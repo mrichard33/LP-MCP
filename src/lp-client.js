@@ -255,7 +255,7 @@ export const getSubSources   = () => getLeadsSourceSubPromoter('b');
  */
 export async function getLead(cstId) {
   return withCircuit(() => lpPost('/api/Customers/GetLead', {
-    startdate:   '2020-01-01',
+    startdate:   '2000-01-01',
     enddate:     new Date().toISOString().slice(0, 10),
     cst_id:      String(cstId),
     lds_id:      '0',

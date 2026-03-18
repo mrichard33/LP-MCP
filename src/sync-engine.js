@@ -190,52 +190,12 @@ const DEFAULT_SOURCE_MAPPINGS = {
 };
 
 async function populateSourceMapping() {
+  // Seed DEFAULT_SOURCE_MAPPINGS into lp_source_mapping table.
+  // NOTE: Previously called getSubSources() (type='b') and getSources('s') from LP,
+  // but those endpoints return branch office codes and numeric IDs — not actual
+  // sourcesubdescr values. Real source discovery now happens in
+  // backfillSourceMappingsFromLeads() after Pass 1 commits all lead rows.
   try {
-    // Get all sub-sources (sourcesubdescr values) — PRIMARY lookup key
-    const subSources = await getSubSources();
-    const subArr = extractArray(subSources);
-    console.log(`[Sync] Sub-sources from LP: ${subArr.length} values`);
-
-    // Get all parent sources — FALLBACK when subdetail is empty
-    const sources = await getSources('s');
-    const srcArr = extractArray(sources);
-    console.log(`[Sync] Parent sources from LP: ${srcArr.length} values`);
-
-    // Log for manual review — Ryan classifies each into a bucket
-    if (subArr.length > 0) {
-      console.log('[Sync] Sub-source sample:', JSON.stringify(subArr.slice(0, 5)));
-    }
-    if (srcArr.length > 0) {
-      console.log('[Sync] Parent source sample:', JSON.stringify(srcArr.slice(0, 5)));
-    }
-
-    // Insert skeleton rows — PostgREST can't use partial unique indexes for upsert,
-    // so we do select→insert/update manually.
-    let inserted = 0;
-    for (const s of subArr) {
-      const key = s.key || s.Key || s.value || s.Value;
-      if (!key) continue;
-      const defaultMap = DEFAULT_SOURCE_MAPPINGS[key];
-      const { data: existing } = await supabase.from('lp_source_mapping')
-        .select('id')
-        .eq('lp_source_subdetail', key)
-        .maybeSingle();
-      if (!existing) {
-        const { error } = await supabase.from('lp_source_mapping').insert({
-          lp_source_subdetail: key,
-          lp_source_raw: null,
-          ghl_intent_bucket: defaultMap?.bucket || 'unmapped',
-          ghl_entry_tag: defaultMap?.tag || 'entry:unmapped',
-        });
-        if (error) {
-          console.warn(`[Sync] Source mapping insert failed for "${key}":`, error.message);
-        } else {
-          inserted++;
-        }
-      }
-    }
-
-    // Also seed known defaults for unmapped sources seen in logs
     let defaultsSeeded = 0;
     for (const [sourceKey, mapping] of Object.entries(DEFAULT_SOURCE_MAPPINGS)) {
       const { data: existing } = await supabase.from('lp_source_mapping')
@@ -282,10 +242,72 @@ async function populateSourceMapping() {
       }
     }
 
-    console.log(`[Sync] Source mapping: ${defaultsSeeded}/${Object.keys(DEFAULT_SOURCE_MAPPINGS).length} defaults seeded, ${inserted} sub-source skeletons ensured, ${rawFallbacks} raw fallbacks added`);
-    return defaultsSeeded + inserted + rawFallbacks;
+    console.log(`[Sync] Source mapping: ${defaultsSeeded}/${Object.keys(DEFAULT_SOURCE_MAPPINGS).length} defaults seeded, ${rawFallbacks} raw fallbacks added`);
+    return defaultsSeeded + rawFallbacks;
   } catch (err) {
     console.warn('[Sync] Source enumeration failed:', err.message);
+    return 0;
+  }
+}
+
+// ─── Backfill Source Mappings From Lead Data ─────────────────────
+// After Pass 1 commits all lp_leads rows, discover actual source values
+// and create skeleton mapping rows for any not already in lp_source_mapping.
+// This replaces the broken LP API calls (GetLeadsSourceSubPromoter type=b/s)
+// that returned branch codes and numeric IDs instead of real source names.
+
+async function backfillSourceMappingsFromLeads() {
+  try {
+    // Get all distinct source combinations from committed lead data
+    const allSources = new Map(); // key = subdetail, value = raw
+    let offset = 0;
+    const pageSize = 1000;
+    while (true) {
+      const { data } = await supabase
+        .from('lp_leads')
+        .select('lead_source_detail, lead_source')
+        .not('lead_source_detail', 'is', null)
+        .range(offset, offset + pageSize - 1);
+      if (!data || data.length === 0) break;
+      for (const r of data) {
+        if (r.lead_source_detail && !allSources.has(r.lead_source_detail)) {
+          allSources.set(r.lead_source_detail, r.lead_source);
+        }
+      }
+      if (data.length < pageSize) break;
+      offset += pageSize;
+    }
+
+    if (allSources.size === 0) {
+      console.log('[Sync] Source backfill: no source data found in lp_leads');
+      return 0;
+    }
+
+    let added = 0;
+    for (const [subdetail, raw] of allSources) {
+      // Check if already mapped
+      const { data: existing } = await supabase.from('lp_source_mapping')
+        .select('id, ghl_intent_bucket')
+        .eq('lp_source_subdetail', subdetail)
+        .maybeSingle();
+      if (!existing) {
+        // Create skeleton row — will default to 'other' in resolveSourceBucket
+        // until manually classified
+        const { error } = await supabase.from('lp_source_mapping').insert({
+          lp_source_subdetail: subdetail,
+          lp_source_raw: raw,
+          ghl_intent_bucket: 'unmapped',
+          ghl_entry_tag: 'entry:unmapped',
+          notes: 'Auto-discovered from lead data — needs classification',
+        });
+        if (!error) added++;
+      }
+    }
+
+    console.log(`[Sync] Source backfill: ${added} new mappings from ${allSources.size} distinct sources in lp_leads`);
+    return added;
+  } catch (err) {
+    console.warn('[Sync] Source backfill from leads failed:', err.message);
     return 0;
   }
 }
@@ -328,14 +350,39 @@ async function syncDispositions() {
 }
 
 // Bug 7: Known disposition code → human-readable label map
+// Extended format: { label, category, recoverable } for codes from LP briefing.
+// Legacy string-only entries kept for backward compat with codes not in briefing.
 const KNOWN_DISPOSITION_LABELS = {
+  // ── Codes from LP briefing (with category + is_recoverable) ──
+  'Sale':     { label: 'Contract Signed',            category: 'closed_won',  recoverable: false },
+  'Data':     { label: 'No Contact / Raw Lead',      category: 'active',      recoverable: true },
+  'OPPFDN':   { label: 'Opportunity Found',          category: 'active',      recoverable: true },
+  'CXL':      { label: 'Cancelled',                  category: 'closed_lost', recoverable: true },
+  'CCC':      { label: 'Cannot Contact',             category: 'deferred',    recoverable: true },
+  'PM':       { label: 'Pending Measure',            category: 'active',      recoverable: false },
+  '1Leg':     { label: 'One Leg Present',            category: 'active',      recoverable: true },
+  'Set':      { label: 'Appointment Set',            category: 'active',      recoverable: false },
+  'Cnf':      { label: 'Appointment Confirmed',      category: 'active',      recoverable: false },
+  'NS':       { label: 'No Show',                    category: 'active',      recoverable: true },
+  'FDNS':     { label: 'Final Demo No Show',         category: 'active',      recoverable: true },
+  'DNC':      { label: 'Do Not Contact',             category: 'dead',        recoverable: false },
+  'Verif':    { label: 'Needs Verification',         category: 'active',      recoverable: true },
+  'SW':       { label: 'Sold — Written Up',          category: 'closed_won',  recoverable: false },
+  'NI':       { label: 'Not Interested',             category: 'closed_lost', recoverable: true },
+  'NOP NOP':  { label: 'No Opportunity — No Opp',    category: 'closed_lost', recoverable: false },
+  'BO':       { label: 'Be Back / Follow Up',        category: 'active',      recoverable: true },
+  'NIS':      { label: 'Not Interested — Shown',     category: 'closed_lost', recoverable: true },
+  'NOP ITM':  { label: 'No Opp — In The Market',     category: 'active',      recoverable: true },
+  'NOP MPR':  { label: 'No Opp — Must Price Right',  category: 'active',      recoverable: true },
+  'No Demo':  { label: 'Demo Not Completed',         category: 'active',      recoverable: true },
+  'OPP NOI':  { label: 'Opportunity — Not Int Now',  category: 'deferred',    recoverable: true },
+  'NG':       { label: 'No Good / Bad Lead',         category: 'dead',        recoverable: false },
+  // ── Legacy codes (string-only, no category info) ──
   'NH':  'No Home',
   'DK':  'Door Knock - No Answer',
-  'NI':  'Not Interested',
   'CB':  'Call Back',
   'AP':  'Appointment Set',
   'DM':  'Demo Completed',
-  'NS':  'No Sale',
   'RS':  'Reschedule',
   'SL':  'Sold',
   'CN':  'Cancelled',
@@ -346,7 +393,6 @@ const KNOWN_DISPOSITION_LABELS = {
   'NA':  'No Answer',
   'AM':  'Answering Machine',
   'LM':  'Left Message',
-  'DNC': 'Do Not Call',
   'RF':  'Referral',
   'HU':  'Hung Up',
   'PI':  'Price Inquiry',
@@ -390,9 +436,15 @@ async function backfillDispositionsFromLeads() {
         .eq('disposition_code', code)
         .maybeSingle();
       if (!existing) {
+        const known = KNOWN_DISPOSITION_LABELS[code];
+        const label = typeof known === 'string' ? known : known?.label || code;
+        const category = typeof known === 'object' ? known.category : null;
+        const recoverable = typeof known === 'object' ? known.recoverable : true;
         await supabase.from('lp_dispositions').upsert({
           disposition_code: code,
-          disposition_label: KNOWN_DISPOSITION_LABELS[code] || code,
+          disposition_label: label,
+          category: category,
+          is_recoverable: recoverable,
           synced_at: new Date().toISOString(),
         }, { onConflict: 'disposition_code' });
         added++;
@@ -1227,17 +1279,22 @@ export async function fullSync() {
     console.log('[Sync] PASS 1 — Loading all contacts into lp_leads...');
 
     const today = new Date();
-    const START_YEAR = 2015;
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const START_YEAR = 2000; // Must go back far enough to capture all historical leads
     const currentYear = today.getFullYear();
 
     for (let year = currentYear; year >= START_YEAR; year--) {
       const windowStart = `${year}-01-01`;
+      // LP treats enddate as exclusive — use tomorrow so today's leads are captured
       const windowEnd = year === currentYear
-        ? today.toISOString().slice(0, 10)
+        ? tomorrow.toISOString().slice(0, 10)
         : `${year}-12-31`;
 
       console.log(`[Sync P1] Fetching leads for ${windowStart} to ${windowEnd}...`);
       let startIndex = 1;
+      const yearStartedAt = new Date();
+      const yearStartCount = counts.leads;
 
       while (true) {
         let result;
@@ -1276,6 +1333,19 @@ export async function fullSync() {
         startIndex += PAGE_SIZE;
         await sleep(RATE_LIMIT_SLEEP_MS);
       }
+
+      // Per-year-chunk sync log entry for monitoring
+      const yearLeads = counts.leads - yearStartCount;
+      if (yearLeads > 0) {
+        await supabase.from('lp_sync_log').insert({
+          entity_type:    'leads',
+          sync_type:      `full_pass1_${year}`,
+          status:         'completed',
+          records_synced: yearLeads,
+          started_at:     yearStartedAt.toISOString(),
+          completed_at:   new Date().toISOString(),
+        }).catch(() => {});  // non-fatal
+      }
     }
 
     // Bug 1: Complete leads log IMMEDIATELY after Pass 1
@@ -1285,9 +1355,18 @@ export async function fullSync() {
       console.error('[Sync] Failed to complete leads sync log:', logErr.message);
     }
 
-    console.log(`[Sync] PASS 1 complete — ${counts.leads} lead rows committed to lp_leads`);
+    // Diagnostic: verify actual row count in Supabase
+    try {
+      const { count: dbCount } = await supabase
+        .from('lp_leads')
+        .select('*', { count: 'exact', head: true });
+      console.log(`[Sync] PASS 1 complete — ${counts.leads} leads processed, ${dbCount} rows in lp_leads table`);
+    } catch (_) {
+      console.log(`[Sync] PASS 1 complete — ${counts.leads} lead rows committed to lp_leads`);
+    }
 
-    // Step 2b: Backfill dispositions from actual lead data
+    // Step 2b: Backfill sources + dispositions from committed lead data
+    await backfillSourceMappingsFromLeads();
     await backfillDispositionsFromLeads();
 
     // ── PASS 2 — Load calls, notes, jobs, milestones ────────────
