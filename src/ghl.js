@@ -14,6 +14,7 @@ if (GHL_API_KEY && !GHL_LOCATION_ID) {
 // to avoid 250K+ failed HTTP calls that would make the sync take forever.
 let ghlDisabled = false;
 let ghlFailCount = 0;
+let loggedFirstMatch = false;
 const GHL_FAIL_THRESHOLD = 5; // Disable after 5 consecutive failures
 
 const ghlClient = GHL_API_KEY ? axios.create({
@@ -36,7 +37,12 @@ export async function searchGHLContact(params) {
       params: { query, locationId: process.env.GHL_LOCATION_ID },
     });
     ghlFailCount = 0; // Reset on success
-    return data?.contacts?.[0] || null;
+    const match = data?.contacts?.[0] || null;
+    if (match && !loggedFirstMatch) {
+      loggedFirstMatch = true;
+      console.log(`[GHL] First search hit: query="${query}" → contactId=${match.id}`);
+    }
+    return match;
   } catch (err) {
     ghlFailCount++;
     const status = err.response?.status || 'no response';
@@ -87,9 +93,16 @@ export async function applyGHLTag(ghlContactId, tag) {
     return true;
   } catch (err) {
     ghlFailCount++;
+    const status = err.response?.status || 'no response';
+    if (ghlFailCount === 1) {
+      console.error(`[GHL] Tag apply failed: HTTP ${status} — ${err.message}`);
+      if (err.response?.data) {
+        console.error('[GHL] Tag response body:', JSON.stringify(err.response.data).slice(0, 300));
+      }
+    }
     if (ghlFailCount >= GHL_FAIL_THRESHOLD) {
       ghlDisabled = true;
-      console.error(`[GHL] Tag application disabled after ${GHL_FAIL_THRESHOLD} failures.`);
+      console.error(`[GHL] Tag application disabled after ${GHL_FAIL_THRESHOLD} failures (last: HTTP ${status}).`);
     }
     return false;
   }
@@ -99,6 +112,7 @@ export async function applyGHLTag(ghlContactId, tag) {
 export function resetGHLState() {
   ghlDisabled = false;
   ghlFailCount = 0;
+  loggedFirstMatch = false;
 }
 
 function normalizePhone(phone) {
