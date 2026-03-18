@@ -23,7 +23,7 @@ import {
   getLeads, getLeadData, getJobStatusChanges, getDispositions,
   getSources, getSubSources, getLead, lpPost, testConnection,
 } from './lp-client.js';
-import { matchToGHL, applyGHLTag } from './ghl.js';
+import { matchToGHL, applyGHLTag, resetGHLState } from './ghl.js';
 import { normalizeSourceAndTag } from './normalization.js';
 import { processMilestoneTriggers } from './milestones.js';
 
@@ -177,18 +177,24 @@ async function resolveSourceBucket(sourcesubdescr, source) {
   return { bucket: 'other', tag: 'entry:other' };
 }
 
+// Track already-logged unmapped sources to avoid log spam
+const loggedUnmappedSources = new Set();
+
 async function logUnmappedSource(sourceSubdetail, sourceRaw) {
   try {
     if (!sourceSubdetail && !sourceRaw) return;
+    const key = `${sourceSubdetail || ''}|${sourceRaw || ''}`;
+    // Only log each unique combo once per sync cycle
+    if (!loggedUnmappedSources.has(key)) {
+      loggedUnmappedSources.add(key);
+      console.log(`[Sync] Unmapped source: subdetail="${sourceSubdetail}", raw="${sourceRaw}"`);
+    }
     await supabase.from('lp_unmapped_sources').upsert({
       source_subdetail: sourceSubdetail || null,
       source_raw: sourceRaw || null,
-    }, { onConflict: 'source_subdetail,source_raw' }).catch(() => {
-      // Table may not exist yet — that's OK
-    });
+    }, { onConflict: 'source_subdetail,source_raw' }).catch(() => {});
   } catch (err) {
-    // Non-critical — just log
-    console.warn(`[Sync] Unmapped source: subdetail="${sourceSubdetail}", raw="${sourceRaw}"`);
+    // Non-critical
   }
 }
 
@@ -566,6 +572,7 @@ export async function fullSync() {
   console.log('[Sync] Starting FULL sync...');
   const startedAt = new Date();
   const stats = { processed: 0, inserted: 0, updated: 0, failed: 0, errors: [] };
+  resetGHLState(); // Give GHL a fresh chance each sync cycle
 
   // Step 0: Test LP API connection
   try {
@@ -683,6 +690,7 @@ export async function incrementalSync() {
   console.log('[Sync] Starting incremental sync...');
   const startedAt = new Date();
   const stats = { processed: 0, inserted: 0, updated: 0, failed: 0, errors: [] };
+  resetGHLState();
 
   try {
     const lastSyncTime = await getLastSyncTimestamp();
