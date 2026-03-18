@@ -5,6 +5,7 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { registerAllTools } from './tools/index.js';
 import { startSyncScheduler, fullSync, incrementalSync, handleWebhookEvent } from './sync-engine.js';
 import { testConnection } from './lp-client.js';
+import { getTokenStatus } from './token-manager.js';
 import supabase from './supabase.js';
 
 const PORT = process.env.PORT || 3000;
@@ -13,7 +14,7 @@ const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 // Create MCP server
 const server = new McpServer({
   name: 'lp-mcp-server',
-  version: '4.0.0',
+  version: '5.0.0',
   description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence',
 });
 
@@ -34,20 +35,21 @@ function authenticate(req, res, next) {
   next();
 }
 
-// Health check
+// Health check — shows config status for all required env vars
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     server: 'lp-mcp-server',
-    version: '4.1.0',
+    version: '5.0.0',
     uptime: process.uptime(),
     lp_config: {
-      server_id: process.env.LP_SERVER_ID ? 'set' : 'MISSING',
-      client_id: process.env.LP_CLIENT_ID ? 'set' : 'MISSING',
-      username: process.env.LP_USERNAME ? 'set' : 'MISSING',
-      password: process.env.LP_PASSWORD ? 'set' : 'MISSING',
-      app_key: process.env.LP_APP_KEY ? 'set' : 'MISSING',
+      api_base_url: process.env.LP_API_BASE_URL ? 'set' : 'MISSING',
+      client_id:    process.env.LP_CLIENT_ID    ? 'set' : 'MISSING',
+      username:     process.env.LP_USERNAME      ? 'set' : 'MISSING',
+      password:     process.env.LP_PASSWORD      ? 'set' : 'MISSING',
+      app_key:      process.env.LP_APP_KEY       ? 'set' : 'MISSING',
     },
+    lp_token: getTokenStatus(),
     supabase: process.env.SUPABASE_URL ? 'configured' : 'MISSING',
     ghl: process.env.GHL_API_KEY ? 'configured' : 'MISSING',
   });
@@ -76,7 +78,7 @@ app.post('/messages', authenticate, async (req, res) => {
   await transport.handlePostMessage(req, res);
 });
 
-// ─── Manual sync endpoints (fire-and-forget per v4 spec) ─────────
+// ─── Manual sync endpoints ───────────────────────────────────────
 
 app.post('/sync/full', authenticate, async (req, res) => {
   res.json({ status: 'started', type: 'full' });
@@ -117,7 +119,7 @@ app.get('/lp/test', authenticate, async (req, res) => {
   }
 });
 
-// ─── Webhook endpoint for LP (if LP supports outbound webhooks) ──
+// ─── Webhook endpoint for LP ─────────────────────────────────────
 
 app.post('/webhook/lp', async (req, res) => {
   // Validate webhook secret if configured
@@ -143,11 +145,12 @@ app.post('/webhook/lp', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`LP MCP Server v4.1 running on port ${PORT}`);
+  console.log(`LP MCP Server v5.0 running on port ${PORT}`);
   console.log(`SSE endpoint: http://localhost:${PORT}/sse`);
   console.log(`Health check: http://localhost:${PORT}/health`);
+  console.log(`LP API test:  http://localhost:${PORT}/lp/test`);
   console.log(`Webhook:      http://localhost:${PORT}/webhook/lp`);
 
-  // Start the sync scheduler — auto-detects first run vs incremental
+  // Start the sync scheduler — pre-warms token, auto-detects first run vs incremental
   startSyncScheduler();
 });

@@ -1,459 +1,125 @@
+// ─── Sync Engine — src/sync-engine.js ─────────────────────────────
+//
+// v5.0 — Runs inside the Railway service alongside the MCP server.
+// All LP calls go through src/lp-client.js (token + retry managed there).
+//
+// Boot sequence:
+//   1. Pre-warm LP token
+//   2. 5-second delay for server init
+//   3. Full sync via POST /api/Customers/GetLead (date-range paginated)
+//   4. Every 15 min: incremental via GetLeadData + GetJobStatusChanges
+//
+// LP GetLead response structure (prospect-level):
+//   { cst_id, firstname, lastname, email, phone1, altphones[], address1,
+//     city, state, zip, leads: [{ id, source, sourcesubdescr, promotername,
+//     disposition, salesrepname, entrydate, lastchangedon, apptset, apptdate,
+//     sat, sold, gsa, jobs: [{ id, jobstatus, grossamount, milestones: [{
+//     mdt_id, datetype, estdate, actdate, enteredby, enteredon }] }],
+//     notes: [] }], calls: [], notes: [] }
+
 import supabase from './supabase.js';
-import { getLeads, getLead, getLeadCalls, getLeadNotes, getLeadActivities, getJob, getDispositions, getLeadsUpdatedSince, getMilestones, getSources, getSubSources, getProspectData, getLeadData, testConnection } from './lp-client.js';
+import { getToken, startTokenRefreshSchedule } from './token-manager.js';
+import {
+  getLeads, getLeadData, getJobStatusChanges, getDispositions,
+  getSources, getSubSources, getLead, lpPost, testConnection,
+} from './lp-client.js';
 import { matchToGHL, applyGHLTag } from './ghl.js';
 import { normalizeSourceAndTag } from './normalization.js';
 import { processMilestoneTriggers } from './milestones.js';
 
 const SYNC_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
-const BATCH_SIZE = 50;
+const PAGE_SIZE = 50;
+const RATE_LIMIT_SLEEP_MS = 300; // LP monitors for excessive use
 
-// ─── Field Mapping: LP API → Supabase ────────────────────────────
-// LP API returns fields in various casings/naming conventions depending on endpoint.
-// We attempt multiple field names to handle GetLead, GetProspectData, GetLeadData, etc.
-function mapLeadToRow(lp) {
-  // LP API field names vary by endpoint — try all known variants
-  const createdAt = lp.DateAdded || lp.dateadded || lp.date_added
-    || lp.created_date || lp.createdate || lp.created_at
-    || lp.DateReceived || lp.datereceived || null;
-  const updatedAt = lp.LastChanged || lp.lastchanged || lp.last_changed
-    || lp.updated_date || lp.updatedate || lp.updated_at || lp.lastmodified || null;
-  const demoDate = lp.DemoDate || lp.demo_date || lp.demodate
-    || lp.ApptResultDate || lp.appointment_result_date || null;
-  const appointmentDate = lp.ApptDate || lp.appointment_date || lp.appointmentdate
-    || lp.appt_date || lp.SalesApptDate || null;
-  const closeDate = lp.CloseDate || lp.close_date || lp.closedate
-    || lp.SoldDate || lp.sold_date || null;
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-  // Lead/prospect ID — LP uses various field names
-  const leadId = lp.ProspectID || lp.prospect_id || lp.prospectid
-    || lp.IssuedLeadID || lp.issued_lead_id || lp.ils_id
-    || lp.CustomerID || lp.customer_id || lp.cst_id
-    || lp.id || lp.lead_id || lp.leadid;
+function normalizePhone(phone) {
+  if (!phone) return null;
+  return phone.replace(/\D/g, '') || null;
+}
 
-  const row = {
-    lp_lead_id: String(leadId),
-    first_name: lp.FirstName || lp.first_name || lp.firstname || lp.fname || null,
-    last_name: lp.LastName || lp.last_name || lp.lastname || lp.lname || null,
-    email: lp.Email || lp.email || lp.EmailAddress || lp.emailaddress || null,
-    phone: lp.Phone || lp.phone || lp.Phone1 || lp.phone1 || lp.HomePhone || lp.homephone || null,
-    phone_alt: lp.Phone2 || lp.phone_alt || lp.phone2 || lp.CellPhone || lp.cellphone || lp.WorkPhone || lp.workphone || null,
-    address: lp.Address1 || lp.address || lp.address1 || lp.street || null,
-    city: lp.City || lp.city || null,
-    state: lp.State || lp.state || null,
-    zip: lp.Zip || lp.zip || lp.ZipCode || lp.zipcode || null,
-    lead_source: lp.Source || lp.source || lp.LeadSource || lp.leadsource || null,
-    lead_source_detail: lp.SourceSubDescr || lp.sourcesubdescr || lp.source_detail || lp.sourcesubdetail || null,
-    disposition_code: lp.Disposition || lp.disposition || lp.DispositionCode || lp.dispositioncode || lp.disp_code || null,
-    disposition_label: lp.DispositionDesc || lp.disposition_label || lp.dispositiondesc || lp.disp_label || null,
-    rep_id: lp.SalesRepID || lp.rep_id || lp.repid || lp.salesperson_id || lp.ILS_ID || null,
-    rep_name: lp.SalesRepName || lp.rep_name || lp.repname || lp.salesperson || null,
-    call_count: lp.CallCount || lp.call_count || lp.callcount || lp.totalcalls || 0,
-    last_call_date: lp.LastCallDate || lp.last_call_date || lp.lastcalldate || null,
-    last_contact_date: lp.LastContactDate || lp.last_contact_date || lp.lastcontactdate || null,
-    appointment_set: !!(appointmentDate || lp.AppointmentSet || lp.appointment_set || lp.appt_set),
-    appointment_date: appointmentDate,
-    demo_completed: !!(demoDate || lp.DemoCompleted || lp.demo_completed || lp.democompleted),
-    demo_date: demoDate,
-    closed_won: !!(closeDate || lp.ClosedWon || lp.closed_won || lp.sold || lp.Sold),
-    close_date: closeDate,
-    job_value: lp.ContractAmount || lp.contract_amount || lp.contractamount
-      || lp.JobValue || lp.job_value || lp.jobvalue || null,
-    created_at_lp: createdAt,
-    updated_at_lp: updatedAt,
-    synced_at: new Date().toISOString(),
-    raw_lp_data: lp,
-  };
-
-  // Calculate days_to_demo
-  if (row.demo_date && row.created_at_lp) {
-    const diff = new Date(row.demo_date) - new Date(row.created_at_lp);
-    row.days_to_demo = Math.round(diff / 86400000);
+// ─── Extract array from LP API response ──────────────────────────
+// LP may return a direct array, or nested under various keys.
+function extractArray(response) {
+  if (!response) return [];
+  if (Array.isArray(response)) return response;
+  for (const key of ['data', 'leads', 'results', 'Result', 'Records', 'records', 'Customers', 'customers']) {
+    if (Array.isArray(response[key])) return response[key];
   }
-
-  return row;
-}
-
-function mapCallToRow(call, lpLeadId, ghlContactId) {
-  return {
-    lp_call_id: String(call.id || call.call_id || call.callid),
-    lp_lead_id: lpLeadId,
-    ghl_contact_id: ghlContactId || null,
-    call_date: call.call_date || call.calldate || call.date || null,
-    call_duration_sec: call.duration || call.call_duration || call.duration_sec || null,
-    call_result: call.result || call.call_result || call.outcome || null,
-    call_direction: call.direction || call.call_direction || null,
-    rep_id: call.rep_id || call.repid || null,
-    rep_name: call.rep_name || call.repname || null,
-    call_notes: call.notes || call.call_notes || null,
-    recording_url: call.recording_url || call.recordingurl || null,
-    synced_at: new Date().toISOString(),
-    raw_lp_data: call,
-  };
-}
-
-function mapNoteToRow(note, lpLeadId, ghlContactId) {
-  return {
-    lp_note_id: String(note.id || note.note_id || note.noteid),
-    lp_lead_id: lpLeadId,
-    ghl_contact_id: ghlContactId || null,
-    note_body: note.body || note.note || note.text || note.content || null,
-    note_type: note.type || note.note_type || null,
-    created_by_rep_id: note.rep_id || note.created_by || null,
-    created_by_rep_name: note.rep_name || note.created_by_name || null,
-    created_at_lp: note.created_date || note.created_at || note.date || null,
-    synced_at: new Date().toISOString(),
-    raw_lp_data: note,
-  };
-}
-
-function mapActivityToRow(activity, lpLeadId) {
-  return {
-    lp_activity_id: String(activity.id || activity.activity_id || activity.activityid),
-    lp_lead_id: lpLeadId,
-    activity_type: activity.type || activity.activity_type || null,
-    activity_detail: activity.detail || activity.description || activity.activity_detail || null,
-    rep_id: activity.rep_id || activity.repid || null,
-    rep_name: activity.rep_name || activity.repname || null,
-    activity_date: activity.date || activity.activity_date || null,
-    synced_at: new Date().toISOString(),
-    raw_lp_data: activity,
-  };
-}
-
-// ─── Sync Logic ──────────────────────────────────────────────────
-
-async function syncSingleLead(lpLead) {
-  const row = mapLeadToRow(lpLead);
-
-  // Upsert lead
-  const { error: leadErr } = await supabase
-    .from('lp_leads')
-    .upsert(row, { onConflict: 'lp_lead_id' });
-
-  if (leadErr) {
-    throw new Error(`Lead upsert failed for ${row.lp_lead_id}: ${leadErr.message}`);
+  // Single object with prospect ID — wrap it
+  if (response.cst_id || response.ProspectID || response.prospect_id) {
+    return [response];
   }
-
-  // Match to GHL
-  let ghlContactId = null;
-  try {
-    ghlContactId = await matchToGHL({
-      phone: row.phone,
-      phone_alt: row.phone_alt,
-      email: row.email,
-    });
-    if (ghlContactId) {
-      await supabase.from('lp_leads')
-        .update({ ghl_contact_id: ghlContactId })
-        .eq('lp_lead_id', row.lp_lead_id);
-    }
-  } catch (err) {
-    console.warn(`[Sync] GHL match failed for ${row.lp_lead_id}:`, err.message);
-  }
-
-  // Normalize source → intent bucket + apply GHL tag
-  try {
-    await normalizeSourceAndTag({
-      lp_lead_id: row.lp_lead_id,
-      sourcesubdescr: row.lead_source_detail,
-      source: row.lead_source,
-      ghl_tag_applied: false,
-    }, ghlContactId);
-  } catch (err) {
-    console.warn(`[Sync] Normalization failed for ${row.lp_lead_id}:`, err.message);
-  }
-
-  // Sync calls, notes, activities in parallel
-  const lpLeadId = row.lp_lead_id;
-  await Promise.allSettled([
-    syncLeadCalls(lpLeadId, ghlContactId),
-    syncLeadNotes(lpLeadId, ghlContactId),
-    syncLeadActivities(lpLeadId),
-  ]);
-
-  return lpLeadId;
+  return [];
 }
 
-async function syncLeadCalls(lpLeadId, ghlContactId) {
-  try {
-    const calls = await getLeadCalls(lpLeadId);
-    const items = Array.isArray(calls) ? calls : calls?.data || calls?.calls || [];
-    if (items.length === 0) return;
+// ─── Sync Log ────────────────────────────────────────────────────
 
-    const rows = items.map(c => mapCallToRow(c, lpLeadId, ghlContactId));
-    const { error } = await supabase
-      .from('lp_call_logs')
-      .upsert(rows, { onConflict: 'lp_call_id' });
-    if (error) console.warn(`[Sync] Call upsert failed for lead ${lpLeadId}:`, error.message);
-  } catch (err) {
-    // Not all leads have calls — 404 is expected
-    if (err.response?.status !== 404) {
-      console.warn(`[Sync] Calls fetch failed for ${lpLeadId}:`, err.message);
-    }
-  }
-}
-
-async function syncLeadNotes(lpLeadId, ghlContactId) {
-  try {
-    const notes = await getLeadNotes(lpLeadId);
-    const items = Array.isArray(notes) ? notes : notes?.data || notes?.notes || [];
-    if (items.length === 0) return;
-
-    const rows = items.map(n => mapNoteToRow(n, lpLeadId, ghlContactId));
-    const { error } = await supabase
-      .from('lp_notes')
-      .upsert(rows, { onConflict: 'lp_note_id' });
-    if (error) console.warn(`[Sync] Note upsert failed for lead ${lpLeadId}:`, error.message);
-  } catch (err) {
-    if (err.response?.status !== 404) {
-      console.warn(`[Sync] Notes fetch failed for ${lpLeadId}:`, err.message);
-    }
-  }
-}
-
-async function syncLeadActivities(lpLeadId) {
-  try {
-    const activities = await getLeadActivities(lpLeadId);
-    const items = Array.isArray(activities) ? activities : activities?.data || activities?.activities || [];
-    if (items.length === 0) return;
-
-    const rows = items.map(a => mapActivityToRow(a, lpLeadId));
-    const { error } = await supabase
-      .from('lp_activities')
-      .upsert(rows, { onConflict: 'lp_activity_id' });
-    if (error) console.warn(`[Sync] Activity upsert failed for lead ${lpLeadId}:`, error.message);
-  } catch (err) {
-    if (err.response?.status !== 404) {
-      console.warn(`[Sync] Activities fetch failed for ${lpLeadId}:`, err.message);
-    }
-  }
-}
-
-async function logSync(syncType, stats, startTime) {
+async function logSync(opts) {
   const completed = new Date();
   try {
     await supabase.from('lp_sync_log').insert({
-      sync_type: syncType,
-      records_processed: stats.processed,
-      records_inserted: stats.inserted,
-      records_updated: stats.updated,
-      records_failed: stats.failed,
-      error_details: stats.errors.length > 0 ? stats.errors : null,
-      started_at: startTime.toISOString(),
-      completed_at: completed.toISOString(),
-      duration_ms: completed - startTime,
+      sync_type:         opts.sync_type,
+      records_processed: opts.records_processed || 0,
+      records_inserted:  opts.records_inserted  || 0,
+      records_updated:   opts.records_updated   || 0,
+      records_failed:    opts.records_failed    || 0,
+      error_details:     opts.errors?.length > 0 ? opts.errors : null,
+      started_at:        opts.started_at.toISOString(),
+      completed_at:      completed.toISOString(),
+      duration_ms:       opts.duration_ms || (completed - opts.started_at),
     });
   } catch (err) {
     console.error('[Sync] Failed to write sync log:', err.message);
   }
 }
 
-// ─── Extract leads array from LP API response ───────────────────
-// LP API may return data as a direct array, or nested under various keys
-function extractLeadsArray(response) {
-  if (!response) return [];
-  if (Array.isArray(response)) return response;
-  // LP API may wrap results in these keys
-  for (const key of ['data', 'leads', 'results', 'Result', 'Records', 'records', 'Customers', 'customers']) {
-    if (Array.isArray(response[key])) return response[key];
-  }
-  // If it's a single object with a prospect/lead ID, wrap it
-  if (response.ProspectID || response.prospect_id || response.IssuedLeadID) {
-    return [response];
-  }
-  return [];
+async function logSyncError(entityId, err) {
+  console.error(`[Sync] Entity ${entityId} failed:`, err.message);
 }
 
-// ─── Full Sync (initial load) ────────────────────────────────────
-
-export async function fullSync() {
-  console.log('[Sync] Starting FULL sync...');
-  const startTime = new Date();
-  const stats = { processed: 0, inserted: 0, updated: 0, failed: 0, errors: [] };
-
-  // Step 0: Test LP API connection
-  try {
-    const connStatus = await testConnection();
-    console.log(`[Sync] LP API connection: auth=${connStatus.auth_status}, api=${connStatus.api_test}`);
-    if (connStatus.auth_status !== 'success') {
-      console.error('[Sync] LP API authentication failed — cannot sync. Check LP_SERVER_ID, LP_CLIENT_ID, LP_USERNAME, LP_PASSWORD, LP_APP_KEY env vars.');
-      stats.errors.push({ fatal: 'LP API auth failed', details: connStatus.errors });
-      await logSync('full', stats, startTime);
-      return stats;
-    }
-  } catch (err) {
-    console.error('[Sync] LP API connection test failed:', err.message);
-    stats.errors.push({ fatal: `LP connection: ${err.message}` });
-    await logSync('full', stats, startTime);
-    return stats;
-  }
-
-  try {
-    // Step 1: Sync dispositions reference table
-    await syncDispositions();
-
-    // Step 1b: Sync sources reference
-    await syncSources();
-
-    // Step 2: Fetch all leads (paginated via start_index)
-    let startIndex = 0;
-    let hasMore = true;
-
-    while (hasMore) {
-      let leadsResponse;
-      try {
-        leadsResponse = await getLeads({ page_size: BATCH_SIZE, start_index: startIndex });
-      } catch (err) {
-        console.error(`[Sync] Failed to fetch leads at index ${startIndex}:`, err.message);
-        stats.errors.push({ start_index: startIndex, error: err.message });
-        break;
-      }
-
-      const leads = extractLeadsArray(leadsResponse);
-
-      if (leads.length === 0) {
-        hasMore = false;
-        break;
-      }
-
-      for (const lead of leads) {
-        try {
-          await syncSingleLead(lead);
-          stats.processed++;
-          stats.inserted++;
-        } catch (err) {
-          stats.failed++;
-          const lid = lead.ProspectID || lead.prospect_id || lead.id || lead.lead_id;
-          stats.errors.push({ lead_id: lid, error: err.message });
-          console.error(`[Sync] Lead sync failed:`, err.message);
-        }
-      }
-
-      console.log(`[Sync] Processed batch at index ${startIndex} (${leads.length} leads)`);
-
-      // If we got fewer than BATCH_SIZE, we've reached the end
-      if (leads.length < BATCH_SIZE) {
-        hasMore = false;
-      } else {
-        startIndex += leads.length;
-      }
-    }
-
-    // Step 3: Process milestone triggers
-    try {
-      const milestoneResult = await processMilestoneTriggers();
-      console.log(`[Sync] Milestones: ${milestoneResult.fired} tags fired`);
-    } catch (err) {
-      console.warn('[Sync] Milestone processing failed:', err.message);
-    }
-
-    // Step 4: Check Day 15 handoff condition
-    try {
-      await checkDay15Handoffs();
-    } catch (err) {
-      console.warn('[Sync] Day 15 check failed:', err.message);
-    }
-
-    // Step 5: Check lead-level triggers (demo completed, closed won, etc.)
-    try {
-      await checkLeadTriggers();
-    } catch (err) {
-      console.warn('[Sync] Lead trigger checks failed:', err.message);
-    }
-
-  } catch (err) {
-    console.error('[Sync] Full sync failed:', err.message);
-    stats.errors.push({ fatal: err.message });
-  }
-
-  await logSync('full', stats, startTime);
-  console.log(`[Sync] Full sync complete — ${stats.processed} processed, ${stats.failed} failed (${Date.now() - startTime}ms)`);
-  return stats;
+async function getLastSyncTimestamp() {
+  const { data } = await supabase
+    .from('lp_sync_log')
+    .select('completed_at')
+    .order('completed_at', { ascending: false })
+    .limit(1)
+    .single();
+  return data?.completed_at ? new Date(data.completed_at) : null;
 }
 
-// ─── Incremental Sync (delta updates) ────────────────────────────
+// ─── Source Enumeration — Run before first sync ──────────────────
 
-export async function incrementalSync() {
-  console.log('[Sync] Starting incremental sync...');
-  const startTime = new Date();
-  const stats = { processed: 0, inserted: 0, updated: 0, failed: 0, errors: [] };
-
+async function populateSourceMapping() {
   try {
-    // Get last sync time
-    const { data: lastSync } = await supabase
-      .from('lp_sync_log')
-      .select('completed_at')
-      .order('completed_at', { ascending: false })
-      .limit(1)
-      .single();
+    // Get all sub-sources (sourcesubdescr values) — PRIMARY lookup key
+    const subSources = await getSubSources();
+    const subArr = extractArray(subSources);
+    console.log(`[Sync] Sub-sources from LP: ${subArr.length} values`);
 
-    if (!lastSync?.completed_at) {
-      console.log('[Sync] No previous sync found — running full sync instead');
-      return fullSync();
+    // Get all parent sources — FALLBACK when subdetail is empty
+    const sources = await getSources('s');
+    const srcArr = extractArray(sources);
+    console.log(`[Sync] Parent sources from LP: ${srcArr.length} values`);
+
+    // Log for manual review — Ryan classifies each into a bucket
+    if (subArr.length > 0) {
+      console.log('[Sync] Sub-source sample:', JSON.stringify(subArr.slice(0, 5)));
     }
-
-    const since = lastSync.completed_at;
-    let updatedLeads;
-    try {
-      updatedLeads = await getLeadsUpdatedSince(since);
-    } catch (err) {
-      console.error('[Sync] Failed to fetch updated leads:', err.message);
-      stats.errors.push({ error: err.message });
-      await logSync('incremental', stats, startTime);
-      return stats;
+    if (srcArr.length > 0) {
+      console.log('[Sync] Parent source sample:', JSON.stringify(srcArr.slice(0, 5)));
     }
-
-    const leads = extractLeadsArray(updatedLeads);
-
-    for (const lead of leads) {
-      try {
-        await syncSingleLead(lead);
-        stats.processed++;
-        stats.updated++;
-      } catch (err) {
-        stats.failed++;
-        stats.errors.push({ lead_id: lead.id || lead.lead_id, error: err.message });
-      }
-    }
-
-    // Process milestone triggers
-    try {
-      await processMilestoneTriggers();
-    } catch (err) {
-      console.warn('[Sync] Milestone processing failed:', err.message);
-    }
-
-    // Check Day 15 handoff condition
-    try {
-      await checkDay15Handoffs();
-    } catch (err) {
-      console.warn('[Sync] Day 15 check failed:', err.message);
-    }
-
-    // Check lead-level triggers
-    try {
-      await checkLeadTriggers();
-    } catch (err) {
-      console.warn('[Sync] Lead trigger checks failed:', err.message);
-    }
-
   } catch (err) {
-    console.error('[Sync] Incremental sync failed:', err.message);
-    stats.errors.push({ fatal: err.message });
+    console.warn('[Sync] Source enumeration failed:', err.message);
   }
-
-  await logSync('incremental', stats, startTime);
-  console.log(`[Sync] Incremental sync complete — ${stats.processed} processed, ${stats.failed} failed`);
-  return stats;
 }
 
-// ─── Sync dispositions reference data ────────────────────────────
+// ─── Sync Dispositions ───────────────────────────────────────────
 
 async function syncDispositions() {
   try {
     const response = await getDispositions();
-    // LP API GetSalesApptDispProd returns dispositions in various possible formats
-    const items = extractLeadsArray(response);
+    const items = extractArray(response);
 
     let synced = 0;
     for (const d of items) {
@@ -462,7 +128,7 @@ async function syncDispositions() {
 
       await supabase.from('lp_dispositions').upsert({
         disposition_code: code,
-        disposition_label: d.Description || d.description || d.Label || d.label || d.Name || d.name || d.disposition_label || '',
+        disposition_label: d.Description || d.description || d.Label || d.label || d.Name || d.name || '',
         category: d.Category || d.category || null,
         is_recoverable: d.is_recoverable ?? true,
         synced_at: new Date().toISOString(),
@@ -475,86 +141,382 @@ async function syncDispositions() {
   }
 }
 
-// ─── Sync sources reference data ─────────────────────────────────
+// ─── Source Normalization — resolveSourceBucket() ─────────────────
 
-async function syncSources() {
+async function resolveSourceBucket(sourcesubdescr, source) {
+  // Try sourcesubdescr first (primary intent signal)
+  if (sourcesubdescr) {
+    const { data } = await supabase.from('lp_source_mapping')
+      .select('ghl_intent_bucket, ghl_entry_tag')
+      .eq('lp_source_subdetail', sourcesubdescr).single();
+    if (data) return { bucket: data.ghl_intent_bucket, tag: data.ghl_entry_tag };
+  }
+  // Fall back to parent source field
+  if (source) {
+    const { data } = await supabase.from('lp_source_mapping')
+      .select('ghl_intent_bucket, ghl_entry_tag')
+      .eq('lp_source_raw', source).is('lp_source_subdetail', null).single();
+    if (data) return { bucket: data.ghl_intent_bucket, tag: data.ghl_entry_tag };
+  }
+  // Default — log for mapping review
+  await logUnmappedSource(sourcesubdescr, source);
+  return { bucket: 'other', tag: 'entry:other' };
+}
+
+async function logUnmappedSource(sourceSubdetail, sourceRaw) {
   try {
-    // Fetch parent sources
-    const sourcesResp = await getSources('S');
-    const sources = extractLeadsArray(sourcesResp);
-    console.log(`[Sync] Fetched ${sources.length} parent sources`);
-
-    // Fetch sub-sources (sourcesubdescr)
-    const subResp = await getSubSources();
-    const subSources = extractLeadsArray(subResp);
-    console.log(`[Sync] Fetched ${subSources.length} sub-sources`);
+    if (!sourceSubdetail && !sourceRaw) return;
+    await supabase.from('lp_unmapped_sources').upsert({
+      source_subdetail: sourceSubdetail || null,
+      source_raw: sourceRaw || null,
+    }, { onConflict: 'source_subdetail,source_raw' }).catch(() => {
+      // Table may not exist yet — that's OK
+    });
   } catch (err) {
-    console.warn('[Sync] Sources sync failed:', err.message);
+    // Non-critical — just log
+    console.warn(`[Sync] Unmapped source: subdetail="${sourceSubdetail}", raw="${sourceRaw}"`);
   }
 }
 
-// ─── Day 15 Handoff — Automatic Check ────────────────────────────
+// ─── Milestone Tag Map (mdt_id → GHL tag) ────────────────────────
+
+const MDT_TAG_MAP = {
+  R: 'lp-milestone-rtp',          M: 'lp-milestone-measure',
+  O: 'lp-milestone-quoted',       H: 'lp-milestone-hoa-approved',
+  K: 'lp-milestone-ordered',      U: 'lp-milestone-permit-submit',
+  P: 'lp-milestone-permit-issued', V: 'lp-milestone-recv-windows',
+  E: 'lp-milestone-recv-doors',   G: 'lp-milestone-recv-all',
+  S: 'lp-milestone-install-start', F: 'lp-milestone-install-end',
+  C: 'lp-milestone-completion',   I: 'lp-milestone-insp-set',
+  B: 'lp-milestone-insp-passed',  X: 'lp-milestone-snap-trim',
+};
+
+// ─── Per-Prospect Processing — processProspect() ─────────────────
+//
+// The LP GetLead response nests everything under a prospect record:
+// contact info at top level, leads[] array inside, each lead has jobs[]
+// with milestones[] inside.
+
+async function processProspect(prospect) {
+  // 1. Match to GHL contact (phone primary → alt phone → email)
+  let ghlId = null;
+  try {
+    ghlId = await matchToGHL({
+      phone: normalizePhone(prospect.phone1 || prospect.Phone1 || prospect.phone),
+      phone_alt: normalizePhone(prospect.altphones?.[0]?.phone || prospect.Phone2 || prospect.phone_alt),
+      email: prospect.email || prospect.Email || null,
+    });
+  } catch (err) {
+    console.warn(`[Sync] GHL match failed for prospect ${prospect.cst_id}:`, err.message);
+  }
+
+  // 2. Process each lead record under this prospect
+  const leads = prospect.leads || prospect.Leads || [];
+  if (leads.length === 0) {
+    // Some endpoints return flat data — treat the prospect itself as a lead
+    await upsertLeadFromFlat(prospect, ghlId);
+    return;
+  }
+
+  for (const lead of leads) {
+    const { bucket, tag } = await resolveSourceBucket(
+      lead.sourcesubdescr || lead.SourceSubDescr,
+      lead.source || lead.Source,
+    );
+
+    const lpLeadId = String(lead.id || lead.lds_id || lead.LeadID);
+    const lpProspectId = String(prospect.cst_id || prospect.CstID || prospect.prospectid);
+
+    // 3. Check existing state
+    const { data: existing } = await supabase
+      .from('lp_leads')
+      .select('ghl_tag_applied, lp_day15_triggered')
+      .eq('lp_lead_id', lpLeadId)
+      .single();
+
+    // 4. Upsert core lead record
+    const { error: upsertErr } = await supabase.from('lp_leads').upsert({
+      lp_lead_id:         lpLeadId,
+      lp_prospect_id:     lpProspectId,
+      ghl_contact_id:     ghlId,
+      first_name:         prospect.firstname || prospect.FirstName || null,
+      last_name:          prospect.lastname  || prospect.LastName  || null,
+      email:              prospect.email      || prospect.Email     || null,
+      phone:              normalizePhone(prospect.phone1 || prospect.Phone1),
+      phone_alt:          normalizePhone(prospect.altphones?.[0]?.phone || prospect.Phone2),
+      address:            prospect.address1   || prospect.Address1  || null,
+      city:               prospect.city       || prospect.City      || null,
+      state:              prospect.state      || prospect.State     || null,
+      zip:                prospect.zip        || prospect.Zip       || null,
+      lead_source:        lead.source         || lead.Source        || null,
+      lead_source_detail: lead.sourcesubdescr || lead.SourceSubDescr || null,
+      promoter_name:      lead.promotername   || lead.PromoterName  || null,
+      ghl_intent_bucket:  bucket,
+      ghl_entry_tag:      tag,
+      disposition_code:   lead.disposition    || lead.Disposition   || null,
+      rep_name:           lead.salesrepname   || lead.SalesRepName  || null,
+      appointment_set:    lead.apptset === 'true' || lead.apptset === true,
+      appointment_date:   lead.apptdate       || lead.ApptDate      || null,
+      demo_completed:     lead.sat === 'true'  || lead.sat === true,
+      demo_date:          (lead.sat === 'true' || lead.sat === true) ? (lead.apptdate || lead.ApptDate) : null,
+      closed_won:         lead.sold === 'true' || lead.sold === true,
+      job_value:          parseFloat(lead.gsa || lead.GSA) || null,
+      created_at_lp:      lead.entrydate      || lead.EntryDate     || null,
+      updated_at_lp:      lead.lastchangedon  || lead.LastChangedOn || null,
+      synced_at:          new Date().toISOString(),
+      raw_lp_data:        prospect,
+    }, { onConflict: 'lp_lead_id' });
+
+    if (upsertErr) {
+      throw new Error(`Lead upsert failed for ${lpLeadId}: ${upsertErr.message}`);
+    }
+
+    // 5. Apply GHL entry:* tag (once, additive — NEVER use PUT)
+    if (ghlId && !existing?.ghl_tag_applied) {
+      const success = await applyGHLTag(ghlId, tag);
+      if (success) {
+        await supabase.from('lp_leads')
+          .update({ ghl_tag_applied: true })
+          .eq('lp_lead_id', lpLeadId);
+      }
+    }
+
+    // 6. Sync call logs from prospect.calls[] array
+    const calls = prospect.calls || prospect.Calls || [];
+    await syncCallLogs(lpLeadId, ghlId, calls);
+
+    // 7. Sync notes from prospect.notes[] + lead.notes[]
+    const notes = [...(prospect.notes || prospect.Notes || []), ...(lead.notes || lead.Notes || [])];
+    await syncNotes(lpLeadId, ghlId, notes);
+
+    // 8. Sync jobs + milestones from lead.jobs[]
+    for (const job of lead.jobs || lead.Jobs || []) {
+      await syncJobAndMilestones(job, lpLeadId, ghlId);
+    }
+
+    // 9. Day 15 handoff check
+    if (!existing?.lp_day15_triggered && ghlId) {
+      await checkDay15Handoff(
+        lpLeadId, ghlId,
+        lead.entrydate || lead.EntryDate,
+        lead.disposition || lead.Disposition,
+      );
+    }
+  }
+}
+
+// Fallback: upsert from flat data (when LP returns non-nested response)
+async function upsertLeadFromFlat(lp, ghlId) {
+  const lpLeadId = String(lp.lds_id || lp.id || lp.LeadID || lp.cst_id || lp.ProspectID);
+  const lpProspectId = String(lp.cst_id || lp.CstID || lp.ProspectID || '');
+
+  await supabase.from('lp_leads').upsert({
+    lp_lead_id:         lpLeadId,
+    lp_prospect_id:     lpProspectId,
+    ghl_contact_id:     ghlId,
+    first_name:         lp.firstname  || lp.FirstName  || lp.first_name || null,
+    last_name:          lp.lastname   || lp.LastName   || lp.last_name  || null,
+    email:              lp.email      || lp.Email      || null,
+    phone:              normalizePhone(lp.phone1 || lp.Phone1 || lp.phone || lp.Phone),
+    phone_alt:          normalizePhone(lp.phone2 || lp.Phone2 || lp.phone_alt),
+    address:            lp.address1   || lp.Address1   || null,
+    city:               lp.city       || lp.City       || null,
+    state:              lp.state      || lp.State      || null,
+    zip:                lp.zip        || lp.Zip        || null,
+    lead_source:        lp.source     || lp.Source     || null,
+    lead_source_detail: lp.sourcesubdescr || lp.SourceSubDescr || null,
+    disposition_code:   lp.disposition || lp.Disposition || null,
+    rep_name:           lp.salesrepname || lp.SalesRepName || lp.rep_name || null,
+    created_at_lp:      lp.entrydate  || lp.EntryDate  || lp.dateadded || null,
+    updated_at_lp:      lp.lastchangedon || lp.LastChangedOn || null,
+    synced_at:          new Date().toISOString(),
+    raw_lp_data:        lp,
+  }, { onConflict: 'lp_lead_id' });
+}
+
+// ─── Call Log Sync ───────────────────────────────────────────────
+
+async function syncCallLogs(lpLeadId, ghlContactId, calls) {
+  for (const call of calls) {
+    const callId = String(call.id || call.call_id || call.CallID || `${lpLeadId}-${call.calldate || call.CallDate}-${Math.random()}`);
+    try {
+      await supabase.from('lp_call_logs').upsert({
+        lp_call_id:        callId,
+        lp_lead_id:        lpLeadId,
+        ghl_contact_id:    ghlContactId || null,
+        call_date:         call.calldate     || call.CallDate    || call.date || null,
+        call_duration_sec: call.duration     || call.Duration    || null,
+        call_result:       call.resultcode   || call.ResultCode  || call.result || null,
+        call_direction:    call.calltype     || call.CallType    || null,  // A=Outbound, I=Inbound
+        agent_id:          call.emp_id       || call.EmpID       || null,
+        agent_name:        call.agentname    || call.AgentName   || call.rep_name || null,
+        call_notes:        call.notes        || call.Notes       || null,
+        recording_url:     call.recording_url || call.RecordingURL || null,
+        synced_at:         new Date().toISOString(),
+        raw_lp_data:       call,
+      }, { onConflict: 'lp_call_id' });
+    } catch (err) {
+      console.warn(`[Sync] Call upsert failed for ${callId}:`, err.message);
+    }
+  }
+}
+
+// ─── Notes Sync ──────────────────────────────────────────────────
+
+async function syncNotes(lpLeadId, ghlContactId, notes) {
+  for (const note of notes) {
+    const noteId = String(note.id || note.note_id || note.NoteID || `${lpLeadId}-${note.date || note.Date}-${Math.random()}`);
+    try {
+      await supabase.from('lp_notes').upsert({
+        lp_note_id:          noteId,
+        lp_lead_id:          lpLeadId,
+        ghl_contact_id:      ghlContactId || null,
+        note_body:           note.notes    || note.Notes   || note.body    || note.text || null,
+        note_type:           note.rectype  || note.RecType || note.type    || null,
+        note_category:       note.category || note.Category || null,
+        created_by_rep_name: note.enteredby || note.EnteredBy || note.rep_name || null,
+        created_at_lp:       note.date      || note.Date     || note.enteredon || null,
+        synced_at:           new Date().toISOString(),
+        raw_lp_data:         note,
+      }, { onConflict: 'lp_note_id' });
+    } catch (err) {
+      console.warn(`[Sync] Note upsert failed for ${noteId}:`, err.message);
+    }
+  }
+}
+
+// ─── Job + Milestone Sync — syncJobAndMilestones() ───────────────
+
+async function syncJobAndMilestones(job, lpLeadId, ghlContactId) {
+  const jobId = String(job.id || job.job_id || job.JobID);
+
+  // Upsert job record
+  try {
+    await supabase.from('lp_jobs').upsert({
+      lp_job_id:       jobId,
+      lp_lead_id:      lpLeadId,
+      ghl_contact_id:  ghlContactId || null,
+      job_status:      job.jobstatus   || job.JobStatus   || null,
+      job_value:       parseFloat(job.grossamount || job.GrossAmount || job.gsa) || null,
+      rep_name:        job.salesrepname || job.SalesRepName || null,
+      created_at_lp:   job.entrydate   || job.EntryDate   || null,
+      updated_at_lp:   job.lastchangedon || job.LastChangedOn || null,
+      synced_at:       new Date().toISOString(),
+      raw_lp_data:     job,
+    }, { onConflict: 'lp_job_id' });
+  } catch (err) {
+    console.warn(`[Sync] Job upsert failed for ${jobId}:`, err.message);
+  }
+
+  // Process each milestone
+  for (const ms of job.milestones || job.Milestones || []) {
+    const mdtId = ms.mdt_id || ms.MDT_ID || ms.MdtId;
+    if (!mdtId) continue;
+
+    // Check existing state
+    const { data: existing } = await supabase.from('lp_job_milestones')
+      .select('act_date, ghl_tag_fired')
+      .eq('lp_job_id', jobId).eq('mdt_id', mdtId).single();
+
+    // Upsert milestone row
+    try {
+      await supabase.from('lp_job_milestones').upsert({
+        lp_job_id:       jobId,
+        lp_lead_id:      lpLeadId,
+        ghl_contact_id:  ghlContactId || null,
+        mdt_id:          mdtId,
+        datetype:        ms.datetype    || ms.DateType   || null,
+        est_date:        ms.estdate     || ms.EstDate    || null,
+        act_date:        ms.actdate     || ms.ActDate    || null,
+        entered_by:      ms.enteredby   || ms.EnteredBy  || null,
+        entered_on:      ms.enteredon   || ms.EnteredOn  || null,
+        synced_at:       new Date().toISOString(),
+      }, { onConflict: 'lp_job_id, mdt_id', ignoreDuplicates: false });
+    } catch (err) {
+      console.warn(`[Sync] Milestone upsert failed for job ${jobId} mdt ${mdtId}:`, err.message);
+      continue;
+    }
+
+    // Fire GHL tag when act_date populates for first time
+    const actDate = ms.actdate || ms.ActDate;
+    const justCompleted = actDate && !existing?.act_date;
+    const tagNotFired   = !existing?.ghl_tag_fired;
+
+    if (justCompleted && tagNotFired && ghlContactId) {
+      const tag = MDT_TAG_MAP[mdtId];
+      if (tag) {
+        const success = await applyGHLTag(ghlContactId, tag);
+        if (success) {
+          await supabase.from('lp_job_milestones')
+            .update({ ghl_tag_fired: true })
+            .eq('lp_job_id', jobId).eq('mdt_id', mdtId);
+          console.log(`[Sync] Milestone tag fired: ${tag} for contact ${ghlContactId}`);
+        }
+      }
+    }
+  }
+}
+
+// ─── Day 15 Handoff Check ────────────────────────────────────────
+
+async function checkDay15Handoff(lpLeadId, ghlContactId, entryDate, disposition) {
+  if (!entryDate || !ghlContactId) return;
+  // Only fire if lead is old enough and not closed
+  const daysSinceEntry = (Date.now() - new Date(entryDate).getTime()) / 86400000;
+  if (daysSinceEntry < 15) return;
+  // Don't fire for won deals
+  const closedDispositions = ['sold', 'won', 'closed'];
+  if (disposition && closedDispositions.some(d => disposition.toLowerCase().includes(d))) return;
+
+  const success = await applyGHLTag(ghlContactId, 'lp-day15-handoff');
+  if (success) {
+    await supabase.from('lp_leads')
+      .update({ lp_day15_triggered: true })
+      .eq('lp_lead_id', lpLeadId);
+    console.log(`[Sync] Day 15 handoff fired for lead ${lpLeadId}`);
+  }
+}
+
+// ─── Bulk Day 15 + Lead-Level Trigger Checks ─────────────────────
 
 async function checkDay15Handoffs() {
   try {
-    // Find leads ≥15 days old, not closed, no Day 15 tag yet, with a GHL contact
-    const fifteenDaysAgo = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString();
+    const fifteenDaysAgo = new Date(Date.now() - 15 * 86400000).toISOString();
     const { data: eligibleLeads, error } = await supabase
       .from('lp_leads')
-      .select('lp_lead_id, ghl_contact_id, first_name, last_name, created_at_lp, last_contact_date')
+      .select('lp_lead_id, ghl_contact_id, created_at_lp, last_contact_date')
       .eq('lp_day15_triggered', false)
       .eq('closed_won', false)
       .not('ghl_contact_id', 'is', null)
       .lt('created_at_lp', fifteenDaysAgo);
 
-    if (error) {
-      console.error('[Sync] Day 15 query failed:', error.message);
-      return { triggered: 0 };
-    }
+    if (error) { console.error('[Sync] Day 15 query failed:', error.message); return; }
 
     let triggered = 0;
-
     for (const lead of (eligibleLeads || [])) {
-      // Additional check: last_contact_date > 14 days ago (or null)
       if (lead.last_contact_date) {
         const lastContact = new Date(lead.last_contact_date);
-        const fourteenDaysAgo = Date.now() - 14 * 24 * 60 * 60 * 1000;
-        if (lastContact.getTime() > fourteenDaysAgo) continue;
+        if (lastContact.getTime() > Date.now() - 14 * 86400000) continue;
       }
-
       const success = await applyGHLTag(lead.ghl_contact_id, 'lp-day15-handoff');
-
       if (success) {
         await supabase.from('lp_leads')
           .update({ lp_day15_triggered: true })
           .eq('lp_lead_id', lead.lp_lead_id);
-
-        await supabase.from('lp_trigger_log').insert({
-          lp_lead_id: lead.lp_lead_id,
-          ghl_contact_id: lead.ghl_contact_id,
-          event: 'day15_handoff_auto',
-          tag_fired: 'lp-day15-handoff',
-          status: 'success',
-        });
         triggered++;
       }
     }
-
     if (triggered > 0) {
-      console.log(`[Sync] Day 15 handoff: ${triggered} leads triggered for W11.0 enrollment`);
+      console.log(`[Sync] Day 15 handoff: ${triggered} leads triggered`);
     }
-    return { triggered };
   } catch (err) {
-    console.error('[Sync] Day 15 handoff check failed:', err.message);
-    return { triggered: 0 };
+    console.error('[Sync] Day 15 check failed:', err.message);
   }
 }
 
-// ─── Lead-Level Trigger Checks ───────────────────────────────────
-
 async function checkLeadTriggers() {
   try {
-    // Check for demo_completed leads needing tag
+    // demo_completed leads needing tag
     const { data: demoLeads } = await supabase
       .from('lp_leads')
       .select('lp_lead_id, ghl_contact_id')
@@ -562,7 +524,7 @@ async function checkLeadTriggers() {
       .not('ghl_contact_id', 'is', null)
       .not('raw_lp_data->demo_tag_fired', 'eq', true);
 
-    // Check for closed_won leads needing tag
+    // closed_won leads needing tag
     const { data: wonLeads } = await supabase
       .from('lp_leads')
       .select('lp_lead_id, ghl_contact_id')
@@ -570,7 +532,6 @@ async function checkLeadTriggers() {
       .not('ghl_contact_id', 'is', null)
       .not('raw_lp_data->won_tag_fired', 'eq', true);
 
-    // These are best-effort — failures don't block sync
     for (const lead of (demoLeads || [])) {
       await applyGHLTag(lead.ghl_contact_id, 'lp-demo-completed');
     }
@@ -580,6 +541,232 @@ async function checkLeadTriggers() {
   } catch (err) {
     console.warn('[Sync] Lead trigger checks failed:', err.message);
   }
+}
+
+// ─── Full Sync — runFullSync() ───────────────────────────────────
+//
+// Pulls ALL LP leads via POST /api/Customers/GetLead with date range.
+// Pagination: StartIndex (1-based) + PageSize.
+
+export async function fullSync() {
+  console.log('[Sync] Starting FULL sync...');
+  const startedAt = new Date();
+  const stats = { processed: 0, inserted: 0, updated: 0, failed: 0, errors: [] };
+
+  // Step 0: Test LP API connection
+  try {
+    const connStatus = await testConnection();
+    console.log(`[Sync] LP API connection: auth=${connStatus.auth_status}, api=${connStatus.api_test}`);
+    if (connStatus.auth_status !== 'success') {
+      console.error('[Sync] LP API authentication FAILED — check LP_API_BASE_URL, LP_USERNAME, LP_PASSWORD, LP_CLIENT_ID, LP_APP_KEY');
+      stats.errors.push({ fatal: 'LP API auth failed', details: connStatus.errors });
+      await logSync({ sync_type: 'full', ...stats, started_at: startedAt });
+      return stats;
+    }
+  } catch (err) {
+    console.error('[Sync] LP API connection test failed:', err.message);
+    stats.errors.push({ fatal: `LP connection: ${err.message}` });
+    await logSync({ sync_type: 'full', ...stats, started_at: startedAt });
+    return stats;
+  }
+
+  try {
+    // Step 1: Sync dispositions reference
+    await syncDispositions();
+
+    // Step 1b: Enumerate sources for mapping table
+    await populateSourceMapping();
+
+    // Step 2: Paginated lead fetch via GetLead
+    let startIndex = 1; // 1-based per LP API
+    const today = new Date().toISOString().slice(0, 10);
+
+    while (true) {
+      let result;
+      try {
+        result = await getLeads({
+          startdate:  '2020-01-01',
+          enddate:    today,
+          PageSize:   PAGE_SIZE,
+          StartIndex: startIndex,
+        });
+      } catch (err) {
+        console.error(`[Sync] Failed to fetch leads at index ${startIndex}:`, err.message);
+        stats.errors.push({ start_index: startIndex, error: err.message });
+        break;
+      }
+
+      const prospects = extractArray(result);
+      if (prospects.length === 0) break;
+
+      for (const prospect of prospects) {
+        try {
+          await processProspect(prospect);
+          stats.processed++;
+          stats.inserted++;
+        } catch (err) {
+          stats.failed++;
+          const pid = prospect.cst_id || prospect.CstID || prospect.ProspectID;
+          stats.errors.push({ prospect_id: pid, error: err.message });
+          await logSyncError(pid, err);
+        }
+      }
+
+      console.log(`[Sync] Processed records ${startIndex}–${startIndex + prospects.length - 1}`);
+
+      if (prospects.length < PAGE_SIZE) break;
+      startIndex += PAGE_SIZE;
+      await sleep(RATE_LIMIT_SLEEP_MS);
+    }
+
+    // Step 3: Process milestone triggers
+    try {
+      const milestoneResult = await processMilestoneTriggers();
+      console.log(`[Sync] Milestones: ${milestoneResult.fired} tags fired`);
+    } catch (err) {
+      console.warn('[Sync] Milestone processing failed:', err.message);
+    }
+
+    // Step 4: Day 15 handoff check
+    try { await checkDay15Handoffs(); } catch (err) {
+      console.warn('[Sync] Day 15 check failed:', err.message);
+    }
+
+    // Step 5: Lead-level triggers
+    try { await checkLeadTriggers(); } catch (err) {
+      console.warn('[Sync] Lead trigger checks failed:', err.message);
+    }
+
+  } catch (err) {
+    console.error('[Sync] Full sync failed:', err.message);
+    stats.errors.push({ fatal: err.message });
+  }
+
+  const duration = Date.now() - startedAt.getTime();
+  await logSync({ sync_type: 'full', ...stats, started_at: startedAt, duration_ms: duration });
+  console.log(`[Sync] Full sync complete — ${stats.processed} processed, ${stats.failed} failed (${duration}ms)`);
+  return stats;
+}
+
+// ─── Incremental Sync — Two-Part ─────────────────────────────────
+//
+// Part 1: Changed leads via POST /api/Leads/GetLeadData (date range)
+// Part 2: Job status changes via POST /api/Customers/GetJobStatusChanges
+
+export async function incrementalSync() {
+  console.log('[Sync] Starting incremental sync...');
+  const startedAt = new Date();
+  const stats = { processed: 0, inserted: 0, updated: 0, failed: 0, errors: [] };
+
+  try {
+    const lastSyncTime = await getLastSyncTimestamp();
+    if (!lastSyncTime) {
+      console.log('[Sync] No previous sync found — running full sync instead');
+      return fullSync();
+    }
+
+    const since = lastSyncTime.toISOString().slice(0, 10);
+    const today = new Date().toISOString().slice(0, 10);
+
+    // ── Part 1: Changed leads via GetLeadData ──
+    let startIndex = 1;
+    while (true) {
+      let leads;
+      try {
+        leads = await getLeadData({
+          startdate:  since,
+          enddate:    today,
+          PageSize:   PAGE_SIZE,
+          StartIndex: startIndex,
+        });
+      } catch (err) {
+        console.error('[Sync] GetLeadData failed:', err.message);
+        stats.errors.push({ part: 'leads', error: err.message });
+        break;
+      }
+
+      const items = extractArray(leads);
+      if (items.length === 0) break;
+
+      for (const lead of items) {
+        try {
+          // Fetch full prospect record for each changed lead
+          const cstId = lead.cst_id || lead.CstID || lead.prospectid || lead.ProspectID;
+          if (cstId) {
+            const fullResult = await getLead(cstId);
+            const fullProspects = extractArray(fullResult);
+            if (fullProspects.length > 0) {
+              await processProspect(fullProspects[0]);
+              stats.processed++;
+              stats.updated++;
+            }
+          }
+        } catch (err) {
+          stats.failed++;
+          await logSyncError(lead.cst_id || lead.id, err);
+        }
+      }
+
+      if (items.length < PAGE_SIZE) break;
+      startIndex += PAGE_SIZE;
+      await sleep(RATE_LIMIT_SLEEP_MS);
+    }
+
+    // ── Part 2: Job status changes ──
+    startIndex = 1;
+    while (true) {
+      let jobs;
+      try {
+        jobs = await getJobStatusChanges({
+          startdate: since,
+          enddate:   today,
+          PageSize:  PAGE_SIZE,
+          StartIndex: startIndex,
+        });
+      } catch (err) {
+        console.error('[Sync] GetJobStatusChanges failed:', err.message);
+        stats.errors.push({ part: 'jobs', error: err.message });
+        break;
+      }
+
+      const items = extractArray(jobs);
+      if (items.length === 0) break;
+
+      for (const job of items) {
+        try {
+          await syncJobAndMilestones(job, job.lds_id || job.lp_lead_id, null);
+          stats.processed++;
+        } catch (err) {
+          stats.failed++;
+          await logSyncError(job.job_id || job.JobID, err);
+        }
+      }
+
+      if (items.length < PAGE_SIZE) break;
+      startIndex += PAGE_SIZE;
+      await sleep(RATE_LIMIT_SLEEP_MS);
+    }
+
+    // Post-sync triggers
+    try { await processMilestoneTriggers(); } catch (err) {
+      console.warn('[Sync] Milestone processing failed:', err.message);
+    }
+    try { await checkDay15Handoffs(); } catch (err) {
+      console.warn('[Sync] Day 15 check failed:', err.message);
+    }
+    try { await checkLeadTriggers(); } catch (err) {
+      console.warn('[Sync] Lead trigger checks failed:', err.message);
+    }
+
+  } catch (err) {
+    console.error('[Sync] Incremental sync failed:', err.message);
+    stats.errors.push({ fatal: err.message });
+  }
+
+  const duration = Date.now() - startedAt.getTime();
+  await logSync({ sync_type: 'incremental', ...stats, started_at: startedAt, duration_ms: duration });
+  console.log(`[Sync] Incremental sync complete — ${stats.processed} processed, ${stats.failed} failed (${duration}ms)`);
+  return stats;
 }
 
 // ─── Webhook Handler ─────────────────────────────────────────────
@@ -593,25 +780,22 @@ export async function handleWebhookEvent(event, payload) {
       case 'lead.created':
       case 'lead.updated':
       case 'lead.disposition_changed': {
-        const lead = payload.lead || payload;
-        await syncSingleLead(lead);
+        const prospect = payload.lead || payload;
+        await processProspect(prospect);
         stats.processed++;
-
-        // Run source normalization + Day 15 check inline
         await processMilestoneTriggers();
         break;
       }
 
       case 'job.status_changed': {
         const job = payload.job || payload;
-        // Re-sync the lead to pick up job changes
-        if (job.lead_id || job.lp_lead_id) {
+        const cstId = job.cst_id || job.lead_id || job.lp_lead_id;
+        if (cstId) {
           try {
-            const lead = await getLead(job.lead_id || job.lp_lead_id);
-            await syncSingleLead(lead);
-          } catch (err) {
-            stats.errors.push({ error: err.message });
-          }
+            const result = await getLead(cstId);
+            const prospects = extractArray(result);
+            if (prospects[0]) await processProspect(prospects[0]);
+          } catch (err) { stats.errors.push({ error: err.message }); }
         }
         await processMilestoneTriggers();
         stats.processed++;
@@ -620,30 +804,29 @@ export async function handleWebhookEvent(event, payload) {
 
       case 'call.logged':
       case 'note.added': {
-        const leadId = payload.lead_id || payload.lp_lead_id;
-        if (leadId) {
+        const cstId = payload.cst_id || payload.lead_id || payload.lp_lead_id;
+        if (cstId) {
           try {
-            const lead = await getLead(leadId);
-            await syncSingleLead(lead);
+            const result = await getLead(cstId);
+            const prospects = extractArray(result);
+            if (prospects[0]) await processProspect(prospects[0]);
             stats.processed++;
           } catch (err) {
             stats.failed++;
-            stats.errors.push({ lead_id: leadId, error: err.message });
+            stats.errors.push({ cst_id: cstId, error: err.message });
           }
         }
         break;
       }
 
       case 'milestone.completed': {
-        // Immediate milestone fire
-        const leadId = payload.lead_id || payload.lp_lead_id;
-        if (leadId) {
+        const cstId = payload.cst_id || payload.lead_id;
+        if (cstId) {
           try {
-            const lead = await getLead(leadId);
-            await syncSingleLead(lead);
-          } catch (err) {
-            stats.errors.push({ error: err.message });
-          }
+            const result = await getLead(cstId);
+            const prospects = extractArray(result);
+            if (prospects[0]) await processProspect(prospects[0]);
+          } catch (err) { stats.errors.push({ error: err.message }); }
         }
         await processMilestoneTriggers();
         stats.processed++;
@@ -656,10 +839,10 @@ export async function handleWebhookEvent(event, payload) {
   } catch (err) {
     stats.failed++;
     stats.errors.push({ fatal: err.message });
-    console.error(`[Webhook] Event processing failed for ${event}:`, err.message);
+    console.error(`[Webhook] Processing failed for ${event}:`, err.message);
   }
 
-  await logSync(`webhook_${event}`, stats, startTime);
+  await logSync({ sync_type: `webhook_${event}`, ...stats, started_at: startTime });
   return stats;
 }
 
@@ -675,16 +858,19 @@ export function startSyncScheduler() {
 
   console.log(`[Sync] Scheduler started — incremental sync every ${SYNC_INTERVAL_MS / 60000} minutes`);
 
-  // Run initial full sync after 5 second delay (let server boot first)
+  // Run initial sync after 5-second delay (let server boot first)
   setTimeout(async () => {
     try {
-      // Check if we've ever synced
-      const { data: lastSync } = await supabase
-        .from('lp_sync_log')
-        .select('id')
-        .limit(1)
-        .single();
+      // Pre-warm LP token
+      console.log('[Sync] Pre-warming LP token...');
+      await getToken();
+      console.log('[Sync] LP token acquired');
 
+      // Start proactive token refresh schedule
+      startTokenRefreshSchedule();
+
+      // Check if we've ever synced
+      const lastSync = await getLastSyncTimestamp();
       if (lastSync) {
         console.log('[Sync] Previous sync found — running incremental sync');
         await incrementalSync();
@@ -693,9 +879,12 @@ export function startSyncScheduler() {
         await fullSync();
       }
     } catch (err) {
-      // .single() throws when no rows — that means first run
-      console.log('[Sync] First run — starting full sync');
-      await fullSync();
+      console.error('[Sync] Initial sync failed:', err.message);
+      // If it's an auth error, log clearly
+      if (err.message.includes('Token') || err.message.includes('auth') || err.message.includes('401')) {
+        console.error('[Sync] LP authentication failed. Verify these Railway env vars:');
+        console.error('  LP_API_BASE_URL, LP_USERNAME, LP_PASSWORD, LP_CLIENT_ID, LP_APP_KEY');
+      }
     }
   }, 5000);
 
