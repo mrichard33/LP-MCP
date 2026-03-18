@@ -30,8 +30,12 @@ import { processMilestoneTriggers } from './milestones.js';
 const SYNC_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const PAGE_SIZE = 200;
 const RATE_LIMIT_SLEEP_MS = 150; // LP monitors for excessive use
+const REACTIVATION_CUTOFF = '2024-01-01T00:00:00Z'; // Bug 8: Don't trigger Day 15 for leads before this date
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Bug 2: Mutex to prevent overlapping sync processes
+let syncInProgress = false;
 
 function normalizePhone(phone) {
   if (!phone) return null;
@@ -163,22 +167,26 @@ async function getLastSyncTimestamp() {
 
 // Known source → bucket mappings. Add new entries here as Ryan classifies them.
 const DEFAULT_SOURCE_MAPPINGS = {
-  // Canvassing
-  'Canvass':            { bucket: 'canvassing',  tag: 'entry:canvassing' },
-  // Events / Shows
-  'Home Show':          { bucket: 'event',       tag: 'entry:event' },
-  'RV Show':            { bucket: 'event',       tag: 'entry:event' },
-  'Tampa Home Show':    { bucket: 'event',       tag: 'entry:event' },
-  // Internet / Digital
-  'Modernize':          { bucket: 'internet',    tag: 'entry:internet' },
-  'Lead Gurus':         { bucket: 'internet',    tag: 'entry:internet' },
-  // Affiliates / Partners
-  'Priceless':          { bucket: 'affiliate',   tag: 'entry:affiliate' },
+  // Canvassing (includes events/shows — in-person lead gen)
+  'Canvass':            { bucket: 'canvassing',          tag: 'entry:canvassing' },
+  'Home Show':          { bucket: 'canvassing',          tag: 'entry:canvassing' },
+  'RV Show':            { bucket: 'canvassing',          tag: 'entry:canvassing' },
+  'Tampa Home Show':    { bucket: 'canvassing',          tag: 'entry:canvassing' },
+  // Internet / Digital → estimate-calculator bridge
+  'Modernize':          { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
+  'Lead Gurus':         { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
+  // Affiliates / Partners → referral bridge
+  'Priceless':          { bucket: 'referral',            tag: 'entry:referral' },
   // Referrals
-  'Employee Referral':  { bucket: 'referral',    tag: 'entry:referral' },
-  'Previous Customer':  { bucket: 'referral',    tag: 'entry:referral' },
-  // Self-generated
-  'Self Generated':     { bucket: 'self-gen',    tag: 'entry:self-gen' },
+  'Employee Referral':  { bucket: 'referral',            tag: 'entry:referral' },
+  'Previous Customer':  { bucket: 'referral',            tag: 'entry:referral' },
+  // Self-generated → referral bridge
+  'Self Generated':     { bucket: 'referral',            tag: 'entry:referral' },
+  // Bug 5: Historical unmapped sources → other
+  'Old Sub Source':     { bucket: 'other',               tag: 'entry:other' },
+  'Old Source':         { bucket: 'other',               tag: 'entry:other' },
+  // Bug 6: Chatbot source
+  'Reece ChatBot':      { bucket: 'chatbot',             tag: 'entry:chatbot' },
 };
 
 async function populateSourceMapping() {
@@ -254,8 +262,28 @@ async function populateSourceMapping() {
         }
       }
     }
-    console.log(`[Sync] Source mapping: ${defaultsSeeded}/${Object.keys(DEFAULT_SOURCE_MAPPINGS).length} defaults seeded, ${inserted} sub-source skeletons ensured`);
-    return defaultsSeeded + inserted;
+    // Bug 9: Also create lp_source_raw fallback rows for each default mapping
+    // so leads with sourcesubdescr=null but matching source still resolve correctly
+    let rawFallbacks = 0;
+    for (const [sourceKey, mapping] of Object.entries(DEFAULT_SOURCE_MAPPINGS)) {
+      const { data: existingRaw } = await supabase.from('lp_source_mapping')
+        .select('id')
+        .eq('lp_source_raw', sourceKey)
+        .is('lp_source_subdetail', null)
+        .maybeSingle();
+      if (!existingRaw) {
+        const { error } = await supabase.from('lp_source_mapping').insert({
+          lp_source_subdetail: null,
+          lp_source_raw: sourceKey,
+          ghl_intent_bucket: mapping.bucket,
+          ghl_entry_tag: mapping.tag,
+        });
+        if (!error) rawFallbacks++;
+      }
+    }
+
+    console.log(`[Sync] Source mapping: ${defaultsSeeded}/${Object.keys(DEFAULT_SOURCE_MAPPINGS).length} defaults seeded, ${inserted} sub-source skeletons ensured, ${rawFallbacks} raw fallbacks added`);
+    return defaultsSeeded + inserted + rawFallbacks;
   } catch (err) {
     console.warn('[Sync] Source enumeration failed:', err.message);
     return 0;
@@ -299,6 +327,33 @@ async function syncDispositions() {
   }
 }
 
+// Bug 7: Known disposition code → human-readable label map
+const KNOWN_DISPOSITION_LABELS = {
+  'NH':  'No Home',
+  'DK':  'Door Knock - No Answer',
+  'NI':  'Not Interested',
+  'CB':  'Call Back',
+  'AP':  'Appointment Set',
+  'DM':  'Demo Completed',
+  'NS':  'No Sale',
+  'RS':  'Reschedule',
+  'SL':  'Sold',
+  'CN':  'Cancelled',
+  'NQ':  'Not Qualified',
+  'WR':  'Wrong Number',
+  'DC':  'Disconnected',
+  'BZ':  'Busy',
+  'NA':  'No Answer',
+  'AM':  'Answering Machine',
+  'LM':  'Left Message',
+  'DNC': 'Do Not Call',
+  'RF':  'Referral',
+  'HU':  'Hung Up',
+  'PI':  'Price Inquiry',
+  'CC':  'Credit Check',
+  'OT':  'Other',
+};
+
 // ─── Backfill Dispositions From Lead Data ────────────────────────
 // LP reference endpoint only returns configured dispositions (usually 2).
 // The remaining codes exist on lead records — scan and backfill.
@@ -337,7 +392,7 @@ async function backfillDispositionsFromLeads() {
       if (!existing) {
         await supabase.from('lp_dispositions').upsert({
           disposition_code: code,
-          disposition_label: code, // placeholder until manually labeled
+          disposition_label: KNOWN_DISPOSITION_LABELS[code] || code,
           synced_at: new Date().toISOString(),
         }, { onConflict: 'disposition_code' });
         added++;
@@ -643,6 +698,30 @@ async function syncCallLogs(lpLeadId, ghlContactId, calls) {
       console.warn(`[Sync] Call upsert failed for ${callId}:`, err.message);
     }
   }
+
+  // Bug 3: Update call_count and last_contact_date on parent lp_leads row
+  if (calls.length > 0) {
+    try {
+      const { count } = await supabase.from('lp_call_logs')
+        .select('*', { count: 'exact', head: true })
+        .eq('lp_lead_id', lpLeadId);
+
+      const { data: latest } = await supabase.from('lp_call_logs')
+        .select('call_date')
+        .eq('lp_lead_id', lpLeadId)
+        .not('call_date', 'is', null)
+        .order('call_date', { ascending: false })
+        .limit(1)
+        .single();
+
+      await supabase.from('lp_leads').update({
+        call_count: count || 0,
+        last_contact_date: latest?.call_date || null,
+      }).eq('lp_lead_id', lpLeadId);
+    } catch (err) {
+      console.warn(`[Sync] Failed to update call aggregates for lead ${lpLeadId}:`, err.message);
+    }
+  }
 }
 
 // ─── Notes Sync ──────────────────────────────────────────────────
@@ -810,6 +889,8 @@ async function syncJobAndMilestones(job, lpLeadId, ghlContactId) {
 
 async function checkDay15Handoff(lpLeadId, ghlContactId, entryDate, disposition) {
   if (!entryDate || !ghlContactId) return;
+  // Bug 8: Skip leads created before the reactivation cutoff
+  if (new Date(entryDate).getTime() < new Date(REACTIVATION_CUTOFF).getTime()) return;
   // Only fire if lead is old enough and not closed
   const daysSinceEntry = (Date.now() - new Date(entryDate).getTime()) / 86400000;
   if (daysSinceEntry < 15) return;
@@ -837,7 +918,8 @@ async function checkDay15Handoffs() {
       .eq('lp_day15_triggered', false)
       .eq('closed_won', false)
       .not('ghl_contact_id', 'is', null)
-      .lt('created_at_lp', fifteenDaysAgo);
+      .lt('created_at_lp', fifteenDaysAgo)
+      .gte('created_at_lp', REACTIVATION_CUTOFF); // Bug 8: Skip ancient leads
 
     if (error) { console.error('[Sync] Day 15 query failed:', error.message); return; }
 
@@ -898,6 +980,13 @@ async function checkLeadTriggers() {
 // Pagination: StartIndex (1-based) + PageSize.
 
 export async function fullSync() {
+  // Bug 2: Prevent overlapping syncs
+  if (syncInProgress) {
+    console.log('[Sync] Already running — skipped');
+    return null;
+  }
+  syncInProgress = true;
+
   console.log('[Sync] Starting FULL sync...');
   const startedAt = new Date();
   resetGHLState();
@@ -999,13 +1088,18 @@ export async function fullSync() {
       }
     }
 
-    // Complete the data-load entity logs
-    await syncLogComplete(logIds.leads,      counts.leads,      failed > 0 ? `${failed} prospects failed` : null);
-    await syncLogComplete(logIds.calls,      counts.calls);
-    await syncLogComplete(logIds.notes,      counts.notes);
-    await syncLogComplete(logIds.jobs,       counts.jobs);
-    await syncLogComplete(logIds.milestones, counts.milestones);
-    await syncLogComplete(logIds.activities, counts.activities);
+    // Bug 1: Complete data-load entity logs IMMEDIATELY after data loop
+    // so counts are recorded even if post-sync steps crash
+    try {
+      await syncLogComplete(logIds.leads,      counts.leads,      failed > 0 ? `${failed} prospects failed` : null);
+      await syncLogComplete(logIds.calls,      counts.calls);
+      await syncLogComplete(logIds.notes,      counts.notes);
+      await syncLogComplete(logIds.jobs,       counts.jobs);
+      await syncLogComplete(logIds.milestones, counts.milestones);
+      await syncLogComplete(logIds.activities, counts.activities);
+    } catch (logErr) {
+      console.error('[Sync] Failed to complete sync logs:', logErr.message);
+    }
 
     // Step 2b: Backfill dispositions from actual lead data
     await backfillDispositionsFromLeads();
@@ -1056,6 +1150,46 @@ export async function fullSync() {
       await syncLogFail(logIds.ghl_backfill, 0, err.message);
     }
 
+    // Bug 10: Propagate ghl_contact_id from lp_leads to lp_job_milestones
+    // so milestone triggers can fire for leads that were backfilled above
+    try {
+      const { data: milestonesNeedingGhl } = await supabase
+        .from('lp_job_milestones')
+        .select('lp_job_id, mdt_id, lp_lead_id')
+        .is('ghl_contact_id', null)
+        .not('lp_lead_id', 'is', null);
+
+      if (milestonesNeedingGhl && milestonesNeedingGhl.length > 0) {
+        // Get unique lead IDs and their ghl_contact_ids
+        const leadIds = [...new Set(milestonesNeedingGhl.map(m => m.lp_lead_id))];
+        const { data: leads } = await supabase
+          .from('lp_leads')
+          .select('lp_lead_id, ghl_contact_id')
+          .in('lp_lead_id', leadIds)
+          .not('ghl_contact_id', 'is', null);
+
+        if (leads && leads.length > 0) {
+          const ghlMap = Object.fromEntries(leads.map(l => [l.lp_lead_id, l.ghl_contact_id]));
+          let propagated = 0;
+          for (const ms of milestonesNeedingGhl) {
+            const ghlId = ghlMap[ms.lp_lead_id];
+            if (ghlId) {
+              await supabase.from('lp_job_milestones')
+                .update({ ghl_contact_id: ghlId })
+                .eq('lp_job_id', ms.lp_job_id)
+                .eq('mdt_id', ms.mdt_id);
+              propagated++;
+            }
+          }
+          if (propagated > 0) {
+            console.log(`[Sync] Propagated ghl_contact_id to ${propagated} milestone rows`);
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[Sync] Milestone ghl_contact_id propagation failed:', err.message);
+    }
+
     // Step 3: Process milestone triggers
     try {
       const milestoneResult = await processMilestoneTriggers();
@@ -1080,6 +1214,9 @@ export async function fullSync() {
     for (const et of ENTITY_TYPES) {
       await syncLogFail(logIds[et], counts[et] || 0, err.message).catch(() => {});
     }
+  } finally {
+    // Bug 2: Always release the mutex
+    syncInProgress = false;
   }
 
   const duration = Date.now() - startedAt.getTime();
@@ -1093,6 +1230,13 @@ export async function fullSync() {
 // Part 2: Job status changes via POST /api/Customers/GetJobStatusChanges
 
 export async function incrementalSync() {
+  // Bug 2: Prevent overlapping syncs
+  if (syncInProgress) {
+    console.log('[Sync] Already running — skipped');
+    return null;
+  }
+  syncInProgress = true;
+
   console.log('[Sync] Starting incremental sync...');
   const startedAt = new Date();
   resetGHLState();
@@ -1101,6 +1245,7 @@ export async function incrementalSync() {
     const lastSyncTime = await getLastSyncTimestamp();
     if (!lastSyncTime) {
       console.log('[Sync] No previous sync found — running full sync instead');
+      syncInProgress = false; // Release before delegating to fullSync which acquires its own
       return fullSync();
     }
 
@@ -1238,6 +1383,9 @@ export async function incrementalSync() {
   } catch (err) {
     console.error('[Sync] Incremental sync failed:', err.message);
     return { leads: 0, calls: 0, notes: 0, jobs: 0, milestones: 0, activities: 0 };
+  } finally {
+    // Bug 2: Always release the mutex
+    syncInProgress = false;
   }
 }
 
@@ -1380,3 +1528,33 @@ export function stopSyncScheduler() {
     console.log('[Sync] Scheduler stopped');
   }
 }
+
+// Bug 1: Mark any still-running sync logs as failed on process termination
+async function markRunningLogsAsFailed() {
+  try {
+    await supabase.from('lp_sync_log')
+      .update({
+        status: 'failed',
+        error_message: 'Process terminated',
+        completed_at: new Date().toISOString(),
+      })
+      .eq('status', 'running');
+    console.log('[Sync] Marked running sync logs as failed (process terminating)');
+  } catch (_) {
+    // Best-effort — process is shutting down
+  }
+}
+
+process.on('SIGTERM', async () => {
+  console.log('[Sync] SIGTERM received — cleaning up...');
+  stopSyncScheduler();
+  await markRunningLogsAsFailed();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('[Sync] SIGINT received — cleaning up...');
+  stopSyncScheduler();
+  await markRunningLogsAsFailed();
+  process.exit(0);
+});
