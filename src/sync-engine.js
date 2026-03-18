@@ -28,8 +28,8 @@ import { normalizeSourceAndTag } from './normalization.js';
 import { processMilestoneTriggers } from './milestones.js';
 
 const SYNC_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
-const PAGE_SIZE = 50;
-const RATE_LIMIT_SLEEP_MS = 300; // LP monitors for excessive use
+const PAGE_SIZE = 200;
+const RATE_LIMIT_SLEEP_MS = 150; // LP monitors for excessive use
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -187,6 +187,7 @@ async function populateSourceMapping() {
     }
 
     // Insert skeleton rows for each sub-source — gives Ryan classifiable rows
+    // Unique index is on lp_source_subdetail WHERE NOT NULL
     let inserted = 0;
     for (const s of subArr) {
       const key = s.key || s.Key || s.value || s.Value;
@@ -197,8 +198,12 @@ async function populateSourceMapping() {
         lp_source_raw: null,
         ghl_intent_bucket: defaultMap?.bucket || 'unmapped',
         ghl_entry_tag: defaultMap?.tag || 'entry:unmapped',
-      }, { onConflict: 'lp_source_subdetail,lp_source_raw', ignoreDuplicates: true });
-      if (!error) inserted++;
+      }, { onConflict: 'lp_source_subdetail', ignoreDuplicates: true });
+      if (error) {
+        console.warn(`[Sync] Source mapping upsert failed for "${key}":`, error.message);
+      } else {
+        inserted++;
+      }
     }
 
     // Also seed known defaults for unmapped sources seen in logs
@@ -209,7 +214,7 @@ async function populateSourceMapping() {
         lp_source_raw: null,
         ghl_intent_bucket: mapping.bucket,
         ghl_entry_tag: mapping.tag,
-      }, { onConflict: 'lp_source_subdetail,lp_source_raw', ignoreDuplicates: false });
+      }, { onConflict: 'lp_source_subdetail', ignoreDuplicates: false });
       if (error) {
         console.warn(`[Sync] Failed to seed default mapping "${sourceKey}":`, error.message);
       } else {
@@ -294,7 +299,7 @@ async function backfillDispositionsFromLeads() {
 
 // ─── Source Normalization — resolveSourceBucket() ─────────────────
 
-async function resolveSourceBucket(sourcesubdescr, source) {
+async function resolveSourceBucket(sourcesubdescr, source, lpLeadId) {
   // Try sourcesubdescr first (primary intent signal)
   if (sourcesubdescr) {
     const { data, error } = await supabase.from('lp_source_mapping')
@@ -319,14 +324,14 @@ async function resolveSourceBucket(sourcesubdescr, source) {
     }
   }
   // Default — log for mapping review
-  await logUnmappedSource(sourcesubdescr, source);
+  await logUnmappedSource(sourcesubdescr, source, lpLeadId);
   return { bucket: 'other', tag: 'entry:other' };
 }
 
 // Track already-logged unmapped sources to avoid log spam
 const loggedUnmappedSources = new Set();
 
-async function logUnmappedSource(sourceSubdetail, sourceRaw) {
+async function logUnmappedSource(sourceSubdetail, sourceRaw, lpLeadId) {
   try {
     if (!sourceSubdetail && !sourceRaw) return;
     const key = `${sourceSubdetail || ''}|${sourceRaw || ''}`;
@@ -335,12 +340,29 @@ async function logUnmappedSource(sourceSubdetail, sourceRaw) {
       loggedUnmappedSources.add(key);
       console.log(`[Sync] Unmapped source: subdetail="${sourceSubdetail}", raw="${sourceRaw}"`);
     }
-    await supabase.from('lp_unmapped_sources').upsert({
-      source_subdetail: sourceSubdetail || null,
-      source_raw: sourceRaw || null,
-    }, { onConflict: 'source_subdetail,source_raw' });
+    // Check if row exists — upsert with partial unique index needs care
+    const { data: existing } = await supabase.from('lp_unmapped_sources')
+      .select('id, lead_count')
+      .eq('source_subdetail', sourceSubdetail || '')
+      .eq('source_raw', sourceRaw || '')
+      .maybeSingle();
+    if (existing) {
+      await supabase.from('lp_unmapped_sources')
+        .update({
+          lead_count: (existing.lead_count || 0) + 1,
+          sample_lp_lead_id: lpLeadId || existing.sample_lp_lead_id,
+        })
+        .eq('id', existing.id);
+    } else {
+      await supabase.from('lp_unmapped_sources').insert({
+        source_subdetail: sourceSubdetail || null,
+        source_raw: sourceRaw || null,
+        lead_count: 1,
+        sample_lp_lead_id: lpLeadId || null,
+      });
+    }
   } catch (err) {
-    // Non-critical
+    // Non-critical — don't break sync for mapping analytics
   }
 }
 
@@ -399,12 +421,13 @@ async function processProspect(prospect) {
   let subCounts = { calls: 0, notes: 0, jobs: 0, milestones: 0 };
 
   for (const lead of leads) {
+    const lpLeadId = String(getField(lead, 'id', 'lds_id', 'LeadID'));
+
     const { bucket, tag } = await resolveSourceBucket(
       getField(lead, 'sourcesubdescr', 'SourceSubDescr'),
       getField(lead, 'source', 'Source'),
+      lpLeadId,
     );
-
-    const lpLeadId = String(getField(lead, 'id', 'lds_id', 'LeadID'));
     const lpProspectId = String(getField(prospect, 'cst_id', 'CstID', 'prospectid', 'ProspectID'));
 
     // 3. Check existing state
@@ -468,24 +491,23 @@ async function processProspect(prospect) {
       }
     }
 
-    // 6. Sync call logs from prospect.calls[] array
+    // 6-8. Sync sub-entities in parallel (calls, notes, activities, jobs)
     const calls = getField(prospect, 'calls', 'Calls') || [];
-    subCounts.calls += calls.length;
-    await syncCallLogs(lpLeadId, ghlId, calls);
-
-    // 7. Sync notes from prospect.notes[] + lead.notes[]
     const notes = [...(getField(prospect, 'notes', 'Notes') || []), ...(getField(lead, 'notes', 'Notes') || [])];
-    subCounts.notes += notes.length;
-    await syncNotes(lpLeadId, ghlId, notes);
-
-    // 8. Sync jobs + milestones from lead.jobs[]
     const jobs = getField(lead, 'jobs', 'Jobs') || [];
+    subCounts.calls += calls.length;
+    subCounts.notes += notes.length;
     subCounts.jobs += jobs.length;
     for (const job of jobs) {
-      const milestones = getField(job, 'milestones', 'Milestones') || [];
-      subCounts.milestones += milestones.length;
-      await syncJobAndMilestones(job, lpLeadId, ghlId);
+      subCounts.milestones += (getField(job, 'milestones', 'Milestones') || []).length;
     }
+
+    await Promise.all([
+      syncCallLogs(lpLeadId, ghlId, calls),
+      syncNotes(lpLeadId, ghlId, notes),
+      syncActivities(lpLeadId, calls, notes),
+      ...jobs.map(job => syncJobAndMilestones(job, lpLeadId, ghlId)),
+    ]);
 
     // 9. Day 15 handoff check
     if (!existing?.lp_day15_triggered && ghlId) {
@@ -591,6 +613,51 @@ async function syncNotes(lpLeadId, ghlContactId, notes) {
       }, { onConflict: 'lp_note_id' });
     } catch (err) {
       console.warn(`[Sync] Note upsert failed for ${noteId}:`, err.message);
+    }
+  }
+}
+
+// ─── Activity Sync — synthesize from calls + notes ───────────────
+
+async function syncActivities(lpLeadId, calls, notes) {
+  // Synthesize activity rows from call logs and notes
+  for (const call of calls) {
+    const callDatetime = getField(call, 'calldatetime', 'calldate', 'CallDate', 'date', 'call_date');
+    const activityId = `call-${lpLeadId}-${callDatetime || ''}-${getField(call, 'agent', 'agentname') || ''}`;
+    try {
+      await supabase.from('lp_activities').upsert({
+        lp_activity_id:  activityId,
+        lp_lead_id:      lpLeadId,
+        activity_type:   'call',
+        activity_detail: getField(call, 'resultdescr', 'resultcode', 'ResultCode', 'result') || 'Call logged',
+        rep_id:          getField(call, 'agent', 'emp_id', 'EmpID', 'empid', 'rep_id'),
+        rep_name:        getField(call, 'agentname', 'AgentName', 'rep_name', 'agent_name'),
+        activity_date:   callDatetime,
+        synced_at:       new Date().toISOString(),
+        raw_lp_data:     call,
+      }, { onConflict: 'lp_activity_id' });
+    } catch (err) {
+      // Non-critical — call_logs table is the source of truth
+    }
+  }
+
+  for (const note of notes) {
+    const noteDate = getField(note, 'date', 'Date', 'enteredon', 'EnteredOn', 'created_at');
+    const noteId = `note-${lpLeadId}-${noteDate || ''}-${getField(note, 'enteredby', 'EnteredBy') || ''}`;
+    try {
+      await supabase.from('lp_activities').upsert({
+        lp_activity_id:  noteId,
+        lp_lead_id:      lpLeadId,
+        activity_type:   getField(note, 'rectype', 'RecType', 'type', 'note_type') || 'note',
+        activity_detail: (getField(note, 'note', 'notes', 'Notes', 'body', 'text') || '').slice(0, 500),
+        rep_id:          null,
+        rep_name:        getField(note, 'enteredby', 'EnteredBy', 'rep_name', 'entered_by'),
+        activity_date:   noteDate,
+        synced_at:       new Date().toISOString(),
+        raw_lp_data:     note,
+      }, { onConflict: 'lp_activity_id' });
+    } catch (err) {
+      // Non-critical — notes table is the source of truth
     }
   }
 }
