@@ -1350,7 +1350,7 @@ export async function fullSync() {
 
         console.log(`[Sync P1] [${year}] Page ${Math.ceil(startIndex / PAGE_SIZE)}: ${prospects.length} prospects fetched (${counts.leads} leads total)`);
 
-        startIndex += prospects.length;
+        startIndex += PAGE_SIZE;
         await sleep(RATE_LIMIT_SLEEP_MS);
       }
 
@@ -1371,8 +1371,13 @@ export async function fullSync() {
     }
 
     // Bug 1: Complete leads log IMMEDIATELY after Pass 1
+    // Individual errors are already logged via logSyncError() — don't mark
+    // the entire entity as "failed" when most records succeeded.
+    if (failed > 0) {
+      console.warn(`[Sync P1] ${failed} prospects had errors (${counts.leads} succeeded)`);
+    }
     try {
-      await syncLogComplete(logIds.leads, counts.leads, failed > 0 ? `${failed} prospects failed` : null);
+      await syncLogComplete(logIds.leads, counts.leads, null);
     } catch (logErr) {
       console.error('[Sync] Failed to complete leads sync log:', logErr.message);
     }
@@ -1617,7 +1622,7 @@ export async function incrementalSync() {
         syncLogProgress(logIds.activities, counts.activities),
       ]);
 
-      startIndex += items.length;
+      startIndex += PAGE_SIZE;
       await sleep(RATE_LIMIT_SLEEP_MS);
     }
 
@@ -1657,7 +1662,7 @@ export async function incrementalSync() {
         syncLogProgress(logIds.milestones, counts.milestones),
       ]);
 
-      startIndex += items.length;
+      startIndex += PAGE_SIZE;
       await sleep(RATE_LIMIT_SLEEP_MS);
     }
 
