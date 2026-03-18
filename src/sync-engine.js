@@ -489,11 +489,86 @@ const MDT_TAG_MAP = {
   B: 'lp-milestone-insp-passed',  X: 'lp-milestone-snap-trim',
 };
 
+// ─── Pass 1 Helper — upsertLeadOnly() ─────────────────────────────
+//
+// Extracts ONLY the lead upsert from processProspect(). Used during
+// fullSync Pass 1 to commit every lp_leads row before child records
+// are processed in Pass 2. This eliminates foreign key race conditions.
+
+async function upsertLeadOnly(prospect) {
+  const leads = getField(prospect, 'leads', 'Leads') || [];
+  if (leads.length === 0) {
+    // Flat data — upsert as-is (same as processProspect fallback)
+    await upsertLeadFromFlat(prospect, null);
+    return 1;
+  }
+
+  let count = 0;
+  for (const lead of leads) {
+    const lpLeadId = String(getField(lead, 'id', 'lds_id', 'LeadID'));
+    const lpProspectId = String(getField(prospect, 'cst_id', 'CstID', 'prospectid', 'ProspectID'));
+
+    const { bucket, tag } = await resolveSourceBucket(
+      getField(lead, 'sourcesubdescr', 'SourceSubDescr'),
+      getField(lead, 'source', 'Source'),
+      lpLeadId,
+    );
+
+    const apptSet = getField(lead, 'apptset', 'ApptSet');
+    const sat = getField(lead, 'sat', 'Sat');
+    const sold = getField(lead, 'sold', 'Sold');
+    const isApptSet = apptSet === 'true' || apptSet === true;
+    const isDemoCompleted = sat === 'true' || sat === true;
+    const isClosedWon = sold === 'true' || sold === true;
+
+    const { error: upsertErr } = await supabase.from('lp_leads').upsert({
+      lp_lead_id:         lpLeadId,
+      lp_prospect_id:     lpProspectId,
+      ghl_contact_id:     null, // GHL matching deferred to Pass 2 / backfill
+      first_name:         getField(prospect, 'firstname', 'FirstName', 'first_name'),
+      last_name:          getField(prospect, 'lastname', 'LastName', 'last_name'),
+      email:              getField(prospect, 'email', 'Email'),
+      phone:              normalizePhone(getField(prospect, 'phone1', 'Phone1', 'phone')),
+      phone_alt:          normalizePhone(prospect.altphones?.[0]?.phone || getField(prospect, 'Phone2', 'phone2')),
+      address:            getField(prospect, 'address1', 'Address1'),
+      city:               getField(prospect, 'city', 'City'),
+      state:              getField(prospect, 'state', 'State'),
+      zip:                getField(prospect, 'zip', 'Zip'),
+      lead_source:        getField(lead, 'source', 'Source'),
+      lead_source_detail: getField(lead, 'sourcesubdescr', 'SourceSubDescr'),
+      promoter_name:      getField(lead, 'promotername', 'PromoterName'),
+      ghl_intent_bucket:  bucket,
+      ghl_entry_tag:      tag,
+      disposition_code:   getField(lead, 'disposition', 'Disposition'),
+      rep_name:           getField(lead, 'salesrepname', 'SalesRepName'),
+      appointment_set:    isApptSet,
+      appointment_date:   getField(lead, 'apptdate', 'ApptDate'),
+      demo_completed:     isDemoCompleted,
+      demo_date:          isDemoCompleted ? getField(lead, 'apptdate', 'ApptDate') : null,
+      closed_won:         isClosedWon,
+      job_value:          parseFloat(getField(lead, 'gsa', 'GSA', 'grossamount', 'GrossAmount') || 0) || null,
+      created_at_lp:      getField(lead, 'entrydate', 'EntryDate'),
+      updated_at_lp:      getField(lead, 'lastchangedon', 'LastChangedOn'),
+      synced_at:          new Date().toISOString(),
+      raw_lp_data:        prospect,
+    }, { onConflict: 'lp_lead_id' });
+
+    if (upsertErr) {
+      throw new Error(`Lead upsert failed for ${lpLeadId}: ${upsertErr.message}`);
+    }
+    count++;
+  }
+  return count;
+}
+
 // ─── Per-Prospect Processing — processProspect() ─────────────────
 //
 // The LP GetLead response nests everything under a prospect record:
 // contact info at top level, leads[] array inside, each lead has jobs[]
 // with milestones[] inside.
+//
+// Used by incrementalSync and webhook handlers (single-pass is safe
+// because lp_leads is already populated after the first full sync).
 
 async function processProspect(prospect, { skipGHL = false } = {}) {
   // Log prospect keys once for diagnostic purposes
@@ -662,6 +737,130 @@ async function upsertLeadFromFlat(lp, ghlId) {
     synced_at:          new Date().toISOString(),
     raw_lp_data:        lp,
   }, { onConflict: 'lp_lead_id' });
+}
+
+// ─── Pass 2 — syncAllChildRecords() ──────────────────────────────
+//
+// Reads committed lead rows from lp_leads (Pass 1 guaranteed they exist),
+// fetches the full LP prospect for each, and syncs all child tables:
+// calls, notes, activities, jobs, milestones, GHL tags, Day 15.
+//
+// Because every lp_leads row is already committed, there is zero risk
+// of foreign key violations on child record inserts.
+
+async function syncAllChildRecords(logIds, counts) {
+  let offset = 0;
+  const pageSize = 100;
+  let totalProcessed = 0;
+
+  while (true) {
+    const { data: leads, error } = await supabase
+      .from('lp_leads')
+      .select('lp_lead_id, lp_prospect_id, ghl_contact_id, ghl_tag_applied, ghl_entry_tag, lp_day15_triggered, created_at_lp')
+      .range(offset, offset + pageSize - 1)
+      .order('created_at_lp', { ascending: false });
+
+    if (error) throw error;
+    if (!leads || leads.length === 0) break;
+
+    for (const lead of leads) {
+      try {
+        // Fetch full LP record for this prospect
+        const result = await getLead(lead.lp_prospect_id);
+        const prospects = extractArray(result);
+        if (!prospects[0]) continue;
+        const prospect = prospects[0];
+
+        // Match to GHL contact
+        const ghlId = lead.ghl_contact_id || await (async () => {
+          try {
+            return await matchToGHL({
+              phone: normalizePhone(getField(prospect, 'phone1', 'Phone1', 'phone', 'Phone')),
+              phone_alt: normalizePhone(prospect.altphones?.[0]?.phone || getField(prospect, 'Phone2', 'phone2', 'phone_alt')),
+              email: getField(prospect, 'email', 'Email'),
+            });
+          } catch (_) { return null; }
+        })();
+
+        // Apply GHL entry tag (once, additive)
+        if (ghlId && !lead.ghl_tag_applied && lead.ghl_entry_tag) {
+          const success = await applyGHLTag(ghlId, lead.ghl_entry_tag);
+          if (success) {
+            await supabase.from('lp_leads')
+              .update({ ghl_contact_id: ghlId, ghl_tag_applied: true })
+              .eq('lp_lead_id', lead.lp_lead_id);
+          }
+        } else if (ghlId && !lead.ghl_contact_id) {
+          // Store GHL match even if no tag to apply
+          await supabase.from('lp_leads')
+            .update({ ghl_contact_id: ghlId })
+            .eq('lp_lead_id', lead.lp_lead_id);
+        }
+
+        // Sync child records for each lead under this prospect
+        const prospectLeads = getField(prospect, 'leads', 'Leads') || [];
+        const calls = getField(prospect, 'calls', 'Calls') || [];
+
+        for (const lpLead of prospectLeads) {
+          const lpLeadId = String(getField(lpLead, 'id', 'lds_id', 'LeadID'));
+          const notes = [...(getField(prospect, 'notes', 'Notes') || []), ...(getField(lpLead, 'notes', 'Notes') || [])];
+          const jobs = getField(lpLead, 'jobs', 'Jobs') || [];
+
+          // Sync calls, notes, activities in parallel
+          await Promise.all([
+            syncCallLogs(lpLeadId, ghlId, calls),
+            syncNotes(lpLeadId, ghlId, notes),
+            syncActivities(lpLeadId, calls, notes),
+            ...jobs.map(job => syncJobAndMilestones(job, lpLeadId, ghlId)),
+          ]);
+
+          counts.calls      += calls.length;
+          counts.notes      += notes.length;
+          counts.jobs       += jobs.length;
+          for (const job of jobs) {
+            counts.milestones += (getField(job, 'milestones', 'Milestones') || []).length;
+          }
+          counts.activities += calls.length + notes.length;
+        }
+
+        // Day 15 handoff check
+        if (!lead.lp_day15_triggered && ghlId) {
+          const firstLead = prospectLeads[0];
+          if (firstLead) {
+            await checkDay15Handoff(
+              lead.lp_lead_id, ghlId,
+              getField(firstLead, 'entrydate', 'EntryDate'),
+              getField(firstLead, 'disposition', 'Disposition'),
+            );
+          }
+        }
+
+        totalProcessed++;
+      } catch (err) {
+        console.error(`[Sync P2] Failed lead ${lead.lp_lead_id}:`, err.message);
+        await logSyncError(lead.lp_lead_id, err);
+      }
+
+      await sleep(200); // rate limit buffer between LP calls
+    }
+
+    // Flush progress after each page
+    if (logIds) {
+      await Promise.all([
+        syncLogProgress(logIds.calls,      counts.calls),
+        syncLogProgress(logIds.notes,      counts.notes),
+        syncLogProgress(logIds.jobs,       counts.jobs),
+        syncLogProgress(logIds.milestones, counts.milestones),
+        syncLogProgress(logIds.activities, counts.activities),
+      ]);
+    }
+
+    console.log(`[Sync P2] Processed ${totalProcessed} contacts (offset ${offset})`);
+    offset += pageSize;
+  }
+
+  console.log(`[Sync P2] Done — ${totalProcessed} contacts fully processed`);
+  return totalProcessed;
 }
 
 // ─── Call Log Sync ───────────────────────────────────────────────
@@ -1021,7 +1220,12 @@ export async function fullSync() {
     const srcCount = await populateSourceMapping();
     await syncLogComplete(logIds.sources, srcCount);
 
-    // Step 2: Paginated lead fetch via GetLead
+    // ── PASS 1 — Load all contacts into lp_leads ──────────────────
+    // Only upserts lp_leads rows. No calls, notes, jobs, or milestones.
+    // This ensures every parent row is committed before Pass 2 inserts
+    // child records, eliminating foreign key race conditions.
+    console.log('[Sync] PASS 1 — Loading all contacts into lp_leads...');
+
     const today = new Date();
     const START_YEAR = 2015;
     const currentYear = today.getFullYear();
@@ -1032,7 +1236,7 @@ export async function fullSync() {
         ? today.toISOString().slice(0, 10)
         : `${year}-12-31`;
 
-      console.log(`[Sync] Fetching leads for ${windowStart} to ${windowEnd}...`);
+      console.log(`[Sync P1] Fetching leads for ${windowStart} to ${windowEnd}...`);
       let startIndex = 1;
 
       while (true) {
@@ -1045,7 +1249,7 @@ export async function fullSync() {
             StartIndex: startIndex,
           });
         } catch (err) {
-          console.error(`[Sync] Failed to fetch leads (${windowStart}, index ${startIndex}):`, err.message);
+          console.error(`[Sync P1] Failed to fetch leads (${windowStart}, index ${startIndex}):`, err.message);
           break;
         }
 
@@ -1054,15 +1258,8 @@ export async function fullSync() {
 
         for (const prospect of prospects) {
           try {
-            const sub = await processProspect(prospect, { skipGHL: true });
-            counts.leads++;
-            if (sub) {
-              counts.calls      += sub.calls;
-              counts.notes      += sub.notes;
-              counts.jobs       += sub.jobs;
-              counts.milestones += sub.milestones;
-              counts.activities += sub.calls + sub.notes;
-            }
+            const leadCount = await upsertLeadOnly(prospect);
+            counts.leads += leadCount;
           } catch (err) {
             failed++;
             const pid = prospect.cst_id || prospect.CstID || prospect.ProspectID;
@@ -1070,17 +1267,10 @@ export async function fullSync() {
           }
         }
 
-        // Flush live progress for each entity after every page
-        await Promise.all([
-          syncLogProgress(logIds.leads,      counts.leads),
-          syncLogProgress(logIds.calls,      counts.calls),
-          syncLogProgress(logIds.notes,      counts.notes),
-          syncLogProgress(logIds.jobs,       counts.jobs),
-          syncLogProgress(logIds.milestones, counts.milestones),
-          syncLogProgress(logIds.activities, counts.activities),
-        ]);
+        // Flush live progress for leads after every page
+        await syncLogProgress(logIds.leads, counts.leads);
 
-        console.log(`[Sync] [${year}] Processed ${startIndex}–${startIndex + prospects.length - 1} (${counts.leads} leads, ${counts.calls} calls, ${counts.notes} notes, ${counts.jobs} jobs)`);
+        console.log(`[Sync P1] [${year}] Loaded records ${startIndex}–${startIndex + prospects.length - 1} (${counts.leads} leads total)`);
 
         if (prospects.length < PAGE_SIZE) break;
         startIndex += PAGE_SIZE;
@@ -1088,23 +1278,41 @@ export async function fullSync() {
       }
     }
 
-    // Bug 1: Complete data-load entity logs IMMEDIATELY after data loop
-    // so counts are recorded even if post-sync steps crash
+    // Bug 1: Complete leads log IMMEDIATELY after Pass 1
     try {
-      await syncLogComplete(logIds.leads,      counts.leads,      failed > 0 ? `${failed} prospects failed` : null);
+      await syncLogComplete(logIds.leads, counts.leads, failed > 0 ? `${failed} prospects failed` : null);
+    } catch (logErr) {
+      console.error('[Sync] Failed to complete leads sync log:', logErr.message);
+    }
+
+    console.log(`[Sync] PASS 1 complete — ${counts.leads} lead rows committed to lp_leads`);
+
+    // Step 2b: Backfill dispositions from actual lead data
+    await backfillDispositionsFromLeads();
+
+    // ── PASS 2 — Load calls, notes, jobs, milestones ────────────
+    // Reads from lp_leads (guaranteed committed by Pass 1), fetches
+    // full LP records, and processes all child tables.
+    console.log('[Sync] PASS 2 — Loading calls, notes, jobs, milestones...');
+
+    try {
+      await syncAllChildRecords(logIds, counts);
+    } catch (err) {
+      console.error('[Sync P2] Child record sync failed:', err.message);
+    }
+
+    // Complete child entity logs
+    try {
       await syncLogComplete(logIds.calls,      counts.calls);
       await syncLogComplete(logIds.notes,      counts.notes);
       await syncLogComplete(logIds.jobs,       counts.jobs);
       await syncLogComplete(logIds.milestones, counts.milestones);
       await syncLogComplete(logIds.activities, counts.activities);
     } catch (logErr) {
-      console.error('[Sync] Failed to complete sync logs:', logErr.message);
+      console.error('[Sync] Failed to complete child sync logs:', logErr.message);
     }
 
-    // Step 2b: Backfill dispositions from actual lead data
-    await backfillDispositionsFromLeads();
-
-    console.log(`[Sync] Data load complete — ${counts.leads} leads, ${counts.calls} calls, ${counts.notes} notes, ${counts.jobs} jobs, ${counts.milestones} milestones`);
+    console.log(`[Sync] PASS 2 complete — ${counts.calls} calls, ${counts.notes} notes, ${counts.jobs} jobs, ${counts.milestones} milestones`);
 
     // Step 2c: GHL backfill — match leads to GHL contacts and apply entry tags
     try {
