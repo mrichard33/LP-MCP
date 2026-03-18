@@ -186,39 +186,57 @@ async function populateSourceMapping() {
       console.log('[Sync] Parent source sample:', JSON.stringify(srcArr.slice(0, 5)));
     }
 
-    // Insert skeleton rows for each sub-source — gives Ryan classifiable rows
-    // Unique index is on lp_source_subdetail WHERE NOT NULL
+    // Insert skeleton rows — PostgREST can't use partial unique indexes for upsert,
+    // so we do select→insert/update manually.
     let inserted = 0;
     for (const s of subArr) {
       const key = s.key || s.Key || s.value || s.Value;
       if (!key) continue;
       const defaultMap = DEFAULT_SOURCE_MAPPINGS[key];
-      const { error } = await supabase.from('lp_source_mapping').upsert({
-        lp_source_subdetail: key,
-        lp_source_raw: null,
-        ghl_intent_bucket: defaultMap?.bucket || 'unmapped',
-        ghl_entry_tag: defaultMap?.tag || 'entry:unmapped',
-      }, { onConflict: 'lp_source_subdetail', ignoreDuplicates: true });
-      if (error) {
-        console.warn(`[Sync] Source mapping upsert failed for "${key}":`, error.message);
-      } else {
-        inserted++;
+      const { data: existing } = await supabase.from('lp_source_mapping')
+        .select('id')
+        .eq('lp_source_subdetail', key)
+        .maybeSingle();
+      if (!existing) {
+        const { error } = await supabase.from('lp_source_mapping').insert({
+          lp_source_subdetail: key,
+          lp_source_raw: null,
+          ghl_intent_bucket: defaultMap?.bucket || 'unmapped',
+          ghl_entry_tag: defaultMap?.tag || 'entry:unmapped',
+        });
+        if (error) {
+          console.warn(`[Sync] Source mapping insert failed for "${key}":`, error.message);
+        } else {
+          inserted++;
+        }
       }
     }
 
     // Also seed known defaults for unmapped sources seen in logs
     let defaultsSeeded = 0;
     for (const [sourceKey, mapping] of Object.entries(DEFAULT_SOURCE_MAPPINGS)) {
-      const { error } = await supabase.from('lp_source_mapping').upsert({
-        lp_source_subdetail: sourceKey,
-        lp_source_raw: null,
-        ghl_intent_bucket: mapping.bucket,
-        ghl_entry_tag: mapping.tag,
-      }, { onConflict: 'lp_source_subdetail', ignoreDuplicates: false });
-      if (error) {
-        console.warn(`[Sync] Failed to seed default mapping "${sourceKey}":`, error.message);
-      } else {
+      const { data: existing } = await supabase.from('lp_source_mapping')
+        .select('id')
+        .eq('lp_source_subdetail', sourceKey)
+        .maybeSingle();
+      if (existing) {
+        // Update existing row with latest mapping
+        await supabase.from('lp_source_mapping')
+          .update({ ghl_intent_bucket: mapping.bucket, ghl_entry_tag: mapping.tag, updated_at: new Date().toISOString() })
+          .eq('id', existing.id);
         defaultsSeeded++;
+      } else {
+        const { error } = await supabase.from('lp_source_mapping').insert({
+          lp_source_subdetail: sourceKey,
+          lp_source_raw: null,
+          ghl_intent_bucket: mapping.bucket,
+          ghl_entry_tag: mapping.tag,
+        });
+        if (error) {
+          console.warn(`[Sync] Failed to seed default mapping "${sourceKey}":`, error.message);
+        } else {
+          defaultsSeeded++;
+        }
       }
     }
     console.log(`[Sync] Source mapping: ${defaultsSeeded}/${Object.keys(DEFAULT_SOURCE_MAPPINGS).length} defaults seeded, ${inserted} sub-source skeletons ensured`);
