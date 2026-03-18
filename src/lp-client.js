@@ -1,7 +1,7 @@
 import axios from 'axios';
 
 const LP_API_KEY = process.env.LP_API_KEY;
-const LP_API_BASE_URL = process.env.LP_API_BASE_URL;
+const LP_API_BASE_URL = (process.env.LP_API_BASE_URL || '').replace(/\/+$/, '');
 
 const lpClient = axios.create({
   baseURL: LP_API_BASE_URL,

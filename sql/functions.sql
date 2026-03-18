@@ -61,7 +61,7 @@ RETURNS TABLE (
     ROUND(AVG(l.days_to_demo) FILTER (WHERE l.demo_completed), 1) AS avg_days_to_demo,
     MIN(l.days_to_demo) FILTER (WHERE l.demo_completed) AS min_days_to_demo,
     MAX(l.days_to_demo) FILTER (WHERE l.demo_completed) AS max_days_to_demo,
-    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY l.days_to_demo) FILTER (WHERE l.demo_completed), 1) AS median_days_to_demo
+    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY l.days_to_demo) FILTER (WHERE l.demo_completed)::numeric, 1) AS median_days_to_demo
   FROM lp_leads l
   LEFT JOIN lp_source_mapping m
     ON (m.lp_source_subdetail = l.lead_source_detail AND m.lp_source_subdetail IS NOT NULL)
