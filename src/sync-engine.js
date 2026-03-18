@@ -185,8 +185,8 @@ const DEFAULT_SOURCE_MAPPINGS = {
   // Bug 5: Historical unmapped sources → other
   'Old Sub Source':     { bucket: 'other',               tag: 'entry:other' },
   'Old Source':         { bucket: 'other',               tag: 'entry:other' },
-  // Chatbot / website → estimate-calculator bridge
-  'Reece ChatBot':      { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
+  // Chatbot / website
+  'Reece ChatBot':      { bucket: 'chatbot',             tag: 'entry:chatbot' },
   // Internet lead gen / marketplaces → estimate-calculator bridge
   'HomeBuddy':          { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
   'Socius Marketing':   { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
