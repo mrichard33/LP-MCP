@@ -118,11 +118,22 @@ async function getLastSyncTimestamp() {
 
 // Known source → bucket mappings. Add new entries here as Ryan classifies them.
 const DEFAULT_SOURCE_MAPPINGS = {
-  'Canvass':       { bucket: 'canvassing',  tag: 'entry:canvassing' },
-  'Home Show':     { bucket: 'event',       tag: 'entry:event' },
-  'RV Show':       { bucket: 'event',       tag: 'entry:event' },
-  'Modernize':     { bucket: 'internet',    tag: 'entry:internet' },
-  'Priceless':     { bucket: 'affiliate',   tag: 'entry:affiliate' },
+  // Canvassing
+  'Canvass':            { bucket: 'canvassing',  tag: 'entry:canvassing' },
+  // Events / Shows
+  'Home Show':          { bucket: 'event',       tag: 'entry:event' },
+  'RV Show':            { bucket: 'event',       tag: 'entry:event' },
+  'Tampa Home Show':    { bucket: 'event',       tag: 'entry:event' },
+  // Internet / Digital
+  'Modernize':          { bucket: 'internet',    tag: 'entry:internet' },
+  'Lead Gurus':         { bucket: 'internet',    tag: 'entry:internet' },
+  // Affiliates / Partners
+  'Priceless':          { bucket: 'affiliate',   tag: 'entry:affiliate' },
+  // Referrals
+  'Employee Referral':  { bucket: 'referral',    tag: 'entry:referral' },
+  'Previous Customer':  { bucket: 'referral',    tag: 'entry:referral' },
+  // Self-generated
+  'Self Generated':     { bucket: 'self-gen',    tag: 'entry:self-gen' },
 };
 
 async function populateSourceMapping() {
@@ -150,14 +161,13 @@ async function populateSourceMapping() {
     for (const s of subArr) {
       const key = s.key || s.Key || s.value || s.Value;
       if (!key) continue;
-      // Check if a known default mapping exists
       const defaultMap = DEFAULT_SOURCE_MAPPINGS[key];
       const { error } = await supabase.from('lp_source_mapping').upsert({
         lp_source_subdetail: key,
         lp_source_raw: null,
         ghl_intent_bucket: defaultMap?.bucket || 'unmapped',
         ghl_entry_tag: defaultMap?.tag || 'entry:unmapped',
-      }, { onConflict: 'lp_source_subdetail,lp_source_raw', ignoreDuplicates: true }).catch(() => ({}));
+      }, { onConflict: 'lp_source_subdetail,lp_source_raw', ignoreDuplicates: true });
       if (!error) inserted++;
     }
 
@@ -168,7 +178,7 @@ async function populateSourceMapping() {
         lp_source_raw: null,
         ghl_intent_bucket: mapping.bucket,
         ghl_entry_tag: mapping.tag,
-      }, { onConflict: 'lp_source_subdetail,lp_source_raw', ignoreDuplicates: false }).catch(() => {});
+      }, { onConflict: 'lp_source_subdetail,lp_source_raw', ignoreDuplicates: false });
     }
 
     if (inserted > 0) console.log(`[Sync] Source mapping: ${inserted} skeleton rows ensured`);
@@ -485,19 +495,22 @@ async function syncCallLogs(lpLeadId, ghlContactId, calls) {
   }
 
   for (const call of calls) {
-    const callId = String(getField(call, 'id', 'call_id', 'CallID') || `${lpLeadId}-${getField(call, 'calldate', 'CallDate', 'date') || Math.random()}`);
+    // LP call keys: calldatetime, phone, resultcode, resultdescr, calltype, calltypedescr, agent, agentname
+    // No id field — generate from lead + datetime + agent
+    const callDatetime = getField(call, 'calldatetime', 'calldate', 'CallDate', 'date', 'call_date');
+    const callId = String(getField(call, 'id', 'call_id', 'CallID') || `${lpLeadId}-${callDatetime || ''}-${getField(call, 'agent', 'agentname') || Math.random()}`);
     try {
       await supabase.from('lp_call_logs').upsert({
         lp_call_id:        callId,
         lp_lead_id:        lpLeadId,
         ghl_contact_id:    ghlContactId || null,
-        call_date:         getField(call, 'calldate', 'CallDate', 'date', 'call_date'),
+        call_date:         callDatetime,
         call_duration_sec: getField(call, 'duration', 'Duration', 'call_duration', 'callduration'),
-        call_result:       getField(call, 'resultcode', 'ResultCode', 'result', 'callresult', 'CallResult'),
-        call_direction:    getField(call, 'calltype', 'CallType', 'direction', 'call_direction'),
-        rep_id:            getField(call, 'emp_id', 'EmpID', 'empid', 'rep_id'),
+        call_result:       getField(call, 'resultcode', 'ResultCode', 'resultdescr', 'result'),
+        call_direction:    getField(call, 'calltype', 'CallType', 'calltypedescr', 'direction'),
+        rep_id:            getField(call, 'agent', 'emp_id', 'EmpID', 'empid', 'rep_id'),
         rep_name:          getField(call, 'agentname', 'AgentName', 'rep_name', 'agent_name'),
-        call_notes:        getField(call, 'notes', 'Notes', 'call_notes', 'CallNotes'),
+        call_notes:        getField(call, 'notes', 'Notes', 'note', 'call_notes', 'CallNotes'),
         recording_url:     getField(call, 'recording_url', 'RecordingURL', 'recordingurl', 'recording'),
         synced_at:         new Date().toISOString(),
         raw_lp_data:       call,
@@ -524,7 +537,7 @@ async function syncNotes(lpLeadId, ghlContactId, notes) {
         lp_note_id:          noteId,
         lp_lead_id:          lpLeadId,
         ghl_contact_id:      ghlContactId || null,
-        note_body:           getField(note, 'notes', 'Notes', 'body', 'text', 'note_body', 'NoteBody', 'content', 'Content'),
+        note_body:           getField(note, 'note', 'notes', 'Notes', 'body', 'text', 'note_body', 'NoteBody', 'content', 'Content'),
         note_type:           getField(note, 'rectype', 'RecType', 'type', 'note_type'),
         note_category:       getField(note, 'category', 'Category'),
         created_by_rep_name: getField(note, 'enteredby', 'EnteredBy', 'rep_name', 'entered_by'),
