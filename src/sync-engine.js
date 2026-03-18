@@ -75,20 +75,49 @@ function extractArray(response) {
 
 // ─── Sync Log ────────────────────────────────────────────────────
 
+// Write a "started" row and return its id so we can update it on completion
+async function logSyncStart(syncType) {
+  try {
+    const { data, error } = await supabase.from('lp_sync_log').insert({
+      sync_type:         syncType,
+      records_processed: 0,
+      records_inserted:  0,
+      records_updated:   0,
+      records_failed:    0,
+      started_at:        new Date().toISOString(),
+      // completed_at left null = still running
+    }).select('id').single();
+    if (error) throw error;
+    return data?.id;
+  } catch (err) {
+    console.error('[Sync] Failed to write sync-start log:', err.message);
+    return null;
+  }
+}
+
+// Update the existing row on completion (or insert if we lost the id)
 async function logSync(opts) {
   const completed = new Date();
+  const row = {
+    sync_type:         opts.sync_type,
+    records_processed: opts.processed  ?? opts.records_processed ?? 0,
+    records_inserted:  opts.inserted   ?? opts.records_inserted  ?? 0,
+    records_updated:   opts.updated    ?? opts.records_updated   ?? 0,
+    records_failed:    opts.failed     ?? opts.records_failed    ?? 0,
+    error_details:     opts.errors?.length > 0 ? opts.errors : null,
+    started_at:        opts.started_at instanceof Date ? opts.started_at.toISOString() : opts.started_at,
+    completed_at:      completed.toISOString(),
+    duration_ms:       opts.duration_ms || (completed - opts.started_at),
+  };
   try {
-    await supabase.from('lp_sync_log').insert({
-      sync_type:         opts.sync_type,
-      records_processed: opts.records_processed || 0,
-      records_inserted:  opts.records_inserted  || 0,
-      records_updated:   opts.records_updated   || 0,
-      records_failed:    opts.records_failed    || 0,
-      error_details:     opts.errors?.length > 0 ? opts.errors : null,
-      started_at:        opts.started_at.toISOString(),
-      completed_at:      completed.toISOString(),
-      duration_ms:       opts.duration_ms || (completed - opts.started_at),
-    });
+    if (opts.log_id) {
+      // Update the "started" row we created earlier
+      const { error } = await supabase.from('lp_sync_log').update(row).eq('id', opts.log_id);
+      if (error) throw error;
+    } else {
+      // Fallback: insert a new row (no start row was created)
+      await supabase.from('lp_sync_log').insert(row);
+    }
   } catch (err) {
     console.error('[Sync] Failed to write sync log:', err.message);
   }
@@ -103,10 +132,11 @@ async function getLastSyncTimestamp() {
     const { data } = await supabase
       .from('lp_sync_log')
       .select('completed_at')
+      .not('completed_at', 'is', null)         // Skip "started but still running" rows
       .gt('records_processed', 0)              // Ignore 0-record syncs (failed v4 runs)
       .order('completed_at', { ascending: false })
       .limit(1)
-      .maybeSingle();                          // Returns null on 0 rows instead of throwing
+      .maybeSingle();
     return data?.completed_at ? new Date(data.completed_at) : null;
   } catch (err) {
     console.error('[Sync] Failed to read sync log:', err.message);
@@ -172,16 +202,21 @@ async function populateSourceMapping() {
     }
 
     // Also seed known defaults for unmapped sources seen in logs
+    let defaultsSeeded = 0;
     for (const [sourceKey, mapping] of Object.entries(DEFAULT_SOURCE_MAPPINGS)) {
-      await supabase.from('lp_source_mapping').upsert({
+      const { error } = await supabase.from('lp_source_mapping').upsert({
         lp_source_subdetail: sourceKey,
         lp_source_raw: null,
         ghl_intent_bucket: mapping.bucket,
         ghl_entry_tag: mapping.tag,
       }, { onConflict: 'lp_source_subdetail,lp_source_raw', ignoreDuplicates: false });
+      if (error) {
+        console.warn(`[Sync] Failed to seed default mapping "${sourceKey}":`, error.message);
+      } else {
+        defaultsSeeded++;
+      }
     }
-
-    if (inserted > 0) console.log(`[Sync] Source mapping: ${inserted} skeleton rows ensured`);
+    console.log(`[Sync] Source mapping: ${defaultsSeeded}/${Object.keys(DEFAULT_SOURCE_MAPPINGS).length} defaults seeded, ${inserted} sub-source skeletons ensured`);
   } catch (err) {
     console.warn('[Sync] Source enumeration failed:', err.message);
   }
@@ -262,17 +297,26 @@ async function backfillDispositionsFromLeads() {
 async function resolveSourceBucket(sourcesubdescr, source) {
   // Try sourcesubdescr first (primary intent signal)
   if (sourcesubdescr) {
-    const { data } = await supabase.from('lp_source_mapping')
+    const { data, error } = await supabase.from('lp_source_mapping')
       .select('ghl_intent_bucket, ghl_entry_tag')
-      .eq('lp_source_subdetail', sourcesubdescr).single();
-    if (data) return { bucket: data.ghl_intent_bucket, tag: data.ghl_entry_tag };
+      .eq('lp_source_subdetail', sourcesubdescr)
+      .maybeSingle();
+    if (error) console.warn(`[Sync] Source lookup error for subdetail="${sourcesubdescr}":`, error.message);
+    if (data && data.ghl_intent_bucket !== 'unmapped') {
+      return { bucket: data.ghl_intent_bucket, tag: data.ghl_entry_tag };
+    }
   }
   // Fall back to parent source field
   if (source) {
-    const { data } = await supabase.from('lp_source_mapping')
+    const { data, error } = await supabase.from('lp_source_mapping')
       .select('ghl_intent_bucket, ghl_entry_tag')
-      .eq('lp_source_raw', source).is('lp_source_subdetail', null).single();
-    if (data) return { bucket: data.ghl_intent_bucket, tag: data.ghl_entry_tag };
+      .eq('lp_source_raw', source)
+      .is('lp_source_subdetail', null)
+      .maybeSingle();
+    if (error) console.warn(`[Sync] Source lookup error for raw="${source}":`, error.message);
+    if (data && data.ghl_intent_bucket !== 'unmapped') {
+      return { bucket: data.ghl_intent_bucket, tag: data.ghl_entry_tag };
+    }
   }
   // Default — log for mapping review
   await logUnmappedSource(sourcesubdescr, source);
@@ -294,7 +338,7 @@ async function logUnmappedSource(sourceSubdetail, sourceRaw) {
     await supabase.from('lp_unmapped_sources').upsert({
       source_subdetail: sourceSubdetail || null,
       source_raw: sourceRaw || null,
-    }, { onConflict: 'source_subdetail,source_raw' }).catch(() => {});
+    }, { onConflict: 'source_subdetail,source_raw' });
   } catch (err) {
     // Non-critical
   }
@@ -731,6 +775,7 @@ async function checkLeadTriggers() {
 export async function fullSync() {
   console.log('[Sync] Starting FULL sync...');
   const startedAt = new Date();
+  const logId = await logSyncStart('full');
   const stats = { processed: 0, inserted: 0, updated: 0, failed: 0, calls: 0, notes: 0, jobs: 0, milestones: 0, errors: [] };
   resetGHLState(); // Give GHL a fresh chance each sync cycle
   loggedFirstKeys.clear(); // Reset diagnostic key logging for this cycle
@@ -742,13 +787,13 @@ export async function fullSync() {
     if (connStatus.auth_status !== 'success') {
       console.error('[Sync] LP API authentication FAILED — check LP_API_BASE_URL, LP_USERNAME, LP_PASSWORD, LP_CLIENT_ID, LP_APP_KEY');
       stats.errors.push({ fatal: 'LP API auth failed', details: connStatus.errors });
-      await logSync({ sync_type: 'full', ...stats, started_at: startedAt });
+      await logSync({ sync_type: 'full', ...stats, started_at: startedAt, log_id: logId });
       return stats;
     }
   } catch (err) {
     console.error('[Sync] LP API connection test failed:', err.message);
     stats.errors.push({ fatal: `LP connection: ${err.message}` });
-    await logSync({ sync_type: 'full', ...stats, started_at: startedAt });
+    await logSync({ sync_type: 'full', ...stats, started_at: startedAt, log_id: logId });
     return stats;
   }
 
@@ -847,7 +892,7 @@ export async function fullSync() {
   }
 
   const duration = Date.now() - startedAt.getTime();
-  await logSync({ sync_type: 'full', ...stats, started_at: startedAt, duration_ms: duration });
+  await logSync({ sync_type: 'full', ...stats, started_at: startedAt, duration_ms: duration, log_id: logId });
   console.log(`[Sync] Full sync complete — ${stats.processed} leads, ${stats.calls} calls, ${stats.notes} notes, ${stats.jobs} jobs, ${stats.milestones} milestones, ${stats.failed} failed (${Math.round(duration / 1000)}s)`);
   return stats;
 }
@@ -860,6 +905,7 @@ export async function fullSync() {
 export async function incrementalSync() {
   console.log('[Sync] Starting incremental sync...');
   const startedAt = new Date();
+  const logId = await logSyncStart('incremental');
   const stats = { processed: 0, inserted: 0, updated: 0, failed: 0, errors: [] };
   resetGHLState();
 
@@ -969,7 +1015,7 @@ export async function incrementalSync() {
   }
 
   const duration = Date.now() - startedAt.getTime();
-  await logSync({ sync_type: 'incremental', ...stats, started_at: startedAt, duration_ms: duration });
+  await logSync({ sync_type: 'incremental', ...stats, started_at: startedAt, duration_ms: duration, log_id: logId });
   console.log(`[Sync] Incremental sync complete — ${stats.processed} processed, ${stats.failed} failed (${duration}ms)`);
   return stats;
 }
@@ -978,6 +1024,7 @@ export async function incrementalSync() {
 
 export async function handleWebhookEvent(event, payload) {
   const startTime = new Date();
+  const logId = await logSyncStart(`webhook_${event}`);
   const stats = { processed: 0, failed: 0, errors: [] };
 
   try {
@@ -1047,7 +1094,7 @@ export async function handleWebhookEvent(event, payload) {
     console.error(`[Webhook] Processing failed for ${event}:`, err.message);
   }
 
-  await logSync({ sync_type: `webhook_${event}`, ...stats, started_at: startTime });
+  await logSync({ sync_type: `webhook_${event}`, ...stats, started_at: startTime, log_id: logId });
   return stats;
 }
 
