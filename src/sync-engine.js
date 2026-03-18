@@ -79,13 +79,19 @@ async function logSyncError(entityId, err) {
 }
 
 async function getLastSyncTimestamp() {
-  const { data } = await supabase
-    .from('lp_sync_log')
-    .select('completed_at')
-    .order('completed_at', { ascending: false })
-    .limit(1)
-    .single();
-  return data?.completed_at ? new Date(data.completed_at) : null;
+  try {
+    const { data } = await supabase
+      .from('lp_sync_log')
+      .select('completed_at')
+      .gt('records_processed', 0)              // Ignore 0-record syncs (failed v4 runs)
+      .order('completed_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();                          // Returns null on 0 rows instead of throwing
+    return data?.completed_at ? new Date(data.completed_at) : null;
+  } catch (err) {
+    console.error('[Sync] Failed to read sync log:', err.message);
+    return null;  // Treat errors as "never synced" → triggers full sync
+  }
 }
 
 // ─── Source Enumeration — Run before first sync ──────────────────
@@ -348,8 +354,8 @@ async function syncCallLogs(lpLeadId, ghlContactId, calls) {
         call_duration_sec: call.duration     || call.Duration    || null,
         call_result:       call.resultcode   || call.ResultCode  || call.result || null,
         call_direction:    call.calltype     || call.CallType    || null,  // A=Outbound, I=Inbound
-        agent_id:          call.emp_id       || call.EmpID       || null,
-        agent_name:        call.agentname    || call.AgentName   || call.rep_name || null,
+        rep_id:            call.emp_id       || call.EmpID       || null,
+        rep_name:          call.agentname    || call.AgentName   || call.rep_name || null,
         call_notes:        call.notes        || call.Notes       || null,
         recording_url:     call.recording_url || call.RecordingURL || null,
         synced_at:         new Date().toISOString(),
@@ -869,14 +875,20 @@ export function startSyncScheduler() {
       // Start proactive token refresh schedule
       startTokenRefreshSchedule();
 
-      // Check if we've ever synced
-      const lastSync = await getLastSyncTimestamp();
-      if (lastSync) {
-        console.log('[Sync] Previous sync found — running incremental sync');
-        await incrementalSync();
-      } else {
-        console.log('[Sync] No previous sync — running initial full sync');
+      // Check if we should force a full sync (set FORCE_FULL_SYNC=true in Railway to trigger)
+      const forceFullSync = process.env.FORCE_FULL_SYNC === 'true';
+      if (forceFullSync) {
+        console.log('[Sync] FORCE_FULL_SYNC=true — running full sync regardless of history');
         await fullSync();
+      } else {
+        const lastSync = await getLastSyncTimestamp();
+        if (lastSync) {
+          console.log(`[Sync] Last successful sync: ${lastSync.toISOString()} — running incremental`);
+          await incrementalSync();
+        } else {
+          console.log('[Sync] No successful sync found — running initial full sync');
+          await fullSync();
+        }
       }
     } catch (err) {
       console.error('[Sync] Initial sync failed:', err.message);
