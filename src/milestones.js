@@ -57,23 +57,45 @@ export async function processMilestoneTriggers() {
   let fired = 0;
   let errors = 0;
 
+  // Bug 10: Build a map of lead_id → ghl_contact_id from lp_leads
+  // so we can resolve contacts even if the milestone row has null ghl_contact_id
+  const leadIds = [...new Set((newMilestones || []).map(m => m.lp_lead_id).filter(Boolean))];
+  const ghlContactMap = {};
+  if (leadIds.length > 0) {
+    const { data: leads } = await supabase
+      .from('lp_leads')
+      .select('lp_lead_id, ghl_contact_id')
+      .in('lp_lead_id', leadIds)
+      .not('ghl_contact_id', 'is', null);
+    for (const lead of (leads || [])) {
+      ghlContactMap[lead.lp_lead_id] = lead.ghl_contact_id;
+    }
+  }
+
   for (const milestone of (newMilestones || [])) {
-    if (!milestone.ghl_contact_id) continue;
+    // Bug 10: Use lead's ghl_contact_id as fallback if milestone row has null
+    const ghlContactId = milestone.ghl_contact_id || ghlContactMap[milestone.lp_lead_id];
+    if (!ghlContactId) continue;
 
     const tag = MDT_TAG_MAP[milestone.mdt_id];
     if (!tag) continue;
 
-    const success = await applyGHLTag(milestone.ghl_contact_id, tag);
+    const success = await applyGHLTag(ghlContactId, tag);
 
     if (success) {
+      // Also update ghl_contact_id on milestone row if it was resolved from lead
+      const updateFields = { ghl_tag_fired: true };
+      if (!milestone.ghl_contact_id && ghlContactId) {
+        updateFields.ghl_contact_id = ghlContactId;
+      }
       await supabase.from('lp_job_milestones')
-        .update({ ghl_tag_fired: true })
+        .update(updateFields)
         .eq('lp_job_id', milestone.lp_job_id)
         .eq('mdt_id', milestone.mdt_id);
 
       await logTrigger({
         lp_lead_id: milestone.lp_lead_id,
-        ghl_contact_id: milestone.ghl_contact_id,
+        ghl_contact_id: ghlContactId,
         event: `milestone_${milestone.mdt_id}`,
         tag_fired: tag,
         status: 'success',
@@ -82,7 +104,7 @@ export async function processMilestoneTriggers() {
     } else {
       await logTrigger({
         lp_lead_id: milestone.lp_lead_id,
-        ghl_contact_id: milestone.ghl_contact_id,
+        ghl_contact_id: ghlContactId,
         event: `milestone_${milestone.mdt_id}`,
         tag_fired: tag,
         status: 'failed',
