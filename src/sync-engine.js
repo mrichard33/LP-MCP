@@ -185,8 +185,29 @@ const DEFAULT_SOURCE_MAPPINGS = {
   // Bug 5: Historical unmapped sources → other
   'Old Sub Source':     { bucket: 'other',               tag: 'entry:other' },
   'Old Source':         { bucket: 'other',               tag: 'entry:other' },
-  // Bug 6: Chatbot source
+  // Chatbot / website
   'Reece ChatBot':      { bucket: 'chatbot',             tag: 'entry:chatbot' },
+  // Internet lead gen / marketplaces → estimate-calculator bridge
+  'HomeBuddy':          { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
+  'Socius Marketing':   { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
+  'GeoTarget':          { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
+  'Thinxmg':            { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
+  'Fave Marketing':     { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
+  'Porch':              { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
+  'Contractor Appointment': { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
+  // Referral platforms
+  'GetTheReferral.Com': { bucket: 'referral',            tag: 'entry:referral' },
+  'Job Sign':           { bucket: 'referral',            tag: 'entry:referral' },
+  'Customer Referral':  { bucket: 'referral',            tag: 'entry:referral' },
+  // Canvassing territories
+  'Canvasser, Old Ft Myers': { bucket: 'canvassing',     tag: 'entry:canvassing' },
+  'Canvasser, Old St Pete':  { bucket: 'canvassing',     tag: 'entry:canvassing' },
+  // Broadcast / media → other
+  'Radio':              { bucket: 'other',               tag: 'entry:other' },
+  '92.5':               { bucket: 'other',               tag: 'entry:other' },
+  'Peacock':            { bucket: 'other',               tag: 'entry:other' },
+  'Direct':             { bucket: 'other',               tag: 'entry:other' },
+  'Resource Living':    { bucket: 'other',               tag: 'entry:other' },
 };
 
 async function populateSourceMapping() {
@@ -1327,10 +1348,9 @@ export async function fullSync() {
         // Flush live progress for leads after every page
         await syncLogProgress(logIds.leads, counts.leads);
 
-        console.log(`[Sync P1] [${year}] Loaded records ${startIndex}–${startIndex + prospects.length - 1} (${counts.leads} leads total)`);
+        console.log(`[Sync P1] [${year}] Page ${Math.ceil(startIndex / PAGE_SIZE)}: ${prospects.length} prospects fetched (${counts.leads} leads total)`);
 
-        if (prospects.length < PAGE_SIZE) break;
-        startIndex += PAGE_SIZE;
+        startIndex += prospects.length;
         await sleep(RATE_LIMIT_SLEEP_MS);
       }
 
@@ -1597,8 +1617,7 @@ export async function incrementalSync() {
         syncLogProgress(logIds.activities, counts.activities),
       ]);
 
-      if (items.length < PAGE_SIZE) break;
-      startIndex += PAGE_SIZE;
+      startIndex += items.length;
       await sleep(RATE_LIMIT_SLEEP_MS);
     }
 
@@ -1638,8 +1657,7 @@ export async function incrementalSync() {
         syncLogProgress(logIds.milestones, counts.milestones),
       ]);
 
-      if (items.length < PAGE_SIZE) break;
-      startIndex += PAGE_SIZE;
+      startIndex += items.length;
       await sleep(RATE_LIMIT_SLEEP_MS);
     }
 
