@@ -127,14 +127,22 @@ async function syncDispositions() {
     const response = await getDispositions();
     const items = extractArray(response);
 
+    // Log the raw response shape for debugging
+    if (items.length === 0) {
+      console.log('[Sync] Dispositions raw response:', JSON.stringify(response)?.slice(0, 500));
+    } else {
+      console.log('[Sync] Dispositions sample:', JSON.stringify(items[0]));
+    }
+
     let synced = 0;
     for (const d of items) {
-      const code = String(d.Code || d.code || d.disposition_code || d.DispositionCode || d.ID || d.id || '');
+      // LP may return {key, value} format like sources, or {Code, Description}, or other shapes
+      const code = String(d.key || d.Key || d.Code || d.code || d.disposition_code || d.DispositionCode || d.ID || d.id || '');
       if (!code) continue;
 
       await supabase.from('lp_dispositions').upsert({
         disposition_code: code,
-        disposition_label: d.Description || d.description || d.Label || d.label || d.Name || d.name || '',
+        disposition_label: d.value || d.Value || d.Description || d.description || d.Label || d.label || d.Name || d.name || '',
         category: d.Category || d.category || null,
         is_recoverable: d.is_recoverable ?? true,
         synced_at: new Date().toISOString(),
@@ -584,45 +592,57 @@ export async function fullSync() {
     await populateSourceMapping();
 
     // Step 2: Paginated lead fetch via GetLead
-    let startIndex = 1; // 1-based per LP API
-    const today = new Date().toISOString().slice(0, 10);
+    // LP times out on large date ranges — break into yearly windows
+    const today = new Date();
+    const START_YEAR = 2015; // Pull all history from this year
+    const currentYear = today.getFullYear();
 
-    while (true) {
-      let result;
-      try {
-        result = await getLeads({
-          startdate:  '2020-01-01',
-          enddate:    today,
-          PageSize:   PAGE_SIZE,
-          StartIndex: startIndex,
-        });
-      } catch (err) {
-        console.error(`[Sync] Failed to fetch leads at index ${startIndex}:`, err.message);
-        stats.errors.push({ start_index: startIndex, error: err.message });
-        break;
-      }
+    for (let year = START_YEAR; year <= currentYear; year++) {
+      const windowStart = `${year}-01-01`;
+      const windowEnd = year === currentYear
+        ? today.toISOString().slice(0, 10)
+        : `${year}-12-31`;
 
-      const prospects = extractArray(result);
-      if (prospects.length === 0) break;
+      console.log(`[Sync] Fetching leads for ${windowStart} to ${windowEnd}...`);
+      let startIndex = 1; // 1-based per LP API
 
-      for (const prospect of prospects) {
+      while (true) {
+        let result;
         try {
-          await processProspect(prospect);
-          stats.processed++;
-          stats.inserted++;
+          result = await getLeads({
+            startdate:  windowStart,
+            enddate:    windowEnd,
+            PageSize:   PAGE_SIZE,
+            StartIndex: startIndex,
+          });
         } catch (err) {
-          stats.failed++;
-          const pid = prospect.cst_id || prospect.CstID || prospect.ProspectID;
-          stats.errors.push({ prospect_id: pid, error: err.message });
-          await logSyncError(pid, err);
+          console.error(`[Sync] Failed to fetch leads (${windowStart}, index ${startIndex}):`, err.message);
+          stats.errors.push({ year, start_index: startIndex, error: err.message });
+          break;
         }
+
+        const prospects = extractArray(result);
+        if (prospects.length === 0) break;
+
+        for (const prospect of prospects) {
+          try {
+            await processProspect(prospect);
+            stats.processed++;
+            stats.inserted++;
+          } catch (err) {
+            stats.failed++;
+            const pid = prospect.cst_id || prospect.CstID || prospect.ProspectID;
+            stats.errors.push({ prospect_id: pid, error: err.message });
+            await logSyncError(pid, err);
+          }
+        }
+
+        console.log(`[Sync] [${year}] Processed records ${startIndex}–${startIndex + prospects.length - 1}`);
+
+        if (prospects.length < PAGE_SIZE) break;
+        startIndex += PAGE_SIZE;
+        await sleep(RATE_LIMIT_SLEEP_MS);
       }
-
-      console.log(`[Sync] Processed records ${startIndex}–${startIndex + prospects.length - 1}`);
-
-      if (prospects.length < PAGE_SIZE) break;
-      startIndex += PAGE_SIZE;
-      await sleep(RATE_LIMIT_SLEEP_MS);
     }
 
     // Step 3: Process milestone triggers

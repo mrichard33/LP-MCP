@@ -32,6 +32,10 @@ export const lpPost = async (endpoint, fields = {}, retries = 3) => {
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
+      // 120-second timeout — LP queries on large datasets can be slow
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 120000);
+
       const res = await fetch(`${base}${endpoint}`, {
         method:  'POST',
         headers: {
@@ -39,7 +43,10 @@ export const lpPost = async (endpoint, fields = {}, retries = 3) => {
           'Content-Type':   'application/x-www-form-urlencoded',
         },
         body: body.toString(),
+        signal: controller.signal,
       });
+
+      clearTimeout(timeout);
 
       // Token expired mid-sync — force refresh and retry
       if (res.status === 401 || res.status === 403) {
@@ -47,6 +54,8 @@ export const lpPost = async (endpoint, fields = {}, retries = 3) => {
         invalidateToken();
         const newToken = await refreshToken();
         // Retry immediately with new token
+        const retryCtrl = new AbortController();
+        const retryTimeout = setTimeout(() => retryCtrl.abort(), 120000);
         const retryRes = await fetch(`${base}${endpoint}`, {
           method:  'POST',
           headers: {
@@ -54,7 +63,9 @@ export const lpPost = async (endpoint, fields = {}, retries = 3) => {
             'Content-Type':   'application/x-www-form-urlencoded',
           },
           body: body.toString(),
+          signal: retryCtrl.signal,
         });
+        clearTimeout(retryTimeout);
         if (!retryRes.ok) {
           const errText = await retryRes.text().catch(() => '');
           throw new Error(`LP API ${retryRes.status}: ${errText}`);
