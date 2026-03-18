@@ -73,82 +73,67 @@ function extractArray(response) {
   return [];
 }
 
-// ─── Sync Log (progressive updates) ─────────────────────────────
+// ─── Sync Log (one row per entity_type, live progress) ──────────
 
-function newTableCounts() {
-  return {
-    leads:      { processed: 0, inserted: 0, updated: 0, failed: 0 },
-    calls:      { processed: 0, failed: 0 },
-    notes:      { processed: 0, failed: 0 },
-    jobs:       { processed: 0, failed: 0 },
-    milestones: { processed: 0, failed: 0 },
-    activities: { processed: 0, failed: 0 },
-  };
-}
+const ENTITY_TYPES = ['leads', 'calls', 'notes', 'jobs', 'milestones', 'activities', 'dispositions', 'sources', 'ghl_backfill'];
 
-// Write a "started" row and return its id so we can update it on completion
-async function logSyncStart(syncType) {
+// Create a "running" row for an entity and return its id
+async function syncLogStart(entityType, syncType) {
   try {
     const { data, error } = await supabase.from('lp_sync_log').insert({
-      sync_type:         syncType,
-      records_processed: 0,
-      records_inserted:  0,
-      records_updated:   0,
-      records_failed:    0,
-      table_counts:      newTableCounts(),
-      started_at:        new Date().toISOString(),
-      // completed_at left null = still running
+      entity_type:    entityType,
+      sync_type:      syncType,
+      status:         'running',
+      records_synced: 0,
+      started_at:     new Date().toISOString(),
     }).select('id').single();
     if (error) throw error;
     return data?.id;
   } catch (err) {
-    console.error('[Sync] Failed to write sync-start log:', err.message);
+    console.error(`[Sync] Failed to create sync log for ${entityType}:`, err.message);
     return null;
   }
 }
 
-// Flush current stats to DB — call after each page/batch for live progress
-async function logSyncProgress(logId, stats, tableCounts) {
+// Update records_synced count (call after each page/batch for live progress)
+async function syncLogProgress(logId, count) {
   if (!logId) return;
   try {
     await supabase.from('lp_sync_log').update({
-      records_processed: stats.processed ?? 0,
-      records_inserted:  stats.inserted  ?? 0,
-      records_updated:   stats.updated   ?? 0,
-      records_failed:    stats.failed    ?? 0,
-      table_counts:      tableCounts,
-      error_details:     stats.errors?.length > 0 ? stats.errors.slice(-20) : null, // keep last 20 errors
+      records_synced: count,
     }).eq('id', logId);
-  } catch (err) {
+  } catch (_) {
     // Non-fatal — don't break sync over a progress update
   }
 }
 
-// Final update on completion (or insert if we lost the id)
-async function logSync(opts) {
-  const completed = new Date();
-  const row = {
-    sync_type:         opts.sync_type,
-    records_processed: opts.processed  ?? opts.records_processed ?? 0,
-    records_inserted:  opts.inserted   ?? opts.records_inserted  ?? 0,
-    records_updated:   opts.updated    ?? opts.records_updated   ?? 0,
-    records_failed:    opts.failed     ?? opts.records_failed    ?? 0,
-    table_counts:      opts.table_counts ?? null,
-    error_details:     opts.errors?.length > 0 ? opts.errors : null,
-    started_at:        opts.started_at instanceof Date ? opts.started_at.toISOString() : opts.started_at,
-    completed_at:      completed.toISOString(),
-    duration_ms:       opts.duration_ms || (completed - opts.started_at),
-  };
+// Mark entity sync as completed (skips if already completed/failed)
+async function syncLogComplete(logId, count, errorMessage) {
+  if (!logId) return;
   try {
-    if (opts.log_id) {
-      const { error } = await supabase.from('lp_sync_log').update(row).eq('id', opts.log_id);
-      if (error) throw error;
-    } else {
-      await supabase.from('lp_sync_log').insert(row);
-    }
+    await supabase.from('lp_sync_log').update({
+      status:         errorMessage ? 'failed' : 'completed',
+      records_synced: count,
+      error_message:  errorMessage || null,
+      completed_at:   new Date().toISOString(),
+    }).eq('id', logId).eq('status', 'running'); // Only update if still running
   } catch (err) {
-    console.error('[Sync] Failed to write sync log:', err.message);
+    console.error('[Sync] Failed to complete sync log:', err.message);
   }
+}
+
+// Mark entity sync as failed
+async function syncLogFail(logId, count, errorMessage) {
+  await syncLogComplete(logId, count, errorMessage || 'Unknown error');
+}
+
+// Helper: create log rows for all entity types at once, returns { leads: id, calls: id, ... }
+async function syncLogStartAll(syncType, entityTypes = ENTITY_TYPES) {
+  const ids = {};
+  await Promise.all(entityTypes.map(async (et) => {
+    ids[et] = await syncLogStart(et, syncType);
+  }));
+  return ids;
 }
 
 async function logSyncError(entityId, err) {
@@ -160,8 +145,10 @@ async function getLastSyncTimestamp() {
     const { data } = await supabase
       .from('lp_sync_log')
       .select('completed_at')
-      .not('completed_at', 'is', null)         // Skip "started but still running" rows
-      .gt('records_processed', 0)              // Ignore 0-record syncs (failed v4 runs)
+      .eq('entity_type', 'leads')              // Leads entity is the primary sync indicator
+      .eq('status', 'completed')
+      .gt('records_synced', 0)
+      .not('completed_at', 'is', null)
       .order('completed_at', { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -268,8 +255,10 @@ async function populateSourceMapping() {
       }
     }
     console.log(`[Sync] Source mapping: ${defaultsSeeded}/${Object.keys(DEFAULT_SOURCE_MAPPINGS).length} defaults seeded, ${inserted} sub-source skeletons ensured`);
+    return defaultsSeeded + inserted;
   } catch (err) {
     console.warn('[Sync] Source enumeration failed:', err.message);
+    return 0;
   }
 }
 
@@ -303,8 +292,10 @@ async function syncDispositions() {
       synced++;
     }
     console.log(`[Sync] Synced ${synced} dispositions`);
+    return synced;
   } catch (err) {
     console.warn('[Sync] Dispositions sync failed:', err.message);
+    return 0;
   }
 }
 
@@ -909,11 +900,13 @@ async function checkLeadTriggers() {
 export async function fullSync() {
   console.log('[Sync] Starting FULL sync...');
   const startedAt = new Date();
-  const logId = await logSyncStart('full');
-  const stats = { processed: 0, inserted: 0, updated: 0, failed: 0, errors: [] };
-  const tc = newTableCounts(); // per-table breakdown
-  resetGHLState(); // Give GHL a fresh chance each sync cycle
-  loggedFirstKeys.clear(); // Reset diagnostic key logging for this cycle
+  resetGHLState();
+  loggedFirstKeys.clear();
+
+  // Create per-entity log rows — all start as "running"
+  const logIds = await syncLogStartAll('full');
+  const counts = { leads: 0, calls: 0, notes: 0, jobs: 0, milestones: 0, activities: 0 };
+  let failed = 0;
 
   // Step 0: Test LP API connection
   try {
@@ -921,29 +914,27 @@ export async function fullSync() {
     console.log(`[Sync] LP API connection: auth=${connStatus.auth_status}, api=${connStatus.api_test}`);
     if (connStatus.auth_status !== 'success') {
       console.error('[Sync] LP API authentication FAILED — check LP_API_BASE_URL, LP_USERNAME, LP_PASSWORD, LP_CLIENT_ID, LP_APP_KEY');
-      stats.errors.push({ fatal: 'LP API auth failed', details: connStatus.errors });
-      await logSync({ sync_type: 'full', ...stats, started_at: startedAt, log_id: logId });
-      return stats;
+      for (const et of ENTITY_TYPES) await syncLogFail(logIds[et], 0, 'LP API auth failed');
+      return counts;
     }
   } catch (err) {
     console.error('[Sync] LP API connection test failed:', err.message);
-    stats.errors.push({ fatal: `LP connection: ${err.message}` });
-    await logSync({ sync_type: 'full', ...stats, started_at: startedAt, log_id: logId });
-    return stats;
+    for (const et of ENTITY_TYPES) await syncLogFail(logIds[et], 0, err.message);
+    return counts;
   }
 
   try {
     // Step 1: Sync dispositions reference
-    await syncDispositions();
+    const dispCount = await syncDispositions();
+    await syncLogComplete(logIds.dispositions, dispCount);
 
-    // Step 1b: Enumerate sources for mapping table (inserts skeleton rows)
-    await populateSourceMapping();
+    // Step 1b: Enumerate sources for mapping table
+    const srcCount = await populateSourceMapping();
+    await syncLogComplete(logIds.sources, srcCount);
 
     // Step 2: Paginated lead fetch via GetLead
-    // LP times out on large date ranges — break into yearly windows
-    // Newest first — current leads validate the pipeline before backfilling history
     const today = new Date();
-    const START_YEAR = 2015; // Pull all history from this year
+    const START_YEAR = 2015;
     const currentYear = today.getFullYear();
 
     for (let year = currentYear; year >= START_YEAR; year--) {
@@ -953,7 +944,7 @@ export async function fullSync() {
         : `${year}-12-31`;
 
       console.log(`[Sync] Fetching leads for ${windowStart} to ${windowEnd}...`);
-      let startIndex = 1; // 1-based per LP API
+      let startIndex = 1;
 
       while (true) {
         let result;
@@ -966,7 +957,6 @@ export async function fullSync() {
           });
         } catch (err) {
           console.error(`[Sync] Failed to fetch leads (${windowStart}, index ${startIndex}):`, err.message);
-          stats.errors.push({ year, start_index: startIndex, error: err.message });
           break;
         }
 
@@ -975,31 +965,33 @@ export async function fullSync() {
 
         for (const prospect of prospects) {
           try {
-            const subCounts = await processProspect(prospect, { skipGHL: true });
-            stats.processed++;
-            stats.inserted++;
-            tc.leads.processed++;
-            tc.leads.inserted++;
-            if (subCounts) {
-              tc.calls.processed      += subCounts.calls;
-              tc.notes.processed      += subCounts.notes;
-              tc.jobs.processed       += subCounts.jobs;
-              tc.milestones.processed += subCounts.milestones;
-              tc.activities.processed += subCounts.calls + subCounts.notes; // activities synthesized from calls+notes
+            const sub = await processProspect(prospect, { skipGHL: true });
+            counts.leads++;
+            if (sub) {
+              counts.calls      += sub.calls;
+              counts.notes      += sub.notes;
+              counts.jobs       += sub.jobs;
+              counts.milestones += sub.milestones;
+              counts.activities += sub.calls + sub.notes;
             }
           } catch (err) {
-            stats.failed++;
-            tc.leads.failed++;
+            failed++;
             const pid = prospect.cst_id || prospect.CstID || prospect.ProspectID;
-            stats.errors.push({ prospect_id: pid, error: err.message });
             await logSyncError(pid, err);
           }
         }
 
-        // Flush progress to DB after each page so the sync_log updates live
-        await logSyncProgress(logId, stats, tc);
+        // Flush live progress for each entity after every page
+        await Promise.all([
+          syncLogProgress(logIds.leads,      counts.leads),
+          syncLogProgress(logIds.calls,      counts.calls),
+          syncLogProgress(logIds.notes,      counts.notes),
+          syncLogProgress(logIds.jobs,       counts.jobs),
+          syncLogProgress(logIds.milestones, counts.milestones),
+          syncLogProgress(logIds.activities, counts.activities),
+        ]);
 
-        console.log(`[Sync] [${year}] Processed records ${startIndex}–${startIndex + prospects.length - 1} (cumulative: ${tc.leads.processed} leads, ${tc.calls.processed} calls, ${tc.notes.processed} notes, ${tc.jobs.processed} jobs)`);
+        console.log(`[Sync] [${year}] Processed ${startIndex}–${startIndex + prospects.length - 1} (${counts.leads} leads, ${counts.calls} calls, ${counts.notes} notes, ${counts.jobs} jobs)`);
 
         if (prospects.length < PAGE_SIZE) break;
         startIndex += PAGE_SIZE;
@@ -1007,13 +999,20 @@ export async function fullSync() {
       }
     }
 
+    // Complete the data-load entity logs
+    await syncLogComplete(logIds.leads,      counts.leads,      failed > 0 ? `${failed} prospects failed` : null);
+    await syncLogComplete(logIds.calls,      counts.calls);
+    await syncLogComplete(logIds.notes,      counts.notes);
+    await syncLogComplete(logIds.jobs,       counts.jobs);
+    await syncLogComplete(logIds.milestones, counts.milestones);
+    await syncLogComplete(logIds.activities, counts.activities);
+
     // Step 2b: Backfill dispositions from actual lead data
     await backfillDispositionsFromLeads();
 
-    console.log(`[Sync] Data load complete — ${tc.leads.processed} leads, ${tc.calls.processed} calls, ${tc.notes.processed} notes, ${tc.jobs.processed} jobs, ${tc.milestones.processed} milestones`);
+    console.log(`[Sync] Data load complete — ${counts.leads} leads, ${counts.calls} calls, ${counts.notes} notes, ${counts.jobs} jobs, ${counts.milestones} milestones`);
 
     // Step 2c: GHL backfill — match leads to GHL contacts and apply entry tags
-    // Done as a separate pass so the data load isn't blocked by HTTP calls to GHL
     try {
       const { data: unmatchedLeads } = await supabase.from('lp_leads')
         .select('lp_lead_id, phone, phone_alt, email, ghl_entry_tag, ghl_tag_applied')
@@ -1036,7 +1035,6 @@ export async function fullSync() {
               await supabase.from('lp_leads')
                 .update({ ghl_contact_id: ghlId })
                 .eq('lp_lead_id', lead.lp_lead_id);
-              // Apply entry tag if not yet applied
               if (!lead.ghl_tag_applied && lead.ghl_entry_tag) {
                 const success = await applyGHLTag(ghlId, lead.ghl_entry_tag);
                 if (success) {
@@ -1046,14 +1044,16 @@ export async function fullSync() {
                 }
               }
             }
-          } catch (err) {
-            // Non-fatal — GHL matching is best-effort
-          }
+          } catch (err) { /* non-fatal */ }
         }
+        await syncLogComplete(logIds.ghl_backfill, matched);
         console.log(`[Sync] GHL backfill complete: ${matched}/${unmatchedLeads.length} matched`);
+      } else {
+        await syncLogComplete(logIds.ghl_backfill, 0);
       }
     } catch (err) {
       console.warn('[Sync] GHL backfill failed:', err.message);
+      await syncLogFail(logIds.ghl_backfill, 0, err.message);
     }
 
     // Step 3: Process milestone triggers
@@ -1076,13 +1076,15 @@ export async function fullSync() {
 
   } catch (err) {
     console.error('[Sync] Full sync failed:', err.message);
-    stats.errors.push({ fatal: err.message });
+    // Mark any still-running entities as failed
+    for (const et of ENTITY_TYPES) {
+      await syncLogFail(logIds[et], counts[et] || 0, err.message).catch(() => {});
+    }
   }
 
   const duration = Date.now() - startedAt.getTime();
-  await logSync({ sync_type: 'full', ...stats, table_counts: tc, started_at: startedAt, duration_ms: duration, log_id: logId });
-  console.log(`[Sync] Full sync complete — ${tc.leads.processed} leads, ${tc.calls.processed} calls, ${tc.notes.processed} notes, ${tc.jobs.processed} jobs, ${tc.milestones.processed} milestones, ${stats.failed} failed (${Math.round(duration / 1000)}s)`);
-  return stats;
+  console.log(`[Sync] Full sync complete — ${counts.leads} leads, ${counts.calls} calls, ${counts.notes} notes, ${counts.jobs} jobs, ${counts.milestones} milestones, ${failed} failed (${Math.round(duration / 1000)}s)`);
+  return counts;
 }
 
 // ─── Incremental Sync — Two-Part ─────────────────────────────────
@@ -1093,9 +1095,6 @@ export async function fullSync() {
 export async function incrementalSync() {
   console.log('[Sync] Starting incremental sync...');
   const startedAt = new Date();
-  const logId = await logSyncStart('incremental');
-  const stats = { processed: 0, inserted: 0, updated: 0, failed: 0, errors: [] };
-  const tc = newTableCounts();
   resetGHLState();
 
   try {
@@ -1104,6 +1103,10 @@ export async function incrementalSync() {
       console.log('[Sync] No previous sync found — running full sync instead');
       return fullSync();
     }
+
+    const logIds = await syncLogStartAll('incremental', ['leads', 'calls', 'notes', 'jobs', 'milestones', 'activities']);
+    const counts = { leads: 0, calls: 0, notes: 0, jobs: 0, milestones: 0, activities: 0 };
+    let failed = 0;
 
     const since = lastSyncTime.toISOString().slice(0, 10);
     const today = new Date().toISOString().slice(0, 10);
@@ -1121,7 +1124,6 @@ export async function incrementalSync() {
         });
       } catch (err) {
         console.error('[Sync] GetLeadData failed:', err.message);
-        stats.errors.push({ part: 'leads', error: err.message });
         break;
       }
 
@@ -1130,34 +1132,36 @@ export async function incrementalSync() {
 
       for (const lead of items) {
         try {
-          // Fetch full prospect record for each changed lead
           const cstId = lead.cst_id || lead.CstID || lead.prospectid || lead.ProspectID;
           if (cstId) {
             const fullResult = await getLead(cstId);
             const fullProspects = extractArray(fullResult);
             if (fullProspects.length > 0) {
-              const subCounts = await processProspect(fullProspects[0]);
-              stats.processed++;
-              stats.updated++;
-              tc.leads.processed++;
-              tc.leads.updated++;
-              if (subCounts) {
-                tc.calls.processed      += subCounts.calls;
-                tc.notes.processed      += subCounts.notes;
-                tc.jobs.processed       += subCounts.jobs;
-                tc.milestones.processed += subCounts.milestones;
-                tc.activities.processed += subCounts.calls + subCounts.notes;
+              const sub = await processProspect(fullProspects[0]);
+              counts.leads++;
+              if (sub) {
+                counts.calls      += sub.calls;
+                counts.notes      += sub.notes;
+                counts.jobs       += sub.jobs;
+                counts.milestones += sub.milestones;
+                counts.activities += sub.calls + sub.notes;
               }
             }
           }
         } catch (err) {
-          stats.failed++;
-          tc.leads.failed++;
+          failed++;
           await logSyncError(lead.cst_id || lead.id, err);
         }
       }
 
-      await logSyncProgress(logId, stats, tc);
+      await Promise.all([
+        syncLogProgress(logIds.leads,      counts.leads),
+        syncLogProgress(logIds.calls,      counts.calls),
+        syncLogProgress(logIds.notes,      counts.notes),
+        syncLogProgress(logIds.jobs,       counts.jobs),
+        syncLogProgress(logIds.milestones, counts.milestones),
+        syncLogProgress(logIds.activities, counts.activities),
+      ]);
 
       if (items.length < PAGE_SIZE) break;
       startIndex += PAGE_SIZE;
@@ -1177,7 +1181,6 @@ export async function incrementalSync() {
         });
       } catch (err) {
         console.error('[Sync] GetJobStatusChanges failed:', err.message);
-        stats.errors.push({ part: 'jobs', error: err.message });
         break;
       }
 
@@ -1187,23 +1190,35 @@ export async function incrementalSync() {
       for (const job of items) {
         try {
           await syncJobAndMilestones(job, job.lds_id || job.lp_lead_id, null);
-          stats.processed++;
-          tc.jobs.processed++;
+          counts.jobs++;
           const milestones = getField(job, 'milestones', 'Milestones') || [];
-          tc.milestones.processed += milestones.length;
+          counts.milestones += milestones.length;
         } catch (err) {
-          stats.failed++;
-          tc.jobs.failed++;
+          failed++;
           await logSyncError(job.job_id || job.JobID, err);
         }
       }
 
-      await logSyncProgress(logId, stats, tc);
+      await Promise.all([
+        syncLogProgress(logIds.jobs,       counts.jobs),
+        syncLogProgress(logIds.milestones, counts.milestones),
+      ]);
 
       if (items.length < PAGE_SIZE) break;
       startIndex += PAGE_SIZE;
       await sleep(RATE_LIMIT_SLEEP_MS);
     }
+
+    // Complete all entity logs
+    const errorMsg = failed > 0 ? `${failed} records failed` : null;
+    await Promise.all([
+      syncLogComplete(logIds.leads,      counts.leads,      errorMsg),
+      syncLogComplete(logIds.calls,      counts.calls),
+      syncLogComplete(logIds.notes,      counts.notes),
+      syncLogComplete(logIds.jobs,       counts.jobs),
+      syncLogComplete(logIds.milestones, counts.milestones),
+      syncLogComplete(logIds.activities, counts.activities),
+    ]);
 
     // Post-sync triggers
     try { await processMilestoneTriggers(); } catch (err) {
@@ -1216,23 +1231,28 @@ export async function incrementalSync() {
       console.warn('[Sync] Lead trigger checks failed:', err.message);
     }
 
+    const duration = Date.now() - startedAt.getTime();
+    console.log(`[Sync] Incremental sync complete — ${counts.leads} leads, ${counts.calls} calls, ${counts.notes} notes, ${counts.jobs} jobs, ${failed} failed (${Math.round(duration / 1000)}s)`);
+    return counts;
+
   } catch (err) {
     console.error('[Sync] Incremental sync failed:', err.message);
-    stats.errors.push({ fatal: err.message });
+    return { leads: 0, calls: 0, notes: 0, jobs: 0, milestones: 0, activities: 0 };
   }
-
-  const duration = Date.now() - startedAt.getTime();
-  await logSync({ sync_type: 'incremental', ...stats, table_counts: tc, started_at: startedAt, duration_ms: duration, log_id: logId });
-  console.log(`[Sync] Incremental sync complete — ${stats.processed} processed, ${stats.failed} failed (${duration}ms)`);
-  return stats;
 }
 
 // ─── Webhook Handler ─────────────────────────────────────────────
 
 export async function handleWebhookEvent(event, payload) {
-  const startTime = new Date();
-  const logId = await logSyncStart(`webhook_${event}`);
-  const stats = { processed: 0, failed: 0, errors: [] };
+  // Map webhook event → entity_type for the log
+  const entityMap = {
+    'lead.created': 'leads', 'lead.updated': 'leads', 'lead.disposition_changed': 'leads',
+    'job.status_changed': 'jobs', 'call.logged': 'calls', 'note.added': 'notes',
+    'milestone.completed': 'milestones',
+  };
+  const entityType = entityMap[event] || 'leads';
+  const logId = await syncLogStart(entityType, `webhook_${event}`);
+  let synced = 0;
 
   try {
     switch (event) {
@@ -1241,7 +1261,7 @@ export async function handleWebhookEvent(event, payload) {
       case 'lead.disposition_changed': {
         const prospect = payload.lead || payload;
         await processProspect(prospect);
-        stats.processed++;
+        synced++;
         await processMilestoneTriggers();
         break;
       }
@@ -1250,14 +1270,12 @@ export async function handleWebhookEvent(event, payload) {
         const job = payload.job || payload;
         const cstId = job.cst_id || job.lead_id || job.lp_lead_id;
         if (cstId) {
-          try {
-            const result = await getLead(cstId);
-            const prospects = extractArray(result);
-            if (prospects[0]) await processProspect(prospects[0]);
-          } catch (err) { stats.errors.push({ error: err.message }); }
+          const result = await getLead(cstId);
+          const prospects = extractArray(result);
+          if (prospects[0]) await processProspect(prospects[0]);
         }
         await processMilestoneTriggers();
-        stats.processed++;
+        synced++;
         break;
       }
 
@@ -1265,15 +1283,10 @@ export async function handleWebhookEvent(event, payload) {
       case 'note.added': {
         const cstId = payload.cst_id || payload.lead_id || payload.lp_lead_id;
         if (cstId) {
-          try {
-            const result = await getLead(cstId);
-            const prospects = extractArray(result);
-            if (prospects[0]) await processProspect(prospects[0]);
-            stats.processed++;
-          } catch (err) {
-            stats.failed++;
-            stats.errors.push({ cst_id: cstId, error: err.message });
-          }
+          const result = await getLead(cstId);
+          const prospects = extractArray(result);
+          if (prospects[0]) await processProspect(prospects[0]);
+          synced++;
         }
         break;
       }
@@ -1281,28 +1294,25 @@ export async function handleWebhookEvent(event, payload) {
       case 'milestone.completed': {
         const cstId = payload.cst_id || payload.lead_id;
         if (cstId) {
-          try {
-            const result = await getLead(cstId);
-            const prospects = extractArray(result);
-            if (prospects[0]) await processProspect(prospects[0]);
-          } catch (err) { stats.errors.push({ error: err.message }); }
+          const result = await getLead(cstId);
+          const prospects = extractArray(result);
+          if (prospects[0]) await processProspect(prospects[0]);
         }
         await processMilestoneTriggers();
-        stats.processed++;
+        synced++;
         break;
       }
 
       default:
         console.warn(`[Webhook] Unknown event type: ${event}`);
     }
+    await syncLogComplete(logId, synced);
   } catch (err) {
-    stats.failed++;
-    stats.errors.push({ fatal: err.message });
     console.error(`[Webhook] Processing failed for ${event}:`, err.message);
+    await syncLogFail(logId, synced, err.message);
   }
 
-  await logSync({ sync_type: `webhook_${event}`, ...stats, started_at: startTime, log_id: logId });
-  return stats;
+  return { synced };
 }
 
 // ─── Scheduler ───────────────────────────────────────────────────

@@ -9,23 +9,37 @@ export function registerSyncTools(server) {
     'Last sync time, error rate, unmapped source count, circuit breaker status. Ops monitoring.',
     {},
     async () => {
-      // Last sync
-      const { data: lastSync } = await supabase
+      // Last completed sync per entity (most recent)
+      const { data: lastSyncs } = await supabase
         .from('lp_sync_log')
         .select('*')
+        .eq('status', 'completed')
         .order('completed_at', { ascending: false })
-        .limit(1)
-        .single();
+        .limit(20);
 
-      // Recent sync errors (last 24h)
+      // Deduplicate to one per entity_type
+      const lastByEntity = {};
+      for (const row of (lastSyncs || [])) {
+        if (!lastByEntity[row.entity_type]) {
+          lastByEntity[row.entity_type] = row;
+        }
+      }
+
+      // Currently running syncs
+      const { data: running } = await supabase
+        .from('lp_sync_log')
+        .select('entity_type, sync_type, records_synced, started_at')
+        .eq('status', 'running');
+
+      // Recent sync totals (last 24h)
       const oneDayAgo = new Date(Date.now() - 86400000).toISOString();
       const { data: recentSyncs } = await supabase
         .from('lp_sync_log')
-        .select('records_processed, records_failed, error_details')
+        .select('entity_type, records_synced, status')
         .gte('started_at', oneDayAgo);
 
-      const totalProcessed = (recentSyncs || []).reduce((s, r) => s + (r.records_processed || 0), 0);
-      const totalFailed = (recentSyncs || []).reduce((s, r) => s + (r.records_failed || 0), 0);
+      const totalSynced = (recentSyncs || []).reduce((s, r) => s + (r.records_synced || 0), 0);
+      const totalFailed = (recentSyncs || []).filter(r => r.status === 'failed').length;
 
       // Unmapped sources count
       const { count: unmappedCount } = await supabase
@@ -33,7 +47,7 @@ export function registerSyncTools(server) {
         .select('*', { count: 'exact', head: true })
         .eq('reviewed', false);
 
-      // Unfired milestones (act_date set but tag not fired)
+      // Unfired milestones
       const { count: unfiredMilestones } = await supabase
         .from('lp_job_milestones')
         .select('*', { count: 'exact', head: true })
@@ -55,14 +69,12 @@ export function registerSyncTools(server) {
         content: [{
           type: 'text',
           text: JSON.stringify({
-            last_sync: lastSync || null,
+            last_sync_by_entity: lastByEntity,
+            currently_running: running || [],
             last_24h: {
               syncs_run: recentSyncs?.length || 0,
-              records_processed: totalProcessed,
-              records_failed: totalFailed,
-              error_rate: totalProcessed > 0
-                ? `${((totalFailed / totalProcessed) * 100).toFixed(1)}%`
-                : 'N/A',
+              records_synced: totalSynced,
+              failed_syncs: totalFailed,
             },
             unmapped_sources: unmappedCount || 0,
             unfired_milestone_triggers: unfiredMilestones || 0,

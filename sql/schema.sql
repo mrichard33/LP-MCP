@@ -176,21 +176,21 @@ CREATE TABLE IF NOT EXISTS lp_dispositions (
 );
 
 -- =============================================================
--- 8. lp_sync_log (Operational Health)
+-- 8. lp_sync_log (Operational Health — one row per entity per sync)
 -- =============================================================
 CREATE TABLE IF NOT EXISTS lp_sync_log (
-  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  sync_type         TEXT,
-  records_processed INTEGER,
-  records_inserted  INTEGER,
-  records_updated   INTEGER,
-  records_failed    INTEGER,
-  table_counts      JSONB,            -- per-table breakdown: { leads: {processed,failed}, calls: {...}, ... }
-  error_details     JSONB,
-  started_at        TIMESTAMPTZ,
-  completed_at      TIMESTAMPTZ,
-  duration_ms       INTEGER
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  entity_type     TEXT NOT NULL,                  -- leads, calls, notes, jobs, milestones, activities, dispositions, sources, ghl_backfill
+  sync_type       TEXT NOT NULL DEFAULT 'full',   -- full, incremental, webhook_*
+  status          TEXT NOT NULL DEFAULT 'running', -- running, completed, failed
+  records_synced  INTEGER DEFAULT 0,
+  error_message   TEXT,
+  started_at      TIMESTAMPTZ DEFAULT now(),
+  completed_at    TIMESTAMPTZ
 );
+
+CREATE INDEX IF NOT EXISTS idx_sync_log_entity ON lp_sync_log(entity_type);
+CREATE INDEX IF NOT EXISTS idx_sync_log_status ON lp_sync_log(status);
 
 -- =============================================================
 -- 9. lp_source_mapping (sourcesubdescr/source → GHL intent bucket)
