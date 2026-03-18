@@ -1,9 +1,13 @@
 import axios from 'axios';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
+const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
 
 // Log GHL status at module load
 console.log(`[GHL] API key: ${GHL_API_KEY ? 'set' : 'MISSING — GHL matching will be disabled'}`);
+if (GHL_API_KEY && !GHL_LOCATION_ID) {
+  console.warn('[GHL] WARNING: GHL_LOCATION_ID not set — contact search/tag calls will fail without a location');
+}
 
 // ─── GHL Availability Check ─────────────────────────────────────
 // If GHL key is missing or fails auth, disable GHL for the rest of the sync
@@ -13,19 +17,24 @@ let ghlFailCount = 0;
 const GHL_FAIL_THRESHOLD = 5; // Disable after 5 consecutive failures
 
 const ghlClient = GHL_API_KEY ? axios.create({
-  baseURL: 'https://rest.gohighlevel.com/v1',
+  baseURL: 'https://services.leadconnectorhq.com',
   headers: {
     'Authorization': `Bearer ${GHL_API_KEY}`,
+    'Version': '2021-07-28',
     'Content-Type': 'application/json',
   },
   timeout: 10000,
 }) : null;
 
-// Search GHL contact by phone or email
+// Search GHL contact by phone or email (v2 API)
 export async function searchGHLContact(params) {
   if (ghlDisabled || !ghlClient) return null;
   try {
-    const { data } = await ghlClient.get('/contacts/search', { params });
+    // v2 API: GET /contacts/ with query param
+    const query = params.phone || params.email || '';
+    const { data } = await ghlClient.get('/contacts/', {
+      params: { query, locationId: process.env.GHL_LOCATION_ID },
+    });
     ghlFailCount = 0; // Reset on success
     return data?.contacts?.[0] || null;
   } catch (err) {
@@ -66,12 +75,13 @@ export async function matchToGHL(lpLead) {
   return null;
 }
 
-// Apply tag via POST (additive) — NEVER use PUT which replaces all tags
+// Apply tag via POST (additive) — NEVER use PUT which replaces all tags (v2 API)
 export async function applyGHLTag(ghlContactId, tag) {
   if (ghlDisabled || !ghlClient || !ghlContactId) return false;
   try {
     await ghlClient.post(`/contacts/${ghlContactId}/tags`, {
       tags: [tag],
+      locationId: process.env.GHL_LOCATION_ID,
     });
     ghlFailCount = 0;
     return true;
