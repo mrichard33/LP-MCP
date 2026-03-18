@@ -172,16 +172,21 @@ async function populateSourceMapping() {
     }
 
     // Also seed known defaults for unmapped sources seen in logs
+    let defaultsSeeded = 0;
     for (const [sourceKey, mapping] of Object.entries(DEFAULT_SOURCE_MAPPINGS)) {
-      await supabase.from('lp_source_mapping').upsert({
+      const { error } = await supabase.from('lp_source_mapping').upsert({
         lp_source_subdetail: sourceKey,
         lp_source_raw: null,
         ghl_intent_bucket: mapping.bucket,
         ghl_entry_tag: mapping.tag,
       }, { onConflict: 'lp_source_subdetail,lp_source_raw', ignoreDuplicates: false });
+      if (error) {
+        console.warn(`[Sync] Failed to seed default mapping "${sourceKey}":`, error.message);
+      } else {
+        defaultsSeeded++;
+      }
     }
-
-    if (inserted > 0) console.log(`[Sync] Source mapping: ${inserted} skeleton rows ensured`);
+    console.log(`[Sync] Source mapping: ${defaultsSeeded}/${Object.keys(DEFAULT_SOURCE_MAPPINGS).length} defaults seeded, ${inserted} sub-source skeletons ensured`);
   } catch (err) {
     console.warn('[Sync] Source enumeration failed:', err.message);
   }
@@ -262,17 +267,26 @@ async function backfillDispositionsFromLeads() {
 async function resolveSourceBucket(sourcesubdescr, source) {
   // Try sourcesubdescr first (primary intent signal)
   if (sourcesubdescr) {
-    const { data } = await supabase.from('lp_source_mapping')
+    const { data, error } = await supabase.from('lp_source_mapping')
       .select('ghl_intent_bucket, ghl_entry_tag')
-      .eq('lp_source_subdetail', sourcesubdescr).single();
-    if (data) return { bucket: data.ghl_intent_bucket, tag: data.ghl_entry_tag };
+      .eq('lp_source_subdetail', sourcesubdescr)
+      .maybeSingle();
+    if (error) console.warn(`[Sync] Source lookup error for subdetail="${sourcesubdescr}":`, error.message);
+    if (data && data.ghl_intent_bucket !== 'unmapped') {
+      return { bucket: data.ghl_intent_bucket, tag: data.ghl_entry_tag };
+    }
   }
   // Fall back to parent source field
   if (source) {
-    const { data } = await supabase.from('lp_source_mapping')
+    const { data, error } = await supabase.from('lp_source_mapping')
       .select('ghl_intent_bucket, ghl_entry_tag')
-      .eq('lp_source_raw', source).is('lp_source_subdetail', null).single();
-    if (data) return { bucket: data.ghl_intent_bucket, tag: data.ghl_entry_tag };
+      .eq('lp_source_raw', source)
+      .is('lp_source_subdetail', null)
+      .maybeSingle();
+    if (error) console.warn(`[Sync] Source lookup error for raw="${source}":`, error.message);
+    if (data && data.ghl_intent_bucket !== 'unmapped') {
+      return { bucket: data.ghl_intent_bucket, tag: data.ghl_entry_tag };
+    }
   }
   // Default — log for mapping review
   await logUnmappedSource(sourcesubdescr, source);
@@ -294,7 +308,7 @@ async function logUnmappedSource(sourceSubdetail, sourceRaw) {
     await supabase.from('lp_unmapped_sources').upsert({
       source_subdetail: sourceSubdetail || null,
       source_raw: sourceRaw || null,
-    }, { onConflict: 'source_subdetail,source_raw' }).catch(() => {});
+    }, { onConflict: 'source_subdetail,source_raw' });
   } catch (err) {
     // Non-critical
   }
