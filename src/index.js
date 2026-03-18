@@ -3,6 +3,7 @@ import express from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { registerAllTools } from './tools/index.js';
+import { startSyncScheduler, fullSync, incrementalSync } from './sync-engine.js';
 
 const PORT = process.env.PORT || 3000;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -63,8 +64,30 @@ app.post('/messages', authenticate, async (req, res) => {
   await transport.handlePostMessage(req, res);
 });
 
+// Manual sync endpoints
+app.post('/sync/full', authenticate, async (req, res) => {
+  try {
+    const stats = await fullSync();
+    res.json({ status: 'ok', sync_type: 'full', stats });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/sync/incremental', authenticate, async (req, res) => {
+  try {
+    const stats = await incrementalSync();
+    res.json({ status: 'ok', sync_type: 'incremental', stats });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`LP MCP Server v3.0 running on port ${PORT}`);
   console.log(`SSE endpoint: http://localhost:${PORT}/sse`);
   console.log(`Health check: http://localhost:${PORT}/health`);
+
+  // Start the sync scheduler — auto-detects first run vs incremental
+  startSyncScheduler();
 });
