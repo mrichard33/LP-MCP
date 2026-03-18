@@ -1281,7 +1281,7 @@ export async function fullSync() {
     const today = new Date();
     const tomorrow = new Date(today);
     tomorrow.setDate(tomorrow.getDate() + 1);
-    const START_YEAR = 2015;
+    const START_YEAR = 2000; // Must go back far enough to capture all historical leads
     const currentYear = today.getFullYear();
 
     for (let year = currentYear; year >= START_YEAR; year--) {
@@ -1355,7 +1355,15 @@ export async function fullSync() {
       console.error('[Sync] Failed to complete leads sync log:', logErr.message);
     }
 
-    console.log(`[Sync] PASS 1 complete — ${counts.leads} lead rows committed to lp_leads`);
+    // Diagnostic: verify actual row count in Supabase
+    try {
+      const { count: dbCount } = await supabase
+        .from('lp_leads')
+        .select('*', { count: 'exact', head: true });
+      console.log(`[Sync] PASS 1 complete — ${counts.leads} leads processed, ${dbCount} rows in lp_leads table`);
+    } catch (_) {
+      console.log(`[Sync] PASS 1 complete — ${counts.leads} lead rows committed to lp_leads`);
+    }
 
     // Step 2b: Backfill sources + dispositions from committed lead data
     await backfillSourceMappingsFromLeads();
