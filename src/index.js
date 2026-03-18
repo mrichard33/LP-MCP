@@ -60,40 +60,58 @@ app.get('/health', (req, res) => {
 // ─── Streamable HTTP transport (Claude.ai remote MCP) ───────────
 // Claude.ai connects via POST /mcp with Streamable HTTP protocol.
 // Each session gets its own transport+server instance.
+// Session ID is assigned by the transport during the initialize handshake.
 
 const streamableSessions = {};
 
-async function getOrCreateStreamableSession(sessionId) {
-  if (sessionId && streamableSessions[sessionId]) {
-    return streamableSessions[sessionId].transport;
+function isInitializeRequest(body) {
+  if (Array.isArray(body)) {
+    return body.some(msg => msg.method === 'initialize');
   }
-
-  // New session — create transport + connect a fresh MCP server instance
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => crypto.randomUUID(),
-  });
-  const sessionServer = new McpServer({
-    name: 'lp-mcp-server',
-    version: '5.0.0',
-    description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence',
-  });
-  registerAllTools(sessionServer);
-  await sessionServer.connect(transport);
-
-  const newId = transport.sessionId;
-  if (newId) {
-    streamableSessions[newId] = { transport, server: sessionServer };
-    transport.onclose = () => delete streamableSessions[newId];
-  }
-
-  return transport;
+  return body?.method === 'initialize';
 }
 
 app.post('/mcp', authenticate, async (req, res) => {
   try {
     const sessionId = req.headers['mcp-session-id'];
-    const transport = await getOrCreateStreamableSession(sessionId);
+
+    // Existing session — route to its transport
+    if (sessionId && streamableSessions[sessionId]) {
+      await streamableSessions[sessionId].transport.handleRequest(req, res, req.body);
+      return;
+    }
+
+    // New session — only allowed for initialize requests
+    if (!isInitializeRequest(req.body)) {
+      res.status(400).json({ jsonrpc: '2.0', error: { code: -32600, message: 'Bad Request: No valid session. Send an initialize request first.' }, id: null });
+      return;
+    }
+
+    // Create transport + MCP server for this session
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => crypto.randomUUID(),
+    });
+    const sessionServer = new McpServer({
+      name: 'lp-mcp-server',
+      version: '5.0.0',
+      description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence',
+    });
+    registerAllTools(sessionServer);
+    await sessionServer.connect(transport);
+
+    // Handle the initialize request — this assigns the session ID
     await transport.handleRequest(req, res, req.body);
+
+    // Now store the session (ID is set after handleRequest processes initialize)
+    const newId = transport.sessionId;
+    if (newId) {
+      streamableSessions[newId] = { transport, server: sessionServer };
+      console.log(`[MCP] New Streamable HTTP session: ${newId}`);
+      transport.onclose = () => {
+        delete streamableSessions[newId];
+        console.log(`[MCP] Session closed: ${newId}`);
+      };
+    }
   } catch (err) {
     console.error('[MCP] Streamable HTTP error:', err.message);
     if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
