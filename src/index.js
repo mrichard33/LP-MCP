@@ -4,6 +4,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { registerAllTools } from './tools/index.js';
 import { startSyncScheduler, fullSync, incrementalSync, handleWebhookEvent } from './sync-engine.js';
+import { testConnection } from './lp-client.js';
 import supabase from './supabase.js';
 
 const PORT = process.env.PORT || 3000;
@@ -38,8 +39,17 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     server: 'lp-mcp-server',
-    version: '4.0.0',
+    version: '4.1.0',
     uptime: process.uptime(),
+    lp_config: {
+      server_id: process.env.LP_SERVER_ID ? 'set' : 'MISSING',
+      client_id: process.env.LP_CLIENT_ID ? 'set' : 'MISSING',
+      username: process.env.LP_USERNAME ? 'set' : 'MISSING',
+      password: process.env.LP_PASSWORD ? 'set' : 'MISSING',
+      app_key: process.env.LP_APP_KEY ? 'set' : 'MISSING',
+    },
+    supabase: process.env.SUPABASE_URL ? 'configured' : 'MISSING',
+    ghl: process.env.GHL_API_KEY ? 'configured' : 'MISSING',
   });
 });
 
@@ -96,6 +106,17 @@ app.get('/sync/status', authenticate, async (req, res) => {
   }
 });
 
+// ─── LP API connection diagnostic ────────────────────────────────
+
+app.get('/lp/test', authenticate, async (req, res) => {
+  try {
+    const status = await testConnection();
+    res.json(status);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Webhook endpoint for LP (if LP supports outbound webhooks) ──
 
 app.post('/webhook/lp', async (req, res) => {
@@ -122,7 +143,7 @@ app.post('/webhook/lp', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`LP MCP Server v4.0 running on port ${PORT}`);
+  console.log(`LP MCP Server v4.1 running on port ${PORT}`);
   console.log(`SSE endpoint: http://localhost:${PORT}/sse`);
   console.log(`Health check: http://localhost:${PORT}/health`);
   console.log(`Webhook:      http://localhost:${PORT}/webhook/lp`);
