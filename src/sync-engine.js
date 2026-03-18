@@ -1,6 +1,6 @@
 import supabase from './supabase.js';
 import { getLeads, getLead, getLeadCalls, getLeadNotes, getLeadActivities, getJob, getDispositions, getLeadsUpdatedSince } from './lp-client.js';
-import { matchToGHL } from './ghl.js';
+import { matchToGHL, applyGHLTag } from './ghl.js';
 import { normalizeSourceAndTag } from './normalization.js';
 import { processMilestoneTriggers } from './milestones.js';
 
@@ -296,6 +296,20 @@ export async function fullSync() {
       console.warn('[Sync] Milestone processing failed:', err.message);
     }
 
+    // Step 4: Check Day 15 handoff condition
+    try {
+      await checkDay15Handoffs();
+    } catch (err) {
+      console.warn('[Sync] Day 15 check failed:', err.message);
+    }
+
+    // Step 5: Check lead-level triggers (demo completed, closed won, etc.)
+    try {
+      await checkLeadTriggers();
+    } catch (err) {
+      console.warn('[Sync] Lead trigger checks failed:', err.message);
+    }
+
   } catch (err) {
     console.error('[Sync] Full sync failed:', err.message);
     stats.errors.push({ fatal: err.message });
@@ -360,6 +374,20 @@ export async function incrementalSync() {
       console.warn('[Sync] Milestone processing failed:', err.message);
     }
 
+    // Check Day 15 handoff condition
+    try {
+      await checkDay15Handoffs();
+    } catch (err) {
+      console.warn('[Sync] Day 15 check failed:', err.message);
+    }
+
+    // Check lead-level triggers
+    try {
+      await checkLeadTriggers();
+    } catch (err) {
+      console.warn('[Sync] Lead trigger checks failed:', err.message);
+    }
+
   } catch (err) {
     console.error('[Sync] Incremental sync failed:', err.message);
     stats.errors.push({ fatal: err.message });
@@ -390,6 +418,176 @@ async function syncDispositions() {
   } catch (err) {
     console.warn('[Sync] Dispositions sync failed:', err.message);
   }
+}
+
+// ─── Day 15 Handoff — Automatic Check ────────────────────────────
+
+async function checkDay15Handoffs() {
+  try {
+    // Find leads ≥15 days old, not closed, no Day 15 tag yet, with a GHL contact
+    const fifteenDaysAgo = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString();
+    const { data: eligibleLeads, error } = await supabase
+      .from('lp_leads')
+      .select('lp_lead_id, ghl_contact_id, first_name, last_name, created_at_lp, last_contact_date')
+      .eq('lp_day15_triggered', false)
+      .eq('closed_won', false)
+      .not('ghl_contact_id', 'is', null)
+      .lt('created_at_lp', fifteenDaysAgo);
+
+    if (error) {
+      console.error('[Sync] Day 15 query failed:', error.message);
+      return { triggered: 0 };
+    }
+
+    let triggered = 0;
+
+    for (const lead of (eligibleLeads || [])) {
+      // Additional check: last_contact_date > 14 days ago (or null)
+      if (lead.last_contact_date) {
+        const lastContact = new Date(lead.last_contact_date);
+        const fourteenDaysAgo = Date.now() - 14 * 24 * 60 * 60 * 1000;
+        if (lastContact.getTime() > fourteenDaysAgo) continue;
+      }
+
+      const success = await applyGHLTag(lead.ghl_contact_id, 'lp-day15-handoff');
+
+      if (success) {
+        await supabase.from('lp_leads')
+          .update({ lp_day15_triggered: true })
+          .eq('lp_lead_id', lead.lp_lead_id);
+
+        await supabase.from('lp_trigger_log').insert({
+          lp_lead_id: lead.lp_lead_id,
+          ghl_contact_id: lead.ghl_contact_id,
+          event: 'day15_handoff_auto',
+          tag_fired: 'lp-day15-handoff',
+          status: 'success',
+        });
+        triggered++;
+      }
+    }
+
+    if (triggered > 0) {
+      console.log(`[Sync] Day 15 handoff: ${triggered} leads triggered for W11.0 enrollment`);
+    }
+    return { triggered };
+  } catch (err) {
+    console.error('[Sync] Day 15 handoff check failed:', err.message);
+    return { triggered: 0 };
+  }
+}
+
+// ─── Lead-Level Trigger Checks ───────────────────────────────────
+
+async function checkLeadTriggers() {
+  try {
+    // Check for demo_completed leads needing tag
+    const { data: demoLeads } = await supabase
+      .from('lp_leads')
+      .select('lp_lead_id, ghl_contact_id')
+      .eq('demo_completed', true)
+      .not('ghl_contact_id', 'is', null)
+      .not('raw_lp_data->demo_tag_fired', 'eq', true);
+
+    // Check for closed_won leads needing tag
+    const { data: wonLeads } = await supabase
+      .from('lp_leads')
+      .select('lp_lead_id, ghl_contact_id')
+      .eq('closed_won', true)
+      .not('ghl_contact_id', 'is', null)
+      .not('raw_lp_data->won_tag_fired', 'eq', true);
+
+    // These are best-effort — failures don't block sync
+    for (const lead of (demoLeads || [])) {
+      await applyGHLTag(lead.ghl_contact_id, 'lp-demo-completed');
+    }
+    for (const lead of (wonLeads || [])) {
+      await applyGHLTag(lead.ghl_contact_id, 'deal-won');
+    }
+  } catch (err) {
+    console.warn('[Sync] Lead trigger checks failed:', err.message);
+  }
+}
+
+// ─── Webhook Handler ─────────────────────────────────────────────
+
+export async function handleWebhookEvent(event, payload) {
+  const startTime = new Date();
+  const stats = { processed: 0, failed: 0, errors: [] };
+
+  try {
+    switch (event) {
+      case 'lead.created':
+      case 'lead.updated':
+      case 'lead.disposition_changed': {
+        const lead = payload.lead || payload;
+        await syncSingleLead(lead);
+        stats.processed++;
+
+        // Run source normalization + Day 15 check inline
+        await processMilestoneTriggers();
+        break;
+      }
+
+      case 'job.status_changed': {
+        const job = payload.job || payload;
+        // Re-sync the lead to pick up job changes
+        if (job.lead_id || job.lp_lead_id) {
+          try {
+            const lead = await getLead(job.lead_id || job.lp_lead_id);
+            await syncSingleLead(lead);
+          } catch (err) {
+            stats.errors.push({ error: err.message });
+          }
+        }
+        await processMilestoneTriggers();
+        stats.processed++;
+        break;
+      }
+
+      case 'call.logged':
+      case 'note.added': {
+        const leadId = payload.lead_id || payload.lp_lead_id;
+        if (leadId) {
+          try {
+            const lead = await getLead(leadId);
+            await syncSingleLead(lead);
+            stats.processed++;
+          } catch (err) {
+            stats.failed++;
+            stats.errors.push({ lead_id: leadId, error: err.message });
+          }
+        }
+        break;
+      }
+
+      case 'milestone.completed': {
+        // Immediate milestone fire
+        const leadId = payload.lead_id || payload.lp_lead_id;
+        if (leadId) {
+          try {
+            const lead = await getLead(leadId);
+            await syncSingleLead(lead);
+          } catch (err) {
+            stats.errors.push({ error: err.message });
+          }
+        }
+        await processMilestoneTriggers();
+        stats.processed++;
+        break;
+      }
+
+      default:
+        console.warn(`[Webhook] Unknown event type: ${event}`);
+    }
+  } catch (err) {
+    stats.failed++;
+    stats.errors.push({ fatal: err.message });
+    console.error(`[Webhook] Event processing failed for ${event}:`, err.message);
+  }
+
+  await logSync(`webhook_${event}`, stats, startTime);
+  return stats;
 }
 
 // ─── Scheduler ───────────────────────────────────────────────────

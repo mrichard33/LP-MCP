@@ -3,7 +3,8 @@ import express from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { registerAllTools } from './tools/index.js';
-import { startSyncScheduler, fullSync, incrementalSync } from './sync-engine.js';
+import { startSyncScheduler, fullSync, incrementalSync, handleWebhookEvent } from './sync-engine.js';
+import supabase from './supabase.js';
 
 const PORT = process.env.PORT || 3000;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -11,7 +12,7 @@ const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 // Create MCP server
 const server = new McpServer({
   name: 'lp-mcp-server',
-  version: '3.0.0',
+  version: '4.0.0',
   description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence',
 });
 
@@ -20,6 +21,7 @@ registerAllTools(server);
 
 // Express app for SSE transport
 const app = express();
+app.use(express.json());
 
 // Auth middleware
 function authenticate(req, res, next) {
@@ -36,7 +38,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     server: 'lp-mcp-server',
-    version: '3.0.0',
+    version: '4.0.0',
     uptime: process.uptime(),
   });
 });
@@ -64,29 +66,66 @@ app.post('/messages', authenticate, async (req, res) => {
   await transport.handlePostMessage(req, res);
 });
 
-// Manual sync endpoints
+// ─── Manual sync endpoints (fire-and-forget per v4 spec) ─────────
+
 app.post('/sync/full', authenticate, async (req, res) => {
-  try {
-    const stats = await fullSync();
-    res.json({ status: 'ok', sync_type: 'full', stats });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  res.json({ status: 'started', type: 'full' });
+  fullSync().catch(err => console.error('[Sync] Manual full sync failed:', err.message));
 });
 
 app.post('/sync/incremental', authenticate, async (req, res) => {
+  res.json({ status: 'started', type: 'incremental' });
+  incrementalSync().catch(err => console.error('[Sync] Manual incremental sync failed:', err.message));
+});
+
+// GET /sync/status — last 5 sync records
+app.get('/sync/status', authenticate, async (req, res) => {
   try {
-    const stats = await incrementalSync();
-    res.json({ status: 'ok', sync_type: 'incremental', stats });
+    const { data, error } = await supabase
+      .from('lp_sync_log')
+      .select('*')
+      .order('started_at', { ascending: false })
+      .limit(5);
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+    res.json(data);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// ─── Webhook endpoint for LP (if LP supports outbound webhooks) ──
+
+app.post('/webhook/lp', async (req, res) => {
+  // Validate webhook secret if configured
+  const webhookSecret = process.env.N8N_WEBHOOK_SECRET;
+  if (webhookSecret) {
+    const provided = req.headers['x-webhook-secret'] || req.query.secret;
+    if (provided !== webhookSecret) {
+      return res.status(401).json({ error: 'Invalid webhook secret' });
+    }
+  }
+
+  const event = req.body.event || req.headers['x-lp-event'] || 'lead.updated';
+  const payload = req.body.data || req.body;
+
+  console.log(`[Webhook] Received event: ${event}`);
+
+  // Respond immediately — process async
+  res.json({ status: 'accepted', event });
+
+  handleWebhookEvent(event, payload).catch(err =>
+    console.error(`[Webhook] Processing failed for ${event}:`, err.message)
+  );
+});
+
 app.listen(PORT, () => {
-  console.log(`LP MCP Server v3.0 running on port ${PORT}`);
+  console.log(`LP MCP Server v4.0 running on port ${PORT}`);
   console.log(`SSE endpoint: http://localhost:${PORT}/sse`);
   console.log(`Health check: http://localhost:${PORT}/health`);
+  console.log(`Webhook:      http://localhost:${PORT}/webhook/lp`);
 
   // Start the sync scheduler — auto-detects first run vs incremental
   startSyncScheduler();
