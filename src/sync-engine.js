@@ -38,6 +38,26 @@ function normalizePhone(phone) {
   return phone.replace(/\D/g, '') || null;
 }
 
+// ─── Case-insensitive field extraction ──────────────────────────
+// LP API returns inconsistent casing (phone1, Phone1, PHONE1, etc.).
+// Try exact keys first, then case-insensitive fallback.
+function getField(obj, ...keys) {
+  if (!obj) return null;
+  for (const k of keys) {
+    if (obj[k] !== undefined && obj[k] !== null && obj[k] !== '') return obj[k];
+  }
+  const objKeys = Object.keys(obj);
+  for (const k of keys) {
+    const lower = k.toLowerCase();
+    const match = objKeys.find(ok => ok.toLowerCase() === lower);
+    if (match && obj[match] !== undefined && obj[match] !== null && obj[match] !== '') return obj[match];
+  }
+  return null;
+}
+
+// Track whether we've logged the first record's keys for each entity type
+const loggedFirstKeys = new Set();
+
 // ─── Extract array from LP API response ──────────────────────────
 // LP may return a direct array, or nested under various keys.
 function extractArray(response) {
@@ -96,6 +116,15 @@ async function getLastSyncTimestamp() {
 
 // ─── Source Enumeration — Run before first sync ──────────────────
 
+// Known source → bucket mappings. Add new entries here as Ryan classifies them.
+const DEFAULT_SOURCE_MAPPINGS = {
+  'Canvass':       { bucket: 'canvassing',  tag: 'entry:canvassing' },
+  'Home Show':     { bucket: 'event',       tag: 'entry:event' },
+  'RV Show':       { bucket: 'event',       tag: 'entry:event' },
+  'Modernize':     { bucket: 'internet',    tag: 'entry:internet' },
+  'Priceless':     { bucket: 'affiliate',   tag: 'entry:affiliate' },
+};
+
 async function populateSourceMapping() {
   try {
     // Get all sub-sources (sourcesubdescr values) — PRIMARY lookup key
@@ -115,6 +144,34 @@ async function populateSourceMapping() {
     if (srcArr.length > 0) {
       console.log('[Sync] Parent source sample:', JSON.stringify(srcArr.slice(0, 5)));
     }
+
+    // Insert skeleton rows for each sub-source — gives Ryan classifiable rows
+    let inserted = 0;
+    for (const s of subArr) {
+      const key = s.key || s.Key || s.value || s.Value;
+      if (!key) continue;
+      // Check if a known default mapping exists
+      const defaultMap = DEFAULT_SOURCE_MAPPINGS[key];
+      const { error } = await supabase.from('lp_source_mapping').upsert({
+        lp_source_subdetail: key,
+        lp_source_raw: null,
+        ghl_intent_bucket: defaultMap?.bucket || 'unmapped',
+        ghl_entry_tag: defaultMap?.tag || 'entry:unmapped',
+      }, { onConflict: 'lp_source_subdetail,lp_source_raw', ignoreDuplicates: true }).catch(() => ({}));
+      if (!error) inserted++;
+    }
+
+    // Also seed known defaults for unmapped sources seen in logs
+    for (const [sourceKey, mapping] of Object.entries(DEFAULT_SOURCE_MAPPINGS)) {
+      await supabase.from('lp_source_mapping').upsert({
+        lp_source_subdetail: sourceKey,
+        lp_source_raw: null,
+        ghl_intent_bucket: mapping.bucket,
+        ghl_entry_tag: mapping.tag,
+      }, { onConflict: 'lp_source_subdetail,lp_source_raw', ignoreDuplicates: false }).catch(() => {});
+    }
+
+    if (inserted > 0) console.log(`[Sync] Source mapping: ${inserted} skeleton rows ensured`);
   } catch (err) {
     console.warn('[Sync] Source enumeration failed:', err.message);
   }
@@ -152,6 +209,41 @@ async function syncDispositions() {
     console.log(`[Sync] Synced ${synced} dispositions`);
   } catch (err) {
     console.warn('[Sync] Dispositions sync failed:', err.message);
+  }
+}
+
+// ─── Backfill Dispositions From Lead Data ────────────────────────
+// LP reference endpoint only returns configured dispositions (usually 2).
+// The remaining codes exist on lead records — scan and backfill.
+
+async function backfillDispositionsFromLeads() {
+  try {
+    const { data } = await supabase
+      .from('lp_leads')
+      .select('disposition_code')
+      .not('disposition_code', 'is', null);
+    if (!data || data.length === 0) return;
+
+    const codes = [...new Set(data.map(r => r.disposition_code).filter(Boolean))];
+    let added = 0;
+    for (const code of codes) {
+      const { data: existing } = await supabase
+        .from('lp_dispositions')
+        .select('disposition_code')
+        .eq('disposition_code', code)
+        .maybeSingle();
+      if (!existing) {
+        await supabase.from('lp_dispositions').upsert({
+          disposition_code: code,
+          disposition_label: code, // placeholder until manually labeled
+          synced_at: new Date().toISOString(),
+        }, { onConflict: 'disposition_code' });
+        added++;
+      }
+    }
+    if (added > 0) console.log(`[Sync] Backfilled ${added} dispositions from lead data (total codes: ${codes.length})`);
+  } catch (err) {
+    console.warn('[Sync] Disposition backfill failed:', err.message);
   }
 }
 
@@ -218,34 +310,48 @@ const MDT_TAG_MAP = {
 // with milestones[] inside.
 
 async function processProspect(prospect) {
+  // Log prospect keys once for diagnostic purposes
+  if (!loggedFirstKeys.has('prospect')) {
+    loggedFirstKeys.add('prospect');
+    console.log('[Sync] Prospect record keys:', Object.keys(prospect).join(', '));
+  }
+
   // 1. Match to GHL contact (phone primary → alt phone → email)
   let ghlId = null;
   try {
     ghlId = await matchToGHL({
-      phone: normalizePhone(prospect.phone1 || prospect.Phone1 || prospect.phone),
-      phone_alt: normalizePhone(prospect.altphones?.[0]?.phone || prospect.Phone2 || prospect.phone_alt),
-      email: prospect.email || prospect.Email || null,
+      phone: normalizePhone(getField(prospect, 'phone1', 'Phone1', 'phone', 'Phone')),
+      phone_alt: normalizePhone(prospect.altphones?.[0]?.phone || getField(prospect, 'Phone2', 'phone2', 'phone_alt')),
+      email: getField(prospect, 'email', 'Email'),
     });
   } catch (err) {
     console.warn(`[Sync] GHL match failed for prospect ${prospect.cst_id}:`, err.message);
   }
 
   // 2. Process each lead record under this prospect
-  const leads = prospect.leads || prospect.Leads || [];
+  const leads = getField(prospect, 'leads', 'Leads') || [];
   if (leads.length === 0) {
     // Some endpoints return flat data — treat the prospect itself as a lead
     await upsertLeadFromFlat(prospect, ghlId);
-    return;
+    return { calls: 0, notes: 0, jobs: 0, milestones: 0 };
   }
+
+  // Log lead keys once
+  if (!loggedFirstKeys.has('lead') && leads.length > 0) {
+    loggedFirstKeys.add('lead');
+    console.log('[Sync] Lead record keys:', Object.keys(leads[0]).join(', '));
+  }
+
+  let subCounts = { calls: 0, notes: 0, jobs: 0, milestones: 0 };
 
   for (const lead of leads) {
     const { bucket, tag } = await resolveSourceBucket(
-      lead.sourcesubdescr || lead.SourceSubDescr,
-      lead.source || lead.Source,
+      getField(lead, 'sourcesubdescr', 'SourceSubDescr'),
+      getField(lead, 'source', 'Source'),
     );
 
-    const lpLeadId = String(lead.id || lead.lds_id || lead.LeadID);
-    const lpProspectId = String(prospect.cst_id || prospect.CstID || prospect.prospectid);
+    const lpLeadId = String(getField(lead, 'id', 'lds_id', 'LeadID'));
+    const lpProspectId = String(getField(prospect, 'cst_id', 'CstID', 'prospectid', 'ProspectID'));
 
     // 3. Check existing state
     const { data: existing } = await supabase
@@ -255,34 +361,41 @@ async function processProspect(prospect) {
       .single();
 
     // 4. Upsert core lead record
+    const apptSet = getField(lead, 'apptset', 'ApptSet');
+    const sat = getField(lead, 'sat', 'Sat');
+    const sold = getField(lead, 'sold', 'Sold');
+    const isApptSet = apptSet === 'true' || apptSet === true;
+    const isDemoCompleted = sat === 'true' || sat === true;
+    const isClosedWon = sold === 'true' || sold === true;
+
     const { error: upsertErr } = await supabase.from('lp_leads').upsert({
       lp_lead_id:         lpLeadId,
       lp_prospect_id:     lpProspectId,
       ghl_contact_id:     ghlId,
-      first_name:         prospect.firstname || prospect.FirstName || null,
-      last_name:          prospect.lastname  || prospect.LastName  || null,
-      email:              prospect.email      || prospect.Email     || null,
-      phone:              normalizePhone(prospect.phone1 || prospect.Phone1),
-      phone_alt:          normalizePhone(prospect.altphones?.[0]?.phone || prospect.Phone2),
-      address:            prospect.address1   || prospect.Address1  || null,
-      city:               prospect.city       || prospect.City      || null,
-      state:              prospect.state      || prospect.State     || null,
-      zip:                prospect.zip        || prospect.Zip       || null,
-      lead_source:        lead.source         || lead.Source        || null,
-      lead_source_detail: lead.sourcesubdescr || lead.SourceSubDescr || null,
-      promoter_name:      lead.promotername   || lead.PromoterName  || null,
+      first_name:         getField(prospect, 'firstname', 'FirstName', 'first_name'),
+      last_name:          getField(prospect, 'lastname', 'LastName', 'last_name'),
+      email:              getField(prospect, 'email', 'Email'),
+      phone:              normalizePhone(getField(prospect, 'phone1', 'Phone1', 'phone')),
+      phone_alt:          normalizePhone(prospect.altphones?.[0]?.phone || getField(prospect, 'Phone2', 'phone2')),
+      address:            getField(prospect, 'address1', 'Address1'),
+      city:               getField(prospect, 'city', 'City'),
+      state:              getField(prospect, 'state', 'State'),
+      zip:                getField(prospect, 'zip', 'Zip'),
+      lead_source:        getField(lead, 'source', 'Source'),
+      lead_source_detail: getField(lead, 'sourcesubdescr', 'SourceSubDescr'),
+      promoter_name:      getField(lead, 'promotername', 'PromoterName'),
       ghl_intent_bucket:  bucket,
       ghl_entry_tag:      tag,
-      disposition_code:   lead.disposition    || lead.Disposition   || null,
-      rep_name:           lead.salesrepname   || lead.SalesRepName  || null,
-      appointment_set:    lead.apptset === 'true' || lead.apptset === true,
-      appointment_date:   lead.apptdate       || lead.ApptDate      || null,
-      demo_completed:     lead.sat === 'true'  || lead.sat === true,
-      demo_date:          (lead.sat === 'true' || lead.sat === true) ? (lead.apptdate || lead.ApptDate) : null,
-      closed_won:         lead.sold === 'true' || lead.sold === true,
-      job_value:          parseFloat(lead.gsa || lead.GSA) || null,
-      created_at_lp:      lead.entrydate      || lead.EntryDate     || null,
-      updated_at_lp:      lead.lastchangedon  || lead.LastChangedOn || null,
+      disposition_code:   getField(lead, 'disposition', 'Disposition'),
+      rep_name:           getField(lead, 'salesrepname', 'SalesRepName'),
+      appointment_set:    isApptSet,
+      appointment_date:   getField(lead, 'apptdate', 'ApptDate'),
+      demo_completed:     isDemoCompleted,
+      demo_date:          isDemoCompleted ? getField(lead, 'apptdate', 'ApptDate') : null,
+      closed_won:         isClosedWon,
+      job_value:          parseFloat(getField(lead, 'gsa', 'GSA', 'grossamount', 'GrossAmount') || 0) || null,
+      created_at_lp:      getField(lead, 'entrydate', 'EntryDate'),
+      updated_at_lp:      getField(lead, 'lastchangedon', 'LastChangedOn'),
       synced_at:          new Date().toISOString(),
       raw_lp_data:        prospect,
     }, { onConflict: 'lp_lead_id' });
@@ -302,15 +415,21 @@ async function processProspect(prospect) {
     }
 
     // 6. Sync call logs from prospect.calls[] array
-    const calls = prospect.calls || prospect.Calls || [];
+    const calls = getField(prospect, 'calls', 'Calls') || [];
+    subCounts.calls += calls.length;
     await syncCallLogs(lpLeadId, ghlId, calls);
 
     // 7. Sync notes from prospect.notes[] + lead.notes[]
-    const notes = [...(prospect.notes || prospect.Notes || []), ...(lead.notes || lead.Notes || [])];
+    const notes = [...(getField(prospect, 'notes', 'Notes') || []), ...(getField(lead, 'notes', 'Notes') || [])];
+    subCounts.notes += notes.length;
     await syncNotes(lpLeadId, ghlId, notes);
 
     // 8. Sync jobs + milestones from lead.jobs[]
-    for (const job of lead.jobs || lead.Jobs || []) {
+    const jobs = getField(lead, 'jobs', 'Jobs') || [];
+    subCounts.jobs += jobs.length;
+    for (const job of jobs) {
+      const milestones = getField(job, 'milestones', 'Milestones') || [];
+      subCounts.milestones += milestones.length;
       await syncJobAndMilestones(job, lpLeadId, ghlId);
     }
 
@@ -318,37 +437,39 @@ async function processProspect(prospect) {
     if (!existing?.lp_day15_triggered && ghlId) {
       await checkDay15Handoff(
         lpLeadId, ghlId,
-        lead.entrydate || lead.EntryDate,
-        lead.disposition || lead.Disposition,
+        getField(lead, 'entrydate', 'EntryDate'),
+        getField(lead, 'disposition', 'Disposition'),
       );
     }
   }
+
+  return subCounts;
 }
 
 // Fallback: upsert from flat data (when LP returns non-nested response)
 async function upsertLeadFromFlat(lp, ghlId) {
-  const lpLeadId = String(lp.lds_id || lp.id || lp.LeadID || lp.cst_id || lp.ProspectID);
-  const lpProspectId = String(lp.cst_id || lp.CstID || lp.ProspectID || '');
+  const lpLeadId = String(getField(lp, 'lds_id', 'id', 'LeadID', 'cst_id', 'ProspectID'));
+  const lpProspectId = String(getField(lp, 'cst_id', 'CstID', 'ProspectID') || '');
 
   await supabase.from('lp_leads').upsert({
     lp_lead_id:         lpLeadId,
     lp_prospect_id:     lpProspectId,
     ghl_contact_id:     ghlId,
-    first_name:         lp.firstname  || lp.FirstName  || lp.first_name || null,
-    last_name:          lp.lastname   || lp.LastName   || lp.last_name  || null,
-    email:              lp.email      || lp.Email      || null,
-    phone:              normalizePhone(lp.phone1 || lp.Phone1 || lp.phone || lp.Phone),
-    phone_alt:          normalizePhone(lp.phone2 || lp.Phone2 || lp.phone_alt),
-    address:            lp.address1   || lp.Address1   || null,
-    city:               lp.city       || lp.City       || null,
-    state:              lp.state      || lp.State      || null,
-    zip:                lp.zip        || lp.Zip        || null,
-    lead_source:        lp.source     || lp.Source     || null,
-    lead_source_detail: lp.sourcesubdescr || lp.SourceSubDescr || null,
-    disposition_code:   lp.disposition || lp.Disposition || null,
-    rep_name:           lp.salesrepname || lp.SalesRepName || lp.rep_name || null,
-    created_at_lp:      lp.entrydate  || lp.EntryDate  || lp.dateadded || null,
-    updated_at_lp:      lp.lastchangedon || lp.LastChangedOn || null,
+    first_name:         getField(lp, 'firstname', 'FirstName', 'first_name'),
+    last_name:          getField(lp, 'lastname', 'LastName', 'last_name'),
+    email:              getField(lp, 'email', 'Email'),
+    phone:              normalizePhone(getField(lp, 'phone1', 'Phone1', 'phone', 'Phone')),
+    phone_alt:          normalizePhone(getField(lp, 'phone2', 'Phone2', 'phone_alt')),
+    address:            getField(lp, 'address1', 'Address1'),
+    city:               getField(lp, 'city', 'City'),
+    state:              getField(lp, 'state', 'State'),
+    zip:                getField(lp, 'zip', 'Zip'),
+    lead_source:        getField(lp, 'source', 'Source'),
+    lead_source_detail: getField(lp, 'sourcesubdescr', 'SourceSubDescr'),
+    disposition_code:   getField(lp, 'disposition', 'Disposition'),
+    rep_name:           getField(lp, 'salesrepname', 'SalesRepName', 'rep_name'),
+    created_at_lp:      getField(lp, 'entrydate', 'EntryDate', 'dateadded'),
+    updated_at_lp:      getField(lp, 'lastchangedon', 'LastChangedOn'),
     synced_at:          new Date().toISOString(),
     raw_lp_data:        lp,
   }, { onConflict: 'lp_lead_id' });
@@ -357,21 +478,27 @@ async function upsertLeadFromFlat(lp, ghlId) {
 // ─── Call Log Sync ───────────────────────────────────────────────
 
 async function syncCallLogs(lpLeadId, ghlContactId, calls) {
+  // Log first call record keys for diagnostic purposes
+  if (calls.length > 0 && !loggedFirstKeys.has('call')) {
+    loggedFirstKeys.add('call');
+    console.log('[Sync] Call record keys:', Object.keys(calls[0]).join(', '));
+  }
+
   for (const call of calls) {
-    const callId = String(call.id || call.call_id || call.CallID || `${lpLeadId}-${call.calldate || call.CallDate}-${Math.random()}`);
+    const callId = String(getField(call, 'id', 'call_id', 'CallID') || `${lpLeadId}-${getField(call, 'calldate', 'CallDate', 'date') || Math.random()}`);
     try {
       await supabase.from('lp_call_logs').upsert({
         lp_call_id:        callId,
         lp_lead_id:        lpLeadId,
         ghl_contact_id:    ghlContactId || null,
-        call_date:         call.calldate     || call.CallDate    || call.date || null,
-        call_duration_sec: call.duration     || call.Duration    || null,
-        call_result:       call.resultcode   || call.ResultCode  || call.result || null,
-        call_direction:    call.calltype     || call.CallType    || null,  // A=Outbound, I=Inbound
-        rep_id:            call.emp_id       || call.EmpID       || null,
-        rep_name:          call.agentname    || call.AgentName   || call.rep_name || null,
-        call_notes:        call.notes        || call.Notes       || null,
-        recording_url:     call.recording_url || call.RecordingURL || null,
+        call_date:         getField(call, 'calldate', 'CallDate', 'date', 'call_date'),
+        call_duration_sec: getField(call, 'duration', 'Duration', 'call_duration', 'callduration'),
+        call_result:       getField(call, 'resultcode', 'ResultCode', 'result', 'callresult', 'CallResult'),
+        call_direction:    getField(call, 'calltype', 'CallType', 'direction', 'call_direction'),
+        rep_id:            getField(call, 'emp_id', 'EmpID', 'empid', 'rep_id'),
+        rep_name:          getField(call, 'agentname', 'AgentName', 'rep_name', 'agent_name'),
+        call_notes:        getField(call, 'notes', 'Notes', 'call_notes', 'CallNotes'),
+        recording_url:     getField(call, 'recording_url', 'RecordingURL', 'recordingurl', 'recording'),
         synced_at:         new Date().toISOString(),
         raw_lp_data:       call,
       }, { onConflict: 'lp_call_id' });
@@ -384,18 +511,24 @@ async function syncCallLogs(lpLeadId, ghlContactId, calls) {
 // ─── Notes Sync ──────────────────────────────────────────────────
 
 async function syncNotes(lpLeadId, ghlContactId, notes) {
+  // Log first note record keys for diagnostic purposes
+  if (notes.length > 0 && !loggedFirstKeys.has('note')) {
+    loggedFirstKeys.add('note');
+    console.log('[Sync] Note record keys:', Object.keys(notes[0]).join(', '));
+  }
+
   for (const note of notes) {
-    const noteId = String(note.id || note.note_id || note.NoteID || `${lpLeadId}-${note.date || note.Date}-${Math.random()}`);
+    const noteId = String(getField(note, 'id', 'note_id', 'NoteID') || `${lpLeadId}-${getField(note, 'date', 'Date', 'enteredon') || Math.random()}`);
     try {
       await supabase.from('lp_notes').upsert({
         lp_note_id:          noteId,
         lp_lead_id:          lpLeadId,
         ghl_contact_id:      ghlContactId || null,
-        note_body:           note.notes    || note.Notes   || note.body    || note.text || null,
-        note_type:           note.rectype  || note.RecType || note.type    || null,
-        note_category:       note.category || note.Category || null,
-        created_by_rep_name: note.enteredby || note.EnteredBy || note.rep_name || null,
-        created_at_lp:       note.date      || note.Date     || note.enteredon || null,
+        note_body:           getField(note, 'notes', 'Notes', 'body', 'text', 'note_body', 'NoteBody', 'content', 'Content'),
+        note_type:           getField(note, 'rectype', 'RecType', 'type', 'note_type'),
+        note_category:       getField(note, 'category', 'Category'),
+        created_by_rep_name: getField(note, 'enteredby', 'EnteredBy', 'rep_name', 'entered_by'),
+        created_at_lp:       getField(note, 'date', 'Date', 'enteredon', 'EnteredOn', 'created_at'),
         synced_at:           new Date().toISOString(),
         raw_lp_data:         note,
       }, { onConflict: 'lp_note_id' });
@@ -408,7 +541,13 @@ async function syncNotes(lpLeadId, ghlContactId, notes) {
 // ─── Job + Milestone Sync — syncJobAndMilestones() ───────────────
 
 async function syncJobAndMilestones(job, lpLeadId, ghlContactId) {
-  const jobId = String(job.id || job.job_id || job.JobID);
+  // Log first job record keys for diagnostic purposes
+  if (!loggedFirstKeys.has('job')) {
+    loggedFirstKeys.add('job');
+    console.log('[Sync] Job record keys:', Object.keys(job).join(', '));
+  }
+
+  const jobId = String(getField(job, 'id', 'job_id', 'JobID'));
 
   // Upsert job record
   try {
@@ -416,11 +555,11 @@ async function syncJobAndMilestones(job, lpLeadId, ghlContactId) {
       lp_job_id:       jobId,
       lp_lead_id:      lpLeadId,
       ghl_contact_id:  ghlContactId || null,
-      job_status:      job.jobstatus   || job.JobStatus   || null,
-      job_value:       parseFloat(job.grossamount || job.GrossAmount || job.gsa) || null,
-      rep_name:        job.salesrepname || job.SalesRepName || null,
-      created_at_lp:   job.entrydate   || job.EntryDate   || null,
-      updated_at_lp:   job.lastchangedon || job.LastChangedOn || null,
+      job_status:      getField(job, 'jobstatus', 'JobStatus', 'job_status'),
+      job_value:       parseFloat(getField(job, 'grossamount', 'GrossAmount', 'gsa', 'GSA') || 0) || null,
+      rep_name:        getField(job, 'salesrepname', 'SalesRepName', 'rep_name'),
+      created_at_lp:   getField(job, 'entrydate', 'EntryDate'),
+      updated_at_lp:   getField(job, 'lastchangedon', 'LastChangedOn'),
       synced_at:       new Date().toISOString(),
       raw_lp_data:     job,
     }, { onConflict: 'lp_job_id' });
@@ -429,8 +568,16 @@ async function syncJobAndMilestones(job, lpLeadId, ghlContactId) {
   }
 
   // Process each milestone
-  for (const ms of job.milestones || job.Milestones || []) {
-    const mdtId = ms.mdt_id || ms.MDT_ID || ms.MdtId;
+  const milestones = getField(job, 'milestones', 'Milestones') || [];
+
+  // Log first milestone record keys
+  if (milestones.length > 0 && !loggedFirstKeys.has('milestone')) {
+    loggedFirstKeys.add('milestone');
+    console.log('[Sync] Milestone record keys:', Object.keys(milestones[0]).join(', '));
+  }
+
+  for (const ms of milestones) {
+    const mdtId = getField(ms, 'mdt_id', 'MDT_ID', 'MdtId');
     if (!mdtId) continue;
 
     // Check existing state
@@ -445,11 +592,11 @@ async function syncJobAndMilestones(job, lpLeadId, ghlContactId) {
         lp_lead_id:      lpLeadId,
         ghl_contact_id:  ghlContactId || null,
         mdt_id:          mdtId,
-        datetype:        ms.datetype    || ms.DateType   || null,
-        est_date:        ms.estdate     || ms.EstDate    || null,
-        act_date:        ms.actdate     || ms.ActDate    || null,
-        entered_by:      ms.enteredby   || ms.EnteredBy  || null,
-        entered_on:      ms.enteredon   || ms.EnteredOn  || null,
+        datetype:        getField(ms, 'datetype', 'DateType'),
+        est_date:        getField(ms, 'estdate', 'EstDate', 'est_date'),
+        act_date:        getField(ms, 'actdate', 'ActDate', 'act_date'),
+        entered_by:      getField(ms, 'enteredby', 'EnteredBy', 'entered_by'),
+        entered_on:      getField(ms, 'enteredon', 'EnteredOn', 'entered_on'),
         synced_at:       new Date().toISOString(),
       }, { onConflict: 'lp_job_id, mdt_id', ignoreDuplicates: false });
     } catch (err) {
@@ -458,7 +605,7 @@ async function syncJobAndMilestones(job, lpLeadId, ghlContactId) {
     }
 
     // Fire GHL tag when act_date populates for first time
-    const actDate = ms.actdate || ms.ActDate;
+    const actDate = getField(ms, 'actdate', 'ActDate', 'act_date');
     const justCompleted = actDate && !existing?.act_date;
     const tagNotFired   = !existing?.ghl_tag_fired;
 
@@ -571,8 +718,9 @@ async function checkLeadTriggers() {
 export async function fullSync() {
   console.log('[Sync] Starting FULL sync...');
   const startedAt = new Date();
-  const stats = { processed: 0, inserted: 0, updated: 0, failed: 0, errors: [] };
+  const stats = { processed: 0, inserted: 0, updated: 0, failed: 0, calls: 0, notes: 0, jobs: 0, milestones: 0, errors: [] };
   resetGHLState(); // Give GHL a fresh chance each sync cycle
+  loggedFirstKeys.clear(); // Reset diagnostic key logging for this cycle
 
   // Step 0: Test LP API connection
   try {
@@ -595,16 +743,17 @@ export async function fullSync() {
     // Step 1: Sync dispositions reference
     await syncDispositions();
 
-    // Step 1b: Enumerate sources for mapping table
+    // Step 1b: Enumerate sources for mapping table (inserts skeleton rows)
     await populateSourceMapping();
 
     // Step 2: Paginated lead fetch via GetLead
     // LP times out on large date ranges — break into yearly windows
+    // Newest first — current leads validate the pipeline before backfilling history
     const today = new Date();
     const START_YEAR = 2015; // Pull all history from this year
     const currentYear = today.getFullYear();
 
-    for (let year = START_YEAR; year <= currentYear; year++) {
+    for (let year = currentYear; year >= START_YEAR; year--) {
       const windowStart = `${year}-01-01`;
       const windowEnd = year === currentYear
         ? today.toISOString().slice(0, 10)
@@ -633,9 +782,15 @@ export async function fullSync() {
 
         for (const prospect of prospects) {
           try {
-            await processProspect(prospect);
+            const subCounts = await processProspect(prospect);
             stats.processed++;
             stats.inserted++;
+            if (subCounts) {
+              stats.calls += subCounts.calls;
+              stats.notes += subCounts.notes;
+              stats.jobs += subCounts.jobs;
+              stats.milestones += subCounts.milestones;
+            }
           } catch (err) {
             stats.failed++;
             const pid = prospect.cst_id || prospect.CstID || prospect.ProspectID;
@@ -644,13 +799,16 @@ export async function fullSync() {
           }
         }
 
-        console.log(`[Sync] [${year}] Processed records ${startIndex}–${startIndex + prospects.length - 1}`);
+        console.log(`[Sync] [${year}] Processed records ${startIndex}–${startIndex + prospects.length - 1} (cumulative: ${stats.processed} leads, ${stats.calls} calls, ${stats.notes} notes, ${stats.jobs} jobs)`);
 
         if (prospects.length < PAGE_SIZE) break;
         startIndex += PAGE_SIZE;
         await sleep(RATE_LIMIT_SLEEP_MS);
       }
     }
+
+    // Step 2b: Backfill dispositions from actual lead data
+    await backfillDispositionsFromLeads();
 
     // Step 3: Process milestone triggers
     try {
@@ -677,7 +835,7 @@ export async function fullSync() {
 
   const duration = Date.now() - startedAt.getTime();
   await logSync({ sync_type: 'full', ...stats, started_at: startedAt, duration_ms: duration });
-  console.log(`[Sync] Full sync complete — ${stats.processed} processed, ${stats.failed} failed (${duration}ms)`);
+  console.log(`[Sync] Full sync complete — ${stats.processed} leads, ${stats.calls} calls, ${stats.notes} notes, ${stats.jobs} jobs, ${stats.milestones} milestones, ${stats.failed} failed (${Math.round(duration / 1000)}s)`);
   return stats;
 }
 
