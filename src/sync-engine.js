@@ -1337,14 +1337,16 @@ export async function fullSync() {
       // Per-year-chunk sync log entry for monitoring
       const yearLeads = counts.leads - yearStartCount;
       if (yearLeads > 0) {
-        await supabase.from('lp_sync_log').insert({
-          entity_type:    'leads',
-          sync_type:      `full_pass1_${year}`,
-          status:         'completed',
-          records_synced: yearLeads,
-          started_at:     yearStartedAt.toISOString(),
-          completed_at:   new Date().toISOString(),
-        }).catch(() => {});  // non-fatal
+        try {
+          await supabase.from('lp_sync_log').insert({
+            entity_type:    'leads',
+            sync_type:      `full_pass1_${year}`,
+            status:         'completed',
+            records_synced: yearLeads,
+            started_at:     yearStartedAt.toISOString(),
+            completed_at:   new Date().toISOString(),
+          });
+        } catch (_) { /* non-fatal */ }
       }
     }
 
