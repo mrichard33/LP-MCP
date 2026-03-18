@@ -73,7 +73,18 @@ function extractArray(response) {
   return [];
 }
 
-// ─── Sync Log ────────────────────────────────────────────────────
+// ─── Sync Log (progressive updates) ─────────────────────────────
+
+function newTableCounts() {
+  return {
+    leads:      { processed: 0, inserted: 0, updated: 0, failed: 0 },
+    calls:      { processed: 0, failed: 0 },
+    notes:      { processed: 0, failed: 0 },
+    jobs:       { processed: 0, failed: 0 },
+    milestones: { processed: 0, failed: 0 },
+    activities: { processed: 0, failed: 0 },
+  };
+}
 
 // Write a "started" row and return its id so we can update it on completion
 async function logSyncStart(syncType) {
@@ -84,6 +95,7 @@ async function logSyncStart(syncType) {
       records_inserted:  0,
       records_updated:   0,
       records_failed:    0,
+      table_counts:      newTableCounts(),
       started_at:        new Date().toISOString(),
       // completed_at left null = still running
     }).select('id').single();
@@ -95,7 +107,24 @@ async function logSyncStart(syncType) {
   }
 }
 
-// Update the existing row on completion (or insert if we lost the id)
+// Flush current stats to DB — call after each page/batch for live progress
+async function logSyncProgress(logId, stats, tableCounts) {
+  if (!logId) return;
+  try {
+    await supabase.from('lp_sync_log').update({
+      records_processed: stats.processed ?? 0,
+      records_inserted:  stats.inserted  ?? 0,
+      records_updated:   stats.updated   ?? 0,
+      records_failed:    stats.failed    ?? 0,
+      table_counts:      tableCounts,
+      error_details:     stats.errors?.length > 0 ? stats.errors.slice(-20) : null, // keep last 20 errors
+    }).eq('id', logId);
+  } catch (err) {
+    // Non-fatal — don't break sync over a progress update
+  }
+}
+
+// Final update on completion (or insert if we lost the id)
 async function logSync(opts) {
   const completed = new Date();
   const row = {
@@ -104,6 +133,7 @@ async function logSync(opts) {
     records_inserted:  opts.inserted   ?? opts.records_inserted  ?? 0,
     records_updated:   opts.updated    ?? opts.records_updated   ?? 0,
     records_failed:    opts.failed     ?? opts.records_failed    ?? 0,
+    table_counts:      opts.table_counts ?? null,
     error_details:     opts.errors?.length > 0 ? opts.errors : null,
     started_at:        opts.started_at instanceof Date ? opts.started_at.toISOString() : opts.started_at,
     completed_at:      completed.toISOString(),
@@ -111,11 +141,9 @@ async function logSync(opts) {
   };
   try {
     if (opts.log_id) {
-      // Update the "started" row we created earlier
       const { error } = await supabase.from('lp_sync_log').update(row).eq('id', opts.log_id);
       if (error) throw error;
     } else {
-      // Fallback: insert a new row (no start row was created)
       await supabase.from('lp_sync_log').insert(row);
     }
   } catch (err) {
@@ -403,7 +431,7 @@ const MDT_TAG_MAP = {
 // contact info at top level, leads[] array inside, each lead has jobs[]
 // with milestones[] inside.
 
-async function processProspect(prospect) {
+async function processProspect(prospect, { skipGHL = false } = {}) {
   // Log prospect keys once for diagnostic purposes
   if (!loggedFirstKeys.has('prospect')) {
     loggedFirstKeys.add('prospect');
@@ -411,15 +439,18 @@ async function processProspect(prospect) {
   }
 
   // 1. Match to GHL contact (phone primary → alt phone → email)
+  //    Skipped during initial full sync data load — backfilled afterward
   let ghlId = null;
-  try {
-    ghlId = await matchToGHL({
-      phone: normalizePhone(getField(prospect, 'phone1', 'Phone1', 'phone', 'Phone')),
-      phone_alt: normalizePhone(prospect.altphones?.[0]?.phone || getField(prospect, 'Phone2', 'phone2', 'phone_alt')),
-      email: getField(prospect, 'email', 'Email'),
-    });
-  } catch (err) {
-    console.warn(`[Sync] GHL match failed for prospect ${prospect.cst_id}:`, err.message);
+  if (!skipGHL) {
+    try {
+      ghlId = await matchToGHL({
+        phone: normalizePhone(getField(prospect, 'phone1', 'Phone1', 'phone', 'Phone')),
+        phone_alt: normalizePhone(prospect.altphones?.[0]?.phone || getField(prospect, 'Phone2', 'phone2', 'phone_alt')),
+        email: getField(prospect, 'email', 'Email'),
+      });
+    } catch (err) {
+      console.warn(`[Sync] GHL match failed for prospect ${prospect.cst_id}:`, err.message);
+    }
   }
 
   // 2. Process each lead record under this prospect
@@ -861,7 +892,8 @@ export async function fullSync() {
   console.log('[Sync] Starting FULL sync...');
   const startedAt = new Date();
   const logId = await logSyncStart('full');
-  const stats = { processed: 0, inserted: 0, updated: 0, failed: 0, calls: 0, notes: 0, jobs: 0, milestones: 0, errors: [] };
+  const stats = { processed: 0, inserted: 0, updated: 0, failed: 0, errors: [] };
+  const tc = newTableCounts(); // per-table breakdown
   resetGHLState(); // Give GHL a fresh chance each sync cycle
   loggedFirstKeys.clear(); // Reset diagnostic key logging for this cycle
 
@@ -925,24 +957,31 @@ export async function fullSync() {
 
         for (const prospect of prospects) {
           try {
-            const subCounts = await processProspect(prospect);
+            const subCounts = await processProspect(prospect, { skipGHL: true });
             stats.processed++;
             stats.inserted++;
+            tc.leads.processed++;
+            tc.leads.inserted++;
             if (subCounts) {
-              stats.calls += subCounts.calls;
-              stats.notes += subCounts.notes;
-              stats.jobs += subCounts.jobs;
-              stats.milestones += subCounts.milestones;
+              tc.calls.processed      += subCounts.calls;
+              tc.notes.processed      += subCounts.notes;
+              tc.jobs.processed       += subCounts.jobs;
+              tc.milestones.processed += subCounts.milestones;
+              tc.activities.processed += subCounts.calls + subCounts.notes; // activities synthesized from calls+notes
             }
           } catch (err) {
             stats.failed++;
+            tc.leads.failed++;
             const pid = prospect.cst_id || prospect.CstID || prospect.ProspectID;
             stats.errors.push({ prospect_id: pid, error: err.message });
             await logSyncError(pid, err);
           }
         }
 
-        console.log(`[Sync] [${year}] Processed records ${startIndex}–${startIndex + prospects.length - 1} (cumulative: ${stats.processed} leads, ${stats.calls} calls, ${stats.notes} notes, ${stats.jobs} jobs)`);
+        // Flush progress to DB after each page so the sync_log updates live
+        await logSyncProgress(logId, stats, tc);
+
+        console.log(`[Sync] [${year}] Processed records ${startIndex}–${startIndex + prospects.length - 1} (cumulative: ${tc.leads.processed} leads, ${tc.calls.processed} calls, ${tc.notes.processed} notes, ${tc.jobs.processed} jobs)`);
 
         if (prospects.length < PAGE_SIZE) break;
         startIndex += PAGE_SIZE;
@@ -952,6 +991,52 @@ export async function fullSync() {
 
     // Step 2b: Backfill dispositions from actual lead data
     await backfillDispositionsFromLeads();
+
+    console.log(`[Sync] Data load complete — ${tc.leads.processed} leads, ${tc.calls.processed} calls, ${tc.notes.processed} notes, ${tc.jobs.processed} jobs, ${tc.milestones.processed} milestones`);
+
+    // Step 2c: GHL backfill — match leads to GHL contacts and apply entry tags
+    // Done as a separate pass so the data load isn't blocked by HTTP calls to GHL
+    try {
+      const { data: unmatchedLeads } = await supabase.from('lp_leads')
+        .select('lp_lead_id, phone, phone_alt, email, ghl_entry_tag, ghl_tag_applied')
+        .is('ghl_contact_id', null)
+        .not('phone', 'is', null)
+        .limit(5000);
+
+      if (unmatchedLeads && unmatchedLeads.length > 0) {
+        console.log(`[Sync] GHL backfill: ${unmatchedLeads.length} leads without GHL match`);
+        let matched = 0;
+        for (const lead of unmatchedLeads) {
+          try {
+            const ghlId = await matchToGHL({
+              phone: lead.phone,
+              phone_alt: lead.phone_alt,
+              email: lead.email,
+            });
+            if (ghlId) {
+              matched++;
+              await supabase.from('lp_leads')
+                .update({ ghl_contact_id: ghlId })
+                .eq('lp_lead_id', lead.lp_lead_id);
+              // Apply entry tag if not yet applied
+              if (!lead.ghl_tag_applied && lead.ghl_entry_tag) {
+                const success = await applyGHLTag(ghlId, lead.ghl_entry_tag);
+                if (success) {
+                  await supabase.from('lp_leads')
+                    .update({ ghl_tag_applied: true })
+                    .eq('lp_lead_id', lead.lp_lead_id);
+                }
+              }
+            }
+          } catch (err) {
+            // Non-fatal — GHL matching is best-effort
+          }
+        }
+        console.log(`[Sync] GHL backfill complete: ${matched}/${unmatchedLeads.length} matched`);
+      }
+    } catch (err) {
+      console.warn('[Sync] GHL backfill failed:', err.message);
+    }
 
     // Step 3: Process milestone triggers
     try {
@@ -977,8 +1062,8 @@ export async function fullSync() {
   }
 
   const duration = Date.now() - startedAt.getTime();
-  await logSync({ sync_type: 'full', ...stats, started_at: startedAt, duration_ms: duration, log_id: logId });
-  console.log(`[Sync] Full sync complete — ${stats.processed} leads, ${stats.calls} calls, ${stats.notes} notes, ${stats.jobs} jobs, ${stats.milestones} milestones, ${stats.failed} failed (${Math.round(duration / 1000)}s)`);
+  await logSync({ sync_type: 'full', ...stats, table_counts: tc, started_at: startedAt, duration_ms: duration, log_id: logId });
+  console.log(`[Sync] Full sync complete — ${tc.leads.processed} leads, ${tc.calls.processed} calls, ${tc.notes.processed} notes, ${tc.jobs.processed} jobs, ${tc.milestones.processed} milestones, ${stats.failed} failed (${Math.round(duration / 1000)}s)`);
   return stats;
 }
 
@@ -992,6 +1077,7 @@ export async function incrementalSync() {
   const startedAt = new Date();
   const logId = await logSyncStart('incremental');
   const stats = { processed: 0, inserted: 0, updated: 0, failed: 0, errors: [] };
+  const tc = newTableCounts();
   resetGHLState();
 
   try {
@@ -1032,16 +1118,28 @@ export async function incrementalSync() {
             const fullResult = await getLead(cstId);
             const fullProspects = extractArray(fullResult);
             if (fullProspects.length > 0) {
-              await processProspect(fullProspects[0]);
+              const subCounts = await processProspect(fullProspects[0]);
               stats.processed++;
               stats.updated++;
+              tc.leads.processed++;
+              tc.leads.updated++;
+              if (subCounts) {
+                tc.calls.processed      += subCounts.calls;
+                tc.notes.processed      += subCounts.notes;
+                tc.jobs.processed       += subCounts.jobs;
+                tc.milestones.processed += subCounts.milestones;
+                tc.activities.processed += subCounts.calls + subCounts.notes;
+              }
             }
           }
         } catch (err) {
           stats.failed++;
+          tc.leads.failed++;
           await logSyncError(lead.cst_id || lead.id, err);
         }
       }
+
+      await logSyncProgress(logId, stats, tc);
 
       if (items.length < PAGE_SIZE) break;
       startIndex += PAGE_SIZE;
@@ -1072,11 +1170,17 @@ export async function incrementalSync() {
         try {
           await syncJobAndMilestones(job, job.lds_id || job.lp_lead_id, null);
           stats.processed++;
+          tc.jobs.processed++;
+          const milestones = getField(job, 'milestones', 'Milestones') || [];
+          tc.milestones.processed += milestones.length;
         } catch (err) {
           stats.failed++;
+          tc.jobs.failed++;
           await logSyncError(job.job_id || job.JobID, err);
         }
       }
+
+      await logSyncProgress(logId, stats, tc);
 
       if (items.length < PAGE_SIZE) break;
       startIndex += PAGE_SIZE;
@@ -1100,7 +1204,7 @@ export async function incrementalSync() {
   }
 
   const duration = Date.now() - startedAt.getTime();
-  await logSync({ sync_type: 'incremental', ...stats, started_at: startedAt, duration_ms: duration, log_id: logId });
+  await logSync({ sync_type: 'incremental', ...stats, table_counts: tc, started_at: startedAt, duration_ms: duration, log_id: logId });
   console.log(`[Sync] Incremental sync complete — ${stats.processed} processed, ${stats.failed} failed (${duration}ms)`);
   return stats;
 }

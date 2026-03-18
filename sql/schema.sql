@@ -185,6 +185,7 @@ CREATE TABLE IF NOT EXISTS lp_sync_log (
   records_inserted  INTEGER,
   records_updated   INTEGER,
   records_failed    INTEGER,
+  table_counts      JSONB,            -- per-table breakdown: { leads: {processed,failed}, calls: {...}, ... }
   error_details     JSONB,
   started_at        TIMESTAMPTZ,
   completed_at      TIMESTAMPTZ,
