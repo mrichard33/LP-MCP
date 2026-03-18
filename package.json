@@ -1,6 +1,6 @@
 {
   "name": "lp-mcp-server",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "description": "Lead Perfection MCP Server with Supabase Sync Layer — Reece Windows & Doors Revenue Intelligence",
   "main": "src/index.js",
   "type": "module",
