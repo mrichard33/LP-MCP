@@ -1,7 +1,9 @@
 import 'dotenv/config';
+import crypto from 'node:crypto';
 import express from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { registerAllTools } from './tools/index.js';
 import { startSyncScheduler, fullSync, incrementalSync, handleWebhookEvent } from './sync-engine.js';
 import { testConnection } from './lp-client.js';
@@ -55,7 +57,69 @@ app.get('/health', (req, res) => {
   });
 });
 
-// SSE transport for MCP
+// ─── Streamable HTTP transport (Claude.ai remote MCP) ───────────
+// Claude.ai connects via POST /mcp with Streamable HTTP protocol.
+// Each session gets its own transport+server instance.
+
+const streamableSessions = {};
+
+async function getOrCreateStreamableSession(sessionId) {
+  if (sessionId && streamableSessions[sessionId]) {
+    return streamableSessions[sessionId].transport;
+  }
+
+  // New session — create transport + connect a fresh MCP server instance
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => crypto.randomUUID(),
+  });
+  const sessionServer = new McpServer({
+    name: 'lp-mcp-server',
+    version: '5.0.0',
+    description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence',
+  });
+  registerAllTools(sessionServer);
+  await sessionServer.connect(transport);
+
+  const newId = transport.sessionId;
+  if (newId) {
+    streamableSessions[newId] = { transport, server: sessionServer };
+    transport.onclose = () => delete streamableSessions[newId];
+  }
+
+  return transport;
+}
+
+app.post('/mcp', authenticate, async (req, res) => {
+  try {
+    const sessionId = req.headers['mcp-session-id'];
+    const transport = await getOrCreateStreamableSession(sessionId);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error('[MCP] Streamable HTTP error:', err.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/mcp', authenticate, async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'];
+  if (sessionId && streamableSessions[sessionId]) {
+    await streamableSessions[sessionId].transport.handleRequest(req, res);
+  } else {
+    res.status(400).json({ error: 'Missing or invalid session' });
+  }
+});
+
+app.delete('/mcp', authenticate, async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'];
+  if (sessionId && streamableSessions[sessionId]) {
+    await streamableSessions[sessionId].transport.handleRequest(req, res);
+    delete streamableSessions[sessionId];
+  } else {
+    res.status(400).json({ error: 'Missing or invalid session' });
+  }
+});
+
+// ─── Legacy SSE transport (Claude Desktop, Cursor, etc) ─────────
 const transports = {};
 
 app.get('/sse', authenticate, async (req, res) => {
@@ -146,7 +210,8 @@ app.post('/webhook/lp', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`LP MCP Server v5.0 running on port ${PORT}`);
-  console.log(`SSE endpoint: http://localhost:${PORT}/sse`);
+  console.log(`MCP endpoint: http://localhost:${PORT}/mcp (Streamable HTTP — Claude.ai)`);
+  console.log(`SSE endpoint: http://localhost:${PORT}/sse (legacy — Claude Desktop)`);
   console.log(`Health check: http://localhost:${PORT}/health`);
   console.log(`LP API test:  http://localhost:${PORT}/lp/test`);
   console.log(`Webhook:      http://localhost:${PORT}/webhook/lp`);
