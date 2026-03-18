@@ -2,6 +2,9 @@ import axios from 'axios';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 
+// Log GHL status at module load
+console.log(`[GHL] API key: ${GHL_API_KEY ? 'set' : 'MISSING — GHL matching will be disabled'}`);
+
 // ─── GHL Availability Check ─────────────────────────────────────
 // If GHL key is missing or fails auth, disable GHL for the rest of the sync
 // to avoid 250K+ failed HTTP calls that would make the sync take forever.
@@ -27,12 +30,19 @@ export async function searchGHLContact(params) {
     return data?.contacts?.[0] || null;
   } catch (err) {
     ghlFailCount++;
+    const status = err.response?.status || 'no response';
     if (ghlFailCount >= GHL_FAIL_THRESHOLD) {
       ghlDisabled = true;
-      console.error(`[GHL] Disabled after ${GHL_FAIL_THRESHOLD} consecutive failures (${err.message}). GHL matching will be skipped for this sync cycle. Fix GHL_API_KEY and redeploy.`);
+      console.error(`[GHL] Disabled after ${GHL_FAIL_THRESHOLD} consecutive failures (HTTP ${status}: ${err.message}). GHL matching skipped for this sync cycle.`);
+      if (status === 401) {
+        console.error('[GHL] 401 = invalid/expired API key. If using GHL v2 OAuth, the v1 location key may no longer work. Check GHL_API_KEY env var.');
+      }
     } else if (ghlFailCount === 1) {
-      // Only log the first failure to avoid log spam
-      console.error('[GHL] Contact search failed:', err.message);
+      // Log first failure with full detail for debugging
+      console.error(`[GHL] Contact search failed: HTTP ${status} — ${err.message}`);
+      if (err.response?.data) {
+        console.error('[GHL] Response body:', JSON.stringify(err.response.data).slice(0, 300));
+      }
     }
     return null;
   }
