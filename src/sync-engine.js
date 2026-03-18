@@ -314,13 +314,28 @@ async function syncDispositions() {
 
 async function backfillDispositionsFromLeads() {
   try {
-    const { data } = await supabase
-      .from('lp_leads')
-      .select('disposition_code')
-      .not('disposition_code', 'is', null);
-    if (!data || data.length === 0) return;
+    // Use RPC or paginated query to get ALL distinct disposition codes
+    // Supabase default limit is 1000 rows — we need distinct values only
+    let allCodes = new Set();
+    let offset = 0;
+    const pageSize = 1000;
+    while (true) {
+      const { data } = await supabase
+        .from('lp_leads')
+        .select('disposition_code')
+        .not('disposition_code', 'is', null)
+        .range(offset, offset + pageSize - 1);
+      if (!data || data.length === 0) break;
+      for (const r of data) {
+        if (r.disposition_code) allCodes.add(r.disposition_code);
+      }
+      if (data.length < pageSize) break;
+      offset += pageSize;
+    }
 
-    const codes = [...new Set(data.map(r => r.disposition_code).filter(Boolean))];
+    if (allCodes.size === 0) return;
+    const codes = [...allCodes];
+
     let added = 0;
     for (const code of codes) {
       const { data: existing } = await supabase
@@ -337,7 +352,10 @@ async function backfillDispositionsFromLeads() {
         added++;
       }
     }
-    if (added > 0) console.log(`[Sync] Backfilled ${added} dispositions from lead data (total codes: ${codes.length})`);
+    console.log(`[Sync] Disposition backfill: ${added} new from lead data (${codes.length} unique codes found in lp_leads)`);
+    if (codes.length <= 50) {
+      console.log(`[Sync] Disposition codes found: ${codes.join(', ')}`);
+    }
   } catch (err) {
     console.warn('[Sync] Disposition backfill failed:', err.message);
   }
