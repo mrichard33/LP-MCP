@@ -5,18 +5,20 @@ import { runSQL, listTables, getTableSchema } from '../../admin/supabase-admin.j
 export function registerSupabaseAdminTools(server) {
 
   // Tool 30: supabase_run_query [READ/WRITE]
+  // Supabase is the analytics mirror — reads and writes are allowed.
+  // Only DROP/TRUNCATE require explicit confirmation.
   server.tool(
     'supabase_run_query',
-    'Execute a SQL query against Supabase. Read-only by default — set allow_write: true for INSERT/UPDATE/DELETE.',
+    'Execute a SQL query against Supabase (SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER all allowed). Only DROP/TRUNCATE require confirm_destructive: true.',
     {
       query: { type: 'string', description: 'SQL query. Example: "SELECT COUNT(*) FROM lp_leads"' },
-      allow_write: { type: 'boolean', description: 'Set true to allow INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE/CREATE statements (default: false)' },
+      confirm_destructive: { type: 'boolean', description: 'Required only for DROP/TRUNCATE statements (default: false)' },
     },
-    async ({ query, allow_write }) => {
+    async ({ query, confirm_destructive }) => {
       if (!query) return { content: [{ type: 'text', text: 'Error: query is required.' }] };
 
       try {
-        const result = await runSQL(query, allow_write === true);
+        const result = await runSQL(query, confirm_destructive === true);
         return {
           content: [{ type: 'text', text: JSON.stringify({ success: true, result }, null, 2) }],
         };

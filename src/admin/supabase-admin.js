@@ -5,16 +5,16 @@
 
 import supabase from '../supabase.js';
 
-// Statements that modify data — blocked when allowWrite is false
-const WRITE_PATTERNS = /^\s*(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE)\b/i;
+// Destructive DDL — requires explicit confirmation
+const DESTRUCTIVE_PATTERNS = /^\s*(DROP|TRUNCATE)\b/i;
 
-export const runSQL = async (queryText, allowWrite = false) => {
+export const runSQL = async (queryText, confirmDestructive = false) => {
   if (!supabase) throw new Error('Supabase not configured');
 
-  if (!allowWrite && WRITE_PATTERNS.test(queryText)) {
+  if (!confirmDestructive && DESTRUCTIVE_PATTERNS.test(queryText)) {
     throw new Error(
-      'Write statement detected but allow_write is false. ' +
-      'Set allow_write: true to execute INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE/CREATE statements.'
+      'Destructive statement detected (DROP/TRUNCATE). ' +
+      'Set confirm_destructive: true to execute.'
     );
   }
 
