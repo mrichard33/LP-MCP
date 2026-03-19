@@ -1,6 +1,6 @@
 // ─── Sync Engine — src/sync-engine.js ─────────────────────────────
 //
-// v5.0 — Runs inside the Railway service alongside the MCP server.
+// v5.1 — Runs inside the Railway service alongside the MCP server.
 // All LP calls go through src/lp-client.js (token + retry managed there).
 //
 // Boot sequence:
@@ -140,8 +140,21 @@ async function syncLogStartAll(syncType, entityTypes = ENTITY_TYPES) {
   return ids;
 }
 
-async function logSyncError(entityId, err) {
+async function logSyncError(entityId, err, syncType = null) {
   console.error(`[Sync] Entity ${entityId} failed:`, err.message);
+  try {
+    await supabase.from('lp_sync_errors').insert({
+      lp_lead_id: entityId ? String(entityId) : null,
+      lp_prospect_id: null,
+      error_message: err.message,
+      error_stack: err.stack,
+      sync_type: syncType || (syncInProgress ? 'unknown' : null),
+      retry_count: 0,
+      resolved: false,
+    });
+  } catch (logErr) {
+    console.error('[Sync] Failed to log error to lp_sync_errors:', logErr.message);
+  }
 }
 
 async function getLastSyncTimestamp() {
@@ -1314,6 +1327,8 @@ export async function fullSync() {
 
       console.log(`[Sync P1] Fetching leads for ${windowStart} to ${windowEnd}...`);
       let startIndex = 1;
+      let consecutiveEmptyPages = 0;
+      let consecutivePageFailures = 0;
       const yearStartedAt = new Date();
       const yearStartCount = counts.leads;
 
@@ -1326,13 +1341,26 @@ export async function fullSync() {
             PageSize:   PAGE_SIZE,
             StartIndex: startIndex,
           });
+          consecutivePageFailures = 0;
         } catch (err) {
-          console.error(`[Sync P1] Failed to fetch leads (${windowStart}, index ${startIndex}):`, err.message);
-          break;
+          consecutivePageFailures++;
+          console.error(`[Sync P1] Page at index ${startIndex} failed (${consecutivePageFailures}/3): ${err.message}`);
+          if (consecutivePageFailures >= 3) {
+            console.error('[Sync P1] 3 consecutive page failures — aborting year chunk');
+            break;
+          }
+          startIndex += PAGE_SIZE;  // Skip failed page
+          continue;
         }
 
         const prospects = extractArray(result);
-        if (prospects.length === 0) break;
+        if (prospects.length === 0) {
+          consecutiveEmptyPages++;
+          if (consecutiveEmptyPages >= 2) break;
+          startIndex += PAGE_SIZE;
+          continue;
+        }
+        consecutiveEmptyPages = 0;
 
         for (const prospect of prospects) {
           try {
@@ -1341,7 +1369,7 @@ export async function fullSync() {
           } catch (err) {
             failed++;
             const pid = prospect.cst_id || prospect.CstID || prospect.ProspectID;
-            await logSyncError(pid, err);
+            await logSyncError(pid, err, 'full');
           }
         }
 
@@ -1350,7 +1378,7 @@ export async function fullSync() {
 
         console.log(`[Sync P1] [${year}] Page ${Math.ceil(startIndex / PAGE_SIZE)}: ${prospects.length} prospects fetched (${counts.leads} leads total)`);
 
-        startIndex += PAGE_SIZE;
+        startIndex += prospects.length;  // v5.1 fix: increment by actual count, not PAGE_SIZE
         await sleep(RATE_LIMIT_SLEEP_MS);
       }
 
@@ -1622,7 +1650,7 @@ export async function incrementalSync() {
         syncLogProgress(logIds.activities, counts.activities),
       ]);
 
-      startIndex += PAGE_SIZE;
+      startIndex += items.length;  // v5.1 fix: increment by actual count
       await sleep(RATE_LIMIT_SLEEP_MS);
     }
 
@@ -1662,7 +1690,7 @@ export async function incrementalSync() {
         syncLogProgress(logIds.milestones, counts.milestones),
       ]);
 
-      startIndex += PAGE_SIZE;
+      startIndex += items.length;  // v5.1 fix: increment by actual count
       await sleep(RATE_LIMIT_SLEEP_MS);
     }
 
@@ -1804,13 +1832,31 @@ export function startSyncScheduler() {
         console.log('[Sync] FORCE_FULL_SYNC=true — running full sync regardless of history');
         await fullSync();
       } else {
-        const lastSync = await getLastSyncTimestamp();
-        if (lastSync) {
-          console.log(`[Sync] Last successful sync: ${lastSync.toISOString()} — running incremental`);
+        // v5.1 Boot sync guard — skip full if one succeeded < 24h ago
+        const { data: lastFullSync } = await supabase.from('lp_sync_log')
+          .select('completed_at')
+          .eq('sync_type', 'full')
+          .eq('status', 'completed')
+          .order('completed_at', { ascending: false })
+          .limit(1)
+          .single();
+
+        const hoursSinceLastFull = lastFullSync?.completed_at
+          ? (Date.now() - new Date(lastFullSync.completed_at).getTime()) / 3600000
+          : Infinity;
+
+        if (hoursSinceLastFull <= 24) {
+          console.log(`[Sync] Full sync ran ${hoursSinceLastFull.toFixed(1)}h ago — running incremental`);
           await incrementalSync();
         } else {
-          console.log('[Sync] No successful sync found — running initial full sync');
-          await fullSync();
+          const lastSync = await getLastSyncTimestamp();
+          if (lastSync) {
+            console.log(`[Sync] No recent full sync but last sync: ${lastSync.toISOString()} — running incremental`);
+            await incrementalSync();
+          } else {
+            console.log('[Sync] No successful sync found — running initial full sync');
+            await fullSync();
+          }
         }
       }
     } catch (err) {

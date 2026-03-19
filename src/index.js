@@ -6,7 +6,7 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { registerAllTools } from './tools/index.js';
 import { startSyncScheduler, fullSync, incrementalSync, handleWebhookEvent } from './sync-engine.js';
-import { testConnection } from './lp-client.js';
+import { testConnection, getLeads } from './lp-client.js';
 import { getTokenStatus } from './token-manager.js';
 import supabase from './supabase.js';
 
@@ -16,11 +16,11 @@ const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 // Create MCP server
 const server = new McpServer({
   name: 'lp-mcp-server',
-  version: '5.0.0',
+  version: '5.1.0',
   description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence',
 });
 
-// Register all 16 tool functions
+// Register all 33 tool functions (16 LP data + 17 infrastructure admin)
 registerAllTools(server);
 
 // Express app for SSE transport
@@ -42,7 +42,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     server: 'lp-mcp-server',
-    version: '5.0.0',
+    version: '5.1.0',
     uptime: process.uptime(),
     lp_config: {
       api_base_url: process.env.LP_API_BASE_URL ? 'set' : 'MISSING',
@@ -54,6 +54,14 @@ app.get('/health', (req, res) => {
     lp_token: getTokenStatus(),
     supabase: process.env.SUPABASE_URL ? 'configured' : 'MISSING',
     ghl: process.env.GHL_API_KEY ? 'configured' : 'MISSING',
+    railway: {
+      api_token:  process.env.RAILWAY_API_TOKEN  ? 'set' : 'MISSING',
+      service_id: process.env.RAILWAY_SERVICE_ID ? 'set' : 'MISSING',
+    },
+    github: {
+      pat:  process.env.GITHUB_PAT  ? 'set' : 'MISSING',
+      repo: process.env.GITHUB_REPO ? 'set' : 'MISSING',
+    },
   });
 });
 
@@ -93,7 +101,7 @@ app.post('/mcp', authenticate, async (req, res) => {
     });
     const sessionServer = new McpServer({
       name: 'lp-mcp-server',
-      version: '5.0.0',
+      version: '5.1.0',
       description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence',
     });
     registerAllTools(sessionServer);
@@ -172,19 +180,75 @@ app.post('/sync/incremental', authenticate, async (req, res) => {
   incrementalSync().catch(err => console.error('[Sync] Manual incremental sync failed:', err.message));
 });
 
-// GET /sync/status — last 5 sync records
+// POST /sync/reconcile — compare LP count vs Supabase count [v5.1]
+app.post('/sync/reconcile', authenticate, async (req, res) => {
+  try {
+    const { startdate = '2020-01-01', enddate } = req.body || {};
+    const end = enddate || new Date().toISOString().slice(0, 10);
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+    // Count leads in LP (page through to get total)
+    let lpCount = 0;
+    let idx = 1;
+    while (true) {
+      const r = await getLeads({
+        startdate,
+        enddate: end,
+        PageSize: 200,
+        StartIndex: idx,
+      });
+      const items = Array.isArray(r) ? r : (r?.data || r?.leads || r?.results || []);
+      if (!items || items.length === 0) break;
+      lpCount += items.length;
+      idx += items.length;
+      await sleep(300);
+    }
+
+    // Count leads in Supabase
+    const { count: sbCount } = await supabase.from('lp_leads')
+      .select('id', { count: 'exact', head: true })
+      .gte('created_at_lp', startdate)
+      .lte('created_at_lp', end);
+
+    const drift = Math.abs(lpCount - (sbCount || 0));
+    const driftPct = lpCount > 0 ? ((drift / lpCount) * 100).toFixed(2) : '0';
+
+    const result = {
+      lp_count: lpCount,
+      supabase_count: sbCount || 0,
+      drift,
+      drift_percent: driftPct,
+      status: drift === 0 ? 'synced' : 'drift_detected',
+      date_range: { startdate, enddate: end },
+    };
+
+    console.log(`[Reconcile] LP: ${lpCount}, SB: ${sbCount}, Drift: ${drift} (${driftPct}%)`);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /sync/status — last 5 sync records + health metrics [v5.1 enhanced]
 app.get('/sync/status', authenticate, async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('lp_sync_log')
-      .select('*')
-      .order('started_at', { ascending: false })
-      .limit(5);
+    const [syncLog, totalLeads, unmatchedLeads, unresolvedErrors] = await Promise.all([
+      supabase.from('lp_sync_log').select('*').order('started_at', { ascending: false }).limit(5),
+      supabase.from('lp_leads').select('id', { count: 'exact', head: true }),
+      supabase.from('lp_leads').select('id', { count: 'exact', head: true }).is('ghl_contact_id', null),
+      supabase.from('lp_sync_errors').select('id', { count: 'exact', head: true }).eq('resolved', false),
+    ]);
 
-    if (error) {
-      return res.status(500).json({ error: error.message });
+    if (syncLog.error) {
+      return res.status(500).json({ error: syncLog.error.message });
     }
-    res.json(data);
+
+    res.json({
+      recent_syncs: syncLog.data,
+      total_leads: totalLeads.count || 0,
+      unmatched_leads: unmatchedLeads.count || 0,
+      unresolved_errors: unresolvedErrors.count || 0,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -227,7 +291,7 @@ app.post('/webhook/lp', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`LP MCP Server v5.0 running on port ${PORT}`);
+  console.log(`LP MCP Server v5.1 running on port ${PORT}`);
   console.log(`MCP endpoint: http://localhost:${PORT}/mcp (Streamable HTTP — Claude.ai)`);
   console.log(`SSE endpoint: http://localhost:${PORT}/sse (legacy — Claude Desktop)`);
   console.log(`Health check: http://localhost:${PORT}/health`);

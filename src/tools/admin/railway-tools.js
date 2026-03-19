@@ -1,0 +1,233 @@
+// ─── Railway Admin MCP Tools (Tools 17–22) ───────────────────────
+import { railwayQuery, getServiceId } from '../../admin/railway-client.js';
+
+export function registerRailwayTools(server) {
+
+  // Tool 17: get_railway_service_status [READ]
+  server.tool(
+    'get_railway_service_status',
+    'Current Railway service status, uptime, and recent deployments.',
+    {
+      service_id: { type: 'string', description: 'Railway service ID (defaults to RAILWAY_SERVICE_ID env var)' },
+    },
+    async ({ service_id }) => {
+      const sid = service_id || getServiceId();
+      const data = await railwayQuery(`
+        query($serviceId: String!) {
+          service(id: $serviceId) {
+            name
+            icon
+            updatedAt
+            deployments(first: 5) {
+              edges {
+                node {
+                  id
+                  status
+                  createdAt
+                  meta {
+                    commitMessage
+                  }
+                }
+              }
+            }
+          }
+        }
+      `, { serviceId: sid });
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify(data.service, null, 2) }],
+      };
+    }
+  );
+
+  // Tool 18: get_railway_logs [READ]
+  server.tool(
+    'get_railway_logs',
+    'Recent Railway deploy logs. Filter by keyword (e.g. "[Sync]", "error").',
+    {
+      lines: { type: 'number', description: 'Number of log lines to return (default 100, max 500)' },
+      filter: { type: 'string', description: 'Optional keyword filter (e.g. "[Sync]", "error")' },
+      deployment_id: { type: 'string', description: 'Deployment ID (defaults to latest active)' },
+    },
+    async ({ lines, filter, deployment_id }) => {
+      const limit = Math.min(lines || 100, 500);
+
+      // If no deployment_id, get latest
+      let deployId = deployment_id;
+      if (!deployId) {
+        const sid = getServiceId();
+        const svc = await railwayQuery(`
+          query($serviceId: String!) {
+            service(id: $serviceId) {
+              deployments(first: 1) {
+                edges { node { id } }
+              }
+            }
+          }
+        `, { serviceId: sid });
+        deployId = svc.service?.deployments?.edges?.[0]?.node?.id;
+        if (!deployId) {
+          return { content: [{ type: 'text', text: 'No deployments found.' }] };
+        }
+      }
+
+      const data = await railwayQuery(`
+        query($deploymentId: String!, $limit: Int!) {
+          deploymentLogs(deploymentId: $deploymentId, limit: $limit) {
+            timestamp
+            message
+            severity
+          }
+        }
+      `, { deploymentId: deployId, limit });
+
+      let logs = data.deploymentLogs || [];
+      if (filter) {
+        const f = filter.toLowerCase();
+        logs = logs.filter(l => l.message?.toLowerCase().includes(f));
+      }
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ deployment_id: deployId, count: logs.length, logs }, null, 2) }],
+      };
+    }
+  );
+
+  // Tool 19: get_railway_env_vars [READ]
+  // SECURITY: Returns names and metadata only — NEVER actual values.
+  server.tool(
+    'get_railway_env_vars',
+    'List Railway environment variable names and whether they are set. NEVER returns actual values.',
+    {
+      service_id: { type: 'string', description: 'Railway service ID (defaults to RAILWAY_SERVICE_ID env var)' },
+    },
+    async ({ service_id }) => {
+      const sid = service_id || getServiceId();
+      const data = await railwayQuery(`
+        query($serviceId: String!) {
+          variables(serviceId: $serviceId) {
+            name
+            value
+          }
+        }
+      `, { serviceId: sid });
+
+      // Redact values — only return name, is_set, and value length
+      const vars = (data.variables || []).map(v => ({
+        name: v.name,
+        is_set: v.value !== null && v.value !== undefined && v.value !== '',
+        length: v.value?.length || 0,
+      }));
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify(vars, null, 2) }],
+      };
+    }
+  );
+
+  // Tool 20: set_railway_env_var [WRITE]
+  server.tool(
+    'set_railway_env_var',
+    'Create or update a Railway environment variable. Triggers auto-redeploy. Requires confirm: true.',
+    {
+      name: { type: 'string', description: 'Environment variable name' },
+      value: { type: 'string', description: 'New value to set' },
+      confirm: { type: 'boolean', description: 'Must be true to execute. If false/missing, returns preview only.' },
+    },
+    async ({ name, value, confirm }) => {
+      if (!name || value === undefined) {
+        return { content: [{ type: 'text', text: 'Error: name and value are required.' }] };
+      }
+
+      if (confirm !== true) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            preview: true,
+            action: 'set_env_var',
+            name,
+            value_length: value.length,
+            warning: 'This will trigger an auto-redeploy. Set confirm: true to execute.',
+          }, null, 2) }],
+        };
+      }
+
+      const sid = getServiceId();
+      await railwayQuery(`
+        mutation($serviceId: String!, $name: String!, $value: String!) {
+          variableUpsert(input: { serviceId: $serviceId, name: $name, value: $value })
+        }
+      `, { serviceId: sid, name, value });
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ success: true, name, action: 'set', note: 'Auto-redeploy triggered.' }, null, 2) }],
+      };
+    }
+  );
+
+  // Tool 21: redeploy_railway_service [WRITE]
+  server.tool(
+    'redeploy_railway_service',
+    'Trigger a redeployment from the latest commit. Requires confirm: true.',
+    {
+      confirm: { type: 'boolean', description: 'Must be true to execute.' },
+    },
+    async ({ confirm }) => {
+      if (confirm !== true) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            preview: true,
+            action: 'redeploy',
+            warning: 'This will redeploy the service from the latest commit. Set confirm: true to execute.',
+          }, null, 2) }],
+        };
+      }
+
+      const sid = getServiceId();
+      await railwayQuery(`
+        mutation($serviceId: String!) {
+          serviceInstanceRedeploy(serviceId: $serviceId)
+        }
+      `, { serviceId: sid });
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ success: true, action: 'redeploy', service_id: sid }, null, 2) }],
+      };
+    }
+  );
+
+  // Tool 22: rollback_railway_deployment [WRITE]
+  server.tool(
+    'rollback_railway_deployment',
+    'Roll back to a specified previous deployment. Requires confirm: true.',
+    {
+      deployment_id: { type: 'string', description: 'Target deployment ID to roll back to' },
+      confirm: { type: 'boolean', description: 'Must be true to execute.' },
+    },
+    async ({ deployment_id, confirm }) => {
+      if (!deployment_id) {
+        return { content: [{ type: 'text', text: 'Error: deployment_id is required.' }] };
+      }
+
+      if (confirm !== true) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            preview: true,
+            action: 'rollback',
+            target_deployment: deployment_id,
+            warning: 'This will roll back to the specified deployment. Set confirm: true to execute.',
+          }, null, 2) }],
+        };
+      }
+
+      await railwayQuery(`
+        mutation($deploymentId: String!) {
+          deploymentRollback(id: $deploymentId)
+        }
+      `, { deploymentId: deployment_id });
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ success: true, action: 'rollback', deployment_id }, null, 2) }],
+      };
+    }
+  );
+}
