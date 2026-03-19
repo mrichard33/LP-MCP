@@ -57,24 +57,28 @@ export async function processMilestoneTriggers() {
   let fired = 0;
   let errors = 0;
 
-  // Bug 10: Build a map of lead_id → ghl_contact_id from lp_leads
-  // so we can resolve contacts even if the milestone row has null ghl_contact_id
+  // Bug 10: Build a map of lead_id → {ghl_contact_id, lp_prospect_id} from lp_leads
+  // so we can resolve contacts and always log prospect IDs
   const leadIds = [...new Set((newMilestones || []).map(m => m.lp_lead_id).filter(Boolean))];
-  const ghlContactMap = {};
+  const leadDataMap = {};
   if (leadIds.length > 0) {
     const { data: leads } = await supabase
       .from('lp_leads')
-      .select('lp_lead_id, ghl_contact_id')
-      .in('lp_lead_id', leadIds)
-      .not('ghl_contact_id', 'is', null);
+      .select('lp_lead_id, ghl_contact_id, lp_prospect_id')
+      .in('lp_lead_id', leadIds);
     for (const lead of (leads || [])) {
-      ghlContactMap[lead.lp_lead_id] = lead.ghl_contact_id;
+      leadDataMap[lead.lp_lead_id] = {
+        ghl_contact_id: lead.ghl_contact_id,
+        lp_prospect_id: lead.lp_prospect_id,
+      };
     }
   }
 
   for (const milestone of (newMilestones || [])) {
+    const leadData = leadDataMap[milestone.lp_lead_id] || {};
     // Bug 10: Use lead's ghl_contact_id as fallback if milestone row has null
-    const ghlContactId = milestone.ghl_contact_id || ghlContactMap[milestone.lp_lead_id];
+    const ghlContactId = milestone.ghl_contact_id || leadData.ghl_contact_id;
+    const lpProspectId = leadData.lp_prospect_id || null;
     if (!ghlContactId) continue;
 
     const tag = MDT_TAG_MAP[milestone.mdt_id];
@@ -95,6 +99,7 @@ export async function processMilestoneTriggers() {
 
       await logTrigger({
         lp_lead_id: milestone.lp_lead_id,
+        lp_prospect_id: lpProspectId,
         ghl_contact_id: ghlContactId,
         event: `milestone_${milestone.mdt_id}`,
         tag_fired: tag,
@@ -104,6 +109,7 @@ export async function processMilestoneTriggers() {
     } else {
       await logTrigger({
         lp_lead_id: milestone.lp_lead_id,
+        lp_prospect_id: lpProspectId,
         ghl_contact_id: ghlContactId,
         event: `milestone_${milestone.mdt_id}`,
         tag_fired: tag,
@@ -117,10 +123,11 @@ export async function processMilestoneTriggers() {
   return { processed: newMilestones?.length || 0, fired, errors };
 }
 
-async function logTrigger({ lp_lead_id, ghl_contact_id, event, tag_fired, status, error_detail }) {
+async function logTrigger({ lp_lead_id, lp_prospect_id, ghl_contact_id, event, tag_fired, status, error_detail }) {
   try {
     await supabase.from('lp_trigger_log').insert({
       lp_lead_id,
+      lp_prospect_id: lp_prospect_id || null,
       ghl_contact_id,
       event,
       tag_fired,
