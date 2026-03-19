@@ -10,7 +10,7 @@ import { testConnection, getLeads } from './lp-client.js';
 import { getTokenStatus } from './token-manager.js';
 import supabase from './supabase.js';
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 
 // Express app — all MCP sessions create per-session server instances
