@@ -1,6 +1,18 @@
 import { z } from 'zod';
 import supabase from '../supabase.js';
 
+// Helper: fetch disposition labels + categories from lp_dispositions table
+async function getDispositionMap() {
+  const { data } = await supabase
+    .from('lp_dispositions')
+    .select('disposition_code, disposition_label, category, is_recoverable');
+  const map = {};
+  for (const d of (data || [])) {
+    map[d.disposition_code] = { label: d.disposition_label, category: d.category, is_recoverable: d.is_recoverable };
+  }
+  return map;
+}
+
 export function registerSourceTools(server) {
 
   // Tool 12: get_leads_needing_mapping
@@ -101,8 +113,20 @@ export function registerSourceTools(server) {
 
       if (error) return { content: [{ type: 'text', text: `Error: ${error.message}` }] };
 
-      const totalLeads = (data || []).reduce((sum, d) => sum + parseInt(d.lead_count), 0);
-      const noDisp = data?.find(d => d.disposition_code === 'NO_DISPOSITION');
+      // Overlay correct labels from lp_dispositions table
+      const dispMap = await getDispositionMap();
+      const breakdown = (data || []).map(d => {
+        const disp = dispMap[d.disposition_code];
+        return {
+          ...d,
+          disposition_label: disp?.label || d.disposition_label || d.disposition_code || 'Unknown',
+          category: disp?.category || 'unknown',
+          is_recoverable: disp?.is_recoverable ?? true,
+        };
+      });
+
+      const totalLeads = breakdown.reduce((sum, d) => sum + parseInt(d.lead_count), 0);
+      const noDisp = breakdown.find(d => d.disposition_code === 'NO_DISPOSITION');
 
       return {
         content: [{
@@ -112,7 +136,7 @@ export function registerSourceTools(server) {
             total_abandoned_leads: totalLeads,
             no_disposition_count: noDisp ? parseInt(noDisp.lead_count) : 0,
             no_disposition_pct: noDisp ? noDisp.pct_of_total : 0,
-            breakdown: data,
+            breakdown,
             insight: 'Leads with no disposition have the highest reactivation potential. Leads with demo set but not completed are warm re-engagements.',
           }, null, 2),
         }],
