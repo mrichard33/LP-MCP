@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import supabase from '../supabase.js';
 import { applyGHLTag } from '../ghl.js';
 
@@ -8,7 +9,7 @@ export function registerTriggerTools(server) {
     'trigger_day15_handoff',
     'Manually fire Day 15 GHL handoff for a specific lead. Applies lp-day15-handoff tag.',
     {
-      lead_id: { type: 'string', description: 'LP lead ID to trigger handoff for' },
+      lead_id: z.string().describe('LP lead ID to trigger handoff for'),
     },
     async ({ lead_id }) => {
       // Fetch lead

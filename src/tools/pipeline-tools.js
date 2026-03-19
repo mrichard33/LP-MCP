@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import supabase from '../supabase.js';
 
 export function registerPipelineTools(server) {
@@ -7,8 +8,8 @@ export function registerPipelineTools(server) {
     'get_rep_performance',
     'Call/set/close rates by rep for a date range. Sales analytics.',
     {
-      start_date: { type: 'string', description: 'Start date (ISO 8601)' },
-      end_date: { type: 'string', description: 'End date (ISO 8601)' },
+      start_date: z.string().describe('Start date (ISO 8601)'),
+      end_date: z.string().describe('End date (ISO 8601)'),
     },
     async ({ start_date, end_date }) => {
       const { data, error } = await supabase.rpc('get_rep_performance', {
@@ -61,7 +62,7 @@ export function registerPipelineTools(server) {
     'get_revenue_by_source',
     'Revenue and close rate by source and intent bucket. Marketing ROI analysis.',
     {
-      min_leads: { type: 'integer', description: 'Minimum lead count to include (default 5)' },
+      min_leads: z.number().optional().describe('Minimum lead count to include (default 5)'),
     },
     async ({ min_leads = 5 }) => {
       const { data, error } = await supabase.rpc('get_close_rate_by_source');

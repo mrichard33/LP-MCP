@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import supabase from '../supabase.js';
 import { MDT_TAG_MAP, MDT_LABELS } from '../milestones.js';
 
@@ -8,8 +9,8 @@ export function registerJobTools(server) {
     'get_job_status',
     'Full job + milestone status for a contact. Post-sale project tracking.',
     {
-      lead_id: { type: 'string', description: 'LP lead ID' },
-      job_id: { type: 'string', description: 'LP job ID (optional — if omitted, returns all jobs for the lead)' },
+      lead_id: z.string().optional().describe('LP lead ID'),
+      job_id: z.string().optional().describe('LP job ID (optional — if omitted, returns all jobs for the lead)'),
     },
     async ({ lead_id, job_id }) => {
       let jobQuery = supabase.from('lp_jobs').select('*');

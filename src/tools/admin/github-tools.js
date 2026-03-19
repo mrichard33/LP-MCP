@@ -1,4 +1,5 @@
 // ─── GitHub Admin MCP Tools (Tools 23–29) ────────────────────────
+import { z } from 'zod';
 import { ghRequest, ghSearchCode } from '../../admin/github-client.js';
 
 export function registerGitHubTools(server) {
@@ -8,8 +9,8 @@ export function registerGitHubTools(server) {
     'github_list_files',
     'List files and directories at a path in the GitHub repo.',
     {
-      path: { type: 'string', description: 'Directory path (default: root). Example: "src/tools"' },
-      branch: { type: 'string', description: 'Branch name (default: "main")' },
+      path: z.string().optional().describe('Directory path (default: root). Example: "src/tools"'),
+      branch: z.string().optional().describe('Branch name (default: "main")'),
     },
     async ({ path, branch }) => {
       const dirPath = path || '';
@@ -31,8 +32,8 @@ export function registerGitHubTools(server) {
     'github_get_file',
     'Read full content of a file from the GitHub repo. Returns content + sha (needed for edits).',
     {
-      path: { type: 'string', description: 'File path. Example: "src/sync-engine.js"' },
-      branch: { type: 'string', description: 'Branch name (default: "main")' },
+      path: z.string().describe('File path. Example: "src/sync-engine.js"'),
+      branch: z.string().optional().describe('Branch name (default: "main")'),
     },
     async ({ path, branch }) => {
       if (!path) return { content: [{ type: 'text', text: 'Error: path is required.' }] };
@@ -59,12 +60,12 @@ export function registerGitHubTools(server) {
     'github_create_or_update_file',
     'Create or update a file in the GitHub repo. Commits to main trigger Railway auto-deploy. Requires confirm: true.',
     {
-      path: { type: 'string', description: 'File path. Example: "src/tools/admin/reconcile.js"' },
-      content: { type: 'string', description: 'Full file content' },
-      message: { type: 'string', description: 'Commit message' },
-      sha: { type: 'string', description: 'File SHA (required for updates — get from github_get_file)' },
-      branch: { type: 'string', description: 'Branch name (default: "main")' },
-      confirm: { type: 'boolean', description: 'Must be true to execute.' },
+      path: z.string().describe('File path. Example: "src/tools/admin/reconcile.js"'),
+      content: z.string().describe('Full file content'),
+      message: z.string().describe('Commit message'),
+      sha: z.string().optional().describe('File SHA (required for updates — get from github_get_file)'),
+      branch: z.string().optional().describe('Branch name (default: "main")'),
+      confirm: z.boolean().optional().describe('Must be true to execute.'),
     },
     async ({ path, content, message, sha, branch, confirm }) => {
       if (!path || !content || !message) {
@@ -116,8 +117,8 @@ export function registerGitHubTools(server) {
     'github_get_recent_commits',
     'Recent commit history on a branch.',
     {
-      count: { type: 'number', description: 'Number of commits (default 10, max 30)' },
-      branch: { type: 'string', description: 'Branch name (default: "main")' },
+      count: z.number().optional().describe('Number of commits (default 10, max 30)'),
+      branch: z.string().optional().describe('Branch name (default: "main")'),
     },
     async ({ count, branch }) => {
       const n = Math.min(count || 10, 30);
@@ -142,8 +143,8 @@ export function registerGitHubTools(server) {
     'github_create_branch',
     'Create a new branch from an existing branch.',
     {
-      branch_name: { type: 'string', description: 'New branch name. Example: "fix/pagination-increment"' },
-      from_branch: { type: 'string', description: 'Source branch (default: "main")' },
+      branch_name: z.string().describe('New branch name. Example: "fix/pagination-increment"'),
+      from_branch: z.string().optional().describe('Source branch (default: "main")'),
     },
     async ({ branch_name, from_branch }) => {
       if (!branch_name) {
@@ -178,11 +179,11 @@ export function registerGitHubTools(server) {
     'github_create_pull_request',
     'Open a pull request. Requires confirm: true.',
     {
-      title: { type: 'string', description: 'PR title' },
-      body: { type: 'string', description: 'PR description (markdown)' },
-      head: { type: 'string', description: 'Source branch' },
-      base: { type: 'string', description: 'Target branch (default: "main")' },
-      confirm: { type: 'boolean', description: 'Must be true to execute.' },
+      title: z.string().describe('PR title'),
+      body: z.string().optional().describe('PR description (markdown)'),
+      head: z.string().describe('Source branch'),
+      base: z.string().optional().describe('Target branch (default: "main")'),
+      confirm: z.boolean().optional().describe('Must be true to execute.'),
     },
     async ({ title, body, head, base, confirm }) => {
       if (!title || !head) {
@@ -230,7 +231,7 @@ export function registerGitHubTools(server) {
     'github_search_code',
     'Search for a string across all files in the repo.',
     {
-      query: { type: 'string', description: 'Search query. Example: "startIndex += pageSize"' },
+      query: z.string().describe('Search query. Example: "startIndex += pageSize"'),
     },
     async ({ query }) => {
       if (!query) return { content: [{ type: 'text', text: 'Error: query is required.' }] };
