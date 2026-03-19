@@ -1,6 +1,6 @@
 // ─── Sync Engine — src/sync-engine.js ─────────────────────────────
 //
-// v5.1 — Runs inside the Railway service alongside the MCP server.
+// v5.2 — Runs inside the Railway service alongside the MCP server.
 // All LP calls go through src/lp-client.js (token + retry managed there).
 //
 // Boot sequence:
@@ -26,6 +26,7 @@ import {
 import { matchToGHL, applyGHLTag, resetGHLState } from './ghl.js';
 import { normalizeSourceAndTag } from './normalization.js';
 import { processMilestoneTriggers } from './milestones.js';
+import { runPass1DailyWindows } from './full-sync-pass1.js';
 
 const SYNC_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const PAGE_SIZE = 200;
@@ -1312,91 +1313,18 @@ export async function fullSync() {
     // child records, eliminating foreign key race conditions.
     console.log('[Sync] PASS 1 — Loading all contacts into lp_leads...');
 
-    const today = new Date();
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    const START_YEAR = 2000; // Must go back far enough to capture all historical leads
-    const currentYear = today.getFullYear();
-
-    for (let year = currentYear; year >= START_YEAR; year--) {
-      const windowStart = `${year}-01-01`;
-      // LP treats enddate as exclusive — use tomorrow so today's leads are captured
-      const windowEnd = year === currentYear
-        ? tomorrow.toISOString().slice(0, 10)
-        : `${year}-12-31`;
-
-      console.log(`[Sync P1] Fetching leads for ${windowStart} to ${windowEnd}...`);
-      let startIndex = 1;
-      let consecutiveEmptyPages = 0;
-      let consecutivePageFailures = 0;
-      const yearStartedAt = new Date();
-      const yearStartCount = counts.leads;
-
-      while (true) {
-        let result;
-        try {
-          result = await getLeads({
-            startdate:  windowStart,
-            enddate:    windowEnd,
-            PageSize:   PAGE_SIZE,
-            StartIndex: startIndex,
-          });
-          consecutivePageFailures = 0;
-        } catch (err) {
-          consecutivePageFailures++;
-          console.error(`[Sync P1] Page at index ${startIndex} failed (${consecutivePageFailures}/3): ${err.message}`);
-          if (consecutivePageFailures >= 3) {
-            console.error('[Sync P1] 3 consecutive page failures — aborting year chunk');
-            break;
-          }
-          startIndex += PAGE_SIZE;  // Skip failed page
-          continue;
-        }
-
-        const prospects = extractArray(result);
-        if (prospects.length === 0) {
-          consecutiveEmptyPages++;
-          if (consecutiveEmptyPages >= 2) break;
-          startIndex += PAGE_SIZE;
-          continue;
-        }
-        consecutiveEmptyPages = 0;
-
-        for (const prospect of prospects) {
-          try {
-            const leadCount = await upsertLeadOnly(prospect);
-            counts.leads += leadCount;
-          } catch (err) {
-            failed++;
-            const pid = prospect.cst_id || prospect.CstID || prospect.ProspectID;
-            await logSyncError(pid, err, 'full');
-          }
-        }
-
-        // Flush live progress for leads after every page
-        await syncLogProgress(logIds.leads, counts.leads);
-
-        console.log(`[Sync P1] [${year}] Page ${Math.ceil(startIndex / PAGE_SIZE)}: ${prospects.length} prospects fetched (${counts.leads} leads total)`);
-
-        startIndex += prospects.length;  // v5.1 fix: increment by actual count, not PAGE_SIZE
-        await sleep(RATE_LIMIT_SLEEP_MS);
-      }
-
-      // Per-year-chunk sync log entry for monitoring
-      const yearLeads = counts.leads - yearStartCount;
-      if (yearLeads > 0) {
-        try {
-          await supabase.from('lp_sync_log').insert({
-            entity_type:    'leads',
-            sync_type:      `full_pass1_${year}`,
-            status:         'completed',
-            records_synced: yearLeads,
-            started_at:     yearStartedAt.toISOString(),
-            completed_at:   new Date().toISOString(),
-          });
-        } catch (_) { /* non-fatal */ }
-      }
-    }
+    // v5.2: Use daily date windows via extracted Pass 1 module
+    // LP API GetLead silently truncates at ~500-1000 records per date range.
+    // Daily windows ensure every single lead is captured.
+    const pass1Result = await runPass1DailyWindows({
+      upsertLeadOnly,
+      logSyncError,
+      syncLogProgress,
+      supabase,
+      leadsLogId: logIds.leads,
+    });
+    counts.leads = pass1Result.leads;
+    failed = pass1Result.failed;
 
     // Bug 1: Complete leads log IMMEDIATELY after Pass 1
     // Individual errors are already logged via logSyncError() — don't mark
