@@ -1,12 +1,12 @@
 // --- Full Sync Pass 1 --- Daily Windows --- src/full-sync-pass1.js ---
 //
-// v5.2: Uses daily date windows instead of yearly to avoid LP API result cap.
+// v5.2.1: Uses daily date windows instead of yearly to avoid LP API result cap.
 // The LP GetLead endpoint silently truncates at ~500-1000 records per query.
 // Daily windows keep each query safely under the cap.
 //
-// ~9,500 windows from 2000-01-01 to present. At 150ms rate limit per page,
-// empty days resolve in <1s each. Full historical sync takes ~2-4 hours.
-// Subsequent forced syncs are faster due to upsert (no duplicates).
+// Sync log: Writes a progress row for EVERY non-empty window, plus a
+// master "full_p1_progress" row that updates continuously so Ryan can
+// monitor progress in real time from the lp_sync_log table.
 
 import { generateDateWindows } from './date-windows.js';
 import { getLeads } from './lp-client.js';
@@ -40,12 +40,28 @@ function extractArray(response) {
 export async function runPass1DailyWindows(opts) {
   const { upsertLeadOnly, logSyncError, syncLogProgress, supabase, leadsLogId } = opts;
   const dateWindows = generateDateWindows({ windowDays: 1 });
-  console.log(`[Sync P1] v5.2 --- ${dateWindows.length} daily windows (${dateWindows[dateWindows.length - 1]?.start} to ${dateWindows[0]?.end})`);
+  const totalWindowCount = dateWindows.length;
+  const syncStartedAt = new Date().toISOString();
+  console.log(`[Sync P1] v5.2 --- ${totalWindowCount} daily windows (${dateWindows[totalWindowCount - 1]?.start} to ${dateWindows[0]?.end})`);
 
   let totalLeads = 0;
   let totalFailed = 0;
   let totalWindows = 0;
   let emptyWindows = 0;
+
+  // Create a master progress row that we update continuously
+  let progressLogId = null;
+  try {
+    const { data, error } = await supabase.from('lp_sync_log').insert({
+      entity_type:    'leads',
+      sync_type:      'full_p1_progress',
+      status:         'running',
+      records_synced: 0,
+      error_message:  `0/${totalWindowCount} windows processed`,
+      started_at:     syncStartedAt,
+    }).select('id').single();
+    if (!error && data) progressLogId = data.id;
+  } catch (_) {}
 
   for (const window of dateWindows) {
     let startIndex = 1;
@@ -90,13 +106,12 @@ export async function runPass1DailyWindows(opts) {
         }
       }
 
-      // Live progress update
+      // Live progress update on the parent entity log row
       if (syncLogProgress && leadsLogId) {
         await syncLogProgress(leadsLogId, totalLeads);
       }
 
       if (prospects.length > 50) {
-        // Only log pages with significant data to reduce noise
         console.log(`[Sync P1] [${window.start}] Page ${Math.ceil(startIndex / PAGE_SIZE)}: ${prospects.length} prospects (${totalLeads} total)`);
       }
 
@@ -110,25 +125,48 @@ export async function runPass1DailyWindows(opts) {
     if (windowLeads === 0) {
       emptyWindows++;
     } else {
-      // Log non-empty windows for monitoring
+      // Log every non-empty window as its own completed row
       console.log(`[Sync P1] [${window.start}] ${windowLeads} leads synced (${totalLeads} total)`);
-    }
-
-    // Progress summary every 500 windows (~500 days)
-    if (totalWindows % 500 === 0) {
-      console.log(`[Sync P1] Progress: ${totalWindows}/${dateWindows.length} days, ${totalLeads} leads, ${emptyWindows} empty, ${totalFailed} failed`);
-      // Flush a per-batch sync log entry for crash recovery visibility
       try {
         await supabase.from('lp_sync_log').insert({
           entity_type:    'leads',
-          sync_type:      `full_p1_batch_${totalWindows}`,
+          sync_type:      `full_p1_${window.start}`,
           status:         'completed',
-          records_synced: totalLeads,
-          started_at:     new Date(Date.now() - 60000).toISOString(),
+          records_synced: windowLeads,
+          error_message:  null,
+          started_at:     new Date(Date.now() - 120000).toISOString(),
           completed_at:   new Date().toISOString(),
         });
-      } catch (_) { /* non-fatal */ }
+      } catch (_) {}
     }
+
+    // Update the master progress row every window
+    if (progressLogId) {
+      try {
+        const pct = ((totalWindows / totalWindowCount) * 100).toFixed(1);
+        await supabase.from('lp_sync_log').update({
+          records_synced: totalLeads,
+          error_message:  `${totalWindows}/${totalWindowCount} windows (${pct}%) | ${totalLeads} leads | ${emptyWindows} empty | now: ${window.start} | failed: ${totalFailed}`,
+        }).eq('id', progressLogId);
+      } catch (_) {}
+    }
+
+    // Console progress every 50 windows
+    if (totalWindows % 50 === 0) {
+      console.log(`[Sync P1] Progress: ${totalWindows}/${totalWindowCount} days, ${totalLeads} leads, ${emptyWindows} empty, ${totalFailed} failed`);
+    }
+  }
+
+  // Mark master progress row as completed
+  if (progressLogId) {
+    try {
+      await supabase.from('lp_sync_log').update({
+        status:         'completed',
+        records_synced: totalLeads,
+        error_message:  `Done: ${totalWindows} windows, ${totalLeads} leads, ${emptyWindows} empty, ${totalFailed} failed`,
+        completed_at:   new Date().toISOString(),
+      }).eq('id', progressLogId);
+    } catch (_) {}
   }
 
   console.log(`[Sync P1] v5.2 done --- ${totalLeads} leads, ${totalWindows} days processed, ${emptyWindows} empty, ${totalFailed} failed`);
