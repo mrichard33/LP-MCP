@@ -27,6 +27,7 @@ import { matchToGHL, applyGHLTag, resetGHLState } from './ghl.js';
 import { normalizeSourceAndTag } from './normalization.js';
 import { processMilestoneTriggers } from './milestones.js';
 import { runPass1DailyWindows } from './full-sync-pass1.js';
+import { upsertProspect, updateProspectGHL } from './upsert-prospect.js';
 
 const SYNC_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const PAGE_SIZE = 200;
@@ -584,6 +585,10 @@ const MDT_TAG_MAP = {
 
 async function upsertLeadOnly(prospect) {
   const leads = getField(prospect, 'leads', 'Leads') || [];
+
+  // v5.3: Upsert prospect record (one row per person in lp_prospects)
+  await upsertProspect(prospect, { leads });
+
   if (leads.length === 0) {
     // Flat data — upsert as-is (same as processProspect fallback)
     await upsertLeadFromFlat(prospect, null);
@@ -679,8 +684,12 @@ async function processProspect(prospect, { skipGHL = false } = {}) {
     }
   }
 
+  // v5.3: Upsert prospect record (one row per person in lp_prospects)
+  const allLeads = getField(prospect, 'leads', 'Leads') || [];
+  await upsertProspect(prospect, { ghlContactId: ghlId, leads: allLeads });
+
   // 2. Process each lead record under this prospect
-  const leads = getField(prospect, 'leads', 'Leads') || [];
+  const leads = allLeads;
   if (leads.length === 0) {
     // Some endpoints return flat data — treat the prospect itself as a lead
     await upsertLeadFromFlat(prospect, ghlId);
