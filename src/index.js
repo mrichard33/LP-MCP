@@ -37,6 +37,11 @@ function authenticate(req, res, next) {
   next();
 }
 
+// Root — quick status for browser checks
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', server: 'lp-mcp-server', version: '5.1.0', port: PORT });
+});
+
 // Health check — shows config status for all required env vars
 app.get('/health', (req, res) => {
   res.json({
