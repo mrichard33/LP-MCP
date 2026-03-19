@@ -2,6 +2,19 @@
 import { z } from 'zod';
 import { railwayQuery, getServiceId } from '../../admin/railway-client.js';
 
+// Helper to get project + environment IDs (required by several Railway queries)
+const getProjectId = () => {
+  const id = process.env.RAILWAY_PROJECT_ID;
+  if (!id) throw new Error('RAILWAY_PROJECT_ID not configured');
+  return id;
+};
+
+const getEnvironmentId = () => {
+  const id = process.env.RAILWAY_ENVIRONMENT_ID;
+  if (!id) throw new Error('RAILWAY_ENVIRONMENT_ID not configured');
+  return id;
+};
+
 export function registerRailwayTools(server) {
 
   // Tool 17: get_railway_service_status [READ]
@@ -25,9 +38,6 @@ export function registerRailwayTools(server) {
                   id
                   status
                   createdAt
-                  meta {
-                    commitMessage
-                  }
                 }
               }
             }
@@ -61,7 +71,7 @@ export function registerRailwayTools(server) {
           query($serviceId: String!) {
             service(id: $serviceId) {
               deployments(first: 1) {
-                edges { node { id } }
+                edges { node { id status } }
               }
             }
           }
@@ -72,8 +82,9 @@ export function registerRailwayTools(server) {
         }
       }
 
+      // Railway deploymentLogs query — uses deployment ID
       const data = await railwayQuery(`
-        query($deploymentId: String!, $limit: Int!) {
+        query($deploymentId: String!, $limit: Int) {
           deploymentLogs(deploymentId: $deploymentId, limit: $limit) {
             timestamp
             message
@@ -104,20 +115,22 @@ export function registerRailwayTools(server) {
     },
     async ({ service_id }) => {
       const sid = service_id || getServiceId();
-      const data = await railwayQuery(`
-        query($serviceId: String!) {
-          variables(serviceId: $serviceId) {
-            name
-            value
-          }
-        }
-      `, { serviceId: sid });
+      const projectId = getProjectId();
+      const environmentId = getEnvironmentId();
 
-      // Redact values — only return name, is_set, and value length
-      const vars = (data.variables || []).map(v => ({
-        name: v.name,
-        is_set: v.value !== null && v.value !== undefined && v.value !== '',
-        length: v.value?.length || 0,
+      // Railway's variables query returns a JSON object (key-value map), not an array
+      const data = await railwayQuery(`
+        query($projectId: String!, $environmentId: String!, $serviceId: String!) {
+          variables(projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId)
+        }
+      `, { projectId, environmentId, serviceId: sid });
+
+      // data.variables is a JSON object like { KEY: "value", ... }
+      const rawVars = data.variables || {};
+      const vars = Object.entries(rawVars).map(([name, value]) => ({
+        name,
+        is_set: value !== null && value !== undefined && value !== '',
+        length: typeof value === 'string' ? value.length : 0,
       }));
 
       return {
@@ -153,11 +166,22 @@ export function registerRailwayTools(server) {
       }
 
       const sid = getServiceId();
+      const projectId = getProjectId();
+      const environmentId = getEnvironmentId();
+
       await railwayQuery(`
-        mutation($serviceId: String!, $name: String!, $value: String!) {
-          variableUpsert(input: { serviceId: $serviceId, name: $name, value: $value })
+        mutation($input: VariableUpsertInput!) {
+          variableUpsert(input: $input)
         }
-      `, { serviceId: sid, name, value });
+      `, {
+        input: {
+          projectId,
+          environmentId,
+          serviceId: sid,
+          name,
+          value,
+        },
+      });
 
       return {
         content: [{ type: 'text', text: JSON.stringify({ success: true, name, action: 'set', note: 'Auto-redeploy triggered.' }, null, 2) }],
@@ -184,11 +208,13 @@ export function registerRailwayTools(server) {
       }
 
       const sid = getServiceId();
+      const environmentId = getEnvironmentId();
+
       await railwayQuery(`
-        mutation($serviceId: String!) {
-          serviceInstanceRedeploy(serviceId: $serviceId)
+        mutation($serviceId: String!, $environmentId: String!) {
+          serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId)
         }
-      `, { serviceId: sid });
+      `, { serviceId: sid, environmentId });
 
       return {
         content: [{ type: 'text', text: JSON.stringify({ success: true, action: 'redeploy', service_id: sid }, null, 2) }],
