@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import supabase from '../supabase.js';
 
 export function registerSourceTools(server) {
@@ -7,7 +8,7 @@ export function registerSourceTools(server) {
     'get_leads_needing_mapping',
     'sourcesubdescr/source values not yet in the mapping table. Data maintenance.',
     {
-      limit: { type: 'integer', description: 'Max results (default 50)' },
+      limit: z.number().optional().describe('Max results (default 50)'),
     },
     async ({ limit = 50 }) => {
       const { data, error } = await supabase
@@ -37,8 +38,8 @@ export function registerSourceTools(server) {
     'get_source_distribution',
     'Top lead sources by volume with sourcesubdescr and source shown separately. FIRST QUERY TO RUN on connection.',
     {
-      limit: { type: 'integer', description: 'Number of sources to return (default 50)' },
-      show_unmapped_only: { type: 'boolean', description: 'Only show sources without a GHL bucket mapping (default false)' },
+      limit: z.number().optional().describe('Number of sources to return (default 50)'),
+      show_unmapped_only: z.boolean().optional().describe('Only show sources without a GHL bucket mapping (default false)'),
     },
     async ({ limit = 50, show_unmapped_only = false }) => {
       const { data, error } = await supabase.rpc('get_source_distribution', {
@@ -91,7 +92,7 @@ export function registerSourceTools(server) {
     'get_day15_disposition_breakdown',
     'Disposition distribution for Day 15+ leads. Drives W11.1 reactivation strategy.',
     {
-      days_inactive_min: { type: 'integer', description: 'Minimum days since lead creation (default 15)' },
+      days_inactive_min: z.number().optional().describe('Minimum days since lead creation (default 15)'),
     },
     async ({ days_inactive_min = 15 }) => {
       const { data, error } = await supabase.rpc('get_day15_disposition_breakdown', {

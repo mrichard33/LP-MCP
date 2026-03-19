@@ -1,4 +1,5 @@
 // ─── Supabase Admin MCP Tools (Tools 30–33) ──────────────────────
+import { z } from 'zod';
 import supabase from '../../supabase.js';
 import { runSQL, listTables, getTableSchema } from '../../admin/supabase-admin.js';
 
@@ -11,8 +12,8 @@ export function registerSupabaseAdminTools(server) {
     'supabase_run_query',
     'Execute a SQL query against Supabase (SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER all allowed). Only DROP/TRUNCATE require confirm_destructive: true.',
     {
-      query: { type: 'string', description: 'SQL query. Example: "SELECT COUNT(*) FROM lp_leads"' },
-      confirm_destructive: { type: 'boolean', description: 'Required only for DROP/TRUNCATE statements (default: false)' },
+      query: z.string().describe('SQL query. Example: "SELECT COUNT(*) FROM lp_leads"'),
+      confirm_destructive: z.boolean().optional().describe('Required only for DROP/TRUNCATE statements (default: false)'),
     },
     async ({ query, confirm_destructive }) => {
       if (!query) return { content: [{ type: 'text', text: 'Error: query is required.' }] };
@@ -35,7 +36,7 @@ export function registerSupabaseAdminTools(server) {
     'supabase_list_tables',
     'List all lp_* tables with approximate row counts.',
     {
-      prefix: { type: 'string', description: 'Table name prefix filter (default: "lp_")' },
+      prefix: z.string().optional().describe('Table name prefix filter (default: "lp_")'),
     },
     async ({ prefix }) => {
       const result = await listTables(prefix || 'lp_');
@@ -50,7 +51,7 @@ export function registerSupabaseAdminTools(server) {
     'supabase_get_table_schema',
     'Full column definitions, types, defaults, and constraints for a table.',
     {
-      table_name: { type: 'string', description: 'Table name. Example: "lp_leads"' },
+      table_name: z.string().describe('Table name. Example: "lp_leads"'),
     },
     async ({ table_name }) => {
       if (!table_name) return { content: [{ type: 'text', text: 'Error: table_name is required.' }] };
@@ -67,9 +68,9 @@ export function registerSupabaseAdminTools(server) {
     'supabase_get_sync_errors',
     'Unresolved sync errors for diagnosis. Filter by resolved status and sync type.',
     {
-      resolved: { type: 'boolean', description: 'Filter by resolved status (default: false = unresolved only)' },
-      limit: { type: 'number', description: 'Max records to return (default: 50)' },
-      sync_type: { type: 'string', description: 'Filter by sync type: "full", "incremental", or "reconcile"' },
+      resolved: z.boolean().optional().describe('Filter by resolved status (default: false = unresolved only)'),
+      limit: z.number().optional().describe('Max records to return (default: 50)'),
+      sync_type: z.string().optional().describe('Filter by sync type: "full", "incremental", or "reconcile"'),
     },
     async ({ resolved, limit, sync_type }) => {
       if (!supabase) return { content: [{ type: 'text', text: 'Error: Supabase not configured.' }] };

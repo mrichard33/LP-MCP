@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import supabase from '../supabase.js';
 
 // Tool 1: get_lead_summary
@@ -7,8 +8,8 @@ export function registerLeadTools(server) {
     'get_lead_summary',
     'Full LP record + calls + notes + activities for one lead. Use for rep briefing before calls.',
     {
-      lead_id: { type: 'string', description: 'LP lead ID' },
-      search: { type: 'string', description: 'Search by name, phone, or email instead of ID' },
+      lead_id: z.string().optional().describe('LP lead ID'),
+      search: z.string().optional().describe('Search by name, phone, or email instead of ID'),
     },
     async ({ lead_id, search }) => {
       let lead;
@@ -79,10 +80,10 @@ export function registerLeadTools(server) {
     'get_abandoned_leads',
     'Leads with no LP activity after N days. Core targeting for W11.0/W11.1 reactivation.',
     {
-      days_inactive: { type: 'integer', description: 'Minimum days since last contact (default 15)' },
-      limit: { type: 'integer', description: 'Max results (default 100)' },
-      disposition_filter: { type: 'string', description: 'Filter by disposition code' },
-      source_filter: { type: 'string', description: 'Filter by intent bucket' },
+      days_inactive: z.number().optional().describe('Minimum days since last contact (default 15)'),
+      limit: z.number().optional().describe('Max results (default 100)'),
+      disposition_filter: z.string().optional().describe('Filter by disposition code'),
+      source_filter: z.string().optional().describe('Filter by intent bucket'),
     },
     async ({ days_inactive = 15, limit = 100, disposition_filter, source_filter }) => {
       let query = supabase
@@ -121,8 +122,8 @@ export function registerLeadTools(server) {
     'get_leads_by_disposition',
     'All leads matching a disposition code. Use for segment analysis.',
     {
-      disposition_code: { type: 'string', description: 'LP disposition code to filter by' },
-      limit: { type: 'integer', description: 'Max results (default 100)' },
+      disposition_code: z.string().describe('LP disposition code to filter by'),
+      limit: z.number().optional().describe('Max results (default 100)'),
     },
     async ({ disposition_code, limit = 100 }) => {
       const { data, error } = await supabase
@@ -148,8 +149,8 @@ export function registerLeadTools(server) {
     'search_leads',
     'Full-text search across LP records by name, phone, email, or address.',
     {
-      query: { type: 'string', description: 'Search term' },
-      limit: { type: 'integer', description: 'Max results (default 25)' },
+      query: z.string().describe('Search term'),
+      limit: z.number().optional().describe('Max results (default 25)'),
     },
     async ({ query, limit = 25 }) => {
       const searchTerm = `%${query}%`;
@@ -176,7 +177,7 @@ export function registerLeadTools(server) {
     'get_call_history',
     'All call logs for a lead. Use for contact intelligence before outreach.',
     {
-      lead_id: { type: 'string', description: 'LP lead ID' },
+      lead_id: z.string().describe('LP lead ID'),
     },
     async ({ lead_id }) => {
       const { data, error } = await supabase

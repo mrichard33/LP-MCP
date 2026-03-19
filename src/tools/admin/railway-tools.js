@@ -1,4 +1,5 @@
 // ─── Railway Admin MCP Tools (Tools 17–22) ───────────────────────
+import { z } from 'zod';
 import { railwayQuery, getServiceId } from '../../admin/railway-client.js';
 
 export function registerRailwayTools(server) {
@@ -8,7 +9,7 @@ export function registerRailwayTools(server) {
     'get_railway_service_status',
     'Current Railway service status, uptime, and recent deployments.',
     {
-      service_id: { type: 'string', description: 'Railway service ID (defaults to RAILWAY_SERVICE_ID env var)' },
+      service_id: z.string().optional().describe('Railway service ID (defaults to RAILWAY_SERVICE_ID env var)'),
     },
     async ({ service_id }) => {
       const sid = service_id || getServiceId();
@@ -45,9 +46,9 @@ export function registerRailwayTools(server) {
     'get_railway_logs',
     'Recent Railway deploy logs. Filter by keyword (e.g. "[Sync]", "error").',
     {
-      lines: { type: 'number', description: 'Number of log lines to return (default 100, max 500)' },
-      filter: { type: 'string', description: 'Optional keyword filter (e.g. "[Sync]", "error")' },
-      deployment_id: { type: 'string', description: 'Deployment ID (defaults to latest active)' },
+      lines: z.number().optional().describe('Number of log lines to return (default 100, max 500)'),
+      filter: z.string().optional().describe('Optional keyword filter (e.g. "[Sync]", "error")'),
+      deployment_id: z.string().optional().describe('Deployment ID (defaults to latest active)'),
     },
     async ({ lines, filter, deployment_id }) => {
       const limit = Math.min(lines || 100, 500);
@@ -99,7 +100,7 @@ export function registerRailwayTools(server) {
     'get_railway_env_vars',
     'List Railway environment variable names and whether they are set. NEVER returns actual values.',
     {
-      service_id: { type: 'string', description: 'Railway service ID (defaults to RAILWAY_SERVICE_ID env var)' },
+      service_id: z.string().optional().describe('Railway service ID (defaults to RAILWAY_SERVICE_ID env var)'),
     },
     async ({ service_id }) => {
       const sid = service_id || getServiceId();
@@ -130,9 +131,9 @@ export function registerRailwayTools(server) {
     'set_railway_env_var',
     'Create or update a Railway environment variable. Triggers auto-redeploy. Requires confirm: true.',
     {
-      name: { type: 'string', description: 'Environment variable name' },
-      value: { type: 'string', description: 'New value to set' },
-      confirm: { type: 'boolean', description: 'Must be true to execute. If false/missing, returns preview only.' },
+      name: z.string().describe('Environment variable name'),
+      value: z.string().describe('New value to set'),
+      confirm: z.boolean().optional().describe('Must be true to execute. If false/missing, returns preview only.'),
     },
     async ({ name, value, confirm }) => {
       if (!name || value === undefined) {
@@ -169,7 +170,7 @@ export function registerRailwayTools(server) {
     'redeploy_railway_service',
     'Trigger a redeployment from the latest commit. Requires confirm: true.',
     {
-      confirm: { type: 'boolean', description: 'Must be true to execute.' },
+      confirm: z.boolean().optional().describe('Must be true to execute.'),
     },
     async ({ confirm }) => {
       if (confirm !== true) {
@@ -200,8 +201,8 @@ export function registerRailwayTools(server) {
     'rollback_railway_deployment',
     'Roll back to a specified previous deployment. Requires confirm: true.',
     {
-      deployment_id: { type: 'string', description: 'Target deployment ID to roll back to' },
-      confirm: { type: 'boolean', description: 'Must be true to execute.' },
+      deployment_id: z.string().describe('Target deployment ID to roll back to'),
+      confirm: z.boolean().optional().describe('Must be true to execute.'),
     },
     async ({ deployment_id, confirm }) => {
       if (!deployment_id) {
