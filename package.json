@@ -12,7 +12,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@modelcontextprotocol/sdk": "1.12.1",
     "@supabase/supabase-js": "^2.49.4",
     "express": "^4.21.2",
     "dotenv": "^16.4.7",

@@ -13,19 +13,19 @@ import supabase from './supabase.js';
 const PORT = process.env.PORT || 3000;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 
-// Create MCP server
-const server = new McpServer({
-  name: 'lp-mcp-server',
-  version: '5.1.0',
-  description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence',
-});
-
-// Register all 33 tool functions (16 LP data + 17 infrastructure admin)
-registerAllTools(server);
-
-// Express app for SSE transport
+// Express app — all MCP sessions create per-session server instances
 const app = express();
 app.use(express.json());
+
+// CORS — required for browser-based MCP clients (Claude.ai)
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, mcp-session-id');
+  res.setHeader('Access-Control-Expose-Headers', 'mcp-session-id');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
 // Auth middleware
 function authenticate(req, res, next) {
@@ -96,6 +96,7 @@ app.post('/mcp', authenticate, async (req, res) => {
     }
 
     // Create transport + MCP server for this session
+    console.log('[MCP] Creating new session transport...');
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => crypto.randomUUID(),
     });
@@ -104,14 +105,25 @@ app.post('/mcp', authenticate, async (req, res) => {
       version: '5.1.0',
       description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence',
     });
-    registerAllTools(sessionServer);
+
+    try {
+      registerAllTools(sessionServer);
+      console.log('[MCP] All 33 tools registered successfully');
+    } catch (toolErr) {
+      console.error('[MCP] TOOL REGISTRATION FAILED:', toolErr.stack);
+      if (!res.headersSent) res.status(500).json({ error: 'Tool registration failed' });
+      return;
+    }
+
     await sessionServer.connect(transport);
+    console.log('[MCP] Transport connected, handling initialize request...');
 
     // Handle the initialize request — this assigns the session ID
     await transport.handleRequest(req, res, req.body);
 
     // Now store the session (ID is set after handleRequest processes initialize)
     const newId = transport.sessionId;
+    console.log('[MCP] Initialize handled, session ID:', newId || '(none)');
     if (newId) {
       streamableSessions[newId] = { transport, server: sessionServer };
       console.log(`[MCP] New Streamable HTTP session: ${newId}`);
@@ -121,7 +133,7 @@ app.post('/mcp', authenticate, async (req, res) => {
       };
     }
   } catch (err) {
-    console.error('[MCP] Streamable HTTP error:', err.message);
+    console.error('[MCP] Streamable HTTP error:', err.stack);
     if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -146,26 +158,35 @@ app.delete('/mcp', authenticate, async (req, res) => {
 });
 
 // ─── Legacy SSE transport (Claude Desktop, Cursor, etc) ─────────
-const transports = {};
+// Per-session servers — same isolation pattern as Streamable HTTP
+const sseSessions = {};
 
 app.get('/sse', authenticate, async (req, res) => {
   const transport = new SSEServerTransport('/messages', res);
-  transports[transport.sessionId] = transport;
+  const sessionServer = new McpServer({
+    name: 'lp-mcp-server',
+    version: '5.1.0',
+    description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence',
+  });
+  registerAllTools(sessionServer);
+  sseSessions[transport.sessionId] = { transport, server: sessionServer };
+  console.log(`[MCP] New SSE session: ${transport.sessionId}`);
 
   res.on('close', () => {
-    delete transports[transport.sessionId];
+    delete sseSessions[transport.sessionId];
+    console.log(`[MCP] SSE session closed: ${transport.sessionId}`);
   });
 
-  await server.connect(transport);
+  await sessionServer.connect(transport);
 });
 
 app.post('/messages', authenticate, async (req, res) => {
   const sessionId = req.query.sessionId;
-  const transport = transports[sessionId];
-  if (!transport) {
+  const session = sseSessions[sessionId];
+  if (!session) {
     return res.status(404).json({ error: 'Session not found' });
   }
-  await transport.handlePostMessage(req, res);
+  await session.transport.handlePostMessage(req, res);
 });
 
 // ─── Manual sync endpoints ───────────────────────────────────────
