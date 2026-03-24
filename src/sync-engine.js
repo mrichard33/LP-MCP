@@ -1040,6 +1040,7 @@ async function syncNotes(lpLeadId, ghlContactId, notes) {
         note_type:           getField(note, 'rectype', 'RecType', 'type', 'note_type'),
         note_category:       getField(note, 'category', 'Category'),
         created_by_rep_name: getField(note, 'enteredby', 'EnteredBy', 'rep_name', 'entered_by'),
+        created_by_rep_id:   getField(note, 'rep_id', 'agent', 'emp_id', 'EmpID'),
         created_at_lp:       getField(note, 'date', 'Date', 'enteredon', 'EnteredOn', 'created_at'),
         synced_at:           new Date().toISOString(),
         raw_lp_data:         note,
