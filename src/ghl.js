@@ -78,7 +78,7 @@ export async function matchToGHL(lpLead) {
   return null;
 }
 
-// Apply tag via POST (additive) — NEVER use PUT which replaces all tags
+// Apply tag via POST (additive) — NEVER use PUT which replaces all tags (v2 API)
 // NOTE: Do NOT include locationId in body — GHL v2 rejects it with 422.
 export async function applyGHLTag(ghlContactId, tag) {
   if (ghlDisabled || !ghlClient || !ghlContactId) return false;
@@ -107,8 +107,14 @@ export async function applyGHLTag(ghlContactId, tag) {
 
 // ─── Update GHL Contact Custom Fields ────────────────────────────
 // Uses PUT /contacts/{contactId} with ONLY customFields in the body.
-// CRITICAL: Never include 'tags' — would REPLACE all tags.
-// CRITICAL: Never include 'locationId' — GHL v2 API rejects with 422.
+// CRITICAL: Never include 'tags' in the PUT body — that would REPLACE
+// all tags on the contact. We only pass customFields, which is additive.
+// CRITICAL: Never include 'locationId' — GHL v2 API rejects it with 422.
+//
+// @param {string} ghlContactId - GHL contact ID
+// @param {Array} customFields - Array of { id, field_value } objects
+// @returns {boolean} true on success
+
 export async function updateGHLContactFields(ghlContactId, customFields) {
   if (ghlDisabled || !ghlClient || !ghlContactId) return false;
   if (!customFields || customFields.length === 0) return false;
