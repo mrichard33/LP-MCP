@@ -3,11 +3,12 @@
 // Maps LP Supabase fields → GHL custom field IDs.
 // ALL FIELD IDS CONFIRMED via HL MCP cache — March 24, 2026
 //
-// v2 — March 24, 2026
+// v3 — March 24, 2026
 // - Removed best_lead_sales_rep (duplicate of rep_name)
 // - Removed promoter_legacy (duplicate of promoter_name)
 // - Added lp_appointment_time (new GHL field iRuo2towFCpyKnnIUtLH)
 // - DO NOT touch GHL-owned fields: Last Appointment Start Date/Time
+// - Fixed appointment time timezone: LP stores local time, no conversion needed
 //
 // IMPORTANT: Only fields with a valid GHL field ID will be synced.
 // Fields with null transform are skipped (set by entry workflows, not sync).
@@ -65,7 +66,13 @@ const GHL_FIELD_MAP = {
     label: 'LP Appointment Date',
     transform: (lead) => {
       if (!lead.appointment_date) return null;
-      return new Date(lead.appointment_date).toLocaleDateString('en-US');
+      // LP stores local time — Supabase treats it as UTC but it's actually local.
+      // Extract date components directly from the UTC representation (which IS local).
+      const d = new Date(lead.appointment_date);
+      const month = d.getUTCMonth() + 1;
+      const day = d.getUTCDate();
+      const year = d.getUTCFullYear();
+      return `${month}/${day}/${year}`;
     },
   },
   appointment_time: {
@@ -73,14 +80,15 @@ const GHL_FIELD_MAP = {
     label: 'LP Appointment Time',
     transform: (lead) => {
       if (!lead.appointment_date) return null;
+      // LP stores local time — Supabase has it as UTC but it's actually local.
+      // DO NOT convert timezone — just extract hours/minutes from UTC representation.
       const d = new Date(lead.appointment_date);
-      // Format as "h:mm AM/PM" (e.g., "10:00 AM", "2:30 PM")
-      return d.toLocaleTimeString('en-US', {
-        hour: 'numeric',
-        minute: '2-digit',
-        hour12: true,
-        timeZone: 'America/New_York',
-      });
+      let hours = d.getUTCHours();
+      const minutes = d.getUTCMinutes();
+      const ampm = hours >= 12 ? 'PM' : 'AM';
+      hours = hours % 12 || 12; // Convert 0 → 12 for 12 AM
+      const minStr = minutes.toString().padStart(2, '0');
+      return `${hours}:${minStr} ${ampm}`;
     },
   },
   total_appointments: {
