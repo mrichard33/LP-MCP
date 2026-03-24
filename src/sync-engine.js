@@ -28,6 +28,7 @@ import { normalizeSourceAndTag } from './normalization.js';
 import { processMilestoneTriggers } from './milestones.js';
 import { runPass1DailyWindows } from './full-sync-pass1.js';
 import { upsertProspect, updateProspectGHL } from './upsert-prospect.js';
+import { combineNotes } from './safe-notes.js';
 
 const SYNC_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const PAGE_SIZE = 200;
@@ -777,7 +778,7 @@ async function processProspect(prospect, { skipGHL = false } = {}) {
 
     // 6-8. Sync sub-entities in parallel (calls, notes, activities, jobs)
     const calls = getField(prospect, 'calls', 'Calls') || [];
-    const notes = [...(getField(prospect, 'notes', 'Notes') || []), ...(getField(lead, 'notes', 'Notes') || [])];
+    const notes = combineNotes(getField(prospect, 'notes', 'Notes'), getField(lead, 'notes', 'Notes'));
     const jobs = getField(lead, 'jobs', 'Jobs') || [];
     subCounts.calls += calls.length;
     subCounts.notes += notes.length;
@@ -899,7 +900,7 @@ async function syncAllChildRecords(logIds, counts) {
 
         for (const lpLead of prospectLeads) {
           const lpLeadId = String(getField(lpLead, 'id', 'lds_id', 'LeadID'));
-          const notes = [...(getField(prospect, 'notes', 'Notes') || []), ...(getField(lpLead, 'notes', 'Notes') || [])];
+          const notes = combineNotes(getField(prospect, 'notes', 'Notes'), getField(lpLead, 'notes', 'Notes'));
           const jobs = getField(lpLead, 'jobs', 'Jobs') || [];
 
           // Sync calls, notes, activities in parallel
