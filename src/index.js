@@ -9,9 +9,11 @@ import { startSyncScheduler, fullSync, incrementalSync, handleWebhookEvent } fro
 import { testConnection, getLeads } from './lp-client.js';
 import { getTokenStatus } from './token-manager.js';
 import supabase from './supabase.js';
+import { initFieldSync, runBulkFieldSync, logCycleStats } from './ghl-field-bootstrap.js';
 
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
+const FIELD_SYNC_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes, offset from LP sync
 
 // Express app — all MCP sessions create per-session server instances
 const app = express();
@@ -39,7 +41,7 @@ function authenticate(req, res, next) {
 
 // Root — quick status for browser checks
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', server: 'lp-mcp-server', version: '5.1.0', port: PORT });
+  res.json({ status: 'ok', server: 'lp-mcp-server', version: '5.2.0', port: PORT });
 });
 
 // Health check — shows config status for all required env vars
@@ -47,7 +49,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     server: 'lp-mcp-server',
-    version: '5.1.0',
+    version: '5.2.0',
     uptime: process.uptime(),
     lp_config: {
       api_base_url: process.env.LP_API_BASE_URL ? 'set' : 'MISSING',
@@ -107,7 +109,7 @@ app.post('/mcp', authenticate, async (req, res) => {
     });
     const sessionServer = new McpServer({
       name: 'lp-mcp-server',
-      version: '5.1.0',
+      version: '5.2.0',
       description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence',
     });
 
@@ -170,7 +172,7 @@ app.get('/sse', authenticate, async (req, res) => {
   const transport = new SSEServerTransport('/messages', res);
   const sessionServer = new McpServer({
     name: 'lp-mcp-server',
-    version: '5.1.0',
+    version: '5.2.0',
     description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence',
   });
   registerAllTools(sessionServer);
@@ -204,6 +206,12 @@ app.post('/sync/full', authenticate, async (req, res) => {
 app.post('/sync/incremental', authenticate, async (req, res) => {
   res.json({ status: 'started', type: 'incremental' });
   incrementalSync().catch(err => console.error('[Sync] Manual incremental sync failed:', err.message));
+});
+
+// POST /sync/fields — manually trigger GHL field writeback
+app.post('/sync/fields', authenticate, async (req, res) => {
+  res.json({ status: 'started', type: 'field_sync' });
+  runBulkFieldSync().catch(err => console.error('[FieldSync] Manual field sync failed:', err.message));
 });
 
 // POST /sync/reconcile — compare LP count vs Supabase count [v5.1]
@@ -317,13 +325,44 @@ app.post('/webhook/lp', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`LP MCP Server v5.1 running on port ${PORT}`);
+  console.log(`LP MCP Server v5.2 running on port ${PORT}`);
   console.log(`MCP endpoint: http://localhost:${PORT}/mcp (Streamable HTTP — Claude.ai)`);
   console.log(`SSE endpoint: http://localhost:${PORT}/sse (legacy — Claude Desktop)`);
   console.log(`Health check: http://localhost:${PORT}/health`);
   console.log(`LP API test:  http://localhost:${PORT}/lp/test`);
   console.log(`Webhook:      http://localhost:${PORT}/webhook/lp`);
+  console.log(`Field sync:   POST http://localhost:${PORT}/sync/fields (manual trigger)`);
 
-  // Start the sync scheduler — pre-warms token, auto-detects first run vs incremental
+  // Initialize GHL field sync system
+  initFieldSync();
+
+  // Start the LP sync scheduler — pre-warms token, auto-detects first run vs incremental
   startSyncScheduler();
+
+  // ─── GHL Field Sync Scheduler ──────────────────────────────────
+  // Runs every 15 minutes, offset by 7.5 min from LP sync to avoid overlap.
+  // Checks all GHL-matched leads for field changes and pushes only what's different.
+  setTimeout(() => {
+    console.log('[FieldSync] Scheduler started — field sync every 15 minutes');
+
+    // Run initial field sync 2 minutes after boot (let LP sync populate data first)
+    setTimeout(async () => {
+      try {
+        await runBulkFieldSync();
+        logCycleStats();
+      } catch (err) {
+        console.error('[FieldSync] Initial field sync failed:', err.message);
+      }
+    }, 120000); // 2 minutes after boot
+
+    // Schedule periodic field syncs
+    setInterval(async () => {
+      try {
+        await runBulkFieldSync();
+        logCycleStats();
+      } catch (err) {
+        console.error('[FieldSync] Scheduled field sync failed:', err.message);
+      }
+    }, FIELD_SYNC_INTERVAL_MS);
+  }, 450000); // Start scheduler 7.5 min after boot (offset from LP sync)
 });
