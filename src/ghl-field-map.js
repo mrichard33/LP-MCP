@@ -3,8 +3,17 @@
 // Maps LP Supabase fields → GHL custom field IDs.
 // ALL FIELD IDS CONFIRMED via HL MCP cache — March 24, 2026
 //
+// v2 — March 24, 2026
+// - Removed best_lead_sales_rep (duplicate of rep_name)
+// - Removed promoter_legacy (duplicate of promoter_name)
+// - Added lp_appointment_time (new GHL field iRuo2towFCpyKnnIUtLH)
+// - DO NOT touch GHL-owned fields: Last Appointment Start Date/Time
+//
 // IMPORTANT: Only fields with a valid GHL field ID will be synced.
 // Fields with null transform are skipped (set by entry workflows, not sync).
+//
+// CRITICAL: The sync engine must select ONLY the newest lead per GHL
+// contact when a prospect has multiple leads. See ghl-field-sync.js.
 
 const GHL_FIELD_MAP = {
   // ─── IDENTITY ───────────────────────────────────────────────────
@@ -14,7 +23,7 @@ const GHL_FIELD_MAP = {
     transform: (lead) => lead.lp_prospect_id || null,
   },
   lp_lead_id: {
-    ghlFieldId: 'yII9akTft1RKOG0Ri4Q9', // Repurposing "LP Last Appointment ID" → LP Lead ID
+    ghlFieldId: 'yII9akTft1RKOG0Ri4Q9',
     label: 'LP Last Appointment ID',
     transform: (lead) => lead.lp_lead_id || null,
   },
@@ -32,34 +41,46 @@ const GHL_FIELD_MAP = {
   },
 
   // ─── REP & PROMOTER ────────────────────────────────────────────
+  // NOTE: best_lead_sales_rep REMOVED — was duplicate of rep_name
+  // NOTE: promoter_legacy REMOVED — was duplicate of promoter_name
   rep_name: {
     ghlFieldId: 'ML9jAe1P5eq1uSwYTV3o',
     label: 'LP Rep Name',
     transform: (lead) => lead.rep_name || null,
-  },
-  best_lead_sales_rep: {
-    ghlFieldId: 'UuiuAOP3FNF92QIMghva',
-    label: 'LP Best Lead Sales Rep',
-    transform: (lead) => lead.rep_name || null, // Same source, different field for legacy compat
   },
   promoter_name: {
     ghlFieldId: '5TqwYJPONzmWS1UIfM3A',
     label: 'LP Promoter Name',
     transform: (lead) => lead.promoter_name || null,
   },
-  promoter_legacy: {
-    ghlFieldId: '57gPw256Sw4GsoPpANQr',
-    label: 'Promoter',
-    transform: (lead) => lead.promoter_name || null, // Legacy field, same data
-  },
 
   // ─── APPOINTMENT & DEMO ────────────────────────────────────────
+  // NOTE: We write to LP-owned appointment fields ONLY.
+  // DO NOT write to GHL-owned fields:
+  //   - Last Appointment Start Date (x8KO5o89WPLfC7ivia3A)
+  //   - Last Appointment Start Time (U67epWMNqjbf0SHAllEZ)
+  // Those are managed by GHL workflows, not LP sync.
   appointment_date: {
     ghlFieldId: 'GL1rM4cnXBETsBkqxkZw',
     label: 'LP Appointment Date',
     transform: (lead) => {
       if (!lead.appointment_date) return null;
       return new Date(lead.appointment_date).toLocaleDateString('en-US');
+    },
+  },
+  appointment_time: {
+    ghlFieldId: 'iRuo2towFCpyKnnIUtLH',
+    label: 'LP Appointment Time',
+    transform: (lead) => {
+      if (!lead.appointment_date) return null;
+      const d = new Date(lead.appointment_date);
+      // Format as "h:mm AM/PM" (e.g., "10:00 AM", "2:30 PM")
+      return d.toLocaleTimeString('en-US', {
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true,
+        timeZone: 'America/New_York',
+      });
     },
   },
   total_appointments: {
