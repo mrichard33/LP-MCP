@@ -11,10 +11,14 @@
 // This module provides a safe extraction function used everywhere
 // notes are assembled from LP API responses.
 //
-// v2 — Also generates deterministic synthetic IDs for wrapped notes
-// so syncNotes() never falls back to Math.random(). The residual
-// leak (~250 junk rows/cycle) was caused by string-wrapped notes
-// having no `id` or `enteredon` field.
+// v2 — Deterministic synthetic IDs for wrapped notes (no Math.random)
+// v3 — Note enrichment: derives `type` from LP's `important` field
+//       so syncNotes() populates note_type. Also adds `rep_id` as
+//       alias for `enteredby` so created_by_rep_id can be populated.
+//
+// LP note record keys: id, enteredby, enteredon, updatedby, updatedon,
+//                       important, category, note
+// Missing from LP: rectype (no note type field), rep ID (only name)
 
 /**
  * Generate a deterministic hash code from a string.
@@ -36,19 +40,65 @@ function hashCode(str) {
 }
 
 /**
+ * Enrich a note object with derived fields that LP doesn't provide natively.
+ *
+ * syncNotes() in sync-engine.js uses getField() to look up fields by multiple
+ * key names. By adding these derived keys to the note object BEFORE syncNotes
+ * processes it, we populate fields that would otherwise always be null — without
+ * needing to edit the 77KB sync-engine.js file.
+ *
+ * Derived fields:
+ * - `type`: LP has no `rectype` field. Derived from `important` boolean.
+ *           syncNotes() finds this via getField(note, ..., 'type', ...)
+ * - `rep_id`: LP notes have `enteredby` (name) but no rep ID.
+ *             We use enteredby as a proxy identifier.
+ *             syncNotes() would need a new line to use this — see docs.
+ *
+ * @param {Object} note - Note object (real LP or synthetic wrapped)
+ * @returns {Object} Enriched note object (same reference, mutated)
+ */
+function enrichNote(note) {
+  if (!note || typeof note !== 'object') return note;
+
+  // Derive note_type from LP's `important` flag
+  // syncNotes checks: getField(note, 'rectype', 'RecType', 'type', 'note_type')
+  // Adding `type` makes it findable by the existing getField call
+  if (!note.type && !note.rectype && !note.RecType && !note.note_type) {
+    if (note._source) {
+      // String-wrapped note — no metadata available
+      note.type = 'system';
+    } else if (note.important === true || note.important === 'true' || note.important === 'True') {
+      note.type = 'important';
+    } else {
+      note.type = 'standard';
+    }
+  }
+
+  // Derive created_by_rep_id from enteredby (name) as proxy
+  // NOTE: syncNotes() does NOT currently have a created_by_rep_id line
+  // in its upsert. This field will only populate after adding this line
+  // to the syncNotes upsert in sync-engine.js:
+  //   created_by_rep_id: getField(note, 'rep_id', 'agent', 'emp_id', 'EmpID'),
+  if (!note.rep_id && note.enteredby) {
+    note.rep_id = note.enteredby; // Use name as proxy — LP provides no separate ID
+  }
+
+  return note;
+}
+
+/**
  * Safely extract notes from an LP API field, handling:
  * - null/undefined → []
- * - Array of objects → returned as-is (normal case)
+ * - Array of objects → enriched with derived fields
  * - Array of strings → each wrapped as { note: str, id: deterministic }
  * - Plain string → wrapped as [{ note: str, id: deterministic }]
  * - Any other type → [] (skip silently)
  *
- * Wrapped notes include synthetic `id` and `enteredon` fields so that
- * syncNotes() can generate a stable lp_note_id without Math.random().
+ * All notes (real and wrapped) are enriched with derived `type` field.
  *
  * @param {*} raw - The raw value from getField(obj, 'notes', 'Notes')
  * @param {string} source - Label for logging (e.g., 'prospect', 'lead')
- * @returns {Array} Array of note objects safe for syncNotes()
+ * @returns {Array} Array of enriched note objects safe for syncNotes()
  */
 export function safeNotes(raw, source = '') {
   if (raw === null || raw === undefined) return [];
@@ -62,15 +112,15 @@ export function safeNotes(raw, source = '') {
         if (typeof item === 'string') {
           if (item.length <= 1) return null; // Skip single chars (corrupted data)
           const syntheticId = `${source}-str-${hashCode(item)}-${idx}`;
-          return {
+          return enrichNote({
             note: item,
             id: syntheticId,
             enteredon: new Date().toISOString(),
             _source: `${source}_array_string`,
-          };
+          });
         }
-        // Object item → return as-is (this is the expected format)
-        if (typeof item === 'object') return item;
+        // Object item → enrich and return
+        if (typeof item === 'object') return enrichNote(item);
         // Anything else → skip
         return null;
       })
@@ -81,12 +131,12 @@ export function safeNotes(raw, source = '') {
   if (typeof raw === 'string') {
     if (raw.length <= 1) return []; // Skip single chars
     const syntheticId = `${source}-str-${hashCode(raw)}`;
-    return [{
+    return [enrichNote({
       note: raw,
       id: syntheticId,
       enteredon: new Date().toISOString(),
       _source: `${source}_string`,
-    }];
+    })];
   }
 
   // Anything else (number, boolean, etc.) → skip
@@ -98,9 +148,11 @@ export function safeNotes(raw, source = '') {
  * Replaces the buggy pattern:
  *   [...(getField(prospect, 'notes') || []), ...(getField(lead, 'notes') || [])]
  *
+ * All notes are enriched with derived fields (type, rep_id) before return.
+ *
  * @param {*} prospectNotes - Raw notes from prospect level
  * @param {*} leadNotes - Raw notes from lead level
- * @returns {Array} Combined array of note objects
+ * @returns {Array} Combined array of enriched note objects
  */
 export function combineNotes(prospectNotes, leadNotes) {
   return [
