@@ -10,14 +10,41 @@
 //
 // This module provides a safe extraction function used everywhere
 // notes are assembled from LP API responses.
+//
+// v2 — Also generates deterministic synthetic IDs for wrapped notes
+// so syncNotes() never falls back to Math.random(). The residual
+// leak (~250 junk rows/cycle) was caused by string-wrapped notes
+// having no `id` or `enteredon` field.
+
+/**
+ * Generate a deterministic hash code from a string.
+ * Used to create stable IDs for notes that lack real LP IDs.
+ * Same input always produces the same output — no Math.random().
+ *
+ * @param {string} str - Input string
+ * @returns {string} Hex hash string (8 chars)
+ */
+function hashCode(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  // Convert to positive hex string, pad to 8 chars
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
 
 /**
  * Safely extract notes from an LP API field, handling:
  * - null/undefined → []
  * - Array of objects → returned as-is (normal case)
- * - Array of strings → each wrapped as { note: str }
- * - Plain string → wrapped as [{ note: str }]
+ * - Array of strings → each wrapped as { note: str, id: deterministic }
+ * - Plain string → wrapped as [{ note: str, id: deterministic }]
  * - Any other type → [] (skip silently)
+ *
+ * Wrapped notes include synthetic `id` and `enteredon` fields so that
+ * syncNotes() can generate a stable lp_note_id without Math.random().
  *
  * @param {*} raw - The raw value from getField(obj, 'notes', 'Notes')
  * @param {string} source - Label for logging (e.g., 'prospect', 'lead')
@@ -29,12 +56,18 @@ export function safeNotes(raw, source = '') {
   // Normal case: array of objects
   if (Array.isArray(raw)) {
     return raw
-      .map(item => {
+      .map((item, idx) => {
         if (item === null || item === undefined) return null;
-        // String item in array → wrap as note object
+        // String item in array → wrap as note object with deterministic ID
         if (typeof item === 'string') {
           if (item.length <= 1) return null; // Skip single chars (corrupted data)
-          return { note: item, _source: `${source}_array_string` };
+          const syntheticId = `${source}-str-${hashCode(item)}-${idx}`;
+          return {
+            note: item,
+            id: syntheticId,
+            enteredon: new Date().toISOString(),
+            _source: `${source}_array_string`,
+          };
         }
         // Object item → return as-is (this is the expected format)
         if (typeof item === 'object') return item;
@@ -44,10 +77,16 @@ export function safeNotes(raw, source = '') {
       .filter(Boolean);
   }
 
-  // String → wrap as single-item array
+  // String → wrap as single-item array with deterministic ID
   if (typeof raw === 'string') {
     if (raw.length <= 1) return []; // Skip single chars
-    return [{ note: raw, _source: `${source}_string` }];
+    const syntheticId = `${source}-str-${hashCode(raw)}`;
+    return [{
+      note: raw,
+      id: syntheticId,
+      enteredon: new Date().toISOString(),
+      _source: `${source}_string`,
+    }];
   }
 
   // Anything else (number, boolean, etc.) → skip
