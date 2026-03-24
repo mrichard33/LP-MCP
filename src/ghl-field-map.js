@@ -1,114 +1,158 @@
 // ─── GHL Custom Field Mapping — src/ghl-field-map.js ──────────────
 //
 // Maps LP Supabase fields → GHL custom field IDs.
-// Ryan: Replace each 'FILL_IN_GHL_FIELD_ID' with the actual GHL custom field ID.
-//
-// To find field IDs in GHL:
-//   Settings → Custom Fields → Click the field → Copy the field key from the URL
-//   or use the GHL API: GET /locations/{locationId}/customFields
+// ALL FIELD IDS CONFIRMED via HL MCP cache — March 24, 2026
 //
 // IMPORTANT: Only fields with a valid GHL field ID will be synced.
-// Fields with 'FILL_IN_GHL_FIELD_ID' are skipped automatically.
+// Fields with null transform are skipped (set by entry workflows, not sync).
 
 const GHL_FIELD_MAP = {
-  // ─── Fields that already exist in GHL ───────────────────────────
+  // ─── IDENTITY ───────────────────────────────────────────────────
   lp_prospect_id: {
     ghlFieldId: 'ZRQAVrzhtzApzLlHmT87',
     label: 'LP Prospect ID',
     transform: (lead) => lead.lp_prospect_id || null,
   },
-  lp_source_id: {
-    ghlFieldId: 'k6j4IBh5IejPooSCsj49',
-    label: 'LP Source ID',
-    // This maps srs_id — already set by entry workflows, skip during sync
-    transform: null,
-  },
-  pro_id: {
-    ghlFieldId: 'BbUJ6RrdTjjEqqRA8JVx',
-    label: 'Pro ID',
-    // Already set by entry workflows, skip during sync
-    transform: null,
-  },
-
-  // ─── New fields — FILL IN GHL FIELD IDS ─────────────────────────
   lp_lead_id: {
-    ghlFieldId: 'FILL_IN_GHL_FIELD_ID',
-    label: 'LP Lead ID',
+    ghlFieldId: 'yII9akTft1RKOG0Ri4Q9', // Repurposing "LP Last Appointment ID" → LP Lead ID
+    label: 'LP Last Appointment ID',
     transform: (lead) => lead.lp_lead_id || null,
   },
+
+  // ─── DISPOSITION & STATUS ───────────────────────────────────────
   disposition_code: {
-    ghlFieldId: 'FILL_IN_GHL_FIELD_ID',
+    ghlFieldId: 'URWTGtobi9a9Y7gwGxC8',
     label: 'LP Disposition',
     transform: (lead) => lead.disposition_code || null,
   },
   disposition_label: {
-    ghlFieldId: 'FILL_IN_GHL_FIELD_ID',
+    ghlFieldId: 'Ey7J495CZic1WYRSBO7c',
     label: 'LP Disposition Label',
     transform: (lead) => lead.disposition_label || null,
   },
+
+  // ─── REP & PROMOTER ────────────────────────────────────────────
   rep_name: {
-    ghlFieldId: 'FILL_IN_GHL_FIELD_ID',
+    ghlFieldId: 'ML9jAe1P5eq1uSwYTV3o',
     label: 'LP Rep Name',
     transform: (lead) => lead.rep_name || null,
   },
-  appointment_set: {
-    ghlFieldId: 'FILL_IN_GHL_FIELD_ID',
-    label: 'LP Appointment Set',
-    transform: (lead) => lead.appointment_set ? 'Yes' : 'No',
+  best_lead_sales_rep: {
+    ghlFieldId: 'UuiuAOP3FNF92QIMghva',
+    label: 'LP Best Lead Sales Rep',
+    transform: (lead) => lead.rep_name || null, // Same source, different field for legacy compat
   },
+  promoter_name: {
+    ghlFieldId: '5TqwYJPONzmWS1UIfM3A',
+    label: 'LP Promoter Name',
+    transform: (lead) => lead.promoter_name || null,
+  },
+  promoter_legacy: {
+    ghlFieldId: '57gPw256Sw4GsoPpANQr',
+    label: 'Promoter',
+    transform: (lead) => lead.promoter_name || null, // Legacy field, same data
+  },
+
+  // ─── APPOINTMENT & DEMO ────────────────────────────────────────
   appointment_date: {
-    ghlFieldId: 'FILL_IN_GHL_FIELD_ID',
+    ghlFieldId: 'GL1rM4cnXBETsBkqxkZw',
     label: 'LP Appointment Date',
     transform: (lead) => {
       if (!lead.appointment_date) return null;
       return new Date(lead.appointment_date).toLocaleDateString('en-US');
     },
   },
+  total_appointments: {
+    ghlFieldId: 'nWDA6dvUmLZQA02v7LNi',
+    label: 'LP Total Appointments',
+    transform: (lead) => lead.appointment_set ? '1' : '0',
+  },
   demo_completed: {
-    ghlFieldId: 'FILL_IN_GHL_FIELD_ID',
+    ghlFieldId: 'j84cNc7Rk6BkiYdZwuOO',
     label: 'LP Demo Completed',
     transform: (lead) => lead.demo_completed ? 'Yes' : 'No',
   },
+  ever_sat: {
+    ghlFieldId: 'UiNAyILf7qq6fkgJFNxU',
+    label: 'LP Ever Sat',
+    transform: (lead) => lead.demo_completed ? 'Yes' : 'No',
+  },
+
+  // ─── SALE & VALUE ──────────────────────────────────────────────
   closed_won: {
-    ghlFieldId: 'FILL_IN_GHL_FIELD_ID',
+    ghlFieldId: 'kOm9Lj3JqVgMGvW9n10N',
     label: 'LP Closed Won',
     transform: (lead) => lead.closed_won ? 'Yes' : 'No',
   },
+  ever_sold: {
+    ghlFieldId: 'nncbjuo9GIzfaHeydDuh',
+    label: 'LP Ever Sold',
+    transform: (lead) => lead.closed_won ? 'Yes' : 'No',
+  },
   job_value: {
-    ghlFieldId: 'FILL_IN_GHL_FIELD_ID',
+    ghlFieldId: 'CuZs8wl5TdO8oGnbGq6q',
     label: 'LP Job Value',
     transform: (lead) => {
       if (!lead.job_value) return null;
       return parseFloat(lead.job_value).toFixed(2);
     },
   },
+  gross_sale_amount: {
+    ghlFieldId: 'YWhoVixgPtvEDzSXcMpJ',
+    label: 'LP Gross Sale Amount',
+    transform: (lead) => {
+      if (!lead.job_value) return null;
+      return parseFloat(lead.job_value).toFixed(2);
+    },
+  },
+
+  // ─── SOURCE ────────────────────────────────────────────────────
   lead_source: {
-    ghlFieldId: 'FILL_IN_GHL_FIELD_ID',
+    ghlFieldId: 'IvSDubMH0FmZmlCDy5C2',
     label: 'LP Source',
     transform: (lead) => lead.lead_source || null,
   },
   lead_source_detail: {
-    ghlFieldId: 'FILL_IN_GHL_FIELD_ID',
+    ghlFieldId: 'o8h88WeFST8euBUq3Av6',
     label: 'LP Subsource',
     transform: (lead) => lead.lead_source_detail || null,
   },
+
+  // ─── ENGAGEMENT ────────────────────────────────────────────────
   call_count: {
-    ghlFieldId: 'FILL_IN_GHL_FIELD_ID',
+    ghlFieldId: 'H88ytdcOjRbL26YR6YmM',
     label: 'LP Call Count',
     transform: (lead) => lead.call_count != null ? String(lead.call_count) : '0',
   },
   last_contact_date: {
-    ghlFieldId: 'FILL_IN_GHL_FIELD_ID',
+    ghlFieldId: '6wVFsNmhO44BbAFycdQz',
     label: 'LP Last Contact Date',
     transform: (lead) => {
       if (!lead.last_contact_date) return null;
       return new Date(lead.last_contact_date).toLocaleDateString('en-US');
     },
   },
-  promoter_name: {
-    ghlFieldId: 'FILL_IN_GHL_FIELD_ID',
-    label: 'LP Promoter Name',
-    transform: (lead) => lead.promoter_name || null,
+
+  // ─── SYNC METADATA ─────────────────────────────────────────────
+  lp_last_synced: {
+    ghlFieldId: 'NmvZHScugBDOD2elYH1g',
+    label: 'LP Last Synced',
+    transform: () => {
+      const now = new Date();
+      return now.toLocaleString('en-US', { timeZone: 'America/New_York' });
+    },
+  },
+
+  // ─── SKIP DURING SYNC (set by GHL entry workflows) ─────────────
+  lp_source_id: {
+    ghlFieldId: 'k6j4IBh5IejPooSCsj49',
+    label: 'LP Source ID',
+    transform: null,
+  },
+  pro_id: {
+    ghlFieldId: 'BbUJ6RrdTjjEqqRA8JVx',
+    label: 'Pro ID',
+    transform: null,
   },
 };
 
