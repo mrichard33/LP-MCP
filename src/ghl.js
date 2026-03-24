@@ -10,13 +10,12 @@ if (GHL_API_KEY && !GHL_LOCATION_ID) {
 }
 
 // ─── GHL Availability Check ─────────────────────────────────────
-// If GHL key is missing or fails auth, disable GHL for the rest of the sync
-// to avoid 250K+ failed HTTP calls that would make the sync take forever.
 let ghlDisabled = false;
 let ghlFailCount = 0;
 let loggedFirstMatch = false;
 let loggedFirstFieldUpdate = false;
-const GHL_FAIL_THRESHOLD = 5; // Disable after 5 consecutive failures
+let loggedFirstNote = false;
+const GHL_FAIL_THRESHOLD = 5;
 
 const ghlClient = GHL_API_KEY ? axios.create({
   baseURL: 'https://services.leadconnectorhq.com',
@@ -34,12 +33,11 @@ const ghlClient = GHL_API_KEY ? axios.create({
 export async function searchGHLContact(params) {
   if (ghlDisabled || !ghlClient) return null;
   try {
-    // v2 API: GET /contacts/ with query param
     const query = params.phone || params.email || '';
     const { data } = await ghlClient.get('/contacts/', {
       params: { query, locationId: process.env.GHL_LOCATION_ID },
     });
-    ghlFailCount = 0; // Reset on success
+    ghlFailCount = 0;
     const match = data?.contacts?.[0] || null;
     if (match && !loggedFirstMatch) {
       loggedFirstMatch = true;
@@ -51,12 +49,8 @@ export async function searchGHLContact(params) {
     const status = err.response?.status || 'no response';
     if (ghlFailCount >= GHL_FAIL_THRESHOLD) {
       ghlDisabled = true;
-      console.error(`[GHL] Disabled after ${GHL_FAIL_THRESHOLD} consecutive failures (HTTP ${status}: ${err.message}). GHL matching skipped for this sync cycle.`);
-      if (status === 401) {
-        console.error('[GHL] 401 = invalid/expired API key. If using GHL v2 OAuth, the v1 location key may no longer work. Check GHL_API_KEY env var.');
-      }
+      console.error(`[GHL] Disabled after ${GHL_FAIL_THRESHOLD} consecutive failures (HTTP ${status}: ${err.message}).`);
     } else if (ghlFailCount === 1) {
-      // Log first failure with full detail for debugging
       console.error(`[GHL] Contact search failed: HTTP ${status} — ${err.message}`);
       if (err.response?.data) {
         console.error('[GHL] Response body:', JSON.stringify(err.response.data).slice(0, 300));
@@ -66,7 +60,7 @@ export async function searchGHLContact(params) {
   }
 }
 
-// Match LP lead to GHL contact: phone (primary) → phone_alt → email (fallback)
+// Match LP lead to GHL contact: phone → alt phone → email
 export async function matchToGHL(lpLead) {
   if (ghlDisabled || !ghlClient) return null;
   if (lpLead.phone) {
@@ -105,14 +99,13 @@ export async function applyGHLTag(ghlContactId, tag) {
     }
     if (ghlFailCount >= GHL_FAIL_THRESHOLD) {
       ghlDisabled = true;
-      console.error(`[GHL] Tag application disabled after ${GHL_FAIL_THRESHOLD} failures (last: HTTP ${status}).`);
+      console.error(`[GHL] Tag application disabled after ${GHL_FAIL_THRESHOLD} failures.`);
     }
     return false;
   }
 }
 
 // ─── Update GHL Contact Custom Fields ────────────────────────────
-//
 // Uses PUT /contacts/{contactId} with ONLY customFields in the body.
 // CRITICAL: Never include 'tags' in the PUT body — that would REPLACE
 // all tags on the contact. We only pass customFields, which is additive.
@@ -136,25 +129,61 @@ export async function updateGHLContactFields(ghlContactId, customFields) {
       loggedFirstFieldUpdate = true;
       console.log(`[GHL] First field update: contactId=${ghlContactId}, ${customFields.length} fields pushed`);
     }
-
     return true;
   } catch (err) {
     ghlFailCount++;
     const status = err.response?.status || 'no response';
-
     if (ghlFailCount === 1) {
       console.error(`[GHL] Field update failed: HTTP ${status} — ${err.message}`);
       if (err.response?.data) {
         console.error('[GHL] Field update response:', JSON.stringify(err.response.data).slice(0, 500));
       }
     }
-
     if (ghlFailCount >= GHL_FAIL_THRESHOLD) {
       ghlDisabled = true;
-      console.error(`[GHL] Field updates disabled after ${GHL_FAIL_THRESHOLD} failures (last: HTTP ${status}).`);
+      console.error(`[GHL] Field updates disabled after ${GHL_FAIL_THRESHOLD} failures.`);
+    }
+    return false;
+  }
+}
+
+// ─── Add Note to GHL Contact ─────────────────────────────────────
+// POST /contacts/{contactId}/notes with { body: "note text" }
+// CRITICAL: Do NOT include locationId — GHL v2 rejects it.
+//
+// @param {string} ghlContactId - GHL contact ID
+// @param {string} noteBody - The note text content
+// @returns {Object|null} GHL note object on success, null on failure
+export async function addGHLNote(ghlContactId, noteBody) {
+  if (ghlDisabled || !ghlClient || !ghlContactId) return null;
+  if (!noteBody || noteBody.trim().length === 0) return null;
+
+  try {
+    const { data } = await ghlClient.post(`/contacts/${ghlContactId}/notes`, {
+      body: noteBody.trim(),
+    });
+    ghlFailCount = 0;
+
+    if (!loggedFirstNote) {
+      loggedFirstNote = true;
+      console.log(`[GHL] First note added: contactId=${ghlContactId}, ${noteBody.trim().length} chars`);
     }
 
-    return false;
+    return data || { success: true };
+  } catch (err) {
+    ghlFailCount++;
+    const status = err.response?.status || 'no response';
+    if (ghlFailCount === 1) {
+      console.error(`[GHL] Note add failed: HTTP ${status} — ${err.message}`);
+      if (err.response?.data) {
+        console.error('[GHL] Note response:', JSON.stringify(err.response.data).slice(0, 300));
+      }
+    }
+    if (ghlFailCount >= GHL_FAIL_THRESHOLD) {
+      ghlDisabled = true;
+      console.error(`[GHL] Notes disabled after ${GHL_FAIL_THRESHOLD} failures.`);
+    }
+    return null;
   }
 }
 
@@ -164,6 +193,7 @@ export function resetGHLState() {
   ghlFailCount = 0;
   loggedFirstMatch = false;
   loggedFirstFieldUpdate = false;
+  loggedFirstNote = false;
 }
 
 function normalizePhone(phone) {
