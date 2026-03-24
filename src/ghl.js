@@ -29,6 +29,8 @@ const ghlClient = GHL_API_KEY ? axios.create({
 }) : null;
 
 // Search GHL contact by phone or email (v2 API)
+// NOTE: locationId is ONLY needed here — for GET /contacts/ search queries.
+// It must NOT be included in PUT/POST bodies to contact-specific endpoints.
 export async function searchGHLContact(params) {
   if (ghlDisabled || !ghlClient) return null;
   try {
@@ -83,12 +85,12 @@ export async function matchToGHL(lpLead) {
 }
 
 // Apply tag via POST (additive) — NEVER use PUT which replaces all tags (v2 API)
+// NOTE: Do NOT include locationId in body — GHL v2 rejects it with 422.
 export async function applyGHLTag(ghlContactId, tag) {
   if (ghlDisabled || !ghlClient || !ghlContactId) return false;
   try {
     await ghlClient.post(`/contacts/${ghlContactId}/tags`, {
       tags: [tag],
-      locationId: process.env.GHL_LOCATION_ID,
     });
     ghlFailCount = 0;
     return true;
@@ -114,6 +116,7 @@ export async function applyGHLTag(ghlContactId, tag) {
 // Uses PUT /contacts/{contactId} with ONLY customFields in the body.
 // CRITICAL: Never include 'tags' in the PUT body — that would REPLACE
 // all tags on the contact. We only pass customFields, which is additive.
+// CRITICAL: Never include 'locationId' — GHL v2 API rejects it with 422.
 //
 // @param {string} ghlContactId - GHL contact ID
 // @param {Array} customFields - Array of { id, field_value } objects
@@ -126,7 +129,6 @@ export async function updateGHLContactFields(ghlContactId, customFields) {
   try {
     await ghlClient.put(`/contacts/${ghlContactId}`, {
       customFields,
-      locationId: process.env.GHL_LOCATION_ID,
     });
     ghlFailCount = 0;
 
