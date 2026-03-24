@@ -1,23 +1,47 @@
 // ─── GHL Notes Sync — src/ghl-notes-sync.js ──────────────────────
 //
+// v2 — March 24, 2026
 // Pushes LP notes to GHL contact records as internal notes.
 // Each LP note is pushed once, tracked by ghl_note_pushed flag.
 //
-// Flow:
-//   1. Query lp_notes where ghl_contact_id IS NOT NULL and ghl_note_pushed = false
-//   2. For each note, format body with LP metadata (rep, date, category)
-//   3. Call addGHLNote(contactId, formattedBody)
-//   4. Mark ghl_note_pushed = true on success
-//
-// Only syncs notes going forward from when this feature is enabled.
-// To backfill historical notes, set ghl_note_pushed = false on target rows.
+// Date handling: LP stores dates as local time but Supabase has them
+// as UTC. We use getUTC*() methods to extract the date/time as-is,
+// matching the approach in ghl-field-map.js for appointment times.
+// Notes without a date (string-wrapped notes from LP) omit the date
+// line entirely rather than showing an inaccurate date.
 
 import supabase from './supabase.js';
 import { addGHLNote } from './ghl.js';
 
 /**
+ * Format an LP date for display. Uses UTC extraction because LP stores
+ * local time but Supabase treats it as UTC.
+ *
+ * @param {string} dateStr - ISO date string from lp_notes.created_at_lp
+ * @returns {string|null} Formatted date string or null if invalid
+ */
+function formatLPDate(dateStr) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return null;
+
+  const month = d.getUTCMonth() + 1;
+  const day = d.getUTCDate();
+  const year = d.getUTCFullYear();
+
+  let hours = d.getUTCHours();
+  const minutes = d.getUTCMinutes();
+  const ampm = hours >= 12 ? 'PM' : 'AM';
+  hours = hours % 12 || 12;
+  const minStr = minutes.toString().padStart(2, '0');
+
+  return `${month}/${day}/${year} ${hours}:${minStr} ${ampm}`;
+}
+
+/**
  * Format an LP note for GHL display.
  * Includes metadata header so reps know the source.
+ * Omits date line when no LP date is available (string-wrapped notes).
  *
  * @param {Object} note - Row from lp_notes table
  * @returns {string} Formatted note body for GHL
@@ -28,17 +52,16 @@ function formatNoteForGHL(note) {
   // Header line with LP source indicator
   parts.push('📋 LP Note');
 
-  // Metadata line
+  // Metadata line — only include fields that have real data
   const meta = [];
   if (note.created_by_rep_name) meta.push(`By: ${note.created_by_rep_name}`);
   if (note.note_category) meta.push(`Category: ${note.note_category}`);
   if (note.note_type && note.note_type !== 'standard') meta.push(`Type: ${note.note_type}`);
-  if (note.created_at_lp) {
-    const d = new Date(note.created_at_lp);
-    if (!isNaN(d.getTime())) {
-      meta.push(`Date: ${d.toLocaleDateString('en-US')} ${d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })}`);
-    }
-  }
+
+  // Only show date if we have a real LP date — never show fake/sync dates
+  const formattedDate = formatLPDate(note.created_at_lp);
+  if (formattedDate) meta.push(`Date: ${formattedDate}`);
+
   if (meta.length > 0) parts.push(meta.join(' | '));
 
   // Note body
@@ -81,12 +104,11 @@ export async function pushNotesToGHL({ batchSize = 50, delayMs = 300, maxNotes =
       .not('ghl_contact_id', 'is', null)
       .eq('ghl_note_pushed', false)
       .not('note_body', 'is', null)
-      .order('created_at_lp', { ascending: false })
+      .order('created_at_lp', { ascending: false, nullsFirst: false })
       .range(offset, offset + batchSize - 1);
 
     if (error) {
       console.error('[NoteSync] Query failed:', error.message);
-      // If ghl_note_pushed column doesn't exist yet, log clearly
       if (error.message.includes('ghl_note_pushed')) {
         console.error('[NoteSync] Column ghl_note_pushed does not exist — run migration sql/005_add_ghl_note_pushed.sql');
       }
@@ -101,7 +123,6 @@ export async function pushNotesToGHL({ batchSize = 50, delayMs = 300, maxNotes =
       // Skip notes with no meaningful body
       if (!note.note_body || note.note_body.trim().length < 3) {
         stats.skipped++;
-        // Mark as pushed to avoid re-processing
         await supabase.from('lp_notes')
           .update({ ghl_note_pushed: true })
           .eq('id', note.id);
@@ -119,7 +140,6 @@ export async function pushNotesToGHL({ batchSize = 50, delayMs = 300, maxNotes =
           .eq('id', note.id);
       } else {
         stats.failed++;
-        // Don't mark as pushed on failure — will retry next cycle
       }
 
       // Rate limit
