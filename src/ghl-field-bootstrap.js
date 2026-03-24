@@ -1,31 +1,31 @@
-// ─── GHL Field Sync Bootstrap — src/ghl-field-bootstrap.js ────────
+// ─── GHL Sync Bootstrap — src/ghl-field-bootstrap.js ──────────────
 //
-// Wires the GHL field sync into the sync engine at runtime.
-// Called once from index.js on server boot.
+// Wires the GHL field sync AND notes sync into the sync engine.
+// Called from index.js on server boot.
 //
-// Why a bootstrap instead of editing sync-engine.js directly?
-// sync-engine.js is 77KB. This module applies the field sync
-// integration without touching the main file, reducing merge risk.
+// v2 — March 24, 2026
+// Added notes sync: pushes LP notes to GHL contact records.
 //
 // What this does:
 // 1. Logs field sync config on startup
-// 2. Hooks into incremental sync to push changed fields to GHL
-// 3. Runs bulk field sync after GHL backfill on full sync
+// 2. Runs bulk field sync (newest lead per contact only)
+// 3. Runs notes sync (pushes unpushed LP notes to GHL)
 
 import supabase from './supabase.js';
 import { syncLeadFieldsToGHL, bulkFieldSync, getFieldSyncStats, logFieldSyncConfig } from './ghl-field-sync.js';
+import { pushNotesToGHL, countUnpushedNotes } from './ghl-notes-sync.js';
 
 let initialized = false;
 
 /**
- * Initialize the GHL field sync system.
+ * Initialize the GHL sync system.
  * Call once from index.js after the server boots.
  */
 export function initFieldSync() {
   if (initialized) return;
   initialized = true;
   logFieldSyncConfig();
-  console.log('[FieldSync] Bootstrap initialized — field writeback active on incremental sync');
+  console.log('[GHLSync] Bootstrap initialized — field writeback + notes sync active');
 }
 
 /**
@@ -49,29 +49,46 @@ export async function pushLeadFieldsToGHL(lpLeadId, ghlContactId) {
       await syncLeadFieldsToGHL(lead, ghlContactId, lead.ghl_fields_hash);
     }
   } catch (err) {
-    // Non-fatal — don't break sync over a field push
     console.warn(`[FieldSync] Failed for lead ${lpLeadId}: ${err.message}`);
   }
 }
 
 /**
- * Run bulk field sync for all GHL-matched leads.
- * Call after GHL backfill phase in fullSync().
+ * Run bulk field sync (newest lead per contact) + notes sync.
+ * This is the main periodic function called from the scheduler in index.js.
  */
 export async function runBulkFieldSync() {
+  // 1. Field sync — push LP custom field data to GHL contacts
   try {
-    const stats = await bulkFieldSync(100, 200);
-    console.log(`[FieldSync] Bulk complete: ${stats.pushed} updated, ${stats.skipped} unchanged, ${stats.failed} failed`);
-    return stats;
+    const fieldStats = await bulkFieldSync(100, 200);
+    if (fieldStats.pushed > 0 || fieldStats.failed > 0) {
+      console.log(`[FieldSync] Bulk: ${fieldStats.pushed} updated, ${fieldStats.skipped} unchanged, ${fieldStats.failed} failed`);
+    }
   } catch (err) {
     console.warn('[FieldSync] Bulk sync failed:', err.message);
-    return { total: 0, pushed: 0, skipped: 0, failed: 0 };
+  }
+
+  // 2. Notes sync — push LP notes to GHL contact records
+  try {
+    const unpushed = await countUnpushedNotes();
+    if (unpushed > 0) {
+      console.log(`[NoteSync] ${unpushed} notes pending push to GHL`);
+      const noteStats = await pushNotesToGHL({ batchSize: 50, delayMs: 300, maxNotes: 200 });
+      if (noteStats.pushed > 0 || noteStats.failed > 0) {
+        console.log(`[NoteSync] Cycle: ${noteStats.pushed} pushed, ${noteStats.failed} failed`);
+      }
+    }
+  } catch (err) {
+    // Notes sync failure is non-fatal — field sync still works
+    console.warn('[NoteSync] Notes sync failed:', err.message);
+    if (err.message && err.message.includes('ghl_note_pushed')) {
+      console.warn('[NoteSync] Migration needed — run sql/005_add_ghl_note_pushed.sql in Supabase');
+    }
   }
 }
 
 /**
  * Log field sync stats for the current cycle.
- * Call at end of incrementalSync().
  */
 export function logCycleStats() {
   const stats = getFieldSyncStats();
