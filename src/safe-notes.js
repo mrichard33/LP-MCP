@@ -13,8 +13,9 @@
 //
 // v2 — Deterministic synthetic IDs for wrapped notes (no Math.random)
 // v3 — Note enrichment: derives `type` from LP's `important` field
-//       so syncNotes() populates note_type. Also adds `rep_id` as
-//       alias for `enteredby` so created_by_rep_id can be populated.
+// v4 — REMOVED fake enteredon on string-wrapped notes. LP doesn't provide
+//       a date for string notes, so we must not invent one. The GHL notes
+//       formatter will omit the date line when created_at_lp is null.
 //
 // LP note record keys: id, enteredby, enteredon, updatedby, updatedon,
 //                       important, category, note
@@ -42,17 +43,9 @@ function hashCode(str) {
 /**
  * Enrich a note object with derived fields that LP doesn't provide natively.
  *
- * syncNotes() in sync-engine.js uses getField() to look up fields by multiple
- * key names. By adding these derived keys to the note object BEFORE syncNotes
- * processes it, we populate fields that would otherwise always be null — without
- * needing to edit the 77KB sync-engine.js file.
- *
  * Derived fields:
  * - `type`: LP has no `rectype` field. Derived from `important` boolean.
- *           syncNotes() finds this via getField(note, ..., 'type', ...)
  * - `rep_id`: LP notes have `enteredby` (name) but no rep ID.
- *             We use enteredby as a proxy identifier.
- *             syncNotes() would need a new line to use this — see docs.
  *
  * @param {Object} note - Note object (real LP or synthetic wrapped)
  * @returns {Object} Enriched note object (same reference, mutated)
@@ -61,11 +54,8 @@ function enrichNote(note) {
   if (!note || typeof note !== 'object') return note;
 
   // Derive note_type from LP's `important` flag
-  // syncNotes checks: getField(note, 'rectype', 'RecType', 'type', 'note_type')
-  // Adding `type` makes it findable by the existing getField call
   if (!note.type && !note.rectype && !note.RecType && !note.note_type) {
     if (note._source) {
-      // String-wrapped note — no metadata available
       note.type = 'system';
     } else if (note.important === true || note.important === 'true' || note.important === 'True') {
       note.type = 'important';
@@ -75,12 +65,8 @@ function enrichNote(note) {
   }
 
   // Derive created_by_rep_id from enteredby (name) as proxy
-  // NOTE: syncNotes() does NOT currently have a created_by_rep_id line
-  // in its upsert. This field will only populate after adding this line
-  // to the syncNotes upsert in sync-engine.js:
-  //   created_by_rep_id: getField(note, 'rep_id', 'agent', 'emp_id', 'EmpID'),
   if (!note.rep_id && note.enteredby) {
-    note.rep_id = note.enteredby; // Use name as proxy — LP provides no separate ID
+    note.rep_id = note.enteredby;
   }
 
   return note;
@@ -94,7 +80,10 @@ function enrichNote(note) {
  * - Plain string → wrapped as [{ note: str, id: deterministic }]
  * - Any other type → [] (skip silently)
  *
- * All notes (real and wrapped) are enriched with derived `type` field.
+ * IMPORTANT: String-wrapped notes do NOT get a fake enteredon date.
+ * LP doesn't provide a date for these — we must not invent one.
+ * syncNotes() will store created_at_lp as null, and the GHL note
+ * formatter will omit the date line.
  *
  * @param {*} raw - The raw value from getField(obj, 'notes', 'Notes')
  * @param {string} source - Label for logging (e.g., 'prospect', 'lead')
@@ -115,7 +104,7 @@ export function safeNotes(raw, source = '') {
           return enrichNote({
             note: item,
             id: syntheticId,
-            enteredon: new Date().toISOString(),
+            // NO enteredon — LP doesn't provide a date for string notes
             _source: `${source}_array_string`,
           });
         }
@@ -134,7 +123,7 @@ export function safeNotes(raw, source = '') {
     return [enrichNote({
       note: raw,
       id: syntheticId,
-      enteredon: new Date().toISOString(),
+      // NO enteredon — LP doesn't provide a date for string notes
       _source: `${source}_string`,
     })];
   }
@@ -145,10 +134,6 @@ export function safeNotes(raw, source = '') {
 
 /**
  * Combine prospect-level and lead-level notes safely.
- * Replaces the buggy pattern:
- *   [...(getField(prospect, 'notes') || []), ...(getField(lead, 'notes') || [])]
- *
- * All notes are enriched with derived fields (type, rep_id) before return.
  *
  * @param {*} prospectNotes - Raw notes from prospect level
  * @param {*} leadNotes - Raw notes from lead level
