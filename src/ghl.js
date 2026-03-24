@@ -15,6 +15,7 @@ if (GHL_API_KEY && !GHL_LOCATION_ID) {
 let ghlDisabled = false;
 let ghlFailCount = 0;
 let loggedFirstMatch = false;
+let loggedFirstFieldUpdate = false;
 const GHL_FAIL_THRESHOLD = 5; // Disable after 5 consecutive failures
 
 const ghlClient = GHL_API_KEY ? axios.create({
@@ -108,11 +109,59 @@ export async function applyGHLTag(ghlContactId, tag) {
   }
 }
 
+// ─── Update GHL Contact Custom Fields ────────────────────────────
+//
+// Uses PUT /contacts/{contactId} with ONLY customFields in the body.
+// CRITICAL: Never include 'tags' in the PUT body — that would REPLACE
+// all tags on the contact. We only pass customFields, which is additive.
+//
+// @param {string} ghlContactId - GHL contact ID
+// @param {Array} customFields - Array of { id, field_value } objects
+// @returns {boolean} true on success
+
+export async function updateGHLContactFields(ghlContactId, customFields) {
+  if (ghlDisabled || !ghlClient || !ghlContactId) return false;
+  if (!customFields || customFields.length === 0) return false;
+
+  try {
+    await ghlClient.put(`/contacts/${ghlContactId}`, {
+      customFields,
+      locationId: process.env.GHL_LOCATION_ID,
+    });
+    ghlFailCount = 0;
+
+    if (!loggedFirstFieldUpdate) {
+      loggedFirstFieldUpdate = true;
+      console.log(`[GHL] First field update: contactId=${ghlContactId}, ${customFields.length} fields pushed`);
+    }
+
+    return true;
+  } catch (err) {
+    ghlFailCount++;
+    const status = err.response?.status || 'no response';
+
+    if (ghlFailCount === 1) {
+      console.error(`[GHL] Field update failed: HTTP ${status} — ${err.message}`);
+      if (err.response?.data) {
+        console.error('[GHL] Field update response:', JSON.stringify(err.response.data).slice(0, 500));
+      }
+    }
+
+    if (ghlFailCount >= GHL_FAIL_THRESHOLD) {
+      ghlDisabled = true;
+      console.error(`[GHL] Field updates disabled after ${GHL_FAIL_THRESHOLD} failures (last: HTTP ${status}).`);
+    }
+
+    return false;
+  }
+}
+
 // Re-enable GHL (called at start of each sync cycle)
 export function resetGHLState() {
   ghlDisabled = false;
   ghlFailCount = 0;
   loggedFirstMatch = false;
+  loggedFirstFieldUpdate = false;
 }
 
 function normalizePhone(phone) {
