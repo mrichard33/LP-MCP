@@ -65,6 +65,8 @@ function getField(obj, ...keys) {
 
 // Track whether we've logged the first record's keys for each entity type
 const loggedFirstKeys = new Set();
+// Track sync log IDs owned by THIS process — scopes SIGTERM cleanup
+const activeLogIds = new Set();
 
 // ─── Extract array from LP API response ──────────────────────────
 // LP may return a direct array, or nested under various keys.
@@ -96,6 +98,7 @@ async function syncLogStart(entityType, syncType) {
       started_at:     new Date().toISOString(),
     }).select('id').single();
     if (error) throw error;
+    if (data?.id) activeLogIds.add(data.id);
     return data?.id;
   } catch (err) {
     console.error(`[Sync] Failed to create sync log for ${entityType}:`, err.message);
@@ -118,6 +121,7 @@ async function syncLogProgress(logId, count) {
 // Mark entity sync as completed (skips if already completed/failed)
 async function syncLogComplete(logId, count, errorMessage) {
   if (!logId) return;
+  activeLogIds.delete(logId);
   try {
     await supabase.from('lp_sync_log').update({
       status:         errorMessage ? 'failed' : 'completed',
@@ -1864,17 +1868,24 @@ export function stopSyncScheduler() {
   }
 }
 
-// Bug 1: Mark any still-running sync logs as failed on process termination
+// Bug 1: Mark this process's own running sync logs as failed on termination.
+// Scoped to activeLogIds to prevent poisoning a newly-booted process's rows
+// during the SIGTERM overlap window (old process cleanup vs new process boot).
 async function markRunningLogsAsFailed() {
   try {
+    const ids = [...activeLogIds];
+    if (ids.length === 0) {
+      console.log('[Sync] No active sync log IDs to clean up');
+      return;
+    }
     await supabase.from('lp_sync_log')
       .update({
         status: 'failed',
         error_message: 'Process terminated',
         completed_at: new Date().toISOString(),
       })
-      .eq('status', 'running');
-    console.log('[Sync] Marked running sync logs as failed (process terminating)');
+      .in('id', ids);
+    console.log(`[Sync] Marked ${ids.length} owned sync log rows as failed (process terminating)`);
   } catch (_) {
     // Best-effort — process is shutting down
   }
