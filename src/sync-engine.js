@@ -1506,7 +1506,7 @@ export async function fullSync() {
     }
   } finally {
     // Bug 2: Always release the mutex
-    syncInProgress = false;'
+    syncInProgress = false;
     syncStartedAt = null;
   }
 
@@ -1677,13 +1677,15 @@ export async function incrementalSync() {
     console.log(`[Sync] Incremental sync complete — ${counts.leads} leads, ${counts.calls} calls, ${counts.notes} notes, ${counts.jobs} jobs, ${failed} failed (${Math.round(duration / 1000)}s)`);
     return counts;
 
-  } catch (err) {
+} catch (err) {
     console.error('[Sync] Incremental sync failed:', err.message);
     return { leads: 0, calls: 0, notes: 0, jobs: 0, milestones: 0, activities: 0 };
-
-    const duration = Date.now() - startedAt.getTime();
-    console.log(`[Sync] Incremental sync complete — ${counts.leads} leads, ...`);
-    return counts;
+  } finally {
+    // Bug 2: Always release the mutex
+    syncInProgress = false;
+    syncStartedAt = null;
+  }
+}
 
 // ─── Webhook Handler ─────────────────────────────────────────────
 
