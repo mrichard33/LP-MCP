@@ -29,6 +29,7 @@ import { processMilestoneTriggers } from './milestones.js';
 import { runPass1DailyWindows } from './full-sync-pass1.js';
 import { upsertProspect, updateProspectGHL } from './upsert-prospect.js';
 import { combineNotes } from './safe-notes.js';
+import { lpDateToEastern, lpCreatedDate } from './lp-dates.js';
 
 const SYNC_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const PAGE_SIZE = 200;
@@ -645,7 +646,7 @@ async function upsertLeadOnly(prospect) {
       demo_date:          isDemoCompleted ? getField(lead, 'apptdate', 'ApptDate') : null,
       closed_won:         isClosedWon,
       job_value:          parseFloat(getField(lead, 'gsa', 'GSA', 'grossamount', 'GrossAmount') || 0) || null,
-      created_at_lp:      getField(lead, 'entrydate', 'EntryDate'),
+      created_at_lp:      lpCreatedDate(prospect, lead, getField),
       updated_at_lp:      getField(lead, 'lastchangedon', 'LastChangedOn'),
       synced_at:          new Date().toISOString(),
       raw_lp_data:        prospect,
@@ -761,7 +762,7 @@ async function processProspect(prospect, { skipGHL = false } = {}) {
       demo_date:          isDemoCompleted ? getField(lead, 'apptdate', 'ApptDate') : null,
       closed_won:         isClosedWon,
       job_value:          parseFloat(getField(lead, 'gsa', 'GSA', 'grossamount', 'GrossAmount') || 0) || null,
-      created_at_lp:      getField(lead, 'entrydate', 'EntryDate'),
+      created_at_lp:      lpCreatedDate(prospect, lead, getField),
       updated_at_lp:      getField(lead, 'lastchangedon', 'LastChangedOn'),
       synced_at:          new Date().toISOString(),
       raw_lp_data:        prospect,
