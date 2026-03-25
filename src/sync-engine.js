@@ -647,7 +647,7 @@ async function upsertLeadOnly(prospect) {
       closed_won:         isClosedWon,
       job_value:          parseFloat(getField(lead, 'gsa', 'GSA', 'grossamount', 'GrossAmount') || 0) || null,
       created_at_lp:      lpCreatedDate(prospect, lead, getField),
-      updated_at_lp:      lpDateToEastern(getField(lead, 'lastchangedon', 'LastChangedOn')),
+      updated_at_lp:      getField(lead, 'lastchangedon', 'LastChangedOn'),
       synced_at:          new Date().toISOString(),
       raw_lp_data:        prospect,
     }, { onConflict: 'lp_lead_id' });
@@ -762,7 +762,7 @@ async function processProspect(prospect, { skipGHL = false } = {}) {
       demo_date:          isDemoCompleted ? getField(lead, 'apptdate', 'ApptDate') : null,
       closed_won:         isClosedWon,
       job_value:          parseFloat(getField(lead, 'gsa', 'GSA', 'grossamount', 'GrossAmount') || 0) || null,
-      created_at_lp:      getField(lead, 'entrydate', 'EntryDate'),
+      created_at_lp:      lpCreatedDate(prospect, lead, getField),
       updated_at_lp:      getField(lead, 'lastchangedon', 'LastChangedOn'),
       synced_at:          new Date().toISOString(),
       raw_lp_data:        prospect,
