@@ -39,7 +39,8 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // Bug 2: Mutex to prevent overlapping sync processes
 let syncInProgress = false;
-
+let syncStartedAt = null;
+const STALE_LOCK_MINUTES = 120; // 2 hours max before force-reset
 function normalizePhone(phone) {
   if (!phone) return null;
   return phone.replace(/\D/g, '') || null;
@@ -1277,12 +1278,20 @@ async function checkLeadTriggers() {
 // Pagination: StartIndex (1-based) + PageSize.
 
 export async function fullSync() {
-  // Bug 2: Prevent overlapping syncs
+  // Bug 2: Prevent overlapping syncs (with stale lock timeout)
   if (syncInProgress) {
-    console.log('[Sync] Already running — skipped');
-    return null;
+    const elapsed = syncStartedAt ? (Date.now() - syncStartedAt) / 60000 : 0;
+    if (elapsed > STALE_LOCK_MINUTES) {
+      console.warn(`[Sync] Lock held for ${elapsed.toFixed(0)}min (>${STALE_LOCK_MINUTES}) — forcing reset`);
+      syncInProgress = false;
+      syncStartedAt = null;
+    } else {
+      console.log(`[Sync] Already running (${elapsed.toFixed(0)}min) — skipped`);
+      return null;
+    }
   }
   syncInProgress = true;
+  syncStartedAt = Date.now();
 
   console.log('[Sync] Starting FULL sync...');
   const startedAt = new Date();
@@ -1511,12 +1520,20 @@ export async function fullSync() {
 // Part 2: Job status changes via POST /api/Customers/GetJobStatusChanges
 
 export async function incrementalSync() {
-  // Bug 2: Prevent overlapping syncs
+  // Bug 2: Prevent overlapping syncs (with stale lock timeout)
   if (syncInProgress) {
-    console.log('[Sync] Already running — skipped');
-    return null;
+    const elapsed = syncStartedAt ? (Date.now() - syncStartedAt) / 60000 : 0;
+    if (elapsed > STALE_LOCK_MINUTES) {
+      console.warn(`[Sync] Lock held for ${elapsed.toFixed(0)}min (>${STALE_LOCK_MINUTES}) — forcing reset`);
+      syncInProgress = false;
+      syncStartedAt = null;
+    } else {
+      console.log(`[Sync] Already running (${elapsed.toFixed(0)}min) — skipped`);
+      return null;
+    }
   }
   syncInProgress = true;
+  syncStartedAt = Date.now();
 
   console.log('[Sync] Starting incremental sync...');
   const startedAt = new Date();
@@ -1662,10 +1679,14 @@ export async function incrementalSync() {
   } catch (err) {
     console.error('[Sync] Incremental sync failed:', err.message);
     return { leads: 0, calls: 0, notes: 0, jobs: 0, milestones: 0, activities: 0 };
-  } finally {
+} finally {
     // Bug 2: Always release the mutex
     syncInProgress = false;
+    syncStartedAt = null;
   }
+
+  const duration = Date.now() - startedAt.getTime();
+  console.log(`[Sync] Full sync complete —
 }
 
 // ─── Webhook Handler ─────────────────────────────────────────────
@@ -1761,6 +1782,25 @@ export function startSyncScheduler() {
       console.log('[Sync] Pre-warming LP token...');
       await getToken();
       console.log('[Sync] LP token acquired');
+
+// Clean up stale "running" rows from previous deployments
+      try {
+        const staleThreshold = new Date(Date.now() - STALE_LOCK_MINUTES * 60000).toISOString();
+        const { data: staleRows } = await supabase.from('lp_sync_log')
+          .update({ 
+            status: 'failed', 
+            error_message: 'Stale lock — cleaned up on boot', 
+            completed_at: new Date().toISOString() 
+          })
+          .eq('status', 'running')
+          .lt('started_at', staleThreshold)
+          .select('id');
+        if (staleRows?.length > 0) {
+          console.log(`[Sync] Cleaned ${staleRows.length} stale running rows from previous deployments`);
+        }
+      } catch (err) {
+        console.warn('[Sync] Stale row cleanup failed:', err.message);
+      }      
 
       // Start proactive token refresh schedule
       startTokenRefreshSchedule();
