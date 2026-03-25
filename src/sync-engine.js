@@ -29,6 +29,7 @@ import { processMilestoneTriggers } from './milestones.js';
 import { runPass1DailyWindows } from './full-sync-pass1.js';
 import { upsertProspect, updateProspectGHL } from './upsert-prospect.js';
 import { combineNotes } from './safe-notes.js';
+import { lpDateToEastern, lpCreatedDate } from './lp-dates.js';
 
 const SYNC_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 const PAGE_SIZE = 200;
@@ -640,13 +641,13 @@ async function upsertLeadOnly(prospect) {
       disposition_code:   getField(lead, 'disposition', 'Disposition'),
       rep_name:           getField(lead, 'salesrepname', 'SalesRepName'),
       appointment_set:    isApptSet,
-      appointment_date:   getField(lead, 'apptdate', 'ApptDate'),
+      appointment_date:   lpDateToEastern(getField(lead, 'apptdate', 'ApptDate')),
       demo_completed:     isDemoCompleted,
-      demo_date:          isDemoCompleted ? getField(lead, 'apptdate', 'ApptDate') : null,
+      demo_date:          isDemoCompleted ? lpDateToEastern(getField(lead, 'apptdate', 'ApptDate')) : null,
       closed_won:         isClosedWon,
       job_value:          parseFloat(getField(lead, 'gsa', 'GSA', 'grossamount', 'GrossAmount') || 0) || null,
-      created_at_lp:      getField(lead, 'entrydate', 'EntryDate'),
-      updated_at_lp:      getField(lead, 'lastchangedon', 'LastChangedOn'),
+      created_at_lp:      lpCreatedDate(prospect, lead, getField),
+      updated_at_lp:      lpDateToEastern(getField(lead, 'lastchangedon', 'LastChangedOn')),
       synced_at:          new Date().toISOString(),
       raw_lp_data:        prospect,
     }, { onConflict: 'lp_lead_id' });
@@ -834,8 +835,8 @@ async function upsertLeadFromFlat(lp, ghlId) {
     lead_source_detail: getField(lp, 'sourcesubdescr', 'SourceSubDescr'),
     disposition_code:   getField(lp, 'disposition', 'Disposition'),
     rep_name:           getField(lp, 'salesrepname', 'SalesRepName', 'rep_name'),
-    created_at_lp:      getField(lp, 'entrydate', 'EntryDate', 'dateadded'),
-    updated_at_lp:      getField(lp, 'lastchangedon', 'LastChangedOn'),
+    created_at_lp:      lpDateToEastern(getField(lp, 'dateadded', 'DateAdded', 'entrydate', 'EntryDate')),
+    updated_at_lp:      lpDateToEastern(getField(lp, 'lastchangedon', 'LastChangedOn')),
     synced_at:          new Date().toISOString(),
     raw_lp_data:        lp,
   }, { onConflict: 'lp_lead_id' });
@@ -1121,8 +1122,8 @@ async function syncJobAndMilestones(job, lpLeadId, ghlContactId) {
       job_status:      getField(job, 'jobstatus', 'JobStatus', 'job_status'),
       job_value:       parseFloat(getField(job, 'grossamount', 'GrossAmount', 'gsa', 'GSA') || 0) || null,
       rep_name:        getField(job, 'salesrepname', 'SalesRepName', 'rep_name'),
-      created_at_lp:   getField(job, 'entrydate', 'EntryDate'),
-      updated_at_lp:   getField(job, 'lastchangedon', 'LastChangedOn'),
+      created_at_lp:   lpDateToEastern(getField(job, 'entrydate', 'EntryDate')),
+      updated_at_lp:   lpDateToEastern(getField(job, 'lastchangedon', 'LastChangedOn')),
       synced_at:       new Date().toISOString(),
       raw_lp_data:     job,
     }, { onConflict: 'lp_job_id' });
@@ -1156,10 +1157,10 @@ async function syncJobAndMilestones(job, lpLeadId, ghlContactId) {
         ghl_contact_id:  ghlContactId || null,
         mdt_id:          mdtId,
         datetype:        getField(ms, 'datetype', 'DateType'),
-        est_date:        getField(ms, 'estdate', 'EstDate', 'est_date'),
-        act_date:        getField(ms, 'actdate', 'ActDate', 'act_date'),
+        est_date:        lpDateToEastern(getField(ms, 'estdate', 'EstDate', 'est_date')),
+        act_date:        lpDateToEastern(getField(ms, 'actdate', 'ActDate', 'act_date')),
         entered_by:      getField(ms, 'enteredby', 'EnteredBy', 'entered_by'),
-        entered_on:      getField(ms, 'enteredon', 'EnteredOn', 'entered_on'),
+        entered_on:      lpDateToEastern(getField(ms, 'enteredon', 'EnteredOn', 'entered_on')),
         synced_at:       new Date().toISOString(),
       }, { onConflict: 'lp_job_id, mdt_id', ignoreDuplicates: false });
     } catch (err) {
