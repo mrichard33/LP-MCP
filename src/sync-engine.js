@@ -1,5 +1,6 @@
 // ─── Sync Engine — src/sync-engine.js ─────────────────────────────
 //
+// v6.1 — Added GHL notes push (pushNotesToGHL) to fullSync and incrementalSync.
 // v6.0 — Modular orchestrator. All entity-level logic extracted to:
 //   sync-utils.js      — getField, normalizePhone, extractArray, constants
 //   sync-log.js        — sync logging, activeLogIds, mutex state
@@ -9,6 +10,7 @@
 //   sync-children.js   — syncCallLogs, syncNotes, syncActivities, syncJobAndMilestones, Pass 2
 //   sync-triggers.js   — Day 15 handoff, lead-level triggers
 //   lp-dates.js        — lpDateToEastern, lpCreatedDate
+//   ghl-notes-sync.js  — Push LP notes from Supabase to GHL contact notes
 //
 // This file contains only: fullSync, incrementalSync, handleWebhookEvent,
 // scheduler, and process signal handlers.
@@ -19,6 +21,7 @@ import { getLeadData, getJobStatusChanges, getLead, testConnection } from './lp-
 import { resetGHLState, matchToGHL, applyGHLTag } from './ghl.js';
 import { processMilestoneTriggers } from './milestones.js';
 import { runPass1DailyWindows } from './full-sync-pass1.js';
+import { pushNotesToGHL } from './ghl-notes-sync.js';
 
 import { SYNC_INTERVAL_MS, PAGE_SIZE, RATE_LIMIT_SLEEP_MS, sleep, extractArray, getField, loggedFirstKeys } from './sync-utils.js';
 import {
@@ -172,6 +175,14 @@ export async function fullSync() {
       }
     } catch (err) { console.warn('[Sync] Milestone propagation failed:', err.message); }
 
+    // Push LP notes from Supabase to GHL contact records
+    try {
+      const noteStats = await pushNotesToGHL();
+      if (noteStats.pushed > 0 || noteStats.failed > 0) {
+        console.log(`[Sync] GHL notes push: ${noteStats.pushed} pushed, ${noteStats.skipped} skipped, ${noteStats.failed} failed`);
+      }
+    } catch (e) { console.warn('[Sync] GHL notes push failed:', e.message); }
+
     // Post-sync triggers
     try { const r = await processMilestoneTriggers(); console.log(`[Sync] Milestones: ${r.fired} tags fired`); } catch (e) { console.warn('[Sync] Milestone processing:', e.message); }
     try { await checkDay15Handoffs(); } catch (e) { console.warn('[Sync] Day 15:', e.message); }
@@ -282,6 +293,14 @@ export async function incrementalSync() {
       syncLogComplete(logIds.notes, counts.notes), syncLogComplete(logIds.jobs, counts.jobs),
       syncLogComplete(logIds.milestones, counts.milestones), syncLogComplete(logIds.activities, counts.activities),
     ]);
+
+    // Push LP notes from Supabase to GHL contact records
+    try {
+      const noteStats = await pushNotesToGHL({ maxNotes: 100 });
+      if (noteStats.pushed > 0 || noteStats.failed > 0) {
+        console.log(`[Sync] GHL notes push: ${noteStats.pushed} pushed, ${noteStats.skipped} skipped, ${noteStats.failed} failed`);
+      }
+    } catch (e) { console.warn('[Sync] GHL notes push failed:', e.message); }
 
     try { await processMilestoneTriggers(); } catch (e) { console.warn('[Sync] Milestones:', e.message); }
     try { await checkDay15Handoffs(); } catch (e) { console.warn('[Sync] Day 15:', e.message); }
