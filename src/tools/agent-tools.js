@@ -5,7 +5,6 @@ export function registerAgentTools(server) {
 
   // ───────────────────────────────────────────────────
   // Tool: emit_event
-  // Write a system event to the event bus
   // ───────────────────────────────────────────────────
   server.tool(
     'emit_event',
@@ -19,10 +18,10 @@ export function registerAgentTools(server) {
       ghl_contact_id: z.string().optional().describe('GHL contact ID if known'),
       lp_lead_id: z.string().optional().describe('LP Lead ID if known'),
       lp_prospect_id: z.string().optional().describe('LP Prospect ID if known'),
-      payload: z.record(z.any()).optional().describe('Full event data from source'),
-      previous_state: z.record(z.any()).optional().describe('State before the change (for rollback)'),
-      new_state: z.record(z.any()).optional().describe('State after the change'),
-      priority: z.enum(['critical', 'high', 'normal', 'low']).optional().default('normal'),
+      payload: z.string().optional().describe('JSON string of full event data from source'),
+      previous_state: z.string().optional().describe('JSON string of state before the change'),
+      new_state: z.string().optional().describe('JSON string of state after the change'),
+      priority: z.string().optional().describe('Priority: "critical", "high", "normal", or "low" (default: normal)'),
       idempotency_key: z.string().optional().describe('Dedup key to prevent duplicate events'),
       event_timestamp: z.string().optional().describe('ISO timestamp of when event actually occurred'),
     },
@@ -39,9 +38,9 @@ export function registerAgentTools(server) {
             ghl_contact_id: params.ghl_contact_id || null,
             lp_lead_id: params.lp_lead_id || null,
             lp_prospect_id: params.lp_prospect_id || null,
-            payload: params.payload || {},
-            previous_state: params.previous_state || null,
-            new_state: params.new_state || null,
+            payload: params.payload ? JSON.parse(params.payload) : {},
+            previous_state: params.previous_state ? JSON.parse(params.previous_state) : null,
+            new_state: params.new_state ? JSON.parse(params.new_state) : null,
             priority: params.priority || 'normal',
             idempotency_key: params.idempotency_key || null,
             event_timestamp: params.event_timestamp || new Date().toISOString(),
@@ -50,45 +49,30 @@ export function registerAgentTools(server) {
           .single();
 
         if (error) {
-          // Handle idempotency conflict
           if (error.code === '23505' && params.idempotency_key) {
-            return { content: [{ type: 'text', text: JSON.stringify({ status: 'duplicate', idempotency_key: params.idempotency_key, message: 'Event already exists with this idempotency key.' }) }] };
+            return { content: [{ type: 'text', text: JSON.stringify({ status: 'duplicate', idempotency_key: params.idempotency_key }) }] };
           }
           return { content: [{ type: 'text', text: `Error creating event: ${error.message}` }] };
         }
 
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify({
-              status: 'created',
-              event_id: data.id,
-              event_type: data.event_type,
-              entity_id: data.entity_id,
-              priority: data.priority,
-              created_at: data.created_at,
-            }, null, 2),
-          }],
-        };
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'created', event_id: data.id, event_type: data.event_type, entity_id: data.entity_id, priority: data.priority, created_at: data.created_at }, null, 2) }] };
       } catch (err) {
         return { content: [{ type: 'text', text: `Exception: ${err.message}` }] };
       }
     }
   );
 
-
   // ───────────────────────────────────────────────────
   // Tool: get_pending_events
-  // Poll for unprocessed events (decision engine entry point)
   // ───────────────────────────────────────────────────
   server.tool(
     'get_pending_events',
     'Get unprocessed system events, ordered by priority then time. The decision engine entry point.',
     {
-      limit: z.number().optional().default(20).describe('Max events to return (default 20)'),
+      limit: z.number().optional().describe('Max events to return (default 20)'),
       event_type: z.string().optional().describe('Filter by event type'),
       source: z.string().optional().describe('Filter by source system'),
-      priority: z.enum(['critical', 'high', 'normal', 'low']).optional().describe('Filter by priority'),
+      priority: z.string().optional().describe('Filter by priority: critical, high, normal, low'),
     },
     async (params) => {
       let query = supabase
@@ -104,88 +88,59 @@ export function registerAgentTools(server) {
       if (params.priority) query = query.eq('priority', params.priority);
 
       const { data, error } = await query;
-
-      if (error) {
-        return { content: [{ type: 'text', text: `Error fetching events: ${error.message}` }] };
-      }
-
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({
-            count: data.length,
-            events: data,
-          }, null, 2),
-        }],
-      };
+      if (error) return { content: [{ type: 'text', text: `Error: ${error.message}` }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ count: data.length, events: data }, null, 2) }] };
     }
   );
 
-
   // ───────────────────────────────────────────────────
   // Tool: mark_event_processed
-  // Mark one or more events as processed
   // ───────────────────────────────────────────────────
   server.tool(
     'mark_event_processed',
     'Mark system event(s) as processed after the decision engine has handled them.',
     {
-      event_ids: z.array(z.number()).describe('Array of event IDs to mark processed'),
-      processed_by: z.string().describe('Who/what processed it: "agent", "claude", "ryan", "n8n"'),
+      event_ids: z.string().describe('Comma-separated event IDs to mark processed (e.g. "1,2,3")'),
+      processed_by: z.string().describe('Who processed it: "agent", "claude", "ryan", "n8n"'),
       action_taken: z.string().optional().describe('Brief description of action taken'),
     },
     async (params) => {
+      const ids = params.event_ids.split(',').map(id => parseInt(id.trim())).filter(id => !isNaN(id));
       const { data, error } = await supabase
         .from('system_events')
-        .update({
-          processed: true,
-          processed_by: params.processed_by,
-          processed_at: new Date().toISOString(),
-          action_taken: params.action_taken || null,
-        })
-        .in('id', params.event_ids)
+        .update({ processed: true, processed_by: params.processed_by, processed_at: new Date().toISOString(), action_taken: params.action_taken || null })
+        .in('id', ids)
         .select('id');
 
-      if (error) {
-        return { content: [{ type: 'text', text: `Error marking events: ${error.message}` }] };
-      }
-
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({ status: 'updated', count: data.length, event_ids: params.event_ids }),
-        }],
-      };
+      if (error) return { content: [{ type: 'text', text: `Error: ${error.message}` }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'updated', count: data.length, event_ids: ids }) }] };
     }
   );
 
-
   // ───────────────────────────────────────────────────
   // Tool: create_agent_action
-  // Queue an action for execution (with optional approval)
   // ───────────────────────────────────────────────────
   server.tool(
     'create_agent_action',
     'Queue an agent action for execution. Actions can auto-execute or require human approval.',
     {
       event_id: z.number().describe('ID of the triggering system event'),
-      action_type: z.string().describe('Action type: "update_contact", "move_opportunity", "add_tag", "remove_tag", "add_to_workflow", "remove_from_workflow", "send_message", "create_task", "send_notification", "update_custom_field", "create_opportunity", "close_opportunity"'),
-      target_system: z.string().describe('Target system: "ghl", "lp", "n8n", "groupme", "notion"'),
-      target_entity: z.string().describe('Target entity type: "contact", "opportunity", "workflow", "task"'),
+      action_type: z.string().describe('Action type: update_contact, move_opportunity, add_tag, remove_tag, add_to_workflow, remove_from_workflow, send_message, create_task, send_notification'),
+      target_system: z.string().describe('Target: ghl, lp, n8n, groupme, notion'),
+      target_entity: z.string().describe('Entity type: contact, opportunity, workflow, task'),
       target_id: z.string().describe('ID of entity being acted on'),
-      action_payload: z.record(z.any()).describe('Full params for the action'),
-      rollback_payload: z.record(z.any()).optional().describe('Params to undo this action'),
+      action_payload: z.string().describe('JSON string of action params'),
+      rollback_payload: z.string().optional().describe('JSON string of undo params'),
       reasoning: z.string().optional().describe('Why this action is being taken'),
       confidence: z.number().optional().describe('Agent confidence 0.0-1.0'),
       rule_applied: z.string().optional().describe('Rule key that triggered this'),
-      requires_approval: z.boolean().optional().default(false),
+      requires_approval: z.boolean().optional().describe('Whether human must approve (default false)'),
       batch_id: z.string().optional().describe('Group related actions'),
-      sequence_order: z.number().optional().default(0).describe('Order within batch'),
+      sequence_order: z.number().optional().describe('Order within batch (default 0)'),
     },
     async (params) => {
       try {
         const status = params.requires_approval ? 'pending_approval' : 'pending';
-
         const { data, error } = await supabase
           .from('agent_actions')
           .insert({
@@ -194,8 +149,8 @@ export function registerAgentTools(server) {
             target_system: params.target_system,
             target_entity: params.target_entity,
             target_id: params.target_id,
-            action_payload: params.action_payload,
-            rollback_payload: params.rollback_payload || null,
+            action_payload: JSON.parse(params.action_payload),
+            rollback_payload: params.rollback_payload ? JSON.parse(params.rollback_payload) : null,
             reasoning: params.reasoning || null,
             confidence: params.confidence || null,
             rule_applied: params.rule_applied || null,
@@ -207,49 +162,28 @@ export function registerAgentTools(server) {
           .select('id, action_type, status, target_id, created_at')
           .single();
 
-        if (error) {
-          return { content: [{ type: 'text', text: `Error creating action: ${error.message}` }] };
-        }
-
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify({
-              status: 'queued',
-              action_id: data.id,
-              action_type: data.action_type,
-              action_status: data.status,
-              target_id: data.target_id,
-              requires_approval: params.requires_approval || false,
-            }, null, 2),
-          }],
-        };
+        if (error) return { content: [{ type: 'text', text: `Error: ${error.message}` }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'queued', action_id: data.id, action_type: data.action_type, action_status: data.status, target_id: data.target_id, requires_approval: params.requires_approval || false }, null, 2) }] };
       } catch (err) {
         return { content: [{ type: 'text', text: `Exception: ${err.message}` }] };
       }
     }
   );
 
-
   // ───────────────────────────────────────────────────
   // Tool: get_pending_actions
-  // Get actions waiting to be executed or approved
   // ───────────────────────────────────────────────────
   server.tool(
     'get_pending_actions',
     'Get agent actions that are pending execution or awaiting approval.',
     {
-      status: z.enum(['pending', 'pending_approval', 'approved', 'executing']).optional().describe('Filter by status'),
-      limit: z.number().optional().default(20),
+      status: z.string().optional().describe('Filter: pending, pending_approval, approved, executing'),
+      limit: z.number().optional().describe('Max results (default 20)'),
     },
     async (params) => {
       let query = supabase
         .from('agent_actions')
-        .select(`
-          id, event_id, action_type, target_system, target_entity, target_id,
-          action_payload, reasoning, confidence, rule_applied,
-          status, requires_approval, batch_id, sequence_order, created_at
-        `)
+        .select('id, event_id, action_type, target_system, target_entity, target_id, action_payload, reasoning, confidence, rule_applied, status, requires_approval, batch_id, sequence_order, created_at')
         .order('created_at', { ascending: true })
         .limit(params.limit || 20);
 
@@ -260,38 +194,28 @@ export function registerAgentTools(server) {
       }
 
       const { data, error } = await query;
-
-      if (error) {
-        return { content: [{ type: 'text', text: `Error fetching actions: ${error.message}` }] };
-      }
-
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({ count: data.length, actions: data }, null, 2),
-        }],
-      };
+      if (error) return { content: [{ type: 'text', text: `Error: ${error.message}` }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ count: data.length, actions: data }, null, 2) }] };
     }
   );
 
-
   // ───────────────────────────────────────────────────
   // Tool: approve_action
-  // Approve or reject a pending_approval action
   // ───────────────────────────────────────────────────
   server.tool(
     'approve_action',
     'Approve or reject an agent action that requires human approval.',
     {
       action_id: z.number().describe('ID of the action to approve/reject'),
-      decision: z.enum(['approve', 'reject']).describe('Approve or reject'),
-      approved_by: z.string().optional().default('ryan'),
+      decision: z.string().describe('Either "approve" or "reject"'),
+      approved_by: z.string().optional().describe('Who approved (default: ryan)'),
       rejection_reason: z.string().optional().describe('Reason for rejection'),
     },
     async (params) => {
-      const updates = params.decision === 'approve'
-        ? { status: 'approved', approved_by: params.approved_by, approved_at: new Date().toISOString() }
-        : { status: 'rejected', approved_by: params.approved_by, approved_at: new Date().toISOString(), rejection_reason: params.rejection_reason || null };
+      const isApprove = params.decision === 'approve';
+      const updates = isApprove
+        ? { status: 'approved', approved_by: params.approved_by || 'ryan', approved_at: new Date().toISOString() }
+        : { status: 'rejected', approved_by: params.approved_by || 'ryan', approved_at: new Date().toISOString(), rejection_reason: params.rejection_reason || null };
 
       const { data, error } = await supabase
         .from('agent_actions')
@@ -301,95 +225,48 @@ export function registerAgentTools(server) {
         .select('id, action_type, status, target_id')
         .single();
 
-      if (error) {
-        return { content: [{ type: 'text', text: `Error updating action: ${error.message}` }] };
-      }
-
-      if (!data) {
-        return { content: [{ type: 'text', text: `Action ${params.action_id} not found or not in pending_approval status.` }] };
-      }
-
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({
-            status: params.decision === 'approve' ? 'approved' : 'rejected',
-            action_id: data.id,
-            action_type: data.action_type,
-            target_id: data.target_id,
-          }, null, 2),
-        }],
-      };
+      if (error) return { content: [{ type: 'text', text: `Error: ${error.message}` }] };
+      if (!data) return { content: [{ type: 'text', text: `Action ${params.action_id} not found or not pending_approval.` }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ status: isApprove ? 'approved' : 'rejected', action_id: data.id, action_type: data.action_type, target_id: data.target_id }, null, 2) }] };
     }
   );
 
-
   // ───────────────────────────────────────────────────
   // Tool: complete_action
-  // Mark an action as completed or failed after execution
   // ───────────────────────────────────────────────────
   server.tool(
     'complete_action',
     'Mark an agent action as completed or failed after execution attempt.',
     {
       action_id: z.number().describe('ID of the action'),
-      status: z.enum(['completed', 'failed']).describe('Outcome'),
-      execution_result: z.record(z.any()).optional().describe('Response from target system'),
+      status: z.string().describe('Either "completed" or "failed"'),
+      execution_result: z.string().optional().describe('JSON string of response from target system'),
       error_message: z.string().optional().describe('Error details if failed'),
     },
     async (params) => {
       const updates = {
         status: params.status,
         executed_at: new Date().toISOString(),
-        execution_result: params.execution_result || null,
+        execution_result: params.execution_result ? JSON.parse(params.execution_result) : null,
         error_message: params.error_message || null,
       };
 
-      // Increment retry count on failure
       if (params.status === 'failed') {
-        const { data: current } = await supabase
-          .from('agent_actions')
-          .select('retry_count, max_retries')
-          .eq('id', params.action_id)
-          .single();
-
+        const { data: current } = await supabase.from('agent_actions').select('retry_count, max_retries').eq('id', params.action_id).single();
         if (current && current.retry_count < current.max_retries) {
-          // Reset to pending for retry
           updates.status = 'pending';
           updates.retry_count = current.retry_count + 1;
         }
       }
 
-      const { data, error } = await supabase
-        .from('agent_actions')
-        .update(updates)
-        .eq('id', params.action_id)
-        .select('id, action_type, status, retry_count, executed_at')
-        .single();
-
-      if (error) {
-        return { content: [{ type: 'text', text: `Error updating action: ${error.message}` }] };
-      }
-
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({
-            action_id: data.id,
-            action_type: data.action_type,
-            final_status: data.status,
-            retry_count: data.retry_count,
-            executed_at: data.executed_at,
-          }, null, 2),
-        }],
-      };
+      const { data, error } = await supabase.from('agent_actions').update(updates).eq('id', params.action_id).select('id, action_type, status, retry_count, executed_at').single();
+      if (error) return { content: [{ type: 'text', text: `Error: ${error.message}` }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ action_id: data.id, action_type: data.action_type, final_status: data.status, retry_count: data.retry_count, executed_at: data.executed_at }, null, 2) }] };
     }
   );
 
-
   // ───────────────────────────────────────────────────
   // Tool: get_event_history
-  // Query event history for a specific contact/entity
   // ───────────────────────────────────────────────────
   server.tool(
     'get_event_history',
@@ -399,15 +276,13 @@ export function registerAgentTools(server) {
       lp_lead_id: z.string().optional().describe('Filter by LP Lead ID'),
       entity_id: z.string().optional().describe('Filter by generic entity ID'),
       event_type: z.string().optional().describe('Filter by event type'),
-      limit: z.number().optional().default(50),
+      limit: z.number().optional().describe('Max results (default 50)'),
       since: z.string().optional().describe('ISO date — only events after this'),
     },
     async (params) => {
-      let query = supabase
-        .from('system_events')
+      let query = supabase.from('system_events')
         .select('id, event_type, event_subtype, source, entity_type, entity_id, ghl_contact_id, lp_lead_id, payload, new_state, processed, action_taken, priority, event_timestamp, created_at')
-        .order('created_at', { ascending: false })
-        .limit(params.limit || 50);
+        .order('created_at', { ascending: false }).limit(params.limit || 50);
 
       if (params.ghl_contact_id) query = query.eq('ghl_contact_id', params.ghl_contact_id);
       if (params.lp_lead_id) query = query.eq('lp_lead_id', params.lp_lead_id);
@@ -416,24 +291,13 @@ export function registerAgentTools(server) {
       if (params.since) query = query.gte('created_at', params.since);
 
       const { data, error } = await query;
-
-      if (error) {
-        return { content: [{ type: 'text', text: `Error fetching history: ${error.message}` }] };
-      }
-
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({ count: data.length, events: data }, null, 2),
-        }],
-      };
+      if (error) return { content: [{ type: 'text', text: `Error: ${error.message}` }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ count: data.length, events: data }, null, 2) }] };
     }
   );
 
-
   // ───────────────────────────────────────────────────
   // Tool: get_action_history
-  // Query action history for audit/debugging
   // ───────────────────────────────────────────────────
   server.tool(
     'get_action_history',
@@ -442,15 +306,13 @@ export function registerAgentTools(server) {
       target_id: z.string().optional().describe('Filter by target entity ID'),
       action_type: z.string().optional().describe('Filter by action type'),
       status: z.string().optional().describe('Filter by status'),
-      limit: z.number().optional().default(50),
+      limit: z.number().optional().describe('Max results (default 50)'),
       since: z.string().optional().describe('ISO date — only actions after this'),
     },
     async (params) => {
-      let query = supabase
-        .from('agent_actions')
+      let query = supabase.from('agent_actions')
         .select('id, event_id, action_type, target_system, target_entity, target_id, action_payload, reasoning, confidence, rule_applied, status, requires_approval, approved_by, executed_at, execution_result, error_message, retry_count, created_at')
-        .order('created_at', { ascending: false })
-        .limit(params.limit || 50);
+        .order('created_at', { ascending: false }).limit(params.limit || 50);
 
       if (params.target_id) query = query.eq('target_id', params.target_id);
       if (params.action_type) query = query.eq('action_type', params.action_type);
@@ -458,24 +320,13 @@ export function registerAgentTools(server) {
       if (params.since) query = query.gte('created_at', params.since);
 
       const { data, error } = await query;
-
-      if (error) {
-        return { content: [{ type: 'text', text: `Error fetching actions: ${error.message}` }] };
-      }
-
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({ count: data.length, actions: data }, null, 2),
-        }],
-      };
+      if (error) return { content: [{ type: 'text', text: `Error: ${error.message}` }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ count: data.length, actions: data }, null, 2) }] };
     }
   );
 
-
   // ───────────────────────────────────────────────────
   // Tool: agent_dashboard
-  // Quick overview of the agentic system state
   // ───────────────────────────────────────────────────
   server.tool(
     'agent_dashboard',
@@ -483,63 +334,23 @@ export function registerAgentTools(server) {
     {},
     async () => {
       try {
-        // Pending events by priority
-        const { data: pendingEvents } = await supabase
-          .from('system_events')
-          .select('priority')
-          .eq('processed', false);
-
+        const { data: pendingEvents } = await supabase.from('system_events').select('priority').eq('processed', false);
         const eventCounts = { critical: 0, high: 0, normal: 0, low: 0, total: 0 };
         (pendingEvents || []).forEach(e => {
           eventCounts[e.priority] = (eventCounts[e.priority] || 0) + 1;
           eventCounts.total++;
         });
 
-        // Pending actions by status
-        const { data: pendingActions } = await supabase
-          .from('agent_actions')
-          .select('status')
-          .in('status', ['pending', 'pending_approval', 'approved', 'executing']);
-
+        const { data: pendingActions } = await supabase.from('agent_actions').select('status').in('status', ['pending', 'pending_approval', 'approved', 'executing']);
         const actionCounts = { pending: 0, pending_approval: 0, approved: 0, executing: 0 };
-        (pendingActions || []).forEach(a => {
-          actionCounts[a.status] = (actionCounts[a.status] || 0) + 1;
-        });
+        (pendingActions || []).forEach(a => { actionCounts[a.status] = (actionCounts[a.status] || 0) + 1; });
 
-        // Last 24h stats
         const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+        const { count: eventsLast24h } = await supabase.from('system_events').select('id', { count: 'exact', head: true }).gte('created_at', since24h);
+        const { count: actionsCompleted24h } = await supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'completed').gte('executed_at', since24h);
+        const { count: actionsFailed24h } = await supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'failed').gte('created_at', since24h);
 
-        const { count: eventsLast24h } = await supabase
-          .from('system_events')
-          .select('id', { count: 'exact', head: true })
-          .gte('created_at', since24h);
-
-        const { count: actionsCompleted24h } = await supabase
-          .from('agent_actions')
-          .select('id', { count: 'exact', head: true })
-          .eq('status', 'completed')
-          .gte('executed_at', since24h);
-
-        const { count: actionsFailed24h } = await supabase
-          .from('agent_actions')
-          .select('id', { count: 'exact', head: true })
-          .eq('status', 'failed')
-          .gte('created_at', since24h);
-
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify({
-              pending_events: eventCounts,
-              pending_actions: actionCounts,
-              last_24h: {
-                events_received: eventsLast24h || 0,
-                actions_completed: actionsCompleted24h || 0,
-                actions_failed: actionsFailed24h || 0,
-              },
-            }, null, 2),
-          }],
-        };
+        return { content: [{ type: 'text', text: JSON.stringify({ pending_events: eventCounts, pending_actions: actionCounts, last_24h: { events_received: eventsLast24h || 0, actions_completed: actionsCompleted24h || 0, actions_failed: actionsFailed24h || 0 } }, null, 2) }] };
       } catch (err) {
         return { content: [{ type: 'text', text: `Dashboard error: ${err.message}` }] };
       }
