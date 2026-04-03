@@ -41,7 +41,7 @@ function authenticate(req, res, next) {
 
 // Root — quick status for browser checks
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', server: 'lp-mcp-server', version: '5.3.0', port: PORT });
+  res.json({ status: 'ok', server: 'lp-mcp-server', version: '5.4.0', port: PORT });
 });
 
 // Health check — shows config status for all required env vars
@@ -49,8 +49,9 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     server: 'lp-mcp-server',
-    version: '5.3.0',
+    version: '5.4.0',
     uptime: process.uptime(),
+    active_sessions: Object.keys(streamableSessions).length,
     lp_config: {
       api_base_url: process.env.LP_API_BASE_URL ? 'set' : 'MISSING',
       client_id:    process.env.LP_CLIENT_ID    ? 'set' : 'MISSING',
@@ -76,13 +77,14 @@ app.get('/health', (req, res) => {
 // Claude.ai connects via POST /mcp with Streamable HTTP protocol.
 // Each session gets its own transport+server instance.
 //
-// SESSION RECOVERY (v5.3):
+// SESSION RECOVERY (v5.4 — fixed):
 // When Railway redeploys, all in-memory sessions are lost. Claude.ai
-// then sends requests with the old mcp-session-id which the new server
-// doesn't recognize. Instead of returning 400 (which forces manual
-// reconnect in Claude.ai), we auto-create a new session and process
-// the request. Claude.ai picks up the new session ID from the response
-// header and continues transparently — no manual reconnect needed.
+// sends requests with the old mcp-session-id. Per MCP spec, we return
+// HTTP 404 for unknown sessions, which signals the client to start a
+// fresh initialize handshake automatically. No manual reconnect needed.
+//
+// Previous approach (v5.3) tried to auto-create sessions for non-initialize
+// requests, but the MCP SDK rejects non-initialize on fresh transports.
 
 const streamableSessions = {};
 
@@ -95,9 +97,6 @@ function isInitializeRequest(body) {
 
 /**
  * Create a new MCP session (transport + server with all tools registered).
- * Used for both initial connections and session recovery after redeploy.
- *
- * @returns {{ transport: StreamableHTTPServerTransport, server: McpServer }}
  */
 function createMCPSession() {
   const transport = new StreamableHTTPServerTransport({
@@ -105,7 +104,7 @@ function createMCPSession() {
   });
   const sessionServer = new McpServer({
     name: 'lp-mcp-server',
-    version: '5.3.0',
+    version: '5.4.0',
     description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence',
   });
 
@@ -148,22 +147,15 @@ app.post('/mcp', authenticate, async (req, res) => {
     }
 
     // ── Unknown session + NOT initialize = session lost after redeploy
-    // Instead of returning 400 (which forces manual reconnect in Claude.ai),
-    // create a fresh session and process the request. The client gets a
-    // working response with the new session ID in the header.
+    // Return 404 per MCP spec — this signals the client to start a fresh
+    // initialize handshake. The client will automatically reconnect.
     if (sessionId) {
-      console.log(`[MCP] Session recovery: unknown session ${sessionId.slice(0, 8)}... — creating new session`);
-      const { transport, server } = createMCPSession();
-      await server.connect(transport);
-
-      // Force a session ID onto the transport so it can handle non-initialize requests
-      // The transport normally only sets sessionId during initialize, but we need it now
-      transport._sessionId = transport.sessionId || crypto.randomUUID();
-
-      await transport.handleRequest(req, res, req.body);
-
-      const newId = transport.sessionId || transport._sessionId;
-      registerSession(newId, transport, server);
+      console.log(`[MCP] Session recovery: unknown session ${sessionId.slice(0, 8)}... — returning 404 to trigger client re-initialize`);
+      res.status(404).json({
+        jsonrpc: '2.0',
+        error: { code: -32001, message: 'Session not found. Server was redeployed. Please reinitialize.' },
+        id: null,
+      });
       return;
     }
 
@@ -184,7 +176,7 @@ app.get('/mcp', authenticate, async (req, res) => {
   if (sessionId && streamableSessions[sessionId]) {
     await streamableSessions[sessionId].transport.handleRequest(req, res);
   } else {
-    res.status(400).json({ error: 'Missing or invalid session' });
+    res.status(404).json({ error: 'Session not found' });
   }
 });
 
@@ -194,7 +186,7 @@ app.delete('/mcp', authenticate, async (req, res) => {
     await streamableSessions[sessionId].transport.handleRequest(req, res);
     delete streamableSessions[sessionId];
   } else {
-    res.status(400).json({ error: 'Missing or invalid session' });
+    res.status(404).json({ error: 'Session not found' });
   }
 });
 
@@ -206,7 +198,7 @@ app.get('/sse', authenticate, async (req, res) => {
   const transport = new SSEServerTransport('/messages', res);
   const sessionServer = new McpServer({
     name: 'lp-mcp-server',
-    version: '5.3.0',
+    version: '5.4.0',
     description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence',
   });
   registerAllTools(sessionServer);
@@ -359,7 +351,7 @@ app.post('/webhook/lp', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`LP MCP Server v5.3 running on port ${PORT}`);
+  console.log(`LP MCP Server v5.4 running on port ${PORT}`);
   console.log(`MCP endpoint: http://localhost:${PORT}/mcp (Streamable HTTP — Claude.ai)`);
   console.log(`SSE endpoint: http://localhost:${PORT}/sse (legacy — Claude Desktop)`);
   console.log(`Health check: http://localhost:${PORT}/health`);
