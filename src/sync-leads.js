@@ -6,6 +6,8 @@
 // ALL LP date fields are wrapped with lpDateToEastern() for correct
 // timezone storage. created_at_lp uses lpCreatedDate() which prefers
 // dateentered (has time) over entrydate (midnight-zeroed).
+//
+// AGENTIC: Disposition changes emit system events for the Decision Engine.
 
 import supabase from './supabase.js';
 import { getField, normalizePhone, loggedFirstKeys } from './sync-utils.js';
@@ -16,11 +18,13 @@ import { matchToGHL, applyGHLTag } from './ghl.js';
 import { upsertProspect } from './upsert-prospect.js';
 import { combineNotes } from './safe-notes.js';
 import { syncCallLogs, syncNotes, syncActivities, syncJobAndMilestones } from './sync-children.js';
+import { emitEvent, dispositionPriority } from './event-emitter.js';
 
 // ─── Pass 1 Helper — upsertLeadOnly() ────────────────────────────
 //
 // Extracts ONLY the lead upsert from processProspect(). Used during
 // fullSync Pass 1 to commit every lp_leads row before child records.
+// Does NOT emit events (too many leads during full sync).
 
 export async function upsertLeadOnly(prospect) {
   const leads = getField(prospect, 'leads', 'Leads') || [];
@@ -89,6 +93,8 @@ export async function upsertLeadOnly(prospect) {
 //
 // Used by incrementalSync and webhook handlers. Single-pass is safe
 // because lp_leads is already populated after the first full sync.
+//
+// AGENTIC: Detects disposition changes and emits system events.
 
 export async function processProspect(prospect, { skipGHL = false } = {}) {
   if (!loggedFirstKeys.has('prospect')) {
@@ -133,9 +139,13 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
     );
     const lpProspectId = String(getField(prospect, 'cst_id', 'CstID', 'prospectid', 'ProspectID'));
 
+    // ─── AGENTIC: Read existing state BEFORE upsert ──────────────
     const { data: existing } = await supabase.from('lp_leads')
-      .select('ghl_tag_applied, lp_day15_triggered')
+      .select('ghl_tag_applied, lp_day15_triggered, disposition_code, ghl_contact_id')
       .eq('lp_lead_id', lpLeadId).single();
+
+    const previousDisposition = existing?.disposition_code || null;
+    const newDisposition = getField(lead, 'disposition', 'Disposition') || null;
 
     const apptSet = getField(lead, 'apptset', 'ApptSet');
     const sat = getField(lead, 'sat', 'Sat');
@@ -162,7 +172,7 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
       promoter_name:      getField(lead, 'promotername', 'PromoterName'),
       ghl_intent_bucket:  bucket,
       ghl_entry_tag:      tag,
-      disposition_code:   getField(lead, 'disposition', 'Disposition'),
+      disposition_code:   newDisposition,
       rep_name:           getField(lead, 'salesrepname', 'SalesRepName'),
       appointment_set:    isApptSet,
       appointment_date:   lpDateToEastern(getField(lead, 'apptdate', 'ApptDate')),
@@ -177,6 +187,37 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
     }, { onConflict: 'lp_lead_id' });
 
     if (upsertErr) throw new Error(`Lead upsert failed for ${lpLeadId}: ${upsertErr.message}`);
+
+    // ─── AGENTIC: Emit disposition change event ──────────────────
+    if (newDisposition && newDisposition !== previousDisposition) {
+      const contactId = ghlId || existing?.ghl_contact_id || null;
+      const leadName = `${getField(prospect, 'firstname', 'FirstName') || ''} ${getField(prospect, 'lastname', 'LastName') || ''}`.trim();
+
+      await emitEvent({
+        event_type: 'lp.disposition_changed',
+        event_subtype: newDisposition,
+        source: 'lp_sync',
+        entity_type: 'lead',
+        entity_id: lpLeadId,
+        ghl_contact_id: contactId,
+        lp_lead_id: lpLeadId,
+        lp_prospect_id: lpProspectId,
+        payload: {
+          disposition_code: newDisposition,
+          previous_disposition: previousDisposition,
+          lead_name: leadName,
+          rep_name: getField(lead, 'salesrepname', 'SalesRepName') || null,
+          lead_source: getField(lead, 'source', 'Source') || null,
+          appointment_set: isApptSet,
+          demo_completed: isDemoCompleted,
+          closed_won: isClosedWon,
+        },
+        previous_state: previousDisposition ? { disposition_code: previousDisposition } : null,
+        new_state: { disposition_code: newDisposition },
+        priority: dispositionPriority(newDisposition),
+        idempotency_key: `disp_${lpLeadId}_${previousDisposition || 'null'}_${newDisposition}_${new Date().toISOString().slice(0, 10)}`,
+      });
+    }
 
     if (ghlId && !existing?.ghl_tag_applied) {
       const success = await applyGHLTag(ghlId, tag);
