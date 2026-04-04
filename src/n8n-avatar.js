@@ -81,22 +81,42 @@ function extractJsonFromText(text) {
   return null;
 }
 
+/**
+ * Extract GPT text from various OpenAI response formats:
+ * 1. Direct string fields: gpt_output, output_text, text
+ * 2. n8n OpenAI node: output[].content[].text (type=output_text)
+ * 3. Standard OpenAI: choices[].message.content
+ * 4. Deep walk fallback (only strings containing '{')
+ */
 function extractGptText(input) {
   if (!input || typeof input !== 'object') return '';
+
+  // 1. Direct string fields
   if (input.gpt_output) return String(input.gpt_output);
   if (input.output_text) return String(input.output_text);
   if (typeof input.text === 'string' && input.text.includes('{')) return input.text;
+
+  // 2. n8n OpenAI node format: { output: [{ content: [{ type: "output_text", text: "..." }] }] }
   if (Array.isArray(input.output)) {
     for (const msg of input.output) {
       if (msg && Array.isArray(msg.content)) {
         for (const block of msg.content) {
-          if (block && typeof block.text === 'string' && block.text.includes('{')) return block.text;
+          if (block && typeof block.text === 'string' && block.text.includes('{')) {
+            return block.text;
+          }
         }
       }
+      // Also check msg.text directly
       if (msg && typeof msg.text === 'string' && msg.text.includes('{')) return msg.text;
     }
   }
-  if (Array.isArray(input.choices) && input.choices[0]?.message?.content) return String(input.choices[0].message.content);
+
+  // 3. Standard OpenAI format: { choices: [{ message: { content: "..." } }] }
+  if (Array.isArray(input.choices) && input.choices[0]?.message?.content) {
+    return String(input.choices[0].message.content);
+  }
+
+  // 4. Deep walk — find first string containing '{'
   const seen = new Set();
   function walk(obj) {
     if (!obj || seen.has(obj)) return null;
@@ -104,6 +124,7 @@ function extractGptText(input) {
     if (typeof obj !== 'object') return null;
     seen.add(obj);
     if (Array.isArray(obj)) { for (const i of obj) { const f = walk(i); if (f) return f; } return null; }
+    // Prioritize keys likely to contain GPT output
     const priorityKeys = ['text', 'content', 'message', 'response', 'output_text', 'result'];
     for (const k of priorityKeys) { if (k in obj) { const f = walk(obj[k]); if (f) return f; } }
     for (const k of Object.keys(obj)) { if (!priorityKeys.includes(k)) { const f = walk(obj[k]); if (f) return f; } }
@@ -111,6 +132,10 @@ function extractGptText(input) {
   }
   return walk(input) || '';
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// 1. POST /n8n/avatar/score
+// ═══════════════════════════════════════════════════════════════════
 
 function handleAvatarScore(req, res) {
   try {
@@ -124,10 +149,13 @@ function handleAvatarScore(req, res) {
     const bookedRaw = String(payload.booked_appointment || 'none').toLowerCase();
     const requestedQuote = !!payload.requested_quote;
     const timeToAppt = Number(payload.time_to_appointment_hours || 0);
+
     let booked = 'none';
     if (bookedRaw.includes('conf') || bookedRaw.includes('call')) booked = 'call';
     if (bookedRaw.includes('estimate') || bookedRaw.includes('in-home') || bookedRaw.includes('in home') || bookedRaw.includes('visit')) booked = 'estimate';
+
     const blob = [chat, notes, pages, utm, leadSource].join(' ');
+
     let score_planner = 0, score_protector = 0, score_researcher = 0, reasons = [];
     if (includesAny(blob, protectorKeys)) { score_protector += 3; reasons.push('storm_language'); }
     if (includesAny(blob, researcherKeys)) { score_researcher += 3; reasons.push('comparison_or_specs'); }
@@ -137,11 +165,13 @@ function handleAvatarScore(req, res) {
     if (qCount >= 3 || chat.length > 600) { score_researcher += 2; reasons.push('high_question_density'); }
     if (includesAny(blob, ["don't call", 'do not call', 'text only', 'email only', 'not now', 'later'])) { score_planner += 2; reasons.push('wants_control'); }
     if (includesAny(blob, ['insurance', 'premium', 'deductible', 'claim'])) { score_researcher += 2; reasons.push('insurance_interest'); }
+
     const scores = [{ name: 'Cautious Planner', score: score_planner }, { name: 'Storm Focused Protector', score: score_protector }, { name: 'Value Driven Researcher', score: score_researcher }].sort((a, b) => b.score - a.score);
     let customer_avatar = scores[0].name;
     if (scores.length > 1 && scores[0].score === scores[1].score) customer_avatar = 'Cautious Planner';
     customer_avatar = enforceEnum(mapAvatarToEnum(customer_avatar), ENUMS.PrimaryAvatar, 'Cautious Planner').replace(/-/g, ' ').trim();
     let confidence = clamp(60 + (scores[0].score - (scores[1]?.score ?? 0)) * 10, 55, 95);
+
     const painSignals = [
       { pain: 'Storm Vulnerability', keys: ['hurricane','storm','evac','shutters','impact','debris','storm season','hurricane guide','wind','wind-borne','wind borne'] },
       { pain: 'Wrong Decision', keys: ['wrong choice','mess this up','make a mistake','bad choice','best option','compare','which is better','what should i choose'] },
@@ -153,20 +183,26 @@ function handleAvatarScore(req, res) {
     let primary_emotional_pain = 'Sales Pressure';
     for (const p of painSignals) { if (includesAny(blob, p.keys)) { primary_emotional_pain = p.pain; break; } }
     primary_emotional_pain = enforceEnum(mapPainToEnum(primary_emotional_pain), ENUMS.PrimaryEmotionalPain, 'Sales Pressure');
+
     const month = new Date().getMonth() + 1;
     let season_context = enforceEnum(month >= 6 && month <= 11 ? 'Storm Season' : 'Off Season', ENUMS.SeasonContext, 'Off Season');
+
     let journey_stage = 'Nurture';
     if (booked === 'call' || booked === 'estimate') journey_stage = 'Appointment';
     else if (requestedQuote) journey_stage = 'Indoctrination';
     journey_stage = enforceEnum(mapJourneyStageToEnum(journey_stage), ENUMS.JourneyStage, 'Nurture');
+
     let keyPhrases = [...new Set([...findMatches(blob, protectorKeys), ...findMatches(blob, researcherKeys), ...findMatches(blob, plannerKeys)])].slice(0, 8);
     if (reasons.length === 0) reasons.push('no_signal_default');
     const avatar_reason_codes = reasons.slice(0, 3).map(r => reasonLabelMap[String(r).trim()] || 'No clear signal').join(' | ');
     const avatar_key_phrases = keyPhrases.map(p => normalizeWhitespace(p)).filter(Boolean).join(' || ');
+
     const currentWeek = nurture_week || 'Week 1';
     const weekNum = Number((currentWeek.match(/\d+/) || ['1'])[0]);
     const nurture_pillar = (weekNum % 2 === 1) ? 'Education' : 'Engagement';
+
     const raw = { nurture_week, customer_avatar, confidence, reason_codes: reasons.slice(0, 3), key_phrases: keyPhrases, primary_emotional_pain, season_context, journey_stage, booked_appointment_normalized: booked, debug_scores: { planner: score_planner, protector: score_protector, researcher: score_researcher } };
+
     res.json({
       customer_avatar, nurture_week: `Week ${weekNum}`, nurture_pillar,
       avatar_confidence: confidence, avatar_reason_codes, avatar_key_phrases,
@@ -178,17 +214,25 @@ function handleAvatarScore(req, res) {
   } catch (err) { console.error('[n8n/avatar/score] Error:', err.message); res.status(500).json({ error: err.message }); }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// 2. POST /n8n/avatar/parse-gpt  (FIXED: handles nested OpenAI output)
+// ═══════════════════════════════════════════════════════════════════
+
 function handleParseGpt(req, res) {
   try {
     const input = req.body || {};
     const raw = extractGptText(input);
     const parsed = extractJsonFromText(raw);
+
     if (!parsed) return res.status(400).json({ error: 'Could not parse GPT JSON', raw_snippet: String(raw).slice(0, 500) });
+
     const titleCase = s => String(s || '').toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
     const normRC = input => { if (!input) return ''; const arr = Array.isArray(input) ? input : [input]; return arr.map(r => titleCase(normalizeWhitespace(String(r).replace(/_/g, ' ')))).filter(Boolean).slice(0, 3).join(' | '); };
     const normKP = input => { if (!input) return ''; const arr = Array.isArray(input) ? input : [input]; return arr.map(x => normalizeWhitespace(x)).filter(Boolean).slice(0, 8).join(' || '); };
+
     const customer_avatar = enforceEnum(mapAvatarToEnum(parsed.customer_avatar), ENUMS.PrimaryAvatar, 'Cautious Planner');
     const avatar_confidence = typeof parsed.confidence === 'number' ? parsed.confidence : 55;
+
     res.json({
       customer_avatar, avatar_confidence,
       avatar_reason_codes: normRC(parsed.reason_codes),
@@ -201,6 +245,10 @@ function handleParseGpt(req, res) {
   } catch (err) { console.error('[n8n/avatar/parse-gpt] Error:', err.message); res.status(500).json({ error: err.message }); }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// 3. POST /n8n/avatar/unified-inputs
+// ═══════════════════════════════════════════════════════════════════
+
 function handleUnifiedInputs(req, res) {
   try {
     const { scored, gpt_parsed, week_pillar } = req.body || {};
@@ -210,35 +258,67 @@ function handleUnifiedInputs(req, res) {
     const chosen = hasGpt ? gpt_parsed : (scored || {});
     const rawAvatar = String(chosen.customer_avatar || '').trim();
     const rawSeason = String(chosen.season_context || 'Storm Season').trim();
+    const notion_avatar = rawAvatar.replace(/-/g, ' ').replace(/\s+/g, ' ').trim();
+    const notion_season = rawSeason.replace(/-/g, ' ').replace(/\s+/g, ' ').trim();
+
     res.json({
       nurture_pillar: pillar, nurture_week: week,
       customer_avatar: rawAvatar, season_context: rawSeason,
-      notion_pillar: pillar, notion_week: week,
-      notion_avatar: rawAvatar.replace(/-/g, ' ').replace(/\s+/g, ' ').trim(),
-      notion_season: rawSeason.replace(/-/g, ' ').replace(/\s+/g, ' ').trim(),
+      notion_pillar: pillar, notion_week: week, notion_avatar, notion_season,
     });
   } catch (err) { console.error('[n8n/avatar/unified-inputs] Error:', err.message); res.status(500).json({ error: err.message }); }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// 4. POST /n8n/avatar/pick-best
+// ═══════════════════════════════════════════════════════════════════
 
 function handlePickBest(req, res) {
   try {
     const { results, nurture_pillar, nurture_week, customer_avatar, season_context } = req.body || {};
     const pages = results || [];
+
     const getMS = (page, prop) => { const p = page?.properties?.[prop]; return (p?.type === 'multi_select') ? (p.multi_select || []).map(x => x.name).filter(Boolean) : []; };
     const getSel = (page, prop) => { const p = page?.properties?.[prop]; return (p?.type === 'select') ? (p.select?.name || '') : ''; };
     const getCB = (page, prop) => { const p = page?.properties?.[prop]; return (p?.type === 'checkbox') ? !!p.checkbox : false; };
     const getTitle = (page, prop) => { const p = page?.properties?.[prop]; return (p?.type === 'title') ? (p.title || []).map(t => t.plain_text).join('').trim() : ''; };
-    const rt = (page, prop) => { const p = page?.properties?.[prop]; if (!p) return ''; if (p.type === 'rich_text') return (p.rich_text || []).map(x => x.plain_text).join('').trim(); if (p.type === 'title') return (p.title || []).map(x => x.plain_text).join('').trim(); if (p.type === 'select') return p.select?.name || ''; if (p.type === 'multi_select') return (p.multi_select || []).map(x => x.name).join(', '); if (p.type === 'checkbox') return !!p.checkbox; return ''; };
-    function scoreTieBreaker(page) { let score = 0; if (getCB(page, 'Active')) score += 5; if (getSel(page, 'Pillar') === nurture_pillar) score += 50; if (getSel(page, 'Recommended Week') === nurture_week) score += 40; if (getMS(page, 'Primary Avatar').includes(customer_avatar)) score += 60; const seasons = getMS(page, 'Season Relevance'); if (seasons.includes(season_context)) score += 25; if (seasons.includes('Year Round')) score += 10; if (season_context === 'Off Season' && seasons.includes('Storm Season') && !seasons.includes('Year Round')) score -= 15; return score; }
+    const rt = (page, prop) => {
+      const p = page?.properties?.[prop]; if (!p) return '';
+      if (p.type === 'rich_text') return (p.rich_text || []).map(x => x.plain_text).join('').trim();
+      if (p.type === 'title') return (p.title || []).map(x => x.plain_text).join('').trim();
+      if (p.type === 'select') return p.select?.name || '';
+      if (p.type === 'multi_select') return (p.multi_select || []).map(x => x.name).join(', ');
+      if (p.type === 'checkbox') return !!p.checkbox;
+      return '';
+    };
+
+    function scoreTieBreaker(page) {
+      let score = 0;
+      if (getCB(page, 'Active')) score += 5;
+      if (getSel(page, 'Pillar') === nurture_pillar) score += 50;
+      if (getSel(page, 'Recommended Week') === nurture_week) score += 40;
+      if (getMS(page, 'Primary Avatar').includes(customer_avatar)) score += 60;
+      const seasons = getMS(page, 'Season Relevance');
+      if (seasons.includes(season_context)) score += 25;
+      if (seasons.includes('Year Round')) score += 10;
+      if (season_context === 'Off Season' && seasons.includes('Storm Season') && !seasons.includes('Year Round')) score -= 15;
+      return score;
+    }
+
     if (!Array.isArray(pages) || pages.length === 0) {
       return res.json({ inputs: { nurture_pillar, nurture_week, customer_avatar, season_context }, results_count: 0, best_score: null, best_page_id: null, best_title: null, best_page: null, best_topic_name: '', best_key_facts: '', best_email_summary: '', best_sms_hook: '', best_soft_cta: '', best_primary_pain: '', best_primary_avatar_list: '', best_season_relevance_list: '' });
     }
+
     const ranked = pages.map(p => ({ page: p, score: scoreTieBreaker(p), title: getTitle(p, 'Topic Name') || getTitle(p, 'Name') || '' }))
       .sort((a, b) => { if (b.score !== a.score) return b.score - a.score; const tA = (a.title || '').toLowerCase(), tB = (b.title || '').toLowerCase(); if (tA < tB) return -1; if (tA > tB) return 1; return (a.page?.id || '').localeCompare(b.page?.id || ''); });
-    const best = ranked[0]; const bp = best.page;
+
+    const best = ranked[0];
+    const bp = best.page;
+
     res.json({
       inputs: { nurture_pillar, nurture_week, customer_avatar, season_context },
-      results_count: pages.length, best_score: best.score, best_page_id: bp?.id || null, best_title: best.title, best_page: bp,
+      results_count: pages.length, best_score: best.score, best_page_id: bp?.id || null, best_title: best.title,
+      best_page: bp,
       best_topic_name: rt(bp, 'Topic Name'), best_key_facts: rt(bp, 'Key Facts / Research'),
       best_email_summary: rt(bp, 'Education Topic Summary'), best_sms_hook: rt(bp, 'SMS Hook (Example)'),
       best_soft_cta: rt(bp, 'Soft CTA (Email)'), best_primary_pain: rt(bp, 'Primary Emotional Pain'),
@@ -247,13 +327,20 @@ function handlePickBest(req, res) {
   } catch (err) { console.error('[n8n/avatar/pick-best] Error:', err.message); res.status(500).json({ error: err.message }); }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// 5. POST /n8n/avatar/build-ghl
+// ═══════════════════════════════════════════════════════════════════
+
 function handleBuildGhl(req, res) {
   try {
     const { best_page, nurture_pillar } = req.body || {};
-    const best = best_page || {}; const pillar = nurture_pillar || '';
+    const best = best_page || {};
+    const pillar = nurture_pillar || '';
+
     const titlePlain = (page, prop) => { const p = page?.properties?.[prop]; return (p?.type === 'title') ? (p.title || []).map(t => t.plain_text || '').join('').trim() : ''; };
     const selectName = (page, prop) => { const p = page?.properties?.[prop]; return (p?.type === 'select') ? (p.select?.name || '').trim() : ''; };
     const richTextPlain = (page, prop) => { const p = page?.properties?.[prop]; return (p?.type === 'rich_text') ? (p.rich_text || []).map(t => t.plain_text || '').join('').trim() : ''; };
+
     const topicName = decodeHTMLEntities(titlePlain(best, 'Topic Name'));
     const primaryPain = decodeHTMLEntities(selectName(best, 'Primary Emotional Pain'));
     const cognitiveOutcome = decodeHTMLEntities(selectName(best, 'Cognitive Outcome'));
@@ -264,18 +351,31 @@ function handleBuildGhl(req, res) {
     const softCTA = decodeHTMLEntities(richTextPlain(best, 'Soft CTA (Email)'));
     const notionPageId = best?.id || '';
     const notionRowId = decodeHTMLEntities(richTextPlain(best, 'Row ID') || notionPageId);
-    const payload = { customFields: [
-      { id: '2rpIC1i1JkArFQ5l1Kf5', value: pillar }, { id: '2oY9alRtz16kWuCgbRSo', value: topicName },
-      { id: 'vFBE8NHEGq2pp2xO4pWc', value: primaryPain }, { id: 'B9guy6VjVsjUYI7nFjQ4', value: cognitiveOutcome },
-      { id: 'd4TAk14TpIbYc8KWfzcR', value: softCTA }, { id: 'vwvGd9WvhRaYzOJtgltx', value: topicSummary },
-      { id: 'J2dtqVvS1Qx5nKK2c3R6', value: keyFacts }, { id: 'dSQEg0PfQtb13gzYDDzz', value: notionRowId },
-      { id: 'RspcdFzktMcPTQ2Ui5ef', value: new Date().toISOString() },
-    ] };
+
+    const payload = {
+      customFields: [
+        { id: '2rpIC1i1JkArFQ5l1Kf5', value: pillar },
+        { id: '2oY9alRtz16kWuCgbRSo', value: topicName },
+        { id: 'vFBE8NHEGq2pp2xO4pWc', value: primaryPain },
+        { id: 'B9guy6VjVsjUYI7nFjQ4', value: cognitiveOutcome },
+        { id: 'd4TAk14TpIbYc8KWfzcR', value: softCTA },
+        { id: 'vwvGd9WvhRaYzOJtgltx', value: topicSummary },
+        { id: 'J2dtqVvS1Qx5nKK2c3R6', value: keyFacts },
+        { id: 'dSQEg0PfQtb13gzYDDzz', value: notionRowId },
+        { id: 'RspcdFzktMcPTQ2Ui5ef', value: new Date().toISOString() },
+      ],
+    };
+
     if (pillar === 'Education' && educationWeekControlBlock) payload.customFields.push({ id: 'jOApgjImuEUEiKzs1e1L', value: educationWeekControlBlock });
     if (pillar === 'Engagement' && engagementWeekControlBlock) payload.customFields.push({ id: 'kG5umAf8lmVlWlbFAiHR', value: engagementWeekControlBlock });
+
     res.json(payload);
   } catch (err) { console.error('[n8n/avatar/build-ghl] Error:', err.message); res.status(500).json({ error: err.message }); }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// 6. POST /n8n/avatar/build-notion
+// ═══════════════════════════════════════════════════════════════════
 
 function handleBuildNotion(req, res) {
   try {
@@ -283,9 +383,22 @@ function handleBuildNotion(req, res) {
     const bp = best_page || {};
     const timesUsedProp = bp?.properties?.['Times Used'];
     const currentTimesUsed = (timesUsedProp?.type === 'number' && typeof timesUsedProp.number === 'number') ? timesUsedProp.number : 0;
-    res.json({ pageId: best_page_id, body: { properties: { 'Last Used Date': { date: { start: new Date().toISOString() } }, 'Times Used': { number: currentTimesUsed + 1 } } } });
+
+    res.json({
+      pageId: best_page_id,
+      body: {
+        properties: {
+          'Last Used Date': { date: { start: new Date().toISOString() } },
+          'Times Used': { number: currentTimesUsed + 1 },
+        },
+      },
+    });
   } catch (err) { console.error('[n8n/avatar/build-notion] Error:', err.message); res.status(500).json({ error: err.message }); }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// REGISTER ROUTES
+// ═══════════════════════════════════════════════════════════════════
 
 export function registerN8nAvatarRoutes(app) {
   app.post('/n8n/avatar/score', handleAvatarScore);
