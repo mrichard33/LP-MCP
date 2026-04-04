@@ -14,7 +14,7 @@
  * 8. Return complete payload ready for GHL contact update
  */
 
-import { getToken } from '../token-manager.js';
+import { getToken } from './token-manager.js';
 
 const LP_API_BASE = process.env.LP_API_BASE_URL || 'https://api.leadperfection.com';
 const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -114,7 +114,6 @@ function buildEnrichedRecord(fullData, leadInfo, prospectId, contactId) {
     recentNotes: '',
   };
 
-  // Latest lead
   const leadsArr = Array.isArray(leads) ? leads : [];
   if (leadsArr.length > 0) {
     const l = leadsArr[leadsArr.length - 1];
@@ -124,7 +123,6 @@ function buildEnrichedRecord(fullData, leadInfo, prospectId, contactId) {
     enriched.latestLeadStatus = l.Disposition || l.disposition || l.Status || '';
   }
 
-  // Latest appointment
   const apptsArr = Array.isArray(appointments) ? appointments : [];
   if (apptsArr.length > 0) {
     const a = apptsArr[apptsArr.length - 1];
@@ -133,7 +131,6 @@ function buildEnrichedRecord(fullData, leadInfo, prospectId, contactId) {
     enriched.latestApptSalesRep = a.SalesRep || a.salesrep || a.RepName || '';
   }
 
-  // Latest job
   const jobsArr = Array.isArray(jobs) ? jobs : [];
   if (jobsArr.length > 0) {
     const j = jobsArr[jobsArr.length - 1];
@@ -143,7 +140,6 @@ function buildEnrichedRecord(fullData, leadInfo, prospectId, contactId) {
     enriched.latestJobAmount = String(j.ContractAmount || j.contractamount || j.Amount || '');
   }
 
-  // Latest call
   const callsArr = Array.isArray(callHistory) ? callHistory : [];
   if (callsArr.length > 0) {
     const c = callsArr[callsArr.length - 1];
@@ -152,7 +148,6 @@ function buildEnrichedRecord(fullData, leadInfo, prospectId, contactId) {
     enriched.lastCallType = c.CallType || c.calltype || '';
   }
 
-  // Recent notes
   const notesArr = Array.isArray(notes) ? notes : [];
   if (notesArr.length > 0) {
     enriched.recentNotes = notesArr.slice(-3).map(n => {
@@ -168,7 +163,7 @@ function buildEnrichedRecord(fullData, leadInfo, prospectId, contactId) {
 
 // ─── Enrich from LP (aggregate across all leads) ─────────────────
 
-function enrichFromLP(enrichedRecord, rawLead, rawInfo) {
+function enrichFromLP(enrichedRecord, rawLead) {
   const fullRaw = rawLead || {};
 
   let prospect = {};
@@ -182,11 +177,9 @@ function enrichFromLP(enrichedRecord, rawLead, rawInfo) {
 
   const allLeads = prospect.leads || [];
 
-  // Aggregate across all leads
   let totalAppointments = 0;
   let totalJobs = 0;
   const allAppointments = [];
-  const allJobsFlat = [];
 
   for (const lead of allLeads) {
     if (lead.appointments) {
@@ -195,18 +188,13 @@ function enrichFromLP(enrichedRecord, rawLead, rawInfo) {
     }
     if (lead.jobs) {
       totalJobs += lead.jobs.length;
-      allJobsFlat.push(...lead.jobs);
     }
   }
 
-  // Find the most advanced lead (best disposition)
   const dispoRank = { 'Data': 1, 'Set': 2, 'Verified': 3, 'Confirmed': 4, 'Issued': 5, 'Sat': 6, 'Sold': 7 };
-  const sortedLeads = [...allLeads].sort((a, b) => {
-    return (dispoRank[b.disposition] || 0) - (dispoRank[a.disposition] || 0);
-  });
+  const sortedLeads = [...allLeads].sort((a, b) => (dispoRank[b.disposition] || 0) - (dispoRank[a.disposition] || 0));
   const bestLead = sortedLeads.length > 0 ? sortedLeads[0] : null;
 
-  // Pipeline flags from best lead
   const pf = bestLead ? {
     set: bestLead.apptset === 'true' || bestLead.everset === 'true',
     verified: bestLead.verified === 'true' || bestLead.eververified === 'true',
@@ -216,7 +204,6 @@ function enrichFromLP(enrichedRecord, rawLead, rawInfo) {
     sold: bestLead.sold === 'true'
   } : {};
 
-  // Highest pipeline stage
   let highestStage = 'Data';
   if (pf.sold) highestStage = 'Sold';
   else if (pf.sat) highestStage = 'Sat';
@@ -225,31 +212,20 @@ function enrichFromLP(enrichedRecord, rawLead, rawInfo) {
   else if (pf.verified) highestStage = 'Verified';
   else if (pf.set) highestStage = 'Set';
 
-  // Market
   const markets = [...new Set(allLeads.map(l => l.brn_id).filter(Boolean))].join(', ');
-
-  // Sale amounts
-  const totalGrossSale = allLeads
-    .reduce((sum, l) => sum + parseFloat(l.GrossSaleAmount || '0'), 0)
-    .toFixed(2);
-
-  // Sales rep from best lead
+  const totalGrossSale = allLeads.reduce((sum, l) => sum + parseFloat(l.GrossSaleAmount || '0'), 0).toFixed(2);
   const salesRep = bestLead ? (bestLead.salesrepname || '') : '';
 
-  // Latest appointment — sort by date descending
   const latestAppt = allAppointments.length > 0
     ? allAppointments.sort((a, b) => new Date(b.apptdate || 0) - new Date(a.apptdate || 0))[0]
     : null;
 
-  // Split appointment datetime into GHL native date + time fields
   let apptDate = '';
   let apptTime = '';
   let apptStatus = '';
   if (latestAppt && latestAppt.apptdate) {
     const dt = new Date(latestAppt.apptdate);
-    apptDate = dt.getFullYear() + '-' +
-      String(dt.getMonth() + 1).padStart(2, '0') + '-' +
-      String(dt.getDate()).padStart(2, '0');
+    apptDate = dt.getFullYear() + '-' + String(dt.getMonth() + 1).padStart(2, '0') + '-' + String(dt.getDate()).padStart(2, '0');
     const hours = dt.getHours();
     const mins = String(dt.getMinutes()).padStart(2, '0');
     const ampm = hours >= 12 ? 'PM' : 'AM';
@@ -257,7 +233,6 @@ function enrichFromLP(enrichedRecord, rawLead, rawInfo) {
     apptStatus = latestAppt.disposition || '';
   }
 
-  // Friendly timestamp in Eastern time
   const lastSynced = (() => {
     const d = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
     const hours = d.getHours();
@@ -294,7 +269,6 @@ export function registerN8nEnrichRoute(app) {
     const startTime = Date.now();
 
     try {
-      // ── Step 1: Parse input params ──
       const body = req.body || {};
       const lp_prospect_id = body['LP Prospect ID'] || body.lp_prospect_id || body.prospect_id || body.ProspectID || body.prospectid || '';
       const lp_lead_id = body['LP Lead ID'] || body.lp_lead_id || body.lead_id || body.LeadID || body.leadid || body.lds_id || '';
@@ -307,22 +281,16 @@ export function registerN8nEnrichRoute(app) {
         return res.status(400).json({ success: false, error: 'Must provide lp_prospect_id or lp_lead_id', contact_id });
       }
 
-      // ── Step 2: Get LP token ──
       const token = await getToken();
       if (!token) {
         return res.status(500).json({ success: false, error: 'Failed to get LP token' });
       }
 
-      // ── Step 3: Resolve prospect ID ──
       let resolvedProspectId = lp_prospect_id ? String(lp_prospect_id).trim() : '';
 
       if (!resolvedProspectId && lp_lead_id) {
-        // Look up prospect by lead ID
         const leadLookup = await lpPost('/api/Customers/GetLead', {
-          lds_id: lp_lead_id,
-          PageSize: '1',
-          StartIndex: '1',
-          options: '0',
+          lds_id: lp_lead_id, PageSize: '1', StartIndex: '1', options: '0',
         }, token);
 
         let cst_id = '';
@@ -340,26 +308,14 @@ export function registerN8nEnrichRoute(app) {
         resolvedProspectId = cst_id;
       }
 
-      // ── Step 4: Fetch full lead data + lead info in parallel ──
       const [fullData, leadInfo] = await Promise.all([
-        lpPost('/api/Customers/GetLead', {
-          cst_id: resolvedProspectId,
-          PageSize: '1',
-          StartIndex: '1',
-          options: '0',
-        }, token),
-        lpPost('/api/Customers/GetLeadInfo', {
-          prospectid: resolvedProspectId,
-        }, token),
+        lpPost('/api/Customers/GetLead', { cst_id: resolvedProspectId, PageSize: '1', StartIndex: '1', options: '0' }, token),
+        lpPost('/api/Customers/GetLeadInfo', { prospectid: resolvedProspectId }, token),
       ]);
 
-      // ── Step 5: Build enriched record ──
       const { enriched, rawLead, rawInfo } = buildEnrichedRecord(fullData, leadInfo, resolvedProspectId, contact_id);
+      const lpFields = enrichFromLP(enriched, rawLead);
 
-      // ── Step 6: Enrich from LP (aggregate) ──
-      const lpFields = enrichFromLP(enriched, rawLead, rawInfo);
-
-      // ── Step 7: Fetch current GHL tags and merge ──
       let mergedTags = ['lp-linked', 'lp-enriched'];
       try {
         const ghlContact = await ghlGet(contact_id);
@@ -369,7 +325,6 @@ export function registerN8nEnrichRoute(app) {
         console.error('[n8n/enrich] Failed to fetch GHL tags:', e.message);
       }
 
-      // ── Step 8: Build final GHL update payload ──
       const ghlUpdateBody = {
         tags: mergedTags,
         customFields: [
@@ -389,7 +344,6 @@ export function registerN8nEnrichRoute(app) {
         ],
       };
 
-      // ── Return complete result ──
       const elapsed = Date.now() - startTime;
       res.json({
         success: true,
