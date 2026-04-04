@@ -1,8 +1,9 @@
 /**
- * n8n Helper APIs — replaces Code nodes in Token Keeper and Prospect ID Lookup workflows
+ * n8n Helper APIs — replaces Code nodes in Token Keeper, Prospect ID Lookup, and Time to Appointment workflows
  * 
- * POST /n8n/refresh-token   — Gets LP token and stores in GHL custom value
- * POST /n8n/prospect-lookup  — Searches LP by phone/email/name, scores matches, returns best prospect ID
+ * POST /n8n/refresh-token        — Gets LP token and stores in GHL custom value
+ * POST /n8n/prospect-lookup      — Searches LP by phone/email/name, scores matches, returns best prospect ID
+ * POST /n8n/time-to-appointment  — Parses GHL appointment date string, calculates hours until appointment
  */
 
 import { getToken } from './token-manager.js';
@@ -49,47 +50,119 @@ const clean = (s) => String(s || '').toLowerCase().trim();
 const cleanPhone = (p) => String(p || '').replace(/\D/g, '').slice(-10);
 
 // ═══════════════════════════════════════════════════════════════════
+// TIME TO APPOINTMENT — POST /n8n/time-to-appointment
+// Replaces: Calculate hours Code node in * GHL Calculate Time to Appointment
+// ═══════════════════════════════════════════════════════════════════
+
+function parseGhlDateToUTC(raw) {
+  const s = String(raw || '').trim();
+  const m = s.match(/([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})\s+(\d{1,2}):(\d{2})\s+(AM|PM)/i);
+  if (!m) throw new Error('Unrecognized appointment_start format: ' + s);
+
+  const monthName = m[1];
+  const day = Number(m[2]);
+  const year = Number(m[3]);
+  let hour = Number(m[4]);
+  const minute = Number(m[5]);
+  const ampm = m[6].toUpperCase();
+
+  const months = {
+    january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
+    july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
+  };
+  const month = months[monthName.toLowerCase()];
+  if (!month) throw new Error('Bad month name: ' + monthName);
+
+  if (ampm === 'PM' && hour !== 12) hour += 12;
+  if (ampm === 'AM' && hour === 12) hour = 0;
+
+  const utcGuess = new Date(Date.UTC(year, month - 1, day, hour, minute, 0));
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false,
+  });
+
+  const parts = fmt.formatToParts(utcGuess).reduce((acc, p) => (acc[p.type] = p.value, acc), {});
+  const nyRendered = Date.UTC(
+    Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+    Number(parts.hour), Number(parts.minute), Number(parts.second)
+  );
+
+  const offsetMinutes = (nyRendered - utcGuess.getTime()) / 60000;
+  const intendedLocalAsUTC = new Date(Date.UTC(year, month - 1, day, hour, minute, 0));
+  const actualUTC = new Date(intendedLocalAsUTC.getTime() - offsetMinutes * 60000);
+
+  return actualUTC;
+}
+
+async function handleTimeToAppointment(req, res) {
+  try {
+    const body = req.body || {};
+    const contactId = body.contact_id || body.contactId || '';
+    const apptStartRaw = body.appointment_start || body.appointmentStart || '';
+
+    if (!contactId) {
+      return res.status(400).json({ success: false, error: 'Missing contact_id' });
+    }
+    if (!apptStartRaw) {
+      return res.status(400).json({ success: false, error: 'Missing appointment_start', contact_id: contactId });
+    }
+
+    const apptUTC = parseGhlDateToUTC(apptStartRaw);
+    const now = new Date();
+    const diffMs = apptUTC.getTime() - now.getTime();
+    const diffHoursExact = diffMs / (1000 * 60 * 60);
+    const time_to_appointment_hours = Math.max(0, Math.round(diffHoursExact * 10) / 10);
+
+    res.json({
+      success: true,
+      contact_id: contactId,
+      time_to_appointment_hours,
+      appointment_start_utc: apptUTC.toISOString(),
+      now_utc: now.toISOString(),
+    });
+  } catch (err) {
+    console.error('[n8n/time-to-appointment] Error:', err.message);
+    res.status(500).json({ success: false, error: err.message, contact_id: req.body?.contact_id || '' });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // TOKEN KEEPER — POST /n8n/refresh-token
-// Replaces: Validate Token + Find Token Custom Value + Log Success
 // ═══════════════════════════════════════════════════════════════════
 
 async function handleRefreshToken(req, res) {
   const startTime = Date.now();
   try {
-    // Step 1: Get fresh LP token via LP MCP's token manager
     const token = await getToken();
     if (!token) {
       return res.status(500).json({ success: false, error: 'Failed to get LP token' });
     }
 
-    // Step 2: Get GHL custom values to find lp_active_token
     const cvResponse = await ghlRequest('GET', `https://services.leadconnectorhq.com/locations/${GHL_LOCATION_ID}/customValues`);
     const customValues = cvResponse.customValues || cvResponse.data || [];
     const existing = customValues.find(cv =>
       cv.name === 'lp_active_token' || cv.name === 'LP Active Token' || cv.name === 'lp active token'
     );
 
-    // Step 3: Create or update the custom value
     let cvResult;
     if (existing) {
       cvResult = await ghlRequest('PUT', `https://services.leadconnectorhq.com/locations/${GHL_LOCATION_ID}/customValues/${existing.id}`, {
-        name: existing.name,
-        value: token,
+        name: existing.name, value: token,
       });
     } else {
       cvResult = await ghlRequest('POST', `https://services.leadconnectorhq.com/locations/${GHL_LOCATION_ID}/customValues`, {
-        name: 'lp_active_token',
-        value: token,
+        name: 'lp_active_token', value: token,
       });
     }
 
     const elapsed = Date.now() - startTime;
-    const now = new Date().toISOString();
     res.json({
-      success: true,
-      action: existing ? 'updated' : 'created',
+      success: true, action: existing ? 'updated' : 'created',
       cv_id: cvResult.customValue?.id || existing?.id || 'unknown',
-      generated_at: now,
+      generated_at: new Date().toISOString(),
       next_refresh: new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString(),
       elapsed_ms: elapsed,
     });
@@ -101,7 +174,6 @@ async function handleRefreshToken(req, res) {
 
 // ═══════════════════════════════════════════════════════════════════
 // PROSPECT LOOKUP — POST /n8n/prospect-lookup
-// Replaces: Parse Lookup Params + Extract Cached Token + Score & Pick Best Match
 // ═══════════════════════════════════════════════════════════════════
 
 async function handleProspectLookup(req, res) {
@@ -125,13 +197,11 @@ async function handleProspectLookup(req, res) {
       return res.status(400).json({ success: false, error: 'Need at least phone, last_name, or email to search LP', contact_id });
     }
 
-    // Get LP token
     const token = await getToken();
     if (!token) {
       return res.status(500).json({ success: false, error: 'Failed to get LP token', contact_id });
     }
 
-    // Run all 4 searches in parallel
     const now = new Date();
     const oneYearAgo = new Date(now); oneYearAgo.setFullYear(now.getFullYear() - 1);
     const tomorrow = new Date(now); tomorrow.setDate(now.getDate() + 1);
@@ -149,12 +219,10 @@ async function handleProspectLookup(req, res) {
     const emailResults = parseResults(searches[2].status === 'fulfilled' ? searches[2].value : null);
     const nameResults = parseResults(searches[3].status === 'fulfilled' ? searches[3].value : null);
 
-    // Check lognumber first (highest confidence)
     if (lognumberResults.length > 0) {
       const match = lognumberResults[0];
       const prospectId = match.cst_id || match.ProspectID || match.prospect_id || '';
       if (prospectId) {
-        // Save to GHL and add tag
         await saveProspectToGHL(contact_id, String(prospectId), 100, 'lognumber (exact match)');
         const elapsed = Date.now() - startTime;
         return res.json({
@@ -165,7 +233,6 @@ async function handleProspectLookup(req, res) {
       }
     }
 
-    // Merge + deduplicate all results
     const allResults = [...phoneResults, ...emailResults, ...nameResults];
     const candidateMap = new Map();
     for (const record of allResults) {
@@ -183,33 +250,24 @@ async function handleProspectLookup(req, res) {
       });
     }
 
-    // Score each candidate
     const ghl = { contact_id, phone, email, last_name, first_name, address1, city, zip };
     const scored = candidates.map(([pid, record]) => {
       let score = 0;
       const matchedFields = [];
-
       const recPhone = cleanPhone(record.phone || record.Phone || record.HomePhone || '');
       if (cleanPhone(ghl.phone) && recPhone && recPhone === cleanPhone(ghl.phone)) { score += 40; matchedFields.push('phone'); }
-
       const recEmail = clean(record.email || record.Email || '');
       if (clean(ghl.email) && recEmail && recEmail === clean(ghl.email)) { score += 35; matchedFields.push('email'); }
-
       const recLN = clean(record.lastname || record.LastName || '');
       if (clean(ghl.last_name) && recLN && recLN === clean(ghl.last_name)) { score += 15; matchedFields.push('last_name'); }
-
       const recFN = clean(record.firstname || record.FirstName || '');
       if (clean(ghl.first_name) && recFN && recFN === clean(ghl.first_name)) { score += 15; matchedFields.push('first_name'); }
-
       const recAddr = clean(record.address1 || record.Address1 || '');
       if (clean(ghl.address1) && recAddr && clean(ghl.address1).length > 3 && (recAddr.includes(clean(ghl.address1)) || clean(ghl.address1).includes(recAddr))) { score += 10; matchedFields.push('address'); }
-
       const recCity = clean(record.city || record.City || '');
       if (clean(ghl.city) && recCity && recCity === clean(ghl.city)) { score += 5; matchedFields.push('city'); }
-
       const recZip = clean(record.zip || record.Zip || record.postalcode || '');
       if (clean(ghl.zip) && recZip && recZip.substring(0, 5) === clean(ghl.zip).substring(0, 5)) { score += 5; matchedFields.push('zip'); }
-
       return {
         prospect_id: pid,
         name: `${record.firstname || record.FirstName || ''} ${record.lastname || record.LastName || ''}`.trim(),
@@ -220,7 +278,6 @@ async function handleProspectLookup(req, res) {
     });
 
     scored.sort((a, b) => b.score - a.score || b.matchCount - a.matchCount);
-
     const best = scored[0];
     const secondBest = scored.length > 1 ? scored[1] : null;
 
@@ -235,18 +292,14 @@ async function handleProspectLookup(req, res) {
       rejectReason = `Score too low (${best.score}/125). Matched: ${best.matchedFields.join(', ') || 'none'}. Best: ${best.name} (LP #${best.prospect_id}).`;
     }
 
-    // If accepted, save to GHL
     if (accepted) {
       await saveProspectToGHL(contact_id, best.prospect_id, best.score, best.matchedFields.join(' + '));
     }
 
     const elapsed = Date.now() - startTime;
     res.json({
-      success: accepted,
-      lp_prospect_id: accepted ? best.prospect_id : '',
-      contact_id,
-      confidence: best.score,
-      found_by: accepted ? best.matchedFields.join(' + ') : 'none',
+      success: accepted, lp_prospect_id: accepted ? best.prospect_id : '', contact_id,
+      confidence: best.score, found_by: accepted ? best.matchedFields.join(' + ') : 'none',
       match_details: accepted
         ? `Matched ${best.name} (LP #${best.prospect_id}) — score ${best.score}/125 on: ${best.matchedFields.join(', ')}`
         : rejectReason,
@@ -254,8 +307,7 @@ async function handleProspectLookup(req, res) {
       runner_up: secondBest ? { prospect_id: secondBest.prospect_id, name: secondBest.name, score: secondBest.score, matched_fields: secondBest.matchedFields } : null,
       candidates_evaluated: scored.length,
       all_scores: scored.slice(0, 10).map(s => ({ id: s.prospect_id, name: s.name, score: s.score, fields: s.matchedFields })),
-      ghl_updated: accepted,
-      elapsed_ms: elapsed,
+      ghl_updated: accepted, elapsed_ms: elapsed,
     });
   } catch (err) {
     console.error('[n8n/prospect-lookup] Error:', err.stack || err.message);
@@ -265,7 +317,6 @@ async function handleProspectLookup(req, res) {
 
 async function saveProspectToGHL(contactId, prospectId, confidence, foundBy) {
   try {
-    // Save prospect ID + confidence to GHL custom fields
     await ghlRequest('PUT', `https://services.leadconnectorhq.com/contacts/${contactId}`, {
       customFields: [
         { key: 'lp_prospect_id', field_value: prospectId },
@@ -273,7 +324,6 @@ async function saveProspectToGHL(contactId, prospectId, confidence, foundBy) {
         { key: 'lp_last_synced', field_value: new Date().toISOString() },
       ],
     });
-    // Add lp-linked tag (POST to avoid overwriting existing tags)
     await ghlRequest('POST', `https://services.leadconnectorhq.com/contacts/${contactId}/tags`, { tags: ['lp-linked'] });
   } catch (e) {
     console.error('[n8n/prospect-lookup] Failed to save to GHL:', e.message);
@@ -285,4 +335,5 @@ async function saveProspectToGHL(contactId, prospectId, confidence, foundBy) {
 export function registerN8nHelperRoutes(app) {
   app.post('/n8n/refresh-token', handleRefreshToken);
   app.post('/n8n/prospect-lookup', handleProspectLookup);
+  app.post('/n8n/time-to-appointment', handleTimeToAppointment);
 }
