@@ -51,32 +51,95 @@ const cleanPhone = (p) => String(p || '').replace(/\D/g, '').slice(-10);
 
 // ═══════════════════════════════════════════════════════════════════
 // TIME TO APPOINTMENT — POST /n8n/time-to-appointment
-// Replaces: Calculate hours Code node in * GHL Calculate Time to Appointment
+// Handles ALL common date formats:
+//   1. "Saturday, April 5, 2026 2:00 PM" (GHL formatted display)
+//   2. "2026-04-05T18:00:00.000Z" (ISO 8601 — GHL startTime)
+//   3. "2026-04-05T14:00:00-04:00" (ISO with offset)
+//   4. "04/05/2026 2:00 PM" (MM/DD/YYYY AM/PM)
+//   5. "1775595600000" (epoch milliseconds)
+//   6. "1775595600" (epoch seconds)
+// All treated as America/New_York local UNLESS they have a timezone offset or are UTC.
 // ═══════════════════════════════════════════════════════════════════
 
-function parseGhlDateToUTC(raw) {
+function parseFlexibleDateToUTC(raw) {
   const s = String(raw || '').trim();
-  const m = s.match(/([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})\s+(\d{1,2}):(\d{2})\s+(AM|PM)/i);
-  if (!m) throw new Error('Unrecognized appointment_start format: ' + s);
-
-  const monthName = m[1];
-  const day = Number(m[2]);
-  const year = Number(m[3]);
-  let hour = Number(m[4]);
-  const minute = Number(m[5]);
-  const ampm = m[6].toUpperCase();
+  if (!s) throw new Error('Empty appointment_start');
 
   const months = {
-    january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
-    july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
+    january: 0, february: 1, march: 2, april: 3, may: 4, june: 5,
+    july: 6, august: 7, september: 8, october: 9, november: 10, december: 11,
+    jan: 0, feb: 1, mar: 2, apr: 3, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
   };
-  const month = months[monthName.toLowerCase()];
-  if (!month) throw new Error('Bad month name: ' + monthName);
 
-  if (ampm === 'PM' && hour !== 12) hour += 12;
-  if (ampm === 'AM' && hour === 12) hour = 0;
+  // 1. ISO 8601 with Z or offset: "2026-04-05T18:00:00.000Z" or "2026-04-05T14:00:00-04:00"
+  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) {
+    const d = new Date(s);
+    if (!isNaN(d.getTime())) return d;
+  }
 
-  const utcGuess = new Date(Date.UTC(year, month - 1, day, hour, minute, 0));
+  // 2. Pure epoch (ms if > 10 billion, seconds otherwise)
+  if (/^\d{10,13}$/.test(s)) {
+    const num = Number(s);
+    const ms = num > 9999999999 ? num : num * 1000;
+    const d = new Date(ms);
+    if (!isNaN(d.getTime())) return d;
+  }
+
+  // 3. GHL formatted: "Saturday, April 5, 2026 2:00 PM" (with or without day name)
+  const ghlMatch = s.match(/(?:[A-Za-z]+,?\s+)?([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})\s+(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+  if (ghlMatch) {
+    const monthIdx = months[ghlMatch[1].toLowerCase()];
+    if (monthIdx !== undefined) {
+      const day = Number(ghlMatch[2]);
+      const year = Number(ghlMatch[3]);
+      let hour = Number(ghlMatch[4]);
+      const minute = Number(ghlMatch[5]);
+      const ampm = ghlMatch[6].toUpperCase();
+      if (ampm === 'PM' && hour !== 12) hour += 12;
+      if (ampm === 'AM' && hour === 12) hour = 0;
+      return localNYToUTC(year, monthIdx, day, hour, minute);
+    }
+  }
+
+  // 4. MM/DD/YYYY H:MM AM/PM: "04/05/2026 2:00 PM"
+  const usMatch = s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+  if (usMatch) {
+    const monthIdx = Number(usMatch[1]) - 1;
+    const day = Number(usMatch[2]);
+    const year = Number(usMatch[3]);
+    let hour = Number(usMatch[4]);
+    const minute = Number(usMatch[5]);
+    const ampm = usMatch[6].toUpperCase();
+    if (ampm === 'PM' && hour !== 12) hour += 12;
+    if (ampm === 'AM' && hour === 12) hour = 0;
+    return localNYToUTC(year, monthIdx, day, hour, minute);
+  }
+
+  // 5. MM/DD/YYYY without time (assume noon)
+  const dateOnly = s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (dateOnly) {
+    return localNYToUTC(Number(dateOnly[3]), Number(dateOnly[1]) - 1, Number(dateOnly[2]), 12, 0);
+  }
+
+  // 6. YYYY-MM-DD without time (assume noon ET)
+  const isoDate = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoDate) {
+    return localNYToUTC(Number(isoDate[1]), Number(isoDate[2]) - 1, Number(isoDate[3]), 12, 0);
+  }
+
+  // 7. Last resort: try native Date parse
+  const lastResort = new Date(s);
+  if (!isNaN(lastResort.getTime())) return lastResort;
+
+  throw new Error('Unrecognized appointment_start format: ' + s);
+}
+
+/** Convert local America/New_York time components to UTC Date */
+function localNYToUTC(year, monthIdx, day, hour, minute) {
+  // Create a UTC date from the local components
+  const utcGuess = new Date(Date.UTC(year, monthIdx, day, hour, minute, 0));
+
+  // Get the NY offset at that moment
   const fmt = new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/New_York',
     year: 'numeric', month: '2-digit', day: '2-digit',
@@ -91,17 +154,14 @@ function parseGhlDateToUTC(raw) {
   );
 
   const offsetMinutes = (nyRendered - utcGuess.getTime()) / 60000;
-  const intendedLocalAsUTC = new Date(Date.UTC(year, month - 1, day, hour, minute, 0));
-  const actualUTC = new Date(intendedLocalAsUTC.getTime() - offsetMinutes * 60000);
-
-  return actualUTC;
+  return new Date(Date.UTC(year, monthIdx, day, hour, minute, 0) - offsetMinutes * 60000);
 }
 
 async function handleTimeToAppointment(req, res) {
   try {
     const body = req.body || {};
     const contactId = body.contact_id || body.contactId || '';
-    const apptStartRaw = body.appointment_start || body.appointmentStart || '';
+    const apptStartRaw = body.appointment_start || body.appointmentStart || body.start_time || body.startTime || '';
 
     if (!contactId) {
       return res.status(400).json({ success: false, error: 'Missing contact_id' });
@@ -110,7 +170,7 @@ async function handleTimeToAppointment(req, res) {
       return res.status(400).json({ success: false, error: 'Missing appointment_start', contact_id: contactId });
     }
 
-    const apptUTC = parseGhlDateToUTC(apptStartRaw);
+    const apptUTC = parseFlexibleDateToUTC(apptStartRaw);
     const now = new Date();
     const diffMs = apptUTC.getTime() - now.getTime();
     const diffHoursExact = diffMs / (1000 * 60 * 60);
@@ -122,6 +182,7 @@ async function handleTimeToAppointment(req, res) {
       time_to_appointment_hours,
       appointment_start_utc: apptUTC.toISOString(),
       now_utc: now.toISOString(),
+      parsed_from: apptStartRaw,
     });
   } catch (err) {
     console.error('[n8n/time-to-appointment] Error:', err.message);
