@@ -11,6 +11,7 @@ import { getTokenStatus } from './token-manager.js';
 import supabase from './supabase.js';
 import { initFieldSync, runBulkFieldSync, logCycleStats } from './ghl-field-bootstrap.js';
 import { registerN8nEnrichRoute } from './n8n-enrichment.js';
+import { registerN8nHelperRoutes } from './n8n-helpers.js';
 
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -38,14 +39,14 @@ function authenticate(req, res, next) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', server: 'lp-mcp-server', version: '5.5.0', port: PORT });
+  res.json({ status: 'ok', server: 'lp-mcp-server', version: '5.6.0', port: PORT });
 });
 
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     server: 'lp-mcp-server',
-    version: '5.5.0',
+    version: '5.6.0',
     uptime: process.uptime(),
     active_sessions: Object.keys(streamableSessions).length,
     lp_config: {
@@ -58,7 +59,11 @@ app.get('/health', (req, res) => {
     lp_token: getTokenStatus(),
     supabase: process.env.SUPABASE_URL ? 'configured' : 'MISSING',
     ghl: process.env.GHL_API_KEY ? 'configured' : 'MISSING',
-    n8n_enrichment: '/n8n/enrich-lead (POST)',
+    n8n_apis: {
+      enrich_lead: 'POST /n8n/enrich-lead',
+      refresh_token: 'POST /n8n/refresh-token',
+      prospect_lookup: 'POST /n8n/prospect-lookup',
+    },
     railway: {
       api_token:  process.env.RAILWAY_API_TOKEN  ? 'set' : 'MISSING',
       service_id: process.env.RAILWAY_SERVICE_ID ? 'set' : 'MISSING',
@@ -79,14 +84,8 @@ function isInitializeRequest(body) {
 }
 
 function createMCPSession() {
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => crypto.randomUUID(),
-  });
-  const sessionServer = new McpServer({
-    name: 'lp-mcp-server',
-    version: '5.5.0',
-    description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence',
-  });
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID() });
+  const sessionServer = new McpServer({ name: 'lp-mcp-server', version: '5.6.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
   registerAllTools(sessionServer);
   return { transport, server: sessionServer };
 }
@@ -95,126 +94,51 @@ function registerSession(sessionId, transport, server) {
   if (!sessionId) return;
   streamableSessions[sessionId] = { transport, server };
   console.log(`[MCP] Session registered: ${sessionId}`);
-  transport.onclose = () => {
-    delete streamableSessions[sessionId];
-    console.log(`[MCP] Session closed: ${sessionId}`);
-  };
+  transport.onclose = () => { delete streamableSessions[sessionId]; console.log(`[MCP] Session closed: ${sessionId}`); };
 }
 
 app.post('/mcp', authenticate, async (req, res) => {
   try {
     const sessionId = req.headers['mcp-session-id'];
-    if (sessionId && streamableSessions[sessionId]) {
-      await streamableSessions[sessionId].transport.handleRequest(req, res, req.body);
-      return;
-    }
+    if (sessionId && streamableSessions[sessionId]) { await streamableSessions[sessionId].transport.handleRequest(req, res, req.body); return; }
     if (isInitializeRequest(req.body)) {
-      const { transport, server } = createMCPSession();
-      await server.connect(transport);
-      await transport.handleRequest(req, res, req.body);
-      const newId = transport.sessionId;
-      registerSession(newId, transport, server);
-      return;
+      const { transport, server } = createMCPSession(); await server.connect(transport); await transport.handleRequest(req, res, req.body);
+      registerSession(transport.sessionId, transport, server); return;
     }
-    if (sessionId) {
-      console.log(`[MCP] Session recovery: unknown session ${sessionId.slice(0, 8)}... — returning 404`);
-      res.status(404).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found. Please reinitialize.' }, id: null });
-      return;
-    }
+    if (sessionId) { res.status(404).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found. Please reinitialize.' }, id: null }); return; }
     res.status(400).json({ jsonrpc: '2.0', error: { code: -32600, message: 'Bad Request: Send an initialize request first.' }, id: null });
-  } catch (err) {
-    console.error('[MCP] Streamable HTTP error:', err.stack);
-    if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
-  }
+  } catch (err) { console.error('[MCP] Error:', err.stack); if (!res.headersSent) res.status(500).json({ error: 'Internal server error' }); }
 });
 
-app.get('/mcp', authenticate, async (req, res) => {
-  const sessionId = req.headers['mcp-session-id'];
-  if (sessionId && streamableSessions[sessionId]) {
-    await streamableSessions[sessionId].transport.handleRequest(req, res);
-  } else {
-    res.status(404).json({ error: 'Session not found' });
-  }
-});
-
-app.delete('/mcp', authenticate, async (req, res) => {
-  const sessionId = req.headers['mcp-session-id'];
-  if (sessionId && streamableSessions[sessionId]) {
-    await streamableSessions[sessionId].transport.handleRequest(req, res);
-    delete streamableSessions[sessionId];
-  } else {
-    res.status(404).json({ error: 'Session not found' });
-  }
-});
+app.get('/mcp', authenticate, async (req, res) => { const s = req.headers['mcp-session-id']; if (s && streamableSessions[s]) { await streamableSessions[s].transport.handleRequest(req, res); } else { res.status(404).json({ error: 'Session not found' }); } });
+app.delete('/mcp', authenticate, async (req, res) => { const s = req.headers['mcp-session-id']; if (s && streamableSessions[s]) { await streamableSessions[s].transport.handleRequest(req, res); delete streamableSessions[s]; } else { res.status(404).json({ error: 'Session not found' }); } });
 
 // ─── Legacy SSE transport ────────────────────────────────────────
 const sseSessions = {};
-
 app.get('/sse', authenticate, async (req, res) => {
   const transport = new SSEServerTransport('/messages', res);
-  const sessionServer = new McpServer({
-    name: 'lp-mcp-server',
-    version: '5.5.0',
-    description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence',
-  });
-  registerAllTools(sessionServer);
-  sseSessions[transport.sessionId] = { transport, server: sessionServer };
-  console.log(`[MCP] New SSE session: ${transport.sessionId}`);
-  res.on('close', () => {
-    delete sseSessions[transport.sessionId];
-    console.log(`[MCP] SSE session closed: ${transport.sessionId}`);
-  });
-  await sessionServer.connect(transport);
+  const ss = new McpServer({ name: 'lp-mcp-server', version: '5.6.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
+  registerAllTools(ss); sseSessions[transport.sessionId] = { transport, server: ss };
+  res.on('close', () => { delete sseSessions[transport.sessionId]; }); await ss.connect(transport);
 });
+app.post('/messages', authenticate, async (req, res) => { const s = sseSessions[req.query.sessionId]; if (!s) return res.status(404).json({ error: 'Session not found' }); await s.transport.handlePostMessage(req, res); });
 
-app.post('/messages', authenticate, async (req, res) => {
-  const sessionId = req.query.sessionId;
-  const session = sseSessions[sessionId];
-  if (!session) return res.status(404).json({ error: 'Session not found' });
-  await session.transport.handlePostMessage(req, res);
-});
-
-// ─── Manual sync endpoints ───────────────────────────────────────
-
-app.post('/sync/full', authenticate, async (req, res) => {
-  res.json({ status: 'started', type: 'full' });
-  fullSync().catch(err => console.error('[Sync] Manual full sync failed:', err.message));
-});
-
-app.post('/sync/incremental', authenticate, async (req, res) => {
-  res.json({ status: 'started', type: 'incremental' });
-  incrementalSync().catch(err => console.error('[Sync] Manual incremental sync failed:', err.message));
-});
-
-app.post('/sync/fields', authenticate, async (req, res) => {
-  res.json({ status: 'started', type: 'field_sync' });
-  runBulkFieldSync().catch(err => console.error('[FieldSync] Manual field sync failed:', err.message));
-});
+// ─── Sync endpoints ─────────────────────────────────────────────
+app.post('/sync/full', authenticate, async (req, res) => { res.json({ status: 'started', type: 'full' }); fullSync().catch(e => console.error('[Sync]', e.message)); });
+app.post('/sync/incremental', authenticate, async (req, res) => { res.json({ status: 'started', type: 'incremental' }); incrementalSync().catch(e => console.error('[Sync]', e.message)); });
+app.post('/sync/fields', authenticate, async (req, res) => { res.json({ status: 'started', type: 'field_sync' }); runBulkFieldSync().catch(e => console.error('[FieldSync]', e.message)); });
 
 app.post('/sync/reconcile', authenticate, async (req, res) => {
   try {
     const { startdate = '2020-01-01', enddate } = req.body || {};
     const end = enddate || new Date().toISOString().slice(0, 10);
-    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-    let lpCount = 0;
-    let idx = 1;
-    while (true) {
-      const r = await getLeads({ startdate, enddate: end, PageSize: 200, StartIndex: idx });
-      const items = Array.isArray(r) ? r : (r?.data || r?.leads || r?.results || []);
-      if (!items || items.length === 0) break;
-      lpCount += items.length;
-      idx += items.length;
-      await sleep(300);
-    }
-    const { count: sbCount } = await supabase.from('lp_leads')
-      .select('id', { count: 'exact', head: true })
-      .gte('created_at_lp', startdate).lte('created_at_lp', end);
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    let lpCount = 0, idx = 1;
+    while (true) { const r = await getLeads({ startdate, enddate: end, PageSize: 200, StartIndex: idx }); const items = Array.isArray(r) ? r : (r?.data || r?.leads || r?.results || []); if (!items?.length) break; lpCount += items.length; idx += items.length; await sleep(300); }
+    const { count: sbCount } = await supabase.from('lp_leads').select('id', { count: 'exact', head: true }).gte('created_at_lp', startdate).lte('created_at_lp', end);
     const drift = Math.abs(lpCount - (sbCount || 0));
-    const driftPct = lpCount > 0 ? ((drift / lpCount) * 100).toFixed(2) : '0';
-    res.json({ lp_count: lpCount, supabase_count: sbCount || 0, drift, drift_percent: driftPct, status: drift === 0 ? 'synced' : 'drift_detected', date_range: { startdate, enddate: end } });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    res.json({ lp_count: lpCount, supabase_count: sbCount || 0, drift, drift_percent: lpCount > 0 ? ((drift / lpCount) * 100).toFixed(2) : '0', status: drift === 0 ? 'synced' : 'drift_detected', date_range: { startdate, enddate: end } });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/sync/status', authenticate, async (req, res) => {
@@ -227,50 +151,33 @@ app.get('/sync/status', authenticate, async (req, res) => {
     ]);
     if (syncLog.error) return res.status(500).json({ error: syncLog.error.message });
     res.json({ recent_syncs: syncLog.data, total_leads: totalLeads.count || 0, unmatched_leads: unmatchedLeads.count || 0, unresolved_errors: unresolvedErrors.count || 0 });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/lp/test', authenticate, async (req, res) => {
-  try { res.json(await testConnection()); } catch (err) { res.status(500).json({ error: err.message }); }
-});
+app.get('/lp/test', authenticate, async (req, res) => { try { res.json(await testConnection()); } catch (err) { res.status(500).json({ error: err.message }); } });
 
 app.post('/webhook/lp', async (req, res) => {
   const webhookSecret = process.env.N8N_WEBHOOK_SECRET;
-  if (webhookSecret) {
-    const provided = req.headers['x-webhook-secret'] || req.query.secret;
-    if (provided !== webhookSecret) return res.status(401).json({ error: 'Invalid webhook secret' });
-  }
+  if (webhookSecret) { const p = req.headers['x-webhook-secret'] || req.query.secret; if (p !== webhookSecret) return res.status(401).json({ error: 'Invalid webhook secret' }); }
   const event = req.body.event || req.headers['x-lp-event'] || 'lead.updated';
   const payload = req.body.data || req.body;
-  console.log(`[Webhook] Received event: ${event}`);
   res.json({ status: 'accepted', event });
-  handleWebhookEvent(event, payload).catch(err => console.error(`[Webhook] Processing failed for ${event}:`, err.message));
+  handleWebhookEvent(event, payload).catch(e => console.error(`[Webhook] ${event}:`, e.message));
 });
 
-// ─── n8n Enrichment API (replaces Code nodes) ────────────────────
+// ─── n8n APIs (replace all Code nodes) ───────────────────────────
 registerN8nEnrichRoute(app);
+registerN8nHelperRoutes(app);
 
 app.listen(PORT, () => {
-  console.log(`LP MCP Server v5.5 running on port ${PORT}`);
-  console.log(`MCP endpoint: http://localhost:${PORT}/mcp`);
-  console.log(`SSE endpoint: http://localhost:${PORT}/sse`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`n8n enrich:   POST http://localhost:${PORT}/n8n/enrich-lead`);
-  console.log(`LP API test:  http://localhost:${PORT}/lp/test`);
-  console.log(`Webhook:      http://localhost:${PORT}/webhook/lp`);
-
+  console.log(`LP MCP Server v5.6 running on port ${PORT}`);
+  console.log(`n8n APIs:     POST /n8n/enrich-lead | /n8n/refresh-token | /n8n/prospect-lookup`);
+  console.log(`MCP:          http://localhost:${PORT}/mcp`);
+  console.log(`Health:       http://localhost:${PORT}/health`);
   initFieldSync();
   startSyncScheduler();
-
   setTimeout(() => {
-    console.log('[FieldSync] Scheduler started');
-    setTimeout(async () => {
-      try { await runBulkFieldSync(); logCycleStats(); } catch (err) { console.error('[FieldSync] Initial failed:', err.message); }
-    }, 120000);
-    setInterval(async () => {
-      try { await runBulkFieldSync(); logCycleStats(); } catch (err) { console.error('[FieldSync] Scheduled failed:', err.message); }
-    }, FIELD_SYNC_INTERVAL_MS);
+    setTimeout(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, 120000);
+    setInterval(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, FIELD_SYNC_INTERVAL_MS);
   }, 450000);
 });
