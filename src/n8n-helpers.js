@@ -3,7 +3,7 @@
  * 
  * POST /n8n/refresh-token        — Gets LP token and stores in GHL custom value
  * POST /n8n/prospect-lookup      — Searches LP by phone/email/name, scores matches, returns best prospect ID
- * POST /n8n/time-to-appointment  — Parses GHL appointment date string, calculates hours until appointment
+ * POST /n8n/time-to-appointment  — Parses GHL appointment date string, calculates hours, WRITES to GHL contact
  */
 
 import { getToken } from './token-manager.js';
@@ -51,14 +51,7 @@ const cleanPhone = (p) => String(p || '').replace(/\D/g, '').slice(-10);
 
 // ═══════════════════════════════════════════════════════════════════
 // TIME TO APPOINTMENT — POST /n8n/time-to-appointment
-// Handles ALL common date formats:
-//   1. "Saturday, April 5, 2026 2:00 PM" (GHL formatted display)
-//   2. "2026-04-05T18:00:00.000Z" (ISO 8601 — GHL startTime)
-//   3. "2026-04-05T14:00:00-04:00" (ISO with offset)
-//   4. "04/05/2026 2:00 PM" (MM/DD/YYYY AM/PM)
-//   5. "1775595600000" (epoch milliseconds)
-//   6. "1775595600" (epoch seconds)
-// All treated as America/New_York local UNLESS they have a timezone offset or are UTC.
+// Now WRITES directly to GHL contact — n8n workflow only needs 2 nodes (webhook + this)
 // ═══════════════════════════════════════════════════════════════════
 
 function parseFlexibleDateToUTC(raw) {
@@ -71,13 +64,11 @@ function parseFlexibleDateToUTC(raw) {
     jan: 0, feb: 1, mar: 2, apr: 3, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
   };
 
-  // 1. ISO 8601 with Z or offset: "2026-04-05T18:00:00.000Z" or "2026-04-05T14:00:00-04:00"
   if (/^\d{4}-\d{2}-\d{2}T/.test(s)) {
     const d = new Date(s);
     if (!isNaN(d.getTime())) return d;
   }
 
-  // 2. Pure epoch (ms if > 10 billion, seconds otherwise)
   if (/^\d{10,13}$/.test(s)) {
     const num = Number(s);
     const ms = num > 9999999999 ? num : num * 1000;
@@ -85,7 +76,6 @@ function parseFlexibleDateToUTC(raw) {
     if (!isNaN(d.getTime())) return d;
   }
 
-  // 3. GHL formatted: "Saturday, April 5, 2026 2:00 PM" (with or without day name)
   const ghlMatch = s.match(/(?:[A-Za-z]+,?\s+)?([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})\s+(\d{1,2}):(\d{2})\s*(AM|PM)/i);
   if (ghlMatch) {
     const monthIdx = months[ghlMatch[1].toLowerCase()];
@@ -101,7 +91,6 @@ function parseFlexibleDateToUTC(raw) {
     }
   }
 
-  // 4. MM/DD/YYYY H:MM AM/PM: "04/05/2026 2:00 PM"
   const usMatch = s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})\s*(AM|PM)/i);
   if (usMatch) {
     const monthIdx = Number(usMatch[1]) - 1;
@@ -115,44 +104,35 @@ function parseFlexibleDateToUTC(raw) {
     return localNYToUTC(year, monthIdx, day, hour, minute);
   }
 
-  // 5. MM/DD/YYYY without time (assume noon)
   const dateOnly = s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
   if (dateOnly) {
     return localNYToUTC(Number(dateOnly[3]), Number(dateOnly[1]) - 1, Number(dateOnly[2]), 12, 0);
   }
 
-  // 6. YYYY-MM-DD without time (assume noon ET)
   const isoDate = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (isoDate) {
     return localNYToUTC(Number(isoDate[1]), Number(isoDate[2]) - 1, Number(isoDate[3]), 12, 0);
   }
 
-  // 7. Last resort: try native Date parse
   const lastResort = new Date(s);
   if (!isNaN(lastResort.getTime())) return lastResort;
 
   throw new Error('Unrecognized appointment_start format: ' + s);
 }
 
-/** Convert local America/New_York time components to UTC Date */
 function localNYToUTC(year, monthIdx, day, hour, minute) {
-  // Create a UTC date from the local components
   const utcGuess = new Date(Date.UTC(year, monthIdx, day, hour, minute, 0));
-
-  // Get the NY offset at that moment
   const fmt = new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/New_York',
     year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit',
     hour12: false,
   });
-
   const parts = fmt.formatToParts(utcGuess).reduce((acc, p) => (acc[p.type] = p.value, acc), {});
   const nyRendered = Date.UTC(
     Number(parts.year), Number(parts.month) - 1, Number(parts.day),
     Number(parts.hour), Number(parts.minute), Number(parts.second)
   );
-
   const offsetMinutes = (nyRendered - utcGuess.getTime()) / 60000;
   return new Date(Date.UTC(year, monthIdx, day, hour, minute, 0) - offsetMinutes * 60000);
 }
@@ -176,6 +156,24 @@ async function handleTimeToAppointment(req, res) {
     const diffHoursExact = diffMs / (1000 * 60 * 60);
     const time_to_appointment_hours = Math.max(0, Math.round(diffHoursExact * 10) / 10);
 
+    // Write directly to GHL contact — eliminates n8n's broken HTTP Request node
+    let ghl_updated = false;
+    let ghl_error = null;
+    if (GHL_API_KEY) {
+      try {
+        const ghlRes = await ghlRequest('PUT', `https://services.leadconnectorhq.com/contacts/${contactId}`, {
+          customFields: [
+            { id: 'E0qxh4WjZN390LYwdNkM', value: String(time_to_appointment_hours) }
+          ]
+        });
+        ghl_updated = !!(ghlRes.contact || ghlRes.succeded);
+        if (!ghl_updated) ghl_error = JSON.stringify(ghlRes).slice(0, 200);
+      } catch (e) {
+        ghl_error = e.message;
+        console.error('[n8n/time-to-appointment] GHL update failed:', e.message);
+      }
+    }
+
     res.json({
       success: true,
       contact_id: contactId,
@@ -183,6 +181,8 @@ async function handleTimeToAppointment(req, res) {
       appointment_start_utc: apptUTC.toISOString(),
       now_utc: now.toISOString(),
       parsed_from: apptStartRaw,
+      ghl_updated,
+      ghl_error,
     });
   } catch (err) {
     console.error('[n8n/time-to-appointment] Error:', err.message);
