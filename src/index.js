@@ -12,6 +12,8 @@ import supabase from './supabase.js';
 import { initFieldSync, runBulkFieldSync, logCycleStats } from './ghl-field-bootstrap.js';
 import { registerN8nEnrichRoute } from './n8n-enrichment.js';
 import { registerN8nHelperRoutes } from './n8n-helpers.js';
+import { registerN8nAvatarRoutes } from './n8n-avatar.js';
+import { registerDecisionEngineRoutes } from './decision-engine.js';
 
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -39,14 +41,14 @@ function authenticate(req, res, next) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', server: 'lp-mcp-server', version: '5.6.0', port: PORT });
+  res.json({ status: 'ok', server: 'lp-mcp-server', version: '5.8.0', port: PORT });
 });
 
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     server: 'lp-mcp-server',
-    version: '5.6.0',
+    version: '5.8.0',
     uptime: process.uptime(),
     active_sessions: Object.keys(streamableSessions).length,
     lp_config: {
@@ -63,6 +65,18 @@ app.get('/health', (req, res) => {
       enrich_lead: 'POST /n8n/enrich-lead',
       refresh_token: 'POST /n8n/refresh-token',
       prospect_lookup: 'POST /n8n/prospect-lookup',
+      time_to_appointment: 'POST /n8n/time-to-appointment',
+      avatar_score: 'POST /n8n/avatar/score',
+      avatar_parse_gpt: 'POST /n8n/avatar/parse-gpt',
+      avatar_unified_inputs: 'POST /n8n/avatar/unified-inputs',
+      avatar_pick_best: 'POST /n8n/avatar/pick-best',
+      avatar_build_ghl: 'POST /n8n/avatar/build-ghl',
+      avatar_build_notion: 'POST /n8n/avatar/build-notion',
+    },
+    decision_engine: {
+      process: 'POST /n8n/decision-engine/process',
+      status: 'GET /n8n/decision-engine/status',
+      reload_rules: 'POST /n8n/decision-engine/reload-rules',
     },
     railway: {
       api_token:  process.env.RAILWAY_API_TOKEN  ? 'set' : 'MISSING',
@@ -85,7 +99,7 @@ function isInitializeRequest(body) {
 
 function createMCPSession() {
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID() });
-  const sessionServer = new McpServer({ name: 'lp-mcp-server', version: '5.6.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
+  const sessionServer = new McpServer({ name: 'lp-mcp-server', version: '5.8.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
   registerAllTools(sessionServer);
   return { transport, server: sessionServer };
 }
@@ -117,7 +131,7 @@ app.delete('/mcp', authenticate, async (req, res) => { const s = req.headers['mc
 const sseSessions = {};
 app.get('/sse', authenticate, async (req, res) => {
   const transport = new SSEServerTransport('/messages', res);
-  const ss = new McpServer({ name: 'lp-mcp-server', version: '5.6.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
+  const ss = new McpServer({ name: 'lp-mcp-server', version: '5.8.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
   registerAllTools(ss); sseSessions[transport.sessionId] = { transport, server: ss };
   res.on('close', () => { delete sseSessions[transport.sessionId]; }); await ss.connect(transport);
 });
@@ -168,10 +182,16 @@ app.post('/webhook/lp', async (req, res) => {
 // ─── n8n APIs (replace all Code nodes) ───────────────────────────
 registerN8nEnrichRoute(app);
 registerN8nHelperRoutes(app);
+registerN8nAvatarRoutes(app);
+
+// ─── Agentic Decision Engine ─────────────────────────────────────
+registerDecisionEngineRoutes(app);
 
 app.listen(PORT, () => {
-  console.log(`LP MCP Server v5.6 running on port ${PORT}`);
-  console.log(`n8n APIs:     POST /n8n/enrich-lead | /n8n/refresh-token | /n8n/prospect-lookup`);
+  console.log(`LP MCP Server v5.8 running on port ${PORT}`);
+  console.log(`n8n APIs:     POST /n8n/enrich-lead | /n8n/refresh-token | /n8n/prospect-lookup | /n8n/time-to-appointment`);
+  console.log(`Avatar APIs:  POST /n8n/avatar/score | /parse-gpt | /unified-inputs | /pick-best | /build-ghl | /build-notion`);
+  console.log(`Decision:     POST /n8n/decision-engine/process | GET /status | POST /reload-rules`);
   console.log(`MCP:          http://localhost:${PORT}/mcp`);
   console.log(`Health:       http://localhost:${PORT}/health`);
   initFieldSync();
