@@ -7,7 +7,7 @@
  * Queries across:
  *   - GHL API (contact data, tags, lead score, conversations)
  *   - Supabase lead_intelligence (AI analysis history, engagement tracking)
- *   - Supabase lp_leads (LP disposition, prospect ID, appointment data)
+ *   - Supabase lp_leads (LP disposition, notes, calls, appointment, rep data)
  * 
  * Returns a structured context object ready for AI analysis or rule evaluation.
  * 
@@ -19,7 +19,7 @@ import supabase from './supabase.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
-const CONTEXT_CACHE_TTL_MS = parseInt(process.env.CONTEXT_CACHE_TTL_MS || '300000', 10); // 5 min default
+const CONTEXT_CACHE_TTL_MS = parseInt(process.env.CONTEXT_CACHE_TTL_MS || '300000', 10);
 
 // ═══════════════════════════════════════════════════════════════════
 // IN-MEMORY CACHE
@@ -39,7 +39,6 @@ function getCached(contactId) {
 
 function setCache(contactId, data) {
   contextCache.set(contactId, { data, time: Date.now() });
-  // Evict old entries if cache grows too large (> 500 contacts)
   if (contextCache.size > 500) {
     const now = Date.now();
     for (const [key, val] of contextCache) {
@@ -48,13 +47,12 @@ function setCache(contactId, data) {
   }
 }
 
-/** Force-clear cache for a contact (after a state change) */
 export function invalidateContext(contactId) {
   contextCache.delete(contactId);
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// GHL API HELPERS (native fetch — matches action-executor pattern)
+// GHL API HELPERS
 // ═══════════════════════════════════════════════════════════════════
 
 async function ghlFetch(method, path) {
@@ -85,9 +83,6 @@ async function ghlFetch(method, path) {
 // DATA FETCHERS
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * Fetch GHL contact by ID — returns name, tags, lead score, custom fields.
- */
 async function fetchGHLContact(contactId) {
   const data = await ghlFetch('GET', `/contacts/${contactId}`);
   if (!data?.contact) return null;
@@ -104,105 +99,68 @@ async function fetchGHLContact(contactId) {
   };
 }
 
-/**
- * Extract messages array from GHL Conversations API response.
- * The API returns different shapes depending on version/endpoint:
- *   - { messages: [ ... ] }              ← direct array
- *   - { messages: { messages: [ ... ] } } ← nested with pagination
- *   - [ ... ]                             ← raw array
- */
 function extractMessages(msgData) {
   if (!msgData) return [];
-
-  // Shape 1: Direct array at top level
   if (Array.isArray(msgData)) return msgData;
-
-  // Shape 2: { messages: [ ... ] } — direct array
   if (Array.isArray(msgData.messages)) return msgData.messages;
-
-  // Shape 3: { messages: { messages: [ ... ] } } — nested with pagination metadata
   if (msgData.messages && typeof msgData.messages === 'object') {
     if (Array.isArray(msgData.messages.messages)) return msgData.messages.messages;
-    // Try iterating values — some GHL versions use different key names
     const values = Object.values(msgData.messages);
     const arr = values.find(v => Array.isArray(v));
     if (arr) return arr;
   }
-
-  // Shape 4: { data: [ ... ] }
   if (Array.isArray(msgData.data)) return msgData.data;
-
-  console.warn('[ContextBuilder] Could not extract messages array from GHL response:', JSON.stringify(msgData).slice(0, 200));
+  console.warn('[ContextBuilder] Could not extract messages array:', JSON.stringify(msgData).slice(0, 200));
   return [];
 }
 
-/**
- * Fetch recent conversation messages from GHL Conversations API.
- * Returns last N messages (both inbound and outbound).
- * 
- * Wrapped in try-catch — conversation context is supplementary.
- * If it fails, analysis proceeds without conversation history.
- */
 async function fetchConversation(contactId, limit = 10) {
   try {
-    // Step 1: Find conversation for this contact
     const searchData = await ghlFetch('GET',
       `/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`);
-
-    // GHL Conversations API returns array directly or { conversations: [...] }
     const conversations = Array.isArray(searchData) ? searchData : (searchData?.conversations || []);
     if (!conversations.length) return [];
-
     const conversationId = conversations[0].id;
-
-    // Step 2: Get messages from the conversation
     const msgData = await ghlFetch('GET',
       `/conversations/${conversationId}/messages?limit=${limit}`);
-
     const messages = extractMessages(msgData);
-
     return messages.map(m => ({
       direction: m.direction === 1 || m.direction === 'inbound' ? 'inbound' : 'outbound',
       text: m.body || m.message || '',
       type: m.contentType || m.type || 'text',
       timestamp: m.dateAdded || m.createdAt || null,
-    })).reverse(); // Oldest first
+    })).reverse();
   } catch (err) {
     console.error(`[ContextBuilder] fetchConversation failed for ${contactId}:`, err.message);
-    return []; // Non-fatal — analysis proceeds without conversation history
+    return [];
   }
 }
 
-/**
- * Fetch or create lead_intelligence row from Supabase.
- */
 async function fetchLeadIntelligence(contactId) {
   const { data, error } = await supabase
     .from('lead_intelligence')
     .select('*')
     .eq('ghl_contact_id', contactId)
     .maybeSingle();
-
   if (error) {
     console.error(`[ContextBuilder] lead_intelligence fetch error:`, error.message);
     return null;
   }
-
-  return data; // null if no row exists yet — that's fine
+  return data;
 }
 
 /**
- * Fetch LP lead data from lp_leads (if GHL contact is matched).
+ * Fetch LP lead data including raw_lp_data (notes, calls, appointments).
+ * Uses correct lp_leads column names verified from schema.
  */
 async function fetchLPLead(contactId) {
   const { data, error } = await supabase
     .from('lp_leads')
-    .select('id, lead_name, disposition, disposition_date, appointment_date, promoter_name, source_description, created_at_lp, lp_prospect_id')
+    .select('id, lp_lead_id, lp_prospect_id, first_name, last_name, disposition_code, disposition_label, rep_name, promoter_name, lead_source, lead_source_detail, call_count, last_call_date, appointment_set, appointment_date, demo_completed, demo_date, days_to_demo, closed_won, job_value, created_at_lp, raw_lp_data')
     .eq('ghl_contact_id', contactId)
-    .order('updated_at', { ascending: false })
+    .order('synced_at', { ascending: false })
     .limit(1)
     .maybeSingle();
-
   if (error) {
     console.error(`[ContextBuilder] lp_leads fetch error:`, error.message);
     return null;
@@ -210,19 +168,13 @@ async function fetchLPLead(contactId) {
   return data;
 }
 
-/**
- * Fetch pipeline opportunity data for this contact.
- */
 async function fetchOpportunity(contactId) {
   const data = await ghlFetch('GET',
     `/opportunities/search?location_id=${GHL_LOCATION_ID}&contact_id=${contactId}`);
   const opps = data?.opportunities || [];
   if (!opps.length) return null;
-
-  // Return the most recently updated opportunity
   const sorted = opps.sort((a, b) =>
     new Date(b.updatedAt || b.lastStatusChangeAt || 0) - new Date(a.updatedAt || a.lastStatusChangeAt || 0));
-
   const opp = sorted[0];
   return {
     id: opp.id,
@@ -232,6 +184,43 @@ async function fetchOpportunity(contactId) {
     value: opp.monetaryValue || 0,
     lastStatusChangeAt: opp.lastStatusChangeAt || opp.updatedAt || null,
   };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// LP DATA EXTRACTORS (from raw_lp_data JSONB)
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Extract notes from raw LP data. These are rep notes, confirmer notes,
+ * and system notes — critical context for AI analysis.
+ */
+function extractLPNotes(rawData, limit = 5) {
+  if (!rawData) return [];
+  const notes = rawData.notes;
+  if (!Array.isArray(notes)) return [];
+  return notes.slice(0, limit).map(n => ({
+    text: (n.note || '').trim(),
+    category: n.category || 'General',
+    entered_by: n.enteredby || '',
+    date: n.enteredon || '',
+  })).filter(n => n.text.length > 0);
+}
+
+/**
+ * Extract recent call history from raw LP data.
+ * Includes result codes (Confirmed, No Answer, etc.) and call types.
+ */
+function extractLPCalls(rawData, limit = 5) {
+  if (!rawData) return [];
+  const calls = rawData.calls;
+  if (!Array.isArray(calls)) return [];
+  return calls.slice(0, limit).map(c => ({
+    result: c.resultdescr || c.resultcode || '',
+    type: c.calltypedescr || c.calltype || '',
+    agent: c.agentname || '',
+    date: c.calldatetime || '',
+    phone: c.phone || '',
+  }));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -265,10 +254,6 @@ function parseSuppressionTags(tags) {
   return tags.filter(t => t.startsWith('suppress:') || t.startsWith('hold:'));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// DAYS IN STAGE CALCULATOR
-// ═══════════════════════════════════════════════════════════════════
-
 function calculateDaysInStage(opportunity) {
   if (!opportunity?.lastStatusChangeAt) return 0;
   const changed = new Date(opportunity.lastStatusChangeAt);
@@ -280,28 +265,14 @@ function calculateDaysInStage(opportunity) {
 // MAIN ENTRY POINT
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * Build the full lead context for a given GHL contact ID.
- * Used by:
- *   - message-analyzer.js (AI analysis input)
- *   - decision-engine.js (contextual rule evaluation)
- * 
- * @param {string} ghlContactId
- * @param {Object} [options]
- * @param {boolean} [options.includeConversation=true] — fetch recent messages
- * @param {boolean} [options.skipCache=false] — bypass context cache
- * @returns {Object} Structured context object
- */
 export async function buildLeadContext(ghlContactId, options = {}) {
   const { includeConversation = true, skipCache = false } = options;
 
-  // Check cache first
   if (!skipCache) {
     const cached = getCached(ghlContactId);
     if (cached) return cached;
   }
 
-  // Parallel fetch all data sources
   const [ghlContact, intelligence, lpLead, opportunity] = await Promise.all([
     fetchGHLContact(ghlContactId),
     fetchLeadIntelligence(ghlContactId),
@@ -309,7 +280,6 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     fetchOpportunity(ghlContactId),
   ]);
 
-  // Conversation fetch is optional (and slower)
   let conversation = [];
   if (includeConversation && ghlContact) {
     conversation = await fetchConversation(ghlContactId, 10);
@@ -317,12 +287,12 @@ export async function buildLeadContext(ghlContactId, options = {}) {
 
   const tags = ghlContact?.tags || [];
   const daysInStage = calculateDaysInStage(opportunity);
+  const lpName = lpLead ? [lpLead.first_name, lpLead.last_name].filter(Boolean).join(' ') : null;
 
   const context = {
-    // ─── Lead Identity ───────────────────────────────────────
     lead: {
       ghl_contact_id: ghlContactId,
-      name: ghlContact?.name || lpLead?.lead_name || 'Unknown',
+      name: ghlContact?.name || lpName || 'Unknown',
       email: ghlContact?.email || null,
       phone: ghlContact?.phone || null,
       entry_source: parseEntrySource(tags) || intelligence?.entry_source || null,
@@ -336,7 +306,6 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       date_added: ghlContact?.dateAdded || null,
     },
 
-    // ─── Pipeline Position ───────────────────────────────────
     pipeline: {
       opportunity_id: opportunity?.id || null,
       pipeline_id: opportunity?.pipelineId || null,
@@ -347,19 +316,30 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       last_status_change: opportunity?.lastStatusChangeAt || null,
     },
 
-    // ─── LP Data ─────────────────────────────────────────────
+    // ─── LP Data (enriched with notes + calls from raw_lp_data) ──
     lp: {
       matched: !!lpLead,
-      lead_id: lpLead?.id || null,
+      lead_id: lpLead?.lp_lead_id || null,
       prospect_id: lpLead?.lp_prospect_id || null,
-      disposition: lpLead?.disposition || null,
-      disposition_date: lpLead?.disposition_date || null,
-      appointment_date: lpLead?.appointment_date || null,
+      disposition: lpLead?.disposition_code || null,
+      disposition_label: lpLead?.disposition_label || null,
+      rep_name: lpLead?.rep_name || null,
       promoter_name: lpLead?.promoter_name || null,
-      source_description: lpLead?.source_description || null,
+      source: lpLead?.lead_source || null,
+      source_detail: lpLead?.lead_source_detail || null,
+      appointment_set: lpLead?.appointment_set || false,
+      appointment_date: lpLead?.appointment_date || null,
+      demo_completed: lpLead?.demo_completed || false,
+      demo_date: lpLead?.demo_date || null,
+      days_to_demo: lpLead?.days_to_demo || null,
+      closed_won: lpLead?.closed_won || false,
+      job_value: lpLead?.job_value || null,
+      call_count: lpLead?.call_count || 0,
+      last_call_date: lpLead?.last_call_date || null,
+      notes: extractLPNotes(lpLead?.raw_lp_data),
+      recent_calls: extractLPCalls(lpLead?.raw_lp_data),
     },
 
-    // ─── Intelligence (AI analysis + engagement) ─────────────
     intelligence: {
       buyer_stage: intelligence?.buyer_stage || null,
       buyer_stage_confidence: intelligence?.buyer_stage_confidence || null,
@@ -376,7 +356,6 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       last_analysis_at: intelligence?.last_analysis_at || null,
     },
 
-    // ─── Engagement Metrics ──────────────────────────────────
     engagement: {
       emails_opened: intelligence?.emails_opened || 0,
       links_clicked: intelligence?.links_clicked || 0,
@@ -389,39 +368,28 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       lead_score_velocity: intelligence?.lead_score_velocity || 0,
     },
 
-    // ─── Recent Conversation ─────────────────────────────────
     conversation_recent: conversation,
 
-    // ─── Meta ────────────────────────────────────────────────
     meta: {
       context_built_at: new Date().toISOString(),
       data_sources: {
         ghl_contact: !!ghlContact,
         lead_intelligence: !!intelligence,
         lp_lead: !!lpLead,
+        lp_notes: extractLPNotes(lpLead?.raw_lp_data).length > 0,
+        lp_calls: extractLPCalls(lpLead?.raw_lp_data).length > 0,
         opportunity: !!opportunity,
         conversation: conversation.length > 0,
       },
     },
   };
 
-  // Cache the assembled context
   setCache(ghlContactId, context);
-
   return context;
 }
 
-/**
- * UPSERT a lead_intelligence row. Used by message-analyzer.js after AI analysis
- * and by behavioral-emitter.js for engagement signal updates.
- * 
- * @param {string} ghlContactId
- * @param {Object} updates — fields to set/update
- * @returns {Object|null} The upserted row
- */
 export async function upsertLeadIntelligence(ghlContactId, updates) {
   const now = new Date().toISOString();
-
   const { data, error } = await supabase
     .from('lead_intelligence')
     .upsert({
@@ -433,28 +401,22 @@ export async function upsertLeadIntelligence(ghlContactId, updates) {
     })
     .select()
     .single();
-
   if (error) {
     console.error(`[ContextBuilder] lead_intelligence upsert error:`, error.message);
     return null;
   }
-
-  // Invalidate context cache after intelligence update
   invalidateContext(ghlContactId);
-
   return data;
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// EXPRESS ROUTES (for testing/debugging via API)
+// EXPRESS ROUTES
 // ═══════════════════════════════════════════════════════════════════
 
 export function registerContextBuilderRoutes(app) {
-  // Get full lead context — used for debugging and manual inspection
   app.get('/n8n/lead-intelligence/context', async (req, res) => {
     const contactId = req.query.contactId;
     if (!contactId) return res.status(400).json({ error: 'contactId query param required' });
-
     try {
       const context = await buildLeadContext(contactId, { skipCache: true });
       res.json(context);
@@ -464,11 +426,9 @@ export function registerContextBuilderRoutes(app) {
     }
   });
 
-  // Get lead intelligence only (cached Supabase data, no GHL calls)
   app.get('/n8n/lead-intelligence/intelligence', async (req, res) => {
     const contactId = req.query.contactId;
     if (!contactId) return res.status(400).json({ error: 'contactId query param required' });
-
     try {
       const intel = await fetchLeadIntelligence(contactId);
       res.json(intel || { ghl_contact_id: contactId, status: 'no_intelligence_data' });
@@ -477,11 +437,7 @@ export function registerContextBuilderRoutes(app) {
     }
   });
 
-  // Cache stats
   app.get('/n8n/lead-intelligence/cache-stats', (req, res) => {
-    res.json({
-      cached_contacts: contextCache.size,
-      ttl_ms: CONTEXT_CACHE_TTL_MS,
-    });
+    res.json({ cached_contacts: contextCache.size, ttl_ms: CONTEXT_CACHE_TTL_MS });
   });
 }
