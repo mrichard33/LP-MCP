@@ -23,7 +23,7 @@ const GHL_LOCATION_ID = 'SsBG7j5KQAIP1SFP2Sca';
 const GROUPME_BOT_ID = process.env.GROUPME_BOT_ID || '';
 
 // ═══════════════════════════════════════════════════════════════════
-// PIPELINE STAGE MAP — exact GHL names (verified 2026-04-05)
+// PIPELINE STAGE MAP
 // ═══════════════════════════════════════════════════════════════════
 
 const PIPELINE_IDS = {
@@ -63,30 +63,15 @@ const STAGE_MAP = {
 
 const REMOVE_ALL_MARKETING_WF = '07a657bd-0492-4137-a831-babfa608c902';
 
-// ─── GHL API Helper ──────────────────────────────────────────────
-
 async function ghlFetch(method, path, body = null) {
   if (!GHL_API_KEY) throw new Error('GHL_API_KEY not configured');
   const url = `https://services.leadconnectorhq.com${path}`;
-  const opts = {
-    method,
-    headers: {
-      'Authorization': `Bearer ${GHL_API_KEY}`,
-      'Version': '2021-07-28',
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-    },
-    signal: AbortSignal.timeout(15000),
-  };
+  const opts = { method, headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json', 'Accept': 'application/json' }, signal: AbortSignal.timeout(15000) };
   if (body) opts.body = JSON.stringify(body);
   const res = await fetch(url, opts);
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`GHL ${method} ${path} → ${res.status}: ${text.slice(0, 200)}`);
-  }
-  const contentType = res.headers.get('content-type') || '';
-  if (contentType.includes('application/json')) return res.json();
-  return { status: res.status, ok: true };
+  if (!res.ok) { const text = await res.text().catch(() => ''); throw new Error(`GHL ${method} ${path} → ${res.status}: ${text.slice(0, 200)}`); }
+  const ct = res.headers.get('content-type') || '';
+  return ct.includes('application/json') ? res.json() : { status: res.status, ok: true };
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -113,27 +98,20 @@ async function executeMoveOpportunity(action) {
   const contactId = action.target_id;
   const { pipeline, stage, status } = action.action_payload || {};
   if (!contactId || !pipeline || !stage) throw new Error('Missing contactId, pipeline, or stage');
-
   const pipelineId = PIPELINE_IDS[pipeline];
   if (!pipelineId) throw new Error(`Unknown pipeline: ${pipeline}`);
   const stageId = STAGE_MAP[stage];
-  if (!stageId) throw new Error(`Unknown stage: "${stage}" — fix the agent_rule, no aliases allowed`);
+  if (!stageId) throw new Error(`Unknown stage: "${stage}" — fix the agent_rule`);
 
-  const searchRes = await ghlFetch('GET',
-    `/opportunities/search?location_id=${GHL_LOCATION_ID}&contact_id=${contactId}&pipeline_id=${pipelineId}`);
-  const opportunities = searchRes?.opportunities || [];
-
-  if (opportunities.length > 0) {
-    const opp = opportunities[0];
-    await ghlFetch('PUT', `/opportunities/${opp.id}`, { pipelineStageId: stageId, status: status || 'open' });
-    return { action: 'updated', opportunity_id: opp.id, pipeline, stage, status };
+  const searchRes = await ghlFetch('GET', `/opportunities/search?location_id=${GHL_LOCATION_ID}&contact_id=${contactId}&pipeline_id=${pipelineId}`);
+  const opps = searchRes?.opportunities || [];
+  if (opps.length > 0) {
+    await ghlFetch('PUT', `/opportunities/${opps[0].id}`, { pipelineStageId: stageId, status: status || 'open' });
+    return { action: 'updated', opportunity_id: opps[0].id, pipeline, stage, status };
   } else {
     const contactRes = await ghlFetch('GET', `/contacts/${contactId}`);
-    const contact = contactRes?.contact || {};
-    const contactName = contact.name || contact.firstName || 'Unknown';
-    const newOpp = await ghlFetch('POST', '/opportunities/', {
-      pipelineId, pipelineStageId: stageId, locationId: GHL_LOCATION_ID, contactId, name: contactName, status: status || 'open',
-    });
+    const name = contactRes?.contact?.name || contactRes?.contact?.firstName || 'Unknown';
+    const newOpp = await ghlFetch('POST', '/opportunities/', { pipelineId, pipelineStageId: stageId, locationId: GHL_LOCATION_ID, contactId, name, status: status || 'open' });
     return { action: 'created', opportunity_id: newOpp?.opportunity?.id, pipeline, stage, status };
   }
 }
@@ -144,10 +122,10 @@ async function executeRemoveFromWorkflow(action) {
     await ghlFetch('POST', `/contacts/${contactId}/workflow/${REMOVE_ALL_MARKETING_WF}`, {});
     return { action: 'added_to_remove_all_workflow', contact_id: contactId };
   }
-  const workflowId = action.action_payload?.workflow_id;
-  if (!workflowId) throw new Error('Missing workflow_id for remove_from_workflow');
-  await ghlFetch('DELETE', `/contacts/${contactId}/workflow/${workflowId}`);
-  return { action: 'removed', contact_id: contactId, workflow_id: workflowId };
+  const wfId = action.action_payload?.workflow_id;
+  if (!wfId) throw new Error('Missing workflow_id');
+  await ghlFetch('DELETE', `/contacts/${contactId}/workflow/${wfId}`);
+  return { action: 'removed', contact_id: contactId, workflow_id: wfId };
 }
 
 async function executeCreateTask(action) {
@@ -161,134 +139,116 @@ async function executeCreateTask(action) {
 async function executeSendNotification(action) {
   const message = action.action_payload?.message || 'Agent notification';
   const contactId = action.target_id;
-  const fullMessage = contactId && contactId !== 'unknown'
-    ? `🤖 ${message}\nContact: ${contactId}` : `🤖 ${message}`;
-  if (GROUPME_BOT_ID) {
-    await sendGroupMeMessage(fullMessage);
-    return { action: 'groupme_sent', message: fullMessage.slice(0, 100) };
-  }
-  console.log(`[ActionExecutor] NOTIFICATION (no GroupMe): ${fullMessage}`);
-  return { action: 'logged', message: fullMessage.slice(0, 100), note: 'GROUPME_BOT_ID not configured' };
+  const full = contactId && contactId !== 'unknown' ? `🤖 ${message}\nContact: ${contactId}` : `🤖 ${message}`;
+  if (GROUPME_BOT_ID) { await sendGroupMeMessage(full); return { action: 'groupme_sent', message: full.slice(0, 100) }; }
+  return { action: 'logged', message: full.slice(0, 100) };
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// LP APPOINTMENT WRITEBACK — Phase 2 Write Action
+// LP APPOINTMENT WRITEBACK
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * set_lp_appointment action handler.
- * 
- * Pushes a GHL appointment booking to Lead Perfection via the SetAppointment API.
- * Uses lp-client.js which handles token management, form-encoding, retry, and
- * circuit breaker automatically — no GHL Custom Webhook fragility.
- * 
- * Required action_payload fields:
- *   lp_lead_id  — LP lead ID (lds_id). Looked up from lp_leads if not provided.
- *   appt_date   — Appointment date in ISO format (converted to MM/DD/YYYY)
- *   appt_time   — Appointment time (12h or 24h, converted to HH:MM 24h)
- *   set_by      — LP employee ID (default: 5686 = GHL system user)
- * 
- * Optional:
- *   calendar_name — For logging purposes
- */
 async function executeSetLPAppointment(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
 
+  // ─── Fetch triggering event to get appointment details ─────────
+  // The decision engine passes static template params, but can't interpolate
+  // event payload variables. So we fetch the event and pull start_time/title.
+  let eventPayload = {};
+  if (action.event_id) {
+    const { data: evt } = await supabase
+      .from('system_events')
+      .select('payload')
+      .eq('id', action.event_id)
+      .maybeSingle();
+    if (evt?.payload) {
+      eventPayload = typeof evt.payload === 'string' ? JSON.parse(evt.payload) : evt.payload;
+    }
+  }
+
   // ─── Resolve LP Lead ID ────────────────────────────────────────
   let lpLeadId = payload.lp_lead_id;
-
   if (!lpLeadId && contactId) {
-    // Look up from lp_leads table by GHL contact ID
     const { data: lpLead } = await supabase
-      .from('lp_leads')
-      .select('lp_lead_id')
+      .from('lp_leads').select('lp_lead_id')
       .eq('ghl_contact_id', contactId)
-      .order('synced_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
+      .order('synced_at', { ascending: false }).limit(1).maybeSingle();
     if (lpLead?.lp_lead_id) {
       lpLeadId = lpLead.lp_lead_id;
     } else {
-      // Try GHL custom field as fallback
       const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
-      const customFields = ghlRes?.contact?.customFields || [];
-      // GmAVmW6V9sekD7pVONKr = LP Lead ID custom field
-      const lpField = customFields.find(f => f.id === 'GmAVmW6V9sekD7pVONKr');
-      if (lpField?.value) {
-        lpLeadId = String(lpField.value);
-      }
+      const fields = ghlRes?.contact?.customFields || [];
+      const lpField = fields.find(f => f.id === 'GmAVmW6V9sekD7pVONKr');
+      if (lpField?.value) lpLeadId = String(lpField.value);
     }
   }
+  if (!lpLeadId) throw new Error(`No LP Lead ID for contact ${contactId}`);
 
-  if (!lpLeadId) {
-    throw new Error(`Cannot set LP appointment: no LP Lead ID found for contact ${contactId}. Lead may not be in LP yet.`);
+  // ─── Resolve Appointment Date ──────────────────────────────────
+  // Priority: action payload → event payload → GHL contact fields
+  let rawDate = payload.appt_date || eventPayload.start_time || null;
+  if (!rawDate && contactId) {
+    const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
+    const c = ghlRes?.contact || {};
+    rawDate = c.last_appointment_start_date || c.lastAppointmentStartDate || null;
+  }
+  if (!rawDate) throw new Error('Cannot resolve appointment date');
+
+  // Convert to MM/DD/YYYY
+  let apptDate;
+  if (rawDate.includes('-')) {
+    const datePart = rawDate.split('T')[0];
+    const [y, m, d] = datePart.split('-');
+    apptDate = `${m}/${d}/${y}`;
+  } else if (rawDate.includes('/')) {
+    apptDate = rawDate; // Already MM/DD/YYYY
+  } else {
+    apptDate = rawDate;
   }
 
-  // ─── Format Date (ISO → MM/DD/YYYY) ───────────────────────────
-  let apptDate = payload.appt_date;
-  if (apptDate && apptDate.includes('-')) {
-    // ISO format: 2026-04-10 or 2026-04-10T14:00:00
-    const datePart = apptDate.split('T')[0];
-    const [year, month, day] = datePart.split('-');
-    apptDate = `${month}/${day}/${year}`;
+  // ─── Resolve Appointment Time ──────────────────────────────────
+  let rawTime = payload.appt_time || null;
+  // Extract time from ISO start_time if available
+  if (!rawTime && eventPayload.start_time && eventPayload.start_time.includes('T')) {
+    const timePart = eventPayload.start_time.split('T')[1];
+    if (timePart) rawTime = timePart.slice(0, 5); // "14:00"
   }
-  if (!apptDate) throw new Error('Missing appt_date in action payload');
+  if (!rawTime && contactId) {
+    const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
+    const c = ghlRes?.contact || {};
+    rawTime = c.last_appointment_start_time || c.lastAppointmentStartTime || null;
+  }
+  if (!rawTime) throw new Error('Cannot resolve appointment time');
 
-  // ─── Format Time (12h → 24h HH:MM) ────────────────────────────
-  let apptTime = payload.appt_time;
-  if (apptTime) {
-    // Handle "2:00 PM", "10:00 AM", "14:00", etc.
-    const match12 = apptTime.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
-    if (match12) {
-      let hours = parseInt(match12[1], 10);
-      const minutes = match12[2];
-      const period = match12[3].toUpperCase();
-      if (period === 'AM' && hours === 12) hours = 0;
-      if (period === 'PM' && hours !== 12) hours += 12;
-      apptTime = `${String(hours).padStart(2, '0')}:${minutes}`;
-    }
-    // If already in 24h format (e.g. "14:00"), leave as-is
-    // Strip seconds if present (e.g. "14:00:00" → "14:00")
-    if (apptTime.length > 5) apptTime = apptTime.slice(0, 5);
+  // Convert 12h to 24h if needed
+  let apptTime = rawTime;
+  const match12 = apptTime.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (match12) {
+    let h = parseInt(match12[1], 10);
+    const min = match12[2];
+    const p = match12[3].toUpperCase();
+    if (p === 'AM' && h === 12) h = 0;
+    if (p === 'PM' && h !== 12) h += 12;
+    apptTime = `${String(h).padStart(2, '0')}:${min}`;
   }
-  if (!apptTime) throw new Error('Missing appt_time in action payload');
+  if (apptTime.length > 5) apptTime = apptTime.slice(0, 5);
 
   const setBy = payload.set_by || '5686';
+  const calendarName = payload.calendar_name || eventPayload.title || 'N/A';
 
-  // ─── Call LP API via lp-client.js ──────────────────────────────
-  const result = await lpSetAppointment({
-    ldsId: lpLeadId,
-    setBy,
-    apptDate,
-    apptTime,
-  });
+  // ─── Call LP API ───────────────────────────────────────────────
+  const result = await lpSetAppointment({ ldsId: lpLeadId, setBy, apptDate, apptTime });
 
-  // ─── Add GHL note confirming the writeback ─────────────────────
-  const noteText = `[LP SYNC] Appointment set in Lead Perfection\nLP Lead ID: ${lpLeadId}\nDate: ${apptDate}\nTime: ${apptTime}\nCalendar: ${payload.calendar_name || 'N/A'}`;
-  await addGHLNote(contactId, noteText).catch(err => {
-    console.warn(`[ActionExecutor] GHL note failed (non-critical): ${err.message}`);
-  });
+  // ─── Confirm via GHL note + GroupMe ────────────────────────────
+  await addGHLNote(contactId, `[LP SYNC] Appointment set in Lead Perfection\nLP Lead ID: ${lpLeadId}\nDate: ${apptDate}\nTime: ${apptTime}\nCalendar: ${calendarName}`).catch(() => {});
 
-  // ─── GroupMe notification ──────────────────────────────────────
   if (GROUPME_BOT_ID) {
-    await sendGroupMeMessage(
-      `📅 LP Appointment Set\nLP Lead: ${lpLeadId}\nDate: ${apptDate} ${apptTime}\nCalendar: ${payload.calendar_name || 'N/A'}\nContact: ${contactId}`
-    ).catch(() => {});
+    await sendGroupMeMessage(`📅 LP Appointment Set\nLP Lead: ${lpLeadId}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName}\nContact: ${contactId}`).catch(() => {});
   }
 
   console.log(`[ActionExecutor] ✅ LP appointment set: lds_id=${lpLeadId}, ${apptDate} ${apptTime}`);
-
-  return {
-    action: 'lp_appointment_set',
-    lp_lead_id: lpLeadId,
-    appt_date: apptDate,
-    appt_time: apptTime,
-    set_by: setBy,
-    lp_response: result,
-    contact_id: contactId,
-  };
+  return { action: 'lp_appointment_set', lp_lead_id: lpLeadId, appt_date: apptDate, appt_time: apptTime, set_by: setBy, calendar_name: calendarName, lp_response: result, contact_id: contactId };
 }
 
 // ─── GroupMe Helper ──────────────────────────────────────────────
@@ -297,14 +257,11 @@ async function sendGroupMeMessage(text) {
   if (!GROUPME_BOT_ID) return;
   try {
     await fetch('https://api.groupme.com/v3/bots/post', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ bot_id: GROUPME_BOT_ID, text: text.slice(0, 1000) }),
       signal: AbortSignal.timeout(10000),
     });
-  } catch (err) {
-    console.error('[ActionExecutor] GroupMe send failed:', err.message);
-  }
+  } catch (err) { console.error('[ActionExecutor] GroupMe send failed:', err.message); }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -324,69 +281,44 @@ const ACTION_HANDLERS = {
 async function executeSingleAction(action) {
   const handler = ACTION_HANDLERS[action.action_type];
   if (!handler) {
-    await supabase.from('agent_actions').update({
-      status: 'failed', error_message: `Unknown action type: ${action.action_type}`,
-      executed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
-    }).eq('id', action.id);
-    return { action_id: action.id, status: 'failed', error: `Unknown action type: ${action.action_type}` };
+    await supabase.from('agent_actions').update({ status: 'failed', error_message: `Unknown action type: ${action.action_type}`, executed_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', action.id);
+    return { action_id: action.id, status: 'failed', error: `Unknown: ${action.action_type}` };
   }
-
-  await supabase.from('agent_actions').update({
-    status: 'executing', updated_at: new Date().toISOString(),
-  }).eq('id', action.id);
-
+  await supabase.from('agent_actions').update({ status: 'executing', updated_at: new Date().toISOString() }).eq('id', action.id);
   try {
     const result = await handler(action);
-    await supabase.from('agent_actions').update({
-      status: 'completed', execution_result: result,
-      executed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
-    }).eq('id', action.id);
+    await supabase.from('agent_actions').update({ status: 'completed', execution_result: result, executed_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', action.id);
     console.log(`[ActionExecutor] ✅ ${action.action_type} completed (action ${action.id}, rule: ${action.rule_applied})`);
     return { action_id: action.id, status: 'completed', result };
   } catch (err) {
-    const retryCount = (action.retry_count || 0) + 1;
-    const maxRetries = action.max_retries || 3;
-    const newStatus = retryCount >= maxRetries ? 'failed' : 'pending';
-    await supabase.from('agent_actions').update({
-      status: newStatus, error_message: err.message, retry_count: retryCount,
-      executed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
-    }).eq('id', action.id);
-    console.error(`[ActionExecutor] ❌ ${action.action_type} failed (action ${action.id}): ${err.message} [retry ${retryCount}/${maxRetries}]`);
-    return { action_id: action.id, status: newStatus, error: err.message, retry: `${retryCount}/${maxRetries}` };
+    const retries = (action.retry_count || 0) + 1;
+    const max = action.max_retries || 3;
+    const st = retries >= max ? 'failed' : 'pending';
+    await supabase.from('agent_actions').update({ status: st, error_message: err.message, retry_count: retries, executed_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', action.id);
+    console.error(`[ActionExecutor] ❌ ${action.action_type} failed (action ${action.id}): ${err.message} [retry ${retries}/${max}]`);
+    return { action_id: action.id, status: st, error: err.message, retry: `${retries}/${max}` };
   }
 }
 
 export async function executeActions({ limit = 50 } = {}) {
   const startTime = Date.now();
-  const { data: actions, error } = await supabase
-    .from('agent_actions').select('*').eq('status', 'pending')
+  const { data: actions, error } = await supabase.from('agent_actions').select('*').eq('status', 'pending')
     .order('created_at', { ascending: true }).order('sequence_order', { ascending: true }).limit(limit);
-
-  if (error) { console.error('[ActionExecutor] Failed to fetch pending actions:', error.message); return { success: false, error: error.message }; }
-  if (!actions || actions.length === 0) return { success: true, actions_executed: 0, elapsed_ms: Date.now() - startTime };
+  if (error) return { success: false, error: error.message };
+  if (!actions?.length) return { success: true, actions_executed: 0, elapsed_ms: Date.now() - startTime };
 
   const batches = new Map();
-  for (const action of actions) {
-    const key = action.batch_id || `single_${action.id}`;
-    if (!batches.has(key)) batches.set(key, []);
-    batches.get(key).push(action);
-  }
-  for (const batch of batches.values()) batch.sort((a, b) => (a.sequence_order || 0) - (b.sequence_order || 0));
+  for (const a of actions) { const k = a.batch_id || `s_${a.id}`; if (!batches.has(k)) batches.set(k, []); batches.get(k).push(a); }
+  for (const b of batches.values()) b.sort((a, b) => (a.sequence_order || 0) - (b.sequence_order || 0));
 
   console.log(`[ActionExecutor] Executing ${actions.length} actions in ${batches.size} batches...`);
-  const results = [];
-  let completed = 0, failed = 0;
-
-  for (const [batchId, batchActions] of batches) {
-    for (const action of batchActions) {
-      const result = await executeSingleAction(action);
-      results.push(result);
-      if (result.status === 'completed') completed++;
-      else if (result.status === 'failed') failed++;
-      if (result.status === 'failed') { console.warn(`[ActionExecutor] Batch ${batchId} halted — action ${action.id} failed permanently`); break; }
+  const results = []; let completed = 0, failed = 0;
+  for (const [bid, ba] of batches) {
+    for (const a of ba) {
+      const r = await executeSingleAction(a); results.push(r);
+      if (r.status === 'completed') completed++; else if (r.status === 'failed') { failed++; break; }
     }
   }
-
   const elapsed = Date.now() - startTime;
   console.log(`[ActionExecutor] Done: ${completed} completed, ${failed} failed (${elapsed}ms)`);
   return { success: true, actions_executed: results.length, completed, failed, retrying: results.filter(r => r.status === 'pending').length, results, elapsed_ms: elapsed };
@@ -399,18 +331,17 @@ export async function executeActions({ limit = 50 } = {}) {
 export function registerActionExecutorRoutes(app) {
   app.post('/n8n/decision-engine/execute', async (req, res) => {
     try { res.json(await executeActions({ limit: req.body?.limit || 50 })); }
-    catch (err) { console.error('[ActionExecutor] /execute error:', err.message); res.status(500).json({ success: false, error: err.message }); }
+    catch (err) { res.status(500).json({ success: false, error: err.message }); }
   });
-
   app.get('/n8n/decision-engine/execution-stats', async (req, res) => {
     try {
-      const [pendingRes, approvalRes, completedRes, failedRes] = await Promise.all([
+      const [p, a, c, f] = await Promise.all([
         supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'pending'),
         supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'pending_approval'),
         supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'completed'),
         supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'failed'),
       ]);
-      res.json({ pending: pendingRes.count || 0, pending_approval: approvalRes.count || 0, completed: completedRes.count || 0, failed: failedRes.count || 0 });
+      res.json({ pending: p.count || 0, pending_approval: a.count || 0, completed: c.count || 0, failed: f.count || 0 });
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 }
