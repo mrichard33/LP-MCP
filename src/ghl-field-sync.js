@@ -1,7 +1,12 @@
 // ─── GHL Field Sync — src/ghl-field-sync.js ──────────────────────
 //
-// v3 — March 24, 2026
+// v4 — April 5, 2026
 // Syncs LP lead data to GHL contact custom fields with change detection.
+//
+// v4 CHANGES:
+// - Handles 'not_found' return from updateGHLContactFields (deleted GHL contacts)
+// - Auto-clears stale ghl_contact_id from ALL lp_leads rows for deleted contacts
+// - Tracks cleared contacts in stats for observability
 //
 // MERGED LEAD APPROACH: When a prospect has multiple LP leads (e.g., 7
 // leads over several years), we build a MERGED object per GHL contact:
@@ -20,7 +25,7 @@ import { updateGHLContactFields } from './ghl.js';
 import { buildGHLFieldPayload, computeFieldHash, getConfiguredFieldCount } from './ghl-field-map.js';
 
 // Track stats per sync cycle
-let fieldSyncStats = { checked: 0, pushed: 0, skipped: 0, failed: 0 };
+let fieldSyncStats = { checked: 0, pushed: 0, skipped: 0, failed: 0, cleared: 0 };
 
 /**
  * Build a merged lead object from ALL leads for a single GHL contact.
@@ -88,12 +93,42 @@ function buildMergedLead(leads) {
     // Engagement — prospect-level, same on all leads
     call_count: newest.call_count,
     last_contact_date: newest.last_contact_date,
+
+    // All lead IDs for this contact (needed for stale ID cleanup)
+    _all_lead_ids: sorted.map(l => l.lp_lead_id),
   };
+}
+
+/**
+ * Clear stale ghl_contact_id from ALL lp_leads rows for a deleted GHL contact.
+ * Called when GHL returns 400 "Contact not found" during field sync.
+ */
+async function clearStaleGHLContact(ghlContactId, leadIds) {
+  try {
+    const { data } = await supabase.from('lp_leads')
+      .update({ ghl_contact_id: null, ghl_tag_applied: false, ghl_fields_hash: null })
+      .eq('ghl_contact_id', ghlContactId)
+      .select('lp_lead_id');
+    const cleared = data?.length || 0;
+    console.warn(`[FieldSync] Cleared stale GHL ID ${ghlContactId} from ${cleared} lp_leads rows (contact deleted from GHL)`);
+
+    // Also clear from lp_prospects
+    await supabase.from('lp_prospects')
+      .update({ ghl_contact_id: null, ghl_tag_applied: false })
+      .eq('ghl_contact_id', ghlContactId);
+
+    return cleared;
+  } catch (err) {
+    console.error(`[FieldSync] Failed to clear stale GHL ID ${ghlContactId}:`, err.message);
+    return 0;
+  }
 }
 
 /**
  * Sync merged lead fields to the matched GHL contact.
  * Only calls GHL API if field values have changed since last sync.
+ *
+ * v4: Handles 'not_found' return — clears stale ghl_contact_id automatically.
  */
 export async function syncLeadFieldsToGHL(lead, ghlContactId, storedHash) {
   if (!ghlContactId || !lead) {
@@ -117,9 +152,9 @@ export async function syncLeadFieldsToGHL(lead, ghlContactId, storedHash) {
   }
 
   // Push to GHL
-  const success = await updateGHLContactFields(ghlContactId, fields);
+  const result = await updateGHLContactFields(ghlContactId, fields);
 
-  if (success) {
+  if (result === true) {
     fieldSyncStats.pushed++;
 
     // Store new hash on the NEWEST lead row for this contact
@@ -132,6 +167,11 @@ export async function syncLeadFieldsToGHL(lead, ghlContactId, storedHash) {
     }
 
     return { pushed: true, hash: newHash };
+  } else if (result === 'not_found') {
+    // ─── v4: GHL contact was deleted — clean up stale references ──
+    fieldSyncStats.cleared++;
+    await clearStaleGHLContact(ghlContactId, lead._all_lead_ids || []);
+    return { pushed: false, hash: storedHash, cleared: true };
   } else {
     fieldSyncStats.failed++;
     return { pushed: false, hash: storedHash };
@@ -143,16 +183,16 @@ export async function syncLeadFieldsToGHL(lead, ghlContactId, storedHash) {
  *
  * @param {number} batchSize - Not used but kept for API compat
  * @param {number} delayMs - Delay between GHL API calls in ms (default 200)
- * @returns {Object} { total, pushed, skipped, failed }
+ * @returns {Object} { total, pushed, skipped, failed, cleared }
  */
 export async function bulkFieldSync(batchSize = 100, delayMs = 200) {
   const { configured } = getConfiguredFieldCount();
   if (configured === 0) {
     console.log('[FieldSync] No GHL fields configured — skipping bulk sync');
-    return { total: 0, pushed: 0, skipped: 0, failed: 0 };
+    return { total: 0, pushed: 0, skipped: 0, failed: 0, cleared: 0 };
   }
 
-  const stats = { total: 0, pushed: 0, skipped: 0, failed: 0 };
+  const stats = { total: 0, pushed: 0, skipped: 0, failed: 0, cleared: 0 };
   const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
   try {
@@ -190,6 +230,8 @@ export async function bulkFieldSync(batchSize = 100, delayMs = 200) {
       if (result.pushed) {
         stats.pushed++;
         await sleep(delayMs);
+      } else if (result.cleared) {
+        stats.cleared++;
       } else {
         stats.skipped++;
       }
@@ -199,8 +241,8 @@ export async function bulkFieldSync(batchSize = 100, delayMs = 200) {
     stats.failed++;
   }
 
-  if (stats.pushed > 0 || stats.failed > 0) {
-    console.log(`[FieldSync] Bulk sync: ${stats.total} contacts, ${stats.pushed} pushed, ${stats.skipped} unchanged, ${stats.failed} failed`);
+  if (stats.pushed > 0 || stats.failed > 0 || stats.cleared > 0) {
+    console.log(`[FieldSync] Bulk sync: ${stats.total} contacts, ${stats.pushed} pushed, ${stats.skipped} unchanged, ${stats.failed} failed, ${stats.cleared} stale IDs cleared`);
   }
   return stats;
 }
@@ -210,7 +252,7 @@ export async function bulkFieldSync(batchSize = 100, delayMs = 200) {
  */
 export function getFieldSyncStats() {
   const stats = { ...fieldSyncStats };
-  fieldSyncStats = { checked: 0, pushed: 0, skipped: 0, failed: 0 };
+  fieldSyncStats = { checked: 0, pushed: 0, skipped: 0, failed: 0, cleared: 0 };
   return stats;
 }
 
