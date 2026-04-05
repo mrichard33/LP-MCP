@@ -1,6 +1,11 @@
 import { z } from 'zod';
 import supabase from '../supabase.js';
 
+// ─── Explicit column list for lp_leads (excludes raw_lp_data) ────
+// v2.0: raw_lp_data removed to eliminate ~5KB TOAST read per query.
+// The raw LP blob is stored on lp_prospects (one per person) not lp_leads.
+const LP_LEAD_COLUMNS = 'lp_lead_id, lp_prospect_id, ghl_contact_id, first_name, last_name, email, phone, phone_alt, address, city, state, zip, lead_source, lead_source_detail, promoter_name, ghl_intent_bucket, ghl_entry_tag, disposition_code, disposition_label, rep_name, appointment_set, appointment_date, demo_completed, demo_date, days_to_demo, closed_won, job_value, call_count, last_contact_date, created_at_lp, updated_at_lp, synced_at, ghl_tag_applied, lp_day15_triggered';
+
 // Tool 1: get_lead_summary
 export function registerLeadTools(server) {
 
@@ -17,14 +22,14 @@ export function registerLeadTools(server) {
       if (lead_id) {
         const { data } = await supabase
           .from('lp_leads')
-          .select('*')
+          .select(LP_LEAD_COLUMNS)
           .eq('lp_lead_id', lead_id)
           .single();
         lead = data;
       } else if (search) {
         const { data } = await supabase
           .from('lp_leads')
-          .select('*')
+          .select(LP_LEAD_COLUMNS)
           .or(`phone.eq.${search},email.ilike.${search},first_name.ilike.%${search}%,last_name.ilike.%${search}%`)
           .limit(1)
           .single();
