@@ -4,7 +4,7 @@
  * Layer 2 of the agentic system. Reads pending actions from agent_actions
  * and executes them against GHL, LP, GroupMe, and other systems.
  * 
- * Supported action types:
+ * Supported action types (8):
  *   add_tag              → POST /contacts/{id}/tags (additive, never PUT)
  *   remove_tag           → DELETE /contacts/{id}/tags (removes specific tag)
  *   move_opportunity     → Find opp by contact, PUT /opportunities/{oppId} with pipelineStageId
@@ -12,10 +12,11 @@
  *   create_task          → Add GHL note + GroupMe notification (GHL has no task API)
  *   send_notification    → GroupMe message to sales channel
  *   set_lp_appointment   → Push appointment to LP via SetAppointment API (Phase 2 write)
+ *   update_custom_fields → PUT /contacts/{id} with customFields array
  */
 
 import supabase from './supabase.js';
-import { applyGHLTag, addGHLNote } from './ghl.js';
+import { applyGHLTag, addGHLNote, updateGHLContactFields } from './ghl.js';
 import { setAppointment as lpSetAppointment } from './lp-client.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -131,7 +132,9 @@ async function executeRemoveFromWorkflow(action) {
 async function executeCreateTask(action) {
   const contactId = action.target_id;
   const title = action.action_payload?.title || 'Agent task';
-  await addGHLNote(contactId, `[AGENT TASK] ${title}`);
+  const description = action.action_payload?.description || '';
+  const noteText = description ? `[AGENT TASK] ${title}\n${description}` : `[AGENT TASK] ${title}`;
+  await addGHLNote(contactId, noteText);
   if (GROUPME_BOT_ID) await sendGroupMeMessage(`🤖 AGENT TASK: ${title}\nContact: ${contactId}`);
   return { action: 'note_added', contact_id: contactId, title };
 }
@@ -152,72 +155,44 @@ async function executeSetLPAppointment(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
 
-  // ─── Fetch triggering event to get appointment details ─────────
-  // The decision engine passes static template params, but can't interpolate
-  // event payload variables. So we fetch the event and pull start_time/title.
+  // Fetch triggering event for appointment details
   let eventPayload = {};
   if (action.event_id) {
-    const { data: evt } = await supabase
-      .from('system_events')
-      .select('payload')
-      .eq('id', action.event_id)
-      .maybeSingle();
-    if (evt?.payload) {
-      eventPayload = typeof evt.payload === 'string' ? JSON.parse(evt.payload) : evt.payload;
-    }
+    const { data: evt } = await supabase.from('system_events').select('payload').eq('id', action.event_id).maybeSingle();
+    if (evt?.payload) eventPayload = typeof evt.payload === 'string' ? JSON.parse(evt.payload) : evt.payload;
   }
 
-  // ─── Resolve LP Lead ID ────────────────────────────────────────
+  // Resolve LP Lead ID: payload → Supabase lp_leads → GHL custom field
   let lpLeadId = payload.lp_lead_id;
   if (!lpLeadId && contactId) {
-    const { data: lpLead } = await supabase
-      .from('lp_leads').select('lp_lead_id')
-      .eq('ghl_contact_id', contactId)
-      .order('synced_at', { ascending: false }).limit(1).maybeSingle();
-    if (lpLead?.lp_lead_id) {
-      lpLeadId = lpLead.lp_lead_id;
-    } else {
+    const { data: lpLead } = await supabase.from('lp_leads').select('lp_lead_id').eq('ghl_contact_id', contactId).order('synced_at', { ascending: false }).limit(1).maybeSingle();
+    if (lpLead?.lp_lead_id) { lpLeadId = lpLead.lp_lead_id; }
+    else {
       const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
-      const fields = ghlRes?.contact?.customFields || [];
-      const lpField = fields.find(f => f.id === 'GmAVmW6V9sekD7pVONKr');
+      const lpField = (ghlRes?.contact?.customFields || []).find(f => f.id === 'GmAVmW6V9sekD7pVONKr');
       if (lpField?.value) lpLeadId = String(lpField.value);
     }
   }
   if (!lpLeadId) throw new Error(`No LP Lead ID for contact ${contactId}`);
 
-  // ─── Resolve Appointment Date ──────────────────────────────────
-  // Priority: action payload → event payload → GHL contact fields
+  // Resolve appointment date: payload → event → GHL contact
   let rawDate = payload.appt_date || eventPayload.start_time || null;
   if (!rawDate && contactId) {
     const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
-    const c = ghlRes?.contact || {};
-    rawDate = c.last_appointment_start_date || c.lastAppointmentStartDate || null;
+    rawDate = ghlRes?.contact?.last_appointment_start_date || ghlRes?.contact?.lastAppointmentStartDate || null;
   }
   if (!rawDate) throw new Error('Cannot resolve appointment date');
 
-  // Convert to MM/DD/YYYY
   let apptDate;
-  if (rawDate.includes('-')) {
-    const datePart = rawDate.split('T')[0];
-    const [y, m, d] = datePart.split('-');
-    apptDate = `${m}/${d}/${y}`;
-  } else if (rawDate.includes('/')) {
-    apptDate = rawDate; // Already MM/DD/YYYY
-  } else {
-    apptDate = rawDate;
-  }
+  if (rawDate.includes('-')) { const [y, m, d] = rawDate.split('T')[0].split('-'); apptDate = `${m}/${d}/${y}`; }
+  else apptDate = rawDate;
 
-  // ─── Resolve Appointment Time ──────────────────────────────────
+  // Resolve appointment time: payload → event ISO → GHL contact
   let rawTime = payload.appt_time || null;
-  // Extract time from ISO start_time if available
-  if (!rawTime && eventPayload.start_time && eventPayload.start_time.includes('T')) {
-    const timePart = eventPayload.start_time.split('T')[1];
-    if (timePart) rawTime = timePart.slice(0, 5); // "14:00"
-  }
+  if (!rawTime && eventPayload.start_time?.includes('T')) rawTime = eventPayload.start_time.split('T')[1]?.slice(0, 5);
   if (!rawTime && contactId) {
     const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
-    const c = ghlRes?.contact || {};
-    rawTime = c.last_appointment_start_time || c.lastAppointmentStartTime || null;
+    rawTime = ghlRes?.contact?.last_appointment_start_time || ghlRes?.contact?.lastAppointmentStartTime || null;
   }
   if (!rawTime) throw new Error('Cannot resolve appointment time');
 
@@ -226,8 +201,7 @@ async function executeSetLPAppointment(action) {
   const match12 = apptTime.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
   if (match12) {
     let h = parseInt(match12[1], 10);
-    const min = match12[2];
-    const p = match12[3].toUpperCase();
+    const min = match12[2], p = match12[3].toUpperCase();
     if (p === 'AM' && h === 12) h = 0;
     if (p === 'PM' && h !== 12) h += 12;
     apptTime = `${String(h).padStart(2, '0')}:${min}`;
@@ -237,18 +211,35 @@ async function executeSetLPAppointment(action) {
   const setBy = payload.set_by || '5686';
   const calendarName = payload.calendar_name || eventPayload.title || 'N/A';
 
-  // ─── Call LP API ───────────────────────────────────────────────
+  // Call LP API
   const result = await lpSetAppointment({ ldsId: lpLeadId, setBy, apptDate, apptTime });
 
-  // ─── Confirm via GHL note + GroupMe ────────────────────────────
+  // Log to GHL + GroupMe
   await addGHLNote(contactId, `[LP SYNC] Appointment set in Lead Perfection\nLP Lead ID: ${lpLeadId}\nDate: ${apptDate}\nTime: ${apptTime}\nCalendar: ${calendarName}`).catch(() => {});
-
-  if (GROUPME_BOT_ID) {
-    await sendGroupMeMessage(`📅 LP Appointment Set\nLP Lead: ${lpLeadId}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName}\nContact: ${contactId}`).catch(() => {});
-  }
+  if (GROUPME_BOT_ID) await sendGroupMeMessage(`📅 LP Appointment Set\nLP Lead: ${lpLeadId}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName}\nContact: ${contactId}`).catch(() => {});
 
   console.log(`[ActionExecutor] ✅ LP appointment set: lds_id=${lpLeadId}, ${apptDate} ${apptTime}`);
   return { action: 'lp_appointment_set', lp_lead_id: lpLeadId, appt_date: apptDate, appt_time: apptTime, set_by: setBy, calendar_name: calendarName, lp_response: result, contact_id: contactId };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// GHL CUSTOM FIELD UPDATE
+// Uses updateGHLContactFields from ghl.js (PUT /contacts/{id}).
+// Payload: { fields: [{ id: "fieldId", field_value: "value" }, ...] }
+// ═══════════════════════════════════════════════════════════════════
+
+async function executeUpdateCustomFields(action) {
+  const contactId = action.target_id;
+  const fields = action.action_payload?.fields;
+  if (!contactId) throw new Error('Missing contactId');
+  if (!fields || !Array.isArray(fields) || fields.length === 0) throw new Error('Missing or empty fields array');
+
+  const result = await updateGHLContactFields(contactId, fields);
+  if (result === 'not_found') throw new Error(`GHL contact ${contactId} not found (deleted?)`);
+  if (!result) throw new Error('GHL custom field update failed');
+
+  console.log(`[ActionExecutor] ✅ Custom fields updated for ${contactId}: ${fields.length} fields`);
+  return { action: 'custom_fields_updated', contact_id: contactId, field_count: fields.length, fields: fields.map(f => f.id) };
 }
 
 // ─── GroupMe Helper ──────────────────────────────────────────────
@@ -276,6 +267,7 @@ const ACTION_HANDLERS = {
   create_task: executeCreateTask,
   send_notification: executeSendNotification,
   set_lp_appointment: executeSetLPAppointment,
+  update_custom_fields: executeUpdateCustomFields,
 };
 
 async function executeSingleAction(action) {
