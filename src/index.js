@@ -19,6 +19,8 @@ import { registerActionExecutorRoutes } from './action-executor.js';
 import { registerContextBuilderRoutes } from './context-builder.js';
 import { registerBehavioralEmitterRoutes } from './behavioral-emitter.js';
 import { registerMessageAnalyzerRoutes } from './message-analyzer.js';
+// ─── Layer 3.5: Intent Scoring + Conversion Engine ───────────────
+import { registerIntentScorerRoutes } from './intent-scorer.js';
 
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -46,14 +48,14 @@ function authenticate(req, res, next) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', server: 'lp-mcp-server', version: '6.0.0', port: PORT });
+  res.json({ status: 'ok', server: 'lp-mcp-server', version: '6.1.0', port: PORT });
 });
 
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     server: 'lp-mcp-server',
-    version: '6.0.0',
+    version: '6.1.0',
     uptime: process.uptime(),
     active_sessions: Object.keys(streamableSessions).length,
     lp_config: {
@@ -100,6 +102,11 @@ app.get('/health', (req, res) => {
         'POST /webhook/ghl/workflow',
       ],
     },
+    intent_scoring: {
+      score_contact: 'POST /n8n/intent/score',
+      stall_sweep: 'POST /n8n/intent/sweep',
+      breakdown: 'GET /n8n/intent/breakdown?contactId=...',
+    },
     anthropic: process.env.ANTHROPIC_API_KEY ? 'configured' : 'MISSING',
     railway: {
       api_token:  process.env.RAILWAY_API_TOKEN  ? 'set' : 'MISSING',
@@ -122,7 +129,7 @@ function isInitializeRequest(body) {
 
 function createMCPSession() {
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID() });
-  const sessionServer = new McpServer({ name: 'lp-mcp-server', version: '6.0.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
+  const sessionServer = new McpServer({ name: 'lp-mcp-server', version: '6.1.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
   registerAllTools(sessionServer);
   return { transport, server: sessionServer };
 }
@@ -154,7 +161,7 @@ app.delete('/mcp', authenticate, async (req, res) => { const s = req.headers['mc
 const sseSessions = {};
 app.get('/sse', authenticate, async (req, res) => {
   const transport = new SSEServerTransport('/messages', res);
-  const ss = new McpServer({ name: 'lp-mcp-server', version: '6.0.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
+  const ss = new McpServer({ name: 'lp-mcp-server', version: '6.1.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
   registerAllTools(ss); sseSessions[transport.sessionId] = { transport, server: ss };
   res.on('close', () => { delete sseSessions[transport.sessionId]; }); await ss.connect(transport);
 });
@@ -216,13 +223,17 @@ registerContextBuilderRoutes(app);
 registerBehavioralEmitterRoutes(app);
 registerMessageAnalyzerRoutes(app);
 
+// ─── Layer 3.5: Intent Scoring + Conversion Engine ───────────────
+registerIntentScorerRoutes(app);
+
 app.listen(PORT, () => {
-  console.log(`LP MCP Server v6.0.0 running on port ${PORT}`);
+  console.log(`LP MCP Server v6.1.0 running on port ${PORT}`);
   console.log(`n8n APIs:     POST /n8n/enrich-lead | /n8n/refresh-token | /n8n/prospect-lookup | /n8n/time-to-appointment`);
   console.log(`Avatar APIs:  POST /n8n/avatar/score | /parse-gpt | /unified-inputs | /pick-best | /build-ghl | /build-notion`);
   console.log(`Decision:     POST /n8n/decision-engine/process | /execute | GET /status | /execution-stats`);
   console.log(`Layer 3:      POST /webhook/ghl/{reply,appointment,engagement,lead-score,workflow}`);
   console.log(`Intelligence: GET /n8n/lead-intelligence/context | POST /n8n/analyze-pending-replies | /n8n/analyze-message`);
+  console.log(`Intent:       POST /n8n/intent/score | /n8n/intent/sweep | GET /n8n/intent/breakdown`);
   console.log(`MCP:          http://localhost:${PORT}/mcp`);
   console.log(`Health:       http://localhost:${PORT}/health`);
   initFieldSync();
