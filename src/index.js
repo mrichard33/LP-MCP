@@ -15,6 +15,10 @@ import { registerN8nHelperRoutes } from './n8n-helpers.js';
 import { registerN8nAvatarRoutes } from './n8n-avatar.js';
 import { registerDecisionEngineRoutes } from './decision-engine.js';
 import { registerActionExecutorRoutes } from './action-executor.js';
+// ─── Layer 3: Behavioral Intelligence ────────────────────────────
+import { registerContextBuilderRoutes } from './context-builder.js';
+import { registerBehavioralEmitterRoutes } from './behavioral-emitter.js';
+import { registerMessageAnalyzerRoutes } from './message-analyzer.js';
 
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -42,14 +46,14 @@ function authenticate(req, res, next) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', server: 'lp-mcp-server', version: '5.9.0', port: PORT });
+  res.json({ status: 'ok', server: 'lp-mcp-server', version: '6.0.0', port: PORT });
 });
 
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     server: 'lp-mcp-server',
-    version: '5.9.0',
+    version: '6.0.0',
     uptime: process.uptime(),
     active_sessions: Object.keys(streamableSessions).length,
     lp_config: {
@@ -81,6 +85,22 @@ app.get('/health', (req, res) => {
       execution_stats: 'GET /n8n/decision-engine/execution-stats',
       reload_rules: 'POST /n8n/decision-engine/reload-rules',
     },
+    layer3_behavioral: {
+      context: 'GET /n8n/lead-intelligence/context?contactId=...',
+      intelligence: 'GET /n8n/lead-intelligence/intelligence?contactId=...',
+      cache_stats: 'GET /n8n/lead-intelligence/cache-stats',
+      analyze_pending: 'POST /n8n/analyze-pending-replies',
+      analyze_manual: 'POST /n8n/analyze-message',
+      analyzer_status: 'GET /n8n/analyzer-status',
+      webhooks: [
+        'POST /webhook/ghl/reply',
+        'POST /webhook/ghl/appointment',
+        'POST /webhook/ghl/engagement',
+        'POST /webhook/ghl/lead-score',
+        'POST /webhook/ghl/workflow',
+      ],
+    },
+    anthropic: process.env.ANTHROPIC_API_KEY ? 'configured' : 'MISSING',
     railway: {
       api_token:  process.env.RAILWAY_API_TOKEN  ? 'set' : 'MISSING',
       service_id: process.env.RAILWAY_SERVICE_ID ? 'set' : 'MISSING',
@@ -102,7 +122,7 @@ function isInitializeRequest(body) {
 
 function createMCPSession() {
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID() });
-  const sessionServer = new McpServer({ name: 'lp-mcp-server', version: '5.9.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
+  const sessionServer = new McpServer({ name: 'lp-mcp-server', version: '6.0.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
   registerAllTools(sessionServer);
   return { transport, server: sessionServer };
 }
@@ -134,7 +154,7 @@ app.delete('/mcp', authenticate, async (req, res) => { const s = req.headers['mc
 const sseSessions = {};
 app.get('/sse', authenticate, async (req, res) => {
   const transport = new SSEServerTransport('/messages', res);
-  const ss = new McpServer({ name: 'lp-mcp-server', version: '5.9.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
+  const ss = new McpServer({ name: 'lp-mcp-server', version: '6.0.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
   registerAllTools(ss); sseSessions[transport.sessionId] = { transport, server: ss };
   res.on('close', () => { delete sseSessions[transport.sessionId]; }); await ss.connect(transport);
 });
@@ -191,11 +211,18 @@ registerN8nAvatarRoutes(app);
 registerDecisionEngineRoutes(app);
 registerActionExecutorRoutes(app);
 
+// ─── Layer 3: Behavioral Intelligence ────────────────────────────
+registerContextBuilderRoutes(app);
+registerBehavioralEmitterRoutes(app);
+registerMessageAnalyzerRoutes(app);
+
 app.listen(PORT, () => {
-  console.log(`LP MCP Server v5.9 running on port ${PORT}`);
+  console.log(`LP MCP Server v6.0.0 running on port ${PORT}`);
   console.log(`n8n APIs:     POST /n8n/enrich-lead | /n8n/refresh-token | /n8n/prospect-lookup | /n8n/time-to-appointment`);
   console.log(`Avatar APIs:  POST /n8n/avatar/score | /parse-gpt | /unified-inputs | /pick-best | /build-ghl | /build-notion`);
   console.log(`Decision:     POST /n8n/decision-engine/process | /execute | GET /status | /execution-stats`);
+  console.log(`Layer 3:      POST /webhook/ghl/{reply,appointment,engagement,lead-score,workflow}`);
+  console.log(`Intelligence: GET /n8n/lead-intelligence/context | POST /n8n/analyze-pending-replies | /n8n/analyze-message`);
   console.log(`MCP:          http://localhost:${PORT}/mcp`);
   console.log(`Health:       http://localhost:${PORT}/health`);
   initFieldSync();
