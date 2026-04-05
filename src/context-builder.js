@@ -105,32 +105,72 @@ async function fetchGHLContact(contactId) {
 }
 
 /**
+ * Extract messages array from GHL Conversations API response.
+ * The API returns different shapes depending on version/endpoint:
+ *   - { messages: [ ... ] }              ← direct array
+ *   - { messages: { messages: [ ... ] } } ← nested with pagination
+ *   - [ ... ]                             ← raw array
+ */
+function extractMessages(msgData) {
+  if (!msgData) return [];
+
+  // Shape 1: Direct array at top level
+  if (Array.isArray(msgData)) return msgData;
+
+  // Shape 2: { messages: [ ... ] } — direct array
+  if (Array.isArray(msgData.messages)) return msgData.messages;
+
+  // Shape 3: { messages: { messages: [ ... ] } } — nested with pagination metadata
+  if (msgData.messages && typeof msgData.messages === 'object') {
+    if (Array.isArray(msgData.messages.messages)) return msgData.messages.messages;
+    // Try iterating values — some GHL versions use different key names
+    const values = Object.values(msgData.messages);
+    const arr = values.find(v => Array.isArray(v));
+    if (arr) return arr;
+  }
+
+  // Shape 4: { data: [ ... ] }
+  if (Array.isArray(msgData.data)) return msgData.data;
+
+  console.warn('[ContextBuilder] Could not extract messages array from GHL response:', JSON.stringify(msgData).slice(0, 200));
+  return [];
+}
+
+/**
  * Fetch recent conversation messages from GHL Conversations API.
  * Returns last N messages (both inbound and outbound).
+ * 
+ * Wrapped in try-catch — conversation context is supplementary.
+ * If it fails, analysis proceeds without conversation history.
  */
 async function fetchConversation(contactId, limit = 10) {
-  // Step 1: Find conversation for this contact
-  const searchData = await ghlFetch('GET',
-    `/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`);
+  try {
+    // Step 1: Find conversation for this contact
+    const searchData = await ghlFetch('GET',
+      `/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`);
 
-  // GHL Conversations API returns array directly
-  const conversations = Array.isArray(searchData) ? searchData : (searchData?.conversations || []);
-  if (!conversations.length) return [];
+    // GHL Conversations API returns array directly or { conversations: [...] }
+    const conversations = Array.isArray(searchData) ? searchData : (searchData?.conversations || []);
+    if (!conversations.length) return [];
 
-  const conversationId = conversations[0].id;
+    const conversationId = conversations[0].id;
 
-  // Step 2: Get messages from the conversation
-  const msgData = await ghlFetch('GET',
-    `/conversations/${conversationId}/messages?limit=${limit}`);
+    // Step 2: Get messages from the conversation
+    const msgData = await ghlFetch('GET',
+      `/conversations/${conversationId}/messages?limit=${limit}`);
 
-  const messages = msgData?.messages || [];
+    const messages = extractMessages(msgData);
 
-  return messages.map(m => ({
-    direction: m.direction === 1 ? 'inbound' : 'outbound',
-    text: m.body || m.message || '',
-    type: m.contentType || m.type || 'text',
-    timestamp: m.dateAdded || m.createdAt || null,
-  })).reverse(); // Oldest first
+    return messages.map(m => ({
+      direction: m.direction === 1 || m.direction === 'inbound' ? 'inbound' : 'outbound',
+      text: m.body || m.message || '',
+      type: m.contentType || m.type || 'text',
+      timestamp: m.dateAdded || m.createdAt || null,
+    })).reverse(); // Oldest first
+  } catch (err) {
+    console.error(`[ContextBuilder] fetchConversation failed for ${contactId}:`, err.message);
+    return []; // Non-fatal — analysis proceeds without conversation history
+  }
 }
 
 /**
@@ -187,7 +227,7 @@ async function fetchOpportunity(contactId) {
   return {
     id: opp.id,
     pipelineId: opp.pipelineId,
-    pipelineStageName: opp.pipelineStageId, // We'll map this below
+    pipelineStageName: opp.pipelineStageId,
     status: opp.status,
     value: opp.monetaryValue || 0,
     lastStatusChangeAt: opp.lastStatusChangeAt || opp.updatedAt || null,
