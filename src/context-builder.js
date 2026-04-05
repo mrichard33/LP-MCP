@@ -83,6 +83,23 @@ async function ghlFetch(method, path) {
 // DATA FETCHERS
 // ═══════════════════════════════════════════════════════════════════
 
+/**
+ * Extract GHL lead score from contact data.
+ * GHL stores scores in a `scoring` object keyed by score config ID:
+ *   { "69012aac21a6a2c83d334d96": 36 }
+ * NOT as a flat `leadScore` field.
+ */
+function extractLeadScore(contact) {
+  // Try scoring object first (GHL's actual format)
+  const scoringObj = contact.scoring;
+  if (scoringObj && typeof scoringObj === 'object') {
+    const scores = Object.values(scoringObj).filter(v => typeof v === 'number');
+    if (scores.length > 0) return Math.max(...scores);
+  }
+  // Fallback to flat fields (legacy or API version differences)
+  return parseInt(contact.leadScore || contact.lead_score || 0, 10) || 0;
+}
+
 async function fetchGHLContact(contactId) {
   const data = await ghlFetch('GET', `/contacts/${contactId}`);
   if (!data?.contact) return null;
@@ -93,7 +110,7 @@ async function fetchGHLContact(contactId) {
     email: c.email || null,
     phone: c.phone || null,
     tags: c.tags || [],
-    leadScore: c.leadScore || c.lead_score || 0,
+    leadScore: extractLeadScore(c),
     customFields: c.customFields || c.customField || [],
     dateAdded: c.dateAdded || c.createdAt || null,
   };
@@ -149,10 +166,6 @@ async function fetchLeadIntelligence(contactId) {
   return data;
 }
 
-/**
- * Fetch LP lead data including raw_lp_data (notes, calls, appointments).
- * Uses correct lp_leads column names verified from schema.
- */
 async function fetchLPLead(contactId) {
   const { data, error } = await supabase
     .from('lp_leads')
@@ -187,13 +200,9 @@ async function fetchOpportunity(contactId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// LP DATA EXTRACTORS (from raw_lp_data JSONB)
+// LP DATA EXTRACTORS
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * Extract notes from raw LP data. These are rep notes, confirmer notes,
- * and system notes — critical context for AI analysis.
- */
 function extractLPNotes(rawData, limit = 5) {
   if (!rawData) return [];
   const notes = rawData.notes;
@@ -206,10 +215,6 @@ function extractLPNotes(rawData, limit = 5) {
   })).filter(n => n.text.length > 0);
 }
 
-/**
- * Extract recent call history from raw LP data.
- * Includes result codes (Confirmed, No Answer, etc.) and call types.
- */
 function extractLPCalls(rawData, limit = 5) {
   if (!rawData) return [];
   const calls = rawData.calls;
@@ -231,34 +236,19 @@ function parseEntrySource(tags) {
   const entryTag = tags.find(t => t.startsWith('entry:'));
   return entryTag ? entryTag.replace('entry:', '') : null;
 }
-
-function parseStageTag(tags) {
-  return tags.find(t => t.startsWith('stage:')) || null;
-}
-
-function parseBuyerTag(tags) {
-  return tags.find(t => t.startsWith('buyer:')) || null;
-}
-
-function parseBuyerJourneyTag(tags) {
-  return tags.find(t => t.startsWith('bj:')) || null;
-}
-
+function parseStageTag(tags) { return tags.find(t => t.startsWith('stage:')) || null; }
+function parseBuyerTag(tags) { return tags.find(t => t.startsWith('buyer:')) || null; }
+function parseBuyerJourneyTag(tags) { return tags.find(t => t.startsWith('bj:')) || null; }
 function parseObjectionTags(tags) {
   return tags
     .filter(t => t.startsWith('objection:') || t.startsWith('objection-confirmed-') || t.startsWith('pre-demo-concern:'))
     .map(t => t.replace('objection:', '').replace('objection-confirmed-', '').replace('pre-demo-concern:', ''));
 }
-
-function parseSuppressionTags(tags) {
-  return tags.filter(t => t.startsWith('suppress:') || t.startsWith('hold:'));
-}
+function parseSuppressionTags(tags) { return tags.filter(t => t.startsWith('suppress:') || t.startsWith('hold:')); }
 
 function calculateDaysInStage(opportunity) {
   if (!opportunity?.lastStatusChangeAt) return 0;
-  const changed = new Date(opportunity.lastStatusChangeAt);
-  const now = new Date();
-  return Math.floor((now - changed) / (1000 * 60 * 60 * 24));
+  return Math.floor((new Date() - new Date(opportunity.lastStatusChangeAt)) / (1000 * 60 * 60 * 24));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -316,7 +306,6 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       last_status_change: opportunity?.lastStatusChangeAt || null,
     },
 
-    // ─── LP Data (enriched with notes + calls from raw_lp_data) ──
     lp: {
       matched: !!lpLead,
       lead_id: lpLead?.lp_lead_id || null,
