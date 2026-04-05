@@ -7,12 +7,19 @@
  * Queries across:
  *   - GHL API (contact data, tags, lead score, conversations)
  *   - Supabase lead_intelligence (AI analysis history, engagement tracking)
- *   - Supabase lp_leads (LP disposition, notes, calls, appointment, rep data)
+ *   - Supabase lp_leads (LP disposition, appointment, rep data)
+ *   - Supabase lp_notes + lp_call_logs (normalized child tables)
  * 
  * Returns a structured context object ready for AI analysis or rule evaluation.
  * 
  * Caching: Per-contact context cached for 5 minutes to avoid hammering GHL API
  * during burst processing (e.g. 1,500 lead release through W0.0).
+ * 
+ * v2.0 — DISK I/O OPTIMIZATION: Notes and calls now read from normalized
+ * lp_notes and lp_call_logs tables instead of raw_lp_data JSONB blob.
+ * This eliminates ~1.4GB of TOAST reads and provides BETTER data (the
+ * normalized tables contain ALL synced records, not just the latest API snapshot).
+ * raw_lp_data removed from lp_leads SELECT entirely.
  */
 
 import supabase from './supabase.js';
@@ -166,10 +173,11 @@ async function fetchLeadIntelligence(contactId) {
   return data;
 }
 
+// v2.0: raw_lp_data removed from SELECT — notes/calls come from normalized tables
 async function fetchLPLead(contactId) {
   const { data, error } = await supabase
     .from('lp_leads')
-    .select('id, lp_lead_id, lp_prospect_id, first_name, last_name, disposition_code, disposition_label, rep_name, promoter_name, lead_source, lead_source_detail, call_count, last_call_date, appointment_set, appointment_date, demo_completed, demo_date, days_to_demo, closed_won, job_value, created_at_lp, raw_lp_data')
+    .select('id, lp_lead_id, lp_prospect_id, first_name, last_name, disposition_code, disposition_label, rep_name, promoter_name, lead_source, lead_source_detail, call_count, last_call_date, appointment_set, appointment_date, demo_completed, demo_date, days_to_demo, closed_won, job_value, created_at_lp')
     .eq('ghl_contact_id', contactId)
     .order('synced_at', { ascending: false })
     .limit(1)
@@ -179,6 +187,56 @@ async function fetchLPLead(contactId) {
     return null;
   }
   return data;
+}
+
+// v2.0: Read notes from normalized lp_notes table (replaces extractLPNotes from raw blob)
+async function fetchLPNotes(lpLeadId, limit = 5) {
+  if (!lpLeadId) return [];
+  try {
+    const { data, error } = await supabase
+      .from('lp_notes')
+      .select('note_body, note_category, created_by_rep_name, created_at_lp')
+      .eq('lp_lead_id', lpLeadId)
+      .not('note_body', 'is', null)
+      .order('created_at_lp', { ascending: false })
+      .limit(limit);
+    if (error || !data) return [];
+    return data
+      .map(n => ({
+        text: (n.note_body || '').trim(),
+        category: n.note_category || 'General',
+        entered_by: n.created_by_rep_name || '',
+        date: n.created_at_lp || '',
+      }))
+      .filter(n => n.text.length > 0);
+  } catch (err) {
+    console.warn(`[ContextBuilder] lp_notes fetch failed for ${lpLeadId}:`, err.message);
+    return [];
+  }
+}
+
+// v2.0: Read calls from normalized lp_call_logs table (replaces extractLPCalls from raw blob)
+async function fetchLPCalls(lpLeadId, limit = 5) {
+  if (!lpLeadId) return [];
+  try {
+    const { data, error } = await supabase
+      .from('lp_call_logs')
+      .select('call_result, call_direction, rep_name, call_date, lp_lead_id')
+      .eq('lp_lead_id', lpLeadId)
+      .order('call_date', { ascending: false })
+      .limit(limit);
+    if (error || !data) return [];
+    return data.map(c => ({
+      result: c.call_result || '',
+      type: c.call_direction || '',
+      agent: c.rep_name || '',
+      date: c.call_date || '',
+      phone: '',
+    }));
+  } catch (err) {
+    console.warn(`[ContextBuilder] lp_call_logs fetch failed for ${lpLeadId}:`, err.message);
+    return [];
+  }
 }
 
 async function fetchOpportunity(contactId) {
@@ -197,35 +255,6 @@ async function fetchOpportunity(contactId) {
     value: opp.monetaryValue || 0,
     lastStatusChangeAt: opp.lastStatusChangeAt || opp.updatedAt || null,
   };
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// LP DATA EXTRACTORS
-// ═══════════════════════════════════════════════════════════════════
-
-function extractLPNotes(rawData, limit = 5) {
-  if (!rawData) return [];
-  const notes = rawData.notes;
-  if (!Array.isArray(notes)) return [];
-  return notes.slice(0, limit).map(n => ({
-    text: (n.note || '').trim(),
-    category: n.category || 'General',
-    entered_by: n.enteredby || '',
-    date: n.enteredon || '',
-  })).filter(n => n.text.length > 0);
-}
-
-function extractLPCalls(rawData, limit = 5) {
-  if (!rawData) return [];
-  const calls = rawData.calls;
-  if (!Array.isArray(calls)) return [];
-  return calls.slice(0, limit).map(c => ({
-    result: c.resultdescr || c.resultcode || '',
-    type: c.calltypedescr || c.calltype || '',
-    agent: c.agentname || '',
-    date: c.calldatetime || '',
-    phone: c.phone || '',
-  }));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -270,10 +299,13 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     fetchOpportunity(ghlContactId),
   ]);
 
-  let conversation = [];
-  if (includeConversation && ghlContact) {
-    conversation = await fetchConversation(ghlContactId, 10);
-  }
+  // v2.0: Fetch notes and calls from normalized tables (parallel with conversation)
+  const lpLeadId = lpLead?.lp_lead_id || null;
+  const [conversation, lpNotes, lpCalls] = await Promise.all([
+    (includeConversation && ghlContact) ? fetchConversation(ghlContactId, 10) : [],
+    fetchLPNotes(lpLeadId),
+    fetchLPCalls(lpLeadId),
+  ]);
 
   const tags = ghlContact?.tags || [];
   const daysInStage = calculateDaysInStage(opportunity);
@@ -325,8 +357,8 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       job_value: lpLead?.job_value || null,
       call_count: lpLead?.call_count || 0,
       last_call_date: lpLead?.last_call_date || null,
-      notes: extractLPNotes(lpLead?.raw_lp_data),
-      recent_calls: extractLPCalls(lpLead?.raw_lp_data),
+      notes: lpNotes,
+      recent_calls: lpCalls,
     },
 
     intelligence: {
@@ -365,8 +397,8 @@ export async function buildLeadContext(ghlContactId, options = {}) {
         ghl_contact: !!ghlContact,
         lead_intelligence: !!intelligence,
         lp_lead: !!lpLead,
-        lp_notes: extractLPNotes(lpLead?.raw_lp_data).length > 0,
-        lp_calls: extractLPCalls(lpLead?.raw_lp_data).length > 0,
+        lp_notes: lpNotes.length > 0,
+        lp_calls: lpCalls.length > 0,
         opportunity: !!opportunity,
         conversation: conversation.length > 0,
       },
