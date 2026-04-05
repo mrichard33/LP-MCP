@@ -17,6 +17,10 @@
  *   - ghl.reply_received (pending_analysis) → triggers Message Analyzer, NOT rules
  *   - ai.analysis_completed → matched against contextual rules using lead_intelligence
  *   - intent.* events → processed by rules but do NOT trigger re-scoring (loop prevention)
+ *
+ * v2.1 — BUGFIX: Skip GHL actions when ghl_contact_id is null. Previously,
+ * entity_id (LP lead ID) was used as fallback, causing 813 failed actions
+ * against GHL API with numeric LP IDs instead of alphanumeric GHL IDs.
  */
 
 import supabase from './supabase.js';
@@ -146,11 +150,35 @@ async function createActionsFromRule(event, rule) {
   const actions = Array.isArray(rule.action_template) ? rule.action_template : [rule.action_template];
   const batchId = `evt_${event.id}_rule_${rule.rule_key}_${Date.now()}`;
   const created = [];
+
   for (let i = 0; i < actions.length; i++) {
     const tmpl = actions[i];
+    const targetSystem = tmpl.target_system || 'ghl';
+
+    // ─── v2.1 GUARD: Skip GHL actions when no GHL contact ID ────
+    // When ghl_contact_id is null, the lead exists only in LP — there's
+    // no GHL contact to tag, move, or update. Previously this fell back
+    // to entity_id (the LP lead ID), causing 100% failure rate.
+    if (targetSystem === 'ghl' && !event.ghl_contact_id) {
+      console.log(`[DecisionEngine] Skipped GHL action ${tmpl.action_type} for event ${event.id} — no GHL contact (LP lead ${event.entity_id})`);
+      // Record as skipped for audit trail
+      await supabase.from('agent_actions').insert({
+        event_id: event.id, action_type: tmpl.action_type, target_system: targetSystem,
+        target_entity: tmpl.target_entity || 'contact', target_id: event.entity_id || '',
+        action_payload: tmpl.params || tmpl.payload || {},
+        reasoning: `Rule ${rule.rule_key}: ${rule.rule_name} — SKIPPED: no GHL contact match`,
+        confidence: 0, rule_applied: rule.rule_key,
+        status: 'skipped', requires_approval: false,
+        batch_id: batchId, sequence_order: i,
+        error_message: `No GHL contact ID — LP lead ${event.entity_id} not matched to GHL`,
+      });
+      continue;
+    }
+
     const targetId = event.ghl_contact_id || event.entity_id || '';
+
     const { data, error } = await supabase.from('agent_actions').insert({
-      event_id: event.id, action_type: tmpl.action_type, target_system: tmpl.target_system || 'ghl',
+      event_id: event.id, action_type: tmpl.action_type, target_system: targetSystem,
       target_entity: tmpl.target_entity || 'contact', target_id: targetId,
       action_payload: tmpl.params || tmpl.payload || {},
       reasoning: `Rule ${rule.rule_key}: ${rule.rule_name}`, confidence: 1.0,
