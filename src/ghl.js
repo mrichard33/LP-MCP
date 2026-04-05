@@ -27,6 +27,16 @@ const ghlClient = GHL_API_KEY ? axios.create({
   timeout: 10000,
 }) : null;
 
+// ─── "Contact not found" detection helper ────────────────────────
+// GHL returns 400 with "Contact not found" or "Contact with id X not found"
+// when a contact has been deleted. This is NOT a transient error — retrying
+// will never succeed. Callers should clear the stale ghl_contact_id.
+function isContactNotFound(err) {
+  if (err.response?.status !== 400) return false;
+  const body = JSON.stringify(err.response?.data || '').toLowerCase();
+  return body.includes('not found');
+}
+
 // Search GHL contact by phone or email (v2 API)
 // NOTE: locationId is ONLY needed here — for GET /contacts/ search queries.
 // It must NOT be included in PUT/POST bodies to contact-specific endpoints.
@@ -89,6 +99,11 @@ export async function applyGHLTag(ghlContactId, tag) {
     ghlFailCount = 0;
     return true;
   } catch (err) {
+    // v2.1: "Contact not found" is not a transient error — don't count toward disable threshold
+    if (isContactNotFound(err)) {
+      console.warn(`[GHL] Tag apply: contact ${ghlContactId} not found (deleted?) — skipping`);
+      return false;
+    }
     ghlFailCount++;
     const status = err.response?.status || 'no response';
     if (ghlFailCount === 1) {
@@ -111,9 +126,13 @@ export async function applyGHLTag(ghlContactId, tag) {
 // all tags on the contact. We only pass customFields, which is additive.
 // CRITICAL: Never include 'locationId' — GHL v2 API rejects it with 422.
 //
+// v2.1: Returns 'not_found' when GHL returns 400 "Contact not found"
+// (deleted contact). Callers should clear the stale ghl_contact_id.
+// Returns true on success, false on generic failure, 'not_found' on deleted contact.
+//
 // @param {string} ghlContactId - GHL contact ID
 // @param {Array} customFields - Array of { id, field_value } objects
-// @returns {boolean} true on success
+// @returns {boolean|string} true on success, false on error, 'not_found' on deleted contact
 
 export async function updateGHLContactFields(ghlContactId, customFields) {
   if (ghlDisabled || !ghlClient || !ghlContactId) return false;
@@ -131,6 +150,12 @@ export async function updateGHLContactFields(ghlContactId, customFields) {
     }
     return true;
   } catch (err) {
+    // v2.1: "Contact not found" is permanent — return distinct value so callers can clean up
+    if (isContactNotFound(err)) {
+      console.warn(`[GHL] Field update: contact ${ghlContactId} not found (deleted?) — returning 'not_found'`);
+      return 'not_found';
+    }
+
     ghlFailCount++;
     const status = err.response?.status || 'no response';
     if (ghlFailCount === 1) {
@@ -171,6 +196,11 @@ export async function addGHLNote(ghlContactId, noteBody) {
 
     return data || { success: true };
   } catch (err) {
+    // v2.1: "Contact not found" is not transient
+    if (isContactNotFound(err)) {
+      console.warn(`[GHL] Note add: contact ${ghlContactId} not found (deleted?) — skipping`);
+      return null;
+    }
     ghlFailCount++;
     const status = err.response?.status || 'no response';
     if (ghlFailCount === 1) {
