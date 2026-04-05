@@ -336,6 +336,10 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null) 
       entry_source: context.lead?.entry_source || null,
       current_stage_tag: context.lead?.current_stage_tag || null,
       current_buyer_tag: context.lead?.current_buyer_tag || null,
+      // Mirror pipeline + score context (fixes blank fields in lead_intelligence)
+      lead_score: context.engagement?.lead_score || 0,
+      stage_entered_at: context.pipeline?.last_status_change || null,
+      days_in_current_stage: context.pipeline?.days_in_stage || 0,
     });
 
     // 6. Emit ai.analysis_completed event for Decision Engine
