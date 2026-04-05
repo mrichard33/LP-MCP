@@ -4,17 +4,10 @@
  * The PROACTIVE layer. Runs on every behavioral event to:
  * 
  *   1. SPIKE DETECTION (Hot Window Protocol)
- *      Count events per contact in 30-min windows. 2+ events = buying window.
- * 
  *   2. INTENT SCORING (Composite Score 0-100)
- *      Stacks signals from LP, GHL, AI analysis, engagement, and timing.
- * 
  *   3. TIER CLASSIFICATION + TRANSITION DETECTION
- *      cold (0-20) → warm (21-50) → hot (51-80) → imminent (81+)
- * 
  *   4. PATTERN MATCHING (Compound Signal Detection)
- * 
- *   5. CLOSER ASSISTANT (Rep Briefing Generator)
+ *   5. CLOSER ASSISTANT (Decision Ownership + Loss Framing)
  * 
  * Philosophy: "Predict → Intercept → Close"
  */
@@ -155,7 +148,15 @@ function classifyBarrier(intelligence, context) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// 5. CLOSER ASSISTANT — Rep Briefing
+// 5. CLOSER ASSISTANT — Decision Ownership + Loss Framing
+//
+// This is NOT "here's how to approach." This is "here's how to LEAD
+// the decision." Every briefing includes:
+//   SAY FIRST  — The opening frame (assume the decision, own the path)
+//   ASSUME     — What's already decided (never ask IF, ask WHEN)
+//   AVOID      — What kills the deal
+//   PUSH       — The close line
+//   LOSS FRAME — What happens if they DON'T act
 // ═══════════════════════════════════════════════════════════════════
 
 function generateRepBriefing(intelligence, context) {
@@ -163,21 +164,71 @@ function generateRepBriefing(intelligence, context) {
   const objection = intelligence?.objection_type;
   const source = intelligence?.entry_source || context?.lead?.entry_source || 'unknown';
   const demoCompleted = context?.lp?.demo_completed || false;
-  parts.push(`LEAD: ${context?.lead?.name || 'Unknown'} | Source: ${source} | Stage ${intelligence?.buyer_stage || '?'}`);
-  if (context?.lp?.rep_name) parts.push(`Assigned Rep: ${context.lp.rep_name}`);
+  const isImminent = (intelligence?.intent_score || 0) >= 80 || intelligence?.fast_track_eligible;
 
-  if (objection === 'price') parts.push('APPROACH: Lead with financing + ROI. "Most clients pay less per month than their cable bill." Use SA3 — someone saved $500 upfront, spent $15K fixing water damage.');
-  else if (objection === 'spouse') parts.push('APPROACH: "Best if both decision-makers are present — can we find a time for both of you?" Offer evening/weekend.');
-  else if (objection === 'timing') parts.push('APPROACH: Don\'t push timeline. "The process takes 8-12 weeks from order to install. Getting measured now means you\'re ready before next hurricane season."');
-  else if (objection === 'competitor') parts.push('APPROACH: Don\'t trash competitors. "We never use subcontractors — every installer is our employee. Ask the other company who actually installs." 50-year track record.');
-  else if (objection === 'trust') parts.push('APPROACH: Authority first. "We\'ve been doing this since 1972. Randy Reece\'s family. We\'re not going anywhere." Offer to show local projects.');
-  else if (objection === 'diy') parts.push('APPROACH: "Incorrect installation voids the warranty AND your insurance rating. One mistake and you\'re unprotected." Lead with code compliance.');
-  else if (demoCompleted) parts.push('APPROACH: Demo already ran. Follow up on specific concerns. Personalize — don\'t re-pitch.');
-  else parts.push('APPROACH: Discovery mode. Find the emotional driver. Listen more than talk.');
+  parts.push(`LEAD: ${context?.lead?.name || 'Unknown'} | Source: ${source} | Stage ${intelligence?.buyer_stage || '?'} | Score: ${intelligence?.intent_score || 0}`);
+  if (context?.lp?.rep_name) parts.push(`Rep: ${context.lp.rep_name}`);
 
-  if (context?.lp?.notes?.length) parts.push(`REP NOTES: ${context.lp.notes.slice(0, 2).map(n => '"' + n.text + '"').join(' | ')}`);
-  if (intelligence?.fast_track_eligible || (intelligence?.intent_score || 0) >= 80)
-    parts.push('⚡ READY TO CLOSE. Be assumptive: "I\'ve got [time] open — let\'s get you on the schedule." Don\'t ask IF — ask WHEN.');
+  if (objection === 'price') {
+    parts.push('SAY FIRST: "Based on what you told us, I put together a few options — one that fits most budgets."');
+    parts.push('ASSUME: They want this. Price is the last barrier, not a dealbreaker.');
+    parts.push('AVOID: Never say "I understand it\'s expensive." That validates the objection.');
+    parts.push('PUSH: "Most clients pay less per month than their cable bill. Want me to show you the breakdown?"');
+    parts.push('LOSS FRAME: "Material costs reset quarterly — if we don\'t lock pricing now, your quote shifts with the next cycle."');
+  } else if (objection === 'spouse') {
+    parts.push('SAY FIRST: "We find the best results happen when both decision-makers see the options together."');
+    parts.push('ASSUME: Both people will be present. Frame it as obvious, not optional.');
+    parts.push('AVOID: Never say "Do you need to check with your spouse?" — that gives them an exit.');
+    parts.push('PUSH: "I\'ve got an evening slot Thursday or Saturday morning — which works for both of you?"');
+    parts.push('LOSS FRAME: "The longer this sits, the harder it is to coordinate — let\'s get it on the calendar while we\'re both thinking about it."');
+  } else if (objection === 'timing') {
+    parts.push('SAY FIRST: "I totally get it — most people start this process 8-12 weeks before they actually need it done."');
+    parts.push('ASSUME: They ARE doing this, just not sure when. Reframe "later" as "now is actually later."');
+    parts.push('AVOID: Never push a hard deadline they didn\'t set themselves.');
+    parts.push('PUSH: "Getting measured now means you\'re ready before next hurricane season — and pricing is locked at today\'s rate."');
+    parts.push('LOSS FRAME: "Every month you wait is a month closer to season with no protection. And material lead times only get longer."');
+  } else if (objection === 'competitor') {
+    parts.push('SAY FIRST: "Smart to compare — most of our clients did exactly that. Here\'s what they found."');
+    parts.push('ASSUME: They\'re comparing because they\'re serious. That\'s Stage 3 — close to buying.');
+    parts.push('AVOID: Never trash the competitor by name. Never say "they\'re bad." Position, don\'t attack.');
+    parts.push('PUSH: "We never use subcontractors — every installer is our employee with 10+ years. Ask the other company who actually shows up to install."');
+    parts.push('LOSS FRAME: "The company you choose is the one you\'ll call in 10 years when something needs service. We\'ve been here since 1972. Will they?"');
+  } else if (objection === 'trust') {
+    parts.push('SAY FIRST: "That\'s exactly why Randy Reece still runs every project review personally — 50 years of family reputation on the line."');
+    parts.push('ASSUME: They want to trust someone. Give them a reason, not a pitch.');
+    parts.push('AVOID: Never say "trust me" — show proof instead.');
+    parts.push('PUSH: "I can show you 3 projects we completed on your street this year. Want to see the before/after?"');
+    parts.push('LOSS FRAME: "The risk isn\'t choosing us — it\'s choosing a company that won\'t be around to honor the warranty."');
+  } else if (objection === 'diy') {
+    parts.push('SAY FIRST: "I respect that — but impact windows aren\'t like regular windows. The installation IS the product."');
+    parts.push('ASSUME: They\'re capable but don\'t know what they don\'t know. Educate without condescending.');
+    parts.push('AVOID: Never say "you can\'t do this yourself" — say "here\'s what most people don\'t realize."');
+    parts.push('PUSH: "Incorrect installation voids the product warranty AND your insurance wind mitigation rating. One gap and you\'re unprotected."');
+    parts.push('LOSS FRAME: "A failed inspection means ripping everything out and starting over — at 3x the cost."');
+  } else if (demoCompleted) {
+    parts.push('SAY FIRST: "I wanted to follow up on what we discussed — you mentioned [specific concern from notes]."');
+    parts.push('ASSUME: The demo went well. They\'re processing, not rejecting.');
+    parts.push('AVOID: Never re-pitch the full demo. Never ask "so what did you think?" — that invites hesitation.');
+    parts.push('PUSH: "Based on what we measured, the next step is locking in your configuration before material pricing adjusts."');
+    parts.push('LOSS FRAME: "Your quote is based on today\'s material costs. Every week that passes is a week closer to the next price adjustment."');
+  } else {
+    parts.push('SAY FIRST: "Based on what you\'ve been looking at, the next step is getting your home assessed — let\'s lock that in."');
+    parts.push('ASSUME: They\'ve already decided they need this. The question is when, not if.');
+    parts.push('AVOID: Never ask "are you interested?" — they already showed interest by engaging.');
+    parts.push('PUSH: "I\'ve got one morning and one afternoon slot this week — which works better?"');
+    parts.push('LOSS FRAME: "Homes without rated impact protection are the first to see insurance premium increases. Getting assessed now puts you ahead of that."');
+  }
+
+  if (context?.lp?.notes?.length) {
+    parts.push(`\nREP NOTES: ${context.lp.notes.slice(0, 2).map(n => '"' + n.text + '"').join(' | ')}`);
+  }
+
+  if (isImminent) {
+    parts.push('\n⚡ THIS LEAD IS READY. Own the decision:');
+    parts.push('"I\'ve got Mark available [tomorrow/Thursday] — he\'ll have everything measured and quoted on the spot. Morning or afternoon?"');
+    parts.push('Do NOT ask if they want to. The decision is made. You\'re scheduling logistics.');
+  }
+
   return parts.join('\n');
 }
 
@@ -200,7 +251,6 @@ export async function scoreIntent(ghlContactId, context = null) {
   const barrier = classifyBarrier(intelligence, context);
   const briefing = (tier === 'hot' || tier === 'imminent') ? generateRepBriefing(intelligence, context) : null;
 
-  // Velocity calculation — requires minimum 1 hour span to avoid overflow
   const history = (() => {
     try {
       return Array.isArray(intelligence.intent_score_history)
@@ -215,24 +265,17 @@ export async function scoreIntent(ghlContactId, context = null) {
   if (newHistory.length >= 2) {
     const oldest = newHistory[newHistory.length - 1];
     const hoursSpan = (Date.now() - new Date(oldest.timestamp).getTime()) / 3600000;
-    if (hoursSpan >= 1) { // Minimum 1 hour between snapshots for meaningful velocity
-      velocity = ((score - oldest.score) / hoursSpan) * 24;
-    }
+    if (hoursSpan >= 1) velocity = ((score - oldest.score) / hoursSpan) * 24;
   }
-  // Cap to fit NUMERIC(5,2) column — max ±999.99
   const cappedVelocity = Math.max(-999, Math.min(999, Math.round(velocity * 100) / 100));
 
   await upsertLeadIntelligence(ghlContactId, {
-    intent_score: score,
-    intent_tier: tier,
-    intent_velocity: cappedVelocity,
+    intent_score: score, intent_tier: tier, intent_velocity: cappedVelocity,
     compound_pattern: pattern,
     pattern_matched_at: pattern ? now : intelligence.pattern_matched_at,
-    psychological_barrier: barrier,
-    spike_event_count: spike.eventCount,
+    psychological_barrier: barrier, spike_event_count: spike.eventCount,
     spike_window_start: spike.isSpiking ? (intelligence.spike_window_start || now) : null,
-    rep_briefing: briefing,
-    intent_score_history: JSON.stringify(newHistory),
+    rep_briefing: briefing, intent_score_history: JSON.stringify(newHistory),
   });
 
   if (tierChanged) {
