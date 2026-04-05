@@ -12,7 +12,8 @@
  *   create_task          → Add GHL note + GroupMe notification (GHL has no task API)
  *   send_notification    → GroupMe message to sales channel
  * 
- * Pipeline stage IDs verified from Notion "HL Databases > Pipelines" database (2026-04-05).
+ * Stage names and IDs match EXACTLY what is in GHL (verified from GHL UI + Notion sync).
+ * No aliases — if a stage name doesn't match, the action fails loudly so we fix the rule.
  */
 
 import supabase from './supabase.js';
@@ -23,8 +24,7 @@ const GHL_LOCATION_ID = 'SsBG7j5KQAIP1SFP2Sca';
 const GROUPME_BOT_ID = process.env.GROUPME_BOT_ID || '';
 
 // ═══════════════════════════════════════════════════════════════════
-// PIPELINE STAGE MAP — Notion-verified (2026-04-05)
-// Source: Notion > HL Databases > Pipelines database
+// PIPELINE STAGE MAP — exact GHL names (verified 2026-04-05)
 // ═══════════════════════════════════════════════════════════════════
 
 const PIPELINE_IDS = {
@@ -34,42 +34,37 @@ const PIPELINE_IDS = {
 };
 
 const STAGE_MAP = {
-  // ─── P1 — Antifragile Buyer Activation ─────────────────────────
-  'Lead Captured':                '793f72f8-08b3-4d0a-9227-a646f1fdc7f6',
-  'High-Intent Qualified':        '0afdc1bc-2859-4696-ab13-07f8c59e457e',
-  'Indoctrination/Short Nurture': '67f50407-f004-47b3-ad70-83e0eccbe2d1',
-  'Active Nurture':               '538d9a8e-4b38-4331-9711-87f40a6dd4ef',
-  'Re-Engagement':                'a75f34d2-b38d-4edd-ac98-4a89304be71c',
-  'Conversion Sequence':          '79ab10fd-5294-4330-b4ac-91b2df7c7d3a',
-  'Appointment Completed':        '656c8446-da9b-4c97-add8-ba50d8319b84',
-  'Proposal/Estimate Delivered':  '10776799-ee76-409f-a630-9c496e5d708e',
-  'Unresponsive':                 '9a3fec61-4057-4b30-bb23-5b5f57702d4d',
-  'Reactivation':                 '8a17a6ab-56ff-47b2-9c61-77b8ded7e479',
-  'Long Term Nurture':            '36ccbca0-c57f-466a-bd66-c7aa2a91e79d',
-  'Closed Won':                   '2f7396e6-c51f-41f8-85f2-c2896733889f', // P1 Closed Won
+  // ─── P1 — Antifragile Buyer Activation (12 stages) ────────────
+  'Lead Captured':                       '793f72f8-08b3-4d0a-9227-a646f1fdc7f6',
+  'High-Intent Qualified':               '0afdc1bc-2859-4696-ab13-07f8c59e457e',
+  'Indoctrination / Short Nurture':      '67f50407-f004-47b3-ad70-83e0eccbe2d1',
+  'Active Nurture':                      '538d9a8e-4b38-4331-9711-87f40a6dd4ef',
+  'Re-Engagement':                       'a75f34d2-b38d-4edd-ac98-4a89304be71c',
+  'Conversion Sequence':                 '79ab10fd-5294-4330-b4ac-91b2df7c7d3a',
+  'Appointment Completed':               '656c8446-da9b-4c97-add8-ba50d8319b84',
+  'Proposal / Estimate Delivered':       '10776799-ee76-409f-a630-9c496e5d708e',
+  'Unresponsive':                        '9a3fec61-4057-4b30-bb23-5b5f57702d4d',
+  'Reactivation':                        '8a17a6ab-56ff-47b2-9c61-77b8ded7e479',
+  'Long Term Nurture':                   '36ccbca0-c57f-466a-bd66-c7aa2a91e79d',
+  'Closed Won':                          '2f7396e6-c51f-41f8-85f2-c2896733889f',
 
-  // ─── P2 — Client Lifecycle ─────────────────────────────────────
-  'Closed Won (Contract Signed)': 'fec39f2e-ba39-4536-95b2-bbac7ca6c454',
-  'Financing Pending':            'b7fc445c-a969-42b1-9a7a-eda5c89f25a5',
-  'Financing Approved':           '375089e1-aaa5-429f-8c4c-5e01058fa8f8',
-  'HOA/Permit':                   '561f35fe-3632-40e9-bf0d-b9061bdf2589',
-  'Production/Manufacturing':     '6b89bc8d-067a-41fb-a76c-fc0c9feaaf92',
-  'Install Scheduled':            'd852ba71-c6f5-422b-9c74-33b6036c69a5',
-  'Install Completed':            '5fc94c74-d136-481e-b8ca-2200817111af',
-  'Referral & Expansion':         '053a0020-0f96-4a22-8717-8814c3ca1ff8',
+  // ─── P2 — Client Lifecycle (8 stages) ──────────────────────────
+  'Closed Won (Contract Signed)':        'fec39f2e-ba39-4536-95b2-bbac7ca6c454',
+  'Financing Pending / Document Collection': 'b7fc445c-a969-42b1-9a7a-eda5c89f25a5',
+  'Financing Approved':                  '375089e1-aaa5-429f-8c4c-5e01058fa8f8',
+  'HOA / Permit In Progress':            '561f35fe-3632-40e9-bf0d-b9061bdf2589',
+  'Production / Manufacturing':          '6b89bc8d-067a-41fb-a76c-fc0c9feaaf92',
+  'Install Scheduled':                   'd852ba71-c6f5-422b-9c74-33b6036c69a5',
+  'Install Completed':                   '5fc94c74-d136-481e-b8ca-2200817111af',
+  'Referral & Expansion Opportunity':    '053a0020-0f96-4a22-8717-8814c3ca1ff8',
 
-  // ─── P3 — Recycle, Lost, Deferred ──────────────────────────────
-  'Deferred':                     '3b786609-dec8-411f-9318-8b63778aa4cb',
-  'Closed Lost':                  '49be52c6-03e1-4ec0-a3be-3726342bf586',
-  'Not Interested (Now)':         'e0bde70a-f32f-4b6d-88b2-be0c89c46852',
-  'Bad Fit / Wrong Home':         'f9cd1a23-a6f9-452c-b129-c47d5a14a6bd',
-  'Do Not Contact':               '5f332652-b8c1-4a67-ba30-dc3450a3e039',
-  'Hard Disqualified':            '6194a841-8f59-4164-adee-dc0bd99510dc',
-  'Reactivation Queue':           'fda5f000-19a7-420f-935a-f1f2de0c7675',
-
-  // ─── Aliases (agent rules use these names) ─────────────────────
-  'Bad Number/Bad Fit':           '6194a841-8f59-4164-adee-dc0bd99510dc', // → Hard Disqualified
-  'Financing Denied':             'f9cd1a23-a6f9-452c-b129-c47d5a14a6bd', // → Bad Fit / Wrong Home
+  // ─── P3 — Recycle, Lost, Deferred (6 stages) ──────────────────
+  'Deferred / Timing':                   '3b786609-dec8-411f-9318-8b63778aa4cb',
+  'Not Interested (Now)':                'e0bde70a-f32f-4b6d-88b2-be0c89c46852',
+  'Bad Fit / Wrong Home':                'f9cd1a23-a6f9-452c-b129-c47d5a14a6bd',
+  'Do Not Contact':                      '5f332652-b8c1-4a67-ba30-dc3450a3e039',
+  'Hard Disqualified':                   '6194a841-8f59-4164-adee-dc0bd99510dc',
+  'Reactivation Queue':                  'fda5f000-19a7-420f-935a-f1f2de0c7675',
 };
 
 // "Remove from All Marketing Campaigns" workflow ID
@@ -119,7 +114,6 @@ async function executeRemoveTag(action) {
   const tag = action.action_payload?.tag;
   if (!contactId || !tag) throw new Error('Missing contactId or tag');
 
-  // GHL DELETE /contacts/{id}/tags expects body with tags array
   await ghlFetch('DELETE', `/contacts/${contactId}/tags`, { tags: [tag] });
   return { tag_removed: tag, contact_id: contactId };
 }
@@ -133,7 +127,7 @@ async function executeMoveOpportunity(action) {
   if (!pipelineId) throw new Error(`Unknown pipeline: ${pipeline}`);
 
   const stageId = STAGE_MAP[stage];
-  if (!stageId) throw new Error(`Unknown stage: "${stage}" — add to STAGE_MAP`);
+  if (!stageId) throw new Error(`Unknown stage: "${stage}" — fix the agent_rule, no aliases allowed`);
 
   // Find existing opportunity for this contact in target pipeline
   const searchRes = await ghlFetch('GET',
@@ -141,7 +135,6 @@ async function executeMoveOpportunity(action) {
   const opportunities = searchRes?.opportunities || [];
 
   if (opportunities.length > 0) {
-    // Update existing opportunity
     const opp = opportunities[0];
     await ghlFetch('PUT', `/opportunities/${opp.id}`, {
       pipelineStageId: stageId,
@@ -149,7 +142,6 @@ async function executeMoveOpportunity(action) {
     });
     return { action: 'updated', opportunity_id: opp.id, pipeline, stage, status };
   } else {
-    // Create new opportunity
     const contactRes = await ghlFetch('GET', `/contacts/${contactId}`);
     const contact = contactRes?.contact || {};
     const contactName = contact.name || contact.firstName || 'Unknown';
@@ -170,7 +162,6 @@ async function executeRemoveFromWorkflow(action) {
   const removeAll = action.action_payload?.remove_all;
 
   if (removeAll) {
-    // Add to "Remove from All Marketing Campaigns" workflow
     await ghlFetch('POST', `/contacts/${contactId}/workflow/${REMOVE_ALL_MARKETING_WF}`, {});
     return { action: 'added_to_remove_all_workflow', contact_id: contactId };
   }
@@ -186,7 +177,6 @@ async function executeCreateTask(action) {
   const contactId = action.target_id;
   const title = action.action_payload?.title || 'Agent task';
 
-  // GHL doesn't have a good task API — add a note + GroupMe notification
   await addGHLNote(contactId, `[AGENT TASK] ${title}`);
 
   if (GROUPME_BOT_ID) {
@@ -242,9 +232,6 @@ const ACTION_HANDLERS = {
   send_notification: executeSendNotification,
 };
 
-/**
- * Execute a single action. Updates status to executing → completed/failed.
- */
 async function executeSingleAction(action) {
   const handler = ACTION_HANDLERS[action.action_type];
   if (!handler) {
@@ -257,7 +244,6 @@ async function executeSingleAction(action) {
     return { action_id: action.id, status: 'failed', error: `Unknown action type: ${action.action_type}` };
   }
 
-  // Mark as executing
   await supabase.from('agent_actions').update({
     status: 'executing',
     updated_at: new Date().toISOString(),
@@ -266,7 +252,6 @@ async function executeSingleAction(action) {
   try {
     const result = await handler(action);
 
-    // Mark completed
     await supabase.from('agent_actions').update({
       status: 'completed',
       execution_result: result,
@@ -295,13 +280,9 @@ async function executeSingleAction(action) {
   }
 }
 
-/**
- * Execute all pending actions. Processes in batch order (sequence_order within batch_id).
- */
 export async function executeActions({ limit = 50 } = {}) {
   const startTime = Date.now();
 
-  // Fetch pending actions (not pending_approval — those need human review)
   const { data: actions, error } = await supabase
     .from('agent_actions')
     .select('*')
@@ -319,7 +300,6 @@ export async function executeActions({ limit = 50 } = {}) {
     return { success: true, actions_executed: 0, elapsed_ms: Date.now() - startTime };
   }
 
-  // Group by batch_id for sequential execution within batches
   const batches = new Map();
   for (const action of actions) {
     const key = action.batch_id || `single_${action.id}`;
@@ -327,7 +307,6 @@ export async function executeActions({ limit = 50 } = {}) {
     batches.get(key).push(action);
   }
 
-  // Sort each batch by sequence_order
   for (const batch of batches.values()) {
     batch.sort((a, b) => (a.sequence_order || 0) - (b.sequence_order || 0));
   }
@@ -345,7 +324,6 @@ export async function executeActions({ limit = 50 } = {}) {
       if (result.status === 'completed') completed++;
       else if (result.status === 'failed') failed++;
 
-      // If an action in a batch fails permanently, skip remaining batch actions
       if (result.status === 'failed') {
         console.warn(`[ActionExecutor] Batch ${batchId} halted — action ${action.id} failed permanently`);
         break;
@@ -372,7 +350,6 @@ export async function executeActions({ limit = 50 } = {}) {
 // ═══════════════════════════════════════════════════════════════════
 
 export function registerActionExecutorRoutes(app) {
-  // Execute all pending actions
   app.post('/n8n/decision-engine/execute', async (req, res) => {
     try {
       const limit = req.body?.limit || 50;
@@ -384,7 +361,6 @@ export function registerActionExecutorRoutes(app) {
     }
   });
 
-  // Get execution stats
   app.get('/n8n/decision-engine/execution-stats', async (req, res) => {
     try {
       const [pendingRes, approvalRes, completedRes, failedRes] = await Promise.all([
