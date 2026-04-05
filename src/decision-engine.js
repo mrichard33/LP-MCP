@@ -4,8 +4,17 @@
  * The brain of the agentic system. Processes pending system events by:
  * 1. Reading unprocessed events from system_events
  * 2. Matching each event against agent_rules (by event_type + payload pattern)
- * 3. Creating agent_actions for matched rules
- * 4. Marking events as processed
+ * 3. For contextual rules: also evaluating lead_intelligence conditions
+ * 4. Creating agent_actions for matched rules
+ * 5. Marking events as processed
+ * 
+ * Layer 3 Enhancement: Supports two rule types:
+ *   - 'pattern' (default) — Simple event field matching (all existing rules)
+ *   - 'contextual' — Also evaluates context_conditions against lead_intelligence
+ * 
+ * Special event handling:
+ *   - ghl.reply_received (pending_analysis) → triggers Message Analyzer, NOT rules
+ *   - ai.analysis_completed → matched against contextual rules using lead_intelligence
  * 
  * Exposes:
  *   processEvents()                — Process all pending events (called by cron/webhook)
@@ -14,6 +23,7 @@
  */
 
 import supabase from './supabase.js';
+import { analyzeMessage } from './message-analyzer.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // RULE MATCHING
@@ -44,7 +54,8 @@ async function loadRules() {
 
   rulesCache = data || [];
   rulesCacheTime = now;
-  console.log(`[DecisionEngine] Loaded ${rulesCache.length} rules`);
+  const contextual = rulesCache.filter(r => r.rule_type === 'contextual').length;
+  console.log(`[DecisionEngine] Loaded ${rulesCache.length} rules (${contextual} contextual)`);
   return rulesCache;
 }
 
@@ -52,9 +63,6 @@ async function loadRules() {
  * Check if an event matches a rule's event_pattern.
  * Pattern matching: every key in event_pattern must match the corresponding
  * field in the event. Supports nested payload matching.
- * 
- * Example pattern: { event_type: 'lp.disposition_changed', payload: { disposition_code: 'FDNS' } }
- * Matches event:   { event_type: 'lp.disposition_changed', payload: { disposition_code: 'FDNS', lead_name: 'John' } }
  */
 function matchesPattern(event, pattern) {
   if (!pattern || typeof pattern !== 'object') return false;
@@ -74,13 +82,188 @@ function matchesPattern(event, pattern) {
   return true;
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// LAYER 3: CONTEXTUAL RULE EVALUATION
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Fetch lead_intelligence for a contact.
+ * Used by contextual rules to evaluate conditions beyond the event payload.
+ */
+async function fetchLeadIntelligence(ghlContactId) {
+  if (!ghlContactId) return null;
+
+  const { data, error } = await supabase
+    .from('lead_intelligence')
+    .select('*')
+    .eq('ghl_contact_id', ghlContactId)
+    .maybeSingle();
+
+  if (error) {
+    console.error(`[DecisionEngine] lead_intelligence fetch error for ${ghlContactId}:`, error.message);
+    return null;
+  }
+  return data;
+}
+
+/**
+ * Fetch GHL contact tags for contextual has_tag / not_has_tag conditions.
+ * Lightweight — only fetches tags, not full context.
+ */
+async function fetchContactTags(ghlContactId) {
+  const GHL_API_KEY = process.env.GHL_API_KEY;
+  if (!GHL_API_KEY || !ghlContactId) return [];
+
+  try {
+    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${ghlContactId}`, {
+      headers: {
+        'Authorization': `Bearer ${GHL_API_KEY}`,
+        'Version': '2021-07-28',
+        'Accept': 'application/json',
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data?.contact?.tags || [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Evaluate context_conditions against lead_intelligence data.
+ * Returns true if ALL conditions pass.
+ * 
+ * Supported conditions:
+ *   buyer_stage_eq, buyer_stage_gte, buyer_stage_lte
+ *   objection_type_eq, engagement_quality_eq, emotional_state_eq
+ *   fast_track_eligible (boolean)
+ *   lead_score_gte, lead_score_lte
+ *   days_in_stage_gte
+ *   has_tag, not_has_tag (requires GHL contact tags)
+ *   entry_source_eq
+ *   recommended_action_eq
+ */
+async function evaluateContextConditions(conditions, intelligence, event) {
+  if (!conditions || typeof conditions !== 'object') return true; // No conditions = pass
+
+  // Merge intelligence data with event payload for richer matching
+  // (ai.analysis_completed events carry the analysis in payload)
+  const intel = intelligence || {};
+  const payload = event?.payload || {};
+  const merged = { ...intel, ...payload };
+
+  // Tags are fetched lazily only if needed
+  let tags = null;
+
+  for (const [key, expected] of Object.entries(conditions)) {
+    switch (key) {
+      // ─── Buyer Stage ───────────────────────────────
+      case 'buyer_stage_eq':
+        if ((merged.buyer_stage || 0) !== expected) return false;
+        break;
+      case 'buyer_stage_gte':
+        if ((merged.buyer_stage || 0) < expected) return false;
+        break;
+      case 'buyer_stage_lte':
+        if ((merged.buyer_stage || 0) > expected) return false;
+        break;
+
+      // ─── String Equality ───────────────────────────
+      case 'objection_type_eq':
+        if (merged.objection_type !== expected) return false;
+        break;
+      case 'engagement_quality_eq':
+        if (merged.engagement_quality !== expected) return false;
+        break;
+      case 'emotional_state_eq':
+        if (merged.emotional_state !== expected) return false;
+        break;
+      case 'entry_source_eq':
+        if (merged.entry_source !== expected) return false;
+        break;
+      case 'recommended_action_eq':
+        if (merged.recommended_action !== expected) return false;
+        break;
+
+      // ─── Boolean ───────────────────────────────────
+      case 'fast_track_eligible':
+        if (!!merged.fast_track_eligible !== !!expected) return false;
+        break;
+
+      // ─── Lead Score ────────────────────────────────
+      case 'lead_score_gte':
+        if ((merged.lead_score || 0) < expected) return false;
+        break;
+      case 'lead_score_lte':
+        if ((merged.lead_score || 0) > expected) return false;
+        break;
+
+      // ─── Days in Stage ─────────────────────────────
+      case 'days_in_stage_gte':
+        if ((merged.days_in_current_stage || 0) < expected) return false;
+        break;
+
+      // ─── Tag Conditions (lazy-fetch from GHL) ──────
+      case 'has_tag':
+        if (!tags) tags = await fetchContactTags(event.ghl_contact_id);
+        if (!tags.includes(expected)) return false;
+        break;
+      case 'not_has_tag':
+        if (!tags) tags = await fetchContactTags(event.ghl_contact_id);
+        if (tags.includes(expected)) return false;
+        break;
+
+      // ─── Confidence Threshold ──────────────────────
+      case 'buyer_stage_confidence_gte':
+        if ((merged.buyer_stage_confidence || 0) < expected) return false;
+        break;
+
+      default:
+        console.warn(`[DecisionEngine] Unknown context condition: ${key}`);
+    }
+  }
+
+  return true; // All conditions passed
+}
+
 /**
  * Find all rules that match a given event.
+ * For contextual rules, also evaluates context_conditions against lead_intelligence.
  * Returns rules sorted by priority (highest first).
  */
 async function findMatchingRules(event) {
   const rules = await loadRules();
-  return rules.filter(rule => matchesPattern(event, rule.event_pattern));
+  const matched = [];
+
+  // Pre-fetch intelligence once if any contextual rules might match
+  let intelligence = null;
+  let intelligenceFetched = false;
+
+  for (const rule of rules) {
+    // Step 1: Pattern match (required for all rule types)
+    if (!matchesPattern(event, rule.event_pattern)) continue;
+
+    // Step 2: For contextual rules, evaluate context_conditions
+    const ruleType = rule.rule_type || 'pattern';
+    if (ruleType === 'contextual' && rule.context_conditions) {
+      // Lazy-fetch intelligence
+      if (!intelligenceFetched) {
+        intelligence = await fetchLeadIntelligence(event.ghl_contact_id);
+        intelligenceFetched = true;
+      }
+
+      const contextPasses = await evaluateContextConditions(
+        rule.context_conditions, intelligence, event
+      );
+      if (!contextPasses) continue;
+    }
+
+    matched.push(rule);
+  }
+
+  return matched;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -137,12 +320,42 @@ async function createActionsFromRule(event, rule) {
 
 /**
  * Process a single event: match rules, create actions, mark processed.
+ * 
+ * Layer 3 special handling:
+ *   - ghl.reply_received (pending_analysis) → trigger Message Analyzer instead of rules
+ *   - ai.analysis_completed → matched against contextual rules
  */
 export async function processSingleEvent(event) {
+  // ─── Special: pending_analysis → trigger AI Message Analyzer ───
+  if (event.event_type === 'ghl.reply_received' && event.event_subtype === 'pending_analysis') {
+    const contactId = event.ghl_contact_id;
+    const messageText = event.payload?.message_text || '';
+
+    if (contactId && messageText) {
+      // Trigger async analysis — this will emit ai.analysis_completed when done
+      analyzeMessage(contactId, messageText, event.id).catch(err => {
+        console.error(`[DecisionEngine] Message analysis failed for ${contactId}:`, err.message);
+      });
+    }
+
+    // Mark as processed — the analysis will create its own event
+    await supabase
+      .from('system_events')
+      .update({
+        processed: true,
+        processed_by: 'decision_engine',
+        processed_at: new Date().toISOString(),
+        action_taken: 'routed_to_message_analyzer',
+      })
+      .eq('id', event.id);
+
+    return { event_id: event.id, matched_rules: 0, actions_created: 0, routed_to: 'message_analyzer' };
+  }
+
+  // ─── Standard rule matching (pattern + contextual) ─────────────
   const matchedRules = await findMatchingRules(event);
 
   if (matchedRules.length === 0) {
-    // No matching rules — mark as processed with no action
     await supabase
       .from('system_events')
       .update({
@@ -175,6 +388,7 @@ export async function processSingleEvent(event) {
     event_id: event.id,
     matched_rules: matchedRules.length,
     best_rule: bestRule.rule_key,
+    rule_type: bestRule.rule_type || 'pattern',
     actions_created: actions.length,
     actions: actions.map(a => ({ id: a.id, type: a.action_type, status: a.status })),
   };
@@ -191,7 +405,7 @@ export async function processEvents({ limit = 50 } = {}) {
     .from('system_events')
     .select('*')
     .eq('processed', false)
-    .order('priority', { ascending: true })  // critical < high < normal < low alphabetically, but we want critical first
+    .order('priority', { ascending: true })
     .order('created_at', { ascending: true })
     .limit(limit);
 
@@ -217,15 +431,16 @@ export async function processEvents({ limit = 50 } = {}) {
 
   const results = [];
   let totalActions = 0;
+  let aiRouted = 0;
 
   for (const event of events) {
     try {
       const result = await processSingleEvent(event);
       results.push(result);
       totalActions += result.actions_created;
+      if (result.routed_to === 'message_analyzer') aiRouted++;
     } catch (err) {
       console.error(`[DecisionEngine] Error processing event ${event.id}:`, err.message);
-      // Mark as processed with error to avoid infinite retry
       await supabase
         .from('system_events')
         .update({
@@ -240,12 +455,13 @@ export async function processEvents({ limit = 50 } = {}) {
   }
 
   const elapsed = Date.now() - startTime;
-  console.log(`[DecisionEngine] Processed ${events.length} events → ${totalActions} actions created (${elapsed}ms)`);
+  console.log(`[DecisionEngine] Processed ${events.length} events → ${totalActions} actions, ${aiRouted} AI-routed (${elapsed}ms)`);
 
   return {
     success: true,
     events_processed: events.length,
     total_actions_created: totalActions,
+    ai_routed: aiRouted,
     results,
     elapsed_ms: elapsed,
   };
@@ -272,6 +488,7 @@ export function registerDecisionEngineRoutes(app) {
   app.get('/n8n/decision-engine/status', async (req, res) => {
     try {
       const rules = await loadRules();
+      const contextualRules = rules.filter(r => r.rule_type === 'contextual').length;
       const [eventsRes, actionsRes] = await Promise.all([
         supabase.from('system_events').select('id', { count: 'exact', head: true }).eq('processed', false),
         supabase.from('agent_actions').select('id', { count: 'exact', head: true }).in('status', ['pending', 'pending_approval']),
@@ -279,6 +496,8 @@ export function registerDecisionEngineRoutes(app) {
 
       res.json({
         rules_loaded: rules.length,
+        contextual_rules: contextualRules,
+        pattern_rules: rules.length - contextualRules,
         pending_events: eventsRes.count || 0,
         pending_actions: actionsRes.count || 0,
         cache_age_seconds: Math.round((Date.now() - rulesCacheTime) / 1000),
