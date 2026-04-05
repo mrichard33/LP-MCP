@@ -5,13 +5,14 @@
  * and executes them against GHL, GroupMe, and other systems.
  * 
  * Supported action types:
- *   add_tag           → POST /contacts/{id}/tags (additive, never PUT)
- *   move_opportunity  → Find opp by contact, PUT /opportunities/{oppId} with pipelineStageId
+ *   add_tag              → POST /contacts/{id}/tags (additive, never PUT)
+ *   remove_tag           → DELETE /contacts/{id}/tags (removes specific tag)
+ *   move_opportunity     → Find opp by contact, PUT /opportunities/{oppId} with pipelineStageId
  *   remove_from_workflow → Add to "Remove from All Marketing Campaigns" workflow
- *   create_task       → Add GHL note + GroupMe notification (GHL has no task API)
- *   send_notification → GroupMe message to sales channel
+ *   create_task          → Add GHL note + GroupMe notification (GHL has no task API)
+ *   send_notification    → GroupMe message to sales channel
  * 
- * Pipeline stage name → ID mapping is hardcoded from the live GHL account.
+ * Pipeline stage IDs verified from Notion "HL Databases > Pipelines" database (2026-04-05).
  */
 
 import supabase from './supabase.js';
@@ -22,7 +23,8 @@ const GHL_LOCATION_ID = 'SsBG7j5KQAIP1SFP2Sca';
 const GROUPME_BOT_ID = process.env.GROUPME_BOT_ID || '';
 
 // ═══════════════════════════════════════════════════════════════════
-// PIPELINE STAGE MAP — from live GHL account (MCP verified)
+// PIPELINE STAGE MAP — Notion-verified (2026-04-05)
+// Source: Notion > HL Databases > Pipelines database
 // ═══════════════════════════════════════════════════════════════════
 
 const PIPELINE_IDS = {
@@ -31,37 +33,43 @@ const PIPELINE_IDS = {
   P3: '1jIWe4Ad04oJtYE9UuXq',
 };
 
-// Stage name → stage ID (from GHL pipeline config)
 const STAGE_MAP = {
-  // P1 — Antifragile Buyer Activation
-  'Lead Captured':              'a1f2e3d4-0001-4000-8000-000000000001',
-  'High-Intent Qualified':      'a1f2e3d4-0002-4000-8000-000000000002',
-  'Indoctrination/Short Nurture': 'a1f2e3d4-0003-4000-8000-000000000003',
-  'Active Nurture':             'd54fb13b-bc0f-4c57-8348-eb7e8001bd3f',
-  'Re-Engagement':              'cf3c26fa-56ab-4ab3-be9e-dbde5afbff29',
-  'Conversion Sequence':        '79ab10fd-5294-4330-b4ac-91b2df7c7d3a',
-  'Appointment Completed':      '8ee13e72-77ae-47c0-848a-df3fd2a8a9f7',
-  'Proposal/Estimate Delivered': 'f6f7a8b9-0008-4000-8000-000000000008',
-  'Unresponsive':               'bb1c2d3e-0009-4000-8000-000000000009',
-  'Long Term Nurture':          'cc1d2e3f-000a-4000-8000-00000000000a',
-  'Reactivation':               'dd1e2f30-000b-4000-8000-00000000000b',
-  // P2 — Client Lifecycle
-  'Closed Won':                 'ee1f3031-000c-4000-8000-00000000000c',
-  'Financing Pending':          'ff203132-000d-4000-8000-00000000000d',
-  'Financing Approved':         '00213233-000e-4000-8000-00000000000e',
-  'HOA/Permit':                 '01223334-000f-4000-8000-00000000000f',
-  'Production/Manufacturing':   '02233435-0010-4000-8000-000000000010',
-  'Install Scheduled':          '03243536-0011-4000-8000-000000000011',
-  'Install Completed':          '04253637-0012-4000-8000-000000000012',
-  'Referral & Expansion':       '05263738-0013-4000-8000-000000000013',
-  // P3 — Recycle, Lost, Deferred
-  'Deferred':                   '06273839-0014-4000-8000-000000000014',
-  'Closed Lost':                '0728393a-0015-4000-8000-000000000015',
-  'Not Interested (Now)':       '08293a3b-0016-4000-8000-000000000016',
-  'Financing Denied':           '092a3b3c-0017-4000-8000-000000000017',
-  'Bad Number/Bad Fit':         '0a2b3c3d-0018-4000-8000-000000000018',
-  'Do Not Contact':             '0b2c3d3e-0019-4000-8000-000000000019',
-  'Reactivation Queue':         '0c2d3e3f-001a-4000-8000-00000000001a',
+  // ─── P1 — Antifragile Buyer Activation ─────────────────────────
+  'Lead Captured':                '793f72f8-08b3-4d0a-9227-a646f1fdc7f6',
+  'High-Intent Qualified':        '0afdc1bc-2859-4696-ab13-07f8c59e457e',
+  'Indoctrination/Short Nurture': '67f50407-f004-47b3-ad70-83e0eccbe2d1',
+  'Active Nurture':               '538d9a8e-4b38-4331-9711-87f40a6dd4ef',
+  'Re-Engagement':                'a75f34d2-b38d-4edd-ac98-4a89304be71c',
+  'Conversion Sequence':          '79ab10fd-5294-4330-b4ac-91b2df7c7d3a',
+  'Appointment Completed':        '656c8446-da9b-4c97-add8-ba50d8319b84',
+  'Proposal/Estimate Delivered':  '10776799-ee76-409f-a630-9c496e5d708e',
+  'Unresponsive':                 '9a3fec61-4057-4b30-bb23-5b5f57702d4d',
+  'Reactivation':                 '8a17a6ab-56ff-47b2-9c61-77b8ded7e479',
+  'Long Term Nurture':            '36ccbca0-c57f-466a-bd66-c7aa2a91e79d',
+  'Closed Won':                   '2f7396e6-c51f-41f8-85f2-c2896733889f', // P1 Closed Won
+
+  // ─── P2 — Client Lifecycle ─────────────────────────────────────
+  'Closed Won (Contract Signed)': 'fec39f2e-ba39-4536-95b2-bbac7ca6c454',
+  'Financing Pending':            'b7fc445c-a969-42b1-9a7a-eda5c89f25a5',
+  'Financing Approved':           '375089e1-aaa5-429f-8c4c-5e01058fa8f8',
+  'HOA/Permit':                   '561f35fe-3632-40e9-bf0d-b9061bdf2589',
+  'Production/Manufacturing':     '6b89bc8d-067a-41fb-a76c-fc0c9feaaf92',
+  'Install Scheduled':            'd852ba71-c6f5-422b-9c74-33b6036c69a5',
+  'Install Completed':            '5fc94c74-d136-481e-b8ca-2200817111af',
+  'Referral & Expansion':         '053a0020-0f96-4a22-8717-8814c3ca1ff8',
+
+  // ─── P3 — Recycle, Lost, Deferred ──────────────────────────────
+  'Deferred':                     '3b786609-dec8-411f-9318-8b63778aa4cb',
+  'Closed Lost':                  '49be52c6-03e1-4ec0-a3be-3726342bf586',
+  'Not Interested (Now)':         'e0bde70a-f32f-4b6d-88b2-be0c89c46852',
+  'Bad Fit / Wrong Home':         'f9cd1a23-a6f9-452c-b129-c47d5a14a6bd',
+  'Do Not Contact':               '5f332652-b8c1-4a67-ba30-dc3450a3e039',
+  'Hard Disqualified':            '6194a841-8f59-4164-adee-dc0bd99510dc',
+  'Reactivation Queue':           'fda5f000-19a7-420f-935a-f1f2de0c7675',
+
+  // ─── Aliases (agent rules use these names) ─────────────────────
+  'Bad Number/Bad Fit':           '6194a841-8f59-4164-adee-dc0bd99510dc', // → Hard Disqualified
+  'Financing Denied':             'f9cd1a23-a6f9-452c-b129-c47d5a14a6bd', // → Bad Fit / Wrong Home
 };
 
 // "Remove from All Marketing Campaigns" workflow ID
@@ -88,7 +96,9 @@ async function ghlFetch(method, path, body = null) {
     const text = await res.text().catch(() => '');
     throw new Error(`GHL ${method} ${path} → ${res.status}: ${text.slice(0, 200)}`);
   }
-  return res.json();
+  const contentType = res.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) return res.json();
+  return { status: res.status, ok: true };
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -104,6 +114,16 @@ async function executeAddTag(action) {
   return { tag_applied: tag, contact_id: contactId };
 }
 
+async function executeRemoveTag(action) {
+  const contactId = action.target_id;
+  const tag = action.action_payload?.tag;
+  if (!contactId || !tag) throw new Error('Missing contactId or tag');
+
+  // GHL DELETE /contacts/{id}/tags expects body with tags array
+  await ghlFetch('DELETE', `/contacts/${contactId}/tags`, { tags: [tag] });
+  return { tag_removed: tag, contact_id: contactId };
+}
+
 async function executeMoveOpportunity(action) {
   const contactId = action.target_id;
   const { pipeline, stage, status } = action.action_payload || {};
@@ -113,10 +133,11 @@ async function executeMoveOpportunity(action) {
   if (!pipelineId) throw new Error(`Unknown pipeline: ${pipeline}`);
 
   const stageId = STAGE_MAP[stage];
-  if (!stageId) throw new Error(`Unknown stage: ${stage} — add to STAGE_MAP`);
+  if (!stageId) throw new Error(`Unknown stage: "${stage}" — add to STAGE_MAP`);
 
   // Find existing opportunity for this contact in target pipeline
-  const searchRes = await ghlFetch('GET', `/opportunities/search?location_id=${GHL_LOCATION_ID}&contact_id=${contactId}&pipeline_id=${pipelineId}`);
+  const searchRes = await ghlFetch('GET',
+    `/opportunities/search?location_id=${GHL_LOCATION_ID}&contact_id=${contactId}&pipeline_id=${pipelineId}`);
   const opportunities = searchRes?.opportunities || [];
 
   if (opportunities.length > 0) {
@@ -130,7 +151,8 @@ async function executeMoveOpportunity(action) {
   } else {
     // Create new opportunity
     const contactRes = await ghlFetch('GET', `/contacts/${contactId}`);
-    const contactName = contactRes?.contact?.name || contactRes?.contact?.firstName || 'Unknown';
+    const contact = contactRes?.contact || {};
+    const contactName = contact.name || contact.firstName || 'Unknown';
     const newOpp = await ghlFetch('POST', '/opportunities/', {
       pipelineId,
       pipelineStageId: stageId,
@@ -148,7 +170,7 @@ async function executeRemoveFromWorkflow(action) {
   const removeAll = action.action_payload?.remove_all;
 
   if (removeAll) {
-    // Add to "Remove from All Marketing Campaigns" workflow — this is a GHL workflow that removes from everything
+    // Add to "Remove from All Marketing Campaigns" workflow
     await ghlFetch('POST', `/contacts/${contactId}/workflow/${REMOVE_ALL_MARKETING_WF}`, {});
     return { action: 'added_to_remove_all_workflow', contact_id: contactId };
   }
@@ -167,7 +189,6 @@ async function executeCreateTask(action) {
   // GHL doesn't have a good task API — add a note + GroupMe notification
   await addGHLNote(contactId, `[AGENT TASK] ${title}`);
 
-  // Also send GroupMe notification
   if (GROUPME_BOT_ID) {
     await sendGroupMeMessage(`🤖 AGENT TASK: ${title}\nContact: ${contactId}`);
   }
@@ -179,7 +200,6 @@ async function executeSendNotification(action) {
   const message = action.action_payload?.message || 'Agent notification';
   const contactId = action.target_id;
 
-  // Build notification with context
   const fullMessage = contactId && contactId !== 'unknown'
     ? `🤖 ${message}\nContact: ${contactId}`
     : `🤖 ${message}`;
@@ -189,7 +209,6 @@ async function executeSendNotification(action) {
     return { action: 'groupme_sent', message: fullMessage.slice(0, 100) };
   }
 
-  // Fallback: log to console if no GroupMe configured
   console.log(`[ActionExecutor] NOTIFICATION (no GroupMe): ${fullMessage}`);
   return { action: 'logged', message: fullMessage.slice(0, 100), note: 'GROUPME_BOT_ID not configured' };
 }
@@ -216,6 +235,7 @@ async function sendGroupMeMessage(text) {
 
 const ACTION_HANDLERS = {
   add_tag: executeAddTag,
+  remove_tag: executeRemoveTag,
   move_opportunity: executeMoveOpportunity,
   remove_from_workflow: executeRemoveFromWorkflow,
   create_task: executeCreateTask,
@@ -325,9 +345,9 @@ export async function executeActions({ limit = 50 } = {}) {
       if (result.status === 'completed') completed++;
       else if (result.status === 'failed') failed++;
 
-      // If an action in a batch fails, skip remaining batch actions
+      // If an action in a batch fails permanently, skip remaining batch actions
       if (result.status === 'failed') {
-        console.warn(`[ActionExecutor] Batch ${batchId} halted — action ${action.id} failed`);
+        console.warn(`[ActionExecutor] Batch ${batchId} halted — action ${action.id} failed permanently`);
         break;
       }
     }
