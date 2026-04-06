@@ -9,6 +9,11 @@
 //
 // AGENTIC: Disposition changes emit system events for the Decision Engine.
 //
+// v7.1 — Real-time note push: After a disposition change is detected and
+// child records are synced, pushLeadNotesImmediately() pushes all unpushed
+// notes for that lead to GHL within seconds instead of waiting for the
+// batch sync cycle (which can take 30-60 min).
+//
 // v7.0 — DISK I/O OPTIMIZATION: Conditional upserts skip writes when
 // LP record hasn't changed (compares updated_at_lp). Removes raw_lp_data
 // from lp_leads upserts (prospect blob already stored on lp_prospects).
@@ -24,6 +29,7 @@ import { upsertProspect } from './upsert-prospect.js';
 import { combineNotes } from './safe-notes.js';
 import { syncCallLogs, syncNotes, syncActivities, syncJobAndMilestones } from './sync-children.js';
 import { emitEvent, dispositionPriority } from './event-emitter.js';
+import { pushLeadNotesImmediately } from './ghl-notes-sync.js';
 
 // ─── Skip counter for observability ──────────────────────────────
 let _skipStats = { leads: 0, prospects: 0 };
@@ -132,6 +138,7 @@ export async function upsertLeadOnly(prospect) {
 //
 // AGENTIC: Detects disposition changes and emits system events.
 //
+// v7.1: Real-time note push after disposition change + child sync.
 // v7.0: Conditional write — skips heavy upsert + child sync when
 // updated_at_lp hasn't changed AND disposition hasn't changed.
 
@@ -186,6 +193,7 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
     const previousDisposition = existing?.disposition_code || null;
     const newDisposition = getField(lead, 'disposition', 'Disposition') || null;
     const newUpdatedAt = lpDateToEastern(getField(lead, 'lastchangedon', 'LastChangedOn'));
+    const dispositionChanged = newDisposition && newDisposition !== previousDisposition;
 
     // ─── CONDITIONAL WRITE: Skip if LP record hasn't changed ─────
     // We still need to check disposition for event emission and GHL tag
@@ -195,7 +203,7 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
       && existing.updated_at_lp === newUpdatedAt
       && (existing.ghl_contact_id === ghlId || (!ghlId && existing.ghl_contact_id));
 
-    if (recordUnchanged && newDisposition === previousDisposition) {
+    if (recordUnchanged && !dispositionChanged) {
       _skipStats.leads++;
       // Still handle GHL tag if needed
       if (ghlId && !existing?.ghl_tag_applied) {
@@ -215,7 +223,7 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
     if (upsertErr) throw new Error(`Lead upsert failed for ${lpLeadId}: ${upsertErr.message}`);
 
     // ─── AGENTIC: Emit disposition change event ──────────────────
-    if (newDisposition && newDisposition !== previousDisposition) {
+    if (dispositionChanged) {
       const contactId = ghlId || existing?.ghl_contact_id || null;
       const leadName = `${getField(prospect, 'firstname', 'FirstName') || ''} ${getField(prospect, 'lastname', 'LastName') || ''}`.trim();
 
@@ -268,6 +276,19 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
       syncActivities(lpLeadId, calls, notes),
       ...jobs.map(job => syncJobAndMilestones(job, lpLeadId, ghlId)),
     ]);
+
+    // ─── v7.1: REAL-TIME NOTE PUSH on disposition change ─────────
+    // After syncNotes() has saved notes to lp_notes, immediately push
+    // any unpushed notes for this lead to GHL. This eliminates the
+    // 30-60 min delay from waiting for the batch pushNotesToGHL() cycle.
+    if (dispositionChanged) {
+      const contactId = ghlId || existing?.ghl_contact_id || null;
+      if (contactId) {
+        pushLeadNotesImmediately(lpLeadId, contactId).catch(err => {
+          console.error(`[Sync] Real-time note push failed for lead ${lpLeadId}:`, err.message);
+        });
+      }
+    }
 
     if (!existing?.lp_day15_triggered && ghlId) {
       const { checkDay15Handoff } = await import('./sync-triggers.js');
