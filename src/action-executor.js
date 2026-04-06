@@ -13,6 +13,10 @@
  *   send_notification    → GroupMe message to sales channel
  *   set_lp_appointment   → Push appointment to LP via SetAppointment API (Phase 2 write)
  *   update_custom_fields → PUT /contacts/{id} with customFields array
+ *
+ * v2.3 — Template interpolation: resolves {{variable}} placeholders in action_payload
+ *   messages and task descriptions using event payload data. No more blank fields
+ *   in GroupMe notifications.
  */
 
 import supabase from './supabase.js';
@@ -73,6 +77,64 @@ async function ghlFetch(method, path, body = null) {
   if (!res.ok) { const text = await res.text().catch(() => ''); throw new Error(`GHL ${method} ${path} → ${res.status}: ${text.slice(0, 200)}`); }
   const ct = res.headers.get('content-type') || '';
   return ct.includes('application/json') ? res.json() : { status: res.status, ok: true };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TEMPLATE INTERPOLATION — resolve {{variable}} in action payloads
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Fetches the event payload for an action and returns a flat key-value map
+ * of all available variables for template resolution.
+ */
+async function getEventContext(action) {
+  if (!action.event_id) return {};
+  try {
+    const { data: evt } = await supabase
+      .from('system_events')
+      .select('payload, event_type, event_subtype')
+      .eq('id', action.event_id)
+      .maybeSingle();
+    if (!evt?.payload) return {};
+    const payload = typeof evt.payload === 'string' ? JSON.parse(evt.payload) : evt.payload;
+    // Flatten one level deep — {{score}}, {{rep_briefing}}, etc.
+    return { ...payload };
+  } catch (err) {
+    console.error(`[ActionExecutor] Failed to fetch event context for action ${action.id}:`, err.message);
+    return {};
+  }
+}
+
+/**
+ * Resolves {{variable}} placeholders in a string using a context map.
+ * Unresolved variables are replaced with empty string (no leftover {{}} in output).
+ */
+function interpolate(template, context) {
+  if (!template || typeof template !== 'string') return template;
+  return template.replace(/\{\{(\w+)\}\}/g, (match, key) => {
+    const val = context[key];
+    if (val === undefined || val === null) return '';
+    return String(val);
+  });
+}
+
+/**
+ * Deep-interpolates all string values in an action_payload object.
+ */
+function interpolatePayload(payload, context) {
+  if (!payload || typeof payload !== 'object') return payload;
+  if (!context || Object.keys(context).length === 0) return payload;
+  const result = {};
+  for (const [key, val] of Object.entries(payload)) {
+    if (typeof val === 'string') {
+      result[key] = interpolate(val, context);
+    } else if (Array.isArray(val)) {
+      result[key] = val.map(item => typeof item === 'string' ? interpolate(item, context) : item);
+    } else {
+      result[key] = val;
+    }
+  }
+  return result;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -144,10 +206,11 @@ async function executeRemoveFromWorkflow(action) {
   return { action: 'removed', contact_id: contactId, workflow_id: wfId };
 }
 
-async function executeCreateTask(action) {
+async function executeCreateTask(action, context) {
   const contactId = action.target_id;
-  const title = action.action_payload?.title || 'Agent task';
-  const description = action.action_payload?.description || '';
+  const payload = interpolatePayload(action.action_payload, context);
+  const title = payload?.title || 'Agent task';
+  const description = payload?.description || '';
   const noteText = description ? `[AGENT TASK] ${title}\n${description}` : `[AGENT TASK] ${title}`;
   await addGHLNote(contactId, noteText);
   const { name, phone } = await resolveContactInfo(contactId);
@@ -156,8 +219,9 @@ async function executeCreateTask(action) {
   return { action: 'note_added', contact_id: contactId, title };
 }
 
-async function executeSendNotification(action) {
-  const message = action.action_payload?.message || 'Agent notification';
+async function executeSendNotification(action, context) {
+  const payload = interpolatePayload(action.action_payload, context);
+  const message = payload?.message || 'Agent notification';
   const contactId = action.target_id;
   const { name, phone } = await resolveContactInfo(contactId);
   const contactLabel = name ? `${name}${phone ? ` (${phone})` : ''}` : contactId;
@@ -257,6 +321,9 @@ async function executeUpdateCustomFields(action) {
 // EXECUTOR ENGINE
 // ═══════════════════════════════════════════════════════════════════
 
+// Handlers that accept (action, context) for template interpolation
+const CONTEXT_AWARE_HANDLERS = new Set(['send_notification', 'create_task']);
+
 const ACTION_HANDLERS = {
   add_tag: executeAddTag,
   remove_tag: executeRemoveTag,
@@ -276,7 +343,12 @@ async function executeSingleAction(action) {
   }
   await supabase.from('agent_actions').update({ status: 'executing', updated_at: new Date().toISOString() }).eq('id', action.id);
   try {
-    const result = await handler(action);
+    // Fetch event context for template interpolation (only for handlers that need it)
+    let context = {};
+    if (CONTEXT_AWARE_HANDLERS.has(action.action_type)) {
+      context = await getEventContext(action);
+    }
+    const result = await handler(action, context);
     await supabase.from('agent_actions').update({ status: 'completed', execution_result: result, executed_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', action.id);
     console.log(`[ActionExecutor] ✅ ${action.action_type} completed (action ${action.id}, rule: ${action.rule_applied})`);
     return { action_id: action.id, status: 'completed', result };
