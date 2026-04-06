@@ -18,10 +18,10 @@
 import supabase from './supabase.js';
 import { applyGHLTag, addGHLNote, updateGHLContactFields } from './ghl.js';
 import { setAppointment as lpSetAppointment } from './lp-client.js';
+import { sendGroupMeMessage, sendApprovalRequest } from './groupme.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = 'SsBG7j5KQAIP1SFP2Sca';
-const GROUPME_BOT_ID = process.env.GROUPME_BOT_ID || '';
 
 // ═══════════════════════════════════════════════════════════════════
 // PIPELINE STAGE MAP
@@ -73,6 +73,21 @@ async function ghlFetch(method, path, body = null) {
   if (!res.ok) { const text = await res.text().catch(() => ''); throw new Error(`GHL ${method} ${path} → ${res.status}: ${text.slice(0, 200)}`); }
   const ct = res.headers.get('content-type') || '';
   return ct.includes('application/json') ? res.json() : { status: res.status, ok: true };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CONTACT NAME RESOLVER (for GroupMe messages)
+// ═══════════════════════════════════════════════════════════════════
+
+async function resolveContactInfo(contactId) {
+  if (!contactId || /^\d+$/.test(contactId)) return { name: null, phone: null }; // LP prospect ID, skip
+  try {
+    const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
+    const c = ghlRes?.contact || {};
+    const name = [c.firstName, c.lastName].filter(Boolean).join(' ') || c.name || null;
+    const phone = c.phone || null;
+    return { name, phone };
+  } catch { return { name: null, phone: null }; }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -135,16 +150,20 @@ async function executeCreateTask(action) {
   const description = action.action_payload?.description || '';
   const noteText = description ? `[AGENT TASK] ${title}\n${description}` : `[AGENT TASK] ${title}`;
   await addGHLNote(contactId, noteText);
-  if (GROUPME_BOT_ID) await sendGroupMeMessage(`🤖 AGENT TASK: ${title}\nContact: ${contactId}`);
+  const { name, phone } = await resolveContactInfo(contactId);
+  const contactLabel = name ? `${name}${phone ? ` (${phone})` : ''}` : contactId;
+  await sendGroupMeMessage(`🤖 AGENT TASK: ${title}\nContact: ${contactLabel}`);
   return { action: 'note_added', contact_id: contactId, title };
 }
 
 async function executeSendNotification(action) {
   const message = action.action_payload?.message || 'Agent notification';
   const contactId = action.target_id;
-  const full = contactId && contactId !== 'unknown' ? `🤖 ${message}\nContact: ${contactId}` : `🤖 ${message}`;
-  if (GROUPME_BOT_ID) { await sendGroupMeMessage(full); return { action: 'groupme_sent', message: full.slice(0, 100) }; }
-  return { action: 'logged', message: full.slice(0, 100) };
+  const { name, phone } = await resolveContactInfo(contactId);
+  const contactLabel = name ? `${name}${phone ? ` (${phone})` : ''}` : contactId;
+  const full = `🤖 ${message}\nContact: ${contactLabel}`;
+  await sendGroupMeMessage(full);
+  return { action: 'groupme_sent', message: full.slice(0, 100) };
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -155,14 +174,12 @@ async function executeSetLPAppointment(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
 
-  // Fetch triggering event for appointment details
   let eventPayload = {};
   if (action.event_id) {
     const { data: evt } = await supabase.from('system_events').select('payload').eq('id', action.event_id).maybeSingle();
     if (evt?.payload) eventPayload = typeof evt.payload === 'string' ? JSON.parse(evt.payload) : evt.payload;
   }
 
-  // Resolve LP Lead ID: payload → Supabase lp_leads → GHL custom field
   let lpLeadId = payload.lp_lead_id;
   if (!lpLeadId && contactId) {
     const { data: lpLead } = await supabase.from('lp_leads').select('lp_lead_id').eq('ghl_contact_id', contactId).order('synced_at', { ascending: false }).limit(1).maybeSingle();
@@ -175,7 +192,6 @@ async function executeSetLPAppointment(action) {
   }
   if (!lpLeadId) throw new Error(`No LP Lead ID for contact ${contactId}`);
 
-  // Resolve appointment date: payload → event → GHL contact
   let rawDate = payload.appt_date || eventPayload.start_time || null;
   if (!rawDate && contactId) {
     const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
@@ -187,7 +203,6 @@ async function executeSetLPAppointment(action) {
   if (rawDate.includes('-')) { const [y, m, d] = rawDate.split('T')[0].split('-'); apptDate = `${m}/${d}/${y}`; }
   else apptDate = rawDate;
 
-  // Resolve appointment time: payload → event ISO → GHL contact
   let rawTime = payload.appt_time || null;
   if (!rawTime && eventPayload.start_time?.includes('T')) rawTime = eventPayload.start_time.split('T')[1]?.slice(0, 5);
   if (!rawTime && contactId) {
@@ -196,7 +211,6 @@ async function executeSetLPAppointment(action) {
   }
   if (!rawTime) throw new Error('Cannot resolve appointment time');
 
-  // Convert 12h to 24h if needed
   let apptTime = rawTime;
   const match12 = apptTime.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
   if (match12) {
@@ -211,12 +225,11 @@ async function executeSetLPAppointment(action) {
   const setBy = payload.set_by || '5686';
   const calendarName = payload.calendar_name || eventPayload.title || 'N/A';
 
-  // Call LP API
   const result = await lpSetAppointment({ ldsId: lpLeadId, setBy, apptDate, apptTime });
 
-  // Log to GHL + GroupMe
   await addGHLNote(contactId, `[LP SYNC] Appointment set in Lead Perfection\nLP Lead ID: ${lpLeadId}\nDate: ${apptDate}\nTime: ${apptTime}\nCalendar: ${calendarName}`).catch(() => {});
-  if (GROUPME_BOT_ID) await sendGroupMeMessage(`📅 LP Appointment Set\nLP Lead: ${lpLeadId}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName}\nContact: ${contactId}`).catch(() => {});
+  const { name } = await resolveContactInfo(contactId);
+  await sendGroupMeMessage(`📅 LP Appointment Set\nContact: ${name || contactId}\nLP Lead: ${lpLeadId}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName}`).catch(() => {});
 
   console.log(`[ActionExecutor] ✅ LP appointment set: lds_id=${lpLeadId}, ${apptDate} ${apptTime}`);
   return { action: 'lp_appointment_set', lp_lead_id: lpLeadId, appt_date: apptDate, appt_time: apptTime, set_by: setBy, calendar_name: calendarName, lp_response: result, contact_id: contactId };
@@ -224,8 +237,6 @@ async function executeSetLPAppointment(action) {
 
 // ═══════════════════════════════════════════════════════════════════
 // GHL CUSTOM FIELD UPDATE
-// Uses updateGHLContactFields from ghl.js (PUT /contacts/{id}).
-// Payload: { fields: [{ id: "fieldId", field_value: "value" }, ...] }
 // ═══════════════════════════════════════════════════════════════════
 
 async function executeUpdateCustomFields(action) {
@@ -240,19 +251,6 @@ async function executeUpdateCustomFields(action) {
 
   console.log(`[ActionExecutor] ✅ Custom fields updated for ${contactId}: ${fields.length} fields`);
   return { action: 'custom_fields_updated', contact_id: contactId, field_count: fields.length, fields: fields.map(f => f.id) };
-}
-
-// ─── GroupMe Helper ──────────────────────────────────────────────
-
-async function sendGroupMeMessage(text) {
-  if (!GROUPME_BOT_ID) return;
-  try {
-    await fetch('https://api.groupme.com/v3/bots/post', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bot_id: GROUPME_BOT_ID, text: text.slice(0, 1000) }),
-      signal: AbortSignal.timeout(10000),
-    });
-  } catch (err) { console.error('[ActionExecutor] GroupMe send failed:', err.message); }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -294,10 +292,40 @@ async function executeSingleAction(action) {
 
 export async function executeActions({ limit = 50 } = {}) {
   const startTime = Date.now();
+
+  // ─── Send GroupMe approval requests for pending_approval actions ──
+  const { data: approvalActions } = await supabase.from('agent_actions')
+    .select('*').eq('status', 'pending_approval')
+    .order('created_at', { ascending: true }).limit(20);
+  if (approvalActions?.length) {
+    // Group by batch_id
+    const approvalBatches = new Map();
+    for (const a of approvalActions) {
+      const k = a.batch_id || `s_${a.id}`;
+      if (!approvalBatches.has(k)) approvalBatches.set(k, []);
+      approvalBatches.get(k).push(a);
+    }
+    for (const [batchId, actions] of approvalBatches) {
+      // Check if we already sent a request for this batch
+      const { data: existing } = await supabase
+        .from('groupme_approval_requests')
+        .select('id')
+        .eq('batch_id', batchId)
+        .maybeSingle();
+      if (!existing) {
+        const { name, phone } = await resolveContactInfo(actions[0].target_id);
+        await sendApprovalRequest(actions, name, phone).catch(err => {
+          console.error(`[ActionExecutor] Approval request failed for batch ${batchId}:`, err.message);
+        });
+      }
+    }
+  }
+
+  // ─── Execute pending actions ──────────────────────────────────
   const { data: actions, error } = await supabase.from('agent_actions').select('*').eq('status', 'pending')
     .order('created_at', { ascending: true }).order('sequence_order', { ascending: true }).limit(limit);
   if (error) return { success: false, error: error.message };
-  if (!actions?.length) return { success: true, actions_executed: 0, elapsed_ms: Date.now() - startTime };
+  if (!actions?.length) return { success: true, actions_executed: 0, approval_requests_sent: approvalActions?.length || 0, elapsed_ms: Date.now() - startTime };
 
   const batches = new Map();
   for (const a of actions) { const k = a.batch_id || `s_${a.id}`; if (!batches.has(k)) batches.set(k, []); batches.get(k).push(a); }
@@ -313,7 +341,7 @@ export async function executeActions({ limit = 50 } = {}) {
   }
   const elapsed = Date.now() - startTime;
   console.log(`[ActionExecutor] Done: ${completed} completed, ${failed} failed (${elapsed}ms)`);
-  return { success: true, actions_executed: results.length, completed, failed, retrying: results.filter(r => r.status === 'pending').length, results, elapsed_ms: elapsed };
+  return { success: true, actions_executed: results.length, completed, failed, retrying: results.filter(r => r.status === 'pending').length, approval_requests_sent: approvalActions?.length || 0, results, elapsed_ms: elapsed };
 }
 
 // ═══════════════════════════════════════════════════════════════════
