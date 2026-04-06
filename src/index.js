@@ -23,6 +23,8 @@ import { registerMessageAnalyzerRoutes } from './message-analyzer.js';
 import { registerIntentScorerRoutes } from './intent-scorer.js';
 // ─── REST API for GHL Agent Studio ───────────────────────────────
 import { registerRestApiRoutes } from './rest-api.js';
+// ─── GroupMe Two-Way Integration ─────────────────────────────────
+import { registerGroupMeRoutes } from './groupme.js';
 
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -49,15 +51,50 @@ function authenticate(req, res, next) {
   next();
 }
 
+// ─── Auto-migrate: create tables if missing ──────────────────────
+async function runMigrations() {
+  try {
+    const { error } = await supabase.rpc('exec_sql', {
+      sql: `CREATE TABLE IF NOT EXISTS groupme_approval_requests (
+        id SERIAL PRIMARY KEY,
+        short_ref TEXT UNIQUE NOT NULL,
+        batch_id TEXT,
+        action_ids INTEGER[] NOT NULL DEFAULT '{}',
+        rule_applied TEXT,
+        target_id TEXT,
+        contact_name TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        resolved_by TEXT,
+        resolved_at TIMESTAMPTZ,
+        requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )`
+    });
+    if (error) {
+      // Fallback: try direct insert to test if table exists
+      const { error: testErr } = await supabase.from('groupme_approval_requests').select('id').limit(1);
+      if (testErr && testErr.code === '42P01') {
+        console.warn('[Migration] groupme_approval_requests table missing — please create manually in Supabase SQL editor');
+      } else {
+        console.log('[Migration] groupme_approval_requests table exists');
+      }
+    } else {
+      console.log('[Migration] groupme_approval_requests table ready');
+    }
+  } catch (err) {
+    console.warn('[Migration] Skipped:', err.message);
+  }
+}
+
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', server: 'lp-mcp-server', version: '6.2.0', port: PORT });
+  res.json({ status: 'ok', server: 'lp-mcp-server', version: '6.3.0', port: PORT });
 });
 
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     server: 'lp-mcp-server',
-    version: '6.2.0',
+    version: '6.3.0',
     uptime: process.uptime(),
     active_sessions: Object.keys(streamableSessions).length,
     lp_config: {
@@ -70,6 +107,13 @@ app.get('/health', (req, res) => {
     lp_token: getTokenStatus(),
     supabase: process.env.SUPABASE_URL ? 'configured' : 'MISSING',
     ghl: process.env.GHL_API_KEY ? 'configured' : 'MISSING',
+    groupme: {
+      bot_id: process.env.GROUPME_BOT_ID ? 'configured' : 'MISSING',
+      group_id: process.env.GROUPME_GROUP_ID || 'not set',
+      webhook: 'POST /webhook/groupme',
+      send: 'POST /groupme/send',
+      pending: 'GET /groupme/pending',
+    },
     n8n_apis: {
       enrich_lead: 'POST /n8n/enrich-lead',
       refresh_token: 'POST /n8n/refresh-token',
@@ -137,7 +181,7 @@ function isInitializeRequest(body) {
 
 function createMCPSession() {
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID() });
-  const sessionServer = new McpServer({ name: 'lp-mcp-server', version: '6.2.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
+  const sessionServer = new McpServer({ name: 'lp-mcp-server', version: '6.3.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
   registerAllTools(sessionServer);
   return { transport, server: sessionServer };
 }
@@ -169,7 +213,7 @@ app.delete('/mcp', authenticate, async (req, res) => { const s = req.headers['mc
 const sseSessions = {};
 app.get('/sse', authenticate, async (req, res) => {
   const transport = new SSEServerTransport('/messages', res);
-  const ss = new McpServer({ name: 'lp-mcp-server', version: '6.2.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
+  const ss = new McpServer({ name: 'lp-mcp-server', version: '6.3.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
   registerAllTools(ss); sseSessions[transport.sessionId] = { transport, server: ss };
   res.on('close', () => { delete sseSessions[transport.sessionId]; }); await ss.connect(transport);
 });
@@ -237,8 +281,11 @@ registerIntentScorerRoutes(app);
 // ─── REST API for GHL Agent Studio ───────────────────────────────
 registerRestApiRoutes(app, authenticate);
 
-app.listen(PORT, () => {
-  console.log(`LP MCP Server v6.2.0 running on port ${PORT}`);
+// ─── GroupMe Two-Way Integration ─────────────────────────────────
+registerGroupMeRoutes(app);
+
+app.listen(PORT, async () => {
+  console.log(`LP MCP Server v6.3.0 running on port ${PORT}`);
   console.log(`n8n APIs:     POST /n8n/enrich-lead | /n8n/refresh-token | /n8n/prospect-lookup | /n8n/time-to-appointment`);
   console.log(`Avatar APIs:  POST /n8n/avatar/score | /parse-gpt | /unified-inputs | /pick-best | /build-ghl | /build-notion`);
   console.log(`Decision:     POST /n8n/decision-engine/process | /execute | GET /status | /execution-stats`);
@@ -246,8 +293,10 @@ app.listen(PORT, () => {
   console.log(`Intelligence: GET /n8n/lead-intelligence/context | POST /n8n/analyze-pending-replies | /n8n/analyze-message`);
   console.log(`Intent:       POST /n8n/intent/score | /n8n/intent/sweep | GET /n8n/intent/breakdown`);
   console.log(`REST API:     GET /api/prospects/:id | /api/leads/:id | /api/search | /api/lead-summary/:contactId`);
+  console.log(`GroupMe:      POST /webhook/groupme | POST /groupme/send | GET /groupme/pending`);
   console.log(`MCP:          http://localhost:${PORT}/mcp`);
   console.log(`Health:       http://localhost:${PORT}/health`);
+  await runMigrations();
   initFieldSync();
   startSyncScheduler();
   setTimeout(() => {
