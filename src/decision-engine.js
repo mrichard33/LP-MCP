@@ -18,10 +18,13 @@
  *   - ai.analysis_completed → matched against contextual rules using lead_intelligence
  *   - intent.* events → processed by rules but do NOT trigger re-scoring (loop prevention)
  *
+ * v2.2.1 — Added INTENT_ to stage gate prefixes. Previously only BEHAVIORAL_ and
+ *   OBJECTION_ were gated. INTENT_HOT_FROM_COLD was firing on anonymous Guest Visitors.
+ *
  * v2.2 — Stage Gate + Deduplication:
- *   - Stage Gate: behavioral/objection rules require contact to have phone OR email,
+ *   - Stage Gate: behavioral/objection/intent rules require contact to have phone OR email,
  *     AND buyer_stage >= 3 or an appointment tag. Anonymous live chat visitors
- *     asking basic questions no longer trigger W9.0 objection sequences.
+ *     asking basic questions no longer trigger W9.0 objection sequences or hot lead alerts.
  *   - Deduplication: before creating actions, checks for existing pending/pending_approval
  *     actions with same rule_key + target_id within 30-min window. Prevents 3x
  *     duplicate actions from rapid-fire messages.
@@ -39,10 +42,11 @@ import { scoreIntent } from './intent-scorer.js';
 
 const DEDUP_WINDOW_MINUTES = 30;
 
-// Behavioral rule prefixes that require stage gate + dedup
+// Rule prefixes that require stage gate (phone/email + funnel stage) + dedup
 const BEHAVIORAL_RULE_PREFIXES = [
   'BEHAVIORAL_',
   'OBJECTION_',
+  'INTENT_',
 ];
 
 function isBehavioralRule(ruleKey) {
@@ -85,7 +89,7 @@ function matchesPattern(event, pattern) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// STAGE GATE — Prevent behavioral rules from firing on unqualified contacts
+// STAGE GATE — Prevent behavioral/intent rules from firing on unqualified contacts
 // ═══════════════════════════════════════════════════════════════════
 
 // Tags that indicate a contact is far enough in the funnel for behavioral rules
@@ -98,7 +102,7 @@ const QUALIFYING_TAGS = [
 ];
 
 async function passesStageGate(event, rule) {
-  // Only apply stage gate to behavioral rules
+  // Only apply stage gate to behavioral/intent rules
   if (!isBehavioralRule(rule.rule_key)) return true;
 
   const contactId = event.ghl_contact_id;
@@ -152,7 +156,7 @@ async function passesStageGate(event, rule) {
 // ═══════════════════════════════════════════════════════════════════
 
 async function hasDuplicatePendingActions(ruleKey, targetId) {
-  // Only dedup behavioral rules
+  // Only dedup behavioral/intent rules
   if (!isBehavioralRule(ruleKey)) return false;
   if (!targetId) return false;
 
@@ -261,7 +265,7 @@ async function findMatchingRules(event) {
       if (!(await evaluateContextConditions(rule.context_conditions, intelligence, event))) continue;
     }
 
-    // ─── v2.2: Stage Gate — block behavioral rules for unqualified contacts ───
+    // ─── v2.2: Stage Gate — block behavioral/intent rules for unqualified contacts ───
     if (!(await passesStageGate(event, rule))) continue;
 
     matched.push(rule);
@@ -278,7 +282,6 @@ async function createActionsFromRule(event, rule) {
   const targetId = event.ghl_contact_id || event.entity_id || '';
   if (await hasDuplicatePendingActions(rule.rule_key, targetId)) {
     console.log(`[DecisionEngine] Dedup: skipping ${rule.rule_key} for ${targetId} — already has pending actions`);
-    // Mark event as processed with dedup note
     return [];
   }
 
@@ -402,9 +405,6 @@ export async function processEvents({ limit = 50 } = {}) {
       results.push(result);
       totalActions += result.actions_created;
       if (result.routed_to === 'message_analyzer') aiRouted++;
-      if (result.matched_rules === 0 && result.actions_created === 0 && !result.routed_to) {
-        // Could be stage-gated or no matching rules
-      }
       if (result.actions_created === 0 && result.matched_rules > 0) deduped++;
 
       // ─── Intent Scoring: queue contact for scoring ────
