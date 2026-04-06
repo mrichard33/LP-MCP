@@ -124,11 +124,6 @@ async function withCircuit(fn) {
 
 // ─── Phase 1 Read Endpoints ──────────────────────────────────────
 
-/**
- * POST /api/Customers/GetLead — Primary lead/prospect data (full sync source).
- * Pagination: StartIndex (1-based) + PageSize.
- * Set cst_id=0 for all prospects, or a specific cst_id for one.
- */
 export async function getLeads(params = {}) {
   return withCircuit(() => lpPost('/api/Customers/GetLead', {
     startdate:   params.startdate  || '2020-01-01',
@@ -143,10 +138,6 @@ export async function getLeads(params = {}) {
   }));
 }
 
-/**
- * POST /api/Leads/GetLeadData — Date-range lead list for incremental sync.
- * Returns lead-level records (not full prospect nesting).
- */
 export async function getLeadData(params = {}) {
   return withCircuit(() => lpPost('/api/Leads/GetLeadData', {
     startdate:   params.startdate  || '',
@@ -157,10 +148,6 @@ export async function getLeadData(params = {}) {
   }));
 }
 
-/**
- * POST /api/Customers/GetJobStatusChanges — Job/milestone change detection.
- * Used in Part 2 of incremental sync to catch milestone updates.
- */
 export async function getJobStatusChanges(params = {}) {
   return withCircuit(() => lpPost('/api/Customers/GetJobStatusChanges', {
     startdate:   params.startdate  || '',
@@ -175,9 +162,6 @@ export async function getJobStatusChanges(params = {}) {
   }));
 }
 
-/**
- * POST /api/Customers/GetMilestones — Dedicated milestone pull.
- */
 export async function getMilestones(params = {}) {
   return withCircuit(() => lpPost('/api/Customers/GetMilestones', {
     startdate:   params.startdate  || '',
@@ -189,9 +173,6 @@ export async function getMilestones(params = {}) {
   }));
 }
 
-/**
- * POST /api/Customers/GetLeadInfo — Quick lead lookup with source fields.
- */
 export async function getLeadInfo(params = {}) {
   return withCircuit(() => lpPost('/api/Customers/GetLeadInfo', {
     prospectid:  params.prospectid || '',
@@ -203,9 +184,6 @@ export async function getLeadInfo(params = {}) {
   }));
 }
 
-/**
- * POST /api/Customers/GetCustomers3 — Contact search by phone/email for GHL matching.
- */
 export async function getCustomers3(params = {}) {
   return withCircuit(() => lpPost('/api/Customers/GetCustomers3', {
     phone:       params.phone      || '',
@@ -215,29 +193,18 @@ export async function getCustomers3(params = {}) {
   }));
 }
 
-/**
- * POST /api/Leads/GetLeadsSourceSubPromoter — Source + sub-source enumeration.
- * type: s=Sources, b=SubSources, p=Promoters
- */
 export async function getLeadsSourceSubPromoter(type = 's') {
   return withCircuit(() => lpPost('/api/Leads/GetLeadsSourceSubPromoter', {
     type,
   }));
 }
 
-/**
- * POST /api/SalesApi/GetSalesApptDispProd — Enumerate reference data.
- * type: d=dispositions, e=call result codes, u=queues, k=call types
- */
 export async function getSalesApptDispProd(type = 'd') {
   return withCircuit(() => lpPost('/api/SalesApi/GetSalesApptDispProd', {
     type,
   }));
 }
 
-/**
- * POST /api/SalesApi/GetSalesJobDetail — Full job details.
- */
 export async function getSalesJobDetail(jobId) {
   return withCircuit(() => lpPost('/api/SalesApi/GetSalesJobDetail', {
     job_id: String(jobId),
@@ -250,9 +217,6 @@ export const getDispositions = () => getSalesApptDispProd('d');
 export const getSources      = (type = 's') => getLeadsSourceSubPromoter(type);
 export const getSubSources   = () => getLeadsSourceSubPromoter('b');
 
-/**
- * Get a single prospect by cst_id — fetches via GetLead with cst_id filter.
- */
 export async function getLead(cstId) {
   return withCircuit(() => lpPost('/api/Customers/GetLead', {
     startdate:   '2000-01-01',
@@ -265,6 +229,56 @@ export async function getLead(cstId) {
     options:     '0',
     SortOrder:   '0',
   }));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Phase 2 Write Endpoints
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/Leads/SetAppointment — Set appointment in LP for a lead.
+ * 
+ * LP requires EXACTLY these fields as form-urlencoded (no JSON, no extra fields):
+ *   lds_id    — LP lead ID (NOT prospect ID)
+ *   set_by    — LP employee ID of the person setting the appointment
+ *   appt_date — Appointment date in MM/DD/YYYY format
+ *   appt_time — Appointment time in HH:MM 24-hour format
+ * 
+ * Returns: { message: "Appointment set successfully.", status: null, error: null }
+ * Error:   { message: "Exception Occured", error: "Cannot find column 1.", status: null }
+ *          (This error means the body was sent as JSON instead of form-encoded)
+ * 
+ * CRITICAL: Content-Type MUST be application/x-www-form-urlencoded.
+ *           lpPost() handles this automatically via URLSearchParams.
+ *           NEVER send JSON body to this endpoint.
+ * 
+ * @param {string} ldsId    — LP lead ID
+ * @param {string} setBy    — LP employee ID (default: 5686 = GHL system user)
+ * @param {string} apptDate — Date in MM/DD/YYYY format
+ * @param {string} apptTime — Time in HH:MM 24-hour format
+ * @returns {Object} LP API response
+ */
+export async function setAppointment({ ldsId, setBy = '5686', apptDate, apptTime }) {
+  if (!ldsId) throw new Error('setAppointment: ldsId (LP lead ID) is required');
+  if (!apptDate) throw new Error('setAppointment: apptDate is required (MM/DD/YYYY)');
+  if (!apptTime) throw new Error('setAppointment: apptTime is required (HH:MM 24h)');
+
+  console.log(`[LP] SetAppointment: lds_id=${ldsId}, date=${apptDate}, time=${apptTime}, set_by=${setBy}`);
+
+  const result = await withCircuit(() => lpPost('/api/Leads/SetAppointment', {
+    lds_id:    String(ldsId),
+    set_by:    String(setBy),
+    appt_date: apptDate,
+    appt_time: apptTime,
+  }));
+
+  // Check for LP error response
+  if (result?.error) {
+    throw new Error(`LP SetAppointment error: ${result.error} (message: ${result.message || 'none'})`);
+  }
+
+  console.log(`[LP] SetAppointment SUCCESS: lds_id=${ldsId}, response: ${JSON.stringify(result).slice(0, 200)}`);
+  return result;
 }
 
 // ─── Diagnostic — Connection Test ────────────────────────────────
