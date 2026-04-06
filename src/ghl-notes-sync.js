@@ -1,6 +1,6 @@
 // ─── GHL Notes Sync — src/ghl-notes-sync.js ──────────────────────
 //
-// v3 — March 24, 2026
+// v4 — April 6, 2026
 // Pushes LP notes to GHL contact records as internal notes.
 // Each LP note is pushed once, tracked by ghl_note_pushed flag.
 //
@@ -11,6 +11,9 @@
 // Date handling: LP stores dates as local time but Supabase has them
 // as UTC. We use getUTC*() methods to extract the date/time as-is.
 // Notes without a date (string-wrapped notes) omit the date line.
+//
+// v4: Added pushLeadNotesImmediately() for real-time note push on
+// disposition changes. Exported formatNoteForGHL and formatLPDate.
 
 import supabase from './supabase.js';
 import { addGHLNote } from './ghl.js';
@@ -19,7 +22,7 @@ import { addGHLNote } from './ghl.js';
  * Format an LP date for display. Uses UTC extraction because LP stores
  * local time but Supabase treats it as UTC.
  */
-function formatLPDate(dateStr) {
+export function formatLPDate(dateStr) {
   if (!dateStr) return null;
   const d = new Date(dateStr);
   if (isNaN(d.getTime())) return null;
@@ -42,7 +45,7 @@ function formatLPDate(dateStr) {
  * Includes metadata header so reps know the source.
  * Omits date line when no LP date is available (string-wrapped notes).
  */
-function formatNoteForGHL(note) {
+export function formatNoteForGHL(note) {
   const parts = [];
 
   parts.push('📋 LP Note');
@@ -142,6 +145,71 @@ export async function pushNotesToGHL({ batchSize = 50, delayMs = 300, maxNotes =
   if (stats.pushed > 0 || stats.failed > 0) {
     console.log(`[NoteSync] Complete: ${stats.pushed} pushed, ${stats.skipped} skipped, ${stats.failed} failed`);
   }
+  return stats;
+}
+
+/**
+ * REAL-TIME NOTE PUSH — Push all unpushed notes for a specific lead immediately.
+ * 
+ * Called by sync-leads.js after a disposition change is detected.
+ * This eliminates the 30-60 min delay for time-sensitive notes
+ * (cancellations, rescheduling, rep notes entered just before disp change).
+ *
+ * Only pushes notes that have a ghl_contact_id and haven't been pushed yet.
+ * 
+ * @param {string} lpLeadId - LP lead ID
+ * @param {string} ghlContactId - GHL contact ID to push notes to
+ * @returns {Object} { pushed, skipped, failed }
+ */
+export async function pushLeadNotesImmediately(lpLeadId, ghlContactId) {
+  if (!lpLeadId || !ghlContactId) return { pushed: 0, skipped: 0, failed: 0 };
+
+  const stats = { pushed: 0, skipped: 0, failed: 0 };
+
+  try {
+    const { data: notes, error } = await supabase
+      .from('lp_notes')
+      .select('id, lp_note_id, lp_lead_id, ghl_contact_id, note_body, note_type, note_category, created_by_rep_name, created_at_lp')
+      .eq('lp_lead_id', lpLeadId)
+      .eq('ghl_note_pushed', false)
+      .not('note_body', 'is', null)
+      .order('created_at_lp', { ascending: true, nullsFirst: false });
+
+    if (error) {
+      console.error(`[NoteSync] Real-time query failed for lead ${lpLeadId}:`, error.message);
+      return stats;
+    }
+    if (!notes || notes.length === 0) return stats;
+
+    for (const note of notes) {
+      if (!note.note_body || note.note_body.trim().length < 3) {
+        stats.skipped++;
+        await supabase.from('lp_notes').update({ ghl_note_pushed: true }).eq('id', note.id);
+        continue;
+      }
+
+      // Use ghlContactId param (may be more current than what's on the note row)
+      const targetContactId = note.ghl_contact_id || ghlContactId;
+      const formattedBody = formatNoteForGHL(note);
+      const result = await addGHLNote(targetContactId, formattedBody);
+
+      if (result) {
+        stats.pushed++;
+        await supabase.from('lp_notes')
+          .update({ ghl_note_pushed: true, ghl_contact_id: targetContactId })
+          .eq('id', note.id);
+      } else {
+        stats.failed++;
+      }
+    }
+
+    if (stats.pushed > 0) {
+      console.log(`[NoteSync] Real-time push for lead ${lpLeadId}: ${stats.pushed} notes → GHL ${ghlContactId}`);
+    }
+  } catch (err) {
+    console.error(`[NoteSync] Real-time push error for lead ${lpLeadId}:`, err.message);
+  }
+
   return stats;
 }
 
