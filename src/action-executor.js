@@ -17,12 +17,13 @@
  *   set_lp_appointment   → Push appointment to LP via SetAppointment API (Phase 2 write)
  *   update_custom_fields → PUT /contacts/{id} with customFields array
  *
- * v3.6 — Direct LP API lookup for Prospect ID (LP is source of truth).
- *   resolveLPProspectId now queries LP API directly via getLeadByLdsId,
- *   bypassing Supabase cache delay. Fallback: Supabase → "Not in LP".
- *   resolveContactInfo has Supabase lp_leads fallback when GHL is rate-limited.
- *   Name and Prospect ID should NEVER be blank for LP-linked contacts.
+ * v3.7 — Event payload fallback for contact name resolution.
+ *   resolveContactInfo now checks event payload (contactName, lead_name)
+ *   before falling back to contact ID. Combined with webhook changes
+ *   (adding contactName to APPT Handler webhooks), guarantees names
+ *   are never blank in GroupMe notifications.
  *
+ * v3.6 — Direct LP API lookup for Prospect ID.
  * v3.5 — Guaranteed contact name fallback (GHL → Supabase → contact ID).
  * v3.4 — GHL Rate Limiter integration.
  * v3.3 — Enrich send_notification with contact name + LP Prospect ID.
@@ -157,15 +158,19 @@ function interpolatePayload(payload, context) {
 // ═══════════════════════════════════════════════════════════════════
 
 /**
- * v3.5: Resolve contact name with guaranteed fallback chain.
+ * v3.7: Resolve contact name with guaranteed fallback chain.
  * Never returns null for name — always provides SOMETHING.
  * 
  * Fallback chain:
  *   1. GHL API → firstName + lastName
- *   2. Supabase lp_leads → first_name + last_name (no GHL call needed)
- *   3. Contact ID as last resort
+ *   2. Supabase lp_leads → first_name + last_name
+ *   3. Event payload → contactName / contact_name / lead_name
+ *   4. Contact ID as last resort
+ * 
+ * @param {string} contactId — GHL contact ID
+ * @param {Object} eventContext — Optional event payload with name fields
  */
-async function resolveContactInfo(contactId) {
+async function resolveContactInfo(contactId, eventContext = {}) {
   if (!contactId || /^\d+$/.test(contactId)) return { name: contactId || 'Unknown', phone: null };
 
   // Attempt 1: GHL API (rate-limited)
@@ -194,26 +199,23 @@ async function resolveContactInfo(contactId) {
     // Supabase failed — fall through
   }
 
+  // Attempt 3: Event payload (webhook data from APPT Handler or LP sync)
+  const payloadName = eventContext.contactName || eventContext.contact_name
+    || eventContext.lead_name || eventContext.leadName || null;
+  if (payloadName && payloadName !== contactId) {
+    return { name: payloadName, phone: null };
+  }
+
   // Last resort: contact ID
   return { name: contactId, phone: null };
 }
 
 /**
  * v3.6: Resolve LP Prospect ID — LP API is source of truth.
- * 
- * Fallback chain:
- *   1. Get LP Lead ID from Supabase (just the reference key)
- *   2. Call LP API directly via getLeadByLdsId (most current data)
- *   3. Fall back to Supabase lp_leads.lp_prospect_id (cached)
- *   4. "Not in LP" if contact has no LP record
- * 
- * LP API is called directly — no GHL rate limit impact.
- * Supabase is only used as fallback when LP API is unavailable.
  */
 async function resolveLPProspectId(contactId) {
   if (!contactId) return 'Not in LP';
 
-  // Step 1: Get LP Lead ID from Supabase (just the reference key — fast)
   let lpLeadId = null;
   let cachedProspectId = null;
   try {
@@ -228,14 +230,11 @@ async function resolveLPProspectId(contactId) {
 
   if (!lpLeadId) return 'Not in LP';
 
-  // Step 2: Call LP API directly for most current prospect data
   try {
     const result = await getLeadByLdsId(lpLeadId);
-    // LP response is array of prospect objects
     const prospects = Array.isArray(result) ? result : [result];
     for (const prospect of prospects) {
       if (!prospect) continue;
-      // LP uses various field name casings
       const pid = prospect.ProspectID || prospect.prospectid || prospect.CstID
         || prospect.cst_id || prospect.prospectId || null;
       if (pid) {
@@ -247,7 +246,6 @@ async function resolveLPProspectId(contactId) {
     console.warn(`[ActionExecutor] LP API prospect lookup failed for lead ${lpLeadId}: ${err.message}`);
   }
 
-  // Step 3: Fall back to Supabase cached prospect ID
   if (cachedProspectId) {
     console.log(`[ActionExecutor] Using cached prospect ID: ${cachedProspectId} for lead ${lpLeadId}`);
     return cachedProspectId;
@@ -322,19 +320,19 @@ async function executeCreateTask(action, context) {
   const description = payload?.description || '';
   const noteText = description ? `[AGENT TASK] ${title}\n${description}` : `[AGENT TASK] ${title}`;
   await addGHLNote(contactId, noteText);
-  const { name, phone } = await resolveContactInfo(contactId);
+  const { name, phone } = await resolveContactInfo(contactId, context);
   const contactLabel = name ? `${name}${phone ? ` (${phone})` : ''}` : contactId;
   await sendGroupMeMessage(`🤖 AGENT TASK: ${title}\nContact: ${contactLabel}`);
   return { action: 'note_added', contact_id: contactId, title };
 }
 
 /**
- * v3.5+: Enriched send_notification with guaranteed contact data.
- * Name and Prospect ID always resolve — never blank.
+ * v3.7: Enriched send_notification with guaranteed contact data.
+ * Passes event context to resolveContactInfo for payload-based name fallback.
  */
 async function executeSendNotification(action, context) {
   const contactId = action.target_id;
-  const { name, phone } = await resolveContactInfo(contactId);
+  const { name, phone } = await resolveContactInfo(contactId, context);
   const prospectId = await resolveLPProspectId(contactId);
 
   const enrichedContext = {
@@ -551,7 +549,7 @@ async function executeSetLPAppointment(action) {
   const result = await lpSetAppointment({ ldsId: lpLeadId, setBy, apptDate, apptTime });
 
   await addGHLNote(contactId, `[LP SYNC] Appointment set in LP\nLP Lead ID: ${lpLeadId}\nDate: ${apptDate}\nTime: ${apptTime}\nCalendar: ${calendarName}`).catch(() => {});
-  const { name } = await resolveContactInfo(contactId);
+  const { name } = await resolveContactInfo(contactId, eventPayload);
   await sendGroupMeMessage(`📅 LP Appointment Set\nContact: ${name || contactId}\nLP Lead: ${lpLeadId}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName}`).catch(() => {});
 
   console.log(`[ActionExecutor] ✅ LP appointment set: lds_id=${lpLeadId}, ${apptDate} ${apptTime}`);
