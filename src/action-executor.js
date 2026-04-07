@@ -17,11 +17,13 @@
  *   set_lp_appointment   → Push appointment to LP via SetAppointment API (Phase 2 write)
  *   update_custom_fields → PUT /contacts/{id} with customFields array
  *
- * v3.5 — Guaranteed contact name and prospect ID in notifications.
- *   resolveContactInfo now has Supabase lp_leads fallback when GHL is rate-limited.
- *   Fallback chain: GHL API → Supabase lp_leads → event payload → contact ID.
- *   Name and Prospect ID should NEVER show "Unknown" or "N/A" for LP-linked contacts.
+ * v3.6 — Direct LP API lookup for Prospect ID (LP is source of truth).
+ *   resolveLPProspectId now queries LP API directly via getLeadByLdsId,
+ *   bypassing Supabase cache delay. Fallback: Supabase → "Not in LP".
+ *   resolveContactInfo has Supabase lp_leads fallback when GHL is rate-limited.
+ *   Name and Prospect ID should NEVER be blank for LP-linked contacts.
  *
+ * v3.5 — Guaranteed contact name fallback (GHL → Supabase → contact ID).
  * v3.4 — GHL Rate Limiter integration.
  * v3.3 — Enrich send_notification with contact name + LP Prospect ID.
  * v3.2 — Batch tag removal to avoid GHL 429 rate limits.
@@ -31,7 +33,7 @@
 
 import supabase from './supabase.js';
 import { applyGHLTag, addGHLNote, updateGHLContactFields } from './ghl.js';
-import { setAppointment as lpSetAppointment } from './lp-client.js';
+import { setAppointment as lpSetAppointment, getLeadByLdsId } from './lp-client.js';
 import { sendGroupMeMessage, sendApprovalRequest } from './groupme.js';
 import { acquireToken, report429, registerRateLimiterRoutes } from './ghl-rate-limiter.js';
 
@@ -162,8 +164,6 @@ function interpolatePayload(payload, context) {
  *   1. GHL API → firstName + lastName
  *   2. Supabase lp_leads → first_name + last_name (no GHL call needed)
  *   3. Contact ID as last resort
- * 
- * Phone is best-effort only (GHL API or nothing).
  */
 async function resolveContactInfo(contactId) {
   if (!contactId || /^\d+$/.test(contactId)) return { name: contactId || 'Unknown', phone: null };
@@ -199,23 +199,61 @@ async function resolveContactInfo(contactId) {
 }
 
 /**
- * v3.5: Resolve LP Prospect ID with fallback.
+ * v3.6: Resolve LP Prospect ID — LP API is source of truth.
  * 
  * Fallback chain:
- *   1. Supabase lp_leads.lp_prospect_id (primary)
- *   2. "Not in LP" if no LP lead exists
+ *   1. Get LP Lead ID from Supabase (just the reference key)
+ *   2. Call LP API directly via getLeadByLdsId (most current data)
+ *   3. Fall back to Supabase lp_leads.lp_prospect_id (cached)
+ *   4. "Not in LP" if contact has no LP record
+ * 
+ * LP API is called directly — no GHL rate limit impact.
+ * Supabase is only used as fallback when LP API is unavailable.
  */
 async function resolveLPProspectId(contactId) {
   if (!contactId) return 'Not in LP';
+
+  // Step 1: Get LP Lead ID from Supabase (just the reference key — fast)
+  let lpLeadId = null;
+  let cachedProspectId = null;
   try {
     const { data: lpLead } = await supabase.from('lp_leads')
-      .select('lp_prospect_id')
+      .select('lp_lead_id, lp_prospect_id')
       .eq('ghl_contact_id', contactId)
       .order('synced_at', { ascending: false })
       .limit(1).maybeSingle();
-    if (lpLead?.lp_prospect_id) return String(lpLead.lp_prospect_id);
-    return 'Not in LP';
-  } catch { return 'Not in LP'; }
+    lpLeadId = lpLead?.lp_lead_id || null;
+    cachedProspectId = lpLead?.lp_prospect_id ? String(lpLead.lp_prospect_id) : null;
+  } catch {}
+
+  if (!lpLeadId) return 'Not in LP';
+
+  // Step 2: Call LP API directly for most current prospect data
+  try {
+    const result = await getLeadByLdsId(lpLeadId);
+    // LP response is array of prospect objects
+    const prospects = Array.isArray(result) ? result : [result];
+    for (const prospect of prospects) {
+      if (!prospect) continue;
+      // LP uses various field name casings
+      const pid = prospect.ProspectID || prospect.prospectid || prospect.CstID
+        || prospect.cst_id || prospect.prospectId || null;
+      if (pid) {
+        console.log(`[ActionExecutor] LP API resolved prospect ID: ${pid} for lead ${lpLeadId}`);
+        return String(pid);
+      }
+    }
+  } catch (err) {
+    console.warn(`[ActionExecutor] LP API prospect lookup failed for lead ${lpLeadId}: ${err.message}`);
+  }
+
+  // Step 3: Fall back to Supabase cached prospect ID
+  if (cachedProspectId) {
+    console.log(`[ActionExecutor] Using cached prospect ID: ${cachedProspectId} for lead ${lpLeadId}`);
+    return cachedProspectId;
+  }
+
+  return 'Not in LP';
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -291,8 +329,8 @@ async function executeCreateTask(action, context) {
 }
 
 /**
- * v3.5: Enriched send_notification with guaranteed contact data.
- * Name and Prospect ID always resolve — never blank, never "Unknown".
+ * v3.5+: Enriched send_notification with guaranteed contact data.
+ * Name and Prospect ID always resolve — never blank.
  */
 async function executeSendNotification(action, context) {
   const contactId = action.target_id;
