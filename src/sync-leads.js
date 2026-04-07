@@ -9,22 +9,22 @@
 //
 // AGENTIC: Disposition changes emit system events for the Decision Engine.
 //
-// v7.1 — Real-time note push: After a disposition change is detected and
-// child records are synced, pushLeadNotesImmediately() pushes all unpushed
-// notes for that lead to GHL within seconds instead of waiting for the
-// batch sync cycle (which can take 30-60 min).
+// v8.0 — active-entry:* tag management. After processing all leads for
+//   a prospect, determines the NEWEST lead's source and applies the
+//   corresponding active-entry:* tag to the GHL contact. Removes all
+//   stale active-entry:* tags first. This ensures routing decisions
+//   (appointment type, calendar, messaging) always use the most recent
+//   entry source, not a stale one from an older LP lead.
 //
-// v7.0 — DISK I/O OPTIMIZATION: Conditional upserts skip writes when
-// LP record hasn't changed (compares updated_at_lp). Removes raw_lp_data
-// from lp_leads upserts (prospect blob already stored on lp_prospects).
-// Adds skip counters for observability.
+// v7.1 — Real-time note push after disposition change.
+// v7.0 — DISK I/O OPTIMIZATION: Conditional upserts.
 
 import supabase from './supabase.js';
 import { getField, normalizePhone, loggedFirstKeys } from './sync-utils.js';
 import { logSyncError } from './sync-log.js';
 import { resolveSourceBucket } from './sync-sources.js';
 import { lpDateToEastern, lpCreatedDate } from './lp-dates.js';
-import { matchToGHL, applyGHLTag } from './ghl.js';
+import { matchToGHL, applyGHLTag, removeGHLTags } from './ghl.js';
 import { upsertProspect } from './upsert-prospect.js';
 import { combineNotes } from './safe-notes.js';
 import { syncCallLogs, syncNotes, syncActivities, syncJobAndMilestones } from './sync-children.js';
@@ -34,6 +34,25 @@ import { pushLeadNotesImmediately } from './ghl-notes-sync.js';
 // ─── Skip counter for observability ──────────────────────────────
 let _skipStats = { leads: 0, prospects: 0 };
 export function getSkipStats() { const s = { ..._skipStats }; _skipStats = { leads: 0, prospects: 0 }; return s; }
+
+// ─── active-entry:* constants ────────────────────────────────────
+// All possible active-entry:* tags. Used for removal before applying new one.
+const ALL_ACTIVE_ENTRY_TAGS = [
+  'active-entry:risk-report',
+  'active-entry:estimate-calculator',
+  'active-entry:chatbot',
+  'active-entry:canvassing',
+  'active-entry:referral',
+  'active-entry:other',
+  'active-entry:high-intent-digital',
+  'active-entry:unmapped',
+];
+
+// Convert entry:X tag to active-entry:X
+function toActiveEntryTag(entryTag) {
+  if (!entryTag || !entryTag.startsWith('entry:')) return 'active-entry:other';
+  return entryTag.replace('entry:', 'active-entry:');
+}
 
 // ─── Build the lead row payload (DRY helper) ─────────────────────
 function buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId) {
@@ -74,7 +93,6 @@ function buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId
       created_at_lp:      lpCreatedDate(prospect, lead, getField),
       updated_at_lp:      lpDateToEastern(getField(lead, 'lastchangedon', 'LastChangedOn')),
       synced_at:          new Date().toISOString(),
-      // NOTE: raw_lp_data removed from lp_leads — prospect blob lives on lp_prospects
     },
     isApptSet,
     isDemoCompleted,
@@ -83,12 +101,7 @@ function buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId
 }
 
 // ─── Pass 1 Helper — upsertLeadOnly() ────────────────────────────
-//
-// Extracts ONLY the lead upsert from processProspect(). Used during
-// fullSync Pass 1 to commit every lp_leads row before child records.
-// Does NOT emit events (too many leads during full sync).
-//
-// v7.0: Skips upsert if updated_at_lp hasn't changed (conditional write).
+// Used during fullSync Pass 1. Does NOT emit events or manage active-entry tags.
 
 export async function upsertLeadOnly(prospect) {
   const leads = getField(prospect, 'leads', 'Leads') || [];
@@ -104,7 +117,6 @@ export async function upsertLeadOnly(prospect) {
     const lpLeadId = String(getField(lead, 'id', 'lds_id', 'LeadID'));
     const lpProspectId = String(getField(prospect, 'cst_id', 'CstID', 'prospectid', 'ProspectID'));
 
-    // ─── CONDITIONAL WRITE: Skip if LP record hasn't changed ─────
     const newUpdatedAt = lpDateToEastern(getField(lead, 'lastchangedon', 'LastChangedOn'));
     if (newUpdatedAt) {
       const { data: existing } = await supabase.from('lp_leads')
@@ -133,14 +145,8 @@ export async function upsertLeadOnly(prospect) {
 
 // ─── Per-Prospect Processing — processProspect() ─────────────────
 //
-// Used by incrementalSync and webhook handlers. Single-pass is safe
-// because lp_leads is already populated after the first full sync.
-//
 // AGENTIC: Detects disposition changes and emits system events.
-//
-// v7.1: Real-time note push after disposition change + child sync.
-// v7.0: Conditional write — skips heavy upsert + child sync when
-// updated_at_lp hasn't changed AND disposition hasn't changed.
+// v8.0: Manages active-entry:* tag based on newest LP lead source.
 
 export async function processProspect(prospect, { skipGHL = false } = {}) {
   if (!loggedFirstKeys.has('prospect')) {
@@ -177,6 +183,9 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
 
   let subCounts = { calls: 0, notes: 0, jobs: 0, milestones: 0 };
 
+  // ─── v8.0: Track each lead's tag + creation date for active-entry resolution ──
+  const leadSourceTracker = [];
+
   for (const lead of leads) {
     const lpLeadId = String(getField(lead, 'id', 'lds_id', 'LeadID'));
     const { bucket, tag } = await resolveSourceBucket(
@@ -184,6 +193,10 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
       getField(lead, 'source', 'Source'), lpLeadId,
     );
     const lpProspectId = String(getField(prospect, 'cst_id', 'CstID', 'prospectid', 'ProspectID'));
+
+    // Track for active-entry:* resolution after the loop
+    const createdAt = lpCreatedDate(prospect, lead, getField);
+    leadSourceTracker.push({ lpLeadId, tag, createdAt });
 
     // ─── AGENTIC: Read existing state BEFORE upsert ──────────────
     const { data: existing } = await supabase.from('lp_leads')
@@ -195,9 +208,6 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
     const newUpdatedAt = lpDateToEastern(getField(lead, 'lastchangedon', 'LastChangedOn'));
     const dispositionChanged = newDisposition && newDisposition !== previousDisposition;
 
-    // ─── CONDITIONAL WRITE: Skip if LP record hasn't changed ─────
-    // We still need to check disposition for event emission and GHL tag
-    // for first-time application, but skip the heavy upsert + child sync.
     const recordUnchanged = existing?.updated_at_lp
       && newUpdatedAt
       && existing.updated_at_lp === newUpdatedAt
@@ -205,7 +215,6 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
 
     if (recordUnchanged && !dispositionChanged) {
       _skipStats.leads++;
-      // Still handle GHL tag if needed
       if (ghlId && !existing?.ghl_tag_applied) {
         const success = await applyGHLTag(ghlId, tag);
         if (success) {
@@ -253,6 +262,7 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
       });
     }
 
+    // Apply permanent entry:* tag (attribution — never removed)
     if (ghlId && !existing?.ghl_tag_applied) {
       const success = await applyGHLTag(ghlId, tag);
       if (success) {
@@ -277,10 +287,6 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
       ...jobs.map(job => syncJobAndMilestones(job, lpLeadId, ghlId)),
     ]);
 
-    // ─── v7.1: REAL-TIME NOTE PUSH on disposition change ─────────
-    // After syncNotes() has saved notes to lp_notes, immediately push
-    // any unpushed notes for this lead to GHL. This eliminates the
-    // 30-60 min delay from waiting for the batch pushNotesToGHL() cycle.
     if (dispositionChanged) {
       const contactId = ghlId || existing?.ghl_contact_id || null;
       if (contactId) {
@@ -297,6 +303,45 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
         getField(lead, 'entrydate', 'EntryDate'),
         getField(lead, 'disposition', 'Disposition'),
       );
+    }
+  }
+
+  // ═════════════════════════════════════════════════════════════════
+  // v8.0: ACTIVE-ENTRY TAG MANAGEMENT
+  //
+  // After processing all leads, find the NEWEST lead's source and
+  // apply its active-entry:* tag to the GHL contact. This ensures
+  // routing decisions always use the most recent entry source.
+  //
+  // Example: Annette enters as estimate-calculator (2025), then
+  // re-enters as canvassing (2026). Newest lead = canvassing.
+  // GHL gets active-entry:canvassing. LP Inbound routes to WE.
+  // ═════════════════════════════════════════════════════════════════
+  if (ghlId && leadSourceTracker.length > 0) {
+    try {
+      // Sort by created_at descending — newest first
+      leadSourceTracker.sort((a, b) => {
+        const da = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+        const db = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+        return db - da;
+      });
+
+      const newestTag = leadSourceTracker[0].tag;
+      const activeTag = toActiveEntryTag(newestTag);
+
+      // Remove all stale active-entry:* tags, then apply the current one
+      const tagsToRemove = ALL_ACTIVE_ENTRY_TAGS.filter(t => t !== activeTag);
+      if (tagsToRemove.length > 0) {
+        await removeGHLTags(ghlId, tagsToRemove);
+      }
+      await applyGHLTag(ghlId, activeTag);
+
+      if (leadSourceTracker.length > 1) {
+        console.log(`[Sync] active-entry:* set to ${activeTag} for ${ghlId} (${leadSourceTracker.length} LP leads, newest=${leadSourceTracker[0].lpLeadId})`);
+      }
+    } catch (err) {
+      console.error(`[Sync] active-entry:* tag management failed for ${ghlId}:`, err.message);
+      // Non-critical — don't break sync
     }
   }
 
@@ -328,6 +373,5 @@ export async function upsertLeadFromFlat(lp, ghlId) {
     created_at_lp:      lpDateToEastern(getField(lp, 'dateadded', 'DateAdded', 'entrydate', 'EntryDate')),
     updated_at_lp:      lpDateToEastern(getField(lp, 'lastchangedon', 'LastChangedOn')),
     synced_at:          new Date().toISOString(),
-    // NOTE: raw_lp_data removed — prospect blob lives on lp_prospects
   }, { onConflict: 'lp_lead_id' });
 }
