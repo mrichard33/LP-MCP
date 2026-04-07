@@ -4,22 +4,28 @@
  * Layer 2 of the agentic system. Reads pending actions from agent_actions
  * and executes them against GHL, LP, GroupMe, and other systems.
  * 
- * Supported action types (8):
+ * Supported action types (11):
  *   add_tag              → POST /contacts/{id}/tags (additive, never PUT)
  *   remove_tag           → DELETE /contacts/{id}/tags (removes specific tag)
  *   move_opportunity     → Find opp by contact, PUT /opportunities/{oppId} with pipelineStageId
- *   remove_from_workflow → Add to "Remove from All Marketing Campaigns" workflow
+ *   remove_from_workflow → Remove contact from GHL workflow or add to "Remove All" workflow
+ *   add_to_workflow      → POST /contacts/{id}/workflow/{wfId} — enroll contact in GHL workflow
+ *   book_appointment     → POST /calendars/events/appointments — book GHL calendar appointment
+ *   cancel_appointment   → PUT /calendars/events/appointments/{id} — cancel/update GHL appointment
  *   create_task          → Add GHL note + GroupMe notification (GHL has no task API)
  *   send_notification    → GroupMe message to sales channel
  *   set_lp_appointment   → Push appointment to LP via SetAppointment API (Phase 2 write)
  *   update_custom_fields → PUT /contacts/{id} with customFields array
  *
- * v2.5 — LP appointment pre-check: before calling SetAppointment, checks lp_leads
- *   table for existing appointment on same date. If LP already has it (appointment
- *   originated from LP call center), skips the API call. If date differs (reschedule
- *   from GHL), proceeds. Prevents redundant/error-prone duplicate SetAppointment calls.
+ * v3.0 — TIER 1 AGENTIC: Three new action types for routing decisions.
+ *   add_to_workflow: Enrolls contact in any GHL workflow by ID.
+ *   book_appointment: Books a GHL calendar appointment with date/time/calendar.
+ *   cancel_appointment: Cancels or updates an existing GHL appointment.
+ *   These three action types allow the Decision Engine to control WHERE
+ *   contacts go and WHAT appointments they book — replacing GHL IF/ELSE routing.
  *
- * v2.4 — Fix appointment date/time resolution from GHL webhook payloads.
+ * v2.5 — LP appointment pre-check.
+ * v2.4 — Fix appointment date/time resolution.
  * v2.3 — Template interpolation for action payloads.
  */
 
@@ -68,6 +74,18 @@ const STAGE_MAP = {
   'Do Not Contact':                      '5f332652-b8c1-4a67-ba30-dc3450a3e039',
   'Hard Disqualified':                   '6194a841-8f59-4164-adee-dc0bd99510dc',
   'Reactivation Queue':                  'fda5f000-19a7-420f-935a-f1f2de0c7675',
+};
+
+// ═══════════════════════════════════════════════════════════════════
+// CALENDAR MAP — Maps friendly names to GHL calendar IDs
+// ═══════════════════════════════════════════════════════════════════
+
+const CALENDAR_MAP = {
+  'Review Session':            'DQYMaJ22N6zL4SXjHukw',
+  'Measurement Verification':  'zEdPmkNccR2ovo3rQAd3',
+  'Window Estimate':           'aJj14ONxh1oFyDcQ706O',
+  'Home Protection Assessment':'zS1wg0JqQ1zsszJyJqKX',
+  'Confirmation Call':         'gFWoSQrlKIdfRbAPV842',
 };
 
 const REMOVE_ALL_MARKETING_WF = '07a657bd-0492-4137-a831-babfa608c902';
@@ -145,7 +163,7 @@ async function resolveContactInfo(contactId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// ACTION HANDLERS
+// ACTION HANDLERS — EXISTING
 // ═══════════════════════════════════════════════════════════════════
 
 async function executeAddTag(action) {
@@ -223,19 +241,166 @@ async function executeSendNotification(action, context) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// v3.0: ADD TO WORKFLOW — Enroll contact in a GHL workflow
+// ═══════════════════════════════════════════════════════════════════
+//
+// payload: { workflow_id: "GHL workflow UUID" }
+// OR: { workflow_name: "friendly name" } with a WORKFLOW_MAP lookup
+//
+// Uses: POST /contacts/{contactId}/workflow/{workflowId}
+// Same API as remove_from_workflow(remove_all) but with a specific target.
+
+async function executeAddToWorkflow(action) {
+  const contactId = action.target_id;
+  const payload = action.action_payload || {};
+  const wfId = payload.workflow_id;
+
+  if (!contactId) throw new Error('Missing contactId');
+  if (!wfId) throw new Error('Missing workflow_id in action payload');
+
+  await ghlFetch('POST', `/contacts/${contactId}/workflow/${wfId}`, {});
+
+  const wfName = payload.workflow_name || wfId;
+  console.log(`[ActionExecutor] ✅ Contact ${contactId} added to workflow: ${wfName} (${wfId})`);
+
+  return { action: 'added_to_workflow', contact_id: contactId, workflow_id: wfId, workflow_name: wfName };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// v3.0: BOOK APPOINTMENT — Create a GHL calendar appointment
+// ═══════════════════════════════════════════════════════════════════
+//
+// payload: {
+//   calendar_id: "GHL calendar UUID" OR calendar_name: "friendly name",
+//   start_time: "ISO 8601" OR date + time fields,
+//   end_time: "ISO 8601" (optional, defaults to +90min),
+//   title: "appointment title" (optional),
+//   status: "new" | "confirmed" (default: "new"),
+//   assigned_user_id: "GHL user ID" (optional)
+// }
+//
+// Uses: POST /calendars/events/appointments
+//
+// CRITICAL CONSTRAINT: A contact can NOT be in more than one
+// appointment reminder sequence at a time. The APPT Handler GHL
+// workflows manage sequence enrollment — this action just books
+// the calendar slot. The APPT Handler fires on the status trigger.
+
+async function executeBookAppointment(action, context) {
+  const contactId = action.target_id;
+  const payload = interpolatePayload(action.action_payload, context);
+
+  if (!contactId) throw new Error('Missing contactId');
+
+  // Resolve calendar ID from name or direct ID
+  let calendarId = payload.calendar_id;
+  if (!calendarId && payload.calendar_name) {
+    calendarId = CALENDAR_MAP[payload.calendar_name];
+    if (!calendarId) throw new Error(`Unknown calendar name: "${payload.calendar_name}". Valid: ${Object.keys(CALENDAR_MAP).join(', ')}`);
+  }
+  if (!calendarId) throw new Error('Missing calendar_id or calendar_name');
+
+  // Resolve start time
+  let startTime = payload.start_time;
+  if (!startTime && payload.appointment_date && payload.appointment_time) {
+    // Combine date + time into ISO
+    const date = payload.appointment_date; // YYYY-MM-DD or MM/DD/YYYY
+    let time = payload.appointment_time;   // HH:MM or HH:MM AM/PM
+    // Normalize date
+    let isoDate = date;
+    const usMatch = date.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
+    if (usMatch) isoDate = `${usMatch[3]}-${usMatch[1]}-${usMatch[2]}`;
+    // Normalize time to 24h
+    const match12 = time.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+    if (match12) {
+      let h = parseInt(match12[1], 10);
+      const min = match12[2], p = match12[3].toUpperCase();
+      if (p === 'AM' && h === 12) h = 0;
+      if (p === 'PM' && h !== 12) h += 12;
+      time = `${String(h).padStart(2, '0')}:${min}`;
+    }
+    startTime = `${isoDate}T${time}:00-04:00`; // EST offset
+  }
+  if (!startTime) throw new Error('Missing start_time or appointment_date+appointment_time');
+
+  // Calculate end time (default: +90 min for in-home, +15 min for phone)
+  let endTime = payload.end_time;
+  if (!endTime) {
+    const durationMin = payload.duration_minutes || 90;
+    const start = new Date(startTime);
+    const end = new Date(start.getTime() + durationMin * 60000);
+    endTime = end.toISOString();
+  }
+
+  const title = payload.title || payload.calendar_name || 'Appointment';
+  const status = payload.status || 'new';
+  const assignedUserId = payload.assigned_user_id || null;
+
+  const body = {
+    calendarId,
+    locationId: GHL_LOCATION_ID,
+    contactId,
+    startTime,
+    endTime,
+    title,
+    appointmentStatus: status,
+    toNotify: true,
+  };
+  if (assignedUserId) body.assignedUserId = assignedUserId;
+
+  console.log(`[ActionExecutor] Booking appointment: calendar=${calendarId}, contact=${contactId}, start=${startTime}, status=${status}`);
+
+  const result = await ghlFetch('POST', '/calendars/events/appointments', body);
+  const appointmentId = result?.id || result?.appointment?.id || null;
+
+  console.log(`[ActionExecutor] ✅ Appointment booked: id=${appointmentId}, calendar=${title}`);
+
+  return {
+    action: 'appointment_booked',
+    appointment_id: appointmentId,
+    calendar_id: calendarId,
+    calendar_name: title,
+    contact_id: contactId,
+    start_time: startTime,
+    end_time: endTime,
+    status,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// v3.0: CANCEL APPOINTMENT — Update GHL appointment status
+// ═══════════════════════════════════════════════════════════════════
+//
+// payload: {
+//   appointment_id: "GHL appointment UUID",
+//   status: "cancelled" | "noshow" | "confirmed" | "showed"
+// }
+//
+// Uses: PUT /calendars/events/appointments/{appointmentId}
+
+async function executeCancelAppointment(action) {
+  const payload = action.action_payload || {};
+  const appointmentId = payload.appointment_id;
+  const newStatus = payload.status || 'cancelled';
+
+  if (!appointmentId) throw new Error('Missing appointment_id');
+
+  await ghlFetch('PUT', `/calendars/events/appointments/${appointmentId}`, {
+    appointmentStatus: newStatus,
+  });
+
+  console.log(`[ActionExecutor] ✅ Appointment ${appointmentId} status → ${newStatus}`);
+  return { action: 'appointment_updated', appointment_id: appointmentId, new_status: newStatus };
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // LP APPOINTMENT WRITEBACK
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * Normalize a date to YYYY-MM-DD for comparison purposes.
- * Handles: "2026-04-10", "2026-04-10T14:00:00+00:00", "04/10/2026"
- */
 function normalizeDateForComparison(dateStr) {
   if (!dateStr) return null;
   const s = String(dateStr).trim();
-  // ISO format: 2026-04-10 or 2026-04-10T...
   if (s.match(/^\d{4}-\d{2}-\d{2}/)) return s.slice(0, 10);
-  // US format: MM/DD/YYYY
   const usMatch = s.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
   if (usMatch) return `${usMatch[3]}-${usMatch[1]}-${usMatch[2]}`;
   return null;
@@ -245,14 +410,12 @@ async function executeSetLPAppointment(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
 
-  // ─── Fetch event payload (contains the GHL webhook data) ───────
   let eventPayload = {};
   if (action.event_id) {
     const { data: evt } = await supabase.from('system_events').select('payload').eq('id', action.event_id).maybeSingle();
     if (evt?.payload) eventPayload = typeof evt.payload === 'string' ? JSON.parse(evt.payload) : evt.payload;
   }
 
-  // ─── Resolve LP Lead ID ────────────────────────────────────────
   let lpLeadId = payload.lp_lead_id || eventPayload.lp_lead_id || eventPayload.lpLeadId || null;
   if (!lpLeadId && contactId) {
     const { data: lpLead } = await supabase.from('lp_leads').select('lp_lead_id').eq('ghl_contact_id', contactId).order('synced_at', { ascending: false }).limit(1).maybeSingle();
@@ -265,7 +428,6 @@ async function executeSetLPAppointment(action) {
   }
   if (!lpLeadId) throw new Error(`No LP Lead ID for contact ${contactId}`);
 
-  // ─── Resolve appointment date ──────────────────────────────────
   let rawDate = payload.appt_date || payload.appointment_date
     || eventPayload.appt_date || eventPayload.appointment_date
     || eventPayload.start_time || null;
@@ -279,7 +441,6 @@ async function executeSetLPAppointment(action) {
   if (rawDate.includes('-')) { const [y, m, d] = rawDate.split('T')[0].split('-'); apptDate = `${m}/${d}/${y}`; }
   else apptDate = rawDate;
 
-  // ─── Resolve appointment time ──────────────────────────────────
   let rawTime = payload.appt_time || payload.appointment_time
     || eventPayload.appt_time || eventPayload.appointment_time || null;
   if (!rawTime && eventPayload.start_time?.includes('T')) rawTime = eventPayload.start_time.split('T')[1]?.slice(0, 5);
@@ -289,7 +450,6 @@ async function executeSetLPAppointment(action) {
   }
   if (!rawTime) throw new Error('Cannot resolve appointment time');
 
-  // ─── Convert 12h to 24h format if needed ───────────────────────
   let apptTime = rawTime;
   const match12 = apptTime.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
   if (match12) {
@@ -304,15 +464,8 @@ async function executeSetLPAppointment(action) {
   const setBy = payload.set_by || '5686';
   const calendarName = payload.calendar_name || eventPayload.calendar_name || eventPayload.title || 'N/A';
 
-  // ═══════════════════════════════════════════════════════════════
-  // v2.5: LP APPOINTMENT PRE-CHECK
-  // If LP already has an appointment on the same date, skip the API call.
-  // This handles the case where the appointment originated from LP
-  // (call center / canvassing) and GHL is redundantly trying to set it.
-  // If the dates differ, it's a reschedule from GHL — proceed.
-  // ═══════════════════════════════════════════════════════════════
+  // v2.5: LP appointment pre-check
   const ghlDateNormalized = normalizeDateForComparison(rawDate);
-
   try {
     const { data: existingLead } = await supabase
       .from('lp_leads')
@@ -323,34 +476,19 @@ async function executeSetLPAppointment(action) {
     if (existingLead?.appointment_set && existingLead.appointment_date) {
       const lpDateNormalized = normalizeDateForComparison(existingLead.appointment_date);
       if (ghlDateNormalized && lpDateNormalized && ghlDateNormalized === lpDateNormalized) {
-        console.log(`[ActionExecutor] ⏭️ LP already has appointment on ${lpDateNormalized} for lds_id=${lpLeadId} — skipping SetAppointment (originated from LP)`);
-
-        await addGHLNote(contactId, `[LP SYNC] Appointment already exists in LP — skipped duplicate SetAppointment\nLP Lead ID: ${lpLeadId}\nLP Date: ${lpDateNormalized}\nGHL Date: ${ghlDateNormalized}\nCalendar: ${calendarName}`).catch(() => {});
-
-        return {
-          action: 'already_set_in_lp',
-          lp_lead_id: lpLeadId,
-          lp_appointment_date: lpDateNormalized,
-          ghl_appointment_date: ghlDateNormalized,
-          reason: 'LP already has appointment on same date — appointment likely originated from LP call center',
-          calendar_name: calendarName,
-          contact_id: contactId,
-        };
-      } else {
-        console.log(`[ActionExecutor] LP has appointment on ${lpDateNormalized} but GHL wants ${ghlDateNormalized} — proceeding (reschedule)`);
+        console.log(`[ActionExecutor] ⏭️ LP already has appointment on ${lpDateNormalized} for lds_id=${lpLeadId}`);
+        await addGHLNote(contactId, `[LP SYNC] Appointment already exists in LP — skipped\nLP Lead ID: ${lpLeadId}\nDate: ${lpDateNormalized}`).catch(() => {});
+        return { action: 'already_set_in_lp', lp_lead_id: lpLeadId, lp_appointment_date: lpDateNormalized, ghl_appointment_date: ghlDateNormalized, calendar_name: calendarName, contact_id: contactId };
       }
     }
   } catch (err) {
-    // Pre-check failed — proceed anyway (don't block on pre-check errors)
-    console.warn(`[ActionExecutor] LP pre-check failed for ${lpLeadId}: ${err.message} — proceeding with SetAppointment`);
+    console.warn(`[ActionExecutor] LP pre-check failed for ${lpLeadId}: ${err.message}`);
   }
 
-  // ─── Call LP SetAppointment API ────────────────────────────────
-  console.log(`[ActionExecutor] LP Appointment: lds_id=${lpLeadId}, date=${apptDate}, time=${apptTime}, calendar=${calendarName}`);
-
+  console.log(`[ActionExecutor] LP Appointment: lds_id=${lpLeadId}, date=${apptDate}, time=${apptTime}`);
   const result = await lpSetAppointment({ ldsId: lpLeadId, setBy, apptDate, apptTime });
 
-  await addGHLNote(contactId, `[LP SYNC] Appointment set in Lead Perfection\nLP Lead ID: ${lpLeadId}\nDate: ${apptDate}\nTime: ${apptTime}\nCalendar: ${calendarName}`).catch(() => {});
+  await addGHLNote(contactId, `[LP SYNC] Appointment set in LP\nLP Lead ID: ${lpLeadId}\nDate: ${apptDate}\nTime: ${apptTime}\nCalendar: ${calendarName}`).catch(() => {});
   const { name } = await resolveContactInfo(contactId);
   await sendGroupMeMessage(`📅 LP Appointment Set\nContact: ${name || contactId}\nLP Lead: ${lpLeadId}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName}`).catch(() => {});
 
@@ -380,13 +518,16 @@ async function executeUpdateCustomFields(action) {
 // EXECUTOR ENGINE
 // ═══════════════════════════════════════════════════════════════════
 
-const CONTEXT_AWARE_HANDLERS = new Set(['send_notification', 'create_task']);
+const CONTEXT_AWARE_HANDLERS = new Set(['send_notification', 'create_task', 'book_appointment']);
 
 const ACTION_HANDLERS = {
   add_tag: executeAddTag,
   remove_tag: executeRemoveTag,
   move_opportunity: executeMoveOpportunity,
   remove_from_workflow: executeRemoveFromWorkflow,
+  add_to_workflow: executeAddToWorkflow,
+  book_appointment: executeBookAppointment,
+  cancel_appointment: executeCancelAppointment,
   create_task: executeCreateTask,
   send_notification: executeSendNotification,
   set_lp_appointment: executeSetLPAppointment,
