@@ -17,6 +17,12 @@
  *   set_lp_appointment   → Push appointment to LP via SetAppointment API (Phase 2 write)
  *   update_custom_fields → PUT /contacts/{id} with customFields array
  *
+ * v3.1 — Fix set_lp_appointment date/time resolution for webhook payloads.
+ *   GHL APPT Handler sends startDate ("April 8, 2026") and start_time ("2:00 PM")
+ *   but the executor only checked appt_date/appointment_date and appt_time/appointment_time.
+ *   Now resolves startDate, start_date, and start_time from event payloads.
+ *   Adds parseLongDate() for "Month Day, Year" format.
+ *
  * v3.0 — TIER 1 AGENTIC: Three new action types for routing decisions.
  *   add_to_workflow: Enrolls contact in any GHL workflow by ID.
  *   book_appointment: Books a GHL calendar appointment with date/time/calendar.
@@ -397,12 +403,42 @@ async function executeCancelAppointment(action) {
 // LP APPOINTMENT WRITEBACK
 // ═══════════════════════════════════════════════════════════════════
 
+/**
+ * v3.1: Parse long-format dates from GHL webhook payloads.
+ * GHL sends dates like "April 8, 2026" or "April 08, 2026" via
+ * template variables. Converts to MM/DD/YYYY for LP API.
+ * Returns null if the string is not a recognizable long date.
+ */
+const MONTH_MAP = {
+  january: '01', february: '02', march: '03', april: '04',
+  may: '05', june: '06', july: '07', august: '08',
+  september: '09', october: '10', november: '11', december: '12',
+};
+
+function parseLongDate(dateStr) {
+  if (!dateStr) return null;
+  const match = String(dateStr).trim().match(/^(\w+)\s+(\d{1,2}),?\s+(\d{4})$/);
+  if (!match) return null;
+  const month = MONTH_MAP[match[1].toLowerCase()];
+  if (!month) return null;
+  const day = String(match[2]).padStart(2, '0');
+  return `${month}/${day}/${match[3]}`;
+}
+
 function normalizeDateForComparison(dateStr) {
   if (!dateStr) return null;
   const s = String(dateStr).trim();
+  // ISO format: 2026-04-08 or 2026-04-08T14:00:00
   if (s.match(/^\d{4}-\d{2}-\d{2}/)) return s.slice(0, 10);
+  // US format: 04/08/2026
   const usMatch = s.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
   if (usMatch) return `${usMatch[3]}-${usMatch[1]}-${usMatch[2]}`;
+  // v3.1: Long format: "April 8, 2026"
+  const longParsed = parseLongDate(s);
+  if (longParsed) {
+    const [m, d, y] = longParsed.split('/');
+    return `${y}-${m}-${d}`;
+  }
   return null;
 }
 
@@ -428,28 +464,61 @@ async function executeSetLPAppointment(action) {
   }
   if (!lpLeadId) throw new Error(`No LP Lead ID for contact ${contactId}`);
 
+  // ── v3.1: EXPANDED DATE RESOLUTION ──
+  // Priority: explicit payload fields → event payload fields (multiple naming conventions)
+  // GHL webhook sends: startDate ("April 8, 2026"), start_time ("2:00 PM")
+  // GHL workflow sends: appt_date, appointment_date (various formats)
+  // Fallback: ISO start_time if it contains a date, then GHL contact lookup
   let rawDate = payload.appt_date || payload.appointment_date
     || eventPayload.appt_date || eventPayload.appointment_date
-    || eventPayload.start_time || null;
+    || eventPayload.startDate || eventPayload.start_date
+    || null;
+  // Fallback: extract date from ISO start_time (e.g. "2026-04-08T14:00:00")
+  if (!rawDate && eventPayload.start_time && String(eventPayload.start_time).includes('T')) {
+    rawDate = eventPayload.start_time;
+  }
   if (!rawDate && contactId) {
     const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
     rawDate = ghlRes?.contact?.last_appointment_start_date || ghlRes?.contact?.lastAppointmentStartDate || null;
   }
   if (!rawDate) throw new Error('Cannot resolve appointment date');
 
+  // Convert rawDate to MM/DD/YYYY for LP API
   let apptDate;
-  if (rawDate.includes('-')) { const [y, m, d] = rawDate.split('T')[0].split('-'); apptDate = `${m}/${d}/${y}`; }
-  else apptDate = rawDate;
+  if (rawDate.includes('-')) {
+    // ISO format: 2026-04-08 or 2026-04-08T14:00:00
+    const [y, m, d] = rawDate.split('T')[0].split('-');
+    apptDate = `${m}/${d}/${y}`;
+  } else {
+    // v3.1: Try long format ("April 8, 2026") then fall through to raw
+    const longParsed = parseLongDate(rawDate);
+    apptDate = longParsed || rawDate;
+  }
 
+  // ── v3.1: EXPANDED TIME RESOLUTION ──
+  // Priority: explicit payload fields → event payload fields → ISO extraction → GHL contact
+  // GHL webhook sends: start_time ("2:00 PM" or ISO "2026-04-08T14:00:00")
   let rawTime = payload.appt_time || payload.appointment_time
-    || eventPayload.appt_time || eventPayload.appointment_time || null;
-  if (!rawTime && eventPayload.start_time?.includes('T')) rawTime = eventPayload.start_time.split('T')[1]?.slice(0, 5);
+    || eventPayload.appt_time || eventPayload.appointment_time
+    || null;
+  // v3.1: Check start_time — could be "2:00 PM" (direct) or ISO (extract time part)
+  if (!rawTime && eventPayload.start_time) {
+    const st = String(eventPayload.start_time);
+    if (st.includes('T')) {
+      // ISO format: extract time portion "14:00"
+      rawTime = st.split('T')[1]?.slice(0, 5);
+    } else {
+      // Direct time format: "2:00 PM", "14:00", etc.
+      rawTime = st;
+    }
+  }
   if (!rawTime && contactId) {
     const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
     rawTime = ghlRes?.contact?.last_appointment_start_time || ghlRes?.contact?.lastAppointmentStartTime || null;
   }
   if (!rawTime) throw new Error('Cannot resolve appointment time');
 
+  // Normalize 12h → 24h for LP API
   let apptTime = rawTime;
   const match12 = apptTime.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
   if (match12) {
