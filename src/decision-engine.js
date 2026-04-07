@@ -18,6 +18,10 @@
  *   - ai.analysis_completed → matched against contextual rules using lead_intelligence
  *   - intent.* events → processed by rules but do NOT trigger re-scoring (loop prevention)
  *
+ * v2.3 — Added payload_field_not_null / payload_field_null context conditions.
+ *   Fixes LP_DISP_SET / LP_DISP_ISSUE GroupMe flood — rules were firing on
+ *   LP sync backfill events where previous_disposition was null.
+ *
  * v2.2.1 — Added INTENT_ to stage gate prefixes. Previously only BEHAVIORAL_ and
  *   OBJECTION_ were gated. INTENT_HOT_FROM_COLD was firing on anonymous Guest Visitors.
  *
@@ -245,6 +249,26 @@ async function evaluateContextConditions(conditions, intelligence, event) {
       case 'intent_tier_eq': if (merged.intent_tier !== expected) return false; break;
       case 'intent_score_gte': if ((merged.intent_score || 0) < expected) return false; break;
       case 'compound_pattern_eq': if (merged.compound_pattern !== expected) return false; break;
+      // ─── v2.3: Payload field existence checks ────
+      // Used to guard LP disposition rules against sync backfill.
+      // "payload_field_not_null": "previous_disposition" → only fires if field has a value
+      // "payload_field_null": "previous_disposition" → only fires if field is null/missing
+      case 'payload_field_not_null': {
+        const fieldVal = payload[expected];
+        if (fieldVal === null || fieldVal === undefined) {
+          console.log(`[Context] BLOCKED: payload.${expected} is null/missing`);
+          return false;
+        }
+        break;
+      }
+      case 'payload_field_null': {
+        const fieldVal2 = payload[expected];
+        if (fieldVal2 !== null && fieldVal2 !== undefined) {
+          console.log(`[Context] BLOCKED: payload.${expected} has value "${fieldVal2}"`);
+          return false;
+        }
+        break;
+      }
       default: console.warn(`[DecisionEngine] Unknown context condition: ${key}`);
     }
   }
