@@ -17,11 +17,12 @@
  *   set_lp_appointment   → Push appointment to LP via SetAppointment API (Phase 2 write)
  *   update_custom_fields → PUT /contacts/{id} with customFields array
  *
- * v3.2 — Batch tag removal to avoid GHL 429 rate limits.
- *   remove_tag now accepts { tags: ["a","b","c"] } in addition to { tag: "x" }.
- *   GHL DELETE /contacts/{id}/tags natively accepts arrays.
- *   Rule 82 restructured from 55 individual calls to ~5 batch calls.
+ * v3.3 — Enrich send_notification with contact name + LP Prospect ID.
+ *   New template variables: {{contact_name}}, {{contact_id}}, {{contact_phone}}, {{lp_prospect_id}}
+ *   Resolved from GHL API and Supabase lp_leads before interpolation.
+ *   If message contains "Name:" or "Contact ID:", old Contact suffix is suppressed.
  *
+ * v3.2 — Batch tag removal to avoid GHL 429 rate limits.
  * v3.1 — Fix set_lp_appointment date/time resolution for webhook payloads.
  * v3.0 — TIER 1 AGENTIC: add_to_workflow, book_appointment, cancel_appointment.
  * v2.5 — LP appointment pre-check.
@@ -148,7 +149,7 @@ function interpolatePayload(payload, context) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// CONTACT NAME RESOLVER
+// CONTACT + LP PROSPECT RESOLVER
 // ═══════════════════════════════════════════════════════════════════
 
 async function resolveContactInfo(contactId) {
@@ -160,6 +161,23 @@ async function resolveContactInfo(contactId) {
     const phone = c.phone || null;
     return { name, phone };
   } catch { return { name: null, phone: null }; }
+}
+
+/**
+ * v3.3: Resolve LP Prospect ID from Supabase for a GHL contact.
+ * Returns the most recent LP lead's lp_prospect_id (the PROSPECT, not the lead).
+ * Mark specifically requested Prospect ID for GroupMe notifications.
+ */
+async function resolveLPProspectId(contactId) {
+  if (!contactId) return null;
+  try {
+    const { data: lpLead } = await supabase.from('lp_leads')
+      .select('lp_prospect_id')
+      .eq('ghl_contact_id', contactId)
+      .order('synced_at', { ascending: false })
+      .limit(1).maybeSingle();
+    return lpLead?.lp_prospect_id ? String(lpLead.lp_prospect_id) : null;
+  } catch { return null; }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -178,21 +196,13 @@ async function executeAddTag(action) {
  * v3.2: Batch tag removal — accepts either:
  *   { tag: "single-tag" }        → removes one tag (backwards compatible)
  *   { tags: ["a", "b", "c"] }    → removes all tags in ONE API call
- *
- * GHL DELETE /contacts/{id}/tags natively accepts { tags: [...] }.
- * Using batch removal avoids 429 rate limits when removing many tags
- * (e.g., Rule 82 removes ~48 tags at booking).
  */
 async function executeRemoveTag(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
-
-  // Support both single tag and batch array
   const tags = payload.tags || (payload.tag ? [payload.tag] : []);
   if (!contactId || tags.length === 0) throw new Error('Missing contactId or tag/tags');
-
   await ghlFetch('DELETE', `/contacts/${contactId}/tags`, { tags });
-
   if (tags.length === 1) {
     return { tag_removed: tags[0], contact_id: contactId };
   }
@@ -247,15 +257,42 @@ async function executeCreateTask(action, context) {
   return { action: 'note_added', contact_id: contactId, title };
 }
 
+/**
+ * v3.3: Enriched send_notification — resolves contact details and LP Prospect ID
+ * before template interpolation. Available template variables:
+ *   {{contact_name}}    — GHL contact first+last name
+ *   {{contact_id}}      — GHL contact ID
+ *   {{contact_phone}}   — GHL contact phone
+ *   {{lp_prospect_id}}  — LP Prospect ID from Supabase lp_leads
+ *
+ * If the interpolated message already contains "Name:" or "Contact ID:",
+ * the old "Contact: name (phone)" suffix is suppressed to avoid duplication.
+ */
 async function executeSendNotification(action, context) {
-  const payload = interpolatePayload(action.action_payload, context);
-  const message = payload?.message || 'Agent notification';
   const contactId = action.target_id;
   const { name, phone } = await resolveContactInfo(contactId);
-  const contactLabel = name ? `${name}${phone ? ` (${phone})` : ''}` : contactId;
-  const full = `🤖 ${message}\nContact: ${contactLabel}`;
+  const prospectId = await resolveLPProspectId(contactId);
+
+  // Enrich context with resolved contact info for template interpolation
+  const enrichedContext = {
+    ...context,
+    contact_name: name || 'Unknown',
+    contact_id: contactId,
+    contact_phone: phone || '',
+    lp_prospect_id: prospectId || 'N/A',
+  };
+
+  const payload = interpolatePayload(action.action_payload, enrichedContext);
+  const message = payload?.message || 'Agent notification';
+
+  // If message already has structured contact info, don't append the old format
+  const hasContactBlock = message.includes('Name:') || message.includes('Contact ID:');
+  const full = hasContactBlock
+    ? `🤖 ${message}`
+    : `🤖 ${message}\nName: ${name || 'Unknown'}\nContact ID: ${contactId}${prospectId ? `\nProspect ID: ${prospectId}` : ''}`;
+
   await sendGroupMeMessage(full);
-  return { action: 'groupme_sent', message: full.slice(0, 100) };
+  return { action: 'groupme_sent', message: full.slice(0, 200) };
 }
 
 // ═══════════════════════════════════════════════════════════════════
