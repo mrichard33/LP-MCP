@@ -12,11 +12,148 @@
  *   GET /api/search?email=...        — Search by email
  *   GET /api/search?name=...         — Search by name (first or last)
  *   GET /api/lead-summary/:contactId — Full lead intelligence summary
+ *   POST /webhook/ghl-event          — GHL→Agentic handoff (Webhook Bridge)
  */
 
 import supabase from './supabase.js';
+import crypto from 'crypto';
+
+// ═══════════════════════════════════════════════════════════════════
+// WEBHOOK SIGNATURE VERIFICATION (optional but recommended)
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Verifies HMAC-SHA256 signature from GHL Custom Webhook.
+ * If WEBHOOK_SECRET is not set, verification is skipped (open mode).
+ * Header: x-webhook-signature: sha256=<hex>
+ */
+function verifyWebhookSignature(req) {
+  const secret = process.env.WEBHOOK_SECRET;
+  if (!secret) return true; // No secret configured — open mode
+
+  const signature = req.headers['x-webhook-signature'];
+  if (!signature) return false;
+
+  const body = JSON.stringify(req.body);
+  const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(body).digest('hex');
+  return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+}
 
 export function registerRestApiRoutes(app, authenticate) {
+
+  // ═══════════════════════════════════════════════════════════════
+  // POST /webhook/ghl-event — GHL → Agentic Layer Handoff
+  // ═══════════════════════════════════════════════════════════════
+  //
+  // This is the universal entry point for GHL workflows to hand off
+  // decision-making to the LP MCP agentic layer. GHL workflows POST
+  // a JSON payload with contact data + trigger context. This endpoint
+  // creates a system_event and returns immediately. The Decision Engine
+  // picks it up on the next cron cycle.
+  //
+  // Payload contract:
+  // {
+  //   "contact_id":      "GHL contact ID",
+  //   "contact_name":    "Full name",
+  //   "contact_phone":   "Phone",
+  //   "contact_email":   "Email",
+  //   "lp_lead_id":      "LP lead ID (if known)",
+  //   "entry_source":    "entry:tag value",
+  //   "current_tags":    "comma-separated tag string or array",
+  //   "trigger_context": "appointment_booked | disposition_changed | stage_advanced | ...",
+  //   "calendar_name":   "Calendar name (for appointment events)",
+  //   "appointment_date": "YYYY-MM-DD",
+  //   "appointment_time": "HH:MM AM/PM",
+  //   ...any additional fields specific to the trigger
+  // }
+  //
+  // Returns: { received: true, event_id: <id> }
+  //
+  app.post('/webhook/ghl-event', async (req, res) => {
+    try {
+      // ─── Signature verification ────────────────────────────
+      if (!verifyWebhookSignature(req)) {
+        console.warn('[Webhook] Invalid signature — rejected');
+        return res.status(401).json({ error: 'Invalid webhook signature' });
+      }
+
+      const payload = req.body;
+      if (!payload || typeof payload !== 'object') {
+        return res.status(400).json({ error: 'Request body must be JSON' });
+      }
+
+      const contactId = payload.contact_id || payload.contactId || '';
+      const triggerContext = payload.trigger_context || payload.triggerContext || 'unknown';
+      const lpLeadId = payload.lp_lead_id || payload.lpLeadId || null;
+
+      if (!contactId && !lpLeadId) {
+        return res.status(400).json({ error: 'Either contact_id or lp_lead_id is required' });
+      }
+
+      // ─── Build event_subtype from trigger context ──────────
+      const subtypeMap = {
+        'appointment_booked': 'appt:booked',
+        'appointment_cancelled': 'appt:cancelled',
+        'appointment_rescheduled': 'appt:rescheduled',
+        'appointment_completed': 'appt:completed',
+        'appointment_no_show': 'appt:no_show',
+        'disposition_changed': 'lp:disposition',
+        'stage_advanced': 'pipeline:advanced',
+        'tag_added': 'contact:tag_added',
+        'reply_received': 'contact:reply',
+        'booking_requested': 'appt:booking_requested',
+      };
+      const eventSubtype = subtypeMap[triggerContext] || triggerContext;
+
+      // ─── Dedup key: prevent duplicate events from GHL retries ──
+      const idempotencyKey = `ghl_${contactId || lpLeadId}_${triggerContext}_${Math.floor(Date.now() / 60000)}`;
+
+      // ─── Check for duplicate (same key within last 5 min) ──
+      const { data: existing } = await supabase
+        .from('system_events')
+        .select('id')
+        .eq('idempotency_key', idempotencyKey)
+        .limit(1);
+
+      if (existing && existing.length > 0) {
+        console.log(`[Webhook] Dedup: event already exists for ${idempotencyKey}`);
+        return res.json({ received: true, event_id: existing[0].id, deduplicated: true });
+      }
+
+      // ─── Create system_event ───────────────────────────────
+      const { data: event, error } = await supabase
+        .from('system_events')
+        .insert({
+          event_type: 'ghl.workflow_handoff',
+          event_subtype: eventSubtype,
+          source: 'ghl',
+          entity_type: 'contact',
+          entity_id: contactId || lpLeadId,
+          ghl_contact_id: contactId || null,
+          lp_lead_id: lpLeadId || null,
+          payload: payload,
+          priority: triggerContext.includes('appointment') ? 'high' : 'normal',
+          idempotency_key: idempotencyKey,
+          event_timestamp: new Date().toISOString(),
+        })
+        .select('id')
+        .single();
+
+      if (error) {
+        console.error('[Webhook] Event creation failed:', error.message);
+        return res.status(500).json({ error: 'Failed to create event', detail: error.message });
+      }
+
+      console.log(`[Webhook] ✅ Event ${event.id} created: ${triggerContext} for ${contactId || lpLeadId}`);
+      res.json({ received: true, event_id: event.id, trigger_context: triggerContext });
+
+    } catch (err) {
+      console.error('[Webhook] Unhandled error:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  console.log('[Webhook] Registered: POST /webhook/ghl-event');
 
   // ─── GET /api/prospects/:prospectId ────────────────────────────
   // Returns all leads for an LP prospect (cst_id)
