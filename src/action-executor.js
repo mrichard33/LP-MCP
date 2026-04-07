@@ -14,9 +14,13 @@
  *   set_lp_appointment   → Push appointment to LP via SetAppointment API (Phase 2 write)
  *   update_custom_fields → PUT /contacts/{id} with customFields array
  *
- * v2.3 — Template interpolation: resolves {{variable}} placeholders in action_payload
- *   messages and task descriptions using event payload data. No more blank fields
- *   in GroupMe notifications.
+ * v2.5 — LP appointment pre-check: before calling SetAppointment, checks lp_leads
+ *   table for existing appointment on same date. If LP already has it (appointment
+ *   originated from LP call center), skips the API call. If date differs (reschedule
+ *   from GHL), proceeds. Prevents redundant/error-prone duplicate SetAppointment calls.
+ *
+ * v2.4 — Fix appointment date/time resolution from GHL webhook payloads.
+ * v2.3 — Template interpolation for action payloads.
  */
 
 import supabase from './supabase.js';
@@ -80,13 +84,9 @@ async function ghlFetch(method, path, body = null) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// TEMPLATE INTERPOLATION — resolve {{variable}} in action payloads
+// TEMPLATE INTERPOLATION
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * Fetches the event payload for an action and returns a flat key-value map
- * of all available variables for template resolution.
- */
 async function getEventContext(action) {
   if (!action.event_id) return {};
   try {
@@ -97,7 +97,6 @@ async function getEventContext(action) {
       .maybeSingle();
     if (!evt?.payload) return {};
     const payload = typeof evt.payload === 'string' ? JSON.parse(evt.payload) : evt.payload;
-    // Flatten one level deep — {{score}}, {{rep_briefing}}, etc.
     return { ...payload };
   } catch (err) {
     console.error(`[ActionExecutor] Failed to fetch event context for action ${action.id}:`, err.message);
@@ -105,10 +104,6 @@ async function getEventContext(action) {
   }
 }
 
-/**
- * Resolves {{variable}} placeholders in a string using a context map.
- * Unresolved variables are replaced with empty string (no leftover {{}} in output).
- */
 function interpolate(template, context) {
   if (!template || typeof template !== 'string') return template;
   return template.replace(/\{\{(\w+)\}\}/g, (match, key) => {
@@ -118,9 +113,6 @@ function interpolate(template, context) {
   });
 }
 
-/**
- * Deep-interpolates all string values in an action_payload object.
- */
 function interpolatePayload(payload, context) {
   if (!payload || typeof payload !== 'object') return payload;
   if (!context || Object.keys(context).length === 0) return payload;
@@ -138,11 +130,11 @@ function interpolatePayload(payload, context) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// CONTACT NAME RESOLVER (for GroupMe messages)
+// CONTACT NAME RESOLVER
 // ═══════════════════════════════════════════════════════════════════
 
 async function resolveContactInfo(contactId) {
-  if (!contactId || /^\d+$/.test(contactId)) return { name: null, phone: null }; // LP prospect ID, skip
+  if (!contactId || /^\d+$/.test(contactId)) return { name: null, phone: null };
   try {
     const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
     const c = ghlRes?.contact || {};
@@ -234,17 +226,34 @@ async function executeSendNotification(action, context) {
 // LP APPOINTMENT WRITEBACK
 // ═══════════════════════════════════════════════════════════════════
 
+/**
+ * Normalize a date to YYYY-MM-DD for comparison purposes.
+ * Handles: "2026-04-10", "2026-04-10T14:00:00+00:00", "04/10/2026"
+ */
+function normalizeDateForComparison(dateStr) {
+  if (!dateStr) return null;
+  const s = String(dateStr).trim();
+  // ISO format: 2026-04-10 or 2026-04-10T...
+  if (s.match(/^\d{4}-\d{2}-\d{2}/)) return s.slice(0, 10);
+  // US format: MM/DD/YYYY
+  const usMatch = s.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
+  if (usMatch) return `${usMatch[3]}-${usMatch[1]}-${usMatch[2]}`;
+  return null;
+}
+
 async function executeSetLPAppointment(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
 
+  // ─── Fetch event payload (contains the GHL webhook data) ───────
   let eventPayload = {};
   if (action.event_id) {
     const { data: evt } = await supabase.from('system_events').select('payload').eq('id', action.event_id).maybeSingle();
     if (evt?.payload) eventPayload = typeof evt.payload === 'string' ? JSON.parse(evt.payload) : evt.payload;
   }
 
-  let lpLeadId = payload.lp_lead_id;
+  // ─── Resolve LP Lead ID ────────────────────────────────────────
+  let lpLeadId = payload.lp_lead_id || eventPayload.lp_lead_id || eventPayload.lpLeadId || null;
   if (!lpLeadId && contactId) {
     const { data: lpLead } = await supabase.from('lp_leads').select('lp_lead_id').eq('ghl_contact_id', contactId).order('synced_at', { ascending: false }).limit(1).maybeSingle();
     if (lpLead?.lp_lead_id) { lpLeadId = lpLead.lp_lead_id; }
@@ -256,7 +265,10 @@ async function executeSetLPAppointment(action) {
   }
   if (!lpLeadId) throw new Error(`No LP Lead ID for contact ${contactId}`);
 
-  let rawDate = payload.appt_date || eventPayload.start_time || null;
+  // ─── Resolve appointment date ──────────────────────────────────
+  let rawDate = payload.appt_date || payload.appointment_date
+    || eventPayload.appt_date || eventPayload.appointment_date
+    || eventPayload.start_time || null;
   if (!rawDate && contactId) {
     const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
     rawDate = ghlRes?.contact?.last_appointment_start_date || ghlRes?.contact?.lastAppointmentStartDate || null;
@@ -267,7 +279,9 @@ async function executeSetLPAppointment(action) {
   if (rawDate.includes('-')) { const [y, m, d] = rawDate.split('T')[0].split('-'); apptDate = `${m}/${d}/${y}`; }
   else apptDate = rawDate;
 
-  let rawTime = payload.appt_time || null;
+  // ─── Resolve appointment time ──────────────────────────────────
+  let rawTime = payload.appt_time || payload.appointment_time
+    || eventPayload.appt_time || eventPayload.appointment_time || null;
   if (!rawTime && eventPayload.start_time?.includes('T')) rawTime = eventPayload.start_time.split('T')[1]?.slice(0, 5);
   if (!rawTime && contactId) {
     const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
@@ -275,6 +289,7 @@ async function executeSetLPAppointment(action) {
   }
   if (!rawTime) throw new Error('Cannot resolve appointment time');
 
+  // ─── Convert 12h to 24h format if needed ───────────────────────
   let apptTime = rawTime;
   const match12 = apptTime.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
   if (match12) {
@@ -287,7 +302,51 @@ async function executeSetLPAppointment(action) {
   if (apptTime.length > 5) apptTime = apptTime.slice(0, 5);
 
   const setBy = payload.set_by || '5686';
-  const calendarName = payload.calendar_name || eventPayload.title || 'N/A';
+  const calendarName = payload.calendar_name || eventPayload.calendar_name || eventPayload.title || 'N/A';
+
+  // ═══════════════════════════════════════════════════════════════
+  // v2.5: LP APPOINTMENT PRE-CHECK
+  // If LP already has an appointment on the same date, skip the API call.
+  // This handles the case where the appointment originated from LP
+  // (call center / canvassing) and GHL is redundantly trying to set it.
+  // If the dates differ, it's a reschedule from GHL — proceed.
+  // ═══════════════════════════════════════════════════════════════
+  const ghlDateNormalized = normalizeDateForComparison(rawDate);
+
+  try {
+    const { data: existingLead } = await supabase
+      .from('lp_leads')
+      .select('appointment_set, appointment_date')
+      .eq('lp_lead_id', lpLeadId)
+      .maybeSingle();
+
+    if (existingLead?.appointment_set && existingLead.appointment_date) {
+      const lpDateNormalized = normalizeDateForComparison(existingLead.appointment_date);
+      if (ghlDateNormalized && lpDateNormalized && ghlDateNormalized === lpDateNormalized) {
+        console.log(`[ActionExecutor] ⏭️ LP already has appointment on ${lpDateNormalized} for lds_id=${lpLeadId} — skipping SetAppointment (originated from LP)`);
+
+        await addGHLNote(contactId, `[LP SYNC] Appointment already exists in LP — skipped duplicate SetAppointment\nLP Lead ID: ${lpLeadId}\nLP Date: ${lpDateNormalized}\nGHL Date: ${ghlDateNormalized}\nCalendar: ${calendarName}`).catch(() => {});
+
+        return {
+          action: 'already_set_in_lp',
+          lp_lead_id: lpLeadId,
+          lp_appointment_date: lpDateNormalized,
+          ghl_appointment_date: ghlDateNormalized,
+          reason: 'LP already has appointment on same date — appointment likely originated from LP call center',
+          calendar_name: calendarName,
+          contact_id: contactId,
+        };
+      } else {
+        console.log(`[ActionExecutor] LP has appointment on ${lpDateNormalized} but GHL wants ${ghlDateNormalized} — proceeding (reschedule)`);
+      }
+    }
+  } catch (err) {
+    // Pre-check failed — proceed anyway (don't block on pre-check errors)
+    console.warn(`[ActionExecutor] LP pre-check failed for ${lpLeadId}: ${err.message} — proceeding with SetAppointment`);
+  }
+
+  // ─── Call LP SetAppointment API ────────────────────────────────
+  console.log(`[ActionExecutor] LP Appointment: lds_id=${lpLeadId}, date=${apptDate}, time=${apptTime}, calendar=${calendarName}`);
 
   const result = await lpSetAppointment({ ldsId: lpLeadId, setBy, apptDate, apptTime });
 
@@ -321,7 +380,6 @@ async function executeUpdateCustomFields(action) {
 // EXECUTOR ENGINE
 // ═══════════════════════════════════════════════════════════════════
 
-// Handlers that accept (action, context) for template interpolation
 const CONTEXT_AWARE_HANDLERS = new Set(['send_notification', 'create_task']);
 
 const ACTION_HANDLERS = {
@@ -343,7 +401,6 @@ async function executeSingleAction(action) {
   }
   await supabase.from('agent_actions').update({ status: 'executing', updated_at: new Date().toISOString() }).eq('id', action.id);
   try {
-    // Fetch event context for template interpolation (only for handlers that need it)
     let context = {};
     if (CONTEXT_AWARE_HANDLERS.has(action.action_type)) {
       context = await getEventContext(action);
@@ -365,12 +422,10 @@ async function executeSingleAction(action) {
 export async function executeActions({ limit = 50 } = {}) {
   const startTime = Date.now();
 
-  // ─── Send GroupMe approval requests for pending_approval actions ──
   const { data: approvalActions } = await supabase.from('agent_actions')
     .select('*').eq('status', 'pending_approval')
     .order('created_at', { ascending: true }).limit(20);
   if (approvalActions?.length) {
-    // Group by batch_id
     const approvalBatches = new Map();
     for (const a of approvalActions) {
       const k = a.batch_id || `s_${a.id}`;
@@ -378,7 +433,6 @@ export async function executeActions({ limit = 50 } = {}) {
       approvalBatches.get(k).push(a);
     }
     for (const [batchId, actions] of approvalBatches) {
-      // Check if we already sent a request for this batch
       const { data: existing } = await supabase
         .from('groupme_approval_requests')
         .select('id')
@@ -393,7 +447,6 @@ export async function executeActions({ limit = 50 } = {}) {
     }
   }
 
-  // ─── Execute pending actions ──────────────────────────────────
   const { data: actions, error } = await supabase.from('agent_actions').select('*').eq('status', 'pending')
     .order('created_at', { ascending: true }).order('sequence_order', { ascending: true }).limit(limit);
   if (error) return { success: false, error: error.message };
