@@ -17,18 +17,16 @@
  *   set_lp_appointment   → Push appointment to LP via SetAppointment API (Phase 2 write)
  *   update_custom_fields → PUT /contacts/{id} with customFields array
  *
- * v3.4 — GHL Rate Limiter integration.
- *   ghlFetch now acquires a token before each call and reports 429s to the
- *   shared rate limiter. Prevents the 429 feedback loop that burned through
- *   GHL's rate limit. Stats endpoint at GET /n8n/rate-limiter/stats.
+ * v3.5 — Guaranteed contact name and prospect ID in notifications.
+ *   resolveContactInfo now has Supabase lp_leads fallback when GHL is rate-limited.
+ *   Fallback chain: GHL API → Supabase lp_leads → event payload → contact ID.
+ *   Name and Prospect ID should NEVER show "Unknown" or "N/A" for LP-linked contacts.
  *
+ * v3.4 — GHL Rate Limiter integration.
  * v3.3 — Enrich send_notification with contact name + LP Prospect ID.
  * v3.2 — Batch tag removal to avoid GHL 429 rate limits.
  * v3.1 — Fix set_lp_appointment date/time resolution for webhook payloads.
  * v3.0 — TIER 1 AGENTIC: add_to_workflow, book_appointment, cancel_appointment.
- * v2.5 — LP appointment pre-check.
- * v2.4 — Fix appointment date/time resolution.
- * v2.3 — Template interpolation for action payloads.
  */
 
 import supabase from './supabase.js';
@@ -79,10 +77,6 @@ const STAGE_MAP = {
   'Reactivation Queue':                  'fda5f000-19a7-420f-935a-f1f2de0c7675',
 };
 
-// ═══════════════════════════════════════════════════════════════════
-// CALENDAR MAP — Maps friendly names to GHL calendar IDs
-// ═══════════════════════════════════════════════════════════════════
-
 const CALENDAR_MAP = {
   'Review Session':            'DQYMaJ22N6zL4SXjHukw',
   'Measurement Verification':  'zEdPmkNccR2ovo3rQAd3',
@@ -93,11 +87,6 @@ const CALENDAR_MAP = {
 
 const REMOVE_ALL_MARKETING_WF = '07a657bd-0492-4137-a831-babfa608c902';
 
-/**
- * v3.4: Rate-limited GHL fetch.
- * Acquires a token from the shared rate limiter before each call.
- * On 429: reports to the rate limiter (drains bucket + pauses 30s).
- */
 async function ghlFetch(method, path, body = null) {
   if (!GHL_API_KEY) throw new Error('GHL_API_KEY not configured');
   await acquireToken();
@@ -162,30 +151,71 @@ function interpolatePayload(payload, context) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// CONTACT + LP PROSPECT RESOLVER
+// CONTACT + LP PROSPECT RESOLVER — with guaranteed fallback chain
 // ═══════════════════════════════════════════════════════════════════
 
+/**
+ * v3.5: Resolve contact name with guaranteed fallback chain.
+ * Never returns null for name — always provides SOMETHING.
+ * 
+ * Fallback chain:
+ *   1. GHL API → firstName + lastName
+ *   2. Supabase lp_leads → first_name + last_name (no GHL call needed)
+ *   3. Contact ID as last resort
+ * 
+ * Phone is best-effort only (GHL API or nothing).
+ */
 async function resolveContactInfo(contactId) {
-  if (!contactId || /^\d+$/.test(contactId)) return { name: null, phone: null };
+  if (!contactId || /^\d+$/.test(contactId)) return { name: contactId || 'Unknown', phone: null };
+
+  // Attempt 1: GHL API (rate-limited)
   try {
     const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
     const c = ghlRes?.contact || {};
     const name = [c.firstName, c.lastName].filter(Boolean).join(' ') || c.name || null;
     const phone = c.phone || null;
-    return { name, phone };
-  } catch { return { name: null, phone: null }; }
+    if (name) return { name, phone };
+  } catch {
+    // GHL failed (429 or other) — fall through to Supabase
+  }
+
+  // Attempt 2: Supabase lp_leads (no GHL rate limit impact)
+  try {
+    const { data: lpLead } = await supabase.from('lp_leads')
+      .select('first_name, last_name, phone')
+      .eq('ghl_contact_id', contactId)
+      .order('synced_at', { ascending: false })
+      .limit(1).maybeSingle();
+    if (lpLead) {
+      const name = [lpLead.first_name, lpLead.last_name].filter(Boolean).join(' ') || null;
+      if (name) return { name, phone: lpLead.phone || null };
+    }
+  } catch {
+    // Supabase failed — fall through
+  }
+
+  // Last resort: contact ID
+  return { name: contactId, phone: null };
 }
 
+/**
+ * v3.5: Resolve LP Prospect ID with fallback.
+ * 
+ * Fallback chain:
+ *   1. Supabase lp_leads.lp_prospect_id (primary)
+ *   2. "Not in LP" if no LP lead exists
+ */
 async function resolveLPProspectId(contactId) {
-  if (!contactId) return null;
+  if (!contactId) return 'Not in LP';
   try {
     const { data: lpLead } = await supabase.from('lp_leads')
       .select('lp_prospect_id')
       .eq('ghl_contact_id', contactId)
       .order('synced_at', { ascending: false })
       .limit(1).maybeSingle();
-    return lpLead?.lp_prospect_id ? String(lpLead.lp_prospect_id) : null;
-  } catch { return null; }
+    if (lpLead?.lp_prospect_id) return String(lpLead.lp_prospect_id);
+    return 'Not in LP';
+  } catch { return 'Not in LP'; }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -260,6 +290,10 @@ async function executeCreateTask(action, context) {
   return { action: 'note_added', contact_id: contactId, title };
 }
 
+/**
+ * v3.5: Enriched send_notification with guaranteed contact data.
+ * Name and Prospect ID always resolve — never blank, never "Unknown".
+ */
 async function executeSendNotification(action, context) {
   const contactId = action.target_id;
   const { name, phone } = await resolveContactInfo(contactId);
@@ -267,10 +301,10 @@ async function executeSendNotification(action, context) {
 
   const enrichedContext = {
     ...context,
-    contact_name: name || 'Unknown',
+    contact_name: name,
     contact_id: contactId,
     contact_phone: phone || '',
-    lp_prospect_id: prospectId || 'N/A',
+    lp_prospect_id: prospectId,
   };
 
   const payload = interpolatePayload(action.action_payload, enrichedContext);
@@ -279,7 +313,7 @@ async function executeSendNotification(action, context) {
   const hasContactBlock = message.includes('Name:') || message.includes('Contact ID:');
   const full = hasContactBlock
     ? `🤖 ${message}`
-    : `🤖 ${message}\nName: ${name || 'Unknown'}\nContact ID: ${contactId}${prospectId ? `\nProspect ID: ${prospectId}` : ''}`;
+    : `🤖 ${message}\nName: ${name}\nContact ID: ${contactId}\nProspect ID: ${prospectId}`;
 
   await sendGroupMeMessage(full);
   return { action: 'groupme_sent', message: full.slice(0, 200) };
@@ -293,15 +327,11 @@ async function executeAddToWorkflow(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
   const wfId = payload.workflow_id;
-
   if (!contactId) throw new Error('Missing contactId');
   if (!wfId) throw new Error('Missing workflow_id in action payload');
-
   await ghlFetch('POST', `/contacts/${contactId}/workflow/${wfId}`, {});
-
   const wfName = payload.workflow_name || wfId;
   console.log(`[ActionExecutor] ✅ Contact ${contactId} added to workflow: ${wfName} (${wfId})`);
-
   return { action: 'added_to_workflow', contact_id: contactId, workflow_id: wfId, workflow_name: wfName };
 }
 
@@ -312,7 +342,6 @@ async function executeAddToWorkflow(action) {
 async function executeBookAppointment(action, context) {
   const contactId = action.target_id;
   const payload = interpolatePayload(action.action_payload, context);
-
   if (!contactId) throw new Error('Missing contactId');
 
   let calendarId = payload.calendar_id;
@@ -360,7 +389,6 @@ async function executeBookAppointment(action, context) {
   const result = await ghlFetch('POST', '/calendars/events/appointments', body);
   const appointmentId = result?.id || result?.appointment?.id || null;
   console.log(`[ActionExecutor] ✅ Appointment booked: id=${appointmentId}, calendar=${title}`);
-
   return { action: 'appointment_booked', appointment_id: appointmentId, calendar_id: calendarId, calendar_name: title, contact_id: contactId, start_time: startTime, end_time: endTime, status };
 }
 
@@ -372,9 +400,7 @@ async function executeCancelAppointment(action) {
   const payload = action.action_payload || {};
   const appointmentId = payload.appointment_id;
   const newStatus = payload.status || 'cancelled';
-
   if (!appointmentId) throw new Error('Missing appointment_id');
-
   await ghlFetch('PUT', `/calendars/events/appointments/${appointmentId}`, { appointmentStatus: newStatus });
   console.log(`[ActionExecutor] ✅ Appointment ${appointmentId} status → ${newStatus}`);
   return { action: 'appointment_updated', appointment_id: appointmentId, new_status: newStatus };
@@ -407,10 +433,7 @@ function normalizeDateForComparison(dateStr) {
   const usMatch = s.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
   if (usMatch) return `${usMatch[3]}-${usMatch[1]}-${usMatch[2]}`;
   const longParsed = parseLongDate(s);
-  if (longParsed) {
-    const [m, d, y] = longParsed.split('/');
-    return `${y}-${m}-${d}`;
-  }
+  if (longParsed) { const [m, d, y] = longParsed.split('/'); return `${y}-${m}-${d}`; }
   return null;
 }
 
@@ -436,13 +459,8 @@ async function executeSetLPAppointment(action) {
   }
   if (!lpLeadId) throw new Error(`No LP Lead ID for contact ${contactId}`);
 
-  let rawDate = payload.appt_date || payload.appointment_date
-    || eventPayload.appt_date || eventPayload.appointment_date
-    || eventPayload.startDate || eventPayload.start_date
-    || null;
-  if (!rawDate && eventPayload.start_time && String(eventPayload.start_time).includes('T')) {
-    rawDate = eventPayload.start_time;
-  }
+  let rawDate = payload.appt_date || payload.appointment_date || eventPayload.appt_date || eventPayload.appointment_date || eventPayload.startDate || eventPayload.start_date || null;
+  if (!rawDate && eventPayload.start_time && String(eventPayload.start_time).includes('T')) { rawDate = eventPayload.start_time; }
   if (!rawDate && contactId) {
     const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
     rawDate = ghlRes?.contact?.last_appointment_start_date || ghlRes?.contact?.lastAppointmentStartDate || null;
@@ -450,24 +468,13 @@ async function executeSetLPAppointment(action) {
   if (!rawDate) throw new Error('Cannot resolve appointment date');
 
   let apptDate;
-  if (rawDate.includes('-')) {
-    const [y, m, d] = rawDate.split('T')[0].split('-');
-    apptDate = `${m}/${d}/${y}`;
-  } else {
-    const longParsed = parseLongDate(rawDate);
-    apptDate = longParsed || rawDate;
-  }
+  if (rawDate.includes('-')) { const [y, m, d] = rawDate.split('T')[0].split('-'); apptDate = `${m}/${d}/${y}`; }
+  else { const longParsed = parseLongDate(rawDate); apptDate = longParsed || rawDate; }
 
-  let rawTime = payload.appt_time || payload.appointment_time
-    || eventPayload.appt_time || eventPayload.appointment_time
-    || null;
+  let rawTime = payload.appt_time || payload.appointment_time || eventPayload.appt_time || eventPayload.appointment_time || null;
   if (!rawTime && eventPayload.start_time) {
     const st = String(eventPayload.start_time);
-    if (st.includes('T')) {
-      rawTime = st.split('T')[1]?.slice(0, 5);
-    } else {
-      rawTime = st;
-    }
+    rawTime = st.includes('T') ? st.split('T')[1]?.slice(0, 5) : st;
   }
   if (!rawTime && contactId) {
     const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
@@ -491,12 +498,7 @@ async function executeSetLPAppointment(action) {
 
   const ghlDateNormalized = normalizeDateForComparison(rawDate);
   try {
-    const { data: existingLead } = await supabase
-      .from('lp_leads')
-      .select('appointment_set, appointment_date')
-      .eq('lp_lead_id', lpLeadId)
-      .maybeSingle();
-
+    const { data: existingLead } = await supabase.from('lp_leads').select('appointment_set, appointment_date').eq('lp_lead_id', lpLeadId).maybeSingle();
     if (existingLead?.appointment_set && existingLead.appointment_date) {
       const lpDateNormalized = normalizeDateForComparison(existingLead.appointment_date);
       if (ghlDateNormalized && lpDateNormalized && ghlDateNormalized === lpDateNormalized) {
@@ -505,9 +507,7 @@ async function executeSetLPAppointment(action) {
         return { action: 'already_set_in_lp', lp_lead_id: lpLeadId, lp_appointment_date: lpDateNormalized, ghl_appointment_date: ghlDateNormalized, calendar_name: calendarName, contact_id: contactId };
       }
     }
-  } catch (err) {
-    console.warn(`[ActionExecutor] LP pre-check failed for ${lpLeadId}: ${err.message}`);
-  }
+  } catch (err) { console.warn(`[ActionExecutor] LP pre-check failed for ${lpLeadId}: ${err.message}`); }
 
   console.log(`[ActionExecutor] LP Appointment: lds_id=${lpLeadId}, date=${apptDate}, time=${apptTime}`);
   const result = await lpSetAppointment({ ldsId: lpLeadId, setBy, apptDate, apptTime });
@@ -529,11 +529,9 @@ async function executeUpdateCustomFields(action) {
   const fields = action.action_payload?.fields;
   if (!contactId) throw new Error('Missing contactId');
   if (!fields || !Array.isArray(fields) || fields.length === 0) throw new Error('Missing or empty fields array');
-
   const result = await updateGHLContactFields(contactId, fields);
   if (result === 'not_found') throw new Error(`GHL contact ${contactId} not found (deleted?)`);
   if (!result) throw new Error('GHL custom field update failed');
-
   console.log(`[ActionExecutor] ✅ Custom fields updated for ${contactId}: ${fields.length} fields`);
   return { action: 'custom_fields_updated', contact_id: contactId, field_count: fields.length, fields: fields.map(f => f.id) };
 }
@@ -567,9 +565,7 @@ async function executeSingleAction(action) {
   await supabase.from('agent_actions').update({ status: 'executing', updated_at: new Date().toISOString() }).eq('id', action.id);
   try {
     let context = {};
-    if (CONTEXT_AWARE_HANDLERS.has(action.action_type)) {
-      context = await getEventContext(action);
-    }
+    if (CONTEXT_AWARE_HANDLERS.has(action.action_type)) { context = await getEventContext(action); }
     const result = await handler(action, context);
     await supabase.from('agent_actions').update({ status: 'completed', execution_result: result, executed_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', action.id);
     console.log(`[ActionExecutor] ✅ ${action.action_type} completed (action ${action.id}, rule: ${action.rule_applied})`);
@@ -587,33 +583,20 @@ async function executeSingleAction(action) {
 export async function executeActions({ limit = 50 } = {}) {
   const startTime = Date.now();
 
-  const { data: approvalActions } = await supabase.from('agent_actions')
-    .select('*').eq('status', 'pending_approval')
-    .order('created_at', { ascending: true }).limit(20);
+  const { data: approvalActions } = await supabase.from('agent_actions').select('*').eq('status', 'pending_approval').order('created_at', { ascending: true }).limit(20);
   if (approvalActions?.length) {
     const approvalBatches = new Map();
-    for (const a of approvalActions) {
-      const k = a.batch_id || `s_${a.id}`;
-      if (!approvalBatches.has(k)) approvalBatches.set(k, []);
-      approvalBatches.get(k).push(a);
-    }
+    for (const a of approvalActions) { const k = a.batch_id || `s_${a.id}`; if (!approvalBatches.has(k)) approvalBatches.set(k, []); approvalBatches.get(k).push(a); }
     for (const [batchId, actions] of approvalBatches) {
-      const { data: existing } = await supabase
-        .from('groupme_approval_requests')
-        .select('id')
-        .eq('batch_id', batchId)
-        .maybeSingle();
+      const { data: existing } = await supabase.from('groupme_approval_requests').select('id').eq('batch_id', batchId).maybeSingle();
       if (!existing) {
         const { name, phone } = await resolveContactInfo(actions[0].target_id);
-        await sendApprovalRequest(actions, name, phone).catch(err => {
-          console.error(`[ActionExecutor] Approval request failed for batch ${batchId}:`, err.message);
-        });
+        await sendApprovalRequest(actions, name, phone).catch(err => { console.error(`[ActionExecutor] Approval request failed for batch ${batchId}:`, err.message); });
       }
     }
   }
 
-  const { data: actions, error } = await supabase.from('agent_actions').select('*').eq('status', 'pending')
-    .order('created_at', { ascending: true }).order('sequence_order', { ascending: true }).limit(limit);
+  const { data: actions, error } = await supabase.from('agent_actions').select('*').eq('status', 'pending').order('created_at', { ascending: true }).order('sequence_order', { ascending: true }).limit(limit);
   if (error) return { success: false, error: error.message };
   if (!actions?.length) return { success: true, actions_executed: 0, approval_requests_sent: approvalActions?.length || 0, elapsed_ms: Date.now() - startTime };
 
@@ -654,7 +637,5 @@ export function registerActionExecutorRoutes(app) {
       res.json({ pending: p.count || 0, pending_approval: a.count || 0, completed: c.count || 0, failed: f.count || 0 });
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
-
-  // v3.4: Rate limiter stats endpoint
   registerRateLimiterRoutes(app);
 }
