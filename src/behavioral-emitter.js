@@ -13,6 +13,12 @@
  * 
  * Security: All endpoints validate GHL_WEBHOOK_SECRET.
  *
+ * v2.2 — Fix duplicate GroupMe notifications.
+ *   - handleAppointment idempotency key now uses 30-min buckets (was Date.now())
+ *   - 'confirmed' status now emits ghl.appointment_confirmed (was ghl.appointment_booked)
+ *   - 'rescheduled' status now emits ghl.appointment_rescheduled
+ *   Both fixes prevent Rule 82 from firing duplicate notifications.
+ *
  * v2.1 — handleAppointment now extracts startDate and passes all extra
  *   body fields through to the event payload. Filters literal "null"
  *   string values that GHL sends when template variables don't resolve.
@@ -113,6 +119,19 @@ async function handleReply(req, res) {
   return res.json({ status: 'accepted', classification: 'pending_analysis' });
 }
 
+/**
+ * v2.2: Fixed duplicate notifications.
+ * 
+ * Two root causes:
+ * 1. Idempotency key used Date.now() — every webhook call was unique.
+ *    Now uses 30-minute bucket: same contact + calendar + status within
+ *    30 minutes = same key = deduped.
+ * 
+ * 2. 'confirmed' status fell through to ghl.appointment_booked.
+ *    Now maps to ghl.appointment_confirmed — Rule 82 only matches
+ *    ghl.appointment_booked, so confirmations don't fire duplicate
+ *    LP writebacks and GroupMe notifications.
+ */
 async function handleAppointment(req, res) {
   const body = req.body || {};
   const contactId = body.contactId || body.contact_id || null;
@@ -121,17 +140,32 @@ async function handleAppointment(req, res) {
 
   if (!contactId) return res.status(400).json({ error: 'Missing contactId' });
 
-  let eventType = 'ghl.appointment_booked';
-  if (status === 'cancelled' || status === 'canceled') eventType = 'ghl.appointment_cancelled';
-  else if (status === 'no_show' || status === 'noshow' || status === 'no-show') eventType = 'ghl.appointment_no_show';
+  // v2.2: Explicit event type mapping — confirmed is NOT a booking
+  let eventType;
+  if (status === 'cancelled' || status === 'canceled') {
+    eventType = 'ghl.appointment_cancelled';
+  } else if (status === 'no_show' || status === 'noshow' || status === 'no-show') {
+    eventType = 'ghl.appointment_no_show';
+  } else if (status === 'confirmed') {
+    eventType = 'ghl.appointment_confirmed';
+  } else if (status === 'rescheduled') {
+    eventType = 'ghl.appointment_rescheduled';
+  } else {
+    eventType = 'ghl.appointment_booked';
+  }
 
   // v2.1: Extract all appointment fields including startDate.
-  // Clean "null" strings from GHL template variables that didn't resolve.
   const startTime = cleanGHLValue(body.startTime || body.start_time) || null;
   const startDate = cleanGHLValue(body.startDate || body.start_date) || null;
   const endTime = cleanGHLValue(body.endTime || body.end_time) || null;
   const title = cleanGHLValue(body.title || body.name) || null;
   const appointmentId = cleanGHLValue(body.appointmentId || body.appointment_id) || null;
+  const contactName = cleanGHLValue(body.contactName || body.contact_name) || null;
+
+  // v2.2: Idempotency key uses 30-minute time buckets instead of Date.now().
+  // Same contact + calendar + status within 30 min = deduped.
+  const timeBucket = Math.floor(Date.now() / (30 * 60 * 1000));
+  const idempotencyKey = `ghl_appt_${contactId}_${calendarId}_${status}_${timeBucket}`;
 
   await emitEvent({
     event_type: eventType, event_subtype: calendarId || null, source: 'ghl_webhook',
@@ -144,10 +178,11 @@ async function handleAppointment(req, res) {
       end_time: endTime,
       title,
       appointment_id: appointmentId,
+      contactName,
     },
-    priority: 'high', idempotency_key: `ghl_appt_${contactId}_${calendarId}_${status}_${Date.now()}`,
+    priority: 'high', idempotency_key: idempotencyKey,
   });
-  console.log(`[BehavioralEmitter] Appointment ${eventType} for ${contactId} (calendar: ${calendarId}, date: ${startDate}, time: ${startTime})`);
+  console.log(`[BehavioralEmitter] Appointment ${eventType} for ${contactId} (calendar: ${calendarId}, date: ${startDate}, time: ${startTime}, status: ${status})`);
   return res.json({ status: 'accepted', event_type: eventType });
 }
 
