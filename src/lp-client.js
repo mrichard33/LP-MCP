@@ -231,6 +231,29 @@ export async function getLead(cstId) {
   }));
 }
 
+/**
+ * Get a lead directly from LP by Lead ID (lds_id).
+ * Returns the prospect record containing this lead.
+ * Used by Action Executor to get the most current Prospect ID
+ * directly from Lead Perfection (bypasses Supabase cache delay).
+ * 
+ * @param {string|number} ldsId — LP Lead ID
+ * @returns {Object} LP API response (array of prospect records)
+ */
+export async function getLeadByLdsId(ldsId) {
+  return withCircuit(() => lpPost('/api/Customers/GetLead', {
+    startdate:   '2000-01-01',
+    enddate:     new Date().toISOString().slice(0, 10),
+    cst_id:      '0',
+    lds_id:      String(ldsId),
+    ils_id:      '0',
+    PageSize:    '1',
+    StartIndex:  '1',
+    options:     '0',
+    SortOrder:   '0',
+  }));
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Phase 2 Write Endpoints
 // ═══════════════════════════════════════════════════════════════════
