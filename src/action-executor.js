@@ -17,11 +17,12 @@
  *   set_lp_appointment   → Push appointment to LP via SetAppointment API (Phase 2 write)
  *   update_custom_fields → PUT /contacts/{id} with customFields array
  *
- * v3.3 — Enrich send_notification with contact name + LP Prospect ID.
- *   New template variables: {{contact_name}}, {{contact_id}}, {{contact_phone}}, {{lp_prospect_id}}
- *   Resolved from GHL API and Supabase lp_leads before interpolation.
- *   If message contains "Name:" or "Contact ID:", old Contact suffix is suppressed.
+ * v3.4 — GHL Rate Limiter integration.
+ *   ghlFetch now acquires a token before each call and reports 429s to the
+ *   shared rate limiter. Prevents the 429 feedback loop that burned through
+ *   GHL's rate limit. Stats endpoint at GET /n8n/rate-limiter/stats.
  *
+ * v3.3 — Enrich send_notification with contact name + LP Prospect ID.
  * v3.2 — Batch tag removal to avoid GHL 429 rate limits.
  * v3.1 — Fix set_lp_appointment date/time resolution for webhook payloads.
  * v3.0 — TIER 1 AGENTIC: add_to_workflow, book_appointment, cancel_appointment.
@@ -34,6 +35,7 @@ import supabase from './supabase.js';
 import { applyGHLTag, addGHLNote, updateGHLContactFields } from './ghl.js';
 import { setAppointment as lpSetAppointment } from './lp-client.js';
 import { sendGroupMeMessage, sendApprovalRequest } from './groupme.js';
+import { acquireToken, report429, registerRateLimiterRoutes } from './ghl-rate-limiter.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = 'SsBG7j5KQAIP1SFP2Sca';
@@ -91,12 +93,23 @@ const CALENDAR_MAP = {
 
 const REMOVE_ALL_MARKETING_WF = '07a657bd-0492-4137-a831-babfa608c902';
 
+/**
+ * v3.4: Rate-limited GHL fetch.
+ * Acquires a token from the shared rate limiter before each call.
+ * On 429: reports to the rate limiter (drains bucket + pauses 30s).
+ */
 async function ghlFetch(method, path, body = null) {
   if (!GHL_API_KEY) throw new Error('GHL_API_KEY not configured');
+  await acquireToken();
   const url = `https://services.leadconnectorhq.com${path}`;
   const opts = { method, headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-07-28', 'Content-Type': 'application/json', 'Accept': 'application/json' }, signal: AbortSignal.timeout(15000) };
   if (body) opts.body = JSON.stringify(body);
   const res = await fetch(url, opts);
+  if (res.status === 429) {
+    report429();
+    const text = await res.text().catch(() => '');
+    throw new Error(`GHL ${method} ${path} → 429: ${text.slice(0, 200)}`);
+  }
   if (!res.ok) { const text = await res.text().catch(() => ''); throw new Error(`GHL ${method} ${path} → ${res.status}: ${text.slice(0, 200)}`); }
   const ct = res.headers.get('content-type') || '';
   return ct.includes('application/json') ? res.json() : { status: res.status, ok: true };
@@ -163,11 +176,6 @@ async function resolveContactInfo(contactId) {
   } catch { return { name: null, phone: null }; }
 }
 
-/**
- * v3.3: Resolve LP Prospect ID from Supabase for a GHL contact.
- * Returns the most recent LP lead's lp_prospect_id (the PROSPECT, not the lead).
- * Mark specifically requested Prospect ID for GroupMe notifications.
- */
 async function resolveLPProspectId(contactId) {
   if (!contactId) return null;
   try {
@@ -192,11 +200,6 @@ async function executeAddTag(action) {
   return { tag_applied: tag, contact_id: contactId };
 }
 
-/**
- * v3.2: Batch tag removal — accepts either:
- *   { tag: "single-tag" }        → removes one tag (backwards compatible)
- *   { tags: ["a", "b", "c"] }    → removes all tags in ONE API call
- */
 async function executeRemoveTag(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
@@ -257,23 +260,11 @@ async function executeCreateTask(action, context) {
   return { action: 'note_added', contact_id: contactId, title };
 }
 
-/**
- * v3.3: Enriched send_notification — resolves contact details and LP Prospect ID
- * before template interpolation. Available template variables:
- *   {{contact_name}}    — GHL contact first+last name
- *   {{contact_id}}      — GHL contact ID
- *   {{contact_phone}}   — GHL contact phone
- *   {{lp_prospect_id}}  — LP Prospect ID from Supabase lp_leads
- *
- * If the interpolated message already contains "Name:" or "Contact ID:",
- * the old "Contact: name (phone)" suffix is suppressed to avoid duplication.
- */
 async function executeSendNotification(action, context) {
   const contactId = action.target_id;
   const { name, phone } = await resolveContactInfo(contactId);
   const prospectId = await resolveLPProspectId(contactId);
 
-  // Enrich context with resolved contact info for template interpolation
   const enrichedContext = {
     ...context,
     contact_name: name || 'Unknown',
@@ -285,7 +276,6 @@ async function executeSendNotification(action, context) {
   const payload = interpolatePayload(action.action_payload, enrichedContext);
   const message = payload?.message || 'Agent notification';
 
-  // If message already has structured contact info, don't append the old format
   const hasContactBlock = message.includes('Name:') || message.includes('Contact ID:');
   const full = hasContactBlock
     ? `🤖 ${message}`
@@ -664,4 +654,7 @@ export function registerActionExecutorRoutes(app) {
       res.json({ pending: p.count || 0, pending_approval: a.count || 0, completed: c.count || 0, failed: f.count || 0 });
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
+
+  // v3.4: Rate limiter stats endpoint
+  registerRateLimiterRoutes(app);
 }
