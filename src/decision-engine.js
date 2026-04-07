@@ -18,21 +18,14 @@
  *   - ai.analysis_completed → matched against contextual rules using lead_intelligence
  *   - intent.* events → processed by rules but do NOT trigger re-scoring (loop prevention)
  *
+ * v2.4 — LP disposition multi-lead dedup:
+ *   - Group dedup: ANY LP_DISP_* rule for same GHL contact within window blocks new actions
+ *   - Most-recent-lead guard: only the newest LP lead for a GHL contact fires rules
+ *   Fixes Annette Poole scenario (3 LP leads → 1 contact → 3 conflicting rules)
+ *
  * v2.3 — Added payload_field_not_null / payload_field_null context conditions.
- *   Fixes LP_DISP_SET / LP_DISP_ISSUE GroupMe flood — rules were firing on
- *   LP sync backfill events where previous_disposition was null.
- *
- * v2.2.1 — Added INTENT_ to stage gate prefixes. Previously only BEHAVIORAL_ and
- *   OBJECTION_ were gated. INTENT_HOT_FROM_COLD was firing on anonymous Guest Visitors.
- *
- * v2.2 — Stage Gate + Deduplication:
- *   - Stage Gate: behavioral/objection/intent rules require contact to have phone OR email,
- *     AND buyer_stage >= 3 or an appointment tag. Anonymous live chat visitors
- *     asking basic questions no longer trigger W9.0 objection sequences or hot lead alerts.
- *   - Deduplication: before creating actions, checks for existing pending/pending_approval
- *     actions with same rule_key + target_id within 30-min window. Prevents 3x
- *     duplicate actions from rapid-fire messages.
- *
+ * v2.2.1 — Added INTENT_ to stage gate prefixes.
+ * v2.2 — Stage Gate + Deduplication.
  * v2.1 — BUGFIX: Skip GHL actions when ghl_contact_id is null.
  */
 
@@ -46,16 +39,24 @@ import { scoreIntent } from './intent-scorer.js';
 
 const DEDUP_WINDOW_MINUTES = 30;
 
-// Rule prefixes that require stage gate (phone/email + funnel stage) + dedup
+// Rule prefixes that require stage gate (phone/email + funnel stage) + exact-rule dedup
 const BEHAVIORAL_RULE_PREFIXES = [
   'BEHAVIORAL_',
   'OBJECTION_',
   'INTENT_',
 ];
 
+// Rule prefixes that require GROUP dedup (any rule in group blocks all others)
+const LP_DISP_PREFIX = 'LP_DISP_';
+
 function isBehavioralRule(ruleKey) {
   if (!ruleKey) return false;
   return BEHAVIORAL_RULE_PREFIXES.some(prefix => ruleKey.startsWith(prefix));
+}
+
+function isLpDispRule(ruleKey) {
+  if (!ruleKey) return false;
+  return ruleKey.startsWith(LP_DISP_PREFIX);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -93,10 +94,9 @@ function matchesPattern(event, pattern) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// STAGE GATE — Prevent behavioral/intent rules from firing on unqualified contacts
+// STAGE GATE
 // ═══════════════════════════════════════════════════════════════════
 
-// Tags that indicate a contact is far enough in the funnel for behavioral rules
 const QUALIFYING_TAGS = [
   'appt:window-estimate', 'appt:home-assessment', 'appt:measurement-verification',
   'appt:review-session', 'appt:confirmation-call',
@@ -106,7 +106,6 @@ const QUALIFYING_TAGS = [
 ];
 
 async function passesStageGate(event, rule) {
-  // Only apply stage gate to behavioral/intent rules
   if (!isBehavioralRule(rule.rule_key)) return true;
 
   const contactId = event.ghl_contact_id;
@@ -115,80 +114,144 @@ async function passesStageGate(event, rule) {
     return false;
   }
 
-  // Fetch contact from GHL to check phone/email/tags
   const GHL_API_KEY = process.env.GHL_API_KEY;
-  if (!GHL_API_KEY) return true; // can't check, allow through
+  if (!GHL_API_KEY) return true;
 
   try {
     const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
       headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-07-28', 'Accept': 'application/json' },
       signal: AbortSignal.timeout(10000),
     });
-    if (!res.ok) return true; // API error, don't block
+    if (!res.ok) return true;
     const data = await res.json();
     const contact = data?.contact;
     if (!contact) return true;
 
-    // Check 1: Contact must have a phone or email (not anonymous)
     const hasPhone = contact.phone && contact.phone.length > 5;
     const hasEmail = contact.email && contact.email.includes('@') && contact.email !== 'fake@gmail.com';
     if (!hasPhone && !hasEmail) {
-      console.log(`[StageGate] BLOCKED ${rule.rule_key} for ${contactId}: anonymous contact (no phone/email)`);
+      console.log(`[StageGate] BLOCKED ${rule.rule_key} for ${contactId}: anonymous contact`);
       return false;
     }
 
-    // Check 2: Contact must have qualifying tags OR buyer_stage >= 3 in payload
     const tags = contact.tags || [];
     const hasQualifyingTag = tags.some(t => QUALIFYING_TAGS.includes(t));
     const payloadStage = event.payload?.buyer_stage;
     const hasMinStage = payloadStage && payloadStage >= 3;
 
     if (!hasQualifyingTag && !hasMinStage) {
-      console.log(`[StageGate] BLOCKED ${rule.rule_key} for ${contactId}: not qualified (tags: ${tags.slice(0, 5).join(', ')}; buyer_stage: ${payloadStage || 'n/a'})`);
+      console.log(`[StageGate] BLOCKED ${rule.rule_key} for ${contactId}: not qualified`);
       return false;
     }
 
     return true;
   } catch (err) {
     console.error(`[StageGate] Error checking ${contactId}:`, err.message);
-    return true; // don't block on errors
+    return true;
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// DEDUPLICATION — Prevent duplicate actions for same rule + contact
+// DEDUPLICATION
 // ═══════════════════════════════════════════════════════════════════
 
+/**
+ * Check for duplicate pending actions.
+ * - BEHAVIORAL/OBJECTION/INTENT rules: exact rule_key + target_id match
+ * - LP_DISP_* rules: GROUP dedup — ANY LP_DISP_* rule for same target_id blocks
+ * 
+ * v2.4: LP_DISP group dedup prevents multiple LP leads from stacking
+ * conflicting tags on the same GHL contact.
+ */
 async function hasDuplicatePendingActions(ruleKey, targetId) {
-  // Only dedup behavioral/intent rules
-  if (!isBehavioralRule(ruleKey)) return false;
   if (!targetId) return false;
+
+  const needsDedup = isBehavioralRule(ruleKey) || isLpDispRule(ruleKey);
+  if (!needsDedup) return false;
 
   const windowStart = new Date(Date.now() - DEDUP_WINDOW_MINUTES * 60 * 1000).toISOString();
 
   try {
-    const { data, error } = await supabase
+    let query = supabase
       .from('agent_actions')
-      .select('id', { count: 'exact', head: true })
-      .eq('rule_applied', ruleKey)
+      .select('id, rule_applied', { count: 'exact', head: false })
       .eq('target_id', targetId)
-      .in('status', ['pending', 'pending_approval', 'approved', 'executing'])
+      .in('status', ['pending', 'pending_approval', 'approved', 'executing', 'completed'])
       .gte('created_at', windowStart);
+
+    if (isLpDispRule(ruleKey)) {
+      // GROUP dedup: any LP_DISP_* rule for this contact blocks
+      query = query.like('rule_applied', 'LP_DISP_%');
+    } else {
+      // Exact dedup: same rule_key only
+      query = query.eq('rule_applied', ruleKey);
+    }
+
+    const { data, error } = await query.limit(1);
 
     if (error) {
       console.error(`[Dedup] Check failed for ${ruleKey}/${targetId}:`, error.message);
-      return false; // don't block on errors
+      return false;
     }
 
-    const count = data?.length ?? 0;
-    if (count > 0) {
-      console.log(`[Dedup] BLOCKED ${ruleKey} for ${targetId}: ${count} existing actions in ${DEDUP_WINDOW_MINUTES}min window`);
+    if (data && data.length > 0) {
+      const existingRule = data[0].rule_applied;
+      if (isLpDispRule(ruleKey) && existingRule !== ruleKey) {
+        console.log(`[Dedup] GROUP BLOCKED ${ruleKey} for ${targetId}: ${existingRule} already fired in ${DEDUP_WINDOW_MINUTES}min window`);
+      } else {
+        console.log(`[Dedup] BLOCKED ${ruleKey} for ${targetId}: already has actions in ${DEDUP_WINDOW_MINUTES}min window`);
+      }
       return true;
     }
     return false;
   } catch (err) {
     console.error(`[Dedup] Error:`, err.message);
     return false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// LP MULTI-LEAD GUARD — Only newest lead fires rules
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * v2.4: When an lp.disposition_changed event fires, check if this LP lead
+ * is the most recent lead for the associated GHL contact. If a newer lead
+ * exists, skip this event (the newer lead's disposition is authoritative).
+ * 
+ * This prevents older LP lead records from overriding the current state
+ * when the sync engine processes them.
+ */
+async function isNewestLeadForContact(event) {
+  // Only applies to LP disposition events
+  if (event.event_type !== 'lp.disposition_changed') return true;
+
+  const lpLeadId = event.entity_id || event.lp_lead_id;
+  const ghlContactId = event.ghl_contact_id;
+
+  // If no GHL contact match, can't check — allow through
+  if (!ghlContactId || !lpLeadId) return true;
+
+  try {
+    const { data, error } = await supabase
+      .from('lp_leads')
+      .select('lp_lead_id')
+      .eq('ghl_contact_id', ghlContactId)
+      .order('created_at_lp', { ascending: false })
+      .limit(1);
+
+    if (error || !data || data.length === 0) return true; // can't check, allow
+
+    const newestLeadId = data[0].lp_lead_id;
+    if (String(newestLeadId) !== String(lpLeadId)) {
+      console.log(`[MultiLead] BLOCKED event for LP lead ${lpLeadId} — newer lead ${newestLeadId} exists for GHL contact ${ghlContactId}`);
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    console.error(`[MultiLead] Error checking lead recency:`, err.message);
+    return true; // don't block on errors
   }
 }
 
@@ -245,14 +308,9 @@ async function evaluateContextConditions(conditions, intelligence, event) {
         if (!tags) tags = await fetchContactTags(event.ghl_contact_id);
         if (tags.includes(expected)) return false; break;
       case 'buyer_stage_confidence_gte': if ((merged.buyer_stage_confidence || 0) < expected) return false; break;
-      // ─── Intent tier conditions ──────────────────
       case 'intent_tier_eq': if (merged.intent_tier !== expected) return false; break;
       case 'intent_score_gte': if ((merged.intent_score || 0) < expected) return false; break;
       case 'compound_pattern_eq': if (merged.compound_pattern !== expected) return false; break;
-      // ─── v2.3: Payload field existence checks ────
-      // Used to guard LP disposition rules against sync backfill.
-      // "payload_field_not_null": "previous_disposition" → only fires if field has a value
-      // "payload_field_null": "previous_disposition" → only fires if field is null/missing
       case 'payload_field_not_null': {
         const fieldVal = payload[expected];
         if (fieldVal === null || fieldVal === undefined) {
@@ -289,7 +347,6 @@ async function findMatchingRules(event) {
       if (!(await evaluateContextConditions(rule.context_conditions, intelligence, event))) continue;
     }
 
-    // ─── v2.2: Stage Gate — block behavioral/intent rules for unqualified contacts ───
     if (!(await passesStageGate(event, rule))) continue;
 
     matched.push(rule);
@@ -302,10 +359,9 @@ async function findMatchingRules(event) {
 // ═══════════════════════════════════════════════════════════════════
 
 async function createActionsFromRule(event, rule) {
-  // ─── v2.2: Deduplication — skip if same rule+contact already has pending actions ───
   const targetId = event.ghl_contact_id || event.entity_id || '';
   if (await hasDuplicatePendingActions(rule.rule_key, targetId)) {
-    console.log(`[DecisionEngine] Dedup: skipping ${rule.rule_key} for ${targetId} — already has pending actions`);
+    console.log(`[DecisionEngine] Dedup: skipping ${rule.rule_key} for ${targetId}`);
     return [];
   }
 
@@ -317,9 +373,8 @@ async function createActionsFromRule(event, rule) {
     const tmpl = actions[i];
     const targetSystem = tmpl.target_system || 'ghl';
 
-    // ─── v2.1 GUARD: Skip GHL actions when no GHL contact ID ────
     if (targetSystem === 'ghl' && !event.ghl_contact_id) {
-      console.log(`[DecisionEngine] Skipped GHL action ${tmpl.action_type} for event ${event.id} — no GHL contact (LP lead ${event.entity_id})`);
+      console.log(`[DecisionEngine] Skipped GHL action ${tmpl.action_type} for event ${event.id} — no GHL contact`);
       await supabase.from('agent_actions').insert({
         event_id: event.id, action_type: tmpl.action_type, target_system: targetSystem,
         target_entity: tmpl.target_entity || 'contact', target_id: event.entity_id || '',
@@ -366,6 +421,18 @@ export async function processSingleEvent(event) {
       processed_at: new Date().toISOString(), action_taken: 'routed_to_message_analyzer',
     }).eq('id', event.id);
     return { event_id: event.id, matched_rules: 0, actions_created: 0, routed_to: 'message_analyzer' };
+  }
+
+  // ─── v2.4: Multi-lead guard for LP disposition events ──────
+  if (event.event_type === 'lp.disposition_changed') {
+    if (!(await isNewestLeadForContact(event))) {
+      await supabase.from('system_events').update({
+        processed: true, processed_by: 'decision_engine',
+        processed_at: new Date().toISOString(),
+        action_taken: 'skipped:older_lead (newer LP lead exists for this GHL contact)',
+      }).eq('id', event.id);
+      return { event_id: event.id, matched_rules: 0, actions_created: 0, skipped_reason: 'older_lead' };
+    }
   }
 
   // ─── Standard rule matching ────────────────────────────
@@ -418,9 +485,8 @@ export async function processEvents({ limit = 50 } = {}) {
 
   console.log(`[DecisionEngine] Processing ${events.length} pending events...`);
   const results = [];
-  let totalActions = 0, aiRouted = 0, intentScored = 0, stageGated = 0, deduped = 0;
+  let totalActions = 0, aiRouted = 0, intentScored = 0, deduped = 0, olderLeadSkipped = 0;
 
-  // Collect unique contacts for intent scoring (deduplicate)
   const contactsToScore = new Set();
 
   for (const event of events) {
@@ -430,8 +496,8 @@ export async function processEvents({ limit = 50 } = {}) {
       totalActions += result.actions_created;
       if (result.routed_to === 'message_analyzer') aiRouted++;
       if (result.actions_created === 0 && result.matched_rules > 0) deduped++;
+      if (result.skipped_reason === 'older_lead') olderLeadSkipped++;
 
-      // ─── Intent Scoring: queue contact for scoring ────
       if (event.ghl_contact_id && !event.event_type.startsWith('intent.')) {
         contactsToScore.add(event.ghl_contact_id);
       }
@@ -445,7 +511,6 @@ export async function processEvents({ limit = 50 } = {}) {
     }
   }
 
-  // ─── Score intent for all affected contacts ───────────
   for (const contactId of contactsToScore) {
     try {
       const scoreResult = await scoreIntent(contactId);
@@ -459,12 +524,13 @@ export async function processEvents({ limit = 50 } = {}) {
   }
 
   const elapsed = Date.now() - startTime;
-  console.log(`[DecisionEngine] Done: ${events.length} events → ${totalActions} actions, ${aiRouted} AI-routed, ${intentScored} scored, ${deduped} deduped (${elapsed}ms)`);
+  console.log(`[DecisionEngine] Done: ${events.length} events → ${totalActions} actions, ${aiRouted} AI-routed, ${intentScored} scored, ${deduped} deduped, ${olderLeadSkipped} older-lead-skipped (${elapsed}ms)`);
 
   return {
     success: true, events_processed: events.length,
     total_actions_created: totalActions, ai_routed: aiRouted,
-    intent_scored: intentScored, deduped, results, elapsed_ms: elapsed,
+    intent_scored: intentScored, deduped, older_lead_skipped: olderLeadSkipped,
+    results, elapsed_ms: elapsed,
   };
 }
 
