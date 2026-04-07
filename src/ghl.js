@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { acquireToken, report429 } from './ghl-rate-limiter.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
@@ -24,6 +25,30 @@ const ghlClient = GHL_API_KEY ? axios.create({
   },
   timeout: 10000,
 }) : null;
+
+// ═══════════════════════════════════════════════════════════════════
+// RATE LIMITER INTEGRATION
+// Axios interceptors ensure ALL GHL calls go through the token bucket.
+// ═══════════════════════════════════════════════════════════════════
+
+if (ghlClient) {
+  // Request interceptor: acquire a token before each request
+  ghlClient.interceptors.request.use(async (config) => {
+    await acquireToken();
+    return config;
+  });
+
+  // Response interceptor: report 429 to drain bucket + pause
+  ghlClient.interceptors.response.use(
+    (response) => response,
+    (error) => {
+      if (error.response?.status === 429) {
+        report429();
+      }
+      return Promise.reject(error);
+    }
+  );
+}
 
 function isContactNotFound(err) {
   if (err.response?.status !== 400) return false;
@@ -108,13 +133,7 @@ export async function applyGHLTag(ghlContactId, tag) {
   }
 }
 
-// ─── Remove tags via DELETE — for active-entry:* swap ────────────
-// Removes one or more tags from a GHL contact. Uses DELETE /contacts/{id}/tags.
-// Silent on "Contact not found" (already deleted).
-//
-// @param {string} ghlContactId - GHL contact ID
-// @param {string[]} tags - Array of tag strings to remove
-// @returns {boolean} true on success, false on failure
+// Remove tags via DELETE — for active-entry:* swap
 export async function removeGHLTags(ghlContactId, tags) {
   if (ghlDisabled || !ghlClient || !ghlContactId) return false;
   if (!tags || tags.length === 0) return true;
