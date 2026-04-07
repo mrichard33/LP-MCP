@@ -3,13 +3,11 @@ import axios from 'axios';
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
 
-// Log GHL status at module load
 console.log(`[GHL] API key: ${GHL_API_KEY ? 'set' : 'MISSING — GHL matching will be disabled'}`);
 if (GHL_API_KEY && !GHL_LOCATION_ID) {
   console.warn('[GHL] WARNING: GHL_LOCATION_ID not set — contact search/tag calls will fail without a location');
 }
 
-// ─── GHL Availability Check ─────────────────────────────────────
 let ghlDisabled = false;
 let ghlFailCount = 0;
 let loggedFirstMatch = false;
@@ -27,19 +25,12 @@ const ghlClient = GHL_API_KEY ? axios.create({
   timeout: 10000,
 }) : null;
 
-// ─── "Contact not found" detection helper ────────────────────────
-// GHL returns 400 with "Contact not found" or "Contact with id X not found"
-// when a contact has been deleted. This is NOT a transient error — retrying
-// will never succeed. Callers should clear the stale ghl_contact_id.
 function isContactNotFound(err) {
   if (err.response?.status !== 400) return false;
   const body = JSON.stringify(err.response?.data || '').toLowerCase();
   return body.includes('not found');
 }
 
-// Search GHL contact by phone or email (v2 API)
-// NOTE: locationId is ONLY needed here — for GET /contacts/ search queries.
-// It must NOT be included in PUT/POST bodies to contact-specific endpoints.
 export async function searchGHLContact(params) {
   if (ghlDisabled || !ghlClient) return null;
   try {
@@ -70,7 +61,6 @@ export async function searchGHLContact(params) {
   }
 }
 
-// Match LP lead to GHL contact: phone → alt phone → email
 export async function matchToGHL(lpLead) {
   if (ghlDisabled || !ghlClient) return null;
   if (lpLead.phone) {
@@ -88,8 +78,7 @@ export async function matchToGHL(lpLead) {
   return null;
 }
 
-// Apply tag via POST (additive) — NEVER use PUT which replaces all tags (v2 API)
-// NOTE: Do NOT include locationId in body — GHL v2 rejects it with 422.
+// Apply tag via POST (additive) — NEVER use PUT which replaces all tags
 export async function applyGHLTag(ghlContactId, tag) {
   if (ghlDisabled || !ghlClient || !ghlContactId) return false;
   try {
@@ -99,7 +88,6 @@ export async function applyGHLTag(ghlContactId, tag) {
     ghlFailCount = 0;
     return true;
   } catch (err) {
-    // v2.1: "Contact not found" is not a transient error — don't count toward disable threshold
     if (isContactNotFound(err)) {
       console.warn(`[GHL] Tag apply: contact ${ghlContactId} not found (deleted?) — skipping`);
       return false;
@@ -120,19 +108,39 @@ export async function applyGHLTag(ghlContactId, tag) {
   }
 }
 
-// ─── Update GHL Contact Custom Fields ────────────────────────────
-// Uses PUT /contacts/{contactId} with ONLY customFields in the body.
-// CRITICAL: Never include 'tags' in the PUT body — that would REPLACE
-// all tags on the contact. We only pass customFields, which is additive.
-// CRITICAL: Never include 'locationId' — GHL v2 API rejects it with 422.
-//
-// v2.1: Returns 'not_found' when GHL returns 400 "Contact not found"
-// (deleted contact). Callers should clear the stale ghl_contact_id.
-// Returns true on success, false on generic failure, 'not_found' on deleted contact.
+// ─── Remove tags via DELETE — for active-entry:* swap ────────────
+// Removes one or more tags from a GHL contact. Uses DELETE /contacts/{id}/tags.
+// Silent on "Contact not found" (already deleted).
 //
 // @param {string} ghlContactId - GHL contact ID
-// @param {Array} customFields - Array of { id, field_value } objects
-// @returns {boolean|string} true on success, false on error, 'not_found' on deleted contact
+// @param {string[]} tags - Array of tag strings to remove
+// @returns {boolean} true on success, false on failure
+export async function removeGHLTags(ghlContactId, tags) {
+  if (ghlDisabled || !ghlClient || !ghlContactId) return false;
+  if (!tags || tags.length === 0) return true;
+  try {
+    await ghlClient.delete(`/contacts/${ghlContactId}/tags`, {
+      data: { tags },
+    });
+    ghlFailCount = 0;
+    return true;
+  } catch (err) {
+    if (isContactNotFound(err)) {
+      console.warn(`[GHL] Tag remove: contact ${ghlContactId} not found — skipping`);
+      return false;
+    }
+    ghlFailCount++;
+    const status = err.response?.status || 'no response';
+    if (ghlFailCount === 1) {
+      console.error(`[GHL] Tag remove failed: HTTP ${status} — ${err.message}`);
+    }
+    if (ghlFailCount >= GHL_FAIL_THRESHOLD) {
+      ghlDisabled = true;
+      console.error(`[GHL] Tag removal disabled after ${GHL_FAIL_THRESHOLD} failures.`);
+    }
+    return false;
+  }
+}
 
 export async function updateGHLContactFields(ghlContactId, customFields) {
   if (ghlDisabled || !ghlClient || !ghlContactId) return false;
@@ -150,7 +158,6 @@ export async function updateGHLContactFields(ghlContactId, customFields) {
     }
     return true;
   } catch (err) {
-    // v2.1: "Contact not found" is permanent — return distinct value so callers can clean up
     if (isContactNotFound(err)) {
       console.warn(`[GHL] Field update: contact ${ghlContactId} not found (deleted?) — returning 'not_found'`);
       return 'not_found';
@@ -172,13 +179,6 @@ export async function updateGHLContactFields(ghlContactId, customFields) {
   }
 }
 
-// ─── Add Note to GHL Contact ─────────────────────────────────────
-// POST /contacts/{contactId}/notes with { body: "note text" }
-// CRITICAL: Do NOT include locationId — GHL v2 rejects it.
-//
-// @param {string} ghlContactId - GHL contact ID
-// @param {string} noteBody - The note text content
-// @returns {Object|null} GHL note object on success, null on failure
 export async function addGHLNote(ghlContactId, noteBody) {
   if (ghlDisabled || !ghlClient || !ghlContactId) return null;
   if (!noteBody || noteBody.trim().length === 0) return null;
@@ -196,7 +196,6 @@ export async function addGHLNote(ghlContactId, noteBody) {
 
     return data || { success: true };
   } catch (err) {
-    // v2.1: "Contact not found" is not transient
     if (isContactNotFound(err)) {
       console.warn(`[GHL] Note add: contact ${ghlContactId} not found (deleted?) — skipping`);
       return null;
@@ -217,7 +216,6 @@ export async function addGHLNote(ghlContactId, noteBody) {
   }
 }
 
-// Re-enable GHL (called at start of each sync cycle)
 export function resetGHLState() {
   ghlDisabled = false;
   ghlFailCount = 0;
