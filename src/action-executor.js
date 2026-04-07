@@ -6,7 +6,7 @@
  * 
  * Supported action types (11):
  *   add_tag              → POST /contacts/{id}/tags (additive, never PUT)
- *   remove_tag           → DELETE /contacts/{id}/tags (removes specific tag)
+ *   remove_tag           → DELETE /contacts/{id}/tags (single tag or batch array)
  *   move_opportunity     → Find opp by contact, PUT /opportunities/{oppId} with pipelineStageId
  *   remove_from_workflow → Remove contact from GHL workflow or add to "Remove All" workflow
  *   add_to_workflow      → POST /contacts/{id}/workflow/{wfId} — enroll contact in GHL workflow
@@ -17,19 +17,13 @@
  *   set_lp_appointment   → Push appointment to LP via SetAppointment API (Phase 2 write)
  *   update_custom_fields → PUT /contacts/{id} with customFields array
  *
+ * v3.2 — Batch tag removal to avoid GHL 429 rate limits.
+ *   remove_tag now accepts { tags: ["a","b","c"] } in addition to { tag: "x" }.
+ *   GHL DELETE /contacts/{id}/tags natively accepts arrays.
+ *   Rule 82 restructured from 55 individual calls to ~5 batch calls.
+ *
  * v3.1 — Fix set_lp_appointment date/time resolution for webhook payloads.
- *   GHL APPT Handler sends startDate ("April 8, 2026") and start_time ("2:00 PM")
- *   but the executor only checked appt_date/appointment_date and appt_time/appointment_time.
- *   Now resolves startDate, start_date, and start_time from event payloads.
- *   Adds parseLongDate() for "Month Day, Year" format.
- *
- * v3.0 — TIER 1 AGENTIC: Three new action types for routing decisions.
- *   add_to_workflow: Enrolls contact in any GHL workflow by ID.
- *   book_appointment: Books a GHL calendar appointment with date/time/calendar.
- *   cancel_appointment: Cancels or updates an existing GHL appointment.
- *   These three action types allow the Decision Engine to control WHERE
- *   contacts go and WHAT appointments they book — replacing GHL IF/ELSE routing.
- *
+ * v3.0 — TIER 1 AGENTIC: add_to_workflow, book_appointment, cancel_appointment.
  * v2.5 — LP appointment pre-check.
  * v2.4 — Fix appointment date/time resolution.
  * v2.3 — Template interpolation for action payloads.
@@ -169,7 +163,7 @@ async function resolveContactInfo(contactId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// ACTION HANDLERS — EXISTING
+// ACTION HANDLERS
 // ═══════════════════════════════════════════════════════════════════
 
 async function executeAddTag(action) {
@@ -180,12 +174,30 @@ async function executeAddTag(action) {
   return { tag_applied: tag, contact_id: contactId };
 }
 
+/**
+ * v3.2: Batch tag removal — accepts either:
+ *   { tag: "single-tag" }        → removes one tag (backwards compatible)
+ *   { tags: ["a", "b", "c"] }    → removes all tags in ONE API call
+ *
+ * GHL DELETE /contacts/{id}/tags natively accepts { tags: [...] }.
+ * Using batch removal avoids 429 rate limits when removing many tags
+ * (e.g., Rule 82 removes ~48 tags at booking).
+ */
 async function executeRemoveTag(action) {
   const contactId = action.target_id;
-  const tag = action.action_payload?.tag;
-  if (!contactId || !tag) throw new Error('Missing contactId or tag');
-  await ghlFetch('DELETE', `/contacts/${contactId}/tags`, { tags: [tag] });
-  return { tag_removed: tag, contact_id: contactId };
+  const payload = action.action_payload || {};
+
+  // Support both single tag and batch array
+  const tags = payload.tags || (payload.tag ? [payload.tag] : []);
+  if (!contactId || tags.length === 0) throw new Error('Missing contactId or tag/tags');
+
+  await ghlFetch('DELETE', `/contacts/${contactId}/tags`, { tags });
+
+  if (tags.length === 1) {
+    return { tag_removed: tags[0], contact_id: contactId };
+  }
+  console.log(`[ActionExecutor] ✅ Batch removed ${tags.length} tags from ${contactId}`);
+  return { tags_removed: tags.length, tags, contact_id: contactId };
 }
 
 async function executeMoveOpportunity(action) {
@@ -247,14 +259,8 @@ async function executeSendNotification(action, context) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// v3.0: ADD TO WORKFLOW — Enroll contact in a GHL workflow
+// v3.0: ADD TO WORKFLOW
 // ═══════════════════════════════════════════════════════════════════
-//
-// payload: { workflow_id: "GHL workflow UUID" }
-// OR: { workflow_name: "friendly name" } with a WORKFLOW_MAP lookup
-//
-// Uses: POST /contacts/{contactId}/workflow/{workflowId}
-// Same API as remove_from_workflow(remove_all) but with a specific target.
 
 async function executeAddToWorkflow(action) {
   const contactId = action.target_id;
@@ -273,24 +279,8 @@ async function executeAddToWorkflow(action) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// v3.0: BOOK APPOINTMENT — Create a GHL calendar appointment
+// v3.0: BOOK APPOINTMENT
 // ═══════════════════════════════════════════════════════════════════
-//
-// payload: {
-//   calendar_id: "GHL calendar UUID" OR calendar_name: "friendly name",
-//   start_time: "ISO 8601" OR date + time fields,
-//   end_time: "ISO 8601" (optional, defaults to +90min),
-//   title: "appointment title" (optional),
-//   status: "new" | "confirmed" (default: "new"),
-//   assigned_user_id: "GHL user ID" (optional)
-// }
-//
-// Uses: POST /calendars/events/appointments
-//
-// CRITICAL CONSTRAINT: A contact can NOT be in more than one
-// appointment reminder sequence at a time. The APPT Handler GHL
-// workflows manage sequence enrollment — this action just books
-// the calendar slot. The APPT Handler fires on the status trigger.
 
 async function executeBookAppointment(action, context) {
   const contactId = action.target_id;
@@ -298,7 +288,6 @@ async function executeBookAppointment(action, context) {
 
   if (!contactId) throw new Error('Missing contactId');
 
-  // Resolve calendar ID from name or direct ID
   let calendarId = payload.calendar_id;
   if (!calendarId && payload.calendar_name) {
     calendarId = CALENDAR_MAP[payload.calendar_name];
@@ -306,17 +295,13 @@ async function executeBookAppointment(action, context) {
   }
   if (!calendarId) throw new Error('Missing calendar_id or calendar_name');
 
-  // Resolve start time
   let startTime = payload.start_time;
   if (!startTime && payload.appointment_date && payload.appointment_time) {
-    // Combine date + time into ISO
-    const date = payload.appointment_date; // YYYY-MM-DD or MM/DD/YYYY
-    let time = payload.appointment_time;   // HH:MM or HH:MM AM/PM
-    // Normalize date
+    const date = payload.appointment_date;
+    let time = payload.appointment_time;
     let isoDate = date;
     const usMatch = date.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
     if (usMatch) isoDate = `${usMatch[3]}-${usMatch[1]}-${usMatch[2]}`;
-    // Normalize time to 24h
     const match12 = time.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
     if (match12) {
       let h = parseInt(match12[1], 10);
@@ -325,11 +310,10 @@ async function executeBookAppointment(action, context) {
       if (p === 'PM' && h !== 12) h += 12;
       time = `${String(h).padStart(2, '0')}:${min}`;
     }
-    startTime = `${isoDate}T${time}:00-04:00`; // EST offset
+    startTime = `${isoDate}T${time}:00-04:00`;
   }
   if (!startTime) throw new Error('Missing start_time or appointment_date+appointment_time');
 
-  // Calculate end time (default: +90 min for in-home, +15 min for phone)
   let endTime = payload.end_time;
   if (!endTime) {
     const durationMin = payload.duration_minutes || 90;
@@ -342,47 +326,20 @@ async function executeBookAppointment(action, context) {
   const status = payload.status || 'new';
   const assignedUserId = payload.assigned_user_id || null;
 
-  const body = {
-    calendarId,
-    locationId: GHL_LOCATION_ID,
-    contactId,
-    startTime,
-    endTime,
-    title,
-    appointmentStatus: status,
-    toNotify: true,
-  };
+  const body = { calendarId, locationId: GHL_LOCATION_ID, contactId, startTime, endTime, title, appointmentStatus: status, toNotify: true };
   if (assignedUserId) body.assignedUserId = assignedUserId;
 
   console.log(`[ActionExecutor] Booking appointment: calendar=${calendarId}, contact=${contactId}, start=${startTime}, status=${status}`);
-
   const result = await ghlFetch('POST', '/calendars/events/appointments', body);
   const appointmentId = result?.id || result?.appointment?.id || null;
-
   console.log(`[ActionExecutor] ✅ Appointment booked: id=${appointmentId}, calendar=${title}`);
 
-  return {
-    action: 'appointment_booked',
-    appointment_id: appointmentId,
-    calendar_id: calendarId,
-    calendar_name: title,
-    contact_id: contactId,
-    start_time: startTime,
-    end_time: endTime,
-    status,
-  };
+  return { action: 'appointment_booked', appointment_id: appointmentId, calendar_id: calendarId, calendar_name: title, contact_id: contactId, start_time: startTime, end_time: endTime, status };
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// v3.0: CANCEL APPOINTMENT — Update GHL appointment status
+// v3.0: CANCEL APPOINTMENT
 // ═══════════════════════════════════════════════════════════════════
-//
-// payload: {
-//   appointment_id: "GHL appointment UUID",
-//   status: "cancelled" | "noshow" | "confirmed" | "showed"
-// }
-//
-// Uses: PUT /calendars/events/appointments/{appointmentId}
 
 async function executeCancelAppointment(action) {
   const payload = action.action_payload || {};
@@ -391,10 +348,7 @@ async function executeCancelAppointment(action) {
 
   if (!appointmentId) throw new Error('Missing appointment_id');
 
-  await ghlFetch('PUT', `/calendars/events/appointments/${appointmentId}`, {
-    appointmentStatus: newStatus,
-  });
-
+  await ghlFetch('PUT', `/calendars/events/appointments/${appointmentId}`, { appointmentStatus: newStatus });
   console.log(`[ActionExecutor] ✅ Appointment ${appointmentId} status → ${newStatus}`);
   return { action: 'appointment_updated', appointment_id: appointmentId, new_status: newStatus };
 }
@@ -403,12 +357,6 @@ async function executeCancelAppointment(action) {
 // LP APPOINTMENT WRITEBACK
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * v3.1: Parse long-format dates from GHL webhook payloads.
- * GHL sends dates like "April 8, 2026" or "April 08, 2026" via
- * template variables. Converts to MM/DD/YYYY for LP API.
- * Returns null if the string is not a recognizable long date.
- */
 const MONTH_MAP = {
   january: '01', february: '02', march: '03', april: '04',
   may: '05', june: '06', july: '07', august: '08',
@@ -428,12 +376,9 @@ function parseLongDate(dateStr) {
 function normalizeDateForComparison(dateStr) {
   if (!dateStr) return null;
   const s = String(dateStr).trim();
-  // ISO format: 2026-04-08 or 2026-04-08T14:00:00
   if (s.match(/^\d{4}-\d{2}-\d{2}/)) return s.slice(0, 10);
-  // US format: 04/08/2026
   const usMatch = s.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
   if (usMatch) return `${usMatch[3]}-${usMatch[1]}-${usMatch[2]}`;
-  // v3.1: Long format: "April 8, 2026"
   const longParsed = parseLongDate(s);
   if (longParsed) {
     const [m, d, y] = longParsed.split('/');
@@ -464,16 +409,10 @@ async function executeSetLPAppointment(action) {
   }
   if (!lpLeadId) throw new Error(`No LP Lead ID for contact ${contactId}`);
 
-  // ── v3.1: EXPANDED DATE RESOLUTION ──
-  // Priority: explicit payload fields → event payload fields (multiple naming conventions)
-  // GHL webhook sends: startDate ("April 8, 2026"), start_time ("2:00 PM")
-  // GHL workflow sends: appt_date, appointment_date (various formats)
-  // Fallback: ISO start_time if it contains a date, then GHL contact lookup
   let rawDate = payload.appt_date || payload.appointment_date
     || eventPayload.appt_date || eventPayload.appointment_date
     || eventPayload.startDate || eventPayload.start_date
     || null;
-  // Fallback: extract date from ISO start_time (e.g. "2026-04-08T14:00:00")
   if (!rawDate && eventPayload.start_time && String(eventPayload.start_time).includes('T')) {
     rawDate = eventPayload.start_time;
   }
@@ -483,32 +422,23 @@ async function executeSetLPAppointment(action) {
   }
   if (!rawDate) throw new Error('Cannot resolve appointment date');
 
-  // Convert rawDate to MM/DD/YYYY for LP API
   let apptDate;
   if (rawDate.includes('-')) {
-    // ISO format: 2026-04-08 or 2026-04-08T14:00:00
     const [y, m, d] = rawDate.split('T')[0].split('-');
     apptDate = `${m}/${d}/${y}`;
   } else {
-    // v3.1: Try long format ("April 8, 2026") then fall through to raw
     const longParsed = parseLongDate(rawDate);
     apptDate = longParsed || rawDate;
   }
 
-  // ── v3.1: EXPANDED TIME RESOLUTION ──
-  // Priority: explicit payload fields → event payload fields → ISO extraction → GHL contact
-  // GHL webhook sends: start_time ("2:00 PM" or ISO "2026-04-08T14:00:00")
   let rawTime = payload.appt_time || payload.appointment_time
     || eventPayload.appt_time || eventPayload.appointment_time
     || null;
-  // v3.1: Check start_time — could be "2:00 PM" (direct) or ISO (extract time part)
   if (!rawTime && eventPayload.start_time) {
     const st = String(eventPayload.start_time);
     if (st.includes('T')) {
-      // ISO format: extract time portion "14:00"
       rawTime = st.split('T')[1]?.slice(0, 5);
     } else {
-      // Direct time format: "2:00 PM", "14:00", etc.
       rawTime = st;
     }
   }
@@ -518,7 +448,6 @@ async function executeSetLPAppointment(action) {
   }
   if (!rawTime) throw new Error('Cannot resolve appointment time');
 
-  // Normalize 12h → 24h for LP API
   let apptTime = rawTime;
   const match12 = apptTime.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
   if (match12) {
@@ -533,7 +462,6 @@ async function executeSetLPAppointment(action) {
   const setBy = payload.set_by || '5686';
   const calendarName = payload.calendar_name || eventPayload.calendar_name || eventPayload.title || 'N/A';
 
-  // v2.5: LP appointment pre-check
   const ghlDateNormalized = normalizeDateForComparison(rawDate);
   try {
     const { data: existingLead } = await supabase
