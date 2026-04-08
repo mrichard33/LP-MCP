@@ -15,6 +15,9 @@
  *   POST /webhook/groupme — Callback URL for GroupMe bot
  *   POST /groupme/send    — Manual send (for testing)
  *   GET  /groupme/pending  — View pending approval requests
+ *
+ * v1.1 — Fix: rejection sets status='rejected' (was 'cancelled' which
+ *   violated the agent_actions check constraint).
  */
 
 import supabase from './supabase.js';
@@ -174,11 +177,11 @@ async function handleGroupMeCallback(payload) {
     return { handled: true, action: 'approved', shortRef, actionCount: actionIds.length };
 
   } else {
-    // Reject all actions in the batch
+    // v1.1: Reject all actions in the batch — use 'rejected' (not 'cancelled')
     const { error } = await supabase
       .from('agent_actions')
       .update({
-        status: 'cancelled',
+        status: 'rejected',
         approved_by: senderName.toLowerCase(),
         error_message: `Rejected via GroupMe by ${senderName}`,
         updated_at: new Date().toISOString(),
