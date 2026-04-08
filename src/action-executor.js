@@ -51,6 +51,7 @@ import { applyGHLTag, addGHLNote, updateGHLContactFields } from './ghl.js';
 import { setAppointment as lpSetAppointment, getLeadByLdsId } from './lp-client.js';
 import { sendGroupMeMessage, sendApprovalRequest } from './groupme.js';
 import { acquireToken, report429, registerRateLimiterRoutes } from './ghl-rate-limiter.js';
+import { formatPhone, formatDateTime } from './format-helpers.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = 'SsBG7j5KQAIP1SFP2Sca';
@@ -451,7 +452,8 @@ function buildRichNotification({ baseMessage, name, phone, contactId, prospectId
   const lines = [];
   lines.push(`🤖 ${baseMessage}`);
 
-  const nameLine = `👤 ${name || 'Unknown'}${phone ? ` (${phone})` : ''}`;
+  const displayPhone = formatPhone(phone);
+  const nameLine = `👤 ${name || 'Unknown'}${displayPhone ? ` (${displayPhone})` : ''}`;
   lines.push(nameLine);
 
   const idLabel = isLPLeadId(contactId) ? 'LP Lead ID' : 'Contact ID';
@@ -481,7 +483,8 @@ function buildRichNotification({ baseMessage, name, phone, contactId, prospectId
 
   if (enrichment.appointmentDate) {
     const prefix = enrichment.calendarName ? `${enrichment.calendarName}: ` : '';
-    lines.push(`📅 ${prefix}${enrichment.appointmentDate}`);
+    const displayDate = formatDateTime(enrichment.appointmentDate) || enrichment.appointmentDate;
+    lines.push(`📅 ${prefix}${displayDate}`);
   }
 
   return lines.join('\n');
