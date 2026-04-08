@@ -11,6 +11,14 @@
  *   - User replies "Yes 1234" or "No 1234" (where 1234 = batch ID prefix)
  *   - Webhook handler matches reply → approves/rejects batch → executes
  *
+ * v1.2 — Enriched approval requests with full decision context.
+ *   sendApprovalRequest now accepts eventContext and lpLeadData params.
+ *   Approval messages include: contact name+phone, last message text,
+ *   LP source, rep name, disposition, what triggered the rule, and
+ *   what the actions will do. Goal: approve/reject from GroupMe alone.
+ *
+ * v1.1 — Fix: rejection uses status='rejected' (was 'cancelled').
+ *
  * Routes:
  *   POST /webhook/groupme — Callback URL for GroupMe bot
  *   POST /groupme/send    — Manual send (for testing)
@@ -54,36 +62,113 @@ export async function sendGroupMeMessage(text) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// APPROVAL REQUEST FORMAT
+// ENRICHED APPROVAL REQUEST FORMAT (v1.2)
 // ═══════════════════════════════════════════════════════════════════
 
-export async function sendApprovalRequest(batchActions, contactName, contactPhone) {
+/**
+ * Human-readable rule name mapping for GroupMe display.
+ */
+const RULE_DISPLAY_NAMES = {
+  'BEHAVIORAL_FAST_TRACK':        '🔥 AI FAST-TRACK',
+  'BEHAVIORAL_SPOUSE_OBJECTION':  '💑 SPOUSE OBJECTION',
+  'BEHAVIORAL_PRICE_OBJECTION':   '💰 PRICE OBJECTION',
+  'BEHAVIORAL_TIMING_OBJECTION':  '⏰ TIMING OBJECTION',
+  'BEHAVIORAL_TRUST_OBJECTION':   '🛡️ TRUST OBJECTION',
+  'BEHAVIORAL_COMPETITOR_OBJECTION': '⚔️ COMPETITOR OBJECTION',
+  'BEHAVIORAL_DIY_OBJECTION':     '🔧 DIY OBJECTION',
+  'BEHAVIORAL_DISENGAGEMENT':     '📉 DISENGAGEMENT',
+  'BEHAVIORAL_ESCALATE_REP':      '🚨 REP ESCALATION',
+  'BEHAVIORAL_DNC_REPLY':         '🚫 DNC REPLY',
+};
+
+/**
+ * Build a concise action summary for GroupMe display.
+ */
+function formatActionSummary(actions) {
+  const parts = [];
+  for (const a of actions) {
+    if (a.action_type === 'add_tag') parts.push(`Tag: ${a.action_payload?.tag}`);
+    else if (a.action_type === 'remove_tag') {
+      const tags = a.action_payload?.tags || [a.action_payload?.tag];
+      parts.push(`Remove: ${tags.join(', ')}`);
+    }
+    else if (a.action_type === 'move_opportunity') parts.push(`Pipeline → ${a.action_payload?.pipeline} ${a.action_payload?.stage}`);
+    else if (a.action_type === 'remove_from_workflow') parts.push('Remove from workflow');
+    else if (a.action_type === 'create_task') parts.push(`Task: ${(a.action_payload?.title || '').slice(0, 60)}`);
+    else if (a.action_type === 'send_notification') parts.push('Notify');
+    else parts.push(a.action_type);
+  }
+  return parts.join(' | ');
+}
+
+/**
+ * v1.2: Enriched approval request with full decision context.
+ * 
+ * @param {Array} batchActions — Actions in this batch
+ * @param {string} contactName — Resolved contact name
+ * @param {string} contactPhone — Resolved phone
+ * @param {Object} enrichment — Additional context for the approval message
+ * @param {string} enrichment.messageText — Last inbound message that triggered the rule
+ * @param {string} enrichment.messageType — SMS / Email / Live Chat
+ * @param {string} enrichment.lpSource — LP lead source
+ * @param {string} enrichment.repName — Assigned rep
+ * @param {string} enrichment.disposition — Current LP disposition
+ * @param {string} enrichment.prospectId — LP Prospect ID
+ * @param {number} enrichment.score — Intent score
+ * @param {string} enrichment.tier — Intent tier
+ * @param {string} enrichment.briefing — AI-generated rep briefing
+ * @param {string} enrichment.aiSummary — AI conversation summary
+ */
+export async function sendApprovalRequest(batchActions, contactName, contactPhone, enrichment = {}) {
   if (!batchActions?.length) return;
 
   const first = batchActions[0];
   const batchId = first.batch_id || `s_${first.id}`;
-  // Use first 8 chars of batch_id as short reference
   const shortRef = String(first.id);
 
-  const actionSummary = batchActions.map(a => {
-    if (a.action_type === 'add_tag') return `Tag: ${a.action_payload?.tag}`;
-    if (a.action_type === 'move_opportunity') return `Move → ${a.action_payload?.pipeline} ${a.action_payload?.stage}`;
-    if (a.action_type === 'remove_from_workflow') return `Remove from workflow`;
-    if (a.action_type === 'create_task') return `Task: ${a.action_payload?.title}`;
-    if (a.action_type === 'send_notification') return `Notify`;
-    return a.action_type;
-  }).join('\n  ');
+  const ruleName = RULE_DISPLAY_NAMES[first.rule_applied] || first.rule_applied;
+  const actionSummary = formatActionSummary(batchActions);
 
-  const msg = [
-    `🔔 APPROVAL NEEDED [#${shortRef}]`,
-    `Rule: ${first.rule_applied}`,
-    `Contact: ${contactName || 'Unknown'}${contactPhone ? ` (${contactPhone})` : ''}`,
-    `Reason: ${first.reasoning || 'N/A'}`,
-    `Actions:`,
-    `  ${actionSummary}`,
-    ``,
-    `Reply: Yes ${shortRef} or No ${shortRef}`,
-  ].join('\n');
+  // Build the message lines
+  const lines = [];
+  lines.push(`🔔 APPROVAL [#${shortRef}]`);
+  lines.push(`${ruleName}`);
+  lines.push(`👤 ${contactName || 'Unknown'}${contactPhone ? ` (${contactPhone})` : ''}`);
+
+  // Context: what triggered this
+  if (enrichment.messageText) {
+    const msg = enrichment.messageText.slice(0, 120);
+    lines.push(`💬 "${msg}"${enrichment.messageType ? ` [${enrichment.messageType}]` : ''}`);
+  }
+
+  // LP data if available
+  const lpParts = [];
+  if (enrichment.lpSource) lpParts.push(`Src: ${enrichment.lpSource}`);
+  if (enrichment.repName) lpParts.push(`Rep: ${enrichment.repName}`);
+  if (enrichment.disposition) lpParts.push(`Disp: ${enrichment.disposition}`);
+  if (enrichment.prospectId && enrichment.prospectId !== 'Not in LP') lpParts.push(`Prospect: ${enrichment.prospectId}`);
+  if (lpParts.length > 0) lines.push(`📋 ${lpParts.join(' | ')}`);
+
+  // Intent data if available
+  if (enrichment.score || enrichment.tier) {
+    const intentParts = [];
+    if (enrichment.score) intentParts.push(`Score: ${enrichment.score}`);
+    if (enrichment.tier) intentParts.push(`Tier: ${enrichment.tier}`);
+    if (enrichment.barrier) intentParts.push(`Barrier: ${enrichment.barrier}`);
+    lines.push(`📊 ${intentParts.join(' | ')}`);
+  }
+
+  // AI summary if available
+  if (enrichment.aiSummary) {
+    lines.push(`🤖 ${enrichment.aiSummary.slice(0, 150)}`);
+  }
+
+  // What the actions will do
+  lines.push(`🎯 ${actionSummary}`);
+  lines.push('');
+  lines.push(`Reply: Yes ${shortRef} or No ${shortRef}`);
+
+  const msg = lines.join('\n');
 
   await sendGroupMeMessage(msg);
 
