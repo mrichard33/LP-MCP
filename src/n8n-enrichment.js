@@ -6,12 +6,19 @@
  * This endpoint does everything the 8 Code nodes did:
  * 1. Parse input params from GHL webhook body
  * 2. Get LP token (uses LP MCP's built-in token manager)
- * 3. Resolve prospect ID (from prospect_id or lead_id)
+ * 3. Resolve prospect ID (from prospect_id, lead_id, OR phone/email fallback)
  * 4. Fetch full lead data + lead info from LP API
  * 5. Build enriched record (aggregate leads, appointments, jobs, calls)
  * 6. Calculate highest stage, market, sale amounts, etc.
  * 7. Fetch current GHL tags and merge
  * 8. Return complete payload ready for GHL contact update
+ *
+ * v2.0 — Phone/email fallback via GetCustomers3 + lp_lead_id writeback
+ *   When lp_prospect_id and lp_lead_id are both empty, accepts phone/email
+ *   as fallback search params and uses LP GetCustomers3 to resolve the prospect.
+ *   Also writes lp_lead_id (real lds_id) back to GHL customFields so
+ *   contact.lp_lead_id gets populated after enrichment.
+ *   Fixes: SetAppointment wrong-ID bug (in1_id vs lds_id).
  */
 
 import { getToken } from './token-manager.js';
@@ -66,6 +73,87 @@ function parseResponse(data) {
   }
   if (data.cst_id || data.ProspectID || data.firstname) return data;
   return data;
+}
+
+// ─── v2.0: Phone/email fallback via GetCustomers3 ────────────────
+
+/**
+ * Search LP by phone or email using GetCustomers3.
+ * Returns the prospect ID (cst_id) if found, or null.
+ * Tries phone first (most reliable match), then email.
+ */
+async function resolveProspectByPhoneEmail({ phone, email, last_name }, token) {
+  // Normalize phone: strip non-digits
+  const cleanPhone = phone ? String(phone).replace(/\D/g, '') : '';
+
+  // Try phone first
+  if (cleanPhone) {
+    console.log(`[n8n/enrich] GetCustomers3 fallback: searching by phone ${cleanPhone}`);
+    const result = await lpPost('/api/Customers/GetCustomers3', {
+      phone: cleanPhone,
+      email: '',
+      lastname: '',
+      prospectid: '',
+    }, token);
+
+    const prospect = parseGetCustomers3(result);
+    if (prospect) {
+      console.log(`[n8n/enrich] GetCustomers3 phone match: cst_id=${prospect.cst_id}`);
+      return String(prospect.cst_id);
+    }
+  }
+
+  // Try email
+  if (email) {
+    console.log(`[n8n/enrich] GetCustomers3 fallback: searching by email ${email}`);
+    const result = await lpPost('/api/Customers/GetCustomers3', {
+      phone: '',
+      email: email,
+      lastname: '',
+      prospectid: '',
+    }, token);
+
+    const prospect = parseGetCustomers3(result);
+    if (prospect) {
+      console.log(`[n8n/enrich] GetCustomers3 email match: cst_id=${prospect.cst_id}`);
+      return String(prospect.cst_id);
+    }
+  }
+
+  // Try last name (least specific, may return multiple)
+  if (last_name && !cleanPhone && !email) {
+    console.log(`[n8n/enrich] GetCustomers3 fallback: searching by lastname ${last_name}`);
+    const result = await lpPost('/api/Customers/GetCustomers3', {
+      phone: '',
+      email: '',
+      lastname: last_name,
+      prospectid: '',
+    }, token);
+
+    const prospect = parseGetCustomers3(result);
+    if (prospect) {
+      console.log(`[n8n/enrich] GetCustomers3 lastname match: cst_id=${prospect.cst_id}`);
+      return String(prospect.cst_id);
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Parse GetCustomers3 response — returns the first prospect record or null.
+ * GetCustomers3 returns an array of prospect records.
+ */
+function parseGetCustomers3(data) {
+  if (!data) return null;
+  if (Array.isArray(data)) {
+    return data.length > 0 ? data[0] : null;
+  }
+  if (data.Records && Array.isArray(data.Records)) {
+    return data.Records.length > 0 ? data.Records[0] : null;
+  }
+  if (data.cst_id || data.ProspectID) return data;
+  return null;
 }
 
 // ─── Build enriched record from LP data ──────────────────────────
@@ -233,6 +321,19 @@ function enrichFromLP(enrichedRecord, rawLead) {
     apptStatus = latestAppt.disposition || '';
   }
 
+  // v2.0: Extract the real lds_id from the latest lead for lp_lead_id writeback
+  let latestLdsId = '';
+  if (allLeads.length > 0) {
+    // Use the most recently entered lead's lds_id
+    const sortedByDate = [...allLeads].sort((a, b) => {
+      const dateA = new Date(a.dateentered || a.DateEntered || a.entrydate || 0);
+      const dateB = new Date(b.dateentered || b.DateEntered || b.entrydate || 0);
+      return dateB - dateA;
+    });
+    const latest = sortedByDate[0];
+    latestLdsId = String(latest.lds_id || latest.LeadID || latest.id || '');
+  }
+
   const lastSynced = (() => {
     const d = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
     const hours = d.getHours();
@@ -245,6 +346,7 @@ function enrichFromLP(enrichedRecord, rawLead) {
 
   return {
     lp_prospect_id: String(enrichedRecord.lp_prospect_id || prospect.cst_id || ''),
+    lp_lead_id: latestLdsId,
     contact_id: enrichedRecord.contact_id || '',
     lp_highest_stage: highestStage,
     lp_market: markets,
@@ -273,12 +375,13 @@ export function registerN8nEnrichRoute(app) {
       const lp_prospect_id = body['LP Prospect ID'] || body.lp_prospect_id || body.prospect_id || body.ProspectID || body.prospectid || '';
       const lp_lead_id = body['LP Lead ID'] || body.lp_lead_id || body.lead_id || body.LeadID || body.leadid || body.lds_id || '';
       const contact_id = body.contact_id || body.contactId || body.ghl_contact_id || '';
+      const phone = body.phone || body.Phone || '';
+      const email = body.email || body.Email || '';
+      const first_name = body.first_name || body.firstName || body.FirstName || body.firstname || '';
+      const last_name = body.last_name || body.lastName || body.LastName || body.lastname || '';
 
       if (!contact_id) {
         return res.status(400).json({ success: false, error: 'contact_id is required' });
-      }
-      if (!lp_prospect_id && !lp_lead_id) {
-        return res.status(400).json({ success: false, error: 'Must provide lp_prospect_id or lp_lead_id', contact_id });
       }
 
       const token = await getToken();
@@ -287,8 +390,11 @@ export function registerN8nEnrichRoute(app) {
       }
 
       let resolvedProspectId = lp_prospect_id ? String(lp_prospect_id).trim() : '';
+      let resolvedVia = 'prospect_id';
 
+      // Resolution chain: prospect_id → lead_id → phone/email fallback
       if (!resolvedProspectId && lp_lead_id) {
+        resolvedVia = 'lead_id';
         const leadLookup = await lpPost('/api/Customers/GetLead', {
           lds_id: lp_lead_id, PageSize: '1', StartIndex: '1', options: '0',
         }, token);
@@ -302,10 +408,47 @@ export function registerN8nEnrichRoute(app) {
           cst_id = String(leadLookup.Records[0].cst_id || '');
         }
 
-        if (!cst_id) {
-          return res.status(404).json({ success: false, error: `Could not resolve prospect ID from lead ID ${lp_lead_id}`, contact_id });
+        if (cst_id) resolvedProspectId = cst_id;
+      }
+
+      // v2.0: Phone/email fallback via GetCustomers3
+      if (!resolvedProspectId && (phone || email || last_name)) {
+        resolvedVia = 'phone_email_fallback';
+        console.log(`[n8n/enrich] No LP IDs available — trying GetCustomers3 fallback for contact ${contact_id}`);
+        const fallbackResult = await resolveProspectByPhoneEmail({ phone, email, last_name }, token);
+        if (fallbackResult) {
+          resolvedProspectId = fallbackResult;
         }
-        resolvedProspectId = cst_id;
+      }
+
+      // v2.0: If still no prospect ID, fetch GHL contact to get phone/email and retry
+      if (!resolvedProspectId && contact_id) {
+        resolvedVia = 'ghl_contact_fallback';
+        console.log(`[n8n/enrich] No LP IDs or phone/email — fetching GHL contact ${contact_id} for phone/email`);
+        try {
+          const ghlContact = await ghlGet(contact_id);
+          const c = ghlContact?.contact || ghlContact || {};
+          const ghlPhone = c.phone || '';
+          const ghlEmail = c.email || '';
+          const ghlLastName = c.lastName || '';
+          if (ghlPhone || ghlEmail) {
+            const fallbackResult = await resolveProspectByPhoneEmail({
+              phone: ghlPhone, email: ghlEmail, last_name: ghlLastName,
+            }, token);
+            if (fallbackResult) resolvedProspectId = fallbackResult;
+          }
+        } catch (e) {
+          console.error('[n8n/enrich] GHL contact fetch failed:', e.message);
+        }
+      }
+
+      if (!resolvedProspectId) {
+        return res.status(404).json({
+          success: false,
+          error: 'Could not resolve LP prospect. Tried: prospect_id, lead_id, phone, email, GHL contact lookup. Lead may still be in LP inbound queue (not yet processed).',
+          contact_id,
+          resolution_attempted: resolvedVia,
+        });
       }
 
       const [fullData, leadInfo] = await Promise.all([
@@ -325,30 +468,37 @@ export function registerN8nEnrichRoute(app) {
         console.error('[n8n/enrich] Failed to fetch GHL tags:', e.message);
       }
 
-      const ghlUpdateBody = {
-        tags: mergedTags,
-        customFields: [
-          { key: 'lp_prospect_id', field_value: lpFields.lp_prospect_id },
-          { key: 'lp_highest_stage', field_value: lpFields.lp_highest_stage },
-          { key: 'lp_market', field_value: lpFields.lp_market },
-          { key: 'lp_total_leads', field_value: String(lpFields.lp_total_leads) },
-          { key: 'lp_gross_sale_amount', field_value: lpFields.lp_gross_sale_amount },
-          { key: 'lp_ever_sold', field_value: lpFields.lp_ever_sold },
-          { key: 'lp_ever_sat', field_value: lpFields.lp_ever_sat },
-          { key: 'lp_best_lead_sales_rep', field_value: lpFields.lp_best_lead_sales_rep },
-          { key: 'lp_total_appointments', field_value: String(lpFields.lp_total_appointments) },
-          { key: 'lp_latest_appt_status', field_value: lpFields.lp_latest_appt_status },
-          { key: 'lp_last_synced', field_value: lpFields.lp_last_synced },
-          { key: 'last_appointment_start_date', field_value: lpFields.last_appointment_start_date },
-          { key: 'last_appointment_start_time', field_value: lpFields.last_appointment_start_time },
-        ],
-      };
+      // v2.0: Include lp_lead_id in customFields so GHL gets the real lds_id
+      const customFields = [
+        { key: 'lp_prospect_id', field_value: lpFields.lp_prospect_id },
+        { key: 'lp_highest_stage', field_value: lpFields.lp_highest_stage },
+        { key: 'lp_market', field_value: lpFields.lp_market },
+        { key: 'lp_total_leads', field_value: String(lpFields.lp_total_leads) },
+        { key: 'lp_gross_sale_amount', field_value: lpFields.lp_gross_sale_amount },
+        { key: 'lp_ever_sold', field_value: lpFields.lp_ever_sold },
+        { key: 'lp_ever_sat', field_value: lpFields.lp_ever_sat },
+        { key: 'lp_best_lead_sales_rep', field_value: lpFields.lp_best_lead_sales_rep },
+        { key: 'lp_total_appointments', field_value: String(lpFields.lp_total_appointments) },
+        { key: 'lp_latest_appt_status', field_value: lpFields.lp_latest_appt_status },
+        { key: 'lp_last_synced', field_value: lpFields.lp_last_synced },
+        { key: 'last_appointment_start_date', field_value: lpFields.last_appointment_start_date },
+        { key: 'last_appointment_start_time', field_value: lpFields.last_appointment_start_time },
+      ];
+
+      // v2.0: Write lp_lead_id (the real lds_id) if we resolved one
+      if (lpFields.lp_lead_id) {
+        customFields.push({ key: 'lp_lead_id', field_value: lpFields.lp_lead_id });
+      }
+
+      const ghlUpdateBody = { tags: mergedTags, customFields };
 
       const elapsed = Date.now() - startTime;
       res.json({
         success: true,
         contact_id,
         lp_prospect_id: lpFields.lp_prospect_id,
+        lp_lead_id: lpFields.lp_lead_id || null,
+        resolved_via: resolvedVia,
         ghl_update_body: ghlUpdateBody,
         enriched_summary: {
           firstName: enriched.firstName,
