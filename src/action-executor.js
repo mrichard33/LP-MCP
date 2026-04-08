@@ -17,12 +17,14 @@
  *   set_lp_appointment   → Push appointment to LP via SetAppointment API (Phase 2 write)
  *   update_custom_fields → PUT /contacts/{id} with customFields array
  *
- * v3.7 — Event payload fallback for contact name resolution.
- *   resolveContactInfo now checks event payload (contactName, lead_name)
- *   before falling back to contact ID. Combined with webhook changes
- *   (adding contactName to APPT Handler webhooks), guarantees names
- *   are never blank in GroupMe notifications.
+ * v3.8 — LP Lead ID detection in resolvers.
+ *   resolveContactInfo and resolveLPProspectId now detect when target_id
+ *   is an LP Lead ID (numeric) vs GHL Contact ID (alphanumeric).
+ *   LP disposition events use lp_lead_id as entity_id for unmatched contacts.
+ *   Without this fix, OPPFDN/1Leg/BO notifications showed "Not in LP"
+ *   for contacts that ARE in LP but have no GHL match.
  *
+ * v3.7 — Event payload fallback for contact name resolution.
  * v3.6 — Direct LP API lookup for Prospect ID.
  * v3.5 — Guaranteed contact name fallback (GHL → Supabase → contact ID).
  * v3.4 — GHL Rate Limiter integration.
@@ -40,6 +42,20 @@ import { acquireToken, report429, registerRateLimiterRoutes } from './ghl-rate-l
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = 'SsBG7j5KQAIP1SFP2Sca';
+
+// ═══════════════════════════════════════════════════════════════════
+// ID TYPE DETECTION
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * v3.8: Detect if a target_id is an LP Lead ID (numeric) vs GHL Contact ID.
+ * LP disposition events use lp_lead_id as entity_id for contacts with no GHL match.
+ * GHL Contact IDs are alphanumeric strings (e.g., "ocjV8XY2Bz3Ov5tD8dbc").
+ * LP Lead IDs are purely numeric strings (e.g., "521532").
+ */
+function isLPLeadId(id) {
+  return id && /^\d+$/.test(String(id));
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // PIPELINE STAGE MAP
@@ -158,20 +174,59 @@ function interpolatePayload(payload, context) {
 // ═══════════════════════════════════════════════════════════════════
 
 /**
- * v3.7: Resolve contact name with guaranteed fallback chain.
+ * v3.8: Resolve contact name with guaranteed fallback chain.
+ * Now detects LP Lead IDs (numeric) and queries by lp_lead_id.
  * Never returns null for name — always provides SOMETHING.
  * 
- * Fallback chain:
+ * Fallback chain for GHL Contact IDs (alphanumeric):
  *   1. GHL API → firstName + lastName
- *   2. Supabase lp_leads → first_name + last_name
+ *   2. Supabase lp_leads by ghl_contact_id → first_name + last_name
  *   3. Event payload → contactName / contact_name / lead_name
  *   4. Contact ID as last resort
  * 
- * @param {string} contactId — GHL contact ID
- * @param {Object} eventContext — Optional event payload with name fields
+ * Fallback chain for LP Lead IDs (numeric):
+ *   1. Supabase lp_leads by lp_lead_id → first_name + last_name
+ *   2. LP API via getLeadByLdsId → name fields
+ *   3. Event payload → contactName / contact_name / lead_name
+ *   4. "LP Lead [id]" as last resort
  */
 async function resolveContactInfo(contactId, eventContext = {}) {
-  if (!contactId || /^\d+$/.test(contactId)) return { name: contactId || 'Unknown', phone: null };
+  if (!contactId) return { name: 'Unknown', phone: null };
+
+  // v3.8: If target_id is an LP Lead ID, query lp_leads by lp_lead_id
+  if (isLPLeadId(contactId)) {
+    // Attempt 1: Supabase lp_leads by lp_lead_id
+    try {
+      const { data: lpLead } = await supabase.from('lp_leads')
+        .select('first_name, last_name, phone, ghl_contact_id')
+        .eq('lp_lead_id', contactId)
+        .maybeSingle();
+      if (lpLead) {
+        const name = [lpLead.first_name, lpLead.last_name].filter(Boolean).join(' ') || null;
+        if (name) return { name, phone: lpLead.phone || null, ghlContactId: lpLead.ghl_contact_id || null };
+      }
+    } catch {}
+
+    // Attempt 2: LP API direct lookup
+    try {
+      const result = await getLeadByLdsId(contactId);
+      const prospects = Array.isArray(result) ? result : [result];
+      for (const p of prospects) {
+        if (!p) continue;
+        const name = [p.FirstName || p.firstname, p.LastName || p.lastname].filter(Boolean).join(' ') || null;
+        if (name) return { name, phone: p.Phone || p.phone || null };
+      }
+    } catch {}
+
+    // Attempt 3: Event payload
+    const payloadName = eventContext.contactName || eventContext.contact_name
+      || eventContext.lead_name || eventContext.leadName || null;
+    if (payloadName) return { name: payloadName, phone: null };
+
+    return { name: `LP Lead ${contactId}`, phone: null };
+  }
+
+  // Standard path: GHL Contact ID (alphanumeric)
 
   // Attempt 1: GHL API (rate-limited)
   try {
@@ -184,7 +239,7 @@ async function resolveContactInfo(contactId, eventContext = {}) {
     // GHL failed (429 or other) — fall through to Supabase
   }
 
-  // Attempt 2: Supabase lp_leads (no GHL rate limit impact)
+  // Attempt 2: Supabase lp_leads by ghl_contact_id
   try {
     const { data: lpLead } = await supabase.from('lp_leads')
       .select('first_name, last_name, phone')
@@ -211,25 +266,44 @@ async function resolveContactInfo(contactId, eventContext = {}) {
 }
 
 /**
- * v3.6: Resolve LP Prospect ID — LP API is source of truth.
+ * v3.8: Resolve LP Prospect ID — LP API is source of truth.
+ * Now detects LP Lead IDs (numeric) and queries directly.
+ * 
+ * For GHL Contact IDs: ghl_contact_id → lp_lead_id → LP API → prospect ID
+ * For LP Lead IDs: lp_lead_id → LP API → prospect ID (skips GHL lookup)
  */
 async function resolveLPProspectId(contactId) {
   if (!contactId) return 'Not in LP';
 
   let lpLeadId = null;
   let cachedProspectId = null;
-  try {
-    const { data: lpLead } = await supabase.from('lp_leads')
-      .select('lp_lead_id, lp_prospect_id')
-      .eq('ghl_contact_id', contactId)
-      .order('synced_at', { ascending: false })
-      .limit(1).maybeSingle();
-    lpLeadId = lpLead?.lp_lead_id || null;
-    cachedProspectId = lpLead?.lp_prospect_id ? String(lpLead.lp_prospect_id) : null;
-  } catch {}
+
+  if (isLPLeadId(contactId)) {
+    // v3.8: target_id IS the LP Lead ID — query directly
+    lpLeadId = contactId;
+    try {
+      const { data: lpLead } = await supabase.from('lp_leads')
+        .select('lp_prospect_id')
+        .eq('lp_lead_id', contactId)
+        .maybeSingle();
+      cachedProspectId = lpLead?.lp_prospect_id ? String(lpLead.lp_prospect_id) : null;
+    } catch {}
+  } else {
+    // Standard: GHL Contact ID → look up LP Lead ID
+    try {
+      const { data: lpLead } = await supabase.from('lp_leads')
+        .select('lp_lead_id, lp_prospect_id')
+        .eq('ghl_contact_id', contactId)
+        .order('synced_at', { ascending: false })
+        .limit(1).maybeSingle();
+      lpLeadId = lpLead?.lp_lead_id || null;
+      cachedProspectId = lpLead?.lp_prospect_id ? String(lpLead.lp_prospect_id) : null;
+    } catch {}
+  }
 
   if (!lpLeadId) return 'Not in LP';
 
+  // LP API direct lookup for most current prospect data
   try {
     const result = await getLeadByLdsId(lpLeadId);
     const prospects = Array.isArray(result) ? result : [result];
@@ -319,7 +393,10 @@ async function executeCreateTask(action, context) {
   const title = payload?.title || 'Agent task';
   const description = payload?.description || '';
   const noteText = description ? `[AGENT TASK] ${title}\n${description}` : `[AGENT TASK] ${title}`;
-  await addGHLNote(contactId, noteText);
+  // Only add GHL note if target is a GHL contact ID (not LP Lead ID)
+  if (!isLPLeadId(contactId)) {
+    await addGHLNote(contactId, noteText);
+  }
   const { name, phone } = await resolveContactInfo(contactId, context);
   const contactLabel = name ? `${name}${phone ? ` (${phone})` : ''}` : contactId;
   await sendGroupMeMessage(`🤖 AGENT TASK: ${title}\nContact: ${contactLabel}`);
@@ -327,8 +404,8 @@ async function executeCreateTask(action, context) {
 }
 
 /**
- * v3.7: Enriched send_notification with guaranteed contact data.
- * Passes event context to resolveContactInfo for payload-based name fallback.
+ * v3.8: Enriched send_notification with LP Lead ID awareness.
+ * Detects LP Lead IDs and resolves name/prospect from LP directly.
  */
 async function executeSendNotification(action, context) {
   const contactId = action.target_id;
@@ -347,9 +424,10 @@ async function executeSendNotification(action, context) {
   const message = payload?.message || 'Agent notification';
 
   const hasContactBlock = message.includes('Name:') || message.includes('Contact ID:');
+  const idLabel = isLPLeadId(contactId) ? `LP Lead ID: ${contactId}` : `Contact ID: ${contactId}`;
   const full = hasContactBlock
     ? `🤖 ${message}`
-    : `🤖 ${message}\nName: ${name}\nContact ID: ${contactId}\nProspect ID: ${prospectId}`;
+    : `🤖 ${message}\nName: ${name}\n${idLabel}\nProspect ID: ${prospectId}`;
 
   await sendGroupMeMessage(full);
   return { action: 'groupme_sent', message: full.slice(0, 200) };
@@ -485,19 +563,24 @@ async function executeSetLPAppointment(action) {
 
   let lpLeadId = payload.lp_lead_id || eventPayload.lp_lead_id || eventPayload.lpLeadId || null;
   if (!lpLeadId && contactId) {
-    const { data: lpLead } = await supabase.from('lp_leads').select('lp_lead_id').eq('ghl_contact_id', contactId).order('synced_at', { ascending: false }).limit(1).maybeSingle();
-    if (lpLead?.lp_lead_id) { lpLeadId = lpLead.lp_lead_id; }
-    else {
-      const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
-      const lpField = (ghlRes?.contact?.customFields || []).find(f => f.id === 'GmAVmW6V9sekD7pVONKr');
-      if (lpField?.value) lpLeadId = String(lpField.value);
+    // v3.8: If target_id is already an LP Lead ID, use it directly
+    if (isLPLeadId(contactId)) {
+      lpLeadId = contactId;
+    } else {
+      const { data: lpLead } = await supabase.from('lp_leads').select('lp_lead_id').eq('ghl_contact_id', contactId).order('synced_at', { ascending: false }).limit(1).maybeSingle();
+      if (lpLead?.lp_lead_id) { lpLeadId = lpLead.lp_lead_id; }
+      else {
+        const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
+        const lpField = (ghlRes?.contact?.customFields || []).find(f => f.id === 'GmAVmW6V9sekD7pVONKr');
+        if (lpField?.value) lpLeadId = String(lpField.value);
+      }
     }
   }
   if (!lpLeadId) throw new Error(`No LP Lead ID for contact ${contactId}`);
 
   let rawDate = payload.appt_date || payload.appointment_date || eventPayload.appt_date || eventPayload.appointment_date || eventPayload.startDate || eventPayload.start_date || null;
   if (!rawDate && eventPayload.start_time && String(eventPayload.start_time).includes('T')) { rawDate = eventPayload.start_time; }
-  if (!rawDate && contactId) {
+  if (!rawDate && contactId && !isLPLeadId(contactId)) {
     const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
     rawDate = ghlRes?.contact?.last_appointment_start_date || ghlRes?.contact?.lastAppointmentStartDate || null;
   }
@@ -512,7 +595,7 @@ async function executeSetLPAppointment(action) {
     const st = String(eventPayload.start_time);
     rawTime = st.includes('T') ? st.split('T')[1]?.slice(0, 5) : st;
   }
-  if (!rawTime && contactId) {
+  if (!rawTime && contactId && !isLPLeadId(contactId)) {
     const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
     rawTime = ghlRes?.contact?.last_appointment_start_time || ghlRes?.contact?.lastAppointmentStartTime || null;
   }
@@ -539,7 +622,9 @@ async function executeSetLPAppointment(action) {
       const lpDateNormalized = normalizeDateForComparison(existingLead.appointment_date);
       if (ghlDateNormalized && lpDateNormalized && ghlDateNormalized === lpDateNormalized) {
         console.log(`[ActionExecutor] ⏭️ LP already has appointment on ${lpDateNormalized} for lds_id=${lpLeadId}`);
-        await addGHLNote(contactId, `[LP SYNC] Appointment already exists in LP — skipped\nLP Lead ID: ${lpLeadId}\nDate: ${lpDateNormalized}`).catch(() => {});
+        if (!isLPLeadId(contactId)) {
+          await addGHLNote(contactId, `[LP SYNC] Appointment already exists in LP — skipped\nLP Lead ID: ${lpLeadId}\nDate: ${lpDateNormalized}`).catch(() => {});
+        }
         return { action: 'already_set_in_lp', lp_lead_id: lpLeadId, lp_appointment_date: lpDateNormalized, ghl_appointment_date: ghlDateNormalized, calendar_name: calendarName, contact_id: contactId };
       }
     }
@@ -548,7 +633,9 @@ async function executeSetLPAppointment(action) {
   console.log(`[ActionExecutor] LP Appointment: lds_id=${lpLeadId}, date=${apptDate}, time=${apptTime}`);
   const result = await lpSetAppointment({ ldsId: lpLeadId, setBy, apptDate, apptTime });
 
-  await addGHLNote(contactId, `[LP SYNC] Appointment set in LP\nLP Lead ID: ${lpLeadId}\nDate: ${apptDate}\nTime: ${apptTime}\nCalendar: ${calendarName}`).catch(() => {});
+  if (!isLPLeadId(contactId)) {
+    await addGHLNote(contactId, `[LP SYNC] Appointment set in LP\nLP Lead ID: ${lpLeadId}\nDate: ${apptDate}\nTime: ${apptTime}\nCalendar: ${calendarName}`).catch(() => {});
+  }
   const { name } = await resolveContactInfo(contactId, eventPayload);
   await sendGroupMeMessage(`📅 LP Appointment Set\nContact: ${name || contactId}\nLP Lead: ${lpLeadId}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName}`).catch(() => {});
 
