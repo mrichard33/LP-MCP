@@ -18,6 +18,12 @@
  *   - ai.analysis_completed → matched against contextual rules using lead_intelligence
  *   - intent.* events → processed by rules but do NOT trigger re-scoring (loop prevention)
  *
+ * v2.5 — lp_disposition_in context condition.
+ *   New operator for evaluateContextConditions: gates a rule on whether the
+ *   contact's current LP disposition_code is in an allowlist. Used by
+ *   BEHAVIORAL_*_OBJECTION rules (Ed Keller finding) to require post-demo
+ *   status (FDNS/BO/1Leg/NIS/OPPFDN) before running W9.0 objection handling.
+ *
  * v2.4 — LP disposition multi-lead dedup:
  *   - Group dedup: ANY LP_DISP_* rule for same GHL contact within window blocks new actions
  *   - Most-recent-lead guard: only the newest LP lead for a GHL contact fires rules
@@ -323,6 +329,28 @@ async function evaluateContextConditions(conditions, intelligence, event) {
         const fieldVal2 = payload[expected];
         if (fieldVal2 !== null && fieldVal2 !== undefined) {
           console.log(`[Context] BLOCKED: payload.${expected} has value "${fieldVal2}"`);
+          return false;
+        }
+        break;
+      }
+      case 'lp_disposition_in': {
+        // v2.5: Gate rule on current LP disposition (post-demo allowlist).
+        // Used by BEHAVIORAL_*_OBJECTION rules to skip pre-appointment contacts
+        // per Ed Keller finding: W9.0 objection handling is post-demo only.
+        const allowed = Array.isArray(expected) ? expected : [expected];
+        const ghlContactId = event.ghl_contact_id;
+        if (!ghlContactId) {
+          console.log(`[Context] BLOCKED: lp_disposition_in requires ghl_contact_id`);
+          return false;
+        }
+        const { data: lpLead } = await supabase.from('lp_leads')
+          .select('disposition_code')
+          .eq('ghl_contact_id', ghlContactId)
+          .order('synced_at', { ascending: false })
+          .limit(1).maybeSingle();
+        const disp = lpLead?.disposition_code || null;
+        if (!allowed.includes(disp)) {
+          console.log(`[Context] BLOCKED: lp_disposition "${disp}" not in [${allowed.join(',')}]`);
           return false;
         }
         break;

@@ -17,6 +17,18 @@
  *   set_lp_appointment   → Push appointment to LP via SetAppointment API (Phase 2 write)
  *   update_custom_fields → PUT /contacts/{id} with customFields array
  *
+ * v3.9 — Enriched GroupMe notifications and approval requests.
+ *   resolveContactInfo now returns { name, phone, ghlContactId, lpLead } where
+ *   lpLead is the full Supabase row — reused by buildNotificationEnrichment so
+ *   enrichment building adds zero new lp_leads queries.
+ *   New buildNotificationEnrichment pulls decision context from the event
+ *   payload, lp_leads, and lead_intelligence (single query) and feeds it into
+ *   both the approval-request path (sendApprovalRequest v1.2) and the executed
+ *   send_notification path (buildRichNotification). Reviewers can now approve
+ *   from GroupMe alone without switching to GHL/LP.
+ *   Known limitation: for multi-event approval batches, enrichment reflects
+ *   only the first action's triggering event.
+ *
  * v3.8 — LP Lead ID detection in resolvers.
  *   resolveContactInfo and resolveLPProspectId now detect when target_id
  *   is an LP Lead ID (numeric) vs GHL Contact ID (alphanumeric).
@@ -191,19 +203,32 @@ function interpolatePayload(payload, context) {
  *   4. "LP Lead [id]" as last resort
  */
 async function resolveContactInfo(contactId, eventContext = {}) {
-  if (!contactId) return { name: 'Unknown', phone: null };
+  if (!contactId) return { name: 'Unknown', phone: null, ghlContactId: null, lpLead: null };
+
+  // v3.9: Columns used both for name resolution and downstream enrichment building.
+  const LP_LEAD_COLUMNS = 'lp_lead_id, lp_prospect_id, ghl_contact_id, first_name, last_name, phone, ' +
+    'lead_source, lead_source_detail, disposition_code, disposition_label, rep_name, ' +
+    'appointment_set, appointment_date, demo_completed';
 
   // v3.8: If target_id is an LP Lead ID, query lp_leads by lp_lead_id
   if (isLPLeadId(contactId)) {
+    let lpLeadRow = null;
+
     // Attempt 1: Supabase lp_leads by lp_lead_id
     try {
       const { data: lpLead } = await supabase.from('lp_leads')
-        .select('first_name, last_name, phone, ghl_contact_id')
+        .select(LP_LEAD_COLUMNS)
         .eq('lp_lead_id', contactId)
         .maybeSingle();
       if (lpLead) {
+        lpLeadRow = lpLead;
         const name = [lpLead.first_name, lpLead.last_name].filter(Boolean).join(' ') || null;
-        if (name) return { name, phone: lpLead.phone || null, ghlContactId: lpLead.ghl_contact_id || null };
+        if (name) return {
+          name,
+          phone: lpLead.phone || null,
+          ghlContactId: lpLead.ghl_contact_id || null,
+          lpLead: lpLeadRow,
+        };
       }
     } catch {}
 
@@ -214,19 +239,48 @@ async function resolveContactInfo(contactId, eventContext = {}) {
       for (const p of prospects) {
         if (!p) continue;
         const name = [p.FirstName || p.firstname, p.LastName || p.lastname].filter(Boolean).join(' ') || null;
-        if (name) return { name, phone: p.Phone || p.phone || null };
+        if (name) return {
+          name,
+          phone: p.Phone || p.phone || null,
+          ghlContactId: lpLeadRow?.ghl_contact_id || null,
+          lpLead: lpLeadRow,
+        };
       }
     } catch {}
 
     // Attempt 3: Event payload
     const payloadName = eventContext.contactName || eventContext.contact_name
       || eventContext.lead_name || eventContext.leadName || null;
-    if (payloadName) return { name: payloadName, phone: null };
+    if (payloadName) return {
+      name: payloadName,
+      phone: null,
+      ghlContactId: lpLeadRow?.ghl_contact_id || null,
+      lpLead: lpLeadRow,
+    };
 
-    return { name: `LP Lead ${contactId}`, phone: null };
+    return {
+      name: `LP Lead ${contactId}`,
+      phone: null,
+      ghlContactId: lpLeadRow?.ghl_contact_id || null,
+      lpLead: lpLeadRow,
+    };
   }
 
   // Standard path: GHL Contact ID (alphanumeric)
+
+  // v3.9: Query Supabase once up front so we have the lpLead row for enrichment
+  // regardless of which name-resolution attempt succeeds.
+  let lpLeadRow = null;
+  try {
+    const { data: lpLead } = await supabase.from('lp_leads')
+      .select(LP_LEAD_COLUMNS)
+      .eq('ghl_contact_id', contactId)
+      .order('synced_at', { ascending: false })
+      .limit(1).maybeSingle();
+    if (lpLead) lpLeadRow = lpLead;
+  } catch {
+    // Supabase failed — fall through
+  }
 
   // Attempt 1: GHL API (rate-limited)
   try {
@@ -234,35 +288,31 @@ async function resolveContactInfo(contactId, eventContext = {}) {
     const c = ghlRes?.contact || {};
     const name = [c.firstName, c.lastName].filter(Boolean).join(' ') || c.name || null;
     const phone = c.phone || null;
-    if (name) return { name, phone };
+    if (name) return { name, phone, ghlContactId: contactId, lpLead: lpLeadRow };
   } catch {
     // GHL failed (429 or other) — fall through to Supabase
   }
 
-  // Attempt 2: Supabase lp_leads by ghl_contact_id
-  try {
-    const { data: lpLead } = await supabase.from('lp_leads')
-      .select('first_name, last_name, phone')
-      .eq('ghl_contact_id', contactId)
-      .order('synced_at', { ascending: false })
-      .limit(1).maybeSingle();
-    if (lpLead) {
-      const name = [lpLead.first_name, lpLead.last_name].filter(Boolean).join(' ') || null;
-      if (name) return { name, phone: lpLead.phone || null };
-    }
-  } catch {
-    // Supabase failed — fall through
+  // Attempt 2: Supabase lp_leads (already fetched above)
+  if (lpLeadRow) {
+    const name = [lpLeadRow.first_name, lpLeadRow.last_name].filter(Boolean).join(' ') || null;
+    if (name) return {
+      name,
+      phone: lpLeadRow.phone || null,
+      ghlContactId: contactId,
+      lpLead: lpLeadRow,
+    };
   }
 
   // Attempt 3: Event payload (webhook data from APPT Handler or LP sync)
   const payloadName = eventContext.contactName || eventContext.contact_name
     || eventContext.lead_name || eventContext.leadName || null;
   if (payloadName && payloadName !== contactId) {
-    return { name: payloadName, phone: null };
+    return { name: payloadName, phone: null, ghlContactId: contactId, lpLead: lpLeadRow };
   }
 
   // Last resort: contact ID
-  return { name: contactId, phone: null };
+  return { name: contactId, phone: null, ghlContactId: contactId, lpLead: lpLeadRow };
 }
 
 /**
@@ -326,6 +376,115 @@ async function resolveLPProspectId(contactId) {
   }
 
   return 'Not in LP';
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// v3.9: NOTIFICATION ENRICHMENT BUILDER
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * v3.9: Build the enrichment object consumed by sendApprovalRequest (v1.2)
+ * and buildRichNotification. Populates decision context so approvers can
+ * act from GroupMe alone without switching to GHL/LP.
+ *
+ * Sources (in precedence order, first non-null wins for each key):
+ *   1. Event payload (context) — freshest; already contains message_text etc.
+ *   2. lp_leads row (passed in, no extra query)
+ *   3. lead_intelligence row (single query by ghl_contact_id)
+ */
+async function buildNotificationEnrichment(contactId, context = {}, { lpLead = null, prospectId = null, ghlContactId = null } = {}) {
+  const enrichment = {
+    messageText: context.message_text || context.messageText || context.body || null,
+    messageType: context.message_type || context.messageType || null,
+    lpSource: null,
+    repName: null,
+    disposition: null,
+    prospectId: prospectId && prospectId !== 'Not in LP' ? prospectId : null,
+    score: context.score || context.intent_score || null,
+    tier: context.tier || context.intent_tier || null,
+    barrier: context.barrier || context.psychological_barrier || null,
+    briefing: context.briefing || context.rep_briefing || null,
+    aiSummary: context.ai_summary || context.ai_reasoning || null,
+    objection: context.objection_type || null,
+    appointmentDate: context.start_time || context.appointment_date || null,
+    calendarName: context.calendar_name || null,
+  };
+
+  // Layer 2: lp_leads row (no extra query)
+  if (lpLead) {
+    if (!enrichment.lpSource) enrichment.lpSource = lpLead.lead_source_detail || lpLead.lead_source || null;
+    if (!enrichment.repName) enrichment.repName = lpLead.rep_name || null;
+    if (!enrichment.disposition) enrichment.disposition = lpLead.disposition_label || lpLead.disposition_code || null;
+    if (!enrichment.appointmentDate) enrichment.appointmentDate = lpLead.appointment_date || null;
+  }
+
+  // Layer 3: lead_intelligence — single query by ghl_contact_id
+  const intelKey = ghlContactId || (lpLead?.ghl_contact_id) || (isLPLeadId(contactId) ? null : contactId);
+  if (intelKey) {
+    try {
+      const { data: intel } = await supabase.from('lead_intelligence')
+        .select('intent_score, intent_tier, objection_type, psychological_barrier, rep_briefing, ai_reasoning')
+        .eq('ghl_contact_id', intelKey)
+        .maybeSingle();
+      if (intel) {
+        if (!enrichment.score) enrichment.score = intel.intent_score || null;
+        if (!enrichment.tier) enrichment.tier = intel.intent_tier || null;
+        if (!enrichment.barrier) enrichment.barrier = intel.psychological_barrier || null;
+        if (!enrichment.briefing) enrichment.briefing = intel.rep_briefing || null;
+        if (!enrichment.aiSummary) enrichment.aiSummary = intel.ai_reasoning || null;
+        if (!enrichment.objection) enrichment.objection = intel.objection_type || null;
+      }
+    } catch {
+      // Silent — enrichment is best-effort. groupme.js formatter handles missing keys.
+    }
+  }
+
+  return enrichment;
+}
+
+/**
+ * v3.9: Format a rich GroupMe notification message using structured data.
+ * Always renders from structured fields — ignores inline `Name:` blocks in
+ * legacy action_payload templates.
+ */
+function buildRichNotification({ baseMessage, name, phone, contactId, prospectId, enrichment = {} }) {
+  const lines = [];
+  lines.push(`🤖 ${baseMessage}`);
+
+  const nameLine = `👤 ${name || 'Unknown'}${phone ? ` (${phone})` : ''}`;
+  lines.push(nameLine);
+
+  const idLabel = isLPLeadId(contactId) ? 'LP Lead ID' : 'Contact ID';
+  const idParts = [`${idLabel}: ${contactId}`];
+  if (prospectId && prospectId !== 'Not in LP') idParts.push(`Prospect: ${prospectId}`);
+  lines.push(`   ${idParts.join(' | ')}`);
+
+  if (enrichment.messageText) {
+    const msg = String(enrichment.messageText).slice(0, 120);
+    const suffix = enrichment.messageType ? ` [${enrichment.messageType}]` : '';
+    lines.push(`💬 "${msg}"${suffix}`);
+  }
+
+  const lpParts = [];
+  if (enrichment.lpSource) lpParts.push(`Src: ${enrichment.lpSource}`);
+  if (enrichment.repName) lpParts.push(`Rep: ${enrichment.repName}`);
+  if (enrichment.disposition) lpParts.push(`Disp: ${enrichment.disposition}`);
+  if (lpParts.length) lines.push(`📋 ${lpParts.join(' | ')}`);
+
+  if (enrichment.score || enrichment.tier || enrichment.barrier) {
+    const intentParts = [];
+    if (enrichment.score) intentParts.push(`Score: ${enrichment.score}`);
+    if (enrichment.tier) intentParts.push(`Tier: ${enrichment.tier}`);
+    if (enrichment.barrier) intentParts.push(`Barrier: ${enrichment.barrier}`);
+    lines.push(`📊 ${intentParts.join(' | ')}`);
+  }
+
+  if (enrichment.appointmentDate) {
+    const prefix = enrichment.calendarName ? `${enrichment.calendarName}: ` : '';
+    lines.push(`📅 ${prefix}${enrichment.appointmentDate}`);
+  }
+
+  return lines.join('\n');
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -404,13 +563,15 @@ async function executeCreateTask(action, context) {
 }
 
 /**
- * v3.8: Enriched send_notification with LP Lead ID awareness.
- * Detects LP Lead IDs and resolves name/prospect from LP directly.
+ * v3.9: Rich send_notification — builds enrichment and renders via
+ * buildRichNotification so the executed message matches the approval preview.
+ * v3.8: LP Lead ID awareness — detects LP Lead IDs and resolves name/prospect from LP directly.
  */
 async function executeSendNotification(action, context) {
   const contactId = action.target_id;
-  const { name, phone } = await resolveContactInfo(contactId, context);
+  const { name, phone, lpLead, ghlContactId } = await resolveContactInfo(contactId, context);
   const prospectId = await resolveLPProspectId(contactId);
+  const enrichment = await buildNotificationEnrichment(contactId, context, { lpLead, prospectId, ghlContactId });
 
   const enrichedContext = {
     ...context,
@@ -421,14 +582,9 @@ async function executeSendNotification(action, context) {
   };
 
   const payload = interpolatePayload(action.action_payload, enrichedContext);
-  const message = payload?.message || 'Agent notification';
+  const baseMessage = payload?.message || 'Agent notification';
 
-  const hasContactBlock = message.includes('Name:') || message.includes('Contact ID:');
-  const idLabel = isLPLeadId(contactId) ? `LP Lead ID: ${contactId}` : `Contact ID: ${contactId}`;
-  const full = hasContactBlock
-    ? `🤖 ${message}`
-    : `🤖 ${message}\nName: ${name}\n${idLabel}\nProspect ID: ${prospectId}`;
-
+  const full = buildRichNotification({ baseMessage, name, phone, contactId, prospectId, enrichment });
   await sendGroupMeMessage(full);
   return { action: 'groupme_sent', message: full.slice(0, 200) };
 }
@@ -713,8 +869,14 @@ export async function executeActions({ limit = 50 } = {}) {
     for (const [batchId, actions] of approvalBatches) {
       const { data: existing } = await supabase.from('groupme_approval_requests').select('id').eq('batch_id', batchId).maybeSingle();
       if (!existing) {
-        const { name, phone } = await resolveContactInfo(actions[0].target_id);
-        await sendApprovalRequest(actions, name, phone).catch(err => { console.error(`[ActionExecutor] Approval request failed for batch ${batchId}:`, err.message); });
+        // v3.9: build enrichment only for batches we're about to notify on,
+        // so poll cycles for already-notified batches don't pay query cost.
+        const firstAction = actions[0];
+        const { name, phone, lpLead, ghlContactId } = await resolveContactInfo(firstAction.target_id);
+        const prospectId = await resolveLPProspectId(firstAction.target_id);
+        const ctx = await getEventContext(firstAction);
+        const enrichment = await buildNotificationEnrichment(firstAction.target_id, ctx, { lpLead, prospectId, ghlContactId });
+        await sendApprovalRequest(actions, name, phone, enrichment).catch(err => { console.error(`[ActionExecutor] Approval request failed for batch ${batchId}:`, err.message); });
       }
     }
   }
