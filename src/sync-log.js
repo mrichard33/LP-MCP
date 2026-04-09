@@ -3,6 +3,9 @@
 // Sync log management for lp_sync_log table.
 // Tracks per-entity sync progress, completion, and failures.
 // activeLogIds scopes SIGTERM cleanup to THIS process's rows only.
+//
+// v6.2 — getLastSyncTimestamp now includes failed syncs that wrote records.
+//         Added MAX_INCREMENTAL_DAYS to cap the sync window.
 
 import supabase from './supabase.js';
 
@@ -15,6 +18,9 @@ export const activeLogIds = new Set();
 export let syncInProgress = false;
 export let syncStartedAt = null;
 export const STALE_LOCK_MINUTES = 120; // 2 hours max before force-reset
+
+// Max days to look back in incremental sync — prevents OOM on large backlogs
+export const MAX_INCREMENTAL_DAYS = 3;
 
 export function setSyncInProgress(val) { syncInProgress = val; }
 export function setSyncStartedAt(val) { syncStartedAt = val; }
@@ -97,9 +103,14 @@ export async function logSyncError(entityId, err, syncType = null) {
   }
 }
 
+// Get the most recent sync timestamp to use as the "since" date for incremental sync.
+// v6.2: Also considers failed syncs that wrote a significant number of records
+// (>100), since those records ARE in the database. This prevents the sync from
+// repeatedly trying to re-pull a week-old backlog after process terminations.
 export async function getLastSyncTimestamp() {
   try {
-    const { data } = await supabase
+    // First try: completed syncs with records (the ideal case)
+    const { data: completed } = await supabase
       .from('lp_sync_log')
       .select('completed_at')
       .eq('entity_type', 'leads')
@@ -109,7 +120,40 @@ export async function getLastSyncTimestamp() {
       .order('completed_at', { ascending: false })
       .limit(1)
       .maybeSingle();
-    return data?.completed_at ? new Date(data.completed_at) : null;
+
+    // Second try: failed syncs that wrote >100 records (partial progress is real)
+    const { data: partialFailed } = await supabase
+      .from('lp_sync_log')
+      .select('started_at')
+      .eq('entity_type', 'leads')
+      .eq('status', 'failed')
+      .gt('records_synced', 100)
+      .not('started_at', 'is', null)
+      .order('started_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const completedTs = completed?.completed_at ? new Date(completed.completed_at) : null;
+    const failedTs = partialFailed?.started_at ? new Date(partialFailed.started_at) : null;
+
+    // Use whichever is more recent
+    let bestTs = null;
+    if (completedTs && failedTs) {
+      bestTs = completedTs > failedTs ? completedTs : failedTs;
+    } else {
+      bestTs = completedTs || failedTs;
+    }
+
+    if (!bestTs) return null;
+
+    // Cap: never look back more than MAX_INCREMENTAL_DAYS
+    const maxLookback = new Date(Date.now() - MAX_INCREMENTAL_DAYS * 24 * 60 * 60 * 1000);
+    if (bestTs < maxLookback) {
+      console.log(`[Sync] Last sync timestamp ${bestTs.toISOString()} is older than ${MAX_INCREMENTAL_DAYS} days — capping to ${maxLookback.toISOString()}`);
+      return maxLookback;
+    }
+
+    return bestTs;
   } catch (err) {
     console.error('[Sync] Failed to read sync log:', err.message);
     return null;
