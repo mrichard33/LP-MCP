@@ -453,7 +453,7 @@ function buildRichNotification({ baseMessage, name, phone, contactId, prospectId
   lines.push(`🤖 ${baseMessage}`);
 
   const displayPhone = formatPhone(phone);
-  const nameLine = `👤 ${name || 'Unknown'}${displayPhone ? ` (${displayPhone})` : ''}`;
+  const nameLine = `👤 ${name || 'Unknown'}${displayPhone ? ` ${displayPhone}` : ''}`;
   lines.push(nameLine);
 
   const idLabel = isLPLeadId(contactId) ? 'LP Lead ID' : 'Contact ID';
