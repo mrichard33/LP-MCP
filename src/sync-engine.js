@@ -1,5 +1,9 @@
 // ─── Sync Engine — src/sync-engine.js ─────────────────────────────
 //
+// v6.2 — Added MAX_INCREMENTAL_LEADS cap to prevent OOM on large backlogs.
+//         Incremental sync now stops after processing 2000 leads per run.
+//         Subsequent runs continue from where the last one left off via
+//         the updated getLastSyncTimestamp (which considers partial syncs).
 // v6.1 — Added GHL notes push (pushNotesToGHL) to fullSync and incrementalSync.
 // v6.0 — Modular orchestrator. All entity-level logic extracted to:
 //   sync-utils.js      — getField, normalizePhone, extractArray, constants
@@ -35,6 +39,10 @@ import { syncDispositions, backfillDispositionsFromLeads } from './sync-disposit
 import { upsertLeadOnly, processProspect } from './sync-leads.js';
 import { syncAllChildRecords, syncJobAndMilestones } from './sync-children.js';
 import { checkDay15Handoffs, checkLeadTriggers } from './sync-triggers.js';
+
+// Max leads to process per incremental sync run — prevents OOM/timeout.
+// The sync runs every 15 min; it will catch up in subsequent runs.
+const MAX_INCREMENTAL_LEADS = 2000;
 
 // ─── Full Sync ───────────────────────────────────────────────────
 
@@ -235,16 +243,27 @@ export async function incrementalSync() {
     let failed = 0;
     const since = lastSyncTime.toISOString().slice(0, 10);
     const today = new Date().toISOString().slice(0, 10);
+    let hitCap = false;
+
+    console.log(`[Sync] Incremental window: ${since} → ${today} (max ${MAX_INCREMENTAL_LEADS} leads)`);
 
     // Part 1: Changed leads
     let startIndex = 1;
     while (true) {
+      // Safety cap: stop if we've processed enough leads for this run
+      if (counts.leads >= MAX_INCREMENTAL_LEADS) {
+        console.log(`[Sync] Hit MAX_INCREMENTAL_LEADS cap (${MAX_INCREMENTAL_LEADS}) — stopping. Will continue in next run.`);
+        hitCap = true;
+        break;
+      }
+
       let leads;
       try { leads = await getLeadData({ startdate: since, enddate: today, PageSize: PAGE_SIZE, StartIndex: startIndex }); }
       catch (err) { console.error('[Sync] GetLeadData failed:', err.message); break; }
       const items = extractArray(leads);
       if (items.length === 0) break;
       for (const lead of items) {
+        if (counts.leads >= MAX_INCREMENTAL_LEADS) { hitCap = true; break; }
         try {
           const cstId = lead.cst_id || lead.CstID || lead.prospectid || lead.ProspectID;
           if (cstId) {
@@ -258,6 +277,7 @@ export async function incrementalSync() {
           }
         } catch (err) { failed++; await logSyncError(lead.cst_id || lead.id, err); }
       }
+      if (hitCap) break;
       await Promise.all([
         syncLogProgress(logIds.leads, counts.leads), syncLogProgress(logIds.calls, counts.calls),
         syncLogProgress(logIds.notes, counts.notes), syncLogProgress(logIds.jobs, counts.jobs),
@@ -267,27 +287,29 @@ export async function incrementalSync() {
       await sleep(RATE_LIMIT_SLEEP_MS);
     }
 
-    // Part 2: Job status changes
-    startIndex = 1;
-    while (true) {
-      let jobs;
-      try { jobs = await getJobStatusChanges({ startdate: since, enddate: today, PageSize: PAGE_SIZE, StartIndex: startIndex }); }
-      catch (err) { console.error('[Sync] GetJobStatusChanges failed:', err.message); break; }
-      const items = extractArray(jobs);
-      if (items.length === 0) break;
-      for (const job of items) {
-        try {
-          await syncJobAndMilestones(job, job.lds_id || job.lp_lead_id, null);
-          counts.jobs++;
-          counts.milestones += (getField(job, 'milestones', 'Milestones') || []).length;
-        } catch (err) { failed++; await logSyncError(job.job_id || job.JobID, err); }
+    // Part 2: Job status changes (skip if we already hit the leads cap to save time)
+    if (!hitCap) {
+      startIndex = 1;
+      while (true) {
+        let jobs;
+        try { jobs = await getJobStatusChanges({ startdate: since, enddate: today, PageSize: PAGE_SIZE, StartIndex: startIndex }); }
+        catch (err) { console.error('[Sync] GetJobStatusChanges failed:', err.message); break; }
+        const items = extractArray(jobs);
+        if (items.length === 0) break;
+        for (const job of items) {
+          try {
+            await syncJobAndMilestones(job, job.lds_id || job.lp_lead_id, null);
+            counts.jobs++;
+            counts.milestones += (getField(job, 'milestones', 'Milestones') || []).length;
+          } catch (err) { failed++; await logSyncError(job.job_id || job.JobID, err); }
+        }
+        await Promise.all([ syncLogProgress(logIds.jobs, counts.jobs), syncLogProgress(logIds.milestones, counts.milestones) ]);
+        startIndex += items.length;
+        await sleep(RATE_LIMIT_SLEEP_MS);
       }
-      await Promise.all([ syncLogProgress(logIds.jobs, counts.jobs), syncLogProgress(logIds.milestones, counts.milestones) ]);
-      startIndex += items.length;
-      await sleep(RATE_LIMIT_SLEEP_MS);
     }
 
-    const errorMsg = failed > 0 ? `${failed} records failed` : null;
+    const errorMsg = failed > 0 ? `${failed} records failed` : (hitCap ? `Capped at ${MAX_INCREMENTAL_LEADS} leads` : null);
     await Promise.all([
       syncLogComplete(logIds.leads, counts.leads, errorMsg), syncLogComplete(logIds.calls, counts.calls),
       syncLogComplete(logIds.notes, counts.notes), syncLogComplete(logIds.jobs, counts.jobs),
@@ -307,7 +329,7 @@ export async function incrementalSync() {
     try { await checkLeadTriggers(); } catch (e) { console.warn('[Sync] Lead triggers:', e.message); }
 
     const duration = Date.now() - startedAt.getTime();
-    console.log(`[Sync] Incremental sync complete — ${counts.leads} leads, ${counts.calls} calls, ${counts.notes} notes, ${counts.jobs} jobs, ${failed} failed (${Math.round(duration / 1000)}s)`);
+    console.log(`[Sync] Incremental sync complete — ${counts.leads} leads, ${counts.calls} calls, ${counts.notes} notes, ${counts.jobs} jobs, ${failed} failed${hitCap ? ' (CAPPED)' : ''} (${Math.round(duration / 1000)}s)`);
     return counts;
 
   } catch (err) {
