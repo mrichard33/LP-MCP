@@ -5,13 +5,20 @@
  * and emits typed system events into the Decision Engine pipeline.
  * 
  * Webhook endpoints:
- *   POST /webhook/ghl/reply        — Inbound SMS/email replies
- *   POST /webhook/ghl/appointment  — Appointment created/updated/deleted
- *   POST /webhook/ghl/engagement   — Email opened, link clicked, VSL watched
- *   POST /webhook/ghl/lead-score   — Lead score threshold crossed
- *   POST /webhook/ghl/workflow     — Workflow completed
+ *   POST /webhook/ghl/reply            — Inbound SMS/email replies
+ *   POST /webhook/ghl/appointment      — Appointment created/updated/deleted
+ *   POST /webhook/ghl/engagement       — Email opened, link clicked, VSL watched
+ *   POST /webhook/ghl/lead-score       — Lead score threshold crossed
+ *   POST /webhook/ghl/workflow         — Workflow completed
+ *   POST /webhook/ghl/contact-created  — New contact created in GHL
  * 
  * Security: All endpoints validate GHL_WEBHOOK_SECRET.
+ *
+ * v2.3 — Add /webhook/ghl/contact-created endpoint.
+ *   Resolves entry_source from active-entry:* tags, explicit fields,
+ *   or GHL source. Emits ghl.contact_created for Decision Engine routing.
+ *   This is Gap 1 from the agentic migration audit — prerequisite for
+ *   W0.0 Master Router migration.
  *
  * v2.2 — Fix duplicate GroupMe notifications.
  *   - handleAppointment idempotency key now uses 30-min buckets (was Date.now())
@@ -297,6 +304,116 @@ async function handleWorkflowCompleted(req, res) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// v2.3: CONTACT CREATED HANDLER
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Resolve entry source from GHL webhook body.
+ * 
+ * Priority chain:
+ *   1. active-entry:* tag in body.tags (most authoritative — set by LP sync or entry workflows)
+ *   2. Explicit entry_source / lead_source field in body
+ *   3. GHL source field (body.source)
+ *   4. Fallback: "unknown"
+ * 
+ * The resolved source is normalized to the canonical entry:* values:
+ *   risk-report, estimate-calculator, chatbot, canvassing, referral, other
+ */
+const ENTRY_SOURCE_ALIASES = {
+  // Normalize various GHL source strings to canonical entry source names
+  'risk-report': 'risk-report',
+  'risk_report': 'risk-report',
+  'hrr': 'risk-report',
+  'home-risk-report': 'risk-report',
+  'estimate-calculator': 'estimate-calculator',
+  'estimate_calculator': 'estimate-calculator',
+  'calculator': 'estimate-calculator',
+  'chatbot': 'chatbot',
+  'chat': 'chatbot',
+  'live-chat': 'chatbot',
+  'live_chat': 'chatbot',
+  'canvassing': 'canvassing',
+  'canvass': 'canvassing',
+  'door-to-door': 'canvassing',
+  'referral': 'referral',
+  'referred': 'referral',
+  'manual': 'other',
+  'other': 'other',
+  'unknown': 'unknown',
+};
+
+function resolveEntrySource(body) {
+  // 1. Check tags for active-entry:*
+  const tags = body.tags || body.contactTags || [];
+  if (Array.isArray(tags)) {
+    for (const tag of tags) {
+      const t = String(tag).trim().toLowerCase();
+      if (t.startsWith('active-entry:')) {
+        return t.replace('active-entry:', '');
+      }
+    }
+  }
+
+  // 2. Explicit entry_source / lead_source field
+  const explicit = cleanGHLValue(body.entry_source || body.entrySource || body.lead_source || body.leadSource);
+  if (explicit) {
+    const normalized = ENTRY_SOURCE_ALIASES[explicit.toLowerCase()];
+    return normalized || explicit.toLowerCase();
+  }
+
+  // 3. GHL source field
+  const ghlSource = cleanGHLValue(body.source);
+  if (ghlSource) {
+    const normalized = ENTRY_SOURCE_ALIASES[ghlSource.toLowerCase()];
+    return normalized || ghlSource.toLowerCase();
+  }
+
+  // 4. Fallback
+  return 'unknown';
+}
+
+async function handleContactCreated(req, res) {
+  const body = req.body || {};
+  const contactId = body.contactId || body.contact_id || body.id || null;
+
+  if (!contactId) return res.status(400).json({ error: 'Missing contactId' });
+
+  const entrySource = resolveEntrySource(body);
+  const contactName = cleanGHLValue(body.contactName || body.contact_name
+    || body.name || body.firstName || body.first_name) || null;
+  const phone = cleanGHLValue(body.phone) || null;
+  const email = cleanGHLValue(body.email) || null;
+
+  // 30-minute idempotency bucket — same contact within 30 min = deduped.
+  // GHL "Contact Created" triggers can fire multiple times if workflows
+  // or integrations re-trigger on the same contact creation event.
+  const timeBucket = Math.floor(Date.now() / (30 * 60 * 1000));
+  const idempotencyKey = `ghl_contact_created_${contactId}_${timeBucket}`;
+
+  await emitEvent({
+    event_type: 'ghl.contact_created',
+    event_subtype: entrySource,
+    source: 'ghl_webhook',
+    entity_type: 'contact',
+    entity_id: contactId,
+    ghl_contact_id: contactId,
+    payload: {
+      entry_source: entrySource,
+      contactName,
+      phone,
+      email,
+      raw_tags: body.tags || body.contactTags || [],
+      raw_source: body.source || null,
+    },
+    priority: 'high',
+    idempotency_key: idempotencyKey,
+  });
+
+  console.log(`[BehavioralEmitter] Contact created: ${contactId} (source: ${entrySource}, name: ${contactName})`);
+  return res.json({ status: 'accepted', event_type: 'ghl.contact_created', entry_source: entrySource });
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // ROUTE REGISTRATION
 // ═══════════════════════════════════════════════════════════════════
 
@@ -329,6 +446,10 @@ export function registerBehavioralEmitterRoutes(app) {
     try { await handleWorkflowCompleted(req, res); }
     catch (err) { console.error('[BehavioralEmitter] /workflow error:', err.message); if (!res.headersSent) res.status(500).json({ error: err.message }); }
   });
+  app.post('/webhook/ghl/contact-created', validateGHL, async (req, res) => {
+    try { await handleContactCreated(req, res); }
+    catch (err) { console.error('[BehavioralEmitter] /contact-created error:', err.message); if (!res.headersSent) res.status(500).json({ error: err.message }); }
+  });
 
-  console.log('[BehavioralEmitter] GHL webhook routes registered: /webhook/ghl/{reply,appointment,engagement,lead-score,workflow}');
+  console.log('[BehavioralEmitter] GHL webhook routes registered: /webhook/ghl/{reply,appointment,engagement,lead-score,workflow,contact-created}');
 }
