@@ -14,6 +14,15 @@
  * 
  * Security: All endpoints validate GHL_WEBHOOK_SECRET.
  *
+ * v2.3.1 — /webhook/ghl/contact-created self-enriches via GHL API.
+ *   GHL standard webhooks send template variables as flat strings,
+ *   not raw JSON. Tags arrive as comma-separated strings, not arrays.
+ *   Instead of relying on GHL to send structured data, the endpoint:
+ *     1. Accepts just contactId (+ optional fields from webhook body)
+ *     2. Calls GHL API to fetch the full contact (tags, source, name)
+ *     3. Resolves entry_source from GHL API tags (most reliable)
+ *     4. Falls back to webhook body fields if GHL API fails
+ *
  * v2.3 — Add /webhook/ghl/contact-created endpoint.
  *   Resolves entry_source from active-entry:* tags, explicit fields,
  *   or GHL source. Emits ghl.contact_created for Decision Engine routing.
@@ -36,6 +45,7 @@ import { upsertLeadIntelligence } from './context-builder.js';
 import supabase from './supabase.js';
 
 const GHL_WEBHOOK_SECRET = process.env.GHL_WEBHOOK_SECRET || '';
+const GHL_API_KEY = process.env.GHL_API_KEY;
 
 function validateWebhook(req) {
   if (!GHL_WEBHOOK_SECRET) return true;
@@ -304,23 +314,26 @@ async function handleWorkflowCompleted(req, res) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// v2.3: CONTACT CREATED HANDLER
+// v2.3.1: CONTACT CREATED HANDLER — Self-Enriching
 // ═══════════════════════════════════════════════════════════════════
 
 /**
- * Resolve entry source from GHL webhook body.
- * 
- * Priority chain:
- *   1. active-entry:* tag in body.tags (most authoritative — set by LP sync or entry workflows)
- *   2. Explicit entry_source / lead_source field in body
- *   3. GHL source field (body.source)
- *   4. Fallback: "unknown"
- * 
- * The resolved source is normalized to the canonical entry:* values:
- *   risk-report, estimate-calculator, chatbot, canvassing, referral, other
+ * Normalize tags from any format GHL might send:
+ *   - Array of strings: ["tag1", "tag2"]             → as-is
+ *   - Comma-separated string: "tag1, tag2, tag3"     → split + trim
+ *   - Single string: "tag1"                          → wrap in array
+ *   - null/undefined                                 → empty array
  */
+function normalizeTags(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw.map(t => String(t).trim()).filter(Boolean);
+  if (typeof raw === 'string') {
+    return raw.split(',').map(t => t.trim()).filter(Boolean);
+  }
+  return [];
+}
+
 const ENTRY_SOURCE_ALIASES = {
-  // Normalize various GHL source strings to canonical entry source names
   'risk-report': 'risk-report',
   'risk_report': 'risk-report',
   'hrr': 'risk-report',
@@ -342,34 +355,66 @@ const ENTRY_SOURCE_ALIASES = {
   'unknown': 'unknown',
 };
 
-function resolveEntrySource(body) {
+/**
+ * Resolve entry source from a normalized tags array + source string.
+ * 
+ * Priority:
+ *   1. active-entry:* tag (most authoritative — set by LP sync or entry workflows)
+ *   2. GHL source field
+ *   3. Fallback: "unknown"
+ */
+function resolveEntrySourceFromData(tags, ghlSource) {
   // 1. Check tags for active-entry:*
-  const tags = body.tags || body.contactTags || [];
-  if (Array.isArray(tags)) {
-    for (const tag of tags) {
-      const t = String(tag).trim().toLowerCase();
-      if (t.startsWith('active-entry:')) {
-        return t.replace('active-entry:', '');
-      }
+  for (const tag of tags) {
+    const t = tag.toLowerCase();
+    if (t.startsWith('active-entry:')) {
+      return t.replace('active-entry:', '');
     }
   }
 
-  // 2. Explicit entry_source / lead_source field
-  const explicit = cleanGHLValue(body.entry_source || body.entrySource || body.lead_source || body.leadSource);
-  if (explicit) {
-    const normalized = ENTRY_SOURCE_ALIASES[explicit.toLowerCase()];
-    return normalized || explicit.toLowerCase();
-  }
-
-  // 3. GHL source field
-  const ghlSource = cleanGHLValue(body.source);
+  // 2. GHL source field
   if (ghlSource) {
     const normalized = ENTRY_SOURCE_ALIASES[ghlSource.toLowerCase()];
     return normalized || ghlSource.toLowerCase();
   }
 
-  // 4. Fallback
+  // 3. Fallback
   return 'unknown';
+}
+
+/**
+ * Fetch full contact from GHL API for self-enrichment.
+ * Returns { tags, source, name, phone, email } or null on failure.
+ */
+async function fetchGHLContact(contactId) {
+  if (!GHL_API_KEY || !contactId) return null;
+  try {
+    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+      headers: {
+        'Authorization': `Bearer ${GHL_API_KEY}`,
+        'Version': '2021-07-28',
+        'Accept': 'application/json',
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) {
+      console.warn(`[BehavioralEmitter] GHL contact lookup failed for ${contactId}: ${res.status}`);
+      return null;
+    }
+    const data = await res.json();
+    const c = data?.contact;
+    if (!c) return null;
+    return {
+      tags: c.tags || [],
+      source: c.source || null,
+      name: [c.firstName, c.lastName].filter(Boolean).join(' ') || c.name || null,
+      phone: c.phone || null,
+      email: c.email || null,
+    };
+  } catch (err) {
+    console.warn(`[BehavioralEmitter] GHL contact lookup error for ${contactId}: ${err.message}`);
+    return null;
+  }
 }
 
 async function handleContactCreated(req, res) {
@@ -378,15 +423,31 @@ async function handleContactCreated(req, res) {
 
   if (!contactId) return res.status(400).json({ error: 'Missing contactId' });
 
-  const entrySource = resolveEntrySource(body);
-  const contactName = cleanGHLValue(body.contactName || body.contact_name
-    || body.name || body.firstName || body.first_name) || null;
-  const phone = cleanGHLValue(body.phone) || null;
-  const email = cleanGHLValue(body.email) || null;
+  // Self-enrich: fetch full contact from GHL API for reliable tags + source
+  const ghlContact = await fetchGHLContact(contactId);
 
-  // 30-minute idempotency bucket — same contact within 30 min = deduped.
-  // GHL "Contact Created" triggers can fire multiple times if workflows
-  // or integrations re-trigger on the same contact creation event.
+  // Build data from GHL API (primary) with webhook body as fallback
+  let tags, source, contactName, phone, email;
+
+  if (ghlContact) {
+    tags = ghlContact.tags;  // Already a proper array from GHL API
+    source = ghlContact.source;
+    contactName = ghlContact.name;
+    phone = ghlContact.phone;
+    email = ghlContact.email;
+  } else {
+    // Fallback to webhook body — tags may be comma-separated string
+    tags = normalizeTags(body.tags || body.contactTags);
+    source = cleanGHLValue(body.source) || null;
+    contactName = cleanGHLValue(body.contactName || body.contact_name
+      || body.name || body.firstName || body.first_name) || null;
+    phone = cleanGHLValue(body.phone) || null;
+    email = cleanGHLValue(body.email) || null;
+  }
+
+  const entrySource = resolveEntrySourceFromData(tags, source);
+
+  // 30-minute idempotency bucket — same contact within 30 min = deduped
   const timeBucket = Math.floor(Date.now() / (30 * 60 * 1000));
   const idempotencyKey = `ghl_contact_created_${contactId}_${timeBucket}`;
 
@@ -402,14 +463,15 @@ async function handleContactCreated(req, res) {
       contactName,
       phone,
       email,
-      raw_tags: body.tags || body.contactTags || [],
-      raw_source: body.source || null,
+      tags,
+      ghl_source: source,
+      enriched_via: ghlContact ? 'ghl_api' : 'webhook_body',
     },
     priority: 'high',
     idempotency_key: idempotencyKey,
   });
 
-  console.log(`[BehavioralEmitter] Contact created: ${contactId} (source: ${entrySource}, name: ${contactName})`);
+  console.log(`[BehavioralEmitter] Contact created: ${contactId} (source: ${entrySource}, name: ${contactName}, enriched: ${ghlContact ? 'API' : 'body'})`);
   return res.json({ status: 'accepted', event_type: 'ghl.contact_created', entry_source: entrySource });
 }
 
