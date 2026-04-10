@@ -4,7 +4,7 @@
  * Layer 2 of the agentic system. Reads pending actions from agent_actions
  * and executes them against GHL, LP, GroupMe, and other systems.
  * 
- * Supported action types (11):
+ * Supported action types (12):
  *   add_tag              → POST /contacts/{id}/tags (additive, never PUT)
  *   remove_tag           → DELETE /contacts/{id}/tags (single tag or batch array)
  *   move_opportunity     → Find opp by contact, PUT /opportunities/{oppId} with pipelineStageId
@@ -16,6 +16,7 @@
  *   send_notification    → GroupMe message to sales channel
  *   set_lp_appointment   → Push appointment to LP via SetAppointment API (Phase 2 write)
  *   update_custom_fields → PUT /contacts/{id} with customFields array
+ *   update_contact_email → PUT /contacts/{id} with {email} — LP email enrichment (v9.0)
  *
  * v3.9 — Enriched GroupMe notifications and approval requests.
  *   resolveContactInfo now returns { name, phone, ghlContactId, lpLead } where
@@ -47,7 +48,7 @@
  */
 
 import supabase from './supabase.js';
-import { applyGHLTag, addGHLNote, updateGHLContactFields } from './ghl.js';
+import { applyGHLTag, addGHLNote, updateGHLContactFields, updateGHLContactEmail, getGHLContact } from './ghl.js';
 import { setAppointment as lpSetAppointment, getLeadByLdsId } from './lp-client.js';
 import { sendGroupMeMessage, sendApprovalRequest } from './groupme.js';
 import { acquireToken, report429, registerRateLimiterRoutes } from './ghl-rate-limiter.js';
@@ -819,10 +820,100 @@ async function executeUpdateCustomFields(action) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// EMAIL ENRICHMENT — update core email field from LP data (v9.0)
+// ═══════════════════════════════════════════════════════════════════
+
+async function executeUpdateContactEmail(action, context) {
+  const contactId = action.target_id;
+  if (!contactId) throw new Error('Missing contactId');
+
+  // Read fields from event context (raw payload) — NOT from interpolated action_payload.
+  // scoring_reasons is an array in the event payload; interpolation would stringify it.
+  const payload = interpolatePayload(action.action_payload, context);
+  const newEmail = payload.email || context.candidate_email;
+  const confidence = Number(payload.confidence_score || context.confidence_score || 0);
+  const scoringReasons = context.scoring_reasons || []; // raw array from event payload
+  const sourceLeadId = payload.source_lead_id || context.source_lead_id || null;
+  const lpProspectId = payload.lp_prospect_id || context.lp_prospect_id || null;
+
+  if (!newEmail) throw new Error('Missing email in payload');
+
+  // Pre-check: fetch GHL contact's current email and score it.
+  // If GHL already has a good email (score >= 75), skip the update.
+  let oldEmail = null;
+  try {
+    const ghlContact = await getGHLContact(contactId);
+    if (ghlContact?.email) {
+      oldEmail = ghlContact.email;
+      const { scoreEmail } = await import('./email-scorer.js');
+      const currentScore = scoreEmail(ghlContact.email);
+      if (currentScore.score >= 75) {
+        console.log(`[ActionExecutor] Email enrichment skipped for ${contactId}: GHL already has good email "${ghlContact.email}" (score: ${currentScore.score})`);
+        // Log the skip
+        try {
+          await supabase.from('email_enrichment_log').insert({
+            ghl_contact_id: contactId,
+            lp_prospect_id: lpProspectId,
+            old_email: oldEmail,
+            new_email: newEmail,
+            confidence_score: confidence,
+            scoring_reasons: scoringReasons,
+            source_lead_id: sourceLeadId,
+            action_taken: 'skipped_ghl_has_good_email',
+          });
+        } catch {}
+        return { action: 'email_enrichment_skipped', contact_id: contactId, reason: 'ghl_has_good_email', existing_email: ghlContact.email, existing_score: currentScore.score };
+      }
+    }
+  } catch (err) {
+    console.warn(`[ActionExecutor] GHL pre-check failed for ${contactId}: ${err.message} — proceeding with update`);
+  }
+
+  // Execute the email update
+  const result = await updateGHLContactEmail(contactId, newEmail);
+  if (result === 'not_found') throw new Error(`GHL contact ${contactId} not found`);
+  if (!result) throw new Error('GHL email update failed');
+
+  // Add a GHL note documenting the enrichment
+  await addGHLNote(contactId,
+    `[EMAIL ENRICHMENT] Email updated from LP data\n` +
+    `New: ${newEmail}\n` +
+    `Confidence: ${confidence}/100\n` +
+    `Source Lead: ${sourceLeadId || 'N/A'}\n` +
+    `Reasons: ${scoringReasons.join(', ')}`
+  ).catch(() => {});
+
+  // Log to email_enrichment_log
+  try {
+    await supabase.from('email_enrichment_log').insert({
+      ghl_contact_id: contactId,
+      lp_prospect_id: lpProspectId,
+      old_email: oldEmail,
+      new_email: newEmail,
+      confidence_score: confidence,
+      scoring_reasons: scoringReasons,
+      source_lead_id: sourceLeadId,
+      action_taken: 'updated',
+    });
+  } catch (logErr) {
+    console.warn(`[ActionExecutor] Email enrichment log failed: ${logErr.message}`);
+  }
+
+  console.log(`[ActionExecutor] ✅ Email enriched for ${contactId}: ${newEmail} (confidence: ${confidence})`);
+  return {
+    action: 'email_enriched',
+    contact_id: contactId,
+    new_email: newEmail,
+    old_email: oldEmail,
+    confidence_score: confidence,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // EXECUTOR ENGINE
 // ═══════════════════════════════════════════════════════════════════
 
-const CONTEXT_AWARE_HANDLERS = new Set(['send_notification', 'create_task', 'book_appointment']);
+const CONTEXT_AWARE_HANDLERS = new Set(['send_notification', 'create_task', 'book_appointment', 'update_contact_email']);
 
 const ACTION_HANDLERS = {
   add_tag: executeAddTag,
@@ -836,6 +927,7 @@ const ACTION_HANDLERS = {
   send_notification: executeSendNotification,
   set_lp_appointment: executeSetLPAppointment,
   update_custom_fields: executeUpdateCustomFields,
+  update_contact_email: executeUpdateContactEmail,
 };
 
 async function executeSingleAction(action) {

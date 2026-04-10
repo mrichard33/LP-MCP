@@ -198,6 +198,57 @@ export async function updateGHLContactFields(ghlContactId, customFields) {
   }
 }
 
+/**
+ * Update a GHL contact's core email field.
+ * Uses PUT /contacts/{id} with just the email field.
+ * NOTE: Do NOT include tags array in PUT body — it replaces all tags.
+ */
+export async function updateGHLContactEmail(ghlContactId, email) {
+  if (ghlDisabled || !ghlClient || !ghlContactId || !email) return false;
+
+  try {
+    await ghlClient.put(`/contacts/${ghlContactId}`, { email });
+    ghlFailCount = 0;
+    console.log(`[GHL] Email updated for ${ghlContactId}: ${email}`);
+    return true;
+  } catch (err) {
+    if (isContactNotFound(err)) {
+      console.warn(`[GHL] Email update: contact ${ghlContactId} not found — skipping`);
+      return 'not_found';
+    }
+    ghlFailCount++;
+    const status = err.response?.status || 'no response';
+    console.error(`[GHL] Email update failed for ${ghlContactId}: HTTP ${status} — ${err.message}`);
+    if (ghlFailCount >= GHL_FAIL_THRESHOLD) {
+      ghlDisabled = true;
+      console.error(`[GHL] Email updates disabled after ${GHL_FAIL_THRESHOLD} failures.`);
+    }
+    return false;
+  }
+}
+
+/**
+ * Fetch a GHL contact by ID (lightweight GET for pre-update checks).
+ * Returns the contact object or null on error/not-found.
+ */
+export async function getGHLContact(ghlContactId) {
+  if (ghlDisabled || !ghlClient || !ghlContactId) return null;
+
+  try {
+    const { data } = await ghlClient.get(`/contacts/${ghlContactId}`);
+    ghlFailCount = 0;
+    return data?.contact || data || null;
+  } catch (err) {
+    if (isContactNotFound(err)) return null;
+    ghlFailCount++;
+    if (ghlFailCount >= GHL_FAIL_THRESHOLD) {
+      ghlDisabled = true;
+      console.error(`[GHL] Contact fetches disabled after ${GHL_FAIL_THRESHOLD} failures.`);
+    }
+    return null;
+  }
+}
+
 export async function addGHLNote(ghlContactId, noteBody) {
   if (ghlDisabled || !ghlClient || !ghlContactId) return null;
   if (!noteBody || noteBody.trim().length === 0) return null;

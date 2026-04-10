@@ -25,6 +25,8 @@ import { registerIntentScorerRoutes } from './intent-scorer.js';
 import { registerRestApiRoutes } from './rest-api.js';
 // ─── GroupMe Two-Way Integration ─────────────────────────────────
 import { registerGroupMeRoutes } from './groupme.js';
+// ─── Admin: Email Enrichment Backfill ────────────────────────────
+import { runEmailBackfill } from './admin/email-backfill.js';
 
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -284,6 +286,18 @@ registerRestApiRoutes(app, authenticate);
 // ─── GroupMe Two-Way Integration ─────────────────────────────────
 registerGroupMeRoutes(app);
 
+// ─── Admin: Email Enrichment Backfill ────────────────────────────
+app.post('/admin/email-backfill', async (req, res) => {
+  try {
+    const dryRun = req.query.dryRun !== 'false';
+    const limit = parseInt(req.query.limit || '500', 10);
+    const results = await runEmailBackfill({ dryRun, limit });
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, async () => {
   console.log(`LP MCP Server v6.3.0 running on port ${PORT}`);
   console.log(`n8n APIs:     POST /n8n/enrich-lead | /n8n/refresh-token | /n8n/prospect-lookup | /n8n/time-to-appointment`);
@@ -294,6 +308,7 @@ app.listen(PORT, async () => {
   console.log(`Intent:       POST /n8n/intent/score | /n8n/intent/sweep | GET /n8n/intent/breakdown`);
   console.log(`REST API:     GET /api/prospects/:id | /api/leads/:id | /api/search | /api/lead-summary/:contactId`);
   console.log(`GroupMe:      POST /webhook/groupme | POST /groupme/send | GET /groupme/pending`);
+  console.log(`Admin:        POST /admin/email-backfill?dryRun=true&limit=500`);
   console.log(`MCP:          http://localhost:${PORT}/mcp`);
   console.log(`Health:       http://localhost:${PORT}/health`);
   await runMigrations();
