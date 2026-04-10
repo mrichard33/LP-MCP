@@ -345,6 +345,51 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
     }
   }
 
+  // ═════════════════════════════════════════════════════════════════
+  // v9.0: EMAIL ENRICHMENT CHECK
+  //
+  // After processing all leads, check if LP has a high-confidence email
+  // for this prospect. If so, emit an enrichment event for the Decision
+  // Engine to process (which will update the GHL contact's email).
+  // ═════════════════════════════════════════════════════════════════
+  if (ghlId) {
+    try {
+      const { findBestEmailForProspect } = await import('./email-scorer.js');
+      const prospectId = String(getField(prospect, 'cst_id', 'CstID', 'prospectid', 'ProspectID'));
+      const firstName = getField(prospect, 'firstname', 'FirstName', 'first_name');
+      const lastName = getField(prospect, 'lastname', 'LastName', 'last_name');
+
+      const bestEmail = await findBestEmailForProspect(prospectId, { firstName, lastName });
+
+      if (bestEmail && bestEmail.score >= 75) {
+        const idempKey = `email_enrich_${ghlId}_${bestEmail.email}_${new Date().toISOString().slice(0, 10)}`;
+
+        await emitEvent({
+          event_type: 'email.enrichment_available',
+          event_subtype: bestEmail.score >= 85 ? 'high_confidence' : 'medium_confidence',
+          source: 'lp_sync',
+          entity_type: 'contact',
+          entity_id: ghlId,
+          ghl_contact_id: ghlId,
+          lp_prospect_id: prospectId,
+          payload: {
+            candidate_email: bestEmail.email,
+            confidence_score: bestEmail.score,
+            scoring_reasons: bestEmail.reasons,
+            source_lead_id: bestEmail.sourceLeadId,
+            prospect_first_name: firstName,
+            prospect_last_name: lastName,
+          },
+          priority: 'normal',
+          idempotency_key: idempKey,
+        });
+      }
+    } catch (err) {
+      console.error(`[Sync] Email enrichment check failed for ${ghlId}:`, err.message);
+      // Non-critical — don't break sync
+    }
+  }
+
   return subCounts;
 }
 
