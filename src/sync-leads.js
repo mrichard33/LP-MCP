@@ -9,6 +9,10 @@
 //
 // AGENTIC: Disposition changes emit system events for the Decision Engine.
 //
+// v9.1 — Email enrichment: check email_enrichment_log before emitting
+//   to prevent duplicate enrichment events and duplicate GroupMe alerts.
+//   Idempotency key is now permanent (no date suffix).
+//
 // v8.0 — active-entry:* tag management. After processing all leads for
 //   a prospect, determines the NEWEST lead's source and applies the
 //   corresponding active-entry:* tag to the GHL contact. Removes all
@@ -346,43 +350,61 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
   }
 
   // ═════════════════════════════════════════════════════════════════
-  // v9.0: EMAIL ENRICHMENT CHECK
+  // v9.1: EMAIL ENRICHMENT CHECK
   //
   // After processing all leads, check if LP has a high-confidence email
   // for this prospect. If so, emit an enrichment event for the Decision
   // Engine to process (which will update the GHL contact's email).
+  //
+  // v9.1 FIX: Check email_enrichment_log FIRST. If this contact was
+  // already enriched (action_taken = 'updated' or 'skipped_ghl_has_good_email'),
+  // skip entirely — no event, no action, no duplicate GroupMe message.
+  // Idempotency key is permanent (no date suffix) as a second safety net.
   // ═════════════════════════════════════════════════════════════════
   if (ghlId) {
     try {
-      const { findBestEmailForProspect } = await import('./email-scorer.js');
-      const prospectId = String(getField(prospect, 'cst_id', 'CstID', 'prospectid', 'ProspectID'));
-      const firstName = getField(prospect, 'firstname', 'FirstName', 'first_name');
-      const lastName = getField(prospect, 'lastname', 'LastName', 'last_name');
+      // v9.1: Check if this contact was already enriched — skip if so
+      const { data: alreadyEnriched } = await supabase
+        .from('email_enrichment_log')
+        .select('id')
+        .eq('ghl_contact_id', ghlId)
+        .limit(1)
+        .maybeSingle();
 
-      const bestEmail = await findBestEmailForProspect(prospectId, { firstName, lastName });
+      if (alreadyEnriched) {
+        // Already enriched — do nothing. No event, no action, no GroupMe spam.
+      } else {
+        const { findBestEmailForProspect } = await import('./email-scorer.js');
+        const prospectId = String(getField(prospect, 'cst_id', 'CstID', 'prospectid', 'ProspectID'));
+        const firstName = getField(prospect, 'firstname', 'FirstName', 'first_name');
+        const lastName = getField(prospect, 'lastname', 'LastName', 'last_name');
 
-      if (bestEmail && bestEmail.score >= 75) {
-        const idempKey = `email_enrich_${ghlId}_${bestEmail.email}_${new Date().toISOString().slice(0, 10)}`;
+        const bestEmail = await findBestEmailForProspect(prospectId, { firstName, lastName });
 
-        await emitEvent({
-          event_type: 'email.enrichment_available',
-          event_subtype: bestEmail.score >= 85 ? 'high_confidence' : 'medium_confidence',
-          source: 'lp_sync',
-          entity_type: 'contact',
-          entity_id: ghlId,
-          ghl_contact_id: ghlId,
-          lp_prospect_id: prospectId,
-          payload: {
-            candidate_email: bestEmail.email,
-            confidence_score: bestEmail.score,
-            scoring_reasons: bestEmail.reasons,
-            source_lead_id: bestEmail.sourceLeadId,
-            prospect_first_name: firstName,
-            prospect_last_name: lastName,
-          },
-          priority: 'normal',
-          idempotency_key: idempKey,
-        });
+        if (bestEmail && bestEmail.score >= 75) {
+          // v9.1: Permanent idempotency key — no date suffix, fires once ever
+          const idempKey = `email_enrich_${ghlId}_${bestEmail.email}`;
+
+          await emitEvent({
+            event_type: 'email.enrichment_available',
+            event_subtype: bestEmail.score >= 85 ? 'high_confidence' : 'medium_confidence',
+            source: 'lp_sync',
+            entity_type: 'contact',
+            entity_id: ghlId,
+            ghl_contact_id: ghlId,
+            lp_prospect_id: prospectId,
+            payload: {
+              candidate_email: bestEmail.email,
+              confidence_score: bestEmail.score,
+              scoring_reasons: bestEmail.reasons,
+              source_lead_id: bestEmail.sourceLeadId,
+              prospect_first_name: firstName,
+              prospect_last_name: lastName,
+            },
+            priority: 'normal',
+            idempotency_key: idempKey,
+          });
+        }
       }
     } catch (err) {
       console.error(`[Sync] Email enrichment check failed for ${ghlId}:`, err.message);
