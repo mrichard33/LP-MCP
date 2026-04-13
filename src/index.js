@@ -34,6 +34,7 @@ const FIELD_SYNC_INTERVAL_MS = 15 * 60 * 1000;
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
