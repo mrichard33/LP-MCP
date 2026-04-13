@@ -14,6 +14,13 @@
  * 
  * Security: All endpoints validate GHL_WEBHOOK_SECRET.
  *
+ * v2.4 — /webhook/ghl/lead-score self-enriches via GHL API.
+ *   GHL's {{contact.engagement_score}} merge field doesn't resolve in
+ *   webhook template variables — always sends 0. The actual score lives
+ *   in the GHL API at contact.scoring: { "<profileId>": <score> }.
+ *   handleLeadScore now calls fetchGHLContact() to get the real score
+ *   and computes delta from lead_intelligence previous value.
+ *
  * v2.3.1 — /webhook/ghl/contact-created self-enriches via GHL API.
  *   GHL standard webhooks send template variables as flat strings,
  *   not raw JSON. Tags arrive as comma-separated strings, not arrays.
@@ -271,13 +278,55 @@ async function handleEngagement(req, res) {
   return res.json({ status: 'accepted', event_type: eventType });
 }
 
+/**
+ * v2.4: Self-enriching lead score handler.
+ *
+ * GHL's {{contact.engagement_score}} merge field doesn't resolve in
+ * webhook template variables — always sends 0/empty. The actual score
+ * lives in the GHL API response at contact.scoring: { profileId: score }.
+ *
+ * Flow:
+ *   1. Receive webhook with contactId (score from body is unreliable)
+ *   2. Call GHL API to fetch contact.scoring
+ *   3. Extract score from first scoring profile
+ *   4. Get previous score from lead_intelligence for delta calculation
+ *   5. Emit event with real score data
+ */
 async function handleLeadScore(req, res) {
   const body = req.body || {};
   const contactId = body.contactId || body.contact_id || null;
-  const score = parseInt(body.score || body.lead_score || '0', 10);
-  const previousScore = parseInt(body.previousScore || body.previous_score || '0', 10);
 
   if (!contactId) return res.status(400).json({ error: 'Missing contactId' });
+
+  // Self-enrich: fetch real score from GHL API
+  const ghlContact = await fetchGHLContact(contactId);
+
+  let score = 0;
+  let enrichedVia = 'webhook_body';
+  if (ghlContact?.scoring) {
+    const profileScores = Object.values(ghlContact.scoring);
+    if (profileScores.length > 0 && typeof profileScores[0] === 'number') {
+      score = profileScores[0];
+      enrichedVia = 'ghl_api';
+    }
+  }
+
+  // Fallback to body value if API didn't return a score
+  if (score === 0 && enrichedVia === 'webhook_body') {
+    score = parseInt(body.score || body.lead_score || '0', 10);
+  }
+
+  // Get previous score from lead_intelligence for delta calculation
+  let previousScore = 0;
+  try {
+    const { data: intel } = await supabase
+      .from('lead_intelligence')
+      .select('lead_score')
+      .eq('ghl_contact_id', contactId)
+      .maybeSingle();
+    if (intel?.lead_score != null) previousScore = intel.lead_score;
+  } catch {}
+
   const delta = score - previousScore;
 
   await upsertLeadIntelligence(contactId, {
@@ -288,12 +337,16 @@ async function handleLeadScore(req, res) {
   await emitEvent({
     event_type: 'ghl.lead_score_changed', event_subtype: score >= 50 ? 'hyperactive' : 'normal',
     source: 'ghl_webhook', entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
-    payload: { score, previous_score: previousScore, delta, hyperactive_eligible: score >= 50 && delta >= 30 },
+    payload: { score, previous_score: previousScore, delta, hyperactive_eligible: score >= 50 && delta >= 30, enriched_via: enrichedVia },
     priority, idempotency_key: `ghl_score_${contactId}_${score}_${Date.now()}`,
   });
 
-  if (score >= 50) console.log(`[BehavioralEmitter] 🔥 HYPERACTIVE BUYER signal: ${contactId} score=${score} (delta=${delta})`);
-  return res.json({ status: 'accepted', score, priority });
+  if (score >= 50) {
+    console.log(`[BehavioralEmitter] 🔥 HYPERACTIVE BUYER signal: ${contactId} score=${score} (delta=${delta})`);
+  } else {
+    console.log(`[BehavioralEmitter] Lead score: ${contactId} score=${score} (delta=${delta}, enriched: ${enrichedVia})`);
+  }
+  return res.json({ status: 'accepted', score, delta, priority, enriched_via: enrichedVia });
 }
 
 async function handleWorkflowCompleted(req, res) {
@@ -384,7 +437,10 @@ function resolveEntrySourceFromData(tags, ghlSource) {
 
 /**
  * Fetch full contact from GHL API for self-enrichment.
- * Returns { tags, source, name, phone, email } or null on failure.
+ * Returns { tags, source, name, phone, email, scoring } or null on failure.
+ *
+ * v2.4: Added scoring field — contains engagement score profiles
+ *   as { profileId: score }. Used by handleLeadScore for self-enrichment.
  */
 async function fetchGHLContact(contactId) {
   if (!GHL_API_KEY || !contactId) return null;
@@ -410,6 +466,7 @@ async function fetchGHLContact(contactId) {
       name: [c.firstName, c.lastName].filter(Boolean).join(' ') || c.name || null,
       phone: c.phone || null,
       email: c.email || null,
+      scoring: c.scoring || null,
     };
   } catch (err) {
     console.warn(`[BehavioralEmitter] GHL contact lookup error for ${contactId}: ${err.message}`);
