@@ -917,7 +917,7 @@ async function executeUpdateContactEmail(action, context) {
 async function executeCalculateTimeLapseTier(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
-  const { source_field_id, tier_thresholds, fallback_tag } = payload;
+  const { source_field_id, tier_thresholds, fallback_tag, fallback_strategy } = payload;
 
   if (!contactId) throw new Error('Missing contactId');
   if (!source_field_id) throw new Error('Missing source_field_id in payload');
@@ -934,8 +934,33 @@ async function executeCalculateTimeLapseTier(action) {
   let daysSince = null;
   let tierTag = fallback_tag || 'time-lapse:cold';
 
-  if (fieldValue && typeof fieldValue === 'number' && fieldValue > 0) {
-    daysSince = Math.floor((Date.now() - fieldValue) / 86400000);
+  let dateMs = null;
+
+  if (fieldValue) {
+    if (typeof fieldValue === 'number' && fieldValue > 0) {
+      // Unix ms timestamp (backward compat)
+      dateMs = fieldValue;
+    } else if (typeof fieldValue === 'string') {
+      // ISO date: "2026-04-15" or "2026-04-15T14:00:00Z"
+      const parsed = new Date(fieldValue);
+      if (!isNaN(parsed.getTime())) {
+        dateMs = parsed.getTime();
+      }
+    }
+  }
+
+  // Fallback: contact creation date (for edge cases where appointment field is empty)
+  if (!dateMs && fallback_strategy === 'contact_creation_date' && contact?.dateAdded) {
+    const created = new Date(contact.dateAdded);
+    if (!isNaN(created.getTime())) {
+      dateMs = created.getTime();
+      console.log(`[ActionExecutor] [TIER] Using contact creation date for ${contactId}: ${contact.dateAdded}`);
+    }
+  }
+
+  if (dateMs) {
+    daysSince = Math.floor((Date.now() - dateMs) / 86400000);
+    if (daysSince < 0) daysSince = 0; // future appointment = treat as today
 
     // 3. Determine tier from thresholds
     if (tier_thresholds) {
@@ -948,7 +973,7 @@ async function executeCalculateTimeLapseTier(action) {
       }
     }
   } else {
-    console.log(`[ActionExecutor] [TIER] No valid LP Last Contact for ${contactId}, using fallback: ${tierTag}`);
+    console.log(`[ActionExecutor] [TIER] No valid date for ${contactId}, using fallback: ${tierTag}`);
   }
 
   // 4. Apply tier tag
