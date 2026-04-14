@@ -1,25 +1,19 @@
 /**
  * Context Builder — src/context-builder.js
  * 
- * Layer 3 foundation. Assembles the full lead context that the AI Message
- * Analyzer and Contextual Decision Engine need to make strategic decisions.
+ * v2.3 — PROSPECT ID AS PRIMARY LP LOOKUP
+ * LP Prospect ID is the most reliable identifier — stable, never changes,
+ * not affected by the in1_id/lds_id confusion. Now used as the PRIMARY
+ * LP lookup path, with ghl_contact_id and lp_lead_id as fallbacks.
  * 
- * Queries across:
- *   - GHL API (contact data, tags, lead score, conversations)
- *   - Supabase lead_intelligence (AI analysis history, engagement tracking)
- *   - Supabase lp_leads (LP disposition, appointment, rep data)
- *   - Supabase lp_notes + lp_call_logs (normalized child tables)
+ * LP Lead Resolution Chain:
+ *   1. LP Prospect ID from GHL custom field → lp_leads.lp_prospect_id (PRIMARY)
+ *   2. lp_leads.ghl_contact_id (fast when linkage exists)
+ *   3. LP Lead ID from GHL custom field → lp_leads.lp_lead_id (may have in1_id)
+ *   4. LP Disposition from GHL custom field → direct injection (minimal)
+ * All successful lookups backfill ghl_contact_id for self-healing.
  * 
- * Returns a structured context object ready for AI analysis or rule evaluation.
- * 
- * Caching: Per-contact context cached for 5 minutes to avoid hammering GHL API
- * during burst processing (e.g. 1,500 lead release through W0.0).
- * 
- * v2.0 — DISK I/O OPTIMIZATION: Notes and calls now read from normalized
- * lp_notes and lp_call_logs tables instead of raw_lp_data JSONB blob.
- * This eliminates ~1.4GB of TOAST reads and provides BETTER data (the
- * normalized tables contain ALL synced records, not just the latest API snapshot).
- * raw_lp_data removed from lp_leads SELECT entirely.
+ * v2.0 — Notes/calls from normalized lp_notes + lp_call_logs tables.
  */
 
 import supabase from './supabase.js';
@@ -27,6 +21,12 @@ import supabase from './supabase.js';
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
 const CONTEXT_CACHE_TTL_MS = parseInt(process.env.CONTEXT_CACHE_TTL_MS || '300000', 10);
+
+// GHL Custom Field IDs
+const CF_LP_LEAD_ID = 'GmAVmW6V9sekD7pVONKr';       // May contain in1_id — tertiary fallback
+const CF_LP_INBOUND_ID = '3YMxheIlPyhACB8zyc3W';     // LP Inbound Lead ID (temporary, queue only — never use for lookups)
+const CF_LP_DISPOSITION = 'ZZCpHTthFMaVc3g5vMAS';     // LP Disposition code
+const CF_LP_PROSPECT_ID = 'ZRQAVrzhtzApzLlHmT87';    // LP Prospect ID — PRIMARY identifier
 
 // ═══════════════════════════════════════════════════════════════════
 // IN-MEMORY CACHE
@@ -86,24 +86,22 @@ async function ghlFetch(method, path) {
   }
 }
 
+function getCustomFieldValue(customFields, fieldId) {
+  if (!Array.isArray(customFields)) return null;
+  const field = customFields.find(f => f.id === fieldId);
+  return field?.value || null;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // DATA FETCHERS
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * Extract GHL lead score from contact data.
- * GHL stores scores in a `scoring` object keyed by score config ID:
- *   { "69012aac21a6a2c83d334d96": 36 }
- * NOT as a flat `leadScore` field.
- */
 function extractLeadScore(contact) {
-  // Try scoring object first (GHL's actual format)
   const scoringObj = contact.scoring;
   if (scoringObj && typeof scoringObj === 'object') {
     const scores = Object.values(scoringObj).filter(v => typeof v === 'number');
     if (scores.length > 0) return Math.max(...scores);
   }
-  // Fallback to flat fields (legacy or API version differences)
   return parseInt(contact.leadScore || contact.lead_score || 0, 10) || 0;
 }
 
@@ -173,24 +171,86 @@ async function fetchLeadIntelligence(contactId) {
   return data;
 }
 
-// v2.0: raw_lp_data removed from SELECT — notes/calls come from normalized tables
-async function fetchLPLead(contactId) {
+const LP_LEAD_COLUMNS = 'id, lp_lead_id, lp_prospect_id, first_name, last_name, disposition_code, disposition_label, rep_name, promoter_name, lead_source, lead_source_detail, call_count, last_call_date, appointment_set, appointment_date, demo_completed, demo_date, days_to_demo, closed_won, job_value, created_at_lp, ghl_contact_id';
+
+/**
+ * Backfill ghl_contact_id on an LP lead row (fire-and-forget).
+ * Self-healing: future lookups via ghl_contact_id will work without fallback.
+ */
+function backfillGhlContactId(lpLeadRow, ghlContactId) {
+  if (!lpLeadRow || !ghlContactId || lpLeadRow.ghl_contact_id) return;
+  supabase.from('lp_leads')
+    .update({ ghl_contact_id: ghlContactId })
+    .eq('id', lpLeadRow.id)
+    .then(({ error }) => {
+      if (error) console.warn(`[ContextBuilder] Backfill failed for LP lead ${lpLeadRow.lp_lead_id}:`, error.message);
+      else console.log(`[ContextBuilder] ✅ Backfilled ghl_contact_id ${ghlContactId} → LP lead ${lpLeadRow.lp_lead_id} (prospect ${lpLeadRow.lp_prospect_id})`);
+    });
+}
+
+/**
+ * PRIMARY: LP lead lookup via Prospect ID.
+ * Most reliable — Prospect ID is stable, never changes, not affected by in1_id bug.
+ * One prospect can have multiple leads — we take the most recently synced one.
+ */
+async function fetchLPLeadByProspectId(prospectId) {
+  if (!prospectId) return null;
+  try {
+    const { data, error } = await supabase
+      .from('lp_leads')
+      .select(LP_LEAD_COLUMNS)
+      .eq('lp_prospect_id', String(prospectId))
+      .order('synced_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error || !data) return null;
+    return data;
+  } catch (err) {
+    console.error(`[ContextBuilder] lp_leads prospect lookup error:`, err.message);
+    return null;
+  }
+}
+
+/**
+ * SECONDARY: LP lead lookup via ghl_contact_id direct linkage.
+ * Fast when set correctly, but linkage is often broken (null).
+ */
+async function fetchLPLeadByGhlContactId(contactId) {
   const { data, error } = await supabase
     .from('lp_leads')
-    .select('id, lp_lead_id, lp_prospect_id, first_name, last_name, disposition_code, disposition_label, rep_name, promoter_name, lead_source, lead_source_detail, call_count, last_call_date, appointment_set, appointment_date, demo_completed, demo_date, days_to_demo, closed_won, job_value, created_at_lp')
+    .select(LP_LEAD_COLUMNS)
     .eq('ghl_contact_id', contactId)
     .order('synced_at', { ascending: false })
     .limit(1)
     .maybeSingle();
   if (error) {
-    console.error(`[ContextBuilder] lp_leads fetch error:`, error.message);
+    console.error(`[ContextBuilder] lp_leads ghl_contact_id lookup error:`, error.message);
     return null;
   }
   return data;
 }
 
-// v2.0: Read notes from normalized lp_notes table (replaces extractLPNotes from raw blob)
-async function fetchLPNotes(lpLeadId, limit = 5) {
+/**
+ * TERTIARY: LP lead lookup via lp_lead_id from GHL custom field.
+ * WARNING: This field may contain an in1_id (inbound queue ID) instead of lds_id.
+ */
+async function fetchLPLeadByLdsId(lpLeadId) {
+  if (!lpLeadId) return null;
+  try {
+    const { data, error } = await supabase
+      .from('lp_leads')
+      .select(LP_LEAD_COLUMNS)
+      .eq('lp_lead_id', String(lpLeadId))
+      .maybeSingle();
+    if (error || !data) return null;
+    return data;
+  } catch (err) {
+    console.error(`[ContextBuilder] lp_leads lp_lead_id lookup error:`, err.message);
+    return null;
+  }
+}
+
+async function fetchLPNotes(lpLeadId, limit = 8) {
   if (!lpLeadId) return [];
   try {
     const { data, error } = await supabase
@@ -215,7 +275,6 @@ async function fetchLPNotes(lpLeadId, limit = 5) {
   }
 }
 
-// v2.0: Read calls from normalized lp_call_logs table (replaces extractLPCalls from raw blob)
 async function fetchLPCalls(lpLeadId, limit = 5) {
   if (!lpLeadId) return [];
   try {
@@ -292,14 +351,74 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     if (cached) return cached;
   }
 
-  const [ghlContact, intelligence, lpLead, opportunity] = await Promise.all([
+  // Step 1: Fetch GHL contact + intelligence + opportunity in parallel
+  const [ghlContact, intelligence, opportunity] = await Promise.all([
     fetchGHLContact(ghlContactId),
     fetchLeadIntelligence(ghlContactId),
-    fetchLPLead(ghlContactId),
     fetchOpportunity(ghlContactId),
   ]);
 
-  // v2.0: Fetch notes and calls from normalized tables (parallel with conversation)
+  // ─── Step 2: LP Lead Resolution Chain ──────────────────────────
+  // Priority 1: Prospect ID (most reliable, from GHL custom field)
+  // Priority 2: ghl_contact_id direct linkage (fast when set)
+  // Priority 3: LP Lead ID from GHL custom field (may be in1_id)
+  // Priority 4: Disposition from GHL custom field (minimal)
+  
+  let lpLead = null;
+  let lpResolveMethod = null;
+  let ghlCustomFieldDisposition = null;
+  
+  const cfProspectId = ghlContact?.customFields
+    ? getCustomFieldValue(ghlContact.customFields, CF_LP_PROSPECT_ID)
+    : null;
+
+  // Priority 1: Prospect ID
+  if (cfProspectId) {
+    lpLead = await fetchLPLeadByProspectId(cfProspectId);
+    if (lpLead) {
+      lpResolveMethod = 'prospect_id';
+      backfillGhlContactId(lpLead, ghlContactId);
+      console.log(`[ContextBuilder] LP resolved via prospect_id=${cfProspectId}: ${lpLead.first_name} ${lpLead.last_name} (${lpLead.disposition_code})`);
+    }
+  }
+
+  // Priority 2: ghl_contact_id
+  if (!lpLead) {
+    lpLead = await fetchLPLeadByGhlContactId(ghlContactId);
+    if (lpLead) {
+      lpResolveMethod = 'ghl_contact_id';
+      console.log(`[ContextBuilder] LP resolved via ghl_contact_id: ${lpLead.first_name} ${lpLead.last_name} (${lpLead.disposition_code})`);
+    }
+  }
+
+  // Priority 3: LP Lead ID from GHL custom field
+  if (!lpLead && ghlContact?.customFields) {
+    const cfLpLeadId = getCustomFieldValue(ghlContact.customFields, CF_LP_LEAD_ID);
+    if (cfLpLeadId) {
+      console.log(`[ContextBuilder] LP fallback: trying lp_lead_id=${cfLpLeadId} (may be in1_id)`);
+      lpLead = await fetchLPLeadByLdsId(cfLpLeadId);
+      if (lpLead) {
+        lpResolveMethod = 'lp_lead_id';
+        backfillGhlContactId(lpLead, ghlContactId);
+        console.log(`[ContextBuilder] LP resolved via lp_lead_id: ${lpLead.first_name} ${lpLead.last_name} (${lpLead.disposition_code})`);
+      }
+    }
+  }
+
+  // Priority 4: Disposition from GHL custom field (minimal — no LP row)
+  if (!lpLead && ghlContact?.customFields) {
+    ghlCustomFieldDisposition = getCustomFieldValue(ghlContact.customFields, CF_LP_DISPOSITION);
+    if (ghlCustomFieldDisposition) {
+      lpResolveMethod = 'ghl_custom_field_only';
+      console.log(`[ContextBuilder] LP minimal: disposition=${ghlCustomFieldDisposition} from GHL custom field (no Supabase row)`);
+    }
+  }
+
+  if (!lpLead && !ghlCustomFieldDisposition) {
+    console.log(`[ContextBuilder] No LP data found for ${ghlContactId}`);
+  }
+
+  // ─── Step 3: Fetch LP notes, calls, and conversation in parallel ───
   const lpLeadId = lpLead?.lp_lead_id || null;
   const [conversation, lpNotes, lpCalls] = await Promise.all([
     (includeConversation && ghlContact) ? fetchConversation(ghlContactId, 10) : [],
@@ -341,8 +460,8 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     lp: {
       matched: !!lpLead,
       lead_id: lpLead?.lp_lead_id || null,
-      prospect_id: lpLead?.lp_prospect_id || null,
-      disposition: lpLead?.disposition_code || null,
+      prospect_id: lpLead?.lp_prospect_id || cfProspectId || null,
+      disposition: lpLead?.disposition_code || ghlCustomFieldDisposition || null,
       disposition_label: lpLead?.disposition_label || null,
       rep_name: lpLead?.rep_name || null,
       promoter_name: lpLead?.promoter_name || null,
@@ -359,6 +478,8 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       last_call_date: lpLead?.last_call_date || null,
       notes: lpNotes,
       recent_calls: lpCalls,
+      _resolve_method: lpResolveMethod,
+      _ghl_custom_field_disposition: ghlCustomFieldDisposition,
     },
 
     intelligence: {
@@ -397,7 +518,9 @@ export async function buildLeadContext(ghlContactId, options = {}) {
         ghl_contact: !!ghlContact,
         lead_intelligence: !!intelligence,
         lp_lead: !!lpLead,
+        lp_resolve_method: lpResolveMethod,
         lp_notes: lpNotes.length > 0,
+        lp_notes_count: lpNotes.length,
         lp_calls: lpCalls.length > 0,
         opportunity: !!opportunity,
         conversation: conversation.length > 0,

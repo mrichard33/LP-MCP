@@ -13,6 +13,15 @@
  * Output: Structured assessment written to lead_intelligence table
  *         + ai.analysis_completed event emitted for Decision Engine.
  * 
+ * v1.1 — ACCURACY ENHANCEMENT:
+ *   - Enhanced system prompt with explicit instructions to weigh LP notes heavily
+ *   - Added CRITICAL ACCURACY RULES to prevent common misclassifications
+ *   - Increased LP notes from 3→5 in context summary (8 fetched by context-builder)
+ *   - Increased conversation context from 3→5 recent messages
+ *   - Added LP disposition context even when LP lead row is missing (GHL custom field fallback)
+ *   - Added explicit instructions about distinguishing trust break vs spouse objection
+ *   - Added instruction not to classify simple questions as objections
+ * 
  * Cost controls:
  *   - Skip messages < 3 words (handled by behavioral-emitter)
  *   - Rate limit: ANALYSIS_RATE_LIMIT per hour (default 100)
@@ -74,7 +83,9 @@ function markAnalyzed(contactId) {
 
 const SYSTEM_PROMPT = `You are the Antifragile Sales System intelligence engine for Reece Windows & Doors, a hurricane impact window and door company in South Florida.
 
-You analyze inbound lead messages to determine their position in the buyer journey and recommend the optimal next action. You also have access to LeadPerfection CRM data including rep notes, call history, and appointment status — use this to inform your analysis.
+You analyze inbound lead messages to determine their position in the buyer journey and recommend the optimal next action.
+
+CRITICAL: You have access to LeadPerfection (LP) CRM data including rep notes, call history, disposition codes, and appointment status. LP NOTES AND DISPOSITION ARE YOUR MOST RELIABLE DATA SOURCE — they come from real sales reps who interacted with the lead in person. Always weigh LP data MORE heavily than the inbound message alone when they conflict.
 
 RETURN ONLY a valid JSON object — no markdown, no backticks, no explanation outside the JSON.
 
@@ -103,16 +114,44 @@ Stage 5 (Committed) — Ready to buy or customer. Asks about scheduling, next st
 OBJECTION MAPPING:
 Price — "too expensive", "can't afford", "cheaper options" → Deploy SA3
 Timing — "not now", "next year", "busy season" → Deploy SA4 urgency
-Spouse — "need to talk to wife/husband/partner" → Two-decision-maker sequence
-Trust — "how do I know", "never heard of you" → Deploy SA2
-Competitor — "getting other quotes", "already have someone" → Positioning needed
+Spouse — "need to talk to wife/husband/partner", ONLY when the lead explicitly says they need their partner to decide. 1Leg LP disposition = demo happened with only one spouse present. This is different from a spouse objection — 1Leg means the demo already ran.
+Trust — "how do I know", "never heard of you", company broke a promise, rep didn't follow through → Deploy SA2
+Competitor — "getting other quotes", "already have someone", "going with another company" → Positioning needed
 DIY — "doing it myself", "YouTube", "handyman" → Deploy SA2+SA3
 
-LP DISPOSITION CONTEXT (if available):
-Rep notes are critical intelligence — they tell you WHY the lead is at its current status.
-Example: "Not ready for rehash or taking a decision" = timing objection, Stage 4
-Example: "HC 04/03 6:00PM" = appointment confirmation notation
-Example: "Customer called to cancel, going with competitor" = competitor objection
+CRITICAL ACCURACY RULES:
+1. DO NOT classify a simple identity question (e.g. "Are you the owner?", "Who is this?") as a trust objection. These are curiosity/verification questions, not expressions of distrust.
+2. DO NOT classify a lead as "spouse objection" just because LP shows 1Leg disposition. 1Leg means only one spouse was at the demo — the REAL objection may be price, trust, timing, or something else entirely. Read the rep notes to find the actual reason.
+3. When rep notes describe a broken promise (e.g. "promised numbers but never sent"), the objection is TRUST, not spouse, even if the lead mentions their partner.
+4. If a lead says "not interested" or "not a fit", check rep notes for WHY before classifying. A trust break (broken promise) masked as "not interested" should be classified as trust.
+5. When LP disposition is OPPFDN (Full Demo No Sale) and the lead is in W8.0 (post-demo sequence), classify the objection ONLY if the message explicitly states one. Do not infer objections from short messages — let the post-demo sequence do its job.
+6. Set objection_confidence to 0.9+ ONLY when the message explicitly states the objection. For inferred objections, use 0.5-0.7.
+
+LP DISPOSITION CONTEXT:
+FDNS = Full Demo, No Sale (demo ran, they said no)
+OPPFDN = Full Demo, No Sale (same as FDNS — post-demo state)
+BO = Be Back/Follow Up (demo never ran)
+1Leg = One spouse present, demo ran but decision deferred
+Issue = Lead issued to sales rep (good — means it's being worked)
+Set = Appointment scheduled
+Cnf = Appointment confirmed
+CXL = Appointment cancelled
+CCC = Customer called to cancel
+NoHome = Rep went to home, nobody there
+NoRehash = Rep-requested 7-day hold (believes deal is closing)
+DNC = Do Not Contact
+Sale = Deal closed
+PM = Post-sale/production
+
+LP REP NOTE INTERPRETATION:
+Rep notes are the GROUND TRUTH of what happened with the lead. Common patterns:
+- "HC [date] [time]" = Homeowner Confirmed for appointment
+- "Not ready for rehash" = timing objection, lead needs cooling period
+- "Going with competitor" or "getting other quotes" = competitor objection
+- "Promised numbers but never sent" or "rep didn't follow through" = TRUST BREAK (not spouse!)
+- "Spoke to Ms/Mr and confirmed" = appointment confirmation
+- "Both parties present" = spouse objection is NOT relevant
+- "Only one party home" = 1Leg situation but read further for the REAL objection
 
 FAST-TRACK SIGNALS (DS#6):
 "How soon can you come out?", "Ready to schedule", "Do you do financing?",
@@ -120,9 +159,9 @@ FAST-TRACK SIGNALS (DS#6):
 
 STORY ARC RECOMMENDATIONS:
 SA1 (Hurricane Damage) — fear/vulnerability awareness
-SA2 (Code Compliance) — legitimacy/rules/standards questions
+SA2 (Code Compliance) — legitimacy/rules/standards/authority questions
 SA3 (Cheap Window Regret) — price fixation/cheapest option
-SA4 (Insurance Disaster) — insurance/claims/coverage
+SA4 (Insurance Disaster) — insurance/claims/coverage/timing pressure
 SA5 (Home Value Increase) — investment/ROI/resale thinking`;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -133,7 +172,7 @@ async function callClaude(messageText, context) {
   if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY not configured');
 
   const contextSummary = buildContextSummary(context);
-  const userPrompt = `LEAD CONTEXT:\n${contextSummary}\n\nINBOUND MESSAGE:\n"${messageText}"\n\nAnalyze this message and return the JSON assessment.`;
+  const userPrompt = `LEAD CONTEXT:\n${contextSummary}\n\nINBOUND MESSAGE:\n"${messageText}"\n\nAnalyze this message and return the JSON assessment. Remember: LP rep notes and disposition are your most reliable data — weigh them heavily.`;
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -168,7 +207,8 @@ async function callClaude(messageText, context) {
 
 /**
  * Build a concise context summary for the AI prompt.
- * Includes LP CRM data (notes, calls, rep info) for richer analysis.
+ * v1.1: Enhanced with more LP notes (5), more conversation context (5),
+ * and LP disposition fallback from GHL custom fields.
  */
 function buildContextSummary(context) {
   const parts = [];
@@ -182,38 +222,56 @@ function buildContextSummary(context) {
     if (context.lead.objection_tags?.length) {
       parts.push(`Known Objections: ${context.lead.objection_tags.join(', ')}`);
     }
+    // v1.1: Include suppression tags — they indicate DNC or hold status
+    if (context.lead.suppression_tags?.length) {
+      parts.push(`Suppression/Hold: ${context.lead.suppression_tags.join(', ')}`);
+    }
   }
 
   // ─── LeadPerfection CRM Data ───────────────────────────────
-  if (context.lp?.matched) {
+  if (context.lp?.matched || context.lp?.disposition) {
     parts.push(`\nLP CRM DATA:`);
     parts.push(`LP Disposition: ${context.lp.disposition || 'none'}${context.lp.disposition_label ? ' (' + context.lp.disposition_label + ')' : ''}`);
     if (context.lp.rep_name) parts.push(`Sales Rep: ${context.lp.rep_name}`);
     if (context.lp.promoter_name) parts.push(`Promoter/Canvasser: ${context.lp.promoter_name}`);
-    parts.push(`Lead Source: ${context.lp.source || 'unknown'}${context.lp.source_detail ? ' / ' + context.lp.source_detail : ''}`);
+    if (context.lp.source) parts.push(`Lead Source: ${context.lp.source}${context.lp.source_detail ? ' / ' + context.lp.source_detail : ''}`);
     parts.push(`Demo Completed: ${context.lp.demo_completed ? 'YES' : 'no'}`);
     parts.push(`Appointment Set: ${context.lp.appointment_set ? 'YES' : 'no'}${context.lp.appointment_date ? ' — ' + context.lp.appointment_date : ''}`);
     if (context.lp.closed_won) parts.push(`CLOSED WON — Job Value: $${context.lp.job_value || 0}`);
     if (context.lp.call_count) parts.push(`Call Count: ${context.lp.call_count}`);
 
-    // Rep notes — critical intelligence for buyer stage classification
+    // v1.1: Show up to 5 LP notes (increased from 3) with full 200-char text
     if (context.lp.notes?.length) {
-      const noteLines = context.lp.notes.slice(0, 3).map(n =>
-        `  [${n.entered_by}] ${n.text.slice(0, 150)}`
-      ).join('\n');
-      parts.push(`Rep/System Notes:\n${noteLines}`);
+      parts.push(`\nLP REP/SYSTEM NOTES (read these carefully — they are ground truth):`);
+      const noteLines = context.lp.notes.slice(0, 5).map(n => {
+        const byLine = n.entered_by ? `[${n.entered_by}]` : '[System]';
+        const dateLine = n.date ? ` (${new Date(n.date).toLocaleDateString()})` : '';
+        return `  ${byLine}${dateLine} ${n.text.slice(0, 200)}`;
+      }).join('\n');
+      parts.push(noteLines);
     }
 
     // Recent call results
     if (context.lp.recent_calls?.length) {
-      const callLines = context.lp.recent_calls.slice(0, 3).map(c =>
+      const callLines = context.lp.recent_calls.slice(0, 5).map(c =>
         `${c.type}: ${c.result} (${c.agent})`
       ).join(', ');
       parts.push(`Recent Calls: ${callLines}`);
     }
+
+    // v2.1 fallback indicator
+    if (context.lp._fallback_used) {
+      parts.push(`(LP data retrieved via GHL custom field fallback — ghl_contact_id linkage was broken)`);
+    }
+  } else if (context.lp?._ghl_custom_field_disposition) {
+    // v2.1: Minimal LP context from GHL custom fields when LP lead row is completely missing
+    parts.push(`\nLP CRM DATA (minimal — from GHL custom fields only):`);
+    parts.push(`LP Disposition: ${context.lp._ghl_custom_field_disposition}`);
+    parts.push(`(Full LP lead record not available in Supabase — limited context)`);
   }
 
   if (context.pipeline) {
+    parts.push(`\nPIPELINE:`);
     parts.push(`Days in Current Stage: ${context.pipeline.days_in_stage}`);
     parts.push(`Pipeline Status: ${context.pipeline.status || 'unknown'}`);
   }
@@ -230,12 +288,16 @@ function buildContextSummary(context) {
     if (context.intelligence.objection_type) {
       parts.push(`Previous Objection: ${context.intelligence.objection_type}`);
     }
+    if (context.intelligence.ai_reasoning) {
+      parts.push(`Previous Reasoning: ${context.intelligence.ai_reasoning.slice(0, 150)}`);
+    }
   }
 
+  // v1.1: Show 5 recent conversation messages (increased from 3) with more text
   if (context.conversation_recent?.length) {
-    const recent = context.conversation_recent.slice(-3);
-    const convo = recent.map(m => `[${m.direction}] ${m.text?.slice(0, 100) || '(empty)'}`).join('\n');
-    parts.push(`\nRecent Conversation:\n${convo}`);
+    const recent = context.conversation_recent.slice(-5);
+    const convo = recent.map(m => `[${m.direction}] ${m.text?.slice(0, 150) || '(empty)'}`).join('\n');
+    parts.push(`\nRecent Conversation (most recent last):\n${convo}`);
   }
 
   return parts.join('\n');
@@ -340,6 +402,8 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null) 
         ...analysis,
         message_preview: messageText.slice(0, 100),
         analysis_duration_ms: Date.now() - startTime,
+        lp_data_available: context.lp?.matched || false,
+        lp_fallback_used: context.lp?._fallback_used || false,
       },
       priority: analysis.fast_track_eligible ? 'critical' :
                 analysis.engagement_quality === 'dnc' ? 'critical' :
@@ -350,9 +414,10 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null) 
     markAnalyzed(ghlContactId);
 
     const elapsed = Date.now() - startTime;
+    const lpNote = context.lp?.matched ? '(LP✓)' : context.lp?._fallback_used ? '(LP-fallback✓)' : '(no LP)';
     console.log(`[MessageAnalyzer] ✅ ${ghlContactId}: Stage ${analysis.buyer_stage} (${analysis.buyer_stage_confidence}), ` +
       `${analysis.objection_type || 'no objection'}, ${analysis.engagement_quality}, ` +
-      `fast_track=${analysis.fast_track_eligible} (${elapsed}ms)`);
+      `fast_track=${analysis.fast_track_eligible} ${lpNote} (${elapsed}ms)`);
 
     return analysis;
 
