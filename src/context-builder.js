@@ -15,19 +15,19 @@
  * Caching: Per-contact context cached for 5 minutes to avoid hammering GHL API
  * during burst processing (e.g. 1,500 lead release through W0.0).
  * 
- * v2.1 — LP LEAD FALLBACK: When lp_leads.ghl_contact_id lookup returns null
- * (broken linkage — common for canvassing and LP-synced leads), falls back to:
- *   1. GHL custom field lp_lead_id (GmAVmW6V9sekD7pVONKr) → query lp_leads.lp_lead_id
- *   2. GHL custom field LP Disposition (ZZCpHTthFMaVc3g5vMAS) → direct injection
- * This ensures the AI message analyzer always has LP context when available,
- * even when the Supabase ghl_contact_id linkage is broken.
- * Also writes back the ghl_contact_id to fix the broken linkage for future queries.
+ * v2.2 — LP ID ARCHITECTURE FIX: The lp_lead_id GHL custom field may contain
+ * an in1_id (inbound queue ID) instead of the real lds_id. The correct fallback
+ * chain is now:
+ *   1. lp_leads.ghl_contact_id (primary — direct linkage)
+ *   2. LP Prospect ID from GHL custom field → lp_leads.lp_prospect_id (most reliable)
+ *   3. LP Lead ID from GHL custom field → lp_leads.lp_lead_id (may have stale in1_id)
+ *   4. LP Disposition from GHL custom field → direct injection (minimal context)
+ * Also writes back ghl_contact_id to fix broken linkage for future queries.
+ * 
+ * v2.1 — LP LEAD FALLBACK: Initial implementation with lp_lead_id fallback.
  * 
  * v2.0 — DISK I/O OPTIMIZATION: Notes and calls now read from normalized
  * lp_notes and lp_call_logs tables instead of raw_lp_data JSONB blob.
- * This eliminates ~1.4GB of TOAST reads and provides BETTER data (the
- * normalized tables contain ALL synced records, not just the latest API snapshot).
- * raw_lp_data removed from lp_leads SELECT entirely.
  */
 
 import supabase from './supabase.js';
@@ -37,9 +37,10 @@ const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
 const CONTEXT_CACHE_TTL_MS = parseInt(process.env.CONTEXT_CACHE_TTL_MS || '300000', 10);
 
 // GHL Custom Field IDs for LP data fallback
-const CF_LP_LEAD_ID = 'GmAVmW6V9sekD7pVONKr';
-const CF_LP_DISPOSITION = 'ZZCpHTthFMaVc3g5vMAS';
-const CF_LP_PROSPECT_ID = 'ZRQAVrzhtzApzLlHmT87';
+const CF_LP_LEAD_ID = 'GmAVmW6V9sekD7pVONKr';       // May contain in1_id (inbound queue) — use as secondary fallback
+const CF_LP_INBOUND_ID = '3YMxheIlPyhACB8zyc3W';     // LP Inbound Lead ID (temporary, queue only)
+const CF_LP_DISPOSITION = 'ZZCpHTthFMaVc3g5vMAS';     // LP Disposition code
+const CF_LP_PROSPECT_ID = 'ZRQAVrzhtzApzLlHmT87';    // LP Prospect ID — MOST RELIABLE cross-reference
 
 // ═══════════════════════════════════════════════════════════════════
 // IN-MEMORY CACHE
@@ -103,10 +104,6 @@ async function ghlFetch(method, path) {
 // GHL CUSTOM FIELD HELPER
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * Extract a custom field value from the GHL contact customFields array.
- * GHL returns: [{ id: "fieldId", value: "someValue" }, ...]
- */
 function getCustomFieldValue(customFields, fieldId) {
   if (!Array.isArray(customFields)) return null;
   const field = customFields.find(f => f.id === fieldId);
@@ -117,20 +114,12 @@ function getCustomFieldValue(customFields, fieldId) {
 // DATA FETCHERS
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * Extract GHL lead score from contact data.
- * GHL stores scores in a `scoring` object keyed by score config ID:
- *   { "69012aac21a6a2c83d334d96": 36 }
- * NOT as a flat `leadScore` field.
- */
 function extractLeadScore(contact) {
-  // Try scoring object first (GHL's actual format)
   const scoringObj = contact.scoring;
   if (scoringObj && typeof scoringObj === 'object') {
     const scores = Object.values(scoringObj).filter(v => typeof v === 'number');
     if (scores.length > 0) return Math.max(...scores);
   }
-  // Fallback to flat fields (legacy or API version differences)
   return parseInt(contact.leadScore || contact.lead_score || 0, 10) || 0;
 }
 
@@ -200,7 +189,6 @@ async function fetchLeadIntelligence(contactId) {
   return data;
 }
 
-// v2.0: raw_lp_data removed from SELECT — notes/calls come from normalized tables
 const LP_LEAD_COLUMNS = 'id, lp_lead_id, lp_prospect_id, first_name, last_name, disposition_code, disposition_label, rep_name, promoter_name, lead_source, lead_source_detail, call_count, last_call_date, appointment_set, appointment_date, demo_completed, demo_date, days_to_demo, closed_won, job_value, created_at_lp, ghl_contact_id';
 
 async function fetchLPLead(contactId) {
@@ -219,9 +207,42 @@ async function fetchLPLead(contactId) {
 }
 
 /**
- * v2.1: Fallback LP lead lookup via lp_lead_id from GHL custom field.
- * Called when the primary ghl_contact_id lookup returns null.
- * Also writes back the ghl_contact_id to fix the broken linkage.
+ * v2.2: Fallback LP lead lookup via Prospect ID — MOST RELIABLE cross-reference.
+ * LP Prospect ID is stable and never changes (unlike lp_lead_id which may be in1_id).
+ * One prospect can have multiple leads — we take the most recently synced one.
+ */
+async function fetchLPLeadByProspectId(prospectId, ghlContactId) {
+  if (!prospectId) return null;
+  try {
+    const { data, error } = await supabase
+      .from('lp_leads')
+      .select(LP_LEAD_COLUMNS)
+      .eq('lp_prospect_id', String(prospectId))
+      .order('synced_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error || !data) return null;
+    // Backfill ghl_contact_id if missing
+    if (data && ghlContactId && !data.ghl_contact_id) {
+      supabase.from('lp_leads')
+        .update({ ghl_contact_id: ghlContactId })
+        .eq('id', data.id)
+        .then(({ error: updateErr }) => {
+          if (updateErr) console.warn(`[ContextBuilder] Failed to backfill ghl_contact_id on prospect ${prospectId}:`, updateErr.message);
+          else console.log(`[ContextBuilder] ✅ Backfilled ghl_contact_id ${ghlContactId} on LP lead ${data.lp_lead_id} (prospect ${prospectId})`);
+        });
+    }
+    return data;
+  } catch (err) {
+    console.error(`[ContextBuilder] lp_leads prospect fallback error:`, err.message);
+    return null;
+  }
+}
+
+/**
+ * v2.1/v2.2: Fallback LP lead lookup via lp_lead_id from GHL custom field.
+ * NOTE: This field may contain an in1_id (inbound queue ID) instead of the real lds_id.
+ * Used as SECONDARY fallback after Prospect ID lookup.
  */
 async function fetchLPLeadByLdsId(lpLeadId, ghlContactId) {
   if (!lpLeadId) return null;
@@ -231,11 +252,10 @@ async function fetchLPLeadByLdsId(lpLeadId, ghlContactId) {
     .eq('lp_lead_id', String(lpLeadId))
     .maybeSingle();
   if (error) {
-    console.error(`[ContextBuilder] lp_leads fallback fetch error:`, error.message);
+    console.error(`[ContextBuilder] lp_leads lp_lead_id fallback error:`, error.message);
     return null;
   }
   if (data && ghlContactId && !data.ghl_contact_id) {
-    // Fix the broken linkage so future queries work via the primary path
     supabase.from('lp_leads')
       .update({ ghl_contact_id: ghlContactId })
       .eq('lp_lead_id', String(lpLeadId))
@@ -247,7 +267,6 @@ async function fetchLPLeadByLdsId(lpLeadId, ghlContactId) {
   return data;
 }
 
-// v2.0: Read notes from normalized lp_notes table (replaces extractLPNotes from raw blob)
 async function fetchLPNotes(lpLeadId, limit = 8) {
   if (!lpLeadId) return [];
   try {
@@ -273,7 +292,6 @@ async function fetchLPNotes(lpLeadId, limit = 8) {
   }
 }
 
-// v2.0: Read calls from normalized lp_call_logs table (replaces extractLPCalls from raw blob)
 async function fetchLPCalls(lpLeadId, limit = 5) {
   if (!lpLeadId) return [];
   try {
@@ -357,31 +375,49 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     fetchOpportunity(ghlContactId),
   ]);
 
-  // ─── v2.1: LP Lead Fallback via GHL Custom Fields ──────────────
+  // ─── v2.2: LP Lead Fallback Chain (Prospect ID → Lead ID → Custom Field) ───
   let lpLead = lpLeadPrimary;
   let lpFallbackUsed = false;
+  let lpFallbackMethod = null;
   let ghlCustomFieldDisposition = null;
 
   if (!lpLead && ghlContact?.customFields) {
-    const cfLpLeadId = getCustomFieldValue(ghlContact.customFields, CF_LP_LEAD_ID);
-    if (cfLpLeadId) {
-      console.log(`[ContextBuilder] LP fallback: ghl_contact_id lookup failed, trying lp_lead_id=${cfLpLeadId} from GHL custom field`);
-      lpLead = await fetchLPLeadByLdsId(cfLpLeadId, ghlContactId);
+    // Fallback 1: Prospect ID (MOST RELIABLE — never changes, not affected by in1_id bug)
+    const cfProspectId = getCustomFieldValue(ghlContact.customFields, CF_LP_PROSPECT_ID);
+    if (cfProspectId) {
+      console.log(`[ContextBuilder] LP fallback 1: trying prospect_id=${cfProspectId} from GHL custom field`);
+      lpLead = await fetchLPLeadByProspectId(cfProspectId, ghlContactId);
       if (lpLead) {
         lpFallbackUsed = true;
-        console.log(`[ContextBuilder] ✅ LP fallback matched: ${lpLead.first_name} ${lpLead.last_name} (${lpLead.disposition_code})`);
+        lpFallbackMethod = 'prospect_id';
+        console.log(`[ContextBuilder] ✅ LP fallback via prospect_id matched: ${lpLead.first_name} ${lpLead.last_name} (${lpLead.disposition_code})`);
       }
     }
-    // Even if LP lead row is missing, grab disposition from GHL custom field
+
+    // Fallback 2: Lead ID (may contain in1_id — secondary reliability)
+    if (!lpLead) {
+      const cfLpLeadId = getCustomFieldValue(ghlContact.customFields, CF_LP_LEAD_ID);
+      if (cfLpLeadId) {
+        console.log(`[ContextBuilder] LP fallback 2: trying lp_lead_id=${cfLpLeadId} from GHL custom field (may be in1_id)`);
+        lpLead = await fetchLPLeadByLdsId(cfLpLeadId, ghlContactId);
+        if (lpLead) {
+          lpFallbackUsed = true;
+          lpFallbackMethod = 'lp_lead_id';
+          console.log(`[ContextBuilder] ✅ LP fallback via lp_lead_id matched: ${lpLead.first_name} ${lpLead.last_name} (${lpLead.disposition_code})`);
+        }
+      }
+    }
+
+    // Fallback 3: Disposition from GHL custom field (minimal context, no LP row)
     if (!lpLead) {
       ghlCustomFieldDisposition = getCustomFieldValue(ghlContact.customFields, CF_LP_DISPOSITION);
       if (ghlCustomFieldDisposition) {
-        console.log(`[ContextBuilder] LP minimal fallback: disposition=${ghlCustomFieldDisposition} from GHL custom field (no LP lead row in Supabase)`);
+        console.log(`[ContextBuilder] LP fallback 3 (minimal): disposition=${ghlCustomFieldDisposition} from GHL custom field`);
       }
     }
   }
 
-  // v2.0/v2.1: Fetch notes and calls from normalized tables (parallel with conversation)
+  // Fetch notes and calls from normalized tables (parallel with conversation)
   const lpLeadId = lpLead?.lp_lead_id || null;
   const [conversation, lpNotes, lpCalls] = await Promise.all([
     (includeConversation && ghlContact) ? fetchConversation(ghlContactId, 10) : [],
@@ -393,8 +429,7 @@ export async function buildLeadContext(ghlContactId, options = {}) {
   const daysInStage = calculateDaysInStage(opportunity);
   const lpName = lpLead ? [lpLead.first_name, lpLead.last_name].filter(Boolean).join(' ') : null;
 
-  // v2.1: Extract additional LP context from GHL custom fields when LP lead row exists
-  // but may be missing some data (e.g. prospect ID)
+  // Extract prospect ID from GHL custom fields as supplement
   const cfProspectId = ghlContact?.customFields
     ? getCustomFieldValue(ghlContact.customFields, CF_LP_PROSPECT_ID)
     : null;
@@ -447,8 +482,9 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       last_call_date: lpLead?.last_call_date || null,
       notes: lpNotes,
       recent_calls: lpCalls,
-      // v2.1: Fallback metadata for debugging
+      // Fallback metadata for debugging
       _fallback_used: lpFallbackUsed,
+      _fallback_method: lpFallbackMethod,
       _ghl_custom_field_disposition: ghlCustomFieldDisposition,
     },
 
@@ -489,6 +525,7 @@ export async function buildLeadContext(ghlContactId, options = {}) {
         lead_intelligence: !!intelligence,
         lp_lead: !!lpLead,
         lp_lead_fallback: lpFallbackUsed,
+        lp_fallback_method: lpFallbackMethod,
         lp_notes: lpNotes.length > 0,
         lp_calls: lpCalls.length > 0,
         opportunity: !!opportunity,
