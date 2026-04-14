@@ -4,7 +4,7 @@
  * Layer 2 of the agentic system. Reads pending actions from agent_actions
  * and executes them against GHL, LP, GroupMe, and other systems.
  * 
- * Supported action types (12):
+ * Supported action types (13):
  *   add_tag              → POST /contacts/{id}/tags (additive, never PUT)
  *   remove_tag           → DELETE /contacts/{id}/tags (single tag or batch array)
  *   move_opportunity     → Find opp by contact, PUT /opportunities/{oppId} with pipelineStageId
@@ -17,6 +17,7 @@
  *   set_lp_appointment   → Push appointment to LP via SetAppointment API (Phase 2 write)
  *   update_custom_fields → PUT /contacts/{id} with customFields array
  *   update_contact_email → PUT /contacts/{id} with {email} — LP email enrichment (v9.0)
+ *   calculate_time_lapse_tier → Read LP Last Contact, compute tier, apply time-lapse tag
  *
  * v3.9 — Enriched GroupMe notifications and approval requests.
  *   resolveContactInfo now returns { name, phone, ghlContactId, lpLead } where
@@ -910,6 +911,66 @@ async function executeUpdateContactEmail(action, context) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// v4.0: CALCULATE TIME-LAPSE TIER
+// ═══════════════════════════════════════════════════════════════════
+
+async function executeCalculateTimeLapseTier(action) {
+  const contactId = action.target_id;
+  const payload = action.action_payload || {};
+  const { source_field_id, tier_thresholds, fallback_tag } = payload;
+
+  if (!contactId) throw new Error('Missing contactId');
+  if (!source_field_id) throw new Error('Missing source_field_id in payload');
+
+  // 1. Fetch contact and read custom field value
+  let fieldValue = null;
+  const contact = await getGHLContact(contactId);
+  if (contact?.customFields) {
+    const field = contact.customFields.find(f => f.id === source_field_id);
+    fieldValue = field?.value ?? null;
+  }
+
+  // 2. Calculate days since last contact
+  let daysSince = null;
+  let tierTag = fallback_tag || 'time-lapse:cold';
+
+  if (fieldValue && typeof fieldValue === 'number' && fieldValue > 0) {
+    daysSince = Math.floor((Date.now() - fieldValue) / 86400000);
+
+    // 3. Determine tier from thresholds
+    if (tier_thresholds) {
+      if (daysSince <= (tier_thresholds.warm?.max_days ?? 90)) {
+        tierTag = tier_thresholds.warm?.tag || 'time-lapse:warm';
+      } else if (daysSince <= (tier_thresholds.cool?.max_days ?? 365)) {
+        tierTag = tier_thresholds.cool?.tag || 'time-lapse:cool';
+      } else {
+        tierTag = tier_thresholds.cold?.tag || 'time-lapse:cold';
+      }
+    }
+  } else {
+    console.log(`[ActionExecutor] [TIER] No valid LP Last Contact for ${contactId}, using fallback: ${tierTag}`);
+  }
+
+  // 4. Apply tier tag
+  await ghlFetch('POST', `/contacts/${contactId}/tags`, { tags: [tierTag] });
+
+  console.log(`[ActionExecutor] [TIER] ${contactId}: ${daysSince ?? '?'} days → ${tierTag}`);
+
+  // 5. Return result with _context for batch propagation to send_notification
+  return {
+    action: 'time_lapse_tier_calculated',
+    contact_id: contactId,
+    tier: tierTag,
+    days_since: daysSince,
+    field_value: fieldValue,
+    _context: {
+      calculated_tier: tierTag.replace('time-lapse:', '').toUpperCase(),
+      days_since_last_contact: daysSince !== null ? daysSince : 'unknown',
+    },
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // EXECUTOR ENGINE
 // ═══════════════════════════════════════════════════════════════════
 
@@ -928,9 +989,10 @@ const ACTION_HANDLERS = {
   set_lp_appointment: executeSetLPAppointment,
   update_custom_fields: executeUpdateCustomFields,
   update_contact_email: executeUpdateContactEmail,
+  calculate_time_lapse_tier: executeCalculateTimeLapseTier,
 };
 
-async function executeSingleAction(action) {
+async function executeSingleAction(action, batchContext = {}) {
   const handler = ACTION_HANDLERS[action.action_type];
   if (!handler) {
     await supabase.from('agent_actions').update({ status: 'failed', error_message: `Unknown action type: ${action.action_type}`, executed_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', action.id);
@@ -939,8 +1001,9 @@ async function executeSingleAction(action) {
   await supabase.from('agent_actions').update({ status: 'executing', updated_at: new Date().toISOString() }).eq('id', action.id);
   try {
     let context = {};
-    if (CONTEXT_AWARE_HANDLERS.has(action.action_type)) { context = await getEventContext(action); }
+    if (CONTEXT_AWARE_HANDLERS.has(action.action_type)) { context = { ...(await getEventContext(action)), ...batchContext }; }
     const result = await handler(action, context);
+    if (result?._context) Object.assign(batchContext, result._context);
     await supabase.from('agent_actions').update({ status: 'completed', execution_result: result, executed_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', action.id);
     console.log(`[ActionExecutor] ✅ ${action.action_type} completed (action ${action.id}, rule: ${action.rule_applied})`);
     return { action_id: action.id, status: 'completed', result };
@@ -987,8 +1050,9 @@ export async function executeActions({ limit = 50 } = {}) {
   console.log(`[ActionExecutor] Executing ${actions.length} actions in ${batches.size} batches...`);
   const results = []; let completed = 0, failed = 0;
   for (const [bid, ba] of batches) {
+    const batchContext = {};
     for (const a of ba) {
-      const r = await executeSingleAction(a); results.push(r);
+      const r = await executeSingleAction(a, batchContext); results.push(r);
       if (r.status === 'completed') completed++; else if (r.status === 'failed') { failed++; break; }
     }
   }
