@@ -1,7 +1,7 @@
 /**
  * LP Appointment Sync — src/lp-appointment-sync.js
  * 
- * v4.1: Direct webhook endpoint for GHL → LP appointment synchronization.
+ * v4.2: Direct webhook endpoint for GHL → LP appointment synchronization.
  * Called by GHL APPT Handler workflows via standard webhook (form-encoded).
  * 
  * Contains the safe lds_id resolution chain that validates every candidate
@@ -9,11 +9,16 @@
  * GmAVmW6V9sekD7pVONKr (may contain in1_id from addlead).
  * 
  * Resolution chain:
- *   0. Prospect ID fast-path → GetLead by cst_id → find bookable lead (NEW in v4.1)
+ *   0. Prospect ID fast-path → GetLead by cst_id → find bookable lead
  *   1. Supabase lp_leads by ghl_contact_id → most recent bookable lead → validate via LP API
  *   2. LP API GetCustomers3 by phone/email → prospect → GetLead → find bookable lead
  *   3. GHL field GmAVmW6V9sekD7pVONKr ONLY if != field 3YMxheIlPyhACB8zyc3W (in1_id) AND validates
  *   4. Graceful skip with GroupMe notification if no valid lds_id found
+ * 
+ * v4.2: GHL standard webhooks don't resolve {{appointment.*}} merge fields.
+ *   The endpoint now falls back to GHL contact custom fields (Last Appointment
+ *   Start Date / Time) when date/time are missing from the webhook body.
+ *   The APPT Handler writes these BEFORE the webhook step, so they're always available.
  * 
  * Endpoint: POST /webhook/ghl/set-lp-appointment
  * 
@@ -22,9 +27,9 @@
  *   contact_name:     {{contact.name}}
  *   contact_phone:    {{contact.phone}}
  *   contact_email:    {{contact.email}}
- *   appointment_date: {{appointment.only_start_date}}
- *   appointment_time: {{appointment.only_start_time}}
- *   calendar_name:    {{appointment.calendar_name}}
+ *   appointment_date: {{contact.last_appointment_start_date}}
+ *   appointment_time: {{contact.last_appointment_start_time}}
+ *   calendar_name:    Window Estimate (or MV / HPA)
  *   lp_prospect_id:   {{contact.lp_prospect_id}}
  */
 
@@ -40,6 +45,10 @@ import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken } from './ghl-rate-limiter.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
+
+// GHL custom field IDs for appointment data (written by APPT Handler before this webhook fires)
+const LAST_APPT_DATE_FIELD = 'x8KO5o89WPLfC7ivia3A';
+const LAST_APPT_TIME_FIELD = 'U67epWMNqjbf0SHAllEZ';
 
 /**
  * Clean a value from GHL webhook body.
@@ -112,10 +121,6 @@ function findBookableLead(leadRecords, prospectId) {
  * Safely resolve a REAL LP Lead ID (lds_id) for a GHL contact.
  * Every candidate is validated via LP API getLeadByLdsId before acceptance.
  * 
- * v4.1: Added Step 0 — prospect ID fast-path. When GHL sends lp_prospect_id,
- * we skip Supabase and GetCustomers3 entirely and go straight to GetLead by cst_id.
- * This is the fastest and most reliable path for contacts that have a known prospect.
- * 
  * @param {string} ghlContactId — GHL Contact ID
  * @param {Object} contactInfo  — { phone, email, prospectId } from GHL
  * @returns {{ ldsId: string, prospectId: string, source: string } | null}
@@ -124,8 +129,6 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
   const webhookProspectId = cleanGHLValue(contactInfo.prospectId);
 
   // ── Step 0: Prospect ID fast-path (v4.1) ──────────────────────
-  // If GHL sent lp_prospect_id, go straight to LP API GetLead by cst_id.
-  // Skips Supabase cache and GetCustomers3 phone/email search entirely.
   if (webhookProspectId && /^\d+$/.test(webhookProspectId)) {
     try {
       const leadsResult = await getLeads({ cst_id: webhookProspectId, PageSize: 20 });
@@ -141,7 +144,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
     }
   }
 
-  // ── Step 1: Supabase lp_leads (sync engine stores REAL lds_id values) ──
+  // ── Step 1: Supabase lp_leads ──
   try {
     const { data: leads } = await supabase.from('lp_leads')
       .select('lp_lead_id, lp_prospect_id, disposition_code, appointment_set, appointment_date')
@@ -300,23 +303,40 @@ function parseApptTime(raw) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// MAIN SYNC FUNCTION
+// v4.2: GHL CONTACT FALLBACK FOR APPOINTMENT DATE/TIME
 // ═══════════════════════════════════════════════════════════════════
 
 /**
- * Sync a GHL appointment to LP.
+ * Fetch appointment date/time from GHL contact custom fields.
+ * The APPT Handler writes Last Appointment Start Date (x8KO5o89WPLfC7ivia3A)
+ * and Last Appointment Start Time (U67epWMNqjbf0SHAllEZ) BEFORE this webhook
+ * fires, so these fields are always available as a fallback.
  * 
- * @param {Object} params
- * @param {string} params.contactId       — GHL Contact ID
- * @param {string} params.contactPhone    — Contact phone
- * @param {string} params.contactEmail    — Contact email
- * @param {string} params.contactName     — Contact name
- * @param {string} params.prospectId      — LP Prospect ID (v4.1 fast-path)
- * @param {string} params.appointmentDate — Date (any parseable format)
- * @param {string} params.appointmentTime — Time (any parseable format)
- * @param {string} params.calendarName    — Calendar name for logging
- * @returns {Object} result with action, lp_lead_id, etc.
+ * @param {string} contactId — GHL Contact ID
+ * @returns {{ date: string|null, time: string|null }}
  */
+async function fetchApptFromGHLContact(contactId) {
+  try {
+    const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
+    const fields = ghlRes?.contact?.customFields || [];
+    const dateField = fields.find(f => f.id === LAST_APPT_DATE_FIELD);
+    const timeField = fields.find(f => f.id === LAST_APPT_TIME_FIELD);
+    const date = dateField?.value ? String(dateField.value).trim() : null;
+    const time = timeField?.value ? String(timeField.value).trim() : null;
+    if (date || time) {
+      console.log(`[LP-APPT] GHL contact fallback: date=${date}, time=${time}`);
+    }
+    return { date, time };
+  } catch (err) {
+    console.warn(`[LP-APPT] GHL contact fallback failed for ${contactId}: ${err.message}`);
+    return { date: null, time: null };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// MAIN SYNC FUNCTION
+// ═══════════════════════════════════════════════════════════════════
+
 async function syncAppointmentToLP({
   contactId, contactPhone, contactEmail, contactName,
   prospectId: webhookProspectId,
@@ -402,11 +422,11 @@ async function syncAppointmentToLP({
 
   // ── Post-success logging ──
   await addGHLNote(contactId,
-    `[LP SYNC] Appointment set (v4.1)\nLP Lead: ${ldsId} (via ${source})\nProspect: ${prospectId || 'N/A'}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName || 'N/A'}`
+    `[LP SYNC] Appointment set (v4.2)\nLP Lead: ${ldsId} (via ${source})\nProspect: ${prospectId || 'N/A'}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName || 'N/A'}`
   ).catch(() => {});
 
   await sendGroupMeMessage(
-    `📅 LP Appointment Set (v4.1)\n` +
+    `📅 LP Appointment Set (v4.2)\n` +
     `👤 ${contactName || contactId}\n` +
     `📋 LP Lead: ${ldsId} (${source}) | Prospect: ${prospectId || 'N/A'}\n` +
     `📅 ${apptDate} ${apptTime} | ${calendarName || 'N/A'}`
@@ -438,14 +458,18 @@ export function registerLPAppointmentSyncRoutes(app) {
    * Direct webhook for GHL APPT Handler workflows.
    * Accepts both JSON and form-encoded (standard webhook) payloads.
    * 
+   * v4.2: Falls back to GHL contact custom fields when appointment
+   * date/time are missing. GHL standard webhooks don't resolve
+   * {{appointment.*}} merge fields — only {{contact.*}} fields work.
+   * 
    * Fields:
    *   contactId / contact_id:             GHL Contact ID (REQUIRED)
    *   contact_phone / contactPhone:       Phone number
    *   contact_email / contactEmail:       Email
    *   contact_name / contactName:         Full name
    *   lp_prospect_id / prospect_id:       LP Prospect ID (fast-path)
-   *   appointment_date / appointmentDate: Date (REQUIRED)
-   *   appointment_time / appointmentTime: Time (REQUIRED)
+   *   appointment_date / appointmentDate: Date (falls back to GHL contact)
+   *   appointment_time / appointmentTime: Time (falls back to GHL contact)
    *   calendar_name / calendarName:       Calendar name
    */
   app.post('/webhook/ghl/set-lp-appointment', async (req, res) => {
@@ -453,15 +477,28 @@ export function registerLPAppointmentSyncRoutes(app) {
     try {
       const body = req.body || {};
       const contactId = cleanGHLValue(body.contact_id || body.contactId);
-      const appointmentDate = cleanGHLValue(body.appointment_date || body.appointmentDate || body.start_date || body.startDate);
-      const appointmentTime = cleanGHLValue(body.appointment_time || body.appointmentTime || body.start_time || body.startTime);
+      let appointmentDate = cleanGHLValue(body.appointment_date || body.appointmentDate || body.start_date || body.startDate);
+      let appointmentTime = cleanGHLValue(body.appointment_time || body.appointmentTime || body.start_time || body.startTime);
       const prospectId = cleanGHLValue(body.lp_prospect_id || body.prospect_id || body.prospectId);
 
       if (!contactId) {
         return res.status(400).json({ success: false, error: 'contact_id is required' });
       }
+
+      // v4.2: GHL standard webhooks don't resolve {{appointment.*}} variables.
+      // Fall back to GHL contact custom fields written by the APPT Handler.
       if (!appointmentDate || !appointmentTime) {
-        return res.status(400).json({ success: false, error: 'appointment_date and appointment_time are required' });
+        console.log(`[LP-APPT] Missing date/time from webhook body — fetching from GHL contact ${contactId}`);
+        const fallback = await fetchApptFromGHLContact(contactId);
+        if (!appointmentDate && fallback.date) appointmentDate = fallback.date;
+        if (!appointmentTime && fallback.time) appointmentTime = fallback.time;
+      }
+
+      if (!appointmentDate || !appointmentTime) {
+        return res.status(400).json({
+          success: false,
+          error: 'appointment_date and appointment_time are required (not in webhook body or GHL contact fields)',
+        });
       }
 
       console.log(`[LP-APPT] Webhook received: contact=${contactId}, date=${appointmentDate}, time=${appointmentTime}, prospect=${prospectId || 'none'}`);
