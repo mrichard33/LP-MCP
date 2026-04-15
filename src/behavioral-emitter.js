@@ -53,6 +53,72 @@ import supabase from './supabase.js';
 
 const GHL_WEBHOOK_SECRET = process.env.GHL_WEBHOOK_SECRET || '';
 const GHL_API_KEY = process.env.GHL_API_KEY;
+const SELF_BASE_URL = `http://localhost:${process.env.PORT || 8080}`;
+
+/**
+ * Fire-and-forget agentic pipeline: analyze → process → execute.
+ * Runs after GHL webhook response is already sent. Uses internal HTTP
+ * calls to reuse existing endpoint logic without circular imports.
+ *
+ * Timeline target: ~10-15 seconds end-to-end.
+ */
+async function triggerAgenticPipeline(contactId, messageText) {
+  const start = Date.now();
+
+  // Step 1: Analyze the message (~4-8 sec — Claude API call)
+  try {
+    const analyzeRes = await fetch(`${SELF_BASE_URL}/n8n/analyze-message`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contactId, message: messageText }),
+      signal: AbortSignal.timeout(45000),
+    });
+    if (!analyzeRes.ok) {
+      console.warn(`[AgenticPipeline] Analyze failed: ${analyzeRes.status}`);
+      return; // Analysis failed — heartbeat will retry
+    }
+    const analyzeData = await analyzeRes.json();
+    console.log(`[AgenticPipeline] Analysis complete for ${contactId}: stage=${analyzeData.buyer_stage || '?'} (${Date.now() - start}ms)`);
+  } catch (err) {
+    console.warn(`[AgenticPipeline] Analyze error for ${contactId}: ${err.message}`);
+    return; // Let heartbeat handle it
+  }
+
+  // Step 2: Process pending events → Decision Engine creates actions
+  try {
+    const processRes = await fetch(`${SELF_BASE_URL}/n8n/decision-engine/process`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (processRes.ok) {
+      const processData = await processRes.json();
+      console.log(`[AgenticPipeline] Events processed: ${processData.events_processed || 0}, actions: ${processData.total_actions_created || 0} (${Date.now() - start}ms)`);
+    }
+  } catch (err) {
+    console.warn(`[AgenticPipeline] Process error: ${err.message}`);
+    return;
+  }
+
+  // Step 3: Execute pending actions → pre-generate response + send GroupMe approval
+  try {
+    const execRes = await fetch(`${SELF_BASE_URL}/n8n/decision-engine/execute`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ limit: 10 }),
+      signal: AbortSignal.timeout(60000),
+    });
+    if (execRes.ok) {
+      const execData = await execRes.json();
+      console.log(`[AgenticPipeline] Executed: ${execData.actions_executed || 0}, approvals: ${execData.approval_requests_sent || 0} (${Date.now() - start}ms total)`);
+    }
+  } catch (err) {
+    console.warn(`[AgenticPipeline] Execute error: ${err.message}`);
+  }
+
+  console.log(`[AgenticPipeline] Pipeline complete for ${contactId} (${Date.now() - start}ms)`);
+}
 
 function validateWebhook(req) {
   if (!GHL_WEBHOOK_SECRET) return true;
@@ -140,6 +206,12 @@ async function handleReply(req, res) {
     priority: 'high', idempotency_key: `ghl_reply_${contactId}_${Date.now()}`,
   });
   console.log(`[BehavioralEmitter] Substantive reply from ${contactId} (${trimmed.split(/\s+/).length} words) → pending AI analysis`);
+
+  // Fire-and-forget: run the full agentic pipeline inline instead of waiting for heartbeat.
+  triggerAgenticPipeline(contactId, trimmed).catch(err => {
+    console.error(`[BehavioralEmitter] Async pipeline failed for ${contactId}: ${err.message}`);
+  });
+
   return res.json({ status: 'accepted', classification: 'pending_analysis' });
 }
 
