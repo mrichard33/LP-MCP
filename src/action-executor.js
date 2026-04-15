@@ -51,6 +51,7 @@
 import supabase from './supabase.js';
 import { applyGHLTag, addGHLNote, updateGHLContactFields, updateGHLContactEmail, getGHLContact } from './ghl.js';
 import { setAppointment as lpSetAppointment, getLeadByLdsId } from './lp-client.js';
+import { resolveLPLeadId } from './lp-appointment-sync.js';
 import { sendGroupMeMessage, sendApprovalRequest } from './groupme.js';
 import { acquireToken, report429, registerRateLimiterRoutes } from './ghl-rate-limiter.js';
 import { formatPhone, formatDateTime } from './format-helpers.js';
@@ -682,7 +683,7 @@ async function executeCancelAppointment(action) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// LP APPOINTMENT WRITEBACK
+// LP APPOINTMENT WRITEBACK — v4.0
 // ═══════════════════════════════════════════════════════════════════
 
 const MONTH_MAP = {
@@ -712,38 +713,111 @@ function normalizeDateForComparison(dateStr) {
   return null;
 }
 
+/**
+ * v4.0: Set appointment in LP with safe Lead ID resolution.
+ *
+ * Key change from v3.x: NEVER blindly uses GHL custom field GmAVmW6V9sekD7pVONKr.
+ * Instead uses resolveLPLeadId() (imported from lp-appointment-sync.js) which
+ * validates every candidate through LP API.
+ *
+ * Resolution chain:
+ *   1. Supabase lp_leads (sync engine stores real lds_id) → validate via LP API
+ *   2. GetCustomers3 phone/email → prospect → GetLead → find bookable lead
+ *   3. GHL field ONLY if != inbound ID field AND validates via LP API
+ *   4. Graceful skip with GroupMe notification if no valid lds_id found
+ *
+ * On success: writes confirmed lds_id back to GHL field GmAVmW6V9sekD7pVONKr
+ * and stores prospect ID in GHL field ZRQAVrzhtzApzLlHmT87.
+ */
 async function executeSetLPAppointment(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
 
+  // ── Fetch event payload for date/time resolution ──
   let eventPayload = {};
   if (action.event_id) {
     const { data: evt } = await supabase.from('system_events').select('payload').eq('id', action.event_id).maybeSingle();
     if (evt?.payload) eventPayload = typeof evt.payload === 'string' ? JSON.parse(evt.payload) : evt.payload;
   }
 
-  let lpLeadId = payload.lp_lead_id || eventPayload.lp_lead_id || eventPayload.lpLeadId || null;
-  if (!lpLeadId && contactId) {
-    // v3.8: If target_id is already an LP Lead ID, use it directly
-    if (isLPLeadId(contactId)) {
-      lpLeadId = contactId;
-    } else {
-      const { data: lpLead } = await supabase.from('lp_leads').select('lp_lead_id').eq('ghl_contact_id', contactId).order('synced_at', { ascending: false }).limit(1).maybeSingle();
-      if (lpLead?.lp_lead_id) { lpLeadId = lpLead.lp_lead_id; }
-      else {
-        const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
-        const lpField = (ghlRes?.contact?.customFields || []).find(f => f.id === 'GmAVmW6V9sekD7pVONKr');
-        if (lpField?.value) lpLeadId = String(lpField.value);
+  // ── v4.0: Resolve LP Lead ID through safe chain ──
+  let lpLeadId = null;
+  let resolvedProspectId = null;
+  let resolutionSource = 'unknown';
+
+  if (isLPLeadId(contactId)) {
+    // Target is already an LP Lead ID (from LP disposition events)
+    lpLeadId = contactId;
+    resolutionSource = 'target_is_lp_lead_id';
+    console.log(`[LP-APPT] Target ${contactId} is LP Lead ID — using directly`);
+  } else {
+    // GHL Contact ID → resolve through safe chain
+    let ghlContact = null;
+    try {
+      const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
+      ghlContact = ghlRes?.contact || null;
+    } catch (err) {
+      console.warn(`[LP-APPT] GHL contact fetch failed for ${contactId}: ${err.message}`);
+    }
+
+    const phone = (ghlContact?.phone || '').replace(/\D/g, '').slice(-10);
+    const email = ghlContact?.email || '';
+    const resolution = await resolveLPLeadId(contactId, { phone, email });
+
+    if (!resolution) {
+      // ── Graceful skip: no valid LP lead found ──
+      const { name } = await resolveContactInfo(contactId, eventPayload);
+      const skipMsg = `⚠️ LP APPT SKIP: No valid LP Lead ID for ${name || contactId}. ` +
+        `Lead may still be in LP inbound queue, or has no LP record. ` +
+        `GHL Contact: ${contactId}. Manual appointment set required in LP.`;
+      await sendGroupMeMessage(skipMsg).catch(() => {});
+
+      if (ghlContact) {
+        await addGHLNote(contactId,
+          `[LP SYNC] Appointment NOT synced to LP — no valid Lead ID found.\n` +
+          `Possible causes: lead still in inbound queue, no LP match, or only in1_id available.\n` +
+          `Manual action: set appointment in LP directly.`
+        ).catch(() => {});
       }
+
+      console.warn(`[LP-APPT] ⚠️ SKIPPED: No valid lds_id for contact ${contactId}`);
+      return {
+        action: 'skipped_no_valid_lead_id',
+        contact_id: contactId,
+        reason: 'No valid LP Lead ID found through any resolution path',
+        resolution_attempted: ['supabase', 'lp_api_customers3', 'ghl_field'],
+      };
+    }
+
+    lpLeadId = resolution.ldsId;
+    resolvedProspectId = resolution.prospectId;
+    resolutionSource = resolution.source;
+
+    // ── v4.0: Write confirmed lds_id + prospect ID back to GHL ──
+    try {
+      const writebackFields = [
+        { id: 'GmAVmW6V9sekD7pVONKr', field_value: lpLeadId },
+      ];
+      if (resolvedProspectId) {
+        writebackFields.push({ id: 'ZRQAVrzhtzApzLlHmT87', field_value: resolvedProspectId });
+      }
+      await updateGHLContactFields(contactId, writebackFields);
+      console.log(`[LP-APPT] ✅ Wrote back confirmed lds_id=${lpLeadId}, prospect=${resolvedProspectId} to GHL`);
+    } catch (err) {
+      console.warn(`[LP-APPT] GHL writeback failed (non-blocking): ${err.message}`);
     }
   }
+
   if (!lpLeadId) throw new Error(`No LP Lead ID for contact ${contactId}`);
 
+  // ── Resolve appointment date/time (unchanged from v3.1) ──
   let rawDate = payload.appt_date || payload.appointment_date || eventPayload.appt_date || eventPayload.appointment_date || eventPayload.startDate || eventPayload.start_date || null;
   if (!rawDate && eventPayload.start_time && String(eventPayload.start_time).includes('T')) { rawDate = eventPayload.start_time; }
   if (!rawDate && contactId && !isLPLeadId(contactId)) {
-    const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
-    rawDate = ghlRes?.contact?.last_appointment_start_date || ghlRes?.contact?.lastAppointmentStartDate || null;
+    try {
+      const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
+      rawDate = ghlRes?.contact?.last_appointment_start_date || ghlRes?.contact?.lastAppointmentStartDate || null;
+    } catch {}
   }
   if (!rawDate) throw new Error('Cannot resolve appointment date');
 
@@ -757,8 +831,10 @@ async function executeSetLPAppointment(action) {
     rawTime = st.includes('T') ? st.split('T')[1]?.slice(0, 5) : st;
   }
   if (!rawTime && contactId && !isLPLeadId(contactId)) {
-    const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
-    rawTime = ghlRes?.contact?.last_appointment_start_time || ghlRes?.contact?.lastAppointmentStartTime || null;
+    try {
+      const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
+      rawTime = ghlRes?.contact?.last_appointment_start_time || ghlRes?.contact?.lastAppointmentStartTime || null;
+    } catch {}
   }
   if (!rawTime) throw new Error('Cannot resolve appointment time');
 
@@ -776,32 +852,46 @@ async function executeSetLPAppointment(action) {
   const setBy = payload.set_by || '5686';
   const calendarName = payload.calendar_name || eventPayload.calendar_name || eventPayload.title || 'N/A';
 
+  // ── Duplicate check (unchanged from v3.1) ──
   const ghlDateNormalized = normalizeDateForComparison(rawDate);
   try {
     const { data: existingLead } = await supabase.from('lp_leads').select('appointment_set, appointment_date').eq('lp_lead_id', lpLeadId).maybeSingle();
     if (existingLead?.appointment_set && existingLead.appointment_date) {
       const lpDateNormalized = normalizeDateForComparison(existingLead.appointment_date);
       if (ghlDateNormalized && lpDateNormalized && ghlDateNormalized === lpDateNormalized) {
-        console.log(`[ActionExecutor] ⏭️ LP already has appointment on ${lpDateNormalized} for lds_id=${lpLeadId}`);
+        console.log(`[LP-APPT] ⏭️ LP already has appointment on ${lpDateNormalized} for lds_id=${lpLeadId}`);
         if (!isLPLeadId(contactId)) {
           await addGHLNote(contactId, `[LP SYNC] Appointment already exists in LP — skipped\nLP Lead ID: ${lpLeadId}\nDate: ${lpDateNormalized}`).catch(() => {});
         }
-        return { action: 'already_set_in_lp', lp_lead_id: lpLeadId, lp_appointment_date: lpDateNormalized, ghl_appointment_date: ghlDateNormalized, calendar_name: calendarName, contact_id: contactId };
+        return { action: 'already_set_in_lp', lp_lead_id: lpLeadId, lp_appointment_date: lpDateNormalized, ghl_appointment_date: ghlDateNormalized, calendar_name: calendarName, contact_id: contactId, resolution_source: resolutionSource };
       }
     }
-  } catch (err) { console.warn(`[ActionExecutor] LP pre-check failed for ${lpLeadId}: ${err.message}`); }
+  } catch (err) { console.warn(`[LP-APPT] LP pre-check failed for ${lpLeadId}: ${err.message}`); }
 
-  console.log(`[ActionExecutor] LP Appointment: lds_id=${lpLeadId}, date=${apptDate}, time=${apptTime}`);
+  // ── Execute LP SetAppointment ──
+  console.log(`[LP-APPT] Setting appointment: lds_id=${lpLeadId}, date=${apptDate}, time=${apptTime}, resolved_via=${resolutionSource}`);
   const result = await lpSetAppointment({ ldsId: lpLeadId, setBy, apptDate, apptTime });
 
+  // ── Post-success: GHL note + GroupMe notification ──
   if (!isLPLeadId(contactId)) {
-    await addGHLNote(contactId, `[LP SYNC] Appointment set in LP\nLP Lead ID: ${lpLeadId}\nDate: ${apptDate}\nTime: ${apptTime}\nCalendar: ${calendarName}`).catch(() => {});
+    await addGHLNote(contactId, `[LP SYNC] Appointment set in LP (v4.0)\nLP Lead ID: ${lpLeadId} (confirmed via ${resolutionSource})\nProspect ID: ${resolvedProspectId || 'N/A'}\nDate: ${apptDate}\nTime: ${apptTime}\nCalendar: ${calendarName}`).catch(() => {});
   }
   const { name } = await resolveContactInfo(contactId, eventPayload);
-  await sendGroupMeMessage(`📅 LP Appointment Set\nContact: ${name || contactId}\nLP Lead: ${lpLeadId}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName}`).catch(() => {});
+  await sendGroupMeMessage(`📅 LP Appointment Set (v4.0)\nContact: ${name || contactId}\nLP Lead: ${lpLeadId} (${resolutionSource})\nProspect: ${resolvedProspectId || 'N/A'}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName}`).catch(() => {});
 
-  console.log(`[ActionExecutor] ✅ LP appointment set: lds_id=${lpLeadId}, ${apptDate} ${apptTime}`);
-  return { action: 'lp_appointment_set', lp_lead_id: lpLeadId, appt_date: apptDate, appt_time: apptTime, set_by: setBy, calendar_name: calendarName, lp_response: result, contact_id: contactId };
+  console.log(`[LP-APPT] ✅ LP appointment set: lds_id=${lpLeadId}, ${apptDate} ${apptTime}, resolved_via=${resolutionSource}`);
+  return {
+    action: 'lp_appointment_set',
+    lp_lead_id: lpLeadId,
+    lp_prospect_id: resolvedProspectId || null,
+    appt_date: apptDate,
+    appt_time: apptTime,
+    set_by: setBy,
+    calendar_name: calendarName,
+    resolution_source: resolutionSource,
+    lp_response: result,
+    contact_id: contactId,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════
