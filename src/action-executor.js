@@ -1152,6 +1152,47 @@ export async function executeActions({ limit = 50 } = {}) {
         const prospectId = await resolveLPProspectId(firstAction.target_id);
         const ctx = await getEventContext(firstAction);
         const enrichment = await buildNotificationEnrichment(firstAction.target_id, ctx, { lpLead, prospectId, ghlContactId });
+
+        // ── PRE-APPROVAL AI GENERATION for send_message actions ──
+        if (firstAction.action_type === 'send_message' && firstAction.action_payload?.requires_ai_generation) {
+          try {
+            const { generateResponse } = await import('./response-generator.js');
+            const triggerMessage = ctx.message_text || ctx.messageText || ctx.body || 'No trigger message';
+            const channel = firstAction.action_payload?.channel || 'sms';
+
+            console.log(`[ActionExecutor] Pre-generating AI response for approval ${batchId}`);
+            const generated = await generateResponse(firstAction.target_id, channel, triggerMessage);
+
+            // Store generated message in the action payload (IMMUTABLE after approval)
+            const updatedPayload = {
+              ...firstAction.action_payload,
+              message: generated.message,
+              subject: generated.subject,
+              story_arc: generated.story_arc,
+              ai_reasoning: generated.reasoning,
+              requires_ai_generation: false,  // Cleared — generation complete
+              pre_generated: true,            // Flag: message was AI-generated before approval
+              generated_at: new Date().toISOString(),  // Audit: when the response was created
+            };
+
+            await supabase.from('agent_actions')
+              .update({ action_payload: updatedPayload, updated_at: new Date().toISOString() })
+              .eq('id', firstAction.id);
+
+            // Add the generated message to enrichment so it shows in GroupMe
+            enrichment.generatedMessage = generated.message;
+            enrichment.storyArc = generated.story_arc;
+            enrichment.aiReasoning = generated.reasoning;
+
+            console.log(`[ActionExecutor] Pre-generated: "${generated.message.slice(0, 80)}..." (arc: ${generated.story_arc})`);
+          } catch (err) {
+            console.error(`[ActionExecutor] Pre-approval generation failed for ${batchId}: ${err.message}`);
+            // Still send approval without preview — Mark can reject if needed
+            enrichment.generatedMessage = null;
+            enrichment.aiGenerationError = err.message;
+          }
+        }
+
         await sendApprovalRequest(actions, name, phone, enrichment).catch(err => { console.error(`[ActionExecutor] Approval request failed for batch ${batchId}:`, err.message); });
       }
     }

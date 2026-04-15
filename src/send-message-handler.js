@@ -300,11 +300,19 @@ export async function executeSendMessage(action, context) {
   }
 
   // ── AI Response Generation ─────────────────────────────────────
+  // IMMUTABILITY RULE: If message exists in payload, send it. No regeneration.
+  // This ensures approved preview text === sent text.
   let generated = null;
 
-  if (!message || payload.requires_ai_generation) {
+  if (message) {
+    // Message already exists (pre-generated during approval, or manually provided)
+    // Use it directly — do not regenerate under any circumstance.
+    console.log(`[SendMessage] Using ${payload.pre_generated ? 'pre-generated' : 'provided'} message for ${contactId} (${message.length} chars)`);
+  } else if (payload.requires_ai_generation) {
+    // No message AND requires generation — this is the fallback path.
+    // Should only happen if pre-approval generation failed or was bypassed.
+    console.warn(`[SendMessage] Generating at send-time for ${contactId} — should have been pre-generated in approval flow`);
     const triggerMessage = context.message_text || context.messageText || context.body || 'No trigger message available';
-    console.log(`[SendMessage] Generating AI response for ${contactId} (channel: ${channel})`);
     try {
       generated = await generateResponse(contactId, channel, triggerMessage);
       message = generated.message;
