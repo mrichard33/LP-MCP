@@ -25,6 +25,8 @@ import { registerIntentScorerRoutes } from './intent-scorer.js';
 import { registerRestApiRoutes } from './rest-api.js';
 // ─── GroupMe Two-Way Integration ─────────────────────────────────
 import { registerGroupMeRoutes } from './groupme.js';
+// ─── LP Appointment Sync (GHL → LP) ────────────────────────────
+import { registerLPAppointmentSyncRoutes } from './lp-appointment-sync.js';
 // ─── Admin: Email Enrichment Backfill ────────────────────────────
 import { runEmailBackfill } from './admin/email-backfill.js';
 
@@ -286,6 +288,9 @@ registerRestApiRoutes(app, authenticate);
 
 // ─── GroupMe Two-Way Integration ─────────────────────────────────
 registerGroupMeRoutes(app);
+
+// ─── LP Appointment Sync (GHL → LP) ────────────────────────────
+registerLPAppointmentSyncRoutes(app);
 
 // ─── Admin: Email Enrichment Backfill ────────────────────────────
 app.post('/admin/email-backfill', async (req, res) => {
