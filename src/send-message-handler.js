@@ -28,6 +28,7 @@ import supabase from './supabase.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { applyGHLTag } from './ghl.js';
 import { acquireToken, report429 } from './ghl-rate-limiter.js';
+import { generateResponse } from './response-generator.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 const GHL_LOCATION_ID = 'SsBG7j5KQAIP1SFP2Sca';
@@ -224,12 +225,12 @@ export async function executeSendMessage(action, context) {
   if (!contactId) throw new Error('Missing contactId (target_id)');
 
   const payload = action.action_payload || {};
-  const message = payload.message || context.message || context.response_text;
+  let message = payload.message || context.message || context.response_text;
   const channel = (payload.channel || 'sms').toLowerCase();
-  const subject = payload.subject || null;
+  let subject = payload.subject || null;
   const fromName = payload.from_name || 'Reece Windows & Doors';
 
-  if (!message) throw new Error('Missing message text in payload');
+  if (!message && !payload.requires_ai_generation) throw new Error('Missing message text in payload');
   if (!['sms', 'email'].includes(channel)) {
     throw new Error(`Invalid channel "${channel}" — must be "sms" or "email"`);
   }
@@ -298,6 +299,31 @@ export async function executeSendMessage(action, context) {
     };
   }
 
+  // ── AI Response Generation ─────────────────────────────────────
+  let generated = null;
+
+  if (!message || payload.requires_ai_generation) {
+    const triggerMessage = context.message_text || context.messageText || context.body || 'No trigger message available';
+    console.log(`[SendMessage] Generating AI response for ${contactId} (channel: ${channel})`);
+    try {
+      generated = await generateResponse(contactId, channel, triggerMessage);
+      message = generated.message;
+      subject = generated.subject || subject;
+      console.log(`[SendMessage] AI generated: "${message.slice(0, 80)}..." (arc: ${generated.story_arc}, reason: ${generated.reasoning})`);
+    } catch (err) {
+      console.error(`[SendMessage] AI generation failed for ${contactId}: ${err.message}`);
+      return {
+        action: 'send_message_ai_generation_failed',
+        contact_id: contactId,
+        channel,
+        reason: 'ai_generation_failed',
+        error: err.message,
+      };
+    }
+  }
+
+  if (!message) throw new Error('No message text after AI generation');
+
   // ── Send message ───────────────────────────────────────────────
   // Primary: GHL Conversations API (in-thread reply)
   // Fallback: GHL incoming webhook (new thread)
@@ -349,14 +375,18 @@ export async function executeSendMessage(action, context) {
   const contactName = context.contact_name || payload.contact_name || contactId;
   const preview = message.length > 80 ? message.slice(0, 80) + '...' : message;
   const channelEmoji = channel === 'sms' ? '📱' : '📧';
+  const aiLabel = generated ? '🤖 AI-GENERATED ' : '';
+  const arcLine = generated?.story_arc ? `\nArc: ${generated.story_arc}` : '';
+  const reasonLine = generated?.reasoning ? ` | ${generated.reasoning}` : '';
 
   await sendGroupMeMessage(
-    `${channelEmoji} AGENTIC MESSAGE SENT\n` +
+    `${channelEmoji} ${aiLabel}AGENTIC MESSAGE SENT\n` +
     `👤 ${contactName}\n` +
-    `Channel: ${channel.toUpperCase()}\n` +
-    `Rule: ${action.rule_applied || 'manual'}\n` +
-    `Via: ${sendMethod}\n` +
-    `Message: "${preview}"`
+    `Channel: ${channel.toUpperCase()} | Via: ${sendMethod}\n` +
+    `Rule: ${action.rule_applied || 'manual'}` +
+    arcLine +
+    reasonLine +
+    `\nMessage: "${preview}"`
   ).catch(err => {
     console.warn(`[SendMessage] GroupMe notification failed: ${err.message}`);
   });
@@ -372,5 +402,8 @@ export async function executeSendMessage(action, context) {
     send_method: sendMethod,
     conversation_id: sendResult?.conversationId || null,
     message_id: sendResult?.messageId || null,
+    ai_generated: !!generated,
+    story_arc: generated?.story_arc || null,
+    ai_reasoning: generated?.reasoning || null,
   };
 }
