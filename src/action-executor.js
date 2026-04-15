@@ -4,7 +4,7 @@
  * Layer 2 of the agentic system. Reads pending actions from agent_actions
  * and executes them against GHL, LP, GroupMe, and other systems.
  * 
- * Supported action types (13):
+ * Supported action types (14):
  *   add_tag              → POST /contacts/{id}/tags (additive, never PUT)
  *   remove_tag           → DELETE /contacts/{id}/tags (single tag or batch array)
  *   move_opportunity     → Find opp by contact, PUT /opportunities/{oppId} with pipelineStageId
@@ -18,6 +18,7 @@
  *   update_custom_fields → PUT /contacts/{id} with customFields array
  *   update_contact_email → PUT /contacts/{id} with {email} — LP email enrichment (v9.0)
  *   calculate_time_lapse_tier → Read LP Last Contact, compute tier, apply time-lapse tag
+ *   send_message         → POST to GHL incoming webhook → GHL workflow sends SMS/email
  *
  * v3.9 — Enriched GroupMe notifications and approval requests.
  *   resolveContactInfo now returns { name, phone, ghlContactId, lpLead } where
@@ -55,6 +56,7 @@ import { resolveLPLeadId } from './lp-appointment-sync.js';
 import { sendGroupMeMessage, sendApprovalRequest } from './groupme.js';
 import { acquireToken, report429, registerRateLimiterRoutes } from './ghl-rate-limiter.js';
 import { formatPhone, formatDateTime } from './format-helpers.js';
+import { executeSendMessage } from './send-message-handler.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = 'SsBG7j5KQAIP1SFP2Sca';
@@ -1089,7 +1091,7 @@ async function executeCalculateTimeLapseTier(action) {
 // EXECUTOR ENGINE
 // ═══════════════════════════════════════════════════════════════════
 
-const CONTEXT_AWARE_HANDLERS = new Set(['send_notification', 'create_task', 'book_appointment', 'update_contact_email']);
+const CONTEXT_AWARE_HANDLERS = new Set(['send_notification', 'create_task', 'book_appointment', 'update_contact_email', 'send_message']);
 
 const ACTION_HANDLERS = {
   add_tag: executeAddTag,
@@ -1105,6 +1107,7 @@ const ACTION_HANDLERS = {
   update_custom_fields: executeUpdateCustomFields,
   update_contact_email: executeUpdateContactEmail,
   calculate_time_lapse_tier: executeCalculateTimeLapseTier,
+  send_message: executeSendMessage,
 };
 
 async function executeSingleAction(action, batchContext = {}) {
