@@ -1,14 +1,15 @@
 /**
  * LP Appointment Sync — src/lp-appointment-sync.js
  * 
- * v4.0: Direct webhook endpoint for GHL → LP appointment synchronization.
- * Called by GHL APPT Handler workflows via HTTP action step.
+ * v4.1: Direct webhook endpoint for GHL → LP appointment synchronization.
+ * Called by GHL APPT Handler workflows via standard webhook (form-encoded).
  * 
  * Contains the safe lds_id resolution chain that validates every candidate
  * through the LP API before use. NEVER blindly trusts GHL custom field
  * GmAVmW6V9sekD7pVONKr (may contain in1_id from addlead).
  * 
  * Resolution chain:
+ *   0. Prospect ID fast-path → GetLead by cst_id → find bookable lead (NEW in v4.1)
  *   1. Supabase lp_leads by ghl_contact_id → most recent bookable lead → validate via LP API
  *   2. LP API GetCustomers3 by phone/email → prospect → GetLead → find bookable lead
  *   3. GHL field GmAVmW6V9sekD7pVONKr ONLY if != field 3YMxheIlPyhACB8zyc3W (in1_id) AND validates
@@ -16,18 +17,15 @@
  * 
  * Endpoint: POST /webhook/ghl/set-lp-appointment
  * 
- * GHL Workflow HTTP Action config:
- *   URL:    https://lp-mcp-production.up.railway.app/webhook/ghl/set-lp-appointment
- *   Method: POST
- *   Body:   {
- *     "contact_id":       "{{contact.id}}",
- *     "contact_phone":    "{{contact.phone}}",
- *     "contact_email":    "{{contact.email}}",
- *     "contact_name":     "{{contact.name}}",
- *     "appointment_date": "{{appointment.start_date}}",
- *     "appointment_time": "{{appointment.start_time}}",
- *     "calendar_name":    "{{appointment.calendar_name}}"
- *   }
+ * GHL Workflow Standard Webhook config (form-encoded):
+ *   contactId:        {{contact.id}}
+ *   contact_name:     {{contact.name}}
+ *   contact_phone:    {{contact.phone}}
+ *   contact_email:    {{contact.email}}
+ *   appointment_date: {{appointment.only_start_date}}
+ *   appointment_time: {{appointment.only_start_time}}
+ *   calendar_name:    {{appointment.calendar_name}}
+ *   lp_prospect_id:   {{contact.lp_prospect_id}}
  */
 
 import supabase from './supabase.js';
@@ -42,6 +40,15 @@ import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken } from './ghl-rate-limiter.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
+
+/**
+ * Clean a value from GHL webhook body.
+ * GHL sends literal string "null" when a template variable doesn't resolve.
+ */
+function cleanGHLValue(val) {
+  if (val === 'null' || val === 'undefined' || val === '' || val == null) return null;
+  return String(val).trim();
+}
 
 // ─── GHL API helper (mirrors action-executor.js pattern) ─────────
 async function ghlFetch(method, path, body = null) {
@@ -69,7 +76,7 @@ async function ghlFetch(method, path, body = null) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// LP LEAD ID RESOLUTION CHAIN (v4.0)
+// LP LEAD ID RESOLUTION CHAIN (v4.1)
 // ═══════════════════════════════════════════════════════════════════
 
 const LP_LEAD_ID_FIELD    = 'GmAVmW6V9sekD7pVONKr';
@@ -82,14 +89,57 @@ const BOOKABLE_DISPOSITIONS = new Set([
 ]);
 
 /**
+ * Find the best bookable lead from an array of LP lead records.
+ * Returns { ldsId, prospectId, disp } or null.
+ */
+function findBookableLead(leadRecords, prospectId) {
+  let bestLead = null;
+  for (const lead of leadRecords) {
+    if (!lead) continue;
+    const ldsId = lead.LeadID || lead.leadid || lead.lds_id;
+    const disp = lead.Disposition || lead.disposition || lead.disp_code || '';
+    if (!ldsId) continue;
+    if (!bestLead) bestLead = { ldsId: String(ldsId), prospectId: String(prospectId), disp };
+    if (BOOKABLE_DISPOSITIONS.has(disp)) {
+      bestLead = { ldsId: String(ldsId), prospectId: String(prospectId), disp };
+      break;
+    }
+  }
+  return bestLead;
+}
+
+/**
  * Safely resolve a REAL LP Lead ID (lds_id) for a GHL contact.
  * Every candidate is validated via LP API getLeadByLdsId before acceptance.
  * 
+ * v4.1: Added Step 0 — prospect ID fast-path. When GHL sends lp_prospect_id,
+ * we skip Supabase and GetCustomers3 entirely and go straight to GetLead by cst_id.
+ * This is the fastest and most reliable path for contacts that have a known prospect.
+ * 
  * @param {string} ghlContactId — GHL Contact ID
- * @param {Object} contactInfo  — { phone, email } from GHL (avoids extra API call)
+ * @param {Object} contactInfo  — { phone, email, prospectId } from GHL
  * @returns {{ ldsId: string, prospectId: string, source: string } | null}
  */
 async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
+  const webhookProspectId = cleanGHLValue(contactInfo.prospectId);
+
+  // ── Step 0: Prospect ID fast-path (v4.1) ──────────────────────
+  // If GHL sent lp_prospect_id, go straight to LP API GetLead by cst_id.
+  // Skips Supabase cache and GetCustomers3 phone/email search entirely.
+  if (webhookProspectId && /^\d+$/.test(webhookProspectId)) {
+    try {
+      const leadsResult = await getLeads({ cst_id: webhookProspectId, PageSize: 20 });
+      const leadRecords = Array.isArray(leadsResult) ? leadsResult : [leadsResult];
+      const best = findBookableLead(leadRecords, webhookProspectId);
+      if (best) {
+        console.log(`[LP-RESOLVE] ✅ Prospect ID fast-path: lds_id=${best.ldsId}, prospect=${webhookProspectId}, disp=${best.disp}`);
+        return { ldsId: best.ldsId, prospectId: webhookProspectId, source: 'prospect_id_fastpath' };
+      }
+      console.warn(`[LP-RESOLVE] Prospect ${webhookProspectId} has no bookable leads — falling through`);
+    } catch (err) {
+      console.warn(`[LP-RESOLVE] Prospect ID fast-path failed for ${webhookProspectId}: ${err.message}`);
+    }
+  }
 
   // ── Step 1: Supabase lp_leads (sync engine stores REAL lds_id values) ──
   try {
@@ -99,7 +149,6 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
       .order('synced_at', { ascending: false });
 
     if (leads?.length) {
-      // Prefer the most recent lead in a bookable disposition
       const bookable = leads.find(l => BOOKABLE_DISPOSITIONS.has(l.disposition_code));
       const candidate = bookable || leads[0];
 
@@ -142,23 +191,10 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
         try {
           const leadsResult = await getLeads({ cst_id: prospectId, PageSize: 20 });
           const leadRecords = Array.isArray(leadsResult) ? leadsResult : [leadsResult];
-
-          let bestLead = null;
-          for (const lead of leadRecords) {
-            if (!lead) continue;
-            const ldsId = lead.LeadID || lead.leadid || lead.lds_id;
-            const disp = lead.Disposition || lead.disposition || lead.disp_code || '';
-            if (!ldsId) continue;
-            if (!bestLead) bestLead = { ldsId: String(ldsId), prospectId: String(prospectId), disp };
-            if (BOOKABLE_DISPOSITIONS.has(disp)) {
-              bestLead = { ldsId: String(ldsId), prospectId: String(prospectId), disp };
-              break;
-            }
-          }
-
-          if (bestLead) {
-            console.log(`[LP-RESOLVE] ✅ GetCustomers3: lds_id=${bestLead.ldsId}, prospect=${bestLead.prospectId}, disp=${bestLead.disp}`);
-            return { ldsId: bestLead.ldsId, prospectId: bestLead.prospectId, source: 'lp_api_customers3' };
+          const best = findBookableLead(leadRecords, prospectId);
+          if (best) {
+            console.log(`[LP-RESOLVE] ✅ GetCustomers3: lds_id=${best.ldsId}, prospect=${best.prospectId}, disp=${best.disp}`);
+            return { ldsId: best.ldsId, prospectId: best.prospectId, source: 'lp_api_customers3' };
           }
         } catch (err) {
           console.warn(`[LP-RESOLVE] GetLead for prospect ${prospectId} failed: ${err.message}`);
@@ -203,7 +239,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// DATE/TIME PARSING (shared with action-executor.js)
+// DATE/TIME PARSING
 // ═══════════════════════════════════════════════════════════════════
 
 const MONTH_MAP = {
@@ -233,34 +269,23 @@ function normalizeDateForComparison(dateStr) {
   return null;
 }
 
-/**
- * Parse appointment date into MM/DD/YYYY format for LP API.
- */
 function parseApptDate(raw) {
   if (!raw) return null;
   const s = String(raw).trim();
-  // ISO format: 2026-04-15 or 2026-04-15T10:00:00
   if (s.match(/^\d{4}-\d{2}-\d{2}/)) {
     const [y, m, d] = s.split('T')[0].split('-');
     return `${m}/${d}/${y}`;
   }
-  // Already MM/DD/YYYY
   if (s.match(/^\d{2}\/\d{2}\/\d{4}$/)) return s;
-  // Long format: April 15, 2026
   const longParsed = parseLongDate(s);
   if (longParsed) return longParsed;
-  return s; // Return as-is, LP will reject if invalid
+  return s;
 }
 
-/**
- * Parse appointment time into HH:MM 24-hour format for LP API.
- */
 function parseApptTime(raw) {
   if (!raw) return null;
   let t = String(raw).trim();
-  // Extract time from ISO datetime
   if (t.includes('T')) t = t.split('T')[1]?.slice(0, 5) || t;
-  // Convert 12-hour to 24-hour
   const match12 = t.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
   if (match12) {
     let h = parseInt(match12[1], 10);
@@ -270,7 +295,6 @@ function parseApptTime(raw) {
     if (p === 'PM' && h !== 12) h += 12;
     return `${String(h).padStart(2, '0')}:${min}`;
   }
-  // Already 24-hour — truncate to HH:MM
   if (t.length > 5) t = t.slice(0, 5);
   return t;
 }
@@ -283,36 +307,38 @@ function parseApptTime(raw) {
  * Sync a GHL appointment to LP.
  * 
  * @param {Object} params
- * @param {string} params.contactId      — GHL Contact ID
- * @param {string} params.contactPhone   — Contact phone
- * @param {string} params.contactEmail   — Contact email
- * @param {string} params.contactName    — Contact name
+ * @param {string} params.contactId       — GHL Contact ID
+ * @param {string} params.contactPhone    — Contact phone
+ * @param {string} params.contactEmail    — Contact email
+ * @param {string} params.contactName     — Contact name
+ * @param {string} params.prospectId      — LP Prospect ID (v4.1 fast-path)
  * @param {string} params.appointmentDate — Date (any parseable format)
  * @param {string} params.appointmentTime — Time (any parseable format)
- * @param {string} params.calendarName   — Calendar name for logging
+ * @param {string} params.calendarName    — Calendar name for logging
  * @returns {Object} result with action, lp_lead_id, etc.
  */
 async function syncAppointmentToLP({
   contactId, contactPhone, contactEmail, contactName,
+  prospectId: webhookProspectId,
   appointmentDate, appointmentTime, calendarName,
 }) {
   if (!contactId) throw new Error('contact_id is required');
 
-  // ── Resolve LP Lead ID (v4.0 safe chain) ──
+  // ── Resolve LP Lead ID (v4.1 safe chain with prospect fast-path) ──
   const resolution = await resolveLPLeadId(contactId, {
     phone: contactPhone,
     email: contactEmail,
+    prospectId: webhookProspectId,
   });
 
   if (!resolution) {
-    // Graceful skip
     const skipMsg = `⚠️ LP APPT SKIP: No valid LP Lead ID for ${contactName || contactId}. ` +
       `Lead may be in LP inbound queue or has no LP record. ` +
       `GHL: ${contactId}. Set appointment in LP manually.`;
     await sendGroupMeMessage(skipMsg).catch(() => {});
     await addGHLNote(contactId,
       `[LP SYNC] Appointment NOT synced — no valid Lead ID found.\n` +
-      `Tried: Supabase cache, LP API (phone/email), GHL field.\n` +
+      `Tried: prospect fast-path, Supabase cache, LP API (phone/email), GHL field.\n` +
       `Manual action: set appointment in LP directly.`
     ).catch(() => {});
 
@@ -376,11 +402,11 @@ async function syncAppointmentToLP({
 
   // ── Post-success logging ──
   await addGHLNote(contactId,
-    `[LP SYNC] Appointment set (v4.0)\nLP Lead: ${ldsId} (via ${source})\nProspect: ${prospectId || 'N/A'}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName || 'N/A'}`
+    `[LP SYNC] Appointment set (v4.1)\nLP Lead: ${ldsId} (via ${source})\nProspect: ${prospectId || 'N/A'}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName || 'N/A'}`
   ).catch(() => {});
 
   await sendGroupMeMessage(
-    `📅 LP Appointment Set (v4.0)\n` +
+    `📅 LP Appointment Set (v4.1)\n` +
     `👤 ${contactName || contactId}\n` +
     `📋 LP Lead: ${ldsId} (${source}) | Prospect: ${prospectId || 'N/A'}\n` +
     `📅 ${apptDate} ${apptTime} | ${calendarName || 'N/A'}`
@@ -410,27 +436,26 @@ export function registerLPAppointmentSyncRoutes(app) {
    * POST /webhook/ghl/set-lp-appointment
    * 
    * Direct webhook for GHL APPT Handler workflows.
-   * Fires immediately on appointment booking — no agentic delay.
+   * Accepts both JSON and form-encoded (standard webhook) payloads.
    * 
-   * Body: {
-   *   contact_id:       "GHL Contact ID" (REQUIRED)
-   *   contact_phone:    "Phone number"
-   *   contact_email:    "Email"
-   *   contact_name:     "Full name"
-   *   appointment_date: "Date in any format"  (REQUIRED)
-   *   appointment_time: "Time in any format"  (REQUIRED)
-   *   calendar_name:    "Calendar name"
-   * }
-   * 
-   * Returns: { success, action, lp_lead_id, ... }
+   * Fields:
+   *   contactId / contact_id:             GHL Contact ID (REQUIRED)
+   *   contact_phone / contactPhone:       Phone number
+   *   contact_email / contactEmail:       Email
+   *   contact_name / contactName:         Full name
+   *   lp_prospect_id / prospect_id:       LP Prospect ID (fast-path)
+   *   appointment_date / appointmentDate: Date (REQUIRED)
+   *   appointment_time / appointmentTime: Time (REQUIRED)
+   *   calendar_name / calendarName:       Calendar name
    */
   app.post('/webhook/ghl/set-lp-appointment', async (req, res) => {
     const startTime = Date.now();
     try {
       const body = req.body || {};
-      const contactId = body.contact_id || body.contactId;
-      const appointmentDate = body.appointment_date || body.appointmentDate || body.start_date || body.startDate;
-      const appointmentTime = body.appointment_time || body.appointmentTime || body.start_time || body.startTime;
+      const contactId = cleanGHLValue(body.contact_id || body.contactId);
+      const appointmentDate = cleanGHLValue(body.appointment_date || body.appointmentDate || body.start_date || body.startDate);
+      const appointmentTime = cleanGHLValue(body.appointment_time || body.appointmentTime || body.start_time || body.startTime);
+      const prospectId = cleanGHLValue(body.lp_prospect_id || body.prospect_id || body.prospectId);
 
       if (!contactId) {
         return res.status(400).json({ success: false, error: 'contact_id is required' });
@@ -439,16 +464,17 @@ export function registerLPAppointmentSyncRoutes(app) {
         return res.status(400).json({ success: false, error: 'appointment_date and appointment_time are required' });
       }
 
-      console.log(`[LP-APPT] Webhook received: contact=${contactId}, date=${appointmentDate}, time=${appointmentTime}`);
+      console.log(`[LP-APPT] Webhook received: contact=${contactId}, date=${appointmentDate}, time=${appointmentTime}, prospect=${prospectId || 'none'}`);
 
       const result = await syncAppointmentToLP({
         contactId,
-        contactPhone: body.contact_phone || body.contactPhone || body.phone || '',
-        contactEmail: body.contact_email || body.contactEmail || body.email || '',
-        contactName: body.contact_name || body.contactName || body.name || '',
+        contactPhone: cleanGHLValue(body.contact_phone || body.contactPhone || body.phone) || '',
+        contactEmail: cleanGHLValue(body.contact_email || body.contactEmail || body.email) || '',
+        contactName: cleanGHLValue(body.contact_name || body.contactName || body.name) || '',
+        prospectId,
         appointmentDate,
         appointmentTime,
-        calendarName: body.calendar_name || body.calendarName || body.title || '',
+        calendarName: cleanGHLValue(body.calendar_name || body.calendarName || body.title) || '',
       });
 
       result.elapsed_ms = Date.now() - startTime;
@@ -456,8 +482,7 @@ export function registerLPAppointmentSyncRoutes(app) {
 
     } catch (err) {
       console.error(`[LP-APPT] Webhook error: ${err.message}`);
-      // Notify on failure so it doesn't go unnoticed
-      await sendGroupMeMessage(`❌ LP APPT SYNC FAILED: ${err.message}\nContact: ${req.body?.contact_id || 'unknown'}`).catch(() => {});
+      await sendGroupMeMessage(`❌ LP APPT SYNC FAILED: ${err.message}\nContact: ${req.body?.contact_id || req.body?.contactId || 'unknown'}`).catch(() => {});
       res.status(500).json({
         success: false,
         error: err.message,
