@@ -27,8 +27,9 @@ import { registerRestApiRoutes } from './rest-api.js';
 import { registerGroupMeRoutes } from './groupme.js';
 // ─── LP Appointment Sync (GHL → LP) ────────────────────────────
 import { registerLPAppointmentSyncRoutes } from './lp-appointment-sync.js';
-// ─── Admin: Email Enrichment Backfill ────────────────────────────
+// ─── Admin ──────────────────────────────────────────────────────
 import { runEmailBackfill } from './admin/email-backfill.js';
+import { registerEmailCleanupRoutes } from './admin/email-cleanup.js';
 
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -151,6 +152,7 @@ app.get('/health', (req, res) => {
         'POST /webhook/ghl/engagement',
         'POST /webhook/ghl/lead-score',
         'POST /webhook/ghl/workflow',
+        'POST /webhook/ghl/set-lp-appointment',
       ],
     },
     intent_scoring: {
@@ -292,7 +294,7 @@ registerGroupMeRoutes(app);
 // ─── LP Appointment Sync (GHL → LP) ────────────────────────────
 registerLPAppointmentSyncRoutes(app);
 
-// ─── Admin: Email Enrichment Backfill ────────────────────────────
+// ─── Admin ──────────────────────────────────────────────────────
 app.post('/admin/email-backfill', async (req, res) => {
   try {
     const dryRun = req.query.dryRun !== 'false';
@@ -303,6 +305,7 @@ app.post('/admin/email-backfill', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+registerEmailCleanupRoutes(app);
 
 app.listen(PORT, async () => {
   console.log(`LP MCP Server v6.3.0 running on port ${PORT}`);
@@ -314,7 +317,8 @@ app.listen(PORT, async () => {
   console.log(`Intent:       POST /n8n/intent/score | /n8n/intent/sweep | GET /n8n/intent/breakdown`);
   console.log(`REST API:     GET /api/prospects/:id | /api/leads/:id | /api/search | /api/lead-summary/:contactId`);
   console.log(`GroupMe:      POST /webhook/groupme | POST /groupme/send | GET /groupme/pending`);
-  console.log(`Admin:        POST /admin/email-backfill?dryRun=true&limit=500`);
+  console.log(`LP Sync:      POST /webhook/ghl/set-lp-appointment`);
+  console.log(`Admin:        POST /admin/email-backfill | /admin/email-cleanup`);
   console.log(`MCP:          http://localhost:${PORT}/mcp`);
   console.log(`Health:       http://localhost:${PORT}/health`);
   await runMigrations();
