@@ -96,6 +96,7 @@ function formatActionSummary(actions) {
     else if (a.action_type === 'remove_from_workflow') parts.push('Remove from workflow');
     else if (a.action_type === 'create_task') parts.push(`Task: ${(a.action_payload?.title || '').slice(0, 60)}`);
     else if (a.action_type === 'send_notification') parts.push('Notify');
+    else if (a.action_type === 'send_message') parts.push(`send_message: ${(a.action_payload?.channel || 'SMS').toUpperCase()} reply`);
     else parts.push(a.action_type);
   }
   return parts.join(' | ');
@@ -165,6 +166,14 @@ export async function sendApprovalRequest(batchActions, contactName, contactPhon
 
   // What the actions will do
   lines.push(`🎯 ${actionSummary}`);
+
+  // Generated AI response preview — NEVER truncate. This is what Mark reads to approve.
+  if (enrichment.generatedMessage) {
+    lines.push(`📱 "${enrichment.generatedMessage}"`);
+  } else if (enrichment.aiGenerationError) {
+    lines.push(`⚠️ AI generation failed: ${enrichment.aiGenerationError.slice(0, 100)}`);
+  }
+
   lines.push('');
   lines.push(`Reply: Yes ${shortRef} or No ${shortRef}`);
 
