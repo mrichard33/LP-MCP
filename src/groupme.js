@@ -11,6 +11,12 @@
  *   - User replies "Yes 1234" or "No 1234" (where 1234 = batch ID prefix)
  *   - Webhook handler matches reply → approves/rejects batch → executes
  *
+ * v1.3 — Auto-execute after approval.
+ *   After an approval updates actions to 'pending', immediately triggers
+ *   the action executor via internal HTTP call. Eliminates the delay between
+ *   approving in GroupMe and the message actually being sent. Fire-and-forget
+ *   with the heartbeat as safety net.
+ *
  * v1.2 — Enriched approval requests with full decision context.
  *   sendApprovalRequest now accepts eventContext and lpLeadData params.
  *   Approval messages include: contact name+phone, last message text,
@@ -23,15 +29,13 @@
  *   POST /webhook/groupme — Callback URL for GroupMe bot
  *   POST /groupme/send    — Manual send (for testing)
  *   GET  /groupme/pending  — View pending approval requests
- *
- * v1.1 — Fix: rejection sets status='rejected' (was 'cancelled' which
- *   violated the agent_actions check constraint).
  */
 
 import supabase from './supabase.js';
 
 const GROUPME_BOT_ID = process.env.GROUPME_BOT_ID || '';
 const GROUPME_GROUP_ID = process.env.GROUPME_GROUP_ID || '';
+const SELF_BASE_URL = `http://localhost:${process.env.PORT || 8080}`;
 
 // ═══════════════════════════════════════════════════════════════════
 // OUTBOUND: Send messages to GroupMe
@@ -58,6 +62,33 @@ export async function sendGroupMeMessage(text) {
   } catch (err) {
     console.error('[GroupMe] Send failed:', err.message);
     return { sent: false, reason: err.message };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// v1.3: AUTO-EXECUTE AFTER APPROVAL
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Fire-and-forget: trigger the action executor immediately after an approval.
+ * Eliminates the wait for the next heartbeat cycle.
+ */
+async function triggerExecution() {
+  try {
+    const res = await fetch(`${SELF_BASE_URL}/n8n/decision-engine/execute`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ limit: 10 }),
+      signal: AbortSignal.timeout(60000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      console.log(`[GroupMe] Auto-execute after approval: ${data.actions_executed || 0} executed, ${data.completed || 0} completed (${data.elapsed_ms || 0}ms)`);
+    } else {
+      console.warn(`[GroupMe] Auto-execute failed: HTTP ${res.status}`);
+    }
+  } catch (err) {
+    console.warn(`[GroupMe] Auto-execute error: ${err.message}`);
   }
 }
 
@@ -104,21 +135,6 @@ function formatActionSummary(actions) {
 
 /**
  * v1.2: Enriched approval request with full decision context.
- * 
- * @param {Array} batchActions — Actions in this batch
- * @param {string} contactName — Resolved contact name
- * @param {string} contactPhone — Resolved phone
- * @param {Object} enrichment — Additional context for the approval message
- * @param {string} enrichment.messageText — Last inbound message that triggered the rule
- * @param {string} enrichment.messageType — SMS / Email / Live Chat
- * @param {string} enrichment.lpSource — LP lead source
- * @param {string} enrichment.repName — Assigned rep
- * @param {string} enrichment.disposition — Current LP disposition
- * @param {string} enrichment.prospectId — LP Prospect ID
- * @param {number} enrichment.score — Intent score
- * @param {string} enrichment.tier — Intent tier
- * @param {string} enrichment.briefing — AI-generated rep briefing
- * @param {string} enrichment.aiSummary — AI conversation summary
  */
 export async function sendApprovalRequest(batchActions, contactName, contactPhone, enrichment = {}) {
   if (!batchActions?.length) return;
@@ -268,6 +284,12 @@ async function handleGroupMeCallback(payload) {
     await sendGroupMeMessage(`✅ Approved #${shortRef} (${request.rule_applied}). ${actionIds.length} actions queued for execution.`);
 
     console.log(`[GroupMe] ✅ Batch approved: #${shortRef} — ${actionIds.length} actions by ${senderName}`);
+
+    // v1.3: Immediately trigger execution — don't wait for heartbeat
+    triggerExecution().catch(err => {
+      console.warn(`[GroupMe] Auto-execute failed after approval: ${err.message}`);
+    });
+
     return { handled: true, action: 'approved', shortRef, actionCount: actionIds.length };
 
   } else {
