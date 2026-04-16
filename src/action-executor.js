@@ -4,10 +4,11 @@
  * Layer 2 of the agentic system. Reads pending actions from agent_actions
  * and executes them against GHL, LP, GroupMe, and other systems.
  * 
- * Supported action types (14):
+ * Supported action types (15):
  *   add_tag              → POST /contacts/{id}/tags (additive, never PUT)
  *   remove_tag           → DELETE /contacts/{id}/tags (single tag or batch array)
  *   move_opportunity     → Find opp by contact, PUT /opportunities/{oppId} with pipelineStageId
+ *   update_opportunity   → PUT /opportunities/{oppId} with monetaryValue, source, lostReasonId (v4.1)
  *   remove_from_workflow → Remove contact from GHL workflow or add to "Remove All" workflow
  *   add_to_workflow      → POST /contacts/{id}/workflow/{wfId} — enroll contact in GHL workflow
  *   book_appointment     → POST /calendars/events/appointments — book GHL calendar appointment
@@ -19,6 +20,10 @@
  *   update_contact_email → PUT /contacts/{id} with {email} — LP email enrichment (v9.0)
  *   calculate_time_lapse_tier → Read LP Last Contact, compute tier, apply time-lapse tag
  *   send_message         → POST to GHL incoming webhook → GHL workflow sends SMS/email
+ *
+ * v4.1 — update_opportunity: PUT /opportunities/{oppId} for monetaryValue, source,
+ *   lostReasonId. Also supports updating contact source via PUT /contacts/{id}.
+ *   Used for P2 value/source enrichment backfill and ongoing loss intelligence.
  *
  * v3.9 — Enriched GroupMe notifications and approval requests.
  *   resolveContactInfo now returns { name, phone, ghlContactId, lpLead } where
@@ -33,12 +38,6 @@
  *   only the first action's triggering event.
  *
  * v3.8 — LP Lead ID detection in resolvers.
- *   resolveContactInfo and resolveLPProspectId now detect when target_id
- *   is an LP Lead ID (numeric) vs GHL Contact ID (alphanumeric).
- *   LP disposition events use lp_lead_id as entity_id for unmatched contacts.
- *   Without this fix, OPPFDN/1Leg/BO notifications showed "Not in LP"
- *   for contacts that ARE in LP but have no GHL match.
- *
  * v3.7 — Event payload fallback for contact name resolution.
  * v3.6 — Direct LP API lookup for Prospect ID.
  * v3.5 — Guaranteed contact name fallback (GHL → Supabase → contact ID).
@@ -66,12 +65,6 @@ const GHL_LOCATION_ID = 'SsBG7j5KQAIP1SFP2Sca';
 // ID TYPE DETECTION
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * v3.8: Detect if a target_id is an LP Lead ID (numeric) vs GHL Contact ID.
- * LP disposition events use lp_lead_id as entity_id for contacts with no GHL match.
- * GHL Contact IDs are alphanumeric strings (e.g., "ocjV8XY2Bz3Ov5tD8dbc").
- * LP Lead IDs are purely numeric strings (e.g., "521532").
- */
 function isLPLeadId(id) {
   return id && /^\d+$/.test(String(id));
 }
@@ -192,36 +185,15 @@ function interpolatePayload(payload, context) {
 // CONTACT + LP PROSPECT RESOLVER — with guaranteed fallback chain
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * v3.8: Resolve contact name with guaranteed fallback chain.
- * Now detects LP Lead IDs (numeric) and queries by lp_lead_id.
- * Never returns null for name — always provides SOMETHING.
- * 
- * Fallback chain for GHL Contact IDs (alphanumeric):
- *   1. GHL API → firstName + lastName
- *   2. Supabase lp_leads by ghl_contact_id → first_name + last_name
- *   3. Event payload → contactName / contact_name / lead_name
- *   4. Contact ID as last resort
- * 
- * Fallback chain for LP Lead IDs (numeric):
- *   1. Supabase lp_leads by lp_lead_id → first_name + last_name
- *   2. LP API via getLeadByLdsId → name fields
- *   3. Event payload → contactName / contact_name / lead_name
- *   4. "LP Lead [id]" as last resort
- */
 async function resolveContactInfo(contactId, eventContext = {}) {
   if (!contactId) return { name: 'Unknown', phone: null, ghlContactId: null, lpLead: null };
 
-  // v3.9: Columns used both for name resolution and downstream enrichment building.
   const LP_LEAD_COLUMNS = 'lp_lead_id, lp_prospect_id, ghl_contact_id, first_name, last_name, phone, ' +
     'lead_source, lead_source_detail, disposition_code, disposition_label, rep_name, ' +
     'appointment_set, appointment_date, demo_completed';
 
-  // v3.8: If target_id is an LP Lead ID, query lp_leads by lp_lead_id
   if (isLPLeadId(contactId)) {
     let lpLeadRow = null;
-
-    // Attempt 1: Supabase lp_leads by lp_lead_id
     try {
       const { data: lpLead } = await supabase.from('lp_leads')
         .select(LP_LEAD_COLUMNS)
@@ -230,53 +202,23 @@ async function resolveContactInfo(contactId, eventContext = {}) {
       if (lpLead) {
         lpLeadRow = lpLead;
         const name = [lpLead.first_name, lpLead.last_name].filter(Boolean).join(' ') || null;
-        if (name) return {
-          name,
-          phone: lpLead.phone || null,
-          ghlContactId: lpLead.ghl_contact_id || null,
-          lpLead: lpLeadRow,
-        };
+        if (name) return { name, phone: lpLead.phone || null, ghlContactId: lpLead.ghl_contact_id || null, lpLead: lpLeadRow };
       }
     } catch {}
-
-    // Attempt 2: LP API direct lookup
     try {
       const result = await getLeadByLdsId(contactId);
       const prospects = Array.isArray(result) ? result : [result];
       for (const p of prospects) {
         if (!p) continue;
         const name = [p.FirstName || p.firstname, p.LastName || p.lastname].filter(Boolean).join(' ') || null;
-        if (name) return {
-          name,
-          phone: p.Phone || p.phone || null,
-          ghlContactId: lpLeadRow?.ghl_contact_id || null,
-          lpLead: lpLeadRow,
-        };
+        if (name) return { name, phone: p.Phone || p.phone || null, ghlContactId: lpLeadRow?.ghl_contact_id || null, lpLead: lpLeadRow };
       }
     } catch {}
-
-    // Attempt 3: Event payload
-    const payloadName = eventContext.contactName || eventContext.contact_name
-      || eventContext.lead_name || eventContext.leadName || null;
-    if (payloadName) return {
-      name: payloadName,
-      phone: null,
-      ghlContactId: lpLeadRow?.ghl_contact_id || null,
-      lpLead: lpLeadRow,
-    };
-
-    return {
-      name: `LP Lead ${contactId}`,
-      phone: null,
-      ghlContactId: lpLeadRow?.ghl_contact_id || null,
-      lpLead: lpLeadRow,
-    };
+    const payloadName = eventContext.contactName || eventContext.contact_name || eventContext.lead_name || eventContext.leadName || null;
+    if (payloadName) return { name: payloadName, phone: null, ghlContactId: lpLeadRow?.ghl_contact_id || null, lpLead: lpLeadRow };
+    return { name: `LP Lead ${contactId}`, phone: null, ghlContactId: lpLeadRow?.ghl_contact_id || null, lpLead: lpLeadRow };
   }
 
-  // Standard path: GHL Contact ID (alphanumeric)
-
-  // v3.9: Query Supabase once up front so we have the lpLead row for enrichment
-  // regardless of which name-resolution attempt succeeds.
   let lpLeadRow = null;
   try {
     const { data: lpLead } = await supabase.from('lp_leads')
@@ -285,50 +227,29 @@ async function resolveContactInfo(contactId, eventContext = {}) {
       .order('synced_at', { ascending: false })
       .limit(1).maybeSingle();
     if (lpLead) lpLeadRow = lpLead;
-  } catch {
-    // Supabase failed — fall through
-  }
+  } catch {}
 
-  // Attempt 1: GHL API (rate-limited)
   try {
     const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
     const c = ghlRes?.contact || {};
     const name = [c.firstName, c.lastName].filter(Boolean).join(' ') || c.name || null;
     const phone = c.phone || null;
     if (name) return { name, phone, ghlContactId: contactId, lpLead: lpLeadRow };
-  } catch {
-    // GHL failed (429 or other) — fall through to Supabase
-  }
+  } catch {}
 
-  // Attempt 2: Supabase lp_leads (already fetched above)
   if (lpLeadRow) {
     const name = [lpLeadRow.first_name, lpLeadRow.last_name].filter(Boolean).join(' ') || null;
-    if (name) return {
-      name,
-      phone: lpLeadRow.phone || null,
-      ghlContactId: contactId,
-      lpLead: lpLeadRow,
-    };
+    if (name) return { name, phone: lpLeadRow.phone || null, ghlContactId: contactId, lpLead: lpLeadRow };
   }
 
-  // Attempt 3: Event payload (webhook data from APPT Handler or LP sync)
-  const payloadName = eventContext.contactName || eventContext.contact_name
-    || eventContext.lead_name || eventContext.leadName || null;
+  const payloadName = eventContext.contactName || eventContext.contact_name || eventContext.lead_name || eventContext.leadName || null;
   if (payloadName && payloadName !== contactId) {
     return { name: payloadName, phone: null, ghlContactId: contactId, lpLead: lpLeadRow };
   }
 
-  // Last resort: contact ID
   return { name: contactId, phone: null, ghlContactId: contactId, lpLead: lpLeadRow };
 }
 
-/**
- * v3.8: Resolve LP Prospect ID — LP API is source of truth.
- * Now detects LP Lead IDs (numeric) and queries directly.
- * 
- * For GHL Contact IDs: ghl_contact_id → lp_lead_id → LP API → prospect ID
- * For LP Lead IDs: lp_lead_id → LP API → prospect ID (skips GHL lookup)
- */
 async function resolveLPProspectId(contactId) {
   if (!contactId) return 'Not in LP';
 
@@ -336,7 +257,6 @@ async function resolveLPProspectId(contactId) {
   let cachedProspectId = null;
 
   if (isLPLeadId(contactId)) {
-    // v3.8: target_id IS the LP Lead ID — query directly
     lpLeadId = contactId;
     try {
       const { data: lpLead } = await supabase.from('lp_leads')
@@ -346,7 +266,6 @@ async function resolveLPProspectId(contactId) {
       cachedProspectId = lpLead?.lp_prospect_id ? String(lpLead.lp_prospect_id) : null;
     } catch {}
   } else {
-    // Standard: GHL Contact ID → look up LP Lead ID
     try {
       const { data: lpLead } = await supabase.from('lp_leads')
         .select('lp_lead_id, lp_prospect_id')
@@ -360,7 +279,6 @@ async function resolveLPProspectId(contactId) {
 
   if (!lpLeadId) return 'Not in LP';
 
-  // LP API direct lookup for most current prospect data
   try {
     const result = await getLeadByLdsId(lpLeadId);
     const prospects = Array.isArray(result) ? result : [result];
@@ -389,16 +307,6 @@ async function resolveLPProspectId(contactId) {
 // v3.9: NOTIFICATION ENRICHMENT BUILDER
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * v3.9: Build the enrichment object consumed by sendApprovalRequest (v1.2)
- * and buildRichNotification. Populates decision context so approvers can
- * act from GroupMe alone without switching to GHL/LP.
- *
- * Sources (in precedence order, first non-null wins for each key):
- *   1. Event payload (context) — freshest; already contains message_text etc.
- *   2. lp_leads row (passed in, no extra query)
- *   3. lead_intelligence row (single query by ghl_contact_id)
- */
 async function buildNotificationEnrichment(contactId, context = {}, { lpLead = null, prospectId = null, ghlContactId = null } = {}) {
   const enrichment = {
     messageText: context.message_text || context.messageText || context.body || null,
@@ -417,7 +325,6 @@ async function buildNotificationEnrichment(contactId, context = {}, { lpLead = n
     calendarName: context.calendar_name || null,
   };
 
-  // Layer 2: lp_leads row (no extra query)
   if (lpLead) {
     if (!enrichment.lpSource) enrichment.lpSource = lpLead.lead_source_detail || lpLead.lead_source || null;
     if (!enrichment.repName) enrichment.repName = lpLead.rep_name || null;
@@ -425,7 +332,6 @@ async function buildNotificationEnrichment(contactId, context = {}, { lpLead = n
     if (!enrichment.appointmentDate) enrichment.appointmentDate = lpLead.appointment_date || null;
   }
 
-  // Layer 3: lead_intelligence — single query by ghl_contact_id
   const intelKey = ghlContactId || (lpLead?.ghl_contact_id) || (isLPLeadId(contactId) ? null : contactId);
   if (intelKey) {
     try {
@@ -441,44 +347,32 @@ async function buildNotificationEnrichment(contactId, context = {}, { lpLead = n
         if (!enrichment.aiSummary) enrichment.aiSummary = intel.ai_reasoning || null;
         if (!enrichment.objection) enrichment.objection = intel.objection_type || null;
       }
-    } catch {
-      // Silent — enrichment is best-effort. groupme.js formatter handles missing keys.
-    }
+    } catch {}
   }
 
   return enrichment;
 }
 
-/**
- * v3.9: Format a rich GroupMe notification message using structured data.
- * Always renders from structured fields — ignores inline `Name:` blocks in
- * legacy action_payload templates.
- */
 function buildRichNotification({ baseMessage, name, phone, contactId, prospectId, enrichment = {} }) {
   const lines = [];
   lines.push(`🤖 ${baseMessage}`);
-
   const displayPhone = formatPhone(phone);
   const nameLine = `👤 ${name || 'Unknown'}${displayPhone ? ` ${displayPhone}` : ''}`;
   lines.push(nameLine);
-
   const idLabel = isLPLeadId(contactId) ? 'LP Lead ID' : 'Contact ID';
   const idParts = [`${idLabel}: ${contactId}`];
   if (prospectId && prospectId !== 'Not in LP') idParts.push(`Prospect: ${prospectId}`);
   lines.push(`   ${idParts.join(' | ')}`);
-
   if (enrichment.messageText) {
     const msg = String(enrichment.messageText).slice(0, 120);
     const suffix = enrichment.messageType ? ` [${enrichment.messageType}]` : '';
     lines.push(`💬 "${msg}"${suffix}`);
   }
-
   const lpParts = [];
   if (enrichment.lpSource) lpParts.push(`Src: ${enrichment.lpSource}`);
   if (enrichment.repName) lpParts.push(`Rep: ${enrichment.repName}`);
   if (enrichment.disposition) lpParts.push(`Disp: ${enrichment.disposition}`);
   if (lpParts.length) lines.push(`📋 ${lpParts.join(' | ')}`);
-
   if (enrichment.score || enrichment.tier || enrichment.barrier) {
     const intentParts = [];
     if (enrichment.score) intentParts.push(`Score: ${enrichment.score}`);
@@ -486,13 +380,11 @@ function buildRichNotification({ baseMessage, name, phone, contactId, prospectId
     if (enrichment.barrier) intentParts.push(`Barrier: ${enrichment.barrier}`);
     lines.push(`📊 ${intentParts.join(' | ')}`);
   }
-
   if (enrichment.appointmentDate) {
     const prefix = enrichment.calendarName ? `${enrichment.calendarName}: ` : '';
     const displayDate = formatDateTime(enrichment.appointmentDate) || enrichment.appointmentDate;
     lines.push(`📅 ${prefix}${displayDate}`);
   }
-
   return lines.join('\n');
 }
 
@@ -549,6 +441,94 @@ if (opps.length > 0) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// v4.1: UPDATE OPPORTUNITY — monetaryValue, source, lostReasonId
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * v4.1: Update opportunity details that move_opportunity doesn't handle.
+ * Supports: monetaryValue, source, lostReasonId, status, name.
+ * 
+ * Payload options:
+ *   opportunity_id  — direct opp ID (fastest, skips search)
+ *   pipeline        — "P1"/"P2"/"P3" (used with contactId to find opp)
+ *   monetaryValue   — numeric sale amount
+ *   source          — opportunity source string
+ *   lostReasonId    — GHL native lost reason ID
+ *   status          — open/won/lost/abandoned
+ *   contact_source  — if provided, also updates the GHL contact's source field
+ *   contact_custom_fields — [{id, field_value}] to update on the contact
+ */
+async function executeUpdateOpportunity(action) {
+  const contactId = action.target_id;
+  const payload = action.action_payload || {};
+  
+  let oppId = payload.opportunity_id;
+  
+  // If no direct opp ID, search by contact + pipeline
+  if (!oppId) {
+    const pipeline = payload.pipeline;
+    if (!contactId || !pipeline) throw new Error('Missing opportunity_id or contactId+pipeline');
+    const pipelineId = PIPELINE_IDS[pipeline];
+    if (!pipelineId) throw new Error(`Unknown pipeline: ${pipeline}`);
+    
+    const searchRes = await ghlFetch('GET', `/opportunities/search?location_id=${GHL_LOCATION_ID}&contact_id=${contactId}&pipeline_id=${pipelineId}`);
+    const opps = searchRes?.opportunities || [];
+    if (opps.length === 0) throw new Error(`No ${pipeline} opportunity found for contact ${contactId}`);
+    oppId = opps[0].id;
+  }
+  
+  // Build the update body — only include fields that are provided
+  const updateBody = {};
+  if (payload.monetaryValue !== undefined && payload.monetaryValue !== null) {
+    updateBody.monetaryValue = Number(payload.monetaryValue);
+  }
+  if (payload.source) {
+    updateBody.source = payload.source;
+  }
+  if (payload.lostReasonId) {
+    updateBody.lostReasonId = payload.lostReasonId;
+  }
+  if (payload.status) {
+    updateBody.status = payload.status;
+  }
+  if (payload.name) {
+    updateBody.name = payload.name;
+  }
+  
+  if (Object.keys(updateBody).length === 0 && !payload.contact_source && !payload.contact_custom_fields) {
+    return { action: 'skipped_no_fields', opportunity_id: oppId, contact_id: contactId };
+  }
+  
+  // Update the opportunity
+  let oppResult = null;
+  if (Object.keys(updateBody).length > 0) {
+    oppResult = await ghlFetch('PUT', `/opportunities/${oppId}`, updateBody);
+    console.log(`[ActionExecutor] ✅ update_opportunity: opp ${oppId} updated — ${Object.keys(updateBody).join(', ')}`);
+  }
+  
+  // Optionally update contact source (core field, not custom field)
+  if (payload.contact_source && contactId && !isLPLeadId(contactId)) {
+    await ghlFetch('PUT', `/contacts/${contactId}`, { source: payload.contact_source });
+    console.log(`[ActionExecutor] ✅ update_opportunity: contact ${contactId} source → "${payload.contact_source}"`);
+  }
+  
+  // Optionally update contact custom fields (e.g., LP Gross Sale Amount)
+  if (payload.contact_custom_fields && Array.isArray(payload.contact_custom_fields) && contactId && !isLPLeadId(contactId)) {
+    await updateGHLContactFields(contactId, payload.contact_custom_fields);
+    console.log(`[ActionExecutor] ✅ update_opportunity: contact ${contactId} custom fields updated — ${payload.contact_custom_fields.length} fields`);
+  }
+  
+  return {
+    action: 'opportunity_updated',
+    opportunity_id: oppId,
+    contact_id: contactId,
+    fields_updated: Object.keys(updateBody),
+    contact_source_updated: !!payload.contact_source,
+    contact_custom_fields_updated: payload.contact_custom_fields?.length || 0,
+  };
+}
+
 async function executeRemoveFromWorkflow(action) {
   const contactId = action.target_id;
   if (action.action_payload?.remove_all) {
@@ -567,7 +547,6 @@ async function executeCreateTask(action, context) {
   const title = payload?.title || 'Agent task';
   const description = payload?.description || '';
   const noteText = description ? `[AGENT TASK] ${title}\n${description}` : `[AGENT TASK] ${title}`;
-  // Only add GHL note if target is a GHL contact ID (not LP Lead ID)
   if (!isLPLeadId(contactId)) {
     await addGHLNote(contactId, noteText);
   }
@@ -577,11 +556,6 @@ async function executeCreateTask(action, context) {
   return { action: 'note_added', contact_id: contactId, title };
 }
 
-/**
- * v3.9: Rich send_notification — builds enrichment and renders via
- * buildRichNotification so the executed message matches the approval preview.
- * v3.8: LP Lead ID awareness — detects LP Lead IDs and resolves name/prospect from LP directly.
- */
 async function executeSendNotification(action, context) {
   const contactId = action.target_id;
   const { name, phone, lpLead, ghlContactId } = await resolveContactInfo(contactId, context);
@@ -722,45 +696,25 @@ function normalizeDateForComparison(dateStr) {
   return null;
 }
 
-/**
- * v4.0: Set appointment in LP with safe Lead ID resolution.
- *
- * Key change from v3.x: NEVER blindly uses GHL custom field GmAVmW6V9sekD7pVONKr.
- * Instead uses resolveLPLeadId() (imported from lp-appointment-sync.js) which
- * validates every candidate through LP API.
- *
- * Resolution chain:
- *   1. Supabase lp_leads (sync engine stores real lds_id) → validate via LP API
- *   2. GetCustomers3 phone/email → prospect → GetLead → find bookable lead
- *   3. GHL field ONLY if != inbound ID field AND validates via LP API
- *   4. Graceful skip with GroupMe notification if no valid lds_id found
- *
- * On success: writes confirmed lds_id back to GHL field GmAVmW6V9sekD7pVONKr
- * and stores prospect ID in GHL field ZRQAVrzhtzApzLlHmT87.
- */
 async function executeSetLPAppointment(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
 
-  // ── Fetch event payload for date/time resolution ──
   let eventPayload = {};
   if (action.event_id) {
     const { data: evt } = await supabase.from('system_events').select('payload').eq('id', action.event_id).maybeSingle();
     if (evt?.payload) eventPayload = typeof evt.payload === 'string' ? JSON.parse(evt.payload) : evt.payload;
   }
 
-  // ── v4.0: Resolve LP Lead ID through safe chain ──
   let lpLeadId = null;
   let resolvedProspectId = null;
   let resolutionSource = 'unknown';
 
   if (isLPLeadId(contactId)) {
-    // Target is already an LP Lead ID (from LP disposition events)
     lpLeadId = contactId;
     resolutionSource = 'target_is_lp_lead_id';
     console.log(`[LP-APPT] Target ${contactId} is LP Lead ID — using directly`);
   } else {
-    // GHL Contact ID → resolve through safe chain
     let ghlContact = null;
     try {
       const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
@@ -774,7 +728,6 @@ async function executeSetLPAppointment(action) {
     const resolution = await resolveLPLeadId(contactId, { phone, email });
 
     if (!resolution) {
-      // ── Graceful skip: no valid LP lead found ──
       const { name } = await resolveContactInfo(contactId, eventPayload);
       const skipMsg = `⚠️ LP APPT SKIP: No valid LP Lead ID for ${name || contactId}. ` +
         `Lead may still be in LP inbound queue, or has no LP record. ` +
@@ -802,7 +755,6 @@ async function executeSetLPAppointment(action) {
     resolvedProspectId = resolution.prospectId;
     resolutionSource = resolution.source;
 
-    // ── v4.0: Write confirmed lds_id + prospect ID back to GHL ──
     try {
       const writebackFields = [
         { id: 'GmAVmW6V9sekD7pVONKr', field_value: lpLeadId },
@@ -819,7 +771,6 @@ async function executeSetLPAppointment(action) {
 
   if (!lpLeadId) throw new Error(`No LP Lead ID for contact ${contactId}`);
 
-  // ── Resolve appointment date/time (unchanged from v3.1) ──
   let rawDate = payload.appt_date || payload.appointment_date || eventPayload.appt_date || eventPayload.appointment_date || eventPayload.startDate || eventPayload.start_date || null;
   if (!rawDate && eventPayload.start_time && String(eventPayload.start_time).includes('T')) { rawDate = eventPayload.start_time; }
   if (!rawDate && contactId && !isLPLeadId(contactId)) {
@@ -861,7 +812,6 @@ async function executeSetLPAppointment(action) {
   const setBy = payload.set_by || '5686';
   const calendarName = payload.calendar_name || eventPayload.calendar_name || eventPayload.title || 'N/A';
 
-  // ── Duplicate check (unchanged from v3.1) ──
   const ghlDateNormalized = normalizeDateForComparison(rawDate);
   try {
     const { data: existingLead } = await supabase.from('lp_leads').select('appointment_set, appointment_date').eq('lp_lead_id', lpLeadId).maybeSingle();
@@ -877,11 +827,9 @@ async function executeSetLPAppointment(action) {
     }
   } catch (err) { console.warn(`[LP-APPT] LP pre-check failed for ${lpLeadId}: ${err.message}`); }
 
-  // ── Execute LP SetAppointment ──
   console.log(`[LP-APPT] Setting appointment: lds_id=${lpLeadId}, date=${apptDate}, time=${apptTime}, resolved_via=${resolutionSource}`);
   const result = await lpSetAppointment({ ldsId: lpLeadId, setBy, apptDate, apptTime });
 
-  // ── Post-success: GHL note + GroupMe notification ──
   if (!isLPLeadId(contactId)) {
     await addGHLNote(contactId, `[LP SYNC] Appointment set in LP (v4.0)\nLP Lead ID: ${lpLeadId} (confirmed via ${resolutionSource})\nProspect ID: ${resolvedProspectId || 'N/A'}\nDate: ${apptDate}\nTime: ${apptTime}\nCalendar: ${calendarName}`).catch(() => {});
   }
@@ -927,19 +875,15 @@ async function executeUpdateContactEmail(action, context) {
   const contactId = action.target_id;
   if (!contactId) throw new Error('Missing contactId');
 
-  // Read fields from event context (raw payload) — NOT from interpolated action_payload.
-  // scoring_reasons is an array in the event payload; interpolation would stringify it.
   const payload = interpolatePayload(action.action_payload, context);
   const newEmail = payload.email || context.candidate_email;
   const confidence = Number(payload.confidence_score || context.confidence_score || 0);
-  const scoringReasons = context.scoring_reasons || []; // raw array from event payload
+  const scoringReasons = context.scoring_reasons || [];
   const sourceLeadId = payload.source_lead_id || context.source_lead_id || null;
   const lpProspectId = payload.lp_prospect_id || context.lp_prospect_id || null;
 
   if (!newEmail) throw new Error('Missing email in payload');
 
-  // Pre-check: fetch GHL contact's current email and score it.
-  // If GHL already has a good email (score >= 75), skip the update.
   let oldEmail = null;
   try {
     const ghlContact = await getGHLContact(contactId);
@@ -949,17 +893,11 @@ async function executeUpdateContactEmail(action, context) {
       const currentScore = scoreEmail(ghlContact.email);
       if (currentScore.score >= 75) {
         console.log(`[ActionExecutor] Email enrichment skipped for ${contactId}: GHL already has good email "${ghlContact.email}" (score: ${currentScore.score})`);
-        // Log the skip
         try {
           await supabase.from('email_enrichment_log').insert({
-            ghl_contact_id: contactId,
-            lp_prospect_id: lpProspectId,
-            old_email: oldEmail,
-            new_email: newEmail,
-            confidence_score: confidence,
-            scoring_reasons: scoringReasons,
-            source_lead_id: sourceLeadId,
-            action_taken: 'skipped_ghl_has_good_email',
+            ghl_contact_id: contactId, lp_prospect_id: lpProspectId, old_email: oldEmail,
+            new_email: newEmail, confidence_score: confidence, scoring_reasons: scoringReasons,
+            source_lead_id: sourceLeadId, action_taken: 'skipped_ghl_has_good_email',
           });
         } catch {}
         return { action: 'email_enrichment_skipped', contact_id: contactId, reason: 'ghl_has_good_email', existing_email: ghlContact.email, existing_score: currentScore.score };
@@ -969,12 +907,10 @@ async function executeUpdateContactEmail(action, context) {
     console.warn(`[ActionExecutor] GHL pre-check failed for ${contactId}: ${err.message} — proceeding with update`);
   }
 
-  // Execute the email update
   const result = await updateGHLContactEmail(contactId, newEmail);
   if (result === 'not_found') throw new Error(`GHL contact ${contactId} not found`);
   if (!result) throw new Error('GHL email update failed');
 
-  // Add a GHL note documenting the enrichment
   await addGHLNote(contactId,
     `[EMAIL ENRICHMENT] Email updated from LP data\n` +
     `New: ${newEmail}\n` +
@@ -983,30 +919,18 @@ async function executeUpdateContactEmail(action, context) {
     `Reasons: ${scoringReasons.join(', ')}`
   ).catch(() => {});
 
-  // Log to email_enrichment_log
   try {
     await supabase.from('email_enrichment_log').insert({
-      ghl_contact_id: contactId,
-      lp_prospect_id: lpProspectId,
-      old_email: oldEmail,
-      new_email: newEmail,
-      confidence_score: confidence,
-      scoring_reasons: scoringReasons,
-      source_lead_id: sourceLeadId,
-      action_taken: 'updated',
+      ghl_contact_id: contactId, lp_prospect_id: lpProspectId, old_email: oldEmail,
+      new_email: newEmail, confidence_score: confidence, scoring_reasons: scoringReasons,
+      source_lead_id: sourceLeadId, action_taken: 'updated',
     });
   } catch (logErr) {
     console.warn(`[ActionExecutor] Email enrichment log failed: ${logErr.message}`);
   }
 
   console.log(`[ActionExecutor] ✅ Email enriched for ${contactId}: ${newEmail} (confidence: ${confidence})`);
-  return {
-    action: 'email_enriched',
-    contact_id: contactId,
-    new_email: newEmail,
-    old_email: oldEmail,
-    confidence_score: confidence,
-  };
+  return { action: 'email_enriched', contact_id: contactId, new_email: newEmail, old_email: oldEmail, confidence_score: confidence };
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1021,7 +945,6 @@ async function executeCalculateTimeLapseTier(action) {
   if (!contactId) throw new Error('Missing contactId');
   if (!source_field_id) throw new Error('Missing source_field_id in payload');
 
-  // 1. Fetch contact and read custom field value
   let fieldValue = null;
   const contact = await getGHLContact(contactId);
   if (contact?.customFields) {
@@ -1029,18 +952,14 @@ async function executeCalculateTimeLapseTier(action) {
     fieldValue = field?.value ?? null;
   }
 
-  // 2. Calculate days since last contact
   let daysSince = null;
   let tierTag = fallback_tag || 'time-lapse:cold';
-
   let dateMs = null;
 
   if (fieldValue) {
     if (typeof fieldValue === 'number' && fieldValue > 0) {
-      // Unix ms timestamp (backward compat)
       dateMs = fieldValue;
     } else if (typeof fieldValue === 'string') {
-      // ISO date: "2026-04-15" or "2026-04-15T14:00:00Z"
       const parsed = new Date(fieldValue);
       if (!isNaN(parsed.getTime())) {
         dateMs = parsed.getTime();
@@ -1048,7 +967,6 @@ async function executeCalculateTimeLapseTier(action) {
     }
   }
 
-  // Fallback: contact creation date (for edge cases where appointment field is empty)
   if (!dateMs && fallback_strategy === 'contact_creation_date' && contact?.dateAdded) {
     const created = new Date(contact.dateAdded);
     if (!isNaN(created.getTime())) {
@@ -1059,9 +977,8 @@ async function executeCalculateTimeLapseTier(action) {
 
   if (dateMs) {
     daysSince = Math.floor((Date.now() - dateMs) / 86400000);
-    if (daysSince < 0) daysSince = 0; // future appointment = treat as today
+    if (daysSince < 0) daysSince = 0;
 
-    // 3. Determine tier from thresholds
     if (tier_thresholds) {
       if (daysSince <= (tier_thresholds.warm?.max_days ?? 90)) {
         tierTag = tier_thresholds.warm?.tag || 'time-lapse:warm';
@@ -1075,12 +992,9 @@ async function executeCalculateTimeLapseTier(action) {
     console.log(`[ActionExecutor] [TIER] No valid date for ${contactId}, using fallback: ${tierTag}`);
   }
 
-  // 4. Apply tier tag
   await ghlFetch('POST', `/contacts/${contactId}/tags`, { tags: [tierTag] });
-
   console.log(`[ActionExecutor] [TIER] ${contactId}: ${daysSince ?? '?'} days → ${tierTag}`);
 
-  // 5. Return result with _context for batch propagation to send_notification
   return {
     action: 'time_lapse_tier_calculated',
     contact_id: contactId,
@@ -1104,6 +1018,7 @@ const ACTION_HANDLERS = {
   add_tag: executeAddTag,
   remove_tag: executeRemoveTag,
   move_opportunity: executeMoveOpportunity,
+  update_opportunity: executeUpdateOpportunity,
   remove_from_workflow: executeRemoveFromWorkflow,
   add_to_workflow: executeAddToWorkflow,
   book_appointment: executeBookAppointment,
@@ -1152,15 +1067,12 @@ export async function executeActions({ limit = 50 } = {}) {
     for (const [batchId, actions] of approvalBatches) {
       const { data: existing } = await supabase.from('groupme_approval_requests').select('id').eq('batch_id', batchId).maybeSingle();
       if (!existing) {
-        // v3.9: build enrichment only for batches we're about to notify on,
-        // so poll cycles for already-notified batches don't pay query cost.
         const firstAction = actions[0];
         const { name, phone, lpLead, ghlContactId } = await resolveContactInfo(firstAction.target_id);
         const prospectId = await resolveLPProspectId(firstAction.target_id);
         const ctx = await getEventContext(firstAction);
         const enrichment = await buildNotificationEnrichment(firstAction.target_id, ctx, { lpLead, prospectId, ghlContactId });
 
-        // ── PRE-APPROVAL AI GENERATION for send_message actions ──
         if (firstAction.action_type === 'send_message' && firstAction.action_payload?.requires_ai_generation) {
           try {
             const { generateResponse } = await import('./response-generator.js');
@@ -1170,23 +1082,21 @@ export async function executeActions({ limit = 50 } = {}) {
             console.log(`[ActionExecutor] Pre-generating AI response for approval ${batchId}`);
             const generated = await generateResponse(firstAction.target_id, channel, triggerMessage);
 
-            // Store generated message in the action payload (IMMUTABLE after approval)
             const updatedPayload = {
               ...firstAction.action_payload,
               message: generated.message,
               subject: generated.subject,
               story_arc: generated.story_arc,
               ai_reasoning: generated.reasoning,
-              requires_ai_generation: false,  // Cleared — generation complete
-              pre_generated: true,            // Flag: message was AI-generated before approval
-              generated_at: new Date().toISOString(),  // Audit: when the response was created
+              requires_ai_generation: false,
+              pre_generated: true,
+              generated_at: new Date().toISOString(),
             };
 
             await supabase.from('agent_actions')
               .update({ action_payload: updatedPayload, updated_at: new Date().toISOString() })
               .eq('id', firstAction.id);
 
-            // Add the generated message to enrichment so it shows in GroupMe
             enrichment.generatedMessage = generated.message;
             enrichment.storyArc = generated.story_arc;
             enrichment.aiReasoning = generated.reasoning;
@@ -1194,7 +1104,6 @@ export async function executeActions({ limit = 50 } = {}) {
             console.log(`[ActionExecutor] Pre-generated: "${generated.message.slice(0, 80)}..." (arc: ${generated.story_arc})`);
           } catch (err) {
             console.error(`[ActionExecutor] Pre-approval generation failed for ${batchId}: ${err.message}`);
-            // Still send approval without preview — Mark can reject if needed
             enrichment.generatedMessage = null;
             enrichment.aiGenerationError = err.message;
           }
