@@ -57,6 +57,7 @@ import { sendGroupMeMessage, sendApprovalRequest } from './groupme.js';
 import { acquireToken, report429, registerRateLimiterRoutes } from './ghl-rate-limiter.js';
 import { formatPhone, formatDateTime } from './format-helpers.js';
 import { executeSendMessage } from './send-message-handler.js';
+import { checkForwardOnly } from './pipeline-guard.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = 'SsBG7j5KQAIP1SFP2Sca';
@@ -531,7 +532,13 @@ async function executeMoveOpportunity(action) {
 
   const searchRes = await ghlFetch('GET', `/opportunities/search?location_id=${GHL_LOCATION_ID}&contact_id=${contactId}&pipeline_id=${pipelineId}`);
   const opps = searchRes?.opportunities || [];
-  if (opps.length > 0) {
+if (opps.length > 0) {
+    // v4.0: Forward-only guard — prevent backward pipeline movement
+    const guard = checkForwardOnly(opps[0].pipelineStageId, stageId);
+    if (!guard.allowed) {
+      console.log(`[ActionExecutor] ⏭️ Forward-only: ${pipeline} opp at pos ${guard.currentPos}, target pos ${guard.targetPos} — ${guard.reason}`);
+      return { action: 'skipped_forward_only', opportunity_id: opps[0].id, pipeline, current_position: guard.currentPos, target_position: guard.targetPos, target_stage: stage, reason: guard.reason };
+    }
     await ghlFetch('PUT', `/opportunities/${opps[0].id}`, { pipelineStageId: stageId, status: status || 'open' });
     return { action: 'updated', opportunity_id: opps[0].id, pipeline, stage, status };
   } else {
