@@ -13,13 +13,19 @@
  *   2. Suppression check — suppress-automation / dnc / do-not-contact → BLOCK
  *   3. Bot session check — active bot tags without stop signal → BLOCK
  *   4. Pre-send pause-bot — 24h Conversation AI deactivation before send
- *   5. Rate limit — 1 auto-message per 2h per contact → BLOCK
+ *   5. Rate limit — configurable via SEND_MESSAGE_RATE_LIMIT_MS (default 10min)
  *   6. Human awareness — GroupMe notification on every send
  *   7. Channel validation — only 'sms' or 'email' accepted
  *
  * Required env:
  *   GHL_API_KEY — GHL API key (required for tag fetch, Conversations API)
  *   GHL_SEND_MESSAGE_WEBHOOK_URL — GHL incoming webhook URL (fallback)
+ *   SEND_MESSAGE_RATE_LIMIT_MS — Rate limit window in ms (default 600000 = 10min)
+ *
+ * v2.1 — Configurable rate limit via SEND_MESSAGE_RATE_LIMIT_MS env var.
+ *   Was hardcoded at 2h which blocked conversational back-and-forth.
+ *   Now defaults to 10 minutes — enough to prevent spam but allows
+ *   real-time lead conversations.
  *
  * v2.0 — Bot session guardrail, pause-bot injection, Conversations API.
  */
@@ -33,7 +39,7 @@ import { generateResponse } from './response-generator.js';
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 const GHL_LOCATION_ID = 'SsBG7j5KQAIP1SFP2Sca';
 const GHL_SEND_MESSAGE_WEBHOOK_URL = process.env.GHL_SEND_MESSAGE_WEBHOOK_URL || '';
-const RATE_LIMIT_MS = 2 * 60 * 60 * 1000; // 2 hours between auto-messages per contact
+const RATE_LIMIT_MS = parseInt(process.env.SEND_MESSAGE_RATE_LIMIT_MS || '600000', 10); // default 10 min
 
 // ═══════════════════════════════════════════════════════════════════
 // TAG HELPERS
@@ -288,13 +294,14 @@ export async function executeSendMessage(action, context) {
   }
 
   // ── Guardrail 5: Rate limit check ─────────────────────────────
+  const rateLimitMinutes = Math.round(RATE_LIMIT_MS / 60000);
   const rateLimited = await isRateLimited(contactId);
   if (rateLimited) {
-    console.log(`[SendMessage] ⏭️ RATE LIMITED: ${contactId} received auto-message within 2h window`);
+    console.log(`[SendMessage] ⏭️ RATE LIMITED: ${contactId} received auto-message within ${rateLimitMinutes}min window`);
     return {
       action: 'send_message_rate_limited',
       contact_id: contactId,
-      reason: 'rate_limited_2h',
+      reason: `rate_limited_${rateLimitMinutes}min`,
       channel,
     };
   }
