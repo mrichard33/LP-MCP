@@ -5,7 +5,7 @@
  * 1. Reading unprocessed events from system_events
  * 2. Matching each event against agent_rules (by event_type + payload pattern)
  * 3. For contextual rules: also evaluating lead_intelligence conditions
- * 4. Creating agent_actions for matched rules
+ * 4. Creating agent_actions for ALL matched rules (v2.6)
  * 5. Marking events as processed
  * 6. SCORING INTENT after every event (Layer 3.5 — Predict → Intercept → Close)
  * 
@@ -17,6 +17,12 @@
  *   - ghl.reply_received (pending_analysis) → triggers Message Analyzer, NOT rules
  *   - ai.analysis_completed → matched against contextual rules using lead_intelligence
  *   - intent.* events → processed by rules but do NOT trigger re-scoring (loop prevention)
+ *
+ * v2.6 — Multi-rule execution per event.
+ *   CRITICAL FIX: processSingleEvent was using matchedRules[0] (first-match-wins).
+ *   Rule 106 (AGENTIC_RESPOND) was silently skipped whenever a BEHAVIORAL_*_OBJECTION
+ *   rule matched first on the same ai.analysis_completed event. Now iterates over ALL
+ *   matched rules. Dedup logic in createActionsFromRule prevents true duplicates.
  *
  * v2.5 — lp_disposition_in context condition.
  *   New operator for evaluateContextConditions: gates a rule on whether the
@@ -474,12 +480,19 @@ export async function processSingleEvent(event) {
     return { event_id: event.id, matched_rules: 0, actions_created: 0 };
   }
 
-  const bestRule = matchedRules[0];
-  const actions = await createActionsFromRule(event, bestRule);
+  // ─── v2.6: Execute ALL matched rules, not just the first ──
+  // Dedup logic in createActionsFromRule prevents true duplicates.
+  let allActions = [];
+  const firedRuleKeys = [];
+  for (const rule of matchedRules) {
+    const actions = await createActionsFromRule(event, rule);
+    allActions.push(...actions);
+    if (actions.length > 0) firedRuleKeys.push(rule.rule_key);
+  }
 
-  const actionNote = actions.length > 0
-    ? `rule:${bestRule.rule_key} → ${actions.length} actions`
-    : `rule:${bestRule.rule_key} → deduped (0 actions)`;
+  const actionNote = allActions.length > 0
+    ? `rules:[${firedRuleKeys.join(',')}] → ${allActions.length} actions`
+    : `rules:[${matchedRules.map(r => r.rule_key).join(',')}] → all deduped (0 actions)`;
 
   await supabase.from('system_events').update({
     processed: true, processed_by: 'decision_engine',
@@ -489,9 +502,9 @@ export async function processSingleEvent(event) {
 
   return {
     event_id: event.id, matched_rules: matchedRules.length,
-    best_rule: bestRule.rule_key, rule_type: bestRule.rule_type || 'pattern',
-    actions_created: actions.length,
-    actions: actions.map(a => ({ id: a.id, type: a.action_type, status: a.status })),
+    fired_rules: firedRuleKeys,
+    actions_created: allActions.length,
+    actions: allActions.map(a => ({ id: a.id, type: a.action_type, status: a.status, rule: a.rule_applied })),
   };
 }
 
