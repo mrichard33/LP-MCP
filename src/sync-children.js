@@ -9,12 +9,17 @@
 // - Only upserts records that don't already exist (INSERT-only for immutable child records)
 // - Jobs still use full upsert (mutable status field)
 // - raw_lp_data removed from call_logs and activities (low-value, high-cost)
+//
+// v7.1 — MILESTONE EVENT EMISSION:
+// - When a milestone tag fires, emit lp.milestone_completed to system_events
+// - Enables P2_MILESTONE_* agent rules (IDs 113-119) for pipeline advancement
 
 import supabase from './supabase.js';
 import { getField, normalizePhone, extractArray, loggedFirstKeys, sleep } from './sync-utils.js';
 import { syncLogProgress, logSyncError } from './sync-log.js';
 import { lpDateToEastern } from './lp-dates.js';
 import { matchToGHL, applyGHLTag } from './ghl.js';
+import { emitEvent } from './event-emitter.js';
 import { combineNotes } from './safe-notes.js';
 import { getLead } from './lp-client.js';
 
@@ -228,6 +233,7 @@ export async function syncActivities(lpLeadId, calls, notes) {
 // ─── Job + Milestone Sync ────────────────────────────────────────
 // Jobs are mutable (status changes) so we keep full upsert, but
 // milestones use existence check since they're append-only.
+// v7.1: Emits lp.milestone_completed events when milestone tags fire.
 export async function syncJobAndMilestones(job, lpLeadId, ghlContactId) {
   if (!loggedFirstKeys.has('job')) {
     loggedFirstKeys.add('job');
@@ -286,6 +292,21 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId) {
           await supabase.from('lp_job_milestones')
             .update({ ghl_tag_fired: true }).eq('lp_job_id', jobId).eq('mdt_id', mdtId);
           console.log(`[Sync] Milestone tag fired: ${tag} for contact ${ghlContactId}`);
+          // v7.1: Emit milestone event for P2 lifecycle agent rules
+          try {
+            await emitEvent({
+              event_type: 'lp.milestone_completed',
+              source: 'lp_sync',
+              entity_type: 'contact',
+              entity_id: ghlContactId,
+              ghl_contact_id: ghlContactId,
+              payload: { mdt_id: mdtId, milestone_tag: tag, job_id: jobId, lp_lead_id: lpLeadId },
+              priority: 'normal',
+              idempotency_key: `lp_milestone_${ghlContactId}_${mdtId}_${jobId}`,
+            });
+          } catch (emitErr) {
+            console.warn(`[Sync] Milestone event emit failed for ${ghlContactId} ${mdtId}: ${emitErr.message}`);
+          }
         }
       }
     }
