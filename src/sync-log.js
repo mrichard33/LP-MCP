@@ -4,6 +4,13 @@
 // Tracks per-entity sync progress, completion, and failures.
 // activeLogIds scopes SIGTERM cleanup to THIS process's rows only.
 //
+// v6.4 — syncLogProgress is now time-throttled rather than page-bound.
+//         Callers can invoke it per-record without flooding Supabase —
+//         the function itself enforces a minimum interval between writes
+//         per logId. Default 5000ms, configurable via env:
+//         SYNC_PROGRESS_THROTTLE_MS=N.
+//         Lets the records_synced column update smoothly during long
+//         runs instead of sitting at 0 until page boundaries.
 // v6.3 — FORCE_SYNC_SINCE env var override in getLastSyncTimestamp.
 //         Set to a valid ISO date to override computed "since" for a
 //         one-shot backfill (bypasses MAX_INCREMENTAL_DAYS cap).
@@ -25,6 +32,13 @@ export const STALE_LOCK_MINUTES = 120; // 2 hours max before force-reset
 
 // Max days to look back in incremental sync — prevents OOM on large backlogs
 export const MAX_INCREMENTAL_DAYS = 3;
+
+// v6.4: Throttle for syncLogProgress writes. Callers can invoke per-record;
+// this map tracks the last DB-write timestamp per logId and skips writes
+// inside the throttle window. 5s default keeps the dashboard feeling live
+// while capping write volume to ~0.2 updates/sec/entity.
+const lastProgressWrite = new Map();
+const PROGRESS_THROTTLE_MS = parseInt(process.env.SYNC_PROGRESS_THROTTLE_MS || '5000', 10);
 
 export function setSyncInProgress(val) { syncInProgress = val; }
 export function setSyncStartedAt(val) { syncStartedAt = val; }
@@ -48,9 +62,16 @@ export async function syncLogStart(entityType, syncType) {
   }
 }
 
-// Update records_synced count (call after each page/batch for live progress)
+// Update records_synced count. v6.4: Time-throttled — safe to call per-record.
+// Writes at most once per PROGRESS_THROTTLE_MS (default 5000ms) per logId.
+// Calls inside the throttle window are no-ops. Final count is guaranteed
+// correct via syncLogComplete, which writes unconditionally.
 export async function syncLogProgress(logId, count) {
   if (!logId) return;
+  const now = Date.now();
+  const last = lastProgressWrite.get(logId) || 0;
+  if (now - last < PROGRESS_THROTTLE_MS) return; // throttled — skip write
+  lastProgressWrite.set(logId, now);
   try {
     await supabase.from('lp_sync_log').update({
       records_synced: count,
@@ -64,6 +85,7 @@ export async function syncLogProgress(logId, count) {
 export async function syncLogComplete(logId, count, errorMessage) {
   if (!logId) return;
   activeLogIds.delete(logId);
+  lastProgressWrite.delete(logId); // v6.4: clear throttle state for this logId
   try {
     await supabase.from('lp_sync_log').update({
       status:         errorMessage ? 'failed' : 'completed',
