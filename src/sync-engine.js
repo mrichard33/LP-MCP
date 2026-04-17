@@ -1,5 +1,11 @@
 // ─── Sync Engine — src/sync-engine.js ─────────────────────────────
 //
+// v6.4 — Per-record syncLogProgress calls in incrementalSync inner loops
+//         so the records_synced column updates smoothly during long runs
+//         (was updating only at page boundaries, every ~200 leads, leaving
+//         the dashboard at 0 for minutes). syncLogProgress is now
+//         time-throttled at the helper level (default 5s between writes
+//         per logId), so per-record calls are safe — most are no-ops.
 // v6.3 — Self-healing timeout wrapper (runWithTimeout) on all scheduled
 //         sync calls. If a sync hangs on an unresolved await (LP API
 //         stall, stuck HTTP request, etc.), the wrapper fires after
@@ -320,6 +326,8 @@ export async function incrementalSync() {
               const sub = await processProspect(fullProspects[0]);
               counts.leads++;
               if (sub) { counts.calls += sub.calls; counts.notes += sub.notes; counts.jobs += sub.jobs; counts.milestones += sub.milestones; counts.activities += sub.calls + sub.notes; }
+              // v6.4: per-record progress update (throttled in syncLogProgress — most calls no-op)
+              syncLogProgress(logIds.leads, counts.leads);
             }
           }
         } catch (err) { failed++; await logSyncError(lead.cst_id || lead.id, err); }
@@ -348,6 +356,9 @@ export async function incrementalSync() {
             await syncJobAndMilestones(job, job.lds_id || job.lp_lead_id, null);
             counts.jobs++;
             counts.milestones += (getField(job, 'milestones', 'Milestones') || []).length;
+            // v6.4: per-record progress update (throttled in syncLogProgress — most calls no-op)
+            syncLogProgress(logIds.jobs, counts.jobs);
+            syncLogProgress(logIds.milestones, counts.milestones);
           } catch (err) { failed++; await logSyncError(job.job_id || job.JobID, err); }
         }
         await Promise.all([ syncLogProgress(logIds.jobs, counts.jobs), syncLogProgress(logIds.milestones, counts.milestones) ]);
