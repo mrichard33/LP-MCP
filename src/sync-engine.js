@@ -1,5 +1,19 @@
 // ─── Sync Engine — src/sync-engine.js ─────────────────────────────
 //
+// v6.4 — Per-record syncLogProgress calls in incrementalSync inner loops
+//         so the records_synced column updates smoothly during long runs
+//         (was updating only at page boundaries, every ~200 leads, leaving
+//         the dashboard at 0 for minutes). syncLogProgress is now
+//         time-throttled at the helper level (default 5s between writes
+//         per logId), so per-record calls are safe — most are no-ops.
+// v6.3 — Self-healing timeout wrapper (runWithTimeout) on all scheduled
+//         sync calls. If a sync hangs on an unresolved await (LP API
+//         stall, stuck HTTP request, etc.), the wrapper fires after
+//         SYNC_TIMEOUT_MINUTES (default 45min), explicitly resets the
+//         mutex, and sweeps this-process "running" log rows to "failed".
+//         Next scheduled interval picks up cleanly instead of waiting
+//         for the 120-min STALE_LOCK_MINUTES coarse recovery.
+//         Configurable via SYNC_TIMEOUT_MINUTES env var.
 // v6.2 — Added MAX_INCREMENTAL_LEADS cap to prevent OOM on large backlogs.
 //         Incremental sync now stops after processing 2000 leads per run.
 //         Subsequent runs continue from where the last one left off via
@@ -43,6 +57,45 @@ import { checkDay15Handoffs, checkLeadTriggers } from './sync-triggers.js';
 // Max leads to process per incremental sync run — prevents OOM/timeout.
 // The sync runs every 15 min; it will catch up in subsequent runs.
 const MAX_INCREMENTAL_LEADS = 2000;
+
+// v6.3: Self-healing timeout. If a scheduled sync hangs on an unresolved
+// await (LP API stall, stuck HTTP), runWithTimeout fires after this window,
+// resets the mutex, and sweeps in-flight log rows. Override via env:
+// SYNC_TIMEOUT_MINUTES=60
+const SYNC_TIMEOUT_MINUTES = parseInt(process.env.SYNC_TIMEOUT_MINUTES || '45', 10);
+const SYNC_TIMEOUT_MS = SYNC_TIMEOUT_MINUTES * 60 * 1000;
+
+// ─── Timeout Wrapper ─────────────────────────────────────────────
+//
+// Wraps a sync call in a wall-clock timeout. If the underlying sync
+// function hangs (unresolved await), this rejects after timeoutMs and
+// force-resets the shared mutex so the next scheduled interval runs
+// cleanly. Note: Promise.race does NOT cancel the losing promise — the
+// hung operation continues in the Node event loop. That's acceptable;
+// upserts are idempotent and the coarse STALE_LOCK (120min) plus
+// per-process activeLogIds scoping keep state coherent.
+async function runWithTimeout(syncFn, timeoutMs, label) {
+  let timeoutHandle;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutHandle = setTimeout(async () => {
+      console.error(`[Sync] ${label} TIMED OUT after ${timeoutMs / 60000}min — force-resetting mutex and sweeping in-flight log rows`);
+      setSyncInProgress(false);
+      setSyncStartedAt(null);
+      try {
+        await markRunningLogsAsFailed();
+      } catch (e) {
+        console.warn('[Sync] Timeout sweep failed:', e.message);
+      }
+      reject(new Error(`${label} timed out after ${timeoutMs / 60000}min`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([syncFn(), timeoutPromise]);
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
 
 // ─── Full Sync ───────────────────────────────────────────────────
 
@@ -273,6 +326,8 @@ export async function incrementalSync() {
               const sub = await processProspect(fullProspects[0]);
               counts.leads++;
               if (sub) { counts.calls += sub.calls; counts.notes += sub.notes; counts.jobs += sub.jobs; counts.milestones += sub.milestones; counts.activities += sub.calls + sub.notes; }
+              // v6.4: per-record progress update (throttled in syncLogProgress — most calls no-op)
+              syncLogProgress(logIds.leads, counts.leads);
             }
           }
         } catch (err) { failed++; await logSyncError(lead.cst_id || lead.id, err); }
@@ -301,6 +356,9 @@ export async function incrementalSync() {
             await syncJobAndMilestones(job, job.lds_id || job.lp_lead_id, null);
             counts.jobs++;
             counts.milestones += (getField(job, 'milestones', 'Milestones') || []).length;
+            // v6.4: per-record progress update (throttled in syncLogProgress — most calls no-op)
+            syncLogProgress(logIds.jobs, counts.jobs);
+            syncLogProgress(logIds.milestones, counts.milestones);
           } catch (err) { failed++; await logSyncError(job.job_id || job.JobID, err); }
         }
         await Promise.all([ syncLogProgress(logIds.jobs, counts.jobs), syncLogProgress(logIds.milestones, counts.milestones) ]);
@@ -391,7 +449,7 @@ let syncTimer = null;
 
 export function startSyncScheduler() {
   if (!supabase) { console.warn('[Sync] Supabase not configured — sync disabled'); return; }
-  console.log(`[Sync] Scheduler started — incremental sync every ${SYNC_INTERVAL_MS / 60000} minutes`);
+  console.log(`[Sync] Scheduler started — incremental sync every ${SYNC_INTERVAL_MS / 60000} minutes (timeout: ${SYNC_TIMEOUT_MINUTES}min)`);
 
   setTimeout(async () => {
     try {
@@ -413,7 +471,7 @@ export function startSyncScheduler() {
       const forceFullSync = process.env.FORCE_FULL_SYNC === 'true';
       if (forceFullSync) {
         console.log('[Sync] FORCE_FULL_SYNC=true — running full sync');
-        await fullSync();
+        await runWithTimeout(() => fullSync(), SYNC_TIMEOUT_MS, 'boot fullSync');
       } else {
         const { data: lastFullSync } = await supabase.from('lp_sync_log')
           .select('completed_at').eq('sync_type', 'full').eq('status', 'completed')
@@ -422,15 +480,15 @@ export function startSyncScheduler() {
           ? (Date.now() - new Date(lastFullSync.completed_at).getTime()) / 3600000 : Infinity;
         if (hoursSinceLastFull <= 24) {
           console.log(`[Sync] Full sync ran ${hoursSinceLastFull.toFixed(1)}h ago — running incremental`);
-          await incrementalSync();
+          await runWithTimeout(() => incrementalSync(), SYNC_TIMEOUT_MS, 'boot incrementalSync');
         } else {
           const lastSync = await getLastSyncTimestamp();
           if (lastSync) {
             console.log(`[Sync] No recent full sync but last sync: ${lastSync.toISOString()} — running incremental`);
-            await incrementalSync();
+            await runWithTimeout(() => incrementalSync(), SYNC_TIMEOUT_MS, 'boot incrementalSync');
           } else {
             console.log('[Sync] No successful sync found — running initial full sync');
-            await fullSync();
+            await runWithTimeout(() => fullSync(), SYNC_TIMEOUT_MS, 'boot fullSync');
           }
         }
       }
@@ -443,7 +501,8 @@ export function startSyncScheduler() {
   }, 5000);
 
   syncTimer = setInterval(async () => {
-    try { await incrementalSync(); } catch (err) { console.error('[Sync] Scheduled sync failed:', err.message); }
+    try { await runWithTimeout(() => incrementalSync(), SYNC_TIMEOUT_MS, 'scheduled incrementalSync'); }
+    catch (err) { console.error('[Sync] Scheduled sync failed:', err.message); }
   }, SYNC_INTERVAL_MS);
 }
 
