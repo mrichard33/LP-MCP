@@ -4,6 +4,10 @@
 // Tracks per-entity sync progress, completion, and failures.
 // activeLogIds scopes SIGTERM cleanup to THIS process's rows only.
 //
+// v6.3 — FORCE_SYNC_SINCE env var override in getLastSyncTimestamp.
+//         Set to a valid ISO date to override computed "since" for a
+//         one-shot backfill (bypasses MAX_INCREMENTAL_DAYS cap).
+//         Unset/invalid = normal behavior.
 // v6.2 — getLastSyncTimestamp now includes failed syncs that wrote records.
 //         Added MAX_INCREMENTAL_DAYS to cap the sync window.
 
@@ -104,11 +108,28 @@ export async function logSyncError(entityId, err, syncType = null) {
 }
 
 // Get the most recent sync timestamp to use as the "since" date for incremental sync.
+// v6.3: FORCE_SYNC_SINCE env override takes precedence — used for one-shot backfills
+//        when the gap exceeds MAX_INCREMENTAL_DAYS. Set to an ISO date string.
 // v6.2: Also considers failed syncs that wrote a significant number of records
 // (>100), since those records ARE in the database. This prevents the sync from
 // repeatedly trying to re-pull a week-old backlog after process terminations.
 export async function getLastSyncTimestamp() {
   try {
+    // v6.3: Env override — one-shot backfill with an explicit since-date.
+    // Set FORCE_SYNC_SINCE to an ISO date (e.g. "2026-04-03T00:00:00Z") to
+    // override the computed timestamp and bypass the MAX_INCREMENTAL_DAYS cap.
+    // Unset to revert to normal. Invalid values are logged and ignored.
+    const override = process.env.FORCE_SYNC_SINCE;
+    if (override) {
+      const ts = new Date(override);
+      if (!isNaN(ts.getTime())) {
+        console.log(`[Sync] FORCE_SYNC_SINCE override active — using ${ts.toISOString()} (MAX_INCREMENTAL_DAYS cap bypassed)`);
+        return ts;
+      } else {
+        console.warn(`[Sync] FORCE_SYNC_SINCE invalid (not a valid ISO date): "${override}" — ignoring, falling back to normal lookup`);
+      }
+    }
+
     // First try: completed syncs with records (the ideal case)
     const { data: completed } = await supabase
       .from('lp_sync_log')
