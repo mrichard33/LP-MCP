@@ -11,16 +11,39 @@
  * Guardrails (fail-closed):
  *   1. Tag fetch — single GHL API call, reused for all tag-based checks
  *   2. Suppression check — suppress-automation / dnc / do-not-contact → BLOCK
- *   3. Bot session check — active bot tags without stop signal → BLOCK
- *   4. Pre-send pause-bot — 24h Conversation AI deactivation before send
- *   5. Rate limit — configurable via SEND_MESSAGE_RATE_LIMIT_MS (default 10min)
- *   6. Human awareness — GroupMe notification on every send
- *   7. Channel validation — only 'sms' or 'email' accepted
+ *   3. Conversation gate (v3.0):
+ *        - stop-bot present     → BLOCK  (hard stop, wins over everything)
+ *        - pause-bot present    → ALLOW  (explicit opt-in)
+ *        - neither              → BLOCK  (no opt-in = Conv AI/workflows own it)
+ *   4. Rate limit — configurable via SEND_MESSAGE_RATE_LIMIT_MS (default 10min)
+ *   5. Human awareness — GroupMe notification on every send
+ *   6. Channel validation — only 'sms' or 'email' accepted
  *
  * Required env:
  *   GHL_API_KEY — GHL API key (required for tag fetch, Conversations API)
  *   GHL_SEND_MESSAGE_WEBHOOK_URL — GHL incoming webhook URL (fallback)
  *   SEND_MESSAGE_RATE_LIMIT_MS — Rate limit window in ms (default 600000 = 10min)
+ *
+ * v3.0 — Conversation opt-in gate replaces bot-session heuristic.
+ *   The previous implementation treated stop-bot and pause-bot as
+ *   "bot is already handled, safe for agentic to send" — which is the
+ *   OPPOSITE of intended semantics. It also auto-injected pause-bot
+ *   as a side effect of every send, which silently opted contacts in
+ *   to agentic conversation forever.
+ *
+ *   New semantics (Mark, 2026-04-17):
+ *     - stop-bot  = "do not have a conversation with this lead, period"
+ *                   Hard block. Wins over pause-bot if both are present.
+ *     - pause-bot = "agentic system may converse with this lead"
+ *                   Explicit opt-in. Default state (no pause-bot) means
+ *                   Conv AI / GHL workflows own the conversation channel,
+ *                   and the agentic system should stay out of it.
+ *     - Non-conversation agentic actions (add_tag, move_opportunity,
+ *       add_to_workflow, etc.) are unaffected and continue running.
+ *
+ *   pause-bot is now applied deliberately by GHL workflows (on bot
+ *   completion) or by rules/reps that decide to hand conversation
+ *   over to agentic — NOT as a side effect of this handler.
  *
  * v2.1 — Configurable rate limit via SEND_MESSAGE_RATE_LIMIT_MS env var.
  *   Was hardcoded at 2h which blocked conversational back-and-forth.
@@ -32,7 +55,6 @@
 
 import supabase from './supabase.js';
 import { sendGroupMeMessage } from './groupme.js';
-import { applyGHLTag } from './ghl.js';
 import { acquireToken, report429 } from './ghl-rate-limiter.js';
 import { generateResponse } from './response-generator.js';
 
@@ -77,35 +99,28 @@ function isContactSuppressed(tags) {
 }
 
 /**
- * Check if a chatbot session is potentially active for this contact.
+ * Conversation gate — decides whether the agentic system is permitted to
+ * send a message to this contact based on the tag state.
  *
- * Bot lifecycle: Bot activates → conversation runs → bot adds `stop-bot` on exit.
- * If bot-related tags exist but no suppression signal, the bot may still be active.
- * Contacts with NO bot tags (canvassing, referral, LP-only) are safe — they
- * never entered a bot channel.
+ * Precedence (highest to lowest):
+ *   1. stop-bot present  → deny (reason: stop_bot)      — hard stop
+ *   2. pause-bot present → allow                         — explicit opt-in
+ *   3. neither           → deny (reason: no_opt_in)     — default off
  *
- * Returns true if the agentic system should NOT send (bot may be active).
+ * stop-bot always wins, even if pause-bot is also present, so that a
+ * later "stop-bot" application is an unambiguous kill switch.
+ *
+ * Pure function — operates on pre-fetched tag array.
+ * Returns { allowed: boolean, reason: string }.
  */
-function isBotSessionActive(tags) {
-  if (!tags || !tags.length) return false;
-
-  // Bot suppression signals — any of these = bot is already handled, safe to send
-  if (tags.includes('stop-bot')) return false;       // permanent bot kill (DNC exit)
-  if (tags.includes('pause-bot')) return false;       // temporary 24h suppression
-
-  // chatbot-completed-* also indicates the bot is done
-  const botCompleted = tags.some(t => t.startsWith('chatbot-completed-'));
-  if (botCompleted) return false;
-
-  // Check for any bot activity indicators WITHOUT a suppression signal
-  const botIndicators = tags.some(t =>
-    t.startsWith('activate-bot') ||
-    t.startsWith('chatbot-') ||      // chatbot-booked-*, etc. (mid-flow tags)
-    t === 'bot-active'
-  );
-
-  // Bot indicators present but no suppression = bot may still be active
-  return botIndicators;
+function checkConversationGate(tags) {
+  if (tags.includes('stop-bot')) {
+    return { allowed: false, reason: 'stop_bot' };
+  }
+  if (tags.includes('pause-bot')) {
+    return { allowed: true, reason: 'pause_bot_opt_in' };
+  }
+  return { allowed: false, reason: 'no_opt_in' };
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -254,6 +269,9 @@ export async function executeSendMessage(action, context) {
   }
 
   // ── Guardrail 2: Suppression check ─────────────────────────────
+  // Defense in depth — catches broad "contact is off-limits" signals
+  // (suppress-automation, dnc, do-not-contact) that exist independently
+  // of the stop-bot/pause-bot conversation semantics.
   if (isContactSuppressed(tags)) {
     console.log(`[SendMessage] ⏭️ SUPPRESSED: ${contactId} has suppress-automation or DNC tag`);
     return {
@@ -264,36 +282,23 @@ export async function executeSendMessage(action, context) {
     };
   }
 
-  // ── Guardrail 3: Bot session check ─────────────────────────────
-  if (isBotSessionActive(tags)) {
-    console.log(`[SendMessage] ⏭️ BOT ACTIVE: ${contactId} has bot tags but no stop-bot/pause-bot — bot session may be active`);
+  // ── Guardrail 3: Conversation opt-in gate ──────────────────────
+  // v3.0 semantics: stop-bot blocks, pause-bot allows, neither blocks.
+  // pause-bot is the explicit opt-in signal. Absence = Conv AI /
+  // GHL workflows own the conversation channel; agentic stays out.
+  const gate = checkConversationGate(tags);
+  if (!gate.allowed) {
+    const label = gate.reason === 'stop_bot' ? 'STOP-BOT' : 'NO OPT-IN';
+    console.log(`[SendMessage] ⏭️ ${label}: ${contactId} — gate denied (reason: ${gate.reason})`);
     return {
-      action: 'send_message_bot_active',
+      action: `send_message_${gate.reason}`,
       contact_id: contactId,
-      reason: 'bot_session_active',
+      reason: gate.reason,
       channel,
     };
   }
 
-  // ── Guardrail 4: Pre-send pause-bot tag injection ──────────────
-  // Prevents Conversation AI bot from waking up when the lead replies
-  const botAlreadySuppressed = tags.includes('stop-bot')
-    || tags.includes('pause-bot')
-    || tags.some(t => t.startsWith('chatbot-completed-'));
-
-  if (!botAlreadySuppressed) {
-    console.log(`[SendMessage] Adding pause-bot tag to ${contactId} (24h bot suppression before agentic send)`);
-    await applyGHLTag(contactId, 'pause-bot').catch(err => {
-      // Non-fatal — message still sends, bot conflict risk remains but is low
-      console.warn(`[SendMessage] Failed to add pause-bot tag: ${err.message}`);
-    });
-    // The "Tagged - pause-bot" GHL workflow (cbb6ac0e) will:
-    //   1. Set Conversation AI to INACTIVE for 24h
-    //   2. Wait 24h
-    //   3. Auto-remove the pause-bot tag
-  }
-
-  // ── Guardrail 5: Rate limit check ─────────────────────────────
+  // ── Guardrail 4: Rate limit check ──────────────────────────────
   const rateLimitMinutes = Math.round(RATE_LIMIT_MS / 60000);
   const rateLimited = await isRateLimited(contactId);
   if (rateLimited) {
