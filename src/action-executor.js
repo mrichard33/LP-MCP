@@ -21,6 +21,24 @@
  *   calculate_time_lapse_tier → Read LP Last Contact, compute tier, apply time-lapse tag
  *   send_message         → POST to GHL incoming webhook → GHL workflow sends SMS/email
  *
+ * v4.2 — Approval pipeline tightening (2026-04-24).
+ *   Three fixes so every GroupMe approval card carries full context and the
+ *   queue never silently stalls:
+ *   1. Head-of-line fix: executeActions() pre-filters the pending_approval
+ *      query to exclude batches that already have an active tracking record
+ *      in groupme_approval_requests. Previously limit(20)+order-asc could
+ *      pin on stale unanswered approvals and starve new ones indefinitely.
+ *      Paired with the 48h TTL in sql/008_approval_queue_ttl.sql.
+ *   2. Inbound-message fallback: buildNotificationEnrichment and the
+ *      pre-generation step both now recognize `message_preview` (the field
+ *      carried by ai.analysis_completed events, which is what AGENTIC_*
+ *      rules fire on). Prior releases only checked message_text/messageText/
+ *      body and silently dropped the inbound line from the approval card.
+ *   3. Concurrent-safe loop: the in-loop `if (existing) continue` guard is
+ *      retained on top of the pre-filter so two overlapping heartbeats (or a
+ *      heartbeat colliding with an approval-triggered executor run) cannot
+ *      double-send the same approval card.
+ *
  * v4.1 — update_opportunity: PUT /opportunities/{oppId} for monetaryValue, source,
  *   lostReasonId. Also supports updating contact source via PUT /contacts/{id}.
  *   Used for P2 value/source enrichment backfill and ongoing loss intelligence.
@@ -309,7 +327,9 @@ async function resolveLPProspectId(contactId) {
 
 async function buildNotificationEnrichment(contactId, context = {}, { lpLead = null, prospectId = null, ghlContactId = null } = {}) {
   const enrichment = {
-    messageText: context.message_text || context.messageText || context.body || null,
+    // v4.2 — accept message_preview as a fallback. It is the field on
+    // ai.analysis_completed events, which is what AGENTIC_* rules fire on.
+    messageText: context.message_text || context.messageText || context.body || context.message_preview || null,
     messageType: context.message_type || context.messageType || null,
     lpSource: null,
     repName: null,
@@ -1060,57 +1080,89 @@ async function executeSingleAction(action, batchContext = {}) {
 export async function executeActions({ limit = 50 } = {}) {
   const startTime = Date.now();
 
-  const { data: approvalActions } = await supabase.from('agent_actions').select('*').eq('status', 'pending_approval').order('created_at', { ascending: true }).limit(20);
+  // v4.2 — Pre-filter batches that already have an active ('pending') tracking
+  // record so stale unanswered approvals do not starve the limit(20) window.
+  // Only status='pending' blocks; resolved/expired/approved/rejected entries
+  // are ignored, permitting legitimate re-sends after an expiry/failure.
+  // Paired with sql/008_approval_queue_ttl.sql (48h TTL auto-expiry).
+  const { data: trackedRows } = await supabase
+    .from('groupme_approval_requests')
+    .select('batch_id')
+    .eq('status', 'pending');
+  const trackedBatchIds = new Set((trackedRows || []).map(r => r.batch_id).filter(Boolean));
+
+  const { data: rawApprovalActions } = await supabase.from('agent_actions')
+    .select('*')
+    .eq('status', 'pending_approval')
+    .order('created_at', { ascending: true })
+    .limit(100);
+
+  const approvalActions = (rawApprovalActions || [])
+    .filter(a => !trackedBatchIds.has(a.batch_id || `s_${a.id}`))
+    .slice(0, 20);
+
   if (approvalActions?.length) {
     const approvalBatches = new Map();
     for (const a of approvalActions) { const k = a.batch_id || `s_${a.id}`; if (!approvalBatches.has(k)) approvalBatches.set(k, []); approvalBatches.get(k).push(a); }
     for (const [batchId, actions] of approvalBatches) {
-      const { data: existing } = await supabase.from('groupme_approval_requests').select('id').eq('batch_id', batchId).maybeSingle();
-      if (!existing) {
-        const firstAction = actions[0];
-        const { name, phone, lpLead, ghlContactId } = await resolveContactInfo(firstAction.target_id);
-        const prospectId = await resolveLPProspectId(firstAction.target_id);
-        const ctx = await getEventContext(firstAction);
-        const enrichment = await buildNotificationEnrichment(firstAction.target_id, ctx, { lpLead, prospectId, ghlContactId });
+      // Defense-in-depth: re-check for an active tracking record inside the
+      // loop. Guards against concurrent executor runs (heartbeat +
+      // approval-triggered execute) from double-sending the same card.
+      const { data: existing } = await supabase
+        .from('groupme_approval_requests')
+        .select('id')
+        .eq('batch_id', batchId)
+        .eq('status', 'pending')
+        .maybeSingle();
+      if (existing) continue;
 
-        if (firstAction.action_type === 'send_message' && firstAction.action_payload?.requires_ai_generation) {
-          try {
-            const { generateResponse } = await import('./response-generator.js');
-            const triggerMessage = ctx.message_text || ctx.messageText || ctx.body || 'No trigger message';
-            const channel = firstAction.action_payload?.channel || 'sms';
+      const firstAction = actions[0];
+      const { name, phone, lpLead, ghlContactId } = await resolveContactInfo(firstAction.target_id);
+      const prospectId = await resolveLPProspectId(firstAction.target_id);
+      const ctx = await getEventContext(firstAction);
+      const enrichment = await buildNotificationEnrichment(firstAction.target_id, ctx, { lpLead, prospectId, ghlContactId });
 
-            console.log(`[ActionExecutor] Pre-generating AI response for approval ${batchId}`);
-            const generated = await generateResponse(firstAction.target_id, channel, triggerMessage);
+      if (firstAction.action_type === 'send_message' && firstAction.action_payload?.requires_ai_generation) {
+        try {
+          const { generateResponse } = await import('./response-generator.js');
+          // v4.2 — message_preview is the canonical inbound field on
+          // ai.analysis_completed events (what AGENTIC_* rules fire on).
+          // Still accept message_text/messageText/body from ghl.reply_received
+          // and other event shapes.
+          const triggerMessage = ctx.message_text || ctx.messageText || ctx.body || ctx.message_preview || 'No trigger message';
+          const channel = firstAction.action_payload?.channel || 'sms';
 
-            const updatedPayload = {
-              ...firstAction.action_payload,
-              message: generated.message,
-              subject: generated.subject,
-              story_arc: generated.story_arc,
-              ai_reasoning: generated.reasoning,
-              requires_ai_generation: false,
-              pre_generated: true,
-              generated_at: new Date().toISOString(),
-            };
+          console.log(`[ActionExecutor] Pre-generating AI response for approval ${batchId}`);
+          const generated = await generateResponse(firstAction.target_id, channel, triggerMessage);
 
-            await supabase.from('agent_actions')
-              .update({ action_payload: updatedPayload, updated_at: new Date().toISOString() })
-              .eq('id', firstAction.id);
+          const updatedPayload = {
+            ...firstAction.action_payload,
+            message: generated.message,
+            subject: generated.subject,
+            story_arc: generated.story_arc,
+            ai_reasoning: generated.reasoning,
+            requires_ai_generation: false,
+            pre_generated: true,
+            generated_at: new Date().toISOString(),
+          };
 
-            enrichment.generatedMessage = generated.message;
-            enrichment.storyArc = generated.story_arc;
-            enrichment.aiReasoning = generated.reasoning;
+          await supabase.from('agent_actions')
+            .update({ action_payload: updatedPayload, updated_at: new Date().toISOString() })
+            .eq('id', firstAction.id);
 
-            console.log(`[ActionExecutor] Pre-generated: "${generated.message.slice(0, 80)}..." (arc: ${generated.story_arc})`);
-          } catch (err) {
-            console.error(`[ActionExecutor] Pre-approval generation failed for ${batchId}: ${err.message}`);
-            enrichment.generatedMessage = null;
-            enrichment.aiGenerationError = err.message;
-          }
+          enrichment.generatedMessage = generated.message;
+          enrichment.storyArc = generated.story_arc;
+          enrichment.aiReasoning = generated.reasoning;
+
+          console.log(`[ActionExecutor] Pre-generated: "${generated.message.slice(0, 80)}..." (arc: ${generated.story_arc})`);
+        } catch (err) {
+          console.error(`[ActionExecutor] Pre-approval generation failed for ${batchId}: ${err.message}`);
+          enrichment.generatedMessage = null;
+          enrichment.aiGenerationError = err.message;
         }
-
-        await sendApprovalRequest(actions, name, phone, enrichment).catch(err => { console.error(`[ActionExecutor] Approval request failed for batch ${batchId}:`, err.message); });
       }
+
+      await sendApprovalRequest(actions, name, phone, enrichment).catch(err => { console.error(`[ActionExecutor] Approval request failed for batch ${batchId}:`, err.message); });
     }
   }
 
