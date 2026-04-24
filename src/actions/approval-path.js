@@ -12,6 +12,14 @@
  *   3. triggerMessage resolution accepts message_preview (the field on
  *      ai.analysis_completed events that AGENTIC_* rules fire on).
  *
+ * v4.3 (2026-04-24) — Pre-generation now searches the batch for the
+ * send_message action instead of checking only actions[0]. Rules that
+ * emit multiple actions (e.g. AGENTIC_RESPOND_POST_CHATBOT emits
+ * [add_tag pause-bot, send_message]) put send_message at index 1, so the
+ * firstAction check never matched and cards shipped to GroupMe without the
+ * 📱 AI response preview line. Now we find the send_message action by
+ * action_type and pre-generate for it specifically.
+ *
  * Paired with sql/008_approval_queue_ttl.sql which auto-expires unanswered
  * approvals after 48h so the tracked-batch set stays bounded.
  */
@@ -73,7 +81,17 @@ export async function processApprovalQueue() {
     const ctx = await getEventContext(firstAction);
     const enrichment = await buildNotificationEnrichment(firstAction.target_id, ctx, { lpLead, prospectId, ghlContactId });
 
-    if (firstAction.action_type === 'send_message' && firstAction.action_payload?.requires_ai_generation) {
+    // v4.3 — Search the whole batch for a send_message action that needs
+    // pre-generation. Rules like AGENTIC_RESPOND_POST_CHATBOT emit
+    // [add_tag pause-bot (index 0), send_message (index 1)], so checking
+    // only actions[0] misses the generation trigger. The card then ships
+    // without the 📱 "..." preview line even though the payload asks for
+    // AI generation.
+    const sendAction = actions.find(
+      a => a.action_type === 'send_message' && a.action_payload?.requires_ai_generation
+    );
+
+    if (sendAction) {
       try {
         const { generateResponse } = await import('../response-generator.js');
         // v4.2 — message_preview is the canonical inbound field on
@@ -81,13 +99,13 @@ export async function processApprovalQueue() {
         // Still accept message_text/messageText/body from ghl.reply_received
         // and other event shapes.
         const triggerMessage = ctx.message_text || ctx.messageText || ctx.body || ctx.message_preview || 'No trigger message';
-        const channel = firstAction.action_payload?.channel || 'sms';
+        const channel = sendAction.action_payload?.channel || 'sms';
 
-        console.log(`[ActionExecutor] Pre-generating AI response for approval ${batchId}`);
-        const generated = await generateResponse(firstAction.target_id, channel, triggerMessage);
+        console.log(`[ActionExecutor] Pre-generating AI response for approval ${batchId} (send_message action ${sendAction.id})`);
+        const generated = await generateResponse(sendAction.target_id, channel, triggerMessage);
 
         const updatedPayload = {
-          ...firstAction.action_payload,
+          ...sendAction.action_payload,
           message: generated.message,
           subject: generated.subject,
           story_arc: generated.story_arc,
@@ -99,7 +117,7 @@ export async function processApprovalQueue() {
 
         await supabase.from('agent_actions')
           .update({ action_payload: updatedPayload, updated_at: new Date().toISOString() })
-          .eq('id', firstAction.id);
+          .eq('id', sendAction.id);
 
         enrichment.generatedMessage = generated.message;
         enrichment.storyArc = generated.story_arc;
