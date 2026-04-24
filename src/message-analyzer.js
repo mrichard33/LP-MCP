@@ -12,6 +12,21 @@
  * 
  * Output: Structured assessment written to lead_intelligence table
  *         + ai.analysis_completed event emitted for Decision Engine.
+ *
+ * v1.2 (2026-04-24) — Cache keyed by message content hash, not contactId.
+ *   PROBLEM: v1.1 cached by contactId alone with a 1-hour TTL. Result: if
+ *   a contact replied twice within an hour, the second reply was silently
+ *   skipped — no re-analysis, no ai.analysis_completed event, and downstream
+ *   rules like AGENTIC_RESPOND_POST_CHATBOT never fired. Reply-to-reply
+ *   agentic conversation was structurally broken.
+ *
+ *   FIX: Cache key is now `${contactId}:${sha256(messageText).slice(0,16)}`.
+ *   Same exact message within TTL = skipped (webhook retry protection).
+ *   Different message anytime = analyzed. TTL shortened from 1h → 2min
+ *   because content-hashing made the long window unnecessary and kept
+ *   contacts locked out of re-engagement for too long.
+ *
+ *   Override TTL with env var ANALYSIS_CACHE_TTL_MS if needed.
  * 
  * v1.1 — ACCURACY ENHANCEMENT:
  *   - Enhanced system prompt with explicit instructions to weigh LP notes heavily
@@ -25,16 +40,21 @@
  * Cost controls:
  *   - Skip messages < 3 words (handled by behavioral-emitter)
  *   - Rate limit: ANALYSIS_RATE_LIMIT per hour (default 100)
- *   - Cache: Don't re-analyze same contact within ANALYSIS_CACHE_TTL_MS
+ *   - Cache: Don't re-analyze same (contact, message) pair within ANALYSIS_CACHE_TTL_MS
  *   - Model: claude-sonnet-4-20250514 (cost-effective)
  */
 
+import crypto from 'node:crypto';
 import { buildLeadContext, upsertLeadIntelligence } from './context-builder.js';
 import { emitEvent } from './event-emitter.js';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const ANALYSIS_RATE_LIMIT = parseInt(process.env.ANALYSIS_RATE_LIMIT || '100', 10);
-const ANALYSIS_CACHE_TTL_MS = parseInt(process.env.ANALYSIS_CACHE_TTL_MS || '3600000', 10);
+// v1.2: default shortened from 3600000 (1h) → 120000 (2min). Content-hash
+// keying means the only reason to cache is webhook retry suppression, and
+// 2 minutes is more than enough for that. If a customer legitimately sends
+// the same identical string twice within 2 min, we still skip (likely retry).
+const ANALYSIS_CACHE_TTL_MS = parseInt(process.env.ANALYSIS_CACHE_TTL_MS || '120000', 10);
 const MODEL = 'claude-sonnet-4-20250514';
 
 // ═══════════════════════════════════════════════════════════════════
@@ -56,23 +76,45 @@ function checkRateLimit() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// ANALYSIS CACHE
+// ANALYSIS CACHE — v1.2: keyed by (contactId, messageHash)
 // ═══════════════════════════════════════════════════════════════════
 
 const analysisCache = new Map();
 
-function wasRecentlyAnalyzed(contactId) {
-  const last = analysisCache.get(contactId);
+/**
+ * Build a cache key that reflects BOTH contact and message content.
+ * Hashing the message means:
+ *   - duplicate webhook deliveries of the same message → cache hit, skipped
+ *   - new message from same contact → different key, always analyzed
+ * Takes first 16 hex chars of sha256 — plenty of collision resistance
+ * for short-TTL in-memory caching.
+ */
+function buildCacheKey(contactId, messageText) {
+  const msgHash = crypto
+    .createHash('sha256')
+    .update(String(messageText || ''))
+    .digest('hex')
+    .slice(0, 16);
+  return `${contactId}:${msgHash}`;
+}
+
+function wasRecentlyAnalyzed(contactId, messageText) {
+  const key = buildCacheKey(contactId, messageText);
+  const last = analysisCache.get(key);
   if (!last) return false;
   return (Date.now() - last) < ANALYSIS_CACHE_TTL_MS;
 }
 
-function markAnalyzed(contactId) {
-  analysisCache.set(contactId, Date.now());
+function markAnalyzed(contactId, messageText) {
+  const key = buildCacheKey(contactId, messageText);
+  analysisCache.set(key, Date.now());
+  // Periodic cleanup: drop entries older than TTL when the cache grows.
+  // Keyed cleanup because entries are now per-(contact, message) rather
+  // than per-contact, so the map can grow faster with active conversations.
   if (analysisCache.size > 1000) {
     const cutoff = Date.now() - ANALYSIS_CACHE_TTL_MS;
-    for (const [key, val] of analysisCache) {
-      if (val < cutoff) analysisCache.delete(key);
+    for (const [k, v] of analysisCache) {
+      if (v < cutoff) analysisCache.delete(k);
     }
   }
 }
@@ -333,8 +375,12 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null) 
     console.warn(`[MessageAnalyzer] Rate limit reached (${ANALYSIS_RATE_LIMIT}/hr). Skipping ${ghlContactId}`);
     return null;
   }
-  if (wasRecentlyAnalyzed(ghlContactId)) {
-    console.log(`[MessageAnalyzer] Skipping ${ghlContactId} — analyzed within cache TTL`);
+  // v1.2: cache check is now (contact, messageHash) — so a genuinely new
+  // reply from the same contact passes even when a prior reply was
+  // analyzed recently. Only exact duplicates (webhook retries or copy-
+  // pastes) within the short TTL are skipped.
+  if (wasRecentlyAnalyzed(ghlContactId, messageText)) {
+    console.log(`[MessageAnalyzer] Skipping ${ghlContactId} — identical message already analyzed within ${Math.round(ANALYSIS_CACHE_TTL_MS / 1000)}s (likely retry)`);
     return null;
   }
   if (!ANTHROPIC_API_KEY) {
@@ -411,7 +457,7 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null) 
       idempotency_key: `ai_analysis_${ghlContactId}_${Date.now()}`,
     });
 
-    markAnalyzed(ghlContactId);
+    markAnalyzed(ghlContactId, messageText);
 
     const elapsed = Date.now() - startTime;
     const lpNote = context.lp?.matched ? '(LP✓)' : context.lp?._fallback_used ? '(LP-fallback✓)' : '(no LP)';
@@ -463,7 +509,8 @@ export async function analyzePendingReplies({ limit = 10 } = {}) {
 
     const result = await analyzeMessage(contactId, messageText, event.id);
     if (result) { analyzed++; }
-    else if (wasRecentlyAnalyzed(contactId)) { skipped++; }
+    // v1.2: pass messageText to match the new (contact, message) cache key
+    else if (wasRecentlyAnalyzed(contactId, messageText)) { skipped++; }
     else { failed++; }
 
     await (await import('./supabase.js')).default
@@ -516,6 +563,7 @@ export function registerMessageAnalyzerRoutes(app) {
       rate_limit: ANALYSIS_RATE_LIMIT,
       remaining: Math.max(0, ANALYSIS_RATE_LIMIT - analysisCount),
       cache_size: analysisCache.size,
+      cache_ttl_ms: ANALYSIS_CACHE_TTL_MS,
       api_key_configured: !!ANTHROPIC_API_KEY,
     });
   });
