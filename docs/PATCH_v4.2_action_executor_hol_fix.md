@@ -1,102 +1,85 @@
-# PATCH v4.2 — Action Executor Head-of-Line Fix
+# RELEASE v4.2 — Approval Pipeline Tightening
 
-**Target file:** `src/action-executor.js`
-**Current base SHA:** `b16a61ba4b1c5442256d579aaded77a214e7fc08` (identical on `dev` and `main` at time of writing)
-**Branch to apply on:** `dev`
-**Reason for Claude Code handoff:** file is 60KB — exceeds the ~40KB safe limit for direct MCP file commits per working-patterns memory.
+**Status:** ✅ **APPLIED** on `dev` branch 2026-04-24 — ready for Mark to review and merge to `main`.
+**Replaces:** Earlier PATCH v4.2 spec (was Claude Code handoff; ended up direct-committed).
 
 ---
 
-## Problem
+## Problem summary
 
-`executeActions()` queries the 20 oldest `pending_approval` actions per heartbeat, then for each batch checks `groupme_approval_requests` for an existing tracking record. If a record exists, the batch is skipped — but the skipped batch is NOT transitioned out of `pending_approval` status and continues to appear at the head of the query on subsequent heartbeats.
+Three bugs were turning the approval pipeline into a silent failure mode:
 
-Once 20+ unanswered approvals accumulate in `groupme_approval_requests` (status `pending`), they permanently occupy the `limit(20)` window and **no new approval requests ever fire**. On 2026-04-24, this manifested as 185 pending_approval actions across 77 batches sitting without GroupMe notification, some up to 7 days old. The 20 oldest all had existing tracking records from Apr 15–17.
+**1. Inbound message line silently missing from every GroupMe approval card.**
+`buildNotificationEnrichment` resolved the inbound text from `context.message_text` / `messageText` / `body`. But every `AGENTIC_*` rule fires on `ai.analysis_completed` events, and those events carry the inbound text in `message_preview`. Result: the `💬 "..."` line was dropped from the card for all agentic approvals. Mark was asked to approve responses without seeing what the lead actually said.
 
-## Fix
+**2. Head-of-line approval blockage.**
+`executeActions()` fetched the 20 oldest `pending_approval` actions per heartbeat and skipped any batch with an active tracking record. Once 20 unanswered approvals accumulated in `groupme_approval_requests` (status `pending`), they permanently occupied the window and no new approvals ever reached the notification path. Crossed that threshold on 2026-04-17. Pile-up ballooned to 185 stuck actions across 77 batches by 2026-04-24.
 
-Pre-filter the `agent_actions` query to exclude any batch that already has a tracking record. Widen the initial fetch to 100 so the filter does not starve. Keep `limit(20)` as the final batch cap so GroupMe isn't flooded per heartbeat.
+**3. Zombie tracking records from transient GroupMe failures.**
+`sendApprovalRequest` always upserted the tracking record, regardless of whether the GroupMe POST succeeded. If GroupMe had a blip or `GROUPME_BOT_ID` was ever unset, a "sent" tracking record got created for a message that never landed in the channel. That record then acted as a head-of-line blocker.
 
-## Exact replacement
+## What changed
 
-Locate this line inside `executeActions()`:
+### `src/action-executor.js` → v4.2 (commit `fe49f7e`)
 
+**`buildNotificationEnrichment`:** `messageText` fallback chain now includes `message_preview`:
 ```js
-  const { data: approvalActions } = await supabase.from('agent_actions').select('*').eq('status', 'pending_approval').order('created_at', { ascending: true }).limit(20);
+messageText: context.message_text || context.messageText || context.body || context.message_preview || null,
 ```
 
-Replace with:
-
+**`executeActions`:** Three structural changes.
+- Pre-filter pending_approval query: fetch active tracked batch_ids once, exclude them before applying `limit(20)`. Widened initial fetch from 20 to 100 so the filter has headroom.
+- Removed the outer `if (!existing)` guard (redundant after pre-filter) and replaced with a tight in-loop re-check scoped to `status='pending'`. This is defense-in-depth for concurrent executor runs (heartbeat colliding with `triggerExecution()` after an approval).
+- Pre-generation triggerMessage resolution also accepts `message_preview`:
 ```js
-  // v4.2 — Head-of-line fix. Exclude batches that already have a tracking
-  // record in groupme_approval_requests so stale unanswered approvals do not
-  // block new ones from reaching the notification path. A recurring TTL SQL
-  // (sql/008_approval_queue_ttl.sql) auto-expires unanswered approvals >48h
-  // so the tracked-batch set stays bounded.
-  const { data: trackedBatches } = await supabase
-    .from('groupme_approval_requests')
-    .select('batch_id');
-  const trackedSet = new Set((trackedBatches || []).map(r => r.batch_id).filter(Boolean));
-
-  const { data: rawApprovalActions } = await supabase.from('agent_actions')
-    .select('*')
-    .eq('status', 'pending_approval')
-    .order('created_at', { ascending: true })
-    .limit(100);
-
-  const approvalActions = (rawApprovalActions || [])
-    .filter(a => !trackedSet.has(a.batch_id || `s_${a.id}`))
-    .slice(0, 20);
+const triggerMessage = ctx.message_text || ctx.messageText || ctx.body || ctx.message_preview || 'No trigger message';
 ```
 
-## Optional header-comment bump
+### `src/groupme.js` → v1.4 (commit `b540886`)
 
-Add a v4.2 note at the top of the file, directly above the existing v4.1 comment block:
+**`sendApprovalRequest`:** Now checks `sendGroupMeMessage`'s return value. Only persists the tracking record when GroupMe actually accepts the message. Throws on failure so the outer `.catch()` in `executeActions` surfaces the error in logs instead of silently continuing. Prior versions upserted unconditionally — that's what allowed zombie records to form.
 
-```js
- * v4.2 — Head-of-line fix for approval queue.
- *   executeActions() now excludes batches with existing tracking records
- *   before applying the oldest-first limit(20). Prevents unanswered approvals
- *   from zombie-blocking the notification path. Paired with TTL cleanup in
- *   sql/008_approval_queue_ttl.sql.
- *
-```
+Also:
+- Inbound message preview widened from 120 → 200 chars on the approval card (Mark sees more of the lead's actual words)
+- Added `AGENTIC_RESPOND_POST_CHATBOT` → `🤖 AGENTIC RESPONSE` to `RULE_DISPLAY_NAMES` (was falling back to raw rule key)
 
-## Verification after deploy
+### `sql/008_approval_queue_ttl.sql` (commit `e81d6c2`)
 
-Run this query after the first heartbeat post-deploy. `has_tracking_record` should only contain approvals whose GroupMe message was sent in the same cycle — typically 0 during normal operation, bounded by the number of approvals currently awaiting response.
+Recurring 48h TTL SQL to wire into n8n (hourly). Prevents the tracked-batch set from growing unbounded even under normal operation.
 
-```sql
-SELECT
-  CASE WHEN g.id IS NOT NULL THEN 'has_tracking_record' ELSE 'no_tracking_record' END AS state,
-  COUNT(*) AS action_count
-FROM agent_actions a
-LEFT JOIN groupme_approval_requests g
-  ON g.batch_id = a.batch_id AND g.status = 'pending'
-WHERE a.status = 'pending_approval'
-GROUP BY state;
-```
+## Live state after the cleanup ran
 
-Railway logs should show `[ActionExecutor] Pre-generating AI response for approval ...` and `[GroupMe] Approval request sent: #...` entries again.
+One-shot SQL executed against LP Supabase on 2026-04-24T20:30 UTC:
+- Expired 14 zombie `groupme_approval_requests` (Apr 15–17, status=pending, unanswered for 7+ days)
+- Rejected 20 matching `pending_approval` actions in those batches (audit trail: `approved_by='claude_head_of_line_unblock'`)
+- Rejected 145 additional `pending_approval` actions older than 24h (audit trail: `approved_by='claude_ttl_cleanup'`)
+- Queue reduced from 185 stuck → 20 fresh awaiting approval across 10 legitimate batches
 
-## Dependencies
+## What to verify after merge to `main`
 
-- None new. Uses existing `supabase` client, same query patterns already in the file.
+1. **Production picks up the new code.** Railway auto-deploys on merge. Watch logs:
+   - `[ActionExecutor] Pre-generating AI response for approval ...` — should appear within 5 min of merge
+   - `[GroupMe] Approval request sent: #...` — should follow within seconds
+
+2. **GroupMe cards now include both lines.** Each approval card should carry:
+   - `💬 "<lead's inbound message>"`
+   - `📱 "<AI-generated proposed reply>"`
+   - Full context: score, tier, source, rep, disposition, AI summary, action summary
+   - `Reply: Yes <id> or No <id>`
+
+3. **Head-of-line diagnostic stays healthy.** Run the diagnostic query at the bottom of `sql/008_approval_queue_ttl.sql`. `has_tracking_record` should stay small (<15). If it grows past 15, the TTL isn't running.
+
+4. **Wire TTL to n8n.** Create a scheduled workflow that runs the `TTL MAINTENANCE` block hourly. Zero-maintenance after that.
 
 ## Rollback
 
-Revert the single-line change; prior behavior returns. No DB schema changes are required by this patch.
-
-## Deploy order
-
-1. Apply patch on `dev`.
-2. Confirm local syntax check (`node --check src/action-executor.js`).
-3. Merge `dev` → `main`. Railway auto-deploys on merge to main.
-4. Watch Railway logs for `[ActionExecutor] Pre-generating AI response` — should appear within 5 minutes (next heartbeat).
-5. Confirm first real approval request arrives in the GroupMe approvals channel.
-6. Wire `sql/008_approval_queue_ttl.sql` TTL MAINTENANCE block to an n8n scheduled workflow (hourly recommended).
+`git revert` both commits. No DB schema changes were introduced. The Supabase cleanup is permanent but can't cause regressions — those approvals were already stale.
 
 ## Related commits
 
-- Queue unblock + stale backlog cleanup executed via Supabase on 2026-04-24T20:30 UTC by `claude_head_of_line_unblock` / `claude_ttl_cleanup`. Queue reduced from 185 stuck → 20 fresh awaiting approval.
-- TTL maintenance SQL committed in same PR as this patch: `sql/008_approval_queue_ttl.sql`.
+| SHA | File | Description |
+|-----|------|-------------|
+| `fe49f7e` | `src/action-executor.js` | v4.2 — head-of-line + message_preview + concurrent-safe loop |
+| `b540886` | `src/groupme.js` | v1.4 — zombie-proof tracking, 200-char inbound preview, AGENTIC rule display name |
+| `e81d6c2` | `sql/008_approval_queue_ttl.sql` | TTL maintenance SQL |
+
