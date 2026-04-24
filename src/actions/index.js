@@ -11,7 +11,9 @@
  * it in ACTION_HANDLERS.
  *
  * Refactored from src/action-executor.js on 2026-04-24. Behavior preserved
- * exactly; v4.2 approval-pipeline fixes live in approval-path.js.
+ * exactly; v4.2 approval-pipeline fixes live in approval-path.js. Stuck-
+ * action reaper (added 2026-04-24) runs first as defense against Railway
+ * redeploys killing processes mid-handler.
  *
  * Supported action types (15):
  *   add_tag, remove_tag, move_opportunity, update_opportunity,
@@ -26,6 +28,7 @@ import { executeSendMessage } from '../send-message-handler.js';
 import { registerRateLimiterRoutes } from '../ghl-rate-limiter.js';
 import { getEventContext } from './resolvers.js';
 import { processApprovalQueue } from './approval-path.js';
+import { reapStuckActions } from './reaper.js';
 
 // ─── Handlers ──────────────────────────────────────────────────────
 import { executeAddTag, executeRemoveTag } from './handlers/tags.js';
@@ -121,6 +124,11 @@ async function executeSingleAction(action, batchContext = {}) {
 export async function executeActions({ limit = 50 } = {}) {
   const startTime = Date.now();
 
+  // Phase 0: reap any 'executing' actions stuck from a killed process.
+  // Requeues idempotent ones to 'pending' (they'll run in phase 2 below)
+  // and fails non-idempotent / retry-exhausted ones with an audit trail.
+  const reaperResult = await reapStuckActions();
+
   // Phase 1: process any pending_approval actions (send GroupMe cards).
   const approvalRequestsSent = await processApprovalQueue();
 
@@ -138,6 +146,7 @@ export async function executeActions({ limit = 50 } = {}) {
       success: true,
       actions_executed: 0,
       approval_requests_sent: approvalRequestsSent,
+      stuck_actions_reaped: reaperResult.reaped || 0,
       elapsed_ms: Date.now() - startTime,
     };
   }
@@ -173,6 +182,8 @@ export async function executeActions({ limit = 50 } = {}) {
     failed,
     retrying: results.filter(r => r.status === 'pending').length,
     approval_requests_sent: approvalRequestsSent,
+    stuck_actions_reaped: reaperResult.reaped || 0,
+    reaper_detail: reaperResult.reaped > 0 ? reaperResult : undefined,
     results,
     elapsed_ms: elapsed,
   };
@@ -193,17 +204,19 @@ export function registerActionExecutorRoutes(app) {
 
   app.get('/n8n/decision-engine/execution-stats', async (req, res) => {
     try {
-      const [p, a, c, f] = await Promise.all([
+      const [p, a, c, f, e] = await Promise.all([
         supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'pending'),
         supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'pending_approval'),
         supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'completed'),
         supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'failed'),
+        supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'executing'),
       ]);
       res.json({
         pending: p.count || 0,
         pending_approval: a.count || 0,
         completed: c.count || 0,
         failed: f.count || 0,
+        executing: e.count || 0,
       });
     } catch (err) {
       res.status(500).json({ error: err.message });
