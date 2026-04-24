@@ -11,6 +11,18 @@
  *   - User replies "Yes 1234" or "No 1234" (where 1234 = batch ID prefix)
  *   - Webhook handler matches reply → approves/rejects batch → executes
  *
+ * v1.4 — Zombie-proof tracking (2026-04-24).
+ *   sendApprovalRequest now checks the sendGroupMeMessage return value and
+ *   only inserts the groupme_approval_requests tracking record when GroupMe
+ *   actually accepted the message. Prior versions upserted unconditionally,
+ *   which could create phantom "pending" records if GroupMe was transiently
+ *   unavailable — those records then acted as head-of-line blockers in
+ *   action-executor.js's approval loop. Paired with action-executor v4.2.
+ *
+ *   Also throws on GroupMe delivery failure so the outer .catch() in
+ *   executeActions surfaces the error visibly in logs instead of silently
+ *   moving on.
+ *
  * v1.3 — Auto-execute after approval.
  *   After an approval updates actions to 'pending', immediately triggers
  *   the action executor via internal HTTP call. Eliminates the delay between
@@ -110,6 +122,7 @@ const RULE_DISPLAY_NAMES = {
   'BEHAVIORAL_DISENGAGEMENT':     '📉 DISENGAGEMENT',
   'BEHAVIORAL_ESCALATE_REP':      '🚨 REP ESCALATION',
   'BEHAVIORAL_DNC_REPLY':         '🚫 DNC REPLY',
+  'AGENTIC_RESPOND_POST_CHATBOT': '🤖 AGENTIC RESPONSE',
 };
 
 /**
@@ -135,6 +148,9 @@ function formatActionSummary(actions) {
 
 /**
  * v1.2: Enriched approval request with full decision context.
+ * v1.4: Only persists tracking record when GroupMe actually accepts the
+ *       message — prevents zombie records that could head-of-line block
+ *       the executor's approval loop.
  */
 export async function sendApprovalRequest(batchActions, contactName, contactPhone, enrichment = {}) {
   if (!batchActions?.length) return;
@@ -152,9 +168,9 @@ export async function sendApprovalRequest(batchActions, contactName, contactPhon
   lines.push(`${ruleName}`);
   lines.push(`👤 ${contactName || 'Unknown'}${contactPhone ? ` (${contactPhone})` : ''}`);
 
-  // Context: what triggered this
+  // Context: what triggered this (inbound message from lead)
   if (enrichment.messageText) {
-    const msg = enrichment.messageText.slice(0, 120);
+    const msg = enrichment.messageText.slice(0, 200);
     lines.push(`💬 "${msg}"${enrichment.messageType ? ` [${enrichment.messageType}]` : ''}`);
   }
 
@@ -195,7 +211,13 @@ export async function sendApprovalRequest(batchActions, contactName, contactPhon
 
   const msg = lines.join('\n');
 
-  await sendGroupMeMessage(msg);
+  // v1.4 — Send first. Only persist the tracking record if GroupMe accepted it.
+  // If delivery failed, throw so the outer catch in executeActions surfaces the
+  // error and the batch stays unprocessed for the next heartbeat to retry.
+  const sendResult = await sendGroupMeMessage(msg);
+  if (!sendResult?.sent) {
+    throw new Error(`GroupMe delivery failed: ${sendResult?.reason || 'unknown'} — not persisting tracking record so batch ${batchId} can retry next heartbeat`);
+  }
 
   // Store the mapping so we can match replies
   await supabase.from('groupme_approval_requests').upsert({
