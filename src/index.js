@@ -27,6 +27,8 @@ import { registerRestApiRoutes } from './rest-api.js';
 import { registerGroupMeRoutes } from './groupme.js';
 // ─── LP Appointment Sync (GHL → LP) ────────────────────────────
 import { registerLPAppointmentSyncRoutes } from './lp-appointment-sync.js';
+// ─── Workflow Completion (tag-based self-enrichment) ─────────────
+import { registerWorkflowCompletionRoutes } from './workflow-completion-handler.js';
 // ─── Admin ──────────────────────────────────────────────────────
 import { runEmailBackfill } from './admin/email-backfill.js';
 import { registerEmailCleanupRoutes } from './admin/email-cleanup.js';
@@ -152,6 +154,7 @@ app.get('/health', (req, res) => {
         'POST /webhook/ghl/engagement',
         'POST /webhook/ghl/lead-score',
         'POST /webhook/ghl/workflow',
+        'POST /webhook/ghl/workflow-tag',
         'POST /webhook/ghl/set-lp-appointment',
       ],
     },
@@ -294,6 +297,16 @@ registerGroupMeRoutes(app);
 // ─── LP Appointment Sync (GHL → LP) ────────────────────────────
 registerLPAppointmentSyncRoutes(app);
 
+// ─── Workflow Completion (tag-based self-enrichment) ─────────────
+// Pairs with /webhook/ghl/workflow in behavioral-emitter.js. The /workflow
+// path is the older, payload-based handler (requires workflowId in body —
+// none of the current 61 GHL webhook steps populate the body, so every
+// emitted event has workflow_id: null and is useless for analytics). The
+// /workflow-tag path here is the replacement: the GHL step sends only
+// {contactId}, this handler self-enriches by reading completed:wXX tags
+// from the GHL API and resolves them via the local TAG_TO_WORKFLOW map.
+registerWorkflowCompletionRoutes(app);
+
 // ─── Admin ──────────────────────────────────────────────────────
 app.post('/admin/email-backfill', async (req, res) => {
   try {
@@ -312,7 +325,7 @@ app.listen(PORT, async () => {
   console.log(`n8n APIs:     POST /n8n/enrich-lead | /n8n/refresh-token | /n8n/prospect-lookup | /n8n/time-to-appointment`);
   console.log(`Avatar APIs:  POST /n8n/avatar/score | /parse-gpt | /unified-inputs | /pick-best | /build-ghl | /build-notion`);
   console.log(`Decision:     POST /n8n/decision-engine/process | /execute | GET /status | /execution-stats`);
-  console.log(`Layer 3:      POST /webhook/ghl/{reply,appointment,engagement,lead-score,workflow}`);
+  console.log(`Layer 3:      POST /webhook/ghl/{reply,appointment,engagement,lead-score,workflow,workflow-tag}`);
   console.log(`Intelligence: GET /n8n/lead-intelligence/context | POST /n8n/analyze-pending-replies | /n8n/analyze-message`);
   console.log(`Intent:       POST /n8n/intent/score | /n8n/intent/sweep | GET /n8n/intent/breakdown`);
   console.log(`REST API:     GET /api/prospects/:id | /api/leads/:id | /api/search | /api/lead-summary/:contactId`);
