@@ -3,9 +3,9 @@
 // On STATUS_CHANGED → APPOINTMENT_PENDING (first APPT request from IME):
 //   1. Fetch full WO from IME GET /WorkOrders/{id}
 //   2. Find the GHL contact stub created by W-IME-IN
-//   3. Update GHL contact with real customer data + ime_enrichment_status
-//   4. POST to LP /api/Leads/AddLead, capture in1_id
-//   5. Write lp_inbound_lead_id back to GHL custom field
+//   3. Update GHL contact custom fields (ime_enrichment_status='enriched', etc.)
+//   4. Tag flip: add ime-enriched, remove ime-stub-pending-enrichment (v1.6)
+//   5. POST to LP /api/Leads/AddLead, capture in1_id, write back to GHL
 //   6. Persist Supabase ime_work_orders row with full state
 //
 // Failures at step 4 are partial successes — we still leave GHL enriched and
@@ -17,6 +17,8 @@ import {
   getGHLContact,
   updateGHLContactFields,
   searchGHLContact,
+  applyGHLTag,
+  removeGHLTags,
 } from '../ghl.js';
 import { getWorkOrder } from './work-orders.js';
 import { addLeadFromIME } from './lp-bridge.js';
@@ -110,7 +112,19 @@ export async function enrichWorkOrder(woId) {
   await updateGHLContactFields(contact.id, enrichmentFields);
   console.log(`[ime] [enrich] GHL contact ${contact.id} marked enriched`);
 
-  // 4. POST to LP addlead
+  // 4. Tag flip — Railway owns this in v1.6 (was synchronous in W-IME-IN before).
+  // Adds ime-enriched, removes ime-stub-pending-enrichment. Non-fatal: a failure
+  // here doesn't block the LP addlead, since the GHL fields are already updated
+  // and the retry cron will re-attempt the whole pipeline if anything else fails.
+  try {
+    await applyGHLTag(contact.id, 'ime-enriched');
+    await removeGHLTags(contact.id, ['ime-stub-pending-enrichment']);
+    console.log(`[ime] [enrich] tag flip complete for contact ${contact.id}`);
+  } catch (err) {
+    console.warn(`[ime] [enrich] tag flip failed for ${contact.id} (non-fatal): ${err.message}`);
+  }
+
+  // 5. POST to LP addlead
   let lpResponse = null;
   let lpInboundId = null;
   try {
@@ -133,7 +147,7 @@ export async function enrichWorkOrder(woId) {
     return { ghlContactId: contact.id, lpInboundLeadId: null, partial: true };
   }
 
-  // 5. Persist Supabase row
+  // 6. Persist Supabase row
   await supabase.from('ime_work_orders').upsert(
     {
       ime_work_order_id:    woId,

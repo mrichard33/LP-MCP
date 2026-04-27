@@ -32,6 +32,34 @@ export function requireAuth(req, res, next) {
   next();
 }
 
+// Outbound guard (v1.6 §6) — verify the WO is IME-originated before pushing to IME.
+// Prevents Reece's non-Sam's-Club leads (HRR, Estimate Calculator, Chatbot,
+// Canvassing, Referral, etc.) from being sent to IME if a future GHL workflow
+// misfires. Stashes the row on req.imeWorkOrder for handlers that want it.
+export async function requireIMELead(req, res, next) {
+  const woId = parseInt(req.params.id, 10);
+  if (!woId || Number.isNaN(woId)) {
+    return res.status(400).json({ error: 'missing or invalid wo_id' });
+  }
+
+  const { data: row, error } = await supabase
+    .from('ime_work_orders')
+    .select('ime_work_order_id, ghl_contact_id, ime_enrichment_status')
+    .eq('ime_work_order_id', woId)
+    .maybeSingle();
+
+  if (error || !row) {
+    console.warn(`[ime] [guard] outbound blocked: WO ${woId} not in ime_work_orders (not an IME-originated lead)`);
+    return res.status(404).json({
+      error: 'not_an_ime_lead',
+      message: `WO ${woId} not found in ime_work_orders. Outbound IME calls are only permitted for leads originated via IME.`,
+    });
+  }
+
+  req.imeWorkOrder = row;
+  next();
+}
+
 // POST /ime/dispatch — called by GHL W-IME-IN Custom Webhook OUT
 export async function dispatch(req, res) {
   const body = req.body || {};
