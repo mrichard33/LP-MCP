@@ -13,6 +13,22 @@
  * Output: Structured assessment written to lead_intelligence table
  *         + ai.analysis_completed event emitted for Decision Engine.
  *
+ * v1.3 (2026-04-27) — CTA-affirmative override + recency-over-history.
+ *   PROBLEM: When a lead replied affirmatively ("Sure", "Yes", "OK") to
+ *   a clear CTA ("Want me to send the link?"), the analyzer would
+ *   over-weight historical objections (e.g. previously-detected price
+ *   concern) and return recommended_action='continue_current' with
+ *   objection-handler story arc deployment. Result: AGENTIC_PRICING_LINK
+ *   _RESPONSE didn't fire on what should have been the textbook auto-
+ *   send case. Surfaced 2026-04-27 with 15Z6TaUK4WHBK1R4H64S — three
+ *   "Sure" replies in one conversation, none triggered the link send.
+ *
+ *   FIX: High-priority CTA-AFFIRMATIVE OVERRIDE block placed at the
+ *   top of the system prompt (where the model attends most). Rule:
+ *   when most recent outbound is a CTA and inbound is a short
+ *   affirmative, recommended_action MUST be fast_track_booking
+ *   regardless of prior objections. Recency outweighs history.
+ *
  * v1.2 (2026-04-24) — Cache keyed by message content hash, not contactId.
  *   PROBLEM: v1.1 cached by contactId alone with a 1-hour TTL. Result: if
  *   a contact replied twice within an hour, the second reply was silently
@@ -129,6 +145,8 @@ You analyze inbound lead messages to determine their position in the buyer journ
 
 CRITICAL: You have access to LeadPerfection (LP) CRM data including rep notes, call history, disposition codes, and appointment status. LP NOTES AND DISPOSITION ARE YOUR MOST RELIABLE DATA SOURCE — they come from real sales reps who interacted with the lead in person. Always weigh LP data MORE heavily than the inbound message alone when they conflict.
 
+EQUALLY CRITICAL: The most recent outbound + inbound exchange in conversation_recent is the IMMEDIATE CONTEXT. Read the most recent outbound message FIRST to understand what the inbound is responding TO. A short reply like "Sure" or "Yes" is meaningless without knowing what was just asked. Recency in the conversation outweighs historical analyses.
+
 RETURN ONLY a valid JSON object — no markdown, no backticks, no explanation outside the JSON.
 
 Required JSON structure:
@@ -146,11 +164,58 @@ Required JSON structure:
   "reasoning": "<1-2 sentence explanation>"
 }
 
+═══════════════════════════════════════════════════════════════════
+CTA-AFFIRMATIVE OVERRIDE — HIGHEST-PRIORITY RULE
+═══════════════════════════════════════════════════════════════════
+
+BEFORE applying any other reasoning, scan the conversation_recent for this pattern:
+
+PATTERN: The most recent OUTBOUND message contains a direct CTA offering a specific resource (link, calculator, pricing, quote, calendar slot, demo). The inbound message is a short affirmative agreement.
+
+CTA OUTBOUND MARKERS — look in the 1–2 most recent outbound messages for any of these phrasings (or close variants):
+  • "Want me to send it?" / "Want it?" / "Want the link?"
+  • "Should I send the link/calculator/pricing/quote?"
+  • "Can I send you ___?"
+  • "Want to see your number?" / "Want to see your price?"
+  • "Want to grab a slot?" / "Ready to schedule?"
+  • "Should we get started?"
+  • "Want pricing?" / "Want me to send pricing?"
+  • Any question proposing a specific next step (link send, calendar booking, info delivery)
+
+AFFIRMATIVE INBOUND MARKERS — the lead's reply is one of:
+  • "sure" / "yes" / "yep" / "yeah" / "ya" / "yup" / "ok" / "okay"
+  • "yes please" / "send it" / "send me the link"
+  • "go ahead" / "absolutely" / "definitely"
+  • "sounds good" / "let's do it" / "sure thing" / "of course"
+  • Any short positive response (1–4 words) that signals agreement
+
+WHEN BOTH MATCH, YOU MUST RETURN:
+  • recommended_action: "fast_track_booking"
+  • fast_track_eligible: true
+  • buyer_stage: 4 (or 5 if appointment was offered)
+  • engagement_quality: "meaningful"
+  • objection_type: null (UNLESS the current message explicitly states a NEW objection)
+  • recommended_story_arc: null
+  • reasoning: brief — "Lead accepted CTA — deliver the offered resource."
+
+DO NOT, when this pattern fires:
+  • Deploy objection handlers (SA1/SA2/SA3/SA4/SA5)
+  • Add qualification questions ("how many windows?", "what's your timeline?")
+  • Add hedging preamble ("most folks are surprised by...", "before we dive in...")
+  • Re-deploy a prior objection's story arc because of historical context
+  • Set recommended_action to advance_stage or continue_current
+
+THE LEAD HAS EXPLICITLY ACCEPTED. DELIVER WHAT WAS OFFERED.
+
+OBJECTION RESOLUTION VIA CTA: If a lead previously had a price/timing/spouse/trust objection but now matches this pattern, the objection is FUNCTIONALLY RESOLVED by their acceptance of the proposed next action. Do not re-deploy the prior objection's handler. The historical objection is a data point, not a constraint.
+
+═══════════════════════════════════════════════════════════════════
+
 BUYER JOURNEY STAGES (Antifragile Sales System):
 Stage 1 (Indifferent) — Unaware of problem severity. Needs SA1/SA2/SA4.
 Stage 2 (Curious) — Aware, exploring. Asks "what" and "how" questions. Needs indoctrination.
 Stage 3 (Comparing) — Evaluating options. Asks "how much", compares competitors, requests specifics.
-Stage 4 (Negotiating) — Decided but uncommitted. Raises specific objections.
+Stage 4 (Negotiating) — Decided but uncommitted. Raises specific objections OR accepts CTA offers.
 Stage 5 (Committed) — Ready to buy or customer. Asks about scheduling, next steps.
 
 OBJECTION MAPPING:
@@ -168,6 +233,9 @@ CRITICAL ACCURACY RULES:
 4. If a lead says "not interested" or "not a fit", check rep notes for WHY before classifying. A trust break (broken promise) masked as "not interested" should be classified as trust.
 5. When LP disposition is OPPFDN (Full Demo No Sale) and the lead is in W8.0 (post-demo sequence), classify the objection ONLY if the message explicitly states one. Do not infer objections from short messages — let the post-demo sequence do its job.
 6. Set objection_confidence to 0.9+ ONLY when the message explicitly states the objection. For inferred objections, use 0.5-0.7.
+7. CTA-AFFIRMATIVE PATTERN: See the CTA-AFFIRMATIVE OVERRIDE section above. When the most recent outbound is a CTA and the inbound is an affirmative, ALWAYS return recommended_action="fast_track_booking". Do not over-think this. The lead has said yes — your job is to deliver what was offered, not to add commentary or qualifications.
+8. PRIOR OBJECTIONS DO NOT BLOCK PROGRESS. If a lead's previous objection was "price" but they now respond affirmatively to a "want the link?" CTA, the objection has been FUNCTIONALLY RESOLVED by their acceptance. Send what was offered. Do not re-deploy SA3.
+9. RECENCY OUTWEIGHS HISTORICAL CONTEXT. The most recent outbound + inbound exchange is the highest-priority signal. LP notes and prior analyses are CONTEXT, not CONSTRAINTS. A lead can have a stage_2 history and be stage_4 right now if they've just accepted a CTA. Update your buyer_stage based on the current exchange, not the past.
 
 LP DISPOSITION CONTEXT:
 FDNS = Full Demo, No Sale (demo ran, they said no)
@@ -197,14 +265,17 @@ Rep notes are the GROUND TRUTH of what happened with the lead. Common patterns:
 
 FAST-TRACK SIGNALS (DS#6):
 "How soon can you come out?", "Ready to schedule", "Do you do financing?",
-"My neighbor used you", specific quantity + pricing questions, high urgency
+"My neighbor used you", specific quantity + pricing questions, high urgency,
+AND short affirmative replies to direct CTAs (see CTA-AFFIRMATIVE OVERRIDE above).
 
 STORY ARC RECOMMENDATIONS:
 SA1 (Hurricane Damage) — fear/vulnerability awareness
 SA2 (Code Compliance) — legitimacy/rules/standards/authority questions
 SA3 (Cheap Window Regret) — price fixation/cheapest option
 SA4 (Insurance Disaster) — insurance/claims/coverage/timing pressure
-SA5 (Home Value Increase) — investment/ROI/resale thinking`;
+SA5 (Home Value Increase) — investment/ROI/resale thinking
+
+NOTE: Story arcs are for OBJECTION HANDLING. When a lead has accepted a CTA (see CTA-AFFIRMATIVE OVERRIDE), no story arc is needed — set recommended_story_arc to null.`;
 
 // ═══════════════════════════════════════════════════════════════════
 // CLAUDE API CALL
@@ -214,7 +285,7 @@ async function callClaude(messageText, context) {
   if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY not configured');
 
   const contextSummary = buildContextSummary(context);
-  const userPrompt = `LEAD CONTEXT:\n${contextSummary}\n\nINBOUND MESSAGE:\n"${messageText}"\n\nAnalyze this message and return the JSON assessment. Remember: LP rep notes and disposition are your most reliable data — weigh them heavily.`;
+  const userPrompt = `LEAD CONTEXT:\n${contextSummary}\n\nINBOUND MESSAGE:\n"${messageText}"\n\nAnalyze this message and return the JSON assessment.\n\nFIRST: scan the most recent outbound message in Recent Conversation. Is it a CTA offering a specific resource? Is the inbound message a short affirmative? If both, apply the CTA-AFFIRMATIVE OVERRIDE — recommended_action MUST be "fast_track_booking". Don't add hedging or objection handlers.\n\nSECOND: if no CTA-affirmative match, weigh LP rep notes and disposition heavily for routing decisions.`;
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -328,7 +399,7 @@ function buildContextSummary(context) {
   if (context.intelligence?.buyer_stage) {
     parts.push(`Previous AI Analysis: Stage ${context.intelligence.buyer_stage} (confidence: ${context.intelligence.buyer_stage_confidence})`);
     if (context.intelligence.objection_type) {
-      parts.push(`Previous Objection: ${context.intelligence.objection_type}`);
+      parts.push(`Previous Objection: ${context.intelligence.objection_type}  [HISTORICAL — do not let this override CTA-AFFIRMATIVE pattern]`);
     }
     if (context.intelligence.ai_reasoning) {
       parts.push(`Previous Reasoning: ${context.intelligence.ai_reasoning.slice(0, 150)}`);
@@ -339,7 +410,7 @@ function buildContextSummary(context) {
   if (context.conversation_recent?.length) {
     const recent = context.conversation_recent.slice(-5);
     const convo = recent.map(m => `[${m.direction}] ${m.text?.slice(0, 150) || '(empty)'}`).join('\n');
-    parts.push(`\nRecent Conversation (most recent last):\n${convo}`);
+    parts.push(`\nRecent Conversation (most recent last) — READ THE LAST OUTBOUND CAREFULLY:\n${convo}`);
   }
 
   return parts.join('\n');
