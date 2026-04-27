@@ -14,6 +14,16 @@
  * 
  * Security: All endpoints validate GHL_WEBHOOK_SECRET.
  *
+ * v2.5 (2026-04-27) — handleReply now bypasses the trivial filter for
+ *   contacts with the `pause-bot` tag. The trivial filter (matches "ok",
+ *   "sure", "yes", emojis, etc.) was eating critical CTA confirmations
+ *   for contacts owned by the agentic system. Surfaced 2026-04-27 with
+ *   contact 15Z6TaUK4WHBK1R4H64S (Mark Test): three "Sure" replies
+ *   classified trivial → bypassed message_analyzer → no agentic action
+ *   queued → no GroupMe approval. With pause-bot active, the agentic
+ *   system OWNS the conversation surface, so even a one-word "Sure" in
+ *   response to a CTA is a buying signal that needs analysis + response.
+ *
  * v2.4 — /webhook/ghl/lead-score self-enriches via GHL API.
  *   GHL's {{contact.engagement_score}} merge field doesn't resolve in
  *   webhook template variables — always sends 0. The actual score lives
@@ -177,6 +187,7 @@ async function handleReply(req, res) {
   if (!contactId) return res.status(400).json({ error: 'Missing contactId in webhook payload' });
   const trimmed = messageText.trim();
 
+  // DNC always wins, regardless of contact state
   if (isDNCSignal(trimmed)) {
     await emitEvent({
       event_type: 'ghl.reply_received', event_subtype: 'dnc', source: 'ghl_webhook',
@@ -188,15 +199,35 @@ async function handleReply(req, res) {
     return res.json({ status: 'accepted', classification: 'dnc' });
   }
 
+  // v2.5: Trivial filter has a pause-bot escape hatch.
+  // For contacts where the agentic system owns the conversation surface
+  // (signaled by `pause-bot`), even one-word replies like "Sure" are
+  // critical — they're CTA confirmations, not noise. Route those through
+  // the analyzer so the Decision Engine can fire AGENTIC_RESPOND_*.
+  // Without this gate, a hyperactive buyer responding "Sure" to "Want to
+  // schedule a measurement?" gets ghosted by the system that's supposed
+  // to own them.
   if (isTrivialMessage(trimmed)) {
-    try { await upsertLeadIntelligence(contactId, { last_reply_at: new Date().toISOString(), last_engagement_at: new Date().toISOString() }); } catch {}
-    await emitEvent({
-      event_type: 'ghl.reply_received', event_subtype: 'trivial', source: 'ghl_webhook',
-      entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
-      payload: { message_text: trimmed, message_type: messageType, engagement_quality: 'neutral', word_count: trimmed.split(/\s+/).length },
-      priority: 'low', idempotency_key: `ghl_reply_trivial_${contactId}_${Date.now()}`,
-    });
-    return res.json({ status: 'accepted', classification: 'trivial' });
+    const ghlContact = await fetchGHLContact(contactId);
+    const hasPauseBot = Array.isArray(ghlContact?.tags)
+      && ghlContact.tags.some(t => String(t).toLowerCase() === 'pause-bot');
+
+    if (!hasPauseBot) {
+      // Standard trivial path — log engagement, emit low-priority event,
+      // no analyzer call.
+      try { await upsertLeadIntelligence(contactId, { last_reply_at: new Date().toISOString(), last_engagement_at: new Date().toISOString() }); } catch {}
+      await emitEvent({
+        event_type: 'ghl.reply_received', event_subtype: 'trivial', source: 'ghl_webhook',
+        entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
+        payload: { message_text: trimmed, message_type: messageType, engagement_quality: 'neutral', word_count: trimmed.split(/\s+/).length },
+        priority: 'low', idempotency_key: `ghl_reply_trivial_${contactId}_${Date.now()}`,
+      });
+      return res.json({ status: 'accepted', classification: 'trivial' });
+    }
+
+    // pause-bot active: fall through to the substantive path below so the
+    // agentic system can decide what to do with the short reply in context.
+    console.log(`[BehavioralEmitter] Trivial reply "${trimmed.slice(0, 30)}" from ${contactId} but pause-bot active → routing to analyzer`);
   }
 
   await emitEvent({
@@ -513,6 +544,10 @@ function resolveEntrySourceFromData(tags, ghlSource) {
  *
  * v2.4: Added scoring field — contains engagement score profiles
  *   as { profileId: score }. Used by handleLeadScore for self-enrichment.
+ *
+ * v2.5: Now also called by handleReply when a message matches the trivial
+ *   filter — so we can check for `pause-bot` and decide whether to bypass
+ *   the trivial early-exit.
  */
 async function fetchGHLContact(contactId) {
   if (!GHL_API_KEY || !contactId) return null;
