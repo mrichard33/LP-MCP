@@ -29,6 +29,8 @@ import { registerGroupMeRoutes } from './groupme.js';
 import { registerLPAppointmentSyncRoutes } from './lp-appointment-sync.js';
 // ─── Workflow Completion (tag-based self-enrichment) ─────────────
 import { registerWorkflowCompletionRoutes } from './workflow-completion-handler.js';
+// ─── IME MIC Integration (Sam's Club Construction leads) ─────────
+import { registerImeRoutes, startImeWorkers } from './ime/index.js';
 // ─── Admin ──────────────────────────────────────────────────────
 import { runEmailBackfill } from './admin/email-backfill.js';
 import { registerEmailCleanupRoutes } from './admin/email-cleanup.js';
@@ -307,6 +309,9 @@ registerLPAppointmentSyncRoutes(app);
 // from the GHL API and resolves them via the local TAG_TO_WORKFLOW map.
 registerWorkflowCompletionRoutes(app);
 
+// ─── IME MIC Integration (Sam's Club Construction leads) ─────────
+registerImeRoutes(app);
+
 // ─── Admin ──────────────────────────────────────────────────────
 app.post('/admin/email-backfill', async (req, res) => {
   try {
@@ -332,11 +337,13 @@ app.listen(PORT, async () => {
   console.log(`GroupMe:      POST /webhook/groupme | POST /groupme/send | GET /groupme/pending`);
   console.log(`LP Sync:      POST /webhook/ghl/set-lp-appointment`);
   console.log(`Admin:        POST /admin/email-backfill | /admin/email-cleanup`);
+  console.log(`IME:          POST /ime/dispatch | /ime/work-orders/:id/{refetch,appointment,install,close,cancel,complete}`);
   console.log(`MCP:          http://localhost:${PORT}/mcp`);
   console.log(`Health:       http://localhost:${PORT}/health`);
   await runMigrations();
   initFieldSync();
   startSyncScheduler();
+  startImeWorkers();
   setTimeout(() => {
     setTimeout(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, 120000);
     setInterval(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, FIELD_SYNC_INTERVAL_MS);
