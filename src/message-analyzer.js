@@ -13,6 +13,32 @@
  * Output: Structured assessment written to lead_intelligence table
  *         + ai.analysis_completed event emitted for Decision Engine.
  *
+ * v1.4 (2026-04-27) — Conversation context truncation fix.
+ *   PROBLEM: v1.3 added the CTA-AFFIRMATIVE OVERRIDE block which made
+ *   the AI actively scan recent outbound messages for CTAs. But the
+ *   conversation_recent slice limit was 150 chars per message, set in
+ *   v1.1 when the prompt didn't depend on seeing full message content.
+ *   Result: typical SMS CTAs ("Want me to send it?", "Want the link?")
+ *   sit at the END of 200-400 char messages, beyond the 150-char cutoff.
+ *   The AI saw the opener, the value prop, then "[truncated]" and
+ *   reasoned correctly: "Recent outbound message appears incomplete/
+ *   cut off, so no clear CTA-affirmative pattern." Honest reasoning,
+ *   missing information.
+ *
+ *   Surfaced 2026-04-27 22:51Z — first analysis post-v1.3 deploy on
+ *   contact 15Z6TaUK4WHBK1R4H64S returned recommended_action=
+ *   continue_current with that exact reasoning quoted in the GroupMe
+ *   approval ping. The prompt was working; the data wasn't reaching it.
+ *
+ *   FIX: Bumped per-message slice from 150 → 1000 chars. Covers the
+ *   full body of every typical SMS (160 chars max per segment, max
+ *   ~1600 for concatenated MMS), short email previews, and most rep
+ *   notes. For unusually long emails the tail still gets truncated
+ *   but the explicit "[truncated]" marker tells the AI to look harder
+ *   in the next message rather than assume there's no CTA. Total
+ *   context budget: 5 messages × 1000 chars = ~5KB worst case, well
+ *   within the 200KB Claude prompt limit.
+ *
  * v1.3 (2026-04-27) — CTA-affirmative override + recency-over-history.
  *   PROBLEM: When a lead replied affirmatively ("Sure", "Yes", "OK") to
  *   a clear CTA ("Want me to send the link?"), the analyzer would
@@ -72,6 +98,12 @@ const ANALYSIS_RATE_LIMIT = parseInt(process.env.ANALYSIS_RATE_LIMIT || '100', 1
 // the same identical string twice within 2 min, we still skip (likely retry).
 const ANALYSIS_CACHE_TTL_MS = parseInt(process.env.ANALYSIS_CACHE_TTL_MS || '120000', 10);
 const MODEL = 'claude-sonnet-4-20250514';
+
+// v1.4: per-message slice cap when serializing conversation_recent for
+// the AI prompt. Was 150 in v1.1-v1.3 — too short to contain CTAs that
+// sit at the end of typical SMS bodies. 1000 chars covers full SMS
+// (max 1600 for concatenated MMS) plus short email previews.
+const CONVERSATION_MESSAGE_SLICE_CHARS = 1000;
 
 // ═══════════════════════════════════════════════════════════════════
 // RATE LIMITING
@@ -145,7 +177,7 @@ You analyze inbound lead messages to determine their position in the buyer journ
 
 CRITICAL: You have access to LeadPerfection (LP) CRM data including rep notes, call history, disposition codes, and appointment status. LP NOTES AND DISPOSITION ARE YOUR MOST RELIABLE DATA SOURCE — they come from real sales reps who interacted with the lead in person. Always weigh LP data MORE heavily than the inbound message alone when they conflict.
 
-EQUALLY CRITICAL: The most recent outbound + inbound exchange in conversation_recent is the IMMEDIATE CONTEXT. Read the most recent outbound message FIRST to understand what the inbound is responding TO. A short reply like "Sure" or "Yes" is meaningless without knowing what was just asked. Recency in the conversation outweighs historical analyses.
+EQUALLY CRITICAL: The most recent outbound + inbound exchange in conversation_recent is the IMMEDIATE CONTEXT. Read the most recent outbound message FIRST (in full, end to end — CTAs typically appear at the END of messages, after the value prop) to understand what the inbound is responding TO. A short reply like "Sure" or "Yes" is meaningless without knowing what was just asked. Recency in the conversation outweighs historical analyses.
 
 RETURN ONLY a valid JSON object — no markdown, no backticks, no explanation outside the JSON.
 
@@ -172,7 +204,7 @@ BEFORE applying any other reasoning, scan the conversation_recent for this patte
 
 PATTERN: The most recent OUTBOUND message contains a direct CTA offering a specific resource (link, calculator, pricing, quote, calendar slot, demo). The inbound message is a short affirmative agreement.
 
-CTA OUTBOUND MARKERS — look in the 1–2 most recent outbound messages for any of these phrasings (or close variants):
+CTA OUTBOUND MARKERS — look in the 1–2 most recent outbound messages, focusing on the END of the message (CTAs are typically the closing line, after the value pitch). Look for any of these phrasings (or close variants):
   • "Want me to send it?" / "Want it?" / "Want the link?"
   • "Should I send the link/calculator/pricing/quote?"
   • "Can I send you ___?"
@@ -181,6 +213,8 @@ CTA OUTBOUND MARKERS — look in the 1–2 most recent outbound messages for any
   • "Should we get started?"
   • "Want pricing?" / "Want me to send pricing?"
   • Any question proposing a specific next step (link send, calendar booking, info delivery)
+
+IF THE OUTBOUND APPEARS TRUNCATED ("[truncated]" marker): assume a CTA was likely present at the end and proceed with the override evaluation if the inbound is a clear affirmative. Do NOT use truncation as an excuse to skip the override.
 
 AFFIRMATIVE INBOUND MARKERS — the lead's reply is one of:
   • "sure" / "yes" / "yep" / "yeah" / "ya" / "yup" / "ok" / "okay"
@@ -204,6 +238,7 @@ DO NOT, when this pattern fires:
   • Add hedging preamble ("most folks are surprised by...", "before we dive in...")
   • Re-deploy a prior objection's story arc because of historical context
   • Set recommended_action to advance_stage or continue_current
+  • Use truncation of context as a reason to default to continue_current — assume CTA was present
 
 THE LEAD HAS EXPLICITLY ACCEPTED. DELIVER WHAT WAS OFFERED.
 
@@ -236,6 +271,7 @@ CRITICAL ACCURACY RULES:
 7. CTA-AFFIRMATIVE PATTERN: See the CTA-AFFIRMATIVE OVERRIDE section above. When the most recent outbound is a CTA and the inbound is an affirmative, ALWAYS return recommended_action="fast_track_booking". Do not over-think this. The lead has said yes — your job is to deliver what was offered, not to add commentary or qualifications.
 8. PRIOR OBJECTIONS DO NOT BLOCK PROGRESS. If a lead's previous objection was "price" but they now respond affirmatively to a "want the link?" CTA, the objection has been FUNCTIONALLY RESOLVED by their acceptance. Send what was offered. Do not re-deploy SA3.
 9. RECENCY OUTWEIGHS HISTORICAL CONTEXT. The most recent outbound + inbound exchange is the highest-priority signal. LP notes and prior analyses are CONTEXT, not CONSTRAINTS. A lead can have a stage_2 history and be stage_4 right now if they've just accepted a CTA. Update your buyer_stage based on the current exchange, not the past.
+10. NEVER USE "TRUNCATION" AS AN EXCUSE. If a recent outbound message ends with "...[truncated]" but the inbound is a clear short affirmative ("Sure", "Yes"), assume the truncation cut off a CTA and apply the CTA-AFFIRMATIVE OVERRIDE. The cost of a false-positive link send is far lower than the cost of a missed legitimate CTA acceptance.
 
 LP DISPOSITION CONTEXT:
 FDNS = Full Demo, No Sale (demo ran, they said no)
@@ -285,7 +321,7 @@ async function callClaude(messageText, context) {
   if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY not configured');
 
   const contextSummary = buildContextSummary(context);
-  const userPrompt = `LEAD CONTEXT:\n${contextSummary}\n\nINBOUND MESSAGE:\n"${messageText}"\n\nAnalyze this message and return the JSON assessment.\n\nFIRST: scan the most recent outbound message in Recent Conversation. Is it a CTA offering a specific resource? Is the inbound message a short affirmative? If both, apply the CTA-AFFIRMATIVE OVERRIDE — recommended_action MUST be "fast_track_booking". Don't add hedging or objection handlers.\n\nSECOND: if no CTA-affirmative match, weigh LP rep notes and disposition heavily for routing decisions.`;
+  const userPrompt = `LEAD CONTEXT:\n${contextSummary}\n\nINBOUND MESSAGE:\n"${messageText}"\n\nAnalyze this message and return the JSON assessment.\n\nFIRST: scan the most recent outbound message in Recent Conversation END-TO-END. CTAs typically appear at the END of messages (after the value prop). Is the END of the most recent outbound a CTA offering a specific resource? Is the inbound message a short affirmative? If both, apply the CTA-AFFIRMATIVE OVERRIDE — recommended_action MUST be "fast_track_booking". Don't add hedging or objection handlers. If the message ends with "[truncated]" but the inbound is "Sure"/"Yes"/"OK", assume a CTA was cut off and apply the override anyway.\n\nSECOND: if no CTA-affirmative match, weigh LP rep notes and disposition heavily for routing decisions.`;
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -320,6 +356,8 @@ async function callClaude(messageText, context) {
 
 /**
  * Build a concise context summary for the AI prompt.
+ * v1.4: Bumped per-message slice from 150 → 1000 chars so SMS CTAs at
+ * the end of typical 200-400 char messages are visible to the AI.
  * v1.1: Enhanced with more LP notes (5), more conversation context (5),
  * and LP disposition fallback from GHL custom fields.
  */
@@ -406,11 +444,24 @@ function buildContextSummary(context) {
     }
   }
 
-  // v1.1: Show 5 recent conversation messages (increased from 3) with more text
+  // v1.4: Show 5 recent conversation messages with full body up to 1000 chars.
+  // The 150-char cap from v1.1 was cutting CTAs off the end of typical SMS bodies
+  // (a 263-char outbound with "Want me to send it?" at chars 240-258 was being
+  // truncated to char 150, hiding the CTA from the AI). 1000 chars covers full
+  // SMS (max 1600 chars for concatenated MMS) plus short emails. For unusually
+  // long emails, the explicit "[truncated]" marker tells the AI to assume a CTA
+  // may have been cut and apply the CTA-AFFIRMATIVE OVERRIDE anyway when the
+  // inbound is a clear affirmative.
   if (context.conversation_recent?.length) {
     const recent = context.conversation_recent.slice(-5);
-    const convo = recent.map(m => `[${m.direction}] ${m.text?.slice(0, 150) || '(empty)'}`).join('\n');
-    parts.push(`\nRecent Conversation (most recent last) — READ THE LAST OUTBOUND CAREFULLY:\n${convo}`);
+    const convo = recent.map(m => {
+      const text = m.text || '(empty)';
+      const truncated = text.length > CONVERSATION_MESSAGE_SLICE_CHARS
+        ? text.slice(0, CONVERSATION_MESSAGE_SLICE_CHARS) + ' ...[truncated]'
+        : text;
+      return `[${m.direction}] ${truncated}`;
+    }).join('\n');
+    parts.push(`\nRecent Conversation (most recent last) — READ THE LAST OUTBOUND END-TO-END (CTAs live at the END):\n${convo}`);
   }
 
   return parts.join('\n');
