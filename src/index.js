@@ -26,6 +26,11 @@ import {
   registerPauseWorkflowSweepRoutes,
   startPauseWorkflowSweepScheduler,
 } from './pause-workflow-sweep.js';
+// ─── Approval Escalation Sweep (30min escalate / 60min auto-exec / 4h auto-reject) ───
+import {
+  registerApprovalEscalationRoutes,
+  startApprovalEscalationScheduler,
+} from './approval-escalation-sweep.js';
 // ─── REST API for GHL Agent Studio ───────────────────────────────
 import { registerRestApiRoutes } from './rest-api.js';
 // ─── GroupMe Two-Way Integration ─────────────────────────────────
@@ -175,6 +180,14 @@ app.get('/health', (req, res) => {
       fizzle_threshold_days: 7,
       interval_minutes: 15,
     },
+    approval_escalation: {
+      sweep: 'POST /n8n/approval-escalation/sweep',
+      escalate_after_min: 30,
+      auto_execute_after_min: 60,
+      auto_reject_send_message_after_hours: 4,
+      interval_minutes: 15,
+      kill_switch_env: 'APPROVAL_ESCALATION_DISABLED',
+    },
     rest_api: {
       prospect: 'GET /api/prospects/:prospectId',
       lead: 'GET /api/leads/:leadId',
@@ -308,6 +321,13 @@ registerIntentScorerRoutes(app);
 // GHL_APPT_STAGE_ADVANCE which removes it on booking.
 registerPauseWorkflowSweepRoutes(app);
 
+// ─── Approval Escalation Sweep ───────────────────────────────────
+// 30min: escalate stuck pending_approval to GroupMe.
+// 60min: auto-execute SAFE_ACTION_TYPES at confidence >= 0.95.
+// 4h: auto-reject stale send_message (rule will regenerate fresh).
+// Kill switch: APPROVAL_ESCALATION_DISABLED=true env var.
+registerApprovalEscalationRoutes(app);
+
 // ─── REST API for GHL Agent Studio ───────────────────────────────
 registerRestApiRoutes(app, authenticate);
 
@@ -352,6 +372,7 @@ app.listen(PORT, async () => {
   console.log(`Intelligence: GET /n8n/lead-intelligence/context | POST /n8n/analyze-pending-replies | /n8n/analyze-message`);
   console.log(`Intent:       POST /n8n/intent/score | /n8n/intent/sweep | GET /n8n/intent/breakdown`);
   console.log(`Pause Sweep:  POST /n8n/pause-workflow/sweep (7d fizzle, 15min interval)`);
+  console.log(`Approval Esc: POST /n8n/approval-escalation/sweep (30min/60min/4h tiers, 15min interval)`);
   console.log(`REST API:     GET /api/prospects/:id | /api/leads/:id | /api/search | /api/lead-summary/:contactId`);
   console.log(`GroupMe:      POST /webhook/groupme | POST /groupme/send | GET /groupme/pending`);
   console.log(`LP Sync:      POST /webhook/ghl/set-lp-appointment`);
@@ -364,6 +385,7 @@ app.listen(PORT, async () => {
   startSyncScheduler();
   startImeWorkers();
   startPauseWorkflowSweepScheduler();
+  startApprovalEscalationScheduler();
   setTimeout(() => {
     setTimeout(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, 120000);
     setInterval(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, FIELD_SYNC_INTERVAL_MS);
