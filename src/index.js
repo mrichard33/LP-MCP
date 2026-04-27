@@ -21,6 +21,11 @@ import { registerBehavioralEmitterRoutes } from './behavioral-emitter.js';
 import { registerMessageAnalyzerRoutes } from './message-analyzer.js';
 // ─── Layer 3.5: Intent Scoring + Conversion Engine ───────────────
 import { registerIntentScorerRoutes } from './intent-scorer.js';
+// ─── Pause-Workflow Fizzle Sweep (framework: HOT1 / MOMENTUM ACT-5) ───
+import {
+  registerPauseWorkflowSweepRoutes,
+  startPauseWorkflowSweepScheduler,
+} from './pause-workflow-sweep.js';
 // ─── REST API for GHL Agent Studio ───────────────────────────────
 import { registerRestApiRoutes } from './rest-api.js';
 // ─── GroupMe Two-Way Integration ─────────────────────────────────
@@ -165,6 +170,11 @@ app.get('/health', (req, res) => {
       stall_sweep: 'POST /n8n/intent/sweep',
       breakdown: 'GET /n8n/intent/breakdown?contactId=...',
     },
+    pause_workflow: {
+      sweep: 'POST /n8n/pause-workflow/sweep',
+      fizzle_threshold_days: 7,
+      interval_minutes: 15,
+    },
     rest_api: {
       prospect: 'GET /api/prospects/:prospectId',
       lead: 'GET /api/leads/:leadId',
@@ -290,6 +300,14 @@ registerMessageAnalyzerRoutes(app);
 // ─── Layer 3.5: Intent Scoring + Conversion Engine ───────────────
 registerIntentScorerRoutes(app);
 
+// ─── Pause-Workflow Fizzle Sweep (framework: HOT1 / MOMENTUM ACT-5) ───
+// Releases pause-workflow tag after 7d of customer silence so paused
+// drips resume from where they left off. Pairs with momentum-firing
+// rules (BEHAVIORAL_FAST_TRACK, INTENT_SPIKE_HOT_WINDOW,
+// AGENTIC_RESPOND_POST_CHATBOT) which add the tag, plus
+// GHL_APPT_STAGE_ADVANCE which removes it on booking.
+registerPauseWorkflowSweepRoutes(app);
+
 // ─── REST API for GHL Agent Studio ───────────────────────────────
 registerRestApiRoutes(app, authenticate);
 
@@ -333,6 +351,7 @@ app.listen(PORT, async () => {
   console.log(`Layer 3:      POST /webhook/ghl/{reply,appointment,engagement,lead-score,workflow,workflow-tag}`);
   console.log(`Intelligence: GET /n8n/lead-intelligence/context | POST /n8n/analyze-pending-replies | /n8n/analyze-message`);
   console.log(`Intent:       POST /n8n/intent/score | /n8n/intent/sweep | GET /n8n/intent/breakdown`);
+  console.log(`Pause Sweep:  POST /n8n/pause-workflow/sweep (7d fizzle, 15min interval)`);
   console.log(`REST API:     GET /api/prospects/:id | /api/leads/:id | /api/search | /api/lead-summary/:contactId`);
   console.log(`GroupMe:      POST /webhook/groupme | POST /groupme/send | GET /groupme/pending`);
   console.log(`LP Sync:      POST /webhook/ghl/set-lp-appointment`);
@@ -344,6 +363,7 @@ app.listen(PORT, async () => {
   initFieldSync();
   startSyncScheduler();
   startImeWorkers();
+  startPauseWorkflowSweepScheduler();
   setTimeout(() => {
     setTimeout(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, 120000);
     setInterval(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, FIELD_SYNC_INTERVAL_MS);
