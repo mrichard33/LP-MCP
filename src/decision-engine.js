@@ -18,6 +18,13 @@
  *   - ai.analysis_completed → matched against contextual rules using lead_intelligence
  *   - intent.* events → processed by rules but do NOT trigger re-scoring (loop prevention)
  *
+ * v2.7 — recommended_action_neq context operator.
+ *   Inverse of recommended_action_eq. Lets AGENTIC_RESPOND_POST_CHATBOT
+ *   skip when the analyzer already flagged fast_track_booking (the
+ *   AGENTIC_BOOKING_LINK_RESPONSE rule owns that path). Without this,
+ *   both rules fired on fast_track_booking events — link plus a
+ *   redundant approval ping for the AI-generated contextual reply.
+ *
  * v2.6 — Multi-rule execution per event.
  *   CRITICAL FIX: processSingleEvent was using matchedRules[0] (first-match-wins).
  *   Rule 106 (AGENTIC_RESPOND) was silently skipped whenever a BEHAVIORAL_*_OBJECTION
@@ -309,6 +316,9 @@ async function evaluateContextConditions(conditions, intelligence, event) {
       case 'emotional_state_eq': if (merged.emotional_state !== expected) return false; break;
       case 'entry_source_eq': if (merged.entry_source !== expected) return false; break;
       case 'recommended_action_eq': if (merged.recommended_action !== expected) return false; break;
+      // v2.7: Inverse of recommended_action_eq. Lets AGENTIC_RESPOND_POST_CHATBOT
+      // skip when AGENTIC_BOOKING_LINK_RESPONSE owns the path (fast_track_booking).
+      case 'recommended_action_neq': if (merged.recommended_action === expected) return false; break;
       case 'fast_track_eligible': if (!!merged.fast_track_eligible !== !!expected) return false; break;
       case 'lead_score_gte': if ((merged.lead_score || 0) < expected) return false; break;
       case 'lead_score_lte': if ((merged.lead_score || 0) > expected) return false; break;
