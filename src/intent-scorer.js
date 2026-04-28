@@ -1,15 +1,38 @@
 /**
  * Intent Scorer — src/intent-scorer.js
- * 
+ *
  * The PROACTIVE layer. Runs on every behavioral event to:
- * 
  *   1. SPIKE DETECTION (Hot Window Protocol)
  *   2. INTENT SCORING (Composite Score 0-100)
  *   3. TIER CLASSIFICATION + TRANSITION DETECTION
  *   4. PATTERN MATCHING (Compound Signal Detection)
  *   5. CLOSER ASSISTANT (Decision Ownership + Loss Framing)
- * 
+ *
  * Philosophy: "Predict → Intercept → Close"
+ *
+ * v1.1 — 2026-04-28. KILL CANVASSING FALSE-POSITIVE on Hot Window.
+ *   Per Mark's Nancy Kesner / JpTvo8p5fmVp3uKO8g2k investigation:
+ *   canvassing leads were generating "🔥 HOT WINDOW: Call within 10 min"
+ *   GroupMe alerts within 90 seconds of contact creation, despite zero
+ *   user-driven engagement. Pattern:
+ *
+ *     17:54:44 ghl.contact_created  (canvasser entered them)
+ *     17:54:51 ghl.appointment_booked  (canvasser booked it)
+ *     17:55:29 ghl.lead_score_changed  (auto from tags)
+ *     → 2 events in 30min = SPIKE → "HOT WINDOW" alert fires
+ *
+ *   None of those are buyer signals. They're rep-driven CRM activity.
+ *
+ *   The fix: split spike-eligible events into INBOUND_ENGAGEMENT
+ *   (genuine lead actions) and OUTCOME (outputs that may be rep-driven).
+ *   Spike now requires AT LEAST ONE inbound engagement event in the
+ *   window — rep activity alone can no longer trigger a HOT WINDOW.
+ *
+ *   ghl.lead_score_changed and ai.analysis_completed are removed from
+ *   the candidate set entirely — they are downstream automation events,
+ *   not buyer signals.
+ *
+ * v1.0 — Initial implementation.
  */
 
 import supabase from './supabase.js';
@@ -19,24 +42,67 @@ import { emitEvent } from './event-emitter.js';
 const SPIKE_WINDOW_MS = 30 * 60 * 1000;
 const SPIKE_THRESHOLD = 2;
 
+// v1.1: Split spike-eligible events by source-of-truth.
+//
+// INBOUND_ENGAGEMENT: real lead actions. The lead opened, clicked,
+// replied, or watched something — undeniable buyer signal.
+const INBOUND_ENGAGEMENT_EVENTS = [
+  'ghl.reply_received',
+  'ghl.email_opened',
+  'ghl.link_clicked',
+  'ghl.vsl_watched',
+];
+
+// OUTCOME: signals that COULD be rep-driven (canvassing booking, manual
+// admin action) or lead-driven (self-service calendar booking via funnel).
+// Counted toward total spike count, but cannot trigger a spike on their
+// own — at least 1 INBOUND_ENGAGEMENT must be present.
+const OUTCOME_EVENTS = [
+  'ghl.appointment_booked',
+];
+
+// REMOVED from spike detection (was: ghl.lead_score_changed, ai.analysis_completed):
+// - lead_score_changed: noisy automation event, fires whenever any tag-based
+//   scoring rule trips. Not a buyer signal.
+// - ai.analysis_completed: internal system event from message analyzer. Not
+//   a buyer signal. (Reply that triggered the analysis is already counted.)
+
 // ═══════════════════════════════════════════════════════════════════
-// 1. SPIKE DETECTION — Hot Window Protocol
+// 1. SPIKE DETECTION — Hot Window Protocol (v1.1)
 // ═══════════════════════════════════════════════════════════════════
 
 async function detectSpike(ghlContactId) {
   const windowStart = new Date(Date.now() - SPIKE_WINDOW_MS).toISOString();
-  const { count, error } = await supabase
+  const candidateEvents = [...INBOUND_ENGAGEMENT_EVENTS, ...OUTCOME_EVENTS];
+
+  const { data, error } = await supabase
     .from('system_events')
-    .select('id', { count: 'exact', head: true })
+    .select('event_type')
     .eq('ghl_contact_id', ghlContactId)
     .gte('created_at', windowStart)
-    .in('event_type', [
-      'ghl.reply_received', 'ghl.email_opened', 'ghl.link_clicked',
-      'ghl.vsl_watched', 'ghl.appointment_booked', 'ghl.lead_score_changed',
-      'ai.analysis_completed'
-    ]);
-  const eventCount = error ? 0 : (count || 0);
-  return { isSpiking: eventCount >= SPIKE_THRESHOLD, eventCount, windowMinutes: 30 };
+    .in('event_type', candidateEvents);
+
+  if (error) {
+    console.error(`[IntentScorer] Spike detection query failed for ${ghlContactId}:`, error.message);
+    return { isSpiking: false, eventCount: 0, inboundCount: 0, outcomeCount: 0, windowMinutes: 30 };
+  }
+
+  const events = data || [];
+  const inboundCount = events.filter(e => INBOUND_ENGAGEMENT_EVENTS.includes(e.event_type)).length;
+  const outcomeCount = events.filter(e => OUTCOME_EVENTS.includes(e.event_type)).length;
+  const totalCount = events.length;
+
+  // v1.1: Spike requires (a) total events ≥ threshold AND (b) at least one
+  // genuine inbound engagement signal. Pure rep-side activity does NOT spike.
+  const isSpiking = totalCount >= SPIKE_THRESHOLD && inboundCount >= 1;
+
+  return {
+    isSpiking,
+    eventCount: totalCount,
+    inboundCount,
+    outcomeCount,
+    windowMinutes: 30,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -149,14 +215,6 @@ function classifyBarrier(intelligence, context) {
 
 // ═══════════════════════════════════════════════════════════════════
 // 5. CLOSER ASSISTANT — Decision Ownership + Loss Framing
-//
-// This is NOT "here's how to approach." This is "here's how to LEAD
-// the decision." Every briefing includes:
-//   SAY FIRST  — The opening frame (assume the decision, own the path)
-//   ASSUME     — What's already decided (never ask IF, ask WHEN)
-//   AVOID      — What kills the deal
-//   PUSH       — The close line
-//   LOSS FRAME — What happens if they DON'T act
 // ═══════════════════════════════════════════════════════════════════
 
 function generateRepBriefing(intelligence, context) {
@@ -295,11 +353,21 @@ export async function scoreIntent(ghlContactId, context = null) {
       event_type: 'intent.spike_detected', event_subtype: 'hot_window',
       source: 'intent_scorer', entity_type: 'contact', entity_id: ghlContactId,
       ghl_contact_id: ghlContactId,
-      payload: { event_count: spike.eventCount, window_minutes: spike.windowMinutes, score, tier },
+      payload: {
+        event_count: spike.eventCount,
+        inbound_count: spike.inboundCount,         // v1.1
+        outcome_count: spike.outcomeCount,         // v1.1
+        window_minutes: spike.windowMinutes, score, tier,
+      },
       priority: 'critical',
       idempotency_key: `intent_spike_${ghlContactId}_${Date.now()}`,
     });
-    console.log(`[IntentScorer] 🔥 SPIKE: ${ghlContactId} — ${spike.eventCount} events in ${spike.windowMinutes}min`);
+    console.log(`[IntentScorer] 🔥 SPIKE: ${ghlContactId} — ${spike.eventCount} events (${spike.inboundCount} inbound + ${spike.outcomeCount} outcome) in ${spike.windowMinutes}min`);
+  } else if (spike.eventCount >= SPIKE_THRESHOLD && spike.inboundCount === 0) {
+    // v1.1: log when we suppress a spike for the canvassing/rep-driven case.
+    // Helps Mark see that the new gate is working without drowning the alert
+    // channel.
+    console.log(`[IntentScorer] Spike suppressed for ${ghlContactId}: ${spike.eventCount} events but 0 inbound engagement (rep-driven activity only)`);
   }
 
   return { score, tier, previousTier, tierChanged, pattern, barrier, spike, briefing, velocity: cappedVelocity };
