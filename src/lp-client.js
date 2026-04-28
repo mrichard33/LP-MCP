@@ -12,12 +12,49 @@
 //   https://apitest2.leadperfection.com (Test 2)
 //
 // Token is ONLY valid on the server it was generated on.
+//
+// ═══════════════════════════════════════════════════════════════════
+// IMPORTANT — LP API documentation status as of 2026-04-28:
+// ═══════════════════════════════════════════════════════════════════
+//
+// /api/Leads/GetLeadData is OFFICIALLY DEPRECATED per LP's own docs:
+//   "WARNING - This API call is depreciated. Although still useable,
+//    no further updates or support will be provided for this call.
+//    Please see Customers/GetLead for the current version."
+//
+// /api/Customers/GetLead is the modern replacement. Critically, it
+// supports an `options` bitmask field that lets us filter on:
+//   1024  - Lead Date Entered
+//   2048  - Lead Last Changed Date
+//   4096  - Lead Entry Date
+//   8192  - Appointment Last Date Changed
+//   16384 - Issued Lead Last Date changed
+//   32768 - Job Last Modified On date
+//   65536 - Milestone Updated On Date
+//   131072 - Notes Last Update On date     ← KEY for catching new notes
+//
+// Comprehensive bitmask 261120 (sum of all of the above) returns any
+// lead whose record OR notes OR calls OR appts OR jobs OR milestones
+// changed in the window. This is the right call for incremental sync.
+//
+// As of 2026-04-24, /api/Leads/GetLeadData began silently returning 0
+// rows for windows that DID contain changes. This client now bypasses
+// it entirely and uses /api/Customers/GetLead with options=261120.
 
 import { getToken, refreshToken, invalidateToken, getTokenStatus } from './token-manager.js';
 
 const LP_BASE = () => (process.env.LP_API_BASE_URL || '').replace(/\/+$/, '');
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// ─── Bitmask for GetLead change-window filtering ─────────────────
+// 261120 = 1024+2048+4096+8192+16384+32768+65536+131072
+// Captures every change we care about: lead created/modified, appts
+// changed, issued leads changed, jobs modified, milestones updated,
+// notes updated. Override via env var if LP changes the bit values
+// or if a narrower filter becomes desired.
+
+const GETLEAD_DEFAULT_OPTIONS = parseInt(process.env.LP_GETLEAD_OPTIONS || '261120', 10);
 
 // ─── Core POST helper with retry + token refresh ─────────────────
 
@@ -122,8 +159,31 @@ async function withCircuit(fn) {
   }
 }
 
+// Internal: extract item array from any LP response shape
+function _itemsFrom(result) {
+  if (Array.isArray(result)) return result;
+  if (result && typeof result === 'object') {
+    return result.data || result.leads || result.results || result.items || [];
+  }
+  return [];
+}
+
 // ─── Phase 1 Read Endpoints ──────────────────────────────────────
 
+/**
+ * Bulk lead fetch via /api/Customers/GetLead.
+ *
+ * This is the MODERN, NON-DEPRECATED endpoint per LP docs.
+ *
+ * The `options` bitmask controls which date fields the date-range
+ * filter applies to. Default is 261120 (all change types). Pass 0 for
+ * "Lead Date Entered only" (legacy GetLeadData-equivalent behavior).
+ *
+ * Per LP docs, this endpoint returns FULL prospect data including
+ * embedded notes, calls, jobs, milestones — no per-prospect re-fetch
+ * needed for sync purposes (though sync-engine still does one for
+ * freshness; that's a future optimization).
+ */
 export async function getLeads(params = {}) {
   return withCircuit(() => lpPost('/api/Customers/GetLead', {
     startdate:   params.startdate  || '2020-01-01',
@@ -133,20 +193,115 @@ export async function getLeads(params = {}) {
     ils_id:      String(params.ils_id  ?? 0),
     PageSize:    String(params.PageSize  || 50),
     StartIndex:  String(params.StartIndex || 1),
-    options:     String(params.options ?? 0),
+    options:     String(params.options ?? GETLEAD_DEFAULT_OPTIONS),
     SortOrder:   String(params.SortOrder ?? 0),
   }));
 }
 
+/**
+ * Get leads with any change in the window — explicit, well-named alias
+ * for getLeads with the comprehensive options bitmask. This is the
+ * function sync-engine should call to find leads to sync.
+ *
+ * Pass `options` to override the default bitmask, or omit to use 261120.
+ */
+export async function getChangedLeads(params = {}) {
+  return getLeads({
+    startdate:  params.startdate,
+    enddate:    params.enddate,
+    cst_id:     params.cst_id,
+    lds_id:     params.lds_id,
+    ils_id:     params.ils_id,
+    PageSize:   params.PageSize,
+    StartIndex: params.StartIndex,
+    options:    params.options ?? GETLEAD_DEFAULT_OPTIONS,
+    SortOrder:  params.SortOrder,
+  });
+}
+
+/**
+ * Legacy alias — getLeadData() is the function sync-engine.js currently
+ * imports. Per LP docs, /api/Leads/GetLeadData is officially deprecated.
+ * We route this call through getChangedLeads (which uses /api/Customers/GetLead
+ * with options=261120) so existing call sites keep working without a
+ * sync-engine.js diff.
+ *
+ * If LP ever fixes the deprecated endpoint and you want to revert, set
+ * env LP_USE_DEPRECATED_GETLEADDATA=true (not recommended).
+ */
 export async function getLeadData(params = {}) {
-  return withCircuit(() => lpPost('/api/Leads/GetLeadData', {
+  if (String(process.env.LP_USE_DEPRECATED_GETLEADDATA || '').toLowerCase() === 'true') {
+    return _getLeadDataDeprecated(params);
+  }
+  return getChangedLeads(params);
+}
+
+// ─── Deprecated/diagnostic raw GetLeadData call ──────────────────
+// Kept around for the sync-probe endpoint and as an emergency
+// backdoor via LP_USE_DEPRECATED_GETLEADDATA=true. Do NOT use this
+// in normal sync flows — LP docs say it will not be updated/supported.
+
+async function _getLeadDataDeprecated(params = {}, { omitProId = false } = {}) {
+  const fields = {
     startdate:   params.startdate  || '',
     enddate:     params.enddate    || '',
-    pro_id:      String(params.pro_id ?? 0),
     PageSize:    String(params.PageSize  || 50),
     StartIndex:  String(params.StartIndex || 1),
-  }));
+  };
+  if (!omitProId) {
+    fields.pro_id = String(params.pro_id ?? 0);
+  }
+  return withCircuit(() => lpPost('/api/Leads/GetLeadData', fields));
 }
+
+// Diagnostic helper used by /n8n/admin/sync-probe — runs all 3 paths
+// (deprecated GetLeadData with pro_id=0, deprecated GetLeadData without
+// pro_id, modern GetLead with bitmask) in parallel. Returns counts +
+// first-item keys for each so we can verify what LP actually returns.
+export async function probeLeadEndpoints({ startdate, enddate, PageSize = 50 } = {}) {
+  const probes = await Promise.allSettled([
+    _getLeadDataDeprecated({ startdate, enddate, PageSize, StartIndex: 1 }),
+    _getLeadDataDeprecated({ startdate, enddate, PageSize, StartIndex: 1 }, { omitProId: true }),
+    getLeads({ startdate, enddate, PageSize, StartIndex: 1, options: GETLEAD_DEFAULT_OPTIONS }),
+  ]);
+
+  const summarize = (label, settledResult) => {
+    if (settledResult.status === 'rejected') {
+      return { label, error: settledResult.reason?.message || String(settledResult.reason) };
+    }
+    const items = _itemsFrom(settledResult.value);
+    return {
+      label,
+      count: items.length,
+      response_shape: Array.isArray(settledResult.value) ? 'array' : (typeof settledResult.value),
+      first_item_keys: items[0] ? Object.keys(items[0]).slice(0, 20) : [],
+      raw_response_keys: !Array.isArray(settledResult.value) && settledResult.value
+        ? Object.keys(settledResult.value)
+        : [],
+    };
+  };
+
+  return {
+    path_a: summarize('GetLeadData with pro_id=0 (DEPRECATED per LP docs)', probes[0]),
+    path_b: summarize('GetLeadData with pro_id omitted (DEPRECATED)', probes[1]),
+    path_c: summarize(`GetLead with options=${GETLEAD_DEFAULT_OPTIONS} (CURRENT, used by sync)`, probes[2]),
+    options_bitmask: GETLEAD_DEFAULT_OPTIONS,
+    options_explanation: '261120 = Lead Created + Lead Modified + Lead Entry + Appt Changed + Issued Lead Changed + Job Modified + Milestone Updated + Notes Updated',
+  };
+}
+
+// Backward-compat exports — these no longer maintain meaningful state
+// but are still imported by data-freshness.js. Keep them as no-ops so
+// freshness probe doesn't break.
+export function getLeadPathCacheState() {
+  return {
+    cached_path: 'C',
+    valid: true,
+    note: 'Auto-fallback retired 2026-04-28 — sync now uses /api/Customers/GetLead with options bitmask permanently. See lp-client.js header for details.',
+    options_bitmask: GETLEAD_DEFAULT_OPTIONS,
+  };
+}
+export function clearLeadPathCache() { /* no-op — cache retired */ }
 
 export async function getJobStatusChanges(params = {}) {
   return withCircuit(() => lpPost('/api/Customers/GetJobStatusChanges', {
@@ -236,7 +391,7 @@ export async function getLead(cstId) {
  * Returns the prospect record containing this lead.
  * Used by Action Executor to get the most current Prospect ID
  * directly from Lead Perfection (bypasses Supabase cache delay).
- * 
+ *
  * @param {string|number} ldsId — LP Lead ID
  * @returns {Object} LP API response (array of prospect records)
  */
@@ -260,21 +415,21 @@ export async function getLeadByLdsId(ldsId) {
 
 /**
  * POST /api/Leads/SetAppointment — Set appointment in LP for a lead.
- * 
- * LP requires EXACTLY these fields as form-urlencoded (no JSON, no extra fields):
- *   lds_id    — LP lead ID (NOT prospect ID)
- *   set_by    — LP employee ID of the person setting the appointment
- *   appt_date — Appointment date in MM/DD/YYYY format
- *   appt_time — Appointment time in HH:MM 24-hour format
- * 
- * Returns: { message: "Appointment set successfully.", status: null, error: null }
- * Error:   { message: "Exception Occured", error: "Cannot find column 1.", status: null }
- *          (This error means the body was sent as JSON instead of form-encoded)
- * 
- * CRITICAL: Content-Type MUST be application/x-www-form-urlencoded.
- *           lpPost() handles this automatically via URLSearchParams.
- *           NEVER send JSON body to this endpoint.
- * 
+ *
+ * Per LP API docs:
+ *   - lds_id    — LP lead ID (NOT prospect ID, NOT in1_id)
+ *   - set_by    — LP employee ID setting the appointment
+ *   - appt_date — MM/dd/yyyy format
+ *   - appt_time — Standard 24-hour HH:MM format (e.g. "14:30")
+ *   - Content-Type MUST be application/x-www-form-urlencoded
+ *
+ * The lead must be in a 'set-able' status — typically dispo'd as Data,
+ * not Out Of Area, and without an existing future appointment.
+ * SetAppointment will fail (return error) if any of these are violated.
+ *
+ * For sales-rep-specific assignment, consider /api/Leads/SetAppointmentSalesRep
+ * which adds optional product_id and slr_id parameters.
+ *
  * @param {string} ldsId    — LP lead ID
  * @param {string} setBy    — LP employee ID (default: 5686 = GHL system user)
  * @param {string} apptDate — Date in MM/DD/YYYY format
@@ -302,6 +457,40 @@ export async function setAppointment({ ldsId, setBy = '5686', apptDate, apptTime
 
   console.log(`[LP] SetAppointment SUCCESS: lds_id=${ldsId}, response: ${JSON.stringify(result).slice(0, 200)}`);
   return result;
+}
+
+/**
+ * POST /api/SalesApi/AddNotes — Add a note to a prospect, issued lead, or job.
+ *
+ * Per LP API docs:
+ *   - rectype: 'cst' (prospect) | 'ils' (issued lead) | 'job'
+ *   - recid:   ID number (cst_id / ils_id / job_id depending on rectype)
+ *   - notes:   Note body text
+ *   - nct_id:  Note category ID (default 1; client-specific)
+ *
+ * Useful for the agentic system to leave a record in LP after a tag/
+ * action change so the next sales rep sees what the bot did.
+ *
+ * @param {Object} params
+ * @param {string} params.rectype — 'cst' | 'ils' | 'job'
+ * @param {string|number} params.recid — entity ID
+ * @param {string} params.notes — note text
+ * @param {number} [params.categoryId] — note category (default 1)
+ * @returns {Object} LP API response
+ */
+export async function addNote({ rectype, recid, notes, categoryId = 1 }) {
+  if (!['cst', 'ils', 'job'].includes(rectype)) {
+    throw new Error(`addNote: rectype must be 'cst', 'ils', or 'job' (got '${rectype}')`);
+  }
+  if (!recid) throw new Error('addNote: recid is required');
+  if (!notes) throw new Error('addNote: notes is required');
+
+  return withCircuit(() => lpPost('/api/SalesApi/AddNotes', {
+    rectype,
+    recid:  String(recid),
+    notes,
+    nct_id: String(categoryId),
+  }));
 }
 
 // ─── Diagnostic — Connection Test ────────────────────────────────

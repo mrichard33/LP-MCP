@@ -24,11 +24,15 @@
  * Scheduler (registered by startDataFreshnessMonitorScheduler):
  *   Runs runFreshnessCheck() every CHECK_INTERVAL_MINUTES (default 30).
  *
+ * v1.1 — 2026-04-28. Sync probe upgraded to test all 3 lead-fetch paths
+ *        (pro_id=0, pro_id omitted, /api/Customers/GetLead) so we can
+ *        see exactly which path the auto-fallback in lp-client picks.
+ *
  * v1.0 — 2026-04-28.
  */
 
 import supabase from '../supabase.js';
-import { getLeadData, getJobStatusChanges } from '../lp-client.js';
+import { getJobStatusChanges, probeLeadEndpoints } from '../lp-client.js';
 import { sendGroupMeMessage } from '../groupme.js';
 
 // ─── Configuration ──────────────────────────────────────────────────
@@ -245,29 +249,25 @@ function formatStaleness(min) {
 }
 
 // ─── LP API sync probe (diagnostic) ─────────────────────────────────
-// Mirrors what incrementalSync calls — useful for confirming whether
-// LP itself is returning records for a given window.
+// v1.1: Tests all 3 lead-fetch paths in parallel via probeLeadEndpoints,
+// plus getJobStatusChanges as the control. Returns a clear verdict
+// telling Mark which path the auto-fallback is currently using.
 
 export async function probeSyncEndpoints({ days = 3 } = {}) {
   const enddate   = new Date().toISOString().slice(0, 10);
   const startdate = new Date(Date.now() - days * 24 * 3600 * 1000).toISOString().slice(0, 10);
   const out = { window: { startdate, enddate, days } };
 
-  // GetLeadData — currently broken (returning 0 records)
+  // 3-path probe of lead endpoints (parallelized inside probeLeadEndpoints)
+  let leadProbe = null;
   try {
-    const r = await getLeadData({ startdate, enddate, PageSize: 50, StartIndex: 1 });
-    const items = Array.isArray(r) ? r : (r?.data || r?.leads || r?.results || []);
-    out.getLeadData = {
-      response_shape: Array.isArray(r) ? 'array' : (typeof r),
-      count: items.length,
-      first_item_keys: items[0] ? Object.keys(items[0]).slice(0, 20) : [],
-      raw_response_keys: !Array.isArray(r) && r ? Object.keys(r) : [],
-    };
+    leadProbe = await probeLeadEndpoints({ startdate, enddate, PageSize: 50 });
+    out.lead_endpoints = leadProbe;
   } catch (err) {
-    out.getLeadData = { error: err.message };
+    out.lead_endpoints = { error: err.message };
   }
 
-  // GetJobStatusChanges — currently working
+  // Control: getJobStatusChanges (currently working)
   try {
     const r = await getJobStatusChanges({ startdate, enddate, PageSize: 50, StartIndex: 1 });
     const items = Array.isArray(r) ? r : (r?.data || r?.jobs || r?.results || []);
@@ -280,17 +280,30 @@ export async function probeSyncEndpoints({ days = 3 } = {}) {
     out.getJobStatusChanges = { error: err.message };
   }
 
-  // Comparison verdict
-  const leadCount = out.getLeadData?.count ?? 0;
-  const jobCount  = out.getJobStatusChanges?.count ?? 0;
-  if (leadCount === 0 && jobCount > 0) {
-    out.verdict = 'getLeadData broken (returns 0) but getJobStatusChanges works — confirms LP-side or parameter issue with /api/Leads/GetLeadData';
-  } else if (leadCount > 0 && jobCount > 0) {
-    out.verdict = 'Both endpoints returning records — sync should be healthy';
-  } else if (leadCount === 0 && jobCount === 0) {
-    out.verdict = 'Both endpoints returning 0 — check LP token/auth or business actually quiet for this window';
+  // Verdict — which path is currently working
+  const a = leadProbe?.path_a?.count ?? null;
+  const b = leadProbe?.path_b?.count ?? null;
+  const c = leadProbe?.path_c?.count ?? null;
+  const job = out.getJobStatusChanges?.count ?? 0;
+
+  if (a > 0) {
+    out.verdict = `Path A working (GetLeadData with pro_id=0 returned ${a}). Sync should be healthy on legacy path.`;
+    out.recommended_action = 'No code change needed. Investigate why recent incremental syncs returned 0.';
+  } else if (b > 0) {
+    out.verdict = `Path A broken (0 records) but Path B working (GetLeadData WITHOUT pro_id returned ${b}). pro_id=0 is the broken parameter.`;
+    out.recommended_action = 'Permanent fix: patch lp-client.js getLeadData to omit pro_id by default. The auto-fallback is currently doing this for you on every run.';
+  } else if (c > 0) {
+    out.verdict = `Both Path A and Path B return 0 from GetLeadData. Path C (/api/Customers/GetLead) returned ${c}. /api/Leads/GetLeadData appears fully broken on LP side.`;
+    out.recommended_action = 'The auto-fallback is currently routing all traffic to /api/Customers/GetLead. Consider asking Amanda at LP to investigate /api/Leads/GetLeadData. To accelerate backfill, set FORCE_SYNC_SINCE env var on Railway to ~5 days ago for one full incremental.';
+  } else if (a === 0 && b === 0 && c === 0 && job > 0) {
+    out.verdict = `All 3 lead paths return 0 but getJobStatusChanges returns ${job}. Auth+token+network are fine but every lead-fetch endpoint is empty for this window. Unusual.`;
+    out.recommended_action = 'Try a wider window (?days=14). If still 0, contact Amanda at LP — both /api/Leads/GetLeadData AND /api/Customers/GetLead are misbehaving.';
+  } else if (a === 0 && b === 0 && c === 0 && job === 0) {
+    out.verdict = 'Every endpoint returns 0. Likely token/auth issue OR the window genuinely has no activity.';
+    out.recommended_action = 'Try a wider window. If still 0, hit /lp/test to verify auth.';
   } else {
-    out.verdict = 'Unusual pattern — review raw response keys';
+    out.verdict = 'Partial / unusual response pattern. Inspect response_shape and raw_response_keys for each path.';
+    out.recommended_action = 'Manual inspection required.';
   }
 
   return out;
