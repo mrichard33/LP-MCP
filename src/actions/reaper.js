@@ -1,9 +1,13 @@
 /**
  * Stuck-Action Reaper — src/actions/reaper.js
  *
- * Defense against Railway redeploys killing the Node.js process mid-handler.
+ * Defense against state-machine pathologies that strand actions in non-
+ * executor-readable statuses. Two phases run on every heartbeat cycle as
+ * a 15-line guardrail at the top of executeActions().
  *
- * Failure pattern being addressed:
+ * ─── PHASE 1: Stuck 'executing' (Railway redeploy zombies) ──────────
+ *
+ * Failure pattern:
  *   1. Executor marks action status = 'executing'
  *   2. Handler begins GHL API call (may succeed or fail)
  *   3. Railway sends SIGTERM → SIGKILL (during redeploy)
@@ -11,14 +15,32 @@
  *   5. Action sits in 'executing' forever; executeActions() only picks 'pending'
  *
  * On 2026-04-24 we discovered 72 such zombies dating back to 2026-04-13 —
- * silently dropped stage advances, P2 enrichments, and hot-lead alerts. This
- * reaper prevents recurrence by sweeping stale 'executing' rows at the start
- * of every heartbeat cycle and transitioning them back to 'pending' (for
- * idempotent retry) or 'failed' (for non-idempotent or exhausted-retry).
+ * silently dropped stage advances, P2 enrichments, and hot-lead alerts.
+ * Phase 1 prevents recurrence by sweeping stale 'executing' rows back to
+ * 'pending' (idempotent retry) or 'failed' (non-idempotent / retries
+ * exhausted).
  *
- * Runs as a 15-line guardrail at the top of executeActions(). No cron,
- * no extra infrastructure. Because the 5-min heartbeat already drives
- * executeActions(), the reaper inherits that cadence automatically.
+ * ─── PHASE 2: Stuck 'approved' (orphan state from MCP approve_action bug) ─
+ *
+ * Failure pattern (fixed in commit 2ac7f25 on 2026-04-28):
+ *   1. Action sits in 'pending_approval' awaiting human review
+ *   2. Approver calls MCP approve_action tool with decision='approve'
+ *   3. Tool writes status='approved' (WRONG — should be 'pending')
+ *   4. executeActions() pickup query is `.eq('status', 'pending')` so
+ *      'approved' rows are never picked up
+ *   5. Action sits in 'approved' forever — silently dropped customer
+ *      tagging, opportunity moves, GroupMe alerts
+ *
+ * On 2026-04-28 we discovered 56 such orphans dating back to 2026-04-12,
+ * cleaned manually via SQL skip. The MCP tool was patched in 2ac7f25.
+ * Phase 2 sweeps any 'approved' rows older than 2 minutes back to
+ * 'pending' so they execute. The 2-minute grace allows brief transitional
+ * use of 'approved' if any future code path needs it; anything older is
+ * pathological and gets recovered.
+ *
+ * Both phases inherit the 5-minute heartbeat cadence — no extra cron, no
+ * extra infrastructure. The reaper runs first inside executeActions() so
+ * recovered rows execute in the same cycle.
  */
 
 import supabase from '../supabase.js';
@@ -28,8 +50,13 @@ import supabase from '../supabase.js';
 // with full LP API roundtrip) finishes in <30s. Anything 20× that is dead.
 const REAPER_AGE_MINUTES = 10;
 
+// Actions in 'approved' status older than this are pathological orphans.
+// 2 minutes is well past any plausible transitional use (the executor
+// picks up 'pending' rows within seconds).
+const APPROVED_RECOVERY_AGE_MINUTES = 2;
+
 // Handlers that produce side effects a retry would duplicate. Always fail
-// these rather than retry, regardless of age or retry budget.
+// these rather than retry, regardless of age or retry budget. (Phase 1 only.)
 const NON_IDEMPOTENT_ACTION_TYPES = new Set([
   'create_task',         // posts GHL note + GroupMe notification
   'send_notification',   // posts GroupMe message
@@ -37,13 +64,11 @@ const NON_IDEMPOTENT_ACTION_TYPES = new Set([
 ]);
 
 /**
- * Find actions stuck in 'executing' status for more than REAPER_AGE_MINUTES
- * and transition them back to 'pending' (for retry) or 'failed' (non-idempotent
- * or retries exhausted).
- *
- * Returns { reaped, requeued, failed } for logging / stats.
+ * Phase 1: Find actions stuck in 'executing' status for more than
+ * REAPER_AGE_MINUTES and transition them back to 'pending' (for retry)
+ * or 'failed' (non-idempotent or retries exhausted).
  */
-export async function reapStuckActions() {
+async function reapStuckExecuting() {
   const cutoff = new Date(Date.now() - REAPER_AGE_MINUTES * 60 * 1000).toISOString();
 
   const { data: stuck, error } = await supabase
@@ -53,7 +78,7 @@ export async function reapStuckActions() {
     .lt('updated_at', cutoff);
 
   if (error) {
-    console.error(`[Reaper] Failed to fetch stuck actions: ${error.message}`);
+    console.error(`[Reaper:executing] fetch failed: ${error.message}`);
     return { reaped: 0, requeued: 0, failed: 0, error: error.message };
   }
   if (!stuck?.length) return { reaped: 0, requeued: 0, failed: 0 };
@@ -90,7 +115,7 @@ export async function reapStuckActions() {
       .eq('status', 'executing'); // Guard against race: only update if still executing
 
     if (updateErr) {
-      console.error(`[Reaper] Failed to update action ${action.id}: ${updateErr.message}`);
+      console.error(`[Reaper:executing] update failed for action ${action.id}: ${updateErr.message}`);
       continue;
     }
 
@@ -98,6 +123,95 @@ export async function reapStuckActions() {
     else failed++;
   }
 
-  console.log(`[Reaper] ${stuck.length} stuck actions reaped — ${requeued} requeued, ${failed} failed`);
+  console.log(`[Reaper:executing] ${stuck.length} stuck — ${requeued} requeued, ${failed} failed`);
   return { reaped: stuck.length, requeued, failed };
+}
+
+/**
+ * Phase 2: Find actions stuck in 'approved' status for more than
+ * APPROVED_RECOVERY_AGE_MINUTES and promote them to 'pending' so the
+ * executor's pickup query matches them.
+ *
+ * 'approved' is an orphan state — the executor only reads 'pending'.
+ * The MCP approve_action tool used to write this status by mistake (fixed
+ * in 2ac7f25); this phase recovers any rows that slip in from that or
+ * any future code path that produces the bad state.
+ *
+ * Only promotes rows whose original transition is recent enough to be
+ * actionable. Rows older than 24h are skipped to 'skipped' — the moment
+ * is dead and forcing them through could fire stale customer messages
+ * or make stale stage moves.
+ */
+async function reapStuckApproved() {
+  const promoteCutoff = new Date(Date.now() - APPROVED_RECOVERY_AGE_MINUTES * 60 * 1000).toISOString();
+  const skipCutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+  const { data: stuck, error } = await supabase
+    .from('agent_actions')
+    .select('id, action_type, rule_applied, approved_by, approved_at, created_at, updated_at')
+    .eq('status', 'approved')
+    .lt('updated_at', promoteCutoff);
+
+  if (error) {
+    console.error(`[Reaper:approved] fetch failed: ${error.message}`);
+    return { reaped: 0, promoted: 0, skipped: 0, error: error.message };
+  }
+  if (!stuck?.length) return { reaped: 0, promoted: 0, skipped: 0 };
+
+  let promoted = 0;
+  let skipped = 0;
+
+  for (const action of stuck) {
+    const isStale = action.created_at && action.created_at < skipCutoff;
+    const newStatus = isStale ? 'skipped' : 'pending';
+
+    const errorMsg = isStale
+      ? `Reaped: stuck in 'approved' status >${24}h; skipped (moment is dead, executing now could fire stale customer messages or stage moves)`
+      : `Reaped: stuck in 'approved' status >${APPROVED_RECOVERY_AGE_MINUTES}min; promoted to 'pending' so executor picks up. Approved by: ${action.approved_by || '(none)'}`;
+
+    const { error: updateErr } = await supabase
+      .from('agent_actions')
+      .update({
+        status: newStatus,
+        error_message: errorMsg,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', action.id)
+      .eq('status', 'approved'); // Guard against race
+
+    if (updateErr) {
+      console.error(`[Reaper:approved] update failed for action ${action.id}: ${updateErr.message}`);
+      continue;
+    }
+
+    if (newStatus === 'pending') promoted++;
+    else skipped++;
+  }
+
+  if (promoted > 0 || skipped > 0) {
+    console.log(`[Reaper:approved] ${stuck.length} stuck — ${promoted} promoted to pending, ${skipped} skipped (>24h stale)`);
+  }
+  return { reaped: stuck.length, promoted, skipped };
+}
+
+/**
+ * Combined reaper. Returns aggregate counts so executeActions() can include
+ * them in its response payload for n8n / monitoring visibility.
+ *
+ * Backward-compatible return shape: callers that read `.reaped` continue
+ * to work. New `.approved_recovered` and `.approved_skipped` fields are
+ * additive.
+ */
+export async function reapStuckActions() {
+  const exec = await reapStuckExecuting();
+  const appr = await reapStuckApproved();
+
+  return {
+    reaped: (exec.reaped || 0) + (appr.reaped || 0),
+    requeued: exec.requeued || 0,
+    failed: exec.failed || 0,
+    approved_recovered: appr.promoted || 0,
+    approved_skipped: appr.skipped || 0,
+    error: exec.error || appr.error,
+  };
 }

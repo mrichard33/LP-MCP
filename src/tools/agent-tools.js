@@ -190,6 +190,10 @@ export function registerAgentTools(server) {
       if (params.status) {
         query = query.eq('status', params.status);
       } else {
+        // 'approved' included in default scope so legacy stuck rows from
+        // pre-2026-04-28 (when this tool wrote that status by mistake) are
+        // visible in dashboards. The reaper sweeps them on each heartbeat;
+        // they should never accumulate going forward.
         query = query.in('status', ['pending', 'pending_approval', 'approved']);
       }
 
@@ -202,9 +206,15 @@ export function registerAgentTools(server) {
   // ───────────────────────────────────────────────────
   // Tool: approve_action
   // ───────────────────────────────────────────────────
+  // BUG FIX 2026-04-28 — was setting status='approved' on approval, which
+  // is an orphan state the executor never reads (only picks up 'pending').
+  // Created 56 silently-orphaned actions across the system. Now writes
+  // status='pending' to match the GroupMe webhook flow in groupme.js.
+  // Reaper still sweeps any 'approved' rows defensively for legacy data
+  // and any other code paths that might produce that status.
   server.tool(
     'approve_action',
-    'Approve or reject an agent action that requires human approval.',
+    'Approve or reject an agent action that requires human approval. Approved actions are queued for executor pickup; rejected actions are marked rejected with optional reason.',
     {
       action_id: z.number().describe('ID of the action to approve/reject'),
       decision: z.string().describe('Either "approve" or "reject"'),
@@ -214,8 +224,22 @@ export function registerAgentTools(server) {
     async (params) => {
       const isApprove = params.decision === 'approve';
       const updates = isApprove
-        ? { status: 'approved', approved_by: params.approved_by || 'ryan', approved_at: new Date().toISOString() }
-        : { status: 'rejected', approved_by: params.approved_by || 'ryan', approved_at: new Date().toISOString(), rejection_reason: params.rejection_reason || null };
+        ? {
+            // 'pending' (NOT 'approved') so the executor's
+            //   .eq('status', 'pending')
+            // pickup query matches. Mirrors groupme.js:handleGroupMeCallback.
+            status: 'pending',
+            approved_by: params.approved_by || 'ryan',
+            approved_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          }
+        : {
+            status: 'rejected',
+            approved_by: params.approved_by || 'ryan',
+            approved_at: new Date().toISOString(),
+            rejection_reason: params.rejection_reason || null,
+            updated_at: new Date().toISOString(),
+          };
 
       const { data, error } = await supabase
         .from('agent_actions')
@@ -227,7 +251,7 @@ export function registerAgentTools(server) {
 
       if (error) return { content: [{ type: 'text', text: `Error: ${error.message}` }] };
       if (!data) return { content: [{ type: 'text', text: `Action ${params.action_id} not found or not pending_approval.` }] };
-      return { content: [{ type: 'text', text: JSON.stringify({ status: isApprove ? 'approved' : 'rejected', action_id: data.id, action_type: data.action_type, target_id: data.target_id }, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ decision: isApprove ? 'approved' : 'rejected', action_id: data.id, action_type: data.action_type, target_id: data.target_id, queued_status: data.status }, null, 2) }] };
     }
   );
 
