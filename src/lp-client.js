@@ -161,60 +161,134 @@ async function _getLeadDataRaw(params = {}, { omitProId = false } = {}) {
   return withCircuit(() => lpPost('/api/Leads/GetLeadData', fields));
 }
 
-// ─── getLeadData with auto-fallback ──────────────────────────────
+// ─── Path-stickiness cache ───────────────────────────────────────
+// Once we discover which path actually returns data, remember it
+// and route paginated continuations to the same path. Without this,
+// page 1 might win on Path C but page 2 (StartIndex>1) would go
+// straight back to broken Path A and the loop terminates after 50
+// records — crippling backfills.
+//
+// Cache TTL is short (30min default) so we periodically retry Path A
+// in case LP fixes the upstream issue. Override via env:
+//   LP_PATH_CACHE_TTL_MS=N   (default 1_800_000 = 30min)
+
+const PATH_CACHE_TTL_MS = parseInt(process.env.LP_PATH_CACHE_TTL_MS || `${30 * 60 * 1000}`, 10);
+let _pathCache = { path: null, expires: 0, lastWinAt: null, lastWinCount: null };
+
+export function getLeadPathCacheState() {
+  const now = Date.now();
+  return {
+    cached_path: _pathCache.path,
+    valid: _pathCache.path !== null && now < _pathCache.expires,
+    expires_at: _pathCache.expires ? new Date(_pathCache.expires).toISOString() : null,
+    expires_in_ms: _pathCache.expires ? Math.max(0, _pathCache.expires - now) : 0,
+    last_win_at: _pathCache.lastWinAt ? new Date(_pathCache.lastWinAt).toISOString() : null,
+    last_win_count: _pathCache.lastWinCount,
+    ttl_ms: PATH_CACHE_TTL_MS,
+  };
+}
+
+export function clearLeadPathCache() {
+  _pathCache = { path: null, expires: 0, lastWinAt: null, lastWinCount: null };
+}
+
+function _rememberWin(path, count) {
+  _pathCache = {
+    path,
+    expires: Date.now() + PATH_CACHE_TTL_MS,
+    lastWinAt: Date.now(),
+    lastWinCount: count,
+  };
+}
+
+function _cachedPathStillValid() {
+  return _pathCache.path !== null && Date.now() < _pathCache.expires;
+}
+
+// ─── getLeadData with auto-fallback + path stickiness ────────────
 // Background: starting ~2026-04-24, /api/Leads/GetLeadData began silently
 // returning 0 rows for valid windows that DID contain changes. The same
-// window on /api/Customers/GetLead returns full data, and
-// /api/Customers/GetJobStatusChanges (also under /Customers/) returns
-// thousands of milestones. Pattern strongly suggests an LP-side change to
-// /api/Leads/GetLeadData (likely pro_id=0 semantics or endpoint drift).
+// window on /api/Customers/GetLead returns full data. Pattern strongly
+// suggests an LP-side change (likely pro_id=0 semantics or endpoint drift).
 //
 // Strategy:
-//   1. Try /api/Leads/GetLeadData with pro_id=0 (legacy behavior)
-//   2. If first page returns 0 items, try the same call with pro_id omitted
-//   3. If THAT also returns 0, fall back to /api/Customers/GetLead via getLeads()
-//   4. Log which path succeeded so we can tell what's actually happening
+//   - If cache says path B or C won recently → go straight to that path
+//     (this preserves pagination correctness — page 2/3/4 use the same
+//     path as page 1)
+//   - Otherwise: try Path A first, then B, then C on first page
+//   - Cache the winning path for PATH_CACHE_TTL_MS (default 30min)
 //
-// Disable via env LP_GETLEADDATA_FALLBACK=false to revert to original behavior.
-//
-// IMPORTANT: We only fall back when StartIndex=1 (first page). If we're
-// paginating mid-stream we trust the original call's "no more pages" signal.
+// Disable via env:
+//   LP_GETLEADDATA_FALLBACK=false   (revert to legacy behavior)
 
 export async function getLeadData(params = {}) {
   const fallbackEnabled = String(process.env.LP_GETLEADDATA_FALLBACK || 'true').toLowerCase() !== 'false';
+
+  if (!fallbackEnabled) {
+    return _getLeadDataRaw(params);
+  }
+
+  // ─── Path-cache shortcut: if a non-A path won recently, go straight ──
+  if (_cachedPathStillValid() && _pathCache.path !== 'A') {
+    if (_pathCache.path === 'B') {
+      const r = await _getLeadDataRaw(params, { omitProId: true });
+      const items = _itemsFrom(r);
+      if (items.length > 0) _rememberWin('B', items.length);
+      return r;
+    }
+    if (_pathCache.path === 'C') {
+      const r = await getLeads({
+        startdate: params.startdate,
+        enddate:   params.enddate,
+        PageSize:  params.PageSize,
+        StartIndex: params.StartIndex,
+      });
+      const items = _itemsFrom(r);
+      if (items.length > 0) _rememberWin('C', items.length);
+      return r;
+    }
+  }
+
   const isFirstPage = (params.StartIndex || 1) === 1 || params.StartIndex === '1';
 
-  // ─── Path A: Original /api/Leads/GetLeadData with pro_id=0 ────
+  // ─── Path A: original behavior with pro_id=0 ──────────────────
   let result;
   try {
     result = await _getLeadDataRaw(params);
   } catch (err) {
-    // Hard error on path A — re-throw, don't try fallbacks
-    throw err;
+    throw err;  // hard error on path A — re-throw, don't try fallbacks
   }
 
-  if (!fallbackEnabled || !isFirstPage) return result;
-
-  const itemsA = _itemsFrom(result);
-  if (itemsA.length > 0) {
+  // For paginated continuations (StartIndex > 1) without a cached
+  // path, we still trust path A's result — but if A returns 0 here it
+  // means the first page never set a cache, which shouldn't happen.
+  if (!isFirstPage) {
+    const items = _itemsFrom(result);
+    if (items.length > 0) _rememberWin('A', items.length);
     return result;
   }
 
-  // ─── Path B: /api/Leads/GetLeadData with pro_id OMITTED ───────
-  // (Tests whether pro_id=0 is the issue specifically.)
+  const itemsA = _itemsFrom(result);
+  if (itemsA.length > 0) {
+    _rememberWin('A', itemsA.length);
+    return result;
+  }
+
+  // ─── Path B: GetLeadData with pro_id OMITTED ──────────────────
   try {
     const resultB = await _getLeadDataRaw(params, { omitProId: true });
     const itemsB = _itemsFrom(resultB);
     if (itemsB.length > 0) {
       console.warn(`[LP] getLeadData fallback HIT path B (pro_id omitted) — ${itemsB.length} items. ` +
-                   `pro_id=0 appears to be the broken parameter; consider patching the call permanently.`);
+                   `pro_id=0 appears to be the broken parameter; cache will pin to B for ${Math.round(PATH_CACHE_TTL_MS / 60000)}min.`);
+      _rememberWin('B', itemsB.length);
       return resultB;
     }
   } catch (err) {
     console.warn('[LP] getLeadData path B (no pro_id) failed:', err.message);
   }
 
-  // ─── Path C: Fall back to /api/Customers/GetLead via getLeads ──
+  // ─── Path C: getLeads (/api/Customers/GetLead) ────────────────
   try {
     const resultC = await getLeads({
       startdate: params.startdate,
@@ -225,14 +299,15 @@ export async function getLeadData(params = {}) {
     const itemsC = _itemsFrom(resultC);
     if (itemsC.length > 0) {
       console.warn(`[LP] getLeadData fallback HIT path C (/api/Customers/GetLead) — ${itemsC.length} items. ` +
-                   `Original /api/Leads/GetLeadData appears broken on LP side; sync running on fallback.`);
+                   `Original /api/Leads/GetLeadData broken on LP side; cache will pin to C for ${Math.round(PATH_CACHE_TTL_MS / 60000)}min.`);
+      _rememberWin('C', itemsC.length);
       return resultC;
     }
     console.warn('[LP] getLeadData all 3 paths returned 0 items — window may genuinely be empty, or LP API broken.');
-    return resultC;  // Return the empty result so caller treats as "no records"
+    return resultC;
   } catch (err) {
     console.warn('[LP] getLeadData path C (getLeads fallback) failed:', err.message);
-    return result;  // Return original empty result
+    return result;  // return original empty result
   }
 }
 
@@ -266,6 +341,7 @@ export async function probeLeadEndpoints({ startdate, enddate, PageSize = 50 } =
     path_a: summarize('GetLeadData with pro_id=0 (current behavior)', probes[0]),
     path_b: summarize('GetLeadData with pro_id omitted', probes[1]),
     path_c: summarize('GetLead (alternate endpoint, /api/Customers/GetLead)', probes[2]),
+    cache_state: getLeadPathCacheState(),
   };
 }
 
