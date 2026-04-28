@@ -18,6 +18,11 @@
  * Use raw text input. PDF / DOCX parsing is the caller's responsibility
  * (use pdf-parse, mammoth, etc. upstream).
  *
+ * v1.1 — listSourceDocs paginates to avoid 1000-row Supabase default
+ *        cap (which silently undercounted sources after first ingest).
+ *        Also uses a dedicated COUNT-per-source query when chunk
+ *        totals exceed the row sample, for accuracy without scanning
+ *        every row.
  * v1.0 — Initial implementation.
  */
 
@@ -27,6 +32,8 @@ import { embedBatch, chunkText, estimateTokens } from './openai-embeddings.js';
 const DEFAULT_TARGET_TOKENS = 500;
 const DEFAULT_OVERLAP_TOKENS = 50;
 const INSERT_BATCH_SIZE = 100;
+const LIST_PAGE_SIZE = 1000;
+const LIST_MAX_PAGES = 50; // hard ceiling — 50K rows max in summary
 
 // ═══════════════════════════════════════════════════════════════════
 // CORE INGESTION
@@ -72,16 +79,23 @@ export async function ingestDocument(params) {
 
   // Step 1: Optional replace — soft-delete existing chunks
   if (replace) {
-    const { count, error: delError } = await supabase
+    // Get accurate count first (head:true select doesn't combine with update)
+    const { count: priorCount } = await supabase
+      .from('kb_embeddings')
+      .select('id', { count: 'exact', head: true })
+      .eq('source_doc', source_doc)
+      .eq('active', true);
+
+    const { error: delError } = await supabase
       .from('kb_embeddings')
       .update({ active: false })
       .eq('source_doc', source_doc)
-      .eq('active', true)
-      .select('id', { count: 'exact', head: true });
+      .eq('active', true);
+
     if (delError) {
       console.warn(`[KBIngest] soft-delete failed for ${source_doc}: ${delError.message}`);
     } else {
-      chunksReplaced = count || 0;
+      chunksReplaced = priorCount || 0;
       console.log(`[KBIngest] Soft-deleted ${chunksReplaced} prior chunks for ${source_doc}`);
     }
   }
@@ -196,43 +210,92 @@ export async function ingestDocument(params) {
  */
 export async function clearSourceDoc(source_doc) {
   if (!source_doc) throw new Error('clearSourceDoc requires source_doc');
-  const { error, count } = await supabase
+
+  // Count first (for accurate return value)
+  const { count: priorCount } = await supabase
+    .from('kb_embeddings')
+    .select('id', { count: 'exact', head: true })
+    .eq('source_doc', source_doc)
+    .eq('active', true);
+
+  const { error } = await supabase
     .from('kb_embeddings')
     .update({ active: false })
     .eq('source_doc', source_doc)
-    .eq('active', true)
-    .select('id', { count: 'exact', head: true });
+    .eq('active', true);
+
   if (error) throw new Error(`clearSourceDoc failed: ${error.message}`);
-  return { source_doc, chunks_deactivated: count || 0 };
+  return { source_doc, chunks_deactivated: priorCount || 0 };
 }
 
 /**
- * Health: list known source docs with chunk counts.
+ * v1.1: List known source docs with accurate chunk counts.
+ *
+ * Uses a two-stage approach:
+ *   1. Get distinct source_doc list via paginated scan of source_doc only
+ *   2. For each source_doc, do a COUNT(*) query (cheap — uses index)
+ *
+ * This avoids the prior 1000-row Supabase default cap that silently
+ * undercounted sources once the table grew past 1K active chunks.
  */
 export async function listSourceDocs() {
-  const { data, error } = await supabase
-    .from('kb_embeddings')
-    .select('source_doc, source_doc_version, ingested_at')
-    .eq('active', true);
-  if (error) throw new Error(`listSourceDocs failed: ${error.message}`);
+  // Stage 1: collect distinct source_doc values via pagination
+  const distinctSources = new Map(); // source_doc → { source_doc_version, latest_ingested_at }
+  let from = 0;
+  let pages = 0;
 
-  // Aggregate in memory
-  const summary = {};
-  for (const row of (data || [])) {
-    if (!summary[row.source_doc]) {
-      summary[row.source_doc] = {
-        source_doc: row.source_doc,
-        source_doc_version: row.source_doc_version,
-        chunks: 0,
-        latest_ingested_at: row.ingested_at,
-      };
+  while (pages < LIST_MAX_PAGES) {
+    const { data, error } = await supabase
+      .from('kb_embeddings')
+      .select('source_doc, source_doc_version, ingested_at')
+      .eq('active', true)
+      .order('id', { ascending: true })
+      .range(from, from + LIST_PAGE_SIZE - 1);
+
+    if (error) throw new Error(`listSourceDocs page ${pages} failed: ${error.message}`);
+    if (!data || data.length === 0) break;
+
+    for (const row of data) {
+      const existing = distinctSources.get(row.source_doc);
+      if (!existing) {
+        distinctSources.set(row.source_doc, {
+          source_doc_version: row.source_doc_version,
+          latest_ingested_at: row.ingested_at,
+        });
+      } else if (row.ingested_at && row.ingested_at > existing.latest_ingested_at) {
+        existing.latest_ingested_at = row.ingested_at;
+        existing.source_doc_version = row.source_doc_version || existing.source_doc_version;
+      }
     }
-    summary[row.source_doc].chunks++;
-    if (new Date(row.ingested_at) > new Date(summary[row.source_doc].latest_ingested_at)) {
-      summary[row.source_doc].latest_ingested_at = row.ingested_at;
-    }
+
+    if (data.length < LIST_PAGE_SIZE) break; // last page
+    from += LIST_PAGE_SIZE;
+    pages++;
   }
-  return Object.values(summary).sort((a, b) => b.chunks - a.chunks);
+
+  // Stage 2: accurate COUNT(*) per distinct source_doc
+  const summary = [];
+  for (const [source_doc, meta] of distinctSources.entries()) {
+    const { count, error: countError } = await supabase
+      .from('kb_embeddings')
+      .select('id', { count: 'exact', head: true })
+      .eq('source_doc', source_doc)
+      .eq('active', true);
+
+    if (countError) {
+      console.warn(`[KBIngest] count failed for ${source_doc}: ${countError.message}`);
+      continue;
+    }
+
+    summary.push({
+      source_doc,
+      source_doc_version: meta.source_doc_version,
+      chunks: count || 0,
+      latest_ingested_at: meta.latest_ingested_at,
+    });
+  }
+
+  return summary.sort((a, b) => b.chunks - a.chunks);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -254,8 +317,6 @@ async function logIngestion(entry) {
 export function registerKbIngestionRoutes(app) {
   /**
    * Ingest text into the KB.
-   * Auth: MCP_AUTH_TOKEN required (apply via existing middleware).
-   *
    * Body: { text, source_doc, source_doc_version?, source_section?,
    *         metadata?, replace?, targetTokens?, overlapTokens? }
    */
@@ -294,7 +355,8 @@ export function registerKbIngestionRoutes(app) {
   app.get('/n8n/kb/sources', async (_req, res) => {
     try {
       const list = await listSourceDocs();
-      res.json({ count: list.length, sources: list });
+      const totalChunks = list.reduce((sum, s) => sum + (s.chunks || 0), 0);
+      res.json({ count: list.length, total_chunks: totalChunks, sources: list });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
