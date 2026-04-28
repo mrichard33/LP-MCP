@@ -11,17 +11,108 @@
  *   - OBJECTION       → kb_objection_scripts + supporting kb_story_arcs + kb_proof_points
  *   - PRICING         → kb_pricing_anchors (by window count if known)
  *   - QUESTION        → kb_faqs (keyword/pattern match) + kb_story_arcs
- *   - BOOK / RECONNECT / NOT_INTERESTED / SEND_INFO / UNCLEAR
+ *   - BOOK / BOOK_NEXTSTEP / BOOK_QUOTE_READY / FAST_TRACK_FRUSTRATED
+ *                     → BOOKING CONTEXT injected; skip objection/pricing pulls
+ *   - CALLBACK / CALLBACK_CALM
+ *                     → BOOKING CONTEXT (Confirmation Call calendar)
+ *   - RECONNECT / NOT_INTERESTED / SEND_INFO / UNCLEAR
  *                     → kb_story_arcs (chosen by buyer_stage)
  *
  * Always pulls (when relevant context provided):
  *   - kb_techniques relevant to current buyer_stage
  *   - kb_competitor_intel if a competitor name is detected in message
  *
+ * v1.1 — 2026-04-28. Calendar awareness:
+ *   - Adds resolveBookingContext({intentClass, activeEntryTag})
+ *   - Surfaces correct calendar ID per intent + lead source:
+ *     · CALLBACK_CALM / CALLBACK   → Confirmation Call (gFWoSQrlKIdfRbAPV842)
+ *     · estimate-calculator entry  → Window Measurement Verification (zEdPmkNccR2ovo3rQAd3)
+ *     · default in-home            → Window Estimate (aJj14ONxh1oFyDcQ706O)
+ *   - Adds booking_context to kb_pack with calendar_id, visit_type, duration,
+ *     guidance ("skip discovery, go to scheduling"), and a booking_url
+ *     (pattern overridable via GHL_BOOKING_URL_BASE env var).
+ *
  * v1.0 — Initial implementation.
  */
 
 import supabase from '../supabase.js';
+
+// ═══════════════════════════════════════════════════════════════════
+// CALENDAR CONSTANTS — Reece booking calendars
+// ═══════════════════════════════════════════════════════════════════
+
+export const CALENDAR_IDS = {
+  CONFIRMATION_CALL: 'gFWoSQrlKIdfRbAPV842',  // 1-2min call to confirm details before in-home
+  WINDOW_ESTIMATE:   'aJj14ONxh1oFyDcQ706O',  // Standard 90-min in-home Window Protection Estimate
+  MV:                'zEdPmkNccR2ovo3rQAd3',  // Window Measurement Verification — for estimate calculator leads
+};
+
+// Override via env so Mark can swap to a custom domain later
+const BOOKING_URL_BASE = (process.env.GHL_BOOKING_URL_BASE || 'https://api.leadconnectorhq.com/widget/booking').replace(/\/+$/, '');
+
+const calendarUrl = (id) => `${BOOKING_URL_BASE}/${id}`;
+
+/**
+ * Resolve the right booking calendar based on intent + lead source.
+ *
+ * @param {Object} args
+ * @param {string} args.intentClass — Classifier output (e.g. 'BOOK_QUOTE_READY')
+ * @param {string} [args.activeEntryTag] — Current lead source tag (e.g. 'active-entry:estimate-calculator')
+ * @returns {Object|null} BookingContext, or null when not a booking-relevant intent
+ */
+export function resolveBookingContext({ intentClass, activeEntryTag } = {}) {
+  // Phone callback intents → Confirmation Call calendar (15min phone slot)
+  if (intentClass === 'CALLBACK' || intentClass === 'CALLBACK_CALM') {
+    return {
+      type:             'phone_call',
+      visit_type:       'phone',
+      calendar_id:      CALENDAR_IDS.CONFIRMATION_CALL,
+      calendar_name:    'Confirmation Call',
+      duration_minutes: 15,
+      booking_url:      calendarUrl(CALENDAR_IDS.CONFIRMATION_CALL),
+      description:      '1-2 minute phone call to confirm details before any in-home estimate',
+      guidance:         'Confirm phone number, offer the call slot. Do NOT pitch in-home yet — that comes after the call.',
+    };
+  }
+
+  // Estimate calculator leads → MV calendar (web-form completers ready for measurement)
+  if (typeof activeEntryTag === 'string' && activeEntryTag === 'active-entry:estimate-calculator') {
+    return {
+      type:             'in_home',
+      visit_type:       'in_home',
+      calendar_id:      CALENDAR_IDS.MV,
+      calendar_name:    'Window Measurement Verification',
+      duration_minutes: 90,
+      booking_url:      calendarUrl(CALENDAR_IDS.MV),
+      description:      'In-home measurement verification — about an hour and a half — for online estimate calculator leads',
+      guidance:         'They already used the online calculator. The in-home is to verify measurements and finalize penny-accurate pricing. Move directly to scheduling — skip discovery.',
+    };
+  }
+
+  // Default in-home: standard Window Estimate
+  return {
+    type:             'in_home',
+    visit_type:       'in_home',
+    calendar_id:      CALENDAR_IDS.WINDOW_ESTIMATE,
+    calendar_name:    'Window Estimate',
+    duration_minutes: 90,
+    booking_url:      calendarUrl(CALENDAR_IDS.WINDOW_ESTIMATE),
+    description:      'Standard in-home Window Protection Estimate — about an hour and a half. Specialist measures to Florida code and provides exact pricing valid for 1 year.',
+    guidance:         'Both homeowners should be present. No pressure to decide on the spot. Penny-accurate pricing.',
+  };
+}
+
+// Buying-signal intents — kb pack should skip discovery/pricing/objection
+// and instead surface the BOOKING CONTEXT with "go straight to scheduling"
+// guidance. Keeps the prompt deterministic about what these signals mean.
+const BUYING_SIGNAL_INTENTS = new Set([
+  'BOOK',                    // generic book intent
+  'BOOK_NEXTSTEP',           // "what's next"
+  'BOOK_QUOTE_READY',        // "I want a quote" — distinct from PRICING ("how much?")
+  'FAST_TRACK_FRUSTRATED',   // "just schedule me"
+]);
+
+const CALLBACK_INTENTS = new Set(['CALLBACK', 'CALLBACK_CALM']);
 
 // ═══════════════════════════════════════════════════════════════════
 // HELPERS
@@ -242,6 +333,9 @@ function detectObjection(messageText) {
  * @param {string[]} [params.objectionTags] — From contact tags
  * @param {string} [params.recommendedArc] — From lead_intelligence
  * @param {number} [params.windowCount] — From contact custom field if known
+ * @param {string} [params.activeEntryTag] — v1.1: lead's current source tag
+ *                                           (e.g. 'active-entry:estimate-calculator')
+ *                                           Used to pick the right calendar.
  * @returns {Promise<Object>} — Structured KB context for the prompt
  */
 export async function buildKbPack(params) {
@@ -253,6 +347,7 @@ export async function buildKbPack(params) {
     objectionTags = [],
     recommendedArc = null,
     windowCount = null,
+    activeEntryTag = null,
   } = params;
 
   // Detect signals from message
@@ -266,6 +361,7 @@ export async function buildKbPack(params) {
     arc_options: [],
     objection_script: null,
     pricing_anchor: null,
+    booking_context: null,
     faqs: [],
     proof_points: [],
     techniques: [],
@@ -273,6 +369,7 @@ export async function buildKbPack(params) {
     detected_signals: {
       competitor: detectedCompetitor,
       objection: detectedObjection,
+      active_entry: activeEntryTag,
     },
   };
 
@@ -306,6 +403,7 @@ export async function buildKbPack(params) {
       break;
 
     case 'PRICING':
+      // "how much does it cost?" — pivot to discovery, no booking yet.
       result.pricing_anchor = await getPricingAnchor(windowCount);
       break;
 
@@ -313,7 +411,16 @@ export async function buildKbPack(params) {
       result.faqs = await searchFaqs(messageText, channel, 3);
       break;
 
+    // ─── v1.1: Buying-signal intents — surface booking context ──────
     case 'BOOK':
+    case 'BOOK_NEXTSTEP':
+    case 'BOOK_QUOTE_READY':
+    case 'FAST_TRACK_FRUSTRATED':
+    case 'CALLBACK':
+    case 'CALLBACK_CALM':
+      result.booking_context = resolveBookingContext({ intentClass, activeEntryTag });
+      break;
+
     case 'RECONNECT':
     case 'NOT_INTERESTED':
     case 'SEND_INFO':
@@ -322,6 +429,7 @@ export async function buildKbPack(params) {
       break;
 
     default:
+      // Unknown intents fall through with arc + techniques only.
       break;
   }
 
@@ -362,6 +470,26 @@ export function formatKbPackForPrompt(pack) {
     }
     if (Array.isArray(pack.primary_arc.do_not_say) && pack.primary_arc.do_not_say.length > 0) {
       lines.push(`  DO NOT SAY: ${JSON.stringify(pack.primary_arc.do_not_say).slice(0, 300)}`);
+    }
+    lines.push('');
+  }
+
+  // ─── BOOKING CONTEXT — appears only for buying-signal/callback intents ──
+  if (pack.booking_context) {
+    const b = pack.booking_context;
+    const isBuyingSignal = BUYING_SIGNAL_INTENTS.has(pack.intent_class);
+    const isCallback = CALLBACK_INTENTS.has(pack.intent_class);
+
+    lines.push('BOOKING CONTEXT (use this calendar in the response):');
+    lines.push(`  Calendar: ${b.calendar_name} (${b.duration_minutes}min, ${b.visit_type})`);
+    lines.push(`  Calendar ID: ${b.calendar_id}`);
+    lines.push(`  Booking URL: ${b.booking_url}`);
+    lines.push(`  Description: ${b.description}`);
+    lines.push(`  Guidance: ${b.guidance}`);
+    if (isBuyingSignal) {
+      lines.push(`  ⚡ BUYING-SIGNAL HANDLING: Skip discovery questions. Skip re-pitching value. Skip mentioning financing or pricing. Acknowledge their intent in ONE short line, then offer two specific calendar slots from this calendar. Match urgency.`);
+    } else if (isCallback) {
+      lines.push(`  ☎️ CALLBACK HANDLING: Confirm the lead's phone number, offer one specific call slot, do not try to keep them in text. Hand off after confirming.`);
     }
     lines.push('');
   }
