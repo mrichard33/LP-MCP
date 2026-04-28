@@ -5,61 +5,213 @@
  * trigger-message resolution, or head-of-line behavior stays a small,
  * focused edit. Extracted from action-executor.js v4.2 refactor.
  *
- * v4.2 changes preserved exactly:
- *   1. Pre-filter the pending_approval query against active tracking records
- *      so stale unanswered approvals cannot starve the limit(20) window.
- *   2. In-loop defense-in-depth re-check for concurrent executor runs.
- *   3. triggerMessage resolution accepts message_preview (the field on
- *      ai.analysis_completed events that AGENTIC_* rules fire on).
+ * v4.5 (2026-04-28) — APPLY HANDOFF INLINE ON SHORT-CIRCUIT.
+ *   PROBLEM: Under v4.4 the pre-gen short-circuit branch left the action
+ *   queued and shipped an approval card that had NO message preview line
+ *   (because makeShortCircuitResult sets message:null). Mark would see:
  *
- * v4.3 (2026-04-24) — Pre-generation now searches the batch for the
- * send_message action instead of checking only actions[0]. Rules that
- * emit multiple actions (e.g. AGENTIC_RESPOND_POST_CHATBOT emits
- * [add_tag pause-bot, send_message]) put send_message at index 1, so the
- * firstAction check never matched and cards shipped to GroupMe without the
- * 📱 AI response preview line. Now we find the send_message action by
- * action_type and pre-generate for it specifically.
+ *     🔔 APPROVAL [#27239]
+ *     🤖 AGENTIC RESPONSE
+ *     👤 Mark Test (+19545081512)
+ *     💬 "Can someone call me now?"
+ *     🤖 Lead is persistently requesting immediate human contact...
+ *     🎯 send_message: SMS reply | Tag: pause-workflow
+ *     Reply: Yes 27239 or No 27239
+ *
+ *   No 📱 line. Nothing to actually approve. If Mark approved anyway,
+ *   the runtime would call generateResponse() AGAIN, hit the gate AGAIN,
+ *   and only THEN apply the handoff tag via handleShortCircuit. Two
+ *   gate evaluations, one wasted approval cycle, and a misleading card
+ *   that asked for review of a non-decision.
+ *
+ *   FIX: When pre-gen returns short_circuit:true, apply the handoff
+ *   IMMEDIATELY at queue time:
+ *     1. POST the handoff tag (and suppress-automation if disqualifier)
+ *        to the GHL contact
+ *     2. Mark every action in the batch as completed with a structured
+ *        execution_result describing the handoff
+ *     3. Send a 🛑 AGENTIC SHORT-CIRCUIT notice to GroupMe (informational,
+ *        not an approval card)
+ *     4. Skip sendApprovalRequest entirely for this batch
+ *
+ *   The runtime path in send-message-handler.handleShortCircuit becomes
+ *   a no-op for these actions (they're already 'completed' before
+ *   send-message-handler ever sees them) but stays in place as the
+ *   canonical path for actions that bypass pre-generation (direct LP
+ *   webhook send, n8n manual triggers, etc.).
+ *
+ *   Surfaced 2026-04-28 by Mark with contact 15Z6TaUK4WHBK1R4H64S asking
+ *   "Can someone call me now?" — gate fired CALLBACK, blank approval
+ *   card landed in GroupMe, Mark approved, runtime applied
+ *   hdl:callback-request, no GHL workflow listened, conversation died.
  *
  * v4.4 (2026-04-28) — Two safety fixes for AGENTIC_* approvals:
+ *   1. NULL-SAFE PREVIEW LOG (the `generated.message.slice(0,80)` log
+ *      crashed when message:null due to a short-circuit).
+ *   2. SHORT-CIRCUIT PASS-THROUGH (don't overwrite payload with null;
+ *      let runtime regenerate). Superseded by v4.5 inline handoff above.
  *
- *   1. NULL-SAFE PREVIEW LOG. The hot-path log
- *        console.log(`...${generated.message.slice(0, 80)}...`)
- *      crashed with "Cannot read properties of null (reading 'slice')"
- *      whenever generateResponse returned short_circuit:true (because
- *      makeShortCircuitResult sets message:null deliberately). The
- *      crash was caught by the outer try/catch and surfaced to GroupMe
- *      as "AI generation failed: Cannot read properties of null", which
- *      misleadingly suggested an upstream model error.
+ * v4.3 (2026-04-24) — Pre-generation searches the whole batch for the
+ * send_message action instead of checking only actions[0].
  *
- *   2. SHORT-CIRCUIT PASS-THROUGH. When generateResponse returns
- *      short_circuit:true (a compliance/intent gate fired — STOP,
- *      WHO_IS_THIS, ANGRY, RENTER, etc.), we MUST NOT overwrite
- *      action_payload.message with null and flip pre_generated:true.
- *      Doing so produces an action that runtime can't actually send
- *      ("No message text after AI generation") and leaves the contact
- *      stuck. Instead we leave the action untouched
- *      (requires_ai_generation:true), so when send-message-handler
- *      executes it, generateResponse short-circuits again at runtime
- *      and handleShortCircuit applies the correct handoff tag, sets
- *      suppress-automation if disqualifier, and notifies GroupMe with
- *      a 🛑 short-circuit card.
+ * v4.2 — Pre-filter active tracking records to prevent head-of-line block.
  *
- *      The card we send NOW (at approval time) shows the gate context
- *      so the human reviewer sees what's about to happen — but we
- *      don't try to "approve a null message".
- *
- * Paired with sql/008_approval_queue_ttl.sql which auto-expires unanswered
- * approvals after 48h so the tracked-batch set stays bounded.
+ * Paired with sql/008_approval_queue_ttl.sql (48h auto-expiry).
  */
 
 import supabase from '../supabase.js';
-import { sendApprovalRequest } from '../groupme.js';
+import { sendApprovalRequest, sendGroupMeMessage } from '../groupme.js';
 import { resolveContactInfo, resolveLPProspectId, getEventContext } from './resolvers.js';
 import { buildNotificationEnrichment } from './enrichment.js';
+import { acquireToken, report429 } from '../ghl-rate-limiter.js';
+import { bumpContactCache } from '../context-builder.js';
+
+const GHL_API_KEY = process.env.GHL_API_KEY || '';
+
+// ═══════════════════════════════════════════════════════════════════
+// v4.5: INLINE HANDOFF HELPERS
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * POST tags to a contact using the additive endpoint. Mirrors the helper
+ * in send-message-handler.js so we don't need a circular import. Returns
+ * true on success, false on failure (logged).
+ */
+async function applyContactTagsInline(contactId, tagList) {
+  if (!contactId || !Array.isArray(tagList) || tagList.length === 0) return false;
+  if (!GHL_API_KEY) return false;
+  const filtered = tagList.filter(t => typeof t === 'string' && t.length > 0);
+  if (filtered.length === 0) return false;
+
+  try {
+    await acquireToken();
+    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/tags`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${GHL_API_KEY}`,
+        'Version': '2021-07-28',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({ tags: filtered }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (res.status === 429) {
+      report429();
+      console.warn(`[ApprovalPath] applyContactTagsInline 429 for ${contactId}`);
+      return false;
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      console.warn(`[ApprovalPath] applyContactTagsInline ${res.status}: ${text.slice(0, 150)}`);
+      return false;
+    }
+    bumpContactCache(contactId);
+    return true;
+  } catch (err) {
+    console.warn(`[ApprovalPath] applyContactTagsInline threw: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * v4.5 — Inline handoff. Replaces the approval-card-then-runtime path
+ * for short-circuited send_message actions. Applies the handoff tag(s)
+ * directly, marks every action in the batch as 'completed' with an
+ * execution_result that mirrors send-message-handler.handleShortCircuit's
+ * shape, and sends an informational notice to GroupMe.
+ *
+ * Returns the count of actions completed for stats.
+ */
+async function applyHandoffInline({
+  contactId,
+  batchActions,
+  generated,
+  contactName,
+  contactPhone,
+  triggerMessage,
+}) {
+  const handoffTag = generated.handoff_tag || null;
+  const isDQ = !!generated.is_disqualifier;
+  const tagsToApply = [];
+  if (handoffTag) tagsToApply.push(handoffTag);
+  if (isDQ) tagsToApply.push('suppress-automation');
+
+  let tagApplied = false;
+  if (tagsToApply.length > 0) {
+    tagApplied = await applyContactTagsInline(contactId, tagsToApply);
+  }
+
+  // Mark every action in the batch completed. add_tag actions in the batch
+  // (e.g. pause-workflow) are intentionally also marked complete because
+  // the agentic system has decided this lead is being handed off — the
+  // pause-workflow tag is no longer the right side effect (the GHL workflow
+  // listening on handoffTag will own state from here). If a future rule
+  // wants pause-workflow to apply alongside a handoff, add it to the
+  // tagsToApply list above explicitly.
+  const completedAt = new Date().toISOString();
+  const sharedResult = {
+    action: 'send_message_handed_off_inline',
+    reason: 'compliance_gate_handoff',
+    contact_id: contactId,
+    handoff_tag: handoffTag,
+    handler_code: generated.handler_code || null,
+    intent_class: generated.intent_class || null,
+    bucket_type: generated.bucket_type || null,
+    is_disqualifier: isDQ,
+    tags_applied: tagApplied ? tagsToApply : [],
+    classification_method: generated.classification_method || null,
+    classifier_confidence: generated.classifier_confidence ?? null,
+    applied_at: 'queue_time_v4_5',
+  };
+
+  const actionIds = batchActions.map(a => a.id);
+  await supabase
+    .from('agent_actions')
+    .update({
+      status: 'completed',
+      executed_at: completedAt,
+      approved_by: 'auto_handoff_pregeneration',
+      execution_result: sharedResult,
+      updated_at: completedAt,
+    })
+    .in('id', actionIds);
+
+  // GroupMe informational notice — same format as
+  // send-message-handler.handleShortCircuit so the human signal is
+  // identical regardless of which path applied the tag.
+  const dqLabel = isDQ ? ' [DISQUALIFIER]' : '';
+  const tagSummary = tagsToApply.join(', ') || 'none';
+  const preview = (triggerMessage || '').slice(0, 120);
+  const displayName = contactName ? `${contactName}${contactPhone ? ` (${contactPhone})` : ''}` : contactId;
+
+  await sendGroupMeMessage(
+    `🛑 AGENTIC SHORT-CIRCUIT${dqLabel} (queue-time)\n` +
+    `👤 ${displayName}\n` +
+    `Intent: ${generated.intent_class || 'unknown'}` +
+    (generated.handler_code ? ` (${generated.handler_code})` : '') + `\n` +
+    `Tags applied: ${tagSummary}${tagApplied ? '' : ' [TAG WRITE FAILED]'}\n` +
+    `Method: ${generated.classification_method || 'unknown'} (${(generated.classifier_confidence ?? 0).toFixed(2)})\n` +
+    `Inbound: "${preview}"\n` +
+    `→ GHL workflow on tag now owns the response. No approval card sent (nothing for human to review — handoff is mechanical).`
+  ).catch(err => {
+    console.warn(`[ApprovalPath] GroupMe (inline short-circuit) failed: ${err.message}`);
+  });
+
+  console.log(`[ApprovalPath] 🛑 INLINE HANDOFF: ${contactId} → ${tagSummary} ` +
+    `(intent: ${generated.intent_class}, ${batchActions.length} actions completed, no approval card)`);
+
+  return actionIds.length;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// MAIN — APPROVAL QUEUE PROCESSOR
+// ═══════════════════════════════════════════════════════════════════
 
 /**
  * Process the pending_approval queue. Returns the number of approval
- * requests sent this cycle for stats reporting.
+ * requests sent this cycle for stats reporting (does not include
+ * inline-handoff batches that bypassed the approval card).
  */
 export async function processApprovalQueue() {
   // v4.2 — Pre-filter batches that already have an active ('pending') tracking
@@ -91,6 +243,9 @@ export async function processApprovalQueue() {
     approvalBatches.get(k).push(a);
   }
 
+  let cardsSent = 0;
+  let inlineHandoffs = 0;
+
   for (const [batchId, actions] of approvalBatches) {
     // Defense-in-depth: re-check for an active tracking record inside the
     // loop. Guards against concurrent executor runs (heartbeat + approval-
@@ -112,12 +267,12 @@ export async function processApprovalQueue() {
     // v4.3 — Search the whole batch for a send_message action that needs
     // pre-generation. Rules like AGENTIC_RESPOND_POST_CHATBOT emit
     // [add_tag pause-bot (index 0), send_message (index 1)], so checking
-    // only actions[0] misses the generation trigger. The card then ships
-    // without the 📱 "..." preview line even though the payload asks for
-    // AI generation.
+    // only actions[0] misses the generation trigger.
     const sendAction = actions.find(
       a => a.action_type === 'send_message' && a.action_payload?.requires_ai_generation
     );
+
+    let inlineHandoffApplied = false;
 
     if (sendAction) {
       try {
@@ -132,27 +287,23 @@ export async function processApprovalQueue() {
         console.log(`[ActionExecutor] Pre-generating AI response for approval ${batchId} (send_message action ${sendAction.id})`);
         const generated = await generateResponse(sendAction.target_id, channel, triggerMessage);
 
-        // ── v4.4: SHORT-CIRCUIT PASS-THROUGH ─────────────────────
-        // If a compliance/intent gate fired, message is null by design.
-        // Do NOT overwrite action_payload — leave requires_ai_generation:true
-        // so the runtime handler regenerates and applies the proper handoff
-        // tag via send-message-handler.handleShortCircuit().
         if (generated.short_circuit) {
+          // ── v4.5: APPLY HANDOFF INLINE — no approval card, no runtime gate.
           console.log(`[ActionExecutor] Pre-gen short-circuit (intent: ${generated.intent_class}, ` +
                       `handler: ${generated.handler_code || 'n/a'}, ` +
                       `tag: ${generated.handoff_tag || 'none'}). ` +
-                      `Action ${sendAction.id} left as-is — runtime will apply handoff.`);
+                      `Applying handoff INLINE — skipping approval card.`);
 
-          enrichment.generatedMessage = null;
-          enrichment.shortCircuit = true;
-          enrichment.intentClass = generated.intent_class || null;
-          enrichment.handlerCode = generated.handler_code || null;
-          enrichment.handoffTag = generated.handoff_tag || null;
-          enrichment.isDisqualifier = !!generated.is_disqualifier;
-          enrichment.classifierMethod = generated.classification_method || null;
-          enrichment.classifierConfidence = generated.classifier_confidence ?? null;
-          enrichment.aiReasoning = `Compliance gate: ${generated.intent_class}` +
-            (generated.handoff_tag ? ` → tag ${generated.handoff_tag}` : '');
+          const completedCount = await applyHandoffInline({
+            contactId: sendAction.target_id,
+            batchActions: actions,
+            generated,
+            contactName: name,
+            contactPhone: phone,
+            triggerMessage,
+          });
+          inlineHandoffs += completedCount > 0 ? 1 : 0;
+          inlineHandoffApplied = true;
         } else {
           // Normal generation — pre-fill the action payload so the human
           // can preview-and-approve before runtime sends.
@@ -185,13 +336,23 @@ export async function processApprovalQueue() {
         console.error(`[ActionExecutor] Pre-approval generation failed for ${batchId}: ${err.message}`);
         enrichment.generatedMessage = null;
         enrichment.aiGenerationError = err.message;
+        // Fall through to send the approval card with the error surfaced.
       }
     }
+
+    // Skip the approval card entirely if v4.5 inline handoff already
+    // resolved this batch.
+    if (inlineHandoffApplied) continue;
 
     await sendApprovalRequest(actions, name, phone, enrichment).catch(err => {
       console.error(`[ActionExecutor] Approval request failed for batch ${batchId}:`, err.message);
     });
+    cardsSent++;
   }
 
-  return approvalActions.length;
+  if (inlineHandoffs > 0) {
+    console.log(`[ApprovalPath] Cycle: ${cardsSent} cards sent, ${inlineHandoffs} inline handoffs (no card)`);
+  }
+
+  return cardsSent;
 }
