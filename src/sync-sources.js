@@ -28,6 +28,22 @@ export const DEFAULT_SOURCE_MAPPINGS = {
   'Fave Marketing':     { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
   'Porch':              { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
   'Contractor Appointment': { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
+  // 2026-04-27: The on-site Reece Estimate Calculator form. The "Window
+  // Estimator" GHL source on contact_created events corresponds to this
+  // subdetail on the LP side. 71 leads since launch (Feb 28 2026).
+  // Routes through the estimate-calculator bucket and the W3.1 Estimate
+  // Calculator Bridge workflow.
+  //
+  // NOT in this list (intentionally):
+  //  - Reecewindows.com — generic "came through the domain" catch-all
+  //    (rep-entered web leads, Contact Us forms, callers citing the URL,
+  //    legacy data going back to 2007). 2,172 leads, 99.4% no GHL link.
+  //    Routes to entry:other via fallback.
+  //  - Estimate Calculator (Direct Mail) — only a single test lead
+  //    ("Mark Test 4", Feb 17 2026, disposition=Data). No real campaign
+  //    exists yet. Add here if/when Direct Mail launches a real vanity
+  //    URL → calculator funnel.
+  'Website Estimate Calculator': { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
   'GetTheReferral.Com': { bucket: 'referral',            tag: 'entry:referral' },
   'Job Sign':           { bucket: 'referral',            tag: 'entry:referral' },
   'Customer Referral':  { bucket: 'referral',            tag: 'entry:referral' },
