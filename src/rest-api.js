@@ -5,14 +5,16 @@
  * API call nodes can fetch LP data without speaking MCP protocol.
  *
  * Routes:
- *   GET /api/prospects/:prospectId   — LP prospect by cst_id
- *   GET /api/leads/:leadId           — LP lead by lds_id
- *   GET /api/search?phone=...        — Search by phone (E.164 or digits)
- *   GET /api/search?ghlContactId=... — Search by GHL contact ID
- *   GET /api/search?email=...        — Search by email
- *   GET /api/search?name=...         — Search by name (first or last)
- *   GET /api/lead-summary/:contactId — Full lead intelligence summary
- *   POST /webhook/ghl-event          — GHL→Agentic handoff (Webhook Bridge)
+ *   GET /api/prospects/:prospectId       — LP prospect by cst_id
+ *   GET /api/leads/:leadId               — LP lead by lds_id
+ *   GET /api/search?phone=...            — Search by phone (E.164 or digits)
+ *   GET /api/search?ghlContactId=...     — Search by GHL contact ID
+ *   GET /api/search?email=...            — Search by email
+ *   GET /api/search?name=...             — Search by name (first or last)
+ *   GET /api/lead-summary/:contactId     — Full lead intelligence summary
+ *   GET /api/service-area/lookup?zip=... — Map zip → market + service phone (no auth)
+ *   POST /api/service-area/lookup        — Same, with {"zip": "..."} JSON body (no auth)
+ *   POST /webhook/ghl-event              — GHL→Agentic handoff (Webhook Bridge, no auth)
  */
 
 import supabase from './supabase.js';
@@ -37,6 +39,158 @@ function verifyWebhookSignature(req) {
   const body = JSON.stringify(req.body);
   const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(body).digest('hex');
   return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SERVICE AREA LOOKUP — shared handler for GET + POST
+// ═══════════════════════════════════════════════════════════════════
+//
+// Maps a US zip code to the right Reece service market + dispatch phone.
+// Backed by service_area_zips (1,060 zips) joined to service_markets (10 rows).
+// Falls back to GENERAL ((954) 800-8906) if the zip isn't in the table or
+// no zip is supplied at all.
+//
+// Used by HDL.2 (Customer Service Handler) Step 4: Custom Webhook step
+// reads the contact's postal_code, calls this endpoint, saves the response
+// to contact custom fields, then HDL.2 routes via market_code IF/ELSE.
+//
+// Response contract (always 200 — never errors out, since downstream GHL
+// workflow can't gracefully handle 4xx/5xx without a fallback branch):
+// {
+//   "matched":             true|false,    // true if zip found in table
+//   "zip":                 "33312",       // echoed back (or null)
+//   "market_code":         "FTLAU",       // always set
+//   "market_name":         "Ft. Lauderdale",
+//   "service_phone":       "(754) 203-9190",
+//   "service_phone_e164":  "+17542039190",
+//   "has_dedicated_phone": true|false,
+//   "city":                "Fort Lauderdale",   // null if unmatched
+//   "county":              "Broward",            // null if unmatched
+//   "lookup_method":       "zip" | "fallback"
+// }
+async function serviceAreaLookupHandler(req, res) {
+  try {
+    // Extract zip from query (GET) or JSON body (POST). Tolerate empty strings.
+    const rawZip = (req.query?.zip ?? req.body?.zip ?? '').toString().trim();
+
+    // Normalize: strip non-digits, keep first 5 (handles "33312-1234" → "33312")
+    const zip = rawZip.replace(/\D/g, '').slice(0, 5);
+
+    // ─── Fallback when no zip supplied ────────────────────────
+    if (!zip || zip.length < 5) {
+      const { data: fallback } = await supabase
+        .from('service_markets')
+        .select('*')
+        .eq('market_code', 'GENERAL')
+        .maybeSingle();
+
+      return res.json({
+        matched: false,
+        zip: rawZip || null,
+        market_code: fallback?.market_code || 'GENERAL',
+        market_name: fallback?.market_name || 'General / Out-of-mapped-area fallback',
+        service_phone: fallback?.service_phone || '(954) 800-8906',
+        service_phone_e164: fallback?.service_phone_e164 || '+19548008906',
+        has_dedicated_phone: fallback?.has_dedicated_phone ?? false,
+        city: null,
+        county: null,
+        lookup_method: 'fallback',
+        reason: 'no_zip_supplied',
+      });
+    }
+
+    // ─── Look up zip in service_area_zips ─────────────────────
+    const { data: zipRow, error: zipErr } = await supabase
+      .from('service_area_zips')
+      .select('zip, city, county, market_code')
+      .eq('zip', zip)
+      .maybeSingle();
+
+    if (zipErr) {
+      console.error('[ServiceArea] zip lookup error:', zipErr.message);
+      // Fall through to GENERAL on DB error — never break HDL.2
+    }
+
+    // ─── If zip not in table, return GENERAL ─────────────────
+    if (!zipRow) {
+      const { data: fallback } = await supabase
+        .from('service_markets')
+        .select('*')
+        .eq('market_code', 'GENERAL')
+        .maybeSingle();
+
+      return res.json({
+        matched: false,
+        zip,
+        market_code: fallback?.market_code || 'GENERAL',
+        market_name: fallback?.market_name || 'General / Out-of-mapped-area fallback',
+        service_phone: fallback?.service_phone || '(954) 800-8906',
+        service_phone_e164: fallback?.service_phone_e164 || '+19548008906',
+        has_dedicated_phone: fallback?.has_dedicated_phone ?? false,
+        city: null,
+        county: null,
+        lookup_method: 'fallback',
+        reason: 'zip_not_in_service_area',
+      });
+    }
+
+    // ─── Resolve market metadata ─────────────────────────────
+    const { data: market, error: marketErr } = await supabase
+      .from('service_markets')
+      .select('*')
+      .eq('market_code', zipRow.market_code)
+      .maybeSingle();
+
+    if (marketErr || !market) {
+      console.error(`[ServiceArea] market lookup failed for ${zipRow.market_code}:`, marketErr?.message);
+      // Should never happen if FK integrity holds — fall back to GENERAL
+      return res.json({
+        matched: false,
+        zip,
+        market_code: 'GENERAL',
+        market_name: 'General / Out-of-mapped-area fallback',
+        service_phone: '(954) 800-8906',
+        service_phone_e164: '+19548008906',
+        has_dedicated_phone: false,
+        city: zipRow.city || null,
+        county: zipRow.county || null,
+        lookup_method: 'fallback',
+        reason: 'market_metadata_missing',
+      });
+    }
+
+    // ─── Happy path ──────────────────────────────────────────
+    res.json({
+      matched: true,
+      zip,
+      market_code: market.market_code,
+      market_name: market.market_name,
+      service_phone: market.service_phone,
+      service_phone_e164: market.service_phone_e164,
+      has_dedicated_phone: market.has_dedicated_phone,
+      city: zipRow.city,
+      county: zipRow.county,
+      lookup_method: 'zip',
+    });
+
+  } catch (err) {
+    console.error('[ServiceArea] Unhandled error:', err.message);
+    // Even on uncaught error, return a usable fallback so HDL.2 doesn't break
+    res.json({
+      matched: false,
+      zip: null,
+      market_code: 'GENERAL',
+      market_name: 'General / Out-of-mapped-area fallback',
+      service_phone: '(954) 800-8906',
+      service_phone_e164: '+19548008906',
+      has_dedicated_phone: false,
+      city: null,
+      county: null,
+      lookup_method: 'fallback',
+      reason: 'internal_error',
+      error: err.message,
+    });
+  }
 }
 
 export function registerRestApiRoutes(app, authenticate) {
@@ -154,6 +308,16 @@ export function registerRestApiRoutes(app, authenticate) {
   });
 
   console.log('[Webhook] Registered: POST /webhook/ghl-event');
+
+  // ═══════════════════════════════════════════════════════════════
+  // /api/service-area/lookup — Zip → Market routing for HDL.2
+  // ═══════════════════════════════════════════════════════════════
+  // No auth: this is non-sensitive zip→phone mapping; called by GHL
+  // Custom Webhook step which can't easily pass auth tokens.
+  // Both GET (zip in querystring) and POST (zip in JSON body) supported.
+  app.get('/api/service-area/lookup', serviceAreaLookupHandler);
+  app.post('/api/service-area/lookup', serviceAreaLookupHandler);
+  console.log('[REST API] Registered: GET+POST /api/service-area/lookup (no-auth, HDL.2 routing)');
 
   // ─── GET /api/prospects/:prospectId ────────────────────────────
   // Returns all leads for an LP prospect (cst_id)
