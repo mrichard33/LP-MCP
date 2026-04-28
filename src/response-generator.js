@@ -3,28 +3,24 @@
  *
  * Agentic Responder intelligence core.
  *
- * v2.4 — 2026-04-28. MERGE TAG AWARENESS.
- *   Per Mark: agentic bot must send GHL trigger links so the GHL
- *   account tracks per-click attribution. kb-retriever v1.5 now
- *   returns booking_url as a `{{trigger_link.XXX}}` merge tag —
- *   GHL renders it at delivery, generating a unique tracked URL
- *   per recipient.
+ * v2.5 — 2026-04-28. BARE MERGE TAG + ASK-VS-LINK MUTUAL EXCLUSION.
+ *   Two prompt-side tightenings paired with kb-retriever v1.6:
  *
- *   Three changes:
+ *   1. Booking URL is now the BARE merge tag `{{trigger_link.<ID>}}` —
+ *      kb-retriever no longer appends &utm_term suffixes. (v1.5 form
+ *      produced malformed URLs because the rendered short URL has no
+ *      query string — `&utm_term=mv` glued on yielded a 404.)
+ *      System prompt examples updated accordingly.
  *
- *   1. URL sanitizer rewritten to handle merge tags:
- *      - Bare merge tags pass through unchanged
- *      - Markdown wrapping a merge tag is unwrapped
- *      - Hallucinated URLs are stripped (or replaced with canonical
- *        merge tag if no other tag is present)
- *      - Duplicate merge tags are deduped
+ *   2. New hard rule: if the bot includes a booking link, it does NOT
+ *      also ask a scheduling question (morning/afternoon, what time,
+ *      etc). The calendar IS the question — the lead picks the time
+ *      when they click. This caught a real failure where a FAST_TRACK
+ *      Stage 5 reply asked "morning or afternoon?" AND attached the
+ *      calendar link in the same SMS — confusing the lead and
+ *      undermining the link.
  *
- *   2. System prompt URL RULES updated to explain merge tag form
- *      with WRONG/RIGHT examples that include the trigger_link syntax.
- *
- *   3. CANONICAL URL block in user prompt clarifies that the value
- *      is a merge tag — looks weird, that's expected, paste verbatim.
- *
+ * v2.4 — Merge tag awareness (URL sanitizer + system prompt examples).
  * v2.3 — Framework integration (Antifragile + Expert + Traffic + DotCom)
  *        + context-aware booking + traffic temperature.
  * v2.2 — Defense-in-depth against URL hallucination.
@@ -58,13 +54,15 @@ function urlHostAllowed(url) {
   }
 }
 
-// v2.4: Merge tag form `{{trigger_link.<ID>}}` (optionally followed by
-// `&param=value` chain). Used by sanitizer to detect and pass through.
+// v2.5: Merge tag form `{{trigger_link.<ID>}}`. Pass 0 of the sanitizer
+// strips any hallucinated UTM suffix before subsequent passes run, so by
+// the time MERGE_TAG_RX is evaluated for dedup, suffixes are gone. Kept
+// flexible (optional &param=value chain) for defense-in-depth.
 const MERGE_TAG_RX = /\{\{trigger_link\.[A-Za-z0-9_-]+\}\}(?:&[A-Za-z_][A-Za-z0-9_]*=[^\s&]+)*/g;
 const BARE_MERGE_TAG_RX = /\{\{trigger_link\.[A-Za-z0-9_-]+\}\}/;
 
 // ═══════════════════════════════════════════════════════════════════
-// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.4
+// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.5
 // ═══════════════════════════════════════════════════════════════════
 
 const SYSTEM_PROMPT = `You are the Agentic Responder for Reece Windows & Doors, a hurricane impact window and door company founded in North Carolina in 1972, with Florida operations since 2005, serving South Florida homeowners. Your job is to write SMS or email replies that move leads ONE stage forward in the Antifragile Sales System buyer journey — never to close the deal in a single message.
@@ -165,37 +163,40 @@ When a KB PACK is included in the user prompt, the structured content in it (PRI
 
 When NO pack is provided, fall back to the story arc summaries below — but stay conservative on specifics.
 
-═══════ BOOKING LINKS — GHL TRIGGER LINK MERGE TAGS (v2.4) ═══════
+═══════ BOOKING LINKS — GHL TRIGGER LINK MERGE TAGS (v2.5) ═══════
 The booking_url provided in BOOKING CONTEXT is a GHL TRIGGER LINK MERGE TAG. It looks like this:
 
   {{trigger_link.QqvhMNyB7YQzHqSNOXHm}}
-  {{trigger_link.QqvhMNyB7YQzHqSNOXHm}}&utm_term=phone_primary
-  {{trigger_link.QqvhMNyB7YQzHqSNOXHm}}&utm_term=mv&utm_medium=email
 
-The merge tag looks weird — that's expected. GHL renders it server-side at delivery, substituting in the contact's name/address/phone, the configured UTMs, and a per-recipient click tracker. The lead receives a fully rendered URL like https://link.reecewindows.com/widget/booking/...
+The merge tag looks weird — that's expected. GHL renders it server-side at delivery to a per-recipient short URL (https://link.reecewindows.com/l/<short>) and records click attribution against the contact. The trigger link's UTMs (utm_source, utm_medium, utm_campaign, utm_content) are configured statically in GHL — you do NOT add UTMs yourself.
 
 Rules for booking links:
 - You may include AT MOST ONE booking link per message
-- The link MUST be the booking_url from BOOKING CONTEXT, copied VERBATIM (including the entire {{trigger_link...}}&utm_term=... string if provided)
-- Do NOT modify the merge tag (don't change the ID, don't strip the suffix, don't replace it with a resolved URL)
+- The link MUST be the booking_url from BOOKING CONTEXT, copied VERBATIM (the {{trigger_link.<ID>}} string, exactly as written)
+- Do NOT modify the merge tag (don't change the ID, don't append &utm_*= or ?utm_*= suffixes, don't replace it with a resolved URL)
 - Do NOT use markdown link syntax — output the merge tag bare
 - Do NOT include more than one merge tag
+- ⛔ NEVER include a booking link AND a scheduling question (morning/afternoon, what time, when works) in the same message. The calendar IS the question — the lead picks their time when they click. Pick one approach per message: ask, OR link.
 
 WRONG examples (NEVER produce these):
-  ❌ "[Schedule here]({{trigger_link.QqvhMNyB7YQzHqSNOXHm}})" — markdown wrapping is forbidden
-  ❌ "https://reecewindows.com/calendar"                       — invented URL
-  ❌ "https://link.reecewindows.com/widget/booking/abc"        — typing the resolved URL instead of merge tag
-  ❌ "{{trigger_link.QqvhMNyB7YQzHqSNOXHm}}"                   — stripped the suffix when one was provided
-  ❌ "Visit our calendar (link below)"                         — vague, no merge tag
+  ❌ "[Schedule here]({{trigger_link.QqvhMNyB7YQzHqSNOXHm}})"           — markdown wrapping is forbidden
+  ❌ "https://reecewindows.com/calendar"                                 — invented URL
+  ❌ "https://link.reecewindows.com/widget/booking/abc"                  — typing the resolved URL instead of merge tag
+  ❌ "{{trigger_link.QqvhMNyB7YQzHqSNOXHm}}&utm_term=mv"                — appending UTMs (breaks the rendered URL — short URL has no `?`)
+  ❌ "{{trigger_link.QqvhMNyB7YQzHqSNOXHm}}?utm_term=mv"                — appending UTMs is forbidden, even with `?`
+  ❌ "Morning or afternoon? {{trigger_link.QqvhMNyB7YQzHqSNOXHm}}"      — asking AND linking (calendar already handles time selection)
+  ❌ "Saturday works — what time? {{trigger_link.SPQHJKSLbwhJ1bhg2dIy}}" — same: pick ask OR link, never both
+  ❌ "Visit our calendar (link below)"                                   — vague, no merge tag
 
 RIGHT examples:
-  ✅ "Want to grab a slot this week? {{trigger_link.QqvhMNyB7YQzHqSNOXHm}}&utm_term=in_home_first"
-  ✅ "Quick call works: {{trigger_link.sfQAvcOczlOGQX1LE0Ht}}&utm_term=phone_primary"
-  (bare merge tag, exactly as provided in KB PACK, prepended with regular text)
+  ✅ "Want to grab a slot this week? {{trigger_link.QqvhMNyB7YQzHqSNOXHm}}"
+  ✅ "Quick call works: {{trigger_link.sfQAvcOczlOGQX1LE0Ht}}"
+  ✅ "Saturday it is — pick the time that works: {{trigger_link.SPQHJKSLbwhJ1bhg2dIy}}"
+  (bare merge tag, exactly as provided in KB PACK, prepended with regular text — no UTM suffixes, no scheduling question)
 
 If the KB PACK does not provide a booking_url and you don't have a merge tag to paste, simply DO NOT include any link. A message with no link is better than an invented URL.
 
-═══════ CONTEXT-AWARE BOOKING (kb-retriever v1.5) ═══════
+═══════ CONTEXT-AWARE BOOKING (kb-retriever v1.6) ═══════
 The BOOKING CONTEXT in the KB pack carries a "policy" that matches the user's actual request. Honor it:
 
 - policy: phone_primary_in_home_fallback
@@ -236,7 +237,7 @@ If the user prompt flags FAST_TRACK = true (lead_score >50 with engagement in la
 - Skip education
 - Use SA3 (cheap regret) or SA5 (ROI)
 - Include the merge tag as PRIMARY CTA, not footer (BOOKING LINKS rules still apply)
-- Compress to a single decision point: "want me to grab a slot this week?"
+- Compress to a single decision point — and pick ONE form: either ASK ("want me to grab a slot this week?") OR LINK (send the merge tag). Never both. The calendar self-serves time selection; do not stack a "morning or afternoon?" question on top of a booking link.
 
 ═══════ SMS INDEPENDENCE ═══════
 SMS messages must be EMOTIONALLY STANDALONE:
@@ -288,6 +289,8 @@ Reece was founded in North Carolina in 1972. Florida operations began in 2005.
 - Never invent assets, materials, or resources we offer. If the KB pack does not list a "checklist," "guide," "PDF," "report," "video," "infographic," or any other deliverable, we DO NOT have it. Do not promise to send what doesn't exist.
 - Never invent or modify URLs (see BOOKING LINKS rules)
 - Never type a resolved URL when a merge tag is provided — paste the merge tag verbatim
+- Never append &utm_*= or ?utm_*= suffixes to a merge tag — UTMs are configured statically on the trigger link in GHL
+- Never include a booking link AND a scheduling question (morning/afternoon, what time, when works) in the same message — the calendar is the question
 - Never use markdown link syntax — output bare merge tags / URLs only
 - Never repeat what an automated workflow already said
 - Never ignore what the lead said
@@ -299,8 +302,8 @@ Reece was founded in North Carolina in 1972. Florida operations began in 2005.
 - Never lead with "Congrats" or "Congratulations" on a life event when the lead is also expressing concern, fatigue, or an objection — empathy first, never the celebratory frame
 
 ═══════ CHANNEL CONSTRAINTS ═══════
-SMS:   1-3 sentences max. Under 160 chars ideal, 320 max. ONE question max. Merge tags as bare text (no markdown). At most ONE merge tag per message.
-Email: 2-4 short paragraphs. 150-400 words. Subject line required (no exclamation). HSO structure visible. Merge tags as bare text (no markdown).
+SMS:   1-3 sentences max. Under 160 chars ideal, 320 max. ONE question max. Merge tags as bare text (no markdown). At most ONE merge tag per message. NEVER ask a scheduling question AND include a booking link in the same SMS — the calendar lets the lead pick their time.
+Email: 2-4 short paragraphs. 150-400 words. Subject line required (no exclamation). HSO structure visible. Merge tags as bare text (no markdown). NEVER ask a scheduling question AND include a booking link in the same email — the calendar lets the lead pick their time.
 
 ═══════ RESPONSE FORMAT ═══════
 Return ONLY a valid JSON object — no markdown fences, no preamble:
@@ -375,7 +378,7 @@ function extractActiveEntryTag(context) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// PROMPT BUILDER (v2.4 — merge tag canonical block)
+// PROMPT BUILDER (v2.5 — bare merge tag canonical block)
 // ═══════════════════════════════════════════════════════════════════
 
 function buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack, trafficTemp) {
@@ -481,7 +484,7 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     }
   }
 
-  // ─── v2.4: CANONICAL BOOKING LINK BLOCK (merge tag) ──────────────
+  // ─── v2.5: CANONICAL BOOKING LINK BLOCK (bare merge tag) ─────────
   const canonicalUrl = kbPack?.booking_context?.booking_url || null;
   const canonicalCalName = kbPack?.booking_context?.calendar_name || null;
   if (canonicalUrl) {
@@ -492,8 +495,9 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     if (canonicalCalName) parts.push(`(That ${looksLikeMergeTag ? 'merge tag' : 'URL'} is the ${canonicalCalName} calendar.)`);
     if (looksLikeMergeTag) {
       parts.push(`This is a GHL TRIGGER LINK MERGE TAG. It looks weird with the {{ }} braces — that is correct and expected.`);
-      parts.push(`GHL renders the tag at delivery, generating a unique tracked URL per recipient with the contact's data and UTMs.`);
-      parts.push(`If you include a booking link: paste this exact merge tag string, including any &utm_term= or &utm_medium= suffix. No markdown. No modifications.`);
+      parts.push(`GHL renders the tag at delivery to a per-recipient short URL with click tracking. UTMs are configured statically on the trigger link in GHL — DO NOT append &utm_*= or ?utm_*= to the merge tag.`);
+      parts.push(`If you include a booking link: paste this exact merge tag string. No markdown. No modifications. No UTM suffixes.`);
+      parts.push(`AND do NOT also ask a scheduling question (morning/afternoon, what time, when works) in the same message — the calendar already lets the lead pick their slot. Pick one approach: ask, OR link.`);
     } else {
       parts.push(`If you include a booking link: paste this exact string. No markdown. No modifications. No invented domains.`);
     }
@@ -593,18 +597,21 @@ function validateResponse(parsed, channel) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// v2.4 — URL SANITIZER (merge-tag-aware)
+// v2.5 — URL SANITIZER (merge-tag-aware)
 // ═══════════════════════════════════════════════════════════════════
 //
-// The booking link from kb-retriever v1.5 is a GHL trigger link merge
-// tag (e.g. `{{trigger_link.QqvhMNyB7YQzHqSNOXHm}}&utm_term=phone_primary`).
-// Merge tags don't have http://, so URL_RX won't match them — they pass
-// through unchanged. But we still need to handle:
+// The booking link from kb-retriever v1.6 is a bare GHL trigger link
+// merge tag (e.g. `{{trigger_link.QqvhMNyB7YQzHqSNOXHm}}`). Merge tags
+// don't have http://, so URL_RX won't match them — they pass through
+// unchanged. But we still need to handle:
 //
 //   1. Markdown wrapping the merge tag → unwrap to bare merge tag
 //   2. Hallucinated bare URLs alongside the merge tag → strip them
 //   3. Multiple merge tags → keep first, strip rest
 //   4. Hallucinated URL with no merge tag in message → replace with canonical
+//   5. Stripping any &utm_*= suffix the model hallucinated after the tag
+//      (legacy of v1.5 behavior — v1.6 never produces these, but the
+//      model may still try based on pre-v2.5 prompt patterns)
 
 const URL_RX = /https?:\/\/[^\s<>"'`)\]]+/g;
 const MARKDOWN_LINK_RX = /\[([^\]]*)\]\(\s*([^)]+?)\s*\)/g;
@@ -616,6 +623,20 @@ function sanitizeMessageUrls(message, channel, kbPack) {
   const canonicalUrl = kbPack?.booking_context?.booking_url || null;
   const canonicalIsMergeTag = canonicalUrl && canonicalUrl.startsWith('{{trigger_link.');
   let mutations = [];
+
+  // ─── Pass 0 (v2.5): Strip any UTM chain hallucinated after a merge tag ─
+  // v1.6 kb-retriever returns a bare {{trigger_link.<ID>}} — but the model
+  // may still emit `{{trigger_link.X}}&utm_term=mv` based on stale habits
+  // from v1.5/v2.4-era prompts. Strip those suffixes so the rendered URL
+  // is valid (the GHL short URL has no `?` query string, so `&utm_*=`
+  // tacked on produces a 404).
+  out = out.replace(
+    /(\{\{trigger_link\.[A-Za-z0-9_-]+\}\})(?:[?&][A-Za-z_][A-Za-z0-9_]*=[^\s&?]*)+/g,
+    (match, tag) => {
+      mutations.push('stripped_utm_suffix');
+      return tag;
+    }
+  );
 
   // ─── Pass 1: Unwrap markdown links ──────────────────────────────
   // [text](url) → bare url (or text if url is bogus)
@@ -794,7 +815,7 @@ export async function generateResponse(contactId, channel, triggerMessage) {
 
   validated.message = sanitizeMessageUrls(validated.message, channel, kbPack);
 
-  // v2.4: log whether the merge tag actually made it into the final message
+  // v2.5: log whether the merge tag actually made it into the final message
   const mergeTagInMessage = BARE_MERGE_TAG_RX.test(validated.message);
 
   console.log(`[ResponseGenerator] Generated ${channel} for ${contactId}: ` +
@@ -826,7 +847,7 @@ export async function generateResponse(contactId, channel, triggerMessage) {
     buyer_stage: buyerStage,
     active_entry_tag: activeEntryTag,
     has_existing_appt: hasExistingAppt,
-    merge_tag_sent: mergeTagInMessage,                           // v2.4
+    merge_tag_sent: mergeTagInMessage,                           // v2.5
     ...validated,
   };
 }
