@@ -3,49 +3,42 @@
  *
  * Orchestrates structured KB lookups (Tier 1) for the response generator.
  *
- * v1.5 — 2026-04-28. GHL TRIGGER LINK TAGS for per-click attribution.
- *   Per Mark: "When the trigger link is clicked, the GHL account tracks
- *   the clicks. It is pretty important if possible if we can send the
- *   actual trigger link for this reason."
+ * v1.6 — 2026-04-28. BARE MERGE TAG — drop dynamic UTM suffix.
+ *   Field test (action #27812) showed v1.5's form produced a malformed
+ *   rendered URL: GHL renders {{trigger_link.X}} to a bare short URL
+ *   with NO query string (e.g. https://link.reecewindows.com/l/4RXyuG_sJP).
+ *   Appending `&utm_term=mv` after that yields an invalid URL — the `&`
+ *   should have been `?` since there is no preceding query string. Result:
+ *   the link 404'd because the short-code lookup saw `4RXyuG_sJP&utm_term=mv`
+ *   instead of `4RXyuG_sJP`.
  *
- *   Big shift: booking_url now returns the GHL trigger link MERGE TAG
- *   (e.g. `{{trigger_link.QqvhMNyB7YQzHqSNOXHm}}`), not a resolved URL.
- *   GHL renders the merge tag at delivery, generating a unique tracked
- *   URL per recipient. This gives Mark per-message, per-contact click
- *   attribution that resolved URLs can't match — even when the resolved
- *   URL goes through link.reecewindows.com.
+ *   Decision: drop the dynamic UTM append entirely. The trigger link's
+ *   GHL static config (utm_source=ghl, utm_medium=sms, utm_campaign=
+ *   agentic_bot, utm_content=<calendar-specific>) provides per-link
+ *   attribution. Per-policy granularity (utm_term=mv vs phone_primary)
+ *   is sacrificed for reliability; the calendar choice ITSELF still
+ *   encodes policy (MV calendar vs Confirmation Call vs Window Estimate).
  *
- *   The trigger link's URL is configured in GHL (see Mark's spec) with
- *   utm_source=ghl, utm_medium=sms, utm_campaign=agentic_bot,
- *   utm_content=<calendar-specific>, and {{contact.*}} merge tags for
- *   pre-fill. GHL substitutes contact data + click tracking automatically.
+ *   buildTriggerLinkUrl now returns just `{{trigger_link.<ID>}}`. The
+ *   opts argument is retained for backward compatibility with callers
+ *   that still pass channel/policy, but those values are now ignored.
  *
- *   Two dynamic UTM additions (appended after the merge tag):
- *     - utm_term=<policy_slug> — encodes which booking policy fired
- *       (phone_primary | mv | confirm | in_home_first), enabling
- *       attribution analysis by user-preference path
- *     - utm_medium=email — only appended when channel='email'; the
- *       trigger link's static utm_medium is 'sms'. GA4/Meta take the
- *       last value of duplicate params, so this overrides correctly.
+ *   buildBookingUrl (the resolved-URL fallback) is unchanged — it still
+ *   bakes utm_term + utm_medium into proper query string params for
+ *   diagnostic and non-merge-tag use cases.
  *
- *   Trigger Link IDs (configured in GHL by Mark):
+ * v1.5 — GHL trigger link merge tags + dynamic UTM suffix (REVERTED in v1.6
+ *   because the suffix produced malformed URLs after GHL rendering).
+ *   Trigger Link IDs (configured in GHL by Mark — unchanged in v1.6):
  *     CONFIRMATION_CALL  → sfQAvcOczlOGQX1LE0Ht  (book call)
  *     WINDOW_ESTIMATE    → QqvhMNyB7YQzHqSNOXHm
  *     MV                 → SPQHJKSLbwhJ1bhg2dIy  (book measurement verification)
  *     ESTIMATE_CALCULATOR → aS10ZzuBDRI2GUpzQh1v
- *
- *   utm_content slugs (per Mark's updated spec):
+ *   utm_content slugs (configured statically on each trigger link in GHL):
  *     CONFIRMATION_CALL  → book_call_link
  *     WINDOW_ESTIMATE    → book_window_estimate_link
- *     MV                 → book_measurement_verification_link  (was book_mv_link)
- *     ESTIMATE_CALCULATOR → estimate_calculator_pricing_link   (was universal_pricing_link)
- *
- *   Backward-compatible additions:
- *     - booking_url_resolved exposed alongside booking_url for diagnostics
- *       and any consumer that needs the static URL form
- *     - buildBookingUrl() retained for resolved-URL use cases (calculator
- *       links sent outside conversation API context, debugging, etc.)
- *     - New exports: buildTriggerLinkUrl, getEstimateCalculatorTriggerLink
+ *     MV                 → book_measurement_verification_link
+ *     ESTIMATE_CALCULATOR → estimate_calculator_pricing_link
  *
  * v1.3 — Context-aware calendar selection (4-policy decision tree).
  * v1.2 — In-home-first booking policy (superseded by v1.3).
@@ -65,11 +58,13 @@ export const CALENDAR_IDS = {
   MV:                'zEdPmkNccR2ovo3rQAd3',  // Window Measurement Verification
 };
 
-// v1.5: GHL trigger link IDs — Mark's "Agentic Bot Trigger - *" links.
+// v1.6: GHL trigger link IDs — Mark's "Agentic Bot Trigger - *" links.
 // These are the source of truth for per-click attribution. The bot writes
-// the merge tag form ({{trigger_link.<ID>}}) into outbound messages and
-// GHL renders it server-side at delivery, generating a unique tracked URL
-// per recipient.
+// the bare merge tag form ({{trigger_link.<ID>}}) into outbound messages
+// and GHL renders it server-side at delivery, generating a unique tracked
+// short URL per recipient. UTMs (utm_source/medium/campaign/content) are
+// configured statically on each trigger link's destination URL in GHL —
+// kb-retriever does NOT append them dynamically (see v1.6 header).
 export const TRIGGER_LINK_IDS = {
   CONFIRMATION_CALL:   process.env.REECE_TRIGGER_CALL          || 'sfQAvcOczlOGQX1LE0Ht',
   WINDOW_ESTIMATE:     process.env.REECE_TRIGGER_WE            || 'QqvhMNyB7YQzHqSNOXHm',
@@ -114,49 +109,36 @@ const POLICY_TO_UTM_TERM = {
 };
 
 // ═══════════════════════════════════════════════════════════════════
-// URL BUILDERS (v1.5)
+// URL BUILDERS (v1.6 — bare merge tag, no UTM suffix)
 // ═══════════════════════════════════════════════════════════════════
 
 /**
  * Build the trigger-link-form booking URL for use in outbound messages.
  *
- * Returns a string of the form:
- *   {{trigger_link.<ID>}}                                (no overrides)
- *   {{trigger_link.<ID>}}&utm_term=<slug>                (policy only)
- *   {{trigger_link.<ID>}}&utm_term=<slug>&utm_medium=email   (email channel)
+ * v1.6: Returns the BARE GHL merge tag — `{{trigger_link.<ID>}}`.
+ * No dynamic UTM suffix is appended. (See header comment for rationale —
+ * v1.5's `&utm_term=…` form produced malformed URLs because GHL renders
+ * the merge tag to a bare short URL with no `?` query string.)
  *
- * GHL renders the {{trigger_link.<ID>}} portion at delivery time. The
- * appended &param=value chain is glued onto the rendered URL — duplicate
- * utm_medium values are resolved by analytics last-wins behavior.
+ * GHL renders the merge tag at delivery to a per-recipient short URL
+ * (e.g. https://link.reecewindows.com/l/abc123) and records click
+ * attribution against the contact. The trigger link's destination URL
+ * (configured in GHL) carries utm_source/medium/campaign/content for
+ * downstream analytics — those static UTMs flow through on redirect.
  *
  * @param {keyof TRIGGER_LINK_IDS} triggerKey
- * @param {Object} opts
- * @param {string} opts.channel — 'sms' | 'email'
- * @param {string} [opts.policy] — Active booking policy
+ * @param {Object} [opts] — Retained for backward compatibility; values
+ *                          (channel, policy) are IGNORED in v1.6. They
+ *                          were previously used to inject utm_term /
+ *                          utm_medium suffixes that produced malformed
+ *                          rendered URLs.
  * @returns {string|null}
  */
 export function buildTriggerLinkUrl(triggerKey, opts = {}) {
   const id = TRIGGER_LINK_IDS[triggerKey];
   if (!id) return null;
-  const { channel = 'sms', policy = null } = opts;
-
-  let url = `{{trigger_link.${id}}}`;
-
-  const overrides = [];
-  if (policy && POLICY_TO_UTM_TERM[policy]) {
-    overrides.push(`utm_term=${POLICY_TO_UTM_TERM[policy]}`);
-  }
-  if (channel === 'email') {
-    // Trigger link is configured with utm_medium=sms; this overrides
-    // for email sends. Most analytics tools (GA4, Meta) take the last
-    // value of duplicate params.
-    overrides.push('utm_medium=email');
-  }
-  if (overrides.length > 0) {
-    url += '&' + overrides.join('&');
-  }
-
-  return url;
+  // v1.6: bare merge tag only — no dynamic UTM suffix.
+  return `{{trigger_link.${id}}}`;
 }
 
 /**
@@ -221,7 +203,7 @@ export function getEstimateCalculatorUrl(opts = {}) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// CALENDAR DEFINITION FACTORIES (v1.5 — opts-aware, trigger-link form)
+// CALENDAR DEFINITION FACTORIES (v1.6 — bare merge tag form)
 // ═══════════════════════════════════════════════════════════════════
 
 function windowEstimateCalendar(opts) {
@@ -323,7 +305,7 @@ export function detectUserBookingPreference(messageText) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// BOOKING CONTEXT RESOLVER (v1.5 — passes channel + policy to URL builders)
+// BOOKING CONTEXT RESOLVER (v1.6 — channel/policy passed but unused by URL builder)
 // ═══════════════════════════════════════════════════════════════════
 
 /**
@@ -335,7 +317,10 @@ export function detectUserBookingPreference(messageText) {
  * @param {string} [args.userPreference]
  * @param {boolean} [args.hasExistingAppt]
  * @param {string} [args.lpDisposition]
- * @param {string} [args.channel='sms']  — v1.5: drives utm_medium override
+ * @param {string} [args.channel='sms']  — v1.6: still threaded through for
+ *                                         buildBookingUrl() (resolved-URL
+ *                                         fallback path); ignored by the
+ *                                         primary buildTriggerLinkUrl().
  * @returns {Object} BookingContext with primary, fallback, policy, guidance
  */
 export function resolveBookingContext({
@@ -346,7 +331,9 @@ export function resolveBookingContext({
   lpDisposition = null,
   channel = 'sms',
 } = {}) {
-  // Determine policy first so we can bake it into utm_term.
+  // Determine policy first so we can route to the right calendar.
+  // (v1.5 also baked policy into utm_term; v1.6 dropped that — the
+  // calendar choice itself encodes the policy.)
   let policy;
   const isCallbackIntent = intentClass === 'CALLBACK' || intentClass === 'CALLBACK_CALM';
   const isEstimateCalculator = activeEntryTag === 'active-entry:estimate-calculator';
@@ -701,7 +688,8 @@ export async function buildKbPack(params) {
     result.primary_arc = await getStoryArc(result.arc_options[0].arc_id);
   }
 
-  // v1.5: pass channel through for utm_medium override
+  // v1.6: channel still threaded through (consumed by buildBookingUrl
+  // for the resolved-URL fallback); buildTriggerLinkUrl ignores it.
   const bookingCtxArgs = {
     intentClass,
     activeEntryTag,
@@ -773,7 +761,7 @@ export async function buildKbPack(params) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// PROMPT FORMATTER (v1.5 — explains merge tag form)
+// PROMPT FORMATTER (v1.6 — explains bare merge tag form)
 // ═══════════════════════════════════════════════════════════════════
 
 export function formatKbPackForPrompt(pack) {
@@ -796,7 +784,7 @@ export function formatKbPackForPrompt(pack) {
     lines.push('');
   }
 
-  // ─── BOOKING CONTEXT — v1.5 (trigger link merge tags) ─────────────────
+  // ─── BOOKING CONTEXT — v1.6 (bare trigger link merge tag) ───────────
   if (pack.booking_context) {
     const b = pack.booking_context;
     const policy = b.policy || 'in_home_first_call_fallback';
@@ -806,7 +794,7 @@ export function formatKbPackForPrompt(pack) {
     const isTimingObjection  = pack.intent_class === 'OBJECTION'
       && pack.detected_signals?.objection === 'timing';
 
-    lines.push('BOOKING CONTEXT (v1.5 — GHL trigger link merge tags):');
+    lines.push('BOOKING CONTEXT (v1.6 — bare GHL trigger link merge tag, no UTM suffix):');
     lines.push(`  Policy: ${policy}`);
     if (pack.detected_signals?.user_booking_preference) {
       lines.push(`  User explicitly asked for: ${pack.detected_signals.user_booking_preference}`);
