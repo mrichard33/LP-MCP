@@ -1,59 +1,33 @@
 /**
  * Decision Engine — src/decision-engine.js
  * 
- * The brain of the agentic system. Processes pending system events by:
- * 1. Reading unprocessed events from system_events
- * 2. Matching each event against agent_rules (by event_type + payload pattern)
- * 3. For contextual rules: also evaluating lead_intelligence conditions
- * 4. Creating agent_actions for ALL matched rules (v2.6)
- * 5. Marking events as processed
- * 6. SCORING INTENT after every event (Layer 3.5 — Predict → Intercept → Close)
- * 
- * Rule types:
- *   - 'pattern' (default) — Simple event field matching
- *   - 'contextual' — Also evaluates context_conditions against lead_intelligence
- * 
- * Special event handling:
- *   - ghl.reply_received (pending_analysis) → triggers Message Analyzer, NOT rules
- *   - ai.analysis_completed → matched against contextual rules using lead_intelligence
- *   - intent.* events → processed by rules but do NOT trigger re-scoring (loop prevention)
+ * The brain of the agentic system.
+ *
+ * v2.9 — 2026-04-28. has_any_tag / not_has_any_tag context operators.
+ *   Per Mark's Nancy Kesner / Jp...g2k canvassing investigation:
+ *   GHL_APPT_STAGE_ADVANCE was firing on every appointment_booked
+ *   event INCLUDING appointment status updates (Confirmed → Showed),
+ *   which wiped post-demo state and re-stamped stage:booked-main-appointment
+ *   on already-post-demo leads.
+ *
+ *   The existing has_tag / not_has_tag operators only accept a single
+ *   tag. Adding array-form variants so a single condition can guard
+ *   against multiple downstream tags:
+ *
+ *     "not_has_any_tag": ["stage:post-appointment", "lp-demo-completed",
+ *                          "bj:stage-5-committed", "lp-sale"]
+ *
+ *   Pairs with: agent_rules update converting GHL_APPT_STAGE_ADVANCE to
+ *   rule_type='contextual' with the above guard.
  *
  * v2.8 — Auto-approve gate for AGENTIC_RESPOND_POST_CHATBOT.
- *   shouldRequireApproval() bypasses the rule-level approval gate when the
- *   contact carries any Stage 3+ tag. Stage 3+ buyers asking pricing or
- *   scheduling questions need responses in minutes, not days. Lower-funnel
- *   contacts (no Stage 3+ tag) still require human approval. Reversible by
- *   reverting this commit; setting rule.requires_approval=false directly
- *   provides a more aggressive global bypass.
- *
  * v2.7 — recommended_action_neq context operator.
- *   Inverse of recommended_action_eq. Lets AGENTIC_RESPOND_POST_CHATBOT
- *   skip when the analyzer already flagged fast_track_booking (the
- *   AGENTIC_BOOKING_LINK_RESPONSE rule owns that path). Without this,
- *   both rules fired on fast_track_booking events — link plus a
- *   redundant approval ping for the AI-generated contextual reply.
- *
  * v2.6 — Multi-rule execution per event.
- *   CRITICAL FIX: processSingleEvent was using matchedRules[0] (first-match-wins).
- *   Rule 106 (AGENTIC_RESPOND) was silently skipped whenever a BEHAVIORAL_*_OBJECTION
- *   rule matched first on the same ai.analysis_completed event. Now iterates over ALL
- *   matched rules. Dedup logic in createActionsFromRule prevents true duplicates.
- *
  * v2.5 — lp_disposition_in context condition.
- *   New operator for evaluateContextConditions: gates a rule on whether the
- *   contact's current LP disposition_code is in an allowlist. Used by
- *   BEHAVIORAL_*_OBJECTION rules (Ed Keller finding) to require post-demo
- *   status (FDNS/BO/1Leg/NIS/OPPFDN) before running W9.0 objection handling.
- *
- * v2.4 — LP disposition multi-lead dedup:
- *   - Group dedup: ANY LP_DISP_* rule for same GHL contact within window blocks new actions
- *   - Most-recent-lead guard: only the newest LP lead for a GHL contact fires rules
- *   Fixes Annette Poole scenario (3 LP leads → 1 contact → 3 conflicting rules)
- *
- * v2.3 — Added payload_field_not_null / payload_field_null context conditions.
- * v2.2.1 — Added INTENT_ to stage gate prefixes.
+ * v2.4 — LP disposition multi-lead dedup.
+ * v2.3 — payload_field_not_null / payload_field_null operators.
  * v2.2 — Stage Gate + Deduplication.
- * v2.1 — BUGFIX: Skip GHL actions when ghl_contact_id is null.
+ * v2.1 — Skip GHL actions when ghl_contact_id is null.
  */
 
 import supabase from './supabase.js';
@@ -66,20 +40,14 @@ import { scoreIntent } from './intent-scorer.js';
 
 const DEDUP_WINDOW_MINUTES = 30;
 
-// Rule prefixes that require stage gate (phone/email + funnel stage) + exact-rule dedup
 const BEHAVIORAL_RULE_PREFIXES = [
   'BEHAVIORAL_',
   'OBJECTION_',
   'INTENT_',
 ];
 
-// Rule prefixes that require GROUP dedup (any rule in group blocks all others)
 const LP_DISP_PREFIX = 'LP_DISP_';
 
-// v2.8: Tags that mark a contact as Stage 3+ in the buyer journey
-// (Comparing, Negotiating, or Committed). Used by shouldRequireApproval()
-// to bypass the human-approval gate on AGENTIC_RESPOND_POST_CHATBOT for
-// high-intent contacts where reply latency directly impacts conversion.
 const STAGE_3_PLUS_TAGS = [
   'bj:stage-3-comparing',
   'bj:stage-4-negotiating',
@@ -195,14 +163,6 @@ async function passesStageGate(event, rule) {
 // DEDUPLICATION
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * Check for duplicate pending actions.
- * - BEHAVIORAL/OBJECTION/INTENT rules: exact rule_key + target_id match
- * - LP_DISP_* rules: GROUP dedup — ANY LP_DISP_* rule for same target_id blocks
- * 
- * v2.4: LP_DISP group dedup prevents multiple LP leads from stacking
- * conflicting tags on the same GHL contact.
- */
 async function hasDuplicatePendingActions(ruleKey, targetId) {
   if (!targetId) return false;
 
@@ -220,10 +180,8 @@ async function hasDuplicatePendingActions(ruleKey, targetId) {
       .gte('created_at', windowStart);
 
     if (isLpDispRule(ruleKey)) {
-      // GROUP dedup: any LP_DISP_* rule for this contact blocks
       query = query.like('rule_applied', 'LP_DISP_%');
     } else {
-      // Exact dedup: same rule_key only
       query = query.eq('rule_applied', ruleKey);
     }
 
@@ -254,22 +212,12 @@ async function hasDuplicatePendingActions(ruleKey, targetId) {
 // LP MULTI-LEAD GUARD — Only newest lead fires rules
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * v2.4: When an lp.disposition_changed event fires, check if this LP lead
- * is the most recent lead for the associated GHL contact. If a newer lead
- * exists, skip this event (the newer lead's disposition is authoritative).
- * 
- * This prevents older LP lead records from overriding the current state
- * when the sync engine processes them.
- */
 async function isNewestLeadForContact(event) {
-  // Only applies to LP disposition events
   if (event.event_type !== 'lp.disposition_changed') return true;
 
   const lpLeadId = event.entity_id || event.lp_lead_id;
   const ghlContactId = event.ghl_contact_id;
 
-  // If no GHL contact match, can't check — allow through
   if (!ghlContactId || !lpLeadId) return true;
 
   try {
@@ -280,7 +228,7 @@ async function isNewestLeadForContact(event) {
       .order('created_at_lp', { ascending: false })
       .limit(1);
 
-    if (error || !data || data.length === 0) return true; // can't check, allow
+    if (error || !data || data.length === 0) return true;
 
     const newestLeadId = data[0].lp_lead_id;
     if (String(newestLeadId) !== String(lpLeadId)) {
@@ -291,7 +239,7 @@ async function isNewestLeadForContact(event) {
     return true;
   } catch (err) {
     console.error(`[MultiLead] Error checking lead recency:`, err.message);
-    return true; // don't block on errors
+    return true;
   }
 }
 
@@ -337,8 +285,6 @@ async function evaluateContextConditions(conditions, intelligence, event) {
       case 'emotional_state_eq': if (merged.emotional_state !== expected) return false; break;
       case 'entry_source_eq': if (merged.entry_source !== expected) return false; break;
       case 'recommended_action_eq': if (merged.recommended_action !== expected) return false; break;
-      // v2.7: Inverse of recommended_action_eq. Lets AGENTIC_RESPOND_POST_CHATBOT
-      // skip when AGENTIC_BOOKING_LINK_RESPONSE owns the path (fast_track_booking).
       case 'recommended_action_neq': if (merged.recommended_action === expected) return false; break;
       case 'fast_track_eligible': if (!!merged.fast_track_eligible !== !!expected) return false; break;
       case 'lead_score_gte': if ((merged.lead_score || 0) < expected) return false; break;
@@ -350,6 +296,30 @@ async function evaluateContextConditions(conditions, intelligence, event) {
       case 'not_has_tag':
         if (!tags) tags = await fetchContactTags(event.ghl_contact_id);
         if (tags.includes(expected)) return false; break;
+
+      // v2.9: Array-form tag operators. Single condition can guard against
+      // multiple tags. Used by GHL_APPT_STAGE_ADVANCE to skip post-demo
+      // and post-close leads.
+      case 'has_any_tag': {
+        const wanted = Array.isArray(expected) ? expected : [expected];
+        if (!tags) tags = await fetchContactTags(event.ghl_contact_id);
+        if (!wanted.some(t => tags.includes(t))) {
+          console.log(`[Context] BLOCKED: has_any_tag — none of [${wanted.join(',')}] present on contact`);
+          return false;
+        }
+        break;
+      }
+      case 'not_has_any_tag': {
+        const blocked = Array.isArray(expected) ? expected : [expected];
+        if (!tags) tags = await fetchContactTags(event.ghl_contact_id);
+        const found = blocked.find(t => tags.includes(t));
+        if (found) {
+          console.log(`[Context] BLOCKED: not_has_any_tag — contact has "${found}" (in blocklist)`);
+          return false;
+        }
+        break;
+      }
+
       case 'buyer_stage_confidence_gte': if ((merged.buyer_stage_confidence || 0) < expected) return false; break;
       case 'intent_tier_eq': if (merged.intent_tier !== expected) return false; break;
       case 'intent_score_gte': if ((merged.intent_score || 0) < expected) return false; break;
@@ -371,9 +341,6 @@ async function evaluateContextConditions(conditions, intelligence, event) {
         break;
       }
       case 'lp_disposition_in': {
-        // v2.5: Gate rule on current LP disposition (post-demo allowlist).
-        // Used by BEHAVIORAL_*_OBJECTION rules to skip pre-appointment contacts
-        // per Ed Keller finding: W9.0 objection handling is post-demo only.
         const allowed = Array.isArray(expected) ? expected : [expected];
         const ghlContactId = event.ghl_contact_id;
         if (!ghlContactId) {
@@ -423,22 +390,6 @@ async function findMatchingRules(event) {
 // APPROVAL GATING (v2.8)
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * v2.8: Determine whether a given (rule, event) action requires human approval.
- *
- * Default behavior: respect the rule's requires_approval flag.
- *
- * Per-rule overrides:
- *   - AGENTIC_RESPOND_POST_CHATBOT: bypass approval when contact has any
- *     Stage 3+ tag. Late-stage buyers asking pricing/scheduling questions
- *     need replies in minutes; the rule's pause-bot precondition + this
- *     stage gate together provide sufficient guardrails to ship without
- *     human review. Top-of-funnel contacts (no Stage 3+ tag) continue to
- *     require approval.
- *
- * Failure mode: if the GHL tag fetch fails, fall back to the rule's
- * configured requires_approval value (safer to over-gate than under-gate).
- */
 async function shouldRequireApproval(rule, event) {
   const baseRequirement = rule.requires_approval || false;
   if (!baseRequirement) return false;
@@ -475,8 +426,6 @@ async function createActionsFromRule(event, rule) {
   const batchId = `evt_${event.id}_rule_${rule.rule_key}_${Date.now()}`;
   const created = [];
 
-  // v2.8: Resolve approval requirement once per rule firing (not per action),
-  // so all actions in a batch share the same gating decision.
   const requiresApproval = await shouldRequireApproval(rule, event);
 
   for (let i = 0; i < actions.length; i++) {
@@ -517,7 +466,6 @@ async function createActionsFromRule(event, rule) {
 // ═══════════════════════════════════════════════════════════════════
 
 export async function processSingleEvent(event) {
-  // ─── Special: pending_analysis → AI Message Analyzer ───
   if (event.event_type === 'ghl.reply_received' && event.event_subtype === 'pending_analysis') {
     const contactId = event.ghl_contact_id;
     const messageText = event.payload?.message_text || '';
@@ -533,7 +481,6 @@ export async function processSingleEvent(event) {
     return { event_id: event.id, matched_rules: 0, actions_created: 0, routed_to: 'message_analyzer' };
   }
 
-  // ─── v2.4: Multi-lead guard for LP disposition events ──────
   if (event.event_type === 'lp.disposition_changed') {
     if (!(await isNewestLeadForContact(event))) {
       await supabase.from('system_events').update({
@@ -545,7 +492,6 @@ export async function processSingleEvent(event) {
     }
   }
 
-  // ─── Standard rule matching ────────────────────────────
   const matchedRules = await findMatchingRules(event);
 
   if (matchedRules.length === 0) {
@@ -556,8 +502,6 @@ export async function processSingleEvent(event) {
     return { event_id: event.id, matched_rules: 0, actions_created: 0 };
   }
 
-  // ─── v2.6: Execute ALL matched rules, not just the first ──
-  // Dedup logic in createActionsFromRule prevents true duplicates.
   let allActions = [];
   const firedRuleKeys = [];
   for (const rule of matchedRules) {
