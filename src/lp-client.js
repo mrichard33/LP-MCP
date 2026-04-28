@@ -138,14 +138,135 @@ export async function getLeads(params = {}) {
   }));
 }
 
-export async function getLeadData(params = {}) {
-  return withCircuit(() => lpPost('/api/Leads/GetLeadData', {
+// Internal: extract item array from any LP response shape
+function _itemsFrom(result) {
+  if (Array.isArray(result)) return result;
+  if (result && typeof result === 'object') {
+    return result.data || result.leads || result.results || result.items || [];
+  }
+  return [];
+}
+
+// Internal: raw call to /api/Leads/GetLeadData (no fallback)
+async function _getLeadDataRaw(params = {}, { omitProId = false } = {}) {
+  const fields = {
     startdate:   params.startdate  || '',
     enddate:     params.enddate    || '',
-    pro_id:      String(params.pro_id ?? 0),
     PageSize:    String(params.PageSize  || 50),
     StartIndex:  String(params.StartIndex || 1),
-  }));
+  };
+  if (!omitProId) {
+    fields.pro_id = String(params.pro_id ?? 0);
+  }
+  return withCircuit(() => lpPost('/api/Leads/GetLeadData', fields));
+}
+
+// ─── getLeadData with auto-fallback ──────────────────────────────
+// Background: starting ~2026-04-24, /api/Leads/GetLeadData began silently
+// returning 0 rows for valid windows that DID contain changes. The same
+// window on /api/Customers/GetLead returns full data, and
+// /api/Customers/GetJobStatusChanges (also under /Customers/) returns
+// thousands of milestones. Pattern strongly suggests an LP-side change to
+// /api/Leads/GetLeadData (likely pro_id=0 semantics or endpoint drift).
+//
+// Strategy:
+//   1. Try /api/Leads/GetLeadData with pro_id=0 (legacy behavior)
+//   2. If first page returns 0 items, try the same call with pro_id omitted
+//   3. If THAT also returns 0, fall back to /api/Customers/GetLead via getLeads()
+//   4. Log which path succeeded so we can tell what's actually happening
+//
+// Disable via env LP_GETLEADDATA_FALLBACK=false to revert to original behavior.
+//
+// IMPORTANT: We only fall back when StartIndex=1 (first page). If we're
+// paginating mid-stream we trust the original call's "no more pages" signal.
+
+export async function getLeadData(params = {}) {
+  const fallbackEnabled = String(process.env.LP_GETLEADDATA_FALLBACK || 'true').toLowerCase() !== 'false';
+  const isFirstPage = (params.StartIndex || 1) === 1 || params.StartIndex === '1';
+
+  // ─── Path A: Original /api/Leads/GetLeadData with pro_id=0 ────
+  let result;
+  try {
+    result = await _getLeadDataRaw(params);
+  } catch (err) {
+    // Hard error on path A — re-throw, don't try fallbacks
+    throw err;
+  }
+
+  if (!fallbackEnabled || !isFirstPage) return result;
+
+  const itemsA = _itemsFrom(result);
+  if (itemsA.length > 0) {
+    return result;
+  }
+
+  // ─── Path B: /api/Leads/GetLeadData with pro_id OMITTED ───────
+  // (Tests whether pro_id=0 is the issue specifically.)
+  try {
+    const resultB = await _getLeadDataRaw(params, { omitProId: true });
+    const itemsB = _itemsFrom(resultB);
+    if (itemsB.length > 0) {
+      console.warn(`[LP] getLeadData fallback HIT path B (pro_id omitted) — ${itemsB.length} items. ` +
+                   `pro_id=0 appears to be the broken parameter; consider patching the call permanently.`);
+      return resultB;
+    }
+  } catch (err) {
+    console.warn('[LP] getLeadData path B (no pro_id) failed:', err.message);
+  }
+
+  // ─── Path C: Fall back to /api/Customers/GetLead via getLeads ──
+  try {
+    const resultC = await getLeads({
+      startdate: params.startdate,
+      enddate:   params.enddate,
+      PageSize:  params.PageSize,
+      StartIndex: params.StartIndex,
+    });
+    const itemsC = _itemsFrom(resultC);
+    if (itemsC.length > 0) {
+      console.warn(`[LP] getLeadData fallback HIT path C (/api/Customers/GetLead) — ${itemsC.length} items. ` +
+                   `Original /api/Leads/GetLeadData appears broken on LP side; sync running on fallback.`);
+      return resultC;
+    }
+    console.warn('[LP] getLeadData all 3 paths returned 0 items — window may genuinely be empty, or LP API broken.');
+    return resultC;  // Return the empty result so caller treats as "no records"
+  } catch (err) {
+    console.warn('[LP] getLeadData path C (getLeads fallback) failed:', err.message);
+    return result;  // Return original empty result
+  }
+}
+
+// Diagnostic helper used by sync-probe — runs all 3 paths in parallel,
+// returns counts + first-item keys for each. Mark hits this via the
+// /n8n/admin/sync-probe endpoint to see what LP actually returns.
+export async function probeLeadEndpoints({ startdate, enddate, PageSize = 50 } = {}) {
+  const probes = await Promise.allSettled([
+    _getLeadDataRaw({ startdate, enddate, PageSize, StartIndex: 1 }),
+    _getLeadDataRaw({ startdate, enddate, PageSize, StartIndex: 1 }, { omitProId: true }),
+    getLeads({ startdate, enddate, PageSize, StartIndex: 1 }),
+  ]);
+
+  const summarize = (label, settledResult) => {
+    if (settledResult.status === 'rejected') {
+      return { label, error: settledResult.reason?.message || String(settledResult.reason) };
+    }
+    const items = _itemsFrom(settledResult.value);
+    return {
+      label,
+      count: items.length,
+      response_shape: Array.isArray(settledResult.value) ? 'array' : (typeof settledResult.value),
+      first_item_keys: items[0] ? Object.keys(items[0]).slice(0, 20) : [],
+      raw_response_keys: !Array.isArray(settledResult.value) && settledResult.value
+        ? Object.keys(settledResult.value)
+        : [],
+    };
+  };
+
+  return {
+    path_a: summarize('GetLeadData with pro_id=0 (current behavior)', probes[0]),
+    path_b: summarize('GetLeadData with pro_id omitted', probes[1]),
+    path_c: summarize('GetLead (alternate endpoint, /api/Customers/GetLead)', probes[2]),
+  };
 }
 
 export async function getJobStatusChanges(params = {}) {
