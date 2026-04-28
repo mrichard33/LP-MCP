@@ -10,7 +10,7 @@
  *   2. classifyInbound(triggerMessage)        ← Phase 1
  *      ├─ compliance_gate (tag_and_handoff)   → SHORT-CIRCUIT (no LLM call)
  *      └─ intent_router                       → continue to step 3
- *   3. buildKbPack({intent, stage, ...})      ← Phase 3
+ *   3. buildKbPack({intent, stage, activeEntry, ...})  ← Phase 3
  *   4. buildResponsePrompt(context, kb_pack)  ← Phase 5 prompt rewrite
  *   5. callClaude(systemPrompt, userPrompt)
  *   6. validate + return
@@ -22,6 +22,13 @@
  *   - Classifier: claude-haiku-4-5-20251001 (~$0.001 per classification)
  *   - Vector embed (when triggered): text-embedding-3-small (~$0.00001 per query)
  *   - Total per response: ~$0.01-0.015 typical
+ *
+ * v2.1 — 2026-04-28. Calendar awareness:
+ *        Extracts the lead's `active-entry:*` tag from context and passes
+ *        it to buildKbPack as activeEntryTag. The kb pack uses this to
+ *        pick the right Reece calendar (estimate-calculator → MV calendar,
+ *        callbacks → Confirmation Call calendar, default → Window Estimate).
+ *        Pairs with kb-retriever v1.1.
  *
  * v2.0 — Phase 1 (compliance gates) + Phase 3 (KB injection) + Phase 5
  *        (Antifragile-hardened SYSTEM_PROMPT) integrated.
@@ -96,13 +103,14 @@ Stage 5 (Committed)     → FACILITATE next step. Scheduling, prep, logistics. N
 Most common mistake: writing Stage 3 positioning for a Stage 1 prospect. Match message to stage.
 
 ═══════ KB PACK PRIMACY ═══════
-When a KB PACK is included in the user prompt, the structured content in it (PRIMARY STORY ARC, OBJECTION SCRIPT, PRICING ANCHOR, FAQ MATCHES, PROOF POINTS, COMPETITOR INTEL, TECHNIQUES) is your authoritative source. Rules:
+When a KB PACK is included in the user prompt, the structured content in it (PRIMARY STORY ARC, BOOKING CONTEXT, OBJECTION SCRIPT, PRICING ANCHOR, FAQ MATCHES, PROOF POINTS, COMPETITOR INTEL, TECHNIQUES) is your authoritative source. Rules:
 1. Adapt tone and personalize the language — but do NOT invent claims, statistics, or proof points that are not in the pack
 2. If the pack lists "DO NOT SAY" items, those are HARD prohibitions
 3. If a PROOF POINTS section is included, only cite facts from that list — never invent statistics
 4. If an OBJECTION SCRIPT is included with body_template, follow its structure
 5. If a PRICING ANCHOR is included, NEVER quote a specific number — use the anchoring_message phrasing only
-6. If COMPETITOR INTEL is included, use talking_point and reece_advantage; respect do_not_attack as hard prohibition
+6. If a BOOKING CONTEXT is included, use ITS calendar (the booking_url provided), not a guessed link, and follow its handling guidance ("Skip discovery..." / "Confirm phone...")
+7. If COMPETITOR INTEL is included, use talking_point and reece_advantage; respect do_not_attack as hard prohibition
 
 When NO pack is provided, fall back to the story arc summaries below — but stay conservative on specifics.
 
@@ -148,6 +156,8 @@ Every message contains a booking path. Trust level decides positioning:
 - L4-L6 (high): primary CTA — "Want me to grab a time this week?"
 
 If you don't know the trust level, default to L1-L2 (footer).
+
+When a BOOKING CONTEXT is provided in the KB pack, use ITS booking_url (do not invent a different one). The calendar selection is already done for you — just paste the URL.
 
 ═══════ OBJECTION HANDLING (NO KB OVERRIDE) ═══════
 When a KB OBJECTION SCRIPT is provided, follow it. Otherwise:
@@ -245,6 +255,14 @@ function isHyperactiveBuyer(context) {
 function inferWindowCount(context) {
   // TODO: pull from GHL custom field if/when available
   return null;
+}
+
+// v2.1: Pull the lead's CURRENT source from active-entry:* tag (single tag —
+// swapped on re-entry). The kb-retriever uses it to pick the right calendar.
+// Permanent entry:* tags are attribution only and aren't used here.
+function extractActiveEntryTag(context) {
+  const tags = context?.lead?.current_tags || [];
+  return tags.find(t => typeof t === 'string' && t.startsWith('active-entry:')) || null;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -485,29 +503,6 @@ function makeShortCircuitResult(classification, channel, triggerMessage) {
  * @param {string} channel — 'sms' or 'email'
  * @param {string} triggerMessage — the inbound message to respond to
  * @returns {Promise<Object>} Response or short-circuit handoff
- *
- * Return shape — short-circuit (compliance gate fired):
- *   {
- *     short_circuit: true,
- *     handoff_action: 'tag_and_handoff',
- *     handoff_tag: 'hdl:stop',
- *     intent_class: 'STOP',
- *     handler_code: 'HDL-STOP-01',
- *     is_disqualifier: false,
- *     classifier_confidence: 0.95,
- *     reasoning: '...',
- *     message: null, subject: null, story_arc: null
- *   }
- *
- * Return shape — generated response (normal path):
- *   {
- *     short_circuit: false,
- *     intent_class: 'OBJECTION',
- *     message: '...',
- *     channel, subject, story_arc, trust_level_targeted,
- *     hso_breakdown, voice_used, reasoning,
- *     kb_pack_used: true
- *   }
  */
 export async function generateResponse(contactId, channel, triggerMessage) {
   // 1. Build full lead context (always fresh)
@@ -549,6 +544,7 @@ export async function generateResponse(contactId, channel, triggerMessage) {
   const buyerStage = inferBuyerStage(context);
   const fastTrack = isHyperactiveBuyer(context);
   const windowCount = inferWindowCount(context);
+  const activeEntryTag = extractActiveEntryTag(context);  // v2.1
 
   let kbPack = null;
   try {
@@ -560,6 +556,7 @@ export async function generateResponse(contactId, channel, triggerMessage) {
       objectionTags: context.lead?.objection_tags || [],
       recommendedArc: context.intelligence?.recommended_story_arc,
       windowCount,
+      activeEntryTag,                                       // v2.1: drives calendar selection
     });
   } catch (err) {
     console.warn(`[ResponseGenerator] KB pack build failed for ${contactId}: ${err.message} — proceeding without`);
@@ -582,6 +579,7 @@ export async function generateResponse(contactId, channel, triggerMessage) {
     `trust=L${validated.trust_level_targeted || '?'} ` +
     `voice=${validated.voice_used} ` +
     `kb_pack=${kbPack ? 'yes' : 'no'} ` +
+    `cal=${kbPack?.booking_context?.calendar_name || 'n/a'} ` +
     `fast_track=${fastTrack} ` +
     `(${validated.message.length} chars)`);
 
@@ -592,8 +590,10 @@ export async function generateResponse(contactId, channel, triggerMessage) {
     classification_method: classification.classification_method,
     handler_code: classification.handler_code,
     kb_pack_used: !!kbPack,
+    booking_calendar: kbPack?.booking_context?.calendar_name || null,
     fast_track: fastTrack,
     buyer_stage: buyerStage,
+    active_entry_tag: activeEntryTag,
     ...validated,
   };
 }
