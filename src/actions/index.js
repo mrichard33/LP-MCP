@@ -12,11 +12,12 @@
  *
  * Refactored from src/action-executor.js on 2026-04-24. Behavior preserved
  * exactly; v4.2 approval-pipeline fixes live in approval-path.js. Stuck-
- * action reaper (added 2026-04-24) runs first as defense against Railway
- * redeploys killing processes mid-handler.
+ * action reaper (added 2026-04-24, Phase 2 added 2026-04-28) runs first
+ * as defense against Railway redeploys killing processes mid-handler and
+ * against the orphan 'approved' status.
  *
- * Supported action types (15):
- *   add_tag, remove_tag, move_opportunity, update_opportunity,
+ * Supported action types (16):
+ *   add_tag, remove_tag, set_stage, move_opportunity, update_opportunity,
  *   remove_from_workflow, add_to_workflow, book_appointment,
  *   cancel_appointment, create_task, send_notification, set_lp_appointment,
  *   update_custom_fields, update_contact_email, calculate_time_lapse_tier,
@@ -31,7 +32,7 @@ import { processApprovalQueue } from './approval-path.js';
 import { reapStuckActions } from './reaper.js';
 
 // ─── Handlers ──────────────────────────────────────────────────────
-import { executeAddTag, executeRemoveTag } from './handlers/tags.js';
+import { executeAddTag, executeRemoveTag, executeSetStage } from './handlers/tags.js';
 import { executeMoveOpportunity, executeUpdateOpportunity } from './handlers/opportunities.js';
 import { executeAddToWorkflow, executeRemoveFromWorkflow } from './handlers/workflows.js';
 import { executeBookAppointment, executeCancelAppointment } from './handlers/appointments.js';
@@ -45,6 +46,7 @@ import { executeCalculateTimeLapseTier } from './handlers/time-lapse.js';
 const ACTION_HANDLERS = {
   add_tag: executeAddTag,
   remove_tag: executeRemoveTag,
+  set_stage: executeSetStage,                   // v4.3 — atomic stage tag swap
   move_opportunity: executeMoveOpportunity,
   update_opportunity: executeUpdateOpportunity,
   remove_from_workflow: executeRemoveFromWorkflow,
@@ -124,9 +126,11 @@ async function executeSingleAction(action, batchContext = {}) {
 export async function executeActions({ limit = 50 } = {}) {
   const startTime = Date.now();
 
-  // Phase 0: reap any 'executing' actions stuck from a killed process.
-  // Requeues idempotent ones to 'pending' (they'll run in phase 2 below)
-  // and fails non-idempotent / retry-exhausted ones with an audit trail.
+  // Phase 0: reap any 'executing' actions stuck from a killed process,
+  // and any orphaned 'approved' status rows from the legacy MCP
+  // approve_action bug (fixed in 2ac7f25 on 2026-04-28). Requeues
+  // idempotent ones to 'pending' (they'll run in phase 2 below) and
+  // fails non-idempotent / retry-exhausted ones with an audit trail.
   const reaperResult = await reapStuckActions();
 
   // Phase 1: process any pending_approval actions (send GroupMe cards).
