@@ -13,7 +13,7 @@
  *   3. buildKbPack({intent, stage, activeEntry, ...})  ← Phase 3
  *   4. buildResponsePrompt(context, kb_pack)  ← Phase 5 prompt rewrite
  *   5. callClaude(systemPrompt, userPrompt)
- *   6. validate + return
+ *   6. validate + sanitizeMessageUrls + return    ← v2.2
  *
  * Called by: send-message-handler.js when action has requires_ai_generation: true
  *
@@ -23,16 +23,29 @@
  *   - Vector embed (when triggered): text-embedding-3-small (~$0.00001 per query)
  *   - Total per response: ~$0.01-0.015 typical
  *
- * v2.1 — 2026-04-28. Calendar awareness:
+ * v2.2 — 2026-04-28. URL HALLUCINATION FIX.
+ *   Sonnet was generating responses with hallucinated booking URLs
+ *   (e.g. "https://reecewindows.com/calendar" instead of the actual
+ *   GHL booking_url from the KB pack), and using markdown link syntax
+ *   [text](url) which got mangled by the GroupMe approval template.
+ *
+ *   Three-layer defense added:
+ *     1. sanitizeMessageUrls() — post-Claude scrubber that strips
+ *        markdown link syntax and replaces ANY URL in the message
+ *        with the canonical booking_url from the KB pack. If no
+ *        booking_url is provided, non-allowlisted URLs are stripped.
+ *     2. System prompt tightened — explicit WRONG/RIGHT URL examples,
+ *        zero-tolerance markdown ban for SMS, no-fabricated-assets rule.
+ *     3. User prompt now includes a dedicated, prominent CANONICAL URL
+ *        line right above the inbound message so the model can't miss
+ *        which URL to paste verbatim.
+ *
+ * v2.1 — Calendar awareness:
  *        Extracts the lead's `active-entry:*` tag from context and passes
- *        it to buildKbPack as activeEntryTag. The kb pack uses this to
- *        pick the right Reece calendar (estimate-calculator → MV calendar,
- *        callbacks → Confirmation Call calendar, default → Window Estimate).
- *        Pairs with kb-retriever v1.1.
+ *        it to buildKbPack as activeEntryTag.
  *
  * v2.0 — Phase 1 (compliance gates) + Phase 3 (KB injection) + Phase 5
  *        (Antifragile-hardened SYSTEM_PROMPT) integrated.
- *        Returns either {short_circuit: true, ...handoff} or {short_circuit: false, ...response}.
  *
  * v1.1 — Brand-language fix: NC 1972 / FL 2005 distinction enforced.
  * v1.0 — Initial response generation with Antifragile Sales System prompt.
@@ -47,20 +60,39 @@ const MODEL = process.env.RESPONSE_GENERATOR_MODEL || 'claude-sonnet-4-20250514'
 const MAX_TOKENS = parseInt(process.env.RESPONSE_GENERATOR_MAX_TOKENS || '600', 10);
 const TIMEOUT_MS = 30000;
 
+// Domains we own. Any URL outside this list in a model output is
+// treated as a hallucination and either replaced (with booking_url)
+// or stripped. Update via env REECE_DOMAIN_ALLOWLIST="a.com,b.com".
+const REECE_DOMAIN_ALLOWLIST = (
+  process.env.REECE_DOMAIN_ALLOWLIST ||
+  'reecewindows.com,getreecewindows.com,mail.reecewindows.com,reecewindowsmail.com,api.leadconnectorhq.com,app.gohighlevel.com,services.leadconnectorhq.com'
+).split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+
+function urlHostAllowed(url) {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    return REECE_DOMAIN_ALLOWLIST.some(d => host === d || host.endsWith('.' + d));
+  } catch {
+    return false;
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════
-// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.0
+// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.2
 // ═══════════════════════════════════════════════════════════════════
 
 const SYSTEM_PROMPT = `You are the Agentic Responder for Reece Windows & Doors, a hurricane impact window and door company founded in North Carolina in 1972, with Florida operations since 2005, serving South Florida homeowners. Your job is to write SMS or email replies that move leads ONE stage forward in the Antifragile Sales System buyer journey — never to close the deal in a single message.
 
 ═══════ VOICE ═══════
 - First person plural ("we", "our team") by default — never "I" alone
-- Conversational but professional — no slang, no emojis, no exclamation marks
+- Conversational but professional — no slang, no emojis, no exclamation marks ANYWHERE (subject OR body)
 - Sound like a knowledgeable South Florida neighbor who happens to be in the window business — "expert friend" not "salesperson"
 - Never say "I understand your concern" or any AI-sounding phrases
 - Never mention being automated, AI, or a system
 - Never use "just following up" — every message has a PURPOSE
 - Always acknowledge what the lead said before pivoting
+- For life-event objections (new baby, surgery, family emergency, medical situation, recent loss), match their energy — short, warm, NO upselling, NO cheerful "Congrats!" preamble. Lead with empathy. Then offer to circle back in 4-8 weeks. Do not pitch.
 
 ═══════ ATTRACTIVE CHARACTER — RANDY REECE (LIMITED USE) ═══════
 For SA1 and SA3 specifically, you MAY write in Randy Reece's voice when the KB pack indicates ac_voice_eligible. Randy is the founder. He's personally seen homes destroyed by storms (SA1) and replacement jobs from families who went with the cheapest competitor (SA3). When using Randy's voice, write in first-person singular ("I") and reference what he's seen. Use sparingly — never more than once per conversation thread. Default voice remains "we / our team."
@@ -109,10 +141,35 @@ When a KB PACK is included in the user prompt, the structured content in it (PRI
 3. If a PROOF POINTS section is included, only cite facts from that list — never invent statistics
 4. If an OBJECTION SCRIPT is included with body_template, follow its structure
 5. If a PRICING ANCHOR is included, NEVER quote a specific number — use the anchoring_message phrasing only
-6. If a BOOKING CONTEXT is included, use ITS calendar (the booking_url provided), not a guessed link, and follow its handling guidance ("Skip discovery..." / "Confirm phone...")
+6. If a BOOKING CONTEXT is included, use ITS booking_url EXACTLY (see URL RULES below)
 7. If COMPETITOR INTEL is included, use talking_point and reece_advantage; respect do_not_attack as hard prohibition
 
 When NO pack is provided, fall back to the story arc summaries below — but stay conservative on specifics.
+
+═══════ URL RULES — ZERO TOLERANCE ═══════
+You may include AT MOST ONE URL in your message, and it MUST be one of:
+- The exact booking_url from BOOKING CONTEXT (copy-paste verbatim)
+- An exact URL provided in another field of the KB PACK (e.g. proof_points.source_url)
+
+You MAY NOT:
+- Invent or modify a URL
+- Guess a domain or path
+- "Improve" or shorten a URL
+- Use markdown link syntax: [text](url) is FORBIDDEN — output bare URLs only
+- Include more than one URL
+
+WRONG examples (NEVER produce these):
+  ❌ "[Schedule here](https://reecewindows.com/calendar)"      — markdown + invented domain
+  ❌ "Visit reecewindows.com/booking"                          — invented path, no protocol
+  ❌ "www.reecewindows.com/quote"                              — guessed URL
+  ❌ "Check out our calendar: reece.com/cal"                   — abbreviated/invented
+  ❌ "[here](https://api.leadconnectorhq.com/widget/booking/X)" — markdown wrapping a real URL is still WRONG
+
+RIGHT example:
+  ✅ "Want to grab a slot this week? https://api.leadconnectorhq.com/widget/booking/aJj14ONxh1oFyDcQ706O"
+     (bare URL, exactly as provided in KB PACK, prepended with regular text)
+
+If the KB PACK does not provide a URL and you don't have one to paste, simply DO NOT include a URL. A message with no URL is better than a message with a wrong URL.
 
 ═══════ STORY ARCS — FALLBACK SUMMARIES ═══════
 SA1: Hurricane damage stories — homes built before current code, vulnerability awareness
@@ -139,7 +196,7 @@ The lead's active-w* tags tell you what content they've recently received. Treat
 If the user prompt flags FAST_TRACK = true (lead_score >50 with engagement in last 48h), this lead is HOT:
 - Skip education
 - Use SA3 (cheap regret) or SA5 (ROI)
-- Include the booking link as PRIMARY CTA, not footer
+- Include the booking link as PRIMARY CTA, not footer (URL RULES still apply)
 - Compress to a single decision point: "want me to grab a slot this week?"
 
 ═══════ SMS INDEPENDENCE ═══════
@@ -151,18 +208,21 @@ SMS messages must be EMOTIONALLY STANDALONE:
 
 ═══════ BOOKING ESCAPE HATCH ═══════
 Every message contains a booking path. Trust level decides positioning:
-- L1-L2 (low trust): footer only — "Ready now? Skip ahead: [link]"
-- L3 (medium): inline mention — "If you'd rather just see the numbers, here's the calendar: [link]"
-- L4-L6 (high): primary CTA — "Want me to grab a time this week?"
+- L1-L2 (low trust): footer only — soft inline mention with the booking_url
+- L3 (medium): inline mention with the booking_url
+- L4-L6 (high): primary CTA with the booking_url
 
 If you don't know the trust level, default to L1-L2 (footer).
 
-When a BOOKING CONTEXT is provided in the KB pack, use ITS booking_url (do not invent a different one). The calendar selection is already done for you — just paste the URL.
+The URL you include MUST be the booking_url from BOOKING CONTEXT verbatim. See URL RULES.
+
+For LIFE-EVENT timing objections (new baby, surgery, family emergency, recent loss): DO NOT include a booking link. The right move is empathy + offer to circle back in 4-8 weeks. Pushing a calendar in this moment damages the relationship.
 
 ═══════ OBJECTION HANDLING (NO KB OVERRIDE) ═══════
 When a KB OBJECTION SCRIPT is provided, follow it. Otherwise:
 - Price → SA3 (cost of cheap) + SA5 (ROI). NEVER defend price directly. NEVER quote numbers.
-- Timing → SA4 (cost of waiting) + SA1 (storm season). Gentle time pressure.
+- Timing (LIFE-EVENT — baby/surgery/family/medical) → Acknowledge with empathy. Offer to circle back. NO pitch. NO booking link. NO upselling. Short, warm, sincere.
+- Timing (LOGISTICAL — busy/traveling/out of town) → SA4 (cost of waiting) + SA1 (storm season). Gentle time pressure. May include booking link.
 - Spouse → Acknowledge BOTH parties. Offer information that helps them decide together.
 - Trust → SA2 (50+ years company, BBB A+, own crews). One specific proof point.
 - Competitor → SA3 (questions to ask others). Position through QUESTIONS, never attacks.
@@ -188,17 +248,21 @@ Reece was founded in North Carolina in 1972. Florida operations began in 2005.
 - Never quote prices or estimates
 - Never make promises about discounts or deals
 - Never invent statistics or proof points (use only KB-provided ones)
+- Never invent assets, materials, or resources we offer. If the KB pack does not list a "checklist," "guide," "PDF," "report," "video," "infographic," or any other deliverable, we DO NOT have it. Do not promise to send what doesn't exist.
+- Never invent or modify URLs (see URL RULES)
+- Never use markdown link syntax — bare URLs only
 - Never repeat what an automated workflow already said
 - Never ignore what the lead said
 - Never send a generic message — every reply must reference their specific situation
-- Never use exclamation marks in subject lines
+- Never use exclamation marks anywhere — subject lines OR body
 - Never use ALL CAPS in body
 - Never use emoji (in any channel)
-- Never say "Don't miss out!", "Act now!", "Limited time!"
+- Never say "Don't miss out", "Act now", "Limited time"
+- Never lead with "Congrats" or "Congratulations" on a life event when the lead is also expressing concern, fatigue, or an objection — empathy first, never the celebratory frame
 
 ═══════ CHANNEL CONSTRAINTS ═══════
-SMS:   1-3 sentences max. Under 160 chars ideal, 320 max. ONE question max. Booking link as raw URL when included.
-Email: 2-4 short paragraphs. 150-400 words. Subject line required (no exclamation). HSO structure visible.
+SMS:   1-3 sentences max. Under 160 chars ideal, 320 max. ONE question max. URLs must be bare (no markdown). At most ONE URL per message.
+Email: 2-4 short paragraphs. 150-400 words. Subject line required (no exclamation). HSO structure visible. URLs still must be bare/exact.
 
 ═══════ RESPONSE FORMAT ═══════
 Return ONLY a valid JSON object — no markdown fences, no preamble:
@@ -266,7 +330,7 @@ function extractActiveEntryTag(context) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// PROMPT BUILDER (v2.0 — KB-aware)
+// PROMPT BUILDER (v2.0 — KB-aware, v2.2 — canonical URL line)
 // ═══════════════════════════════════════════════════════════════════
 
 function buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack) {
@@ -274,8 +338,8 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
 
   parts.push(`CHANNEL: ${channel.toUpperCase()}`);
   parts.push(channel === 'sms'
-    ? 'Constraints: under 160 chars ideal, 320 max. 1-3 sentences. ONE question max. Booking link as raw URL if included.'
-    : 'Constraints: 150-400 words. 2-4 short paragraphs. Subject line required.'
+    ? 'Constraints: under 160 chars ideal, 320 max. 1-3 sentences. ONE question max. Booking link as RAW URL (no markdown). At most ONE URL.'
+    : 'Constraints: 150-400 words. 2-4 short paragraphs. Subject line required. URLs as raw text (no markdown).'
   );
 
   // Classification (always)
@@ -330,7 +394,10 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
       parts.push(`\nLP Rep Notes (most reliable intelligence):`);
       context.lp.notes.slice(0, 5).forEach(n => {
         const by = n.entered_by || 'System';
-        parts.push(`  [${by}] ${n.text.slice(0, 1500)}`);
+        // v2.2 null-safety: n.text should never be null (context-builder
+        // filters), but guard anyway so a bad row never crashes generation.
+        const noteText = typeof n.text === 'string' ? n.text.slice(0, 1500) : '';
+        parts.push(`  [${by}] ${noteText}`);
       });
     }
     if (context.lp.recent_calls?.length) {
@@ -383,11 +450,30 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     }
   }
 
+  // ─── v2.2: CANONICAL URL LINE ──────────────────────────────────
+  // Sonnet was hallucinating booking URLs. Make the canonical URL
+  // unmissable — put it in its own block right before the trigger.
+  const canonicalUrl = kbPack?.booking_context?.booking_url || null;
+  const canonicalCalName = kbPack?.booking_context?.calendar_name || null;
+  if (canonicalUrl) {
+    parts.push(`\n═══════ CANONICAL URL — COPY VERBATIM IF YOU INCLUDE A LINK ═══════`);
+    parts.push(`The ONLY URL you may include is this one, exactly as written:`);
+    parts.push(`  ${canonicalUrl}`);
+    if (canonicalCalName) parts.push(`(That URL is the ${canonicalCalName} calendar.)`);
+    parts.push(`If you include a URL: paste this exact string. No markdown. No modifications. No invented domains.`);
+    parts.push(`If you do not need to include a URL: omit URL entirely. A message with no URL is better than a wrong one.`);
+    parts.push(`═══════ END CANONICAL URL ═══════`);
+  } else {
+    parts.push(`\n═══════ NO URL AUTHORIZED ═══════`);
+    parts.push(`No booking URL is available for this response. Do NOT include any URL in your message.`);
+    parts.push(`═══════ END NO URL AUTHORIZED ═══════`);
+  }
+
   // The trigger message
   parts.push(`\nTHE INBOUND MESSAGE TO RESPOND TO:`);
   parts.push(`"${triggerMessage}"`);
 
-  parts.push(`\nGenerate the ${channel} response. Apply HSO. Move them ONE stage forward. Reference their specific situation. Include a soft next step. If KB pack provided, follow it.`);
+  parts.push(`\nGenerate the ${channel} response. Apply HSO. Move them ONE stage forward. Reference their specific situation. Include a soft next step. If KB pack provided, follow it. URL rules are non-negotiable.`);
 
   return parts.join('\n');
 }
@@ -464,6 +550,93 @@ function validateResponse(parsed, channel) {
     voice_used: voice,
     reasoning: String(parsed.reasoning || '').slice(0, 500),
   };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// v2.2 — URL SANITIZER (post-Claude)
+// ═══════════════════════════════════════════════════════════════════
+//
+// Belt-and-suspenders defense against URL hallucinations. Even with
+// the URL RULES section in the system prompt and the CANONICAL URL
+// block in the user prompt, Sonnet has been observed inventing
+// plausible-looking URLs (e.g. "https://reecewindows.com/calendar")
+// and wrapping them in markdown link syntax.
+//
+// This sanitizer runs after validateResponse and:
+//   1. Strips markdown link syntax [text](url)
+//      - Keeps `text` as visible label text
+//      - Drops the URL part if it's not allowlisted
+//      - Replaces with canonical booking_url if one is provided
+//   2. Replaces any remaining bare URLs with the canonical booking_url
+//      (when one is provided in kbPack), OR strips non-allowlisted
+//      URLs entirely (when no canonical URL is available)
+//   3. Collapses duplicate URLs and excess whitespace
+//
+// The result: the only URL in the outbound message is either the
+// canonical booking_url or nothing. Hallucinated domains never reach
+// the lead.
+
+const URL_RX = /https?:\/\/[^\s<>"'`)\]]+/g;
+const MARKDOWN_LINK_RX = /\[([^\]]*)\]\(\s*([^)]+?)\s*\)/g;
+
+function sanitizeMessageUrls(message, channel, kbPack) {
+  if (!message || typeof message !== 'string') return message;
+  let out = message;
+
+  const canonicalUrl = kbPack?.booking_context?.booking_url || null;
+  let mutations = [];
+
+  // Step 1: Strip markdown link syntax. Replace [text](url) with either
+  // the canonical URL (if one exists) or just `text` (if URL is bogus).
+  out = out.replace(MARKDOWN_LINK_RX, (match, text, url) => {
+    mutations.push('markdown_link');
+    const trimmedUrl = url.trim().replace(/["']/g, '');  // strip stray quotes glued in
+    if (canonicalUrl) {
+      // We have a real URL — substitute it, drop the markdown wrapper
+      return canonicalUrl;
+    }
+    // No canonical URL. Check if the embedded URL is allowlisted; if so
+    // keep it bare. Otherwise drop the URL portion entirely.
+    if (urlHostAllowed(trimmedUrl)) {
+      return trimmedUrl;
+    }
+    // Nothing safe to keep — drop the link, leave the visible text
+    return text || '';
+  });
+
+  // Step 2: Replace any bare URL not on the allowlist with canonicalUrl,
+  // or strip if we don't have a canonical to use.
+  out = out.replace(URL_RX, (match) => {
+    const cleaned = match.replace(/[)\].,;:]+$/, '');  // strip trailing punctuation glued in
+    if (urlHostAllowed(cleaned)) {
+      return cleaned;
+    }
+    mutations.push('hallucinated_url');
+    return canonicalUrl || '';
+  });
+
+  // Step 3: Dedupe consecutive identical URLs (in case markdown +
+  // bare-URL replacement produced doubles).
+  if (canonicalUrl) {
+    const escaped = canonicalUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const dupeRx = new RegExp(`(${escaped})(\\s*${escaped})+`, 'g');
+    const before = out;
+    out = out.replace(dupeRx, '$1');
+    if (out !== before) mutations.push('deduped_urls');
+  }
+
+  // Step 4: Collapse excess whitespace produced by URL stripping.
+  out = out
+    .replace(/[ \t]+/g, ' ')
+    .replace(/ +\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  if (mutations.length > 0) {
+    console.warn(`[ResponseGenerator] URL sanitizer applied: ${mutations.join(', ')} — channel=${channel}, canonical=${canonicalUrl ? 'yes' : 'no'}`);
+  }
+
+  return out;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -572,6 +745,11 @@ export async function generateResponse(contactId, channel, triggerMessage) {
   if (!validated) {
     throw new Error('AI response generation failed: invalid response structure');
   }
+
+  // ─── v2.2: URL SANITIZER (post-Claude) ─────────────────────────
+  // Strips markdown link syntax + replaces hallucinated URLs with the
+  // canonical booking_url (or removes them if no canonical is available).
+  validated.message = sanitizeMessageUrls(validated.message, channel, kbPack);
 
   console.log(`[ResponseGenerator] Generated ${channel} for ${contactId}: ` +
     `intent=${classification.intent_class} ` +
