@@ -1,62 +1,33 @@
 /**
  * Response Generator — src/response-generator.js
  *
- * Agentic Responder intelligence core. Generates contextually relevant
- * SMS/email responses for leads using the full lead context from GHL,
- * LeadPerfection, and Supabase.
+ * Agentic Responder intelligence core.
  *
- * Pipeline (v2.0):
- *   1. buildLeadContext(contactId)
- *   2. classifyInbound(triggerMessage)        ← Phase 1
- *      ├─ compliance_gate (tag_and_handoff)   → SHORT-CIRCUIT (no LLM call)
- *      └─ intent_router                       → continue to step 3
- *   3. buildKbPack({intent, stage, activeEntry, hasExistingAppt, lpDisp})  ← Phase 3
- *   4. buildResponsePrompt(context, kb_pack)  ← Phase 5 prompt rewrite
- *   5. callClaude(systemPrompt, userPrompt)
- *   6. validate + sanitizeMessageUrls + return    ← v2.2
+ * v2.4 — 2026-04-28. MERGE TAG AWARENESS.
+ *   Per Mark: agentic bot must send GHL trigger links so the GHL
+ *   account tracks per-click attribution. kb-retriever v1.5 now
+ *   returns booking_url as a `{{trigger_link.XXX}}` merge tag —
+ *   GHL renders it at delivery, generating a unique tracked URL
+ *   per recipient.
  *
- * Called by: send-message-handler.js when action has requires_ai_generation: true
+ *   Three changes:
  *
- * Cost controls:
- *   - Main model: claude-sonnet-4-20250514, max_tokens 600
- *   - Classifier: claude-haiku-4-5-20251001 (~$0.001 per classification)
- *   - Vector embed (when triggered): text-embedding-3-small (~$0.00001 per query)
- *   - Total per response: ~$0.01-0.015 typical
+ *   1. URL sanitizer rewritten to handle merge tags:
+ *      - Bare merge tags pass through unchanged
+ *      - Markdown wrapping a merge tag is unwrapped
+ *      - Hallucinated URLs are stripped (or replaced with canonical
+ *        merge tag if no other tag is present)
+ *      - Duplicate merge tags are deduped
  *
- * v2.3 — 2026-04-28. FRAMEWORK INTEGRATION + context-aware booking.
- *   Per Mark: "Make sure the system follows the frameworks from:
- *     - The Antifragile Sales System
- *     - DotCom Secrets
- *     - Expert Secrets
- *     - Traffic Secrets
- *     Make sure this knowledge is fully integrated into the agentic system."
+ *   2. System prompt URL RULES updated to explain merge tag form
+ *      with WRONG/RIGHT examples that include the trigger_link syntax.
  *
- *   Two changes:
+ *   3. CANONICAL URL block in user prompt clarifies that the value
+ *      is a merge tag — looks weird, that's expected, paste verbatim.
  *
- *   1. buildKbPack now receives hasExistingAppt and lpDisposition from
- *      context.lp.* — so the kb-retriever v1.3 context-aware calendar
- *      selector picks the right calendar for the lead's actual state
- *      (existing appt → Confirmation Call, MV-source → MV calendar,
- *      explicit phone request → Confirmation Call, etc.) instead of
- *      always defaulting to in-home Window Estimate.
- *
- *   2. New FRAMEWORK INTEGRATION section in the system prompt that
- *      makes the four frameworks ACTIONABLE rather than just referenced:
- *        - Antifragile (5 stages × 4 trust levels) — already there
- *        - Expert Secrets (One Thing, False Beliefs, The Vehicle,
- *          Future Pacing, Origin Stories) — NEW
- *        - Traffic Secrets (temperature matching) — NEW
- *        - DotCom Secrets (Value Ladder awareness) — strengthened
- *      Plus a "which framework by stage" mapping so the model knows
- *      which lens to lead with at each stage of the buyer journey.
- *
- *   Also adds CONTEXT-AWARE BOOKING section that mirrors the four
- *   policies emitted by kb-retriever v1.3 (phone_primary_in_home_fallback,
- *   mv_only, confirm_existing_appt, in_home_first_call_fallback) with
- *   explicit handling guidance for each.
- *
- * v2.2 — Defense-in-depth against URL hallucination (sanitizer + prompt
- *        URL RULES + canonical URL block in user prompt).
+ * v2.3 — Framework integration (Antifragile + Expert + Traffic + DotCom)
+ *        + context-aware booking + traffic temperature.
+ * v2.2 — Defense-in-depth against URL hallucination.
  * v2.1 — Calendar awareness: extracts active-entry tag.
  * v2.0 — Phase 1 + Phase 3 + Phase 5 integration.
  * v1.1 — Brand-language fix.
@@ -72,9 +43,6 @@ const MODEL = process.env.RESPONSE_GENERATOR_MODEL || 'claude-sonnet-4-20250514'
 const MAX_TOKENS = parseInt(process.env.RESPONSE_GENERATOR_MAX_TOKENS || '600', 10);
 const TIMEOUT_MS = 30000;
 
-// Domains we own. Any URL outside this list in a model output is
-// treated as a hallucination and either replaced (with booking_url)
-// or stripped. Update via env REECE_DOMAIN_ALLOWLIST="a.com,b.com".
 const REECE_DOMAIN_ALLOWLIST = (
   process.env.REECE_DOMAIN_ALLOWLIST ||
   'reecewindows.com,getreecewindows.com,mail.reecewindows.com,reecewindowsmail.com,api.leadconnectorhq.com,app.gohighlevel.com,services.leadconnectorhq.com'
@@ -90,8 +58,13 @@ function urlHostAllowed(url) {
   }
 }
 
+// v2.4: Merge tag form `{{trigger_link.<ID>}}` (optionally followed by
+// `&param=value` chain). Used by sanitizer to detect and pass through.
+const MERGE_TAG_RX = /\{\{trigger_link\.[A-Za-z0-9_-]+\}\}(?:&[A-Za-z_][A-Za-z0-9_]*=[^\s&]+)*/g;
+const BARE_MERGE_TAG_RX = /\{\{trigger_link\.[A-Za-z0-9_-]+\}\}/;
+
 // ═══════════════════════════════════════════════════════════════════
-// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.3
+// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.4
 // ═══════════════════════════════════════════════════════════════════
 
 const SYSTEM_PROMPT = `You are the Agentic Responder for Reece Windows & Doors, a hurricane impact window and door company founded in North Carolina in 1972, with Florida operations since 2005, serving South Florida homeowners. Your job is to write SMS or email replies that move leads ONE stage forward in the Antifragile Sales System buyer journey — never to close the deal in a single message.
@@ -192,32 +165,37 @@ When a KB PACK is included in the user prompt, the structured content in it (PRI
 
 When NO pack is provided, fall back to the story arc summaries below — but stay conservative on specifics.
 
-═══════ URL RULES — ZERO TOLERANCE ═══════
-You may include AT MOST ONE URL in your message, and it MUST be one of:
-- The exact booking_url from BOOKING CONTEXT (copy-paste verbatim)
-- An exact URL provided in another field of the KB PACK (e.g. proof_points.source_url)
+═══════ BOOKING LINKS — GHL TRIGGER LINK MERGE TAGS (v2.4) ═══════
+The booking_url provided in BOOKING CONTEXT is a GHL TRIGGER LINK MERGE TAG. It looks like this:
 
-You MAY NOT:
-- Invent or modify a URL
-- Guess a domain or path
-- "Improve" or shorten a URL
-- Use markdown link syntax: [text](url) is FORBIDDEN — output bare URLs only
-- Include more than one URL
+  {{trigger_link.QqvhMNyB7YQzHqSNOXHm}}
+  {{trigger_link.QqvhMNyB7YQzHqSNOXHm}}&utm_term=phone_primary
+  {{trigger_link.QqvhMNyB7YQzHqSNOXHm}}&utm_term=mv&utm_medium=email
+
+The merge tag looks weird — that's expected. GHL renders it server-side at delivery, substituting in the contact's name/address/phone, the configured UTMs, and a per-recipient click tracker. The lead receives a fully rendered URL like https://link.reecewindows.com/widget/booking/...
+
+Rules for booking links:
+- You may include AT MOST ONE booking link per message
+- The link MUST be the booking_url from BOOKING CONTEXT, copied VERBATIM (including the entire {{trigger_link...}}&utm_term=... string if provided)
+- Do NOT modify the merge tag (don't change the ID, don't strip the suffix, don't replace it with a resolved URL)
+- Do NOT use markdown link syntax — output the merge tag bare
+- Do NOT include more than one merge tag
 
 WRONG examples (NEVER produce these):
-  ❌ "[Schedule here](https://reecewindows.com/calendar)"      — markdown + invented domain
-  ❌ "Visit reecewindows.com/booking"                          — invented path, no protocol
-  ❌ "www.reecewindows.com/quote"                              — guessed URL
-  ❌ "Check out our calendar: reece.com/cal"                   — abbreviated/invented
-  ❌ "[here](https://api.leadconnectorhq.com/widget/booking/X)" — markdown wrapping a real URL is still WRONG
+  ❌ "[Schedule here]({{trigger_link.QqvhMNyB7YQzHqSNOXHm}})" — markdown wrapping is forbidden
+  ❌ "https://reecewindows.com/calendar"                       — invented URL
+  ❌ "https://link.reecewindows.com/widget/booking/abc"        — typing the resolved URL instead of merge tag
+  ❌ "{{trigger_link.QqvhMNyB7YQzHqSNOXHm}}"                   — stripped the suffix when one was provided
+  ❌ "Visit our calendar (link below)"                         — vague, no merge tag
 
-RIGHT example:
-  ✅ "Want to grab a slot this week? https://api.leadconnectorhq.com/widget/booking/aJj14ONxh1oFyDcQ706O"
-     (bare URL, exactly as provided in KB PACK, prepended with regular text)
+RIGHT examples:
+  ✅ "Want to grab a slot this week? {{trigger_link.QqvhMNyB7YQzHqSNOXHm}}&utm_term=in_home_first"
+  ✅ "Quick call works: {{trigger_link.sfQAvcOczlOGQX1LE0Ht}}&utm_term=phone_primary"
+  (bare merge tag, exactly as provided in KB PACK, prepended with regular text)
 
-If the KB PACK does not provide a URL and you don't have one to paste, simply DO NOT include a URL. A message with no URL is better than a message with a wrong URL.
+If the KB PACK does not provide a booking_url and you don't have a merge tag to paste, simply DO NOT include any link. A message with no link is better than an invented URL.
 
-═══════ CONTEXT-AWARE BOOKING (kb-retriever v1.3) ═══════
+═══════ CONTEXT-AWARE BOOKING (kb-retriever v1.5) ═══════
 The BOOKING CONTEXT in the KB pack carries a "policy" that matches the user's actual request. Honor it:
 
 - policy: phone_primary_in_home_fallback
@@ -257,7 +235,7 @@ The lead's active-w* tags tell you what content they've recently received. Treat
 If the user prompt flags FAST_TRACK = true (lead_score >50 with engagement in last 48h), this lead is HOT:
 - Skip education
 - Use SA3 (cheap regret) or SA5 (ROI)
-- Include the booking link as PRIMARY CTA, not footer (URL RULES still apply)
+- Include the merge tag as PRIMARY CTA, not footer (BOOKING LINKS rules still apply)
 - Compress to a single decision point: "want me to grab a slot this week?"
 
 ═══════ SMS INDEPENDENCE ═══════
@@ -269,19 +247,19 @@ SMS messages must be EMOTIONALLY STANDALONE:
 
 ═══════ BOOKING ESCAPE HATCH ═══════
 Trust level decides positioning of the booking offer:
-- L1-L2 (low trust): footer only — soft inline mention with the booking_url
-- L3 (medium): inline mention with the booking_url
-- L4-L6 (high): primary CTA with the booking_url
+- L1-L2 (low trust): footer only — soft inline mention with the merge tag
+- L3 (medium): inline mention with the merge tag
+- L4-L6 (high): primary CTA with the merge tag
 
 If you don't know the trust level, default to L1-L2 (footer).
 
-For LIFE-EVENT timing objections (new baby, surgery, family emergency, recent loss): DO NOT include a booking link. The right move is empathy + offer to circle back in 4-8 weeks. Pushing a calendar in this moment damages the relationship.
+For LIFE-EVENT timing objections (new baby, surgery, family emergency, recent loss): DO NOT include a merge tag. The right move is empathy + offer to circle back in 4-8 weeks. Pushing a calendar in this moment damages the relationship.
 
 ═══════ OBJECTION HANDLING (NO KB OVERRIDE) ═══════
 When a KB OBJECTION SCRIPT is provided, follow it. Otherwise:
 - Price → SA3 (cost of cheap) + SA5 (ROI). NEVER defend price directly. NEVER quote numbers.
 - Timing (LIFE-EVENT — baby/surgery/family/medical) → Acknowledge with empathy. Offer to circle back. NO pitch. NO booking link. NO upselling. Short, warm, sincere.
-- Timing (LOGISTICAL — busy/traveling/out of town) → SA4 (cost of waiting) + SA1 (storm season). Gentle time pressure. May include booking link.
+- Timing (LOGISTICAL — busy/traveling/out of town) → SA4 (cost of waiting) + SA1 (storm season). Gentle time pressure. May include merge tag.
 - Spouse → Acknowledge BOTH parties. Offer information that helps them decide together.
 - Trust → SA2 (50+ years company, BBB A+, own crews). One specific proof point.
 - Competitor → SA3 (questions to ask others). Position through QUESTIONS, never attacks.
@@ -308,8 +286,9 @@ Reece was founded in North Carolina in 1972. Florida operations began in 2005.
 - Never make promises about discounts or deals
 - Never invent statistics or proof points (use only KB-provided ones)
 - Never invent assets, materials, or resources we offer. If the KB pack does not list a "checklist," "guide," "PDF," "report," "video," "infographic," or any other deliverable, we DO NOT have it. Do not promise to send what doesn't exist.
-- Never invent or modify URLs (see URL RULES)
-- Never use markdown link syntax — bare URLs only
+- Never invent or modify URLs (see BOOKING LINKS rules)
+- Never type a resolved URL when a merge tag is provided — paste the merge tag verbatim
+- Never use markdown link syntax — output bare merge tags / URLs only
 - Never repeat what an automated workflow already said
 - Never ignore what the lead said
 - Never send a generic message — every reply must reference their specific situation
@@ -320,8 +299,8 @@ Reece was founded in North Carolina in 1972. Florida operations began in 2005.
 - Never lead with "Congrats" or "Congratulations" on a life event when the lead is also expressing concern, fatigue, or an objection — empathy first, never the celebratory frame
 
 ═══════ CHANNEL CONSTRAINTS ═══════
-SMS:   1-3 sentences max. Under 160 chars ideal, 320 max. ONE question max. URLs must be bare (no markdown). At most ONE URL per message.
-Email: 2-4 short paragraphs. 150-400 words. Subject line required (no exclamation). HSO structure visible. URLs still must be bare/exact.
+SMS:   1-3 sentences max. Under 160 chars ideal, 320 max. ONE question max. Merge tags as bare text (no markdown). At most ONE merge tag per message.
+Email: 2-4 short paragraphs. 150-400 words. Subject line required (no exclamation). HSO structure visible. Merge tags as bare text (no markdown).
 
 ═══════ RESPONSE FORMAT ═══════
 Return ONLY a valid JSON object — no markdown fences, no preamble:
@@ -345,23 +324,20 @@ Return ONLY a valid JSON object — no markdown fences, no preamble:
 // ═══════════════════════════════════════════════════════════════════
 
 function inferBuyerStage(context) {
-  // Priority 1: explicit AI-classified stage
   if (context.intelligence?.buyer_stage) {
     const n = parseInt(String(context.intelligence.buyer_stage).match(/\d+/)?.[0] || '0', 10);
     if (n >= 1 && n <= 5) return n;
   }
-  // Priority 2: stage tag (e.g. 'stage:3-comparing')
   const stageTag = context.lead?.current_stage_tag || '';
   const m = stageTag.match(/stage:(\d+)/);
   if (m) {
     const n = parseInt(m[1], 10);
     if (n >= 1 && n <= 5) return n;
   }
-  // Priority 3: pipeline state heuristics
-  if (context.lp?.demo_completed) return 4;        // post-demo = negotiating
-  if (context.lp?.appointment_set) return 3;        // booked = comparing
-  if (context.lp?.closed_won) return 5;             // committed
-  return 2;                                         // default: curious
+  if (context.lp?.demo_completed) return 4;
+  if (context.lp?.appointment_set) return 3;
+  if (context.lp?.closed_won) return 5;
+  return 2;
 }
 
 function isHyperactiveBuyer(context) {
@@ -376,7 +352,6 @@ function isHyperactiveBuyer(context) {
   return ageMs < 48 * 60 * 60 * 1000;
 }
 
-// v2.3: classify traffic temperature for Traffic Secrets calibration.
 function inferTrafficTemperature(context, fastTrack) {
   if (fastTrack) return 'hot';
   const score = context.engagement?.lead_score || context.lead?.lead_score || 0;
@@ -391,20 +366,16 @@ function inferTrafficTemperature(context, fastTrack) {
 }
 
 function inferWindowCount(context) {
-  // TODO: pull from GHL custom field if/when available
   return null;
 }
 
-// v2.1: Pull the lead's CURRENT source from active-entry:* tag (single tag —
-// swapped on re-entry). The kb-retriever uses it to pick the right calendar.
-// Permanent entry:* tags are attribution only and aren't used here.
 function extractActiveEntryTag(context) {
   const tags = context?.lead?.current_tags || [];
   return tags.find(t => typeof t === 'string' && t.startsWith('active-entry:')) || null;
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// PROMPT BUILDER (v2.3 — adds traffic temperature line)
+// PROMPT BUILDER (v2.4 — merge tag canonical block)
 // ═══════════════════════════════════════════════════════════════════
 
 function buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack, trafficTemp) {
@@ -412,23 +383,19 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
 
   parts.push(`CHANNEL: ${channel.toUpperCase()}`);
   parts.push(channel === 'sms'
-    ? 'Constraints: under 160 chars ideal, 320 max. 1-3 sentences. ONE question max. Booking link as RAW URL (no markdown). At most ONE URL.'
-    : 'Constraints: 150-400 words. 2-4 short paragraphs. Subject line required. URLs as raw text (no markdown).'
+    ? 'Constraints: under 160 chars ideal, 320 max. 1-3 sentences. ONE question max. Booking link = merge tag, bare (no markdown). At most ONE link.'
+    : 'Constraints: 150-400 words. 2-4 short paragraphs. Subject line required. Merge tags as bare text (no markdown).'
   );
 
-  // Classification (always)
   parts.push(`\nCLASSIFICATION: ${classification.intent_class} (${classification.confidence?.toFixed(2) || 'n/a'} confidence, ${classification.classification_method})`);
   if (classification.reasoning) parts.push(`Classifier reasoning: ${classification.reasoning}`);
 
-  // v2.3: Traffic temperature for Traffic Secrets calibration
   parts.push(`\nTRAFFIC TEMPERATURE: ${trafficTemp.toUpperCase()} — calibrate hook intensity per Traffic Secrets section.`);
 
-  // Hyperactive buyer flag
   if (fastTrack) {
-    parts.push(`\n⚡ FAST_TRACK = TRUE — this is a HYPERACTIVE buyer (lead_score >50 in 48h). Skip education. Push to booking. Booking link as PRIMARY CTA, not footer.`);
+    parts.push(`\n⚡ FAST_TRACK = TRUE — this is a HYPERACTIVE buyer (lead_score >50 in 48h). Skip education. Push to booking. Merge tag as PRIMARY CTA, not footer.`);
   }
 
-  // Lead profile
   parts.push(`\nLEAD: ${context.lead.name}`);
   parts.push(`Entry: ${context.lead.entry_source || 'unknown'} | Lead Score: ${context.lead.lead_score} | Date Added: ${context.lead.date_added || 'unknown'}`);
 
@@ -445,14 +412,12 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     parts.push(`Suppression Tags: ${context.lead.suppression_tags.join(', ')}`);
   }
 
-  // Pipeline (now with resolved stage name from v2.4 context-builder)
   if (context.pipeline?.status) {
     const stageStr = context.pipeline.stage_name || context.pipeline.stage_id || 'unknown';
     const pipeStr = context.pipeline.pipeline_name || 'unknown';
     parts.push(`\nPIPELINE: ${pipeStr} | Stage: ${stageStr} | Status: ${context.pipeline.status} | Days in stage: ${context.pipeline.days_in_stage}`);
   }
 
-  // LP CRM Data (GROUND TRUTH)
   if (context.lp?.matched || context.lp?.disposition) {
     parts.push(`\nLP CRM (Ground Truth):`);
     parts.push(`Disposition: ${context.lp.disposition || 'none'}${context.lp.disposition_label ? ' (' + context.lp.disposition_label + ')' : ''}`);
@@ -480,7 +445,6 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     }
   }
 
-  // AI Analysis
   if (context.intelligence?.buyer_stage) {
     parts.push(`\nPRIOR AI ANALYSIS:`);
     parts.push(`Buyer Stage: ${context.intelligence.buyer_stage} (conf: ${context.intelligence.buyer_stage_confidence})`);
@@ -493,17 +457,14 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     if (context.intelligence.ai_reasoning) parts.push(`Prior reasoning: ${context.intelligence.ai_reasoning}`);
   }
 
-  // Engagement
   parts.push(`\nENGAGEMENT: opens=${context.engagement?.emails_opened || 0} | clicks=${context.engagement?.links_clicked || 0} | replies=${context.engagement?.replies_count || 0} | VSL=${context.engagement?.vsl_watched ? 'watched' : 'not watched'}`);
 
-  // Active workflows (funnel position context)
   const activeTags = (context.lead.current_tags || []).filter(t => t.startsWith('active-w'));
   const completedTags = (context.lead.current_tags || []).filter(t =>
     t.includes('-complete') || t.includes('-sent'));
   if (activeTags.length) parts.push(`Active Workflows: ${activeTags.join(', ')}`);
   if (completedTags.length) parts.push(`Completed: ${completedTags.slice(0, 8).join(', ')}`);
 
-  // Conversation history
   if (context.conversation_recent?.length) {
     parts.push(`\nCONVERSATION HISTORY (most recent last):`);
     context.conversation_recent.slice(-10).forEach(m => {
@@ -511,7 +472,6 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     });
   }
 
-  // ─── KB PACK INJECTION ─────────────────────────────────────────
   if (kbPack) {
     const formatted = formatKbPackForPrompt(kbPack);
     if (formatted) {
@@ -521,28 +481,34 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     }
   }
 
-  // ─── v2.2: CANONICAL URL LINE ──────────────────────────────────
+  // ─── v2.4: CANONICAL BOOKING LINK BLOCK (merge tag) ──────────────
   const canonicalUrl = kbPack?.booking_context?.booking_url || null;
   const canonicalCalName = kbPack?.booking_context?.calendar_name || null;
   if (canonicalUrl) {
-    parts.push(`\n═══════ CANONICAL URL — COPY VERBATIM IF YOU INCLUDE A LINK ═══════`);
-    parts.push(`The ONLY URL you may include is this one, exactly as written:`);
+    const looksLikeMergeTag = canonicalUrl.startsWith('{{trigger_link.');
+    parts.push(`\n═══════ CANONICAL BOOKING LINK — COPY VERBATIM IF YOU INCLUDE A LINK ═══════`);
+    parts.push(`The ONLY booking link you may include is this one, exactly as written:`);
     parts.push(`  ${canonicalUrl}`);
-    if (canonicalCalName) parts.push(`(That URL is the ${canonicalCalName} calendar.)`);
-    parts.push(`If you include a URL: paste this exact string. No markdown. No modifications. No invented domains.`);
-    parts.push(`If you do not need to include a URL: omit URL entirely. A message with no URL is better than a wrong one.`);
-    parts.push(`═══════ END CANONICAL URL ═══════`);
+    if (canonicalCalName) parts.push(`(That ${looksLikeMergeTag ? 'merge tag' : 'URL'} is the ${canonicalCalName} calendar.)`);
+    if (looksLikeMergeTag) {
+      parts.push(`This is a GHL TRIGGER LINK MERGE TAG. It looks weird with the {{ }} braces — that is correct and expected.`);
+      parts.push(`GHL renders the tag at delivery, generating a unique tracked URL per recipient with the contact's data and UTMs.`);
+      parts.push(`If you include a booking link: paste this exact merge tag string, including any &utm_term= or &utm_medium= suffix. No markdown. No modifications.`);
+    } else {
+      parts.push(`If you include a booking link: paste this exact string. No markdown. No modifications. No invented domains.`);
+    }
+    parts.push(`If you do not need a booking link: omit it entirely. A message with no link is better than a wrong one.`);
+    parts.push(`═══════ END CANONICAL BOOKING LINK ═══════`);
   } else {
-    parts.push(`\n═══════ NO URL AUTHORIZED ═══════`);
-    parts.push(`No booking URL is available for this response. Do NOT include any URL in your message.`);
-    parts.push(`═══════ END NO URL AUTHORIZED ═══════`);
+    parts.push(`\n═══════ NO BOOKING LINK AUTHORIZED ═══════`);
+    parts.push(`No booking link is available for this response. Do NOT include any URL or merge tag in your message.`);
+    parts.push(`═══════ END NO BOOKING LINK AUTHORIZED ═══════`);
   }
 
-  // The trigger message
   parts.push(`\nTHE INBOUND MESSAGE TO RESPOND TO:`);
   parts.push(`"${triggerMessage}"`);
 
-  parts.push(`\nGenerate the ${channel} response. Apply HSO. Move them ONE stage forward. Apply the right framework lens for this stage. Reference their specific situation. Include a soft next step. If KB pack provided, follow it. URL rules are non-negotiable.`);
+  parts.push(`\nGenerate the ${channel} response. Apply HSO. Move them ONE stage forward. Apply the right framework lens for this stage. Reference their specific situation. Include a soft next step. If KB pack provided, follow it. Booking link rules are non-negotiable.`);
 
   return parts.join('\n');
 }
@@ -609,7 +575,6 @@ function validateResponse(parsed, channel) {
 
   const voice = parsed.voice_used === 'randy' ? 'randy' : 'we';
 
-  // v2.3: capture frameworks_applied for analytics
   const frameworksApplied = Array.isArray(parsed.frameworks_applied)
     ? parsed.frameworks_applied.filter(f => typeof f === 'string').slice(0, 4)
     : [];
@@ -628,8 +593,18 @@ function validateResponse(parsed, channel) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// v2.2 — URL SANITIZER (post-Claude)
+// v2.4 — URL SANITIZER (merge-tag-aware)
 // ═══════════════════════════════════════════════════════════════════
+//
+// The booking link from kb-retriever v1.5 is a GHL trigger link merge
+// tag (e.g. `{{trigger_link.QqvhMNyB7YQzHqSNOXHm}}&utm_term=phone_primary`).
+// Merge tags don't have http://, so URL_RX won't match them — they pass
+// through unchanged. But we still need to handle:
+//
+//   1. Markdown wrapping the merge tag → unwrap to bare merge tag
+//   2. Hallucinated bare URLs alongside the merge tag → strip them
+//   3. Multiple merge tags → keep first, strip rest
+//   4. Hallucinated URL with no merge tag in message → replace with canonical
 
 const URL_RX = /https?:\/\/[^\s<>"'`)\]]+/g;
 const MARKDOWN_LINK_RX = /\[([^\]]*)\]\(\s*([^)]+?)\s*\)/g;
@@ -639,37 +614,74 @@ function sanitizeMessageUrls(message, channel, kbPack) {
   let out = message;
 
   const canonicalUrl = kbPack?.booking_context?.booking_url || null;
+  const canonicalIsMergeTag = canonicalUrl && canonicalUrl.startsWith('{{trigger_link.');
   let mutations = [];
 
+  // ─── Pass 1: Unwrap markdown links ──────────────────────────────
+  // [text](url) → bare url (or text if url is bogus)
   out = out.replace(MARKDOWN_LINK_RX, (match, text, url) => {
     mutations.push('markdown_link');
     const trimmedUrl = url.trim().replace(/["']/g, '');
-    if (canonicalUrl) {
-      return canonicalUrl;
+
+    // Markdown wrapping a merge tag → unwrap to bare merge tag
+    if (BARE_MERGE_TAG_RX.test(trimmedUrl)) {
+      return trimmedUrl;
     }
+    // Markdown wrapping a real allowlisted URL → unwrap to bare URL
     if (urlHostAllowed(trimmedUrl)) {
       return trimmedUrl;
     }
+    // Markdown wrapping garbage → replace with canonical or just text
+    if (canonicalUrl) return canonicalUrl;
     return text || '';
   });
 
+  // ─── Pass 2: Detect what's already in the message ───────────────
+  const hasMergeTagAlready = BARE_MERGE_TAG_RX.test(out);
+  let canonicalEmitted = canonicalUrl ? out.includes(canonicalUrl) : false;
+  if (hasMergeTagAlready) canonicalEmitted = true;
+
+  // ─── Pass 3: Replace hallucinated bare URLs ─────────────────────
   out = out.replace(URL_RX, (match) => {
     const cleaned = match.replace(/[)\].,;:]+$/, '');
     if (urlHostAllowed(cleaned)) {
       return cleaned;
     }
     mutations.push('hallucinated_url');
-    return canonicalUrl || '';
+    if (canonicalEmitted) {
+      // Already have a merge tag or canonical — just strip the bad URL
+      return '';
+    }
+    if (canonicalUrl) {
+      canonicalEmitted = true;
+      return canonicalUrl;
+    }
+    return '';
   });
 
+  // ─── Pass 4: Dedup multiple identical canonical strings ─────────
   if (canonicalUrl) {
     const escaped = canonicalUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const dupeRx = new RegExp(`(${escaped})(\\s*${escaped})+`, 'g');
     const before = out;
     out = out.replace(dupeRx, '$1');
-    if (out !== before) mutations.push('deduped_urls');
+    if (out !== before) mutations.push('deduped_canonical');
   }
 
+  // ─── Pass 5: Dedup any merge tags (first wins) ──────────────────
+  // Catches case where canonical has a suffix but model output the
+  // bare tag (or vice versa).
+  let seenTag = false;
+  out = out.replace(MERGE_TAG_RX, (match) => {
+    if (seenTag) {
+      mutations.push('deduped_merge_tag');
+      return '';
+    }
+    seenTag = true;
+    return match;
+  });
+
+  // ─── Pass 6: Whitespace cleanup ─────────────────────────────────
   out = out
     .replace(/[ \t]+/g, ' ')
     .replace(/ +\n/g, '\n')
@@ -677,7 +689,7 @@ function sanitizeMessageUrls(message, channel, kbPack) {
     .trim();
 
   if (mutations.length > 0) {
-    console.warn(`[ResponseGenerator] URL sanitizer applied: ${mutations.join(', ')} — channel=${channel}, canonical=${canonicalUrl ? 'yes' : 'no'}`);
+    console.warn(`[ResponseGenerator] URL sanitizer applied: ${mutations.join(', ')} — channel=${channel}, canonical=${canonicalIsMergeTag ? 'merge_tag' : (canonicalUrl ? 'url' : 'none')}`);
   }
 
   return out;
@@ -712,13 +724,11 @@ function makeShortCircuitResult(classification, channel, triggerMessage) {
 // ═══════════════════════════════════════════════════════════════════
 
 export async function generateResponse(contactId, channel, triggerMessage) {
-  // 1. Build full lead context (always fresh)
   const context = await buildLeadContext(contactId, {
     includeConversation: true,
     skipCache: true,
   });
 
-  // 2. PHASE 1: Classify the inbound
   let classification;
   try {
     classification = await classifyInbound(triggerMessage, {
@@ -741,20 +751,17 @@ export async function generateResponse(contactId, channel, triggerMessage) {
     };
   }
 
-  // ─── PHASE 1 SHORT-CIRCUIT ─────────────────────────────────────
   if (isShortCircuit(classification)) {
     console.log(`[ResponseGenerator] SHORT-CIRCUIT for ${contactId}: ${classification.intent_class} → ${classification.ghl_handoff_tag} (${classification.classification_method})`);
     return makeShortCircuitResult(classification, channel, triggerMessage);
   }
 
-  // 3. PHASE 3: Build KB pack
   const buyerStage    = inferBuyerStage(context);
   const fastTrack     = isHyperactiveBuyer(context);
-  const trafficTemp   = inferTrafficTemperature(context, fastTrack);   // v2.3
+  const trafficTemp   = inferTrafficTemperature(context, fastTrack);
   const windowCount   = inferWindowCount(context);
   const activeEntryTag = extractActiveEntryTag(context);
 
-  // v2.3: surface LP state to kb-retriever for context-aware calendar selection
   const hasExistingAppt = !!context.lp?.appointment_set;
   const lpDisposition   = context.lp?.disposition || null;
 
@@ -769,26 +776,26 @@ export async function generateResponse(contactId, channel, triggerMessage) {
       recommendedArc: context.intelligence?.recommended_story_arc,
       windowCount,
       activeEntryTag,
-      hasExistingAppt,                                  // v2.3
-      lpDisposition,                                    // v2.3
+      hasExistingAppt,
+      lpDisposition,
     });
   } catch (err) {
     console.warn(`[ResponseGenerator] KB pack build failed for ${contactId}: ${err.message} — proceeding without`);
     kbPack = null;
   }
 
-  // 4-5. PHASE 5: Build prompt + call Claude
   const userPrompt = buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack, trafficTemp);
   const raw = await callClaude(userPrompt);
 
-  // 6. Validate
   const validated = validateResponse(raw, channel);
   if (!validated) {
     throw new Error('AI response generation failed: invalid response structure');
   }
 
-  // ─── v2.2: URL SANITIZER (post-Claude) ─────────────────────────
   validated.message = sanitizeMessageUrls(validated.message, channel, kbPack);
+
+  // v2.4: log whether the merge tag actually made it into the final message
+  const mergeTagInMessage = BARE_MERGE_TAG_RX.test(validated.message);
 
   console.log(`[ResponseGenerator] Generated ${channel} for ${contactId}: ` +
     `intent=${classification.intent_class} ` +
@@ -800,6 +807,7 @@ export async function generateResponse(contactId, channel, triggerMessage) {
     `policy=${kbPack?.booking_context?.policy || 'none'} ` +
     `temp=${trafficTemp} ` +
     `fast_track=${fastTrack} ` +
+    `merge_tag_sent=${mergeTagInMessage} ` +
     `frameworks=${(validated.frameworks_applied || []).join('+') || 'none'} ` +
     `(${validated.message.length} chars)`);
 
@@ -811,13 +819,14 @@ export async function generateResponse(contactId, channel, triggerMessage) {
     handler_code: classification.handler_code,
     kb_pack_used: !!kbPack,
     booking_calendar: kbPack?.booking_context?.calendar_name || null,
-    booking_policy: kbPack?.booking_context?.policy || null,        // v2.3
-    user_booking_preference: kbPack?.detected_signals?.user_booking_preference || null, // v2.3
+    booking_policy: kbPack?.booking_context?.policy || null,
+    user_booking_preference: kbPack?.detected_signals?.user_booking_preference || null,
     fast_track: fastTrack,
-    traffic_temperature: trafficTemp,                                 // v2.3
+    traffic_temperature: trafficTemp,
     buyer_stage: buyerStage,
     active_entry_tag: activeEntryTag,
-    has_existing_appt: hasExistingAppt,                               // v2.3
+    has_existing_appt: hasExistingAppt,
+    merge_tag_sent: mergeTagInMessage,                           // v2.4
     ...validated,
   };
 }
