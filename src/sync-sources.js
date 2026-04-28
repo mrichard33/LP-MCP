@@ -28,15 +28,15 @@ export const DEFAULT_SOURCE_MAPPINGS = {
   'Fave Marketing':     { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
   'Porch':              { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
   'Contractor Appointment': { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
-  // 2026-04-27: Reclassified from unmapped/auto-discovered. These are the
-  // real on-site Reece estimate calculator paths. Together they account for
-  // ~2,243 leads previously leaking to entry:other. The "Website Estimate
-  // Calculator" label is the newer/canonical name; "Reecewindows.com" is
-  // the older alias for the same flow; "Estimate Calculator" (Direct Mail)
-  // is a vanity-URL print campaign that lands on the same form.
-  'Reecewindows.com':           { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
-  'Website Estimate Calculator':{ bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
-  'Estimate Calculator':        { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
+  // 2026-04-27: The on-site Estimate Calculator form ("Window Estimator"
+  // GHL source). 71 leads to date with the canonical "Website Estimate
+  // Calculator" subdetail label, plus 1 Direct Mail vanity-URL lead with
+  // the "Estimate Calculator" subdetail. NOT included: Reecewindows.com —
+  // that's a generic "came through the website domain" catch-all (rep-
+  // entered web leads, Contact Us forms, callers citing the URL) and
+  // routes to entry:other.
+  'Website Estimate Calculator': { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
+  'Estimate Calculator':         { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
   'GetTheReferral.Com': { bucket: 'referral',            tag: 'entry:referral' },
   'Job Sign':           { bucket: 'referral',            tag: 'entry:referral' },
   'Customer Referral':  { bucket: 'referral',            tag: 'entry:referral' },
