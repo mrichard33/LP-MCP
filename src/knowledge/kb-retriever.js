@@ -14,7 +14,8 @@
  *   - BOOK / BOOK_NEXTSTEP / BOOK_QUOTE_READY / FAST_TRACK_FRUSTRATED
  *                     → BOOKING CONTEXT injected; skip objection/pricing pulls
  *   - CALLBACK / CALLBACK_CALM
- *                     → BOOKING CONTEXT (Confirmation Call calendar)
+ *                     → BOOKING CONTEXT with IN-HOME as primary, Confirmation
+ *                       Call as fallback only (per Mark's in-home-first policy)
  *   - RECONNECT / NOT_INTERESTED / SEND_INFO / UNCLEAR
  *                     → kb_story_arcs (chosen by buyer_stage)
  *
@@ -22,15 +23,27 @@
  *   - kb_techniques relevant to current buyer_stage
  *   - kb_competitor_intel if a competitor name is detected in message
  *
- * v1.1 — 2026-04-28. Calendar awareness:
+ * v1.2 — 2026-04-28. IN-HOME-FIRST BOOKING POLICY.
+ *   Per Mark's instruction: always try to schedule the Window Estimate
+ *   (or MV for estimate-calculator leads) FIRST. The 15-min Confirmation
+ *   Call is a SECONDARY fallback, only offered after the lead explicitly
+ *   declines the in-home appointment.
+ *
+ *   Changes:
+ *   - resolveBookingContext now ALWAYS returns the in-home calendar as
+ *     primary, including for CALLBACK / CALLBACK_CALM intents.
+ *   - For CALLBACK intents, a `fallback` block is also included with
+ *     the Confirmation Call calendar — but it's marked as fallback-only
+ *     and the guidance text directs the model to lead with in-home.
+ *   - Top-level booking_context fields (calendar_id, etc.) still point
+ *     to the in-home calendar so existing consumers that read those
+ *     fields keep working.
+ *   - formatKbPackForPrompt renders both primary AND fallback when
+ *     present, with explicit hierarchy ("PRIMARY: ..., FALLBACK ONLY: ...").
+ *
+ * v1.1 — Calendar awareness:
  *   - Adds resolveBookingContext({intentClass, activeEntryTag})
- *   - Surfaces correct calendar ID per intent + lead source:
- *     · CALLBACK_CALM / CALLBACK   → Confirmation Call (gFWoSQrlKIdfRbAPV842)
- *     · estimate-calculator entry  → Window Measurement Verification (zEdPmkNccR2ovo3rQAd3)
- *     · default in-home            → Window Estimate (aJj14ONxh1oFyDcQ706O)
- *   - Adds booking_context to kb_pack with calendar_id, visit_type, duration,
- *     guidance ("skip discovery, go to scheduling"), and a booking_url
- *     (pattern overridable via GHL_BOOKING_URL_BASE env var).
+ *   - Surfaces correct calendar ID per intent + lead source
  *
  * v1.0 — Initial implementation.
  */
@@ -42,9 +55,9 @@ import supabase from '../supabase.js';
 // ═══════════════════════════════════════════════════════════════════
 
 export const CALENDAR_IDS = {
-  CONFIRMATION_CALL: 'gFWoSQrlKIdfRbAPV842',  // 1-2min call to confirm details before in-home
-  WINDOW_ESTIMATE:   'aJj14ONxh1oFyDcQ706O',  // Standard 90-min in-home Window Protection Estimate
-  MV:                'zEdPmkNccR2ovo3rQAd3',  // Window Measurement Verification — for estimate calculator leads
+  CONFIRMATION_CALL: 'gFWoSQrlKIdfRbAPV842',  // 1-2min call to confirm details — FALLBACK ONLY
+  WINDOW_ESTIMATE:   'aJj14ONxh1oFyDcQ706O',  // 90-min in-home Window Protection Estimate (DEFAULT)
+  MV:                'zEdPmkNccR2ovo3rQAd3',  // Window Measurement Verification (estimate-calculator leads)
 };
 
 // Override via env so Mark can swap to a custom domain later
@@ -52,31 +65,13 @@ const BOOKING_URL_BASE = (process.env.GHL_BOOKING_URL_BASE || 'https://api.leadc
 
 const calendarUrl = (id) => `${BOOKING_URL_BASE}/${id}`;
 
-/**
- * Resolve the right booking calendar based on intent + lead source.
- *
- * @param {Object} args
- * @param {string} args.intentClass — Classifier output (e.g. 'BOOK_QUOTE_READY')
- * @param {string} [args.activeEntryTag] — Current lead source tag (e.g. 'active-entry:estimate-calculator')
- * @returns {Object|null} BookingContext, or null when not a booking-relevant intent
- */
-export function resolveBookingContext({ intentClass, activeEntryTag } = {}) {
-  // Phone callback intents → Confirmation Call calendar (15min phone slot)
-  if (intentClass === 'CALLBACK' || intentClass === 'CALLBACK_CALM') {
-    return {
-      type:             'phone_call',
-      visit_type:       'phone',
-      calendar_id:      CALENDAR_IDS.CONFIRMATION_CALL,
-      calendar_name:    'Confirmation Call',
-      duration_minutes: 15,
-      booking_url:      calendarUrl(CALENDAR_IDS.CONFIRMATION_CALL),
-      description:      '1-2 minute phone call to confirm details before any in-home estimate',
-      guidance:         'Confirm phone number, offer the call slot. Do NOT pitch in-home yet — that comes after the call.',
-    };
-  }
+// ─── Calendar definitions ────────────────────────────────────────
 
-  // Estimate calculator leads → MV calendar (web-form completers ready for measurement)
-  if (typeof activeEntryTag === 'string' && activeEntryTag === 'active-entry:estimate-calculator') {
+function inHomeCalendar({ activeEntryTag }) {
+  const isEstimateCalculator = typeof activeEntryTag === 'string'
+    && activeEntryTag === 'active-entry:estimate-calculator';
+
+  if (isEstimateCalculator) {
     return {
       type:             'in_home',
       visit_type:       'in_home',
@@ -84,12 +79,10 @@ export function resolveBookingContext({ intentClass, activeEntryTag } = {}) {
       calendar_name:    'Window Measurement Verification',
       duration_minutes: 90,
       booking_url:      calendarUrl(CALENDAR_IDS.MV),
-      description:      'In-home measurement verification — about an hour and a half — for online estimate calculator leads',
-      guidance:         'They already used the online calculator. The in-home is to verify measurements and finalize penny-accurate pricing. Move directly to scheduling — skip discovery.',
+      description:      'In-home measurement verification — about an hour and a half — for online estimate calculator leads. Specialist verifies measurements and finalizes penny-accurate pricing.',
     };
   }
 
-  // Default in-home: standard Window Estimate
   return {
     type:             'in_home',
     visit_type:       'in_home',
@@ -98,7 +91,71 @@ export function resolveBookingContext({ intentClass, activeEntryTag } = {}) {
     duration_minutes: 90,
     booking_url:      calendarUrl(CALENDAR_IDS.WINDOW_ESTIMATE),
     description:      'Standard in-home Window Protection Estimate — about an hour and a half. Specialist measures to Florida code and provides exact pricing valid for 1 year.',
-    guidance:         'Both homeowners should be present. No pressure to decide on the spot. Penny-accurate pricing.',
+  };
+}
+
+const confirmationCallCalendar = {
+  type:             'phone_call',
+  visit_type:       'phone',
+  calendar_id:      CALENDAR_IDS.CONFIRMATION_CALL,
+  calendar_name:    'Confirmation Call',
+  duration_minutes: 15,
+  booking_url:      calendarUrl(CALENDAR_IDS.CONFIRMATION_CALL),
+  description:      '1-2 minute phone call to confirm details. Used as a fallback when a lead explicitly declines the in-home estimate.',
+};
+
+/**
+ * Resolve the right booking calendar based on intent + lead source.
+ *
+ * IN-HOME-FIRST POLICY (per Mark): The in-home Window Estimate (or MV
+ * for estimate-calculator leads) is ALWAYS the primary offering. The
+ * 15-min Confirmation Call is a SECONDARY fallback and is only offered
+ * after the lead explicitly declines the in-home appointment.
+ *
+ * Returns booking_context with:
+ *   - Top-level fields (calendar_id, calendar_name, etc.) → primary in-home
+ *   - primary: { ...in-home calendar }
+ *   - fallback: { ...confirmation-call calendar } — only present for
+ *               CALLBACK intents; null otherwise
+ *   - policy: 'in_home_only' | 'in_home_first_call_fallback'
+ *   - guidance: instruction text for the model
+ *
+ * @param {Object} args
+ * @param {string} args.intentClass — Classifier output (e.g. 'BOOK_QUOTE_READY')
+ * @param {string} [args.activeEntryTag] — Current lead source tag (e.g. 'active-entry:estimate-calculator')
+ * @returns {Object|null} BookingContext, or null when not a booking-relevant intent
+ */
+export function resolveBookingContext({ intentClass, activeEntryTag } = {}) {
+  const inHome = inHomeCalendar({ activeEntryTag });
+  const isCallback = intentClass === 'CALLBACK' || intentClass === 'CALLBACK_CALM';
+
+  // Common base — top-level fields point to the IN-HOME calendar so
+  // existing readers of booking_context.calendar_id etc. keep working.
+  const base = {
+    ...inHome,
+    primary: inHome,
+  };
+
+  if (isCallback) {
+    return {
+      ...base,
+      policy:   'in_home_first_call_fallback',
+      fallback: confirmationCallCalendar,
+      guidance: [
+        'The lead asked for a phone call. Per Reece policy, the in-home estimate is our PRIMARY offering and the 15-min phone call is a SECONDARY fallback.',
+        'FIRST: Acknowledge their preference for a call, then OFFER THE IN-HOME APPOINTMENT — give two specific in-home slots.',
+        'Frame the in-home as the better option: specialist measures to Florida code on-site, you get penny-accurate pricing valid for 1 year, both homeowners can see the actual product.',
+        'ONLY mention the 15-min Confirmation Call as a fallback option if the lead explicitly declines the in-home OR insists on a phone-first approach. Do NOT lead with the call.',
+      ].join(' '),
+    };
+  }
+
+  // BOOK / BOOK_NEXTSTEP / BOOK_QUOTE_READY / FAST_TRACK_FRUSTRATED — in-home only
+  return {
+    ...base,
+    policy:   'in_home_only',
+    fallback: null,
+    guidance: 'Move directly to scheduling — skip discovery, skip re-pitching value, skip mentioning financing or specific pricing. Acknowledge intent in ONE short line, then offer two specific in-home slots. Both homeowners should be present. No pressure to decide on the spot.',
   };
 }
 
@@ -304,7 +361,9 @@ function detectCompetitorMention(messageText) {
 
 const OBJECTION_KEYWORDS = {
   price:      ['too expensive', 'expensive', "can't afford", 'budget', 'cost too much', 'pricey', 'cheaper'],
-  timing:     ['not now', 'later', 'next year', 'wait', 'busy', 'in a few months', 'after', 'before'],
+  timing:     ['not now', 'later', 'next year', 'wait', 'busy', 'in a few months', 'after', 'before',
+               'good time', 'bad time', 'just had a baby', 'newborn', 'family emergency',
+               'medical', 'surgery', 'recovering'],
   spouse:     ['spouse', 'husband', 'wife', 'partner', 'talk to', 'discuss with'],
   trust:      ['been burned', 'scam', 'don\'t trust', 'reviews', 'reputation', 'bbb'],
   competitor: ['other quote', 'another company', 'comparing', 'shopping around', 'other estimate'],
@@ -400,6 +459,15 @@ export async function buildKbPack(params) {
           result.primary_arc = await getStoryArc(result.objection_script.story_arc);
         }
       }
+      // v1.2: For pre-demo timing objections (e.g. "just had a baby"), still
+      // surface booking context so the model can offer a softer reschedule.
+      // This is critical because pre-demo timing objections SHOULD route to
+      // W5.2 Appointment Rescue, NOT W9.0 Objection Handler. Including
+      // booking_context here gives the model the calendar it needs to gently
+      // reschedule rather than capitulate.
+      if (detectedObjection === 'timing') {
+        result.booking_context = resolveBookingContext({ intentClass, activeEntryTag });
+      }
       break;
 
     case 'PRICING':
@@ -411,7 +479,7 @@ export async function buildKbPack(params) {
       result.faqs = await searchFaqs(messageText, channel, 3);
       break;
 
-    // ─── v1.1: Buying-signal intents — surface booking context ──────
+    // ─── v1.1: Buying-signal + callback intents — surface booking context ──
     case 'BOOK':
     case 'BOOK_NEXTSTEP':
     case 'BOOK_QUOTE_READY':
@@ -474,22 +542,39 @@ export function formatKbPackForPrompt(pack) {
     lines.push('');
   }
 
-  // ─── BOOKING CONTEXT — appears only for buying-signal/callback intents ──
+  // ─── BOOKING CONTEXT — IN-HOME-FIRST policy (v1.2) ────────────────────
   if (pack.booking_context) {
     const b = pack.booking_context;
     const isBuyingSignal = BUYING_SIGNAL_INTENTS.has(pack.intent_class);
     const isCallback = CALLBACK_INTENTS.has(pack.intent_class);
+    const isTimingObjection = pack.intent_class === 'OBJECTION'
+      && pack.detected_signals?.objection === 'timing';
 
-    lines.push('BOOKING CONTEXT (use this calendar in the response):');
-    lines.push(`  Calendar: ${b.calendar_name} (${b.duration_minutes}min, ${b.visit_type})`);
-    lines.push(`  Calendar ID: ${b.calendar_id}`);
-    lines.push(`  Booking URL: ${b.booking_url}`);
-    lines.push(`  Description: ${b.description}`);
+    lines.push('BOOKING CONTEXT — IN-HOME-FIRST POLICY:');
+    lines.push(`  Policy: ${b.policy || 'in_home_only'}`);
+
+    // Primary (always in-home)
+    const primary = b.primary || b;
+    lines.push(`  PRIMARY (default offering): ${primary.calendar_name} — ${primary.duration_minutes}min ${primary.visit_type}`);
+    lines.push(`    Calendar ID: ${primary.calendar_id}`);
+    lines.push(`    Booking URL: ${primary.booking_url}`);
+    lines.push(`    Description: ${primary.description}`);
+
+    // Fallback (only present for CALLBACK)
+    if (b.fallback) {
+      lines.push(`  FALLBACK ONLY (use only if lead explicitly declines in-home): ${b.fallback.calendar_name} — ${b.fallback.duration_minutes}min ${b.fallback.visit_type}`);
+      lines.push(`    Calendar ID: ${b.fallback.calendar_id}`);
+      lines.push(`    Booking URL: ${b.fallback.booking_url}`);
+    }
+
     lines.push(`  Guidance: ${b.guidance}`);
+
     if (isBuyingSignal) {
-      lines.push(`  ⚡ BUYING-SIGNAL HANDLING: Skip discovery questions. Skip re-pitching value. Skip mentioning financing or pricing. Acknowledge their intent in ONE short line, then offer two specific calendar slots from this calendar. Match urgency.`);
+      lines.push(`  ⚡ BUYING-SIGNAL HANDLING: Skip discovery, skip re-pitching value, skip mentioning financing. Acknowledge their intent in ONE short line, then offer two specific in-home slots from the PRIMARY calendar. Match their urgency.`);
     } else if (isCallback) {
-      lines.push(`  ☎️ CALLBACK HANDLING: Confirm the lead's phone number, offer one specific call slot, do not try to keep them in text. Hand off after confirming.`);
+      lines.push(`  ☎️ CALLBACK HANDLING: The lead asked for a phone call. Per Reece policy, the in-home Window Estimate is our PRIMARY offering — try to schedule THAT first. Acknowledge the call request, then offer two specific in-home slots. Only offer the 15-min Confirmation Call as a fallback if they explicitly decline the in-home or insist on a phone-first approach. Do NOT lead with the call.`);
+    } else if (isTimingObjection) {
+      lines.push(`  ⏳ TIMING OBJECTION HANDLING (PRE-DEMO): Lead has a real life situation (new baby, surgery, family emergency, etc.). Do NOT push hard. Acknowledge with empathy. Offer to reschedule to a future date that works better for them — keep it open-ended ("when would be a better time in the next month or two?"). Do NOT route to W9.0 (post-demo objection sequence) — this is a pre-demo reschedule, not a closing objection.`);
     }
     lines.push('');
   }
