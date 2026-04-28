@@ -1,30 +1,21 @@
 /**
  * Context Builder — src/context-builder.js
  *
- * v2.4 — PHASE 6 FRESHNESS HARDENING
- *   - Default in-memory cache TTL dropped 5min → 60s (env CONTEXT_CACHE_TTL_MS)
- *   - bumpContactCache(contactId) export so action handlers can invalidate
- *     after tag/field changes (eliminates 5-min stale window)
- *   - LP staleness flagging: lp_data_stale + lp_data_age_minutes computed
- *     against synced_at + LP_DATA_STALE_THRESHOLD_MIN env (default 15)
- *   - Pipeline stage ID resolved to human-readable name via in-memory
- *     pipeline cache (was leaking raw UUIDs into LLM prompts)
- *   - Lost reason from GHL custom field surfaced into context.lp.lost_reason
- *   - Recent rep notes now returned untruncated (response generator chooses
- *     truncation budget based on token policy)
+ * v2.5 — 2026-04-28. EXPOSE CONTACT ADDRESS FIELDS for booking URL pre-fill.
+ *   Per Mark: agentic bot must send GHL trigger links with UTMs AND
+ *   pre-filled contact data (fullName, streetAddress, city, state,
+ *   postalCode, phone). The bot sends via conversation API where GHL
+ *   merge tags do NOT render, so we substitute server-side.
  *
- * v2.3 — PROSPECT ID AS PRIMARY LP LOOKUP
- *   LP Prospect ID is the most reliable identifier — stable, never changes,
- *   not affected by the in1_id/lds_id confusion. Used as the PRIMARY LP
- *   lookup path with ghl_contact_id and lp_lead_id as fallbacks.
+ *   Changes:
+ *   - fetchGHLContact() now captures address1, city, state, postalCode
+ *     from the GHL contact API response
+ *   - context.lead exposes: address1, city, state, postal_code
+ *     (snake_case to match other lead fields)
  *
- *   LP Lead Resolution Chain:
- *     1. LP Prospect ID from GHL custom field → lp_leads.lp_prospect_id (PRIMARY)
- *     2. lp_leads.ghl_contact_id (fast when linkage exists)
- *     3. LP Lead ID from GHL custom field → lp_leads.lp_lead_id (may have in1_id)
- *     4. LP Disposition from GHL custom field → direct injection (minimal)
- *   All successful lookups backfill ghl_contact_id for self-healing.
- *
+ * v2.4 — Phase 6 freshness hardening (cache TTL, LP staleness, pipeline
+ *        stage name resolution, lost reason, untruncated notes).
+ * v2.3 — Prospect ID as primary LP lookup.
  * v2.0 — Notes/calls from normalized lp_notes + lp_call_logs tables.
  */
 
@@ -37,14 +28,13 @@ const LP_DATA_STALE_THRESHOLD_MIN = parseInt(process.env.LP_DATA_STALE_THRESHOLD
 const PIPELINE_CACHE_TTL_MS = parseInt(process.env.PIPELINE_CACHE_TTL_MS || '900000', 10); // 15 min — pipelines change rarely
 
 // GHL Custom Field IDs
-const CF_LP_LEAD_ID = 'GmAVmW6V9sekD7pVONKr';       // May contain in1_id — tertiary fallback
-const CF_LP_INBOUND_ID = '3YMxheIlPyhACB8zyc3W';     // LP Inbound Lead ID (temporary, queue only — never use for lookups)
-const CF_LP_DISPOSITION = 'ZZCpHTthFMaVc3g5vMAS';     // LP Disposition code
-const CF_LP_PROSPECT_ID = 'ZRQAVrzhtzApzLlHmT87';    // LP Prospect ID — PRIMARY identifier
-const CF_LP_LOST_REASON = 'I9CbRV0dKMfwaSlge9uU';    // P1/P3 Loss Reason (v2.4)
+const CF_LP_LEAD_ID = 'GmAVmW6V9sekD7pVONKr';
+const CF_LP_INBOUND_ID = '3YMxheIlPyhACB8zyc3W';
+const CF_LP_DISPOSITION = 'ZZCpHTthFMaVc3g5vMAS';
+const CF_LP_PROSPECT_ID = 'ZRQAVrzhtzApzLlHmT87';
+const CF_LP_LOST_REASON = 'I9CbRV0dKMfwaSlge9uU';
 
 // LP dispositions where stale data is high-risk (active deals).
-// Static data (Sold, ClosedLost, NoSale long-tail) is fine to cache longer.
 const LP_ACTIVE_DISPOSITIONS = new Set([
   'Issue', 'Data', 'BO', '1Leg', 'NIS', 'NIS2', 'NoHome',
   'CXL', 'PNQ', 'NoRehash', 'FDNS', 'OPPFDN',
@@ -80,19 +70,13 @@ export function invalidateContext(contactId) {
   contextCache.delete(contactId);
 }
 
-/**
- * Public alias for action handlers to call after tag/field changes.
- * Action executor should call this whenever a write happens that would
- * invalidate the context (tag add/remove, custom field update, opportunity
- * stage change).
- */
 export function bumpContactCache(contactId) {
   if (!contactId) return;
   contextCache.delete(contactId);
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// PIPELINE STAGE NAME CACHE (v2.4)
+// PIPELINE STAGE NAME CACHE
 // ═══════════════════════════════════════════════════════════════════
 
 let pipelineCache = null;
@@ -109,7 +93,6 @@ async function loadPipelineStages() {
   const stageMap = new Map();
   for (const pipe of pipelines) {
     for (const stage of (pipe.stages || [])) {
-      // Key by stage ID for direct lookup
       stageMap.set(stage.id, {
         stage_id: stage.id,
         stage_name: stage.name,
@@ -183,8 +166,16 @@ async function fetchGHLContact(contactId) {
   return {
     id: c.id,
     name: [c.firstName, c.lastName].filter(Boolean).join(' ') || c.name || 'Unknown',
+    firstName: c.firstName || null,
+    lastName: c.lastName || null,
     email: c.email || null,
     phone: c.phone || null,
+    // v2.5: address fields for booking URL pre-fill
+    address1: c.address1 || null,
+    city: c.city || null,
+    state: c.state || null,
+    postalCode: c.postalCode || c.postal_code || null,
+    country: c.country || null,
     tags: c.tags || [],
     leadScore: extractLeadScore(c),
     customFields: c.customFields || c.customField || [],
@@ -242,13 +233,8 @@ async function fetchLeadIntelligence(contactId) {
   return data;
 }
 
-// v2.4: Added synced_at for staleness detection
 const LP_LEAD_COLUMNS = 'id, lp_lead_id, lp_prospect_id, first_name, last_name, disposition_code, disposition_label, rep_name, promoter_name, lead_source, lead_source_detail, call_count, last_call_date, appointment_set, appointment_date, demo_completed, demo_date, days_to_demo, closed_won, job_value, created_at_lp, ghl_contact_id, synced_at';
 
-/**
- * Backfill ghl_contact_id on an LP lead row (fire-and-forget).
- * Self-healing: future lookups via ghl_contact_id will work without fallback.
- */
 function backfillGhlContactId(lpLeadRow, ghlContactId) {
   if (!lpLeadRow || !ghlContactId || lpLeadRow.ghl_contact_id) return;
   supabase.from('lp_leads')
@@ -260,11 +246,6 @@ function backfillGhlContactId(lpLeadRow, ghlContactId) {
     });
 }
 
-/**
- * PRIMARY: LP lead lookup via Prospect ID.
- * Most reliable — Prospect ID is stable, never changes, not affected by in1_id bug.
- * One prospect can have multiple leads — we take the most recently synced one.
- */
 async function fetchLPLeadByProspectId(prospectId) {
   if (!prospectId) return null;
   try {
@@ -283,10 +264,6 @@ async function fetchLPLeadByProspectId(prospectId) {
   }
 }
 
-/**
- * SECONDARY: LP lead lookup via ghl_contact_id direct linkage.
- * Fast when set correctly, but linkage is often broken (null).
- */
 async function fetchLPLeadByGhlContactId(contactId) {
   const { data, error } = await supabase
     .from('lp_leads')
@@ -302,10 +279,6 @@ async function fetchLPLeadByGhlContactId(contactId) {
   return data;
 }
 
-/**
- * TERTIARY: LP lead lookup via lp_lead_id from GHL custom field.
- * WARNING: This field may contain an in1_id (inbound queue ID) instead of lds_id.
- */
 async function fetchLPLeadByLdsId(lpLeadId) {
   if (!lpLeadId) return null;
   try {
@@ -411,10 +384,6 @@ function calculateDaysInStage(opportunity) {
   return Math.floor((new Date() - new Date(opportunity.lastStatusChangeAt)) / (1000 * 60 * 60 * 24));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// LP STALENESS HELPER (v2.4)
-// ═══════════════════════════════════════════════════════════════════
-
 function calcLpStaleness(lpLead) {
   if (!lpLead?.synced_at) {
     return { ageMinutes: null, isStale: false, isStaleActive: false };
@@ -438,7 +407,6 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     if (cached) return cached;
   }
 
-  // Step 1: Fetch GHL contact + intelligence + opportunity in parallel
   const [ghlContact, intelligence, opportunity] = await Promise.all([
     fetchGHLContact(ghlContactId),
     fetchLeadIntelligence(ghlContactId),
@@ -446,11 +414,6 @@ export async function buildLeadContext(ghlContactId, options = {}) {
   ]);
 
   // ─── Step 2: LP Lead Resolution Chain ──────────────────────────
-  // Priority 1: Prospect ID (most reliable, from GHL custom field)
-  // Priority 2: ghl_contact_id direct linkage (fast when set)
-  // Priority 3: LP Lead ID from GHL custom field (may be in1_id)
-  // Priority 4: Disposition from GHL custom field (minimal)
-
   let lpLead = null;
   let lpResolveMethod = null;
   let ghlCustomFieldDisposition = null;
@@ -460,12 +423,10 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     ? getCustomFieldValue(ghlContact.customFields, CF_LP_PROSPECT_ID)
     : null;
 
-  // v2.4: Pull lost reason from GHL custom field upfront (independent of LP match)
   if (ghlContact?.customFields) {
     ghlCustomFieldLostReason = getCustomFieldValue(ghlContact.customFields, CF_LP_LOST_REASON);
   }
 
-  // Priority 1: Prospect ID
   if (cfProspectId) {
     lpLead = await fetchLPLeadByProspectId(cfProspectId);
     if (lpLead) {
@@ -475,7 +436,6 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     }
   }
 
-  // Priority 2: ghl_contact_id
   if (!lpLead) {
     lpLead = await fetchLPLeadByGhlContactId(ghlContactId);
     if (lpLead) {
@@ -484,7 +444,6 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     }
   }
 
-  // Priority 3: LP Lead ID from GHL custom field
   if (!lpLead && ghlContact?.customFields) {
     const cfLpLeadId = getCustomFieldValue(ghlContact.customFields, CF_LP_LEAD_ID);
     if (cfLpLeadId) {
@@ -498,7 +457,6 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     }
   }
 
-  // Priority 4: Disposition from GHL custom field (minimal — no LP row)
   if (!lpLead && ghlContact?.customFields) {
     ghlCustomFieldDisposition = getCustomFieldValue(ghlContact.customFields, CF_LP_DISPOSITION);
     if (ghlCustomFieldDisposition) {
@@ -511,7 +469,6 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     console.log(`[ContextBuilder] No LP data found for ${ghlContactId}`);
   }
 
-  // ─── Step 3: Fetch LP notes, calls, conversation, and pipeline stage in parallel ───
   const lpLeadId = lpLead?.lp_lead_id || null;
   const [conversation, lpNotes, lpCalls, pipelineStageInfo] = await Promise.all([
     (includeConversation && ghlContact) ? fetchConversation(ghlContactId, 10) : [],
@@ -529,8 +486,16 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     lead: {
       ghl_contact_id: ghlContactId,
       name: ghlContact?.name || lpName || 'Unknown',
+      first_name: ghlContact?.firstName || lpLead?.first_name || null,    // v2.5
+      last_name: ghlContact?.lastName || lpLead?.last_name || null,        // v2.5
       email: ghlContact?.email || null,
       phone: ghlContact?.phone || null,
+      // v2.5: address fields for booking URL pre-fill
+      address1: ghlContact?.address1 || null,
+      city: ghlContact?.city || null,
+      state: ghlContact?.state || null,
+      postal_code: ghlContact?.postalCode || null,
+      country: ghlContact?.country || null,
       entry_source: parseEntrySource(tags) || intelligence?.entry_source || null,
       current_tags: tags,
       current_stage_tag: parseStageTag(tags),
@@ -547,7 +512,7 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       pipeline_id: opportunity?.pipelineId || null,
       pipeline_name: pipelineStageInfo?.pipeline_name || null,
       stage_id: opportunity?.pipelineStageId || null,
-      stage_name: pipelineStageInfo?.stage_name || null,           // v2.4: human-readable
+      stage_name: pipelineStageInfo?.stage_name || null,
       status: opportunity?.status || null,
       value: opportunity?.value || 0,
       days_in_stage: daysInStage,
@@ -573,13 +538,13 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       job_value: lpLead?.job_value || null,
       call_count: lpLead?.call_count || 0,
       last_call_date: lpLead?.last_call_date || null,
-      lost_reason: ghlCustomFieldLostReason || null,                 // v2.4
+      lost_reason: ghlCustomFieldLostReason || null,
       notes: lpNotes,
       recent_calls: lpCalls,
-      synced_at: lpLead?.synced_at || null,                           // v2.4
-      data_age_minutes: staleness.ageMinutes,                         // v2.4
-      data_stale: staleness.isStale,                                  // v2.4
-      data_stale_active: staleness.isStaleActive,                     // v2.4 (high-risk: stale on active dispo)
+      synced_at: lpLead?.synced_at || null,
+      data_age_minutes: staleness.ageMinutes,
+      data_stale: staleness.isStale,
+      data_stale_active: staleness.isStaleActive,
       _resolve_method: lpResolveMethod,
       _ghl_custom_field_disposition: ghlCustomFieldDisposition,
     },
@@ -616,7 +581,7 @@ export async function buildLeadContext(ghlContactId, options = {}) {
 
     meta: {
       context_built_at: new Date().toISOString(),
-      context_builder_version: '2.4',
+      context_builder_version: '2.5',
       cache_ttl_ms: CONTEXT_CACHE_TTL_MS,
       data_sources: {
         ghl_contact: !!ghlContact,
@@ -629,6 +594,7 @@ export async function buildLeadContext(ghlContactId, options = {}) {
         opportunity: !!opportunity,
         pipeline_stage_resolved: !!pipelineStageInfo,
         conversation: conversation.length > 0,
+        contact_address_present: !!(ghlContact?.address1),    // v2.5
       },
       warnings: [
         ...(staleness.isStaleActive ? [`lp_data_stale_active:${staleness.ageMinutes}min`] : []),
@@ -699,7 +665,6 @@ export function registerContextBuilderRoutes(app) {
     });
   });
 
-  // v2.4: cache invalidation endpoint for n8n flows after tag/field writes
   app.post('/n8n/lead-intelligence/bump-cache', async (req, res) => {
     const contactId = req.body?.contactId || req.query?.contactId;
     if (!contactId) return res.status(400).json({ error: 'contactId required' });
