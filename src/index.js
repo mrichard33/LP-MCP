@@ -46,11 +46,15 @@ import { registerImeRoutes, startImeWorkers } from './ime/index.js';
 // ─── Admin ──────────────────────────────────────────────────────
 import { runEmailBackfill } from './admin/email-backfill.js';
 import { registerEmailCleanupRoutes } from './admin/email-cleanup.js';
+import {
+  registerDataFreshnessRoutes,
+  startDataFreshnessMonitorScheduler,
+} from './admin/data-freshness.js';
 
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 const FIELD_SYNC_INTERVAL_MS = 15 * 60 * 1000;
-const SERVER_VERSION = '6.4.0';
+const SERVER_VERSION = '6.5.0';
 
 const app = express();
 app.use(express.json());
@@ -204,6 +208,13 @@ app.get('/health', (req, res) => {
       auto_reject_send_message_after_hours: 4,
       interval_minutes: 15,
       kill_switch_env: 'APPROVAL_ESCALATION_DISABLED',
+    },
+    data_freshness: {
+      view: 'GET /n8n/admin/freshness',
+      check: 'POST /n8n/admin/freshness-check',
+      sync_probe: 'GET /n8n/admin/sync-probe?days=3',
+      check_interval_min: parseInt(process.env.FRESHNESS_CHECK_INTERVAL_MIN || '30', 10),
+      alert_dedup_hours: parseInt(process.env.FRESHNESS_ALERT_DEDUP_HOURS || '6', 10),
     },
     rest_api: {
       prospect: 'GET /api/prospects/:prospectId',
@@ -379,6 +390,11 @@ app.post('/admin/email-backfill', async (req, res) => {
 });
 registerEmailCleanupRoutes(app);
 
+// Data freshness monitor — auto-detects stale tables + sync watermark issues.
+// Fires GroupMe alerts on stale-data detection (with dedup). Apply sql/015
+// before relying on the log/dedup features.
+registerDataFreshnessRoutes(app);
+
 app.listen(PORT, async () => {
   console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
   console.log(`n8n APIs:     POST /n8n/enrich-lead | /n8n/refresh-token | /n8n/prospect-lookup | /n8n/time-to-appointment`);
@@ -390,6 +406,7 @@ app.listen(PORT, async () => {
   console.log(`KB Ingest:    POST /n8n/kb/ingest | /n8n/kb/clear-source | GET /n8n/kb/sources`);
   console.log(`Pause Sweep:  POST /n8n/pause-workflow/sweep (7d fizzle, 15min interval)`);
   console.log(`Approval Esc: POST /n8n/approval-escalation/sweep (30min/60min/4h tiers, 15min interval)`);
+  console.log(`Freshness:    GET /n8n/admin/freshness | POST /n8n/admin/freshness-check | GET /n8n/admin/sync-probe`);
   console.log(`REST API:     GET /api/prospects/:id | /api/leads/:id | /api/search | /api/lead-summary/:contactId`);
   console.log(`GroupMe:      POST /webhook/groupme | POST /groupme/send | GET /groupme/pending`);
   console.log(`LP Sync:      POST /webhook/ghl/set-lp-appointment`);
@@ -403,6 +420,7 @@ app.listen(PORT, async () => {
   startImeWorkers();
   startPauseWorkflowSweepScheduler();
   startApprovalEscalationScheduler();
+  startDataFreshnessMonitorScheduler();
   setTimeout(() => {
     setTimeout(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, 120000);
     setInterval(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, FIELD_SYNC_INTERVAL_MS);
