@@ -21,6 +21,8 @@ import { registerBehavioralEmitterRoutes } from './behavioral-emitter.js';
 import { registerMessageAnalyzerRoutes } from './message-analyzer.js';
 // ─── Layer 3.5: Intent Scoring + Conversion Engine ───────────────
 import { registerIntentScorerRoutes } from './intent-scorer.js';
+// ─── Phase 4: KB Vector Ingestion (agentic bot knowledge layer) ──
+import { registerKbIngestionRoutes } from './knowledge/ingest-embeddings.js';
 // ─── Pause-Workflow Fizzle Sweep (framework: HOT1 / MOMENTUM ACT-5) ───
 import {
   registerPauseWorkflowSweepRoutes,
@@ -48,6 +50,7 @@ import { registerEmailCleanupRoutes } from './admin/email-cleanup.js';
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 const FIELD_SYNC_INTERVAL_MS = 15 * 60 * 1000;
+const SERVER_VERSION = '6.4.0';
 
 const app = express();
 app.use(express.json());
@@ -91,7 +94,6 @@ async function runMigrations() {
       )`
     });
     if (error) {
-      // Fallback: try direct insert to test if table exists
       const { error: testErr } = await supabase.from('groupme_approval_requests').select('id').limit(1);
       if (testErr && testErr.code === '42P01') {
         console.warn('[Migration] groupme_approval_requests table missing — please create manually in Supabase SQL editor');
@@ -107,14 +109,14 @@ async function runMigrations() {
 }
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', server: 'lp-mcp-server', version: '6.3.0', port: PORT });
+  res.json({ status: 'ok', server: 'lp-mcp-server', version: SERVER_VERSION, port: PORT });
 });
 
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     server: 'lp-mcp-server',
-    version: '6.3.0',
+    version: SERVER_VERSION,
     uptime: process.uptime(),
     active_sessions: Object.keys(streamableSessions).length,
     lp_config: {
@@ -157,6 +159,7 @@ app.get('/health', (req, res) => {
       context: 'GET /n8n/lead-intelligence/context?contactId=...',
       intelligence: 'GET /n8n/lead-intelligence/intelligence?contactId=...',
       cache_stats: 'GET /n8n/lead-intelligence/cache-stats',
+      bump_cache: 'POST /n8n/lead-intelligence/bump-cache',
       analyze_pending: 'POST /n8n/analyze-pending-replies',
       analyze_manual: 'POST /n8n/analyze-message',
       analyzer_status: 'GET /n8n/analyzer-status',
@@ -174,6 +177,20 @@ app.get('/health', (req, res) => {
       score_contact: 'POST /n8n/intent/score',
       stall_sweep: 'POST /n8n/intent/sweep',
       breakdown: 'GET /n8n/intent/breakdown?contactId=...',
+    },
+    knowledge_base: {
+      ingest: 'POST /n8n/kb/ingest',
+      clear_source: 'POST /n8n/kb/clear-source',
+      sources: 'GET /n8n/kb/sources',
+      openai_key: process.env.OPENAI_API_KEY ? 'configured' : 'MISSING',
+      embedding_model: process.env.OPENAI_EMBEDDING_MODEL || 'text-embedding-3-small',
+    },
+    response_generator: {
+      anthropic_key: process.env.ANTHROPIC_API_KEY ? 'configured' : 'MISSING',
+      send_primary_path: process.env.GHL_SEND_PRIMARY_PATH || 'webhook',
+      send_webhook_url: process.env.GHL_SEND_MESSAGE_WEBHOOK_URL ? 'configured' : 'MISSING',
+      send_sms_via_webhook: (process.env.GHL_SEND_SMS_VIA_WEBHOOK || 'true').toLowerCase() !== 'false',
+      send_email_via_webhook: (process.env.GHL_SEND_EMAIL_VIA_WEBHOOK || 'true').toLowerCase() !== 'false',
     },
     pause_workflow: {
       sweep: 'POST /n8n/pause-workflow/sweep',
@@ -216,7 +233,7 @@ function isInitializeRequest(body) {
 
 function createMCPSession() {
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID() });
-  const sessionServer = new McpServer({ name: 'lp-mcp-server', version: '6.3.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
+  const sessionServer = new McpServer({ name: 'lp-mcp-server', version: SERVER_VERSION, description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
   registerAllTools(sessionServer);
   return { transport, server: sessionServer };
 }
@@ -248,7 +265,7 @@ app.delete('/mcp', authenticate, async (req, res) => { const s = req.headers['mc
 const sseSessions = {};
 app.get('/sse', authenticate, async (req, res) => {
   const transport = new SSEServerTransport('/messages', res);
-  const ss = new McpServer({ name: 'lp-mcp-server', version: '6.3.0', description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
+  const ss = new McpServer({ name: 'lp-mcp-server', version: SERVER_VERSION, description: 'Lead Perfection MCP Server — Reece Windows & Doors Revenue Intelligence' });
   registerAllTools(ss); sseSessions[transport.sessionId] = { transport, server: ss };
   res.on('close', () => { delete sseSessions[transport.sessionId]; }); await ss.connect(transport);
 });
@@ -313,6 +330,12 @@ registerMessageAnalyzerRoutes(app);
 // ─── Layer 3.5: Intent Scoring + Conversion Engine ───────────────
 registerIntentScorerRoutes(app);
 
+// ─── Phase 4: KB Vector Ingestion (agentic bot knowledge layer) ──
+// POST /n8n/kb/ingest        — ingest text into kb_embeddings
+// POST /n8n/kb/clear-source  — soft-delete chunks for a source_doc
+// GET  /n8n/kb/sources       — list ingested sources with counts
+registerKbIngestionRoutes(app);
+
 // ─── Pause-Workflow Fizzle Sweep (framework: HOT1 / MOMENTUM ACT-5) ───
 // Releases pause-workflow tag after 7d of customer silence so paused
 // drips resume from where they left off. Pairs with momentum-firing
@@ -338,13 +361,6 @@ registerGroupMeRoutes(app);
 registerLPAppointmentSyncRoutes(app);
 
 // ─── Workflow Completion (tag-based self-enrichment) ─────────────
-// Pairs with /webhook/ghl/workflow in behavioral-emitter.js. The /workflow
-// path is the older, payload-based handler (requires workflowId in body —
-// none of the current 61 GHL webhook steps populate the body, so every
-// emitted event has workflow_id: null and is useless for analytics). The
-// /workflow-tag path here is the replacement: the GHL step sends only
-// {contactId}, this handler self-enriches by reading completed:wXX tags
-// from the GHL API and resolves them via the local TAG_TO_WORKFLOW map.
 registerWorkflowCompletionRoutes(app);
 
 // ─── IME MIC Integration (Sam's Club Construction leads) ─────────
@@ -364,13 +380,14 @@ app.post('/admin/email-backfill', async (req, res) => {
 registerEmailCleanupRoutes(app);
 
 app.listen(PORT, async () => {
-  console.log(`LP MCP Server v6.3.0 running on port ${PORT}`);
+  console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
   console.log(`n8n APIs:     POST /n8n/enrich-lead | /n8n/refresh-token | /n8n/prospect-lookup | /n8n/time-to-appointment`);
   console.log(`Avatar APIs:  POST /n8n/avatar/score | /parse-gpt | /unified-inputs | /pick-best | /build-ghl | /build-notion`);
   console.log(`Decision:     POST /n8n/decision-engine/process | /execute | GET /status | /execution-stats`);
   console.log(`Layer 3:      POST /webhook/ghl/{reply,appointment,engagement,lead-score,workflow,workflow-tag}`);
   console.log(`Intelligence: GET /n8n/lead-intelligence/context | POST /n8n/analyze-pending-replies | /n8n/analyze-message`);
   console.log(`Intent:       POST /n8n/intent/score | /n8n/intent/sweep | GET /n8n/intent/breakdown`);
+  console.log(`KB Ingest:    POST /n8n/kb/ingest | /n8n/kb/clear-source | GET /n8n/kb/sources`);
   console.log(`Pause Sweep:  POST /n8n/pause-workflow/sweep (7d fizzle, 15min interval)`);
   console.log(`Approval Esc: POST /n8n/approval-escalation/sweep (30min/60min/4h tiers, 15min interval)`);
   console.log(`REST API:     GET /api/prospects/:id | /api/leads/:id | /api/search | /api/lead-summary/:contactId`);
