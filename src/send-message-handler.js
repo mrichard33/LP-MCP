@@ -4,59 +4,40 @@
  * Agentic Responder action handler. Sends SMS or email to contacts
  * via the GHL Conversations API (in-thread) with webhook fallback.
  *
+ * v3.1 — Short-circuit handoff support for compliance gates.
+ *   When response-generator returns short_circuit=true (compliance gate
+ *   fired), this handler applies the GHL handoff tag (e.g. 'hdl:stop'),
+ *   suppresses the message send, optionally adds 'suppress-automation'
+ *   for disqualifiers, invalidates the context cache, and notifies
+ *   GroupMe. The actual response text lives in GHL workflows that
+ *   listen on the hdl:* tags.
+ *
+ * v3.0 — Conversation opt-in gate replaces bot-session heuristic.
+ *   - stop-bot  = "do not have a conversation with this lead, period"
+ *   - pause-bot = "agentic system may converse with this lead"
+ *   - neither   = Conv AI / GHL workflows own the channel; agentic stays out
+ *
+ * v2.1 — Configurable rate limit via SEND_MESSAGE_RATE_LIMIT_MS env var.
+ *
  * Architecture:
  *   LP MCP → GHL Conversations API (in-thread reply)
  *   Fallback → POST to GHL incoming webhook (new thread)
  *
- * Guardrails (fail-closed):
+ * Guardrails (fail-closed, in order):
  *   1. Tag fetch — single GHL API call, reused for all tag-based checks
- *   2. Suppression check — suppress-automation / dnc / do-not-contact → BLOCK
- *   3. Conversation gate (v3.0):
- *        - stop-bot present     → BLOCK  (hard stop, wins over everything)
- *        - pause-bot present    → ALLOW  (explicit opt-in)
- *        - neither              → BLOCK  (no opt-in = Conv AI/workflows own it)
- *   4. Rate limit — configurable via SEND_MESSAGE_RATE_LIMIT_MS (default 10min)
- *   5. Human awareness — GroupMe notification on every send
- *   6. Channel validation — only 'sms' or 'email' accepted
- *
- * Required env:
- *   GHL_API_KEY — GHL API key (required for tag fetch, Conversations API)
- *   GHL_SEND_MESSAGE_WEBHOOK_URL — GHL incoming webhook URL (fallback)
- *   SEND_MESSAGE_RATE_LIMIT_MS — Rate limit window in ms (default 600000 = 10min)
- *
- * v3.0 — Conversation opt-in gate replaces bot-session heuristic.
- *   The previous implementation treated stop-bot and pause-bot as
- *   "bot is already handled, safe for agentic to send" — which is the
- *   OPPOSITE of intended semantics. It also auto-injected pause-bot
- *   as a side effect of every send, which silently opted contacts in
- *   to agentic conversation forever.
- *
- *   New semantics (Mark, 2026-04-17):
- *     - stop-bot  = "do not have a conversation with this lead, period"
- *                   Hard block. Wins over pause-bot if both are present.
- *     - pause-bot = "agentic system may converse with this lead"
- *                   Explicit opt-in. Default state (no pause-bot) means
- *                   Conv AI / GHL workflows own the conversation channel,
- *                   and the agentic system should stay out of it.
- *     - Non-conversation agentic actions (add_tag, move_opportunity,
- *       add_to_workflow, etc.) are unaffected and continue running.
- *
- *   pause-bot is now applied deliberately by GHL workflows (on bot
- *   completion) or by rules/reps that decide to hand conversation
- *   over to agentic — NOT as a side effect of this handler.
- *
- * v2.1 — Configurable rate limit via SEND_MESSAGE_RATE_LIMIT_MS env var.
- *   Was hardcoded at 2h which blocked conversational back-and-forth.
- *   Now defaults to 10 minutes — enough to prevent spam but allows
- *   real-time lead conversations.
- *
- * v2.0 — Bot session guardrail, pause-bot injection, Conversations API.
+ *   2. Suppression check (suppress-automation / dnc / do-not-contact) → BLOCK
+ *   3. Conversation gate (stop-bot / pause-bot) → BLOCK
+ *   4. Rate limit (SEND_MESSAGE_RATE_LIMIT_MS, default 10min)
+ *   5. AI generation (with compliance-gate short-circuit)
+ *   6. Send (Conversations API → webhook fallback)
+ *   7. GroupMe notification for human awareness
  */
 
 import supabase from './supabase.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken, report429 } from './ghl-rate-limiter.js';
 import { generateResponse } from './response-generator.js';
+import { bumpContactCache } from './context-builder.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 const GHL_LOCATION_ID = 'SsBG7j5KQAIP1SFP2Sca';
@@ -92,7 +73,6 @@ async function fetchContactTags(contactId) {
 
 /**
  * Check if a contact has suppression tags (DNC, suppress-automation).
- * Pure function — operates on pre-fetched tag array.
  */
 function isContactSuppressed(tags) {
   return tags.some(t => t === 'suppress-automation' || t === 'dnc' || t === 'do-not-contact');
@@ -106,12 +86,6 @@ function isContactSuppressed(tags) {
  *   1. stop-bot present  → deny (reason: stop_bot)      — hard stop
  *   2. pause-bot present → allow                         — explicit opt-in
  *   3. neither           → deny (reason: no_opt_in)     — default off
- *
- * stop-bot always wins, even if pause-bot is also present, so that a
- * later "stop-bot" application is an unambiguous kill switch.
- *
- * Pure function — operates on pre-fetched tag array.
- * Returns { allowed: boolean, reason: string }.
  */
 function checkConversationGate(tags) {
   if (tags.includes('stop-bot')) {
@@ -123,13 +97,52 @@ function checkConversationGate(tags) {
   return { allowed: false, reason: 'no_opt_in' };
 }
 
+/**
+ * Apply tags to a GHL contact (v3.1).
+ * Used for compliance-gate handoffs (e.g. 'hdl:stop', 'suppress-automation').
+ * Returns true on success, false on failure.
+ */
+async function applyContactTags(contactId, tagList) {
+  if (!contactId || !Array.isArray(tagList) || tagList.length === 0) return false;
+  if (!GHL_API_KEY) return false;
+  const filtered = tagList.filter(t => typeof t === 'string' && t.length > 0);
+  if (filtered.length === 0) return false;
+
+  try {
+    await acquireToken();
+    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/tags`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${GHL_API_KEY}`,
+        'Version': '2021-07-28',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({ tags: filtered }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (res.status === 429) {
+      report429();
+      console.warn(`[SendMessage] applyContactTags 429 for ${contactId}`);
+      return false;
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      console.warn(`[SendMessage] applyContactTags ${res.status}: ${text.slice(0, 150)}`);
+      return false;
+    }
+    bumpContactCache(contactId);
+    return true;
+  } catch (err) {
+    console.warn(`[SendMessage] applyContactTags threw: ${err.message}`);
+    return false;
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // RATE LIMIT
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * Check rate limit — has this contact received an auto-message within RATE_LIMIT_MS?
- */
 async function isRateLimited(contactId) {
   if (!contactId) return false;
   try {
@@ -143,7 +156,7 @@ async function isRateLimited(contactId) {
       .gte('executed_at', windowStart);
     return (count || 0) > 0;
   } catch {
-    return false; // If we can't check rate limit, allow the message
+    return false;
   }
 }
 
@@ -151,9 +164,6 @@ async function isRateLimited(contactId) {
 // GHL CONVERSATIONS API
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * Rate-limited GHL API fetch — mirrors the pattern in action-executor.js.
- */
 async function ghlFetch(method, path, body = null) {
   if (!GHL_API_KEY) throw new Error('GHL_API_KEY not configured');
   await acquireToken();
@@ -183,25 +193,16 @@ async function ghlFetch(method, path, body = null) {
   return ct.includes('application/json') ? res.json() : { status: res.status, ok: true };
 }
 
-/**
- * Send a message via the GHL Conversations API (in-thread reply).
- * Returns { conversationId, messageId } on success, null if no conversation found.
- */
 async function sendViaConversationsAPI(contactId, message, channel, subject) {
-  // Step 1: Find the contact's most recent conversation
   const searchData = await ghlFetch('GET',
     `/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`);
   const conversations = Array.isArray(searchData)
     ? searchData
     : (searchData?.conversations || []);
 
-  if (!conversations.length) {
-    return null; // No conversation found — caller falls back to webhook
-  }
+  if (!conversations.length) return null;
 
   const conversationId = conversations[0].id;
-
-  // Step 2: Send message in-thread
   const msgBody = {
     type: channel === 'email' ? 'Email' : 'SMS',
     contactId,
@@ -211,7 +212,6 @@ async function sendViaConversationsAPI(contactId, message, channel, subject) {
 
   if (channel === 'email') {
     if (subject) msgBody.subject = subject;
-    // Include conversationProviderId for email if available
     if (conversations[0].conversationProviderId) {
       msgBody.conversationProviderId = conversations[0].conversationProviderId;
     }
@@ -227,6 +227,66 @@ async function sendViaConversationsAPI(contactId, message, channel, subject) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// COMPLIANCE GATE SHORT-CIRCUIT (v3.1)
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Handle a compliance-gate short-circuit returned by response-generator.
+ * Applies the handoff tag (and suppress-automation if disqualifier),
+ * skips message send, notifies GroupMe.
+ *
+ * GHL workflows listening on the hdl:* tag own the actual response text.
+ */
+async function handleShortCircuit(contactId, generated, action, context) {
+  const handoffTag = generated.handoff_tag;
+  const isDQ = !!generated.is_disqualifier;
+
+  const tagsToApply = [];
+  if (handoffTag) tagsToApply.push(handoffTag);
+  if (isDQ) tagsToApply.push('suppress-automation');
+
+  let tagApplied = false;
+  if (tagsToApply.length > 0) {
+    tagApplied = await applyContactTags(contactId, tagsToApply);
+  }
+
+  // Notify GroupMe so a human knows what happened
+  const contactName = context?.contact_name || action?.action_payload?.contact_name || contactId;
+  const dqLabel = isDQ ? ' [DISQUALIFIER]' : '';
+  const tagSummary = tagsToApply.join(', ') || 'none';
+  const preview = (generated.trigger_message_preview || '').slice(0, 120);
+
+  await sendGroupMeMessage(
+    `🛑 AGENTIC SHORT-CIRCUIT${dqLabel}\n` +
+    `👤 ${contactName}\n` +
+    `Intent: ${generated.intent_class || 'unknown'}` +
+    (generated.handler_code ? ` (${generated.handler_code})` : '') + `\n` +
+    `Tags applied: ${tagSummary}${tagApplied ? '' : ' [TAG WRITE FAILED]'}\n` +
+    `Method: ${generated.classification_method || 'unknown'} (${(generated.classifier_confidence || 0).toFixed(2)})\n` +
+    `Inbound: "${preview}"\n` +
+    `→ GHL workflow on tag now owns the response.`
+  ).catch(err => {
+    console.warn(`[SendMessage] GroupMe (short-circuit) failed: ${err.message}`);
+  });
+
+  console.log(`[SendMessage] 🛑 SHORT-CIRCUIT: ${contactId} → ${tagSummary} (intent: ${generated.intent_class}, ${generated.classification_method})`);
+
+  return {
+    action: 'send_message_handed_off',
+    contact_id: contactId,
+    channel: generated.channel || 'unknown',
+    intent_class: generated.intent_class,
+    handler_code: generated.handler_code,
+    handoff_tag: handoffTag,
+    tags_applied: tagApplied ? tagsToApply : [],
+    is_disqualifier: isDQ,
+    classifier_confidence: generated.classifier_confidence,
+    classification_method: generated.classification_method,
+    reason: 'compliance_gate_handoff',
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // MAIN HANDLER
 // ═══════════════════════════════════════════════════════════════════
 
@@ -235,10 +295,11 @@ async function sendViaConversationsAPI(contactId, message, channel, subject) {
  *
  * Expected action_payload:
  *   {
- *     message: "Your message text here",
+ *     message: "Your message text here",          // optional if requires_ai_generation
  *     channel: "sms" | "email",
  *     subject: "Email subject (email only)",
- *     from_name: "Randy Reece" (optional, defaults to "Reece Windows & Doors")
+ *     from_name: "Randy Reece" (optional, defaults to "Reece Windows & Doors"),
+ *     requires_ai_generation: boolean
  *   }
  */
 export async function executeSendMessage(action, context) {
@@ -256,7 +317,7 @@ export async function executeSendMessage(action, context) {
     throw new Error(`Invalid channel "${channel}" — must be "sms" or "email"`);
   }
 
-  // ── Guardrail 1: Fetch contact tags (single API call) ──────────
+  // ── Guardrail 1: Fetch contact tags ────────────────────────────
   const tags = await fetchContactTags(contactId);
   if (tags === null) {
     console.log(`[SendMessage] ⛔ BLOCKED: Could not fetch tags for ${contactId} — failing closed`);
@@ -269,9 +330,6 @@ export async function executeSendMessage(action, context) {
   }
 
   // ── Guardrail 2: Suppression check ─────────────────────────────
-  // Defense in depth — catches broad "contact is off-limits" signals
-  // (suppress-automation, dnc, do-not-contact) that exist independently
-  // of the stop-bot/pause-bot conversation semantics.
   if (isContactSuppressed(tags)) {
     console.log(`[SendMessage] ⏭️ SUPPRESSED: ${contactId} has suppress-automation or DNC tag`);
     return {
@@ -283,9 +341,6 @@ export async function executeSendMessage(action, context) {
   }
 
   // ── Guardrail 3: Conversation opt-in gate ──────────────────────
-  // v3.0 semantics: stop-bot blocks, pause-bot allows, neither blocks.
-  // pause-bot is the explicit opt-in signal. Absence = Conv AI /
-  // GHL workflows own the conversation channel; agentic stays out.
   const gate = checkConversationGate(tags);
   if (!gate.allowed) {
     const label = gate.reason === 'stop_bot' ? 'STOP-BOT' : 'NO OPT-IN';
@@ -313,23 +368,30 @@ export async function executeSendMessage(action, context) {
 
   // ── AI Response Generation ─────────────────────────────────────
   // IMMUTABILITY RULE: If message exists in payload, send it. No regeneration.
-  // This ensures approved preview text === sent text.
   let generated = null;
 
   if (message) {
-    // Message already exists (pre-generated during approval, or manually provided)
-    // Use it directly — do not regenerate under any circumstance.
     console.log(`[SendMessage] Using ${payload.pre_generated ? 'pre-generated' : 'provided'} message for ${contactId} (${message.length} chars)`);
   } else if (payload.requires_ai_generation) {
-    // No message AND requires generation — this is the fallback path.
-    // Should only happen if pre-approval generation failed or was bypassed.
     console.warn(`[SendMessage] Generating at send-time for ${contactId} — should have been pre-generated in approval flow`);
     const triggerMessage = context.message_text || context.messageText || context.body || 'No trigger message available';
     try {
       generated = await generateResponse(contactId, channel, triggerMessage);
+
+      // ── v3.1: SHORT-CIRCUIT handling (compliance gate fired) ──
+      if (generated.short_circuit) {
+        return await handleShortCircuit(contactId, generated, action, context);
+      }
+
       message = generated.message;
       subject = generated.subject || subject;
-      console.log(`[SendMessage] AI generated: "${message.slice(0, 80)}..." (arc: ${generated.story_arc}, reason: ${generated.reasoning})`);
+      console.log(`[SendMessage] AI generated: "${message.slice(0, 80)}..." ` +
+        `(intent: ${generated.intent_class || 'n/a'}, ` +
+        `arc: ${generated.story_arc}, ` +
+        `trust: L${generated.trust_level_targeted || '?'}, ` +
+        `voice: ${generated.voice_used || 'we'}, ` +
+        `kb: ${generated.kb_pack_used ? 'yes' : 'no'}, ` +
+        `fast: ${generated.fast_track ? 'yes' : 'no'})`);
     } catch (err) {
       console.error(`[SendMessage] AI generation failed for ${contactId}: ${err.message}`);
       return {
@@ -345,8 +407,6 @@ export async function executeSendMessage(action, context) {
   if (!message) throw new Error('No message text after AI generation');
 
   // ── Send message ───────────────────────────────────────────────
-  // Primary: GHL Conversations API (in-thread reply)
-  // Fallback: GHL incoming webhook (new thread)
   let sendResult = null;
   let sendMethod = 'conversations_api';
 
@@ -357,7 +417,6 @@ export async function executeSendMessage(action, context) {
     sendResult = null;
   }
 
-  // Fallback: webhook if Conversations API returned null or threw
   if (!sendResult) {
     sendMethod = 'webhook_fallback';
     if (!GHL_SEND_MESSAGE_WEBHOOK_URL) {
@@ -396,20 +455,32 @@ export async function executeSendMessage(action, context) {
   const preview = message.length > 80 ? message.slice(0, 80) + '...' : message;
   const channelEmoji = channel === 'sms' ? '📱' : '📧';
   const aiLabel = generated ? '🤖 AI-GENERATED ' : '';
+
+  // v2.0 enriched info
+  const intentLine = generated?.intent_class ? `\nIntent: ${generated.intent_class}` : '';
   const arcLine = generated?.story_arc ? `\nArc: ${generated.story_arc}` : '';
-  const reasonLine = generated?.reasoning ? ` | ${generated.reasoning}` : '';
+  const trustLine = generated?.trust_level_targeted ? ` | L${generated.trust_level_targeted}` : '';
+  const voiceLine = generated?.voice_used === 'randy' ? ' | Randy voice' : '';
+  const kbLine = generated?.kb_pack_used ? ' | KB' : '';
+  const fastLine = generated?.fast_track ? ' | ⚡FAST' : '';
+  const reasonLine = generated?.reasoning ? `\nReason: ${generated.reasoning}` : '';
 
   await sendGroupMeMessage(
     `${channelEmoji} ${aiLabel}AGENTIC MESSAGE SENT\n` +
     `👤 ${contactName}\n` +
     `Channel: ${channel.toUpperCase()} | Via: ${sendMethod}\n` +
     `Rule: ${action.rule_applied || 'manual'}` +
-    arcLine +
+    intentLine +
+    arcLine + trustLine + voiceLine + kbLine + fastLine +
     reasonLine +
     `\nMessage: "${preview}"`
   ).catch(err => {
     console.warn(`[SendMessage] GroupMe notification failed: ${err.message}`);
   });
+
+  // v3.1: invalidate context cache after successful send (tag changes
+  // in GHL can be triggered by the conversation downstream)
+  bumpContactCache(contactId);
 
   console.log(`[SendMessage] ✅ ${channel.toUpperCase()} sent to ${contactId} via ${sendMethod} (rule: ${action.rule_applied || 'manual'}, ${message.length} chars)`);
 
@@ -423,7 +494,14 @@ export async function executeSendMessage(action, context) {
     conversation_id: sendResult?.conversationId || null,
     message_id: sendResult?.messageId || null,
     ai_generated: !!generated,
+    intent_class: generated?.intent_class || null,
+    classifier_method: generated?.classification_method || null,
     story_arc: generated?.story_arc || null,
+    trust_level_targeted: generated?.trust_level_targeted || null,
+    voice_used: generated?.voice_used || null,
+    kb_pack_used: generated?.kb_pack_used || false,
+    fast_track: generated?.fast_track || false,
+    buyer_stage: generated?.buyer_stage || null,
     ai_reasoning: generated?.reasoning || null,
   };
 }
