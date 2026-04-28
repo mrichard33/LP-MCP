@@ -18,6 +18,14 @@
  *   - ai.analysis_completed → matched against contextual rules using lead_intelligence
  *   - intent.* events → processed by rules but do NOT trigger re-scoring (loop prevention)
  *
+ * v2.8 — Auto-approve gate for AGENTIC_RESPOND_POST_CHATBOT.
+ *   shouldRequireApproval() bypasses the rule-level approval gate when the
+ *   contact carries any Stage 3+ tag. Stage 3+ buyers asking pricing or
+ *   scheduling questions need responses in minutes, not days. Lower-funnel
+ *   contacts (no Stage 3+ tag) still require human approval. Reversible by
+ *   reverting this commit; setting rule.requires_approval=false directly
+ *   provides a more aggressive global bypass.
+ *
  * v2.7 — recommended_action_neq context operator.
  *   Inverse of recommended_action_eq. Lets AGENTIC_RESPOND_POST_CHATBOT
  *   skip when the analyzer already flagged fast_track_booking (the
@@ -67,6 +75,19 @@ const BEHAVIORAL_RULE_PREFIXES = [
 
 // Rule prefixes that require GROUP dedup (any rule in group blocks all others)
 const LP_DISP_PREFIX = 'LP_DISP_';
+
+// v2.8: Tags that mark a contact as Stage 3+ in the buyer journey
+// (Comparing, Negotiating, or Committed). Used by shouldRequireApproval()
+// to bypass the human-approval gate on AGENTIC_RESPOND_POST_CHATBOT for
+// high-intent contacts where reply latency directly impacts conversion.
+const STAGE_3_PLUS_TAGS = [
+  'bj:stage-3-comparing',
+  'bj:stage-4-negotiating',
+  'bj:stage-5-committed',
+  'buyer:vendor-comparison',
+  'buyer:decision',
+  'buyer:post-decision',
+];
 
 function isBehavioralRule(ruleKey) {
   if (!ruleKey) return false;
@@ -399,6 +420,47 @@ async function findMatchingRules(event) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// APPROVAL GATING (v2.8)
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * v2.8: Determine whether a given (rule, event) action requires human approval.
+ *
+ * Default behavior: respect the rule's requires_approval flag.
+ *
+ * Per-rule overrides:
+ *   - AGENTIC_RESPOND_POST_CHATBOT: bypass approval when contact has any
+ *     Stage 3+ tag. Late-stage buyers asking pricing/scheduling questions
+ *     need replies in minutes; the rule's pause-bot precondition + this
+ *     stage gate together provide sufficient guardrails to ship without
+ *     human review. Top-of-funnel contacts (no Stage 3+ tag) continue to
+ *     require approval.
+ *
+ * Failure mode: if the GHL tag fetch fails, fall back to the rule's
+ * configured requires_approval value (safer to over-gate than under-gate).
+ */
+async function shouldRequireApproval(rule, event) {
+  const baseRequirement = rule.requires_approval || false;
+  if (!baseRequirement) return false;
+
+  if (rule.rule_key === 'AGENTIC_RESPOND_POST_CHATBOT' && event.ghl_contact_id) {
+    try {
+      const tags = await fetchContactTags(event.ghl_contact_id);
+      const hasStage3Plus = tags.some(t => STAGE_3_PLUS_TAGS.includes(t));
+      if (hasStage3Plus) {
+        console.log(`[AutoApprove] AGENTIC_RESPOND for ${event.ghl_contact_id}: Stage 3+ tag present, bypassing approval gate`);
+        return false;
+      }
+      console.log(`[AutoApprove] AGENTIC_RESPOND for ${event.ghl_contact_id}: no Stage 3+ tag, retaining approval gate`);
+    } catch (err) {
+      console.error(`[AutoApprove] Tag fetch failed for ${event.ghl_contact_id}, defaulting to baseRequirement=true:`, err.message);
+    }
+  }
+
+  return baseRequirement;
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // ACTION CREATION
 // ═══════════════════════════════════════════════════════════════════
 
@@ -412,6 +474,10 @@ async function createActionsFromRule(event, rule) {
   const actions = Array.isArray(rule.action_template) ? rule.action_template : [rule.action_template];
   const batchId = `evt_${event.id}_rule_${rule.rule_key}_${Date.now()}`;
   const created = [];
+
+  // v2.8: Resolve approval requirement once per rule firing (not per action),
+  // so all actions in a batch share the same gating decision.
+  const requiresApproval = await shouldRequireApproval(rule, event);
 
   for (let i = 0; i < actions.length; i++) {
     const tmpl = actions[i];
@@ -437,11 +503,11 @@ async function createActionsFromRule(event, rule) {
       target_entity: tmpl.target_entity || 'contact', target_id: targetId,
       action_payload: tmpl.params || tmpl.payload || {},
       reasoning: `Rule ${rule.rule_key}: ${rule.rule_name}`, confidence: 1.0,
-      rule_applied: rule.rule_key, status: rule.requires_approval ? 'pending_approval' : 'pending',
-      requires_approval: rule.requires_approval || false, batch_id: batchId, sequence_order: i,
+      rule_applied: rule.rule_key, status: requiresApproval ? 'pending_approval' : 'pending',
+      requires_approval: requiresApproval, batch_id: batchId, sequence_order: i,
     }).select().single();
     if (error) { console.error(`[DecisionEngine] Action create failed for ${rule.rule_key}:`, error.message); }
-    else { created.push(data); console.log(`[DecisionEngine] Action: ${tmpl.action_type} (${rule.requires_approval ? 'approval' : 'auto'}) — ${rule.rule_key}`); }
+    else { created.push(data); console.log(`[DecisionEngine] Action: ${tmpl.action_type} (${requiresApproval ? 'approval' : 'auto'}) — ${rule.rule_key}`); }
   }
   return created;
 }
