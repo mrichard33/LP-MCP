@@ -10,7 +10,7 @@
  *   2. classifyInbound(triggerMessage)        ← Phase 1
  *      ├─ compliance_gate (tag_and_handoff)   → SHORT-CIRCUIT (no LLM call)
  *      └─ intent_router                       → continue to step 3
- *   3. buildKbPack({intent, stage, activeEntry, ...})  ← Phase 3
+ *   3. buildKbPack({intent, stage, activeEntry, hasExistingAppt, lpDisp})  ← Phase 3
  *   4. buildResponsePrompt(context, kb_pack)  ← Phase 5 prompt rewrite
  *   5. callClaude(systemPrompt, userPrompt)
  *   6. validate + sanitizeMessageUrls + return    ← v2.2
@@ -18,37 +18,49 @@
  * Called by: send-message-handler.js when action has requires_ai_generation: true
  *
  * Cost controls:
- *   - Main model: claude-sonnet-4-20250514, max_tokens 600 (slight bump for KB-richer prompts)
+ *   - Main model: claude-sonnet-4-20250514, max_tokens 600
  *   - Classifier: claude-haiku-4-5-20251001 (~$0.001 per classification)
  *   - Vector embed (when triggered): text-embedding-3-small (~$0.00001 per query)
  *   - Total per response: ~$0.01-0.015 typical
  *
- * v2.2 — 2026-04-28. URL HALLUCINATION FIX.
- *   Sonnet was generating responses with hallucinated booking URLs
- *   (e.g. "https://reecewindows.com/calendar" instead of the actual
- *   GHL booking_url from the KB pack), and using markdown link syntax
- *   [text](url) which got mangled by the GroupMe approval template.
+ * v2.3 — 2026-04-28. FRAMEWORK INTEGRATION + context-aware booking.
+ *   Per Mark: "Make sure the system follows the frameworks from:
+ *     - The Antifragile Sales System
+ *     - DotCom Secrets
+ *     - Expert Secrets
+ *     - Traffic Secrets
+ *     Make sure this knowledge is fully integrated into the agentic system."
  *
- *   Three-layer defense added:
- *     1. sanitizeMessageUrls() — post-Claude scrubber that strips
- *        markdown link syntax and replaces ANY URL in the message
- *        with the canonical booking_url from the KB pack. If no
- *        booking_url is provided, non-allowlisted URLs are stripped.
- *     2. System prompt tightened — explicit WRONG/RIGHT URL examples,
- *        zero-tolerance markdown ban for SMS, no-fabricated-assets rule.
- *     3. User prompt now includes a dedicated, prominent CANONICAL URL
- *        line right above the inbound message so the model can't miss
- *        which URL to paste verbatim.
+ *   Two changes:
  *
- * v2.1 — Calendar awareness:
- *        Extracts the lead's `active-entry:*` tag from context and passes
- *        it to buildKbPack as activeEntryTag.
+ *   1. buildKbPack now receives hasExistingAppt and lpDisposition from
+ *      context.lp.* — so the kb-retriever v1.3 context-aware calendar
+ *      selector picks the right calendar for the lead's actual state
+ *      (existing appt → Confirmation Call, MV-source → MV calendar,
+ *      explicit phone request → Confirmation Call, etc.) instead of
+ *      always defaulting to in-home Window Estimate.
  *
- * v2.0 — Phase 1 (compliance gates) + Phase 3 (KB injection) + Phase 5
- *        (Antifragile-hardened SYSTEM_PROMPT) integrated.
+ *   2. New FRAMEWORK INTEGRATION section in the system prompt that
+ *      makes the four frameworks ACTIONABLE rather than just referenced:
+ *        - Antifragile (5 stages × 4 trust levels) — already there
+ *        - Expert Secrets (One Thing, False Beliefs, The Vehicle,
+ *          Future Pacing, Origin Stories) — NEW
+ *        - Traffic Secrets (temperature matching) — NEW
+ *        - DotCom Secrets (Value Ladder awareness) — strengthened
+ *      Plus a "which framework by stage" mapping so the model knows
+ *      which lens to lead with at each stage of the buyer journey.
  *
- * v1.1 — Brand-language fix: NC 1972 / FL 2005 distinction enforced.
- * v1.0 — Initial response generation with Antifragile Sales System prompt.
+ *   Also adds CONTEXT-AWARE BOOKING section that mirrors the four
+ *   policies emitted by kb-retriever v1.3 (phone_primary_in_home_fallback,
+ *   mv_only, confirm_existing_appt, in_home_first_call_fallback) with
+ *   explicit handling guidance for each.
+ *
+ * v2.2 — Defense-in-depth against URL hallucination (sanitizer + prompt
+ *        URL RULES + canonical URL block in user prompt).
+ * v2.1 — Calendar awareness: extracts active-entry tag.
+ * v2.0 — Phase 1 + Phase 3 + Phase 5 integration.
+ * v1.1 — Brand-language fix.
+ * v1.0 — Initial.
  */
 
 import { buildLeadContext } from './context-builder.js';
@@ -79,10 +91,44 @@ function urlHostAllowed(url) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.2
+// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.3
 // ═══════════════════════════════════════════════════════════════════
 
 const SYSTEM_PROMPT = `You are the Agentic Responder for Reece Windows & Doors, a hurricane impact window and door company founded in North Carolina in 1972, with Florida operations since 2005, serving South Florida homeowners. Your job is to write SMS or email replies that move leads ONE stage forward in the Antifragile Sales System buyer journey — never to close the deal in a single message.
+
+═══════ FRAMEWORK INTEGRATION ═══════
+Reece's agentic system runs on FOUR overlapping frameworks. They tell you HOW to think, not WHAT to say. Apply them as lenses on every reply.
+
+▼ ANTIFRAGILE SALES SYSTEM (Reece's master framework — ALWAYS active)
+- 5 buyer stages × 4 trust levels (mapped in detail below)
+- Every interaction either BUILDS antifragility (genuine helpfulness, no pressure, lead gets stronger trusting us) or BREAKS it (push too hard, lead disengages, the relationship is harder next time)
+- HSO mandate (Hook → Story → Offer) is non-negotiable
+- Trust required by ask is non-negotiable — you don't get to ask for L4 commitment from an L1 lead
+
+▼ EXPERT SECRETS (Russell Brunson — belief shifting)
+- ONE THING: Every reply has a SINGLE focus. If your draft is doing two things at once, cut one.
+- FALSE BELIEFS over logic: Objections are false beliefs (about price, time, trust, capability) — not logical positions. Don't argue facts. Tell a story that makes the false belief feel obviously wrong.
+- THE VEHICLE: Windows are NOT the product. Hurricane safety, family protection, and home value preservation ARE the product. Windows are the vehicle. Frame conversations in the destination ("sleep through the next storm," "your insurance gets better," "your home holds value") not the vehicle ("custom impact glazing," "PGT WinGuard").
+- FUTURE PACING: When making an offer, paint life AFTER. "Imagine sleeping through the next storm without checking your phone every hour" lands harder than "our windows are hurricane-rated."
+- ORIGIN STORIES: When using Randy's voice (SA1/SA3 only), reach for a SPECIFIC moment, not a category. "Wilma 2005, corner of Pines and Flamingo, that family lost everything" lands. "After many storms over the years" doesn't.
+
+▼ TRAFFIC SECRETS (Russell Brunson — temperature awareness)
+Match the lead's TRAFFIC TEMPERATURE — wrong-temperature messages get scrolled past:
+- COLD (no prior engagement, score <30, just entered) → educate, don't sell. Pattern interrupt + curiosity hook + soft micro-commitment. Don't pitch the product.
+- WARM (engaged once, score 30-70, in nurture workflows) → bridge prior step to next step. "Last we talked you mentioned X. Ready for Y?"
+- HOT (FAST_TRACK, score >70, recent action <48h) → close-friendly. Skip education, single CTA, match their urgency.
+The Hook earns the right to a Story. The Story sells the Offer. Hooks calibrated to traffic temperature; otherwise they bounce.
+
+▼ DOTCOM SECRETS (Russell Brunson — funnel architecture)
+- VALUE LADDER awareness: A lead doesn't jump from cold-traffic to a $30k contract. Reece's rungs — educational content → estimate request → in-home appointment → MV (when applicable) → contract → install → maintenance/referral. Your message offers the NEXT rung, not three rungs up.
+- ATTRACTIVE CHARACTER: Randy Reece for SA1/SA3 only when KB approves it. Otherwise "we / our team." Don't break character mid-conversation.
+- HYPERACTIVE BUYER detection (FAST_TRACK flag): when triggered, drop everything else, push to book.
+
+▼ WHICH FRAMEWORK BY STAGE (mapping):
+  Stage 1-2 (Indifferent/Curious)  → Traffic Secrets (right temperature) + Expert Secrets (vehicle framing)
+  Stage 3   (Comparing)            → DotCom Secrets (value ladder) + Expert Secrets (false beliefs about competitors)
+  Stage 4   (Negotiating)          → Expert Secrets (false belief dissolution) + Antifragile (trust escalation)
+  Stage 5   (Committed)            → DotCom Secrets (Hyperactive Buyer handling) + facilitate, do not sell
 
 ═══════ VOICE ═══════
 - First person plural ("we", "our team") by default — never "I" alone
@@ -141,7 +187,7 @@ When a KB PACK is included in the user prompt, the structured content in it (PRI
 3. If a PROOF POINTS section is included, only cite facts from that list — never invent statistics
 4. If an OBJECTION SCRIPT is included with body_template, follow its structure
 5. If a PRICING ANCHOR is included, NEVER quote a specific number — use the anchoring_message phrasing only
-6. If a BOOKING CONTEXT is included, use ITS booking_url EXACTLY (see URL RULES below)
+6. If a BOOKING CONTEXT is included, follow its policy (see CONTEXT-AWARE BOOKING below)
 7. If COMPETITOR INTEL is included, use talking_point and reece_advantage; respect do_not_attack as hard prohibition
 
 When NO pack is provided, fall back to the story arc summaries below — but stay conservative on specifics.
@@ -170,6 +216,21 @@ RIGHT example:
      (bare URL, exactly as provided in KB PACK, prepended with regular text)
 
 If the KB PACK does not provide a URL and you don't have one to paste, simply DO NOT include a URL. A message with no URL is better than a message with a wrong URL.
+
+═══════ CONTEXT-AWARE BOOKING (kb-retriever v1.3) ═══════
+The BOOKING CONTEXT in the KB pack carries a "policy" that matches the user's actual request. Honor it:
+
+- policy: phone_primary_in_home_fallback
+  → User explicitly asked for a phone call (or CALLBACK intent). Offer the 15-min Confirmation Call slot — that is the right calendar. Do NOT push them toward the in-home estimate against their stated preference. The in-home is a fallback if THEY pivot.
+
+- policy: mv_only
+  → Lead came from estimate-calculator OR asked for measurement verification. Frame as a verification visit, not a sales appointment. "A specialist verifies the measurements you entered online and finalizes pricing." Do NOT pitch this as discovery.
+
+- policy: confirm_existing_appt
+  → Lead has an existing appointment. Use the Confirmation Call calendar to confirm details (time, address, who'll be home). Do NOT re-book the in-home. Do NOT offer additional appointment slots. If they want to RESCHEDULE not confirm, switch to the appropriate in-home calendar with empathy.
+
+- policy: in_home_first_call_fallback (default)
+  → No explicit user preference, no existing appt. Lead with two specific in-home slots from PRIMARY. Offer the FALLBACK 15-min call only if the lead pushes back or insists on phone-first.
 
 ═══════ STORY ARCS — FALLBACK SUMMARIES ═══════
 SA1: Hurricane damage stories — homes built before current code, vulnerability awareness
@@ -207,14 +268,12 @@ SMS messages must be EMOTIONALLY STANDALONE:
 - The SMS earns its own response on its own merits
 
 ═══════ BOOKING ESCAPE HATCH ═══════
-Every message contains a booking path. Trust level decides positioning:
+Trust level decides positioning of the booking offer:
 - L1-L2 (low trust): footer only — soft inline mention with the booking_url
 - L3 (medium): inline mention with the booking_url
 - L4-L6 (high): primary CTA with the booking_url
 
 If you don't know the trust level, default to L1-L2 (footer).
-
-The URL you include MUST be the booking_url from BOOKING CONTEXT verbatim. See URL RULES.
 
 For LIFE-EVENT timing objections (new baby, surgery, family emergency, recent loss): DO NOT include a booking link. The right move is empathy + offer to circle back in 4-8 weeks. Pushing a calendar in this moment damages the relationship.
 
@@ -277,6 +336,7 @@ Return ONLY a valid JSON object — no markdown fences, no preamble:
     "offer": "1-line description of the offer/next step"
   },
   "voice_used": "we|randy",
+  "frameworks_applied": ["antifragile","expert_secrets","traffic_secrets","dotcom_secrets"],
   "reasoning": "1 sentence explaining your strategy"
 }`;
 
@@ -316,6 +376,20 @@ function isHyperactiveBuyer(context) {
   return ageMs < 48 * 60 * 60 * 1000;
 }
 
+// v2.3: classify traffic temperature for Traffic Secrets calibration.
+function inferTrafficTemperature(context, fastTrack) {
+  if (fastTrack) return 'hot';
+  const score = context.engagement?.lead_score || context.lead?.lead_score || 0;
+  const lastEng = context.engagement?.last_engagement_at
+    || context.engagement?.last_reply_at;
+  const recentMs = lastEng ? Date.now() - new Date(lastEng).getTime() : Infinity;
+  const recentDays = recentMs / (24 * 60 * 60 * 1000);
+
+  if (score >= 70 && recentDays < 2) return 'hot';
+  if (score >= 30 || recentDays < 14) return 'warm';
+  return 'cold';
+}
+
 function inferWindowCount(context) {
   // TODO: pull from GHL custom field if/when available
   return null;
@@ -330,10 +404,10 @@ function extractActiveEntryTag(context) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// PROMPT BUILDER (v2.0 — KB-aware, v2.2 — canonical URL line)
+// PROMPT BUILDER (v2.3 — adds traffic temperature line)
 // ═══════════════════════════════════════════════════════════════════
 
-function buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack) {
+function buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack, trafficTemp) {
   const parts = [];
 
   parts.push(`CHANNEL: ${channel.toUpperCase()}`);
@@ -345,6 +419,9 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   // Classification (always)
   parts.push(`\nCLASSIFICATION: ${classification.intent_class} (${classification.confidence?.toFixed(2) || 'n/a'} confidence, ${classification.classification_method})`);
   if (classification.reasoning) parts.push(`Classifier reasoning: ${classification.reasoning}`);
+
+  // v2.3: Traffic temperature for Traffic Secrets calibration
+  parts.push(`\nTRAFFIC TEMPERATURE: ${trafficTemp.toUpperCase()} — calibrate hook intensity per Traffic Secrets section.`);
 
   // Hyperactive buyer flag
   if (fastTrack) {
@@ -384,18 +461,14 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     if (context.lp.closed_won) parts.push(`CLOSED WON — $${context.lp.job_value}`);
     if (context.lp.lost_reason) parts.push(`LOST REASON: ${context.lp.lost_reason}`);
 
-    // v2.4: surface staleness so model can hedge if needed
     if (context.lp.data_stale_active) {
       parts.push(`⚠️ LP data is ${context.lp.data_age_minutes}min stale on an ACTIVE disposition — treat status as approximate.`);
     }
 
-    // v2.0: extended notes (was truncated 250, now 1500)
     if (context.lp.notes?.length) {
       parts.push(`\nLP Rep Notes (most reliable intelligence):`);
       context.lp.notes.slice(0, 5).forEach(n => {
         const by = n.entered_by || 'System';
-        // v2.2 null-safety: n.text should never be null (context-builder
-        // filters), but guard anyway so a bad row never crashes generation.
         const noteText = typeof n.text === 'string' ? n.text.slice(0, 1500) : '';
         parts.push(`  [${by}] ${noteText}`);
       });
@@ -439,8 +512,6 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   }
 
   // ─── KB PACK INJECTION ─────────────────────────────────────────
-  // Phase 3: structured KB pack from kb-retriever takes precedence
-  // over fallback story arc summaries in the system prompt.
   if (kbPack) {
     const formatted = formatKbPackForPrompt(kbPack);
     if (formatted) {
@@ -451,8 +522,6 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   }
 
   // ─── v2.2: CANONICAL URL LINE ──────────────────────────────────
-  // Sonnet was hallucinating booking URLs. Make the canonical URL
-  // unmissable — put it in its own block right before the trigger.
   const canonicalUrl = kbPack?.booking_context?.booking_url || null;
   const canonicalCalName = kbPack?.booking_context?.calendar_name || null;
   if (canonicalUrl) {
@@ -473,7 +542,7 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   parts.push(`\nTHE INBOUND MESSAGE TO RESPOND TO:`);
   parts.push(`"${triggerMessage}"`);
 
-  parts.push(`\nGenerate the ${channel} response. Apply HSO. Move them ONE stage forward. Reference their specific situation. Include a soft next step. If KB pack provided, follow it. URL rules are non-negotiable.`);
+  parts.push(`\nGenerate the ${channel} response. Apply HSO. Move them ONE stage forward. Apply the right framework lens for this stage. Reference their specific situation. Include a soft next step. If KB pack provided, follow it. URL rules are non-negotiable.`);
 
   return parts.join('\n');
 }
@@ -540,6 +609,11 @@ function validateResponse(parsed, channel) {
 
   const voice = parsed.voice_used === 'randy' ? 'randy' : 'we';
 
+  // v2.3: capture frameworks_applied for analytics
+  const frameworksApplied = Array.isArray(parsed.frameworks_applied)
+    ? parsed.frameworks_applied.filter(f => typeof f === 'string').slice(0, 4)
+    : [];
+
   return {
     message: parsed.message.trim(),
     channel,
@@ -548,6 +622,7 @@ function validateResponse(parsed, channel) {
     trust_level_targeted: trustLevel,
     hso_breakdown: parsed.hso_breakdown && typeof parsed.hso_breakdown === 'object' ? parsed.hso_breakdown : null,
     voice_used: voice,
+    frameworks_applied: frameworksApplied,
     reasoning: String(parsed.reasoning || '').slice(0, 500),
   };
 }
@@ -555,26 +630,6 @@ function validateResponse(parsed, channel) {
 // ═══════════════════════════════════════════════════════════════════
 // v2.2 — URL SANITIZER (post-Claude)
 // ═══════════════════════════════════════════════════════════════════
-//
-// Belt-and-suspenders defense against URL hallucinations. Even with
-// the URL RULES section in the system prompt and the CANONICAL URL
-// block in the user prompt, Sonnet has been observed inventing
-// plausible-looking URLs (e.g. "https://reecewindows.com/calendar")
-// and wrapping them in markdown link syntax.
-//
-// This sanitizer runs after validateResponse and:
-//   1. Strips markdown link syntax [text](url)
-//      - Keeps `text` as visible label text
-//      - Drops the URL part if it's not allowlisted
-//      - Replaces with canonical booking_url if one is provided
-//   2. Replaces any remaining bare URLs with the canonical booking_url
-//      (when one is provided in kbPack), OR strips non-allowlisted
-//      URLs entirely (when no canonical URL is available)
-//   3. Collapses duplicate URLs and excess whitespace
-//
-// The result: the only URL in the outbound message is either the
-// canonical booking_url or nothing. Hallucinated domains never reach
-// the lead.
 
 const URL_RX = /https?:\/\/[^\s<>"'`)\]]+/g;
 const MARKDOWN_LINK_RX = /\[([^\]]*)\]\(\s*([^)]+?)\s*\)/g;
@@ -586,28 +641,20 @@ function sanitizeMessageUrls(message, channel, kbPack) {
   const canonicalUrl = kbPack?.booking_context?.booking_url || null;
   let mutations = [];
 
-  // Step 1: Strip markdown link syntax. Replace [text](url) with either
-  // the canonical URL (if one exists) or just `text` (if URL is bogus).
   out = out.replace(MARKDOWN_LINK_RX, (match, text, url) => {
     mutations.push('markdown_link');
-    const trimmedUrl = url.trim().replace(/["']/g, '');  // strip stray quotes glued in
+    const trimmedUrl = url.trim().replace(/["']/g, '');
     if (canonicalUrl) {
-      // We have a real URL — substitute it, drop the markdown wrapper
       return canonicalUrl;
     }
-    // No canonical URL. Check if the embedded URL is allowlisted; if so
-    // keep it bare. Otherwise drop the URL portion entirely.
     if (urlHostAllowed(trimmedUrl)) {
       return trimmedUrl;
     }
-    // Nothing safe to keep — drop the link, leave the visible text
     return text || '';
   });
 
-  // Step 2: Replace any bare URL not on the allowlist with canonicalUrl,
-  // or strip if we don't have a canonical to use.
   out = out.replace(URL_RX, (match) => {
-    const cleaned = match.replace(/[)\].,;:]+$/, '');  // strip trailing punctuation glued in
+    const cleaned = match.replace(/[)\].,;:]+$/, '');
     if (urlHostAllowed(cleaned)) {
       return cleaned;
     }
@@ -615,8 +662,6 @@ function sanitizeMessageUrls(message, channel, kbPack) {
     return canonicalUrl || '';
   });
 
-  // Step 3: Dedupe consecutive identical URLs (in case markdown +
-  // bare-URL replacement produced doubles).
   if (canonicalUrl) {
     const escaped = canonicalUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const dupeRx = new RegExp(`(${escaped})(\\s*${escaped})+`, 'g');
@@ -625,7 +670,6 @@ function sanitizeMessageUrls(message, channel, kbPack) {
     if (out !== before) mutations.push('deduped_urls');
   }
 
-  // Step 4: Collapse excess whitespace produced by URL stripping.
   out = out
     .replace(/[ \t]+/g, ' ')
     .replace(/ +\n/g, '\n')
@@ -646,8 +690,8 @@ function sanitizeMessageUrls(message, channel, kbPack) {
 function makeShortCircuitResult(classification, channel, triggerMessage) {
   return {
     short_circuit: true,
-    handoff_action: classification.action_type,           // 'tag_and_handoff'
-    handoff_tag: classification.ghl_handoff_tag,          // e.g. 'hdl:stop'
+    handoff_action: classification.action_type,
+    handoff_tag: classification.ghl_handoff_tag,
     intent_class: classification.intent_class,
     handler_code: classification.handler_code,
     bucket_type: classification.bucket_type,
@@ -657,7 +701,6 @@ function makeShortCircuitResult(classification, channel, triggerMessage) {
     reasoning: classification.reasoning,
     channel,
     trigger_message_preview: (triggerMessage || '').slice(0, 200),
-    // Empty fields so downstream code that destructures still works:
     message: null,
     subject: null,
     story_arc: null,
@@ -668,15 +711,6 @@ function makeShortCircuitResult(classification, channel, triggerMessage) {
 // MAIN EXPORT
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * Generate a contextually relevant response for a lead, OR return a
- * short-circuit instruction if the inbound matches a compliance gate.
- *
- * @param {string} contactId — GHL contact ID
- * @param {string} channel — 'sms' or 'email'
- * @param {string} triggerMessage — the inbound message to respond to
- * @returns {Promise<Object>} Response or short-circuit handoff
- */
 export async function generateResponse(contactId, channel, triggerMessage) {
   // 1. Build full lead context (always fresh)
   const context = await buildLeadContext(contactId, {
@@ -714,10 +748,15 @@ export async function generateResponse(contactId, channel, triggerMessage) {
   }
 
   // 3. PHASE 3: Build KB pack
-  const buyerStage = inferBuyerStage(context);
-  const fastTrack = isHyperactiveBuyer(context);
-  const windowCount = inferWindowCount(context);
-  const activeEntryTag = extractActiveEntryTag(context);  // v2.1
+  const buyerStage    = inferBuyerStage(context);
+  const fastTrack     = isHyperactiveBuyer(context);
+  const trafficTemp   = inferTrafficTemperature(context, fastTrack);   // v2.3
+  const windowCount   = inferWindowCount(context);
+  const activeEntryTag = extractActiveEntryTag(context);
+
+  // v2.3: surface LP state to kb-retriever for context-aware calendar selection
+  const hasExistingAppt = !!context.lp?.appointment_set;
+  const lpDisposition   = context.lp?.disposition || null;
 
   let kbPack = null;
   try {
@@ -729,7 +768,9 @@ export async function generateResponse(contactId, channel, triggerMessage) {
       objectionTags: context.lead?.objection_tags || [],
       recommendedArc: context.intelligence?.recommended_story_arc,
       windowCount,
-      activeEntryTag,                                       // v2.1: drives calendar selection
+      activeEntryTag,
+      hasExistingAppt,                                  // v2.3
+      lpDisposition,                                    // v2.3
     });
   } catch (err) {
     console.warn(`[ResponseGenerator] KB pack build failed for ${contactId}: ${err.message} — proceeding without`);
@@ -737,7 +778,7 @@ export async function generateResponse(contactId, channel, triggerMessage) {
   }
 
   // 4-5. PHASE 5: Build prompt + call Claude
-  const userPrompt = buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack);
+  const userPrompt = buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack, trafficTemp);
   const raw = await callClaude(userPrompt);
 
   // 6. Validate
@@ -747,8 +788,6 @@ export async function generateResponse(contactId, channel, triggerMessage) {
   }
 
   // ─── v2.2: URL SANITIZER (post-Claude) ─────────────────────────
-  // Strips markdown link syntax + replaces hallucinated URLs with the
-  // canonical booking_url (or removes them if no canonical is available).
   validated.message = sanitizeMessageUrls(validated.message, channel, kbPack);
 
   console.log(`[ResponseGenerator] Generated ${channel} for ${contactId}: ` +
@@ -758,7 +797,10 @@ export async function generateResponse(contactId, channel, triggerMessage) {
     `voice=${validated.voice_used} ` +
     `kb_pack=${kbPack ? 'yes' : 'no'} ` +
     `cal=${kbPack?.booking_context?.calendar_name || 'n/a'} ` +
+    `policy=${kbPack?.booking_context?.policy || 'none'} ` +
+    `temp=${trafficTemp} ` +
     `fast_track=${fastTrack} ` +
+    `frameworks=${(validated.frameworks_applied || []).join('+') || 'none'} ` +
     `(${validated.message.length} chars)`);
 
   return {
@@ -769,9 +811,13 @@ export async function generateResponse(contactId, channel, triggerMessage) {
     handler_code: classification.handler_code,
     kb_pack_used: !!kbPack,
     booking_calendar: kbPack?.booking_context?.calendar_name || null,
+    booking_policy: kbPack?.booking_context?.policy || null,        // v2.3
+    user_booking_preference: kbPack?.detected_signals?.user_booking_preference || null, // v2.3
     fast_track: fastTrack,
+    traffic_temperature: trafficTemp,                                 // v2.3
     buyer_stage: buyerStage,
     active_entry_tag: activeEntryTag,
+    has_existing_appt: hasExistingAppt,                               // v2.3
     ...validated,
   };
 }
