@@ -2,64 +2,73 @@
  * Send Message Handler — src/send-message-handler.js
  *
  * Agentic Responder action handler. Sends SMS or email to contacts
- * via Mark's GHL "Send Reply" webhook workflow with Conversations API
- * as the fallback path.
+ * via channel-specific routing — webhook for SMS, Conversations API
+ * for email — with cross-fallback for both.
  *
- * v3.2 — WEBHOOK-PRIMARY (Mark's architectural intent)
- *   The GHL_SEND_MESSAGE_WEBHOOK_URL points to a GHL workflow
- *   (497e664a-01ef-400d-aca5-1050d8eeccf8) that:
- *     - Finds the contact by inboundWebhookRequest.contactId
- *     - Branches by inboundWebhookRequest.channel ('sms' | 'email')
- *     - SMS branch: sends Send-SMS-Reply with body=inboundWebhookRequest.message
- *     - Email branch: ⚠️ CURRENTLY EMPTY — email sends will silently drop
- *       until a Send-Email action is added to that branch with
- *       body={{inboundWebhookRequest.message}} and
- *       subject={{inboundWebhookRequest.subject}}
+ * v3.3 — CHANNEL-SPECIFIC ROUTING (email threading discovery)
+ *   Mark surfaced that the GHL workflow Send-Email action creates a
+ *   NEW outbound email instead of replying in-thread. This is a GHL
+ *   limitation, not a workflow bug — workflows have no "Reply to Email"
+ *   action and Send-Email always uses a fresh Message-ID. Recipients'
+ *   email clients render those as new conversations.
  *
- *   Webhook is now PRIMARY because:
- *     - It's the canonical "send a message" pipeline Mark designed
- *     - GHL workflow handles compliance/formatting/logging in one place
- *     - Conversations API bypassed the workflow entirely (wrong)
- *     - Future enhancements (compliance overlay, retry, audit) belong in GHL
+ *   The Conversations API solves this. POSTing to /conversations/messages
+ *   with type=Email + conversationId + conversationProviderId tells GHL
+ *   to thread the reply (In-Reply-To / References headers handled
+ *   internally). Threading only works through this path.
  *
- *   Conversations API kept as FALLBACK because:
- *     - Webhook 5xx / network blip → message still goes out
- *     - Workflow paused / accidentally deleted → graceful degradation
- *     - Logged on every fallback hit so Mark can see if webhook is unreliable
+ *   New defaults:
+ *     SMS   → webhook PRIMARY, Conversations API fallback
+ *             (workflow centralizes compliance, no threading concern)
+ *     Email → Conversations API PRIMARY, webhook fallback
+ *             (only Conv API can reply in-thread; workflow fallback
+ *             will create a new thread but at least delivers)
  *
- *   Kill switch: GHL_SEND_PRIMARY_PATH=conversations_api (env) reverses
- *   the priority back to v3.1 behavior. Default: 'webhook'.
+ *   Configuration knobs:
+ *     GHL_SEND_PRIMARY_PATH=webhook (default) | conversations_api
+ *       Acts as a global override. SMS is webhook-first either way
+ *       unless overridden. Email is Conv-API-first either way unless
+ *       overridden.
+ *     GHL_SEND_SMS_VIA_WEBHOOK=true (default)
+ *       Set false to force Conv API for SMS too (rarely needed).
+ *     GHL_SEND_EMAIL_VIA_WEBHOOK=false (default — flipped in v3.3)
+ *       Set true to force webhook for email anyway. WILL BREAK THREADING.
+ *       Only useful if email branch in GHL workflow is configured for
+ *       a specific use case where new-thread is desired.
  *
- *   ⚠️ EMAIL CHANNEL: until Mark adds the Send Email action to the
- *   Email branch of the workflow, emails sent via webhook will return
- *   HTTP 200 but never reach the recipient. The workflow swallows them.
- *   No way for LP MCP to detect this. Two options for the meantime:
- *     1. Set GHL_SEND_PRIMARY_PATH=conversations_api
- *     2. Set GHL_SEND_EMAIL_VIA_WEBHOOK=false (channel-specific override)
- *   Once the branch is fixed, no code change needed.
+ * v3.2 — Webhook-primary architecture (Mark's intent).
+ *   Replaced the inherited "Conv API primary, webhook fallback" with
+ *   webhook-primary so Mark's GHL Send-Reply workflow becomes the
+ *   canonical send pipeline. v3.3 refines this with email-threading
+ *   exception above.
  *
- * v3.1 — Short-circuit handoff support for compliance gates.
- *   When response-generator returns short_circuit=true (compliance gate
- *   fired), this handler applies the GHL handoff tag (e.g. 'hdl:stop'),
- *   suppresses the message send, optionally adds 'suppress-automation'
- *   for disqualifiers, invalidates the context cache, and notifies
- *   GroupMe. The actual response text lives in GHL workflows that
- *   listen on the hdl:* tags.
+ *   Workflow: 497e664a-01ef-400d-aca5-1050d8eeccf8
+ *   Workflow expects:
+ *     inboundWebhookRequest.contactId  (Find Contact)
+ *     inboundWebhookRequest.channel    ('sms' | 'email')
+ *     inboundWebhookRequest.message    (SMS body / email body)
+ *     inboundWebhookRequest.subject    (email subject)
+ *
+ * v3.1 — Short-circuit handoff for compliance gates.
+ *   When response-generator returns short_circuit=true, this handler
+ *   applies the GHL handoff tag (e.g. 'hdl:stop'), suppresses the
+ *   message send, optionally adds 'suppress-automation' for DQs,
+ *   invalidates the context cache, and notifies GroupMe.
  *
  * v3.0 — Conversation opt-in gate.
  *   - stop-bot  = "do not have a conversation with this lead, period"
  *   - pause-bot = "agentic system may converse with this lead"
- *   - neither   = Conv AI / GHL workflows own the channel; agentic stays out
+ *   - neither   = Conv AI / GHL workflows own the channel
  *
  * v2.1 — Configurable rate limit via SEND_MESSAGE_RATE_LIMIT_MS env var.
  *
  * Guardrails (fail-closed, in order):
- *   1. Tag fetch — single GHL API call, reused for all tag-based checks
- *   2. Suppression check (suppress-automation / dnc / do-not-contact) → BLOCK
- *   3. Conversation gate (stop-bot / pause-bot) → BLOCK
+ *   1. Tag fetch — single GHL API call
+ *   2. Suppression check (suppress-automation / dnc / do-not-contact)
+ *   3. Conversation gate (stop-bot / pause-bot)
  *   4. Rate limit (SEND_MESSAGE_RATE_LIMIT_MS, default 10min)
  *   5. AI generation (with compliance-gate short-circuit)
- *   6. Send (Webhook → Conversations API fallback)
+ *   6. Send (channel-routed: SMS=webhook, Email=Conv API; cross-fallback)
  *   7. GroupMe notification for human awareness
  */
 
@@ -74,13 +83,17 @@ const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
 const GHL_SEND_MESSAGE_WEBHOOK_URL = process.env.GHL_SEND_MESSAGE_WEBHOOK_URL || '';
 const RATE_LIMIT_MS = parseInt(process.env.SEND_MESSAGE_RATE_LIMIT_MS || '600000', 10); // default 10 min
 
-// v3.2: routing config
+// v3.3: channel-specific routing.
+// SEND_PRIMARY_PATH is a global override. Per-channel knobs win.
 const SEND_PRIMARY_PATH = (process.env.GHL_SEND_PRIMARY_PATH || 'webhook').toLowerCase();
-// Per-channel webhook opt-out (default: both on). Set to false to force
-// Conv-API-only for that channel — useful while the email branch in the
-// workflow is being fixed.
+// SMS: webhook by default (workflow Send-SMS-Reply works fine, threads naturally).
 const WEBHOOK_FOR_SMS = (process.env.GHL_SEND_SMS_VIA_WEBHOOK || 'true').toLowerCase() !== 'false';
-const WEBHOOK_FOR_EMAIL = (process.env.GHL_SEND_EMAIL_VIA_WEBHOOK || 'true').toLowerCase() !== 'false';
+// Email: Conv API by default in v3.3+ (only path that preserves threading).
+// Default flipped from 'true' (v3.2) to 'false' (v3.3) per Mark's threading
+// discovery. Setting to 'true' forces webhook for email anyway, which will
+// create a new email thread instead of replying in-thread. Avoid unless you
+// have a specific reason.
+const WEBHOOK_FOR_EMAIL = (process.env.GHL_SEND_EMAIL_VIA_WEBHOOK || 'false').toLowerCase() === 'true';
 
 // ═══════════════════════════════════════════════════════════════════
 // TAG HELPERS
@@ -211,19 +224,17 @@ async function ghlFetch(method, path, body = null) {
 }
 
 /**
- * PRIMARY (v3.2): POST to Mark's GHL "Send Reply" webhook workflow.
+ * POST to Mark's GHL "Send Reply" webhook workflow.
  *
  * Workflow: 497e664a-01ef-400d-aca5-1050d8eeccf8
- * Workflow expects:
- *   inboundWebhookRequest.contactId (used by Find Contact)
- *   inboundWebhookRequest.channel ('sms' | 'email')
- *   inboundWebhookRequest.message (used as SMS body / email body)
- *   inboundWebhookRequest.subject (email subject when Mark adds Email branch)
+ *
+ * GOOD FOR: SMS (Send-SMS-Reply action threads naturally per phone number)
+ * BAD FOR:  Email (Send-Email action creates a new thread, breaks reply
+ *           threading — use sendViaConversationsAPI instead)
  *
  * Returns { webhook_status } on success, throws on failure.
- *
- * NOTE: Returns 200 even if the workflow internally does nothing (e.g.
- * empty Email branch). The caller cannot detect silent drops.
+ * NOTE: HTTP 200 from GHL doesn't mean the workflow actually sent —
+ * if a branch is empty or misconfigured, the message silently drops.
  */
 async function sendViaWebhook(contactId, message, channel, subject, action) {
   if (!GHL_SEND_MESSAGE_WEBHOOK_URL) {
@@ -258,7 +269,13 @@ async function sendViaWebhook(contactId, message, channel, subject, action) {
 }
 
 /**
- * FALLBACK (v3.2): GHL Conversations API direct send.
+ * GHL Conversations API direct send.
+ *
+ * GOOD FOR: Email (POST with type=Email + conversationId +
+ *           conversationProviderId preserves email thread — In-Reply-To /
+ *           References headers handled by GHL internally)
+ * GOOD FOR: SMS too (lands in same conversation thread regardless)
+ *
  * Returns { conversationId, messageId } on success, null if no
  * conversation thread exists for this contact.
  */
@@ -281,8 +298,12 @@ async function sendViaConversationsAPI(contactId, message, channel, subject) {
 
   if (channel === 'email') {
     if (subject) msgBody.subject = subject;
+    // conversationProviderId is REQUIRED for in-thread email reply.
+    // Without it, GHL may create a new email thread.
     if (conversations[0].conversationProviderId) {
       msgBody.conversationProviderId = conversations[0].conversationProviderId;
+    } else {
+      console.warn(`[SendMessage] Email send for ${contactId}: no conversationProviderId — threading may break`);
     }
   }
 
@@ -296,52 +317,82 @@ async function sendViaConversationsAPI(contactId, message, channel, subject) {
 }
 
 /**
- * Routing decision: should the webhook be the primary path for this channel?
+ * Routing decision: which path is primary for this channel?
+ *
+ * Channel-specific defaults (v3.3):
+ *   SMS   → webhook (workflow handles threading-free)
+ *   Email → Conversations API (only path that preserves threading)
+ *
+ * Per-channel env var overrides take precedence over the global
+ * SEND_PRIMARY_PATH override.
+ *
+ * Returns 'webhook' | 'conversations_api'.
  */
-function shouldUseWebhookPrimary(channel) {
-  if (SEND_PRIMARY_PATH !== 'webhook') return false;
-  if (!GHL_SEND_MESSAGE_WEBHOOK_URL) return false;
-  if (channel === 'sms' && !WEBHOOK_FOR_SMS) return false;
-  if (channel === 'email' && !WEBHOOK_FOR_EMAIL) return false;
-  return true;
+function decidePrimaryPath(channel) {
+  // No webhook URL configured → must use Conv API
+  if (!GHL_SEND_MESSAGE_WEBHOOK_URL) return 'conversations_api';
+
+  // Global kill switch
+  if (SEND_PRIMARY_PATH === 'conversations_api') return 'conversations_api';
+
+  // Per-channel routing (v3.3 default)
+  if (channel === 'sms') {
+    return WEBHOOK_FOR_SMS ? 'webhook' : 'conversations_api';
+  }
+  if (channel === 'email') {
+    return WEBHOOK_FOR_EMAIL ? 'webhook' : 'conversations_api';
+  }
+
+  // Unknown channel — shouldn't happen due to upstream validation
+  return 'conversations_api';
 }
 
 /**
- * Try primary path, then fallback. Returns { result, sendMethod }.
+ * Try primary path, then cross-fallback. Returns { result, sendMethod }.
+ *
+ * sendMethod values:
+ *   'webhook'                       — webhook primary succeeded
+ *   'conversations_api'              — Conv API primary succeeded
+ *   'webhook_fallback'              — Conv API primary failed, webhook saved it
+ *   'conversations_api_fallback'    — webhook primary failed, Conv API saved it
  */
 async function sendWithFallback(contactId, message, channel, subject, action) {
-  const useWebhookFirst = shouldUseWebhookPrimary(channel);
+  const primary = decidePrimaryPath(channel);
 
-  if (useWebhookFirst) {
-    // Primary: webhook
+  if (primary === 'webhook') {
+    // Try webhook first
     try {
       const result = await sendViaWebhook(contactId, message, channel, subject, action);
       return { result, sendMethod: 'webhook' };
     } catch (err) {
       console.warn(`[SendMessage] Webhook primary failed for ${contactId} (${channel}): ${err.message} — falling back to Conv API`);
     }
-    // Fallback: Conversations API
+    // Fallback to Conv API
     try {
       const result = await sendViaConversationsAPI(contactId, message, channel, subject);
       if (result) return { result, sendMethod: 'conversations_api_fallback' };
     } catch (err) {
-      console.warn(`[SendMessage] Conversations API fallback also failed for ${contactId}: ${err.message}`);
+      console.warn(`[SendMessage] Conv API fallback also failed for ${contactId}: ${err.message}`);
     }
     throw new Error('Both webhook and Conversations API failed');
   }
 
-  // Conv API primary path (kill switch enabled, or webhook URL missing, or channel opted out)
+  // primary === 'conversations_api'
   try {
     const result = await sendViaConversationsAPI(contactId, message, channel, subject);
     if (result) return { result, sendMethod: 'conversations_api' };
   } catch (err) {
-    console.warn(`[SendMessage] Conv API primary failed for ${contactId}: ${err.message} — falling back to webhook`);
+    console.warn(`[SendMessage] Conv API primary failed for ${contactId} (${channel}): ${err.message} — falling back to webhook`);
   }
+  // Fallback to webhook (will create new thread for email — acceptable last resort)
   if (GHL_SEND_MESSAGE_WEBHOOK_URL) {
+    if (channel === 'email') {
+      console.warn(`[SendMessage] Email fallback to webhook for ${contactId} — reply will create new thread, not in-thread`);
+    }
     const result = await sendViaWebhook(contactId, message, channel, subject, action);
     return { result, sendMethod: 'webhook_fallback' };
   }
-  throw new Error('Conversations API failed and no webhook URL configured');
+  throw new Error('Conv API failed and no webhook URL configured');
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -502,7 +553,7 @@ export async function executeSendMessage(action, context) {
 
   if (!message) throw new Error('No message text after AI generation');
 
-  // ── Send (v3.2: webhook primary, Conv API fallback) ────────────
+  // ── Send (v3.3: channel-routed) ────────────────────────────────
   const { result: sendResult, sendMethod } = await sendWithFallback(
     contactId, message, channel, subject, action
   );
