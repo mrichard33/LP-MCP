@@ -1,6 +1,24 @@
 /**
  * LP Appointment Sync — src/lp-appointment-sync.js
  *
+ * v5.1.6: CALENDAR NAME RESOLUTION (fixes GroupMe N/A calendar field).
+ *
+ *   Three layers of calendar name resolution, in priority order:
+ *
+ *   1. Webhook body — `calendar_name` (existing) OR `calendar_id` (NEW).
+ *      `calendar_id` is mapped to a display name via CALENDAR_NAME_MAP.
+ *      APPT Handlers should send `calendar_id` in the webhook body
+ *      (the workflow knows which calendar fired it).
+ *
+ *   2. GHL appointments API — `enrichFromGHLContact` now fetches the
+ *      latest appointment in parallel with the contact GET. Pulls
+ *      calendarId + calendar metadata from the appointment record.
+ *
+ *   3. Fallback — appointment.title field, or 'N/A' as last resort.
+ *
+ *   CALENDAR_NAME_MAP covers the five live calendars per architecture spec:
+ *      Review Session, MV, Window Estimate, HPA, Confirmation Call.
+ *
  * v5.1.5: EMAIL MATCHING (Step 4) + AUTO-CLEAR `lp-sync-failed` ON SUCCESS.
  *
  *   Email matching joins phone in the last-resort tier — both run only
@@ -20,8 +38,8 @@
  * v5.1.1: Adds /webhook/ghl/lp-probe diagnostic endpoint.
  * v5.1: HLCID-first chain + manual-action fallback tag.
  *
- * v5.1.5 chain (each candidate validated against the live LP record
- *   AND must have lognumber === inbound GHL contact ID before accept):
+ * v5.1.6 resolution chain (each candidate validated against the live LP
+ *   record AND must have lognumber === inbound GHL contact ID before accept):
  *
  *   0. SUPABASE FAST-PATH — lp_leads.ghl_contact_id (cache hint,
  *      lognumber-validated). One DB query + one LP getLeadByLdsId.
@@ -44,7 +62,7 @@
  *   5. FAILURE — apply `lp-sync-failed` tag, GroupMe + GHL note.
  *
  * Endpoints:
- *   POST /webhook/ghl/set-lp-appointment — main sync entry (v5.1.5)
+ *   POST /webhook/ghl/set-lp-appointment — main sync entry (v5.1.6)
  *   POST /webhook/ghl/lp-probe          — diagnostic (v5.1.2)
  */
 
@@ -66,6 +84,7 @@ import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken } from './ghl-rate-limiter.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
+const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
 
 // GHL custom field IDs
 const LAST_APPT_DATE_FIELD  = 'x8KO5o89WPLfC7ivia3A';
@@ -75,6 +94,24 @@ const LP_INBOUND_ID_FIELD   = '3YMxheIlPyhACB8zyc3W';
 const LP_PROSPECT_ID_FIELD  = 'ZRQAVrzhtzApzLlHmT87';
 
 const LP_SYNC_FAILED_TAG = 'lp-sync-failed';
+
+// ─── Calendar ID → display name map (v5.1.6) ───────────────────
+// Source: system architecture spec (5 live calendars).
+// Used to translate calendar_id from webhook body or appointments API
+// into the human-readable name shown in GroupMe + GHL notes.
+const CALENDAR_NAME_MAP = {
+  'DQYMaJ22N6zL4SXjHukw': 'Review Session',
+  'zEdPmkNccR2ovo3rQAd3': 'MV',
+  'aJj14ONxh1oFyDcQ706O': 'Window Estimate',
+  'zS1wg0JqQ1zsszJyJqKX': 'HPA',
+  'gFWoSQrlKIdfRbAPV842': 'Confirmation Call',
+};
+
+function calendarNameFromId(calendarId) {
+  if (!calendarId) return null;
+  const id = String(calendarId).trim();
+  return CALENDAR_NAME_MAP[id] || null;
+}
 
 function cleanGHLValue(val) {
   if (val === 'null' || val === 'undefined' || val === '' || val == null) return null;
@@ -110,35 +147,83 @@ async function ghlFetch(method, path, body = null) {
   return ct.includes('application/json') ? res.json() : { status: res.status, ok: true };
 }
 
-async function enrichFromGHLContact(contactId) {
+/**
+ * v5.1.6: Fetch the most recent appointment for a contact.
+ * Used as fallback when calendar_id/calendar_name not in webhook body.
+ *
+ * Tries multiple endpoint shapes because GHL v2 has shifted the
+ * response structure between versions. Returns the most recent
+ * appointment by startTime descending, or null on failure.
+ */
+async function fetchLatestAppointment(contactId) {
+  if (!contactId) return null;
   try {
-    const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
-    const contact = ghlRes?.contact || {};
-    const fields = contact.customFields || [];
+    const qs = new URLSearchParams({ contactId });
+    if (GHL_LOCATION_ID) qs.set('locationId', GHL_LOCATION_ID);
+    const res = await ghlFetch('GET', `/calendars/events/appointments?${qs.toString()}`);
 
-    return {
-      phone: contact.phone || null,
-      email: contact.email || null,
-      name: [contact.firstName, contact.lastName].filter(Boolean).join(' ') || contact.name || null,
-      address1: contact.address1 || null,
-      postalCode: contact.postalCode || null,
-      city: contact.city || null,
-      state: contact.state || null,
-      prospectId: getCustomField(fields, LP_PROSPECT_ID_FIELD),
-      inboundId: getCustomField(fields, LP_INBOUND_ID_FIELD),
-      ghlLeadIdField: getCustomField(fields, LP_LEAD_ID_FIELD),
-      appointmentDate: getCustomField(fields, LAST_APPT_DATE_FIELD),
-      appointmentTime: getCustomField(fields, LAST_APPT_TIME_FIELD),
-    };
+    // Response can be { events: [...] } | { appointments: [...] } | [...]
+    const list = res?.events || res?.appointments || (Array.isArray(res) ? res : null) || [];
+    if (!Array.isArray(list) || list.length === 0) return null;
+
+    const sorted = list
+      .filter(a => a && (a.startTime || a.start_time || a.startsAt))
+      .sort((a, b) => {
+        const ta = new Date(a.startTime || a.start_time || a.startsAt).getTime();
+        const tb = new Date(b.startTime || b.start_time || b.startsAt).getTime();
+        return tb - ta;
+      });
+    return sorted[0] || list[0] || null;
   } catch (err) {
-    console.warn(`[LP-APPT] GHL enrichment failed for ${contactId}: ${err.message}`);
-    return {
-      phone: null, email: null, name: null,
-      address1: null, postalCode: null, city: null, state: null,
-      prospectId: null, inboundId: null, ghlLeadIdField: null,
-      appointmentDate: null, appointmentTime: null,
-    };
+    console.warn(`[LP-APPT] fetchLatestAppointment failed for ${contactId}: ${err.message}`);
+    return null;
   }
+}
+
+async function enrichFromGHLContact(contactId) {
+  // v5.1.6: parallel fetch — contact GET + latest appointment.
+  // Both are best-effort; either failing leaves the field null and
+  // the caller falls through to whatever was already in the webhook body.
+  const [contactRes, latestAppt] = await Promise.all([
+    ghlFetch('GET', `/contacts/${contactId}`).catch(err => {
+      console.warn(`[LP-APPT] GHL contact fetch failed for ${contactId}: ${err.message}`);
+      return null;
+    }),
+    fetchLatestAppointment(contactId),
+  ]);
+
+  const contact = contactRes?.contact || {};
+  const fields = contact.customFields || [];
+
+  // Calendar resolution: appointment.calendarId → name map → appointment.title fallback
+  let calendarId = null;
+  let calendarName = null;
+  if (latestAppt) {
+    calendarId = latestAppt.calendarId || latestAppt.calendar_id || null;
+    if (calendarId) {
+      calendarName = calendarNameFromId(calendarId);
+    }
+    if (!calendarName) {
+      calendarName = latestAppt.calendarName || latestAppt.calendar_name || latestAppt.title || null;
+    }
+  }
+
+  return {
+    phone: contact.phone || null,
+    email: contact.email || null,
+    name: [contact.firstName, contact.lastName].filter(Boolean).join(' ') || contact.name || null,
+    address1: contact.address1 || null,
+    postalCode: contact.postalCode || null,
+    city: contact.city || null,
+    state: contact.state || null,
+    prospectId: getCustomField(fields, LP_PROSPECT_ID_FIELD),
+    inboundId: getCustomField(fields, LP_INBOUND_ID_FIELD),
+    ghlLeadIdField: getCustomField(fields, LP_LEAD_ID_FIELD),
+    appointmentDate: getCustomField(fields, LAST_APPT_DATE_FIELD),
+    appointmentTime: getCustomField(fields, LAST_APPT_TIME_FIELD),
+    calendarId,
+    calendarName,
+  };
 }
 
 const BOOKABLE_DISPOSITIONS = new Set([
@@ -534,7 +619,7 @@ ACTION:
   });
 
   await addGHLNote(contactId,
-    `[LP SYNC v5.1.5] Appointment NOT synced — full lognumber-validated chain failed.\n` +
+    `[LP SYNC v5.1.6] Appointment NOT synced — full lognumber-validated chain failed.\n` +
     `Tried (in priority order): supabase+lognumber, GHL field+lognumber, prospect+lognumber, phone+lognumber (last resort), email+lognumber (last resort).\n` +
     `LP IDs: ${idsLine}\n` +
     `Appt: ${apptLine}\n` +
@@ -638,11 +723,11 @@ async function syncAppointmentToLP({
   const result = await lpSetAppointment({ ldsId, setBy: '5686', apptDate, apptTime });
 
   await addGHLNote(contactId,
-    `[LP SYNC v5.1.5] Appointment set\nLP Lead: ${ldsId} (via ${source}, step ${step})\nProspect: ${prospectId || 'N/A'}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName || 'N/A'}`
+    `[LP SYNC v5.1.6] Appointment set\nLP Lead: ${ldsId} (via ${source}, step ${step})\nProspect: ${prospectId || 'N/A'}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName || 'N/A'}`
   ).catch(() => {});
 
   await sendGroupMeMessage(
-    `📅 LP Appointment Set (v5.1.5 ID-first)\n` +
+    `📅 LP Appointment Set (v5.1.6 ID-first)\n` +
     `👤 ${contactName || contactId}\n` +
     `📋 LP Lead: ${ldsId} (${source}, step ${step}) | Prospect: ${prospectId || 'N/A'}\n` +
     `📅 ${apptDate} ${apptTime} | ${calendarName || 'N/A'}`
@@ -858,12 +943,18 @@ export function registerLPAppointmentSyncRoutes(app) {
       let contactEmail = cleanGHLValue(body.contact_email || body.contactEmail || body.email) || '';
       let contactName  = cleanGHLValue(body.contact_name || body.contactName || body.name) || '';
       let calendarName = cleanGHLValue(body.calendar_name || body.calendarName || body.title) || '';
+      let calendarId   = cleanGHLValue(body.calendar_id || body.calendarId) || '';
       let address1     = cleanGHLValue(body.address1 || body.address) || '';
       let postalCode   = cleanGHLValue(body.postal_code || body.postalCode || body.zip) || '';
       let city         = cleanGHLValue(body.city) || '';
       let state        = cleanGHLValue(body.state) || '';
 
-      const needsEnrich = !appointmentDate || !appointmentTime || !prospectId || !contactPhone || !address1 || !contactEmail;
+      // v5.1.6: if calendar_id provided but no name yet, try the map first
+      if (!calendarName && calendarId) {
+        calendarName = calendarNameFromId(calendarId) || '';
+      }
+
+      const needsEnrich = !appointmentDate || !appointmentTime || !prospectId || !contactPhone || !address1 || !contactEmail || !calendarName;
       if (needsEnrich) {
         console.log(`[LP-APPT] Self-enriching from GHL API for ${contactId}`);
         const enriched = await enrichFromGHLContact(contactId);
@@ -879,6 +970,13 @@ export function registerLPAppointmentSyncRoutes(app) {
         if (!postalCode && enriched.postalCode) postalCode = enriched.postalCode;
         if (!city && enriched.city) city = enriched.city;
         if (!state && enriched.state) state = enriched.state;
+        // v5.1.6: calendar resolution from enrichment (if still missing)
+        if (!calendarId && enriched.calendarId) calendarId = enriched.calendarId;
+        if (!calendarName && enriched.calendarName) calendarName = enriched.calendarName;
+        // Final attempt at the map with the freshly-enriched ID
+        if (!calendarName && calendarId) {
+          calendarName = calendarNameFromId(calendarId) || '';
+        }
       }
 
       if (!appointmentDate || !appointmentTime) {
@@ -934,8 +1032,8 @@ export function registerLPAppointmentSyncRoutes(app) {
     }
   });
 
-  console.log('[LP-APPT] Registered: POST /webhook/ghl/set-lp-appointment (v5.1.5 ID-first, phone+email last resort, auto tag cleanup)');
+  console.log('[LP-APPT] Registered: POST /webhook/ghl/set-lp-appointment (v5.1.6 calendar-name resolution + ID-first chain)');
   console.log('[LP-PROBE] Registered: POST /webhook/ghl/lp-probe (v5.1.2 diagnostic w/ userfields+lognumber)');
 }
 
-export { resolveLPLeadId, syncAppointmentToLP, extractHLCID, findLeadByHLCID, probeLPForContact };
+export { resolveLPLeadId, syncAppointmentToLP, extractHLCID, findLeadByHLCID, probeLPForContact, fetchLatestAppointment, calendarNameFromId, CALENDAR_NAME_MAP };
