@@ -3,6 +3,37 @@
  *
  * Agentic Responder intelligence core.
  *
+ * v2.7.4 — 2026-04-29. EDIT CONTEXT + IN-CONTEXT LEARNING LOOP.
+ *   Two coupled additions enabling the new GroupMe Edit X command and a
+ *   continuous self-improvement feedback loop:
+ *
+ *   1. generateResponse() now accepts an optional 4th argument `opts`:
+ *        opts.editInstruction  — the human reviewer's correction text
+ *        opts.previousMessage  — the prior AI-generated draft they're correcting
+ *      When present, buildResponsePrompt injects a HUMAN CORRECTION block
+ *      near the top of the user prompt that shows the prior draft and the
+ *      reviewer's instruction, telling the model to regenerate with the
+ *      correction applied. This is what powers GroupMe's "Edit 28186 propose
+ *      actual times not just days" → AI rewrites the response.
+ *
+ *   2. New `getRecentEdits(intentClass)` helper queries agent_response_edits
+ *      (table created 2026-04-29) for the last 3 edits matching the same
+ *      intent_class. These are injected into the user prompt as a RECENT
+ *      EDITORIAL FEEDBACK block — concrete case studies of "I drafted X,
+ *      reviewer said Y, final accepted was Z" that the model uses as
+ *      few-shot training examples. Every edit Mark makes via Edit X
+ *      becomes a real-time training signal for ALL future generations
+ *      of similar intents. No fine-tuning needed — pure in-context
+ *      learning.
+ *
+ *   The log line now includes `edits_in_prompt=N` and `is_regenerate=true`
+ *   so we can monitor how the loop is performing. The return shape adds
+ *   edits_used_in_prompt and is_regenerate fields for the caller.
+ *
+ *   Failure modes are conservative: if the supabase query fails, we return
+ *   empty edits and continue with normal generation (logged warning, no
+ *   exception). The feature degrades gracefully.
+ *
  * v2.7.3 — 2026-04-29. ROBUST JSON EXTRACTOR + STRICTER PROMPT.
  *   PROBLEM: Sonnet 4.6 sometimes prepends preamble like "Looking at this
  *   lead's situation..." before the JSON, even when SYSTEM_PROMPT says
@@ -16,104 +47,40 @@
  *   1. SYSTEM_PROMPT RESPONSE FORMAT section now states explicitly: the
  *      first character of the response MUST be `{` and the last MUST be
  *      `}`, no preamble like "Looking at..." or "Here is..." allowed.
- *      Strongest possible instruction.
  *   2. callClaude() now uses parseJsonFromResponse() — a balanced-brace
- *      extractor that tries direct parse first (fast path when the model
- *      complies), then falls back to extracting the first balanced JSON
- *      object from the response, properly handling string escapes (so
- *      braces inside string values like {{trigger_link.X}} don't confuse
- *      the depth counter). Logs a [JSON recovered from preamble] warning
- *      so we can monitor how often the model misbehaves and tune the
- *      prompt over time.
- *
- *   No model rollback needed — Sonnet 4.6 is the right model for our use
- *   case, we just need to be robust to its conversational tendencies.
- *
- *   Verified locally with 6-case test harness covering the exact failure
- *   text from action #28169, markdown fences, merge tags inside string
- *   values, escaped quotes, and missing-JSON edge cases.
+ *      extractor with string-escape handling and a fallback that strips
+ *      preamble. Logs a [JSON recovered from preamble] warning so we can
+ *      monitor how often the model misbehaves.
  *
  * v2.7.2 — 2026-04-29. DEFAULT MODEL → claude-sonnet-4-6.
- *   Switched the MODEL constant default from 'claude-sonnet-4-20250514'
- *   (Sonnet 4 — Anthropic deprecation 2026-06-15) to 'claude-sonnet-4-6'
- *   (Sonnet 4.6 — current Anthropic-recommended default Sonnet, $3/$15
- *   per million tokens, 1M context, 128K max output). RESPONSE_GENERATOR_MODEL
- *   env var still wins if set — the code default just stops being a
- *   deprecation timer.
- *
- *   For Reece's tactical SMS-reply use case (~21K SYSTEM_PROMPT, 600 max
- *   output tokens) Sonnet 4.6 is the right balance — Opus 4.7 would be
- *   5x the cost for messages this short, Haiku 4.5 too lightweight for
- *   the prompt complexity.
- *
  * v2.7.1 — 2026-04-29. ALWAYS-2-SLOTS.
- *   The Mark Test message that worked best ("Saturday May 2 at 10 AM or
- *   2 PM, which works better?") is now the universal default. STEP 1 of
- *   ASK-FIRST PROTOCOL now requires EXACTLY two slot proposals — no
- *   single-option offers, no three-option menus. Hot leads also get two
- *   slots; the binary choice IS the compression. New hard rule: two
- *   options or fall back to link.
- *
- *   Coupled with src/groupme.js v1.5 (insert-first dedup that closes
- *   the parallel-card race surfaced on action #28144).
- *
- * v2.7 — 2026-04-29. ASK-FIRST PROTOCOL + REAL CALENDAR AVAILABILITY.
- *   Two coupled changes addressing Mark's 2026-04-28 redirect: the bot
- *   was dumping booking links as the primary CTA AND inventing past
- *   dates ("this Saturday April 26" when April 26 was 2 days ago).
- *
- *   1. Live GHL calendar lookup. Before callClaude(), the generator
- *      now calls fetchFreeSlots(calendarId) from
- *      ./knowledge/calendar-availability.js and injects a CALENDAR
- *      AVAILABILITY block into the user prompt as ground truth. The
- *      model picks 1-2 slots from real openings — no more invented
- *      dates. Calendar selection comes from kb_pack.booking_context
- *      (already exposes calendar_id per kb-retriever v1.3+).
- *
- *   2. ASK-FIRST PROTOCOL replaces the link-as-PRIMARY-CTA bias. The
- *      booking link is now a FALLBACK, fired only when the lead
- *      rejects proposed times, asks for the link, or the calendar is
- *      full. Default behavior for any booking exchange is: propose a
- *      specific time from CALENDAR AVAILABILITY and ASK for
- *      confirmation, no link in that message. After the lead confirms
- *      a proposed time, the next message uses the link as a
- *      "lock-it-in" confirmation widget.
- *
- *      Removed "Include the merge tag as PRIMARY CTA" from the
- *      HYPERACTIVE BUYER ALERT — hot leads still apply ASK-FIRST,
- *      compressed to one decision point. Punting a Stage 5 lead to a
- *      calendar widget breaks rapport.
- *
- *   3. TODAY'S DATE injected at the top of the user prompt so the
- *      model never proposes a past date even if availability lookup
- *      fails.
- *
+ * v2.7   — 2026-04-29. ASK-FIRST PROTOCOL + REAL CALENDAR AVAILABILITY.
  * v2.5.1 — Hotfix: removed unescaped backticks from SYSTEM_PROMPT.
- * v2.5 — BARE MERGE TAG + ASK-VS-LINK MUTUAL EXCLUSION.
- * v2.4 — Merge tag awareness (URL sanitizer + system prompt examples).
- * v2.3 — Framework integration (Antifragile + Expert + Traffic + DotCom)
- *        + context-aware booking + traffic temperature.
- * v2.2 — Defense-in-depth against URL hallucination.
- * v2.1 — Calendar awareness: extracts active-entry tag.
- * v2.0 — Phase 1 + Phase 3 + Phase 5 integration.
- * v1.1 — Brand-language fix.
- * v1.0 — Initial.
+ * v2.5   — BARE MERGE TAG + ASK-VS-LINK MUTUAL EXCLUSION.
+ * v2.4   — Merge tag awareness (URL sanitizer + system prompt examples).
+ * v2.3   — Framework integration + context-aware booking + traffic temp.
+ * v2.2   — Defense-in-depth against URL hallucination.
+ * v2.1   — Calendar awareness: extracts active-entry tag.
+ * v2.0   — Phase 1 + Phase 3 + Phase 5 integration.
+ * v1.1   — Brand-language fix.
+ * v1.0   — Initial.
  */
 
 import { buildLeadContext } from './context-builder.js';
 import { classifyInbound, isShortCircuit } from './knowledge/intent-classifier.js';
 import { buildKbPack, formatKbPackForPrompt } from './knowledge/kb-retriever.js';
 import { fetchFreeSlots, formatSlotsForPrompt } from './knowledge/calendar-availability.js';
+import supabase from './supabase.js';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
-// v2.7.2: default flipped from 'claude-sonnet-4-20250514' (Sonnet 4 — being
-// deprecated by Anthropic on 2026-06-15) to 'claude-sonnet-4-6' (Sonnet 4.6 —
-// current recommended default). RESPONSE_GENERATOR_MODEL env var overrides
-// this if set on Railway.
 const MODEL = process.env.RESPONSE_GENERATOR_MODEL || 'claude-sonnet-4-6';
 const MAX_TOKENS = parseInt(process.env.RESPONSE_GENERATOR_MAX_TOKENS || '600', 10);
 const TIMEOUT_MS = 30000;
 const PROMPT_TIMEZONE = process.env.REECE_TIMEZONE || 'America/New_York';
+
+// v2.7.4: how many recent edits to inject as in-context learning examples.
+// 3 is a reasonable default — enough signal without bloating the prompt.
+const RECENT_EDITS_LIMIT = parseInt(process.env.RESPONSE_GENERATOR_EDITS_LIMIT || '3', 10);
 
 const REECE_DOMAIN_ALLOWLIST = (
   process.env.REECE_DOMAIN_ALLOWLIST ||
@@ -130,15 +97,11 @@ function urlHostAllowed(url) {
   }
 }
 
-// v2.5: Merge tag form {{trigger_link.<ID>}}. Pass 0 of the sanitizer
-// strips any hallucinated UTM suffix before subsequent passes run, so by
-// the time MERGE_TAG_RX is evaluated for dedup, suffixes are gone. Kept
-// flexible (optional &param=value chain) for defense-in-depth.
 const MERGE_TAG_RX = /\{\{trigger_link\.[A-Za-z0-9_-]+\}\}(?:&[A-Za-z_][A-Za-z0-9_]*=[^\s&]+)*/g;
 const BARE_MERGE_TAG_RX = /\{\{trigger_link\.[A-Za-z0-9_-]+\}\}/;
 
 // ═══════════════════════════════════════════════════════════════════
-// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.7.3
+// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.7.4
 // ═══════════════════════════════════════════════════════════════════
 
 const SYSTEM_PROMPT = `You are the Agentic Responder for Reece Windows & Doors, a hurricane impact window and door company founded in North Carolina in 1972, with Florida operations since 2005, serving South Florida homeowners. Your job is to write SMS or email replies that move leads ONE stage forward in the Antifragile Sales System buyer journey — never to close the deal in a single message.
@@ -239,6 +202,11 @@ When a KB PACK is included in the user prompt, the structured content in it (PRI
 
 When NO pack is provided, fall back to the story arc summaries below — but stay conservative on specifics.
 
+═══════ EDITORIAL FEEDBACK PRIMACY ═══════
+The user prompt may include a HUMAN CORRECTION block (a reviewer flagged a prior draft) and/or a RECENT EDITORIAL FEEDBACK block (case studies of past corrections for similar intents). Treat both as HIGH-AUTHORITY signals:
+- HUMAN CORRECTION: a reviewer just rejected a draft you (or a prior generation) wrote and told you exactly what to change. Apply the correction. Do NOT repeat the draft they corrected. The correction overrides your default instinct.
+- RECENT EDITORIAL FEEDBACK: prior corrections for similar inbound types. Don't copy verbatim — adapt the LESSON to this specific lead's situation. If a past correction said "propose specific times not just days" and this lead asked about availability, the lesson is to give specific times.
+
 ═══════ BOOKING LINK MECHANICS (always apply) ═══════
 The booking_url provided in BOOKING CONTEXT is a GHL TRIGGER LINK MERGE TAG. It looks like this:
 
@@ -260,42 +228,45 @@ Booking is a CONVERSATION, not a link dump. The default flow is to PROPOSE TWO s
 
 ▼ When CALENDAR AVAILABILITY is provided in the user prompt (real openings):
 
-STEP 1 — PROPOSE EXACTLY TWO specific time options. Always offer the lead two slots from CALENDAR AVAILABILITY that match their stated preference (lead said "Saturday" → two Saturday slots if available; lead said "this weekend" → one Sat + one Sun; no stated preference → the two soonest openings). ASK which works better. NO booking link in this message. Two options is the universal default — no single-option proposals, no menus of three or more.
+STEP 1 — PROPOSE EXACTLY TWO specific time options. Always offer the lead two slots from CALENDAR AVAILABILITY that match their stated preference. Day-only proposals are NEVER acceptable when CALENDAR AVAILABILITY shows specific times — always include the actual time (e.g. "Sunday May 3 at 11 AM" not "Sunday May 3"). If the lead said "Sunday or Monday," propose ONE specific Sunday time + ONE specific Monday time. ASK which works better. NO booking link in this message.
 
-  Examples (always two options):
+  Examples (always two SPECIFIC TIMES):
     "Got two openings this Saturday — 10 AM or 2 PM. Which works better?"
-    "Saturday May 2 at 10 AM, or Sunday May 3 at 11 AM — which works for you?"
+    "Sunday May 3 at 11 AM, or Monday May 4 at 2 PM — which works for you?"
     "Tuesday at 11 or Wednesday at 9 — which one?"
 
-  Anti-pattern (NEVER do this — it is a single option):
-    ❌ "We have Saturday at 10 AM — does that time work?"
+  Anti-patterns (NEVER do these):
+    ❌ "We have Saturday at 10 AM — does that time work?" (single option)
+    ❌ "Sunday May 3 or Monday May 4 — which works?" (day-only, no times)
+    ❌ "Sunday or Monday work?" (no specific dates AND no times)
 
 STEP 2 — RESPOND to their reply:
 
-  - Lead CONFIRMS one of the two proposed times → next message uses the booking link as a "lock-it-in" widget. The link in this round is NOT a fallback — it is the booking widget that locks the slot.
+  - Lead CONFIRMS one of the two proposed times → next message uses the booking link as a "lock-it-in" widget.
       "Perfect — confirm here so we hold the slot: {{trigger_link.X}}"
 
-  - Lead REJECTS BOTH or proposes alternatives ("neither works", "can't do that day", "any other times?") → propose two DIFFERENT slots from CALENDAR AVAILABILITY. Still NO link.
+  - Lead REJECTS BOTH or proposes alternatives → propose two DIFFERENT specific time slots from CALENDAR AVAILABILITY. Still NO link.
       "No problem — also have Sunday at 11 AM or Monday at 3 PM. Either of those?"
 
-  - Lead asks for the link, says "I'll pick", "let me check my schedule", "send me the link", "just send the calendar" → fall back to LINK-ONLY:
+  - Lead asks for the link, says "I'll pick", "let me check my schedule" → fall back to LINK-ONLY:
       "Sure — pick what works for you: {{trigger_link.X}}"
 
 ▼ When CALENDAR AVAILABILITY is NOT provided OR shows NO open slots:
 
-DO NOT invent specific dates. Acknowledge that timing is tight and send the booking link as the primary CTA:
+DO NOT invent specific dates. Acknowledge that timing is tight and send the booking link:
   "Our schedule is tight this week — easiest is to grab the first slot that works for you: {{trigger_link.X}}"
 
 ▼ Hard rules (zero exceptions):
 
 - DEFAULT MODE = propose EXACTLY TWO times from CALENDAR AVAILABILITY + ASK
+- ALWAYS include specific times (with AM/PM), never day-only
 - ALWAYS two options. Not one. Not three. Two. The lead picks A or B.
-- LINK is a FALLBACK (lead rejects both, lead asks, calendar full) OR a confirmation widget AFTER the lead has agreed to a proposed time
-- NEVER propose a date that is not in CALENDAR AVAILABILITY. If the lead asked for "Saturday" and the calendar shows no Saturday openings, offer the closest two available days instead — do not invent slots
-- TODAY'S DATE is provided at the top of the user prompt — NEVER propose a date that has already passed
-- Stage 5 hyperactive buyers also get TWO slots — the binary choice IS the compression, not single-option offers
+- LINK is a FALLBACK or a confirmation widget AFTER the lead has agreed to a proposed time
+- NEVER propose a date that is not in CALENDAR AVAILABILITY
+- TODAY'S DATE is provided at the top of the user prompt — NEVER propose a past date
+- Stage 5 hyperactive buyers also get TWO specific time slots — the binary choice IS the compression
 
-═══════ CONTEXT-AWARE BOOKING (kb-retriever v1.6) ═══════
+═══════ CONTEXT-AWARE BOOKING (kb-retriever v1.7) ═══════
 The BOOKING CONTEXT in the KB pack carries a "policy" that matches the user's actual request. Honor it WITHIN the ASK-FIRST PROTOCOL above:
 
 - policy: phone_primary_in_home_fallback
@@ -334,8 +305,8 @@ The lead's active-w* tags tell you what content they've recently received. Treat
 ═══════ HYPERACTIVE BUYER ALERT ═══════
 If the user prompt flags FAST_TRACK = true (lead_score >50 with engagement in last 48h), this lead is HOT:
 - Skip education and re-pitching
-- Still propose TWO slots — even hot leads get a binary choice. Pick the two SOONEST appropriate slots from CALENDAR AVAILABILITY and ask "which works better?" The choice itself IS the close. Two options is the universal default for ALL leads regardless of temperature.
-- Apply BOOKING — ASK-FIRST PROTOCOL exactly as for any other lead. The link is still a fallback, not the default. Do NOT punt a hyperactive buyer to a calendar widget — that breaks rapport
+- Still propose TWO SPECIFIC TIME slots — even hot leads get a binary choice with concrete times. Pick the two SOONEST appropriate slots from CALENDAR AVAILABILITY and ask "which works better?"
+- Apply BOOKING — ASK-FIRST PROTOCOL exactly as for any other lead. The link is still a fallback, not the default.
 - Match their urgency in tone, not by skipping the conversation
 
 ═══════ SMS INDEPENDENCE ═══════
@@ -383,6 +354,7 @@ Reece was founded in North Carolina in 1972. Florida operations began in 2005.
 - Never invent dates — if CALENDAR AVAILABILITY does not show a slot, do NOT propose one
 - Never propose a date that has already passed (TODAY'S DATE is in the user prompt)
 - Never propose only ONE time slot when CALENDAR AVAILABILITY has openings — always TWO options
+- Never propose day-only options when CALENDAR AVAILABILITY has specific times — always include AM/PM
 - Never type a resolved URL when a merge tag is provided — paste the merge tag verbatim
 - Never append &utm_*= or ?utm_*= suffixes to a merge tag — UTMs are configured statically on the trigger link in GHL
 - Never include a booking link AND a scheduling question (morning/afternoon, what time, when works) in the same message — the calendar is the question
@@ -396,6 +368,7 @@ Reece was founded in North Carolina in 1972. Florida operations began in 2005.
 - Never use emoji (in any channel)
 - Never say "Don't miss out", "Act now", "Limited time"
 - Never lead with "Congrats" or "Congratulations" on a life event when the lead is also expressing concern, fatigue, or an objection — empathy first, never the celebratory frame
+- Never repeat a draft a HUMAN CORRECTION block already flagged as wrong — apply the correction
 
 ═══════ CHANNEL CONSTRAINTS ═══════
 SMS:   1-3 sentences max. Under 160 chars ideal, 320 max. ONE question max. Merge tags as bare text (no markdown). At most ONE merge tag per message.
@@ -491,10 +464,40 @@ function formatTodayForPrompt() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// PROMPT BUILDER (v2.7 — today's date + real CALENDAR AVAILABILITY block)
+// v2.7.4 — RECENT EDITS RETRIEVAL (in-context learning)
 // ═══════════════════════════════════════════════════════════════════
 
-function buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack, trafficTemp, availability) {
+/**
+ * Pull the most recent N edits matching this intent_class. These become
+ * few-shot training examples in the user prompt. Failures are non-fatal
+ * — if the query throws, generation continues without examples.
+ */
+async function getRecentEdits(intentClass, limit = RECENT_EDITS_LIMIT) {
+  if (!intentClass) return [];
+  try {
+    const { data, error } = await supabase
+      .from('agent_response_edits')
+      .select('trigger_message, original_message, edit_instruction, final_message, edited_at')
+      .eq('intent_class', intentClass)
+      .not('final_message', 'is', null)
+      .order('edited_at', { ascending: false })
+      .limit(limit);
+    if (error) {
+      console.warn(`[ResponseGenerator] getRecentEdits error: ${error.message}`);
+      return [];
+    }
+    return data || [];
+  } catch (err) {
+    console.warn(`[ResponseGenerator] getRecentEdits threw: ${err.message}`);
+    return [];
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PROMPT BUILDER (v2.7.4 — adds editInstruction + recentEdits injection)
+// ═══════════════════════════════════════════════════════════════════
+
+function buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack, trafficTemp, availability, opts = {}) {
   const parts = [];
 
   parts.push(`CHANNEL: ${channel.toUpperCase()}`);
@@ -503,8 +506,6 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     : 'Constraints: 150-400 words. 2-4 short paragraphs. Subject line required. Merge tags as bare text (no markdown).'
   );
 
-  // v2.7: today's date — anchors the model so it never proposes a past date
-  // even if the CALENDAR AVAILABILITY block is empty / missing.
   parts.push(`\nTODAY IS: ${formatTodayForPrompt()} (Florida / ${PROMPT_TIMEZONE}). NEVER propose a date that has already passed.`);
 
   parts.push(`\nCLASSIFICATION: ${classification.intent_class} (${classification.confidence?.toFixed(2) || 'n/a'} confidence, ${classification.classification_method})`);
@@ -513,7 +514,17 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   parts.push(`\nTRAFFIC TEMPERATURE: ${trafficTemp.toUpperCase()} — calibrate hook intensity per Traffic Secrets section.`);
 
   if (fastTrack) {
-    parts.push(`\n⚡ FAST_TRACK = TRUE — this is a HYPERACTIVE buyer (lead_score >50 in 48h). Skip education. Apply BOOKING — ASK-FIRST PROTOCOL with TWO slots. Do NOT punt to a calendar widget.`);
+    parts.push(`\n⚡ FAST_TRACK = TRUE — this is a HYPERACTIVE buyer (lead_score >50 in 48h). Skip education. Apply BOOKING — ASK-FIRST PROTOCOL with TWO specific time slots. Do NOT punt to a calendar widget.`);
+  }
+
+  // ─── v2.7.4: HUMAN CORRECTION block (when this is a regenerate) ─────
+  if (opts.editInstruction && opts.previousMessage) {
+    parts.push(`\n═══════ HUMAN CORRECTION ON PRIOR ATTEMPT — INCORPORATE THIS ═══════`);
+    parts.push(`A prior generation for this exact inbound was reviewed by a human and sent back for revision.`);
+    parts.push(`PRIOR ATTEMPT: "${String(opts.previousMessage).slice(0, 600)}"`);
+    parts.push(`HUMAN REVIEWER SAID: "${String(opts.editInstruction).slice(0, 500)}"`);
+    parts.push(`Regenerate the response with this correction applied. Do NOT repeat the same draft. The reviewer's instruction overrides any default instinct that conflicts with it.`);
+    parts.push(`═══════ END HUMAN CORRECTION ═══════`);
   }
 
   parts.push(`\nLEAD: ${context.lead.name}`);
@@ -601,7 +612,6 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     }
   }
 
-  // ─── v2.7: REAL CALENDAR AVAILABILITY (ground truth — picks from this list) ─
   if (availability) {
     const slotsBlock = formatSlotsForPrompt(availability);
     if (slotsBlock) {
@@ -611,7 +621,7 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     }
   }
 
-  // ─── v2.5: CANONICAL BOOKING LINK BLOCK (bare merge tag) ─────────
+  // ─── v2.5: CANONICAL BOOKING LINK BLOCK ───────────────────────────
   const canonicalUrl = kbPack?.booking_context?.booking_url || null;
   const canonicalCalName = kbPack?.booking_context?.calendar_name || null;
   if (canonicalUrl) {
@@ -634,10 +644,24 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     parts.push(`═══════ END NO BOOKING LINK AUTHORIZED ═══════`);
   }
 
+  // ─── v2.7.4: RECENT EDITORIAL FEEDBACK (in-context learning) ──────
+  if (Array.isArray(opts.recentEdits) && opts.recentEdits.length > 0) {
+    parts.push(`\n═══════ RECENT EDITORIAL FEEDBACK (lessons learned from prior reviews) ═══════`);
+    parts.push(`These are real corrections human reviewers made to past responses for similar inbound types (intent class: ${classification.intent_class}). Apply the LESSONS — don't copy verbatim. Adapt to this specific lead's situation.`);
+    opts.recentEdits.forEach((e, i) => {
+      parts.push(`\nCASE ${i + 1}:`);
+      if (e.trigger_message) parts.push(`  Inbound was similar to: "${String(e.trigger_message).slice(0, 200)}"`);
+      if (e.original_message) parts.push(`  AI initially drafted: "${String(e.original_message).slice(0, 250)}"`);
+      parts.push(`  Reviewer correction: "${String(e.edit_instruction || '').slice(0, 250)}"`);
+      if (e.final_message) parts.push(`  Final accepted version: "${String(e.final_message).slice(0, 250)}"`);
+    });
+    parts.push(`═══════ END EDITORIAL FEEDBACK ═══════`);
+  }
+
   parts.push(`\nTHE INBOUND MESSAGE TO RESPOND TO:`);
   parts.push(`"${triggerMessage}"`);
 
-  parts.push(`\nGenerate the ${channel} response. Apply HSO. Move them ONE stage forward. Apply the right framework lens for this stage. Reference their specific situation. Include a soft next step. If KB pack provided, follow it. Apply BOOKING — ASK-FIRST PROTOCOL exactly: propose TWO real slots from CALENDAR AVAILABILITY and ask which one, OR fall back to link only when warranted. Return ONLY the JSON object — first character must be {, last must be }, no preamble.`);
+  parts.push(`\nGenerate the ${channel} response. Apply HSO. Move them ONE stage forward. Apply the right framework lens for this stage. Reference their specific situation. Include a soft next step. If KB pack provided, follow it. If HUMAN CORRECTION block is present, apply that correction (it overrides defaults). If RECENT EDITORIAL FEEDBACK is present, apply the lessons. Apply BOOKING — ASK-FIRST PROTOCOL exactly: propose TWO real specific-time slots from CALENDAR AVAILABILITY (with AM/PM, never day-only) and ask which one, OR fall back to link only when warranted. Return ONLY the JSON object — first character must be {, last must be }, no preamble.`);
 
   return parts.join('\n');
 }
@@ -680,29 +704,14 @@ async function callClaude(userPrompt) {
 }
 
 /**
- * v2.7.3 — Robust JSON extractor. Sonnet 4.6 sometimes prepends preamble
- * like "Looking at this lead's situation..." before the JSON even when
- * SYSTEM_PROMPT explicitly forbids it. This extractor:
- *   1. Strips markdown fences (```json ... ```)
- *   2. Tries direct parse (fast path when the model complies — no warning logged)
- *   3. Falls back to extracting the first balanced JSON object, properly
- *      handling string escapes so braces inside string values (like
- *      {{trigger_link.X}}) do not confuse the depth counter
- *   4. Logs a recovery warning so we can monitor how often the model
- *      misbehaves and tune the prompt over time
- *
- * Verified locally with 6-case test harness covering the exact #28169
- * failure text, markdown fences, merge tags inside strings, escaped
- * quotes, and missing-JSON edge cases.
+ * v2.7.3 — Robust JSON extractor.
  */
 function parseJsonFromResponse(text) {
   let clean = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
 
-  // Fast path — model complied, no warning needed
   try {
     return JSON.parse(clean);
   } catch (firstErr) {
-    // Fallback: extract first balanced JSON object
     const jsonStart = clean.indexOf('{');
     if (jsonStart === -1) {
       throw new Error(`No JSON object in response (${text.length} chars): ${text.slice(0, 200)}`);
@@ -795,7 +804,6 @@ function sanitizeMessageUrls(message, channel, kbPack) {
   const canonicalIsMergeTag = canonicalUrl && canonicalUrl.startsWith('{{trigger_link.');
   let mutations = [];
 
-  // ─── Pass 0: Strip any UTM chain hallucinated after a merge tag ─
   out = out.replace(
     /(\{\{trigger_link\.[A-Za-z0-9_-]+\}\})(?:[?&][A-Za-z_][A-Za-z0-9_]*=[^\s&?]*)+/g,
     (match, tag) => {
@@ -804,35 +812,24 @@ function sanitizeMessageUrls(message, channel, kbPack) {
     }
   );
 
-  // ─── Pass 1: Unwrap markdown links ──────────────────────────────
   out = out.replace(MARKDOWN_LINK_RX, (match, text, url) => {
     mutations.push('markdown_link');
     const trimmedUrl = url.trim().replace(/["']/g, '');
-    if (BARE_MERGE_TAG_RX.test(trimmedUrl)) {
-      return trimmedUrl;
-    }
-    if (urlHostAllowed(trimmedUrl)) {
-      return trimmedUrl;
-    }
+    if (BARE_MERGE_TAG_RX.test(trimmedUrl)) return trimmedUrl;
+    if (urlHostAllowed(trimmedUrl)) return trimmedUrl;
     if (canonicalUrl) return canonicalUrl;
     return text || '';
   });
 
-  // ─── Pass 2: Detect what's already in the message ───────────────
   const hasMergeTagAlready = BARE_MERGE_TAG_RX.test(out);
   let canonicalEmitted = canonicalUrl ? out.includes(canonicalUrl) : false;
   if (hasMergeTagAlready) canonicalEmitted = true;
 
-  // ─── Pass 3: Replace hallucinated bare URLs ─────────────────────
   out = out.replace(URL_RX, (match) => {
     const cleaned = match.replace(/[)\].,;:]+$/, '');
-    if (urlHostAllowed(cleaned)) {
-      return cleaned;
-    }
+    if (urlHostAllowed(cleaned)) return cleaned;
     mutations.push('hallucinated_url');
-    if (canonicalEmitted) {
-      return '';
-    }
+    if (canonicalEmitted) return '';
     if (canonicalUrl) {
       canonicalEmitted = true;
       return canonicalUrl;
@@ -840,7 +837,6 @@ function sanitizeMessageUrls(message, channel, kbPack) {
     return '';
   });
 
-  // ─── Pass 4: Dedup multiple identical canonical strings ─────────
   if (canonicalUrl) {
     const escaped = canonicalUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const dupeRx = new RegExp(`(${escaped})(\\s*${escaped})+`, 'g');
@@ -849,7 +845,6 @@ function sanitizeMessageUrls(message, channel, kbPack) {
     if (out !== before) mutations.push('deduped_canonical');
   }
 
-  // ─── Pass 5: Dedup any merge tags (first wins) ──────────────────
   let seenTag = false;
   out = out.replace(MERGE_TAG_RX, (match) => {
     if (seenTag) {
@@ -860,7 +855,6 @@ function sanitizeMessageUrls(message, channel, kbPack) {
     return match;
   });
 
-  // ─── Pass 6: Whitespace cleanup ─────────────────────────────────
   out = out
     .replace(/[ \t]+/g, ' ')
     .replace(/ +\n/g, '\n')
@@ -899,10 +893,21 @@ function makeShortCircuitResult(classification, channel, triggerMessage) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// MAIN EXPORT
+// MAIN EXPORT (v2.7.4 — accepts opts.editInstruction + opts.previousMessage)
 // ═══════════════════════════════════════════════════════════════════
 
-export async function generateResponse(contactId, channel, triggerMessage) {
+/**
+ * Generate an AI response for an inbound message.
+ *
+ * @param {string} contactId — GHL contact ID
+ * @param {string} channel — 'sms' | 'email'
+ * @param {string} triggerMessage — the inbound text
+ * @param {Object} [opts] — optional regenerate context
+ * @param {string} [opts.editInstruction] — human reviewer's correction
+ * @param {string} [opts.previousMessage] — prior AI draft being corrected
+ * @returns {Promise<Object>} validated response with metadata
+ */
+export async function generateResponse(contactId, channel, triggerMessage, opts = {}) {
   const context = await buildLeadContext(contactId, {
     includeConversation: true,
     skipCache: true,
@@ -963,7 +968,6 @@ export async function generateResponse(contactId, channel, triggerMessage) {
     kbPack = null;
   }
 
-  // v2.7: fetch real GHL calendar availability for the booking calendar
   let availability = null;
   const calendarId = getCalendarIdFromKbPack(kbPack);
   if (calendarId) {
@@ -975,7 +979,18 @@ export async function generateResponse(contactId, channel, triggerMessage) {
     }
   }
 
-  const userPrompt = buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack, trafficTemp, availability);
+  // v2.7.4: pull recent edits for in-context learning
+  const recentEdits = await getRecentEdits(classification.intent_class, RECENT_EDITS_LIMIT);
+
+  const userPrompt = buildResponsePrompt(
+    context, channel, triggerMessage, kbPack, classification,
+    fastTrack, trafficTemp, availability,
+    {
+      editInstruction: opts.editInstruction || null,
+      previousMessage: opts.previousMessage || null,
+      recentEdits,
+    }
+  );
   const raw = await callClaude(userPrompt);
 
   const validated = validateResponse(raw, channel);
@@ -1003,6 +1018,8 @@ export async function generateResponse(contactId, channel, triggerMessage) {
     `fast_track=${fastTrack} ` +
     `merge_tag_sent=${mergeTagInMessage} ` +
     `model=${MODEL} ` +
+    `edits_in_prompt=${recentEdits.length} ` +
+    `is_regenerate=${!!opts.editInstruction} ` +
     `frameworks=${(validated.frameworks_applied || []).join('+') || 'none'} ` +
     `(${validated.message.length} chars)`);
 
@@ -1024,6 +1041,8 @@ export async function generateResponse(contactId, channel, triggerMessage) {
     merge_tag_sent: mergeTagInMessage,
     availability_slots_used: availability ? availability.slots.length : 0,
     availability_total_open: availability ? availability.slots_total_count : 0,
+    edits_used_in_prompt: recentEdits.length,
+    is_regenerate: !!opts.editInstruction,
     ...validated,
   };
 }
