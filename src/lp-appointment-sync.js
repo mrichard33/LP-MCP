@@ -1,54 +1,58 @@
 /**
  * LP Appointment Sync — src/lp-appointment-sync.js
  *
- * v5.0: Expanded fallback resolution chain + actionable failure notification.
+ * v5.1: HLCID-FIRST RESOLUTION CHAIN + MANUAL-ACTION FALLBACK TAG.
  *
- * Why v5.0 exists:
- *   v4.3 had four resolution paths but only ONE narrowing strategy when the
- *   GHL prospect ID failed (a single GetCustomers3 call passing phone AND
- *   email together — LP intersects them, so a stale email or shared phone
- *   would skip valid prospects). When LP only has the lead at a household
- *   level (multiple people on one phone) or the email on file is wrong,
- *   the chain failed to find a real lead even though one existed.
+ * Why v5.1 exists:
+ *   v5.0's `findBookableLead` picked the first lead under a prospect
+ *   that had a bookable disposition. This silently picked the WRONG
+ *   lead when prospects have multiple leads (e.g. an older Sale lead
+ *   plus a newer Data lead, or repeat re-engagements). The correct
+ *   match is via HLCID — the GHL contact ID stored on each LP lead by
+ *   the LP→GHL integration. v5.1 makes HLCID the authoritative match
+ *   in every resolution path; bookable-disposition is now only a
+ *   tiebreaker if multiple leads share an HLCID (defensive — should
+ *   never happen).
  *
- *   Marie Widjaja (GHL 2WHqbq7n46JncW3oJ2IJ, 2026-04-29) hit this: prospect
- *   426508 had no bookable lead yet (still in LP inbound queue), her phone
- *   wasn't reachable in LP, and the chain skipped without trying the
- *   address narrowing that would have caught it.
+ *   v5.0's phone+email and phone-only fallbacks are removed entirely:
+ *   they relied on disposition heuristics under a phone-narrowed
+ *   prospect list, which is exactly the failure mode that triggered
+ *   this rewrite.
  *
- * v5.0 chain (each candidate validated via LP API getLeadByLdsId before
- *  acceptance — never trust an unvalidated ID):
+ * v5.1 chain (each candidate validated via LP API getLeadByLdsId
+ *   AND HLCID match before acceptance):
  *
- *   0. PROSPECT FAST-PATH — GHL `lp_prospect_id` field → getLeads(cst_id).
- *      Cleanest signal when present. Unchanged from v4.3.
+ *   0. SUPABASE FAST-PATH — lp_leads.ghl_contact_id (cache).
+ *      Note: this column is populated by phone/email matching during
+ *      sync, NOT from LP's HLCID field, so the cache hit is a hint,
+ *      not authority. We still call getLeadByLdsId and require the
+ *      live LP record's HLCID to equal the inbound GHL contactId
+ *      before accepting.
  *
- *   1. HLCID (Supabase) — lp_leads where ghl_contact_id = contact.id, most
- *      recent bookable, validated via LP API. Unchanged from v4.3.
+ *   1. PROSPECT + HLCID — getLeads(cst_id=prospectId, PageSize=50)
+ *      → scan returned leads, accept the first whose HLCID matches.
+ *      Authoritative path when GHL has the prospect ID populated.
  *
- *   2. PHONE + ADDRESS — GetCustomers3({phone}), narrow result list to
- *      prospects whose street number AND zip match the GHL contact. NEW.
- *      Most precise LP API match — handles shared phones (households,
- *      property managers) where address is the disambiguator.
+ *   2. PHONE → HLCID — getCustomers3({phone}) → for each prospect,
+ *      getLeads(cst_id=p.ProspectID), filter by HLCID match. Accept
+ *      first HLCID match across the prospect list.
  *
- *   3. PHONE + EMAIL — same prospect list, narrow by email. NEW (v4.3 sent
- *      both fields to LP at once, which intersects; we want union with
- *      address-first preference).
+ *   3. GHL FIELD + HLCID — `GmAVmW6V9sekD7pVONKr` (LP Lead ID custom
+ *      field), validated via getLeadByLdsId AND HLCID match required.
+ *      Must NOT equal the in1_id field (`3YMxheIlPyhACB8zyc3W`) — that
+ *      is the inbound queue ID, not a real lds_id.
  *
- *   4. PHONE ONLY — same prospect list, accept first prospect with a
- *      bookable lead. NEW. Last-resort match when address is missing on
- *      one side or email is stale.
+ *   4. FAILURE — apply `lp-sync-failed` tag to the GHL contact, which
+ *      triggers a separate GHL workflow that handles the team
+ *      notification (email + SMS + task). Also add a GHL note and
+ *      send an enriched GroupMe card with manual-action steps.
  *
- *   5. GHL FIELD — `GmAVmW6V9sekD7pVONKr`, validated, must NOT equal the
- *      stored `in1_id` (`3YMxheIlPyhACB8zyc3W`). Unchanged from v4.3.
+ * The expensive LP API call (`GetCustomers3` with phone) is made AT
+ * MOST ONCE — its result is cached locally in resolveLPLeadId.
  *
- *   6. FAILURE — actionable GroupMe notification with full appointment
- *      details + LP IDs tried + direct manual-action steps. v4.3 only
- *      sent a one-liner. v5.0 sends a structured card the team can act on.
- *
- * The expensive LP API call (`GetCustomers3` with phone) is made AT MOST
- * ONCE — its result is cached locally in resolveLPLeadId and reused
- * across steps 2/3/4. Steps 2 → 3 → 4 are pure client-side filtering of
- * the same prospect list.
+ * HLCID extraction handles LP's inconsistent casing across endpoints
+ * (HLCID, hlcid, HlcId, Hlcid). If LP returns it under another name
+ * we'll see all-misses in logs and adjust.
  *
  * Endpoint: POST /webhook/ghl/set-lp-appointment
  */
@@ -60,7 +64,12 @@ import {
   getCustomers3,
   getLeads,
 } from './lp-client.js';
-import { getGHLContact, updateGHLContactFields, addGHLNote } from './ghl.js';
+import {
+  getGHLContact,
+  updateGHLContactFields,
+  addGHLNote,
+  applyGHLTag,
+} from './ghl.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken } from './ghl-rate-limiter.js';
 
@@ -72,6 +81,13 @@ const LAST_APPT_TIME_FIELD  = 'U67epWMNqjbf0SHAllEZ';
 const LP_LEAD_ID_FIELD      = 'GmAVmW6V9sekD7pVONKr';
 const LP_INBOUND_ID_FIELD   = '3YMxheIlPyhACB8zyc3W';
 const LP_PROSPECT_ID_FIELD  = 'ZRQAVrzhtzApzLlHmT87';
+
+// Tag applied to a GHL contact when the LP sync chain exhausts all
+// resolution paths. A separate GHL workflow listens for this tag and
+// fires the team notification (email/SMS/task). This decouples the
+// MCP code from the team's notification preferences and lets ops tune
+// who gets notified without redeploying.
+const LP_SYNC_FAILED_TAG = 'lp-sync-failed';
 
 /**
  * Clean a value from GHL webhook body.
@@ -116,17 +132,12 @@ async function ghlFetch(method, path, body = null) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// v4.3: SELF-ENRICHMENT FROM GHL CONTACT
+// SELF-ENRICHMENT FROM GHL CONTACT (unchanged from v5.0)
 // ═══════════════════════════════════════════════════════════════════
 
 /**
  * Fetch the GHL contact and extract all fields needed for LP sync.
- * Called when the webhook body is missing critical fields (which is always
- * the case with GHL standard webhooks that don't resolve merge fields).
- *
- * v5.0 also returns address1 and postalCode for phone+address narrowing.
- *
- * Returns an object with all extracted fields. Null values = not available.
+ * Returns an object with all extracted fields. Null = not available.
  */
 async function enrichFromGHLContact(contactId) {
   try {
@@ -160,59 +171,75 @@ async function enrichFromGHLContact(contactId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// LP LEAD ID RESOLUTION CHAIN (v5.0)
+// LP LEAD ID RESOLUTION CHAIN (v5.1 — HLCID-first)
 // ═══════════════════════════════════════════════════════════════════
 
-// Dispositions where LP will accept a SetAppointment call
+// Bookable-disposition list — kept only as a tiebreaker if multiple
+// leads share an HLCID (defensive; should not happen in practice).
 const BOOKABLE_DISPOSITIONS = new Set([
   'Data', 'Issue', 'Set', 'NIS', 'NIS2', 'NI', 'BO', '1Leg', 'NoHome',
 ]);
 
 /**
- * Find the best bookable lead from an array of LP lead records.
- * Prefers leads with a BOOKABLE_DISPOSITIONS disposition; falls back to
- * the first record with any lds_id if no bookable lead exists.
+ * Extract HLCID from an LP lead record. LP API casing varies across
+ * endpoints, so check all known variants. Returns null if absent.
+ * If LP routes the GHL contact ID through a user1-user15 field instead,
+ * this will return null and the chain will fall through — we'll see
+ * all-misses in logs and add the field name once observed.
  */
-function findBookableLead(leadRecords, prospectId) {
-  let bestLead = null;
-  for (const lead of leadRecords) {
-    if (!lead) continue;
-    const ldsId = lead.LeadID || lead.leadid || lead.lds_id;
-    const disp = lead.Disposition || lead.disposition || lead.disp_code || '';
-    if (!ldsId) continue;
-    if (!bestLead) bestLead = { ldsId: String(ldsId), prospectId: String(prospectId), disp };
-    if (BOOKABLE_DISPOSITIONS.has(disp)) {
-      bestLead = { ldsId: String(ldsId), prospectId: String(prospectId), disp };
-      break;
-    }
-  }
-  return bestLead;
+function extractHLCID(leadRecord) {
+  if (!leadRecord) return null;
+  const v = leadRecord.HLCID
+        ?? leadRecord.hlcid
+        ?? leadRecord.HlcId
+        ?? leadRecord.Hlcid
+        ?? leadRecord.hlcID
+        ?? leadRecord.HLcId;
+  return v != null && String(v).trim() !== '' ? String(v).trim() : null;
 }
 
 /**
- * Extract the leading street number from a street address.
- * "13454 1st Street East" → "13454"
- * "Apt 5, 1234 Main St"   → "1234"  (uses last leading-number group; usually safer)
- * Empty / unmatched returns "".
+ * Find a lead from a list whose HLCID matches the GHL contact ID.
+ * Replaces v5.0's findBookableLead — disposition is a tiebreaker only
+ * if multiple leads share the HLCID (which should never happen).
+ *
+ * Returns { ldsId, prospectId, disp, hlcidMatched: true } or null.
  */
-function streetNumberFrom(addr) {
-  if (!addr) return '';
-  const s = String(addr).trim();
-  // Prefer the FIRST numeric token (most addresses lead with house number)
-  const m = s.match(/\b(\d{1,7})\b/);
-  return m ? m[1] : '';
+function findLeadByHLCID(leadRecords, ghlContactId, prospectIdFallback = null) {
+  if (!ghlContactId || !Array.isArray(leadRecords) || leadRecords.length === 0) return null;
+  const targetId = String(ghlContactId).trim();
+
+  const matches = [];
+  for (const lead of leadRecords) {
+    if (!lead) continue;
+    const hlcid = extractHLCID(lead);
+    if (!hlcid) continue;
+    if (hlcid !== targetId) continue;
+    const ldsId = lead.LeadID || lead.leadid || lead.lds_id;
+    if (!ldsId) continue;
+    const disp = lead.Disposition || lead.disposition || lead.disp_code || '';
+    const pid = lead.ProspectID || lead.prospectid || lead.CstID || lead.cst_id || prospectIdFallback;
+    matches.push({ ldsId: String(ldsId), prospectId: pid ? String(pid) : null, disp });
+  }
+
+  if (matches.length === 0) return null;
+  if (matches.length === 1) return { ...matches[0], hlcidMatched: true };
+
+  // Multiple HLCID matches under one prospect — defensive tiebreak by
+  // bookable disposition. This branch should rarely fire; log it.
+  console.warn(`[LP-RESOLVE] ⚠️ ${matches.length} leads matched HLCID=${targetId} — tiebreaking by bookable disposition`);
+  const bookable = matches.find(m => BOOKABLE_DISPOSITIONS.has(m.disp));
+  return { ...(bookable || matches[0]), hlcidMatched: true };
 }
 
-/** Normalize a US zip to 5 digits. "33708-1234" → "33708". */
+/**
+ * Normalize a US zip to 5 digits. "33708-1234" → "33708".
+ * Kept for failure-card display, no longer used in resolution chain.
+ */
 function zip5(zip) {
   if (!zip) return '';
   const m = String(zip).match(/\d{5}/);
   return m ? m[0] : '';
-}
-
-/** Normalize email for case-insensitive comparison. */
-function normalizeEmail(e) {
-  return String(e || '').toLowerCase().trim();
 }
 
 /**
@@ -224,104 +251,111 @@ function normalizePhone(p) {
 }
 
 /**
- * Pick the address fields off a prospect returned by LP GetCustomers3.
- * LP's response keys vary across endpoints; we check several common
- * casings rather than assuming one shape.
+ * Given a single LP prospect record (from GetCustomers3), fetch its
+ * leads and find the one whose HLCID matches the target GHL contact.
+ * Used by Step 2 (phone fallback). Returns null if no HLCID match.
  */
-function prospectAddressFields(p) {
-  return {
-    address: p.Address || p.address || p.Address1 || p.address1 || p.AddressLine1 || '',
-    zip:     p.Zip || p.zip || p.PostalCode || p.postalCode || p.ZipCode || p.zipcode || '',
-    email:   p.Email || p.email || '',
-  };
-}
-
-/**
- * Resolve a prospect to a bookable LP lead. Used as the inner step of
- * phone-based fallbacks. Returns null if the prospect has no bookable lead.
- */
-async function resolveProspectToBookableLead(prospect) {
+async function resolveProspectToHLCIDLead(prospect, ghlContactId) {
   const prospectId = prospect.ProspectID || prospect.prospectid || prospect.CstID || prospect.cst_id;
   if (!prospectId) return null;
   try {
-    const leadsResult = await getLeads({ cst_id: prospectId, PageSize: 20 });
+    const leadsResult = await getLeads({ cst_id: prospectId, PageSize: 50 });
     const leadRecords = Array.isArray(leadsResult) ? leadsResult : [leadsResult];
-    return findBookableLead(leadRecords, prospectId);
+    return findLeadByHLCID(leadRecords, ghlContactId, prospectId);
   } catch (err) {
-    console.warn(`[LP-RESOLVE] GetLead for prospect ${prospectId} failed: ${err.message}`);
+    console.warn(`[LP-RESOLVE] GetLeads for prospect ${prospectId} failed: ${err.message}`);
     return null;
   }
 }
 
 /**
- * Safely resolve a REAL LP Lead ID (lds_id) for a GHL contact.
+ * Safely resolve a REAL LP Lead ID (lds_id) for a GHL contact. Every
+ * accepted candidate is HLCID-validated against the inbound contactId.
  *
- * v5.0 chain — see file header for full description. Each candidate is
- * validated via LP API getLeadByLdsId (or is the direct output of an
- * LP getLeads/getCustomers3 call that already returns lds_id) before
- * acceptance.
+ * v5.1 chain — see file header. Returns null if all paths fail.
  */
 async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
   const webhookProspectId = cleanGHLValue(contactInfo.prospectId);
-  const phoneRaw = contactInfo.phone || '';
-  const emailRaw = contactInfo.email || '';
-  const phone = normalizePhone(phoneRaw);
-  const email = normalizeEmail(emailRaw);
-  const contactStreetNo = streetNumberFrom(contactInfo.address1);
-  const contactZip      = zip5(contactInfo.postalCode);
+  const phone = normalizePhone(contactInfo.phone || '');
 
-  // ── Step 0: Prospect ID fast-path ─────────────────────────────
-  if (webhookProspectId && /^\d+$/.test(webhookProspectId)) {
-    try {
-      const leadsResult = await getLeads({ cst_id: webhookProspectId, PageSize: 20 });
-      const leadRecords = Array.isArray(leadsResult) ? leadsResult : [leadsResult];
-      const best = findBookableLead(leadRecords, webhookProspectId);
-      if (best) {
-        console.log(`[LP-RESOLVE] ✅ Step 0 prospect fast-path: lds_id=${best.ldsId}, prospect=${webhookProspectId}, disp=${best.disp}`);
-        return { ldsId: best.ldsId, prospectId: webhookProspectId, source: 'prospect_id_fastpath', step: 0 };
-      }
-      console.warn(`[LP-RESOLVE] Step 0: prospect ${webhookProspectId} has no bookable leads — falling through`);
-    } catch (err) {
-      console.warn(`[LP-RESOLVE] Step 0 fast-path failed for ${webhookProspectId}: ${err.message}`);
-    }
-  }
-
-  // ── Step 1: HLCID match (Supabase lp_leads.ghl_contact_id) ────
+  // ── Step 0: Supabase fast-path (cache hint, HLCID-validated) ──
+  // The Supabase ghl_contact_id column is populated by phone/email
+  // matching, NOT from LP HLCID. So a cache hit is a HINT — we still
+  // pull the live LP record and confirm HLCID matches before accepting.
   try {
     const { data: leads } = await supabase.from('lp_leads')
-      .select('lp_lead_id, lp_prospect_id, disposition_code, appointment_set, appointment_date')
+      .select('lp_lead_id, lp_prospect_id, disposition_code, synced_at')
       .eq('ghl_contact_id', ghlContactId)
-      .order('synced_at', { ascending: false });
+      .order('synced_at', { ascending: false })
+      .limit(5);
 
     if (leads?.length) {
-      const bookable = leads.find(l => BOOKABLE_DISPOSITIONS.has(l.disposition_code));
-      const candidate = bookable || leads[0];
-
-      if (candidate.lp_lead_id) {
+      for (const candidate of leads) {
+        if (!candidate.lp_lead_id) continue;
         try {
           const result = await getLeadByLdsId(candidate.lp_lead_id);
           const records = Array.isArray(result) ? result : [result];
-          const valid = records.find(r => r && (r.LeadID || r.leadid || r.lds_id));
-          if (valid) {
-            const pid = String(valid.ProspectID || valid.prospectid || valid.CstID || valid.cst_id || candidate.lp_prospect_id || '');
-            console.log(`[LP-RESOLVE] ✅ Step 1 HLCID: lds_id=${candidate.lp_lead_id}, prospect=${pid}, disp=${candidate.disposition_code}`);
-            return { ldsId: String(candidate.lp_lead_id), prospectId: pid, source: 'hlcid_supabase_validated', step: 1 };
+          // The LP getLeadByLdsId response is a list of prospect
+          // records, each containing a `leads` array. Walk into the
+          // leads to find the one with matching lds_id and HLCID.
+          for (const prospect of records) {
+            if (!prospect) continue;
+            const innerLeads = prospect.leads || prospect.Leads || [];
+            const target = innerLeads.find(l =>
+              String(l.LeadID || l.leadid || l.lds_id) === String(candidate.lp_lead_id)
+            );
+            if (!target) continue;
+            const hlcid = extractHLCID(target);
+            if (hlcid && hlcid === String(ghlContactId)) {
+              const pid = String(prospect.ProspectID || prospect.prospectid || prospect.CstID || prospect.cst_id || candidate.lp_prospect_id || '');
+              console.log(`[LP-RESOLVE] ✅ Step 0 Supabase+HLCID: lds_id=${candidate.lp_lead_id}, prospect=${pid}, disp=${candidate.disposition_code}`);
+              return { ldsId: String(candidate.lp_lead_id), prospectId: pid, source: 'supabase_hlcid_validated', step: 0 };
+            }
+            console.warn(`[LP-RESOLVE] Step 0: lds_id=${candidate.lp_lead_id} HLCID mismatch (got ${hlcid || 'null'}, want ${ghlContactId})`);
           }
         } catch (err) {
-          console.warn(`[LP-RESOLVE] Step 1 HLCID candidate ${candidate.lp_lead_id} failed validation: ${err.message}`);
+          console.warn(`[LP-RESOLVE] Step 0 validation failed for lds_id=${candidate.lp_lead_id}: ${err.message}`);
         }
       }
     }
   } catch (err) {
-    console.warn(`[LP-RESOLVE] Step 1 HLCID lookup failed: ${err.message}`);
+    console.warn(`[LP-RESOLVE] Step 0 Supabase lookup failed: ${err.message}`);
   }
 
-  // ── Steps 2/3/4 share ONE GetCustomers3 phone-only call ───────
-  // We deliberately query LP by phone alone (not phone+email together —
-  // LP intersects them, which is too restrictive). Then we narrow the
-  // result list client-side, address-first.
-  let prospectList = [];
+  // ── Step 1: Prospect + HLCID ──────────────────────────────────
+  if (webhookProspectId && /^\d+$/.test(webhookProspectId)) {
+    try {
+      const leadsResult = await getLeads({ cst_id: webhookProspectId, PageSize: 50 });
+      // LP getLeads returns prospect records each containing inner leads.
+      // Flatten to a single lead list for HLCID scanning.
+      const records = Array.isArray(leadsResult) ? leadsResult : [leadsResult];
+      const allLeads = [];
+      for (const prospect of records) {
+        if (!prospect) continue;
+        const innerLeads = prospect.leads || prospect.Leads || [];
+        if (innerLeads.length === 0) {
+          // Some endpoints return a flat lead instead of nested
+          allLeads.push(prospect);
+        } else {
+          allLeads.push(...innerLeads);
+        }
+      }
+      const best = findLeadByHLCID(allLeads, ghlContactId, webhookProspectId);
+      if (best) {
+        console.log(`[LP-RESOLVE] ✅ Step 1 prospect+HLCID: lds_id=${best.ldsId}, prospect=${best.prospectId || webhookProspectId}, disp=${best.disp}`);
+        return { ldsId: best.ldsId, prospectId: best.prospectId || webhookProspectId, source: 'prospect_plus_hlcid', step: 1 };
+      }
+      console.warn(`[LP-RESOLVE] Step 1: prospect ${webhookProspectId} has no lead with matching HLCID — falling through`);
+    } catch (err) {
+      console.warn(`[LP-RESOLVE] Step 1 prospect+HLCID failed for ${webhookProspectId}: ${err.message}`);
+    }
+  }
+
+  // ── Step 2: Phone → HLCID ─────────────────────────────────────
+  // GetCustomers3({phone}) returns prospects sharing that phone.
+  // For each, fetch their leads and look for an HLCID match.
   if (phone) {
+    let prospectList = [];
     try {
       const prospects = await getCustomers3({ phone });
       prospectList = Array.isArray(prospects) ? prospects : (prospects ? [prospects] : []);
@@ -330,60 +364,22 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
     } catch (err) {
       console.warn(`[LP-RESOLVE] GetCustomers3 by phone failed: ${err.message}`);
     }
-  } else {
-    console.warn(`[LP-RESOLVE] No phone available — skipping steps 2/3/4`);
-  }
 
-  // ── Step 2: Phone + address narrowing ─────────────────────────
-  // Match leading street number AND 5-digit zip. If both match, this
-  // is a confident hit even when multiple prospects share the phone.
-  if (prospectList.length && contactStreetNo && contactZip) {
     for (const p of prospectList) {
-      const { address: pAddr, zip: pZip } = prospectAddressFields(p);
-      const pStreetNo = streetNumberFrom(pAddr);
-      const pZip5 = zip5(pZip);
-      if (pStreetNo && pZip5 && pStreetNo === contactStreetNo && pZip5 === contactZip) {
-        const best = await resolveProspectToBookableLead(p);
-        if (best) {
-          console.log(`[LP-RESOLVE] ✅ Step 2 phone+address: lds_id=${best.ldsId}, prospect=${best.prospectId}, disp=${best.disp}`);
-          return { ldsId: best.ldsId, prospectId: best.prospectId, source: 'phone_plus_address', step: 2 };
-        }
-      }
-    }
-    console.warn(`[LP-RESOLVE] Step 2: no phone+address match (street=${contactStreetNo}, zip=${contactZip})`);
-  }
-
-  // ── Step 3: Phone + email narrowing ───────────────────────────
-  if (prospectList.length && email) {
-    for (const p of prospectList) {
-      const { email: pEmail } = prospectAddressFields(p);
-      if (pEmail && normalizeEmail(pEmail) === email) {
-        const best = await resolveProspectToBookableLead(p);
-        if (best) {
-          console.log(`[LP-RESOLVE] ✅ Step 3 phone+email: lds_id=${best.ldsId}, prospect=${best.prospectId}, disp=${best.disp}`);
-          return { ldsId: best.ldsId, prospectId: best.prospectId, source: 'phone_plus_email', step: 3 };
-        }
-      }
-    }
-    console.warn(`[LP-RESOLVE] Step 3: no phone+email match`);
-  }
-
-  // ── Step 4: Phone only (last-resort) ──────────────────────────
-  // Accept the first prospect on the phone with a bookable lead.
-  // Households with multiple prospects on one phone will get the first
-  // bookable one — acceptable when address/email both failed to narrow.
-  if (prospectList.length) {
-    for (const p of prospectList) {
-      const best = await resolveProspectToBookableLead(p);
+      const best = await resolveProspectToHLCIDLead(p, ghlContactId);
       if (best) {
-        console.log(`[LP-RESOLVE] ✅ Step 4 phone-only: lds_id=${best.ldsId}, prospect=${best.prospectId}, disp=${best.disp}`);
-        return { ldsId: best.ldsId, prospectId: best.prospectId, source: 'phone_only_lastresort', step: 4 };
+        console.log(`[LP-RESOLVE] ✅ Step 2 phone+HLCID: lds_id=${best.ldsId}, prospect=${best.prospectId}, disp=${best.disp}`);
+        return { ldsId: best.ldsId, prospectId: best.prospectId, source: 'phone_plus_hlcid', step: 2 };
       }
     }
-    console.warn(`[LP-RESOLVE] Step 4: phone-only — no prospect on this phone has a bookable lead`);
+    if (prospectList.length) {
+      console.warn(`[LP-RESOLVE] Step 2: no prospect on this phone has a lead with matching HLCID`);
+    }
+  } else {
+    console.warn(`[LP-RESOLVE] No phone available — skipping Step 2`);
   }
 
-  // ── Step 5: GHL field — must validate AND not equal in1_id ────
+  // ── Step 3: GHL field + HLCID ─────────────────────────────────
   try {
     const ghlRes = await ghlFetch('GET', `/contacts/${ghlContactId}`);
     const customFields = ghlRes?.contact?.customFields || [];
@@ -394,29 +390,37 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
 
     if (ghlLeadId) {
       if (ghlInboundId && ghlLeadId === ghlInboundId) {
-        console.warn(`[LP-RESOLVE] Step 5: GHL field matches inbound ID (${ghlLeadId}) — skipping`);
+        console.warn(`[LP-RESOLVE] Step 3: GHL field matches inbound ID (${ghlLeadId}) — skipping`);
       } else {
         const result = await getLeadByLdsId(ghlLeadId);
         const records = Array.isArray(result) ? result : [result];
-        const valid = records.find(r => r && (r.LeadID || r.leadid || r.lds_id));
-        if (valid) {
-          const pid = String(valid.ProspectID || valid.prospectid || valid.CstID || valid.cst_id || '');
-          console.log(`[LP-RESOLVE] ✅ Step 5 GHL field validated: lds_id=${ghlLeadId}, prospect=${pid}`);
-          return { ldsId: ghlLeadId, prospectId: pid, source: 'ghl_field_validated', step: 5 };
+        for (const prospect of records) {
+          if (!prospect) continue;
+          const innerLeads = prospect.leads || prospect.Leads || [];
+          const target = innerLeads.find(l =>
+            String(l.LeadID || l.leadid || l.lds_id) === ghlLeadId
+          );
+          if (!target) continue;
+          const hlcid = extractHLCID(target);
+          if (hlcid && hlcid === String(ghlContactId)) {
+            const pid = String(prospect.ProspectID || prospect.prospectid || prospect.CstID || prospect.cst_id || '');
+            console.log(`[LP-RESOLVE] ✅ Step 3 GHL field+HLCID: lds_id=${ghlLeadId}, prospect=${pid}`);
+            return { ldsId: ghlLeadId, prospectId: pid, source: 'ghl_field_plus_hlcid', step: 3 };
+          }
+          console.warn(`[LP-RESOLVE] Step 3: GHL field lds_id=${ghlLeadId} HLCID mismatch (got ${hlcid || 'null'}, want ${ghlContactId})`);
         }
-        console.warn(`[LP-RESOLVE] Step 5: GHL field ${ghlLeadId} failed validation — likely in1_id`);
       }
     }
   } catch (err) {
-    console.warn(`[LP-RESOLVE] Step 5 GHL field check failed: ${err.message}`);
+    console.warn(`[LP-RESOLVE] Step 3 GHL field check failed: ${err.message}`);
   }
 
-  console.warn(`[LP-RESOLVE] ❌ No valid lds_id for ${ghlContactId} after 6-step chain`);
+  console.warn(`[LP-RESOLVE] ❌ No HLCID-validated lds_id for ${ghlContactId} after 4-step chain`);
   return null;
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// DATE/TIME PARSING
+// DATE/TIME PARSING (unchanged from v5.0)
 // ═══════════════════════════════════════════════════════════════════
 
 const MONTH_MAP = {
@@ -477,7 +481,7 @@ function parseApptTime(raw) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// FAILURE NOTIFICATION (v5.0 — actionable card)
+// FAILURE NOTIFICATION (v5.1 — adds tag + workflow trigger)
 // ═══════════════════════════════════════════════════════════════════
 
 /**
@@ -490,10 +494,13 @@ function formatPhoneDisplay(p) {
 }
 
 /**
- * Send a structured GroupMe notification when LP sync skips for lack of
- * a valid lds_id. v4.3 sent a one-liner; v5.0 includes the data the team
- * needs to manually create or set the appointment in LP without going
- * back to GHL to look anything up.
+ * Apply the lp-sync-failed tag (triggers the manual-action workflow),
+ * write a GHL note, and send a structured GroupMe card.
+ *
+ * The tag is the primary mechanism — a separate GHL workflow listens
+ * for it and fires the team notification (email/SMS/task). The
+ * GroupMe card is for real-time visibility; the GHL note is for the
+ * next person who opens the contact in the UI.
  */
 async function sendSyncFailureNotification({
   contactId, contactName, contactPhone, contactEmail,
@@ -505,12 +512,12 @@ async function sendSyncFailureNotification({
   const addrLine = [
     address1,
     [city, state].filter(Boolean).join(', '),
-    postalCode,
+    zip5(postalCode) || postalCode,
   ].filter(Boolean).join(' • ') || 'no address on file';
 
   const idsLine = [
-    prospectId    ? `prospect=${prospectId}`            : null,
-    inboundId     ? `in1_id=${inboundId}`               : null,
+    prospectId    ? `prospect=${prospectId}`              : null,
+    inboundId     ? `in1_id=${inboundId}`                 : null,
     ghlLeadIdField? `ghl_lp_lead_field=${ghlLeadIdField}` : null,
   ].filter(Boolean).join(' • ') || 'none populated';
 
@@ -522,6 +529,16 @@ async function sendSyncFailureNotification({
 
   const ghlLink = `https://app.gohighlevel.com/v2/location/SsBG7j5KQAIP1SFP2Sca/contacts/detail/${contactId}`;
 
+  // ── 1. Apply the tag — triggers the manual-action workflow ────
+  const tagApplied = await applyGHLTag(contactId, LP_SYNC_FAILED_TAG).catch((err) => {
+    console.warn(`[LP-APPT] Failed to apply ${LP_SYNC_FAILED_TAG} tag: ${err.message}`);
+    return false;
+  });
+  if (tagApplied) {
+    console.log(`[LP-APPT] Applied ${LP_SYNC_FAILED_TAG} tag to ${contactId} — manual-action workflow will fire`);
+  }
+
+  // ── 2. GroupMe card ───────────────────────────────────────────
   const card =
 `🚨 LP APPT SYNC FAILED — manual action required
 
@@ -535,27 +552,34 @@ async function sendSyncFailureNotification({
 🆔 LP IDs tried: ${idsLine}
 🔗 GHL: ${ghlLink}
 
-CHAIN RESULT — all 6 steps failed:
-  0 prospect fast-path • 1 HLCID • 2 phone+address
-  3 phone+email • 4 phone-only • 5 GHL lead-id field
+CHAIN RESULT — all 4 HLCID-validated steps failed:
+  0 supabase+HLCID • 1 prospect+HLCID
+  2 phone+HLCID    • 3 GHL field+HLCID
+
+Tag '${LP_SYNC_FAILED_TAG}' applied${tagApplied ? '' : ' (FAILED — see logs)'} →
+manual-action workflow will fire team notifications.
 
 ACTION:
   1. Open lead in LP (search by phone ${phoneDisplay || '???'} or address)
   2. If lead does not exist in LP yet → create it from GHL data above
-  3. Once lds_id exists → SetAppointment to ${apptLine}
-  4. Optional: paste lds_id into GHL field LP Lead ID for future syncs`;
+  3. Confirm HLCID on the LP lead matches GHL contact ${contactId}
+  4. Once lds_id exists with correct HLCID → SetAppointment to ${apptLine}
+  5. Optional: paste lds_id into GHL field LP Lead ID for future syncs
+  6. Remove tag '${LP_SYNC_FAILED_TAG}' from contact when resolved`;
 
   await sendGroupMeMessage(card).catch((err) => {
     console.warn(`[LP-APPT] GroupMe notification failed: ${err.message}`);
   });
 
-  // Also leave a note on the GHL contact so the next person to open it sees the gap
+  // ── 3. GHL note for in-CRM visibility ─────────────────────────
   await addGHLNote(contactId,
-    `[LP SYNC v5.0] Appointment NOT synced — full chain failed.\n` +
-    `Tried: prospect fast-path, HLCID/Supabase, phone+address, phone+email, phone-only, GHL field.\n` +
+    `[LP SYNC v5.1] Appointment NOT synced — full HLCID-validated chain failed.\n` +
+    `Tried: supabase+HLCID, prospect+HLCID, phone+HLCID, GHL field+HLCID.\n` +
     `LP IDs: ${idsLine}\n` +
     `Appt: ${apptLine}\n` +
-    `MANUAL ACTION: create/find lead in LP, run SetAppointment.`
+    `Tag '${LP_SYNC_FAILED_TAG}' ${tagApplied ? 'applied' : 'FAILED to apply'} — ` +
+    `manual-action workflow handles team notification.\n` +
+    `MANUAL ACTION: create/find lead in LP with HLCID=${contactId}, run SetAppointment, remove tag.`
   ).catch(() => {});
 }
 
@@ -591,7 +615,8 @@ async function syncAppointmentToLP({
       action: 'skipped_no_valid_lead_id',
       contact_id: contactId,
       contact_name: contactName,
-      attempted_steps: ['prospect_fastpath', 'hlcid', 'phone+address', 'phone+email', 'phone-only', 'ghl_field'],
+      attempted_steps: ['supabase+hlcid', 'prospect+hlcid', 'phone+hlcid', 'ghl_field+hlcid'],
+      manual_action_tag_applied: LP_SYNC_FAILED_TAG,
     };
   }
 
@@ -637,11 +662,11 @@ async function syncAppointmentToLP({
   const result = await lpSetAppointment({ ldsId, setBy: '5686', apptDate, apptTime });
 
   await addGHLNote(contactId,
-    `[LP SYNC v5.0] Appointment set\nLP Lead: ${ldsId} (via ${source}, step ${step})\nProspect: ${prospectId || 'N/A'}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName || 'N/A'}`
+    `[LP SYNC v5.1] Appointment set\nLP Lead: ${ldsId} (via ${source}, step ${step})\nProspect: ${prospectId || 'N/A'}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName || 'N/A'}`
   ).catch(() => {});
 
   await sendGroupMeMessage(
-    `📅 LP Appointment Set (v5.0)\n` +
+    `📅 LP Appointment Set (v5.1 HLCID)\n` +
     `👤 ${contactName || contactId}\n` +
     `📋 LP Lead: ${ldsId} (${source}, step ${step}) | Prospect: ${prospectId || 'N/A'}\n` +
     `📅 ${apptDate} ${apptTime} | ${calendarName || 'N/A'}`
@@ -667,10 +692,9 @@ export function registerLPAppointmentSyncRoutes(app) {
   /**
    * POST /webhook/ghl/set-lp-appointment
    *
-   * v5.0: Self-enriching endpoint with expanded resolution chain.
+   * v5.1: Self-enriching endpoint with HLCID-first resolution chain.
    * Only contactId is truly required from the webhook body. All other
-   * fields are auto-fetched from GHL when missing — including the
-   * address fields used by the new phone+address narrowing step.
+   * fields are auto-fetched from GHL when missing.
    */
   app.post('/webhook/ghl/set-lp-appointment', async (req, res) => {
     const startTime = Date.now();
@@ -697,7 +721,6 @@ export function registerLPAppointmentSyncRoutes(app) {
       let city         = cleanGHLValue(body.city) || '';
       let state        = cleanGHLValue(body.state) || '';
 
-      // v4.3 enrichment, extended in v5.0 to fetch address fields too
       const needsEnrich = !appointmentDate || !appointmentTime || !prospectId || !contactPhone || !address1;
       if (needsEnrich) {
         console.log(`[LP-APPT] Self-enriching from GHL API for ${contactId} (missing: ${[
@@ -749,8 +772,8 @@ export function registerLPAppointmentSyncRoutes(app) {
     }
   });
 
-  console.log('[LP-APPT] Registered: POST /webhook/ghl/set-lp-appointment (v5.0)');
+  console.log('[LP-APPT] Registered: POST /webhook/ghl/set-lp-appointment (v5.1 HLCID-first)');
 }
 
-// Export for potential reuse by action-executor
-export { resolveLPLeadId, syncAppointmentToLP };
+// Export for potential reuse by action-executor and tests
+export { resolveLPLeadId, syncAppointmentToLP, extractHLCID, findLeadByHLCID };
