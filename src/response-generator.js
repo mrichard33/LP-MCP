@@ -3,6 +3,19 @@
  *
  * Agentic Responder intelligence core.
  *
+ * v2.7.2 — 2026-04-29. DEFAULT MODEL → claude-sonnet-4-6.
+ *   Switched the MODEL constant default from 'claude-sonnet-4-20250514'
+ *   (Sonnet 4 — Anthropic deprecation 2026-06-15) to 'claude-sonnet-4-6'
+ *   (Sonnet 4.6 — current Anthropic-recommended default Sonnet, $3/$15
+ *   per million tokens, 1M context, 128K max output). RESPONSE_GENERATOR_MODEL
+ *   env var still wins if set — the code default just stops being a
+ *   deprecation timer.
+ *
+ *   For Reece's tactical SMS-reply use case (~21K SYSTEM_PROMPT, 600 max
+ *   output tokens) Sonnet 4.6 is the right balance — Opus 4.7 would be
+ *   5x the cost for messages this short, Haiku 4.5 too lightweight for
+ *   the prompt complexity.
+ *
  * v2.7.1 — 2026-04-29. ALWAYS-2-SLOTS.
  *   The Mark Test message that worked best ("Saturday May 2 at 10 AM or
  *   2 PM, which works better?") is now the universal default. STEP 1 of
@@ -63,7 +76,11 @@ import { buildKbPack, formatKbPackForPrompt } from './knowledge/kb-retriever.js'
 import { fetchFreeSlots, formatSlotsForPrompt } from './knowledge/calendar-availability.js';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
-const MODEL = process.env.RESPONSE_GENERATOR_MODEL || 'claude-sonnet-4-20250514';
+// v2.7.2: default flipped from 'claude-sonnet-4-20250514' (Sonnet 4 — being
+// deprecated by Anthropic on 2026-06-15) to 'claude-sonnet-4-6' (Sonnet 4.6 —
+// current recommended default). RESPONSE_GENERATOR_MODEL env var overrides
+// this if set on Railway.
+const MODEL = process.env.RESPONSE_GENERATOR_MODEL || 'claude-sonnet-4-6';
 const MAX_TOKENS = parseInt(process.env.RESPONSE_GENERATOR_MAX_TOKENS || '600', 10);
 const TIMEOUT_MS = 30000;
 const PROMPT_TIMEZONE = process.env.REECE_TIMEZONE || 'America/New_York';
