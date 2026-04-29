@@ -50,6 +50,7 @@ import {
   registerDataFreshnessRoutes,
   startDataFreshnessMonitorScheduler,
 } from './admin/data-freshness.js';
+import { runGhlContactIdBackfill } from './admin/ghl-contact-id-backfill.js';
 
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -390,6 +391,26 @@ app.post('/admin/email-backfill', async (req, res) => {
 });
 registerEmailCleanupRoutes(app);
 
+// One-shot backfill of lp_leads.ghl_contact_id from LP's `lognumber` field.
+// Pairs with v9.2 sync-leads.js. Default is dry run; pass {dry_run:false}
+// to actually write. Loop with response.next_cursor until response.done.
+//   POST body: { dry_run, limit, after_prospect_id, concurrency }
+app.post('/admin/backfill-ghl-contact-id-from-lognumber', async (req, res) => {
+  try {
+    const body = req.body || {};
+    // Default to dry run unless dry_run is explicitly false (in body or query)
+    const dryRun = !(body.dry_run === false || req.query.dryRun === 'false' || body.dryRun === false);
+    const limit = parseInt(body.limit || req.query.limit || '500', 10);
+    const concurrency = parseInt(body.concurrency || req.query.concurrency || '3', 10);
+    const afterProspectId = body.after_prospect_id || body.afterProspectId
+      || req.query.after_prospect_id || req.query.afterProspectId || null;
+    const results = await runGhlContactIdBackfill({ dryRun, limit, afterProspectId, concurrency });
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Data freshness monitor — auto-detects stale tables + sync watermark issues.
 // Fires GroupMe alerts on stale-data detection (with dedup). Apply sql/015
 // before relying on the log/dedup features.
@@ -410,7 +431,7 @@ app.listen(PORT, async () => {
   console.log(`REST API:     GET /api/prospects/:id | /api/leads/:id | /api/search | /api/lead-summary/:contactId`);
   console.log(`GroupMe:      POST /webhook/groupme | POST /groupme/send | GET /groupme/pending`);
   console.log(`LP Sync:      POST /webhook/ghl/set-lp-appointment`);
-  console.log(`Admin:        POST /admin/email-backfill | /admin/email-cleanup`);
+  console.log(`Admin:        POST /admin/email-backfill | /admin/email-cleanup | /admin/backfill-ghl-contact-id-from-lognumber`);
   console.log(`IME:          POST /ime/dispatch | /ime/work-orders/:id/{refetch,appointment,install,close,cancel,complete}`);
   console.log(`MCP:          http://localhost:${PORT}/mcp`);
   console.log(`Health:       http://localhost:${PORT}/health`);
