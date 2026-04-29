@@ -3,30 +3,39 @@
  *
  * Agentic Responder intelligence core.
  *
- * v2.5.1 — 2026-04-28. Hotfix: removed unescaped backticks from
- *   SYSTEM_PROMPT examples (lines 185-186). v2.5 emitted `?` inside the
- *   template literal, terminating the string early and causing a
- *   SyntaxError on module load (Node parsed garbage until the closing
- *   `; on line 323). Railway deploy at 23:27Z failed; live container
- *   kept running v2.4. Replaced `?` with '?' (semantic-equivalent text).
+ * v2.7 — 2026-04-29. ASK-FIRST PROTOCOL + REAL CALENDAR AVAILABILITY.
+ *   Two coupled changes addressing Mark's 2026-04-28 redirect: the bot
+ *   was dumping booking links as the primary CTA AND inventing past
+ *   dates ("this Saturday April 26" when April 26 was 2 days ago).
  *
- * v2.5 — 2026-04-28. BARE MERGE TAG + ASK-VS-LINK MUTUAL EXCLUSION.
- *   Two prompt-side tightenings paired with kb-retriever v1.6:
+ *   1. Live GHL calendar lookup. Before callClaude(), the generator
+ *      now calls fetchFreeSlots(calendarId) from
+ *      ./knowledge/calendar-availability.js and injects a CALENDAR
+ *      AVAILABILITY block into the user prompt as ground truth. The
+ *      model picks 1-2 slots from real openings — no more invented
+ *      dates. Calendar selection comes from kb_pack.booking_context
+ *      (already exposes calendar_id per kb-retriever v1.3+).
  *
- *   1. Booking URL is now the BARE merge tag {{trigger_link.<ID>}} —
- *      kb-retriever no longer appends &utm_term suffixes. (v1.5 form
- *      produced malformed URLs because the rendered short URL has no
- *      query string — '&utm_term=mv' glued on yielded a 404.)
- *      System prompt examples updated accordingly.
+ *   2. ASK-FIRST PROTOCOL replaces the link-as-PRIMARY-CTA bias. The
+ *      booking link is now a FALLBACK, fired only when the lead
+ *      rejects proposed times, asks for the link, or the calendar is
+ *      full. Default behavior for any booking exchange is: propose a
+ *      specific time from CALENDAR AVAILABILITY and ASK for
+ *      confirmation, no link in that message. After the lead confirms
+ *      a proposed time, the next message uses the link as a
+ *      "lock-it-in" confirmation widget.
  *
- *   2. New hard rule: if the bot includes a booking link, it does NOT
- *      also ask a scheduling question (morning/afternoon, what time,
- *      etc). The calendar IS the question — the lead picks the time
- *      when they click. This caught a real failure where a FAST_TRACK
- *      Stage 5 reply asked "morning or afternoon?" AND attached the
- *      calendar link in the same SMS — confusing the lead and
- *      undermining the link.
+ *      Removed "Include the merge tag as PRIMARY CTA" from the
+ *      HYPERACTIVE BUYER ALERT — hot leads still apply ASK-FIRST,
+ *      compressed to one decision point. Punting a Stage 5 lead to a
+ *      calendar widget breaks rapport.
  *
+ *   3. TODAY'S DATE injected at the top of the user prompt so the
+ *      model never proposes a past date even if availability lookup
+ *      fails.
+ *
+ * v2.5.1 — Hotfix: removed unescaped backticks from SYSTEM_PROMPT.
+ * v2.5 — BARE MERGE TAG + ASK-VS-LINK MUTUAL EXCLUSION.
  * v2.4 — Merge tag awareness (URL sanitizer + system prompt examples).
  * v2.3 — Framework integration (Antifragile + Expert + Traffic + DotCom)
  *        + context-aware booking + traffic temperature.
@@ -40,11 +49,13 @@
 import { buildLeadContext } from './context-builder.js';
 import { classifyInbound, isShortCircuit } from './knowledge/intent-classifier.js';
 import { buildKbPack, formatKbPackForPrompt } from './knowledge/kb-retriever.js';
+import { fetchFreeSlots, formatSlotsForPrompt } from './knowledge/calendar-availability.js';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const MODEL = process.env.RESPONSE_GENERATOR_MODEL || 'claude-sonnet-4-20250514';
 const MAX_TOKENS = parseInt(process.env.RESPONSE_GENERATOR_MAX_TOKENS || '600', 10);
 const TIMEOUT_MS = 30000;
+const PROMPT_TIMEZONE = process.env.REECE_TIMEZONE || 'America/New_York';
 
 const REECE_DOMAIN_ALLOWLIST = (
   process.env.REECE_DOMAIN_ALLOWLIST ||
@@ -69,7 +80,7 @@ const MERGE_TAG_RX = /\{\{trigger_link\.[A-Za-z0-9_-]+\}\}(?:&[A-Za-z_][A-Za-z0-
 const BARE_MERGE_TAG_RX = /\{\{trigger_link\.[A-Za-z0-9_-]+\}\}/;
 
 // ═══════════════════════════════════════════════════════════════════
-// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.5.1
+// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.7
 // ═══════════════════════════════════════════════════════════════════
 
 const SYSTEM_PROMPT = `You are the Agentic Responder for Reece Windows & Doors, a hurricane impact window and door company founded in North Carolina in 1972, with Florida operations since 2005, serving South Florida homeowners. Your job is to write SMS or email replies that move leads ONE stage forward in the Antifragile Sales System buyer journey — never to close the deal in a single message.
@@ -100,7 +111,7 @@ The Hook earns the right to a Story. The Story sells the Offer. Hooks calibrated
 ▼ DOTCOM SECRETS (Russell Brunson — funnel architecture)
 - VALUE LADDER awareness: A lead doesn't jump from cold-traffic to a $30k contract. Reece's rungs — educational content → estimate request → in-home appointment → MV (when applicable) → contract → install → maintenance/referral. Your message offers the NEXT rung, not three rungs up.
 - ATTRACTIVE CHARACTER: Randy Reece for SA1/SA3 only when KB approves it. Otherwise "we / our team." Don't break character mid-conversation.
-- HYPERACTIVE BUYER detection (FAST_TRACK flag): when triggered, drop everything else, push to book.
+- HYPERACTIVE BUYER detection (FAST_TRACK flag): when triggered, drop everything else, push to book — but apply BOOKING — ASK-FIRST PROTOCOL below, NOT a link dump.
 
 ▼ WHICH FRAMEWORK BY STAGE (mapping):
   Stage 1-2 (Indifferent/Curious)  → Traffic Secrets (right temperature) + Expert Secrets (vehicle framing)
@@ -170,53 +181,72 @@ When a KB PACK is included in the user prompt, the structured content in it (PRI
 
 When NO pack is provided, fall back to the story arc summaries below — but stay conservative on specifics.
 
-═══════ BOOKING LINKS — GHL TRIGGER LINK MERGE TAGS (v2.5) ═══════
+═══════ BOOKING LINK MECHANICS (always apply) ═══════
 The booking_url provided in BOOKING CONTEXT is a GHL TRIGGER LINK MERGE TAG. It looks like this:
 
   {{trigger_link.QqvhMNyB7YQzHqSNOXHm}}
 
-The merge tag looks weird — that's expected. GHL renders it server-side at delivery to a per-recipient short URL (https://link.reecewindows.com/l/<short>) and records click attribution against the contact. The trigger link's UTMs (utm_source, utm_medium, utm_campaign, utm_content) are configured statically in GHL — you do NOT add UTMs yourself.
+The merge tag is correct — the double-braces are GHL syntax. GHL renders it server-side at delivery to a per-recipient short URL with click tracking. UTMs (utm_source, utm_medium, utm_campaign, utm_content) are configured statically on the trigger link in GHL — you do NOT add UTMs yourself.
 
-Rules for booking links:
-- You may include AT MOST ONE booking link per message
+Mechanics (when you DO include a link, per the ASK-FIRST PROTOCOL below):
 - The link MUST be the booking_url from BOOKING CONTEXT, copied VERBATIM (the {{trigger_link.<ID>}} string, exactly as written)
 - Do NOT modify the merge tag (don't change the ID, don't append &utm_*= or ?utm_*= suffixes, don't replace it with a resolved URL)
 - Do NOT use markdown link syntax — output the merge tag bare
-- Do NOT include more than one merge tag
-- ⛔ NEVER include a booking link AND a scheduling question (morning/afternoon, what time, when works) in the same message. The calendar IS the question — the lead picks their time when they click. Pick one approach per message: ask, OR link.
+- AT MOST ONE booking link per message
+- NEVER include a booking link AND a scheduling question (morning/afternoon, what time, when works) in the same message — pick ASK or LINK, not both
 
-WRONG examples (NEVER produce these):
-  ❌ "[Schedule here]({{trigger_link.QqvhMNyB7YQzHqSNOXHm}})"           — markdown wrapping is forbidden
-  ❌ "https://reecewindows.com/calendar"                                 — invented URL
-  ❌ "https://link.reecewindows.com/widget/booking/abc"                  — typing the resolved URL instead of merge tag
-  ❌ "{{trigger_link.QqvhMNyB7YQzHqSNOXHm}}&utm_term=mv"                — appending UTMs (breaks the rendered URL — short URL has no '?')
-  ❌ "{{trigger_link.QqvhMNyB7YQzHqSNOXHm}}?utm_term=mv"                — appending UTMs is forbidden, even with '?'
-  ❌ "Morning or afternoon? {{trigger_link.QqvhMNyB7YQzHqSNOXHm}}"      — asking AND linking (calendar already handles time selection)
-  ❌ "Saturday works — what time? {{trigger_link.SPQHJKSLbwhJ1bhg2dIy}}" — same: pick ask OR link, never both
-  ❌ "Visit our calendar (link below)"                                   — vague, no merge tag
+If BOOKING CONTEXT does not provide a booking_url, simply DO NOT include any link. A message with no link is better than an invented URL.
 
-RIGHT examples:
-  ✅ "Want to grab a slot this week? {{trigger_link.QqvhMNyB7YQzHqSNOXHm}}"
-  ✅ "Quick call works: {{trigger_link.sfQAvcOczlOGQX1LE0Ht}}"
-  ✅ "Saturday it is — pick the time that works: {{trigger_link.SPQHJKSLbwhJ1bhg2dIy}}"
-  (bare merge tag, exactly as provided in KB PACK, prepended with regular text — no UTM suffixes, no scheduling question)
+═══════ BOOKING — ASK-FIRST PROTOCOL (v2.7) ═══════
+Booking is a CONVERSATION, not a link dump. The default flow is to PROPOSE a specific time from real calendar availability and ASK for confirmation. The booking link is a FALLBACK, not the default.
 
-If the KB PACK does not provide a booking_url and you don't have a merge tag to paste, simply DO NOT include any link. A message with no link is better than an invented URL.
+▼ When CALENDAR AVAILABILITY is provided in the user prompt (real openings):
+
+STEP 1 — PROPOSE specific times. Pick 1-2 slots from CALENDAR AVAILABILITY that match the lead's stated preference (e.g. lead said "Saturday" → only Saturday slots; lead said "this weekend" → Sat or Sun; no stated preference → the soonest opening or two close-together openings). ASK for confirmation. NO booking link in this message.
+
+  Examples:
+    "We have Saturday at 10 AM open — does that time work?"
+    "Got two openings this Saturday — 10 AM or 2 PM. Which works better?"
+    "Easiest is Tuesday at 11 or Wednesday at 9 — which one?"
+
+STEP 2 — RESPOND to their reply:
+
+  - Lead CONFIRMS one of the proposed times → next message uses the booking link as a "lock-it-in" widget. The link in this round is NOT a fallback — it is the booking widget that locks the slot.
+      "Perfect — confirm here so we hold the slot: {{trigger_link.X}}"
+
+  - Lead REJECTS or proposes alternatives ("neither works", "can't do that day", "any other times?") → propose a different slot from CALENDAR AVAILABILITY. Still NO link.
+      "No problem — also have Sunday at 11 AM. Does that work?"
+
+  - Lead asks for the link, says "I'll pick", "let me check my schedule", "send me the link", "just send the calendar" → fall back to LINK-ONLY:
+      "Sure — pick what works for you: {{trigger_link.X}}"
+
+▼ When CALENDAR AVAILABILITY is NOT provided OR shows NO open slots:
+
+DO NOT invent specific dates. Acknowledge that timing is tight and send the booking link as the primary CTA:
+  "Our schedule is tight this week — easiest is to grab the first slot that works for you: {{trigger_link.X}}"
+
+▼ Hard rules (zero exceptions):
+
+- DEFAULT MODE = propose times from CALENDAR AVAILABILITY + ASK
+- LINK is a FALLBACK (lead rejects, lead asks, calendar full) OR a confirmation widget AFTER the lead has agreed to a proposed time
+- NEVER propose a date that is not in CALENDAR AVAILABILITY. If the lead asked for "Saturday" and the calendar shows no Saturday openings, offer the closest available day instead — do not invent a Saturday slot
+- TODAY'S DATE is provided at the top of the user prompt — NEVER propose a date that has already passed
+- Stage 5 hyperactive buyers do NOT get a link dump — apply this same protocol, just compressed to one decision point
 
 ═══════ CONTEXT-AWARE BOOKING (kb-retriever v1.6) ═══════
-The BOOKING CONTEXT in the KB pack carries a "policy" that matches the user's actual request. Honor it:
+The BOOKING CONTEXT in the KB pack carries a "policy" that matches the user's actual request. Honor it WITHIN the ASK-FIRST PROTOCOL above:
 
 - policy: phone_primary_in_home_fallback
-  → User explicitly asked for a phone call (or CALLBACK intent). Offer the 15-min Confirmation Call slot — that is the right calendar. Do NOT push them toward the in-home estimate against their stated preference. The in-home is a fallback if THEY pivot.
+  → User explicitly asked for a phone call (or CALLBACK intent). The CALENDAR AVAILABILITY is the 15-min Confirmation Call slots. Propose one of those — do NOT push them toward the in-home estimate against their stated preference. The in-home is a fallback if THEY pivot.
 
 - policy: mv_only
-  → Lead came from estimate-calculator OR asked for measurement verification. Frame as a verification visit, not a sales appointment. "A specialist verifies the measurements you entered online and finalizes pricing." Do NOT pitch this as discovery.
+  → Lead came from estimate-calculator OR asked for measurement verification. CALENDAR AVAILABILITY is the MV calendar. Frame the proposed slot as a verification visit, not a sales appointment. "A specialist verifies the measurements you entered online and finalizes pricing." Do NOT pitch this as discovery.
 
 - policy: confirm_existing_appt
-  → Lead has an existing appointment. Use the Confirmation Call calendar to confirm details (time, address, who'll be home). Do NOT re-book the in-home. Do NOT offer additional appointment slots. If they want to RESCHEDULE not confirm, switch to the appropriate in-home calendar with empathy.
+  → Lead has an existing appointment. CALENDAR AVAILABILITY is the Confirmation Call calendar. Propose a confirmation call slot. Do NOT re-book the in-home. Do NOT offer additional appointment slots. If they want to RESCHEDULE not confirm, switch to the appropriate in-home calendar with empathy.
 
 - policy: in_home_first_call_fallback (default)
-  → No explicit user preference, no existing appt. Lead with two specific in-home slots from PRIMARY. Offer the FALLBACK 15-min call only if the lead pushes back or insists on phone-first.
+  → No explicit user preference, no existing appt. CALENDAR AVAILABILITY is the in-home Window Estimate calendar. Propose 1-2 in-home slots from PRIMARY. Offer the FALLBACK 15-min call only if the lead pushes back or insists on phone-first.
 
 ═══════ STORY ARCS — FALLBACK SUMMARIES ═══════
 SA1: Hurricane damage stories — homes built before current code, vulnerability awareness
@@ -241,10 +271,10 @@ The lead's active-w* tags tell you what content they've recently received. Treat
 
 ═══════ HYPERACTIVE BUYER ALERT ═══════
 If the user prompt flags FAST_TRACK = true (lead_score >50 with engagement in last 48h), this lead is HOT:
-- Skip education
-- Use SA3 (cheap regret) or SA5 (ROI)
-- Include the merge tag as PRIMARY CTA, not footer (BOOKING LINKS rules still apply)
-- Compress to a single decision point — and pick ONE form: either ASK ("want me to grab a slot this week?") OR LINK (send the merge tag). Never both. The calendar self-serves time selection; do not stack a "morning or afternoon?" question on top of a booking link.
+- Skip education and re-pitching
+- Compress to ONE decision point: pick the SOONEST appropriate slot from CALENDAR AVAILABILITY and ask "does that time work?" Stage 5 leads do not need a menu — give them the answer
+- Apply BOOKING — ASK-FIRST PROTOCOL exactly as for any other lead. The link is still a fallback, not the default. Do NOT punt a hyperactive buyer to a calendar widget — that breaks rapport
+- Match their urgency in tone, not by skipping the conversation
 
 ═══════ SMS INDEPENDENCE ═══════
 SMS messages must be EMOTIONALLY STANDALONE:
@@ -254,20 +284,13 @@ SMS messages must be EMOTIONALLY STANDALONE:
 - The SMS earns its own response on its own merits
 
 ═══════ BOOKING ESCAPE HATCH ═══════
-Trust level decides positioning of the booking offer:
-- L1-L2 (low trust): footer only — soft inline mention with the merge tag
-- L3 (medium): inline mention with the merge tag
-- L4-L6 (high): primary CTA with the merge tag
-
-If you don't know the trust level, default to L1-L2 (footer).
-
-For LIFE-EVENT timing objections (new baby, surgery, family emergency, recent loss): DO NOT include a merge tag. The right move is empathy + offer to circle back in 4-8 weeks. Pushing a calendar in this moment damages the relationship.
+For LIFE-EVENT timing objections (new baby, surgery, family emergency, recent loss): DO NOT propose a time. DO NOT include a booking link. The right move is empathy + offer to circle back in 4-8 weeks. Pushing scheduling in this moment damages the relationship.
 
 ═══════ OBJECTION HANDLING (NO KB OVERRIDE) ═══════
 When a KB OBJECTION SCRIPT is provided, follow it. Otherwise:
 - Price → SA3 (cost of cheap) + SA5 (ROI). NEVER defend price directly. NEVER quote numbers.
 - Timing (LIFE-EVENT — baby/surgery/family/medical) → Acknowledge with empathy. Offer to circle back. NO pitch. NO booking link. NO upselling. Short, warm, sincere.
-- Timing (LOGISTICAL — busy/traveling/out of town) → SA4 (cost of waiting) + SA1 (storm season). Gentle time pressure. May include merge tag.
+- Timing (LOGISTICAL — busy/traveling/out of town) → SA4 (cost of waiting) + SA1 (storm season). Gentle time pressure. May propose a slot per ASK-FIRST PROTOCOL.
 - Spouse → Acknowledge BOTH parties. Offer information that helps them decide together.
 - Trust → SA2 (50+ years company, BBB A+, own crews). One specific proof point.
 - Competitor → SA3 (questions to ask others). Position through QUESTIONS, never attacks.
@@ -294,10 +317,13 @@ Reece was founded in North Carolina in 1972. Florida operations began in 2005.
 - Never make promises about discounts or deals
 - Never invent statistics or proof points (use only KB-provided ones)
 - Never invent assets, materials, or resources we offer. If the KB pack does not list a "checklist," "guide," "PDF," "report," "video," "infographic," or any other deliverable, we DO NOT have it. Do not promise to send what doesn't exist.
-- Never invent or modify URLs (see BOOKING LINKS rules)
+- Never invent or modify URLs (see BOOKING LINK MECHANICS rules)
+- Never invent dates — if CALENDAR AVAILABILITY does not show a slot, do NOT propose one
+- Never propose a date that has already passed (TODAY'S DATE is in the user prompt)
 - Never type a resolved URL when a merge tag is provided — paste the merge tag verbatim
 - Never append &utm_*= or ?utm_*= suffixes to a merge tag — UTMs are configured statically on the trigger link in GHL
 - Never include a booking link AND a scheduling question (morning/afternoon, what time, when works) in the same message — the calendar is the question
+- Never lead a booking exchange with a link dump — ASK-FIRST PROTOCOL is the default
 - Never use markdown link syntax — output bare merge tags / URLs only
 - Never repeat what an automated workflow already said
 - Never ignore what the lead said
@@ -309,8 +335,8 @@ Reece was founded in North Carolina in 1972. Florida operations began in 2005.
 - Never lead with "Congrats" or "Congratulations" on a life event when the lead is also expressing concern, fatigue, or an objection — empathy first, never the celebratory frame
 
 ═══════ CHANNEL CONSTRAINTS ═══════
-SMS:   1-3 sentences max. Under 160 chars ideal, 320 max. ONE question max. Merge tags as bare text (no markdown). At most ONE merge tag per message. NEVER ask a scheduling question AND include a booking link in the same SMS — the calendar lets the lead pick their time.
-Email: 2-4 short paragraphs. 150-400 words. Subject line required (no exclamation). HSO structure visible. Merge tags as bare text (no markdown). NEVER ask a scheduling question AND include a booking link in the same email — the calendar lets the lead pick their time.
+SMS:   1-3 sentences max. Under 160 chars ideal, 320 max. ONE question max. Merge tags as bare text (no markdown). At most ONE merge tag per message.
+Email: 2-4 short paragraphs. 150-400 words. Subject line required (no exclamation). HSO structure visible. Merge tags as bare text (no markdown).
 
 ═══════ RESPONSE FORMAT ═══════
 Return ONLY a valid JSON object — no markdown fences, no preamble:
@@ -384,11 +410,28 @@ function extractActiveEntryTag(context) {
   return tags.find(t => typeof t === 'string' && t.startsWith('active-entry:')) || null;
 }
 
+function getCalendarIdFromKbPack(kbPack) {
+  if (!kbPack || !kbPack.booking_context) return null;
+  const bc = kbPack.booking_context;
+  if (bc.primary && bc.primary.calendar_id) return bc.primary.calendar_id;
+  return bc.calendar_id || null;
+}
+
+function formatTodayForPrompt() {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: PROMPT_TIMEZONE,
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  }).format(new Date());
+}
+
 // ═══════════════════════════════════════════════════════════════════
-// PROMPT BUILDER (v2.5 — bare merge tag canonical block)
+// PROMPT BUILDER (v2.7 — today's date + real CALENDAR AVAILABILITY block)
 // ═══════════════════════════════════════════════════════════════════
 
-function buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack, trafficTemp) {
+function buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack, trafficTemp, availability) {
   const parts = [];
 
   parts.push(`CHANNEL: ${channel.toUpperCase()}`);
@@ -397,13 +440,17 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     : 'Constraints: 150-400 words. 2-4 short paragraphs. Subject line required. Merge tags as bare text (no markdown).'
   );
 
+  // v2.7: today's date — anchors the model so it never proposes a past date
+  // even if the CALENDAR AVAILABILITY block is empty / missing.
+  parts.push(`\nTODAY IS: ${formatTodayForPrompt()} (Florida / ${PROMPT_TIMEZONE}). NEVER propose a date that has already passed.`);
+
   parts.push(`\nCLASSIFICATION: ${classification.intent_class} (${classification.confidence?.toFixed(2) || 'n/a'} confidence, ${classification.classification_method})`);
   if (classification.reasoning) parts.push(`Classifier reasoning: ${classification.reasoning}`);
 
   parts.push(`\nTRAFFIC TEMPERATURE: ${trafficTemp.toUpperCase()} — calibrate hook intensity per Traffic Secrets section.`);
 
   if (fastTrack) {
-    parts.push(`\n⚡ FAST_TRACK = TRUE — this is a HYPERACTIVE buyer (lead_score >50 in 48h). Skip education. Push to booking. Merge tag as PRIMARY CTA, not footer.`);
+    parts.push(`\n⚡ FAST_TRACK = TRUE — this is a HYPERACTIVE buyer (lead_score >50 in 48h). Skip education. Apply BOOKING — ASK-FIRST PROTOCOL, compressed to one decision point. Do NOT punt to a calendar widget.`);
   }
 
   parts.push(`\nLEAD: ${context.lead.name}`);
@@ -491,6 +538,16 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     }
   }
 
+  // ─── v2.7: REAL CALENDAR AVAILABILITY (ground truth — picks from this list) ─
+  if (availability) {
+    const slotsBlock = formatSlotsForPrompt(availability);
+    if (slotsBlock) {
+      parts.push(`\n═══════ CALENDAR AVAILABILITY ═══════`);
+      parts.push(slotsBlock);
+      parts.push(`═══════ END CALENDAR AVAILABILITY ═══════`);
+    }
+  }
+
   // ─── v2.5: CANONICAL BOOKING LINK BLOCK (bare merge tag) ─────────
   const canonicalUrl = kbPack?.booking_context?.booking_url || null;
   const canonicalCalName = kbPack?.booking_context?.calendar_name || null;
@@ -501,14 +558,12 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     parts.push(`  ${canonicalUrl}`);
     if (canonicalCalName) parts.push(`(That ${looksLikeMergeTag ? 'merge tag' : 'URL'} is the ${canonicalCalName} calendar.)`);
     if (looksLikeMergeTag) {
-      parts.push(`This is a GHL TRIGGER LINK MERGE TAG. It looks weird with the {{ }} braces — that is correct and expected.`);
+      parts.push(`This is a GHL TRIGGER LINK MERGE TAG. The double-braces are correct GHL syntax — render expected.`);
       parts.push(`GHL renders the tag at delivery to a per-recipient short URL with click tracking. UTMs are configured statically on the trigger link in GHL — DO NOT append &utm_*= or ?utm_*= to the merge tag.`);
-      parts.push(`If you include a booking link: paste this exact merge tag string. No markdown. No modifications. No UTM suffixes.`);
-      parts.push(`AND do NOT also ask a scheduling question (morning/afternoon, what time, when works) in the same message — the calendar already lets the lead pick their slot. Pick one approach: ask, OR link.`);
+      parts.push(`Per ASK-FIRST PROTOCOL: include this link ONLY when (a) the lead has confirmed a proposed time and you are sending the lock-it-in message, (b) the lead asked for the link, (c) the lead rejected proposed times and asked for alternatives via self-serve, or (d) CALENDAR AVAILABILITY is empty/missing. Otherwise: ASK with proposed times, no link.`);
     } else {
       parts.push(`If you include a booking link: paste this exact string. No markdown. No modifications. No invented domains.`);
     }
-    parts.push(`If you do not need a booking link: omit it entirely. A message with no link is better than a wrong one.`);
     parts.push(`═══════ END CANONICAL BOOKING LINK ═══════`);
   } else {
     parts.push(`\n═══════ NO BOOKING LINK AUTHORIZED ═══════`);
@@ -519,7 +574,7 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   parts.push(`\nTHE INBOUND MESSAGE TO RESPOND TO:`);
   parts.push(`"${triggerMessage}"`);
 
-  parts.push(`\nGenerate the ${channel} response. Apply HSO. Move them ONE stage forward. Apply the right framework lens for this stage. Reference their specific situation. Include a soft next step. If KB pack provided, follow it. Booking link rules are non-negotiable.`);
+  parts.push(`\nGenerate the ${channel} response. Apply HSO. Move them ONE stage forward. Apply the right framework lens for this stage. Reference their specific situation. Include a soft next step. If KB pack provided, follow it. Apply BOOKING — ASK-FIRST PROTOCOL exactly: propose a real slot from CALENDAR AVAILABILITY and ask, OR fall back to link only when warranted.`);
 
   return parts.join('\n');
 }
@@ -812,7 +867,21 @@ export async function generateResponse(contactId, channel, triggerMessage) {
     kbPack = null;
   }
 
-  const userPrompt = buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack, trafficTemp);
+  // v2.7: fetch real GHL calendar availability for the booking calendar
+  // selected by kb-retriever. If the lookup fails, the prompt's "no
+  // availability" branch fires and the model falls back to link-as-CTA.
+  let availability = null;
+  const calendarId = getCalendarIdFromKbPack(kbPack);
+  if (calendarId) {
+    try {
+      availability = await fetchFreeSlots(calendarId);
+    } catch (err) {
+      console.warn(`[ResponseGenerator] Calendar availability fetch threw for ${contactId} (cal ${calendarId}): ${err.message} — proceeding without`);
+      availability = null;
+    }
+  }
+
+  const userPrompt = buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack, trafficTemp, availability);
   const raw = await callClaude(userPrompt);
 
   const validated = validateResponse(raw, channel);
@@ -824,6 +893,10 @@ export async function generateResponse(contactId, channel, triggerMessage) {
 
   // v2.5: log whether the merge tag actually made it into the final message
   const mergeTagInMessage = BARE_MERGE_TAG_RX.test(validated.message);
+  // v2.7: log availability lookup state
+  const availSummary = availability
+    ? (availability.slots.length > 0 ? `${availability.slots.length}slots/${availability.slots_total_count}total` : 'empty')
+    : (calendarId ? 'fetch_failed' : 'no_calendar');
 
   console.log(`[ResponseGenerator] Generated ${channel} for ${contactId}: ` +
     `intent=${classification.intent_class} ` +
@@ -833,6 +906,7 @@ export async function generateResponse(contactId, channel, triggerMessage) {
     `kb_pack=${kbPack ? 'yes' : 'no'} ` +
     `cal=${kbPack?.booking_context?.calendar_name || 'n/a'} ` +
     `policy=${kbPack?.booking_context?.policy || 'none'} ` +
+    `avail=${availSummary} ` +
     `temp=${trafficTemp} ` +
     `fast_track=${fastTrack} ` +
     `merge_tag_sent=${mergeTagInMessage} ` +
@@ -855,6 +929,8 @@ export async function generateResponse(contactId, channel, triggerMessage) {
     active_entry_tag: activeEntryTag,
     has_existing_appt: hasExistingAppt,
     merge_tag_sent: mergeTagInMessage,                           // v2.5
+    availability_slots_used: availability ? availability.slots.length : 0,  // v2.7
+    availability_total_open: availability ? availability.slots_total_count : 0,  // v2.7
     ...validated,
   };
 }
