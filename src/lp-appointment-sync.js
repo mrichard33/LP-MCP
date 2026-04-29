@@ -1,33 +1,55 @@
 /**
  * LP Appointment Sync — src/lp-appointment-sync.js
  *
+ * v5.1.4: PHONE/EMAIL MATCHING DEMOTED TO LAST RESORT.
+ *
+ *   Per policy: ID-based resolution paths (Supabase cache, GHL Lead ID
+ *   custom field, prospect ID + lognumber) are tried first. Phone
+ *   matching only runs as a final fallback when no LP identifier is
+ *   available on the GHL contact. Phone alone is not authoritative —
+ *   multiple LP prospects can share a phone (spouses, household members,
+ *   stale duplicate records). When phone path runs, we still require
+ *   the matched prospect's lead to have lognumber === GHL contact ID
+ *   before accepting.
+ *
+ *   Note on Step 0: the Supabase fast-path reads lp_leads.ghl_contact_id,
+ *   which is itself populated by phone/email matching during nightly
+ *   sync. We keep it at the top of the chain because the lookup is
+ *   cheap (one DB query) and we re-validate via getLeadByLdsId AND
+ *   require lognumber match before accepting — making it safe regardless
+ *   of how the cache value was originally derived.
+ *
  * v5.1.3: Read GHL contact ID from LP's `lognumber` field.
- *
- *   The probe revealed the GHL→LP integration writes the GHL contact ID
- *   into LP's `lognumber` field (per LP API docs: "Identifier unique to
- *   the sender of the lead, helpful in matching results back to the
- *   sender"). LP does NOT have an HLCID-named field on the lead record,
- *   despite the conceptual label. v5.1.0–v5.1.2 looked under HLCID/hlcid/
- *   etc. and matched nothing — every booking failed Step 1.
- *
- *   Other LP integrations may put non-GHL identifiers in lognumber
- *   (UUIDs, internal IDs, empty). Those simply won't match the target
- *   GHL contact ID and the chain falls through correctly. We also keep
- *   checking the HLCID-named variants in case LP ever adds a dedicated
- *   field — first match wins.
- *
  * v5.1.2: Probe surfaces lognumber, userfields, and notes content.
  * v5.1.1: Adds /webhook/ghl/lp-probe diagnostic endpoint.
+ * v5.1: HLCID-first chain + manual-action fallback tag.
  *
- * v5.1: HLCID-FIRST RESOLUTION CHAIN + MANUAL-ACTION FALLBACK TAG.
- *   0. SUPABASE FAST-PATH — lp_leads.ghl_contact_id (cache).
- *   1. PROSPECT + HLCID — getLeads(cst_id=prospectId, PageSize=50)
- *   2. PHONE → HLCID — getCustomers3({phone}) → leads per prospect.
- *   3. GHL FIELD + HLCID — `GmAVmW6V9sekD7pVONKr` validated.
+ * v5.1.4 chain (each candidate validated against the live LP record
+ *   AND must have lognumber === inbound GHL contact ID before accept):
+ *
+ *   0. SUPABASE FAST-PATH — lp_leads.ghl_contact_id (cache hint,
+ *      lognumber-validated). One DB query + one LP getLeadByLdsId.
+ *
+ *   1. GHL LEAD ID FIELD — `GmAVmW6V9sekD7pVONKr` on the GHL contact.
+ *      Most authoritative when populated: identifies the exact lead.
+ *      One GHL GET + one LP getLeadByLdsId. Skipped if the field is
+ *      empty or matches the in1_id (inbound queue ID, not a real lds_id).
+ *
+ *   2. PROSPECT ID + LOGNUMBER — GHL custom field LP_PROSPECT_ID_FIELD.
+ *      One LP getLeads(cst_id) call → scan returned leads, accept the
+ *      one whose lognumber matches the GHL contact ID. Authoritative
+ *      because the prospect ID came from GHL itself.
+ *
+ *   3. PHONE + LOGNUMBER (LAST RESORT) — getCustomers3({phone}) →
+ *      for each prospect returned, getLeads(cst_id) + lognumber filter.
+ *      Only runs when steps 0–2 produced nothing. Multiple LP API
+ *      calls. Used only when the GHL contact has no LP identifier
+ *      yet (rare — usually present after first inbound webhook fires).
+ *
  *   4. FAILURE — apply `lp-sync-failed` tag, GroupMe + GHL note.
  *
  * Endpoints:
- *   POST /webhook/ghl/set-lp-appointment — main sync entry (v5.1.3)
+ *   POST /webhook/ghl/set-lp-appointment — main sync entry (v5.1.4)
  *   POST /webhook/ghl/lp-probe          — diagnostic (v5.1.2)
  */
 
@@ -130,15 +152,12 @@ const BOOKABLE_DISPOSITIONS = new Set([
 /**
  * Extract the GHL contact ID stored on an LP lead record.
  *
- * The GHL→LP integration writes it to LP's `lognumber` field, NOT
- * any HLCID-named field. We check `lognumber` variants first, then
- * fall back to HLCID-named fields in case LP ever adds a dedicated
- * field. First non-empty value wins.
- *
- * Note: not every `lognumber` value is a GHL contact ID. Other LP
- * integrations populate it with UUIDs, internal IDs, or leave it empty.
- * findLeadByHLCID compares the returned value against the target GHL
- * contact ID, so non-matching values are correctly skipped.
+ * The GHL→LP integration writes it to LP's `lognumber` field (per LP
+ * API docs: "Identifier unique to the sender of the lead"). Other
+ * tenants may put non-GHL values in lognumber (UUIDs, internal IDs,
+ * empty strings); those won't equal the target GHL contact ID and the
+ * chain falls through correctly. HLCID-named variants are kept as a
+ * forward-compat fallback in case LP ever adds a dedicated field.
  */
 function extractHLCID(leadRecord) {
   if (!leadRecord) return null;
@@ -194,7 +213,6 @@ async function resolveProspectToHLCIDLead(prospect, ghlContactId) {
   if (!prospectId) return null;
   try {
     const leadsResult = await getLeads({ cst_id: prospectId, PageSize: 50 });
-    // getLeads returns prospect records each containing inner leads — flatten.
     const records = Array.isArray(leadsResult) ? leadsResult : [leadsResult];
     const allLeads = [];
     for (const p of records) {
@@ -210,11 +228,24 @@ async function resolveProspectToHLCIDLead(prospect, ghlContactId) {
   }
 }
 
+/**
+ * v5.1.4 chain — see file header for full priority rationale.
+ *
+ *   Step 0 (Supabase cache, lognumber-validated)
+ *      ↓ no hit
+ *   Step 1 (GHL Lead ID field, lognumber-validated)
+ *      ↓ field empty / matches in1_id / lognumber mismatch
+ *   Step 2 (Prospect ID + lognumber)
+ *      ↓ no GHL prospect ID, or no matching lead under that prospect
+ *   Step 3 (Phone + lognumber — LAST RESORT)
+ *      ↓ no phone, or no matching lead across all phone-matched prospects
+ *   FAILURE
+ */
 async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
   const webhookProspectId = cleanGHLValue(contactInfo.prospectId);
   const phone = normalizePhone(contactInfo.phone || '');
 
-  // Step 0: Supabase fast-path
+  // ── Step 0: Supabase fast-path (cache hint, lognumber-validated) ──
   try {
     const { data: leads } = await supabase.from('lp_leads')
       .select('lp_lead_id, lp_prospect_id, disposition_code, synced_at')
@@ -238,10 +269,10 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
             const hlcid = extractHLCID(target);
             if (hlcid && hlcid === String(ghlContactId)) {
               const pid = String(prospect.ProspectID || prospect.prospectid || prospect.CstID || prospect.cst_id || candidate.lp_prospect_id || '');
-              console.log(`[LP-RESOLVE] ✅ Step 0 Supabase+HLCID: lds_id=${candidate.lp_lead_id}, prospect=${pid}, disp=${candidate.disposition_code}`);
+              console.log(`[LP-RESOLVE] ✅ Step 0 Supabase+lognumber: lds_id=${candidate.lp_lead_id}, prospect=${pid}, disp=${candidate.disposition_code}`);
               return { ldsId: String(candidate.lp_lead_id), prospectId: pid, source: 'supabase_hlcid_validated', step: 0 };
             }
-            console.warn(`[LP-RESOLVE] Step 0: lds_id=${candidate.lp_lead_id} HLCID mismatch (got ${hlcid || 'null'}, want ${ghlContactId})`);
+            console.warn(`[LP-RESOLVE] Step 0: lds_id=${candidate.lp_lead_id} lognumber mismatch (got ${hlcid || 'null'}, want ${ghlContactId})`);
           }
         } catch (err) {
           console.warn(`[LP-RESOLVE] Step 0 validation failed for lds_id=${candidate.lp_lead_id}: ${err.message}`);
@@ -252,7 +283,50 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
     console.warn(`[LP-RESOLVE] Step 0 Supabase lookup failed: ${err.message}`);
   }
 
-  // Step 1: Prospect + HLCID
+  // ── Step 1: GHL Lead ID field + lognumber ─────────────────────
+  // Most authoritative path when populated: GHL contact carries the
+  // exact lds_id from a previous successful sync. We validate it
+  // by fetching live and confirming lognumber matches.
+  try {
+    const ghlRes = await ghlFetch('GET', `/contacts/${ghlContactId}`);
+    const customFields = ghlRes?.contact?.customFields || [];
+    const leadIdField = customFields.find(f => f.id === LP_LEAD_ID_FIELD);
+    const inboundIdField = customFields.find(f => f.id === LP_INBOUND_ID_FIELD);
+    const ghlLeadId = leadIdField?.value ? String(leadIdField.value) : null;
+    const ghlInboundId = inboundIdField?.value ? String(inboundIdField.value) : null;
+
+    if (ghlLeadId) {
+      if (ghlInboundId && ghlLeadId === ghlInboundId) {
+        console.warn(`[LP-RESOLVE] Step 1: GHL field matches inbound ID (${ghlLeadId}) — skipping (in1_id is not a real lds_id)`);
+      } else {
+        const result = await getLeadByLdsId(ghlLeadId);
+        const records = Array.isArray(result) ? result : [result];
+        for (const prospect of records) {
+          if (!prospect) continue;
+          const innerLeads = prospect.leads || prospect.Leads || [];
+          const target = innerLeads.find(l =>
+            String(l.LeadID || l.leadid || l.lds_id || l.id) === ghlLeadId
+          );
+          if (!target) continue;
+          const hlcid = extractHLCID(target);
+          if (hlcid && hlcid === String(ghlContactId)) {
+            const pid = String(prospect.ProspectID || prospect.prospectid || prospect.CstID || prospect.cst_id || '');
+            console.log(`[LP-RESOLVE] ✅ Step 1 GHL field+lognumber: lds_id=${ghlLeadId}, prospect=${pid}`);
+            return { ldsId: ghlLeadId, prospectId: pid, source: 'ghl_field_plus_hlcid', step: 1 };
+          }
+          console.warn(`[LP-RESOLVE] Step 1: GHL field lds_id=${ghlLeadId} lognumber mismatch (got ${hlcid || 'null'}, want ${ghlContactId})`);
+        }
+      }
+    } else {
+      console.log(`[LP-RESOLVE] Step 1: GHL Lead ID field empty — skipping`);
+    }
+  } catch (err) {
+    console.warn(`[LP-RESOLVE] Step 1 GHL field check failed: ${err.message}`);
+  }
+
+  // ── Step 2: Prospect ID + lognumber ───────────────────────────
+  // Authoritative because the prospect ID came from GHL itself (set
+  // when the lead was originally pushed to LP). One LP API call.
   if (webhookProspectId && /^\d+$/.test(webhookProspectId)) {
     try {
       const leadsResult = await getLeads({ cst_id: webhookProspectId, PageSize: 50 });
@@ -269,78 +343,47 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
       }
       const best = findLeadByHLCID(allLeads, ghlContactId, webhookProspectId);
       if (best) {
-        console.log(`[LP-RESOLVE] ✅ Step 1 prospect+HLCID: lds_id=${best.ldsId}, prospect=${best.prospectId || webhookProspectId}, disp=${best.disp}`);
-        return { ldsId: best.ldsId, prospectId: best.prospectId || webhookProspectId, source: 'prospect_plus_hlcid', step: 1 };
+        console.log(`[LP-RESOLVE] ✅ Step 2 prospect+lognumber: lds_id=${best.ldsId}, prospect=${best.prospectId || webhookProspectId}, disp=${best.disp}`);
+        return { ldsId: best.ldsId, prospectId: best.prospectId || webhookProspectId, source: 'prospect_plus_hlcid', step: 2 };
       }
-      console.warn(`[LP-RESOLVE] Step 1: prospect ${webhookProspectId} has no lead with matching HLCID — falling through`);
+      console.warn(`[LP-RESOLVE] Step 2: prospect ${webhookProspectId} has no lead with matching lognumber — falling through`);
     } catch (err) {
-      console.warn(`[LP-RESOLVE] Step 1 prospect+HLCID failed for ${webhookProspectId}: ${err.message}`);
+      console.warn(`[LP-RESOLVE] Step 2 prospect+lognumber failed for ${webhookProspectId}: ${err.message}`);
     }
+  } else {
+    console.log(`[LP-RESOLVE] Step 2: GHL has no LP Prospect ID — skipping`);
   }
 
-  // Step 2: Phone → HLCID
+  // ── Step 3: Phone + lognumber (LAST RESORT) ───────────────────
+  // Only runs when no LP identifier was available on the GHL contact.
+  // Multiple LP prospects can share a phone; we still require lognumber
+  // match before accepting any phone-matched candidate.
   if (phone) {
     let prospectList = [];
     try {
       const prospects = await getCustomers3({ phone });
       prospectList = Array.isArray(prospects) ? prospects : (prospects ? [prospects] : []);
       prospectList = prospectList.filter(Boolean);
-      console.log(`[LP-RESOLVE] GetCustomers3 by phone returned ${prospectList.length} prospect(s)`);
+      console.log(`[LP-RESOLVE] Step 3 (last resort): GetCustomers3 by phone returned ${prospectList.length} prospect(s)`);
     } catch (err) {
-      console.warn(`[LP-RESOLVE] GetCustomers3 by phone failed: ${err.message}`);
+      console.warn(`[LP-RESOLVE] Step 3 GetCustomers3 by phone failed: ${err.message}`);
     }
 
     for (const p of prospectList) {
       const best = await resolveProspectToHLCIDLead(p, ghlContactId);
       if (best) {
-        console.log(`[LP-RESOLVE] ✅ Step 2 phone+HLCID: lds_id=${best.ldsId}, prospect=${best.prospectId}, disp=${best.disp}`);
-        return { ldsId: best.ldsId, prospectId: best.prospectId, source: 'phone_plus_hlcid', step: 2 };
+        console.log(`[LP-RESOLVE] ✅ Step 3 phone+lognumber (last resort): lds_id=${best.ldsId}, prospect=${best.prospectId}, disp=${best.disp}`);
+        return { ldsId: best.ldsId, prospectId: best.prospectId, source: 'phone_plus_hlcid_lastresort', step: 3 };
       }
     }
     if (prospectList.length) {
-      console.warn(`[LP-RESOLVE] Step 2: no prospect on this phone has a lead with matching HLCID`);
+      console.warn(`[LP-RESOLVE] Step 3: no phone-matched prospect has a lead with matching lognumber`);
     }
   } else {
-    console.warn(`[LP-RESOLVE] No phone available — skipping Step 2`);
+    console.warn(`[LP-RESOLVE] Step 3: no phone available — skipping last-resort path`);
   }
 
-  // Step 3: GHL field + HLCID
-  try {
-    const ghlRes = await ghlFetch('GET', `/contacts/${ghlContactId}`);
-    const customFields = ghlRes?.contact?.customFields || [];
-    const leadIdField = customFields.find(f => f.id === LP_LEAD_ID_FIELD);
-    const inboundIdField = customFields.find(f => f.id === LP_INBOUND_ID_FIELD);
-    const ghlLeadId = leadIdField?.value ? String(leadIdField.value) : null;
-    const ghlInboundId = inboundIdField?.value ? String(inboundIdField.value) : null;
-
-    if (ghlLeadId) {
-      if (ghlInboundId && ghlLeadId === ghlInboundId) {
-        console.warn(`[LP-RESOLVE] Step 3: GHL field matches inbound ID (${ghlLeadId}) — skipping`);
-      } else {
-        const result = await getLeadByLdsId(ghlLeadId);
-        const records = Array.isArray(result) ? result : [result];
-        for (const prospect of records) {
-          if (!prospect) continue;
-          const innerLeads = prospect.leads || prospect.Leads || [];
-          const target = innerLeads.find(l =>
-            String(l.LeadID || l.leadid || l.lds_id || l.id) === ghlLeadId
-          );
-          if (!target) continue;
-          const hlcid = extractHLCID(target);
-          if (hlcid && hlcid === String(ghlContactId)) {
-            const pid = String(prospect.ProspectID || prospect.prospectid || prospect.CstID || prospect.cst_id || '');
-            console.log(`[LP-RESOLVE] ✅ Step 3 GHL field+HLCID: lds_id=${ghlLeadId}, prospect=${pid}`);
-            return { ldsId: ghlLeadId, prospectId: pid, source: 'ghl_field_plus_hlcid', step: 3 };
-          }
-          console.warn(`[LP-RESOLVE] Step 3: GHL field lds_id=${ghlLeadId} HLCID mismatch (got ${hlcid || 'null'}, want ${ghlContactId})`);
-        }
-      }
-    }
-  } catch (err) {
-    console.warn(`[LP-RESOLVE] Step 3 GHL field check failed: ${err.message}`);
-  }
-
-  console.warn(`[LP-RESOLVE] ❌ No HLCID-validated lds_id for ${ghlContactId} after 4-step chain`);
+  console.warn(`[LP-RESOLVE] ❌ No lognumber-validated lds_id for ${ghlContactId} after 4-step chain`);
   return null;
 }
 
@@ -459,9 +502,9 @@ async function sendSyncFailureNotification({
 🆔 LP IDs tried: ${idsLine}
 🔗 GHL: ${ghlLink}
 
-CHAIN RESULT — all 4 HLCID-validated steps failed:
-  0 supabase+HLCID • 1 prospect+HLCID
-  2 phone+HLCID    • 3 GHL field+HLCID
+CHAIN RESULT — all 4 lognumber-validated steps failed:
+  0 supabase+lognumber       • 1 GHL field+lognumber
+  2 prospect+lognumber       • 3 phone+lognumber (last resort)
 
 Tag '${LP_SYNC_FAILED_TAG}' applied${tagApplied ? '' : ' (FAILED — see logs)'} →
 manual-action workflow will fire team notifications.
@@ -479,8 +522,8 @@ ACTION:
   });
 
   await addGHLNote(contactId,
-    `[LP SYNC v5.1.3] Appointment NOT synced — full HLCID-validated chain failed.\n` +
-    `Tried: supabase+HLCID, prospect+HLCID, phone+HLCID, GHL field+HLCID.\n` +
+    `[LP SYNC v5.1.4] Appointment NOT synced — full lognumber-validated chain failed.\n` +
+    `Tried (in priority order): supabase+lognumber, GHL field+lognumber, prospect+lognumber, phone+lognumber (last resort).\n` +
     `LP IDs: ${idsLine}\n` +
     `Appt: ${apptLine}\n` +
     `Tag '${LP_SYNC_FAILED_TAG}' ${tagApplied ? 'applied' : 'FAILED to apply'} — ` +
@@ -519,7 +562,7 @@ async function syncAppointmentToLP({
       action: 'skipped_no_valid_lead_id',
       contact_id: contactId,
       contact_name: contactName,
-      attempted_steps: ['supabase+hlcid', 'prospect+hlcid', 'phone+hlcid', 'ghl_field+hlcid'],
+      attempted_steps: ['supabase+lognumber', 'ghl_field+lognumber', 'prospect+lognumber', 'phone+lognumber_lastresort'],
       manual_action_tag_applied: LP_SYNC_FAILED_TAG,
     };
   }
@@ -564,11 +607,11 @@ async function syncAppointmentToLP({
   const result = await lpSetAppointment({ ldsId, setBy: '5686', apptDate, apptTime });
 
   await addGHLNote(contactId,
-    `[LP SYNC v5.1.3] Appointment set\nLP Lead: ${ldsId} (via ${source}, step ${step})\nProspect: ${prospectId || 'N/A'}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName || 'N/A'}`
+    `[LP SYNC v5.1.4] Appointment set\nLP Lead: ${ldsId} (via ${source}, step ${step})\nProspect: ${prospectId || 'N/A'}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName || 'N/A'}`
   ).catch(() => {});
 
   await sendGroupMeMessage(
-    `📅 LP Appointment Set (v5.1.3 lognumber)\n` +
+    `📅 LP Appointment Set (v5.1.4 ID-first)\n` +
     `👤 ${contactName || contactId}\n` +
     `📋 LP Lead: ${ldsId} (${source}, step ${step}) | Prospect: ${prospectId || 'N/A'}\n` +
     `📅 ${apptDate} ${apptTime} | ${calendarName || 'N/A'}`
@@ -860,7 +903,7 @@ export function registerLPAppointmentSyncRoutes(app) {
     }
   });
 
-  console.log('[LP-APPT] Registered: POST /webhook/ghl/set-lp-appointment (v5.1.3 lognumber-aware)');
+  console.log('[LP-APPT] Registered: POST /webhook/ghl/set-lp-appointment (v5.1.4 ID-first, phone last resort)');
   console.log('[LP-PROBE] Registered: POST /webhook/ghl/lp-probe (v5.1.2 diagnostic w/ userfields+lognumber)');
 }
 
