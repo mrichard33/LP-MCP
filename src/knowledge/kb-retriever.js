@@ -3,6 +3,33 @@
  *
  * Orchestrates structured KB lookups (Tier 1) for the response generator.
  *
+ * v1.7 — 2026-04-29. SCHEDULING-SIGNAL FALLBACK.
+ *   PROBLEM: Even with the BOOK classifier fixes, the keyword scan can still
+ *   misroute when the inbound has no specific BOOK trigger keyword AND the
+ *   semantic classifier (Haiku) doesn't pick up on conversation continuity.
+ *   Surfaced on action #28186 ("Saturday doesn't work. Do you have anything
+ *   on Sunday or Monday?") which routed to QUESTION because Layer 1 matched
+ *   "do you" — without booking_context attached, the calendar lookup was
+ *   skipped and the bot proposed day-only slots with no specific times.
+ *
+ *   FIX: Add a defensive scheduling-signal detector that looks for explicit
+ *   scheduling cues in the message text:
+ *     - Day-of-week names (monday, tuesday, ..., sunday, weekend)
+ *     - Availability questions ("anything on", "what about", "do you have")
+ *     - Reschedule signals ("doesn't work", "different time/day", "another time")
+ *     - Time-of-day cues ("morning", "afternoon", "evening")
+ *
+ *   When detected on intent classes that don't normally attach booking_context
+ *   (QUESTION, UNCLEAR, RECONNECT, NOT_INTERESTED, SEND_INFO), this fallback
+ *   forces booking_context attachment so the calendar lookup fires and the
+ *   bot has real availability to propose specific times from. This is
+ *   belt-and-suspenders alongside the classifier improvements (better BOOK
+ *   description + stronger continuation keywords on 2026-04-29).
+ *
+ *   The detected_signals.scheduling_signal field is also exposed in the
+ *   prompt so the model knows the lead is in scheduling mode even if the
+ *   intent_class header says QUESTION.
+ *
  * v1.6 — 2026-04-28. BARE MERGE TAG — drop dynamic UTM suffix.
  *   Field test (action #27812) showed v1.5's form produced a malformed
  *   rendered URL: GHL renders {{trigger_link.X}} to a bare short URL
@@ -27,19 +54,7 @@
  *   bakes utm_term + utm_medium into proper query string params for
  *   diagnostic and non-merge-tag use cases.
  *
- * v1.5 — GHL trigger link merge tags + dynamic UTM suffix (REVERTED in v1.6
- *   because the suffix produced malformed URLs after GHL rendering).
- *   Trigger Link IDs (configured in GHL by Mark — unchanged in v1.6):
- *     CONFIRMATION_CALL  → sfQAvcOczlOGQX1LE0Ht  (book call)
- *     WINDOW_ESTIMATE    → QqvhMNyB7YQzHqSNOXHm
- *     MV                 → SPQHJKSLbwhJ1bhg2dIy  (book measurement verification)
- *     ESTIMATE_CALCULATOR → aS10ZzuBDRI2GUpzQh1v
- *   utm_content slugs (configured statically on each trigger link in GHL):
- *     CONFIRMATION_CALL  → book_call_link
- *     WINDOW_ESTIMATE    → book_window_estimate_link
- *     MV                 → book_measurement_verification_link
- *     ESTIMATE_CALCULATOR → estimate_calculator_pricing_link
- *
+ * v1.5 — GHL trigger link merge tags + dynamic UTM suffix (REVERTED in v1.6).
  * v1.3 — Context-aware calendar selection (4-policy decision tree).
  * v1.2 — In-home-first booking policy (superseded by v1.3).
  * v1.1 — Calendar awareness: resolveBookingContext + activeEntryTag.
@@ -53,18 +68,11 @@ import supabase from '../supabase.js';
 // ═══════════════════════════════════════════════════════════════════
 
 export const CALENDAR_IDS = {
-  CONFIRMATION_CALL: 'gFWoSQrlKIdfRbAPV842',  // 1-2min phone confirmation
-  WINDOW_ESTIMATE:   'aJj14ONxh1oFyDcQ706O',  // 90-min in-home Window Protection Estimate
-  MV:                'zEdPmkNccR2ovo3rQAd3',  // Window Measurement Verification
+  CONFIRMATION_CALL: 'gFWoSQrlKIdfRbAPV842',
+  WINDOW_ESTIMATE:   'aJj14ONxh1oFyDcQ706O',
+  MV:                'zEdPmkNccR2ovo3rQAd3',
 };
 
-// v1.6: GHL trigger link IDs — Mark's "Agentic Bot Trigger - *" links.
-// These are the source of truth for per-click attribution. The bot writes
-// the bare merge tag form ({{trigger_link.<ID>}}) into outbound messages
-// and GHL renders it server-side at delivery, generating a unique tracked
-// short URL per recipient. UTMs (utm_source/medium/campaign/content) are
-// configured statically on each trigger link's destination URL in GHL —
-// kb-retriever does NOT append them dynamically (see v1.6 header).
 export const TRIGGER_LINK_IDS = {
   CONFIRMATION_CALL:   process.env.REECE_TRIGGER_CALL          || 'sfQAvcOczlOGQX1LE0Ht',
   WINDOW_ESTIMATE:     process.env.REECE_TRIGGER_WE            || 'QqvhMNyB7YQzHqSNOXHm',
@@ -72,9 +80,6 @@ export const TRIGGER_LINK_IDS = {
   ESTIMATE_CALCULATOR: process.env.REECE_TRIGGER_CALCULATOR    || 'aS10ZzuBDRI2GUpzQh1v',
 };
 
-// utm_content slugs per Mark's updated spec (one per calendar so click
-// attribution can distinguish which calendar was clicked). Kept here for
-// the resolved-URL fallback path (buildBookingUrl).
 const BOOKING_SPECS = {
   CONFIRMATION_CALL: {
     base:        process.env.REECE_CALL_BOOKING_URL || `https://link.reecewindows.com/widget/booking/${CALENDAR_IDS.CONFIRMATION_CALL}`,
@@ -94,13 +99,10 @@ const BOOKING_SPECS = {
   ESTIMATE_CALCULATOR: {
     base:        process.env.REECE_CALCULATOR_URL || 'https://landing.reecewindows.com/instant-window-pricing-page',
     utm_content: 'estimate_calculator_pricing_link',
-    // LP integration markers — pre-attribute calculator clicks to the
-    // chatbot pro/source so LP can route them on creation.
     extra_params: { pro_id: '3269', lp_source_id: '842' },
   },
 };
 
-// Short policy slugs for utm_term — keeps attribution URLs readable.
 const POLICY_TO_UTM_TERM = {
   phone_primary_in_home_fallback: 'phone_primary',
   mv_only:                        'mv',
@@ -112,56 +114,17 @@ const POLICY_TO_UTM_TERM = {
 // URL BUILDERS (v1.6 — bare merge tag, no UTM suffix)
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * Build the trigger-link-form booking URL for use in outbound messages.
- *
- * v1.6: Returns the BARE GHL merge tag — `{{trigger_link.<ID>}}`.
- * No dynamic UTM suffix is appended. (See header comment for rationale —
- * v1.5's `&utm_term=…` form produced malformed URLs because GHL renders
- * the merge tag to a bare short URL with no `?` query string.)
- *
- * GHL renders the merge tag at delivery to a per-recipient short URL
- * (e.g. https://link.reecewindows.com/l/abc123) and records click
- * attribution against the contact. The trigger link's destination URL
- * (configured in GHL) carries utm_source/medium/campaign/content for
- * downstream analytics — those static UTMs flow through on redirect.
- *
- * @param {keyof TRIGGER_LINK_IDS} triggerKey
- * @param {Object} [opts] — Retained for backward compatibility; values
- *                          (channel, policy) are IGNORED in v1.6. They
- *                          were previously used to inject utm_term /
- *                          utm_medium suffixes that produced malformed
- *                          rendered URLs.
- * @returns {string|null}
- */
 export function buildTriggerLinkUrl(triggerKey, opts = {}) {
   const id = TRIGGER_LINK_IDS[triggerKey];
   if (!id) return null;
-  // v1.6: bare merge tag only — no dynamic UTM suffix.
   return `{{trigger_link.${id}}}`;
 }
 
-/**
- * Build a fully-resolved booking URL with UTMs and contact pre-fill.
- *
- * Used when:
- *   - The bot needs a real URL outside GHL conversation context
- *     (e.g., diagnostic logging, LP MCP tools)
- *   - As a fallback if GHL trigger-link rendering ever fails
- *
- * For outbound messages sent via the GHL conversation API, prefer
- * buildTriggerLinkUrl() — that gets per-click attribution from GHL.
- *
- * @param {Object} spec — { base, utm_content, extra_params }
- * @param {Object} opts
- * @returns {string|null}
- */
 export function buildBookingUrl(spec, opts = {}) {
   if (!spec || !spec.base) return null;
   const { channel = 'sms', policy = null, contactData = {} } = opts;
 
   const params = new URLSearchParams();
-
   params.set('utm_source',   'ghl');
   params.set('utm_medium',   channel === 'email' ? 'email' : 'sms');
   params.set('utm_campaign', 'agentic_bot');
@@ -169,11 +132,8 @@ export function buildBookingUrl(spec, opts = {}) {
   if (policy && POLICY_TO_UTM_TERM[policy]) {
     params.set('utm_term', POLICY_TO_UTM_TERM[policy]);
   }
-
   for (const [k, v] of Object.entries(spec.extra_params || {})) {
-    if (v !== null && v !== undefined && v !== '') {
-      params.set(k, String(v));
-    }
+    if (v !== null && v !== undefined && v !== '') params.set(k, String(v));
   }
 
   const cd = contactData || {};
@@ -186,15 +146,12 @@ export function buildBookingUrl(spec, opts = {}) {
     phone:         cd.phone          || null,
   };
   for (const [k, v] of Object.entries(prefill)) {
-    if (v && typeof v === 'string' && v.trim().length > 0) {
-      params.set(k, v.trim());
-    }
+    if (v && typeof v === 'string' && v.trim().length > 0) params.set(k, v.trim());
   }
 
   return `${spec.base}?${params.toString()}`;
 }
 
-// Convenience export for tripwire / value-ladder use cases.
 export function getEstimateCalculatorTriggerLink(opts = {}) {
   return buildTriggerLinkUrl('ESTIMATE_CALCULATOR', opts);
 }
@@ -203,45 +160,42 @@ export function getEstimateCalculatorUrl(opts = {}) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// CALENDAR DEFINITION FACTORIES (v1.6 — bare merge tag form)
+// CALENDAR DEFINITION FACTORIES
 // ═══════════════════════════════════════════════════════════════════
 
 function windowEstimateCalendar(opts) {
   return {
-    type:                 'in_home',
-    visit_type:           'in_home',
-    calendar_id:          CALENDAR_IDS.WINDOW_ESTIMATE,
-    calendar_name:        'Window Estimate',
-    duration_minutes:     90,
-    booking_url:          buildTriggerLinkUrl('WINDOW_ESTIMATE', opts),                  // merge tag (used in messages)
-    booking_url_resolved: buildBookingUrl(BOOKING_SPECS.WINDOW_ESTIMATE, opts),         // resolved (debug/fallback)
-    description:          'Standard in-home Window Protection Estimate — about an hour and a half. Specialist measures to Florida code and provides exact pricing valid for 1 year. Both homeowners should be present.',
+    type: 'in_home', visit_type: 'in_home',
+    calendar_id: CALENDAR_IDS.WINDOW_ESTIMATE,
+    calendar_name: 'Window Estimate',
+    duration_minutes: 90,
+    booking_url: buildTriggerLinkUrl('WINDOW_ESTIMATE', opts),
+    booking_url_resolved: buildBookingUrl(BOOKING_SPECS.WINDOW_ESTIMATE, opts),
+    description: 'Standard in-home Window Protection Estimate — about an hour and a half. Specialist measures to Florida code and provides exact pricing valid for 1 year. Both homeowners should be present.',
   };
 }
 
 function mvCalendar(opts) {
   return {
-    type:                 'in_home',
-    visit_type:           'in_home',
-    calendar_id:          CALENDAR_IDS.MV,
-    calendar_name:        'Window Measurement Verification',
-    duration_minutes:     90,
-    booking_url:          buildTriggerLinkUrl('MV', opts),
+    type: 'in_home', visit_type: 'in_home',
+    calendar_id: CALENDAR_IDS.MV,
+    calendar_name: 'Window Measurement Verification',
+    duration_minutes: 90,
+    booking_url: buildTriggerLinkUrl('MV', opts),
     booking_url_resolved: buildBookingUrl(BOOKING_SPECS.MV, opts),
-    description:          'In-home measurement verification — about 90 minutes — for leads who came through the online estimate calculator. Specialist verifies measurements and finalizes penny-accurate pricing. Both homeowners should be present.',
+    description: 'In-home measurement verification — about 90 minutes — for leads who came through the online estimate calculator. Specialist verifies measurements and finalizes penny-accurate pricing. Both homeowners should be present.',
   };
 }
 
 function confirmationCallCalendar(opts) {
   return {
-    type:                 'phone_call',
-    visit_type:           'phone',
-    calendar_id:          CALENDAR_IDS.CONFIRMATION_CALL,
-    calendar_name:        'Confirmation Call',
-    duration_minutes:     15,
-    booking_url:          buildTriggerLinkUrl('CONFIRMATION_CALL', opts),
+    type: 'phone_call', visit_type: 'phone',
+    calendar_id: CALENDAR_IDS.CONFIRMATION_CALL,
+    calendar_name: 'Confirmation Call',
+    duration_minutes: 15,
+    booking_url: buildTriggerLinkUrl('CONFIRMATION_CALL', opts),
     booking_url_resolved: buildBookingUrl(BOOKING_SPECS.CONFIRMATION_CALL, opts),
-    description:          '1-2 minute phone call. Used for: (a) leads who explicitly request a phone conversation, (b) confirming details for an existing appointment, (c) brief callback when an in-home is logistically impossible.',
+    description: '1-2 minute phone call. Used for: (a) leads who explicitly request a phone conversation, (b) confirming details for an existing appointment, (c) brief callback when an in-home is logistically impossible.',
   };
 }
 
@@ -286,6 +240,30 @@ const APPT_CONFIRMATION_KEYWORDS = [
   'confirm the appointment', 'time of my appointment', 'time for my',
 ];
 
+// ═══════════════════════════════════════════════════════════════════
+// v1.7 — SCHEDULING-SIGNAL DETECTION (defensive fallback)
+// ═══════════════════════════════════════════════════════════════════
+
+const SCHEDULING_SIGNAL_KEYWORDS = [
+  // Day-of-week names — strong continuation signal when conversation is mid-booking
+  'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+  'weekend', 'this weekend', 'next weekend', 'weekday', 'next week',
+  // Time-of-day references in scheduling context
+  'morning', 'afternoon', 'evening', 'tonight',
+  // Availability questions
+  'anything on', 'anything available', 'any time', 'open slot',
+  'open time', 'availability', 'what times', 'what time',
+  'any other times', 'any other days',
+  // Reschedule signals
+  "doesn't work", 'doesnt work', "doesn t work", 'cant do', "can't do",
+  'reschedule', 'different time', 'different day', 'another time',
+  'another day', 'change the time', 'change the day', 'move it',
+  // Confirmation cues (lead picking from offered slots)
+  'works for me', 'works better', 'that works', 'that one',
+  // Direct asks
+  'what about', 'how about', 'how about sunday', 'how about monday',
+];
+
 function containsAny(text, keywords) {
   for (const kw of keywords) {
     if (text.includes(kw)) return kw;
@@ -304,25 +282,23 @@ export function detectUserBookingPreference(messageText) {
   return null;
 }
 
+/**
+ * v1.7 — Detect scheduling continuation signals. Returns the matched
+ * keyword if found, null otherwise. Used as a defensive fallback to
+ * attach booking_context when intent classifies as QUESTION/UNCLEAR/
+ * RECONNECT/NOT_INTERESTED/SEND_INFO but the lead is clearly engaged
+ * in a scheduling conversation.
+ */
+export function detectSchedulingSignal(messageText) {
+  if (!messageText || typeof messageText !== 'string') return null;
+  const lc = messageText.toLowerCase();
+  return containsAny(lc, SCHEDULING_SIGNAL_KEYWORDS);
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // BOOKING CONTEXT RESOLVER (v1.6 — channel/policy passed but unused by URL builder)
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * Resolve the right booking calendar based on user preference + context.
- *
- * @param {Object} args
- * @param {string} args.intentClass
- * @param {string} [args.activeEntryTag]
- * @param {string} [args.userPreference]
- * @param {boolean} [args.hasExistingAppt]
- * @param {string} [args.lpDisposition]
- * @param {string} [args.channel='sms']  — v1.6: still threaded through for
- *                                         buildBookingUrl() (resolved-URL
- *                                         fallback path); ignored by the
- *                                         primary buildTriggerLinkUrl().
- * @returns {Object} BookingContext with primary, fallback, policy, guidance
- */
 export function resolveBookingContext({
   intentClass,
   activeEntryTag,
@@ -331,9 +307,6 @@ export function resolveBookingContext({
   lpDisposition = null,
   channel = 'sms',
 } = {}) {
-  // Determine policy first so we can route to the right calendar.
-  // (v1.5 also baked policy into utm_term; v1.6 dropped that — the
-  // calendar choice itself encodes the policy.)
   let policy;
   const isCallbackIntent = intentClass === 'CALLBACK' || intentClass === 'CALLBACK_CALM';
   const isEstimateCalculator = activeEntryTag === 'active-entry:estimate-calculator';
@@ -353,13 +326,9 @@ export function resolveBookingContext({
   const phone  = confirmationCallCalendar(opts);
   const mv     = mvCalendar(opts);
 
-  // ─── CASE A: User asked for a phone call ────────────────────────
   if (policy === 'phone_primary_in_home_fallback') {
     return {
-      ...phone,
-      primary:  phone,
-      fallback: inHome,
-      policy,
+      ...phone, primary: phone, fallback: inHome, policy,
       guidance: [
         'The lead asked for a phone call. Honor that — offer the 15-min Confirmation Call slot first, not the in-home.',
         'If during that call we discover they want the full in-home estimate, the in-home Window Estimate is the natural next step (it\'s in the fallback).',
@@ -368,13 +337,9 @@ export function resolveBookingContext({
     };
   }
 
-  // ─── CASE B: Measurement Verification ────────────────────────────
   if (policy === 'mv_only') {
     return {
-      ...mv,
-      primary:  mv,
-      fallback: null,
-      policy,
+      ...mv, primary: mv, fallback: null, policy,
       guidance: [
         'This lead came through the online Estimate Calculator (or asked for MV directly).',
         'The next step is a Window Measurement Verification — about 90 minutes, in-home.',
@@ -384,13 +349,9 @@ export function resolveBookingContext({
     };
   }
 
-  // ─── CASE C: Existing appointment — confirmation only ────────────
   if (policy === 'confirm_existing_appt') {
     return {
-      ...phone,
-      primary:  phone,
-      fallback: null,
-      policy,
+      ...phone, primary: phone, fallback: null, policy,
       guidance: [
         'Lead has an existing appointment. The right calendar here is the Confirmation Call — used to confirm time, address, who will be present, etc.',
         'Do NOT re-book the in-home appointment. Do NOT offer additional appointment slots.',
@@ -400,12 +361,8 @@ export function resolveBookingContext({
     };
   }
 
-  // ─── CASE D (default): In-home first, call as fallback ───────────
   return {
-    ...inHome,
-    primary:  inHome,
-    fallback: phone,
-    policy,
+    ...inHome, primary: inHome, fallback: phone, policy,
     guidance: [
       `Default Reece policy: the in-home ${inHome.calendar_name} is the primary offering — about 90 minutes, both homeowners present.`,
       'If the lead doesn\'t push back, offer two specific in-home slots without asking permission.',
@@ -415,14 +372,9 @@ export function resolveBookingContext({
 }
 
 const BUYING_SIGNAL_INTENTS = new Set([
-  'BOOK',
-  'BOOK_NEXTSTEP',
-  'BOOK_QUOTE_READY',
-  'FAST_TRACK_FRUSTRATED',
+  'BOOK', 'BOOK_NEXTSTEP', 'BOOK_QUOTE_READY', 'FAST_TRACK_FRUSTRATED',
 ]);
-
 const CALLBACK_INTENTS = new Set(['CALLBACK', 'CALLBACK_CALM']);
-
 const APPT_STATUS_INTENTS = new Set(['APPT_STATUS']);
 
 // ═══════════════════════════════════════════════════════════════════
@@ -448,7 +400,7 @@ async function safeFetch(promise, label) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// TABLE-LEVEL LOOKUPS (unchanged from v1.3)
+// TABLE-LEVEL LOOKUPS
 // ═══════════════════════════════════════════════════════════════════
 
 export async function getStoryArc(arcId) {
@@ -632,8 +584,12 @@ function detectObjection(messageText) {
 /**
  * Build the full KB pack for a response generation call.
  *
- * @param {Object} params
- * @returns {Promise<Object>}
+ * v1.7 — Now also detects scheduling continuation signals (day names,
+ * "doesn't work", "anything on", reschedule cues). When detected on
+ * intent classes that don't normally attach booking_context (QUESTION,
+ * UNCLEAR, RECONNECT, NOT_INTERESTED, SEND_INFO), forces booking_context
+ * attachment so the calendar lookup fires. Belt-and-suspenders alongside
+ * classifier-side fixes.
  */
 export async function buildKbPack(params) {
   const {
@@ -653,6 +609,8 @@ export async function buildKbPack(params) {
   const detectedObjection = detectObjection(messageText)
     || (objectionTags.length > 0 ? objectionTags[0] : null);
   const userBookingPreference = detectUserBookingPreference(messageText);
+  // v1.7: scheduling-signal detection for defensive booking_context attachment
+  const schedulingSignal = detectSchedulingSignal(messageText);
 
   const result = {
     intent_class: intentClass,
@@ -670,6 +628,7 @@ export async function buildKbPack(params) {
       objection: detectedObjection,
       active_entry: activeEntryTag,
       user_booking_preference: userBookingPreference,
+      scheduling_signal: schedulingSignal,  // v1.7
       has_existing_appt: hasExistingAppt,
     },
   };
@@ -688,8 +647,6 @@ export async function buildKbPack(params) {
     result.primary_arc = await getStoryArc(result.arc_options[0].arc_id);
   }
 
-  // v1.6: channel still threaded through (consumed by buildBookingUrl
-  // for the resolved-URL fallback); buildTriggerLinkUrl ignores it.
   const bookingCtxArgs = {
     intentClass,
     activeEntryTag,
@@ -707,18 +664,29 @@ export async function buildKbPack(params) {
           result.primary_arc = await getStoryArc(result.objection_script.story_arc);
         }
       }
-      if (detectedObjection === 'timing') {
+      // v1.7: also attach booking_context when scheduling signal present
+      // (e.g. "I want to reschedule, Saturday doesn't work" — timing objection
+      // PLUS scheduling continuation)
+      if (detectedObjection === 'timing' || schedulingSignal) {
         result.booking_context = resolveBookingContext(bookingCtxArgs);
       }
       break;
 
     case 'PRICING':
       result.pricing_anchor = await getPricingAnchor(windowCount);
+      // v1.7: rare but possible — "I want to know the price for the Sunday slot"
+      if (schedulingSignal) {
+        result.booking_context = resolveBookingContext(bookingCtxArgs);
+      }
       break;
 
     case 'QUESTION':
       result.faqs = await searchFaqs(messageText, channel, 3);
-      if (userBookingPreference) {
+      // v1.7: attach booking_context if user preference OR scheduling signal
+      // detected — this catches misclassified continuations like "Saturday
+      // doesn't work, anything Sunday?" that Layer 1 keyword scan routes to
+      // QUESTION when it shouldn't.
+      if (userBookingPreference || schedulingSignal) {
         result.booking_context = resolveBookingContext(bookingCtxArgs);
       }
       break;
@@ -740,7 +708,8 @@ export async function buildKbPack(params) {
     case 'NOT_INTERESTED':
     case 'SEND_INFO':
     case 'UNCLEAR':
-      if (userBookingPreference) {
+      // v1.7: same defensive attachment as QUESTION
+      if (userBookingPreference || schedulingSignal) {
         result.booking_context = resolveBookingContext(bookingCtxArgs);
       }
       break;
@@ -761,7 +730,7 @@ export async function buildKbPack(params) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// PROMPT FORMATTER (v1.6 — explains bare merge tag form)
+// PROMPT FORMATTER
 // ═══════════════════════════════════════════════════════════════════
 
 export function formatKbPackForPrompt(pack) {
@@ -784,7 +753,6 @@ export function formatKbPackForPrompt(pack) {
     lines.push('');
   }
 
-  // ─── BOOKING CONTEXT — v1.6 (bare trigger link merge tag) ───────────
   if (pack.booking_context) {
     const b = pack.booking_context;
     const policy = b.policy || 'in_home_first_call_fallback';
@@ -793,11 +761,15 @@ export function formatKbPackForPrompt(pack) {
     const isApptStatus       = APPT_STATUS_INTENTS.has(pack.intent_class);
     const isTimingObjection  = pack.intent_class === 'OBJECTION'
       && pack.detected_signals?.objection === 'timing';
+    const schedulingSignal   = pack.detected_signals?.scheduling_signal;
 
-    lines.push('BOOKING CONTEXT (v1.6 — bare GHL trigger link merge tag, no UTM suffix):');
+    lines.push('BOOKING CONTEXT (v1.7):');
     lines.push(`  Policy: ${policy}`);
     if (pack.detected_signals?.user_booking_preference) {
       lines.push(`  User explicitly asked for: ${pack.detected_signals.user_booking_preference}`);
+    }
+    if (schedulingSignal) {
+      lines.push(`  Scheduling signal detected in inbound: "${schedulingSignal}" — lead is engaged in a scheduling exchange. Apply BOOKING — ASK-FIRST PROTOCOL with TWO specific time options from CALENDAR AVAILABILITY (not day-only proposals).`);
     }
     if (pack.detected_signals?.has_existing_appt) {
       lines.push(`  Lead has existing appointment in LP.`);
