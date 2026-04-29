@@ -9,6 +9,36 @@
 //
 // AGENTIC: Disposition changes emit system events for the Decision Engine.
 //
+// v9.2 — `lp_leads.ghl_contact_id` is now ID-DERIVED when possible.
+//   The GHL→LP integration writes the GHL contact ID into LP's
+//   `lognumber` field (per LP API docs: "Identifier unique to the
+//   sender of the lead"). When `lead.lognumber` matches the GHL
+//   contact ID shape (20-char base62 alphanumeric), we use it as
+//   the lead row's ghl_contact_id directly. Fallback chain:
+//     1. lead.lognumber  (if shape-valid 20-char alphanumeric)
+//     2. prospect-level matchToGHL result (phone/email match)
+//     3. null
+//   Other LP integrations may put non-GHL values in lognumber
+//   (UUIDs with separators, internal IDs); those won't match the
+//   pattern and we fall through to phone/email match.
+//
+//   Why this matters: Step 0 of the appointment-sync resolution
+//   chain reads lp_leads.ghl_contact_id and re-validates against
+//   lognumber. With v9.2, the cache value is ID-derived → cache
+//   hits are more accurate, and the fast-path is more often
+//   taken on the first try.
+//
+//   BACKFILL NOTE: This change only populates new/updated rows.
+//   To backfill existing lp_leads rows where ghl_contact_id is
+//   null but a shape-valid lognumber exists in LP, run a full
+//   sync (FORCE_FULL_SYNC=true) or a one-shot SQL/script update.
+//
+//   The Pass 1 skip-check and the processProspect recordUnchanged
+//   check are both updated to compare against the lognumber-derived
+//   ghl_contact_id (not the prospect-level phone-match), so cached
+//   rows missing ghl_contact_id will be re-upserted on next sync
+//   when a shape-valid lognumber becomes available.
+//
 // v9.1 — Email enrichment: check email_enrichment_log before emitting
 //   to prevent duplicate enrichment events and duplicate GroupMe alerts.
 //   Idempotency key is now permanent (no date suffix).
@@ -58,8 +88,35 @@ function toActiveEntryTag(entryTag) {
   return entryTag.replace('entry:', 'active-entry:');
 }
 
+// ─── v9.2: GHL contact ID derivation from LP lognumber ───────────
+//
+// GHL contact IDs are 20-char base62 alphanumeric (e.g.,
+// "2WHqbq7n46JncW3oJ2IJ"). The GHL→LP integration writes them to
+// LP's `lognumber` field. When shape-valid, lognumber is the most
+// authoritative GHL contact ID for THIS lead specifically (it
+// identifies the actual sender, not a phone-match guess).
+//
+// Other LP integrations write non-GHL values to lognumber (UUIDs
+// with separators like "53af1c5b_e4f5_4494_b88b_395285391bae",
+// internal IDs, empty strings). The strict 20-char alphanumeric
+// regex filters those out → we fall back to phone/email match.
+const GHL_CONTACT_ID_PATTERN = /^[A-Za-z0-9]{20}$/;
+
+function deriveLeadGhlId(lead, fallbackGhlId) {
+  if (!lead) return fallbackGhlId || null;
+  const ln = getField(lead, 'lognumber', 'LogNumber', 'logNumber');
+  if (ln && GHL_CONTACT_ID_PATTERN.test(String(ln).trim())) {
+    return String(ln).trim();
+  }
+  return fallbackGhlId || null;
+}
+
 // ─── Build the lead row payload (DRY helper) ─────────────────────
+// v9.2: ghl_contact_id is now lognumber-derived when shape-valid,
+// falling back to the prospect-level ghlId (phone/email match).
 function buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId) {
+  const leadGhlId = deriveLeadGhlId(lead, ghlId);
+
   const apptSet = getField(lead, 'apptset', 'ApptSet');
   const sat = getField(lead, 'sat', 'Sat');
   const sold = getField(lead, 'sold', 'Sold');
@@ -71,7 +128,7 @@ function buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId
     row: {
       lp_lead_id:         lpLeadId,
       lp_prospect_id:     lpProspectId,
-      ghl_contact_id:     ghlId,
+      ghl_contact_id:     leadGhlId,
       first_name:         getField(prospect, 'firstname', 'FirstName', 'first_name'),
       last_name:          getField(prospect, 'lastname', 'LastName', 'last_name'),
       email:              getField(prospect, 'email', 'Email'),
@@ -101,11 +158,17 @@ function buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId
     isApptSet,
     isDemoCompleted,
     isClosedWon,
+    leadGhlId,
   };
 }
 
 // ─── Pass 1 Helper — upsertLeadOnly() ────────────────────────────
 // Used during fullSync Pass 1. Does NOT emit events or manage active-entry tags.
+//
+// v9.2: Pass 1 now populates ghl_contact_id from lognumber when
+// shape-valid, even though we don't run matchToGHL in Pass 1. The
+// skip-check is updated so that rows with stale null ghl_contact_id
+// will be re-upserted when a shape-valid lognumber becomes available.
 
 export async function upsertLeadOnly(prospect) {
   const leads = getField(prospect, 'leads', 'Leads') || [];
@@ -124,12 +187,20 @@ export async function upsertLeadOnly(prospect) {
     const newUpdatedAt = lpDateToEastern(getField(lead, 'lastchangedon', 'LastChangedOn'));
     if (newUpdatedAt) {
       const { data: existing } = await supabase.from('lp_leads')
-        .select('updated_at_lp')
+        .select('updated_at_lp, ghl_contact_id')
         .eq('lp_lead_id', lpLeadId).single();
+
       if (existing?.updated_at_lp && existing.updated_at_lp === newUpdatedAt) {
-        _skipStats.leads++;
-        count++;
-        continue;
+        // v9.2: don't skip if we now have a lognumber-derived ghl_contact_id
+        // and the cached row is still missing it. This lets the cache
+        // backfill from lognumber even when nothing else changed.
+        const newLeadGhlId = deriveLeadGhlId(lead, null);
+        const needsGhlIdBackfill = !existing.ghl_contact_id && newLeadGhlId;
+        if (!needsGhlIdBackfill) {
+          _skipStats.leads++;
+          count++;
+          continue;
+        }
       }
     }
 
@@ -212,10 +283,15 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
     const newUpdatedAt = lpDateToEastern(getField(lead, 'lastchangedon', 'LastChangedOn'));
     const dispositionChanged = newDisposition && newDisposition !== previousDisposition;
 
+    // v9.2: compute lead-level GHL ID (lognumber-preferred) for the
+    // recordUnchanged check, so a stale cache row missing ghl_contact_id
+    // gets re-upserted when lognumber is now shape-valid.
+    const newLeadGhlId = deriveLeadGhlId(lead, ghlId);
+
     const recordUnchanged = existing?.updated_at_lp
       && newUpdatedAt
       && existing.updated_at_lp === newUpdatedAt
-      && (existing.ghl_contact_id === ghlId || (!ghlId && existing.ghl_contact_id));
+      && (existing.ghl_contact_id === newLeadGhlId || (!newLeadGhlId && existing.ghl_contact_id));
 
     if (recordUnchanged && !dispositionChanged) {
       _skipStats.leads++;
@@ -416,14 +492,16 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
 }
 
 // Fallback: upsert from flat data (when LP returns non-nested response)
+// v9.2: ghl_contact_id is now lognumber-derived when shape-valid.
 export async function upsertLeadFromFlat(lp, ghlId) {
   const lpLeadId = String(getField(lp, 'lds_id', 'id', 'LeadID', 'cst_id', 'ProspectID'));
   const lpProspectId = String(getField(lp, 'cst_id', 'CstID', 'ProspectID') || '');
+  const flatGhlId = deriveLeadGhlId(lp, ghlId);
 
   await supabase.from('lp_leads').upsert({
     lp_lead_id:         lpLeadId,
     lp_prospect_id:     lpProspectId,
-    ghl_contact_id:     ghlId,
+    ghl_contact_id:     flatGhlId,
     first_name:         getField(lp, 'firstname', 'FirstName', 'first_name'),
     last_name:          getField(lp, 'lastname', 'LastName', 'last_name'),
     email:              getField(lp, 'email', 'Email'),
@@ -442,3 +520,6 @@ export async function upsertLeadFromFlat(lp, ghlId) {
     synced_at:          new Date().toISOString(),
   }, { onConflict: 'lp_lead_id' });
 }
+
+// v9.2: Export for use by other modules (e.g., one-shot backfill scripts)
+export { deriveLeadGhlId, GHL_CONTACT_ID_PATTERN };
