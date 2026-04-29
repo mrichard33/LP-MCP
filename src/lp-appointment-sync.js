@@ -1,30 +1,26 @@
 /**
  * LP Appointment Sync — src/lp-appointment-sync.js
  *
- * v5.1.4: PHONE/EMAIL MATCHING DEMOTED TO LAST RESORT.
+ * v5.1.5: EMAIL MATCHING (Step 4) + AUTO-CLEAR `lp-sync-failed` ON SUCCESS.
  *
- *   Per policy: ID-based resolution paths (Supabase cache, GHL Lead ID
- *   custom field, prospect ID + lognumber) are tried first. Phone
- *   matching only runs as a final fallback when no LP identifier is
- *   available on the GHL contact. Phone alone is not authoritative —
- *   multiple LP prospects can share a phone (spouses, household members,
- *   stale duplicate records). When phone path runs, we still require
- *   the matched prospect's lead to have lognumber === GHL contact ID
- *   before accepting.
+ *   Email matching joins phone in the last-resort tier — both run only
+ *   after ID-based paths (Supabase, GHL Lead ID field, prospect ID)
+ *   have produced no match. Email path uses LP's getCustomers3({email})
+ *   then validates each prospect's leads against lognumber.
  *
- *   Note on Step 0: the Supabase fast-path reads lp_leads.ghl_contact_id,
- *   which is itself populated by phone/email matching during nightly
- *   sync. We keep it at the top of the chain because the lookup is
- *   cheap (one DB query) and we re-validate via getLeadByLdsId AND
- *   require lognumber match before accepting — making it safe regardless
- *   of how the cache value was originally derived.
+ *   Tag cleanup: when a successful resolution returns (whether actually
+ *   running SetAppointment or short-circuiting via already-set duplicate
+ *   check), we now strip `lp-sync-failed` from the GHL contact. That
+ *   tag was applied by an earlier failed attempt and shouldn't persist
+ *   after the issue is resolved. Best-effort, non-blocking.
  *
+ * v5.1.4: Phone matching demoted to last resort.
  * v5.1.3: Read GHL contact ID from LP's `lognumber` field.
  * v5.1.2: Probe surfaces lognumber, userfields, and notes content.
  * v5.1.1: Adds /webhook/ghl/lp-probe diagnostic endpoint.
  * v5.1: HLCID-first chain + manual-action fallback tag.
  *
- * v5.1.4 chain (each candidate validated against the live LP record
+ * v5.1.5 chain (each candidate validated against the live LP record
  *   AND must have lognumber === inbound GHL contact ID before accept):
  *
  *   0. SUPABASE FAST-PATH — lp_leads.ghl_contact_id (cache hint,
@@ -32,24 +28,23 @@
  *
  *   1. GHL LEAD ID FIELD — `GmAVmW6V9sekD7pVONKr` on the GHL contact.
  *      Most authoritative when populated: identifies the exact lead.
- *      One GHL GET + one LP getLeadByLdsId. Skipped if the field is
- *      empty or matches the in1_id (inbound queue ID, not a real lds_id).
  *
  *   2. PROSPECT ID + LOGNUMBER — GHL custom field LP_PROSPECT_ID_FIELD.
  *      One LP getLeads(cst_id) call → scan returned leads, accept the
- *      one whose lognumber matches the GHL contact ID. Authoritative
- *      because the prospect ID came from GHL itself.
+ *      one whose lognumber matches the GHL contact ID.
  *
  *   3. PHONE + LOGNUMBER (LAST RESORT) — getCustomers3({phone}) →
  *      for each prospect returned, getLeads(cst_id) + lognumber filter.
- *      Only runs when steps 0–2 produced nothing. Multiple LP API
- *      calls. Used only when the GHL contact has no LP identifier
- *      yet (rare — usually present after first inbound webhook fires).
  *
- *   4. FAILURE — apply `lp-sync-failed` tag, GroupMe + GHL note.
+ *   4. EMAIL + LOGNUMBER (LAST RESORT) — getCustomers3({email}) →
+ *      same shape as Step 3 but using email. Runs after phone because
+ *      phone usually narrows the prospect set more tightly. Only runs
+ *      when steps 0–3 produced nothing.
+ *
+ *   5. FAILURE — apply `lp-sync-failed` tag, GroupMe + GHL note.
  *
  * Endpoints:
- *   POST /webhook/ghl/set-lp-appointment — main sync entry (v5.1.4)
+ *   POST /webhook/ghl/set-lp-appointment — main sync entry (v5.1.5)
  *   POST /webhook/ghl/lp-probe          — diagnostic (v5.1.2)
  */
 
@@ -65,6 +60,7 @@ import {
   updateGHLContactFields,
   addGHLNote,
   applyGHLTag,
+  removeGHLTags,
 } from './ghl.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken } from './ghl-rate-limiter.js';
@@ -149,16 +145,6 @@ const BOOKABLE_DISPOSITIONS = new Set([
   'Data', 'Issue', 'Set', 'NIS', 'NIS2', 'NI', 'BO', '1Leg', 'NoHome',
 ]);
 
-/**
- * Extract the GHL contact ID stored on an LP lead record.
- *
- * The GHL→LP integration writes it to LP's `lognumber` field (per LP
- * API docs: "Identifier unique to the sender of the lead"). Other
- * tenants may put non-GHL values in lognumber (UUIDs, internal IDs,
- * empty strings); those won't equal the target GHL contact ID and the
- * chain falls through correctly. HLCID-named variants are kept as a
- * forward-compat fallback in case LP ever adds a dedicated field.
- */
 function extractHLCID(leadRecord) {
   if (!leadRecord) return null;
   const v = leadRecord.lognumber
@@ -208,6 +194,10 @@ function normalizePhone(p) {
   return String(p || '').replace(/\D/g, '').slice(-10);
 }
 
+function cleanEmail(e) {
+  return String(e || '').trim().toLowerCase();
+}
+
 async function resolveProspectToHLCIDLead(prospect, ghlContactId) {
   const prospectId = prospect.ProspectID || prospect.prospectid || prospect.CstID || prospect.cst_id;
   if (!prospectId) return null;
@@ -229,21 +219,19 @@ async function resolveProspectToHLCIDLead(prospect, ghlContactId) {
 }
 
 /**
- * v5.1.4 chain — see file header for full priority rationale.
+ * v5.1.5 chain — see file header for full priority rationale.
  *
  *   Step 0 (Supabase cache, lognumber-validated)
- *      ↓ no hit
  *   Step 1 (GHL Lead ID field, lognumber-validated)
- *      ↓ field empty / matches in1_id / lognumber mismatch
  *   Step 2 (Prospect ID + lognumber)
- *      ↓ no GHL prospect ID, or no matching lead under that prospect
  *   Step 3 (Phone + lognumber — LAST RESORT)
- *      ↓ no phone, or no matching lead across all phone-matched prospects
+ *   Step 4 (Email + lognumber — LAST RESORT)
  *   FAILURE
  */
 async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
   const webhookProspectId = cleanGHLValue(contactInfo.prospectId);
   const phone = normalizePhone(contactInfo.phone || '');
+  const email = cleanEmail(contactInfo.email || '');
 
   // ── Step 0: Supabase fast-path (cache hint, lognumber-validated) ──
   try {
@@ -284,9 +272,6 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
   }
 
   // ── Step 1: GHL Lead ID field + lognumber ─────────────────────
-  // Most authoritative path when populated: GHL contact carries the
-  // exact lds_id from a previous successful sync. We validate it
-  // by fetching live and confirming lognumber matches.
   try {
     const ghlRes = await ghlFetch('GET', `/contacts/${ghlContactId}`);
     const customFields = ghlRes?.contact?.customFields || [];
@@ -325,8 +310,6 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
   }
 
   // ── Step 2: Prospect ID + lognumber ───────────────────────────
-  // Authoritative because the prospect ID came from GHL itself (set
-  // when the lead was originally pushed to LP). One LP API call.
   if (webhookProspectId && /^\d+$/.test(webhookProspectId)) {
     try {
       const leadsResult = await getLeads({ cst_id: webhookProspectId, PageSize: 50 });
@@ -355,9 +338,6 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
   }
 
   // ── Step 3: Phone + lognumber (LAST RESORT) ───────────────────
-  // Only runs when no LP identifier was available on the GHL contact.
-  // Multiple LP prospects can share a phone; we still require lognumber
-  // match before accepting any phone-matched candidate.
   if (phone) {
     let prospectList = [];
     try {
@@ -380,10 +360,40 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
       console.warn(`[LP-RESOLVE] Step 3: no phone-matched prospect has a lead with matching lognumber`);
     }
   } else {
-    console.warn(`[LP-RESOLVE] Step 3: no phone available — skipping last-resort path`);
+    console.warn(`[LP-RESOLVE] Step 3: no phone available — skipping last-resort phone path`);
   }
 
-  console.warn(`[LP-RESOLVE] ❌ No lognumber-validated lds_id for ${ghlContactId} after 4-step chain`);
+  // ── Step 4: Email + lognumber (LAST RESORT) ───────────────────
+  // Final fallback. getCustomers3({email}) returns prospects sharing
+  // the email; for each, we fetch their leads and require lognumber
+  // match before accepting. Multiple LP prospects can share an email
+  // (especially shared household / family / staff inboxes).
+  if (email) {
+    let prospectList = [];
+    try {
+      const prospects = await getCustomers3({ email });
+      prospectList = Array.isArray(prospects) ? prospects : (prospects ? [prospects] : []);
+      prospectList = prospectList.filter(Boolean);
+      console.log(`[LP-RESOLVE] Step 4 (last resort): GetCustomers3 by email returned ${prospectList.length} prospect(s)`);
+    } catch (err) {
+      console.warn(`[LP-RESOLVE] Step 4 GetCustomers3 by email failed: ${err.message}`);
+    }
+
+    for (const p of prospectList) {
+      const best = await resolveProspectToHLCIDLead(p, ghlContactId);
+      if (best) {
+        console.log(`[LP-RESOLVE] ✅ Step 4 email+lognumber (last resort): lds_id=${best.ldsId}, prospect=${best.prospectId}, disp=${best.disp}`);
+        return { ldsId: best.ldsId, prospectId: best.prospectId, source: 'email_plus_hlcid_lastresort', step: 4 };
+      }
+    }
+    if (prospectList.length) {
+      console.warn(`[LP-RESOLVE] Step 4: no email-matched prospect has a lead with matching lognumber`);
+    }
+  } else {
+    console.warn(`[LP-RESOLVE] Step 4: no email available — skipping last-resort email path`);
+  }
+
+  console.warn(`[LP-RESOLVE] ❌ No lognumber-validated lds_id for ${ghlContactId} after 5-step chain`);
   return null;
 }
 
@@ -502,9 +512,10 @@ async function sendSyncFailureNotification({
 🆔 LP IDs tried: ${idsLine}
 🔗 GHL: ${ghlLink}
 
-CHAIN RESULT — all 4 lognumber-validated steps failed:
+CHAIN RESULT — all 5 lognumber-validated steps failed:
   0 supabase+lognumber       • 1 GHL field+lognumber
   2 prospect+lognumber       • 3 phone+lognumber (last resort)
+  4 email+lognumber (last resort)
 
 Tag '${LP_SYNC_FAILED_TAG}' applied${tagApplied ? '' : ' (FAILED — see logs)'} →
 manual-action workflow will fire team notifications.
@@ -515,21 +526,38 @@ ACTION:
   3. Confirm lognumber on the LP lead matches GHL contact ${contactId}
   4. Once lds_id exists with correct lognumber → SetAppointment to ${apptLine}
   5. Optional: paste lds_id into GHL field LP Lead ID for future syncs
-  6. Remove tag '${LP_SYNC_FAILED_TAG}' from contact when resolved`;
+  6. Remove tag '${LP_SYNC_FAILED_TAG}' from contact when resolved
+     (or just re-fire this webhook — successful resolution auto-clears it)`;
 
   await sendGroupMeMessage(card).catch((err) => {
     console.warn(`[LP-APPT] GroupMe notification failed: ${err.message}`);
   });
 
   await addGHLNote(contactId,
-    `[LP SYNC v5.1.4] Appointment NOT synced — full lognumber-validated chain failed.\n` +
-    `Tried (in priority order): supabase+lognumber, GHL field+lognumber, prospect+lognumber, phone+lognumber (last resort).\n` +
+    `[LP SYNC v5.1.5] Appointment NOT synced — full lognumber-validated chain failed.\n` +
+    `Tried (in priority order): supabase+lognumber, GHL field+lognumber, prospect+lognumber, phone+lognumber (last resort), email+lognumber (last resort).\n` +
     `LP IDs: ${idsLine}\n` +
     `Appt: ${apptLine}\n` +
     `Tag '${LP_SYNC_FAILED_TAG}' ${tagApplied ? 'applied' : 'FAILED to apply'} — ` +
     `manual-action workflow handles team notification.\n` +
-    `MANUAL ACTION: create/find lead in LP with lognumber=${contactId}, run SetAppointment, remove tag.`
+    `MANUAL ACTION: create/find lead in LP with lognumber=${contactId}, run SetAppointment, remove tag (or re-fire webhook).`
   ).catch(() => {});
+}
+
+/**
+ * Best-effort cleanup: remove `lp-sync-failed` tag from a GHL contact
+ * after a successful resolution. The tag was applied by an earlier
+ * failed attempt; with the issue now resolved, it should not persist.
+ * Non-blocking — failures are logged but never thrown.
+ */
+async function clearSyncFailedTag(contactId) {
+  if (!contactId) return;
+  try {
+    await removeGHLTags(contactId, [LP_SYNC_FAILED_TAG]);
+    console.log(`[LP-APPT] Cleared ${LP_SYNC_FAILED_TAG} tag from ${contactId} (success path)`);
+  } catch (err) {
+    console.warn(`[LP-APPT] ${LP_SYNC_FAILED_TAG} cleanup failed for ${contactId}: ${err.message}`);
+  }
 }
 
 // ─── Main sync ──────────────────────────────────────────────────
@@ -562,7 +590,7 @@ async function syncAppointmentToLP({
       action: 'skipped_no_valid_lead_id',
       contact_id: contactId,
       contact_name: contactName,
-      attempted_steps: ['supabase+lognumber', 'ghl_field+lognumber', 'prospect+lognumber', 'phone+lognumber_lastresort'],
+      attempted_steps: ['supabase+lognumber', 'ghl_field+lognumber', 'prospect+lognumber', 'phone+lognumber_lastresort', 'email+lognumber_lastresort'],
       manual_action_tag_applied: LP_SYNC_FAILED_TAG,
     };
   }
@@ -577,6 +605,9 @@ async function syncAppointmentToLP({
   } catch (err) {
     console.warn(`[LP-APPT] GHL writeback failed (non-blocking): ${err.message}`);
   }
+
+  // Resolution succeeded — clear any stale failure tag from prior attempts
+  await clearSyncFailedTag(contactId);
 
   const apptDate = parseApptDate(appointmentDate);
   const apptTime = parseApptTime(appointmentTime);
@@ -607,11 +638,11 @@ async function syncAppointmentToLP({
   const result = await lpSetAppointment({ ldsId, setBy: '5686', apptDate, apptTime });
 
   await addGHLNote(contactId,
-    `[LP SYNC v5.1.4] Appointment set\nLP Lead: ${ldsId} (via ${source}, step ${step})\nProspect: ${prospectId || 'N/A'}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName || 'N/A'}`
+    `[LP SYNC v5.1.5] Appointment set\nLP Lead: ${ldsId} (via ${source}, step ${step})\nProspect: ${prospectId || 'N/A'}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName || 'N/A'}`
   ).catch(() => {});
 
   await sendGroupMeMessage(
-    `📅 LP Appointment Set (v5.1.4 ID-first)\n` +
+    `📅 LP Appointment Set (v5.1.5 ID-first)\n` +
     `👤 ${contactName || contactId}\n` +
     `📋 LP Lead: ${ldsId} (${source}, step ${step}) | Prospect: ${prospectId || 'N/A'}\n` +
     `📅 ${apptDate} ${apptTime} | ${calendarName || 'N/A'}`
@@ -832,7 +863,7 @@ export function registerLPAppointmentSyncRoutes(app) {
       let city         = cleanGHLValue(body.city) || '';
       let state        = cleanGHLValue(body.state) || '';
 
-      const needsEnrich = !appointmentDate || !appointmentTime || !prospectId || !contactPhone || !address1;
+      const needsEnrich = !appointmentDate || !appointmentTime || !prospectId || !contactPhone || !address1 || !contactEmail;
       if (needsEnrich) {
         console.log(`[LP-APPT] Self-enriching from GHL API for ${contactId}`);
         const enriched = await enrichFromGHLContact(contactId);
@@ -903,7 +934,7 @@ export function registerLPAppointmentSyncRoutes(app) {
     }
   });
 
-  console.log('[LP-APPT] Registered: POST /webhook/ghl/set-lp-appointment (v5.1.4 ID-first, phone last resort)');
+  console.log('[LP-APPT] Registered: POST /webhook/ghl/set-lp-appointment (v5.1.5 ID-first, phone+email last resort, auto tag cleanup)');
   console.log('[LP-PROBE] Registered: POST /webhook/ghl/lp-probe (v5.1.2 diagnostic w/ userfields+lognumber)');
 }
 
