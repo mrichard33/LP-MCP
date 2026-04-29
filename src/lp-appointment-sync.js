@@ -1,8 +1,22 @@
 /**
  * LP Appointment Sync — src/lp-appointment-sync.js
  *
- * v5.1.2: Probe surfaces lognumber, userfields, and notes content.
+ * v5.1.3: Read GHL contact ID from LP's `lognumber` field.
  *
+ *   The probe revealed the GHL→LP integration writes the GHL contact ID
+ *   into LP's `lognumber` field (per LP API docs: "Identifier unique to
+ *   the sender of the lead, helpful in matching results back to the
+ *   sender"). LP does NOT have an HLCID-named field on the lead record,
+ *   despite the conceptual label. v5.1.0–v5.1.2 looked under HLCID/hlcid/
+ *   etc. and matched nothing — every booking failed Step 1.
+ *
+ *   Other LP integrations may put non-GHL identifiers in lognumber
+ *   (UUIDs, internal IDs, empty). Those simply won't match the target
+ *   GHL contact ID and the chain falls through correctly. We also keep
+ *   checking the HLCID-named variants in case LP ever adds a dedicated
+ *   field — first match wins.
+ *
+ * v5.1.2: Probe surfaces lognumber, userfields, and notes content.
  * v5.1.1: Adds /webhook/ghl/lp-probe diagnostic endpoint.
  *
  * v5.1: HLCID-FIRST RESOLUTION CHAIN + MANUAL-ACTION FALLBACK TAG.
@@ -13,7 +27,7 @@
  *   4. FAILURE — apply `lp-sync-failed` tag, GroupMe + GHL note.
  *
  * Endpoints:
- *   POST /webhook/ghl/set-lp-appointment — main sync entry (v5.1)
+ *   POST /webhook/ghl/set-lp-appointment — main sync entry (v5.1.3)
  *   POST /webhook/ghl/lp-probe          — diagnostic (v5.1.2)
  */
 
@@ -113,9 +127,25 @@ const BOOKABLE_DISPOSITIONS = new Set([
   'Data', 'Issue', 'Set', 'NIS', 'NIS2', 'NI', 'BO', '1Leg', 'NoHome',
 ]);
 
+/**
+ * Extract the GHL contact ID stored on an LP lead record.
+ *
+ * The GHL→LP integration writes it to LP's `lognumber` field, NOT
+ * any HLCID-named field. We check `lognumber` variants first, then
+ * fall back to HLCID-named fields in case LP ever adds a dedicated
+ * field. First non-empty value wins.
+ *
+ * Note: not every `lognumber` value is a GHL contact ID. Other LP
+ * integrations populate it with UUIDs, internal IDs, or leave it empty.
+ * findLeadByHLCID compares the returned value against the target GHL
+ * contact ID, so non-matching values are correctly skipped.
+ */
 function extractHLCID(leadRecord) {
   if (!leadRecord) return null;
-  const v = leadRecord.HLCID
+  const v = leadRecord.lognumber
+        ?? leadRecord.LogNumber
+        ?? leadRecord.logNumber
+        ?? leadRecord.HLCID
         ?? leadRecord.hlcid
         ?? leadRecord.HlcId
         ?? leadRecord.Hlcid
@@ -134,7 +164,7 @@ function findLeadByHLCID(leadRecords, ghlContactId, prospectIdFallback = null) {
     const hlcid = extractHLCID(lead);
     if (!hlcid) continue;
     if (hlcid !== targetId) continue;
-    const ldsId = lead.LeadID || lead.leadid || lead.lds_id;
+    const ldsId = lead.LeadID || lead.leadid || lead.lds_id || lead.id;
     if (!ldsId) continue;
     const disp = lead.Disposition || lead.disposition || lead.disp_code || '';
     const pid = lead.ProspectID || lead.prospectid || lead.CstID || lead.cst_id || prospectIdFallback;
@@ -164,8 +194,16 @@ async function resolveProspectToHLCIDLead(prospect, ghlContactId) {
   if (!prospectId) return null;
   try {
     const leadsResult = await getLeads({ cst_id: prospectId, PageSize: 50 });
-    const leadRecords = Array.isArray(leadsResult) ? leadsResult : [leadsResult];
-    return findLeadByHLCID(leadRecords, ghlContactId, prospectId);
+    // getLeads returns prospect records each containing inner leads — flatten.
+    const records = Array.isArray(leadsResult) ? leadsResult : [leadsResult];
+    const allLeads = [];
+    for (const p of records) {
+      if (!p) continue;
+      const ls = p.leads || p.Leads || [];
+      if (ls.length === 0) allLeads.push(p);
+      else allLeads.push(...ls);
+    }
+    return findLeadByHLCID(allLeads, ghlContactId, prospectId);
   } catch (err) {
     console.warn(`[LP-RESOLVE] GetLeads for prospect ${prospectId} failed: ${err.message}`);
     return null;
@@ -194,7 +232,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
             if (!prospect) continue;
             const innerLeads = prospect.leads || prospect.Leads || [];
             const target = innerLeads.find(l =>
-              String(l.LeadID || l.leadid || l.lds_id) === String(candidate.lp_lead_id)
+              String(l.LeadID || l.leadid || l.lds_id || l.id) === String(candidate.lp_lead_id)
             );
             if (!target) continue;
             const hlcid = extractHLCID(target);
@@ -285,7 +323,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
           if (!prospect) continue;
           const innerLeads = prospect.leads || prospect.Leads || [];
           const target = innerLeads.find(l =>
-            String(l.LeadID || l.leadid || l.lds_id) === ghlLeadId
+            String(l.LeadID || l.leadid || l.lds_id || l.id) === ghlLeadId
           );
           if (!target) continue;
           const hlcid = extractHLCID(target);
@@ -431,8 +469,8 @@ manual-action workflow will fire team notifications.
 ACTION:
   1. Open lead in LP (search by phone ${phoneDisplay || '???'} or address)
   2. If lead does not exist in LP yet → create it from GHL data above
-  3. Confirm HLCID on the LP lead matches GHL contact ${contactId}
-  4. Once lds_id exists with correct HLCID → SetAppointment to ${apptLine}
+  3. Confirm lognumber on the LP lead matches GHL contact ${contactId}
+  4. Once lds_id exists with correct lognumber → SetAppointment to ${apptLine}
   5. Optional: paste lds_id into GHL field LP Lead ID for future syncs
   6. Remove tag '${LP_SYNC_FAILED_TAG}' from contact when resolved`;
 
@@ -441,13 +479,13 @@ ACTION:
   });
 
   await addGHLNote(contactId,
-    `[LP SYNC v5.1] Appointment NOT synced — full HLCID-validated chain failed.\n` +
+    `[LP SYNC v5.1.3] Appointment NOT synced — full HLCID-validated chain failed.\n` +
     `Tried: supabase+HLCID, prospect+HLCID, phone+HLCID, GHL field+HLCID.\n` +
     `LP IDs: ${idsLine}\n` +
     `Appt: ${apptLine}\n` +
     `Tag '${LP_SYNC_FAILED_TAG}' ${tagApplied ? 'applied' : 'FAILED to apply'} — ` +
     `manual-action workflow handles team notification.\n` +
-    `MANUAL ACTION: create/find lead in LP with HLCID=${contactId}, run SetAppointment, remove tag.`
+    `MANUAL ACTION: create/find lead in LP with lognumber=${contactId}, run SetAppointment, remove tag.`
   ).catch(() => {});
 }
 
@@ -526,11 +564,11 @@ async function syncAppointmentToLP({
   const result = await lpSetAppointment({ ldsId, setBy: '5686', apptDate, apptTime });
 
   await addGHLNote(contactId,
-    `[LP SYNC v5.1] Appointment set\nLP Lead: ${ldsId} (via ${source}, step ${step})\nProspect: ${prospectId || 'N/A'}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName || 'N/A'}`
+    `[LP SYNC v5.1.3] Appointment set\nLP Lead: ${ldsId} (via ${source}, step ${step})\nProspect: ${prospectId || 'N/A'}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName || 'N/A'}`
   ).catch(() => {});
 
   await sendGroupMeMessage(
-    `📅 LP Appointment Set (v5.1 HLCID)\n` +
+    `📅 LP Appointment Set (v5.1.3 lognumber)\n` +
     `👤 ${contactName || contactId}\n` +
     `📋 LP Lead: ${ldsId} (${source}, step ${step}) | Prospect: ${prospectId || 'N/A'}\n` +
     `📅 ${apptDate} ${apptTime} | ${calendarName || 'N/A'}`
@@ -549,10 +587,6 @@ async function syncAppointmentToLP({
 
 // ─── Diagnostic probe (v5.1.2 — surfaces lognumber + userfields) ──
 
-/**
- * Build a compact diagnostic snapshot of an LP lead-shaped object.
- * v5.1.2: includes lognumber, full userfields content, and notes preview.
- */
 function leadSnapshot(lead) {
   if (!lead || typeof lead !== 'object') return null;
   const keys = Object.keys(lead);
@@ -567,8 +601,6 @@ function leadSnapshot(lead) {
     if (k in lead) sample[k] = lead[k];
   }
 
-  // Userfields can arrive as: array of {name,value}, flat object, or
-  // string-keyed object with userN keys. Normalize to {name: value}.
   let userfieldsNormalized = null;
   const ufRaw = lead.userfields ?? lead.UserFields ?? lead.user_fields;
   if (Array.isArray(ufRaw)) {
@@ -583,7 +615,6 @@ function leadSnapshot(lead) {
     userfieldsNormalized = ufRaw;
   }
 
-  // Notes: surface count + first few previews if present
   let notesPreview = null;
   const nRaw = lead.notes ?? lead.Notes;
   if (Array.isArray(nRaw) && nRaw.length) {
@@ -608,10 +639,6 @@ function leadSnapshot(lead) {
   };
 }
 
-/**
- * Snapshot the prospect-level record (different shape than lead).
- * Returns lognumber-equivalent fields + userfields + notes content.
- */
 function prospectSnapshot(prospect) {
   if (!prospect || typeof prospect !== 'object') return null;
   const keys = Object.keys(prospect);
@@ -650,7 +677,6 @@ async function probeLPForContact({ contactId, prospectId, phone }) {
     step2_phone_lookup: null,
   };
 
-  // Step 1 probe
   if (prospectId && /^\d+$/.test(String(prospectId))) {
     const start = Date.now();
     try {
@@ -683,7 +709,6 @@ async function probeLPForContact({ contactId, prospectId, phone }) {
     }
   }
 
-  // Step 2 probe
   if (phone) {
     const start = Date.now();
     try {
@@ -835,7 +860,7 @@ export function registerLPAppointmentSyncRoutes(app) {
     }
   });
 
-  console.log('[LP-APPT] Registered: POST /webhook/ghl/set-lp-appointment (v5.1 HLCID-first)');
+  console.log('[LP-APPT] Registered: POST /webhook/ghl/set-lp-appointment (v5.1.3 lognumber-aware)');
   console.log('[LP-PROBE] Registered: POST /webhook/ghl/lp-probe (v5.1.2 diagnostic w/ userfields+lognumber)');
 }
 
