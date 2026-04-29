@@ -1,33 +1,20 @@
 /**
  * LP Appointment Sync — src/lp-appointment-sync.js
  *
+ * v5.1.2: Probe surfaces lognumber, userfields, and notes content.
+ *
  * v5.1.1: Adds /webhook/ghl/lp-probe diagnostic endpoint.
  *
  * v5.1: HLCID-FIRST RESOLUTION CHAIN + MANUAL-ACTION FALLBACK TAG.
- *
- * Why v5.1 exists:
- *   v5.0's `findBookableLead` picked the first lead under a prospect
- *   that had a bookable disposition. This silently picked the WRONG
- *   lead when prospects have multiple leads (e.g. an older Sale lead
- *   plus a newer Data lead, or repeat re-engagements). The correct
- *   match is via HLCID — the GHL contact ID stored on each LP lead by
- *   the LP→GHL integration. v5.1 makes HLCID the authoritative match
- *   in every resolution path.
- *
- * v5.1 chain (each candidate validated via LP API getLeadByLdsId
- *   AND HLCID match before acceptance):
- *
  *   0. SUPABASE FAST-PATH — lp_leads.ghl_contact_id (cache).
  *   1. PROSPECT + HLCID — getLeads(cst_id=prospectId, PageSize=50)
- *   2. PHONE → HLCID — getCustomers3({phone}) → for each prospect,
- *      getLeads(cst_id), filter by HLCID match.
- *   3. GHL FIELD + HLCID — `GmAVmW6V9sekD7pVONKr` (LP Lead ID custom
- *      field), validated AND HLCID match required.
- *   4. FAILURE — apply `lp-sync-failed` tag, send GroupMe + GHL note.
+ *   2. PHONE → HLCID — getCustomers3({phone}) → leads per prospect.
+ *   3. GHL FIELD + HLCID — `GmAVmW6V9sekD7pVONKr` validated.
+ *   4. FAILURE — apply `lp-sync-failed` tag, GroupMe + GHL note.
  *
  * Endpoints:
  *   POST /webhook/ghl/set-lp-appointment — main sync entry (v5.1)
- *   POST /webhook/ghl/lp-probe          — diagnostic (v5.1.1)
+ *   POST /webhook/ghl/lp-probe          — diagnostic (v5.1.2)
  */
 
 import supabase from './supabase.js';
@@ -55,14 +42,8 @@ const LP_LEAD_ID_FIELD      = 'GmAVmW6V9sekD7pVONKr';
 const LP_INBOUND_ID_FIELD   = '3YMxheIlPyhACB8zyc3W';
 const LP_PROSPECT_ID_FIELD  = 'ZRQAVrzhtzApzLlHmT87';
 
-// Tag applied to a GHL contact when the LP sync chain exhausts all
-// resolution paths. A separate GHL workflow listens for this tag and
-// fires the team notification (email/SMS/task).
 const LP_SYNC_FAILED_TAG = 'lp-sync-failed';
 
-/**
- * Clean a value from GHL webhook body.
- */
 function cleanGHLValue(val) {
   if (val === 'null' || val === 'undefined' || val === '' || val == null) return null;
   return String(val).trim();
@@ -73,7 +54,6 @@ function getCustomField(customFields, fieldId) {
   return field?.value != null ? String(field.value).trim() : null;
 }
 
-// ─── GHL API helper ──────────────────────────────────────────────
 async function ghlFetch(method, path, body = null) {
   if (!GHL_API_KEY) throw new Error('GHL_API_KEY not configured');
   await acquireToken();
@@ -97,10 +77,6 @@ async function ghlFetch(method, path, body = null) {
   const ct = res.headers.get('content-type') || '';
   return ct.includes('application/json') ? res.json() : { status: res.status, ok: true };
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// SELF-ENRICHMENT FROM GHL CONTACT
-// ═══════════════════════════════════════════════════════════════════
 
 async function enrichFromGHLContact(contactId) {
   try {
@@ -132,10 +108,6 @@ async function enrichFromGHLContact(contactId) {
     };
   }
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// LP LEAD ID RESOLUTION CHAIN (v5.1 — HLCID-first)
-// ═══════════════════════════════════════════════════════════════════
 
 const BOOKABLE_DISPOSITIONS = new Set([
   'Data', 'Issue', 'Set', 'NIS', 'NIS2', 'NI', 'BO', '1Leg', 'NoHome',
@@ -204,7 +176,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
   const webhookProspectId = cleanGHLValue(contactInfo.prospectId);
   const phone = normalizePhone(contactInfo.phone || '');
 
-  // ── Step 0: Supabase fast-path (cache hint, HLCID-validated) ──
+  // Step 0: Supabase fast-path
   try {
     const { data: leads } = await supabase.from('lp_leads')
       .select('lp_lead_id, lp_prospect_id, disposition_code, synced_at')
@@ -242,7 +214,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
     console.warn(`[LP-RESOLVE] Step 0 Supabase lookup failed: ${err.message}`);
   }
 
-  // ── Step 1: Prospect + HLCID ──────────────────────────────────
+  // Step 1: Prospect + HLCID
   if (webhookProspectId && /^\d+$/.test(webhookProspectId)) {
     try {
       const leadsResult = await getLeads({ cst_id: webhookProspectId, PageSize: 50 });
@@ -268,7 +240,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
     }
   }
 
-  // ── Step 2: Phone → HLCID ─────────────────────────────────────
+  // Step 2: Phone → HLCID
   if (phone) {
     let prospectList = [];
     try {
@@ -294,7 +266,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
     console.warn(`[LP-RESOLVE] No phone available — skipping Step 2`);
   }
 
-  // ── Step 3: GHL field + HLCID ─────────────────────────────────
+  // Step 3: GHL field + HLCID
   try {
     const ghlRes = await ghlFetch('GET', `/contacts/${ghlContactId}`);
     const customFields = ghlRes?.contact?.customFields || [];
@@ -334,9 +306,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
   return null;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// DATE/TIME PARSING
-// ═══════════════════════════════════════════════════════════════════
+// ─── Date/time parsing ──────────────────────────────────────────
 
 const MONTH_MAP = {
   january: '01', february: '02', march: '03', april: '04',
@@ -395,9 +365,7 @@ function parseApptTime(raw) {
   return t;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// FAILURE NOTIFICATION
-// ═══════════════════════════════════════════════════════════════════
+// ─── Failure notification ──────────────────────────────────────
 
 function formatPhoneDisplay(p) {
   const d = normalizePhone(p);
@@ -483,9 +451,7 @@ ACTION:
   ).catch(() => {});
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// MAIN SYNC FUNCTION
-// ═══════════════════════════════════════════════════════════════════
+// ─── Main sync ──────────────────────────────────────────────────
 
 async function syncAppointmentToLP({
   contactId, contactPhone, contactEmail, contactName,
@@ -581,30 +547,53 @@ async function syncAppointmentToLP({
   };
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// DIAGNOSTIC PROBE (v5.1.1)
-// ═══════════════════════════════════════════════════════════════════
+// ─── Diagnostic probe (v5.1.2 — surfaces lognumber + userfields) ──
 
 /**
  * Build a compact diagnostic snapshot of an LP lead-shaped object.
- * We don't dump the full record (could be huge + leak PII) — we only
- * return field NAMES and a few signal values to identify HLCID location.
+ * v5.1.2: includes lognumber, full userfields content, and notes preview.
  */
 function leadSnapshot(lead) {
   if (!lead || typeof lead !== 'object') return null;
   const keys = Object.keys(lead);
 
-  // Find any field name containing "hlc" / "ghl" / "contact" — surface these
-  // even if extractHLCID couldn't find one under known names.
   const hlcidLikeKeys = keys.filter(k => /hlc|ghl|contact|external/i.test(k));
   const userFieldKeys = keys.filter(k => /^user\d+$/i.test(k));
 
   const sample = {};
   for (const k of hlcidLikeKeys) sample[k] = lead[k];
   for (const k of userFieldKeys) sample[k] = lead[k];
-  // also include common identifiers
-  for (const k of ['LeadID', 'leadid', 'lds_id', 'ProspectID', 'prospectid', 'CstID', 'cst_id', 'Disposition', 'disposition']) {
+  for (const k of ['LeadID', 'leadid', 'lds_id', 'id', 'ProspectID', 'prospectid', 'CstID', 'cst_id', 'Disposition', 'disposition', 'lognumber', 'in1_id', 'sender']) {
     if (k in lead) sample[k] = lead[k];
+  }
+
+  // Userfields can arrive as: array of {name,value}, flat object, or
+  // string-keyed object with userN keys. Normalize to {name: value}.
+  let userfieldsNormalized = null;
+  const ufRaw = lead.userfields ?? lead.UserFields ?? lead.user_fields;
+  if (Array.isArray(ufRaw)) {
+    userfieldsNormalized = {};
+    for (const uf of ufRaw) {
+      if (!uf) continue;
+      const name = uf.name || uf.Name || uf.field || uf.Field || uf.key || uf.Key;
+      const val  = uf.value ?? uf.Value ?? uf.val ?? uf.Val;
+      if (name) userfieldsNormalized[String(name)] = val;
+    }
+  } else if (ufRaw && typeof ufRaw === 'object') {
+    userfieldsNormalized = ufRaw;
+  }
+
+  // Notes: surface count + first few previews if present
+  let notesPreview = null;
+  const nRaw = lead.notes ?? lead.Notes;
+  if (Array.isArray(nRaw) && nRaw.length) {
+    notesPreview = {
+      count: nRaw.length,
+      sample: nRaw.slice(0, 2).map(n => ({
+        keys: Object.keys(n || {}).slice(0, 10),
+        preview: String(n?.note || n?.Note || n?.body || n?.Body || n?.text || n?.Text || '').slice(0, 200),
+      })),
+    };
   }
 
   return {
@@ -614,6 +603,43 @@ function leadSnapshot(lead) {
     user_field_names: userFieldKeys,
     extracted_hlcid: extractHLCID(lead),
     sample_values: sample,
+    userfields_normalized: userfieldsNormalized,
+    notes_preview: notesPreview,
+  };
+}
+
+/**
+ * Snapshot the prospect-level record (different shape than lead).
+ * Returns lognumber-equivalent fields + userfields + notes content.
+ */
+function prospectSnapshot(prospect) {
+  if (!prospect || typeof prospect !== 'object') return null;
+  const keys = Object.keys(prospect);
+
+  const sample = {};
+  for (const k of ['cst_id', 'CstID', 'firstname', 'lastname', 'phone1', 'address1', 'city', 'state', 'zip', 'email']) {
+    if (k in prospect) sample[k] = prospect[k];
+  }
+
+  let userfieldsNormalized = null;
+  const ufRaw = prospect.userfields ?? prospect.UserFields ?? prospect.user_fields;
+  if (Array.isArray(ufRaw)) {
+    userfieldsNormalized = {};
+    for (const uf of ufRaw) {
+      if (!uf) continue;
+      const name = uf.name || uf.Name || uf.field || uf.Field || uf.key || uf.Key;
+      const val  = uf.value ?? uf.Value ?? uf.val ?? uf.Val;
+      if (name) userfieldsNormalized[String(name)] = val;
+    }
+  } else if (ufRaw && typeof ufRaw === 'object') {
+    userfieldsNormalized = ufRaw;
+  }
+
+  return {
+    field_count: keys.length,
+    all_field_names: keys,
+    sample_values: sample,
+    userfields_normalized: userfieldsNormalized,
   };
 }
 
@@ -624,14 +650,13 @@ async function probeLPForContact({ contactId, prospectId, phone }) {
     step2_phone_lookup: null,
   };
 
-  // ── Step 1 probe — getLeads(cst_id=prospectId) ────────────────
+  // Step 1 probe
   if (prospectId && /^\d+$/.test(String(prospectId))) {
     const start = Date.now();
     try {
       const result = await getLeads({ cst_id: prospectId, PageSize: 50 });
       const records = Array.isArray(result) ? result : [result];
 
-      // Walk into prospect.leads to get actual lead objects
       const inner = [];
       for (const p of records) {
         if (!p) continue;
@@ -644,6 +669,7 @@ async function probeLPForContact({ contactId, prospectId, phone }) {
         elapsed_ms: Date.now() - start,
         prospect_record_count: records.length,
         prospect_record_keys: records[0] ? Object.keys(records[0]).slice(0, 40) : [],
+        prospect_snapshots: records.map(prospectSnapshot),
         inner_lead_count: inner.length,
         inner_leads: inner.map(leadSnapshot),
         hlcid_match_attempted_against: contactId,
@@ -657,7 +683,7 @@ async function probeLPForContact({ contactId, prospectId, phone }) {
     }
   }
 
-  // ── Step 2 probe — getCustomers3({phone}) → leads per prospect ──
+  // Step 2 probe
   if (phone) {
     const start = Date.now();
     try {
@@ -684,6 +710,7 @@ async function probeLPForContact({ contactId, prospectId, phone }) {
           }
           perProspect.push({
             prospect_id: pid,
+            prospect_snapshot: records[0] ? prospectSnapshot(records[0]) : null,
             inner_lead_count: inner.length,
             inner_leads: inner.map(leadSnapshot),
             any_hlcid_matched: inner.some(l => extractHLCID(l) === contactId),
@@ -709,17 +736,10 @@ async function probeLPForContact({ contactId, prospectId, phone }) {
   return probe;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// WEBHOOK ENDPOINTS
-// ═══════════════════════════════════════════════════════════════════
+// ─── Webhook endpoints ─────────────────────────────────────────
 
 export function registerLPAppointmentSyncRoutes(app) {
 
-  /**
-   * POST /webhook/ghl/set-lp-appointment
-   *
-   * v5.1: Self-enriching endpoint with HLCID-first resolution chain.
-   */
   app.post('/webhook/ghl/set-lp-appointment', async (req, res) => {
     const startTime = Date.now();
     try {
@@ -746,13 +766,8 @@ export function registerLPAppointmentSyncRoutes(app) {
 
       const needsEnrich = !appointmentDate || !appointmentTime || !prospectId || !contactPhone || !address1;
       if (needsEnrich) {
-        console.log(`[LP-APPT] Self-enriching from GHL API for ${contactId} (missing: ${[
-          !appointmentDate && 'date', !appointmentTime && 'time',
-          !prospectId && 'prospect', !contactPhone && 'phone', !address1 && 'address',
-        ].filter(Boolean).join(', ')})`);
-
+        console.log(`[LP-APPT] Self-enriching from GHL API for ${contactId}`);
         const enriched = await enrichFromGHLContact(contactId);
-
         if (!appointmentDate && enriched.appointmentDate) appointmentDate = enriched.appointmentDate;
         if (!appointmentTime && enriched.appointmentTime) appointmentTime = enriched.appointmentTime;
         if (!prospectId && enriched.prospectId) prospectId = enriched.prospectId;
@@ -765,8 +780,6 @@ export function registerLPAppointmentSyncRoutes(app) {
         if (!postalCode && enriched.postalCode) postalCode = enriched.postalCode;
         if (!city && enriched.city) city = enriched.city;
         if (!state && enriched.state) state = enriched.state;
-
-        console.log(`[LP-APPT] After enrichment: date=${appointmentDate}, time=${appointmentTime}, prospect=${prospectId || 'none'}, phone=${contactPhone ? 'yes' : 'no'}, addr=${address1 ? 'yes' : 'no'}`);
       }
 
       if (!appointmentDate || !appointmentTime) {
@@ -775,8 +788,6 @@ export function registerLPAppointmentSyncRoutes(app) {
           error: 'appointment_date and appointment_time not available (checked webhook body + GHL contact)',
         });
       }
-
-      console.log(`[LP-APPT] Webhook received: contact=${contactId}, date=${appointmentDate}, time=${appointmentTime}, prospect=${prospectId || 'none'}`);
 
       const result = await syncAppointmentToLP({
         contactId, contactPhone, contactEmail, contactName,
@@ -795,20 +806,6 @@ export function registerLPAppointmentSyncRoutes(app) {
     }
   });
 
-  /**
-   * POST /webhook/ghl/lp-probe
-   *
-   * v5.1.1 diagnostic endpoint. NEVER calls SetAppointment, NEVER applies
-   * tags, NEVER mutates anything. Just runs the LP API queries that the
-   * resolution chain would run, and returns the raw shape of what LP
-   * returned so we can see field names, HLCID locations, etc.
-   *
-   * Body: { contactId } OR { prospectId, phone, contactId (for HLCID match) }
-   *
-   * Returns probe object with step1_prospect_lookup + step2_phone_lookup,
-   * each containing field counts, key lists, HLCID-like field names,
-   * extractHLCID results per lead, and match-attempt outcomes.
-   */
   app.post('/webhook/ghl/lp-probe', async (req, res) => {
     const startTime = Date.now();
     try {
@@ -817,7 +814,6 @@ export function registerLPAppointmentSyncRoutes(app) {
       let prospectId = cleanGHLValue(body.prospectId || body.prospect_id || body.lp_prospect_id);
       let phone = cleanGHLValue(body.phone || body.contact_phone);
 
-      // Self-enrich if we have contactId but no prospect/phone
       if (contactId && (!prospectId || !phone)) {
         const enriched = await enrichFromGHLContact(contactId);
         if (!prospectId) prospectId = enriched.prospectId;
@@ -840,8 +836,7 @@ export function registerLPAppointmentSyncRoutes(app) {
   });
 
   console.log('[LP-APPT] Registered: POST /webhook/ghl/set-lp-appointment (v5.1 HLCID-first)');
-  console.log('[LP-PROBE] Registered: POST /webhook/ghl/lp-probe (v5.1.1 diagnostic)');
+  console.log('[LP-PROBE] Registered: POST /webhook/ghl/lp-probe (v5.1.2 diagnostic w/ userfields+lognumber)');
 }
 
-// Export for potential reuse by action-executor and tests
 export { resolveLPLeadId, syncAppointmentToLP, extractHLCID, findLeadByHLCID, probeLPForContact };
