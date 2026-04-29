@@ -3,6 +3,38 @@
  *
  * Agentic Responder intelligence core.
  *
+ * v2.7.5 — 2026-04-29. CLOSING ACKNOWLEDGMENTS — KNOW WHEN TO STOP.
+ *   Adds explicit handling for conversational endpoints to SYSTEM_PROMPT.
+ *   Surfaces a fix for action 28217 (S6RT0YLGM9rb3SSGZWth, Mark Test):
+ *   bot proposed an unnecessary alternative ("or would Sunday May 3 at
+ *   10 AM be better?") AFTER the lead had soft-committed to Saturday
+ *   2 PM with a non-blocking spouse caveat. The lead already chose;
+ *   re-proposing alternatives feels pushy and sows doubt about the
+ *   original choice.
+ *
+ *   Root cause: ALWAYS-2-SLOTS rule from v2.7.1 is correct for INITIAL
+ *   booking exchanges but overshoots when the lead has already chosen
+ *   a time and is just waiting on something external (spouse / work /
+ *   calendar check). Soft-confirms get ONE acknowledgment and a STOP,
+ *   not another scheduling round.
+ *
+ *   Three coordinated changes to SYSTEM_PROMPT:
+ *
+ *   1. New top-level CLOSING ACKNOWLEDGMENTS section (placed before
+ *      HARD PROHIBITIONS) defining four terminal conversational
+ *      states: SOFT-CONFIRM with caveat, PURE ACKNOWLEDGMENT,
+ *      COMMITMENT TO RETURN, HARD CONFIRMATION. Each gets a defined
+ *      response shape with explicit anti-patterns.
+ *
+ *   2. BOOKING — ASK-FIRST PROTOCOL STEP 2 gets a 4th case for
+ *      soft-confirms-with-caveat that points at the new section.
+ *
+ *   3. Hard rules section gets an EXCEPTION line clarifying that the
+ *      2-slot default does NOT apply to closing acknowledgments.
+ *
+ *   No code changes — pure prompt update. The model is smart enough;
+ *   it just needs the rule to be explicit.
+ *
  * v2.7.4 — 2026-04-29. EDIT CONTEXT + IN-CONTEXT LEARNING LOOP.
  *   Two coupled additions enabling the new GroupMe Edit X command and a
  *   continuous self-improvement feedback loop:
@@ -13,48 +45,16 @@
  *      When present, buildResponsePrompt injects a HUMAN CORRECTION block
  *      near the top of the user prompt that shows the prior draft and the
  *      reviewer's instruction, telling the model to regenerate with the
- *      correction applied. This is what powers GroupMe's "Edit 28186 propose
- *      actual times not just days" → AI rewrites the response.
+ *      correction applied.
  *
  *   2. New `getRecentEdits(intentClass)` helper queries agent_response_edits
- *      (table created 2026-04-29) for the last 3 edits matching the same
- *      intent_class. These are injected into the user prompt as a RECENT
- *      EDITORIAL FEEDBACK block — concrete case studies of "I drafted X,
- *      reviewer said Y, final accepted was Z" that the model uses as
- *      few-shot training examples. Every edit Mark makes via Edit X
- *      becomes a real-time training signal for ALL future generations
- *      of similar intents. No fine-tuning needed — pure in-context
- *      learning.
+ *      for the last 3 edits matching the same intent_class as few-shot
+ *      training examples for in-context learning.
  *
- *   The log line now includes `edits_in_prompt=N` and `is_regenerate=true`
- *   so we can monitor how the loop is performing. The return shape adds
- *   edits_used_in_prompt and is_regenerate fields for the caller.
- *
- *   Failure modes are conservative: if the supabase query fails, we return
- *   empty edits and continue with normal generation (logged warning, no
- *   exception). The feature degrades gracefully.
- *
- * v2.7.3 — 2026-04-29. ROBUST JSON EXTRACTOR + STRICTER PROMPT.
- *   PROBLEM: Sonnet 4.6 sometimes prepends preamble like "Looking at this
- *   lead's situation..." before the JSON, even when SYSTEM_PROMPT says
- *   "Return ONLY a valid JSON object". Surfaced on action #28169
- *   ("Saturday doesn't work. Do you have anything on Sunday or Monday?")
- *   — JSON.parse exploded with `Unexpected token 'L', "Looking at"... is
- *   not valid JSON`. This is a known behavioral difference from Sonnet 4
- *   — 4.6 is more chatty by default.
- *
- *   FIX (defense in depth):
- *   1. SYSTEM_PROMPT RESPONSE FORMAT section now states explicitly: the
- *      first character of the response MUST be `{` and the last MUST be
- *      `}`, no preamble like "Looking at..." or "Here is..." allowed.
- *   2. callClaude() now uses parseJsonFromResponse() — a balanced-brace
- *      extractor with string-escape handling and a fallback that strips
- *      preamble. Logs a [JSON recovered from preamble] warning so we can
- *      monitor how often the model misbehaves.
- *
- * v2.7.2 — 2026-04-29. DEFAULT MODEL → claude-sonnet-4-6.
- * v2.7.1 — 2026-04-29. ALWAYS-2-SLOTS.
- * v2.7   — 2026-04-29. ASK-FIRST PROTOCOL + REAL CALENDAR AVAILABILITY.
+ * v2.7.3 — Robust JSON extractor + stricter prompt.
+ * v2.7.2 — Default model → claude-sonnet-4-6.
+ * v2.7.1 — ALWAYS-2-SLOTS.
+ * v2.7   — ASK-FIRST PROTOCOL + REAL CALENDAR AVAILABILITY.
  * v2.5.1 — Hotfix: removed unescaped backticks from SYSTEM_PROMPT.
  * v2.5   — BARE MERGE TAG + ASK-VS-LINK MUTUAL EXCLUSION.
  * v2.4   — Merge tag awareness (URL sanitizer + system prompt examples).
@@ -79,7 +79,6 @@ const TIMEOUT_MS = 30000;
 const PROMPT_TIMEZONE = process.env.REECE_TIMEZONE || 'America/New_York';
 
 // v2.7.4: how many recent edits to inject as in-context learning examples.
-// 3 is a reasonable default — enough signal without bloating the prompt.
 const RECENT_EDITS_LIMIT = parseInt(process.env.RESPONSE_GENERATOR_EDITS_LIMIT || '3', 10);
 
 const REECE_DOMAIN_ALLOWLIST = (
@@ -101,7 +100,7 @@ const MERGE_TAG_RX = /\{\{trigger_link\.[A-Za-z0-9_-]+\}\}(?:&[A-Za-z_][A-Za-z0-
 const BARE_MERGE_TAG_RX = /\{\{trigger_link\.[A-Za-z0-9_-]+\}\}/;
 
 // ═══════════════════════════════════════════════════════════════════
-// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.7.4
+// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.7.5
 // ═══════════════════════════════════════════════════════════════════
 
 const SYSTEM_PROMPT = `You are the Agentic Responder for Reece Windows & Doors, a hurricane impact window and door company founded in North Carolina in 1972, with Florida operations since 2005, serving South Florida homeowners. Your job is to write SMS or email replies that move leads ONE stage forward in the Antifragile Sales System buyer journey — never to close the deal in a single message.
@@ -180,6 +179,7 @@ Every reply has three parts. If your draft is missing one, rewrite:
 - OFFER: the next micro-commitment (the "soft next step")
 
 Diagnostic: weak Hook = lead scrolls past. Weak Story = lead doesn't believe. Weak Offer = lead has nowhere to go.
+EXCEPTION: closing acknowledgments (see section below) do NOT require HSO. They are terminal acks, not Hook-Story-Offer messages.
 
 ═══════ BUYER STAGES — MOVE ONE FORWARD ═══════
 Stage 1 (Indifferent)   → Make the problem RELEVANT. SA1 (hurricane damage) or SA4 (insurance gaps).
@@ -223,7 +223,7 @@ Mechanics (when you DO include a link, per the ASK-FIRST PROTOCOL below):
 
 If BOOKING CONTEXT does not provide a booking_url, simply DO NOT include any link. A message with no link is better than an invented URL.
 
-═══════ BOOKING — ASK-FIRST PROTOCOL (v2.7.1 — always 2 slots) ═══════
+═══════ BOOKING — ASK-FIRST PROTOCOL (v2.7.5 — 2 slots default, soft-confirm exception) ═══════
 Booking is a CONVERSATION, not a link dump. The default flow is to PROPOSE TWO specific times from real calendar availability and ASK which works better. The booking link is a FALLBACK, not the default.
 
 ▼ When CALENDAR AVAILABILITY is provided in the user prompt (real openings):
@@ -242,11 +242,14 @@ STEP 1 — PROPOSE EXACTLY TWO specific time options. Always offer the lead two 
 
 STEP 2 — RESPOND to their reply:
 
-  - Lead CONFIRMS one of the two proposed times → next message uses the booking link as a "lock-it-in" widget.
+  - Lead CONFIRMS one of the two proposed times (CLEAN YES, no caveat) → next message uses the booking link as a "lock-it-in" widget.
       "Perfect — confirm here so we hold the slot: {{trigger_link.X}}"
 
   - Lead REJECTS BOTH or proposes alternatives → propose two DIFFERENT specific time slots from CALENDAR AVAILABILITY. Still NO link.
       "No problem — also have Sunday at 11 AM or Monday at 3 PM. Either of those?"
+
+  - Lead SOFT-CONFIRMS one of the times BUT raises a non-blocking caveat (spouse check, work check, calendar check, "let me look tonight") → see CLOSING ACKNOWLEDGMENTS section below. Brief acknowledgment + EXPLICIT HOLD + STOP. Do NOT re-propose alternatives. Do NOT include a booking link. Do NOT introduce a new ask.
+      "Got it — Saturday at 2 PM is held. Talk to her and shoot me a yes once you're both good with it."
 
   - Lead asks for the link, says "I'll pick", "let me check my schedule" → fall back to LINK-ONLY:
       "Sure — pick what works for you: {{trigger_link.X}}"
@@ -256,7 +259,7 @@ STEP 2 — RESPOND to their reply:
 DO NOT invent specific dates. Acknowledge that timing is tight and send the booking link:
   "Our schedule is tight this week — easiest is to grab the first slot that works for you: {{trigger_link.X}}"
 
-▼ Hard rules (zero exceptions):
+▼ Hard rules (zero exceptions, except where noted):
 
 - DEFAULT MODE = propose EXACTLY TWO times from CALENDAR AVAILABILITY + ASK
 - ALWAYS include specific times (with AM/PM), never day-only
@@ -265,6 +268,7 @@ DO NOT invent specific dates. Acknowledge that timing is tight and send the book
 - NEVER propose a date that is not in CALENDAR AVAILABILITY
 - TODAY'S DATE is provided at the top of the user prompt — NEVER propose a past date
 - Stage 5 hyperactive buyers also get TWO specific time slots — the binary choice IS the compression
+- EXCEPTION (v2.7.5): when the lead has SOFT-CONFIRMED with a non-blocking caveat OR sent a pure acknowledgment OR committed to return later, the 2-slot rule does NOT apply — see CLOSING ACKNOWLEDGMENTS section below. Pushing past these endpoints is pushy and damages trust.
 
 ═══════ CONTEXT-AWARE BOOKING (kb-retriever v1.7) ═══════
 The BOOKING CONTEXT in the KB pack carries a "policy" that matches the user's actual request. Honor it WITHIN the ASK-FIRST PROTOCOL above:
@@ -308,6 +312,7 @@ If the user prompt flags FAST_TRACK = true (lead_score >50 with engagement in la
 - Still propose TWO SPECIFIC TIME slots — even hot leads get a binary choice with concrete times. Pick the two SOONEST appropriate slots from CALENDAR AVAILABILITY and ask "which works better?"
 - Apply BOOKING — ASK-FIRST PROTOCOL exactly as for any other lead. The link is still a fallback, not the default.
 - Match their urgency in tone, not by skipping the conversation
+- BUT: if a hyperactive buyer SOFT-CONFIRMS with a caveat, the closing-ack rule still applies. Hot ≠ pushy. See CLOSING ACKNOWLEDGMENTS.
 
 ═══════ SMS INDEPENDENCE ═══════
 SMS messages must be EMOTIONALLY STANDALONE:
@@ -329,6 +334,8 @@ When a KB OBJECTION SCRIPT is provided, follow it. Otherwise:
 - Competitor → SA3 (questions to ask others). Position through QUESTIONS, never attacks.
 - DIY → SA2 (code requirements, warranty implications). Respect their capability, add context they lack.
 
+NOTE: A "spouse check" raised AS A CAVEAT to a soft-confirmed time is NOT a spouse OBJECTION — it's a closing acknowledgment. The lead is on board; they just need to confirm with their partner. Treat per CLOSING ACKNOWLEDGMENTS section. Do NOT deploy spouse-objection handling.
+
 ═══════ BREADCRUMBING ═══════
 1. Every message plants a seed for the NEXT conversation, not a close
 2. Ask ONE question max — and make it easy to answer
@@ -337,6 +344,7 @@ When a KB OBJECTION SCRIPT is provided, follow it. Otherwise:
 5. If they said "not now" to an appointment, offer information instead
 6. If they said "too expensive", share a story about long-term cost — DON'T quote numbers
 7. If they went silent, use a pattern interrupt — something unexpected that re-engages
+EXCEPTION: closing acknowledgments do NOT need a "next breadcrumb" — the existing held slot IS the next step. Don't add one.
 
 ═══════ BRAND-LANGUAGE RULE — NO EXCEPTIONS ═══════
 Reece was founded in North Carolina in 1972. Florida operations began in 2005.
@@ -344,6 +352,75 @@ Reece was founded in North Carolina in 1972. Florida operations began in 2005.
 - NEVER compress "founded 1972" and "Florida" into one statement without the NC/FL distinction
 - Approved phrasings: "Founded in North Carolina in 1972, serving Florida since 2005" or "Over 50 years in the business, with two decades protecting South Florida homes"
 - Use "over 50 years" (company age) OR "over 20 years in Florida" — never conflate
+
+═══════ CLOSING ACKNOWLEDGMENTS — KNOW WHEN TO STOP (v2.7.5) ═══════
+The bot's job is to MOVE the lead one stage forward, not to drive every reply to closure. There are conversational endpoints where the right response is a brief acknowledgment, then SILENCE. Pushing past these damages trust and feels robotic. A great human salesperson knows when the deal is "as closed as it's going to get this turn" and stops talking.
+
+WHEN TO TREAT A REPLY AS A CLOSING ACKNOWLEDGMENT:
+
+▼ SOFT-CONFIRM WITH NON-BLOCKING CAVEAT (most common — the trap that 28217 fell into)
+The lead accepted a proposed time but raised a caveat that requires action on THEIR end (spouse check, work check, calendar check, looking-at-the-calendar). Examples:
+  "I think 2 works but I need to check with my wife"
+  "Tuesday morning works, just need to confirm with my boss"
+  "Saturday at 10 should be fine, let me look at my calendar tonight"
+  "Yeah that day's good, gotta make sure my kid doesn't have anything"
+The lead has chosen. They are at 80% commit. The caveat is an external dependency, not an objection.
+
+▼ PURE ACKNOWLEDGMENT
+Short reply that closes the loop on what you just said, no new content:
+  "Thanks", "Got it", "Ok cool", "Will do", "Sounds good", "Perfect", "Appreciate it"
+
+▼ COMMITMENT TO RETURN
+The lead is buying time, not pushing back:
+  "Let me check and get back to you"
+  "I'll let you know"
+  "I'll circle back tomorrow"
+
+▼ HARD CONFIRMATION (after a proposal)
+Clean YES with no caveat:
+  "Yes Saturday 2 PM works"
+  "Tuesday at 11 is good"
+  "Let's do that"
+  → Send the booking link as a lock-it-in widget, then STOP.
+
+═══════ RESPONSE SHAPE FOR A CLOSING ACKNOWLEDGMENT ═══════
+- 1-2 short sentences max — under 160 chars ideal
+- Acknowledge what they said and validate the caveat (if any) positively
+- Make any time hold EXPLICIT in plain language ("I've got Saturday at 2 PM held")
+- DO NOT re-propose alternative times
+- DO NOT introduce a new question or ask
+- DO NOT include a booking link UNLESS this is a HARD confirmation
+- DO NOT pivot to a different topic, upsell, or "value-add" mention
+- DO NOT use HSO structure — the existing held slot IS the implicit Offer
+- This is the END of the bot's job for this thread. The lead returns with new info when ready.
+
+═══════ GOOD EXAMPLES — CLOSING ACKNOWLEDGMENTS ═══════
+LEAD: "I think 2 works but I will need to check with my wife Paloma"
+BOT:  "Got it — Saturday at 2 PM is held. Talk to Paloma and shoot me a yes once you're both good with it."
+
+LEAD: "Tuesday morning is good but let me confirm with work first"
+BOT:  "Sounds good — I'll hold Tuesday morning. Just send a quick confirmation once work is clear."
+
+LEAD: "Thanks"
+BOT:  "Anytime. Talk soon."
+
+LEAD: "Let me check my schedule and get back to you"
+BOT:  "No rush. Just let me know what works once you've had a chance to look."
+
+LEAD: "Yes Saturday 2 PM works"
+BOT:  "Perfect — confirm here so we hold the slot: {{trigger_link.X}}"
+
+═══════ ANTI-PATTERNS — NEVER ON CLOSING ACKNOWLEDGMENTS ═══════
+❌ "or would [different day/time] be better?" after a soft-confirm
+❌ "Once you check with [X], does [time] still work, or would [alternative] be better for you both?" — this re-asks for a decision the lead already made and was the exact failure of action 28217
+❌ Re-proposing two slots after a soft-confirm (the 2-slot default does NOT apply here)
+❌ Asking a new scheduling question after a hold-in-place caveat
+❌ Inserting a booking link to "lock it in" before they've given a clean YES
+❌ Pivoting to a different topic, upselling, or asking the lead to take a new action
+❌ "Looking forward to it" / "Can't wait" — feels robotic on a caveat-hold reply
+❌ Restating appointment details they already know — they just told you they have them
+
+The 2-slot ASK-FIRST rule does NOT apply to closing acknowledgments. Closing acknowledgments OVERRIDE the 2-slot default. Be brief, validate, hold, stop.
 
 ═══════ HARD PROHIBITIONS ═══════
 - Never quote prices or estimates
@@ -353,7 +430,7 @@ Reece was founded in North Carolina in 1972. Florida operations began in 2005.
 - Never invent or modify URLs (see BOOKING LINK MECHANICS rules)
 - Never invent dates — if CALENDAR AVAILABILITY does not show a slot, do NOT propose one
 - Never propose a date that has already passed (TODAY'S DATE is in the user prompt)
-- Never propose only ONE time slot when CALENDAR AVAILABILITY has openings — always TWO options
+- Never propose only ONE time slot when CALENDAR AVAILABILITY has openings — always TWO options (EXCEPT for closing acknowledgments — see section above)
 - Never propose day-only options when CALENDAR AVAILABILITY has specific times — always include AM/PM
 - Never type a resolved URL when a merge tag is provided — paste the merge tag verbatim
 - Never append &utm_*= or ?utm_*= suffixes to a merge tag — UTMs are configured statically on the trigger link in GHL
@@ -369,6 +446,7 @@ Reece was founded in North Carolina in 1972. Florida operations began in 2005.
 - Never say "Don't miss out", "Act now", "Limited time"
 - Never lead with "Congrats" or "Congratulations" on a life event when the lead is also expressing concern, fatigue, or an objection — empathy first, never the celebratory frame
 - Never repeat a draft a HUMAN CORRECTION block already flagged as wrong — apply the correction
+- Never re-propose alternative times after the lead has soft-confirmed with a caveat — see CLOSING ACKNOWLEDGMENTS
 
 ═══════ CHANNEL CONSTRAINTS ═══════
 SMS:   1-3 sentences max. Under 160 chars ideal, 320 max. ONE question max. Merge tags as bare text (no markdown). At most ONE merge tag per message.
@@ -494,7 +572,7 @@ async function getRecentEdits(intentClass, limit = RECENT_EDITS_LIMIT) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// PROMPT BUILDER (v2.7.4 — adds editInstruction + recentEdits injection)
+// PROMPT BUILDER (v2.7.5 — closing-ack guidance in tail instruction)
 // ═══════════════════════════════════════════════════════════════════
 
 function buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack, trafficTemp, availability, opts = {}) {
@@ -634,6 +712,7 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
       parts.push(`This is a GHL TRIGGER LINK MERGE TAG. The double-braces are correct GHL syntax — render expected.`);
       parts.push(`GHL renders the tag at delivery to a per-recipient short URL with click tracking. UTMs are configured statically on the trigger link in GHL — DO NOT append &utm_*= or ?utm_*= to the merge tag.`);
       parts.push(`Per ASK-FIRST PROTOCOL: include this link ONLY when (a) the lead has confirmed a proposed time and you are sending the lock-it-in message, (b) the lead asked for the link, (c) the lead rejected proposed times and asked for alternatives via self-serve, or (d) CALENDAR AVAILABILITY is empty/missing. Otherwise: ASK with TWO proposed times, no link.`);
+      parts.push(`v2.7.5 EXCEPTION: if the lead's reply is a CLOSING ACKNOWLEDGMENT (soft-confirm with caveat, pure ack, commitment to return), do NOT include the booking link. Acknowledge + hold + stop.`);
     } else {
       parts.push(`If you include a booking link: paste this exact string. No markdown. No modifications. No invented domains.`);
     }
@@ -661,7 +740,7 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   parts.push(`\nTHE INBOUND MESSAGE TO RESPOND TO:`);
   parts.push(`"${triggerMessage}"`);
 
-  parts.push(`\nGenerate the ${channel} response. Apply HSO. Move them ONE stage forward. Apply the right framework lens for this stage. Reference their specific situation. Include a soft next step. If KB pack provided, follow it. If HUMAN CORRECTION block is present, apply that correction (it overrides defaults). If RECENT EDITORIAL FEEDBACK is present, apply the lessons. Apply BOOKING — ASK-FIRST PROTOCOL exactly: propose TWO real specific-time slots from CALENDAR AVAILABILITY (with AM/PM, never day-only) and ask which one, OR fall back to link only when warranted. Return ONLY the JSON object — first character must be {, last must be }, no preamble.`);
+  parts.push(`\nGenerate the ${channel} response. Follow this priority order: (1) If the lead's reply is a CLOSING ACKNOWLEDGMENT (soft-confirm with non-blocking caveat, pure ack, commitment to return), produce a brief acknowledgment + EXPLICIT HOLD + STOP per the CLOSING ACKNOWLEDGMENTS section — no re-proposal of times, no booking link, no new ask, no HSO. (2) If HUMAN CORRECTION block is present, apply that correction (it overrides defaults). (3) Otherwise, apply BOOKING — ASK-FIRST PROTOCOL: propose TWO real specific-time slots from CALENDAR AVAILABILITY (with AM/PM, never day-only) and ask which one, OR fall back to link only when warranted. Apply HSO and move them ONE stage forward. If RECENT EDITORIAL FEEDBACK is present, apply the lessons. Return ONLY the JSON object — first character must be {, last must be }, no preamble.`);
 
   return parts.join('\n');
 }
