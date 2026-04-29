@@ -41,6 +41,8 @@ import { registerGroupMeRoutes } from './groupme.js';
 import { registerLPAppointmentSyncRoutes } from './lp-appointment-sync.js';
 // ─── Workflow Completion (tag-based self-enrichment) ─────────────
 import { registerWorkflowCompletionRoutes } from './workflow-completion-handler.js';
+// ─── Entry Events (Route B agentic-first entry routing) ─────────
+import { registerEntryEventRoutes } from './entry-event-handler.js';
 // ─── IME MIC Integration (Sam's Club Construction leads) ─────────
 import { registerImeRoutes, startImeWorkers } from './ime/index.js';
 // ─── Admin ──────────────────────────────────────────────────────
@@ -176,6 +178,7 @@ app.get('/health', (req, res) => {
         'POST /webhook/ghl/workflow',
         'POST /webhook/ghl/workflow-tag',
         'POST /webhook/ghl/set-lp-appointment',
+        'POST /webhook/ghl/entry',
       ],
     },
     intent_scoring: {
@@ -375,6 +378,14 @@ registerLPAppointmentSyncRoutes(app);
 // ─── Workflow Completion (tag-based self-enrichment) ─────────────
 registerWorkflowCompletionRoutes(app);
 
+// ─── Entry Events (Route B agentic-first entry routing) ──────────
+// POST /webhook/ghl/entry receives entry-source events from simplified
+// GHL workflows (one webhook step per entry source) and emits
+// ghl.entry_detected events. Decision Engine routes via ENTRY_ROUTE_*
+// rules → add_to_workflow with webhook_url targeting the destination
+// workflow's Inbound Webhook trigger.
+registerEntryEventRoutes(app);
+
 // ─── IME MIC Integration (Sam's Club Construction leads) ─────────
 registerImeRoutes(app);
 
@@ -421,7 +432,7 @@ app.listen(PORT, async () => {
   console.log(`n8n APIs:     POST /n8n/enrich-lead | /n8n/refresh-token | /n8n/prospect-lookup | /n8n/time-to-appointment`);
   console.log(`Avatar APIs:  POST /n8n/avatar/score | /parse-gpt | /unified-inputs | /pick-best | /build-ghl | /build-notion`);
   console.log(`Decision:     POST /n8n/decision-engine/process | /execute | GET /status | /execution-stats`);
-  console.log(`Layer 3:      POST /webhook/ghl/{reply,appointment,engagement,lead-score,workflow,workflow-tag}`);
+  console.log(`Layer 3:      POST /webhook/ghl/{reply,appointment,engagement,lead-score,workflow,workflow-tag,entry}`);
   console.log(`Intelligence: GET /n8n/lead-intelligence/context | POST /n8n/analyze-pending-replies | /n8n/analyze-message`);
   console.log(`Intent:       POST /n8n/intent/score | /n8n/intent/sweep | GET /n8n/intent/breakdown`);
   console.log(`KB Ingest:    POST /n8n/kb/ingest | /n8n/kb/clear-source | GET /n8n/kb/sources`);
@@ -431,6 +442,7 @@ app.listen(PORT, async () => {
   console.log(`REST API:     GET /api/prospects/:id | /api/leads/:id | /api/search | /api/lead-summary/:contactId`);
   console.log(`GroupMe:      POST /webhook/groupme | POST /groupme/send | GET /groupme/pending`);
   console.log(`LP Sync:      POST /webhook/ghl/set-lp-appointment`);
+  console.log(`Entry:        POST /webhook/ghl/entry | GET /webhook/ghl/entry/sources`);
   console.log(`Admin:        POST /admin/email-backfill | /admin/email-cleanup | /admin/backfill-ghl-contact-id-from-lognumber`);
   console.log(`IME:          POST /ime/dispatch | /ime/work-orders/:id/{refetch,appointment,install,close,cancel,complete}`);
   console.log(`MCP:          http://localhost:${PORT}/mcp`);
