@@ -3,6 +3,36 @@
  *
  * Agentic Responder intelligence core.
  *
+ * v2.7.3 — 2026-04-29. ROBUST JSON EXTRACTOR + STRICTER PROMPT.
+ *   PROBLEM: Sonnet 4.6 sometimes prepends preamble like "Looking at this
+ *   lead's situation..." before the JSON, even when SYSTEM_PROMPT says
+ *   "Return ONLY a valid JSON object". Surfaced on action #28169
+ *   ("Saturday doesn't work. Do you have anything on Sunday or Monday?")
+ *   — JSON.parse exploded with `Unexpected token 'L', "Looking at"... is
+ *   not valid JSON`. This is a known behavioral difference from Sonnet 4
+ *   — 4.6 is more chatty by default.
+ *
+ *   FIX (defense in depth):
+ *   1. SYSTEM_PROMPT RESPONSE FORMAT section now states explicitly: the
+ *      first character of the response MUST be `{` and the last MUST be
+ *      `}`, no preamble like "Looking at..." or "Here is..." allowed.
+ *      Strongest possible instruction.
+ *   2. callClaude() now uses parseJsonFromResponse() — a balanced-brace
+ *      extractor that tries direct parse first (fast path when the model
+ *      complies), then falls back to extracting the first balanced JSON
+ *      object from the response, properly handling string escapes (so
+ *      braces inside string values like {{trigger_link.X}} don't confuse
+ *      the depth counter). Logs a [JSON recovered from preamble] warning
+ *      so we can monitor how often the model misbehaves and tune the
+ *      prompt over time.
+ *
+ *   No model rollback needed — Sonnet 4.6 is the right model for our use
+ *   case, we just need to be robust to its conversational tendencies.
+ *
+ *   Verified locally with 6-case test harness covering the exact failure
+ *   text from action #28169, markdown fences, merge tags inside string
+ *   values, escaped quotes, and missing-JSON edge cases.
+ *
  * v2.7.2 — 2026-04-29. DEFAULT MODEL → claude-sonnet-4-6.
  *   Switched the MODEL constant default from 'claude-sonnet-4-20250514'
  *   (Sonnet 4 — Anthropic deprecation 2026-06-15) to 'claude-sonnet-4-6'
@@ -108,7 +138,7 @@ const MERGE_TAG_RX = /\{\{trigger_link\.[A-Za-z0-9_-]+\}\}(?:&[A-Za-z_][A-Za-z0-
 const BARE_MERGE_TAG_RX = /\{\{trigger_link\.[A-Za-z0-9_-]+\}\}/;
 
 // ═══════════════════════════════════════════════════════════════════
-// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.7.1
+// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.7.3
 // ═══════════════════════════════════════════════════════════════════
 
 const SYSTEM_PROMPT = `You are the Agentic Responder for Reece Windows & Doors, a hurricane impact window and door company founded in North Carolina in 1972, with Florida operations since 2005, serving South Florida homeowners. Your job is to write SMS or email replies that move leads ONE stage forward in the Antifragile Sales System buyer journey — never to close the deal in a single message.
@@ -372,7 +402,7 @@ SMS:   1-3 sentences max. Under 160 chars ideal, 320 max. ONE question max. Merg
 Email: 2-4 short paragraphs. 150-400 words. Subject line required (no exclamation). HSO structure visible. Merge tags as bare text (no markdown).
 
 ═══════ RESPONSE FORMAT ═══════
-Return ONLY a valid JSON object — no markdown fences, no preamble:
+Return ONLY a valid JSON object. Your ENTIRE response must be the raw JSON. No markdown fences. No preamble like "Looking at..." or "Here is...". No commentary before or after. The very first character of your response MUST be { and the very last character MUST be }. Nothing else:
 {
   "message": "The response text to send",
   "subject": "Email subject line (null for SMS)",
@@ -607,7 +637,7 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   parts.push(`\nTHE INBOUND MESSAGE TO RESPOND TO:`);
   parts.push(`"${triggerMessage}"`);
 
-  parts.push(`\nGenerate the ${channel} response. Apply HSO. Move them ONE stage forward. Apply the right framework lens for this stage. Reference their specific situation. Include a soft next step. If KB pack provided, follow it. Apply BOOKING — ASK-FIRST PROTOCOL exactly: propose TWO real slots from CALENDAR AVAILABILITY and ask which one, OR fall back to link only when warranted.`);
+  parts.push(`\nGenerate the ${channel} response. Apply HSO. Move them ONE stage forward. Apply the right framework lens for this stage. Reference their specific situation. Include a soft next step. If KB pack provided, follow it. Apply BOOKING — ASK-FIRST PROTOCOL exactly: propose TWO real slots from CALENDAR AVAILABILITY and ask which one, OR fall back to link only when warranted. Return ONLY the JSON object — first character must be {, last must be }, no preamble.`);
 
   return parts.join('\n');
 }
@@ -646,8 +676,67 @@ async function callClaude(userPrompt) {
     .map(block => block.text)
     .join('') || '';
 
-  const clean = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-  return JSON.parse(clean);
+  return parseJsonFromResponse(text);
+}
+
+/**
+ * v2.7.3 — Robust JSON extractor. Sonnet 4.6 sometimes prepends preamble
+ * like "Looking at this lead's situation..." before the JSON even when
+ * SYSTEM_PROMPT explicitly forbids it. This extractor:
+ *   1. Strips markdown fences (```json ... ```)
+ *   2. Tries direct parse (fast path when the model complies — no warning logged)
+ *   3. Falls back to extracting the first balanced JSON object, properly
+ *      handling string escapes so braces inside string values (like
+ *      {{trigger_link.X}}) do not confuse the depth counter
+ *   4. Logs a recovery warning so we can monitor how often the model
+ *      misbehaves and tune the prompt over time
+ *
+ * Verified locally with 6-case test harness covering the exact #28169
+ * failure text, markdown fences, merge tags inside strings, escaped
+ * quotes, and missing-JSON edge cases.
+ */
+function parseJsonFromResponse(text) {
+  let clean = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+
+  // Fast path — model complied, no warning needed
+  try {
+    return JSON.parse(clean);
+  } catch (firstErr) {
+    // Fallback: extract first balanced JSON object
+    const jsonStart = clean.indexOf('{');
+    if (jsonStart === -1) {
+      throw new Error(`No JSON object in response (${text.length} chars): ${text.slice(0, 200)}`);
+    }
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let jsonEnd = -1;
+    for (let i = jsonStart; i < clean.length; i++) {
+      const ch = clean[i];
+      if (escape) { escape = false; continue; }
+      if (ch === '\\') { escape = true; continue; }
+      if (ch === '"') { inString = !inString; continue; }
+      if (inString) continue;
+      if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) { jsonEnd = i; break; }
+      }
+    }
+    if (jsonEnd === -1) {
+      throw new Error(`Unbalanced JSON in response: ${clean.slice(jsonStart, jsonStart + 200)}`);
+    }
+    const extracted = clean.slice(jsonStart, jsonEnd + 1);
+    try {
+      const parsed = JSON.parse(extracted);
+      const preambleLen = jsonStart;
+      const preview = clean.slice(0, Math.min(preambleLen, 80)).replace(/\n/g, ' ');
+      console.warn(`[ResponseGenerator] JSON recovered from preamble (${preambleLen} chars stripped): "${preview}${preambleLen > 80 ? '...' : ''}"`);
+      return parsed;
+    } catch (secondErr) {
+      throw new Error(`Extracted JSON failed to parse: ${secondErr.message}. First 200 chars: ${extracted.slice(0, 200)}`);
+    }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════
