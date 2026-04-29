@@ -11,30 +11,41 @@
  *   - User replies "Yes 1234" or "No 1234" (where 1234 = batch ID prefix)
  *   - Webhook handler matches reply → approves/rejects batch → executes
  *
+ * v1.5 — INSERT-FIRST DEDUP (2026-04-29).
+ *   PROBLEM: Two parallel GroupMe approval cards firing for the same batch.
+ *   Surfaced 2026-04-28 by Mark on action #28144 (Mark Test). Railway logs
+ *   showed two `processApprovalQueue` workers entering the loop within 5s
+ *   of each other, both passing the in-loop existence check (because the
+ *   tracking record had not been inserted yet — the v1.4 code sent the
+ *   GroupMe message BEFORE persisting the tracking row). Both workers
+ *   sent the message; both then upserted the same `short_ref` row (the
+ *   second was a no-op due to onConflict, leaving exactly one tracking
+ *   record in the DB but two messages in GroupMe).
+ *
+ *   ROOT CAUSE: The v1.4 ordering — send first, persist second — leaves
+ *   a TOCTOU window between the existence check in approval-path.js and
+ *   the upsert here. Concurrent runs (n8n heartbeat + auto-execute trigger
+ *   after a prior approval) can both pass the check and both send.
+ *
+ *   FIX: Claim the batch via strict INSERT before calling sendGroupMeMessage.
+ *   `short_ref` already has a unique constraint (used by the v1.4 onConflict),
+ *   so a strict insert will fail with code 23505 if another worker has
+ *   claimed it. On unique violation we silently skip the send (the other
+ *   worker is handling it). On any other insert error we throw so the
+ *   batch retries. After a successful claim, if GroupMe delivery fails
+ *   we DELETE the claim row so the next heartbeat can retry.
+ *
+ *   This closes the race fully — there is no longer a window where two
+ *   workers can both send a GroupMe card for the same batch.
+ *
  * v1.4 — Zombie-proof tracking (2026-04-24).
  *   sendApprovalRequest now checks the sendGroupMeMessage return value and
  *   only inserts the groupme_approval_requests tracking record when GroupMe
- *   actually accepted the message. Prior versions upserted unconditionally,
- *   which could create phantom "pending" records if GroupMe was transiently
- *   unavailable — those records then acted as head-of-line blockers in
- *   action-executor.js's approval loop. Paired with action-executor v4.2.
- *
- *   Also throws on GroupMe delivery failure so the outer .catch() in
- *   executeActions surfaces the error visibly in logs instead of silently
- *   moving on.
+ *   actually accepted the message. (Superseded by v1.5 above — claim now
+ *   happens BEFORE the send, not after.)
  *
  * v1.3 — Auto-execute after approval.
- *   After an approval updates actions to 'pending', immediately triggers
- *   the action executor via internal HTTP call. Eliminates the delay between
- *   approving in GroupMe and the message actually being sent. Fire-and-forget
- *   with the heartbeat as safety net.
- *
  * v1.2 — Enriched approval requests with full decision context.
- *   sendApprovalRequest now accepts eventContext and lpLeadData params.
- *   Approval messages include: contact name+phone, last message text,
- *   LP source, rep name, disposition, what triggered the rule, and
- *   what the actions will do. Goal: approve/reject from GroupMe alone.
- *
  * v1.1 — Fix: rejection uses status='rejected' (was 'cancelled').
  *
  * Routes:
@@ -147,10 +158,13 @@ function formatActionSummary(actions) {
 }
 
 /**
- * v1.2: Enriched approval request with full decision context.
- * v1.4: Only persists tracking record when GroupMe actually accepts the
- *       message — prevents zombie records that could head-of-line block
- *       the executor's approval loop.
+ * v1.5 — Insert-first dedup. Claim the batch by inserting the tracking
+ * record BEFORE sending the GroupMe message. If another worker has already
+ * claimed it (concurrent run), the unique constraint on short_ref fires a
+ * 23505 error and we silently skip. If GroupMe delivery fails after a
+ * successful claim, we delete the claim so the next heartbeat retries.
+ *
+ * v1.2 — Enriched approval request with full decision context.
  */
 export async function sendApprovalRequest(batchActions, contactName, contactPhone, enrichment = {}) {
   if (!batchActions?.length) return;
@@ -211,25 +225,53 @@ export async function sendApprovalRequest(batchActions, contactName, contactPhon
 
   const msg = lines.join('\n');
 
-  // v1.4 — Send first. Only persist the tracking record if GroupMe accepted it.
-  // If delivery failed, throw so the outer catch in executeActions surfaces the
-  // error and the batch stays unprocessed for the next heartbeat to retry.
-  const sendResult = await sendGroupMeMessage(msg);
-  if (!sendResult?.sent) {
-    throw new Error(`GroupMe delivery failed: ${sendResult?.reason || 'unknown'} — not persisting tracking record so batch ${batchId} can retry next heartbeat`);
+  // ──────────────────────────────────────────────────────────────────
+  // v1.5 — INSERT-FIRST DEDUP. Claim the batch BEFORE sending. If another
+  // worker has already claimed it, the unique constraint on short_ref
+  // fires a 23505 error and we silently skip. Closes the TOCTOU window
+  // that allowed concurrent processApprovalQueue runs (heartbeat +
+  // auto-execute trigger) to both fire a GroupMe card.
+  // ──────────────────────────────────────────────────────────────────
+
+  const { error: claimErr } = await supabase
+    .from('groupme_approval_requests')
+    .insert({
+      short_ref: shortRef,
+      batch_id: batchId,
+      action_ids: batchActions.map(a => a.id),
+      rule_applied: first.rule_applied,
+      target_id: first.target_id,
+      contact_name: contactName || null,
+      status: 'pending',
+      requested_at: new Date().toISOString(),
+    });
+
+  if (claimErr) {
+    if (claimErr.code === '23505') {
+      // Unique violation on short_ref — another worker has this batch.
+      // Silently skip; the other worker's GroupMe send is in flight or
+      // already complete.
+      console.log(`[GroupMe] Batch ${batchId} (#${shortRef}) already claimed by another worker — skipping duplicate send`);
+      return;
+    }
+    throw new Error(`Failed to claim approval batch ${batchId}: ${claimErr.message}`);
   }
 
-  // Store the mapping so we can match replies
-  await supabase.from('groupme_approval_requests').upsert({
-    short_ref: shortRef,
-    batch_id: batchId,
-    action_ids: batchActions.map(a => a.id),
-    rule_applied: first.rule_applied,
-    target_id: first.target_id,
-    contact_name: contactName || null,
-    status: 'pending',
-    requested_at: new Date().toISOString(),
-  }, { onConflict: 'short_ref' });
+  // Claimed — now send the GroupMe message.
+  const sendResult = await sendGroupMeMessage(msg);
+  if (!sendResult?.sent) {
+    // Send failed — release our claim so the next heartbeat can retry.
+    // Best-effort delete (don't throw on delete failure — the throw below
+    // is the signal the caller cares about).
+    await supabase
+      .from('groupme_approval_requests')
+      .delete()
+      .eq('short_ref', shortRef)
+      .catch(err => {
+        console.warn(`[GroupMe] Failed to release claim for ${shortRef} after send failure: ${err.message}`);
+      });
+    throw new Error(`GroupMe delivery failed: ${sendResult?.reason || 'unknown'} — claim released, batch ${batchId} can retry next heartbeat`);
+  }
 
   console.log(`[GroupMe] Approval request sent: #${shortRef} (${first.rule_applied}, ${batchActions.length} actions)`);
 }
