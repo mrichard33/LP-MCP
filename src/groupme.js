@@ -13,6 +13,29 @@
  *       "No 1234"           → reject
  *       "Edit 1234 <desc>"  → AI rewrites with the description as guidance
  *
+ * v1.6.1 — TRIGGER RECOVERY BUGFIX (2026-04-29).
+ *   Fixes two bugs in v1.6's resolveTriggerMessage that broke the Edit X
+ *   command in nearly every real-world case:
+ *     1. Queried the `event_data` column, which doesn't exist — the
+ *        actual column on system_events is `payload` (jsonb). Every
+ *        invocation hit a SQL error and returned null.
+ *     2. Even after the column-name fix, the action's event_id usually
+ *        points at an `ai.analysis_completed` event whose payload only
+ *        carries a 200-char truncated `message_preview` — not the full
+ *        inbound. The full `message_text` lives on the upstream
+ *        `ghl.reply_received` event fired moments earlier.
+ *   Replaced with recoverTriggerMessage(eventId, contactIdHint), which:
+ *     - reads from `payload` (correct column)
+ *     - returns the event's own payload.message_text if present (direct
+ *       reply_received case)
+ *     - otherwise traces back to the most recent ghl.reply_received for
+ *       the same ghl_contact_id at-or-before the action's event timestamp
+ *       and returns its full message_text
+ *     - falls back to payload.message_preview only as a last resort
+ *     - returns { text, source } so the log line can record which path
+ *       was taken
+ *   Edit X is now actually usable.
+ *
  * v1.6 — EDIT X COMMAND + IN-CONTEXT LEARNING LOOP (2026-04-29).
  *   New third option on every approval card: `Edit <ref> <description>`.
  *   When fired:
@@ -247,27 +270,70 @@ export async function sendApprovalRequest(batchActions, contactName, contactPhon
 // ═══════════════════════════════════════════════════════════════════
 
 /**
- * Resolve the original inbound message that triggered this approval batch.
- * Looks at system_events.event_data first; falls back to null.
+ * v1.6.1 — Recover the inbound text the bot was responding to.
+ *
+ * The agent_action's event_id usually points at an `ai.analysis_completed`
+ * event whose payload only has a 200-char `message_preview`. The canonical
+ * full text lives on the upstream `ghl.reply_received` event for the same
+ * contact, fired moments before. We try the action's event first (works
+ * for direct reply_received-triggered actions), then fall back to the
+ * most-recent ghl.reply_received for that contact at-or-before the
+ * action's event timestamp.
+ *
+ * Returns { text, source } or null if nothing recoverable. The `source`
+ * tag indicates which path produced the text:
+ *   - `event_<id>_direct`            — event itself was a reply_received
+ *   - `event_<id>_traceback`         — found via ghl.reply_received lookup
+ *   - `event_<id>_preview_fallback`  — last resort, truncated preview
  */
-async function resolveTriggerMessage(eventId) {
+async function recoverTriggerMessage(eventId, contactIdHint) {
   if (!eventId) return null;
-  try {
-    const { data, error } = await supabase
-      .from('system_events')
-      .select('event_data')
-      .eq('id', eventId)
-      .maybeSingle();
-    if (error) {
-      console.warn(`[GroupMe] resolveTriggerMessage: system_events lookup error: ${error.message}`);
-      return null;
-    }
-    const ed = data?.event_data || {};
-    return ed.message_text || ed.messageText || ed.text || ed.body || null;
-  } catch (err) {
-    console.warn(`[GroupMe] resolveTriggerMessage threw: ${err.message}`);
+
+  const { data: ev, error: evErr } = await supabase
+    .from('system_events')
+    .select('id, event_type, payload, ghl_contact_id, created_at')
+    .eq('id', eventId)
+    .maybeSingle();
+
+  if (evErr || !ev) {
+    console.warn(`[GroupMe] recoverTriggerMessage: lookup of event ${eventId} failed: ${evErr?.message || 'not found'}`);
     return null;
   }
+
+  // Direct hit: the event itself is a reply_received with full text
+  if (ev.payload?.message_text) {
+    return { text: ev.payload.message_text, source: `event_${ev.id}_direct` };
+  }
+
+  // Traceback: search for the most recent reply_received for the same
+  // contact at-or-before this event's timestamp
+  const cid = contactIdHint || ev.ghl_contact_id;
+  if (cid) {
+    const { data: replies, error: repErr } = await supabase
+      .from('system_events')
+      .select('id, payload, created_at')
+      .eq('ghl_contact_id', cid)
+      .eq('event_type', 'ghl.reply_received')
+      .lte('created_at', ev.created_at)
+      .order('id', { ascending: false })
+      .limit(1);
+
+    if (repErr) {
+      console.warn(`[GroupMe] recoverTriggerMessage: reply_received lookup failed: ${repErr.message}`);
+    }
+
+    const reply = replies?.[0];
+    if (reply?.payload?.message_text) {
+      return { text: reply.payload.message_text, source: `event_${reply.id}_traceback` };
+    }
+  }
+
+  // Last-resort: truncated preview from the analysis event
+  if (ev.payload?.message_preview) {
+    return { text: ev.payload.message_preview, source: `event_${ev.id}_preview_fallback` };
+  }
+
+  return null;
 }
 
 /**
@@ -390,12 +456,14 @@ async function editApprovalRequest(shortRef, editInstruction, senderName) {
     return { handled: true, action: 'no_message' };
   }
 
-  // 3. Resolve the original trigger message
-  const triggerMessage = await resolveTriggerMessage(sendMsgAction.event_id);
-  if (!triggerMessage) {
+  // 3. Resolve the original trigger message (v1.6.1: traceback to
+  //    ghl.reply_received for full text, not the truncated 200-char preview)
+  const recovered = await recoverTriggerMessage(sendMsgAction.event_id, contactId);
+  if (!recovered?.text) {
     await sendGroupMeMessage(`❌ Couldn't find the original inbound message for #${shortRef} (event_id ${sendMsgAction.event_id}). Reject and ask the lead to message again, or send manually.`);
     return { handled: true, action: 'no_trigger_message' };
   }
+  const triggerMessage = recovered.text;
 
   // 4. Regenerate via response-generator v2.7.4 with edit context
   let regenerated;
@@ -489,7 +557,7 @@ async function editApprovalRequest(shortRef, editInstruction, senderName) {
     return { handled: true, action: 'recard_failed', error: err.message };
   }
 
-  console.log(`[GroupMe] ✏️ Edit applied for #${shortRef} by ${senderName}: action=${sendMsgAction.id}, intent=${regenerated.intent_class}, ${regenerated.message.length} chars, edits_in_prompt=${regenerated.edits_used_in_prompt || 0}`);
+  console.log(`[GroupMe] ✏️ Edit applied for #${shortRef} by ${senderName}: action=${sendMsgAction.id}, intent=${regenerated.intent_class}, trigger_source=${recovered.source}, ${regenerated.message.length} chars, edits_in_prompt=${regenerated.edits_used_in_prompt || 0}`);
   return {
     handled: true,
     action: 'edited',
