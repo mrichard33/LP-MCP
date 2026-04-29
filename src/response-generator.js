@@ -3,13 +3,20 @@
  *
  * Agentic Responder intelligence core.
  *
+ * v2.5.1 — 2026-04-28. Hotfix: removed unescaped backticks from
+ *   SYSTEM_PROMPT examples (lines 185-186). v2.5 emitted `?` inside the
+ *   template literal, terminating the string early and causing a
+ *   SyntaxError on module load (Node parsed garbage until the closing
+ *   `; on line 323). Railway deploy at 23:27Z failed; live container
+ *   kept running v2.4. Replaced `?` with '?' (semantic-equivalent text).
+ *
  * v2.5 — 2026-04-28. BARE MERGE TAG + ASK-VS-LINK MUTUAL EXCLUSION.
  *   Two prompt-side tightenings paired with kb-retriever v1.6:
  *
- *   1. Booking URL is now the BARE merge tag `{{trigger_link.<ID>}}` —
+ *   1. Booking URL is now the BARE merge tag {{trigger_link.<ID>}} —
  *      kb-retriever no longer appends &utm_term suffixes. (v1.5 form
  *      produced malformed URLs because the rendered short URL has no
- *      query string — `&utm_term=mv` glued on yielded a 404.)
+ *      query string — '&utm_term=mv' glued on yielded a 404.)
  *      System prompt examples updated accordingly.
  *
  *   2. New hard rule: if the bot includes a booking link, it does NOT
@@ -54,7 +61,7 @@ function urlHostAllowed(url) {
   }
 }
 
-// v2.5: Merge tag form `{{trigger_link.<ID>}}`. Pass 0 of the sanitizer
+// v2.5: Merge tag form {{trigger_link.<ID>}}. Pass 0 of the sanitizer
 // strips any hallucinated UTM suffix before subsequent passes run, so by
 // the time MERGE_TAG_RX is evaluated for dedup, suffixes are gone. Kept
 // flexible (optional &param=value chain) for defense-in-depth.
@@ -62,7 +69,7 @@ const MERGE_TAG_RX = /\{\{trigger_link\.[A-Za-z0-9_-]+\}\}(?:&[A-Za-z_][A-Za-z0-
 const BARE_MERGE_TAG_RX = /\{\{trigger_link\.[A-Za-z0-9_-]+\}\}/;
 
 // ═══════════════════════════════════════════════════════════════════
-// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.5
+// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.5.1
 // ═══════════════════════════════════════════════════════════════════
 
 const SYSTEM_PROMPT = `You are the Agentic Responder for Reece Windows & Doors, a hurricane impact window and door company founded in North Carolina in 1972, with Florida operations since 2005, serving South Florida homeowners. Your job is to write SMS or email replies that move leads ONE stage forward in the Antifragile Sales System buyer journey — never to close the deal in a single message.
@@ -182,8 +189,8 @@ WRONG examples (NEVER produce these):
   ❌ "[Schedule here]({{trigger_link.QqvhMNyB7YQzHqSNOXHm}})"           — markdown wrapping is forbidden
   ❌ "https://reecewindows.com/calendar"                                 — invented URL
   ❌ "https://link.reecewindows.com/widget/booking/abc"                  — typing the resolved URL instead of merge tag
-  ❌ "{{trigger_link.QqvhMNyB7YQzHqSNOXHm}}&utm_term=mv"                — appending UTMs (breaks the rendered URL — short URL has no `?`)
-  ❌ "{{trigger_link.QqvhMNyB7YQzHqSNOXHm}}?utm_term=mv"                — appending UTMs is forbidden, even with `?`
+  ❌ "{{trigger_link.QqvhMNyB7YQzHqSNOXHm}}&utm_term=mv"                — appending UTMs (breaks the rendered URL — short URL has no '?')
+  ❌ "{{trigger_link.QqvhMNyB7YQzHqSNOXHm}}?utm_term=mv"                — appending UTMs is forbidden, even with '?'
   ❌ "Morning or afternoon? {{trigger_link.QqvhMNyB7YQzHqSNOXHm}}"      — asking AND linking (calendar already handles time selection)
   ❌ "Saturday works — what time? {{trigger_link.SPQHJKSLbwhJ1bhg2dIy}}" — same: pick ask OR link, never both
   ❌ "Visit our calendar (link below)"                                   — vague, no merge tag
@@ -601,7 +608,7 @@ function validateResponse(parsed, channel) {
 // ═══════════════════════════════════════════════════════════════════
 //
 // The booking link from kb-retriever v1.6 is a bare GHL trigger link
-// merge tag (e.g. `{{trigger_link.QqvhMNyB7YQzHqSNOXHm}}`). Merge tags
+// merge tag (e.g. {{trigger_link.QqvhMNyB7YQzHqSNOXHm}}). Merge tags
 // don't have http://, so URL_RX won't match them — they pass through
 // unchanged. But we still need to handle:
 //
@@ -613,7 +620,7 @@ function validateResponse(parsed, channel) {
 //      (legacy of v1.5 behavior — v1.6 never produces these, but the
 //      model may still try based on pre-v2.5 prompt patterns)
 
-const URL_RX = /https?:\/\/[^\s<>"'`)\]]+/g;
+const URL_RX = /https?:\/\/[^\s<>"')\]]+/g;
 const MARKDOWN_LINK_RX = /\[([^\]]*)\]\(\s*([^)]+?)\s*\)/g;
 
 function sanitizeMessageUrls(message, channel, kbPack) {
@@ -626,9 +633,9 @@ function sanitizeMessageUrls(message, channel, kbPack) {
 
   // ─── Pass 0 (v2.5): Strip any UTM chain hallucinated after a merge tag ─
   // v1.6 kb-retriever returns a bare {{trigger_link.<ID>}} — but the model
-  // may still emit `{{trigger_link.X}}&utm_term=mv` based on stale habits
+  // may still emit {{trigger_link.X}}&utm_term=mv based on stale habits
   // from v1.5/v2.4-era prompts. Strip those suffixes so the rendered URL
-  // is valid (the GHL short URL has no `?` query string, so `&utm_*=`
+  // is valid (the GHL short URL has no '?' query string, so &utm_*=
   // tacked on produces a 404).
   out = out.replace(
     /(\{\{trigger_link\.[A-Za-z0-9_-]+\}\})(?:[?&][A-Za-z_][A-Za-z0-9_]*=[^\s&?]*)+/g,
