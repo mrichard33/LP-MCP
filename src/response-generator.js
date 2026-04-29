@@ -3,6 +3,48 @@
  *
  * Agentic Responder intelligence core.
  *
+ * v2.7.6 — 2026-04-29. AUTO-BOOK ON HARD CONFIRMATION OF HELD TIME.
+ *   The fallout from action 28253 (Mark Test, S6RT0YLGM9rb3SSGZWth):
+ *   v2.7.5 correctly classified "Hey Saturday works for us" as a HARD
+ *   CONFIRMATION of the previously-held Saturday 2 PM proposal — but
+ *   the prompt told it to send the booking link. That's friction we
+ *   shouldn't impose: we already know the time, the calendar, the
+ *   contact, and (via the soft-confirm/spousal-clearance pattern) we
+ *   know both decision-makers are aligned. The right move is to BOOK
+ *   the appointment via GHL Calendar API and send a verbal confirm.
+ *
+ *   Three coordinated changes:
+ *
+ *   1. NEW SYSTEM_PROMPT section: "AUTO-BOOK ON HARD CONFIRMATION OF
+ *      HELD TIME" (placed after CLOSING ACKNOWLEDGMENTS). Defines the
+ *      pattern (bot proposed specific times → lead picked one →
+ *      possibly a spouse/work caveat resolved → lead now confirming)
+ *      and the response shape: verbal confirmation + companion_action
+ *      to book directly.
+ *
+ *   2. NEW JSON output field: `companion_action`. Optional. When the
+ *      model detects an extractable held time AND the BOOKING CONTEXT
+ *      provides a calendar_name, the model emits a companion_action
+ *      of type book_appointment with the extracted ISO start_time and
+ *      calendar_name. The approval-path bridge converts this into a
+ *      sibling agent_action in the same batch.
+ *
+ *   3. The HARD CONFIRMATION subsection of CLOSING ACKNOWLEDGMENTS is
+ *      rewritten: previously sent the booking link; now (a) tries to
+ *      extract held time and emit companion_action, (b) falls back to
+ *      booking link only when extraction fails (no calendar context,
+ *      ambiguous proposal, etc).
+ *
+ *   The user prompt now also surfaces the active-entry tag explicitly
+ *   so the model has full context for calendar selection. validateResponse
+ *   passes companion_action through unchanged for the bridge to consume.
+ *
+ *   Pairs with src/actions/approval-path.js v4.6: when generateResponse
+ *   returns a companion_action, the approval pipeline inserts a sibling
+ *   agent_action of the requested type into the same batch_id, so the
+ *   GroupMe approval card shows both the verbal confirm AND the auto-book
+ *   for human review in a single approval event.
+ *
  * v2.7.5 — 2026-04-29. CLOSING ACKNOWLEDGMENTS — KNOW WHEN TO STOP.
  *   Adds explicit handling for conversational endpoints to SYSTEM_PROMPT.
  *   Surfaces a fix for action 28217 (S6RT0YLGM9rb3SSGZWth, Mark Test):
@@ -100,7 +142,7 @@ const MERGE_TAG_RX = /\{\{trigger_link\.[A-Za-z0-9_-]+\}\}(?:&[A-Za-z_][A-Za-z0-
 const BARE_MERGE_TAG_RX = /\{\{trigger_link\.[A-Za-z0-9_-]+\}\}/;
 
 // ═══════════════════════════════════════════════════════════════════
-// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.7.5
+// SYSTEM PROMPT — Antifragile Sales System Response Generation v2.7.6
 // ═══════════════════════════════════════════════════════════════════
 
 const SYSTEM_PROMPT = `You are the Agentic Responder for Reece Windows & Doors, a hurricane impact window and door company founded in North Carolina in 1972, with Florida operations since 2005, serving South Florida homeowners. Your job is to write SMS or email replies that move leads ONE stage forward in the Antifragile Sales System buyer journey — never to close the deal in a single message.
@@ -377,11 +419,13 @@ The lead is buying time, not pushing back:
   "I'll circle back tomorrow"
 
 ▼ HARD CONFIRMATION (after a proposal)
-Clean YES with no caveat:
+Clean YES with no caveat — the lead has accepted a held time outright:
   "Yes Saturday 2 PM works"
   "Tuesday at 11 is good"
   "Let's do that"
-  → Send the booking link as a lock-it-in widget, then STOP.
+  "Hey Saturday works for us" (the "us" indicates spousal sign-off — also HARD CONFIRMATION)
+  → DEFAULT: emit companion_action to book directly + verbal confirmation. See AUTO-BOOK ON HARD CONFIRMATION section below.
+  → FALLBACK: only if held time cannot be extracted from the conversation OR no calendar context is available, send the booking link.
 
 ═══════ RESPONSE SHAPE FOR A CLOSING ACKNOWLEDGMENT ═══════
 - 1-2 short sentences max — under 160 chars ideal
@@ -408,7 +452,10 @@ LEAD: "Let me check my schedule and get back to you"
 BOT:  "No rush. Just let me know what works once you've had a chance to look."
 
 LEAD: "Yes Saturday 2 PM works"
-BOT:  "Perfect — confirm here so we hold the slot: {{trigger_link.X}}"
+BOT:  "Perfect — Saturday at 2 PM is locked in. We'll send a confirmation reminder closer to the date. See you then." (with companion_action: book_appointment)
+
+LEAD: "Hey Saturday works for us" (after prior "I'll check with my wife" → soft-confirm of Saturday 2 PM)
+BOT:  "Perfect — Saturday at 2 PM is locked in for you and Paloma. We'll send a confirmation reminder closer to the date. See you then." (with companion_action: book_appointment)
 
 ═══════ ANTI-PATTERNS — NEVER ON CLOSING ACKNOWLEDGMENTS ═══════
 ❌ "or would [different day/time] be better?" after a soft-confirm
@@ -421,6 +468,112 @@ BOT:  "Perfect — confirm here so we hold the slot: {{trigger_link.X}}"
 ❌ Restating appointment details they already know — they just told you they have them
 
 The 2-slot ASK-FIRST rule does NOT apply to closing acknowledgments. Closing acknowledgments OVERRIDE the 2-slot default. Be brief, validate, hold, stop.
+
+═══════ AUTO-BOOK ON HARD CONFIRMATION OF HELD TIME (v2.7.6) ═══════
+When a lead HARD-CONFIRMS a previously-proposed time, the right move is NOT to send a self-serve booking link. We already have everything we need: the time (in conversation history), the calendar (in BOOKING CONTEXT), the contact, and explicit confirmation. Sending a link would force the lead to navigate a calendar widget to re-pick a time we already agreed on — that's friction that loses warm deals. A great human salesperson would just say "Great, I've got you down for Saturday at 2 PM, see you then" and put it on their calendar. The bot should do the same.
+
+WHEN THIS APPLIES — ALL of the following must be true:
+1. RECENT BOT MESSAGE proposed at least one specific time slot (with date AND time, e.g. "Saturday 10 AM or 2 PM", "Tuesday May 4 at 11 AM"). The proposal can be 1–2 turns back, not necessarily the immediately-prior message — the lead may have soft-confirmed first, gone away to check with spouse/work, then returned with a hard confirmation.
+2. LEAD'S CURRENT REPLY is a HARD CONFIRMATION (clean yes, "works for us", "let's do that", "yes that day at that time works") of one of the previously-proposed times — NOT proposing a new time, NOT raising a new caveat.
+3. BOOKING CONTEXT is provided in the user prompt with a calendar_name (e.g. "Window Estimate", "Measurement Verification", "Confirmation Call").
+4. The HELD TIME can be extracted unambiguously from the conversation. If the bot proposed multiple slots and the lead accepted one explicitly OR the lead's reply maps to only one of the proposed slots OR there was an interim soft-confirm of one specific slot, you can extract it.
+
+WHEN UNSURE → DON'T AUTO-BOOK. Fall back to sending the booking link as a self-serve widget. Better to give the lead a calendar than to book the wrong time.
+
+═══════ HOW TO EXTRACT THE HELD TIME ═══════
+Look at the conversation history (most recent last). Find the most recent BOT proposal that contained specific date+time slots. Then trace forward through the lead's replies:
+- If the lead picked one explicitly ("2 works", "the 2 PM one", "Saturday at 2") → that's the held time.
+- If the lead soft-confirmed with a caveat and then later returned with a hard confirm without proposing a new time → the held time is the one from the soft-confirm.
+- If the lead's hard-confirm names a day that uniquely maps to one proposed slot ("Saturday works" when only one Saturday slot was proposed) → that's the held time.
+
+Convert to ISO 8601 with the Florida / America/New_York timezone offset. The TODAY IS line at the top of the user prompt gives you the current date — use it to resolve relative dates ("Saturday" = the next Saturday on or after today). Standard offsets:
+- EDT (March 2nd Sunday → November 1st Sunday): -04:00
+- EST (rest of the year): -05:00
+- Florida is in EDT during the warmer months — match the offset to TODAY IS.
+
+═══════ RESPONSE SHAPE FOR AUTO-BOOK ═══════
+Verbal confirmation message (no link, no further question, no HSO):
+- Acknowledge the confirmation warmly ("Perfect", "Got it", "Great")
+- Restate the held time and date in human terms ("Saturday at 2 PM")
+- If multiple parties involved (e.g. "and Paloma"), include both
+- Mention that a confirmation reminder is coming closer to the date
+- End with a natural sign-off ("See you then", "Talk soon")
+- Under 200 chars ideal
+
+Companion action: emit a top-level companion_action field in your JSON output:
+{
+  "action_type": "book_appointment",
+  "action_payload": {
+    "calendar_name": "<exact calendar_name from BOOKING CONTEXT>",
+    "start_time": "<ISO 8601 with FL/EDT offset, e.g. 2026-05-02T14:00:00-04:00>",
+    "duration_minutes": 90,
+    "title": "<calendar_name> - <lead's name>",
+    "status": "confirmed"
+  },
+  "reasoning": "<1 sentence explaining the extraction: which prior bot message proposed the time, which inbound confirmed it, what calendar maps from the booking context>"
+}
+
+The duration_minutes default is 90 unless BOOKING CONTEXT specifies otherwise. The title should include the calendar name + the lead's name. Do not include any other fields in action_payload.
+
+═══════ EXAMPLES — AUTO-BOOK ═══════
+EXAMPLE 1 (the action 28253 case):
+  Conversation history:
+    [outbound, 03:52] "Saturday works - 10 AM or 2 PM, which is better for you?"
+    [inbound,  03:53] "I think 2 works but I will need to check with my wife Paloma."
+    [outbound, 04:15] "Got it — Saturday at 2 PM is held. Talk to Paloma..." (closing-ack)
+    [inbound,  12:16] "Hey Saturday works for us"  ← THIS IS THE TRIGGER
+  TODAY IS: Wednesday, April 29, 2026
+  Active entry: canvassing
+  BOOKING CONTEXT calendar_name: Window Estimate
+  → Lead is hard-confirming Saturday 2 PM (held since soft-confirm at 03:53, validated by spousal sign-off "for us")
+  → Saturday on or after 2026-04-29 = Saturday 2026-05-02
+  → ISO start_time: 2026-05-02T14:00:00-04:00
+  →
+  {
+    "message": "Perfect — Saturday at 2 PM is locked in for you and Paloma. We'll send a confirmation reminder closer to the date. See you then.",
+    "companion_action": {
+      "action_type": "book_appointment",
+      "action_payload": {
+        "calendar_name": "Window Estimate",
+        "start_time": "2026-05-02T14:00:00-04:00",
+        "duration_minutes": 90,
+        "title": "Window Estimate - Mark Test",
+        "status": "confirmed"
+      },
+      "reasoning": "Bot proposed Saturday 10 AM or 2 PM at 03:52. Lead soft-confirmed 2 PM with spouse-check at 03:53. Lead hard-confirmed at 12:16 with 'works for us' (spousal sign-off implied). Window Estimate calendar from BOOKING CONTEXT."
+    }
+  }
+
+EXAMPLE 2 (clean immediate confirm):
+  Conversation history:
+    [outbound, today] "Tuesday May 5 at 11 AM, or Wednesday May 6 at 9 AM — which works for you?"
+    [inbound, today]  "Tuesday at 11 works"  ← TRIGGER
+  → Held time: Tuesday May 5 2026 at 11:00 AM EDT = 2026-05-05T11:00:00-04:00
+  →
+  {
+    "message": "Perfect — Tuesday May 5 at 11 AM is locked in. We'll send a confirmation reminder closer to the date. See you then.",
+    "companion_action": { "action_type": "book_appointment", "action_payload": {"calendar_name": "Window Estimate", "start_time": "2026-05-05T11:00:00-04:00", "duration_minutes": 90, "title": "Window Estimate - Sarah Jones", "status": "confirmed"}, "reasoning": "..." }
+  }
+
+EXAMPLE 3 (extraction fails → fallback to link):
+  Conversation history:
+    [outbound, today] "We have some openings this week. Want me to send a link to pick a time?"
+    [inbound,  today] "Yes please"  ← TRIGGER
+  → No specific time was ever proposed. "Yes please" is a CTA-affirmative for the link, not a confirmation of a held time.
+  → DO NOT emit companion_action. Send the booking link instead.
+
+═══════ AUTO-BOOK ANTI-PATTERNS (NEVER) ═══════
+❌ Emitting companion_action when no specific time was ever proposed (e.g. lead is responding to an open "want a link?" CTA)
+❌ Inventing a held time the bot didn't propose
+❌ Auto-booking when the lead is proposing a NEW time that wasn't on offer ("Actually can we do Sunday instead?")
+❌ Auto-booking when the inbound is a re-proposal or counter ("Saturday's full, what about Friday?")
+❌ Including the booking link in the message AND emitting companion_action — pick one path
+❌ Setting status to anything other than "confirmed"
+❌ Using a calendar_name that isn't from the BOOKING CONTEXT (don't guess calendars)
+❌ Past dates — if the extracted Saturday is BEFORE today's date in the user prompt, you've miscounted; recompute
+❌ EDT/EST mismatch — if today is in summer, use -04:00; in winter, -05:00
+
+When in doubt, fall back to the link. A link send is recoverable. A wrong-day booking damages trust.
 
 ═══════ HARD PROHIBITIONS ═══════
 - Never quote prices or estimates
@@ -466,7 +619,18 @@ Return ONLY a valid JSON object. Your ENTIRE response must be the raw JSON. No m
   },
   "voice_used": "we|randy",
   "frameworks_applied": ["antifragile","expert_secrets","traffic_secrets","dotcom_secrets"],
-  "reasoning": "1 sentence explaining your strategy"
+  "reasoning": "1 sentence explaining your strategy",
+  "companion_action": null | {
+    "action_type": "book_appointment",
+    "action_payload": {
+      "calendar_name": "<from BOOKING CONTEXT>",
+      "start_time": "<ISO 8601 with FL timezone offset>",
+      "duration_minutes": 90,
+      "title": "<calendar_name> - <lead name>",
+      "status": "confirmed"
+    },
+    "reasoning": "<extraction trace: which proposal, which confirmation, which calendar>"
+  }
 }`;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -572,7 +736,7 @@ async function getRecentEdits(intentClass, limit = RECENT_EDITS_LIMIT) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// PROMPT BUILDER (v2.7.5 — closing-ack guidance in tail instruction)
+// PROMPT BUILDER (v2.7.6 — adds active-entry visibility + companion_action passthrough)
 // ═══════════════════════════════════════════════════════════════════
 
 function buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack, trafficTemp, availability, opts = {}) {
@@ -614,6 +778,14 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   if (context.lead.current_stage_tag) parts.push(`Stage Tag: ${context.lead.current_stage_tag}`);
   if (context.lead.current_buyer_tag) parts.push(`Buyer Tag: ${context.lead.current_buyer_tag}`);
   if (context.lead.current_bj_tag) parts.push(`Buyer Journey: ${context.lead.current_bj_tag}`);
+
+  // v2.7.6: surface active-entry tag explicitly. The model needs this for
+  // calendar selection when emitting companion_action on auto-book paths,
+  // and it provides useful context for routing in general (e.g.
+  // active-entry:canvassing → Window Estimate calendar).
+  const activeEntryTag = extractActiveEntryTag(context);
+  if (activeEntryTag) parts.push(`Active Entry: ${activeEntryTag}`);
+
   if (context.lead.objection_tags?.length) {
     parts.push(`Known Objections: ${context.lead.objection_tags.join(', ')}`);
   }
@@ -713,6 +885,7 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
       parts.push(`GHL renders the tag at delivery to a per-recipient short URL with click tracking. UTMs are configured statically on the trigger link in GHL — DO NOT append &utm_*= or ?utm_*= to the merge tag.`);
       parts.push(`Per ASK-FIRST PROTOCOL: include this link ONLY when (a) the lead has confirmed a proposed time and you are sending the lock-it-in message, (b) the lead asked for the link, (c) the lead rejected proposed times and asked for alternatives via self-serve, or (d) CALENDAR AVAILABILITY is empty/missing. Otherwise: ASK with TWO proposed times, no link.`);
       parts.push(`v2.7.5 EXCEPTION: if the lead's reply is a CLOSING ACKNOWLEDGMENT (soft-confirm with caveat, pure ack, commitment to return), do NOT include the booking link. Acknowledge + hold + stop.`);
+      parts.push(`v2.7.6 EXCEPTION: if the lead's reply is a HARD CONFIRMATION of a previously-held time (and the held time is unambiguously extractable from conversation history), do NOT include the booking link. Instead, emit a companion_action of type book_appointment with calendar_name="${canonicalCalName || 'unknown'}" and the extracted ISO start_time. Send a verbal confirmation message only. The booking link is the FALLBACK when extraction fails.`);
     } else {
       parts.push(`If you include a booking link: paste this exact string. No markdown. No modifications. No invented domains.`);
     }
@@ -740,7 +913,7 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   parts.push(`\nTHE INBOUND MESSAGE TO RESPOND TO:`);
   parts.push(`"${triggerMessage}"`);
 
-  parts.push(`\nGenerate the ${channel} response. Follow this priority order: (1) If the lead's reply is a CLOSING ACKNOWLEDGMENT (soft-confirm with non-blocking caveat, pure ack, commitment to return), produce a brief acknowledgment + EXPLICIT HOLD + STOP per the CLOSING ACKNOWLEDGMENTS section — no re-proposal of times, no booking link, no new ask, no HSO. (2) If HUMAN CORRECTION block is present, apply that correction (it overrides defaults). (3) Otherwise, apply BOOKING — ASK-FIRST PROTOCOL: propose TWO real specific-time slots from CALENDAR AVAILABILITY (with AM/PM, never day-only) and ask which one, OR fall back to link only when warranted. Apply HSO and move them ONE stage forward. If RECENT EDITORIAL FEEDBACK is present, apply the lessons. Return ONLY the JSON object — first character must be {, last must be }, no preamble.`);
+  parts.push(`\nGenerate the ${channel} response. Follow this priority order: (1) If the lead's reply is a HARD CONFIRMATION of a previously-held time AND BOOKING CONTEXT provides a calendar_name AND the held time is unambiguously extractable from conversation history → produce a verbal confirmation message (no link, no question, no HSO) AND emit companion_action of type book_appointment per the AUTO-BOOK ON HARD CONFIRMATION section. (2) If the lead's reply is a CLOSING ACKNOWLEDGMENT (soft-confirm with non-blocking caveat, pure ack, commitment to return), produce a brief acknowledgment + EXPLICIT HOLD + STOP per the CLOSING ACKNOWLEDGMENTS section — no re-proposal of times, no booking link, no new ask, no HSO, no companion_action. (3) If HUMAN CORRECTION block is present, apply that correction (it overrides defaults). (4) Otherwise, apply BOOKING — ASK-FIRST PROTOCOL: propose TWO real specific-time slots from CALENDAR AVAILABILITY (with AM/PM, never day-only) and ask which one, OR fall back to link only when warranted. Apply HSO and move them ONE stage forward. If RECENT EDITORIAL FEEDBACK is present, apply the lessons. Return ONLY the JSON object — first character must be {, last must be }, no preamble. Include companion_action only when criteria (1) all match; otherwise omit the field or set it to null.`);
 
   return parts.join('\n');
 }
@@ -855,6 +1028,52 @@ function validateResponse(parsed, channel) {
     ? parsed.frameworks_applied.filter(f => typeof f === 'string').slice(0, 4)
     : [];
 
+  // v2.7.6: validate companion_action shape. Only book_appointment is
+  // currently supported. Anything else is dropped silently with a warn.
+  // Required payload fields: calendar_name (string), start_time (ISO string).
+  // Optional: duration_minutes (number, default 90), title (string),
+  // status (string, default "confirmed").
+  let companionAction = null;
+  if (parsed.companion_action && typeof parsed.companion_action === 'object') {
+    const ca = parsed.companion_action;
+    const supportedTypes = ['book_appointment'];
+    if (!supportedTypes.includes(ca.action_type)) {
+      console.warn(`[ResponseGenerator] Dropping unsupported companion_action.action_type="${ca.action_type}"`);
+    } else if (!ca.action_payload || typeof ca.action_payload !== 'object') {
+      console.warn(`[ResponseGenerator] Dropping companion_action: missing/invalid action_payload`);
+    } else {
+      const cap = ca.action_payload;
+      const calendarName = typeof cap.calendar_name === 'string' ? cap.calendar_name.trim() : '';
+      const startTime = typeof cap.start_time === 'string' ? cap.start_time.trim() : '';
+      const isoLike = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(startTime);
+      if (!calendarName || !startTime || !isoLike) {
+        console.warn(`[ResponseGenerator] Dropping companion_action: invalid calendar_name or start_time (got cal="${calendarName}", start="${startTime}")`);
+      } else {
+        // Past-date guard: reject if start_time is before now.
+        const startMs = Date.parse(startTime);
+        if (Number.isNaN(startMs)) {
+          console.warn(`[ResponseGenerator] Dropping companion_action: unparseable start_time "${startTime}"`);
+        } else if (startMs < Date.now()) {
+          console.warn(`[ResponseGenerator] Dropping companion_action: start_time "${startTime}" is in the past`);
+        } else {
+          companionAction = {
+            action_type: 'book_appointment',
+            action_payload: {
+              calendar_name: calendarName,
+              start_time: startTime,
+              duration_minutes: typeof cap.duration_minutes === 'number' && cap.duration_minutes > 0
+                ? cap.duration_minutes
+                : 90,
+              title: typeof cap.title === 'string' ? cap.title.slice(0, 200) : `${calendarName} Appointment`,
+              status: typeof cap.status === 'string' ? cap.status : 'confirmed',
+            },
+            reasoning: typeof ca.reasoning === 'string' ? ca.reasoning.slice(0, 500) : null,
+          };
+        }
+      }
+    }
+  }
+
   return {
     message: parsed.message.trim(),
     channel,
@@ -865,6 +1084,7 @@ function validateResponse(parsed, channel) {
     voice_used: voice,
     frameworks_applied: frameworksApplied,
     reasoning: String(parsed.reasoning || '').slice(0, 500),
+    companion_action: companionAction,
   };
 }
 
@@ -1099,6 +1319,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     `model=${MODEL} ` +
     `edits_in_prompt=${recentEdits.length} ` +
     `is_regenerate=${!!opts.editInstruction} ` +
+    `companion=${validated.companion_action ? validated.companion_action.action_type : 'none'} ` +
     `frameworks=${(validated.frameworks_applied || []).join('+') || 'none'} ` +
     `(${validated.message.length} chars)`);
 

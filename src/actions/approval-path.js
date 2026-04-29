@@ -5,6 +5,44 @@
  * trigger-message resolution, or head-of-line behavior stays a small,
  * focused edit. Extracted from action-executor.js v4.2 refactor.
  *
+ * v4.6 (2026-04-29) — COMPANION_ACTION INSERTION (auto-book on hard confirm).
+ *   Pairs with response-generator.js v2.7.6 which can now emit a top-level
+ *   companion_action field (currently only book_appointment). When the
+ *   pre-generation result includes companion_action, this approval-path
+ *   inserts a sibling agent_action into the same batch_id BEFORE sending
+ *   the GroupMe approval card. The card therefore shows BOTH the verbal
+ *   confirmation send_message AND the auto-book — Mark approves once,
+ *   both fire together.
+ *
+ *   Insertion shape:
+ *     - event_id: same as the parent send_message action
+ *     - target_system: 'ghl' (book_appointment hits GHL Calendar API)
+ *     - target_entity: 'contact'
+ *     - target_id: same contact
+ *     - action_type: companion_action.action_type ('book_appointment')
+ *     - action_payload: companion_action.action_payload (validated by
+ *       response-generator.validateResponse — past dates, missing fields,
+ *       and bad calendar names are dropped before this code sees them)
+ *     - reasoning: companion_action.reasoning (extraction trace)
+ *     - confidence: 1.0
+ *     - rule_applied: same as parent (e.g. AGENTIC_RESPOND_POST_CHATBOT)
+ *     - status: 'pending_approval' (same gate as parent)
+ *     - requires_approval: true
+ *     - batch_id: same batch_id (so approval-card aggregation works)
+ *     - sequence_order: parent.sequence_order - 1 (so executor processes
+ *       the booking BEFORE the verbal confirmation message; that way if
+ *       the booking fails, we don't send a "locked in" message that
+ *       wasn't actually locked in)
+ *
+ *   The approval card aggregator already iterates the full batch's
+ *   actions, so adding this row before sendApprovalRequest is enough —
+ *   no card-format changes needed in groupme.js.
+ *
+ *   If the companion_action insert fails (DB error), we log a warning
+ *   and continue with the original verbal-confirm-only flow. Better to
+ *   have a verbal confirmation without an auto-book than to block the
+ *   whole batch.
+ *
  * v4.5 (2026-04-28) — APPLY HANDOFF INLINE ON SHORT-CIRCUIT.
  *   PROBLEM: Under v4.4 the pre-gen short-circuit branch left the action
  *   queued and shipped an approval card that had NO message preview line
@@ -331,6 +369,69 @@ export async function processApprovalQueue() {
             ? generated.message.slice(0, 80)
             : '(no message)';
           console.log(`[ActionExecutor] Pre-generated: "${preview}..." (arc: ${generated.story_arc || 'n/a'})`);
+
+          // ── v4.6: COMPANION_ACTION INSERTION ──────────────────────
+          // If response-generator emitted a companion_action (e.g.
+          // book_appointment for hard-confirmed held times), insert it
+          // as a sibling row in the same batch BEFORE the approval card
+          // is sent. The card aggregator iterates the batch and will
+          // automatically include this in the human review.
+          //
+          // The companion was already shape-validated by validateResponse
+          // (past-date guard, ISO format, calendar_name presence) — if
+          // it's truthy here, it's safe to persist.
+          if (generated.companion_action && generated.companion_action.action_type) {
+            const companion = generated.companion_action;
+            const parentSeq = typeof sendAction.sequence_order === 'number' ? sendAction.sequence_order : 0;
+            try {
+              const { data: companionRow, error: companionErr } = await supabase
+                .from('agent_actions')
+                .insert({
+                  event_id: sendAction.event_id,
+                  action_type: companion.action_type,
+                  target_system: 'ghl',
+                  target_entity: 'contact',
+                  target_id: sendAction.target_id,
+                  action_payload: companion.action_payload,
+                  reasoning: companion.reasoning
+                    ? `Companion to send_message ${sendAction.id}: ${companion.reasoning}`
+                    : `Companion to send_message ${sendAction.id} (${sendAction.rule_applied || 'manual'})`,
+                  confidence: 1.0,
+                  rule_applied: sendAction.rule_applied,
+                  status: 'pending_approval',
+                  requires_approval: true,
+                  batch_id: sendAction.batch_id,
+                  // sequence_order = parentSeq - 1 so the executor runs
+                  // book_appointment BEFORE send_message. If booking
+                  // fails, we don't want to send a "locked in" SMS.
+                  sequence_order: parentSeq - 1,
+                })
+                .select()
+                .single();
+
+              if (companionErr) {
+                console.warn(`[ActionExecutor] Companion insert failed for batch ${batchId}: ${companionErr.message} — proceeding without companion`);
+              } else if (companionRow) {
+                // Add to in-memory batch so the approval card sees it.
+                actions.push(companionRow);
+                // Sort by sequence_order so the card displays in execution order.
+                actions.sort((a, b) => (a.sequence_order ?? 0) - (b.sequence_order ?? 0));
+
+                console.log(`[ActionExecutor] ✅ Companion ${companion.action_type} inserted: id=${companionRow.id}, batch=${batchId}, seq=${companionRow.sequence_order}, payload.calendar_name="${companion.action_payload?.calendar_name || 'n/a'}", payload.start_time="${companion.action_payload?.start_time || 'n/a'}"`);
+
+                // Surface companion details in enrichment for the approval card.
+                enrichment.companionAction = {
+                  type: companion.action_type,
+                  calendar_name: companion.action_payload?.calendar_name || null,
+                  start_time: companion.action_payload?.start_time || null,
+                  duration_minutes: companion.action_payload?.duration_minutes || null,
+                  reasoning: companion.reasoning || null,
+                };
+              }
+            } catch (insertErr) {
+              console.warn(`[ActionExecutor] Companion insert threw for batch ${batchId}: ${insertErr.message} — proceeding without companion`);
+            }
+          }
         }
       } catch (err) {
         console.error(`[ActionExecutor] Pre-approval generation failed for ${batchId}: ${err.message}`);
