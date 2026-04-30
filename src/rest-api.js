@@ -5,20 +5,22 @@
  * API call nodes can fetch LP data without speaking MCP protocol.
  *
  * Routes:
- *   GET /api/prospects/:prospectId       — LP prospect by cst_id
- *   GET /api/leads/:leadId               — LP lead by lds_id
- *   GET /api/search?phone=...            — Search by phone (E.164 or digits)
- *   GET /api/search?ghlContactId=...     — Search by GHL contact ID
- *   GET /api/search?email=...            — Search by email
- *   GET /api/search?name=...             — Search by name (first or last)
- *   GET /api/lead-summary/:contactId     — Full lead intelligence summary
- *   GET /api/service-area/lookup?zip=... — Map zip → market + service phone (no auth)
- *   POST /api/service-area/lookup        — Same, with {"zip": "..."} JSON body (no auth)
- *   POST /webhook/ghl-event              — GHL→Agentic handoff (Webhook Bridge, no auth)
+ *   GET /api/prospects/:prospectId               — LP prospect by cst_id
+ *   GET /api/leads/:leadId                       — LP lead by lds_id
+ *   GET /api/search?phone=...                    — Search by phone (E.164 or digits)
+ *   GET /api/search?ghlContactId=...             — Search by GHL contact ID
+ *   GET /api/search?email=...                    — Search by email
+ *   GET /api/search?name=...                     — Search by name (first or last)
+ *   GET /api/lead-summary/:contactId             — Full lead intelligence summary
+ *   GET /api/service-area/lookup?zip=...         — Map zip → market + service phone (no auth)
+ *   POST /api/service-area/lookup                — Same, with {"zip": "..."} JSON body (no auth)
+ *   POST /api/agentic/dynamic-callback-message   — AI-generated SMS for HDL.2 (no auth)
+ *   POST /webhook/ghl-event                      — GHL→Agentic handoff (Webhook Bridge, no auth)
  */
 
 import supabase from './supabase.js';
 import crypto from 'crypto';
+import { registerCallbackMessageRoutes } from './agentic-callback-message.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // WEBHOOK SIGNATURE VERIFICATION (optional but recommended)
@@ -318,6 +320,16 @@ export function registerRestApiRoutes(app, authenticate) {
   app.get('/api/service-area/lookup', serviceAreaLookupHandler);
   app.post('/api/service-area/lookup', serviceAreaLookupHandler);
   console.log('[REST API] Registered: GET+POST /api/service-area/lookup (no-auth, HDL.2 routing)');
+
+  // ═══════════════════════════════════════════════════════════════
+  // POST /api/agentic/dynamic-callback-message — Dynamic SMS for HDL.2
+  // ═══════════════════════════════════════════════════════════════
+  // Generates a context-aware SMS handoff message via Claude. Replaces
+  // the two static SMS templates that lived in HDL.2 (within-hours and
+  // after-hours). Always returns 200 — falls back to a static template
+  // body if the AI path fails so the workflow keeps moving. See
+  // agentic-callback-message.js for the full contract and prompt.
+  registerCallbackMessageRoutes(app);
 
   // ─── GET /api/prospects/:prospectId ────────────────────────────
   // Returns all leads for an LP prospect (cst_id)
