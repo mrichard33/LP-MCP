@@ -5,6 +5,28 @@
  * via channel-specific routing — webhook for SMS, Conversations API
  * for email — with cross-fallback for both.
  *
+ * v3.4 (2026-04-30) — Trigger message fallback fix.
+ *   PROBLEM: When the rule that fires this handler is gated on
+ *   ai.analysis_completed (e.g. AGENTIC_RESPOND_POST_CHATBOT), the
+ *   action's event_id points to the analysis event, not the original
+ *   ghl.reply_received. The analysis payload only carried
+ *   message_preview, not message_text. The fallback chain
+ *     context.message_text || context.messageText || context.body
+ *       || 'No trigger message available'
+ *   resolved to the literal string "No trigger message available",
+ *   which the intent classifier matched on the whole-word "no"
+ *   keyword → CUSTOMER_STATUS_NEGATIVE → hdl:callback-sales handoff
+ *   → silent short-circuit. Surfaced 2026-04-30 with contact
+ *   4uaY9wDO6Zz8hjA1DjXd: clear booking intent classified as customer-
+ *   status-negative, no AI reply, no GroupMe approval.
+ *
+ *   FIX: (1) Extend the resolution chain to include message_preview
+ *   (paired with message-analyzer v1.5 which now emits full
+ *   message_text). (2) When NOTHING resolves, fail fast with a
+ *   structured result rather than feeding placeholder text to the
+ *   classifier. Better to drop the action and surface the missing-
+ *   context bug than to misclassify and silently misroute.
+ *
  * v3.3 — CHANNEL-SPECIFIC ROUTING (email threading discovery)
  *   Mark surfaced that the GHL workflow Send-Email action creates a
  *   NEW outbound email instead of replying in-thread. This is a GHL
@@ -521,7 +543,31 @@ export async function executeSendMessage(action, context) {
     console.log(`[SendMessage] Using ${payload.pre_generated ? 'pre-generated' : 'provided'} message for ${contactId} (${message.length} chars)`);
   } else if (payload.requires_ai_generation) {
     console.warn(`[SendMessage] Generating at send-time for ${contactId} — should have been pre-generated in approval flow`);
-    const triggerMessage = context.message_text || context.messageText || context.body || 'No trigger message available';
+    // v3.4: Resolve trigger message from event context. Order matters:
+    //   message_text         — full inbound from message-analyzer v1.5+
+    //                          OR ghl.reply_received payload directly
+    //   messageText / body   — alternate field names some emitters use
+    //   message_preview      — first 100 chars from analysis event (legacy fallback)
+    // If NONE resolves, fail fast — feeding a placeholder string to the
+    // classifier (e.g. "No trigger message available") tripped the "no"
+    // keyword and silently misrouted to callback-sales.
+    const triggerMessage = context.message_text
+      || context.messageText
+      || context.body
+      || context.message_preview
+      || null;
+    if (!triggerMessage) {
+      const ctxKeys = Object.keys(context || {});
+      console.error(`[SendMessage] ⛔ No trigger message in event context for ${contactId} (event_id=${action.event_id}) — refusing to call classifier on placeholder. Event payload keys: [${ctxKeys.join(', ')}]`);
+      return {
+        action: 'send_message_no_trigger_message',
+        contact_id: contactId,
+        channel,
+        reason: 'no_trigger_message_in_event_context',
+        event_id: action.event_id,
+        event_payload_keys: ctxKeys,
+      };
+    }
     try {
       generated = await generateResponse(contactId, channel, triggerMessage);
 
