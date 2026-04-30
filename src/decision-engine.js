@@ -3,6 +3,24 @@
  * 
  * The brain of the agentic system.
  *
+ * v2.10 — 2026-04-30. REVERT v2.8 auto-approve bypass for AGENTIC_RESPOND_POST_CHATBOT.
+ *   v2.8 added a Stage 3+ tag bypass that auto-approved AI replies for
+ *   contacts with bj:stage-3-comparing / stage-4-negotiating / stage-5-committed
+ *   (and the buyer:* equivalents). The intent was to reduce friction for
+ *   warm-buyer fast paths, but in practice it's premature: the AI generation
+ *   pipeline is still being hardened (see send-message-handler v3.4 / 
+ *   message-analyzer v1.5 fixes 2026-04-30 for the exact failure mode that
+ *   v2.8 silently masked). Until the responder is broadly trusted, every
+ *   AI-generated message goes through GroupMe approval — no exceptions
+ *   based on tag state.
+ *
+ *   shouldRequireApproval is now a pass-through that simply honors the
+ *   rule's own requires_approval flag. STAGE_3_PLUS_TAGS constant removed.
+ *
+ *   To re-enable an auto-approve path later, prefer setting requires_approval=
+ *   false on a NARROWER rule (e.g. a stage-5-only variant) rather than
+ *   bypassing the gate inside the engine.
+ *
  * v2.9 — 2026-04-28. has_any_tag / not_has_any_tag context operators.
  *   Per Mark's Nancy Kesner / Jp...g2k canvassing investigation:
  *   GHL_APPT_STAGE_ADVANCE was firing on every appointment_booked
@@ -20,7 +38,7 @@
  *   Pairs with: agent_rules update converting GHL_APPT_STAGE_ADVANCE to
  *   rule_type='contextual' with the above guard.
  *
- * v2.8 — Auto-approve gate for AGENTIC_RESPOND_POST_CHATBOT.
+ * v2.8 — Auto-approve gate for AGENTIC_RESPOND_POST_CHATBOT. [REVERTED in v2.10]
  * v2.7 — recommended_action_neq context operator.
  * v2.6 — Multi-rule execution per event.
  * v2.5 — lp_disposition_in context condition.
@@ -48,14 +66,8 @@ const BEHAVIORAL_RULE_PREFIXES = [
 
 const LP_DISP_PREFIX = 'LP_DISP_';
 
-const STAGE_3_PLUS_TAGS = [
-  'bj:stage-3-comparing',
-  'bj:stage-4-negotiating',
-  'bj:stage-5-committed',
-  'buyer:vendor-comparison',
-  'buyer:decision',
-  'buyer:post-decision',
-];
+// v2.10: STAGE_3_PLUS_TAGS removed along with the v2.8 auto-approve bypass.
+// All approval gating now flows through the rule's own requires_approval flag.
 
 function isBehavioralRule(ruleKey) {
   if (!ruleKey) return false;
@@ -387,28 +399,19 @@ async function findMatchingRules(event) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// APPROVAL GATING (v2.8)
+// APPROVAL GATING (v2.10 — pass-through; v2.8 bypass removed)
 // ═══════════════════════════════════════════════════════════════════
+//
+// Each rule's own requires_approval flag is the sole determinant of whether
+// a created action goes to pending_approval (queued for GroupMe review) or
+// pending (auto-execute). No rule-key-specific bypasses live here.
+//
+// This function is kept as a single chokepoint so future approval policies
+// (e.g. time-of-day gating, per-user trust scores) can be added in one
+// place rather than scattered across handlers.
 
-async function shouldRequireApproval(rule, event) {
-  const baseRequirement = rule.requires_approval || false;
-  if (!baseRequirement) return false;
-
-  if (rule.rule_key === 'AGENTIC_RESPOND_POST_CHATBOT' && event.ghl_contact_id) {
-    try {
-      const tags = await fetchContactTags(event.ghl_contact_id);
-      const hasStage3Plus = tags.some(t => STAGE_3_PLUS_TAGS.includes(t));
-      if (hasStage3Plus) {
-        console.log(`[AutoApprove] AGENTIC_RESPOND for ${event.ghl_contact_id}: Stage 3+ tag present, bypassing approval gate`);
-        return false;
-      }
-      console.log(`[AutoApprove] AGENTIC_RESPOND for ${event.ghl_contact_id}: no Stage 3+ tag, retaining approval gate`);
-    } catch (err) {
-      console.error(`[AutoApprove] Tag fetch failed for ${event.ghl_contact_id}, defaulting to baseRequirement=true:`, err.message);
-    }
-  }
-
-  return baseRequirement;
+async function shouldRequireApproval(rule /*, event */) {
+  return rule.requires_approval || false;
 }
 
 // ═══════════════════════════════════════════════════════════════════
