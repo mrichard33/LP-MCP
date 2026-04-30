@@ -14,6 +14,17 @@
  * 
  * Security: All endpoints validate GHL_WEBHOOK_SECRET.
  *
+ * v2.6 (2026-04-30) — handleWorkflowCompleted now branches on
+ *   workflowName via AGENTIC_EVENT_MAP. Markers like
+ *   "agentic.handoff_started" / "agentic.handoff_ended" emit distinct
+ *   event_types instead of the generic ghl.workflow_completed. Pairs
+ *   with GHL workflows "Tagged - pause-bot" (cbb6ac0e) and
+ *   "Tag:Removed - pause-bot" (fdc47bac) which signal when the agentic
+ *   system has taken control of (or relinquished) a conversation.
+ *   Decision Engine rules AGENTIC_HANDOFF_STARTED (id 145) and
+ *   AGENTIC_HANDOFF_ENDED (id 146) consume these events and emit
+ *   GroupMe notifications + tag the contact `agentic-active`.
+ *
  * v2.5 (2026-04-27) — handleReply now bypasses the trivial filter for
  *   contacts with the `pause-bot` tag. The trivial filter (matches "ok",
  *   "sure", "yes", emojis, etc.) was eating critical CTA confirmations
@@ -452,6 +463,22 @@ async function handleLeadScore(req, res) {
   return res.json({ status: 'accepted', score, delta, priority, enriched_via: enrichedVia });
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// AGENTIC EVENT TYPE MAPPING (v2.6)
+// ═══════════════════════════════════════════════════════════════════
+//
+// When a source GHL workflow passes one of these dot-namespaced markers
+// as `workflowName`, emit a distinct event_type so Decision Engine rules
+// can fire on the specific signal. Otherwise fall back to the generic
+// ghl.workflow_completed used by the 13 Tier 1 content-completion
+// webhooks. Add new markers here when wiring additional agentic-state
+// webhooks.
+//
+const AGENTIC_EVENT_MAP = {
+  'agentic.handoff_started': 'agentic.handoff_started',
+  'agentic.handoff_ended':   'agentic.handoff_ended',
+};
+
 async function handleWorkflowCompleted(req, res) {
   const body = req.body || {};
   const contactId = body.contactId || body.contact_id || null;
@@ -460,13 +487,35 @@ async function handleWorkflowCompleted(req, res) {
 
   if (!contactId) return res.status(400).json({ error: 'Missing contactId' });
 
+  // v2.6: Branch on workflowName for dedicated agentic event types.
+  // Standard content-completion webhooks (13 Tier 1 workflows) keep
+  // ghl.workflow_completed unchanged — zero behavioral change. Agentic
+  // markers get distinct event_types so dedicated rules fire on them
+  // without coupling to the generic firehose.
+  const mappedType = AGENTIC_EVENT_MAP[workflowName];
+  const isAgentic = !!mappedType;
+  const eventType = mappedType || 'ghl.workflow_completed';
+
+  // 5-min idempotency bucket for agentic events to guard against
+  // tag-bounce double-fires (rare but possible if a glitch adds and
+  // removes pause-bot in quick succession). Standard completions keep
+  // the original Date.now() key — they're already idempotent via the
+  // workflowId and don't need bucket dedup.
+  const idempotencyKey = isAgentic
+    ? `${eventType}_${contactId}_${Math.floor(Date.now() / (5 * 60 * 1000))}`
+    : `ghl_wf_complete_${contactId}_${workflowId}_${Date.now()}`;
+
   await emitEvent({
-    event_type: 'ghl.workflow_completed', event_subtype: workflowId, source: 'ghl_webhook',
+    event_type: eventType, event_subtype: workflowId, source: 'ghl_webhook',
     entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
     payload: { workflow_id: workflowId, workflow_name: workflowName },
-    priority: 'normal', idempotency_key: `ghl_wf_complete_${contactId}_${workflowId}_${Date.now()}`,
+    priority: isAgentic ? 'high' : 'normal', idempotency_key: idempotencyKey,
   });
-  return res.json({ status: 'accepted', event_type: 'ghl.workflow_completed' });
+
+  if (isAgentic) {
+    console.log(`[BehavioralEmitter] AGENTIC event: ${eventType} for ${contactId}`);
+  }
+  return res.json({ status: 'accepted', event_type: eventType });
 }
 
 // ═══════════════════════════════════════════════════════════════════
