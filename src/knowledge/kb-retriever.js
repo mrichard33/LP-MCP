@@ -3,6 +3,31 @@
  *
  * Orchestrates structured KB lookups (Tier 1) for the response generator.
  *
+ * v1.8 — 2026-04-30. ALIGN MV calendar_name with action-handler CALENDAR_MAP.
+ *   PROBLEM: mvCalendar() returned calendar_name: "Window Measurement
+ *   Verification" but src/actions/constants.js CALENDAR_MAP keys this
+ *   calendar as plain "Measurement Verification". When the AI emitted a
+ *   companion_action with the prefixed name (per v2.7.6 auto-book on hard
+ *   confirmation), the book_appointment handler validated against
+ *   CALENDAR_MAP, didn't find a match, and threw:
+ *     "Unknown calendar name: Window Measurement Verification.
+ *      Valid: Review Session, Measurement Verification, Window Estimate,
+ *      Home Protection Assessment, Confirmation Call"
+ *
+ *   Surfaced 2026-04-30 with contact 4uaY9wDO6Zz8hjA1DjXd: bot ran the full
+ *   booking conversation correctly (mv_only policy, ASK-FIRST with two
+ *   specific times, hard-confirmation auto-book per response-generator
+ *   v2.7.6) but action 30399 failed silently — verbal confirmation
+ *   "Monday at 2 PM is locked in" went out, the calendar entry never
+ *   actually got created in GHL.
+ *
+ *   FIX: calendar_name aligned to "Measurement Verification" — exactly
+ *   matching the CALENDAR_MAP key. calendar_id (zEdPmkNccR2ovo3rQAd3)
+ *   and policy ('mv_only') were already correct; this is a pure label
+ *   alignment fix. The MV description is also updated to drop the
+ *   redundant "Window" prefix in casual prose so the AI doesn't echo
+ *   the wrong phrase back into messages.
+ *
  * v1.7 — 2026-04-29. SCHEDULING-SIGNAL FALLBACK.
  *   PROBLEM: Even with the BOOK classifier fixes, the keyword scan can still
  *   misroute when the inbound has no specific BOOK trigger keyword AND the
@@ -179,11 +204,13 @@ function mvCalendar(opts) {
   return {
     type: 'in_home', visit_type: 'in_home',
     calendar_id: CALENDAR_IDS.MV,
-    calendar_name: 'Window Measurement Verification',
+    // v1.8: must match CALENDAR_MAP key in src/actions/constants.js exactly
+    // (the book_appointment handler validates calendar_name against that map).
+    calendar_name: 'Measurement Verification',
     duration_minutes: 90,
     booking_url: buildTriggerLinkUrl('MV', opts),
     booking_url_resolved: buildBookingUrl(BOOKING_SPECS.MV, opts),
-    description: 'In-home measurement verification — about 90 minutes — for leads who came through the online estimate calculator. Specialist verifies measurements and finalizes penny-accurate pricing. Both homeowners should be present.',
+    description: 'In-home measurement verification — about 90 minutes — for leads who came through the online estimate calculator. Specialist verifies the measurements they entered online and finalizes penny-accurate pricing. Both homeowners should be present.',
   };
 }
 
@@ -342,7 +369,7 @@ export function resolveBookingContext({
       ...mv, primary: mv, fallback: null, policy,
       guidance: [
         'This lead came through the online Estimate Calculator (or asked for MV directly).',
-        'The next step is a Window Measurement Verification — about 90 minutes, in-home.',
+        'The next step is a Measurement Verification visit — about 90 minutes, in-home.',
         'A specialist verifies the measurements they entered online and finalizes penny-accurate pricing.',
         'Both homeowners should be present so any questions can be answered on the spot. Do NOT pitch this as a sales appointment — frame it as a verification visit.',
       ].join(' '),
