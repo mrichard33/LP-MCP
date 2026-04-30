@@ -24,6 +24,14 @@
  * Scheduler (registered by startDataFreshnessMonitorScheduler):
  *   Runs runFreshnessCheck() every CHECK_INTERVAL_MINUTES (default 30).
  *
+ * v1.2 — 2026-04-30. Kill switch for GroupMe alerts.
+ *        FRESHNESS_GROUPME_ALERTS_DISABLED=true silences SYNC WATERMARK
+ *        STUCK and STALE DATA pings to GroupMe while continuing to log
+ *        every check to data_freshness_log. Use when ops alerts are
+ *        creating noise during active LP-sync work and you want the
+ *        signal preserved for /n8n/admin/freshness inspection without
+ *        the channel pings.
+ *
  * v1.1 — 2026-04-28. Sync probe upgraded to test all 3 lead-fetch paths
  *        (pro_id=0, pro_id omitted, /api/Customers/GetLead) so we can
  *        see exactly which path the auto-fallback in lp-client picks.
@@ -63,6 +71,11 @@ const MONITORED_TABLES = [
 const ALERT_DEDUP_HOURS      = parseInt(process.env.FRESHNESS_ALERT_DEDUP_HOURS || '6', 10);
 const CHECK_INTERVAL_MINUTES = parseInt(process.env.FRESHNESS_CHECK_INTERVAL_MIN || '30', 10);
 const ZERO_RECORD_RUN_LIMIT  = parseInt(process.env.FRESHNESS_ZERO_RECORD_LIMIT  || '5', 10);
+// v1.2: Global kill switch for GroupMe alerts. When true, stale-data and
+// sync-watermark-stuck alerts skip GroupMe but still write to
+// data_freshness_log so /n8n/admin/freshness reflects current state.
+// Set FRESHNESS_GROUPME_ALERTS_DISABLED=true on Railway to silence ops pings.
+const GROUPME_ALERTS_DISABLED = (process.env.FRESHNESS_GROUPME_ALERTS_DISABLED || 'false').toLowerCase() === 'true';
 
 // ─── Per-table check ────────────────────────────────────────────────
 
@@ -195,7 +208,10 @@ export async function runFreshnessCheck({ alert = true } = {}) {
         const icon = r.severity === 'critical' ? '🚨' : '⚠️';
         const msg  = `${icon} STALE DATA [${r.severity.toUpperCase()}]\n${human}`;
 
-        const sendResult = await sendGroupMeMessage(msg);
+        // v1.2: respect kill switch. Logs are still written above.
+        const sendResult = GROUPME_ALERTS_DISABLED
+          ? { sent: false, suppressed: true }
+          : await sendGroupMeMessage(msg);
         if (sendResult?.sent) {
           // Mark the most recent log row as alerted
           await supabase
@@ -214,7 +230,10 @@ export async function runFreshnessCheck({ alert = true } = {}) {
     if (watermark.status === 'stuck') {
       try {
         if (await shouldAlert('__sync_watermark__')) {
-          const sendResult = await sendGroupMeMessage(`🚨 SYNC WATERMARK STUCK\n${watermark.message}`);
+          // v1.2: respect kill switch. Suppressed alerts still leave a log row below.
+          const sendResult = GROUPME_ALERTS_DISABLED
+            ? { sent: false, suppressed: true }
+            : await sendGroupMeMessage(`🚨 SYNC WATERMARK STUCK\n${watermark.message}`);
           if (sendResult?.sent) {
             await supabase.from('data_freshness_log').insert({
               table_name:    '__sync_watermark__',
@@ -224,6 +243,14 @@ export async function runFreshnessCheck({ alert = true } = {}) {
               alerted_at:    new Date().toISOString(),
             });
             alerted.push('__sync_watermark__');
+          } else if (GROUPME_ALERTS_DISABLED) {
+            // Still leave a non-alerted log row so /n8n/admin/freshness reflects it.
+            await supabase.from('data_freshness_log').insert({
+              table_name:    '__sync_watermark__',
+              status:        'stale',
+              severity:      'critical',
+              error_message: `${watermark.message} [GroupMe alert suppressed by FRESHNESS_GROUPME_ALERTS_DISABLED]`,
+            });
           }
         }
       } catch (err) {
@@ -238,6 +265,7 @@ export async function runFreshnessCheck({ alert = true } = {}) {
     sync_watermark: watermark,
     stale_count: stale.length,
     alerted,
+    groupme_alerts_disabled: GROUPME_ALERTS_DISABLED,
   };
 }
 
@@ -325,6 +353,7 @@ export function registerDataFreshnessRoutes(app) {
         all_fresh: stale.length === 0 && watermark.status !== 'stuck',
         stale_count: stale.length,
         sync_watermark: watermark,
+        groupme_alerts_disabled: GROUPME_ALERTS_DISABLED,
         results,
       });
     } catch (err) {
@@ -363,7 +392,7 @@ let freshnessTimer = null;
 export function startDataFreshnessMonitorScheduler() {
   if (freshnessTimer) return;
   const intervalMs = CHECK_INTERVAL_MINUTES * 60 * 1000;
-  console.log(`[Freshness] Scheduler started — checks every ${CHECK_INTERVAL_MINUTES}min, dedup ${ALERT_DEDUP_HOURS}h`);
+  console.log(`[Freshness] Scheduler started — checks every ${CHECK_INTERVAL_MINUTES}min, dedup ${ALERT_DEDUP_HOURS}h, groupme_alerts=${GROUPME_ALERTS_DISABLED ? 'DISABLED' : 'enabled'}`);
 
   // First check 60s after boot — gives sync scheduler time to settle
   setTimeout(() => {
