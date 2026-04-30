@@ -5,6 +5,59 @@
  * trigger-message resolution, or head-of-line behavior stays a small,
  * focused edit. Extracted from action-executor.js v4.2 refactor.
  *
+ * v4.8 (2026-04-30) — AGENTIC AUTO-REPLY (env-gated, tag-verified).
+ *   Mark's ask: turn on full auto-reply for the agentic responder. When
+ *   AGENTIC_AUTOREPLY_ENABLED=true AND the contact still carries the
+ *   required tag (default 'pause-bot') AND the action came from an
+ *   allowlisted rule (default AGENTIC_RESPOND_POST_CHATBOT), the batch's
+ *   send_message + add_tag actions auto-execute via Phase 2 instead of
+ *   waiting for a human approval card.
+ *
+ *   Four gates — ALL AND-ed; failing any one falls back to the v4.6/v4.7
+ *   approval-card path:
+ *     G1. env var AGENTIC_AUTOREPLY_ENABLED === 'true' (master kill switch)
+ *     G2. action.rule_applied is in AGENTIC_AUTOREPLY_RULES allowlist
+ *     G3. pre-generation succeeded (no short-circuit, no error)
+ *     G4. contact has AGENTIC_AUTOREPLY_REQUIRED_TAG (default 'pause-bot'),
+ *         verified LIVE from the GHL contact GET endpoint at execution
+ *         time — NOT from cache. Tags can change between rule fire and
+ *         approval-path execution, and we want the safety belt on the
+ *         actual current state.
+ *
+ *   What flips: every action in the batch with status='pending_approval'
+ *   and requires_approval=true gets flipped to status='pending',
+ *   requires_approval=false. Phase 2 of the executor on the SAME
+ *   heartbeat picks them up. The book_appointment companion (already
+ *   auto-executing per v4.7) is unaffected — it stays on its own path.
+ *
+ *   What does NOT flip:
+ *   - v4.5 inline-handoff batches (short-circuit) — they bypass auto-
+ *     reply entirely; the handoff is the action.
+ *   - Batches where pre-gen errored — they still get an approval card so
+ *     the human can see the error and intervene.
+ *   - Batches where ANY of G1-G4 fails — same fallback to the card.
+ *
+ *   Visibility: instead of an approval card, GroupMe gets a
+ *   "🚀 AGENTIC AUTO-REPLY (no approval needed)" info notice with the
+ *   sent message, reasoning, intent class, any companion booking, and
+ *   any tags applied. Mark can audit what fired but cannot edit/reject
+ *   (the message is already out). The action audit trail captures the
+ *   full payload for retrospection and v2.7.4 in-context learning.
+ *
+ *   Trade-off: with auto-reply on, the "Edit X" / approve-reject cycle
+ *   is unavailable for batches that pass the gates. The system trusts
+ *   the AI's output for the allowlisted rule + tag combination. Tighten
+ *   or loosen by editing AGENTIC_AUTOREPLY_RULES or flipping the env
+ *   var off at any time without redeploy (Railway picks up env changes
+ *   on the next heartbeat).
+ *
+ *   Tuning knobs (env vars):
+ *     AGENTIC_AUTOREPLY_ENABLED       — 'true' | 'false' (default: false)
+ *     AGENTIC_AUTOREPLY_RULES         — comma-separated rule keys
+ *                                       (default: AGENTIC_RESPOND_POST_CHATBOT)
+ *     AGENTIC_AUTOREPLY_REQUIRED_TAG  — single tag string
+ *                                       (default: pause-bot)
+ *
  * v4.7 (2026-04-30) — AUTO-EXECUTE book_appointment companion actions.
  *   Mark's ask: when the AI emits companion_action: book_appointment, the
  *   booking should fire IMMEDIATELY without waiting for GroupMe approval.
@@ -147,6 +200,43 @@ import { bumpContactCache } from '../context-builder.js';
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 
 // ═══════════════════════════════════════════════════════════════════
+// v4.8: AGENTIC AUTO-REPLY GATING (env-gated, tag-verified)
+// ═══════════════════════════════════════════════════════════════════
+//
+// Master kill switch. Set to 'true' (string, case-insensitive) to enable
+// auto-reply for batches that pass all four gates. Default 'false' so
+// upgrades to this code do NOT change observable behavior unless the
+// operator explicitly opts in.
+const AGENTIC_AUTOREPLY_ENABLED = String(
+  process.env.AGENTIC_AUTOREPLY_ENABLED || 'false'
+).toLowerCase() === 'true';
+
+// Allowlist of rule keys whose batches are eligible for auto-reply.
+// Comma-separated. Default: just AGENTIC_RESPOND_POST_CHATBOT (the rule
+// that fires on ai.analysis_completed for pause-bot-tagged contacts).
+// Add more rule keys here as the system matures and other agentic rules
+// earn full-trust status.
+const AGENTIC_AUTOREPLY_RULES = (
+  process.env.AGENTIC_AUTOREPLY_RULES || 'AGENTIC_RESPOND_POST_CHATBOT'
+).split(',').map(s => s.trim()).filter(Boolean);
+
+// The contact tag that MUST be present at execution time for auto-reply
+// to fire. Default 'pause-bot' — the tag that signals "the chatbot has
+// stepped aside; the agentic responder is in charge". If a human or
+// another workflow has removed this tag between rule fire and approval-
+// path execution, auto-reply gracefully falls back to the approval card.
+const AGENTIC_AUTOREPLY_REQUIRED_TAG = (
+  process.env.AGENTIC_AUTOREPLY_REQUIRED_TAG || 'pause-bot'
+).trim();
+
+// Log effective config at startup so it shows in Railway logs after each
+// deploy. Helps confirm the env vars are actually applied.
+console.log(`[ApprovalPath] v4.8 auto-reply config: ` +
+  `enabled=${AGENTIC_AUTOREPLY_ENABLED}, ` +
+  `rules=[${AGENTIC_AUTOREPLY_RULES.join(',')}], ` +
+  `required_tag="${AGENTIC_AUTOREPLY_REQUIRED_TAG}"`);
+
+// ═══════════════════════════════════════════════════════════════════
 // v4.7: COMPANION AUTO-EXECUTE ALLOWLIST
 // ═══════════════════════════════════════════════════════════════════
 //
@@ -207,6 +297,194 @@ async function applyContactTagsInline(contactId, tagList) {
     console.warn(`[ApprovalPath] applyContactTagsInline threw: ${err.message}`);
     return false;
   }
+}
+
+/**
+ * v4.8 — Live tag fetch for the auto-reply gate. We deliberately do NOT
+ * trust any cached tag snapshot for this decision: tags change between
+ * rule fire and approval-path execution (e.g. a human pulls 'pause-bot'
+ * to take the conversation back), and the safety belt MUST reflect
+ * current state.
+ *
+ * Returns:
+ *   - Array of tag strings on success (possibly empty)
+ *   - null on any error (caller treats as "ineligible" → falls back to
+ *     the approval card)
+ */
+async function fetchContactTagsLive(contactId) {
+  if (!contactId || !GHL_API_KEY) return null;
+  try {
+    await acquireToken();
+    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${GHL_API_KEY}`,
+        'Version': '2021-07-28',
+        'Accept': 'application/json',
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.status === 429) {
+      report429();
+      console.warn(`[ApprovalPath] fetchContactTagsLive 429 for ${contactId}`);
+      return null;
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      console.warn(`[ApprovalPath] fetchContactTagsLive ${res.status} for ${contactId}: ${text.slice(0, 150)}`);
+      return null;
+    }
+    const data = await res.json();
+    // GHL v2 response shape: { contact: { tags: [...] } }. Some endpoints
+    // return tags at the root. Accept either, default to empty array if
+    // the field is missing entirely.
+    const tags = data?.contact?.tags ?? data?.tags;
+    if (!Array.isArray(tags)) {
+      console.warn(`[ApprovalPath] fetchContactTagsLive ${contactId}: tags not array (got: ${typeof tags})`);
+      return [];
+    }
+    return tags;
+  } catch (err) {
+    console.warn(`[ApprovalPath] fetchContactTagsLive threw for ${contactId}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * v4.8 — Evaluate the four gates for auto-reply on a single batch.
+ * Called AFTER pre-generation succeeds (so G3 implicit). G4 fires the
+ * live GHL contact GET only when G1+G2 pass — no wasted API calls when
+ * the env var is off.
+ *
+ * Returns { eligible: boolean, reason: string, tags: string[] | null }.
+ * `reason` is logged verbatim so each batch's gate decision is auditable.
+ */
+async function evaluateAutoReplyEligibility(sendAction) {
+  // G1: master kill switch
+  if (!AGENTIC_AUTOREPLY_ENABLED) {
+    return { eligible: false, reason: 'env_disabled', tags: null };
+  }
+  // G2: rule allowlist
+  const ruleApplied = sendAction.rule_applied || null;
+  if (!ruleApplied || !AGENTIC_AUTOREPLY_RULES.includes(ruleApplied)) {
+    return {
+      eligible: false,
+      reason: `rule_not_in_allowlist:${ruleApplied || 'none'}`,
+      tags: null,
+    };
+  }
+  // G4: live tag verification (G3 is implicit — we only get here if pre-gen
+  // succeeded; the caller handles the short-circuit and error branches).
+  const tags = await fetchContactTagsLive(sendAction.target_id);
+  if (tags === null) {
+    return {
+      eligible: false,
+      reason: 'tag_fetch_failed_falling_back_to_approval',
+      tags: null,
+    };
+  }
+  if (!tags.includes(AGENTIC_AUTOREPLY_REQUIRED_TAG)) {
+    return {
+      eligible: false,
+      reason: `missing_required_tag:${AGENTIC_AUTOREPLY_REQUIRED_TAG}`,
+      tags,
+    };
+  }
+  return { eligible: true, reason: 'all_gates_passed', tags };
+}
+
+/**
+ * v4.8 — Auto-reply application. Flips every action in the batch with
+ * status='pending_approval' AND requires_approval=true to status='pending'
+ * so Phase 2 of the executor picks them up on this same heartbeat. The
+ * companion book_appointment (already auto-executing per v4.7) is
+ * untouched. Sends an informational GroupMe notice and skips the
+ * approval card.
+ *
+ * Returns:
+ *   - flippable.length on success (positive int)
+ *   - 0 if there were no flippable actions (caller should fall through)
+ *   - -1 on DB update failure (caller MUST fall through to approval card
+ *     so the human still has eyes on it)
+ */
+async function applyAutoReplyInline({
+  batchActions,
+  sendAction,
+  generated,
+  contactName,
+  contactPhone,
+  triggerMessage,
+  tags,
+}) {
+  const flippable = batchActions.filter(
+    a => a.status === 'pending_approval' && a.requires_approval === true
+  );
+  if (flippable.length === 0) {
+    console.warn(`[ApprovalPath] AUTO-REPLY: no flippable actions in batch ${sendAction.batch_id || `s_${sendAction.id}`} — falling through`);
+    return 0;
+  }
+
+  const ids = flippable.map(a => a.id);
+  const updatedAt = new Date().toISOString();
+  const { error } = await supabase
+    .from('agent_actions')
+    .update({
+      status: 'pending',
+      requires_approval: false,
+      approved_by: 'auto_reply_v4_8',
+      updated_at: updatedAt,
+    })
+    .in('id', ids);
+
+  if (error) {
+    console.error(`[ApprovalPath] AUTO-REPLY db update failed for batch ${sendAction.batch_id}: ${error.message} — falling through to approval card`);
+    return -1;
+  }
+
+  // ── Build informational GroupMe notice ───────────────────────────
+  // Distinct format from approval card so Mark immediately recognizes
+  // there is no decision required. Header explicitly says "no approval
+  // needed". No "Reply: Yes/No" footer.
+  const preview = (triggerMessage || '').slice(0, 120);
+  const sentMessage = (sendAction.action_payload?.message || generated.message || '').slice(0, 400);
+  const reasoning = (generated.reasoning || '').slice(0, 200);
+  const displayName = contactName ? `${contactName}${contactPhone ? ` (${contactPhone})` : ''}` : sendAction.target_id;
+  const intent = generated.intent_class || 'unknown';
+  const arc = generated.story_arc && generated.story_arc !== 'none' ? generated.story_arc : null;
+
+  // Companion booking line — surface even though the booking is auto-
+  // executing on its own pending row (which is NOT in flippable).
+  let companionLine = '';
+  if (generated.companion_action?.action_type === 'book_appointment' && generated.companion_action.action_payload) {
+    const cap = generated.companion_action.action_payload;
+    companionLine = `📅 Auto-booked: ${cap.calendar_name || '?'} — ${cap.start_time || '?'} (status: ${cap.status || '?'})\n`;
+  }
+
+  // Tag actions in the auto-fired batch (e.g. pause-workflow).
+  const tagActions = flippable.filter(a => a.action_type === 'add_tag');
+  const tagsAdded = tagActions.map(a => a.action_payload?.tag).filter(Boolean);
+  const tagsLine = tagsAdded.length > 0 ? `🏷  +${tagsAdded.join(', +')}\n` : '';
+
+  await sendGroupMeMessage(
+    `🚀 AGENTIC AUTO-REPLY (no approval needed)\n` +
+    `👤 ${displayName}\n` +
+    `Intent: ${intent}${arc ? ` | Arc: ${arc}` : ''} | Rule: ${sendAction.rule_applied || 'n/a'}\n` +
+    `💬 "${preview}"\n` +
+    `📱 "${sentMessage}"\n` +
+    (reasoning ? `🤖 ${reasoning}\n` : '') +
+    companionLine +
+    tagsLine +
+    `→ Auto-fired (${flippable.length} action${flippable.length === 1 ? '' : 's'}) at ${updatedAt}. Batch ${sendAction.batch_id || `s_${sendAction.id}`}.`
+  ).catch(err => {
+    console.warn(`[ApprovalPath] GroupMe (auto-reply notice) failed: ${err.message}`);
+  });
+
+  console.log(`[ApprovalPath] 🚀 AUTO-REPLY: contact=${sendAction.target_id} ` +
+    `rule=${sendAction.rule_applied} intent=${intent} ` +
+    `flipped=${flippable.length} tags=${tags?.length || 0} ` +
+    `companion=${generated.companion_action?.action_type || 'none'}`);
+
+  return flippable.length;
 }
 
 /**
@@ -306,7 +584,7 @@ async function applyHandoffInline({
 /**
  * Process the pending_approval queue. Returns the number of approval
  * requests sent this cycle for stats reporting (does not include
- * inline-handoff batches that bypassed the approval card).
+ * inline-handoff or auto-reply batches that bypassed the approval card).
  */
 export async function processApprovalQueue() {
   // v4.2 — Pre-filter batches that already have an active ('pending') tracking
@@ -340,6 +618,7 @@ export async function processApprovalQueue() {
 
   let cardsSent = 0;
   let inlineHandoffs = 0;
+  let autoReplies = 0;
 
   for (const [batchId, actions] of approvalBatches) {
     // Defense-in-depth: re-check for an active tracking record inside the
@@ -368,6 +647,9 @@ export async function processApprovalQueue() {
     );
 
     let inlineHandoffApplied = false;
+    let autoReplyApplied = false;
+    let lastGenerated = null;
+    let lastTriggerMessage = null;
 
     if (sendAction) {
       try {
@@ -378,9 +660,11 @@ export async function processApprovalQueue() {
         // and other event shapes.
         const triggerMessage = ctx.message_text || ctx.messageText || ctx.body || ctx.message_preview || 'No trigger message';
         const channel = sendAction.action_payload?.channel || 'sms';
+        lastTriggerMessage = triggerMessage;
 
         console.log(`[ActionExecutor] Pre-generating AI response for approval ${batchId} (send_message action ${sendAction.id})`);
         const generated = await generateResponse(sendAction.target_id, channel, triggerMessage);
+        lastGenerated = generated;
 
         if (generated.short_circuit) {
           // ── v4.5: APPLY HANDOFF INLINE — no approval card, no runtime gate.
@@ -416,6 +700,11 @@ export async function processApprovalQueue() {
           await supabase.from('agent_actions')
             .update({ action_payload: updatedPayload, updated_at: new Date().toISOString() })
             .eq('id', sendAction.id);
+
+          // v4.8: Keep an in-memory copy of the updated payload so the
+          // auto-reply notice can read sendAction.action_payload.message
+          // directly without re-fetching the row.
+          sendAction.action_payload = updatedPayload;
 
           enrichment.generatedMessage = generated.message;
           enrichment.storyArc = generated.story_arc;
@@ -511,18 +800,55 @@ export async function processApprovalQueue() {
               console.warn(`[ActionExecutor] Companion insert threw for batch ${batchId}: ${insertErr.message} — proceeding without companion`);
             }
           }
+
+          // ── v4.8: AGENTIC AUTO-REPLY GATE ─────────────────────────
+          // Four-gate eligibility check. Runs only after a successful
+          // generation (G3 implicit). When all four gates pass, flip
+          // the batch's pending_approval rows to pending so Phase 2
+          // executes them on this same heartbeat. Skip the approval
+          // card. The book_appointment companion (already auto-
+          // executing per v4.7) is unaffected.
+          //
+          // On any failure (env off, rule not allowlisted, tag missing,
+          // tag fetch error, DB update error), the code falls through
+          // to sendApprovalRequest as before.
+          const eligibility = await evaluateAutoReplyEligibility(sendAction);
+          if (eligibility.eligible) {
+            const flipped = await applyAutoReplyInline({
+              batchActions: actions,
+              sendAction,
+              generated,
+              contactName: name,
+              contactPhone: phone,
+              triggerMessage,
+              tags: eligibility.tags,
+            });
+            if (flipped > 0) {
+              autoReplies++;
+              autoReplyApplied = true;
+            } else if (flipped === -1) {
+              console.warn(`[ApprovalPath] AUTO-REPLY DB update failed for batch ${batchId} — falling through to approval card`);
+            }
+            // flipped === 0 (no flippable actions) also falls through
+          } else if (AGENTIC_AUTOREPLY_ENABLED) {
+            // Only log the gate decision when the env var is on. With
+            // env off, every batch logs 'env_disabled' — too noisy.
+            console.log(`[ApprovalPath] AUTO-REPLY gate skip (batch ${batchId}): ${eligibility.reason}`);
+          }
         }
       } catch (err) {
         console.error(`[ActionExecutor] Pre-approval generation failed for ${batchId}: ${err.message}`);
         enrichment.generatedMessage = null;
         enrichment.aiGenerationError = err.message;
         // Fall through to send the approval card with the error surfaced.
+        // v4.8: do NOT auto-reply on generation errors — the card is the
+        // right surface for "something went wrong, human eyes please".
       }
     }
 
-    // Skip the approval card entirely if v4.5 inline handoff already
-    // resolved this batch.
-    if (inlineHandoffApplied) continue;
+    // Skip the approval card if v4.5 inline handoff or v4.8 auto-reply
+    // already resolved this batch.
+    if (inlineHandoffApplied || autoReplyApplied) continue;
 
     await sendApprovalRequest(actions, name, phone, enrichment).catch(err => {
       console.error(`[ActionExecutor] Approval request failed for batch ${batchId}:`, err.message);
@@ -530,8 +856,8 @@ export async function processApprovalQueue() {
     cardsSent++;
   }
 
-  if (inlineHandoffs > 0) {
-    console.log(`[ApprovalPath] Cycle: ${cardsSent} cards sent, ${inlineHandoffs} inline handoffs (no card)`);
+  if (inlineHandoffs > 0 || autoReplies > 0) {
+    console.log(`[ApprovalPath] Cycle: ${cardsSent} cards sent, ${inlineHandoffs} inline handoffs, ${autoReplies} auto-replies (no card)`);
   }
 
   return cardsSent;
