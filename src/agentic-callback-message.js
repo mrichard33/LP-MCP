@@ -63,8 +63,28 @@
  *     "business_hours":  true,
  *     "fell_back":       false,    // true if we used the static fallback
  *     "model":           "claude-sonnet-4-6",
- *     "elapsed_ms":      842
+ *     "elapsed_ms":      842,
+ *     "request_id":      "a1b2c3d4"
  *   }
+ *
+ * Audit logging (added 2026-04-30):
+ *   Every successful response (AI or fallback) is also written to the
+ *   agentic_callback_log Supabase table for prompt tuning and ops
+ *   visibility. The write is fire-and-forget — failures are logged
+ *   but do NOT block or alter the HTTP response.
+ *
+ *   The audit row captures BOTH the message that was actually returned
+ *   AND the static-fallback equivalent that the OLD template would
+ *   have produced — so Mark can run side-by-side comparisons:
+ *     SELECT recent_inbound_message,
+ *            message AS ai_msg,
+ *            static_fallback_message AS old_template
+ *     FROM agentic_callback_log
+ *     WHERE fell_back = false
+ *     ORDER BY created_at DESC
+ *     LIMIT 20;
+ *
+ *   See sql/agentic_callback_log.sql for the table DDL.
  *
  * Failure modes & fallback:
  *   - Claude API down / 5xx / timeout (8s)  → static template
@@ -82,6 +102,7 @@
  */
 
 import crypto from 'crypto';
+import supabase from './supabase.js';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const MODEL = process.env.CALLBACK_MESSAGE_MODEL
@@ -192,7 +213,8 @@ function isWithinBusinessHours(now = new Date()) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// FALLBACK TEMPLATES (when AI path fails)
+// FALLBACK TEMPLATES (when AI path fails — also written to audit log
+// on EVERY row for side-by-side comparison)
 // ═══════════════════════════════════════════════════════════════════
 
 function buildFallbackMessage({ first_name, market_name, service_phone_display, business_hours }) {
@@ -292,6 +314,60 @@ function parseJson(text) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// AUDIT LOG
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Fire-and-forget write to agentic_callback_log. Failures (table
+ * missing, RLS denial, network blip) are logged at warn level but
+ * NEVER thrown — the HTTP response has already been sent by the time
+ * this runs, and a missed audit row is acceptable; a failed request
+ * is not.
+ *
+ * Called by the route handler with the full input + result so we
+ * can capture everything in a single row.
+ */
+async function logToAudit(input, result) {
+  try {
+    const row = {
+      contact_id:              input.contact_id || null,
+      first_name:              input.first_name || null,
+      recent_inbound_message:  input.recent_inbound_message || null,
+      market_name:             input.market_name || null,
+      service_phone_display:   input.service_phone_display || null,
+      has_dedicated_phone:     typeof input.has_dedicated_phone === 'boolean'
+        ? input.has_dedicated_phone
+        : null,
+      business_hours:          result.business_hours,
+      callback_type:           input.callback_type || null,
+      handoff_reason:          input.handoff_reason || null,
+
+      message:                 result.message || null,
+      reasoning:               result.reasoning || null,
+      fell_back:               !!result.fell_back,
+      fell_back_reason:        result.fell_back_reason || null,
+
+      static_fallback_message: result.static_fallback_message || null,
+
+      model:                   result.model || null,
+      elapsed_ms:              typeof result.elapsed_ms === 'number' ? result.elapsed_ms : null,
+      request_id:              result.request_id || null,
+      message_length:          typeof result.message === 'string' ? result.message.length : null,
+    };
+
+    const { error } = await supabase.from('agentic_callback_log').insert(row);
+    if (error) {
+      // Most likely cause: table doesn't exist yet (Mark hasn't run the
+      // CREATE TABLE in Supabase dashboard). Log once at warn — the
+      // endpoint stays functional regardless.
+      console.warn(`[CallbackMessage] audit_log_insert error: ${error.message}`);
+    }
+  } catch (err) {
+    console.warn(`[CallbackMessage] audit_log_insert threw: ${err.message}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // MAIN HANDLER
 // ═══════════════════════════════════════════════════════════════════
 
@@ -304,34 +380,41 @@ async function generateCallbackMessage(input) {
     ? input.business_hours
     : isWithinBusinessHours();
 
+  // Always compute the static-fallback equivalent. We attach it to the
+  // result so the audit log has a side-by-side baseline regardless of
+  // whether the AI path ran. Cheap to compute (pure string concat).
+  const static_fallback_message = buildFallbackMessage({ ...input, business_hours });
+
   // Hard-required: a non-empty inbound message.
   const trimmedInbound = (input.recent_inbound_message || '').trim();
   if (!trimmedInbound) {
-    const fallback = buildFallbackMessage({ ...input, business_hours });
     console.log(`[CallbackMessage] [${reqId}] no_inbound_message — fallback (${Date.now() - startedAt}ms)`);
     return {
-      message: fallback,
+      message: static_fallback_message,
       reasoning: 'No recent_inbound_message provided — used static fallback template.',
       business_hours,
       fell_back: true,
       fell_back_reason: 'missing_inbound_message',
+      static_fallback_message,
       model: null,
       elapsed_ms: Date.now() - startedAt,
+      request_id: reqId,
     };
   }
 
   // No API key configured — fall back without trying Claude.
   if (!ANTHROPIC_API_KEY) {
-    const fallback = buildFallbackMessage({ ...input, business_hours });
     console.warn(`[CallbackMessage] [${reqId}] no_api_key — fallback (${Date.now() - startedAt}ms)`);
     return {
-      message: fallback,
+      message: static_fallback_message,
       reasoning: 'ANTHROPIC_API_KEY not configured — used static fallback template.',
       business_hours,
       fell_back: true,
       fell_back_reason: 'no_api_key',
+      static_fallback_message,
       model: null,
       elapsed_ms: Date.now() - startedAt,
+      request_id: reqId,
     };
   }
 
@@ -358,22 +441,25 @@ async function generateCallbackMessage(input) {
       reasoning: typeof parsed?.reasoning === 'string' ? parsed.reasoning.slice(0, 400) : null,
       business_hours,
       fell_back: false,
+      static_fallback_message,
       model: MODEL,
       elapsed_ms: elapsed,
+      request_id: reqId,
     };
   } catch (err) {
-    const fallback = buildFallbackMessage({ ...input, business_hours });
     const elapsed = Date.now() - startedAt;
     console.warn(`[CallbackMessage] [${reqId}] ai_error contact=${input.contact_id || 'n/a'} ` +
       `err="${err.message}" — fallback (${elapsed}ms)`);
     return {
-      message: fallback,
+      message: static_fallback_message,
       reasoning: `AI generation failed (${err.message}); used static fallback template.`,
       business_hours,
       fell_back: true,
       fell_back_reason: err.message,
+      static_fallback_message,
       model: MODEL,
       elapsed_ms: elapsed,
+      request_id: reqId,
     };
   }
 }
@@ -386,14 +472,14 @@ async function generateCallbackMessage(input) {
  * Registers POST /api/agentic/dynamic-callback-message on the given
  * Express app. No-auth — same posture as /api/service-area/lookup since
  * GHL custom_webhook can't easily pass auth tokens. The endpoint is
- * write-free (no DB mutations) and the input is only used to compose
- * a transient SMS string.
+ * write-free for the LEAD's data (no GHL contact mutations) — only
+ * appends to agentic_callback_log for audit.
  */
 export function registerCallbackMessageRoutes(app) {
   app.post('/api/agentic/dynamic-callback-message', async (req, res) => {
     try {
       const body = req.body || {};
-      const result = await generateCallbackMessage({
+      const sanitizedInput = {
         first_name: typeof body.first_name === 'string' ? body.first_name.slice(0, 100) : null,
         recent_inbound_message: typeof body.recent_inbound_message === 'string'
           ? body.recent_inbound_message.slice(0, 1000)
@@ -411,10 +497,20 @@ export function registerCallbackMessageRoutes(app) {
         contact_id: typeof body.contact_id === 'string' ? body.contact_id.slice(0, 100) : null,
         handoff_reason: typeof body.handoff_reason === 'string' ? body.handoff_reason.slice(0, 100) : null,
         callback_type: ['sales', 'service'].includes(body.callback_type) ? body.callback_type : null,
-      });
+      };
+
+      const result = await generateCallbackMessage(sanitizedInput);
 
       // Always 200, even on internal errors — see header comment.
-      res.json(result);
+      // Strip static_fallback_message from the HTTP response — it's an
+      // internal audit artifact, not part of the public contract.
+      const { static_fallback_message: _omit, ...publicResult } = result;
+      res.json(publicResult);
+
+      // Fire-and-forget audit write. Doesn't block the response, never
+      // throws. If the table doesn't exist yet, we'll see a one-line
+      // warn in Railway logs and the endpoint keeps working.
+      logToAudit(sanitizedInput, result).catch(() => { /* swallow */ });
     } catch (err) {
       // Truly unexpected error (something not caught by generateCallbackMessage's
       // own try/catch). Log it and return the after-hours fallback as a last
@@ -430,9 +526,10 @@ export function registerCallbackMessageRoutes(app) {
         fell_back_reason: 'unhandled_endpoint_error',
         model: null,
         elapsed_ms: 0,
+        request_id: null,
       });
     }
   });
 
-  console.log('[REST API] Registered: POST /api/agentic/dynamic-callback-message (no-auth, HDL.2 dynamic SMS)');
+  console.log('[REST API] Registered: POST /api/agentic/dynamic-callback-message (no-auth, HDL.2 dynamic SMS, audit-logged)');
 }
