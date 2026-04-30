@@ -13,6 +13,24 @@
  * Output: Structured assessment written to lead_intelligence table
  *         + ai.analysis_completed event emitted for Decision Engine.
  *
+ * v1.5 (2026-04-30) — Include full message_text in emitted event payload.
+ *   PROBLEM: ai.analysis_completed events only carried `message_preview`
+ *   (first 100 chars). The agentic responder (send-message-handler) expected
+ *   `message_text` in the event context and fell back to the literal string
+ *   "No trigger message available" when none was found. The intent classifier
+ *   then matched the keyword "no" in that placeholder with whole-word regex,
+ *   classified the inbound as CUSTOMER_STATUS_NEGATIVE, applied
+ *   hdl:callback-sales, and short-circuited response generation silently.
+ *   Surfaced 2026-04-30 with contact 4uaY9wDO6Zz8hjA1DjXd: lead said
+ *   "Hey can you set a date for someone to come measure?" (Stage 5 booking
+ *   intent) and got handed off to callback-sales with no SMS reply, no
+ *   GroupMe approval prompt.
+ *
+ *   FIX: Add `message_text: messageText` (full, untruncated) to the
+ *   ai.analysis_completed payload alongside the existing message_preview.
+ *   Pairs with send-message-handler.js v3.4 which now also accepts
+ *   message_preview as a final fallback before failing fast.
+ *
  * v1.4 (2026-04-27) — Conversation context truncation fix.
  *   PROBLEM: v1.3 added the CTA-AFFIRMATIVE OVERRIDE block which made
  *   the AI actively scan recent outbound messages for CTAs. But the
@@ -568,6 +586,10 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null) 
       ghl_contact_id: ghlContactId,
       payload: {
         ...analysis,
+        // v1.5: Full message_text so downstream consumers (send-message-handler)
+        // have the actual inbound. message_preview is kept for backward
+        // compatibility with anything reading the first 100 chars.
+        message_text: messageText,
         message_preview: messageText.slice(0, 100),
         analysis_duration_ms: Date.now() - startTime,
         lp_data_available: context.lp?.matched || false,
