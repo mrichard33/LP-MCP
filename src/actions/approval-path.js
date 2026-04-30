@@ -5,6 +5,44 @@
  * trigger-message resolution, or head-of-line behavior stays a small,
  * focused edit. Extracted from action-executor.js v4.2 refactor.
  *
+ * v4.7 (2026-04-30) — AUTO-EXECUTE book_appointment companion actions.
+ *   Mark's ask: when the AI emits companion_action: book_appointment, the
+ *   booking should fire IMMEDIATELY without waiting for GroupMe approval.
+ *   The verbal-confirmation send_message in the same batch still goes
+ *   through approval (still want a human eye on outbound copy until the
+ *   responder is widely trusted), but the actual GHL Calendar write
+ *   doesn't waste an approval cycle.
+ *
+ *   Why this is safe to auto-execute:
+ *   1. response-generator.js v2.7.6 only emits a companion_action when
+ *      the lead has hard-confirmed a SPECIFIC time previously offered by
+ *      the bot — not on a vague "yes" or "ok"
+ *   2. validateResponse already drops companions with past dates, missing
+ *      fields, malformed start_time, or unknown calendar_name (v1.8 fix)
+ *   3. The booking action's idempotency is handled by GHL — duplicate
+ *      bookings on the same calendar/contact/start_time are rejected
+ *   4. If the booking does fail (rate limit, slot conflict), the failure
+ *      surfaces on the action row and Mark sees it in the action audit.
+ *      The verbal-confirm SMS is still gated on his approval, so he can
+ *      reject the SMS if he sees a failed book_appointment in the card.
+ *
+ *   Implementation: a single COMPANION_AUTO_EXECUTE allowlist controls
+ *   which companion types skip approval. Today: just 'book_appointment'.
+ *   Future companion types default to the v4.6 approval-gated path until
+ *   explicitly added to the allowlist.
+ *
+ *   Card behavior: the auto-executing companion is NOT pushed into the
+ *   batch's `actions` array (the card aggregator only displays
+ *   approval-gated rows), but the companion details are still surfaced
+ *   via enrichment.companionAction so the card can render an "AUTO-BOOK
+ *   QUEUED" line. groupme.js can read that field and display it however
+ *   it wants. (If groupme.js ignores it, no harm — the booking still
+ *   fires; the card just doesn't mention it.)
+ *
+ *   Phase 2 of the executor picks the auto-execute companion up on the
+ *   very next cycle — the same heartbeat that processed Phase 1
+ *   (approval queue) above. Typical lag: <500ms.
+ *
  * v4.6 (2026-04-29) — COMPANION_ACTION INSERTION (auto-book on hard confirm).
  *   Pairs with response-generator.js v2.7.6 which can now emit a top-level
  *   companion_action field (currently only book_appointment). When the
@@ -12,9 +50,10 @@
  *   inserts a sibling agent_action into the same batch_id BEFORE sending
  *   the GroupMe approval card. The card therefore shows BOTH the verbal
  *   confirmation send_message AND the auto-book — Mark approves once,
- *   both fire together.
+ *   both fire together.  (NOTE: superseded by v4.7 for book_appointment;
+ *   the companion now auto-executes instead of joining the approval card.)
  *
- *   Insertion shape:
+ *   Insertion shape (v4.6):
  *     - event_id: same as the parent send_message action
  *     - target_system: 'ghl' (book_appointment hits GHL Calendar API)
  *     - target_entity: 'contact'
@@ -26,8 +65,9 @@
  *     - reasoning: companion_action.reasoning (extraction trace)
  *     - confidence: 1.0
  *     - rule_applied: same as parent (e.g. AGENTIC_RESPOND_POST_CHATBOT)
- *     - status: 'pending_approval' (same gate as parent)
- *     - requires_approval: true
+ *     - status: 'pending_approval' (same gate as parent) [v4.7: 'pending'
+ *       for auto-execute types]
+ *     - requires_approval: true [v4.7: false for auto-execute types]
  *     - batch_id: same batch_id (so approval-card aggregation works)
  *     - sequence_order: parent.sequence_order - 1 (so executor processes
  *       the booking BEFORE the verbal confirmation message; that way if
@@ -105,6 +145,23 @@ import { acquireToken, report429 } from '../ghl-rate-limiter.js';
 import { bumpContactCache } from '../context-builder.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
+
+// ═══════════════════════════════════════════════════════════════════
+// v4.7: COMPANION AUTO-EXECUTE ALLOWLIST
+// ═══════════════════════════════════════════════════════════════════
+//
+// Companion action types that SKIP approval and auto-execute via Phase 2
+// of the executor. Today: book_appointment only. The AI emits companion
+// book_appointment only when the lead hard-confirmed a previously-offered
+// time and validateResponse cleared past-date / missing-field / unknown-
+// calendar guards — that's a tighter trust window than the verbal-confirm
+// SMS itself, so the booking fires immediately while the SMS still waits
+// for human review.
+//
+// Add a type here only when the same trust argument applies: the AI must
+// only emit it under a verifiable, narrow condition AND validateResponse
+// must already screen for shape errors.
+const COMPANION_AUTO_EXECUTE = new Set(['book_appointment']);
 
 // ═══════════════════════════════════════════════════════════════════
 // v4.5: INLINE HANDOFF HELPERS
@@ -373,9 +430,14 @@ export async function processApprovalQueue() {
           // ── v4.6: COMPANION_ACTION INSERTION ──────────────────────
           // If response-generator emitted a companion_action (e.g.
           // book_appointment for hard-confirmed held times), insert it
-          // as a sibling row in the same batch BEFORE the approval card
-          // is sent. The card aggregator iterates the batch and will
-          // automatically include this in the human review.
+          // as a sibling row in the same batch.
+          //
+          // v4.7: book_appointment companions auto-execute (status:
+          // 'pending', requires_approval: false) — Phase 2 of the
+          // executor will pick them up on the same heartbeat that
+          // processed this approval queue. Future companion types
+          // default to the v4.6 approval-gated path unless added to
+          // COMPANION_AUTO_EXECUTE.
           //
           // The companion was already shape-validated by validateResponse
           // (past-date guard, ISO format, calendar_name presence) — if
@@ -383,6 +445,7 @@ export async function processApprovalQueue() {
           if (generated.companion_action && generated.companion_action.action_type) {
             const companion = generated.companion_action;
             const parentSeq = typeof sendAction.sequence_order === 'number' ? sendAction.sequence_order : 0;
+            const isAutoExecuting = COMPANION_AUTO_EXECUTE.has(companion.action_type);
             try {
               const { data: companionRow, error: companionErr } = await supabase
                 .from('agent_actions')
@@ -398,12 +461,17 @@ export async function processApprovalQueue() {
                     : `Companion to send_message ${sendAction.id} (${sendAction.rule_applied || 'manual'})`,
                   confidence: 1.0,
                   rule_applied: sendAction.rule_applied,
-                  status: 'pending_approval',
-                  requires_approval: true,
+                  // v4.7: auto-execute types skip approval; everything
+                  // else stays approval-gated as in v4.6.
+                  status: isAutoExecuting ? 'pending' : 'pending_approval',
+                  requires_approval: !isAutoExecuting,
                   batch_id: sendAction.batch_id,
-                  // sequence_order = parentSeq - 1 so the executor runs
-                  // book_appointment BEFORE send_message. If booking
-                  // fails, we don't want to send a "locked in" SMS.
+                  // sequence_order = parentSeq - 1 keeps the booking
+                  // ahead of the verbal-confirm SMS in the batch order.
+                  // Under v4.7 auto-execute the SMS is in a different
+                  // status anyway (pending_approval vs pending), but
+                  // keeping the order correct preserves intent for
+                  // future approval-gated companions.
                   sequence_order: parentSeq - 1,
                 })
                 .select()
@@ -412,20 +480,31 @@ export async function processApprovalQueue() {
               if (companionErr) {
                 console.warn(`[ActionExecutor] Companion insert failed for batch ${batchId}: ${companionErr.message} — proceeding without companion`);
               } else if (companionRow) {
-                // Add to in-memory batch so the approval card sees it.
-                actions.push(companionRow);
-                // Sort by sequence_order so the card displays in execution order.
-                actions.sort((a, b) => (a.sequence_order ?? 0) - (b.sequence_order ?? 0));
+                // v4.7: Only push approval-gated companions into the
+                // batch's actions[] array. Auto-executing companions
+                // are picked up by Phase 2 directly and shouldn't
+                // appear as approval-card line items.
+                if (!isAutoExecuting) {
+                  actions.push(companionRow);
+                  // Sort by sequence_order so the card displays in execution order.
+                  actions.sort((a, b) => (a.sequence_order ?? 0) - (b.sequence_order ?? 0));
+                }
 
-                console.log(`[ActionExecutor] ✅ Companion ${companion.action_type} inserted: id=${companionRow.id}, batch=${batchId}, seq=${companionRow.sequence_order}, payload.calendar_name="${companion.action_payload?.calendar_name || 'n/a'}", payload.start_time="${companion.action_payload?.start_time || 'n/a'}"`);
+                console.log(`[ActionExecutor] ✅ Companion ${companion.action_type} inserted: id=${companionRow.id}, batch=${batchId}, seq=${companionRow.sequence_order}, ` +
+                  `mode=${isAutoExecuting ? 'AUTO-EXECUTE' : 'approval-gated'}, ` +
+                  `payload.calendar_name="${companion.action_payload?.calendar_name || 'n/a'}", ` +
+                  `payload.start_time="${companion.action_payload?.start_time || 'n/a'}"`);
 
                 // Surface companion details in enrichment for the approval card.
+                // Even auto-executing companions get surfaced — the card can
+                // render an "AUTO-BOOK QUEUED" line for human visibility.
                 enrichment.companionAction = {
                   type: companion.action_type,
                   calendar_name: companion.action_payload?.calendar_name || null,
                   start_time: companion.action_payload?.start_time || null,
                   duration_minutes: companion.action_payload?.duration_minutes || null,
                   reasoning: companion.reasoning || null,
+                  auto_executing: isAutoExecuting,
                 };
               }
             } catch (insertErr) {
