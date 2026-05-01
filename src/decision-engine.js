@@ -3,6 +3,44 @@
  * 
  * The brain of the agentic system.
  *
+ * v2.11 — 2026-05-01. Three new context predicates for engagement-depth
+ *   gating and inbound text matching:
+ *
+ *     thread_turn_count_gte: <int>
+ *       Count of GHL conversation messages (both directions) for this
+ *       contact within the last 60 minutes. Lets escalation rules require
+ *       a minimum amount of back-and-forth before they fire — closes the
+ *       Mark Test gap where BEHAVIORAL_ESCALATE_NON_CS_HOT_CALL fired
+ *       after only 2 turns ("Do you sell aluminum windows?" + "It's a
+ *       new project") and dumped the contact into Hot Call SMS.
+ *       60-min lookback approximates a single live thread without needing
+ *       gap-detection logic — Mark's prior aluminum thread that day was
+ *       9+ hours earlier and falls outside the window.
+ *
+ *     any_of: [<conditions>, <conditions>, ...]
+ *       OR-semantics block. The clause passes when at least one of its
+ *       child condition objects passes when evaluated recursively. Pairs
+ *       with thread_turn_count_gte to add a high-intent bypass:
+ *         "any_of": [
+ *           {"thread_turn_count_gte": 3},
+ *           {"intent_score_gte": 80}
+ *         ]
+ *       Lets a hot lead escalate on turn 1 when the analyzer scored them
+ *       hot, while keeping the gate for cold/medium contacts.
+ *
+ *     payload_message_matches: <regex string>
+ *       Tests event.payload.message_text against a JS regex (case-insensitive).
+ *       Used by INTENT_CANCEL_REQUESTED as an analyzer-independent backstop
+ *       so the rule can fire on explicit "cancel my appointment" inbound
+ *       messages even before the analyzer learns to classify cancel intent.
+ *       Will be augmented (not replaced) once message-analyzer.js learns
+ *       cancel-intent classification.
+ *
+ *   The countThreadTurns helper hits GHL API directly because LP MCP and
+ *   HL MCP run on separate Supabase instances (no cross-DB JOINs). Two
+ *   API calls per evaluation — acceptable since the predicate is only
+ *   used on ai.analysis_completed events (low frequency).
+ *
  * v2.10 — 2026-04-30. REVERT v2.8 auto-approve bypass for AGENTIC_RESPOND_POST_CHATBOT.
  *   v2.8 added a Stage 3+ tag bypass that auto-approved AI replies for
  *   contacts with bj:stage-3-comparing / stage-4-negotiating / stage-5-committed
@@ -280,6 +318,86 @@ async function fetchContactTags(ghlContactId) {
   } catch { return []; }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// v2.11 — THREAD TURN COUNT (for engagement-depth gating)
+// ═══════════════════════════════════════════════════════════════════
+//
+// Counts GHL conversation messages (both directions) for a contact within
+// the last `sinceMinutes`. Used by thread_turn_count_gte predicate to gate
+// escalation rules — keeps the bot from prematurely handing off after one
+// or two messages.
+//
+// Implementation: hits GHL API directly because LP MCP runs on its own
+// Supabase instance separate from HL MCP's message cache, and cross-DB
+// JOINs are not possible. Two API calls per evaluation — first fetches
+// the conversation ID, second fetches its messages.
+//
+// The 60-minute lookback approximates "single live thread" without needing
+// explicit gap detection. Threads typically have replies within minutes;
+// a 60-min cutoff cleanly separates the active thread from re-engagement
+// hours later.
+//
+// Returns 0 on any failure (treats as fail-closed for the caller — gate
+// will block the rule from firing). Set GHL_API_KEY at minimum.
+async function countThreadTurns(ghlContactId, sinceMinutes = 60) {
+  const GHL_API_KEY = process.env.GHL_API_KEY;
+  if (!GHL_API_KEY || !ghlContactId) return 0;
+
+  const locationId = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
+
+  try {
+    // 1. Fetch the conversation ID for this contact (most-recent only)
+    const convRes = await fetch(
+      `https://services.leadconnectorhq.com/conversations/search?contactId=${ghlContactId}&locationId=${locationId}&limit=1`,
+      {
+        headers: {
+          'Authorization': `Bearer ${GHL_API_KEY}`,
+          'Version': '2021-04-15',
+          'Accept': 'application/json',
+        },
+        signal: AbortSignal.timeout(8000),
+      }
+    );
+    if (!convRes.ok) {
+      console.warn(`[ThreadCount] conversation search failed for ${ghlContactId}: ${convRes.status}`);
+      return 0;
+    }
+    const convData = await convRes.json();
+    const conv = convData?.conversations?.[0];
+    if (!conv?.id) return 0;
+
+    // 2. Fetch messages in that conversation
+    const msgRes = await fetch(
+      `https://services.leadconnectorhq.com/conversations/${conv.id}/messages`,
+      {
+        headers: {
+          'Authorization': `Bearer ${GHL_API_KEY}`,
+          'Version': '2021-04-15',
+          'Accept': 'application/json',
+        },
+        signal: AbortSignal.timeout(8000),
+      }
+    );
+    if (!msgRes.ok) {
+      console.warn(`[ThreadCount] messages fetch failed for conv ${conv.id}: ${msgRes.status}`);
+      return 0;
+    }
+    const msgData = await msgRes.json();
+    const messages = msgData?.messages?.messages || [];
+
+    // 3. Count messages within the lookback window
+    const cutoff = Date.now() - (sinceMinutes * 60 * 1000);
+    const recent = messages.filter(m => {
+      const ts = new Date(m.dateAdded).getTime();
+      return Number.isFinite(ts) && ts >= cutoff;
+    });
+    return recent.length;
+  } catch (err) {
+    console.error(`[ThreadCount] error for ${ghlContactId}: ${err.message}`);
+    return 0;
+  }
+}
+
 async function evaluateContextConditions(conditions, intelligence, event) {
   if (!conditions || typeof conditions !== 'object') return true;
   const intel = intelligence || {};
@@ -371,6 +489,50 @@ async function evaluateContextConditions(conditions, intelligence, event) {
         }
         break;
       }
+
+      // v2.11 — Engagement depth + OR-semantics + payload regex
+      case 'thread_turn_count_gte': {
+        const turnCount = await countThreadTurns(event.ghl_contact_id, 60);
+        if (turnCount < expected) {
+          console.log(`[Context] BLOCKED: thread_turn_count ${turnCount} < ${expected} (60-min window)`);
+          return false;
+        }
+        break;
+      }
+      case 'any_of': {
+        if (!Array.isArray(expected)) {
+          console.warn(`[Context] any_of value must be an array, got ${typeof expected}`);
+          return false;
+        }
+        let anyPassed = false;
+        for (const altCondition of expected) {
+          if (await evaluateContextConditions(altCondition, intelligence, event)) {
+            anyPassed = true;
+            break;
+          }
+        }
+        if (!anyPassed) {
+          console.log(`[Context] BLOCKED: any_of — none of ${expected.length} alternatives matched`);
+          return false;
+        }
+        break;
+      }
+      case 'payload_message_matches': {
+        const text = String(payload.message_text || '');
+        let pattern;
+        try {
+          pattern = new RegExp(expected, 'i');
+        } catch (err) {
+          console.error(`[Context] Invalid regex in payload_message_matches "${expected}": ${err.message}`);
+          return false;
+        }
+        if (!pattern.test(text)) {
+          console.log(`[Context] BLOCKED: payload_message_matches /${expected}/i did not match`);
+          return false;
+        }
+        break;
+      }
+
       default: console.warn(`[DecisionEngine] Unknown context condition: ${key}`);
     }
   }
