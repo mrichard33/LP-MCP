@@ -16,17 +16,26 @@
  * as defense against Railway redeploys killing processes mid-handler and
  * against the orphan 'approved' status.
  *
- * Supported action types (18):
+ * Supported action types (19):
  *   add_tag, remove_tag, set_stage, move_opportunity, update_opportunity,
  *   remove_from_workflow, add_to_workflow, book_appointment,
  *   cancel_appointment, reschedule_appointment, create_task,
  *   send_notification, set_lp_appointment, create_lp_lead,
- *   update_custom_fields, update_contact_email, calculate_time_lapse_tier,
- *   send_message.
+ *   update_lp_dnc_status, update_custom_fields, update_contact_email,
+ *   calculate_time_lapse_tier, send_message.
  *
  * 2026-05-01 — added create_lp_lead (Jane recovery). Closes the
  * chatbot-in-session-booking gap that left contacts out of LP because
  * Bot 4 didn't set any tag wired to the existing LP-Send Lead workflow.
+ *
+ * 2026-05-01 — added update_lp_dnc_status (Charles Poulos recovery).
+ * Closes the GHL→LP DNC propagation gap that left STOP-keyword DNC
+ * contacts marked DNC in GHL but still "Data" disposition in LP.
+ * The original GHL workflow webhook was failing with LP returning
+ * "Customer ID does not exist" — root cause was a merge field issue
+ * ({{contact.lp_prospect_id}} not resolving). The agentic handler
+ * reads the prospect ID directly from the GHL contact object,
+ * sidestepping the merge field entirely.
  */
 
 import supabase from '../supabase.js';
@@ -43,6 +52,7 @@ import { executeAddToWorkflow, executeRemoveFromWorkflow } from './handlers/work
 import { executeBookAppointment, executeCancelAppointment, executeRescheduleAppointment } from './handlers/appointments.js';
 import { executeSetLPAppointment } from './handlers/lp-appointment.js';
 import { executeCreateLPLead } from './handlers/lp-lead.js';
+import { executeUpdateLPDNCStatus } from './handlers/lp-dnc.js';
 import { executeCreateTask } from './handlers/tasks.js';
 import { executeSendNotification } from './handlers/notifications.js';
 import { executeUpdateCustomFields, executeUpdateContactEmail } from './handlers/custom-fields.js';
@@ -64,6 +74,7 @@ const ACTION_HANDLERS = {
   send_notification: executeSendNotification,
   set_lp_appointment: executeSetLPAppointment,
   create_lp_lead: executeCreateLPLead,           // 2026-05-01 — agentic LP push (Jane recovery)
+  update_lp_dnc_status: executeUpdateLPDNCStatus, // 2026-05-01 — agentic DNC push (Charles Poulos recovery)
   update_custom_fields: executeUpdateCustomFields,
   update_contact_email: executeUpdateContactEmail,
   calculate_time_lapse_tier: executeCalculateTimeLapseTier,
