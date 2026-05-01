@@ -61,6 +61,7 @@ const NON_IDEMPOTENT_ACTION_TYPES = new Set([
   'create_task',         // posts GHL note + GroupMe notification
   'send_notification',   // posts GroupMe message
   'send_message',        // sends customer-facing SMS/email
+  'create_lp_lead',      // 2026-05-01 — posts to LP /api/Leads/LeadAdd; double-creates would queue duplicate inbound leads
 ]);
 
 /**
