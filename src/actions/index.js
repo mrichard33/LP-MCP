@@ -16,12 +16,12 @@
  * as defense against Railway redeploys killing processes mid-handler and
  * against the orphan 'approved' status.
  *
- * Supported action types (16):
+ * Supported action types (17):
  *   add_tag, remove_tag, set_stage, move_opportunity, update_opportunity,
  *   remove_from_workflow, add_to_workflow, book_appointment,
- *   cancel_appointment, create_task, send_notification, set_lp_appointment,
- *   update_custom_fields, update_contact_email, calculate_time_lapse_tier,
- *   send_message.
+ *   cancel_appointment, reschedule_appointment, create_task,
+ *   send_notification, set_lp_appointment, update_custom_fields,
+ *   update_contact_email, calculate_time_lapse_tier, send_message.
  */
 
 import supabase from '../supabase.js';
@@ -35,7 +35,7 @@ import { reapStuckActions } from './reaper.js';
 import { executeAddTag, executeRemoveTag, executeSetStage } from './handlers/tags.js';
 import { executeMoveOpportunity, executeUpdateOpportunity } from './handlers/opportunities.js';
 import { executeAddToWorkflow, executeRemoveFromWorkflow } from './handlers/workflows.js';
-import { executeBookAppointment, executeCancelAppointment } from './handlers/appointments.js';
+import { executeBookAppointment, executeCancelAppointment, executeRescheduleAppointment } from './handlers/appointments.js';
 import { executeSetLPAppointment } from './handlers/lp-appointment.js';
 import { executeCreateTask } from './handlers/tasks.js';
 import { executeSendNotification } from './handlers/notifications.js';
@@ -53,6 +53,7 @@ const ACTION_HANDLERS = {
   add_to_workflow: executeAddToWorkflow,
   book_appointment: executeBookAppointment,
   cancel_appointment: executeCancelAppointment,
+  reschedule_appointment: executeRescheduleAppointment, // v2.7.8 — agentic reschedule (cancel old + book new)
   create_task: executeCreateTask,
   send_notification: executeSendNotification,
   set_lp_appointment: executeSetLPAppointment,
@@ -67,6 +68,7 @@ const CONTEXT_AWARE_HANDLERS = new Set([
   'send_notification',
   'create_task',
   'book_appointment',
+  'reschedule_appointment',  // v2.7.8 — needs context for date interpolation in new_start_time
   'update_contact_email',
   'send_message',
 ]);

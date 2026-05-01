@@ -5,6 +5,91 @@
  * trigger-message resolution, or head-of-line behavior stays a small,
  * focused edit. Extracted from action-executor.js v4.2 refactor.
  *
+ * v4.9 (2026-04-30) — COMPANION_AUTO_EXECUTE expanded for cancel/reschedule.
+ *   Pairs with response-generator v2.7.8's cancellation flow, which can
+ *   now emit two new companion types:
+ *     - cancel_appointment      (lead pushed back on reschedule offer)
+ *     - reschedule_appointment  (lead picked a new time; combined op:
+ *                                cancels old + books new in one handler call)
+ *
+ *   Both join book_appointment in the auto-execute allowlist. Same trust
+ *   argument applies: the AI emits these only when validateResponse has
+ *   confirmed the appointment_id (cancel) or both old_appointment_id +
+ *   new_start_time (reschedule), AND the AI's prompt requires explicit
+ *   conversation evidence (turn-2 pushback for cancel, turn-3 hard
+ *   confirm of a proposed reschedule slot for reschedule). Past-date
+ *   guards still apply for reschedule.
+ *
+ *   Why auto-execute the cancel matters: with the auto-reply env var on,
+ *   the verbal-confirm SMS ("I've taken Tuesday May 5 off the calendar")
+ *   fires immediately. If the cancel itself were approval-gated, the
+ *   lead would be told the appointment is cancelled while it's still
+ *   active on the calendar — a lie. Auto-executing the cancel makes the
+ *   SMS truthful by the time it lands.
+ *
+ *   Same applies to reschedule: the verbal "moved you to Saturday at 2 PM"
+ *   only matches reality if both the cancel and the new booking have
+ *   succeeded by the time the SMS goes out. Phase 2 picks up auto-
+ *   execute companions on the SAME heartbeat as the SMS, so latency is
+ *   minimal (typically <500ms gap). The reschedule handler enforces
+ *   cancel-before-book ordering server-side.
+ *
+ *   No other behavior change in this version. The four auto-reply gates
+ *   from v4.8 still apply unchanged for the verbal-confirm SMS itself.
+ *
+ * v4.8 (2026-04-30) — AGENTIC AUTO-REPLY (env-gated, tag-verified).
+ *   Mark's ask: turn on full auto-reply for the agentic responder. When
+ *   AGENTIC_AUTOREPLY_ENABLED=true AND the contact still carries the
+ *   required tag (default 'pause-bot') AND the action came from an
+ *   allowlisted rule (default AGENTIC_RESPOND_POST_CHATBOT), the batch's
+ *   send_message + add_tag actions auto-execute via Phase 2 instead of
+ *   waiting for a human approval card.
+ *
+ *   Four gates — ALL AND-ed; failing any one falls back to the v4.6/v4.7
+ *   approval-card path:
+ *     G1. env var AGENTIC_AUTOREPLY_ENABLED === 'true' (master kill switch)
+ *     G2. action.rule_applied is in AGENTIC_AUTOREPLY_RULES allowlist
+ *     G3. pre-generation succeeded (no short-circuit, no error)
+ *     G4. contact has AGENTIC_AUTOREPLY_REQUIRED_TAG (default 'pause-bot'),
+ *         verified LIVE from the GHL contact GET endpoint at execution
+ *         time — NOT from cache. Tags can change between rule fire and
+ *         approval-path execution, and we want the safety belt on the
+ *         actual current state.
+ *
+ *   What flips: every action in the batch with status='pending_approval'
+ *   and requires_approval=true gets flipped to status='pending',
+ *   requires_approval=false. Phase 2 of the executor on the SAME
+ *   heartbeat picks them up. The book_appointment companion (already
+ *   auto-executing per v4.7) is unaffected — it stays on its own path.
+ *
+ *   What does NOT flip:
+ *   - v4.5 inline-handoff batches (short-circuit) — they bypass auto-
+ *     reply entirely; the handoff is the action.
+ *   - Batches where pre-gen errored — they still get an approval card so
+ *     the human can see the error and intervene.
+ *   - Batches where ANY of G1-G4 fails — same fallback to the card.
+ *
+ *   Visibility: instead of an approval card, GroupMe gets a
+ *   "🚀 AGENTIC AUTO-REPLY (no approval needed)" info notice with the
+ *   sent message, reasoning, intent class, any companion booking, and
+ *   any tags applied. Mark can audit what fired but cannot edit/reject
+ *   (the message is already out). The action audit trail captures the
+ *   full payload for retrospection and v2.7.4 in-context learning.
+ *
+ *   Trade-off: with auto-reply on, the "Edit X" / approve-reject cycle
+ *   is unavailable for batches that pass the gates. The system trusts
+ *   the AI's output for the allowlisted rule + tag combination. Tighten
+ *   or loosen by editing AGENTIC_AUTOREPLY_RULES or flipping the env
+ *   var off at any time without redeploy (Railway picks up env changes
+ *   on the next heartbeat).
+ *
+ *   Tuning knobs (env vars):
+ *     AGENTIC_AUTOREPLY_ENABLED       — 'true' | 'false' (default: false)
+ *     AGENTIC_AUTOREPLY_RULES         — comma-separated rule keys
+ *                                       (default: AGENTIC_RESPOND_POST_CHATBOT)
+ *     AGENTIC_AUTOREPLY_REQUIRED_TAG  — single tag string
+ *                                       (default: pause-bot)
+ *
  * v4.7 (2026-04-30) — AUTO-EXECUTE book_appointment companion actions.
  *   Mark's ask: when the AI emits companion_action: book_appointment, the
  *   booking should fire IMMEDIATELY without waiting for GroupMe approval.
@@ -27,9 +112,8 @@
  *      reject the SMS if he sees a failed book_appointment in the card.
  *
  *   Implementation: a single COMPANION_AUTO_EXECUTE allowlist controls
- *   which companion types skip approval. Today: just 'book_appointment'.
- *   Future companion types default to the v4.6 approval-gated path until
- *   explicitly added to the allowlist.
+ *   which companion types skip approval. v4.9 expands this to include
+ *   cancel_appointment and reschedule_appointment.
  *
  *   Card behavior: the auto-executing companion is NOT pushed into the
  *   batch's `actions` array (the card aggregator only displays
@@ -45,34 +129,12 @@
  *
  * v4.6 (2026-04-29) — COMPANION_ACTION INSERTION (auto-book on hard confirm).
  *   Pairs with response-generator.js v2.7.6 which can now emit a top-level
- *   companion_action field (currently only book_appointment). When the
- *   pre-generation result includes companion_action, this approval-path
- *   inserts a sibling agent_action into the same batch_id BEFORE sending
- *   the GroupMe approval card. The card therefore shows BOTH the verbal
- *   confirmation send_message AND the auto-book — Mark approves once,
- *   both fire together.  (NOTE: superseded by v4.7 for book_appointment;
- *   the companion now auto-executes instead of joining the approval card.)
- *
- *   Insertion shape (v4.6):
- *     - event_id: same as the parent send_message action
- *     - target_system: 'ghl' (book_appointment hits GHL Calendar API)
- *     - target_entity: 'contact'
- *     - target_id: same contact
- *     - action_type: companion_action.action_type ('book_appointment')
- *     - action_payload: companion_action.action_payload (validated by
- *       response-generator.validateResponse — past dates, missing fields,
- *       and bad calendar names are dropped before this code sees them)
- *     - reasoning: companion_action.reasoning (extraction trace)
- *     - confidence: 1.0
- *     - rule_applied: same as parent (e.g. AGENTIC_RESPOND_POST_CHATBOT)
- *     - status: 'pending_approval' (same gate as parent) [v4.7: 'pending'
- *       for auto-execute types]
- *     - requires_approval: true [v4.7: false for auto-execute types]
- *     - batch_id: same batch_id (so approval-card aggregation works)
- *     - sequence_order: parent.sequence_order - 1 (so executor processes
- *       the booking BEFORE the verbal confirmation message; that way if
- *       the booking fails, we don't send a "locked in" message that
- *       wasn't actually locked in)
+ *   companion_action field. When the pre-generation result includes
+ *   companion_action, this approval-path inserts a sibling agent_action
+ *   into the same batch_id BEFORE sending the GroupMe approval card. The
+ *   card therefore shows BOTH the verbal confirmation send_message AND
+ *   the auto-book — Mark approves once, both fire together. (NOTE:
+ *   superseded by v4.7+ for action types in COMPANION_AUTO_EXECUTE.)
  *
  *   The approval card aggregator already iterates the full batch's
  *   actions, so adding this row before sendApprovalRequest is enough —
@@ -86,21 +148,8 @@
  * v4.5 (2026-04-28) — APPLY HANDOFF INLINE ON SHORT-CIRCUIT.
  *   PROBLEM: Under v4.4 the pre-gen short-circuit branch left the action
  *   queued and shipped an approval card that had NO message preview line
- *   (because makeShortCircuitResult sets message:null). Mark would see:
- *
- *     🔔 APPROVAL [#27239]
- *     🤖 AGENTIC RESPONSE
- *     👤 Mark Test (+19545081512)
- *     💬 "Can someone call me now?"
- *     🤖 Lead is persistently requesting immediate human contact...
- *     🎯 send_message: SMS reply | Tag: pause-workflow
- *     Reply: Yes 27239 or No 27239
- *
- *   No 📱 line. Nothing to actually approve. If Mark approved anyway,
- *   the runtime would call generateResponse() AGAIN, hit the gate AGAIN,
- *   and only THEN apply the handoff tag via handleShortCircuit. Two
- *   gate evaluations, one wasted approval cycle, and a misleading card
- *   that asked for review of a non-decision.
+ *   (because makeShortCircuitResult sets message:null). Mark would see a
+ *   blank approval card asking for review of a non-decision.
  *
  *   FIX: When pre-gen returns short_circuit:true, apply the handoff
  *   IMMEDIATELY at queue time:
@@ -112,16 +161,9 @@
  *        not an approval card)
  *     4. Skip sendApprovalRequest entirely for this batch
  *
- *   The runtime path in send-message-handler.handleShortCircuit becomes
- *   a no-op for these actions (they're already 'completed' before
- *   send-message-handler ever sees them) but stays in place as the
- *   canonical path for actions that bypass pre-generation (direct LP
- *   webhook send, n8n manual triggers, etc.).
- *
  *   Surfaced 2026-04-28 by Mark with contact 15Z6TaUK4WHBK1R4H64S asking
  *   "Can someone call me now?" — gate fired CALLBACK, blank approval
- *   card landed in GroupMe, Mark approved, runtime applied
- *   hdl:callback-request, no GHL workflow listened, conversation died.
+ *   card landed in GroupMe.
  *
  * v4.4 (2026-04-28) — Two safety fixes for AGENTIC_* approvals:
  *   1. NULL-SAFE PREVIEW LOG (the `generated.message.slice(0,80)` log
@@ -147,21 +189,76 @@ import { bumpContactCache } from '../context-builder.js';
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 
 // ═══════════════════════════════════════════════════════════════════
-// v4.7: COMPANION AUTO-EXECUTE ALLOWLIST
+// v4.8: AGENTIC AUTO-REPLY GATING (env-gated, tag-verified)
+// ═══════════════════════════════════════════════════════════════════
+//
+// Master kill switch. Set to 'true' (string, case-insensitive) to enable
+// auto-reply for batches that pass all four gates. Default 'false' so
+// upgrades to this code do NOT change observable behavior unless the
+// operator explicitly opts in.
+const AGENTIC_AUTOREPLY_ENABLED = String(
+  process.env.AGENTIC_AUTOREPLY_ENABLED || 'false'
+).toLowerCase() === 'true';
+
+// Allowlist of rule keys whose batches are eligible for auto-reply.
+// Comma-separated. Default: just AGENTIC_RESPOND_POST_CHATBOT (the rule
+// that fires on ai.analysis_completed for pause-bot-tagged contacts).
+// Add more rule keys here as the system matures and other agentic rules
+// earn full-trust status.
+const AGENTIC_AUTOREPLY_RULES = (
+  process.env.AGENTIC_AUTOREPLY_RULES || 'AGENTIC_RESPOND_POST_CHATBOT'
+).split(',').map(s => s.trim()).filter(Boolean);
+
+// The contact tag that MUST be present at execution time for auto-reply
+// to fire. Default 'pause-bot' — the tag that signals "the chatbot has
+// stepped aside; the agentic responder is in charge". If a human or
+// another workflow has removed this tag between rule fire and approval-
+// path execution, auto-reply gracefully falls back to the approval card.
+const AGENTIC_AUTOREPLY_REQUIRED_TAG = (
+  process.env.AGENTIC_AUTOREPLY_REQUIRED_TAG || 'pause-bot'
+).trim();
+
+// Log effective config at startup so it shows in Railway logs after each
+// deploy. Helps confirm the env vars are actually applied.
+console.log(`[ApprovalPath] v4.9 auto-reply config: ` +
+  `enabled=${AGENTIC_AUTOREPLY_ENABLED}, ` +
+  `rules=[${AGENTIC_AUTOREPLY_RULES.join(',')}], ` +
+  `required_tag="${AGENTIC_AUTOREPLY_REQUIRED_TAG}"`);
+
+// ═══════════════════════════════════════════════════════════════════
+// v4.9: COMPANION AUTO-EXECUTE ALLOWLIST
 // ═══════════════════════════════════════════════════════════════════
 //
 // Companion action types that SKIP approval and auto-execute via Phase 2
-// of the executor. Today: book_appointment only. The AI emits companion
-// book_appointment only when the lead hard-confirmed a previously-offered
-// time and validateResponse cleared past-date / missing-field / unknown-
-// calendar guards — that's a tighter trust window than the verbal-confirm
-// SMS itself, so the booking fires immediately while the SMS still waits
-// for human review.
+// of the executor. These fire immediately when the AI emits them so the
+// verbal-confirm SMS in the same batch lands on a state that matches
+// what we just told the lead.
 //
-// Add a type here only when the same trust argument applies: the AI must
-// only emit it under a verifiable, narrow condition AND validateResponse
-// must already screen for shape errors.
-const COMPANION_AUTO_EXECUTE = new Set(['book_appointment']);
+//   book_appointment        — v4.7. AI emits only on hard-confirmation
+//                              of a previously-proposed time. Past-date
+//                              + missing-field guards in validateResponse.
+//   cancel_appointment      — v4.9. AI emits only on turn-2 pushback
+//                              after offering reschedule. Requires
+//                              appointment_id from EXISTING APPOINTMENTS
+//                              context block (validateResponse drops
+//                              companions with no appointment_id).
+//   reschedule_appointment  — v4.9. AI emits only on hard-confirmation
+//                              of a proposed reschedule slot. Requires
+//                              old_appointment_id + new_start_time;
+//                              past-date guard on new_start_time.
+//                              Handler enforces cancel-before-book ordering.
+//
+// Trust argument is the same across all three: the AI emits the companion
+// only under verifiable, narrow conditions, AND validateResponse screens
+// for shape errors. If any guard trips, the companion is dropped before
+// it reaches this code, so anything that arrives here is safe to fire.
+//
+// Add a type only when the same trust argument applies.
+const COMPANION_AUTO_EXECUTE = new Set([
+  'book_appointment',
+  'cancel_appointment',
+  'reschedule_appointment',
+]);
 
 // ═══════════════════════════════════════════════════════════════════
 // v4.5: INLINE HANDOFF HELPERS
@@ -210,6 +307,202 @@ async function applyContactTagsInline(contactId, tagList) {
 }
 
 /**
+ * v4.8 — Live tag fetch for the auto-reply gate. We deliberately do NOT
+ * trust any cached tag snapshot for this decision: tags change between
+ * rule fire and approval-path execution (e.g. a human pulls 'pause-bot'
+ * to take the conversation back), and the safety belt MUST reflect
+ * current state.
+ *
+ * Returns:
+ *   - Array of tag strings on success (possibly empty)
+ *   - null on any error (caller treats as "ineligible" → falls back to
+ *     the approval card)
+ */
+async function fetchContactTagsLive(contactId) {
+  if (!contactId || !GHL_API_KEY) return null;
+  try {
+    await acquireToken();
+    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${GHL_API_KEY}`,
+        'Version': '2021-07-28',
+        'Accept': 'application/json',
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.status === 429) {
+      report429();
+      console.warn(`[ApprovalPath] fetchContactTagsLive 429 for ${contactId}`);
+      return null;
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      console.warn(`[ApprovalPath] fetchContactTagsLive ${res.status} for ${contactId}: ${text.slice(0, 150)}`);
+      return null;
+    }
+    const data = await res.json();
+    // GHL v2 response shape: { contact: { tags: [...] } }. Some endpoints
+    // return tags at the root. Accept either, default to empty array if
+    // the field is missing entirely.
+    const tags = data?.contact?.tags ?? data?.tags;
+    if (!Array.isArray(tags)) {
+      console.warn(`[ApprovalPath] fetchContactTagsLive ${contactId}: tags not array (got: ${typeof tags})`);
+      return [];
+    }
+    return tags;
+  } catch (err) {
+    console.warn(`[ApprovalPath] fetchContactTagsLive threw for ${contactId}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * v4.8 — Evaluate the four gates for auto-reply on a single batch.
+ * Called AFTER pre-generation succeeds (so G3 implicit). G4 fires the
+ * live GHL contact GET only when G1+G2 pass — no wasted API calls when
+ * the env var is off.
+ *
+ * Returns { eligible: boolean, reason: string, tags: string[] | null }.
+ * `reason` is logged verbatim so each batch's gate decision is auditable.
+ */
+async function evaluateAutoReplyEligibility(sendAction) {
+  // G1: master kill switch
+  if (!AGENTIC_AUTOREPLY_ENABLED) {
+    return { eligible: false, reason: 'env_disabled', tags: null };
+  }
+  // G2: rule allowlist
+  const ruleApplied = sendAction.rule_applied || null;
+  if (!ruleApplied || !AGENTIC_AUTOREPLY_RULES.includes(ruleApplied)) {
+    return {
+      eligible: false,
+      reason: `rule_not_in_allowlist:${ruleApplied || 'none'}`,
+      tags: null,
+    };
+  }
+  // G4: live tag verification (G3 is implicit — we only get here if pre-gen
+  // succeeded; the caller handles the short-circuit and error branches).
+  const tags = await fetchContactTagsLive(sendAction.target_id);
+  if (tags === null) {
+    return {
+      eligible: false,
+      reason: 'tag_fetch_failed_falling_back_to_approval',
+      tags: null,
+    };
+  }
+  if (!tags.includes(AGENTIC_AUTOREPLY_REQUIRED_TAG)) {
+    return {
+      eligible: false,
+      reason: `missing_required_tag:${AGENTIC_AUTOREPLY_REQUIRED_TAG}`,
+      tags,
+    };
+  }
+  return { eligible: true, reason: 'all_gates_passed', tags };
+}
+
+/**
+ * v4.8 — Auto-reply application. Flips every action in the batch with
+ * status='pending_approval' AND requires_approval=true to status='pending'
+ * so Phase 2 of the executor picks them up on this same heartbeat. The
+ * companion book_appointment / cancel_appointment / reschedule_appointment
+ * (already auto-executing per v4.7/v4.9) are untouched. Sends an
+ * informational GroupMe notice and skips the approval card.
+ *
+ * Returns:
+ *   - flippable.length on success (positive int)
+ *   - 0 if there were no flippable actions (caller should fall through)
+ *   - -1 on DB update failure (caller MUST fall through to approval card
+ *     so the human still has eyes on it)
+ */
+async function applyAutoReplyInline({
+  batchActions,
+  sendAction,
+  generated,
+  contactName,
+  contactPhone,
+  triggerMessage,
+  tags,
+}) {
+  const flippable = batchActions.filter(
+    a => a.status === 'pending_approval' && a.requires_approval === true
+  );
+  if (flippable.length === 0) {
+    console.warn(`[ApprovalPath] AUTO-REPLY: no flippable actions in batch ${sendAction.batch_id || `s_${sendAction.id}`} — falling through`);
+    return 0;
+  }
+
+  const ids = flippable.map(a => a.id);
+  const updatedAt = new Date().toISOString();
+  const { error } = await supabase
+    .from('agent_actions')
+    .update({
+      status: 'pending',
+      requires_approval: false,
+      approved_by: 'auto_reply_v4_8',
+      updated_at: updatedAt,
+    })
+    .in('id', ids);
+
+  if (error) {
+    console.error(`[ApprovalPath] AUTO-REPLY db update failed for batch ${sendAction.batch_id}: ${error.message} — falling through to approval card`);
+    return -1;
+  }
+
+  // ── Build informational GroupMe notice ───────────────────────────
+  // Distinct format from approval card so Mark immediately recognizes
+  // there is no decision required. Header explicitly says "no approval
+  // needed". No "Reply: Yes/No" footer.
+  const preview = (triggerMessage || '').slice(0, 120);
+  const sentMessage = (sendAction.action_payload?.message || generated.message || '').slice(0, 400);
+  const reasoning = (generated.reasoning || '').slice(0, 200);
+  const displayName = contactName ? `${contactName}${contactPhone ? ` (${contactPhone})` : ''}` : sendAction.target_id;
+  const intent = generated.intent_class || 'unknown';
+  const arc = generated.story_arc && generated.story_arc !== 'none' ? generated.story_arc : null;
+
+  // v4.9: companion line — handle book_appointment, cancel_appointment,
+  // and reschedule_appointment formats so all three surface in the notice.
+  let companionLine = '';
+  const ca = generated.companion_action;
+  if (ca?.action_type === 'book_appointment' && ca.action_payload) {
+    const cap = ca.action_payload;
+    companionLine = `📅 Auto-booked: ${cap.calendar_name || '?'} — ${cap.start_time || '?'} (status: ${cap.status || '?'})\n`;
+  } else if (ca?.action_type === 'cancel_appointment' && ca.action_payload) {
+    const cap = ca.action_payload;
+    companionLine = `🗓 Auto-cancelled: appointment ${cap.appointment_id || '?'}` +
+      (cap.reason ? ` (reason: ${String(cap.reason).slice(0, 80)})` : '') + `\n`;
+  } else if (ca?.action_type === 'reschedule_appointment' && ca.action_payload) {
+    const cap = ca.action_payload;
+    companionLine = `🔄 Auto-rescheduled: ${cap.old_appointment_id || '?'} → ${cap.new_calendar_name || '?'} ${cap.new_start_time || '?'} (status: ${cap.status || '?'})\n`;
+  }
+
+  // Tag actions in the auto-fired batch (e.g. pause-workflow).
+  const tagActions = flippable.filter(a => a.action_type === 'add_tag');
+  const tagsAdded = tagActions.map(a => a.action_payload?.tag).filter(Boolean);
+  const tagsLine = tagsAdded.length > 0 ? `🏷  +${tagsAdded.join(', +')}\n` : '';
+
+  await sendGroupMeMessage(
+    `🚀 AGENTIC AUTO-REPLY (no approval needed)\n` +
+    `👤 ${displayName}\n` +
+    `Intent: ${intent}${arc ? ` | Arc: ${arc}` : ''} | Rule: ${sendAction.rule_applied || 'n/a'}\n` +
+    `💬 "${preview}"\n` +
+    `📱 "${sentMessage}"\n` +
+    (reasoning ? `🤖 ${reasoning}\n` : '') +
+    companionLine +
+    tagsLine +
+    `→ Auto-fired (${flippable.length} action${flippable.length === 1 ? '' : 's'}) at ${updatedAt}. Batch ${sendAction.batch_id || `s_${sendAction.id}`}.`
+  ).catch(err => {
+    console.warn(`[ApprovalPath] GroupMe (auto-reply notice) failed: ${err.message}`);
+  });
+
+  console.log(`[ApprovalPath] 🚀 AUTO-REPLY: contact=${sendAction.target_id} ` +
+    `rule=${sendAction.rule_applied} intent=${intent} ` +
+    `flipped=${flippable.length} tags=${tags?.length || 0} ` +
+    `companion=${ca?.action_type || 'none'}`);
+
+  return flippable.length;
+}
+
+/**
  * v4.5 — Inline handoff. Replaces the approval-card-then-runtime path
  * for short-circuited send_message actions. Applies the handoff tag(s)
  * directly, marks every action in the batch as 'completed' with an
@@ -237,13 +530,6 @@ async function applyHandoffInline({
     tagApplied = await applyContactTagsInline(contactId, tagsToApply);
   }
 
-  // Mark every action in the batch completed. add_tag actions in the batch
-  // (e.g. pause-workflow) are intentionally also marked complete because
-  // the agentic system has decided this lead is being handed off — the
-  // pause-workflow tag is no longer the right side effect (the GHL workflow
-  // listening on handoffTag will own state from here). If a future rule
-  // wants pause-workflow to apply alongside a handoff, add it to the
-  // tagsToApply list above explicitly.
   const completedAt = new Date().toISOString();
   const sharedResult = {
     action: 'send_message_handed_off_inline',
@@ -272,9 +558,6 @@ async function applyHandoffInline({
     })
     .in('id', actionIds);
 
-  // GroupMe informational notice — same format as
-  // send-message-handler.handleShortCircuit so the human signal is
-  // identical regardless of which path applied the tag.
   const dqLabel = isDQ ? ' [DISQUALIFIER]' : '';
   const tagSummary = tagsToApply.join(', ') || 'none';
   const preview = (triggerMessage || '').slice(0, 120);
@@ -306,13 +589,9 @@ async function applyHandoffInline({
 /**
  * Process the pending_approval queue. Returns the number of approval
  * requests sent this cycle for stats reporting (does not include
- * inline-handoff batches that bypassed the approval card).
+ * inline-handoff or auto-reply batches that bypassed the approval card).
  */
 export async function processApprovalQueue() {
-  // v4.2 — Pre-filter batches that already have an active ('pending') tracking
-  // record so stale unanswered approvals do not starve the limit(20) window.
-  // Only status='pending' blocks; resolved/expired/approved/rejected entries
-  // are ignored, permitting legitimate re-sends after an expiry/failure.
   const { data: trackedRows } = await supabase
     .from('groupme_approval_requests')
     .select('batch_id')
@@ -340,11 +619,9 @@ export async function processApprovalQueue() {
 
   let cardsSent = 0;
   let inlineHandoffs = 0;
+  let autoReplies = 0;
 
   for (const [batchId, actions] of approvalBatches) {
-    // Defense-in-depth: re-check for an active tracking record inside the
-    // loop. Guards against concurrent executor runs (heartbeat + approval-
-    // triggered execute) from double-sending the same card.
     const { data: existing } = await supabase
       .from('groupme_approval_requests')
       .select('id')
@@ -359,23 +636,16 @@ export async function processApprovalQueue() {
     const ctx = await getEventContext(firstAction);
     const enrichment = await buildNotificationEnrichment(firstAction.target_id, ctx, { lpLead, prospectId, ghlContactId });
 
-    // v4.3 — Search the whole batch for a send_message action that needs
-    // pre-generation. Rules like AGENTIC_RESPOND_POST_CHATBOT emit
-    // [add_tag pause-bot (index 0), send_message (index 1)], so checking
-    // only actions[0] misses the generation trigger.
     const sendAction = actions.find(
       a => a.action_type === 'send_message' && a.action_payload?.requires_ai_generation
     );
 
     let inlineHandoffApplied = false;
+    let autoReplyApplied = false;
 
     if (sendAction) {
       try {
         const { generateResponse } = await import('../response-generator.js');
-        // v4.2 — message_preview is the canonical inbound field on
-        // ai.analysis_completed events (what AGENTIC_* rules fire on).
-        // Still accept message_text/messageText/body from ghl.reply_received
-        // and other event shapes.
         const triggerMessage = ctx.message_text || ctx.messageText || ctx.body || ctx.message_preview || 'No trigger message';
         const channel = sendAction.action_payload?.channel || 'sms';
 
@@ -383,7 +653,6 @@ export async function processApprovalQueue() {
         const generated = await generateResponse(sendAction.target_id, channel, triggerMessage);
 
         if (generated.short_circuit) {
-          // ── v4.5: APPLY HANDOFF INLINE — no approval card, no runtime gate.
           console.log(`[ActionExecutor] Pre-gen short-circuit (intent: ${generated.intent_class}, ` +
                       `handler: ${generated.handler_code || 'n/a'}, ` +
                       `tag: ${generated.handoff_tag || 'none'}). ` +
@@ -400,8 +669,6 @@ export async function processApprovalQueue() {
           inlineHandoffs += completedCount > 0 ? 1 : 0;
           inlineHandoffApplied = true;
         } else {
-          // Normal generation — pre-fill the action payload so the human
-          // can preview-and-approve before runtime sends.
           const updatedPayload = {
             ...sendAction.action_payload,
             message: generated.message,
@@ -417,31 +684,21 @@ export async function processApprovalQueue() {
             .update({ action_payload: updatedPayload, updated_at: new Date().toISOString() })
             .eq('id', sendAction.id);
 
+          sendAction.action_payload = updatedPayload;
+
           enrichment.generatedMessage = generated.message;
           enrichment.storyArc = generated.story_arc;
           enrichment.aiReasoning = generated.reasoning;
 
-          // v4.4: null-safe preview log (was: generated.message.slice(0,80))
           const preview = typeof generated.message === 'string'
             ? generated.message.slice(0, 80)
             : '(no message)';
           console.log(`[ActionExecutor] Pre-generated: "${preview}..." (arc: ${generated.story_arc || 'n/a'})`);
 
-          // ── v4.6: COMPANION_ACTION INSERTION ──────────────────────
-          // If response-generator emitted a companion_action (e.g.
-          // book_appointment for hard-confirmed held times), insert it
-          // as a sibling row in the same batch.
-          //
-          // v4.7: book_appointment companions auto-execute (status:
-          // 'pending', requires_approval: false) — Phase 2 of the
-          // executor will pick them up on the same heartbeat that
-          // processed this approval queue. Future companion types
-          // default to the v4.6 approval-gated path unless added to
-          // COMPANION_AUTO_EXECUTE.
-          //
-          // The companion was already shape-validated by validateResponse
-          // (past-date guard, ISO format, calendar_name presence) — if
-          // it's truthy here, it's safe to persist.
+          // ── v4.6/v4.7/v4.9: COMPANION_ACTION INSERTION ────────────
+          // Insert sibling action for any companion the AI emitted. Auto-
+          // execute types (book/cancel/reschedule) skip approval; other
+          // types stay approval-gated as in v4.6.
           if (generated.companion_action && generated.companion_action.action_type) {
             const companion = generated.companion_action;
             const parentSeq = typeof sendAction.sequence_order === 'number' ? sendAction.sequence_order : 0;
@@ -461,17 +718,9 @@ export async function processApprovalQueue() {
                     : `Companion to send_message ${sendAction.id} (${sendAction.rule_applied || 'manual'})`,
                   confidence: 1.0,
                   rule_applied: sendAction.rule_applied,
-                  // v4.7: auto-execute types skip approval; everything
-                  // else stays approval-gated as in v4.6.
                   status: isAutoExecuting ? 'pending' : 'pending_approval',
                   requires_approval: !isAutoExecuting,
                   batch_id: sendAction.batch_id,
-                  // sequence_order = parentSeq - 1 keeps the booking
-                  // ahead of the verbal-confirm SMS in the batch order.
-                  // Under v4.7 auto-execute the SMS is in a different
-                  // status anyway (pending_approval vs pending), but
-                  // keeping the order correct preserves intent for
-                  // future approval-gated companions.
                   sequence_order: parentSeq - 1,
                 })
                 .select()
@@ -480,29 +729,33 @@ export async function processApprovalQueue() {
               if (companionErr) {
                 console.warn(`[ActionExecutor] Companion insert failed for batch ${batchId}: ${companionErr.message} — proceeding without companion`);
               } else if (companionRow) {
-                // v4.7: Only push approval-gated companions into the
-                // batch's actions[] array. Auto-executing companions
-                // are picked up by Phase 2 directly and shouldn't
-                // appear as approval-card line items.
                 if (!isAutoExecuting) {
                   actions.push(companionRow);
-                  // Sort by sequence_order so the card displays in execution order.
                   actions.sort((a, b) => (a.sequence_order ?? 0) - (b.sequence_order ?? 0));
                 }
 
-                console.log(`[ActionExecutor] ✅ Companion ${companion.action_type} inserted: id=${companionRow.id}, batch=${batchId}, seq=${companionRow.sequence_order}, ` +
-                  `mode=${isAutoExecuting ? 'AUTO-EXECUTE' : 'approval-gated'}, ` +
-                  `payload.calendar_name="${companion.action_payload?.calendar_name || 'n/a'}", ` +
-                  `payload.start_time="${companion.action_payload?.start_time || 'n/a'}"`);
+                // v4.9: log shape varies by action type. Log key payload
+                // fields for whichever companion this is so the audit
+                // line reads cleanly for cancel/reschedule too.
+                const cap = companion.action_payload || {};
+                const payloadSummary = companion.action_type === 'book_appointment'
+                  ? `calendar="${cap.calendar_name || 'n/a'}", start="${cap.start_time || 'n/a'}"`
+                  : companion.action_type === 'cancel_appointment'
+                    ? `appointment_id="${cap.appointment_id || 'n/a'}"`
+                    : companion.action_type === 'reschedule_appointment'
+                      ? `old="${cap.old_appointment_id || 'n/a'}", new_calendar="${cap.new_calendar_name || 'n/a'}", new_start="${cap.new_start_time || 'n/a'}"`
+                      : '(unknown payload shape)';
 
-                // Surface companion details in enrichment for the approval card.
-                // Even auto-executing companions get surfaced — the card can
-                // render an "AUTO-BOOK QUEUED" line for human visibility.
+                console.log(`[ActionExecutor] ✅ Companion ${companion.action_type} inserted: id=${companionRow.id}, batch=${batchId}, seq=${companionRow.sequence_order}, ` +
+                  `mode=${isAutoExecuting ? 'AUTO-EXECUTE' : 'approval-gated'}, ${payloadSummary}`);
+
                 enrichment.companionAction = {
                   type: companion.action_type,
-                  calendar_name: companion.action_payload?.calendar_name || null,
-                  start_time: companion.action_payload?.start_time || null,
-                  duration_minutes: companion.action_payload?.duration_minutes || null,
+                  calendar_name: cap.calendar_name || cap.new_calendar_name || null,
+                  start_time: cap.start_time || cap.new_start_time || null,
+                  duration_minutes: cap.duration_minutes || null,
+                  appointment_id: cap.appointment_id || null,
+                  old_appointment_id: cap.old_appointment_id || null,
                   reasoning: companion.reasoning || null,
                   auto_executing: isAutoExecuting,
                 };
@@ -511,18 +764,37 @@ export async function processApprovalQueue() {
               console.warn(`[ActionExecutor] Companion insert threw for batch ${batchId}: ${insertErr.message} — proceeding without companion`);
             }
           }
+
+          // ── v4.8: AGENTIC AUTO-REPLY GATE ─────────────────────────
+          const eligibility = await evaluateAutoReplyEligibility(sendAction);
+          if (eligibility.eligible) {
+            const flipped = await applyAutoReplyInline({
+              batchActions: actions,
+              sendAction,
+              generated,
+              contactName: name,
+              contactPhone: phone,
+              triggerMessage,
+              tags: eligibility.tags,
+            });
+            if (flipped > 0) {
+              autoReplies++;
+              autoReplyApplied = true;
+            } else if (flipped === -1) {
+              console.warn(`[ApprovalPath] AUTO-REPLY DB update failed for batch ${batchId} — falling through to approval card`);
+            }
+          } else if (AGENTIC_AUTOREPLY_ENABLED) {
+            console.log(`[ApprovalPath] AUTO-REPLY gate skip (batch ${batchId}): ${eligibility.reason}`);
+          }
         }
       } catch (err) {
         console.error(`[ActionExecutor] Pre-approval generation failed for ${batchId}: ${err.message}`);
         enrichment.generatedMessage = null;
         enrichment.aiGenerationError = err.message;
-        // Fall through to send the approval card with the error surfaced.
       }
     }
 
-    // Skip the approval card entirely if v4.5 inline handoff already
-    // resolved this batch.
-    if (inlineHandoffApplied) continue;
+    if (inlineHandoffApplied || autoReplyApplied) continue;
 
     await sendApprovalRequest(actions, name, phone, enrichment).catch(err => {
       console.error(`[ActionExecutor] Approval request failed for batch ${batchId}:`, err.message);
@@ -530,8 +802,8 @@ export async function processApprovalQueue() {
     cardsSent++;
   }
 
-  if (inlineHandoffs > 0) {
-    console.log(`[ApprovalPath] Cycle: ${cardsSent} cards sent, ${inlineHandoffs} inline handoffs (no card)`);
+  if (inlineHandoffs > 0 || autoReplies > 0) {
+    console.log(`[ApprovalPath] Cycle: ${cardsSent} cards sent, ${inlineHandoffs} inline handoffs, ${autoReplies} auto-replies (no card)`);
   }
 
   return cardsSent;
