@@ -45,6 +45,12 @@ import { getToken, refreshToken, invalidateToken, getTokenStatus } from './token
 
 const LP_BASE = () => (process.env.LP_API_BASE_URL || '').replace(/\/+$/, '');
 
+// Legacy inbound-queue endpoint. Unauthenticated, JSON-body, returns
+// `{"status":"OK","error":"","message":"lead added: <in1_id>"}`. Used
+// by addLead() below. Override via env var if LP changes the br* path
+// or provides a non-production stub.
+const LP_POST_URL = () => (process.env.LP_POST_URL || 'https://lppost.leadperfection.com/br27/addlead');
+
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ─── Bitmask for GetLead change-window filtering ─────────────────
@@ -457,6 +463,114 @@ export async function setAppointment({ ldsId, setBy = '5686', apptDate, apptTime
 
   console.log(`[LP] SetAppointment SUCCESS: lds_id=${ldsId}, response: ${JSON.stringify(result).slice(0, 200)}`);
   return result;
+}
+
+/**
+ * POST to legacy lppost endpoint to add a lead to LP's inbound queue.
+ *
+ * Endpoint: ${LP_POST_URL} (default https://lppost.leadperfection.com/br27/addlead).
+ * This is NOT the documented REST API /api/Leads/LeadAdd — it's the legacy
+ * inbound-queue webhook. We use it instead of LeadAdd for two reasons:
+ *
+ *   1. UNAUTHENTICATED. Doesn't need the Bearer token, so it's resilient
+ *      to token-manager hiccups during high-traffic intake.
+ *   2. INBOUND-QUEUE PATH. LP processes leads through its inbound queue
+ *      and fires the LP-Inbound Webhook callback to GHL when ready —
+ *      that callback is what writes lp_lead_id, lp_prospect_id, and
+ *      LP Disposition back to the GHL contact. Hitting LeadAdd on the
+ *      REST API skips that callback chain.
+ *
+ * Critically, when both `adate` (MM/DD/YYYY) and `atime` ("10:00 AM" or
+ * "14:00") are present, LP creates the appointment as part of inbound
+ * processing — single round-trip for chatbot/in-session bookings where
+ * the lead doesn't yet exist in LP.
+ *
+ * Required fields: firstname, address1, city, state, zip, phone1, email,
+ * srs_id (LP SubSource ID). Without phone1 the inbound queue rejects the
+ * row silently and you get back status=OK with an empty in1_id.
+ *
+ * Response shape:
+ *   { status: "OK", error: "", message: "lead added: 384191" }
+ *
+ * The trailing integer is the in1_id (LP inbound queue row ID), NOT the
+ * real lds_id. The real lds_id arrives via the LP-Inbound Webhook callback
+ * once LP's queue processes the row (typically <60s).
+ *
+ * @param {Object} fields — flat object with all the LP inbound fields
+ * @returns {{ status: string, error: string, message: string }}
+ */
+export async function addLead(fields = {}) {
+  const url = LP_POST_URL();
+
+  // Minimal validation — LP rejects the row silently if any of these
+  // are missing. Surface a clean error to the caller instead.
+  const required = ['firstname', 'address1', 'city', 'state', 'zip', 'phone1', 'email', 'srs_id'];
+  const missing = required.filter(k => {
+    const v = fields[k];
+    return v === undefined || v === null || String(v).trim() === '';
+  });
+  if (missing.length) {
+    throw new Error(`addLead: missing required field(s): ${missing.join(', ')}`);
+  }
+
+  console.log(`[LP] addLead → ${url}: firstname=${fields.firstname}, phone1=${fields.phone1}, lognumber=${fields.lognumber || '(none)'}, adate=${fields.adate || '(none)'}, atime=${fields.atime || '(none)'}`);
+
+  // 30-second timeout — this endpoint is fast (<2s typical). retries=2.
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30000);
+
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(fields),
+        redirect: 'follow', // HTTP→HTTPS 307 redirect is normal here
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeout);
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        throw new Error(`lppost ${res.status}: ${errText.slice(0, 200)}`);
+      }
+
+      const result = await res.json();
+
+      // LP returns { status: "OK", error: "", message: "lead added: <in1_id>" }
+      // on success. On validation failure it returns status=ERROR and a
+      // human-readable error string.
+      if (result?.error) {
+        throw new Error(`lppost addlead error: ${result.error}`);
+      }
+      if (result?.status && result.status.toUpperCase() !== 'OK') {
+        throw new Error(`lppost addlead non-OK status: ${result.status} — ${result.message || '(no message)'}`);
+      }
+
+      console.log(`[LP] addLead SUCCESS: ${result.message || JSON.stringify(result).slice(0, 200)}`);
+      return result;
+    } catch (err) {
+      if (attempt === 2) throw err;
+      console.warn(`[LP] addLead attempt ${attempt} failed, retrying in 2s: ${err.message}`);
+      await sleep(2000);
+    }
+  }
+}
+
+/**
+ * Parse the in1_id (LP inbound queue ID) out of an addLead response.
+ * Response message format is "lead added: 384191" — we want "384191".
+ * Returns null if the message doesn't contain a parseable ID.
+ *
+ * @param {{ message?: string }} addLeadResponse
+ * @returns {string|null}
+ */
+export function extractInboundLeadId(addLeadResponse) {
+  if (!addLeadResponse) return null;
+  const msg = String(addLeadResponse.message || '');
+  const match = msg.match(/(\d+)\s*$/);
+  return match ? match[1] : null;
 }
 
 /**
