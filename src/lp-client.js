@@ -466,6 +466,87 @@ export async function setAppointment({ ldsId, setBy = '5686', apptDate, apptTime
   return result;
 }
 
+/**
+ * POST /api/Customers/UpdateDNCStatus — Update internal DNC status on a prospect.
+ *
+ * Per LP API docs:
+ *   - custid       — LP prospect ID (NOT lead ID, NOT in1_id)
+ *   - newDncStatus — Single character code: C / M / T / E / P
+ *                       C = Do Not Call
+ *                       M = Do Not Mail
+ *                       T = Do Not Text
+ *                       E = Do Not Email
+ *                       P = Do Not Promote (broadest suppression)
+ *   - empid        — LP employee ID applying the DNC flag
+ *   - phone        — Optional, used by LP for audit/dedup
+ *   - Content-Type MUST be application/x-www-form-urlencoded
+ *
+ * LP returns array-wrapped response:
+ *   Success: [{ "Result": 1, "Message": "..." }]
+ *   Error:   [{ "Result": 0, "Message": "Error: Invalid DNC value. Customer ID does not exist. ..." }]
+ *
+ * Each DNC code is an INDEPENDENT flag in LP. To suppress multiple
+ * channels, call this function multiple times with different codes,
+ * or have the rule template emit multiple update_lp_dnc_status actions.
+ *
+ * Built 2026-05-01 to fix the GHL→LP DNC propagation gap. The original
+ * GHL workflow webhook was failing with "Invalid DNC value. Customer ID
+ * does not exist. Employee ID does not exist." — root cause was a merge-
+ * field issue ({{contact.lp_prospect_id}} not resolving). This function
+ * reads the prospect ID directly off the GHL contact object via the
+ * action handler, bypassing the merge field entirely.
+ *
+ * @param {Object} params
+ * @param {string|number} params.custid       — LP prospect ID
+ * @param {string} params.newDncStatus        — One of: C, M, T, E, P
+ * @param {string|number} [params.empid]      — LP employee ID (default 5686)
+ * @param {string} [params.phone]             — Optional phone for LP audit
+ * @returns {Object} LP API response (already validated for Result===1)
+ */
+const VALID_DNC_CODES = new Set(['C', 'M', 'T', 'E', 'P']);
+
+export async function updateDncStatus({ custid, newDncStatus, empid = '5686', phone }) {
+  if (!custid) {
+    throw new Error('updateDncStatus: custid (LP prospect ID) is required');
+  }
+  if (!newDncStatus) {
+    throw new Error('updateDncStatus: newDncStatus is required (one of: C/M/T/E/P)');
+  }
+  const code = String(newDncStatus).trim().toUpperCase();
+  if (!VALID_DNC_CODES.has(code)) {
+    throw new Error(`updateDncStatus: invalid newDncStatus "${newDncStatus}" (must be one of: C/M/T/E/P)`);
+  }
+
+  console.log(`[LP] UpdateDNCStatus: custid=${custid}, code=${code}, empid=${empid}${phone ? `, phone=${phone}` : ''}`);
+
+  const fields = {
+    custid:       String(custid),
+    newDncStatus: code,
+    empid:        String(empid),
+  };
+  if (phone) fields.phone = String(phone);
+
+  const result = await withCircuit(() => lpPost('/api/Customers/UpdateDNCStatus', fields));
+
+  // LP returns array-wrapped responses for this endpoint — unwrap.
+  const item = Array.isArray(result) ? (result[0] || {}) : (result || {});
+
+  // Detect the documented failure shape:
+  //   { "Result": 0, "Message": "Error: Invalid DNC value. Customer ID does not exist. ..." }
+  const resultCode = item.Result ?? item.result ?? null;
+  const message    = item.Message ?? item.message ?? '';
+  const looksLikeError =
+    resultCode === 0 ||
+    (typeof message === 'string' && /^\s*Error\s*:/i.test(message));
+
+  if (looksLikeError) {
+    throw new Error(`LP UpdateDNCStatus error (custid=${custid}, code=${code}, empid=${empid}): ${message || '(no message)'}`);
+  }
+
+  console.log(`[LP] UpdateDNCStatus SUCCESS: custid=${custid}, code=${code}, response: ${JSON.stringify(item).slice(0, 200)}`);
+  return item;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // addLead — REST-first with legacy lppost fallback
 // ═══════════════════════════════════════════════════════════════════
