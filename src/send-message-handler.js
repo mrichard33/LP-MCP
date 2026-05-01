@@ -5,6 +5,67 @@
  * via channel-specific routing — webhook for SMS, Conversations API
  * for email — with cross-fallback for both.
  *
+ * v3.6 (2026-05-01) — Rich GroupMe notification on send.
+ *   PROBLEM: The "📱 AGENTIC MESSAGE SENT" GroupMe ping built its own
+ *   ad-hoc string and used context.contact_name with a fallback to the
+ *   raw contact ID. When upstream events didn't populate contact_name,
+ *   the ping showed:
+ *       📱 AGENTIC MESSAGE SENT
+ *       👤 wnl6nhVkQ18pylh0dw1g    ← raw GHL contact ID, no name
+ *       Channel: SMS | Via: webhook
+ *       Rule: AGENTIC_RESPOND_POST_CHATBOT
+ *       Message: "..."
+ *   Mark surfaced this 2026-05-01 — wanted the contact's real name AND
+ *   the LP source / sub-source / rep / disposition / intent / appointment
+ *   visible in this notification just like the v2.0 task notifications.
+ *
+ *   FIX: Mirror the v2.0 task / send_notification pattern.
+ *     1. resolveContactInfo(contactId)  — fetches name + phone live
+ *        from GHL, falls back to LP if needed. Same helper the rich
+ *        notification handlers already use.
+ *     2. resolveLPProspectId(contactId) — pulls prospect_id for the
+ *        ID line.
+ *     3. buildNotificationEnrichment   — assembles LP source +
+ *        sub-source (v4.0), rep, disposition, intent score / tier /
+ *        barrier, inbound message preview, appointment context.
+ *     4. buildRichNotification         — formats the standard context
+ *        block (👤 / Contact ID / 💬 / 📋 / 📊 / 📅).
+ *   Channel emoji (📱/📧) and agentic-specific metadata (intent / arc /
+ *   trust / voice / kb / fast / reason / channel-via / rule) are
+ *   appended below the rich block, since buildRichNotification doesn't
+ *   know about send-specific fields.
+ *
+ *   The default 🤖 prefix from buildRichNotification is replaced with
+ *   the channel emoji (📱 SMS, 📧 email) to preserve the existing visual
+ *   convention. The 🤖 AI-GENERATED label moves into the base message
+ *   when the response was generated.
+ *
+ *   Net result for an SMS that lands during a real LP-tracked conversation:
+ *       📱 🤖 AI-GENERATED AGENTIC MESSAGE SENT
+ *       👤 Mark Test (954) 508-1512
+ *          Contact ID: wnl6nhVkQ18pylh0dw1g | Prospect: 12345
+ *       💬 "Hello?" [sms]
+ *       📋 Src: Reece ChatBot > Window Estimate Calculator | Rep: Michael Carr | Disp: Be Back
+ *       📊 Score: 67 | Tier: warm | Barrier: timing
+ *       📅 Window Estimate: 05/05/2026 at 02:00 PM
+ *       Channel: SMS | Via: webhook | Rule: AGENTIC_RESPOND_POST_CHATBOT
+ *       Intent: RECONNECT | Arc: none | L1 | KB | ⚡FAST
+ *       Reason: Lead reconnecting after canceled appointment
+ *       Message: "Still here, Mark. Quick question before we get you re..."
+ *
+ *   When LP data is absent (test contacts, GHL-only leads), the LP
+ *   line and intent line are simply omitted — the notification still
+ *   shows the resolved name + phone instead of the raw contact ID.
+ *
+ *   PAIRS WITH:
+ *     - enrichment.js v4.0  — split lpSource (parent) and lpSourceDetail
+ *       (sub-source) so both render in the 📋 line.
+ *     - handlers/tasks.js v2.0  — same buildRichNotification pattern.
+ *     - handlers/notifications.js  — same buildRichNotification pattern.
+ *
+ *   No semantic / guardrail changes — only the notification format.
+ *   The actual SMS/email send path is unchanged.
+ *
  * v3.5 (2026-05-01) — pause-bot OVERRIDES suppress-automation for agentic sends.
  *   PROBLEM: Guardrail 2 (suppression check) treated suppress-automation
  *   as a hard block, identical to dnc / do-not-contact. But suppress-
@@ -78,61 +139,13 @@
  *   classifier. Better to drop the action and surface the missing-
  *   context bug than to misclassify and silently misroute.
  *
- * v3.3 — CHANNEL-SPECIFIC ROUTING (email threading discovery)
- *   Mark surfaced that the GHL workflow Send-Email action creates a
- *   NEW outbound email instead of replying in-thread. This is a GHL
- *   limitation, not a workflow bug — workflows have no "Reply to Email"
- *   action and Send-Email always uses a fresh Message-ID. Recipients'
- *   email clients render those as new conversations.
- *
- *   The Conversations API solves this. POSTing to /conversations/messages
- *   with type=Email + conversationId + conversationProviderId tells GHL
- *   to thread the reply (In-Reply-To / References headers handled
- *   internally). Threading only works through this path.
- *
- *   New defaults:
- *     SMS   → webhook PRIMARY, Conversations API fallback
- *             (workflow centralizes compliance, no threading concern)
- *     Email → Conversations API PRIMARY, webhook fallback
- *             (only Conv API can reply in-thread; workflow fallback
- *             will create a new thread but at least delivers)
- *
- *   Configuration knobs:
- *     GHL_SEND_PRIMARY_PATH=webhook (default) | conversations_api
- *       Acts as a global override. SMS is webhook-first either way
- *       unless overridden. Email is Conv-API-first either way unless
- *       overridden.
- *     GHL_SEND_SMS_VIA_WEBHOOK=true (default)
- *       Set false to force Conv API for SMS too (rarely needed).
- *     GHL_SEND_EMAIL_VIA_WEBHOOK=false (default — flipped in v3.3)
- *       Set true to force webhook for email anyway. WILL BREAK THREADING.
- *       Only useful if email branch in GHL workflow is configured for
- *       a specific use case where new-thread is desired.
- *
- * v3.2 — Webhook-primary architecture (Mark's intent).
- *   Replaced the inherited "Conv API primary, webhook fallback" with
- *   webhook-primary so Mark's GHL Send-Reply workflow becomes the
- *   canonical send pipeline. v3.3 refines this with email-threading
- *   exception above.
- *
- *   Workflow: 497e664a-01ef-400d-aca5-1050d8eeccf8
- *   Workflow expects:
- *     inboundWebhookRequest.contactId  (Find Contact)
- *     inboundWebhookRequest.channel    ('sms' | 'email')
- *     inboundWebhookRequest.message    (SMS body / email body)
- *     inboundWebhookRequest.subject    (email subject)
- *
+ * v3.3 — CHANNEL-SPECIFIC ROUTING (email threading discovery).
+ * v3.2 — Webhook-primary architecture.
  * v3.1 — Short-circuit handoff for compliance gates.
- *   When response-generator returns short_circuit=true, this handler
- *   applies the GHL handoff tag (e.g. 'hdl:stop'), suppresses the
- *   message send, optionally adds 'suppress-automation' for DQs,
- *   invalidates the context cache, and notifies GroupMe.
- *
  * v3.0 — Conversation opt-in gate.
  *   - stop-bot  = "do not have a conversation with this lead, period"
  *   - pause-bot = "agentic system may converse with this lead"
  *   - neither   = Conv AI / GHL workflows own the channel
- *
  * v2.1 — Configurable rate limit via SEND_MESSAGE_RATE_LIMIT_MS env var.
  *
  * Guardrails (fail-closed, in order):
@@ -144,7 +157,7 @@
  *   4. Rate limit (SEND_MESSAGE_RATE_LIMIT_MS, default 10min)
  *   5. AI generation (with compliance-gate short-circuit)
  *   6. Send (channel-routed: SMS=webhook, Email=Conv API; cross-fallback)
- *   7. GroupMe notification for human awareness
+ *   7. GroupMe notification (v3.6 — rich format with resolved name + LP context)
  */
 
 import supabase from './supabase.js';
@@ -152,6 +165,10 @@ import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken, report429 } from './ghl-rate-limiter.js';
 import { generateResponse } from './response-generator.js';
 import { bumpContactCache } from './context-builder.js';
+// v3.6: rich GroupMe notification — same helpers used by tasks v2.0 +
+// notifications handlers, so all four GroupMe surfaces share one format.
+import { resolveContactInfo, resolveLPProspectId } from './actions/resolvers.js';
+import { buildNotificationEnrichment, buildRichNotification } from './actions/enrichment.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
@@ -712,33 +729,53 @@ export async function executeSendMessage(action, context) {
     contactId, message, channel, subject, action
   );
 
-  // ── GroupMe notification for human awareness ───────────────────
-  const contactName = context.contact_name || payload.contact_name || contactId;
-  const preview = message.length > 80 ? message.slice(0, 80) + '...' : message;
-  const channelEmoji = channel === 'sms' ? '📱' : '📧';
-  const aiLabel = generated ? '🤖 AI-GENERATED ' : '';
+  // ── GroupMe notification (v3.6: rich format) ───────────────────
+  // Resolve the contact's real name + phone, pull LP enrichment, and
+  // build the standard rich block. Channel emoji replaces the default
+  // 🤖 prefix; agentic-specific metadata (intent, arc, trust, voice,
+  // kb, fast, reason, channel-via, rule) is appended below the block.
+  // If any resolver fails, the notification still goes out — fall back
+  // to whatever is available.
+  try {
+    const { name, phone, lpLead, ghlContactId } = await resolveContactInfo(contactId, context);
+    const prospectId = await resolveLPProspectId(contactId);
+    const enrichment = await buildNotificationEnrichment(contactId, context, { lpLead, prospectId, ghlContactId });
 
-  const intentLine = generated?.intent_class ? `\nIntent: ${generated.intent_class}` : '';
-  const arcLine = generated?.story_arc ? `\nArc: ${generated.story_arc}` : '';
-  const trustLine = generated?.trust_level_targeted ? ` | L${generated.trust_level_targeted}` : '';
-  const voiceLine = generated?.voice_used === 'randy' ? ' | Randy voice' : '';
-  const kbLine = generated?.kb_pack_used ? ' | KB' : '';
-  const fastLine = generated?.fast_track ? ' | ⚡FAST' : '';
-  const reasonLine = generated?.reasoning ? `\nReason: ${generated.reasoning}` : '';
-  const fallbackFlag = sendMethod.includes('fallback') ? ' ⚠️ FALLBACK' : '';
+    const channelEmoji = channel === 'sms' ? '📱' : '📧';
+    const aiLabel = generated ? '🤖 AI-GENERATED ' : '';
+    const fallbackFlag = sendMethod.includes('fallback') ? ' ⚠️ FALLBACK' : '';
+    const baseMessage = `${aiLabel}AGENTIC MESSAGE SENT${fallbackFlag}`;
 
-  await sendGroupMeMessage(
-    `${channelEmoji} ${aiLabel}AGENTIC MESSAGE SENT${fallbackFlag}\n` +
-    `👤 ${contactName}\n` +
-    `Channel: ${channel.toUpperCase()} | Via: ${sendMethod}\n` +
-    `Rule: ${action.rule_applied || 'manual'}` +
-    intentLine +
-    arcLine + trustLine + voiceLine + kbLine + fastLine +
-    reasonLine +
-    `\nMessage: "${preview}"`
-  ).catch(err => {
-    console.warn(`[SendMessage] GroupMe notification failed: ${err.message}`);
-  });
+    // Build standard rich block, then swap the leading 🤖 for the channel emoji.
+    let full = buildRichNotification({ baseMessage, name, phone, contactId, prospectId, enrichment });
+    full = full.replace(/^🤖 /, `${channelEmoji} `);
+
+    // Channel / send method / rule line
+    full += `\nChannel: ${channel.toUpperCase()} | Via: ${sendMethod} | Rule: ${action.rule_applied || 'manual'}`;
+
+    // Agentic generation metadata (only present when AI generated the message)
+    const agenticParts = [];
+    if (generated?.intent_class) agenticParts.push(`Intent: ${generated.intent_class}`);
+    if (generated?.story_arc) agenticParts.push(`Arc: ${generated.story_arc}`);
+    if (generated?.trust_level_targeted) agenticParts.push(`L${generated.trust_level_targeted}`);
+    if (generated?.voice_used === 'randy') agenticParts.push('Randy voice');
+    if (generated?.kb_pack_used) agenticParts.push('KB');
+    if (generated?.fast_track) agenticParts.push('⚡FAST');
+    if (agenticParts.length) full += `\n${agenticParts.join(' | ')}`;
+    if (generated?.reasoning) full += `\nReason: ${generated.reasoning}`;
+
+    // Final outbound message preview — what the lead will see
+    const preview = message.length > 80 ? message.slice(0, 80) + '...' : message;
+    full += `\nMessage: "${preview}"`;
+
+    await sendGroupMeMessage(full).catch(err => {
+      console.warn(`[SendMessage] GroupMe notification failed: ${err.message}`);
+    });
+  } catch (err) {
+    // Notification path failure must never break the send chain — the SMS
+    // already went out by this point. Log and move on.
+    console.warn(`[SendMessage] Rich notification build failed for ${contactId}: ${err.message}`);
+  }
 
   bumpContactCache(contactId);
 
