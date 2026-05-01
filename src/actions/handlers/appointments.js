@@ -20,27 +20,39 @@
  *   "Uncertain". Anything else is dropped with a warn log. The select
  *   options match what Mark configured in GHL (2026-04-30).
  *
- * cancel_appointment (v3.1 — 2026-05-01): PUT /calendars/events/appointments/{id} —
+ * cancel_appointment (v3.2 — 2026-05-01): PUT /calendars/events/appointments/{id} —
  *   cancel/update GHL appointment status. Accepts an optional `reason`
  *   field that is logged in the action result for audit; reasons are
  *   not pushed back to GHL (no native field for that).
  *
- *   v3.1 ADDITION — contact custom field fallback: when the action fires
- *   from a rule that only knows the contact (e.g. INTENT_CANCEL_REQUESTED
- *   on ai.analysis_completed), the action_payload won't carry an
- *   appointment_id. Instead of failing, the handler now fetches the
- *   contact via GHL API and reads the Event ID custom field
- *   (rmadoRNzDKPb5aNmFwGO) set by the APPT Handler workflows at booking
- *   time. The result includes resolved_from = 'payload' | 'contact_custom_field'
- *   for audit. If neither path resolves an ID, the handler still throws.
+ *   v3.2 — 2026-05-01: REPLACED contact custom field fallback with live
+ *   GHL appointments API lookup. The v3.1 implementation read the contact
+ *   custom field rmadoRNzDKPb5aNmFwGO ("Last Appointment ID") which was
+ *   supposed to be set by APPT Handler workflows at booking time — but
+ *   live data on contact wnl6nhVkQ18pylh0dw1g (Mark Test) showed the field
+ *   was empty even though an appointment had been booked. The Event ID
+ *   was actually in a different field (bja3R0i0pGRmz6fFVdxb / "Last
+ *   Cancelled Appointment ID") which only stores cancelled appointments.
+ *   Neither field is reliable for the cancel-current-booking case.
  *
- *   Cited incident: contact wnl6nhVkQ18pylh0dw1g (Mark Test) — explicit
- *   "Hey can you cancel my appointment?" inbound message, bot routed to
- *   reschedule path instead of executing the cancel; calendar event
- *   9Sj3QzszzviQAJSLRwVT for Thursday May 7 6 PM remained active.
+ *   v3.2 fallback now calls GET /contacts/{contactId}/appointments to fetch
+ *   the contact's full appointment list, filters out cancelled/no-show/
+ *   invalid statuses, and prefers the next future appointment over past
+ *   ones. This is the source-of-truth path: GHL itself, no workflow
+ *   side-effect dependency.
  *
- * reschedule_appointment (v1.0 — NEW): cancels old + books new in a
- *   single executor call. Order matters:
+ *   Result includes resolved_from = 'payload' | 'live_api'. If neither
+ *   path resolves an ID, the handler still throws.
+ *
+ *   Cited incidents:
+ *     • wnl6nhVkQ18pylh0dw1g — said "cancel my appointment", v3.1 cancel
+ *       failed because last_appointment_id was empty.
+ *     • Same contact at 23:07 — SPOUSE_GATE_BLOCK_SOLO_BOOKING (rule #155)
+ *       fired auto-cancel on a fresh booking; v3.1 cancel failed for
+ *       same reason.
+ *
+ * reschedule_appointment (v1.0): cancels old + books new in a single
+ *   executor call. Order matters:
  *     1. PUT old appointment to status='cancelled'. If this fails, abort
  *        — we don't want to create a second appointment when the first
  *        is still active.
@@ -55,14 +67,7 @@
  *        contact (the data is contact-level, not appointment-level).
  *
  *   Payload field naming uses "new_*" prefixes to disambiguate from the
- *   old appointment's metadata:
- *     old_appointment_id  →  the existing appt to cancel
- *     new_calendar_name   →  calendar for the new booking (usually same as old)
- *     new_start_time      →  ISO 8601 with FL offset
- *     new_end_time        →  optional; auto-calculated from duration if missing
- *     duration_minutes    →  default 90
- *     status              →  "new" (default) or "confirmed" — same gate as book
- *     qualifying_data     →  optional, same shape as book_appointment
+ *   old appointment's metadata.
  *
  * Extracted from action-executor.js v4.2 refactor.
  */
@@ -76,12 +81,11 @@ const FIELD_ID_WINDOW_COUNT = 'h9FJTUbmUHIuD6JKmpXv';
 const FIELD_ID_DECISION_MAKERS_PRESENT = 'GH1QGGOseMKmJAMqajiN';
 const DECISION_MAKERS_VALID_VALUES = new Set(['Yes', 'No', 'Solo Owner', 'Uncertain']);
 
-// v3.1 cancel_appointment: contact custom field that stores the GHL Event ID
-// when an appointment is booked. Set by the APPT Handler workflows at booking
-// time. Used as a fallback resolver when the action_payload doesn't carry
-// appointment_id (rules that fire from ai.analysis_completed know the contact
-// but not the appointment).
-const APPT_EVENT_ID_FIELD = 'rmadoRNzDKPb5aNmFwGO';
+// v3.2: appointment statuses that mean "not active / don't try to cancel"
+// (used by resolveActiveAppointmentId to filter the contact's appointment list).
+const NON_ACTIVE_APPOINTMENT_STATUSES = new Set([
+  'cancelled', 'canceled', 'no_show', 'noshow', 'no-show', 'invalid',
+]);
 
 /**
  * v3.1 — Persist qualifying data to GHL custom fields. Returns the count
@@ -133,12 +137,8 @@ async function persistQualifyingData(contactId, qualifyingData) {
 
 /**
  * Internal: build the GHL appointment POST body from a payload that uses
- * the standard book_appointment field names (calendar_name/calendar_id,
- * start_time, end_time, etc.). Used by both executeBookAppointment and
- * executeRescheduleAppointment (after the latter translates new_* fields).
- *
- * Throws on missing/invalid fields. Returns { body, calendarId, startTime,
- * endTime, title, status } so callers can log or transform further.
+ * the standard book_appointment field names. Used by both
+ * executeBookAppointment and executeRescheduleAppointment.
  */
 function buildAppointmentBody(payload, contactId) {
   let calendarId = payload.calendar_id;
@@ -228,29 +228,69 @@ export async function executeBookAppointment(action, context) {
 }
 
 /**
- * v3.1 — Resolve a GHL appointment Event ID from a contact's custom field.
- * Returns null if the contact lookup fails or the field is empty.
+ * v3.2 — Resolve the contact's active appointment ID via live GHL API call.
+ * Returns null if no active appointment found or the lookup fails.
  *
- * The Event ID custom field is set by the APPT Handler workflows at the
- * moment the contact books an appointment. It points to the GHL Calendar
- * Event ID that is the correct target for PUT /calendars/events/appointments/{id}
- * status updates.
+ * Strategy:
+ *   1. GET /contacts/{contactId}/appointments — full appointment list
+ *   2. Filter out cancelled/no-show/invalid statuses
+ *   3. Prefer the NEXT FUTURE appointment (smallest startTime >= now)
+ *   4. Fall back to most-recent past appointment if no future ones exist
  *
- * Logs at info level on success, warn on failure. Never throws — the
- * caller is responsible for raising a more specific error when both the
- * payload and this fallback fail to produce an ID.
+ * Why live API instead of custom field: the v3.1 implementation read
+ * contact custom field rmadoRNzDKPb5aNmFwGO ("Last Appointment ID")
+ * which depends on APPT Handler workflows running a field-write step
+ * at booking time. Live data showed that field empty for contacts who
+ * clearly had appointments. The appointments API is the source of truth.
+ *
+ * Trade-off: one extra API call per cancel-from-rule invocation. Worth
+ * it for reliability.
+ *
+ * Logs at info level on success, warn on failure. Never throws.
  */
-async function resolveAppointmentIdFromContact(contactId) {
+async function resolveActiveAppointmentId(contactId) {
   if (!contactId) return null;
   try {
-    const contactRes = await ghlFetch('GET', `/contacts/${contactId}`);
-    const fields = contactRes?.contact?.customFields || [];
-    const eventField = fields.find(f => f.id === APPT_EVENT_ID_FIELD);
-    if (!eventField?.value) return null;
-    const id = String(eventField.value).trim();
-    return id || null;
+    const result = await ghlFetch('GET', `/contacts/${contactId}/appointments`);
+    // GHL response shape varies — appointments may live under .events,
+    // .appointments, or be the top-level array. Handle all shapes.
+    const list = (Array.isArray(result) ? result : null)
+      || result?.events
+      || result?.appointments
+      || [];
+    if (!Array.isArray(list) || list.length === 0) {
+      console.log(`[ActionExecutor] cancel_appointment: contact ${contactId} has no appointments in GHL`);
+      return null;
+    }
+
+    const active = list
+      .filter(a => {
+        const status = String(a?.appointmentStatus || '').toLowerCase();
+        return a?.id && !NON_ACTIVE_APPOINTMENT_STATUSES.has(status);
+      })
+      .map(a => ({
+        id: a.id,
+        startMs: a.startTime ? new Date(a.startTime).getTime() : 0,
+        status: a.appointmentStatus,
+      }));
+
+    if (active.length === 0) {
+      console.log(`[ActionExecutor] cancel_appointment: contact ${contactId} has appointments but none are active (all cancelled/no-show)`);
+      return null;
+    }
+
+    const now = Date.now();
+    const future = active.filter(a => a.startMs >= now).sort((a, b) => a.startMs - b.startMs);
+    if (future.length > 0) {
+      console.log(`[ActionExecutor] cancel_appointment: resolved next-future appointment ${future[0].id} (status: ${future[0].status}) for contact ${contactId}`);
+      return future[0].id;
+    }
+
+    const past = active.sort((a, b) => b.startMs - a.startMs);
+    console.log(`[ActionExecutor] cancel_appointment: no future appointments; resolved most-recent past appointment ${past[0].id} (status: ${past[0].status}) for contact ${contactId}`);
+    return past[0].id;
   } catch (err) {
-    console.warn(`[ActionExecutor] cancel_appointment: contact ${contactId} lookup failed during fallback: ${err.message}`);
+    console.warn(`[ActionExecutor] cancel_appointment: appointments API lookup failed for ${contactId}: ${err.message}`);
     return null;
   }
 }
@@ -262,21 +302,20 @@ export async function executeCancelAppointment(action) {
   const newStatus = payload.status || 'cancelled';
   const reason = payload.reason || null;
 
-  // v3.1 — Fallback: rules that fire from ai.analysis_completed (e.g.
-  // INTENT_CANCEL_REQUESTED) only know the contact, not the appointment.
-  // Resolve from the Event ID custom field that the APPT Handlers wrote
-  // to the contact at booking time.
+  // v3.2 — Fallback: rules that fire from ai.analysis_completed or
+  // ghl.appointment_booked (e.g. INTENT_CANCEL_REQUESTED, SPOUSE_GATE_*)
+  // know only the contact, not the appointment. Resolve via live GHL
+  // appointments API (replaces v3.1's custom-field-based fallback).
   if (!appointmentId && action.target_id) {
-    appointmentId = await resolveAppointmentIdFromContact(action.target_id);
+    appointmentId = await resolveActiveAppointmentId(action.target_id);
     if (appointmentId) {
-      resolvedFrom = 'contact_custom_field';
-      console.log(`[ActionExecutor] cancel_appointment: resolved appointment_id ${appointmentId} from contact ${action.target_id} custom field`);
+      resolvedFrom = 'live_api';
     }
   }
 
   if (!appointmentId) {
     throw new Error(
-      `Missing appointment_id (and contact custom field fallback did not resolve one for target_id=${action.target_id || 'none'})`
+      `Missing appointment_id and live appointments API returned no active appointment for target_id=${action.target_id || 'none'}`
     );
   }
 
@@ -328,8 +367,6 @@ export async function executeRescheduleAppointment(action, context) {
   console.log(`[ActionExecutor] ✅ Old appointment ${oldId} cancelled`);
 
   // ─── Step 2/2: book the new appointment ────────────────────────────
-  // Translate "new_*" payload fields to the standard book_appointment shape
-  // before calling buildAppointmentBody.
   const bookPayload = {
     calendar_name: payload.new_calendar_name,
     calendar_id: payload.new_calendar_id,
@@ -357,8 +394,6 @@ export async function executeRescheduleAppointment(action, context) {
     newAppointmentId = bookResult?.id || bookResult?.appointment?.id || null;
     console.log(`[ActionExecutor] ✅ Reschedule complete: new appointment id=${newAppointmentId}, status=${built.status}`);
   } catch (err) {
-    // Old is cancelled; new failed. Report half-success — ops sees the
-    // orphan in the audit and can re-book manually.
     console.error(`[ActionExecutor] ⚠️ Reschedule partial failure: old ${oldId} cancelled, new booking failed: ${err.message}`);
     return {
       action: 'reschedule_partial_failure',
