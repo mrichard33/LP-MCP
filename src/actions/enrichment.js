@@ -5,9 +5,34 @@
  * from the event payload, lp_leads, and lead_intelligence so approval cards
  * are self-sufficient and reviewers can approve without opening GHL/LP.
  *
- * Extracted from action-executor.js v4.2 refactor. Includes the v4.2
- * message_preview fallback that unbreaks the 💬 inbound-message line on
- * approval cards triggered by ai.analysis_completed events.
+ * Extracted from action-executor.js v4.2 refactor.
+ *
+ * v4.0 (2026-05-01) — LP SOURCE / SUB-SOURCE SPLIT.
+ *   PROBLEM: enrichment.lpSource collapsed lead_source (parent — e.g.
+ *   "Reece ChatBot") and lead_source_detail (sub — e.g. "Window Estimate
+ *   Calculator") into a single field with the latter winning. Reviewers
+ *   only saw the sub-source, not the parent — losing the channel-of-origin
+ *   signal that matters for routing/attribution decisions.
+ *
+ *   FIX: Capture both as separate fields:
+ *     lpSource        = lpLead.lead_source        (parent / channel)
+ *     lpSourceDetail  = lpLead.lead_source_detail (sub / specific origin)
+ *
+ *   buildRichNotification renders both when present:
+ *     📋 Src: Reece ChatBot > Window Estimate Calculator | Rep: ... | Disp: ...
+ *
+ *   Edge cases:
+ *     Both present  → "Src: <parent> > <sub>"
+ *     Parent only   → "Src: <parent>"
+ *     Sub only      → "Src: <sub>"   (rare — defends against LP rows
+ *                                     where the parent is null but sub is set)
+ *     Neither       → 📋 line skipped entirely
+ *
+ *   Mark surfaced this requirement after seeing GroupMe notifications that
+ *   were missing source breakdown — wanted parent + sub visible across
+ *   ALL notification types so attribution context is always one glance away.
+ *
+ * v3.9 + v4.2 — message_preview fallback for ai.analysis_completed events.
  */
 
 import supabase from '../supabase.js';
@@ -15,7 +40,7 @@ import { formatPhone, formatDateTime } from '../format-helpers.js';
 import { isLPLeadId } from './helpers.js';
 
 // ═══════════════════════════════════════════════════════════════════
-// NOTIFICATION ENRICHMENT BUILDER (v3.9 + v4.2 message_preview fallback)
+// NOTIFICATION ENRICHMENT BUILDER
 // ═══════════════════════════════════════════════════════════════════
 
 export async function buildNotificationEnrichment(contactId, context = {}, { lpLead = null, prospectId = null, ghlContactId = null } = {}) {
@@ -24,7 +49,13 @@ export async function buildNotificationEnrichment(contactId, context = {}, { lpL
     // ai.analysis_completed events, which is what AGENTIC_* rules fire on.
     messageText: context.message_text || context.messageText || context.body || context.message_preview || null,
     messageType: context.message_type || context.messageType || null,
-    lpSource: null,
+
+    // v4.0 — parent source AND sub-source captured separately. The 📋
+    // line in buildRichNotification renders them as "Src: <parent> > <sub>"
+    // when both are present, or one of them when only one is set.
+    lpSource: null,        // lead_source        — channel of origin (e.g. "Reece ChatBot", "Canvass")
+    lpSourceDetail: null,  // lead_source_detail — specific subtype  (e.g. "Window Estimate Calculator")
+
     repName: null,
     disposition: null,
     prospectId: prospectId && prospectId !== 'Not in LP' ? prospectId : null,
@@ -39,7 +70,11 @@ export async function buildNotificationEnrichment(contactId, context = {}, { lpL
   };
 
   if (lpLead) {
-    if (!enrichment.lpSource) enrichment.lpSource = lpLead.lead_source_detail || lpLead.lead_source || null;
+    // v4.0: split source into parent / sub. Previous behavior collapsed
+    // lead_source_detail || lead_source into a single lpSource field;
+    // both fields are now preserved.
+    if (!enrichment.lpSource) enrichment.lpSource = lpLead.lead_source || null;
+    if (!enrichment.lpSourceDetail) enrichment.lpSourceDetail = lpLead.lead_source_detail || null;
     if (!enrichment.repName) enrichment.repName = lpLead.rep_name || null;
     if (!enrichment.disposition) enrichment.disposition = lpLead.disposition_label || lpLead.disposition_code || null;
     if (!enrichment.appointmentDate) enrichment.appointmentDate = lpLead.appointment_date || null;
@@ -67,7 +102,8 @@ export async function buildNotificationEnrichment(contactId, context = {}, { lpL
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// RICH NOTIFICATION FORMATTER — used by send_notification action
+// RICH NOTIFICATION FORMATTER — used by send_notification, create_task,
+// and (v3.6+) send_message handlers
 // ═══════════════════════════════════════════════════════════════════
 
 export function buildRichNotification({ baseMessage, name, phone, contactId, prospectId, enrichment = {} }) {
@@ -85,11 +121,22 @@ export function buildRichNotification({ baseMessage, name, phone, contactId, pro
     const suffix = enrichment.messageType ? ` [${enrichment.messageType}]` : '';
     lines.push(`💬 "${msg}"${suffix}`);
   }
+
+  // v4.0: render LP source as "parent > sub" when both are present.
+  // Falls back to whichever single field is set, or omits the line entirely.
   const lpParts = [];
-  if (enrichment.lpSource) lpParts.push(`Src: ${enrichment.lpSource}`);
+  if (enrichment.lpSource && enrichment.lpSourceDetail) {
+    lpParts.push(`Src: ${enrichment.lpSource} > ${enrichment.lpSourceDetail}`);
+  } else if (enrichment.lpSource) {
+    lpParts.push(`Src: ${enrichment.lpSource}`);
+  } else if (enrichment.lpSourceDetail) {
+    // Edge case: parent missing but sub is set. Use sub as the source.
+    lpParts.push(`Src: ${enrichment.lpSourceDetail}`);
+  }
   if (enrichment.repName) lpParts.push(`Rep: ${enrichment.repName}`);
   if (enrichment.disposition) lpParts.push(`Disp: ${enrichment.disposition}`);
   if (lpParts.length) lines.push(`📋 ${lpParts.join(' | ')}`);
+
   if (enrichment.score || enrichment.tier || enrichment.barrier) {
     const intentParts = [];
     if (enrichment.score) intentParts.push(`Score: ${enrichment.score}`);
