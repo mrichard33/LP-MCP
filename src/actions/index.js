@@ -16,12 +16,17 @@
  * as defense against Railway redeploys killing processes mid-handler and
  * against the orphan 'approved' status.
  *
- * Supported action types (17):
+ * Supported action types (18):
  *   add_tag, remove_tag, set_stage, move_opportunity, update_opportunity,
  *   remove_from_workflow, add_to_workflow, book_appointment,
  *   cancel_appointment, reschedule_appointment, create_task,
- *   send_notification, set_lp_appointment, update_custom_fields,
- *   update_contact_email, calculate_time_lapse_tier, send_message.
+ *   send_notification, set_lp_appointment, create_lp_lead,
+ *   update_custom_fields, update_contact_email, calculate_time_lapse_tier,
+ *   send_message.
+ *
+ * 2026-05-01 — added create_lp_lead (Jane recovery). Closes the
+ * chatbot-in-session-booking gap that left contacts out of LP because
+ * Bot 4 didn't set any tag wired to the existing LP-Send Lead workflow.
  */
 
 import supabase from '../supabase.js';
@@ -37,6 +42,7 @@ import { executeMoveOpportunity, executeUpdateOpportunity } from './handlers/opp
 import { executeAddToWorkflow, executeRemoveFromWorkflow } from './handlers/workflows.js';
 import { executeBookAppointment, executeCancelAppointment, executeRescheduleAppointment } from './handlers/appointments.js';
 import { executeSetLPAppointment } from './handlers/lp-appointment.js';
+import { executeCreateLPLead } from './handlers/lp-lead.js';
 import { executeCreateTask } from './handlers/tasks.js';
 import { executeSendNotification } from './handlers/notifications.js';
 import { executeUpdateCustomFields, executeUpdateContactEmail } from './handlers/custom-fields.js';
@@ -57,6 +63,7 @@ const ACTION_HANDLERS = {
   create_task: executeCreateTask,
   send_notification: executeSendNotification,
   set_lp_appointment: executeSetLPAppointment,
+  create_lp_lead: executeCreateLPLead,           // 2026-05-01 — agentic LP push (Jane recovery)
   update_custom_fields: executeUpdateCustomFields,
   update_contact_email: executeUpdateContactEmail,
   calculate_time_lapse_tier: executeCalculateTimeLapseTier,
@@ -71,6 +78,7 @@ const CONTEXT_AWARE_HANDLERS = new Set([
   'reschedule_appointment',  // v2.7.8 — needs context for date interpolation in new_start_time
   'update_contact_email',
   'send_message',
+  'create_lp_lead',          // 2026-05-01 — needs event payload for appointment_date/time
 ]);
 
 // ═══════════════════════════════════════════════════════════════════
