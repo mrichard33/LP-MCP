@@ -7,6 +7,13 @@
  *
  * Extracted from action-executor.js v4.2 refactor.
  *
+ * v4.1 (2026-05-01) — Optional headerEmoji on buildRichNotification.
+ *   Channel-specific notifications (send-message-handler v3.6) can pass
+ *   '📱' for SMS or '📧' for email so the header emoji matches the channel
+ *   rather than the generic 🤖. Defaults to '🤖' when not provided so all
+ *   existing callers (executeSendNotification, executeCreateTask v2.0)
+ *   render unchanged.
+ *
  * v4.0 (2026-05-01) — LP SOURCE / SUB-SOURCE SPLIT.
  *   PROBLEM: enrichment.lpSource collapsed lead_source (parent — e.g.
  *   "Reece ChatBot") and lead_source_detail (sub — e.g. "Window Estimate
@@ -106,9 +113,11 @@ export async function buildNotificationEnrichment(contactId, context = {}, { lpL
 // and (v3.6+) send_message handlers
 // ═══════════════════════════════════════════════════════════════════
 
-export function buildRichNotification({ baseMessage, name, phone, contactId, prospectId, enrichment = {} }) {
+export function buildRichNotification({ baseMessage, name, phone, contactId, prospectId, enrichment = {}, headerEmoji = '🤖' }) {
   const lines = [];
-  lines.push(`🤖 ${baseMessage}`);
+  // v4.1: headerEmoji defaults to 🤖 for backward compat. Channel-specific
+  // notifications (send-message-handler v3.6) pass 📱/📧.
+  lines.push(`${headerEmoji} ${baseMessage}`);
   const displayPhone = formatPhone(phone);
   const nameLine = `👤 ${name || 'Unknown'}${displayPhone ? ` ${displayPhone}` : ''}`;
   lines.push(nameLine);
