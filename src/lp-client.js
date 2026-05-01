@@ -45,6 +45,13 @@ import { getToken, refreshToken, invalidateToken, getTokenStatus } from './token
 
 const LP_BASE = () => (process.env.LP_API_BASE_URL || '').replace(/\/+$/, '');
 
+// Legacy inbound-queue endpoint. Unauthenticated, JSON-body, returns
+// `{"status":"OK","error":"","message":"lead added: <in1_id>"}`. Used
+// as fallback when the authenticated REST /api/Leads/LeadAdd path
+// fails. Override via env var if LP changes the br* path or provides
+// a non-production stub.
+const LP_POST_URL = () => (process.env.LP_POST_URL || 'https://lppost.leadperfection.com/br27/addlead');
+
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ─── Bitmask for GetLead change-window filtering ─────────────────
@@ -457,6 +464,182 @@ export async function setAppointment({ ldsId, setBy = '5686', apptDate, apptTime
 
   console.log(`[LP] SetAppointment SUCCESS: lds_id=${ldsId}, response: ${JSON.stringify(result).slice(0, 200)}`);
   return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// addLead — REST-first with legacy lppost fallback
+// ═══════════════════════════════════════════════════════════════════
+//
+// Per Mark's directive 2026-05-01: try the authenticated REST endpoint
+// /api/Leads/LeadAdd first (consistent with the rest of this client),
+// and fall back to the unauthenticated lppost/br27/addlead legacy
+// endpoint if REST fails for any reason.
+//
+// The REST and legacy endpoints have DIFFERENT field names:
+//   REST    | Legacy
+//   --------|--------
+//   phone   | phone1
+//   productID | productid
+//   apptdate | adate
+//   appttime | atime
+//
+// This function accepts REST-style names from the caller and translates
+// to legacy names automatically when falling back. Callers should use
+// REST naming.
+//
+// Both endpoints add the lead to LP's INBOUND queue (not directly to
+// the prospect table). LP processes the queue and fires the LP-Inbound
+// Webhook callback to GHL when ready — that callback writes lp_lead_id,
+// lp_prospect_id, and LP Disposition back to the GHL contact. So both
+// paths feed into the same downstream callback chain.
+//
+// Both endpoints support same-session appointment creation when both
+// date and time fields are present — single round-trip for chatbot
+// in-session bookings.
+
+const LEGACY_FIELD_MAP = {
+  phone:     'phone1',
+  productID: 'productid',
+  apptdate:  'adate',
+  appttime:  'atime',
+};
+
+function _translateToLegacy(restFields) {
+  const out = {};
+  for (const [k, v] of Object.entries(restFields || {})) {
+    const legacyKey = LEGACY_FIELD_MAP[k] || k;
+    out[legacyKey] = v;
+  }
+  return out;
+}
+
+/**
+ * Add a lead to LP's inbound queue. REST-first, legacy fallback.
+ *
+ * Required fields (caller should provide REST naming):
+ *   firstname, address1, city, state, zip, phone, email, srs_id
+ *
+ * Optional appointment fields (both must be set or both empty):
+ *   apptdate (MM/DD/YYYY), appttime ("10:00 AM" or "14:00")
+ *
+ * Returns the LP response, normalized to a shape that includes:
+ *   { ...originalResponse, _path: 'rest' | 'legacy' }
+ *
+ * Caller can use extractInboundLeadId() to parse the in1_id out.
+ *
+ * @param {Object} fields — REST-named field map
+ * @returns {Object} LP API response with _path indicator
+ */
+export async function addLead(fields = {}) {
+  // Validate required fields up-front. LP rejects rows silently when
+  // any of these are missing (status=OK with empty in1_id).
+  const required = ['firstname', 'address1', 'city', 'state', 'zip', 'phone', 'email', 'srs_id'];
+  const missing = required.filter(k => {
+    const v = fields[k];
+    return v === undefined || v === null || String(v).trim() === '';
+  });
+  if (missing.length) {
+    throw new Error(`addLead: missing required field(s): ${missing.join(', ')}`);
+  }
+
+  // Both apptdate and appttime must be set together or both omitted.
+  if ((fields.apptdate && !fields.appttime) || (!fields.apptdate && fields.appttime)) {
+    throw new Error('addLead: apptdate and appttime must both be set or both empty');
+  }
+
+  console.log(`[LP] addLead → trying REST /api/Leads/LeadAdd: firstname=${fields.firstname}, phone=${fields.phone}, srs_id=${fields.srs_id}, lognumber=${fields.lognumber || '(none)'}, apptdate=${fields.apptdate || '(none)'}, appttime=${fields.appttime || '(none)'}`);
+
+  // ─── PATH 1: REST (preferred) ────────────────────────────────────
+  try {
+    // Coerce all values to strings — lpPost form-encodes via URLSearchParams.
+    const restFields = {};
+    for (const [k, v] of Object.entries(fields)) {
+      if (v === null || v === undefined) continue;
+      restFields[k] = String(v);
+    }
+    const restResult = await withCircuit(() => lpPost('/api/Leads/LeadAdd', restFields));
+
+    // LP's REST error envelope: { status: "ERROR", error: "...", message: "..." }
+    // Treat any non-empty error string OR explicit non-OK status as a soft
+    // failure that should trigger fallback rather than throw to the caller.
+    const restHasError =
+      (restResult?.error && String(restResult.error).trim() !== '') ||
+      (restResult?.status && String(restResult.status).toUpperCase() !== 'OK');
+    if (restHasError) {
+      throw new Error(`REST LeadAdd returned error: status="${restResult?.status}", error="${restResult?.error}", message="${restResult?.message}"`);
+    }
+
+    console.log(`[LP] addLead REST SUCCESS: ${(restResult?.message || JSON.stringify(restResult)).slice(0, 200)}`);
+    return { ...(restResult || {}), _path: 'rest' };
+  } catch (restErr) {
+    // ─── PATH 2: Legacy lppost fallback ────────────────────────────
+    console.warn(`[LP] addLead REST failed (${restErr.message.slice(0, 200)}) — falling back to legacy lppost`);
+
+    const legacyFields = _translateToLegacy(fields);
+    const url = LP_POST_URL();
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 30000);
+
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(legacyFields),
+          redirect: 'follow', // HTTP→HTTPS 307 is normal here
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeout);
+
+        if (!res.ok) {
+          const errText = await res.text().catch(() => '');
+          throw new Error(`lppost ${res.status}: ${errText.slice(0, 200)}`);
+        }
+
+        const result = await res.json();
+
+        if (result?.error && String(result.error).trim() !== '') {
+          throw new Error(`lppost addlead error: ${result.error}`);
+        }
+        if (result?.status && String(result.status).toUpperCase() !== 'OK') {
+          throw new Error(`lppost addlead non-OK status: ${result.status} — ${result.message || '(no message)'}`);
+        }
+
+        console.log(`[LP] addLead LEGACY SUCCESS: ${(result.message || JSON.stringify(result)).slice(0, 200)}`);
+        return { ...(result || {}), _path: 'legacy', _rest_error: restErr.message.slice(0, 200) };
+      } catch (legacyErr) {
+        if (attempt === 2) {
+          // Both paths exhausted — throw a combined error so the caller
+          // and the action_actions error_message capture both failures.
+          throw new Error(`addLead failed: REST=${restErr.message.slice(0, 150)}; LEGACY=${legacyErr.message.slice(0, 150)}`);
+        }
+        console.warn(`[LP] addLead legacy attempt ${attempt} failed, retrying in 2s: ${legacyErr.message}`);
+        await sleep(2000);
+      }
+    }
+  }
+}
+
+/**
+ * Parse the in1_id (LP inbound queue ID) out of an addLead response.
+ * Handles both REST and legacy response shapes:
+ *   - REST may return { id, in1_id, ... } depending on LP version
+ *   - Legacy returns { status: "OK", message: "lead added: 384191" }
+ *
+ * Returns null if no parseable ID is found.
+ *
+ * @param {Object} addLeadResponse
+ * @returns {string|null}
+ */
+export function extractInboundLeadId(addLeadResponse) {
+  if (!addLeadResponse) return null;
+  if (addLeadResponse.in1_id) return String(addLeadResponse.in1_id);
+  if (addLeadResponse.id)     return String(addLeadResponse.id);
+  const msg = String(addLeadResponse.message || '');
+  const match = msg.match(/(\d+)\s*$/);
+  return match ? match[1] : null;
 }
 
 /**

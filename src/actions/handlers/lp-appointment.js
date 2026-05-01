@@ -1,18 +1,30 @@
 /**
  * LP Appointment Handler — src/actions/handlers/lp-appointment.js
  *
- * Phase 2 write: push GHL-booked appointments into LeadPerfection via the
- * SetAppointment API. The heaviest single handler because of the LP Lead ID
- * resolution chain and the date/time format bridging between GHL (ISO) and
- * LP (MM/DD/YYYY form-encoded).
+ * Phase 2 write: push GHL-booked appointments into LeadPerfection via
+ * the SetAppointment API. Resolves LP Lead ID through Supabase cache →
+ * LP API → GHL field, then calls /api/Leads/SetAppointment with
+ * form-encoded payload.
  *
  * Resolution order:
  *   1. target_id is already an LP Lead ID (numeric) → use directly
- *   2. Fetch GHL contact → try resolveLPLeadId() (Supabase cache → LP GetCustomers3 → GHL field)
- *   3. If no valid lds_id found → notify via GroupMe, add note, SKIP (not fail)
+ *   2. Fetch GHL contact → try resolveLPLeadId() (Supabase cache → LP
+ *      GetCustomers3 → GHL field)
+ *   3. If no valid lds_id found → notify via GroupMe, add note, SKIP
+ *      (not fail). The skip notification points the operator at the
+ *      create_lp_lead action as the right next step — that handler
+ *      will push the contact into LP's inbound queue with the appt
+ *      baked in.
  *
- * Pre-check: if LP already has an appointment on the same normalized date,
- * skip the write (idempotency against retries).
+ * Pre-check: if LP already has an appointment on the same normalized
+ * date, skip the write (idempotency against retries).
+ *
+ * 2026-05-01 — REMOVED duplicate executeCreateLPLead from this file.
+ * The canonical handler is now src/actions/handlers/lp-lead.js. That
+ * version uses srs_id=5574 (corrected from the incorrect '830' that
+ * was here — '830' is actually pro_id in Reece's LP source map; the
+ * legacy GHL workflow has them swapped) and uses REST field naming
+ * so addLead's REST path works without translation.
  *
  * Extracted from action-executor.js v4.2 refactor.
  */
@@ -25,6 +37,12 @@ import { addGHLNote, updateGHLContactFields } from '../../ghl.js';
 import { isLPLeadId, ghlFetch } from '../helpers.js';
 import { parseLongDate, normalizeDateForComparison } from '../date-parsers.js';
 import { resolveContactInfo } from '../resolvers.js';
+import { buildRichNotification } from '../enrichment.js';
+
+// GHL custom field IDs used by the writeback path. Keep in sync with
+// ghl-field-map.js.
+const FIELD_LP_PROSPECT_ID = 'ZRQAVrzhtzApzLlHmT87'; // lp_prospect_id
+const FIELD_LP_LEAD_ID     = 'GmAVmW6V9sekD7pVONKr'; // lp_lead_id (real lds_id)
 
 export async function executeSetLPAppointment(action) {
   const contactId = action.target_id;
@@ -59,16 +77,24 @@ export async function executeSetLPAppointment(action) {
 
     if (!resolution) {
       const { name } = await resolveContactInfo(contactId, eventPayload);
-      const skipMsg = `⚠️ LP APPT SKIP: No valid LP Lead ID for ${name || contactId}. ` +
-        `Lead may still be in LP inbound queue, or has no LP record. ` +
-        `GHL Contact: ${contactId}. Manual appointment set required in LP.`;
-      await sendGroupMeMessage(skipMsg).catch(() => {});
+      // Use buildRichNotification (v4.2) so the always-on Prospect line
+      // renders "Prospect: NONE" — making it visually consistent with
+      // create_lp_lead notifications and clearly signaling the gap.
+      const skipMsg = buildRichNotification({
+        baseMessage: `⚠️ LP APPT SKIP: No valid LP Lead ID — lead may still be in inbound queue or has no LP record yet`,
+        name,
+        phone,
+        contactId,
+        prospectId: null, // forces "Prospect: NONE"
+        enrichment: {},
+      });
+      await sendGroupMeMessage(`${skipMsg}\n👉 Manual: set appt directly in LP, OR queue create_lp_lead to push contact + appt in one shot.`).catch(() => {});
 
       if (ghlContact) {
         await addGHLNote(contactId,
-          `[LP SYNC] Appointment NOT synced to LP — no valid Lead ID found.\n` +
+          `[LP SYNC v4.3] Appointment NOT synced to LP — no valid Lead ID found.\n` +
           `Possible causes: lead still in inbound queue, no LP match, or only in1_id available.\n` +
-          `Manual action: set appointment in LP directly.`
+          `Recommendation: queue a create_lp_lead action to push the contact + appointment to LP in one shot.`
         ).catch(() => {});
       }
 
@@ -87,10 +113,10 @@ export async function executeSetLPAppointment(action) {
 
     try {
       const writebackFields = [
-        { id: 'GmAVmW6V9sekD7pVONKr', field_value: lpLeadId },
+        { id: FIELD_LP_LEAD_ID, field_value: lpLeadId },
       ];
       if (resolvedProspectId) {
-        writebackFields.push({ id: 'ZRQAVrzhtzApzLlHmT87', field_value: resolvedProspectId });
+        writebackFields.push({ id: FIELD_LP_PROSPECT_ID, field_value: resolvedProspectId });
       }
       await updateGHLContactFields(contactId, writebackFields);
       console.log(`[LP-APPT] ✅ Wrote back confirmed lds_id=${lpLeadId}, prospect=${resolvedProspectId} to GHL`);
@@ -165,12 +191,15 @@ export async function executeSetLPAppointment(action) {
         console.log(`[LP-APPT] ⏭️ LP already has appointment on ${lpDateNormalized} for lds_id=${lpLeadId}`);
         if (!isLPLeadId(contactId)) {
           await addGHLNote(contactId,
-            `[LP SYNC] Appointment already exists in LP — skipped\nLP Lead ID: ${lpLeadId}\nDate: ${lpDateNormalized}`
+            `[LP SYNC v4.3] Appointment already exists in LP — skipped\n` +
+            `LP Lead ID: ${lpLeadId} | Prospect: ${resolvedProspectId || 'N/A'}\n` +
+            `Date: ${lpDateNormalized}`
           ).catch(() => {});
         }
         return {
           action: 'already_set_in_lp',
           lp_lead_id: lpLeadId,
+          lp_prospect_id: resolvedProspectId,
           lp_appointment_date: lpDateNormalized,
           ghl_appointment_date: ghlDateNormalized,
           calendar_name: calendarName,
@@ -189,14 +218,21 @@ export async function executeSetLPAppointment(action) {
 
   if (!isLPLeadId(contactId)) {
     await addGHLNote(contactId,
-      `[LP SYNC] Appointment set in LP (v4.0)\nLP Lead ID: ${lpLeadId} (confirmed via ${resolutionSource})\n` +
-      `Prospect ID: ${resolvedProspectId || 'N/A'}\nDate: ${apptDate}\nTime: ${apptTime}\nCalendar: ${calendarName}`
+      `[LP SYNC v4.3] Appointment set in LP\n` +
+      `LP Lead ID: ${lpLeadId} (confirmed via ${resolutionSource})\n` +
+      `Prospect ID: ${resolvedProspectId || 'N/A'}\n` +
+      `Date: ${apptDate}\nTime: ${apptTime}\nCalendar: ${calendarName}`
     ).catch(() => {});
   }
   const { name } = await resolveContactInfo(contactId, eventPayload);
+  // Success notification uses inline formatting (not buildRichNotification)
+  // because the LP Lead/Prospect IDs are the authoritative known-good values
+  // we want surfaced prominently — not the GHL-derived enrichment fallback.
   await sendGroupMeMessage(
-    `📅 LP Appointment Set (v4.0)\nContact: ${name || contactId}\nLP Lead: ${lpLeadId} (${resolutionSource})\n` +
-    `Prospect: ${resolvedProspectId || 'N/A'}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName}`
+    `📅 LP Appointment Set\n` +
+    `Contact: ${name || contactId}\n` +
+    `📋 Contact: ${contactId} | Prospect: ${resolvedProspectId || 'NONE'} | LP Lead: ${lpLeadId} (${resolutionSource})\n` +
+    `Date: ${apptDate} ${apptTime}\nCalendar: ${calendarName}`
   ).catch(() => {});
 
   console.log(`[LP-APPT] ✅ LP appointment set: lds_id=${lpLeadId}, ${apptDate} ${apptTime}, resolved_via=${resolutionSource}`);
