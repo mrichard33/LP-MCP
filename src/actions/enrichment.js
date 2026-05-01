@@ -7,6 +7,27 @@
  *
  * Extracted from action-executor.js v4.2 refactor.
  *
+ * v4.2 (2026-05-01) — ALWAYS-RENDER PROSPECT LINE.
+ *   PROBLEM: buildRichNotification omitted the Prospect line entirely
+ *   when prospectId was null/missing. Reviewers had no way to tell
+ *   from the GroupMe message whether a contact was already in LP or
+ *   not — absence-of-line could mean either "not in LP yet" or "we
+ *   forgot to include it."
+ *
+ *   FIX (per Mark's directive): always render the Prospect line.
+ *   When the ID is present and meaningful, render the digits. When
+ *   absent or sentinel "Not in LP", render "NONE" so the absence is
+ *   itself signal — a reviewer seeing "Prospect: NONE" knows
+ *   immediately the lead hasn't been pushed to LP yet (and can take
+ *   action accordingly).
+ *
+ *   Edge cases:
+ *     prospectId = "427403"     → "Prospect: 427403"
+ *     prospectId = null         → "Prospect: NONE"
+ *     prospectId = undefined    → "Prospect: NONE"
+ *     prospectId = "Not in LP"  → "Prospect: NONE"
+ *     prospectId = ""           → "Prospect: NONE"
+ *
  * v4.1 (2026-05-01) — Optional headerEmoji on buildRichNotification.
  *   Channel-specific notifications (send-message-handler v3.6) can pass
  *   '📱' for SMS or '📧' for email so the header emoji matches the channel
@@ -123,7 +144,15 @@ export function buildRichNotification({ baseMessage, name, phone, contactId, pro
   lines.push(nameLine);
   const idLabel = isLPLeadId(contactId) ? 'LP Lead ID' : 'Contact ID';
   const idParts = [`${idLabel}: ${contactId}`];
-  if (prospectId && prospectId !== 'Not in LP') idParts.push(`Prospect: ${prospectId}`);
+  // v4.2 (2026-05-01): always render the Prospect line. Per Mark's directive,
+  // absence-of-Prospect-ID is itself signal — a reviewer seeing "Prospect: NONE"
+  // immediately knows the lead hasn't been pushed to LP yet (and can take
+  // action). Previous behavior omitted the line entirely when prospectId
+  // was null/empty/sentinel, which made it indistinguishable from a bug.
+  const prospectClean = (prospectId && String(prospectId).trim() && prospectId !== 'Not in LP')
+    ? String(prospectId)
+    : 'NONE';
+  idParts.push(`Prospect: ${prospectClean}`);
   lines.push(`   ${idParts.join(' | ')}`);
   if (enrichment.messageText) {
     const msg = String(enrichment.messageText).slice(0, 120);
