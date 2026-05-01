@@ -5,6 +5,57 @@
  * via channel-specific routing — webhook for SMS, Conversations API
  * for email — with cross-fallback for both.
  *
+ * v3.5 (2026-05-01) — pause-bot OVERRIDES suppress-automation for agentic sends.
+ *   PROBLEM: Guardrail 2 (suppression check) treated suppress-automation
+ *   as a hard block, identical to dnc / do-not-contact. But suppress-
+ *   automation is a workflow-driven flag (added by AUTOMATION_SUPPRESS_ON_BOOKING
+ *   on appointment events, and by other automation rules), not a lead-
+ *   driven opt-out. Meanwhile pause-bot is the explicit opt-in to
+ *   agentic conversation. The two collided for any contact who books
+ *   an appointment then later texts the bot — pause-bot was set, but
+ *   suppress-automation blocked all agentic SMS sends.
+ *
+ *   Surfaced 2026-05-01: contact wnl6nhVkQ18pylh0dw1g had pause-bot
+ *   AND suppress-automation. v4.8 auto-reply gate (which only checks
+ *   pause-bot) opened. GroupMe got the "🚀 AGENTIC AUTO-REPLY" notice
+ *   with the message preview. Phase 2 picked up the action.
+ *   executeSendMessage Guardrail 2 saw suppress-automation and short-
+ *   circuited with action=send_message_suppressed. The SMS was silently
+ *   dropped. From Mark's perspective: the GroupMe notice was a lie.
+ *
+ *   Production blast radius: AUTOMATION_SUPPRESS_ON_BOOKING fires on
+ *   every ghl.appointment_booked event and stamps suppress-automation.
+ *   That tag persists. Once stamped, the agentic responder is
+ *   permanently unable to message the contact even with pause-bot
+ *   present — affects every contact who books then later texts in.
+ *
+ *   FIX: Split suppression into hard vs soft.
+ *     HARD (always blocks):  dnc, do-not-contact
+ *                            — represent the lead's own choice;
+ *                            pause-bot does NOT override them.
+ *     SOFT (overridable):    suppress-automation
+ *                            — workflow-driven; if pause-bot is also
+ *                            present, the agentic system has been
+ *                            explicitly opted in and the soft flag is
+ *                            ignored.
+ *
+ *   Logs the override when it fires so the trail is visible in Railway:
+ *     [SendMessage] ⚠️ pause-bot OVERRIDES suppress-automation for
+ *       <contactId> — agentic opt-in present, allowing send.
+ *
+ *   stop-bot is unrelated (handled by Guardrail 3, conversation gate,
+ *   and treated as a hard "no conversation at all" — pause-bot does
+ *   NOT override stop-bot). No change to stop-bot semantics.
+ *
+ *   isContactSuppressed (boolean) replaced by checkSuppression which
+ *   returns granular state. Distinct `reason` fields surface in the
+ *   action result for audit clarity:
+ *     hard_suppression_dnc
+ *     hard_suppression_do-not-contact
+ *     contact_suppressed (soft, no pause-bot — preserves existing
+ *                         reason string for backward compat with any
+ *                         tooling that filters on it)
+ *
  * v3.4 (2026-04-30) — Trigger message fallback fix.
  *   PROBLEM: When the rule that fires this handler is gated on
  *   ai.analysis_completed (e.g. AGENTIC_RESPOND_POST_CHATBOT), the
@@ -86,7 +137,9 @@
  *
  * Guardrails (fail-closed, in order):
  *   1. Tag fetch — single GHL API call
- *   2. Suppression check (suppress-automation / dnc / do-not-contact)
+ *   2. Suppression check (v3.5):
+ *        — hard: dnc, do-not-contact (always block)
+ *        — soft: suppress-automation (overridden by pause-bot)
  *   3. Conversation gate (stop-bot / pause-bot)
  *   4. Rate limit (SEND_MESSAGE_RATE_LIMIT_MS, default 10min)
  *   5. AI generation (with compliance-gate short-circuit)
@@ -140,8 +193,41 @@ async function fetchContactTags(contactId) {
   }
 }
 
-function isContactSuppressed(tags) {
-  return tags.some(t => t === 'suppress-automation' || t === 'dnc' || t === 'do-not-contact');
+/**
+ * v3.5 — Granular suppression check.
+ *
+ * Replaces the boolean isContactSuppressed (which collapsed lead-driven
+ * opt-out and workflow-driven suppression into a single block).
+ *
+ * Hard suppression (dnc / do-not-contact) ALWAYS blocks. These represent
+ * the lead's own choice; pause-bot does NOT override them.
+ *
+ * Soft suppression (suppress-automation) is workflow-driven — applied by
+ * automation rules like AUTOMATION_SUPPRESS_ON_BOOKING, not by the lead.
+ * When the contact also has pause-bot (explicit agentic opt-in), the soft
+ * flag is ignored: the agentic system has been told it may converse with
+ * this lead, and that opt-in trumps a workflow-side signal.
+ *
+ * Returns:
+ *   { hard: true, tag }                       — block (lead's choice)
+ *   { soft: true, tag }                       — block (no pause-bot to
+ *                                               override the workflow flag)
+ *   { allowed: true, overridden: true, tag }  — soft suppression present
+ *                                               but pause-bot overrides;
+ *                                               caller logs the override
+ *                                               and falls through to send
+ *   null                                      — no suppression at all
+ */
+function checkSuppression(tags) {
+  if (tags.includes('dnc')) return { hard: true, tag: 'dnc' };
+  if (tags.includes('do-not-contact')) return { hard: true, tag: 'do-not-contact' };
+  if (tags.includes('suppress-automation')) {
+    if (tags.includes('pause-bot')) {
+      return { allowed: true, overridden: true, tag: 'suppress-automation' };
+    }
+    return { soft: true, tag: 'suppress-automation' };
+  }
+  return null;
 }
 
 function checkConversationGate(tags) {
@@ -499,15 +585,37 @@ export async function executeSendMessage(action, context) {
     };
   }
 
-  // ── Guardrail 2: Suppression check ─────────────────────────────
-  if (isContactSuppressed(tags)) {
-    console.log(`[SendMessage] ⏭️ SUPPRESSED: ${contactId} has suppress-automation or DNC tag`);
-    return {
-      action: 'send_message_suppressed',
-      contact_id: contactId,
-      reason: 'contact_suppressed',
-      channel,
-    };
+  // ── Guardrail 2: Suppression check (v3.5 — granular hard/soft) ─
+  // Hard suppression (dnc/do-not-contact) always blocks: lead's own choice.
+  // Soft suppression (suppress-automation) is workflow-driven; if pause-bot
+  // is also present, the agentic opt-in overrides the soft flag and we
+  // fall through to send. The override is explicitly logged so the trail
+  // is visible in Railway when it fires.
+  const suppression = checkSuppression(tags);
+  if (suppression) {
+    if (suppression.hard) {
+      console.log(`[SendMessage] ⛔ HARD SUPPRESSION: ${contactId} has ${suppression.tag} tag — blocking agentic send (lead-driven opt-out, pause-bot does NOT override)`);
+      return {
+        action: 'send_message_suppressed',
+        contact_id: contactId,
+        reason: `hard_suppression_${suppression.tag}`,
+        channel,
+      };
+    }
+    if (suppression.soft) {
+      console.log(`[SendMessage] ⏭️ SOFT SUPPRESSION: ${contactId} has suppress-automation but no pause-bot to override — blocking`);
+      return {
+        action: 'send_message_suppressed',
+        contact_id: contactId,
+        reason: 'contact_suppressed',
+        channel,
+      };
+    }
+    if (suppression.overridden) {
+      console.log(`[SendMessage] ⚠️ pause-bot OVERRIDES suppress-automation for ${contactId} — agentic opt-in present, allowing send`);
+      // Fall through to remaining guardrails. The override is recorded
+      // in the action log so post-hoc audit can reconstruct what fired.
+    }
   }
 
   // ── Guardrail 3: Conversation opt-in gate ──────────────────────
