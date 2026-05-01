@@ -14,6 +14,38 @@
  * 
  * Security: All endpoints validate GHL_WEBHOOK_SECRET.
  *
+ * v2.7 (2026-05-01) — Reply buffer for rapid-fire message combining.
+ *   PROBLEM: When a contact sent multiple inbound SMS within seconds of
+ *   each other (e.g. "My wife and I cannot make it to the appointment"
+ *   immediately followed by "If I can just be there then we can do it"),
+ *   the analyzer ran twice — once per message — and produced two
+ *   independent classifications, ignoring that the second message
+ *   changed the meaning of the first. The bot then sent two outbound
+ *   replies, the second of which violated the all-decision-makers rule
+ *   ("we can make that work with just you"). Surfaced 2026-05-01 with
+ *   contact wnl6nhVkQ18pylh0dw1g (Mark Test) — 22-second gap between
+ *   messages, both got separate replies 26 seconds apart.
+ *
+ *   FIX: In-process Map-based debounce. Each substantive reply joins
+ *   a buffer keyed on contactId; the buffer's timer is reset on every
+ *   new message; when the timer expires (REPLY_DEBOUNCE_MS, default
+ *   35s) the buffered messages are combined with newlines and the
+ *   combined text is passed to the agentic pipeline as a single
+ *   analyzer call. Each individual message is still emitted into
+ *   system_events for audit, and those event rows are marked processed
+ *   when the buffer fires so the heartbeat backstop doesn't re-analyze
+ *   them with stale single-message context.
+ *
+ *   DNC and trivial (without pause-bot) paths bypass the buffer — they
+ *   need to fire immediately and don't need analyzer combining. Trivial
+ *   replies for pause-bot contacts (the agentic-owned conversation case)
+ *   fall through to the substantive path and ARE buffered.
+ *
+ *   Trade-off: in-process Map is lost on Railway redeploy, and only
+ *   works when LP MCP runs as a single instance (which it does today).
+ *   If we ever scale horizontally, this needs to move to Redis or a
+ *   reply_buffers Supabase table.
+ *
  * v2.6 (2026-04-30) — handleWorkflowCompleted now branches on
  *   workflowName via AGENTIC_EVENT_MAP. Markers like
  *   "agentic.handoff_started" / "agentic.handoff_ended" emit distinct
@@ -75,6 +107,12 @@ import supabase from './supabase.js';
 const GHL_WEBHOOK_SECRET = process.env.GHL_WEBHOOK_SECRET || '';
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const SELF_BASE_URL = `http://localhost:${process.env.PORT || 8080}`;
+
+// v2.7 — Reply buffer config and state
+const REPLY_DEBOUNCE_MS = parseInt(process.env.REPLY_DEBOUNCE_MS || '35000', 10);
+// In-process Map: contactId → { messages: string[], eventIds: number[],
+// timeoutId: NodeJS.Timeout, firstSeenAt: number, latestType: string }
+const replyBuffers = new Map();
 
 /**
  * Fire-and-forget agentic pipeline: analyze → process → execute.
@@ -141,6 +179,67 @@ async function triggerAgenticPipeline(contactId, messageText) {
   console.log(`[AgenticPipeline] Pipeline complete for ${contactId} (${Date.now() - start}ms)`);
 }
 
+/**
+ * v2.7 — Schedule (or reschedule) the agentic pipeline trigger for a
+ * contact's reply buffer. Each new message resets the timer; the pipeline
+ * runs only when REPLY_DEBOUNCE_MS elapses without further messages.
+ *
+ * Marks all buffered system_events rows as processed before triggering,
+ * so the 5-min heartbeat backstop in decision-engine doesn't re-analyze
+ * the individual messages and produce stale single-message classifications.
+ */
+function scheduleBufferedPipeline(contactId, trimmed, emittedEventId) {
+  let buf = replyBuffers.get(contactId);
+  if (buf?.timeoutId) clearTimeout(buf.timeoutId);
+  if (!buf) {
+    buf = { messages: [], eventIds: [], firstSeenAt: Date.now(), timeoutId: null };
+    replyBuffers.set(contactId, buf);
+  }
+  buf.messages.push(trimmed);
+  if (typeof emittedEventId === 'number' || (typeof emittedEventId === 'string' && emittedEventId)) {
+    buf.eventIds.push(emittedEventId);
+  }
+
+  buf.timeoutId = setTimeout(async () => {
+    // Snapshot before deleting; any messages that arrive AFTER this point
+    // start a fresh buffer.
+    const messages = buf.messages.slice();
+    const eventIds = buf.eventIds.slice();
+    const firstSeenAt = buf.firstSeenAt;
+    replyBuffers.delete(contactId);
+
+    // Mark individual reply events as processed so the heartbeat in
+    // decision-engine doesn't re-analyze them with stale single-message
+    // context. The combined-buffer analysis below produces the canonical
+    // ai.analysis_completed event for this turn.
+    if (eventIds.length > 0) {
+      try {
+        await supabase
+          .from('system_events')
+          .update({
+            processed: true,
+            processed_by: 'behavioral_emitter_buffer',
+            processed_at: new Date().toISOString(),
+            action_taken: `combined_into_reply_buffer (n=${messages.length})`,
+          })
+          .in('id', eventIds);
+      } catch (err) {
+        console.warn(`[ReplyBuffer] Mark-processed failed for ${contactId}: ${err.message}`);
+      }
+    }
+
+    const combined = messages.length === 1 ? messages[0] : messages.join('\n');
+    const elapsedSec = Math.round((Date.now() - firstSeenAt) / 1000);
+    console.log(
+      `[ReplyBuffer] Fired for ${contactId}: ${messages.length} message${messages.length === 1 ? '' : 's'}, ${elapsedSec}s window → triggering pipeline with combined text`
+    );
+
+    triggerAgenticPipeline(contactId, combined).catch(err => {
+      console.error(`[ReplyBuffer] Pipeline failed for ${contactId}: ${err.message}`);
+    });
+  }, REPLY_DEBOUNCE_MS);
+}
+
 function validateWebhook(req) {
   if (!GHL_WEBHOOK_SECRET) return true;
   const provided = req.headers['x-ghl-signature']
@@ -198,7 +297,8 @@ async function handleReply(req, res) {
   if (!contactId) return res.status(400).json({ error: 'Missing contactId in webhook payload' });
   const trimmed = messageText.trim();
 
-  // DNC always wins, regardless of contact state
+  // DNC always wins, regardless of contact state — fires immediately,
+  // bypasses the reply buffer (no analyzer call needed).
   if (isDNCSignal(trimmed)) {
     await emitEvent({
       event_type: 'ghl.reply_received', event_subtype: 'dnc', source: 'ghl_webhook',
@@ -225,7 +325,7 @@ async function handleReply(req, res) {
 
     if (!hasPauseBot) {
       // Standard trivial path — log engagement, emit low-priority event,
-      // no analyzer call.
+      // no analyzer call. Bypasses the reply buffer (no pipeline trigger).
       try { await upsertLeadIntelligence(contactId, { last_reply_at: new Date().toISOString(), last_engagement_at: new Date().toISOString() }); } catch {}
       await emitEvent({
         event_type: 'ghl.reply_received', event_subtype: 'trivial', source: 'ghl_webhook',
@@ -238,23 +338,26 @@ async function handleReply(req, res) {
 
     // pause-bot active: fall through to the substantive path below so the
     // agentic system can decide what to do with the short reply in context.
-    console.log(`[BehavioralEmitter] Trivial reply "${trimmed.slice(0, 30)}" from ${contactId} but pause-bot active → routing to analyzer`);
+    // The reply buffer applies — this short message will be combined with
+    // any other rapid-fire messages from the same contact.
+    console.log(`[BehavioralEmitter] Trivial reply "${trimmed.slice(0, 30)}" from ${contactId} but pause-bot active → routing to analyzer (buffered)`);
   }
 
-  await emitEvent({
+  const emittedEvent = await emitEvent({
     event_type: 'ghl.reply_received', event_subtype: 'pending_analysis', source: 'ghl_webhook',
     entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
     payload: { message_text: trimmed, message_type: messageType, word_count: trimmed.split(/\s+/).length },
     priority: 'high', idempotency_key: `ghl_reply_${contactId}_${Date.now()}`,
   });
-  console.log(`[BehavioralEmitter] Substantive reply from ${contactId} (${trimmed.split(/\s+/).length} words) → pending AI analysis`);
+  console.log(`[BehavioralEmitter] Substantive reply from ${contactId} (${trimmed.split(/\s+/).length} words) → buffered for ${REPLY_DEBOUNCE_MS}ms`);
 
-  // Fire-and-forget: run the full agentic pipeline inline instead of waiting for heartbeat.
-  triggerAgenticPipeline(contactId, trimmed).catch(err => {
-    console.error(`[BehavioralEmitter] Async pipeline failed for ${contactId}: ${err.message}`);
-  });
+  // v2.7: Buffer this message and (re)schedule the pipeline trigger.
+  // If another message arrives for the same contact before the timer
+  // expires, the buffer is extended and both messages are combined into
+  // a single analyzer call.
+  scheduleBufferedPipeline(contactId, trimmed, emittedEvent?.id);
 
-  return res.json({ status: 'accepted', classification: 'pending_analysis' });
+  return res.json({ status: 'accepted', classification: 'pending_analysis', buffered: true });
 }
 
 /**
@@ -726,5 +829,5 @@ export function registerBehavioralEmitterRoutes(app) {
     catch (err) { console.error('[BehavioralEmitter] /contact-created error:', err.message); if (!res.headersSent) res.status(500).json({ error: err.message }); }
   });
 
-  console.log('[BehavioralEmitter] GHL webhook routes registered: /webhook/ghl/{reply,appointment,engagement,lead-score,workflow,contact-created}');
+  console.log(`[BehavioralEmitter] GHL webhook routes registered. Reply buffer: ${REPLY_DEBOUNCE_MS}ms.`);
 }
