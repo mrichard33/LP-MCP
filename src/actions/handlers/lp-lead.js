@@ -1,56 +1,80 @@
 /**
  * LP Lead Handler — src/actions/handlers/lp-lead.js
  *
- * Phase 2 write: agentic creation of leads in LeadPerfection. Catchall
- * for any contact path that didn't push to LP via a GHL workflow — most
- * commonly chatbot in-session bookings, where Bot 4 books the appointment
- * but no upstream workflow fires LP-Send Lead to Lead Perfection.
+ * Phase 2 write: agentic creation of a brand-new lead in LP's inbound
+ * queue. The catchall path for any contact that booked an appointment
+ * but isn't yet in LP — typically chatbot in-session bookings, where
+ * Bot 4 books the appointment but no upstream GHL workflow fires
+ * LP-Send Lead to Lead Perfection.
  *
- * Idempotency: always check lp_inbound_lead_id and lp_lead_id custom
- * fields BEFORE pushing. If either is set, the lead is already (or will
- * shortly be) in LP — skip with reason 'already_in_lp'. The reaper also
- * marks create_lp_lead non-idempotent so retries won't double-fire even
- * if the in-handler check were bypassed.
+ * Why this exists: workflow LP-Send Lead to Lead Perfection (8e30ff37)
+ * only fires from three triggers (trigger-hot-call tag, window-estimator
+ * tag, manual). Bot 4 booking flow drops chatbot-completed-booked /
+ * chatbot-booked-estimate / booked-estimate tags — none of which match
+ * any of those triggers, so the lead never gets pushed. Workflow W-E1
+ * (75829de7) DOES add a "This lead was sent to Lead Perfection" note
+ * with a clickable URL on appointment booking, but that note is just
+ * an HTML hyperlink — no actual webhook fires. Result: contact has
+ * appointment in GHL only, never in LP. This handler closes the gap.
  *
- * Required fields: firstname, phone, address1, zip. Missing any of these
- * is a clean SKIP (not a throw) with GroupMe + GHL note explaining what
- * needs to be completed.
+ * Idempotency: handler short-circuits if either lp_inbound_lead_id or
+ * lp_lead_id is already populated on the contact. The reaper marks
+ * create_lp_lead non-idempotent (2026-05-01) so retries on stuck rows
+ * are failed rather than retried — the in-handler check is the safety
+ * net for normal duplicate fires.
+ *
+ * Field validation: requires firstname, phone, address1, city, state,
+ * postalCode, email. Missing-field case is a clean SKIP (not a throw)
+ * so the action doesn't churn through retries — operator must update
+ * the contact in GHL and the next event-driven fire will retry.
  *
  * On success:
  *   - Write returned in1_id to lp_inbound_lead_id custom field
  *   - Add tag 'lp-pushed-by-agentic' for diagnostics + dedup
- *   - Add GHL note documenting the push
- *   - Send rich GroupMe notification (always includes Prospect line,
- *     even when 'PENDING' — per Mark's directive that absence is signal)
+ *   - Add GHL note documenting the push (with sender / srs_id / appt)
+ *   - Send rich GroupMe notification (always includes "Prospect: PENDING"
+ *     line — per Mark's directive that absence is signal)
  *
- * The LP-Inbound Webhook on the GHL side will then fire the callback
- * that writes back lp_lead_id and lp_prospect_id and clears any
- * lp-sync-failed tag. This handler does not wait for that callback.
+ * The LP-Inbound Webhook on the GHL side then fires the callback that
+ * writes back lp_lead_id and lp_prospect_id and clears any lp-sync-failed
+ * tag. Typical end-to-end latency: ~60s.
  *
  * Built 2026-05-01 in response to Jane (mbAtXiTF1bCOBj7KpTfc) — chatbot
- * lead booked Window Estimate that never made it to LP because none of
- * the four existing LP push paths triggered for her.
+ * lead booked Window Estimate that never made it to LP.
  */
 
 import supabase from '../../supabase.js';
-import { addLead as lpAddLead } from '../../lp-client.js';
+import { addLead as lpAddLead, extractInboundLeadId } from '../../lp-client.js';
 import { sendGroupMeMessage } from '../../groupme.js';
 import { addGHLNote, updateGHLContactFields, applyGHLTag } from '../../ghl.js';
 import { isLPLeadId, ghlFetch } from '../helpers.js';
+import { parseLongDate } from '../date-parsers.js';
 import { resolveContactInfo } from '../resolvers.js';
+import { buildRichNotification } from '../enrichment.js';
 
-// GHL custom field IDs — pinned in Mark's project memory
-const FIELD_LP_INBOUND_LEAD_ID = '3YMxheIlPyhACB8zyc3W';
-const FIELD_LP_LEAD_ID         = 'GmAVmW6V9sekD7pVONKr';
-const FIELD_LP_SOURCE_ID       = 'BbUJ6RrdTjjEqqRA8JVx'; // srs_id (sub-source)
-const FIELD_CONTACT_SUMMARY    = 'dDFaBRpRn2aHVZTboUeB';
-const FIELD_LAST_APPT_DATE     = 'x8KO5o89WPLfC7ivia3A'; // last_appointment_start_date
-const FIELD_LAST_APPT_TIME     = 'U67epWMNqjbf0SHAllEZ'; // last_appointment_start_time
+// ─── GHL custom field IDs (canonical Reece location field map) ─────
+const FIELD_LP_INBOUND_LEAD_ID  = '3YMxheIlPyhACB8zyc3W'; // in1_id (LP inbound queue)
+const FIELD_LP_LEAD_ID          = 'GmAVmW6V9sekD7pVONKr'; // real lds_id
+const FIELD_LP_SOURCE_ID        = 'BbUJ6RrdTjjEqqRA8JVx'; // srs_id (LP SubSource)
+const FIELD_LP_PROMOTER_ID      = 'k6j4IBh5IejPooSCsj49'; // pro_id (LP Promoter / employee)
+const FIELD_CONTACT_SUMMARY     = 'dDFaBRpRn2aHVZTboUeB'; // pre-built contact summary
 
-// Fallback srs_id for chatbot leads when contact-level field is empty.
-// Confirmed by Mark 2026-05-01 — this matches the Reece ChatBot
-// sub-source code in LP's source/sub-source table.
-const DEFAULT_CHATBOT_SRS_ID = '5574';
+// Default LP SubSource ID for chatbot leads. Confirmed by Mark 2026-05-01:
+// 5574 is the Reece ChatBot sub-source code. Override via env if Reece's
+// SubSource map changes. NOTE: the legacy GHL workflow Chatbot Contact
+// Created - Timeout Send Lead has srs_id=830 hardcoded in its URL — that's
+// actually pro_id. The workflow has them swapped. Don't copy that bug.
+const DEFAULT_CHATBOT_SRS_ID = process.env.LP_DEFAULT_CHATBOT_SRS_ID || '5574';
+
+/**
+ * Read a custom field value off a GHL contact's customFields array.
+ * Returns the value as a string, or empty string if not present.
+ */
+function readCF(contact, fieldId) {
+  const arr = contact?.customFields || [];
+  const f = arr.find(x => x.id === fieldId);
+  return (f?.value !== undefined && f?.value !== null) ? String(f.value) : '';
+}
 
 /**
  * Format US 10-digit phone for LP. Returns digits-only or empty string.
@@ -61,39 +85,28 @@ function normalizePhone(phone) {
 }
 
 /**
- * Read a custom field value from a GHL contact's customFields array.
- * GHL surfaces custom fields as { id, value } objects.
- */
-function readCustomField(ghlContact, fieldId) {
-  const arr = ghlContact?.customFields || [];
-  const found = arr.find(f => f && f.id === fieldId);
-  return found?.value;
-}
-
-/**
  * Resolve the appointment date+time. Priority order:
- *   1. action_payload.appt_date / appt_time (rule explicitly passed)
+ *   1. action_payload.adate / atime / apptdate / appttime (rule explicitly passed)
  *   2. event_payload.appointment_date / appointment_time (the most
  *      common path — ghl.workflow_handoff appt:booked event from
  *      LP-Set Appointment workflow step 1)
- *   3. ghlContact custom fields (FIELD_LAST_APPT_DATE/TIME)
- *   4. ghlContact.last_appointment_* (in case GHL surfaces them top-level)
+ *   3. ghlContact.last_appointment_start_date / start_time (top-level fields)
  *
  * Returns { adate: 'MM/DD/YYYY', atime: '10:00 AM' } or null when both
- * fields cannot be resolved.
+ * fields cannot be resolved (or include_appt was set false).
  */
-function resolveAppointment(payload, eventPayload, ghlContact) {
-  let rawDate = payload.appt_date || payload.appointment_date
+function resolveAppointment(payload, eventPayload, ghlContact, includeAppt) {
+  if (!includeAppt) return null;
+
+  let rawDate = payload.adate || payload.apptdate || payload.appt_date || payload.appointment_date
     || eventPayload.appt_date || eventPayload.appointment_date
     || eventPayload.startDate || eventPayload.start_date
-    || readCustomField(ghlContact, FIELD_LAST_APPT_DATE)
     || ghlContact?.last_appointment_start_date
     || ghlContact?.lastAppointmentStartDate
     || null;
 
-  let rawTime = payload.appt_time || payload.appointment_time
+  let rawTime = payload.atime || payload.appttime || payload.appt_time || payload.appointment_time
     || eventPayload.appt_time || eventPayload.appointment_time
-    || readCustomField(ghlContact, FIELD_LAST_APPT_TIME)
     || ghlContact?.last_appointment_start_time
     || ghlContact?.lastAppointmentStartTime
     || null;
@@ -101,6 +114,10 @@ function resolveAppointment(payload, eventPayload, ghlContact) {
   // ISO datetime string fallback for date
   if (!rawDate && eventPayload.start_time && String(eventPayload.start_time).includes('T')) {
     rawDate = eventPayload.start_time;
+  }
+  if (!rawTime && eventPayload.start_time) {
+    const st = String(eventPayload.start_time);
+    if (st.includes('T')) rawTime = st.split('T')[1]?.slice(0, 5) || null;
   }
 
   // Reject "null" string sentinel that some GHL workflow fires emit
@@ -115,21 +132,22 @@ function resolveAppointment(payload, eventPayload, ghlContact) {
     const [y, m, d] = String(rawDate).split('T')[0].split('-');
     adate = `${m}/${d}/${y}`;
   } else {
-    adate = String(rawDate);
+    const long = parseLongDate(String(rawDate));
+    adate = long || String(rawDate);
   }
 
   // Time stays in human format ("10:00 AM"). LP's LeadAdd accepts this.
-  const atime = String(rawTime);
+  const atime = String(rawTime).trim();
 
   return { adate, atime };
 }
 
-export async function executeCreateLPLead(action, context = {}) {
+export async function executeCreateLPLead(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
 
-  if (isLPLeadId(contactId)) {
-    return { action: 'skipped_target_is_lp_id', contact_id: contactId };
+  if (!contactId || isLPLeadId(contactId)) {
+    throw new Error(`create_lp_lead: target_id must be a GHL contact ID (got: ${contactId})`);
   }
 
   // ─── Pull event payload ────────────────────────────────────────────
@@ -137,174 +155,231 @@ export async function executeCreateLPLead(action, context = {}) {
   // ghl.workflow_handoff appt:booked.
   let eventPayload = {};
   if (action.event_id) {
-    const { data: evt } = await supabase
-      .from('system_events')
-      .select('payload')
-      .eq('id', action.event_id)
-      .maybeSingle();
-    if (evt?.payload) {
-      eventPayload = typeof evt.payload === 'string' ? JSON.parse(evt.payload) : evt.payload;
-    }
+    try {
+      const { data: evt } = await supabase
+        .from('system_events')
+        .select('payload')
+        .eq('id', action.event_id)
+        .maybeSingle();
+      if (evt?.payload) {
+        eventPayload = typeof evt.payload === 'string' ? JSON.parse(evt.payload) : evt.payload;
+      }
+    } catch {}
   }
 
-  // ─── Pull GHL contact ──────────────────────────────────────────────
+  // ─── Fetch GHL contact ─────────────────────────────────────────────
   let ghlContact = null;
   try {
     const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
     ghlContact = ghlRes?.contact || null;
   } catch (err) {
-    throw new Error(`GHL contact fetch failed: ${err.message}`);
+    throw new Error(`create_lp_lead: GHL contact fetch failed for ${contactId}: ${err.message}`);
   }
-  if (!ghlContact) throw new Error(`GHL contact ${contactId} not found`);
+  if (!ghlContact) {
+    throw new Error(`create_lp_lead: GHL contact ${contactId} not found`);
+  }
 
-  // ─── IDEMPOTENCY GUARD ─────────────────────────────────────────────
-  // If either LP ID is already populated, lead is already in LP.
-  // Cleanly skip — never re-post.
-  const existingInbound = readCustomField(ghlContact, FIELD_LP_INBOUND_LEAD_ID);
-  const existingLead    = readCustomField(ghlContact, FIELD_LP_LEAD_ID);
-
-  if (existingInbound || existingLead) {
-    console.log(`[LP-LEAD] ⏭️ Skip: contact ${contactId} already in LP (in1=${existingInbound}, lds=${existingLead})`);
+  // ─── Idempotency guard ─────────────────────────────────────────────
+  // If either LP ID is already populated, lead is already in (or about
+  // to be in) LP. Cleanly skip — never re-post.
+  const existingInbound = readCF(ghlContact, FIELD_LP_INBOUND_LEAD_ID);
+  const existingLeadId  = readCF(ghlContact, FIELD_LP_LEAD_ID);
+  if (existingInbound || existingLeadId) {
+    console.log(`[LP-CREATE] ⏭️ Skip: contact ${contactId} already in LP (in1=${existingInbound || 'none'}, lds=${existingLeadId || 'none'})`);
     return {
       action: 'already_in_lp',
       contact_id: contactId,
       lp_inbound_lead_id: existingInbound || null,
-      lp_lead_id: existingLead || null,
+      lp_lead_id: existingLeadId || null,
     };
   }
 
-  // ─── REQUIRED FIELDS CHECK ─────────────────────────────────────────
+  // ─── Validate required GHL fields ─────────────────────────────────
+  // We need the basics that LP requires to create a lead. Skip cleanly
+  // (don't throw) if any are missing — the action would just retry and
+  // we'd churn notifications. The skip is its own success state.
   const phone     = normalizePhone(ghlContact.phone);
-  const firstname = ghlContact.firstName || '';
+  const firstName = ghlContact.firstName || '';
   const address1  = ghlContact.address1 || '';
+  const city      = ghlContact.city || '';
+  const state     = ghlContact.state || '';
   const zip       = ghlContact.postalCode || '';
+  const email     = ghlContact.email || '';
 
   const missing = [];
-  if (!firstname) missing.push('firstname');
+  if (!firstName) missing.push('firstName');
   if (!phone)     missing.push('phone');
   if (!address1)  missing.push('address1');
-  if (!zip)       missing.push('zip');
+  if (!city)      missing.push('city');
+  if (!state)     missing.push('state');
+  if (!zip)       missing.push('postalCode');
+  if (!email)     missing.push('email');
 
   if (missing.length) {
     const { name } = await resolveContactInfo(contactId, eventPayload);
-    const skipMsg =
-      `⚠️ AGENTIC LP-LEAD SKIP: Cannot push to LP — missing required fields\n` +
-      `👤 ${name || 'Unknown'} ${phone ? `(${phone})` : ''}\n` +
-      `   Contact ID: ${contactId} | Prospect: NONE\n` +
-      `Missing: ${missing.join(', ')}\n` +
-      `Action required: complete the contact in GHL or push to LP manually.`;
+    // v4.2 enrichment: always render the Prospect line. NONE here means
+    // the contact isn't in LP yet, which is exactly the state we're trying
+    // to fix — so the GroupMe alert points the operator to the missing
+    // fields blocking the push.
+    const skipMsg = buildRichNotification({
+      baseMessage: `⚠️ LP CREATE SKIP: missing required field(s) — ${missing.join(', ')}`,
+      name,
+      phone,
+      contactId,
+      prospectId: null, // forces "Prospect: NONE"
+      enrichment: {},
+    });
     await sendGroupMeMessage(skipMsg).catch(() => {});
     await addGHLNote(contactId,
-      `[AGENTIC LP-LEAD] Skipped — missing required fields: ${missing.join(', ')}`
+      `[LP CREATE v1.0] Skipped — required field(s) missing: ${missing.join(', ')}\n` +
+      `Lead cannot be pushed to Lead Perfection until these are populated.\n` +
+      `Add the missing fields in GHL; the next appointment_booked event will retry the push.`
     ).catch(() => {});
+    console.warn(`[LP-CREATE] ⚠️ SKIPPED ${contactId}: missing ${missing.join(', ')}`);
     return {
       action: 'skipped_missing_fields',
       contact_id: contactId,
-      missing,
+      missing_fields: missing,
     };
   }
 
-  // ─── BUILD LeadAdd PAYLOAD ─────────────────────────────────────────
-  const srs_id = readCustomField(ghlContact, FIELD_LP_SOURCE_ID)
-    || payload.srs_id
-    || DEFAULT_CHATBOT_SRS_ID;
-  const contactSummary = readCustomField(ghlContact, FIELD_CONTACT_SUMMARY)
-    || ghlContact.memory_summary
-    || '';
-  const appt = resolveAppointment(payload, eventPayload, ghlContact);
+  // ─── Resolve LP source / promoter / product / notes ───────────────
+  const srsId = String(payload.srs_id || readCF(ghlContact, FIELD_LP_SOURCE_ID) || DEFAULT_CHATBOT_SRS_ID);
+  const proId = String(payload.pro_id || readCF(ghlContact, FIELD_LP_PROMOTER_ID) || '');
+  const product = String(payload.product || 'Win');
+  const sender = String(payload.sender || `GHL-${ghlContact.source || 'Agentic'}`);
+  const contactSummary = readCF(ghlContact, FIELD_CONTACT_SUMMARY);
+  const notes = String(
+    payload.notes ||
+    contactSummary ||
+    `Lead from GHL Agentic system. Contact ID: ${contactId}. See chat history in GHL for details.`
+  );
 
+  // ─── Resolve appointment (optional, default include) ──────────────
+  const includeAppt = payload.include_appt !== false;
+  const appt = resolveAppointment(payload, eventPayload, ghlContact, includeAppt);
+  const adate = appt?.adate || '';
+  const atime = appt?.atime || '';
+
+  // ─── Build payload (REST-style names; addLead's legacy fallback path
+  //     handles translation if REST endpoint fails) ─────────────────
   const leadFields = {
-    firstname,
+    firstname: firstName,
     lastname: ghlContact.lastName || '',
     address1,
-    address2: ghlContact.address2 || '',
-    city:     ghlContact.city  || '',
-    state:    ghlContact.state || '',
+    city,
+    state,
     zip,
-    phone,
-    phonetype: '1',
-    email: ghlContact.email || '',
-    productID: 'Windows',
-    srs_id: String(srs_id),
-    sender: payload.sender || `agentic-${action.rule_applied || 'create_lp_lead'}`,
-    notes: contactSummary || `Agentic LP push for GHL contact ${contactId}`,
+    phone,                                   // REST naming
+    email,
+    sender,
+    srs_id: srsId,
+    pro_id: proId,
+    productID: product,                       // REST naming
+    proddescr: product,
+    notes,
     lognumber: contactId,
+    User1: contactId,                         // cross-attribution: GHL contact ID in LP
+    HasConsent: 'true',
+    ConsentDate: ghlContact.dateAdded || new Date().toISOString(),
+    TextOptIn: 'true',
+    EmailOptIn: 'true',
   };
-  if (appt) {
-    leadFields.apptdate = appt.adate;
-    leadFields.appttime = appt.atime;
+  if (adate && atime) {
+    leadFields.apptdate = adate;              // REST naming
+    leadFields.appttime = atime;              // REST naming
   }
 
-  // ─── POST TO LP ────────────────────────────────────────────────────
-  console.log(`[LP-LEAD] Adding lead: ${firstname} ${ghlContact.lastName || ''} (${phone})${appt ? ` w/ appt ${appt.adate} ${appt.atime}` : ''}`);
+  // ─── POST TO LP (REST first, legacy fallback) ─────────────────────
   let lpResponse;
   try {
     lpResponse = await lpAddLead(leadFields);
   } catch (err) {
-    // LP push failed — escalate to GroupMe + tag for visibility
+    // Both REST and legacy paths exhausted. Tag for visibility, escalate
+    // to GroupMe with full context, throw so the action goes to 'failed'
+    // (reaper marks create_lp_lead non-idempotent so it won't retry).
     const { name } = await resolveContactInfo(contactId, eventPayload);
     await applyGHLTag(contactId, 'lp-sync-failed').catch(() => {});
-    await sendGroupMeMessage(
-      `🚨 AGENTIC LP-LEAD FAILED: Could not push to LP\n` +
-      `👤 ${name || 'Unknown'} (${phone})\n` +
-      `   Contact ID: ${contactId} | Prospect: NONE\n` +
-      `Error: ${String(err.message).slice(0, 200)}\n` +
-      `Action required: manual LP push.`
-    ).catch(() => {});
-    throw err; // executor will mark failed; reaper will not retry (non-idempotent)
+    const failMsg = buildRichNotification({
+      baseMessage: `❌ LP CREATE FAILED: both REST and legacy lppost paths exhausted`,
+      name,
+      phone,
+      contactId,
+      prospectId: null, // forces "Prospect: NONE"
+      enrichment: {},
+    });
+    await sendGroupMeMessage(`${failMsg}\n📝 Error: ${String(err.message).slice(0, 250)}\n👉 Manual recovery required.`).catch(() => {});
+    throw err;
   }
 
-  // Parse the inbound id from the LP response. Both REST and legacy
-  // shapes are handled — REST may return { id, in1_id, ... } while
-  // legacy lppost returns { status: "OK", message: "lead added: 384191" }.
-  let inboundId = null;
-  if (lpResponse?.in1_id)        inboundId = String(lpResponse.in1_id);
-  else if (lpResponse?.id)       inboundId = String(lpResponse.id);
-  else if (lpResponse?.message && typeof lpResponse.message === 'string') {
-    const m = lpResponse.message.match(/(\d+)\s*$/);
-    if (m) inboundId = m[1];
-  }
-
+  // ─── Parse the inbound id from the response ───────────────────────
+  const inboundId = extractInboundLeadId(lpResponse);
   if (!inboundId) {
-    throw new Error(`LP LeadAdd returned no inbound id: ${JSON.stringify(lpResponse).slice(0, 200)}`);
+    // LP returned OK but with no parseable in1_id — log raw response,
+    // throw so the action goes to 'failed' (reaper non-idempotent guard
+    // prevents retry-doubling).
+    console.error(`[LP-CREATE] LP returned OK but no in1_id parseable: ${JSON.stringify(lpResponse).slice(0, 300)}`);
+    throw new Error(`LP addLead returned OK but in1_id could not be parsed: ${lpResponse?.message || '(no message)'}`);
   }
 
-  // ─── WRITE BACK ────────────────────────────────────────────────────
+  const pathTaken = lpResponse?._path || 'unknown'; // 'rest' | 'legacy'
+
+  // ─── Write the in1_id back to GHL ─────────────────────────────────
+  // Real lp_lead_id and lp_prospect_id will arrive via the LP-Inbound
+  // Webhook callback within ~60s; we don't wait for that here.
   try {
     await updateGHLContactFields(contactId, [
       { id: FIELD_LP_INBOUND_LEAD_ID, field_value: inboundId },
     ]);
     await applyGHLTag(contactId, 'lp-pushed-by-agentic');
   } catch (err) {
-    console.warn(`[LP-LEAD] Writeback failed (non-blocking): ${err.message}`);
+    console.warn(`[LP-CREATE] GHL writeback failed (non-blocking): ${err.message}`);
   }
 
-  // ─── NOTES + GROUPME (always include Prospect line) ────────────────
-  const { name } = await resolveContactInfo(contactId, eventPayload);
-  const apptLine = appt ? `\nAppointment: ${appt.adate} ${appt.atime}` : '';
-  const noteText =
-    `[AGENTIC LP-LEAD v1.0] Lead pushed to LP\n` +
-    `LP Inbound ID: ${inboundId}\n` +
-    `srs_id: ${srs_id}` +
-    apptLine +
-    `\nLP Prospect ID and lp_lead_id will populate via LP-Inbound Webhook callback.`;
-  await addGHLNote(contactId, noteText).catch(() => {});
-
-  await sendGroupMeMessage(
-    `📝 AGENTIC LP-LEAD: ${name || contactId} pushed to LP\n` +
-    `👤 ${name || 'Unknown'} (${phone})\n` +
-    `   Contact ID: ${contactId} | Prospect: PENDING (LP callback) | Inbound: ${inboundId}` +
-    apptLine
+  // ─── Annotate the contact ─────────────────────────────────────────
+  const apptLine = adate && atime
+    ? `Appointment included: ${adate} at ${atime}`
+    : `No appointment included.`;
+  await addGHLNote(contactId,
+    `[LP CREATE v1.0] Lead pushed to Lead Perfection inbound queue\n` +
+    `LP Inbound ID (in1_id): ${inboundId}\n` +
+    `Path: ${pathTaken === 'rest' ? 'REST /api/Leads/LeadAdd' : pathTaken === 'legacy' ? 'lppost (legacy fallback)' : 'unknown'}\n` +
+    `srs_id: ${srsId} | pro_id: ${proId || '(none)'} | product: ${product} | sender: ${sender}\n` +
+    `${apptLine}\n` +
+    `LP will issue real lds_id within ~60s and the LP-Inbound Webhook callback will write lp_lead_id + lp_prospect_id back to this contact.`
   ).catch(() => {});
 
-  console.log(`[LP-LEAD] ✅ Lead created: contact=${contactId}, in1_id=${inboundId}${appt ? `, appt=${appt.adate} ${appt.atime}` : ''}`);
+  // ─── Notify GroupMe (always include Prospect line) ────────────────
+  // Prospect is "PENDING" because LP hasn't issued the lds_id yet. The
+  // follow-up callback (within ~60s) writes lp_prospect_id; reviewer can
+  // refresh the contact in 60-90s to see it populated.
+  const { name } = await resolveContactInfo(contactId, eventPayload);
+  const successMsg = buildRichNotification({
+    baseMessage: `🆕 LP Lead Created via ${pathTaken === 'rest' ? 'REST' : 'legacy'} (Inbound: ${inboundId})`,
+    name,
+    phone,
+    contactId,
+    prospectId: 'PENDING',  // callback within ~60s will populate
+    enrichment: {
+      appointmentDate: adate && atime ? `${adate} ${atime}` : null,
+      lpSource: sender,
+    },
+  });
+  await sendGroupMeMessage(successMsg).catch(() => {});
+
+  console.log(`[LP-CREATE] ✅ Lead pushed to LP (${pathTaken}): in1_id=${inboundId} for contact ${contactId} (appt: ${adate ? `${adate} ${atime}` : 'none'})`);
 
   return {
     action: 'lp_lead_created',
     contact_id: contactId,
     lp_inbound_lead_id: inboundId,
-    appointment: appt,
-    srs_id,
+    path: pathTaken,
+    srs_id: srsId,
+    pro_id: proId || null,
+    product,
+    appt_date: adate || null,
+    appt_time: atime || null,
+    appt_included: !!(adate && atime),
     lp_response: lpResponse,
   };
 }
