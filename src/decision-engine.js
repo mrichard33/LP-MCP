@@ -3,6 +3,36 @@
  *
  * The brain of the agentic system.
  *
+ * v2.13 — 2026-05-04. Channel-aware send_message action creation.
+ *   PROBLEM: The AGENTIC_RESPOND_POST_CHATBOT rule template hardcodes
+ *   "channel": "sms" in its action_template params. createActionsFromRule
+ *   wrote tmpl.params directly into action_payload with no event-aware
+ *   override, so every send_message action landed with channel=sms
+ *   regardless of whether the inbound was an SMS or an email reply.
+ *   send-message-handler.js v3.3+ then routed through the SMS webhook
+ *   instead of the email Conversations API path, splitting threads.
+ *
+ *   FIX: For send_message actions, override action_payload.channel from
+ *   the source event when the event carries channel info. Rule template's
+ *   hardcoded channel remains as the fallback default for events without
+ *   channel info (behavioral rules fired by lp.disposition_changed,
+ *   ghl.appointment_booked, legacy paths). Rule does not need to change.
+ *
+ *   Pairs with message-analyzer.js v1.6 which adds channel to the
+ *   ai.analysis_completed event payload, derived from the source
+ *   ghl.reply_received's message_type. processSingleEventInner now
+ *   passes the inferred channel into analyzeMessage so the chain is
+ *   complete: ghl.reply_received.message_type → analyzeMessage(channel)
+ *   → ai.analysis_completed.payload.channel → action_payload.channel
+ *   → send-message-handler routing.
+ *
+ *   New helper: inferChannelFromEvent(event) — single source of truth
+ *   for deriving 'sms' | 'email' | null from a system_events row's
+ *   payload. Reads payload.channel first (set by analyzer v1.6+), then
+ *   falls back to payload.message_type (GHL's native field on
+ *   ghl.reply_received). Returns null when neither resolves cleanly,
+ *   in which case the rule template's value wins.
+ *
  * v2.12 — 2026-05-04. MVI Antifragile: inbound idempotency guard.
  *   Every event now claims a row in processed_events before any rule
  *   matching runs. Catches duplicate webhook deliveries that produce
@@ -601,6 +631,40 @@ async function shouldRequireApproval(rule /*, event */) {
 // ACTION CREATION
 // ═══════════════════════════════════════════════════════════════════
 
+/**
+ * v2.13 — Derive the canonical inbound channel from a system_events row.
+ *
+ * Reads (in order of preference):
+ *   1. event.payload.channel — explicit field (set by message-analyzer
+ *      v1.6+ when carrying forward from ghl.reply_received)
+ *   2. event.payload.message_type — GHL's native field on
+ *      ghl.reply_received events ("SMS" | "Email" | "TYPE_SMS" | "TYPE_EMAIL")
+ *
+ * Returns 'sms' | 'email' | null. Null when the event has no channel
+ * info (lp.disposition_changed, ghl.appointment_booked, behavioral
+ * events) — caller should keep the rule template's channel default.
+ *
+ * Exported for use by processSingleEventInner when invoking
+ * analyzeMessage so the analyzer can carry channel forward into its
+ * own emitted ai.analysis_completed event.
+ */
+function inferChannelFromEvent(event) {
+  if (!event?.payload) return null;
+  const explicit = event.payload.channel;
+  if (typeof explicit === 'string') {
+    const c = explicit.toLowerCase();
+    if (c === 'sms' || c === 'email') return c;
+  }
+  const mt = event.payload.message_type;
+  if (typeof mt === 'string') {
+    const m = mt.toLowerCase();
+    if (m === 'sms' || m === 'email') return m;
+    if (m === 'type_sms') return 'sms';
+    if (m === 'type_email') return 'email';
+  }
+  return null;
+}
+
 async function createActionsFromRule(event, rule) {
   const targetId = event.ghl_contact_id || event.entity_id || '';
   if (await hasDuplicatePendingActions(rule.rule_key, targetId)) {
@@ -618,12 +682,26 @@ async function createActionsFromRule(event, rule) {
     const tmpl = actions[i];
     const targetSystem = tmpl.target_system || 'ghl';
 
+    // v2.13: Compute action payload with channel override for send_message.
+    // Rule's hardcoded channel becomes a fallback default; when the source
+    // event carries channel info (ai.analysis_completed v1.6+,
+    // ghl.reply_received), that wins. No-op for action types other than
+    // send_message and for events without channel data.
+    let actionPayload = tmpl.params || tmpl.payload || {};
+    if (tmpl.action_type === 'send_message') {
+      const eventChannel = inferChannelFromEvent(event);
+      if (eventChannel && actionPayload.channel !== eventChannel) {
+        actionPayload = { ...actionPayload, channel: eventChannel };
+        console.log(`[DecisionEngine] Channel override for ${rule.rule_key}: ${tmpl.params?.channel || 'unset'} → ${eventChannel} (event ${event.id})`);
+      }
+    }
+
     if (targetSystem === 'ghl' && !event.ghl_contact_id) {
       console.log(`[DecisionEngine] Skipped GHL action ${tmpl.action_type} for event ${event.id} — no GHL contact`);
       await supabase.from('agent_actions').insert({
         event_id: event.id, action_type: tmpl.action_type, target_system: targetSystem,
         target_entity: tmpl.target_entity || 'contact', target_id: event.entity_id || '',
-        action_payload: tmpl.params || tmpl.payload || {},
+        action_payload: actionPayload,
         reasoning: `Rule ${rule.rule_key}: ${rule.rule_name} — SKIPPED: no GHL contact match`,
         confidence: 0, rule_applied: rule.rule_key,
         status: 'skipped', requires_approval: false,
@@ -636,7 +714,7 @@ async function createActionsFromRule(event, rule) {
     const { data, error } = await supabase.from('agent_actions').insert({
       event_id: event.id, action_type: tmpl.action_type, target_system: targetSystem,
       target_entity: tmpl.target_entity || 'contact', target_id: targetId,
-      action_payload: tmpl.params || tmpl.payload || {},
+      action_payload: actionPayload,
       reasoning: `Rule ${rule.rule_key}: ${rule.rule_name}`, confidence: 1.0,
       rule_applied: rule.rule_key, status: requiresApproval ? 'pending_approval' : 'pending',
       requires_approval: requiresApproval, batch_id: batchId, sequence_order: i,
@@ -658,7 +736,12 @@ async function processSingleEventInner(event) {
     const contactId = event.ghl_contact_id;
     const messageText = event.payload?.message_text || '';
     if (contactId && messageText) {
-      analyzeMessage(contactId, messageText, event.id).catch(err => {
+      // v2.13: derive channel from event.payload (message_type) and pass
+      // to analyzer so ai.analysis_completed carries it forward. The
+      // analyzer's own analyzePendingReplies path does the same derivation
+      // independently — keep the two callers consistent.
+      const inboundChannel = inferChannelFromEvent(event);
+      analyzeMessage(contactId, messageText, event.id, inboundChannel).catch(err => {
         console.error(`[DecisionEngine] Analysis failed for ${contactId}:`, err.message);
       });
     }
