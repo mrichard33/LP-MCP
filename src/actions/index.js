@@ -16,13 +16,21 @@
  * as defense against Railway redeploys killing processes mid-handler and
  * against the orphan 'approved' status.
  *
- * Supported action types (19):
+ * MVI v2.5 (2026-05-04) — three additions:
+ *   1. send_message acquires an outbound_lock keyed on (contact, trigger_id)
+ *      before delegating to executeSendMessage. lock-held → skipped.
+ *   2. layer3_dispatch handler — reads layer3_action_dispatch and queues
+ *      the row's action sequence into agent_actions. Closes the
+ *      no_matching_rules gap (event 18741, Douglas / Bonnie Jennings).
+ *   3. emit_event handler — used by Layer 3 sequences and observability rules.
+ *
+ * Supported action types (21):
  *   add_tag, remove_tag, set_stage, move_opportunity, update_opportunity,
  *   remove_from_workflow, add_to_workflow, book_appointment,
  *   cancel_appointment, reschedule_appointment, create_task,
  *   send_notification, set_lp_appointment, create_lp_lead,
  *   update_lp_dnc_status, update_custom_fields, update_contact_email,
- *   calculate_time_lapse_tier, send_message.
+ *   calculate_time_lapse_tier, send_message, layer3_dispatch, emit_event.
  *
  * 2026-05-01 — added create_lp_lead (Jane recovery). Closes the
  * chatbot-in-session-booking gap that left contacts out of LP because
@@ -55,6 +63,10 @@ import { getEventContext } from './resolvers.js';
 import { processApprovalQueue } from './approval-path.js';
 import { reapStuckActions } from './reaper.js';
 
+// MVI v2.5 — outbound dedup + Layer 3 dispatch
+import { tryAcquireLock, releaseLock } from '../services/outbound-locks.js';
+import { getDispatchForClassification } from '../services/layer3-dispatch.js';
+
 // ─── Handlers ──────────────────────────────────────────────────────
 import { executeAddTag, executeRemoveTag, executeSetStage } from './handlers/tags.js';
 import { executeMoveOpportunity, executeUpdateOpportunity } from './handlers/opportunities.js';
@@ -67,6 +79,158 @@ import { executeCreateTask } from './handlers/tasks.js';
 import { executeSendNotification } from './handlers/notifications.js';
 import { executeUpdateCustomFields, executeUpdateContactEmail } from './handlers/custom-fields.js';
 import { executeCalculateTimeLapseTier } from './handlers/time-lapse.js';
+import { executeEmitEvent } from './handlers/system-events.js';
+
+// ═══════════════════════════════════════════════════════════════════
+// MVI v2.5 — send_message wrapper: outbound lock around the existing handler
+// ═══════════════════════════════════════════════════════════════════
+//
+// Why a wrapper rather than modifying send-message-handler.js: the lock
+// is an orchestration concern, not a send concern. Keeping it here means
+// the handler stays focused on the GHL/webhook send mechanics, and the
+// dedup logic is inspectable in one place alongside the rest of the
+// executor.
+//
+// trigger_id resolution priority:
+//   1. action.action_payload.trigger_id        (explicit)
+//   2. context.event.payload.message_id        (inbound message we're replying to)
+//   3. `evt-${context.event.id}`               (fallback to source event)
+//
+// Lock TTL is the default 300s. If a real send takes longer than that
+// (rare), the next attempt re-acquires under "reacquired_after_expiry".
+
+async function executeSendMessageWithLock(action, context) {
+  const params = action.action_payload || {};
+  const event = context?.event;
+  const trigger_id =
+    params.trigger_id ||
+    event?.payload?.message_id ||
+    (event?.id ? `evt-${event.id}` : null);
+  const contact_id = action.target_id;
+
+  const lock = await tryAcquireLock({
+    contact_id,
+    trigger_id,
+    sender: 'agent_executor',
+    message_preview: params.message || params.body,
+  });
+
+  if (!lock.acquired) {
+    console.log(
+      `[ActionExecutor] send_message blocked by outbound lock: contact=${contact_id} trigger=${trigger_id} held_by=${lock.held_by}`
+    );
+    return {
+      skipped: true,
+      reason: 'outbound_lock_held',
+      held_by: lock.held_by,
+      lock_expires_at: lock.expires_at,
+      contact_id,
+      trigger_id,
+    };
+  }
+
+  try {
+    const result = await executeSendMessage(action, context);
+    return { ...result, _outbound_lock: { acquired: true, trigger_id, lock_key: lock.lock_key, reason: lock.reason } };
+  } catch (err) {
+    // Release on failure so a retry can take the lock back.
+    if (trigger_id) await releaseLock(contact_id, trigger_id);
+    throw err;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// MVI v2.5 — layer3_dispatch handler
+// ═══════════════════════════════════════════════════════════════════
+//
+// Fired by the LAYER3_DISPATCH agent_rule on every ai.analysis_completed
+// that carries a recommended_action. Reads layer3_action_dispatch for the
+// matching active row, applies the confidence gate, and queues each
+// sub-action into agent_actions as a fresh batch.
+//
+// Action specs in the dispatch row use the same shape as agent_rules
+// action_template entries: { action_type, target_system, target_entity,
+// params }. params becomes action_payload.
+//
+// We do NOT route through createActionsFromRule because:
+//   - The originating rule (LAYER3_DISPATCH) fires once and queues this
+//     single action. The dispatch table is what fans it out into the
+//     concrete sequence. Re-using createActionsFromRule would also force
+//     us to resolve a synthetic rule each call.
+//   - We want the queued sub-actions tagged with rule_applied=LAYER3_DISPATCH
+//     and source_classification for forensics, which the rule path doesn't
+//     emit by default.
+
+async function executeLayer3Dispatch(action, context) {
+  const event = context?.event;
+  if (!event) {
+    return { skipped: true, reason: 'no_event_context', action_id: action.id };
+  }
+
+  const result = await getDispatchForClassification(event.payload || {});
+  if (!result.dispatch) {
+    console.log(
+      `[ActionExecutor] layer3_dispatch skipped: action=${action.id} reason=${result.reason}` +
+      (result.confidence !== undefined ? ` (confidence=${result.confidence}, threshold=${result.threshold})` : '')
+    );
+    return { skipped: true, ...result };
+  }
+
+  const targetId = action.target_id;
+  const dispatch = result.dispatch;
+  const subActions = Array.isArray(dispatch.actions) ? dispatch.actions : [];
+  const batchId = `layer3_${event.id}_${dispatch.recommended_action}_${Date.now()}`;
+  const queued = [];
+
+  for (let i = 0; i < subActions.length; i++) {
+    const tmpl = subActions[i] || {};
+    if (!tmpl.action_type) continue;
+
+    const targetSystem = tmpl.target_system || 'ghl';
+    const targetEntity = tmpl.target_entity || 'contact';
+    const subTargetId = tmpl.target_id || targetId;
+
+    if (targetSystem === 'ghl' && !subTargetId) {
+      console.log(`[ActionExecutor] layer3_dispatch: skipping ${tmpl.action_type} — no GHL contact id`);
+      continue;
+    }
+
+    const { data, error } = await supabase.from('agent_actions').insert({
+      event_id: event.id,
+      action_type: tmpl.action_type,
+      target_system: targetSystem,
+      target_entity: targetEntity,
+      target_id: String(subTargetId || ''),
+      action_payload: tmpl.params || tmpl.payload || {},
+      reasoning: `LAYER3_DISPATCH(${dispatch.recommended_action}): ${dispatch.notes || 'data-driven dispatch'}`,
+      confidence: result.confidence ?? 1.0,
+      rule_applied: 'LAYER3_DISPATCH',
+      status: 'pending',
+      requires_approval: false,
+      batch_id: batchId,
+      sequence_order: i,
+    }).select().single();
+
+    if (error) {
+      console.error(`[ActionExecutor] layer3_dispatch: queue failed for ${tmpl.action_type}: ${error.message}`);
+      continue;
+    }
+    queued.push({ id: data.id, action_type: data.action_type });
+  }
+
+  console.log(
+    `[ActionExecutor] layer3_dispatch(${dispatch.recommended_action}): queued ${queued.length}/${subActions.length} sub-actions (batch=${batchId})`
+  );
+
+  return {
+    classification: dispatch.recommended_action,
+    confidence: result.confidence,
+    threshold: result.threshold,
+    queued_count: queued.length,
+    queued,
+    batch_id: batchId,
+  };
+}
 
 // ─── Handler registry ──────────────────────────────────────────────
 const ACTION_HANDLERS = {
@@ -88,7 +252,9 @@ const ACTION_HANDLERS = {
   update_custom_fields: executeUpdateCustomFields,
   update_contact_email: executeUpdateContactEmail,
   calculate_time_lapse_tier: executeCalculateTimeLapseTier,
-  send_message: executeSendMessage,
+  send_message: executeSendMessageWithLock,      // MVI v2.5 — outbound_locks wrap
+  layer3_dispatch: executeLayer3Dispatch,        // MVI v2.5 — Layer 3 fan-out
+  emit_event: executeEmitEvent,                  // MVI v2.5 — observability / follow-on
 };
 
 // Handlers that need the triggering event's payload injected as context.
@@ -100,6 +266,7 @@ const CONTEXT_AWARE_HANDLERS = new Set([
   'update_contact_email',
   'send_message',
   'create_lp_lead',          // 2026-05-01 — needs event payload for appointment_date/time
+  'layer3_dispatch',         // MVI v2.5 — needs event.payload.recommended_action
 ]);
 
 // ═══════════════════════════════════════════════════════════════════
