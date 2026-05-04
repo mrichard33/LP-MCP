@@ -1,7 +1,24 @@
 /**
  * Decision Engine — src/decision-engine.js
- * 
+ *
  * The brain of the agentic system.
+ *
+ * v2.12 — 2026-05-04. MVI Antifragile: inbound idempotency guard.
+ *   Every event now claims a row in processed_events before any rule
+ *   matching runs. Catches duplicate webhook deliveries that produce
+ *   distinct system_events rows for the same physical message. See
+ *   src/services/idempotency.js for the claim/record contract.
+ *
+ *   Behavior:
+ *     - Same idempotency key (e.g. {contact_id}:{message_id}) ⇒ second
+ *       event short-circuits with skipped_reason='already_processed' and
+ *       does NOT match rules.
+ *     - First event proceeds normally; result is recorded into
+ *       processed_events.result.
+ *     - Errors are recorded too, so forensics can see the failure path.
+ *
+ *   This is additive — prior dedup (system_events.processed,
+ *   hasDuplicatePendingActions, multi-lead guard) keeps working.
  *
  * v2.11 — 2026-05-01. Three new context predicates for engagement-depth
  *   gating and inbound text matching:
@@ -89,6 +106,10 @@
 import supabase from './supabase.js';
 import { analyzeMessage } from './message-analyzer.js';
 import { scoreIntent } from './intent-scorer.js';
+
+// MVI v2.5 — inbound idempotency. Claim before processing; record result on
+// completion so duplicate webhook deliveries can't double-fire rules.
+import { tryClaimEvent, recordResult } from './services/idempotency.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -630,7 +651,9 @@ async function createActionsFromRule(event, rule) {
 // EVENT PROCESSING
 // ═══════════════════════════════════════════════════════════════════
 
-export async function processSingleEvent(event) {
+// MVI v2.5 — inner implementation. processSingleEvent (below) wraps this
+// with the inbound idempotency guard.
+async function processSingleEventInner(event) {
   if (event.event_type === 'ghl.reply_received' && event.event_subtype === 'pending_analysis') {
     const contactId = event.ghl_contact_id;
     const messageText = event.payload?.message_text || '';
@@ -693,6 +716,38 @@ export async function processSingleEvent(event) {
   };
 }
 
+// MVI v2.5 — public entry point. Wraps processSingleEventInner with the
+// processed_events idempotency claim. Same return shape; adds
+// skipped_reason='already_processed' for duplicate deliveries.
+export async function processSingleEvent(event) {
+  const claim = await tryClaimEvent(event);
+  if (!claim.claimed) {
+    console.log(`[DecisionEngine] Event already processed: id=${event.id} key=${claim.key}`);
+    await supabase.from('system_events').update({
+      processed: true, processed_by: 'decision_engine',
+      processed_at: new Date().toISOString(),
+      action_taken: `skipped:already_processed (key=${claim.key})`,
+    }).eq('id', event.id);
+    return {
+      event_id: event.id,
+      matched_rules: 0,
+      actions_created: 0,
+      skipped_reason: 'already_processed',
+      idempotency_key: claim.key,
+    };
+  }
+
+  let result;
+  try {
+    result = await processSingleEventInner(event);
+  } catch (err) {
+    if (claim.key) await recordResult(claim.key, { error: err.message });
+    throw err;
+  }
+  if (claim.key) await recordResult(claim.key, result);
+  return result;
+}
+
 export async function processEvents({ limit = 50 } = {}) {
   const startTime = Date.now();
   const { data: events, error } = await supabase.from('system_events').select('*')
@@ -711,7 +766,7 @@ export async function processEvents({ limit = 50 } = {}) {
 
   console.log(`[DecisionEngine] Processing ${events.length} pending events...`);
   const results = [];
-  let totalActions = 0, aiRouted = 0, intentScored = 0, deduped = 0, olderLeadSkipped = 0;
+  let totalActions = 0, aiRouted = 0, intentScored = 0, deduped = 0, olderLeadSkipped = 0, alreadyProcessed = 0;
 
   const contactsToScore = new Set();
 
@@ -723,8 +778,9 @@ export async function processEvents({ limit = 50 } = {}) {
       if (result.routed_to === 'message_analyzer') aiRouted++;
       if (result.actions_created === 0 && result.matched_rules > 0) deduped++;
       if (result.skipped_reason === 'older_lead') olderLeadSkipped++;
+      if (result.skipped_reason === 'already_processed') alreadyProcessed++;
 
-      if (event.ghl_contact_id && !event.event_type.startsWith('intent.')) {
+      if (event.ghl_contact_id && !event.event_type.startsWith('intent.') && result.skipped_reason !== 'already_processed') {
         contactsToScore.add(event.ghl_contact_id);
       }
     } catch (err) {
@@ -750,12 +806,13 @@ export async function processEvents({ limit = 50 } = {}) {
   }
 
   const elapsed = Date.now() - startTime;
-  console.log(`[DecisionEngine] Done: ${events.length} events → ${totalActions} actions, ${aiRouted} AI-routed, ${intentScored} scored, ${deduped} deduped, ${olderLeadSkipped} older-lead-skipped (${elapsed}ms)`);
+  console.log(`[DecisionEngine] Done: ${events.length} events → ${totalActions} actions, ${aiRouted} AI-routed, ${intentScored} scored, ${deduped} deduped, ${olderLeadSkipped} older-lead-skipped, ${alreadyProcessed} already-processed (${elapsed}ms)`);
 
   return {
     success: true, events_processed: events.length,
     total_actions_created: totalActions, ai_routed: aiRouted,
     intent_scored: intentScored, deduped, older_lead_skipped: olderLeadSkipped,
+    already_processed: alreadyProcessed,
     results, elapsed_ms: elapsed,
   };
 }
