@@ -7,11 +7,12 @@
  * MVI v2.5 (2026-05-04) — Namespace exclusivity at write-time.
  *   executeAddTag now enforces single-occupancy across exclusive namespaces:
  *
- *     p3:            (e.g. p3:ghosted vs p3:not-interested-now)
- *     loss-reason:   (e.g. loss-reason:ghosted vs loss-reason:not-interested)
- *     stage:         (already enforced by set_stage; add_tag now matches)
- *     active-entry:  (one entry source at a time)
- *     buyer:         (one buyer-stage tag at a time)
+ *     p3:                  (e.g. p3:ghosted vs p3:not-interested-now)
+ *     loss-reason:         (e.g. loss-reason:ghosted vs loss-reason:not-interested)
+ *     stage:               (already enforced by set_stage; add_tag now matches)
+ *     active-entry:        (one entry source at a time)
+ *     buyer:               (one buyer-stage tag at a time)
+ *     objection-confirmed: (one confirmed objection at a time — v2.5.1)
  *
  *   When adding a tag in one of these namespaces, we GET the contact, find
  *   any conflicting tags in that namespace, batch-DELETE them, then add.
@@ -50,6 +51,7 @@ const NAMESPACE_EXCLUSIVE_PREFIXES = [
   'stage:',
   'active-entry:',
   'buyer:',
+  'objection-confirmed:',
 ];
 
 export async function executeAddTag(action) {
