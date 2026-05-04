@@ -25,13 +25,13 @@ const DEFAULT_CLOSURE_TAG = 'stage:long-term-nurture';
 
 async function fetchDriftCandidates(closureTag, closedForHours) {
   const HL_URL = process.env.HL_MCP_URL;
-  const HL_TOKEN = process.env.HL_MCP_TOKEN;
+  const HL_TOKEN = process.env.HL_INTERNAL_TOKEN || process.env.HL_MCP_TOKEN;
   if (!HL_URL) {
     console.warn('[drift-detector] HL_MCP_URL not set — skipping scan');
     return { contacts: [] };
   }
   try {
-    const res = await fetch(`${HL_URL.replace(/\/$/, '')}/tools/get_drift_candidates`, {
+    const res = await fetch(`${HL_URL.replace(/\/$/, '')}/internal/get-drift-candidates`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
