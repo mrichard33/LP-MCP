@@ -15,6 +15,11 @@ import { registerN8nHelperRoutes } from './n8n-helpers.js';
 import { registerN8nAvatarRoutes } from './n8n-avatar.js';
 import { registerDecisionEngineRoutes } from './decision-engine.js';
 import { registerActionExecutorRoutes } from './action-executor.js';
+// ─── Executor Heartbeat (failover for n8n cron) ──────────────────
+import {
+  registerExecutorHeartbeatRoutes,
+  startExecutorHeartbeatScheduler,
+} from './executor-heartbeat.js';
 // ─── Layer 3: Behavioral Intelligence ────────────────────────────
 import { registerContextBuilderRoutes } from './context-builder.js';
 import { registerBehavioralEmitterRoutes } from './behavioral-emitter.js';
@@ -57,7 +62,7 @@ import { runGhlContactIdBackfill } from './admin/ghl-contact-id-backfill.js';
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 const FIELD_SYNC_INTERVAL_MS = 15 * 60 * 1000;
-const SERVER_VERSION = '6.5.0';
+const SERVER_VERSION = '6.5.1';
 
 const app = express();
 app.use(express.json());
@@ -158,6 +163,10 @@ app.get('/health', (req, res) => {
     decision_engine: {
       process: 'POST /n8n/decision-engine/process',
       execute: 'POST /n8n/decision-engine/execute',
+      execute_action: 'POST /n8n/decision-engine/execute-action',
+      execute_action_by_id: 'POST /n8n/decision-engine/execute-action/:id',
+      heartbeat: 'POST /n8n/decision-engine/heartbeat',
+      heartbeat_status: 'GET /n8n/decision-engine/heartbeat-status',
       status: 'GET /n8n/decision-engine/status',
       execution_stats: 'GET /n8n/decision-engine/execution-stats',
       reload_rules: 'POST /n8n/decision-engine/reload-rules',
@@ -212,6 +221,14 @@ app.get('/health', (req, res) => {
       auto_reject_send_message_after_hours: 4,
       interval_minutes: 15,
       kill_switch_env: 'APPROVAL_ESCALATION_DISABLED',
+    },
+    executor_heartbeat: {
+      heartbeat: 'POST /n8n/decision-engine/heartbeat',
+      status: 'GET /n8n/decision-engine/heartbeat-status',
+      stale_threshold_ms: parseInt(process.env.EXECUTOR_STALE_THRESHOLD_MS || `${6 * 60 * 1000}`, 10),
+      heartbeat_interval_ms: parseInt(process.env.EXECUTOR_HEARTBEAT_INTERVAL_MS || `${5 * 60 * 1000}`, 10),
+      kill_switch_env: 'EXECUTOR_HEARTBEAT_DISABLED',
+      enabled: process.env.EXECUTOR_HEARTBEAT_DISABLED !== 'true',
     },
     data_freshness: {
       view: 'GET /n8n/admin/freshness',
@@ -337,6 +354,11 @@ registerN8nAvatarRoutes(app);
 registerDecisionEngineRoutes(app);
 registerActionExecutorRoutes(app);
 
+// ─── Executor Heartbeat (failover for n8n cron) ──────────────────
+// 2026-05-02: in-process scheduler that fires the executor when n8n's
+// external heartbeat goes stale. See src/executor-heartbeat.js for design.
+registerExecutorHeartbeatRoutes(app);
+
 // ─── Layer 3: Behavioral Intelligence ────────────────────────────
 registerContextBuilderRoutes(app);
 registerBehavioralEmitterRoutes(app);
@@ -431,13 +453,14 @@ app.listen(PORT, async () => {
   console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
   console.log(`n8n APIs:     POST /n8n/enrich-lead | /n8n/refresh-token | /n8n/prospect-lookup | /n8n/time-to-appointment`);
   console.log(`Avatar APIs:  POST /n8n/avatar/score | /parse-gpt | /unified-inputs | /pick-best | /build-ghl | /build-notion`);
-  console.log(`Decision:     POST /n8n/decision-engine/process | /execute | GET /status | /execution-stats`);
+  console.log(`Decision:     POST /n8n/decision-engine/process | /execute | /execute-action | /heartbeat | GET /status | /execution-stats | /heartbeat-status`);
   console.log(`Layer 3:      POST /webhook/ghl/{reply,appointment,engagement,lead-score,workflow,workflow-tag,entry}`);
   console.log(`Intelligence: GET /n8n/lead-intelligence/context | POST /n8n/analyze-pending-replies | /n8n/analyze-message`);
   console.log(`Intent:       POST /n8n/intent/score | /n8n/intent/sweep | GET /n8n/intent/breakdown`);
   console.log(`KB Ingest:    POST /n8n/kb/ingest | /n8n/kb/clear-source | GET /n8n/kb/sources`);
   console.log(`Pause Sweep:  POST /n8n/pause-workflow/sweep (7d fizzle, 15min interval)`);
   console.log(`Approval Esc: POST /n8n/approval-escalation/sweep (30min/60min/4h tiers, 15min interval)`);
+  console.log(`Heartbeat:    POST /n8n/decision-engine/heartbeat (5min failover, 6min stale threshold)`);
   console.log(`Freshness:    GET /n8n/admin/freshness | POST /n8n/admin/freshness-check | GET /n8n/admin/sync-probe`);
   console.log(`REST API:     GET /api/prospects/:id | /api/leads/:id | /api/search | /api/lead-summary/:contactId`);
   console.log(`GroupMe:      POST /webhook/groupme | POST /groupme/send | GET /groupme/pending`);
@@ -454,6 +477,10 @@ app.listen(PORT, async () => {
   startPauseWorkflowSweepScheduler();
   startApprovalEscalationScheduler();
   startDataFreshnessMonitorScheduler();
+  // 2026-05-02: failover heartbeat for the Action Executor. Sits dormant
+  // when n8n's external heartbeat is healthy; takes over within 6min if
+  // n8n stops firing. Killable via EXECUTOR_HEARTBEAT_DISABLED=true.
+  startExecutorHeartbeatScheduler();
   setTimeout(() => {
     setTimeout(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, 120000);
     setInterval(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, FIELD_SYNC_INTERVAL_MS);

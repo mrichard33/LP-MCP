@@ -1,10 +1,23 @@
 /**
  * Appointment Handlers — src/actions/handlers/appointments.js
  *
- * book_appointment (v3.1): POST /calendars/events/appointments — book GHL
- *   calendar appointment. Accepts calendar_name (mapped to ID) or direct
- *   calendar_id. Supports US-format date/time as well as ISO start_time.
- *   Duration defaults to 90 min, end_time auto-calculated if not provided.
+ * book_appointment (v3.3 — 2026-05-02): POST /calendars/events/appointments —
+ *   book GHL calendar appointment. Accepts calendar_name (mapped to ID) or
+ *   direct calendar_id. Supports US-format date/time as well as ISO
+ *   start_time. Duration defaults to 90 min, end_time auto-calculated if
+ *   not provided.
+ *
+ *   v3.3 — 2026-05-02: added ignore_free_slot_validation payload flag.
+ *   When true, sets ignoreFreeSlotValidation: true on the GHL appointment
+ *   POST body, bypassing GHL's calendar availability checks. Used for
+ *   recovery flows where the source-of-truth (e.g. the customer's verbal
+ *   agreement via chatbot) says the slot is valid even if GHL's calendar
+ *   rules would otherwise block it. This matches the "Override Availability"
+ *   flag used by GHL's Book Appointment workflow action and the LP webhook
+ *   booking flow. Cited incident: Jeanne Jewell 2026-05-02 — Bot 4
+ *   OUT_OF_AREA misfire blocked the in-session booking; recovery rebooking
+ *   needed override because GHL availability had already been consumed
+ *   by other reps in the intervening hours.
  *
  *   v3.1 ADDITION — qualifying_data persistence: after a successful booking,
  *   if action_payload includes qualifying_data { window_count?,
@@ -51,8 +64,8 @@
  *       fired auto-cancel on a fresh booking; v3.1 cancel failed for
  *       same reason.
  *
- * reschedule_appointment (v1.0): cancels old + books new in a single
- *   executor call. Order matters:
+ * reschedule_appointment (v1.1 — 2026-05-02): cancels old + books new in
+ *   a single executor call. Order matters:
  *     1. PUT old appointment to status='cancelled'. If this fails, abort
  *        — we don't want to create a second appointment when the first
  *        is still active.
@@ -65,6 +78,10 @@
  *        step 1 with "appointment already cancelled").
  *     3. Same qualifying_data persistence as book_appointment, on the
  *        contact (the data is contact-level, not appointment-level).
+ *
+ *   v1.1: also forwards ignore_free_slot_validation to the new-booking
+ *   step, so reschedules can override availability the same way book
+ *   does.
  *
  *   Payload field naming uses "new_*" prefixes to disambiguate from the
  *   old appointment's metadata.
@@ -139,6 +156,11 @@ async function persistQualifyingData(contactId, qualifyingData) {
  * Internal: build the GHL appointment POST body from a payload that uses
  * the standard book_appointment field names. Used by both
  * executeBookAppointment and executeRescheduleAppointment.
+ *
+ * v3.3 — 2026-05-02: when payload.ignore_free_slot_validation is truthy,
+ * adds ignoreFreeSlotValidation: true to the body. GHL respects this flag
+ * to bypass calendar availability checks, matching the "Override
+ * Availability" toggle in the workflow Book Appointment action.
  */
 function buildAppointmentBody(payload, contactId) {
   let calendarId = payload.calendar_id;
@@ -180,6 +202,7 @@ function buildAppointmentBody(payload, contactId) {
   const title = payload.title || payload.calendar_name || 'Appointment';
   const status = payload.status || 'new';
   const assignedUserId = payload.assigned_user_id || null;
+  const ignoreFreeSlotValidation = !!payload.ignore_free_slot_validation;
 
   const body = {
     calendarId,
@@ -192,8 +215,9 @@ function buildAppointmentBody(payload, contactId) {
     toNotify: true,
   };
   if (assignedUserId) body.assignedUserId = assignedUserId;
+  if (ignoreFreeSlotValidation) body.ignoreFreeSlotValidation = true;
 
-  return { body, calendarId, startTime, endTime, title, status };
+  return { body, calendarId, startTime, endTime, title, status, ignoreFreeSlotValidation };
 }
 
 export async function executeBookAppointment(action, context) {
@@ -201,9 +225,9 @@ export async function executeBookAppointment(action, context) {
   const payload = interpolatePayload(action.action_payload, context);
   if (!contactId) throw new Error('Missing contactId');
 
-  const { body, calendarId, startTime, endTime, title, status } = buildAppointmentBody(payload, contactId);
+  const { body, calendarId, startTime, endTime, title, status, ignoreFreeSlotValidation } = buildAppointmentBody(payload, contactId);
 
-  console.log(`[ActionExecutor] Booking appointment: calendar=${calendarId}, contact=${contactId}, start=${startTime}, status=${status}`);
+  console.log(`[ActionExecutor] Booking appointment: calendar=${calendarId}, contact=${contactId}, start=${startTime}, status=${status}${ignoreFreeSlotValidation ? ', override_availability=true' : ''}`);
   const result = await ghlFetch('POST', '/calendars/events/appointments', body);
   const appointmentId = result?.id || result?.appointment?.id || null;
   console.log(`[ActionExecutor] ✅ Appointment booked: id=${appointmentId}, calendar=${title}`);
@@ -223,6 +247,7 @@ export async function executeBookAppointment(action, context) {
     start_time: startTime,
     end_time: endTime,
     status,
+    ignore_free_slot_validation: ignoreFreeSlotValidation,
     qualifying_data_fields_written: qualifyingDataFieldsWritten,
   };
 }
@@ -331,7 +356,7 @@ export async function executeCancelAppointment(action) {
 }
 
 /**
- * v1.0 — reschedule_appointment: cancel old + book new in one operation.
+ * v1.1 — reschedule_appointment: cancel old + book new in one operation.
  *
  * Why a combined action instead of two companions:
  *   - Keeps companion_action a single object (no multi-companion refactor)
@@ -348,6 +373,9 @@ export async function executeCancelAppointment(action) {
  *     "already cancelled" — no value. So we don't auto-retry here.
  *   - Both succeed → return full-success result with new appointment_id.
  *     Qualifying data persistence runs after both succeed (best-effort).
+ *
+ * v1.1 — 2026-05-02: forwards ignore_free_slot_validation to the new
+ * booking step (Jeanne Jewell pattern).
  */
 export async function executeRescheduleAppointment(action, context) {
   const contactId = action.target_id;
@@ -378,6 +406,7 @@ export async function executeRescheduleAppointment(action, context) {
     assigned_user_id: payload.assigned_user_id,
     appointment_date: payload.appointment_date,
     appointment_time: payload.appointment_time,
+    ignore_free_slot_validation: payload.ignore_free_slot_validation, // v1.1
   };
 
   let newAppointmentId = null;
@@ -389,7 +418,7 @@ export async function executeRescheduleAppointment(action, context) {
     bookStartTime = built.startTime;
     bookCalendarName = built.title;
     bookStatus = built.status;
-    console.log(`[ActionExecutor] Reschedule step 2/2: booking new appointment, calendar=${built.calendarId}, start=${built.startTime}`);
+    console.log(`[ActionExecutor] Reschedule step 2/2: booking new appointment, calendar=${built.calendarId}, start=${built.startTime}${built.ignoreFreeSlotValidation ? ', override_availability=true' : ''}`);
     const bookResult = await ghlFetch('POST', '/calendars/events/appointments', built.body);
     newAppointmentId = bookResult?.id || bookResult?.appointment?.id || null;
     console.log(`[ActionExecutor] ✅ Reschedule complete: new appointment id=${newAppointmentId}, status=${built.status}`);

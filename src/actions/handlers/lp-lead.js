@@ -24,9 +24,11 @@
  * net for normal duplicate fires.
  *
  * Field validation: requires firstname, phone, address1, city, state,
- * postalCode, email. Missing-field case is a clean SKIP (not a throw)
- * so the action doesn't churn through retries — operator must update
- * the contact in GHL and the next event-driven fire will retry.
+ * postalCode (per LP's actual addLead requirements). EMAIL IS OPTIONAL
+ * (corrected 2026-05-02 — earlier versions wrongly required it).
+ * Missing-field case is a clean SKIP (not a throw) so the action
+ * doesn't churn through retries — operator must update the contact
+ * in GHL and the next event-driven fire will retry.
  *
  * On success:
  *   - Write returned in1_id to lp_inbound_lead_id custom field
@@ -41,6 +43,12 @@
  *
  * Built 2026-05-01 in response to Jane (mbAtXiTF1bCOBj7KpTfc) — chatbot
  * lead booked Window Estimate that never made it to LP.
+ *
+ * 2026-05-02 fixes (Jeanne Jewell recovery):
+ *   - Email no longer required. Mark confirmed LP accepts emailless leads.
+ *   - Email is conditionally included only when present.
+ *   - lp-client.js addLead now defaults to LEGACY-FIRST path ordering,
+ *     which preserves srs_id/pro_id attribution that REST silently dropped.
  */
 
 import supabase from '../../supabase.js';
@@ -195,16 +203,18 @@ export async function executeCreateLPLead(action) {
   }
 
   // ─── Validate required GHL fields ─────────────────────────────────
-  // We need the basics that LP requires to create a lead. Skip cleanly
-  // (don't throw) if any are missing — the action would just retry and
-  // we'd churn notifications. The skip is its own success state.
+  // We need the basics that LP requires to create a lead. EMAIL IS
+  // NOT REQUIRED — LP accepts leads without email (corrected 2026-05-02).
+  // Skip cleanly (don't throw) if any required field is missing — the
+  // action would just retry and we'd churn notifications. The skip is
+  // its own success state.
   const phone     = normalizePhone(ghlContact.phone);
   const firstName = ghlContact.firstName || '';
   const address1  = ghlContact.address1 || '';
   const city      = ghlContact.city || '';
   const state     = ghlContact.state || '';
   const zip       = ghlContact.postalCode || '';
-  const email     = ghlContact.email || '';
+  const email     = ghlContact.email || ''; // optional — included only if present
 
   const missing = [];
   if (!firstName) missing.push('firstName');
@@ -213,7 +223,7 @@ export async function executeCreateLPLead(action) {
   if (!city)      missing.push('city');
   if (!state)     missing.push('state');
   if (!zip)       missing.push('postalCode');
-  if (!email)     missing.push('email');
+  // Note: email is NOT in this list — LP accepts emailless leads.
 
   if (missing.length) {
     const { name } = await resolveContactInfo(contactId, eventPayload);
@@ -231,7 +241,7 @@ export async function executeCreateLPLead(action) {
     });
     await sendGroupMeMessage(skipMsg).catch(() => {});
     await addGHLNote(contactId,
-      `[LP CREATE v1.0] Skipped — required field(s) missing: ${missing.join(', ')}\n` +
+      `[LP CREATE v1.1] Skipped — required field(s) missing: ${missing.join(', ')}\n` +
       `Lead cannot be pushed to Lead Perfection until these are populated.\n` +
       `Add the missing fields in GHL; the next appointment_booked event will retry the push.`
     ).catch(() => {});
@@ -261,8 +271,15 @@ export async function executeCreateLPLead(action) {
   const adate = appt?.adate || '';
   const atime = appt?.atime || '';
 
-  // ─── Build payload (REST-style names; addLead's legacy fallback path
-  //     handles translation if REST endpoint fails) ─────────────────
+  // ─── Build payload ───────────────────────────────────────────────
+  // Use REST-style names; lp-client's addLead translates to legacy
+  // names automatically when calling the lppost endpoint (which is
+  // now the PRIMARY path as of 2026-05-02 because it preserves srs_id
+  // and pro_id attribution that REST silently dropped).
+  //
+  // Optional fields (email, pro_id) are included only when populated.
+  // lp-client's addLead also strips blank values defensively, so this
+  // is belt-and-suspenders.
   const leadFields = {
     firstname: firstName,
     lastname: ghlContact.lastName || '',
@@ -270,38 +287,39 @@ export async function executeCreateLPLead(action) {
     city,
     state,
     zip,
-    phone,                                   // REST naming
-    email,
+    phone,                                   // REST naming → translates to phone1 for legacy
     sender,
     srs_id: srsId,
-    pro_id: proId,
-    productID: product,                       // REST naming
+    productID: product,                      // REST naming → translates to productid for legacy
     proddescr: product,
     notes,
     lognumber: contactId,
-    User1: contactId,                         // cross-attribution: GHL contact ID in LP
+    User1: contactId,                        // cross-attribution: GHL contact ID in LP
     HasConsent: 'true',
     ConsentDate: ghlContact.dateAdded || new Date().toISOString(),
     TextOptIn: 'true',
     EmailOptIn: 'true',
   };
+  // Conditional optional fields — only set when populated.
+  if (email)     leadFields.email = email;
+  if (proId)     leadFields.pro_id = proId;
   if (adate && atime) {
-    leadFields.apptdate = adate;              // REST naming
-    leadFields.appttime = atime;              // REST naming
+    leadFields.apptdate = adate;             // REST naming → translates to adate for legacy
+    leadFields.appttime = atime;             // REST naming → translates to atime for legacy
   }
 
-  // ─── POST TO LP (REST first, legacy fallback) ─────────────────────
+  // ─── POST TO LP (legacy lppost is primary; REST is fallback) ──────
   let lpResponse;
   try {
     lpResponse = await lpAddLead(leadFields);
   } catch (err) {
-    // Both REST and legacy paths exhausted. Tag for visibility, escalate
+    // Both legacy and REST paths exhausted. Tag for visibility, escalate
     // to GroupMe with full context, throw so the action goes to 'failed'
     // (reaper marks create_lp_lead non-idempotent so it won't retry).
     const { name } = await resolveContactInfo(contactId, eventPayload);
     await applyGHLTag(contactId, 'lp-sync-failed').catch(() => {});
     const failMsg = buildRichNotification({
-      baseMessage: `❌ LP CREATE FAILED: both REST and legacy lppost paths exhausted`,
+      baseMessage: `❌ LP CREATE FAILED: both legacy lppost and REST paths exhausted`,
       name,
       phone,
       contactId,
@@ -322,7 +340,7 @@ export async function executeCreateLPLead(action) {
     throw new Error(`LP addLead returned OK but in1_id could not be parsed: ${lpResponse?.message || '(no message)'}`);
   }
 
-  const pathTaken = lpResponse?._path || 'unknown'; // 'rest' | 'legacy'
+  const pathTaken = lpResponse?._path || 'unknown'; // 'legacy' | 'rest'
 
   // ─── Write the in1_id back to GHL ─────────────────────────────────
   // Real lp_lead_id and lp_prospect_id will arrive via the LP-Inbound
@@ -340,11 +358,16 @@ export async function executeCreateLPLead(action) {
   const apptLine = adate && atime
     ? `Appointment included: ${adate} at ${atime}`
     : `No appointment included.`;
+  const pathLabel =
+    pathTaken === 'legacy' ? 'lppost (legacy — primary path, preserves srs/pro)'
+    : pathTaken === 'rest' ? 'REST /api/Leads/LeadAdd (fallback path)'
+    : 'unknown';
   await addGHLNote(contactId,
-    `[LP CREATE v1.0] Lead pushed to Lead Perfection inbound queue\n` +
+    `[LP CREATE v1.1] Lead pushed to Lead Perfection inbound queue\n` +
     `LP Inbound ID (in1_id): ${inboundId}\n` +
-    `Path: ${pathTaken === 'rest' ? 'REST /api/Leads/LeadAdd' : pathTaken === 'legacy' ? 'lppost (legacy fallback)' : 'unknown'}\n` +
+    `Path: ${pathLabel}\n` +
     `srs_id: ${srsId} | pro_id: ${proId || '(none)'} | product: ${product} | sender: ${sender}\n` +
+    `Email: ${email || '(none — LP accepts emailless leads)'}\n` +
     `${apptLine}\n` +
     `LP will issue real lds_id within ~60s and the LP-Inbound Webhook callback will write lp_lead_id + lp_prospect_id back to this contact.`
   ).catch(() => {});
@@ -355,7 +378,7 @@ export async function executeCreateLPLead(action) {
   // refresh the contact in 60-90s to see it populated.
   const { name } = await resolveContactInfo(contactId, eventPayload);
   const successMsg = buildRichNotification({
-    baseMessage: `🆕 LP Lead Created via ${pathTaken === 'rest' ? 'REST' : 'legacy'} (Inbound: ${inboundId})`,
+    baseMessage: `🆕 LP Lead Created via ${pathTaken === 'legacy' ? 'lppost' : 'REST'} (Inbound: ${inboundId})`,
     name,
     phone,
     contactId,
@@ -367,7 +390,7 @@ export async function executeCreateLPLead(action) {
   });
   await sendGroupMeMessage(successMsg).catch(() => {});
 
-  console.log(`[LP-CREATE] ✅ Lead pushed to LP (${pathTaken}): in1_id=${inboundId} for contact ${contactId} (appt: ${adate ? `${adate} ${atime}` : 'none'})`);
+  console.log(`[LP-CREATE] ✅ Lead pushed to LP (${pathTaken}): in1_id=${inboundId} for contact ${contactId} (srs=${srsId}, pro=${proId || 'none'}, email=${email || 'none'}, appt=${adate ? `${adate} ${atime}` : 'none'})`);
 
   return {
     action: 'lp_lead_created',
@@ -376,6 +399,7 @@ export async function executeCreateLPLead(action) {
     path: pathTaken,
     srs_id: srsId,
     pro_id: proId || null,
+    email: email || null,
     product,
     appt_date: adate || null,
     appt_time: atime || null,

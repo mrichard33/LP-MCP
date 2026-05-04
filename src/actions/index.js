@@ -36,6 +36,16 @@
  * ({{contact.lp_prospect_id}} not resolving). The agentic handler
  * reads the prospect ID directly from the GHL contact object,
  * sidestepping the merge field entirely.
+ *
+ * 2026-05-02 — added executeActionById + POST /execute-action endpoint
+ * (Jeanne Jewell recovery). The FIFO queue order (created_at ASC) means
+ * a freshly-queued action sits behind every older pending action. With
+ * 5K+ pending in the queue and a 5-min n8n cron pulling 10 at a time,
+ * a new action could wait hours. Direct-execute lets Claude (or any
+ * authenticated caller) run a specific action_id immediately, bypassing
+ * the FIFO. Used for recovery flows and time-sensitive operations like
+ * appointment booking. Same handler pipeline — same retry semantics —
+ * just skips the queue ordering step.
  */
 
 import supabase from '../supabase.js';
@@ -214,6 +224,100 @@ export async function executeActions({ limit = 50 } = {}) {
   };
 }
 
+/**
+ * 2026-05-02 — Direct execute by ID. Runs a single action immediately,
+ * bypassing the FIFO queue ordering. Used for recovery flows and time-
+ * sensitive operations where waiting on the 5K+ pending queue is not
+ * acceptable.
+ *
+ * Behavior:
+ *   - Fetches the action by ID. Throws if not found.
+ *   - Refuses to run actions with status='completed' or 'rejected'
+ *     (terminal states). Caller must reset status manually if they
+ *     want to re-run.
+ *   - For status='pending', 'failed', or 'executing': runs through
+ *     executeSingleAction with the same retry/error semantics.
+ *     - 'failed' → resets retry_count to 0 before running (manual rerun
+ *       implies caller wants a fresh attempt, not to count against retries).
+ *     - 'executing' → assumes process died mid-run (matches reaper logic).
+ *     - 'pending' → just runs.
+ *   - For status='pending_approval': returns an error. Caller must
+ *     approve_action first. We don't bypass approval gates from here
+ *     because some action types are gated for safety reasons.
+ *
+ * Does NOT run the reaper or approval queue phases. Single action only.
+ * Does NOT inject batch context — batchContext is empty {} since this
+ * is a one-off execution.
+ *
+ * @param {number} actionId
+ * @param {object} [opts]
+ * @param {boolean} [opts.allowExecuting=true]  Run actions stuck in 'executing'
+ * @param {boolean} [opts.resetRetryCount=true] For failed actions, reset retry_count
+ * @returns {Promise<object>} executeSingleAction result
+ */
+export async function executeActionById(actionId, opts = {}) {
+  const { allowExecuting = true, resetRetryCount = true } = opts;
+
+  if (typeof actionId !== 'number' || !Number.isFinite(actionId)) {
+    throw new Error('executeActionById: actionId must be a finite number');
+  }
+
+  const { data: action, error: fetchErr } = await supabase
+    .from('agent_actions')
+    .select('*')
+    .eq('id', actionId)
+    .maybeSingle();
+
+  if (fetchErr) throw new Error(`Failed to fetch action ${actionId}: ${fetchErr.message}`);
+  if (!action) throw new Error(`Action ${actionId} not found`);
+
+  const terminal = new Set(['completed', 'rejected']);
+  if (terminal.has(action.status)) {
+    return {
+      action_id: actionId,
+      status: action.status,
+      skipped: true,
+      reason: `Action is in terminal state '${action.status}'. Reset status manually to re-run.`,
+    };
+  }
+
+  if (action.status === 'pending_approval') {
+    return {
+      action_id: actionId,
+      status: 'pending_approval',
+      skipped: true,
+      reason: 'Action requires approval. Use approve_action first, then re-call execute-action.',
+    };
+  }
+
+  if (action.status === 'executing' && !allowExecuting) {
+    return {
+      action_id: actionId,
+      status: 'executing',
+      skipped: true,
+      reason: 'Action already in executing state. Pass allowExecuting=true to override.',
+    };
+  }
+
+  // For previously-failed actions, reset the retry counter so the manual
+  // re-run gets a fresh attempt budget. Keep error_message for audit.
+  if (action.status === 'failed' && resetRetryCount) {
+    await supabase.from('agent_actions').update({
+      retry_count: 0,
+      updated_at: new Date().toISOString(),
+    }).eq('id', actionId);
+    action.retry_count = 0;
+  }
+
+  console.log(`[ActionExecutor] Direct-execute action ${actionId} (type: ${action.action_type}, prior status: ${action.status})`);
+  const result = await executeSingleAction(action, {});
+  return {
+    ...result,
+    direct_execute: true,
+    prior_status: action.status,
+  };
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // EXPRESS ROUTES
 // ═══════════════════════════════════════════════════════════════════
@@ -222,6 +326,41 @@ export function registerActionExecutorRoutes(app) {
   app.post('/n8n/decision-engine/execute', async (req, res) => {
     try {
       res.json(await executeActions({ limit: req.body?.limit || 50 }));
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // 2026-05-02 — Direct execute by action_id. Bypasses FIFO queue.
+  // Body: { action_id: number, allow_executing?: boolean, reset_retry_count?: boolean }
+  // Or path param: POST /execute-action/:id
+  app.post('/n8n/decision-engine/execute-action', async (req, res) => {
+    try {
+      const actionId = Number(req.body?.action_id);
+      if (!Number.isFinite(actionId)) {
+        return res.status(400).json({ success: false, error: 'action_id is required (number)' });
+      }
+      const result = await executeActionById(actionId, {
+        allowExecuting: req.body?.allow_executing !== false,
+        resetRetryCount: req.body?.reset_retry_count !== false,
+      });
+      res.json({ success: true, ...result });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  app.post('/n8n/decision-engine/execute-action/:id', async (req, res) => {
+    try {
+      const actionId = Number(req.params.id);
+      if (!Number.isFinite(actionId)) {
+        return res.status(400).json({ success: false, error: 'id must be a number' });
+      }
+      const result = await executeActionById(actionId, {
+        allowExecuting: req.body?.allow_executing !== false,
+        resetRetryCount: req.body?.reset_retry_count !== false,
+      });
+      res.json({ success: true, ...result });
     } catch (err) {
       res.status(500).json({ success: false, error: err.message });
     }
