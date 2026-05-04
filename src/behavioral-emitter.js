@@ -14,6 +14,43 @@
  * 
  * Security: All endpoints validate GHL_WEBHOOK_SECRET.
  *
+ * v2.8 (2026-05-04) — Thread channel through the reply buffer.
+ *   PROBLEM: v2.7's reply buffer (scheduleBufferedPipeline →
+ *   triggerAgenticPipeline) is a third caller path to analyzeMessage
+ *   that v1.6/v2.13 didn't update. handleReply captured messageType
+ *   from the GHL webhook body and emitted it on ghl.reply_received,
+ *   but did NOT pass it into scheduleBufferedPipeline. The buffer
+ *   then triggered the agentic pipeline over loopback HTTP without
+ *   any channel info. /n8n/analyze-message ignored the channel field
+ *   too (it only read contactId + message), so analyzeMessage was
+ *   called with channel=null → ai.analysis_completed emitted with
+ *   payload.channel=null → decision-engine v2.13's
+ *   inferChannelFromEvent had nothing to read → action.channel
+ *   defaulted to the rule template's hardcoded 'sms' → email replies
+ *   were still answered via SMS. Confirmed on contact
+ *   7jl9cVfry8OyQF6oI2V5 2026-05-04 20:18 UTC: ghl.reply_received
+ *   19260 had message_type='Email'; ai.analysis_completed 19268 had
+ *   channel=null; webhook payload landed with channel='sms'.
+ *
+ *   FIX: Three threaded changes —
+ *     1. scheduleBufferedPipeline now takes messageType as a 4th param
+ *        and records latestType on the buffer state object.
+ *     2. When the buffer fires, latestType is normalized to
+ *        'sms' | 'email' | null and passed into triggerAgenticPipeline.
+ *     3. triggerAgenticPipeline forwards the channel in the POST body
+ *        of /n8n/analyze-message.
+ *
+ *   Pairs with message-analyzer.js v1.7 which extends the
+ *   /n8n/analyze-message endpoint to accept channel from req.body and
+ *   forward it to analyzeMessage.
+ *
+ *   When the buffer combines multiple messages from the same contact,
+ *   latestType is overwritten on each new message — practically all
+ *   messages in a single buffer window will share a channel anyway
+ *   (each channel has its own conversation thread), and if they
+ *   somehow differ, the most recent type is the right one to honor for
+ *   the reply.
+ *
  * v2.7 (2026-05-01) — Reply buffer for rapid-fire message combining.
  *   PROBLEM: When a contact sent multiple inbound SMS within seconds of
  *   each other (e.g. "My wife and I cannot make it to the appointment"
@@ -121,15 +158,20 @@ const replyBuffers = new Map();
  *
  * Timeline target: ~10-15 seconds end-to-end.
  */
-async function triggerAgenticPipeline(contactId, messageText) {
+async function triggerAgenticPipeline(contactId, messageText, channel = null) {
   const start = Date.now();
 
   // Step 1: Analyze the message (~4-8 sec — Claude API call)
+  // v2.8: forward channel ('sms' | 'email' | null) so message-analyzer
+  // v1.7+ can carry it through to ai.analysis_completed and downstream
+  // decision-engine v2.13+ can use it to override the rule template's
+  // channel for send_message actions. Null is safe (analyzer falls
+  // back to the rule template's default).
   try {
     const analyzeRes = await fetch(`${SELF_BASE_URL}/n8n/analyze-message`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contactId, message: messageText }),
+      body: JSON.stringify({ contactId, message: messageText, channel }),
       signal: AbortSignal.timeout(45000),
     });
     if (!analyzeRes.ok) {
@@ -188,17 +230,26 @@ async function triggerAgenticPipeline(contactId, messageText) {
  * so the 5-min heartbeat backstop in decision-engine doesn't re-analyze
  * the individual messages and produce stale single-message classifications.
  */
-function scheduleBufferedPipeline(contactId, trimmed, emittedEventId) {
+function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageType = null) {
   let buf = replyBuffers.get(contactId);
   if (buf?.timeoutId) clearTimeout(buf.timeoutId);
   if (!buf) {
-    buf = { messages: [], eventIds: [], firstSeenAt: Date.now(), timeoutId: null };
+    // v2.8: latestType records the most recent messageType seen for this
+    // buffer window. Normalized to 'sms'|'email'|null when the buffer
+    // fires and passed downstream so the analyzer can carry channel
+    // forward into ai.analysis_completed.
+    buf = { messages: [], eventIds: [], firstSeenAt: Date.now(), timeoutId: null, latestType: null };
     replyBuffers.set(contactId, buf);
   }
   buf.messages.push(trimmed);
   if (typeof emittedEventId === 'number' || (typeof emittedEventId === 'string' && emittedEventId)) {
     buf.eventIds.push(emittedEventId);
   }
+  // v2.8: track most recent messageType. In practice all messages in a
+  // single buffer window share a channel (each channel has its own
+  // thread), but if they ever differ, "latest wins" is the right policy
+  // for the outbound reply.
+  if (messageType) buf.latestType = messageType;
 
   buf.timeoutId = setTimeout(async () => {
     // Snapshot before deleting; any messages that arrive AFTER this point
@@ -206,6 +257,7 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId) {
     const messages = buf.messages.slice();
     const eventIds = buf.eventIds.slice();
     const firstSeenAt = buf.firstSeenAt;
+    const latestType = buf.latestType;
     replyBuffers.delete(contactId);
 
     // Mark individual reply events as processed so the heartbeat in
@@ -230,11 +282,22 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId) {
 
     const combined = messages.length === 1 ? messages[0] : messages.join('\n');
     const elapsedSec = Math.round((Date.now() - firstSeenAt) / 1000);
+
+    // v2.8: normalize messageType ("SMS" | "Email" | "TYPE_SMS" |
+    // "TYPE_EMAIL" | etc) to 'sms' | 'email' | null. Passed into
+    // triggerAgenticPipeline so analyzer can carry channel forward.
+    const channel = (() => {
+      const lt = String(latestType || '').toLowerCase();
+      if (lt.includes('email')) return 'email';
+      if (lt.includes('sms'))   return 'sms';
+      return null;
+    })();
+
     console.log(
-      `[ReplyBuffer] Fired for ${contactId}: ${messages.length} message${messages.length === 1 ? '' : 's'}, ${elapsedSec}s window → triggering pipeline with combined text`
+      `[ReplyBuffer] Fired for ${contactId}: ${messages.length} message${messages.length === 1 ? '' : 's'}, ${elapsedSec}s window, channel=${channel || 'unknown'} → triggering pipeline with combined text`
     );
 
-    triggerAgenticPipeline(contactId, combined).catch(err => {
+    triggerAgenticPipeline(contactId, combined, channel).catch(err => {
       console.error(`[ReplyBuffer] Pipeline failed for ${contactId}: ${err.message}`);
     });
   }, REPLY_DEBOUNCE_MS);
@@ -349,13 +412,16 @@ async function handleReply(req, res) {
     payload: { message_text: trimmed, message_type: messageType, word_count: trimmed.split(/\s+/).length },
     priority: 'high', idempotency_key: `ghl_reply_${contactId}_${Date.now()}`,
   });
-  console.log(`[BehavioralEmitter] Substantive reply from ${contactId} (${trimmed.split(/\s+/).length} words) → buffered for ${REPLY_DEBOUNCE_MS}ms`);
+  console.log(`[BehavioralEmitter] Substantive reply from ${contactId} (${trimmed.split(/\s+/).length} words, type=${messageType}) → buffered for ${REPLY_DEBOUNCE_MS}ms`);
 
   // v2.7: Buffer this message and (re)schedule the pipeline trigger.
   // If another message arrives for the same contact before the timer
   // expires, the buffer is extended and both messages are combined into
   // a single analyzer call.
-  scheduleBufferedPipeline(contactId, trimmed, emittedEvent?.id);
+  // v2.8: pass messageType so the buffer can carry channel forward to
+  // the agentic pipeline (and ultimately to ai.analysis_completed and
+  // the send_message action's channel field).
+  scheduleBufferedPipeline(contactId, trimmed, emittedEvent?.id, messageType);
 
   return res.json({ status: 'accepted', classification: 'pending_analysis', buffered: true });
 }
