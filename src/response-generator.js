@@ -3,6 +3,29 @@
  *
  * Agentic Responder intelligence core.
  *
+ * v2.7.9 — 2026-05-04. PATH B / RESCHEDULE PATH B VERBAL TEMPLATE UPDATE.
+ *   Mark's directive 2026-05-04: GHL workflows now own all reminder /
+ *   confirmation sends post-booking. The bot's PATH B verbal should not
+ *   promise a "call shortly to confirm a few details" as if a human will
+ *   always call — workflows handle the confirmation cadence, and a rep
+ *   only calls if extra info is required.
+ *
+ *   New PATH B template:
+ *     "Ok, great [name]! You're set for [day and time]. You'll be getting
+ *      a confirmation shortly, and expect a call from our team if we
+ *      need to confirm anything additional."
+ *
+ *   New STATE 3 PATH B (reschedule) template:
+ *     "Got it [name] — moved you to [day and time]. You'll be getting a
+ *      confirmation shortly, and expect a call from our team if we need
+ *      to confirm anything additional."
+ *
+ *   PATH A templates unchanged ("locked in" + "We'll send a confirmation
+ *   reminder closer to the date" — workflow handles the reminder, the
+ *   verbal stays accurate).
+ *
+ *   Pairs with approval-path.js v4.10 sequence_order race fix.
+ *
  * v2.7.8 — 2026-04-30. CANCELLATION FLOW + PHASE 2 QUALIFYING DATA PERSISTENCE.
  *   Mark's ask: when a lead asks to cancel their appointment, the bot
  *   should look up existing appointments first, ask for the reason,
@@ -313,7 +336,7 @@ Only emit decision_makers_present in qualifying_data when the lead has actually 
 Verbal: "Perfect — Tuesday May 5 at 2 PM is locked in. We'll send a confirmation reminder closer to the date. See you then."
 
 ▼ PATH B — ANY QUALIFIER MISSING → status="new" + HANDOFF MESSAGE (DEFAULT)
-Verbal template: "Ok, great! I have you down for [day and time]. You will be receiving a call shortly to confirm a few details."
+Verbal template: "Ok, great [name]! You're set for [day and time]. You'll be getting a confirmation shortly, and expect a call from our team if we need to confirm anything additional."
 
 DEFAULT BIAS: PATH B when unsure. Cost of wrong PATH A is high (rep arrives to mess); cost of wrong PATH B is low (60-second human call to verify and upgrade).
 
@@ -404,7 +427,7 @@ Apply the SAME Q1/Q2/Q3 gate as initial booking:
 - Any missing (most common case for reschedule — discovery rarely happens during cancel/reschedule) → status="new" (DEFAULT)
 
 Verbal confirmation message (PATH B template adapted):
-  "Got it — moved you to Saturday May 9 at 10 AM. You will be receiving a call shortly to confirm a few details."
+  "Got it [name] — moved you to Saturday May 9 at 10 AM. You'll be getting a confirmation shortly, and expect a call from our team if we need to confirm anything additional."
 
 PATH A version (rare for reschedule):
   "Done — moved you to Saturday May 9 at 10 AM. We'll send a confirmation reminder closer to the date. See you then."
@@ -527,7 +550,7 @@ EXAMPLE B1 (PATH B — zero qualifiers — the action 30435 case):
     [inbound]  "2 works"  ← TRIGGER
   →
   {
-    "message": "Ok, great! I have you down for Tuesday May 5 at 2 PM. You will be receiving a call shortly to confirm a few details.",
+    "message": "Ok, great Mark! You're set for Tuesday May 5 at 2 PM. You'll be getting a confirmation shortly, and expect a call from our team if we need to confirm anything additional.",
     "companion_action": {
       "action_type": "book_appointment",
       "action_payload": {
@@ -575,7 +598,7 @@ EXAMPLE C2 (reschedule with no qualifying data — PATH B reschedule):
   TODAY IS: Wednesday, April 30, 2026
   →
   {
-    "message": "Got it — moved you to Saturday May 9 at 10 AM. You will be receiving a call shortly to confirm a few details.",
+    "message": "Got it Mark — moved you to Saturday May 9 at 10 AM. You'll be getting a confirmation shortly, and expect a call from our team if we need to confirm anything additional.",
     "companion_action": {
       "action_type": "reschedule_appointment",
       "action_payload": {
