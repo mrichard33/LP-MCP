@@ -50,6 +50,14 @@ import { registerWorkflowCompletionRoutes } from './workflow-completion-handler.
 import { registerEntryEventRoutes } from './entry-event-handler.js';
 // ─── IME MIC Integration (Sam's Club Construction leads) ─────────
 import { registerImeRoutes, startImeWorkers } from './ime/index.js';
+// ─── MVI v2.5 — Antifragile services ─────────────────────────────
+// Drift detector cron + scan endpoint (30min interval, 5min delay).
+// Internal lock-check endpoint for HL MCP advisory checks.
+import {
+  registerDriftDetectorRoutes,
+  startDriftDetectorScheduler,
+} from './services/drift-detector.js';
+import { registerInternalRoutes } from './services/internal-routes.js';
 // ─── Admin ──────────────────────────────────────────────────────
 import { runEmailBackfill } from './admin/email-backfill.js';
 import { registerEmailCleanupRoutes } from './admin/email-cleanup.js';
@@ -229,6 +237,17 @@ app.get('/health', (req, res) => {
       heartbeat_interval_ms: parseInt(process.env.EXECUTOR_HEARTBEAT_INTERVAL_MS || `${5 * 60 * 1000}`, 10),
       kill_switch_env: 'EXECUTOR_HEARTBEAT_DISABLED',
       enabled: process.env.EXECUTOR_HEARTBEAT_DISABLED !== 'true',
+    },
+    drift_detector: {
+      scan: 'POST /n8n/drift-detector/scan',
+      interval_minutes: 30,
+      initial_delay_minutes: 5,
+      kill_switch_env: 'DRIFT_DETECTOR_DISABLED',
+      enabled: process.env.DRIFT_DETECTOR_DISABLED !== 'true',
+      hl_mcp_url: process.env.HL_MCP_URL ? 'configured' : 'MISSING',
+    },
+    internal: {
+      check_outbound_lock: 'POST /internal/check-outbound-lock',
     },
     data_freshness: {
       view: 'GET /n8n/admin/freshness',
@@ -411,6 +430,14 @@ registerEntryEventRoutes(app);
 // ─── IME MIC Integration (Sam's Club Construction leads) ─────────
 registerImeRoutes(app);
 
+// ─── MVI v2.5 — Antifragile services ─────────────────────────────
+// Drift detector: 30-min cron that asks HL MCP for closed-in-GHL contacts
+// and joins against LP disposition. Drift → system.drift_detected →
+// DRIFT_NOTIFY_GROUPME rule → GroupMe alert. Never auto-overwrites LP.
+// Internal lock check: HL MCP advisory checks against outbound_locks.
+registerDriftDetectorRoutes(app);
+registerInternalRoutes(app);
+
 // ─── Admin ──────────────────────────────────────────────────────
 app.post('/admin/email-backfill', async (req, res) => {
   try {
@@ -461,6 +488,8 @@ app.listen(PORT, async () => {
   console.log(`Pause Sweep:  POST /n8n/pause-workflow/sweep (7d fizzle, 15min interval)`);
   console.log(`Approval Esc: POST /n8n/approval-escalation/sweep (30min/60min/4h tiers, 15min interval)`);
   console.log(`Heartbeat:    POST /n8n/decision-engine/heartbeat (5min failover, 6min stale threshold)`);
+  console.log(`Drift Det:    POST /n8n/drift-detector/scan (30min interval, MVI v2.5)`);
+  console.log(`Internal:     POST /internal/check-outbound-lock (HL MCP advisory)`);
   console.log(`Freshness:    GET /n8n/admin/freshness | POST /n8n/admin/freshness-check | GET /n8n/admin/sync-probe`);
   console.log(`REST API:     GET /api/prospects/:id | /api/leads/:id | /api/search | /api/lead-summary/:contactId`);
   console.log(`GroupMe:      POST /webhook/groupme | POST /groupme/send | GET /groupme/pending`);
@@ -481,6 +510,9 @@ app.listen(PORT, async () => {
   // when n8n's external heartbeat is healthy; takes over within 6min if
   // n8n stops firing. Killable via EXECUTOR_HEARTBEAT_DISABLED=true.
   startExecutorHeartbeatScheduler();
+  // MVI v2.5: drift detector. 30-min interval, 5-min initial delay.
+  // Killable via DRIFT_DETECTOR_DISABLED=true.
+  startDriftDetectorScheduler();
   setTimeout(() => {
     setTimeout(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, 120000);
     setInterval(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, FIELD_SYNC_INTERVAL_MS);
