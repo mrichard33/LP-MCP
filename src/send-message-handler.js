@@ -5,6 +5,59 @@
  * via channel-specific routing — webhook for SMS, Conversations API
  * for email — with cross-fallback for both.
  *
+ * v3.10 (2026-05-04) — Email body field + true emailMessageId threading.
+ *   PROBLEM: After v3.9 deployed, the agentic email replies still landed
+ *   in a new thread in the lead's inbox. Railway logs on test contact
+ *   7jl9cVfry8OyQF6oI2V5 (2026-05-04 21:38:23 UTC) showed:
+ *     [SendMessage] Email send for ...: no conversationProviderId — threading may break
+ *     [SendMessage] Conv API primary failed: GHL POST /conversations/messages
+ *       → 422: {"status":422,"message":"There is no message or attachments
+ *       for this message. Skip sending."}
+ *     [SendMessage] Email fallback to webhook for ... — reply will create
+ *       new thread, not in-thread
+ *
+ *   Two distinct bugs in sendViaConversationsAPI:
+ *
+ *   Bug 1 — wrong body field. GHL's POST /conversations/messages reads
+ *   different body fields for SMS vs Email:
+ *     - SMS  → 'message' (string, plain text)
+ *     - Email → 'html' (string, HTML body)
+ *   Per the Provider Outbound Message schema documented at
+ *   https://marketplace.gohighlevel.com/docs/webhook/ProviderOutboundMessage
+ *   and the V2 Email API guide. Sending 'message' for type='Email' causes
+ *   GHL to evaluate the body as empty (since 'html' is missing) and
+ *   return 422 "no message or attachments." The catch in sendWithFallback
+ *   then runs the webhook path, which delivers but cannot preserve email
+ *   threading because the agentic-send GHL workflow has no access to
+ *   In-Reply-To / References header info.
+ *
+ *   Bug 2 — no threading reference. Even with the right body field, the
+ *   recipient's email client (Gmail / iCloud) keys threading on
+ *   In-Reply-To and References headers. GHL exposes this on outbound via
+ *   the optional 'emailMessageId' field — pass the inbound message's GHL
+ *   id and GHL stamps the right headers internally. v3.9's "Re: <subject>"
+ *   was a secondary heuristic, not a guarantee — modern email clients
+ *   need the headers.
+ *
+ *   FIX: Two changes in sendViaConversationsAPI:
+ *     1. For channel='email', set msgBody.html = message (instead of
+ *        msgBody.message). For SMS, keep msgBody.message unchanged. This
+ *        matches GHL's per-channel field convention and resolves the 422.
+ *     2. Look up the most recent inbound email's GHL message id via the
+ *        new getInboundEmailMessageId helper (mirrors getInboundEmailSubject
+ *        from v3.9 — same conversations/search → messages?limit=20 →
+ *        find inbound email pattern, but returns m.id instead of
+ *        m.meta.email.subject). When found, set msgBody.emailMessageId
+ *        so GHL writes the In-Reply-To / References headers. Falls back
+ *        gracefully when no inbound email exists or the API call fails;
+ *        v3.9's Re: subject prefix continues to apply as the secondary
+ *        threading signal.
+ *
+ *   No semantic change for SMS. No new env vars. No schema changes. No
+ *   GHL workflow changes. Pairs with v3.9's body strip and Re: prefix —
+ *   together, agentic email replies arrive in-thread with a clean body
+ *   and the right subject.
+ *
  * v3.9 (2026-05-04) — Email body cleanup + Re: threading.
  *   PROBLEM: After v1.7/v2.8 channel propagation landed, two new defects
  *   surfaced on contact 7jl9cVfry8OyQF6oI2V5 2026-05-04 20:50:
@@ -512,6 +565,51 @@ async function ghlFetch(method, path, body = null) {
  * (or vice versa) when the conversation has both.
  */
 /**
+ * v3.10 — Look up the GHL message ID of the most recent inbound email
+ * for a contact. Used as the `emailMessageId` field on the outbound
+ * Conv API send, which tells GHL to stamp In-Reply-To and References
+ * headers — that's what makes Gmail / iCloud thread the bot's reply
+ * into the lead's existing email conversation.
+ *
+ * Returns the message id string (e.g. "zunY2dCBTLnqBcmu4APu") or null
+ * on:
+ *   - no conversation for this contact
+ *   - no inbound email messages
+ *   - any API error
+ *
+ * Same shape as getInboundEmailSubject from v3.9 so the two helpers
+ * can share a future cache layer if added.
+ */
+async function getInboundEmailMessageId(contactId) {
+  if (!contactId || !GHL_API_KEY) return null;
+
+  try {
+    const search = await ghlFetch('GET',
+      `/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`);
+    const conversations = Array.isArray(search) ? search : (search?.conversations || []);
+    if (!conversations.length) return null;
+
+    const conversationId = conversations[0].id;
+    const msgData = await ghlFetch('GET',
+      `/conversations/${conversationId}/messages?limit=20`);
+    const messages = msgData?.messages?.messages || msgData?.messages || [];
+    if (!Array.isArray(messages) || messages.length === 0) return null;
+
+    // Newest-first. Find the most recent inbound EMAIL and return its
+    // top-level GHL id. Mirrors getInboundEmailSubject's filter; we
+    // intentionally return id rather than meta.email.subject here.
+    const recentInboundEmail = messages.find(m =>
+      m.direction === 'inbound' &&
+      (m.messageType === 'TYPE_EMAIL' || m.type === 3)
+    );
+    return recentInboundEmail?.id || null;
+  } catch (err) {
+    console.warn(`[SendMessage] getInboundEmailMessageId failed for ${contactId}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * v3.9 — Look up the SUBJECT of the most recent inbound email for a
  * contact. Used to construct "Re: <subject>" for outbound email replies
  * so the email-client threads them with the original conversation.
@@ -701,22 +799,47 @@ async function sendViaConversationsAPI(contactId, message, channel, subject) {
   if (!conversations.length) return null;
 
   const conversationId = conversations[0].id;
+
+  // v3.10: GHL's /conversations/messages reads different body fields per
+  // channel — `message` for SMS, `html` for Email. Sending `message` on
+  // an Email type returns 422 "no message or attachments" because GHL
+  // ignores the SMS field and finds no email body. Build msgBody with
+  // the correct per-channel field.
   const msgBody = {
     type: channel === 'email' ? 'Email' : 'SMS',
     contactId,
     conversationId,
-    message,
   };
 
   if (channel === 'email') {
+    msgBody.html = message;
     if (subject) msgBody.subject = subject;
-    // conversationProviderId is REQUIRED for in-thread email reply.
-    // Without it, GHL may create a new email thread.
+
+    // v3.10: emailMessageId is GHL's threading reference. When set to
+    // the inbound email's GHL message id, GHL stamps In-Reply-To and
+    // References headers on the outbound — Gmail / iCloud then thread
+    // the reply into the lead's existing conversation. Without it,
+    // even a "Re: <subject>" subject is not always enough to thread
+    // (clients vary). Pairs with v3.9's Re: prefix as belt-and-suspenders.
+    const inboundEmailMessageId = await getInboundEmailMessageId(contactId);
+    if (inboundEmailMessageId) {
+      msgBody.emailMessageId = inboundEmailMessageId;
+      console.log(`[SendMessage] v3.10: threading email reply for ${contactId} via emailMessageId=${inboundEmailMessageId}`);
+    } else {
+      console.warn(`[SendMessage] v3.10: no inbound email found for ${contactId} — outbound will not have In-Reply-To header (Re: subject is the only threading signal)`);
+    }
+
+    // conversationProviderId is REQUIRED for in-thread email reply on
+    // CUSTOM email providers; not required (and often absent) for the
+    // default LC-Email / Mailgun provider. Pass it when present, log
+    // when absent — but absence is no longer a hard threading break
+    // now that emailMessageId carries the In-Reply-To.
     if (conversations[0].conversationProviderId) {
       msgBody.conversationProviderId = conversations[0].conversationProviderId;
-    } else {
-      console.warn(`[SendMessage] Email send for ${contactId}: no conversationProviderId — threading may break`);
     }
+  } else {
+    // SMS: body lives in msgBody.message
+    msgBody.message = message;
   }
 
   const result = await ghlFetch('POST', '/conversations/messages', msgBody);
