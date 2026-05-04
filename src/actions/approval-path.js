@@ -5,6 +5,56 @@
  * trigger-message resolution, or head-of-line behavior stays a small,
  * focused edit. Extracted from action-executor.js v4.2 refactor.
  *
+ * v4.10 (2026-05-04) — sequence_order race fix for booking companions.
+ *   PROBLEM: Under v4.6 (companion insertion), book_appointment and
+ *   reschedule_appointment were always inserted with
+ *     sequence_order: parentSeq - 1
+ *   so they ran BEFORE send_message in Phase 2 of the executor. When
+ *   book_appointment fired first, the GHL calendar write attached the
+ *   appointment to the calendar owner (a different GHL user than the
+ *   contact's assigned_to). The agentic-send GHL workflow that
+ *   send_message hits resolves its outbound "From" against the contact's
+ *   live state, so by the time the SMS fired ~1.5s later, the From hopped
+ *   from the assigned-user's number to the calendar-owner's number
+ *   mid-thread.
+ *
+ *   Symptom (contact 7jl9cVfry8OyQF6oI2V5, 2026-05-04 18:45 UTC):
+ *     - Earlier SMS in the same conversation went out from 9542808890
+ *       (assigned user, no booking yet)
+ *     - Auto-book on "Wednesday works" inserted book_appointment with
+ *       seq=-1; Phase 2 ran book first (18:45:18), then send_message
+ *       (18:45:20)
+ *     - The confirmation SMS landed from 9543710083 — a different
+ *       GHL number with userId 3K6HtoPyBLWeQrrnSnCD (the MV calendar's
+ *       owner)
+ *     - On the lead's phone, the booking confirmation appeared in a
+ *       brand-new SMS thread instead of the existing 8890 thread,
+ *       making the conversation look like the bot stopped replying
+ *
+ *   FIX: Differentiate sequence_order by companion type at insert time.
+ *     - book_appointment      → parentSeq + 2  (run AFTER send_message
+ *                                                + add_tag, so the SMS
+ *                                                fires on pre-booking
+ *                                                contact state)
+ *     - reschedule_appointment → parentSeq + 2 (same — the new booking
+ *                                                also re-points calendar
+ *                                                owner)
+ *     - cancel_appointment    → parentSeq - 1  (UNCHANGED — keep before
+ *                                                send_message so the
+ *                                                verbal "I've taken X
+ *                                                off the calendar" is
+ *                                                truthful by the time
+ *                                                it lands)
+ *
+ *   Trade-off for book/reschedule: the verbal "I have you down for
+ *   Wednesday May 6 at 10 AM" lands ~500ms BEFORE the GHL calendar
+ *   write completes. This is below human perception and the lead does
+ *   not see a calendar-side discrepancy. The thread-continuity win is
+ *   worth the trivial truthfulness window.
+ *
+ *   No other behavior change. Pairs with response-generator v2.7.9
+ *   which updates the PATH B / reschedule PATH B verbal templates.
+ *
  * v4.9 (2026-04-30) — COMPANION_AUTO_EXECUTE expanded for cancel/reschedule.
  *   Pairs with response-generator v2.7.8's cancellation flow, which can
  *   now emit two new companion types:
@@ -220,7 +270,7 @@ const AGENTIC_AUTOREPLY_REQUIRED_TAG = (
 
 // Log effective config at startup so it shows in Railway logs after each
 // deploy. Helps confirm the env vars are actually applied.
-console.log(`[ApprovalPath] v4.9 auto-reply config: ` +
+console.log(`[ApprovalPath] v4.10 auto-reply config: ` +
   `enabled=${AGENTIC_AUTOREPLY_ENABLED}, ` +
   `rules=[${AGENTIC_AUTOREPLY_RULES.join(',')}], ` +
   `required_tag="${AGENTIC_AUTOREPLY_REQUIRED_TAG}"`);
@@ -703,6 +753,23 @@ export async function processApprovalQueue() {
             const companion = generated.companion_action;
             const parentSeq = typeof sendAction.sequence_order === 'number' ? sendAction.sequence_order : 0;
             const isAutoExecuting = COMPANION_AUTO_EXECUTE.has(companion.action_type);
+
+            // v4.10: sequence_order race fix.
+            //   book_appointment / reschedule_appointment must run AFTER
+            //   send_message — both write to GHL calendars and that write
+            //   re-points the contact's effective send-from user to the
+            //   calendar owner. If they run first, the agentic-send
+            //   workflow picks up the new owner and the SMS fires from
+            //   a different number, breaking the lead's SMS thread.
+            //   cancel_appointment stays BEFORE send_message so the
+            //   verbal "I've taken X off the calendar" is truthful by
+            //   the time it lands.
+            const seqAfterSend = (
+              companion.action_type === 'book_appointment' ||
+              companion.action_type === 'reschedule_appointment'
+            );
+            const companionSeqOrder = seqAfterSend ? parentSeq + 2 : parentSeq - 1;
+
             try {
               const { data: companionRow, error: companionErr } = await supabase
                 .from('agent_actions')
@@ -721,7 +788,7 @@ export async function processApprovalQueue() {
                   status: isAutoExecuting ? 'pending' : 'pending_approval',
                   requires_approval: !isAutoExecuting,
                   batch_id: sendAction.batch_id,
-                  sequence_order: parentSeq - 1,
+                  sequence_order: companionSeqOrder,
                 })
                 .select()
                 .single();
