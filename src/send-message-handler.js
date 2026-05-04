@@ -5,6 +5,58 @@
  * via channel-specific routing — webhook for SMS, Conversations API
  * for email — with cross-fallback for both.
  *
+ * v3.8 (2026-05-04) — Reply-from mirror + proper-case channelType.
+ *   PROBLEM: Mark's GHL setup rotates lead-owner / from-number across
+ *   contacts. Same lead can have inbound messages arriving on multiple
+ *   GHL numbers (different campaigns, different reps). The agentic-send
+ *   GHL workflow defaults to the contact's assigned-user's number,
+ *   which is often NOT the same number the lead's most recent inbound
+ *   came TO. Result: bot replies hop to a different SMS thread on the
+ *   lead's phone mid-conversation. Confirmed on contact 7jl9cVfry8OyQF6oI2V5
+ *   2026-05-04 (8890 inbound thread → 0083 reply thread after auto-book).
+ *
+ *   Companion fix: approval-path.js v4.10 already removed the
+ *   sequence_order race that triggered the most acute case (booking
+ *   running before send_message). v3.8 extends thread-continuity to
+ *   the general case where the contact's assigned-user simply does not
+ *   own the number/address the lead is messaging.
+ *
+ *   FIX: Two new fields in the webhook payload to the agentic-send GHL
+ *   workflow.
+ *
+ *     1. replyFromAddress
+ *        For SMS: the GHL phone number (e.g. "+19542808890") the lead's
+ *        most recent inbound SMS was sent TO. Fetched from the GHL
+ *        Conversations API at send time. Mark's workflow can use this
+ *        to temporarily set contact.assignedTo to the user who owns
+ *        that number before the Send-SMS-Reply step, then revert after
+ *        the send. The Send-SMS-Reply node will pick up the temporary
+ *        assignment and send from the matching number.
+ *
+ *        For Email: the GHL inbox address the lead's most recent inbound
+ *        email was sent TO (same lookup path).
+ *
+ *        For backward-compatible convenience, replyFromPhone and
+ *        replyFromEmail mirror replyFromAddress per channel.
+ *
+ *     2. channelType
+ *        Proper-case channel name ("SMS" or "Email") matching GHL's
+ *        native message-type convention. The existing `channel` field
+ *        is unchanged (still lowercase) so any consumer keying on the
+ *        old contract still works; channelType is additive.
+ *
+ *   New helper getReplyFromAddress(contactId, channel) wraps the GHL
+ *   Conversations API call. Adds one GHL API hit per send (~100-200ms),
+ *   which is acceptable for this scenario — we already do similar
+ *   lookups in sendViaConversationsAPI. Failure to look up the
+ *   reply-from is non-fatal: the field is sent as null and the GHL
+ *   workflow falls back to its default (contact's assigned-user
+ *   number) just like today.
+ *
+ *   No semantic change to suppression / opt-in / rate-limit / send
+ *   path / GroupMe notification logic. The four guardrails are
+ *   unchanged.
+ *
  * v3.7 (2026-05-01) — pause-bot is the universal allow signal.
  *   PROBLEM: Several guardrails were silently blocking sends even when
  *   pause-bot (the explicit agentic opt-in) was set. Mark's directive
@@ -400,6 +452,68 @@ async function ghlFetch(method, path, body = null) {
 }
 
 /**
+ * v3.8 — Look up the address (phone or email) the lead's MOST RECENT
+ * inbound message of this channel was sent TO. That address is the
+ * correct "from" for our reply, regardless of who the contact is
+ * currently assigned to. The agentic-send GHL workflow uses this to
+ * temporarily reassign the contact to the user who owns that number/
+ * inbox before the Send-SMS-Reply step.
+ *
+ * Returns the inbound .to value (e.g. "+19542808890") or null on:
+ *   - no conversation for this contact
+ *   - no inbound messages of the requested channel
+ *   - any API error (caller passes null forward; GHL workflow falls
+ *     back to its default behavior — contact's assigned-user number)
+ *
+ * Filters by channel so an SMS reply doesn't pick up an email inbox
+ * (or vice versa) when the conversation has both.
+ */
+async function getReplyFromAddress(contactId, channel) {
+  if (!contactId || !GHL_API_KEY) return null;
+
+  const wantedMessageType = channel === 'sms' ? 'TYPE_SMS'
+                          : channel === 'email' ? 'TYPE_EMAIL'
+                          : null;
+  // Numeric `type` field GHL also stamps on each message, kept as a
+  // secondary filter in case a conversation row pre-dates the
+  // messageType field convention. 2 = SMS, 3 = Email per GHL docs.
+  const wantedTypeNum = channel === 'sms' ? 2
+                      : channel === 'email' ? 3
+                      : null;
+
+  try {
+    const search = await ghlFetch('GET',
+      `/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`);
+    const conversations = Array.isArray(search) ? search : (search?.conversations || []);
+    if (!conversations.length) return null;
+
+    const conversationId = conversations[0].id;
+    const msgData = await ghlFetch('GET',
+      `/conversations/${conversationId}/messages?limit=20`);
+    // GHL response shape varies by endpoint version; accept either nesting.
+    const messages = msgData?.messages?.messages || msgData?.messages || [];
+    if (!Array.isArray(messages) || messages.length === 0) return null;
+
+    // Messages come back newest-first. Find the most recent inbound of
+    // the requested channel and return its `to` field — that's OUR
+    // address (number/inbox) the lead messaged.
+    const recentInbound = messages.find(m =>
+      m.direction === 'inbound' &&
+      (
+        wantedMessageType ? m.messageType === wantedMessageType : true
+      ) &&
+      (
+        wantedTypeNum ? (m.type === wantedTypeNum || m.messageType === wantedMessageType) : true
+      )
+    );
+    return recentInbound?.to || null;
+  } catch (err) {
+    console.warn(`[SendMessage] getReplyFromAddress failed for ${contactId} (${channel}): ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * POST to Mark's GHL "Send Reply" webhook workflow.
  *
  * Workflow: 497e664a-01ef-400d-aca5-1050d8eeccf8
@@ -411,15 +525,39 @@ async function ghlFetch(method, path, body = null) {
  * Returns { webhook_status } on success, throws on failure.
  * NOTE: HTTP 200 from GHL doesn't mean the workflow actually sent —
  * if a branch is empty or misconfigured, the message silently drops.
+ *
+ * v3.8 — Payload now includes:
+ *   - channelType: "SMS" | "Email"   (proper case; GHL native convention)
+ *   - replyFromAddress               (the address the lead's last inbound
+ *                                     of this channel was sent TO)
+ *   - replyFromPhone                 (mirror of replyFromAddress for SMS,
+ *                                     null for Email)
+ *   - replyFromEmail                 (mirror of replyFromAddress for Email,
+ *                                     null for SMS)
+ *   - replyFromAddressSource         (debug — "most_recent_inbound" or "none")
  */
 async function sendViaWebhook(contactId, message, channel, subject, action) {
   if (!GHL_SEND_MESSAGE_WEBHOOK_URL) {
     throw new Error('GHL_SEND_MESSAGE_WEBHOOK_URL not configured');
   }
 
+  // v3.8 — Reply-from mirroring. Look up the address the lead's most
+  // recent inbound of this channel was sent TO so the GHL workflow can
+  // route the reply back through the matching user/number. Failure is
+  // non-fatal — null falls back to the workflow's default behavior.
+  const replyFromAddress = await getReplyFromAddress(contactId, channel);
+
+  // v3.8 — channelType in proper case (matches GHL's native TYPE_SMS /
+  // TYPE_EMAIL convention). The existing `channel` field is preserved
+  // unchanged for any consumer that keys on the old lowercase contract.
+  const channelType = channel === 'sms' ? 'SMS'
+                    : channel === 'email' ? 'Email'
+                    : channel.toUpperCase();
+
   const payload = {
     contactId,
-    channel,
+    channel,                          // v3.7 — lowercase, unchanged for back-compat
+    channelType,                      // v3.8 — proper case ("SMS" | "Email")
     message,
     subject: subject || null,
     fromName: 'Reece Windows & Doors',
@@ -427,7 +565,19 @@ async function sendViaWebhook(contactId, message, channel, subject, action) {
     sentAt: new Date().toISOString(),
     ruleTrigger: action?.rule_applied || 'manual',
     eventId: action?.event_id || null,
+    // v3.8 — reply-from mirroring fields. Use replyFromAddress as the
+    // single source of truth in the GHL workflow; the channel-specific
+    // mirrors (replyFromPhone, replyFromEmail) are conveniences for
+    // workflows that want to branch on a specific channel without
+    // checking channelType.
+    replyFromAddress,
+    replyFromPhone: channel === 'sms' ? replyFromAddress : null,
+    replyFromEmail: channel === 'email' ? replyFromAddress : null,
+    replyFromAddressSource: replyFromAddress ? 'most_recent_inbound' : 'none',
   };
+
+  console.log(`[SendMessage] webhook payload: contact=${contactId} channel=${channelType} ` +
+    `replyFromAddress=${replyFromAddress || 'null'} (source=${replyFromAddress ? 'most_recent_inbound' : 'none'})`);
 
   const res = await fetch(GHL_SEND_MESSAGE_WEBHOOK_URL, {
     method: 'POST',
