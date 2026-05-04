@@ -13,6 +13,47 @@
  * Output: Structured assessment written to lead_intelligence table
  *         + ai.analysis_completed event emitted for Decision Engine.
  *
+ * v1.8 (2026-05-04) — Atomic dedup at analyzeMessage entry.
+ *   PROBLEM: markAnalyzed() ran at the END of analyzeMessage, after a
+ *   ~4-second Claude API call. The dedup cache check (wasRecentlyAnalyzed)
+ *   ran at the START. Two callers entering analyzeMessage within those 4
+ *   seconds both saw an empty cache, both ran the full analysis, both
+ *   emitted ai.analysis_completed for the same inbound. Confirmed on
+ *   contact 7jl9cVfry8OyQF6oI2V5 2026-05-04 20:49: ghl.reply_received
+ *   19328 produced ai.analysis_completed 19332 (started 20:50:12) AND
+ *   19334 (started 20:50:14), both with channel=email and matching
+ *   message_text, two seconds apart. Both fired
+ *   AGENTIC_RESPOND_POST_CHATBOT, both produced send_message actions,
+ *   the lead got two outbound emails.
+ *
+ *   The two callers in this case were:
+ *     a. behavioral-emitter v2.8's reply buffer hitting
+ *        /n8n/analyze-message over loopback HTTP (intended path).
+ *     b. analyzePendingReplies polling unprocessed ghl.reply_received
+ *        events (called by an external n8n cron). The buffer marks
+ *        events processed AT FIRE TIME (35s after emission), so during
+ *        the 35-second debounce window the event is still processed=false
+ *        and analyzePendingReplies will pick it up if scheduled.
+ *
+ *   FIX: Move markAnalyzed() from the end of the function to immediately
+ *   after the cache check, before any await. wasRecentlyAnalyzed (read)
+ *   and markAnalyzed (write) are now atomic in JS's single-threaded
+ *   event loop — no await separates them, so the second caller sees the
+ *   first caller's cache write deterministically and short-circuits with
+ *   the existing "identical message already analyzed within Xs" log line.
+ *
+ *   Trade-off: if the analysis throws (Claude API error, malformed
+ *   response, etc.), the failed contact + message hash sits in the cache
+ *   for the 2-minute TTL and any retry within that window is suppressed.
+ *   Acceptable because (a) the TTL is short, (b) the next genuinely-
+ *   different inbound has a different cache key and runs, (c) the prior
+ *   behavior of double-firing on every reply is materially worse than
+ *   occasionally suppressing a retry.
+ *
+ *   Pairs with send-message-handler.js v3.9 which fixes the downstream
+ *   "Subject:" prefix and Re: threading defects exposed by the same
+ *   2026-05-04 test session.
+ *
  * v1.7 (2026-05-04) — Accept channel on /n8n/analyze-message endpoint.
  *   PROBLEM: v1.6 added `channel` as a 4th parameter to analyzeMessage
  *   and propagated it onto ai.analysis_completed.payload.channel. The
@@ -561,10 +602,23 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
   // reply from the same contact passes even when a prior reply was
   // analyzed recently. Only exact duplicates (webhook retries or copy-
   // pastes) within the short TTL are skipped.
+  // v1.8: cache check + cache write are now atomic (no await between
+  // them). When two callers race through analyzeMessage simultaneously
+  // (e.g. behavioral-emitter's buffer-triggered /n8n/analyze-message
+  // and analyzePendingReplies polling the same unprocessed event during
+  // the 35s debounce window), the first to enter wins the cache, the
+  // second sees the hit and skips. See v1.8 changelog above.
   if (wasRecentlyAnalyzed(ghlContactId, messageText)) {
     console.log(`[MessageAnalyzer] Skipping ${ghlContactId} — identical message already analyzed within ${Math.round(ANALYSIS_CACHE_TTL_MS / 1000)}s (likely retry)`);
     return null;
   }
+  // v1.8: claim the dedup slot BEFORE any await so a parallel caller
+  // sees the write. If the analysis throws below, the slot stays
+  // claimed for the cache TTL — that's intentional (suppresses retries
+  // of the same exact message in the short window; genuinely-different
+  // inbounds have different hashes and run normally).
+  markAnalyzed(ghlContactId, messageText);
+
   if (!ANTHROPIC_API_KEY) {
     console.error('[MessageAnalyzer] ANTHROPIC_API_KEY not configured — cannot analyze');
     return null;
@@ -650,7 +704,9 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
       idempotency_key: `ai_analysis_${ghlContactId}_${Date.now()}`,
     });
 
-    markAnalyzed(ghlContactId, messageText);
+    // v1.8: markAnalyzed moved to entry-of-function (immediately after
+    // cache check) for atomic dedup. Removed from here to avoid a
+    // redundant Map.set on the same key.
 
     const elapsed = Date.now() - startTime;
     const lpNote = context.lp?.matched ? '(LP✓)' : context.lp?._fallback_used ? '(LP-fallback✓)' : '(no LP)';

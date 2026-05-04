@@ -5,6 +5,49 @@
  * via channel-specific routing — webhook for SMS, Conversations API
  * for email — with cross-fallback for both.
  *
+ * v3.9 (2026-05-04) — Email body cleanup + Re: threading.
+ *   PROBLEM: After v1.7/v2.8 channel propagation landed, two new defects
+ *   surfaced on contact 7jl9cVfry8OyQF6oI2V5 2026-05-04 20:50:
+ *     a. The outbound email body began with a literal "Subject: <subject>"
+ *        line followed by two newlines, then the actual body. response-
+ *        generator.js produces { message, subject } where the message
+ *        field already contains the "Subject: ..." prefix. The previous
+ *        code passed message through to sendViaConversationsAPI verbatim,
+ *        so the prefix leaked into the rendered email body even though
+ *        msgBody.subject was set correctly via the separate field.
+ *     b. The outbound email's subject was a brand-new AI-authored line
+ *        ("What actually happens during the Measurement Verification")
+ *        instead of "Re: Your Measurement Verification Is Scheduled".
+ *        Email clients (Gmail, Outlook) thread on subject; new subject
+ *        means new visual thread. From the lead's perspective, every
+ *        agentic reply landed as a separate conversation.
+ *
+ *   FIX: Two changes wrapped in a single email-channel branch placed
+ *   right before sendWithFallback.
+ *     1. Strip a leading "Subject: <line>\n+" prefix from the message
+ *        text. If the subject field on the action_payload was somehow
+ *        empty, capture the stripped value as a fallback so we don't
+ *        lose subject information entirely.
+ *     2. Look up the most recent inbound email's subject via a new
+ *        helper getInboundEmailSubject (mirrors getReplyFromAddress's
+ *        shape — same conversations/search + messages?limit=20 pattern,
+ *        filtered by direction='inbound' AND email message type, returns
+ *        meta.email.subject or null). If found, override the outbound
+ *        subject with "Re: <inbound subject>" (or the inbound subject
+ *        directly when it already starts with "Re:"). Falls back to the
+ *        AI-generated subject when the lookup returns null.
+ *
+ *   No new env vars, no rule changes, no schema changes. Adds at most
+ *   one extra GHL API call per email send (~100-200ms) — same shape as
+ *   the existing v3.8 getReplyFromAddress lookup. Failure to look up
+ *   the inbound subject is non-fatal (caller falls back to the AI
+ *   subject and proceeds).
+ *
+ *   Pairs with message-analyzer.js v1.8 which fixes the upstream
+ *   double-fire that was producing two emails per reply in the first
+ *   place. Together: one email per reply, clean body, threaded into
+ *   the existing conversation.
+ *
  * v3.8 (2026-05-04) — Reply-from mirror + proper-case channelType.
  *   PROBLEM: Mark's GHL setup rotates lead-owner / from-number across
  *   contacts. Same lead can have inbound messages arriving on multiple
@@ -468,6 +511,49 @@ async function ghlFetch(method, path, body = null) {
  * Filters by channel so an SMS reply doesn't pick up an email inbox
  * (or vice versa) when the conversation has both.
  */
+/**
+ * v3.9 — Look up the SUBJECT of the most recent inbound email for a
+ * contact. Used to construct "Re: <subject>" for outbound email replies
+ * so the email-client threads them with the original conversation.
+ *
+ * Returns the subject string (without "Re:" prefix manipulation —
+ * caller decides) or null on:
+ *   - no conversation for this contact
+ *   - no inbound email messages
+ *   - any API error (caller falls back to the AI-generated subject)
+ *
+ * Same shape as getReplyFromAddress so the two helpers can share future
+ * caching if we add it.
+ */
+async function getInboundEmailSubject(contactId) {
+  if (!contactId || !GHL_API_KEY) return null;
+
+  try {
+    const search = await ghlFetch('GET',
+      `/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`);
+    const conversations = Array.isArray(search) ? search : (search?.conversations || []);
+    if (!conversations.length) return null;
+
+    const conversationId = conversations[0].id;
+    const msgData = await ghlFetch('GET',
+      `/conversations/${conversationId}/messages?limit=20`);
+    const messages = msgData?.messages?.messages || msgData?.messages || [];
+    if (!Array.isArray(messages) || messages.length === 0) return null;
+
+    // Newest-first. Find the most recent inbound EMAIL and return its
+    // meta.email.subject. The numeric type=3 / messageType==='TYPE_EMAIL'
+    // filter mirrors getReplyFromAddress's pattern.
+    const recentInboundEmail = messages.find(m =>
+      m.direction === 'inbound' &&
+      (m.messageType === 'TYPE_EMAIL' || m.type === 3)
+    );
+    return recentInboundEmail?.meta?.email?.subject || null;
+  } catch (err) {
+    console.warn(`[SendMessage] getInboundEmailSubject failed for ${contactId}: ${err.message}`);
+    return null;
+  }
+}
+
 async function getReplyFromAddress(contactId, channel) {
   if (!contactId || !GHL_API_KEY) return null;
 
@@ -936,6 +1022,42 @@ export async function executeSendMessage(action, context) {
   }
 
   if (!message) throw new Error('No message text after AI generation');
+
+  // ── v3.9: Email cleanup + Re: threading ────────────────────────
+  // For email channel only:
+  //   1. Strip leading "Subject: <line>\n+" prefix from the body.
+  //      response-generator emits { message: 'Subject: ...\n\n<body>',
+  //      subject: '...' } — without this strip, the rendered email
+  //      shows the "Subject: ..." line as the first line of the body.
+  //   2. Override the outbound subject with "Re: <inbound subject>"
+  //      so email clients thread the reply into the existing thread.
+  //      Falls back to the AI-generated subject when no prior inbound
+  //      email is found (or the lookup fails).
+  if (channel === 'email') {
+    const subjectPrefix = message.match(/^Subject:\s*([^\n]+)\n+/);
+    if (subjectPrefix) {
+      const strippedSubject = subjectPrefix[1].trim();
+      message = message.slice(subjectPrefix[0].length);
+      if (!subject && strippedSubject) {
+        subject = strippedSubject;
+        console.log(`[SendMessage] v3.9: subject was empty, recovered from message prefix: "${strippedSubject.slice(0, 60)}"`);
+      } else {
+        console.log(`[SendMessage] v3.9: stripped "Subject:" prefix from email body for ${contactId}`);
+      }
+    }
+    const inboundSubject = await getInboundEmailSubject(contactId);
+    if (inboundSubject) {
+      const trimmed = inboundSubject.trim();
+      const alreadyRe = /^re\s*:/i.test(trimmed);
+      const threadedSubject = alreadyRe ? trimmed : `Re: ${trimmed}`;
+      if (subject !== threadedSubject) {
+        console.log(`[SendMessage] v3.9: overriding subject for threading: "${(subject || '').slice(0, 60)}" → "${threadedSubject.slice(0, 60)}"`);
+        subject = threadedSubject;
+      }
+    } else if (!subject) {
+      console.warn(`[SendMessage] v3.9: no inbound email subject found for ${contactId} and no AI subject — outbound will go without subject`);
+    }
+  }
 
   // ── Send (v3.3: channel-routed) ────────────────────────────────
   const { result: sendResult, sendMethod } = await sendWithFallback(
