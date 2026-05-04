@@ -4,6 +4,24 @@
  * GHL contact tag mutation. Additive POST, never PUT (GHL overwrites on PUT).
  * Batch remove supported to avoid 429s on large removals (v3.2).
  *
+ * MVI v2.5 (2026-05-04) — Namespace exclusivity at write-time.
+ *   executeAddTag now enforces single-occupancy across exclusive namespaces:
+ *
+ *     p3:            (e.g. p3:ghosted vs p3:not-interested-now)
+ *     loss-reason:   (e.g. loss-reason:ghosted vs loss-reason:not-interested)
+ *     stage:         (already enforced by set_stage; add_tag now matches)
+ *     active-entry:  (one entry source at a time)
+ *     buyer:         (one buyer-stage tag at a time)
+ *
+ *   When adding a tag in one of these namespaces, we GET the contact, find
+ *   any conflicting tags in that namespace, batch-DELETE them, then add.
+ *   Closes the Douglas / Bonnie Jennings tag-stacking class.
+ *
+ *   Failure modes:
+ *     GET fails → log + skip exclusivity, still add (don't block on read errors).
+ *     DELETE fails → throws, action retries with same exclusivity logic.
+ *     POST fails → throws, action retries.
+ *
  * v4.3 — set_stage atomic stage tag swap (2026-04-28).
  *   New action type that fetches the contact's current tags, removes any
  *   conflicting stage:* tags in a single batch DELETE, then adds the new
@@ -22,12 +40,50 @@
 
 import { ghlFetch } from '../helpers.js';
 
+// MVI v2.5 — namespaces where only one tag per family should ever exist.
+// Adding a tag from one of these auto-removes any other tag with the same
+// prefix. Keep this list conservative — adding a namespace here is a
+// behavior change for every rule that touches it.
+const NAMESPACE_EXCLUSIVE_PREFIXES = [
+  'p3:',
+  'loss-reason:',
+  'stage:',
+  'active-entry:',
+  'buyer:',
+];
+
 export async function executeAddTag(action) {
   const contactId = action.target_id;
   const tag = action.action_payload?.tag;
   if (!contactId || !tag) throw new Error('Missing contactId or tag');
+
+  // MVI v2.5 — namespace exclusivity. Best-effort: a GET failure logs
+  // but does NOT block the add. Audit tool catches stragglers.
+  const namespace = NAMESPACE_EXCLUSIVE_PREFIXES.find((p) => tag.startsWith(p));
+  let removedConflicting = [];
+  if (namespace) {
+    try {
+      const contact = await ghlFetch('GET', `/contacts/${contactId}`);
+      const currentTags = contact?.contact?.tags || contact?.tags || [];
+      removedConflicting = currentTags.filter((t) => t.startsWith(namespace) && t !== tag);
+      if (removedConflicting.length > 0) {
+        await ghlFetch('DELETE', `/contacts/${contactId}/tags`, { tags: removedConflicting });
+        console.log(
+          `[ActionExecutor] namespace exclusivity enforced: contact=${contactId} ns=${namespace} removed=[${removedConflicting.join(',')}] adding=${tag}`
+        );
+      }
+    } catch (err) {
+      console.error(`[executeAddTag] exclusivity check failed for ${contactId} ns=${namespace}: ${err.message} — proceeding with add`);
+      removedConflicting = [];
+    }
+  }
+
   await ghlFetch('POST', `/contacts/${contactId}/tags`, { tags: [tag] });
-  return { tag_applied: tag, contact_id: contactId };
+  return {
+    tag_applied: tag,
+    contact_id: contactId,
+    ...(namespace ? { namespace, removed_conflicting: removedConflicting } : {}),
+  };
 }
 
 export async function executeRemoveTag(action) {
