@@ -13,6 +13,29 @@
  * Output: Structured assessment written to lead_intelligence table
  *         + ai.analysis_completed event emitted for Decision Engine.
  *
+ * v1.6 (2026-05-04) — Carry inbound channel forward in ai.analysis_completed.
+ *   PROBLEM: ai.analysis_completed events did not carry the inbound
+ *   channel (sms vs email). Downstream rules — specifically
+ *   AGENTIC_RESPOND_POST_CHATBOT — produce send_message actions whose
+ *   channel field came from the rule's action_template. The template
+ *   hardcodes "channel": "sms", so every agentic reply landed with
+ *   channel=sms regardless of whether the inbound was an email reply
+ *   or an SMS. send-message-handler.js v3.3+ then routed through the
+ *   SMS webhook instead of the email Conversations API path, splitting
+ *   email threads on the lead's side.
+ *
+ *   FIX: Pair with decision-engine.js v2.13. analyzeMessage() takes a
+ *   new 4th parameter `channel` (default null for backward compat),
+ *   and the emitted ai.analysis_completed payload now includes
+ *   `channel: 'sms' | 'email' | null`. Callers (decision-engine
+ *   processSingleEventInner and the analyzer's own
+ *   analyzePendingReplies) derive channel from the source
+ *   ghl.reply_received event's payload.message_type and pass it in.
+ *
+ *   Behavior is unchanged when the caller doesn't pass channel —
+ *   payload.channel is null and downstream code falls back to the rule
+ *   template's value (no regression for legacy behavioral rules).
+ *
  * v1.5 (2026-04-30) — Include full message_text in emitted event payload.
  *   PROBLEM: ai.analysis_completed events only carried `message_preview`
  *   (first 100 chars). The agentic responder (send-message-handler) expected
@@ -510,7 +533,7 @@ function validateAnalysis(analysis) {
 // MAIN ENTRY POINT
 // ═══════════════════════════════════════════════════════════════════
 
-export async function analyzeMessage(ghlContactId, messageText, eventId = null) {
+export async function analyzeMessage(ghlContactId, messageText, eventId = null, channel = null) {
   if (!checkRateLimit()) {
     console.warn(`[MessageAnalyzer] Rate limit reached (${ANALYSIS_RATE_LIMIT}/hr). Skipping ${ghlContactId}`);
     return null;
@@ -586,6 +609,13 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null) 
       ghl_contact_id: ghlContactId,
       payload: {
         ...analysis,
+        // v1.6: Inbound channel ('sms' | 'email' | null) so downstream
+        // rules / actions can route correctly. Read by decision-engine
+        // v2.13's inferChannelFromEvent helper to override the rule
+        // template's channel for send_message actions. Null when caller
+        // didn't supply a channel (legacy paths) — the rule template
+        // value remains as fallback in that case.
+        channel: channel || null,
         // v1.5: Full message_text so downstream consumers (send-message-handler)
         // have the actual inbound. message_preview is kept for backward
         // compatibility with anything reading the first 100 chars.
@@ -651,7 +681,15 @@ export async function analyzePendingReplies({ limit = 10 } = {}) {
     const messageText = event.payload?.message_text || '';
     if (!contactId || !messageText) { skipped++; continue; }
 
-    const result = await analyzeMessage(contactId, messageText, event.id);
+    // v1.6: derive channel from the source event's message_type so
+    // analyzeMessage carries it forward into ai.analysis_completed.
+    // GHL emits message_type as "Email" or "SMS" (or "TYPE_EMAIL"/
+    // "TYPE_SMS" on some endpoints) — normalize to lowercase short form.
+    const rawType = String(event.payload?.message_type || '').toLowerCase();
+    const inboundChannel = rawType.includes('email') ? 'email'
+                         : rawType.includes('sms')   ? 'sms'
+                         : null;
+    const result = await analyzeMessage(contactId, messageText, event.id, inboundChannel);
     if (result) { analyzed++; }
     // v1.2: pass messageText to match the new (contact, message) cache key
     else if (wasRecentlyAnalyzed(contactId, messageText)) { skipped++; }
