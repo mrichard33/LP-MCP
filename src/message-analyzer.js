@@ -13,6 +13,25 @@
  * Output: Structured assessment written to lead_intelligence table
  *         + ai.analysis_completed event emitted for Decision Engine.
  *
+ * v1.7 (2026-05-04) — Accept channel on /n8n/analyze-message endpoint.
+ *   PROBLEM: v1.6 added `channel` as a 4th parameter to analyzeMessage
+ *   and propagated it onto ai.analysis_completed.payload.channel. The
+ *   two callers we updated (decision-engine processSingleEventInner and
+ *   the analyzer's own analyzePendingReplies) work correctly. But there
+ *   is a third caller — behavioral-emitter.js v2.7's reply buffer hits
+ *   /n8n/analyze-message over loopback HTTP. That endpoint extracted
+ *   only contactId + message from the request body and called
+ *   analyzeMessage with two args, so channel arrived as null. For
+ *   contacts that go through the buffer (which is the production path
+ *   for substantive replies on pause-bot contacts), email replies still
+ *   landed with payload.channel=null and downstream decision-engine
+ *   v2.13 had nothing to read.
+ *
+ *   FIX: Endpoint now reads channel from req.body and forwards it as
+ *   the 4th arg. behavioral-emitter v2.8 sends it. Backward-compatible
+ *   with any other caller that omits the field — channel falls back to
+ *   null, same as the v1.6 behavior.
+ *
  * v1.6 (2026-05-04) — Carry inbound channel forward in ai.analysis_completed.
  *   PROBLEM: ai.analysis_completed events did not carry the inbound
  *   channel (sms vs email). Downstream rules — specifically
@@ -729,10 +748,15 @@ export function registerMessageAnalyzerRoutes(app) {
   });
 
   app.post('/n8n/analyze-message', async (req, res) => {
-    const { contactId, message } = req.body || {};
+    // v1.7: accept channel in request body so callers (notably
+    // behavioral-emitter v2.8's reply buffer) can pass the inbound
+    // channel through to analyzeMessage and onto ai.analysis_completed.
+    // Null is safe — analyzer treats it as "unknown" and downstream
+    // decision-engine v2.13 falls back to the rule template's channel.
+    const { contactId, message, channel } = req.body || {};
     if (!contactId || !message) return res.status(400).json({ error: 'contactId and message required' });
     try {
-      const result = await analyzeMessage(contactId, message);
+      const result = await analyzeMessage(contactId, message, null, channel || null);
       res.json({ success: !!result, analysis: result });
     } catch (err) {
       res.status(500).json({ error: err.message });
