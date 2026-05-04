@@ -24,6 +24,11 @@
  *      no_matching_rules gap (event 18741, Douglas / Bonnie Jennings).
  *   3. emit_event handler — used by Layer 3 sequences and observability rules.
  *
+ *   IMPORTANT plumbing note: getEventContext returns the spread payload
+ *   directly (not { event, payload, ... }). Both new wrappers fetch the
+ *   originating system_events row by action.event_id when they need
+ *   structural fields like event.id or event.payload.message_id.
+ *
  * Supported action types (21):
  *   add_tag, remove_tag, set_stage, move_opportunity, update_opportunity,
  *   remove_from_workflow, add_to_workflow, book_appointment,
@@ -81,32 +86,41 @@ import { executeUpdateCustomFields, executeUpdateContactEmail } from './handlers
 import { executeCalculateTimeLapseTier } from './handlers/time-lapse.js';
 import { executeEmitEvent } from './handlers/system-events.js';
 
+// MVI v2.5 — fetch the source event for a given action. The shared
+// getEventContext returns ONLY the spread payload (no event_id /
+// event_type). Wrappers that need the event row itself use this helper.
+async function fetchSourceEvent(action) {
+  if (!action?.event_id) return null;
+  const { data } = await supabase
+    .from('system_events')
+    .select('id, event_type, event_subtype, ghl_contact_id, entity_id, payload')
+    .eq('id', action.event_id)
+    .maybeSingle();
+  return data || null;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // MVI v2.5 — send_message wrapper: outbound lock around the existing handler
 // ═══════════════════════════════════════════════════════════════════
 //
-// Why a wrapper rather than modifying send-message-handler.js: the lock
-// is an orchestration concern, not a send concern. Keeping it here means
-// the handler stays focused on the GHL/webhook send mechanics, and the
-// dedup logic is inspectable in one place alongside the rest of the
-// executor.
-//
 // trigger_id resolution priority:
 //   1. action.action_payload.trigger_id        (explicit)
-//   2. context.event.payload.message_id        (inbound message we're replying to)
-//   3. `evt-${context.event.id}`               (fallback to source event)
+//   2. context.message_id                      (flattened payload from getEventContext)
+//   3. fetched event.payload.message_id        (when context didn't carry it)
+//   4. `evt-${action.event_id}`                (fallback to source event)
 //
 // Lock TTL is the default 300s. If a real send takes longer than that
 // (rare), the next attempt re-acquires under "reacquired_after_expiry".
 
 async function executeSendMessageWithLock(action, context) {
   const params = action.action_payload || {};
-  const event = context?.event;
-  const trigger_id =
-    params.trigger_id ||
-    event?.payload?.message_id ||
-    (event?.id ? `evt-${event.id}` : null);
   const contact_id = action.target_id;
+
+  let trigger_id = params.trigger_id || context?.message_id || null;
+  if (!trigger_id) {
+    const evt = await fetchSourceEvent(action);
+    trigger_id = evt?.payload?.message_id || (evt?.id ? `evt-${evt.id}` : null);
+  }
 
   const lock = await tryAcquireLock({
     contact_id,
@@ -131,9 +145,11 @@ async function executeSendMessageWithLock(action, context) {
 
   try {
     const result = await executeSendMessage(action, context);
-    return { ...result, _outbound_lock: { acquired: true, trigger_id, lock_key: lock.lock_key, reason: lock.reason } };
+    return {
+      ...result,
+      _outbound_lock: { acquired: true, trigger_id, lock_key: lock.lock_key, reason: lock.reason },
+    };
   } catch (err) {
-    // Release on failure so a retry can take the lock back.
     if (trigger_id) await releaseLock(contact_id, trigger_id);
     throw err;
   }
@@ -148,23 +164,18 @@ async function executeSendMessageWithLock(action, context) {
 // matching active row, applies the confidence gate, and queues each
 // sub-action into agent_actions as a fresh batch.
 //
+// We fetch the source event ourselves rather than rely on getEventContext —
+// that helper returns the spread payload only, but we also need event.id
+// for batch_id stamping and event.ghl_contact_id for sub-target fallback.
+//
 // Action specs in the dispatch row use the same shape as agent_rules
 // action_template entries: { action_type, target_system, target_entity,
 // params }. params becomes action_payload.
-//
-// We do NOT route through createActionsFromRule because:
-//   - The originating rule (LAYER3_DISPATCH) fires once and queues this
-//     single action. The dispatch table is what fans it out into the
-//     concrete sequence. Re-using createActionsFromRule would also force
-//     us to resolve a synthetic rule each call.
-//   - We want the queued sub-actions tagged with rule_applied=LAYER3_DISPATCH
-//     and source_classification for forensics, which the rule path doesn't
-//     emit by default.
 
-async function executeLayer3Dispatch(action, context) {
-  const event = context?.event;
+async function executeLayer3Dispatch(action /*, context */) {
+  const event = await fetchSourceEvent(action);
   if (!event) {
-    return { skipped: true, reason: 'no_event_context', action_id: action.id };
+    return { skipped: true, reason: 'no_source_event', action_id: action.id };
   }
 
   const result = await getDispatchForClassification(event.payload || {});
@@ -176,7 +187,7 @@ async function executeLayer3Dispatch(action, context) {
     return { skipped: true, ...result };
   }
 
-  const targetId = action.target_id;
+  const targetId = action.target_id || event.ghl_contact_id || event.entity_id || null;
   const dispatch = result.dispatch;
   const subActions = Array.isArray(dispatch.actions) ? dispatch.actions : [];
   const batchId = `layer3_${event.id}_${dispatch.recommended_action}_${Date.now()}`;
@@ -266,8 +277,10 @@ const CONTEXT_AWARE_HANDLERS = new Set([
   'update_contact_email',
   'send_message',
   'create_lp_lead',          // 2026-05-01 — needs event payload for appointment_date/time
-  'layer3_dispatch',         // MVI v2.5 — needs event.payload.recommended_action
 ]);
+// Note: layer3_dispatch doesn't go through CONTEXT_AWARE_HANDLERS because
+// it fetches its own source event row (it needs event.id, not just the
+// spread payload that getEventContext provides).
 
 // ═══════════════════════════════════════════════════════════════════
 // EXECUTOR ENGINE
