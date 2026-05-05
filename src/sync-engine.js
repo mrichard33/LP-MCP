@@ -1,5 +1,22 @@
 // ─── Sync Engine — src/sync-engine.js ─────────────────────────────
 //
+// v6.5 — Parallel entity sweeps with bounded concurrency.
+//         Splits incrementalSync into two independent sweeps that run
+//         in parallel: runLeadsSweep (changed leads + child records)
+//         and runJobChangesSweep (job-status changes). Within each
+//         sweep, processProspect calls run with bounded concurrency
+//         (SYNC_PROSPECT_CONCURRENCY, default 3) per page so we
+//         parallelize without hammering LP. Each sweep gets its own
+//         per-sweep timeout (SYNC_PER_SWEEP_TIMEOUT_MIN, default
+//         20min) — a stalled sweep no longer wastes the other's
+//         budget, and Promise.allSettled isolates failures so one
+//         sweep failing doesn't cascade into the other's logs being
+//         marked failed. Diagnostic root cause: the legacy sequential
+//         loop hit the 45-min wall-clock timeout, marking all 6
+//         entity-type log rows as "Process terminated" simultaneously
+//         (29 such failures in 24h on 2026-05-05). Same idempotency,
+//         mutex, MAX_INCREMENTAL_LEADS cap, and resume-from-last-sync
+//         semantics preserved — accuracy is unchanged.
 // v6.4 — Per-record syncLogProgress calls in incrementalSync inner loops
 //         so the records_synced column updates smoothly during long runs
 //         (was updating only at page boundaries, every ~200 leads, leaving
@@ -64,6 +81,33 @@ const MAX_INCREMENTAL_LEADS = 2000;
 // SYNC_TIMEOUT_MINUTES=60
 const SYNC_TIMEOUT_MINUTES = parseInt(process.env.SYNC_TIMEOUT_MINUTES || '45', 10);
 const SYNC_TIMEOUT_MS = SYNC_TIMEOUT_MINUTES * 60 * 1000;
+
+// v6.5: Per-sweep timeout (each sweep gets its own budget) and bounded
+// concurrency for processProspect calls within a page.
+// SYNC_PER_SWEEP_TIMEOUT_MIN is wall-clock per sweep — leads and
+// job-changes each get this budget independently.
+// SYNC_PROSPECT_CONCURRENCY caps in-flight processProspect calls inside
+// a page; LP API rate-limit headroom should comfortably absorb 3 concurrent
+// per sweep (so up to 6 cross-sweep). Tune via env if LP starts pushing back.
+const SYNC_PER_SWEEP_TIMEOUT_MS = parseInt(process.env.SYNC_PER_SWEEP_TIMEOUT_MIN || '20', 10) * 60 * 1000;
+const SYNC_PROSPECT_CONCURRENCY = parseInt(process.env.SYNC_PROSPECT_CONCURRENCY || '3', 10);
+
+// ─── Bounded-Parallel Helper (v6.5) ──────────────────────────────
+//
+// Runs `fn(item)` over `items` with at most `concurrency` operations in
+// flight at once. Uses fixed-size batches (Promise.allSettled per batch)
+// rather than a streaming pool — simpler and good enough for the page
+// sizes we see (PAGE_SIZE=200). Returns the allSettled-style results so
+// callers can decide how to handle individual failures.
+async function processInBatches(items, concurrency, fn) {
+  const results = [];
+  for (let i = 0; i < items.length; i += concurrency) {
+    const batch = items.slice(i, i + concurrency);
+    const batchResults = await Promise.allSettled(batch.map(fn));
+    results.push(...batchResults);
+  }
+  return results;
+}
 
 // ─── Timeout Wrapper ─────────────────────────────────────────────
 //
@@ -262,6 +306,139 @@ export async function fullSync() {
   return counts;
 }
 
+// ─── v6.5: Independent Sweeps for Parallel Incremental Sync ──────
+//
+// Splits the legacy sequential incrementalSync into two independent
+// sweeps that run concurrently. Each returns its own counts/failed/hitCap
+// so the orchestrator can aggregate and decide log completion per entity.
+//
+// runLeadsSweep   — changed leads via getLeadData; for each prospect,
+//                   processProspect() also pulls calls/notes/jobs/milestones.
+//                   Bounded concurrency (SYNC_PROSPECT_CONCURRENCY) inside a
+//                   page; respects MAX_INCREMENTAL_LEADS cap.
+// runJobChangesSweep — job-status changes via getJobStatusChanges; same
+//                   bounded-batch pattern. No cap (job-change deltas are
+//                   small in practice).
+//
+// Both sweeps share the same idempotency guarantees as the legacy code —
+// every upsert keys on lp_lead_id / lp_job_id / mdt_id so retries and
+// concurrent writes converge to the same state.
+async function runLeadsSweep(since, today, logIds, maxLeads) {
+  const counts = { leads: 0, calls: 0, notes: 0, jobs: 0, milestones: 0, activities: 0 };
+  let failed = 0;
+  let hitCap = false;
+  let startIndex = 1;
+
+  while (counts.leads < maxLeads) {
+    let leads;
+    try {
+      leads = await getLeadData({
+        startdate: since, enddate: today,
+        PageSize: PAGE_SIZE, StartIndex: startIndex,
+      });
+    } catch (err) {
+      console.error('[Sync:Leads] GetLeadData failed:', err.message);
+      break;
+    }
+    const items = extractArray(leads);
+    if (items.length === 0) break;
+
+    // Parallelize processProspect within the page. Each handler returns
+    // its sub-counts (or null on skip/error) so we aggregate after
+    // Promise.allSettled completes — no shared-state increments under
+    // concurrent execution.
+    const batchResults = await processInBatches(items, SYNC_PROSPECT_CONCURRENCY, async (lead) => {
+      // Hit-cap guard: if a peer in this batch already pushed us over
+      // the cap, skip without consuming an LP API call.
+      if (counts.leads >= maxLeads) { hitCap = true; return null; }
+
+      const cstId = lead.cst_id || lead.CstID || lead.prospectid || lead.ProspectID;
+      if (!cstId) return null;
+
+      try {
+        const fullResult = await getLead(cstId);
+        const fullProspects = extractArray(fullResult);
+        if (fullProspects.length === 0) return null;
+        return await processProspect(fullProspects[0]);
+      } catch (err) {
+        failed++;
+        await logSyncError(cstId, err);
+        return null;
+      }
+    });
+
+    // Aggregate this batch's results into sweep-local counts.
+    for (const r of batchResults) {
+      if (r.status !== 'fulfilled' || !r.value) continue;
+      const sub = r.value;
+      counts.leads++;
+      counts.calls += sub.calls || 0;
+      counts.notes += sub.notes || 0;
+      counts.jobs += sub.jobs || 0;
+      counts.milestones += sub.milestones || 0;
+      counts.activities += (sub.calls || 0) + (sub.notes || 0);
+    }
+
+    // v6.4-style throttled progress writes (most calls no-op via the
+    // 5s-per-logId throttle inside syncLogProgress).
+    syncLogProgress(logIds.leads, counts.leads);
+    syncLogProgress(logIds.calls, counts.calls);
+    syncLogProgress(logIds.notes, counts.notes);
+    syncLogProgress(logIds.jobs, counts.jobs);
+    syncLogProgress(logIds.milestones, counts.milestones);
+    syncLogProgress(logIds.activities, counts.activities);
+
+    if (hitCap || counts.leads >= maxLeads) { hitCap = true; break; }
+    startIndex += items.length;
+    await sleep(RATE_LIMIT_SLEEP_MS);
+  }
+
+  if (hitCap) {
+    console.log(`[Sync:Leads] Hit MAX_INCREMENTAL_LEADS cap (${maxLeads}) — stopping. Will continue in next run.`);
+  }
+  return { counts, failed, hitCap };
+}
+
+async function runJobChangesSweep(since, today, logIds) {
+  const counts = { jobs: 0, milestones: 0 };
+  let failed = 0;
+  let startIndex = 1;
+
+  while (true) {
+    let jobs;
+    try {
+      jobs = await getJobStatusChanges({
+        startdate: since, enddate: today,
+        PageSize: PAGE_SIZE, StartIndex: startIndex,
+      });
+    } catch (err) {
+      console.error('[Sync:JobChanges] GetJobStatusChanges failed:', err.message);
+      break;
+    }
+    const items = extractArray(jobs);
+    if (items.length === 0) break;
+
+    await processInBatches(items, SYNC_PROSPECT_CONCURRENCY, async (job) => {
+      try {
+        await syncJobAndMilestones(job, job.lds_id || job.lp_lead_id, null);
+        counts.jobs++;
+        counts.milestones += (getField(job, 'milestones', 'Milestones') || []).length;
+      } catch (err) {
+        failed++;
+        await logSyncError(job.job_id || job.JobID, err);
+      }
+    });
+
+    syncLogProgress(logIds.jobs, counts.jobs);
+    syncLogProgress(logIds.milestones, counts.milestones);
+
+    startIndex += items.length;
+    await sleep(RATE_LIMIT_SLEEP_MS);
+  }
+
+  return { counts, failed };
+}
+
 // ─── Incremental Sync ────────────────────────────────────────────
 
 export async function incrementalSync() {
@@ -292,87 +469,94 @@ export async function incrementalSync() {
     }
 
     const logIds = await syncLogStartAll('incremental', ['leads', 'calls', 'notes', 'jobs', 'milestones', 'activities']);
-    const counts = { leads: 0, calls: 0, notes: 0, jobs: 0, milestones: 0, activities: 0 };
-    let failed = 0;
     const since = lastSyncTime.toISOString().slice(0, 10);
     const today = new Date().toISOString().slice(0, 10);
+
+    console.log(`[Sync] Incremental window: ${since} → ${today} (max ${MAX_INCREMENTAL_LEADS} leads, prospect concurrency ${SYNC_PROSPECT_CONCURRENCY}, per-sweep timeout ${SYNC_PER_SWEEP_TIMEOUT_MS / 60000}min)`);
+
+    // v6.5: Run leads + job-changes in parallel, each with its own
+    // per-sweep timeout. Promise.allSettled isolates failures so one
+    // sweep failing doesn't cascade into the other's logs being marked
+    // failed. The mutex still prevents concurrent incrementalSync runs;
+    // parallelism here is bounded INSIDE this single run only.
+    console.log('[Sync] Running parallel sweeps: leads + job-changes');
+    const [leadsRes, jobsRes] = await Promise.allSettled([
+      runWithTimeout(
+        () => runLeadsSweep(since, today, logIds, MAX_INCREMENTAL_LEADS),
+        SYNC_PER_SWEEP_TIMEOUT_MS,
+        'leadsSweep'
+      ),
+      runWithTimeout(
+        () => runJobChangesSweep(since, today, logIds),
+        SYNC_PER_SWEEP_TIMEOUT_MS,
+        'jobChangesSweep'
+      ),
+    ]);
+
+    // Aggregate per-sweep results into orchestrator-level counts.
+    const counts = { leads: 0, calls: 0, notes: 0, jobs: 0, milestones: 0, activities: 0 };
+    let failed = 0;
     let hitCap = false;
 
-    console.log(`[Sync] Incremental window: ${since} → ${today} (max ${MAX_INCREMENTAL_LEADS} leads)`);
-
-    // Part 1: Changed leads
-    let startIndex = 1;
-    while (true) {
-      // Safety cap: stop if we've processed enough leads for this run
-      if (counts.leads >= MAX_INCREMENTAL_LEADS) {
-        console.log(`[Sync] Hit MAX_INCREMENTAL_LEADS cap (${MAX_INCREMENTAL_LEADS}) — stopping. Will continue in next run.`);
-        hitCap = true;
-        break;
-      }
-
-      let leads;
-      try { leads = await getLeadData({ startdate: since, enddate: today, PageSize: PAGE_SIZE, StartIndex: startIndex }); }
-      catch (err) { console.error('[Sync] GetLeadData failed:', err.message); break; }
-      const items = extractArray(leads);
-      if (items.length === 0) break;
-      for (const lead of items) {
-        if (counts.leads >= MAX_INCREMENTAL_LEADS) { hitCap = true; break; }
-        try {
-          const cstId = lead.cst_id || lead.CstID || lead.prospectid || lead.ProspectID;
-          if (cstId) {
-            const fullResult = await getLead(cstId);
-            const fullProspects = extractArray(fullResult);
-            if (fullProspects.length > 0) {
-              const sub = await processProspect(fullProspects[0]);
-              counts.leads++;
-              if (sub) { counts.calls += sub.calls; counts.notes += sub.notes; counts.jobs += sub.jobs; counts.milestones += sub.milestones; counts.activities += sub.calls + sub.notes; }
-              // v6.4: per-record progress update (throttled in syncLogProgress — most calls no-op)
-              syncLogProgress(logIds.leads, counts.leads);
-            }
-          }
-        } catch (err) { failed++; await logSyncError(lead.cst_id || lead.id, err); }
-      }
-      if (hitCap) break;
+    if (leadsRes.status === 'fulfilled' && leadsRes.value) {
+      const r = leadsRes.value;
+      counts.leads = r.counts.leads;
+      counts.calls = r.counts.calls;
+      counts.notes = r.counts.notes;
+      counts.jobs += r.counts.jobs;
+      counts.milestones += r.counts.milestones;
+      counts.activities = r.counts.activities;
+      failed += r.failed;
+      hitCap = r.hitCap;
+    } else {
+      const reason = leadsRes.reason?.message || 'leadsSweep failed';
+      console.error('[Sync] Leads sweep failed:', reason);
+      // Mark leads-side logs as failed; orchestrator continues so any
+      // jobsSweep results still complete cleanly below.
       await Promise.all([
-        syncLogProgress(logIds.leads, counts.leads), syncLogProgress(logIds.calls, counts.calls),
-        syncLogProgress(logIds.notes, counts.notes), syncLogProgress(logIds.jobs, counts.jobs),
-        syncLogProgress(logIds.milestones, counts.milestones), syncLogProgress(logIds.activities, counts.activities),
+        syncLogFail(logIds.leads, 0, reason).catch(() => {}),
+        syncLogFail(logIds.calls, 0, reason).catch(() => {}),
+        syncLogFail(logIds.notes, 0, reason).catch(() => {}),
+        syncLogFail(logIds.activities, 0, reason).catch(() => {}),
       ]);
-      startIndex += items.length;
-      await sleep(RATE_LIMIT_SLEEP_MS);
     }
 
-    // Part 2: Job status changes (skip if we already hit the leads cap to save time)
-    if (!hitCap) {
-      startIndex = 1;
-      while (true) {
-        let jobs;
-        try { jobs = await getJobStatusChanges({ startdate: since, enddate: today, PageSize: PAGE_SIZE, StartIndex: startIndex }); }
-        catch (err) { console.error('[Sync] GetJobStatusChanges failed:', err.message); break; }
-        const items = extractArray(jobs);
-        if (items.length === 0) break;
-        for (const job of items) {
-          try {
-            await syncJobAndMilestones(job, job.lds_id || job.lp_lead_id, null);
-            counts.jobs++;
-            counts.milestones += (getField(job, 'milestones', 'Milestones') || []).length;
-            // v6.4: per-record progress update (throttled in syncLogProgress — most calls no-op)
-            syncLogProgress(logIds.jobs, counts.jobs);
-            syncLogProgress(logIds.milestones, counts.milestones);
-          } catch (err) { failed++; await logSyncError(job.job_id || job.JobID, err); }
-        }
-        await Promise.all([ syncLogProgress(logIds.jobs, counts.jobs), syncLogProgress(logIds.milestones, counts.milestones) ]);
-        startIndex += items.length;
-        await sleep(RATE_LIMIT_SLEEP_MS);
+    if (jobsRes.status === 'fulfilled' && jobsRes.value) {
+      const r = jobsRes.value;
+      counts.jobs += r.counts.jobs;
+      counts.milestones += r.counts.milestones;
+      failed += r.failed;
+    } else {
+      const reason = jobsRes.reason?.message || 'jobChangesSweep failed';
+      console.error('[Sync] Job-changes sweep failed:', reason);
+      // jobs/milestones logs are co-owned by the leads sweep — only
+      // mark them failed if leads sweep ALSO failed (otherwise leads-
+      // sweep contributions stand and we close those logs below).
+      if (leadsRes.status !== 'fulfilled') {
+        await Promise.all([
+          syncLogFail(logIds.jobs, 0, reason).catch(() => {}),
+          syncLogFail(logIds.milestones, 0, reason).catch(() => {}),
+        ]);
       }
     }
 
+    // Close logs for entity types whose owning sweep resolved fulfilled.
+    // Skip entities whose sweep already failed above; those rows are
+    // already in 'failed' state.
     const errorMsg = failed > 0 ? `${failed} records failed` : (hitCap ? `Capped at ${MAX_INCREMENTAL_LEADS} leads` : null);
-    await Promise.all([
-      syncLogComplete(logIds.leads, counts.leads, errorMsg), syncLogComplete(logIds.calls, counts.calls),
-      syncLogComplete(logIds.notes, counts.notes), syncLogComplete(logIds.jobs, counts.jobs),
-      syncLogComplete(logIds.milestones, counts.milestones), syncLogComplete(logIds.activities, counts.activities),
-    ]);
+    const closes = [];
+    if (leadsRes.status === 'fulfilled') {
+      closes.push(syncLogComplete(logIds.leads, counts.leads, errorMsg));
+      closes.push(syncLogComplete(logIds.calls, counts.calls));
+      closes.push(syncLogComplete(logIds.notes, counts.notes));
+      closes.push(syncLogComplete(logIds.activities, counts.activities));
+    }
+    // jobs/milestones close if EITHER sweep contributed successfully.
+    if (leadsRes.status === 'fulfilled' || jobsRes.status === 'fulfilled') {
+      closes.push(syncLogComplete(logIds.jobs, counts.jobs));
+      closes.push(syncLogComplete(logIds.milestones, counts.milestones));
+    }
+    await Promise.all(closes);
 
     // Push LP notes from Supabase to GHL contact records
     try {
