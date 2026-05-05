@@ -14,6 +14,23 @@
  * 
  * Security: All endpoints validate GHL_WEBHOOK_SECRET.
  *
+ * v2.10 (2026-05-05) — Defensive customData parsing in handleAppointment.
+ *   PROBLEM: Same nested-customData root cause as v2.9, but in
+ *   handleAppointment. GHL outbound webhooks auto-populate contactId at
+ *   top level but nest user-defined Custom Data fields (calendarId,
+ *   startDate, status, title, etc.) inside `customData`. handleAppointment
+ *   only read top-level body.* — every field except contactId came back
+ *   null. Confirmed via system_events 20402/20412/20423 on 2026-05-05
+ *   between 14:13–14:39 UTC: 5 ghl.appointment_booked events landed with
+ *   payload {calendar_id:null, status:"", start_time:null, ...}, blocking
+ *   Layer 3 calendar-aware routing and APPT Handler downstream logic.
+ *
+ *   FIX: Pull every field defensively from body | customData | appointment.
+ *   Mirrors handleWorkflowCompleted v2.9 + extends to also read from a
+ *   nested `appointment` sub-object that some GHL configurations use.
+ *   Adds raw-body keyset logging when all key fields land empty so future
+ *   webhook regressions are diagnosable from Railway logs.
+ *
  * v2.9 (2026-05-05) — Defensive customData parsing in handleWorkflowCompleted.
  *   PROBLEM: GHL outbound custom-webhooks nest user-defined Custom Data
  *   fields inside a `customData` object while auto-populating contactId
@@ -463,9 +480,26 @@ async function handleReply(req, res) {
  */
 async function handleAppointment(req, res) {
   const body = req.body || {};
-  const contactId = body.contactId || body.contact_id || null;
-  const calendarId = body.calendarId || body.calendar_id || null;
-  const status = (body.status || body.appointmentStatus || '').toLowerCase();
+
+  // v2.10: Defensive payload parsing across body | customData | appointment.
+  // GHL nests Custom Data fields inside `customData`; some configurations
+  // also place appointment metadata inside an `appointment` sub-object.
+  // See header comment v2.10 entry for full diagnosis.
+  const customData = (body.customData || body.custom_data || body.customValues || {}) || {};
+  const apptData = (body.appointment || {}) || {};
+
+  const contactId = body.contactId || body.contact_id
+    || customData.contactId || customData.contact_id
+    || apptData.contactId || apptData.contact_id || null;
+  const calendarId = body.calendarId || body.calendar_id
+    || customData.calendarId || customData.calendar_id
+    || apptData.calendarId || apptData.calendar_id || null;
+  const status = (
+    body.status || body.appointmentStatus
+    || customData.status || customData.appointmentStatus
+    || apptData.status || apptData.appointmentStatus
+    || ''
+  ).toString().toLowerCase();
 
   if (!contactId) return res.status(400).json({ error: 'Missing contactId' });
 
@@ -483,13 +517,47 @@ async function handleAppointment(req, res) {
     eventType = 'ghl.appointment_booked';
   }
 
-  // v2.1: Extract all appointment fields including startDate.
-  const startTime = cleanGHLValue(body.startTime || body.start_time) || null;
-  const startDate = cleanGHLValue(body.startDate || body.start_date) || null;
-  const endTime = cleanGHLValue(body.endTime || body.end_time) || null;
-  const title = cleanGHLValue(body.title || body.name) || null;
-  const appointmentId = cleanGHLValue(body.appointmentId || body.appointment_id) || null;
-  const contactName = cleanGHLValue(body.contactName || body.contact_name) || null;
+  // v2.1+v2.10: Extract all appointment fields, defensive across body|customData|apptData.
+  const startTime = cleanGHLValue(
+    body.startTime || body.start_time
+    || customData.startTime || customData.start_time
+    || apptData.startTime || apptData.start_time
+  ) || null;
+  const startDate = cleanGHLValue(
+    body.startDate || body.start_date
+    || customData.startDate || customData.start_date
+    || apptData.startDate || apptData.start_date
+  ) || null;
+  const endTime = cleanGHLValue(
+    body.endTime || body.end_time
+    || customData.endTime || customData.end_time
+    || apptData.endTime || apptData.end_time
+  ) || null;
+  const title = cleanGHLValue(
+    body.title || body.name
+    || customData.title || customData.name
+    || apptData.title || apptData.name
+  ) || null;
+  const appointmentId = cleanGHLValue(
+    body.appointmentId || body.appointment_id
+    || customData.appointmentId || customData.appointment_id
+    || apptData.appointmentId || apptData.appointment_id || apptData.id
+  ) || null;
+  const contactName = cleanGHLValue(
+    body.contactName || body.contact_name
+    || customData.contactName || customData.contact_name
+  ) || null;
+
+  // v2.10: If every field except contactId came back empty, log raw body
+  // shape so future webhook regressions are diagnosable from Railway logs.
+  if (!calendarId && !startTime && !startDate && !title && !appointmentId) {
+    console.warn(
+      `[BehavioralEmitter] /appointment EMPTY-PAYLOAD for ${contactId} — `
+      + `body keys: [${Object.keys(body).join(', ')}], `
+      + `customData keys: [${Object.keys(customData).join(', ')}], `
+      + `apptData keys: [${Object.keys(apptData).join(', ')}]`
+    );
+  }
 
   // v2.2: Idempotency key uses 30-minute time buckets instead of Date.now().
   // Same contact + calendar + status within 30 min = deduped.
