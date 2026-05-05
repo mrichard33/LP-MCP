@@ -1,6 +1,40 @@
 /**
  * Context Builder — src/context-builder.js
  *
+ * v2.6 — 2026-05-05. EXPOSE ESTIMATE TOTAL + WINDOW COUNT for authoritative
+ *   money block in AI prompt.
+ *
+ *   PROBLEM: On contact 7jl9cVfry8OyQF6oI2V5, the agentic responder cited
+ *   "$36,000 estimate in their hand" but the actual GHL custom field
+ *   `Estimate Total` was $15,775.17. Mark surfaced this as a hallucination
+ *   risk: the bot is using data from the prompt to ground replies (good)
+ *   but the data it's seeing isn't accurate (bad).
+ *
+ *   ROOT CAUSE: Only 5 custom fields were extracted into context (LP Lead
+ *   ID, LP Inbound ID, LP Disposition, LP Prospect ID, LP Lost Reason).
+ *   `Estimate Total` and `Window Count` were never pulled. The AI never
+ *   saw the real numbers — it synthesized $36k from an LP rep note that
+ *   happened to mention a ballpark figure (lp_notes are dropped verbatim
+ *   into the prompt under the "LP Rep Notes (most reliable intelligence)"
+ *   header — that label invites the AI to trust them as authoritative).
+ *
+ *   FIX: Two new custom field constants and a new top-level `estimate`
+ *   block on the context object exposing { total, window_count, has_data }.
+ *   Both fields are numerically coerced (parseFloat with $/,/whitespace
+ *   stripping for total; parseInt for count) and fall back to null on
+ *   bad data so we never inject NaN / "undefined" into the AI prompt.
+ *
+ *   PAIRS WITH:
+ *     - response-generator.js v2.7.10 — renders context.estimate as the
+ *       "CUSTOMER'S ACTUAL ESTIMATE (AUTHORITATIVE)" block ABOVE LP rep
+ *       notes, with explicit usage rules ("use ONLY these numbers if
+ *       quoting; default remains do not quote").
+ *
+ *   No schema changes, no env vars, no rule changes. data_sources audit
+ *   gains two booleans (estimate_total_present, window_count_present)
+ *   so we can verify the field is actually populated on test contacts
+ *   without re-pulling the GHL contact.
+ *
  * v2.5 — 2026-04-28. EXPOSE CONTACT ADDRESS FIELDS for booking URL pre-fill.
  *   Per Mark: agentic bot must send GHL trigger links with UTMs AND
  *   pre-filled contact data (fullName, streetAddress, city, state,
@@ -33,6 +67,16 @@ const CF_LP_INBOUND_ID = '3YMxheIlPyhACB8zyc3W';
 const CF_LP_DISPOSITION = 'ZZCpHTthFMaVc3g5vMAS';
 const CF_LP_PROSPECT_ID = 'ZRQAVrzhtzApzLlHmT87';
 const CF_LP_LOST_REASON = 'I9CbRV0dKMfwaSlge9uU';
+
+// v2.6: Estimate fields used to build authoritative money block in the
+// AI prompt. Without these, the AI inferred dollar amounts from rep
+// notes (which are dropped verbatim into the prompt) — causing it to
+// quote stale or incorrect figures (e.g. $36,000 from a rep ballpark
+// when the actual estimate was $15,775.17). The AI is doing what we
+// asked — using the most authoritative-looking signal in context — but
+// the actual estimate must outrank rep notes.
+const CF_ESTIMATE_TOTAL = 'PqUYMgBojosjSGMBEUqX';   // dollar amount, e.g. "15775.17"
+const CF_WINDOW_COUNT   = 'h9FJTUbmUHIuD6JKmpXv';   // integer count, e.g. "12"
 
 // LP dispositions where stale data is high-risk (active deals).
 const LP_ACTIVE_DISPOSITIONS = new Set([
@@ -144,6 +188,23 @@ function getCustomFieldValue(customFields, fieldId) {
   if (!Array.isArray(customFields)) return null;
   const field = customFields.find(f => f.id === fieldId);
   return field?.value || null;
+}
+
+// v2.6: numeric coercion helpers for money / count fields. GHL stores
+// custom field values as strings (sometimes with $/,/whitespace). Bad
+// data → null so we never inject NaN or "undefined" into the AI prompt.
+function coerceMoney(raw) {
+  if (raw === null || raw === undefined || raw === '') return null;
+  const cleaned = String(raw).replace(/[$,\s]/g, '');
+  const num = parseFloat(cleaned);
+  return Number.isFinite(num) && num >= 0 ? num : null;
+}
+
+function coerceCount(raw) {
+  if (raw === null || raw === undefined || raw === '') return null;
+  const cleaned = String(raw).replace(/[^0-9.-]/g, '');
+  const num = parseInt(cleaned, 10);
+  return Number.isFinite(num) && num >= 0 ? num : null;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -427,6 +488,18 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     ghlCustomFieldLostReason = getCustomFieldValue(ghlContact.customFields, CF_LP_LOST_REASON);
   }
 
+  // v2.6: Estimate fields. Pulled here so they're available to both the
+  // context return AND any future synthetic-note injection paths. coerceMoney
+  // / coerceCount handle GHL's string-typed custom fields and bad data.
+  const cfEstimateTotalRaw = ghlContact?.customFields
+    ? getCustomFieldValue(ghlContact.customFields, CF_ESTIMATE_TOTAL)
+    : null;
+  const cfWindowCountRaw = ghlContact?.customFields
+    ? getCustomFieldValue(ghlContact.customFields, CF_WINDOW_COUNT)
+    : null;
+  const estimateTotal = coerceMoney(cfEstimateTotalRaw);
+  const windowCount = coerceCount(cfWindowCountRaw);
+
   if (cfProspectId) {
     lpLead = await fetchLPLeadByProspectId(cfProspectId);
     if (lpLead) {
@@ -519,6 +592,21 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       last_status_change: opportunity?.lastStatusChangeAt || null,
     },
 
+    // v2.6: New top-level estimate block. Contains ONLY the customer's
+    // actual estimate as recorded in GHL custom fields. Distinct from
+    // pipeline.value (opp monetaryValue) and lp.job_value (LP closed-won
+    // amount) — those represent different concepts and are the wrong
+    // signals to use as a "what we quoted" reference.
+    //
+    // has_data: true when at least one field has a valid numeric value.
+    // The response-generator uses this to decide whether to render the
+    // AUTHORITATIVE block.
+    estimate: {
+      total: estimateTotal,
+      window_count: windowCount,
+      has_data: estimateTotal !== null || windowCount !== null,
+    },
+
     lp: {
       matched: !!lpLead,
       lead_id: lpLead?.lp_lead_id || null,
@@ -581,7 +669,7 @@ export async function buildLeadContext(ghlContactId, options = {}) {
 
     meta: {
       context_built_at: new Date().toISOString(),
-      context_builder_version: '2.5',
+      context_builder_version: '2.6',
       cache_ttl_ms: CONTEXT_CACHE_TTL_MS,
       data_sources: {
         ghl_contact: !!ghlContact,
@@ -595,6 +683,12 @@ export async function buildLeadContext(ghlContactId, options = {}) {
         pipeline_stage_resolved: !!pipelineStageInfo,
         conversation: conversation.length > 0,
         contact_address_present: !!(ghlContact?.address1),    // v2.5
+        // v2.6: visibility into estimate field population. Used by the
+        // response-generator's prompt builder to decide whether to render
+        // the AUTHORITATIVE money block, and surfaced here so audits can
+        // confirm the field was actually populated on a given test contact.
+        estimate_total_present: estimateTotal !== null,
+        window_count_present: windowCount !== null,
       },
       warnings: [
         ...(staleness.isStaleActive ? [`lp_data_stale_active:${staleness.ageMinutes}min`] : []),
