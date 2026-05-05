@@ -16,6 +16,14 @@
  *   import { registerWorkflowCompletionRoutes } from './workflow-completion-handler.js';
  *   registerWorkflowCompletionRoutes(app);
  * 
+ * v1.2 — 2026-05-05. Added 8 completed-objection-{branch} keys for W9.0.
+ *   W9.0 silent-path terminals apply per-branch completion tags
+ *   (completed-objection-price, completed-objection-competitor, etc.)
+ *   instead of a single completed:w90 tag. This preserves branch identity
+ *   directly in the emitted event payload via completion_tag field.
+ *   Filter expanded to accept completed-objection- prefix in addition to completed:.
+ *   Branch noted in workflow_name for Railway log observability.
+ *
  * v1.1 — 2026-05-05. Added completed:wec mapping for the Window Estimate
  *   Calculator entry receiver workflow (59e07e46). Pairs with the
  *   ESTIMATE_CALC_COMPLETED rule re-aim from ghl.lead_score_changed (proxy)
@@ -69,6 +77,18 @@ const TAG_TO_WORKFLOW = {
   'completed:objval': { id: '377de49d-f8df-4f41-b9e4-8e9aba36732f', name: 'Objection Validator + Tag Sync' },
   'completed:w100':   { id: 'fd3d777a-25e0-4b49-8de8-971e22f64aea', name: 'W10.0 - Sales/Close' },
   'completed:w120':   { id: '6b2c2920-a21b-4ebd-92df-8e31ef4ed8dc', name: 'W12.0 - Customer Onboarding' },
+
+  // W9.0 per-branch completion tags (silent-terminal; one fires per unresolved branch).
+  // All map to the same W9.0 workflow ID — branch is preserved via completion_tag in event payload.
+  // Agent rules can read completion_tag to act per-branch, or match on event_subtype to handle all branches uniformly.
+  'completed-objection-price':      { id: 'fdf4ad82-33ab-4e73-b581-18d21d51ac42', name: 'W9.0 - Objection Handler (Price branch unresolved)' },
+  'completed-objection-competitor': { id: 'fdf4ad82-33ab-4e73-b581-18d21d51ac42', name: 'W9.0 - Objection Handler (Competitor branch unresolved)' },
+  'completed-objection-timing':     { id: 'fdf4ad82-33ab-4e73-b581-18d21d51ac42', name: 'W9.0 - Objection Handler (Timing branch unresolved)' },
+  'completed-objection-trust':      { id: 'fdf4ad82-33ab-4e73-b581-18d21d51ac42', name: 'W9.0 - Objection Handler (Trust branch unresolved)' },
+  'completed-objection-complexity': { id: 'fdf4ad82-33ab-4e73-b581-18d21d51ac42', name: 'W9.0 - Objection Handler (Complexity branch unresolved)' },
+  'completed-objection-spouse':     { id: 'fdf4ad82-33ab-4e73-b581-18d21d51ac42', name: 'W9.0 - Objection Handler (Spouse branch unresolved)' },
+  'completed-objection-worth':      { id: 'fdf4ad82-33ab-4e73-b581-18d21d51ac42', name: 'W9.0 - Objection Handler (Worth branch unresolved)' },
+  'completed-objection-shutters':   { id: 'fdf4ad82-33ab-4e73-b581-18d21d51ac42', name: 'W9.0 - Objection Handler (Shutters branch unresolved)' },
 };
 
 async function handleWorkflowCompletedByTag(req, res) {
@@ -101,15 +121,21 @@ async function handleWorkflowCompletedByTag(req, res) {
     else if (typeof raw === 'string') tags = raw.split(',').map(t => t.trim()).filter(Boolean);
   }
 
-  const completedTags = tags.filter(t => t.startsWith('completed:'));
+  // Filter accepts both legacy `completed:*` AND W9.0 per-branch `completed-objection-*` patterns.
+  const completedTags = tags.filter(t =>
+    t.startsWith('completed:') || t.startsWith('completed-objection-')
+  );
   if (completedTags.length === 0) {
-    console.warn(`[WorkflowCompletion] No completed:* tags for ${contactId}`);
-    return res.json({ status: 'accepted', event_type: 'none', reason: 'no_completed_tag_found' });
+    console.warn(`[WorkflowCompletion] No completion tags for ${contactId}`);
+    return res.json({ status: 'accepted', event_type: 'none', reason: 'no_completion_tag_found' });
   }
 
   const emitted = [];
   for (const tag of completedTags) {
     const workflow = TAG_TO_WORKFLOW[tag];
+    // Fallback: strip the `completed:` prefix if no exact match (legacy behavior).
+    // For completed-objection-* tags without a mapping, this would yield a non-UUID
+    // — so unmapped per-branch tags simply won't emit a usable event_subtype.
     const workflowId = workflow?.id || tag.replace('completed:', '');
     const workflowName = workflow?.name || `Unknown (${tag})`;
 
