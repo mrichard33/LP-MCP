@@ -16,6 +16,13 @@
  *   import { registerWorkflowCompletionRoutes } from './workflow-completion-handler.js';
  *   registerWorkflowCompletionRoutes(app);
  * 
+ * v1.1 — 2026-05-05. Added completed:wec mapping for the Window Estimate
+ *   Calculator entry receiver workflow (59e07e46). Pairs with the
+ *   ESTIMATE_CALC_COMPLETED rule re-aim from ghl.lead_score_changed (proxy)
+ *   to ghl.workflow_completed (direct signal). Mark adds the
+ *   "Add Contact Tag: completed:wec" step at end of the entry receiver
+ *   workflow in GHL UI.
+ *
  * v1.0 — Initial implementation. Tag-to-workflow mapping for 20 workflows.
  */
 
@@ -38,6 +45,10 @@ function validateWebhook(req) {
 // ═══════════════════════════════════════════════════════════════════
 
 const TAG_TO_WORKFLOW = {
+  // Tier 0 entry receivers (ingestion workflows that fire BEFORE W0.x bridges)
+  'completed:wec':    { id: '59e07e46-19fc-4dab-a068-94dd1588a7bd', name: 'Window Estimate Calculator Completed (entry receiver)' },
+
+  // Tier 1 bridges
   'completed:w01':    { id: '85f4600a-a55d-4fb5-bd62-d2886dc3d461', name: 'W0.1 - Risk Report Entry Bridge' },
   'completed:w02':    { id: '74c90736-6550-4504-881d-2849231aa63c', name: 'W0.2 - Estimate Calculator Bridge' },
   'completed:w03':    { id: '2d404941-fc8b-46c7-a310-2acd176eb2f9', name: 'W0.3 - Chatbot Intent Qualifier' },
