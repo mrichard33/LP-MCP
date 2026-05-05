@@ -5,6 +5,62 @@
  * via channel-specific routing — webhook for SMS, Conversations API
  * for email — with cross-fallback for both.
  *
+ * v3.11 (2026-05-05) — Email sender control (FROM-address override).
+ *   PROBLEM: After v3.10 fixed In-Reply-To headers via emailMessageId,
+ *   contact 7jl9cVfry8OyQF6oI2V5 still showed broken thread continuity.
+ *   The customer received the original email from User A, replied to
+ *   it, but the agentic reply went out from User B's email address —
+ *   because the contact had been REASSIGNED in GHL (canvassing →
+ *   followup → different rep) between the two messages.
+ *
+ *   GHL's POST /conversations/messages defaults the FROM to the
+ *   contact's CURRENT assignedTo user when no sender field is set on
+ *   the body. v3.10 only set: type, contactId, conversationId, html,
+ *   subject, emailMessageId, conversationProviderId. No userId. No
+ *   emailFrom. So even with the right In-Reply-To headers, Gmail /
+ *   iCloud showed a different sender on the reply, breaking visual
+ *   thread continuity.
+ *
+ *   FIX: Two changes in sendViaConversationsAPI for the email branch.
+ *
+ *     1. New helper getThreadOriginatorUserId(contactId)
+ *        Mirrors getInboundEmailMessageId from v3.10 — same
+ *        conversations/search → messages?limit=20 fetch — but filters
+ *        to the most recent OUTBOUND email and returns its userId.
+ *        That's the GHL user who originated the thread (sent the
+ *        first or most recent email to the lead). Using their userId
+ *        on our reply tells GHL to load that user's email config and
+ *        send from the same address regardless of current assignment.
+ *
+ *     2. Set BOTH userId AND emailFrom on msgBody for email channel.
+ *        Per GHL's V2 Conversations Send API:
+ *          - userId        → preferred for LC-Email / Mailgun
+ *                            (GHL's default email infrastructure,
+ *                            which Reece uses with mail.reecewindows.com)
+ *          - emailFrom     → preferred for custom email providers
+ *                            (when conversationProviderId is set)
+ *        Setting both is safe — GHL ignores the irrelevant one for
+ *        the active provider. Provides a belt-and-suspenders override
+ *        regardless of which path GHL routes through.
+ *
+ *   Webhook fallback path (sendViaWebhook) ALSO updated to pass
+ *   replyFromUserId in the payload. Mark's GHL "Send Reply" workflow
+ *   can use this to temporarily reassign the contact to the right
+ *   user before the Send-Email action — so even when the Conv API
+ *   primary fails and we fall through to webhook, the reply lands
+ *   from the original sender's address.
+ *
+ *   IMPORTANT NOTE about webhook fallback for email: even with the
+ *   FROM address corrected, the webhook path CANNOT preserve email
+ *   thread continuity (no In-Reply-To header support on GHL's
+ *   Send-Email action). v3.10's emailMessageId only works on the
+ *   Conv API path. v3.11 makes the webhook fallback look better
+ *   (correct sender) but the only way to get true threading is for
+ *   the Conv API primary to succeed. Pairs with v3.10's body field +
+ *   emailMessageId fix that resolved the 422 forcing the fallback.
+ *
+ *   No semantic change for SMS. No new env vars. No schema changes.
+ *
  * v3.10 (2026-05-04) — Email body field + true emailMessageId threading.
  *   PROBLEM: After v3.9 deployed, the agentic email replies still landed
  *   in a new thread in the lead's inbox. Railway logs on test contact
@@ -22,318 +78,32 @@
  *   different body fields for SMS vs Email:
  *     - SMS  → 'message' (string, plain text)
  *     - Email → 'html' (string, HTML body)
- *   Per the Provider Outbound Message schema documented at
- *   https://marketplace.gohighlevel.com/docs/webhook/ProviderOutboundMessage
- *   and the V2 Email API guide. Sending 'message' for type='Email' causes
- *   GHL to evaluate the body as empty (since 'html' is missing) and
- *   return 422 "no message or attachments." The catch in sendWithFallback
- *   then runs the webhook path, which delivers but cannot preserve email
- *   threading because the agentic-send GHL workflow has no access to
- *   In-Reply-To / References header info.
+ *   Sending 'message' for type='Email' causes GHL to evaluate the body
+ *   as empty (since 'html' is missing) and return 422.
  *
- *   Bug 2 — no threading reference. Even with the right body field, the
- *   recipient's email client (Gmail / iCloud) keys threading on
- *   In-Reply-To and References headers. GHL exposes this on outbound via
- *   the optional 'emailMessageId' field — pass the inbound message's GHL
- *   id and GHL stamps the right headers internally. v3.9's "Re: <subject>"
- *   was a secondary heuristic, not a guarantee — modern email clients
- *   need the headers.
+ *   Bug 2 — no threading reference. Modern email clients (Gmail / iCloud)
+ *   key threading on In-Reply-To and References headers. GHL exposes this
+ *   on outbound via the optional 'emailMessageId' field — pass the inbound
+ *   message's GHL id and GHL stamps the right headers internally.
  *
  *   FIX: Two changes in sendViaConversationsAPI:
  *     1. For channel='email', set msgBody.html = message (instead of
- *        msgBody.message). For SMS, keep msgBody.message unchanged. This
- *        matches GHL's per-channel field convention and resolves the 422.
+ *        msgBody.message). For SMS, keep msgBody.message unchanged.
  *     2. Look up the most recent inbound email's GHL message id via the
- *        new getInboundEmailMessageId helper (mirrors getInboundEmailSubject
- *        from v3.9 — same conversations/search → messages?limit=20 →
- *        find inbound email pattern, but returns m.id instead of
- *        m.meta.email.subject). When found, set msgBody.emailMessageId
- *        so GHL writes the In-Reply-To / References headers. Falls back
- *        gracefully when no inbound email exists or the API call fails;
- *        v3.9's Re: subject prefix continues to apply as the secondary
- *        threading signal.
- *
- *   No semantic change for SMS. No new env vars. No schema changes. No
- *   GHL workflow changes. Pairs with v3.9's body strip and Re: prefix —
- *   together, agentic email replies arrive in-thread with a clean body
- *   and the right subject.
+ *        new getInboundEmailMessageId helper. When found, set
+ *        msgBody.emailMessageId so GHL writes the In-Reply-To /
+ *        References headers.
  *
  * v3.9 (2026-05-04) — Email body cleanup + Re: threading.
- *   PROBLEM: After v1.7/v2.8 channel propagation landed, two new defects
- *   surfaced on contact 7jl9cVfry8OyQF6oI2V5 2026-05-04 20:50:
- *     a. The outbound email body began with a literal "Subject: <subject>"
- *        line followed by two newlines, then the actual body. response-
- *        generator.js produces { message, subject } where the message
- *        field already contains the "Subject: ..." prefix. The previous
- *        code passed message through to sendViaConversationsAPI verbatim,
- *        so the prefix leaked into the rendered email body even though
- *        msgBody.subject was set correctly via the separate field.
- *     b. The outbound email's subject was a brand-new AI-authored line
- *        ("What actually happens during the Measurement Verification")
- *        instead of "Re: Your Measurement Verification Is Scheduled".
- *        Email clients (Gmail, Outlook) thread on subject; new subject
- *        means new visual thread. From the lead's perspective, every
- *        agentic reply landed as a separate conversation.
- *
- *   FIX: Two changes wrapped in a single email-channel branch placed
- *   right before sendWithFallback.
- *     1. Strip a leading "Subject: <line>\n+" prefix from the message
- *        text. If the subject field on the action_payload was somehow
- *        empty, capture the stripped value as a fallback so we don't
- *        lose subject information entirely.
- *     2. Look up the most recent inbound email's subject via a new
- *        helper getInboundEmailSubject (mirrors getReplyFromAddress's
- *        shape — same conversations/search + messages?limit=20 pattern,
- *        filtered by direction='inbound' AND email message type, returns
- *        meta.email.subject or null). If found, override the outbound
- *        subject with "Re: <inbound subject>" (or the inbound subject
- *        directly when it already starts with "Re:"). Falls back to the
- *        AI-generated subject when the lookup returns null.
- *
- *   No new env vars, no rule changes, no schema changes. Adds at most
- *   one extra GHL API call per email send (~100-200ms) — same shape as
- *   the existing v3.8 getReplyFromAddress lookup. Failure to look up
- *   the inbound subject is non-fatal (caller falls back to the AI
- *   subject and proceeds).
- *
- *   Pairs with message-analyzer.js v1.8 which fixes the upstream
- *   double-fire that was producing two emails per reply in the first
- *   place. Together: one email per reply, clean body, threaded into
- *   the existing conversation.
- *
  * v3.8 (2026-05-04) — Reply-from mirror + proper-case channelType.
- *   PROBLEM: Mark's GHL setup rotates lead-owner / from-number across
- *   contacts. Same lead can have inbound messages arriving on multiple
- *   GHL numbers (different campaigns, different reps). The agentic-send
- *   GHL workflow defaults to the contact's assigned-user's number,
- *   which is often NOT the same number the lead's most recent inbound
- *   came TO. Result: bot replies hop to a different SMS thread on the
- *   lead's phone mid-conversation. Confirmed on contact 7jl9cVfry8OyQF6oI2V5
- *   2026-05-04 (8890 inbound thread → 0083 reply thread after auto-book).
- *
- *   Companion fix: approval-path.js v4.10 already removed the
- *   sequence_order race that triggered the most acute case (booking
- *   running before send_message). v3.8 extends thread-continuity to
- *   the general case where the contact's assigned-user simply does not
- *   own the number/address the lead is messaging.
- *
- *   FIX: Two new fields in the webhook payload to the agentic-send GHL
- *   workflow.
- *
- *     1. replyFromAddress
- *        For SMS: the GHL phone number (e.g. "+19542808890") the lead's
- *        most recent inbound SMS was sent TO. Fetched from the GHL
- *        Conversations API at send time. Mark's workflow can use this
- *        to temporarily set contact.assignedTo to the user who owns
- *        that number before the Send-SMS-Reply step, then revert after
- *        the send. The Send-SMS-Reply node will pick up the temporary
- *        assignment and send from the matching number.
- *
- *        For Email: the GHL inbox address the lead's most recent inbound
- *        email was sent TO (same lookup path).
- *
- *        For backward-compatible convenience, replyFromPhone and
- *        replyFromEmail mirror replyFromAddress per channel.
- *
- *     2. channelType
- *        Proper-case channel name ("SMS" or "Email") matching GHL's
- *        native message-type convention. The existing `channel` field
- *        is unchanged (still lowercase) so any consumer keying on the
- *        old contract still works; channelType is additive.
- *
- *   New helper getReplyFromAddress(contactId, channel) wraps the GHL
- *   Conversations API call. Adds one GHL API hit per send (~100-200ms),
- *   which is acceptable for this scenario — we already do similar
- *   lookups in sendViaConversationsAPI. Failure to look up the
- *   reply-from is non-fatal: the field is sent as null and the GHL
- *   workflow falls back to its default (contact's assigned-user
- *   number) just like today.
- *
- *   No semantic change to suppression / opt-in / rate-limit / send
- *   path / GroupMe notification logic. The four guardrails are
- *   unchanged.
- *
  * v3.7 (2026-05-01) — pause-bot is the universal allow signal.
- *   PROBLEM: Several guardrails were silently blocking sends even when
- *   pause-bot (the explicit agentic opt-in) was set. Mark's directive
- *   2026-05-01: when pause-bot is active, the bot must respond no
- *   matter what. The ONLY blocks are dnc-sms and stage:dnc (plus the
- *   pre-existing dnc / do-not-contact, retained for legal compliance).
- *
- *   FIX:
- *     1. Suppression list (Guardrail 2) — added dnc-sms and stage:dnc
- *        as hard blocks. These are channel-specific SMS DNC and
- *        pipeline-level DNC stage. Existing dnc / do-not-contact
- *        retained as compliance-critical hard blocks (TCPA/CAN-SPAM
- *        exposure too high to drop them silently — flag this if you
- *        want pure dnc-sms / stage:dnc gating).
- *     2. Conversation gate (Guardrail 3) — pause-bot now wins over
- *        stop-bot. The two coexisting is unusual, but if it ever
- *        happens, pause-bot is the more recent / explicit opt-in
- *        signal and should govern. Per Mark: "make sure nothing else
- *        stops the bot from responding."
- *     3. Rate limit (Guardrail 4) — bypassed when pause-bot is set.
- *        When the agentic bot owns the conversation, throttling
- *        creates dead-air mid-thread. Without pause-bot, the rate
- *        limit still applies (legacy automation paths that send
- *        without explicit opt-in).
- *
- *   NET BEHAVIOR with pause-bot:
- *     dnc-sms          → block (hard suppression)
- *     stage:dnc        → block (hard suppression)
- *     dnc              → block (legacy lead opt-out, retained)
- *     do-not-contact   → block (legacy lead opt-out, retained)
- *     anything else    → ALLOW (rate limit, suppress-automation,
- *                        stop-bot all bypassed)
- *
- *   Without pause-bot, all prior guardrails (no-opt-in, stop-bot,
- *   suppress-automation, rate limit) still apply unchanged.
- *
  * v3.6 (2026-05-01) — Rich GroupMe notification on send.
- *   PROBLEM: The "📱 AGENTIC MESSAGE SENT" GroupMe ping built its own
- *   ad-hoc string and used context.contact_name with a fallback to the
- *   raw contact ID. When upstream events didn't populate contact_name,
- *   the ping showed:
- *       📱 AGENTIC MESSAGE SENT
- *       👤 wnl6nhVkQ18pylh0dw1g    ← raw GHL contact ID, no name
- *       Channel: SMS | Via: webhook
- *       Rule: AGENTIC_RESPOND_POST_CHATBOT
- *       Message: "..."
- *   Mark surfaced this 2026-05-01 — wanted the contact's real name AND
- *   the LP source / sub-source / rep / disposition / intent / appointment
- *   visible in this notification just like the v2.0 task notifications.
- *
- *   FIX: Mirror the v2.0 task / send_notification pattern.
- *     1. resolveContactInfo(contactId)  — fetches name + phone live
- *        from GHL, falls back to LP if needed. Same helper the rich
- *        notification handlers already use.
- *     2. resolveLPProspectId(contactId) — pulls prospect_id for the
- *        ID line.
- *     3. buildNotificationEnrichment   — assembles LP source +
- *        sub-source (v4.0), rep, disposition, intent score / tier /
- *        barrier, inbound message preview, appointment context.
- *     4. buildRichNotification         — formats the standard context
- *        block (👤 / Contact ID / 💬 / 📋 / 📊 / 📅).
- *   Channel emoji (📱/📧) and agentic-specific metadata (intent / arc /
- *   trust / voice / kb / fast / reason / channel-via / rule) are
- *   appended below the rich block, since buildRichNotification doesn't
- *   know about send-specific fields.
- *
- *   The default 🤖 prefix from buildRichNotification is replaced with
- *   the channel emoji (📱 SMS, 📧 email) to preserve the existing visual
- *   convention. The 🤖 AI-GENERATED label moves into the base message
- *   when the response was generated.
- *
- *   Net result for an SMS that lands during a real LP-tracked conversation:
- *       📱 🤖 AI-GENERATED AGENTIC MESSAGE SENT
- *       👤 Mark Test (954) 508-1512
- *          Contact ID: wnl6nhVkQ18pylh0dw1g | Prospect: 12345
- *       💬 "Hello?" [sms]
- *       📋 Src: Reece ChatBot > Window Estimate Calculator | Rep: Michael Carr | Disp: Be Back
- *       📊 Score: 67 | Tier: warm | Barrier: timing
- *       📅 Window Estimate: 05/05/2026 at 02:00 PM
- *       Channel: SMS | Via: webhook | Rule: AGENTIC_RESPOND_POST_CHATBOT
- *       Intent: RECONNECT | Arc: none | L1 | KB | ⚡FAST
- *       Reason: Lead reconnecting after canceled appointment
- *       Message: "Still here, Mark. Quick question before we get you re..."
- *
- *   When LP data is absent (test contacts, GHL-only leads), the LP
- *   line and intent line are simply omitted — the notification still
- *   shows the resolved name + phone instead of the raw contact ID.
- *
- *   PAIRS WITH:
- *     - enrichment.js v4.0  — split lpSource (parent) and lpSourceDetail
- *       (sub-source) so both render in the 📋 line.
- *     - handlers/tasks.js v2.0  — same buildRichNotification pattern.
- *     - handlers/notifications.js  — same buildRichNotification pattern.
- *
- *   No semantic / guardrail changes — only the notification format.
- *   The actual SMS/email send path is unchanged.
- *
  * v3.5 (2026-05-01) — pause-bot OVERRIDES suppress-automation for agentic sends.
- *   PROBLEM: Guardrail 2 (suppression check) treated suppress-automation
- *   as a hard block, identical to dnc / do-not-contact. But suppress-
- *   automation is a workflow-driven flag (added by AUTOMATION_SUPPRESS_ON_BOOKING
- *   on appointment events, and by other automation rules), not a lead-
- *   driven opt-out. Meanwhile pause-bot is the explicit opt-in to
- *   agentic conversation. The two collided for any contact who books
- *   an appointment then later texts the bot — pause-bot was set, but
- *   suppress-automation blocked all agentic SMS sends.
- *
- *   Surfaced 2026-05-01: contact wnl6nhVkQ18pylh0dw1g had pause-bot
- *   AND suppress-automation. v4.8 auto-reply gate (which only checks
- *   pause-bot) opened. GroupMe got the "🚀 AGENTIC AUTO-REPLY" notice
- *   with the message preview. Phase 2 picked up the action.
- *   executeSendMessage Guardrail 2 saw suppress-automation and short-
- *   circuited with action=send_message_suppressed. The SMS was silently
- *   dropped. From Mark's perspective: the GroupMe notice was a lie.
- *
- *   Production blast radius: AUTOMATION_SUPPRESS_ON_BOOKING fires on
- *   every ghl.appointment_booked event and stamps suppress-automation.
- *   That tag persists. Once stamped, the agentic responder is
- *   permanently unable to message the contact even with pause-bot
- *   present — affects every contact who books then later texts in.
- *
- *   FIX: Split suppression into hard vs soft.
- *     HARD (always blocks):  dnc, do-not-contact
- *                            — represent the lead's own choice;
- *                            pause-bot does NOT override them.
- *     SOFT (overridable):    suppress-automation
- *                            — workflow-driven; if pause-bot is also
- *                            present, the agentic system has been
- *                            explicitly opted in and the soft flag is
- *                            ignored.
- *
- *   Logs the override when it fires so the trail is visible in Railway:
- *     [SendMessage] ⚠️ pause-bot OVERRIDES suppress-automation for
- *       <contactId> — agentic opt-in present, allowing send.
- *
- *   stop-bot is unrelated (handled by Guardrail 3, conversation gate,
- *   and treated as a hard "no conversation at all" — pause-bot does
- *   NOT override stop-bot). No change to stop-bot semantics.
- *   [v3.7 NOTE: stop-bot semantics CHANGED — pause-bot now wins.]
- *
- *   isContactSuppressed (boolean) replaced by checkSuppression which
- *   returns granular state. Distinct `reason` fields surface in the
- *   action result for audit clarity:
- *     hard_suppression_dnc
- *     hard_suppression_do-not-contact
- *     hard_suppression_dnc-sms        (added v3.7)
- *     hard_suppression_stage:dnc      (added v3.7)
- *     contact_suppressed (soft, no pause-bot — preserves existing
- *                         reason string for backward compat with any
- *                         tooling that filters on it)
- *
  * v3.4 (2026-04-30) — Trigger message fallback fix.
- *   PROBLEM: When the rule that fires this handler is gated on
- *   ai.analysis_completed (e.g. AGENTIC_RESPOND_POST_CHATBOT), the
- *   action's event_id points to the analysis event, not the original
- *   ghl.reply_received. The analysis payload only carried
- *   message_preview, not message_text. The fallback chain
- *     context.message_text || context.messageText || context.body
- *       || 'No trigger message available'
- *   resolved to the literal string "No trigger message available",
- *   which the intent classifier matched on the whole-word "no"
- *   keyword → CUSTOMER_STATUS_NEGATIVE → hdl:callback-sales handoff
- *   → silent short-circuit. Surfaced 2026-04-30 with contact
- *   4uaY9wDO6Zz8hjA1DjXd: clear booking intent classified as customer-
- *   status-negative, no AI reply, no GroupMe approval.
- *
- *   FIX: (1) Extend the resolution chain to include message_preview
- *   (paired with message-analyzer v1.5 which now emits full
- *   message_text). (2) When NOTHING resolves, fail fast with a
- *   structured result rather than feeding placeholder text to the
- *   classifier. Better to drop the action and surface the missing-
- *   context bug than to misclassify and silently misroute.
- *
  * v3.3 — CHANNEL-SPECIFIC ROUTING (email threading discovery).
  * v3.2 — Webhook-primary architecture.
  * v3.1 — Short-circuit handoff for compliance gates.
  * v3.0 — Conversation opt-in gate.
- *   - stop-bot  = "do not have a conversation with this lead, period"
- *     [v3.7: pause-bot overrides stop-bot if both present]
- *   - pause-bot = "agentic system may converse with this lead"
- *   - neither   = Conv AI / GHL workflows own the channel
  * v2.1 — Configurable rate limit via SEND_MESSAGE_RATE_LIMIT_MS env var.
  *
  * Guardrails (fail-closed, in order):
@@ -610,6 +380,52 @@ async function getInboundEmailMessageId(contactId) {
 }
 
 /**
+ * v3.11 — Look up the GHL userId of the user who originated the email
+ * thread by finding the most recent OUTBOUND email and returning its
+ * userId. That's the GHL user whose email config sent the message the
+ * lead is now replying to — using their userId on our reply tells GHL
+ * to load the same email config and send from the same address,
+ * regardless of who the contact is currently assigned to.
+ *
+ * Returns the userId string or null on:
+ *   - no conversation for this contact
+ *   - no outbound email messages (e.g. customer-initiated thread)
+ *   - any API error (caller falls back to GHL default — current
+ *     assignedTo user — which is the v3.10 behavior)
+ *
+ * Same shape as getInboundEmailMessageId / getInboundEmailSubject so
+ * future cache layer can wrap all three.
+ */
+async function getThreadOriginatorUserId(contactId) {
+  if (!contactId || !GHL_API_KEY) return null;
+
+  try {
+    const search = await ghlFetch('GET',
+      `/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`);
+    const conversations = Array.isArray(search) ? search : (search?.conversations || []);
+    if (!conversations.length) return null;
+
+    const conversationId = conversations[0].id;
+    const msgData = await ghlFetch('GET',
+      `/conversations/${conversationId}/messages?limit=20`);
+    const messages = msgData?.messages?.messages || msgData?.messages || [];
+    if (!Array.isArray(messages) || messages.length === 0) return null;
+
+    // Newest-first. Find the most recent OUTBOUND email and return its
+    // userId. That's the user who initiated/owns the thread; using their
+    // userId tells GHL to send our reply from the same address.
+    const recentOutboundEmail = messages.find(m =>
+      m.direction === 'outbound' &&
+      (m.messageType === 'TYPE_EMAIL' || m.type === 3)
+    );
+    return recentOutboundEmail?.userId || null;
+  } catch (err) {
+    console.warn(`[SendMessage] getThreadOriginatorUserId failed for ${contactId}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * v3.9 — Look up the SUBJECT of the most recent inbound email for a
  * contact. Used to construct "Re: <subject>" for outbound email replies
  * so the email-client threads them with the original conversation.
@@ -719,6 +535,21 @@ async function getReplyFromAddress(contactId, channel) {
  *   - replyFromEmail                 (mirror of replyFromAddress for Email,
  *                                     null for SMS)
  *   - replyFromAddressSource         (debug — "most_recent_inbound" or "none")
+ *
+ * v3.11 — Payload also now includes (email channel only):
+ *   - replyFromUserId                (the GHL userId who originated the
+ *                                     email thread — most recent OUTBOUND
+ *                                     email's userId; null when no prior
+ *                                     outbound exists, e.g. customer-
+ *                                     initiated thread)
+ *
+ *   Mark's GHL "Send Reply" workflow can use this to temporarily
+ *   reassign the contact to that user before the Send-Email action,
+ *   so the FROM address matches the original sender even when current
+ *   assignedTo has changed. Note: thread continuity in the lead's
+ *   inbox still requires the Conv API path (In-Reply-To headers) —
+ *   the webhook fallback for email gets the right FROM address but
+ *   still creates a new visual thread.
  */
 async function sendViaWebhook(contactId, message, channel, subject, action) {
   if (!GHL_SEND_MESSAGE_WEBHOOK_URL) {
@@ -730,6 +561,17 @@ async function sendViaWebhook(contactId, message, channel, subject, action) {
   // route the reply back through the matching user/number. Failure is
   // non-fatal — null falls back to the workflow's default behavior.
   const replyFromAddress = await getReplyFromAddress(contactId, channel);
+
+  // v3.11 — For email channel, also fetch the userId of the user who
+  // originated the email thread (most recent OUTBOUND email's userId).
+  // Mark's GHL workflow can use this to set contact.assignedTo to the
+  // right user before the Send-Email action runs. SMS doesn't need this
+  // because v3.8's replyFromPhone already locks the number, and SMS
+  // sends carry no thread state.
+  let replyFromUserId = null;
+  if (channel === 'email') {
+    replyFromUserId = await getThreadOriginatorUserId(contactId);
+  }
 
   // v3.8 — channelType in proper case (matches GHL's native TYPE_SMS /
   // TYPE_EMAIL convention). The existing `channel` field is preserved
@@ -757,11 +599,16 @@ async function sendViaWebhook(contactId, message, channel, subject, action) {
     replyFromAddress,
     replyFromPhone: channel === 'sms' ? replyFromAddress : null,
     replyFromEmail: channel === 'email' ? replyFromAddress : null,
+    // v3.11 — userId of the email thread originator. null for SMS or
+    // when no prior outbound email exists.
+    replyFromUserId,
     replyFromAddressSource: replyFromAddress ? 'most_recent_inbound' : 'none',
   };
 
   console.log(`[SendMessage] webhook payload: contact=${contactId} channel=${channelType} ` +
-    `replyFromAddress=${replyFromAddress || 'null'} (source=${replyFromAddress ? 'most_recent_inbound' : 'none'})`);
+    `replyFromAddress=${replyFromAddress || 'null'} ` +
+    `replyFromUserId=${replyFromUserId || 'null'} ` +
+    `(source=${replyFromAddress ? 'most_recent_inbound' : 'none'})`);
 
   const res = await fetch(GHL_SEND_MESSAGE_WEBHOOK_URL, {
     method: 'POST',
@@ -788,6 +635,23 @@ async function sendViaWebhook(contactId, message, channel, subject, action) {
  *
  * Returns { conversationId, messageId } on success, null if no
  * conversation thread exists for this contact.
+ *
+ * v3.11 — For email sends, also sets userId AND emailFrom on the
+ * message body to override GHL's default behavior (which uses the
+ * contact's CURRENT assignedTo user as the sender). This fixes the
+ * bug where reassigning a contact mid-conversation caused agentic
+ * replies to land from the wrong email address, breaking visual
+ * thread continuity in Gmail / iCloud.
+ *
+ *   userId      → preferred for LC-Email / Mailgun (Reece's default
+ *                 email infra with mail.reecewindows.com)
+ *   emailFrom   → preferred for custom email providers (when
+ *                 conversationProviderId is set)
+ *
+ * Setting both is safe — GHL ignores the irrelevant one for the
+ * active provider. When neither helper returns a value (e.g. first
+ * outbound in thread, or API failure), GHL falls back to default
+ * behavior — same as v3.10. No regression.
  */
 async function sendViaConversationsAPI(contactId, message, channel, subject) {
   const searchData = await ghlFetch('GET',
@@ -827,6 +691,33 @@ async function sendViaConversationsAPI(contactId, message, channel, subject) {
       console.log(`[SendMessage] v3.10: threading email reply for ${contactId} via emailMessageId=${inboundEmailMessageId}`);
     } else {
       console.warn(`[SendMessage] v3.10: no inbound email found for ${contactId} — outbound will not have In-Reply-To header (Re: subject is the only threading signal)`);
+    }
+
+    // v3.11: Sender control. Override GHL's default of "use the
+    // contact's currently-assigned user" by passing the user who
+    // originated the thread. Set BOTH userId (LC-Email path) and
+    // emailFrom (custom provider path) — GHL uses whichever applies
+    // to the active email infrastructure; the irrelevant one is
+    // ignored.
+    //
+    // Without this, contact reassignment mid-conversation (e.g.
+    // canvassing → followup → different rep) caused replies to go
+    // out from the new assignee's address — different sender =
+    // visually different thread in the lead's inbox, even with the
+    // v3.10 In-Reply-To headers fixed.
+    const threadOriginatorUserId = await getThreadOriginatorUserId(contactId);
+    const replyFromAddress = await getReplyFromAddress(contactId, 'email');
+
+    if (threadOriginatorUserId) {
+      msgBody.userId = threadOriginatorUserId;
+      console.log(`[SendMessage] v3.11: setting userId=${threadOriginatorUserId} (thread originator's userId) — overrides current assignedTo`);
+    }
+    if (replyFromAddress) {
+      msgBody.emailFrom = replyFromAddress;
+      console.log(`[SendMessage] v3.11: setting emailFrom=${replyFromAddress} (most recent inbound's TO field)`);
+    }
+    if (!threadOriginatorUserId && !replyFromAddress) {
+      console.warn(`[SendMessage] v3.11: no thread originator found for ${contactId} — falling back to GHL default sender (current assignedTo user)`);
     }
 
     // conversationProviderId is REQUIRED for in-thread email reply on
@@ -922,7 +813,7 @@ async function sendWithFallback(contactId, message, channel, subject, action) {
   // Fallback to webhook (will create new thread for email — acceptable last resort)
   if (GHL_SEND_MESSAGE_WEBHOOK_URL) {
     if (channel === 'email') {
-      console.warn(`[SendMessage] Email fallback to webhook for ${contactId} — reply will create new thread, not in-thread`);
+      console.warn(`[SendMessage] Email fallback to webhook for ${contactId} — reply will create new thread, not in-thread (FROM address still corrected via replyFromUserId)`);
     }
     const result = await sendViaWebhook(contactId, message, channel, subject, action);
     return { result, sendMethod: 'webhook_fallback' };
