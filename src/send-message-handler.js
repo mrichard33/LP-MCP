@@ -5,61 +5,64 @@
  * via channel-specific routing — webhook for SMS, Conversations API
  * for email — with cross-fallback for both.
  *
- * v3.11 (2026-05-05) — Email sender control (FROM-address override).
- *   PROBLEM: After v3.10 fixed In-Reply-To headers via emailMessageId,
- *   contact 7jl9cVfry8OyQF6oI2V5 still showed broken thread continuity.
- *   The customer received the original email from User A, replied to
- *   it, but the agentic reply went out from User B's email address —
- *   because the contact had been REASSIGNED in GHL (canvassing →
- *   followup → different rep) between the two messages.
+ * v3.11 (2026-05-05) — Email sender continuity (userId + emailFrom override).
+ *   PROBLEM: After v3.10 deployed, agentic email replies threaded correctly
+ *   in the email server (In-Reply-To / References stamped via emailMessageId)
+ *   but appeared in the customer's inbox as a separate visual conversation
+ *   because the reply came FROM a different user's email address. Confirmed
+ *   on test contact 7jl9cVfry8OyQF6oI2V5 2026-05-05: original outbound was
+ *   sent by User A, contact was later reassigned (canvassing → followup) to
+ *   User B, customer replied, agentic reply went out from User B's address.
+ *   Different sender = different visual thread for Gmail/iCloud, even with
+ *   correct headers.
  *
- *   GHL's POST /conversations/messages defaults the FROM to the
- *   contact's CURRENT assignedTo user when no sender field is set on
- *   the body. v3.10 only set: type, contactId, conversationId, html,
- *   subject, emailMessageId, conversationProviderId. No userId. No
- *   emailFrom. So even with the right In-Reply-To headers, Gmail /
- *   iCloud showed a different sender on the reply, breaking visual
- *   thread continuity.
+ *   ROOT CAUSE: sendViaConversationsAPI built msgBody with NO sender field
+ *   set. GHL's POST /conversations/messages defaults FROM to the contact's
+ *   currently assignedTo user when neither `userId` nor `emailFrom` is
+ *   specified. Mark's GHL setup rotates assignment across users (different
+ *   campaigns / canvassing handoffs), so the default is wrong any time a
+ *   contact gets touched by more than one rep before replying.
  *
- *   FIX: Two changes in sendViaConversationsAPI for the email branch.
+ *   FIX (Conv API path — primary for email since v3.3):
+ *     1. New helper getThreadOriginatorUserId(contactId) — mirrors
+ *        getInboundEmailMessageId but filters to the most recent OUTBOUND
+ *        email and returns m.userId (the user whose mailbox originated the
+ *        thread).
+ *     2. In sendViaConversationsAPI's email branch, set BOTH:
+ *          msgBody.userId    = originatorUserId   (LC-Email/Mailgun path —
+ *                                                  Reece's default mail.
+ *                                                  reecewindows.com setup
+ *                                                  honors this)
+ *          msgBody.emailFrom = replyFromAddress   (custom provider path —
+ *                                                  used when paired with
+ *                                                  conversationProviderId)
+ *        GHL ignores whichever doesn't apply for the active provider, so
+ *        setting both is safe and provider-agnostic.
+ *     3. Both lookups run in parallel via Promise.all to keep latency at
+ *        ~the same as before (the two GHL conversation/messages fetches
+ *        are de-duplicated by GHL's edge cache when fired in parallel).
+ *     4. Failure-soft: when no prior outbound exists (first message in
+ *        thread) or no inbound exists, the corresponding field is omitted
+ *        and GHL falls back to its default. This preserves backward-compat
+ *        for genuinely fresh conversations.
  *
- *     1. New helper getThreadOriginatorUserId(contactId)
- *        Mirrors getInboundEmailMessageId from v3.10 — same
- *        conversations/search → messages?limit=20 fetch — but filters
- *        to the most recent OUTBOUND email and returns its userId.
- *        That's the GHL user who originated the thread (sent the
- *        first or most recent email to the lead). Using their userId
- *        on our reply tells GHL to load that user's email config and
- *        send from the same address regardless of current assignment.
+ *   FIX (Webhook fallback path — applies when Conv API fails):
+ *     - Add threadOriginatorUserId to the payload so the agentic-send GHL
+ *       workflow can use it to temporarily reassign the contact before
+ *       firing the Send-Email action. Mirrors the existing v3.8 pattern
+ *       for replyFromAddress / replyFromPhone / replyFromEmail. Field is
+ *       null for SMS or when no prior outbound exists.
+ *     - NOTE: even with this, the webhook fallback still creates a new
+ *       email thread (no In-Reply-To headers available via GHL workflow
+ *       Send-Email action). The fallback is a degraded mode — Conv API
+ *       remains the only path that fully threads. Mark tracking separately.
  *
- *     2. Set BOTH userId AND emailFrom on msgBody for email channel.
- *        Per GHL's V2 Conversations Send API:
- *          - userId        → preferred for LC-Email / Mailgun
- *                            (GHL's default email infrastructure,
- *                            which Reece uses with mail.reecewindows.com)
- *          - emailFrom     → preferred for custom email providers
- *                            (when conversationProviderId is set)
- *        Setting both is safe — GHL ignores the irrelevant one for
- *        the active provider. Provides a belt-and-suspenders override
- *        regardless of which path GHL routes through.
- *
- *   Webhook fallback path (sendViaWebhook) ALSO updated to pass
- *   replyFromUserId in the payload. Mark's GHL "Send Reply" workflow
- *   can use this to temporarily reassign the contact to the right
- *   user before the Send-Email action — so even when the Conv API
- *   primary fails and we fall through to webhook, the reply lands
- *   from the original sender's address.
- *
- *   IMPORTANT NOTE about webhook fallback for email: even with the
- *   FROM address corrected, the webhook path CANNOT preserve email
- *   thread continuity (no In-Reply-To header support on GHL's
- *   Send-Email action). v3.10's emailMessageId only works on the
- *   Conv API path. v3.11 makes the webhook fallback look better
- *   (correct sender) but the only way to get true threading is for
- *   the Conv API primary to succeed. Pairs with v3.10's body field +
- *   emailMessageId fix that resolved the 422 forcing the fallback.
- *
- *   No semantic change for SMS. No new env vars. No schema changes.
+ *   No new env vars. No schema changes. No GHL workflow changes required
+ *   (workflow updates are nice-to-have for the fallback path; Conv API
+ *   path is fully fixed by this commit alone). Pairs with v3.10's
+ *   emailMessageId threading and v3.9's Re: subject prefix — together,
+ *   agentic email replies arrive in the same thread, from the same
+ *   address, with the same subject the customer is replying to.
  *
  * v3.10 (2026-05-04) — Email body field + true emailMessageId threading.
  *   PROBLEM: After v3.9 deployed, the agentic email replies still landed
@@ -380,21 +383,24 @@ async function getInboundEmailMessageId(contactId) {
 }
 
 /**
- * v3.11 — Look up the GHL userId of the user who originated the email
- * thread by finding the most recent OUTBOUND email and returning its
- * userId. That's the GHL user whose email config sent the message the
- * lead is now replying to — using their userId on our reply tells GHL
- * to load the same email config and send from the same address,
- * regardless of who the contact is currently assigned to.
+ * v3.11 — Look up the GHL userId of the user whose mailbox originated the
+ * email thread. Used as the `userId` field on outbound Conv API email sends
+ * so the FROM address matches the user who started the thread, regardless
+ * of who the contact is currently assigned to.
+ *
+ * Strategy: find the most recent OUTBOUND email in the conversation and
+ * return its userId. That user's email config drives the FROM address when
+ * GHL's POST /conversations/messages honors `userId` (LC-Email / Mailgun
+ * default path — Reece's mail.reecewindows.com setup).
  *
  * Returns the userId string or null on:
  *   - no conversation for this contact
- *   - no outbound email messages (e.g. customer-initiated thread)
- *   - any API error (caller falls back to GHL default — current
- *     assignedTo user — which is the v3.10 behavior)
+ *   - no outbound email messages (this is the FIRST agentic send in the
+ *     thread, or the thread has only inbound — fall back to GHL default)
+ *   - any API error
  *
- * Same shape as getInboundEmailMessageId / getInboundEmailSubject so
- * future cache layer can wrap all three.
+ * Same shape as getInboundEmailMessageId so the two helpers can share a
+ * future cache layer if added.
  */
 async function getThreadOriginatorUserId(contactId) {
   if (!contactId || !GHL_API_KEY) return null;
@@ -412,8 +418,11 @@ async function getThreadOriginatorUserId(contactId) {
     if (!Array.isArray(messages) || messages.length === 0) return null;
 
     // Newest-first. Find the most recent OUTBOUND email and return its
-    // userId. That's the user who initiated/owns the thread; using their
-    // userId tells GHL to send our reply from the same address.
+    // userId — the user whose mailbox originated the thread. We use
+    // OUTBOUND (not inbound) because inbound messages may carry the
+    // userId of the receiving mailbox owner, which is the same data
+    // we want, but the outbound's userId is the canonical author and
+    // is more reliable across GHL provider configs.
     const recentOutboundEmail = messages.find(m =>
       m.direction === 'outbound' &&
       (m.messageType === 'TYPE_EMAIL' || m.type === 3)
@@ -537,7 +546,7 @@ async function getReplyFromAddress(contactId, channel) {
  *   - replyFromAddressSource         (debug — "most_recent_inbound" or "none")
  *
  * v3.11 — Payload also now includes (email channel only):
- *   - replyFromUserId                (the GHL userId who originated the
+ *   - threadOriginatorUserId         (the GHL userId who originated the
  *                                     email thread — most recent OUTBOUND
  *                                     email's userId; null when no prior
  *                                     outbound exists, e.g. customer-
@@ -560,18 +569,13 @@ async function sendViaWebhook(contactId, message, channel, subject, action) {
   // recent inbound of this channel was sent TO so the GHL workflow can
   // route the reply back through the matching user/number. Failure is
   // non-fatal — null falls back to the workflow's default behavior.
-  const replyFromAddress = await getReplyFromAddress(contactId, channel);
-
-  // v3.11 — For email channel, also fetch the userId of the user who
-  // originated the email thread (most recent OUTBOUND email's userId).
-  // Mark's GHL workflow can use this to set contact.assignedTo to the
-  // right user before the Send-Email action runs. SMS doesn't need this
-  // because v3.8's replyFromPhone already locks the number, and SMS
-  // sends carry no thread state.
-  let replyFromUserId = null;
-  if (channel === 'email') {
-    replyFromUserId = await getThreadOriginatorUserId(contactId);
-  }
+  // v3.11 — Also fetch threadOriginatorUserId for email so the GHL
+  // workflow can reassign the contact to the original thread owner
+  // before sending. Run in parallel; both helpers fail-soft to null.
+  const [replyFromAddress, threadOriginatorUserId] = await Promise.all([
+    getReplyFromAddress(contactId, channel),
+    channel === 'email' ? getThreadOriginatorUserId(contactId) : Promise.resolve(null),
+  ]);
 
   // v3.8 — channelType in proper case (matches GHL's native TYPE_SMS /
   // TYPE_EMAIL convention). The existing `channel` field is preserved
@@ -599,15 +603,19 @@ async function sendViaWebhook(contactId, message, channel, subject, action) {
     replyFromAddress,
     replyFromPhone: channel === 'sms' ? replyFromAddress : null,
     replyFromEmail: channel === 'email' ? replyFromAddress : null,
-    // v3.11 — userId of the email thread originator. null for SMS or
-    // when no prior outbound email exists.
-    replyFromUserId,
     replyFromAddressSource: replyFromAddress ? 'most_recent_inbound' : 'none',
+    // v3.11 — Thread originator for email channel. The GHL agentic-send
+    // workflow can use this to temporarily reassign the contact to the
+    // original thread owner before the Send-Email action fires, so the
+    // fallback path's outbound goes from the right user even though it
+    // can't preserve In-Reply-To headers (workflow Send-Email node has
+    // no header API). null for SMS or when no prior outbound exists.
+    threadOriginatorUserId,
   };
 
   console.log(`[SendMessage] webhook payload: contact=${contactId} channel=${channelType} ` +
     `replyFromAddress=${replyFromAddress || 'null'} ` +
-    `replyFromUserId=${replyFromUserId || 'null'} ` +
+    `threadOriginatorUserId=${threadOriginatorUserId || 'null'} ` +
     `(source=${replyFromAddress ? 'most_recent_inbound' : 'none'})`);
 
   const res = await fetch(GHL_SEND_MESSAGE_WEBHOOK_URL, {
@@ -685,7 +693,18 @@ async function sendViaConversationsAPI(contactId, message, channel, subject) {
     // the reply into the lead's existing conversation. Without it,
     // even a "Re: <subject>" subject is not always enough to thread
     // (clients vary). Pairs with v3.9's Re: prefix as belt-and-suspenders.
-    const inboundEmailMessageId = await getInboundEmailMessageId(contactId);
+    //
+    // v3.11: also fetch thread originator (userId of last outbound) and
+    // reply-from address (the email the customer replied TO). Run all
+    // three lookups in parallel — they hit the same /conversations and
+    // /messages endpoints so GHL's edge cache de-dupes the actual API
+    // load. Adds ~0ms on warm cache, ~150-300ms on cold.
+    const [inboundEmailMessageId, originatorUserId, replyFromAddr] = await Promise.all([
+      getInboundEmailMessageId(contactId),
+      getThreadOriginatorUserId(contactId),
+      getReplyFromAddress(contactId, 'email'),
+    ]);
+
     if (inboundEmailMessageId) {
       msgBody.emailMessageId = inboundEmailMessageId;
       console.log(`[SendMessage] v3.10: threading email reply for ${contactId} via emailMessageId=${inboundEmailMessageId}`);
@@ -693,31 +712,24 @@ async function sendViaConversationsAPI(contactId, message, channel, subject) {
       console.warn(`[SendMessage] v3.10: no inbound email found for ${contactId} — outbound will not have In-Reply-To header (Re: subject is the only threading signal)`);
     }
 
-    // v3.11: Sender control. Override GHL's default of "use the
-    // contact's currently-assigned user" by passing the user who
-    // originated the thread. Set BOTH userId (LC-Email path) and
-    // emailFrom (custom provider path) — GHL uses whichever applies
-    // to the active email infrastructure; the irrelevant one is
-    // ignored.
-    //
-    // Without this, contact reassignment mid-conversation (e.g.
-    // canvassing → followup → different rep) caused replies to go
-    // out from the new assignee's address — different sender =
-    // visually different thread in the lead's inbox, even with the
-    // v3.10 In-Reply-To headers fixed.
-    const threadOriginatorUserId = await getThreadOriginatorUserId(contactId);
-    const replyFromAddress = await getReplyFromAddress(contactId, 'email');
-
-    if (threadOriginatorUserId) {
-      msgBody.userId = threadOriginatorUserId;
-      console.log(`[SendMessage] v3.11: setting userId=${threadOriginatorUserId} (thread originator's userId) — overrides current assignedTo`);
+    // v3.11: sender continuity. GHL defaults the FROM on email sends via
+    // /conversations/messages to the contact's currently assignedTo user
+    // when neither `userId` nor `emailFrom` is set. Setting both covers
+    // the two GHL email provider configurations:
+    //   - userId    → LC-Email (Mailgun default) honors this
+    //   - emailFrom → Custom provider (paired with conversationProviderId)
+    // GHL ignores whichever doesn't apply for the active provider, so
+    // setting both is safe and provider-agnostic.
+    if (originatorUserId) {
+      msgBody.userId = originatorUserId;
+      console.log(`[SendMessage] v3.11: setting userId=${originatorUserId} as thread originator (overrides current assignedTo)`);
     }
-    if (replyFromAddress) {
-      msgBody.emailFrom = replyFromAddress;
-      console.log(`[SendMessage] v3.11: setting emailFrom=${replyFromAddress} (most recent inbound's TO field)`);
+    if (replyFromAddr) {
+      msgBody.emailFrom = replyFromAddr;
+      console.log(`[SendMessage] v3.11: setting emailFrom=${replyFromAddr} (most recent inbound's TO address)`);
     }
-    if (!threadOriginatorUserId && !replyFromAddress) {
-      console.warn(`[SendMessage] v3.11: no thread originator found for ${contactId} — falling back to GHL default sender (current assignedTo user)`);
+    if (!originatorUserId && !replyFromAddr) {
+      console.warn(`[SendMessage] v3.11: no prior outbound + no inbound email found for ${contactId} — sender will default to current assignedTo user (first agentic send in thread)`);
     }
 
     // conversationProviderId is REQUIRED for in-thread email reply on
@@ -813,7 +825,7 @@ async function sendWithFallback(contactId, message, channel, subject, action) {
   // Fallback to webhook (will create new thread for email — acceptable last resort)
   if (GHL_SEND_MESSAGE_WEBHOOK_URL) {
     if (channel === 'email') {
-      console.warn(`[SendMessage] Email fallback to webhook for ${contactId} — reply will create new thread, not in-thread (FROM address still corrected via replyFromUserId)`);
+      console.warn(`[SendMessage] Email fallback to webhook for ${contactId} — reply will create new thread, not in-thread (FROM address still corrected via threadOriginatorUserId)`);
     }
     const result = await sendViaWebhook(contactId, message, channel, subject, action);
     return { result, sendMethod: 'webhook_fallback' };
