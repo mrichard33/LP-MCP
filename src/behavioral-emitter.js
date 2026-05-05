@@ -14,6 +14,28 @@
  * 
  * Security: All endpoints validate GHL_WEBHOOK_SECRET.
  *
+ * v2.9 (2026-05-05) — Defensive customData parsing in handleWorkflowCompleted.
+ *   PROBLEM: GHL outbound custom-webhooks nest user-defined Custom Data
+ *   fields inside a `customData` object while auto-populating contactId
+ *   at the top level. handleWorkflowCompleted predated entry-event-handler
+ *   v1.1's defensive parsing fix and was reading body.workflowId directly
+ *   — always undefined for the 13 Tier 1 content-completion webhooks.
+ *   Result: every ghl.workflow_completed event in system_events had
+ *   payload.workflow_id=null and event_subtype=null, making the Phase 2
+ *   STAGE_*_ROUTE_* routing rules (which pattern-match on payload.workflow_id)
+ *   silently inert. Confirmed via system_events 19636/19637/19638 on
+ *   2026-05-05 around 00:05-00:10 UTC — three organic completions, all
+ *   with workflow_id=null and action_taken='no_matching_rules'.
+ *
+ *   FIX: Pull contactId/workflowId/workflowName from top-level OR
+ *   customData (mirrors entry-event-handler.js v1.1). contactId still
+ *   resolves at top level for GHL auto-populated webhooks; workflowId
+ *   and workflowName now resolve from the customData nest.
+ *
+ *   No behavioral change for AGENTIC_EVENT_MAP markers (handoff_started/
+ *   handoff_ended) — those workflows already configure customData
+ *   correctly, the receiver was just not reading the nested location.
+ *
  * v2.8 (2026-05-04) — Thread channel through the reply buffer.
  *   PROBLEM: v2.7's reply buffer (scheduleBufferedPipeline →
  *   triggerAgenticPipeline) is a third caller path to analyzeMessage
@@ -650,9 +672,21 @@ const AGENTIC_EVENT_MAP = {
 
 async function handleWorkflowCompleted(req, res) {
   const body = req.body || {};
-  const contactId = body.contactId || body.contact_id || null;
-  const workflowId = body.workflowId || body.workflow_id || null;
-  const workflowName = body.workflowName || body.workflow_name || null;
+  // GHL outbound custom-webhooks auto-populate contactId at the top
+  // level but NEST user-defined Custom Data fields (workflowId,
+  // workflowName) inside a `customData` object. See entry-event-handler.js
+  // v1.1 for the canonical defensive-parsing pattern. Without the
+  // customData fallback, body.workflowId is always undefined and every
+  // ghl.workflow_completed event lands with payload.workflow_id=null,
+  // breaking any rule that pattern-matches on workflow_id (Phase 2
+  // STAGE_*_ROUTE_* rules in particular).
+  const customData = (body.customData || body.custom_data || body.customValues || {}) || {};
+  const contactId = body.contactId || body.contact_id
+    || customData.contactId || customData.contact_id || null;
+  const workflowId = body.workflowId || body.workflow_id
+    || customData.workflowId || customData.workflow_id || null;
+  const workflowName = body.workflowName || body.workflow_name
+    || customData.workflowName || customData.workflow_name || null;
 
   if (!contactId) return res.status(400).json({ error: 'Missing contactId' });
 
