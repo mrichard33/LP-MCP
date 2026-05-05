@@ -3,6 +3,51 @@
  *
  * Agentic Responder intelligence core.
  *
+ * v2.7.10 — 2026-05-05. AUTHORITATIVE ESTIMATE BLOCK + ESTIMATE QUOTING EXCEPTION.
+ *   PROBLEM: On test contact 7jl9cVfry8OyQF6oI2V5, the agentic email reply
+ *   referenced "$36,000 estimate in their hand" — but the actual GHL
+ *   custom field `Estimate Total` was $15,775.17. The AI was using data
+ *   in the prompt to ground its reply (good — that's the whole design),
+ *   but the data wasn't accurate (bad). Investigation traced the $36k to
+ *   an LP rep note containing a ballpark figure, dropped verbatim into
+ *   the prompt under the "LP Rep Notes (most reliable intelligence)"
+ *   header. The AI treated the rep note as an authoritative source.
+ *
+ *   The system prompt's HARD PROHIBITION "Never quote prices or estimates"
+ *   is too blunt — it doesn't account for cases where the contact record
+ *   has a real, verified estimate that the bot SHOULD reference if it
+ *   needs to reference any number at all.
+ *
+ *   FIX: Pair with context-builder.js v2.6 which exposes the customer's
+ *   actual Estimate Total + Window Count as `context.estimate.{total,
+ *   window_count, has_data}`. Two changes here:
+ *
+ *     1. PROMPT BUILDER — when context.estimate.has_data is true, inject
+ *        an AUTHORITATIVE block ABOVE the LP rep notes section. The block
+ *        formats the dollar amount as USD currency (Intl.NumberFormat),
+ *        renders the window count as an integer, and includes explicit
+ *        framing telling the AI: "if you reference a number, use ONLY
+ *        the figures in this block — never from rep notes, conversation
+ *        history, or your own calculations." Position above rep notes
+ *        is intentional — establishes authority before the rep-note
+ *        "most reliable intelligence" framing tries to claim it.
+ *
+ *     2. SYSTEM PROMPT — replace the blunt "Never quote prices or
+ *        estimates" prohibition with a conditional: "Never quote prices
+ *        or estimates EXCEPT figures present in CUSTOMER'S ACTUAL
+ *        ESTIMATE block. If that block is absent, the prohibition holds
+ *        absolutely." The block is only injected when the field is
+ *        actually populated, so absence == prohibition holds — the AI
+ *        gets a clean signal either way.
+ *
+ *   When context.estimate.has_data is FALSE (most contacts don't have
+ *   the calculator field populated), no block is injected and the AI
+ *   falls back to the prohibition. Existing behavior preserved for
+ *   non-calculator-entry leads.
+ *
+ *   No new env vars, no schema changes. Pairs with context-builder v2.6
+ *   which Mark already pushed.
+ *
  * v2.7.9 — 2026-05-04. PATH B / RESCHEDULE PATH B VERBAL TEMPLATE UPDATE.
  *   Mark's directive 2026-05-04: GHL workflows now own all reminder /
  *   confirmation sends post-booking. The bot's PATH B verbal should not
@@ -651,7 +696,7 @@ CANCELLATION:
 ❌ Treating "I need to cancel" as a STOP / opt-out (it's about ONE appointment, not all messaging)
 
 ═══════ HARD PROHIBITIONS ═══════
-- Never quote prices or estimates
+- Never quote prices or estimates EXCEPT figures present in the CUSTOMER'S ACTUAL ESTIMATE (AUTHORITATIVE) block when that block is included in the user prompt. If the block is absent, the prohibition holds absolutely — do not quote, infer, or compute any dollar figure or window count from rep notes, conversation history, training-data priors, or any other source. When the block is present, you may reference the figures in it — and ONLY those figures.
 - Never make promises about discounts or deals
 - Never invent statistics or proof points
 - Never invent assets/materials/resources
@@ -855,6 +900,35 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     const stageStr = context.pipeline.stage_name || context.pipeline.stage_id || 'unknown';
     const pipeStr = context.pipeline.pipeline_name || 'unknown';
     parts.push(`\nPIPELINE: ${pipeStr} | Stage: ${stageStr} | Status: ${context.pipeline.status} | Days in stage: ${context.pipeline.days_in_stage}`);
+  }
+
+  // v2.7.10: AUTHORITATIVE customer estimate block. Injected ABOVE the
+  // LP CRM section so the real figure establishes authority before any
+  // rep notes (which are framed as "most reliable intelligence" and
+  // historically caused the AI to quote stale ballpark numbers from
+  // free-text notes — e.g. "$36,000" hallucination on contact
+  // 7jl9cVfry8OyQF6oI2V5 2026-05-05).
+  //
+  // Only renders when context.estimate.has_data is true — i.e. the
+  // contact has at least one of Estimate Total / Window Count populated
+  // in GHL. When absent, no block is rendered and the system-prompt
+  // HARD PROHIBITION on quoting prices/estimates holds absolutely.
+  if (context.estimate?.has_data) {
+    parts.push(`\n═══════ CUSTOMER'S ACTUAL ESTIMATE (AUTHORITATIVE — overrides any figure in rep notes / conversation history) ═══════`);
+    if (context.estimate.total !== null && context.estimate.total !== undefined) {
+      const formattedTotal = new Intl.NumberFormat('en-US', {
+        style: 'currency',
+        currency: 'USD',
+        maximumFractionDigits: 2,
+      }).format(context.estimate.total);
+      parts.push(`Estimate Total (from Window Estimate Calculator): ${formattedTotal}`);
+    }
+    if (context.estimate.window_count !== null && context.estimate.window_count !== undefined) {
+      parts.push(`Window Count: ${context.estimate.window_count}`);
+    }
+    parts.push(`If you reference a dollar figure or window count in your reply, use ONLY the numbers in this block. NEVER quote a number from rep notes, prior conversation history, your own calculations, or training-data priors.`);
+    parts.push(`Per HARD PROHIBITIONS: never quote prices/estimates EXCEPT figures in this block. This block is the ONLY authoritative source. Default behavior remains: do not quote unless directly relevant to the lead's question.`);
+    parts.push(`═══════ END CUSTOMER'S ACTUAL ESTIMATE ═══════`);
   }
 
   if (context.lp?.matched || context.lp?.disposition) {
