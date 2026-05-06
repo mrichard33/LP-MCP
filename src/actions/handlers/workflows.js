@@ -31,6 +31,12 @@
  *   'json' → application/json. Use only when the destination explicitly
  *      requires JSON (non-GHL targets, future integrations).
  *
+ * v1.3 — Phase 2 of Workflow Registry rollout. Logs and result objects now
+ *        include canonical_code/canonical_name when present in
+ *        action_payload (set by agent_rules post-Phase 2.1). Legacy
+ *        workflow_id and workflow_name still respected for backward
+ *        compatibility — registry annotations are additive.
+ *
  * v1.2 — Form-encoded as default body format for Route B (matches GHL
  *        inbound webhook standard at Reece). Optional 'json' override.
  *
@@ -61,12 +67,33 @@ function buildFormBody(payload) {
   return params.toString();
 }
 
+/**
+ * Build a human-readable workflow label for logs and result objects.
+ * Prefers canonical_code (the registry-stable identifier) over the
+ * legacy workflow_name. Falls back gracefully when neither is present.
+ *
+ * Phase 2 of the Workflow Registry rollout: agent_rules action_template
+ * payloads now annotate canonical_code alongside workflow_id, so the
+ * Action Executor speaks canonical codes wherever possible.
+ */
+function buildLogLabel(payload, fallback) {
+  const code = payload.canonical_code;
+  const cname = payload.canonical_name;
+  const legacy = payload.workflow_name;
+  if (code && cname) return `${cname}`;
+  if (code) return `${code}`;
+  if (legacy) return legacy;
+  return fallback || 'unknown';
+}
+
 export async function executeAddToWorkflow(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
   const wfId = payload.workflow_id;
   const webhookUrl = payload.webhook_url;
-  const wfName = payload.workflow_name || wfId || webhookUrl || 'unknown';
+  const canonicalCode = payload.canonical_code || null;
+  const canonicalName = payload.canonical_name || null;
+  const wfLabel = buildLogLabel(payload, wfId || webhookUrl);
   const format = (payload.format || 'form').toLowerCase();
 
   if (!contactId) throw new Error('Missing contactId');
@@ -103,12 +130,14 @@ export async function executeAddToWorkflow(action) {
       const text = await res.text().catch(() => '');
       throw new Error(`Inbound webhook POST → ${res.status}: ${text.slice(0, 200)}`);
     }
-    console.log(`[ActionExecutor] ✅ Route B (${format}): Contact ${contactId} POSTed to ${wfName}`);
+    console.log(`[ActionExecutor] ✅ Route B (${format}): Contact ${contactId} POSTed to ${wfLabel}`);
     return {
       action: 'added_to_workflow_via_webhook',
       contact_id: contactId,
       webhook_url: webhookUrl,
-      workflow_name: wfName,
+      workflow_name: payload.workflow_name || null,
+      canonical_code: canonicalCode,
+      canonical_name: canonicalName,
       route: 'B',
       format,
     };
@@ -117,24 +146,38 @@ export async function executeAddToWorkflow(action) {
   // ── Route A: GHL API enrollment (default) ─────────────────────
   if (!wfId) throw new Error('Missing workflow_id (or webhook_url) in action payload');
   await ghlFetch('POST', `/contacts/${contactId}/workflow/${wfId}`, {});
-  console.log(`[ActionExecutor] ✅ Route A: Contact ${contactId} added to workflow: ${wfName} (${wfId})`);
+  console.log(`[ActionExecutor] ✅ Route A: Contact ${contactId} added to workflow: ${wfLabel} (${wfId})`);
   return {
     action: 'added_to_workflow',
     contact_id: contactId,
     workflow_id: wfId,
-    workflow_name: wfName,
+    workflow_name: payload.workflow_name || null,
+    canonical_code: canonicalCode,
+    canonical_name: canonicalName,
     route: 'A',
   };
 }
 
 export async function executeRemoveFromWorkflow(action) {
   const contactId = action.target_id;
-  if (action.action_payload?.remove_all) {
+  const payload = action.action_payload || {};
+  if (payload.remove_all) {
     await ghlFetch('POST', `/contacts/${contactId}/workflow/${REMOVE_ALL_MARKETING_WF}`, {});
     return { action: 'added_to_remove_all_workflow', contact_id: contactId };
   }
-  const wfId = action.action_payload?.workflow_id;
+  const wfId = payload.workflow_id;
+  const canonicalCode = payload.canonical_code || null;
+  const canonicalName = payload.canonical_name || null;
+  const wfLabel = buildLogLabel(payload, wfId);
   if (!wfId) throw new Error('Missing workflow_id');
   await ghlFetch('DELETE', `/contacts/${contactId}/workflow/${wfId}`);
-  return { action: 'removed', contact_id: contactId, workflow_id: wfId };
+  console.log(`[ActionExecutor] ✅ Removed contact ${contactId} from workflow: ${wfLabel} (${wfId})`);
+  return {
+    action: 'removed',
+    contact_id: contactId,
+    workflow_id: wfId,
+    workflow_name: payload.workflow_name || null,
+    canonical_code: canonicalCode,
+    canonical_name: canonicalName,
+  };
 }
