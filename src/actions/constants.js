@@ -13,33 +13,91 @@ export const PIPELINE_IDS = {
   P3: '1jIWe4Ad04oJtYE9UuXq',
 };
 
+/**
+ * STAGE_MAP — canonical name → stageId
+ *
+ * After the 2026-05-06 Antifragile rename, both canonical and legacy keys
+ * resolve to the same stable stageIds. Use canonical names for new rules.
+ *
+ * P1 zone framework: TOFU = entry, MOFU = trust-building, BOFU = conversion,
+ * SOFU = side-funnel recovery. Sale Recorded is the BOFU terminal.
+ */
 export const STAGE_MAP = {
+  // ============================================================
+  // P1 — Antifragile Buyer Activation Pipeline (canonical)
+  // ============================================================
+  // TOFU
   'Lead Captured':                       '793f72f8-08b3-4d0a-9227-a646f1fdc7f6',
   'High-Intent Qualified':               '0afdc1bc-2859-4696-ab13-07f8c59e457e',
+  'Re-engagement':                       '9a3fec61-4057-4b30-bb23-5b5f57702d4d',
+  // MOFU
+  'Indoctrination':                      '67f50407-f004-47b3-ad70-83e0eccbe2d1',
+  'Solution Education':                  '538d9a8e-4b38-4331-9711-87f40a6dd4ef',
+  'Solution Pitch':                      'a75f34d2-b38d-4edd-ac98-4a89304be71c',
+  // BOFU
+  'Appointment Booked':                  '79ab10fd-5294-4330-b4ac-91b2df7c7d3a',
+  'Appointment Completed':               '656c8446-da9b-4c97-add8-ba50d8319b84',
+  'Proposal Delivered':                  '10776799-ee76-409f-a630-9c496e5d708e',
+  'Sale Recorded':                       '2f7396e6-c51f-41f8-85f2-c2896733889f',
+  // SOFU
+  'Reactivation':                        '8a17a6ab-56ff-47b2-9c61-77b8ded7e479',
+  'Long-Term Hold':                      '36ccbca0-c57f-466a-bd66-c7aa2a91e79d',
+
+  // P1 — Legacy aliases (do not use for new rules)
+  // ⚠ 'Re-Engagement' (capital E + hyphen) maps to the OLD stage 5 entropy
+  //   bucket which is now labeled 'Solution Pitch'. The canonical
+  //   'Re-engagement' (lowercase e) is at stageId 9a3fec61. Rules using
+  //   'Re-Engagement' continue routing to Solution Pitch — this is the
+  //   bug being fixed in the Phase B Pass 2 SQL canonicalization.
   'Indoctrination / Short Nurture':      '67f50407-f004-47b3-ad70-83e0eccbe2d1',
   'Active Nurture':                      '538d9a8e-4b38-4331-9711-87f40a6dd4ef',
   'Re-Engagement':                       'a75f34d2-b38d-4edd-ac98-4a89304be71c',
   'Conversion Sequence':                 '79ab10fd-5294-4330-b4ac-91b2df7c7d3a',
-  'Appointment Completed':               '656c8446-da9b-4c97-add8-ba50d8319b84',
   'Proposal / Estimate Delivered':       '10776799-ee76-409f-a630-9c496e5d708e',
   'Unresponsive':                        '9a3fec61-4057-4b30-bb23-5b5f57702d4d',
-  'Reactivation':                        '8a17a6ab-56ff-47b2-9c61-77b8ded7e479',
   'Long Term Nurture':                   '36ccbca0-c57f-466a-bd66-c7aa2a91e79d',
   'Closed Won':                          '2f7396e6-c51f-41f8-85f2-c2896733889f',
-  'Closed Won (Contract Signed)':        'fec39f2e-ba39-4536-95b2-bbac7ca6c454',
-  'Financing Pending / Document Collection': 'b7fc445c-a969-42b1-9a7a-eda5c89f25a5',
+  // catches the previously-broken W11_1_REROUTE_LAPSED_* rules
+  '11. Long Term Nurture':               '36ccbca0-c57f-466a-bd66-c7aa2a91e79d',
+
+  // ============================================================
+  // P2 — Client Lifecycle Pipeline (canonical)
+  // ============================================================
+  // Sale & Setup
+  'Contract Signed':                     'fec39f2e-ba39-4536-95b2-bbac7ca6c454',
+  'Financing Pending':                   'b7fc445c-a969-42b1-9a7a-eda5c89f25a5',
+  // Build Authorization
   'Financing Approved':                  '375089e1-aaa5-429f-8c4c-5e01058fa8f8',
-  'HOA / Permit In Progress':            '561f35fe-3632-40e9-bf0d-b9061bdf2589',
-  'Production / Manufacturing':          '6b89bc8d-067a-41fb-a76c-fc0c9feaaf92',
+  'Permitting & HOA':                    '561f35fe-3632-40e9-bf0d-b9061bdf2589',
+  // Build Execution
+  'In Production':                       '6b89bc8d-067a-41fb-a76c-fc0c9feaaf92',
   'Install Scheduled':                   'd852ba71-c6f5-422b-9c74-33b6036c69a5',
   'Install Completed':                   '5fc94c74-d136-481e-b8ca-2200817111af',
-  'Referral & Expansion Opportunity':    '053a0020-0f96-4a22-8717-8814c3ca1ff8',
+  // Customer Lifecycle
+  'Referral & Expansion':                '053a0020-0f96-4a22-8717-8814c3ca1ff8',
+
+  // P2 — Legacy aliases
+  'Closed Won (Contract Signed)':            'fec39f2e-ba39-4536-95b2-bbac7ca6c454',
+  'Financing Pending / Document Collection': 'b7fc445c-a969-42b1-9a7a-eda5c89f25a5',
+  'HOA / Permit In Progress':                '561f35fe-3632-40e9-bf0d-b9061bdf2589',
+  'Production / Manufacturing':              '6b89bc8d-067a-41fb-a76c-fc0c9feaaf92',
+  'Referral & Expansion Opportunity':        '053a0020-0f96-4a22-8717-8814c3ca1ff8',
+
+  // ============================================================
+  // P3 — Recycle, Lost, Deferred & Future Monetization (canonical)
+  // ============================================================
+  // Recovery
+  'Deferred (Timing)':                   '3b786609-dec8-411f-9318-8b63778aa4cb',
+  'Not Interested (Cooling)':            'e0bde70a-f32f-4b6d-88b2-be0c89c46852',
+  'Reactivation Queue':                  'fda5f000-19a7-420f-935a-f1f2de0c7675',
+  // Terminal
+  'Bad Fit / Wrong Home':                'f9cd1a23-a6f9-452c-b129-c47d5a14a6bd',
+  'Hard Disqualified':                   '6194a841-8f59-4164-adee-dc0bd99510dc',
+  'Do Not Contact':                      '5f332652-b8c1-4a67-ba30-dc3450a3e039',
+
+  // P3 — Legacy aliases
   'Deferred / Timing':                   '3b786609-dec8-411f-9318-8b63778aa4cb',
   'Not Interested (Now)':                'e0bde70a-f32f-4b6d-88b2-be0c89c46852',
-  'Bad Fit / Wrong Home':                'f9cd1a23-a6f9-452c-b129-c47d5a14a6bd',
-  'Do Not Contact':                      '5f332652-b8c1-4a67-ba30-dc3450a3e039',
-  'Hard Disqualified':                   '6194a841-8f59-4164-adee-dc0bd99510dc',
-  'Reactivation Queue':                  'fda5f000-19a7-420f-935a-f1f2de0c7675',
 };
 
 export const CALENDAR_MAP = {
