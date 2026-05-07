@@ -13,6 +13,24 @@
  * Output: Structured assessment written to lead_intelligence table
  *         + ai.analysis_completed event emitted for Decision Engine.
  *
+ * v1.9 (2026-05-07) — priority_lane sort in analyzePendingReplies.
+ *   PROBLEM: analyzePendingReplies fetched pending ghl.reply_received
+ *   events ordered by `priority` (text). Postgres sorts text alphabetically
+ *   ('critical' < 'high' < 'low' < 'normal'), so 'normal'-priority events
+ *   sort LAST. Same starvation pathology as decision-engine.js v2.14
+ *   (see that file's header for the full incident write-up — 392 bulk
+ *   handoff webhooks at 22:43 starved Mark Test's normal-priority reply).
+ *   ghl.reply_received events are typically priority='high' so the
+ *   alphabetical bug rarely surfaced here in practice, but the principle
+ *   is the same and consistency across the two pull queries is worth more
+ *   than waiting for a second incident to prove it.
+ *
+ *   FIX: Order by priority_lane (int) ASC instead of priority (text) ASC.
+ *   priority_lane is filled by trg_system_events_default_priority_lane
+ *   (sql/021_event_priority_lanes.sql) on every system_events insert.
+ *   Pairs with decision-engine.js v2.14 which makes the same change to
+ *   processEvents.
+ *
  * v1.8 (2026-05-04) — Atomic dedup at analyzeMessage entry.
  *   PROBLEM: markAnalyzed() ran at the END of analyzeMessage, after a
  *   ~4-second Claude API call. The dedup cache check (wasRecentlyAnalyzed)
@@ -743,7 +761,9 @@ export async function analyzePendingReplies({ limit = 10 } = {}) {
     .eq('event_type', 'ghl.reply_received')
     .eq('processed', false)
     .in('event_subtype', ['pending_analysis'])
-    .order('priority', { ascending: true })
+    // v1.9: order by priority_lane (int) — see header doc block. Replaces
+    // the alphabetical text sort that left 'normal' events behind 'high'.
+    .order('priority_lane', { ascending: true })
     .order('created_at', { ascending: true })
     .limit(limit);
 
