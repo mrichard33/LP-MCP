@@ -3,6 +3,39 @@
  *
  * The brain of the agentic system.
  *
+ * v2.14 — 2026-05-07. priority_lane sort to prevent bulk-event starvation.
+ *   PROBLEM: processEvents fetched pending system_events ordered by
+ *   `priority` (text). Postgres sorts text alphabetically:
+ *     'critical' < 'high' < 'low' < 'normal'
+ *   so 'normal' sorted LAST. With a bulk webhook spike (e.g. 392
+ *   agentic.handoff_started events fired in 11 seconds when 348
+ *   contacts were bulk-tagged with agentic-active in GHL), the 50-
+ *   event cron limit drained the high-priority backlog first and a
+ *   single 'normal'-priority ai.analysis_completed event for a real
+ *   customer reply could wait ~50 minutes for processing. A live
+ *   conversation cannot tolerate that latency — agentic responses
+ *   need to be near-instant.
+ *
+ *   FIX: sql/021_event_priority_lanes.sql adds an int priority_lane
+ *   column with a BEFORE INSERT trigger that assigns lanes:
+ *      0 — explicit critical
+ *      5 — ai.* events (live conversation analysis)
+ *     10 — explicit high
+ *    100 — default
+ *    200 — explicit low
+ *   processEvents now orders by priority_lane ASC, so AI events get
+ *   processed ahead of any number of bulk webhook events regardless
+ *   of webhook spike volume. The in-JS sort that ran AFTER the SQL
+ *   LIMIT (and was therefore powerless to fix the wrong-batch
+ *   problem) is updated to also use priority_lane, with a fallback
+ *   to deriving the lane from the priority text field for legacy
+ *   rows that pre-date the migration.
+ *
+ *   Pairs with message-analyzer.js v1.9 which updates
+ *   analyzePendingReplies to use priority_lane on the same
+ *   principle (ghl.reply_received events live behind the same
+ *   queue and need the same fairness guarantee).
+ *
  * v2.13 — 2026-05-04. Channel-aware send_message action creation.
  *   PROBLEM: The AGENTIC_RESPOND_POST_CHATBOT rule template hardcodes
  *   "channel": "sms" in its action_template params. createActionsFromRule
@@ -166,6 +199,19 @@ function isBehavioralRule(ruleKey) {
 function isLpDispRule(ruleKey) {
   if (!ruleKey) return false;
   return ruleKey.startsWith(LP_DISP_PREFIX);
+}
+
+// v2.14: Lane fallback for legacy rows missing priority_lane. Mirrors the
+// same logic the BEFORE INSERT trigger uses (sql/021_event_priority_lanes.sql)
+// so SQL and JS sort orders agree even on rows inserted before the migration
+// applied. Should be a no-op after the backfill UPDATE in 021 sets every
+// pre-existing row's priority_lane.
+function laneFromPriorityText(event) {
+  if (event.priority === 'critical') return 0;
+  if (typeof event.event_type === 'string' && event.event_type.startsWith('ai.')) return 5;
+  if (event.priority === 'high') return 10;
+  if (event.priority === 'low') return 200;
+  return 100;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -833,18 +879,29 @@ export async function processSingleEvent(event) {
 
 export async function processEvents({ limit = 50 } = {}) {
   const startTime = Date.now();
+  // v2.14: Sort by priority_lane (int) instead of priority (text). Postgres
+  // sorts text alphabetically — 'critical' < 'high' < 'low' < 'normal' — which
+  // put 'normal' events LAST and let bulk 'high' webhook spikes starve live
+  // ai.* response events. priority_lane is filled by
+  // trg_system_events_default_priority_lane (sql/021): ai.* events get lane 5,
+  // above 'high' at lane 10, so live conversation responses can never be
+  // starved by bulk operations regardless of webhook volume.
   const { data: events, error } = await supabase.from('system_events').select('*')
-    .eq('processed', false).order('priority', { ascending: true })
+    .eq('processed', false).order('priority_lane', { ascending: true })
     .order('created_at', { ascending: true }).limit(limit);
 
   if (error) { console.error('[DecisionEngine] Fetch error:', error.message); return { success: false, error: error.message }; }
   if (!events?.length) return { success: true, events_processed: 0, elapsed_ms: Date.now() - startTime };
 
-  const priorityOrder = { critical: 0, high: 1, normal: 2, low: 3 };
+  // v2.14: Sort by priority_lane to match the SQL order. Defensive fallback
+  // (laneFromPriorityText) handles rows where priority_lane is NULL — should
+  // not exist after the sql/021 backfill, but the guard keeps the engine
+  // resilient if the migration is rolled back or a row is inserted via a
+  // path that bypasses the trigger.
   events.sort((a, b) => {
-    const pa = priorityOrder[a.priority] ?? 2;
-    const pb = priorityOrder[b.priority] ?? 2;
-    return pa !== pb ? pa - pb : new Date(a.created_at) - new Date(b.created_at);
+    const la = a.priority_lane ?? laneFromPriorityText(a);
+    const lb = b.priority_lane ?? laneFromPriorityText(b);
+    return la !== lb ? la - lb : new Date(a.created_at) - new Date(b.created_at);
   });
 
   console.log(`[DecisionEngine] Processing ${events.length} pending events...`);
