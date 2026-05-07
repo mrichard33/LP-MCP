@@ -120,6 +120,10 @@ export function registerAgentTools(server) {
   // ───────────────────────────────────────────────────
   // Tool: create_agent_action
   // ───────────────────────────────────────────────────
+  // 2026-05-07 — added optional `priority` (sql/020 priority lanes).
+  // When omitted, the BEFORE INSERT trigger assigns a lane based on
+  // action_type and rule_applied. Pass an explicit value only when
+  // overriding the default lane.
   server.tool(
     'create_agent_action',
     'Queue an agent action for execution. Actions can auto-execute or require human approval.',
@@ -137,33 +141,41 @@ export function registerAgentTools(server) {
       requires_approval: z.boolean().optional().describe('Whether human must approve (default false)'),
       batch_id: z.string().optional().describe('Group related actions'),
       sequence_order: z.number().optional().describe('Order within batch (default 0)'),
+      priority: z.number().int().optional().describe('Pull-queue priority lane (lower = higher priority). Omit to let the DB trigger pick a lane based on action_type/rule_applied. Default lanes: 10=customer-facing send_message/send_notification, 15=layer3_dispatch, 20=AGENTIC_* routing tags, 50=state updates, 100=default, 200=BULK_*/MIGRATION_* batch work. Override only when you need to.'),
     },
     async (params) => {
       try {
         const status = params.requires_approval ? 'pending_approval' : 'pending';
+        const insertRow = {
+          event_id: params.event_id,
+          action_type: params.action_type,
+          target_system: params.target_system,
+          target_entity: params.target_entity,
+          target_id: params.target_id,
+          action_payload: JSON.parse(params.action_payload),
+          rollback_payload: params.rollback_payload ? JSON.parse(params.rollback_payload) : null,
+          reasoning: params.reasoning || null,
+          confidence: params.confidence || null,
+          rule_applied: params.rule_applied || null,
+          status,
+          requires_approval: params.requires_approval || false,
+          batch_id: params.batch_id || null,
+          sequence_order: params.sequence_order || 0,
+        };
+        // priority is only set when caller provides it. Omitting the key
+        // (vs. setting null) lets the BEFORE INSERT trigger fill the
+        // default lane.
+        if (params.priority !== undefined && params.priority !== null) {
+          insertRow.priority = params.priority;
+        }
         const { data, error } = await supabase
           .from('agent_actions')
-          .insert({
-            event_id: params.event_id,
-            action_type: params.action_type,
-            target_system: params.target_system,
-            target_entity: params.target_entity,
-            target_id: params.target_id,
-            action_payload: JSON.parse(params.action_payload),
-            rollback_payload: params.rollback_payload ? JSON.parse(params.rollback_payload) : null,
-            reasoning: params.reasoning || null,
-            confidence: params.confidence || null,
-            rule_applied: params.rule_applied || null,
-            status,
-            requires_approval: params.requires_approval || false,
-            batch_id: params.batch_id || null,
-            sequence_order: params.sequence_order || 0,
-          })
-          .select('id, action_type, status, target_id, created_at')
+          .insert(insertRow)
+          .select('id, action_type, status, target_id, priority, created_at')
           .single();
 
         if (error) return { content: [{ type: 'text', text: `Error: ${error.message}` }] };
-        return { content: [{ type: 'text', text: JSON.stringify({ status: 'queued', action_id: data.id, action_type: data.action_type, action_status: data.status, target_id: data.target_id, requires_approval: params.requires_approval || false }, null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'queued', action_id: data.id, action_type: data.action_type, action_status: data.status, target_id: data.target_id, priority: data.priority, requires_approval: params.requires_approval || false }, null, 2) }] };
       } catch (err) {
         return { content: [{ type: 'text', text: `Exception: ${err.message}` }] };
       }
@@ -183,7 +195,8 @@ export function registerAgentTools(server) {
     async (params) => {
       let query = supabase
         .from('agent_actions')
-        .select('id, event_id, action_type, target_system, target_entity, target_id, action_payload, reasoning, confidence, rule_applied, status, requires_approval, batch_id, sequence_order, created_at')
+        .select('id, event_id, action_type, target_system, target_entity, target_id, action_payload, reasoning, confidence, rule_applied, status, requires_approval, batch_id, sequence_order, priority, created_at')
+        .order('priority', { ascending: true, nullsFirst: false })
         .order('created_at', { ascending: true })
         .limit(params.limit || 20);
 
@@ -335,7 +348,7 @@ export function registerAgentTools(server) {
     },
     async (params) => {
       let query = supabase.from('agent_actions')
-        .select('id, event_id, action_type, target_system, target_entity, target_id, action_payload, reasoning, confidence, rule_applied, status, requires_approval, approved_by, executed_at, execution_result, error_message, retry_count, created_at')
+        .select('id, event_id, action_type, target_system, target_entity, target_id, action_payload, reasoning, confidence, rule_applied, status, requires_approval, approved_by, executed_at, execution_result, error_message, retry_count, priority, created_at')
         .order('created_at', { ascending: false }).limit(params.limit || 50);
 
       if (params.target_id) query = query.eq('target_id', params.target_id);
