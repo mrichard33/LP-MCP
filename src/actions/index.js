@@ -67,6 +67,18 @@
  * the FIFO. Used for recovery flows and time-sensitive operations like
  * appointment booking. Same handler pipeline — same retry semantics —
  * just skips the queue ordering step.
+ *
+ * 2026-05-07 — priority lanes (sql/020). The pull query now orders by
+ * priority ASC, then created_at ASC, then sequence_order ASC. Customer-
+ * facing actions (send_message=10, layer3_dispatch=15, agentic routing
+ * tags=20) skip ahead of bulk batch work (BULK_*/MIGRATION_*=200), so a
+ * background cleanup job can't starve a real-time customer reply.
+ * Priority defaults are set by a BEFORE INSERT trigger in Postgres, so
+ * every code path that inserts into agent_actions (this file's
+ * layer3_dispatch handler included) gets a sensible lane automatically.
+ * Callers who need to override pass priority explicitly via
+ * create_agent_action. Triggered by action 49546 (Mark Test, 2026-05-07)
+ * sitting behind a ~250-action BULK_MIGRATION_2026_05_06 batch.
  */
 
 import supabase from '../supabase.js';
@@ -180,6 +192,12 @@ async function executeSendMessageWithLock(action, context) {
 // Action specs in the dispatch row use the same shape as agent_rules
 // action_template entries: { action_type, target_system, target_entity,
 // params }. params becomes action_payload.
+//
+// Priority is left unset on the insert so the BEFORE INSERT trigger
+// (sql/020) assigns the right lane based on each sub-action's
+// action_type. A send_message sub-action lands in lane 10, an add_tag
+// from this AGENTIC dispatch lands in lane 20, etc. Templates can still
+// override by including an explicit `priority` field.
 
 async function executeLayer3Dispatch(action /*, context */) {
   const event = await fetchSourceEvent(action);
@@ -215,7 +233,7 @@ async function executeLayer3Dispatch(action /*, context */) {
       continue;
     }
 
-    const { data, error } = await supabase.from('agent_actions').insert({
+    const insertRow = {
       event_id: event.id,
       action_type: tmpl.action_type,
       target_system: targetSystem,
@@ -229,7 +247,12 @@ async function executeLayer3Dispatch(action /*, context */) {
       requires_approval: false,
       batch_id: batchId,
       sequence_order: i,
-    }).select().single();
+    };
+    if (tmpl.priority !== undefined && tmpl.priority !== null) {
+      insertRow.priority = tmpl.priority;
+    }
+
+    const { data, error } = await supabase.from('agent_actions').insert(insertRow).select().single();
 
     if (error) {
       console.error(`[ActionExecutor] layer3_dispatch: queue failed for ${tmpl.action_type}: ${error.message}`);
@@ -360,9 +383,15 @@ export async function executeActions({ limit = 50 } = {}) {
   const approvalRequestsSent = await processApprovalQueue();
 
   // Phase 2: execute actions whose status is 'pending' (approved or auto-approved).
+  // Pull order (sql/020 — priority lanes, 2026-05-07):
+  //   1. priority ASC      — customer-facing (10) before background batch (200)
+  //   2. created_at ASC    — within a lane, oldest first (FIFO)
+  //   3. sequence_order ASC — within a batch, respect intra-batch order
+  // The partial index idx_aa_priority_pull (status=pending) covers this exactly.
   const { data: actions, error } = await supabase.from('agent_actions')
     .select('*')
     .eq('status', 'pending')
+    .order('priority', { ascending: true, nullsFirst: false })
     .order('created_at', { ascending: true })
     .order('sequence_order', { ascending: true })
     .limit(limit);
