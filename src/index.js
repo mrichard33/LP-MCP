@@ -85,13 +85,20 @@ app.use((req, res, next) => {
   next();
 });
 
+const AUTH_SOFT_LAUNCH = process.env.AUTH_SOFT_LAUNCH === 'true';
+
 function authenticate(req, res, next) {
   if (!MCP_AUTH_TOKEN) return next();
+
   const authHeader = req.headers.authorization;
-  if (!authHeader || authHeader !== `Bearer ${MCP_AUTH_TOKEN}`) {
-    return res.status(401).json({ error: 'Unauthorized' });
+  if (authHeader === `Bearer ${MCP_AUTH_TOKEN}`) return next();
+
+  if (AUTH_SOFT_LAUNCH) {
+    console.warn(`[Auth] SOFT_LAUNCH: unauthenticated ${req.method} ${req.path} from ${req.ip} ua="${req.headers['user-agent'] || 'none'}" — would reject in enforce mode`);
+    return next();
   }
-  next();
+
+  return res.status(401).json({ error: 'Unauthorized' });
 }
 
 // ─── Auto-migrate: create tables if missing ──────────────────────
