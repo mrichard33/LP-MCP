@@ -71,14 +71,15 @@
  * 2026-05-07 — priority lanes (sql/020). The pull query now orders by
  * priority ASC, then created_at ASC, then sequence_order ASC. Customer-
  * facing actions (send_message=10, layer3_dispatch=15, agentic routing
- * tags=20) skip ahead of bulk batch work (BULK_*/MIGRATION_*=200), so a
- * background cleanup job can't starve a real-time customer reply.
- * Priority defaults are set by a BEFORE INSERT trigger in Postgres, so
- * every code path that inserts into agent_actions (this file's
- * layer3_dispatch handler included) gets a sensible lane automatically.
- * Callers who need to override pass priority explicitly via
- * create_agent_action. Triggered by action 49546 (Mark Test, 2026-05-07)
- * sitting behind a ~250-action BULK_MIGRATION_2026_05_06 batch.
+ * tags=20) skip ahead of bulk batch work (BULK_ and MIGRATION_ prefixed
+ * rules at 200), so a background cleanup job can't starve a real-time
+ * customer reply. Priority defaults are set by a BEFORE INSERT trigger
+ * in Postgres, so every code path that inserts into agent_actions
+ * (this file's layer3_dispatch handler included) gets a sensible lane
+ * automatically. Callers who need to override pass priority explicitly
+ * via create_agent_action. Triggered by action 49546 (Mark Test,
+ * 2026-05-07) sitting behind a ~250-action BULK_MIGRATION_2026_05_06
+ * batch.
  */
 
 import supabase from '../supabase.js';
