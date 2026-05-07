@@ -29,13 +29,14 @@
  *   originating system_events row by action.event_id when they need
  *   structural fields like event.id or event.payload.message_id.
  *
- * Supported action types (21):
+ * Supported action types (22):
  *   add_tag, remove_tag, set_stage, move_opportunity, update_opportunity,
  *   remove_from_workflow, add_to_workflow, book_appointment,
  *   cancel_appointment, reschedule_appointment, create_task,
  *   send_notification, set_lp_appointment, create_lp_lead,
  *   update_lp_dnc_status, update_custom_fields, update_contact_email,
- *   calculate_time_lapse_tier, send_message, layer3_dispatch, emit_event.
+ *   calculate_time_lapse_tier, send_message, layer3_dispatch, emit_event,
+ *   compute_rescission_dispatch.
  *
  * 2026-05-01 — added create_lp_lead (Jane recovery). Closes the
  * chatbot-in-session-booking gap that left contacts out of LP because
@@ -49,6 +50,13 @@
  * ({{contact.lp_prospect_id}} not resolving). The agentic handler
  * reads the prospect ID directly from the GHL contact object,
  * sidestepping the merge field entirely.
+ *
+ * 2026-05-06 — added compute_rescission_dispatch (Thomas Michaud post-mortem).
+ * Wires the FL 3-business-day rescission rescue arc. Detects signing-date
+ * cues from inbound text, computes deadline + variant via rescission-window.js,
+ * synchronously tags + writes custom fields so GHL workflow O.RR can fire on
+ * the tag trigger immediately, then queues GroupMe HIGH-priority alert +
+ * observability event. past_window branch hands off to L.1 gracefully.
  *
  * 2026-05-02 — added executeActionById + POST /execute-action endpoint
  * (Jeanne Jewell recovery). The FIFO queue order (created_at ASC) means
@@ -85,6 +93,7 @@ import { executeSendNotification } from './handlers/notifications.js';
 import { executeUpdateCustomFields, executeUpdateContactEmail } from './handlers/custom-fields.js';
 import { executeCalculateTimeLapseTier } from './handlers/time-lapse.js';
 import { executeEmitEvent } from './handlers/system-events.js';
+import { executeComputeRescissionDispatch } from './handlers/rescission.js';
 
 // MVI v2.5 — fetch the source event for a given action. The shared
 // getEventContext returns ONLY the spread payload (no event_id /
@@ -266,6 +275,7 @@ const ACTION_HANDLERS = {
   send_message: executeSendMessageWithLock,      // MVI v2.5 — outbound_locks wrap
   layer3_dispatch: executeLayer3Dispatch,        // MVI v2.5 — Layer 3 fan-out
   emit_event: executeEmitEvent,                  // MVI v2.5 — observability / follow-on
+  compute_rescission_dispatch: executeComputeRescissionDispatch, // 2026-05-06 — FL rescission rescue (Thomas Michaud post-mortem)
 };
 
 // Handlers that need the triggering event's payload injected as context.
@@ -281,6 +291,8 @@ const CONTEXT_AWARE_HANDLERS = new Set([
 // Note: layer3_dispatch doesn't go through CONTEXT_AWARE_HANDLERS because
 // it fetches its own source event row (it needs event.id, not just the
 // spread payload that getEventContext provides).
+// compute_rescission_dispatch also fetches its own source event for the
+// same reason (needs event.id and event.created_at for sign-date defaulting).
 
 // ═══════════════════════════════════════════════════════════════════
 // EXECUTOR ENGINE

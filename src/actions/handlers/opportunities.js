@@ -5,6 +5,9 @@
  *   Auto-creates opp if none exists. Forward-only guard (v4.0) prevents
  *   backward pipeline movement.
  *
+ *   v4.3 (2026-05-06): allow_backward payload flag bypasses the guard for
+ *   intentional backward moves (remediation, cold-cancellation rerouting).
+ *
  * update_opportunity (v4.1): PUT monetaryValue, source, lostReasonId, status,
  *   name. Optionally also updates contact source and custom fields.
  *   Used for P2 value/source enrichment and loss intelligence.
@@ -19,7 +22,9 @@ import { updateGHLContactFields } from '../../ghl.js';
 
 export async function executeMoveOpportunity(action) {
   const contactId = action.target_id;
-  const { pipeline, stage, status } = action.action_payload || {};
+  const payload = action.action_payload || {};
+  const { pipeline, stage, status } = payload;
+  const allowBackward = payload.allow_backward === true;
   if (!contactId || !pipeline || !stage) throw new Error('Missing contactId, pipeline, or stage');
   const pipelineId = PIPELINE_IDS[pipeline];
   if (!pipelineId) throw new Error(`Unknown pipeline: ${pipeline}`);
@@ -30,8 +35,10 @@ export async function executeMoveOpportunity(action) {
   const opps = searchRes?.opportunities || [];
   if (opps.length > 0) {
     // v4.0: Forward-only guard — prevent backward pipeline movement
+    // v4.3: allow_backward: true in payload bypasses the guard for intentional
+    //       backward moves (remediation, cold-cancellation rerouting, etc.)
     const guard = checkForwardOnly(opps[0].pipelineStageId, stageId);
-    if (!guard.allowed) {
+    if (!guard.allowed && !allowBackward) {
       console.log(`[ActionExecutor] ⏭️ Forward-only: ${pipeline} opp at pos ${guard.currentPos}, target pos ${guard.targetPos} — ${guard.reason}`);
       return {
         action: 'skipped_forward_only',
@@ -43,8 +50,18 @@ export async function executeMoveOpportunity(action) {
         reason: guard.reason,
       };
     }
+    if (!guard.allowed && allowBackward) {
+      console.log(`[ActionExecutor] ⚠️ Backward move ALLOWED via allow_backward: ${pipeline} opp at pos ${guard.currentPos}, target pos ${guard.targetPos} — ${guard.reason}`);
+    }
     await ghlFetch('PUT', `/opportunities/${opps[0].id}`, { pipelineStageId: stageId, status: status || 'open' });
-    return { action: 'updated', opportunity_id: opps[0].id, pipeline, stage, status };
+    return {
+      action: 'updated',
+      opportunity_id: opps[0].id,
+      pipeline,
+      stage,
+      status,
+      backward_override: !guard.allowed && allowBackward,
+    };
   } else {
     const contactRes = await ghlFetch('GET', `/contacts/${contactId}`);
     const name = contactRes?.contact?.name || contactRes?.contact?.firstName || 'Unknown';

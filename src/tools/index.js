@@ -6,6 +6,7 @@ import { registerSyncTools } from './sync-tools.js';
 import { registerTriggerTools } from './trigger-tools.js';
 import { registerAgentTools } from './agent-tools.js';
 import { registerIntelTools } from './intel-tools.js';
+import { registerRescissionTools } from './rescission-tools.js';
 import { registerAdminTools } from './admin/index.js';
 
 export function registerAllTools(server) {
@@ -21,6 +22,9 @@ export function registerAllTools(server) {
   // Intelligence / diagnostic tools (3) — v6.1 (2026-05-01)
   //   check_service_area, get_decoded_contact, get_contact_timeline
   registerIntelTools(server);
+  // Rescission rescue tools (3) — v6.6 (2026-05-06)
+  //   compute_rescission_deadline, detect_signing_date, list_federal_holidays
+  registerRescissionTools(server);
   // Infrastructure admin tools (17) — v5.1
   registerAdminTools(server);
 }
