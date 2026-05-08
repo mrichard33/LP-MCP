@@ -48,6 +48,11 @@ import { registerLPAppointmentSyncRoutes } from './lp-appointment-sync.js';
 import { registerWorkflowCompletionRoutes } from './workflow-completion-handler.js';
 // ─── Entry Events (Route B agentic-first entry routing) ─────────
 import { registerEntryEventRoutes } from './entry-event-handler.js';
+// ─── GHL Tag Webhook Bridge (Wave 1.2 — Tier 1 tag events) ──────
+// Receives forwarded ContactTagUpdate from HL MCP, diffs vs
+// contact_tag_snapshot, emits ghl.tag_added / ghl.tag_removed events.
+// Unblocks dormant rules 97, 149, 150, 151.
+import { registerGhlTagRoutes } from './ghl-tag-handler.js';
 // ─── IME MIC Integration (Sam's Club Construction leads) ─────────
 import { registerImeRoutes, startImeWorkers } from './ime/index.js';
 // ─── MVI v2.5 — Antifragile services ─────────────────────────────
@@ -426,6 +431,11 @@ registerWorkflowCompletionRoutes(app);
 // rules → add_to_workflow with webhook_url targeting the destination
 // workflow's Inbound Webhook trigger.
 registerEntryEventRoutes(app);
+
+// ─── GHL Tag Webhook Bridge (Wave 1.2) ───────────────────────────
+// Receives ContactTagUpdate forwards from HL MCP at /webhooks/ghl-tag,
+// diffs vs contact_tag_snapshot, emits ghl.tag_added / ghl.tag_removed.
+registerGhlTagRoutes(app);
 
 // ─── IME MIC Integration (Sam's Club Construction leads) ─────────
 registerImeRoutes(app);
