@@ -5,6 +5,59 @@
  * via channel-specific routing — webhook for SMS, Conversations API
  * for email — with cross-fallback for both.
  *
+ * v3.13 (2026-05-08) — Plumb generateResponse companion_action through
+ *   the auto-fire path so reschedule / cancel / book companions actually
+ *   queue when a rule has requires_approval=false.
+ *   PROBLEM: After v3.12 deployed, agentic-active leads now fire send_message
+ *   with requires_approval=false straight to Phase 2 of the executor —
+ *   bypassing processApprovalQueue in approval-path.js. The companion_action
+ *   insertion logic ONLY existed inside processApprovalQueue (added in v4.6
+ *   of approval-path), so generateResponse's companion_action field was
+ *   silently dropped on every auto-fire. Concretely: contact 7jl9cVfry8OyQF6oI2V5
+ *   2026-05-08 13:00 ET — bot SMS'd "Ok, great Mark! You're set for Tuesday
+ *   May 12 at 2 PM" and the AI emitted a reschedule_appointment companion
+ *   targeting old_appointment_id=P2GPr4pIdoaf6Q1mIV1P → 2026-05-12T14:00:00-04:00.
+ *   No companion was queued. The GHL appointment stayed at Mon May 11 at 2 PM.
+ *   The verbal lied to the lead.
+ *
+ *   FIX: Add a queueCompanionAction helper that mirrors approval-path.js
+ *   v4.10's insert logic, called from executeSendMessage after the send
+ *   succeeds. Companion is inserted as a sibling agent_action sharing the
+ *   parent's batch_id, with status='pending' + requires_approval=false so
+ *   Phase 2 of the next executor heartbeat picks it up.
+ *
+ *   Allowlist (mirrors COMPANION_AUTO_EXECUTE in approval-path.js):
+ *     book_appointment       — auto-book on hard confirmation of held time
+ *     cancel_appointment     — auto-cancel after pushback on reschedule offer
+ *     reschedule_appointment — auto-move on hard confirmation of new slot
+ *
+ *   Sequence ordering (mirrors v4.10):
+ *     book / reschedule → parentSeq + 2 (run AFTER send_message; same
+ *                          calendar-owner thread-continuity rationale as v4.10)
+ *     cancel            → parentSeq - 1 (intent: keep verbal "I've taken X
+ *                          off the calendar" truthful by the time it lands;
+ *                          here the parent already ran so this is mostly
+ *                          for ordering vs other post-send actions)
+ *
+ *   Trade-off vs approval-path's insertion: approval-path runs companion
+ *   insert in Phase 1, then Phase 2 of the SAME heartbeat fires the
+ *   companion ~500ms after the SMS. Here we insert from inside Phase 2,
+ *   so the companion fires on the NEXT heartbeat — typical lag is one
+ *   n8n cron tick (1-5 min). Acceptable for the user-facing reality:
+ *   bot says "moved you to Tuesday" → calendar moves within 1-5 min.
+ *   Worst case is no worse than the bug it fixes (companion never fires).
+ *
+ *   Failure-soft: insert errors are logged + surfaced in the return value
+ *   under companion_queued: false / companion_error: <msg> but never
+ *   throw. The send already happened; we don't want to roll it back.
+ *
+ *   Backward-compat: when the rule has requires_approval=true (other
+ *   agentic rules), the existing approval-path.js companion insert still
+ *   runs — and pre-generation in approval-path strips action_payload's
+ *   requires_ai_generation flag, so executeSendMessage receives a message
+ *   already populated and skips its own generateResponse call. No double-
+ *   insert risk.
+ *
  * v3.12 (2026-05-08) — Remove pause-bot opt-in gate. Agentic-active
  *   IS the opt-in.
  *   PROBLEM: The bot wasn't auto-responding even when contacts were
@@ -120,14 +173,15 @@
  * v3.0 — Conversation opt-in gate. [REMOVED in v3.12]
  * v2.1 — Configurable rate limit via SEND_MESSAGE_RATE_LIMIT_MS env var. [REMOVED in v3.12]
  *
- * Guardrails (fail-closed, in order) — v3.12:
+ * Guardrails (fail-closed, in order) — v3.13:
  *   1. Tag fetch — single GHL API call
  *   2. Hard suppression check — dnc / do-not-contact / dnc-sms / stage:dnc
  *      always block (compliance / lead opt-out, non-negotiable)
  *   3. Stop-bot check — explicit kill switch on this contact's bot
  *   4. AI generation (with compliance-gate short-circuit)
  *   5. Send (channel-routed: SMS=webhook, Email=Conv API; cross-fallback)
- *   6. GroupMe notification (rich format with resolved name + LP context)
+ *   6. Companion action queue (v3.13 — book/cancel/reschedule sibling insert)
+ *   7. GroupMe notification (rich format with resolved name + LP context)
  */
 
 import supabase from './supabase.js';
@@ -860,6 +914,130 @@ async function handleShortCircuit(contactId, generated, action, context) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// COMPANION ACTION QUEUE (v3.13)
+// ═══════════════════════════════════════════════════════════════════
+//
+// Inserts a sibling agent_action for the companion_action emitted by
+// generateResponse. Mirrors the logic in approval-path.js v4.10 so the
+// auto-fire path (rule.requires_approval=false → straight to Phase 2)
+// gets the same companion treatment as the approval-gated path.
+//
+// Allowlist (mirrors COMPANION_AUTO_EXECUTE in approval-path.js):
+//   book_appointment       — auto-book on hard confirmation of held time
+//   cancel_appointment     — auto-cancel after pushback on reschedule offer
+//   reschedule_appointment — auto-move on hard confirmation of new slot
+//
+// All three auto-execute (status='pending', requires_approval=false). The
+// AI's response-generator validateResponse already screens for past dates,
+// missing fields, malformed start_time, unknown calendar_name, and
+// missing appointment_id (cancel) / old_appointment_id+new_start_time
+// (reschedule). Anything that arrives here has passed those checks.
+//
+// Sequence ordering (mirrors approval-path.js v4.10):
+//   book / reschedule → parentSeq + 2 (after send_message — calendar
+//                       write re-points contact's effective send-from
+//                       user, so SMS must fire on pre-booking state)
+//   cancel            → parentSeq - 1 (verbal "I've taken X off" should
+//                       be truthful by the time it lands; here the parent
+//                       already ran so this is mostly for ordering vs.
+//                       any other post-send actions in the same batch)
+//
+// Latency vs approval-path.js v4.10:
+//   - approval-path: insert in Phase 1, fire in Phase 2 same heartbeat
+//     → ~500ms gap between send + companion
+//   - here:          insert from inside Phase 2, fire in next heartbeat
+//     → 1-5 min gap (one n8n cron tick). Acceptable: still beats silent
+//     drop, and verbal "moved you to Tuesday" stays true within that
+//     window even if the calendar move lags briefly.
+//
+// Failure-soft: insert errors return { queued: false, error } and never
+// throw. The send already happened; rollback isn't possible. Caller
+// surfaces the failure in execution_result for audit.
+const COMPANION_AUTO_EXECUTE = new Set([
+  'book_appointment',
+  'cancel_appointment',
+  'reschedule_appointment',
+]);
+
+async function queueCompanionAction(parentAction, generated) {
+  if (!generated || !generated.companion_action) {
+    return { queued: false, reason: 'no_companion' };
+  }
+
+  const companion = generated.companion_action;
+  const ctype = companion.action_type;
+  if (!ctype || typeof ctype !== 'string') {
+    console.warn(`[SendMessage] companion_action missing action_type — skipping`);
+    return { queued: false, reason: 'missing_action_type' };
+  }
+  if (!COMPANION_AUTO_EXECUTE.has(ctype)) {
+    console.warn(`[SendMessage] companion_action type "${ctype}" not in allowlist — skipping`);
+    return { queued: false, reason: `type_not_allowlisted:${ctype}` };
+  }
+  if (!companion.action_payload || typeof companion.action_payload !== 'object') {
+    console.warn(`[SendMessage] companion_action ${ctype} has no action_payload — skipping`);
+    return { queued: false, reason: 'missing_action_payload' };
+  }
+
+  const parentSeq = typeof parentAction.sequence_order === 'number' ? parentAction.sequence_order : 0;
+  // book / reschedule run AFTER send_message; cancel runs BEFORE (mirrors
+  // approval-path.js v4.10 sequence_order race fix)
+  const seqAfterSend = (ctype === 'book_appointment' || ctype === 'reschedule_appointment');
+  const companionSeqOrder = seqAfterSend ? parentSeq + 2 : parentSeq - 1;
+
+  try {
+    const { data, error } = await supabase
+      .from('agent_actions')
+      .insert({
+        event_id: parentAction.event_id || null,
+        action_type: ctype,
+        target_system: 'ghl',
+        target_entity: 'contact',
+        target_id: parentAction.target_id,
+        action_payload: companion.action_payload,
+        reasoning: companion.reasoning
+          ? `Companion to send_message ${parentAction.id} (auto-fire path): ${companion.reasoning}`
+          : `Companion to send_message ${parentAction.id} (${parentAction.rule_applied || 'manual'}, auto-fire path)`,
+        confidence: 1.0,
+        rule_applied: parentAction.rule_applied,
+        status: 'pending',
+        requires_approval: false,
+        batch_id: parentAction.batch_id || null,
+        sequence_order: companionSeqOrder,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.warn(`[SendMessage] companion_action insert failed for ${ctype} (parent ${parentAction.id}): ${error.message}`);
+      return { queued: false, reason: 'db_insert_failed', error: error.message, action_type: ctype };
+    }
+
+    const cap = companion.action_payload || {};
+    const summary = ctype === 'book_appointment'
+      ? `calendar="${cap.calendar_name || '?'}" start="${cap.start_time || '?'}" status="${cap.status || '?'}"`
+      : ctype === 'cancel_appointment'
+        ? `appointment_id="${cap.appointment_id || '?'}"`
+        : ctype === 'reschedule_appointment'
+          ? `old="${cap.old_appointment_id || '?'}" → ${cap.new_calendar_name || '?'} ${cap.new_start_time || '?'} status="${cap.status || '?'}"`
+          : '(unknown)';
+
+    console.log(`[SendMessage] ✅ Companion ${ctype} queued: id=${data.id} seq=${data.sequence_order} batch=${data.batch_id || 'none'} — ${summary}`);
+
+    return {
+      queued: true,
+      action_id: data.id,
+      action_type: ctype,
+      sequence_order: data.sequence_order,
+      batch_id: data.batch_id || null,
+    };
+  } catch (err) {
+    console.warn(`[SendMessage] companion_action insert threw for ${ctype}: ${err.message}`);
+    return { queued: false, reason: 'insert_threw', error: err.message, action_type: ctype };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // MAIN HANDLER
 // ═══════════════════════════════════════════════════════════════════
 
@@ -1024,6 +1202,18 @@ export async function executeSendMessage(action, context) {
     contactId, message, channel, subject, action
   );
 
+  // ── Companion action queue (v3.13) ─────────────────────────────
+  // generateResponse may emit a companion_action (book/cancel/reschedule).
+  // Approval-gated rules get this inserted by approval-path.js v4.6+.
+  // Auto-fire rules (requires_approval=false → straight to Phase 2) used
+  // to silently drop it; v3.13 inserts the sibling action here so the
+  // calendar actually moves when the bot says it did. Insert is failure-
+  // soft — the send already happened; rollback isn't possible.
+  let companionResult = { queued: false, reason: 'not_attempted' };
+  if (generated && generated.companion_action) {
+    companionResult = await queueCompanionAction(action, generated);
+  }
+
   // ── GroupMe notification (v3.6: rich format) ───────────────────
   // Resolve the contact's real name + phone, pull LP enrichment, and
   // build the standard rich block. Channel emoji replaces the default
@@ -1058,6 +1248,26 @@ export async function executeSendMessage(action, context) {
     if (generated?.fast_track) agenticParts.push('⚡FAST');
     if (agenticParts.length) full += `\n${agenticParts.join(' | ')}`;
     if (generated?.reasoning) full += `\nReason: ${generated.reasoning}`;
+
+    // v3.13: companion action line (book/cancel/reschedule queued)
+    if (companionResult.queued) {
+      const ct = companionResult.action_type;
+      const ca = generated?.companion_action;
+      const cap = ca?.action_payload || {};
+      let companionLine = '';
+      if (ct === 'book_appointment') {
+        companionLine = `📅 Auto-booked: ${cap.calendar_name || '?'} — ${cap.start_time || '?'} (status: ${cap.status || '?'})`;
+      } else if (ct === 'cancel_appointment') {
+        companionLine = `🗓 Auto-cancelled: ${cap.appointment_id || '?'}` + (cap.reason ? ` (reason: ${String(cap.reason).slice(0, 80)})` : '');
+      } else if (ct === 'reschedule_appointment') {
+        companionLine = `🔄 Auto-rescheduled: ${cap.old_appointment_id || '?'} → ${cap.new_calendar_name || '?'} ${cap.new_start_time || '?'} (status: ${cap.status || '?'})`;
+      }
+      if (companionLine) full += `\n${companionLine}`;
+    } else if (generated?.companion_action && companionResult.reason && !companionResult.reason.startsWith('not_attempted')) {
+      // Companion was emitted but failed to queue — surface in GroupMe so
+      // the team sees the verbal-vs-reality mismatch and can intervene.
+      full += `\n⚠️ Companion ${generated.companion_action.action_type || 'unknown'} FAILED to queue: ${companionResult.reason}${companionResult.error ? ` (${companionResult.error})` : ''}`;
+    }
 
     // Final outbound message preview — what the lead will see
     const preview = message.length > 80 ? message.slice(0, 80) + '...' : message;
@@ -1097,5 +1307,11 @@ export async function executeSendMessage(action, context) {
     fast_track: generated?.fast_track || false,
     buyer_stage: generated?.buyer_stage || null,
     ai_reasoning: generated?.reasoning || null,
+    // v3.13: companion action audit trail
+    companion_emitted: !!generated?.companion_action,
+    companion_type: generated?.companion_action?.action_type || null,
+    companion_queued: companionResult.queued,
+    companion_action_id: companionResult.action_id || null,
+    companion_error: companionResult.queued ? null : (companionResult.error || companionResult.reason || null),
   };
 }
