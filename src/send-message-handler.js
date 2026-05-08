@@ -5,6 +5,49 @@
  * via channel-specific routing — webhook for SMS, Conversations API
  * for email — with cross-fallback for both.
  *
+ * v3.12 (2026-05-08) — Remove pause-bot opt-in gate. Agentic-active
+ *   IS the opt-in.
+ *   PROBLEM: The bot wasn't auto-responding even when contacts were
+ *   tagged agentic-active. Two layers of legacy gating in this handler
+ *   blocked sends unless an additional pause-bot tag was present:
+ *     - Guardrail 2 (suppress-automation soft suppression) — overridden
+ *       by pause-bot, otherwise blocked.
+ *     - Guardrail 3 (conversation gate) — required pause-bot to allow,
+ *       blocked everything else with reason='no_opt_in'.
+ *     - Guardrail 4 (rate limit) — bypassed when pause-bot present,
+ *       otherwise throttled to 1 send / 10 minutes per contact.
+ *
+ *   The pause-bot tag was the original "agentic system is in charge"
+ *   signal. With the system matured, that role is now owned by the
+ *   agentic-active tag, which is enforced UPSTREAM at the rule level
+ *   (AGENTIC_RESPOND_POST_CHATBOT.context_conditions.has_tag = agentic-active).
+ *   By the time a send_message action reaches this handler, the rule
+ *   has already verified agentic-active is set. Re-gating on pause-bot
+ *   here was redundant and was silently dropping valid sends.
+ *
+ *   FIX: Strip the pause-bot opt-in entirely.
+ *     - checkSuppression: keep hard DNC blocks (dnc / do-not-contact /
+ *       dnc-sms / stage:dnc) — those are compliance, non-negotiable.
+ *       Drop suppress-automation gating: that flag was for legacy GHL
+ *       workflow throttling and is irrelevant once agentic-active is
+ *       in charge.
+ *     - checkConversationGate: only stop-bot blocks. Otherwise allowed.
+ *     - Rate limit (isRateLimited): removed. The bot must respond to
+ *       every inbound; throttling drops messages mid-thread.
+ *
+ *   Rules affected (all 3 enabled rules that fire send_message with
+ *   requires_approval=false):
+ *     - AGENTIC_RESPOND_POST_CHATBOT  — main agentic bot reply
+ *     - INTENT_CANCEL_REQUESTED      — auto-cancel on cancel request
+ *     - SPOUSE_GATE_BLOCK_SOLO_BOOKING — auto-cancel solo bookings
+ *   Each rule's own context_conditions stay the source of truth for
+ *   when the send fires.
+ *
+ *   Backward-compat: pause-bot tag remains harmless if still applied
+ *   by upstream workflows — it just no longer means anything special
+ *   in this handler. Rip out the upstream taggers in a follow-up
+ *   commit if cleanup is wanted.
+ *
  * v3.11 (2026-05-05) — Email sender continuity (userId + emailFrom override).
  *   PROBLEM: After v3.10 deployed, agentic email replies threaded correctly
  *   in the email server (In-Reply-To / References stamped via emailMessageId)
@@ -65,60 +108,26 @@
  *   address, with the same subject the customer is replying to.
  *
  * v3.10 (2026-05-04) — Email body field + true emailMessageId threading.
- *   PROBLEM: After v3.9 deployed, the agentic email replies still landed
- *   in a new thread in the lead's inbox. Railway logs on test contact
- *   7jl9cVfry8OyQF6oI2V5 (2026-05-04 21:38:23 UTC) showed:
- *     [SendMessage] Email send for ...: no conversationProviderId — threading may break
- *     [SendMessage] Conv API primary failed: GHL POST /conversations/messages
- *       → 422: {"status":422,"message":"There is no message or attachments
- *       for this message. Skip sending."}
- *     [SendMessage] Email fallback to webhook for ... — reply will create
- *       new thread, not in-thread
- *
- *   Two distinct bugs in sendViaConversationsAPI:
- *
- *   Bug 1 — wrong body field. GHL's POST /conversations/messages reads
- *   different body fields for SMS vs Email:
- *     - SMS  → 'message' (string, plain text)
- *     - Email → 'html' (string, HTML body)
- *   Sending 'message' for type='Email' causes GHL to evaluate the body
- *   as empty (since 'html' is missing) and return 422.
- *
- *   Bug 2 — no threading reference. Modern email clients (Gmail / iCloud)
- *   key threading on In-Reply-To and References headers. GHL exposes this
- *   on outbound via the optional 'emailMessageId' field — pass the inbound
- *   message's GHL id and GHL stamps the right headers internally.
- *
- *   FIX: Two changes in sendViaConversationsAPI:
- *     1. For channel='email', set msgBody.html = message (instead of
- *        msgBody.message). For SMS, keep msgBody.message unchanged.
- *     2. Look up the most recent inbound email's GHL message id via the
- *        new getInboundEmailMessageId helper. When found, set
- *        msgBody.emailMessageId so GHL writes the In-Reply-To /
- *        References headers.
- *
- * v3.9 (2026-05-04) — Email body cleanup + Re: threading.
- * v3.8 (2026-05-04) — Reply-from mirror + proper-case channelType.
- * v3.7 (2026-05-01) — pause-bot is the universal allow signal.
- * v3.6 (2026-05-01) — Rich GroupMe notification on send.
- * v3.5 (2026-05-01) — pause-bot OVERRIDES suppress-automation for agentic sends.
- * v3.4 (2026-04-30) — Trigger message fallback fix.
+ * v3.9  (2026-05-04) — Email body cleanup + Re: threading.
+ * v3.8  (2026-05-04) — Reply-from mirror + proper-case channelType.
+ * v3.7  (2026-05-01) — pause-bot is the universal allow signal. [SUPERSEDED by v3.12]
+ * v3.6  (2026-05-01) — Rich GroupMe notification on send.
+ * v3.5  (2026-05-01) — pause-bot OVERRIDES suppress-automation for agentic sends. [SUPERSEDED by v3.12]
+ * v3.4  (2026-04-30) — Trigger message fallback fix.
  * v3.3 — CHANNEL-SPECIFIC ROUTING (email threading discovery).
  * v3.2 — Webhook-primary architecture.
  * v3.1 — Short-circuit handoff for compliance gates.
- * v3.0 — Conversation opt-in gate.
- * v2.1 — Configurable rate limit via SEND_MESSAGE_RATE_LIMIT_MS env var.
+ * v3.0 — Conversation opt-in gate. [REMOVED in v3.12]
+ * v2.1 — Configurable rate limit via SEND_MESSAGE_RATE_LIMIT_MS env var. [REMOVED in v3.12]
  *
- * Guardrails (fail-closed, in order):
+ * Guardrails (fail-closed, in order) — v3.12:
  *   1. Tag fetch — single GHL API call
- *   2. Suppression check (v3.7):
- *        — hard: dnc, do-not-contact, dnc-sms, stage:dnc (always block)
- *        — soft: suppress-automation (overridden by pause-bot)
- *   3. Conversation gate (v3.7: pause-bot wins over stop-bot)
- *   4. Rate limit (v3.7: bypassed when pause-bot is set)
- *   5. AI generation (with compliance-gate short-circuit)
- *   6. Send (channel-routed: SMS=webhook, Email=Conv API; cross-fallback)
- *   7. GroupMe notification (v3.6 — rich format with resolved name + LP context)
+ *   2. Hard suppression check — dnc / do-not-contact / dnc-sms / stage:dnc
+ *      always block (compliance / lead opt-out, non-negotiable)
+ *   3. Stop-bot check — explicit kill switch on this contact's bot
+ *   4. AI generation (with compliance-gate short-circuit)
+ *   5. Send (channel-routed: SMS=webhook, Email=Conv API; cross-fallback)
+ *   6. GroupMe notification (rich format with resolved name + LP context)
  */
 
 import supabase from './supabase.js';
@@ -134,7 +143,6 @@ import { buildNotificationEnrichment, buildRichNotification } from './actions/en
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
 const GHL_SEND_MESSAGE_WEBHOOK_URL = process.env.GHL_SEND_MESSAGE_WEBHOOK_URL || '';
-const RATE_LIMIT_MS = parseInt(process.env.SEND_MESSAGE_RATE_LIMIT_MS || '600000', 10); // default 10 min
 
 // v3.3: channel-specific routing.
 // SEND_PRIMARY_PATH is a global override. Per-channel knobs win.
@@ -172,61 +180,48 @@ async function fetchContactTags(contactId) {
 }
 
 /**
- * v3.7 — Granular suppression check.
+ * v3.12 — Hard suppression check (compliance only).
  *
- * Hard suppression (ALWAYS blocks, even with pause-bot):
+ * Hard suppression (ALWAYS blocks):
  *   dnc              — legacy lead-driven opt-out (retained for compliance)
  *   do-not-contact   — legacy lead-driven opt-out (retained for compliance)
- *   dnc-sms          — channel-specific SMS DNC (new in v3.7)
- *   stage:dnc        — pipeline-level DNC stage (new in v3.7)
+ *   dnc-sms          — channel-specific SMS DNC
+ *   stage:dnc        — pipeline-level DNC stage
  *
- * Soft suppression (overridable by pause-bot):
- *   suppress-automation — workflow-driven flag (e.g. AUTOMATION_SUPPRESS_ON_BOOKING).
- *                         If pause-bot is also present, the agentic system has
- *                         been explicitly opted in and the soft flag is ignored.
+ * Soft suppression (suppress-automation) is no longer evaluated here. That
+ * flag was a legacy GHL-workflow throttle that was overridden by pause-bot.
+ * With agentic-active now the canonical "agentic bot is in charge" signal
+ * (enforced UPSTREAM at the rule level), this handler trusts the rule's
+ * decision and does not re-gate on suppress-automation.
  *
  * Returns:
- *   { hard: true, tag }                       — block (compliance)
- *   { soft: true, tag }                       — block (no pause-bot to override)
- *   { allowed: true, overridden: true, tag }  — soft suppression but pause-bot
- *                                               overrides; caller logs and falls
- *                                               through
- *   null                                      — no suppression
+ *   { hard: true, tag }  — block (compliance)
+ *   null                 — no suppression
  */
 function checkSuppression(tags) {
   if (tags.includes('dnc')) return { hard: true, tag: 'dnc' };
   if (tags.includes('do-not-contact')) return { hard: true, tag: 'do-not-contact' };
   if (tags.includes('dnc-sms')) return { hard: true, tag: 'dnc-sms' };
   if (tags.includes('stage:dnc')) return { hard: true, tag: 'stage:dnc' };
-  if (tags.includes('suppress-automation')) {
-    if (tags.includes('pause-bot')) {
-      return { allowed: true, overridden: true, tag: 'suppress-automation' };
-    }
-    return { soft: true, tag: 'suppress-automation' };
-  }
   return null;
 }
 
 /**
- * v3.7 — Conversation opt-in gate.
+ * v3.12 — Stop-bot kill switch.
  *
- * pause-bot wins over stop-bot. The two coexisting is unusual, but if it
- * happens, pause-bot is the more recent / explicit agentic opt-in signal
- * and governs.
+ * pause-bot opt-in REMOVED. The agentic-active tag is now the canonical
+ * "agentic bot is in charge" signal and is enforced upstream at the rule
+ * level. This gate exists only to honor an explicit stop-bot tag, which
+ * a rep can apply to silence the bot mid-thread.
  *
- *   pause-bot present  → ALLOWED (regardless of stop-bot)
- *   stop-bot only      → blocked
- *   neither            → blocked (no opt-in, GHL workflows / Conv AI own
- *                        the channel)
+ *   stop-bot present → blocked
+ *   otherwise        → allowed
  */
 function checkConversationGate(tags) {
-  if (tags.includes('pause-bot')) {
-    return { allowed: true, reason: 'pause_bot_opt_in' };
-  }
   if (tags.includes('stop-bot')) {
     return { allowed: false, reason: 'stop_bot' };
   }
-  return { allowed: false, reason: 'no_opt_in' };
+  return { allowed: true, reason: 'auto_respond' };
 }
 
 async function applyContactTags(contactId, tagList) {
@@ -262,27 +257,6 @@ async function applyContactTags(contactId, tagList) {
     return true;
   } catch (err) {
     console.warn(`[SendMessage] applyContactTags threw: ${err.message}`);
-    return false;
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// RATE LIMIT
-// ═══════════════════════════════════════════════════════════════════
-
-async function isRateLimited(contactId) {
-  if (!contactId) return false;
-  try {
-    const windowStart = new Date(Date.now() - RATE_LIMIT_MS).toISOString();
-    const { count } = await supabase
-      .from('agent_actions')
-      .select('id', { count: 'exact', head: true })
-      .eq('action_type', 'send_message')
-      .eq('target_id', contactId)
-      .eq('status', 'completed')
-      .gte('executed_at', windowStart);
-    return (count || 0) > 0;
-  } catch {
     return false;
   }
 }
@@ -915,75 +889,35 @@ export async function executeSendMessage(action, context) {
     };
   }
 
-  // v3.7: pause-bot is the universal allow signal once we get past
-  // hard suppression. Capture it once for use in Guardrails 3/4.
-  const hasPauseBot = tags.includes('pause-bot');
-
-  // ── Guardrail 2: Suppression check (v3.7 — granular hard/soft) ─
-  // Hard suppression (dnc / do-not-contact / dnc-sms / stage:dnc)
-  // ALWAYS blocks: lead's own choice or compliance-mandated.
-  // Soft suppression (suppress-automation) is workflow-driven; if
-  // pause-bot is also present, the agentic opt-in overrides the soft
-  // flag and we fall through to send. The override is explicitly logged
-  // so the trail is visible in Railway when it fires.
+  // ── Guardrail 2: Hard suppression check (v3.12 — compliance only) ──
+  // Hard suppression (dnc / do-not-contact / dnc-sms / stage:dnc) ALWAYS
+  // blocks: lead's own choice or compliance-mandated. Soft suppression
+  // (suppress-automation) is no longer evaluated here — agentic-active
+  // upstream is now the canonical "agentic bot is in charge" signal.
   const suppression = checkSuppression(tags);
-  if (suppression) {
-    if (suppression.hard) {
-      console.log(`[SendMessage] ⛔ HARD SUPPRESSION: ${contactId} has ${suppression.tag} tag — blocking agentic send (compliance / lead opt-out, pause-bot does NOT override)`);
-      return {
-        action: 'send_message_suppressed',
-        contact_id: contactId,
-        reason: `hard_suppression_${suppression.tag}`,
-        channel,
-      };
-    }
-    if (suppression.soft) {
-      console.log(`[SendMessage] ⏭️ SOFT SUPPRESSION: ${contactId} has suppress-automation but no pause-bot to override — blocking`);
-      return {
-        action: 'send_message_suppressed',
-        contact_id: contactId,
-        reason: 'contact_suppressed',
-        channel,
-      };
-    }
-    if (suppression.overridden) {
-      console.log(`[SendMessage] ⚠️ pause-bot OVERRIDES suppress-automation for ${contactId} — agentic opt-in present, allowing send`);
-      // Fall through to remaining guardrails. The override is recorded
-      // in the action log so post-hoc audit can reconstruct what fired.
-    }
+  if (suppression?.hard) {
+    console.log(`[SendMessage] ⛔ HARD SUPPRESSION: ${contactId} has ${suppression.tag} tag — blocking agentic send (compliance / lead opt-out)`);
+    return {
+      action: 'send_message_suppressed',
+      contact_id: contactId,
+      reason: `hard_suppression_${suppression.tag}`,
+      channel,
+    };
   }
 
-  // ── Guardrail 3: Conversation opt-in gate (v3.7) ───────────────
-  // pause-bot wins over stop-bot. Without pause-bot, stop-bot still blocks.
+  // ── Guardrail 3: Stop-bot kill switch (v3.12 — opt-in removed) ──
+  // pause-bot opt-in REMOVED. The bot auto-responds whenever the
+  // upstream rule's conditions match (e.g. agentic-active tag for
+  // AGENTIC_RESPOND_POST_CHATBOT). Only stop-bot blocks now.
   const gate = checkConversationGate(tags);
   if (!gate.allowed) {
-    const label = gate.reason === 'stop_bot' ? 'STOP-BOT' : 'NO OPT-IN';
-    console.log(`[SendMessage] ⏭️ ${label}: ${contactId} — gate denied (reason: ${gate.reason})`);
+    console.log(`[SendMessage] ⏭️ STOP-BOT: ${contactId} — gate denied (reason: ${gate.reason})`);
     return {
       action: `send_message_${gate.reason}`,
       contact_id: contactId,
       reason: gate.reason,
       channel,
     };
-  }
-
-  // ── Guardrail 4: Rate limit check (v3.7 — pause-bot bypass) ────
-  // When the agentic bot owns the conversation (pause-bot present),
-  // throttling creates dead-air mid-thread and breaks the lead's
-  // sense of being heard. Without pause-bot the rate limit still
-  // applies — protects legacy automation paths from re-firing.
-  if (!hasPauseBot) {
-    const rateLimitMinutes = Math.round(RATE_LIMIT_MS / 60000);
-    const rateLimited = await isRateLimited(contactId);
-    if (rateLimited) {
-      console.log(`[SendMessage] ⏭️ RATE LIMITED: ${contactId} received auto-message within ${rateLimitMinutes}min window`);
-      return {
-        action: 'send_message_rate_limited',
-        contact_id: contactId,
-        reason: `rate_limited_${rateLimitMinutes}min`,
-        channel,
-      };
-    }
   }
 
   // ── AI Response Generation ─────────────────────────────────────
