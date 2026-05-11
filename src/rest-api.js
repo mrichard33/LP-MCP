@@ -15,12 +15,14 @@
  *   GET /api/service-area/lookup?zip=...         — Map zip → market + service phone (no auth)
  *   POST /api/service-area/lookup                — Same, with {"zip": "..."} JSON body (no auth)
  *   POST /api/agentic/dynamic-callback-message   — AI-generated SMS for HDL.2 (no auth)
+ *   POST /api/agentic/nurture/generate           — Outbound nurture generator (S4.5 v2)
  *   POST /webhook/ghl-event                      — GHL→Agentic handoff (Webhook Bridge, no auth)
  */
 
 import supabase from './supabase.js';
 import crypto from 'crypto';
 import { registerCallbackMessageRoutes } from './agentic-callback-message.js';
+import { registerNurtureRoutes } from './nurture/nurture-orchestrator.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // WEBHOOK SIGNATURE VERIFICATION (optional but recommended)
@@ -330,6 +332,17 @@ export function registerRestApiRoutes(app, authenticate) {
   // body if the AI path fails so the workflow keeps moving. See
   // agentic-callback-message.js for the full contract and prompt.
   registerCallbackMessageRoutes(app);
+
+  // ═══════════════════════════════════════════════════════════════
+  // POST /api/agentic/nurture/generate — Outbound nurture message
+  // ═══════════════════════════════════════════════════════════════
+  // Generates outbound Seinfeld-style nurture content for the S4.5 v2
+  // GHL workflow (and future workflow codes). Runs the full 8-step
+  // pipeline (context → interrupts → prompt selection → generation →
+  // hard blockers → judge score → GHL writeback → audit). Always
+  // returns 200; the send_ready boolean signals whether the gate was
+  // flipped. See src/nurture/nurture-orchestrator.js for the contract.
+  registerNurtureRoutes(app);
 
   // ─── GET /api/prospects/:prospectId ────────────────────────────
   // Returns all leads for an LP prospect (cst_id)

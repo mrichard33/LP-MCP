@@ -1,6 +1,23 @@
 /**
  * Context Builder — src/context-builder.js
  *
+ * v2.7 — 2026-05-11. ADD NURTURE HISTORY BLOCK for the outbound nurture
+ *   message generator (src/nurture/*).
+ *
+ *   Adds a top-level `nurture` block containing:
+ *     stories_already_deployed — last 8 story arcs (chronological)
+ *     subjects_already_used    — last 10 subjects (most-recent first)
+ *     sequence_position        — max seq_pos for the requested workflow_code
+ *
+ *   Used by:
+ *     - nurture-prompt-selector.js to hard-exclude repeated story arcs
+ *     - nurture-hard-blockers.js to reject duplicate subject lines
+ *     - nurture-orchestrator.js to track cycle position
+ *
+ *   buildLeadContext now accepts options.workflow_code; when present,
+ *   sequence_position is computed against that workflow's rows. When
+ *   absent, sequence_position is 0.
+ *
  * v2.6 — 2026-05-05. EXPOSE ESTIMATE TOTAL + WINDOW COUNT for authoritative
  *   money block in AI prompt.
  *
@@ -445,6 +462,58 @@ function calculateDaysInStage(opportunity) {
   return Math.floor((new Date() - new Date(opportunity.lastStatusChangeAt)) / (1000 * 60 * 60 * 24));
 }
 
+// v2.7: Pull recent nurture history for the outbound message engine.
+// Returns the last N story arcs, the last 10 subjects, and the highest
+// sequence_position observed for the requested workflow_code. Used by
+// the prompt selector (to exclude recently-used arcs) and the hard
+// blockers (to reject repeated subject lines).
+async function fetchNurtureHistory(ghlContactId, workflowCode) {
+  try {
+    const { data, error } = await supabase
+      .from('agentic_messages')
+      .select('generated_meta, generated_subject, workflow_code, sequence_position')
+      .eq('ghl_contact_id', ghlContactId)
+      .in('send_status', ['generated_ready', 'ghl_sent_confirmed'])
+      .order('generated_at', { ascending: false })
+      .limit(20);
+
+    if (error || !data) {
+      return { stories_already_deployed: [], subjects_already_used: [], sequence_position: 0 };
+    }
+
+    // Last 8 deployed story arcs, in chronological order (oldest → newest).
+    // Selector / blockers slice from the END to get the most recent.
+    const stories = data
+      .slice(0, 8)
+      .reverse()
+      .map(r => r.generated_meta?.story_arc_used)
+      .filter(Boolean);
+
+    // Last 10 subjects, most-recent first.
+    const subjects = data
+      .slice(0, 10)
+      .map(r => r.generated_subject)
+      .filter(Boolean);
+
+    let seqPos = 0;
+    if (workflowCode) {
+      const workflowRows = data.filter(r => r.workflow_code === workflowCode);
+      if (workflowRows.length > 0) {
+        seqPos = Math.max(...workflowRows.map(r => r.sequence_position || 0));
+      }
+    }
+
+    return {
+      stories_already_deployed: stories,
+      subjects_already_used: subjects,
+      sequence_position: seqPos,
+    };
+  } catch (err) {
+    console.warn(`[ContextBuilder] fetchNurtureHistory failed for ${ghlContactId}: ${err.message}`);
+    return { stories_already_deployed: [], subjects_already_used: [], sequence_position: 0 };
+  }
+}
+
 function calcLpStaleness(lpLead) {
   if (!lpLead?.synced_at) {
     return { ageMinutes: null, isStale: false, isStaleActive: false };
@@ -461,7 +530,7 @@ function calcLpStaleness(lpLead) {
 // ═══════════════════════════════════════════════════════════════════
 
 export async function buildLeadContext(ghlContactId, options = {}) {
-  const { includeConversation = true, skipCache = false } = options;
+  const { includeConversation = true, skipCache = false, workflow_code = null } = options;
 
   if (!skipCache) {
     const cached = getCached(ghlContactId);
@@ -543,11 +612,12 @@ export async function buildLeadContext(ghlContactId, options = {}) {
   }
 
   const lpLeadId = lpLead?.lp_lead_id || null;
-  const [conversation, lpNotes, lpCalls, pipelineStageInfo] = await Promise.all([
+  const [conversation, lpNotes, lpCalls, pipelineStageInfo, nurtureHistory] = await Promise.all([
     (includeConversation && ghlContact) ? fetchConversation(ghlContactId, 10) : [],
     fetchLPNotes(lpLeadId),
     fetchLPCalls(lpLeadId),
     opportunity?.pipelineStageId ? resolvePipelineStage(opportunity.pipelineStageId) : null,
+    fetchNurtureHistory(ghlContactId, workflow_code),
   ]);
 
   const tags = ghlContact?.tags || [];
@@ -667,9 +737,15 @@ export async function buildLeadContext(ghlContactId, options = {}) {
 
     conversation_recent: conversation,
 
+    // v2.7: Nurture history block. Populated by fetchNurtureHistory() from
+    // agentic_messages rows in 'generated_ready' or 'ghl_sent_confirmed'
+    // status. Empty arrays / 0 when no prior nurture activity. Used by the
+    // outbound message engine; safe to ignore in other contexts.
+    nurture: nurtureHistory,
+
     meta: {
       context_built_at: new Date().toISOString(),
-      context_builder_version: '2.6',
+      context_builder_version: '2.7',
       cache_ttl_ms: CONTEXT_CACHE_TTL_MS,
       data_sources: {
         ghl_contact: !!ghlContact,
