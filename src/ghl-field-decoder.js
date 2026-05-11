@@ -25,15 +25,21 @@
 //
 // v1.1 (2026-05-11) — Adds 'nurture' category with the 11 fields used by
 //   the outbound nurture message engine (src/nurture/*). IDs captured
-//   from the GHL UI when Mark created the fields. ai_email_preheader_draft
-//   is a pre-existing field that was reused for nurture rather than
-//   created fresh — annotated in the entry.
+//   from the GHL UI when Mark created the fields.
 //
 // v1.2 (2026-05-11) — Adds 12th nurture field: Nurture Enrollment Reason
 //   (5MmqueQgbVELUl8CpaMR). Persists the inbound webhook's enrollment_reason
-//   on the contact via a workflow step (not by the orchestrator). Enables
-//   smart-list filtering and contact UI visibility for "why was this
-//   contact enrolled this cycle".
+//   on the contact via a workflow step (not by the orchestrator).
+//
+// v1.3 (2026-05-11) — Cross-referenced HL MCP custom_fields cache and
+//   corrected C8mSMxWqXGr1HvxrImyx display name: GHL actually named it
+//   "AI Email Preview Draft" with field_key contact.ai_email_preview_draft.
+//   This was previously labeled "AI Email Preheader Draft" in this decoder,
+//   which never matched the actual GHL UI label or merge tag. The field
+//   stores the short blurb that appears in inbox preview panes — same
+//   thing email convention calls a preheader, but GHL calls preview.
+//   Behavior unchanged (orchestrator writes by ID); only the display
+//   label and the merge-tag string consumers should use are corrected.
 
 const GHL_FIELD_DECODER = {
 
@@ -123,22 +129,33 @@ const GHL_FIELD_DECODER = {
 
   // ─── NURTURE (S4.5 Outbound Message Engine) ────────────────────
   // 12 fields used by src/nurture/* — drafts, gates, metadata for the
-  // outbound nurture pipeline. Populated 2026-05-11. ai_email_preheader_draft
-  // (C8mSMxWqXGr1HvxrImyx) was a pre-existing field reused for nurture
-  // rather than created fresh, so writes will be visible to any other
-  // workflow reading that field.
-  'hmmFUscWqxH1On6WPCP3': { name: 'AI Email Subject Draft',       category: 'nurture', notes: 'Written by nurture orchestrator phase 1.' },
-  'C8mSMxWqXGr1HvxrImyx': { name: 'AI Email Preheader Draft',     category: 'nurture', notes: 'Pre-existing field reused for nurture — may be shared with other email workflows.' },
-  'WP3BnkdAsINf13CCYGbr': { name: 'AI Email Body Draft',          category: 'nurture', notes: 'HTML body. Phase 1 write.' },
-  'xr0EkxRCshI6tlm4dpvO': { name: 'AI SMS Body Draft',            category: 'nurture', notes: 'SMS body. Phase 1 write when prompt emits SMS.' },
-  '2KB3bkyJ92DGExsFiIIJ': { name: 'AI Message Meta JSON',         category: 'nurture', notes: 'JSON: story_arc_used, formula_used, techniques_used, primary_belief_shift.' },
-  'h6OyxuBTv7w7ieub1P9y': { name: 'AI Next Wait Hours',           category: 'nurture', notes: 'Hours until next nurture cycle. v1 default 168 (7 days).' },
-  'sxmZVqEc1KCgpauUbTAt': { name: 'AI Message Generation ID',     category: 'nurture', notes: 'Joins to agentic_messages.generation_id for audit.' },
-  'vo7aZJT2J1ozVv3cux0T': { name: 'AI Message Confidence',        category: 'nurture', notes: 'Pass B judge overall score, 0-1, 3 decimals.' },
-  'PMq1AzXFX3nudZgNFxbw': { name: 'AI Message Send Ready (gate)', category: 'nurture', notes: 'EMAIL GATE. Phase 2 — last field written on success. GHL workflow waits on this.' },
-  'kIOFapo85KNwpq95Qhl7': { name: 'AI SMS Send Ready (gate)',     category: 'nurture', notes: 'SMS GATE. Phase 2 — only set when SMS body emitted.' },
-  'apoe5TFnilPriJmIzvbo': { name: 'AI Message Sequence Position', category: 'nurture', notes: 'Cycle counter 1-12 for S4.5 calendar. Written by GHL workflow Step 1 from webhook payload; also written by orchestrator writeback for audit.' },
-  '5MmqueQgbVELUl8CpaMR': { name: 'Nurture Enrollment Reason',    category: 'nurture', notes: 'Why this contact was enrolled this cycle (engaged_no_book, rotation_continue, manual, re_engagement, etc.). Written by GHL workflow Step 1b from inbound webhook enrollment_reason payload field.' },
+  // outbound nurture pipeline. Populated 2026-05-11. All display names
+  // and field_keys cross-checked against HL MCP custom_fields cache
+  // (synced 14:00 ET 2026-05-11) except 5MmqueQgbVELUl8CpaMR which
+  // was created after the sync.
+  //
+  // C8mSMxWqXGr1HvxrImyx (preview/preheader): GHL named this "AI Email
+  // Preview Draft" with field_key contact.ai_email_preview_draft. Email
+  // convention calls this the preheader; GHL calls it preview. Same
+  // function, just different label. Anyone authoring a Send Email step
+  // needs the merge tag {{contact.ai_email_preview_draft}} — the
+  // {{contact.ai_email_preheader_draft}} form has never existed.
+  //
+  // PMq1AzXFX3nudZgNFxbw and kIOFapo85KNwpq95Qhl7 (the two gates) are
+  // GHL RADIO fields with Yes/No options — not free-text. See
+  // nurture-writeback.js v1.3 for the orchestrator-side fix.
+  'hmmFUscWqxH1On6WPCP3': { name: 'AI Email Subject Draft',       category: 'nurture', notes: 'GHL key: contact.ai_email_subject_draft. Written by nurture orchestrator phase 1.' },
+  'C8mSMxWqXGr1HvxrImyx': { name: 'AI Email Preview Draft',       category: 'nurture', notes: 'GHL key: contact.ai_email_preview_draft. Holds the short blurb that appears in inbox preview panes (preheader text by email convention).' },
+  'WP3BnkdAsINf13CCYGbr': { name: 'AI Email Body Draft',          category: 'nurture', notes: 'GHL key: contact.ai_email_body_draft. HTML body. Phase 1 write.' },
+  'xr0EkxRCshI6tlm4dpvO': { name: 'AI SMS Body Draft',            category: 'nurture', notes: 'GHL key: contact.ai_sms_body_draft. Phase 1 write when prompt emits SMS.' },
+  '2KB3bkyJ92DGExsFiIIJ': { name: 'AI Msg Meta Json',             category: 'nurture', notes: 'GHL key: contact.ai_msg_meta_json. JSON: story_arc_used, formula_used, techniques_used, primary_belief_shift.' },
+  'h6OyxuBTv7w7ieub1P9y': { name: 'AI Msg Next Wait Hours',       category: 'nurture', notes: 'GHL key: contact.ai_msg_next_wait_hours. Hours until next nurture cycle. v1 default 168 (7 days).' },
+  'sxmZVqEc1KCgpauUbTAt': { name: 'AI Msg Generation ID',         category: 'nurture', notes: 'GHL key: contact.ai_msg_generation_id. Joins to agentic_messages.generation_id for audit.' },
+  'vo7aZJT2J1ozVv3cux0T': { name: 'AI Msg Confidence',            category: 'nurture', notes: 'GHL key: contact.ai_msg_confidence. Pass B judge overall score, 0-1, 3 decimals.' },
+  'PMq1AzXFX3nudZgNFxbw': { name: 'AI Msg Send Ready',            category: 'nurture', notes: 'GHL key: contact.ai_msg_send_ready. RADIO field — accepts "Yes"/"No" only. EMAIL GATE. GHL workflow waits on this; orchestrator flips to "Yes" on phase 2.' },
+  'kIOFapo85KNwpq95Qhl7': { name: 'AI SMS Send Ready',            category: 'nurture', notes: 'GHL key: contact.ai_sms_send_ready. RADIO field — accepts "Yes"/"No" only. SMS GATE. Phase 2 — only set when SMS body emitted.' },
+  'apoe5TFnilPriJmIzvbo': { name: 'AI Msg Sequence Position',     category: 'nurture', notes: 'GHL key: contact.ai_msg_sequence_position. Cycle counter 1-12 for S4.5 calendar. Written by GHL workflow Step 1 from webhook payload (sole owner — see nurture-writeback.js v1.2).' },
+  '5MmqueQgbVELUl8CpaMR': { name: 'Nurture Enrollment Reason',    category: 'nurture', notes: 'GHL key: TBD — not yet in HL MCP cache. Likely contact.nurture_enrollment_reason based on display-name pattern. Why this contact was enrolled this cycle (engaged_no_book, rotation_continue, manual, re_engagement). Written by GHL workflow Step 1b from inbound webhook payload.' },
 
   // ─── CHATBOT-SPECIFIC ──────────────────────────────────────────
   'KsMdYWa9GmtLinA05jZW': { name: 'Chatbot Exit Point',      category: 'chatbot' },
