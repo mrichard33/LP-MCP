@@ -28,6 +28,12 @@
 //   from the GHL UI when Mark created the fields. ai_email_preheader_draft
 //   is a pre-existing field that was reused for nurture rather than
 //   created fresh — annotated in the entry.
+//
+// v1.2 (2026-05-11) — Adds 12th nurture field: Nurture Enrollment Reason
+//   (5MmqueQgbVELUl8CpaMR). Persists the inbound webhook's enrollment_reason
+//   on the contact via a workflow step (not by the orchestrator). Enables
+//   smart-list filtering and contact UI visibility for "why was this
+//   contact enrolled this cycle".
 
 const GHL_FIELD_DECODER = {
 
@@ -116,7 +122,7 @@ const GHL_FIELD_DECODER = {
   'NmvZHScugBDOD2elYH1g': { name: 'Summary Generated Date / LP Last Synced', category: 'ai' },
 
   // ─── NURTURE (S4.5 Outbound Message Engine) ────────────────────
-  // 11 fields used by src/nurture/* — drafts, gates, metadata for the
+  // 12 fields used by src/nurture/* — drafts, gates, metadata for the
   // outbound nurture pipeline. Populated 2026-05-11. ai_email_preheader_draft
   // (C8mSMxWqXGr1HvxrImyx) was a pre-existing field reused for nurture
   // rather than created fresh, so writes will be visible to any other
@@ -131,7 +137,8 @@ const GHL_FIELD_DECODER = {
   'vo7aZJT2J1ozVv3cux0T': { name: 'AI Message Confidence',        category: 'nurture', notes: 'Pass B judge overall score, 0-1, 3 decimals.' },
   'PMq1AzXFX3nudZgNFxbw': { name: 'AI Message Send Ready (gate)', category: 'nurture', notes: 'EMAIL GATE. Phase 2 — last field written on success. GHL workflow waits on this.' },
   'kIOFapo85KNwpq95Qhl7': { name: 'AI SMS Send Ready (gate)',     category: 'nurture', notes: 'SMS GATE. Phase 2 — only set when SMS body emitted.' },
-  'apoe5TFnilPriJmIzvbo': { name: 'AI Message Sequence Position', category: 'nurture', notes: 'Cycle counter 1-12 for S4.5 calendar.' },
+  'apoe5TFnilPriJmIzvbo': { name: 'AI Message Sequence Position', category: 'nurture', notes: 'Cycle counter 1-12 for S4.5 calendar. Written by GHL workflow Step 1 from webhook payload; also written by orchestrator writeback for audit.' },
+  '5MmqueQgbVELUl8CpaMR': { name: 'Nurture Enrollment Reason',    category: 'nurture', notes: 'Why this contact was enrolled this cycle (engaged_no_book, rotation_continue, manual, re_engagement, etc.). Written by GHL workflow Step 1b from inbound webhook enrollment_reason payload field.' },
 
   // ─── CHATBOT-SPECIFIC ──────────────────────────────────────────
   'KsMdYWa9GmtLinA05jZW': { name: 'Chatbot Exit Point',      category: 'chatbot' },
