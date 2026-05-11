@@ -3,7 +3,7 @@
  *
  * Coordinates the 8-step pipeline for one outbound nurture generation:
  *   1. assembleContext   (buildLeadContext)
- *   2. checkInterrupts   (inline — booked, DNC, recent reply)
+ *   2. checkInterrupts   (inline — hard state, Layer 3 authority, overlap)
  *   3. selectPrompt      (nurture-prompt-selector.js, falls back to GENERIC)
  *   4. generateContent   (nurture-generator.js)
  *   5. hardBlockers      (nurture-hard-blockers.js — Pass A, one retry)
@@ -301,16 +301,50 @@ function extractRequestFields(body) {
   return merged;
 }
 
+/**
+ * Pre-generation interrupts — checked BEFORE any LLM call.
+ *
+ * Order matters: most authoritative signals first, cheapest checks first.
+ *
+ *   1. Hard contact-state suppressions (DNC, stop-seinfeld, appt-booked).
+ *      These are operator-asserted facts — never argue with them.
+ *
+ *   2. Layer 3 routing authority. The agentic Layer 3 system continuously
+ *      analyzes every contact across every reply/status change and writes
+ *      its conclusions to lead_intelligence (recommended_action,
+ *      engagement_quality, etc.). When Layer 3 says "suppress" or
+ *      "disengagement", downstream content systems do NOT get to override
+ *      that — the whole point of Layer 3 is that it has the broadest view
+ *      of intent across channels. Honoring it here saves the Sonnet
+ *      generation + judge call AND closes the routing gap that allowed
+ *      disengaged contacts to receive rescue/nurture emails (W5.2 incident
+ *      2026-05-11 22:00 UTC).
+ *
+ *   3. Overlap suppression (recent inbound reply). Defers messages when a
+ *      human is likely working the contact in another channel.
+ */
 function checkInterrupts(context) {
   const tags = context?.lead?.current_tags || [];
+
+  // 1. Hard contact-state suppressions
+  if (tags.includes('dnc') || tags.includes('stop-seinfeld')) {
+    return { status: 'suppressed_interrupt', reason: 'dnc_or_stop' };
+  }
   if (tags.includes('stage:appt-booked')) {
     return { status: 'suppressed_interrupt', reason: 'appt_booked' };
   }
-  if (tags.includes('dnc') || tags.includes('stop-seinfeld')) {
-    return { status: 'suppressed_interrupt', reason: 'dnc' };
+
+  // 2. Layer 3 routing authority — most authoritative cross-channel signal
+  const recAction = context?.intelligence?.recommended_action;
+  if (recAction === 'suppress') {
+    return { status: 'suppressed_interrupt', reason: 'layer3_recommends_suppress' };
+  }
+  const engagementQuality = context?.intelligence?.engagement_quality;
+  if (engagementQuality === 'disengagement') {
+    return { status: 'suppressed_interrupt', reason: 'layer3_disengagement' };
   }
 
-  // Recent inbound reply → defer (overlap suppression).
+  // 3. Recent inbound reply → defer (overlap suppression)
   const lastReply = context?.engagement?.last_reply_at;
   if (lastReply) {
     const ageHrs = (Date.now() - new Date(lastReply).getTime()) / 3_600_000;
