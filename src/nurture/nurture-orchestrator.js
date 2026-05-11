@@ -419,6 +419,21 @@ function finishResponse(generation_id, send_ready, suppressed_reason, startedAt)
 
 export function registerNurtureRoutes(app) {
   app.post('/api/agentic/nurture/generate', async (req, res) => {
+    // ─── Ops diagnostic — log every inbound's parsed shape ────────
+    // Captures content-type + parsed-body keys + body byte length so a
+    // body-parser mismatch is immediately visible in Railway logs.
+    // We had a case (2026-05-11) where GHL standard webhook fired with
+    // customData but no Content-Type header, causing both express.json
+    // and express.urlencoded to skip — req.body ended up empty and the
+    // route returned "workflow_code required" without any breadcrumb.
+    // This line makes the next such case a one-log-line diagnosis.
+    try {
+      const ct = req.headers['content-type'] || 'none';
+      const bodyKeys = Object.keys(req.body || {});
+      const bodyLen = bodyKeys.length === 0 ? 0 : JSON.stringify(req.body).length;
+      console.log(`[NurtureOrch] inbound ct="${ct}" keys=[${bodyKeys.join(',') || '<empty>'}] bodyLen=${bodyLen}`);
+    } catch { /* diagnostic must never throw */ }
+
     try {
       const body = req.body || {};
 
