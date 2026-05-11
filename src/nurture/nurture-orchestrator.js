@@ -3,7 +3,7 @@
  *
  * Coordinates the 8-step pipeline for one outbound nurture generation:
  *   1. assembleContext   (buildLeadContext)
- *   2. checkInterrupts   (inline — hard state, Layer 3 authority, overlap)
+ *   2. checkInterrupts   (inline — booked, DNC, recent reply)
  *   3. selectPrompt      (nurture-prompt-selector.js, falls back to GENERIC)
  *   4. generateContent   (nurture-generator.js)
  *   5. hardBlockers      (nurture-hard-blockers.js — Pass A, one retry)
@@ -85,7 +85,8 @@ export async function runNurtureGeneration(request) {
     prompt = await fetchFallbackPrompt(request.workflow_code, request.channel);
     if (!prompt) {
       await updateStatus(generation_id, 'failed_generation', 'no_prompt_match_and_no_fallback');
-      await alertGroupMe(`[NurtureOrch] no prompt match for ${request.workflow_code}/${request.channel} on ${request.contact_id}`);
+      await alertGroupMe(buildErrorCard(request, context, generation_id, 'no_prompt_match',
+        `No prompt matched workflow_code=${request.workflow_code} channel=${request.channel} (no active FALLBACK either). Check agentic_messaging_prompts has at least one row with workflow_code='${request.workflow_code}' AND channel='${request.channel}' AND active=true.`));
       return finishResponse(generation_id, false, 'no_prompt_match', startedAt);
     }
   }
@@ -118,7 +119,10 @@ export async function runNurtureGeneration(request) {
         await updateRowOnSuppress(generation_id, 'suppressed_low_conf',
           `hard_blockers_after_retry:${hardResult.failures.join(',')}`,
           { output: genResult.output, hard_failures: hardResult.failures, retry_count: retryCount });
-        await alertGroupMe(`[NurtureOrch] suppressed (hard blockers after retry) for ${request.contact_id}: ${hardResult.failures.join(', ')}`);
+        await alertGroupMe(buildSuppressionCard(request, context, generation_id, 'hard_blockers_after_retry', {
+          hardFailures: hardResult.failures,
+          subject: genResult.output && genResult.output.subject,
+        }));
         return finishResponse(generation_id, false, 'hard_blockers_after_retry', startedAt);
       }
     } catch (retryErr) {
@@ -163,7 +167,10 @@ export async function runNurtureGeneration(request) {
         await updateRowOnSuppress(generation_id, 'suppressed_low_conf',
           `hard_blockers_on_retry:${reHard.failures.join(',')}`,
           { output: genResult.output, hard_failures: reHard.failures, retry_count: retryCount });
-        await alertGroupMe(`[NurtureOrch] suppressed (B-retry hit hard blockers) for ${request.contact_id}`);
+        await alertGroupMe(buildSuppressionCard(request, context, generation_id, 'b_retry_hit_hard_blockers', {
+          hardFailures: reHard.failures,
+          subject: genResult.output && genResult.output.subject,
+        }));
         return finishResponse(generation_id, false, 'b_retry_hit_hard_blockers', startedAt);
       }
       scoreResult = await scoreMessage(buildScoreInput(genResult.output, request, prompt, context));
@@ -176,7 +183,13 @@ export async function runNurtureGeneration(request) {
             confidence_breakdown: scoreResult,
             retry_count: retryCount,
           });
-        await alertGroupMe(`[NurtureOrch] suppressed (low score after retry) for ${request.contact_id}: ${Number(scoreResult.overallScore).toFixed(2)}`);
+        await alertGroupMe(buildSuppressionCard(request, context, generation_id, 'low_score_after_retry', {
+          score: scoreResult.overallScore,
+          threshold: scoreResult.threshold,
+          judgeFailures: scoreResult.failureReasons,
+          judgeRationale: scoreResult.rationale,
+          subject: genResult.output && genResult.output.subject,
+        }));
         return finishResponse(generation_id, false, 'low_score_after_retry', startedAt);
       }
     } catch (retryErr) {
@@ -190,13 +203,13 @@ export async function runNurtureGeneration(request) {
     if (SHADOW_MODE) {
       await writeDraftsOnly(request.contact_id, genResult.output, generation_id, scoreResult.overallScore);
       await markAwaitingApproval(generation_id, genResult.output, scoreResult, retryCount);
-      await postShadowApprovalCard(request, generation_id, genResult.output, scoreResult);
+      await postShadowApprovalCard(request, context, generation_id, genResult.output, scoreResult, retryCount);
       return finishResponse(generation_id, false, 'awaiting_approval', startedAt);
     }
     await writeBackToGHL(request.contact_id, genResult.output, generation_id, scoreResult.overallScore);
   } catch (writeErr) {
     await updateStatus(generation_id, 'failed_generation', `writeback_error:${writeErr.message.slice(0, 200)}`);
-    await alertGroupMe(`[NurtureOrch] writeback failed for ${request.contact_id}: ${writeErr.message}`);
+    await alertGroupMe(buildErrorCard(request, context, generation_id, 'writeback_error', writeErr.message));
     return finishResponse(generation_id, false, 'writeback_error', startedAt);
   }
 
@@ -507,6 +520,167 @@ async function fetchFallbackPrompt(workflow_code, channel) {
   return data || null;
 }
 
+
+
+// ─── GROUPME MESSAGE BUILDERS ─────────────────────────────────────────
+//
+// Cards over log-lines. Every message that goes to GroupMe is meant for
+// a human to act on, not a developer debugging. So every card leads with:
+//
+//   WHO  — contact name + email + phone (not just an opaque ID)
+//   WHY  — judge rationale, specific hard-blocker names, exact error text
+//   WHAT — one direct GHL contact URL + plain-English action instructions
+//
+// The shadow approval flow in particular is the highest-stakes message
+// type: it's literally the human-in-the-loop checkpoint deciding whether
+// a real email goes out. It must be skim-readable on a phone.
+//
+// Three variants:
+//   buildApprovalCard()   — shadow-mode success, awaiting human review
+//   buildSuppressionCard() — Pass A/B suppression with judge detail
+//   buildErrorCard()      — writeback / config errors
+
+const GHL_LOC_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
+
+function ghlContactUrl(contactId) {
+  return `https://app.gohighlevel.com/v2/location/${GHL_LOC_ID}/contacts/detail/${contactId}`;
+}
+
+function contactDisplay(context, contactId) {
+  const lead = context?.lead || {};
+  const composed = [lead.first_name, lead.last_name].filter(Boolean).join(' ').trim();
+  const name = lead.name || composed || '(no name)';
+  const email = lead.email ? `\n${lead.email}` : '';
+  const phone = lead.phone ? ` · ${lead.phone}` : '';
+  return `${name}${email}${phone}\nid: ${contactId}`;
+}
+
+function htmlToPreview(html, maxChars = 320) {
+  if (!html) return '';
+  return String(html)
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&[a-z]+;/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxChars);
+}
+
+function buildApprovalCard(request, context, generation_id, output, scoreResult, retryCount) {
+  const stage = output.buyer_stage_targeted
+    ?? context?.intelligence?.buyer_stage
+    ?? '?';
+  const arc = output.story_arc_used || '?';
+  const formula = output.formula_used || '?';
+  const score = Number(scoreResult.overallScore || 0).toFixed(2);
+  const threshold = Number(scoreResult.threshold || 0.78).toFixed(2);
+  const judgeNote = (scoreResult.rationale || '').trim();
+  const belief = (output.primary_belief_shift || '').trim();
+  const preview = htmlToPreview(output.body_html || output.sms_body, 320);
+
+  const lines = [
+    `✅ SEINFELD DRAFT READY — please review`,
+    ``,
+    contactDisplay(context, request.contact_id),
+    ``,
+    `Cycle ${request.sequence_position} · Stage ${stage} · ${arc}/${formula} · ${request.workflow_code}`,
+    `Judge: ${score} / ${threshold}${retryCount ? `  (${retryCount} retr${retryCount === 1 ? 'y' : 'ies'})` : ''}`,
+  ];
+  if (belief) {
+    lines.push(``, `Belief shift:`, belief);
+  }
+  lines.push(
+    ``,
+    `SUBJECT: ${output.subject || '(none)'}`,
+    `PREHEADER: ${output.preheader || '(none)'}`,
+    ``,
+    `BODY PREVIEW:`,
+    preview,
+  );
+  if (judgeNote) {
+    lines.push(``, `Judge said:`, judgeNote);
+  }
+  lines.push(
+    ``,
+    `▶ Open in GHL:`,
+    ghlContactUrl(request.contact_id),
+    ``,
+    `▶ TO SEND: open the contact and set "AI Msg Send Ready" = Yes`,
+    `▶ TO SKIP: leave it; next cycle will overwrite the draft`,
+    ``,
+    `gen ${generation_id}`,
+  );
+  return lines.join('\n');
+}
+
+function buildSuppressionCard(request, context, generation_id, reason, opts = {}) {
+  let title;
+  if (reason === 'hard_blockers_after_retry') {
+    title = '⚠️ DRAFT SUPPRESSED — broke hard rules on both attempts';
+  } else if (reason === 'b_retry_hit_hard_blockers') {
+    title = '⚠️ DRAFT SUPPRESSED — retry broke hard rules';
+  } else if (reason === 'low_score_after_retry') {
+    title = '⚠️ DRAFT SUPPRESSED — judge rejected after retry';
+  } else {
+    title = `⚠️ DRAFT SUPPRESSED — ${reason}`;
+  }
+
+  const score = opts.score !== undefined && opts.score !== null
+    ? Number(opts.score).toFixed(2) : null;
+  const threshold = opts.threshold !== undefined && opts.threshold !== null
+    ? Number(opts.threshold).toFixed(2) : null;
+  const hardFails = (opts.hardFailures && opts.hardFailures.length)
+    ? opts.hardFailures.join(', ') : null;
+  const judgeFails = (opts.judgeFailures && opts.judgeFailures.length)
+    ? opts.judgeFailures.join(', ') : null;
+  const judgeNote = (opts.judgeRationale || '').trim();
+
+  const lines = [
+    title,
+    ``,
+    contactDisplay(context, request.contact_id),
+    ``,
+    `Cycle ${request.sequence_position} · ${request.workflow_code} · ch ${request.channel}`,
+  ];
+  if (score !== null) {
+    lines.push(`Judge: ${score}${threshold ? ' / ' + threshold : ''}  (final, after retry)`);
+  }
+  if (hardFails) lines.push(`Hard rules broken: ${hardFails}`);
+  if (judgeFails) lines.push(`Judge flagged: ${judgeFails}`);
+  if (opts.subject) lines.push(``, `Last subject tried: ${opts.subject}`);
+  if (judgeNote) {
+    lines.push(``, `Judge said:`, judgeNote);
+  }
+  lines.push(
+    ``,
+    `No email sent. Drafts NOT written to GHL.`,
+    ``,
+    `▶ Contact: ${ghlContactUrl(request.contact_id)}`,
+    `▶ Audit row: ${generation_id}`,
+  );
+  return lines.join('\n');
+}
+
+function buildErrorCard(request, context, generation_id, kind, detail) {
+  let title;
+  if (kind === 'writeback_error') title = '🔴 WRITEBACK FAILED';
+  else if (kind === 'no_prompt_match') title = '🔴 CONFIG ERROR — no matching prompt';
+  else title = `🔴 ${String(kind).toUpperCase()}`;
+
+  const lines = [
+    title,
+    ``,
+    contactDisplay(context, request.contact_id),
+    ``,
+    `Cycle ${request.sequence_position} · ${request.workflow_code} · ch ${request.channel}`,
+    ``,
+    `Detail: ${detail || '(no detail)'}`,
+    ``,
+    `▶ Contact: ${ghlContactUrl(request.contact_id)}`,
+    `▶ Audit row: ${generation_id}`,
+  ];
+  return lines.join('\n');
+}
+
 async function alertGroupMe(message) {
   try {
     await sendGroupMeMessage(message);
@@ -515,16 +689,8 @@ async function alertGroupMe(message) {
   }
 }
 
-async function postShadowApprovalCard(request, generation_id, output, scoreResult) {
-  const subject = output.subject ? `subj="${output.subject.slice(0, 60)}" ` : '';
-  const preview = (output.body_html ? output.body_html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
-    : output.sms_body || '').slice(0, 240);
-  const msg =
-    `[Shadow] ${generation_id}\n` +
-    `contact=${request.contact_id} wf=${request.workflow_code} pos=${request.sequence_position} ch=${request.channel}\n` +
-    `score=${Number(scoreResult.overallScore).toFixed(2)} ${subject}\n` +
-    `preview: ${preview}`;
-  await alertGroupMe(msg);
+async function postShadowApprovalCard(request, context, generation_id, output, scoreResult, retryCount) {
+  await alertGroupMe(buildApprovalCard(request, context, generation_id, output, scoreResult, retryCount));
 }
 
 function finishResponse(generation_id, send_ready, suppressed_reason, startedAt) {
