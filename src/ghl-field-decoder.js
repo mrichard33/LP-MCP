@@ -40,6 +40,14 @@
 //   thing email convention calls a preheader, but GHL calls preview.
 //   Behavior unchanged (orchestrator writes by ID); only the display
 //   label and the merge-tag string consumers should use are corrected.
+//
+// v1.4 (2026-05-11) — Locked in the verified field_key for the Nurture
+//   Enrollment Reason field (5MmqueQgbVELUl8CpaMR). Mark confirmed in
+//   the GHL UI: the key is contact.enrollment_reason — NOT
+//   contact.nurture_enrollment_reason as the naming pattern of the
+//   other Nurture-prefixed fields (nurture_pillar, nurture_topic_name,
+//   nurture_week) would have suggested. Documented here so future
+//   investigators don't re-derive the wrong guess from the pattern.
 
 const GHL_FIELD_DECODER = {
 
@@ -131,8 +139,9 @@ const GHL_FIELD_DECODER = {
   // 12 fields used by src/nurture/* — drafts, gates, metadata for the
   // outbound nurture pipeline. Populated 2026-05-11. All display names
   // and field_keys cross-checked against HL MCP custom_fields cache
-  // (synced 14:00 ET 2026-05-11) except 5MmqueQgbVELUl8CpaMR which
-  // was created after the sync.
+  // (synced 14:00 ET 2026-05-11). The 12th (5MmqueQgbVELUl8CpaMR) was
+  // created after the cache sync; its key was verified directly by
+  // Mark in the GHL UI rather than from the cache.
   //
   // C8mSMxWqXGr1HvxrImyx (preview/preheader): GHL named this "AI Email
   // Preview Draft" with field_key contact.ai_email_preview_draft. Email
@@ -144,6 +153,13 @@ const GHL_FIELD_DECODER = {
   // PMq1AzXFX3nudZgNFxbw and kIOFapo85KNwpq95Qhl7 (the two gates) are
   // GHL RADIO fields with Yes/No options — not free-text. See
   // nurture-writeback.js v1.3 for the orchestrator-side fix.
+  //
+  // 5MmqueQgbVELUl8CpaMR (enrollment reason): GHL display name is
+  // "Nurture Enrollment Reason" but the field_key is just
+  // contact.enrollment_reason — NOT contact.nurture_enrollment_reason
+  // despite the prefix pattern of the other Nurture-named fields
+  // (nurture_pillar, nurture_topic_name, nurture_week). Verified by
+  // Mark in the UI 2026-05-11.
   'hmmFUscWqxH1On6WPCP3': { name: 'AI Email Subject Draft',       category: 'nurture', notes: 'GHL key: contact.ai_email_subject_draft. Written by nurture orchestrator phase 1.' },
   'C8mSMxWqXGr1HvxrImyx': { name: 'AI Email Preview Draft',       category: 'nurture', notes: 'GHL key: contact.ai_email_preview_draft. Holds the short blurb that appears in inbox preview panes (preheader text by email convention).' },
   'WP3BnkdAsINf13CCYGbr': { name: 'AI Email Body Draft',          category: 'nurture', notes: 'GHL key: contact.ai_email_body_draft. HTML body. Phase 1 write.' },
@@ -155,7 +171,7 @@ const GHL_FIELD_DECODER = {
   'PMq1AzXFX3nudZgNFxbw': { name: 'AI Msg Send Ready',            category: 'nurture', notes: 'GHL key: contact.ai_msg_send_ready. RADIO field — accepts "Yes"/"No" only. EMAIL GATE. GHL workflow waits on this; orchestrator flips to "Yes" on phase 2.' },
   'kIOFapo85KNwpq95Qhl7': { name: 'AI SMS Send Ready',            category: 'nurture', notes: 'GHL key: contact.ai_sms_send_ready. RADIO field — accepts "Yes"/"No" only. SMS GATE. Phase 2 — only set when SMS body emitted.' },
   'apoe5TFnilPriJmIzvbo': { name: 'AI Msg Sequence Position',     category: 'nurture', notes: 'GHL key: contact.ai_msg_sequence_position. Cycle counter 1-12 for S4.5 calendar. Written by GHL workflow Step 1 from webhook payload (sole owner — see nurture-writeback.js v1.2).' },
-  '5MmqueQgbVELUl8CpaMR': { name: 'Nurture Enrollment Reason',    category: 'nurture', notes: 'GHL key: TBD — not yet in HL MCP cache. Likely contact.nurture_enrollment_reason based on display-name pattern. Why this contact was enrolled this cycle (engaged_no_book, rotation_continue, manual, re_engagement). Written by GHL workflow Step 1b from inbound webhook payload.' },
+  '5MmqueQgbVELUl8CpaMR': { name: 'Nurture Enrollment Reason',    category: 'nurture', notes: 'GHL key: contact.enrollment_reason (NOT nurture_enrollment_reason despite the display-name prefix). Why this contact was enrolled this cycle (engaged_no_book, rotation_continue, manual, re_engagement). Written by GHL workflow Step 7 from inbound webhook payload.' },
 
   // ─── CHATBOT-SPECIFIC ──────────────────────────────────────────
   'KsMdYWa9GmtLinA05jZW': { name: 'Chatbot Exit Point',      category: 'chatbot' },
