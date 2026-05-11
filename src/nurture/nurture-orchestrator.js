@@ -13,12 +13,14 @@
  *
  * Endpoint: POST /api/agentic/nurture/generate
  *
- * Request (any of the following body shapes — see extractRequestFields):
- *   Flat:    { contact_id, workflow_code, sequence_position, channel,
- *              enrollment_reason?, trigger_event_id? }
- *   Wrapped: { customData: { ... same fields ... } }
- *   String:  { customData: '{"contact_id":...,"workflow_code":...}' }
- *   Array:   { customData: [{key,value},{key,value},...] }
+ * Request — see extractRequestFields for the full shape catalog. Briefly:
+ * the route accepts flat top-level fields, fields nested under
+ * customData (object | stringified JSON | array of {key,value} pairs),
+ * or a mix — GHL's standard webhook delivers BOTH (full contact tree
+ * flattened + customData wrapper containing the workflow-specific
+ * payload). The extractor merges customData on top of whatever's flat,
+ * because customData is the explicit payload from the workflow author
+ * and wins on overlap.
  *
  * Response (always 200, never 4xx/5xx — GHL workflows can't handle
  * non-200 cleanly):
@@ -213,69 +215,90 @@ export async function runNurtureGeneration(request) {
 /**
  * Defensively extract request fields from a body of unknown shape.
  *
- * GHL's "standard webhook" action (the one configured with a customData
- * array of {key, value} pairs in the workflow editor) does not always
- * serialize the body the way a naive form-encoded curl would. We've
- * observed at least four shapes in the wild and need to accept all of
- * them so the orchestrator works regardless of which webhook variant
- * fired the request:
+ * GHL's "standard webhook" action flattens the ENTIRE contact tree into
+ * the top-level request body — every standard field (contact_id,
+ * first_name, email, phone, tags, address1, ...) AND every custom field
+ * by its human-readable display name — and ALSO sends customData as a
+ * sibling key containing the workflow-author-defined payload. So a
+ * single request typically contains both:
  *
- *   1. FLAT — typical curl with form-encoded or simple JSON.
- *      { contact_id: 'x', workflow_code: 'S4.5', ... }
+ *   - top-level: contact_id="abc", first_name="Mark", email="...", ...
+ *   - customData: { contact_id: "abc", workflow_code: "S4.5",
+ *                   sequence_position: 1, channel: "email", ... }
  *
- *   2. NESTED OBJECT — some GHL variants wrap everything under customData.
- *      { customData: { contact_id: 'x', workflow_code: 'S4.5', ... } }
+ * The workflow-author payload (customData) is what the orchestrator
+ * actually needs — workflow_code, channel, sequence_position, etc. only
+ * live there. The flat fields ARE useful (contact_id is duplicated for
+ * convenience), but on their own they're not enough. So this extractor
+ * ALWAYS merges customData over the flat body when present, regardless
+ * of whether top-level fields already exist.
  *
- *   3. STRINGIFIED JSON — GHL standard webhook with mixed encoding
- *      sometimes sends the entire customData payload as a single
- *      JSON-string field.
- *      { customData: '{"contact_id":"x","workflow_code":"S4.5",...}' }
+ * Four customData shapes are accepted:
  *
- *   4. ARRAY OF PAIRS — GHL's internal canonical representation may
- *      arrive as the raw {key, value} array.
- *      { customData: [{key: 'contact_id', value: 'x'}, ...] }
+ *   A. NESTED OBJECT — { customData: { workflow_code, channel, ... } }
+ *      Most common in practice. GHL standard webhook flattens its
+ *      configured customData array into an object before sending.
  *
- * Returns a flat object with the request fields available at the top
- * level. If none of the shapes are recognized, returns the body as-is
- * (which will then fail validation with a clear diagnostic).
+ *   B. STRINGIFIED JSON — { customData: '{"workflow_code":...}' }
+ *      Occurs when the webhook is serialized through a transport that
+ *      re-encodes structured values as strings.
+ *
+ *   C. ARRAY OF PAIRS — { customData: [{key, value}, ...] }
+ *      GHL's internal canonical form. Should be rare in practice but
+ *      cheap to handle.
+ *
+ *   D. ABSENT — no customData key at all (direct curl, tests, alternate
+ *      caller). In that case the flat top-level body is the payload.
+ *
+ * Note that customData WINS on overlap: if a workflow author writes
+ * customData.contact_id="x" they want "x", not whatever GHL flattened
+ * in from the contact record.
  */
 function extractRequestFields(body) {
   if (!body || typeof body !== 'object') return {};
 
-  // Shape 1 — flat. Either we already have what we need, or this isn't
-  // a wrapped variant so there's nothing else to try.
-  if (body.contact_id || body.workflow_code) return body;
+  // Start with whatever GHL flattened at the top level. This includes
+  // standard contact fields (contact_id, email, phone, ...), every
+  // custom field by display name, and any flat caller-supplied keys.
+  let merged = { ...body };
 
   const cd = body.customData;
-  if (!cd) return body;
+  if (cd === undefined || cd === null) return merged;
 
-  // Shape 2 — nested object.
+  let cdFlat = null;
+
+  // Shape A — nested object.
   if (typeof cd === 'object' && !Array.isArray(cd)) {
-    return { ...body, ...cd };
+    cdFlat = cd;
   }
-
-  // Shape 3 — stringified JSON.
-  if (typeof cd === 'string') {
-    try {
-      const parsed = JSON.parse(cd);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        return { ...body, ...parsed };
-      }
-    } catch { /* not JSON, fall through */ }
+  // Shape B — stringified JSON.
+  else if (typeof cd === 'string') {
+    const trimmed = cd.trim();
+    if (trimmed.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          cdFlat = parsed;
+        }
+      } catch { /* not JSON — fall through */ }
+    }
   }
-
-  // Shape 4 — array of {key, value} pairs.
-  if (Array.isArray(cd)) {
-    const flat = {};
+  // Shape C — array of {key, value} pairs.
+  else if (Array.isArray(cd)) {
+    cdFlat = {};
     for (const pair of cd) {
       if (pair && typeof pair === 'object' && typeof pair.key === 'string') {
-        flat[pair.key] = pair.value;
+        cdFlat[pair.key] = pair.value;
       }
     }
-    return { ...body, ...flat };
   }
 
-  return body;
+  if (cdFlat) {
+    // customData fields win on overlap — they're the explicit payload
+    // from the workflow author.
+    merged = { ...merged, ...cdFlat };
+  }
+  return merged;
 }
 
 function checkInterrupts(context) {
@@ -484,23 +507,47 @@ function finishResponse(generation_id, send_ready, suppressed_reason, startedAt)
 
 export function registerNurtureRoutes(app) {
   app.post('/api/agentic/nurture/generate', async (req, res) => {
-    // ─── Ops diagnostic — log every inbound's parsed shape ────────
-    // Captures content-type, the keys actually parsed by express, and
-    // body byte length. Makes it possible to root-cause body-parser
-    // mismatches at a glance — see extractRequestFields for the four
-    // GHL body shapes this route is hardened against.
+    // ─── Ops diagnostic — log inbound shape and what we extracted ──
+    // Two log lines per request:
+    //   1. inbound: content-type, key counts, whether customData was
+    //      present and in what shape, total body byte length
+    //   2. extracted: which expected fields were found AFTER unwrapping
+    //
+    // GHL's standard webhook flattens the entire contact (200+ keys)
+    // into the body, so we deliberately do NOT enumerate raw keys here
+    // — just counts plus the customData shape, which is what matters
+    // for debugging body-parser issues.
+    let cdShape = 'absent';
     try {
       const ct = req.headers['content-type'] || 'none';
-      const rawBodyKeys = Object.keys(req.body || {});
-      const bodyLen = rawBodyKeys.length === 0 ? 0 : JSON.stringify(req.body).length;
-      console.log(`[NurtureOrch] inbound ct="${ct}" rawKeys=[${rawBodyKeys.join(',') || '<empty>'}] bodyLen=${bodyLen}`);
+      const raw = req.body || {};
+      const rawKeyCount = Object.keys(raw).length;
+      const bodyLen = rawKeyCount === 0 ? 0 : JSON.stringify(raw).length;
+      const cd = raw.customData;
+      if (cd === undefined || cd === null) cdShape = 'absent';
+      else if (Array.isArray(cd)) cdShape = `array[${cd.length}]`;
+      else if (typeof cd === 'object') cdShape = `object{${Object.keys(cd).length}}`;
+      else if (typeof cd === 'string') cdShape = `string[${cd.length}]`;
+      else cdShape = typeof cd;
+      console.log(`[NurtureOrch] inbound ct="${ct}" rawKeys.count=${rawKeyCount} customData=${cdShape} bodyLen=${bodyLen}`);
     } catch { /* diagnostic must never throw */ }
 
     try {
-      // Defensively unwrap the body — accept flat, nested-customData,
-      // stringified-customData, or array-of-pairs customData. See the
-      // extractRequestFields docstring for the full shape catalog.
+      // Defensively unwrap the body — merge customData (in whatever
+      // shape) over the flat top-level fields. See extractRequestFields
+      // for the shape catalog.
       const body = extractRequestFields(req.body);
+
+      // Diagnostic: which of the expected fields did we find after unwrap.
+      try {
+        const found = [];
+        const missing = [];
+        for (const k of ['contact_id', 'workflow_code', 'channel', 'sequence_position', 'enrollment_reason']) {
+          if (body[k] !== undefined && body[k] !== null && body[k] !== '') found.push(k);
+          else missing.push(k);
+        }
+        console.log(`[NurtureOrch] extracted found=[${found.join(',')}] missing=[${missing.join(',')}] cd=${cdShape}`);
+      } catch { /* diagnostic must never throw */ }
 
       // Optional bearer auth via MESSAGE_ENGINE_TOKEN. When the env var
       // is set, requests must present a matching Bearer token. When
