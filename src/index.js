@@ -46,6 +46,8 @@ import { registerGroupMeRoutes } from './groupme.js';
 import { registerLPAppointmentSyncRoutes } from './lp-appointment-sync.js';
 // ─── Workflow Completion (tag-based self-enrichment) ─────────────
 import { registerWorkflowCompletionRoutes } from './workflow-completion-handler.js';
+// ─── Cooling Callbacks (end-of-hold receivers from I.COOL-* GHL workflows) ─
+import { registerCoolingCallbackRoutes } from './cooling-callback-handler.js';
 // ─── Entry Events (Route B agentic-first entry routing) ─────────
 import { registerEntryEventRoutes } from './entry-event-handler.js';
 // ─── GHL Tag Webhook Bridge (Wave 1.2 — Tier 1 tag events) ──────
@@ -423,6 +425,9 @@ registerLPAppointmentSyncRoutes(app);
 
 // ─── Workflow Completion (tag-based self-enrichment) ─────────────
 registerWorkflowCompletionRoutes(app);
+
+// ─── Cooling Callbacks (end-of-hold receivers from I.COOL-* GHL workflows) ─
+registerCoolingCallbackRoutes(app);
 
 // ─── Entry Events (Route B agentic-first entry routing) ──────────
 // POST /webhook/ghl/entry receives entry-source events from simplified
