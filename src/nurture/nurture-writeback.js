@@ -12,34 +12,37 @@
  * states between phase 1 and phase 2 leave the gate false, so the GHL
  * workflow's wait+exit logic catches it.
  *
- * Field IDs MUST be provided by Mark after he creates them in the GHL
- * UI. Until then, this file uses 'FILL_ME_IN' placeholders that must
- * be replaced before deploy. ghl-field-decoder.js should also gain a
- * 'nurture' category for the new fields.
- *
  * Shadow-mode helper: writeDraftsOnly() performs phase 1 only and is
  * called from the orchestrator when NURTURE_SHADOW_MODE=true. The gate
  * stays unwritten so the GHL workflow never sends.
+ *
+ * v1.1 — 2026-05-11. FIELD_IDS configured with real values from the GHL
+ *   UI. 10 net-new fields + 1 reused (ai_email_preheader_draft —
+ *   C8mSMxWqXGr1HvxrImyx existed prior and is shared with other email
+ *   workflows, so writes here will be visible there too). Mirror entries
+ *   added to src/ghl-field-decoder.js under the new 'nurture' category.
  */
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_BASE = 'https://services.leadconnectorhq.com';
 
-// FIELD IDS — replace 'FILL_ME_IN' with the real IDs from the GHL UI
-// before enabling this in production. The orchestrator will throw on
-// the first phase-1 call if these are still placeholders.
+// FIELD IDS — populated 2026-05-11 from GHL UI.
+// ai_email_preheader_draft (C8mSMxWqXGr1HvxrImyx) is a PRE-EXISTING field
+// reused for nurture rather than created fresh. Writes here will be
+// visible to any other workflow reading the same field — currently no
+// known cross-readers, but worth knowing if behavior surfaces elsewhere.
 export const FIELD_IDS = {
-  ai_email_subject_draft:    'FILL_ME_IN',
-  ai_email_preheader_draft:  'FILL_ME_IN',
-  ai_email_body_draft:       'FILL_ME_IN',
-  ai_sms_body_draft:         'FILL_ME_IN',
-  ai_msg_meta_json:          'FILL_ME_IN',
-  ai_msg_next_wait_hours:    'FILL_ME_IN',
-  ai_msg_generation_id:      'FILL_ME_IN',
-  ai_msg_confidence:         'FILL_ME_IN',
-  ai_msg_send_ready:         'FILL_ME_IN',
-  ai_sms_send_ready:         'FILL_ME_IN',
-  ai_msg_sequence_position:  'FILL_ME_IN',
+  ai_email_subject_draft:    'hmmFUscWqxH1On6WPCP3',
+  ai_email_preheader_draft:  'C8mSMxWqXGr1HvxrImyx', // pre-existing, reused
+  ai_email_body_draft:       'WP3BnkdAsINf13CCYGbr',
+  ai_sms_body_draft:         'xr0EkxRCshI6tlm4dpvO',
+  ai_msg_meta_json:          '2KB3bkyJ92DGExsFiIIJ',
+  ai_msg_next_wait_hours:    'h6OyxuBTv7w7ieub1P9y',
+  ai_msg_generation_id:      'sxmZVqEc1KCgpauUbTAt',
+  ai_msg_confidence:         'vo7aZJT2J1ozVv3cux0T',
+  ai_msg_send_ready:         'PMq1AzXFX3nudZgNFxbw',
+  ai_sms_send_ready:         'kIOFapo85KNwpq95Qhl7',
+  ai_msg_sequence_position:  'apoe5TFnilPriJmIzvbo',
 };
 
 function assertFieldIdsConfigured(usedKeys) {

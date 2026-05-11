@@ -22,6 +22,12 @@
 //   When GHL field IDs change (e.g. field deleted + recreated), this
 //   table needs updating. Suspected drift can be confirmed by opening
 //   the field in GHL Settings → Custom Fields and comparing IDs.
+//
+// v1.1 (2026-05-11) — Adds 'nurture' category with the 11 fields used by
+//   the outbound nurture message engine (src/nurture/*). IDs captured
+//   from the GHL UI when Mark created the fields. ai_email_preheader_draft
+//   is a pre-existing field that was reused for nurture rather than
+//   created fresh — annotated in the entry.
 
 const GHL_FIELD_DECODER = {
 
@@ -109,6 +115,24 @@ const GHL_FIELD_DECODER = {
   'X2t7jeEnsJC6LQPCq4Ij': { name: 'Pain Driver',             category: 'ai', notes: 'Inferred from Jeanne live data — Insurance/Financial/Storm/etc.' },
   'NmvZHScugBDOD2elYH1g': { name: 'Summary Generated Date / LP Last Synced', category: 'ai' },
 
+  // ─── NURTURE (S4.5 Outbound Message Engine) ────────────────────
+  // 11 fields used by src/nurture/* — drafts, gates, metadata for the
+  // outbound nurture pipeline. Populated 2026-05-11. ai_email_preheader_draft
+  // (C8mSMxWqXGr1HvxrImyx) was a pre-existing field reused for nurture
+  // rather than created fresh, so writes will be visible to any other
+  // workflow reading that field.
+  'hmmFUscWqxH1On6WPCP3': { name: 'AI Email Subject Draft',       category: 'nurture', notes: 'Written by nurture orchestrator phase 1.' },
+  'C8mSMxWqXGr1HvxrImyx': { name: 'AI Email Preheader Draft',     category: 'nurture', notes: 'Pre-existing field reused for nurture — may be shared with other email workflows.' },
+  'WP3BnkdAsINf13CCYGbr': { name: 'AI Email Body Draft',          category: 'nurture', notes: 'HTML body. Phase 1 write.' },
+  'xr0EkxRCshI6tlm4dpvO': { name: 'AI SMS Body Draft',            category: 'nurture', notes: 'SMS body. Phase 1 write when prompt emits SMS.' },
+  '2KB3bkyJ92DGExsFiIIJ': { name: 'AI Message Meta JSON',         category: 'nurture', notes: 'JSON: story_arc_used, formula_used, techniques_used, primary_belief_shift.' },
+  'h6OyxuBTv7w7ieub1P9y': { name: 'AI Next Wait Hours',           category: 'nurture', notes: 'Hours until next nurture cycle. v1 default 168 (7 days).' },
+  'sxmZVqEc1KCgpauUbTAt': { name: 'AI Message Generation ID',     category: 'nurture', notes: 'Joins to agentic_messages.generation_id for audit.' },
+  'vo7aZJT2J1ozVv3cux0T': { name: 'AI Message Confidence',        category: 'nurture', notes: 'Pass B judge overall score, 0-1, 3 decimals.' },
+  'PMq1AzXFX3nudZgNFxbw': { name: 'AI Message Send Ready (gate)', category: 'nurture', notes: 'EMAIL GATE. Phase 2 — last field written on success. GHL workflow waits on this.' },
+  'kIOFapo85KNwpq95Qhl7': { name: 'AI SMS Send Ready (gate)',     category: 'nurture', notes: 'SMS GATE. Phase 2 — only set when SMS body emitted.' },
+  'apoe5TFnilPriJmIzvbo': { name: 'AI Message Sequence Position', category: 'nurture', notes: 'Cycle counter 1-12 for S4.5 calendar.' },
+
   // ─── CHATBOT-SPECIFIC ──────────────────────────────────────────
   'KsMdYWa9GmtLinA05jZW': { name: 'Chatbot Exit Point',      category: 'chatbot' },
   'RF710H9k39oLl9TsQIy4': { name: 'Chat Transcript',         category: 'chatbot' },
@@ -163,6 +187,7 @@ export function decodeField(field) {
  *     status:      [...],
  *     appointment: [...],
  *     ai:          [...],
+ *     nurture:     [...],
  *     unknown:     [...],
  *     ...
  *   }
