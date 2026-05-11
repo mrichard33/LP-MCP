@@ -4,13 +4,14 @@
  * Two-phase write to GHL custom fields.
  *
  *   Phase 1: drafts + meta + wait window
- *   Phase 2: generation_id + confidence + gate (ai_msg_send_ready=true)
+ *   Phase 2: generation_id + confidence + gate (ai_msg_send_ready=Yes)
  *
  * The gate is the LAST field written so any reader of the GHL contact
- * sees either (a) nothing-new yet, (b) drafts but gate=false (do not
- * send), or (c) all fields including gate=true (safe to send). Partial
- * states between phase 1 and phase 2 leave the gate false, so the GHL
- * workflow's wait+exit logic catches it.
+ * sees either (a) nothing-new yet, (b) drafts but gate=No (do not send),
+ * or (c) all fields including gate=Yes (safe to send). Partial states
+ * between phase 1 and phase 2 leave the gate as-is (typically No from
+ * the workflow's reset step), so the GHL workflow's wait+exit logic
+ * catches it.
  *
  * Shadow-mode helper: writeDraftsOnly() performs phase 1 only and is
  * called from the orchestrator when NURTURE_SHADOW_MODE=true. The gate
@@ -23,18 +24,19 @@
  *   added to src/ghl-field-decoder.js under the new 'nurture' category.
  *
  * v1.2 — 2026-05-11. Single-writer ownership for ai_msg_sequence_position.
- *   Previously the writeback wrote this field in phase 1; the GHL workflow's
- *   Step 1 also writes it from the inbound webhook payload. Two writers
- *   for the same field invites stale-write races during retries and makes
- *   debugging ambiguous. Per architecture review, the workflow is now the
- *   sole owner: it writes the position from the canonical payload value
- *   immediately on entry, and the orchestrator reads only.
+ *   GHL workflow Step 1 is now the sole owner; orchestrator reads only.
  *
- *   The function still ACCEPTS opts.sequence_position so the orchestrator
- *   doesn't need to change. The value is used for logging context and for
- *   the agentic_messages.sequence_position column write (handled in the
- *   orchestrator, not here). It just isn't written to the GHL contact field
- *   anymore.
+ * v1.3 — 2026-05-11. Gate value format fixed. ai_msg_send_ready and
+ *   ai_sms_send_ready are configured in GHL as single-select fields
+ *   with options "Yes"/"No" (not text fields with "true"/"false").
+ *   The GHL workflow's wait-for-condition step checks `== "Yes"` and
+ *   the reset step writes "No". Previously this module wrote "true"/
+ *   "false", which on a select-type field either fails silently or
+ *   stores an invalid value — meaning the orchestrator's gate-flip
+ *   never matched the workflow's wait condition, and live-mode sends
+ *   would always time out at 24h into the stuck-alert path. Shadow
+ *   mode masked this because the human approver writes the proper
+ *   "Yes" value manually via GroupMe approval.
  */
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -58,10 +60,15 @@ export const FIELD_IDS = {
   ai_msg_next_wait_hours:    'h6OyxuBTv7w7ieub1P9y',
   ai_msg_generation_id:      'sxmZVqEc1KCgpauUbTAt',
   ai_msg_confidence:         'vo7aZJT2J1ozVv3cux0T',
-  ai_msg_send_ready:         'PMq1AzXFX3nudZgNFxbw',
-  ai_sms_send_ready:         'kIOFapo85KNwpq95Qhl7',
+  ai_msg_send_ready:         'PMq1AzXFX3nudZgNFxbw', // Yes/No select
+  ai_sms_send_ready:         'kIOFapo85KNwpq95Qhl7', // Yes/No select
   ai_msg_sequence_position:  'apoe5TFnilPriJmIzvbo', // WORKFLOW-OWNED — not written here
 };
+
+// Gate values must match GHL select-field option labels exactly.
+// The S4.5 v2 workflow's wait-for-condition step checks `== "Yes"`
+// and the reset step writes "No".
+const GATE_FLIPPED = 'Yes';
 
 function assertFieldIdsConfigured(usedKeys) {
   const missing = usedKeys.filter(k => !FIELD_IDS[k] || FIELD_IDS[k] === 'FILL_ME_IN');
@@ -170,17 +177,17 @@ export async function writeBackToGHL(contactId, output, generationId, confidence
   const phase2Fields = [
     { id: FIELD_IDS.ai_msg_generation_id, field_value: String(generationId) },
     { id: FIELD_IDS.ai_msg_confidence, field_value: String(Number(confidence || 0).toFixed(3)) },
-    { id: FIELD_IDS.ai_msg_send_ready, field_value: 'true' },
+    { id: FIELD_IDS.ai_msg_send_ready, field_value: GATE_FLIPPED },
   ];
   if (output.sms_body) {
-    phase2Fields.push({ id: FIELD_IDS.ai_sms_send_ready, field_value: 'true' });
+    phase2Fields.push({ id: FIELD_IDS.ai_sms_send_ready, field_value: GATE_FLIPPED });
   }
 
   await ghlUpdate(contactId, phase2Fields);
 
   const seqLog = opts.sequence_position !== undefined ? ` seq=${opts.sequence_position}` : '';
   console.log(`[NurtureWriteback] ok contact=${contactId} gen=${generationId}${seqLog} ` +
-    `fields_written=${phase1Fields.length + phase2Fields.length}`);
+    `fields_written=${phase1Fields.length + phase2Fields.length} gate=${GATE_FLIPPED}`);
 }
 
 /**
