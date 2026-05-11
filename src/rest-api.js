@@ -16,6 +16,7 @@
  *   POST /api/service-area/lookup                — Same, with {"zip": "..."} JSON body (no auth)
  *   POST /api/agentic/dynamic-callback-message   — AI-generated SMS for HDL.2 (no auth)
  *   POST /api/agentic/nurture/generate           — Outbound nurture generator (S4.5 v2)
+ *   POST /api/agentic/messages/engagement        — Email engagement events (§12.3)
  *   POST /webhook/ghl-event                      — GHL→Agentic handoff (Webhook Bridge, no auth)
  */
 
@@ -23,6 +24,7 @@ import supabase from './supabase.js';
 import crypto from 'crypto';
 import { registerCallbackMessageRoutes } from './agentic-callback-message.js';
 import { registerNurtureRoutes } from './nurture/nurture-orchestrator.js';
+import { registerEngagementRoutes } from './nurture/nurture-engagement.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // WEBHOOK SIGNATURE VERIFICATION (optional but recommended)
@@ -343,6 +345,18 @@ export function registerRestApiRoutes(app, authenticate) {
   // returns 200; the send_ready boolean signals whether the gate was
   // flipped. See src/nurture/nurture-orchestrator.js for the contract.
   registerNurtureRoutes(app);
+
+  // ═══════════════════════════════════════════════════════════════
+  // POST /api/agentic/messages/engagement — Email engagement events
+  // ═══════════════════════════════════════════════════════════════
+  // §12.3 of the S4.5 v1.0 architecture spec. Receives email open,
+  // click, reply, unsubscribe, and booking-attribution events from a
+  // GHL Tier 1 webhook workflow and idempotently writes them to
+  // agentic_messages. First-touch wins. Drives every §14 learning
+  // loop (prompt performance review, confidence threshold
+  // calibration, story-arc deployment validation). Always 200.
+  // See src/nurture/nurture-engagement.js for the contract.
+  registerEngagementRoutes(app);
 
   // ─── GET /api/prospects/:prospectId ────────────────────────────
   // Returns all leads for an LP prospect (cst_id)

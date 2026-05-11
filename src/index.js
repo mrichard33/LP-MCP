@@ -40,6 +40,10 @@ import {
 } from './approval-escalation-sweep.js';
 // ─── REST API for GHL Agent Studio ───────────────────────────────
 import { registerRestApiRoutes } from './rest-api.js';
+// ─── Agentic Message Engine — MV refresh + snapshot ──────────────
+// Daily refresh of mv_agentic_message_performance + snapshot read
+// for the weekly GroupMe performance report. §14 of S4.5 v1.0.
+import { registerAgenticMvRefreshRoutes } from './agentic-mv-refresh.js';
 // ─── GroupMe Two-Way Integration ─────────────────────────────────
 import { registerGroupMeRoutes } from './groupme.js';
 // ─── LP Appointment Sync (GHL → LP) ────────────────────────────
@@ -270,6 +274,12 @@ app.get('/health', (req, res) => {
       check_interval_min: parseInt(process.env.FRESHNESS_CHECK_INTERVAL_MIN || '30', 10),
       alert_dedup_hours: parseInt(process.env.FRESHNESS_ALERT_DEDUP_HOURS || '6', 10),
     },
+    agentic_message_engine: {
+      generate: 'POST /api/agentic/nurture/generate',
+      engagement: 'POST /api/agentic/messages/engagement',
+      refresh_mv: 'POST /n8n/agentic/refresh-performance-mv',
+      snapshot: 'GET /n8n/agentic/performance-snapshot?workflow_code=&min_sent=&limit=',
+    },
     rest_api: {
       prospect: 'GET /api/prospects/:prospectId',
       lead: 'GET /api/leads/:leadId',
@@ -498,6 +508,13 @@ app.post('/admin/backfill-ghl-contact-id-from-lognumber', async (req, res) => {
 // before relying on the log/dedup features.
 registerDataFreshnessRoutes(app);
 
+// ─── Agentic Message Engine — MV refresh + snapshot ──────────────
+// POST /n8n/agentic/refresh-performance-mv (daily cron target)
+// GET  /n8n/agentic/performance-snapshot   (weekly report read)
+// §14 of S4.5 v1.0 — feeds the three learning loops + weekly
+// GroupMe performance report.
+registerAgenticMvRefreshRoutes(app);
+
 app.listen(PORT, async () => {
   console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
   console.log(`n8n APIs:     POST /n8n/enrich-lead | /n8n/refresh-token | /n8n/prospect-lookup | /n8n/time-to-appointment`);
@@ -513,6 +530,8 @@ app.listen(PORT, async () => {
   console.log(`Drift Det:    POST /n8n/drift-detector/scan (30min interval, MVI v2.5)`);
   console.log(`Internal:     POST /internal/check-outbound-lock (HL MCP advisory)`);
   console.log(`Freshness:    GET /n8n/admin/freshness | POST /n8n/admin/freshness-check | GET /n8n/admin/sync-probe`);
+  console.log(`Agentic MV:   POST /n8n/agentic/refresh-performance-mv | GET /n8n/agentic/performance-snapshot`);
+  console.log(`Agentic Msg:  POST /api/agentic/nurture/generate | POST /api/agentic/messages/engagement`);
   console.log(`REST API:     GET /api/prospects/:id | /api/leads/:id | /api/search | /api/lead-summary/:contactId`);
   console.log(`GroupMe:      POST /webhook/groupme | POST /groupme/send | GET /groupme/pending`);
   console.log(`LP Sync:      POST /webhook/ghl/set-lp-appointment`);
