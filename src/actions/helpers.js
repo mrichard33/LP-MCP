@@ -3,9 +3,23 @@
  *
  * Shared helpers: ID type detection, GHL fetch wrapper, template interpolation.
  * Extracted from action-executor.js v4.2 refactor.
+ *
+ * 2026-05-11 — INTERPOLATION FILTERS.
+ *   The {{key}} substitution now also accepts {{key|filter}} syntax.
+ *   A filter takes the raw context value and returns a transformed
+ *   string. Initial filter set:
+ *     |date  → MM/DD/YYYY - H:MM AM/PM in America/New_York
+ *              (via formatDateTimeUS in format-helpers.js)
+ *
+ *   Adding a new filter: implement the transform fn and add it to
+ *   INTERPOLATE_FILTERS. Filter name must be \w+ (alphanumeric + _).
+ *
+ *   Backward compat: existing {{key}} templates are unchanged — the
+ *   filter group is optional in the regex.
  */
 
 import { acquireToken, report429 } from '../ghl-rate-limiter.js';
+import { formatDateTimeUS } from '../format-helpers.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 
@@ -51,14 +65,37 @@ export async function ghlFetch(method, path, body = null) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// TEMPLATE INTERPOLATION — {{var}} substitution from event context
+// TEMPLATE INTERPOLATION — {{var}} or {{var|filter}} substitution
 // ═══════════════════════════════════════════════════════════════════
+
+/**
+ * 2026-05-11 — registered filters for {{key|filter}} syntax.
+ *   date → MM/DD/YYYY - H:MM AM/PM in America/New_York (DST-aware).
+ *
+ * A filter receives the raw context value and returns a string (or null
+ * to fall back to the raw value).
+ */
+const INTERPOLATE_FILTERS = {
+  date: (val) => formatDateTimeUS(val),
+};
 
 export function interpolate(template, context) {
   if (!template || typeof template !== 'string') return template;
-  return template.replace(/\{\{(\w+)\}\}/g, (match, key) => {
+  // Regex captures key and optional |filter. The filter group is itself
+  // optional via (?:...)?, preserving full backward compat with plain
+  // {{key}} templates.
+  return template.replace(/\{\{(\w+)(?:\|(\w+))?\}\}/g, (_match, key, filter) => {
     const val = context[key];
     if (val === undefined || val === null) return '';
+    if (filter) {
+      const fn = INTERPOLATE_FILTERS[filter];
+      if (fn) {
+        const out = fn(val);
+        // Filter that returns null/undefined falls back to raw value
+        // so a bad input doesn't blank the field entirely.
+        if (out !== null && out !== undefined) return String(out);
+      }
+    }
     return String(val);
   });
 }

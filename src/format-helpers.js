@@ -88,3 +88,49 @@ export function formatDateTime(dateStr, timeStr = null) {
   // Fallback: return with time if provided
   return timePart ? `${s} at ${timePart}` : s;
 }
+
+/**
+ * 2026-05-11 — Format an ISO date/time as "MM/DD/YYYY - H:MM AM/PM" in
+ * Eastern Time. Used by the {{key|date}} filter in actions/helpers.js
+ * so message templates can render timestamps in Mark's local time with
+ * DST handled automatically by Intl.DateTimeFormat.
+ *
+ * Distinct from formatDateTime() above:
+ *   - formatDateTime uses " at " separator and parses the literal HH:MM
+ *     from the ISO string (no timezone conversion).
+ *   - formatDateTimeUS uses " - " separator and converts to ET, so a
+ *     UTC timestamp +00:00 renders 4-5 hours earlier than its literal
+ *     ISO clock time (depending on DST).
+ *
+ * Both helpers coexist so existing callers (appointment displays, etc.)
+ * that rely on formatDateTime's literal-time semantics keep working.
+ *
+ * Examples (ET output):
+ *   2026-05-05T03:37:06.829-04:00 (EDT) → "05/05/2026 - 3:37 AM"
+ *   2026-03-25T22:52:44.493+00:00 (UTC) → "03/25/2026 - 6:52 PM"
+ *   2026-01-15T12:00:00Z          (UTC) → "01/15/2026 - 7:00 AM"
+ *
+ * Returns null for unparseable input so callers can fall back to the
+ * raw value.
+ */
+export function formatDateTimeUS(input) {
+  if (!input) return null;
+  const d = new Date(input);
+  if (isNaN(d.getTime())) return null;
+
+  const datePart = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(d);
+
+  const timePart = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  }).format(d);
+
+  return `${datePart} - ${timePart}`;
+}
