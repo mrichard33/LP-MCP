@@ -13,15 +13,12 @@
  *
  * Endpoint: POST /api/agentic/nurture/generate
  *
- * Request:
- *   {
- *     contact_id: 'ghl_xxx',
- *     workflow_code: 'S4.5',
- *     sequence_position: 3,
- *     channel: 'email' | 'sms' | 'email+sms',
- *     enrollment_reason?: string,
- *     trigger_event_id?: string         // reserved for v2 idempotency
- *   }
+ * Request (any of the following body shapes — see extractRequestFields):
+ *   Flat:    { contact_id, workflow_code, sequence_position, channel,
+ *              enrollment_reason?, trigger_event_id? }
+ *   Wrapped: { customData: { ... same fields ... } }
+ *   String:  { customData: '{"contact_id":...,"workflow_code":...}' }
+ *   Array:   { customData: [{key,value},{key,value},...] }
  *
  * Response (always 200, never 4xx/5xx — GHL workflows can't handle
  * non-200 cleanly):
@@ -212,6 +209,74 @@ export async function runNurtureGeneration(request) {
 }
 
 // ─── HELPERS ─────────────────────────────────────────────────────────
+
+/**
+ * Defensively extract request fields from a body of unknown shape.
+ *
+ * GHL's "standard webhook" action (the one configured with a customData
+ * array of {key, value} pairs in the workflow editor) does not always
+ * serialize the body the way a naive form-encoded curl would. We've
+ * observed at least four shapes in the wild and need to accept all of
+ * them so the orchestrator works regardless of which webhook variant
+ * fired the request:
+ *
+ *   1. FLAT — typical curl with form-encoded or simple JSON.
+ *      { contact_id: 'x', workflow_code: 'S4.5', ... }
+ *
+ *   2. NESTED OBJECT — some GHL variants wrap everything under customData.
+ *      { customData: { contact_id: 'x', workflow_code: 'S4.5', ... } }
+ *
+ *   3. STRINGIFIED JSON — GHL standard webhook with mixed encoding
+ *      sometimes sends the entire customData payload as a single
+ *      JSON-string field.
+ *      { customData: '{"contact_id":"x","workflow_code":"S4.5",...}' }
+ *
+ *   4. ARRAY OF PAIRS — GHL's internal canonical representation may
+ *      arrive as the raw {key, value} array.
+ *      { customData: [{key: 'contact_id', value: 'x'}, ...] }
+ *
+ * Returns a flat object with the request fields available at the top
+ * level. If none of the shapes are recognized, returns the body as-is
+ * (which will then fail validation with a clear diagnostic).
+ */
+function extractRequestFields(body) {
+  if (!body || typeof body !== 'object') return {};
+
+  // Shape 1 — flat. Either we already have what we need, or this isn't
+  // a wrapped variant so there's nothing else to try.
+  if (body.contact_id || body.workflow_code) return body;
+
+  const cd = body.customData;
+  if (!cd) return body;
+
+  // Shape 2 — nested object.
+  if (typeof cd === 'object' && !Array.isArray(cd)) {
+    return { ...body, ...cd };
+  }
+
+  // Shape 3 — stringified JSON.
+  if (typeof cd === 'string') {
+    try {
+      const parsed = JSON.parse(cd);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return { ...body, ...parsed };
+      }
+    } catch { /* not JSON, fall through */ }
+  }
+
+  // Shape 4 — array of {key, value} pairs.
+  if (Array.isArray(cd)) {
+    const flat = {};
+    for (const pair of cd) {
+      if (pair && typeof pair === 'object' && typeof pair.key === 'string') {
+        flat[pair.key] = pair.value;
+      }
+    }
+    return { ...body, ...flat };
+  }
+
+  return body;
+}
 
 function checkInterrupts(context) {
   const tags = context?.lead?.current_tags || [];
@@ -420,22 +485,22 @@ function finishResponse(generation_id, send_ready, suppressed_reason, startedAt)
 export function registerNurtureRoutes(app) {
   app.post('/api/agentic/nurture/generate', async (req, res) => {
     // ─── Ops diagnostic — log every inbound's parsed shape ────────
-    // Captures content-type + parsed-body keys + body byte length so a
-    // body-parser mismatch is immediately visible in Railway logs.
-    // We had a case (2026-05-11) where GHL standard webhook fired with
-    // customData but no Content-Type header, causing both express.json
-    // and express.urlencoded to skip — req.body ended up empty and the
-    // route returned "workflow_code required" without any breadcrumb.
-    // This line makes the next such case a one-log-line diagnosis.
+    // Captures content-type, the keys actually parsed by express, and
+    // body byte length. Makes it possible to root-cause body-parser
+    // mismatches at a glance — see extractRequestFields for the four
+    // GHL body shapes this route is hardened against.
     try {
       const ct = req.headers['content-type'] || 'none';
-      const bodyKeys = Object.keys(req.body || {});
-      const bodyLen = bodyKeys.length === 0 ? 0 : JSON.stringify(req.body).length;
-      console.log(`[NurtureOrch] inbound ct="${ct}" keys=[${bodyKeys.join(',') || '<empty>'}] bodyLen=${bodyLen}`);
+      const rawBodyKeys = Object.keys(req.body || {});
+      const bodyLen = rawBodyKeys.length === 0 ? 0 : JSON.stringify(req.body).length;
+      console.log(`[NurtureOrch] inbound ct="${ct}" rawKeys=[${rawBodyKeys.join(',') || '<empty>'}] bodyLen=${bodyLen}`);
     } catch { /* diagnostic must never throw */ }
 
     try {
-      const body = req.body || {};
+      // Defensively unwrap the body — accept flat, nested-customData,
+      // stringified-customData, or array-of-pairs customData. See the
+      // extractRequestFields docstring for the full shape catalog.
+      const body = extractRequestFields(req.body);
 
       // Optional bearer auth via MESSAGE_ENGINE_TOKEN. When the env var
       // is set, requests must present a matching Bearer token. When
