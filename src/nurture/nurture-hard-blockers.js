@@ -37,8 +37,20 @@
  *     Stage 3+ (Comparing/...): REQUIRED         → fire check
  *     null buyer_stage_target: defensive skip    → skip check
  *   Net rule: fire the check only when buyer_stage_target is numerically
- *   3 or greater. Anything else (null, 1, 2) gives the model discretion
- *   to omit the booking link per the prompt's CTA RULES section.
+ *   3 or greater.
+ *
+ * v1.5 — 2026-05-12. CTA-type-aware MISSING_BOOKING_LINK. The locked
+ *   CTA rotation introduces no-URL CTA types (reply_prompt,
+ *   reflection_close, self_id_cue, no_cta) where omitting the link is
+ *   correct behavior, plus URL-bearing types (soft_booking_offer,
+ *   resource_offer, direct_assessment_ask) where the link is required
+ *   regardless of buyer_stage_target. Decision tree:
+ *     cta_type ∈ NO_URL_CTAS   → SKIP  (intentional omission)
+ *     cta_type ∈ URL_CTAS       → FIRE  (URL required)
+ *     cta_type missing/legacy   → v1.4 stage-based fallback
+ *   has_ps is informational — even URL CTAs can place the URL in the
+ *   body (direct_assessment_ask), so has_ps alone doesn't tell us
+ *   whether a link should exist. cta_type does.
  */
 
 export const HARD_BLOCKER_CODES = Object.freeze({
@@ -60,6 +72,11 @@ export const HARD_BLOCKER_CODES = Object.freeze({
   BARE_URL:                'BARE_URL',
   WEAK_CTA_TEXT:           'WEAK_CTA_TEXT',
 });
+
+// v1.5: CTA type classification for MISSING_BOOKING_LINK decision.
+// Must stay aligned with the CTA TYPE PLAYBOOK in S4.5 system prompts.
+const NO_URL_CTAS = ['reply_prompt', 'reflection_close', 'self_id_cue', 'no_cta'];
+const URL_CTAS    = ['soft_booking_offer', 'resource_offer', 'direct_assessment_ask'];
 
 // Phrases that indicate fake urgency unless the prompt has a real
 // scarcity signal in context (context.scarcity_real === true).
@@ -267,17 +284,22 @@ export function runHardBlockers(output, prompt, context) {
   // 8. Booking link — accepts http(s) URL or {{trigger_link.*}} merge tag
   //    in EITHER body_html OR ps_text.
   //
-  //    Tier-aware (v1.4): mirror the Antifragile CTA RULES from the prompts.
-  //      Stage 1 (Indifferent):  NEVER allowed     → skip check
-  //      Stage 2 (Curious):       OPTIONAL          → skip check
-  //      Stage 3+ (Comparing/+): REQUIRED          → fire check
-  //      null buyer_stage_target: defensive skip    → skip check
-  //
-  //    Net rule: fire ONLY when buyer_stage_target is numerically 3 or
-  //    greater. For everything else the model has discretion to omit
-  //    the booking link per its own CTA RULES section.
-  const stage = prompt?.buyer_stage_target;
-  const requireBookingLink = typeof stage === 'number' && stage >= 3;
+  //    CTA-type-aware + tier-aware (v1.5). Decision tree:
+  //      cta_type ∈ NO_URL_CTAS  → skip (intentional omission)
+  //      cta_type ∈ URL_CTAS      → fire (URL required)
+  //      cta_type missing/legacy  → fall back to v1.4 stage-based logic
+  //                                   (fire only when buyer_stage_target >= 3)
+  const ctaType = prompt?.cta_type;
+  let requireBookingLink;
+  if (ctaType && NO_URL_CTAS.includes(ctaType)) {
+    requireBookingLink = false;
+  } else if (ctaType && URL_CTAS.includes(ctaType)) {
+    requireBookingLink = true;
+  } else {
+    const stage = prompt?.buyer_stage_target;
+    requireBookingLink = typeof stage === 'number' && stage >= 3;
+  }
+
   if (requireBookingLink) {
     const bodyText = output.body_html || '';
     const psText = output.ps_text || '';
