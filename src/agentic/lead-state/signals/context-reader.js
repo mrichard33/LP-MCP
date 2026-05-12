@@ -17,6 +17,17 @@
  *
  * Phase 1 scope: only the suppression-state signals. Phase 2 adds
  * engagement/intent/objection/pressure extractors here.
+ *
+ * v1.1 — 2026-05-12. Broaden isCustomerP2() to catch post-sale contacts
+ *   that still have stale BOFU buyer-journey tags. Surfaced by Chuck
+ *   Muller dry-run: opp status='won' in P1, all p2-stage:* + lp-milestone-*
+ *   tags present, but my v1.0 CUSTOMER_P2 check only looked at
+ *   pipeline.pipeline_id and lp.closed_won — neither fired because
+ *   context-builder returns the P1 sale-recorded opp (not the P2 one)
+ *   and LP marks his disposition OPPFDN (closed_won=false). He hit
+ *   ACTIVE_BOFU via bj:stage-5-committed, which is a sticky historical
+ *   tag that never clears after sale. False positive avoided by reading
+ *   the post-sale tag signature.
  */
 
 // ── Tag presence ────────────────────────────────────────────────────
@@ -77,19 +88,63 @@ export function hasActiveBooking(ctx) {
 
 // ── P2 customer (post-sale) ─────────────────────────────────────────
 //
-// Two signals — either = CUSTOMER_P2:
-//   1. opportunity in pipeline P2 (44mOrpmHqk7YqZN9vSPW)
-//   2. lp.closed_won === true
+// v1.1: broadened from the original two checks to a five-signal OR.
 //
-// P2 = client lifecycle pipeline. Customers in P2 should not receive
-// pre-sale narrative nurture unless explicit cross-sell mode is on
-// (cross-sell is a Phase 2+ feature; v1 always suppresses P2 contacts).
+// Why the broadening was needed
+// ─────────────────────────────
+// Original checks (still here, top of the OR chain):
+//   1. opportunity in pipeline P2
+//   2. lp.closed_won === true
+// Both are clean signals when present, but neither is REQUIRED for a
+// real post-sale customer:
+//   - context-builder returns only the most-recently-updated opp; for
+//     contacts who finished the P1 sale path and moved to P2 lifecycle,
+//     that's often still the P1 "Sale Recorded" opp, not any P2 row
+//   - lp.closed_won is tied to LP disposition codes like SW; contacts
+//     with OPPFDN (demo ran, opp full down) can still be post-sale per
+//     downstream milestones, even though closed_won=false
+//
+// Added signals (broaden the net):
+//   3. ANY p2-stage:* tag — set by P2 lifecycle workflows (financing,
+//      production, install-scheduled, install-completed)
+//   4. lp-milestone-completion — LP confirms install complete
+//   5. opportunity.status === 'won' + lp-demo-completed — P1 sale path
+//      finished, demo verified by LP
+//
+// False-positive resistance: none of the added signals can fire on a
+// pre-sale contact. p2-stage:* prefix is reserved for the P2 lifecycle
+// pipeline. lp-milestone-completion is set only by the LP completion
+// webhook. opp.status='won' + lp-demo-completed requires both a closed-
+// won P1 opportunity AND a verified completed demo — impossible pre-sale.
+//
+// Priority effect: CUSTOMER_P2 runs BEFORE ACTIVE_BOFU in the suppression
+// shape, so this broadening correctly catches Chuck-Muller-style contacts
+// (post-sale but still carrying bj:stage-5-committed) before the sticky
+// BOFU tag mistakenly fires.
 
 const PIPELINE_P2_ID = '44mOrpmHqk7YqZN9vSPW';
 
+const P2_LIFECYCLE_TAG_PREFIXES = ['p2-stage:'];
+
+const POST_SALE_MILESTONE_TAGS = [
+  'lp-milestone-completion',
+];
+
+const DEMO_VERIFIED_TAGS = [
+  'lp-demo-completed',
+];
+
 export function isCustomerP2(ctx) {
+  // 1. Direct P2 pipeline membership
   if (ctx?.pipeline?.pipeline_id === PIPELINE_P2_ID) return true;
+  // 2. LP says sale is recorded
   if (ctx?.lp?.closed_won === true) return true;
+  // 3. Any p2-stage:* tag = P2 lifecycle workflow has touched the contact
+  if (hasAnyTagPrefix(ctx, P2_LIFECYCLE_TAG_PREFIXES)) return true;
+  // 4. LP completion milestone = install finished
+  if (hasAnyTag(ctx, POST_SALE_MILESTONE_TAGS)) return true;
+  // 5. P1 sale-recorded path: won opp + demo verified
+  if (ctx?.pipeline?.status === 'won' && hasAnyTag(ctx, DEMO_VERIFIED_TAGS)) return true;
   return false;
 }
 
@@ -103,8 +158,15 @@ export function isCustomerP2(ctx) {
 //   2. buyer:* / bj:* tag indicating stage 3+
 //   3. hold:no-rehash (rep is closing — do not interfere)
 //
-// Note: pipeline.stage_name is also a candidate signal but the GHL stage
-// name is free-form and risks drift. Tags are the canonical signal.
+// IMPORTANT: bj:stage-5-committed and buyer:committed are STICKY tags
+// that remain after a sale completes. They correctly identify pre-sale
+// committed buyers as BOFU, but produce false positives for post-sale
+// customers. The CUSTOMER_P2 check (v1.1+, above) runs FIRST in the
+// suppression priority order and catches post-sale customers via the
+// p2-stage:* / lp-milestone-completion / won-opp signals before the
+// sticky BOFU tags get a chance to fire here. Don't remove the sticky
+// tags from BOFU_BUYER_TAGS — they're correct for pre-sale committed
+// buyers; the priority order is what disambiguates the two cases.
 
 const BOFU_STAGE_TAGS = [
   'stage:solution-pitch',
