@@ -1,6 +1,36 @@
 /**
  * LP Appointment Sync — src/lp-appointment-sync.js
  *
+ * v5.1.7: SUPABASE-LINK-TRUSTED FALLBACK at Step 0 (sub-step 0b).
+ *
+ *   Step 0 now runs TWO acceptance passes through the same Supabase
+ *   candidates:
+ *
+ *   - 0a (preferred): lognumber-validated — LP lead's lognumber field
+ *     equals the inbound GHL contact ID. Strongest signal. Existing
+ *     v5.1.5 behavior.
+ *
+ *   - 0b (fallback): supabase-link-trusted — accept the lp_lead_id
+ *     whenever Supabase's lp_leads.ghl_contact_id is linked to this
+ *     contact AND the LP lead's disposition_code is in
+ *     BOOKABLE_DISPOSITIONS, EVEN IF the live LP lead's lognumber
+ *     doesn't carry the GHL contact ID. The Supabase link is built
+ *     by our own sync code from LP source data, so it remains
+ *     trustworthy in cases where lognumber holds a non-GHL value
+ *     (most commonly Modernize-sourced leads where lognumber is a
+ *     Modernize-specific ID).
+ *
+ *   Without 0b, every Modernize-source contact with a real LP lead
+ *   was falling through Steps 0/1/2/3/4 (all require lognumber match)
+ *   and incorrectly tagging `lp-sync-failed`, firing the I.LP-FAIL
+ *   handler workflow at dispatch/Edwin/Trudy/Jazmine. Observed on
+ *   contact maFVKCeyftMPi2x8ik2l (Deb Fieser): LP lead 538073 had
+ *   lognumber="90916145833" and disposition="Set"; Supabase had
+ *   ghl_contact_id linked correctly.
+ *
+ *   The 0a/0b passes share a single per-candidate getLeadByLdsId
+ *   fetch via an in-function cache to avoid duplicating API calls.
+ *
  * v5.1.6: CALENDAR NAME RESOLUTION (fixes GroupMe N/A calendar field).
  *
  *   Three layers of calendar name resolution, in priority order:
@@ -38,11 +68,17 @@
  * v5.1.1: Adds /webhook/ghl/lp-probe diagnostic endpoint.
  * v5.1: HLCID-first chain + manual-action fallback tag.
  *
- * v5.1.6 resolution chain (each candidate validated against the live LP
- *   record AND must have lognumber === inbound GHL contact ID before accept):
+ * v5.1.7 resolution chain — Step 0 has two acceptance modes, all
+ *   downstream steps still require lognumber === inbound GHL contact ID:
  *
- *   0. SUPABASE FAST-PATH — lp_leads.ghl_contact_id (cache hint,
- *      lognumber-validated). One DB query + one LP getLeadByLdsId.
+ *   0a. SUPABASE FAST-PATH (lognumber-validated) — lp_leads.ghl_contact_id
+ *       linked AND live LP lead.lognumber === ghlContactId. Strongest.
+ *
+ *   0b. SUPABASE-LINK-TRUSTED (no lognumber) — lp_leads.ghl_contact_id
+ *       linked AND live LP lead.disposition_code is in BOOKABLE_DISPOSITIONS.
+ *       Required for Modernize-sourced leads (lognumber holds a
+ *       Modernize ID, not the GHL contact ID). Accepts because the
+ *       Supabase ghl_contact_id link was built by our own sync code.
  *
  *   1. GHL LEAD ID FIELD — `GmAVmW6V9sekD7pVONKr` on the GHL contact.
  *      Most authoritative when populated: identifies the exact lead.
@@ -304,9 +340,10 @@ async function resolveProspectToHLCIDLead(prospect, ghlContactId) {
 }
 
 /**
- * v5.1.5 chain — see file header for full priority rationale.
+ * v5.1.7 chain — see file header for full priority rationale.
  *
- *   Step 0 (Supabase cache, lognumber-validated)
+ *   Step 0 (Supabase cache, lognumber-validated)             ← 0a
+ *   Step 0 (Supabase link trusted, bookable disposition)     ← 0b
  *   Step 1 (GHL Lead ID field, lognumber-validated)
  *   Step 2 (Prospect ID + lognumber)
  *   Step 3 (Phone + lognumber — LAST RESORT)
@@ -318,7 +355,18 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
   const phone = normalizePhone(contactInfo.phone || '');
   const email = cleanEmail(contactInfo.email || '');
 
-  // ── Step 0: Supabase fast-path (cache hint, lognumber-validated) ──
+  // ── Step 0: Supabase fast-path — two acceptance passes ───────
+  //   0a. lognumber-validated (strict): live LP lead.lognumber must
+  //       equal the inbound GHL contact ID. Strongest signal; preserved
+  //       from v5.1.5.
+  //   0b. supabase-link-trusted (fallback): accept the candidate even
+  //       without a lognumber match, provided the LP lead's
+  //       disposition is bookable. The Supabase ghl_contact_id link
+  //       was established by our own sync code against LP source data,
+  //       so it remains trustworthy in cases where lognumber holds a
+  //       non-GHL value (Modernize-sourced leads in particular).
+  // Both passes share a per-candidate cache of getLeadByLdsId results
+  // to avoid duplicate LP API calls between 0a and 0b.
   try {
     const { data: leads } = await supabase.from('lp_leads')
       .select('lp_lead_id, lp_prospect_id, disposition_code, synced_at')
@@ -327,28 +375,63 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
       .limit(5);
 
     if (leads?.length) {
+      const lpFetchCache = new Map();
+      const fetchLiveLpLead = async (ldsId) => {
+        if (lpFetchCache.has(ldsId)) return lpFetchCache.get(ldsId);
+        try {
+          const result = await getLeadByLdsId(ldsId);
+          const records = Array.isArray(result) ? result : [result];
+          lpFetchCache.set(ldsId, records);
+          return records;
+        } catch (err) {
+          console.warn(`[LP-RESOLVE] Step 0 live fetch failed for lds_id=${ldsId}: ${err.message}`);
+          lpFetchCache.set(ldsId, null);
+          return null;
+        }
+      };
+
+      // ── 0a. lognumber-validated (preferred) ──
       for (const candidate of leads) {
         if (!candidate.lp_lead_id) continue;
-        try {
-          const result = await getLeadByLdsId(candidate.lp_lead_id);
-          const records = Array.isArray(result) ? result : [result];
-          for (const prospect of records) {
-            if (!prospect) continue;
-            const innerLeads = prospect.leads || prospect.Leads || [];
-            const target = innerLeads.find(l =>
-              String(l.LeadID || l.leadid || l.lds_id || l.id) === String(candidate.lp_lead_id)
-            );
-            if (!target) continue;
-            const hlcid = extractHLCID(target);
-            if (hlcid && hlcid === String(ghlContactId)) {
-              const pid = String(prospect.ProspectID || prospect.prospectid || prospect.CstID || prospect.cst_id || candidate.lp_prospect_id || '');
-              console.log(`[LP-RESOLVE] ✅ Step 0 Supabase+lognumber: lds_id=${candidate.lp_lead_id}, prospect=${pid}, disp=${candidate.disposition_code}`);
-              return { ldsId: String(candidate.lp_lead_id), prospectId: pid, source: 'supabase_hlcid_validated', step: 0 };
-            }
-            console.warn(`[LP-RESOLVE] Step 0: lds_id=${candidate.lp_lead_id} lognumber mismatch (got ${hlcid || 'null'}, want ${ghlContactId})`);
+        const records = await fetchLiveLpLead(candidate.lp_lead_id);
+        if (!records) continue;
+        for (const prospect of records) {
+          if (!prospect) continue;
+          const innerLeads = prospect.leads || prospect.Leads || [];
+          const target = innerLeads.find(l =>
+            String(l.LeadID || l.leadid || l.lds_id || l.id) === String(candidate.lp_lead_id)
+          );
+          if (!target) continue;
+          const hlcid = extractHLCID(target);
+          if (hlcid && hlcid === String(ghlContactId)) {
+            const pid = String(prospect.ProspectID || prospect.prospectid || prospect.CstID || prospect.cst_id || candidate.lp_prospect_id || '');
+            console.log(`[LP-RESOLVE] ✅ Step 0a Supabase+lognumber: lds_id=${candidate.lp_lead_id}, prospect=${pid}, disp=${candidate.disposition_code}`);
+            return { ldsId: String(candidate.lp_lead_id), prospectId: pid, source: 'supabase_hlcid_validated', step: 0 };
           }
-        } catch (err) {
-          console.warn(`[LP-RESOLVE] Step 0 validation failed for lds_id=${candidate.lp_lead_id}: ${err.message}`);
+        }
+      }
+
+      // ── 0b. supabase-link-trusted, bookable disposition (no lognumber required) ──
+      for (const candidate of leads) {
+        if (!candidate.lp_lead_id) continue;
+        const disp = candidate.disposition_code || '';
+        if (!BOOKABLE_DISPOSITIONS.has(disp)) {
+          console.warn(`[LP-RESOLVE] Step 0b: lds_id=${candidate.lp_lead_id} disp=${disp || '(empty)'} not bookable — skip`);
+          continue;
+        }
+        const records = await fetchLiveLpLead(candidate.lp_lead_id);
+        if (!records) continue;
+        for (const prospect of records) {
+          if (!prospect) continue;
+          const innerLeads = prospect.leads || prospect.Leads || [];
+          const target = innerLeads.find(l =>
+            String(l.LeadID || l.leadid || l.lds_id || l.id) === String(candidate.lp_lead_id)
+          );
+          if (!target) continue;
+          const pid = String(prospect.ProspectID || prospect.prospectid || prospect.CstID || prospect.cst_id || candidate.lp_prospect_id || '');
+          const liveLognumber = extractHLCID(target);
+          console.log(`[LP-RESOLVE] ✅ Step 0b Supabase-link-trusted (no lognumber match required): lds_id=${candidate.lp_lead_id}, prospect=${pid}, disp=${disp}, lp_lognumber=${liveLognumber || '(empty)'} — trusting Supabase ghl_contact_id link`);
+          return { ldsId: String(candidate.lp_lead_id), prospectId: pid, source: 'supabase_link_trusted_bookable', step: 0 };
         }
       }
     }
@@ -478,7 +561,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
     console.warn(`[LP-RESOLVE] Step 4: no email available — skipping last-resort email path`);
   }
 
-  console.warn(`[LP-RESOLVE] ❌ No lognumber-validated lds_id for ${ghlContactId} after 5-step chain`);
+  console.warn(`[LP-RESOLVE] ❌ No lds_id matched for ${ghlContactId} after Step 0a/0b + Steps 1–4 chain`);
   return null;
 }
 
@@ -1032,7 +1115,7 @@ export function registerLPAppointmentSyncRoutes(app) {
     }
   });
 
-  console.log('[LP-APPT] Registered: POST /webhook/ghl/set-lp-appointment (v5.1.6 calendar-name resolution + ID-first chain)');
+  console.log('[LP-APPT] Registered: POST /webhook/ghl/set-lp-appointment (v5.1.7 supabase-link-trusted 0b fallback + ID-first chain)');
   console.log('[LP-PROBE] Registered: POST /webhook/ghl/lp-probe (v5.1.2 diagnostic w/ userfields+lognumber)');
 }
 
