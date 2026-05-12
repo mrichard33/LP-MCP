@@ -51,6 +51,11 @@
  *   each generation receives the right URL pre-rendered. Replaces the
  *   static GHL trigger-link approach that gave every cycle identical
  *   utm_campaign / utm_content. See src/nurture/nurture-booking-link.js.
+ *
+ * v1.4 — 2026-05-12. Pass context to buildNurtureState so it can omit
+ *   contact merge tags (first_name, last_name, phone, email) the lead
+ *   doesn't actually have on file. Without context, the builder
+ *   defaults to NO contact merge tags — UTMs only.
  */
 
 import crypto from 'crypto';
@@ -114,9 +119,11 @@ export async function runNurtureGeneration(request) {
   // Must happen AFTER selectPrompt (we need the prompt metadata to
   // derive utm_content) but BEFORE generateNurtureContent (the
   // user_prompt_template references {{nurture_state.booking_url}}).
-  // See src/nurture/nurture-booking-link.js for the URL composition
-  // and UTM scheme.
-  context.nurture_state = buildNurtureState(prompt, request);
+  // Pass context so the builder can omit contact merge tags the lead
+  // doesn't have on file (e.g. no last_name → no last_name param).
+  // See src/nurture/nurture-booking-link.js for the URL composition,
+  // UTM scheme, and conditional-field rules.
+  context.nurture_state = buildNurtureState(prompt, request, context);
   console.log(`[NurtureOrch] nurture_state campaign="${context.nurture_state.utm_campaign}" content="${context.nurture_state.utm_content}"`);
 
   // Step 4 — generate

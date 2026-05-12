@@ -30,12 +30,26 @@
  *
  * MERGE TAGS IN THE URL
  * ─────────────────────
- * The URL contains literal {{contact.first_name}} and {{contact.phone}}
- * substrings. These resolve at GHL send time, not in our renderTemplate
- * pass (which only walks context paths, not contact.* keys). The
- * orchestrator's renderTemplate substitutes {{nurture_state.booking_url}}
- * with the entire URL string — the {{contact.*}} braces are part of
- * the substituted value and pass through to GHL unmolested.
+ * The URL contains literal {{contact.*}} substrings for contact
+ * fields that exist on the lead. These resolve at GHL send time, not
+ * in our renderTemplate pass (which only walks context paths, not
+ * contact.* keys). The orchestrator's renderTemplate substitutes
+ * {{nurture_state.booking_url}} with the entire URL string — the
+ * {{contact.*}} braces are part of the substituted value and pass
+ * through to GHL unmolested.
+ *
+ * CONDITIONAL CONTACT FIELDS (v1.1 — 2026-05-12)
+ * ──────────────────────────────────────────────
+ * Contact field merge tags (first_name, last_name, phone, email) are
+ * only included when the corresponding field exists on the lead in
+ * context.lead.*. Absent fields are omitted from the URL entirely
+ * rather than rendering as `&last_name=`. Rationale: a contact with
+ * only a phone number shouldn't surface empty params downstream, and
+ * the landing page can pre-fill only the fields we actually have.
+ *
+ * Detection is "non-empty after trimming" — null, undefined, '', and
+ * whitespace-only all count as absent. If you want a field to ALWAYS
+ * appear regardless of value, add it to ALWAYS_INCLUDE below.
  *
  * EXTENSION POINT
  * ───────────────
@@ -46,6 +60,25 @@
  */
 
 const BOOKING_BASE_URL = 'https://landing.reecewindows.com/window-estimate';
+
+/**
+ * Contact fields we will include in the URL as GHL merge tags when
+ * the field has a non-empty value on the lead. Order is preserved
+ * in the output URL so generated URLs are consistent across calls
+ * for the same contact (helps with caching, log readability, and
+ * any downstream UTM analytics that match on URL substrings).
+ */
+const CONTACT_FIELD_MAP = [
+  { leadKey: 'first_name', urlKey: 'first_name', mergeTag: '{{contact.first_name}}' },
+  { leadKey: 'last_name',  urlKey: 'last_name',  mergeTag: '{{contact.last_name}}'  },
+  { leadKey: 'phone',      urlKey: 'phone',      mergeTag: '{{contact.phone}}'      },
+  { leadKey: 'email',      urlKey: 'email',      mergeTag: '{{contact.email}}'      },
+];
+
+function hasValue(v) {
+  if (v === null || v === undefined) return false;
+  return String(v).trim().length > 0;
+}
 
 /**
  * Compute UTM parameters for a single generation.
@@ -100,13 +133,15 @@ export function buildBookingUtms(prompt, request) {
 }
 
 /**
- * Build the booking URL from UTM params, preserving GHL merge tags
- * for runtime contact-field substitution.
+ * Build the booking URL from UTM params + lead, preserving GHL merge
+ * tags for runtime contact-field substitution and omitting any
+ * contact fields the lead doesn't have on file.
  *
- * Output shape:
+ * Output shape (example, lead has first_name + phone + email but no last_name):
  *   https://landing.reecewindows.com/window-estimate?
  *     first_name={{contact.first_name}}&
  *     phone={{contact.phone}}&
+ *     email={{contact.email}}&
  *     utm_source=ghl&
  *     utm_medium=email&
  *     utm_campaign=<campaign>&
@@ -117,17 +152,27 @@ export function buildBookingUtms(prompt, request) {
  * text rather than merge tags. Plain concatenation is correct here.
  *
  * @param {{source,medium,campaign,content}} utm
+ * @param {object} lead  — context.lead object; first_name/last_name/phone/email
+ *                         are checked for non-empty values
  * @returns {string} fully-composed URL with merge tags intact
  */
-export function buildBookingUrl(utm) {
-  const parts = [
-    `first_name={{contact.first_name}}`,
-    `phone={{contact.phone}}`,
-    `utm_source=${encodeURIComponent(utm.source)}`,
-    `utm_medium=${encodeURIComponent(utm.medium)}`,
-    `utm_campaign=${encodeURIComponent(utm.campaign)}`,
-    `utm_content=${encodeURIComponent(utm.content)}`,
-  ];
+export function buildBookingUrl(utm, lead = {}) {
+  const parts = [];
+
+  // Contact fields first — only include each one if the lead has a
+  // non-empty value for it. Missing fields are omitted entirely.
+  for (const { leadKey, urlKey, mergeTag } of CONTACT_FIELD_MAP) {
+    if (hasValue(lead?.[leadKey])) {
+      parts.push(`${urlKey}=${mergeTag}`);
+    }
+  }
+
+  // UTM params — always present, regardless of contact field state.
+  parts.push(`utm_source=${encodeURIComponent(utm.source)}`);
+  parts.push(`utm_medium=${encodeURIComponent(utm.medium)}`);
+  parts.push(`utm_campaign=${encodeURIComponent(utm.campaign)}`);
+  parts.push(`utm_content=${encodeURIComponent(utm.content)}`);
+
   return `${BOOKING_BASE_URL}?${parts.join('&')}`;
 }
 
@@ -136,7 +181,7 @@ export function buildBookingUrl(utm) {
  * injected into the context envelope before generation.
  *
  * The orchestrator should set:
- *   context.nurture_state = buildNurtureState(prompt, request);
+ *   context.nurture_state = buildNurtureState(prompt, request, context);
  *
  * After injection, the user_prompt_template can reference any of:
  *   {{nurture_state.booking_url}}
@@ -147,12 +192,18 @@ export function buildBookingUrl(utm) {
  *
  * @param {object} prompt
  * @param {object} request
+ * @param {object} context  — the lead context envelope, used to read
+ *                            lead.first_name / last_name / phone / email
+ *                            so absent fields can be omitted from the URL.
+ *                            Optional for backwards compatibility — when
+ *                            omitted, NO contact merge tags are included.
  * @returns {{booking_url:string, utm_campaign:string, utm_content:string, utm_source:string, utm_medium:string}}
  */
-export function buildNurtureState(prompt, request) {
+export function buildNurtureState(prompt, request, context = {}) {
   const utm = buildBookingUtms(prompt, request);
+  const lead = context?.lead || {};
   return {
-    booking_url: buildBookingUrl(utm),
+    booking_url: buildBookingUrl(utm, lead),
     utm_campaign: utm.campaign,
     utm_content: utm.content,
     utm_source: utm.source,
