@@ -44,6 +44,21 @@
  *      Doors") so any signature in body_html duplicates it. Patterns
  *      catch em-dash signatures, common sign-offs, and bare
  *      "Reece Windows & Doors" lines.
+ *
+ * v1.3 — 2026-05-12. Dynamic-UTM migration. Replaces static GHL
+ *   trigger links with per-message landing URLs (see
+ *   src/nurture/nurture-booking-link.js). The new prompts require all
+ *   booking CTAs to use the rendered nurture_state.booking_url wrapped
+ *   in <a href="..."> with FRIENDLY descriptive link text. Two new
+ *   blockers enforce that contract:
+ *     BARE_URL — URL appears in body or ps_text without being wrapped
+ *       in <a href="..."> tags. Subjects/preheaders are skipped since
+ *       links there don't make sense.
+ *     WEAK_CTA_TEXT — anchor inner text is one of the weak-CTA
+ *       phrases ("click here", "click", "here", "this link",
+ *       "read more", "learn more"). Forces descriptive link text
+ *       like "Book your free window estimate" so the click reads
+ *       as a clear next step.
  */
 
 export const HARD_BLOCKER_CODES = Object.freeze({
@@ -64,6 +79,9 @@ export const HARD_BLOCKER_CODES = Object.freeze({
   OUTCOME_GUARANTEE:       'OUTCOME_GUARANTEE',
   // v1.2 — defense in depth for the template-hardcoded signature
   BODY_CONTAINS_SIGNATURE: 'BODY_CONTAINS_SIGNATURE',
+  // v1.3 — friendly-CTA enforcement for the dynamic-UTM URL scheme
+  BARE_URL:                'BARE_URL',
+  WEAK_CTA_TEXT:           'WEAK_CTA_TEXT',
 });
 
 // Phrases that indicate fake urgency unless the prompt has a real
@@ -179,6 +197,81 @@ function hasBodySignature(bodyHtml) {
   if (!bodyHtml) return false;
   for (const rx of BODY_SIGNATURE_PATTERNS) {
     if (rx.test(bodyHtml)) return true;
+  }
+  return false;
+}
+
+// v1.3: BARE_URL detection.
+// Any http(s) URL appearing in body or ps_text MUST be wrapped in an
+// <a href="..."> tag. Bare URLs render as plain text in many clients
+// and look unprofessional alongside other linked CTAs. The check is:
+// every http(s) URL substring must be inside an href attribute OR
+// already part of an <a> tag (in case the URL appears as visible text
+// AND as the href — which is fine, the model is allowed to show the
+// URL as the visible text).
+//
+// Implementation strategy: strip everything inside <a href="...">...</a>
+// blocks (both attribute and inner text), then look for any remaining
+// http(s) URL. If found → BARE_URL.
+const BARE_URL_TEST = /https?:\/\//i;
+const ANCHOR_BLOCK = /<a\s[^>]*href=["'][^"']*["'][^>]*>[\s\S]*?<\/a>/gi;
+
+function hasBareUrl(text) {
+  if (!text) return false;
+  // Strip everything inside <a>...</a> tags entirely — both the href
+  // attribute and the inner content. Anything left over with http(s)
+  // is bare.
+  const stripped = String(text).replace(ANCHOR_BLOCK, '');
+  return BARE_URL_TEST.test(stripped);
+}
+
+// v1.3: WEAK_CTA_TEXT detection.
+// The visible text inside an <a> tag should describe what clicking will
+// do ("Book your free window estimate", "See your storm protection
+// options"). Generic placeholder text ("click here", "click", "here",
+// "this link", "read more", "learn more") forces the reader to figure
+// out from context what the link is for — and it scores poorly with
+// screen readers and accessibility checks.
+//
+// Match: <a ...>text</a> where lowercased trimmed text exactly equals
+// or starts-with-then-trivially-extends one of the weak phrases.
+// "click here for details" → flagged. "click here." → flagged.
+// "Click here to book your free estimate" → flagged (starts with weak).
+// "Book your free estimate" → passes.
+const WEAK_CTA_PHRASES = [
+  'click here',
+  'click',
+  'here',
+  'this link',
+  'read more',
+  'learn more',
+  'tap here',
+  'go here',
+];
+
+const ANCHOR_WITH_TEXT = /<a\s[^>]*href=["'][^"']*["'][^>]*>([\s\S]*?)<\/a>/gi;
+
+function hasWeakCtaText(text) {
+  if (!text) return false;
+  let match;
+  // Reset lastIndex since regex has /g flag
+  const rx = new RegExp(ANCHOR_WITH_TEXT.source, ANCHOR_WITH_TEXT.flags);
+  while ((match = rx.exec(text)) !== null) {
+    // Inner text — strip any nested HTML and normalize whitespace/punct
+    const inner = match[1]
+      .replace(/<[^>]+>/g, '')
+      .replace(/&[a-z]+;/gi, ' ')
+      .replace(/[.!?,;:]+$/, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+    if (!inner) continue;
+    for (const phrase of WEAK_CTA_PHRASES) {
+      // Exact match OR starts with phrase followed by a word boundary
+      // (so "click here for details" is flagged but "clicking" isn't).
+      if (inner === phrase) return true;
+      if (inner.startsWith(phrase + ' ')) return true;
+    }
   }
   return false;
 }
@@ -320,6 +413,23 @@ export function runHardBlockers(output, prompt, context) {
   //     in body duplicates it. Patterns ONLY fire on body_html.
   if (hasBodySignature(output.body_html)) {
     failures.push(HARD_BLOCKER_CODES.BODY_CONTAINS_SIGNATURE);
+  }
+
+  // v1.3
+  // 15. Bare URL — every http(s) URL in body or ps_text must be wrapped
+  //     in <a href="...">visible text</a>. Bare URLs look unprofessional
+  //     alongside other CTAs and break the friendly-CTA contract.
+  const linkScanText = (output.body_html || '') + ' ' + (output.ps_text || '');
+  if (hasBareUrl(linkScanText)) {
+    failures.push(HARD_BLOCKER_CODES.BARE_URL);
+  }
+
+  // 16. Weak CTA text — anchor inner text must be descriptive. Phrases
+  //     like "click here" / "click" / "here" / "read more" force the
+  //     reader to figure out what clicking does. Required: descriptive
+  //     CTA like "Book your free window estimate".
+  if (hasWeakCtaText(linkScanText)) {
+    failures.push(HARD_BLOCKER_CODES.WEAK_CTA_TEXT);
   }
 
   return {
