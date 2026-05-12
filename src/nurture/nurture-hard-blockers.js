@@ -27,6 +27,23 @@
  *       claim will be paid" or "we'll lower your premium". Past-tense
  *       parable references about other families are NOT flagged; the
  *       patterns require "your" or explicit guarantee verbs.
+ *
+ * v1.2 — 2026-05-12. Three changes for the P.S. field migration:
+ *   1. MISSING_BOOKING_LINK now checks body_html OR ps_text. With the
+ *      new email-template architecture, booking links live in the P.S.
+ *      section (Stage 2-3+) rather than the body. Previous check
+ *      always failed since body_html no longer carries booking links.
+ *   2. MISSING_BOOKING_LINK is SKIPPED when the prompt targets buyer
+ *      stage 1 (prompt.buyer_stage_target === 1). Stage 1 nurture is
+ *      intentionally no-CTA — the CTA rules in the system prompts
+ *      forbid booking links anywhere on Stage 1 messages. Requiring
+ *      one would force the model to violate its own instructions.
+ *   3. NEW: BODY_CONTAINS_SIGNATURE — detects when the model adds a
+ *      signature inside body_html. The email template now hardcodes
+ *      a two-line signature block (rep name + "Reece Windows &
+ *      Doors") so any signature in body_html duplicates it. Patterns
+ *      catch em-dash signatures, common sign-offs, and bare
+ *      "Reece Windows & Doors" lines.
  */
 
 export const HARD_BLOCKER_CODES = Object.freeze({
@@ -45,6 +62,8 @@ export const HARD_BLOCKER_CODES = Object.freeze({
   // v1.1 — compliance gates from S4.5 storyline rotation calendar §7
   BRAND_LINE_VIOLATION:    'BRAND_LINE_VIOLATION',
   OUTCOME_GUARANTEE:       'OUTCOME_GUARANTEE',
+  // v1.2 — defense in depth for the template-hardcoded signature
+  BODY_CONTAINS_SIGNATURE: 'BODY_CONTAINS_SIGNATURE',
 });
 
 // Phrases that indicate fake urgency unless the prompt has a real
@@ -133,6 +152,37 @@ function hasOutcomeGuarantee(text) {
   return false;
 }
 
+// v1.2: BODY_CONTAINS_SIGNATURE detection.
+// The email template hardcodes a two-line signature block after body_html:
+//   Line 1: rep name (resolved from {{custom_values.rep_name}})
+//   Line 2: Reece Windows & Doors
+// Any signature inside body_html duplicates this. Patterns catch the
+// common slips: em-dash + rep name pattern, "Reece Windows & Doors"
+// anywhere in body, classic sign-offs near end of body, etc.
+//
+// These patterns ONLY fire on body_html — subject lines, preheaders,
+// and SMS are NOT checked (signatures aren't a risk there).
+const BODY_SIGNATURE_PATTERNS = [
+  // Em-dash + merge tag
+  /—\s*\{\{\s*custom_values\.rep_name\s*\}\}/i,
+  // Em-dash + literal rep names
+  /—\s*(Mark|Randy|Mark Richard|Randy Reece)(\s|<|$|,|\.)/i,
+  // Company name anywhere in body — template adds it, body must not
+  /Reece\s+Windows\s+(&|&amp;|and)\s+Doors/i,
+  // Classic sign-offs — match start of paragraph or end of body proximity
+  /<p[^>]*>\s*(Best|Talk soon|Sincerely|Cheers|Warmly|Regards|All the best),?\s*(<br\s*\/?>|<\/p>|$)/i,
+  // Collective sign-offs
+  /—\s*(the\s+)?Reece(\s+team)?(\s|<|$|,|\.)/i,
+];
+
+function hasBodySignature(bodyHtml) {
+  if (!bodyHtml) return false;
+  for (const rx of BODY_SIGNATURE_PATTERNS) {
+    if (rx.test(bodyHtml)) return true;
+  }
+  return false;
+}
+
 function stripHtml(html) {
   return String(html || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 }
@@ -203,10 +253,18 @@ export function runHardBlockers(output, prompt, context) {
     }
   }
 
-  // 8. Booking link in body — accepts http(s) URL or {{trigger_link.*}} tag
-  if (output.body_html) {
-    const hasUrl = /https?:\/\//i.test(output.body_html);
-    const hasMergeTag = /\{\{\s*trigger_link\./i.test(output.body_html);
+  // 8. Booking link — accepts http(s) URL or {{trigger_link.*}} merge tag
+  //    in EITHER body_html OR ps_text. With the new email-template
+  //    architecture, booking links live in the P.S. section (Stage 2-3+)
+  //    not the body. Stage 1 prompts intentionally have NO booking link
+  //    anywhere (the prompt's CTA RULES forbid it) — skip this check
+  //    entirely when prompt.buyer_stage_target === 1.
+  if (prompt?.buyer_stage_target !== 1) {
+    const bodyText = output.body_html || '';
+    const psText = output.ps_text || '';
+    const combined = bodyText + ' ' + psText;
+    const hasUrl = /https?:\/\//i.test(combined);
+    const hasMergeTag = /\{\{\s*trigger_link\./i.test(combined);
     if (!hasUrl && !hasMergeTag) {
       failures.push(HARD_BLOCKER_CODES.MISSING_BOOKING_LINK);
     }
@@ -253,6 +311,15 @@ export function runHardBlockers(output, prompt, context) {
   //     reader. Past-tense parable references about other families are NOT flagged.
   if (hasOutcomeGuarantee(fullTextPreserveCase)) {
     failures.push(HARD_BLOCKER_CODES.OUTCOME_GUARANTEE);
+  }
+
+  // v1.2
+  // 14. Body contains signature — body_html must NOT include the rep name,
+  //     "Reece Windows & Doors", or a classic sign-off. The email template
+  //     hardcodes a two-line signature block AFTER body_html; any signature
+  //     in body duplicates it. Patterns ONLY fire on body_html.
+  if (hasBodySignature(output.body_html)) {
+    failures.push(HARD_BLOCKER_CODES.BODY_CONTAINS_SIGNATURE);
   }
 
   return {
