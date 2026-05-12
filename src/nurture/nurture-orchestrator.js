@@ -6,7 +6,8 @@
  *   2. checkInterrupts   (inline — booked, DNC, recent reply)
  *   3. selectPrompt      (nurture-prompt-selector.js, falls back to GENERIC)
  *   3b. injectNurtureState (buildNurtureState — dynamic booking URL + UTMs)
- *   3c. adaptiveCtaEvolution (cta-evolution.js — mutate cta_type by signals)
+ *   3c. adaptiveCtaEvolution (cta-evolution.js — mutate cta_type + inject
+ *       system-prompt override when completion signals fire)
  *   4. generateContent   (nurture-generator.js)
  *   5. hardBlockers      (nurture-hard-blockers.js — Pass A, one retry)
  *   6. scoreMessage      (message-content-scorer.js — Pass B, one retry, hybrid floor+threshold)
@@ -73,6 +74,24 @@
  *   signals fire (HRR completed, HG sent). Persistence of the
  *   mutation reaches agentic_messages.evolved_cta_type +
  *   cta_mutation_reason for audit.
+ * v1.7 — 2026-05-12. EVOLUTION OVERRIDE injection. Step 3c now ALSO
+ *   calls injectEvolutionOverride() after applyEvolution() to extend
+ *   the prompt's system_prompt with an explicit override block. The
+ *   override tells the model the contact already consumed the resource
+ *   (past tense), the RESOURCE BINDING is overridden, and what copy
+ *   pattern to follow for the evolved CTA type.
+ *
+ *   Without this, the prompt's RESOURCE BINDING block still told the
+ *   model to describe the original resource (e.g., "describe the Home
+ *   Risk Report"), and the model produced bait-and-switch copy: Risk-
+ *   Report-offer language attached to a Window Estimate booking URL.
+ *   Verified live failure today (gen_1778622132866_60175241).
+ *
+ *   `prompt` is rebound after injection — it becomes a NEW object via
+ *   spread, with system_prompt extended. Subsequent retry paths
+ *   (constrainedPrompt, judgeFeedbackPrompt) inherit the override
+ *   naturally because they spread from the rebound `prompt`. The
+ *   underlying agentic_messaging_prompts row is never mutated.
  */
 
 import crypto from 'crypto';
@@ -86,7 +105,7 @@ import { writeBackToGHL, writeDraftsOnly } from './nurture-writeback.js';
 import { sendGroupMeMessage } from '../groupme.js';
 import { resolveSequencePosition } from './nurture-sequence-resolver.js';
 import { buildNurtureState } from './nurture-booking-link.js';
-import { resolveAdaptiveCta, applyEvolution } from '../agentic/cta-evolution.js';
+import { resolveAdaptiveCta, applyEvolution, injectEvolutionOverride } from '../agentic/cta-evolution.js';
 
 const SHADOW_MODE = process.env.NURTURE_SHADOW_MODE === 'true';
 
@@ -208,8 +227,21 @@ export async function runNurtureGeneration(request) {
   // done the micro-commitment (HRR completed, HG sent), rather than
   // re-offering the same resource.
   //
-  // Pure function; never throws but wrapped defensively so a future
-  // rule with a buggy condition can't break generation.
+  // Three actions when an evolution fires:
+  //   1. applyEvolution() — mutates nurture_state in place (cta_type,
+  //      booking_url, url_mode, has_ps) so the user-prompt template
+  //      renders with the evolved values.
+  //   2. injectEvolutionOverride() — returns a NEW prompt object with
+  //      the evolution's override_text appended to system_prompt. The
+  //      override tells the model the resource is past tense and the
+  //      RESOURCE BINDING block is explicitly overridden. Without this,
+  //      the model would write copy describing the original resource
+  //      while linking to the new (different) URL — bait-and-switch.
+  //   3. Persist the mutation to agentic_messages.evolved_cta_type +
+  //      cta_mutation_reason via the writeback helpers below.
+  //
+  // Pure function paths; defensively wrapped so a future rule with a
+  // buggy condition cannot break generation.
   let evolution = null;
   try {
     evolution = resolveAdaptiveCta({
@@ -219,7 +251,9 @@ export async function runNurtureGeneration(request) {
     });
     if (evolution) {
       applyEvolution(context.nurture_state, evolution);
-      console.log(`[NurtureOrch] cta evolved ${generation_id}: ${prompt.cta_type} → ${evolution.cta_type} reason=${evolution.mutation_reason}`);
+      const baseCta = prompt.cta_type; // captured BEFORE rebind so log shows base→evolved correctly
+      prompt = injectEvolutionOverride(prompt, evolution);
+      console.log(`[NurtureOrch] cta evolved ${generation_id}: ${baseCta} → ${evolution.cta_type} reason=${evolution.mutation_reason} override_chars=${(evolution.override_text || '').length}`);
     }
   } catch (evolErr) {
     console.warn(`[NurtureOrch] cta evolution threw for ${generation_id}: ${evolErr.message} — proceeding with base cta_type`);
