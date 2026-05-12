@@ -51,6 +51,14 @@ function shapeError(err) {
   return { status, body };
 }
 
+async function fetchExistingLink(id) {
+  const { data } = await client.get('/links/', {
+    params: { locationId: GHL_LOCATION_ID },
+  });
+  const links = Array.isArray(data?.links) ? data.links : (Array.isArray(data) ? data : []);
+  return links.find(l => l.id === id) || null;
+}
+
 export function registerGhlTriggerLinkRoutes(app) {
 
   // ───────────────────────────────────────────────────────────────
@@ -125,12 +133,7 @@ export function registerGhlTriggerLinkRoutes(app) {
   app.get('/admin/ghl-links/:id', async (req, res) => {
     if (!ensureReady(res)) return;
     try {
-      // GHL doesn't expose a single-get; list and filter
-      const { data } = await client.get('/links/', {
-        params: { locationId: GHL_LOCATION_ID },
-      });
-      const links = Array.isArray(data?.links) ? data.links : (Array.isArray(data) ? data : []);
-      const match = links.find(l => l.id === req.params.id);
+      const match = await fetchExistingLink(req.params.id);
       if (!match) return res.status(404).json({ ok: false, error: 'not_found' });
       res.json({ ok: true, link: match });
     } catch (err) {
@@ -141,23 +144,44 @@ export function registerGhlTriggerLinkRoutes(app) {
 
   // ───────────────────────────────────────────────────────────────
   // PUT /admin/ghl-links/:id — update redirectTo / name
+  //
+  // GHL PUT /links/:id requires:
+  //   - `name` to always be present (even on partial update)
+  //   - `locationId` to NOT be present (422 if included)
+  // If caller omits `name`, we fetch the existing record to preserve it.
   // ───────────────────────────────────────────────────────────────
   app.put('/admin/ghl-links/:id', async (req, res) => {
     if (!ensureReady(res)) return;
-    const updates = {};
-    if (req.body?.name) updates.name = req.body.name;
-    if (req.body?.redirectTo) updates.redirectTo = req.body.redirectTo;
-    if (Object.keys(updates).length === 0) {
+
+    const wantName = req.body?.name;
+    const wantRedirect = req.body?.redirectTo;
+
+    if (!wantName && !wantRedirect) {
       return res.status(400).json({ ok: false, error: 'nothing to update' });
     }
+
     try {
+      // Always need to know existing record to preserve `name`
+      // when caller is only updating redirectTo.
+      let resolvedName = wantName;
+      let resolvedRedirect = wantRedirect;
+
+      if (!resolvedName || !resolvedRedirect) {
+        const existing = await fetchExistingLink(req.params.id);
+        if (!existing) return res.status(404).json({ ok: false, error: 'not_found' });
+        resolvedName = resolvedName || existing.name;
+        resolvedRedirect = resolvedRedirect || existing.redirectTo;
+      }
+
       const { data } = await client.put(`/links/${req.params.id}`, {
-        ...updates,
-        locationId: GHL_LOCATION_ID,
+        name: resolvedName,
+        redirectTo: resolvedRedirect,
       });
+      console.log(`[GHL Links] Updated id=${req.params.id} → ${resolvedRedirect}`);
       res.json({ ok: true, link: data?.link || data });
     } catch (err) {
       const e = shapeError(err);
+      console.error(`[GHL Links] update failed: HTTP ${e.status}`, JSON.stringify(e.body).slice(0, 300));
       res.status(502).json({ ok: false, error: 'ghl_update_failed', status: e.status, body: e.body });
     }
   });
