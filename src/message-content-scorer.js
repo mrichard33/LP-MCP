@@ -26,18 +26,54 @@
  *     // regenerate, log result.failureReasons
  *   }
  *
+ * SCORING SCALE
+ * ─────────────
+ * Every dimension is on a 0.0–1.0 scale where 1.0 is perfect (equivalent
+ * to 100%). The judge prompt anchors the scale explicitly:
+ *   0.9–1.0  Excellent
+ *   0.7–0.89 Solid (production-acceptable)
+ *   0.5–0.69 Marginal
+ *   0.3–0.49 Weak
+ *   0.0–0.29 Broken
+ * Multiply by 100 if you want percentage display.
+ *
+ * TWO SUMMARY METRICS (v1.1 — 2026-05-12)
+ * ────────────────────────────────────────
+ * The result includes BOTH:
+ *
+ *   overallScore — Math.min of the five dimensions. Designed as a
+ *                  HARSH guardrail: a single broken axis (e.g. 0.30
+ *                  on trust) blocks the message even if other axes
+ *                  are 0.90+. Caller uses this as a FLOOR check.
+ *
+ *   averageScore — mean of the five dimensions. Designed as the
+ *                  HOLISTIC quality signal — what a human reviewer
+ *                  would call "how good was this message overall."
+ *                  Caller uses this for the THRESHOLD check.
+ *
+ * The orchestrator uses a hybrid: pass when min ≥ floor AND avg ≥
+ * threshold. This prevents one weak axis from killing otherwise-strong
+ * work (the old behavior) while still catching truly broken outputs.
+ * See src/nurture/nurture-orchestrator.js for the decision logic.
+ *
+ * The result's `passed` field stays bound to the old MIN ≥ threshold
+ * rule for backwards compatibility with response-generator.js and any
+ * other caller. New callers should derive their own decision from
+ * `dimensions`, `overallScore`, and `averageScore` directly.
+ *
  * Returns:
  *   {
- *     passed: boolean,
- *     overallScore: number,      // min of dimensions, 0-1
- *     threshold: number,         // applied threshold (snapshot)
+ *     passed: boolean,             // overallScore >= threshold (legacy)
+ *     overallScore: number,        // min of dimensions, 0–1
+ *     averageScore: number,        // mean of dimensions, 0–1 (NEW v1.1)
+ *     threshold: number,           // applied threshold (snapshot)
  *     dimensions: {
  *       relevance, stageAlignment, trust, clarity, forwardMomentum
  *     },
- *     failureReasons: string[],  // from CONTROLLED_VOCAB
+ *     failureReasons: string[],    // from CONTROLLED_VOCAB
  *     scorerModel: string,
  *     latencyMs: number,
- *     raw: object,               // full Claude response, for logging
+ *     raw: object,                 // full Claude response, for logging
  *   }
  *
  * Env vars:
@@ -48,6 +84,8 @@
  *
  * v1.0 — Initial. No persistence layer here — caller is responsible
  *        for writing to message_scores table. Keeps this module pure.
+ * v1.1 — 2026-05-12. Add averageScore to result for hybrid floor +
+ *        threshold scoring in the nurture orchestrator.
  */
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
@@ -290,6 +328,7 @@ function parseScoreJson(rawText) {
  * @returns {Promise<{
  *   passed: boolean,
  *   overallScore: number,
+ *   averageScore: number,
  *   threshold: number,
  *   dimensions: { relevance, stageAlignment, trust, clarity, forwardMomentum },
  *   failureReasons: string[],
@@ -319,9 +358,10 @@ export async function scoreMessage(input) {
   const { rawText, fullResponse } = await callClaude(systemPrompt, userPrompt);
   const { dimensions, failureReasons, rationale } = parseScoreJson(rawText);
 
-  // Overall score = MIN of dimensions. A message is only as strong as
-  // its weakest axis. Weighted-avg lets a strong axis paper over a
-  // broken one — we don't want that.
+  // overallScore — Math.min. A HARSH guardrail: catches a single broken
+  // axis (e.g. trust 0.30) even when others are strong. The orchestrator
+  // uses this for FLOOR checks. Callers wanting holistic quality should
+  // read averageScore instead.
   const overallScore = Math.min(
     dimensions.relevance,
     dimensions.stageAlignment,
@@ -330,12 +370,30 @@ export async function scoreMessage(input) {
     dimensions.forwardMomentum,
   );
 
+  // averageScore — arithmetic mean. The HOLISTIC quality signal — what
+  // a human reviewer would call "how good was this message overall."
+  // The orchestrator uses this for THRESHOLD checks.
+  const dimVals = [
+    dimensions.relevance,
+    dimensions.stageAlignment,
+    dimensions.trust,
+    dimensions.clarity,
+    dimensions.forwardMomentum,
+  ];
+  const averageScore = dimVals.reduce((sum, v) => sum + v, 0) / dimVals.length;
+
+  // Legacy `passed` field stays bound to overallScore (MIN >= threshold).
+  // Backwards-compatible with response-generator.js and any external
+  // caller that depends on this semantic. New callers (the nurture
+  // orchestrator) compute their own pass/soft-pass/fail decision from
+  // the raw dimensions, overallScore, and averageScore.
   const passed = overallScore >= threshold;
   const latencyMs = Date.now() - startedAt;
 
   return {
     passed,
     overallScore,
+    averageScore,
     threshold,
     dimensions,
     failureReasons,
