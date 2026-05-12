@@ -3,6 +3,19 @@
 // Maps LP Supabase fields → GHL custom field IDs.
 // ALL FIELD IDS CONFIRMED via HL MCP cache — March 24, 2026
 //
+// v5 — May 12, 2026
+// - FIX: Adds canonical "LP Lead ID" write (GmAVmW6V9sekD7pVONKr).
+//   Previously the `lp_lead_id` entry routed solely to
+//   yII9akTft1RKOG0Ri4Q9 ("LP Last Appointment ID"), leaving the
+//   canonical LP Lead ID field GHL-side empty. That broke
+//   lp-appointment-sync.js resolver Step 1, which reads the canonical
+//   field — every booking fell through Steps 0/2/3/4 and frequently
+//   triggered the `lp-sync-failed` tag → I.LP-FAIL workflow alerts.
+//   See: I.LP-FAIL (cca1f069) firing email+SMS to dispatch/Edwin/Trudy/Jazmine.
+// - Existing yII9akTft1RKOG0Ri4Q9 write preserved under
+//   `lp_last_appointment_id` key — any downstream consumer of that
+//   field keeps getting the same value it always did.
+//
 // v4 — March 24, 2026
 // - Works with MERGED lead objects from ghl-field-sync.js v3
 // - Status fields (rep, promoter, source) pass empty strings to CLEAR
@@ -21,7 +34,24 @@ const GHL_FIELD_MAP = {
     label: 'LP Prospect ID',
     transform: (lead) => lead.lp_prospect_id || null,
   },
+  // v5 FIX: Canonical "LP Lead ID" field per system prompt master
+  // reference + ghl-field-decoder.js. This is what
+  // lp-appointment-sync.js resolver Step 1 reads
+  // (LP_LEAD_ID_FIELD = 'GmAVmW6V9sekD7pVONKr'). Without it populated,
+  // the resolver falls through to lognumber-dependent steps and often
+  // tags `lp-sync-failed`, firing the I.LP-FAIL handler workflow.
   lp_lead_id: {
+    ghlFieldId: 'GmAVmW6V9sekD7pVONKr',
+    label: 'LP Lead ID',
+    transform: (lead) => lead.lp_lead_id || null,
+  },
+  // Separate GHL field "LP Last Appointment ID". Previously this slot
+  // was (mistakenly) mapped under the `lp_lead_id` key. Kept here under
+  // its own key so any existing consumer of yII9akTft1RKOG0Ri4Q9 still
+  // receives the newest-lead ID. The value written is identical to
+  // lp_lead_id above — both come from the newest LP lead per
+  // buildMergedLead() in ghl-field-sync.js.
+  lp_last_appointment_id: {
     ghlFieldId: 'yII9akTft1RKOG0Ri4Q9',
     label: 'LP Last Appointment ID',
     transform: (lead) => lead.lp_lead_id || null,
