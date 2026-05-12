@@ -6,6 +6,7 @@
  *   2. checkInterrupts   (inline — booked, DNC, recent reply)
  *   3. selectPrompt      (nurture-prompt-selector.js, falls back to GENERIC)
  *   3b. injectNurtureState (buildNurtureState — dynamic booking URL + UTMs)
+ *   3c. adaptiveCtaEvolution (cta-evolution.js — mutate cta_type by signals)
  *   4. generateContent   (nurture-generator.js)
  *   5. hardBlockers      (nurture-hard-blockers.js — Pass A, one retry)
  *   6. scoreMessage      (message-content-scorer.js — Pass B, one retry, hybrid floor+threshold)
@@ -67,6 +68,11 @@
  *   on AVG. Soft-pass band lands borderline-clean work in the approval
  *   queue instead of suppressing it. GroupMe cards display scores as
  *   0–100 integers to match human mental model.
+ * v1.6 — 2026-05-12. Phase B — adaptive CTA evolution. Step 3c reads
+ *   contact tags and mutates nurture_state.cta_type when completion
+ *   signals fire (HRR completed, HG sent). Persistence of the
+ *   mutation reaches agentic_messages.evolved_cta_type +
+ *   cta_mutation_reason for audit.
  */
 
 import crypto from 'crypto';
@@ -80,6 +86,7 @@ import { writeBackToGHL, writeDraftsOnly } from './nurture-writeback.js';
 import { sendGroupMeMessage } from '../groupme.js';
 import { resolveSequencePosition } from './nurture-sequence-resolver.js';
 import { buildNurtureState } from './nurture-booking-link.js';
+import { resolveAdaptiveCta, applyEvolution } from '../agentic/cta-evolution.js';
 
 const SHADOW_MODE = process.env.NURTURE_SHADOW_MODE === 'true';
 
@@ -193,7 +200,33 @@ export async function runNurtureGeneration(request) {
 
   // Step 3b — inject nurture_state (dynamic booking URL + UTMs).
   context.nurture_state = buildNurtureState(prompt, request, context);
-  console.log(`[NurtureOrch] nurture_state campaign="${context.nurture_state.utm_campaign}" content="${context.nurture_state.utm_content}"`);
+
+  // Step 3c — adaptive CTA evolution (Phase B).
+  //
+  // PRINCIPLE: completion is a stronger behavioral signal than no-
+  // engagement, so we ESCALATE the cta_type when a contact has already
+  // done the micro-commitment (HRR completed, HG sent), rather than
+  // re-offering the same resource.
+  //
+  // Pure function; never throws but wrapped defensively so a future
+  // rule with a buggy condition can't break generation.
+  let evolution = null;
+  try {
+    evolution = resolveAdaptiveCta({
+      prompt,
+      context,
+      baseState: context.nurture_state,
+    });
+    if (evolution) {
+      applyEvolution(context.nurture_state, evolution);
+      console.log(`[NurtureOrch] cta evolved ${generation_id}: ${prompt.cta_type} → ${evolution.cta_type} reason=${evolution.mutation_reason}`);
+    }
+  } catch (evolErr) {
+    console.warn(`[NurtureOrch] cta evolution threw for ${generation_id}: ${evolErr.message} — proceeding with base cta_type`);
+    evolution = null;
+  }
+
+  console.log(`[NurtureOrch] nurture_state campaign="${context.nurture_state.utm_campaign}" content="${context.nurture_state.utm_content}" cta=${context.nurture_state.cta_type}`);
 
   // Step 4 — generate
   let genResult;
@@ -221,7 +254,7 @@ export async function runNurtureGeneration(request) {
       if (!hardResult.passed) {
         await updateRowOnSuppress(generation_id, 'suppressed_low_conf',
           `hard_blockers_after_retry:${hardResult.failures.join(',')}`,
-          { output: genResult.output, hard_failures: hardResult.failures, retry_count: retryCount });
+          { output: genResult.output, hard_failures: hardResult.failures, retry_count: retryCount, evolution });
         await alertGroupMe(buildSuppressionCard(request, context, generation_id, 'hard_blockers_after_retry', {
           hardFailures: hardResult.failures,
           subject: genResult.output && genResult.output.subject,
@@ -276,7 +309,7 @@ export async function runNurtureGeneration(request) {
       if (!reHard.passed) {
         await updateRowOnSuppress(generation_id, 'suppressed_low_conf',
           `hard_blockers_on_retry:${reHard.failures.join(',')}`,
-          { output: genResult.output, hard_failures: reHard.failures, retry_count: retryCount });
+          { output: genResult.output, hard_failures: reHard.failures, retry_count: retryCount, evolution });
         await alertGroupMe(buildSuppressionCard(request, context, generation_id, 'b_retry_hit_hard_blockers', {
           hardFailures: reHard.failures,
           subject: genResult.output && genResult.output.subject,
@@ -297,6 +330,7 @@ export async function runNurtureGeneration(request) {
             confidence_score: scoreResult.overallScore,
             confidence_breakdown: scoreResult,
             retry_count: retryCount,
+            evolution,
           });
         await alertGroupMe(buildSuppressionCard(request, context, generation_id, 'low_score_after_retry', {
           min: evalResult.min,
@@ -323,7 +357,7 @@ export async function runNurtureGeneration(request) {
   try {
     if (SHADOW_MODE || evalResult.decision === 'soft_pass') {
       await writeDraftsOnly(request.contact_id, genResult.output, generation_id, scoreResult.overallScore);
-      await markAwaitingApproval(generation_id, genResult.output, scoreResult, retryCount, evalResult);
+      await markAwaitingApproval(generation_id, genResult.output, scoreResult, retryCount, evalResult, evolution);
       const cardReason = SHADOW_MODE ? 'shadow_mode' : 'soft_pass';
       await alertGroupMe(buildApprovalCard(request, context, generation_id, genResult.output, scoreResult, retryCount, evalResult, cardReason));
       return finishResponse(generation_id, false, 'awaiting_approval', startedAt);
@@ -336,11 +370,11 @@ export async function runNurtureGeneration(request) {
   }
 
   // Step 8 — final audit (pass path only)
-  await markGeneratedReady(generation_id, genResult.output, scoreResult, retryCount);
+  await markGeneratedReady(generation_id, genResult.output, scoreResult, retryCount, evolution);
 
   const elapsed = Date.now() - startedAt;
   console.log(`[NurtureOrch] ok ${generation_id} contact=${request.contact_id} wf=${request.workflow_code} ` +
-    `pos=${request.sequence_position} ch=${request.channel} min=${fmt100(evalResult.min)}/100 avg=${fmt100(evalResult.avg)}/100 retries=${retryCount} (${elapsed}ms)`);
+    `pos=${request.sequence_position} ch=${request.channel} min=${fmt100(evalResult.min)}/100 avg=${fmt100(evalResult.avg)}/100 retries=${retryCount}${evolution ? ` evolved=${evolution.cta_type}` : ''} (${elapsed}ms)`);
 
   return finishResponse(generation_id, true, null, startedAt);
 }
@@ -511,13 +545,15 @@ async function updateRowOnSuppress(generation_id, status, reason, extras) {
       confidence_score: extras.confidence_score ?? null,
       confidence_breakdown: extras.confidence_breakdown || null,
       retry_count: extras.retry_count || 0,
+      evolved_cta_type: extras?.evolution?.cta_type || null,
+      cta_mutation_reason: extras?.evolution?.mutation_reason || null,
       updated_at: new Date().toISOString(),
     })
     .eq('generation_id', generation_id);
   if (error) console.warn(`[NurtureOrch] updateRowOnSuppress failed: ${error.message}`);
 }
 
-async function markGeneratedReady(generation_id, output, scoreResult, retryCount) {
+async function markGeneratedReady(generation_id, output, scoreResult, retryCount, evolution = null) {
   if (!supabase) return;
   const { error } = await supabase.from('agentic_messages')
     .update({
@@ -531,6 +567,8 @@ async function markGeneratedReady(generation_id, output, scoreResult, retryCount
       confidence_score: scoreResult.overallScore,
       confidence_breakdown: scoreResult,
       retry_count: retryCount,
+      evolved_cta_type: evolution?.cta_type || null,
+      cta_mutation_reason: evolution?.mutation_reason || null,
       written_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     })
@@ -538,7 +576,7 @@ async function markGeneratedReady(generation_id, output, scoreResult, retryCount
   if (error) console.warn(`[NurtureOrch] markGeneratedReady failed: ${error.message}`);
 }
 
-async function markAwaitingApproval(generation_id, output, scoreResult, retryCount, evalResult) {
+async function markAwaitingApproval(generation_id, output, scoreResult, retryCount, evalResult, evolution = null) {
   if (!supabase) return;
   // For soft-pass, suppressed_reason carries the decision so analytics
   // can distinguish "shadow mode parked" from "borderline awaiting human."
@@ -558,6 +596,8 @@ async function markAwaitingApproval(generation_id, output, scoreResult, retryCou
       confidence_score: scoreResult.overallScore,
       confidence_breakdown: scoreResult,
       retry_count: retryCount,
+      evolved_cta_type: evolution?.cta_type || null,
+      cta_mutation_reason: evolution?.mutation_reason || null,
       written_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     })
