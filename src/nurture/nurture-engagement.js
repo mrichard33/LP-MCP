@@ -18,8 +18,17 @@
  *     "payload":       { ... }            // optional, ignored for v1
  *   }
  *
+ * Event resolution is forgiving — see resolveEvent() below. We accept:
+ *   - Canonical names: opened, clicked, replied, unsubscribed, bounced, booking
+ *   - GHL trigger-name format: "Opened Email", "Clicked Email Link",
+ *     "Replied to Email", "Unsubscribed from Email", "Booked Appointment"
+ *   - Mailgun raw values: opened, clicked, unsubscribed, complained, etc.
+ *   - Fuzzy substring fallback: any string containing "open", "click",
+ *     "reply", "unsub", "bounce", or "book" maps to the obvious column.
+ *
  * Response (always 200 — GHL workflows can't handle non-200 cleanly):
- *   { ok: true, generation_id, event, occurred_at, applied, reason? }
+ *   { ok: true, generation_id, event, resolved_column, occurred_at,
+ *     applied, reason? }
  *
  * Semantics:
  *   - First-touch wins. If `opened_at` is already set, a second "opened"
@@ -40,8 +49,14 @@
 
 import supabase from '../supabase.js';
 
-// Map common event aliases → the column we write.
+// Direct event-name lookups → the column we write.
+// Includes:
+//   - canonical names (opened, clicked, replied, unsubscribed, bounced)
+//   - mailgun raw event values (open, click, complained, etc.)
+//   - GHL trigger-name format produced by {{workflow.trigger_name}} after
+//     our normalizeEvent() runs ("Opened Email" → opened_email)
 const EVENT_TO_COLUMN = {
+  // Canonical + mailgun raw
   opened:        'opened_at',
   open:          'opened_at',
   email_opened:  'opened_at',
@@ -53,13 +68,28 @@ const EVENT_TO_COLUMN = {
   reply:         'replied_at',
   email_replied: 'replied_at',
   customer_replied: 'replied_at',
+  customer_reply:   'replied_at',
   unsubscribed:   'unsubscribed_at',
   unsubscribe:    'unsubscribed_at',
-  // Hard bounces are not unsubscribes, but for v1 we record them in the
-  // same slot so we can see "no longer reachable" without adding a new
-  // column. Revisit if we need to separate them later.
+  complained:     'unsubscribed_at',
+  // Hard bounces share the unsubscribed_at slot for v1. Both mean
+  // "no longer reachable" for retention purposes. Separate column
+  // would be a v2 schema change.
   bounced:        'unsubscribed_at',
   bounce:         'unsubscribed_at',
+
+  // GHL trigger-name format — what Mark configured in workflow
+  // 59fd6298 ("I-S4.5R - Agentic Seinfeld Engagement Tracker") when
+  // the webhook sends event = {{workflow.trigger_name}}.
+  opened_email:                     'opened_at',
+  clicked_email_link:               'clicked_at',
+  email_link_clicked:               'clicked_at',
+  replied_to_email:                 'replied_at',
+  email_replied_to:                 'replied_at',
+  unsubscribed_from_email:          'unsubscribed_at',
+  email_unsubscribed:               'unsubscribed_at',
+  bounced_email:                    'unsubscribed_at',
+  email_bounced:                    'unsubscribed_at',
 };
 
 // Booking gets a separate column pair, set together.
@@ -67,7 +97,64 @@ const BOOKING_EVENTS = new Set([
   'booking', 'booked',
   'appointment_booked', 'appt_booked',
   'stage_appt_booked',
+  // GHL trigger-name format variants
+  'booked_appointment',
+  'main_appointment_booked',
+  'booked_main_appointment',
+  'appointment',
 ]);
+
+/**
+ * Resolve an event string to either a column name (for engagement
+ * timestamps) or the sentinel 'BOOKING' (for booking attribution).
+ * Returns null if no match.
+ *
+ * Resolution order:
+ *   1. Exact lookup in EVENT_TO_COLUMN (covers ~25 known strings)
+ *   2. Exact membership in BOOKING_EVENTS
+ *   3. Fuzzy substring fallback — keyword "book" wins over the others
+ *      because "booked the appointment" contains both "book" AND
+ *      potentially others by accident. Otherwise: open / click / reply /
+ *      unsub / bounce in declared priority.
+ *
+ * Returns { column, fuzzy } shape so the caller can log how it resolved.
+ */
+function resolveEvent(event) {
+  if (!event) return null;
+
+  // Exact matches first.
+  if (EVENT_TO_COLUMN[event]) {
+    return { column: EVENT_TO_COLUMN[event], fuzzy: false, booking: false };
+  }
+  if (BOOKING_EVENTS.has(event)) {
+    return { column: null, fuzzy: false, booking: true };
+  }
+
+  // Fuzzy fallback. Booking checked first because "book" is the most
+  // semantically distinctive — "booked the appointment" contains it
+  // unambiguously, and we want to attribute even if the trigger gets
+  // renamed in GHL.
+  if (event.includes('book') || event.includes('appoint')) {
+    return { column: null, fuzzy: true, booking: true };
+  }
+  if (event.includes('unsub') || event.includes('complain')) {
+    return { column: 'unsubscribed_at', fuzzy: true, booking: false };
+  }
+  if (event.includes('bounce')) {
+    return { column: 'unsubscribed_at', fuzzy: true, booking: false };
+  }
+  if (event.includes('open')) {
+    return { column: 'opened_at', fuzzy: true, booking: false };
+  }
+  if (event.includes('click')) {
+    return { column: 'clicked_at', fuzzy: true, booking: false };
+  }
+  if (event.includes('reply') || event.includes('replied')) {
+    return { column: 'replied_at', fuzzy: true, booking: false };
+  }
+
+  return null;
+}
 
 /**
  * Defensively unwrap body. Same shape catalog as the generate endpoint
@@ -121,7 +208,7 @@ function parseOccurredAt(raw) {
   }
 }
 
-async function applyEngagement(generation_id, event, occurred_at) {
+async function applyEngagement(generation_id, resolution, occurred_at) {
   if (!supabase) {
     return { applied: false, reason: 'supabase_not_configured' };
   }
@@ -142,7 +229,7 @@ async function applyEngagement(generation_id, event, occurred_at) {
 
   const update = {};
 
-  if (BOOKING_EVENTS.has(event)) {
+  if (resolution.booking) {
     if (row.booking_attributed === true) {
       return {
         applied: false,
@@ -155,10 +242,7 @@ async function applyEngagement(generation_id, event, occurred_at) {
     update.booking_attributed = true;
     update.booking_attributed_at = occurred_at;
   } else {
-    const column = EVENT_TO_COLUMN[event];
-    if (!column) {
-      return { applied: false, reason: `unknown_event:${event}` };
-    }
+    const column = resolution.column;
     if (row[column]) {
       // First-touch wins.
       return {
@@ -232,14 +316,35 @@ export function registerEngagementRoutes(app) {
         return res.status(200).json({ ok: false, error: 'event required' });
       }
 
-      const result = await applyEngagement(generation_id, event, occurred_at);
+      // Resolve event → column or BOOKING sentinel.
+      const resolution = resolveEvent(event);
+      if (!resolution) {
+        console.log(`[NurtureEng] gen=${generation_id} event=${event} resolved=NONE applied=false reason=unknown_event`);
+        return res.status(200).json({
+          ok: true,
+          generation_id,
+          event,
+          resolved_column: null,
+          occurred_at,
+          applied: false,
+          reason: `unknown_event:${event}`,
+          workflow_code: null,
+        });
+      }
 
-      console.log(`[NurtureEng] gen=${generation_id} event=${event} applied=${result.applied} reason=${result.reason || '-'} contact=${result.contact_id || '-'}`);
+      const result = await applyEngagement(generation_id, resolution, occurred_at);
+
+      const resolvedLabel = resolution.booking
+        ? `BOOKING${resolution.fuzzy ? ' (fuzzy)' : ''}`
+        : `${resolution.column}${resolution.fuzzy ? ' (fuzzy)' : ''}`;
+      console.log(`[NurtureEng] gen=${generation_id} event=${event} resolved=${resolvedLabel} applied=${result.applied} reason=${result.reason || '-'} contact=${result.contact_id || '-'}`);
 
       res.status(200).json({
         ok: true,
         generation_id,
         event,
+        resolved_column: resolution.booking ? 'booking_attributed' : resolution.column,
+        resolution_fuzzy: resolution.fuzzy,
         occurred_at,
         applied: result.applied,
         reason: result.reason || null,
