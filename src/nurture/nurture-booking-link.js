@@ -2,21 +2,27 @@
  * Nurture Booking Link Builder — src/nurture/nurture-booking-link.js
  *
  * Composes the booking URL the agentic system emits in CTAs. As of
- * v2.1 (2026-05-12), prefers a GHL trigger link merge tag when the
- * prompt has one mapped, falls back to a direct UTM-laden URL when
- * no trigger link is configured, and propagates the prompt's
- * cta_type + has_ps into nurture_state for the user_prompt to read.
+ * v2.2 (2026-05-12), normalizes the trigger_link_field_key into either
+ * form (bare id or full {{trigger_link.id}} merge tag) and emits
+ * exactly one well-formed merge tag.
  *
  * TWO MODES OF OPERATION
  * ──────────────────────
  *
  * MODE 1 — TRIGGER LINK (preferred when prompt.trigger_link_field_key is set)
- *   Emit `{{trigger_link.<fieldKey>}}` as the URL. GHL substitutes the
- *   merge tag at send time with the short link; on click GHL substitutes
+ *   Emit `{{trigger_link.<id>}}` as the URL. GHL substitutes the merge
+ *   tag at send time with the short link; on click GHL substitutes
  *   {{contact.*}} merge tags inside the redirectTo and redirects. UTMs
  *   live inside the trigger link's redirectTo (configured via the GHL
  *   admin API). Per-week analytics work via the redirectTo's
  *   utm_content baked in at link-creation time.
+ *
+ *   Why we accept BOTH forms in trigger_link_field_key:
+ *     - GHL's POST /links/ response returns `fieldKey` as the FULL
+ *       wrapped merge tag (e.g. "{{trigger_link.xph2s9MW7c6oJQk78zwc}}").
+ *     - Earlier hand-mapped rows may store just the bare id.
+ *     - Re-wrapping a wrapped value produces double-curlied garbage.
+ *   The normalizeFieldKey() helper handles both cleanly.
  *
  *   This gives the operations team:
  *     - per-link visibility in GHL contact activity timelines
@@ -31,14 +37,8 @@
  *   silently — the email still goes out with a working URL, just
  *   without the named trigger-link binding.
  *
- *   Triggered by:
- *     - prompt row has no trigger_link_field_key
- *     - prompt row has no cta_type that references a URL (reply_prompt,
- *       reflection_close, self_id_cue) — still emits a URL so prompts
- *       that decide to include one don't 404
- *
- * CTA TYPE + HAS_PS PROPAGATION (v2.1 — 2026-05-12)
- * ─────────────────────────────────────────────────
+ * CTA TYPE + HAS_PS PROPAGATION (v2.1)
+ * ─────────────────────────────────────
  * The CTA TYPE PLAYBOOK in the prompt's system_prompt branches on
  * cta_type. The model needs to know which type this generation uses,
  * so nurture_state surfaces it via {{nurture_state.cta_type}} and
@@ -63,6 +63,31 @@ const CONTACT_FIELD_MAP = [
 function hasValue(v) {
   if (v === null || v === undefined) return false;
   return String(v).trim().length > 0;
+}
+
+/**
+ * Normalize a trigger_link_field_key into a fully-formed merge tag.
+ *
+ * Inputs we accept (case-insensitive on the prefix, lenient on whitespace):
+ *   "{{trigger_link.xph2s9MW7c6oJQk78zwc}}"  → use as-is
+ *   "{{ trigger_link.xph2s9MW7c6oJQk78zwc }}" → re-emit canonical form
+ *   "xph2s9MW7c6oJQk78zwc"                    → wrap as {{trigger_link.xph2s9MW7c6oJQk78zwc}}
+ *
+ * Returns null if the input isn't a non-empty string.
+ */
+function normalizeTriggerLinkMergeTag(fieldKey) {
+  if (!fieldKey || typeof fieldKey !== 'string') return null;
+  const trimmed = fieldKey.trim();
+  if (trimmed.length === 0) return null;
+
+  // Already a merge tag — normalize whitespace and return canonical form.
+  const wrappedMatch = trimmed.match(/^\{\{\s*trigger_link\.([^}\s]+)\s*\}\}$/i);
+  if (wrappedMatch) {
+    return `{{trigger_link.${wrappedMatch[1]}}}`;
+  }
+
+  // Bare id — wrap it.
+  return `{{trigger_link.${trimmed}}}`;
 }
 
 /**
@@ -127,8 +152,9 @@ export function buildBookingUrl(utm, lead = {}) {
  * Public composition helper. Build the full nurture_state block to be
  * injected into the context envelope before generation.
  *
- * v2.1 (2026-05-12) — propagates cta_type + has_ps from prompt row to
- *   nurture_state. v2.0 — trigger-link-aware.
+ * v2.2 (2026-05-12) — normalize trigger_link_field_key (accepts both
+ *   bare id and wrapped merge tag). Fixes double-wrap when GHL's
+ *   POST /links/ response stores `fieldKey` as the full merge tag.
  *
  * The orchestrator should set:
  *   context.nurture_state = buildNurtureState(prompt, request, context);
@@ -153,27 +179,17 @@ export function buildNurtureState(prompt, request, context = {}) {
   const utm = buildBookingUtms(prompt, request);
   const lead = context?.lead || {};
 
-  // Resolve cta_type with a safe default. The CTA TYPE PLAYBOOK in the
-  // prompt's system_prompt expects one of:
-  //   reply_prompt | reflection_close | soft_booking_offer | resource_offer
-  //   | self_id_cue | direct_assessment_ask | no_cta
-  // soft_booking_offer is the safest default — keeps the Booking
-  // Escape Hatch principle satisfied for any prompt that didn't
-  // explicitly opt in to a different shape.
   const cta_type = prompt?.cta_type || 'soft_booking_offer';
-
-  // has_ps is a boolean column; stringify for template safety since
-  // some renderTemplate implementations stringify-via-String() and
-  // a literal false would become "false" anyway — explicit is clearer.
   const has_ps = String(prompt?.has_ps === true);
 
-  // Determine URL mode.
-  const fieldKey = prompt?.trigger_link_field_key;
+  // Trigger link is the preferred URL source. Normalize handles both
+  // bare-id and wrapped-merge-tag inputs (GHL API returns the latter).
+  const mergeTag = normalizeTriggerLinkMergeTag(prompt?.trigger_link_field_key);
+
   let booking_url;
   let url_mode;
-
-  if (fieldKey && typeof fieldKey === 'string' && fieldKey.trim().length > 0) {
-    booking_url = `{{trigger_link.${fieldKey.trim()}}}`;
+  if (mergeTag) {
+    booking_url = mergeTag;
     url_mode = 'trigger_link';
   } else {
     booking_url = buildBookingUrl(utm, lead);
