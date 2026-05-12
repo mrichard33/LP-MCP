@@ -5,6 +5,7 @@
  *   1. assembleContext   (buildLeadContext)
  *   2. checkInterrupts   (inline — booked, DNC, recent reply)
  *   3. selectPrompt      (nurture-prompt-selector.js, falls back to GENERIC)
+ *   3b. injectNurtureState (buildNurtureState — dynamic booking URL + UTMs)
  *   4. generateContent   (nurture-generator.js)
  *   5. hardBlockers      (nurture-hard-blockers.js — Pass A, one retry)
  *   6. scoreMessage      (message-content-scorer.js — Pass B, one retry)
@@ -42,6 +43,14 @@
  *   payload is empty. Closes a class of bugs where re-enrollment via
  *   the GHL UI or HL MCP add_to_workflow API silently re-sent WK1
  *   regardless of where the contact actually was in the cycle.
+ *
+ * v1.3 — 2026-05-12. Per-message dynamic UTMs. After selectPrompt,
+ *   inject context.nurture_state with a per-cycle booking_url containing
+ *   workflow- and message-aware UTM parameters. The
+ *   user_prompt_template references {{nurture_state.booking_url}} so
+ *   each generation receives the right URL pre-rendered. Replaces the
+ *   static GHL trigger-link approach that gave every cycle identical
+ *   utm_campaign / utm_content. See src/nurture/nurture-booking-link.js.
  */
 
 import crypto from 'crypto';
@@ -54,6 +63,7 @@ import { scoreMessage } from '../message-content-scorer.js';
 import { writeBackToGHL, writeDraftsOnly } from './nurture-writeback.js';
 import { sendGroupMeMessage } from '../groupme.js';
 import { resolveSequencePosition } from './nurture-sequence-resolver.js';
+import { buildNurtureState } from './nurture-booking-link.js';
 
 const SHADOW_MODE = process.env.NURTURE_SHADOW_MODE === 'true';
 
@@ -99,6 +109,15 @@ export async function runNurtureGeneration(request) {
     }
   }
   await attachPromptToRow(generation_id, prompt);
+
+  // Step 3b — inject nurture_state (dynamic booking URL + UTMs).
+  // Must happen AFTER selectPrompt (we need the prompt metadata to
+  // derive utm_content) but BEFORE generateNurtureContent (the
+  // user_prompt_template references {{nurture_state.booking_url}}).
+  // See src/nurture/nurture-booking-link.js for the URL composition
+  // and UTM scheme.
+  context.nurture_state = buildNurtureState(prompt, request);
+  console.log(`[NurtureOrch] nurture_state campaign="${context.nurture_state.utm_campaign}" content="${context.nurture_state.utm_content}"`);
 
   // Step 4 — generate
   let genResult;
