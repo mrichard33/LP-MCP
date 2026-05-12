@@ -2,9 +2,10 @@
  * Nurture Booking Link Builder — src/nurture/nurture-booking-link.js
  *
  * Composes the booking URL the agentic system emits in CTAs. As of
- * v2.0 (2026-05-12), prefers a GHL trigger link merge tag when the
- * prompt has one mapped, and falls back to a direct UTM-laden URL
- * when no trigger link is configured.
+ * v2.1 (2026-05-12), prefers a GHL trigger link merge tag when the
+ * prompt has one mapped, falls back to a direct UTM-laden URL when
+ * no trigger link is configured, and propagates the prompt's
+ * cta_type + has_ps into nurture_state for the user_prompt to read.
  *
  * TWO MODES OF OPERATION
  * ──────────────────────
@@ -36,19 +37,14 @@
  *       reflection_close, self_id_cue) — still emits a URL so prompts
  *       that decide to include one don't 404
  *
- * MERGE TAGS IN THE URL
- * ─────────────────────
- * In direct-URL mode the URL contains literal {{contact.*}} substrings
- * for contact fields that exist on the lead. These resolve at GHL send
- * time, not in our renderTemplate pass (which only walks context paths,
- * not contact.* keys). The orchestrator's renderTemplate substitutes
- * {{nurture_state.booking_url}} with the entire URL string — the
- * {{contact.*}} braces are part of the substituted value and pass
- * through to GHL unmolested.
- *
- * In trigger-link mode the URL IS a {{trigger_link.<key>}} merge tag.
- * GHL substitutes that at send time too, identical pass-through
- * semantics.
+ * CTA TYPE + HAS_PS PROPAGATION (v2.1 — 2026-05-12)
+ * ─────────────────────────────────────────────────
+ * The CTA TYPE PLAYBOOK in the prompt's system_prompt branches on
+ * cta_type. The model needs to know which type this generation uses,
+ * so nurture_state surfaces it via {{nurture_state.cta_type}} and
+ * {{nurture_state.has_ps}}. Defaults: cta_type='soft_booking_offer',
+ * has_ps=false — applied when the prompt row doesn't specify (e.g.
+ * old non-S4.5 prompts).
  */
 
 const BOOKING_BASE_URL = 'https://landing.reecewindows.com/window-estimate';
@@ -131,11 +127,8 @@ export function buildBookingUrl(utm, lead = {}) {
  * Public composition helper. Build the full nurture_state block to be
  * injected into the context envelope before generation.
  *
- * v2.0 (2026-05-12) — trigger-link-aware. Prefers trigger link merge
- * tag when prompt.trigger_link_field_key is set. Falls back to direct
- * URL otherwise. Always returns a non-null booking_url string so the
- * prompt template's {{nurture_state.booking_url}} reference never
- * resolves to empty.
+ * v2.1 (2026-05-12) — propagates cta_type + has_ps from prompt row to
+ *   nurture_state. v2.0 — trigger-link-aware.
  *
  * The orchestrator should set:
  *   context.nurture_state = buildNurtureState(prompt, request, context);
@@ -144,6 +137,8 @@ export function buildBookingUrl(utm, lead = {}) {
  *   {{nurture_state.booking_url}}      — full URL string (trigger link
  *                                         merge tag OR direct URL)
  *   {{nurture_state.url_mode}}         — 'trigger_link' | 'direct'
+ *   {{nurture_state.cta_type}}         — see CTA TYPE PLAYBOOK in system prompt
+ *   {{nurture_state.has_ps}}           — 'true' | 'false' (string for template safety)
  *   {{nurture_state.utm_campaign}}     — only meaningful in direct mode
  *   {{nurture_state.utm_content}}      — only meaningful in direct mode
  *   {{nurture_state.utm_source}}       — only meaningful in direct mode
@@ -152,31 +147,44 @@ export function buildBookingUrl(utm, lead = {}) {
  * @param {object} prompt
  * @param {object} request
  * @param {object} context
- * @returns {{booking_url:string, url_mode:string, utm_campaign:string, utm_content:string, utm_source:string, utm_medium:string}}
+ * @returns {object}
  */
 export function buildNurtureState(prompt, request, context = {}) {
   const utm = buildBookingUtms(prompt, request);
   const lead = context?.lead || {};
 
-  // Mode 1: trigger link is mapped → use merge tag, skip direct URL build.
-  // The fieldKey identifies the link in the GHL location-scoped namespace.
+  // Resolve cta_type with a safe default. The CTA TYPE PLAYBOOK in the
+  // prompt's system_prompt expects one of:
+  //   reply_prompt | reflection_close | soft_booking_offer | resource_offer
+  //   | self_id_cue | direct_assessment_ask | no_cta
+  // soft_booking_offer is the safest default — keeps the Booking
+  // Escape Hatch principle satisfied for any prompt that didn't
+  // explicitly opt in to a different shape.
+  const cta_type = prompt?.cta_type || 'soft_booking_offer';
+
+  // has_ps is a boolean column; stringify for template safety since
+  // some renderTemplate implementations stringify-via-String() and
+  // a literal false would become "false" anyway — explicit is clearer.
+  const has_ps = String(prompt?.has_ps === true);
+
+  // Determine URL mode.
   const fieldKey = prompt?.trigger_link_field_key;
+  let booking_url;
+  let url_mode;
+
   if (fieldKey && typeof fieldKey === 'string' && fieldKey.trim().length > 0) {
-    return {
-      booking_url: `{{trigger_link.${fieldKey.trim()}}}`,
-      url_mode: 'trigger_link',
-      utm_campaign: utm.campaign,
-      utm_content: utm.content,
-      utm_source: utm.source,
-      utm_medium: utm.medium,
-    };
+    booking_url = `{{trigger_link.${fieldKey.trim()}}}`;
+    url_mode = 'trigger_link';
+  } else {
+    booking_url = buildBookingUrl(utm, lead);
+    url_mode = 'direct';
   }
 
-  // Mode 2: direct-URL fallback. Composes per-message URL with dynamic
-  // UTMs and conditional contact fields. Identical to v1.x behavior.
   return {
-    booking_url: buildBookingUrl(utm, lead),
-    url_mode: 'direct',
+    booking_url,
+    url_mode,
+    cta_type,
+    has_ps,
     utm_campaign: utm.campaign,
     utm_content: utm.content,
     utm_source: utm.source,
