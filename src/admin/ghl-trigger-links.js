@@ -1,62 +1,39 @@
 /**
- * GHL Trigger Links — admin API
+ * GHL Trigger Links — admin HTTP routes
  *
- * GoHighLevel "trigger links" are short, trackable URLs that
- * redirect to an external destination. They:
+ * Thin wrapper around src/admin/ghl-trigger-link-client.js. Same routes
+ * as before plus a new POST /admin/ghl-links/seed-s4-5 for bulk-creating
+ * S4.5 nurture trigger links idempotently.
+ *
+ * GoHighLevel "trigger links" are short, trackable URLs that:
  *   1. fire the "Email Link Clicked" trigger on click (which feeds
  *      our I.ENG engagement webhook), and
- *   2. carry UTMs and per-contact tracking IDs that the raw
- *      destination URL cannot.
+ *   2. carry UTMs and per-contact tracking IDs via {{contact.*}}
+ *      merge tags that GHL substitutes at click-time.
  *
  * Naming convention (locked to match the existing library):
- *   - lowercase-hyphenated semantic name
+ *   - lowercase-hyphenated or "Category — Identifier" pattern
  *   - no UUIDs, no dates, no version suffixes
- *   - examples: book, calculator, guide-download, mv-confirmation
- *
- * GHL API reference: GET/POST /links with locationId in body/query.
- * Auth: same Bearer GHL_API_KEY + Version 2021-07-28 as src/ghl.js.
+ *   - examples: book, calculator, "S4.5 Booking — WK2 Epiphany SA3"
  */
 
-import axios from 'axios';
-
-const GHL_API_KEY = process.env.GHL_API_KEY;
-const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
-
-const client = GHL_API_KEY ? axios.create({
-  baseURL: 'https://services.leadconnectorhq.com',
-  headers: {
-    Authorization: `Bearer ${GHL_API_KEY}`,
-    Version: '2021-07-28',
-    'Content-Type': 'application/json',
-    Accept: 'application/json',
-  },
-  timeout: 15000,
-}) : null;
+import {
+  isReady,
+  readinessError,
+  listLinks,
+  findLinkById,
+  createLink,
+  updateLink,
+  deleteLink,
+  seedS45Links,
+} from './ghl-trigger-link-client.js';
 
 function ensureReady(res) {
-  if (!client) {
-    res.status(500).json({ ok: false, error: 'GHL_API_KEY not configured' });
-    return false;
-  }
-  if (!GHL_LOCATION_ID) {
-    res.status(500).json({ ok: false, error: 'GHL_LOCATION_ID not configured' });
+  if (!isReady()) {
+    res.status(500).json({ ok: false, error: readinessError() });
     return false;
   }
   return true;
-}
-
-function shapeError(err) {
-  const status = err.response?.status || 0;
-  const body = err.response?.data || err.message;
-  return { status, body };
-}
-
-async function fetchExistingLink(id) {
-  const { data } = await client.get('/links/', {
-    params: { locationId: GHL_LOCATION_ID },
-  });
-  const links = Array.isArray(data?.links) ? data.links : (Array.isArray(data) ? data : []);
-  return links.find(l => l.id === id) || null;
 }
 
 export function registerGhlTriggerLinkRoutes(app) {
@@ -67,25 +44,11 @@ export function registerGhlTriggerLinkRoutes(app) {
   app.get('/admin/ghl-links', async (req, res) => {
     if (!ensureReady(res)) return;
     try {
-      const { data } = await client.get('/links/', {
-        params: { locationId: GHL_LOCATION_ID },
-      });
-      const links = Array.isArray(data?.links) ? data.links : (Array.isArray(data) ? data : []);
-      res.json({
-        ok: true,
-        count: links.length,
-        links: links.map(l => ({
-          id: l.id,
-          name: l.name,
-          redirectTo: l.redirectTo,
-          fieldKey: l.fieldKey,           // {{trigger_link.<key>}} merge tag
-          locationId: l.locationId,
-        })),
-      });
+      const links = await listLinks();
+      res.json({ ok: true, count: links.length, links });
     } catch (err) {
-      const e = shapeError(err);
-      console.error(`[GHL Links] list failed: HTTP ${e.status}`, JSON.stringify(e.body).slice(0, 300));
-      res.status(502).json({ ok: false, error: 'ghl_list_failed', status: e.status, body: e.body });
+      console.error(`[GHL Links] list failed: ${err.message}`);
+      res.status(502).json({ ok: false, error: 'ghl_list_failed', message: err.message });
     }
   });
 
@@ -96,34 +59,51 @@ export function registerGhlTriggerLinkRoutes(app) {
   app.post('/admin/ghl-links', async (req, res) => {
     if (!ensureReady(res)) return;
     const { name, redirectTo } = req.body || {};
-    if (!name || typeof name !== 'string') {
-      return res.status(400).json({ ok: false, error: 'name required (string)' });
+    try {
+      const link = await createLink({ name, redirectTo });
+      console.log(`[GHL Links] Created "${name}" → ${redirectTo} (id=${link?.id})`);
+      res.json({ ok: true, link });
+    } catch (err) {
+      console.error(`[GHL Links] create failed: ${err.message}`);
+      res.status(err.message?.includes('required') ? 400 : 502).json({
+        ok: false,
+        error: 'ghl_create_failed',
+        message: err.message,
+      });
     }
-    if (!redirectTo || typeof redirectTo !== 'string') {
-      return res.status(400).json({ ok: false, error: 'redirectTo required (string URL)' });
+  });
+
+  // ───────────────────────────────────────────────────────────────
+  // POST /admin/ghl-links/seed-s4-5 — bulk-create S4.5 trigger links
+  //
+  // Idempotent. Creates/updates the 8 S4.5 nurture trigger links and
+  // writes trigger_link_id + trigger_link_field_key back into the
+  // agentic_messaging_prompts table by prompt_code. Safe to run
+  // repeatedly — uses list-then-match-by-name semantics.
+  //
+  // Usage:
+  //   curl -X POST https://lp-mcp-production.up.railway.app/admin/ghl-links/seed-s4-5
+  //
+  // Optional preview mode:
+  //   curl -X POST .../admin/ghl-links/seed-s4-5 -d '{"preview":true}'
+  //   → returns the spec list without making any GHL or DB changes.
+  // ───────────────────────────────────────────────────────────────
+  app.post('/admin/ghl-links/seed-s4-5', async (req, res) => {
+    if (!ensureReady(res)) return;
+    if (req.body?.preview === true) {
+      // Lazy import to avoid circular-init issues — we already imported
+      // seedS45Links above, but the spec constant lives in the same module
+      // and we want a preview path that doesn't run the full reconcile.
+      const { S45_LINK_SPECS } = await import('./ghl-trigger-link-client.js');
+      return res.json({ ok: true, preview: true, specs: S45_LINK_SPECS });
     }
     try {
-      const { data } = await client.post('/links/', {
-        name,
-        redirectTo,
-        locationId: GHL_LOCATION_ID,
-      });
-      const link = data?.link || data;
-      console.log(`[GHL Links] Created "${name}" → ${redirectTo} (id=${link?.id})`);
-      res.json({
-        ok: true,
-        link: {
-          id: link?.id,
-          name: link?.name,
-          redirectTo: link?.redirectTo,
-          fieldKey: link?.fieldKey,
-          locationId: link?.locationId,
-        },
-      });
+      const result = await seedS45Links();
+      console.log(`[GHL Links] Seed S4.5: created=${result.summary?.created || 0} updated=${result.summary?.updated || 0} unchanged=${result.summary?.unchanged || 0}`);
+      res.json(result);
     } catch (err) {
-      const e = shapeError(err);
-      console.error(`[GHL Links] create failed: HTTP ${e.status}`, JSON.stringify(e.body).slice(0, 300));
-      res.status(502).json({ ok: false, error: 'ghl_create_failed', status: e.status, body: e.body });
+      console.error(`[GHL Links] seed-s4-5 failed: ${err.message}`);
+      res.status(502).json({ ok: false, error: 'seed_failed', message: err.message });
     }
   });
 
@@ -133,56 +113,30 @@ export function registerGhlTriggerLinkRoutes(app) {
   app.get('/admin/ghl-links/:id', async (req, res) => {
     if (!ensureReady(res)) return;
     try {
-      const match = await fetchExistingLink(req.params.id);
-      if (!match) return res.status(404).json({ ok: false, error: 'not_found' });
-      res.json({ ok: true, link: match });
+      const link = await findLinkById(req.params.id);
+      if (!link) return res.status(404).json({ ok: false, error: 'not_found' });
+      res.json({ ok: true, link });
     } catch (err) {
-      const e = shapeError(err);
-      res.status(502).json({ ok: false, error: 'ghl_get_failed', status: e.status, body: e.body });
+      res.status(502).json({ ok: false, error: 'ghl_get_failed', message: err.message });
     }
   });
 
   // ───────────────────────────────────────────────────────────────
-  // PUT /admin/ghl-links/:id — update redirectTo / name
-  //
-  // GHL PUT /links/:id requires:
-  //   - `name` to always be present (even on partial update)
-  //   - `locationId` to NOT be present (422 if included)
-  // If caller omits `name`, we fetch the existing record to preserve it.
+  // PUT /admin/ghl-links/:id — update name and/or redirectTo
   // ───────────────────────────────────────────────────────────────
   app.put('/admin/ghl-links/:id', async (req, res) => {
     if (!ensureReady(res)) return;
-
-    const wantName = req.body?.name;
-    const wantRedirect = req.body?.redirectTo;
-
-    if (!wantName && !wantRedirect) {
+    const { name, redirectTo } = req.body || {};
+    if (!name && !redirectTo) {
       return res.status(400).json({ ok: false, error: 'nothing to update' });
     }
-
     try {
-      // Always need to know existing record to preserve `name`
-      // when caller is only updating redirectTo.
-      let resolvedName = wantName;
-      let resolvedRedirect = wantRedirect;
-
-      if (!resolvedName || !resolvedRedirect) {
-        const existing = await fetchExistingLink(req.params.id);
-        if (!existing) return res.status(404).json({ ok: false, error: 'not_found' });
-        resolvedName = resolvedName || existing.name;
-        resolvedRedirect = resolvedRedirect || existing.redirectTo;
-      }
-
-      const { data } = await client.put(`/links/${req.params.id}`, {
-        name: resolvedName,
-        redirectTo: resolvedRedirect,
-      });
-      console.log(`[GHL Links] Updated id=${req.params.id} → ${resolvedRedirect}`);
-      res.json({ ok: true, link: data?.link || data });
+      const link = await updateLink(req.params.id, { name, redirectTo });
+      console.log(`[GHL Links] Updated id=${req.params.id} → ${redirectTo || '(name only)'}`);
+      res.json({ ok: true, link });
     } catch (err) {
-      const e = shapeError(err);
-      console.error(`[GHL Links] update failed: HTTP ${e.status}`, JSON.stringify(e.body).slice(0, 300));
-      res.status(502).json({ ok: false, error: 'ghl_update_failed', status: e.status, body: e.body });
+      const status = err.message === 'not_found' ? 404 : 502;
+      res.status(status).json({ ok: false, error: 'ghl_update_failed', message: err.message });
     }
   });
 
@@ -192,15 +146,12 @@ export function registerGhlTriggerLinkRoutes(app) {
   app.delete('/admin/ghl-links/:id', async (req, res) => {
     if (!ensureReady(res)) return;
     try {
-      await client.delete(`/links/${req.params.id}`, {
-        params: { locationId: GHL_LOCATION_ID },
-      });
-      res.json({ ok: true, deleted: req.params.id });
+      const result = await deleteLink(req.params.id);
+      res.json({ ok: true, ...result });
     } catch (err) {
-      const e = shapeError(err);
-      res.status(502).json({ ok: false, error: 'ghl_delete_failed', status: e.status, body: e.body });
+      res.status(502).json({ ok: false, error: 'ghl_delete_failed', message: err.message });
     }
   });
 
-  console.log('[GHL Links] Registered: GET|POST /admin/ghl-links | GET|PUT|DELETE /admin/ghl-links/:id');
+  console.log('[GHL Links] Registered: GET|POST /admin/ghl-links | GET|PUT|DELETE /admin/ghl-links/:id | POST /admin/ghl-links/seed-s4-5');
 }
