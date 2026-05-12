@@ -78,6 +78,7 @@ import {
 } from './admin/data-freshness.js';
 import { runGhlContactIdBackfill } from './admin/ghl-contact-id-backfill.js';
 import { registerGhlTriggerLinkRoutes } from './admin/ghl-trigger-links.js';
+import { registerAgenticLeadStateRoutes } from './admin/agentic-lead-states.js';
 
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -287,6 +288,11 @@ app.get('/health', (req, res) => {
       get:    'GET  /admin/ghl-links/:id',
       update: 'PUT  /admin/ghl-links/:id',
       delete: 'DELETE /admin/ghl-links/:id',
+    },
+    agentic_lead_states: {
+      backfill:     'POST /admin/agentic-lead-states/backfill',
+      job_status:   'GET  /admin/agentic-lead-states/backfill/:jobId',
+      distribution: 'GET  /admin/agentic-lead-states/distribution',
     },
     rest_api: {
       prospect: 'GET /api/prospects/:prospectId',
@@ -528,6 +534,15 @@ registerAgenticMvRefreshRoutes(app);
 // trigger links. See src/admin/ghl-trigger-links.js.
 registerGhlTriggerLinkRoutes(app);
 
+// ─── Agentic Lead States (admin) ─────────────────────────────────
+// HTTP wrapper around scripts/backfill-agentic-lead-states.js so the
+// Phase 1 classifier backfill (and future sweep) can be triggered
+// without Railway shell access. See src/admin/agentic-lead-states.js.
+//   POST   /admin/agentic-lead-states/backfill
+//   GET    /admin/agentic-lead-states/backfill/:jobId
+//   GET    /admin/agentic-lead-states/distribution
+registerAgenticLeadStateRoutes(app);
+
 app.listen(PORT, async () => {
   console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
   console.log(`n8n APIs:     POST /n8n/enrich-lead | /n8n/refresh-token | /n8n/prospect-lookup | /n8n/time-to-appointment`);
@@ -546,6 +561,7 @@ app.listen(PORT, async () => {
   console.log(`Agentic MV:   POST /n8n/agentic/refresh-performance-mv | GET /n8n/agentic/performance-snapshot`);
   console.log(`Agentic Msg:  POST /api/agentic/nurture/generate | POST /api/agentic/messages/engagement`);
   console.log(`GHL Links:    GET|POST /admin/ghl-links | GET|PUT|DELETE /admin/ghl-links/:id`);
+  console.log(`Lead States:  POST /admin/agentic-lead-states/backfill | GET /admin/agentic-lead-states/backfill/:jobId | /distribution`);
   console.log(`REST API:     GET /api/prospects/:id | /api/leads/:id | /api/search | /api/lead-summary/:contactId`);
   console.log(`GroupMe:      POST /webhook/groupme | POST /groupme/send | GET /groupme/pending`);
   console.log(`LP Sync:      POST /webhook/ghl/set-lp-appointment`);
