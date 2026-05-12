@@ -77,6 +77,7 @@ import {
   startDataFreshnessMonitorScheduler,
 } from './admin/data-freshness.js';
 import { runGhlContactIdBackfill } from './admin/ghl-contact-id-backfill.js';
+import { registerGhlTriggerLinkRoutes } from './admin/ghl-trigger-links.js';
 
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -89,7 +90,7 @@ app.use(express.urlencoded({ extended: true }));
 
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, PUT, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, mcp-session-id');
   res.setHeader('Access-Control-Expose-Headers', 'mcp-session-id');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
@@ -272,6 +273,13 @@ app.get('/health', (req, res) => {
       engagement: 'POST /api/agentic/messages/engagement',
       refresh_mv: 'POST /n8n/agentic/refresh-performance-mv',
       snapshot: 'GET /n8n/agentic/performance-snapshot?workflow_code=&min_sent=&limit=',
+    },
+    ghl_trigger_links: {
+      list:   'GET  /admin/ghl-links',
+      create: 'POST /admin/ghl-links',
+      get:    'GET  /admin/ghl-links/:id',
+      update: 'PUT  /admin/ghl-links/:id',
+      delete: 'DELETE /admin/ghl-links/:id',
     },
     rest_api: {
       prospect: 'GET /api/prospects/:prospectId',
@@ -508,6 +516,11 @@ registerDataFreshnessRoutes(app);
 // GroupMe performance report.
 registerAgenticMvRefreshRoutes(app);
 
+// ─── GHL Trigger Links (admin) ──────────────────────────────────
+// Proxies GHL /links/ API so agentic email bodies can use trackable
+// trigger links. See src/admin/ghl-trigger-links.js.
+registerGhlTriggerLinkRoutes(app);
+
 app.listen(PORT, async () => {
   console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
   console.log(`n8n APIs:     POST /n8n/enrich-lead | /n8n/refresh-token | /n8n/prospect-lookup | /n8n/time-to-appointment`);
@@ -525,6 +538,7 @@ app.listen(PORT, async () => {
   console.log(`Freshness:    GET /n8n/admin/freshness | POST /n8n/admin/freshness-check | GET /n8n/admin/sync-probe`);
   console.log(`Agentic MV:   POST /n8n/agentic/refresh-performance-mv | GET /n8n/agentic/performance-snapshot`);
   console.log(`Agentic Msg:  POST /api/agentic/nurture/generate | POST /api/agentic/messages/engagement`);
+  console.log(`GHL Links:    GET|POST /admin/ghl-links | GET|PUT|DELETE /admin/ghl-links/:id`);
   console.log(`REST API:     GET /api/prospects/:id | /api/leads/:id | /api/search | /api/lead-summary/:contactId`);
   console.log(`GroupMe:      POST /webhook/groupme | POST /groupme/send | GET /groupme/pending`);
   console.log(`LP Sync:      POST /webhook/ghl/set-lp-appointment`);
