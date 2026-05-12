@@ -35,6 +35,13 @@
  * gate flip) is skipped — drafts land in GHL but ai_msg_send_ready stays
  * false. The orchestrator posts a GroupMe approval card and parks the
  * row at send_status='pending' with suppressed_reason='awaiting_approval'.
+ *
+ * v1.2 — 2026-05-12. Sequence position defense in depth. The route
+ *   handler now calls resolveSequencePosition (payload → GHL contact
+ *   field → default of 1) instead of blindly defaulting to 1 when the
+ *   payload is empty. Closes a class of bugs where re-enrollment via
+ *   the GHL UI or HL MCP add_to_workflow API silently re-sent WK1
+ *   regardless of where the contact actually was in the cycle.
  */
 
 import crypto from 'crypto';
@@ -46,6 +53,7 @@ import { runHardBlockers } from './nurture-hard-blockers.js';
 import { scoreMessage } from '../message-content-scorer.js';
 import { writeBackToGHL, writeDraftsOnly } from './nurture-writeback.js';
 import { sendGroupMeMessage } from '../groupme.js';
+import { resolveSequencePosition } from './nurture-sequence-resolver.js';
 
 const SHADOW_MODE = process.env.NURTURE_SHADOW_MODE === 'true';
 
@@ -440,6 +448,7 @@ async function updateRowOnSuppress(generation_id, status, reason, extras) {
       generated_subject: output.subject || null,
       generated_preheader: output.preheader || null,
       generated_body: output.body_html || null,
+      generated_ps: output.ps_text || null,
       generated_sms: output.sms_body || null,
       generated_meta: meta,
       hard_blocker_failures: extras.hard_failures || [],
@@ -460,6 +469,7 @@ async function markGeneratedReady(generation_id, output, scoreResult, retryCount
       generated_subject: output.subject || null,
       generated_preheader: output.preheader || null,
       generated_body: output.body_html || null,
+      generated_ps: output.ps_text || null,
       generated_sms: output.sms_body || null,
       generated_meta: pickMeta(output),
       confidence_score: scoreResult.overallScore,
@@ -481,6 +491,7 @@ async function markAwaitingApproval(generation_id, output, scoreResult, retryCou
       generated_subject: output.subject || null,
       generated_preheader: output.preheader || null,
       generated_body: output.body_html || null,
+      generated_ps: output.ps_text || null,
       generated_sms: output.sms_body || null,
       generated_meta: pickMeta(output),
       confidence_score: scoreResult.overallScore,
@@ -503,6 +514,7 @@ function pickMeta(output) {
     primary_belief_shift: output.primary_belief_shift || null,
     specific_data_points_referenced: output.specific_data_points_referenced || null,
     booking_escape_hatch_position: output.booking_escape_hatch_position || null,
+    has_ps: !!output.ps_text,
   };
 }
 
@@ -596,6 +608,9 @@ function buildApprovalCard(request, context, generation_id, output, scoreResult,
     `BODY PREVIEW:`,
     preview,
   );
+  if (output.ps_text) {
+    lines.push(``, `P.S.: ${output.ps_text}`);
+  }
   if (judgeNote) {
     lines.push(``, `Judge said:`, judgeNote);
   }
@@ -772,10 +787,21 @@ export function registerNurtureRoutes(app) {
         return res.status(200).json({ error: "channel must be 'email', 'sms', or 'email+sms'", send_ready: false });
       }
 
+      // ─── Resolve sequence_position via the defense-in-depth chain.
+      // payload → GHL contact custom field → default 1. See
+      // src/nurture/nurture-sequence-resolver.js. Logging the source
+      // makes it easy to spot misconfigured callers in production —
+      // 'payload' is the rotation-continue path, 'contact_field' is
+      // the manual / API enrollment path, 'default' means we couldn't
+      // resolve and assumed first cycle.
+      const seqResolved = await resolveSequencePosition(body.contact_id, body.sequence_position);
+      console.log(`[NurtureOrch] seq_pos resolved=${seqResolved.position} source=${seqResolved.source} payload="${body.sequence_position ?? ''}"`);
+
       const result = await runNurtureGeneration({
         contact_id: body.contact_id,
         workflow_code: body.workflow_code,
-        sequence_position: Number(body.sequence_position) || 1,
+        sequence_position: seqResolved.position,
+        sequence_source: seqResolved.source,
         channel: body.channel,
         enrollment_reason: body.enrollment_reason || null,
         trigger_event_id: body.trigger_event_id || null,
