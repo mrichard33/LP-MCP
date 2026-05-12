@@ -1,7 +1,7 @@
 /**
  * Nurture Orchestrator — src/nurture/nurture-orchestrator.js
  *
- * Coordinates the 8-step pipeline for one outbound nurture generation:
+ * Coordinates the pipeline for one outbound nurture generation:
  *   1. assembleContext   (buildLeadContext)
  *   2. checkInterrupts   (inline — booked, DNC, recent reply)
  *   3. selectPrompt      (nurture-prompt-selector.js, falls back to GENERIC)
@@ -9,21 +9,20 @@
  *   3c. adaptiveCtaEvolution (cta-evolution.js — mutate cta_type + inject
  *       system-prompt override when completion signals fire)
  *   4. generateContent   (nurture-generator.js)
- *   5. hardBlockers      (nurture-hard-blockers.js — Pass A, one retry)
- *   6. scoreMessage      (message-content-scorer.js — Pass B, one retry, hybrid floor+threshold)
- *   7. writeBackToGHL    (nurture-writeback.js — two-phase) OR writeDraftsOnly (soft-pass)
+ *   5. applyAutofix      (nurture-autofix.js — truncate subject/preheader,
+ *                         strip in-body signatures, ship instead of suppress)
+ *   6. validateSafety    (nurture-safety-validator.js — 5-blocker safety
+ *                         check, one retry, suppress on second failure)
+ *   7. writeBackToGHL    (nurture-writeback.js — two-phase) OR writeDraftsOnly
+ *                         (SHADOW_MODE / awaiting_approval)
  *   8. auditLog          (UPDATE agentic_messages row → generated_ready)
  *
- * Endpoint: POST /api/agentic/nurture/generate
+ * On any suppress path, clearGhlDraftFields() runs as defense-in-depth
+ * to wipe any stale draft from a previous successful send that the
+ * GHL workflow's broken clear-step left behind (the duplicate-send
+ * trap fix — see clearGhlDraftFields docs in nurture-writeback.js).
  *
- * Request — see extractRequestFields for the full shape catalog. Briefly:
- * the route accepts flat top-level fields, fields nested under
- * customData (object | stringified JSON | array of {key,value} pairs),
- * or a mix — GHL's standard webhook delivers BOTH (full contact tree
- * flattened + customData wrapper containing the workflow-specific
- * payload). The extractor merges customData on top of whatever's flat,
- * because customData is the explicit payload from the workflow author
- * and wins on overlap.
+ * Endpoint: POST /api/agentic/nurture/generate
  *
  * Response (always 200, never 4xx/5xx — GHL workflows can't handle
  * non-200 cleanly):
@@ -39,59 +38,49 @@
  * false. The orchestrator posts a GroupMe approval card and parks the
  * row at send_status='pending' with suppressed_reason='awaiting_approval'.
  *
- * SCORING (v1.5 — 2026-05-12, hybrid)
- * ───────────────────────────────────
- * The judge produces five dimension scores (0.0–1.0 each, 1.0 = perfect).
- * We compute two summary metrics:
- *   - overallScore = MIN of dimensions (harsh — catches a single broken axis)
- *   - averageScore = MEAN of dimensions (holistic — overall quality)
+ * SAFETY VALIDATION (v2.0 — 2026-05-12)
+ * ──────────────────────────────────────
+ * Replaces the previous Pass A (17-code hard blockers) + Pass B (LLM
+ * soft judge with 5-dimension scoring + hybrid floor/threshold) with
+ * a single 5-code safety validator. Stylistic critique is gone; only
+ * five things suppress a send:
  *
- * Decision logic per generation attempt:
- *   PASS         if min ≥ floor AND avg ≥ threshold              → send
- *   SOFT-PASS    if min ≥ floor AND avg ≥ (threshold − softBand)  → write draft, awaiting_approval
- *                 AND failureReasons is empty                       (human reviews; same path as SHADOW_MODE)
- *   FAIL         otherwise                                         → retry once, then suppress
+ *   1. BRAND_LINE_VIOLATION         — Founding/origin claim that
+ *                                      misattributes Reece's NC roots
+ *   2. PROHIBITED_CLAIM             — Outcome guarantee, fake urgency,
+ *                                      or banned phrase
+ *   3. PERSONAL_DATA_LEAK           — SSN/CC/account-shaped strings,
+ *                                      unknown phones/addresses
+ *   4. NULL_BODY                    — Output missing or <50 words
+ *   5. DESTINATION_PROMISE_MISMATCH — Copy promises content type X,
+ *                                      link goes to type Y (bait-and-
+ *                                      switch detector)
  *
- * Floor catches truly broken outputs (a single dimension at 0.30 still
- * blocks the message even if the others are 0.95). Threshold/softBand
- * give a band where borderline-but-clean work lands in the approval
- * queue rather than getting killed.
+ * Everything else either auto-fixes (subject/preheader length, in-body
+ * signature) or ships unmodified.
  *
- * Env vars (added in v1.5):
- *   MESSAGE_SCORE_FLOOR     — default 0.60 (min-dimension floor)
- *   MESSAGE_SCORE_SOFT_BAND — default 0.05 (avg points below threshold
- *                              still eligible for soft-pass)
+ * Pre-validation, autofix runs to normalize formatting. The validator
+ * sees the auto-fixed output, not the raw model output.
+ *
+ * On safety failure: retry ONCE with the failure codes injected into
+ * the system prompt. If second attempt still fails → suppress with
+ * status='suppressed_low_conf' and clear GHL drafts.
  *
  * v1.2 — 2026-05-12. Sequence position defense in depth.
  * v1.3 — 2026-05-12. Per-message dynamic UTMs via buildNurtureState.
  * v1.4 — 2026-05-12. Pass context to buildNurtureState (conditional fields).
- * v1.5 — 2026-05-12. Hybrid score evaluation: floor on MIN, threshold
- *   on AVG. Soft-pass band lands borderline-clean work in the approval
- *   queue instead of suppressing it. GroupMe cards display scores as
- *   0–100 integers to match human mental model.
- * v1.6 — 2026-05-12. Phase B — adaptive CTA evolution. Step 3c reads
- *   contact tags and mutates nurture_state.cta_type when completion
- *   signals fire (HRR completed, HG sent). Persistence of the
- *   mutation reaches agentic_messages.evolved_cta_type +
- *   cta_mutation_reason for audit.
- * v1.7 — 2026-05-12. EVOLUTION OVERRIDE injection. Step 3c now ALSO
- *   calls injectEvolutionOverride() after applyEvolution() to extend
- *   the prompt's system_prompt with an explicit override block. The
- *   override tells the model the contact already consumed the resource
- *   (past tense), the RESOURCE BINDING is overridden, and what copy
- *   pattern to follow for the evolved CTA type.
- *
- *   Without this, the prompt's RESOURCE BINDING block still told the
- *   model to describe the original resource (e.g., "describe the Home
- *   Risk Report"), and the model produced bait-and-switch copy: Risk-
- *   Report-offer language attached to a Window Estimate booking URL.
- *   Verified live failure today (gen_1778622132866_60175241).
- *
- *   `prompt` is rebound after injection — it becomes a NEW object via
- *   spread, with system_prompt extended. Subsequent retry paths
- *   (constrainedPrompt, judgeFeedbackPrompt) inherit the override
- *   naturally because they spread from the rebound `prompt`. The
- *   underlying agentic_messaging_prompts row is never mutated.
+ * v1.5 — 2026-05-12. Hybrid score evaluation [SUPERSEDED in v2.0].
+ * v1.6 — 2026-05-12. Phase B — adaptive CTA evolution.
+ * v1.7 — 2026-05-12. EVOLUTION OVERRIDE injection.
+ * v2.0 — 2026-05-12. SAFETY-VALIDATOR REFACTOR. Removed Pass B (LLM
+ *   soft judge) from the nurture path entirely. Pass A replaced with
+ *   the 5-code safety validator (nurture-safety-validator.js). Added
+ *   autofix step before validation. Added clearGhlDraftFields() call
+ *   on every suppress path to prevent duplicate-send via stale drafts.
+ *   Drops send-rate suppression from ~97% to expected <10%. The
+ *   message-content-scorer.js module is still imported by response-
+ *   generator.js (inbound reply pipeline) and remains intact — only
+ *   the nurture orchestrator's dependency was removed.
  */
 
 import crypto from 'crypto';
@@ -99,80 +88,15 @@ import supabase from '../supabase.js';
 import { buildLeadContext } from '../context-builder.js';
 import { selectPrompt } from './nurture-prompt-selector.js';
 import { generateNurtureContent } from './nurture-generator.js';
-import { runHardBlockers } from './nurture-hard-blockers.js';
-import { scoreMessage } from '../message-content-scorer.js';
-import { writeBackToGHL, writeDraftsOnly } from './nurture-writeback.js';
+import { validateSafety, SAFETY_CODES } from './nurture-safety-validator.js';
+import { applyAutofix } from './nurture-autofix.js';
+import { writeBackToGHL, writeDraftsOnly, clearGhlDraftFields } from './nurture-writeback.js';
 import { sendGroupMeMessage } from '../groupme.js';
 import { resolveSequencePosition } from './nurture-sequence-resolver.js';
 import { buildNurtureState } from './nurture-booking-link.js';
 import { resolveAdaptiveCta, applyEvolution, injectEvolutionOverride } from '../agentic/cta-evolution.js';
 
 const SHADOW_MODE = process.env.NURTURE_SHADOW_MODE === 'true';
-
-// Hybrid score evaluation thresholds. See evaluateScore() for usage.
-const MESSAGE_SCORE_FLOOR = parseFloat(process.env.MESSAGE_SCORE_FLOOR || '0.60');
-const MESSAGE_SCORE_SOFT_BAND = parseFloat(process.env.MESSAGE_SCORE_SOFT_BAND || '0.05');
-
-/**
- * Display helper — 0–1 decimal → 0–100 integer for human-readable
- * GroupMe cards and logs. Internal storage stays as 0–1 floats.
- */
-function fmt100(score) {
-  if (typeof score !== 'number' || Number.isNaN(score)) return '?';
-  return String(Math.round(score * 100));
-}
-
-/**
- * Compute MIN and MEAN of the five judge dimensions, defensively
- * handling missing/null dimension values. Returns { min, avg, count }.
- * count tells us how many dimensions actually had numeric values —
- * if it's 0 (scorer error path), callers should treat the score as
- * indeterminate.
- */
-function summarizeDimensions(dimensions) {
-  const vals = [];
-  for (const key of ['relevance', 'stageAlignment', 'trust', 'clarity', 'forwardMomentum']) {
-    const v = dimensions?.[key];
-    if (typeof v === 'number' && !Number.isNaN(v)) vals.push(v);
-  }
-  if (vals.length === 0) return { min: 0, avg: 0, count: 0 };
-  const min = Math.min(...vals);
-  const avg = vals.reduce((s, v) => s + v, 0) / vals.length;
-  return { min, avg, count: vals.length };
-}
-
-/**
- * Apply the hybrid floor + threshold + soft-band rules to a scoreResult.
- * Returns one of:
- *   'pass'      — min ≥ floor AND avg ≥ threshold
- *   'soft_pass' — min ≥ floor AND avg ≥ (threshold − softBand) AND no concrete failureReasons
- *   'fail'      — anything else (broken dimension, low avg, or concrete failure reasons)
- *
- * The decision is also returned with the underlying metrics so callers
- * can include them in audit rows and GroupMe cards.
- */
-function evaluateScore(scoreResult) {
-  const { min, avg, count } = summarizeDimensions(scoreResult?.dimensions);
-  const threshold = typeof scoreResult?.threshold === 'number' ? scoreResult.threshold : 0.78;
-  const floor = MESSAGE_SCORE_FLOOR;
-  const softBand = MESSAGE_SCORE_SOFT_BAND;
-  const concreteFails = Array.isArray(scoreResult?.failureReasons) ? scoreResult.failureReasons : [];
-
-  // If scorer errored out (no usable dimensions), soft-pass — Pass A
-  // already cleared and that's the floor. Matches the pre-hybrid
-  // behavior where scoreMessage_error → passed: true.
-  if (count === 0) {
-    return { decision: 'pass', min, avg, threshold, floor, softBand };
-  }
-
-  if (min >= floor && avg >= threshold) {
-    return { decision: 'pass', min, avg, threshold, floor, softBand };
-  }
-  if (min >= floor && avg >= (threshold - softBand) && concreteFails.length === 0) {
-    return { decision: 'soft_pass', min, avg, threshold, floor, softBand };
-  }
-  return { decision: 'fail', min, avg, threshold, floor, softBand };
-}
 
 /**
  * Main entry — orchestrate one generation cycle.
@@ -190,6 +114,9 @@ export async function runNurtureGeneration(request) {
     });
   } catch (err) {
     console.error(`[NurtureOrch] context build failed for ${request.contact_id}: ${err.message}`);
+    // No clear here — we don't have valid context to know what to do
+    // with the contact, and the lookup may have failed because the
+    // contact_id itself is bad.
     return finishResponse(generation_id, false, 'context_build_failed', startedAt);
   }
 
@@ -201,6 +128,7 @@ export async function runNurtureGeneration(request) {
   const interrupt = checkInterrupts(context);
   if (interrupt) {
     await updateStatus(generation_id, interrupt.status, interrupt.reason);
+    await safeClearDrafts(request.contact_id, `interrupt:${interrupt.reason}`);
     return finishResponse(generation_id, false, interrupt.reason, startedAt);
   }
 
@@ -210,8 +138,9 @@ export async function runNurtureGeneration(request) {
     prompt = await fetchFallbackPrompt(request.workflow_code, request.channel);
     if (!prompt) {
       await updateStatus(generation_id, 'failed_generation', 'no_prompt_match_and_no_fallback');
+      await safeClearDrafts(request.contact_id, 'no_prompt_match');
       await alertGroupMe(buildErrorCard(request, context, generation_id, 'no_prompt_match',
-        `No prompt matched workflow_code=${request.workflow_code} channel=${request.channel} (no active FALLBACK either). Check agentic_messaging_prompts has at least one row with workflow_code='${request.workflow_code}' AND channel='${request.channel}' AND active=true.`));
+        `No prompt matched workflow_code=${request.workflow_code} channel=${request.channel} (no active FALLBACK either).`));
       return finishResponse(generation_id, false, 'no_prompt_match', startedAt);
     }
   }
@@ -220,28 +149,8 @@ export async function runNurtureGeneration(request) {
   // Step 3b — inject nurture_state (dynamic booking URL + UTMs).
   context.nurture_state = buildNurtureState(prompt, request, context);
 
-  // Step 3c — adaptive CTA evolution (Phase B).
-  //
-  // PRINCIPLE: completion is a stronger behavioral signal than no-
-  // engagement, so we ESCALATE the cta_type when a contact has already
-  // done the micro-commitment (HRR completed, HG sent), rather than
-  // re-offering the same resource.
-  //
-  // Three actions when an evolution fires:
-  //   1. applyEvolution() — mutates nurture_state in place (cta_type,
-  //      booking_url, url_mode, has_ps) so the user-prompt template
-  //      renders with the evolved values.
-  //   2. injectEvolutionOverride() — returns a NEW prompt object with
-  //      the evolution's override_text appended to system_prompt. The
-  //      override tells the model the resource is past tense and the
-  //      RESOURCE BINDING block is explicitly overridden. Without this,
-  //      the model would write copy describing the original resource
-  //      while linking to the new (different) URL — bait-and-switch.
-  //   3. Persist the mutation to agentic_messages.evolved_cta_type +
-  //      cta_mutation_reason via the writeback helpers below.
-  //
-  // Pure function paths; defensively wrapped so a future rule with a
-  // buggy condition cannot break generation.
+  // Step 3c — adaptive CTA evolution (Phase B). See cta-evolution.js
+  // for the override injection that prevents bait-and-switch copy.
   let evolution = null;
   try {
     evolution = resolveAdaptiveCta({
@@ -251,7 +160,7 @@ export async function runNurtureGeneration(request) {
     });
     if (evolution) {
       applyEvolution(context.nurture_state, evolution);
-      const baseCta = prompt.cta_type; // captured BEFORE rebind so log shows base→evolved correctly
+      const baseCta = prompt.cta_type;
       prompt = injectEvolutionOverride(prompt, evolution);
       console.log(`[NurtureOrch] cta evolved ${generation_id}: ${baseCta} → ${evolution.cta_type} reason=${evolution.mutation_reason} override_chars=${(evolution.override_text || '').length}`);
     }
@@ -268,147 +177,87 @@ export async function runNurtureGeneration(request) {
     genResult = await generateNurtureContent(prompt, context);
   } catch (err) {
     await updateStatus(generation_id, 'failed_generation', err.message.slice(0, 200));
+    await safeClearDrafts(request.contact_id, 'generation_error');
     return finishResponse(generation_id, false, 'generation_error', startedAt);
   }
 
-  // Step 5 — Pass A (hard blockers)
-  let hardResult = runHardBlockers(genResult.output, prompt, context);
+  // Step 5 — autofix formatting. Runs BEFORE safety validation so the
+  // validator sees normalized output. The model often emits slightly
+  // long subjects or a sign-off line; auto-fixing those things keeps
+  // the message shippable instead of triggering suppression.
+  const autofixResult = applyAutofix(genResult.output);
+  if (autofixResult.applied.length > 0) {
+    console.log(`[NurtureOrch] autofix ${generation_id}: applied=${autofixResult.applied.join(',')}`);
+  }
+  let output = autofixResult.output;
+  let autofixesApplied = autofixResult.applied;
+
+  // Step 6 — safety validation. Pass A only; Pass B (the LLM soft
+  // judge) is no longer called from the nurture path. One retry on
+  // safety failure with the failure codes injected into the prompt;
+  // if the retry still fails, suppress.
+  let safety = validateSafety(output, prompt, context);
   let retryCount = 0;
-  if (!hardResult.passed) {
+  if (!safety.passed) {
     retryCount++;
-    console.warn(`[NurtureOrch] hard blockers failed first attempt for ${generation_id}: ${hardResult.failures.join(', ')} — retrying`);
+    console.warn(`[NurtureOrch] safety failed first attempt for ${generation_id}: ${safety.failures.join(', ')} details=${safety.details.join('|')} — retrying`);
     try {
       const constrainedPrompt = {
         ...prompt,
         system_prompt: prompt.system_prompt +
-          `\n\nIMPORTANT: A previous attempt failed these hard checks: ${hardResult.failures.join(', ')}. You MUST fix all of them in this attempt.`,
+          `\n\nIMPORTANT: A previous attempt failed these safety checks: ${safety.failures.join(', ')}. Details: ${safety.details.join('; ')}. You MUST fix all of them in this attempt. These are non-negotiable compliance and trust requirements.`,
       };
       genResult = await generateNurtureContent(constrainedPrompt, context);
-      hardResult = runHardBlockers(genResult.output, prompt, context);
-      if (!hardResult.passed) {
+      const retryAutofix = applyAutofix(genResult.output);
+      if (retryAutofix.applied.length > 0) {
+        console.log(`[NurtureOrch] autofix retry ${generation_id}: applied=${retryAutofix.applied.join(',')}`);
+      }
+      output = retryAutofix.output;
+      autofixesApplied = [...autofixesApplied, ...retryAutofix.applied];
+      safety = validateSafety(output, prompt, context);
+      if (!safety.passed) {
         await updateRowOnSuppress(generation_id, 'suppressed_low_conf',
-          `hard_blockers_after_retry:${hardResult.failures.join(',')}`,
-          { output: genResult.output, hard_failures: hardResult.failures, retry_count: retryCount, evolution });
-        await alertGroupMe(buildSuppressionCard(request, context, generation_id, 'hard_blockers_after_retry', {
-          hardFailures: hardResult.failures,
-          subject: genResult.output && genResult.output.subject,
+          `safety_failed_after_retry:${safety.failures.join(',')}`,
+          { output, safety_failures: safety.failures, safety_details: safety.details, retry_count: retryCount, autofixes: autofixesApplied, evolution });
+        await safeClearDrafts(request.contact_id, `safety_failed:${safety.failures.join(',')}`);
+        await alertGroupMe(buildSuppressionCard(request, context, generation_id, 'safety_failed_after_retry', {
+          safetyFailures: safety.failures,
+          safetyDetails: safety.details,
+          subject: output && output.subject,
         }));
-        return finishResponse(generation_id, false, 'hard_blockers_after_retry', startedAt);
+        return finishResponse(generation_id, false, 'safety_failed_after_retry', startedAt);
       }
     } catch (retryErr) {
       await updateStatus(generation_id, 'failed_generation', `retry_error:${retryErr.message.slice(0, 200)}`);
+      await safeClearDrafts(request.contact_id, 'retry_error');
       return finishResponse(generation_id, false, 'retry_error', startedAt);
     }
   }
 
-  // Step 6 — Pass B (LLM judge) with hybrid floor + threshold evaluation.
-  //
-  // Three outcomes: pass / soft_pass / fail (see evaluateScore above).
-  // On fail, retry ONCE with the judge's feedback embedded; re-evaluate
-  // both passes. If still fail after retry → suppress. Soft-pass takes
-  // the same path as SHADOW_MODE (drafts only + human approval card).
-  let scoreResult;
+  // Step 7 — writeback. Two paths:
+  //   - SHADOW_MODE env flag → drafts only + approval card
+  //   - else → full two-phase writeback (sends the email)
   try {
-    scoreResult = await scoreMessage(buildScoreInput(genResult.output, request, prompt, context));
-  } catch (scoreErr) {
-    console.warn(`[NurtureOrch] scoreMessage threw, soft-passing: ${scoreErr.message}`);
-    scoreResult = {
-      passed: true,
-      overallScore: 0,
-      averageScore: 0,
-      threshold: 0,
-      dimensions: {},
-      failureReasons: [],
-      rationale: `scoreMessage_error:${scoreErr.message}`,
-      scorerModel: 'unknown',
-    };
-  }
-
-  let evalResult = evaluateScore(scoreResult);
-  console.log(`[NurtureOrch] judge ${generation_id}: min=${fmt100(evalResult.min)}/100 avg=${fmt100(evalResult.avg)}/100 floor=${fmt100(evalResult.floor)} threshold=${fmt100(evalResult.threshold)} → ${evalResult.decision}`);
-
-  if (evalResult.decision === 'fail') {
-    retryCount++;
-    console.warn(`[NurtureOrch] Pass B failed for ${generation_id}: avg=${fmt100(evalResult.avg)}/100 reasons=${(scoreResult.failureReasons || []).join(',')} — retrying`);
-    try {
-      const judgeFeedbackPrompt = {
-        ...prompt,
-        system_prompt: prompt.system_prompt +
-          `\n\nIMPORTANT: A previous attempt scored avg=${fmt100(evalResult.avg)}/100 (threshold ${fmt100(evalResult.threshold)}/100) with failure reasons: ${(scoreResult.failureReasons || []).join(', ')}. Judge said: ${scoreResult.rationale || 'no rationale'}. Address each issue.`,
-      };
-      genResult = await generateNurtureContent(judgeFeedbackPrompt, context);
-
-      // Re-run Pass A on retry output
-      const reHard = runHardBlockers(genResult.output, prompt, context);
-      if (!reHard.passed) {
-        await updateRowOnSuppress(generation_id, 'suppressed_low_conf',
-          `hard_blockers_on_retry:${reHard.failures.join(',')}`,
-          { output: genResult.output, hard_failures: reHard.failures, retry_count: retryCount, evolution });
-        await alertGroupMe(buildSuppressionCard(request, context, generation_id, 'b_retry_hit_hard_blockers', {
-          hardFailures: reHard.failures,
-          subject: genResult.output && genResult.output.subject,
-        }));
-        return finishResponse(generation_id, false, 'b_retry_hit_hard_blockers', startedAt);
-      }
-
-      // Re-run Pass B with hybrid evaluation
-      scoreResult = await scoreMessage(buildScoreInput(genResult.output, request, prompt, context));
-      evalResult = evaluateScore(scoreResult);
-      console.log(`[NurtureOrch] judge retry ${generation_id}: min=${fmt100(evalResult.min)}/100 avg=${fmt100(evalResult.avg)}/100 → ${evalResult.decision}`);
-
-      if (evalResult.decision === 'fail') {
-        await updateRowOnSuppress(generation_id, 'suppressed_low_conf',
-          `low_score_after_retry:min=${fmt100(evalResult.min)}_avg=${fmt100(evalResult.avg)}`,
-          {
-            output: genResult.output,
-            confidence_score: scoreResult.overallScore,
-            confidence_breakdown: scoreResult,
-            retry_count: retryCount,
-            evolution,
-          });
-        await alertGroupMe(buildSuppressionCard(request, context, generation_id, 'low_score_after_retry', {
-          min: evalResult.min,
-          avg: evalResult.avg,
-          threshold: evalResult.threshold,
-          floor: evalResult.floor,
-          judgeFailures: scoreResult.failureReasons,
-          judgeRationale: scoreResult.rationale,
-          subject: genResult.output && genResult.output.subject,
-        }));
-        return finishResponse(generation_id, false, 'low_score_after_retry', startedAt);
-      }
-      // Otherwise fall through with new evalResult (pass or soft_pass)
-    } catch (retryErr) {
-      await updateStatus(generation_id, 'failed_generation', `b_retry_error:${retryErr.message.slice(0, 200)}`);
-      return finishResponse(generation_id, false, 'b_retry_error', startedAt);
-    }
-  }
-
-  // Step 7 — writeback. Three paths:
-  //   - SHADOW_MODE env flag → drafts only + approval card (regardless of decision)
-  //   - decision === 'soft_pass' → drafts only + soft-pass approval card
-  //   - decision === 'pass' → full two-phase writeback (sends the email)
-  try {
-    if (SHADOW_MODE || evalResult.decision === 'soft_pass') {
-      await writeDraftsOnly(request.contact_id, genResult.output, generation_id, scoreResult.overallScore);
-      await markAwaitingApproval(generation_id, genResult.output, scoreResult, retryCount, evalResult, evolution);
-      const cardReason = SHADOW_MODE ? 'shadow_mode' : 'soft_pass';
-      await alertGroupMe(buildApprovalCard(request, context, generation_id, genResult.output, scoreResult, retryCount, evalResult, cardReason));
+    if (SHADOW_MODE) {
+      await writeDraftsOnly(request.contact_id, output, generation_id, 1.0);
+      await markAwaitingApproval(generation_id, output, retryCount, autofixesApplied, evolution);
+      await alertGroupMe(buildApprovalCard(request, context, generation_id, output, retryCount, autofixesApplied));
       return finishResponse(generation_id, false, 'awaiting_approval', startedAt);
     }
-    await writeBackToGHL(request.contact_id, genResult.output, generation_id, scoreResult.overallScore);
+    await writeBackToGHL(request.contact_id, output, generation_id, 1.0);
   } catch (writeErr) {
     await updateStatus(generation_id, 'failed_generation', `writeback_error:${writeErr.message.slice(0, 200)}`);
+    await safeClearDrafts(request.contact_id, 'writeback_error');
     await alertGroupMe(buildErrorCard(request, context, generation_id, 'writeback_error', writeErr.message));
     return finishResponse(generation_id, false, 'writeback_error', startedAt);
   }
 
   // Step 8 — final audit (pass path only)
-  await markGeneratedReady(generation_id, genResult.output, scoreResult, retryCount, evolution);
+  await markGeneratedReady(generation_id, output, retryCount, autofixesApplied, evolution);
 
   const elapsed = Date.now() - startedAt;
   console.log(`[NurtureOrch] ok ${generation_id} contact=${request.contact_id} wf=${request.workflow_code} ` +
-    `pos=${request.sequence_position} ch=${request.channel} min=${fmt100(evalResult.min)}/100 avg=${fmt100(evalResult.avg)}/100 retries=${retryCount}${evolution ? ` evolved=${evolution.cta_type}` : ''} (${elapsed}ms)`);
+    `pos=${request.sequence_position} ch=${request.channel} retries=${retryCount} autofixes=${autofixesApplied.length}${evolution ? ` evolved=${evolution.cta_type}` : ''} (${elapsed}ms)`);
 
   return finishResponse(generation_id, true, null, startedAt);
 }
@@ -417,22 +266,10 @@ export async function runNurtureGeneration(request) {
 
 /**
  * Defensively extract request fields from a body of unknown shape.
- *
- * GHL's "standard webhook" action flattens the ENTIRE contact tree into
- * the top-level request body — every standard field (contact_id,
- * first_name, email, phone, tags, address1, ...) AND every custom field
- * by its human-readable display name — and ALSO sends customData as a
- * sibling key containing the workflow-author-defined payload.
- *
- * Four customData shapes are accepted:
- *   A. NESTED OBJECT     — { customData: { ... } }
- *   B. STRINGIFIED JSON  — { customData: '{"...":...}' }
- *   C. ARRAY OF PAIRS    — { customData: [{key, value}, ...] }
- *   D. ABSENT            — no customData key at all
- *
- * customData WINS on overlap: if a workflow author writes
- * customData.contact_id="x" they want "x", not whatever GHL flattened
- * in from the contact record.
+ * GHL webhooks can deliver the workflow payload as a flat top-level
+ * body, nested under customData (object | stringified JSON | array of
+ * {key,value} pairs), or both. customData wins on overlap because
+ * that's the explicit payload from the workflow author.
  */
 function extractRequestFields(body) {
   if (!body || typeof body !== 'object') return {};
@@ -503,22 +340,17 @@ function checkInterrupts(context) {
   return null;
 }
 
-function buildScoreInput(output, request, prompt, context) {
-  const channel = request.channel === 'sms' ? 'sms' : 'email';
-  const message = channel === 'sms'
-    ? (output.sms_body || '')
-    : (output.body_html || output.sms_body || '');
-  return {
-    message,
-    channel,
-    subject: output.subject || null,
-    buyerStage: context?.intelligence?.buyer_stage ? String(context.intelligence.buyer_stage) : null,
-    trustLevelTargeted: output.trust_level_targeted || null,
-    storyArc: output.story_arc_used || null,
-    intentClass: null,
-    triggerMessage: null,
-    thresholdOverride: prompt.confidence_threshold,
-  };
+/**
+ * Wrapper around clearGhlDraftFields that never throws — clear failures
+ * should not break the orchestrator's response to the GHL workflow.
+ * Logged but absorbed.
+ */
+async function safeClearDrafts(contactId, reason) {
+  try {
+    await clearGhlDraftFields(contactId, reason);
+  } catch (err) {
+    console.warn(`[NurtureOrch] clear drafts failed for ${contactId} reason=${reason}: ${err.message}`);
+  }
 }
 
 async function createPendingRow(generation_id, request, context) {
@@ -565,6 +397,11 @@ async function updateRowOnSuppress(generation_id, status, reason, extras) {
   const meta = { ...output };
   delete meta.body_html;
   delete meta.sms_body;
+  // Stash safety details in confidence_breakdown so the audit trail
+  // captures exactly which safety codes fired and why.
+  const safetyBreakdown = (extras.safety_failures || extras.safety_details)
+    ? { safety_failures: extras.safety_failures || [], safety_details: extras.safety_details || [], autofixes: extras.autofixes || [] }
+    : null;
   const { error } = await supabase.from('agentic_messages')
     .update({
       send_status: status,
@@ -575,9 +412,9 @@ async function updateRowOnSuppress(generation_id, status, reason, extras) {
       generated_ps: output.ps_text || null,
       generated_sms: output.sms_body || null,
       generated_meta: meta,
-      hard_blocker_failures: extras.hard_failures || [],
-      confidence_score: extras.confidence_score ?? null,
-      confidence_breakdown: extras.confidence_breakdown || null,
+      hard_blocker_failures: extras.safety_failures || [],
+      confidence_score: null,
+      confidence_breakdown: safetyBreakdown,
       retry_count: extras.retry_count || 0,
       evolved_cta_type: extras?.evolution?.cta_type || null,
       cta_mutation_reason: extras?.evolution?.mutation_reason || null,
@@ -587,7 +424,7 @@ async function updateRowOnSuppress(generation_id, status, reason, extras) {
   if (error) console.warn(`[NurtureOrch] updateRowOnSuppress failed: ${error.message}`);
 }
 
-async function markGeneratedReady(generation_id, output, scoreResult, retryCount, evolution = null) {
+async function markGeneratedReady(generation_id, output, retryCount, autofixesApplied, evolution = null) {
   if (!supabase) return;
   const { error } = await supabase.from('agentic_messages')
     .update({
@@ -598,8 +435,8 @@ async function markGeneratedReady(generation_id, output, scoreResult, retryCount
       generated_ps: output.ps_text || null,
       generated_sms: output.sms_body || null,
       generated_meta: pickMeta(output),
-      confidence_score: scoreResult.overallScore,
-      confidence_breakdown: scoreResult,
+      confidence_score: null,
+      confidence_breakdown: autofixesApplied?.length ? { autofixes: autofixesApplied } : null,
       retry_count: retryCount,
       evolved_cta_type: evolution?.cta_type || null,
       cta_mutation_reason: evolution?.mutation_reason || null,
@@ -610,25 +447,20 @@ async function markGeneratedReady(generation_id, output, scoreResult, retryCount
   if (error) console.warn(`[NurtureOrch] markGeneratedReady failed: ${error.message}`);
 }
 
-async function markAwaitingApproval(generation_id, output, scoreResult, retryCount, evalResult, evolution = null) {
+async function markAwaitingApproval(generation_id, output, retryCount, autofixesApplied, evolution = null) {
   if (!supabase) return;
-  // For soft-pass, suppressed_reason carries the decision so analytics
-  // can distinguish "shadow mode parked" from "borderline awaiting human."
-  const reason = evalResult?.decision === 'soft_pass'
-    ? `soft_pass:min=${fmt100(evalResult.min)}_avg=${fmt100(evalResult.avg)}`
-    : 'awaiting_approval';
   const { error } = await supabase.from('agentic_messages')
     .update({
       send_status: 'pending',
-      suppressed_reason: reason,
+      suppressed_reason: 'awaiting_approval',
       generated_subject: output.subject || null,
       generated_preheader: output.preheader || null,
       generated_body: output.body_html || null,
       generated_ps: output.ps_text || null,
       generated_sms: output.sms_body || null,
       generated_meta: pickMeta(output),
-      confidence_score: scoreResult.overallScore,
-      confidence_breakdown: scoreResult,
+      confidence_score: null,
+      confidence_breakdown: autofixesApplied?.length ? { autofixes: autofixesApplied } : null,
       retry_count: retryCount,
       evolved_cta_type: evolution?.cta_type || null,
       cta_mutation_reason: evolution?.mutation_reason || null,
@@ -667,23 +499,13 @@ async function fetchFallbackPrompt(workflow_code, channel) {
   return data || null;
 }
 
-
-
 // ─── GROUPME MESSAGE BUILDERS ─────────────────────────────────────────
 //
 // Cards over log-lines. Every message that goes to GroupMe is meant for
 // a human to act on, not a developer debugging. So every card leads with:
 //   WHO  — contact name + email + phone (not just an opaque ID)
-//   WHY  — judge rationale, specific hard-blocker names, exact error text
+//   WHY  — safety codes + details, specific failure reasons, exact error text
 //   WHAT — one direct GHL contact URL + plain-English action instructions
-//
-// Scores are displayed as 0–100 integers in user-facing cards (the
-// underlying math is 0.0–1.0 floats — see fmt100).
-//
-// Four variants:
-//   buildApprovalCard()    — shadow-mode or soft-pass, awaiting human review
-//   buildSuppressionCard() — Pass A/B suppression with judge detail
-//   buildErrorCard()       — writeback / config errors
 
 const GHL_LOC_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
 
@@ -710,34 +532,16 @@ function htmlToPreview(html, maxChars = 320) {
     .slice(0, maxChars);
 }
 
-function buildApprovalCard(request, context, generation_id, output, scoreResult, retryCount, evalResult, cardReason) {
+function buildApprovalCard(request, context, generation_id, output, retryCount, autofixesApplied) {
   const stage = output.buyer_stage_targeted
     ?? context?.intelligence?.buyer_stage
     ?? '?';
   const arc = output.story_arc_used || '?';
   const formula = output.formula_used || '?';
-  const judgeNote = (scoreResult.rationale || '').trim();
   const belief = (output.primary_belief_shift || '').trim();
   const preview = htmlToPreview(output.body_html || output.sms_body, 320);
 
-  // Title varies by approval reason
-  let title;
-  if (cardReason === 'soft_pass') {
-    title = '⏸️ SOFT-PASS — close to threshold, please review';
-  } else if (cardReason === 'shadow_mode') {
-    title = '✅ SEINFELD DRAFT READY — please review (shadow mode)';
-  } else {
-    title = '✅ SEINFELD DRAFT READY — please review';
-  }
-
-  // Score line: show min/avg/threshold on the 100 scale
-  let scoreLine;
-  if (evalResult) {
-    scoreLine = `Judge: avg ${fmt100(evalResult.avg)}/100 · min ${fmt100(evalResult.min)}/100 · threshold ${fmt100(evalResult.threshold)}/100`;
-  } else {
-    // Fallback for shadow-mode path called without evalResult (defensive)
-    scoreLine = `Judge: ${fmt100(scoreResult?.overallScore)}/100`;
-  }
+  const title = '✅ SEINFELD DRAFT READY — please review (shadow mode)';
 
   const lines = [
     title,
@@ -745,8 +549,13 @@ function buildApprovalCard(request, context, generation_id, output, scoreResult,
     contactDisplay(context, request.contact_id),
     ``,
     `Cycle ${request.sequence_position} · Stage ${stage} · ${arc}/${formula} · ${request.workflow_code}`,
-    scoreLine + (retryCount ? `  (${retryCount} retr${retryCount === 1 ? 'y' : 'ies'})` : ''),
   ];
+  if (retryCount) {
+    lines.push(`Generated with ${retryCount} retr${retryCount === 1 ? 'y' : 'ies'}`);
+  }
+  if (autofixesApplied?.length) {
+    lines.push(`Autofixes applied: ${autofixesApplied.join(', ')}`);
+  }
   if (belief) {
     lines.push(``, `Belief shift:`, belief);
   }
@@ -760,9 +569,6 @@ function buildApprovalCard(request, context, generation_id, output, scoreResult,
   );
   if (output.ps_text) {
     lines.push(``, `P.S.: ${output.ps_text}`);
-  }
-  if (judgeNote) {
-    lines.push(``, `Judge said:`, judgeNote);
   }
   lines.push(
     ``,
@@ -779,35 +585,16 @@ function buildApprovalCard(request, context, generation_id, output, scoreResult,
 
 function buildSuppressionCard(request, context, generation_id, reason, opts = {}) {
   let title;
-  if (reason === 'hard_blockers_after_retry') {
-    title = '⚠️ DRAFT SUPPRESSED — broke hard rules on both attempts';
-  } else if (reason === 'b_retry_hit_hard_blockers') {
-    title = '⚠️ DRAFT SUPPRESSED — retry broke hard rules';
-  } else if (reason === 'low_score_after_retry') {
-    title = '⚠️ DRAFT SUPPRESSED — judge rejected after retry';
+  if (reason === 'safety_failed_after_retry') {
+    title = '⚠️ DRAFT SUPPRESSED — safety check failed on both attempts';
   } else {
     title = `⚠️ DRAFT SUPPRESSED — ${reason}`;
   }
 
-  // Build score line — prefer the new min/avg form when provided
-  let scoreLine = null;
-  if (opts.min !== undefined || opts.avg !== undefined) {
-    const parts = [];
-    if (opts.avg !== undefined) parts.push(`avg ${fmt100(opts.avg)}/100`);
-    if (opts.min !== undefined) parts.push(`min ${fmt100(opts.min)}/100`);
-    if (opts.threshold !== undefined) parts.push(`threshold ${fmt100(opts.threshold)}/100`);
-    if (opts.floor !== undefined) parts.push(`floor ${fmt100(opts.floor)}/100`);
-    scoreLine = `Judge: ${parts.join(' · ')}  (final, after retry)`;
-  } else if (opts.score !== undefined && opts.score !== null) {
-    const t = opts.threshold !== undefined ? `/${fmt100(opts.threshold)}` : '';
-    scoreLine = `Judge: ${fmt100(opts.score)}/100${t}  (final, after retry)`;
-  }
-
-  const hardFails = (opts.hardFailures && opts.hardFailures.length)
-    ? opts.hardFailures.join(', ') : null;
-  const judgeFails = (opts.judgeFailures && opts.judgeFailures.length)
-    ? opts.judgeFailures.join(', ') : null;
-  const judgeNote = (opts.judgeRationale || '').trim();
+  const safetyFails = (opts.safetyFailures && opts.safetyFailures.length)
+    ? opts.safetyFailures.join(', ') : null;
+  const safetyDetails = (opts.safetyDetails && opts.safetyDetails.length)
+    ? opts.safetyDetails.join(' | ') : null;
 
   const lines = [
     title,
@@ -816,16 +603,12 @@ function buildSuppressionCard(request, context, generation_id, reason, opts = {}
     ``,
     `Cycle ${request.sequence_position} · ${request.workflow_code} · ch ${request.channel}`,
   ];
-  if (scoreLine) lines.push(scoreLine);
-  if (hardFails) lines.push(`Hard rules broken: ${hardFails}`);
-  if (judgeFails) lines.push(`Judge flagged: ${judgeFails}`);
+  if (safetyFails) lines.push(`Safety codes: ${safetyFails}`);
+  if (safetyDetails) lines.push(`Details: ${safetyDetails}`);
   if (opts.subject) lines.push(``, `Last subject tried: ${opts.subject}`);
-  if (judgeNote) {
-    lines.push(``, `Judge said:`, judgeNote);
-  }
   lines.push(
     ``,
-    `No email sent. Drafts NOT written to GHL.`,
+    `No email sent. GHL draft fields cleared to prevent stale-send risk.`,
     ``,
     `▶ Contact: ${ghlContactUrl(request.contact_id)}`,
     `▶ Audit row: ${generation_id}`,
@@ -943,5 +726,5 @@ export function registerNurtureRoutes(app) {
     }
   });
 
-  console.log('[REST API] Registered: POST /api/agentic/nurture/generate (nurture orchestrator)');
+  console.log('[REST API] Registered: POST /api/agentic/nurture/generate (nurture orchestrator v2.0)');
 }
