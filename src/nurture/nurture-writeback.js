@@ -37,6 +37,22 @@
  *   would always time out at 24h into the stuck-alert path. Shadow
  *   mode masked this because the human approver writes the proper
  *   "Yes" value manually via GroupMe approval.
+ *
+ * v1.4 — 2026-05-12. P.S. SECTION SUPPORT. Add ai_email_ps_draft
+ *   (vrAbErigvAzLCU9jj7kT) to FIELD_IDS and to phase-1 writes.
+ *
+ *   Per the S4.5 v2 workflow change today, the email step now branches
+ *   on `{{contact.ai_email_ps_draft}}` having a value — Template A
+ *   (with P.S. block) is used when populated, Template B (no P.S.)
+ *   when empty. So this module ALWAYS writes the ps_draft field even
+ *   when the LLM didn't emit one — writes an empty string in that
+ *   case, which clears any stale draft from a previous cycle and
+ *   triggers the workflow's "no-PS" branch. Without this active
+ *   clear, a previous cycle's P.S. would persist into the next cycle's
+ *   email and the "Has Value" check would route to Template A even
+ *   when the new content lacks a P.S. — same class of stale-draft bug
+ *   that the workflow's "Clear Previous Email Details" step exists
+ *   to prevent.
  */
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -51,10 +67,14 @@ const GHL_BASE = 'https://services.leadconnectorhq.com';
 // ai_msg_sequence_position is owned by the GHL workflow (Step 1 of the
 // S4.5 v2 shell writes it from the inbound webhook payload). This module
 // no longer writes it; the entry is kept here for reference only.
+//
+// ai_email_ps_draft (vrAbErigvAzLCU9jj7kT) added 2026-05-12 for the
+// P.S. branching feature — see v1.4 changelog above.
 export const FIELD_IDS = {
   ai_email_subject_draft:    'hmmFUscWqxH1On6WPCP3',
   ai_email_preheader_draft:  'C8mSMxWqXGr1HvxrImyx', // pre-existing, reused
   ai_email_body_draft:       'WP3BnkdAsINf13CCYGbr',
+  ai_email_ps_draft:         'vrAbErigvAzLCU9jj7kT', // v1.4 PS branching
   ai_sms_body_draft:         'xr0EkxRCshI6tlm4dpvO',
   ai_msg_meta_json:          '2KB3bkyJ92DGExsFiIIJ',
   ai_msg_next_wait_hours:    'h6OyxuBTv7w7ieub1P9y',
@@ -112,6 +132,11 @@ function calculateNextWaitHours() {
  *
  * ai_msg_sequence_position is intentionally NOT written here — the GHL
  * workflow owns that field. See v1.2 changelog at the top of this file.
+ *
+ * ai_email_ps_draft is ALWAYS written, even when empty. The S4.5 v2
+ * workflow branches on it having a value; clearing it actively ensures
+ * the workflow picks the right template on each cycle. See v1.4
+ * changelog at the top of this file.
  */
 function buildPhase1Fields(output, nextWaitHours) {
   const fields = [];
@@ -129,6 +154,16 @@ function buildPhase1Fields(output, nextWaitHours) {
     fields.push({ id: FIELD_IDS.ai_email_body_draft, field_value: String(output.body_html) });
     usedKeys.push('ai_email_body_draft');
   }
+
+  // v1.4 — P.S. draft is always written. Empty string when the LLM
+  // didn't emit a P.S., which both clears stale content and tells the
+  // workflow to use Template B (no-PS variant).
+  fields.push({
+    id: FIELD_IDS.ai_email_ps_draft,
+    field_value: output.ps_text ? String(output.ps_text) : '',
+  });
+  usedKeys.push('ai_email_ps_draft');
+
   if (output.sms_body) {
     fields.push({ id: FIELD_IDS.ai_sms_body_draft, field_value: String(output.sms_body) });
     usedKeys.push('ai_sms_body_draft');
@@ -141,6 +176,7 @@ function buildPhase1Fields(output, nextWaitHours) {
       formula_used: output.formula_used || null,
       techniques_used: output.techniques_used || null,
       primary_belief_shift: output.primary_belief_shift || null,
+      has_ps: !!output.ps_text,
     }),
   });
   usedKeys.push('ai_msg_meta_json');
@@ -186,7 +222,8 @@ export async function writeBackToGHL(contactId, output, generationId, confidence
   await ghlUpdate(contactId, phase2Fields);
 
   const seqLog = opts.sequence_position !== undefined ? ` seq=${opts.sequence_position}` : '';
-  console.log(`[NurtureWriteback] ok contact=${contactId} gen=${generationId}${seqLog} ` +
+  const psLog = output.ps_text ? ' ps=yes' : ' ps=no';
+  console.log(`[NurtureWriteback] ok contact=${contactId} gen=${generationId}${seqLog}${psLog} ` +
     `fields_written=${phase1Fields.length + phase2Fields.length} gate=${GATE_FLIPPED}`);
 }
 
@@ -210,5 +247,6 @@ export async function writeDraftsOnly(contactId, output, generationId, confidenc
   await ghlUpdate(contactId, fields);
 
   const seqLog = opts.sequence_position !== undefined ? ` seq=${opts.sequence_position}` : '';
-  console.log(`[NurtureWriteback] shadow contact=${contactId} gen=${generationId}${seqLog} fields_written=${fields.length} (gate NOT flipped)`);
+  const psLog = output.ps_text ? ' ps=yes' : ' ps=no';
+  console.log(`[NurtureWriteback] shadow contact=${contactId} gen=${generationId}${seqLog}${psLog} fields_written=${fields.length} (gate NOT flipped)`);
 }
