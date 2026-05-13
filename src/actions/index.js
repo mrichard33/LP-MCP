@@ -29,14 +29,15 @@
  *   originating system_events row by action.event_id when they need
  *   structural fields like event.id or event.payload.message_id.
  *
- * Supported action types (23):
+ * Supported action types (26):
  *   add_tag, remove_tag, set_stage, move_opportunity, update_opportunity,
  *   remove_from_workflow, add_to_workflow, book_appointment,
  *   cancel_appointment, reschedule_appointment, create_task,
  *   send_notification, set_lp_appointment, create_lp_lead,
  *   update_lp_dnc_status, update_custom_fields, update_contact_email,
  *   calculate_time_lapse_tier, send_message, layer3_dispatch, emit_event,
- *   compute_rescission_dispatch, check_eligibility.
+ *   compute_rescission_dispatch, check_eligibility, compute_risk_score,
+ *   check_throttle, classify_bucket.
  *
  * 2026-05-01 — added create_lp_lead (Jane recovery). Closes the
  * chatbot-in-session-booking gap that left contacts out of LP because
@@ -45,11 +46,6 @@
  * 2026-05-01 — added update_lp_dnc_status (Charles Poulos recovery).
  * Closes the GHL→LP DNC propagation gap that left STOP-keyword DNC
  * contacts marked DNC in GHL but still "Data" disposition in LP.
- * The original GHL workflow webhook was failing with LP returning
- * "Customer ID does not exist" — root cause was a merge field issue
- * ({{contact.lp_prospect_id}} not resolving). The agentic handler
- * reads the prospect ID directly from the GHL contact object,
- * sidestepping the merge field entirely.
  *
  * 2026-05-06 — added compute_rescission_dispatch (Thomas Michaud post-mortem).
  * Wires the FL 3-business-day rescission rescue arc. Detects signing-date
@@ -60,41 +56,31 @@
  *
  * 2026-05-02 — added executeActionById + POST /execute-action endpoint
  * (Jeanne Jewell recovery). The FIFO queue order (created_at ASC) means
- * a freshly-queued action sits behind every older pending action. With
- * 5K+ pending in the queue and a 5-min n8n cron pulling 10 at a time,
- * a new action could wait hours. Direct-execute lets Claude (or any
- * authenticated caller) run a specific action_id immediately, bypassing
- * the FIFO. Used for recovery flows and time-sensitive operations like
- * appointment booking. Same handler pipeline — same retry semantics —
- * just skips the queue ordering step.
+ * a freshly-queued action sits behind every older pending action.
  *
- * 2026-05-07 — priority lanes (sql/020). The pull query now orders by
- * priority ASC, then created_at ASC, then sequence_order ASC. Customer-
- * facing actions (send_message=10, layer3_dispatch=15, agentic routing
- * tags=20) skip ahead of bulk batch work (BULK_ and MIGRATION_ prefixed
- * rules at 200), so a background cleanup job can't starve a real-time
- * customer reply. Priority defaults are set by a BEFORE INSERT trigger
- * in Postgres, so every code path that inserts into agent_actions
- * (this file's layer3_dispatch handler included) gets a sensible lane
- * automatically. Callers who need to override pass priority explicitly
- * via create_agent_action. Triggered by action 49546 (Mark Test,
- * 2026-05-07) sitting behind a ~250-action BULK_MIGRATION_2026_05_06
- * batch.
+ * 2026-05-07 — priority lanes (sql/020). Customer-facing actions
+ * (send_message=10, layer3_dispatch=15, agentic routing tags=20) skip
+ * ahead of bulk batch work at lane 200.
  *
  * 2026-05-13 — Phase 1 Intake/Routing Layer #51: universal suppression
  * for outbound send_message. executeSendMessageWithLock now calls
  * checkSuppression() before acquiring the outbound lock. On match, the
- * send is skipped without lock acquisition or GHL API call. SUPPRESS_TAGS
- * list lives in src/services/suppression-check.js. Tag source is
- * contact_tag_snapshot (kept current by GHL webhook in ghl-tag-handler.js).
+ * send is skipped without lock acquisition or GHL API call.
  *
- * 2026-05-13 — Phase 1 Intake/Routing Layer #52: check_eligibility action.
- * Hard gate for resurrection enrollment (Day 15 backfill, S1.2 / S4.5
- * re-engagement). Five-check sequence: phone, email, suppression (via
- * snapshot), exclusion tags (live GHL), caller-supplied extras. Tags the
- * contact intake-eligible:{mode} or intake-ineligible and emits
- * intake.eligibility_passed / intake.eligibility_failed events for the
- * downstream Decision Engine. Handler in handlers/eligibility.js.
+ * 2026-05-13 — Phase 1 #52: check_eligibility — hard gate for
+ * resurrection enrollment (phone, email, suppression, exclusion tags).
+ *
+ * 2026-05-13 — Phase 1 #54/#55/#56: composite risk scoring and bucket
+ * routing for the Day 15 backfill + dormant-pool resurrection. Adds
+ * compute_risk_score (40% decay / 25% deliverability / 15% age / 20%
+ * intent, locked weights), check_throttle (resurrection_enrollment_log
+ * dedup), and classify_bucket (bucket → workflow_id resolver). Together
+ * with #51/#52 these form the full Intake/Routing Layer pipeline:
+ *   check_eligibility → compute_risk_score → classify_bucket
+ *   → check_throttle → add_to_workflow
+ * Each step short-circuits the batch on hard fail; classify_bucket
+ * exposes target_workflow_id via batchContext._context so the downstream
+ * add_to_workflow picks it up without rule re-templating.
  */
 
 import supabase from '../supabase.js';
@@ -127,6 +113,10 @@ import { executeEmitEvent } from './handlers/system-events.js';
 import { executeComputeRescissionDispatch } from './handlers/rescission.js';
 // Phase 1 #52 — Intake/Routing Layer eligibility gate
 import { executeCheckEligibility } from './handlers/eligibility.js';
+// Phase 1 #54/#55/#56 — Intake/Routing Layer scoring + routing
+import { executeComputeRiskScore } from './handlers/risk-score.js';
+import { executeCheckThrottle } from './handlers/throttle.js';
+import { executeClassifyBucket } from './handlers/classify-bucket.js';
 
 // MVI v2.5 — fetch the source event for a given action. The shared
 // getEventContext returns ONLY the spread payload (no event_id /
@@ -150,18 +140,6 @@ async function fetchSourceEvent(action) {
 //   1. checkSuppression(contact_id)  — tag-based gate (NEW 2026-05-13)
 //   2. tryAcquireLock                — outbound dedup
 //   3. executeSendMessage            — actual GHL API call
-//
-// Suppression match → skipped, no lock acquired, no GHL API call,
-// action marked completed with execution_result carrying the matched tag.
-//
-// trigger_id resolution priority:
-//   1. action.action_payload.trigger_id        (explicit)
-//   2. context.message_id                      (flattened payload from getEventContext)
-//   3. fetched event.payload.message_id        (when context didn't carry it)
-//   4. `evt-${action.event_id}`                (fallback to source event)
-//
-// Lock TTL is the default 300s. If a real send takes longer than that
-// (rare), the next attempt re-acquires under "reacquired_after_expiry".
 
 async function executeSendMessageWithLock(action, context) {
   const params = action.action_payload || {};
@@ -226,25 +204,6 @@ async function executeSendMessageWithLock(action, context) {
 // ═══════════════════════════════════════════════════════════════════
 // MVI v2.5 — layer3_dispatch handler
 // ═══════════════════════════════════════════════════════════════════
-//
-// Fired by the LAYER3_DISPATCH agent_rule on every ai.analysis_completed
-// that carries a recommended_action. Reads layer3_action_dispatch for the
-// matching active row, applies the confidence gate, and queues each
-// sub-action into agent_actions as a fresh batch.
-//
-// We fetch the source event ourselves rather than rely on getEventContext —
-// that helper returns the spread payload only, but we also need event.id
-// for batch_id stamping and event.ghl_contact_id for sub-target fallback.
-//
-// Action specs in the dispatch row use the same shape as agent_rules
-// action_template entries: { action_type, target_system, target_entity,
-// params }. params becomes action_payload.
-//
-// Priority is left unset on the insert so the BEFORE INSERT trigger
-// (sql/020) assigns the right lane based on each sub-action's
-// action_type. A send_message sub-action lands in lane 10, an add_tag
-// from this AGENTIC dispatch lands in lane 20, etc. Templates can still
-// override by including an explicit `priority` field.
 
 async function executeLayer3Dispatch(action /*, context */) {
   const event = await fetchSourceEvent(action);
@@ -347,6 +306,9 @@ const ACTION_HANDLERS = {
   emit_event: executeEmitEvent,                  // MVI v2.5 — observability / follow-on
   compute_rescission_dispatch: executeComputeRescissionDispatch, // 2026-05-06 — FL rescission rescue (Thomas Michaud post-mortem)
   check_eligibility: executeCheckEligibility,    // 2026-05-13 — Phase 1 #52 Intake/Routing eligibility gate
+  compute_risk_score: executeComputeRiskScore,   // 2026-05-13 — Phase 1 #54 composite scoring
+  check_throttle: executeCheckThrottle,          // 2026-05-13 — Phase 1 #55 enrollment dedup
+  classify_bucket: executeClassifyBucket,        // 2026-05-13 — Phase 1 #56 bucket→workflow resolver
 };
 
 // Handlers that need the triggering event's payload injected as context.
@@ -364,8 +326,11 @@ const CONTEXT_AWARE_HANDLERS = new Set([
 // spread payload that getEventContext provides).
 // compute_rescission_dispatch also fetches its own source event for the
 // same reason (needs event.id and event.created_at for sign-date defaulting).
-// check_eligibility does not need event context — it operates only on
-// action.target_id and the action_payload.
+// check_eligibility / compute_risk_score / check_throttle / classify_bucket
+// (Phase 1 Intake/Routing) do not need event context — they operate only on
+// action.target_id and the action_payload, plus shared batchContext written
+// by upstream handlers via result._context (classify_bucket sets
+// bucket_target_workflow_id for downstream add_to_workflow).
 
 // ═══════════════════════════════════════════════════════════════════
 // EXECUTOR ENGINE
@@ -501,25 +466,6 @@ export async function executeActions({ limit = 50 } = {}) {
  * sensitive operations where waiting on the 5K+ pending queue is not
  * acceptable.
  *
- * Behavior:
- *   - Fetches the action by ID. Throws if not found.
- *   - Refuses to run actions with status='completed' or 'rejected'
- *     (terminal states). Caller must reset status manually if they
- *     want to re-run.
- *   - For status='pending', 'failed', or 'executing': runs through
- *     executeSingleAction with the same retry/error semantics.
- *     - 'failed' → resets retry_count to 0 before running (manual rerun
- *       implies caller wants a fresh attempt, not to count against retries).
- *     - 'executing' → assumes process died mid-run (matches reaper logic).
- *     - 'pending' → just runs.
- *   - For status='pending_approval': returns an error. Caller must
- *     approve_action first. We don't bypass approval gates from here
- *     because some action types are gated for safety reasons.
- *
- * Does NOT run the reaper or approval queue phases. Single action only.
- * Does NOT inject batch context — batchContext is empty {} since this
- * is a one-off execution.
- *
  * @param {number} actionId
  * @param {object} [opts]
  * @param {boolean} [opts.allowExecuting=true]  Run actions stuck in 'executing'
@@ -603,8 +549,6 @@ export function registerActionExecutorRoutes(app) {
   });
 
   // 2026-05-02 — Direct execute by action_id. Bypasses FIFO queue.
-  // Body: { action_id: number, allow_executing?: boolean, reset_retry_count?: boolean }
-  // Or path param: POST /execute-action/:id
   app.post('/n8n/decision-engine/execute-action', async (req, res) => {
     try {
       const actionId = Number(req.body?.action_id);
