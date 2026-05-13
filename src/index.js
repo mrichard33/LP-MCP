@@ -20,6 +20,13 @@ import {
   registerExecutorHeartbeatRoutes,
   startExecutorHeartbeatScheduler,
 } from './executor-heartbeat.js';
+// ─── Decision Engine Heartbeat (failover for n8n cron, Play 2) ───
+// 2026-05-13: in-process scheduler that fires processEvents when n8n's
+// external decision-engine cron goes stale. See src/decision-engine-heartbeat.js.
+import {
+  registerDecisionEngineHeartbeatRoutes,
+  startDecisionEngineHeartbeatScheduler,
+} from './decision-engine-heartbeat.js';
 // ─── Layer 3: Behavioral Intelligence ────────────────────────────
 import { registerContextBuilderRoutes } from './context-builder.js';
 import { registerBehavioralEmitterRoutes } from './behavioral-emitter.js';
@@ -188,6 +195,8 @@ app.get('/health', (req, res) => {
       execute_action_by_id: 'POST /n8n/decision-engine/execute-action/:id',
       heartbeat: 'POST /n8n/decision-engine/heartbeat',
       heartbeat_status: 'GET /n8n/decision-engine/heartbeat-status',
+      heartbeat_de: 'POST /n8n/decision-engine/heartbeat-de',
+      heartbeat_de_status: 'GET /n8n/decision-engine/heartbeat-de-status',
       status: 'GET /n8n/decision-engine/status',
       execution_stats: 'GET /n8n/decision-engine/execution-stats',
       reload_rules: 'POST /n8n/decision-engine/reload-rules',
@@ -250,6 +259,14 @@ app.get('/health', (req, res) => {
       heartbeat_interval_ms: parseInt(process.env.EXECUTOR_HEARTBEAT_INTERVAL_MS || `${5 * 60 * 1000}`, 10),
       kill_switch_env: 'EXECUTOR_HEARTBEAT_DISABLED',
       enabled: process.env.EXECUTOR_HEARTBEAT_DISABLED !== 'true',
+    },
+    decision_engine_heartbeat: {
+      heartbeat: 'POST /n8n/decision-engine/heartbeat-de',
+      status: 'GET /n8n/decision-engine/heartbeat-de-status',
+      stale_threshold_ms: parseInt(process.env.DECISION_ENGINE_STALE_THRESHOLD_MS || `${6 * 60 * 1000}`, 10),
+      heartbeat_interval_ms: parseInt(process.env.DECISION_ENGINE_HEARTBEAT_INTERVAL_MS || `${5 * 60 * 1000}`, 10),
+      kill_switch_env: 'DECISION_ENGINE_HEARTBEAT_DISABLED',
+      enabled: process.env.DECISION_ENGINE_HEARTBEAT_DISABLED !== 'true',
     },
     drift_detector: {
       scan: 'POST /n8n/drift-detector/scan',
@@ -409,6 +426,13 @@ registerActionExecutorRoutes(app);
 // external heartbeat goes stale. See src/executor-heartbeat.js for design.
 registerExecutorHeartbeatRoutes(app);
 
+// ─── Decision Engine Heartbeat (failover for n8n cron, Play 2) ───
+// 2026-05-13: in-process scheduler that fires processEvents when n8n's
+// external decision-engine cron goes stale. Pairs with executor-heartbeat
+// to remove n8n as a single point of failure. See
+// src/decision-engine-heartbeat.js for design.
+registerDecisionEngineHeartbeatRoutes(app);
+
 // ─── Layer 3: Behavioral Intelligence ────────────────────────────
 registerContextBuilderRoutes(app);
 registerBehavioralEmitterRoutes(app);
@@ -540,14 +564,14 @@ app.listen(PORT, async () => {
   console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
   console.log(`n8n APIs:     POST /n8n/enrich-lead | /n8n/refresh-token | /n8n/prospect-lookup | /n8n/time-to-appointment`);
   console.log(`Avatar APIs:  POST /n8n/avatar/score | /parse-gpt | /unified-inputs | /pick-best | /build-ghl | /build-notion`);
-  console.log(`Decision:     POST /n8n/decision-engine/process | /execute | /execute-action | /heartbeat | GET /status | /execution-stats | /heartbeat-status`);
+  console.log(`Decision:     POST /n8n/decision-engine/process | /execute | /execute-action | /heartbeat | /heartbeat-de | GET /status | /execution-stats | /heartbeat-status | /heartbeat-de-status`);
   console.log(`Layer 3:      POST /webhook/ghl/{reply,appointment,engagement,lead-score,workflow,workflow-tag,entry}`);
   console.log(`Intelligence: GET /n8n/lead-intelligence/context | POST /n8n/analyze-pending-replies | /n8n/analyze-message`);
   console.log(`Intent:       POST /n8n/intent/score | /n8n/intent/sweep | GET /n8n/intent/breakdown`);
   console.log(`KB Ingest:    POST /n8n/kb/ingest | /n8n/kb/clear-source | GET /n8n/kb/sources`);
   console.log(`Pause Sweep:  POST /n8n/pause-workflow/sweep (7d fizzle, 15min interval)`);
   console.log(`Approval Esc: POST /n8n/approval-escalation/sweep (30min/60min/4h tiers, 15min interval)`);
-  console.log(`Heartbeat:    POST /n8n/decision-engine/heartbeat (5min failover, 6min stale threshold)`);
+  console.log(`Heartbeat:    POST /n8n/decision-engine/heartbeat (executor failover) | /heartbeat-de (DE failover, 6min stale threshold)`);
   console.log(`Drift Det:    POST /n8n/drift-detector/scan (30min interval, MVI v2.5)`);
   console.log(`Internal:     POST /internal/check-outbound-lock (HL MCP advisory)`);
   console.log(`Freshness:    GET /n8n/admin/freshness | POST /n8n/admin/freshness-check | GET /n8n/admin/sync-probe`);
@@ -574,6 +598,11 @@ app.listen(PORT, async () => {
   // when n8n's external heartbeat is healthy; takes over within 6min if
   // n8n stops firing. Killable via EXECUTOR_HEARTBEAT_DISABLED=true.
   startExecutorHeartbeatScheduler();
+  // 2026-05-13: failover heartbeat for the Decision Engine (Play 2).
+  // Sits dormant when n8n's external decision-engine cron is healthy;
+  // takes over within 6min if n8n stops firing.
+  // Killable via DECISION_ENGINE_HEARTBEAT_DISABLED=true.
+  startDecisionEngineHeartbeatScheduler();
   // MVI v2.5: drift detector. 30-min interval, 5-min initial delay.
   // Killable via DRIFT_DETECTOR_DISABLED=true.
   startDriftDetectorScheduler();
