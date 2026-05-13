@@ -30,40 +30,27 @@
  * ─────────
  *   score = ROUND(100 * (0.40*decay + 0.25*deliver + 0.15*age + 0.20*intent))
  *
- * CLASSIFICATION
- * ──────────────
- *   'warm_dormant'   (Bucket A) — score >= 50           → S4.5 Agentic Seinfeld
- *   'cold_valid'     (Bucket B) — 15 <= score < 50      → S1.2 Calculator Re-engagement
- *   'dangerous_dead' (Bucket C) — score < 15            → Quarantine
+ * CLASSIFICATION (constraint-aligned values per contact_risk_scores_classification_check)
+ * ──────────────────────────────────────────────────────────────────────────────────────
+ *   'warm'       (Bucket A) — score >= 50           → S4.5 Agentic Seinfeld
+ *   'cold_valid' (Bucket B) — 15 <= score < 50      → S1.2 Calculator Re-engagement
+ *   'dangerous'  (Bucket C) — score < 15            → Quarantine
  *
  *   Hard override: if deliverability <= 0.1 (bounce / invalid / no-email),
- *   force 'dangerous_dead' regardless of composite. A reachable contact is
- *   the necessary condition for resurrection — without that, no other
- *   signal matters.
+ *   force 'dangerous' regardless of composite. A reachable contact is the
+ *   necessary condition for resurrection — without that, no other signal
+ *   matters.
+ *
+ *   Naming note: earlier drafts used 'warm_dormant' / 'dangerous_dead' but
+ *   the pre-existing contact_risk_scores CHECK constraint expects the
+ *   shorter forms. Aligned 2026-05-13.
  *
  * OUTPUTS
  * ───────
  *   Upserts contact_risk_scores row with score, components jsonb, and
- *   classification. expires_at = NOW() + 7 days (re-score weekly during
- *   active campaigns; on-demand outside).
+ *   classification. expires_at = NOW() + 7 days.
  *
  *   Applies tag risk:{a|b|c} for fast GHL-side filtering.
- *
- * ACTION PAYLOAD
- * ──────────────
- *   {
- *     refresh_engagement_first?: boolean   // default false — caller pre-refreshes for batch
- *     ttl_days?: number                    // default 7
- *   }
- *
- * RETURNS (execution_result)
- *   {
- *     score: 0-100,
- *     classification: 'warm_dormant'|'cold_valid'|'dangerous_dead',
- *     bucket: 'A'|'B'|'C',
- *     components: { decay, deliverability, age, intent },
- *     reasoning: string
- *   }
  */
 
 import supabase from '../../supabase.js';
@@ -82,6 +69,11 @@ const AGE_HALF_LIFE_DAYS = 180;
 const SCORE_WARM_THRESHOLD = 50;
 const SCORE_COLD_THRESHOLD = 15;
 
+// ── Classification labels (constraint-aligned) ───────────────────────
+const CLASS_WARM      = 'warm';
+const CLASS_COLD      = 'cold_valid';
+const CLASS_DANGEROUS = 'dangerous';
+
 // ── Tags ──────────────────────────────────────────────────────────────
 const TAG_BUCKET_A = 'risk:a';
 const TAG_BUCKET_B = 'risk:b';
@@ -89,7 +81,6 @@ const TAG_BUCKET_C = 'risk:c';
 const BUCKET_TAGS = [TAG_BUCKET_A, TAG_BUCKET_B, TAG_BUCKET_C];
 
 // ── Deliverability hard-fail tag set ──────────────────────────────────
-// Presence of any of these forces deliverability = 0.1 and classification = C.
 const HARD_DELIVERY_FAIL_TAGS = [
   'lp-bounced',
   'email-bounced',
@@ -99,10 +90,6 @@ const HARD_DELIVERY_FAIL_TAGS = [
   'unsubscribed',
 ];
 
-/**
- * Read engagement_summary.decay_score for a contact.
- * Returns 0 if no row.
- */
 async function getDecayScore(ghlContactId) {
   const { data } = await supabase
     .from('engagement_summary')
@@ -118,33 +105,23 @@ async function getDecayScore(ghlContactId) {
   };
 }
 
-/**
- * Compute deliverability score from live GHL contact tags + enrichment log.
- *
- * @param {object} contact — GHL contact object (already fetched)
- * @returns {Promise<{score:number, reason:string, hard_fail:boolean}>}
- */
 async function getDeliverabilityScore(ghlContactId, contact) {
   const email = (contact?.email || '').trim().toLowerCase();
   const tags = Array.isArray(contact?.tags) ? contact.tags : [];
 
-  // Missing email → 0
   if (!email || !email.includes('@')) {
     return { score: 0.0, reason: 'no_email', hard_fail: true };
   }
-  // Placeholder emails
   const placeholders = ['fake@gmail.com'];
   if (placeholders.includes(email) || email.endsWith('@noemail.com') || email.endsWith('@invalid.com')) {
     return { score: 0.0, reason: 'placeholder_email', hard_fail: true };
   }
 
-  // Hard-fail tags
   const matchedFail = tags.find(t => HARD_DELIVERY_FAIL_TAGS.includes(t));
   if (matchedFail) {
     return { score: 0.1, reason: `tag:${matchedFail}`, hard_fail: true };
   }
 
-  // Latest enrichment confidence (if any)
   const { data: enrichRow } = await supabase
     .from('email_enrichment_log')
     .select('confidence_score, action_taken, created_at')
@@ -160,13 +137,9 @@ async function getDeliverabilityScore(ghlContactId, contact) {
     };
   }
 
-  // Default — unknown, slight optimism
   return { score: 0.6, reason: 'no_enrichment_record_default', hard_fail: false };
 }
 
-/**
- * Compute age score from earliest lp_lead row for this contact.
- */
 async function getAgeScore(ghlContactId) {
   const { data } = await supabase
     .from('lp_leads')
@@ -188,9 +161,6 @@ async function getAgeScore(ghlContactId) {
   };
 }
 
-/**
- * Read intent_score from lead_intelligence (0-100 → 0-1).
- */
 async function getIntentScore(ghlContactId) {
   const { data } = await supabase
     .from('lead_intelligence')
@@ -208,22 +178,15 @@ async function getIntentScore(ghlContactId) {
   };
 }
 
-/**
- * Apply the appropriate risk:{a|b|c} tag to the contact, removing any
- * conflicting bucket tags first. Best-effort — failure doesn't change
- * the classification decision.
- */
 async function applyBucketTag(ghlContactId, bucket, currentTags) {
   const targetTag = bucket === 'A' ? TAG_BUCKET_A
                   : bucket === 'B' ? TAG_BUCKET_B
                   : TAG_BUCKET_C;
   try {
-    // Remove conflicting bucket tags
     const conflicting = (currentTags || []).filter(t => BUCKET_TAGS.includes(t) && t !== targetTag);
     if (conflicting.length > 0) {
       await ghlFetch('DELETE', `/contacts/${ghlContactId}/tags`, { tags: conflicting });
     }
-    // Add the target tag
     if (!currentTags?.includes(targetTag)) {
       await ghlFetch('POST', `/contacts/${ghlContactId}/tags`, { tags: [targetTag] });
     }
@@ -240,7 +203,6 @@ export async function executeComputeRiskScore(action) {
   const refreshFirst = params.refresh_engagement_first === true;
   const ttlDays = Number.isFinite(params.ttl_days) ? params.ttl_days : 7;
 
-  // ── 1. Optionally refresh engagement first ─────────────────────
   if (refreshFirst) {
     try {
       await refreshEngagementSummary({ mode: 'targeted', contact_ids: [contactId] });
@@ -249,7 +211,6 @@ export async function executeComputeRiskScore(action) {
     }
   }
 
-  // ── 2. Fetch live GHL contact (one call, used by 2 inputs) ────
   let contact;
   try {
     const resp = await ghlFetch('GET', `/contacts/${contactId}`);
@@ -261,7 +222,6 @@ export async function executeComputeRiskScore(action) {
     throw new Error(`Contact ${contactId} not found in GHL`);
   }
 
-  // ── 3. Gather all 4 component scores in parallel ──────────────
   const [decay, deliv, age, intent] = await Promise.all([
     getDecayScore(contactId),
     getDeliverabilityScore(contactId, contact),
@@ -269,7 +229,6 @@ export async function executeComputeRiskScore(action) {
     getIntentScore(contactId),
   ]);
 
-  // ── 4. Composite ──────────────────────────────────────────────
   const composite01 = (
     W_DECAY * decay.score +
     W_DELIVERABILITY * deliv.score +
@@ -279,23 +238,22 @@ export async function executeComputeRiskScore(action) {
   let score = Math.round(composite01 * 100);
   score = Math.max(0, Math.min(100, score));
 
-  // ── 5. Classify with hard-deliverability override ─────────────
+  // Classification — uses constraint-aligned names ('warm' / 'cold_valid' / 'dangerous')
   let classification, bucket;
   if (deliv.hard_fail) {
-    classification = 'dangerous_dead';
+    classification = CLASS_DANGEROUS;
     bucket = 'C';
   } else if (score >= SCORE_WARM_THRESHOLD) {
-    classification = 'warm_dormant';
+    classification = CLASS_WARM;
     bucket = 'A';
   } else if (score >= SCORE_COLD_THRESHOLD) {
-    classification = 'cold_valid';
+    classification = CLASS_COLD;
     bucket = 'B';
   } else {
-    classification = 'dangerous_dead';
+    classification = CLASS_DANGEROUS;
     bucket = 'C';
   }
 
-  // ── 6. Persist to contact_risk_scores ─────────────────────────
   const components = {
     decay:           { value: decay.score,  weight: W_DECAY,         source: decay.source },
     deliverability:  { value: deliv.score,  weight: W_DELIVERABILITY, reason: deliv.reason, hard_fail: deliv.hard_fail },
@@ -318,10 +276,8 @@ export async function executeComputeRiskScore(action) {
 
   if (upsertErr) {
     console.warn(`[risk-score] upsert failed for ${contactId}: ${upsertErr.message}`);
-    // Continue — return the computed result even if persistence failed
   }
 
-  // ── 7. Apply bucket tag (best-effort) ─────────────────────────
   await applyBucketTag(contactId, bucket, contact.tags || []);
 
   const reasoning =
