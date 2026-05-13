@@ -31,10 +31,24 @@
  *
  * The `tags` field is the FULL current tag set. The handler diffs vs snapshot
  * to determine what changed.
+ *
+ * 2026-05-13 — Play 1 Optimization: applyIntakeFilter integration.
+ *   Tag events are the highest-volume / lowest-match event class in the
+ *   system (1,155 ghl.tag_added/day, 0.5% match rate before filtering).
+ *   Each diff event now passes through applyIntakeFilter() before being
+ *   inserted into system_events. Only events whose subtype is in
+ *   ALLOWED_TAG_ADDED_SUBTYPES (4 entries) or ALLOWED_TAG_REMOVED_SUBTYPES
+ *   (currently empty) are kept. Filtered events are recorded to
+ *   system_events_filtered (72h TTL) for observability and rollback.
+ *
+ *   Contact tag snapshot is ALWAYS updated regardless of filter outcome.
+ *   The filter affects only what reaches the Decision Engine, not the
+ *   snapshot state that downstream code (suppression-check.js) reads.
  */
 
 import crypto from 'node:crypto';
 import supabase from './supabase.js';
+import { applyIntakeFilter } from './services/event-intake-filter.js';
 
 function normalizeTag(t) {
   if (typeof t !== 'string') return null;
@@ -128,7 +142,9 @@ async function handleGhlTagWebhook(req, res) {
   const isFirstSeen = !priorRow;
   const priorTags = priorRow?.tags || [];
 
-  // 4. Atomic upsert snapshot
+  // 4. Atomic upsert snapshot — ALWAYS, regardless of downstream event filter.
+  // contact_tag_snapshot is used by suppression-check.js and must stay current
+  // even when the diff events are filtered out of the decision engine queue.
   const { error: upsertErr } = await supabase
     .from('contact_tag_snapshot')
     .upsert(
@@ -177,12 +193,39 @@ async function handleGhlTagWebhook(req, res) {
     });
   }
 
-  // 7. Build and insert events
+  // 7. Build diff event rows
   const minuteBucket = Math.floor(Date.now() / 60000);
-  const eventRows = [
+  const candidateRows = [
     ...added.map((tag) => buildEventRow({ contact_id, tag, action: 'added', minuteBucket })),
     ...removed.map((tag) => buildEventRow({ contact_id, tag, action: 'removed', minuteBucket })),
   ];
+
+  // 7b. Phase 1 Optimization Play 1 (2026-05-13) — intake filter.
+  // Run each candidate row through applyIntakeFilter. Filtered rows are
+  // logged to system_events_filtered (telemetry) and dropped from the
+  // main queue. Tag events are the highest-volume / lowest-match class
+  // (~1,155/day, 0.5% match) so this is where the filter pays off most.
+  const eventRows = [];
+  let filteredCount = 0;
+  for (const row of candidateRows) {
+    const decision = await applyIntakeFilter(row, { bypass: false });
+    if (decision.allow) {
+      eventRows.push(row);
+    } else {
+      filteredCount++;
+    }
+  }
+
+  if (eventRows.length === 0) {
+    return res.status(200).json({
+      ok: true,
+      added: added.length,
+      removed: removed.length,
+      events_inserted: 0,
+      filtered_out: filteredCount,
+      latency_ms: Date.now() - start,
+    });
+  }
 
   // Upsert with ignoreDuplicates handles webhook retry idempotency.
   const { data: inserted, error: insertErr } = await supabase
@@ -212,6 +255,7 @@ async function handleGhlTagWebhook(req, res) {
     added: added.length,
     removed: removed.length,
     events_inserted: inserted?.length || 0,
+    filtered_out: filteredCount,
     latency_ms: Date.now() - start,
   });
 }
