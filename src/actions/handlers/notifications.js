@@ -7,6 +7,41 @@
  *
  * Extracted from action-executor.js v4.2 refactor.
  *
+ * 2026-05-13 — RECOVERABLE NON-IDEMPOTENT RETRY (executor stall fix).
+ *   Pre-fix: send_notification stuck >10min in 'executing' was reaped
+ *   and marked failed without retry — at-most-once delivery, ~37/week
+ *   silently dropped (typical cause: Railway redeploy mid-handler).
+ *
+ *   send_notification is now in the RECOVERABLE_NON_IDEMPOTENT set
+ *   (see src/actions/reaper.js). When the reaper detects a stuck action,
+ *   it requeues instead of dropping. To keep retries safe, three
+ *   changes land here:
+ *
+ *     1. Every outbound notification appends a recovery footer:
+ *          `\n\nref: a${action.id}`
+ *        Visible by design — operational debugging, support visibility,
+ *        screenshot evidence. The same token is what verification
+ *        searches for in history.
+ *
+ *     2. When action.retry_count > 0 (i.e., this is a retry), the
+ *        handler calls checkForActionRef(action.id, 50) against
+ *        GroupMe's read API. If the marker is found in recent history,
+ *        the message already made it — return verified_already_sent
+ *        without re-sending. If not found, log retry_resending and
+ *        proceed.
+ *
+ *     3. Three telemetry events for observability:
+ *          notification_retry_verified_sent      — found, skip resend
+ *          notification_retry_resending          — not found, send
+ *          notification_retry_history_check_failed — read API down, fail-open
+ *
+ *   Recovery ceiling: standard retry_count / max_retries (default 3)
+ *   applies. After max attempts the action fails permanently.
+ *
+ *   Requires GROUPME_ACCESS_TOKEN env var. Without it, the history
+ *   check fails-open (logs the warning, proceeds with send) — same
+ *   risk as before the fix, just no improvement.
+ *
  * 2026-05-11 — PER-RULE COOLDOWN + WIDER LOG PREVIEW.
  *   1. Opt-in cooldown: if the action's payload includes a positive
  *      `cooldown_minutes` value, the handler checks agent_actions for
@@ -28,11 +63,13 @@
 
 import supabase from '../../supabase.js';
 import { sendGroupMeMessage } from '../../groupme.js';
+import { checkForActionRef } from '../../groupme-read.js';
 import { interpolatePayload } from '../helpers.js';
 import { resolveContactInfo, resolveLPProspectId } from '../resolvers.js';
 import { buildNotificationEnrichment, buildRichNotification } from '../enrichment.js';
 
 const LOG_PREVIEW_CHARS = 600;
+const RECOVERY_HISTORY_LIMIT = 50;
 
 /**
  * 2026-05-11 — check whether this (rule_applied, target_id) recently
@@ -98,6 +135,43 @@ export async function executeSendNotification(action, context) {
     }
   }
 
+  // 2026-05-13 — RECOVERY VERIFICATION.
+  // Only fires when this is a retry (retry_count > 0). First-time sends
+  // skip the read-API call. If the action's ref footer is already in
+  // recent history, the original send made it — return without
+  // resending. If not found OR the read API errors, fail-open (send).
+  const isRetry = (action.retry_count || 0) > 0;
+  if (isRetry) {
+    const check = await checkForActionRef(action.id, RECOVERY_HISTORY_LIMIT);
+    if (check.found === true) {
+      console.log(
+        `[Notifications] notification_retry_verified_sent action=${action.id} ` +
+        `retry=${action.retry_count} groupme_msg=${check.message_id} sent_at=${check.created_at}`
+      );
+      return {
+        action: 'verified_already_sent',
+        skipped: true,
+        via: 'groupme_history',
+        groupme_message_id: check.message_id,
+        groupme_sent_at: check.created_at,
+        retry_count: action.retry_count,
+      };
+    } else if (check.found === false) {
+      console.log(
+        `[Notifications] notification_retry_resending action=${action.id} ` +
+        `retry=${action.retry_count} checked=${check.checked_count} — not found, resending`
+      );
+      // proceed to send
+    } else {
+      // found === null: history check failed (no token, HTTP error, etc.)
+      console.warn(
+        `[Notifications] notification_retry_history_check_failed action=${action.id} ` +
+        `retry=${action.retry_count} reason=${check.reason} — failing open, will send`
+      );
+      // proceed to send (fail-open: better to over-notify than silently drop)
+    }
+  }
+
   const contactId = action.target_id;
   const { name, phone, lpLead, ghlContactId } = await resolveContactInfo(contactId, context);
   const prospectId = await resolveLPProspectId(contactId);
@@ -114,7 +188,16 @@ export async function executeSendNotification(action, context) {
   const payload = interpolatePayload(action.action_payload, enrichedContext);
   const baseMessage = payload?.message || 'Agent notification';
 
-  const full = buildRichNotification({ baseMessage, name, phone, contactId, prospectId, enrichment });
+  const built = buildRichNotification({ baseMessage, name, phone, contactId, prospectId, enrichment });
+  // 2026-05-13 — append recovery footer. Visible by design (operational
+  // debugging) and used by checkForActionRef to verify prior sends on retry.
+  const full = `${built}\n\nref: a${action.id}`;
+
   await sendGroupMeMessage(full);
-  return { action: 'groupme_sent', message: full.slice(0, LOG_PREVIEW_CHARS) };
+  return {
+    action: 'groupme_sent',
+    message: full.slice(0, LOG_PREVIEW_CHARS),
+    ref_footer: `a${action.id}`,
+    retry_count: action.retry_count || 0,
+  };
 }
