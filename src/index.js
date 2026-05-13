@@ -76,6 +76,11 @@ import {
   startDriftDetectorScheduler,
 } from './services/drift-detector.js';
 import { registerInternalRoutes } from './services/internal-routes.js';
+// ─── Phase 1 #53 — Engagement Summary Refresh ────────────────────
+// 2026-05-13: aggregates 90d engagement signals into engagement_summary
+// via the refresh_engagement_summary() PL/pgSQL function. Pre-req: run
+// sql/phase1_53_refresh_engagement_summary.sql once in Supabase SQL Editor.
+import { registerEngagementSummaryRoutes } from './jobs/refresh-engagement-summary.js';
 // ─── Admin ──────────────────────────────────────────────────────
 import { runEmailBackfill } from './admin/email-backfill.js';
 import { registerEmailCleanupRoutes } from './admin/email-cleanup.js';
@@ -292,6 +297,11 @@ app.get('/health', (req, res) => {
       refresh_mv: 'POST /n8n/agentic/refresh-performance-mv',
       snapshot: 'GET /n8n/agentic/performance-snapshot?workflow_code=&min_sent=&limit=',
     },
+    engagement_summary: {
+      refresh: 'POST /n8n/engagement/refresh',
+      status: 'GET /n8n/engagement/status',
+      function_required: 'refresh_engagement_summary (PL/pgSQL — run sql/phase1_53_refresh_engagement_summary.sql)',
+    },
     ghl_trigger_links: {
       list:   'GET  /admin/ghl-links',
       create: 'POST /admin/ghl-links',
@@ -501,6 +511,16 @@ registerImeRoutes(app);
 registerDriftDetectorRoutes(app);
 registerInternalRoutes(app);
 
+// ─── Phase 1 #53 — Engagement Summary Refresh ────────────────────
+// 2026-05-13: aggregates 90d engagement signals into engagement_summary
+// (one row per ghl_contact_id) for risk-score (#54) consumption.
+// Calls refresh_engagement_summary() PL/pgSQL function (defined in
+// sql/phase1_53_refresh_engagement_summary.sql — Mark runs once in
+// Supabase SQL Editor). Endpoint surface:
+//   POST /n8n/engagement/refresh  { mode, contact_ids?, dry_run? }
+//   GET  /n8n/engagement/status
+registerEngagementSummaryRoutes(app);
+
 // ─── Admin ──────────────────────────────────────────────────────
 app.post('/admin/email-backfill', async (req, res) => {
   try {
@@ -577,6 +597,7 @@ app.listen(PORT, async () => {
   console.log(`Freshness:    GET /n8n/admin/freshness | POST /n8n/admin/freshness-check | GET /n8n/admin/sync-probe`);
   console.log(`Agentic MV:   POST /n8n/agentic/refresh-performance-mv | GET /n8n/agentic/performance-snapshot`);
   console.log(`Agentic Msg:  POST /api/agentic/nurture/generate | POST /api/agentic/messages/engagement`);
+  console.log(`Engagement:   POST /n8n/engagement/refresh | GET /n8n/engagement/status`);
   console.log(`GHL Links:    GET|POST /admin/ghl-links | GET|PUT|DELETE /admin/ghl-links/:id`);
   console.log(`Lead States:  POST /admin/agentic-lead-states/backfill | GET /admin/agentic-lead-states/backfill/:jobId | /distribution`);
   console.log(`REST API:     GET /api/prospects/:id | /api/leads/:id | /api/search | /api/lead-summary/:contactId`);
