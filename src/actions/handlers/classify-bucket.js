@@ -8,55 +8,33 @@
  * workflow_id for downstream enrollment. Emits a bucket.classified
  * event so rules can react.
  *
- * THIS IS THE BRIDGE between scoring (#54) and enrollment (add_to_workflow).
- * Without it, every rule would have to hardcode workflow IDs per bucket,
- * leaking the mapping across many places.
- *
  * BUCKET → WORKFLOW MAPPING (LOCKED canonical IDs, 2026-05-13)
  * ────────────────────────────────────────────────────────────
- *   A (warm_dormant)   → S4.5 Agentic Seinfeld           f99fba97-6d2f-4fd6-966c-b5e5e36f8938
- *   B (cold_valid)     → S1.2 Calculator Re-engagement   bf894396-1cd9-4095-8789-7ce12a4e412a
- *   C (dangerous_dead) → quarantine (tag only, no workflow target)
+ *   A (warm)       → S4.5 Agentic Seinfeld           f99fba97-6d2f-4fd6-966c-b5e5e36f8938
+ *   B (cold_valid) → S1.2 Calculator Re-engagement   bf894396-1cd9-4095-8789-7ce12a4e412a
+ *   C (dangerous)  → quarantine (tag only, no workflow target)
  *
- *   Callers can override via action_payload.workflow_map (rare).
+ *   Naming note: contact_risk_scores has a CHECK constraint allowing only
+ *   'warm' / 'cold_valid' / 'dangerous' / 'unknown'. Earlier drafts used
+ *   'warm_dormant' / 'dangerous_dead' — aligned to the constraint 2026-05-13.
  *
- * THROTTLE KEYS (recommended convention — pair with #55)
- * ──────────────────────────────────────────────────────
+ * THROTTLE KEYS
+ * ─────────────
  *   A → 'resurrection:s4_5'
  *   B → 'resurrection:s1_2'
  *   C → 'resurrection:quarantine'
  *
- * ACTION PAYLOAD
- * ──────────────
- *   {
- *     require_fresh_score?: boolean   // default true — score must not be expired
- *     workflow_map?:        object    // override default bucket→workflow_id
- *     emit_event?:          boolean   // default true — fire bucket.classified
- *     phase_marker?:        string    // optional rollout phase identifier
- *   }
- *
  * RETURNS (execution_result)
  *   {
- *     bucket:            'A'|'B'|'C',
- *     classification:    'warm_dormant'|'cold_valid'|'dangerous_dead',
- *     score:             0-100,
- *     target_workflow_id: string|null,  // null for Bucket C
- *     throttle_key:      string,
+ *     bucket:                'A'|'B'|'C',
+ *     classification:        'warm'|'cold_valid'|'dangerous',
+ *     score:                 0-100,
+ *     target_workflow_id:    string|null,  // null for Bucket C
+ *     throttle_key:          string,
  *     action_recommendation: 'enroll'|'quarantine',
- *     score_age_hours:   number,
+ *     score_age_hours:       number,
  *     contact_id, computed_at
  *   }
- *
- *   Also sets batchContext via _context so downstream handlers in the
- *   same batch can read target_workflow_id without re-resolving.
- *
- * FAILURE MODES
- * ─────────────
- *   - No contact_risk_scores row → throws ('score not computed yet — run
- *     compute_risk_score first'). Caller short-circuits.
- *   - Score expired and require_fresh_score=true → throws.
- *   - Score expired and require_fresh_score=false → still resolves, but
- *     adds expired:true to result so downstream can decide.
  */
 
 import supabase from '../../supabase.js';
@@ -65,7 +43,7 @@ import supabase from '../../supabase.js';
 const DEFAULT_WORKFLOW_MAP = {
   A: 'f99fba97-6d2f-4fd6-966c-b5e5e36f8938', // S4.5 Agentic Seinfeld
   B: 'bf894396-1cd9-4095-8789-7ce12a4e412a', // S1.2 Calculator Re-engagement
-  C: null,                                   // Bucket C: tag-only quarantine, no workflow
+  C: null,                                   // Bucket C: tag-only quarantine
 };
 
 const DEFAULT_THROTTLE_KEY = {
@@ -74,23 +52,20 @@ const DEFAULT_THROTTLE_KEY = {
   C: 'resurrection:quarantine',
 };
 
+// Constraint-aligned values per contact_risk_scores_classification_check
 const CLASSIFICATION_TO_BUCKET = {
-  warm_dormant:   'A',
-  cold_valid:     'B',
-  dangerous_dead: 'C',
+  warm:       'A',
+  cold_valid: 'B',
+  dangerous:  'C',
+  // 'unknown' is allowed by the constraint but isn't a bucket assignment;
+  // throw rather than guess so caller knows the score is invalid.
 };
 
-/**
- * Emit a bucket.classified event so other rules can react (e.g. enroll
- * into the resolved workflow, send GroupMe notification on Bucket A
- * classification, etc.). bypass_filter:true to avoid the event-intake
- * gate dropping intake.* events until they're added to the allowlist.
- */
 async function emitClassifiedEvent({ contactId, bucket, score, classification, targetWorkflowId, throttleKey, phaseMarker }) {
   try {
     await supabase.from('system_events').insert({
       event_type: 'bucket.classified',
-      event_subtype: bucket.toLowerCase(),  // 'a' | 'b' | 'c'
+      event_subtype: bucket.toLowerCase(),
       source: 'agent_executor',
       entity_type: 'contact',
       entity_id: contactId,
@@ -117,12 +92,11 @@ export async function executeClassifyBucket(action) {
   if (!contactId) throw new Error('Missing contactId');
 
   const params = action.action_payload || {};
-  const requireFresh = params.require_fresh_score !== false; // default true
-  const emitEvent = params.emit_event !== false;             // default true
+  const requireFresh = params.require_fresh_score !== false;
+  const emitEvent = params.emit_event !== false;
   const workflowMap = { ...DEFAULT_WORKFLOW_MAP, ...(params.workflow_map || {}) };
   const phaseMarker = params.phase_marker || null;
 
-  // ── 1. Read most recent contact_risk_scores ───────────────────
   const { data: scoreRow, error: readErr } = await supabase
     .from('contact_risk_scores')
     .select('score, classification, components, computed_at, expires_at')
@@ -136,12 +110,10 @@ export async function executeClassifyBucket(action) {
   }
   if (!scoreRow) {
     throw new Error(
-      `classify-bucket: no contact_risk_scores row for ${contactId}. ` +
-      `Run compute_risk_score first.`
+      `classify-bucket: no contact_risk_scores row for ${contactId}. Run compute_risk_score first.`
     );
   }
 
-  // ── 2. Freshness check ────────────────────────────────────────
   const now = Date.now();
   const computedMs = new Date(scoreRow.computed_at).getTime();
   const expiresMs = scoreRow.expires_at ? new Date(scoreRow.expires_at).getTime() : null;
@@ -150,17 +122,15 @@ export async function executeClassifyBucket(action) {
 
   if (expired && requireFresh) {
     throw new Error(
-      `classify-bucket: score for ${contactId} expired at ${scoreRow.expires_at}. ` +
-      `Re-run compute_risk_score before classifying.`
+      `classify-bucket: score for ${contactId} expired at ${scoreRow.expires_at}. Re-run compute_risk_score.`
     );
   }
 
-  // ── 3. Resolve bucket ─────────────────────────────────────────
   const classification = scoreRow.classification;
   const bucket = CLASSIFICATION_TO_BUCKET[classification];
   if (!bucket) {
     throw new Error(
-      `classify-bucket: unknown classification '${classification}' for ${contactId}. ` +
+      `classify-bucket: unmapped classification '${classification}' for ${contactId}. ` +
       `Expected one of: ${Object.keys(CLASSIFICATION_TO_BUCKET).join(', ')}`
     );
   }
@@ -169,7 +139,6 @@ export async function executeClassifyBucket(action) {
   const throttleKey = DEFAULT_THROTTLE_KEY[bucket];
   const actionRecommendation = bucket === 'C' ? 'quarantine' : 'enroll';
 
-  // ── 4. Optional event emit ────────────────────────────────────
   if (emitEvent) {
     await emitClassifiedEvent({
       contactId,
@@ -198,7 +167,6 @@ export async function executeClassifyBucket(action) {
     expired,
     computed_at: scoreRow.computed_at,
     contact_id: contactId,
-    // Share with downstream batch handlers (add_to_workflow, check_throttle)
     _context: {
       bucket_target_workflow_id: targetWorkflowId,
       bucket_throttle_key: throttleKey,
