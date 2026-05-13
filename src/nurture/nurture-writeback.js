@@ -53,6 +53,34 @@
  *   when the new content lacks a P.S. — same class of stale-draft bug
  *   that the workflow's "Clear Previous Email Details" step exists
  *   to prevent.
+ *
+ * v1.5 — 2026-05-12. clearGhlDraftFields() helper. The GHL workflow's
+ *   "Clear Past Email Fields" step (step 23 of f99fba97) was confirmed
+ *   to silently no-op on long-text fields: actionType=clear_field_data
+ *   with empty-string value doesn't actually clear AI Email Body Draft
+ *   or AI Msg Meta Json. Result: after a successful send, the workflow
+ *   advances to the next sequence position but the body/meta from the
+ *   PREVIOUS cycle remain populated on the contact. If the next cycle's
+ *   orchestrator call suppresses (failed_generation, suppressed_low_conf,
+ *   etc.) and the gate then flips for any reason, the workflow's empty-
+ *   body guard sees populated body → sends the STALE email a second time.
+ *
+ *   Verified failure mode 2026-05-12: Mark Test (y4dvOxtWW12xGrBavCUt)
+ *   pos 4 email sent twice — once at 23:08:13 (intended) and again at
+ *   ~23:14:52 (duplicate, with pos 5 attempted in between as failed_
+ *   generation, leaving pos 4 content intact). The engagement endpoint
+ *   correctly rejected the duplicate event_sent with applied=false
+ *   reason=ghl_sent_at_already_set, but the GHL send had already fired.
+ *
+ *   Fix: orchestrator (and only orchestrator) owns clearing the GHL
+ *   draft fields. Called on suppress paths to ensure stale content
+ *   from any previous successful send is wiped before the workflow
+ *   advances. Uses direct GHL API PATCH (PUT here, same shape as
+ *   writeBackToGHL) which has been verified to actually clear long-
+ *   text fields with empty-string values.
+ *
+ *   NOT called on awaiting_approval / soft_pass paths — those preserve
+ *   the drafts for human review (design intent).
  */
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -89,6 +117,23 @@ export const FIELD_IDS = {
 // The S4.5 v2 workflow's wait-for-condition step checks `== "Yes"`
 // and the reset step writes "No".
 const GATE_FLIPPED = 'Yes';
+
+// v1.5 — fields cleared by clearGhlDraftFields(). Kept as a named
+// constant so the contract is auditable from one place.
+//
+// We DO NOT clear: ai_msg_send_ready, ai_sms_send_ready (gate fields
+// are workflow-owned and the workflow has its own Reset Send Gate
+// step), ai_msg_sequence_position (workflow-owned), ai_msg_next_wait_hours
+// (cadence info that should persist), ai_sms_body_draft (we currently
+// only nurture via email — leaving this populated is safe).
+const CLEAR_FIELDS = [
+  'ai_email_subject_draft',
+  'ai_email_preheader_draft',
+  'ai_email_body_draft',
+  'ai_email_ps_draft',
+  'ai_msg_meta_json',
+  'ai_msg_generation_id',
+];
 
 function assertFieldIdsConfigured(usedKeys) {
   const missing = usedKeys.filter(k => !FIELD_IDS[k] || FIELD_IDS[k] === 'FILL_ME_IN');
@@ -250,3 +295,56 @@ export async function writeDraftsOnly(contactId, output, generationId, confidenc
   const psLog = output.ps_text ? ' ps=yes' : ' ps=no';
   console.log(`[NurtureWriteback] shadow contact=${contactId} gen=${generationId}${seqLog}${psLog} fields_written=${fields.length} (gate NOT flipped)`);
 }
+
+/**
+ * Clear the GHL draft fields on a contact. Used by the orchestrator on
+ * suppress paths (suppressed_low_conf, suppressed_overlap, suppressed_
+ * interrupt, failed_generation) to ensure that any stale draft content
+ * from a previous successful send is wiped before the GHL workflow
+ * advances to the next sequence position.
+ *
+ * Background: the GHL workflow's "Clear Past Email Fields" step
+ * (step 23 of f99fba97) was confirmed to silently no-op on long-text
+ * fields when actionType=clear_field_data is used with empty-string
+ * values. Direct API PUT with empty strings DOES clear those fields —
+ * verified live on Mark Test 2026-05-12. So we own the clear here.
+ *
+ * NOT called on awaiting_approval / soft_pass paths — those preserve
+ * drafts for human review. NOT called on the success path either —
+ * writeBackToGHL is overwriting all of these fields with fresh content
+ * in that case anyway.
+ *
+ * Idempotent. Safe to call on a contact whose fields are already empty;
+ * the GHL API will just record a no-op update.
+ *
+ * @param {string} contactId
+ * @param {string} reason  — suppress reason, for log only
+ */
+export async function clearGhlDraftFields(contactId, reason = 'suppress') {
+  if (!contactId) {
+    throw new Error('clearGhlDraftFields: contactId required');
+  }
+  assertFieldIdsConfigured(CLEAR_FIELDS);
+
+  // Confidence is a numeric field — clear by writing 0, which the
+  // decoder treats as "no score yet."
+  const fields = CLEAR_FIELDS.map(k => ({ id: FIELD_IDS[k], field_value: '' }));
+  fields.push({ id: FIELD_IDS.ai_msg_confidence, field_value: 0 });
+
+  try {
+    await ghlUpdate(contactId, fields);
+    console.log(`[NurtureWriteback] cleared drafts contact=${contactId} reason=${reason} fields=${fields.length}`);
+  } catch (err) {
+    // Never fail the parent orchestrator over a clear failure — log
+    // and continue. The clear is defense-in-depth; absence of clear
+    // doesn't break correctness, only re-exposes the stale-draft risk
+    // on the next cycle.
+    console.warn(`[NurtureWriteback] clear failed contact=${contactId} reason=${reason}: ${err.message}`);
+  }
+}
+
+// Exported for tests.
+export const _internal = {
+  CLEAR_FIELDS,
+  buildPhase1Fields,
+};
