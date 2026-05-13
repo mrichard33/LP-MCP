@@ -1,18 +1,35 @@
 /**
  * Event Emitter — src/event-emitter.js
- * 
+ *
  * Thin helper to emit system events into the system_events table.
  * Used by sync-leads.js (disposition changes), sync-engine.js (sync events),
  * and any other system component that needs to fire events for the Decision Engine.
- * 
+ *
  * Uses idempotency_key to prevent duplicate events from re-syncs.
+ *
+ * 2026-05-13 — Play 1 Optimization: event-intake-filter integration.
+ *   All emits run through applyIntakeFilter() first. Events for types/
+ *   subtypes not in the allowlist are recorded to system_events_filtered
+ *   for telemetry and dropped from the main queue. Pass bypass:true to
+ *   skip the gate when the caller already knows the event has a consumer
+ *   (used by internal emitters: intent.*, behavioral.*, ai.*, system.*).
+ *   See src/services/event-intake-filter.js for the allowlist and rationale.
  */
 
 import supabase from './supabase.js';
+import { applyIntakeFilter } from './services/event-intake-filter.js';
 
 /**
  * Emit a system event. Skips silently if idempotency_key already exists.
- * 
+ *
+ * Filter behavior (2026-05-13):
+ *   - Before any DB write, applyIntakeFilter() checks if the event type
+ *     has any active rule consumer. If not, the event is recorded to
+ *     system_events_filtered (72h TTL) and emitEvent returns
+ *     { filtered: true, reason }.
+ *   - Pass opts.bypass_filter = true to skip the gate. Used by internal
+ *     emitters that have proven rule consumers (intent.*, ai.*, etc).
+ *
  * @param {Object} opts
  * @param {string} opts.event_type       - e.g. 'lp.disposition_changed', 'ghl.appointment_booked'
  * @param {string} [opts.event_subtype]  - e.g. the disposition code 'FDNS', 'BO', etc.
@@ -27,7 +44,9 @@ import supabase from './supabase.js';
  * @param {Object} [opts.new_state]      - State after the change
  * @param {string} [opts.priority]       - 'critical', 'high', 'normal', 'low' (default: 'normal')
  * @param {string} [opts.idempotency_key] - Unique key to prevent duplicates
- * @returns {Object|null} The inserted event row, or null if skipped
+ * @param {boolean} [opts.bypass_filter]  - 2026-05-13: skip event-intake-filter gate
+ * @returns {Object|null} The inserted event row, or null if skipped/filtered.
+ *                        Filtered events return { filtered: true, reason }.
  */
 export async function emitEvent(opts) {
   const {
@@ -35,9 +54,23 @@ export async function emitEvent(opts) {
     ghl_contact_id, lp_lead_id, lp_prospect_id,
     payload = {}, previous_state = null, new_state = null,
     priority = 'normal', idempotency_key = null,
+    bypass_filter = false,
   } = opts;
 
   try {
+    // ─── Phase 1 Optimization Play 1 (2026-05-13) ──────────────────
+    // Event intake filter. Runs BEFORE the idempotency check so filtered
+    // events never touch system_events at all (and so the idempotency
+    // key isn't burned on a dropped event).
+    const filterDecision = await applyIntakeFilter(
+      { event_type, event_subtype, source, ghl_contact_id, entity_id, payload },
+      { bypass: bypass_filter }
+    );
+    if (!filterDecision.allow) {
+      // Telemetry is already recorded inside applyIntakeFilter.
+      return { filtered: true, reason: filterDecision.reason };
+    }
+
     // Check idempotency — skip if this exact event was already emitted
     if (idempotency_key) {
       const { data: existing } = await supabase
@@ -95,16 +128,16 @@ export async function emitEvent(opts) {
  */
 export function dispositionPriority(code) {
   const c = String(code || '').trim();
-  
+
   // Critical — immediate action required
   if (['DNC', 'Sale', 'SW'].includes(c)) return 'critical';
-  
+
   // High — appointment-related, time-sensitive
   if (['Cnf', 'Set', 'NS', 'FDNS', 'CXL', 'NoHome', '1Leg', 'Issue'].includes(c)) return 'high';
-  
+
   // Low — dead/suppressed codes
   if (['NG', 'BD', 'CTR', 'NOP NOP', 'NOPNOP', 'Renter', 'VNI'].includes(c)) return 'low';
-  
+
   // Normal — everything else
   return 'normal';
 }
