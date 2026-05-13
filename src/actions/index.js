@@ -80,6 +80,13 @@
  * via create_agent_action. Triggered by action 49546 (Mark Test,
  * 2026-05-07) sitting behind a ~250-action BULK_MIGRATION_2026_05_06
  * batch.
+ *
+ * 2026-05-13 — Phase 1 Intake/Routing Layer #51: universal suppression
+ * for outbound send_message. executeSendMessageWithLock now calls
+ * checkSuppression() before acquiring the outbound lock. On match, the
+ * send is skipped without lock acquisition or GHL API call. SUPPRESS_TAGS
+ * list lives in src/services/suppression-check.js. Tag source is
+ * contact_tag_snapshot (kept current by GHL webhook in ghl-tag-handler.js).
  */
 
 import supabase from '../supabase.js';
@@ -92,6 +99,9 @@ import { reapStuckActions } from './reaper.js';
 // MVI v2.5 — outbound dedup + Layer 3 dispatch
 import { tryAcquireLock, releaseLock } from '../services/outbound-locks.js';
 import { getDispatchForClassification } from '../services/layer3-dispatch.js';
+
+// Phase 1 Intake/Routing Layer #51 — universal outbound suppression
+import { checkSuppression } from '../services/suppression-check.js';
 
 // ─── Handlers ──────────────────────────────────────────────────────
 import { executeAddTag, executeRemoveTag, executeSetStage } from './handlers/tags.js';
@@ -123,7 +133,16 @@ async function fetchSourceEvent(action) {
 
 // ═══════════════════════════════════════════════════════════════════
 // MVI v2.5 — send_message wrapper: outbound lock around the existing handler
+// Phase 1 #51 — universal suppression check runs BEFORE lock acquisition
 // ═══════════════════════════════════════════════════════════════════
+//
+// Order:
+//   1. checkSuppression(contact_id)  — tag-based gate (NEW 2026-05-13)
+//   2. tryAcquireLock                — outbound dedup
+//   3. executeSendMessage            — actual GHL API call
+//
+// Suppression match → skipped, no lock acquired, no GHL API call,
+// action marked completed with execution_result carrying the matched tag.
 //
 // trigger_id resolution priority:
 //   1. action.action_payload.trigger_id        (explicit)
@@ -137,6 +156,23 @@ async function fetchSourceEvent(action) {
 async function executeSendMessageWithLock(action, context) {
   const params = action.action_payload || {};
   const contact_id = action.target_id;
+
+  // Phase 1 #51 — universal suppression gate. Runs first so suppressed
+  // sends do not waste a lock slot or call GHL. Fail-open on infra errors.
+  const suppression = await checkSuppression(contact_id);
+  if (suppression.suppressed) {
+    console.log(
+      `[ActionExecutor] send_message suppressed: contact=${contact_id} ` +
+      `matched_tag=${suppression.matched_tag} all=${(suppression.all_matches || []).join(',')}`
+    );
+    return {
+      skipped: true,
+      reason: 'suppressed',
+      matched_tag: suppression.matched_tag,
+      all_matches: suppression.all_matches,
+      contact_id,
+    };
+  }
 
   let trigger_id = params.trigger_id || context?.message_id || null;
   if (!trigger_id) {
@@ -296,7 +332,7 @@ const ACTION_HANDLERS = {
   update_custom_fields: executeUpdateCustomFields,
   update_contact_email: executeUpdateContactEmail,
   calculate_time_lapse_tier: executeCalculateTimeLapseTier,
-  send_message: executeSendMessageWithLock,      // MVI v2.5 — outbound_locks wrap
+  send_message: executeSendMessageWithLock,      // MVI v2.5 — outbound_locks wrap; 2026-05-13 — + suppression gate
   layer3_dispatch: executeLayer3Dispatch,        // MVI v2.5 — Layer 3 fan-out
   emit_event: executeEmitEvent,                  // MVI v2.5 — observability / follow-on
   compute_rescission_dispatch: executeComputeRescissionDispatch, // 2026-05-06 — FL rescission rescue (Thomas Michaud post-mortem)
