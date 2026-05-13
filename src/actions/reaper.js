@@ -41,6 +41,39 @@
  * Both phases inherit the 5-minute heartbeat cadence — no extra cron, no
  * extra infrastructure. The reaper runs first inside executeActions() so
  * recovered rows execute in the same cycle.
+ *
+ * ─── 2026-05-13 — RECOVERABLE NON-IDEMPOTENT (executor stall fix) ──
+ *
+ * Pre-fix: every action_type in NON_IDEMPOTENT_ACTION_TYPES was dropped
+ * on stall (marked failed, no retry) to prevent duplicate side effects.
+ * Cost: ~37/week send_notifications silently lost when Railway
+ * redeployed mid-handler.
+ *
+ * The set is now split:
+ *
+ *   NON_IDEMPOTENT_ACTION_TYPES (still drops on stall):
+ *     - create_task        — would post duplicate GHL note + GroupMe
+ *     - send_message       — would send duplicate customer SMS/email
+ *     - create_lp_lead     — would queue duplicate LP inbound lead
+ *
+ *   RECOVERABLE_NON_IDEMPOTENT_ACTION_TYPES (requeues within budget):
+ *     - send_notification  — handler verifies via GroupMe history check
+ *                            before resending (see notifications.js +
+ *                            groupme-read.js)
+ *
+ * Adding an action_type to the recoverable set requires:
+ *   1. External system has a read API queryable for evidence of prior
+ *      completion (GroupMe: /groups/:id/messages; for create_task we'd
+ *      need GHL task search; for create_lp_lead we'd need LP lookup).
+ *   2. Handler stamps a recoverable identifier into the outbound payload
+ *      (e.g., the `ref: a${action.id}` footer on send_notification).
+ *   3. Handler runs the verification check on retry_count > 0 and
+ *      short-circuits if the prior attempt succeeded.
+ *
+ * Recovery budget = standard retry_count / max_retries (default 3 total
+ * handler attempts including the original). After exhaustion the action
+ * is failed for good. Prevents immortal-retry loops if the verification
+ * read-API consistently fails.
  */
 
 import supabase from '../supabase.js';
@@ -55,19 +88,30 @@ const REAPER_AGE_MINUTES = 10;
 // picks up 'pending' rows within seconds).
 const APPROVED_RECOVERY_AGE_MINUTES = 2;
 
-// Handlers that produce side effects a retry would duplicate. Always fail
-// these rather than retry, regardless of age or retry budget. (Phase 1 only.)
+// Strict non-idempotent: drop on stall. No external verification path
+// exists yet — a retry could duplicate (LP lead, GHL task, customer SMS).
 const NON_IDEMPOTENT_ACTION_TYPES = new Set([
-  'create_task',         // posts GHL note + GroupMe notification
-  'send_notification',   // posts GroupMe message
-  'send_message',        // sends customer-facing SMS/email
-  'create_lp_lead',      // 2026-05-01 — posts to LP /api/Leads/LeadAdd; double-creates would queue duplicate inbound leads
+  'create_task',        // posts GHL note + GroupMe notification
+  'send_message',       // sends customer-facing SMS/email
+  'create_lp_lead',     // 2026-05-01 — posts to LP /api/Leads/LeadAdd
+]);
+
+// 2026-05-13 — Recoverable non-idempotent: requeue on stall within
+// retry budget. The handler verifies whether the action already
+// completed externally before resending. See header comment for the
+// requirements to add an action_type to this set.
+const RECOVERABLE_NON_IDEMPOTENT_ACTION_TYPES = new Set([
+  'send_notification',  // verified via GroupMe history check (ref footer)
 ]);
 
 /**
  * Phase 1: Find actions stuck in 'executing' status for more than
  * REAPER_AGE_MINUTES and transition them back to 'pending' (for retry)
  * or 'failed' (non-idempotent or retries exhausted).
+ *
+ * Recoverable non-idempotent actions (send_notification today) are
+ * requeued like idempotent ones — the handler verifies externally
+ * before resending. They still respect the retry budget.
  */
 async function reapStuckExecuting() {
   const cutoff = new Date(Date.now() - REAPER_AGE_MINUTES * 60 * 1000).toISOString();
@@ -80,27 +124,42 @@ async function reapStuckExecuting() {
 
   if (error) {
     console.error(`[Reaper:executing] fetch failed: ${error.message}`);
-    return { reaped: 0, requeued: 0, failed: 0, error: error.message };
+    return { reaped: 0, requeued: 0, failed: 0, recovery_requeued: 0, error: error.message };
   }
-  if (!stuck?.length) return { reaped: 0, requeued: 0, failed: 0 };
+  if (!stuck?.length) return { reaped: 0, requeued: 0, failed: 0, recovery_requeued: 0 };
 
   let requeued = 0;
   let failed = 0;
+  let recoveryRequeued = 0;
 
   for (const action of stuck) {
     const newRetryCount = (action.retry_count || 0) + 1;
     const max = action.max_retries || 3;
     const retriesExhausted = newRetryCount >= max;
-    const nonIdempotent = NON_IDEMPOTENT_ACTION_TYPES.has(action.action_type);
+    const isRecoverable = RECOVERABLE_NON_IDEMPOTENT_ACTION_TYPES.has(action.action_type);
+    const isStrictNonIdempotent = NON_IDEMPOTENT_ACTION_TYPES.has(action.action_type);
 
-    const newStatus = (nonIdempotent || retriesExhausted) ? 'failed' : 'pending';
-
+    let newStatus;
     let errorMsg;
-    if (nonIdempotent) {
+
+    if (isRecoverable) {
+      // Requeue within retry budget. Handler verifies before resending.
+      if (retriesExhausted) {
+        newStatus = 'failed';
+        errorMsg = `Reaped: stuck in executing >${REAPER_AGE_MINUTES}min; recovery attempts exhausted (${newRetryCount}/${max}) for ${action.action_type}`;
+      } else {
+        newStatus = 'pending';
+        errorMsg = `Reaped: stuck in executing >${REAPER_AGE_MINUTES}min; requeued for recovery-verified retry (${newRetryCount}/${max}, ${action.action_type})`;
+      }
+    } else if (isStrictNonIdempotent) {
+      // Drop. No external verification path exists for this type.
+      newStatus = 'failed';
       errorMsg = `Reaped: stuck in executing >${REAPER_AGE_MINUTES}min; not retried (non-idempotent ${action.action_type} would duplicate side effects)`;
     } else if (retriesExhausted) {
+      newStatus = 'failed';
       errorMsg = `Reaped: stuck in executing >${REAPER_AGE_MINUTES}min; retries exhausted (${newRetryCount}/${max})`;
     } else {
+      newStatus = 'pending';
       errorMsg = `Reaped: stuck in executing >${REAPER_AGE_MINUTES}min; requeued for retry (${newRetryCount}/${max})`;
     }
 
@@ -120,12 +179,24 @@ async function reapStuckExecuting() {
       continue;
     }
 
-    if (newStatus === 'pending') requeued++;
-    else failed++;
+    if (newStatus === 'pending') {
+      if (isRecoverable) recoveryRequeued++;
+      else requeued++;
+    } else {
+      failed++;
+    }
   }
 
-  console.log(`[Reaper:executing] ${stuck.length} stuck — ${requeued} requeued, ${failed} failed`);
-  return { reaped: stuck.length, requeued, failed };
+  console.log(
+    `[Reaper:executing] ${stuck.length} stuck — ${requeued} requeued (idempotent), ` +
+    `${recoveryRequeued} recovery-requeued, ${failed} failed`
+  );
+  return {
+    reaped: stuck.length,
+    requeued: requeued + recoveryRequeued,
+    failed,
+    recovery_requeued: recoveryRequeued,
+  };
 }
 
 /**
@@ -200,8 +271,8 @@ async function reapStuckApproved() {
  * them in its response payload for n8n / monitoring visibility.
  *
  * Backward-compatible return shape: callers that read `.reaped` continue
- * to work. New `.approved_recovered` and `.approved_skipped` fields are
- * additive.
+ * to work. `.approved_recovered`, `.approved_skipped`, and the
+ * 2026-05-13 `.recovery_requeued` fields are additive.
  */
 export async function reapStuckActions() {
   const exec = await reapStuckExecuting();
@@ -211,6 +282,7 @@ export async function reapStuckActions() {
     reaped: (exec.reaped || 0) + (appr.reaped || 0),
     requeued: exec.requeued || 0,
     failed: exec.failed || 0,
+    recovery_requeued: exec.recovery_requeued || 0,
     approved_recovered: appr.promoted || 0,
     approved_skipped: appr.skipped || 0,
     error: exec.error || appr.error,
