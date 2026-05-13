@@ -1,0 +1,282 @@
+/**
+ * Decision Engine Heartbeat — src/decision-engine-heartbeat.js
+ *
+ * Phase 1 Optimization Play 2 (2026-05-13).
+ *
+ * In-process failover scheduler for the Decision Engine. Sits dormant
+ * while n8n's external heartbeat is healthy, takes over automatically
+ * if n8n stops firing the decision-engine cron.
+ *
+ * BACKGROUND
+ * ──────────
+ * Layer 1 of the agentic system relies on a 5-minute n8n cron
+ * (workflow ERnvX5hp6i90VVWc) hitting POST /n8n/decision-engine/process
+ * to convert pending system_events into agent_actions. When that cron
+ * stops firing, events pile up indefinitely — customer replies, booking
+ * confirmations, AI handoffs all sit in the queue silently.
+ *
+ * Cited incident: 2026-05-13. n8n workflow ERnvX5hp6i90VVWc went
+ * dormant at 02:25 UTC on 2026-05-11. Schedule trigger silently
+ * stopped firing while the workflow was still marked active=true.
+ * Other n8n schedules (Daily MV Refresh) continued running. Discovered
+ * 2.5 days later when 998 events had accumulated, including:
+ *   - 10 unprocessed inbound replies
+ *   - 12 appointment bookings
+ *   - 14 agentic handoffs
+ *   - 8 critical lead_score_changed events
+ * Oldest event was 47 hours old.
+ *
+ * Pairs with src/executor-heartbeat.js which is the equivalent failover
+ * for the Action Executor (Layer 2). Together they make the agentic
+ * system n8n-independent: n8n is preferred when healthy, but the system
+ * recovers on its own within 6 minutes if n8n stops firing.
+ *
+ * DESIGN
+ * ──────
+ * Failover, not parallel. The scheduler:
+ *   1. Checks the most recent processed_at across system_events
+ *   2. If < STALE_THRESHOLD_MS old: skip (n8n is doing its job)
+ *   3. If >= STALE_THRESHOLD_MS old: run processEvents
+ *
+ * Why failover rather than always-on:
+ *   - processSingleEvent already has inbound idempotency (MVI v2.5,
+ *     processed_events table) so duplicate processing is SAFE for
+ *     correctness — same event won't double-fire rules. But running
+ *     two drivers in parallel is wasteful.
+ *   - Keeps n8n authoritative when healthy. n8n stays the system of
+ *     record for "did this 5-min cycle fire" observability.
+ *
+ * KILL SWITCH
+ * ───────────
+ *   DECISION_ENGINE_HEARTBEAT_DISABLED=true — disables the scheduler entirely
+ *
+ * TUNING
+ * ──────
+ *   STALE_THRESHOLD_MS — how stale "no events processed in X ms" means
+ *                        before failover fires. Default 6min — gives
+ *                        n8n's 5-min cadence a 1-min buffer.
+ *   HEARTBEAT_INTERVAL_MS — how often this scheduler wakes up. Default
+ *                           5min — same as n8n cadence.
+ *   FIRST_RUN_DELAY_MS — initial wait on boot. Default 3min — gives
+ *                        the server time to settle, n8n a chance to
+ *                        fire first if it's healthy.
+ *
+ * MANUAL TRIGGER
+ * ──────────────
+ *   POST /n8n/decision-engine/heartbeat-de
+ *     Forces a heartbeat check immediately (subject to staleness gate).
+ *     Pass { force: true } in body to bypass the staleness gate and
+ *     run processEvents unconditionally.
+ *
+ * OBSERVABILITY
+ * ─────────────
+ *   - Logs every heartbeat decision at info level
+ *   - On failover-fire: logs the staleness duration and the processEvents
+ *     result summary (events_processed/actions_created counts)
+ *   - On skip: logs the most-recent processed_at age in seconds
+ */
+
+import supabase from './supabase.js';
+import { processEvents } from './decision-engine.js';
+
+const STALE_THRESHOLD_MS = parseInt(
+  process.env.DECISION_ENGINE_STALE_THRESHOLD_MS || `${6 * 60 * 1000}`, 10
+);
+const HEARTBEAT_INTERVAL_MS = parseInt(
+  process.env.DECISION_ENGINE_HEARTBEAT_INTERVAL_MS || `${5 * 60 * 1000}`, 10
+);
+const FIRST_RUN_DELAY_MS = parseInt(
+  process.env.DECISION_ENGINE_HEARTBEAT_FIRST_RUN_DELAY_MS || `${3 * 60 * 1000}`, 10
+);
+
+let intervalHandle = null;
+
+/**
+ * Find the most recent processed_at timestamp across all system_events.
+ * Returns ISO string or null if no events have ever been processed.
+ */
+async function getMostRecentProcessedAt() {
+  const { data, error } = await supabase
+    .from('system_events')
+    .select('processed_at')
+    .not('processed_at', 'is', null)
+    .order('processed_at', { ascending: false })
+    .limit(1);
+  if (error) {
+    console.warn(`[DecisionEngineHeartbeat] processed_at query failed: ${error.message}`);
+    return null;
+  }
+  return data?.[0]?.processed_at || null;
+}
+
+/**
+ * Check whether there are pending events that warrant firing the engine.
+ * Returns count of unprocessed events (capped at 1 for efficiency).
+ */
+async function hasPendingEvents() {
+  const { count, error } = await supabase
+    .from('system_events')
+    .select('id', { count: 'exact', head: true })
+    .eq('processed', false);
+  if (error) {
+    console.warn(`[DecisionEngineHeartbeat] pending count failed: ${error.message}`);
+    return false;
+  }
+  return (count || 0) > 0;
+}
+
+/**
+ * Check if the decision engine needs a failover kick. Returns:
+ *   { needs_run: bool, last_processed_at, age_ms, has_pending }
+ */
+async function checkEngineHealth() {
+  const [lastIso, hasPending] = await Promise.all([
+    getMostRecentProcessedAt(),
+    hasPendingEvents(),
+  ]);
+
+  if (!hasPending) {
+    // Nothing to process — no need to fire regardless of staleness.
+    return { needs_run: false, last_processed_at: lastIso, age_ms: null, has_pending: false };
+  }
+
+  if (!lastIso) {
+    // Pending events exist but no processing history — fire to drain.
+    return { needs_run: true, last_processed_at: null, age_ms: null, has_pending: true };
+  }
+
+  const ageMs = Date.now() - Date.parse(lastIso);
+  return {
+    needs_run: ageMs >= STALE_THRESHOLD_MS,
+    last_processed_at: lastIso,
+    age_ms: ageMs,
+    has_pending: true,
+  };
+}
+
+/**
+ * One heartbeat cycle. Checks staleness, fires processEvents if needed.
+ * Returns the result for logging / route response.
+ */
+export async function runDecisionEngineHeartbeat({ force = false } = {}) {
+  if (process.env.DECISION_ENGINE_HEARTBEAT_DISABLED === 'true') {
+    return { skipped: true, reason: 'DECISION_ENGINE_HEARTBEAT_DISABLED=true' };
+  }
+
+  const health = await checkEngineHealth();
+
+  if (!force && !health.needs_run) {
+    const ageSeconds = health.age_ms != null ? Math.round(health.age_ms / 1000) : null;
+    const reason = !health.has_pending ? 'no_pending_events' : 'n8n_healthy';
+    console.log(`[DecisionEngineHeartbeat] Skip — ${reason}${ageSeconds !== null ? ` (last processed_at ${ageSeconds}s ago)` : ''}`);
+    return {
+      skipped: true,
+      reason,
+      last_processed_at: health.last_processed_at,
+      age_ms: health.age_ms,
+      has_pending: health.has_pending,
+      stale_threshold_ms: STALE_THRESHOLD_MS,
+    };
+  }
+
+  const ageDescription = health.age_ms != null
+    ? `${Math.round(health.age_ms / 1000)}s stale`
+    : 'no prior processing';
+  console.log(
+    `[DecisionEngineHeartbeat] FAILOVER — firing processEvents (${ageDescription}, threshold ${STALE_THRESHOLD_MS}ms${force ? ', forced' : ''})`
+  );
+
+  const startedAt = Date.now();
+  let result;
+  try {
+    result = await processEvents({ limit: 50 });
+  } catch (err) {
+    console.error(`[DecisionEngineHeartbeat] processEvents threw: ${err.message}`);
+    return {
+      skipped: false,
+      fired: true,
+      forced: !!force,
+      error: err.message,
+      last_processed_at_before: health.last_processed_at,
+      age_ms_before: health.age_ms,
+      elapsed_ms: Date.now() - startedAt,
+    };
+  }
+
+  console.log(
+    `[DecisionEngineHeartbeat] Done — ${result.events_processed || 0} processed (${result.total_actions_created || 0} actions, ${result.ai_routed || 0} AI-routed, ${result.deduped || 0} deduped), ${result.elapsed_ms}ms`
+  );
+  return {
+    skipped: false,
+    fired: true,
+    forced: !!force,
+    last_processed_at_before: health.last_processed_at,
+    age_ms_before: health.age_ms,
+    engine_result: result,
+    elapsed_ms: Date.now() - startedAt,
+  };
+}
+
+/**
+ * Start the in-process heartbeat scheduler. Idempotent — calling twice
+ * is a no-op.
+ */
+export function startDecisionEngineHeartbeatScheduler() {
+  if (intervalHandle) return;
+  if (process.env.DECISION_ENGINE_HEARTBEAT_DISABLED === 'true') {
+    console.log('[DecisionEngineHeartbeat] Disabled via DECISION_ENGINE_HEARTBEAT_DISABLED=true — scheduler not armed');
+    return;
+  }
+
+  setTimeout(() => {
+    runDecisionEngineHeartbeat().catch(err => {
+      console.error('[DecisionEngineHeartbeat] Initial run failed:', err.message);
+    });
+    intervalHandle = setInterval(() => {
+      runDecisionEngineHeartbeat().catch(err => {
+        console.error('[DecisionEngineHeartbeat] Scheduled run failed:', err.message);
+      });
+    }, HEARTBEAT_INTERVAL_MS);
+  }, FIRST_RUN_DELAY_MS);
+
+  console.log(
+    `[DecisionEngineHeartbeat] Scheduler armed: stale_threshold=${STALE_THRESHOLD_MS}ms, interval=${HEARTBEAT_INTERVAL_MS}ms, first_run_delay=${FIRST_RUN_DELAY_MS}ms`
+  );
+}
+
+/**
+ * Express routes:
+ *   POST /n8n/decision-engine/heartbeat-de
+ *     Manually trigger a heartbeat check. Body: { force?: boolean }.
+ *     If force=true, bypasses the staleness gate and fires processEvents.
+ *
+ *   GET /n8n/decision-engine/heartbeat-de-status
+ *     Returns the current health state without firing the engine.
+ */
+export function registerDecisionEngineHeartbeatRoutes(app) {
+  app.post('/n8n/decision-engine/heartbeat-de', async (req, res) => {
+    try {
+      const force = req.body?.force === true;
+      const result = await runDecisionEngineHeartbeat({ force });
+      res.json({ success: true, ...result });
+    } catch (err) {
+      console.error('[DecisionEngineHeartbeat] /heartbeat-de error:', err.message);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  app.get('/n8n/decision-engine/heartbeat-de-status', async (req, res) => {
+    try {
+      const health = await checkEngineHealth();
+      res.json({
+        success: true,
+        ...health,
+        stale_threshold_ms: STALE_THRESHOLD_MS,
+        heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
+        disabled: process.env.DECISION_ENGINE_HEARTBEAT_DISABLED === 'true',
+      });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+}
