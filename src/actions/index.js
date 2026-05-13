@@ -29,14 +29,14 @@
  *   originating system_events row by action.event_id when they need
  *   structural fields like event.id or event.payload.message_id.
  *
- * Supported action types (22):
+ * Supported action types (23):
  *   add_tag, remove_tag, set_stage, move_opportunity, update_opportunity,
  *   remove_from_workflow, add_to_workflow, book_appointment,
  *   cancel_appointment, reschedule_appointment, create_task,
  *   send_notification, set_lp_appointment, create_lp_lead,
  *   update_lp_dnc_status, update_custom_fields, update_contact_email,
  *   calculate_time_lapse_tier, send_message, layer3_dispatch, emit_event,
- *   compute_rescission_dispatch.
+ *   compute_rescission_dispatch, check_eligibility.
  *
  * 2026-05-01 — added create_lp_lead (Jane recovery). Closes the
  * chatbot-in-session-booking gap that left contacts out of LP because
@@ -87,6 +87,14 @@
  * send is skipped without lock acquisition or GHL API call. SUPPRESS_TAGS
  * list lives in src/services/suppression-check.js. Tag source is
  * contact_tag_snapshot (kept current by GHL webhook in ghl-tag-handler.js).
+ *
+ * 2026-05-13 — Phase 1 Intake/Routing Layer #52: check_eligibility action.
+ * Hard gate for resurrection enrollment (Day 15 backfill, S1.2 / S4.5
+ * re-engagement). Five-check sequence: phone, email, suppression (via
+ * snapshot), exclusion tags (live GHL), caller-supplied extras. Tags the
+ * contact intake-eligible:{mode} or intake-ineligible and emits
+ * intake.eligibility_passed / intake.eligibility_failed events for the
+ * downstream Decision Engine. Handler in handlers/eligibility.js.
  */
 
 import supabase from '../supabase.js';
@@ -117,6 +125,8 @@ import { executeUpdateCustomFields, executeUpdateContactEmail } from './handlers
 import { executeCalculateTimeLapseTier } from './handlers/time-lapse.js';
 import { executeEmitEvent } from './handlers/system-events.js';
 import { executeComputeRescissionDispatch } from './handlers/rescission.js';
+// Phase 1 #52 — Intake/Routing Layer eligibility gate
+import { executeCheckEligibility } from './handlers/eligibility.js';
 
 // MVI v2.5 — fetch the source event for a given action. The shared
 // getEventContext returns ONLY the spread payload (no event_id /
@@ -336,6 +346,7 @@ const ACTION_HANDLERS = {
   layer3_dispatch: executeLayer3Dispatch,        // MVI v2.5 — Layer 3 fan-out
   emit_event: executeEmitEvent,                  // MVI v2.5 — observability / follow-on
   compute_rescission_dispatch: executeComputeRescissionDispatch, // 2026-05-06 — FL rescission rescue (Thomas Michaud post-mortem)
+  check_eligibility: executeCheckEligibility,    // 2026-05-13 — Phase 1 #52 Intake/Routing eligibility gate
 };
 
 // Handlers that need the triggering event's payload injected as context.
@@ -353,6 +364,8 @@ const CONTEXT_AWARE_HANDLERS = new Set([
 // spread payload that getEventContext provides).
 // compute_rescission_dispatch also fetches its own source event for the
 // same reason (needs event.id and event.created_at for sign-date defaulting).
+// check_eligibility does not need event context — it operates only on
+// action.target_id and the action_payload.
 
 // ═══════════════════════════════════════════════════════════════════
 // EXECUTOR ENGINE
