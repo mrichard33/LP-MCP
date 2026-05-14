@@ -15,6 +15,7 @@ import { registerN8nHelperRoutes } from './n8n-helpers.js';
 import { registerN8nAvatarRoutes } from './n8n-avatar.js';
 import { registerDecisionEngineRoutes } from './decision-engine.js';
 import { registerActionExecutorRoutes } from './action-executor.js';
+import { registerStateRoutes } from './state-routes.js';
 // ─── Executor Heartbeat (failover for n8n cron) ──────────────────
 import {
   registerExecutorHeartbeatRoutes,
@@ -287,6 +288,7 @@ registerN8nAvatarRoutes(app);
 // ─── Agentic Decision Engine + Action Executor ───────────────────
 registerDecisionEngineRoutes(app);
 registerActionExecutorRoutes(app);
+registerStateRoutes(app);
 
 // ─── Executor Heartbeat (failover for n8n cron) ──────────────────
 registerExecutorHeartbeatRoutes(app);
