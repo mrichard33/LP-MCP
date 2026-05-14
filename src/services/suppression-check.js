@@ -27,6 +27,32 @@
  * Phase principle: GHL workflows retain only timer + send. Agentic owns
  * routing, suppression, classification. Suppression must be enforced at
  * the agentic outbound gate so no rule can accidentally bypass it.
+ *
+ * ─── 2026-05-14 ALIGNMENT WITH send-message-handler.js v3.12 ────────
+ *
+ * Removed `pause-bot` and `suppress-automation` from SUPPRESS_TAGS.
+ *
+ * Those two tags were the original "agentic bot is in charge" gating
+ * signals. As of send-message-handler.js v3.12 (2026-05-08), the canonical
+ * signal is `agentic-active`, enforced UPSTREAM at the rule level (e.g.
+ * AGENTIC_RESPOND_POST_CHATBOT.context_conditions.has_tag = agentic-active).
+ * By the time a send_message action reaches this universal gate, the rule
+ * has already verified agentic-active is set. Re-gating on the legacy tags
+ * here was silently dropping valid sends — first observed on contact
+ * ZREwiRF6uoWsysyrzuKJ (Mary Hayward) 2026-05-13 23:20:52, where
+ * AUTOMATION_SUPPRESS_ON_BOOKING's 48hr post-booking pause stamped all
+ * three legacy tags onto a contact who then replied to a W8.0 email; the
+ * agentic responder was suppressed even though the rule's own conditions
+ * had already passed.
+ *
+ * Compliance / safety tags remain (dnc family, unsubscribed, cooling-active,
+ * quarantined, suppress-outbound, stop-bot). stop-bot stays because it is a
+ * lead-initiated kill switch that the contact triggered explicitly — that
+ * is a universal signal regardless of which subsystem is sending.
+ *
+ * Defense in depth: send-message-handler.js v3.12 also hard-blocks on
+ * dnc / do-not-contact / dnc-sms / stage:dnc and on stop-bot at the local
+ * handler. Compliance gates are preserved on both layers.
  */
 
 import supabase from '../supabase.js';
@@ -37,8 +63,7 @@ import supabase from '../supabase.js';
  * (contact_tag_snapshot normalizes on write).
  */
 export const SUPPRESS_TAGS = [
-  // Operational pause flags
-  'suppress-automation',
+  // Explicit one-shot suppressor (operational)
   'suppress-outbound',
 
   // Intake/Routing Layer (Phase 1)
@@ -52,10 +77,13 @@ export const SUPPRESS_TAGS = [
   'dnc-related',
   'unsubscribed',
 
-  // Contact-initiated bot pauses (respected universally — strong negative
-  // signal regardless of which channel the agentic send is using)
+  // Contact-initiated kill switch — respected universally because it is a
+  // direct lead-initiated signal regardless of which channel the agentic
+  // send is using. `pause-bot` (booking-window pause) and `suppress-automation`
+  // (legacy GHL workflow throttle) were REMOVED 2026-05-14 — `agentic-active`
+  // is now the canonical "agentic in charge" signal, enforced upstream at
+  // the rule level. See header comment.
   'stop-bot',
-  'pause-bot',
 ];
 
 // Set for O(1) intersection check
