@@ -81,6 +81,27 @@
  *   message-content-scorer.js module is still imported by response-
  *   generator.js (inbound reply pipeline) and remains intact — only
  *   the nurture orchestrator's dependency was removed.
+ * v2.1 — 2026-05-14. INTERRUPT VISIBILITY + force_send bypass.
+ *   PROBLEM: Intentional suppressions (recent_reply, DNC, appt_booked,
+ *   layer3_*) were silently dropping rows into agentic_messages with
+ *   no Railway log line and no GroupMe card. Found this debugging why
+ *   Mark Test contact never received Week 2 of S4.5 on 2026-05-14 —
+ *   the row was correctly suppressed at 16:38:02 with reason=recent_reply
+ *   (Mark had replied to W8.0 at 15:10:04, within the 24h window), but
+ *   the only way to see the suppression was to query the DB directly.
+ *
+ *   FIX (visibility): emit a single structured JSON info-level log line
+ *   from the interrupt path so intentional suppressions are visible in
+ *   Railway logs without firing GroupMe noise. Carries WHO (contact id,
+ *   lead name), WHY (status + reason), and reason-specific metadata
+ *   (e.g. last_reply_at + ageHrs for recent_reply).
+ *
+ *   FIX (force_send): accept a `force_send: true` field in the request
+ *   payload that bypasses checkInterrupts. Intended for admin/test use
+ *   only (e.g. force-firing a specific Week N on a test contact to
+ *   validate the rest of the pipeline end-to-end). Production GHL
+ *   workflows never set this. When set, emits a warn-level log so the
+ *   override is auditable.
  */
 
 import crypto from 'crypto';
@@ -124,12 +145,41 @@ export async function runNurtureGeneration(request) {
   // if a later step throws.
   await createPendingRow(generation_id, request, context);
 
-  // Step 2 — pre-gen interrupts (deterministic)
-  const interrupt = checkInterrupts(context);
-  if (interrupt) {
-    await updateStatus(generation_id, interrupt.status, interrupt.reason);
-    await safeClearDrafts(request.contact_id, `interrupt:${interrupt.reason}`);
-    return finishResponse(generation_id, false, interrupt.reason, startedAt);
+  // Step 2 — pre-gen interrupts (deterministic).
+  // v2.1: Skippable via request.force_send for admin/test use only.
+  // When skipped, emit a warn-level audit log. When NOT skipped and
+  // an interrupt fires, emit a single structured info-level log line
+  // (visibility-only — no GroupMe noise for intentional suppressions).
+  if (request.force_send === true) {
+    console.log(JSON.stringify({
+      level: 'warn',
+      type: 'interrupts_bypassed',
+      workflow_code: request.workflow_code,
+      sequence_position: request.sequence_position,
+      ghl_contact_id: request.contact_id,
+      lead_name: context.lead?.name,
+      generation_id,
+    }));
+  } else {
+    const interrupt = checkInterrupts(context);
+    if (interrupt) {
+      console.log(JSON.stringify({
+        level: 'info',
+        type: 'intentional_suppression',
+        status: interrupt.status,
+        reason: interrupt.reason,
+        workflow_code: request.workflow_code,
+        sequence_position: request.sequence_position,
+        ghl_contact_id: request.contact_id,
+        lead_name: context.lead?.name,
+        generation_id,
+        ...(interrupt.last_reply_at ? { last_reply_at: interrupt.last_reply_at } : {}),
+        ...(interrupt.ageHrs !== undefined ? { ageHrs: interrupt.ageHrs } : {}),
+      }));
+      await updateStatus(generation_id, interrupt.status, interrupt.reason);
+      await safeClearDrafts(request.contact_id, `interrupt:${interrupt.reason}`);
+      return finishResponse(generation_id, false, interrupt.reason, startedAt);
+    }
   }
 
   // Step 3 — select prompt (fall back to GENERIC if no specific match)
@@ -310,6 +360,14 @@ function extractRequestFields(body) {
 
 /**
  * Pre-generation interrupts — checked BEFORE any LLM call.
+ *
+ * Return shape:
+ *   { status, reason }                              — generic interrupts
+ *   { status, reason, last_reply_at, ageHrs }       — recent_reply (carries
+ *                                                     reason-specific metadata
+ *                                                     so the caller's structured
+ *                                                     log line shows WHY)
+ *   null                                            — no interrupt, proceed
  */
 function checkInterrupts(context) {
   const tags = context?.lead?.current_tags || [];
@@ -334,7 +392,12 @@ function checkInterrupts(context) {
   if (lastReply) {
     const ageHrs = (Date.now() - new Date(lastReply).getTime()) / 3_600_000;
     if (ageHrs < 24) {
-      return { status: 'suppressed_overlap', reason: 'recent_reply' };
+      return {
+        status: 'suppressed_overlap',
+        reason: 'recent_reply',
+        last_reply_at: lastReply,
+        ageHrs,
+      };
     }
   }
   return null;
@@ -631,6 +694,8 @@ function buildErrorCard(request, context, generation_id, kind, detail) {
     ``,
     `Detail: ${detail || '(no detail)'}`,
     ``,
+    `Detail: ${detail || '(no detail)'}`,
+    ``,
     `▶ Contact: ${ghlContactUrl(request.contact_id)}`,
     `▶ Audit row: ${generation_id}`,
   ];
@@ -709,6 +774,11 @@ export function registerNurtureRoutes(app) {
       const seqResolved = await resolveSequencePosition(body.contact_id, body.sequence_position);
       console.log(`[NurtureOrch] seq_pos resolved=${seqResolved.position} source=${seqResolved.source} payload="${body.sequence_position ?? ''}"`);
 
+      // v2.1: force_send is admin/test-only. Coerce true/false/"true"/"false"
+      // to a strict boolean so a payload typo can't accidentally bypass
+      // interrupts in production.
+      const forceSend = body.force_send === true || body.force_send === 'true';
+
       const result = await runNurtureGeneration({
         contact_id: body.contact_id,
         workflow_code: body.workflow_code,
@@ -717,6 +787,7 @@ export function registerNurtureRoutes(app) {
         channel: body.channel,
         enrollment_reason: body.enrollment_reason || null,
         trigger_event_id: body.trigger_event_id || null,
+        force_send: forceSend,
       });
 
       res.json(result);
@@ -726,5 +797,5 @@ export function registerNurtureRoutes(app) {
     }
   });
 
-  console.log('[REST API] Registered: POST /api/agentic/nurture/generate (nurture orchestrator v2.0)');
+  console.log('[REST API] Registered: POST /api/agentic/nurture/generate (nurture orchestrator v2.1)');
 }
