@@ -694,8 +694,6 @@ function buildErrorCard(request, context, generation_id, kind, detail) {
     ``,
     `Detail: ${detail || '(no detail)'}`,
     ``,
-    `Detail: ${detail || '(no detail)'}`,
-    ``,
     `▶ Contact: ${ghlContactUrl(request.contact_id)}`,
     `▶ Audit row: ${generation_id}`,
   ];
