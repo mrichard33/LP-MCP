@@ -117,6 +117,8 @@ import { executeCheckEligibility } from './handlers/eligibility.js';
 import { executeComputeRiskScore } from './handlers/risk-score.js';
 import { executeCheckThrottle } from './handlers/throttle.js';
 import { executeClassifyBucket } from './handlers/classify-bucket.js';
+// S5.2 v2 (Spec v1.2) — objection-state substrate writer
+import { executeTransitionObjectionState } from './handlers/objection-state.js';
 
 // MVI v2.5 — fetch the source event for a given action. The shared
 // getEventContext returns ONLY the spread payload (no event_id /
@@ -309,6 +311,7 @@ const ACTION_HANDLERS = {
   compute_risk_score: executeComputeRiskScore,   // 2026-05-13 — Phase 1 #54 composite scoring
   check_throttle: executeCheckThrottle,          // 2026-05-13 — Phase 1 #55 enrollment dedup
   classify_bucket: executeClassifyBucket,        // 2026-05-13 — Phase 1 #56 bucket→workflow resolver
+  transition_objection_state: executeTransitionObjectionState, // 2026-05-14 — S5.2 v2 objection-state substrate writer (Spec v1.2)
 };
 
 // Handlers that need the triggering event's payload injected as context.
