@@ -225,6 +225,58 @@ const MODEL = 'claude-sonnet-4-20250514';
 const CONVERSATION_MESSAGE_SLICE_CHARS = 1000;
 
 // ═══════════════════════════════════════════════════════════════════
+// v1.10 (2026-05-14) — STATE TRANSITION PROPOSALS (S5.2 v2, Spec v1.2)
+// ═══════════════════════════════════════════════════════════════════
+// Layer 3 stops emitting only recommended_action strings. It now also
+// proposes a buyer-state transition by mapping the legacy action to a
+// state code from the new objection_state_policies taxonomy. The
+// proposal is emitted as a `message_analyzer_proposal` event;
+// STATE_CLASSIFICATION agent_rules consume it and queue the
+// transition_objection_state action.
+//
+// Backward compatibility: ai.analysis_completed continues to carry
+// recommended_action exactly as before. The proposal envelope is
+// ADDITIVE for one release cycle, then recommended_action can be
+// retired in Phase 5.
+const CLASSIFIER_VERSION = 'message-analyzer-v1.10';
+
+const ACTION_TO_STATE_MAP = {
+  // Action string                     → state code (or null = no proposal)
+  objection_price:           'APPOINTMENT_FRICTION.price_anxiety_pre_demo',
+  objection_price_post_demo: 'POST_PROPOSAL_RESISTANCE.financing_pressure',
+  objection_spouse:          'APPOINTMENT_FRICTION.spouse_uncertainty',
+  objection_trust:           'APPOINTMENT_FRICTION.trust_hesitation',
+  objection_overwhelmed:     'APPOINTMENT_FRICTION.overwhelmed',
+  busy_callback:             'APPOINTMENT_FRICTION.timing_delay',
+  disengagement:             'DISENGAGEMENT.passive_cooling',
+  soft_refusal:              'DISENGAGEMENT.soft_opt_out',
+  hard_refusal:              'DISENGAGEMENT.hard_loss',
+  // wrong_person: handled outside the state model (data hygiene)
+};
+
+// Map the validated recommended_action to a state code where possible.
+// Falls back to objection_type-based inference for the legacy
+// "deploy_objection_handler" path. Returns null when no proposal applies.
+function deriveProposedState(analysis) {
+  if (!analysis) return null;
+  // 1. Direct hit on the legacy action string (sales-system shorthand).
+  const direct = ACTION_TO_STATE_MAP[analysis.recommended_action];
+  if (direct) return direct;
+  // 2. Engagement-quality terminal states.
+  if (analysis.engagement_quality === 'dnc') return 'DISENGAGEMENT.hard_loss';
+  if (analysis.engagement_quality === 'disengagement') return 'DISENGAGEMENT.passive_cooling';
+  // 3. Objection-type inference for the "deploy_objection_handler" action.
+  if (analysis.recommended_action === 'deploy_objection_handler' && analysis.objection_type) {
+    const t = String(analysis.objection_type).toLowerCase();
+    if (t === 'price')   return 'APPOINTMENT_FRICTION.price_anxiety_pre_demo';
+    if (t === 'spouse')  return 'APPOINTMENT_FRICTION.spouse_uncertainty';
+    if (t === 'trust')   return 'APPOINTMENT_FRICTION.trust_hesitation';
+    if (t === 'timing')  return 'APPOINTMENT_FRICTION.timing_delay';
+  }
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // RATE LIMITING
 // ═══════════════════════════════════════════════════════════════════
 
@@ -725,6 +777,44 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
     // v1.8: markAnalyzed moved to entry-of-function (immediately after
     // cache check) for atomic dedup. Removed from here to avoid a
     // redundant Map.set on the same key.
+
+    // v1.10: S5.2 v2 state transition proposal. Emitted as an additive
+    // event so STATE_CLASSIFICATION agent_rules can queue a
+    // transition_objection_state action. recommended_action remains on
+    // ai.analysis_completed unchanged for one release cycle.
+    const proposed_state = deriveProposedState(analysis);
+    if (proposed_state) {
+      const proposalConfidence = analysis.objection_confidence ?? analysis.buyer_stage_confidence ?? null;
+      try {
+        await emitEvent({
+          event_type: 'message_analyzer_proposal',
+          event_subtype: proposed_state,
+          source: 'message_analyzer',
+          entity_type: 'contact',
+          entity_id: ghlContactId,
+          ghl_contact_id: ghlContactId,
+          payload: {
+            type: 'state_transition_proposal',
+            from_state: null, // resolved at handler time from contact_objection_states
+            to_state: proposed_state,
+            confidence: proposalConfidence,
+            signal: analysis.recommended_action,
+            evidence: messageText.slice(0, 200),
+            classifier_version: CLASSIFIER_VERSION,
+            channel: channel || null,
+            recommended_action: analysis.recommended_action,
+            objection_type: analysis.objection_type,
+            engagement_quality: analysis.engagement_quality,
+            buyer_stage: analysis.buyer_stage,
+          },
+          priority: analysis.engagement_quality === 'dnc' ? 'critical'
+                  : analysis.objection_type ? 'high' : 'normal',
+          idempotency_key: `ma_proposal_${ghlContactId}_${Date.now()}`,
+        });
+      } catch (err) {
+        console.warn(`[MessageAnalyzer] proposal emit failed for ${ghlContactId}: ${err.message}`);
+      }
+    }
 
     const elapsed = Date.now() - startTime;
     const lpNote = context.lp?.matched ? '(LP✓)' : context.lp?._fallback_used ? '(LP-fallback✓)' : '(no LP)';
