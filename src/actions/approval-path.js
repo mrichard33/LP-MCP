@@ -540,7 +540,7 @@ async function applyAutoReplyInline({
     companionLine +
     tagsLine +
     `→ Auto-fired (${flippable.length} action${flippable.length === 1 ? '' : 's'}) at ${updatedAt}. Batch ${sendAction.batch_id || `s_${sendAction.id}`}.`
-  ).catch(err => {
+  , { contactId: sendAction.target_id, contactName }).catch(err => {
     console.warn(`[ApprovalPath] GroupMe (auto-reply notice) failed: ${err.message}`);
   });
 
@@ -622,7 +622,7 @@ async function applyHandoffInline({
     `Method: ${generated.classification_method || 'unknown'} (${(generated.classifier_confidence ?? 0).toFixed(2)})\n` +
     `Inbound: "${preview}"\n` +
     `→ GHL workflow on tag now owns the response. No approval card sent (nothing for human to review — handoff is mechanical).`
-  ).catch(err => {
+  , { contactId, contactName }).catch(err => {
     console.warn(`[ApprovalPath] GroupMe (inline short-circuit) failed: ${err.message}`);
   });
 
