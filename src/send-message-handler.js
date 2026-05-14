@@ -1273,7 +1273,7 @@ export async function executeSendMessage(action, context) {
     const preview = message.length > 80 ? message.slice(0, 80) + '...' : message;
     full += `\nMessage: "${preview}"`;
 
-    await sendGroupMeMessage(full).catch(err => {
+    await sendGroupMeMessage(full, { contactId, contactName: name }).catch(err => {
       console.warn(`[SendMessage] GroupMe notification failed: ${err.message}`);
     });
   } catch (err) {
