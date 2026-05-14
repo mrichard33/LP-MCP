@@ -403,7 +403,7 @@ async function getInboundEmailMessageId(contactId) {
       m.direction === 'inbound' &&
       (m.messageType === 'TYPE_EMAIL' || m.type === 3)
     );
-    return recentInboundEmail?.id || null;
+    return recentInboundEmail?.meta?.email?.messageIds?.[0] || null;
   } catch (err) {
     console.warn(`[SendMessage] getInboundEmailMessageId failed for ${contactId}: ${err.message}`);
     return null;
