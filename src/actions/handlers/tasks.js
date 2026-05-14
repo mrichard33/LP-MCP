@@ -5,6 +5,16 @@
  * notification combo. The note preserves the task for historical record
  * on the contact; the GroupMe ping surfaces it to the team.
  *
+ * v2.1 (2026-05-14) — OPT IN TO v1.7 GROUPME DEBOUNCE.
+ *   Pass { contactId, contactName } to sendGroupMeMessage so multiple
+ *   tasks (or task + send_notification + send_message rich notif) for
+ *   the same contact within the debounce window collapse into ONE
+ *   consolidated GroupMe card. See groupme.js v1.7 header for the
+ *   queue mechanics. No other behavior change.
+ *
+ *   Was: 1 inbound → 2 create_tasks → 2 separate GroupMe cards.
+ *   Now: 1 inbound → 2 create_tasks → 1 consolidated card (5s later).
+ *
  * v2.0 (2026-05-01) — RICH GROUPME NOTIFICATIONS.
  *
  * v1.0 (the version this replaces) shipped a 2-line GroupMe message:
@@ -95,7 +105,11 @@ export async function executeCreateTask(action, context) {
     full += `\n👉 Assigned: ${assignedTo}`;
   }
 
-  await sendGroupMeMessage(full).catch(err => {
+  // v2.1: opt in to groupme.js v1.7 debounce — passing contactId routes
+  // through the in-memory consolidation buffer keyed by contact. Tasks
+  // are the most common multi-fire case (one inbound → multiple agent
+  // rules → multiple tasks for the same contact within ~600ms).
+  await sendGroupMeMessage(full, { contactId, contactName: name }).catch(err => {
     console.warn(`[ActionExecutor] create_task: GroupMe send failed for ${contactId}: ${err.message}`);
   });
 
