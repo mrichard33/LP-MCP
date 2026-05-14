@@ -13,6 +13,41 @@
  *       "No 1234"           → reject
  *       "Edit 1234 <desc>"  → AI rewrites with the description as guidance
  *
+ * v1.7 — DEBOUNCED CONSOLIDATION (2026-05-14).
+ *   PROBLEM: When the action executor fires multiple actions for the same
+ *   contact within seconds (e.g. one inbound message triggering
+ *   send_message + create_task("HOT WINDOW") + create_task("Objection") +
+ *   behavioral hyperactive), each handler independently called
+ *   sendGroupMeMessage(). Mark's GroupMe inbox got 3-5 separate cards for
+ *   one contact in <2 seconds, fragmenting visibility.
+ *
+ *   FIX: sendGroupMeMessage now accepts opts = { contactId, contactName,
+ *   flushNow }. When contactId is provided AND flushNow is falsy, the
+ *   message is queued in an in-memory buffer keyed by contactId for
+ *   GROUPME_DEBOUNCE_MS (default 5000ms). All messages for the same
+ *   contact within that window emit as ONE consolidated card with the
+ *   count, contact display name, and a horizontal-rule separator between
+ *   entries.
+ *
+ *   Callers WITHOUT contactId (system events, sync alerts) or WITH
+ *   flushNow:true (approval cards, error cards, immediate operator
+ *   notifications) fire immediately as before. The 5s window starts on
+ *   the FIRST queued message and is NOT reset by subsequent additions —
+ *   the buffer flushes at most 5s after the first event.
+ *
+ *   Backward-compat: sendGroupMeMessage(text) without opts behaves
+ *   exactly as before (immediate send). No callers break by omission.
+ *
+ *   Buffer cap: MAX_CONSOLIDATED_LINES (20) per contact; once reached,
+ *   the buffer flushes immediately and a new one opens for the same
+ *   contact. Protects against runaway behavioral firing.
+ *
+ *   Process restart: buffer is in-memory only. On Railway redeploy or
+ *   crash, up to 5s of routine notifications could be lost. Approval
+ *   cards (sendApprovalRequest) are NOT affected — they use the durable
+ *   groupme_approval_requests table for dedup and don't pass through the
+ *   debounce queue.
+ *
  * v1.6.1 — TRIGGER RECOVERY BUGFIX (2026-04-29).
  *   Fixes two bugs in v1.6's resolveTriggerMessage that broke the Edit X
  *   command in nearly every real-world case:
@@ -69,6 +104,7 @@
  *   POST /webhook/groupme — Callback URL for GroupMe bot
  *   POST /groupme/send    — Manual send (for testing)
  *   GET  /groupme/pending — View pending approval requests
+ *   GET  /groupme/queue-state — View in-flight debounce buffers (v1.7)
  */
 
 import supabase from './supabase.js';
@@ -79,14 +115,79 @@ const GROUPME_GROUP_ID = process.env.GROUPME_GROUP_ID || '';
 const SELF_BASE_URL = `http://localhost:${process.env.PORT || 8080}`;
 
 // ═══════════════════════════════════════════════════════════════════
+// v1.7: DEBOUNCED CONSOLIDATION CONFIG + STATE
+// ═══════════════════════════════════════════════════════════════════
+//
+// In-memory buffer keyed by contactId. Each entry:
+//   {
+//     contactId:        string  — the contact this buffer is for
+//     contactName:      string|null — display name if any caller provided one
+//     lines:            string[]    — queued message texts in arrival order
+//     firstQueuedAt:    number      — Date.now() of the first line (timer anchor)
+//     timer:            Timeout     — handle to the flush setTimeout
+//   }
+//
+// Single-process Node = single shared Map. No cross-process coordination
+// needed; the LP MCP runs as one Railway service instance. If we ever
+// scale horizontally, this would need a Redis or DB-backed queue.
+
+const NOTIFICATION_DEBOUNCE_MS = parseInt(
+  process.env.GROUPME_DEBOUNCE_MS || '5000',
+  10
+);
+const MAX_CONSOLIDATED_LINES = 20;
+const MAX_CARD_CHARS = 950; // leave headroom under GroupMe's 1000-char hard limit
+
+const pendingNotifications = new Map();
+
+console.log(`[GroupMe] v1.7 debounce config: window=${NOTIFICATION_DEBOUNCE_MS}ms max_lines=${MAX_CONSOLIDATED_LINES} max_chars=${MAX_CARD_CHARS}`);
+
+// ═══════════════════════════════════════════════════════════════════
 // OUTBOUND: Send messages to GroupMe
 // ═══════════════════════════════════════════════════════════════════
 
-export async function sendGroupMeMessage(text) {
+/**
+ * v1.7 — Extended signature. Backward-compatible: legacy callers passing
+ * just (text) continue to fire immediately.
+ *
+ * @param {string} text — the message body
+ * @param {object} [opts]
+ * @param {string} [opts.contactId]   — GHL contact ID. When present, the
+ *   message is queued for consolidation with other queued messages for
+ *   the same contact within NOTIFICATION_DEBOUNCE_MS.
+ * @param {string} [opts.contactName] — Display name for the consolidated
+ *   card header. Optional; first non-null name wins for the buffer.
+ * @param {boolean} [opts.flushNow]   — Force immediate send even if
+ *   contactId is provided. Use for urgent operator-facing cards.
+ * @returns {Promise<{sent: boolean, reason?: string, queue_size?: number}>}
+ *   sent=true: fired immediately. sent=false with reason='queued': buffered.
+ *   sent=false with other reason: send failed.
+ */
+export async function sendGroupMeMessage(text, opts = {}) {
   if (!GROUPME_BOT_ID) {
     console.log('[GroupMe] No BOT_ID — message logged only:', text.slice(0, 100));
     return { sent: false, reason: 'no_bot_id' };
   }
+
+  const { contactId, contactName, flushNow } = opts || {};
+
+  // Immediate path: no contactId (system event) OR explicit flushNow
+  // (approval/error/operator card). This is the v1.6-and-earlier behavior.
+  if (!contactId || flushNow) {
+    return await _sendRawGroupMeMessage(text);
+  }
+
+  // Debounced path: queue for consolidation.
+  return _queueForConsolidation(contactId, contactName || null, text);
+}
+
+/**
+ * Internal: raw POST to GroupMe with no queueing logic. Called by the
+ * immediate-send path of sendGroupMeMessage AND by the debounce flusher
+ * when a buffer's timer fires. Approval-card senders also call this
+ * indirectly via sendGroupMeMessage(text) (no opts → immediate path).
+ */
+async function _sendRawGroupMeMessage(text) {
   try {
     const res = await fetch('https://api.groupme.com/v3/bots/post', {
       method: 'POST',
@@ -104,6 +205,129 @@ export async function sendGroupMeMessage(text) {
     console.error('[GroupMe] Send failed:', err.message);
     return { sent: false, reason: err.message };
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// v1.7: DEBOUNCE QUEUE INTERNALS
+// ═══════════════════════════════════════════════════════════════════
+
+function _queueForConsolidation(contactId, contactName, text) {
+  const existing = pendingNotifications.get(contactId);
+
+  if (existing) {
+    // Buffer cap check — flush immediately if full, then open a new one
+    // with this line so the current call's content isn't lost.
+    if (existing.lines.length >= MAX_CONSOLIDATED_LINES) {
+      console.log(`[GroupMe] queue cap hit for contact=${contactId} (${MAX_CONSOLIDATED_LINES} lines), flushing early`);
+      clearTimeout(existing.timer);
+      pendingNotifications.delete(contactId);
+      // Don't await — fire-and-forget so the new buffer opens promptly
+      _flushBuffer(existing).catch(err =>
+        console.warn(`[GroupMe] early-cap flush failed for ${contactId}: ${err.message}`)
+      );
+      // fall through to open a new buffer below
+    } else {
+      // Normal append: keep the existing buffer + timer (5s window is from
+      // the FIRST queued message, not reset by subsequent adds).
+      existing.lines.push(text);
+      // First non-null contactName wins
+      if (!existing.contactName && contactName) {
+        existing.contactName = contactName;
+      }
+      console.log(`[GroupMe] queued contact=${contactId} queue_size=${existing.lines.length}`);
+      return { sent: false, reason: 'queued', queue_size: existing.lines.length };
+    }
+  }
+
+  // First call for this contact (or post-cap reset above): open buffer +
+  // schedule flush.
+  const buf = {
+    contactId,
+    contactName: contactName || null,
+    lines: [text],
+    firstQueuedAt: Date.now(),
+    timer: null,
+  };
+  pendingNotifications.set(contactId, buf);
+  buf.timer = setTimeout(() => {
+    _flushContact(contactId).catch(err =>
+      console.warn(`[GroupMe] flush timer failed for ${contactId}: ${err.message}`)
+    );
+  }, NOTIFICATION_DEBOUNCE_MS);
+  console.log(`[GroupMe] queued contact=${contactId} queue_size=1 (first-in-window, flush in ${NOTIFICATION_DEBOUNCE_MS}ms)`);
+  return { sent: false, reason: 'queued', queue_size: 1 };
+}
+
+async function _flushContact(contactId) {
+  const buf = pendingNotifications.get(contactId);
+  if (!buf) return; // already flushed by a cap-hit path
+  pendingNotifications.delete(contactId);
+  await _flushBuffer(buf);
+}
+
+async function _flushBuffer(buf) {
+  const elapsed = Date.now() - buf.firstQueuedAt;
+
+  if (buf.lines.length === 1) {
+    // Single message — send as-is, no consolidation header. Caller still
+    // gets the 5s delay (cost of opt-in), but the message format is
+    // identical to what they passed in.
+    console.log(`[GroupMe] flushed contact=${buf.contactId} lines=1 elapsed_ms=${elapsed} (single, no header)`);
+    return await _sendRawGroupMeMessage(buf.lines[0]);
+  }
+
+  const consolidated = _buildConsolidatedCard(buf);
+  console.log(`[GroupMe] flushed contact=${buf.contactId} lines=${buf.lines.length} elapsed_ms=${elapsed} consolidated_chars=${consolidated.length}`);
+  return await _sendRawGroupMeMessage(consolidated);
+}
+
+function _buildConsolidatedCard(buf) {
+  const displayName = buf.contactName || buf.contactId;
+  const windowSec = Math.round((Date.now() - buf.firstQueuedAt) / 100) / 10;
+  const header = `🔔 ${buf.lines.length} alerts · ${displayName} · ${windowSec}s window`;
+  const separator = '\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
+
+  let card = `${header}\n\n${buf.lines.join(separator)}`;
+
+  // If over the 950-char budget, trim each line proportionally. We try to
+  // preserve as much per-line content as possible while staying under
+  // GroupMe's 1000-char hard limit (so _sendRawGroupMeMessage's slice(0,
+  // 1000) doesn't chop content mid-word).
+  if (card.length > MAX_CARD_CHARS) {
+    const fixedOverhead = header.length + 2 + (separator.length * (buf.lines.length - 1));
+    const budget = MAX_CARD_CHARS - fixedOverhead;
+    const perLineBudget = Math.max(80, Math.floor(budget / buf.lines.length));
+    const trimmed = buf.lines.map(line =>
+      line.length > perLineBudget
+        ? line.slice(0, perLineBudget - 14) + '… [truncated]'
+        : line
+    );
+    card = `${header}\n\n${trimmed.join(separator)}`;
+    // Final hard cap — should never trip with proportional trim above,
+    // but defense in depth.
+    if (card.length > 999) card = card.slice(0, 996) + '…';
+  }
+
+  return card;
+}
+
+/**
+ * Diagnostic helper — current in-flight buffers. Exposed via GET
+ * /groupme/queue-state route for operational visibility.
+ */
+function snapshotPendingQueue() {
+  const out = [];
+  for (const [contactId, buf] of pendingNotifications.entries()) {
+    out.push({
+      contact_id: contactId,
+      contact_name: buf.contactName,
+      lines: buf.lines.length,
+      first_queued_at: new Date(buf.firstQueuedAt).toISOString(),
+      ms_in_buffer: Date.now() - buf.firstQueuedAt,
+      ms_until_flush: Math.max(0, NOTIFICATION_DEBOUNCE_MS - (Date.now() - buf.firstQueuedAt)),
+    });
+  }
+  return out;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -175,6 +399,11 @@ function approvalFooter(shortRef) {
  * v1.5 — Insert-first dedup. Claim the batch by inserting the tracking
  * record BEFORE sending the GroupMe message.
  * v1.6 — Footer line now advertises Edit X option.
+ *
+ * NOTE: Approval cards intentionally DO NOT pass through the v1.7
+ * debounce layer. They use sendGroupMeMessage(msg) without opts so they
+ * fire immediately — approvals are time-sensitive operator decisions and
+ * should never be delayed or consolidated.
  */
 export async function sendApprovalRequest(batchActions, contactName, contactPhone, enrichment = {}) {
   if (!batchActions?.length) return;
@@ -250,6 +479,7 @@ export async function sendApprovalRequest(batchActions, contactName, contactPhon
     throw new Error(`Failed to claim approval batch ${batchId}: ${claimErr.message}`);
   }
 
+  // v1.7: approval cards bypass debounce (no opts → immediate send).
   const sendResult = await sendGroupMeMessage(msg);
   if (!sendResult?.sent) {
     await supabase
@@ -341,6 +571,9 @@ async function recoverTriggerMessage(eventId, contactIdHint) {
  * short_ref as the original card (caller must have already archived the
  * old groupme_approval_requests row, freeing the short_ref). Inserts a
  * new tracking row using the v1.5 INSERT-FIRST pattern.
+ *
+ * v1.7: Like sendApprovalRequest, this bypasses the debounce layer
+ * (sendGroupMeMessage call with no opts → immediate).
  */
 async function sendRegeneratedApprovalCard({
   request, batchActions, newMessage, editInstruction, senderName, shortRef,
@@ -753,5 +986,17 @@ export function registerGroupMeRoutes(app) {
     }
   });
 
-  console.log('[GroupMe] Registered: POST /webhook/groupme | POST /groupme/send | GET /groupme/pending');
+  // v1.7: in-flight debounce buffer snapshot — operational visibility
+  app.get('/groupme/queue-state', (req, res) => {
+    const snapshot = snapshotPendingQueue();
+    res.json({
+      window_ms: NOTIFICATION_DEBOUNCE_MS,
+      max_lines_per_buffer: MAX_CONSOLIDATED_LINES,
+      max_card_chars: MAX_CARD_CHARS,
+      buffer_count: snapshot.length,
+      buffers: snapshot,
+    });
+  });
+
+  console.log('[GroupMe] Registered: POST /webhook/groupme | POST /groupme/send | GET /groupme/pending | GET /groupme/queue-state');
 }

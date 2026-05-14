@@ -7,6 +7,15 @@
  *
  * Extracted from action-executor.js v4.2 refactor.
  *
+ * 2026-05-14 — OPT IN TO v1.7 GROUPME DEBOUNCE.
+ *   Pass { contactId, contactName } to sendGroupMeMessage so multiple
+ *   notifications (or notification + task + send_message rich notif)
+ *   for the same contact within the 5s window collapse into one
+ *   consolidated GroupMe card. See groupme.js v1.7 header for queue
+ *   mechanics. The recovery `ref: a${id}` footer is preserved per-line
+ *   inside the consolidated card, so checkForActionRef-based retry
+ *   verification still works on history lookup.
+ *
  * 2026-05-13 — RECOVERABLE NON-IDEMPOTENT RETRY (executor stall fix).
  *   Pre-fix: send_notification stuck >10min in 'executing' was reaped
  *   and marked failed without retry — at-most-once delivery, ~37/week
@@ -193,7 +202,12 @@ export async function executeSendNotification(action, context) {
   // debugging) and used by checkForActionRef to verify prior sends on retry.
   const full = `${built}\n\nref: a${action.id}`;
 
-  await sendGroupMeMessage(full);
+  // 2026-05-14 — opt in to groupme.js v1.7 debounce. Passing contactId
+  // routes through the consolidation buffer; multiple sends for the same
+  // contact within 5s emit as one card. The `ref: a${id}` footer is
+  // preserved inside the consolidated card so checkForActionRef retry
+  // verification still works against GroupMe history.
+  await sendGroupMeMessage(full, { contactId, contactName: name });
   return {
     action: 'groupme_sent',
     message: full.slice(0, LOG_PREVIEW_CHARS),
