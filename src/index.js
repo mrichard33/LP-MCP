@@ -48,6 +48,8 @@ import {
 import { registerRestApiRoutes } from './rest-api.js';
 // ─── Agentic Message Engine — MV refresh + snapshot ──────────────
 import { registerAgenticMvRefreshRoutes } from './agentic-mv-refresh.js';
+// ─── Agentic Appointment Notifications (cancel/reschedule email+SMS) ────
+import { registerAppointmentNotificationRoutes } from './notifications/appointment-notifications.js';
 // ─── GroupMe Two-Way Integration ─────────────────────────────────
 import { registerGroupMeRoutes } from './groupme.js';
 // ─── LP Appointment Sync (GHL → LP) ────────────────────────────
@@ -386,6 +388,7 @@ app.post('/admin/backfill-ghl-contact-id-from-lognumber', async (req, res) => {
 
 registerDataFreshnessRoutes(app);
 registerAgenticMvRefreshRoutes(app);
+registerAppointmentNotificationRoutes(app);
 registerGhlTriggerLinkRoutes(app);
 registerAgenticLeadStateRoutes(app);
 
