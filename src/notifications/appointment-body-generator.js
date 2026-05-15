@@ -39,189 +39,379 @@ const TEMPERATURE = parseFloat(process.env.APPT_NOTIFICATION_TEMPERATURE || '0.4
 const EMAIL_CHAR_CAP = parseInt(process.env.APPT_NOTIFICATION_EMAIL_CAP || '1500', 10);
 const SMS_CHAR_CAP = parseInt(process.env.APPT_NOTIFICATION_SMS_CAP || '300', 10);
 
-const SYSTEM_PROMPT = `You generate TWO bodies for one internal sales-ops alert when an appointment changes status. Both go to the Reece Windows & Doors dispatch distribution list (Dispatch, Edwin, Trudy, Jazmine) via GHL's native internal_notification steps — an EMAIL and an SMS. You write both at once.
+const SYSTEM_PROMPT = `You write internal dispatch alerts for the Reece Windows & Doors call-center and dispatch team (Dispatch / Edwin / Trudy / Jazmine) when an appointment is cancelled or rescheduled. Your job is to make the rep's next phone call efficient and informed. You do not promote, market, route through automation, or describe internal systems.
 
 OUTPUT
 Return ONLY valid JSON with exactly two string keys:
   { "email_body": "...", "sms_body": "..." }
-No preamble, no markdown fences, no commentary. First character is {, last character is }.
+No preamble, no markdown fences, no commentary. First character {, last character }.
 
-VOICE
-Factual operations alert. Past-tense neutral. Reps and dispatch read these to act on, not to feel.
-- No marketing language, no apologies, no exclamation marks.
-- No markdown — GHL email renders plain text with newlines; SMS strips formatting.
-- First person plural is fine ("we", "the team") in the rep-action line.
+AUDIENCE AND VOICE
+You are writing for dispatchers and phone reps. Operational and direct.
+- Plain English. No marketing language, no internal architecture words, no system jargon. Banned vocabulary: "S5.2", "TOFU", "BOFU", "compression psychology", "Antifragile", "indoctrination", "stage:re-engagement", "stage:reactivation", "routing decision", "agent task", "nurture flow", "dormant buyer", "BOFU re-entry", "earned compression", "agentic system". If you find yourself reaching for any of these, rewrite in plain rep-speak.
+- No exclamation marks, no apologies, no sales pep talk.
+- Past tense for the cancellation/reschedule event; second person ("call them", "confirm with them") for the action.
+- Never fabricate. When a field is empty or "(unknown)", omit its segment cleanly. No empty parens, no "undefined", no dangling punctuation.
+- When the data does not support a confident statement about WHY they cancelled, write "No stated reason on file." rather than inventing one.
 
-UNIVERSAL RULES
-- Use \`appointment_title\` from the input VERBATIM in both bodies. If the input says "Roof Estimate", write "Roof Estimate". NEVER substitute, abbreviate, or hardcode "Window Estimate" or any other calendar name.
-- Header line per status:
-    Cancelled:    ❌ {appointment_title} CANCELLED — {first_name} {last_name}
-    Rescheduled:  🔄 {appointment_title} RESCHEDULED — {first_name} {last_name}
-- Never fabricate. If a field is missing from the input/context, omit it gracefully — no empty parens, no dangling punctuation, no "undefined".
-- Never reference internal architecture (no "workflow", no UUIDs, no "system_events", no "Layer 3").
-- Never speculate about WHY the lead cancelled or rescheduled unless the provided timeline shows direct evidence.
+EMAIL BODY — target 500–950 chars, hard cap 1500
+═══════════════════════════════════════════════
+Use this exact section layout, in this order. Newlines separate blocks; blank line between blocks.
 
-═══════════════════════════════════════════════════════════
-EMAIL BODY — target 600-1200 chars, hard cap 1500
-═══════════════════════════════════════════════════════════
-5 blocks separated by blank lines. No labels except where shown.
+[Header line]
+  Cancelled:    ❌ APPOINTMENT CANCELLED — {first_name} {last_name}
+  Rescheduled:  🔄 APPOINTMENT RESCHEDULED — {first_name} {last_name}
 
-1) Header line (per status, see UNIVERSAL RULES)
+[Contact block — 2 lines]
+  📞 {phone}   ✉️ {email}
+  📍 {city}, {postal}
+  Drop any segment whose value is empty. If phone is empty, drop the entire phone segment including the icon. Same for email, city, postal. If the city/postal line becomes empty, drop the whole line.
 
-2) Contact essentials — three lines, drop any line whose value is missing:
-   Phone: {phone}
-   Email: {email}
-   City:  {city}
+[ID block — 1 line]
+  🆔 Prospect {prospect_id}   Contact {contact_id}
+  When prospect_id is "(unknown)" or empty, write "🆔 Contact {contact_id}" only.
 
-3) Appointment timing:
-   Cancelled:
-     Was: {start_date} at {start_time}
-   Rescheduled:
-     Was: {previous_start_date} at {previous_start_time}
-     Now: {start_date} at {start_time}
-
-4) Source line + close-rate intel (one line each):
-   Source: {lp_source} → {lp_subsource}
-   Source intel: {N} closed of {M} ({pct}% close rate, last 90d)
-   (If lp_source or lp_subsource missing, write "Source: not on file" and "Source intel: not available".)
-
-5) Recent activity — 1-2 short bullets from the provided timeline. Each bullet ≤ 100 chars.
-   • Most recent meaningful event (call disposition, last note, demo, etc.)
-   • Optional second bullet only if a second event is genuinely relevant.
-   (If no relevant prior activity, write "• No prior call or note history.")
-
-6) Lifecycle / trust state, when provided:
-   Lifecycle: {lifecycle_stage} · Trust: {trust_state}
-   (Omit the entire line if neither value is provided.)
-
-7) Closer — two lines:
-   Rep: {assigned_user, or "unassigned"}
-   Next: {one concise dispatch directive — e.g. "rebook within 48h", "call to confirm new slot", "review cancel reason"}
-
-═══════════════════════════════════════════════════════════
-SMS BODY — target ≤220 chars, hard cap 300
-═══════════════════════════════════════════════════════════
-One or at most two lines. No headers, no blank lines. Drop fields gracefully when missing.
-
-Template shapes (adapt the wording, do not copy literally if a field is missing):
-
+[Timing block]
   Cancelled:
-    ❌ APPT CANCELLED: {first} {last} ({phone}) — {appt_title} {start_date} {start_time}. Src: {lp_source}/{lp_subsource}. Stage: {lifecycle_stage}. Reach out to reschedule.
-
+    📅 Was: {formatted_was} ({appointment_title})
   Rescheduled:
-    🔄 APPT RESCHEDULED: {first} {last} ({phone}) — {appt_title} moved {previous_start_date} {previous_start_time} → {start_date} {start_time}. Src: {lp_source}/{lp_subsource}.
+    📅 Was: {formatted_was}
+    📅 Now: {formatted_now}
+       ({appointment_title})
+
+[Source + rep block — 2 lines]
+  🧭 Source: {effective_source} → {effective_subsource}
+  👤 Rep on file: {assigned_user OR "Unassigned"}
+  When effective_subsource is empty, write "🧭 Source: {effective_source}".
+  When both source values are empty, omit the source line entirely.
+
+[Blank line, then:]
+WHY CANCELLED:    (cancelled status)
+WHY MOVED:        (rescheduled status)
+Then 1–3 sentences in plain English. Pull the strongest signal from the labeled "CANCELLATION REASON CANDIDATES" block in the user prompt — prefer in this order: (1) chat_transcript_tail if it contains a direct reason quote, (2) ai_short_summary, (3) most_recent_note, (4) most_recent_call_outcome, (5) concern/objection tags translated into plain English (e.g. "concern-expressed:timing" → "timing was a known concern"). Mention prior_cancellations or prior_reschedules counts when ≥ 2 — call them out as a pattern. If nothing supports a reason: "No stated reason on file."
+
+[Blank line, then:]
+LEAD CONTEXT:
+2–4 plain-English bullets covering:
+  - whether they've ever had an in-home estimate (use demo_completed)
+  - how active they've been (use timeline density / call_count — "Active over the past N days" or "First contact this week")
+  - source attribution in plain language ("came in through online estimate calculator", "from outbound canvass", etc.)
+  - relevant pain or intent signals translated to plain English (skip if irrelevant or unintelligible)
+Omit any bullet whose underlying data is absent. Never use raw tag names in the bullets.
+
+[Blank line, then:]
+WHAT TO DO:
+One short paragraph (2–3 sentences) with concrete, actionable direction. Tailor to the situation using these heuristics (pick ONE — do not list multiple options):
+
+  Cancellation patterns:
+    - Stated budget concern (transcript/notes mention money/can't afford):
+        "Call within 24 hours. If they confirm budget is the blocker, offer to add them to a 90-day follow-up list and ask permission to send financing-option information. Do not push for a same-day rebook."
+    - Stated timing concern (timing tags or notes):
+        "Soft follow-up call within 5–7 days. Ask whether anything on their end has changed before offering a new slot."
+    - Multiple cancellations (prior_cancellations >= 2):
+        "Pattern of cancellations on file. Make one attempt to understand what's getting in the way. If unsuccessful, hand off to long-term follow-up — do not aggressively rebook."
+    - Demo already completed (demo_completed = true):
+        "High-priority callback. They've already had an estimate — find out what changed since the visit and try to rebook within the week."
+    - No reason on file, no demo, first cancellation:
+        "Call within 24 hours to find out why they cancelled and offer to rebook."
+    - No-show pattern from tags:
+        "Pattern of no-shows. Only confirm a new slot if they reach out first."
+
+  Reschedule patterns:
+    - First reschedule, no concern signals:
+        "Confirm the new slot with a call 24 hours before. No further action needed unless they reach out."
+    - Multiple reschedules (prior_reschedules >= 2):
+        "Two or more reschedules on file. Confirm the new slot AND verify all decision-makers will be present — watch this for cancellation risk."
+    - Reschedule after demo completed:
+        "Customer is engaged — already had an estimate. Confirm the new slot and ask if they have any new questions before the visit."
+    - Default:
+        "Confirm new slot 24 hours before the appointment."
+
+Pick the single best-matching heuristic. Adapt the wording to the specific situation if the data strongly suggests a sharper instruction, but stay within the same operational register.
+
+═══════════════════════════════════════════════════════════
+SMS BODY — target ≤270 chars, hard cap 300
+═══════════════════════════════════════════════════════════
+Four short lines max. Drop fields gracefully when missing.
+
+Cancelled template:
+  ❌ APPT CANCELLED — {first} {last} ({phone})
+  Prospect {prospect_id} | {appt_title} {formatted_was}
+  Reason: {≤80-char plain-English summary of why}
+  Action: {≤90-char compressed version of the WHAT TO DO heuristic}
+
+Rescheduled template:
+  🔄 APPT RESCHEDULED — {first} {last} ({phone})
+  Prospect {prospect_id} | {appt_title}
+  {formatted_was} → {formatted_now}
+  Action: {≤90-char compressed action}
 
 Rules:
-- When phone is missing, drop "(phone)" entirely — no empty parens.
-- When lp_source or lp_subsource is missing, drop the "Src:" segment entirely.
-- When lifecycle_stage is missing, drop "Stage: …".
-- Result MUST be ≤ 300 chars. Tighten the dispatch sentence first; never truncate the contact name.
+- When phone empty, drop "({phone})".
+- When prospect_id is "(unknown)", drop "Prospect {prospect_id} | ".
+- If total exceeds 300, trim the Reason line to a few words (still meaningful: "Budget" / "Timing" / "Pattern of cancellations"), then trim Action if still over.
 
 ═══════════════════════════════════════════════════════════
 JSON OUTPUT FORMAT
 ═══════════════════════════════════════════════════════════
 {
-  "email_body": "❌ Window Estimate CANCELLED — Jane Doe\\n\\nPhone: (555) 111-2222\\nCity: Boca Raton\\n\\nWas: 2026-05-20 at 10:00 AM\\n\\nSource: facebook_ad → windows_florida_jan\\nSource intel: 18 closed of 100 (18% close rate, last 90d)\\n\\n• Last call 2026-05-14: Connected, customer confirmed interest.\\n\\nLifecycle: warm · Trust: building\\n\\nRep: Alex Rep\\nNext: rebook within 48h",
-  "sms_body": "❌ APPT CANCELLED: Jane Doe (555-111-2222) — Window Estimate 2026-05-20 10:00 AM. Src: facebook_ad/windows_florida_jan. Stage: warm. Reach out to reschedule."
+  "email_body": "❌ APPOINTMENT CANCELLED — Mark Richard\\n\\n📞 (954) 508-1512   ✉️ mfollen@icloud.com\\n📍 Delray Beach, 33484\\n🆔 Prospect 427375   Contact y4dvOxtWW12xGrBavCUt\\n\\n📅 Was: 05-16-2026 at 6:00 PM (Window Estimate)\\n🧭 Source: Estimate Calculator → Estimate Calculator\\n👤 Rep on file: Mark Richard\\n\\nWHY CANCELLED:\\nThe customer cited budget concerns ('don't have the money for windows right now') combined with a timing objection already on file. This is their second cancellation in the past week — the prior appointment was rescheduled before being cancelled outright.\\n\\nLEAD CONTEXT:\\n- Never had an in-home estimate completed\\n- Active over the past 4 days (chatbot, two appointments booked then cancelled)\\n- Came in through the online estimate calculator\\n\\nWHAT TO DO:\\nCall within 24 hours to confirm the budget concern. If they're genuinely priced out today, offer to add them to a 90-day follow-up list and ask permission to send financing-option information. Do not push for a same-day rebook.",
+  "sms_body": "❌ APPT CANCELLED — Mark Richard (954) 508-1512\\nProspect 427375 | Window Estimate 05-16-2026 at 6:00 PM\\nReason: Budget + timing (2nd cancellation in a week)\\nAction: Call w/in 24h. Don't push rebook. Offer 90-day FU + financing."
 }
 
 Return ONLY the JSON object.`;
 
+// ───────────────────────────────────────────────────────────────────
+// DATE/TIME FORMATTER
+// ───────────────────────────────────────────────────────────────────
+
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+function parseApptDate(input) {
+  if (input === null || input === undefined) return null;
+  const s = String(input).trim();
+  if (!s) return null;
+  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m) {
+    const y = Number(m[1]);
+    const mo = Number(m[2]);
+    const d = Number(m[3]);
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) return { y, mo, d };
+    return null;
+  }
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) {
+    const mo = Number(m[1]);
+    const d = Number(m[2]);
+    const y = Number(m[3]);
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) return { y, mo, d };
+    return null;
+  }
+  return null;
+}
+
+function parseApptTime(input) {
+  if (input === null || input === undefined) return null;
+  const s = String(input).trim();
+  if (!s) return null;
+  let m = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM|am|pm)$/);
+  if (m) {
+    let h = Number(m[1]);
+    const min = Number(m[2]);
+    const period = m[3].toUpperCase();
+    if (h < 1 || h > 12 || min < 0 || min > 59) return null;
+    if (period === 'PM' && h !== 12) h += 12;
+    if (period === 'AM' && h === 12) h = 0;
+    return { h, min };
+  }
+  m = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+  if (m) {
+    const h = Number(m[1]);
+    const min = Number(m[2]);
+    if (h < 0 || h > 23 || min < 0 || min > 59) return null;
+    return { h, min };
+  }
+  return null;
+}
+
+/**
+ * Format a date+time pair from GHL merge tags into the canonical
+ * "MM-DD-YYYY at h:MM AM/PM" shape. Never throws, never fabricates.
+ */
+export function formatApptDateTime(date, time) {
+  const d = parseApptDate(date);
+  const t = parseApptTime(time);
+  const dateStr = d ? `${pad2(d.mo)}-${pad2(d.d)}-${d.y}` : '';
+  let timeStr = '';
+  if (t) {
+    let h12 = t.h % 12;
+    if (h12 === 0) h12 = 12;
+    const period = t.h < 12 ? 'AM' : 'PM';
+    timeStr = `${h12}:${pad2(t.min)} ${period}`;
+  }
+  if (dateStr && timeStr) return `${dateStr} at ${timeStr}`;
+  if (dateStr) return dateStr;
+  if (timeStr) return timeStr;
+  return '';
+}
+
+// ───────────────────────────────────────────────────────────────────
+// CUSTOM-FIELD LOOKUP HELPERS
+// ───────────────────────────────────────────────────────────────────
+
+function cfValue(group, fieldName) {
+  if (!Array.isArray(group)) return null;
+  const match = group.find(f => f && f.name === fieldName);
+  if (!match) return null;
+  const v = match.value;
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  return s === '' ? null : s;
+}
+
+function tailString(input, max) {
+  if (!input) return '';
+  const s = String(input);
+  if (s.length <= max) return s;
+  return s.slice(s.length - max);
+}
+
 /**
  * Build the user-message context for Claude. Bundles the payload +
- * hybrid context into a structured block — Claude reads better off
- * "labeled facts" than "stuffed paragraphs."
+ * hybrid context into a structured "labeled facts" block geared to
+ * dispatch voice: who, when, why, lead context, what to do.
  */
 function buildUserPrompt({ payload, context }) {
   const lines = [];
 
+  // ─── Header / status ────────────────────────────────────────────
   lines.push(`STATUS: ${payload.status}`);
-  lines.push(`APPOINTMENT_TITLE (use verbatim): ${payload.appointment_title}`);
-  lines.push(`CALENDAR_ID: ${payload.calendar_id}`);
+  lines.push(`APPOINTMENT_TITLE: ${payload.appointment_title || ''}`);
   lines.push('');
 
-  lines.push('CONTACT (from payload):');
-  lines.push(`  first_name: ${payload.contact_first_name || ''}`);
-  lines.push(`  last_name:  ${payload.contact_last_name || ''}`);
-  lines.push(`  phone:      ${payload.contact_phone || ''}`);
-  lines.push(`  email:      ${payload.contact_email || ''}`);
-  lines.push(`  city:       ${payload.city || ''}`);
-  lines.push(`  postal:     ${payload.postal_code || ''}`);
-  lines.push(`  assigned:   ${payload.assigned_user || ''}`);
-  lines.push(`  lifecycle:  ${payload.lifecycle_stage || ''}`);
-  lines.push(`  trust:      ${payload.trust_state || ''}`);
+  // ─── Contact ────────────────────────────────────────────────────
+  const lead = context?.lead_summary?.lead || {};
+  const prospectIdRaw = lead.lp_prospect_id;
+  const prospectId =
+    prospectIdRaw === null || prospectIdRaw === undefined || String(prospectIdRaw).trim() === ''
+      ? '(unknown)'
+      : String(prospectIdRaw).trim();
+
+  lines.push('CONTACT:');
+  lines.push(`  name:        ${payload.contact_first_name || ''} ${payload.contact_last_name || ''}`.trimEnd());
+  lines.push(`  phone:       ${payload.contact_phone || ''}`);
+  lines.push(`  email:       ${payload.contact_email || ''}`);
+  lines.push(`  city:        ${payload.city || ''}`);
+  lines.push(`  postal:      ${payload.postal_code || ''}`);
+  lines.push(`  contact_id:  ${payload.contact_id || ''}`);
+  lines.push(`  prospect_id: ${prospectId}`);
   lines.push('');
 
-  lines.push('APPOINTMENT TIMING:');
-  lines.push(`  start_date:          ${payload.start_date || ''}`);
-  lines.push(`  start_time:          ${payload.start_time || ''}`);
+  // ─── Timing (formatted) ─────────────────────────────────────────
+  const formattedWas =
+    payload.status === 'rescheduled'
+      ? formatApptDateTime(payload.previous_start_date, payload.previous_start_time)
+      : formatApptDateTime(payload.start_date, payload.start_time);
+  lines.push('TIMING (formatted, use verbatim — do not re-format):');
+  lines.push(`  was: ${formattedWas}`);
   if (payload.status === 'rescheduled') {
-    lines.push(`  previous_start_date: ${payload.previous_start_date || ''}`);
-    lines.push(`  previous_start_time: ${payload.previous_start_time || ''}`);
+    const formattedNow = formatApptDateTime(payload.start_date, payload.start_time);
+    lines.push(`  new: ${formattedNow}`);
   }
   lines.push('');
 
+  // ─── Source ─────────────────────────────────────────────────────
+  const effSource = context?.effective_source ? String(context.effective_source).trim() : '';
+  const effSub = context?.effective_subsource ? String(context.effective_subsource).trim() : '';
   lines.push('SOURCE:');
-  lines.push(`  lp_source:    ${payload.lp_source || '(empty)'}`);
-  lines.push(`  lp_subsource: ${payload.lp_subsource || '(empty)'}`);
-  if (context.source_analytics) {
+  lines.push(`  effective_source:    ${effSource || '(empty)'}`);
+  lines.push(`  effective_subsource: ${effSub || '(empty)'}`);
+  if (context?.source_analytics) {
     const a = context.source_analytics;
-    lines.push(
-      `  source_analytics: matched_on=${a.matched_on} total_leads=${a.total_leads} closed_won=${a.closed_won} close_rate_pct=${a.close_rate_pct ?? 'n/a'} total_revenue=${a.total_revenue}`,
-    );
+    const pct = a.close_rate_pct ?? 'n/a';
+    lines.push(`  analytics: ${a.closed_won} closed of ${a.total_leads} (${pct}% close rate, matched_on=${a.matched_on})`);
   } else {
-    lines.push('  source_analytics: NOT AVAILABLE');
+    lines.push('  analytics: (unavailable)');
   }
   lines.push('');
 
-  // Decoded contact summary (live GHL).
-  if (context.decoded_contact) {
-    const p = context.decoded_contact.profile || {};
-    lines.push('LIVE GHL CONTACT:');
-    lines.push(`  ghl_phone:  ${p.phone || ''}`);
-    lines.push(`  ghl_city:   ${p.city || ''}`);
-    lines.push(`  ghl_tags:   ${(p.tags || []).slice(0, 6).join(', ')}`);
-    if (p.assigned_to) lines.push(`  assigned_to_id: ${p.assigned_to}`);
-    lines.push('');
-  }
+  // ─── Rep on file ────────────────────────────────────────────────
+  lines.push(`REP ON FILE: ${payload.assigned_user || '(unassigned)'}`);
+  lines.push('');
 
-  // Lead summary (LP record + recent activity).
-  if (context.lead_summary && context.lead_summary.lead) {
-    const l = context.lead_summary.lead;
-    lines.push('LP LEAD:');
-    lines.push(
-      `  lp_lead_id=${l.lp_lead_id} disposition=${l.disposition_label || l.disposition_code || '(none)'} rep=${l.rep_name || '(none)'} job_value=${l.job_value || '?'} closed_won=${!!l.closed_won}`,
-    );
-    const recent = context.lead_summary.recent || {};
-    if (recent.calls?.length) {
-      const c = recent.calls[0];
-      lines.push(
-        `  most_recent_call: ${c.call_date} outcome="${c.outcome || c.call_type || ''}" rep=${c.rep_name || ''}`,
-      );
-    }
-    if (recent.notes?.length) {
-      const n = recent.notes[0];
-      const body = String(n.note_body || n.body || '').trim().slice(0, 140);
-      lines.push(`  most_recent_note: ${n.created_at_lp} "${body}"`);
-    }
-    lines.push('');
-  }
+  // ─── Lead history signals ───────────────────────────────────────
+  const tags = Array.isArray(context?.decoded_contact?.profile?.tags)
+    ? context.decoded_contact.profile.tags
+    : [];
+  const cfAi = context?.decoded_contact?.custom_fields?.ai;
+  const cfChatbot = context?.decoded_contact?.custom_fields?.chatbot;
+  const timeline = Array.isArray(context?.timeline) ? context.timeline : [];
 
-  // Timeline (top events across LP + system events).
-  if (context.timeline && context.timeline.length) {
-    lines.push('TIMELINE (most recent first, top 6 shown):');
-    for (const ev of context.timeline.slice(0, 6)) {
+  const demoFromTag = tags.some(t => String(t || '').toLowerCase() === 'lp-demo-completed');
+  const demoFromLead = Boolean(lead.demo_completed);
+  const demoCompleted = demoFromTag || demoFromLead;
+
+  const appointmentsBooked = Number.isFinite(Number(lead.appointment_set))
+    ? Number(lead.appointment_set)
+    : timeline.filter(e => /appointment_booked|appointment_set|appointment_created/.test(String(e.type || ''))).length;
+
+  const priorCancellationsTimeline = timeline.filter(e =>
+    /appointment_cancelled/.test(String(e.type || '')),
+  ).length;
+  const priorCancelTag = tags.some(t => String(t || '').toLowerCase().includes('appt-cancelled')) ? 1 : 0;
+  const priorCancellations = Math.max(priorCancellationsTimeline, priorCancelTag);
+
+  const priorReschedules = timeline.filter(e =>
+    /appointment_rescheduled/.test(String(e.type || '')),
+  ).length;
+
+  const intentSignals = tags.filter(t => String(t || '').toLowerCase().startsWith('intent-'));
+  const concernSignals = tags.filter(t => {
+    const s = String(t || '').toLowerCase();
+    return s.startsWith('concern-expressed:') || s.startsWith('objection-');
+  });
+
+  const painPoint = cfValue(cfAi, 'Pain Point');
+
+  lines.push('LEAD HISTORY SIGNALS (use these to write "WHY" and "WHAT TO DO" — do not echo verbatim):');
+  lines.push(`  demo_completed: ${demoCompleted ? 'true' : 'false'}`);
+  lines.push(`  appointments_booked: ${appointmentsBooked}`);
+  lines.push(`  prior_cancellations: ${priorCancellations}`);
+  lines.push(`  prior_reschedules:   ${priorReschedules}`);
+  lines.push(`  call_count:          ${lead.call_count ?? 0}`);
+  lines.push(`  most_recent_disposition: ${lead.disposition_label || '(none)'}`);
+  lines.push(`  intent_signals:  ${intentSignals.join(', ') || '(none)'}`);
+  lines.push(`  concern_signals: ${concernSignals.join(', ') || '(none)'}`);
+  lines.push(`  pain_point:      ${painPoint || ''}`);
+  lines.push('');
+
+  // ─── Cancellation reason candidates ─────────────────────────────
+  const aiShortSummary = cfValue(cfAi, 'AI Short Summary');
+  const lastSentiment = cfValue(cfAi, 'Last Sentiment');
+
+  const recentNotes = context?.lead_summary?.recent?.notes;
+  const mostRecentNote =
+    Array.isArray(recentNotes) && recentNotes.length
+      ? String(recentNotes[0].note_body || recentNotes[0].body || '').trim().slice(0, 400)
+      : '';
+
+  const recentCalls = context?.lead_summary?.recent?.calls;
+  const mostRecentCallOutcome =
+    Array.isArray(recentCalls) && recentCalls.length
+      ? String(recentCalls[0].outcome || recentCalls[0].call_type || '').trim()
+      : '';
+
+  const chatTranscript = cfValue(cfChatbot, 'Chat Transcript');
+  const chatTranscriptTail = chatTranscript ? tailString(chatTranscript, 600) : '';
+
+  lines.push('CANCELLATION REASON CANDIDATES (use to write "WHY" — pick the strongest):');
+  lines.push(`  ai_short_summary: ${aiShortSummary || ''}`);
+  lines.push(`  last_sentiment:   ${lastSentiment || ''}`);
+  lines.push(`  most_recent_note: ${mostRecentNote}`);
+  lines.push(`  most_recent_call_outcome: ${mostRecentCallOutcome}`);
+  lines.push(`  chat_transcript_tail: ${chatTranscriptTail}`);
+  lines.push('');
+
+  // ─── Timeline ───────────────────────────────────────────────────
+  if (timeline.length) {
+    lines.push('TIMELINE (most recent 6 events):');
+    for (const ev of timeline.slice(0, 6)) {
       lines.push(`  - ${ev.ts} [${ev.type}] ${ev.summary}`);
     }
     lines.push('');
-  }
-
-  if (context.data_gaps && context.data_gaps.length) {
-    lines.push(`DATA GAPS (sources that failed or were skipped): ${context.data_gaps.join('; ')}`);
+  } else {
+    lines.push('TIMELINE: (no events on file)');
     lines.push('');
   }
 
-  lines.push('Write both bodies now, following the SYSTEM PROMPT exactly. Return ONLY the JSON object.');
+  // ─── Data gaps ──────────────────────────────────────────────────
+  const gaps = Array.isArray(context?.data_gaps) ? context.data_gaps : [];
+  lines.push(`DATA GAPS: ${gaps.length ? gaps.join('; ') : 'none'}`);
+  lines.push('');
+
+  lines.push('Write the email and SMS bodies per the SYSTEM PROMPT.');
   return lines.join('\n');
 }
 
@@ -375,6 +565,7 @@ export async function generateAppointmentBody({ payload, context }) {
 export const _internal = {
   SYSTEM_PROMPT,
   buildUserPrompt,
+  formatApptDateTime,
   stripMarkdown,
   enforceCharCap,
   extractJson,

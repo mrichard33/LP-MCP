@@ -290,10 +290,20 @@ export async function loadAppointmentContext({
   lp_source,
   lp_subsource,
   timeout_ms = DEFAULT_TIMEOUT_MS,
+  _deps,
 }) {
   if (!contact_id) {
     throw new Error('loadAppointmentContext: contact_id required');
   }
+
+  // Dependency injection for tests; production callers omit _deps and
+  // the module-scope loaders are used directly.
+  const loaders = {
+    loadDecodedContact: _deps?.loadDecodedContact || loadDecodedContact,
+    loadLeadSummary: _deps?.loadLeadSummary || loadLeadSummary,
+    loadContactTimeline: _deps?.loadContactTimeline || loadContactTimeline,
+    loadSourceAnalytics: _deps?.loadSourceAnalytics || loadSourceAnalytics,
+  };
 
   const data_gaps = [];
 
@@ -306,15 +316,15 @@ export async function loadAppointmentContext({
   }
 
   const tasks = [
-    withTimeout(loadDecodedContact(contact_id), timeout_ms, 'decoded_contact')
+    withTimeout(loaders.loadDecodedContact(contact_id), timeout_ms, 'decoded_contact')
       .then(v => ({ kind: 'decoded_contact', value: v }))
       .catch(err => ({ kind: 'decoded_contact', error: err.message })),
 
-    withTimeout(loadLeadSummary(contact_id), timeout_ms, 'lead_summary')
+    withTimeout(loaders.loadLeadSummary(contact_id), timeout_ms, 'lead_summary')
       .then(v => ({ kind: 'lead_summary', value: v }))
       .catch(err => ({ kind: 'lead_summary', error: err.message })),
 
-    withTimeout(loadContactTimeline(contact_id), timeout_ms, 'timeline')
+    withTimeout(loaders.loadContactTimeline(contact_id), timeout_ms, 'timeline')
       .then(v => ({ kind: 'timeline', value: v }))
       .catch(err => ({ kind: 'timeline', error: err.message })),
   ];
@@ -322,7 +332,7 @@ export async function loadAppointmentContext({
   if (sourceIntelEnabled) {
     tasks.push(
       withTimeout(
-        loadSourceAnalytics(lp_source, lp_subsource),
+        loaders.loadSourceAnalytics(lp_source, lp_subsource),
         timeout_ms,
         'source_analytics',
       )
@@ -348,6 +358,43 @@ export async function loadAppointmentContext({
     }
     ctx[r.kind] = r.value ?? null;
   }
+
+  // ─── Effective source resolution with LP fallback ──────────────
+  // Payload `lp_source`/`lp_subsource` come from GHL merge tags and
+  // are sometimes empty even when the LP record has a known source.
+  // When both payload fields are empty AND the LP record carries a
+  // `lead_source`, fall back to it and retry the close-rate aggregate
+  // using the resolved value.
+  const payloadSource = String(lp_source || '').trim();
+  const payloadSubsource = String(lp_subsource || '').trim();
+  let effective_source = payloadSource || null;
+  let effective_subsource = payloadSubsource || null;
+
+  if (!payloadSource && !payloadSubsource) {
+    const lpSource = String(ctx.lead_summary?.lead?.lead_source || '').trim();
+    const lpSubsource = String(ctx.lead_summary?.lead?.lead_source_detail || '').trim();
+    if (lpSource) {
+      effective_source = lpSource;
+      effective_subsource = lpSubsource || null;
+      ctx.data_gaps.push('source_resolved_from:lp_fallback');
+
+      if (!ctx.source_analytics) {
+        try {
+          const retried = await withTimeout(
+            loaders.loadSourceAnalytics(effective_source, effective_subsource),
+            1500,
+            'source_analytics_retry',
+          );
+          ctx.source_analytics = retried ?? null;
+        } catch (err) {
+          ctx.data_gaps.push(`source_analytics_retry:${err.message}`);
+        }
+      }
+    }
+  }
+
+  ctx.effective_source = effective_source;
+  ctx.effective_subsource = effective_subsource;
 
   return ctx;
 }
