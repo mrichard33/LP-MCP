@@ -674,11 +674,12 @@ test('buildUserPrompt: formats timing via formatApptDateTime', () => {
   assert.match(out, /was:\s*05-16-2026 at 6:00 PM/);
 });
 
-test('buildUserPrompt: surfaces prospect_id from lead_summary', () => {
+test('buildUserPrompt: reads prospect_id from resolved_prospect_id when present', () => {
   const ctx = {
     decoded_contact: { profile: { tags: [] }, custom_fields: {} },
-    lead_summary: { lead: { lp_prospect_id: '427375' }, recent: { calls: [], notes: [], activities: [] } },
+    lead_summary: { lead: { lp_prospect_id: null }, recent: { calls: [], notes: [], activities: [] } },
     timeline: [],
+    resolved_prospect_id: '427375',
     effective_source: '',
     effective_subsource: '',
     data_gaps: [],
@@ -687,7 +688,24 @@ test('buildUserPrompt: surfaces prospect_id from lead_summary', () => {
   assert.match(out, /prospect_id:\s*427375/);
 });
 
-test('buildUserPrompt: substitutes "(unknown)" when prospect_id is null', () => {
+test('buildUserPrompt: uses GHL ID label (not Contact) in the labeled-facts block', () => {
+  const ctx = {
+    decoded_contact: { profile: { tags: [] }, custom_fields: {} },
+    lead_summary: { lead: { lp_prospect_id: null }, recent: { calls: [], notes: [], activities: [] } },
+    timeline: [],
+    effective_source: '',
+    effective_subsource: '',
+    resolved_prospect_id: null,
+    data_gaps: [],
+  };
+  const out = bodyInternal.buildUserPrompt({ payload: dispatchPayload(), context: ctx });
+  // The user prompt still exposes contact_id verbatim; the GHL ID label is
+  // applied by the SYSTEM_PROMPT when rendering. Sanity-check both.
+  assert.match(out, /contact_id:\s*y4dvOxt/);
+  assert.match(out, /prospect_id:\s*\(unknown\)/);
+});
+
+test('buildUserPrompt: substitutes "(unknown)" when resolved_prospect_id is null', () => {
   const ctx = {
     decoded_contact: { profile: { tags: [] }, custom_fields: {} },
     lead_summary: { lead: { lp_prospect_id: null }, recent: { calls: [], notes: [], activities: [] } },
@@ -698,6 +716,22 @@ test('buildUserPrompt: substitutes "(unknown)" when prospect_id is null', () => 
   };
   const out = bodyInternal.buildUserPrompt({ payload: dispatchPayload(), context: ctx });
   assert.match(out, /prospect_id:\s*\(unknown\)/);
+});
+
+test('SYSTEM_PROMPT uses "GHL ID" label, never "Contact {id}"', () => {
+  const sys = bodyInternal.SYSTEM_PROMPT;
+  assert.match(sys, /GHL ID \{contact_id\}/);
+  // The literal "Contact {contact_id}" rendering must not appear anywhere
+  // in the system prompt (the old label was the source of "Contact <id>"
+  // strings in rendered bodies).
+  assert.ok(
+    !/Contact \{contact_id\}/.test(sys),
+    'SYSTEM_PROMPT still references "Contact {contact_id}" — should be "GHL ID {contact_id}"',
+  );
+  assert.ok(
+    !/Contact y4dvOxtWW12xGrBavCUt/.test(sys),
+    'SYSTEM_PROMPT example still renders "Contact y4dvOxt..." — should be "GHL ID y4dvOxt..."',
+  );
 });
 
 test('buildUserPrompt: surfaces chat_transcript_tail, concern tags, pain_point', () => {
@@ -848,4 +882,217 @@ test('loadAppointmentContext: no fallback when LP lead_source also empty', async
   assert.equal(ctx.effective_source, null);
   assert.equal(ctx.effective_subsource, null);
   assert.ok(!ctx.data_gaps.includes('source_resolved_from:lp_fallback'));
+});
+
+// ───────────────────────────────────────────────────────────────────
+// PROSPECT ID — 3-tier resolution chain
+// ───────────────────────────────────────────────────────────────────
+
+test('Tier 1: resolves prospect_id from lp_leads when present', async () => {
+  let phoneLookupCalls = 0;
+  const ctx = await loadAppointmentContext({
+    contact_id: 'gC1',
+    contact_phone: '(954) 508-1512',
+    lp_source: '',
+    lp_subsource: '',
+    _deps: {
+      loadDecodedContact: async () => ({ profile: { id: 'gC1', tags: [] }, custom_fields: {} }),
+      loadLeadSummary: async () => ({
+        lead: { lp_lead_id: 'L1', lp_prospect_id: '111222' },
+        recent: { calls: [], notes: [], activities: [] },
+      }),
+      loadContactTimeline: async () => [],
+      loadSourceAnalytics: async () => null,
+      lookupProspectByPhone: async () => {
+        phoneLookupCalls++;
+        return '999999';
+      },
+    },
+  });
+
+  assert.equal(ctx.resolved_prospect_id, '111222');
+  assert.equal(phoneLookupCalls, 0, 'Tier 3 must not run when Tier 1 resolves');
+  assert.ok(!ctx.data_gaps.some(g => /prospect_resolved_from/.test(g)));
+});
+
+test('Tier 2: resolves prospect_id from decoded_contact custom field when lp_leads empty', async () => {
+  let phoneLookupCalls = 0;
+  const ctx = await loadAppointmentContext({
+    contact_id: 'gC1',
+    contact_phone: '(954) 508-1512',
+    lp_source: '',
+    lp_subsource: '',
+    _deps: {
+      loadDecodedContact: async () => ({
+        profile: { id: 'gC1', tags: [] },
+        custom_fields: {
+          identity: [
+            { name: 'LP Prospect ID', value: '427375', id: 'ZRQAVrzhtzApzLlHmT87' },
+          ],
+        },
+      }),
+      loadLeadSummary: async () => ({
+        lead: { lp_lead_id: 'L1', lp_prospect_id: null },
+        recent: { calls: [], notes: [], activities: [] },
+      }),
+      loadContactTimeline: async () => [],
+      loadSourceAnalytics: async () => null,
+      lookupProspectByPhone: async () => {
+        phoneLookupCalls++;
+        return '999999';
+      },
+    },
+  });
+
+  assert.equal(ctx.resolved_prospect_id, '427375');
+  assert.equal(phoneLookupCalls, 0, 'Tier 3 must not run when Tier 2 resolves');
+  assert.ok(
+    !ctx.data_gaps.includes('prospect_resolved_from:lp_api_lookup'),
+    `Tier 2 hit should NOT add lp_api_lookup data gap: ${JSON.stringify(ctx.data_gaps)}`,
+  );
+});
+
+test('Tier 2: finds LP Prospect ID by field id even under non-identity category', async () => {
+  const ctx = await loadAppointmentContext({
+    contact_id: 'gC1',
+    contact_phone: '',
+    lp_source: '',
+    lp_subsource: '',
+    _deps: {
+      loadDecodedContact: async () => ({
+        profile: { id: 'gC1', tags: [] },
+        custom_fields: {
+          // Field showed up under an unexpected category — should still resolve.
+          unknown: [
+            { name: 'Mystery', value: 'xx', id: 'someOtherId' },
+            { name: 'LP Prospect ID', value: '555', id: 'ZRQAVrzhtzApzLlHmT87' },
+          ],
+        },
+      }),
+      loadLeadSummary: async () => ({
+        lead: { lp_lead_id: 'L1', lp_prospect_id: null },
+        recent: { calls: [], notes: [], activities: [] },
+      }),
+      loadContactTimeline: async () => [],
+      loadSourceAnalytics: async () => null,
+      lookupProspectByPhone: async () => null,
+    },
+  });
+
+  assert.equal(ctx.resolved_prospect_id, '555');
+});
+
+test('Tier 3: falls through to LP API search by phone when lead_summary AND decoded_contact miss', async () => {
+  const ctx = await loadAppointmentContext({
+    contact_id: 'gC1',
+    contact_phone: '(954) 508-1512',
+    lp_source: '',
+    lp_subsource: '',
+    _deps: {
+      loadDecodedContact: async () => ({
+        profile: { id: 'gC1', tags: [] },
+        custom_fields: { identity: [{ name: 'Something Else', value: 'x', id: 'aaa' }] },
+      }),
+      loadLeadSummary: async () => ({
+        lead: { lp_lead_id: 'L1', lp_prospect_id: null },
+        recent: { calls: [], notes: [], activities: [] },
+      }),
+      loadContactTimeline: async () => [],
+      loadSourceAnalytics: async () => null,
+      lookupProspectByPhone: async phone => {
+        assert.equal(phone, '(954) 508-1512');
+        return '999888';
+      },
+    },
+  });
+
+  assert.equal(ctx.resolved_prospect_id, '999888');
+  assert.ok(
+    ctx.data_gaps.includes('prospect_resolved_from:lp_api_lookup'),
+    `Tier 3 hit must record lp_api_lookup data gap: ${JSON.stringify(ctx.data_gaps)}`,
+  );
+});
+
+test('Tier 3 fallthrough: leaves prospect unknown when LP API returns no match', async () => {
+  const ctx = await loadAppointmentContext({
+    contact_id: 'gC1',
+    contact_phone: '(954) 508-1512',
+    lp_source: '',
+    lp_subsource: '',
+    _deps: {
+      loadDecodedContact: async () => ({
+        profile: { id: 'gC1', tags: [] },
+        custom_fields: {},
+      }),
+      loadLeadSummary: async () => ({
+        lead: { lp_lead_id: 'L1', lp_prospect_id: null },
+        recent: { calls: [], notes: [], activities: [] },
+      }),
+      loadContactTimeline: async () => [],
+      loadSourceAnalytics: async () => null,
+      lookupProspectByPhone: async () => null,
+    },
+  });
+
+  assert.equal(ctx.resolved_prospect_id, null);
+  assert.ok(
+    !ctx.data_gaps.some(g => /prospect_resolved_from/.test(g)),
+    `No-match Tier 3 must NOT record a prospect_resolved_from gap: ${JSON.stringify(ctx.data_gaps)}`,
+  );
+});
+
+test('Tier 3: silent fallthrough when LP API throws', async () => {
+  const ctx = await loadAppointmentContext({
+    contact_id: 'gC1',
+    contact_phone: '(954) 508-1512',
+    lp_source: '',
+    lp_subsource: '',
+    _deps: {
+      loadDecodedContact: async () => ({
+        profile: { id: 'gC1', tags: [] },
+        custom_fields: {},
+      }),
+      loadLeadSummary: async () => ({
+        lead: { lp_lead_id: 'L1', lp_prospect_id: null },
+        recent: { calls: [], notes: [], activities: [] },
+      }),
+      loadContactTimeline: async () => [],
+      loadSourceAnalytics: async () => null,
+      lookupProspectByPhone: async () => {
+        throw new Error('lp_leads_phone_lookup:boom');
+      },
+    },
+  });
+
+  assert.equal(ctx.resolved_prospect_id, null);
+  assert.ok(!ctx.data_gaps.some(g => /prospect_resolved_from/.test(g)));
+});
+
+test('Tier 3: skipped when no contact_phone provided', async () => {
+  let phoneLookupCalls = 0;
+  const ctx = await loadAppointmentContext({
+    contact_id: 'gC1',
+    contact_phone: '',
+    lp_source: '',
+    lp_subsource: '',
+    _deps: {
+      loadDecodedContact: async () => ({
+        profile: { id: 'gC1', tags: [] },
+        custom_fields: {},
+      }),
+      loadLeadSummary: async () => ({
+        lead: { lp_lead_id: 'L1', lp_prospect_id: null },
+        recent: { calls: [], notes: [], activities: [] },
+      }),
+      loadContactTimeline: async () => [],
+      loadSourceAnalytics: async () => null,
+      lookupProspectByPhone: async () => {
+        phoneLookupCalls++;
+        return '999999';
+      },
+    },
+  });
+
+  assert.equal(ctx.resolved_prospect_id, null);
+  assert.equal(phoneLookupCalls, 0);
 });
