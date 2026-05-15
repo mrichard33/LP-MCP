@@ -7,6 +7,38 @@
  *
  * Extracted from action-executor.js v4.2 refactor.
  *
+ * 2026-05-14 (v2) — NOTIFICATION CLASSIFIER v1.0.
+ *   Canonical 4-class notification taxonomy per
+ *   Reece_GroupMe_Notification_Standard_v1.md:
+ *
+ *     🤖 SYSTEM EVENT          (cold, factual)
+ *     🚨 SALES PRIORITY        (urgent, action required)
+ *     🧠 PIPELINE INTELLIGENCE (strategic, doctrinal)
+ *     🔧 DEBUG                 (internal only, dev channel)
+ *
+ *   Two routing paths:
+ *
+ *     CLASSIFIED PATH — When the rule's action_payload includes
+ *     `notification_class` (or `action_verb`), the handler routes
+ *     through buildClassifiedNotification() in notification-classifier.js,
+ *     producing the standardized card with header, tier, status,
+ *     narrative, and ref footer. Narrative is auto-sanitized to strip
+ *     step numbers, "buggy fallthrough", UUIDs, and other forbidden
+ *     debug-leakage patterns.
+ *
+ *     LEGACY PATH — Rules that haven't been migrated yet continue to
+ *     use buildRichNotification (in enrichment.js). The legacy path
+ *     ALSO applies sanitizeNarrative() to the message field, so even
+ *     un-migrated rules can no longer leak "step #149 buggy fallthrough"
+ *     to rep-facing channels.
+ *
+ *   CLASS 4 DEV CHANNEL: When notification_class === 'debug', the
+ *   handler routes through sendToDevChannel (in notification-classifier.js),
+ *   which uses GROUPME_DEV_BOT_ID and bypasses the rep-facing groupme.js
+ *   entirely. If GROUPME_DEV_BOT_ID is unset, the message is logged to
+ *   console and to agent_actions.execution_result only — never sent to
+ *   rep-facing channels.
+ *
  * 2026-05-14 — OPT IN TO v1.7 GROUPME DEBOUNCE.
  *   Pass { contactId, contactName } to sendGroupMeMessage so multiple
  *   notifications (or notification + task + send_message rich notif)
@@ -17,57 +49,15 @@
  *   verification still works on history lookup.
  *
  * 2026-05-13 — RECOVERABLE NON-IDEMPOTENT RETRY (executor stall fix).
- *   Pre-fix: send_notification stuck >10min in 'executing' was reaped
- *   and marked failed without retry — at-most-once delivery, ~37/week
- *   silently dropped (typical cause: Railway redeploy mid-handler).
- *
- *   send_notification is now in the RECOVERABLE_NON_IDEMPOTENT set
- *   (see src/actions/reaper.js). When the reaper detects a stuck action,
- *   it requeues instead of dropping. To keep retries safe, three
- *   changes land here:
- *
- *     1. Every outbound notification appends a recovery footer:
- *          `\n\nref: a${action.id}`
- *        Visible by design — operational debugging, support visibility,
- *        screenshot evidence. The same token is what verification
- *        searches for in history.
- *
- *     2. When action.retry_count > 0 (i.e., this is a retry), the
- *        handler calls checkForActionRef(action.id, 50) against
- *        GroupMe's read API. If the marker is found in recent history,
- *        the message already made it — return verified_already_sent
- *        without re-sending. If not found, log retry_resending and
- *        proceed.
- *
- *     3. Three telemetry events for observability:
- *          notification_retry_verified_sent      — found, skip resend
- *          notification_retry_resending          — not found, send
- *          notification_retry_history_check_failed — read API down, fail-open
- *
- *   Recovery ceiling: standard retry_count / max_retries (default 3)
- *   applies. After max attempts the action fails permanently.
- *
- *   Requires GROUPME_ACCESS_TOKEN env var. Without it, the history
- *   check fails-open (logs the warning, proceeds with send) — same
- *   risk as before the fix, just no improvement.
+ *   send_notification is in the RECOVERABLE_NON_IDEMPOTENT set (see
+ *   src/actions/reaper.js). When the reaper detects a stuck action, it
+ *   requeues instead of dropping. Every outbound notification appends
+ *   a recovery footer `\n\nref: a${action.id}` used by checkForActionRef
+ *   to detect already-sent messages on retry.
  *
  * 2026-05-11 — PER-RULE COOLDOWN + WIDER LOG PREVIEW.
- *   1. Opt-in cooldown: if the action's payload includes a positive
- *      `cooldown_minutes` value, the handler checks agent_actions for
- *      a recent COMPLETED send_notification with the same rule_applied
- *      and target_id. If one is found inside the window, the GroupMe
- *      send is skipped and the action is marked completed with
- *      action='cooldown_skipped' + the prior fire timestamp. Lets noisy
- *      rules (DRIFT_NOTIFY_GROUPME with 4320, AGENTIC_HANDOFF_* with 5)
- *      throttle themselves at the handler layer without needing a new
- *      Decision Engine operator. Defaults to 0 (no cooldown) so every
- *      rule that doesn't opt in keeps its current behavior.
- *   2. execution_result.message preview raised from 200 → 600 chars.
- *      The 200-char cap was clipping at "Prospect:" on standard cards
- *      and making audits look like delivery was broken when in fact
- *      the full message was making it through to GroupMe (the
- *      sendGroupMeMessage path clips at 1000). 600 is plenty for a
- *      typical card, still bounded for storage.
+ *   Opt-in cooldown via payload.cooldown_minutes; execution_result.message
+ *   preview raised from 200 → 600 chars.
  */
 
 import supabase from '../../supabase.js';
@@ -76,6 +66,13 @@ import { checkForActionRef } from '../../groupme-read.js';
 import { interpolatePayload } from '../helpers.js';
 import { resolveContactInfo, resolveLPProspectId } from '../resolvers.js';
 import { buildNotificationEnrichment, buildRichNotification } from '../enrichment.js';
+import {
+  buildClassifiedNotification,
+  isClassifiedPayload,
+  isDevOnly,
+  sanitizeNarrative,
+  sendToDevChannel,
+} from '../notification-classifier.js';
 
 const LOG_PREVIEW_CHARS = 600;
 const RECOVERY_HISTORY_LIMIT = 50;
@@ -83,8 +80,6 @@ const RECOVERY_HISTORY_LIMIT = 50;
 /**
  * 2026-05-11 — check whether this (rule_applied, target_id) recently
  * fired a completed send_notification inside the cooldown window.
- * Returns the matching row (with id, created_at) or null. Returns null
- * on lookup failure (fail-open: better to over-notify than silently drop).
  */
 async function findRecentNotification(ruleApplied, targetId, cooldownMinutes, selfActionId) {
   if (!ruleApplied || !targetId || !(cooldownMinutes > 0)) return null;
@@ -115,10 +110,7 @@ async function findRecentNotification(ruleApplied, targetId, cooldownMinutes, se
 export async function executeSendNotification(action, context) {
   const params = action.action_payload || {};
 
-  // 2026-05-11 — opt-in cooldown gate. Skip GroupMe send if the same
-  // (rule, target) fired within cooldown_minutes. Action is still marked
-  // completed so it doesn't retry; the result records the skip reason
-  // for audit visibility.
+  // 2026-05-11 — opt-in cooldown gate.
   const cooldownMinutes = Number(params.cooldown_minutes) || 0;
   if (cooldownMinutes > 0) {
     const recent = await findRecentNotification(
@@ -144,11 +136,7 @@ export async function executeSendNotification(action, context) {
     }
   }
 
-  // 2026-05-13 — RECOVERY VERIFICATION.
-  // Only fires when this is a retry (retry_count > 0). First-time sends
-  // skip the read-API call. If the action's ref footer is already in
-  // recent history, the original send made it — return without
-  // resending. If not found OR the read API errors, fail-open (send).
+  // 2026-05-13 — RECOVERY VERIFICATION on retries.
   const isRetry = (action.retry_count || 0) > 0;
   if (isRetry) {
     const check = await checkForActionRef(action.id, RECOVERY_HISTORY_LIMIT);
@@ -170,14 +158,11 @@ export async function executeSendNotification(action, context) {
         `[Notifications] notification_retry_resending action=${action.id} ` +
         `retry=${action.retry_count} checked=${check.checked_count} — not found, resending`
       );
-      // proceed to send
     } else {
-      // found === null: history check failed (no token, HTTP error, etc.)
       console.warn(
         `[Notifications] notification_retry_history_check_failed action=${action.id} ` +
         `retry=${action.retry_count} reason=${check.reason} — failing open, will send`
       );
-      // proceed to send (fail-open: better to over-notify than silently drop)
     }
   }
 
@@ -195,21 +180,70 @@ export async function executeSendNotification(action, context) {
   };
 
   const payload = interpolatePayload(action.action_payload, enrichedContext);
-  const baseMessage = payload?.message || 'Agent notification';
 
-  const built = buildRichNotification({ baseMessage, name, phone, contactId, prospectId, enrichment });
-  // 2026-05-13 — append recovery footer. Visible by design (operational
-  // debugging) and used by checkForActionRef to verify prior sends on retry.
-  const full = `${built}\n\nref: a${action.id}`;
+  // ══════════════════════════════════════════════════════════════════
+  // 2026-05-14 v2 — CLASSIFIED vs LEGACY routing
+  // ══════════════════════════════════════════════════════════════════
 
-  // 2026-05-14 — opt in to groupme.js v1.7 debounce. Passing contactId
-  // routes through the consolidation buffer; multiple sends for the same
-  // contact within 5s emit as one card. The `ref: a${id}` footer is
-  // preserved inside the consolidated card so checkForActionRef retry
-  // verification still works against GroupMe history.
+  let full;
+  let formatPath;
+
+  if (isClassifiedPayload(payload)) {
+    // CLASSIFIED PATH — new 4-class format
+    formatPath = 'classified';
+    const klass = payload.notification_class || 'system';
+
+    full = buildClassifiedNotification({
+      notification_class: klass,
+      action_verb: payload.action_verb,
+      name,
+      phone,
+      contactId,
+      prospectId,
+      tier: payload.tier || enrichment?.tier,
+      status: payload.status,
+      narrative: payload.narrative || payload.message,
+      actWithin: payload.act_within,
+      nextStep: payload.next_step,
+      refHash: `a${action.id}`,
+    });
+
+    // CLASS 4 routing — debug class goes to dev channel only.
+    // Self-contained sender in notification-classifier.js bypasses
+    // groupme.js entirely so debug can never accidentally land in a
+    // rep-facing channel.
+    if (isDevOnly(klass)) {
+      const result = await sendToDevChannel(full);
+      return {
+        action: result?.sent ? 'debug_sent_to_dev' : 'debug_logged_only',
+        format: 'classified',
+        notification_class: 'debug',
+        message: full.slice(0, LOG_PREVIEW_CHARS),
+        ref_footer: `a${action.id}`,
+        send_result: result,
+      };
+    }
+  } else {
+    // LEGACY PATH — buildRichNotification with sanitizer applied to message
+    formatPath = 'legacy';
+    const rawMessage = payload?.message || 'Agent notification';
+    const { text: cleanMessage, hits } = sanitizeNarrative(rawMessage);
+    if (hits.length > 0) {
+      console.log(`[Notifications] Sanitized legacy message for rule=${action.rule_applied}: stripped ${hits.join(', ')}`);
+    }
+    const baseMessage = cleanMessage || 'Agent notification';
+
+    const built = buildRichNotification({ baseMessage, name, phone, contactId, prospectId, enrichment });
+    // Append recovery footer (preserved across consolidation per groupme.js v1.7).
+    full = `${built}\n\nref: a${action.id}`;
+  }
+
+  // Rep-facing send — passes contactId for v1.7 debounce consolidation.
   await sendGroupMeMessage(full, { contactId, contactName: name });
   return {
     action: 'groupme_sent',
+    format: formatPath,
+    notification_class: isClassifiedPayload(payload) ? (payload.notification_class || 'system') : null,
     message: full.slice(0, LOG_PREVIEW_CHARS),
     ref_footer: `a${action.id}`,
     retry_count: action.retry_count || 0,
