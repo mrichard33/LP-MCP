@@ -362,25 +362,27 @@ export function registerRestApiRoutes(app, authenticate) {
   registerEngagementRoutes(app);
 
   // ═══════════════════════════════════════════════════════════════
-  // POST /api/agentic/notifications/appointment — GroupMe alerts
+  // POST /api/agentic/notifications/appointment — GHL email + SMS
   // ═══════════════════════════════════════════════════════════════
   // Calendar-agnostic endpoint that any GHL appointment workflow can
   // fire the same Layer-3 webhook config at. Pulls per-contact LIVE
   // intelligence from LP MCP services + aggregate analytics from
-  // Supabase, generates a GroupMe-styled team message via Claude,
-  // posts to the Reece Sales Board GroupMe bot FIRST, then writes
-  // back to GHL in strict order (body+id, then team_notification_ready
-  // = Yes as the final atomic gate). The GHL workflow's wait-for-
-  // condition step reads team_notification_ready and proceeds; a
-  // 30-minute timeout fires the fallback branch when this endpoint
-  // fails for any reason.
+  // Supabase, generates BOTH an email body and an SMS body via
+  // Claude (one structured call), and writes them back to GHL in
+  // strict order: body+sms+id in one PATCH, then
+  // team_notification_ready = "Yes" as the separate, final atomic
+  // gate. The GHL workflow's wait-for-condition step reads
+  // team_notification_ready and proceeds to its already-wired
+  // internal_notification (email + SMS) steps, which render the two
+  // bodies as merge tags. This endpoint never posts to GroupMe; the
+  // existing GroupMe pipeline (src/groupme.js) is unrelated.
   //
   // v1 whitelist: status ∈ { cancelled, rescheduled }. Adding more
   // statuses (booked, confirmed) is a one-line change to
   // ENABLED_NOTIFICATION_STATUSES in notifications/appointment-
   // notifications.js. Feature-flagged via
   // ENABLE_ENHANCED_APPT_NOTIFICATIONS env var (returns 503 when not
-  // 'true' so the workflow timeout fires the fallback).
+  // 'true' so the workflow's 30-min timeout fires the fallback).
   registerAppointmentNotificationRoutes(app);
 
   // ─── GET /api/prospects/:prospectId ────────────────────────────

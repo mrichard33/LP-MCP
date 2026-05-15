@@ -2,34 +2,39 @@
  * Agentic Appointment Notifications — endpoint + orchestrator
  * src/notifications/appointment-notifications.js
  *
- * Calendar-agnostic endpoint that any future GHL appointment workflow
- * can fire the same Layer-3 webhook config at. The endpoint:
+ * Calendar-agnostic endpoint that any GHL appointment workflow can
+ * fire the same Layer-3 webhook config at. Delivery to the
+ * Dispatch / Edwin / Trudy / Jazmine distribution list happens via
+ * GHL's already-wired internal_notification (email + SMS) steps that
+ * read {{contact.team_notification_body}} and
+ * {{contact.team_notification_sms}} once the gate flips. THIS module
+ * never posts to GroupMe, Slack, or any external channel.
  *
- *   1. Validates the request against the single whitelist constant
- *      ENABLED_NOTIFICATION_STATUSES (adding a status later is a one-
- *      line change).
- *   2. Pulls LIVE per-contact intelligence + Supabase aggregates in
- *      parallel via loadAppointmentContext (4s total cap).
- *   3. Generates the GroupMe message body via Claude.
- *   4. Posts to the Reece Sales Board GroupMe bot FIRST (using
- *      GROUPME_BOT_ID).
- *   5. Writes audit fields back to the GHL contact in strict order:
- *        a. team_notification_body
- *        b. team_notification_id
- *        c. (LAST) team_notification_ready = "Yes"
- *      The ready flip is the atomic gate. If GroupMe failed, step 5 is
- *      skipped entirely. If (a) or (b) fail, (c) is skipped.
- *   6. Logs to lp_agentic_notifications on every path.
- *   7. Returns 200 on success, non-200 on failure. NEVER flips the
- *      gate on a non-200 response.
+ * Flow per request:
+ *   1. Validate against ENABLED_NOTIFICATION_STATUSES (whitelist —
+ *      adding statuses later is a one-line change).
+ *   2. Pull LIVE per-contact intelligence + Supabase aggregates in
+ *      parallel via loadAppointmentContext (4s cap, partial failures
+ *      surface as data_gaps).
+ *   3. Generate { email_body, sms_body } via Claude.
+ *   4. Write back to GHL in strict order:
+ *        Call 1: team_notification_body + team_notification_sms +
+ *                team_notification_id (one PATCH, three fields)
+ *        Call 2: team_notification_ready = "Yes" (separate, FINAL)
+ *      The ready flip is the atomic gate. If Call 1 fails, Call 2
+ *      is never attempted — the gate stays unflipped and the GHL
+ *      workflow's 30-min timeout fires the fallback.
+ *   5. Log to lp_agentic_notifications on every path.
+ *   6. 200 on success, non-200 on failure. NEVER flip the gate on
+ *      a non-200 response.
  *
  * Feature flag: ENABLE_ENHANCED_APPT_NOTIFICATIONS=false → endpoint
- * returns 503 so the GHL workflow's 30-min timeout fires the fallback
- * branch and the legacy notification still goes out.
+ * returns 503 so the GHL workflow's 30-min timeout fires the
+ * fallback branch.
  *
  * Companion endpoint: POST /api/agentic/notifications/engagement
- * accepts { notification_id, event } and is stubbed for future use
- * (GroupMe webhook → reply tracking).
+ * accepts { notification_id, event } where event ∈ { email_sent,
+ * sms_sent, team_acknowledged }. Stubbed for future tracking.
  */
 
 import crypto from 'crypto';
@@ -65,13 +70,6 @@ const REQUIRED_FIELDS = [
 
 // rescheduled requires the previous slot too
 const RESCHEDULED_EXTRA_REQUIRED = ['previous_start_time', 'previous_start_date'];
-
-const GROUPME_BOT_ID = process.env.GROUPME_BOT_ID || '';
-const GROUPME_POST_URL = 'https://api.groupme.com/v3/bots/post';
-const GROUPME_TIMEOUT_MS = parseInt(
-  process.env.APPT_NOTIFICATION_GROUPME_TIMEOUT_MS || '8000',
-  10,
-);
 
 const GHL_BASE = 'https://services.leadconnectorhq.com';
 const GHL_TIMEOUT_MS = parseInt(
@@ -122,27 +120,31 @@ export function extractRequestFields(body) {
 }
 
 /**
- * Validate the request body against the whitelist + required fields.
+ * Validate the request body against an injected whitelist + required
+ * fields. The whitelist defaults to ENABLED_NOTIFICATION_STATUSES;
+ * tests can pass a different one to prove the constant is the single
+ * source of truth.
+ *
  * Returns { valid: boolean, errors: string[], normalized: {...} }.
- * Empty-string fields count as "present but blank" for lp_source/
- * lp_subsource (per contract — they're required keys, but may be "").
- * Empty-string fields count as MISSING for everything else.
+ * Empty-string fields count as "present but blank" for lp_source /
+ * lp_subsource (per contract). For everything else, empty-string =
+ * MISSING.
  */
-export function validateRequest(body) {
+export function validateRequest(body, statuses = ENABLED_NOTIFICATION_STATUSES) {
   const errors = [];
 
   const status = String(body.status || '').trim().toLowerCase();
   if (!status) {
     errors.push("'status' is required");
-  } else if (!ENABLED_NOTIFICATION_STATUSES.includes(status)) {
+  } else if (!statuses.includes(status)) {
     errors.push(
-      `'status' must be one of [${ENABLED_NOTIFICATION_STATUSES.join(', ')}], got '${status}'`,
+      `'status' must be one of [${statuses.join(', ')}], got '${status}'`,
     );
   }
 
   const ALLOW_EMPTY = new Set(['lp_source', 'lp_subsource']);
   for (const key of REQUIRED_FIELDS) {
-    if (key === 'status') continue; // handled above
+    if (key === 'status') continue;
     const raw = body[key];
     const present = raw !== undefined && raw !== null && (ALLOW_EMPTY.has(key) || String(raw).trim() !== '');
     if (!present) errors.push(`'${key}' is required`);
@@ -184,49 +186,13 @@ export function validateRequest(body) {
 }
 
 // ───────────────────────────────────────────────────────────────────
-// GROUPME POST
-// ───────────────────────────────────────────────────────────────────
-
-/**
- * POST the message to the Reece Sales Board GroupMe bot. Returns
- * { ok, status, body? } — caller treats !ok as fatal and skips GHL
- * writeback entirely so the gate never flips when the team didn't
- * actually receive the message.
- *
- * We bypass the queue/debounce path in src/groupme.js because the
- * appointment-notification flow has a strict ordering contract: we
- * MUST know whether GroupMe accepted the post before deciding to
- * touch GHL. The debounce path returns sent=false reason=queued,
- * which is correct for fire-and-forget alerts but wrong here.
- */
-export async function postToGroupMe(text, { botId = GROUPME_BOT_ID, fetchImpl = fetch } = {}) {
-  if (!botId) {
-    return { ok: false, status: 0, body: 'no_groupme_bot_id_configured' };
-  }
-  try {
-    const res = await fetchImpl(GROUPME_POST_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bot_id: botId, text: String(text).slice(0, 1000) }),
-      signal: AbortSignal.timeout(GROUPME_TIMEOUT_MS),
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      return { ok: false, status: res.status, body: body.slice(0, 300) };
-    }
-    return { ok: true, status: res.status };
-  } catch (err) {
-    return { ok: false, status: 0, body: err.message };
-  }
-}
-
-// ───────────────────────────────────────────────────────────────────
 // GHL WRITEBACK
 // ───────────────────────────────────────────────────────────────────
 
 function resolveGhlFieldIds() {
   return {
     body: process.env.GHL_FIELD_TEAM_NOTIFICATION_BODY || '',
+    sms: process.env.GHL_FIELD_TEAM_NOTIFICATION_SMS || '',
     id: process.env.GHL_FIELD_TEAM_NOTIFICATION_ID || '',
     ready: process.env.GHL_FIELD_TEAM_NOTIFICATION_READY || '',
   };
@@ -256,41 +222,42 @@ async function ghlPutContact(contactId, customFields, { fetchImpl = fetch } = {}
  * Strict-order GHL writeback. The ready flip is in a SEPARATE second
  * PUT — non-negotiable per the build spec, because the GHL workflow's
  * wait-for-condition step reads ready and immediately advances when
- * it sees "Yes". Body+id MUST land first.
+ * it sees "Yes". body + sms + id MUST land first.
  *
  * Step layout:
- *   1) PUT body + id  (one call)
- *   2) PUT ready=Yes  (separate call)
+ *   1) PUT body + sms + id  (one call, three fields)
+ *   2) PUT ready=Yes        (separate call, single field — the gate)
  *
- * Caller spec mentions "(a) body, (b) id, (c) ready". This bundles
- * (a)+(b) into one round-trip and keeps (c) strictly separate. Both
- * sub-steps are observable via the callbacks parameter — tests assert
- * the order via the mocked GHL_PUT records.
+ * If Call 1 throws, this function re-throws and Call 2 is never
+ * attempted. Tests assert this by asserting the recorded mock-fetch
+ * call count and field shape.
  */
 export async function writeBackToGhl({
   contactId,
-  body,
+  emailBody,
+  smsBody,
   notificationId,
   fieldIds = resolveGhlFieldIds(),
   fetchImpl = fetch,
   hooks = {},
 }) {
-  if (!fieldIds.body || !fieldIds.id || !fieldIds.ready) {
+  if (!fieldIds.body || !fieldIds.sms || !fieldIds.id || !fieldIds.ready) {
     throw new Error(
-      `ghl_field_ids_not_configured: body=${!!fieldIds.body} id=${!!fieldIds.id} ready=${!!fieldIds.ready}`,
+      `ghl_field_ids_not_configured: body=${!!fieldIds.body} sms=${!!fieldIds.sms} id=${!!fieldIds.id} ready=${!!fieldIds.ready}`,
     );
   }
 
-  // ─── Call 1: body + id (must succeed before ready) ─────────────
+  // ─── Call 1: body + sms + id (must succeed before ready) ───────
   await ghlPutContact(
     contactId,
     [
-      { id: fieldIds.body, field_value: String(body) },
+      { id: fieldIds.body, field_value: String(emailBody) },
+      { id: fieldIds.sms, field_value: String(smsBody) },
       { id: fieldIds.id, field_value: String(notificationId) },
     ],
     { fetchImpl },
   );
-  if (hooks.onBodyAndIdWritten) await hooks.onBodyAndIdWritten();
+  if (hooks.onBodiesAndIdWritten) await hooks.onBodiesAndIdWritten();
 
   // ─── Call 2: ready=Yes (the atomic gate) ───────────────────────
   await ghlPutContact(
@@ -323,18 +290,17 @@ async function logAudit(row) {
 
 /**
  * Orchestrate one notification end-to-end. Returns:
- *   { ok: true, notification_id, body, ...details }       on success
- *   { ok: false, http_status, error, notification_id }    on failure
+ *   { ok: true, notification_id, email_body, sms_body, ...details }   on success
+ *   { ok: false, http_status, error, notification_id }                on failure
  *
- * The caller (Express handler) maps these to HTTP responses. We never
- * flip the GHL gate on a failure path — the spec's contract.
+ * The caller (Express handler) maps these to HTTP responses. We
+ * never flip the GHL gate on a failure path — the spec's contract.
  */
 export async function runAppointmentNotification(input, deps = {}) {
   const {
     fetchImpl = fetch,
     loadContext = loadAppointmentContext,
     generateBody = generateAppointmentBody,
-    postGroupMe = postToGroupMe,
     writeGhl = writeBackToGhl,
     audit = logAudit,
     fieldIds,
@@ -342,6 +308,16 @@ export async function runAppointmentNotification(input, deps = {}) {
 
   const notificationId = crypto.randomUUID();
   const startedAt = Date.now();
+
+  const baseAuditRow = () => ({
+    notification_id: notificationId,
+    contact_id: input.contact_id,
+    status: input.status,
+    calendar_id: input.calendar_id,
+    appointment_title: input.appointment_title,
+    lp_source: input.lp_source,
+    lp_subsource: input.lp_subsource,
+  });
 
   // ─── Step 1: hybrid intelligence load ──────────────────────────
   let context;
@@ -353,15 +329,9 @@ export async function runAppointmentNotification(input, deps = {}) {
     });
   } catch (err) {
     await audit({
-      notification_id: notificationId,
-      contact_id: input.contact_id,
-      status: input.status,
-      calendar_id: input.calendar_id,
-      appointment_title: input.appointment_title,
-      lp_source: input.lp_source,
-      lp_subsource: input.lp_subsource,
-      body: null,
-      groupme_posted_at: null,
+      ...baseAuditRow(),
+      email_body: null,
+      sms_body: null,
       ghl_writeback_at: null,
       model_used: null,
       data_gaps: null,
@@ -375,21 +345,15 @@ export async function runAppointmentNotification(input, deps = {}) {
     };
   }
 
-  // ─── Step 2: generate body via Claude ──────────────────────────
+  // ─── Step 2: generate { email_body, sms_body } via Claude ──────
   let generated;
   try {
     generated = await generateBody({ payload: input, context });
   } catch (err) {
     await audit({
-      notification_id: notificationId,
-      contact_id: input.contact_id,
-      status: input.status,
-      calendar_id: input.calendar_id,
-      appointment_title: input.appointment_title,
-      lp_source: input.lp_source,
-      lp_subsource: input.lp_subsource,
-      body: null,
-      groupme_posted_at: null,
+      ...baseAuditRow(),
+      email_body: null,
+      sms_body: null,
       ghl_writeback_at: null,
       model_used: null,
       data_gaps: context.data_gaps || null,
@@ -403,53 +367,21 @@ export async function runAppointmentNotification(input, deps = {}) {
     };
   }
 
-  // ─── Step 3: post to GroupMe FIRST (atomic gate dep #1) ────────
-  const gmResult = await postGroupMe(generated.text, { fetchImpl });
-  if (!gmResult.ok) {
-    await audit({
-      notification_id: notificationId,
-      contact_id: input.contact_id,
-      status: input.status,
-      calendar_id: input.calendar_id,
-      appointment_title: input.appointment_title,
-      lp_source: input.lp_source,
-      lp_subsource: input.lp_subsource,
-      body: generated.text,
-      groupme_posted_at: null,
-      ghl_writeback_at: null,
-      model_used: generated.model,
-      data_gaps: context.data_gaps || null,
-      error: `groupme_post_failed:status=${gmResult.status}:${gmResult.body || ''}`,
-    });
-    return {
-      ok: false,
-      http_status: 502,
-      error: `groupme_post_failed:${gmResult.status}`,
-      notification_id: notificationId,
-    };
-  }
-  const groupmePostedAt = new Date().toISOString();
-
-  // ─── Step 4: GHL writeback in strict order (body+id, then ready) ─
+  // ─── Step 3: GHL writeback in strict order ─────────────────────
   try {
     await writeGhl({
       contactId: input.contact_id,
-      body: generated.text,
+      emailBody: generated.email_body,
+      smsBody: generated.sms_body,
       notificationId,
       fieldIds,
       fetchImpl,
     });
   } catch (err) {
     await audit({
-      notification_id: notificationId,
-      contact_id: input.contact_id,
-      status: input.status,
-      calendar_id: input.calendar_id,
-      appointment_title: input.appointment_title,
-      lp_source: input.lp_source,
-      lp_subsource: input.lp_subsource,
-      body: generated.text,
-      groupme_posted_at: groupmePostedAt,
+      ...baseAuditRow(),
+      email_body: generated.email_body,
+      sms_body: generated.sms_body,
       ghl_writeback_at: null,
       model_used: generated.model,
       data_gaps: context.data_gaps || null,
@@ -460,22 +392,15 @@ export async function runAppointmentNotification(input, deps = {}) {
       http_status: 502,
       error: `ghl_writeback_failed:${err.message}`,
       notification_id: notificationId,
-      groupme_posted: true,
     };
   }
   const ghlWritebackAt = new Date().toISOString();
 
-  // ─── Step 5: success audit ─────────────────────────────────────
+  // ─── Step 4: success audit ─────────────────────────────────────
   await audit({
-    notification_id: notificationId,
-    contact_id: input.contact_id,
-    status: input.status,
-    calendar_id: input.calendar_id,
-    appointment_title: input.appointment_title,
-    lp_source: input.lp_source,
-    lp_subsource: input.lp_subsource,
-    body: generated.text,
-    groupme_posted_at: groupmePostedAt,
+    ...baseAuditRow(),
+    email_body: generated.email_body,
+    sms_body: generated.sms_body,
     ghl_writeback_at: ghlWritebackAt,
     model_used: generated.model,
     data_gaps: context.data_gaps || null,
@@ -486,6 +411,7 @@ export async function runAppointmentNotification(input, deps = {}) {
   console.log(
     `[ApptNotif] ok notification=${notificationId} contact=${input.contact_id} ` +
       `status=${input.status} calendar=${input.calendar_id} title="${input.appointment_title}" ` +
+      `email_chars=${generated.email_body.length} sms_chars=${generated.sms_body.length} ` +
       `gaps=${(context.data_gaps || []).length} (${elapsed}ms)`,
   );
 
@@ -493,9 +419,9 @@ export async function runAppointmentNotification(input, deps = {}) {
     ok: true,
     http_status: 200,
     notification_id: notificationId,
-    body: generated.text,
+    email_body: generated.email_body,
+    sms_body: generated.sms_body,
     model: generated.model,
-    groupme_posted: true,
     ghl_writeback_success: true,
     data_gaps: context.data_gaps || [],
     latency_ms: elapsed,
@@ -568,7 +494,6 @@ export function registerAppointmentNotificationRoutes(app) {
           ok: false,
           error: result.error,
           notification_id: result.notification_id,
-          groupme_posted: !!result.groupme_posted,
         });
       }
 
@@ -577,7 +502,6 @@ export function registerAppointmentNotificationRoutes(app) {
         notification_id: result.notification_id,
         calendar_id: normalized.calendar_id,
         appointment_title: normalized.appointment_title,
-        groupme_posted: true,
         ghl_writeback_success: true,
         data_gaps: result.data_gaps,
         latency_ms: result.latency_ms,
@@ -589,10 +513,10 @@ export function registerAppointmentNotificationRoutes(app) {
   });
 
   // ─── POST /api/agentic/notifications/engagement ────────────────
-  // Companion endpoint stub. Future use: GroupMe webhook posts back
-  // when a rep acknowledges the alert (e.g. 👍 reaction) so we can
-  // close the loop on team-acknowledged events. v1 just records the
-  // event into agent_actions-style log without state transitions.
+  // Companion endpoint stub. Future use: GHL workflow posts back as
+  // the email or SMS internal_notification fires, and a separate
+  // mechanism reports team acknowledgement. v1 records the event
+  // shape but applies no state transitions.
   app.post('/api/agentic/notifications/engagement', async (req, res) => {
     const authCheck = checkBearerAuth(req);
     if (!authCheck.ok) {
@@ -606,7 +530,7 @@ export function registerAppointmentNotificationRoutes(app) {
     if (!notification_id) {
       return res.status(422).json({ ok: false, error: "'notification_id' is required" });
     }
-    const ALLOWED_EVENTS = ['groupme_posted', 'team_acknowledged'];
+    const ALLOWED_EVENTS = ['email_sent', 'sms_sent', 'team_acknowledged'];
     if (!ALLOWED_EVENTS.includes(event)) {
       return res.status(422).json({
         ok: false,
@@ -628,7 +552,7 @@ export function registerAppointmentNotificationRoutes(app) {
   });
 
   console.log(
-    '[REST API] Registered: POST /api/agentic/notifications/appointment (agentic appointment notifications v1)',
+    '[REST API] Registered: POST /api/agentic/notifications/appointment (agentic appointment notifications v2 — email+SMS via GHL)',
   );
   console.log(
     '[REST API] Registered: POST /api/agentic/notifications/engagement (appointment notification engagement stub v1)',
