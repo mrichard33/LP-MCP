@@ -32,8 +32,11 @@ import {
   enforceCharCap,
   stripMarkdown,
   extractJson,
+  formatApptDateTime,
   _internal as bodyInternal,
 } from '../src/notifications/appointment-body-generator.js';
+
+import { _internal as intelInternal, loadAppointmentContext } from '../src/notifications/appointment-intelligence.js';
 
 // ───────────────────────────────────────────────────────────────────
 // HELPERS
@@ -610,4 +613,239 @@ test('audit row on body-generation failure: bodies null, ghl_writeback_at null, 
   assert.equal(auditRow.sms_body, null);
   assert.equal(auditRow.ghl_writeback_at, null);
   assert.ok(/body_generation_failed/.test(auditRow.error));
+});
+
+// ───────────────────────────────────────────────────────────────────
+// DATE / TIME FORMATTER
+// ───────────────────────────────────────────────────────────────────
+
+const FORMATTER_CASES = [
+  ['2026-05-16', '6:00 PM', '05-16-2026 at 6:00 PM'],
+  ['2026-05-16', '18:00', '05-16-2026 at 6:00 PM'],
+  ['2026-05-16', '06:00:00', '05-16-2026 at 6:00 AM'],
+  ['5/16/2026', '6:00 PM', '05-16-2026 at 6:00 PM'],
+  ['2026-05-16', '', '05-16-2026'],
+  ['', '6:00 PM', '6:00 PM'],
+  ['', '', ''],
+  ['not-a-date', 'not-a-time', ''],
+];
+
+for (const [d, t, expected] of FORMATTER_CASES) {
+  test(`formatApptDateTime: date='${d}' time='${t}' -> '${expected}'`, () => {
+    assert.equal(formatApptDateTime(d, t), expected);
+  });
+}
+
+// ───────────────────────────────────────────────────────────────────
+// buildUserPrompt — dispatch-context labeled facts
+// ───────────────────────────────────────────────────────────────────
+
+function dispatchPayload(overrides = {}) {
+  return {
+    status: 'cancelled',
+    appointment_title: 'Window Estimate',
+    calendar_id: 'aJj14ONxh1oFyDcQ706O',
+    contact_id: 'y4dvOxt',
+    contact_first_name: 'Mark',
+    contact_last_name: 'Richard',
+    contact_phone: '(954) 508-1512',
+    contact_email: 'mfollen@icloud.com',
+    city: 'Delray Beach',
+    postal_code: '33484',
+    assigned_user: '',
+    start_date: '2026-05-16',
+    start_time: '6:00 PM',
+    lp_source: '',
+    lp_subsource: '',
+    ...overrides,
+  };
+}
+
+test('buildUserPrompt: formats timing via formatApptDateTime', () => {
+  const ctx = {
+    decoded_contact: { profile: { tags: [] }, custom_fields: {} },
+    lead_summary: { lead: { lp_prospect_id: '427375' }, recent: { calls: [], notes: [], activities: [] } },
+    timeline: [],
+    effective_source: 'Estimate Calculator',
+    effective_subsource: 'Estimate Calculator',
+    data_gaps: [],
+  };
+  const out = bodyInternal.buildUserPrompt({ payload: dispatchPayload(), context: ctx });
+  assert.match(out, /was:\s*05-16-2026 at 6:00 PM/);
+});
+
+test('buildUserPrompt: surfaces prospect_id from lead_summary', () => {
+  const ctx = {
+    decoded_contact: { profile: { tags: [] }, custom_fields: {} },
+    lead_summary: { lead: { lp_prospect_id: '427375' }, recent: { calls: [], notes: [], activities: [] } },
+    timeline: [],
+    effective_source: '',
+    effective_subsource: '',
+    data_gaps: [],
+  };
+  const out = bodyInternal.buildUserPrompt({ payload: dispatchPayload(), context: ctx });
+  assert.match(out, /prospect_id:\s*427375/);
+});
+
+test('buildUserPrompt: substitutes "(unknown)" when prospect_id is null', () => {
+  const ctx = {
+    decoded_contact: { profile: { tags: [] }, custom_fields: {} },
+    lead_summary: { lead: { lp_prospect_id: null }, recent: { calls: [], notes: [], activities: [] } },
+    timeline: [],
+    effective_source: '',
+    effective_subsource: '',
+    data_gaps: [],
+  };
+  const out = bodyInternal.buildUserPrompt({ payload: dispatchPayload(), context: ctx });
+  assert.match(out, /prospect_id:\s*\(unknown\)/);
+});
+
+test('buildUserPrompt: surfaces chat_transcript_tail, concern tags, pain_point', () => {
+  const ctx = {
+    decoded_contact: {
+      profile: { tags: ['concern-expressed:timing'] },
+      custom_fields: {
+        chatbot: [{ name: 'Chat Transcript', value: "A long transcript ending with: don't have the money for windows right now" }],
+        ai: [{ name: 'Pain Point', value: 'Clarity' }],
+      },
+    },
+    lead_summary: { lead: { lp_prospect_id: '427375' }, recent: { calls: [], notes: [], activities: [] } },
+    timeline: [],
+    effective_source: 'Estimate Calculator',
+    effective_subsource: 'Estimate Calculator',
+    data_gaps: [],
+  };
+  const out = bodyInternal.buildUserPrompt({ payload: dispatchPayload(), context: ctx });
+  assert.match(out, /chat_transcript_tail:.*money for windows right now/);
+  assert.match(out, /concern_signals:.*concern-expressed:timing/);
+  assert.match(out, /pain_point:\s*Clarity/);
+});
+
+test('buildUserPrompt: counts prior_cancellations and prior_reschedules from timeline + tags', () => {
+  const ctx = {
+    decoded_contact: { profile: { tags: ['appt-cancelled'] }, custom_fields: {} },
+    lead_summary: { lead: { lp_prospect_id: '427375', appointment_set: 2 }, recent: { calls: [], notes: [], activities: [] } },
+    timeline: [
+      { ts: '2026-05-14', type: 'event:appointment_rescheduled', summary: 'Appointment moved' },
+      { ts: '2026-05-13', type: 'event:appointment_cancelled', summary: 'Cancelled' },
+    ],
+    effective_source: '',
+    effective_subsource: '',
+    data_gaps: [],
+  };
+  const out = bodyInternal.buildUserPrompt({ payload: dispatchPayload(), context: ctx });
+  assert.match(out, /prior_cancellations:\s*[12]/);
+  assert.match(out, /prior_reschedules:\s*1/);
+});
+
+test('buildUserPrompt: rescheduled payload emits both was: and new: formatted lines', () => {
+  const ctx = {
+    decoded_contact: { profile: { tags: [] }, custom_fields: {} },
+    lead_summary: { lead: { lp_prospect_id: '427375' }, recent: { calls: [], notes: [], activities: [] } },
+    timeline: [],
+    effective_source: '',
+    effective_subsource: '',
+    data_gaps: [],
+  };
+  const out = bodyInternal.buildUserPrompt({
+    payload: dispatchPayload({
+      status: 'rescheduled',
+      start_date: '2026-05-18',
+      start_time: '6:00 PM',
+      previous_start_date: '2026-05-15',
+      previous_start_time: '10:00 AM',
+    }),
+    context: ctx,
+  });
+  assert.match(out, /was:\s*05-15-2026 at 10:00 AM/);
+  assert.match(out, /new:\s*05-18-2026 at 6:00 PM/);
+});
+
+// ───────────────────────────────────────────────────────────────────
+// LP SOURCE FALLBACK — loadAppointmentContext effective_source resolution
+// ───────────────────────────────────────────────────────────────────
+
+test('loadAppointmentContext: falls back to LP lead_source when payload source is empty', async () => {
+  const ctx = await loadAppointmentContext({
+    contact_id: 'gC1',
+    lp_source: '',
+    lp_subsource: '',
+    _deps: {
+      loadDecodedContact: async () => ({
+        profile: { id: 'gC1', name: 'Test', tags: [] },
+        custom_fields: {},
+      }),
+      loadLeadSummary: async () => ({
+        lead: {
+          lp_lead_id: 'L1',
+          lp_prospect_id: '123',
+          lead_source: 'Canvass',
+          lead_source_detail: 'Door-to-Door',
+        },
+        recent: { calls: [], notes: [], activities: [] },
+      }),
+      loadContactTimeline: async () => [],
+      loadSourceAnalytics: async (src, sub) => ({
+        matched_on: 'source',
+        source: src,
+        subsource: sub,
+        total_leads: 10,
+        closed_won: 2,
+        close_rate_pct: 20,
+        total_revenue: 30000,
+      }),
+    },
+  });
+
+  assert.equal(ctx.effective_source, 'Canvass');
+  assert.equal(ctx.effective_subsource, 'Door-to-Door');
+  assert.ok(
+    ctx.data_gaps.includes('source_resolved_from:lp_fallback'),
+    `expected source_resolved_from:lp_fallback in data_gaps: ${JSON.stringify(ctx.data_gaps)}`,
+  );
+  // Retry populated source_analytics using the LP-resolved source.
+  assert.ok(ctx.source_analytics);
+  assert.equal(ctx.source_analytics.source, 'Canvass');
+});
+
+test('loadAppointmentContext: keeps payload source when present, no fallback', async () => {
+  const ctx = await loadAppointmentContext({
+    contact_id: 'gC1',
+    lp_source: 'facebook_ad',
+    lp_subsource: 'windows_jan',
+    _deps: {
+      loadDecodedContact: async () => ({ profile: { id: 'gC1', tags: [] }, custom_fields: {} }),
+      loadLeadSummary: async () => ({
+        lead: { lp_lead_id: 'L1', lead_source: 'Canvass', lead_source_detail: 'Door-to-Door' },
+        recent: { calls: [], notes: [], activities: [] },
+      }),
+      loadContactTimeline: async () => [],
+      loadSourceAnalytics: async () => null,
+    },
+  });
+
+  assert.equal(ctx.effective_source, 'facebook_ad');
+  assert.equal(ctx.effective_subsource, 'windows_jan');
+  assert.ok(!ctx.data_gaps.includes('source_resolved_from:lp_fallback'));
+});
+
+test('loadAppointmentContext: no fallback when LP lead_source also empty', async () => {
+  const ctx = await loadAppointmentContext({
+    contact_id: 'gC1',
+    lp_source: '',
+    lp_subsource: '',
+    _deps: {
+      loadDecodedContact: async () => ({ profile: { id: 'gC1', tags: [] }, custom_fields: {} }),
+      loadLeadSummary: async () => ({
+        lead: { lp_lead_id: 'L1', lead_source: '', lead_source_detail: '' },
+        recent: { calls: [], notes: [], activities: [] },
+      }),
+      loadContactTimeline: async () => [],
+      loadSourceAnalytics: async () => null,
+    },
+  });
+
+  assert.equal(ctx.effective_source, null);
+  assert.equal(ctx.effective_subsource, null);
+  assert.ok(!ctx.data_gaps.includes('source_resolved_from:lp_fallback'));
 });
