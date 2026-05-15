@@ -24,8 +24,15 @@
  *      The ready flip is the atomic gate. If Call 1 fails, Call 2
  *      is never attempted — the gate stays unflipped and the GHL
  *      workflow's 30-min timeout fires the fallback.
- *   5. Log to lp_agentic_notifications on every path.
- *   6. 200 on success, non-200 on failure. NEVER flip the gate on
+ *   5. Schedule a fire-and-forget tag poke (add + remove a no-op tag)
+ *      ~2s after writeback. GHL Wait-for-Condition steps don't
+ *      reliably re-evaluate when watched fields change via API PUT;
+ *      tag-change events DO fire workflow re-evaluation. The poke
+ *      forces the wait step to re-check, see ready="Yes", and advance.
+ *      Tag used: `notif-ready-poke`. No agent rule or workflow trigger
+ *      should key on this tag.
+ *   6. Log to lp_agentic_notifications on every path.
+ *   7. 200 on success, non-200 on failure. NEVER flip the gate on
  *      a non-200 response.
  *
  * Feature flag: ENABLE_ENHANCED_APPT_NOTIFICATIONS=false → endpoint
@@ -74,6 +81,20 @@ const RESCHEDULED_EXTRA_REQUIRED = ['previous_start_time', 'previous_start_date'
 const GHL_BASE = 'https://services.leadconnectorhq.com';
 const GHL_TIMEOUT_MS = parseInt(
   process.env.APPT_NOTIFICATION_GHL_TIMEOUT_MS || '10000',
+  10,
+);
+
+// Tag used to force GHL workflow re-evaluation after the writeback.
+// Add + remove fires two tag-change events; the wait-for-condition
+// step picks up the events and re-checks the ready field.
+const READY_POKE_TAG = 'notif-ready-poke';
+
+// Delay before firing the poke. Long enough for the GHL webhook
+// response (200) to land and the contact to advance into the wait
+// step before the tag-change event arrives. 2s is conservative —
+// the webhook RTT itself is typically <500ms once we return.
+const READY_POKE_DELAY_MS = parseInt(
+  process.env.APPT_NOTIFICATION_POKE_DELAY_MS || '2000',
   10,
 );
 
@@ -219,6 +240,65 @@ async function ghlPutContact(contactId, customFields, { fetchImpl = fetch } = {}
 }
 
 /**
+ * Tag poke — adds then removes a no-op tag to fire two contact-change
+ * events. GHL Wait-for-Condition steps don't always pick up custom
+ * field updates from API PUTs, but they DO pick up tag changes.
+ * Fire-and-forget; failures are logged but never bubble up.
+ *
+ * Add and remove are sequential to ensure the contact's final state
+ * has the tag REMOVED (no lingering noise). Each call is wrapped in
+ * its own try/catch so a remove failure doesn't leave the tag in
+ * place silently — it logs.
+ */
+async function ghlPokeTag(contactId, tag, { fetchImpl = fetch } = {}) {
+  const apiKey = process.env.GHL_API_KEY || '';
+  if (!apiKey) {
+    console.warn('[ApptNotif] tag poke skipped: GHL_API_KEY not configured');
+    return;
+  }
+  const headers = {
+    Authorization: `Bearer ${apiKey}`,
+    Version: '2021-07-28',
+    'Content-Type': 'application/json',
+  };
+  // Add the tag — this is the event that triggers wait re-evaluation.
+  try {
+    const addRes = await fetchImpl(`${GHL_BASE}/contacts/${contactId}/tags`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ tags: [tag] }),
+      signal: AbortSignal.timeout(GHL_TIMEOUT_MS),
+    });
+    if (!addRes.ok) {
+      const errText = await addRes.text().catch(() => '');
+      console.warn(
+        `[ApptNotif] tag poke add failed contact=${contactId} status=${addRes.status} ${errText.slice(0, 200)}`,
+      );
+    }
+  } catch (err) {
+    console.warn(`[ApptNotif] tag poke add threw contact=${contactId}: ${err.message}`);
+    return; // don't try remove if add never happened
+  }
+  // Remove the tag — keeps the contact state clean.
+  try {
+    const rmRes = await fetchImpl(`${GHL_BASE}/contacts/${contactId}/tags`, {
+      method: 'DELETE',
+      headers,
+      body: JSON.stringify({ tags: [tag] }),
+      signal: AbortSignal.timeout(GHL_TIMEOUT_MS),
+    });
+    if (!rmRes.ok) {
+      const errText = await rmRes.text().catch(() => '');
+      console.warn(
+        `[ApptNotif] tag poke remove failed contact=${contactId} status=${rmRes.status} ${errText.slice(0, 200)}`,
+      );
+    }
+  } catch (err) {
+    console.warn(`[ApptNotif] tag poke remove threw contact=${contactId}: ${err.message}`);
+  }
+}
+
+/**
  * Strict-order GHL writeback. The ready flip is in a SEPARATE second
  * PUT — non-negotiable per the build spec, because the GHL workflow's
  * wait-for-condition step reads ready and immediately advances when
@@ -227,10 +307,13 @@ async function ghlPutContact(contactId, customFields, { fetchImpl = fetch } = {}
  * Step layout:
  *   1) PUT body + sms + id  (one call, three fields)
  *   2) PUT ready=Yes        (separate call, single field — the gate)
+ *   3) Schedule fire-and-forget tag poke (~2s later) to force GHL
+ *      workflow re-evaluation. See ghlPokeTag for rationale.
  *
  * If Call 1 throws, this function re-throws and Call 2 is never
  * attempted. Tests assert this by asserting the recorded mock-fetch
- * call count and field shape.
+ * call count and field shape. The tag poke is scheduled AFTER both
+ * PUTs succeed; a poke failure never affects the writeback contract.
  */
 export async function writeBackToGhl({
   contactId,
@@ -266,6 +349,20 @@ export async function writeBackToGhl({
     { fetchImpl },
   );
   if (hooks.onReadyFlipped) await hooks.onReadyFlipped();
+
+  // ─── Step 3: fire-and-forget tag poke to force wait re-evaluation
+  // Delayed so the GHL webhook response lands first and the contact
+  // is sitting in the wait-for-condition step when the tag event
+  // arrives. Wrapped in setTimeout (not awaited) — the writeback
+  // contract is already satisfied. Errors are logged inside ghlPokeTag.
+  if (hooks.skipPoke !== true) {
+    setTimeout(() => {
+      ghlPokeTag(contactId, READY_POKE_TAG, { fetchImpl }).catch((err) => {
+        console.warn(`[ApptNotif] tag poke scheduling error contact=${contactId}: ${err.message}`);
+      });
+    }, READY_POKE_DELAY_MS);
+    if (hooks.onPokeScheduled) await hooks.onPokeScheduled();
+  }
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -564,7 +661,10 @@ export function registerAppointmentNotificationRoutes(app) {
 export const _internal = {
   resolveGhlFieldIds,
   ghlPutContact,
+  ghlPokeTag,
   isFeatureEnabled,
   checkBearerAuth,
   logAudit,
+  READY_POKE_TAG,
+  READY_POKE_DELAY_MS,
 };
