@@ -104,6 +104,30 @@ function parseFlexibleDateToUTC(raw) {
     return localNYToUTC(year, monthIdx, day, hour, minute);
   }
 
+  // ISO date + 12-hour AM/PM time (e.g. "2026-05-18 6:00 PM" — produced by
+  // concatenating GHL contact.last_appointment_start_date + start_time)
+  const isoDateAmPm = s.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+  if (isoDateAmPm) {
+    const year = Number(isoDateAmPm[1]);
+    const monthIdx = Number(isoDateAmPm[2]) - 1;
+    const day = Number(isoDateAmPm[3]);
+    let hour = Number(isoDateAmPm[4]);
+    const minute = Number(isoDateAmPm[5]);
+    const ampm = isoDateAmPm[6].toUpperCase();
+    if (ampm === 'PM' && hour !== 12) hour += 12;
+    if (ampm === 'AM' && hour === 12) hour = 0;
+    return localNYToUTC(year, monthIdx, day, hour, minute);
+  }
+
+  // ISO date + 24-hour time (e.g. "2026-05-18 18:00")
+  const isoDate24 = s.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})$/);
+  if (isoDate24) {
+    return localNYToUTC(
+      Number(isoDate24[1]), Number(isoDate24[2]) - 1, Number(isoDate24[3]),
+      Number(isoDate24[4]), Number(isoDate24[5])
+    );
+  }
+
   const dateOnly = s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
   if (dateOnly) {
     return localNYToUTC(Number(dateOnly[3]), Number(dateOnly[1]) - 1, Number(dateOnly[2]), 12, 0);
@@ -141,13 +165,48 @@ async function handleTimeToAppointment(req, res) {
   try {
     const body = req.body || {};
     const contactId = body.contact_id || body.contactId || '';
-    const apptStartRaw = body.appointment_start || body.appointmentStart || body.start_time || body.startTime || '';
+
+    // Accept full datetime in any of these keys
+    let apptStartRaw = String(
+      body.appointment_start || body.appointmentStart ||
+      body.start_time || body.startTime || ''
+    ).trim();
+
+    // FALLBACK: reconstruct from separate date + time fields. This works around
+    // GHL standard `webhook` action not resolving multiple merge tags in a single
+    // customData value (e.g. "{{contact.last_appointment_start_date}} {{contact.last_appointment_start_time}}"
+    // arrives empty). Sending the two tokens as separate customData keys avoids that.
+    if (!apptStartRaw) {
+      const apptDate = String(
+        body.appointment_date || body.appointmentDate ||
+        body.last_appointment_start_date || ''
+      ).trim();
+      const apptTime = String(
+        body.appointment_time || body.appointmentTime ||
+        body.last_appointment_start_time || ''
+      ).trim();
+      if (apptDate && apptTime) {
+        apptStartRaw = `${apptDate} ${apptTime}`;
+      } else if (apptDate) {
+        apptStartRaw = apptDate;
+      }
+    }
 
     if (!contactId) {
       return res.status(400).json({ success: false, error: 'Missing contact_id' });
     }
     if (!apptStartRaw) {
-      return res.status(400).json({ success: false, error: 'Missing appointment_start', contact_id: contactId });
+      // DIAGNOSTIC: echo received body and log so we can see what GHL actually sent.
+      console.error('[n8n/time-to-appointment] Missing appointment_start | content-type=' +
+        (req.headers['content-type'] || 'unset') + ' | body=' + JSON.stringify(body));
+      return res.status(400).json({
+        success: false,
+        error: 'Missing appointment_start',
+        contact_id: contactId,
+        body_received: body,
+        content_type_received: req.headers['content-type'] || 'unset',
+        hint: 'Send appointment_start as a full datetime, OR send appointment_date + appointment_time as separate customData keys.'
+      });
     }
 
     const apptUTC = parseFlexibleDateToUTC(apptStartRaw);
