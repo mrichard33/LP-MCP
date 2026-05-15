@@ -29,12 +29,28 @@
 import supabase from '../supabase.js';
 import { getGHLContact } from '../ghl.js';
 import { decodeFields } from '../ghl-field-decoder.js';
+import { getLead as lpGetLead, getCustomers3 as lpGetCustomers3 } from '../lp-client.js';
+import { extractArray, getField } from '../sync-utils.js';
 
 const DEFAULT_TIMEOUT_MS = parseInt(
   process.env.APPT_NOTIFICATION_CONTEXT_TIMEOUT_MS || '4000',
   10
 );
 const TIMELINE_LIMIT = 10;
+
+const LP_API_SOURCE_LOOKUP_TIMEOUT_MS = 2500;
+const SOURCE_ANALYTICS_RETRY_TIMEOUT_MS = 1500;
+
+// Priority-ordered list of GHL custom-field source pairs to walk for
+// Tier 2 resolution. Both fields in a pair must carry non-empty values
+// for the pair to be accepted. Order matters: LP-attributed pair first
+// (highest fidelity), then generic source fields, then first-touch
+// attribution.
+const GHL_SOURCE_PAIRS = [
+  { source: 'LP Source',             subsource: 'LP Subsource' },
+  { source: 'Source Category',       subsource: 'Source Subcategory' },
+  { source: 'First Source Category', subsource: 'First Source Subcategory' },
+];
 
 /**
  * Race a promise against a timeout that rejects with a tagged error so
@@ -307,6 +323,127 @@ async function loadSourceAnalytics(lp_source, lp_subsource) {
 }
 
 /**
+ * Walk every category of decoded_contact.custom_fields and find the
+ * first complete source-pair from GHL_SOURCE_PAIRS. A pair is "complete"
+ * when both the source field and the subsource field exist on the
+ * contact AND both have non-empty trimmed string values.
+ *
+ * Returns { source, subsource, matched_pair_name } or null when no
+ * complete pair is found.
+ */
+function findGhlSourcePair(decodedContact) {
+  if (!decodedContact?.custom_fields) return null;
+  const byName = {};
+  for (const category of Object.values(decodedContact.custom_fields)) {
+    if (!Array.isArray(category)) continue;
+    for (const field of category) {
+      if (!field?.name) continue;
+      const val = String(field.value ?? '').trim();
+      if (val) byName[field.name] = val;
+    }
+  }
+  for (const pair of GHL_SOURCE_PAIRS) {
+    const src = byName[pair.source];
+    const sub = byName[pair.subsource];
+    if (src && sub) {
+      return {
+        source: src,
+        subsource: sub,
+        matched_pair_name: `${pair.source}/${pair.subsource}`,
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Look up a custom field by name across every category of a decoded
+ * contact. Returns the string value (trimmed) or null when absent.
+ */
+function findGhlCustomField(decodedContact, fieldName) {
+  if (!decodedContact?.custom_fields) return null;
+  for (const category of Object.values(decodedContact.custom_fields)) {
+    if (!Array.isArray(category)) continue;
+    for (const field of category) {
+      if (field?.name === fieldName) {
+        const val = String(field.value ?? '').trim();
+        if (val) return val;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Pull source + subsource from an LP record using the same field
+ * mapping that sync-leads.js applies when populating lp_leads.lead_source
+ * and lp_leads.lead_source_detail. The point of this fallback is to
+ * surface what would have been in lp_leads if the sync had run already
+ * — so the field names MUST match sync-leads.js exactly.
+ *
+ * LP responses from getLead / getCustomers3 are arrays of prospects;
+ * each prospect carries its source on the nested `leads` records.
+ * Walk leads first, then fall back to top-level prospect fields just
+ * in case a flattened shape arrives.
+ *
+ * Returns { source, subsource } or null.
+ */
+function extractSourceFromLpRecord(lpRecord) {
+  if (!lpRecord) return null;
+
+  const leads = getField(lpRecord, 'leads', 'Leads');
+  if (Array.isArray(leads) && leads.length) {
+    for (const lead of leads) {
+      const src = getField(lead, 'source', 'Source');
+      const sub = getField(lead, 'sourcesubdescr', 'SourceSubDescr');
+      if (src && String(src).trim()) {
+        return {
+          source: String(src).trim(),
+          subsource: sub ? String(sub).trim() : null,
+        };
+      }
+    }
+  }
+
+  const src = getField(lpRecord, 'source', 'Source');
+  const sub = getField(lpRecord, 'sourcesubdescr', 'SourceSubDescr');
+  if (src && String(src).trim()) {
+    return {
+      source: String(src).trim(),
+      subsource: sub ? String(sub).trim() : null,
+    };
+  }
+  return null;
+}
+
+/**
+ * Tier 3 path A — direct LP fetch by prospect ID. Returns
+ * { source, subsource } or null. Quiet on failure: callers attribute
+ * the gap via data_gaps.
+ */
+async function lookupSourceByProspectId(prospectId) {
+  if (!prospectId) return null;
+  const result = await lpGetLead(prospectId);
+  const prospects = extractArray(result);
+  if (!prospects.length) return null;
+  return extractSourceFromLpRecord(prospects[0]);
+}
+
+/**
+ * Tier 3 path B — LP search by phone (last-10 digits). Returns
+ * { source, subsource } or null.
+ */
+async function lookupSourceByPhone(phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (digits.length < 10) return null;
+  const last10 = digits.slice(-10);
+  const result = await lpGetCustomers3({ phone: last10 });
+  const prospects = extractArray(result);
+  if (!prospects.length) return null;
+  return extractSourceFromLpRecord(prospects[0]);
+}
+
+/**
  * Main entrypoint.
  *
  * Runs all sources in parallel with a 4s total cap. Any source that
@@ -334,6 +471,8 @@ export async function loadAppointmentContext({
     loadContactTimeline: _deps?.loadContactTimeline || loadContactTimeline,
     loadSourceAnalytics: _deps?.loadSourceAnalytics || loadSourceAnalytics,
     lookupProspectByPhone: _deps?.lookupProspectByPhone || lookupProspectByPhone,
+    lookupSourceByProspectId: _deps?.lookupSourceByProspectId || lookupSourceByProspectId,
+    lookupSourceByPhone: _deps?.lookupSourceByPhone || lookupSourceByPhone,
   };
 
   const data_gaps = [];
@@ -390,37 +529,95 @@ export async function loadAppointmentContext({
     ctx[r.kind] = r.value ?? null;
   }
 
-  // ─── Effective source resolution with LP fallback ──────────────
+  // ─── Effective source resolution chain ─────────────────────────
   // Payload `lp_source`/`lp_subsource` come from GHL merge tags and
-  // are sometimes empty even when the LP record has a known source.
-  // When both payload fields are empty AND the LP record carries a
-  // `lead_source`, fall back to it and retry the close-rate aggregate
-  // using the resolved value.
+  // are often empty even when the contact has a known source elsewhere.
+  // When the payload is empty, walk three fallback tiers in order:
+  //   Tier 1: lp_leads cache (already loaded above)
+  //   Tier 2: GHL contact custom-field source-pair (e.g. Source
+  //           Category / Source Subcategory)
+  //   Tier 3: LP API direct lookup, by prospect ID then by phone.
+  // After the chain settles, retry close-rate analytics if any tier
+  // resolved a source.
   const payloadSource = String(lp_source || '').trim();
   const payloadSubsource = String(lp_subsource || '').trim();
   let effective_source = payloadSource || null;
   let effective_subsource = payloadSubsource || null;
 
-  if (!payloadSource && !payloadSubsource) {
+  // Tier 1 — LP cache (lp_leads) fallback.
+  if (!effective_source && !effective_subsource) {
     const lpSource = String(ctx.lead_summary?.lead?.lead_source || '').trim();
     const lpSubsource = String(ctx.lead_summary?.lead?.lead_source_detail || '').trim();
     if (lpSource) {
       effective_source = lpSource;
       effective_subsource = lpSubsource || null;
       ctx.data_gaps.push('source_resolved_from:lp_fallback');
+    }
+  }
 
-      if (!ctx.source_analytics) {
-        try {
-          const retried = await withTimeout(
-            loaders.loadSourceAnalytics(effective_source, effective_subsource),
-            1500,
-            'source_analytics_retry',
-          );
-          ctx.source_analytics = retried ?? null;
-        } catch (err) {
-          ctx.data_gaps.push(`source_analytics_retry:${err.message}`);
-        }
+  // Tier 2 — walk GHL custom fields for a complete source-pair.
+  if (!effective_source && !effective_subsource) {
+    const ghlPair = findGhlSourcePair(ctx.decoded_contact);
+    if (ghlPair) {
+      effective_source = ghlPair.source;
+      effective_subsource = ghlPair.subsource;
+      ctx.data_gaps.push(
+        `source_resolved_from:ghl_custom_field:${ghlPair.matched_pair_name}`,
+      );
+    }
+  }
+
+  // Tier 3 — LP API direct lookup. Path A by prospect ID (from the GHL
+  // "LP Prospect ID" custom field), Path B by phone. Both bounded at
+  // 2.5s and quiet on failure.
+  if (!effective_source && !effective_subsource) {
+    const prospectIdFromGhl = findGhlCustomField(ctx.decoded_contact, 'LP Prospect ID');
+    const phoneDigits = String(contact_phone || '').replace(/\D/g, '').slice(-10);
+
+    let lookupMode = null;
+    let extracted = null;
+
+    try {
+      if (prospectIdFromGhl) {
+        extracted = await withTimeout(
+          loaders.lookupSourceByProspectId(prospectIdFromGhl),
+          LP_API_SOURCE_LOOKUP_TIMEOUT_MS,
+          'source_lookup_lp_api',
+        );
+        lookupMode = 'by_prospect_id';
+      } else if (phoneDigits.length === 10) {
+        extracted = await withTimeout(
+          loaders.lookupSourceByPhone(phoneDigits),
+          LP_API_SOURCE_LOOKUP_TIMEOUT_MS,
+          'source_lookup_lp_api',
+        );
+        lookupMode = 'by_phone';
       }
+    } catch (err) {
+      const detail = String(err?.message || 'unknown').slice(0, 80);
+      ctx.data_gaps.push(`source_lookup_lp_api_failed:${detail}`);
+    }
+
+    if (extracted?.source) {
+      effective_source = extracted.source;
+      effective_subsource = extracted.subsource || null;
+      ctx.data_gaps.push(`source_resolved_from:lp_api:${lookupMode}`);
+    }
+  }
+
+  // After the entire Tier-1-through-Tier-3 chain settles, retry the
+  // close-rate analytics with whatever source resolved. Skip when the
+  // initial parallel load already populated it.
+  if (effective_source && !ctx.source_analytics) {
+    try {
+      const retried = await withTimeout(
+        loaders.loadSourceAnalytics(effective_source, effective_subsource),
+        SOURCE_ANALYTICS_RETRY_TIMEOUT_MS,
+        'source_analytics_retry',
+      );
+      ctx.source_analytics = retried ?? null;
+    } catch (err) {
+      ctx.data_gaps.push(`source_analytics_retry:${err.message}`);
     }
   }
 
@@ -482,5 +679,11 @@ export const _internal = {
   loadContactTimeline,
   loadSourceAnalytics,
   lookupProspectByPhone,
+  lookupSourceByProspectId,
+  lookupSourceByPhone,
+  findGhlSourcePair,
+  findGhlCustomField,
+  extractSourceFromLpRecord,
   withTimeout,
+  GHL_SOURCE_PAIRS,
 };
