@@ -324,6 +324,7 @@ export async function runAppointmentNotification(input, deps = {}) {
   try {
     context = await loadContext({
       contact_id: input.contact_id,
+      contact_phone: input.contact_phone,
       lp_source: input.lp_source,
       lp_subsource: input.lp_subsource,
     });

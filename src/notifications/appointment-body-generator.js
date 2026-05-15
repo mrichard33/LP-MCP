@@ -68,8 +68,8 @@ Use this exact section layout, in this order. Newlines separate blocks; blank li
   Drop any segment whose value is empty. If phone is empty, drop the entire phone segment including the icon. Same for email, city, postal. If the city/postal line becomes empty, drop the whole line.
 
 [ID block — 1 line]
-  🆔 Prospect {prospect_id}   Contact {contact_id}
-  When prospect_id is "(unknown)" or empty, write "🆔 Contact {contact_id}" only.
+  🆔 Prospect {prospect_id}   GHL ID {contact_id}
+  When prospect_id is "(unknown)" or empty, write "🆔 GHL ID {contact_id}" only.
 
 [Timing block]
   Cancelled:
@@ -136,27 +136,28 @@ Four short lines max. Drop fields gracefully when missing.
 
 Cancelled template:
   ❌ APPT CANCELLED — {first} {last} ({phone})
-  Prospect {prospect_id} | {appt_title} {formatted_was}
+  Prospect {prospect_id} | GHL ID {contact_id} | {appt_title} {formatted_was}
   Reason: {≤80-char plain-English summary of why}
   Action: {≤90-char compressed version of the WHAT TO DO heuristic}
 
 Rescheduled template:
   🔄 APPT RESCHEDULED — {first} {last} ({phone})
-  Prospect {prospect_id} | {appt_title}
+  Prospect {prospect_id} | GHL ID {contact_id} | {appt_title}
   {formatted_was} → {formatted_now}
   Action: {≤90-char compressed action}
 
 Rules:
 - When phone empty, drop "({phone})".
-- When prospect_id is "(unknown)", drop "Prospect {prospect_id} | ".
+- When prospect_id is "(unknown)", drop "Prospect {prospect_id} | " but ALWAYS keep "GHL ID {contact_id}".
+- GHL ID is mandatory on every SMS so reps can paste it into a contact lookup.
 - If total exceeds 300, trim the Reason line to a few words (still meaningful: "Budget" / "Timing" / "Pattern of cancellations"), then trim Action if still over.
 
 ═══════════════════════════════════════════════════════════
 JSON OUTPUT FORMAT
 ═══════════════════════════════════════════════════════════
 {
-  "email_body": "❌ APPOINTMENT CANCELLED — Mark Richard\\n\\n📞 (954) 508-1512   ✉️ mfollen@icloud.com\\n📍 Delray Beach, 33484\\n🆔 Prospect 427375   Contact y4dvOxtWW12xGrBavCUt\\n\\n📅 Was: 05-16-2026 at 6:00 PM (Window Estimate)\\n🧭 Source: Estimate Calculator → Estimate Calculator\\n👤 Rep on file: Mark Richard\\n\\nWHY CANCELLED:\\nThe customer cited budget concerns ('don't have the money for windows right now') combined with a timing objection already on file. This is their second cancellation in the past week — the prior appointment was rescheduled before being cancelled outright.\\n\\nLEAD CONTEXT:\\n- Never had an in-home estimate completed\\n- Active over the past 4 days (chatbot, two appointments booked then cancelled)\\n- Came in through the online estimate calculator\\n\\nWHAT TO DO:\\nCall within 24 hours to confirm the budget concern. If they're genuinely priced out today, offer to add them to a 90-day follow-up list and ask permission to send financing-option information. Do not push for a same-day rebook.",
-  "sms_body": "❌ APPT CANCELLED — Mark Richard (954) 508-1512\\nProspect 427375 | Window Estimate 05-16-2026 at 6:00 PM\\nReason: Budget + timing (2nd cancellation in a week)\\nAction: Call w/in 24h. Don't push rebook. Offer 90-day FU + financing."
+  "email_body": "❌ APPOINTMENT CANCELLED — Mark Richard\\n\\n📞 (954) 508-1512   ✉️ mfollen@icloud.com\\n📍 Delray Beach, 33484\\n🆔 Prospect 427375   GHL ID y4dvOxtWW12xGrBavCUt\\n\\n📅 Was: 05-16-2026 at 6:00 PM (Window Estimate)\\n🧭 Source: Estimate Calculator → Estimate Calculator\\n👤 Rep on file: Mark Richard\\n\\nWHY CANCELLED:\\nThe customer cited budget concerns ('don't have the money for windows right now') combined with a timing objection already on file. This is their second cancellation in the past week — the prior appointment was rescheduled before being cancelled outright.\\n\\nLEAD CONTEXT:\\n- Never had an in-home estimate completed\\n- Active over the past 4 days (chatbot, two appointments booked then cancelled)\\n- Came in through the online estimate calculator\\n\\nWHAT TO DO:\\nCall within 24 hours to confirm the budget concern. If they're genuinely priced out today, offer to add them to a 90-day follow-up list and ask permission to send financing-option information. Do not push for a same-day rebook.",
+  "sms_body": "❌ APPT CANCELLED — Mark Richard (954) 508-1512\\nProspect 427375 | GHL ID y4dvOxtWW12xGrBavCUt | Window Estimate 05-16-2026 at 6:00 PM\\nReason: Budget + timing (2nd cancellation in a week)\\nAction: Call w/in 24h. Don't push rebook. Offer 90-day FU + financing."
 }
 
 Return ONLY the JSON object.`;
@@ -273,11 +274,8 @@ function buildUserPrompt({ payload, context }) {
 
   // ─── Contact ────────────────────────────────────────────────────
   const lead = context?.lead_summary?.lead || {};
-  const prospectIdRaw = lead.lp_prospect_id;
   const prospectId =
-    prospectIdRaw === null || prospectIdRaw === undefined || String(prospectIdRaw).trim() === ''
-      ? '(unknown)'
-      : String(prospectIdRaw).trim();
+    String(context?.resolved_prospect_id ?? '').trim() || '(unknown)';
 
   lines.push('CONTACT:');
   lines.push(`  name:        ${payload.contact_first_name || ''} ${payload.contact_last_name || ''}`.trimEnd());
