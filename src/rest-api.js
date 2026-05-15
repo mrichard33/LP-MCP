@@ -17,6 +17,8 @@
  *   POST /api/agentic/dynamic-callback-message   — AI-generated SMS for HDL.2 (no auth)
  *   POST /api/agentic/nurture/generate           — Outbound nurture generator (S4.5 v2)
  *   POST /api/agentic/messages/engagement        — Email engagement events (§12.3)
+ *   POST /api/agentic/notifications/appointment  — Calendar-agnostic GroupMe alerts (cancelled/rescheduled, v1)
+ *   POST /api/agentic/notifications/engagement   — Notification engagement stub (v1)
  *   POST /webhook/ghl-event                      — GHL→Agentic handoff (Webhook Bridge, no auth)
  */
 
@@ -25,6 +27,7 @@ import crypto from 'crypto';
 import { registerCallbackMessageRoutes } from './agentic-callback-message.js';
 import { registerNurtureRoutes } from './nurture/nurture-orchestrator.js';
 import { registerEngagementRoutes } from './nurture/nurture-engagement.js';
+import { registerAppointmentNotificationRoutes } from './notifications/appointment-notifications.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // WEBHOOK SIGNATURE VERIFICATION (optional but recommended)
@@ -357,6 +360,28 @@ export function registerRestApiRoutes(app, authenticate) {
   // calibration, story-arc deployment validation). Always 200.
   // See src/nurture/nurture-engagement.js for the contract.
   registerEngagementRoutes(app);
+
+  // ═══════════════════════════════════════════════════════════════
+  // POST /api/agentic/notifications/appointment — GroupMe alerts
+  // ═══════════════════════════════════════════════════════════════
+  // Calendar-agnostic endpoint that any GHL appointment workflow can
+  // fire the same Layer-3 webhook config at. Pulls per-contact LIVE
+  // intelligence from LP MCP services + aggregate analytics from
+  // Supabase, generates a GroupMe-styled team message via Claude,
+  // posts to the Reece Sales Board GroupMe bot FIRST, then writes
+  // back to GHL in strict order (body+id, then team_notification_ready
+  // = Yes as the final atomic gate). The GHL workflow's wait-for-
+  // condition step reads team_notification_ready and proceeds; a
+  // 30-minute timeout fires the fallback branch when this endpoint
+  // fails for any reason.
+  //
+  // v1 whitelist: status ∈ { cancelled, rescheduled }. Adding more
+  // statuses (booked, confirmed) is a one-line change to
+  // ENABLED_NOTIFICATION_STATUSES in notifications/appointment-
+  // notifications.js. Feature-flagged via
+  // ENABLE_ENHANCED_APPT_NOTIFICATIONS env var (returns 503 when not
+  // 'true' so the workflow timeout fires the fallback).
+  registerAppointmentNotificationRoutes(app);
 
   // ─── GET /api/prospects/:prospectId ────────────────────────────
   // Returns all leads for an LP prospect (cst_id)
