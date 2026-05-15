@@ -1096,3 +1096,438 @@ test('Tier 3: skipped when no contact_phone provided', async () => {
   assert.equal(ctx.resolved_prospect_id, null);
   assert.equal(phoneLookupCalls, 0);
 });
+
+// ───────────────────────────────────────────────────────────────────
+// SOURCE RESOLUTION — Tier 2 (GHL custom field) + Tier 3 (LP API)
+// ───────────────────────────────────────────────────────────────────
+
+// Base _deps that returns no usable Tier 1 data — used as the starting
+// point for every Tier 2 / Tier 3 case below.
+function noTier1Deps(overrides = {}) {
+  return {
+    loadDecodedContact: overrides.loadDecodedContact || (async () => ({
+      profile: { id: 'gC1', tags: [] },
+      custom_fields: {},
+    })),
+    loadLeadSummary: overrides.loadLeadSummary || (async () => ({
+      lead: { lp_lead_id: 'L1', lp_prospect_id: null, lead_source: '', lead_source_detail: '' },
+      recent: { calls: [], notes: [], activities: [] },
+    })),
+    loadContactTimeline: async () => [],
+    loadSourceAnalytics: overrides.loadSourceAnalytics || (async () => null),
+    lookupProspectByPhone: async () => null,
+    lookupSourceByProspectId: overrides.lookupSourceByProspectId || (async () => null),
+    lookupSourceByPhone: overrides.lookupSourceByPhone || (async () => null),
+  };
+}
+
+test('Tier 2: resolves from Source Category / Source Subcategory pair', async () => {
+  const ctx = await loadAppointmentContext({
+    contact_id: 'f977HcicOOc95WKpmoy5',
+    contact_phone: '(727) 946-1333',
+    lp_source: '',
+    lp_subsource: '',
+    _deps: noTier1Deps({
+      loadDecodedContact: async () => ({
+        profile: { id: 'gC1', tags: [] },
+        custom_fields: {
+          source: [
+            { name: 'Source Category', value: 'canvassing' },
+            { name: 'Source Subcategory', value: 'field' },
+          ],
+        },
+      }),
+    }),
+  });
+
+  assert.equal(ctx.effective_source, 'canvassing');
+  assert.equal(ctx.effective_subsource, 'field');
+  assert.ok(
+    ctx.data_gaps.includes(
+      'source_resolved_from:ghl_custom_field:Source Category/Source Subcategory',
+    ),
+    `data_gaps missing Tier-2 label: ${JSON.stringify(ctx.data_gaps)}`,
+  );
+});
+
+test('Tier 2: prefers LP Source / LP Subsource pair over Source Category', async () => {
+  const ctx = await loadAppointmentContext({
+    contact_id: 'gC1',
+    contact_phone: '(727) 946-1333',
+    lp_source: '',
+    lp_subsource: '',
+    _deps: noTier1Deps({
+      loadDecodedContact: async () => ({
+        profile: { id: 'gC1', tags: [] },
+        custom_fields: {
+          source: [
+            { name: 'LP Source', value: 'Estimate Calculator' },
+            { name: 'LP Subsource', value: 'Estimate Calculator' },
+            { name: 'Source Category', value: 'canvassing' },
+            { name: 'Source Subcategory', value: 'field' },
+          ],
+        },
+      }),
+    }),
+  });
+
+  assert.equal(ctx.effective_source, 'Estimate Calculator');
+  assert.ok(
+    ctx.data_gaps.includes(
+      'source_resolved_from:ghl_custom_field:LP Source/LP Subsource',
+    ),
+  );
+});
+
+test('Tier 2: falls through to First Source Category pair when others absent', async () => {
+  const ctx = await loadAppointmentContext({
+    contact_id: 'gC1',
+    contact_phone: '(727) 946-1333',
+    lp_source: '',
+    lp_subsource: '',
+    _deps: noTier1Deps({
+      loadDecodedContact: async () => ({
+        profile: { id: 'gC1', tags: [] },
+        custom_fields: {
+          attribution: [
+            { name: 'First Source Category', value: 'web' },
+            { name: 'First Source Subcategory', value: 'Form' },
+          ],
+        },
+      }),
+    }),
+  });
+
+  assert.equal(ctx.effective_source, 'web');
+  assert.equal(ctx.effective_subsource, 'Form');
+  assert.ok(
+    ctx.data_gaps.includes(
+      'source_resolved_from:ghl_custom_field:First Source Category/First Source Subcategory',
+    ),
+  );
+});
+
+test('Tier 2: incomplete pair (only source, no subsource) does NOT resolve', async () => {
+  let prospectIdLookups = 0;
+  const ctx = await loadAppointmentContext({
+    contact_id: 'gC1',
+    contact_phone: '',
+    lp_source: '',
+    lp_subsource: '',
+    _deps: noTier1Deps({
+      loadDecodedContact: async () => ({
+        profile: { id: 'gC1', tags: [] },
+        custom_fields: {
+          source: [
+            { name: 'Source Category', value: 'canvassing' },
+            { name: 'Source Subcategory', value: '' },
+          ],
+        },
+      }),
+      lookupSourceByProspectId: async () => {
+        prospectIdLookups++;
+        return null;
+      },
+    }),
+  });
+
+  assert.equal(ctx.effective_source, null);
+  assert.equal(prospectIdLookups, 0); // Tier 3 path A only runs with prospect id, and we have none here
+  assert.ok(
+    !ctx.data_gaps.some(g => g.startsWith('source_resolved_from:ghl_custom_field:')),
+    `incomplete pair should not record a Tier-2 resolution: ${JSON.stringify(ctx.data_gaps)}`,
+  );
+});
+
+test('Tier 3: resolves by prospect_id when GHL custom field carries LP Prospect ID', async () => {
+  let phoneLookups = 0;
+  let receivedProspectId = null;
+  const ctx = await loadAppointmentContext({
+    contact_id: 'gC1',
+    contact_phone: '(727) 946-1333',
+    lp_source: '',
+    lp_subsource: '',
+    _deps: noTier1Deps({
+      loadDecodedContact: async () => ({
+        profile: { id: 'gC1', tags: [] },
+        custom_fields: {
+          identity: [{ name: 'LP Prospect ID', value: '431348' }],
+        },
+      }),
+      lookupSourceByProspectId: async pid => {
+        receivedProspectId = pid;
+        return { source: 'Canvassing', subsource: 'Field' };
+      },
+      lookupSourceByPhone: async () => {
+        phoneLookups++;
+        return null;
+      },
+    }),
+  });
+
+  assert.equal(receivedProspectId, '431348');
+  assert.equal(phoneLookups, 0);
+  assert.equal(ctx.effective_source, 'Canvassing');
+  assert.equal(ctx.effective_subsource, 'Field');
+  assert.ok(
+    ctx.data_gaps.includes('source_resolved_from:lp_api:by_prospect_id'),
+    `data_gaps missing Tier-3 by-prospect label: ${JSON.stringify(ctx.data_gaps)}`,
+  );
+});
+
+test('Tier 3: falls back to phone lookup when prospect id absent', async () => {
+  let prospectLookups = 0;
+  let receivedPhone = null;
+  const ctx = await loadAppointmentContext({
+    contact_id: 'gC1',
+    contact_phone: '(727) 946-1333',
+    lp_source: '',
+    lp_subsource: '',
+    _deps: noTier1Deps({
+      loadDecodedContact: async () => ({
+        profile: { id: 'gC1', tags: [] },
+        custom_fields: {},
+      }),
+      lookupSourceByProspectId: async () => {
+        prospectLookups++;
+        return null;
+      },
+      lookupSourceByPhone: async phone => {
+        receivedPhone = phone;
+        return { source: 'Web', subsource: 'Form' };
+      },
+    }),
+  });
+
+  assert.equal(receivedPhone, '7279461333');
+  assert.equal(prospectLookups, 0);
+  assert.equal(ctx.effective_source, 'Web');
+  assert.equal(ctx.effective_subsource, 'Form');
+  assert.ok(
+    ctx.data_gaps.includes('source_resolved_from:lp_api:by_phone'),
+    `data_gaps missing Tier-3 by-phone label: ${JSON.stringify(ctx.data_gaps)}`,
+  );
+});
+
+test('Tier 3: tolerates LP API failure quietly, leaves source unresolved', async () => {
+  const ctx = await loadAppointmentContext({
+    contact_id: 'gC1',
+    contact_phone: '(727) 946-1333',
+    lp_source: '',
+    lp_subsource: '',
+    _deps: noTier1Deps({
+      loadDecodedContact: async () => ({
+        profile: { id: 'gC1', tags: [] },
+        custom_fields: {
+          identity: [{ name: 'LP Prospect ID', value: '431348' }],
+        },
+      }),
+      lookupSourceByProspectId: async () => {
+        throw new Error('LP timeout');
+      },
+    }),
+  });
+
+  assert.equal(ctx.effective_source, null);
+  assert.equal(ctx.effective_subsource, null);
+  assert.ok(
+    ctx.data_gaps.some(g => g.startsWith('source_lookup_lp_api_failed:')),
+    `expected source_lookup_lp_api_failed label: ${JSON.stringify(ctx.data_gaps)}`,
+  );
+});
+
+test('All tiers miss: effective_source stays null, original gap intact', async () => {
+  const ctx = await loadAppointmentContext({
+    contact_id: 'gC1',
+    contact_phone: '',
+    lp_source: '',
+    lp_subsource: '',
+    _deps: noTier1Deps(),
+  });
+  assert.equal(ctx.effective_source, null);
+  assert.ok(ctx.data_gaps.includes('source_intel_unavailable:empty_lp_source'));
+  assert.ok(!ctx.data_gaps.some(g => g.startsWith('source_resolved_from:')));
+});
+
+test('Source analytics retry runs once a tier resolves and analytics was null', async () => {
+  let analyticsCalls = 0;
+  const ctx = await loadAppointmentContext({
+    contact_id: 'gC1',
+    contact_phone: '(727) 946-1333',
+    lp_source: '',
+    lp_subsource: '',
+    _deps: noTier1Deps({
+      loadDecodedContact: async () => ({
+        profile: { id: 'gC1', tags: [] },
+        custom_fields: {
+          source: [
+            { name: 'Source Category', value: 'canvassing' },
+            { name: 'Source Subcategory', value: 'field' },
+          ],
+        },
+      }),
+      loadSourceAnalytics: async (src, sub) => {
+        analyticsCalls++;
+        return {
+          matched_on: 'source',
+          source: src,
+          subsource: sub,
+          total_leads: 100,
+          closed_won: 20,
+          close_rate_pct: 20,
+          total_revenue: 100000,
+        };
+      },
+    }),
+  });
+
+  // Only one analytics call should fire: the initial parallel load is
+  // skipped because payload lp_source/lp_subsource were empty
+  // (sourceIntelEnabled = false); the retry runs after Tier 2 resolves.
+  assert.equal(analyticsCalls, 1);
+  assert.ok(ctx.source_analytics);
+  assert.equal(ctx.source_analytics.source, 'canvassing');
+  assert.equal(ctx.source_analytics.close_rate_pct, 20);
+});
+
+test('Resolution short-circuits: Tier 1 hit prevents Tier 2 / Tier 3 from running', async () => {
+  let tier2Sentinel = 0;
+  let tier3Sentinel = 0;
+  const ctx = await loadAppointmentContext({
+    contact_id: 'gC1',
+    contact_phone: '(727) 946-1333',
+    lp_source: '',
+    lp_subsource: '',
+    _deps: {
+      loadDecodedContact: async () => {
+        tier2Sentinel++; // decoded_contact is loaded for Tier 2 walks
+        return {
+          profile: { id: 'gC1', tags: [] },
+          custom_fields: {
+            source: [
+              { name: 'Source Category', value: 'TIER2_SHOULD_NOT_WIN' },
+              { name: 'Source Subcategory', value: 'TIER2_SHOULD_NOT_WIN' },
+            ],
+          },
+        };
+      },
+      loadLeadSummary: async () => ({
+        lead: {
+          lp_lead_id: 'L1',
+          lp_prospect_id: '111',
+          lead_source: 'Canvass',
+          lead_source_detail: 'Door-to-Door',
+        },
+        recent: { calls: [], notes: [], activities: [] },
+      }),
+      loadContactTimeline: async () => [],
+      loadSourceAnalytics: async () => null,
+      lookupProspectByPhone: async () => null,
+      lookupSourceByProspectId: async () => {
+        tier3Sentinel++;
+        return null;
+      },
+      lookupSourceByPhone: async () => {
+        tier3Sentinel++;
+        return null;
+      },
+    },
+  });
+
+  assert.equal(ctx.effective_source, 'Canvass');
+  assert.equal(ctx.effective_subsource, 'Door-to-Door');
+  assert.equal(tier3Sentinel, 0, 'Tier 3 lookups must not run when Tier 1 resolves');
+  assert.ok(
+    ctx.data_gaps.includes('source_resolved_from:lp_fallback'),
+    `expected Tier 1 label: ${JSON.stringify(ctx.data_gaps)}`,
+  );
+  assert.ok(
+    !ctx.data_gaps.some(g => g.startsWith('source_resolved_from:ghl_custom_field:')),
+    'Tier 2 must not record a resolution label when Tier 1 wins',
+  );
+});
+
+// ───────────────────────────────────────────────────────────────────
+// SOURCE EXTRACTION HELPERS (unit tests on internals)
+// ───────────────────────────────────────────────────────────────────
+
+test('extractSourceFromLpRecord: pulls source from leads[0] using sync-leads field names', () => {
+  const out = intelInternal.extractSourceFromLpRecord({
+    cst_id: '431348',
+    leads: [
+      { Source: 'Canvassing', SourceSubDescr: 'Field' },
+    ],
+  });
+  assert.deepEqual(out, { source: 'Canvassing', subsource: 'Field' });
+});
+
+test('extractSourceFromLpRecord: handles lowercase source/sourcesubdescr', () => {
+  const out = intelInternal.extractSourceFromLpRecord({
+    leads: [{ source: 'Web', sourcesubdescr: 'Form' }],
+  });
+  assert.deepEqual(out, { source: 'Web', subsource: 'Form' });
+});
+
+test('extractSourceFromLpRecord: walks past leads without a source to the next', () => {
+  const out = intelInternal.extractSourceFromLpRecord({
+    leads: [
+      { Source: '', SourceSubDescr: '' },
+      { Source: 'Canvassing', SourceSubDescr: 'Field' },
+    ],
+  });
+  assert.deepEqual(out, { source: 'Canvassing', subsource: 'Field' });
+});
+
+test('extractSourceFromLpRecord: falls back to top-level fields when leads array empty', () => {
+  const out = intelInternal.extractSourceFromLpRecord({
+    Source: 'Referral',
+    SourceSubDescr: 'Word of Mouth',
+    leads: [],
+  });
+  assert.deepEqual(out, { source: 'Referral', subsource: 'Word of Mouth' });
+});
+
+test('extractSourceFromLpRecord: returns null when nothing usable', () => {
+  assert.equal(intelInternal.extractSourceFromLpRecord({}), null);
+  assert.equal(intelInternal.extractSourceFromLpRecord({ leads: [{}] }), null);
+  assert.equal(intelInternal.extractSourceFromLpRecord(null), null);
+});
+
+test('findGhlSourcePair: returns matched_pair_name reflecting the winning pair', () => {
+  const out = intelInternal.findGhlSourcePair({
+    custom_fields: {
+      source: [
+        { name: 'Source Category', value: 'canvassing' },
+        { name: 'Source Subcategory', value: 'field' },
+      ],
+    },
+  });
+  assert.equal(out?.source, 'canvassing');
+  assert.equal(out?.subsource, 'field');
+  assert.equal(out?.matched_pair_name, 'Source Category/Source Subcategory');
+});
+
+test('findGhlSourcePair: returns null when no complete pair exists', () => {
+  assert.equal(
+    intelInternal.findGhlSourcePair({
+      custom_fields: {
+        source: [{ name: 'Source Category', value: 'canvassing' }],
+      },
+    }),
+    null,
+  );
+  assert.equal(intelInternal.findGhlSourcePair({ custom_fields: {} }), null);
+  assert.equal(intelInternal.findGhlSourcePair(null), null);
+});
+
+test('findGhlCustomField: scans every category, ignores empty values', () => {
+  const decoded = {
+    custom_fields: {
+      a: [{ name: 'Other', value: 'x' }],
+      b: [{ name: 'LP Prospect ID', value: '' }],
+      c: [{ name: 'LP Prospect ID', value: '431348' }],
+    },
+  };
+  assert.equal(intelInternal.findGhlCustomField(decoded, 'LP Prospect ID'), '431348');
+  assert.equal(intelInternal.findGhlCustomField(decoded, 'Missing'), null);
+});
