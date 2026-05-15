@@ -20,7 +20,9 @@
  *   7. Close the open row (set exited_at, resolution, exit_event_id).
  *   8. Insert the new row (trigger fills recovery/parent_attempt_number).
  *   9. Mirror state_code to the GHL custom field `objection_state_code`.
- *  10. Optionally enqueue a workflow enrollment if the policy has one.
+ *  10. For S5.2 cluster states, ensure `last_appointment_reschedule_link`
+ *      is populated with a valid, separator-suffixed URL (v1.4).
+ *  11. Optionally enqueue a workflow enrollment if the policy has one.
  *
  * NOTE on transactions: the Supabase JS client (PostgREST) does not expose
  * BEGIN/COMMIT. We get atomicity via an advisory lock + the partial unique
@@ -40,14 +42,52 @@
  *   }
  *
  * 2026-05-14 — initial version (Spec v1.2 build handoff).
+ * 2026-05-15 — v1.3: write s5_2_rebook_url for S5.2 cluster states.
+ * 2026-05-15 — v1.4: REVERSED — write back to the EXISTING
+ *              last_appointment_reschedule_link field instead of creating a
+ *              new field. Verified via codebase search that no other code
+ *              writes to dmDV700VEZfEldz9JzRf (GHL platform populates it on
+ *              appointment booking, but no app code touches it). Writes are
+ *              idempotent: we only update when the computed URL differs
+ *              from what's already there.
+ *
+ *              Why the change: avoids creating a new custom field, simpler
+ *              ops surface, GHL trigger links reference one canonical merge
+ *              tag {{contact.last_appointment_reschedule_link}}. When a
+ *              fresh appointment is later booked, GHL's calendar widget
+ *              overwrites the field naturally — no coordination needed.
  */
 
 import supabase from '../../supabase.js';
-import { updateGHLContactFields } from '../../ghl.js';
+import { updateGHLContactFields, getGHLContact } from '../../ghl.js';
 import { emitEvent } from '../../event-emitter.js';
 
 const GHL_FIELD_OBJECTION_STATE_CODE =
   process.env.GHL_FIELD_OBJECTION_STATE_CODE || null;
+
+// v1.4 — rebook URL is written back to the SAME field GHL populates on
+// appointment booking. The handler manages this field defensively: only
+// overwrites it when (a) the existing value is empty/expired AND (b) the
+// computed fallback URL would actually change what's stored. This makes
+// it safe to coexist with GHL's native appointment-widget writes.
+const GHL_FIELD_LAST_APPT_RESCHEDULE_LINK =
+  process.env.GHL_FIELD_LAST_APPT_RESCHEDULE_LINK || 'dmDV700VEZfEldz9JzRf';
+const GHL_FIELD_LP_APPOINTMENT_DATE =
+  process.env.GHL_FIELD_LP_APPOINTMENT_DATE || 'GL1rM4cnXBETsBkqxkZw';
+
+// Fallback rebook destination when the contact has no future appointment to
+// reschedule against. Window Estimate calendar widget — generic booking flow.
+const GENERIC_REBOOK_URL =
+  process.env.S5_2_GENERIC_REBOOK_URL ||
+  'https://link.reecewindows.com/widget/booking/aJj14ONxh1oFyDcQ706O';
+
+// State clusters where rebook URL is relevant. Friction + Disruption states
+// both end up in S5.2; other clusters (POST_PROPOSAL_RESISTANCE, DISENGAGEMENT)
+// route to W9.0 / L.5 / P3 and don't use this field.
+const S5_2_CLUSTERS = new Set([
+  'APPOINTMENT_FRICTION',
+  'APPOINTMENT_DISRUPTION',
+]);
 
 const ALLOWED_TRIGGER_SOURCES = new Set([
   'LP_WEBHOOK', 'MESSAGE_ANALYZER', 'BEHAVIORAL_RULE', 'TIMER_EXPIRY',
@@ -195,8 +235,9 @@ export async function executeTransitionObjectionState(action) {
     .single();
   if (insErr) throw new Error(`insert new state: ${insErr.message}`);
 
-  // 7. Mirror to GHL custom field (best-effort; not a hard failure).
-  await mirrorToGhlCustomField(contact_id, proposed_state);
+  // 7. Mirror state_code + ensure reschedule URL is set. Best-effort —
+  // mirror failure is logged but does not fail the transition.
+  const mirrorResult = await mirrorToGhlCustomFields(contact_id, proposed_state, proposedPolicy.parent_state);
 
   // 8. Workflow enrollment (best-effort enqueue of an add_to_workflow action).
   let workflowEnrolled = false;
@@ -230,7 +271,9 @@ export async function executeTransitionObjectionState(action) {
     recovery_attempt_number: newRow.recovery_attempt_number,
     parent_attempt_number: newRow.parent_attempt_number,
     workflow_enrolled: workflowEnrolled,
-    mirror_field_set: !!GHL_FIELD_OBJECTION_STATE_CODE,
+    mirror_state_set: mirrorResult.state_set,
+    rebook_field_action: mirrorResult.rebook_field_action,
+    rebook_url_source: mirrorResult.rebook_url_source,
   };
 }
 
@@ -306,21 +349,209 @@ async function emitTransitionEvent(event_type, payload) {
   }
 }
 
-async function mirrorToGhlCustomField(contact_id, state_code) {
-  if (!GHL_FIELD_OBJECTION_STATE_CODE) {
-    // Field ID not yet wired in env. Skip silently — the field exists in GHL,
-    // we just don't know its ID yet (set GHL_FIELD_OBJECTION_STATE_CODE).
-    return false;
+/**
+ * Mirror state info to GHL custom fields.
+ *
+ *   1. objection_state_code → always written when env var is configured
+ *      (drives GHL workflow branch routing).
+ *
+ *   2. last_appointment_reschedule_link → for S5.2 cluster states only.
+ *      v1.4 idempotent-write logic:
+ *        - If the existing value is already a usable reschedule URL
+ *          (non-empty, appointment date is in the future, AND it already
+ *          ends with `?` or `&`), leave it alone.
+ *        - If the existing value is a usable reschedule URL but missing
+ *          the trailing separator, rewrite it with the separator appended.
+ *        - If the existing value is empty/expired, overwrite with the
+ *          generic Window Estimate calendar URL + trailing separator.
+ *      Writes are skipped entirely when the computed value matches what's
+ *      already in GHL — avoids noisy field updates and rate limiter waste.
+ *
+ * Failure modes are logged but never raised — mirror is best-effort.
+ *
+ * @returns {{
+ *   state_set: boolean,
+ *   rebook_field_action: 'unchanged'|'wrote_separator'|'wrote_generic'|'skipped'|null,
+ *   rebook_url_source: 'reschedule_link'|'generic'|null
+ * }}
+ */
+async function mirrorToGhlCustomFields(contact_id, state_code, parent_state) {
+  const result = {
+    state_set: false,
+    rebook_field_action: null,
+    rebook_url_source: null,
+  };
+
+  // We may need to read GHL to know what's already in the reschedule field.
+  // Only fetch when we're going to act on the rebook URL — i.e. S5.2 states.
+  const willHandleRebookField = S5_2_CLUSTERS.has(parent_state);
+
+  let contact = null;
+  if (willHandleRebookField) {
+    try {
+      contact = await getGHLContact(contact_id);
+    } catch (err) {
+      console.warn(`[ObjectionState] contact fetch threw for ${contact_id}: ${err.message}`);
+      // contact stays null; the rebook decision will default to generic
+    }
   }
+
+  const fieldsToWrite = [];
+
+  // ─── state_code mirror (always when configured) ──────────────
+  if (GHL_FIELD_OBJECTION_STATE_CODE) {
+    fieldsToWrite.push({
+      id: GHL_FIELD_OBJECTION_STATE_CODE,
+      field_value: state_code,
+    });
+  }
+
+  // ─── rebook URL idempotent write (S5.2 cluster only) ─────────
+  if (willHandleRebookField) {
+    const decision = decideRebookFieldWrite(contact);
+    result.rebook_field_action = decision.action;
+    result.rebook_url_source = decision.source;
+
+    if (decision.action !== 'unchanged' && decision.urlToWrite) {
+      fieldsToWrite.push({
+        id: GHL_FIELD_LAST_APPT_RESCHEDULE_LINK,
+        field_value: decision.urlToWrite,
+      });
+    }
+  }
+
+  if (fieldsToWrite.length === 0) {
+    if (result.rebook_field_action == null && willHandleRebookField) {
+      result.rebook_field_action = 'unchanged';
+    }
+    return result;
+  }
+
   try {
-    const result = await updateGHLContactFields(contact_id, [
-      { id: GHL_FIELD_OBJECTION_STATE_CODE, value: state_code },
-    ]);
-    return result === true;
+    const writeResult = await updateGHLContactFields(contact_id, fieldsToWrite);
+    const ok = writeResult === true;
+    if (ok) {
+      result.state_set = fieldsToWrite.some(f => f.id === GHL_FIELD_OBJECTION_STATE_CODE);
+    }
+    return result;
   } catch (err) {
     console.warn(`[ObjectionState] GHL mirror failed for ${contact_id}: ${err.message}`);
-    return false;
+    return result;
   }
+}
+
+/**
+ * Decide what (if anything) to write to last_appointment_reschedule_link
+ * given the contact's current state.
+ *
+ * Returns an object describing both the action taken and the URL to write:
+ *
+ *   { action: 'unchanged',       urlToWrite: null,        source: 'reschedule_link' }
+ *     → existing value is already valid + has trailing separator. No write.
+ *
+ *   { action: 'wrote_separator', urlToWrite: '<rl>?'|'<rl>&', source: 'reschedule_link' }
+ *     → existing reschedule link is valid but missing trailing separator.
+ *       Rewrite it with the separator appended.
+ *
+ *   { action: 'wrote_generic',   urlToWrite: '<generic>?',  source: 'generic' }
+ *     → existing field is empty, expired, or contact couldn't be fetched.
+ *       Overwrite with generic Window Estimate URL.
+ *
+ *   { action: 'unchanged',       urlToWrite: null,        source: 'generic' }
+ *     → existing value already equals the generic URL+separator (idempotent
+ *       skip when we'd be writing the same thing that's already there).
+ */
+function decideRebookFieldWrite(contact) {
+  const genericWithSep = appendSeparator(GENERIC_REBOOK_URL);
+
+  // Contact fetch failed — write the generic URL so trigger links don't break.
+  if (!contact) {
+    return {
+      action: 'wrote_generic',
+      urlToWrite: genericWithSep,
+      source: 'generic',
+    };
+  }
+
+  const customFields = Array.isArray(contact.customFields) ? contact.customFields : [];
+  const existingLink = readCustomField(customFields, GHL_FIELD_LAST_APPT_RESCHEDULE_LINK);
+  const apptDateRaw = readCustomField(customFields, GHL_FIELD_LP_APPOINTMENT_DATE);
+
+  const hasFutureAppointment = isAppointmentInFuture(apptDateRaw);
+  const linkLooksUsable = !!existingLink && hasFutureAppointment;
+
+  if (linkLooksUsable) {
+    // Reschedule link is real. Ensure it has the trailing separator so trigger
+    // links can blindly append `utm_source=...`.
+    if (existingLink.endsWith('?') || existingLink.endsWith('&')) {
+      return { action: 'unchanged', urlToWrite: null, source: 'reschedule_link' };
+    }
+    return {
+      action: 'wrote_separator',
+      urlToWrite: appendSeparator(existingLink),
+      source: 'reschedule_link',
+    };
+  }
+
+  // Field is empty, or the appointment date is past/today. Fall back to
+  // generic. Idempotent: skip if the field already holds the generic URL.
+  if (existingLink === genericWithSep) {
+    return { action: 'unchanged', urlToWrite: null, source: 'generic' };
+  }
+  return {
+    action: 'wrote_generic',
+    urlToWrite: genericWithSep,
+    source: 'generic',
+  };
+}
+
+/**
+ * Read a custom field value from a GHL contact's customFields array.
+ * Handles both {id, value} and {id, field_value} shapes that GHL uses across
+ * different API surfaces.
+ */
+function readCustomField(customFields, fieldId) {
+  if (!fieldId || !Array.isArray(customFields)) return null;
+  const match = customFields.find(f => f && f.id === fieldId);
+  if (!match) return null;
+  const raw = match.value ?? match.field_value ?? match.fieldValue;
+  if (raw == null) return null;
+  const str = String(raw).trim();
+  return str.length > 0 ? str : null;
+}
+
+/**
+ * Returns true if the supplied appointment date string parses to a future
+ * timestamp. Accepts MM/DD/YYYY (the ghl-field-map.js format), ISO strings,
+ * and other Date-parseable formats. Returns false on parse failure or past
+ * dates — the safe default is to fall back to the generic rebook URL.
+ *
+ * Note: We treat "today" as past since the appointment has either already
+ * occurred or is about to. A reschedule link for today's appointment is
+ * unlikely to be useful (GHL widgets typically refuse same-day rebooks).
+ */
+function isAppointmentInFuture(dateStr) {
+  if (!dateStr) return false;
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return false;
+  // Compare to start-of-tomorrow so today's appointments fall to generic.
+  const tomorrow = new Date();
+  tomorrow.setHours(0, 0, 0, 0);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  return d.getTime() >= tomorrow.getTime();
+}
+
+/**
+ * Append the correct query-string separator to a URL so downstream callers
+ * can blindly concatenate `utm_source=...&utm_medium=...`.
+ *   - No `?` in URL  → append `?`
+ *   - Has `?`        → append `&`
+ *   - Already ends in `?` or `&` → no change
+ */
+function appendSeparator(url) {
+  if (!url) return null;
+  if (url.endsWith('?') || url.endsWith('&')) return url;
+  return url.includes('?') ? `${url}&` : `${url}?`;
 }
 
 async function enqueueWorkflowEnrollment({ contact_id, workflow_id, source_action_id, payload }) {
