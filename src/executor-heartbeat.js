@@ -20,12 +20,36 @@
  * Mark asked Claude to recover a Bot 4 OUT_OF_AREA misfire (Jeanne
  * Jewell, contact Pb19irZgit7Gpqj80fI3).
  *
+ * 2026-05-15 — PENDING-ACTION GATE.
+ *   The original failover used the most-recent `executed_at` timestamp
+ *   as a proxy for "is n8n healthy?". During a healthy quiet period,
+ *   n8n fires every 5 min and finds nothing to execute, so no
+ *   `executed_at` advances. The failover then read MAX(executed_at)
+ *   as stale and fired the executor — which also found nothing.
+ *   Result: noisy log lines every 5 min ("FAILOVER ... Done — 0 executed")
+ *   that look like a malfunction but are just a tautological false
+ *   positive when the queue is empty.
+ *
+ *   Fix: gate failover on the presence of pending actions, mirroring
+ *   the pattern already used by decision-engine-heartbeat.js (gates on
+ *   `hasPendingEvents`). Now:
+ *     - queue empty → skip with `no_pending_actions` reason
+ *     - queue has work + last run recent → skip with `n8n_healthy` reason
+ *     - queue has work + last run stale → fire failover
+ *
+ *   The fix preserves the original safety net: if n8n stops firing
+ *   while the queue has pending work, the failover still triggers
+ *   within 6 minutes. The only change is we no longer fire when there
+ *   is provably nothing to execute.
+ *
  * DESIGN
  * ──────
  * Failover, not parallel. The scheduler:
- *   1. Checks the most recent executed_at across agent_actions
- *   2. If < STALE_THRESHOLD_MS old: skip (n8n is doing its job)
- *   3. If >= STALE_THRESHOLD_MS old: run executeActions
+ *   1. Checks for pending actions in the queue
+ *   2. If none: skip (nothing to do regardless of n8n state)
+ *   3. If pending and most recent executed_at < STALE_THRESHOLD_MS old:
+ *      skip (n8n is doing its job)
+ *   4. Otherwise: run executeActions
  *
  * Why failover rather than always-on:
  *   - The executor's SELECT doesn't claim/lock rows. Two concurrent
@@ -57,15 +81,16 @@
  * ──────────────
  *   POST /n8n/decision-engine/heartbeat
  *     Forces a heartbeat check immediately (subject to staleness gate).
- *     Pass { force: true } in body to bypass the staleness gate and
- *     run executeActions unconditionally.
+ *     Pass { force: true } in body to bypass both the pending-action
+ *     gate AND the staleness gate and run executeActions unconditionally.
  *
  * OBSERVABILITY
  * ─────────────
  *   - Logs every heartbeat decision at info level
  *   - On failover-fire: logs the staleness duration and the executor
  *     result summary (completed/failed/retrying counts)
- *   - On skip: logs the most-recent executed_at age in seconds
+ *   - On skip: logs the reason (`no_pending_actions` or `n8n_healthy`)
+ *     and most-recent executed_at age in seconds when applicable
  */
 
 import supabase from './supabase.js';
@@ -102,27 +127,70 @@ async function getMostRecentExecutionAt() {
 }
 
 /**
+ * 2026-05-15 — gate. Are there any actions that the executor would
+ * actually pick up if it ran right now? Status 'pending' is the normal
+ * executable state. Status 'executing' is included so a stuck row that
+ * needs the reaper still triggers a failover when n8n is dead. Other
+ * statuses (pending_approval, completed, failed, rejected, cancelled)
+ * are not executor work — pending_approval waits for GroupMe approval,
+ * the others are terminal.
+ */
+async function hasPendingActions() {
+  const { count, error } = await supabase
+    .from('agent_actions')
+    .select('id', { count: 'exact', head: true })
+    .in('status', ['pending', 'executing']);
+  if (error) {
+    console.warn(`[ExecutorHeartbeat] pending count failed: ${error.message}`);
+    // Fail-open: assume there might be work. Worst case is a benign
+    // failover fire that finds nothing — same as old behavior.
+    return true;
+  }
+  return (count || 0) > 0;
+}
+
+/**
  * Check if the executor needs a failover kick. Returns:
- *   { needs_run: bool, last_executed_at, age_ms }
+ *   { needs_run, last_executed_at, age_ms, has_pending }
+ *
+ * 2026-05-15 — `has_pending` added to the contract. When false, the
+ * heartbeat skips regardless of staleness.
  */
 async function checkExecutorHealth() {
-  const lastIso = await getMostRecentExecutionAt();
-  if (!lastIso) {
-    // No execution history at all — either fresh deploy or empty queue.
-    // Treat as needs_run so we can drain whatever's pending.
-    return { needs_run: true, last_executed_at: null, age_ms: null };
+  const [lastIso, hasPending] = await Promise.all([
+    getMostRecentExecutionAt(),
+    hasPendingActions(),
+  ]);
+
+  if (!hasPending) {
+    // Queue is empty — nothing for the executor to do regardless of
+    // how stale the last execution was.
+    return {
+      needs_run: false,
+      last_executed_at: lastIso,
+      age_ms: lastIso ? Date.now() - Date.parse(lastIso) : null,
+      has_pending: false,
+    };
   }
+
+  if (!lastIso) {
+    // Pending work exists but no execution history at all (fresh deploy
+    // or all-time empty). Fire to drain.
+    return { needs_run: true, last_executed_at: null, age_ms: null, has_pending: true };
+  }
+
   const ageMs = Date.now() - Date.parse(lastIso);
   return {
     needs_run: ageMs >= STALE_THRESHOLD_MS,
     last_executed_at: lastIso,
     age_ms: ageMs,
+    has_pending: true,
   };
 }
 
 /**
- * One heartbeat cycle. Checks staleness, fires executor if needed.
- * Returns the result for logging / route response.
+ * One heartbeat cycle. Checks staleness + pending-work gate, fires
+ * executor if needed. Returns the result for logging / route response.
  */
 export async function runHeartbeat({ force = false } = {}) {
   if (process.env.EXECUTOR_HEARTBEAT_DISABLED === 'true') {
@@ -133,12 +201,15 @@ export async function runHeartbeat({ force = false } = {}) {
 
   if (!force && !health.needs_run) {
     const ageSeconds = health.age_ms != null ? Math.round(health.age_ms / 1000) : null;
-    console.log(`[ExecutorHeartbeat] Skip — n8n healthy (last run ${ageSeconds}s ago)`);
+    const reason = !health.has_pending ? 'no_pending_actions' : 'n8n_healthy';
+    const ageSuffix = ageSeconds !== null ? ` (last run ${ageSeconds}s ago)` : '';
+    console.log(`[ExecutorHeartbeat] Skip — ${reason}${ageSuffix}`);
     return {
       skipped: true,
-      reason: 'n8n_healthy',
+      reason,
       last_executed_at: health.last_executed_at,
       age_ms: health.age_ms,
+      has_pending: health.has_pending,
       stale_threshold_ms: STALE_THRESHOLD_MS,
     };
   }
@@ -212,7 +283,8 @@ export function startExecutorHeartbeatScheduler() {
  * Express routes:
  *   POST /n8n/decision-engine/heartbeat
  *     Manually trigger a heartbeat check. Body: { force?: boolean }.
- *     If force=true, bypasses the staleness gate and runs unconditionally.
+ *     If force=true, bypasses both the pending-action gate and the
+ *     staleness gate and runs executeActions unconditionally.
  *
  *   GET /n8n/decision-engine/heartbeat-status
  *     Returns the current health state without firing the executor.
