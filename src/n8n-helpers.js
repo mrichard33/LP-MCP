@@ -164,31 +164,55 @@ function localNYToUTC(year, monthIdx, day, hour, minute) {
 async function handleTimeToAppointment(req, res) {
   try {
     const body = req.body || {};
-    const contactId = body.contact_id || body.contactId || '';
 
-    // Accept full datetime in any of these keys
+    // GHL standard `webhook` action nests its customData under body.customData
+    // (top-level fields are the contact custom-field dump with display-name keys).
+    // Read from both root and nested customData so we work regardless of which
+    // mode GHL is sending in.
+    const cd = (body.customData && typeof body.customData === 'object') ? body.customData : {};
+    const cal = (body.calendar && typeof body.calendar === 'object') ? body.calendar : {};
+
+    const contactId =
+      body.contact_id || body.contactId ||
+      cd.contact_id || cd.contactId || '';
+
+    // Accept full datetime in any of these keys (root or customData)
     let apptStartRaw = String(
       body.appointment_start || body.appointmentStart ||
-      body.start_time || body.startTime || ''
+      body.start_time || body.startTime ||
+      cd.appointment_start || cd.appointmentStart || ''
     ).trim();
 
-    // FALLBACK: reconstruct from separate date + time fields. This works around
-    // GHL standard `webhook` action not resolving multiple merge tags in a single
-    // customData value (e.g. "{{contact.last_appointment_start_date}} {{contact.last_appointment_start_time}}"
-    // arrives empty). Sending the two tokens as separate customData keys avoids that.
+    // FALLBACK 1: reconstruct from separate date + time keys (root or customData)
     if (!apptStartRaw) {
       const apptDate = String(
         body.appointment_date || body.appointmentDate ||
+        cd.appointment_date || cd.appointmentDate ||
         body.last_appointment_start_date || ''
       ).trim();
       const apptTime = String(
         body.appointment_time || body.appointmentTime ||
+        cd.appointment_time || cd.appointmentTime ||
         body.last_appointment_start_time || ''
       ).trim();
       if (apptDate && apptTime) {
         apptStartRaw = `${apptDate} ${apptTime}`;
       } else if (apptDate) {
         apptStartRaw = apptDate;
+      }
+    }
+
+    // FALLBACK 2: GHL appointment-triggered webhooks include calendar.startTime
+    // as ISO without timezone designator, in the calendar's selectedTimezone
+    // (America/New_York for Reece). Reformat as "YYYY-MM-DD HH:MM" so the
+    // existing parser interprets it as NY-local via localNYToUTC.
+    if (!apptStartRaw && cal.startTime) {
+      const calStr = String(cal.startTime).trim();
+      const m = calStr.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+      if (m) {
+        apptStartRaw = `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}`;
+      } else {
+        apptStartRaw = calStr;
       }
     }
 
