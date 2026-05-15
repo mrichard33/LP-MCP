@@ -233,6 +233,35 @@ async function loadContactTimeline(contactId) {
 }
 
 /**
+ * Tier 3 prospect lookup — direct supabase query against lp_leads by
+ * phone (the same table search_leads MCP tool queries). Returns the
+ * `lp_prospect_id` of the most recent matching lead, or null on no
+ * match / no row with a prospect id. Normalizes the input to its last
+ * 10 digits so formatted/unformatted phone variants match.
+ */
+async function lookupProspectByPhone(phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (digits.length < 10) return null;
+  const last10 = digits.slice(-10);
+
+  const { data, error } = await supabase
+    .from('lp_leads')
+    .select('lp_prospect_id, created_at_lp')
+    .ilike('phone', `%${last10}%`)
+    .order('created_at_lp', { ascending: false })
+    .limit(10);
+
+  if (error) throw new Error(`lp_leads_phone_lookup:${error.message}`);
+  if (!Array.isArray(data) || data.length === 0) return null;
+
+  for (const row of data) {
+    const pid = String(row?.lp_prospect_id ?? '').trim();
+    if (pid) return pid;
+  }
+  return null;
+}
+
+/**
  * Filter the get_close_rate_by_source RPC results to the requested
  * source/subsource. The RPC returns all sources × buckets; we pick the
  * row(s) that match. lp_subsource is the more specific filter
@@ -287,6 +316,7 @@ async function loadSourceAnalytics(lp_source, lp_subsource) {
  */
 export async function loadAppointmentContext({
   contact_id,
+  contact_phone,
   lp_source,
   lp_subsource,
   timeout_ms = DEFAULT_TIMEOUT_MS,
@@ -303,6 +333,7 @@ export async function loadAppointmentContext({
     loadLeadSummary: _deps?.loadLeadSummary || loadLeadSummary,
     loadContactTimeline: _deps?.loadContactTimeline || loadContactTimeline,
     loadSourceAnalytics: _deps?.loadSourceAnalytics || loadSourceAnalytics,
+    lookupProspectByPhone: _deps?.lookupProspectByPhone || lookupProspectByPhone,
   };
 
   const data_gaps = [];
@@ -396,6 +427,52 @@ export async function loadAppointmentContext({
   ctx.effective_source = effective_source;
   ctx.effective_subsource = effective_subsource;
 
+  // ─── 3-tier prospect_id resolution ─────────────────────────────
+  // Tier 1: lp_leads (already loaded).
+  // Tier 2: GHL "LP Prospect ID" custom field (id ZRQAVrzhtzApzLlHmT87)
+  //         — walk every category since GHL groups fields by section.
+  // Tier 3: direct LP search by phone, bounded at 2s. Only runs if
+  //         tiers 1 and 2 miss and we have a phone to search by.
+  const tier1 = String(ctx.lead_summary?.lead?.lp_prospect_id ?? '').trim();
+  let resolvedProspectId = tier1 || null;
+
+  if (!resolvedProspectId) {
+    const groups = ctx.decoded_contact?.custom_fields;
+    if (groups && typeof groups === 'object') {
+      for (const category of Object.keys(groups)) {
+        const fields = groups[category];
+        if (!Array.isArray(fields)) continue;
+        const hit = fields.find(
+          f => f && (f.id === 'ZRQAVrzhtzApzLlHmT87' || f.name === 'LP Prospect ID'),
+        );
+        const val = hit ? String(hit.value ?? '').trim() : '';
+        if (val) {
+          resolvedProspectId = val;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!resolvedProspectId && contact_phone) {
+    try {
+      const fromLpApi = await withTimeout(
+        loaders.lookupProspectByPhone(contact_phone),
+        2000,
+        'prospect_lookup_lp_api',
+      );
+      const val = String(fromLpApi ?? '').trim();
+      if (val) {
+        resolvedProspectId = val;
+        ctx.data_gaps.push('prospect_resolved_from:lp_api_lookup');
+      }
+    } catch {
+      // Silent fallthrough — prospect stays unknown.
+    }
+  }
+
+  ctx.resolved_prospect_id = resolvedProspectId;
+
   return ctx;
 }
 
@@ -404,5 +481,6 @@ export const _internal = {
   loadLeadSummary,
   loadContactTimeline,
   loadSourceAnalytics,
+  lookupProspectByPhone,
   withTimeout,
 };
