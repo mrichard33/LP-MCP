@@ -10,8 +10,28 @@
  * 4. Fetch full lead data + lead info from LP API
  * 5. Build enriched record (aggregate leads, appointments, jobs, calls)
  * 6. Calculate highest stage, market, sale amounts, etc.
- * 7. Fetch current GHL tags and merge
- * 8. Return complete payload ready for GHL contact update
+ * 7. Apply lp-linked + lp-enriched tags via additive POST (NEVER via PUT)
+ * 8. Return customFields-only payload ready for GHL contact update
+ *
+ * v3.0 — 2026-05-15 — Tag wipe fix.
+ *   PUT /contacts/{id} with a `tags` array WHOLESALE-REPLACES the contact's
+ *   entire tag set. The previous v2.0 "merge" approach (GET tags → merge with
+ *   ['lp-linked', 'lp-enriched'] → PUT) was racy: any tag added between the
+ *   GET sample and the PUT execution by GHL workflows (I.WE step 2, E.0
+ *   step 106) or agent rules (ENTRY_HYGIENE_AT_CREATION_*) was silently
+ *   wiped. Symptom: every calculator-completed contact ended with empty
+ *   entry:* / active-entry:* / stage:* tags (Mark Test contact
+ *   F5wIFrNefJmXcfFZXuI1, 2026-05-15).
+ *
+ *   Fix: the endpoint no longer fetches/merges/returns `tags`. Instead it
+ *   POSTs `lp-linked` + `lp-enriched` directly to /contacts/{id}/tags
+ *   (additive, never wipes). `ghl_update_body` now contains only
+ *   `customFields` — the n8n workflow PUT still works, but never wipes
+ *   tags because the `tags` field is absent.
+ *
+ *   Companion change: n8n workflow B3QbDlXlVuqcCH78 published draft that
+ *   delegates entirely to this endpoint. The draft's PUT will send the
+ *   tagless ghl_update_body, eliminating the wipe.
  *
  * v2.0 — Phone/email fallback via GetCustomers3 + lp_lead_id writeback
  *   When lp_prospect_id and lp_lead_id are both empty, accepts phone/email
@@ -52,6 +72,32 @@ async function ghlGet(contactId) {
     signal: AbortSignal.timeout(30000),
   });
   return res.json();
+}
+
+/**
+ * v3.0 — Additive tag application via POST /contacts/{id}/tags.
+ *
+ * NEVER use PUT /contacts/{id} with a `tags` array — it wholesale-replaces
+ * the contact's entire tag set and wipes anything added by concurrent
+ * workflows or agent rules between the GET sample and the PUT execution.
+ *
+ * POST /contacts/{id}/tags is additive: GHL merges the provided tags into
+ * the existing set. Idempotent on the server side (duplicate POSTs do not
+ * duplicate tags).
+ */
+async function ghlPostTags(contactId, tags) {
+  const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/tags`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${GHL_API_KEY}`,
+      'Version': '2021-07-28',
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ tags }),
+    signal: AbortSignal.timeout(15000),
+  });
+  return { ok: res.ok, status: res.status };
 }
 
 // ─── Parse LP response (handles various LP API response formats) ─
@@ -459,13 +505,26 @@ export function registerN8nEnrichRoute(app) {
       const { enriched, rawLead, rawInfo } = buildEnrichedRecord(fullData, leadInfo, resolvedProspectId, contact_id);
       const lpFields = enrichFromLP(enriched, rawLead);
 
-      let mergedTags = ['lp-linked', 'lp-enriched'];
+      // ─── v3.0 — Additive tag application (NEVER via PUT body) ──────
+      // Apply lp-linked + lp-enriched via POST /contacts/{id}/tags. This
+      // leaves all other tags untouched. The previous v2.0 approach (GET
+      // tags, merge with new tags, include in PUT body) wiped any tag
+      // added between the GET and the PUT — including entry:* and
+      // active-entry:* tags added by GHL workflows or agent rules.
+      // See file header for full incident notes.
+      let lpTagsApplied = false;
+      let lpTagsStatus = null;
       try {
-        const ghlContact = await ghlGet(contact_id);
-        const existingTags = ghlContact.contact?.tags || ghlContact.tags || [];
-        mergedTags = [...new Set([...existingTags, 'lp-linked', 'lp-enriched'])];
+        const tagRes = await ghlPostTags(contact_id, ['lp-linked', 'lp-enriched']);
+        lpTagsApplied = tagRes.ok;
+        lpTagsStatus = tagRes.status;
+        if (tagRes.ok) {
+          console.log(`[n8n/enrich] ✅ Additive POST lp-linked + lp-enriched to ${contact_id}`);
+        } else {
+          console.error(`[n8n/enrich] Tag POST returned ${tagRes.status} for ${contact_id}`);
+        }
       } catch (e) {
-        console.error('[n8n/enrich] Failed to fetch GHL tags:', e.message);
+        console.error(`[n8n/enrich] Failed to POST lp-linked/lp-enriched to ${contact_id}: ${e.message}`);
       }
 
       // v2.0: Include lp_lead_id in customFields so GHL gets the real lds_id
@@ -490,7 +549,10 @@ export function registerN8nEnrichRoute(app) {
         customFields.push({ key: 'lp_lead_id', field_value: lpFields.lp_lead_id });
       }
 
-      const ghlUpdateBody = { tags: mergedTags, customFields };
+      // v3.0 — `ghl_update_body` no longer contains `tags`. The n8n workflow's
+      // downstream PUT /contacts/{id} will therefore not wipe the tag array.
+      // Tags are applied above via additive POST /contacts/{id}/tags.
+      const ghlUpdateBody = { customFields };
 
       const elapsed = Date.now() - startTime;
       res.json({
@@ -500,6 +562,8 @@ export function registerN8nEnrichRoute(app) {
         lp_lead_id: lpFields.lp_lead_id || null,
         resolved_via: resolvedVia,
         ghl_update_body: ghlUpdateBody,
+        lp_tags_applied: lpTagsApplied,
+        lp_tags_status: lpTagsStatus,
         enriched_summary: {
           firstName: enriched.firstName,
           lastName: enriched.lastName,
