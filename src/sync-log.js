@@ -4,6 +4,16 @@
 // Tracks per-entity sync progress, completion, and failures.
 // activeLogIds scopes SIGTERM cleanup to THIS process's rows only.
 //
+// v6.6 — MAX_INCREMENTAL_DAYS is now env-configurable (default lowered
+//         from 3 → 1). Long gaps between successful syncs no longer
+//         silently expand the per-run workload to 3 days, which was
+//         pushing leads sweeps past the 20-min per-sweep budget. Override
+//         via env: MAX_INCREMENTAL_DAYS=N.
+//         markRunningLogsAsFailed now accepts a `reason` parameter so
+//         callers can disambiguate SIGTERM ("Process terminated") from
+//         timeout ("Sweep timed out") in the lp_sync_log table.
+//         Default reason is still "Process terminated" for SIGTERM/SIGINT
+//         callers that don't pass anything.
 // v6.4 — syncLogProgress is now time-throttled rather than page-bound.
 //         Callers can invoke it per-record without flooding Supabase —
 //         the function itself enforces a minimum interval between writes
@@ -30,8 +40,12 @@ export let syncInProgress = false;
 export let syncStartedAt = null;
 export const STALE_LOCK_MINUTES = 120; // 2 hours max before force-reset
 
-// Max days to look back in incremental sync — prevents OOM on large backlogs
-export const MAX_INCREMENTAL_DAYS = 3;
+// v6.6: Max days to look back in incremental sync. Env-configurable.
+// Default lowered from 3 → 1 so a long gap between successful syncs
+// doesn't silently inflate per-run workload past the per-sweep timeout
+// budget. If you need a deeper backfill, use FORCE_SYNC_SINCE for a
+// one-shot override rather than raising this cap globally.
+export const MAX_INCREMENTAL_DAYS = parseInt(process.env.MAX_INCREMENTAL_DAYS || '1', 10);
 
 // v6.4: Throttle for syncLogProgress writes. Callers can invoke per-record;
 // this map tracks the last DB-write timestamp per logId and skips writes
@@ -205,7 +219,15 @@ export async function getLastSyncTimestamp() {
 
 // Mark this process's own running sync logs as failed on termination.
 // Scoped to activeLogIds to prevent poisoning a newly-booted process's rows.
-export async function markRunningLogsAsFailed() {
+//
+// v6.6: Accepts an optional `reason` argument so callers can distinguish
+// between SIGTERM/SIGINT shutdowns (default: "Process terminated") and
+// programmatic invocations like timeout cleanup (e.g. "Sweep timed out").
+// Without this, every sweep-timeout failure was misleadingly labelled
+// "Process terminated" in the lp_sync_log error_message column, making
+// the diagnostic loop "is Railway killing us or did we time out?" take
+// far longer than it should have.
+export async function markRunningLogsAsFailed(reason = 'Process terminated') {
   try {
     const ids = [...activeLogIds];
     if (ids.length === 0) {
@@ -215,11 +237,11 @@ export async function markRunningLogsAsFailed() {
     await supabase.from('lp_sync_log')
       .update({
         status: 'failed',
-        error_message: 'Process terminated',
+        error_message: reason,
         completed_at: new Date().toISOString(),
       })
       .in('id', ids);
-    console.log(`[Sync] Marked ${ids.length} owned sync log rows as failed (process terminating)`);
+    console.log(`[Sync] Marked ${ids.length} owned sync log rows as failed: "${reason}"`);
   } catch (_) {
     // Best-effort — process is shutting down
   }
