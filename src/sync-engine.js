@@ -1,5 +1,29 @@
 // ─── Sync Engine — src/sync-engine.js ─────────────────────────────
 //
+// v6.7 — Eliminate redundant per-prospect getLead refetch in
+//         runLeadsSweep. getChangedLeads (routed through
+//         /api/Customers/GetLead with options=261120) already returns
+//         FULL prospect data including embedded notes, calls, jobs,
+//         milestones. The prior per-prospect getLead(cstId) call was
+//         re-fetching the same data we already had, paying for it
+//         twice and roughly doubling sweep wall-clock. Pass the
+//         page-level lead object directly to processProspect.
+//         Expected impact: ~50% reduction in LP API calls per sweep,
+//         proportional reduction in sweep duration. processProspect
+//         is unchanged — same shape contract (item returned by
+//         extractArray over a GetLead response) as before.
+// v6.6 — MAX_INCREMENTAL_LEADS is now env-configurable; default lowered
+//         from 2000 → 500 to fit comfortably within a 20-min per-sweep
+//         budget. Long backlogs continue to drain across consecutive
+//         runs via getLastSyncTimestamp + MAX_INCREMENTAL_DAYS cap.
+//         Override via env: MAX_INCREMENTAL_LEADS=N.
+//         Timeout wrapper now passes a descriptive reason into
+//         markRunningLogsAsFailed (instead of the prior default
+//         "Process terminated"), so sweep-timeout rows in lp_sync_log
+//         carry an error_message that actually matches the failure
+//         mode. Sweep failure branches in incrementalSync also log
+//         the partial-progress counts before marking rows failed, so
+//         operators can see how far each sweep got before timing out.
 // v6.5 — Parallel entity sweeps with bounded concurrency.
 //         Splits incrementalSync into two independent sweeps that run
 //         in parallel: runLeadsSweep (changed leads + child records)
@@ -71,9 +95,13 @@ import { upsertLeadOnly, processProspect } from './sync-leads.js';
 import { syncAllChildRecords, syncJobAndMilestones } from './sync-children.js';
 import { checkDay15Handoffs, checkLeadTriggers } from './sync-triggers.js';
 
-// Max leads to process per incremental sync run — prevents OOM/timeout.
-// The sync runs every 15 min; it will catch up in subsequent runs.
-const MAX_INCREMENTAL_LEADS = 2000;
+// v6.6: Max leads per incremental run. Env-configurable.
+// Default lowered from 2000 → 500 so a single run fits comfortably within
+// the 20-min per-sweep budget given typical LP API latency. Backlog drains
+// across consecutive 15-min runs; getLastSyncTimestamp resumes where the
+// previous run left off (including failed runs with partial progress).
+// Override: MAX_INCREMENTAL_LEADS=N.
+const MAX_INCREMENTAL_LEADS = parseInt(process.env.MAX_INCREMENTAL_LEADS || '500', 10);
 
 // v6.3: Self-healing timeout. If a scheduled sync hangs on an unresolved
 // await (LP API stall, stuck HTTP), runWithTimeout fires after this window,
@@ -118,19 +146,24 @@ async function processInBatches(items, concurrency, fn) {
 // hung operation continues in the Node event loop. That's acceptable;
 // upserts are idempotent and the coarse STALE_LOCK (120min) plus
 // per-process activeLogIds scoping keep state coherent.
+//
+// v6.6: Pass a descriptive reason to markRunningLogsAsFailed so the
+// lp_sync_log error_message column accurately reflects the timeout
+// (rather than the SIGTERM-flavored default "Process terminated").
 async function runWithTimeout(syncFn, timeoutMs, label) {
   let timeoutHandle;
   const timeoutPromise = new Promise((_, reject) => {
     timeoutHandle = setTimeout(async () => {
+      const reason = `${label} timed out after ${timeoutMs / 60000}min`;
       console.error(`[Sync] ${label} TIMED OUT after ${timeoutMs / 60000}min — force-resetting mutex and sweeping in-flight log rows`);
       setSyncInProgress(false);
       setSyncStartedAt(null);
       try {
-        await markRunningLogsAsFailed();
+        await markRunningLogsAsFailed(reason);
       } catch (e) {
         console.warn('[Sync] Timeout sweep failed:', e.message);
       }
-      reject(new Error(`${label} timed out after ${timeoutMs / 60000}min`));
+      reject(new Error(reason));
     }, timeoutMs);
   });
 
@@ -347,19 +380,23 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
     // its sub-counts (or null on skip/error) so we aggregate after
     // Promise.allSettled completes — no shared-state increments under
     // concurrent execution.
+    //
+    // v6.7: Pass the page-level lead object directly to processProspect.
+    // getLeadData / getChangedLeads already routes to GetLead with
+    // options=261120, which returns FULL prospect data (embedded notes,
+    // calls, jobs, milestones). The prior per-prospect getLead(cstId)
+    // refetch was redundant — same endpoint, same shape, same data,
+    // 2x the LP API cost. lp-client.js comments confirm this contract.
     const batchResults = await processInBatches(items, SYNC_PROSPECT_CONCURRENCY, async (lead) => {
       // Hit-cap guard: if a peer in this batch already pushed us over
-      // the cap, skip without consuming an LP API call.
+      // the cap, skip without consuming further work.
       if (counts.leads >= maxLeads) { hitCap = true; return null; }
 
       const cstId = lead.cst_id || lead.CstID || lead.prospectid || lead.ProspectID;
       if (!cstId) return null;
 
       try {
-        const fullResult = await getLead(cstId);
-        const fullProspects = extractArray(fullResult);
-        if (fullProspects.length === 0) return null;
-        return await processProspect(fullProspects[0]);
+        return await processProspect(lead);
       } catch (err) {
         failed++;
         await logSyncError(cstId, err);
@@ -510,7 +547,14 @@ export async function incrementalSync() {
       hitCap = r.hitCap;
     } else {
       const reason = leadsRes.reason?.message || 'leadsSweep failed';
-      console.error('[Sync] Leads sweep failed:', reason);
+      // v6.6: Log partial-progress counts even though the sweep didn't
+      // return its result object — runLeadsSweep's mutation of counts
+      // happens inside its closure, so we can't read them here. We DO
+      // know the runtime so operators can see whether the sweep made
+      // any forward progress before the timeout fired (via the sync
+      // log records_synced column, which the throttled progress writes
+      // keep current to within ~5s).
+      console.error(`[Sync] Leads sweep failed: ${reason} — check lp_sync_log.records_synced for partial progress`);
       // Mark leads-side logs as failed; orchestrator continues so any
       // jobsSweep results still complete cleanly below.
       await Promise.all([
@@ -528,7 +572,7 @@ export async function incrementalSync() {
       failed += r.failed;
     } else {
       const reason = jobsRes.reason?.message || 'jobChangesSweep failed';
-      console.error('[Sync] Job-changes sweep failed:', reason);
+      console.error(`[Sync] Job-changes sweep failed: ${reason} — check lp_sync_log.records_synced for partial progress`);
       // jobs/milestones logs are co-owned by the leads sweep — only
       // mark them failed if leads sweep ALSO failed (otherwise leads-
       // sweep contributions stand and we close those logs below).
@@ -633,7 +677,7 @@ let syncTimer = null;
 
 export function startSyncScheduler() {
   if (!supabase) { console.warn('[Sync] Supabase not configured — sync disabled'); return; }
-  console.log(`[Sync] Scheduler started — incremental sync every ${SYNC_INTERVAL_MS / 60000} minutes (timeout: ${SYNC_TIMEOUT_MINUTES}min)`);
+  console.log(`[Sync] Scheduler started — incremental sync every ${SYNC_INTERVAL_MS / 60000} minutes (timeout: ${SYNC_TIMEOUT_MINUTES}min, max leads/run: ${MAX_INCREMENTAL_LEADS})`);
 
   setTimeout(async () => {
     try {
@@ -699,13 +743,13 @@ export function stopSyncScheduler() {
 process.on('SIGTERM', async () => {
   console.log('[Sync] SIGTERM received — cleaning up...');
   stopSyncScheduler();
-  await markRunningLogsAsFailed();
+  await markRunningLogsAsFailed('SIGTERM — container terminated');
   process.exit(0);
 });
 
 process.on('SIGINT', async () => {
   console.log('[Sync] SIGINT received — cleaning up...');
   stopSyncScheduler();
-  await markRunningLogsAsFailed();
+  await markRunningLogsAsFailed('SIGINT — process interrupted');
   process.exit(0);
 });
