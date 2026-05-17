@@ -1,5 +1,17 @@
 // ─── Sync Engine — src/sync-engine.js ─────────────────────────────
 //
+// v6.7 — Eliminate redundant per-prospect getLead refetch in
+//         runLeadsSweep. getChangedLeads (routed through
+//         /api/Customers/GetLead with options=261120) already returns
+//         FULL prospect data including embedded notes, calls, jobs,
+//         milestones. The prior per-prospect getLead(cstId) call was
+//         re-fetching the same data we already had, paying for it
+//         twice and roughly doubling sweep wall-clock. Pass the
+//         page-level lead object directly to processProspect.
+//         Expected impact: ~50% reduction in LP API calls per sweep,
+//         proportional reduction in sweep duration. processProspect
+//         is unchanged — same shape contract (item returned by
+//         extractArray over a GetLead response) as before.
 // v6.6 — MAX_INCREMENTAL_LEADS is now env-configurable; default lowered
 //         from 2000 → 500 to fit comfortably within a 20-min per-sweep
 //         budget. Long backlogs continue to drain across consecutive
@@ -368,19 +380,23 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
     // its sub-counts (or null on skip/error) so we aggregate after
     // Promise.allSettled completes — no shared-state increments under
     // concurrent execution.
+    //
+    // v6.7: Pass the page-level lead object directly to processProspect.
+    // getLeadData / getChangedLeads already routes to GetLead with
+    // options=261120, which returns FULL prospect data (embedded notes,
+    // calls, jobs, milestones). The prior per-prospect getLead(cstId)
+    // refetch was redundant — same endpoint, same shape, same data,
+    // 2x the LP API cost. lp-client.js comments confirm this contract.
     const batchResults = await processInBatches(items, SYNC_PROSPECT_CONCURRENCY, async (lead) => {
       // Hit-cap guard: if a peer in this batch already pushed us over
-      // the cap, skip without consuming an LP API call.
+      // the cap, skip without consuming further work.
       if (counts.leads >= maxLeads) { hitCap = true; return null; }
 
       const cstId = lead.cst_id || lead.CstID || lead.prospectid || lead.ProspectID;
       if (!cstId) return null;
 
       try {
-        const fullResult = await getLead(cstId);
-        const fullProspects = extractArray(fullResult);
-        if (fullProspects.length === 0) return null;
-        return await processProspect(fullProspects[0]);
+        return await processProspect(lead);
       } catch (err) {
         failed++;
         await logSyncError(cstId, err);
