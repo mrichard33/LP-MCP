@@ -3,9 +3,10 @@
  * src/notifications/cancellation-body-generator.js
  *
  * Single Claude call returning structured JSON { email_body }. The
- * body is scrubbed of stray markdown and hard-capped (≤2000 chars)
- * so the GHL internal_notification email step can render it verbatim
- * as the value of the {{contact.team_notification_body}} merge tag.
+ * body is scrubbed of stray HTML/markdown and hard-capped (≤2000
+ * chars) so the GHL internal_notification email step can render it
+ * verbatim as the value of the {{contact.team_notification_body}}
+ * merge tag.
  *
  * This handler is EMAIL-ONLY by design. The companion appointment
  * notifications endpoint generates both email AND SMS because that's
@@ -25,9 +26,14 @@
  * notification gate stays unflipped, and the GHL workflow's 30-min
  * timeout fires the fallback (hardcoded HTML) notification path.
  *
- * HTML output: the body uses inline markup only (<br>, <strong>) so
- * it can be safely interpolated inside a <p> wrapper in the GHL
- * email step without producing invalid HTML.
+ * PLAIN-TEXT OUTPUT (changed 2026-05-18):
+ * The GHL email step for this workflow is configured to send PLAIN
+ * TEXT, not HTML. The body must therefore use real newline characters
+ * for line breaks (\n for line break, \n\n for paragraph break) and
+ * must NOT contain HTML tags. Section headers use ALL-CAPS instead of
+ * <strong>. A defensive stripHtmlTags pass runs after generation in
+ * case the model slips a stray tag in — guarantees clean plain text
+ * regardless of model behavior.
  */
 
 import crypto from 'crypto';
@@ -71,6 +77,8 @@ Return ONLY valid JSON with exactly one string key:
   { "email_body": "..." }
 No preamble, no markdown fences, no commentary. First character {, last character }.
 
+Inside the email_body string, encode line breaks as \\n (single newline) and paragraph breaks as \\n\\n (double newline). This is JSON string-escape syntax — the resulting string contains real newline characters when parsed.
+
 AUDIENCE AND VOICE
 - You are writing for the assigned rep and a CC'd manager. Operational and direct.
 - Plain English. No marketing language, no internal system jargon. Banned vocabulary: "Antifragile", "agentic", "Layer 3", "TOFU/BOFU/SOFU", "S5.x", "stage:cancellation-review", "bj:stage-5-committed", "compression psychology", "indoctrination", "nurture flow", "Decision Engine", "Action Executor". If you find yourself reaching for any of these, rewrite in plain rep-speak.
@@ -81,47 +89,50 @@ AUDIENCE AND VOICE
 
 EMAIL BODY — target 900–1500 chars, hard cap 2000
 ═══════════════════════════════════════════════
-Use HTML-safe inline markup only. Allowed tags: <br>, <strong>. Use <br> for single line break, <br><br> for paragraph break. Do NOT use <p>, <div>, <h1>, <ul>, <li>, or any block-level tag — the body is interpolated inside a <p> wrapper in the GHL email step and block-level tags would break the markup.
+PLAIN TEXT ONLY. The GHL email step is configured to send plain text. Do NOT include any HTML tags (no <br>, no <strong>, no <p>, no <a>, none). Do NOT include any markdown (no **bold**, no _italic_, no \`code\`, no #headers). Section headers are written in ALL CAPS as their own line.
 
-Use this section layout in this order, with <br><br> between blocks:
+Line breaks are REAL newline characters (encoded as \\n in JSON). Use one newline to break a line within a block, two newlines (a blank line) to separate blocks.
+
+Use this section layout in this order, with a blank line between blocks:
 
 [Header line]
 🚨 CONTRACT CANCELLATION — {first_name} {last_name}
 
 [Contact block]
-<strong>CONTACT</strong><br>
-📞 {phone}   ✉️ {email}<br>
+CONTACT
+📞 {phone}   ✉️ {email}
 📍 {address}, {city}, {state} {postal_code}
   - Drop any line whose value is empty. If phone or email is missing, drop just that segment (including the icon). If the address line is empty, omit the whole line.
 
 [ID block]
-<strong>IDS</strong><br>
+IDS
 🆔 LP Prospect {prospect_id}   GHL ID {contact_id}
   - When prospect_id is "(unknown)" or empty, write only "🆔 GHL ID {contact_id}".
 
 [Sale block]
-<strong>SALE</strong><br>
-💰 Sale Amount: \${gross_sale_amount}<br>
+SALE
+💰 Sale Amount: \${gross_sale_amount}
 📅 Last Appointment: {last_appointment_date} ({appointment_status})
   - Omit either line if its underlying value is empty. If both are empty, omit the entire SALE block including the header.
 
 [Request block]
-<strong>WHAT THEY'RE REQUESTING</strong><br>
+WHAT THEY'RE REQUESTING
 Quote the AI Short Summary verbatim if it's available and substantive (>50 chars and operationally specific). The summary is already rep-ready — do NOT paraphrase, summarize, rephrase, or "improve" it. Reproduce it as-is.
 If the AI Short Summary is empty, generic ("customer wants to cancel"), or missing, write 2–3 sentences inferring the situation from the most_recent_note, most_recent_call_outcome, or chat_transcript_tail.
 If nothing useful is available anywhere, write exactly: "Customer has indicated they want to cancel their contract. No details captured in the system — confirm specifics on the callback."
 
 [Emotional context block — only when signals exist]
-<strong>EMOTIONAL CONTEXT</strong><br>
-• {bullet}<br>
+EMOTIONAL CONTEXT
+• {bullet}
 • {bullet}
   - 1–3 short bullets pulled from: Emotional Arc (translate to plain English), Trust Level Score (1–2 = guarded, 3 = neutral, 4–5 = engaged/cooperative), Decision Timeline ("ASAP" = wants immediate resolution), Booking Urgency, Pain Point.
+  - Each bullet is its own line (one bullet per line, separated by a single \\n).
   - Omit any bullet whose underlying data is absent.
   - If NO emotional signals exist at all, omit the entire block including the header.
   - Each bullet should be one short clause — no full paragraphs. No raw tag names.
 
 [Action block]
-<strong>SUGGESTED NEXT ACTION</strong><br>
+SUGGESTED NEXT ACTION
 One short paragraph (2–4 sentences) with concrete, actionable direction. Pick the ONE heuristic that best fits the data — do not list multiple options:
 
   - Customer already cooperating + spoke to management (visible in summary):
@@ -147,11 +158,13 @@ Adapt the wording to the specific customer situation. If multiple heuristics see
 ═══════════════════════════════════════════════════════════
 JSON OUTPUT FORMAT — EXAMPLE
 ═══════════════════════════════════════════════════════════
+The newlines in the example below are encoded as \\n. When the JSON is parsed, each \\n becomes a real newline character in the email body string.
+
 {
-  "email_body": "🚨 CONTRACT CANCELLATION — Donna Check<br><br><strong>CONTACT</strong><br>📞 (407) 256-2518   ✉️ donna@donnacheck.com<br>📍 9061 Saint Andrews Way, Mount Dora, FL 32757<br><br><strong>IDS</strong><br>🆔 LP Prospect 429381   GHL ID yOdjFC2CumlfTON7CS5D<br><br><strong>SALE</strong><br>💰 Sale Amount: $16,880<br>📅 Last Appointment: 2026-05-15 (Booked - Estimate)<br><br><strong>WHAT THEY'RE REQUESTING</strong><br>Donna Check (decision-maker) spoke with manager Helen at 12:07 PM and canceled the window order placed Friday evening, May 15, 2026. She requested expedited email confirmation of the cancellation for her home at 9061 Saint Andrews Way, Mount Dora, FL 32757. She will scan and sign the cancellation form from the packet and email it back. She plans to meet with a manager Thursday evening at 6:00.<br><br><strong>EMOTIONAL CONTEXT</strong><br>• Calm and cooperative — emotional arc moved from neutral to grateful by end of call<br>• Trust score 4 — engaged and willing to follow proper paperwork channels<br>• Wants confirmation handled today (ASAP timeline)<br><br><strong>SUGGESTED NEXT ACTION</strong><br>Customer already spoke to manager Helen and is cooperating. Call within 2 hours to confirm receipt of her cancellation request and to confirm she has the cancellation form from the packet. Walk her through emailing the signed form back, and confirm her Thursday 6:00 PM manager meeting. Note: signed Friday May 15 — this is within Florida's 3-business-day rescission window, so this is a straightforward processing call."
+  "email_body": "🚨 CONTRACT CANCELLATION — Donna Check\\n\\nCONTACT\\n📞 (407) 256-2518   ✉️ donna@donnacheck.com\\n📍 9061 Saint Andrews Way, Mount Dora, FL 32757\\n\\nIDS\\n🆔 LP Prospect 429381   GHL ID yOdjFC2CumlfTON7CS5D\\n\\nSALE\\n💰 Sale Amount: $16,880\\n📅 Last Appointment: 2026-05-15 (Booked - Estimate)\\n\\nWHAT THEY'RE REQUESTING\\nDonna Check (decision-maker) spoke with manager Helen at 12:07 PM and canceled the window order placed Friday evening, May 15, 2026. She requested expedited email confirmation of the cancellation for her home at 9061 Saint Andrews Way, Mount Dora, FL 32757. She will scan and sign the cancellation form from the packet and email it back. She plans to meet with a manager Thursday evening at 6:00.\\n\\nEMOTIONAL CONTEXT\\n• Calm and cooperative — emotional arc moved from neutral to grateful by end of call\\n• Trust score 4 — engaged and willing to follow proper paperwork channels\\n• Wants confirmation handled today (ASAP timeline)\\n\\nSUGGESTED NEXT ACTION\\nCustomer already spoke to manager Helen and is cooperating. Call within 2 hours to confirm receipt of her cancellation request and to confirm she has the cancellation form from the packet. Walk her through emailing the signed form back, and confirm her Thursday 6:00 PM manager meeting. Note: signed Friday May 15 — this is within Florida's 3-business-day rescission window, so this is a straightforward processing call."
 }
 
-Return ONLY the JSON object.`;
+Return ONLY the JSON object. No HTML tags anywhere. No markdown anywhere.`;
 
 // ───────────────────────────────────────────────────────────────────
 // LOCAL HELPERS
@@ -183,6 +196,41 @@ function tailString(input, max) {
   const s = String(input);
   if (s.length <= max) return s;
   return s.slice(s.length - max);
+}
+
+/**
+ * Defensive HTML-tag stripper. The system prompt forbids HTML, but
+ * if the model slips a stray <br> or <strong> in anyway, we want to
+ * convert it to the right plain-text equivalent rather than ship the
+ * literal tag to the email. Order matters here:
+ *   1. <br> family → newline (preserves intended line break)
+ *   2. </p><p>     → blank line (preserves intended paragraph break)
+ *   3. Strip every other tag
+ *   4. Decode common HTML entities the model might escape into
+ *      (&nbsp;, &amp;, &lt;, &gt;, &quot;, &#39;)
+ *
+ * Idempotent — calling twice on already-clean text is a no-op.
+ */
+export function stripHtmlTags(text) {
+  return String(text)
+    // <br>, <br/>, <br /> → real newline
+    .replace(/<br\s*\/?\s*>/gi, '\n')
+    // </p>\s*<p ...> → blank line (paragraph break)
+    .replace(/<\/p>\s*<p[^>]*>/gi, '\n\n')
+    // </p> alone at end of block → newline
+    .replace(/<\/p>/gi, '\n')
+    // Opening <p ...> alone → nothing (start of paragraph)
+    .replace(/<p[^>]*>/gi, '')
+    // Any other tag → nothing
+    .replace(/<[^>]+>/g, '')
+    // Common HTML entities
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&apos;/gi, "'");
 }
 
 /**
@@ -362,7 +410,7 @@ function buildUserPrompt({ payload, context }) {
   lines.push(`DATA GAPS: ${gaps.length ? gaps.join('; ') : 'none'}`);
   lines.push('');
 
-  lines.push('Write the email body per the SYSTEM PROMPT.');
+  lines.push('Write the email body per the SYSTEM PROMPT. Plain text only, no HTML, no markdown.');
   return lines.join('\n');
 }
 
@@ -415,6 +463,14 @@ async function callClaude({ system, user, model, maxTokens, temperature }) {
  * Throws on Claude failure or missing-keys-in-JSON. The caller
  * (cancellation-notifications.js orchestrator) turns the throw into
  * a 5xx so the GHL workflow's 30-min timeout fires the fallback.
+ *
+ * Post-processing pipeline (in order):
+ *   1. extractJson      — pull the JSON object out of the model output
+ *   2. stripHtmlTags    — convert any stray HTML to plain-text equivalents
+ *                         (<br> → \n, </p><p> → \n\n, strip everything else)
+ *                         and decode common HTML entities
+ *   3. stripMarkdown    — remove stray markdown emphasis (**bold**, _italic_)
+ *   4. enforceCharCap   — hard-cap at EMAIL_CHAR_CAP chars
  */
 export async function generateCancellationBody({ payload, context }) {
   if (!ANTHROPIC_API_KEY) {
@@ -442,11 +498,14 @@ export async function generateCancellationBody({ payload, context }) {
     throw new Error('email_body_missing_or_empty');
   }
 
-  // Belt-and-suspenders: strip stray markdown the model may have
-  // slipped in despite the prompt forbidding it, then hard-cap the
-  // body length so the GHL field write never overflows.
+  // Belt-and-suspenders post-processing. Order matters: strip HTML
+  // first (converts <br>/<p> tags to real newlines), then strip
+  // markdown emphasis (in case the model slipped any in), then hard-
+  // cap to the configured length. The prompt forbids both HTML and
+  // markdown, but defense-in-depth keeps the email clean regardless
+  // of model behavior.
   const email_body = enforceCharCap(
-    stripMarkdown(parsed.email_body),
+    stripMarkdown(stripHtmlTags(parsed.email_body)),
     EMAIL_CHAR_CAP,
   );
 
@@ -467,6 +526,7 @@ export async function generateCancellationBody({ payload, context }) {
 export const _internal = {
   SYSTEM_PROMPT,
   buildUserPrompt,
+  stripHtmlTags,
   cfValue,
   tailString,
   EMAIL_CHAR_CAP,
