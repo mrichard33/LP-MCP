@@ -18,6 +18,7 @@
  *   POST /api/agentic/nurture/generate           — Outbound nurture generator (S4.5 v2)
  *   POST /api/agentic/messages/engagement        — Email engagement events (§12.3)
  *   POST /api/agentic/notifications/appointment  — Calendar-agnostic GroupMe alerts (cancelled/rescheduled, v1)
+ *   POST /api/agentic/notifications/contract-cancellation — Post-demo contract-cancellation email (v1, email-only)
  *   POST /api/agentic/notifications/engagement   — Notification engagement stub (v1)
  *   POST /webhook/ghl-event                      — GHL→Agentic handoff (Webhook Bridge, no auth)
  */
@@ -28,6 +29,7 @@ import { registerCallbackMessageRoutes } from './agentic-callback-message.js';
 import { registerNurtureRoutes } from './nurture/nurture-orchestrator.js';
 import { registerEngagementRoutes } from './nurture/nurture-engagement.js';
 import { registerAppointmentNotificationRoutes } from './notifications/appointment-notifications.js';
+import { registerContractCancellationNotificationRoutes } from './notifications/cancellation-notifications.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // WEBHOOK SIGNATURE VERIFICATION (optional but recommended)
@@ -384,6 +386,37 @@ export function registerRestApiRoutes(app, authenticate) {
   // ENABLE_ENHANCED_APPT_NOTIFICATIONS env var (returns 503 when not
   // 'true' so the workflow's 30-min timeout fires the fallback).
   registerAppointmentNotificationRoutes(app);
+
+  // ═══════════════════════════════════════════════════════════════
+  // POST /api/agentic/notifications/contract-cancellation — Email only
+  // ═══════════════════════════════════════════════════════════════
+  // Receives a webhook from the GHL "Post-Demo Cancellation Routing"
+  // workflow (id 1da073c9-c8f8-46a1-932b-248547c91060). Pulls per-
+  // contact LIVE intelligence (decoded contact + LP lead summary +
+  // unified timeline + resolved prospect id), generates an email body
+  // via Claude (single call, JSON output), and writes it back to GHL
+  // in strict order: team_notification_body + team_notification_id +
+  // sms-cleared-to-empty in PATCH 1, then team_notification_ready =
+  // "Yes" as the separate atomic gate in PATCH 2. A fire-and-forget
+  // tag poke (notif-ready-poke) fires ~2s later to force the GHL
+  // wait-for-condition step to re-evaluate.
+  //
+  // EMAIL ONLY — no SMS. Contract cancellation is a lower-volume,
+  // higher-stakes event handled by a single assigned user (Shaina) +
+  // CC'd manager (Edwin), so SMS would be noise. The workflow's
+  // Internal Notification step uses {{contact.team_notification_body}}
+  // + the {{trigger_link.ihTBLwptOxJMIbpCDEH7}} ("Open Contact in
+  // Lead Perfection") trigger link directly in the email template;
+  // the agentic body content does NOT need to include the link itself.
+  //
+  // Feature-flagged via ENABLE_CONTRACT_CANCELLATION_NOTIFICATIONS
+  // (defaults TRUE; set to 'false' explicitly to disable and let the
+  // workflow's 30-min timeout fire the fallback branch). Auth: Bearer
+  // MESSAGE_ENGINE_TOKEN, same as appointment notifications. v1 event
+  // whitelist: { contract_cancellation_requested }. Adding new event
+  // types is a one-line change to ENABLED_EVENT_TYPES in
+  // notifications/cancellation-notifications.js.
+  registerContractCancellationNotificationRoutes(app);
 
   // ─── GET /api/prospects/:prospectId ────────────────────────────
   // Returns all leads for an LP prospect (cst_id)
