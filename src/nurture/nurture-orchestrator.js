@@ -102,6 +102,22 @@
  *   validate the rest of the pipeline end-to-end). Production GHL
  *   workflows never set this. When set, emits a warn-level log so the
  *   override is auditable.
+ * v2.2 — 2026-05-18. ACCURATE retry_count AUDIT.
+ *   PROBLEM: agentic_messages.retry_count was reporting 0 for every
+ *   generation that internally retried in nurture-generator.js (e.g.
+ *   max_tokens truncation recovered on the second attempt). The
+ *   orchestrator was only counting safety retries, not generation
+ *   retries. failed_generation rows reported retry_count=0 even though
+ *   the generator did do its one retry. Analytics over agentic_messages
+ *   undercounted total retries.
+ *
+ *   FIX: retryCount is now hoisted before step 4 and seeded with
+ *   genResult.generationRetries (returned by nurture-generator v1.2+).
+ *   The failed-generation catch path reads err.generationRetries from
+ *   the thrown error (set by nurture-generator v1.2+) and writes it via
+ *   the updateStatus() helper, which now accepts an optional retryCount
+ *   parameter. The safety-retry path adds the inner genResult's
+ *   generationRetries on top of the safety-retry increment.
  */
 
 import crypto from 'crypto';
@@ -222,11 +238,21 @@ export async function runNurtureGeneration(request) {
   console.log(`[NurtureOrch] nurture_state campaign="${context.nurture_state.utm_campaign}" content="${context.nurture_state.utm_content}" cta=${context.nurture_state.cta_type}`);
 
   // Step 4 — generate
+  //
+  // retryCount is hoisted here (vs declared inside step 6) so generation-
+  // internal retries — counted in genResult.generationRetries from
+  // nurture-generator v1.2+ — are written to agentic_messages.retry_count
+  // even when no safety retry occurs. Without this hoist, the analytics
+  // row reports retry_count=0 for a generation that actually retried
+  // once internally (e.g. max_tokens truncation recovered on attempt 2).
   let genResult;
+  let retryCount = 0;
   try {
     genResult = await generateNurtureContent(prompt, context);
+    retryCount = genResult.generationRetries || 0;
   } catch (err) {
-    await updateStatus(generation_id, 'failed_generation', err.message.slice(0, 200));
+    const genRetries = err.generationRetries || 1;
+    await updateStatus(generation_id, 'failed_generation', err.message.slice(0, 200), genRetries);
     await safeClearDrafts(request.contact_id, 'generation_error');
     return finishResponse(generation_id, false, 'generation_error', startedAt);
   }
@@ -247,7 +273,6 @@ export async function runNurtureGeneration(request) {
   // safety failure with the failure codes injected into the prompt;
   // if the retry still fails, suppress.
   let safety = validateSafety(output, prompt, context);
-  let retryCount = 0;
   if (!safety.passed) {
     retryCount++;
     console.warn(`[NurtureOrch] safety failed first attempt for ${generation_id}: ${safety.failures.join(', ')} details=${safety.details.join('|')} — retrying`);
@@ -258,6 +283,9 @@ export async function runNurtureGeneration(request) {
           `\n\nIMPORTANT: A previous attempt failed these safety checks: ${safety.failures.join(', ')}. Details: ${safety.details.join('; ')}. You MUST fix all of them in this attempt. These are non-negotiable compliance and trust requirements.`,
       };
       genResult = await generateNurtureContent(constrainedPrompt, context);
+      // Add any generation-internal retries from the safety-retry's
+      // generate call on top of the safety retry itself.
+      retryCount += genResult.generationRetries || 0;
       const retryAutofix = applyAutofix(genResult.output);
       if (retryAutofix.applied.length > 0) {
         console.log(`[NurtureOrch] autofix retry ${generation_id}: applied=${retryAutofix.applied.join(',')}`);
@@ -278,7 +306,8 @@ export async function runNurtureGeneration(request) {
         return finishResponse(generation_id, false, 'safety_failed_after_retry', startedAt);
       }
     } catch (retryErr) {
-      await updateStatus(generation_id, 'failed_generation', `retry_error:${retryErr.message.slice(0, 200)}`);
+      const genRetries = retryErr.generationRetries || 1;
+      await updateStatus(generation_id, 'failed_generation', `retry_error:${retryErr.message.slice(0, 200)}`, retryCount + genRetries);
       await safeClearDrafts(request.contact_id, 'retry_error');
       return finishResponse(generation_id, false, 'retry_error', startedAt);
     }
@@ -296,7 +325,7 @@ export async function runNurtureGeneration(request) {
     }
     await writeBackToGHL(request.contact_id, output, generation_id, 1.0);
   } catch (writeErr) {
-    await updateStatus(generation_id, 'failed_generation', `writeback_error:${writeErr.message.slice(0, 200)}`);
+    await updateStatus(generation_id, 'failed_generation', `writeback_error:${writeErr.message.slice(0, 200)}`, retryCount);
     await safeClearDrafts(request.contact_id, 'writeback_error');
     await alertGroupMe(buildErrorCard(request, context, generation_id, 'writeback_error', writeErr.message));
     return finishResponse(generation_id, false, 'writeback_error', startedAt);
@@ -442,14 +471,26 @@ async function attachPromptToRow(generation_id, prompt) {
   if (error) console.warn(`[NurtureOrch] attachPromptToRow failed: ${error.message}`);
 }
 
-async function updateStatus(generation_id, newStatus, reason) {
+/**
+ * Update a row's status + reason, optionally also writing retry_count.
+ *
+ * retryCount is optional (defaults to null = leave the column alone).
+ * Pass it explicitly from generation-failure paths so the audit row
+ * reflects retries that actually happened in nurture-generator.js —
+ * see v2.2 docstring above.
+ */
+async function updateStatus(generation_id, newStatus, reason, retryCount = null) {
   if (!supabase) return;
+  const updateFields = {
+    send_status: newStatus,
+    suppressed_reason: reason,
+    updated_at: new Date().toISOString(),
+  };
+  if (retryCount !== null && retryCount !== undefined) {
+    updateFields.retry_count = retryCount;
+  }
   const { error } = await supabase.from('agentic_messages')
-    .update({
-      send_status: newStatus,
-      suppressed_reason: reason,
-      updated_at: new Date().toISOString(),
-    })
+    .update(updateFields)
     .eq('generation_id', generation_id);
   if (error) console.warn(`[NurtureOrch] updateStatus failed: ${error.message}`);
 }
@@ -795,5 +836,5 @@ export function registerNurtureRoutes(app) {
     }
   });
 
-  console.log('[REST API] Registered: POST /api/agentic/nurture/generate (nurture orchestrator v2.1)');
+  console.log('[REST API] Registered: POST /api/agentic/nurture/generate (nurture orchestrator v2.2)');
 }
