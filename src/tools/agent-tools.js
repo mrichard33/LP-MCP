@@ -124,12 +124,19 @@ export function registerAgentTools(server) {
   // When omitted, the BEFORE INSERT trigger assigns a lane based on
   // action_type and rule_applied. Pass an explicit value only when
   // overriding the default lane.
+  //
+  // 2026-05-19 — action_type description hardened: removed `update_contact`
+  // from the suggested types list. The LP MCP executor (src/actions/index.js
+  // ACTION_HANDLERS) has no `update_contact` handler, and the underlying
+  // HL MCP path historically wiped tags via PUT (Kristen Nichols incident).
+  // Use add_tag/remove_tag/set_stage for tag mutations and
+  // update_custom_fields for field updates.
   server.tool(
     'create_agent_action',
     'Queue an agent action for execution. Actions can auto-execute or require human approval.',
     {
       event_id: z.number().describe('ID of the triggering system event'),
-      action_type: z.string().describe('Action type: update_contact, move_opportunity, add_tag, remove_tag, add_to_workflow, remove_from_workflow, send_message, create_task, send_notification'),
+      action_type: z.string().describe('Action type. Common: add_tag, remove_tag, set_stage, update_custom_fields, update_contact_email, move_opportunity, update_opportunity, add_to_workflow, remove_from_workflow, send_message, create_task, send_notification, book_appointment, reschedule_appointment, cancel_appointment, emit_event, layer3_dispatch. Do NOT use update_contact — unimplemented in the executor and historically wiped tags via PUT. See LP MCP src/actions/index.js ACTION_HANDLERS for the full registry.'),
       target_system: z.string().describe('Target: ghl, lp, n8n, groupme, notion'),
       target_entity: z.string().describe('Entity type: contact, opportunity, workflow, task'),
       target_id: z.string().describe('ID of entity being acted on'),
