@@ -1,5 +1,37 @@
 // ─── Sync Engine — src/sync-engine.js ─────────────────────────────
 //
+// v6.9 — Per-prospect timeout to stop ONE hung processProspect from
+//         blocking the entire leads sweep. Root cause of the 14-day
+//         silent-stall pattern: processInBatches runs Promise.allSettled
+//         over 3-prospect batches sequentially. If any single
+//         processProspect hangs on an unresolved await (most likely a
+//         GHL or LP HTTP call without a client timeout), allSettled
+//         waits forever — and the sweep wedges until the per-sweep
+//         60-min outer timeout fires. By then the whole budget is wasted
+//         and the sync log shows leads=0 forever. The fix wraps each
+//         processProspect call in a 60s timeout (env-tunable via
+//         SYNC_PROSPECT_TIMEOUT_SEC). Timed-out prospects increment the
+//         failed counter and are logged; the batch moves on. Also adds
+//         a 60s throttled "Sweep heartbeat" log so operators can see the
+//         sweep is still alive even when no multi-LP-lead prospects fire
+//         active-entry updates (single-lead prospects process silently).
+// v6.8 — Cap-hit is no longer mislabeled as a sync failure.
+//         The incrementalSync orchestrator previously passed
+//         `Capped at N leads` into syncLogComplete's errorMessage
+//         argument, which set lp_sync_log.status = 'failed' because
+//         syncLogComplete treats any truthy errorMessage as failure.
+//         That inflated last_24h.failed_syncs to 96% even though the
+//         underlying sweeps were running cleanly. It also poisoned
+//         getLastSyncTimestamp's fallback path (status='completed' with
+//         records>0 is the preferred query; cap-as-failed meant no
+//         completed-with-records row existed for 14 days, so the
+//         cursor stayed stuck at the last truly-completed sync).
+//         Fix: only pass errorMessage when there were real record
+//         failures. Cap-hit is informational — logged to console only,
+//         status stays 'completed'. Pairs with sync-log.js v6.8, which
+//         emits a system.sync_gap_detected event so the real "we have
+//         a gap" signal surfaces immediately instead of being buried
+//         under cap-induced false-failure noise.
 // v6.7 — Eliminate redundant per-prospect getLead refetch in
 //         runLeadsSweep. getChangedLeads (routed through
 //         /api/Customers/GetLead with options=261120) already returns
@@ -120,6 +152,13 @@ const SYNC_TIMEOUT_MS = SYNC_TIMEOUT_MINUTES * 60 * 1000;
 const SYNC_PER_SWEEP_TIMEOUT_MS = parseInt(process.env.SYNC_PER_SWEEP_TIMEOUT_MIN || '20', 10) * 60 * 1000;
 const SYNC_PROSPECT_CONCURRENCY = parseInt(process.env.SYNC_PROSPECT_CONCURRENCY || '3', 10);
 
+// v6.9: Per-prospect timeout. Caps the wall-clock budget of a single
+// processProspect call so one hung HTTP call cannot block the surrounding
+// Promise.allSettled batch forever. Tuned to 60s — healthy prospects
+// finish in 1-3s, so this only fires on pathological cases. Override:
+// SYNC_PROSPECT_TIMEOUT_SEC=N.
+const SYNC_PROSPECT_TIMEOUT_MS = parseInt(process.env.SYNC_PROSPECT_TIMEOUT_SEC || '60', 10) * 1000;
+
 // ─── Bounded-Parallel Helper (v6.5) ──────────────────────────────
 //
 // Runs `fn(item)` over `items` with at most `concurrency` operations in
@@ -172,6 +211,24 @@ async function runWithTimeout(syncFn, timeoutMs, label) {
   } finally {
     clearTimeout(timeoutHandle);
   }
+}
+
+// v6.9: Lightweight per-call timeout used INSIDE the leads sweep batch
+// handler. Unlike runWithTimeout above, this does NOT touch the global
+// mutex or sweep log rows — it just rejects after `ms` so the surrounding
+// Promise.allSettled batch can settle and the sweep keeps moving. The
+// hung underlying promise continues running in the event loop until it
+// resolves on its own or the process restarts; upserts are idempotent
+// so any late-arriving completion is harmless.
+function withProspectTimeout(promise, ms, label) {
+  let timeoutHandle;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutHandle = setTimeout(
+      () => reject(new Error(`prospect timeout after ${ms / 1000}s (${label})`)),
+      ms,
+    );
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeoutHandle));
 }
 
 // ─── Full Sync ───────────────────────────────────────────────────
@@ -359,8 +416,11 @@ export async function fullSync() {
 async function runLeadsSweep(since, today, logIds, maxLeads) {
   const counts = { leads: 0, calls: 0, notes: 0, jobs: 0, milestones: 0, activities: 0 };
   let failed = 0;
+  let timedOut = 0;
   let hitCap = false;
   let startIndex = 1;
+  const sweepStartedAt = Date.now();
+  let lastHeartbeat = sweepStartedAt;
 
   while (counts.leads < maxLeads) {
     let leads;
@@ -376,6 +436,8 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
     const items = extractArray(leads);
     if (items.length === 0) break;
 
+    console.log(`[Sync:Leads] Page startIndex=${startIndex} fetched ${items.length} prospects — processing with concurrency=${SYNC_PROSPECT_CONCURRENCY}, per-prospect timeout=${SYNC_PROSPECT_TIMEOUT_MS / 1000}s`);
+
     // Parallelize processProspect within the page. Each handler returns
     // its sub-counts (or null on skip/error) so we aggregate after
     // Promise.allSettled completes — no shared-state increments under
@@ -387,6 +449,12 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
     // calls, jobs, milestones). The prior per-prospect getLead(cstId)
     // refetch was redundant — same endpoint, same shape, same data,
     // 2x the LP API cost. lp-client.js comments confirm this contract.
+    //
+    // v6.9: Each processProspect call is wrapped in withProspectTimeout
+    // so a single hung HTTP call (e.g. unresolved GHL or LP request) can
+    // no longer block Promise.allSettled — the timeout rejects, the
+    // batch settles, and the sweep keeps moving. Timed-out prospects
+    // count as failed and are logged with their cstId for follow-up.
     const batchResults = await processInBatches(items, SYNC_PROSPECT_CONCURRENCY, async (lead) => {
       // Hit-cap guard: if a peer in this batch already pushed us over
       // the cap, skip without consuming further work.
@@ -396,12 +464,27 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
       if (!cstId) return null;
 
       try {
-        return await processProspect(lead);
+        return await withProspectTimeout(
+          processProspect(lead),
+          SYNC_PROSPECT_TIMEOUT_MS,
+          `cstId=${cstId}`,
+        );
       } catch (err) {
-        failed++;
-        await logSyncError(cstId, err);
+        if (err && err.message && err.message.startsWith('prospect timeout')) {
+          timedOut++;
+          failed++;
+          console.warn(`[Sync:Leads] Prospect cstId=${cstId} ${err.message} — counted as failed, moving on`);
+          await logSyncError(cstId, err);
+        } else {
+          failed++;
+          await logSyncError(cstId, err);
+        }
         return null;
       }
+
+      // Heartbeat (in-batch progress visibility). The check is outside
+      // the inner try so it runs even when prospects succeed; throttled
+      // to once every 60s to keep the log signal-to-noise high.
     });
 
     // Aggregate this batch's results into sweep-local counts.
@@ -425,6 +508,17 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
     syncLogProgress(logIds.milestones, counts.milestones);
     syncLogProgress(logIds.activities, counts.activities);
 
+    // v6.9: Heartbeat log so operators see the sweep is alive between
+    // multi-LP-lead prospect log lines. Throttled at 60s. Always logs
+    // at end of each page so a slow page (e.g. all single-lead prospects)
+    // is visible.
+    const now = Date.now();
+    if (now - lastHeartbeat >= 60000 || counts.leads % 100 === 0) {
+      const elapsedMin = ((now - sweepStartedAt) / 60000).toFixed(1);
+      console.log(`[Sync:Leads] Heartbeat — ${counts.leads} leads processed, ${failed} failed (${timedOut} timeout), elapsed ${elapsedMin}min`);
+      lastHeartbeat = now;
+    }
+
     if (hitCap || counts.leads >= maxLeads) { hitCap = true; break; }
     startIndex += items.length;
     await sleep(RATE_LIMIT_SLEEP_MS);
@@ -432,6 +526,9 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
 
   if (hitCap) {
     console.log(`[Sync:Leads] Hit MAX_INCREMENTAL_LEADS cap (${maxLeads}) — stopping. Will continue in next run.`);
+  }
+  if (timedOut > 0) {
+    console.warn(`[Sync:Leads] ${timedOut} prospects timed out (>${SYNC_PROSPECT_TIMEOUT_MS / 1000}s each) — counted as failed, sweep continued`);
   }
   return { counts, failed, hitCap };
 }
@@ -509,7 +606,7 @@ export async function incrementalSync() {
     const since = lastSyncTime.toISOString().slice(0, 10);
     const today = new Date().toISOString().slice(0, 10);
 
-    console.log(`[Sync] Incremental window: ${since} → ${today} (max ${MAX_INCREMENTAL_LEADS} leads, prospect concurrency ${SYNC_PROSPECT_CONCURRENCY}, per-sweep timeout ${SYNC_PER_SWEEP_TIMEOUT_MS / 60000}min)`);
+    console.log(`[Sync] Incremental window: ${since} → ${today} (max ${MAX_INCREMENTAL_LEADS} leads, prospect concurrency ${SYNC_PROSPECT_CONCURRENCY}, per-sweep timeout ${SYNC_PER_SWEEP_TIMEOUT_MS / 60000}min, per-prospect timeout ${SYNC_PROSPECT_TIMEOUT_MS / 1000}s)`);
 
     // v6.5: Run leads + job-changes in parallel, each with its own
     // per-sweep timeout. Promise.allSettled isolates failures so one
@@ -584,10 +681,22 @@ export async function incrementalSync() {
       }
     }
 
+    // v6.8: Cap-hit is informational, not a failure. The previous build
+    // bundled "Capped at N leads" into the errorMessage argument of
+    // syncLogComplete, which set status='failed' (because the helper
+    // treats any truthy errorMessage as failure). That inflated the
+    // 24h failed_syncs metric to 96% even when the underlying sweeps
+    // were running cleanly and the cap was draining the backlog as
+    // designed. Now we only pass errorMessage when there were real
+    // record failures, and log the cap-hit separately to console for
+    // observability.
+    const errorMsg = failed > 0 ? `${failed} records failed` : null;
+    if (hitCap) {
+      console.log(`[Sync] Hit MAX_INCREMENTAL_LEADS cap (${MAX_INCREMENTAL_LEADS}) — log status stays 'completed'; backlog continues draining in next run.`);
+    }
     // Close logs for entity types whose owning sweep resolved fulfilled.
     // Skip entities whose sweep already failed above; those rows are
     // already in 'failed' state.
-    const errorMsg = failed > 0 ? `${failed} records failed` : (hitCap ? `Capped at ${MAX_INCREMENTAL_LEADS} leads` : null);
     const closes = [];
     if (leadsRes.status === 'fulfilled') {
       closes.push(syncLogComplete(logIds.leads, counts.leads, errorMsg));

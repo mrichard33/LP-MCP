@@ -4,6 +4,21 @@
 // Tracks per-entity sync progress, completion, and failures.
 // activeLogIds scopes SIGTERM cleanup to THIS process's rows only.
 //
+// v6.8 — SYNC GAP DETECTION + ALERT.
+//         When getLastSyncTimestamp computes a bestTs older than
+//         MAX_INCREMENTAL_DAYS, we now emit a `system.sync_gap_detected`
+//         system event and upgrade the log line to console.error with
+//         a ⚠️ prefix. The event payload includes the exact
+//         FORCE_SYNC_SINCE value to use for a one-shot backfill so
+//         operators can recover in one chat command.
+//         Priority: 'critical' if gap > 7 days, else 'high'.
+//         The cap itself is unchanged — we still return the maxLookback
+//         timestamp to keep per-run workload bounded. v6.8 is about
+//         making the gap visible immediately, not auto-recovering.
+//         Root cause: a 14-day gap on 2026-05-05 went silent until
+//         17,176 milestone triggers and 180,134 day-15 leads piled up.
+//         The cap message was console.log buried in normal-looking
+//         output, and no event fired anywhere.
 // v6.6 — MAX_INCREMENTAL_DAYS is now env-configurable (default lowered
 //         from 3 → 1). Long gaps between successful syncs no longer
 //         silently expand the per-run workload to 3 days, which was
@@ -53,6 +68,14 @@ export const MAX_INCREMENTAL_DAYS = parseInt(process.env.MAX_INCREMENTAL_DAYS ||
 // while capping write volume to ~0.2 updates/sec/entity.
 const lastProgressWrite = new Map();
 const PROGRESS_THROTTLE_MS = parseInt(process.env.SYNC_PROGRESS_THROTTLE_MS || '5000', 10);
+
+// v6.8: Suppress duplicate gap alerts within a single boot. The
+// scheduler boot path calls getLastSyncTimestamp twice (once for the
+// "should we run full vs incremental" decision, once inside
+// incrementalSync itself). Without this, every boot with a real gap
+// would emit two near-identical events. The idempotency_key on the
+// emit gives belt-and-suspenders dedup at the system_events level too.
+let _gapAlertEmittedThisProcess = false;
 
 export function setSyncInProgress(val) { syncInProgress = val; }
 export function setSyncStartedAt(val) { syncStartedAt = val; }
@@ -143,6 +166,39 @@ export async function logSyncError(entityId, err, syncType = null) {
   }
 }
 
+// ─── v6.8 helper — emit a sync gap alert ─────────────────────────
+//
+// Lazy-imports event-emitter so this file stays loadable even if the
+// emitter has init-order issues at boot. bypass_filter:true is
+// required because system.* event types are not in the standard
+// rule-consumer allowlist (they go straight to notification handlers).
+async function emitSyncGapAlert(bestTs, maxLookback, gapDays) {
+  if (_gapAlertEmittedThisProcess) return;
+  _gapAlertEmittedThisProcess = true;
+  try {
+    const { emitEvent } = await import('./event-emitter.js');
+    await emitEvent({
+      event_type: 'system.sync_gap_detected',
+      event_subtype: 'incremental_cap_fired',
+      source: 'lp_sync',
+      entity_type: 'system',
+      entity_id: 'sync-engine',
+      payload: {
+        last_successful_sync: bestTs.toISOString(),
+        gap_days: gapDays,
+        capped_to: maxLookback.toISOString(),
+        force_sync_since_value: bestTs.toISOString(),
+        operator_action: `Set FORCE_SYNC_SINCE=${bestTs.toISOString()} on the LP MCP Railway service to backfill this gap, then unset after the next successful sync completes.`,
+      },
+      priority: gapDays > 7 ? 'critical' : 'high',
+      idempotency_key: `sync_gap_${new Date().toISOString().slice(0, 10)}_${gapDays}d`,
+      bypass_filter: true, // system.* events bypass the rule-consumer gate
+    });
+  } catch (alertErr) {
+    console.warn('[Sync] Failed to emit sync gap alert:', alertErr.message);
+  }
+}
+
 // Get the most recent sync timestamp to use as the "since" date for incremental sync.
 // v6.3: FORCE_SYNC_SINCE env override takes precedence — used for one-shot backfills
 //        when the gap exceeds MAX_INCREMENTAL_DAYS. Set to an ISO date string.
@@ -206,7 +262,17 @@ export async function getLastSyncTimestamp() {
     // Cap: never look back more than MAX_INCREMENTAL_DAYS
     const maxLookback = new Date(Date.now() - MAX_INCREMENTAL_DAYS * 24 * 60 * 60 * 1000);
     if (bestTs < maxLookback) {
-      console.log(`[Sync] Last sync timestamp ${bestTs.toISOString()} is older than ${MAX_INCREMENTAL_DAYS} days — capping to ${maxLookback.toISOString()}`);
+      // v6.8: Gap is real — surface it LOUDLY and emit an alert event.
+      // We still cap to keep per-run workload bounded; the alert tells
+      // operators to set FORCE_SYNC_SINCE for an explicit backfill.
+      const gapDays = Math.round((maxLookback.getTime() - bestTs.getTime()) / 86400000);
+      console.error(
+        `[Sync] ⚠️ SYNC GAP DETECTED — last sync ${bestTs.toISOString()} is ${gapDays} days behind. ` +
+        `Capping to ${maxLookback.toISOString()} — the gap will NOT be backfilled by normal runs. ` +
+        `To backfill: set FORCE_SYNC_SINCE=${bestTs.toISOString()}`
+      );
+      // Fire-and-forget — don't block the caller on the alert path.
+      emitSyncGapAlert(bestTs, maxLookback, gapDays).catch(() => {});
       return maxLookback;
     }
 
