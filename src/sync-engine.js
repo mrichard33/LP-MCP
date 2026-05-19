@@ -1,5 +1,22 @@
 // ─── Sync Engine — src/sync-engine.js ─────────────────────────────
 //
+// v6.8 — Cap-hit is no longer mislabeled as a sync failure.
+//         The incrementalSync orchestrator previously passed
+//         `Capped at N leads` into syncLogComplete's errorMessage
+//         argument, which set lp_sync_log.status = 'failed' because
+//         syncLogComplete treats any truthy errorMessage as failure.
+//         That inflated last_24h.failed_syncs to 96% even though the
+//         underlying sweeps were running cleanly. It also poisoned
+//         getLastSyncTimestamp's fallback path (status='completed' with
+//         records>0 is the preferred query; cap-as-failed meant no
+//         completed-with-records row existed for 14 days, so the
+//         cursor stayed stuck at the last truly-completed sync).
+//         Fix: only pass errorMessage when there were real record
+//         failures. Cap-hit is informational — logged to console only,
+//         status stays 'completed'. Pairs with sync-log.js v6.8, which
+//         emits a system.sync_gap_detected event so the real "we have
+//         a gap" signal surfaces immediately instead of being buried
+//         under cap-induced false-failure noise.
 // v6.7 — Eliminate redundant per-prospect getLead refetch in
 //         runLeadsSweep. getChangedLeads (routed through
 //         /api/Customers/GetLead with options=261120) already returns
@@ -584,10 +601,22 @@ export async function incrementalSync() {
       }
     }
 
+    // v6.8: Cap-hit is informational, not a failure. The previous build
+    // bundled "Capped at N leads" into the errorMessage argument of
+    // syncLogComplete, which set status='failed' (because the helper
+    // treats any truthy errorMessage as failure). That inflated the
+    // 24h failed_syncs metric to 96% even when the underlying sweeps
+    // were running cleanly and the cap was draining the backlog as
+    // designed. Now we only pass errorMessage when there were real
+    // record failures, and log the cap-hit separately to console for
+    // observability.
+    const errorMsg = failed > 0 ? `${failed} records failed` : null;
+    if (hitCap) {
+      console.log(`[Sync] Hit MAX_INCREMENTAL_LEADS cap (${MAX_INCREMENTAL_LEADS}) — log status stays 'completed'; backlog continues draining in next run.`);
+    }
     // Close logs for entity types whose owning sweep resolved fulfilled.
     // Skip entities whose sweep already failed above; those rows are
     // already in 'failed' state.
-    const errorMsg = failed > 0 ? `${failed} records failed` : (hitCap ? `Capped at ${MAX_INCREMENTAL_LEADS} leads` : null);
     const closes = [];
     if (leadsRes.status === 'fulfilled') {
       closes.push(syncLogComplete(logIds.leads, counts.leads, errorMsg));
