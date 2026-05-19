@@ -21,6 +21,12 @@
  *   BLOCK — action is rejected before handler dispatch; status becomes
  *           'rejected_by_validation'; GroupMe intelligence notification fires.
  *   WARN  — action proceeds; a warning row writes to validation_log.
+ *
+ * 2026-05-19 — v2 expansion. Added 9 invariants across 4 new categories:
+ *   STAGE_INTEGRITY (SI-1 WARN, SI-2 BLOCK, SI-3 BLOCK)
+ *   SELF_FULFILLING (SF-1 BLOCK)
+ *   CHANNEL_INTEGRITY (CI-1 WARN, CI-2 BLOCK)
+ *   ENTRY_SOURCE_COHERENCE (ES-1 WARN, ES-2 BLOCK, ES-3 BLOCK)
  */
 
 import {
@@ -30,12 +36,26 @@ import {
   checkSolutionPitchRequiresEducation,
 } from './invariants/trust-level.js';
 
-// v2 stubs — files exist with no-op implementations so registry is stable
-// and the orchestrator never has to guard against missing imports.
-// import { checkOneActiveStageTag, ... } from './invariants/stage-integrity.js';
-// import { checkRuleGateNotSetBySibling } from './invariants/self-fulfilling.js';
-// import { checkNotificationChannelMatch, ... } from './invariants/channel-integrity.js';
-// import { checkPrePositionedEntrySkipStage1, ... } from './invariants/entry-source.js';
+import {
+  checkOneActiveStageTag,
+  checkEntrySourceAtomicSwap,
+  checkNoDuplicateWorkflowEnrollment,
+} from './invariants/stage-integrity.js';
+
+import {
+  checkRuleGateNotSetBySibling,
+} from './invariants/self-fulfilling.js';
+
+import {
+  checkNotificationChannelMatch,
+  checkDncNarrativeMatchesTrigger,
+} from './invariants/channel-integrity.js';
+
+import {
+  checkPrePositionedEntrySkipStage1,
+  checkCalculatorNoPrematureLossReason,
+  checkCanvassingBlocksPremiumUntilConfirmed,
+} from './invariants/entry-source.js';
 
 // ─── Applicability filters ─────────────────────────────────────────────
 // Each filter is a fn(action) → boolean. Returns true if the invariant
@@ -61,6 +81,22 @@ const isS2x_Enrollment = (a) =>
 const isS3x_Enrollment = (a) =>
   isWorkflowEnrollment(a) &&
   /^S3\.\d+$/.test(a.action_payload?.canonical_code || '');
+
+// v2 — applicability filters for new invariant categories.
+const isAddTag = (a) => a.action_type === 'add_tag';
+const isAddStageTag = (a) =>
+  isAddTag(a) && String(a.action_payload?.tag || '').toLowerCase().startsWith('stage:');
+const isAddActiveEntryTag = (a) =>
+  isAddTag(a) && String(a.action_payload?.tag || '').toLowerCase().startsWith('active-entry:');
+const isAddLossReasonTag = (a) =>
+  isAddTag(a) && String(a.action_payload?.tag || '').toLowerCase().startsWith('loss-reason:');
+
+const isSendNotification = (a) => a.action_type === 'send_notification';
+
+// SF-1 applies to any executed action whose rule_applied is a real rule
+// (skip synthetic dispatchers handled inside the check).
+const hasRuleApplied = (a) =>
+  !!a.rule_applied && a.rule_applied !== 'LAYER3_DISPATCH' && !String(a.rule_applied).startsWith('AVG_');
 
 // ─── Invariant registry ────────────────────────────────────────────────
 
@@ -111,18 +147,112 @@ export const INVARIANTS = [
     docs_anchor: 'TL-4',
   },
 
-  // ─── STAGE_INTEGRITY (v2) ────────────────────────────────────────────
-  // SI-1, SI-2, SI-3 land in v2. Registry hook in place; implementations
-  // pending. See docs section "Build phasing".
+  // ─── STAGE_INTEGRITY (v2 — 2026-05-19) ───────────────────────────────
+  {
+    key: 'SI-1',
+    name: 'one_active_stage_tag',
+    category: 'STAGE_INTEGRITY',
+    severity: 'WARN', // set_stage handler already does atomic swap; this catches add_tag stragglers
+    framework_citation:
+      'Lead Routing Doctrine — Exactly one stage:* tag at all times. Multi-stage state forks routing non-deterministically',
+    applies_to: isAddStageTag,
+    check: checkOneActiveStageTag,
+    docs_anchor: 'SI-1',
+  },
+  {
+    key: 'SI-2',
+    name: 'entry_source_atomic_swap',
+    category: 'STAGE_INTEGRITY',
+    severity: 'BLOCK',
+    framework_citation:
+      'Lead Routing Doctrine — All routing decisions check active-entry:*. Multiple active entries = unreachable contact (Julius Yarush incident)',
+    applies_to: isAddActiveEntryTag,
+    check: checkEntrySourceAtomicSwap,
+    docs_anchor: 'SI-2',
+  },
+  {
+    key: 'SI-3',
+    name: 'no_duplicate_workflow_enrollment',
+    category: 'STAGE_INTEGRITY',
+    severity: 'BLOCK',
+    framework_citation:
+      'Lead Routing Doctrine — Workflow active-w* tag prevents duplicate enrollment. Karen Reliford incident: 2x S2.5 sends 10.5h apart',
+    applies_to: isWorkflowEnrollment,
+    check: checkNoDuplicateWorkflowEnrollment,
+    docs_anchor: 'SI-3',
+  },
 
-  // ─── SELF_FULFILLING (v2) ────────────────────────────────────────────
-  // SF-1 runtime check + SF-2 startup audit land in v2.
+  // ─── SELF_FULFILLING (v2 — 2026-05-19) ───────────────────────────────
+  {
+    key: 'SF-1',
+    name: 'rule_gate_not_set_by_sibling',
+    category: 'SELF_FULFILLING',
+    severity: 'BLOCK',
+    framework_citation:
+      'Lead Routing Doctrine — A rule\'s gate must not match a tag the same dispatch sets. Shoopen incident: LAYER3 stamped bj:stage-5, then O.0 matched on it',
+    applies_to: hasRuleApplied,
+    check: checkRuleGateNotSetBySibling,
+    docs_anchor: 'SF-1',
+  },
 
-  // ─── CHANNEL_INTEGRITY (v2) ──────────────────────────────────────────
-  // CI-1 (WARN) + CI-2 (BLOCK) land in v2.
+  // ─── CHANNEL_INTEGRITY (v2 — 2026-05-19) ─────────────────────────────
+  {
+    key: 'CI-1',
+    name: 'notification_channel_match',
+    category: 'CHANNEL_INTEGRITY',
+    severity: 'WARN', // outbound-history not tracked yet; we only validate against source event
+    framework_citation:
+      'Expert Secrets Redeemable Admission + Traffic Secrets H/S/O fidelity — Notification must not claim cross-channel state that contradicts the event',
+    applies_to: isSendNotification,
+    check: checkNotificationChannelMatch,
+    docs_anchor: 'CI-1',
+  },
+  {
+    key: 'CI-2',
+    name: 'dnc_narrative_matches_trigger',
+    category: 'CHANNEL_INTEGRITY',
+    severity: 'BLOCK',
+    framework_citation:
+      'Compliance discipline — DNC notification channel must come from event.payload, not rule defaults. James Davis incident: "DNC on SMS" for email reply',
+    applies_to: isSendNotification,
+    check: checkDncNarrativeMatchesTrigger,
+    docs_anchor: 'CI-2',
+  },
 
-  // ─── ENTRY_SOURCE_COHERENCE (v2) ─────────────────────────────────────
-  // ES-1, ES-2, ES-3 land in v2.
+  // ─── ENTRY_SOURCE_COHERENCE (v2 — 2026-05-19) ────────────────────────
+  {
+    key: 'ES-1',
+    name: 'pre_positioned_entry_skip_stage_1',
+    category: 'ENTRY_SOURCE_COHERENCE',
+    severity: 'WARN', // observe before blocking — Stage-1 enrollment of pre-positioned could be legitimate in recovery flows
+    framework_citation:
+      'DotCom Secrets Phase 1 (Traffic Temperature) — Warm/hot traffic gets warm/hot copy, not cold-bridge education. Stage-1 messaging undoes source positioning',
+    applies_to: isWorkflowEnrollment,
+    check: checkPrePositionedEntrySkipStage1,
+    docs_anchor: 'ES-1',
+  },
+  {
+    key: 'ES-2',
+    name: 'calculator_no_premature_loss_reason',
+    category: 'ENTRY_SOURCE_COHERENCE',
+    severity: 'BLOCK',
+    framework_citation:
+      'Lead Routing Doctrine — Loss reasons require prior deal state. Jeff Harrison incident: calculator leads tagged loss-reason without ever booking',
+    applies_to: isAddLossReasonTag,
+    check: checkCalculatorNoPrematureLossReason,
+    docs_anchor: 'ES-2',
+  },
+  {
+    key: 'ES-3',
+    name: 'canvassing_blocks_premium_until_confirmed',
+    category: 'ENTRY_SOURCE_COHERENCE',
+    severity: 'BLOCK',
+    framework_citation:
+      'Canvassing policy 2026-05-08 — CC must confirm canvassing lead before premium funnel position. Premium content to unverified leads burns deliverability',
+    applies_to: isWorkflowEnrollment,
+    check: checkCanvassingBlocksPremiumUntilConfirmed,
+    docs_anchor: 'ES-3',
+  },
 ];
 
 // Quick lookup by key for unit tests and admin tooling
@@ -165,5 +295,11 @@ export const __testing = {
   isO0_Enrollment,
   isS2x_Enrollment,
   isS3x_Enrollment,
+  isAddTag,
+  isAddStageTag,
+  isAddActiveEntryTag,
+  isAddLossReasonTag,
+  isSendNotification,
+  hasRuleApplied,
   DISABLED_VIA_ENV,
 };
