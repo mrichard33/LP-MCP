@@ -18,7 +18,7 @@
  * are a SECOND layer that catches violations the handler can't see:
  *   - Batch ordering errors (one action adds, sibling adds a conflict
  *     before the handler's exclusivity check fires)
- *   - Direct enrollments in active-w* state that bypass handler swap
+ *   - Direct enrollments in active-{prefix}* state that bypass handler swap
  *   - Cross-action invariant breakage (n8n PUT-style mass tag wipes
  *     reaching the executor as add_tag chains)
  *
@@ -49,6 +49,52 @@ async function loadContactTags(contactId) {
 function tagsWithPrefix(tagSet, prefix) {
   if (!tagSet) return [];
   return [...tagSet].filter((t) => t.startsWith(prefix.toLowerCase()));
+}
+
+/**
+ * Generate the set of "active workflow" tag candidates for a given canonical
+ * code. Both the current functional-prefix convention AND the legacy W-prefix
+ * convention are checked because the 2026-05 rename was ID-stable but the
+ * workflows' internal "add tag" steps were updated piecemeal — production
+ * snapshot still shows legacy active-w5.2 (10 contacts) alongside new
+ * active-s5.2 (4 contacts) for the same workflow.
+ *
+ * For canonical_code "S5.2" this returns:
+ *   - active-s5.2          ← NEW convention (post-rename, post-update)
+ *   - active-w-s5.2        ← legacy with dash + prefix kept
+ *   - active-ws5.2         ← legacy with prefix kept, no dash
+ *   - active-w5.2          ← legacy with prefix letter stripped (MOST COMMON
+ *                            in production for S-family workflows)
+ *
+ * For canonical_code "E.4" this returns:
+ *   - active-e.4           ← NEW convention
+ *   - active-w-e.4         ← legacy variants
+ *   - active-we.4
+ *   - active-w.4           ← legacy with prefix letter stripped
+ *
+ * Deduplication is handled by the caller via Set membership check against
+ * the contact's tag snapshot. Extra candidates that aren't on the contact
+ * are harmless.
+ */
+function activeWorkflowTagCandidates(canonicalCode) {
+  const codeLower = String(canonicalCode || '').toLowerCase();
+  if (!codeLower) return [];
+
+  // Strip the leading prefix letter (s, e, o, f, l, a, b, c, i, u, etc.)
+  // to derive the legacy W-form. Handles both "s5.2" → "5.2" and "e.4" → ".4".
+  const withoutPrefix = codeLower.replace(/^[a-z]/, '');
+
+  // Use a Set to dedupe naturally — for canonical codes where the prefix
+  // letter and W happen to coincide (none currently), or where the strip
+  // yields the same result, we don't double-up the array.
+  const candidates = new Set([
+    `active-${codeLower}`,         // NEW: active-s5.2, active-e.4, active-o.0
+    `active-w-${codeLower}`,       // legacy w-dash-prefix: active-w-s5.2
+    `active-w${codeLower}`,        // legacy w-noprefix: active-ws5.2
+    `active-w${withoutPrefix}`,    // legacy w-stripped: active-w5.2, active-w.4
+  ]);
+
+  return [...candidates];
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -198,16 +244,29 @@ export async function checkEntrySourceAtomicSwap(action, ctx = {}) {
 // ═══════════════════════════════════════════════════════════════════════
 //
 // Action add_to_workflow for canonical code X — verify the contact does
-// NOT already have an active-w-{X} or active-w{X} tag (unless the batch
-// removes it first).
+// NOT already have an active-workflow tag indicating they are mid-flight
+// in that workflow (unless the batch removes it first).
 //
 // Why: Karen Reliford post-mortem. Enrolled in S2.5 twice within a 10.5h
-// window because the agentic re-enrollment didn't drop her active-w* tag.
+// window because the agentic re-enrollment didn't drop her active-* tag.
 // Workflow's own "check if started" gate silently let her through twice.
 //
-// The doctrine tag convention is `active-w-{CANONICAL_CODE}` lowercase,
-// but we also check `active-w{code}` (no dash, legacy) for backward
-// compatibility with older rules.
+// TAG CONVENTION (2026-05-19 corrected): The current naming convention
+// after the W→functional-prefix rename uses the canonical code directly:
+//
+//   S5.2 Appointment Rescue  →  active-s5.2
+//   E.4 Canvassing Bridge    →  active-e.4
+//   O.0 Objection Handler    →  active-o.0
+//   F.0 Post-Appt Follow-Up  →  active-f.0
+//
+// Legacy W-prefix tags still exist in production on contacts enrolled
+// before the workflows' internal "add tag" steps were updated. Production
+// snapshot (queried 2026-05-19) shows active-w5.2 on 10 contacts alongside
+// active-s5.2 on 4 contacts — same workflow, two tag generations live
+// simultaneously. SI-3 must check BOTH conventions or it silently allows
+// duplicate enrollment for the majority of mid-flight S-family contacts.
+//
+// activeWorkflowTagCandidates() enumerates all four variants.
 
 export async function checkNoDuplicateWorkflowEnrollment(action, ctx = {}) {
   if (action.action_type !== 'add_to_workflow') {
@@ -227,21 +286,13 @@ export async function checkNoDuplicateWorkflowEnrollment(action, ctx = {}) {
   const tags = await loadContactTags(contactId);
   if (tags === null) return { passed: true, reason: 'infra_error_open' };
 
-  const codeLower = canonicalCode.toLowerCase();
-  // Match both new convention `active-w-S5.2` and legacy `active-ws5.2`
-  // (no dash) and `active-w5.2` (legacy W-prefix without S).
-  const candidates = [
-    `active-w-${codeLower}`,
-    `active-w${codeLower}`,
-    `active-w${codeLower.replace(/^s/, '')}`,
-  ];
-
+  const candidates = activeWorkflowTagCandidates(canonicalCode);
   const found = candidates.filter((c) => tags.has(c));
   if (found.length === 0) {
     return { passed: true, reason: 'not_currently_active' };
   }
 
-  // Check if the batch removes the conflicting active-w* tag first.
+  // Check if the batch removes the conflicting active-* tag first.
   const batchRemoved = ctx.batchPriorTagsRemoved || new Set();
   const stillActive = found.filter((t) => !batchRemoved.has(t));
   if (stillActive.length === 0) {
@@ -251,16 +302,19 @@ export async function checkNoDuplicateWorkflowEnrollment(action, ctx = {}) {
   return {
     passed: false,
     reason:
-      `Contact already has active-w tag(s) [${stillActive.join(', ')}] indicating ` +
+      `Contact already has active-workflow tag(s) [${stillActive.join(', ')}] indicating ` +
       `they are currently enrolled in ${canonicalCode}. Re-enrolling without first ` +
-      `removing the active-w* tag duplicates messaging (Karen Reliford incident). ` +
-      `Queue remove_tag for the active-w* before this add_to_workflow, or use ` +
-      `remove_from_workflow as a sibling action with lower sequence_order.`,
+      `removing the active-* tag duplicates messaging (Karen Reliford incident). ` +
+      `Queue remove_tag for the active-* before this add_to_workflow, or use ` +
+      `remove_from_workflow as a sibling action with lower sequence_order. Note: ` +
+      `both new (active-${canonicalCode.toLowerCase()}) and legacy ` +
+      `(active-w${canonicalCode.toLowerCase().replace(/^[a-z]/, '')}) tag forms are ` +
+      `checked because workflows are mid-migration from W-prefix to functional prefix.`,
     context_snapshot: {
       canonical_code: canonicalCode,
       checked_candidates: candidates,
       currently_active_tags: stillActive,
-      batch_removed_in_session: [...batchRemoved].filter((t) => t.startsWith('active-w')),
+      batch_removed_in_session: [...batchRemoved].filter((t) => t.startsWith('active-')),
     },
   };
 }
@@ -269,4 +323,5 @@ export async function checkNoDuplicateWorkflowEnrollment(action, ctx = {}) {
 export const __testing = {
   loadContactTags,
   tagsWithPrefix,
+  activeWorkflowTagCandidates,
 };
