@@ -81,6 +81,20 @@
  * Each step short-circuits the batch on hard fail; classify_bucket
  * exposes target_workflow_id via batchContext._context so the downstream
  * add_to_workflow picks it up without rule re-templating.
+ *
+ * 2026-05-18 — Antifragile Validation Gate wired into executeSingleAction.
+ * The gate runs immediately before handler dispatch, validates the action
+ * against codified framework invariants (Antifragile Trust Escalation,
+ * Expert Secrets Big Domino, DotCom Traffic Temperature), and rejects
+ * actions that violate doctrine. Status 'rejected_by_validation' is the
+ * new terminal state for blocked actions. See:
+ *   docs/ANTIFRAGILE_VALIDATION_GATE_DOCTRINE.md
+ *   src/services/validation-gate.js
+ *   src/services/validation/doctrine.js
+ *   src/services/validation/invariants/*
+ * v1 ships TL-1..TL-4 (trust-level invariants). v2 adds stage-integrity,
+ * self-fulfilling, channel-integrity, entry-source. Master kill switch:
+ * AVG_ENABLED=false. Per-invariant disable: AVG_DISABLE_INVARIANTS=TL-1,TL-2.
  */
 
 import supabase from '../supabase.js';
@@ -96,6 +110,9 @@ import { getDispatchForClassification } from '../services/layer3-dispatch.js';
 
 // Phase 1 Intake/Routing Layer #51 — universal outbound suppression
 import { checkSuppression } from '../services/suppression-check.js';
+
+// Antifragile Validation Gate — pre-handler invariant check (2026-05-18)
+import { validateAction } from '../services/validation-gate.js';
 
 // ─── Handlers ──────────────────────────────────────────────────────
 import { executeAddTag, executeRemoveTag, executeSetStage } from './handlers/tags.js';
@@ -339,7 +356,7 @@ const CONTEXT_AWARE_HANDLERS = new Set([
 // EXECUTOR ENGINE
 // ═══════════════════════════════════════════════════════════════════
 
-async function executeSingleAction(action, batchContext = {}) {
+async function executeSingleAction(action, batchContext = {}, priorBatchResults = []) {
   const handler = ACTION_HANDLERS[action.action_type];
   if (!handler) {
     await supabase.from('agent_actions').update({
@@ -356,6 +373,38 @@ async function executeSingleAction(action, batchContext = {}) {
     updated_at: new Date().toISOString(),
   }).eq('id', action.id);
 
+  // ═══ Antifragile Validation Gate (2026-05-18) ═══════════════════
+  // Runs immediately before handler dispatch. Blocks actions that violate
+  // codified framework invariants (Antifragile Trust Escalation, Expert
+  // Secrets Big Domino, DotCom Traffic Temperature). Fail-open on infra
+  // errors. See docs/ANTIFRAGILE_VALIDATION_GATE_DOCTRINE.md.
+  let validation;
+  try {
+    validation = await validateAction(action, { priorBatchResults });
+  } catch (e) {
+    console.error(`[ActionExecutor] AVG threw (fail-open): ${e.message}`);
+    validation = { decision: 'pass', blocked: false, warnings: [], reason: 'avg_exception_open' };
+  }
+
+  if (validation.blocked) {
+    await supabase.from('agent_actions').update({
+      status: 'rejected_by_validation',
+      error_message:
+        `AVG ${validation.blocking_invariant.key} — ${validation.blocking_invariant.name}: ` +
+        `${validation.blocking_reason}`,
+      execution_result: validation,
+      executed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }).eq('id', action.id);
+    return {
+      action_id: action.id,
+      status: 'rejected_by_validation',
+      action_type: action.action_type,
+      validation,
+    };
+  }
+  // ═══════════════════════════════════════════════════════════════════
+
   try {
     let context = {};
     if (CONTEXT_AWARE_HANDLERS.has(action.action_type)) {
@@ -370,7 +419,12 @@ async function executeSingleAction(action, batchContext = {}) {
       updated_at: new Date().toISOString(),
     }).eq('id', action.id);
     console.log(`[ActionExecutor] ✅ ${action.action_type} completed (action ${action.id}, rule: ${action.rule_applied})`);
-    return { action_id: action.id, status: 'completed', result };
+    return {
+      action_id: action.id,
+      status: 'completed',
+      action_type: action.action_type,
+      result,
+    };
   } catch (err) {
     const retries = (action.retry_count || 0) + 1;
     const max = action.max_retries || 3;
@@ -383,7 +437,13 @@ async function executeSingleAction(action, batchContext = {}) {
       updated_at: new Date().toISOString(),
     }).eq('id', action.id);
     console.error(`[ActionExecutor] ❌ ${action.action_type} failed (action ${action.id}): ${err.message} [retry ${retries}/${max}]`);
-    return { action_id: action.id, status: st, error: err.message, retry: `${retries}/${max}` };
+    return {
+      action_id: action.id,
+      status: st,
+      action_type: action.action_type,
+      error: err.message,
+      retry: `${retries}/${max}`,
+    };
   }
 }
 
@@ -437,23 +497,29 @@ export async function executeActions({ limit = 50 } = {}) {
 
   console.log(`[ActionExecutor] Executing ${actions.length} actions in ${batches.size} batches...`);
   const results = [];
-  let completed = 0, failed = 0;
+  let completed = 0, failed = 0, rejectedByValidation = 0;
   for (const [, ba] of batches) {
     const batchContext = {};
+    const priorBatchResults = [];
     for (const a of ba) {
-      const r = await executeSingleAction(a, batchContext);
+      const r = await executeSingleAction(a, batchContext, priorBatchResults);
       results.push(r);
+      priorBatchResults.push({ ...r, action: a });
       if (r.status === 'completed') completed++;
       else if (r.status === 'failed') { failed++; break; }
+      else if (r.status === 'rejected_by_validation') rejectedByValidation++;
+      // 'rejected_by_validation' does NOT break the batch — siblings continue.
+      // A single invariant violation shouldn't kill unrelated routing.
     }
   }
   const elapsed = Date.now() - startTime;
-  console.log(`[ActionExecutor] Done: ${completed} completed, ${failed} failed (${elapsed}ms)`);
+  console.log(`[ActionExecutor] Done: ${completed} completed, ${failed} failed, ${rejectedByValidation} rejected_by_validation (${elapsed}ms)`);
   return {
     success: true,
     actions_executed: results.length,
     completed,
     failed,
+    rejected_by_validation: rejectedByValidation,
     retrying: results.filter(r => r.status === 'pending').length,
     approval_requests_sent: approvalRequestsSent,
     stuck_actions_reaped: reaperResult.reaped || 0,
@@ -491,7 +557,7 @@ export async function executeActionById(actionId, opts = {}) {
   if (fetchErr) throw new Error(`Failed to fetch action ${actionId}: ${fetchErr.message}`);
   if (!action) throw new Error(`Action ${actionId} not found`);
 
-  const terminal = new Set(['completed', 'rejected']);
+  const terminal = new Set(['completed', 'rejected', 'rejected_by_validation']);
   if (terminal.has(action.status)) {
     return {
       action_id: actionId,
@@ -530,7 +596,7 @@ export async function executeActionById(actionId, opts = {}) {
   }
 
   console.log(`[ActionExecutor] Direct-execute action ${actionId} (type: ${action.action_type}, prior status: ${action.status})`);
-  const result = await executeSingleAction(action, {});
+  const result = await executeSingleAction(action, {}, []);
   return {
     ...result,
     direct_execute: true,
@@ -586,12 +652,13 @@ export function registerActionExecutorRoutes(app) {
 
   app.get('/n8n/decision-engine/execution-stats', async (req, res) => {
     try {
-      const [p, a, c, f, e] = await Promise.all([
+      const [p, a, c, f, e, rv] = await Promise.all([
         supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'pending'),
         supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'pending_approval'),
         supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'completed'),
         supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'failed'),
         supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'executing'),
+        supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'rejected_by_validation'),
       ]);
       res.json({
         pending: p.count || 0,
@@ -599,6 +666,7 @@ export function registerActionExecutorRoutes(app) {
         completed: c.count || 0,
         failed: f.count || 0,
         executing: e.count || 0,
+        rejected_by_validation: rv.count || 0,
       });
     } catch (err) {
       res.status(500).json({ error: err.message });
