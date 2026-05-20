@@ -23,6 +23,9 @@
  *  10. For S5.2 cluster states, ensure `last_appointment_reschedule_link`
  *      is populated with a valid, separator-suffixed URL (v1.4).
  *  11. Optionally enqueue a workflow enrollment if the policy has one.
+ *  12. Emit a "routed to {workflow} branch {X}" GroupMe notification that
+ *      reflects the actual destination, not a generic "objection detected"
+ *      fall-through message (v1.6).
  *
  * NOTE on transactions: the Supabase JS client (PostgREST) does not expose
  * BEGIN/COMMIT. We get atomicity via an advisory lock + the partial unique
@@ -66,6 +69,22 @@
  *              webhook trigger never fired. Webhook URL is sourced from
  *              objection_state_policies.recovery_webhook_url (column added
  *              this date).
+ *
+ * 2026-05-20 — v1.6: emits an accurate "routed to {workflow} branch {X}"
+ *              GroupMe notification immediately after the workflow enrollment
+ *              is queued. Replaces the legacy `create_task` action from
+ *              layer3_action_dispatch row 8 which said "did not auto-route"
+ *              regardless of whether routing actually succeeded. The new
+ *              notification names:
+ *                - the destination workflow (S5.2 v2)
+ *                - the specific branch (A-J, derived from state_code)
+ *                - the human-readable state label
+ *                - the recovery_attempt_number / parent_attempt_number
+ *                - the recovery window + touch count
+ *                - the trigger source + event id
+ *                - the route taken (A or B)
+ *              Uses notification_class='intelligence' per the v1.0 Notification
+ *              Standard. Cooldown 5min to dedupe rapid re-fires.
  */
 
 import supabase from '../../supabase.js';
@@ -107,6 +126,53 @@ const ALLOWED_TRIGGER_SOURCES = new Set([
 const VALID_RESOLUTIONS = new Set([
   'superseded', 'recovered', 'cooled', 'escalated', 'manual', 'backfilled',
 ]);
+
+// ─── v1.6: state_code → S5.2 v2 branch mapping ─────────────────────────────
+//
+// S5.2 v2's inbound webhook splitter routes contacts to one of branches A-J
+// (plus a Fallback) based on the state_code value in the webhook payload.
+// This map is the human-facing label table — we don't use it for routing
+// (the workflow itself splits on the state_code string), only for notification
+// text. Keep in sync with the actual workflow splitter conditions.
+//
+// Source: project memory / S5.2 v2 build documentation 2026-05-20.
+const STATE_TO_BRANCH = {
+  'APPOINTMENT_FRICTION.spouse_uncertainty':     { branch: 'A', label: 'Spouse Uncertainty' },
+  'APPOINTMENT_FRICTION.timing_delay':           { branch: 'B', label: 'Timing Delay' },
+  'APPOINTMENT_FRICTION.trust_hesitation':       { branch: 'C', label: 'Trust Hesitation' },
+  'APPOINTMENT_FRICTION.overwhelmed':            { branch: 'D', label: 'Overwhelmed' },
+  'APPOINTMENT_FRICTION.price_anxiety_pre_demo': { branch: 'E', label: 'Price Anxiety (Pre-Demo)' },
+  'APPOINTMENT_FRICTION.ghost_after_booking':    { branch: 'F', label: 'Ghost After Booking' },
+  'APPOINTMENT_DISRUPTION.no_show':              { branch: 'G', label: 'No Show' },
+  'APPOINTMENT_DISRUPTION.cancelled':            { branch: 'H', label: 'Cancelled' },
+  'APPOINTMENT_DISRUPTION.one_leg':              { branch: 'I', label: 'One Leg' },
+  'APPOINTMENT_DISRUPTION.be_back':              { branch: 'J', label: 'Be Back' },
+};
+
+const PARENT_STATE_LABELS = {
+  APPOINTMENT_FRICTION:     'Pre-Demo Friction',
+  APPOINTMENT_DISRUPTION:   'Appointment Disruption',
+  POST_PROPOSAL_RESISTANCE: 'Post-Proposal Resistance',
+  DISENGAGEMENT:            'Disengagement',
+};
+
+function mapStateCodeToBranch(state_code) {
+  return STATE_TO_BRANCH[state_code] || { branch: 'Fallback', label: state_code };
+}
+
+function parentStateLabel(parent_state) {
+  return PARENT_STATE_LABELS[parent_state] || parent_state;
+}
+
+// Workflow display names by recovery_workflow_id. Used in notification text.
+// Add new entries when policies start pointing at workflows beyond S5.2 v2.
+const WORKFLOW_NAMES = {
+  '0a6a1349-0b44-429b-91e1-4c5be264cd9f': 'S5.2 v2 Appointment Rescue',
+};
+
+function workflowDisplayName(workflow_id) {
+  return WORKFLOW_NAMES[workflow_id] || `workflow ${workflow_id?.slice(0, 8) || 'unknown'}`;
+}
 
 export async function executeTransitionObjectionState(action) {
   const contact_id = String(action.target_id || action.action_payload?.contact_id || '');
@@ -250,9 +316,10 @@ export async function executeTransitionObjectionState(action) {
   const mirrorResult = await mirrorToGhlCustomFields(contact_id, proposed_state, proposedPolicy.parent_state);
 
   // 8. Workflow enrollment (best-effort enqueue of an add_to_workflow action).
-  let workflowEnrolled = false;
+  // 9. Routing notification (v1.6) — only emitted when enrollment succeeds.
+  let enrollment = { enrolled: false, route: null, action_id: null };
   if (proposedPolicy.recovery_workflow_id && Number(proposedPolicy.recovery_window_days) > 0) {
-    workflowEnrolled = await enqueueWorkflowEnrollment({
+    enrollment = await enqueueWorkflowEnrollment({
       contact_id,
       workflow_id: proposedPolicy.recovery_workflow_id,
       webhook_url: proposedPolicy.recovery_webhook_url,
@@ -272,6 +339,23 @@ export async function executeTransitionObjectionState(action) {
         nuance_tags: newRow.nuance_tags || [],
       },
     });
+
+    // v1.6 — emit a routing-success notification that names the workflow,
+    // branch, and attempt counter. Replaces the legacy "did not auto-route"
+    // task from layer3_action_dispatch row 8.
+    if (enrollment.enrolled) {
+      await enqueueRoutingNotification({
+        contact_id,
+        state_code: proposed_state,
+        parent_state: proposedPolicy.parent_state,
+        proposedPolicy,
+        newRow,
+        trigger_source,
+        triggering_event_id,
+        source_action_id: action.id,
+        route: enrollment.route,
+      });
+    }
   }
 
   return {
@@ -281,7 +365,9 @@ export async function executeTransitionObjectionState(action) {
     state_row_id: newRow.id,
     recovery_attempt_number: newRow.recovery_attempt_number,
     parent_attempt_number: newRow.parent_attempt_number,
-    workflow_enrolled: workflowEnrolled,
+    workflow_enrolled: enrollment.enrolled,
+    enrollment_route: enrollment.route,
+    enrollment_action_id: enrollment.action_id,
     mirror_state_set: mirrorResult.state_set,
     rebook_field_action: mirrorResult.rebook_field_action,
     rebook_url_source: mirrorResult.rebook_url_source,
@@ -581,6 +667,9 @@ async function enqueueWorkflowEnrollment({ contact_id, workflow_id, webhook_url,
   // webhook_url is sourced from objection_state_policies.recovery_webhook_url
   // (added 2026-05-20). workflow_id is always included for audit/observability
   // (logs, GroupMe notifications, validation gate) even when Route B is used.
+  //
+  // v1.6 — returns { enrolled, route, action_id } so the caller can emit
+  // an accurate routing notification.
   const useRouteB = !!webhook_url;
   try {
     const { data, error } = await supabase
@@ -612,12 +701,101 @@ async function enqueueWorkflowEnrollment({ contact_id, workflow_id, webhook_url,
       .single();
     if (error) {
       console.warn(`[ObjectionState] enqueue workflow enrollment failed: ${error.message}`);
-      return false;
+      return { enrolled: false, route: null, action_id: null };
     }
-    return !!data;
+    return {
+      enrolled: !!data,
+      route: useRouteB ? 'B' : 'A',
+      action_id: data?.id || null,
+    };
   } catch (err) {
     console.warn(`[ObjectionState] enqueue workflow enrollment threw: ${err.message}`);
-    return false;
+    return { enrolled: false, route: null, action_id: null };
+  }
+}
+
+/**
+ * v1.6 — Routing-success notification.
+ *
+ * Enqueues a send_notification agent_action that names the destination
+ * workflow, branch, and attempt counter. Uses the classified notification
+ * format (intelligence class) per Notification Standard v1.0.
+ *
+ * Why an agent_action instead of a direct GroupMe send: piggybacks on the
+ * executor's retry semantics, GroupMe v1.7 debounce consolidation, and the
+ * per-rule cooldown gate (5min) — all features the notifications handler
+ * already implements. Direct send would bypass all of that.
+ *
+ * rule_applied: 'STATE_ROUTING_NOTIFICATION' is unique so the cooldown lookup
+ * in notifications.js findRecentNotification() can dedupe by (rule, contact)
+ * within 5 minutes. Rapid re-fires from the same state transition collapse
+ * into a single GroupMe card.
+ *
+ * Failure to enqueue is logged but never raised — notifications are
+ * best-effort, the routing itself is already done.
+ */
+async function enqueueRoutingNotification({
+  contact_id,
+  state_code,
+  parent_state,
+  proposedPolicy,
+  newRow,
+  trigger_source,
+  triggering_event_id,
+  source_action_id,
+  route,
+}) {
+  try {
+    const branchInfo = mapStateCodeToBranch(state_code);
+    const parentLabel = parentStateLabel(parent_state);
+    const workflowName = workflowDisplayName(proposedPolicy.recovery_workflow_id);
+    const isRouteB = route === 'B';
+
+    const attemptSuffix = newRow.recovery_attempt_number > 1
+      ? ` (attempt ${newRow.recovery_attempt_number} of recovery, parent attempt ${newRow.parent_attempt_number || 1})`
+      : ` (attempt ${newRow.recovery_attempt_number}/${proposedPolicy.recovery_touch_count})`;
+
+    const narrative =
+      `${parentLabel}: ${branchInfo.label}. Routed to ${workflowName} Branch ${branchInfo.branch}` +
+      `${attemptSuffix}. Recovery window ${proposedPolicy.recovery_window_days}d, ` +
+      `${proposedPolicy.recovery_touch_count} touch${proposedPolicy.recovery_touch_count === 1 ? '' : 'es'}. ` +
+      `Trigger: ${trigger_source}${triggering_event_id ? ` (event ${triggering_event_id})` : ''}. ` +
+      `Route ${route || '?'}${isRouteB ? ' (inbound webhook)' : ' (GHL API)'}.`;
+
+    const nextStep =
+      `${workflowName} Branch ${branchInfo.branch} cadence: ${proposedPolicy.recovery_touch_count} ` +
+      `touch${proposedPolicy.recovery_touch_count === 1 ? '' : 'es'} over ${proposedPolicy.recovery_window_days} days. ` +
+      `State row ${newRow.id}.`;
+
+    const { error } = await supabase
+      .from('agent_actions')
+      .insert({
+        action_type: 'send_notification',
+        target_system: 'lp',
+        target_entity: 'contact',
+        target_id: String(contact_id),
+        action_payload: {
+          notification_class: 'intelligence',
+          action_verb: `ROUTED TO ${workflowName.toUpperCase()} — BRANCH ${branchInfo.branch}`,
+          tier: 'Warm',
+          status: parentLabel,
+          narrative,
+          next_step: nextStep,
+          cooldown_minutes: 5,
+        },
+        reasoning:
+          `State routing notification for ${state_code} → ${workflowName} Branch ${branchInfo.branch} ` +
+          `(source action ${source_action_id})`,
+        rule_applied: 'STATE_ROUTING_NOTIFICATION',
+        status: 'pending',
+        requires_approval: false,
+        priority: 30,
+      });
+    if (error) {
+      console.warn(`[ObjectionState] enqueue routing notification failed: ${error.message}`);
+    }
+  } catch (err) {
+    console.warn(`[ObjectionState] enqueue routing notification threw: ${err.message}`);
   }
 }
 
