@@ -62,6 +62,13 @@
  *   - Filtered events logged to system_events_filtered with reason
  *   - 72h TTL (separate cleanup cron)
  *   - Console: filtered counts logged once per 100 filters per type
+ *
+ * 2026-05-20 — S5.2 v2 state-classification extension (PR #294 follow-up):
+ *   added 12 subtypes (pre-demo-concern:*, concern-expressed:*, plus DNC
+ *   family) so Rules 241-244 + 246-253 actually receive their trigger
+ *   events. Discovered when manual tag-adds on Mark Test failed to fire
+ *   the state-transition pipeline; events were sitting in
+ *   system_events_filtered with reason="tag_added_subtype_not_in_allowlist".
  */
 
 import supabase from '../supabase.js';
@@ -105,6 +112,11 @@ const ALLOWED_EVENT_TYPES = new Set([
   'ghl.entry_detected',            // 1 rule
   'cron.daily',                    // 1 rule (COLD_LEAD_ZERO_DATA)
 
+  // S5.2 v2 state-classification (PR #294, 2026-05-20)
+  'message_analyzer_proposal',     // 6 rules (LAYER3_PRICE_ANXIETY, etc.)
+  'confirmation_unacknowledged',   // 1 rule (BEHAVIORAL_GHOST_AFTER_BOOKING)
+  'nightly_state_sweep',           // 1 rule (STALE_TO_PASSIVE_COOLING)
+
   // Tag events use a SUBTYPE allowlist below — DO NOT add them here.
   // 'ghl.tag_added'    — handled in subtype list
   // 'ghl.tag_removed'  — handled in subtype list
@@ -123,7 +135,7 @@ const ALLOWED_EVENT_TYPES = new Set([
  * a handful of specific tags. Allowlist by subtype to filter the 99.5%
  * of tag traffic that nothing consumes.
  *
- * Sources for the allowlist (2026-05-13):
+ * Sources for the allowlist (2026-05-13 base, 2026-05-20 extension):
  *   SELECT DISTINCT event_pattern->>'event_subtype'
  *   FROM agent_rules
  *   WHERE event_pattern->>'event_type' IN ('ghl.tag_added','ghl.tag_removed')
@@ -132,10 +144,31 @@ const ALLOWED_EVENT_TYPES = new Set([
  * UPDATE THIS LIST when a rule starts watching a new tag.
  */
 const ALLOWED_TAG_ADDED_SUBTYPES = new Set([
+  // Pre-existing — DO NOT REMOVE
   'hurricane-guide-sent',           // rule SUPPRESS_GUIDE_ON_ACTIVE_SEQUENCE
   'nurture-completed',              // rule W4_5_COMPLETED_ROUTE_TO_W11_0
   'stall-sweep:exhausted',          // rule W5_2_EXHAUSTED_ROUTE_TO_W11_0
   'rebook-reason:not-interested',   // rule W5_2_REBOOK_NOT_INTERESTED_TO_LOSS
+
+  // ── S5.2 v2 STATE CLASSIFICATION (PR #294, 2026-05-20) ──
+  // Pre-demo concern routing → APPOINTMENT_FRICTION states
+  'pre-demo-concern:spouse',        // rule 246 PRE_DEMO_CONCERN_SPOUSE_TO_STATE
+  'pre-demo-concern:timing',        // rule 247 PRE_DEMO_CONCERN_TIMING_TO_STATE
+  'pre-demo-concern:trust',         // rule 248 PRE_DEMO_CONCERN_TRUST_TO_STATE
+  'pre-demo-concern:price',         // rule 249 PRE_DEMO_CONCERN_PRICE_TO_STATE
+
+  // Concern-expressed routing → APPOINTMENT_FRICTION states (same target,
+  // alternate tag prefix used by some legacy classification paths)
+  'concern-expressed:spouse',       // rule 250 CONCERN_EXPRESSED_SPOUSE_TO_STATE
+  'concern-expressed:timing',       // rule 251 CONCERN_EXPRESSED_TIMING_TO_STATE
+  'concern-expressed:trust',        // rule 252 CONCERN_EXPRESSED_TRUST_TO_STATE
+  'concern-expressed:price',        // rule 253 CONCERN_EXPRESSED_PRICE_TO_STATE
+
+  // Disengagement state routing → DISENGAGEMENT.* states
+  'dnc',                            // rule 241 TAG_DNC_TO_HARDLOSS
+  'lp-dnc',                         // rule 242 TAG_LPDNC_TO_HARDLOSS
+  'unsubscribed',                   // rule 243 TAG_UNSUBSCRIBED_TO_HARDLOSS
+  'not_interested',                 // rule 244 TAG_NOT_INTERESTED_TO_SOFT_OPTOUT
 ]);
 
 /**
