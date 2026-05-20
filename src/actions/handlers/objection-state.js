@@ -56,6 +56,16 @@
  *              tag {{contact.last_appointment_reschedule_link}}. When a
  *              fresh appointment is later booked, GHL's calendar widget
  *              overwrites the field naturally — no coordination needed.
+ *
+ * 2026-05-20 — v1.5: workflow enrollment now uses the destination workflow's
+ *              inbound webhook URL (Route B) when available, instead of the
+ *              GHL API (Route A). Route B was the original design intent —
+ *              the format:'json' hint was already in the payload from day
+ *              one — but the URL was never wired through, so every enrollment
+ *              silently took Route A and the destination workflow's inbound
+ *              webhook trigger never fired. Webhook URL is sourced from
+ *              objection_state_policies.recovery_webhook_url (column added
+ *              this date).
  */
 
 import supabase from '../../supabase.js';
@@ -245,6 +255,7 @@ export async function executeTransitionObjectionState(action) {
     workflowEnrolled = await enqueueWorkflowEnrollment({
       contact_id,
       workflow_id: proposedPolicy.recovery_workflow_id,
+      webhook_url: proposedPolicy.recovery_webhook_url,
       source_action_id: action.id,
       payload: {
         state_code: proposed_state,
@@ -323,7 +334,7 @@ async function pickTransitionRule(fromState, proposedState) {
 async function fetchPolicy(state_code) {
   const { data, error } = await supabase
     .from('objection_state_policies')
-    .select('state_code, parent_state, priority, recovery_workflow_id, recovery_window_days, recovery_touch_count, copy_variant, cooldown_period_days')
+    .select('state_code, parent_state, priority, recovery_workflow_id, recovery_webhook_url, recovery_window_days, recovery_touch_count, copy_variant, cooldown_period_days')
     .eq('state_code', state_code)
     .maybeSingle();
   if (error) throw new Error(`fetchPolicy(${state_code}): ${error.message}`);
@@ -554,12 +565,23 @@ function appendSeparator(url) {
   return url.includes('?') ? `${url}&` : `${url}?`;
 }
 
-async function enqueueWorkflowEnrollment({ contact_id, workflow_id, source_action_id, payload }) {
-  // We don't have the GHL inbound-webhook URL for the workflow at this layer;
-  // the existing add_to_workflow handler resolves it from agent_rules templates
-  // OR from the action payload's webhook_url. To stay decoupled, write the
-  // enrollment as an agent_actions row with action_type=add_to_workflow and
-  // let the existing handler pick it up next tick.
+async function enqueueWorkflowEnrollment({ contact_id, workflow_id, webhook_url, source_action_id, payload }) {
+  // Resolve which route the add_to_workflow handler should take:
+  //   Route B (preferred): webhook_url present → executor POSTs the JSON
+  //     payload directly to the workflow's inbound webhook trigger. The
+  //     destination workflow receives state_code, parent_state, attempt
+  //     counters etc. as {{inboundWebhookRequest.X}} merge tags AND its
+  //     trigger fires properly so any first-step actions run.
+  //   Route A (fallback): no webhook_url → executor uses the GHL API
+  //     /contacts/{id}/workflow/{wfId}. The contact enters the workflow
+  //     but no payload is delivered and the inbound-webhook trigger does
+  //     not fire. Only safe when the destination workflow does not depend
+  //     on the webhook payload for routing.
+  //
+  // webhook_url is sourced from objection_state_policies.recovery_webhook_url
+  // (added 2026-05-20). workflow_id is always included for audit/observability
+  // (logs, GroupMe notifications, validation gate) even when Route B is used.
+  const useRouteB = !!webhook_url;
   try {
     const { data, error } = await supabase
       .from('agent_actions')
@@ -568,12 +590,19 @@ async function enqueueWorkflowEnrollment({ contact_id, workflow_id, source_actio
         target_system: 'ghl',
         target_entity: 'contact',
         target_id: String(contact_id),
-        action_payload: {
-          workflow_id,
-          format: 'json',
-          payload, // forwarded to the GHL inbound webhook body
-        },
-        reasoning: `S5.2 v2 enrollment from objection-state handler (source action ${source_action_id})`,
+        action_payload: useRouteB
+          ? {
+              webhook_url,
+              workflow_id,         // kept for audit even on Route B
+              format: 'json',
+              payload,             // forwarded as JSON body to the inbound webhook URL
+            }
+          : {
+              workflow_id,
+              format: 'json',
+              payload,             // ignored by Route A (no payload delivery)
+            },
+        reasoning: `S5.2 v2 enrollment from objection-state handler ${useRouteB ? '(Route B / inbound webhook)' : '(Route A / GHL API)'} — source action ${source_action_id}`,
         rule_applied: 'STATE_ENROLLMENT',
         status: 'pending',
         requires_approval: false,
