@@ -46,6 +46,13 @@ import {
 } from './approval-escalation-sweep.js';
 // ─── REST API for GHL Agent Studio ───────────────────────────────
 import { registerRestApiRoutes } from './rest-api.js';
+// ─── Events Router (per-event-type webhook endpoints) ────────────
+import { registerEventsRouter } from './events-router.js';
+// ─── Objection-State Ghost Sweep (post-booking ghost detection) ──
+import {
+  registerGhostSweepRoutes,
+  startGhostSweepScheduler,
+} from './objection-state-ghost-sweep.js';
 // ─── Agentic Message Engine — MV refresh + snapshot ──────────────
 import { registerAgenticMvRefreshRoutes } from './agentic-mv-refresh.js';
 // ─── Agentic Appointment Notifications (cancel/reschedule email+SMS) ────
@@ -318,6 +325,19 @@ registerApprovalEscalationRoutes(app);
 // ─── REST API for GHL Agent Studio ───────────────────────────────
 registerRestApiRoutes(app, authenticate);
 
+// ─── Events Router (per-event-type webhook endpoints) ────────────
+// S5.2 v2 workflow steps POST to /events/workflow_started, /workflow_exit,
+// /state_transition, /routing_failure. Closes a 404 gap that existed because
+// only /webhook/ghl-event was registered. Each endpoint creates a system_event
+// the Decision Engine then picks up on the next cycle.
+registerEventsRouter(app);
+
+// ─── Objection-State Ghost Sweep ─────────────────────────────────
+// Emits `confirmation_unacknowledged` events for contacts whose
+// appointment has passed without a disposition or inbound reply.
+// Feeds the BEHAVIORAL_GHOST_AFTER_BOOKING STATE_CLASSIFICATION rule.
+registerGhostSweepRoutes(app);
+
 // ─── GroupMe Two-Way Integration ─────────────────────────────────
 registerGroupMeRoutes(app);
 
@@ -405,6 +425,7 @@ app.listen(PORT, async () => {
   startSyncScheduler();
   startImeWorkers();
   startPauseWorkflowSweepScheduler();
+  startGhostSweepScheduler();
   startApprovalEscalationScheduler();
   startDataFreshnessMonitorScheduler();
   startExecutorHeartbeatScheduler();
