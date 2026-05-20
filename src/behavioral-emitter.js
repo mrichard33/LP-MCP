@@ -14,6 +14,34 @@
  * 
  * Security: All endpoints validate GHL_WEBHOOK_SECRET.
  *
+ * v2.11 (2026-05-20) — Extend trivial-filter escape hatch to recognize
+ *   `agentic-active` as an agentic-ownership marker in addition to
+ *   `pause-bot`. The tag convention evolved between v2.5 and v2.6:
+ *   AGENTIC_HANDOFF_STARTED (agent_rules id 145) now applies
+ *   `agentic-active` as the canonical agentic-ownership tag, while the
+ *   trivial-filter gate in v2.5 still only checked for `pause-bot`.
+ *   PROBLEM: Contact 0kk3xz6XatILy8jajymX replied "Sure" to a CTA at
+ *   2026-05-20 21:51:09 UTC with `agentic-active` set but NOT
+ *   `pause-bot`. The trivial filter classified the reply as 'trivial',
+ *   skipped the analyzer, emitted ghl.reply_received with
+ *   event_subtype='trivial', and ai.analysis_completed never fired.
+ *   AGENTIC_RESPOND_POST_CHATBOT (priority 70, gated on agentic-active)
+ *   had no event to react to. Lead got ghosted. Confirmed via LP event
+ *   192872 — action_taken='no_matching_rules', zero agent_actions
+ *   produced. Same class of bug as the original v2.5 incident
+ *   (15Z6TaUK4WHBK1R4H64S, 2026-04-27), different tag.
+ *   FIX: The trivial escape hatch now ORs both tags into a single
+ *   `hasAgenticOwnership` predicate. Either `pause-bot` (legacy) or
+ *   `agentic-active` (current) bypasses the trivial early-exit and
+ *   routes through the analyzer + reply buffer. The fall-through log
+ *   line names whichever tag triggered the bypass so the audit trail
+ *   is unambiguous from Railway logs. Backstop rule
+ *   AGENTIC_ACTIVE_REPLY_BACKSTOP (agent_rules id 228, priority 110)
+ *   was added in parallel as a defense-in-depth catch-all, but with
+ *   this fix the primary analyzer path now runs as designed and the
+ *   backstop should only fire when the analyzer genuinely fails
+ *   (Claude API error, validation failure, etc.).
+ *
  * v2.10 (2026-05-05) — Defensive customData parsing in handleAppointment.
  *   PROBLEM: Same nested-customData root cause as v2.9, but in
  *   handleAppointment. GHL outbound webhooks auto-populate contactId at
@@ -412,20 +440,28 @@ async function handleReply(req, res) {
     return res.json({ status: 'accepted', classification: 'dnc' });
   }
 
-  // v2.5: Trivial filter has a pause-bot escape hatch.
+  // v2.11: Trivial filter has an agentic-ownership escape hatch.
   // For contacts where the agentic system owns the conversation surface
-  // (signaled by `pause-bot`), even one-word replies like "Sure" are
-  // critical — they're CTA confirmations, not noise. Route those through
-  // the analyzer so the Decision Engine can fire AGENTIC_RESPOND_*.
-  // Without this gate, a hyperactive buyer responding "Sure" to "Want to
-  // schedule a measurement?" gets ghosted by the system that's supposed
-  // to own them.
+  // (signaled by EITHER `pause-bot` (legacy) OR `agentic-active`
+  // (current, applied by AGENTIC_HANDOFF_STARTED agent_rules id 145)),
+  // even one-word replies like "Sure" are critical — they're CTA
+  // confirmations, not noise. Route those through the analyzer so the
+  // Decision Engine can fire AGENTIC_RESPOND_POST_CHATBOT (priority 70).
+  // Without this gate, a hyperactive buyer responding "Sure" to "Want
+  // to schedule a measurement?" gets ghosted by the system that's
+  // supposed to own them. v2.11 extended the gate to include
+  // agentic-active after contact 0kk3xz6XatILy8jajymX (Mark Test) hit
+  // the same v2.5 bug — see header for full diagnosis.
   if (isTrivialMessage(trimmed)) {
     const ghlContact = await fetchGHLContact(contactId);
-    const hasPauseBot = Array.isArray(ghlContact?.tags)
-      && ghlContact.tags.some(t => String(t).toLowerCase() === 'pause-bot');
+    const lowercasedTags = Array.isArray(ghlContact?.tags)
+      ? ghlContact.tags.map(t => String(t).toLowerCase())
+      : [];
+    const hasPauseBot = lowercasedTags.includes('pause-bot');
+    const hasAgenticActive = lowercasedTags.includes('agentic-active');
+    const hasAgenticOwnership = hasPauseBot || hasAgenticActive;
 
-    if (!hasPauseBot) {
+    if (!hasAgenticOwnership) {
       // Standard trivial path — log engagement, emit low-priority event,
       // no analyzer call. Bypasses the reply buffer (no pipeline trigger).
       try { await upsertLeadIntelligence(contactId, { last_reply_at: new Date().toISOString(), last_engagement_at: new Date().toISOString() }); } catch {}
@@ -438,11 +474,13 @@ async function handleReply(req, res) {
       return res.json({ status: 'accepted', classification: 'trivial' });
     }
 
-    // pause-bot active: fall through to the substantive path below so the
-    // agentic system can decide what to do with the short reply in context.
-    // The reply buffer applies — this short message will be combined with
-    // any other rapid-fire messages from the same contact.
-    console.log(`[BehavioralEmitter] Trivial reply "${trimmed.slice(0, 30)}" from ${contactId} but pause-bot active → routing to analyzer (buffered)`);
+    // Agentic ownership active: fall through to the substantive path
+    // below so the agentic system can decide what to do with the short
+    // reply in context. The reply buffer applies — this short message
+    // will be combined with any other rapid-fire messages from the same
+    // contact. Log which tag triggered the bypass for audit clarity.
+    const ownershipTag = hasAgenticActive ? 'agentic-active' : 'pause-bot';
+    console.log(`[BehavioralEmitter] Trivial reply "${trimmed.slice(0, 30)}" from ${contactId} but ${ownershipTag} active → routing to analyzer (buffered)`);
   }
 
   const emittedEvent = await emitEvent({
