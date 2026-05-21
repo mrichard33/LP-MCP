@@ -10,6 +10,7 @@
  *     re-emit forever)
  *   - NO LP disposition change has been observed since the appointment
  *   - NO inbound reply since the appointment
+ *   - NO post-appointment disposition in lp_leads (v3 — 2026-05-21)
  *   - contact does not already have an open objection_state row
  *   - contact's current GHL tags do NOT indicate they've already sat,
  *     are a customer, are stop-bot/DNC, or are already enrolled in
@@ -25,6 +26,29 @@
  * Each candidate is emitted with an idempotency_key keyed by
  * contact_id + day-bucket so the sweep is safe to run on a tight
  * cadence without spamming duplicate events.
+ *
+ * 2026-05-21 (v3): SECOND DEFENSE LAYER. Bypass the event-bus null-
+ * ghl_id problem by reading lp_leads directly. The v2 fix relied on
+ * the contact's GHL tags being correctly synced from LP. But for
+ * Sales Rabbit / canvassing leads, the `stage:post-appointment` tag
+ * is applied via a workflow that depends on the LP→GHL field sync
+ * firing — which fails when LP's lp.disposition_changed event is
+ * emitted with NULL ghl_contact_id (95% of the time per 30d data).
+ *
+ * v3 adds hasPostApptDispositionInLPLeads(contactId): a direct
+ * supabase query that checks if ANY lp_leads row for this contact
+ * shows demo_completed=true, closed_won=true, or a disposition_code
+ * in POST_APPT_DISPOSITION_CODES (the set of codes that imply the
+ * appointment time has passed with a known outcome — sat, no-show,
+ * sold, etc.). This is the canonical LP-side truth, completely
+ * independent of the event bus and of GHL tag state.
+ *
+ * Layered defense order (cheapest-first):
+ *   1. hasDispositionSince     — event bus, by ghl_contact_id (still useful when populated)
+ *   2. hasInboundSince         — event bus, inbound replies
+ *   3. hasPostApptDispositionInLPLeads (v3) — direct lp_leads check, sidesteps event bus
+ *   4. hasOpenObjectionState   — already-managed contacts
+ *   5. findExcludedTag (v2)    — live GHL tag check (most expensive — last resort)
  *
  * 2026-05-21 (v2): FALSE-POSITIVE FIX. Mark observed a wave of 24
  * ghost-after-booking enrollments where 14+ contacts had `stage:post-
@@ -61,6 +85,37 @@ const APPT_SUBTYPES = ['appt:booked', 'appointment_booked'];
 
 const DISPOSITION_EVENT_TYPES = ['lp.disposition_changed'];
 const INBOUND_EVENT_TYPES = ['ghl.reply_received', 'sms.received'];
+
+// v3 — disposition codes that mean "the appointment time has passed
+// with a known outcome." Any contact whose lp_leads cache shows ANY
+// of these codes is past the ghost-after-booking window — they
+// either sat, no-showed, sold, or reached a definitive post-demo
+// state. Pre-demo codes (Set, Cnf, Data, CCC, Verif) are NOT in
+// this set — those are still in the window where ghosting matters.
+//
+// Source for code semantics: src/sync-dispositions.js
+// KNOWN_DISPOSITION_LABELS.
+const POST_APPT_DISPOSITION_CODES = new Set([
+  // Sat / closed-won
+  'OPPFDN',    // Opportunity Found — post-demo, opp identified
+  'Sat',       // Sat for the demo
+  'Sold',      // Sold (legacy SL)
+  'SW',        // Sold — Written Up
+  'Sale',      // Contract Signed
+  'PM',        // Pending Measure — post-sale
+  // No-show / appointment-failed-but-resolved
+  'NS',        // No-Show on first demo attempt
+  'FDNS',      // Final Demo No-Show — appointment fully resolved
+  'No Demo',   // Demo not completed (but attempted)
+  // Post-demo no-opp variants
+  '1Leg',      // One Leg Present — they sat, only one spouse
+  'NIS',       // Not Interested — Shown (sat then declined)
+  'NIS2',      // NIS variant
+  'NOP NOP',   // No Opportunity — No Opp
+  'NOP ITM',   // No Opp — In The Market
+  'NOP MPR',   // No Opp — Must Price Right
+  'OPP NOI',   // Opportunity — Not Interested Now (deferred)
+]);
 
 // v2 — tag-based exclusion list. Any contact carrying ANY of these tags
 // is treated as "already past the point where ghosting matters" and
@@ -158,6 +213,53 @@ async function hasOpenObjectionState(contactId) {
 }
 
 /**
+ * v3 — direct lp_leads check, sidesteps the event-bus null-ghl_id
+ * problem. Returns the matched signal if ANY lp_leads row tied to
+ * this contact shows:
+ *   - demo_completed = true
+ *   - closed_won = true
+ *   - disposition_code in POST_APPT_DISPOSITION_CODES
+ *
+ * No `since` cutoff: a contact who has EVER had a post-appointment
+ * disposition is, by definition, not in the "first-time ghost"
+ * window. Subsequent ghosting (a contact who sat in 2024 and rebooks
+ * in 2026, then ghosts the new appt) needs a different state machine
+ * (re-engagement / S5.x), not ghost-after-booking. The system
+ * recognizes "first sat" as a terminal state for this classifier.
+ *
+ * Returns:
+ *   null                     — no post-appt signal in lp_leads
+ *   string (signal name)     — first match found, e.g. "demo_completed",
+ *                              "closed_won", "disposition:OPPFDN"
+ *
+ * Fails open (returns null) on supabase errors — the v2 tag check
+ * downstream still gates, so we don't double-fail-closed.
+ */
+async function findPostApptDispositionSignal(contactId) {
+  try {
+    const { data, error } = await supabase
+      .from('lp_leads')
+      .select('lp_lead_id, disposition_code, demo_completed, closed_won, updated_at_lp')
+      .eq('ghl_contact_id', contactId)
+      .order('updated_at_lp', { ascending: false, nullsFirst: false })
+      .limit(10);
+    if (error || !data || data.length === 0) return null;
+
+    for (const row of data) {
+      if (row.demo_completed === true) return 'demo_completed';
+      if (row.closed_won === true) return 'closed_won';
+      if (row.disposition_code && POST_APPT_DISPOSITION_CODES.has(row.disposition_code)) {
+        return `disposition:${row.disposition_code}`;
+      }
+    }
+    return null;
+  } catch (err) {
+    console.warn(`[GhostSweep] lp_leads sit check failed for ${contactId}: ${err.message}`);
+    return null; // fail-open — tag check downstream still gates
+  }
+}
+
+/**
  * v2 — fetch the contact's live tags from GHL and return the first
  * EXCLUDE_TAGS match, or null if none match. Used to short-circuit
  * contacts who have already sat / converted / been DNC'd before
@@ -198,11 +300,13 @@ export async function runGhostSweep({ dryRun = false } = {}) {
   let emitted = 0;
   let skippedActivity = 0;
   let skippedHasState = 0;
+  let skippedPostApptDispo = 0;
   let skippedExcludedTag = 0;
   let skippedFetchFailed = 0;
   let errors = 0;
   const details = [];
   const exclusionCounts = {};
+  const postApptDispoCounts = {};
 
   for (const appt of candidates) {
     const contactId = appt.ghl_contact_id;
@@ -216,14 +320,29 @@ export async function runGhostSweep({ dryRun = false } = {}) {
         skippedActivity++;
         continue;
       }
+
+      // v3 — direct lp_leads check. Catches the 95% of cases where
+      // lp.disposition_changed events fired with NULL ghl_contact_id
+      // because lp_leads.ghl_contact_id wasn't populated at sync time.
+      // No since cutoff — a contact who EVER had a post-appt
+      // disposition is permanently outside the ghost-after-booking
+      // classifier. Re-engagement after a prior sit is a different
+      // state and goes through a different recovery path.
+      const postApptSignal = await findPostApptDispositionSignal(contactId);
+      if (postApptSignal !== null) {
+        skippedPostApptDispo++;
+        postApptDispoCounts[postApptSignal] = (postApptDispoCounts[postApptSignal] || 0) + 1;
+        if (dryRun) details.push({ contact_id: contactId, decision: 'skipped_post_appt_dispo', signal: postApptSignal });
+        continue;
+      }
+
       if (await hasOpenObjectionState(contactId)) {
         skippedHasState++;
         continue;
       }
 
-      // v2 — tag check (after the cheap event-bus checks so we only
-      // pay the GHL API cost for contacts that survived the earlier
-      // filters).
+      // v2 — tag check (after all the cheap supabase checks; this hits
+      // the GHL API per surviving candidate).
       const excludedTag = await findExcludedTag(contactId);
       if (excludedTag === 'fetch_failed') {
         skippedFetchFailed++;
@@ -275,17 +394,20 @@ export async function runGhostSweep({ dryRun = false } = {}) {
     emitted,
     skipped_recent_activity: skippedActivity,
     skipped_has_open_state: skippedHasState,
+    skipped_post_appt_dispo: skippedPostApptDispo,
     skipped_excluded_tag: skippedExcludedTag,
     skipped_fetch_failed: skippedFetchFailed,
     errors,
     dry_run: !!dryRun,
     elapsed_ms: Date.now() - start,
   };
+  if (skippedPostApptDispo > 0) summary.post_appt_dispo_breakdown = postApptDispoCounts;
   if (skippedExcludedTag > 0) summary.exclusion_breakdown = exclusionCounts;
   if (dryRun) summary.details = details;
   console.log(
     `[GhostSweep] ${candidates.length} candidates → ${emitted} emitted, ` +
     `${skippedActivity} skipped (activity), ${skippedHasState} skipped (open state), ` +
+    `${skippedPostApptDispo} skipped (post-appt dispo), ` +
     `${skippedExcludedTag} skipped (excluded tag), ${skippedFetchFailed} skipped (fetch failed), ` +
     `${errors} errors (${summary.elapsed_ms}ms)`
   );
@@ -319,3 +441,8 @@ export function registerGhostSweepRoutes(app) {
   });
   console.log('[GhostSweep] Registered: POST /n8n/objection-state/ghost-sweep');
 }
+
+// v3: Export POST_APPT_DISPOSITION_CODES so the fall-through sweep and
+// any future consumers can reuse the same canonical "appointment-resolved"
+// disposition set.
+export { POST_APPT_DISPOSITION_CODES, findPostApptDispositionSignal };
