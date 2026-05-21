@@ -9,6 +9,34 @@
 //
 // AGENTIC: Disposition changes emit system events for the Decision Engine.
 //
+// v9.3 — Disposition-changed event now emits with the lognumber-
+//   preferred GHL contact ID (`newLeadGhlId`) instead of the bare
+//   `ghlId` from prospect-level matchToGHL. Same fallback chain as
+//   the lp_leads row's ghl_contact_id: lognumber-derived → phone/
+//   email match → existing cache row → null.
+//
+//   Why this matters: prior to v9.3, even when `lp_leads` carried
+//   a correct ghl_contact_id from lognumber, the emitted event
+//   payload contained NULL ghl_contact_id whenever matchToGHL
+//   returned null at sync time (which happens any time the
+//   prospect's phone/email isn't found, but the GHL contact
+//   exists and was the original submitter — captured via
+//   lognumber). Downstream consumers (ghost sweep, objection-
+//   state sweep, decision engine context conditions) all filter
+//   by ghl_contact_id on the event row, so a null there meant
+//   "this disposition change was invisible to all behavioral
+//   logic." Investigation showed ~54 events/30d in this exact
+//   shape (event ghl_id=null AND lp_leads.ghl_id IS populated),
+//   so this fix is a direct ~3-5% win on disposition event
+//   reachability.
+//
+//   Scope: only closes the emit-side gap where lp_leads already
+//   has the link. The bigger ~95% bulk gap ("lp_leads row itself
+//   is missing the link") still emits null because no ID exists
+//   anywhere — that class is addressed downstream by sweep
+//   hardening (querying lp_leads.disposition_code + demo_completed
+//   directly, sidestepping the event bus).
+//
 // v9.2 — `lp_leads.ghl_contact_id` is now ID-DERIVED when possible.
 //   The GHL→LP integration writes the GHL contact ID into LP's
 //   `lognumber` field (per LP API docs: "Identifier unique to the
@@ -286,6 +314,9 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
     // v9.2: compute lead-level GHL ID (lognumber-preferred) for the
     // recordUnchanged check, so a stale cache row missing ghl_contact_id
     // gets re-upserted when lognumber is now shape-valid.
+    // v9.3: also used as the FIRST tier of the contactId cascade
+    // when emitting disposition events, so events carry the most
+    // authoritative ghl_contact_id available at sync time.
     const newLeadGhlId = deriveLeadGhlId(lead, ghlId);
 
     const recordUnchanged = existing?.updated_at_lp
@@ -312,8 +343,17 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
     if (upsertErr) throw new Error(`Lead upsert failed for ${lpLeadId}: ${upsertErr.message}`);
 
     // ─── AGENTIC: Emit disposition change event ──────────────────
+    //
+    // v9.3: contactId cascade is newLeadGhlId → existing.ghl_contact_id
+    // → null. Previously was `ghlId || existing?.ghl_contact_id`, which
+    // ignored lognumber-derived IDs and emitted null whenever matchToGHL
+    // failed at the prospect level. Since newLeadGhlId already encodes
+    // lognumber-preferred-with-ghlId-fallback semantics (see
+    // deriveLeadGhlId above), substituting it in this cascade strictly
+    // expands coverage — same behavior when lognumber is absent, but
+    // captures the lognumber-derived ID when matchToGHL returned null.
     if (dispositionChanged) {
-      const contactId = ghlId || existing?.ghl_contact_id || null;
+      const contactId = newLeadGhlId || existing?.ghl_contact_id || null;
       const leadName = `${getField(prospect, 'firstname', 'FirstName') || ''} ${getField(prospect, 'lastname', 'LastName') || ''}`.trim();
 
       await emitEvent({
@@ -367,8 +407,11 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
       ...jobs.map(job => syncJobAndMilestones(job, lpLeadId, ghlId)),
     ]);
 
+    // v9.3: same cascade as the emit above — prefer lognumber-derived
+    // ID so the real-time note push reaches the right GHL contact even
+    // when matchToGHL returned null.
     if (dispositionChanged) {
-      const contactId = ghlId || existing?.ghl_contact_id || null;
+      const contactId = newLeadGhlId || existing?.ghl_contact_id || null;
       if (contactId) {
         pushLeadNotesImmediately(lpLeadId, contactId).catch(err => {
           console.error(`[Sync] Real-time note push failed for lead ${lpLeadId}:`, err.message);
