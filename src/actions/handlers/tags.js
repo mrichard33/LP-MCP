@@ -4,24 +4,45 @@
  * GHL contact tag mutation. Additive POST, never PUT (GHL overwrites on PUT).
  * Batch remove supported to avoid 429s on large removals (v3.2).
  *
- * MVI v2.5 (2026-05-04) — Namespace exclusivity at write-time.
- *   executeAddTag now enforces single-occupancy across exclusive namespaces:
+ * MVI v2.6 (2026-05-21) — Namespace immutability + source:* exclusivity.
+ *   executeAddTag now enforces two complementary namespace policies:
  *
- *     p3:                  (e.g. p3:ghosted vs p3:not-interested-now)
- *     loss-reason:         (e.g. loss-reason:ghosted vs loss-reason:not-interested)
- *     stage:               (already enforced by set_stage; add_tag now matches)
- *     active-entry:        (one entry source at a time)
- *     buyer:               (one buyer-stage tag at a time)
- *     objection-confirmed: (one confirmed objection at a time — v2.5.1)
+ *   IMMUTABLE namespaces (write-once-at-creation):
+ *     entry:               (first-touch attribution; never overwritten)
  *
- *   When adding a tag in one of these namespaces, we GET the contact, find
- *   any conflicting tags in that namespace, batch-DELETE them, then add.
- *   Closes the Douglas / Bonnie Jennings tag-stacking class.
+ *     When adding a tag in an immutable namespace, we GET the contact.
+ *     If the contact already has ANY tag in that namespace, the add is
+ *     a no-op — the existing attribution wins. Hygiene rules and
+ *     re-entry paths can safely include an add_tag entry:{x} step
+ *     without worrying about polluting first-touch attribution.
  *
- *   Failure modes:
- *     GET fails → log + skip exclusivity, still add (don't block on read errors).
- *     DELETE fails → throws, action retries with same exclusivity logic.
+ *   EXCLUSIVE namespaces (single-occupancy, latest-wins):
+ *     p3:, loss-reason:, stage:, active-entry:, buyer:,
+ *     objection-confirmed:, source:
+ *
+ *     When adding a tag in an exclusive namespace, we GET the contact,
+ *     find any conflicting tags in that namespace, batch-DELETE them,
+ *     then add. Latest write wins.
+ *
+ *   Failure modes (both checks):
+ *     GET fails → log + skip the namespace logic, still add (don't
+ *                 block on read errors). 15-min audit sweep catches
+ *                 stragglers.
+ *     DELETE fails → throws, action retries.
  *     POST fails → throws, action retries.
+ *
+ *   Architecture rationale: Namespace exclusivity used to be enforced
+ *   per-rule via explicit remove_tag steps. That left every new rule
+ *   (and every workflow, script, manual op) responsible for remembering
+ *   to clean up conflicts. Multiple gaps accumulated over time
+ *   (GHL_ATTR_ESTIMATE_CALCULATOR_ENTRY_BACKFILL on 2026-04-28 caused
+ *   6 active-entry:* violations cleaned up 2026-05-21). Moving the
+ *   policy into the executor makes it a system-level invariant that
+ *   every add_tag caller inherits without remembering.
+ *
+ * MVI v2.5 (2026-05-04) — Namespace exclusivity at write-time.
+ *   Original introduction of NAMESPACE_EXCLUSIVE_PREFIXES. See above
+ *   for current contents.
  *
  * v4.3 — set_stage atomic stage tag swap (2026-04-28).
  *   New action type that fetches the contact's current tags, removes any
@@ -41,7 +62,15 @@
 
 import { ghlFetch } from '../helpers.js';
 
-// MVI v2.5 — namespaces where only one tag per family should ever exist.
+// MVI v2.6 — namespaces that are write-once. The first tag added in
+// the namespace wins permanently; any later add_tag in the same
+// namespace is a no-op. Used for attribution that must not be
+// overwritten by downstream ingestion paths.
+const NAMESPACE_IMMUTABLE_PREFIXES = [
+  'entry:',
+];
+
+// MVI v2.5/v2.6 — namespaces where only one tag per family should ever exist.
 // Adding a tag from one of these auto-removes any other tag with the same
 // prefix. Keep this list conservative — adding a namespace here is a
 // behavior change for every rule that touches it.
@@ -52,6 +81,7 @@ const NAMESPACE_EXCLUSIVE_PREFIXES = [
   'active-entry:',
   'buyer:',
   'objection-confirmed:',
+  'source:',          // MVI v2.6 — source:* mirrors active-entry:* (one current source per contact)
 ];
 
 export async function executeAddTag(action) {
@@ -59,7 +89,41 @@ export async function executeAddTag(action) {
   const tag = action.action_payload?.tag;
   if (!contactId || !tag) throw new Error('Missing contactId or tag');
 
-  // MVI v2.5 — namespace exclusivity. Best-effort: a GET failure logs
+  // MVI v2.6 — IMMUTABILITY CHECK FIRST.
+  //
+  // If the requested tag is in an immutable namespace and the contact
+  // already has any tag in that namespace, skip the add entirely.
+  // First-touch attribution wins; later writes are silently dropped.
+  //
+  // Best-effort: a GET failure logs but does NOT block the add
+  // (consistent with exclusivity logic below). The 15-min audit sweep
+  // catches anything that slipped through.
+  const immutableNamespace = NAMESPACE_IMMUTABLE_PREFIXES.find((p) => tag.startsWith(p));
+  if (immutableNamespace) {
+    try {
+      const contact = await ghlFetch('GET', `/contacts/${contactId}`);
+      const currentTags = contact?.contact?.tags || contact?.tags || [];
+      const existingInNamespace = currentTags.filter((t) => t.startsWith(immutableNamespace));
+      if (existingInNamespace.length > 0) {
+        console.log(
+          `[ActionExecutor] immutable namespace: contact=${contactId} ns=${immutableNamespace} existing=[${existingInNamespace.join(',')}] — skipping add of ${tag}`
+        );
+        return {
+          action: 'no_op',
+          contact_id: contactId,
+          tag_skipped: tag,
+          namespace: immutableNamespace,
+          immutable: true,
+          existing_in_namespace: existingInNamespace,
+          reason: 'immutable namespace already populated',
+        };
+      }
+    } catch (err) {
+      console.error(`[executeAddTag] immutability check failed for ${contactId} ns=${immutableNamespace}: ${err.message} — proceeding with add`);
+    }
+  }
+
+  // MVI v2.5 — exclusivity. Best-effort: a GET failure logs
   // but does NOT block the add. Audit tool catches stragglers.
   const namespace = NAMESPACE_EXCLUSIVE_PREFIXES.find((p) => tag.startsWith(p));
   let removedConflicting = [];
