@@ -53,6 +53,11 @@ import {
   registerGhostSweepRoutes,
   startGhostSweepScheduler,
 } from './objection-state-ghost-sweep.js';
+// ─── Objection Fall-Through Sweep (post-routing miss detection) ──
+import {
+  registerFallthroughSweepRoutes,
+  startFallthroughSweepScheduler,
+} from './objection-fall-through-sweep.js';
 // ─── Agentic Message Engine — MV refresh + snapshot ──────────────
 import { registerAgenticMvRefreshRoutes } from './agentic-mv-refresh.js';
 // ─── Agentic Appointment Notifications (cancel/reschedule email+SMS) ────
@@ -338,6 +343,17 @@ registerEventsRouter(app);
 // Feeds the BEHAVIORAL_GHOST_AFTER_BOOKING STATE_CLASSIFICATION rule.
 registerGhostSweepRoutes(app);
 
+// ─── Objection Fall-Through Sweep ────────────────────────────────
+// 2026-05-20 (Option 1 Step 4): detects intent.objection_detected
+// events where NO routing rule (new state classifier OR legacy Rules
+// 214/215) picked the contact up within a 3min grace window. Emits a
+// `priority`-class GroupMe notification for genuine misses only —
+// successful routing produces its own accurate "ROUTED TO X" intelligence
+// notification via the state handler v1.6 + Rules 214/215 send_notification
+// actions, so this sweep covers the remaining gap (competitor / DIY
+// objections, undetermined-funnel-state contacts, handler crashes).
+registerFallthroughSweepRoutes(app);
+
 // ─── GroupMe Two-Way Integration ─────────────────────────────────
 registerGroupMeRoutes(app);
 
@@ -426,6 +442,7 @@ app.listen(PORT, async () => {
   startImeWorkers();
   startPauseWorkflowSweepScheduler();
   startGhostSweepScheduler();
+  startFallthroughSweepScheduler();
   startApprovalEscalationScheduler();
   startDataFreshnessMonitorScheduler();
   startExecutorHeartbeatScheduler();
