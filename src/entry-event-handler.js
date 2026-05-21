@@ -26,6 +26,13 @@
  *      routing telemetry — distinct from ghl.entry_detected so it does
  *      not trigger Route B rules.
  *
+ * v2.1 — 2026-05-21. bypass_filter:true on the two v2.0 observability
+ *        emits. These events are pure telemetry with no rule consumer,
+ *        so applyIntakeFilter() was silently dropping them — never a
+ *        single ghl.e0_branch_fired or ghl.routing_tags_ensured event
+ *        landed in system_events since launch. Bypass restores them
+ *        so we can verify whether E.0 LP-Advanced exit (and the safety
+ *        net) is firing for every contact that hits it.
  * v2.0 — 2026-05-21. Safety-net + branch-fired observability.
  * v1.1 — 2026-04-29. Defensive payload parsing.
  * v1.0 — Initial Route B implementation.
@@ -409,6 +416,9 @@ async function handleEnsureRoutingTags(req, res) {
     },
     priority: 'normal',
     idempotency_key: `routing_safety_${contactId}_${timeBucket}`,
+    // v2.1: bypass event-intake-filter — observability event with no
+    // rule consumer; without this it gets dropped silently.
+    bypass_filter: true,
   });
 
   console.log(`[EnsureRoutingTags] ✅ ${contactId} inferred=${inferred.source} signal="${inferred.signal}" confidence=${inferred.confidence}`);
@@ -470,6 +480,9 @@ async function handleBranchFired(req, res) {
     },
     priority: 'normal',
     idempotency_key: `e0_branch_${branch}_${contactId}_${timeBucket}`,
+    // v2.1: bypass event-intake-filter — observability event with no
+    // rule consumer; without this it gets dropped silently.
+    bypass_filter: true,
   });
 
   console.log(`[E0Branch] ${branch} → ${destinationWorkflow || '?'} for ${contactId}`);
