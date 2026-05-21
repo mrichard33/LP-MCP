@@ -4,6 +4,13 @@
  * GHL contact tag mutation. Additive POST, never PUT (GHL overwrites on PUT).
  * Batch remove supported to avoid 429s on large removals (v3.2).
  *
+ * MVI v2.7 (2026-05-21) — Add canvass-subtype:* to exclusive prefixes.
+ *   canvass-subtype:{door-to-door|event|sticky} is logically exclusive
+ *   (one current canvass channel per contact). Re-entry through a
+ *   different canvass channel should swap the tag, identical to
+ *   active-entry:* / source:* behavior. Writers (hygiene rules,
+ *   E.0 Canvassing branch, agentic rules) now inherit this for free.
+ *
  * MVI v2.6 (2026-05-21) — Namespace immutability + source:* exclusivity.
  *   executeAddTag now enforces two complementary namespace policies:
  *
@@ -18,7 +25,7 @@
  *
  *   EXCLUSIVE namespaces (single-occupancy, latest-wins):
  *     p3:, loss-reason:, stage:, active-entry:, buyer:,
- *     objection-confirmed:, source:
+ *     objection-confirmed:, source:, canvass-subtype:
  *
  *     When adding a tag in an exclusive namespace, we GET the contact,
  *     find any conflicting tags in that namespace, batch-DELETE them,
@@ -70,7 +77,7 @@ const NAMESPACE_IMMUTABLE_PREFIXES = [
   'entry:',
 ];
 
-// MVI v2.5/v2.6 — namespaces where only one tag per family should ever exist.
+// MVI v2.5/v2.6/v2.7 — namespaces where only one tag per family should ever exist.
 // Adding a tag from one of these auto-removes any other tag with the same
 // prefix. Keep this list conservative — adding a namespace here is a
 // behavior change for every rule that touches it.
@@ -81,7 +88,8 @@ const NAMESPACE_EXCLUSIVE_PREFIXES = [
   'active-entry:',
   'buyer:',
   'objection-confirmed:',
-  'source:',          // MVI v2.6 — source:* mirrors active-entry:* (one current source per contact)
+  'source:',            // MVI v2.6 — source:* mirrors active-entry:* (one current source per contact)
+  'canvass-subtype:',   // MVI v2.7 — canvass channel (door-to-door | event | sticky), one current per contact
 ];
 
 export async function executeAddTag(action) {
