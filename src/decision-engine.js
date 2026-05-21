@@ -3,6 +3,47 @@
  *
  * The brain of the agentic system.
  *
+ * v2.15.1 — 2026-05-21. event_subtype whitespace normalization.
+ *   GHL source names sometimes arrive with trailing whitespace ("Self
+ *   Generated " is the known case, present on 14 system_events in the
+ *   last 90 days). The lowercased event_subtype "self generated "
+ *   would never exact-match a rule pattern of "self generated" without
+ *   trim. Hunt for the producer (n8n workflow or LP MCP webhook
+ *   handler) was inconclusive — multiple ingestion paths emit
+ *   ghl.contact_created events with source='ghl_webhook'.
+ *
+ *   Defensive consumer-side normalization is also the more robust
+ *   architectural fix: any future producer with a whitespace bug
+ *   becomes invisible to the engine. Trimming once in findMatchingRules
+ *   protects both matchesPattern() and the new event_subtype_not_in
+ *   predicate without per-call duplication.
+ *
+ *   The trim mutates event.event_subtype in place so downstream
+ *   action_taken logs reflect the normalized value. Logged with a
+ *   warning when normalization actually changes the string, so we
+ *   can still see which producer needs cleanup later.
+ *
+ * v2.15 — 2026-05-21. event_subtype_not_in context predicate.
+ *   Adds a new context_conditions predicate so a rule can opt out of
+ *   event subtypes that already have a dedicated rule. Used by the
+ *   ENTRY_HYGIENE_AT_CREATION_FALLBACK catch-all rule to ensure it
+ *   only fires for ghl.contact_created events whose event_subtype
+ *   is NOT in the list of subtypes with specific hygiene rules.
+ *
+ *   Without this predicate, the catch-all (event_pattern matches any
+ *   ghl.contact_created) would fire alongside specific subtype rules,
+ *   resulting in conflicting tag writes (e.g. canvassing-specific rule
+ *   adds entry:canvassing while catch-all adds entry:other).
+ *
+ *   Usage:
+ *     "context_conditions": {
+ *       "event_subtype_not_in": ["canvassing", "chatbot", "internet", ...]
+ *     }
+ *
+ *   Pairs with: agent_rules ENTRY_HYGIENE_AT_CREATION_FALLBACK rule
+ *   inserted as part of the Phase 1 hygiene rollout (13 specific rules
+ *   + 1 catch-all).
+ *
  * v2.14 — 2026-05-07. priority_lane sort to prevent bulk-event starvation.
  *   PROBLEM: processEvents fetched pending system_events ordered by
  *   `priority` (text). Postgres sorts text alphabetically:
@@ -84,78 +125,11 @@
  *   hasDuplicatePendingActions, multi-lead guard) keeps working.
  *
  * v2.11 — 2026-05-01. Three new context predicates for engagement-depth
- *   gating and inbound text matching:
- *
- *     thread_turn_count_gte: <int>
- *       Count of GHL conversation messages (both directions) for this
- *       contact within the last 60 minutes. Lets escalation rules require
- *       a minimum amount of back-and-forth before they fire — closes the
- *       Mark Test gap where BEHAVIORAL_ESCALATE_NON_CS_HOT_CALL fired
- *       after only 2 turns ("Do you sell aluminum windows?" + "It's a
- *       new project") and dumped the contact into Hot Call SMS.
- *       60-min lookback approximates a single live thread without needing
- *       gap-detection logic — Mark's prior aluminum thread that day was
- *       9+ hours earlier and falls outside the window.
- *
- *     any_of: [<conditions>, <conditions>, ...]
- *       OR-semantics block. The clause passes when at least one of its
- *       child condition objects passes when evaluated recursively. Pairs
- *       with thread_turn_count_gte to add a high-intent bypass:
- *         "any_of": [
- *           {"thread_turn_count_gte": 3},
- *           {"intent_score_gte": 80}
- *         ]
- *       Lets a hot lead escalate on turn 1 when the analyzer scored them
- *       hot, while keeping the gate for cold/medium contacts.
- *
- *     payload_message_matches: <regex string>
- *       Tests event.payload.message_text against a JS regex (case-insensitive).
- *       Used by INTENT_CANCEL_REQUESTED as an analyzer-independent backstop
- *       so the rule can fire on explicit "cancel my appointment" inbound
- *       messages even before the analyzer learns to classify cancel intent.
- *       Will be augmented (not replaced) once message-analyzer.js learns
- *       cancel-intent classification.
- *
- *   The countThreadTurns helper hits GHL API directly because LP MCP and
- *   HL MCP run on separate Supabase instances (no cross-DB JOINs). Two
- *   API calls per evaluation — acceptable since the predicate is only
- *   used on ai.analysis_completed events (low frequency).
+ *   gating and inbound text matching (thread_turn_count_gte, any_of,
+ *   payload_message_matches).
  *
  * v2.10 — 2026-04-30. REVERT v2.8 auto-approve bypass for AGENTIC_RESPOND_POST_CHATBOT.
- *   v2.8 added a Stage 3+ tag bypass that auto-approved AI replies for
- *   contacts with bj:stage-3-comparing / stage-4-negotiating / stage-5-committed
- *   (and the buyer:* equivalents). The intent was to reduce friction for
- *   warm-buyer fast paths, but in practice it's premature: the AI generation
- *   pipeline is still being hardened (see send-message-handler v3.4 / 
- *   message-analyzer v1.5 fixes 2026-04-30 for the exact failure mode that
- *   v2.8 silently masked). Until the responder is broadly trusted, every
- *   AI-generated message goes through GroupMe approval — no exceptions
- *   based on tag state.
- *
- *   shouldRequireApproval is now a pass-through that simply honors the
- *   rule's own requires_approval flag. STAGE_3_PLUS_TAGS constant removed.
- *
- *   To re-enable an auto-approve path later, prefer setting requires_approval=
- *   false on a NARROWER rule (e.g. a stage-5-only variant) rather than
- *   bypassing the gate inside the engine.
- *
  * v2.9 — 2026-04-28. has_any_tag / not_has_any_tag context operators.
- *   Per Mark's Nancy Kesner / Jp...g2k canvassing investigation:
- *   GHL_APPT_STAGE_ADVANCE was firing on every appointment_booked
- *   event INCLUDING appointment status updates (Confirmed → Showed),
- *   which wiped post-demo state and re-stamped stage:booked-main-appointment
- *   on already-post-demo leads.
- *
- *   The existing has_tag / not_has_tag operators only accept a single
- *   tag. Adding array-form variants so a single condition can guard
- *   against multiple downstream tags:
- *
- *     "not_has_any_tag": ["stage:post-appointment", "lp-demo-completed",
- *                          "bj:stage-5-committed", "lp-sale"]
- *
- *   Pairs with: agent_rules update converting GHL_APPT_STAGE_ADVANCE to
- *   rule_type='contextual' with the above guard.
- *
  * v2.8 — Auto-approve gate for AGENTIC_RESPOND_POST_CHATBOT. [REVERTED in v2.10]
  * v2.7 — recommended_action_neq context operator.
  * v2.6 — Multi-rule execution per event.
@@ -415,27 +389,7 @@ async function fetchContactTags(ghlContactId) {
   } catch { return []; }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// v2.11 — THREAD TURN COUNT (for engagement-depth gating)
-// ═══════════════════════════════════════════════════════════════════
-//
-// Counts GHL conversation messages (both directions) for a contact within
-// the last `sinceMinutes`. Used by thread_turn_count_gte predicate to gate
-// escalation rules — keeps the bot from prematurely handing off after one
-// or two messages.
-//
-// Implementation: hits GHL API directly because LP MCP runs on its own
-// Supabase instance separate from HL MCP's message cache, and cross-DB
-// JOINs are not possible. Two API calls per evaluation — first fetches
-// the conversation ID, second fetches its messages.
-//
-// The 60-minute lookback approximates "single live thread" without needing
-// explicit gap detection. Threads typically have replies within minutes;
-// a 60-min cutoff cleanly separates the active thread from re-engagement
-// hours later.
-//
-// Returns 0 on any failure (treats as fail-closed for the caller — gate
-// will block the rule from firing). Set GHL_API_KEY at minimum.
+// v2.11 — Engagement-depth gating (see top-of-file v2.11 doc).
 async function countThreadTurns(ghlContactId, sinceMinutes = 60) {
   const GHL_API_KEY = process.env.GHL_API_KEY;
   if (!GHL_API_KEY || !ghlContactId) return 0;
@@ -443,7 +397,6 @@ async function countThreadTurns(ghlContactId, sinceMinutes = 60) {
   const locationId = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
 
   try {
-    // 1. Fetch the conversation ID for this contact (most-recent only)
     const convRes = await fetch(
       `https://services.leadconnectorhq.com/conversations/search?contactId=${ghlContactId}&locationId=${locationId}&limit=1`,
       {
@@ -463,7 +416,6 @@ async function countThreadTurns(ghlContactId, sinceMinutes = 60) {
     const conv = convData?.conversations?.[0];
     if (!conv?.id) return 0;
 
-    // 2. Fetch messages in that conversation
     const msgRes = await fetch(
       `https://services.leadconnectorhq.com/conversations/${conv.id}/messages`,
       {
@@ -482,7 +434,6 @@ async function countThreadTurns(ghlContactId, sinceMinutes = 60) {
     const msgData = await msgRes.json();
     const messages = msgData?.messages?.messages || [];
 
-    // 3. Count messages within the lookback window
     const cutoff = Date.now() - (sinceMinutes * 60 * 1000);
     const recent = messages.filter(m => {
       const ts = new Date(m.dateAdded).getTime();
@@ -524,9 +475,6 @@ async function evaluateContextConditions(conditions, intelligence, event) {
         if (!tags) tags = await fetchContactTags(event.ghl_contact_id);
         if (tags.includes(expected)) return false; break;
 
-      // v2.9: Array-form tag operators. Single condition can guard against
-      // multiple tags. Used by GHL_APPT_STAGE_ADVANCE to skip post-demo
-      // and post-close leads.
       case 'has_any_tag': {
         const wanted = Array.isArray(expected) ? expected : [expected];
         if (!tags) tags = await fetchContactTags(event.ghl_contact_id);
@@ -587,7 +535,18 @@ async function evaluateContextConditions(conditions, intelligence, event) {
         break;
       }
 
-      // v2.11 — Engagement depth + OR-semantics + payload regex
+      // v2.15 — event_subtype blocklist. Lets a catch-all rule opt out
+      // of subtypes that have a dedicated rule.
+      case 'event_subtype_not_in': {
+        const blockedSubtypes = Array.isArray(expected) ? expected : [expected];
+        const subtype = event?.event_subtype || null;
+        if (subtype !== null && blockedSubtypes.includes(subtype)) {
+          console.log(`[Context] BLOCKED: event_subtype "${subtype}" in blocklist of ${blockedSubtypes.length} known subtypes`);
+          return false;
+        }
+        break;
+      }
+
       case 'thread_turn_count_gte': {
         const turnCount = await countThreadTurns(event.ghl_contact_id, 60);
         if (turnCount < expected) {
@@ -642,6 +601,21 @@ async function findMatchingRules(event) {
   let intelligence = null;
   let intelligenceFetched = false;
 
+  // v2.15.1 — defensive whitespace normalization. The known case is
+  // GHL source "Self Generated " (trailing space) which lowercases to
+  // "self generated " and never matches a rule pattern of "self generated"
+  // without trim. Normalizing once here protects both matchesPattern()
+  // and the event_subtype_not_in predicate without per-call duplication.
+  // Mutates event.event_subtype in place so downstream action_taken logs
+  // and stored event_subtype reflect the normalized value going forward.
+  if (typeof event.event_subtype === 'string') {
+    const trimmed = event.event_subtype.trim();
+    if (trimmed !== event.event_subtype) {
+      console.warn(`[DecisionEngine] event_subtype whitespace normalized: "${event.event_subtype}" → "${trimmed}" (event ${event.id}) — producer needs cleanup`);
+      event.event_subtype = trimmed;
+    }
+  }
+
   for (const rule of rules) {
     if (!matchesPattern(event, rule.event_pattern)) continue;
     const ruleType = rule.rule_type || 'pattern';
@@ -660,14 +634,6 @@ async function findMatchingRules(event) {
 // ═══════════════════════════════════════════════════════════════════
 // APPROVAL GATING (v2.10 — pass-through; v2.8 bypass removed)
 // ═══════════════════════════════════════════════════════════════════
-//
-// Each rule's own requires_approval flag is the sole determinant of whether
-// a created action goes to pending_approval (queued for GroupMe review) or
-// pending (auto-execute). No rule-key-specific bypasses live here.
-//
-// This function is kept as a single chokepoint so future approval policies
-// (e.g. time-of-day gating, per-user trust scores) can be added in one
-// place rather than scattered across handlers.
 
 async function shouldRequireApproval(rule /*, event */) {
   return rule.requires_approval || false;
@@ -677,23 +643,6 @@ async function shouldRequireApproval(rule /*, event */) {
 // ACTION CREATION
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * v2.13 — Derive the canonical inbound channel from a system_events row.
- *
- * Reads (in order of preference):
- *   1. event.payload.channel — explicit field (set by message-analyzer
- *      v1.6+ when carrying forward from ghl.reply_received)
- *   2. event.payload.message_type — GHL's native field on
- *      ghl.reply_received events ("SMS" | "Email" | "TYPE_SMS" | "TYPE_EMAIL")
- *
- * Returns 'sms' | 'email' | null. Null when the event has no channel
- * info (lp.disposition_changed, ghl.appointment_booked, behavioral
- * events) — caller should keep the rule template's channel default.
- *
- * Exported for use by processSingleEventInner when invoking
- * analyzeMessage so the analyzer can carry channel forward into its
- * own emitted ai.analysis_completed event.
- */
 function inferChannelFromEvent(event) {
   if (!event?.payload) return null;
   const explicit = event.payload.channel;
@@ -728,11 +677,6 @@ async function createActionsFromRule(event, rule) {
     const tmpl = actions[i];
     const targetSystem = tmpl.target_system || 'ghl';
 
-    // v2.13: Compute action payload with channel override for send_message.
-    // Rule's hardcoded channel becomes a fallback default; when the source
-    // event carries channel info (ai.analysis_completed v1.6+,
-    // ghl.reply_received), that wins. No-op for action types other than
-    // send_message and for events without channel data.
     let actionPayload = tmpl.params || tmpl.payload || {};
     if (tmpl.action_type === 'send_message') {
       const eventChannel = inferChannelFromEvent(event);
@@ -775,17 +719,11 @@ async function createActionsFromRule(event, rule) {
 // EVENT PROCESSING
 // ═══════════════════════════════════════════════════════════════════
 
-// MVI v2.5 — inner implementation. processSingleEvent (below) wraps this
-// with the inbound idempotency guard.
 async function processSingleEventInner(event) {
   if (event.event_type === 'ghl.reply_received' && event.event_subtype === 'pending_analysis') {
     const contactId = event.ghl_contact_id;
     const messageText = event.payload?.message_text || '';
     if (contactId && messageText) {
-      // v2.13: derive channel from event.payload (message_type) and pass
-      // to analyzer so ai.analysis_completed carries it forward. The
-      // analyzer's own analyzePendingReplies path does the same derivation
-      // independently — keep the two callers consistent.
       const inboundChannel = inferChannelFromEvent(event);
       analyzeMessage(contactId, messageText, event.id, inboundChannel).catch(err => {
         console.error(`[DecisionEngine] Analysis failed for ${contactId}:`, err.message);
@@ -845,9 +783,6 @@ async function processSingleEventInner(event) {
   };
 }
 
-// MVI v2.5 — public entry point. Wraps processSingleEventInner with the
-// processed_events idempotency claim. Same return shape; adds
-// skipped_reason='already_processed' for duplicate deliveries.
 export async function processSingleEvent(event) {
   const claim = await tryClaimEvent(event);
   if (!claim.claimed) {
@@ -879,13 +814,6 @@ export async function processSingleEvent(event) {
 
 export async function processEvents({ limit = 50 } = {}) {
   const startTime = Date.now();
-  // v2.14: Sort by priority_lane (int) instead of priority (text). Postgres
-  // sorts text alphabetically — 'critical' < 'high' < 'low' < 'normal' — which
-  // put 'normal' events LAST and let bulk 'high' webhook spikes starve live
-  // ai.* response events. priority_lane is filled by
-  // trg_system_events_default_priority_lane (sql/021): ai.* events get lane 5,
-  // above 'high' at lane 10, so live conversation responses can never be
-  // starved by bulk operations regardless of webhook volume.
   const { data: events, error } = await supabase.from('system_events').select('*')
     .eq('processed', false).order('priority_lane', { ascending: true })
     .order('created_at', { ascending: true }).limit(limit);
@@ -893,11 +821,6 @@ export async function processEvents({ limit = 50 } = {}) {
   if (error) { console.error('[DecisionEngine] Fetch error:', error.message); return { success: false, error: error.message }; }
   if (!events?.length) return { success: true, events_processed: 0, elapsed_ms: Date.now() - startTime };
 
-  // v2.14: Sort by priority_lane to match the SQL order. Defensive fallback
-  // (laneFromPriorityText) handles rows where priority_lane is NULL — should
-  // not exist after the sql/021 backfill, but the guard keeps the engine
-  // resilient if the migration is rolled back or a row is inserted via a
-  // path that bypasses the trigger.
   events.sort((a, b) => {
     const la = a.priority_lane ?? laneFromPriorityText(a);
     const lb = b.priority_lane ?? laneFromPriorityText(b);
