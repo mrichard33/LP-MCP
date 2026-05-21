@@ -21,6 +21,8 @@
  *   POST /api/agentic/notifications/contract-cancellation — Post-demo contract-cancellation email (v1, email-only)
  *   POST /api/agentic/notifications/engagement   — Notification engagement stub (v1)
  *   POST /webhook/ghl-event                      — GHL→Agentic handoff (Webhook Bridge, no auth)
+ *   GET  /api/lookup/lp-lead?lead_id=...         — LP lead name + contact info lookup (no auth, cache + LP API live)
+ *   POST /api/lookup/lp-lead                     — Same, with JSON body (no auth)
  */
 
 import supabase from './supabase.js';
@@ -204,6 +206,191 @@ async function serviceAreaLookupHandler(req, res) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// LP LEAD LOOKUP — name + contact-info enrichment for GHL workflows
+// ═══════════════════════════════════════════════════════════════════
+//
+// Built 2026-05-21 because the LP Inbound Webhook (workflow 7f24f79d)
+// payload sometimes arrives without first_name / last_name set. When
+// the GHL Contact Not Found branch tries to create a contact, missing
+// names break Create Contact + downstream personalization.
+//
+// USAGE FROM GHL: Custom Webhook step in the Contact Not Found branch,
+// gated by an IF/ELSE that checks whether the inbound webhook already
+// has names. POST JSON body OR GET query with one of:
+//   - lead_id      (LP lds_id — PRIMARY, most reliable)
+//   - prospect_id  (LP cst_id — fallback)
+//   - phone        (digits or formatted — last-resort fallback)
+//
+// LOOKUP STRATEGY:
+//   1. Try Supabase lp_leads cache (fast, ~50ms). Skip if not present
+//      or missing names.
+//   2. Fall back to LP API live via getLeadByLdsId / getLead /
+//      getCustomers3. ~500-2000ms cold, but always current.
+//
+// RESPONSE CONTRACT (always 200 — never throws to GHL):
+//   {
+//     found: true|false,
+//     first_name: "John",         // empty string if not found
+//     last_name: "Smith",
+//     email: "...",
+//     phone: "5551234567",
+//     address1: "123 Main St",
+//     city: "...",
+//     state: "FL",
+//     zip: "33301",
+//     lead_id: "12345",           // echoed back
+//     prospect_id: "67890",
+//     source: "cache" | "live_api" | null,
+//     lookup_method: "lead_id" | "prospect_id" | "phone" | "none",
+//     reason: "..."               // only when found=false
+//   }
+//
+// Empty strings (not nulls) are returned for missing fields so GHL's
+// IF/ELSE conditions ("field has value") behave predictably.
+async function lpLeadLookupHandler(req, res) {
+  const src = { ...(req.query || {}), ...(req.body || {}) };
+
+  // Accept the naming conventions GHL LP webhooks tend to use.
+  const leadId = String(src.lead_id || src.leadId || src.lds_id || src.ldsId || '').trim();
+  const prospectId = String(src.prospect_id || src.prospectId || src.cst_id || src.cstId || src.prospect_number || src.prospectNumber || '').trim();
+  const phoneRaw = String(src.phone || '').trim();
+  const phoneDigits = phoneRaw.replace(/\D/g, '');
+
+  // Always-200 empty response shape used by every miss path.
+  const emptyResponse = (reason, lookupMethod = 'none') => ({
+    found: false,
+    first_name: '',
+    last_name: '',
+    email: '',
+    phone: phoneDigits || '',
+    address1: '',
+    city: '',
+    state: '',
+    zip: '',
+    lead_id: leadId || '',
+    prospect_id: prospectId || '',
+    source: null,
+    lookup_method: lookupMethod,
+    reason,
+  });
+
+  // Map a normalized record to the response contract. Accepts either a
+  // cache row (lp_leads) or a prospect-level LP API record (post-unwrap).
+  const toResponse = (rec, source, lookupMethod) => {
+    const get = (...names) => {
+      for (const n of names) {
+        const v = rec?.[n];
+        if (v !== undefined && v !== null && String(v).trim() !== '') return String(v);
+      }
+      return '';
+    };
+    return {
+      found: true,
+      first_name: get('first_name', 'firstname', 'FirstName'),
+      last_name: get('last_name', 'lastname', 'LastName'),
+      email: get('email', 'Email'),
+      phone: get('phone', 'phone1', 'Phone1', 'Phone'),
+      address1: get('address', 'address1', 'Address1'),
+      city: get('city', 'City'),
+      state: get('state', 'State'),
+      zip: get('zip', 'Zip'),
+      lead_id: get('lp_lead_id', 'lds_id', 'LeadID', 'id') || leadId || '',
+      prospect_id: get('lp_prospect_id', 'cst_id', 'CstID', 'ProspectID') || prospectId || '',
+      source,
+      lookup_method: lookupMethod,
+    };
+  };
+
+  if (!leadId && !prospectId && !phoneDigits) {
+    return res.json(emptyResponse('no_lookup_key_supplied'));
+  }
+
+  try {
+    // ───── Tier 1: Supabase cache (lp_leads) ─────────────────────
+    // Fast path. The cache is populated by incremental sync, so brand-
+    // new LP leads may not be here yet — we fall through to LP API
+    // in that case.
+    let cacheRow = null;
+    if (leadId) {
+      const { data } = await supabase.from('lp_leads').select('*').eq('lp_lead_id', leadId).maybeSingle();
+      if (data) cacheRow = data;
+    }
+    if (!cacheRow && prospectId) {
+      const { data } = await supabase.from('lp_leads').select('*').eq('lp_prospect_id', prospectId).order('synced_at', { ascending: false }).limit(1).maybeSingle();
+      if (data) cacheRow = data;
+    }
+    if (!cacheRow && phoneDigits && phoneDigits.length >= 10) {
+      const last10 = phoneDigits.slice(-10);
+      const { data } = await supabase.from('lp_leads').select('*').or(`phone.ilike.%${last10}%,phone_alt.ilike.%${last10}%`).order('synced_at', { ascending: false }).limit(1).maybeSingle();
+      if (data) cacheRow = data;
+    }
+
+    if (cacheRow && (cacheRow.first_name || cacheRow.last_name)) {
+      const method = leadId ? 'lead_id' : (prospectId ? 'prospect_id' : 'phone');
+      const result = toResponse(cacheRow, 'cache', method);
+      console.log(`[LP Lead Lookup] HIT via ${method} (cache): lead_id=${leadId || '?'}, name=${result.first_name} ${result.last_name}`);
+      return res.json(result);
+    }
+
+    // ───── Tier 2: LP API live ───────────────────────────────────
+    // Lazy import to avoid loading lp-client when this route isn't hit.
+    const { getLeadByLdsId, getLead, getCustomers3 } = await import('./lp-client.js');
+
+    const unwrap = (resp) => {
+      if (!resp) return [];
+      if (Array.isArray(resp)) return resp;
+      if (typeof resp === 'object') return resp.data || resp.leads || resp.results || resp.items || [];
+      return [];
+    };
+
+    let prospect = null;
+    let method = 'none';
+
+    if (leadId) {
+      try {
+        const resp = await getLeadByLdsId(leadId);
+        const items = unwrap(resp);
+        if (items.length > 0) { prospect = items[0]; method = 'lead_id'; }
+      } catch (err) {
+        console.warn('[LP Lead Lookup] getLeadByLdsId failed:', err.message);
+      }
+    }
+
+    if (!prospect && prospectId) {
+      try {
+        const resp = await getLead(prospectId);
+        const items = unwrap(resp);
+        if (items.length > 0) { prospect = items[0]; method = 'prospect_id'; }
+      } catch (err) {
+        console.warn('[LP Lead Lookup] getLead failed:', err.message);
+      }
+    }
+
+    if (!prospect && phoneDigits && phoneDigits.length >= 10) {
+      try {
+        const resp = await getCustomers3({ phone: phoneDigits.slice(-10) });
+        const items = unwrap(resp);
+        if (items.length > 0) { prospect = items[0]; method = 'phone'; }
+      } catch (err) {
+        console.warn('[LP Lead Lookup] getCustomers3 failed:', err.message);
+      }
+    }
+
+    if (!prospect) {
+      return res.json(emptyResponse('no_match_in_lp_api', method));
+    }
+
+    const result = toResponse(prospect, 'live_api', method);
+    console.log(`[LP Lead Lookup] HIT via ${method} (live): lead_id=${leadId || '?'}, name=${result.first_name} ${result.last_name}`);
+    return res.json(result);
+
+  } catch (err) {
+    console.error('[LP Lead Lookup] Unhandled error:', err.message);
+    return res.json(emptyResponse('internal_error_' + err.message.slice(0, 80)));
+  }
+}
+
 export function registerRestApiRoutes(app, authenticate) {
 
   // ═══════════════════════════════════════════════════════════════
@@ -329,6 +516,17 @@ export function registerRestApiRoutes(app, authenticate) {
   app.get('/api/service-area/lookup', serviceAreaLookupHandler);
   app.post('/api/service-area/lookup', serviceAreaLookupHandler);
   console.log('[REST API] Registered: GET+POST /api/service-area/lookup (no-auth, HDL.2 routing)');
+
+  // ═══════════════════════════════════════════════════════════════
+  // /api/lookup/lp-lead — LP lead name/contact lookup for GHL workflows
+  // ═══════════════════════════════════════════════════════════════
+  // No auth. Called by the GHL Custom Webhook step in the LP Inbound
+  // Webhook workflow's Contact Not Found branch when the inbound
+  // payload is missing first_name / last_name. See lpLeadLookupHandler
+  // above for the full contract.
+  app.get('/api/lookup/lp-lead', lpLeadLookupHandler);
+  app.post('/api/lookup/lp-lead', lpLeadLookupHandler);
+  console.log('[REST API] Registered: GET+POST /api/lookup/lp-lead (no-auth, GHL Create-Contact name fallback)');
 
   // ═══════════════════════════════════════════════════════════════
   // POST /api/agentic/dynamic-callback-message — Dynamic SMS for HDL.2
