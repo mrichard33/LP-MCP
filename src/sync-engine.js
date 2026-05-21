@@ -1,5 +1,32 @@
 // ─── Sync Engine — src/sync-engine.js ─────────────────────────────
 //
+// v6.10 — Prospect deny-list integration. The leads sweep now loads an
+//         active deny-list at start and short-circuits processProspect
+//         for cstIds that consistently time out (default 5 consecutive
+//         failures → 24h denylist). On success, the row is deleted
+//         (clean slate). New denylist transitions are added to the
+//         in-memory Set so subsequent pages in the SAME sweep also
+//         skip the cstId.
+//
+//         Root cause this addresses: ~20 LP cstIds (cstId=28645, 28445,
+//         27878, 63082, 45538, …) chronically timing out at 180s each.
+//         At 3-concurrent prospect handling, those alone consumed
+//         ~20-30 min of every sync cycle wall-clock budget — pushing
+//         the 20-min per-sweep timeout into Railway SIGTERM territory.
+//         Last successful incremental leads sync before this commit
+//         was 2026-05-05; every cycle since failed with "N records
+//         failed" or "SIGTERM — container terminated".
+//
+//         New observable counters added to runLeadsSweep return:
+//           - denylistSkipped: how many cstIds were skipped via the
+//                              deny-list gate this sweep
+//           - newlyDenylisted: how many cstIds transitioned INTO the
+//                              active denylist this sweep
+//
+//         Pairs with:
+//           - sql/migrations/2026-05-21_prospect_denylist.sql (substrate)
+//           - src/prospect-denylist.js (application logic)
+//
 // v6.9 — Per-prospect timeout to stop ONE hung processProspect from
 //         blocking the entire leads sweep. Root cause of the 14-day
 //         silent-stall pattern: processInBatches runs Promise.allSettled
@@ -102,6 +129,7 @@
 //   sync-triggers.js   — Day 15 handoff, lead-level triggers
 //   lp-dates.js        — lpDateToEastern, lpCreatedDate
 //   ghl-notes-sync.js  — Push LP notes from Supabase to GHL contact notes
+//   prospect-denylist.js — auto-skip chronically-timing-out cstIds (v6.10)
 //
 // This file contains only: fullSync, incrementalSync, handleWebhookEvent,
 // scheduler, and process signal handlers.
@@ -126,6 +154,15 @@ import { syncDispositions, backfillDispositionsFromLeads } from './sync-disposit
 import { upsertLeadOnly, processProspect } from './sync-leads.js';
 import { syncAllChildRecords, syncJobAndMilestones } from './sync-children.js';
 import { checkDay15Handoffs, checkLeadTriggers } from './sync-triggers.js';
+
+// v6.10: Prospect deny-list for chronically-timing-out cstIds. The
+// leads sweep loads the active denylist at start and skips processProspect
+// for those cstIds. See src/prospect-denylist.js for the state machine.
+import {
+  loadActiveDenylist,
+  recordProspectFailure,
+  recordProspectSuccess,
+} from './prospect-denylist.js';
 
 // v6.6: Max leads per incremental run. Env-configurable.
 // Default lowered from 2000 → 500 so a single run fits comfortably within
@@ -417,10 +454,23 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
   const counts = { leads: 0, calls: 0, notes: 0, jobs: 0, milestones: 0, activities: 0 };
   let failed = 0;
   let timedOut = 0;
+  // v6.10: deny-list observability counters.
+  let denylistSkipped = 0;
+  let newlyDenylisted = 0;
   let hitCap = false;
   let startIndex = 1;
   const sweepStartedAt = Date.now();
   let lastHeartbeat = sweepStartedAt;
+
+  // v6.10: Load active deny-list once at sweep start. New denylist
+  // transitions added mid-sweep (via recordProspectFailure return) are
+  // appended to this Set so subsequent pages in the SAME sweep also
+  // skip those cstIds. Fails-open: returns empty Set if supabase is
+  // unavailable, so an infrastructure outage doesn't break sync.
+  const denylistSet = await loadActiveDenylist();
+  if (denylistSet.size > 0) {
+    console.log(`[Sync:Leads] Deny-list loaded: ${denylistSet.size} active cstIds will be skipped this sweep`);
+  }
 
   while (counts.leads < maxLeads) {
     let leads;
@@ -455,6 +505,14 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
     // no longer block Promise.allSettled — the timeout rejects, the
     // batch settles, and the sweep keeps moving. Timed-out prospects
     // count as failed and are logged with their cstId for follow-up.
+    //
+    // v6.10: Before calling processProspect, check the deny-list. If
+    // the cstId is in denylistSet (loaded at sweep start + appended on
+    // mid-sweep transitions), skip without touching LP. On a successful
+    // processProspect, fire-and-forget recordProspectSuccess to clear
+    // any prior failure history. On a timeout, fire-and-forget
+    // recordProspectFailure which may transition this cstId into the
+    // active denylist for future sweeps.
     const batchResults = await processInBatches(items, SYNC_PROSPECT_CONCURRENCY, async (lead) => {
       // Hit-cap guard: if a peer in this batch already pushed us over
       // the cap, skip without consuming further work.
@@ -463,28 +521,51 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
       const cstId = lead.cst_id || lead.CstID || lead.prospectid || lead.ProspectID;
       if (!cstId) return null;
 
+      // v6.10: Deny-list gate. Skip cstIds known to chronically time
+      // out. The membership check is O(1) against the in-memory Set.
+      const cstIdStr = String(cstId);
+      if (denylistSet.has(cstIdStr)) {
+        denylistSkipped++;
+        return null;
+      }
+
       try {
-        return await withProspectTimeout(
+        const result = await withProspectTimeout(
           processProspect(lead),
           SYNC_PROSPECT_TIMEOUT_MS,
           `cstId=${cstId}`,
         );
+        // v6.10: Success — clear any prior failure history. Fire-and-
+        // forget so deny-list housekeeping doesn't block the sweep.
+        recordProspectSuccess(cstIdStr).catch(() => {});
+        return result;
       } catch (err) {
         if (err && err.message && err.message.startsWith('prospect timeout')) {
           timedOut++;
           failed++;
           console.warn(`[Sync:Leads] Prospect cstId=${cstId} ${err.message} — counted as failed, moving on`);
           await logSyncError(cstId, err);
+          // v6.10: Record the timeout. If this pushes the cstId over the
+          // consecutive-failure threshold, recordProspectFailure returns
+          // { denylisted: true } and we add it to the in-memory set so
+          // any subsequent page in this sweep also skips it. Fire-and-
+          // forget the write itself — but await the return-value handling
+          // synchronously via .then() so newlyDenylisted is accurate.
+          recordProspectFailure(cstIdStr, err.message).then((res) => {
+            if (res && res.denylisted) {
+              denylistSet.add(cstIdStr);
+              newlyDenylisted++;
+            }
+          }).catch(() => {});
         } else {
           failed++;
           await logSyncError(cstId, err);
+          // Non-timeout failures don't accumulate against the deny-list.
+          // Most non-timeout errors are transient (auth, schema, etc.)
+          // and shouldn't bias the chronic-failure heuristic.
         }
         return null;
       }
-
-      // Heartbeat (in-batch progress visibility). The check is outside
-      // the inner try so it runs even when prospects succeed; throttled
-      // to once every 60s to keep the log signal-to-noise high.
     });
 
     // Aggregate this batch's results into sweep-local counts.
@@ -512,10 +593,17 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
     // multi-LP-lead prospect log lines. Throttled at 60s. Always logs
     // at end of each page so a slow page (e.g. all single-lead prospects)
     // is visible.
+    // v6.10: Include deny-list skip counts so the heartbeat reflects
+    // their contribution to throughput.
     const now = Date.now();
     if (now - lastHeartbeat >= 60000 || counts.leads % 100 === 0) {
       const elapsedMin = ((now - sweepStartedAt) / 60000).toFixed(1);
-      console.log(`[Sync:Leads] Heartbeat — ${counts.leads} leads processed, ${failed} failed (${timedOut} timeout), elapsed ${elapsedMin}min`);
+      console.log(
+        `[Sync:Leads] Heartbeat — ${counts.leads} leads processed, ` +
+        `${failed} failed (${timedOut} timeout), ` +
+        `${denylistSkipped} denylist-skipped (${newlyDenylisted} newly denied), ` +
+        `elapsed ${elapsedMin}min`
+      );
       lastHeartbeat = now;
     }
 
@@ -530,7 +618,13 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
   if (timedOut > 0) {
     console.warn(`[Sync:Leads] ${timedOut} prospects timed out (>${SYNC_PROSPECT_TIMEOUT_MS / 1000}s each) — counted as failed, sweep continued`);
   }
-  return { counts, failed, hitCap };
+  if (denylistSkipped > 0 || newlyDenylisted > 0) {
+    console.log(
+      `[Sync:Leads] Deny-list summary — ${denylistSkipped} skipped at gate, ` +
+      `${newlyDenylisted} newly denylisted this sweep (total active denylist size now: ${denylistSet.size})`
+    );
+  }
+  return { counts, failed, hitCap, denylistSkipped, newlyDenylisted };
 }
 
 async function runJobChangesSweep(since, today, logIds) {
@@ -631,6 +725,9 @@ export async function incrementalSync() {
     const counts = { leads: 0, calls: 0, notes: 0, jobs: 0, milestones: 0, activities: 0 };
     let failed = 0;
     let hitCap = false;
+    // v6.10: deny-list counters surfaced to the orchestrator log.
+    let denylistSkipped = 0;
+    let newlyDenylisted = 0;
 
     if (leadsRes.status === 'fulfilled' && leadsRes.value) {
       const r = leadsRes.value;
@@ -642,6 +739,8 @@ export async function incrementalSync() {
       counts.activities = r.counts.activities;
       failed += r.failed;
       hitCap = r.hitCap;
+      denylistSkipped = r.denylistSkipped || 0;
+      newlyDenylisted = r.newlyDenylisted || 0;
     } else {
       const reason = leadsRes.reason?.message || 'leadsSweep failed';
       // v6.6: Log partial-progress counts even though the sweep didn't
@@ -724,7 +823,11 @@ export async function incrementalSync() {
     try { await checkLeadTriggers(); } catch (e) { console.warn('[Sync] Lead triggers:', e.message); }
 
     const duration = Date.now() - startedAt.getTime();
-    console.log(`[Sync] Incremental sync complete — ${counts.leads} leads, ${counts.calls} calls, ${counts.notes} notes, ${counts.jobs} jobs, ${failed} failed${hitCap ? ' (CAPPED)' : ''} (${Math.round(duration / 1000)}s)`);
+    // v6.10: append deny-list summary to the final orchestrator log
+    // line. Always shown so a zero-count sweep also makes it visible
+    // that the gate ran.
+    const denylistSummary = ` | deny-list: ${denylistSkipped} skipped, ${newlyDenylisted} newly denied`;
+    console.log(`[Sync] Incremental sync complete — ${counts.leads} leads, ${counts.calls} calls, ${counts.notes} notes, ${counts.jobs} jobs, ${failed} failed${hitCap ? ' (CAPPED)' : ''}${denylistSummary} (${Math.round(duration / 1000)}s)`);
     return counts;
 
   } catch (err) {
