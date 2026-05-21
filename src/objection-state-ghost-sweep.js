@@ -11,6 +11,9 @@
  *   - NO LP disposition change has been observed since the appointment
  *   - NO inbound reply since the appointment
  *   - contact does not already have an open objection_state row
+ *   - contact's current GHL tags do NOT indicate they've already sat,
+ *     are a customer, are stop-bot/DNC, or are already enrolled in
+ *     S5.2 v2 / W8.0 / W9.0 (v2 — 2026-05-21)
  *
  * Why emit `confirmation_unacknowledged` instead of writing the state
  * directly: the existing STATE_CLASSIFICATION rule
@@ -23,6 +26,20 @@
  * contact_id + day-bucket so the sweep is safe to run on a tight
  * cadence without spamming duplicate events.
  *
+ * 2026-05-21 (v2): FALSE-POSITIVE FIX. Mark observed a wave of 24
+ * ghost-after-booking enrollments where 14+ contacts had `stage:post-
+ * appointment` / `active-w8.0` / `deal-won` tags (already sat or
+ * already converted), plus 2 had `stop-bot`. The sweep was checking
+ * only the event bus for evidence of life — which fails when LP-MCP
+ * never emitted `lp.disposition_changed` for a sit (a known sync gap).
+ *
+ * v2 adds a live GHL tag check before emitting. Any tag in
+ * EXCLUDE_TAGS short-circuits the contact. This is a belt-and-
+ * suspenders fix paired with context_conditions on Rule 240
+ * (BEHAVIORAL_GHOST_AFTER_BOOKING) — the rule gates again at decision
+ * time so a tag added between sweep emit and rule evaluation still
+ * blocks the false positive. Both gates were missing in v1.
+ *
  * Tuning knobs (env or defaults below):
  *   GHOST_MIN_HOURS=24
  *   GHOST_MAX_HOURS=72
@@ -32,6 +49,7 @@
 
 import supabase from './supabase.js';
 import { emitEvent } from './event-emitter.js';
+import { getGHLContact } from './ghl.js';
 
 const GHOST_MIN_HOURS = Number(process.env.GHOST_MIN_HOURS || 24);
 const GHOST_MAX_HOURS = Number(process.env.GHOST_MAX_HOURS || 72);
@@ -43,6 +61,38 @@ const APPT_SUBTYPES = ['appt:booked', 'appointment_booked'];
 
 const DISPOSITION_EVENT_TYPES = ['lp.disposition_changed'];
 const INBOUND_EVENT_TYPES = ['ghl.reply_received', 'sms.received'];
+
+// v2 — tag-based exclusion list. Any contact carrying ANY of these tags
+// is treated as "already past the point where ghosting matters" and
+// skipped by the sweep. Keep this list in sync with Rule 240's
+// context_conditions.not_has_any_tag — both layers should be redundant.
+//
+// Categories:
+//   - Already-sat / post-demo:  stage:post-appointment, lp-demo-completed,
+//                               active-w8.0, active-w9.0
+//   - Already-converted:        customer, lp-sale, lp-customer, deal-won,
+//                               buyer:post-decision, bj:stage-5-committed,
+//                               stage:customer-onboarding, p2:active
+//   - DNC / suppression:        stop-bot, dnc, dnc-related, unsubscribed,
+//                               optedOut, stage:dnc, cooling-active
+//   - Already-in-rescue:        active-w-S5.2, active-w5.2, active-w-S5.1,
+//                               active-s5.2
+const EXCLUDE_TAGS = new Set([
+  // Sat / post-demo
+  'stage:post-appointment',
+  'lp-demo-completed',
+  'active-w8.0',
+  'active-w9.0',
+  // Converted
+  'customer', 'lp-sale', 'lp-customer', 'deal-won',
+  'buyer:post-decision', 'bj:stage-5-committed',
+  'stage:customer-onboarding', 'p2:active',
+  // DNC / suppression
+  'stop-bot', 'dnc', 'dnc-related', 'unsubscribed', 'optedOut',
+  'stage:dnc', 'cooling-active',
+  // Already in rescue workflow
+  'active-w-S5.2', 'active-w5.2', 'active-w-S5.1', 'active-s5.2',
+]);
 
 async function findApptCandidates(now) {
   const cutoffMax = new Date(now.getTime() - GHOST_MAX_HOURS * 3600 * 1000).toISOString();
@@ -107,6 +157,39 @@ async function hasOpenObjectionState(contactId) {
   }
 }
 
+/**
+ * v2 — fetch the contact's live tags from GHL and return the first
+ * EXCLUDE_TAGS match, or null if none match. Used to short-circuit
+ * contacts who have already sat / converted / been DNC'd before
+ * emitting the ghost-after-booking event.
+ *
+ * On GHL API failure we FAIL CLOSED: return 'fetch_failed' so the
+ * sweep skips the contact rather than emitting a potentially-wrong
+ * ghost classification. The contact will get another chance on the
+ * next sweep cycle when GHL is healthy.
+ *
+ * Returns:
+ *   null                 — no excluded tags, OK to emit
+ *   string (tag name)    — first excluded tag found; skip contact
+ *   'fetch_failed'       — GHL fetch errored; fail closed and skip
+ */
+async function findExcludedTag(contactId) {
+  let contact;
+  try {
+    contact = await getGHLContact(contactId);
+  } catch (err) {
+    console.warn(`[GhostSweep] contact fetch failed for ${contactId}: ${err.message} — failing closed`);
+    return 'fetch_failed';
+  }
+  if (!contact) return 'fetch_failed';
+
+  const tags = Array.isArray(contact.tags) ? contact.tags : [];
+  for (const t of tags) {
+    if (EXCLUDE_TAGS.has(t)) return t;
+  }
+  return null;
+}
+
 export async function runGhostSweep({ dryRun = false } = {}) {
   const start = Date.now();
   const now = new Date();
@@ -115,8 +198,11 @@ export async function runGhostSweep({ dryRun = false } = {}) {
   let emitted = 0;
   let skippedActivity = 0;
   let skippedHasState = 0;
+  let skippedExcludedTag = 0;
+  let skippedFetchFailed = 0;
   let errors = 0;
   const details = [];
+  const exclusionCounts = {};
 
   for (const appt of candidates) {
     const contactId = appt.ghl_contact_id;
@@ -132,6 +218,22 @@ export async function runGhostSweep({ dryRun = false } = {}) {
       }
       if (await hasOpenObjectionState(contactId)) {
         skippedHasState++;
+        continue;
+      }
+
+      // v2 — tag check (after the cheap event-bus checks so we only
+      // pay the GHL API cost for contacts that survived the earlier
+      // filters).
+      const excludedTag = await findExcludedTag(contactId);
+      if (excludedTag === 'fetch_failed') {
+        skippedFetchFailed++;
+        if (dryRun) details.push({ contact_id: contactId, decision: 'skipped_fetch_failed' });
+        continue;
+      }
+      if (excludedTag !== null) {
+        skippedExcludedTag++;
+        exclusionCounts[excludedTag] = (exclusionCounts[excludedTag] || 0) + 1;
+        if (dryRun) details.push({ contact_id: contactId, decision: 'skipped_excluded_tag', tag: excludedTag });
         continue;
       }
 
@@ -173,12 +275,20 @@ export async function runGhostSweep({ dryRun = false } = {}) {
     emitted,
     skipped_recent_activity: skippedActivity,
     skipped_has_open_state: skippedHasState,
+    skipped_excluded_tag: skippedExcludedTag,
+    skipped_fetch_failed: skippedFetchFailed,
     errors,
     dry_run: !!dryRun,
     elapsed_ms: Date.now() - start,
   };
+  if (skippedExcludedTag > 0) summary.exclusion_breakdown = exclusionCounts;
   if (dryRun) summary.details = details;
-  console.log(`[GhostSweep] ${candidates.length} candidates → ${emitted} emitted, ${skippedActivity} skipped (activity), ${skippedHasState} skipped (open state), ${errors} errors (${summary.elapsed_ms}ms)`);
+  console.log(
+    `[GhostSweep] ${candidates.length} candidates → ${emitted} emitted, ` +
+    `${skippedActivity} skipped (activity), ${skippedHasState} skipped (open state), ` +
+    `${skippedExcludedTag} skipped (excluded tag), ${skippedFetchFailed} skipped (fetch failed), ` +
+    `${errors} errors (${summary.elapsed_ms}ms)`
+  );
   return summary;
 }
 
