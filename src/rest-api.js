@@ -23,6 +23,7 @@
  *   POST /webhook/ghl-event                      — GHL→Agentic handoff (Webhook Bridge, no auth)
  *   GET  /api/lookup/lp-lead?lead_id=...         — LP lead name + contact info lookup (no auth, cache + LP API live)
  *   POST /api/lookup/lp-lead                     — Same, with JSON body (no auth)
+ *   POST /api/lookup/lp-lead-and-update-ghl-contact — Lookup LP lead + PATCH GHL contact + tag-poke for Wait-for-Condition (no auth, fire-and-forget)
  */
 
 import supabase from './supabase.js';
@@ -215,43 +216,34 @@ async function serviceAreaLookupHandler(req, res) {
 // the GHL Contact Not Found branch tries to create a contact, missing
 // names break Create Contact + downstream personalization.
 //
-// USAGE FROM GHL: Custom Webhook step in the Contact Not Found branch,
-// gated by an IF/ELSE that checks whether the inbound webhook already
-// has names. POST JSON body OR GET query with one of:
-//   - lead_id      (LP lds_id — PRIMARY, most reliable)
-//   - prospect_id  (LP cst_id — fallback)
-//   - phone        (digits or formatted — last-resort fallback)
+// Two endpoints:
+//   1. /api/lookup/lp-lead — passive lookup, returns name JSON
+//      (synchronous; for use with GHL Custom Webhook / LC Premium)
+//   2. /api/lookup/lp-lead-and-update-ghl-contact — active update,
+//      PATCHes the GHL contact + tag-pokes Wait-for-Condition
+//      (asynchronous; for use with GHL standard outbound Webhook)
+//
+// The active endpoint is the architecturally cleaner option: the GHL
+// workflow fires a standard Webhook (no LC Premium cost), then waits
+// on a Wait-for-Condition step that watches the contact's first_name /
+// last_name fields. LP MCP queries LP, PATCHes the contact, and fires
+// a tag poke to force the wait step to re-evaluate (GHL wait steps
+// don't reliably re-evaluate on API field changes — but they DO
+// re-evaluate on tag-change events).
+
+// ─── Shared lookup helper ──────────────────────────────────────────
+//
+// Extracted from the GET/POST handler so the lookup-and-update endpoint
+// can reuse the same lookup logic. Always returns a normalized response
+// object — never throws to the caller.
 //
 // LOOKUP STRATEGY:
-//   1. Try Supabase lp_leads cache (fast, ~50ms). Skip if not present
-//      or missing names.
-//   2. Fall back to LP API live via getLeadByLdsId / getLead /
-//      getCustomers3. ~500-2000ms cold, but always current.
-//
-// RESPONSE CONTRACT (always 200 — never throws to GHL):
-//   {
-//     found: true|false,
-//     first_name: "John",         // empty string if not found
-//     last_name: "Smith",
-//     email: "...",
-//     phone: "5551234567",
-//     address1: "123 Main St",
-//     city: "...",
-//     state: "FL",
-//     zip: "33301",
-//     lead_id: "12345",           // echoed back
-//     prospect_id: "67890",
-//     source: "cache" | "live_api" | null,
-//     lookup_method: "lead_id" | "prospect_id" | "phone" | "none",
-//     reason: "..."               // only when found=false
-//   }
-//
-// Empty strings (not nulls) are returned for missing fields so GHL's
-// IF/ELSE conditions ("field has value") behave predictably.
-async function lpLeadLookupHandler(req, res) {
-  const src = { ...(req.query || {}), ...(req.body || {}) };
-
-  // Accept the naming conventions GHL LP webhooks tend to use.
+//   1. Supabase lp_leads cache (fast, ~50ms). Skip if not present or
+//      names are empty.
+//   2. LP API live via getLeadByLdsId / getLead / getCustomers3.
+//      ~500-2000ms cold but always current. Brand-new LP leads not
+//      yet in the sync cache are handled by this tier.
+async function _lookupLpLead(src) {
   const leadId = String(src.lead_id || src.leadId || src.lds_id || src.ldsId || '').trim();
   const prospectId = String(src.prospect_id || src.prospectId || src.cst_id || src.cstId || src.prospect_number || src.prospectNumber || '').trim();
   const phoneRaw = String(src.phone || '').trim();
@@ -303,14 +295,11 @@ async function lpLeadLookupHandler(req, res) {
   };
 
   if (!leadId && !prospectId && !phoneDigits) {
-    return res.json(emptyResponse('no_lookup_key_supplied'));
+    return emptyResponse('no_lookup_key_supplied');
   }
 
   try {
     // ───── Tier 1: Supabase cache (lp_leads) ─────────────────────
-    // Fast path. The cache is populated by incremental sync, so brand-
-    // new LP leads may not be here yet — we fall through to LP API
-    // in that case.
     let cacheRow = null;
     if (leadId) {
       const { data } = await supabase.from('lp_leads').select('*').eq('lp_lead_id', leadId).maybeSingle();
@@ -330,11 +319,10 @@ async function lpLeadLookupHandler(req, res) {
       const method = leadId ? 'lead_id' : (prospectId ? 'prospect_id' : 'phone');
       const result = toResponse(cacheRow, 'cache', method);
       console.log(`[LP Lead Lookup] HIT via ${method} (cache): lead_id=${leadId || '?'}, name=${result.first_name} ${result.last_name}`);
-      return res.json(result);
+      return result;
     }
 
     // ───── Tier 2: LP API live ───────────────────────────────────
-    // Lazy import to avoid loading lp-client when this route isn't hit.
     const { getLeadByLdsId, getLead, getCustomers3 } = await import('./lp-client.js');
 
     const unwrap = (resp) => {
@@ -378,17 +366,304 @@ async function lpLeadLookupHandler(req, res) {
     }
 
     if (!prospect) {
-      return res.json(emptyResponse('no_match_in_lp_api', method));
+      return emptyResponse('no_match_in_lp_api', method);
     }
 
     const result = toResponse(prospect, 'live_api', method);
     console.log(`[LP Lead Lookup] HIT via ${method} (live): lead_id=${leadId || '?'}, name=${result.first_name} ${result.last_name}`);
-    return res.json(result);
+    return result;
 
   } catch (err) {
     console.error('[LP Lead Lookup] Unhandled error:', err.message);
-    return res.json(emptyResponse('internal_error_' + err.message.slice(0, 80)));
+    return emptyResponse('internal_error_' + err.message.slice(0, 80));
   }
+}
+
+// ─── Passive lookup handler ────────────────────────────────────────
+// Returns the lookup result as JSON. Synchronous; intended for use
+// with GHL Custom Webhook / LC Premium where the workflow reads the
+// response directly into customData merge tags.
+//
+// RESPONSE CONTRACT (always 200, never throws to GHL):
+//   {
+//     found: true|false,
+//     first_name: "John",         // empty string if not found
+//     last_name: "Smith",
+//     email: "...",
+//     phone: "5551234567",
+//     address1: "123 Main St",
+//     city: "...",
+//     state: "FL",
+//     zip: "33301",
+//     lead_id: "12345",           // echoed back
+//     prospect_id: "67890",
+//     source: "cache" | "live_api" | null,
+//     lookup_method: "lead_id" | "prospect_id" | "phone" | "none",
+//     reason: "..."               // only when found=false
+//   }
+async function lpLeadLookupHandler(req, res) {
+  const src = { ...(req.query || {}), ...(req.body || {}) };
+  const result = await _lookupLpLead(src);
+  return res.json(result);
+}
+
+// ─── GHL API helpers for the lookup-and-update flow ────────────────
+//
+// All three mirror the patterns established in
+// notifications/cancellation-notifications.js. Reusing the same tag
+// poke shape means a contact can carry the same wait-step nudge tag
+// across flows without cross-talk; the tag is short-lived (add+remove
+// within seconds) and used only as a re-evaluation trigger.
+
+const _LP_LOOKUP_GHL_BASE = 'https://services.leadconnectorhq.com';
+const _LP_LOOKUP_GHL_TIMEOUT_MS = parseInt(
+  process.env.LP_LOOKUP_GHL_TIMEOUT_MS || '10000',
+  10,
+);
+const _LP_LOOKUP_DEFAULT_POKE_TAG = 'lp-name-update-poke';
+const _LP_LOOKUP_POKE_DELAY_MS = parseInt(
+  process.env.LP_LOOKUP_POKE_DELAY_MS || '2000',
+  10,
+);
+
+/**
+ * PUT GHL contact standard fields. Only the fields explicitly listed
+ * here are sent — NEVER include `tags` (would full-replace) or
+ * `locationId` (rejected by GHL on contact PUT). Caller passes a flat
+ * { firstName, lastName, email, phone, address1, city, state,
+ * postalCode } object; empty/undefined fields are dropped so we don't
+ * blank out values the GHL contact may already have.
+ */
+async function _lpLookupGhlPatchContact(contactId, fields, { fetchImpl = fetch } = {}) {
+  const apiKey = process.env.GHL_API_KEY || '';
+  if (!apiKey) throw new Error('GHL_API_KEY_not_configured');
+
+  const body = {};
+  const allowed = ['firstName', 'lastName', 'email', 'phone', 'address1', 'city', 'state', 'postalCode'];
+  for (const k of allowed) {
+    const v = fields?.[k];
+    if (v !== undefined && v !== null && String(v).trim() !== '') {
+      body[k] = String(v);
+    }
+  }
+  if (Object.keys(body).length === 0) {
+    return { skipped: true, reason: 'no_fields_to_update' };
+  }
+
+  const res = await fetchImpl(`${_LP_LOOKUP_GHL_BASE}/contacts/${contactId}`, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      Version: '2021-07-28',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(_LP_LOOKUP_GHL_TIMEOUT_MS),
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`ghl_${res.status}:${errText.slice(0, 200)}`);
+  }
+  return res.json().catch(() => ({}));
+}
+
+/**
+ * Add a single tag via POST /contacts/{id}/tags (additive — does NOT
+ * disturb existing tags). Returns silently on failure; tag operations
+ * are best-effort and never throw to the caller.
+ */
+async function _lpLookupGhlAddTag(contactId, tag, { fetchImpl = fetch } = {}) {
+  const apiKey = process.env.GHL_API_KEY || '';
+  if (!apiKey) {
+    console.warn('[LP Lookup+Update] tag add skipped: GHL_API_KEY not configured');
+    return;
+  }
+  try {
+    const r = await fetchImpl(`${_LP_LOOKUP_GHL_BASE}/contacts/${contactId}/tags`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Version: '2021-07-28',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ tags: [tag] }),
+      signal: AbortSignal.timeout(_LP_LOOKUP_GHL_TIMEOUT_MS),
+    });
+    if (!r.ok) {
+      const errText = await r.text().catch(() => '');
+      console.warn(`[LP Lookup+Update] tag add failed contact=${contactId} tag=${tag} status=${r.status} ${errText.slice(0, 200)}`);
+    }
+  } catch (err) {
+    console.warn(`[LP Lookup+Update] tag add threw contact=${contactId} tag=${tag}: ${err.message}`);
+  }
+}
+
+/**
+ * Remove a single tag via DELETE /contacts/{id}/tags. Returns silently
+ * on failure; tag operations are best-effort.
+ */
+async function _lpLookupGhlRemoveTag(contactId, tag, { fetchImpl = fetch } = {}) {
+  const apiKey = process.env.GHL_API_KEY || '';
+  if (!apiKey) return;
+  try {
+    const r = await fetchImpl(`${_LP_LOOKUP_GHL_BASE}/contacts/${contactId}/tags`, {
+      method: 'DELETE',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Version: '2021-07-28',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ tags: [tag] }),
+      signal: AbortSignal.timeout(_LP_LOOKUP_GHL_TIMEOUT_MS),
+    });
+    if (!r.ok) {
+      const errText = await r.text().catch(() => '');
+      console.warn(`[LP Lookup+Update] tag remove failed contact=${contactId} tag=${tag} status=${r.status} ${errText.slice(0, 200)}`);
+    }
+  } catch (err) {
+    console.warn(`[LP Lookup+Update] tag remove threw contact=${contactId} tag=${tag}: ${err.message}`);
+  }
+}
+
+/**
+ * Tag poke = add + brief delay + remove. The ADD fires a tag-change
+ * event that triggers GHL Wait-for-Condition re-evaluation. The
+ * REMOVE keeps the contact's tag set clean so pokes don't accumulate.
+ * Mirrors the ghlPokeTag pattern in cancellation-notifications.js.
+ */
+async function _lpLookupGhlPokeTag(contactId, tag, { fetchImpl = fetch } = {}) {
+  await _lpLookupGhlAddTag(contactId, tag, { fetchImpl });
+  await new Promise(r => setTimeout(r, 500));
+  await _lpLookupGhlRemoveTag(contactId, tag, { fetchImpl });
+}
+
+// ─── Active lookup-and-update handler ──────────────────────────────
+//
+// Asynchronous endpoint for the GHL standard outbound Webhook step.
+// Returns 200 immediately so the GHL workflow can proceed to its
+// Wait-for-Condition step without blocking on LP API latency. The
+// actual work runs in setImmediate.
+//
+// FLOW:
+//   1. Validate ghl_contact_id (required). Return 200 immediately.
+//   2. Async: call _lookupLpLead with whatever IDs the caller passed.
+//   3. If FOUND: PUT contact firstName/lastName (+ optional standard
+//      fields if LP has them). Wait LP_LOOKUP_POKE_DELAY_MS for GHL
+//      eventual consistency. Fire tag poke (add + 500ms + remove).
+//   4. If NOT FOUND: add `lp-lookup:no-match` tag for debugging. Do
+//      NOT poke — let the GHL workflow's Wait-for-Condition timeout
+//      to its fallback branch cleanly.
+//   5. If PATCH fails: log + add `lp-lookup:patch-failed` tag. Do NOT
+//      poke — same fallback reasoning.
+//
+// GHL WORKFLOW USAGE:
+//   - In the Contact Not Found branch, after creating a placeholder
+//     contact (which may have empty firstName/lastName).
+//   - Standard outbound Webhook step posts:
+//       { ghl_contact_id: "{{contact.id}}",
+//         lead_id:       "{{inboundWebhookRequest.lead_id}}",
+//         prospect_id:   "{{inboundWebhookRequest.prospect_number}}" }
+//   - Next step: Wait-for-Condition watching the contact's first_name
+//     (recommended: first_name has value; OR include last_name if
+//     you want stricter gating). Set a 5-minute timeout with a
+//     fallback branch for the LP-truly-has-no-data case.
+//   - This endpoint fires the tag poke that advances the wait step.
+async function lpLeadUpdateGhlContactHandler(req, res) {
+  const src = { ...(req.query || {}), ...(req.body || {}) };
+
+  const ghlContactId = String(
+    src.ghl_contact_id || src.ghlContactId || src.contact_id || src.contactId || ''
+  ).trim();
+
+  if (!ghlContactId) {
+    return res.status(400).json({
+      ok: false,
+      error: 'ghl_contact_id_required',
+      detail: 'Provide ghl_contact_id (or contact_id) in the JSON body or query string.',
+    });
+  }
+
+  const pokeTag = String(src.poke_tag || src.pokeTag || _LP_LOOKUP_DEFAULT_POKE_TAG).trim();
+
+  // ─── Respond 200 immediately ─────────────────────────────────────
+  // The GHL workflow proceeds to the Wait-for-Condition step without
+  // blocking on LP API latency. The poke will arrive seconds later
+  // and force the wait step to re-evaluate.
+  res.json({
+    ok: true,
+    received: true,
+    ghl_contact_id: ghlContactId,
+    poke_tag: pokeTag,
+    processing: 'async',
+  });
+
+  // ─── Schedule async work AFTER response sent ─────────────────────
+  setImmediate(async () => {
+    try {
+      const lookup = await _lookupLpLead(src);
+
+      if (!lookup.found) {
+        console.warn(
+          `[LP Lookup+Update] No LP match for contact=${ghlContactId} ` +
+          `(reason=${lookup.reason}, method=${lookup.lookup_method}). ` +
+          `Tagging lp-lookup:no-match. NOT poking — Wait-for-Condition will timeout to fallback.`
+        );
+        await _lpLookupGhlAddTag(ghlContactId, 'lp-lookup:no-match');
+        return;
+      }
+
+      // PATCH the GHL contact with name + optional standard contact fields.
+      // Only the fields LP actually has — don't blank out existing GHL values.
+      const patchFields = {
+        firstName: lookup.first_name,
+        lastName: lookup.last_name,
+        email: lookup.email,
+        phone: lookup.phone,
+        address1: lookup.address1,
+        city: lookup.city,
+        state: lookup.state,
+        postalCode: lookup.zip,
+      };
+
+      try {
+        const result = await _lpLookupGhlPatchContact(ghlContactId, patchFields);
+        if (result?.skipped) {
+          console.warn(
+            `[LP Lookup+Update] PATCH skipped contact=${ghlContactId} reason=${result.reason}. ` +
+            `Lookup found a record but every field was empty. NOT poking.`
+          );
+          await _lpLookupGhlAddTag(ghlContactId, 'lp-lookup:empty-record');
+          return;
+        }
+        console.log(
+          `[LP Lookup+Update] PATCH ok contact=${ghlContactId} ` +
+          `name="${lookup.first_name} ${lookup.last_name}" via=${lookup.lookup_method}/${lookup.source}`
+        );
+      } catch (err) {
+        console.error(
+          `[LP Lookup+Update] PATCH failed contact=${ghlContactId}: ${err.message}. ` +
+          `Tagging lp-lookup:patch-failed. NOT poking — Wait-for-Condition will timeout to fallback.`
+        );
+        await _lpLookupGhlAddTag(ghlContactId, 'lp-lookup:patch-failed');
+        return;
+      }
+
+      // ─── Tag poke ───────────────────────────────────────────────
+      // Wait so GHL's internal eventual consistency settles before we
+      // fire the tag-change event. Without this delay, the Wait-for-
+      // Condition step can re-evaluate before the PUT is visible.
+      await new Promise(r => setTimeout(r, _LP_LOOKUP_POKE_DELAY_MS));
+
+      // Add + remove fires two tag-change events; either is sufficient
+      // to trigger Wait-for-Condition re-evaluation. Field is now set,
+      // so the condition advances the contact past the wait step.
+      await _lpLookupGhlPokeTag(ghlContactId, pokeTag);
+      console.log(`[LP Lookup+Update] poke fired contact=${ghlContactId} tag=${pokeTag}`);
+
+    } catch (err) {
+      console.error(`[LP Lookup+Update] async worker error contact=${ghlContactId}: ${err.message}`);
+    }
+  });
 }
 
 export function registerRestApiRoutes(app, authenticate) {
@@ -518,15 +793,26 @@ export function registerRestApiRoutes(app, authenticate) {
   console.log('[REST API] Registered: GET+POST /api/service-area/lookup (no-auth, HDL.2 routing)');
 
   // ═══════════════════════════════════════════════════════════════
-  // /api/lookup/lp-lead — LP lead name/contact lookup for GHL workflows
+  // /api/lookup/lp-lead — passive LP lead lookup (returns JSON)
   // ═══════════════════════════════════════════════════════════════
-  // No auth. Called by the GHL Custom Webhook step in the LP Inbound
-  // Webhook workflow's Contact Not Found branch when the inbound
-  // payload is missing first_name / last_name. See lpLeadLookupHandler
-  // above for the full contract.
+  // No auth. For GHL Custom Webhook (LC Premium) steps that want to
+  // read the LP-sourced name into customData merge tags. Synchronous.
+  // See lpLeadLookupHandler / _lookupLpLead above for the contract.
   app.get('/api/lookup/lp-lead', lpLeadLookupHandler);
   app.post('/api/lookup/lp-lead', lpLeadLookupHandler);
   console.log('[REST API] Registered: GET+POST /api/lookup/lp-lead (no-auth, GHL Create-Contact name fallback)');
+
+  // ═══════════════════════════════════════════════════════════════
+  // /api/lookup/lp-lead-and-update-ghl-contact — active update + poke
+  // ═══════════════════════════════════════════════════════════════
+  // No auth. For GHL standard outbound Webhook (no LC Premium cost)
+  // steps in workflows that use a Wait-for-Condition step to
+  // synchronize with the async LP MCP lookup + PATCH. Asynchronous —
+  // returns 200 immediately, does the work in setImmediate, fires a
+  // tag poke to advance the wait step. See
+  // lpLeadUpdateGhlContactHandler above for the full contract.
+  app.post('/api/lookup/lp-lead-and-update-ghl-contact', lpLeadUpdateGhlContactHandler);
+  console.log('[REST API] Registered: POST /api/lookup/lp-lead-and-update-ghl-contact (no-auth, fire-and-forget LP lookup + GHL PATCH + tag-poke)');
 
   // ═══════════════════════════════════════════════════════════════
   // POST /api/agentic/dynamic-callback-message — Dynamic SMS for HDL.2
