@@ -3,6 +3,27 @@
  *
  * The brain of the agentic system.
  *
+ * v2.15 — 2026-05-21. event_subtype_not_in context predicate.
+ *   Adds a new context_conditions predicate so a rule can opt out of
+ *   event subtypes that already have a dedicated rule. Used by the
+ *   ENTRY_HYGIENE_AT_CREATION_FALLBACK catch-all rule to ensure it
+ *   only fires for ghl.contact_created events whose event_subtype
+ *   is NOT in the list of subtypes with specific hygiene rules.
+ *
+ *   Without this predicate, the catch-all (event_pattern matches any
+ *   ghl.contact_created) would fire alongside specific subtype rules,
+ *   resulting in conflicting tag writes (e.g. canvassing-specific rule
+ *   adds entry:canvassing while catch-all adds entry:other).
+ *
+ *   Usage:
+ *     "context_conditions": {
+ *       "event_subtype_not_in": ["canvassing", "chatbot", "internet", ...]
+ *     }
+ *
+ *   Pairs with: agent_rules ENTRY_HYGIENE_AT_CREATION_FALLBACK rule
+ *   inserted as part of the Phase 1 hygiene rollout (13 specific rules
+ *   + 1 catch-all).
+ *
  * v2.14 — 2026-05-07. priority_lane sort to prevent bulk-event starvation.
  *   PROBLEM: processEvents fetched pending system_events ordered by
  *   `priority` (text). Postgres sorts text alphabetically:
@@ -582,6 +603,20 @@ async function evaluateContextConditions(conditions, intelligence, event) {
         const disp = lpLead?.disposition_code || null;
         if (!allowed.includes(disp)) {
           console.log(`[Context] BLOCKED: lp_disposition "${disp}" not in [${allowed.join(',')}]`);
+          return false;
+        }
+        break;
+      }
+
+      // v2.15 — event_subtype blocklist. Lets a catch-all rule opt out
+      // of subtypes that have a dedicated rule. Used by
+      // ENTRY_HYGIENE_AT_CREATION_FALLBACK to fire only when the
+      // incoming event_subtype is unknown / not yet classified.
+      case 'event_subtype_not_in': {
+        const blockedSubtypes = Array.isArray(expected) ? expected : [expected];
+        const subtype = event?.event_subtype || null;
+        if (subtype !== null && blockedSubtypes.includes(subtype)) {
+          console.log(`[Context] BLOCKED: event_subtype "${subtype}" in blocklist of ${blockedSubtypes.length} known subtypes`);
           return false;
         }
         break;
