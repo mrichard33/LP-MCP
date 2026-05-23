@@ -85,6 +85,22 @@
  *                - the route taken (A or B)
  *              Uses notification_class='intelligence' per the v1.0 Notification
  *              Standard. Cooldown 5min to dedupe rapid re-fires.
+ *
+ * 2026-05-23 — v1.7: defensive validation of recovery_workflow_id format.
+ *              The objection_state_policies table previously contained three
+ *              rows with literal placeholder strings (W9.0-WORKFLOW-ID,
+ *              L5-WORKFLOW-ID) inherited from the May 2026 workflow rename.
+ *              enqueueWorkflowEnrollment was inserting them blindly, the
+ *              executor was silently failing against GHL, and a misleading
+ *              "ROUTED TO W9.0-WOR Branch Fallback" notification was firing
+ *              for contacts that never actually entered any workflow. Rows
+ *              were corrected via direct SQL (W9.0 → fdf4ad82..., L5 →
+ *              1bee336e...) but the source-side guard is needed so a future
+ *              placeholder can't reintroduce the same silent failure.
+ *              Also adds O.0 and L.5 entries to WORKFLOW_NAMES and adds the
+ *              POST_PROPOSAL_RESISTANCE / DISENGAGEMENT.passive_cooling
+ *              states to STATE_TO_BRANCH so notifications use real branch
+ *              labels instead of "Fallback".
  */
 
 import supabase from '../../supabase.js';
@@ -112,7 +128,7 @@ const GENERIC_REBOOK_URL =
 
 // State clusters where rebook URL is relevant. Friction + Disruption states
 // both end up in S5.2; other clusters (POST_PROPOSAL_RESISTANCE, DISENGAGEMENT)
-// route to W9.0 / L.5 / P3 and don't use this field.
+// route to O.0 / L.5 and don't use this field.
 const S5_2_CLUSTERS = new Set([
   'APPOINTMENT_FRICTION',
   'APPOINTMENT_DISRUPTION',
@@ -127,16 +143,25 @@ const VALID_RESOLUTIONS = new Set([
   'superseded', 'recovered', 'cooled', 'escalated', 'manual', 'backfilled',
 ]);
 
-// ─── v1.6: state_code → S5.2 v2 branch mapping ─────────────────────────────
+// v1.7 — GHL workflow IDs are 36-char UUIDs. Anything else (legacy placeholder
+// strings like "W9.0-WORKFLOW-ID", typos, blanks) is rejected by
+// enqueueWorkflowEnrollment to prevent silent enrollment failures.
+const GHL_WORKFLOW_UUID_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// ─── v1.6: state_code → S5.2 v2 / O.0 / L.5 branch mapping ─────────────────
 //
-// S5.2 v2's inbound webhook splitter routes contacts to one of branches A-J
-// (plus a Fallback) based on the state_code value in the webhook payload.
-// This map is the human-facing label table — we don't use it for routing
-// (the workflow itself splits on the state_code string), only for notification
-// text. Keep in sync with the actual workflow splitter conditions.
+// Branch label lookup for routing notifications. We don't use this for routing
+// (the destination workflow's splitter does that based on the state_code merge
+// tag in the inbound webhook payload), only for the human-readable notification
+// text. Keep in sync with each destination workflow's splitter conditions.
 //
 // Source: project memory / S5.2 v2 build documentation 2026-05-20.
+// v1.7 (2026-05-23): added POST_PROPOSAL_RESISTANCE.* and
+//                    DISENGAGEMENT.passive_cooling entries so the matching
+//                    notifications don't fall through to "Fallback" label.
 const STATE_TO_BRANCH = {
+  // S5.2 v2 branches (workflow 0a6a1349-...)
   'APPOINTMENT_FRICTION.spouse_uncertainty':     { branch: 'A', label: 'Spouse Uncertainty' },
   'APPOINTMENT_FRICTION.timing_delay':           { branch: 'B', label: 'Timing Delay' },
   'APPOINTMENT_FRICTION.trust_hesitation':       { branch: 'C', label: 'Trust Hesitation' },
@@ -147,6 +172,11 @@ const STATE_TO_BRANCH = {
   'APPOINTMENT_DISRUPTION.cancelled':            { branch: 'H', label: 'Cancelled' },
   'APPOINTMENT_DISRUPTION.one_leg':              { branch: 'I', label: 'One Leg' },
   'APPOINTMENT_DISRUPTION.be_back':              { branch: 'J', label: 'Be Back' },
+  // O.0 Objection Handler branches (workflow fdf4ad82-...)
+  'POST_PROPOSAL_RESISTANCE.delay_request':      { branch: 'Timing',    label: 'Delay Request' },
+  'POST_PROPOSAL_RESISTANCE.financing_pressure': { branch: 'Financing', label: 'Financing Pressure' },
+  // L.5 Cooling Period Timer (workflow 1bee336e-...)
+  'DISENGAGEMENT.passive_cooling':               { branch: 'Cooling',   label: 'Passive Cooling' },
 };
 
 const PARENT_STATE_LABELS = {
@@ -165,9 +195,19 @@ function parentStateLabel(parent_state) {
 }
 
 // Workflow display names by recovery_workflow_id. Used in notification text.
-// Add new entries when policies start pointing at workflows beyond S5.2 v2.
+// Add new entries when policies start pointing at workflows beyond these.
+//
+// v1.7 (2026-05-23): added O.0 Objection Handler (fdf4ad82-...) and
+//                    L.5 Cooling Period Timer (1bee336e-...). Previously
+//                    only S5.2 v2 was listed, so any routing notification
+//                    for POST_PROPOSAL_RESISTANCE.* or
+//                    DISENGAGEMENT.passive_cooling displayed
+//                    "workflow fdf4ad82" / "workflow 1bee336e" instead of
+//                    the human-readable workflow name.
 const WORKFLOW_NAMES = {
   '0a6a1349-0b44-429b-91e1-4c5be264cd9f': 'S5.2 v2 Appointment Rescue',
+  'fdf4ad82-33ab-4e73-b581-18d21d51ac42': 'O.0 Objection Handler',
+  '1bee336e-7df7-4047-84b1-5ed27b3b5d0d': 'L.5 Cooling Period Timer',
 };
 
 function workflowDisplayName(workflow_id) {
@@ -324,6 +364,7 @@ export async function executeTransitionObjectionState(action) {
       workflow_id: proposedPolicy.recovery_workflow_id,
       webhook_url: proposedPolicy.recovery_webhook_url,
       source_action_id: action.id,
+      state_code: proposed_state,
       payload: {
         state_code: proposed_state,
         parent_state: proposedPolicy.parent_state,
@@ -368,6 +409,7 @@ export async function executeTransitionObjectionState(action) {
     workflow_enrolled: enrollment.enrolled,
     enrollment_route: enrollment.route,
     enrollment_action_id: enrollment.action_id,
+    enrollment_skip_reason: enrollment.skip_reason || null,
     mirror_state_set: mirrorResult.state_set,
     rebook_field_action: mirrorResult.rebook_field_action,
     rebook_url_source: mirrorResult.rebook_url_source,
@@ -651,25 +693,62 @@ function appendSeparator(url) {
   return url.includes('?') ? `${url}&` : `${url}?`;
 }
 
-async function enqueueWorkflowEnrollment({ contact_id, workflow_id, webhook_url, source_action_id, payload }) {
-  // Resolve which route the add_to_workflow handler should take:
-  //   Route B (preferred): webhook_url present → executor POSTs the JSON
-  //     payload directly to the workflow's inbound webhook trigger. The
-  //     destination workflow receives state_code, parent_state, attempt
-  //     counters etc. as {{inboundWebhookRequest.X}} merge tags AND its
-  //     trigger fires properly so any first-step actions run.
-  //   Route A (fallback): no webhook_url → executor uses the GHL API
-  //     /contacts/{id}/workflow/{wfId}. The contact enters the workflow
-  //     but no payload is delivered and the inbound-webhook trigger does
-  //     not fire. Only safe when the destination workflow does not depend
-  //     on the webhook payload for routing.
-  //
-  // webhook_url is sourced from objection_state_policies.recovery_webhook_url
-  // (added 2026-05-20). workflow_id is always included for audit/observability
-  // (logs, GroupMe notifications, validation gate) even when Route B is used.
-  //
-  // v1.6 — returns { enrolled, route, action_id } so the caller can emit
-  // an accurate routing notification.
+/**
+ * Enqueue an add_to_workflow agent_action for the destination workflow.
+ *
+ * v1.7 (2026-05-23) — defensive validation:
+ * Before insert, verify workflow_id matches the GHL UUID format. If it
+ * doesn't (e.g. a leftover placeholder string like "W9.0-WORKFLOW-ID"):
+ *   1. Skip the agent_action insert (don't enqueue garbage)
+ *   2. Emit a state_routing_misconfigured event for ops visibility
+ *   3. Return enrolled=false with a skip_reason, so the caller skips the
+ *      routing notification too. No more "ROUTED TO W9.0-WOR — Branch
+ *      Fallback" alerts for contacts that never actually entered any
+ *      workflow.
+ *
+ * Route selection (unchanged from v1.5):
+ *   Route B (preferred): webhook_url present → executor POSTs the JSON
+ *     payload directly to the workflow's inbound webhook trigger. The
+ *     destination workflow receives state_code, parent_state, attempt
+ *     counters etc. as {{inboundWebhookRequest.X}} merge tags AND its
+ *     trigger fires properly so any first-step actions run.
+ *   Route A (fallback): no webhook_url → executor uses the GHL API
+ *     /contacts/{id}/workflow/{wfId}. The contact enters the workflow
+ *     but no payload is delivered and the inbound-webhook trigger does
+ *     not fire. Only safe when the destination workflow does not depend
+ *     on the webhook payload for routing.
+ *
+ * webhook_url is sourced from objection_state_policies.recovery_webhook_url
+ * (added 2026-05-20). workflow_id is always included for audit/observability
+ * (logs, GroupMe notifications, validation gate) even when Route B is used.
+ *
+ * @returns {{ enrolled: boolean, route: 'A'|'B'|null, action_id: number|null,
+ *             skip_reason?: 'invalid_workflow_id'|'db_error' }}
+ */
+async function enqueueWorkflowEnrollment({ contact_id, workflow_id, webhook_url, source_action_id, state_code, payload }) {
+  // v1.7 — Defensive guard against legacy placeholder strings or other
+  // non-UUID workflow_id values reaching the executor.
+  if (!workflow_id || !GHL_WORKFLOW_UUID_REGEX.test(String(workflow_id).trim())) {
+    console.warn(
+      `[ObjectionState] enqueue workflow enrollment SKIPPED — invalid workflow_id ` +
+      `${JSON.stringify(workflow_id)} for state ${state_code} on contact ${contact_id}. ` +
+      `Source action ${source_action_id}.`
+    );
+    await emitTransitionEvent('state_routing_misconfigured', {
+      contact_id,
+      state_code,
+      offending_workflow_id: workflow_id,
+      source_action_id,
+      reason: 'workflow_id_not_uuid_format',
+    });
+    return {
+      enrolled: false,
+      route: null,
+      action_id: null,
+      skip_reason: 'invalid_workflow_id',
+    };
+  }
+
   const useRouteB = !!webhook_url;
   try {
     const { data, error } = await supabase
@@ -701,7 +780,7 @@ async function enqueueWorkflowEnrollment({ contact_id, workflow_id, webhook_url,
       .single();
     if (error) {
       console.warn(`[ObjectionState] enqueue workflow enrollment failed: ${error.message}`);
-      return { enrolled: false, route: null, action_id: null };
+      return { enrolled: false, route: null, action_id: null, skip_reason: 'db_error' };
     }
     return {
       enrolled: !!data,
@@ -710,7 +789,7 @@ async function enqueueWorkflowEnrollment({ contact_id, workflow_id, webhook_url,
     };
   } catch (err) {
     console.warn(`[ObjectionState] enqueue workflow enrollment threw: ${err.message}`);
-    return { enrolled: false, route: null, action_id: null };
+    return { enrolled: false, route: null, action_id: null, skip_reason: 'db_error' };
   }
 }
 
