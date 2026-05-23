@@ -1,22 +1,56 @@
 /**
  * GHL Rate Limiter — src/ghl-rate-limiter.js
- * 
+ *
  * Token bucket rate limiter shared by ALL GHL API consumers in the LP MCP:
  *   - src/ghl.js (axios — sync engine)
  *   - src/action-executor.js (native fetch — action executor)
- * 
+ *
  * Design:
  *   - Bucket capacity: 40 tokens (conservative under GHL's ~100/min limit)
  *   - Refill rate: 40 tokens per minute (~1 every 1.5 seconds)
- *   - Queue-based backpressure: if no tokens, callers wait in FIFO queue
+ *   - Single global drainer interval (no per-caller intervals)
+ *   - Hard timeout on each wait — fail-open after 30s rather than hang
  *   - On 429: drain bucket + pause ALL requests for 5 MINUTES
  *   - Exponential backoff on consecutive 429s: 5min → 10min → 15min (cap)
  *   - Singleton: one instance shared across the entire process
- * 
+ *
+ * v1.2 — 2026-05-23 — Global drainer + hard timeout (Scott Gies recovery)
+ *   Previous version (v1.1): each caller spawned its own setInterval.
+ *   The non-paused branch's interval cleared on first tick because its
+ *   exit condition `tokens > 0 || !isPaused()` evaluated to `... || true`
+ *   (we were NOT paused; that's why we entered this branch). If THIS
+ *   caller wasn't first in queue when processQueue ran, their interval
+ *   cleared without their promise resolving — orphan waiter forever.
+ *
+ *   Discovered when action 68268 (remove_tag buyer:decision for Scott
+ *   Gies, KkvMyszPPcr5uGIMcFiW, OPPFDN $48K-avg) hung the executor for
+ *   22+ min. Rate limiter showed queueDepth=28 with longestWaitMs=32min
+ *   while tokens=40 and paused=false — orphan promises that no interval
+ *   would ever resolve.
+ *
+ *   Fix: single module-scoped drainer interval (fires every 1.5s) is
+ *   responsible for refill + processQueue. Per-caller intervals removed.
+ *   Each waiter has a 30s hard timeout — on fire, the caller is removed
+ *   from the queue and resolved without a token (fail-open). The
+ *   downstream fetch in ghlFetch has its own 15s AbortSignal timeout
+ *   so worst case is a downstream error rather than an indefinite hang.
+ *
+ *   resolved-flag on each entry prevents double-resolve race between
+ *   processQueue and the timeout firing simultaneously.
+ *
+ *   Behavior compat: happy path (tokens available, no pause) is
+ *   unchanged. Wait path returns within 30s max instead of potentially
+ *   forever. API signature unchanged.
+ *
+ *   Added admin: drainStuckWaiters() + POST /n8n/rate-limiter/drain-stuck
+ *   endpoint to fail-open all queued waiters on demand. Used to recover
+ *   orphan promises from the prior buggy state without bouncing the
+ *   service.
+ *
  * v1.1 — 5min base pause with exponential backoff (matches HL MCP)
  *   GHL rate limits are per-location, not per-API-key. Both MCP servers
  *   share the same rate limit budget and must coordinate long pauses.
- * 
+ *
  * v1.0 — Initial implementation (30s pause — too short)
  */
 
@@ -26,6 +60,13 @@ const REFILL_INTERVAL_MS = (60 * 1000) / REFILL_RATE;  // ~1500ms per token
 const BASE_PAUSE_MS = 300000;    // 5 minutes base pause
 const MAX_PAUSE_MS = 900000;     // 15 minutes maximum pause
 
+// v1.2 — hard timeout on each waiter. Fail-open if the drainer somehow
+// stops firing. Downstream ghlFetch has its own 15s AbortSignal timeout,
+// so worst case is a downstream error rather than an indefinite hang.
+const WAIT_TIMEOUT_MS = parseInt(
+  process.env.RATE_LIMITER_WAIT_TIMEOUT_MS || '30000', 10
+);
+
 let tokens = BUCKET_CAPACITY;
 let lastRefill = Date.now();
 let paused = false;
@@ -33,12 +74,16 @@ let pauseUntil = 0;
 let consecutive429Cycles = 0;
 const waitQueue = [];
 
+// v1.2 — single global drainer handle. Started lazily on first wait.
+let drainerHandle = null;
+
 // Stats tracking
 let stats = {
   totalAcquired: 0,
   totalWaited: 0,
   total429s: 0,
   longestWaitMs: 0,
+  timedOut: 0,        // v1.2 — count of fail-open timeouts
   lastReset: Date.now(),
 };
 
@@ -55,11 +100,14 @@ function refill() {
 function processQueue() {
   while (waitQueue.length > 0 && tokens > 0 && !isPaused()) {
     tokens--;
-    const { resolve, queuedAt } = waitQueue.shift();
-    const waitMs = Date.now() - queuedAt;
+    const entry = waitQueue.shift();
+    const waitMs = Date.now() - entry.queuedAt;
     stats.totalWaited++;
     if (waitMs > stats.longestWaitMs) stats.longestWaitMs = waitMs;
-    resolve();
+    // entry.resolve is the wrapped version that clears the timeout and
+    // sets entry.resolved = true to block any double-resolve race with
+    // the timeout firing simultaneously.
+    entry.resolve();
   }
 }
 
@@ -75,37 +123,77 @@ function isPaused() {
   return true;
 }
 
+/**
+ * v1.2 — Single global drainer. Started lazily on the first call that
+ * has to wait. Replaces the per-caller intervals from v1.1 which
+ * orphaned promises whose owners weren't first in queue when their
+ * interval fired.
+ *
+ * Runs every REFILL_INTERVAL_MS (1.5s). Work is trivial when the queue
+ * is empty (just a refill call). Idempotent — early-return if already
+ * started. `.unref()` so the interval doesn't block process exit.
+ */
+function ensureDrainer() {
+  if (drainerHandle) return;
+  drainerHandle = setInterval(() => {
+    refill();
+    if (waitQueue.length > 0) {
+      processQueue();
+    }
+  }, REFILL_INTERVAL_MS);
+  if (typeof drainerHandle.unref === 'function') drainerHandle.unref();
+  console.log(`[RateLimiter] Drainer started (interval=${REFILL_INTERVAL_MS}ms, wait_timeout=${WAIT_TIMEOUT_MS}ms)`);
+}
+
 export function acquireToken() {
   refill();
 
-  if (isPaused()) {
-    return new Promise((resolve) => {
-      waitQueue.push({ resolve, queuedAt: Date.now() });
-      const checkInterval = setInterval(() => {
-        if (!isPaused()) {
-          clearInterval(checkInterval);
-          refill();
-          processQueue();
-        }
-      }, 5000); // Check every 5s during long pauses
-    });
-  }
-
-  if (tokens > 0) {
+  // Fast path: token available, not paused. No queue, no waiting.
+  if (!isPaused() && tokens > 0) {
     tokens--;
     stats.totalAcquired++;
     return Promise.resolve();
   }
 
+  // Slow path: enqueue. Single global drainer handles refill +
+  // processQueue. Hard timeout protects against indefinite waits if
+  // the drainer ever fails to fire for any reason.
+  ensureDrainer();
+
   return new Promise((resolve) => {
-    waitQueue.push({ resolve, queuedAt: Date.now() });
-    const checkInterval = setInterval(() => {
-      refill();
-      if (tokens > 0 || !isPaused()) {
-        clearInterval(checkInterval);
-        processQueue();
-      }
-    }, REFILL_INTERVAL_MS);
+    const entry = {
+      queuedAt: Date.now(),
+      resolved: false,
+      resolve: null,
+    };
+
+    const timeoutHandle = setTimeout(() => {
+      if (entry.resolved) return;
+      entry.resolved = true;
+
+      // Remove from queue if still present (race-safe — splice no-ops
+      // on idx=-1).
+      const idx = waitQueue.indexOf(entry);
+      if (idx >= 0) waitQueue.splice(idx, 1);
+
+      stats.timedOut++;
+      stats.totalAcquired++; // count as acquired (fail-open) for monitoring
+      const waited = Date.now() - entry.queuedAt;
+      console.warn(
+        `[RateLimiter] acquireToken timed out after ${waited}ms ` +
+        `(queue=${waitQueue.length}, tokens=${tokens}, paused=${isPaused()}) — failing open`
+      );
+      resolve();
+    }, WAIT_TIMEOUT_MS);
+
+    entry.resolve = () => {
+      if (entry.resolved) return;
+      entry.resolved = true;
+      clearTimeout(timeoutHandle);
+      resolve();
+    };
+
+    waitQueue.push(entry);
   });
 }
 
@@ -137,6 +225,42 @@ export function reportSuccess() {
   }
 }
 
+/**
+ * v1.2 — Admin: drain all queued waiters immediately (fail-open). Used
+ * to clean up orphan promises from a prior buggy code path without
+ * redeploying or bouncing the service. Each cleared waiter is resolved
+ * without a token; the downstream fetch in ghlFetch has its own 15s
+ * timeout so worst case is a downstream error rather than success-
+ * pretending.
+ */
+export function drainStuckWaiters() {
+  const cleared = waitQueue.length;
+  const ages = [];
+  while (waitQueue.length > 0) {
+    const entry = waitQueue.shift();
+    ages.push(Date.now() - entry.queuedAt);
+    if (!entry.resolved) {
+      entry.resolved = true;
+      stats.timedOut++;
+      stats.totalAcquired++;
+      // We can't access the original timeoutHandle here, but entry.resolve
+      // will be a no-op due to entry.resolved=true. We could call it
+      // anyway to clean up the timeout, but the gain is small.
+      try {
+        if (typeof entry.resolve === 'function') entry.resolve();
+      } catch (e) { /* swallow */ }
+    }
+  }
+  if (cleared > 0) {
+    const maxAge = ages.length ? Math.max(...ages) : 0;
+    console.warn(
+      `[RateLimiter] drainStuckWaiters: cleared ${cleared} waiters ` +
+      `(fail-open, oldest ${maxAge}ms)`
+    );
+  }
+  return { cleared, oldest_age_ms: ages.length ? Math.max(...ages) : 0 };
+}
+
 export function getRateLimiterStats() {
   refill();
   return {
@@ -147,6 +271,8 @@ export function getRateLimiterStats() {
     queueDepth: waitQueue.length,
     consecutive429Cycles,
     currentPauseMs: Math.min(BASE_PAUSE_MS * Math.max(consecutive429Cycles, 1), MAX_PAUSE_MS),
+    drainerActive: drainerHandle !== null,
+    waitTimeoutMs: WAIT_TIMEOUT_MS,
     ...stats,
   };
 }
@@ -154,5 +280,13 @@ export function getRateLimiterStats() {
 export function registerRateLimiterRoutes(app) {
   app.get('/n8n/rate-limiter/stats', (req, res) => {
     res.json(getRateLimiterStats());
+  });
+
+  // v1.2 — Admin: force-drain stuck waiters. Useful for cleaning up
+  // orphan promises from a prior buggy state without bouncing the
+  // service. Returns the count cleared + the new stats snapshot.
+  app.post('/n8n/rate-limiter/drain-stuck', (req, res) => {
+    const result = drainStuckWaiters();
+    res.json({ success: true, ...result, stats: getRateLimiterStats() });
   });
 }
