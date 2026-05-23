@@ -9,75 +9,50 @@
 //
 // AGENTIC: Disposition changes emit system events for the Decision Engine.
 //
+// v10.0 (2026-05-23) — Tag operations now route through the executor's
+//   tag handlers (src/actions/handlers/tags.js) instead of the raw GHL
+//   helpers in ./ghl.js. The handler functions enforce:
+//
+//     - entry:* IMMUTABILITY (first-touch attribution wins; later
+//       adds become no-ops if the namespace is populated)
+//     - active-entry:* EXCLUSIVITY (auto-removes conflicting tags in
+//       the same namespace before adding the new one)
+//     - source:* and other namespace policies
+//
+//   Why this matters: prior to v10.0, processProspect called applyGHLTag()
+//   and removeGHLTags() directly, bypassing the namespace guards. This
+//   meant LP sync could:
+//
+//     (a) Overwrite a contact's entry:* tag with whatever the current LP
+//         source resolved to — the agentic system's hygiene rules
+//         (e.g. ENTRY_HYGIENE_AT_CREATION_INTERNET) might correctly set
+//         active-entry:other at contact creation, but the next LP sync
+//         would happily clobber it with whatever resolveSourceBucket()
+//         returned for the lead. (Mitigated cosmetically by ac00820
+//         fixing the source mapping, but the bypass remained.)
+//     (b) Set the active-entry:* tag via a manual pre-remove-all-then-add
+//         pattern that duplicated the namespace-exclusivity logic in
+//         tags.js — fine in isolation but a source-of-truth split.
+//
+//   v10.0 routes both flows through executeAddTag/executeRemoveTag so
+//   the same namespace policies apply regardless of caller. The manual
+//   ALL_ACTIVE_ENTRY_TAGS pre-removal list is REMOVED — the executor's
+//   NAMESPACE_EXCLUSIVE_PREFIXES guard handles it automatically.
+//
+//   Errors are caught + logged; LP sync never fails on tag operation
+//   errors (preserves prior best-effort semantics).
+//
+//   Related: Rochelle Giron VQF4Qlb77XmNpjjCtZan; PR #306; commit ac00820.
+//
 // v9.3 — Disposition-changed event now emits with the lognumber-
 //   preferred GHL contact ID (`newLeadGhlId`) instead of the bare
-//   `ghlId` from prospect-level matchToGHL. Same fallback chain as
-//   the lp_leads row's ghl_contact_id: lognumber-derived → phone/
-//   email match → existing cache row → null.
+//   `ghlId` from prospect-level matchToGHL.
 //
-//   Why this matters: prior to v9.3, even when `lp_leads` carried
-//   a correct ghl_contact_id from lognumber, the emitted event
-//   payload contained NULL ghl_contact_id whenever matchToGHL
-//   returned null at sync time (which happens any time the
-//   prospect's phone/email isn't found, but the GHL contact
-//   exists and was the original submitter — captured via
-//   lognumber). Downstream consumers (ghost sweep, objection-
-//   state sweep, decision engine context conditions) all filter
-//   by ghl_contact_id on the event row, so a null there meant
-//   "this disposition change was invisible to all behavioral
-//   logic." Investigation showed ~54 events/30d in this exact
-//   shape (event ghl_id=null AND lp_leads.ghl_id IS populated),
-//   so this fix is a direct ~3-5% win on disposition event
-//   reachability.
+// v9.2 — `lp_leads.ghl_contact_id` is now ID-DERIVED when possible
+//   (from LP `lognumber` field when shape-valid 20-char alphanumeric).
 //
-//   Scope: only closes the emit-side gap where lp_leads already
-//   has the link. The bigger ~95% bulk gap ("lp_leads row itself
-//   is missing the link") still emits null because no ID exists
-//   anywhere — that class is addressed downstream by sweep
-//   hardening (querying lp_leads.disposition_code + demo_completed
-//   directly, sidestepping the event bus).
-//
-// v9.2 — `lp_leads.ghl_contact_id` is now ID-DERIVED when possible.
-//   The GHL→LP integration writes the GHL contact ID into LP's
-//   `lognumber` field (per LP API docs: "Identifier unique to the
-//   sender of the lead"). When `lead.lognumber` matches the GHL
-//   contact ID shape (20-char base62 alphanumeric), we use it as
-//   the lead row's ghl_contact_id directly. Fallback chain:
-//     1. lead.lognumber  (if shape-valid 20-char alphanumeric)
-//     2. prospect-level matchToGHL result (phone/email match)
-//     3. null
-//   Other LP integrations may put non-GHL values in lognumber
-//   (UUIDs with separators, internal IDs); those won't match the
-//   pattern and we fall through to phone/email match.
-//
-//   Why this matters: Step 0 of the appointment-sync resolution
-//   chain reads lp_leads.ghl_contact_id and re-validates against
-//   lognumber. With v9.2, the cache value is ID-derived → cache
-//   hits are more accurate, and the fast-path is more often
-//   taken on the first try.
-//
-//   BACKFILL NOTE: This change only populates new/updated rows.
-//   To backfill existing lp_leads rows where ghl_contact_id is
-//   null but a shape-valid lognumber exists in LP, run a full
-//   sync (FORCE_FULL_SYNC=true) or a one-shot SQL/script update.
-//
-//   The Pass 1 skip-check and the processProspect recordUnchanged
-//   check are both updated to compare against the lognumber-derived
-//   ghl_contact_id (not the prospect-level phone-match), so cached
-//   rows missing ghl_contact_id will be re-upserted on next sync
-//   when a shape-valid lognumber becomes available.
-//
-// v9.1 — Email enrichment: check email_enrichment_log before emitting
-//   to prevent duplicate enrichment events and duplicate GroupMe alerts.
-//   Idempotency key is now permanent (no date suffix).
-//
-// v8.0 — active-entry:* tag management. After processing all leads for
-//   a prospect, determines the NEWEST lead's source and applies the
-//   corresponding active-entry:* tag to the GHL contact. Removes all
-//   stale active-entry:* tags first. This ensures routing decisions
-//   (appointment type, calendar, messaging) always use the most recent
-//   entry source, not a stale one from an older LP lead.
-//
+// v9.1 — Email enrichment idempotency check via email_enrichment_log.
+// v8.0 — active-entry:* tag management (superseded by v10.0).
 // v7.1 — Real-time note push after disposition change.
 // v7.0 — DISK I/O OPTIMIZATION: Conditional upserts.
 
@@ -86,7 +61,8 @@ import { getField, normalizePhone, loggedFirstKeys } from './sync-utils.js';
 import { logSyncError } from './sync-log.js';
 import { resolveSourceBucket } from './sync-sources.js';
 import { lpDateToEastern, lpCreatedDate } from './lp-dates.js';
-import { matchToGHL, applyGHLTag, removeGHLTags } from './ghl.js';
+import { matchToGHL } from './ghl.js';
+import { executeAddTag, executeRemoveTag } from './actions/handlers/tags.js';
 import { upsertProspect } from './upsert-prospect.js';
 import { combineNotes } from './safe-notes.js';
 import { syncCallLogs, syncNotes, syncActivities, syncJobAndMilestones } from './sync-children.js';
@@ -97,18 +73,49 @@ import { pushLeadNotesImmediately } from './ghl-notes-sync.js';
 let _skipStats = { leads: 0, prospects: 0 };
 export function getSkipStats() { const s = { ..._skipStats }; _skipStats = { leads: 0, prospects: 0 }; return s; }
 
-// ─── active-entry:* constants ────────────────────────────────────
-// All possible active-entry:* tags. Used for removal before applying new one.
-const ALL_ACTIVE_ENTRY_TAGS = [
-  'active-entry:risk-report',
-  'active-entry:estimate-calculator',
-  'active-entry:chatbot',
-  'active-entry:canvassing',
-  'active-entry:referral',
-  'active-entry:other',
-  'active-entry:high-intent-digital',
-  'active-entry:unmapped',
-];
+// ─── v10.0: Tag operation helpers ────────────────────────────────
+//
+// Thin wrappers that adapt sync-leads' call sites to the executor's
+// action-shaped tag handlers. Both swallow errors with a warn log —
+// LP sync never fails on tag mutation errors (preserves prior
+// best-effort semantics of applyGHLTag/removeGHLTags).
+//
+// Return value mirrors the old applyGHLTag boolean contract: true
+// if the operation completed (including handler-side no-ops like
+// "immutable namespace already populated"), false on hard error.
+//
+// The contract change vs applyGHLTag is subtle but important: a
+// "true" return now means "the desired post-state is in effect"
+// rather than "we successfully POSTed to GHL." For entry:*, that
+// includes the immutability no-op case where the contact already
+// had a different entry:* tag — the sync caller still marks
+// ghl_tag_applied=true to suppress further attempts.
+async function applyTagViaExecutor(contactId, tag) {
+  try {
+    await executeAddTag({
+      target_id: contactId,
+      action_payload: { tag },
+    });
+    return true;
+  } catch (err) {
+    console.warn(`[Sync] applyTagViaExecutor(${contactId}, ${tag}) failed: ${err.message}`);
+    return false;
+  }
+}
+
+async function removeTagsViaExecutor(contactId, tags) {
+  if (!tags || tags.length === 0) return true;
+  try {
+    await executeRemoveTag({
+      target_id: contactId,
+      action_payload: { tags },
+    });
+    return true;
+  } catch (err) {
+    console.warn(`[Sync] removeTagsViaExecutor(${contactId}, ${tags.length} tags) failed: ${err.message}`);
+    return false;
+  }
+}
 
 // Convert entry:X tag to active-entry:X
 function toActiveEntryTag(entryTag) {
@@ -117,17 +124,6 @@ function toActiveEntryTag(entryTag) {
 }
 
 // ─── v9.2: GHL contact ID derivation from LP lognumber ───────────
-//
-// GHL contact IDs are 20-char base62 alphanumeric (e.g.,
-// "2WHqbq7n46JncW3oJ2IJ"). The GHL→LP integration writes them to
-// LP's `lognumber` field. When shape-valid, lognumber is the most
-// authoritative GHL contact ID for THIS lead specifically (it
-// identifies the actual sender, not a phone-match guess).
-//
-// Other LP integrations write non-GHL values to lognumber (UUIDs
-// with separators like "53af1c5b_e4f5_4494_b88b_395285391bae",
-// internal IDs, empty strings). The strict 20-char alphanumeric
-// regex filters those out → we fall back to phone/email match.
 const GHL_CONTACT_ID_PATTERN = /^[A-Za-z0-9]{20}$/;
 
 function deriveLeadGhlId(lead, fallbackGhlId) {
@@ -140,8 +136,6 @@ function deriveLeadGhlId(lead, fallbackGhlId) {
 }
 
 // ─── Build the lead row payload (DRY helper) ─────────────────────
-// v9.2: ghl_contact_id is now lognumber-derived when shape-valid,
-// falling back to the prospect-level ghlId (phone/email match).
 function buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId) {
   const leadGhlId = deriveLeadGhlId(lead, ghlId);
 
@@ -191,12 +185,7 @@ function buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId
 }
 
 // ─── Pass 1 Helper — upsertLeadOnly() ────────────────────────────
-// Used during fullSync Pass 1. Does NOT emit events or manage active-entry tags.
-//
-// v9.2: Pass 1 now populates ghl_contact_id from lognumber when
-// shape-valid, even though we don't run matchToGHL in Pass 1. The
-// skip-check is updated so that rows with stale null ghl_contact_id
-// will be re-upserted when a shape-valid lognumber becomes available.
+// Used during fullSync Pass 1. Does NOT emit events or manage tags.
 
 export async function upsertLeadOnly(prospect) {
   const leads = getField(prospect, 'leads', 'Leads') || [];
@@ -219,9 +208,6 @@ export async function upsertLeadOnly(prospect) {
         .eq('lp_lead_id', lpLeadId).single();
 
       if (existing?.updated_at_lp && existing.updated_at_lp === newUpdatedAt) {
-        // v9.2: don't skip if we now have a lognumber-derived ghl_contact_id
-        // and the cached row is still missing it. This lets the cache
-        // backfill from lognumber even when nothing else changed.
         const newLeadGhlId = deriveLeadGhlId(lead, null);
         const needsGhlIdBackfill = !existing.ghl_contact_id && newLeadGhlId;
         if (!needsGhlIdBackfill) {
@@ -250,6 +236,8 @@ export async function upsertLeadOnly(prospect) {
 //
 // AGENTIC: Detects disposition changes and emits system events.
 // v8.0: Manages active-entry:* tag based on newest LP lead source.
+// v10.0: Tag operations route through executor handlers (immutability +
+//        exclusivity enforced; manual stale-tag list removed).
 
 export async function processProspect(prospect, { skipGHL = false } = {}) {
   if (!loggedFirstKeys.has('prospect')) {
@@ -311,12 +299,6 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
     const newUpdatedAt = lpDateToEastern(getField(lead, 'lastchangedon', 'LastChangedOn'));
     const dispositionChanged = newDisposition && newDisposition !== previousDisposition;
 
-    // v9.2: compute lead-level GHL ID (lognumber-preferred) for the
-    // recordUnchanged check, so a stale cache row missing ghl_contact_id
-    // gets re-upserted when lognumber is now shape-valid.
-    // v9.3: also used as the FIRST tier of the contactId cascade
-    // when emitting disposition events, so events carry the most
-    // authoritative ghl_contact_id available at sync time.
     const newLeadGhlId = deriveLeadGhlId(lead, ghlId);
 
     const recordUnchanged = existing?.updated_at_lp
@@ -326,8 +308,9 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
 
     if (recordUnchanged && !dispositionChanged) {
       _skipStats.leads++;
+      // v10.0: route through executor (entry:* immutability respected)
       if (ghlId && !existing?.ghl_tag_applied) {
-        const success = await applyGHLTag(ghlId, tag);
+        const success = await applyTagViaExecutor(ghlId, tag);
         if (success) {
           await supabase.from('lp_leads').update({ ghl_tag_applied: true }).eq('lp_lead_id', lpLeadId);
         }
@@ -343,15 +326,6 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
     if (upsertErr) throw new Error(`Lead upsert failed for ${lpLeadId}: ${upsertErr.message}`);
 
     // ─── AGENTIC: Emit disposition change event ──────────────────
-    //
-    // v9.3: contactId cascade is newLeadGhlId → existing.ghl_contact_id
-    // → null. Previously was `ghlId || existing?.ghl_contact_id`, which
-    // ignored lognumber-derived IDs and emitted null whenever matchToGHL
-    // failed at the prospect level. Since newLeadGhlId already encodes
-    // lognumber-preferred-with-ghlId-fallback semantics (see
-    // deriveLeadGhlId above), substituting it in this cascade strictly
-    // expands coverage — same behavior when lognumber is absent, but
-    // captures the lognumber-derived ID when matchToGHL returned null.
     if (dispositionChanged) {
       const contactId = newLeadGhlId || existing?.ghl_contact_id || null;
       const leadName = `${getField(prospect, 'firstname', 'FirstName') || ''} ${getField(prospect, 'lastname', 'LastName') || ''}`.trim();
@@ -382,9 +356,15 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
       });
     }
 
-    // Apply permanent entry:* tag (attribution — never removed)
+    // v10.0: Apply permanent entry:* tag via executor.
+    //
+    // The handler's immutability guard ensures that if this contact already
+    // has a different entry:* tag (set by an earlier sync or by an agent
+    // hygiene rule), the add becomes a no-op rather than overwriting
+    // first-touch attribution. We still mark ghl_tag_applied=true so we
+    // don't re-attempt the no-op on every sync.
     if (ghlId && !existing?.ghl_tag_applied) {
-      const success = await applyGHLTag(ghlId, tag);
+      const success = await applyTagViaExecutor(ghlId, tag);
       if (success) {
         await supabase.from('lp_leads').update({ ghl_tag_applied: true }).eq('lp_lead_id', lpLeadId);
       }
@@ -407,9 +387,6 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
       ...jobs.map(job => syncJobAndMilestones(job, lpLeadId, ghlId)),
     ]);
 
-    // v9.3: same cascade as the emit above — prefer lognumber-derived
-    // ID so the real-time note push reaches the right GHL contact even
-    // when matchToGHL returned null.
     if (dispositionChanged) {
       const contactId = newLeadGhlId || existing?.ghl_contact_id || null;
       if (contactId) {
@@ -430,15 +407,21 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
   }
 
   // ═════════════════════════════════════════════════════════════════
-  // v8.0: ACTIVE-ENTRY TAG MANAGEMENT
+  // v10.0: ACTIVE-ENTRY TAG MANAGEMENT
   //
   // After processing all leads, find the NEWEST lead's source and
-  // apply its active-entry:* tag to the GHL contact. This ensures
-  // routing decisions always use the most recent entry source.
+  // apply its active-entry:* tag to the GHL contact via the executor.
+  //
+  // The executor's NAMESPACE_EXCLUSIVE_PREFIXES guard automatically
+  // removes any other active-entry:* tag from the contact in a single
+  // batch DELETE before adding the new one. This replaces the v8.0
+  // pattern of pre-removing all stale tags from a hard-coded list.
   //
   // Example: Annette enters as estimate-calculator (2025), then
   // re-enters as canvassing (2026). Newest lead = canvassing.
-  // GHL gets active-entry:canvassing. LP Inbound routes to WE.
+  // executeAddTag('active-entry:canvassing') reads contact, finds
+  // active-entry:estimate-calculator, DELETEs it, then POSTs the new
+  // tag. GHL ends up with active-entry:canvassing only.
   // ═════════════════════════════════════════════════════════════════
   if (ghlId && leadSourceTracker.length > 0) {
     try {
@@ -452,12 +435,10 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
       const newestTag = leadSourceTracker[0].tag;
       const activeTag = toActiveEntryTag(newestTag);
 
-      // Remove all stale active-entry:* tags, then apply the current one
-      const tagsToRemove = ALL_ACTIVE_ENTRY_TAGS.filter(t => t !== activeTag);
-      if (tagsToRemove.length > 0) {
-        await removeGHLTags(ghlId, tagsToRemove);
-      }
-      await applyGHLTag(ghlId, activeTag);
+      // v10.0: single add — namespace exclusivity guard in executeAddTag
+      // pre-removes any conflicting active-entry:* tag automatically.
+      // No manual ALL_ACTIVE_ENTRY_TAGS list needed.
+      await applyTagViaExecutor(ghlId, activeTag);
 
       if (leadSourceTracker.length > 1) {
         console.log(`[Sync] active-entry:* set to ${activeTag} for ${ghlId} (${leadSourceTracker.length} LP leads, newest=${leadSourceTracker[0].lpLeadId})`);
@@ -469,20 +450,10 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
   }
 
   // ═════════════════════════════════════════════════════════════════
-  // v9.1: EMAIL ENRICHMENT CHECK
-  //
-  // After processing all leads, check if LP has a high-confidence email
-  // for this prospect. If so, emit an enrichment event for the Decision
-  // Engine to process (which will update the GHL contact's email).
-  //
-  // v9.1 FIX: Check email_enrichment_log FIRST. If this contact was
-  // already enriched (action_taken = 'updated' or 'skipped_ghl_has_good_email'),
-  // skip entirely — no event, no action, no duplicate GroupMe message.
-  // Idempotency key is permanent (no date suffix) as a second safety net.
+  // v9.1: EMAIL ENRICHMENT CHECK (unchanged in v10.0)
   // ═════════════════════════════════════════════════════════════════
   if (ghlId) {
     try {
-      // v9.1: Check if this contact was already enriched — skip if so
       const { data: alreadyEnriched } = await supabase
         .from('email_enrichment_log')
         .select('id')
@@ -491,7 +462,7 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
         .maybeSingle();
 
       if (alreadyEnriched) {
-        // Already enriched — do nothing. No event, no action, no GroupMe spam.
+        // Already enriched — no event, no action, no GroupMe spam.
       } else {
         const { findBestEmailForProspect } = await import('./email-scorer.js');
         const prospectId = String(getField(prospect, 'cst_id', 'CstID', 'prospectid', 'ProspectID'));
@@ -501,7 +472,6 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
         const bestEmail = await findBestEmailForProspect(prospectId, { firstName, lastName });
 
         if (bestEmail && bestEmail.score >= 75) {
-          // v9.1: Permanent idempotency key — no date suffix, fires once ever
           const idempKey = `email_enrich_${ghlId}_${bestEmail.email}`;
 
           await emitEvent({
@@ -527,7 +497,6 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
       }
     } catch (err) {
       console.error(`[Sync] Email enrichment check failed for ${ghlId}:`, err.message);
-      // Non-critical — don't break sync
     }
   }
 
@@ -535,7 +504,6 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
 }
 
 // Fallback: upsert from flat data (when LP returns non-nested response)
-// v9.2: ghl_contact_id is now lognumber-derived when shape-valid.
 export async function upsertLeadFromFlat(lp, ghlId) {
   const lpLeadId = String(getField(lp, 'lds_id', 'id', 'LeadID', 'cst_id', 'ProspectID'));
   const lpProspectId = String(getField(lp, 'cst_id', 'CstID', 'ProspectID') || '');
