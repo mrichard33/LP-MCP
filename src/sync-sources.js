@@ -6,54 +6,85 @@
 
 import supabase from './supabase.js';
 
-// Known source → bucket mappings. Add new entries here as Ryan classifies them.
+// Known source → bucket mappings. Add new entries here as Mark classifies them.
+//
+// 2026-05-23 reclassification (aggregators + direct-digital):
+//   The 9 aggregator sources below (Modernize, Lead Gurus, HomeBuddy, Porch,
+//   Thinxmg, Fave Marketing, Socius Marketing, GeoTarget, Contractor
+//   Appointment) were previously mapped to bucket=estimate-calculator. They
+//   are NOT the Reece on-site Estimate Calculator — they are lead-reseller
+//   middleware that buys/aggregates homeowner data from various web sources
+//   and resells to Reece. These leads have never touched a Reece property,
+//   so they get the slow-lane E.5 treatment (entry:other) with credibility-
+//   first messaging instead of E.2 calculator-aware messaging.
+//
+//   Google PPC Windows and Reecewindows.com are direct-Reece digital traffic
+//   — these clicked a Reece-owned property before LP saw them. They route
+//   through E.7 (entry:high-intent-digital) for the abbreviated fast track.
 export const DEFAULT_SOURCE_MAPPINGS = {
   'Canvass':            { bucket: 'canvassing',          tag: 'entry:canvassing' },
   'Home Show':          { bucket: 'canvassing',          tag: 'entry:canvassing' },
   'RV Show':            { bucket: 'canvassing',          tag: 'entry:canvassing' },
   'Tampa Home Show':    { bucket: 'canvassing',          tag: 'entry:canvassing' },
-  'Modernize':          { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
-  'Lead Gurus':         { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
+  // ── AGGREGATORS / LEAD RESELLERS → entry:other (E.5) ─────────────
+  // These sell aggregated homeowner data to Reece. Lead never touched a
+  // Reece property. Credibility-first messaging via E.5 is required —
+  // calculator-aware messaging would be a trust-burning lie.
+  'Modernize':          { bucket: 'other',               tag: 'entry:other' },
+  'Lead Gurus':         { bucket: 'other',               tag: 'entry:other' },
+  'HomeBuddy':          { bucket: 'other',               tag: 'entry:other' },
+  'Socius Marketing':   { bucket: 'other',               tag: 'entry:other' },
+  'GeoTarget':          { bucket: 'other',               tag: 'entry:other' },
+  'Thinxmg':            { bucket: 'other',               tag: 'entry:other' },
+  'Fave Marketing':     { bucket: 'other',               tag: 'entry:other' },
+  'Porch':              { bucket: 'other',               tag: 'entry:other' },
+  'Contractor Appointment': { bucket: 'other',           tag: 'entry:other' },
+  // ── DIRECT-REECE DIGITAL → entry:high-intent-digital (E.7) ───────
+  // Lead clicked a Reece-owned property before LP captured the data.
+  // Eligible for E.7 abbreviated indoctrination + faster booking.
+  'Google PPC Windows': { bucket: 'high-intent-digital', tag: 'entry:high-intent-digital' },
+  'Reecewindows.com':   { bucket: 'high-intent-digital', tag: 'entry:high-intent-digital' },
+  // ── REFERRAL ─────────────────────────────────────────────────────
   'Priceless':          { bucket: 'referral',            tag: 'entry:referral' },
   'Employee Referral':  { bucket: 'referral',            tag: 'entry:referral' },
   'Previous Customer':  { bucket: 'referral',            tag: 'entry:referral' },
   'Self Generated':     { bucket: 'referral',            tag: 'entry:referral' },
+  'GetTheReferral.Com': { bucket: 'referral',            tag: 'entry:referral' },
+  'Job Sign':           { bucket: 'referral',            tag: 'entry:referral' },
+  'Customer Referral':  { bucket: 'referral',            tag: 'entry:referral' },
+  // ── OTHER (E.5) ──────────────────────────────────────────────────
   'Old Sub Source':     { bucket: 'other',               tag: 'entry:other' },
   'Old Source':         { bucket: 'other',               tag: 'entry:other' },
+  'Radio':              { bucket: 'other',               tag: 'entry:other' },
+  '92.5':               { bucket: 'other',               tag: 'entry:other' },
+  'Peacock':            { bucket: 'other',               tag: 'entry:other' },
+  'Direct':             { bucket: 'other',               tag: 'entry:other' },
+  'Resource Living':    { bucket: 'other',               tag: 'entry:other' },
+  // ── CHATBOT (E.3) ────────────────────────────────────────────────
   'Reece ChatBot':      { bucket: 'chatbot',             tag: 'entry:chatbot' },
-  'HomeBuddy':          { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
-  'Socius Marketing':   { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
-  'GeoTarget':          { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
-  'Thinxmg':            { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
-  'Fave Marketing':     { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
-  'Porch':              { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
-  'Contractor Appointment': { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
+  // ── CANVASSING (E.4) — locality variants ─────────────────────────
+  'Canvasser, Old Ft Myers': { bucket: 'canvassing',     tag: 'entry:canvassing' },
+  'Canvasser, Old St Pete':  { bucket: 'canvassing',     tag: 'entry:canvassing' },
+  // ── ESTIMATE CALCULATOR (E.2) — REECE-OWNED ONLY ─────────────────
   // 2026-04-27: The on-site Reece Estimate Calculator form. The "Window
   // Estimator" GHL source on contact_created events corresponds to this
   // subdetail on the LP side. 71 leads since launch (Feb 28 2026).
   // Routes through the estimate-calculator bucket and the W3.1 Estimate
   // Calculator Bridge workflow.
   //
-  // NOT in this list (intentionally):
-  //  - Reecewindows.com — generic "came through the domain" catch-all
-  //    (rep-entered web leads, Contact Us forms, callers citing the URL,
-  //    legacy data going back to 2007). 2,172 leads, 99.4% no GHL link.
-  //    Routes to entry:other via fallback.
+  // NOT in this bucket (intentionally, per 2026-05-23 reclassification):
+  //  - Aggregators (Modernize, Lead Gurus, HomeBuddy, Porch, Thinxmg,
+  //    Fave Marketing, Socius Marketing, GeoTarget, Contractor Appointment)
+  //    — middleware traffic, never touched the Reece calculator.
+  //    Routes to entry:other (E.5).
+  //  - Reecewindows.com — domain catch-all (rep-entered web leads, Contact
+  //    Us forms, callers citing the URL). 2,172 leads, 99.4% no GHL link.
+  //    Routes to entry:high-intent-digital (E.7) as direct-Reece traffic.
   //  - Estimate Calculator (Direct Mail) — only a single test lead
   //    ("Mark Test 4", Feb 17 2026, disposition=Data). No real campaign
   //    exists yet. Add here if/when Direct Mail launches a real vanity
   //    URL → calculator funnel.
   'Website Estimate Calculator': { bucket: 'estimate-calculator', tag: 'entry:estimate-calculator' },
-  'GetTheReferral.Com': { bucket: 'referral',            tag: 'entry:referral' },
-  'Job Sign':           { bucket: 'referral',            tag: 'entry:referral' },
-  'Customer Referral':  { bucket: 'referral',            tag: 'entry:referral' },
-  'Canvasser, Old Ft Myers': { bucket: 'canvassing',     tag: 'entry:canvassing' },
-  'Canvasser, Old St Pete':  { bucket: 'canvassing',     tag: 'entry:canvassing' },
-  'Radio':              { bucket: 'other',               tag: 'entry:other' },
-  '92.5':               { bucket: 'other',               tag: 'entry:other' },
-  'Peacock':            { bucket: 'other',               tag: 'entry:other' },
-  'Direct':             { bucket: 'other',               tag: 'entry:other' },
-  'Resource Living':    { bucket: 'other',               tag: 'entry:other' },
 };
 
 export async function populateSourceMapping() {
