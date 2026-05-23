@@ -31,6 +31,34 @@
  *   'json' → application/json. Use only when the destination explicitly
  *      requires JSON (non-GHL targets, future integrations).
  *
+ * v1.4 (2026-05-23) — Post-success action chaining. When action_payload
+ *        contains _post_success_action, enqueue that follow-up action
+ *        ONLY AFTER the GHL enrollment (Route A) or inbound webhook POST
+ *        (Route B) returns successfully. Replaces the prior pattern where
+ *        callers enqueued the follow-up notification at the same time as
+ *        the enrollment (Rochelle Giron incident — reps got "routed to"
+ *        notifications for contacts that never actually entered the
+ *        destination workflow because the executor silently failed on a
+ *        placeholder workflow_id string).
+ *
+ *        Best-effort: failure to enqueue the post-success action is
+ *        logged but does not fail the parent action — the enrollment
+ *        already succeeded, dropping the notification is preferable to
+ *        rolling back a real GHL state change.
+ *
+ *        _post_success_action shape:
+ *          {
+ *            action_type:       string,           // e.g. 'send_notification'
+ *            target_system:     string,           // 'lp'|'ghl'
+ *            target_entity:     string,           // 'contact' usually
+ *            action_payload:    object,           // forwarded as-is
+ *            reasoning:         string,
+ *            rule_applied:      string,
+ *            priority?:         number,           // default 30
+ *            requires_approval?:boolean,          // default false
+ *          }
+ *        target_id defaults to the parent action's target_id.
+ *
  * v1.3 — Phase 2 of Workflow Registry rollout. Logs and result objects now
  *        include canonical_code/canonical_name when present in
  *        action_payload (set by agent_rules post-Phase 2.1). Legacy
@@ -45,6 +73,7 @@
  * v1.0 — Extracted from action-executor.js v4.2 refactor.
  */
 
+import supabase from '../../supabase.js';
 import { ghlFetch } from '../helpers.js';
 import { REMOVE_ALL_MARKETING_WF } from '../constants.js';
 
@@ -86,6 +115,44 @@ function buildLogLabel(payload, fallback) {
   return fallback || 'unknown';
 }
 
+/**
+ * v1.4 — Post-success action chaining.
+ *
+ * Enqueues a follow-up agent_action AFTER the parent enrollment succeeded.
+ * Used by the objection-state handler to fire routing-success notifications
+ * only when the underlying workflow enrollment actually completed.
+ *
+ * Best-effort: any failure is logged but never raised — the parent
+ * enrollment is already committed, so we'd rather drop a notification
+ * than roll back a real workflow change.
+ */
+async function enqueuePostSuccessAction(parentAction, spec) {
+  if (!spec || typeof spec !== 'object') return;
+  if (!spec.action_type) {
+    console.warn(`[ActionExecutor] _post_success_action missing action_type for parent ${parentAction.id} — skipping`);
+    return;
+  }
+  try {
+    const { error } = await supabase.from('agent_actions').insert({
+      action_type: spec.action_type,
+      target_system: spec.target_system || 'lp',
+      target_entity: spec.target_entity || 'contact',
+      target_id: spec.target_id || parentAction.target_id,
+      action_payload: spec.action_payload || {},
+      reasoning: spec.reasoning || `Post-success chained action from parent ${parentAction.id}`,
+      rule_applied: spec.rule_applied || 'POST_SUCCESS_CHAIN',
+      status: 'pending',
+      requires_approval: spec.requires_approval === true,
+      priority: typeof spec.priority === 'number' ? spec.priority : 30,
+    });
+    if (error) {
+      console.warn(`[ActionExecutor] enqueue _post_success_action failed for parent ${parentAction.id}: ${error.message}`);
+    }
+  } catch (err) {
+    console.warn(`[ActionExecutor] enqueue _post_success_action threw for parent ${parentAction.id}: ${err.message}`);
+  }
+}
+
 export async function executeAddToWorkflow(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
@@ -95,6 +162,7 @@ export async function executeAddToWorkflow(action) {
   const canonicalName = payload.canonical_name || null;
   const wfLabel = buildLogLabel(payload, wfId || webhookUrl);
   const format = (payload.format || 'form').toLowerCase();
+  const postSuccessAction = payload._post_success_action || null;
 
   if (!contactId) throw new Error('Missing contactId');
 
@@ -131,6 +199,12 @@ export async function executeAddToWorkflow(action) {
       throw new Error(`Inbound webhook POST → ${res.status}: ${text.slice(0, 200)}`);
     }
     console.log(`[ActionExecutor] ✅ Route B (${format}): Contact ${contactId} POSTed to ${wfLabel}`);
+
+    // v1.4 — fire chained post-success action only after webhook POST succeeded
+    if (postSuccessAction) {
+      await enqueuePostSuccessAction(action, postSuccessAction);
+    }
+
     return {
       action: 'added_to_workflow_via_webhook',
       contact_id: contactId,
@@ -140,6 +214,7 @@ export async function executeAddToWorkflow(action) {
       canonical_name: canonicalName,
       route: 'B',
       format,
+      post_success_action_queued: !!postSuccessAction,
     };
   }
 
@@ -147,6 +222,12 @@ export async function executeAddToWorkflow(action) {
   if (!wfId) throw new Error('Missing workflow_id (or webhook_url) in action payload');
   await ghlFetch('POST', `/contacts/${contactId}/workflow/${wfId}`, {});
   console.log(`[ActionExecutor] ✅ Route A: Contact ${contactId} added to workflow: ${wfLabel} (${wfId})`);
+
+  // v1.4 — fire chained post-success action only after GHL API confirmed enrollment
+  if (postSuccessAction) {
+    await enqueuePostSuccessAction(action, postSuccessAction);
+  }
+
   return {
     action: 'added_to_workflow',
     contact_id: contactId,
@@ -155,6 +236,7 @@ export async function executeAddToWorkflow(action) {
     canonical_code: canonicalCode,
     canonical_name: canonicalName,
     route: 'A',
+    post_success_action_queued: !!postSuccessAction,
   };
 }
 
