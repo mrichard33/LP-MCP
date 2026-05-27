@@ -1,6 +1,46 @@
 /**
  * LP Appointment Sync — src/lp-appointment-sync.js
  *
+ * v5.1.10 (2026-05-27): FLATTEN GHL WEBHOOK BODY + DEEP CALENDAR LOOKUP.
+ *
+ *   Production feedback from Mark: APPT Handler workflows DO include
+ *   `calendarId` in their webhook payloads, but notifications were
+ *   still rendering without a calendar. Root cause: the v5.1.9 handler
+ *   only read `body.calendarId` and `body.calendar_id` at top level.
+ *   GHL workflow webhook steps put user-defined fields under
+ *   `customData` (premium custom webhook) and sometimes nest calendar
+ *   info inside an `appointment` or `calendar` object (standard
+ *   webhook patterns). Reading flat top-level missed all of those.
+ *
+ *   Three additions in v5.1.10:
+ *
+ *   1. flattenWebhookBody(body) — merges customData into top-level
+ *      regardless of whether GHL sent it as an object, a JSON-encoded
+ *      string, or an array of {key, value} pairs. Mirrors the parser
+ *      used by /api/agentic/notifications/appointment in
+ *      notifications/appointment-notifications.js (extractRequestFields).
+ *
+ *   2. extractCalendarId(body) and extractCalendarName(body) —
+ *      defensive multi-path lookups that check, in order:
+ *        body.calendarId / body.calendar_id           (top-level)
+ *        body.calendar.id / body.calendar.calendarId  (nested object)
+ *        body.appointment.calendarId / ...calendar_id (appointment wrapper)
+ *        body.appointment.calendar.id                 (deep nest)
+ *      Run after flattening so customData-wrapped values are already
+ *      visible at top-level too.
+ *
+ *   3. Inbound diagnostic logging — the webhook handler now logs the
+ *      content-type, raw body keys, customData shape (object/array/
+ *      string + key count), customData keys when discoverable, and
+ *      the parsed contactId / calendarId / calendarName / appointment
+ *      date+time. Bounded to keys only (no values) to keep the log
+ *      compact and PII-free. Means the next failure can be diagnosed
+ *      from the existing logs without a redeploy.
+ *
+ *   The webhook handler now reads from flattenWebhookBody(req.body)
+ *   instead of req.body directly; the probe endpoint does the same
+ *   for symmetry.
+ *
  * v5.1.9 (2026-05-27): SOURCE FROM LIVE LP DATA + CLEAN CALENDAR DISPLAY.
  *
  *   Two fixes following v5.1.8 production feedback:
@@ -29,10 +69,8 @@
  *      can't be resolved. The pipe-separator is now conditional in both
  *      the GroupMe card and the GHL note — when calendarName is empty,
  *      the calendar segment is omitted entirely instead of rendering
- *      "| N/A". Underlying calendar-resolution gap (the APPT Handler
- *      webhook payload not including calendar_id, plus a 404 on
- *      fetchLatestAppointment's GHL endpoint) is unchanged and remains
- *      a separate followup: this fix is display-side only.
+ *      "| N/A". Underlying calendar-resolution gap addressed in v5.1.10
+ *      above.
  *
  * v5.1.8 (2026-05-27): LP SOURCE / SUB-SOURCE ON SUCCESS NOTIFICATIONS.
  *   GroupMe + GHL note carry "Src: <parent> > <sub>" when present. Read
@@ -69,73 +107,15 @@
  *   fetch via an in-function cache to avoid duplicating API calls.
  *
  * v5.1.6: CALENDAR NAME RESOLUTION (fixes GroupMe N/A calendar field).
- *
- *   Three layers of calendar name resolution, in priority order:
- *
- *   1. Webhook body — `calendar_name` (existing) OR `calendar_id` (NEW).
- *      `calendar_id` is mapped to a display name via CALENDAR_NAME_MAP.
- *      APPT Handlers should send `calendar_id` in the webhook body
- *      (the workflow knows which calendar fired it).
- *
- *   2. GHL appointments API — `enrichFromGHLContact` now fetches the
- *      latest appointment in parallel with the contact GET. Pulls
- *      calendarId + calendar metadata from the appointment record.
- *
- *   3. Fallback — appointment.title field, or 'N/A' as last resort.
- *
- *   CALENDAR_NAME_MAP covers the five live calendars per architecture spec:
- *      Review Session, MV, Window Estimate, HPA, Confirmation Call.
- *
  * v5.1.5: EMAIL MATCHING (Step 4) + AUTO-CLEAR `lp-sync-failed` ON SUCCESS.
- *
- *   Email matching joins phone in the last-resort tier — both run only
- *   after ID-based paths (Supabase, GHL Lead ID field, prospect ID)
- *   have produced no match. Email path uses LP's getCustomers3({email})
- *   then validates each prospect's leads against lognumber.
- *
- *   Tag cleanup: when a successful resolution returns (whether actually
- *   running SetAppointment or short-circuiting via already-set duplicate
- *   check), we now strip `lp-sync-failed` from the GHL contact. That
- *   tag was applied by an earlier failed attempt and shouldn't persist
- *   after the issue is resolved. Best-effort, non-blocking.
- *
  * v5.1.4: Phone matching demoted to last resort.
  * v5.1.3: Read GHL contact ID from LP's `lognumber` field.
  * v5.1.2: Probe surfaces lognumber, userfields, and notes content.
  * v5.1.1: Adds /webhook/ghl/lp-probe diagnostic endpoint.
  * v5.1: HLCID-first chain + manual-action fallback tag.
  *
- * v5.1.7 resolution chain — Step 0 has two acceptance modes, all
- *   downstream steps still require lognumber === inbound GHL contact ID:
- *
- *   0a. SUPABASE FAST-PATH (lognumber-validated) — lp_leads.ghl_contact_id
- *       linked AND live LP lead.lognumber === ghlContactId. Strongest.
- *
- *   0b. SUPABASE-LINK-TRUSTED (no lognumber) — lp_leads.ghl_contact_id
- *       linked AND live LP lead.disposition_code is in BOOKABLE_DISPOSITIONS.
- *       Required for Modernize-sourced leads (lognumber holds a
- *       Modernize ID, not the GHL contact ID). Accepts because the
- *       Supabase ghl_contact_id link was built by our own sync code.
- *
- *   1. GHL LEAD ID FIELD — `GmAVmW6V9sekD7pVONKr` on the GHL contact.
- *      Most authoritative when populated: identifies the exact lead.
- *
- *   2. PROSPECT ID + LOGNUMBER — GHL custom field LP_PROSPECT_ID_FIELD.
- *      One LP getLeads(cst_id) call → scan returned leads, accept the
- *      one whose lognumber matches the GHL contact ID.
- *
- *   3. PHONE + LOGNUMBER (LAST RESORT) — getCustomers3({phone}) →
- *      for each prospect returned, getLeads(cst_id) + lognumber filter.
- *
- *   4. EMAIL + LOGNUMBER (LAST RESORT) — getCustomers3({email}) →
- *      same shape as Step 3 but using email. Runs after phone because
- *      phone usually narrows the prospect set more tightly. Only runs
- *      when steps 0–3 produced nothing.
- *
- *   5. FAILURE — apply `lp-sync-failed` tag, GroupMe + GHL note.
- *
  * Endpoints:
- *   POST /webhook/ghl/set-lp-appointment — main sync entry (v5.1.9)
+ *   POST /webhook/ghl/set-lp-appointment — main sync entry (v5.1.10)
  *   POST /webhook/ghl/lp-probe          — diagnostic (v5.1.2)
  */
 
@@ -197,6 +177,134 @@ function getCustomField(customFields, fieldId) {
   return field?.value != null ? String(field.value).trim() : null;
 }
 
+/**
+ * v5.1.10 (2026-05-27): GHL webhook body flattener.
+ *
+ * GHL workflow webhook steps deliver user-defined fields in one of
+ * three shapes depending on the step type and configuration:
+ *
+ *   1. Flat top-level body  (standard Outbound Webhook with simple
+ *                            field mappings):
+ *        { contactId: '...', calendarId: '...', ... }
+ *
+ *   2. customData object   (Premium LC Custom Webhook step):
+ *        { contactId: '...', customData: { calendarId: '...' } }
+ *
+ *   3. customData JSON-encoded string (some Standard Webhook configs):
+ *        { contactId: '...', customData: '{"calendarId":"..."}' }
+ *
+ *   4. customData array of {key, value} pairs (older step versions):
+ *        { contactId: '...',
+ *          customData: [{key:'calendarId', value:'...'}] }
+ *
+ * This helper merges customData into the top-level so downstream code
+ * can do a single property lookup regardless of shape. Mirrors
+ * notifications/appointment-notifications.js extractRequestFields,
+ * inlined here so this module doesn't take a cross-feature import.
+ *
+ * Returns a new object (does not mutate the input). Top-level keys
+ * take precedence over customData keys with the same name.
+ */
+function flattenWebhookBody(body) {
+  if (!body || typeof body !== 'object') return {};
+  const merged = { ...body };
+  const cd = body.customData;
+  if (cd === undefined || cd === null) return merged;
+
+  let cdFlat = null;
+  if (typeof cd === 'object' && !Array.isArray(cd)) {
+    cdFlat = cd;
+  } else if (typeof cd === 'string') {
+    const trimmed = cd.trim();
+    if (trimmed.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          cdFlat = parsed;
+        }
+      } catch {
+        // not JSON — fall through, leave merged as-is
+      }
+    }
+  } else if (Array.isArray(cd)) {
+    cdFlat = {};
+    for (const pair of cd) {
+      if (pair && typeof pair === 'object' && typeof pair.key === 'string') {
+        cdFlat[pair.key] = pair.value;
+      }
+    }
+  }
+  // customData fills in only where the top-level doesn't already have
+  // a value, so explicit top-level keys win.
+  if (cdFlat) {
+    for (const [k, v] of Object.entries(cdFlat)) {
+      if (!(k in merged) || merged[k] === undefined || merged[k] === null || merged[k] === '') {
+        merged[k] = v;
+      }
+    }
+  }
+  return merged;
+}
+
+/**
+ * v5.1.10: defensive multi-path lookup for calendar ID.
+ *
+ * GHL workflow webhook payloads put calendar info in several shapes
+ * depending on the workflow step type. We look in priority order:
+ *   - Top-level:    body.calendarId, body.calendar_id
+ *   - Nested:       body.calendar.id, body.calendar.calendarId
+ *   - Appointment:  body.appointment.calendarId, .calendar_id, .id
+ *   - Deep:         body.appointment.calendar.id, .calendarId
+ *
+ * Should be called AFTER flattenWebhookBody so customData-wrapped
+ * values are already top-level.
+ *
+ * Returns the first non-empty trimmed string, or null.
+ */
+function extractCalendarId(body) {
+  if (!body || typeof body !== 'object') return null;
+  const candidates = [
+    body.calendarId,
+    body.calendar_id,
+    body.calendar?.id,
+    body.calendar?.calendarId,
+    body.calendar?.calendar_id,
+    body.appointment?.calendarId,
+    body.appointment?.calendar_id,
+    body.appointment?.calendar?.id,
+    body.appointment?.calendar?.calendarId,
+  ];
+  for (const v of candidates) {
+    if (v != null && String(v).trim() !== '') return String(v).trim();
+  }
+  return null;
+}
+
+/**
+ * v5.1.10: defensive multi-path lookup for calendar display name.
+ * Same shape as extractCalendarId. Includes body.title as a final
+ * fallback because some GHL workflow steps put the calendar/event
+ * name in `title` rather than a dedicated calendar_name field.
+ */
+function extractCalendarName(body) {
+  if (!body || typeof body !== 'object') return null;
+  const candidates = [
+    body.calendar_name,
+    body.calendarName,
+    body.calendar?.name,
+    body.calendar?.calendarName,
+    body.appointment?.calendar_name,
+    body.appointment?.calendarName,
+    body.appointment?.calendar?.name,
+    body.appointment?.calendar?.calendarName,
+    body.title,
+  ];
+  for (const v of candidates) {
+    if (v != null && String(v).trim() !== '') return String(v).trim();
+  }
+  return null;
+}
+
 async function ghlFetch(method, path, body = null) {
   if (!GHL_API_KEY) throw new Error('GHL_API_KEY not configured');
   await acquireToken();
@@ -225,10 +333,6 @@ async function ghlFetch(method, path, body = null) {
  * v5.1.6: Fetch the most recent appointment for a contact.
  * Used as fallback when calendar_id/calendar_name not in webhook body.
  *
- * Tries multiple endpoint shapes because GHL v2 has shifted the
- * response structure between versions. Returns the most recent
- * appointment by startTime descending, or null on failure.
- *
  * NOTE (2026-05-27): the current endpoint URL returns 404 in production
  * (see logs for "[LP-APPT] fetchLatestAppointment failed ... 404"). The
  * function still degrades gracefully — null on error, caller skips the
@@ -236,6 +340,9 @@ async function ghlFetch(method, path, body = null) {
  * actual endpoint fix is a separate followup; the right path is likely
  * /contacts/{contactId}/appointments but needs verification against
  * the GHL v2 docs before swapping in.
+ *
+ * v5.1.10: should be reached much less often now — calendarId reads
+ * from the flattened webhook body cover the most common cases.
  */
 async function fetchLatestAppointment(contactId) {
   if (!contactId) return null;
@@ -444,17 +551,6 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
   const email = cleanEmail(contactInfo.email || '');
 
   // ── Step 0: Supabase fast-path — two acceptance passes ───────
-  //   0a. lognumber-validated (strict): live LP lead.lognumber must
-  //       equal the inbound GHL contact ID. Strongest signal; preserved
-  //       from v5.1.5.
-  //   0b. supabase-link-trusted (fallback): accept the candidate even
-  //       without a lognumber match, provided the LP lead's
-  //       disposition is bookable. The Supabase ghl_contact_id link
-  //       was established by our own sync code against LP source data,
-  //       so it remains trustworthy in cases where lognumber holds a
-  //       non-GHL value (Modernize-sourced leads in particular).
-  // Both passes share a per-candidate cache of getLeadByLdsId results
-  // to avoid duplicate LP API calls between 0a and 0b.
   try {
     const { data: leads } = await supabase.from('lp_leads')
       .select('lp_lead_id, lp_prospect_id, disposition_code, synced_at')
@@ -637,10 +733,6 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
   }
 
   // ── Step 4: Email + lognumber (LAST RESORT) ───────────────────
-  // Final fallback. getCustomers3({email}) returns prospects sharing
-  // the email; for each, we fetch their leads and require lognumber
-  // match before accepting. Multiple LP prospects can share an email
-  // (especially shared household / family / staff inboxes).
   if (email) {
     let prospectList = [];
     try {
@@ -886,7 +978,6 @@ async function syncAppointmentToLP({
     console.warn(`[LP-APPT] GHL writeback failed (non-blocking): ${err.message}`);
   }
 
-  // Resolution succeeded — clear any stale failure tag from prior attempts
   await clearSyncFailedTag(contactId);
 
   const apptDate = parseApptDate(appointmentDate);
@@ -894,17 +985,6 @@ async function syncAppointmentToLP({
   if (!apptDate) throw new Error(`Cannot parse appointment date: ${appointmentDate}`);
   if (!apptTime) throw new Error(`Cannot parse appointment time: ${appointmentTime}`);
 
-  // v5.1.9: prefer source from the live LP record captured at resolution
-  // time. The Supabase lp_leads cache only has source data after the
-  // 15-min sync has touched the row — for fresh leads (most common
-  // case for first-time appointment-set) that row doesn't exist yet
-  // and v5.1.8's cache-only lookup came back empty. The lognumber-
-  // validation scan in resolveLPLeadId already read the LP lead record;
-  // we just kept the source fields this time.
-  //
-  // Fallback to the Supabase cache only if resolution didn't carry source
-  // (extremely defensive — happens only if extractLpSource returned
-  // null/null AND the row exists in lp_leads with populated source).
   let lpSourceLine = formatLpSource(lpSource, lpSourceDetail);
 
   try {
@@ -933,25 +1013,21 @@ async function syncAppointmentToLP({
     console.warn(`[LP-APPT] Duplicate check failed (non-blocking): ${err.message}`);
   }
 
-  console.log(`[LP-APPT] Setting: lds_id=${ldsId}, date=${apptDate}, time=${apptTime}, via=${source} (step ${step})${lpSourceLine ? `, lpSrc="${lpSourceLine}"` : ', lpSrc=(absent)'}`);
+  console.log(`[LP-APPT] Setting: lds_id=${ldsId}, date=${apptDate}, time=${apptTime}, via=${source} (step ${step})${lpSourceLine ? `, lpSrc="${lpSourceLine}"` : ', lpSrc=(absent)'}, calendar="${calendarName || '(absent)'}"`);
   const result = await lpSetAppointment({ ldsId, setBy: '5686', apptDate, apptTime });
 
-  // v5.1.9: Calendar segment is conditional. When calendarName is empty
-  // (APPT Handler webhook didn't send calendar_id and the fallback
-  // GHL appointments API call 404'd), omit the segment entirely
-  // rather than rendering "| N/A".
   const calendarSegmentGroupMe = calendarName ? ` | ${calendarName}` : '';
   const calendarLineGhlNote    = calendarName ? `\nCalendar: ${calendarName}` : '';
 
   await addGHLNote(contactId,
-    `[LP SYNC v5.1.9] Appointment set\nLP Lead: ${ldsId} (via ${source}, step ${step})\nProspect: ${prospectId || 'N/A'}\n` +
+    `[LP SYNC v5.1.10] Appointment set\nLP Lead: ${ldsId} (via ${source}, step ${step})\nProspect: ${prospectId || 'N/A'}\n` +
     (lpSourceLine ? `Source: ${lpSourceLine}\n` : '') +
     `Date: ${apptDate} ${apptTime}` +
     calendarLineGhlNote
   ).catch(() => {});
 
   await sendGroupMeMessage(
-    `📅 LP Appointment Set (v5.1.9 ID-first)\n` +
+    `📅 LP Appointment Set (v5.1.10 ID-first)\n` +
     `👤 ${contactName || contactId}\n` +
     `📋 LP Lead: ${ldsId} (${source}, step ${step}) | Prospect: ${prospectId || 'N/A'}\n` +
     (lpSourceLine ? `📋 Src: ${lpSourceLine}\n` : '') +
@@ -1154,7 +1230,55 @@ export function registerLPAppointmentSyncRoutes(app) {
   app.post('/webhook/ghl/set-lp-appointment', async (req, res) => {
     const startTime = Date.now();
     try {
-      const body = req.body || {};
+      const rawBody = req.body || {};
+
+      // v5.1.10: inbound shape diagnostic. Logs ONLY keys (not values)
+      // so the line is compact and PII-free. With this, we can see
+      // immediately whether GHL is sending fields flat, under
+      // customData (object/array/string), or in a nested shape — no
+      // redeploy needed to investigate field-shape issues.
+      try {
+        const ct = req.headers['content-type'] || 'none';
+        const rawKeys = Object.keys(rawBody);
+        const cd = rawBody.customData;
+        let cdShape = 'absent';
+        let cdKeys = null;
+        if (cd === undefined || cd === null) {
+          cdShape = 'absent';
+        } else if (Array.isArray(cd)) {
+          cdShape = `array[${cd.length}]`;
+          cdKeys = cd
+            .filter(p => p && typeof p === 'object' && typeof p.key === 'string')
+            .map(p => p.key);
+        } else if (typeof cd === 'object') {
+          cdShape = `object{${Object.keys(cd).length}}`;
+          cdKeys = Object.keys(cd);
+        } else if (typeof cd === 'string') {
+          cdShape = `string[${cd.length}]`;
+          try {
+            const parsed = JSON.parse(cd);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              cdKeys = Object.keys(parsed);
+            }
+          } catch {
+            // not JSON — leave cdKeys null
+          }
+        } else {
+          cdShape = typeof cd;
+        }
+        console.log(
+          `[LP-APPT] inbound ct="${ct}" rawKeys=[${rawKeys.join(',')}] customData=${cdShape}` +
+            (cdKeys ? ` cdKeys=[${cdKeys.join(',')}]` : '')
+        );
+      } catch {
+        // diagnostic must never throw
+      }
+
+      // v5.1.10: flatten customData into top-level before reading any
+      // user-defined fields. After this, body.calendarId resolves
+      // whether GHL sent it flat OR under customData.
+      const body = flattenWebhookBody(rawBody);
+
       const contactId = cleanGHLValue(body.contact_id || body.contactId);
 
       if (!contactId) {
@@ -1169,8 +1293,13 @@ export function registerLPAppointmentSyncRoutes(app) {
       let contactPhone = cleanGHLValue(body.contact_phone || body.contactPhone || body.phone) || '';
       let contactEmail = cleanGHLValue(body.contact_email || body.contactEmail || body.email) || '';
       let contactName  = cleanGHLValue(body.contact_name || body.contactName || body.name) || '';
-      let calendarName = cleanGHLValue(body.calendar_name || body.calendarName || body.title) || '';
-      let calendarId   = cleanGHLValue(body.calendar_id || body.calendarId) || '';
+
+      // v5.1.10: defensive multi-path lookup for calendar fields.
+      // Replaces the top-level-only `body.calendar_id || body.calendarId`
+      // read which missed nested shapes (calendar.id, appointment.calendarId).
+      let calendarId   = cleanGHLValue(extractCalendarId(body)) || '';
+      let calendarName = cleanGHLValue(extractCalendarName(body)) || '';
+
       let address1     = cleanGHLValue(body.address1 || body.address) || '';
       let postalCode   = cleanGHLValue(body.postal_code || body.postalCode || body.zip) || '';
       let city         = cleanGHLValue(body.city) || '';
@@ -1180,6 +1309,14 @@ export function registerLPAppointmentSyncRoutes(app) {
       if (!calendarName && calendarId) {
         calendarName = calendarNameFromId(calendarId) || '';
       }
+
+      // v5.1.10: post-parse summary so we can see what made it through
+      // alongside the inbound shape diagnostic above.
+      console.log(
+        `[LP-APPT] parsed contact=${contactId} calendarId=${calendarId || '(none)'} ` +
+          `calendarName=${calendarName || '(none)'} apptDate=${appointmentDate || '(none)'} ` +
+          `apptTime=${appointmentTime || '(none)'} prospectId=${prospectId || '(none)'}`
+      );
 
       const needsEnrich = !appointmentDate || !appointmentTime || !prospectId || !contactPhone || !address1 || !contactEmail || !calendarName;
       if (needsEnrich) {
@@ -1197,10 +1334,8 @@ export function registerLPAppointmentSyncRoutes(app) {
         if (!postalCode && enriched.postalCode) postalCode = enriched.postalCode;
         if (!city && enriched.city) city = enriched.city;
         if (!state && enriched.state) state = enriched.state;
-        // v5.1.6: calendar resolution from enrichment (if still missing)
         if (!calendarId && enriched.calendarId) calendarId = enriched.calendarId;
         if (!calendarName && enriched.calendarName) calendarName = enriched.calendarName;
-        // Final attempt at the map with the freshly-enriched ID
         if (!calendarName && calendarId) {
           calendarName = calendarNameFromId(calendarId) || '';
         }
@@ -1233,7 +1368,9 @@ export function registerLPAppointmentSyncRoutes(app) {
   app.post('/webhook/ghl/lp-probe', async (req, res) => {
     const startTime = Date.now();
     try {
-      const body = req.body || {};
+      // v5.1.10: probe endpoint also flattens customData for symmetry
+      // with the main set-lp-appointment endpoint.
+      const body = flattenWebhookBody(req.body || {});
       let contactId = cleanGHLValue(body.contactId || body.contact_id);
       let prospectId = cleanGHLValue(body.prospectId || body.prospect_id || body.lp_prospect_id);
       let phone = cleanGHLValue(body.phone || body.contact_phone);
@@ -1259,8 +1396,21 @@ export function registerLPAppointmentSyncRoutes(app) {
     }
   });
 
-  console.log('[LP-APPT] Registered: POST /webhook/ghl/set-lp-appointment (v5.1.9 live-LP source + clean calendar display)');
+  console.log('[LP-APPT] Registered: POST /webhook/ghl/set-lp-appointment (v5.1.10 customData flatten + deep calendar lookup + inbound diagnostics)');
   console.log('[LP-PROBE] Registered: POST /webhook/ghl/lp-probe (v5.1.2 diagnostic w/ userfields+lognumber)');
 }
 
-export { resolveLPLeadId, syncAppointmentToLP, extractHLCID, extractLpSource, findLeadByHLCID, probeLPForContact, fetchLatestAppointment, calendarNameFromId, CALENDAR_NAME_MAP };
+export {
+  resolveLPLeadId,
+  syncAppointmentToLP,
+  extractHLCID,
+  extractLpSource,
+  findLeadByHLCID,
+  probeLPForContact,
+  fetchLatestAppointment,
+  calendarNameFromId,
+  CALENDAR_NAME_MAP,
+  flattenWebhookBody,
+  extractCalendarId,
+  extractCalendarName,
+};
