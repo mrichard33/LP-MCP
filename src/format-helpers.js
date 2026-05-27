@@ -134,3 +134,42 @@ export function formatDateTimeUS(input) {
 
   return `${datePart} - ${timePart}`;
 }
+
+/**
+ * 2026-05-27 — Format an LP lead source for display in notifications.
+ *
+ * Maps lp_leads.lead_source (parent channel — e.g. "Reece ChatBot")
+ * and lp_leads.lead_source_detail (sub — e.g. "Window Estimate
+ * Calculator") to a single display string. Returns null when both
+ * are absent so callers can omit the source line entirely.
+ *
+ * Mirrors the rendering logic in actions/enrichment.js v4.0
+ * (buildRichNotification's 📋 Src: ... line) so all LP-related
+ * notifications surface source the same way — whether they route
+ * through buildRichNotification or hand-roll their own message format
+ * (executeSetLPAppointment and syncAppointmentToLP do the latter and
+ * were missing source until now).
+ *
+ * Examples:
+ *   formatLpSource("Reece ChatBot", "Window Estimate Calculator")
+ *     → "Reece ChatBot > Window Estimate Calculator"
+ *   formatLpSource("Canvass", null)
+ *     → "Canvass"
+ *   formatLpSource(null, "Modernize")
+ *     → "Modernize"   (rare — defends against lp_leads rows where
+ *                      parent is null but sub is set)
+ *   formatLpSource(null, null)        → null
+ *   formatLpSource("", "  ")          → null  (whitespace-only treated as absent)
+ *
+ * Callers should render like:
+ *   const src = formatLpSource(row.lead_source, row.lead_source_detail);
+ *   const line = src ? `📋 Src: ${src}\n` : '';
+ */
+export function formatLpSource(source, detail) {
+  const s = source != null && String(source).trim() !== '' ? String(source).trim() : null;
+  const d = detail != null && String(detail).trim() !== '' ? String(detail).trim() : null;
+  if (s && d) return `${s} > ${d}`;
+  if (s) return s;
+  if (d) return d;
+  return null;
+}
