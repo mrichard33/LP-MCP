@@ -1,6 +1,23 @@
 /**
  * LP Appointment Sync — src/lp-appointment-sync.js
  *
+ * v5.1.8 (2026-05-27): LP SOURCE / SUB-SOURCE ON SUCCESS NOTIFICATIONS.
+ *
+ *   Per Mark's directive, GroupMe notifications fired when an
+ *   appointment is set in LP now surface lead_source +
+ *   lead_source_detail when available. The existing duplicate-check
+ *   query on lp_leads is expanded to also select those two columns
+ *   (no extra round trip) and the formatted source line is rendered on:
+ *     - the success-path GroupMe card  (📋 Src: <parent> > <sub>)
+ *     - the success-path GHL note      (Source: <parent> > <sub>)
+ *     - the already-set-in-LP GHL note (Source: <parent> > <sub>)
+ *   Both fields null → line omitted entirely. SKIP / FAIL paths
+ *   unchanged (no lds_id to look source up against, by definition).
+ *
+ *   Companion change in src/actions/handlers/lp-appointment.js
+ *   (executeSetLPAppointment) — both LP-appointment GroupMe paths now
+ *   surface source consistently.
+ *
  * v5.1.7: SUPABASE-LINK-TRUSTED FALLBACK at Step 0 (sub-step 0b).
  *
  *   Step 0 now runs TWO acceptance passes through the same Supabase
@@ -118,6 +135,7 @@ import {
 } from './ghl.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken } from './ghl-rate-limiter.js';
+import { formatLpSource } from './format-helpers.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
@@ -782,18 +800,26 @@ async function syncAppointmentToLP({
   if (!apptDate) throw new Error(`Cannot parse appointment date: ${appointmentDate}`);
   if (!apptTime) throw new Error(`Cannot parse appointment time: ${appointmentTime}`);
 
+  // v5.1.8 (2026-05-27): pull source + sub-source alongside the existing
+  // idempotency-check columns so both success paths can surface them in
+  // GroupMe + the GHL note. lpSourceLine stays null when both fields are
+  // absent → caller omits the line entirely (graceful "if present").
+  let lpSourceLine = null;
   try {
     const { data: existing } = await supabase.from('lp_leads')
-      .select('appointment_set, appointment_date')
+      .select('appointment_set, appointment_date, lead_source, lead_source_detail')
       .eq('lp_lead_id', ldsId)
       .maybeSingle();
+    lpSourceLine = formatLpSource(existing?.lead_source, existing?.lead_source_detail);
+
     if (existing?.appointment_set && existing.appointment_date) {
       const lpNorm = normalizeDateForComparison(existing.appointment_date);
       const ghlNorm = normalizeDateForComparison(appointmentDate);
       if (lpNorm && ghlNorm && lpNorm === ghlNorm) {
         console.log(`[LP-APPT] ⏭️ Already set on ${lpNorm} for lds_id=${ldsId}`);
         await addGHLNote(contactId,
-          `[LP SYNC] Appointment already exists in LP — skipped\nLP Lead: ${ldsId} | Date: ${lpNorm}`
+          `[LP SYNC] Appointment already exists in LP — skipped\nLP Lead: ${ldsId} | Date: ${lpNorm}` +
+          (lpSourceLine ? `\nSource: ${lpSourceLine}` : '')
         ).catch(() => {});
         return { success: true, action: 'already_set_in_lp', lp_lead_id: ldsId, lp_prospect_id: prospectId, date: lpNorm, resolution_source: source, resolution_step: step };
       }
@@ -802,17 +828,21 @@ async function syncAppointmentToLP({
     console.warn(`[LP-APPT] Duplicate check failed (non-blocking): ${err.message}`);
   }
 
-  console.log(`[LP-APPT] Setting: lds_id=${ldsId}, date=${apptDate}, time=${apptTime}, via=${source} (step ${step})`);
+  console.log(`[LP-APPT] Setting: lds_id=${ldsId}, date=${apptDate}, time=${apptTime}, via=${source} (step ${step})${lpSourceLine ? `, source="${lpSourceLine}"` : ''}`);
   const result = await lpSetAppointment({ ldsId, setBy: '5686', apptDate, apptTime });
 
+  // v5.1.8: include Source line in GHL note + 📋 Src line in GroupMe.
   await addGHLNote(contactId,
-    `[LP SYNC v5.1.6] Appointment set\nLP Lead: ${ldsId} (via ${source}, step ${step})\nProspect: ${prospectId || 'N/A'}\nDate: ${apptDate} ${apptTime}\nCalendar: ${calendarName || 'N/A'}`
+    `[LP SYNC v5.1.8] Appointment set\nLP Lead: ${ldsId} (via ${source}, step ${step})\nProspect: ${prospectId || 'N/A'}\n` +
+    (lpSourceLine ? `Source: ${lpSourceLine}\n` : '') +
+    `Date: ${apptDate} ${apptTime}\nCalendar: ${calendarName || 'N/A'}`
   ).catch(() => {});
 
   await sendGroupMeMessage(
-    `📅 LP Appointment Set (v5.1.6 ID-first)\n` +
+    `📅 LP Appointment Set (v5.1.8 ID-first)\n` +
     `👤 ${contactName || contactId}\n` +
     `📋 LP Lead: ${ldsId} (${source}, step ${step}) | Prospect: ${prospectId || 'N/A'}\n` +
+    (lpSourceLine ? `📋 Src: ${lpSourceLine}\n` : '') +
     `📅 ${apptDate} ${apptTime} | ${calendarName || 'N/A'}`
   ).catch(() => {});
 
@@ -1115,7 +1145,7 @@ export function registerLPAppointmentSyncRoutes(app) {
     }
   });
 
-  console.log('[LP-APPT] Registered: POST /webhook/ghl/set-lp-appointment (v5.1.7 supabase-link-trusted 0b fallback + ID-first chain)');
+  console.log('[LP-APPT] Registered: POST /webhook/ghl/set-lp-appointment (v5.1.8 source/sub-source on notifications + ID-first chain)');
   console.log('[LP-PROBE] Registered: POST /webhook/ghl/lp-probe (v5.1.2 diagnostic w/ userfields+lognumber)');
 }
 

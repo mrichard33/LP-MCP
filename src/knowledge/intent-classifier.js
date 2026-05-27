@@ -24,6 +24,49 @@
  *   - bucket_type='intent_router' + action_type='tag_and_handoff'
  *       → Tag and bail (e.g. APPT_STATUS hands off to APPT Handler workflow).
  *
+ * v1.1 (2026-05-23) — POST-QUALIFICATION AFFIRMATIVE BYPASS.
+ *   PROBLEM: The CUSTOMER_STATUS_AFFIRMATIVE compliance gate (handler
+ *   HDL-CUST-STATUS-YES-01, priority 8) keyword-matches any bare
+ *   affirmative ("yes", "yep", "yeah", "yup", "i am", "we are") at 95%
+ *   confidence and short-circuits to ghl_handoff_tag='hdl:callback-service'.
+ *   The gate exists to catch existing customers replying "yes I'm a current
+ *   customer" to the first-touch customer-detection probe (no Bot 1A
+ *   customer detection yet — issue #10).
+ *
+ *   But the gate fires on ANY short affirmative regardless of where the
+ *   contact is in the funnel. Post-demo contacts replying "yes" to an
+ *   objection-handler follow-up, contacts mid-objection-handling
+ *   confirming a question, or contacts on hold answering a confirmation
+ *   prompt — all get misrouted to callback-service and silently dropped
+ *   out of the agentic flow.
+ *
+ *   Concrete incident: Scott Gies KkvMyszPPcr5uGIMcFiW (OPPFDN, price
+ *   objection, in P3 cooling). After manual rescue in session 35, his
+ *   next short reply got the hdl:callback-service tag re-applied — the
+ *   gate fired again because his tags include lp-demo-completed but the
+ *   classifier has no awareness of that.
+ *
+ *   FIX: Add a context-aware bypass on the customer-status gate (and
+ *   only that gate — STOP, WRONG_NUMBER, etc. must still fire post-demo).
+ *   When the contact carries any of:
+ *     - lp-demo-completed                  (demo has run)
+ *     - objection-confirmed-*  (any value) (in objection-handler flow)
+ *     - stage:objection-handling           (mid-O.0 sequence)
+ *   the CUSTOMER_STATUS_AFFIRMATIVE gate is excluded from BOTH the
+ *   keyword and semantic classification paths. The short reply then
+ *   either falls through to a different intent (objection follow-up,
+ *   booking confirmation, etc.) or to UNCLEAR → generate_response,
+ *   where the AI handles it with full context.
+ *
+ *   Caller (response-generator.js) must pass contactTags in opts. Legacy
+ *   callers that omit it keep the prior behavior — no filtering applied,
+ *   gate fires for everyone (backward compatible). The bypass is OPT-IN
+ *   via contactTags presence.
+ *
+ *   Observability: when the bypass removes handlers from the active set,
+ *   a [BYPASS] log line is emitted with the contact id and which gates
+ *   were excluded.
+ *
  * v1.0 — Initial implementation.
  */
 
@@ -38,6 +81,77 @@ const CLASSIFIER_MAX_TOKENS = 200;
 let handlersCache = null;
 let handlersCacheTime = 0;
 const HANDLERS_CACHE_TTL_MS = 60_000;
+
+// ═══════════════════════════════════════════════════════════════════
+// v1.1 — POST-QUALIFICATION AFFIRMATIVE BYPASS CONFIG
+// ═══════════════════════════════════════════════════════════════════
+//
+// Compliance gates that should be bypassed when the contact has already
+// moved past the qualification stage. The CUSTOMER_STATUS_AFFIRMATIVE
+// gate is the only one currently on this list — it exists to catch
+// "yes I'm a current customer" replies on cold first-touch, and is
+// counter-productive once the contact has had a demo or is mid-objection-
+// handling (any "yes" then is overwhelmingly about something else).
+//
+// STOP, WRONG_NUMBER, and other compliance gates are deliberately NOT on
+// this list — they apply at every stage of the funnel.
+const POST_QUALIFICATION_AFFIRMATIVE_BYPASS_INTENTS = new Set([
+  'CUSTOMER_STATUS_AFFIRMATIVE',
+]);
+
+// Tag patterns that prove the contact is past the qualification stage.
+// ANY one of these is sufficient to trigger the bypass.
+const BYPASS_TAGS_EXACT = new Set([
+  'lp-demo-completed',
+  'stage:objection-handling',
+]);
+const BYPASS_TAGS_PREFIX = [
+  'objection-confirmed-',
+];
+
+/**
+ * Decide whether a given handler should be bypassed for this contact.
+ * Returns true only when (a) the handler's intent_class is on the
+ * bypass list AND (b) the contact carries at least one tag matching
+ * the bypass set.
+ */
+function shouldBypassAffirmativeGate(handler, contactTags) {
+  if (!handler || !POST_QUALIFICATION_AFFIRMATIVE_BYPASS_INTENTS.has(handler.intent_class)) {
+    return false;
+  }
+  if (!Array.isArray(contactTags) || contactTags.length === 0) return false;
+  for (const t of contactTags) {
+    if (typeof t !== 'string') continue;
+    if (BYPASS_TAGS_EXACT.has(t)) return true;
+    for (const prefix of BYPASS_TAGS_PREFIX) {
+      if (t.startsWith(prefix)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Apply the bypass filter and emit a single audit log line when handlers
+ * are removed. Returns the (possibly filtered) handler list. When
+ * contactTags is empty/null the input list is returned untouched — no
+ * filter, no log.
+ */
+function applyPostQualificationBypass(handlers, contactTags, ghlContactId) {
+  if (!Array.isArray(contactTags) || contactTags.length === 0) return handlers;
+  const bypassed = [];
+  const kept = [];
+  for (const h of handlers) {
+    if (shouldBypassAffirmativeGate(h, contactTags)) {
+      bypassed.push(h.intent_class);
+    } else {
+      kept.push(h);
+    }
+  }
+  if (bypassed.length > 0) {
+    console.log(`[IntentClassifier] [BYPASS] post-qualification gate(s) excluded for ${ghlContactId || 'unknown'}: ${bypassed.join(', ')} — contact has at least one of lp-demo-completed / objection-confirmed-* / stage:objection-handling`);
+  }
+  return kept;
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // HANDLER LOADING
@@ -211,6 +325,12 @@ async function classifyWithClaude(messageText, handlers, conversationContext) {
  * @param {string} [opts.ghlContactId] — For audit logging
  * @param {string} [opts.channel] — 'sms' | 'email'
  * @param {boolean} [opts.skipKeywordMatch=false] — Force semantic classification
+ * @param {Array<string>} [opts.contactTags] — v1.1: contact's current tags.
+ *   When provided, the post-qualification affirmative bypass is applied:
+ *   the CUSTOMER_STATUS_AFFIRMATIVE compliance gate is excluded from both
+ *   the keyword and semantic classifier paths if the contact has any of
+ *   lp-demo-completed / objection-confirmed-* / stage:objection-handling.
+ *   Omit (legacy callers) to disable the bypass entirely.
  * @returns {Promise<{
  *   intent_class: string,
  *   handler_code: string|null,
@@ -224,13 +344,19 @@ async function classifyWithClaude(messageText, handlers, conversationContext) {
  * }>}
  */
 export async function classifyInbound(messageText, opts = {}) {
-  const handlers = await loadActiveHandlers();
-  if (handlers.length === 0) {
+  const allHandlers = await loadActiveHandlers();
+  if (allHandlers.length === 0) {
     return makeUnclearResult({
       reasoning: 'no_handlers_loaded',
       method: 'fallback',
     });
   }
+
+  // v1.1: apply the post-qualification affirmative bypass BEFORE either
+  // classification layer runs. If contactTags weren't supplied, this
+  // returns allHandlers unmodified — full backward compatibility for
+  // legacy callers.
+  const handlers = applyPostQualificationBypass(allHandlers, opts.contactTags, opts.ghlContactId);
 
   // ─── LAYER 1: Keyword match ──────────────────────────────────────
   if (!opts.skipKeywordMatch) {

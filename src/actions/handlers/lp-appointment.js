@@ -19,6 +19,20 @@
  * Pre-check: if LP already has an appointment on the same normalized
  * date, skip the write (idempotency against retries).
  *
+ * 2026-05-27 — LP SOURCE / SUB-SOURCE ON SUCCESS NOTIFICATIONS.
+ *   Per Mark's directive, all GroupMe notifications fired when an
+ *   appointment is set in LP must surface lead_source +
+ *   lead_source_detail when available. Existing idempotency query on
+ *   lp_leads is expanded to also select those two columns (no extra
+ *   round trip) and the formatted source line is added to:
+ *     - the success-path GroupMe card
+ *     - the success-path GHL note
+ *     - the already-set-in-LP GHL note
+ *   When both lp_leads fields are null, the source line is omitted
+ *   entirely (graceful "if present" handling). The SKIP path is
+ *   unchanged: by definition no lds_id was resolved, so there's
+ *   nothing to look source up against.
+ *
  * 2026-05-01 — REMOVED duplicate executeCreateLPLead from this file.
  * The canonical handler is now src/actions/handlers/lp-lead.js. That
  * version uses srs_id=5574 (corrected from the incorrect '830' that
@@ -34,6 +48,7 @@ import { setAppointment as lpSetAppointment } from '../../lp-client.js';
 import { resolveLPLeadId } from '../../lp-appointment-sync.js';
 import { sendGroupMeMessage } from '../../groupme.js';
 import { addGHLNote, updateGHLContactFields } from '../../ghl.js';
+import { formatLpSource } from '../../format-helpers.js';
 import { isLPLeadId, ghlFetch } from '../helpers.js';
 import { parseLongDate, normalizeDateForComparison } from '../date-parsers.js';
 import { resolveContactInfo } from '../resolvers.js';
@@ -178,13 +193,20 @@ export async function executeSetLPAppointment(action) {
   const setBy = payload.set_by || '5686';
   const calendarName = payload.calendar_name || eventPayload.calendar_name || eventPayload.title || 'N/A';
 
-  // ─── Idempotency: skip if LP already has appointment on same date ──
+  // ─── Idempotency + source lookup (single Supabase round trip) ──────
+  // 2026-05-27: expanded to also pull lead_source / lead_source_detail
+  // so the success + already-set notifications can surface LP source.
+  // lpSourceLine stays null when both fields are absent → caller omits
+  // the line entirely (graceful "if present" handling).
   const ghlDateNormalized = normalizeDateForComparison(rawDate);
+  let lpSourceLine = null;
   try {
     const { data: existingLead } = await supabase.from('lp_leads')
-      .select('appointment_set, appointment_date')
+      .select('appointment_set, appointment_date, lead_source, lead_source_detail')
       .eq('lp_lead_id', lpLeadId)
       .maybeSingle();
+    lpSourceLine = formatLpSource(existingLead?.lead_source, existingLead?.lead_source_detail);
+
     if (existingLead?.appointment_set && existingLead.appointment_date) {
       const lpDateNormalized = normalizeDateForComparison(existingLead.appointment_date);
       if (ghlDateNormalized && lpDateNormalized && ghlDateNormalized === lpDateNormalized) {
@@ -193,6 +215,7 @@ export async function executeSetLPAppointment(action) {
           await addGHLNote(contactId,
             `[LP SYNC v4.3] Appointment already exists in LP — skipped\n` +
             `LP Lead ID: ${lpLeadId} | Prospect: ${resolvedProspectId || 'N/A'}\n` +
+            (lpSourceLine ? `Source: ${lpSourceLine}\n` : '') +
             `Date: ${lpDateNormalized}`
           ).catch(() => {});
         }
@@ -221,6 +244,7 @@ export async function executeSetLPAppointment(action) {
       `[LP SYNC v4.3] Appointment set in LP\n` +
       `LP Lead ID: ${lpLeadId} (confirmed via ${resolutionSource})\n` +
       `Prospect ID: ${resolvedProspectId || 'N/A'}\n` +
+      (lpSourceLine ? `Source: ${lpSourceLine}\n` : '') +
       `Date: ${apptDate}\nTime: ${apptTime}\nCalendar: ${calendarName}`
     ).catch(() => {});
   }
@@ -228,14 +252,16 @@ export async function executeSetLPAppointment(action) {
   // Success notification uses inline formatting (not buildRichNotification)
   // because the LP Lead/Prospect IDs are the authoritative known-good values
   // we want surfaced prominently — not the GHL-derived enrichment fallback.
+  // 2026-05-27: added 📋 Src: line when lp_leads has source data populated.
   await sendGroupMeMessage(
     `📅 LP Appointment Set\n` +
     `Contact: ${name || contactId}\n` +
     `📋 Contact: ${contactId} | Prospect: ${resolvedProspectId || 'NONE'} | LP Lead: ${lpLeadId} (${resolutionSource})\n` +
+    (lpSourceLine ? `📋 Src: ${lpSourceLine}\n` : '') +
     `Date: ${apptDate} ${apptTime}\nCalendar: ${calendarName}`
   ).catch(() => {});
 
-  console.log(`[LP-APPT] ✅ LP appointment set: lds_id=${lpLeadId}, ${apptDate} ${apptTime}, resolved_via=${resolutionSource}`);
+  console.log(`[LP-APPT] ✅ LP appointment set: lds_id=${lpLeadId}, ${apptDate} ${apptTime}, resolved_via=${resolutionSource}${lpSourceLine ? `, source="${lpSourceLine}"` : ''}`);
   return {
     action: 'lp_appointment_set',
     lp_lead_id: lpLeadId,
