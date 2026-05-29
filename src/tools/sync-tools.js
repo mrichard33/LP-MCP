@@ -1,7 +1,48 @@
 import supabase from '../supabase.js';
 import { getCircuitStatus } from '../lp-client.js';
+import { incrementalSync } from '../sync-engine.js';
 
 export function registerSyncTools(server) {
+
+  // Tool: sync_all_entities — on-demand sync trigger (parity with HL MCP).
+  // Kicks off an incremental sync in the background and returns immediately.
+  // The dashboard "Sync now" button calls this; an inline await would risk the
+  // client's 10s timeout, so we fire-and-forget. incrementalSync() self-guards
+  // against concurrent runs (returns early when one is already in progress) and
+  // falls back to a full sync when no prior sync exists.
+  server.tool(
+    'sync_all_entities',
+    'Trigger an on-demand sync of LP leads/jobs/milestones into Supabase. Runs in the background; poll get_sync_health for progress. Use after a change in LP that should reflect in the dashboard.',
+    {},
+    async () => {
+      let started = true;
+      try {
+        // Fire-and-forget: do not await. Surface async failures in server logs.
+        Promise.resolve()
+          .then(() => incrementalSync())
+          .catch((err) => console.error('[sync_all_entities] background sync failed:', err));
+      } catch (err) {
+        started = false;
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ ok: false, status: 'failed', error: err.message }),
+          }],
+        };
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            ok: true,
+            status: 'started',
+            message: 'Incremental sync started. Poll get_sync_health for progress.',
+          }),
+        }],
+      };
+    }
+  );
 
   // Tool 9: get_sync_health
   server.tool(
