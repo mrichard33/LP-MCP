@@ -828,6 +828,49 @@ function parseApptTime(raw) {
   return t;
 }
 
+// ─── Appointment-sync idempotency (durable marker) ──────────────
+// Incident 2026-05-28 (contact rrtfnVLWXB2GnYt7xu6b): I.LP-A re-entered
+// and ran the agentic appointment-set 5x in ~54 min. The only guard read
+// the lagging Supabase lp_leads cache, so every re-fire wrote another
+// note + GroupMe + SetAppointment. This marker is written synchronously
+// on success and read at the top, so a re-fire seconds later sees it.
+// FAIL-OPEN: any DB error => proceed (never block a legitimate sync).
+const APPT_SYNC_DEDUP_WINDOW_MIN = Number(process.env.LP_APPT_DEDUP_WINDOW_MIN || 1440);
+
+async function findRecentApptSyncMark(dedupKey) {
+  try {
+    const { data, error } = await supabase
+      .from('lp_appointment_sync_marks')
+      .select('created_at')
+      .eq('dedup_key', dedupKey)
+      .maybeSingle();
+    if (error) {
+      console.warn(`[LP-APPT] dedup mark read failed (proceeding): ${error.message}`);
+      return null;
+    }
+    if (!data?.created_at) return null;
+    const ageMin = (Date.now() - new Date(data.created_at).getTime()) / 60000;
+    return ageMin <= APPT_SYNC_DEDUP_WINDOW_MIN ? data : null;
+  } catch (err) {
+    console.warn(`[LP-APPT] dedup mark read threw (proceeding): ${err.message}`);
+    return null;
+  }
+}
+
+async function writeApptSyncMark({ dedupKey, contactId, ldsId, apptDate, apptTime }) {
+  try {
+    const { error } = await supabase
+      .from('lp_appointment_sync_marks')
+      .upsert(
+        { dedup_key: dedupKey, contact_id: contactId, lds_id: ldsId, appt_date: apptDate, appt_time: apptTime, created_at: new Date().toISOString() },
+        { onConflict: 'dedup_key' }
+      );
+    if (error) console.warn(`[LP-APPT] dedup mark write failed (non-blocking): ${error.message}`);
+  } catch (err) {
+    console.warn(`[LP-APPT] dedup mark write threw (non-blocking): ${err.message}`);
+  }
+}
+
 // ─── Failure notification ──────────────────────────────────────
 
 function formatPhoneDisplay(p) {
@@ -985,6 +1028,24 @@ async function syncAppointmentToLP({
   if (!apptDate) throw new Error(`Cannot parse appointment date: ${appointmentDate}`);
   if (!apptTime) throw new Error(`Cannot parse appointment time: ${appointmentTime}`);
 
+  // ── Durable idempotency short-circuit (see helper comment above) ──
+  const dedupKey = `${contactId}:${ldsId}:${normalizeDateForComparison(appointmentDate)}:${apptTime}`;
+  const existingMark = await findRecentApptSyncMark(dedupKey);
+  if (existingMark) {
+    console.log(`[LP-APPT] ⏭️ Duplicate appointment-sync suppressed for ${dedupKey} (marked ${existingMark.created_at}) — skipping SetAppointment, note, and GroupMe`);
+    return {
+      success: true,
+      action: 'duplicate_sync_suppressed',
+      lp_lead_id: ldsId,
+      lp_prospect_id: prospectId,
+      appt_date: apptDate,
+      appt_time: apptTime,
+      resolution_source: source,
+      resolution_step: step,
+      dedup_key: dedupKey,
+    };
+  }
+
   let lpSourceLine = formatLpSource(lpSource, lpSourceDetail);
 
   try {
@@ -1015,6 +1076,8 @@ async function syncAppointmentToLP({
 
   console.log(`[LP-APPT] Setting: lds_id=${ldsId}, date=${apptDate}, time=${apptTime}, via=${source} (step ${step})${lpSourceLine ? `, lpSrc="${lpSourceLine}"` : ', lpSrc=(absent)'}, calendar="${calendarName || '(absent)'}"`);
   const result = await lpSetAppointment({ ldsId, setBy: '5686', apptDate, apptTime });
+
+  await writeApptSyncMark({ dedupKey, contactId, ldsId, apptDate, apptTime });
 
   const calendarSegmentGroupMe = calendarName ? ` | ${calendarName}` : '';
   const calendarLineGhlNote    = calendarName ? `\nCalendar: ${calendarName}` : '';
