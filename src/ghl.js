@@ -249,9 +249,108 @@ export async function getGHLContact(ghlContactId) {
   }
 }
 
-export async function addGHLNote(ghlContactId, noteBody) {
+// ═══════════════════════════════════════════════════════════════════
+// NOTE DE-DUPLICATION (idempotency)
+// ───────────────────────────────────────────────────────────────────
+// Incident 2026-05-28 (contact rrtfnVLWXB2GnYt7xu6b): a single contact
+// received 5 byte-identical "[LP SYNC] Appointment set" notes over
+// ~54 minutes. Root cause was upstream — a GHL APPT-handler workflow
+// fired POST /webhook/ghl/set-lp-appointment five times, and the sync's
+// own duplicate guard (in lp-appointment-sync.js) only read the
+// appointment_set / appointment_date columns from the Supabase lp_leads
+// CACHE. That cache is only refreshed by the 15-minute sync sweep, so
+// inside that window every re-fire saw a stale (un-set) row, passed the
+// guard, and blindly wrote another note (and re-sent GroupMe + re-called
+// LP SetAppointment).
+//
+// Fixing only that one guard would still leave every OTHER note writer
+// exposed to the same double-fire pattern. So we make note creation
+// itself idempotent here, at the single chokepoint every note write
+// passes through: before POSTing, read the contact's recent notes and
+// skip the write if an identical body already exists inside a recency
+// window. This is caller-agnostic — any double-fired note write is now
+// suppressed at the source no matter which workflow/handler triggered it.
+//
+// Window is deliberately generous (default 6h). Byte-identical SYSTEM
+// notes are never something we intend to write twice, so a long window
+// cannot suppress anything we'd actually want kept. A caller that
+// genuinely needs to allow an identical repeat can opt out with
+// addGHLNote(id, body, { dedupe: false }).
+//
+// FAIL-OPEN: if the pre-read fails for any reason, we proceed with the
+// write. This guard exists to prevent spam, and must never cause a
+// legitimate note to be lost because a read hiccupped.
+// ═══════════════════════════════════════════════════════════════════
+const NOTE_DEDUP_WINDOW_MIN = Number(process.env.GHL_NOTE_DEDUP_WINDOW_MIN || 360);
+
+function normalizeNoteBody(body) {
+  // Trim + collapse internal whitespace so trivial formatting noise
+  // (e.g. a stray double space) can't defeat an otherwise-identical match.
+  return String(body || '').trim().replace(/\s+/g, ' ');
+}
+
+/**
+ * Look for an existing note on this contact whose body is identical to
+ * `noteBody` and was added within NOTE_DEDUP_WINDOW_MIN minutes.
+ * Returns the matching note id (or the string 'match' if the id is
+ * absent), or null when there is no recent duplicate.
+ *
+ * Fail-open: any read error returns null (caller will then write).
+ */
+async function findRecentDuplicateNote(ghlContactId, noteBody) {
+  try {
+    const { data } = await ghlClient.get(`/contacts/${ghlContactId}/notes`);
+    const notes = data?.notes || (Array.isArray(data) ? data : []);
+    if (!Array.isArray(notes) || notes.length === 0) return null;
+
+    const target = normalizeNoteBody(noteBody);
+    const cutoff = Date.now() - NOTE_DEDUP_WINDOW_MIN * 60 * 1000;
+
+    for (const n of notes) {
+      if (!n) continue;
+      if (normalizeNoteBody(n.body) !== target) continue;
+      // Enforce the recency window when a timestamp is readable; if the
+      // API omits one, a body match alone is enough to treat as a dup
+      // (suppressing is safer than spamming for identical system notes).
+      const ts = n.dateAdded || n.createdAt || n.dateUpdated;
+      if (ts) {
+        const t = new Date(ts).getTime();
+        if (!Number.isNaN(t) && t < cutoff) continue;
+      }
+      return n.id || 'match';
+    }
+    return null;
+  } catch (err) {
+    console.warn(`[GHL] Note dedup pre-check failed for ${ghlContactId} (writing anyway): ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Add a note to a GHL contact.
+ *
+ * Idempotent by default: if an identical note body already exists on the
+ * contact within the dedup window, the write is skipped and a marker
+ * object ({ skipped: true, ... }) is returned instead of creating a
+ * duplicate. Pass { dedupe: false } to force the write.
+ *
+ * @param {string} ghlContactId
+ * @param {string} noteBody
+ * @param {{ dedupe?: boolean }} [options]
+ */
+export async function addGHLNote(ghlContactId, noteBody, options = {}) {
   if (ghlDisabled || !ghlClient || !ghlContactId) return null;
   if (!noteBody || noteBody.trim().length === 0) return null;
+
+  const dedupe = options.dedupe !== false; // default ON
+
+  if (dedupe) {
+    const dupId = await findRecentDuplicateNote(ghlContactId, noteBody);
+    if (dupId) {
+      console.log(`[GHL] Skipped duplicate note for ${ghlContactId} — matches existing note ${dupId} within ${NOTE_DEDUP_WINDOW_MIN}m`);
+      return { skipped: true, reason: 'duplicate_note', matched_note_id: dupId };
+    }
+  }
 
   try {
     const { data } = await ghlClient.post(`/contacts/${ghlContactId}/notes`, {
