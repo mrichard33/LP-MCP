@@ -5,15 +5,24 @@
  * pipeline, persists the result to agentic_lead_states and (on state
  * change) appends a row to agentic_lead_state_transitions.
  *
- * Pipeline (Phase 1)
+ * Pipeline (Phase 2)
  * ──────────────────
  *   1. Build context via buildLeadContext (always skipCache: stale state
  *      data + fresh signals = wrong state). Acceptable cost: the
  *      classifier doesn't run more than once per minute per contact.
- *   2. Run suppression shape → if it returns a state, write & return.
- *   3. Otherwise fall through to UNCLASSIFIED. (Phase 2 inserts the four
- *      S45_* behavioral shapes between steps 2 and 3.)
- *   4. Persist via upsertCurrentState (handles transition row internally).
+ *   2. Suppression shape → first match wins, returns at confidence 1.00.
+ *   3. S45_* behavioral shapes (classifyS45) in priority order:
+ *      REAWAKENED → DEMO_STALL → TRUST_RECOVERY → LONG_HORIZON
+ *      → DORMANT_HIGH_INTENT. Each returns null below CONFIDENCE_FLOOR.
+ *   4. COLD_NO_SIGNAL shape (deterministic empty-engagement).
+ *   5. Fall through to UNCLASSIFIED (the honest "we don't know" default).
+ *   6. Persist via upsertCurrentState (handles transition row internally).
+ *
+ * The classifier is a PURE STATE-WRITER — it never enrolls. Enrollment is
+ * a separate, gated side effect handled by enrollment.js, invoked by the
+ * sweep (sweep.js) and the reactive handler (handlers/lead-state.js) after
+ * classification. This keeps "what state is this contact" cleanly separated
+ * from "what should we do about it."
  *
  * Versioning
  * ──────────
@@ -25,6 +34,10 @@
  *   - patch: bug fix that doesn't reshape classifications
  *
  * v0.1.0 — Phase 1: 13-state taxonomy + suppression-only classification.
+ * v0.2.0 — Phase 2: five S45_* behavioral shapes + COLD_NO_SIGNAL wired
+ *          in between suppression and UNCLASSIFIED. Behavioral confidence
+ *          scoring (signal-weighted) now in play; shapes self-floor at
+ *          CONFIDENCE_FLOOR.
  *
  * No-GPT contract
  * ───────────────
@@ -39,8 +52,10 @@ import { upsertCurrentState } from './persistence.js';
 import { STATES } from './states.js';
 import { scoreConfidence } from './confidence.js';
 import { classifySuppression } from './shapes/suppression.js';
+import { classifyS45 } from './shapes/s45.js';
+import { classifyCold } from './shapes/cold.js';
 
-export const CLASSIFIER_VERSION = 'v0.1.0';
+export const CLASSIFIER_VERSION = 'v0.2.0';
 
 /**
  * Classify a single contact.
@@ -102,31 +117,32 @@ export async function classifyLeadState(contactId, options = {}) {
     }
   }
 
-  // Phase 1: suppression first. Phase 2 inserts S45_* shapes here, in
-  // order: REAWAKENED → DEMO_STALL → TRUST_RECOVERY → LONG_HORIZON
-  //        → DORMANT_HIGH_INTENT → COLD_NO_SIGNAL → UNCLASSIFIED
-  const suppression = classifySuppression(ctx);
+  // Classification cascade (Phase 2). First non-null wins:
+  //   suppression → S45_* (classifyS45) → COLD_NO_SIGNAL → UNCLASSIFIED.
+  // Suppression and COLD set their own confidence; S45_* shapes self-floor
+  // at CONFIDENCE_FLOOR (a weak behavioral match returns null and falls
+  // through). UNCLASSIFIED is the honest default when nothing claims the
+  // contact.
+  const match = classifySuppression(ctx) || classifyS45(ctx) || classifyCold(ctx);
 
   let chosen;
-  if (suppression) {
+  if (match) {
     chosen = {
-      state: suppression.state,
-      confidence: suppression.confidence,
+      state: match.state,
+      confidence: match.confidence,
       stateReason: {
-        ...suppression.reason,
+        ...match.reason,
         classifier_version: CLASSIFIER_VERSION,
         classified_at: new Date().toISOString(),
       },
     };
   } else {
-    // No suppression. In Phase 1, default to UNCLASSIFIED — behavioral
-    // shapes (S45_* and COLD_NO_SIGNAL) ship in Phase 2.
     chosen = {
       state: STATES.UNCLASSIFIED,
       confidence: scoreConfidence(STATES.UNCLASSIFIED),
       stateReason: {
-        rule: 'no_suppression_match_phase1_default',
-        notes: 'No suppression rule matched. Phase 1 ships suppression-only classification — S45_* behavioral shapes arrive in Phase 2. Until then, non-suppressed contacts land in UNCLASSIFIED.',
+        rule: 'no_shape_matched',
+        notes: 'No suppression, S45_*, or COLD shape matched above the confidence floor. Contact lands in UNCLASSIFIED — not eligible for any routing until a future signal reshapes the classification.',
         signal_snapshot: ctx?.lead?.current_tags
           ? { tags_present: ctx.lead.current_tags.length }
           : null,
@@ -157,7 +173,7 @@ export async function classifyLeadState(contactId, options = {}) {
 }
 
 /**
- * Batch classify. Used by the backfill script and future periodic sweep.
+ * Batch classify. Used by the backfill script and periodic sweep.
  * Sequential by default (don't pound GHL API rate limits) — the caller
  * can chunk and parallelize where it knows the contact list is small.
  */

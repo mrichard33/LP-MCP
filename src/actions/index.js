@@ -95,6 +95,12 @@
  * v1 ships TL-1..TL-4 (trust-level invariants). v2 adds stage-integrity,
  * self-fulfilling, channel-integrity, entry-source. Master kill switch:
  * AVG_ENABLED=false. Per-invariant disable: AVG_DISABLE_INVARIANTS=TL-1,TL-2.
+ *
+ * 2026-06-02 — Phase 2 lead-state: added classify_lead_state. The reactive
+ * invoker for the lead-state intelligence layer — classifies a contact
+ * (writes agentic_lead_states) and routes the result through the S4.5
+ * enrollment gate (shadow-gated). Counterpart to the periodic sweep
+ * (src/agentic/lead-state/sweep.js). See src/actions/handlers/lead-state.js.
  */
 
 import supabase from '../supabase.js';
@@ -137,6 +143,8 @@ import { executeCheckThrottle } from './handlers/throttle.js';
 import { executeClassifyBucket } from './handlers/classify-bucket.js';
 // S5.2 v2 (Spec v1.2) — objection-state substrate writer
 import { executeTransitionObjectionState } from './handlers/objection-state.js';
+// Phase 2 lead-state — reactive classifier + S4.5 enrollment invoker
+import { executeClassifyLeadState } from './handlers/lead-state.js';
 
 // MVI v2.5 — fetch the source event for a given action. The shared
 // getEventContext returns ONLY the spread payload (no event_id /
@@ -330,6 +338,7 @@ const ACTION_HANDLERS = {
   check_throttle: executeCheckThrottle,          // 2026-05-13 — Phase 1 #55 enrollment dedup
   classify_bucket: executeClassifyBucket,        // 2026-05-13 — Phase 1 #56 bucket→workflow resolver
   transition_objection_state: executeTransitionObjectionState, // 2026-05-14 — S5.2 v2 objection-state substrate writer (Spec v1.2)
+  classify_lead_state: executeClassifyLeadState, // 2026-06-02 — Phase 2 lead-state classifier + S4.5 enrollment (reactive invoker)
 };
 
 // Handlers that need the triggering event's payload injected as context.
@@ -352,6 +361,9 @@ const CONTEXT_AWARE_HANDLERS = new Set([
 // action.target_id and the action_payload, plus shared batchContext written
 // by upstream handlers via result._context (classify_bucket sets
 // bucket_target_workflow_id for downstream add_to_workflow).
+// classify_lead_state (Phase 2 lead-state) also does not need event context —
+// it operates on action.target_id (the contact) and builds its own context
+// via the classifier's buildLeadContext call.
 
 // ═══════════════════════════════════════════════════════════════════
 // EXECUTOR ENGINE

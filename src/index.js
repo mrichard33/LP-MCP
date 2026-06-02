@@ -104,6 +104,16 @@ import {
 import { runGhlContactIdBackfill } from './admin/ghl-contact-id-backfill.js';
 import { registerGhlTriggerLinkRoutes } from './admin/ghl-trigger-links.js';
 import { registerAgenticLeadStateRoutes } from './admin/agentic-lead-states.js';
+// ─── Lead-State Sweep (Phase 2 — periodic classify + S4.5 enroll) ──
+// Periodic invoker for the lead-state intelligence layer: classifies a
+// bounded candidate batch into agentic_lead_states and runs eligible
+// results through the S4.5 enrollment gate. Both the timer
+// (LEAD_STATE_SWEEP_ENABLED) and real enrollment (S45_ENROLLMENT_ENABLED)
+// default OFF — manual route POST /admin/lead-state/sweep works regardless.
+import {
+  registerLeadStateSweepRoutes,
+  startLeadStateSweepScheduler,
+} from './agentic/lead-state/sweep.js';
 
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -427,6 +437,7 @@ registerAgenticMvRefreshRoutes(app);
 registerAppointmentNotificationRoutes(app);
 registerGhlTriggerLinkRoutes(app);
 registerAgenticLeadStateRoutes(app);
+registerLeadStateSweepRoutes(app);
 
 app.listen(PORT, async () => {
   console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
@@ -448,6 +459,7 @@ app.listen(PORT, async () => {
   startExecutorHeartbeatScheduler();
   startDecisionEngineHeartbeatScheduler();
   startDriftDetectorScheduler();
+  startLeadStateSweepScheduler();
   setTimeout(() => {
     setTimeout(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, 120000);
     setInterval(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, FIELD_SYNC_INTERVAL_MS);
