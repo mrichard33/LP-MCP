@@ -149,6 +149,11 @@ const LP_PROSPECT_ID_FIELD  = 'ZRQAVrzhtzApzLlHmT87';
 
 const LP_SYNC_FAILED_TAG = 'lp-sync-failed';
 
+// GHL custom fields synced FROM LeadPerfection (used by the early
+// idempotency check below).
+const LP_APPOINTMENT_DATE_FIELD = 'GL1rM4cnXBETsBkqxkZw';
+const APPT_STATUS_FIELD         = 'jHFRKGGsYJJFRbWwthkG';
+
 // ─── Calendar ID → display name map (v5.1.6) ───────────────────
 // Source: system architecture spec (5 live calendars).
 // Used to translate calendar_id from webhook body or appointments API
@@ -977,6 +982,41 @@ async function clearSyncFailedTag(contactId) {
 
 // ─── Main sync ──────────────────────────────────────────────────
 
+/**
+ * Early idempotency: does LP already hold this exact appointment?
+ *
+ * Field-set leads (SalesRabbit / canvassing) have the appointment set
+ * in the field and synced GHL→LP *before* this webhook fires. Their LP
+ * lognumber does not carry the GHL contact id, so resolveLPLeadId()
+ * fails all five lognumber-validated steps and (pre-fix) fired a false
+ * "SYNC FAILED — manual action required" card for an appointment LP
+ * already had. The GHL contact's LP-synced fields are the fresher
+ * truth in this window (the lp_leads cache lags the live LP record).
+ *
+ * Matched precisely against the incoming appointment date (not
+ * ">= today"), corroborated by a confirmed status OR a field-set
+ * origin tag, so a reschedule to a new date or a brand-new booking is
+ * never falsely skipped. FAIL-OPEN — any error returns false so a
+ * legitimate sync is never blocked.
+ */
+async function lpAlreadyHasAppointment(contactId, incomingDateNorm) {
+  if (!contactId || !incomingDateNorm) return false;
+  try {
+    const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
+    const contact = ghlRes?.contact || {};
+    const fields = contact.customFields || [];
+    const tags = (contact.tags || []).map(t => String(t).toLowerCase());
+    const lpApptDateNorm = normalizeDateForComparison(getCustomField(fields, LP_APPOINTMENT_DATE_FIELD));
+    if (!lpApptDateNorm || lpApptDateNorm !== incomingDateNorm) return false;
+    const status = (getCustomField(fields, APPT_STATUS_FIELD) || '').toLowerCase();
+    const fieldSetOrigin = tags.includes('appt-exists') || tags.includes('salesrabbit-appt');
+    return status.includes('confirm') || fieldSetOrigin;
+  } catch (err) {
+    console.warn(`[LP-APPT] lpAlreadyHasAppointment check failed (proceeding): ${err.message}`);
+    return false;
+  }
+}
+
 async function syncAppointmentToLP({
   contactId, contactPhone, contactEmail, contactName,
   address1, city, state, postalCode,
@@ -984,6 +1024,27 @@ async function syncAppointmentToLP({
   appointmentDate, appointmentTime, calendarName,
 }) {
   if (!contactId) throw new Error('contact_id is required');
+
+  // ── Early idempotency: LP already holds this exact appointment ──
+  // Catches field-set (SalesRabbit/canvassing) leads whose LP appt was
+  // set in the field and synced GHL→LP before this webhook ran. Their
+  // lognumber doesn't carry the GHL contact id, so the resolver below
+  // would fail every step and fire a false "manual action" card.
+  const incomingDateNorm = normalizeDateForComparison(appointmentDate);
+  if (await lpAlreadyHasAppointment(contactId, incomingDateNorm)) {
+    console.log(`[LP-APPT] ⏭️ LP already holds appt on ${incomingDateNorm} for ${contactId} (per GHL LP-synced fields) — skipping resolver + SetAppointment`);
+    await applyGHLTag(contactId, 'lp-appt-synced').catch(() => {});
+    await clearSyncFailedTag(contactId); // clear any prior false failure
+    await addGHLNote(contactId,
+      `[LP SYNC] Appointment already present in LP on ${incomingDateNorm} (field-set / SalesRabbit origin) — agentic sync skipped, no duplicate set.`
+    ).catch(() => {});
+    return {
+      success: true,
+      action: 'already_in_lp_skipped_pre_resolve',
+      contact_id: contactId,
+      appt_date_norm: incomingDateNorm,
+    };
+  }
 
   const resolution = await resolveLPLeadId(contactId, {
     phone: contactPhone,
@@ -994,12 +1055,29 @@ async function syncAppointmentToLP({
   });
 
   if (!resolution) {
+    // Failure-path dedup: stop repeat "SYNC FAILED" cards when I.LP-A
+    // re-enters or GHL retries the webhook. Pre-fix the failure path
+    // had no dedup at all (and the success-path dedup silently no-op'd
+    // because the lp_appointment_sync_marks table didn't exist).
+    // FAIL-OPEN via findRecentApptSyncMark.
+    const failKey = `fail:${contactId}:${incomingDateNorm}:${parseApptTime(appointmentTime) || '?'}`;
+    const priorFail = await findRecentApptSyncMark(failKey);
+    if (priorFail) {
+      console.log(`[LP-APPT] ⏭️ Duplicate SYNC-FAILED suppressed for ${failKey} (marked ${priorFail.created_at}) — no repeat GroupMe card`);
+      return {
+        success: false,
+        action: 'duplicate_failure_suppressed',
+        contact_id: contactId,
+        dedup_key: failKey,
+      };
+    }
     await sendSyncFailureNotification({
       contactId, contactName, contactPhone, contactEmail,
       address1, city, state, postalCode,
       prospectId: webhookProspectId, inboundId, ghlLeadIdField,
       appointmentDate, appointmentTime, calendarName,
     });
+    await writeApptSyncMark({ dedupKey: failKey, contactId, ldsId: null, apptDate: incomingDateNorm, apptTime: parseApptTime(appointmentTime) || null });
     return {
       success: false,
       action: 'skipped_no_valid_lead_id',
@@ -1067,6 +1145,7 @@ async function syncAppointmentToLP({
           `[LP SYNC] Appointment already exists in LP — skipped\nLP Lead: ${ldsId} | Date: ${lpNorm}` +
           (lpSourceLine ? `\nSource: ${lpSourceLine}` : '')
         ).catch(() => {});
+        await writeApptSyncMark({ dedupKey, contactId, ldsId, apptDate, apptTime });
         return { success: true, action: 'already_set_in_lp', lp_lead_id: ldsId, lp_prospect_id: prospectId, date: lpNorm, resolution_source: source, resolution_step: step };
       }
     }
