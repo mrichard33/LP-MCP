@@ -19,6 +19,17 @@
  * Pre-check: if LP already has an appointment on the same normalized
  * date, skip the write (idempotency against retries).
  *
+ * 2026-06-02 — CLEAN TEAM-FACING GROUPME CARD.
+ *   The success GroupMe card is cleaned up to match the webhook sync
+ *   path (lp-appointment-sync.js). Removed two pieces of backend noise
+ *   the team doesn't need: the internal resolution source
+ *   "(${resolutionSource})" and the raw GHL contact UUID line. The
+ *   appointment time now renders 12-hour Eastern ("6:00 PM EST") via
+ *   the shared formatApptTime12h helper instead of the raw 24-hour
+ *   string. The value written to LP is unchanged (LP still gets 24h).
+ *   Full diagnostics (resolution source, raw IDs) remain in the GHL
+ *   note, which is the audit-trail home for them.
+ *
  * 2026-06-02 — SUCCESS-SIGNAL TAG FOR GHL FALLBACK GATE.
  *   Applies the `lp-appt-synced` tag to the GHL contact on the two
  *   success paths (lp_appointment_set, already_set_in_lp) and ONLY
@@ -76,7 +87,7 @@ import { setAppointment as lpSetAppointment } from '../../lp-client.js';
 import { resolveLPLeadId } from '../../lp-appointment-sync.js';
 import { sendGroupMeMessage } from '../../groupme.js';
 import { addGHLNote, updateGHLContactFields, applyGHLTag } from '../../ghl.js';
-import { formatLpSource } from '../../format-helpers.js';
+import { formatLpSource, formatApptTime12h } from '../../format-helpers.js';
 import { isLPLeadId, ghlFetch } from '../helpers.js';
 import { parseLongDate, normalizeDateForComparison } from '../date-parsers.js';
 import { resolveContactInfo } from '../resolvers.js';
@@ -312,9 +323,12 @@ export async function executeSetLPAppointment(action) {
 
   // v2: render Calendar conditionally — only show the line/segment when
   // calendarName is meaningful (non-empty, not "N/A").
+  // 2026-06-02: GroupMe now renders the calendar inline (" | Name") to
+  // match the webhook sync card; the GHL note keeps the "\nCalendar:"
+  // line form.
   const showCalendar = hasMeaningfulCalendar(calendarName);
-  const calendarLineGhlNote = showCalendar ? `\nCalendar: ${calendarName}` : '';
-  const calendarLineGroupMe = showCalendar ? `\nCalendar: ${calendarName}` : '';
+  const calendarLineGhlNote    = showCalendar ? `\nCalendar: ${calendarName}` : '';
+  const calendarSegmentGroupMe = showCalendar ? ` | ${calendarName}` : '';
 
   if (!isLPLeadId(contactId)) {
     await addGHLNote(contactId,
@@ -338,13 +352,18 @@ export async function executeSetLPAppointment(action) {
   // we want surfaced prominently — not the GHL-derived enrichment fallback.
   // v2: source now from resolution.lpSource (Supabase fallback);
   // Calendar line omitted entirely when not resolved.
+  // 2026-06-02: card cleaned up to match the webhook sync path — dropped
+  // the internal resolution source "(${resolutionSource})" and the raw
+  // GHL contact UUID line (both backend noise), and the time now renders
+  // 12-hour Eastern ("6:00 PM EST") via formatApptTime12h. The value
+  // written to LP above is unchanged (LP still receives 24h). Full
+  // diagnostics stay in the GHL note.
   await sendGroupMeMessage(
     `📅 LP Appointment Set\n` +
-    `Contact: ${name || contactId}\n` +
-    `📋 Contact: ${contactId} | Prospect: ${resolvedProspectId || 'NONE'} | LP Lead: ${lpLeadId} (${resolutionSource})\n` +
+    `👤 ${name || contactId}\n` +
+    `📋 LP Lead: ${lpLeadId} | Prospect: ${resolvedProspectId || 'NONE'}\n` +
     (lpSourceLine ? `📋 Src: ${lpSourceLine}\n` : '') +
-    `Date: ${apptDate} ${apptTime}` +
-    calendarLineGroupMe
+    `📅 ${apptDate} ${formatApptTime12h(apptTime)}${calendarSegmentGroupMe}`
   ).catch(() => {});
 
   console.log(`[LP-APPT] ✅ LP appointment set: lds_id=${lpLeadId}, ${apptDate} ${apptTime}, resolved_via=${resolutionSource}${lpSourceLine ? `, source="${lpSourceLine}"` : ''}`);
