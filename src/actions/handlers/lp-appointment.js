@@ -89,7 +89,7 @@ import { sendGroupMeMessage } from '../../groupme.js';
 import { addGHLNote, updateGHLContactFields, applyGHLTag } from '../../ghl.js';
 import { formatLpSource, formatApptTime12h } from '../../format-helpers.js';
 import { isLPLeadId, ghlFetch } from '../helpers.js';
-import { parseLongDate, normalizeDateForComparison } from '../date-parsers.js';
+import { toLpApptDate, toLpApptTime, normalizeDateForComparison } from '../date-parsers.js';
 import { resolveContactInfo } from '../resolvers.js';
 import { buildRichNotification } from '../enrichment.js';
 
@@ -225,14 +225,11 @@ export async function executeSetLPAppointment(action) {
   }
   if (!rawDate) throw new Error('Cannot resolve appointment date');
 
-  let apptDate;
-  if (rawDate.includes('-')) {
-    const [y, m, d] = rawDate.split('T')[0].split('-');
-    apptDate = `${m}/${d}/${y}`;
-  } else {
-    const longParsed = parseLongDate(rawDate);
-    apptDate = longParsed || rawDate;
-  }
+  // Validate/normalize to LP's required MM/DD/YYYY. Throw (loud, labeled in
+  // agent_actions.error_message) rather than passing a raw/garbage value
+  // straight to LP, which would surface as an opaque SetAppointment 400.
+  const apptDate = toLpApptDate(rawDate);
+  if (!apptDate) throw new Error(`Appointment date did not resolve to MM/DD/YYYY (raw="${rawDate}")`);
 
   // ─── Resolve appointment time ──────────────────────────────────────
   let rawTime = payload.appt_time || payload.appointment_time || eventPayload.appt_time || eventPayload.appointment_time || null;
@@ -248,16 +245,10 @@ export async function executeSetLPAppointment(action) {
   }
   if (!rawTime) throw new Error('Cannot resolve appointment time');
 
-  let apptTime = rawTime;
-  const match12 = apptTime.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
-  if (match12) {
-    let h = parseInt(match12[1], 10);
-    const min = match12[2], p = match12[3].toUpperCase();
-    if (p === 'AM' && h === 12) h = 0;
-    if (p === 'PM' && h !== 12) h += 12;
-    apptTime = `${String(h).padStart(2, '0')}:${min}`;
-  }
-  if (apptTime.length > 5) apptTime = apptTime.slice(0, 5);
+  // Validate/normalize to LP's required 24-hour HH:MM (same fail-loud
+  // rationale as appt_date above).
+  const apptTime = toLpApptTime(rawTime);
+  if (!apptTime) throw new Error(`Appointment time did not resolve to HH:MM 24h (raw="${rawTime}")`);
 
   const setBy = payload.set_by || '5686';
   // v2: don't default to literal 'N/A' — keep null so the conditional
