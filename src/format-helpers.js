@@ -173,3 +173,61 @@ export function formatLpSource(source, detail) {
   if (d) return d;
   return null;
 }
+
+/**
+ * 2026-06-02 — Format an appointment time for team-facing display.
+ *
+ * The appointment time the system stores and sends to LP is 24-hour
+ * ("18:00") because LP's SetAppointment API requires that format. This
+ * helper is DISPLAY-ONLY — it produces a 12-hour AM/PM string with an
+ * Eastern-time label ("6:00 PM EST") for GroupMe cards and notes, and
+ * never touches the value written to LP.
+ *
+ * The input is treated as a literal Eastern wall-clock time. Reece is a
+ * single-timezone (Florida) operation, so the hour is NOT shifted —
+ * "18:00" simply renders as "6:00 PM EST". This is deliberately not a
+ * timezone conversion (contrast formatDateTimeUS above, which converts
+ * a real instant to ET and can move the hour).
+ *
+ * The label is a static "EST" by default to match how the team reads
+ * times. (Eastern is technically EDT during daylight saving; pass a
+ * different label or wire in date-aware EST/EDT selection later if that
+ * distinction is ever wanted.)
+ *
+ * Examples:
+ *   formatApptTime12h("18:00")    → "6:00 PM EST"
+ *   formatApptTime12h("09:30")    → "9:30 AM EST"
+ *   formatApptTime12h("00:15")    → "12:15 AM EST"
+ *   formatApptTime12h("12:00")    → "12:00 PM EST"
+ *   formatApptTime12h("6:00 PM")  → "6:00 PM EST"  (already-12h, normalized)
+ *   formatApptTime12h("")         → ""             (empty passthrough)
+ *
+ * Best-effort: returns the original string if it can't be parsed, so a
+ * notification never breaks on an unexpected time format.
+ */
+export function formatApptTime12h(time, { label = 'EST' } = {}) {
+  if (!time) return time == null ? '' : String(time);
+  const s = String(time).trim();
+  const suffix = label ? ` ${label}` : '';
+
+  // Already 12-hour (e.g. "6:00 PM") — normalize spacing/casing + label.
+  const m12 = s.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (m12) {
+    const h = parseInt(m12[1], 10);
+    return `${h}:${m12[2]} ${m12[3].toUpperCase()}${suffix}`;
+  }
+
+  // 24-hour "HH:MM" (tolerates optional trailing :SS).
+  const m24 = s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+  if (m24) {
+    const h = parseInt(m24[1], 10);
+    const min = m24[2];
+    if (Number.isNaN(h) || h > 23) return s;
+    const ampm = h >= 12 ? 'PM' : 'AM';
+    const h12 = h % 12 === 0 ? 12 : h % 12;
+    return `${h12}:${min} ${ampm}${suffix}`;
+  }
+
+  // Unrecognized — return as-is so the notification still sends.
+  return s;
+}
