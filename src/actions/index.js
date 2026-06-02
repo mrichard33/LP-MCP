@@ -419,7 +419,12 @@ async function executeSingleAction(action, batchContext = {}, priorBatchResults 
   // ═══════════════════════════════════════════════════════════════════
 
   try {
-    let context = {};
+    // Base context always carries the per-batch contact cache so every handler
+    // can dedupe its GET /contacts/{id} reads. Context-aware handlers also get
+    // the event payload + accumulated batchContext (which already includes
+    // _contactCache via the spread). Non-aware handlers get ONLY _contactCache —
+    // never the accumulated _context — to preserve existing behavior.
+    let context = { _contactCache: batchContext._contactCache };
     if (CONTEXT_AWARE_HANDLERS.has(action.action_type)) {
       context = { ...(await getEventContext(action)), ...batchContext };
     }
@@ -523,7 +528,11 @@ async function claimActions(n) {
  * NOT (a single invariant violation shouldn't kill unrelated routing).
  */
 async function runBatch(batch) {
-  const batchContext = {};
+  // Per-batch contact cache (src/actions/contact-cache.js). One Map per
+  // batch_id → serial within a batch → no concurrency hazard. Dedupes the
+  // redundant GET /contacts/{id} reads that the tag + lp-appointment handlers
+  // would otherwise each perform on the same contact.
+  const batchContext = { _contactCache: new Map() };
   const priorBatchResults = [];
   const out = [];
   for (const a of batch) {

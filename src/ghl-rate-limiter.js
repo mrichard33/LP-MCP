@@ -14,6 +14,16 @@
  *   - Exponential backoff on consecutive 429s: 5min → 10min → 15min (cap)
  *   - Singleton: one instance shared across the entire process
  *
+ * Headroom (env-driven, default 40):
+ *   GHL_RATE_CAPACITY        — bucket capacity (tokens)
+ *   GHL_RATE_REFILL_PER_MIN  — refill rate (tokens/min)
+ *   Ramp conservatively: 40 → 50 first, watch /n8n/rate-limiter/stats and keep
+ *   total429s and timedOut at 0; hold ~15–30 min, then optionally 50 → 60. Stop
+ *   the instant total429s rises — a 429 triggers a 5-min full pause (escalating
+ *   to 15), far costlier than the throughput gained. Do not exceed ~60–70
+ *   without confirming GHL's per-location sustained limit, which is SHARED with
+ *   the HL MCP (both servers draw on the same budget).
+ *
  * v1.2 — 2026-05-23 — Global drainer + hard timeout (Scott Gies recovery)
  *   Previous version (v1.1): each caller spawned its own setInterval.
  *   The non-paused branch's interval cleared on first tick because its
@@ -54,9 +64,11 @@
  * v1.0 — Initial implementation (30s pause — too short)
  */
 
-const BUCKET_CAPACITY = 40;
-const REFILL_RATE = 40;          // tokens per minute
-const REFILL_INTERVAL_MS = (60 * 1000) / REFILL_RATE;  // ~1500ms per token
+// Env-driven (default 40) so headroom can be ramped via Railway env vars
+// without a deploy — see the header note for ramp guidance.
+const BUCKET_CAPACITY = Math.max(1, parseInt(process.env.GHL_RATE_CAPACITY || '40', 10));
+const REFILL_RATE = Math.max(1, parseInt(process.env.GHL_RATE_REFILL_PER_MIN || '40', 10));  // tokens per minute
+const REFILL_INTERVAL_MS = (60 * 1000) / REFILL_RATE;  // ~1500ms per token at 40/min
 const BASE_PAUSE_MS = 300000;    // 5 minutes base pause
 const MAX_PAUSE_MS = 900000;     // 15 minutes maximum pause
 
