@@ -68,6 +68,14 @@
  */
 
 import { ghlFetch } from '../helpers.js';
+import { getContactCached, setCachedContactTags } from '../contact-cache.js';
+
+// TAG-WRITE CONTRACT (do not break): tag mutations are ADDITIVE.
+//   add    → POST /contacts/{id}/tags { tags: [...] }   (GHL appends)
+//   remove → DELETE /contacts/{id}/tags { tags: [...] } (explicit tags only)
+// NEVER use PUT (GHL treats PUT as a full-array replace and wipes existing
+// tags). Exclusivity removals must target same-namespace tags only, never a
+// blanket clear. scripts/test-tag-safety.js enforces both invariants.
 
 // MVI v2.6 — namespaces that are write-once. The first tag added in
 // the namespace wins permanently; any later add_tag in the same
@@ -92,67 +100,93 @@ const NAMESPACE_EXCLUSIVE_PREFIXES = [
   'canvass-subtype:',   // MVI v2.7 — canvass channel (door-to-door | event | sticky), one current per contact
 ];
 
-export async function executeAddTag(action) {
+export async function executeAddTag(action, context = {}) {
   const contactId = action.target_id;
   const tag = action.action_payload?.tag;
   if (!contactId || !tag) throw new Error('Missing contactId or tag');
 
-  // MVI v2.6 — IMMUTABILITY CHECK FIRST.
-  //
-  // If the requested tag is in an immutable namespace and the contact
-  // already has any tag in that namespace, skip the add entirely.
-  // First-touch attribution wins; later writes are silently dropped.
-  //
-  // Best-effort: a GET failure logs but does NOT block the add
-  // (consistent with exclusivity logic below). The 15-min audit sweep
-  // catches anything that slipped through.
+  const cache = context?._contactCache;
   const immutableNamespace = NAMESPACE_IMMUTABLE_PREFIXES.find((p) => tag.startsWith(p));
-  if (immutableNamespace) {
-    try {
-      const contact = await ghlFetch('GET', `/contacts/${contactId}`);
-      const currentTags = contact?.contact?.tags || contact?.tags || [];
-      const existingInNamespace = currentTags.filter((t) => t.startsWith(immutableNamespace));
-      if (existingInNamespace.length > 0) {
-        console.log(
-          `[ActionExecutor] immutable namespace: contact=${contactId} ns=${immutableNamespace} existing=[${existingInNamespace.join(',')}] — skipping add of ${tag}`
-        );
-        return {
-          action: 'no_op',
-          contact_id: contactId,
-          tag_skipped: tag,
-          namespace: immutableNamespace,
-          immutable: true,
-          existing_in_namespace: existingInNamespace,
-          reason: 'immutable namespace already populated',
-        };
-      }
-    } catch (err) {
-      console.error(`[executeAddTag] immutability check failed for ${contactId} ns=${immutableNamespace}: ${err.message} — proceeding with add`);
+  const namespace = NAMESPACE_EXCLUSIVE_PREFIXES.find((p) => tag.startsWith(p));
+
+  // One best-effort read serves the immutability, exclusivity AND
+  // already-present checks (previously up to two separate GETs). Routed
+  // through the per-batch cache so sibling actions reuse it. A read failure
+  // logs but does NOT block the add — currentTags stays null and we fall
+  // back to the historical blind-add behavior. The 15-min audit sweep
+  // catches any straggler that slips through.
+  let currentTags = null; // null = read unknown → blind add, skip namespace logic
+  try {
+    const contact = await getContactCached(contactId, cache);
+    currentTags = contact?.tags || [];
+  } catch (err) {
+    console.error(`[executeAddTag] contact read failed for ${contactId}: ${err.message} — proceeding with add`);
+  }
+
+  // MVI v2.6 — IMMUTABILITY: first-touch attribution wins. If the contact
+  // already has any tag in this immutable namespace, drop the add.
+  if (immutableNamespace && currentTags) {
+    const existingInNamespace = currentTags.filter((t) => t.startsWith(immutableNamespace));
+    if (existingInNamespace.length > 0) {
+      console.log(
+        `[ActionExecutor] immutable namespace: contact=${contactId} ns=${immutableNamespace} existing=[${existingInNamespace.join(',')}] — skipping add of ${tag}`
+      );
+      return {
+        action: 'no_op',
+        contact_id: contactId,
+        tag_skipped: tag,
+        namespace: immutableNamespace,
+        immutable: true,
+        existing_in_namespace: existingInNamespace,
+        reason: 'immutable namespace already populated',
+      };
     }
   }
 
-  // MVI v2.5 — exclusivity. Best-effort: a GET failure logs
-  // but does NOT block the add. Audit tool catches stragglers.
-  const namespace = NAMESPACE_EXCLUSIVE_PREFIXES.find((p) => tag.startsWith(p));
+  // MVI v2.5 — EXCLUSIVITY: find conflicting tags in the same namespace.
   let removedConflicting = [];
-  if (namespace) {
+  if (namespace && currentTags) {
+    removedConflicting = currentTags.filter((t) => t.startsWith(namespace) && t !== tag);
+  }
+
+  // No-op-on-present: tag already there and nothing to clean up → zero writes
+  // (GHL would coalesce a duplicate POST anyway; this saves the call).
+  const alreadyPresent = currentTags ? currentTags.includes(tag) : false;
+  if (alreadyPresent && removedConflicting.length === 0) {
+    return {
+      action: 'no_op',
+      contact_id: contactId,
+      tag_skipped: tag,
+      reason: 'tag already present',
+    };
+  }
+
+  // Enforce exclusivity (same-namespace DELETE only). Best-effort: a DELETE
+  // failure logs but does not block the add (matches prior behavior).
+  if (removedConflicting.length > 0) {
     try {
-      const contact = await ghlFetch('GET', `/contacts/${contactId}`);
-      const currentTags = contact?.contact?.tags || contact?.tags || [];
-      removedConflicting = currentTags.filter((t) => t.startsWith(namespace) && t !== tag);
-      if (removedConflicting.length > 0) {
-        await ghlFetch('DELETE', `/contacts/${contactId}/tags`, { tags: removedConflicting });
-        console.log(
-          `[ActionExecutor] namespace exclusivity enforced: contact=${contactId} ns=${namespace} removed=[${removedConflicting.join(',')}] adding=${tag}`
-        );
+      await ghlFetch('DELETE', `/contacts/${contactId}/tags`, { tags: removedConflicting });
+      console.log(
+        `[ActionExecutor] namespace exclusivity enforced: contact=${contactId} ns=${namespace} removed=[${removedConflicting.join(',')}] adding=${tag}`
+      );
+      if (currentTags) {
+        currentTags = currentTags.filter((t) => !removedConflicting.includes(t));
+        setCachedContactTags(contactId, cache, currentTags);
       }
     } catch (err) {
-      console.error(`[executeAddTag] exclusivity check failed for ${contactId} ns=${namespace}: ${err.message} — proceeding with add`);
+      console.error(`[executeAddTag] exclusivity DELETE failed for ${contactId} ns=${namespace}: ${err.message} — proceeding with add`);
       removedConflicting = [];
     }
   }
 
-  await ghlFetch('POST', `/contacts/${contactId}/tags`, { tags: [tag] });
+  // Additive POST — never PUT. Skip when the tag is already present.
+  if (!alreadyPresent) {
+    await ghlFetch('POST', `/contacts/${contactId}/tags`, { tags: [tag] });
+    if (currentTags) {
+      setCachedContactTags(contactId, cache, [...currentTags, tag]);
+    }
+  }
+
   return {
     tag_applied: tag,
     contact_id: contactId,
@@ -160,17 +194,18 @@ export async function executeAddTag(action) {
   };
 }
 
-export async function executeRemoveTag(action) {
+export async function executeRemoveTag(action, context = {}) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
   let tags = payload.tags || (payload.tag ? [payload.tag] : []);
+  const cache = context?._contactCache;
 
   // v4.3 — prefix mode. Fetch contact, filter tags by prefix, merge with
   // any explicitly-listed tags. No-op if nothing matches.
   if (payload.prefix) {
     if (!contactId) throw new Error('Missing contactId');
-    const contact = await ghlFetch('GET', `/contacts/${contactId}`);
-    const currentTags = contact?.contact?.tags || contact?.tags || [];
+    const contact = await getContactCached(contactId, cache);
+    const currentTags = contact?.tags || [];
     const matched = currentTags.filter(t => t.startsWith(payload.prefix));
     if (matched.length === 0 && tags.length === 0) {
       return {
@@ -181,10 +216,36 @@ export async function executeRemoveTag(action) {
       };
     }
     tags = [...new Set([...tags, ...matched])];
+  } else if (tags.length > 0 && contactId) {
+    // Explicit-tags mode: only DELETE tags the contact actually has. Removing
+    // tags it doesn't have is a wasted GHL call. The read is usually free
+    // (already cached by a sibling action in this batch). Best-effort: if the
+    // read fails, fall back to the historical blind DELETE.
+    try {
+      const contact = await getContactCached(contactId, cache);
+      const currentTags = contact?.tags || [];
+      const present = tags.filter(t => currentTags.includes(t));
+      if (present.length === 0) {
+        return {
+          action: 'no_op',
+          reason: 'no requested tags present',
+          contact_id: contactId,
+          requested: tags,
+        };
+      }
+      tags = present;
+    } catch (err) {
+      console.error(`[executeRemoveTag] contact read failed for ${contactId}: ${err.message} — proceeding with blind DELETE`);
+    }
   }
 
   if (!contactId || tags.length === 0) throw new Error('Missing contactId or tag/tags/prefix');
   await ghlFetch('DELETE', `/contacts/${contactId}/tags`, { tags });
+  // Keep the cache consistent so later same-batch actions see the removal.
+  if (cache?.has(contactId)) {
+    const cur = cache.get(contactId)?.tags || [];
+    setCachedContactTags(contactId, cache, cur.filter(t => !tags.includes(t)));
+  }
   if (tags.length === 1) {
     return { tag_removed: tags[0], contact_id: contactId };
   }
@@ -220,17 +281,18 @@ export async function executeRemoveTag(action) {
  *   - Tag write to GHL is idempotent on server side (POST same tag twice
  *     does not duplicate).
  */
-export async function executeSetStage(action) {
+export async function executeSetStage(action, context = {}) {
   const contactId = action.target_id;
   const newStage = action.action_payload?.tag;
   if (!contactId || !newStage) throw new Error('Missing contactId or tag');
   if (!newStage.startsWith('stage:')) {
     throw new Error(`set_stage requires a stage:* tag, got "${newStage}"`);
   }
+  const cache = context?._contactCache;
 
-  // 1. Read current state
-  const contact = await ghlFetch('GET', `/contacts/${contactId}`);
-  const currentTags = contact?.contact?.tags || contact?.tags || [];
+  // 1. Read current state (via the per-batch cache)
+  const contact = await getContactCached(contactId, cache);
+  const currentTags = contact?.tags || [];
   const conflictingStages = currentTags.filter(t => t.startsWith('stage:') && t !== newStage);
   const alreadyHasNew = currentTags.includes(newStage);
 
@@ -253,6 +315,13 @@ export async function executeSetStage(action) {
   if (conflictingStages.length > 0) {
     await ghlFetch('DELETE', `/contacts/${contactId}/tags`, { tags: conflictingStages });
   }
+
+  // Keep the cache consistent for later same-batch actions.
+  const nextTags = [
+    ...currentTags.filter(t => !conflictingStages.includes(t)),
+    ...(alreadyHasNew ? [] : [newStage]),
+  ];
+  setCachedContactTags(contactId, cache, nextTags);
 
   console.log(`[ActionExecutor] ✅ set_stage(${contactId}) → ${newStage} (removed ${conflictingStages.length} conflicting: ${conflictingStages.join(', ') || 'none'})`);
 

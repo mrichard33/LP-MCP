@@ -88,7 +88,8 @@ import { resolveLPLeadId } from '../../lp-appointment-sync.js';
 import { sendGroupMeMessage } from '../../groupme.js';
 import { addGHLNote, updateGHLContactFields, applyGHLTag } from '../../ghl.js';
 import { formatLpSource, formatApptTime12h } from '../../format-helpers.js';
-import { isLPLeadId, ghlFetch } from '../helpers.js';
+import { isLPLeadId } from '../helpers.js';
+import { getContactCached } from '../contact-cache.js';
 import { toLpApptDate, toLpApptTime, normalizeDateForComparison } from '../date-parsers.js';
 import { resolveContactInfo } from '../resolvers.js';
 import { buildRichNotification } from '../enrichment.js';
@@ -119,9 +120,10 @@ function hasMeaningfulCalendar(name) {
   return true;
 }
 
-export async function executeSetLPAppointment(action) {
+export async function executeSetLPAppointment(action, context = {}) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
+  const cache = context?._contactCache;
 
   let eventPayload = {};
   if (action.event_id) {
@@ -145,8 +147,7 @@ export async function executeSetLPAppointment(action) {
   } else {
     let ghlContact = null;
     try {
-      const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
-      ghlContact = ghlRes?.contact || null;
+      ghlContact = await getContactCached(contactId, cache);
     } catch (err) {
       console.warn(`[LP-APPT] GHL contact fetch failed for ${contactId}: ${err.message}`);
     }
@@ -219,8 +220,8 @@ export async function executeSetLPAppointment(action) {
   }
   if (!rawDate && contactId && !isLPLeadId(contactId)) {
     try {
-      const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
-      rawDate = ghlRes?.contact?.last_appointment_start_date || ghlRes?.contact?.lastAppointmentStartDate || null;
+      const c = await getContactCached(contactId, cache);
+      rawDate = c?.last_appointment_start_date || c?.lastAppointmentStartDate || null;
     } catch {}
   }
   if (!rawDate) throw new Error('Cannot resolve appointment date');
@@ -239,8 +240,8 @@ export async function executeSetLPAppointment(action) {
   }
   if (!rawTime && contactId && !isLPLeadId(contactId)) {
     try {
-      const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
-      rawTime = ghlRes?.contact?.last_appointment_start_time || ghlRes?.contact?.lastAppointmentStartTime || null;
+      const c = await getContactCached(contactId, cache);
+      rawTime = c?.last_appointment_start_time || c?.lastAppointmentStartTime || null;
     } catch {}
   }
   if (!rawTime) throw new Error('Cannot resolve appointment time');
