@@ -3,6 +3,17 @@
  *
  * The brain of the agentic system.
  *
+ * v2.16 — 2026-06-02. Action priority lanes for rule-created actions.
+ *   createActionsFromRule now sets agent_actions.priority from a per-type
+ *   default map (resolveActionPriority), so time-sensitive customer-facing
+ *   actions (set_lp_appointment, send_message, book/cancel/reschedule
+ *   appointment, update_lp_dnc_status, send_notification → priority 20)
+ *   preempt the priority-100 tag backlog in the executor's pull order
+ *   (ORDER BY priority ASC, created_at ASC, sequence_order ASC). Previously
+ *   the insert omitted priority entirely, so every rule action took the
+ *   column default (100) and the priority lane was inert. An explicit
+ *   tmpl.priority on the template still wins. See DEFAULT_PRIORITY_BY_TYPE.
+ *
  * v2.15.1 — 2026-05-21. event_subtype whitespace normalization.
  *   GHL source names sometimes arrive with trailing whitespace ("Self
  *   Generated " is the known case, present on 14 system_events in the
@@ -153,6 +164,46 @@ import { tryClaimEvent, recordResult } from './services/idempotency.js';
 // ═══════════════════════════════════════════════════════════════════
 
 const DEDUP_WINDOW_MINUTES = 30;
+
+// v2.16 — 2026-06-02. Action priority lanes for rule-created actions.
+//   PROBLEM: createActionsFromRule inserted agent_actions with no `priority`
+//   field, so every rule-created action took the column default (100). The
+//   executor's priority-lane pull order (ORDER BY priority ASC, created_at
+//   ASC, sequence_order ASC) was therefore inert — a time-sensitive
+//   set_lp_appointment queued FIFO behind ~900 priority-100 tag ops and
+//   could wait ~12h to execute. The GHL workflow "I.LP-A LP Set Appointment"
+//   only waits 15 minutes before falling through to its fallback, so a late
+//   agentic set is effectively a miss.
+//
+//   FIX: Assign a lower (= higher-priority) lane to customer-facing,
+//   time-sensitive action types so they preempt the bulk tag backlog. The
+//   resolved priority is: tmpl.priority ?? DEFAULT_PRIORITY_BY_TYPE[type] ?? 100,
+//   mirroring what executeLayer3Dispatch already does for layer-3 sub-actions
+//   (src/actions/index.js — it propagates tmpl.priority when set). This just
+//   extends per-type defaulting to rule-created actions. Lower number = pulled
+//   first. Everything not listed keeps the previous default of 100, so bulk
+//   tag/stage ops are unchanged.
+const TIME_SENSITIVE_PRIORITY = 20;
+const DEFAULT_ACTION_PRIORITY = 100;
+const DEFAULT_PRIORITY_BY_TYPE = {
+  set_lp_appointment: TIME_SENSITIVE_PRIORITY,
+  send_message: TIME_SENSITIVE_PRIORITY,
+  book_appointment: TIME_SENSITIVE_PRIORITY,
+  cancel_appointment: TIME_SENSITIVE_PRIORITY,
+  reschedule_appointment: TIME_SENSITIVE_PRIORITY,
+  update_lp_dnc_status: TIME_SENSITIVE_PRIORITY,
+  send_notification: TIME_SENSITIVE_PRIORITY,
+};
+
+// Resolves the agent_actions.priority for a rule action template. An explicit
+// template priority always wins; otherwise fall back to the per-type default,
+// then to the column default (100).
+function resolveActionPriority(tmpl) {
+  if (tmpl && tmpl.priority !== undefined && tmpl.priority !== null) {
+    return tmpl.priority;
+  }
+  return DEFAULT_PRIORITY_BY_TYPE[tmpl?.action_type] ?? DEFAULT_ACTION_PRIORITY;
+}
 
 const BEHAVIORAL_RULE_PREFIXES = [
   'BEHAVIORAL_',
@@ -676,6 +727,7 @@ async function createActionsFromRule(event, rule) {
   for (let i = 0; i < actions.length; i++) {
     const tmpl = actions[i];
     const targetSystem = tmpl.target_system || 'ghl';
+    const priority = resolveActionPriority(tmpl);
 
     let actionPayload = tmpl.params || tmpl.payload || {};
     if (tmpl.action_type === 'send_message') {
@@ -695,6 +747,7 @@ async function createActionsFromRule(event, rule) {
         reasoning: `Rule ${rule.rule_key}: ${rule.rule_name} — SKIPPED: no GHL contact match`,
         confidence: 0, rule_applied: rule.rule_key,
         status: 'skipped', requires_approval: false,
+        priority,
         batch_id: batchId, sequence_order: i,
         error_message: `No GHL contact ID — LP lead ${event.entity_id} not matched to GHL`,
       });
@@ -707,10 +760,10 @@ async function createActionsFromRule(event, rule) {
       action_payload: actionPayload,
       reasoning: `Rule ${rule.rule_key}: ${rule.rule_name}`, confidence: 1.0,
       rule_applied: rule.rule_key, status: requiresApproval ? 'pending_approval' : 'pending',
-      requires_approval: requiresApproval, batch_id: batchId, sequence_order: i,
+      requires_approval: requiresApproval, priority, batch_id: batchId, sequence_order: i,
     }).select().single();
     if (error) { console.error(`[DecisionEngine] Action create failed for ${rule.rule_key}:`, error.message); }
-    else { created.push(data); console.log(`[DecisionEngine] Action: ${tmpl.action_type} (${requiresApproval ? 'approval' : 'auto'}) — ${rule.rule_key}`); }
+    else { created.push(data); console.log(`[DecisionEngine] Action: ${tmpl.action_type} (${requiresApproval ? 'approval' : 'auto'}, priority=${priority}) — ${rule.rule_key}`); }
   }
   return created;
 }
@@ -910,3 +963,12 @@ export function registerDecisionEngineRoutes(app) {
     res.json({ success: true, rules_loaded: rules.length });
   });
 }
+
+// Test-only surface (mirrors the _internal convention used elsewhere, e.g.
+// src/notifications/*). Not part of the runtime API.
+export const _internal = {
+  resolveActionPriority,
+  DEFAULT_PRIORITY_BY_TYPE,
+  DEFAULT_ACTION_PRIORITY,
+  TIME_SENSITIVE_PRIORITY,
+};
