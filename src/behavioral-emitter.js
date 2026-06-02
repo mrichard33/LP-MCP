@@ -214,6 +214,12 @@ const SELF_BASE_URL = `http://localhost:${process.env.PORT || 8080}`;
 
 // v2.7 — Reply buffer config and state
 const REPLY_DEBOUNCE_MS = parseInt(process.env.REPLY_DEBOUNCE_MS || '35000', 10);
+// v2.12 — On analyze failure, retry the pipeline in-process a bounded number of
+// times before giving up and leaving the source events unprocessed (so the
+// decision-engine processing cycle re-runs them). Prevents a transient analyzer
+// blip from silently dropping a reply.
+const BUFFER_MAX_RETRIES = parseInt(process.env.REPLY_BUFFER_MAX_RETRIES || '2', 10);
+const BUFFER_RETRY_DELAY_MS = parseInt(process.env.REPLY_BUFFER_RETRY_DELAY_MS || '20000', 10);
 // In-process Map: contactId → { messages: string[], eventIds: number[],
 // timeoutId: NodeJS.Timeout, firstSeenAt: number, latestType: string }
 const replyBuffers = new Map();
@@ -234,6 +240,11 @@ async function triggerAgenticPipeline(contactId, messageText, channel = null) {
   // decision-engine v2.13+ can use it to override the rule template's
   // channel for send_message actions. Null is safe (analyzer falls
   // back to the rule template's default).
+  // v2.12: the analyze step's success gates whether the reply buffer may mark
+  // the source events processed. Return true ONLY when ai.analysis_completed was
+  // actually produced (analyzeData.success); a failed/hung analysis returns false
+  // so the events stay unprocessed and retriable.
+  let analysisSucceeded = false;
   try {
     const analyzeRes = await fetch(`${SELF_BASE_URL}/n8n/analyze-message`, {
       method: 'POST',
@@ -243,13 +254,18 @@ async function triggerAgenticPipeline(contactId, messageText, channel = null) {
     });
     if (!analyzeRes.ok) {
       console.warn(`[AgenticPipeline] Analyze failed: ${analyzeRes.status}`);
-      return; // Analysis failed — heartbeat will retry
+      return false; // Analysis failed — caller retries / leaves for processing cycle
     }
-    const analyzeData = await analyzeRes.json();
-    console.log(`[AgenticPipeline] Analysis complete for ${contactId}: stage=${analyzeData.buyer_stage || '?'} (${Date.now() - start}ms)`);
+    const analyzeData = await analyzeRes.json().catch(() => ({}));
+    analysisSucceeded = analyzeData?.success === true;
+    if (!analysisSucceeded) {
+      console.warn(`[AgenticPipeline] Analyze returned success=false for ${contactId} (no ai.analysis_completed) — will retry`);
+      return false;
+    }
+    console.log(`[AgenticPipeline] Analysis complete for ${contactId}: stage=${analyzeData.analysis?.buyer_stage || '?'} (${Date.now() - start}ms)`);
   } catch (err) {
     console.warn(`[AgenticPipeline] Analyze error for ${contactId}: ${err.message}`);
-    return; // Let heartbeat handle it
+    return false; // Let the caller / processing cycle retry
   }
 
   // Step 2: Process pending events → Decision Engine creates actions
@@ -266,7 +282,7 @@ async function triggerAgenticPipeline(contactId, messageText, channel = null) {
     }
   } catch (err) {
     console.warn(`[AgenticPipeline] Process error: ${err.message}`);
-    return;
+    return true; // analysis already emitted; the processing cycle will pick up the event
   }
 
   // Step 3: Execute pending actions → pre-generate response + send GroupMe approval
@@ -286,6 +302,7 @@ async function triggerAgenticPipeline(contactId, messageText, channel = null) {
   }
 
   console.log(`[AgenticPipeline] Pipeline complete for ${contactId} (${Date.now() - start}ms)`);
+  return true;
 }
 
 /**
@@ -318,7 +335,7 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageTyp
   // for the outbound reply.
   if (messageType) buf.latestType = messageType;
 
-  buf.timeoutId = setTimeout(async () => {
+  buf.timeoutId = setTimeout(() => {
     // Snapshot before deleting; any messages that arrive AFTER this point
     // start a fresh buffer.
     const messages = buf.messages.slice();
@@ -327,32 +344,10 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageTyp
     const latestType = buf.latestType;
     replyBuffers.delete(contactId);
 
-    // Mark individual reply events as processed so the heartbeat in
-    // decision-engine doesn't re-analyze them with stale single-message
-    // context. The combined-buffer analysis below produces the canonical
-    // ai.analysis_completed event for this turn.
-    if (eventIds.length > 0) {
-      try {
-        await supabase
-          .from('system_events')
-          .update({
-            processed: true,
-            processed_by: 'behavioral_emitter_buffer',
-            processed_at: new Date().toISOString(),
-            action_taken: `combined_into_reply_buffer (n=${messages.length})`,
-          })
-          .in('id', eventIds);
-      } catch (err) {
-        console.warn(`[ReplyBuffer] Mark-processed failed for ${contactId}: ${err.message}`);
-      }
-    }
-
     const combined = messages.length === 1 ? messages[0] : messages.join('\n');
     const elapsedSec = Math.round((Date.now() - firstSeenAt) / 1000);
 
-    // v2.8: normalize messageType ("SMS" | "Email" | "TYPE_SMS" |
-    // "TYPE_EMAIL" | etc) to 'sms' | 'email' | null. Passed into
-    // triggerAgenticPipeline so analyzer can carry channel forward.
+    // v2.8: normalize messageType to 'sms' | 'email' | null for the analyzer.
     const channel = (() => {
       const lt = String(latestType || '').toLowerCase();
       if (lt.includes('email')) return 'email';
@@ -364,10 +359,65 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageTyp
       `[ReplyBuffer] Fired for ${contactId}: ${messages.length} message${messages.length === 1 ? '' : 's'}, ${elapsedSec}s window, channel=${channel || 'unknown'} → triggering pipeline with combined text`
     );
 
-    triggerAgenticPipeline(contactId, combined, channel).catch(err => {
-      console.error(`[ReplyBuffer] Pipeline failed for ${contactId}: ${err.message}`);
-    });
+    // v2.12: fire the pipeline and mark the source events processed ONLY after
+    // analysis is confirmed. On failure, retry in-process up to BUFFER_MAX_RETRIES;
+    // if still failing, leave the events processed=false so the decision-engine
+    // processing cycle (n8n cron, or the in-process heartbeat failover) re-runs
+    // them through analyzeMessage (whose v1.11 timeout + cache-clear make that
+    // retry deterministic). PRE-v2.12 these events were marked processed=true
+    // BEFORE the pipeline ran, so a failed/hung analysis silently dropped the
+    // reply with no retry.
+    runBufferedPipelineWithRetry(contactId, combined, channel, messages, eventIds, 0)
+      .catch(err => console.error(`[ReplyBuffer] Runner error for ${contactId}: ${err.message}`));
   }, REPLY_DEBOUNCE_MS);
+}
+
+// v2.12 — Fire the agentic pipeline for a fired buffer and reconcile the source
+// events' processed state with the outcome. Retries on analyze failure with a
+// fixed delay, bounded by BUFFER_MAX_RETRIES.
+async function runBufferedPipelineWithRetry(contactId, combined, channel, messages, eventIds, attempt) {
+  let ok = false;
+  try {
+    ok = await triggerAgenticPipeline(contactId, combined, channel);
+  } catch (err) {
+    console.error(`[ReplyBuffer] Pipeline threw for ${contactId} (attempt ${attempt + 1}): ${err.message}`);
+    ok = false;
+  }
+  if (ok) {
+    await markBufferEventsProcessed(eventIds, messages.length, contactId);
+    return;
+  }
+  if (attempt + 1 < BUFFER_MAX_RETRIES) {
+    console.warn(`[ReplyBuffer] Analysis failed for ${contactId} (attempt ${attempt + 1}/${BUFFER_MAX_RETRIES}) — retrying in ${BUFFER_RETRY_DELAY_MS}ms`);
+    setTimeout(() => {
+      runBufferedPipelineWithRetry(contactId, combined, channel, messages, eventIds, attempt + 1)
+        .catch(err => console.error(`[ReplyBuffer] Retry runner error for ${contactId}: ${err.message}`));
+    }, BUFFER_RETRY_DELAY_MS);
+    return;
+  }
+  // Exhausted in-process retries. Leave the source events processed=false on
+  // purpose so the decision-engine processing cycle picks them up and re-runs
+  // the analyzer (durable backstop, survives a process restart).
+  console.error(`[ReplyBuffer] Analysis still failing for ${contactId} after ${BUFFER_MAX_RETRIES} attempts — leaving events unprocessed for the processing-cycle retry (eventIds=[${eventIds.join(',')}])`);
+}
+
+// v2.12 — Mark the buffered reply events processed once analysis is confirmed,
+// so the processing-cycle backstop doesn't re-analyze them with stale single-message context.
+async function markBufferEventsProcessed(eventIds, msgCount, contactId) {
+  if (!eventIds?.length) return;
+  try {
+    await supabase
+      .from('system_events')
+      .update({
+        processed: true,
+        processed_by: 'behavioral_emitter_buffer',
+        processed_at: new Date().toISOString(),
+        action_taken: `combined_into_reply_buffer (n=${msgCount})`,
+      })
+      .in('id', eventIds);
+  } catch (err) {
+    console.warn(`[ReplyBuffer] Mark-processed failed for ${contactId}: ${err.message}`);
+  }
 }
 
 function validateWebhook(req) {
