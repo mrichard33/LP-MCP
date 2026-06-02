@@ -19,6 +19,19 @@
  * Pre-check: if LP already has an appointment on the same normalized
  * date, skip the write (idempotency against retries).
  *
+ * 2026-06-02 — SUCCESS-SIGNAL TAG FOR GHL FALLBACK GATE.
+ *   Applies the `lp-appt-synced` tag to the GHL contact on the two
+ *   success paths (lp_appointment_set, already_set_in_lp) and ONLY
+ *   when the target is a GHL contact, not a bare LP lead id. This is
+ *   the honest signal the redesigned "I.LP-A LP Set Appointment"
+ *   workflow gates on: it clears the tag at entry, fires the agentic
+ *   event feed, waits 15 min, then checks — tag present means the
+ *   agentic path set (or confirmed) the LP appointment and the
+ *   workflow exits; tag absent means the agentic path did NOT sync
+ *   (MCP down, or no LP lead resolvable) and the workflow runs its
+ *   GHL-native direct SetAppointment fallback. The tag is never
+ *   applied on the skip/failure path, so absence is unambiguous.
+ *
  * 2026-05-27 v2 — LIVE-LP SOURCE + CLEAN CALENDAR DISPLAY.
  *   Follow-up to the same-day initial source/sub-source rollout. Two
  *   fixes mirroring lp-appointment-sync.js v5.1.9:
@@ -62,7 +75,7 @@ import supabase from '../../supabase.js';
 import { setAppointment as lpSetAppointment } from '../../lp-client.js';
 import { resolveLPLeadId } from '../../lp-appointment-sync.js';
 import { sendGroupMeMessage } from '../../groupme.js';
-import { addGHLNote, updateGHLContactFields } from '../../ghl.js';
+import { addGHLNote, updateGHLContactFields, applyGHLTag } from '../../ghl.js';
 import { formatLpSource } from '../../format-helpers.js';
 import { isLPLeadId, ghlFetch } from '../helpers.js';
 import { parseLongDate, normalizeDateForComparison } from '../date-parsers.js';
@@ -73,6 +86,16 @@ import { buildRichNotification } from '../enrichment.js';
 // ghl-field-map.js.
 const FIELD_LP_PROSPECT_ID = 'ZRQAVrzhtzApzLlHmT87'; // lp_prospect_id
 const FIELD_LP_LEAD_ID     = 'GmAVmW6V9sekD7pVONKr'; // lp_lead_id (real lds_id)
+
+// 2026-06-02: success-signal tag for the GHL workflow fallback gate.
+// Applied ONLY on the two success paths (lp_appointment_set,
+// already_set_in_lp) and ONLY when the target is a GHL contact (not a
+// bare LP lead id). The "I.LP-A LP Set Appointment" workflow removes
+// this tag at entry, waits 15 min, then checks for it: present = the
+// agentic path synced LP (exit); absent = run the GHL-native direct
+// SetAppointment fallback. Never applied on the skip/failure path, so
+// its absence is an honest "agentic did NOT sync" signal.
+const LP_APPT_SYNCED_TAG = 'lp-appt-synced';
 
 // 2026-05-27 v2: helper used by the conditional calendar render below.
 // "N/A" is treated as absent so legacy callers passing the literal
@@ -260,6 +283,12 @@ export async function executeSetLPAppointment(action) {
             (lpSourceLine ? `Source: ${lpSourceLine}\n` : '') +
             `Date: ${lpDateNormalized}`
           ).catch(() => {});
+          // 2026-06-02: LP already holds this appointment — that is a
+          // "synced" outcome for the workflow gate, so tag it the same
+          // as a fresh set. Guarded by the GHL-contact check above.
+          await applyGHLTag(contactId, LP_APPT_SYNCED_TAG).catch((err) => {
+            console.warn(`[LP-APPT] ${LP_APPT_SYNCED_TAG} tag apply failed (already_set path, non-blocking): ${err.message}`);
+          });
         }
         return {
           action: 'already_set_in_lp',
@@ -296,6 +325,12 @@ export async function executeSetLPAppointment(action) {
       `Date: ${apptDate}\nTime: ${apptTime}` +
       calendarLineGhlNote
     ).catch(() => {});
+    // 2026-06-02: LP confirmed the set (lpSetAppointment throws on LP
+    // error, so reaching here means success) — apply the workflow gate
+    // signal. Guarded by the GHL-contact check above.
+    await applyGHLTag(contactId, LP_APPT_SYNCED_TAG).catch((err) => {
+      console.warn(`[LP-APPT] ${LP_APPT_SYNCED_TAG} tag apply failed (set path, non-blocking): ${err.message}`);
+    });
   }
   const { name } = await resolveContactInfo(contactId, eventPayload);
   // Success notification uses inline formatting (not buildRichNotification)
