@@ -1,0 +1,23 @@
+name: CI
+# Lightweight, deterministic gate for the main-default workflow (Option A).
+# Syntax-checks every source file with `node --check` — no install, no
+# secrets, no network. Mark this check "required" in branch protection
+# ONLY after it has gone green on at least one PR.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [dev]
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Syntax-check all source files (node --check)
+        run: |
+          echo "Checking src/**/*.js ..."
+          find src -name '*.js' -print0 | xargs -0 -P4 -n1 node --check
+          echo "All source files parsed OK."
