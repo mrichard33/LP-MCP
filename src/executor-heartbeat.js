@@ -100,7 +100,13 @@ const STALE_THRESHOLD_MS = parseInt(
   process.env.EXECUTOR_STALE_THRESHOLD_MS || `${6 * 60 * 1000}`, 10
 );
 const HEARTBEAT_INTERVAL_MS = parseInt(
-  process.env.EXECUTOR_HEARTBEAT_INTERVAL_MS || `${5 * 60 * 1000}`, 10
+  // Phase 2 (2026-06-02): in-process driver is now PRIMARY (not failover-only)
+  // — default 60s so the executor runs near-continuously and can spend GHL
+  // rate-limiter tokens as they refill. Safe because executeActions claims
+  // rows atomically (claim_agent_actions RPC), so overlap with the n8n cron
+  // backup can't double-fire. The module-level in-flight guard inside
+  // executeActions prevents the route + timer from stacking.
+  process.env.EXECUTOR_HEARTBEAT_INTERVAL_MS || '60000', 10
 );
 const FIRST_RUN_DELAY_MS = parseInt(
   process.env.EXECUTOR_HEARTBEAT_FIRST_RUN_DELAY_MS || `${3 * 60 * 1000}`, 10
@@ -179,9 +185,13 @@ async function checkExecutorHealth() {
     return { needs_run: true, last_executed_at: null, age_ms: null, has_pending: true };
   }
 
+  // Phase 2: PRIMARY driver. Whenever there is pending work, run — the old
+  // STALE_THRESHOLD "only if n8n looks dead" gate is dropped (claiming makes
+  // concurrent n8n + in-process runs safe). age_ms is still reported for
+  // observability.
   const ageMs = Date.now() - Date.parse(lastIso);
   return {
-    needs_run: ageMs >= STALE_THRESHOLD_MS,
+    needs_run: true,
     last_executed_at: lastIso,
     age_ms: ageMs,
     has_pending: true,
@@ -215,16 +225,16 @@ export async function runHeartbeat({ force = false } = {}) {
   }
 
   const ageDescription = health.age_ms != null
-    ? `${Math.round(health.age_ms / 1000)}s stale`
+    ? `last run ${Math.round(health.age_ms / 1000)}s ago`
     : 'no prior execution';
   console.log(
-    `[ExecutorHeartbeat] FAILOVER — firing executor (${ageDescription}, threshold ${STALE_THRESHOLD_MS}ms${force ? ', forced' : ''})`
+    `[ExecutorHeartbeat] Firing executor (primary; ${ageDescription}${force ? ', forced' : ''})`
   );
 
   const startedAt = Date.now();
   let result;
   try {
-    result = await executeActions({ limit: 50 });
+    result = await executeActions();
   } catch (err) {
     console.error(`[ExecutorHeartbeat] executeActions threw: ${err.message}`);
     return {
