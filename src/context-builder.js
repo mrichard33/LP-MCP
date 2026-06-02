@@ -78,6 +78,13 @@ const CONTEXT_CACHE_TTL_MS = parseInt(process.env.CONTEXT_CACHE_TTL_MS || '60000
 const LP_DATA_STALE_THRESHOLD_MIN = parseInt(process.env.LP_DATA_STALE_THRESHOLD_MIN || '15', 10);
 const PIPELINE_CACHE_TTL_MS = parseInt(process.env.PIPELINE_CACHE_TTL_MS || '900000', 10); // 15 min — pipelines change rarely
 
+// v2.8 (2026-06-02) — Per-call ceiling on Supabase reads. The JS client has no
+// abort support; a hung query (lock/pool contention — e.g. lp_leads during a
+// FORCE_FULL_SYNC) would otherwise stall buildLeadContext forever. Each fetcher
+// races its query against this timeout and degrades to its safe fallback
+// (null / []) so a slow data source yields partial context instead of a hang.
+const CONTEXT_SB_TIMEOUT_MS = parseInt(process.env.CONTEXT_SB_TIMEOUT_MS || '6000', 10);
+
 // GHL Custom Field IDs
 const CF_LP_LEAD_ID = 'GmAVmW6V9sekD7pVONKr';
 const CF_LP_INBOUND_ID = '3YMxheIlPyhACB8zyc3W';
@@ -224,6 +231,17 @@ function coerceCount(raw) {
   return Number.isFinite(num) && num >= 0 ? num : null;
 }
 
+// v2.8 — Promise timeout wrapper for Supabase reads. Rejects with a labeled
+// error if the query hasn't settled within CONTEXT_SB_TIMEOUT_MS; callers catch
+// and fall back to their safe default so one slow source never stalls the build.
+function withTimeout(promise, label, ms = CONTEXT_SB_TIMEOUT_MS) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // DATA FETCHERS
 // ═══════════════════════════════════════════════════════════════════
@@ -299,16 +317,24 @@ async function fetchConversation(contactId, limit = 10) {
 }
 
 async function fetchLeadIntelligence(contactId) {
-  const { data, error } = await supabase
-    .from('lead_intelligence')
-    .select('*')
-    .eq('ghl_contact_id', contactId)
-    .maybeSingle();
-  if (error) {
-    console.error(`[ContextBuilder] lead_intelligence fetch error:`, error.message);
+  try {
+    const { data, error } = await withTimeout(
+      supabase
+        .from('lead_intelligence')
+        .select('*')
+        .eq('ghl_contact_id', contactId)
+        .maybeSingle(),
+      'fetchLeadIntelligence',
+    );
+    if (error) {
+      console.error(`[ContextBuilder] lead_intelligence fetch error:`, error.message);
+      return null;
+    }
+    return data;
+  } catch (err) {
+    console.warn(`[ContextBuilder] fetchLeadIntelligence timed out/failed for ${contactId}: ${err.message}`);
     return null;
   }
-  return data;
 }
 
 const LP_LEAD_COLUMNS = 'id, lp_lead_id, lp_prospect_id, first_name, last_name, disposition_code, disposition_label, rep_name, promoter_name, lead_source, lead_source_detail, call_count, last_call_date, appointment_set, appointment_date, demo_completed, demo_date, days_to_demo, closed_won, job_value, created_at_lp, ghl_contact_id, synced_at';
@@ -327,13 +353,16 @@ function backfillGhlContactId(lpLeadRow, ghlContactId) {
 async function fetchLPLeadByProspectId(prospectId) {
   if (!prospectId) return null;
   try {
-    const { data, error } = await supabase
-      .from('lp_leads')
-      .select(LP_LEAD_COLUMNS)
-      .eq('lp_prospect_id', String(prospectId))
-      .order('synced_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const { data, error } = await withTimeout(
+      supabase
+        .from('lp_leads')
+        .select(LP_LEAD_COLUMNS)
+        .eq('lp_prospect_id', String(prospectId))
+        .order('synced_at', { ascending: false })
+        .limit(1)
+        .maybeSingle(),
+      'fetchLPLeadByProspectId',
+    );
     if (error || !data) return null;
     return data;
   } catch (err) {
@@ -343,28 +372,39 @@ async function fetchLPLeadByProspectId(prospectId) {
 }
 
 async function fetchLPLeadByGhlContactId(contactId) {
-  const { data, error } = await supabase
-    .from('lp_leads')
-    .select(LP_LEAD_COLUMNS)
-    .eq('ghl_contact_id', contactId)
-    .order('synced_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  if (error) {
-    console.error(`[ContextBuilder] lp_leads ghl_contact_id lookup error:`, error.message);
+  try {
+    const { data, error } = await withTimeout(
+      supabase
+        .from('lp_leads')
+        .select(LP_LEAD_COLUMNS)
+        .eq('ghl_contact_id', contactId)
+        .order('synced_at', { ascending: false })
+        .limit(1)
+        .maybeSingle(),
+      'fetchLPLeadByGhlContactId',
+    );
+    if (error) {
+      console.error(`[ContextBuilder] lp_leads ghl_contact_id lookup error:`, error.message);
+      return null;
+    }
+    return data;
+  } catch (err) {
+    console.warn(`[ContextBuilder] fetchLPLeadByGhlContactId timed out/failed for ${contactId}: ${err.message}`);
     return null;
   }
-  return data;
 }
 
 async function fetchLPLeadByLdsId(lpLeadId) {
   if (!lpLeadId) return null;
   try {
-    const { data, error } = await supabase
-      .from('lp_leads')
-      .select(LP_LEAD_COLUMNS)
-      .eq('lp_lead_id', String(lpLeadId))
-      .maybeSingle();
+    const { data, error } = await withTimeout(
+      supabase
+        .from('lp_leads')
+        .select(LP_LEAD_COLUMNS)
+        .eq('lp_lead_id', String(lpLeadId))
+        .maybeSingle(),
+      'fetchLPLeadByLdsId',
+    );
     if (error || !data) return null;
     return data;
   } catch (err) {
@@ -376,13 +416,16 @@ async function fetchLPLeadByLdsId(lpLeadId) {
 async function fetchLPNotes(lpLeadId, limit = 8) {
   if (!lpLeadId) return [];
   try {
-    const { data, error } = await supabase
-      .from('lp_notes')
-      .select('note_body, note_category, created_by_rep_name, created_at_lp')
-      .eq('lp_lead_id', lpLeadId)
-      .not('note_body', 'is', null)
-      .order('created_at_lp', { ascending: false })
-      .limit(limit);
+    const { data, error } = await withTimeout(
+      supabase
+        .from('lp_notes')
+        .select('note_body, note_category, created_by_rep_name, created_at_lp')
+        .eq('lp_lead_id', lpLeadId)
+        .not('note_body', 'is', null)
+        .order('created_at_lp', { ascending: false })
+        .limit(limit),
+      'fetchLPNotes',
+    );
     if (error || !data) return [];
     return data
       .map(n => ({
@@ -401,12 +444,15 @@ async function fetchLPNotes(lpLeadId, limit = 8) {
 async function fetchLPCalls(lpLeadId, limit = 5) {
   if (!lpLeadId) return [];
   try {
-    const { data, error } = await supabase
-      .from('lp_call_logs')
-      .select('call_result, call_direction, rep_name, call_date, lp_lead_id')
-      .eq('lp_lead_id', lpLeadId)
-      .order('call_date', { ascending: false })
-      .limit(limit);
+    const { data, error } = await withTimeout(
+      supabase
+        .from('lp_call_logs')
+        .select('call_result, call_direction, rep_name, call_date, lp_lead_id')
+        .eq('lp_lead_id', lpLeadId)
+        .order('call_date', { ascending: false })
+        .limit(limit),
+      'fetchLPCalls',
+    );
     if (error || !data) return [];
     return data.map(c => ({
       result: c.call_result || '',
@@ -469,13 +515,16 @@ function calculateDaysInStage(opportunity) {
 // blockers (to reject repeated subject lines).
 async function fetchNurtureHistory(ghlContactId, workflowCode) {
   try {
-    const { data, error } = await supabase
-      .from('agentic_messages')
-      .select('generated_meta, generated_subject, workflow_code, sequence_position')
-      .eq('ghl_contact_id', ghlContactId)
-      .in('send_status', ['generated_ready', 'ghl_sent_confirmed'])
-      .order('generated_at', { ascending: false })
-      .limit(20);
+    const { data, error } = await withTimeout(
+      supabase
+        .from('agentic_messages')
+        .select('generated_meta, generated_subject, workflow_code, sequence_position')
+        .eq('ghl_contact_id', ghlContactId)
+        .in('send_status', ['generated_ready', 'ghl_sent_confirmed'])
+        .order('generated_at', { ascending: false })
+        .limit(20),
+      'fetchNurtureHistory',
+    );
 
     if (error || !data) {
       return { stories_already_deployed: [], subjects_already_used: [], sequence_position: 0 };
@@ -779,23 +828,31 @@ export async function buildLeadContext(ghlContactId, options = {}) {
 
 export async function upsertLeadIntelligence(ghlContactId, updates) {
   const now = new Date().toISOString();
-  const { data, error } = await supabase
-    .from('lead_intelligence')
-    .upsert({
-      ghl_contact_id: ghlContactId,
-      ...updates,
-      updated_at: now,
-    }, {
-      onConflict: 'ghl_contact_id',
-    })
-    .select()
-    .single();
-  if (error) {
-    console.error(`[ContextBuilder] lead_intelligence upsert error:`, error.message);
+  try {
+    const { data, error } = await withTimeout(
+      supabase
+        .from('lead_intelligence')
+        .upsert({
+          ghl_contact_id: ghlContactId,
+          ...updates,
+          updated_at: now,
+        }, {
+          onConflict: 'ghl_contact_id',
+        })
+        .select()
+        .single(),
+      'upsertLeadIntelligence',
+    );
+    if (error) {
+      console.error(`[ContextBuilder] lead_intelligence upsert error:`, error.message);
+      return null;
+    }
+    invalidateContext(ghlContactId);
+    return data;
+  } catch (err) {
+    console.warn(`[ContextBuilder] upsertLeadIntelligence timed out/failed for ${ghlContactId}: ${err.message}`);
     return null;
   }
-  invalidateContext(ghlContactId);
-  return data;
 }
 
 // ═══════════════════════════════════════════════════════════════════
