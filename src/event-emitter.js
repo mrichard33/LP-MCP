@@ -19,6 +19,28 @@
 import supabase from './supabase.js';
 import { applyIntakeFilter } from './services/event-intake-filter.js';
 
+// v1.1 (2026-06-02) — Per-call ceiling on emitEvent's Supabase calls. The JS
+// client has no abort support; a hung insert/select into system_events would
+// otherwise stall emitEvent forever. analyzeMessage awaits the ai.analysis_completed
+// emit AFTER buildLeadContext and BEFORE returning, so a hang here is the same
+// silent-loss class the analyzer/context-builder timeouts close: the success path
+// would stall with no completed event. Racing each call against this timeout turns
+// a hang into a thrown error caught by emitEvent's outer try/catch → returns null.
+const EMIT_EVENT_TIMEOUT_MS = parseInt(process.env.EMIT_EVENT_TIMEOUT_MS || '6000', 10);
+
+// v1.1 — Promise timeout wrapper. Rejects with a labeled error if `promise`
+// hasn't settled within `ms`. The underlying work is not cancelled (no abort in
+// the Supabase JS client), but emitEvent stops waiting; its catch logs and
+// returns null, which callers already handle safely (e.g. the reply buffer reads
+// emittedEvent?.id → undefined → the event simply isn't buffered).
+function withTimeout(promise, label, ms = EMIT_EVENT_TIMEOUT_MS) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 /**
  * Emit a system event. Skips silently if idempotency_key already exists.
  *
@@ -73,38 +95,44 @@ export async function emitEvent(opts) {
 
     // Check idempotency — skip if this exact event was already emitted
     if (idempotency_key) {
-      const { data: existing } = await supabase
-        .from('system_events')
-        .select('id')
-        .eq('idempotency_key', idempotency_key)
-        .maybeSingle();
+      const { data: existing } = await withTimeout(
+        supabase
+          .from('system_events')
+          .select('id')
+          .eq('idempotency_key', idempotency_key)
+          .maybeSingle(),
+        'emitEvent.idempotencyCheck',
+      );
 
       if (existing) {
         return null; // Already emitted, skip
       }
     }
 
-    const { data, error } = await supabase
-      .from('system_events')
-      .insert({
-        event_type,
-        event_subtype: event_subtype || null,
-        source,
-        entity_type,
-        entity_id: String(entity_id),
-        ghl_contact_id: ghl_contact_id || null,
-        lp_lead_id: lp_lead_id || null,
-        lp_prospect_id: lp_prospect_id || null,
-        payload,
-        previous_state,
-        new_state,
-        priority,
-        idempotency_key,
-        event_timestamp: new Date().toISOString(),
-        processed: false,
-      })
-      .select()
-      .single();
+    const { data, error } = await withTimeout(
+      supabase
+        .from('system_events')
+        .insert({
+          event_type,
+          event_subtype: event_subtype || null,
+          source,
+          entity_type,
+          entity_id: String(entity_id),
+          ghl_contact_id: ghl_contact_id || null,
+          lp_lead_id: lp_lead_id || null,
+          lp_prospect_id: lp_prospect_id || null,
+          payload,
+          previous_state,
+          new_state,
+          priority,
+          idempotency_key,
+          event_timestamp: new Date().toISOString(),
+          processed: false,
+        })
+        .select()
+        .single(),
+      'emitEvent.insert',
+    );
 
     if (error) {
       console.error(`[EventEmitter] Failed to emit ${event_type}:`, error.message);

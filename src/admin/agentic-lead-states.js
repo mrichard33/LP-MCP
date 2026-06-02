@@ -12,10 +12,23 @@
  * Railway shell access (useful for both ad-hoc spot-checks and the
  * eventual nightly sweep).
  *
+ * Candidate selection (backfill)
+ * ──────────────────────────────
+ * Default is NEWEST-SYNCED first (fetchContactIds) — unchanged, and kept
+ * behavior-equivalent with the CLI script. Two opt-in alternatives:
+ *   - dormant_only:true  → fetchDormantContactIds: lp_leads older than
+ *     dormant_days (default 60), not closed-won, freshest-dormant first.
+ *     Use this to get a REPRESENTATIVE S4.5 eligible-rate read — S4.5
+ *     targets dormant contacts, which the newest-synced scan front-loads
+ *     right past (newest-synced is dominated by active/booked/customers
+ *     that all suppress).
+ *   - contact_ids:[...]  → classify an explicit list (targeted checks).
+ *
  * Sync vs async
  * ─────────────
- * Single-contact runs and small batches (limit ≤ 100) run synchronously
- * and return full results in the response — typical case for spot-checks.
+ * Single-contact runs and small batches (limit ≤ 100, or an explicit list
+ * ≤ 100) run synchronously and return full results in the response —
+ * typical case for spot-checks.
  *
  * Larger batches kick off as fire-and-forget background tasks and return
  * a job_id immediately. Progress is queryable via the status endpoint.
@@ -42,6 +55,7 @@ import { scoreConfidence } from '../agentic/lead-state/confidence.js';
 
 const TRIGGER_SOURCE       = 'backfill';
 const SYNC_LIMIT_THRESHOLD = 100;  // limit ≤ this → sync mode
+const DEFAULT_DORMANT_DAYS = 60;   // dormant_only: lead age cutoff (days)
 
 // In-memory job registry. Map<jobId, jobState>.
 const jobs = new Map();
@@ -66,6 +80,52 @@ async function fetchContactIds(cap = 0) {
       .order('synced_at', { ascending: false })
       .range(from, from + PAGE - 1);
     if (error) throw new Error(`lp_leads scan failed at offset ${from}: ${error.message}`);
+    if (!data || data.length === 0) break;
+    for (const row of data) {
+      if (row.ghl_contact_id) all.add(row.ghl_contact_id);
+    }
+    if (data.length < PAGE) break;
+    from += PAGE;
+    if (cap > 0 && all.size >= cap) break;
+  }
+  let ids = Array.from(all);
+  if (cap > 0 && ids.length > cap) ids = ids.slice(0, cap);
+  return ids;
+}
+
+/**
+ * Scan lp_leads for distinct ghl_contact_id values in the DORMANT pool —
+ * leads created more than `dormantDays` ago and not closed-won, ordered
+ * FRESHEST-DORMANT first (created_at_lp DESC) so a capped sample leads
+ * with contacts that just crossed the dormancy threshold (most nurture-
+ * viable) rather than the oldest, likely-dead leads.
+ *
+ * This is a coarse candidate PREFILTER, not the eligibility decision: it
+ * biases the sample toward contacts that are plausibly dormant so the
+ * S45_* shapes actually get a chance to fire. The classifier still makes
+ * the real per-contact determination from full context (engagement
+ * recency, suppression, objection/demo signals), so recently-active-but-
+ * old leads that slip in get correctly suppressed downstream.
+ *
+ * `.not('closed_won','is',true)` keeps both false AND null (un-won) rows.
+ */
+async function fetchDormantContactIds(cap = 0, dormantDays = DEFAULT_DORMANT_DAYS) {
+  if (!supabase) throw new Error('Supabase not configured');
+  const days = Number.isFinite(dormantDays) && dormantDays > 0 ? dormantDays : DEFAULT_DORMANT_DAYS;
+  const cutoff = new Date(Date.now() - days * 86400000).toISOString();
+  const PAGE = 1000;
+  const all = new Set();
+  let from = 0;
+  while (true) {
+    const { data, error } = await supabase
+      .from('lp_leads')
+      .select('ghl_contact_id, created_at_lp, closed_won')
+      .not('ghl_contact_id', 'is', null)
+      .not('closed_won', 'is', true)
+      .lte('created_at_lp', cutoff)
+      .order('created_at_lp', { ascending: false })
+      .range(from, from + PAGE - 1);
+    if (error) throw new Error(`lp_leads dormant scan failed at offset ${from}: ${error.message}`);
     if (!data || data.length === 0) break;
     for (const row of data) {
       if (row.ghl_contact_id) all.add(row.ghl_contact_id);
@@ -184,50 +244,82 @@ export function registerAgenticLeadStateRoutes(app) {
   // POST /admin/agentic-lead-states/backfill
   //
   // Body:
-  //   { contact_id?: string, limit?: number, dry_run?: boolean }
+  //   { contact_id?: string,
+  //     contact_ids?: string[],
+  //     dormant_only?: boolean, dormant_days?: number,   // default 60
+  //     limit?: number, dry_run?: boolean }
+  //
+  // Candidate selection (first match wins):
+  //   - contact_id            → that one contact
+  //   - contact_ids[]         → exactly that list
+  //   - dormant_only:true     → dormant pool (lp_leads older than
+  //                             dormant_days, not closed-won), capped at limit
+  //   - otherwise             → newest-synced, capped at limit (default)
   //
   // Routing:
-  //   - contact_id set            → sync, 1 contact
-  //   - 0 < limit <= 100          → sync, up to `limit` contacts
-  //   - otherwise (full run)      → async, returns job_id
+  //   - contact_id set                       → sync, 1 contact
+  //   - explicit list of ≤ 100               → sync
+  //   - 0 < limit <= 100 (dormant/newest)    → sync
+  //   - otherwise (full run)                 → async, returns job_id
   //
   // Usage:
   //   # spot-check one contact
-  //   curl -X POST .../admin/agentic-lead-states/backfill \
-  //        -H "Content-Type: application/json" \
-  //        -d '{"contact_id":"y4dvOxtWW12xGrBavCUt","dry_run":true}'
+  //   curl ... -d '{"contact_id":"y4dvOxtWW12xGrBavCUt","dry_run":true}'
   //
-  //   # 50-contact dry-run preview
-  //   curl -X POST .../admin/agentic-lead-states/backfill \
-  //        -H "Content-Type: application/json" \
-  //        -d '{"limit":50,"dry_run":true}'
+  //   # 50-contact newest-synced dry-run preview
+  //   curl ... -d '{"limit":50,"dry_run":true}'
   //
-  //   # full backfill (async)
-  //   curl -X POST .../admin/agentic-lead-states/backfill \
-  //        -H "Content-Type: application/json" -d '{}'
+  //   # REPRESENTATIVE dormant-pool shadow pass (async)
+  //   curl ... -d '{"dormant_only":true,"limit":200}'
+  //
+  //   # classify a specific set
+  //   curl ... -d '{"contact_ids":["abc","def"]}'
+  //
+  //   # full newest-synced backfill (async)
+  //   curl ... -d '{}'
   // ───────────────────────────────────────────────────────────────
   app.post('/admin/agentic-lead-states/backfill', async (req, res) => {
-    const body      = req.body || {};
-    const contactId = body.contact_id || null;
-    const limit     = parseInt(body.limit, 10) || 0;
-    const dryRun    = body.dry_run === true;
+    const body        = req.body || {};
+    const contactId   = body.contact_id || null;
+    const limit       = parseInt(body.limit, 10) || 0;
+    const dryRun      = body.dry_run === true;
+    const dormantOnly = body.dormant_only === true;
+    const dormantDays = parseInt(body.dormant_days, 10) || DEFAULT_DORMANT_DAYS;
+    const explicitList = Array.isArray(body.contact_ids)
+      ? body.contact_ids.filter(id => typeof id === 'string' && id.length > 0)
+      : null;
+    const hasList = !!(explicitList && explicitList.length > 0);
 
     try {
-      // Build contact list
+      // Build contact list (first match wins)
       let contactIds;
+      let selection;
       if (contactId) {
         contactIds = [contactId];
+        selection = 'single';
+      } else if (hasList) {
+        contactIds = explicitList;
+        selection = 'explicit_list';
+      } else if (dormantOnly) {
+        contactIds = await fetchDormantContactIds(limit, dormantDays);
+        selection = `dormant(>=${dormantDays}d)`;
       } else {
         contactIds = await fetchContactIds(limit);
+        selection = 'newest_synced';
       }
 
-      const isSyncMode = contactId || (limit > 0 && limit <= SYNC_LIMIT_THRESHOLD);
+      const isSyncMode =
+        !!contactId ||
+        (hasList
+          ? explicitList.length <= SYNC_LIMIT_THRESHOLD
+          : (limit > 0 && limit <= SYNC_LIMIT_THRESHOLD));
 
       if (isSyncMode) {
         const summary = await runBackfill({ contactIds, dryRun, job: null });
         return res.json({
           ok: true,
           mode: 'sync',
+          selection,
           dry_run: dryRun,
           ...summary,
         });
@@ -239,6 +331,7 @@ export function registerAgenticLeadStateRoutes(app) {
         id: jobId,
         status: 'running',
         dry_run: dryRun,
+        selection,
         started_at: new Date().toISOString(),
         completed_at: null,
         total: contactIds.length,
@@ -264,6 +357,7 @@ export function registerAgenticLeadStateRoutes(app) {
       return res.status(202).json({
         ok: true,
         mode: 'async',
+        selection,
         job_id: jobId,
         total: contactIds.length,
         status_url: `/admin/agentic-lead-states/backfill/${jobId}`,
@@ -294,6 +388,7 @@ export function registerAgenticLeadStateRoutes(app) {
       job_id: job.id,
       status: job.status,
       dry_run: job.dry_run,
+      selection: job.selection,
       started_at: job.started_at,
       completed_at: job.completed_at,
       total: job.total,
