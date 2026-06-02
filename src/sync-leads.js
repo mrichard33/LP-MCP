@@ -44,6 +44,16 @@
 //
 //   Related: Rochelle Giron VQF4Qlb77XmNpjjCtZan; PR #306; commit ac00820.
 //
+// v10.1 (2026-06-02) — ghl_contact_id link no longer lost.
+//   buildLeadRow now coalesces deriveLeadGhlId() with the existing
+//   stored ghl_contact_id, and all three writers (upsertLeadOnly,
+//   processProspect, upsertLeadFromFlat) omit the column from the
+//   upsert payload when it would be null so a Pass 1 / FORCE_FULL_SYNC
+//   never clobbers a link established by the incremental phone/email
+//   match. Root cause of resolver Steps 0a/0b being dark for ~98% of
+//   lp_leads rows (the appointment-sync false-failure on field-set
+//   leads, 2026-06-02).
+//
 // v9.3 — Disposition-changed event now emits with the lognumber-
 //   preferred GHL contact ID (`newLeadGhlId`) instead of the bare
 //   `ghlId` from prospect-level matchToGHL.
@@ -136,8 +146,11 @@ function deriveLeadGhlId(lead, fallbackGhlId) {
 }
 
 // ─── Build the lead row payload (DRY helper) ─────────────────────
-function buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId) {
-  const leadGhlId = deriveLeadGhlId(lead, ghlId);
+function buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId, existingGhlId = null) {
+  // v10.1: never lose a previously-established link — fall back to the
+  // existing ghl_contact_id when neither lognumber nor the phone/email
+  // match (ghlId) resolves one this run.
+  const leadGhlId = deriveLeadGhlId(lead, ghlId) || existingGhlId || null;
 
   const apptSet = getField(lead, 'apptset', 'ApptSet');
   const sat = getField(lead, 'sat', 'Sat');
@@ -202,19 +215,20 @@ export async function upsertLeadOnly(prospect) {
     const lpProspectId = String(getField(prospect, 'cst_id', 'CstID', 'prospectid', 'ProspectID'));
 
     const newUpdatedAt = lpDateToEastern(getField(lead, 'lastchangedon', 'LastChangedOn'));
-    if (newUpdatedAt) {
-      const { data: existing } = await supabase.from('lp_leads')
-        .select('updated_at_lp, ghl_contact_id')
-        .eq('lp_lead_id', lpLeadId).single();
+    // v10.1: always read existing so we can (a) decide skip and (b) carry
+    // the existing ghl_contact_id into buildLeadRow. maybeSingle() returns
+    // null cleanly for brand-new leads instead of erroring.
+    const { data: existing } = await supabase.from('lp_leads')
+      .select('updated_at_lp, ghl_contact_id')
+      .eq('lp_lead_id', lpLeadId).maybeSingle();
 
-      if (existing?.updated_at_lp && existing.updated_at_lp === newUpdatedAt) {
-        const newLeadGhlId = deriveLeadGhlId(lead, null);
-        const needsGhlIdBackfill = !existing.ghl_contact_id && newLeadGhlId;
-        if (!needsGhlIdBackfill) {
-          _skipStats.leads++;
-          count++;
-          continue;
-        }
+    if (newUpdatedAt && existing?.updated_at_lp && existing.updated_at_lp === newUpdatedAt) {
+      const newLeadGhlId = deriveLeadGhlId(lead, null);
+      const needsGhlIdBackfill = !existing.ghl_contact_id && newLeadGhlId;
+      if (!needsGhlIdBackfill) {
+        _skipStats.leads++;
+        count++;
+        continue;
       }
     }
 
@@ -223,7 +237,12 @@ export async function upsertLeadOnly(prospect) {
       getField(lead, 'source', 'Source'), lpLeadId,
     );
 
-    const { row } = buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, null);
+    const { row } = buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, null, existing?.ghl_contact_id || null);
+
+    // v10.1: never overwrite an existing ghl_contact_id link with null.
+    // Omitting the column from the upsert payload preserves the stored
+    // value on conflict (Pass 1 / FORCE_FULL_SYNC must not wipe links).
+    if (row.ghl_contact_id == null) delete row.ghl_contact_id;
 
     const { error: upsertErr } = await supabase.from('lp_leads').upsert(row, { onConflict: 'lp_lead_id' });
     if (upsertErr) throw new Error(`Lead upsert failed for ${lpLeadId}: ${upsertErr.message}`);
@@ -319,8 +338,11 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
     }
 
     const { row, isApptSet, isDemoCompleted, isClosedWon } = buildLeadRow(
-      prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId
+      prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId, existing?.ghl_contact_id || null
     );
+
+    // v10.1: never overwrite an existing ghl_contact_id link with null.
+    if (row.ghl_contact_id == null) delete row.ghl_contact_id;
 
     const { error: upsertErr } = await supabase.from('lp_leads').upsert(row, { onConflict: 'lp_lead_id' });
     if (upsertErr) throw new Error(`Lead upsert failed for ${lpLeadId}: ${upsertErr.message}`);
@@ -509,7 +531,7 @@ export async function upsertLeadFromFlat(lp, ghlId) {
   const lpProspectId = String(getField(lp, 'cst_id', 'CstID', 'ProspectID') || '');
   const flatGhlId = deriveLeadGhlId(lp, ghlId);
 
-  await supabase.from('lp_leads').upsert({
+  const flatRow = {
     lp_lead_id:         lpLeadId,
     lp_prospect_id:     lpProspectId,
     ghl_contact_id:     flatGhlId,
@@ -529,7 +551,12 @@ export async function upsertLeadFromFlat(lp, ghlId) {
     created_at_lp:      lpDateToEastern(getField(lp, 'dateadded', 'DateAdded', 'entrydate', 'EntryDate')),
     updated_at_lp:      lpDateToEastern(getField(lp, 'lastchangedon', 'LastChangedOn')),
     synced_at:          new Date().toISOString(),
-  }, { onConflict: 'lp_lead_id' });
+  };
+
+  // v10.1: never overwrite an existing ghl_contact_id link with null.
+  if (flatRow.ghl_contact_id == null) delete flatRow.ghl_contact_id;
+
+  await supabase.from('lp_leads').upsert(flatRow, { onConflict: 'lp_lead_id' });
 }
 
 // v9.2: Export for use by other modules (e.g., one-shot backfill scripts)

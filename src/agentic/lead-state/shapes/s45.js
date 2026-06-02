@@ -5,9 +5,10 @@
  * S4.5 v2 (Agentic Seinfeld Nurture). Each shape:
  *   1. Tests its GATING condition (the defining behavioral signature).
  *      Returns null if not met — the classifier falls through to the next.
- *   2. Assembles the FULL present/conflicts signal Sets (every signal that
- *      genuinely fired, not just the defining one) so confidence reflects
- *      total evidence, not a single trigger.
+ *   2. Assembles the present/conflicts signal Sets purely from
+ *      presentSignals(ctx) — i.e. ONLY signals that genuinely fired — so
+ *      confidence is an honest measure of evidence, never inflated by a
+ *      signal the contact doesn't actually carry.
  *   3. Scores via scoreConfidence(state, { present, conflicts }).
  *   4. Returns null if the score is below CONFIDENCE_FLOOR — a weakly-
  *      matched state is no match. Otherwise returns { state, confidence,
@@ -31,7 +32,21 @@
  * COLD_NO_SIGNAL is a SEPARATE shape (shapes/cold.js) and is NOT
  * S4.5-eligible — it routes to S1.0. The classifier runs cold AFTER s45.
  *
+ * Confidence is deliberately CONSERVATIVE: a single strong signal (e.g. a
+ * trust objection + a disposition) lands around the 0.40 floor, well under
+ * the 0.75 auto-enroll bar. Multi-signal contacts clear the bar. If shadow
+ * data shows too few eligibles reaching 0.75, the volume lever is
+ * S45_ENROLL_MIN_CONFIDENCE (enrollment.js) or a deliberate SIGNAL_WEIGHTS
+ * rebalance (confidence.js) — NOT crediting signals that didn't fire.
+ *
  * v0.2.0 — 2026-06-02. Phase 2 initial.
+ * v0.2.1 — 2026-06-02. Scoring-accuracy fix: removed per-shape force-adds of
+ *          weighted signals (objection_tag/engagement_event/disposition/
+ *          recency/pressure_pattern) that could credit evidence the contact
+ *          did not actually carry (e.g. objection_tag on a PNQ-only
+ *          LONG_HORIZON; engagement_event on an estimate-only DORMANT).
+ *          Shapes now score solely from presentSignals(). Pre-release
+ *          correction (classifier never ran), so CLASSIFIER_VERSION holds.
  */
 
 import { STATES } from '../states.js';
@@ -54,9 +69,12 @@ import {
 } from '../signals/behavioral-signals.js';
 
 /**
- * Assemble the present/conflicts signal Sets shared by all behavioral
- * shapes. `present` = every weighted signal that genuinely fired.
- * `conflicts` (per-shape) = signals that argue AGAINST the chosen state.
+ * Assemble the present signal Set: every weighted signal that GENUINELY
+ * fired for this contact. Shapes do NOT add to this beyond what the
+ * extractors report — confidence stays an honest measure of evidence.
+ * Each shape's GATING condition already guarantees its defining signal is
+ * among these (e.g. isTrustRecovery ⇒ hasObjectionSignal ⇒ objection_tag;
+ * isDemoStall ⇒ hasPressurePattern ⇒ pressure_pattern).
  */
 function presentSignals(ctx) {
   const present = new Set();
@@ -88,12 +106,12 @@ function build(state, ctx, { present, conflicts, rule, notes }) {
 
 // ── 1. REAWAKENED ───────────────────────────────────────────────────
 // Was dormant, just re-engaged. Enters S4.5 at position 5 (states.js).
+// recentlyReengaged guarantees a recent touch (→ recency) and engagement
+// history; presentSignals credits the actual signals (engagement_event for
+// an email re-engagement, strong_intent for a VSL re-engagement).
 export function classifyReawakened(ctx) {
   if (!recentlyReengaged(ctx)) return null;
   const present = presentSignals(ctx);
-  // A fresh touch is the whole point — recency MUST count as evidence here.
-  present.add('recency');
-  present.add('engagement_event');
   return build(STATES.S45_REAWAKENED, ctx, {
     present,
     conflicts: new Set(),
@@ -107,8 +125,6 @@ export function classifyReawakened(ctx) {
 export function classifyDemoStall(ctx) {
   if (!isDemoStall(ctx)) return null;
   const present = presentSignals(ctx);
-  present.add('disposition');       // demo-completed contacts carry an LP disposition
-  present.add('pressure_pattern');  // isDemoStall => pressure-relevant
   // A recent re-engagement argues against treating this as a passive stall.
   const conflicts = new Set();
   const since = daysSinceEngagement(ctx);
@@ -126,7 +142,6 @@ export function classifyDemoStall(ctx) {
 export function classifyTrustRecovery(ctx) {
   if (!isTrustRecovery(ctx)) return null;
   const present = presentSignals(ctx);
-  present.add('objection_tag');
   return build(STATES.S45_TRUST_RECOVERY, ctx, {
     present,
     conflicts: new Set(),
@@ -136,11 +151,12 @@ export function classifyTrustRecovery(ctx) {
 }
 
 // ── 4. LONG_HORIZON ─────────────────────────────────────────────────
-// Timing / future-project signal, no active conversion.
+// Timing / future-project signal, no active conversion. The defining
+// signal is credited honestly by presentSignals: a timing OBJECTION tag →
+// objection_tag; the PNQ-disposition path → disposition (NOT objection_tag).
 export function classifyLongHorizon(ctx) {
   if (!isLongHorizon(ctx)) return null;
   const present = presentSignals(ctx);
-  present.add('objection_tag');
   return build(STATES.S45_LONG_HORIZON, ctx, {
     present,
     conflicts: new Set(),
@@ -151,12 +167,12 @@ export function classifyLongHorizon(ctx) {
 
 // ── 5. DORMANT_HIGH_INTENT ──────────────────────────────────────────
 // Showed strong intent but went dormant without converting (broadest net).
+// hasStrongIntent gate guarantees strong_intent is in presentSignals;
+// engagement_event is credited only if real opens/clicks/replies exist.
 export function classifyDormantHighIntent(ctx) {
   if (!isDormant(ctx)) return null;
   if (!hasStrongIntent(ctx)) return null;
   const present = presentSignals(ctx);
-  present.add('strong_intent');
-  present.add('engagement_event'); // intent implies prior engagement
   // Dormancy is the premise — a very recent touch would contradict it.
   const conflicts = new Set();
   const since = daysSinceEngagement(ctx);
