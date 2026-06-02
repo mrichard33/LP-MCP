@@ -88,8 +88,9 @@ import { resolveLPLeadId } from '../../lp-appointment-sync.js';
 import { sendGroupMeMessage } from '../../groupme.js';
 import { addGHLNote, updateGHLContactFields, applyGHLTag } from '../../ghl.js';
 import { formatLpSource, formatApptTime12h } from '../../format-helpers.js';
-import { isLPLeadId, ghlFetch } from '../helpers.js';
-import { parseLongDate, normalizeDateForComparison } from '../date-parsers.js';
+import { isLPLeadId } from '../helpers.js';
+import { getContactCached } from '../contact-cache.js';
+import { toLpApptDate, toLpApptTime, normalizeDateForComparison } from '../date-parsers.js';
 import { resolveContactInfo } from '../resolvers.js';
 import { buildRichNotification } from '../enrichment.js';
 
@@ -119,9 +120,10 @@ function hasMeaningfulCalendar(name) {
   return true;
 }
 
-export async function executeSetLPAppointment(action) {
+export async function executeSetLPAppointment(action, context = {}) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
+  const cache = context?._contactCache;
 
   let eventPayload = {};
   if (action.event_id) {
@@ -145,8 +147,7 @@ export async function executeSetLPAppointment(action) {
   } else {
     let ghlContact = null;
     try {
-      const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
-      ghlContact = ghlRes?.contact || null;
+      ghlContact = await getContactCached(contactId, cache);
     } catch (err) {
       console.warn(`[LP-APPT] GHL contact fetch failed for ${contactId}: ${err.message}`);
     }
@@ -219,20 +220,17 @@ export async function executeSetLPAppointment(action) {
   }
   if (!rawDate && contactId && !isLPLeadId(contactId)) {
     try {
-      const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
-      rawDate = ghlRes?.contact?.last_appointment_start_date || ghlRes?.contact?.lastAppointmentStartDate || null;
+      const c = await getContactCached(contactId, cache);
+      rawDate = c?.last_appointment_start_date || c?.lastAppointmentStartDate || null;
     } catch {}
   }
   if (!rawDate) throw new Error('Cannot resolve appointment date');
 
-  let apptDate;
-  if (rawDate.includes('-')) {
-    const [y, m, d] = rawDate.split('T')[0].split('-');
-    apptDate = `${m}/${d}/${y}`;
-  } else {
-    const longParsed = parseLongDate(rawDate);
-    apptDate = longParsed || rawDate;
-  }
+  // Validate/normalize to LP's required MM/DD/YYYY. Throw (loud, labeled in
+  // agent_actions.error_message) rather than passing a raw/garbage value
+  // straight to LP, which would surface as an opaque SetAppointment 400.
+  const apptDate = toLpApptDate(rawDate);
+  if (!apptDate) throw new Error(`Appointment date did not resolve to MM/DD/YYYY (raw="${rawDate}")`);
 
   // ─── Resolve appointment time ──────────────────────────────────────
   let rawTime = payload.appt_time || payload.appointment_time || eventPayload.appt_time || eventPayload.appointment_time || null;
@@ -242,22 +240,16 @@ export async function executeSetLPAppointment(action) {
   }
   if (!rawTime && contactId && !isLPLeadId(contactId)) {
     try {
-      const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
-      rawTime = ghlRes?.contact?.last_appointment_start_time || ghlRes?.contact?.lastAppointmentStartTime || null;
+      const c = await getContactCached(contactId, cache);
+      rawTime = c?.last_appointment_start_time || c?.lastAppointmentStartTime || null;
     } catch {}
   }
   if (!rawTime) throw new Error('Cannot resolve appointment time');
 
-  let apptTime = rawTime;
-  const match12 = apptTime.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
-  if (match12) {
-    let h = parseInt(match12[1], 10);
-    const min = match12[2], p = match12[3].toUpperCase();
-    if (p === 'AM' && h === 12) h = 0;
-    if (p === 'PM' && h !== 12) h += 12;
-    apptTime = `${String(h).padStart(2, '0')}:${min}`;
-  }
-  if (apptTime.length > 5) apptTime = apptTime.slice(0, 5);
+  // Validate/normalize to LP's required 24-hour HH:MM (same fail-loud
+  // rationale as appt_date above).
+  const apptTime = toLpApptTime(rawTime);
+  if (!apptTime) throw new Error(`Appointment time did not resolve to HH:MM 24h (raw="${rawTime}")`);
 
   const setBy = payload.set_by || '5686';
   // v2: don't default to literal 'N/A' — keep null so the conditional

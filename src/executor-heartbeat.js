@@ -95,12 +95,36 @@
 
 import supabase from './supabase.js';
 import { executeActions } from './action-executor.js';
+import { sendGroupMeMessage } from './groupme.js';
+import { shouldAlertQueueDepth, formatQueueAlert } from './executor-queue-alerts.js';
+
+// Phase 4 (2026-06-02) — queue-depth observability + alerting. A silent
+// multi-hour backlog used to be invisible; the heartbeat now surfaces
+// pending depth + oldest-pending age on /heartbeat-status and raises a
+// throttled GroupMe alert when the queue is unhealthy.
+const PENDING_ALERT_THRESHOLD = parseInt(
+  process.env.EXECUTOR_PENDING_ALERT_THRESHOLD || '500', 10
+);
+const OLDEST_AGE_ALERT_MS = parseInt(
+  process.env.EXECUTOR_OLDEST_AGE_ALERT_MS || `${30 * 60 * 1000}`, 10
+);
+const ALERT_COOLDOWN_MS = parseInt(
+  process.env.EXECUTOR_ALERT_COOLDOWN_MS || `${30 * 60 * 1000}`, 10
+);
+
+let lastQueueAlertAt = 0;
 
 const STALE_THRESHOLD_MS = parseInt(
   process.env.EXECUTOR_STALE_THRESHOLD_MS || `${6 * 60 * 1000}`, 10
 );
 const HEARTBEAT_INTERVAL_MS = parseInt(
-  process.env.EXECUTOR_HEARTBEAT_INTERVAL_MS || `${5 * 60 * 1000}`, 10
+  // Phase 2 (2026-06-02): in-process driver is now PRIMARY (not failover-only)
+  // — default 60s so the executor runs near-continuously and can spend GHL
+  // rate-limiter tokens as they refill. Safe because executeActions claims
+  // rows atomically (claim_agent_actions RPC), so overlap with the n8n cron
+  // backup can't double-fire. The module-level in-flight guard inside
+  // executeActions prevents the route + timer from stacking.
+  process.env.EXECUTOR_HEARTBEAT_INTERVAL_MS || '60000', 10
 );
 const FIRST_RUN_DELAY_MS = parseInt(
   process.env.EXECUTOR_HEARTBEAT_FIRST_RUN_DELAY_MS || `${3 * 60 * 1000}`, 10
@@ -150,6 +174,51 @@ async function hasPendingActions() {
 }
 
 /**
+ * Phase 4 — queue health snapshot for observability + alerting.
+ * Returns pending depth, oldest-pending age, and executing count.
+ */
+async function getQueueStats() {
+  const [pendingRes, oldestRes, executingRes] = await Promise.all([
+    supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'pending'),
+    supabase.from('agent_actions').select('created_at').eq('status', 'pending')
+      .order('created_at', { ascending: true }).limit(1),
+    supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'executing'),
+  ]);
+
+  const pendingCount = pendingRes.count || 0;
+  const oldestPendingAt = oldestRes.data?.[0]?.created_at || null;
+  const oldestAgeMs = oldestPendingAt ? Date.now() - Date.parse(oldestPendingAt) : null;
+  const executingCount = executingRes.count || 0;
+
+  return { pendingCount, oldestPendingAt, oldestAgeMs, executingCount };
+}
+
+/**
+ * Phase 4 — raise a throttled GroupMe alert when the queue is unhealthy
+ * (pending over threshold OR oldest pending too old). Cooldown prevents
+ * spamming every 60s heartbeat while a backlog persists. Best-effort: a
+ * send failure is logged, never thrown.
+ */
+async function maybeAlertQueueDepth(stats) {
+  const { alert, reasons } = shouldAlertQueueDepth(stats, {
+    pendingThreshold: PENDING_ALERT_THRESHOLD,
+    oldestAgeThresholdMs: OLDEST_AGE_ALERT_MS,
+  });
+  if (!alert) return { alerted: false };
+  if (Date.now() - lastQueueAlertAt < ALERT_COOLDOWN_MS) {
+    return { alerted: false, suppressed: 'cooldown', reasons };
+  }
+  lastQueueAlertAt = Date.now();
+  try {
+    await sendGroupMeMessage(formatQueueAlert(stats, reasons));
+    console.warn(`[ExecutorHeartbeat] queue-depth alert sent — ${reasons.join('; ')}`);
+  } catch (err) {
+    console.error(`[ExecutorHeartbeat] queue-depth alert send failed: ${err.message}`);
+  }
+  return { alerted: true, reasons };
+}
+
+/**
  * Check if the executor needs a failover kick. Returns:
  *   { needs_run, last_executed_at, age_ms, has_pending }
  *
@@ -179,9 +248,13 @@ async function checkExecutorHealth() {
     return { needs_run: true, last_executed_at: null, age_ms: null, has_pending: true };
   }
 
+  // Phase 2: PRIMARY driver. Whenever there is pending work, run — the old
+  // STALE_THRESHOLD "only if n8n looks dead" gate is dropped (claiming makes
+  // concurrent n8n + in-process runs safe). age_ms is still reported for
+  // observability.
   const ageMs = Date.now() - Date.parse(lastIso);
   return {
-    needs_run: ageMs >= STALE_THRESHOLD_MS,
+    needs_run: true,
     last_executed_at: lastIso,
     age_ms: ageMs,
     has_pending: true,
@@ -195,6 +268,16 @@ async function checkExecutorHealth() {
 export async function runHeartbeat({ force = false } = {}) {
   if (process.env.EXECUTOR_HEARTBEAT_DISABLED === 'true') {
     return { skipped: true, reason: 'EXECUTOR_HEARTBEAT_DISABLED=true' };
+  }
+
+  // Phase 4 — queue observability + throttled backlog alert, every cycle
+  // (independent of whether we fire the executor). Best-effort.
+  let queueStats = null;
+  try {
+    queueStats = await getQueueStats();
+    await maybeAlertQueueDepth(queueStats);
+  } catch (err) {
+    console.warn(`[ExecutorHeartbeat] queue stats/alert failed: ${err.message}`);
   }
 
   const health = await checkExecutorHealth();
@@ -211,20 +294,21 @@ export async function runHeartbeat({ force = false } = {}) {
       age_ms: health.age_ms,
       has_pending: health.has_pending,
       stale_threshold_ms: STALE_THRESHOLD_MS,
+      queue_stats: queueStats,
     };
   }
 
   const ageDescription = health.age_ms != null
-    ? `${Math.round(health.age_ms / 1000)}s stale`
+    ? `last run ${Math.round(health.age_ms / 1000)}s ago`
     : 'no prior execution';
   console.log(
-    `[ExecutorHeartbeat] FAILOVER — firing executor (${ageDescription}, threshold ${STALE_THRESHOLD_MS}ms${force ? ', forced' : ''})`
+    `[ExecutorHeartbeat] Firing executor (primary; ${ageDescription}${force ? ', forced' : ''})`
   );
 
   const startedAt = Date.now();
   let result;
   try {
-    result = await executeActions({ limit: 50 });
+    result = await executeActions();
   } catch (err) {
     console.error(`[ExecutorHeartbeat] executeActions threw: ${err.message}`);
     return {
@@ -248,6 +332,7 @@ export async function runHeartbeat({ force = false } = {}) {
     last_executed_at_before: health.last_executed_at,
     age_ms_before: health.age_ms,
     executor_result: result,
+    queue_stats: queueStats,
     elapsed_ms: Date.now() - startedAt,
   };
 }
@@ -303,13 +388,32 @@ export function registerExecutorHeartbeatRoutes(app) {
 
   app.get('/n8n/decision-engine/heartbeat-status', async (req, res) => {
     try {
-      const health = await checkExecutorHealth();
+      const [health, queueStats] = await Promise.all([
+        checkExecutorHealth(),
+        getQueueStats().catch((err) => {
+          console.warn(`[ExecutorHeartbeat] queue stats failed: ${err.message}`);
+          return null;
+        }),
+      ]);
+      const alertEval = queueStats
+        ? shouldAlertQueueDepth(queueStats, {
+            pendingThreshold: PENDING_ALERT_THRESHOLD,
+            oldestAgeThresholdMs: OLDEST_AGE_ALERT_MS,
+          })
+        : { alert: false, reasons: [] };
       res.json({
         success: true,
         ...health,
         stale_threshold_ms: STALE_THRESHOLD_MS,
         heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
         disabled: process.env.EXECUTOR_HEARTBEAT_DISABLED === 'true',
+        queue_stats: queueStats,
+        queue_alert: alertEval,
+        alert_thresholds: {
+          pending: PENDING_ALERT_THRESHOLD,
+          oldest_age_ms: OLDEST_AGE_ALERT_MS,
+          cooldown_ms: ALERT_COOLDOWN_MS,
+        },
       });
     } catch (err) {
       res.status(500).json({ success: false, error: err.message });
