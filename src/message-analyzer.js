@@ -216,7 +216,16 @@ const ANALYSIS_RATE_LIMIT = parseInt(process.env.ANALYSIS_RATE_LIMIT || '100', 1
 // 2 minutes is more than enough for that. If a customer legitimately sends
 // the same identical string twice within 2 min, we still skip (likely retry).
 const ANALYSIS_CACHE_TTL_MS = parseInt(process.env.ANALYSIS_CACHE_TTL_MS || '120000', 10);
-const MODEL = 'claude-sonnet-4-20250514';
+// Model is env-overridable so a model retirement is an env flip, not a deploy.
+const MODEL = process.env.MESSAGE_ANALYZER_MODEL || 'claude-sonnet-4-20250514';
+
+// v1.11 (2026-06-02) — Hard ceiling on the whole analyze path. buildLeadContext
+// makes unbounded Supabase calls (the JS client has no abort support); a hung
+// query (lock/pool contention) stalls analyzeMessage forever, emitting NEITHER
+// ai.analysis_completed NOR ai.analysis_failed — a silent black hole. Racing the
+// work against this timeout converts any hang into a thrown error that hits the
+// catch, emits ai.analysis_failed, and frees the queue.
+const ANALYZE_TIMEOUT_MS = parseInt(process.env.ANALYZE_TIMEOUT_MS || '40000', 10);
 
 // v1.4: per-message slice cap when serializing conversation_recent for
 // the AI prompt. Was 150 in v1.1-v1.3 — too short to contain CTAs that
@@ -484,6 +493,18 @@ SA5 (Home Value Increase) — investment/ROI/resale thinking
 
 NOTE: Story arcs are for OBJECTION HANDLING. When a lead has accepted a CTA (see CTA-AFFIRMATIVE OVERRIDE), no story arc is needed — set recommended_story_arc to null.`;
 
+// v1.11 — Promise timeout wrapper. Rejects with a labeled error if `promise`
+// hasn't settled within `ms`. The underlying work is not cancelled (the JS
+// Supabase client has no abort), but the analyze path stops waiting and the
+// caller's catch emits ai.analysis_failed so the event is visible + retriable.
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // CLAUDE API CALL
 // ═══════════════════════════════════════════════════════════════════
@@ -697,7 +718,15 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
   const startTime = Date.now();
 
   try {
-    const context = await buildLeadContext(ghlContactId, { includeConversation: true, skipCache: false });
+    // v1.11: hard timeout — a hung Supabase call in buildLeadContext must not
+    // stall the analyzer silently (the 5/29–6/2 outage: every reply entered
+    // analyzeMessage, stalled here, emitted no event, and the reply buffer had
+    // already marked the source event processed → silent loss).
+    const context = await withTimeout(
+      buildLeadContext(ghlContactId, { includeConversation: true, skipCache: false }),
+      ANALYZE_TIMEOUT_MS,
+      'buildLeadContext',
+    );
     const rawAnalysis = await callClaude(messageText, context);
     const analysis = validateAnalysis(rawAnalysis);
     if (!analysis) {
@@ -826,6 +855,11 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
 
   } catch (err) {
     console.error(`[MessageAnalyzer] ❌ Failed for ${ghlContactId}:`, err.message);
+    // v1.11: clear the dedup slot on failure so a retry of THIS message is not
+    // suppressed by the v1.8 atomic-claim cache. Without this, a failed analysis
+    // blocks re-analysis for the full cache TTL even though no event was produced
+    // — defeating the buffer/processing-cycle retry path.
+    analysisCache.delete(buildCacheKey(ghlContactId, messageText));
     await emitEvent({
       event_type: 'ai.analysis_failed',
       source: 'message_analyzer',
