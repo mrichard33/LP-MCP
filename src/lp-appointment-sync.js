@@ -135,7 +135,7 @@ import {
 } from './ghl.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken } from './ghl-rate-limiter.js';
-import { formatLpSource } from './format-helpers.js';
+import { formatLpSource, formatApptTime12h } from './format-helpers.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
@@ -1090,11 +1090,11 @@ async function syncAppointmentToLP({
   ).catch(() => {});
 
   await sendGroupMeMessage(
-    `📅 LP Appointment Set (v5.1.10 ID-first)\n` +
+    `📅 LP Appointment Set\n` +
     `👤 ${contactName || contactId}\n` +
-    `📋 LP Lead: ${ldsId} (${source}, step ${step}) | Prospect: ${prospectId || 'N/A'}\n` +
+    `📋 LP Lead: ${ldsId} | Prospect: ${prospectId || 'N/A'}\n` +
     (lpSourceLine ? `📋 Src: ${lpSourceLine}\n` : '') +
-    `📅 ${apptDate} ${apptTime}${calendarSegmentGroupMe}`
+    `📅 ${apptDate} ${formatApptTime12h(apptTime)}${calendarSegmentGroupMe}`
   ).catch(() => {});
 
   console.log(`[LP-APPT] ✅ Done: lds_id=${ldsId}, ${apptDate} ${apptTime}`);
