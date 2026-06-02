@@ -103,6 +103,7 @@ import { registerRateLimiterRoutes } from '../ghl-rate-limiter.js';
 import { getEventContext } from './resolvers.js';
 import { processApprovalQueue } from './approval-path.js';
 import { reapStuckActions } from './reaper.js';
+import { runPool, groupByBatch } from './concurrency.js';
 
 // MVI v2.5 — outbound dedup + Layer 3 dispatch
 import { tryAcquireLock, releaseLock } from '../services/outbound-locks.js';
@@ -447,86 +448,161 @@ async function executeSingleAction(action, batchContext = {}, priorBatchResults 
   }
 }
 
-export async function executeActions({ limit = 50 } = {}) {
-  const startTime = Date.now();
+// ═══════════════════════════════════════════════════════════════════
+// PHASE 2 (2026-06-02) — Safe-claimed bounded concurrency
+//
+// Before: executeActions pulled up to 50 pending rows with a plain SELECT and
+// ran batches serially, capping drain at ~80/hr — far under the real ceiling
+// (the shared GHL token bucket in ghl-rate-limiter.js: 40 calls/min ≈
+// ~1,000 actions/hr at ~2 GHL calls each). Now we CLAIM rows atomically via the
+// claim_agent_actions() Postgres RPC (UPDATE … FOR UPDATE SKIP LOCKED), so
+// concurrent drivers (n8n cron + the in-process primary scheduler) receive
+// disjoint work and never double-fire non-idempotent actions. Within a run we
+// group claimed rows by batch_id and run independent batches through a small
+// async pool; a batch's own actions still run serially in sequence_order.
+//
+// Claiming is CHUNKED (EXECUTOR_CLAIM_CHUNK) so the time-budget cutoff can
+// never strand more than one chunk in 'executing' (the reaper recovers those
+// after 10 min). RUN_BUDGET_MS is kept well under the 10-min reaper age and
+// under the 60s scheduler cadence.
+// ═══════════════════════════════════════════════════════════════════
 
-  // Phase 0: reap any 'executing' actions stuck from a killed process,
-  // and any orphaned 'approved' status rows from the legacy MCP
-  // approve_action bug (fixed in 2ac7f25 on 2026-04-28). Requeues
-  // idempotent ones to 'pending' (they'll run in phase 2 below) and
-  // fails non-idempotent / retry-exhausted ones with an audit trail.
-  const reaperResult = await reapStuckActions();
+const EXECUTOR_BATCH_LIMIT   = Math.max(1, parseInt(process.env.EXECUTOR_BATCH_LIMIT   || '250', 10));
+const EXECUTOR_CONCURRENCY   = Math.max(1, parseInt(process.env.EXECUTOR_CONCURRENCY   || '4', 10));
+const EXECUTOR_RUN_BUDGET_MS = Math.max(1000, parseInt(process.env.EXECUTOR_RUN_BUDGET_MS || '50000', 10));
+const EXECUTOR_CLAIM_CHUNK   = Math.max(1, parseInt(process.env.EXECUTOR_CLAIM_CHUNK   || '25', 10));
 
-  // Phase 1: process any pending_approval actions (send GroupMe cards).
-  const approvalRequestsSent = await processApprovalQueue();
+// Module-level in-flight guard. Protects BOTH entry points (the n8n /execute
+// route AND the 60s in-process scheduler) from stacking into wasteful empty
+// churn. Claiming already makes overlap *correct*; this just avoids redundant
+// work and overlapping reaper/approval passes.
+let executorRunning = false;
 
-  // Phase 2: execute actions whose status is 'pending' (approved or auto-approved).
-  // Pull order (sql/020 — priority lanes, 2026-05-07):
-  //   1. priority ASC      — customer-facing (10) before background batch (200)
-  //   2. created_at ASC    — within a lane, oldest first (FIFO)
-  //   3. sequence_order ASC — within a batch, respect intra-batch order
-  // The partial index idx_aa_priority_pull (status=pending) covers this exactly.
-  const { data: actions, error } = await supabase.from('agent_actions')
+/**
+ * Atomically claim up to `n` pending actions via the claim_agent_actions RPC
+ * (flips them to 'executing' and returns them). Falls back to the legacy
+ * non-claiming SELECT if the RPC is missing (deploy-before-DDL grace) — in that
+ * mode rows are NOT locked, so the caller must stay single-pass / single-driver.
+ *
+ * @returns {Promise<{rows: object[], claimed: boolean}>} claimed=false ⇒ legacy path
+ */
+async function claimActions(n) {
+  const { data, error } = await supabase.rpc('claim_agent_actions', { p_limit: n });
+  if (!error) return { rows: data || [], claimed: true };
+
+  const missing = /does not exist|could not find|undefined function|42883|schema cache/i.test(error.message || '');
+  if (!missing) throw new Error(`claim_agent_actions RPC failed: ${error.message}`);
+
+  console.warn('[ActionExecutor] claim_agent_actions RPC missing — falling back to legacy non-claiming SELECT (single-driver only). Create the RPC to enable concurrency.');
+  const { data: rows, error: selErr } = await supabase.from('agent_actions')
     .select('*')
     .eq('status', 'pending')
     .order('priority', { ascending: true, nullsFirst: false })
     .order('created_at', { ascending: true })
     .order('sequence_order', { ascending: true })
-    .limit(limit);
+    .limit(n);
+  if (selErr) throw new Error(selErr.message);
+  return { rows: rows || [], claimed: false };
+}
 
-  if (error) return { success: false, error: error.message };
-  if (!actions?.length) {
+/**
+ * Run one batch's actions serially in sequence_order. Preserves the original
+ * semantics: a hard `failed` stops the batch; `rejected_by_validation` does
+ * NOT (a single invariant violation shouldn't kill unrelated routing).
+ */
+async function runBatch(batch) {
+  const batchContext = {};
+  const priorBatchResults = [];
+  const out = [];
+  for (const a of batch) {
+    const r = await executeSingleAction(a, batchContext, priorBatchResults);
+    out.push(r);
+    priorBatchResults.push({ ...r, action: a });
+    if (r.status === 'failed') break;
+  }
+  return out;
+}
+
+export async function executeActions({ limit } = {}) {
+  const startTime = Date.now();
+
+  // In-flight guard — one run at a time per process (covers the n8n route and
+  // the in-process scheduler). Claiming makes overlap safe; this avoids churn.
+  if (executorRunning) {
+    return { success: true, skipped: true, reason: 'already_running' };
+  }
+  executorRunning = true;
+
+  try {
+    // Phase 0: reap stuck 'executing' (killed-process zombies) + orphaned
+    // 'approved' rows. Phase 1: send pending_approval GroupMe cards.
+    const reaperResult = await reapStuckActions();
+    const approvalRequestsSent = await processApprovalQueue();
+
+    // Phase 2: claim → group → bounded-concurrent execute, chunked, until the
+    // per-run limit or the wall-clock budget is hit. Pull order is enforced by
+    // the claim RPC (priority ASC NULLS LAST, created_at ASC, sequence_order
+    // ASC — matches idx_aa_priority_pull).
+    const totalLimit = Math.max(1, limit || EXECUTOR_BATCH_LIMIT);
+    const results = [];
+    let completed = 0, failed = 0, rejectedByValidation = 0;
+    let claimedTotal = 0, chunks = 0, budgetExhausted = false, usedLegacyPath = false;
+
+    while (claimedTotal < totalLimit) {
+      if (Date.now() - startTime >= EXECUTOR_RUN_BUDGET_MS) { budgetExhausted = true; break; }
+
+      const want = Math.min(EXECUTOR_CLAIM_CHUNK, totalLimit - claimedTotal);
+      const { rows, claimed } = await claimActions(want);
+      if (!claimed) usedLegacyPath = true;
+      if (!rows.length) break;
+      claimedTotal += rows.length;
+      chunks++;
+
+      const batches = groupByBatch(rows);
+      const batchResults = await runPool(batches, EXECUTOR_CONCURRENCY, runBatch);
+      for (const br of batchResults) {
+        for (const r of br) {
+          results.push(r);
+          if (r.status === 'completed') completed++;
+          else if (r.status === 'failed') failed++;
+          else if (r.status === 'rejected_by_validation') rejectedByValidation++;
+        }
+      }
+
+      // Legacy fallback returns rows still in 'pending' (no lock); looping would
+      // re-pull the same rows. One pass only in that mode.
+      if (!claimed) break;
+    }
+
+    const elapsed = Date.now() - startTime;
+    console.log(
+      `[ActionExecutor] Done: ${completed} completed, ${failed} failed, ` +
+      `${rejectedByValidation} rejected_by_validation across ${chunks} chunk(s), ` +
+      `${claimedTotal} claimed (concurrency=${EXECUTOR_CONCURRENCY})` +
+      `${budgetExhausted ? ' [budget exhausted]' : ''}${usedLegacyPath ? ' [legacy-select fallback]' : ''} (${elapsed}ms)`
+    );
+
     return {
       success: true,
-      actions_executed: 0,
+      actions_executed: results.length,
+      completed,
+      failed,
+      rejected_by_validation: rejectedByValidation,
+      retrying: results.filter(r => r.status === 'pending').length,
       approval_requests_sent: approvalRequestsSent,
       stuck_actions_reaped: reaperResult.reaped || 0,
-      elapsed_ms: Date.now() - startTime,
+      reaper_detail: reaperResult.reaped > 0 ? reaperResult : undefined,
+      claimed_total: claimedTotal,
+      chunks,
+      budget_exhausted: budgetExhausted,
+      concurrency: EXECUTOR_CONCURRENCY,
+      used_legacy_path: usedLegacyPath || undefined,
+      results,
+      elapsed_ms: elapsed,
     };
+  } finally {
+    executorRunning = false;
   }
-
-  const batches = new Map();
-  for (const a of actions) {
-    const k = a.batch_id || `s_${a.id}`;
-    if (!batches.has(k)) batches.set(k, []);
-    batches.get(k).push(a);
-  }
-  for (const b of batches.values()) {
-    b.sort((a, b) => (a.sequence_order || 0) - (b.sequence_order || 0));
-  }
-
-  console.log(`[ActionExecutor] Executing ${actions.length} actions in ${batches.size} batches...`);
-  const results = [];
-  let completed = 0, failed = 0, rejectedByValidation = 0;
-  for (const [, ba] of batches) {
-    const batchContext = {};
-    const priorBatchResults = [];
-    for (const a of ba) {
-      const r = await executeSingleAction(a, batchContext, priorBatchResults);
-      results.push(r);
-      priorBatchResults.push({ ...r, action: a });
-      if (r.status === 'completed') completed++;
-      else if (r.status === 'failed') { failed++; break; }
-      else if (r.status === 'rejected_by_validation') rejectedByValidation++;
-      // 'rejected_by_validation' does NOT break the batch — siblings continue.
-      // A single invariant violation shouldn't kill unrelated routing.
-    }
-  }
-  const elapsed = Date.now() - startTime;
-  console.log(`[ActionExecutor] Done: ${completed} completed, ${failed} failed, ${rejectedByValidation} rejected_by_validation (${elapsed}ms)`);
-  return {
-    success: true,
-    actions_executed: results.length,
-    completed,
-    failed,
-    rejected_by_validation: rejectedByValidation,
-    retrying: results.filter(r => r.status === 'pending').length,
-    approval_requests_sent: approvalRequestsSent,
-    stuck_actions_reaped: reaperResult.reaped || 0,
-    reaper_detail: reaperResult.reaped > 0 ? reaperResult : undefined,
-    results,
-    elapsed_ms: elapsed,
-  };
 }
 
 /**
@@ -611,7 +687,7 @@ export async function executeActionById(actionId, opts = {}) {
 export function registerActionExecutorRoutes(app) {
   app.post('/n8n/decision-engine/execute', async (req, res) => {
     try {
-      res.json(await executeActions({ limit: req.body?.limit || 50 }));
+      res.json(await executeActions({ limit: req.body?.limit }));
     } catch (err) {
       res.status(500).json({ success: false, error: err.message });
     }
