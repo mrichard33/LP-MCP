@@ -1,7 +1,7 @@
 /**
  * Lead-State Taxonomy — src/agentic/lead-state/states.js
  *
- * The FROZEN 14-state vocabulary. Every classification result must be
+ * The FROZEN 15-state vocabulary. Every classification result must be
  * one of these. Adding a new state requires a documented framework
  * decision — don't extend inline.
  *
@@ -14,9 +14,10 @@
  *   RECENT_REP_CONTACT,
  *   CUSTOMER_P2,
  *   SUPPRESSED_POST_DEMO_DECLINE,
+ *   SUPPRESSED_CONFIRMED_LOSS,
  *   SUPPRESSED_LEGAL,
  *   COLD_NO_SIGNAL,
- *   UNCLASSIFIED               — non-S4.5 states (9 total: 7 suppression +
+ *   UNCLASSIFIED               — non-S4.5 states (10 total: 8 suppression +
  *                                COLD_NO_SIGNAL + UNCLASSIFIED)
  *
  * COLD_NO_SIGNAL is technically not a suppression (it routes to S1.0
@@ -40,6 +41,23 @@
  *   DORMANT_HIGH_INTENT). This is a suppression-level guard checked before
  *   any eligible shape. Declines route to the loss/reactivation track
  *   (S5.2 / L.*), not deletion.
+ *
+ * 2026-06-03 — Added SUPPRESSED_CONFIRMED_LOSS (taxonomy 14 → 15).
+ *   A confirmed competitor / not-interested LOSS is recorded in GHL tags
+ *   (loss-reason:*, objection-confirmed:not-interested,
+ *   p3:not-interested-now, concern-expressed:competitor) INDEPENDENT of
+ *   the LP disposition_code. SUPPRESSED_POST_DEMO_DECLINE only catches the
+ *   OPPFDN/FDNS disposition codes — so a lost contact whose disposition is
+ *   CXL (or any non-demo-decline code) fell through to the eligible shapes
+ *   and was classified eligible. Surfaced live by Gerald Aloia
+ *   (zrjJPmKbjX3TZpHiEuVX): tags loss-reason:not-interested +
+ *   p3:not-interested-now + objection-confirmed:not-interested, AI summary
+ *   "hired another company, no longer interested," disposition CXL — yet
+ *   classified S45_TRUST_RECOVERY 0.90 and auto-enrolled into S4.5. A
+ *   bought-elsewhere "no" is exactly the contact the follow-up funnel must
+ *   SUPPRESS. Like the post-demo decline, this is a suppression-level guard
+ *   ahead of every eligible shape; routes to loss/reactivation (L.* / P3),
+ *   not narrative nurture.
  */
 
 // ── State identifiers ───────────────────────────────────────────────
@@ -59,6 +77,7 @@ export const STATES = Object.freeze({
   RECENT_REP_CONTACT:           'RECENT_REP_CONTACT',
   CUSTOMER_P2:                  'CUSTOMER_P2',
   SUPPRESSED_POST_DEMO_DECLINE: 'SUPPRESSED_POST_DEMO_DECLINE',
+  SUPPRESSED_CONFIRMED_LOSS:    'SUPPRESSED_CONFIRMED_LOSS',
   SUPPRESSED_LEGAL:             'SUPPRESSED_LEGAL',
 
   // Non-S4.5 behavioral / default states
@@ -83,6 +102,7 @@ export const SUPPRESSION_STATES = Object.freeze([
   STATES.RECENT_REP_CONTACT,
   STATES.CUSTOMER_P2,
   STATES.SUPPRESSED_POST_DEMO_DECLINE,
+  STATES.SUPPRESSED_CONFIRMED_LOSS,
   STATES.SUPPRESSED_LEGAL,
 ]);
 
