@@ -1,24 +1,31 @@
 /**
  * LLM Client — src/llm-client.js
  *
- * Provider-aware LLM caller with PER-FUNCTION model selection via env.
+ * Provider-aware LLM caller with PER-FUNCTION and PER-GROUP model selection
+ * via env.
  *
  * Every LLM-calling component passes a logical function key (`fn`) — e.g.
  * 'message_analyzer', 'response_generator', 'nurture_generator',
- * 'message_score', 'appt_notification'. The provider and model for that
- * function are resolved from environment variables at call time, so each
- * function can run on its own model (and, if desired, its own provider)
- * without any code change.
+ * 'message_score', 'appt_notification'. Each function belongs to a GROUP
+ * ('decision_engine' for analysis/scoring/classification, 'customer_facing'
+ * for text a human reads). The provider and model are resolved from
+ * environment variables at call time, so each function — or a whole group —
+ * can run on its own model/provider with no code change.
  *
  * ─── ENV CONTRACT ───────────────────────────────────────────────────
  *
- * Globals (fallbacks for every function):
+ * Globals (final fallback for every function):
  *   LLM_PROVIDER            'anthropic' (default) | 'openai'
  *   LLM_MODEL_ANTHROPIC     default Anthropic model (default: claude-sonnet-4-20250514)
  *   LLM_MODEL_OPENAI        default OpenAI model    (default: gpt-5.4-mini)
  *   LLM_TIMEOUT_MS          per-call timeout ms     (default: 30000)
  *   ANTHROPIC_VERSION       anthropic-version header (default: 2023-06-01)
  *   ANTHROPIC_API_KEY / OPENAI_API_KEY   provider credentials
+ *
+ * Group overrides (GROUP = 'DECISION_ENGINE' | 'CUSTOMER_FACING'):
+ *   <GROUP>_PROVIDER        provider for every fn in the group
+ *   <GROUP>_MODEL_ANTHROPIC Anthropic model for the group
+ *   <GROUP>_MODEL_OPENAI    OpenAI model for the group
  *
  * Per-function overrides (FN = the function key upper-cased, non-alnum → '_'):
  *   <FN>_PROVIDER           override provider for this function only
@@ -27,30 +34,33 @@
  *   <FN>_MODEL              legacy single-model var; treated as the Anthropic
  *                           model (back-compat with existing *_MODEL vars)
  *
- * Resolution (per call):
- *   provider = <FN>_PROVIDER || LLM_PROVIDER || 'anthropic'
+ * Resolution (per call, most specific wins):
+ *   provider = <FN>_PROVIDER || <GROUP>_PROVIDER || LLM_PROVIDER || 'anthropic'
  *   model    = <FN>_MODEL_<PROVIDER>
  *              || (<FN>_MODEL, only when provider === 'anthropic')
+ *              || <GROUP>_MODEL_<PROVIDER>
  *              || LLM_MODEL_<PROVIDER>
  *              || built-in default for that provider
  *
- * The model is provider-suffixed ON PURPOSE: flipping a function (or the
- * global) to OpenAI automatically selects the OpenAI model string and never
- * sends a Claude model name to OpenAI (or vice-versa).
+ * The model is provider-suffixed ON PURPOSE: flipping a function or group to
+ * OpenAI automatically selects the OpenAI model string and never sends a Claude
+ * model name to OpenAI (or vice-versa).
  *
  * Examples:
- *   # Point ONLY the analyzer at OpenAI GPT-5.4 Mini, leave the rest on Anthropic:
+ *   # Mark's intended split — two vars move whole categories:
+ *   DECISION_ENGINE_PROVIDER=openai
+ *   DECISION_ENGINE_MODEL_OPENAI=gpt-5.4-mini
+ *   CUSTOMER_FACING_PROVIDER=anthropic
+ *   CUSTOMER_FACING_MODEL_ANTHROPIC=claude-sonnet-4-20250514
+ *
+ *   # Point ONLY the analyzer at OpenAI, leave its group on whatever it is:
  *   MESSAGE_ANALYZER_PROVIDER=openai
  *   MESSAGE_ANALYZER_MODEL_OPENAI=gpt-5.4-mini
  *
- *   # Move EVERYTHING to OpenAI with one model, override the reply-writer to a bigger one:
+ *   # Move EVERYTHING to OpenAI with one model, override the reply-writer:
  *   LLM_PROVIDER=openai
  *   LLM_MODEL_OPENAI=gpt-5.4-mini
  *   RESPONSE_GENERATOR_MODEL_OPENAI=gpt-5.4
- *
- *   # Give the analyzer a different Anthropic model than the nurture writer:
- *   MESSAGE_ANALYZER_MODEL_ANTHROPIC=claude-haiku-4-5-20251001
- *   NURTURE_GENERATOR_MODEL_ANTHROPIC=claude-sonnet-4-20250514
  *
  * NOTE: model ids must match the provider's catalog EXACTLY. Confirm the
  * current id (e.g. the precise GPT-5.4 Mini id) in the provider dashboard
@@ -64,8 +74,8 @@ const LLM_TIMEOUT_MS = parseInt(process.env.LLM_TIMEOUT_MS || '30000', 10);
 
 const GLOBAL_PROVIDER = (process.env.LLM_PROVIDER || 'anthropic').toLowerCase();
 
-// Last-resort provider defaults (used only when no per-function or global
-// model var is set). Override via LLM_MODEL_ANTHROPIC / LLM_MODEL_OPENAI.
+// Last-resort provider defaults (used only when no per-function, group, or
+// global model var is set). Override via LLM_MODEL_ANTHROPIC / LLM_MODEL_OPENAI.
 const BUILTIN_DEFAULT_MODEL = {
   anthropic: process.env.LLM_MODEL_ANTHROPIC || 'claude-sonnet-4-20250514',
   openai: process.env.LLM_MODEL_OPENAI || 'gpt-5.4-mini',
@@ -73,23 +83,52 @@ const BUILTIN_DEFAULT_MODEL = {
 
 const SUPPORTED_PROVIDERS = new Set(['anthropic', 'openai']);
 
-// Normalize a function key to an ENV prefix.
-//   'message_analyzer' -> 'MESSAGE_ANALYZER'
+// fn key → group. Group-level env vars (<GROUP>_PROVIDER / <GROUP>_MODEL_*) set
+// a whole category at once; a per-function var overrides its group. ADD every
+// new LLM call site here as it adopts the client. Unmapped fns simply have no
+// group tier and fall through per-fn → global.
+const FUNCTION_GROUPS = {
+  // decision engine — analysis / scoring / classification (JSON outputs)
+  message_analyzer: 'decision_engine',
+  message_score: 'decision_engine',
+  message_content_scorer: 'decision_engine',
+  intent_scorer: 'decision_engine',
+  appointment_intelligence: 'decision_engine',
+  cancellation_intelligence: 'decision_engine',
+  // customer-facing — text a human reads
+  response_generator: 'customer_facing',
+  nurture_generator: 'customer_facing',
+  agentic_callback: 'customer_facing',
+  appt_notification: 'customer_facing',
+  appointment_body: 'customer_facing',
+  cancellation_body: 'customer_facing',
+};
+
+// Normalize a function/group key to an ENV prefix.
+//   'message_analyzer'   -> 'MESSAGE_ANALYZER'
 //   'response-generator' -> 'RESPONSE_GENERATOR'
-function envPrefix(fn) {
-  return String(fn || '')
+//   'decision_engine'    -> 'DECISION_ENGINE'
+function envPrefix(key) {
+  return String(key || '')
     .toUpperCase()
     .replace(/[^A-Z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '');
 }
 
 /**
- * Resolve { provider, model } for a function key from env. Pure / no I/O —
- * safe to call for logging or pre-flight checks.
+ * Resolve { provider, model, group } for a function key from env. Pure / no
+ * I/O — safe to call for logging or pre-flight checks.
  */
 export function resolveLLM(fn) {
   const P = envPrefix(fn);
-  let provider = (process.env[`${P}_PROVIDER`] || GLOBAL_PROVIDER).toLowerCase();
+  const group = FUNCTION_GROUPS[fn] || null;
+  const G = group ? envPrefix(group) : null;
+
+  let provider = (
+    process.env[`${P}_PROVIDER`] ||
+    (G ? process.env[`${G}_PROVIDER`] : undefined) ||
+    GLOBAL_PROVIDER
+  ).toLowerCase();
   if (!SUPPORTED_PROVIDERS.has(provider)) {
     console.warn(`[LLMClient] Unknown provider '${provider}' for fn '${fn}', falling back to 'anthropic'`);
     provider = 'anthropic';
@@ -98,9 +137,10 @@ export function resolveLLM(fn) {
   const model =
     process.env[`${P}_MODEL_${PROV}`] ||
     (provider === 'anthropic' ? process.env[`${P}_MODEL`] : undefined) ||
+    (G ? process.env[`${G}_MODEL_${PROV}`] : undefined) ||
     process.env[`LLM_MODEL_${PROV}`] ||
     BUILTIN_DEFAULT_MODEL[provider];
-  return { provider, model, fn, env_prefix: P };
+  return { provider, model, fn, group, env_prefix: P };
 }
 
 // Newer OpenAI families (GPT-5.x, o-series) require max_completion_tokens and
@@ -220,4 +260,5 @@ export async function callLLMJson(opts) {
   }
 }
 
-export default { callLLM, callLLMJson, resolveLLM };
+export { FUNCTION_GROUPS };
+export default { callLLM, callLLMJson, resolveLLM, FUNCTION_GROUPS };
