@@ -35,6 +35,14 @@
  * place that needs the cross-table read.
  *
  * v0.2.0 — 2026-06-02. Phase 2 initial.
+ * v0.2.2 — 2026-06-03. Bugfix: objectionTypes() now trims and drops
+ *          empty/whitespace tags, so a blank objection tag (e.g.
+ *          objection_tags: [""]) no longer credits the 0.20 objection_tag
+ *          signal. hasObjectionSignal/isTrustRecovery/isLongHorizon all
+ *          derive from objectionTypes, so they self-correct. This was
+ *          inflating no-engagement-history DEMO_STALL contacts over the
+ *          0.75 enroll bar on a phantom signal (same class as the s45.js
+ *          v0.2.1 fix; pre-go-live, so no behavior change yet).
  */
 
 // ── Tunable thresholds (top-of-file so tuning is a one-line edit) ────
@@ -155,12 +163,17 @@ export function isDemoStall(ctx) {
 
 // ── objections ──────────────────────────────────────────────────────
 
-/** Lower-cased objection sub-types present on the contact (tags + intel). */
+/**
+ * Lower-cased objection sub-types present on the contact (tags + intel).
+ * Empty/whitespace entries are dropped — a blank tag is NOT an objection
+ * and must not credit the objection_tag confidence signal.
+ */
 export function objectionTypes(ctx) {
-  const fromTags = (ctx?.lead?.objection_tags || []).map(t => String(t).toLowerCase());
-  const fromIntel = ctx?.intelligence?.objection_type
-    ? [String(ctx.intelligence.objection_type).toLowerCase()]
-    : [];
+  const fromTags = (ctx?.lead?.objection_tags || [])
+    .map(t => String(t).trim().toLowerCase())
+    .filter(Boolean);
+  const intel = String(ctx?.intelligence?.objection_type || '').trim().toLowerCase();
+  const fromIntel = intel ? [intel] : [];
   return Array.from(new Set([...fromTags, ...fromIntel]));
 }
 
@@ -221,7 +234,7 @@ export function hasDispositionSignal(ctx) {
   return !!disp && String(disp).trim().length > 0;
 }
 
-/** Confirmed objection tag/intel present. */
+/** Confirmed objection tag/intel present (empty tags already filtered out). */
 export function hasObjectionSignal(ctx) {
   return objectionTypes(ctx).length > 0;
 }
