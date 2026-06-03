@@ -36,6 +36,17 @@
  *   decline was re-admitted through DORMANT_HIGH_INTENT on stale intent
  *   signals). Reads disposition_code (the real field) with a legacy
  *   `disposition` fallback.
+ * v1.3 — 2026-06-03. Add isConfirmedLoss() — a confirmed competitor /
+ *   not-interested LOSS recorded in GHL TAGS, independent of the LP
+ *   disposition_code. isPostDemoDecline only catches OPPFDN/FDNS
+ *   disposition codes; a lost contact whose disposition is CXL (or any
+ *   non-demo-decline code) carried the loss only in tags
+ *   (loss-reason:*, objection-confirmed:not-interested,
+ *   p3:not-interested-now, concern-expressed:competitor) and fell through
+ *   to the eligible shapes. Surfaced live by Gerald Aloia
+ *   (zrjJPmKbjX3TZpHiEuVX): bought elsewhere, disposition CXL, classified
+ *   S45_TRUST_RECOVERY 0.90 and auto-enrolled. Feeds the new
+ *   SUPPRESSED_CONFIRMED_LOSS state.
  */
 
 // ── Tag presence ────────────────────────────────────────────────────
@@ -192,6 +203,60 @@ export function isPostDemoDecline(ctx) {
   return POST_DEMO_DECLINE_DISPOSITIONS.includes(dispositionCode(ctx));
 }
 
+// ── Confirmed loss (competitor / not-interested, recorded in TAGS) ──
+//
+// A confirmed LOSS recorded in GHL tags, INDEPENDENT of the LP disposition
+// code. Where isPostDemoDecline catches the demo-decline disposition codes
+// (OPPFDN/FDNS), a contact can be a settled "no" — bought from a competitor,
+// explicitly not interested — while LP carries a non-demo-decline
+// disposition (e.g. CXL). The loss then lives ONLY in the tag signature, and
+// without this check the contact falls through to the S4.5 eligible shapes.
+//
+// Surfaced live 2026-06-03 by Gerald Aloia (zrjJPmKbjX3TZpHiEuVX): tags
+// loss-reason:not-interested + p3:not-interested-now +
+// objection-confirmed:not-interested, AI summary "hired another company, no
+// longer interested," disposition CXL — classified S45_TRUST_RECOVERY 0.90
+// and auto-enrolled into S4.5 by the sweep. A bought-elsewhere "no" is the
+// textbook contact the follow-up funnel must SUPPRESS.
+//
+// Signals (any one = confirmed loss):
+//   - exact tags: objection-confirmed:not-interested, loss-needs-reason is
+//     NOT included (that's a pending-reason flag, not a confirmed loss)
+//   - prefix loss-reason:*  — a loss reason has been recorded
+//   - prefix p3:not-interested  — P3 recycle bucket: not-interested(-now)
+//   - exact tag concern-expressed:competitor PAIRED with a loss/objection
+//     signal — competitor concern alone is mid-funnel and must NOT suppress;
+//     only when it co-occurs with a confirmed-loss marker is it a loss.
+//
+// Deliberately CONSERVATIVE: a bare concern-expressed:competitor (still in
+// the conversation, comparing vendors) is NOT a loss and stays eligible for
+// BOFU/objection handling. We require an explicit loss/not-interested marker.
+//
+// Routes to the loss/reactivation track (L.* / P3), not S4.5.
+
+const CONFIRMED_LOSS_TAGS = [
+  'objection-confirmed:not-interested',
+];
+
+const CONFIRMED_LOSS_TAG_PREFIXES = [
+  'loss-reason:',
+  'p3:not-interested',
+];
+
+export function isConfirmedLoss(ctx) {
+  if (hasAnyTag(ctx, CONFIRMED_LOSS_TAGS)) return true;
+  if (hasAnyTagPrefix(ctx, CONFIRMED_LOSS_TAG_PREFIXES)) return true;
+  // Competitor concern is a loss ONLY when paired with a confirmed-loss
+  // marker — a bare competitor concern is mid-funnel comparison, not a loss.
+  if (
+    hasAnyTag(ctx, ['concern-expressed:competitor', 'objection:competitor']) &&
+    (hasAnyTag(ctx, CONFIRMED_LOSS_TAGS) || hasAnyTagPrefix(ctx, CONFIRMED_LOSS_TAG_PREFIXES))
+  ) {
+    return true;
+  }
+  return false;
+}
+
 // ── Active BOFU ─────────────────────────────────────────────────────
 //
 // BOFU = Bottom of Funnel — contact is in active conversion work and
@@ -294,6 +359,7 @@ export function snapshotSuppressionSignals(ctx) {
     active_booking:       hasActiveBooking(ctx),
     customer_p2:          isCustomerP2(ctx),
     post_demo_decline:    isPostDemoDecline(ctx),
+    confirmed_loss:       isConfirmedLoss(ctx),
     active_bofu:          isInActiveBofu(ctx),
     in_narrative_nurture: inNarrativeNurture(ctx),
     recent_rep_contact:   hasRecentRepContact(ctx, 14),
