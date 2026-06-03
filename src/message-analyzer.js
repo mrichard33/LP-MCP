@@ -209,6 +209,11 @@ import crypto from 'node:crypto';
 import { buildLeadContext, upsertLeadIntelligence } from './context-builder.js';
 import { emitEvent } from './event-emitter.js';
 import { callLLM, resolveLLM } from './llm-client.js';
+// Booking-flow ownership guard (2026-06-03). When a booking is in flight the
+// booking flow owns the turn — the analyzer must not divert it into objection-
+// handling or rep escalation (that produced a duplicate "a rep will call" send
+// alongside the booking confirmation).
+import { hasActiveBooking } from './agentic/lead-state/signals/context-reader.js';
 
 const ANALYSIS_RATE_LIMIT = parseInt(process.env.ANALYSIS_RATE_LIMIT || '100', 10);
 // v1.2: default shortened from 3600000 (1h) → 120000 (2min). Content-hash
@@ -669,7 +674,7 @@ function validateAnalysis(analysis) {
 // MAIN ENTRY POINT
 // ═══════════════════════════════════════════════════════════════════
 
-export async function analyzeMessage(ghlContactId, messageText, eventId = null, channel = null) {
+export async function analyzeMessage(ghlContactId, messageText, eventId = null, channel = null, messageId = null) {
   if (!checkRateLimit()) {
     console.warn(`[MessageAnalyzer] Rate limit reached (${ANALYSIS_RATE_LIMIT}/hr). Skipping ${ghlContactId}`);
     return null;
@@ -712,6 +717,28 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
     if (!analysis) {
       console.error(`[MessageAnalyzer] Invalid analysis response for ${ghlContactId}`);
       return null;
+    }
+
+    // 2026-06-03 — booking-flow ownership override. When a contact is in active
+    // booking (appointment set & demo not yet run, or a booking-stage tag, or
+    // booking:active), the booking flow owns this turn. The analyzer must NOT
+    // recommend objection-handling or rep escalation here — doing so triggered a
+    // parallel "a rep will call" handoff alongside the booking confirmation.
+    // Deterministic guard (the prompt's CTA note can drift); coerce to a safe
+    // action and keep every other analysis field intact. Scoped to active
+    // booking only, so non-booking objections still route normally.
+    const SUPPRESSED_WHEN_BOOKING = ['deploy_objection_handler', 'escalate_to_rep'];
+    const bookingActive =
+      hasActiveBooking(context) ||
+      (context.lead?.current_tags || []).some(t => String(t).toLowerCase() === 'booking:active');
+    if (bookingActive && SUPPRESSED_WHEN_BOOKING.includes(analysis.recommended_action)) {
+      const safeAction = analysis.fast_track_eligible ? 'fast_track_booking' : 'continue_current';
+      console.log(
+        `[MessageAnalyzer] Booking-flow override for ${ghlContactId}: ` +
+        `recommended_action ${analysis.recommended_action} → ${safeAction} ` +
+        `(appointment_set=${context.lp?.appointment_set} demo_completed=${context.lp?.demo_completed})`
+      );
+      analysis.recommended_action = safeAction;
     }
 
     const historyEntry = {
@@ -768,6 +795,11 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
         // didn't supply a channel (legacy paths) — the rule template
         // value remains as fallback in that case.
         channel: channel || null,
+        // Fix 3 (2026-06-03): the real inbound GHL message_id. Threaded so the
+        // outbound dedup lock keys on the inbound (executeSendMessageWithLock
+        // reads it via fetchSourceEvent), not on evt-${analysis_event_id} —
+        // which made every re-analysis of the same inbound a distinct lock key.
+        message_id: messageId || null,
         // v1.5: Full message_text so downstream consumers (send-message-handler)
         // have the actual inbound. message_preview is kept for backward
         // compatibility with anything reading the first 100 chars.
@@ -888,7 +920,7 @@ export async function analyzePendingReplies({ limit = 10 } = {}) {
     const inboundChannel = rawType.includes('email') ? 'email'
                          : rawType.includes('sms')   ? 'sms'
                          : null;
-    const result = await analyzeMessage(contactId, messageText, event.id, inboundChannel);
+    const result = await analyzeMessage(contactId, messageText, event.id, inboundChannel, event.payload?.message_id || null);
     if (result) { analyzed++; }
     // v1.2: pass messageText to match the new (contact, message) cache key
     else if (wasRecentlyAnalyzed(contactId, messageText)) { skipped++; }
@@ -933,10 +965,10 @@ export function registerMessageAnalyzerRoutes(app) {
     // channel through to analyzeMessage and onto ai.analysis_completed.
     // Null is safe — analyzer treats it as "unknown" and downstream
     // decision-engine v2.13 falls back to the rule template's channel.
-    const { contactId, message, channel } = req.body || {};
+    const { contactId, message, channel, message_id } = req.body || {};
     if (!contactId || !message) return res.status(400).json({ error: 'contactId and message required' });
     try {
-      const result = await analyzeMessage(contactId, message, null, channel || null);
+      const result = await analyzeMessage(contactId, message, null, channel || null, message_id || null);
       res.json({ success: !!result, analysis: result });
     } catch (err) {
       res.status(500).json({ error: err.message });

@@ -162,6 +162,11 @@ import { executeActionById } from './action-executor.js';
 // completion so duplicate webhook deliveries can't double-fire rules.
 import { tryClaimEvent, recordResult } from './services/idempotency.js';
 
+// Booking-active guard (2026-06-03). Reuses the same in-home appointment lookup
+// the Layer-3 post-book guard uses, exposed as a context_conditions operator so
+// escalation/objection/callback rules can opt out while a booking is in flight.
+import { hasActiveInHomeAppointment } from './services/layer3-dispatch.js';
+
 // ═══════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════
@@ -549,6 +554,19 @@ async function evaluateContextConditions(conditions, intelligence, event) {
         break;
       }
 
+      // 2026-06-03 — booking-active guard. Blocks a rule from firing while the
+      // contact has an active in-home appointment (booking flow owns the turn).
+      // Same lookup as the Layer-3 post-book guard; fail-open built into the
+      // helper so a transient lookup error never blocks the rule.
+      case 'not_active_in_home_appointment': {
+        if (!expected) break; // only gate when set truthy
+        if (await hasActiveInHomeAppointment(event.ghl_contact_id)) {
+          console.log(`[Context] BLOCKED: not_active_in_home_appointment — contact ${event.ghl_contact_id} has an active in-home appt`);
+          return false;
+        }
+        break;
+      }
+
       case 'buyer_stage_confidence_gte': if ((merged.buyer_stage_confidence || 0) < expected) return false; break;
       case 'intent_tier_eq': if (merged.intent_tier !== expected) return false; break;
       case 'intent_score_gte': if ((merged.intent_score || 0) < expected) return false; break;
@@ -802,7 +820,7 @@ async function processSingleEventInner(event) {
     const messageText = event.payload?.message_text || '';
     if (contactId && messageText) {
       const inboundChannel = inferChannelFromEvent(event);
-      analyzeMessage(contactId, messageText, event.id, inboundChannel).catch(err => {
+      analyzeMessage(contactId, messageText, event.id, inboundChannel, event.payload?.message_id || null).catch(err => {
         console.error(`[DecisionEngine] Analysis failed for ${contactId}:`, err.message);
       });
     }

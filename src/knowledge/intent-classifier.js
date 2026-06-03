@@ -101,6 +101,24 @@ const POST_QUALIFICATION_AFFIRMATIVE_BYPASS_INTENTS = new Set([
   'CUSTOMER_STATUS_AFFIRMATIVE',
 ]);
 
+// 2026-06-03 — Surface B booking guard. During an active booking the booking
+// flow owns the turn; these callback/handoff gates must NOT fire — they tag
+// hdl:callback-* and hand off to HDL.1/HDL.2, which send a parallel "a rep will
+// call" SMS alongside the booking confirmation (the duplicate-message defect).
+// Unlike the affirmative bypass above (which keys on the broader post-
+// qualification tag set), this is scoped to ACTIVE-BOOKING tags ONLY, so a
+// genuine callback request from a non-booking lead still routes normally.
+const BOOKING_ACTIVE_BYPASS_INTENTS = new Set([
+  'CALLBACK',
+  'CUSTOMER_STATUS_NEGATIVE',
+]);
+const BOOKING_ACTIVE_TAGS = new Set([
+  'booking:active',
+  'booking:dm-pending',
+  'bj:stage-5-committed',
+  'stage:hot-call',
+]);
+
 // Tag patterns that prove the contact is past the qualification stage, OR is
 // mid-booking-exchange (where a bare "yeah"/"I will be" answers a booking
 // question, not a "yes I'm a current customer" first-touch reply).
@@ -127,17 +145,30 @@ const BYPASS_TAGS_PREFIX = [
  * the bypass set.
  */
 function shouldBypassAffirmativeGate(handler, contactTags) {
-  if (!handler || !POST_QUALIFICATION_AFFIRMATIVE_BYPASS_INTENTS.has(handler.intent_class)) {
-    return false;
-  }
+  if (!handler) return false;
   if (!Array.isArray(contactTags) || contactTags.length === 0) return false;
-  for (const t of contactTags) {
-    if (typeof t !== 'string') continue;
-    if (BYPASS_TAGS_EXACT.has(t)) return true;
-    for (const prefix of BYPASS_TAGS_PREFIX) {
-      if (t.startsWith(prefix)) return true;
+
+  // Post-qualification affirmative bypass (CUSTOMER_STATUS_AFFIRMATIVE): contact
+  // is past qualification or mid-booking-exchange.
+  if (POST_QUALIFICATION_AFFIRMATIVE_BYPASS_INTENTS.has(handler.intent_class)) {
+    for (const t of contactTags) {
+      if (typeof t !== 'string') continue;
+      if (BYPASS_TAGS_EXACT.has(t)) return true;
+      for (const prefix of BYPASS_TAGS_PREFIX) {
+        if (t.startsWith(prefix)) return true;
+      }
     }
   }
+
+  // Surface B booking guard (CALLBACK / CUSTOMER_STATUS_NEGATIVE): suppress the
+  // callback/handoff gate ONLY while a booking is active, so the booking flow's
+  // confirmation isn't shadowed by a parallel HDL "a rep will call" send.
+  if (BOOKING_ACTIVE_BYPASS_INTENTS.has(handler.intent_class)) {
+    for (const t of contactTags) {
+      if (typeof t === 'string' && BOOKING_ACTIVE_TAGS.has(t)) return true;
+    }
+  }
+
   return false;
 }
 
@@ -159,7 +190,7 @@ function applyPostQualificationBypass(handlers, contactTags, ghlContactId) {
     }
   }
   if (bypassed.length > 0) {
-    console.log(`[IntentClassifier] [BYPASS] post-qualification gate(s) excluded for ${ghlContactId || 'unknown'}: ${bypassed.join(', ')} — contact has at least one of lp-demo-completed / objection-confirmed-* / stage:objection-handling / bj:stage-5-committed / stage:hot-call / booking:active / booking:dm-pending`);
+    console.log(`[IntentClassifier] [BYPASS] gate(s) excluded for ${ghlContactId || 'unknown'}: ${bypassed.join(', ')} — affirmative gates bypass on lp-demo-completed / objection-confirmed-* / stage:objection-handling / booking tags; CALLBACK / CUSTOMER_STATUS_NEGATIVE bypass on active-booking tags only (booking:active / booking:dm-pending / bj:stage-5-committed / stage:hot-call)`);
   }
   return kept;
 }
