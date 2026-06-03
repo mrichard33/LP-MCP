@@ -14,8 +14,8 @@
  * GroupMe, Slack, or any external channel.
  *
  * Failure modes:
- *   - Missing ANTHROPIC_API_KEY   → throws
- *   - Claude API error / timeout  → throws
+ *   - Missing provider credential → throws (from the shared LLM client)
+ *   - LLM API error / timeout     → throws
  *   - Empty model response        → throws
  *   - Non-JSON / malformed JSON   → throws (defensive extractJson)
  *   - Missing email_body or sms_body in parsed JSON → throws
@@ -26,14 +26,13 @@
  */
 
 import crypto from 'crypto';
+import { callLLM } from '../llm-client.js';
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
-const MODEL =
-  process.env.APPT_NOTIFICATION_MODEL ||
-  process.env.NURTURE_GENERATOR_MODEL ||
-  'claude-sonnet-4-5';
+// Provider + model resolved at call time by the shared client from the
+// `appt_notification` fn key (customer_facing group). Legacy
+// APPT_NOTIFICATION_MODEL is still honored by the client for Anthropic
+// back-compat. Timeout is centralized in the client (LLM_TIMEOUT_MS).
 const MAX_TOKENS = parseInt(process.env.APPT_NOTIFICATION_MAX_TOKENS || '700', 10);
-const TIMEOUT_MS = parseInt(process.env.APPT_NOTIFICATION_TIMEOUT_MS || '8000', 10);
 const TEMPERATURE = parseFloat(process.env.APPT_NOTIFICATION_TEMPERATURE || '0.4');
 
 const EMAIL_CHAR_CAP = parseInt(process.env.APPT_NOTIFICATION_EMAIL_CAP || '1500', 10);
@@ -413,38 +412,21 @@ function buildUserPrompt({ payload, context }) {
   return lines.join('\n');
 }
 
-async function callClaude({ system, user, model, maxTokens, temperature }) {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model,
-      max_tokens: maxTokens,
-      temperature,
-      system,
-      messages: [{ role: 'user', content: user }],
-    }),
-    signal: AbortSignal.timeout(TIMEOUT_MS),
+async function callClaude({ system, user, maxTokens, temperature }) {
+  // json:true → OpenAI response_format=json_object (the prompt mandates a JSON
+  // object); ignored for Anthropic. Returns the resolved model for logging.
+  const { text, model } = await callLLM({
+    fn: 'appt_notification',
+    system,
+    user,
+    maxTokens,
+    temperature,
+    json: true,
   });
 
-  if (!res.ok) {
-    const errText = await res.text().catch(() => '');
-    throw new Error(`anthropic_${res.status}:${errText.slice(0, 200)}`);
-  }
-
-  const data = await res.json();
-  const text = (data.content || [])
-    .filter(b => b.type === 'text')
-    .map(b => b.text)
-    .join('')
-    .trim();
-
-  if (!text) throw new Error('anthropic_empty_text');
-  return text;
+  const trimmed = String(text || '').trim();
+  if (!trimmed) throw new Error('llm_empty_text');
+  return { text: trimmed, model };
 }
 
 /**
@@ -514,18 +496,15 @@ export function enforceCharCap(text, max) {
  * throw into a 5xx).
  */
 export async function generateAppointmentBody({ payload, context }) {
-  if (!ANTHROPIC_API_KEY) {
-    throw new Error('ANTHROPIC_API_KEY_not_configured');
-  }
-
   const requestId = crypto.randomBytes(4).toString('hex');
   const startedAt = Date.now();
 
   const user = buildUserPrompt({ payload, context });
-  const raw = await callClaude({
+  // A missing provider credential now throws from inside the client (the
+  // caller turns the throw into a 5xx, same as before).
+  const { text: raw, model } = await callClaude({
     system: SYSTEM_PROMPT,
     user,
-    model: MODEL,
     maxTokens: MAX_TOKENS,
     temperature: TEMPERATURE,
   });
@@ -548,13 +527,13 @@ export async function generateAppointmentBody({ payload, context }) {
   const elapsed = Date.now() - startedAt;
   console.log(
     `[ApptNotif] [${requestId}] generated status=${payload.status} title="${payload.appointment_title}" ` +
-      `email_chars=${email_body.length} sms_chars=${sms_body.length} model=${MODEL} (${elapsed}ms)`,
+      `email_chars=${email_body.length} sms_chars=${sms_body.length} model=${model} (${elapsed}ms)`,
   );
 
   return {
     email_body,
     sms_body,
-    model: MODEL,
+    model,
     request_id: requestId,
     latency_ms: elapsed,
   };

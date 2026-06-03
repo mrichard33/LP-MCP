@@ -30,6 +30,7 @@ import {
 import { registerContextBuilderRoutes } from './context-builder.js';
 import { registerBehavioralEmitterRoutes } from './behavioral-emitter.js';
 import { registerMessageAnalyzerRoutes } from './message-analyzer.js';
+import { resolveLLM, FUNCTION_GROUPS } from './llm-client.js';
 // ─── Layer 3.5: Intent Scoring + Conversion Engine ───────────────
 import { registerIntentScorerRoutes } from './intent-scorer.js';
 // ─── Phase 4: KB Vector Ingestion (agentic bot knowledge layer) ──
@@ -214,6 +215,24 @@ app.get('/health', (req, res) => {
       function_required: 'bulk_compute_risk_scores (PL/pgSQL — run sql/phase1_54_bulk_compute_risk_scores.sql)',
     },
     anthropic: process.env.ANTHROPIC_API_KEY ? 'configured' : 'MISSING',
+  });
+});
+
+// ─── LLM provider/model diagnostics ──────────────────────────────────
+// Shows the provider + model the shared client (src/llm-client.js) resolves
+// for every logical function from the CURRENT env — so the live config can be
+// confirmed after an env change without guessing. Read-only, no LLM calls.
+app.get('/diag/llm', (req, res) => {
+  const functions = {};
+  for (const fn of Object.keys(FUNCTION_GROUPS)) functions[fn] = resolveLLM(fn);
+  res.json({
+    status: 'ok',
+    credentials: {
+      anthropic: process.env.ANTHROPIC_API_KEY ? 'set' : 'MISSING',
+      openai: process.env.OPENAI_API_KEY ? 'set' : 'MISSING',
+    },
+    timeout_ms: parseInt(process.env.LLM_TIMEOUT_MS || '30000', 10),
+    functions,
   });
 });
 

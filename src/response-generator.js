@@ -141,11 +141,13 @@ import { buildKbPack, formatKbPackForPrompt } from './knowledge/kb-retriever.js'
 import { fetchFreeSlots, formatSlotsForPrompt } from './knowledge/calendar-availability.js';
 import { fetchUpcomingAppointments, formatAppointmentsForPrompt } from './knowledge/contact-appointments.js';
 import supabase from './supabase.js';
+import { callLLM, resolveLLM } from './llm-client.js';
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
-const MODEL = process.env.RESPONSE_GENERATOR_MODEL || 'claude-sonnet-4-6';
+// Provider + model resolved at call time by the shared client from the
+// `response_generator` fn key (customer_facing group). Legacy
+// RESPONSE_GENERATOR_MODEL is still honored by the client for Anthropic
+// back-compat.
 const MAX_TOKENS = parseInt(process.env.RESPONSE_GENERATOR_MAX_TOKENS || '600', 10);
-const TIMEOUT_MS = 30000;
 const PROMPT_TIMEZONE = process.env.REECE_TIMEZONE || 'America/New_York';
 
 // v2.7.4: how many recent edits to inject as in-context learning examples.
@@ -1079,34 +1081,17 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
 // ═══════════════════════════════════════════════════════════════════
 
 async function callClaude(userPrompt) {
-  if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY not configured');
-
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: MAX_TOKENS,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: userPrompt }],
-    }),
-    signal: AbortSignal.timeout(TIMEOUT_MS),
+  // Provider/model resolved from env by the shared client. json:true sets
+  // OpenAI response_format=json_object (the system prompt mandates a JSON
+  // object); ignored for Anthropic. parseJsonFromResponse still tolerates
+  // any stray fences/preamble.
+  const { text } = await callLLM({
+    fn: 'response_generator',
+    system: SYSTEM_PROMPT,
+    user: userPrompt,
+    maxTokens: MAX_TOKENS,
+    json: true,
   });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => '');
-    throw new Error(`Claude API ${response.status}: ${errText.slice(0, 200)}`);
-  }
-
-  const data = await response.json();
-  const text = data.content
-    ?.filter(block => block.type === 'text')
-    .map(block => block.text)
-    .join('') || '';
 
   return parseJsonFromResponse(text);
 }
@@ -1599,7 +1584,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     `temp=${trafficTemp} ` +
     `fast_track=${fastTrack} ` +
     `merge_tag_sent=${mergeTagInMessage} ` +
-    `model=${MODEL} ` +
+    `model=${resolveLLM('response_generator').model} ` +
     `edits_in_prompt=${recentEdits.length} ` +
     `is_regenerate=${!!opts.editInstruction} ` +
     `companion=${companionLog} ` +

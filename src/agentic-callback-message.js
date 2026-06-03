@@ -87,9 +87,9 @@
  *   See sql/agentic_callback_log.sql for the table DDL.
  *
  * Failure modes & fallback:
- *   - Claude API down / 5xx / timeout (8s)  → static template
- *   - Missing ANTHROPIC_API_KEY in env       → static template
- *   - Invalid JSON in Claude response        → static template
+ *   - LLM API down / 5xx / timeout           → static template
+ *   - Missing provider credential in env     → static template
+ *   - Invalid JSON in LLM response           → static template
  *   - Empty/missing message field            → static template
  *   In all fallback cases the workflow still gets a usable SMS body.
  *   `fell_back: true` is set so the audit trail shows when the AI
@@ -103,13 +103,12 @@
 
 import crypto from 'crypto';
 import supabase from './supabase.js';
+import { callLLM, resolveLLM } from './llm-client.js';
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
-const MODEL = process.env.CALLBACK_MESSAGE_MODEL
-  || process.env.RESPONSE_GENERATOR_MODEL
-  || 'claude-sonnet-4-6';
+// Provider + model resolved at call time by the shared client from the
+// `agentic_callback` fn key (customer_facing group). Provider/model/timeout
+// are env-controlled (CUSTOMER_FACING_* / AGENTIC_CALLBACK_* / LLM_TIMEOUT_MS).
 const MAX_TOKENS = parseInt(process.env.CALLBACK_MESSAGE_MAX_TOKENS || '300', 10);
-const TIMEOUT_MS = parseInt(process.env.CALLBACK_MESSAGE_TIMEOUT_MS || '8000', 10);
 const TIMEZONE = process.env.REECE_TIMEZONE || 'America/New_York';
 
 // ═══════════════════════════════════════════════════════════════════
@@ -269,34 +268,17 @@ function buildUserPrompt(input) {
 }
 
 async function callClaude(userPrompt) {
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: MAX_TOKENS,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: userPrompt }],
-    }),
-    signal: AbortSignal.timeout(TIMEOUT_MS),
+  // json:true → OpenAI response_format=json_object (the prompt mandates a JSON
+  // object); ignored for Anthropic. Returns the resolved model for logging.
+  const { text, model } = await callLLM({
+    fn: 'agentic_callback',
+    system: SYSTEM_PROMPT,
+    user: userPrompt,
+    maxTokens: MAX_TOKENS,
+    json: true,
   });
 
-  if (!response.ok) {
-    const errText = await response.text().catch(() => '');
-    throw new Error(`Claude API ${response.status}: ${errText.slice(0, 200)}`);
-  }
-
-  const data = await response.json();
-  const text = data.content
-    ?.filter(block => block.type === 'text')
-    .map(block => block.text)
-    .join('') || '';
-
-  return parseJson(text);
+  return { parsed: parseJson(text), model };
 }
 
 function parseJson(text) {
@@ -402,26 +384,13 @@ async function generateCallbackMessage(input) {
     };
   }
 
-  // No API key configured — fall back without trying Claude.
-  if (!ANTHROPIC_API_KEY) {
-    console.warn(`[CallbackMessage] [${reqId}] no_api_key — fallback (${Date.now() - startedAt}ms)`);
-    return {
-      message: static_fallback_message,
-      reasoning: 'ANTHROPIC_API_KEY not configured — used static fallback template.',
-      business_hours,
-      fell_back: true,
-      fell_back_reason: 'no_api_key',
-      static_fallback_message,
-      model: null,
-      elapsed_ms: Date.now() - startedAt,
-      request_id: reqId,
-    };
-  }
-
   const userPrompt = buildUserPrompt({ ...input, business_hours });
 
   try {
-    const parsed = await callClaude(userPrompt);
+    // A missing credential for the resolved provider now throws from inside
+    // the client (caught below → static fallback), so there's no separate
+    // pre-flight key check — that path also works when the group is on OpenAI.
+    const { parsed, model } = await callClaude(userPrompt);
     const message = typeof parsed?.message === 'string' ? parsed.message.trim() : '';
     if (!message) {
       throw new Error('AI returned empty message field');
@@ -434,7 +403,7 @@ async function generateCallbackMessage(input) {
     const elapsed = Date.now() - startedAt;
     console.log(`[CallbackMessage] [${reqId}] ok contact=${input.contact_id || 'n/a'} ` +
       `market=${input.market_name || 'n/a'} hours=${business_hours} ` +
-      `len=${clamped.length} model=${MODEL} (${elapsed}ms)`);
+      `len=${clamped.length} model=${model} (${elapsed}ms)`);
 
     return {
       message: clamped,
@@ -442,7 +411,7 @@ async function generateCallbackMessage(input) {
       business_hours,
       fell_back: false,
       static_fallback_message,
-      model: MODEL,
+      model,
       elapsed_ms: elapsed,
       request_id: reqId,
     };
@@ -457,7 +426,7 @@ async function generateCallbackMessage(input) {
       fell_back: true,
       fell_back_reason: err.message,
       static_fallback_message,
-      model: MODEL,
+      model: resolveLLM('agentic_callback').model,
       elapsed_ms: elapsed,
       request_id: reqId,
     };

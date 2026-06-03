@@ -89,19 +89,15 @@ const SUPPORTED_PROVIDERS = new Set(['anthropic', 'openai']);
 // group tier and fall through per-fn → global.
 const FUNCTION_GROUPS = {
   // decision engine — analysis / scoring / classification (JSON outputs)
-  message_analyzer: 'decision_engine',
-  message_score: 'decision_engine',
-  message_content_scorer: 'decision_engine',
-  intent_scorer: 'decision_engine',
-  appointment_intelligence: 'decision_engine',
-  cancellation_intelligence: 'decision_engine',
+  message_analyzer: 'decision_engine',   // src/message-analyzer.js
+  message_score: 'decision_engine',      // src/message-content-scorer.js (legacy MESSAGE_SCORE_MODEL)
+  intent_classifier: 'decision_engine',  // src/knowledge/intent-classifier.js
   // customer-facing — text a human reads
-  response_generator: 'customer_facing',
-  nurture_generator: 'customer_facing',
-  agentic_callback: 'customer_facing',
-  appt_notification: 'customer_facing',
-  appointment_body: 'customer_facing',
-  cancellation_body: 'customer_facing',
+  response_generator: 'customer_facing', // src/response-generator.js
+  nurture_generator: 'customer_facing',  // src/nurture/nurture-generator.js
+  agentic_callback: 'customer_facing',   // src/agentic-callback-message.js
+  appt_notification: 'customer_facing',  // src/notifications/appointment-body-generator.js (legacy APPT_NOTIFICATION_MODEL)
+  cancellation_body: 'customer_facing',  // src/notifications/cancellation-body-generator.js
 };
 
 // Normalize a function/group key to an ENV prefix.
