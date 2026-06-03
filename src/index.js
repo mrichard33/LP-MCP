@@ -31,6 +31,7 @@ import { registerContextBuilderRoutes } from './context-builder.js';
 import { registerBehavioralEmitterRoutes } from './behavioral-emitter.js';
 import { registerMessageAnalyzerRoutes } from './message-analyzer.js';
 import { resolveLLM, FUNCTION_GROUPS } from './llm-client.js';
+import { registerLlmGatewayRoutes } from './llm-gateway.js';
 // ─── Layer 3.5: Intent Scoring + Conversion Engine ───────────────
 import { registerIntentScorerRoutes } from './intent-scorer.js';
 // ─── Phase 4: KB Vector Ingestion (agentic bot knowledge layer) ──
@@ -327,6 +328,9 @@ app.post('/webhook/lp', async (req, res) => {
 registerN8nEnrichRoute(app);
 registerN8nHelperRoutes(app);
 registerN8nAvatarRoutes(app);
+
+// ─── LLM gateway (env-controlled provider/model for n8n + HL MCP) ─
+registerLlmGatewayRoutes(app);
 
 // ─── Agentic Decision Engine + Action Executor ───────────────────
 registerDecisionEngineRoutes(app);
