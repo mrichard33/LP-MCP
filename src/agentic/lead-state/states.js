@@ -1,21 +1,23 @@
 /**
  * Lead-State Taxonomy — src/agentic/lead-state/states.js
  *
- * The FROZEN 13-state vocabulary. Every classification result must be
+ * The FROZEN 14-state vocabulary. Every classification result must be
  * one of these. Adding a new state requires a documented framework
  * decision — don't extend inline.
  *
  * State categories
  * ────────────────
- *   S45_*                — eligible for S4.5 (5 behavioral states)
+ *   S45_*                       — eligible for S4.5 (5 behavioral states)
  *   ACTIVE_BOFU,
  *   APPT_BOOKED,
  *   IN_NARRATIVE_NURTURE,
  *   RECENT_REP_CONTACT,
  *   CUSTOMER_P2,
- *   COLD_NO_SIGNAL,
+ *   SUPPRESSED_POST_DEMO_DECLINE,
  *   SUPPRESSED_LEGAL,
- *   UNCLASSIFIED        — non-S4.5 states (8 total: 7 suppression + UNCLASSIFIED)
+ *   COLD_NO_SIGNAL,
+ *   UNCLASSIFIED               — non-S4.5 states (9 total: 7 suppression +
+ *                                COLD_NO_SIGNAL + UNCLASSIFIED)
  *
  * COLD_NO_SIGNAL is technically not a suppression (it routes to S1.0
  * per Mark's decision), but it IS deterministic and authoritative —
@@ -23,6 +25,21 @@
  *
  * UNCLASSIFIED is the safety state: emitted when signals are too weak
  * to claim ANY state (confidence < floor). The pre-first-run default.
+ *
+ * Framework decisions
+ * ───────────────────
+ * 2026-06-03 — Added SUPPRESSED_POST_DEMO_DECLINE (taxonomy 13 → 14).
+ *   A recorded post-demo decline (LP disposition_code OPPFDN / FDNS =
+ *   "Full Demo No Sale") is an attribute of the PERSON / relationship
+ *   stage — they have exited the buying conversation — not of one funnel.
+ *   Per the Brunson follow-up-funnel framing, the Seinfeld/soap-opera
+ *   nurture is for the undecided "maybe," never the recorded "no." So a
+ *   decline must suppress from ALL FIVE S4.5 eligible states, not just
+ *   per-shape (the v0.2.3 isDemoStall fix only blocked DEMO_STALL; a
+ *   declined contact with stale intent signals was re-admitted via
+ *   DORMANT_HIGH_INTENT). This is a suppression-level guard checked before
+ *   any eligible shape. Declines route to the loss/reactivation track
+ *   (S5.2 / L.*), not deletion.
  */
 
 // ── State identifiers ───────────────────────────────────────────────
@@ -36,12 +53,13 @@ export const STATES = Object.freeze({
   S45_REAWAKENED:          'S45_REAWAKENED',
 
   // Suppression states — authoritative, bypass confidence gating
-  ACTIVE_BOFU:             'ACTIVE_BOFU',
-  APPT_BOOKED:             'APPT_BOOKED',
-  IN_NARRATIVE_NURTURE:    'IN_NARRATIVE_NURTURE',
-  RECENT_REP_CONTACT:      'RECENT_REP_CONTACT',
-  CUSTOMER_P2:             'CUSTOMER_P2',
-  SUPPRESSED_LEGAL:        'SUPPRESSED_LEGAL',
+  ACTIVE_BOFU:                  'ACTIVE_BOFU',
+  APPT_BOOKED:                  'APPT_BOOKED',
+  IN_NARRATIVE_NURTURE:         'IN_NARRATIVE_NURTURE',
+  RECENT_REP_CONTACT:           'RECENT_REP_CONTACT',
+  CUSTOMER_P2:                  'CUSTOMER_P2',
+  SUPPRESSED_POST_DEMO_DECLINE: 'SUPPRESSED_POST_DEMO_DECLINE',
+  SUPPRESSED_LEGAL:             'SUPPRESSED_LEGAL',
 
   // Non-S4.5 behavioral / default states
   COLD_NO_SIGNAL:          'COLD_NO_SIGNAL',
@@ -64,6 +82,7 @@ export const SUPPRESSION_STATES = Object.freeze([
   STATES.IN_NARRATIVE_NURTURE,
   STATES.RECENT_REP_CONTACT,
   STATES.CUSTOMER_P2,
+  STATES.SUPPRESSED_POST_DEMO_DECLINE,
   STATES.SUPPRESSED_LEGAL,
 ]);
 
