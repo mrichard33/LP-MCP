@@ -137,6 +137,16 @@ import {
   registerNoteChangeAnalyzerRoutes,
   startNoteChangeAnalyzerScheduler,
 } from './agentic/lead-state/note-change-analyzer.js';
+// ─── Enroll-Existing-Eligible (one-time migration for v0.2.0 cutover) ──
+// Drains the pre-existing population of contacts already classified into an
+// eligible S45_* state during pre-go-live classify-only backfills that were
+// never run through the enrollment gate. The change-detected sweep won't
+// re-select them (lead row unchanged, inside the re-floor), so this targeted
+// pass runs enrollIfEligible() on their EXISTING state (no re-classification).
+// Manual/admin-only, no scheduler. POST /admin/lead-state/enroll-existing.
+import {
+  registerEnrollExistingEligibleRoutes,
+} from './agentic/lead-state/enroll-existing-eligible.js';
 
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -484,6 +494,7 @@ registerAgenticLeadStateRoutes(app);
 registerLPForceAddLeadRoutes(app);
 registerLeadStateSweepRoutes(app);
 registerNoteChangeAnalyzerRoutes(app);
+registerEnrollExistingEligibleRoutes(app);
 
 app.listen(PORT, async () => {
   console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
