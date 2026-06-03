@@ -208,16 +208,18 @@
 import crypto from 'node:crypto';
 import { buildLeadContext, upsertLeadIntelligence } from './context-builder.js';
 import { emitEvent } from './event-emitter.js';
+import { callLLM, resolveLLM } from './llm-client.js';
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const ANALYSIS_RATE_LIMIT = parseInt(process.env.ANALYSIS_RATE_LIMIT || '100', 10);
 // v1.2: default shortened from 3600000 (1h) → 120000 (2min). Content-hash
 // keying means the only reason to cache is webhook retry suppression, and
 // 2 minutes is more than enough for that. If a customer legitimately sends
 // the same identical string twice within 2 min, we still skip (likely retry).
 const ANALYSIS_CACHE_TTL_MS = parseInt(process.env.ANALYSIS_CACHE_TTL_MS || '120000', 10);
-// Model is env-overridable so a model retirement is an env flip, not a deploy.
-const MODEL = process.env.MESSAGE_ANALYZER_MODEL || 'claude-sonnet-4-20250514';
+// Provider + model are resolved at call time by the shared LLM client
+// (src/llm-client.js) from the `message_analyzer` fn key — env-controlled,
+// no deploy needed to switch provider or model. Legacy MESSAGE_ANALYZER_MODEL
+// is still honored by the client for Anthropic back-compat.
 
 // v1.11 (2026-06-02) — Hard ceiling on the whole analyze path. buildLeadContext
 // makes unbounded Supabase calls (the JS client has no abort support); a hung
@@ -510,37 +512,20 @@ function withTimeout(promise, ms, label) {
 // ═══════════════════════════════════════════════════════════════════
 
 async function callClaude(messageText, context) {
-  if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY not configured');
-
   const contextSummary = buildContextSummary(context);
   const userPrompt = `LEAD CONTEXT:\n${contextSummary}\n\nINBOUND MESSAGE:\n"${messageText}"\n\nAnalyze this message and return the JSON assessment.\n\nFIRST: scan the most recent outbound message in Recent Conversation END-TO-END. CTAs typically appear at the END of messages (after the value prop). Is the END of the most recent outbound a CTA offering a specific resource? Is the inbound message a short affirmative? If both, apply the CTA-AFFIRMATIVE OVERRIDE — recommended_action MUST be "fast_track_booking". Don't add hedging or objection handlers. If the message ends with "[truncated]" but the inbound is "Sure"/"Yes"/"OK", assume a CTA was cut off and apply the override anyway.\n\nSECOND: if no CTA-affirmative match, weigh LP rep notes and disposition heavily for routing decisions.`;
 
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: 500,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: userPrompt }],
-    }),
-    signal: AbortSignal.timeout(30000),
+  // Provider/model resolved from env by the shared client. json:true sets
+  // OpenAI response_format=json_object (the prompt already mandates JSON);
+  // ignored for Anthropic. Non-2xx throws, so the analyzeMessage catch still
+  // emits ai.analysis_failed.
+  const { text } = await callLLM({
+    fn: 'message_analyzer',
+    system: SYSTEM_PROMPT,
+    user: userPrompt,
+    maxTokens: 500,
+    json: true,
   });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => '');
-    throw new Error(`Claude API ${response.status}: ${errText.slice(0, 200)}`);
-  }
-
-  const data = await response.json();
-  const text = data.content
-    ?.filter(block => block.type === 'text')
-    .map(block => block.text)
-    .join('') || '';
 
   const clean = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
   return JSON.parse(clean);
@@ -709,11 +694,6 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
   // of the same exact message in the short window; genuinely-different
   // inbounds have different hashes and run normally).
   markAnalyzed(ghlContactId, messageText);
-
-  if (!ANTHROPIC_API_KEY) {
-    console.error('[MessageAnalyzer] ANTHROPIC_API_KEY not configured — cannot analyze');
-    return null;
-  }
 
   const startTime = Date.now();
 
@@ -970,7 +950,7 @@ export function registerMessageAnalyzerRoutes(app) {
       remaining: Math.max(0, ANALYSIS_RATE_LIMIT - analysisCount),
       cache_size: analysisCache.size,
       cache_ttl_ms: ANALYSIS_CACHE_TTL_MS,
-      api_key_configured: !!ANTHROPIC_API_KEY,
+      llm: resolveLLM('message_analyzer'),
     });
   });
 }

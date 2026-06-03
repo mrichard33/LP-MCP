@@ -71,10 +71,12 @@
  */
 
 import supabase from '../supabase.js';
+import { callLLM } from '../llm-client.js';
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
-const CLASSIFIER_MODEL = process.env.INTENT_CLASSIFIER_MODEL || 'claude-haiku-4-5-20251001';
-const CLASSIFIER_TIMEOUT_MS = 15000;
+// Provider + model resolved at call time by the shared client from the
+// `intent_classifier` fn key (decision_engine group). Legacy
+// INTENT_CLASSIFIER_MODEL is still honored by the client for Anthropic
+// back-compat (was claude-haiku-4-5-20251001).
 const CLASSIFIER_MAX_TOKENS = 200;
 
 // Cache active handlers in-memory (TTL 60s) — they change rarely.
@@ -264,37 +266,17 @@ function buildClassifierPrompt(messageText, handlers, conversationContext) {
 }
 
 async function classifyWithClaude(messageText, handlers, conversationContext) {
-  if (!ANTHROPIC_API_KEY) {
-    throw new Error('ANTHROPIC_API_KEY not configured');
-  }
-
   const userPrompt = buildClassifierPrompt(messageText, handlers, conversationContext);
 
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: CLASSIFIER_MODEL,
-      max_tokens: CLASSIFIER_MAX_TOKENS,
-      messages: [{ role: 'user', content: userPrompt }],
-    }),
-    signal: AbortSignal.timeout(CLASSIFIER_TIMEOUT_MS),
+  // json:true → OpenAI response_format=json_object (the prompt already asks
+  // for a JSON object); ignored for Anthropic. Non-2xx throws and is caught
+  // by classifyInbound, which falls back to UNCLEAR.
+  const { text } = await callLLM({
+    fn: 'intent_classifier',
+    user: userPrompt,
+    maxTokens: CLASSIFIER_MAX_TOKENS,
+    json: true,
   });
-
-  if (!res.ok) {
-    const errText = await res.text().catch(() => '');
-    throw new Error(`Claude classifier ${res.status}: ${errText.slice(0, 200)}`);
-  }
-
-  const data = await res.json();
-  const text = data.content
-    ?.filter(b => b.type === 'text')
-    .map(b => b.text)
-    .join('') || '';
 
   const clean = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
 

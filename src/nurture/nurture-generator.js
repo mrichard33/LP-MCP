@@ -87,13 +87,14 @@
  */
 
 import crypto from 'crypto';
+import { callLLM, resolveLLM } from '../llm-client.js';
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
-const MODEL = process.env.NURTURE_GENERATOR_MODEL || 'claude-sonnet-4-6';
+// Provider + model resolved at call time by the shared client from the
+// `nurture_generator` fn key (customer_facing group). Legacy
+// NURTURE_GENERATOR_MODEL is still honored by the client for Anthropic
+// back-compat. Timeout is centralized in the client (LLM_TIMEOUT_MS).
 const MAX_TOKENS = parseInt(process.env.NURTURE_MAX_TOKENS || '3000', 10);
-const TIMEOUT_MS = parseInt(process.env.NURTURE_TIMEOUT_MS || '30000', 10);
 const TEMPERATURE_DEFAULT = parseFloat(process.env.NURTURE_TEMPERATURE || '0.7');
-const ANTHROPIC_VERSION = '2023-06-01';
 
 /**
  * Upper bound for max_tokens on the truncation retry. Bounds cost and
@@ -160,53 +161,36 @@ function renderTemplate(template, context) {
  * optional markdown fences (```json) in case the model adds them.
  */
 async function callClaude(systemPrompt, userPrompt, opts) {
-  const { model, maxTokens, temperature } = opts;
-  const body = {
-    model,
-    max_tokens: maxTokens,
-    temperature,
-    system: systemPrompt,
-    messages: [
-      { role: 'user', content: userPrompt },
-    ],
-  };
+  const { maxTokens, temperature } = opts;
 
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': ANTHROPIC_VERSION,
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(TIMEOUT_MS),
+  // Provider/model resolved from env by the shared client. json:true sets
+  // OpenAI response_format=json_object (the prompts already mandate strict
+  // JSON); ignored for Anthropic. Non-2xx throws inside the client.
+  const { text, raw } = await callLLM({
+    fn: 'nurture_generator',
+    system: systemPrompt,
+    user: userPrompt,
+    maxTokens,
+    temperature,
+    json: true,
   });
 
-  if (!res.ok) {
-    const errText = await res.text().catch(() => '');
-    throw new Error(`Anthropic ${res.status}: ${errText.slice(0, 300)}`);
-  }
-
-  const data = await res.json();
-
-  // Detect truncation BEFORE attempting to parse. Claude returns the
-  // partial content with stop_reason='max_tokens' when the model hits
-  // the ceiling mid-stream. Parsing that as JSON produces a misleading
-  // "malformed JSON" error that hides the real cause.
-  if (data.stop_reason === 'max_tokens') {
+  // Detect truncation BEFORE attempting to parse. A truncated body parses as
+  // "malformed JSON" and hides the real cause. Anthropic signals this via
+  // stop_reason='max_tokens'; OpenAI via choices[0].finish_reason='length'.
+  const stopReason = raw?.stop_reason || raw?.choices?.[0]?.finish_reason;
+  if (stopReason === 'max_tokens' || stopReason === 'length') {
     throw new MaxTokensError(
-      `Anthropic hit max_tokens=${maxTokens} ceiling — output truncated`,
+      `LLM hit max_tokens=${maxTokens} ceiling — output truncated`,
       maxTokens,
     );
   }
 
-  const textBlock = (data.content || []).find(b => b.type === 'text');
-  const rawText = textBlock?.text;
-  if (!rawText) {
-    throw new Error('Anthropic returned no text content');
+  if (!text) {
+    throw new Error('LLM returned no text content');
   }
 
-  return extractJson(rawText);
+  return extractJson(text);
 }
 
 /**
@@ -372,14 +356,14 @@ function buildRetrySuffix(firstErr) {
  *   .secondErrorWasJsonParse  — boolean
  */
 export async function generateNurtureContent(prompt, context) {
-  if (!ANTHROPIC_API_KEY) {
-    throw new Error('ANTHROPIC_API_KEY not configured');
-  }
-
   const reqId = crypto.randomBytes(4).toString('hex');
   const startedAt = Date.now();
 
-  const model = prompt.model || MODEL;
+  // Provider/model are now env-controlled via the shared client; the actual
+  // model used is resolved here purely for logging/audit. (A per-prompt-row
+  // model override would now be expressed as a NURTURE_GENERATOR_MODEL_* /
+  // group env var rather than the legacy prompt.model column.)
+  const model = resolveLLM('nurture_generator').model;
   const maxTokens = prompt.max_tokens || MAX_TOKENS;
   const temperature = prompt.temperature ?? TEMPERATURE_DEFAULT;
   const systemPrompt = prompt.system_prompt;

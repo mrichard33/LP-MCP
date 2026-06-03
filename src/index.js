@@ -30,6 +30,8 @@ import {
 import { registerContextBuilderRoutes } from './context-builder.js';
 import { registerBehavioralEmitterRoutes } from './behavioral-emitter.js';
 import { registerMessageAnalyzerRoutes } from './message-analyzer.js';
+import { resolveLLM, FUNCTION_GROUPS } from './llm-client.js';
+import { registerLlmGatewayRoutes } from './llm-gateway.js';
 // ─── Layer 3.5: Intent Scoring + Conversion Engine ───────────────
 import { registerIntentScorerRoutes } from './intent-scorer.js';
 // ─── Phase 4: KB Vector Ingestion (agentic bot knowledge layer) ──
@@ -217,6 +219,24 @@ app.get('/health', (req, res) => {
   });
 });
 
+// ─── LLM provider/model diagnostics ──────────────────────────────────
+// Shows the provider + model the shared client (src/llm-client.js) resolves
+// for every logical function from the CURRENT env — so the live config can be
+// confirmed after an env change without guessing. Read-only, no LLM calls.
+app.get('/diag/llm', (req, res) => {
+  const functions = {};
+  for (const fn of Object.keys(FUNCTION_GROUPS)) functions[fn] = resolveLLM(fn);
+  res.json({
+    status: 'ok',
+    credentials: {
+      anthropic: process.env.ANTHROPIC_API_KEY ? 'set' : 'MISSING',
+      openai: process.env.OPENAI_API_KEY ? 'set' : 'MISSING',
+    },
+    timeout_ms: parseInt(process.env.LLM_TIMEOUT_MS || '30000', 10),
+    functions,
+  });
+});
+
 const streamableSessions = {};
 
 function isInitializeRequest(body) {
@@ -308,6 +328,9 @@ app.post('/webhook/lp', async (req, res) => {
 registerN8nEnrichRoute(app);
 registerN8nHelperRoutes(app);
 registerN8nAvatarRoutes(app);
+
+// ─── LLM gateway (env-controlled provider/model for n8n + HL MCP) ─
+registerLlmGatewayRoutes(app);
 
 // ─── Agentic Decision Engine + Action Executor ───────────────────
 registerDecisionEngineRoutes(app);
