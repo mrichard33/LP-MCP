@@ -91,7 +91,21 @@
 
 import { ghlFetch, interpolatePayload } from '../helpers.js';
 import { CALENDAR_MAP, GHL_LOCATION_ID } from '../constants.js';
-import { updateGHLContactFields } from '../../ghl.js';
+import { updateGHLContactFields, applyGHLTag, removeGHLTags } from '../../ghl.js';
+import { fetchUpcomingAppointments } from '../../knowledge/contact-appointments.js';
+import { isInHomeCalendarId } from '../../knowledge/booking-calendar-router.js';
+
+// Tags cleared once a booking lands (or the flow otherwise terminates) so the
+// post-qualification affirmative-gate bypass (intent-classifier.js) doesn't
+// stay on permanently for the contact. See BUILD HANDOFF §8 correction #6.
+const BOOKING_FLOW_TAGS = ['booking:active', 'booking:dm-pending'];
+// Rule #155 SPOUSE_GATE_BLOCK_SOLO_BOOKING fires on ghl.appointment_booked when
+// the contact has gate:spouse-required and lacks spouse-confirmed-attending. For
+// a confirmed in-home booking we set the release tag (and drop the gate tag)
+// BEFORE creating the appointment so #155's condition is already false when the
+// booked event fires. See BUILD HANDOFF §8.
+const SPOUSE_RELEASE_TAG = 'spouse-confirmed-attending';
+const SPOUSE_GATE_TAG = 'gate:spouse-required';
 
 // v3.1: GHL custom field IDs for qualifying-data persistence.
 const FIELD_ID_WINDOW_COUNT = 'h9FJTUbmUHIuD6JKmpXv';
@@ -220,12 +234,67 @@ function buildAppointmentBody(payload, contactId) {
   return { body, calendarId, startTime, endTime, title, status, ignoreFreeSlotValidation };
 }
 
+/**
+ * v3.4 — Double-book guard. Returns an already-existing active future
+ * appointment on `calendarId` for the contact, or null. Reuses the live
+ * appointment lookup. On lookup failure returns null (fail-open: we'd rather
+ * risk a rare duplicate than block a legitimate booking on a transient API
+ * error — GHL also rejects exact-overlap slots server-side).
+ */
+async function findExistingAppointmentOnCalendar(contactId, calendarId) {
+  if (!contactId || !calendarId) return null;
+  try {
+    const upcoming = await fetchUpcomingAppointments(contactId);
+    if (!Array.isArray(upcoming)) return null;
+    return upcoming.find((a) => a.calendar_id === calendarId) || null;
+  } catch (err) {
+    console.warn(`[ActionExecutor] double-book guard lookup threw for ${contactId}: ${err.message}`);
+    return null;
+  }
+}
+
 export async function executeBookAppointment(action, context) {
   const contactId = action.target_id;
   const payload = interpolatePayload(action.action_payload, context);
   if (!contactId) throw new Error('Missing contactId');
 
   const { body, calendarId, startTime, endTime, title, status, ignoreFreeSlotValidation } = buildAppointmentBody(payload, contactId);
+
+  // v3.4: double-book guard. The executor reaps stuck actions and can re-run a
+  // book_appointment, and the model can emit a duplicate on a re-confirm. If an
+  // active future appointment already exists on this calendar, do NOT create a
+  // second one — return the existing as a no-op success. See BUILD HANDOFF §8.
+  const existing = await findExistingAppointmentOnCalendar(contactId, calendarId);
+  if (existing) {
+    console.log(`[ActionExecutor] ⏭️  Double-book guard: contact ${contactId} already has appointment ${existing.appointment_id} on calendar ${calendarId} (start=${existing.start_time}) — skipping create.`);
+    await removeGHLTags(contactId, BOOKING_FLOW_TAGS).catch(() => {});
+    return {
+      action: 'appointment_book_skipped_existing',
+      appointment_id: existing.appointment_id,
+      calendar_id: calendarId,
+      calendar_name: existing.calendar_name || title,
+      contact_id: contactId,
+      start_time: existing.start_time,
+      status: existing.status,
+      skipped_reason: 'active_future_appointment_exists',
+    };
+  }
+
+  const inHome = isInHomeCalendarId(calendarId);
+  const dmPresent = payload.qualifying_data?.decision_makers_present;
+
+  // v3.4: rule #155 reconciliation. For a confirmed in-home booking where all
+  // decision-makers will attend, set the spouse-gate release tag and drop the
+  // gate tag BEFORE creating the appointment, so SPOUSE_GATE_BLOCK_SOLO_BOOKING
+  // (which fires on the ghl.appointment_booked event) sees its condition as
+  // already false and does not auto-cancel a valid booking. Only on an explicit
+  // 'Yes' and only for in-home calendars — never for phone bookings (a stale
+  // release tag there could later neutralize #155 for a genuine solo in-home).
+  if (inHome && dmPresent === 'Yes') {
+    await applyGHLTag(contactId, SPOUSE_RELEASE_TAG).catch((err) =>
+      console.warn(`[ActionExecutor] #155 release tag add threw for ${contactId}: ${err.message}`));
+    await removeGHLTags(contactId, [SPOUSE_GATE_TAG]).catch(() => {});
+  }
 
   console.log(`[ActionExecutor] Booking appointment: calendar=${calendarId}, contact=${contactId}, start=${startTime}, status=${status}${ignoreFreeSlotValidation ? ', override_availability=true' : ''}`);
   const result = await ghlFetch('POST', '/calendars/events/appointments', body);
@@ -237,6 +306,10 @@ export async function executeBookAppointment(action, context) {
   if (payload.qualifying_data) {
     qualifyingDataFieldsWritten = await persistQualifyingData(contactId, payload.qualifying_data);
   }
+
+  // v3.4: tear down the booking-flow tags now that a booking has landed, so the
+  // affirmative-gate bypass doesn't persist for this contact. See §8 #6.
+  await removeGHLTags(contactId, BOOKING_FLOW_TAGS).catch(() => {});
 
   return {
     action: 'appointment_booked',

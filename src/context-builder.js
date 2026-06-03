@@ -101,6 +101,7 @@ const CF_LP_LOST_REASON = 'I9CbRV0dKMfwaSlge9uU';
 // the actual estimate must outrank rep notes.
 const CF_ESTIMATE_TOTAL = 'PqUYMgBojosjSGMBEUqX';   // dollar amount, e.g. "15775.17"
 const CF_WINDOW_COUNT   = 'h9FJTUbmUHIuD6JKmpXv';   // integer count, e.g. "12"
+const CF_DECISION_MAKERS_PRESENT = 'GH1QGGOseMKmJAMqajiN'; // select: Yes|No|Solo Owner|Uncertain
 
 // LP dispositions where stale data is high-risk (active deals).
 const LP_ACTIVE_DISPOSITIONS = new Set([
@@ -617,6 +618,11 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     : null;
   const estimateTotal = coerceMoney(cfEstimateTotalRaw);
   const windowCount = coerceCount(cfWindowCountRaw);
+  // Decision-maker presence (for the in-home booking gate). Raw select value:
+  // 'Yes' | 'No' | 'Solo Owner' | 'Uncertain' | null.
+  const decisionMakersPresent = ghlContact?.customFields
+    ? getCustomFieldValue(ghlContact.customFields, CF_DECISION_MAKERS_PRESENT)
+    : null;
 
   if (cfProspectId) {
     lpLead = await fetchLPLeadByProspectId(cfProspectId);
@@ -689,6 +695,8 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       postal_code: ghlContact?.postalCode || null,
       country: ghlContact?.country || null,
       entry_source: parseEntrySource(tags) || intelligence?.entry_source || null,
+      // Decision-maker presence for the in-home booking gate (raw GHL select).
+      decision_makers_present: decisionMakersPresent,
       current_tags: tags,
       current_stage_tag: parseStageTag(tags),
       current_buyer_tag: parseBuyerTag(tags),
