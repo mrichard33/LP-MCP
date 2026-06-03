@@ -630,6 +630,7 @@ export async function buildKbPack(params) {
     activeEntryTag = null,
     hasExistingAppt = false,
     lpDisposition = null,
+    contactTags = [],
   } = params;
 
   const detectedCompetitor = detectCompetitorMention(messageText);
@@ -743,6 +744,20 @@ export async function buildKbPack(params) {
 
     default:
       break;
+  }
+
+  // Mid-booking backstop: if the contact is already in the booking flow (tags set
+  // by the resolver / buyer-journey), attach booking_context regardless of intent.
+  // Without this, an ack/status turn ("Hello?", "is that scheduled already?") with
+  // no scheduling-signal keywords attaches nothing, the calendar resolver is
+  // skipped, and the model can emit a raw, mis-routed companion. Attaching it lets
+  // the resolver pick the right calendar (risk-report→PPR, estimate-calc→MV,
+  // default→Window Estimate) and keeps the decision-maker/address gate live.
+  const inBookingFlow = Array.isArray(contactTags) && contactTags.some(
+    (t) => t === 'booking:active' || t === 'booking:dm-pending' || t === 'bj:stage-5-committed',
+  );
+  if (inBookingFlow && !result.booking_context) {
+    result.booking_context = resolveBookingContext(bookingCtxArgs);
   }
 
   if (detectedCompetitor) {

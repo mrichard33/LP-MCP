@@ -826,6 +826,21 @@ export async function processApprovalQueue() {
                   reasoning: companion.reasoning || null,
                   auto_executing: isAutoExecuting,
                 };
+
+                // Fast-path: fire auto-execute companions (book/cancel/reschedule)
+                // inline instead of waiting for the next ~60s executor sweep —
+                // mirrors the send_message fast-path in decision-engine.js. A
+                // single hung handler stalling the sweep previously left bookings
+                // pending for minutes. Same handler (and the §A1 status
+                // normalization), just immediate. No double-execute: the sweep
+                // claims by status and executeActionById no-ops on
+                // terminal/executing states. Dynamic import avoids the circular
+                // dependency (index.js imports approval-path.js). Fire-and-forget.
+                if (isAutoExecuting && companionRow?.id) {
+                  import('./index.js')
+                    .then(({ executeActionById }) => executeActionById(companionRow.id))
+                    .catch(err => console.warn(`[ApprovalPath] inline book/cancel/reschedule fast-path failed for action ${companionRow.id}: ${err.message}`));
+                }
               }
             } catch (insertErr) {
               console.warn(`[ActionExecutor] Companion insert threw for batch ${batchId}: ${insertErr.message} — proceeding without companion`);

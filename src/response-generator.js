@@ -145,7 +145,9 @@ import {
   requiresInHomeGate,
   durationForCalendar,
   calendarNameForKey,
+  isInHomeCalendarId,
 } from './knowledge/booking-calendar-router.js';
+import { CALENDAR_MAP } from './actions/constants.js';
 import { applyGHLTag } from './ghl.js';
 import supabase from './supabase.js';
 import { callLLM, resolveLLM } from './llm-client.js';
@@ -1132,13 +1134,12 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   // ─── Booking gate (BUILD HANDOFF §4) — only when a calendar is resolved ───
   const bcg = kbPack?.booking_context;
   if (bcg && bcg.requires_in_home_gate === true) {
-    parts.push(`\n═══════ IN-HOME BOOKING GATE (a rep visits the home — decision-makers + address REQUIRED) ═══════`);
-    parts.push(`This booking targets the in-home ${bcg.resolved_calendar_name} calendar (${bcg.booking_duration_minutes} min). Clear two gates IN ORDER before booking. Work one step per turn:`);
+    parts.push(`\n═══════ IN-HOME BOOKING GATE (a rep visits the home — capture decision-makers + address) ═══════`);
+    parts.push(`This booking targets the in-home ${bcg.resolved_calendar_name} calendar (${bcg.booking_duration_minutes} min). ALWAYS book on a hard confirmation — there is no hold. Decision-maker confirmation drives the STATUS, not whether to book. Work one step per turn:`);
     parts.push(`  On file → decision-makers: ${bcg.dm_present_value || 'not yet captured'} | address: ${bcg.address_on_file || '(none on file)'} | address confirmed: ${bcg.address_confirmed ? 'yes' : 'no'}`);
-    parts.push(`  STEP 1 — Decision-makers: if not already confirmed, ask whether everyone who'll be part of the decision will be present ("will both of you / all the owners be there?"). Do NOT propose times yet. Map their answer to Yes / Solo Owner / No / Uncertain and emit it in qualifying_data.decision_makers_present once they state it.`);
-    parts.push(`  STEP 2 — If decision-makers = No / Uncertain / "I'll have to check": DO NOT BOOK. This OVERRIDES the PATH B "book as new when unsure" default — for an in-home visit, unsure means HOLD, not book. Acknowledge, offer to hold the time and have them text back once they've confirmed with the other decision-maker(s), then STOP. Emit NO companion_action this turn.`);
-    parts.push(`  STEP 3 — Address: once decision-makers = Yes or Solo Owner, confirm the visit location ("want to make sure we send the team to the right place — is ${bcg.address_on_file || 'your address on file'} where you'd like the visit?"). Capture any correction. Do NOT re-ask name or phone — those are already on file.`);
-    parts.push(`  STEP 4 — Only when decision-makers (Yes/Solo Owner) AND the address are confirmed: propose 2–3 real slots from CALENDAR AVAILABILITY; on a hard confirmation emit book_appointment (status "confirmed" if Q1+Q2+Q3 pass, else "new") with qualifying_data, and confirm back ("You're all set for {day} at {time} — you'll get a confirmation text.").`);
+    parts.push(`  STEP 1 — Decision-makers: if not already captured, ask whether everyone who'll be part of the decision will be present ("will both of you / all the owners be there?"). Map their answer to Yes / Solo Owner / No / Uncertain and emit it in qualifying_data.decision_makers_present once they state it.`);
+    parts.push(`  STEP 2 — Address: confirm the visit location ("want to make sure we send the team to the right place — is ${bcg.address_on_file || 'your address on file'} where you'd like the visit?"). Capture any correction. Do NOT re-ask name or phone — those are already on file.`);
+    parts.push(`  STEP 3 — Propose 2–3 real slots from CALENDAR AVAILABILITY; on a hard confirmation ALWAYS emit book_appointment with qualifying_data, and confirm back ("You're all set for {day} at {time} — you'll get a confirmation text."). STATUS: "confirmed" only when decision-makers are confirmed (Yes / Solo Owner); otherwise "new" (tentative — a human confirms). Never withhold the booking because decision-makers are unsure.`);
     parts.push(`═══════ END IN-HOME BOOKING GATE ═══════`);
   } else if (bcg && bcg.requires_in_home_gate === false) {
     parts.push(`\n═══════ PHONE BOOKING (no in-home gate) ═══════`);
@@ -1589,6 +1590,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       activeEntryTag,
       hasExistingAppt,
       lpDisposition,
+      contactTags: context.lead?.current_tags || [],
     });
   } catch (err) {
     console.warn(`[ResponseGenerator] KB pack build failed for ${contactId}: ${err.message} — proceeding without`);
@@ -1681,28 +1683,32 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // The model is the wrong place to (a) copy an opaque calendar id, (b) know the
   // phone-vs-in-home duration, or (c) be trusted to honor the in-home hold gate.
   // We enforce all three here from the resolver result.
-  if (validated.companion_action?.action_type === 'book_appointment' && bookingResolution) {
+  if (validated.companion_action?.action_type === 'book_appointment') {
     const cap = validated.companion_action.action_payload || {};
-    const requiresGate = requiresInHomeGate(bookingResolution.calendar_key);
 
-    // (a) authoritative calendar id — never the model-echoed name (CALENDAR_MAP
-    //     maps the PPR id to "Review Session", so trusting the name misroutes).
-    cap.calendar_id = bookingResolution.calendar_id;
-    // (b) per-calendar duration (phone calls are short; default would be 90).
-    cap.duration_minutes = durationForCalendar(bookingResolution.calendar_key);
+    // (a) authoritative calendar id — decoupled from bookingResolution so this
+    //     fires even when the resolver was skipped (e.g. an ack/status turn that
+    //     attached no booking_context and the model parroted a raw companion).
+    //     Prefer the resolver, then any id the model echoed, then map the name.
+    //     NEVER trust the name to route: CALENDAR_MAP maps the PPR id to
+    //     "Review Session", so a name lookup can misroute.
+    const targetCalId = bookingResolution?.calendar_id
+      || cap.calendar_id
+      || CALENDAR_MAP[cap.calendar_name];
+    cap.calendar_id = targetCalId;
+    // (b) per-calendar duration when the resolver ran (phone calls are short);
+    //     otherwise leave whatever the model/handler will derive.
+    if (bookingResolution) {
+      cap.duration_minutes = durationForCalendar(bookingResolution.calendar_key);
+    }
 
-    if (requiresGate) {
-      // (c) PATH B override for in-home: the existing prompt would book-as-"new"
-      //     when qualifiers are missing. Our requirement is the opposite — an
-      //     unsatisfied decision-maker gate must HOLD, not book. Drop the booking
-      //     companion unless the DM gate explicitly passes (Yes | Solo Owner).
+    const inHome = isInHomeCalendarId(targetCalId);
+    if (inHome) {
+      // In-home: ALWAYS book — status tracks decision-maker confirmation.
+      // 'confirmed' only when decision-makers are confirmed (Yes | Solo Owner),
+      // else 'new' (tentative; a human confirms). No hold, no dm-pending tag.
       const dm = cap.qualifying_data?.decision_makers_present;
-      const dmPass = dm === 'Yes' || dm === 'Solo Owner';
-      if (!dmPass) {
-        console.warn(`[ResponseGenerator] In-home gate not satisfied (decision_makers_present=${dm ?? 'absent'}) for ${contactId} on ${bookingResolution.calendar_key} — dropping book_appointment, holding the spot.`);
-        validated.companion_action = null;
-        applyGHLTag(contactId, 'booking:dm-pending').catch(() => {});
-      }
+      cap.status = (dm === 'Yes' || dm === 'Solo Owner') ? 'confirmed' : 'new';
     } else {
       // Phone calendars (PPR, Confirmation Call): no decision-maker concept —
       // strip qualifying_data so we never write a spurious DM value for a call.
