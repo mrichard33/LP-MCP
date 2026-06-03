@@ -26,7 +26,7 @@ import { isInHomeCalendarId } from '../knowledge/booking-calendar-router.js';
  * any error or empty result (fail-open — never block a dispatch on a transient
  * lookup failure). fetchUpcomingAppointments already excludes cancelled/no-show.
  */
-async function hasActiveInHomeAppointment(contactId) {
+export async function hasActiveInHomeAppointment(contactId) {
   if (!contactId) return false;
   try {
     const upcoming = await fetchUpcomingAppointments(contactId);

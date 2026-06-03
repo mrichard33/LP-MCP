@@ -231,7 +231,7 @@ const replyBuffers = new Map();
  *
  * Timeline target: ~10-15 seconds end-to-end.
  */
-async function triggerAgenticPipeline(contactId, messageText, channel = null) {
+async function triggerAgenticPipeline(contactId, messageText, channel = null, messageId = null) {
   const start = Date.now();
 
   // Step 1: Analyze the message (~4-8 sec — Claude API call)
@@ -249,7 +249,10 @@ async function triggerAgenticPipeline(contactId, messageText, channel = null) {
     const analyzeRes = await fetch(`${SELF_BASE_URL}/n8n/analyze-message`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contactId, message: messageText, channel }),
+      // Fix 3 (2026-06-03): forward the inbound message_id so it threads onto
+      // ai.analysis_completed and ultimately keys the outbound dedup lock to the
+      // real inbound (not evt-${id}).
+      body: JSON.stringify({ contactId, message: messageText, channel, message_id: messageId }),
       signal: AbortSignal.timeout(45000),
     });
     if (!analyzeRes.ok) {
@@ -314,7 +317,7 @@ async function triggerAgenticPipeline(contactId, messageText, channel = null) {
  * so the 5-min heartbeat backstop in decision-engine doesn't re-analyze
  * the individual messages and produce stale single-message classifications.
  */
-function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageType = null) {
+function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageType = null, messageId = null) {
   let buf = replyBuffers.get(contactId);
   if (buf?.timeoutId) clearTimeout(buf.timeoutId);
   if (!buf) {
@@ -322,7 +325,9 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageTyp
     // buffer window. Normalized to 'sms'|'email'|null when the buffer
     // fires and passed downstream so the analyzer can carry channel
     // forward into ai.analysis_completed.
-    buf = { messages: [], eventIds: [], firstSeenAt: Date.now(), timeoutId: null, latestType: null };
+    // Fix 3: latestMessageId — the inbound message_id of the most recent
+    // message in the window; the outbound reply dedups against this.
+    buf = { messages: [], eventIds: [], firstSeenAt: Date.now(), timeoutId: null, latestType: null, latestMessageId: null };
     replyBuffers.set(contactId, buf);
   }
   buf.messages.push(trimmed);
@@ -334,6 +339,9 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageTyp
   // thread), but if they ever differ, "latest wins" is the right policy
   // for the outbound reply.
   if (messageType) buf.latestType = messageType;
+  // Fix 3: "latest wins" — the outbound reply most directly answers the
+  // most recent inbound, so dedup keys on its message_id.
+  if (messageId) buf.latestMessageId = messageId;
 
   buf.timeoutId = setTimeout(() => {
     // Snapshot before deleting; any messages that arrive AFTER this point
@@ -342,6 +350,7 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageTyp
     const eventIds = buf.eventIds.slice();
     const firstSeenAt = buf.firstSeenAt;
     const latestType = buf.latestType;
+    const latestMessageId = buf.latestMessageId;
     replyBuffers.delete(contactId);
 
     const combined = messages.length === 1 ? messages[0] : messages.join('\n');
@@ -367,7 +376,7 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageTyp
     // retry deterministic). PRE-v2.12 these events were marked processed=true
     // BEFORE the pipeline ran, so a failed/hung analysis silently dropped the
     // reply with no retry.
-    runBufferedPipelineWithRetry(contactId, combined, channel, messages, eventIds, 0)
+    runBufferedPipelineWithRetry(contactId, combined, channel, messages, eventIds, 0, latestMessageId)
       .catch(err => console.error(`[ReplyBuffer] Runner error for ${contactId}: ${err.message}`));
   }, REPLY_DEBOUNCE_MS);
 }
@@ -375,10 +384,10 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageTyp
 // v2.12 — Fire the agentic pipeline for a fired buffer and reconcile the source
 // events' processed state with the outcome. Retries on analyze failure with a
 // fixed delay, bounded by BUFFER_MAX_RETRIES.
-async function runBufferedPipelineWithRetry(contactId, combined, channel, messages, eventIds, attempt) {
+async function runBufferedPipelineWithRetry(contactId, combined, channel, messages, eventIds, attempt, messageId = null) {
   let ok = false;
   try {
-    ok = await triggerAgenticPipeline(contactId, combined, channel);
+    ok = await triggerAgenticPipeline(contactId, combined, channel, messageId);
   } catch (err) {
     console.error(`[ReplyBuffer] Pipeline threw for ${contactId} (attempt ${attempt + 1}): ${err.message}`);
     ok = false;
@@ -390,7 +399,7 @@ async function runBufferedPipelineWithRetry(contactId, combined, channel, messag
   if (attempt + 1 < BUFFER_MAX_RETRIES) {
     console.warn(`[ReplyBuffer] Analysis failed for ${contactId} (attempt ${attempt + 1}/${BUFFER_MAX_RETRIES}) — retrying in ${BUFFER_RETRY_DELAY_MS}ms`);
     setTimeout(() => {
-      runBufferedPipelineWithRetry(contactId, combined, channel, messages, eventIds, attempt + 1)
+      runBufferedPipelineWithRetry(contactId, combined, channel, messages, eventIds, attempt + 1, messageId)
         .catch(err => console.error(`[ReplyBuffer] Retry runner error for ${contactId}: ${err.message}`));
     }, BUFFER_RETRY_DELAY_MS);
     return;
@@ -473,6 +482,11 @@ async function handleReply(req, res) {
   const contactId = body.contactId || body.contact_id || body.id || null;
   const messageText = body.body || body.message || body.text || '';
   const messageType = body.messageType || body.type || 'SMS';
+  // Fix 3 (2026-06-03): capture the GHL inbound message id so it can be threaded
+  // to the outbound dedup lock. Do NOT fall back to body.id — that is the
+  // contactId fallback above and is not a message id (using it would key the
+  // lock to the contact and over-suppress). Falls back to null when absent.
+  const messageId = cleanGHLValue(body.messageId) || cleanGHLValue(body.message_id) || null;
 
   if (!contactId) return res.status(400).json({ error: 'Missing contactId in webhook payload' });
   const trimmed = messageText.trim();
@@ -483,7 +497,7 @@ async function handleReply(req, res) {
     await emitEvent({
       event_type: 'ghl.reply_received', event_subtype: 'dnc', source: 'ghl_webhook',
       entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
-      payload: { message_text: trimmed, message_type: messageType, engagement_quality: 'dnc', word_count: trimmed.split(/\s+/).length },
+      payload: { message_text: trimmed, message_type: messageType, message_id: messageId, engagement_quality: 'dnc', word_count: trimmed.split(/\s+/).length },
       priority: 'critical', idempotency_key: `ghl_reply_dnc_${contactId}_${Date.now()}`,
     });
     console.log(`[BehavioralEmitter] DNC reply from ${contactId}: "${trimmed.slice(0, 50)}"`);
@@ -518,7 +532,7 @@ async function handleReply(req, res) {
       await emitEvent({
         event_type: 'ghl.reply_received', event_subtype: 'trivial', source: 'ghl_webhook',
         entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
-        payload: { message_text: trimmed, message_type: messageType, engagement_quality: 'neutral', word_count: trimmed.split(/\s+/).length },
+        payload: { message_text: trimmed, message_type: messageType, message_id: messageId, engagement_quality: 'neutral', word_count: trimmed.split(/\s+/).length },
         priority: 'low', idempotency_key: `ghl_reply_trivial_${contactId}_${Date.now()}`,
       });
       return res.json({ status: 'accepted', classification: 'trivial' });
@@ -536,7 +550,7 @@ async function handleReply(req, res) {
   const emittedEvent = await emitEvent({
     event_type: 'ghl.reply_received', event_subtype: 'pending_analysis', source: 'ghl_webhook',
     entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
-    payload: { message_text: trimmed, message_type: messageType, word_count: trimmed.split(/\s+/).length },
+    payload: { message_text: trimmed, message_type: messageType, message_id: messageId, word_count: trimmed.split(/\s+/).length },
     priority: 'high', idempotency_key: `ghl_reply_${contactId}_${Date.now()}`,
   });
   console.log(`[BehavioralEmitter] Substantive reply from ${contactId} (${trimmed.split(/\s+/).length} words, type=${messageType}) → buffered for ${REPLY_DEBOUNCE_MS}ms`);
@@ -548,7 +562,7 @@ async function handleReply(req, res) {
   // v2.8: pass messageType so the buffer can carry channel forward to
   // the agentic pipeline (and ultimately to ai.analysis_completed and
   // the send_message action's channel field).
-  scheduleBufferedPipeline(contactId, trimmed, emittedEvent?.id, messageType);
+  scheduleBufferedPipeline(contactId, trimmed, emittedEvent?.id, messageType, messageId);
 
   return res.json({ status: 'accepted', classification: 'pending_analysis', buffered: true });
 }
