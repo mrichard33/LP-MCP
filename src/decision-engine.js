@@ -154,6 +154,9 @@
 import supabase from './supabase.js';
 import { analyzeMessage } from './message-analyzer.js';
 import { scoreIntent } from './intent-scorer.js';
+// Fast-path: run customer-facing replies inline at enqueue instead of waiting
+// for the ~60s executor sweep. Re-exported from actions/index.js.
+import { executeActionById } from './action-executor.js';
 
 // MVI v2.5 — inbound idempotency. Claim before processing; record result on
 // completion so duplicate webhook deliveries can't double-fire rules.
@@ -763,7 +766,28 @@ async function createActionsFromRule(event, rule) {
       requires_approval: requiresApproval, priority, batch_id: batchId, sequence_order: i,
     }).select().single();
     if (error) { console.error(`[DecisionEngine] Action create failed for ${rule.rule_key}:`, error.message); }
-    else { created.push(data); console.log(`[DecisionEngine] Action: ${tmpl.action_type} (${requiresApproval ? 'approval' : 'auto'}, priority=${priority}) — ${rule.rule_key}`); }
+    else {
+      created.push(data);
+      console.log(`[DecisionEngine] Action: ${tmpl.action_type} (${requiresApproval ? 'approval' : 'auto'}, priority=${priority}) — ${rule.rule_key}`);
+
+      // Fast-path: execute the customer-facing reply immediately instead of
+      // waiting for the next ~60s executor sweep. executeActionById runs the
+      // full send_message path (suppression + outbound_lock + handler), so the
+      // executor claiming the same row later is deduped by the lock — no
+      // double-send. Fire-and-forget so enqueue latency is unaffected.
+      // The rule-key clause is what actually matches the reply (send_message
+      // takes the default priority 20); priority<=15 is an OR fallback for any
+      // future rule that sets an explicit high-priority lane.
+      if (
+        !requiresApproval &&
+        data.status === 'pending' &&
+        tmpl.action_type === 'send_message' &&
+        (rule.rule_key === 'AGENTIC_RESPOND_POST_CHATBOT' || priority <= 15)
+      ) {
+        executeActionById(data.id).catch(err =>
+          console.warn(`[DecisionEngine] reply fast-path failed for action ${data.id}: ${err.message}`));
+      }
+    }
   }
   return created;
 }
