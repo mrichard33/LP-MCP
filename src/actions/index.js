@@ -29,10 +29,11 @@
  *   originating system_events row by action.event_id when they need
  *   structural fields like event.id or event.payload.message_id.
  *
- * Supported action types (26):
+ * Supported action types (27):
  *   add_tag, remove_tag, set_stage, move_opportunity, update_opportunity,
  *   remove_from_workflow, add_to_workflow, book_appointment,
- *   cancel_appointment, reschedule_appointment, create_task,
+ *   cancel_appointment, reschedule_appointment, update_appointment_status,
+ *   create_task,
  *   send_notification, set_lp_appointment, create_lp_lead,
  *   update_lp_dnc_status, update_custom_fields, update_contact_email,
  *   calculate_time_lapse_tier, send_message, layer3_dispatch, emit_event,
@@ -125,7 +126,7 @@ import { validateAction } from '../services/validation-gate.js';
 import { executeAddTag, executeRemoveTag, executeSetStage } from './handlers/tags.js';
 import { executeMoveOpportunity, executeUpdateOpportunity } from './handlers/opportunities.js';
 import { executeAddToWorkflow, executeRemoveFromWorkflow } from './handlers/workflows.js';
-import { executeBookAppointment, executeCancelAppointment, executeRescheduleAppointment } from './handlers/appointments.js';
+import { executeBookAppointment, executeCancelAppointment, executeRescheduleAppointment, executeUpdateAppointmentStatus } from './handlers/appointments.js';
 import { executeSetLPAppointment } from './handlers/lp-appointment.js';
 import { executeCreateLPLead } from './handlers/lp-lead.js';
 import { executeUpdateLPDNCStatus } from './handlers/lp-dnc.js';
@@ -239,7 +240,8 @@ async function executeLayer3Dispatch(action /*, context */) {
     return { skipped: true, reason: 'no_source_event', action_id: action.id };
   }
 
-  const result = await getDispatchForClassification(event.payload || {});
+  const dispatchContactId = action.target_id || event.ghl_contact_id || event.entity_id || null;
+  const result = await getDispatchForClassification(event.payload || {}, { contactId: dispatchContactId });
   if (!result.dispatch) {
     console.log(
       `[ActionExecutor] layer3_dispatch skipped: action=${action.id} reason=${result.reason}` +
@@ -321,6 +323,7 @@ const ACTION_HANDLERS = {
   book_appointment: executeBookAppointment,
   cancel_appointment: executeCancelAppointment,
   reschedule_appointment: executeRescheduleAppointment, // v2.7.8 — agentic reschedule (cancel old + book new)
+  update_appointment_status: executeUpdateAppointmentStatus, // 2026-06-03 — in-home book-then-capture status upgrade (new→confirmed)
   create_task: executeCreateTask,
   send_notification: executeSendNotification,
   set_lp_appointment: executeSetLPAppointment,
@@ -347,6 +350,7 @@ const CONTEXT_AWARE_HANDLERS = new Set([
   'create_task',
   'book_appointment',
   'reschedule_appointment',  // v2.7.8 — needs context for date interpolation in new_start_time
+  'update_appointment_status', // 2026-06-03 — consistent with other appointment actions (context currently unused)
   'update_contact_email',
   'send_message',
   'create_lp_lead',          // 2026-05-01 — needs event payload for appointment_date/time
