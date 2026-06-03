@@ -124,6 +124,19 @@ import {
   registerLeadStateSweepRoutes,
   startLeadStateSweepScheduler,
 } from './agentic/lead-state/sweep.js';
+// ─── Note-Change Analyzer (Point 2 — note-driven re-classification) ──
+// Bounded invoker that finds contacts with note/call activity newer than
+// their last note analysis, applies the Option-B dormancy gate (skip
+// contacts replying within NOTE_CHANGE_QUIET_DAYS — those are on the
+// reactive path), runs note-intelligence (writes lead_intelligence fields
+// ONLY, emits nothing — zero customer-send risk), then re-classifies so a
+// rep's recorded note flows into S4.5 eligibility/suppression. Scheduler
+// no-ops unless NOTE_CHANGE_ANALYZER_ENABLED=true; manual route
+// POST /admin/lead-state/note-change works regardless.
+import {
+  registerNoteChangeAnalyzerRoutes,
+  startNoteChangeAnalyzerScheduler,
+} from './agentic/lead-state/note-change-analyzer.js';
 
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -470,6 +483,7 @@ registerGhlTriggerLinkRoutes(app);
 registerAgenticLeadStateRoutes(app);
 registerLPForceAddLeadRoutes(app);
 registerLeadStateSweepRoutes(app);
+registerNoteChangeAnalyzerRoutes(app);
 
 app.listen(PORT, async () => {
   console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
@@ -492,6 +506,7 @@ app.listen(PORT, async () => {
   startDecisionEngineHeartbeatScheduler();
   startDriftDetectorScheduler();
   startLeadStateSweepScheduler();
+  startNoteChangeAnalyzerScheduler();
   setTimeout(() => {
     setTimeout(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, 120000);
     setInterval(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, FIELD_SYNC_INTERVAL_MS);
