@@ -258,7 +258,7 @@ export async function executeBookAppointment(action, context) {
   const payload = interpolatePayload(action.action_payload, context);
   if (!contactId) throw new Error('Missing contactId');
 
-  const { body, calendarId, startTime, endTime, title, status, ignoreFreeSlotValidation } = buildAppointmentBody(payload, contactId);
+  let { body, calendarId, startTime, endTime, title, status, ignoreFreeSlotValidation } = buildAppointmentBody(payload, contactId);
 
   // v3.4: double-book guard. The executor reaps stuck actions and can re-run a
   // book_appointment, and the model can emit a duplicate on a re-confirm. If an
@@ -282,6 +282,19 @@ export async function executeBookAppointment(action, context) {
 
   const inHome = isInHomeCalendarId(calendarId);
   const dmPresent = payload.qualifying_data?.decision_makers_present;
+
+  // Deterministic status backstop (never blocks). An in-home appointment is
+  // ALWAYS booked — there is no conversational hold. 'confirmed' requires
+  // decision-maker confirmation (Yes | Solo Owner); otherwise book tentative
+  // 'new' (a human confirms later). This mirrors the response-generator gate
+  // (§A2) and catches any companion that reached the handler un-normalized
+  // (e.g. a raw model-parroted companion that skipped the resolver).
+  const dmConfirmed = dmPresent === 'Yes' || dmPresent === 'Solo Owner';
+  if (inHome && !dmConfirmed && status === 'confirmed') {
+    console.warn(`[ActionExecutor] In-home status downgrade: contact ${contactId}, calendar ${calendarId}, decision_makers_present=${dmPresent ?? 'absent'} → booking as 'new' (not confirmed).`);
+    status = 'new';
+    body.appointmentStatus = 'new';
+  }
 
   // v3.4: rule #155 reconciliation. For a confirmed in-home booking where all
   // decision-makers will attend, set the spouse-gate release tag and drop the

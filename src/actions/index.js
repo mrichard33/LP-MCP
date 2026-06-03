@@ -428,7 +428,13 @@ async function executeSingleAction(action, batchContext = {}, priorBatchResults 
     if (CONTEXT_AWARE_HANDLERS.has(action.action_type)) {
       context = { ...(await getEventContext(action)), ...batchContext };
     }
-    const result = await handler(action, context);
+    const result = await Promise.race([
+      handler(action, context),
+      new Promise((_, rej) => setTimeout(
+        () => rej(new Error(`handler ${action.action_type} timed out after ${HANDLER_TIMEOUT_MS}ms`)),
+        HANDLER_TIMEOUT_MS,
+      )),
+    ]);
     if (result?._context) Object.assign(batchContext, result._context);
     await supabase.from('agent_actions').update({
       status: 'completed',
@@ -488,6 +494,13 @@ const EXECUTOR_BATCH_LIMIT   = Math.max(1, parseInt(process.env.EXECUTOR_BATCH_L
 const EXECUTOR_CONCURRENCY   = Math.max(1, parseInt(process.env.EXECUTOR_CONCURRENCY   || '4', 10));
 const EXECUTOR_RUN_BUDGET_MS = Math.max(1000, parseInt(process.env.EXECUTOR_RUN_BUDGET_MS || '50000', 10));
 const EXECUTOR_CLAIM_CHUNK   = Math.max(1, parseInt(process.env.EXECUTOR_CLAIM_CHUNK   || '25', 10));
+
+// Per-handler watchdog. A hung handler (e.g. an add_to_workflow webhook fetch
+// that never resolves) would otherwise sit 'executing' indefinitely and hold the
+// executorRunning guard, freezing the whole sweep so every later action drains
+// minutes late. This race caps any single handler; on timeout the catch below
+// marks the action pending/failed and the sweep returns, releasing the guard.
+const HANDLER_TIMEOUT_MS = parseInt(process.env.EXECUTOR_HANDLER_TIMEOUT_MS || '30000', 10);
 
 // Module-level in-flight guard. Protects BOTH entry points (the n8n /execute
 // route AND the 60s in-process scheduler) from stacking into wasteful empty
