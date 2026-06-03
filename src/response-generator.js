@@ -153,6 +153,19 @@ const PROMPT_TIMEZONE = process.env.REECE_TIMEZONE || 'America/New_York';
 // v2.7.4: how many recent edits to inject as in-context learning examples.
 const RECENT_EDITS_LIMIT = parseInt(process.env.RESPONSE_GENERATOR_EDITS_LIMIT || '3', 10);
 
+// Bound the (only) context-building Supabase read in this file so a slow/locked
+// query degrades to empty context instead of stalling generation for minutes.
+// Mirrors the withTimeout pattern + knob in context-builder.js. (The LLM call
+// is already abort-bounded inside llm-client.js, so it needs no wrapper here.)
+const RESPONSE_GEN_SB_TIMEOUT_MS = parseInt(process.env.RESPONSE_GEN_SB_TIMEOUT_MS || '6000', 10);
+function withTimeout(promise, label, ms = RESPONSE_GEN_SB_TIMEOUT_MS) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 const REECE_DOMAIN_ALLOWLIST = (
   process.env.REECE_DOMAIN_ALLOWLIST ||
   'reecewindows.com,getreecewindows.com,mail.reecewindows.com,reecewindowsmail.com,api.leadconnectorhq.com,app.gohighlevel.com,services.leadconnectorhq.com'
@@ -827,13 +840,16 @@ function formatTodayForPrompt() {
 async function getRecentEdits(intentClass, limit = RECENT_EDITS_LIMIT) {
   if (!intentClass) return [];
   try {
-    const { data, error } = await supabase
-      .from('agent_response_edits')
-      .select('trigger_message, original_message, edit_instruction, final_message, edited_at')
-      .eq('intent_class', intentClass)
-      .not('final_message', 'is', null)
-      .order('edited_at', { ascending: false })
-      .limit(limit);
+    const { data, error } = await withTimeout(
+      supabase
+        .from('agent_response_edits')
+        .select('trigger_message, original_message, edit_instruction, final_message, edited_at')
+        .eq('intent_class', intentClass)
+        .not('final_message', 'is', null)
+        .order('edited_at', { ascending: false })
+        .limit(limit),
+      'getRecentEdits',
+    );
     if (error) {
       console.warn(`[ResponseGenerator] getRecentEdits error: ${error.message}`);
       return [];
