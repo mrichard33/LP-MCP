@@ -1,6 +1,37 @@
 /**
  * LP Appointment Sync — src/lp-appointment-sync.js
  *
+ * v5.2.0 (2026-06-03): SELF-HEAL VIA WORKFLOW 8e30ff37 ENROLLMENT.
+ *
+ *   Root cause (Chuck Celeste): a lead booked an appointment before LP
+ *   had issued its inbound entry, so the contact carried only an in1_id
+ *   and no real lds_id. resolveLPLeadId returned no resolution, and the
+ *   handler dead-ended on a manual "SYNC FAILED" GroupMe card — a human
+ *   had to addlead by hand even though we had everything needed to create
+ *   the lead + appointment automatically.
+ *
+ *   Fix: at the top of the `if (!resolution)` block (before the
+ *   failure-path dedup), enroll the contact in workflow 8e30ff37
+ *   ("Send Lead to Lead Perfection") via enrollLpLeadCreation — the
+ *   canonical addlead-with-appointment + inbound-id writeback path. This
+ *   is the same shared helper the /admin/lp/force-addlead route uses, so
+ *   the manual and self-heal paths stay in lockstep.
+ *
+ *   Behavior:
+ *     • Dedup-guarded (create-lead:<contact>) — a webhook re-fire or GHL
+ *       retry won't double-enroll.
+ *     • FAIL-OPEN — any throw falls through to the existing manual-action
+ *       card path (failKey → sendSyncFailureNotification → writeApptSyncMark),
+ *       which now fires ONLY when enrollment throws.
+ *     • Async by design — lead + appointment creation happens inside the
+ *       workflow (ChatGPT summary, branch checks, addlead carrying
+ *       adate/atime, then LP's ~60s callback writes lp_lead_id/
+ *       lp_prospect_id). We do NOT SetAppointment here and we do NOT clear
+ *       the sync-failed tag at enrollment — the tag should clear when the
+ *       LP callback confirms lds_id, which the next (now-resolvable) sync
+ *       through the set-lp-appointment success path already handles.
+ *     • Returns { success: true, action: 'lp_lead_creation_enrolled' }.
+ *
  * v5.1.10 (2026-05-27): FLATTEN GHL WEBHOOK BODY + DEEP CALENDAR LOOKUP.
  *
  *   Production feedback from Mark: APPT Handler workflows DO include
@@ -136,6 +167,7 @@ import {
 import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken } from './ghl-rate-limiter.js';
 import { formatLpSource, formatApptTime12h } from './format-helpers.js';
+import { enrollLpLeadCreation } from './admin/lp-force-addlead.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
@@ -1055,6 +1087,34 @@ async function syncAppointmentToLP({
   });
 
   if (!resolution) {
+    // ── Self-heal: no real lds_id yet ──────────────────────────────
+    // Lead booked an appointment before LP issued its inbound entry, so
+    // only an in1_id exists. Enroll in workflow 8e30ff37 ("Send Lead to
+    // Lead Perfection"), the canonical addlead-with-appointment + writeback
+    // path, instead of firing a manual card. enrollLpLeadCreation is
+    // dedup-guarded (create-lead:<contact>), so a webhook re-fire won't
+    // double-enroll. FAIL-OPEN: any throw falls through to the manual card.
+    //
+    // NOTE: lead + appointment creation is async inside the workflow
+    // (ChatGPT summary, branch checks, addlead, then LP's ~60s callback
+    // writes lp_lead_id/lp_prospect_id). We do NOT SetAppointment here —
+    // the workflow's addlead carries adate/atime, so the appointment is
+    // created with the lead. We return success and let the callback finish.
+    try {
+      const healed = await enrollLpLeadCreation({ contactId, calendarName });
+      if (healed?.success) {
+        console.log(`[LP-APPT] ✅ Self-heal: enrolled ${contactId} in lead-creation wf (${healed.action})`);
+        return {
+          success: true,
+          action: 'lp_lead_creation_enrolled',
+          contact_id: contactId,
+          ...healed,
+        };
+      }
+    } catch (healErr) {
+      console.warn(`[LP-APPT] lead-creation enroll failed for ${contactId}: ${healErr.message} — falling back to manual-action card`);
+    }
+
     // Failure-path dedup: stop repeat "SYNC FAILED" cards when I.LP-A
     // re-enters or GHL retries the webhook. Pre-fix the failure path
     // had no dedup at all (and the success-path dedup silently no-op'd
