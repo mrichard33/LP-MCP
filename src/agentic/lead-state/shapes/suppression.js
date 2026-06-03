@@ -1,7 +1,7 @@
 /**
  * Suppression Shape — src/agentic/lead-state/shapes/suppression.js
  *
- * Deterministic ineligibility classification. Returns one of the seven
+ * Deterministic ineligibility classification. Returns one of the eight
  * suppression states OR null (caller falls through to other shapes).
  *
  * Priority order — first match wins:
@@ -10,23 +10,28 @@
  *   3. APPT_BOOKED                  — in active appointment workflow
  *   4. ACTIVE_BOFU                  — in active conversion work
  *   5. SUPPRESSED_POST_DEMO_DECLINE — recorded post-demo decline (OPPFDN/FDNS)
- *   6. IN_NARRATIVE_NURTURE         — already in S4.5 (or another narrative)
- *   7. RECENT_REP_CONTACT           — rep is actively working the lead (last 14d)
+ *   6. SUPPRESSED_CONFIRMED_LOSS    — confirmed competitor/not-interested loss (tags)
+ *   7. IN_NARRATIVE_NURTURE         — already in S4.5 (or another narrative)
+ *   8. RECENT_REP_CONTACT           — rep is actively working the lead (last 14d)
  *
  * Why this order: legal trumps everything. Then customer status —
  * a P2 customer who happens to be in an A.* appointment workflow is
  * still primarily a customer (cross-sell territory, not pre-sale).
- * Appointment + BOFU before the decline check because an ACTIVE
+ * Appointment + BOFU before the decline/loss checks because an ACTIVE
  * re-engagement supersedes a stale decline — if a contact declined a demo
  * but has since re-booked or re-entered conversion work, the live state
- * wins and the audit should say so. Otherwise a recorded decline is the
- * authoritative reason a contact is out of S4.5, ahead of the softer
- * narrative-blur and rep-contact signals. (All suppression states block
- * S4.5 equally; order only sets which reason the audit trail records.)
- * Decline before narrative-nurture so that a declined contact who somehow
+ * wins and the audit should say so. Otherwise a recorded decline (5) or a
+ * confirmed competitor/not-interested loss (6) is the authoritative reason
+ * a contact is out of S4.5, ahead of the softer narrative-blur and
+ * rep-contact signals. (All suppression states block S4.5 equally; order
+ * only sets which reason the audit trail records.)
+ * Decline/loss before narrative-nurture so that a lost contact who somehow
  * still carries active-s4.5 (e.g. a Route B enrollment whose workflow
  * entry-guard then bounced it, as happened with Williams) is recorded as
- * the decline — the root reason — rather than IN_NARRATIVE_NURTURE.
+ * the decline/loss — the root reason — rather than IN_NARRATIVE_NURTURE.
+ * Post-demo decline (5) before confirmed-loss (6) only because the
+ * disposition-code signal is the more specific one when both fire; they
+ * route to the same loss/reactivation track.
  * Rep contact last because it's a softer signal than the others —
  * doesn't preclude future S4.5 enrollment, just defers it.
  *
@@ -42,6 +47,7 @@ import {
   hasActiveBooking,
   isInActiveBofu,
   isPostDemoDecline,
+  isConfirmedLoss,
   inNarrativeNurture,
   hasRecentRepContact,
   snapshotSuppressionSignals,
@@ -137,7 +143,30 @@ export function classifySuppression(ctx) {
     };
   }
 
-  // 6. Already in another narrative nurture
+  // 6. Confirmed competitor / not-interested loss (recorded in TAGS)
+  //    A settled "no" carried in tags (loss-reason:*, p3:not-interested*,
+  //    objection-confirmed:not-interested) INDEPENDENT of the LP disposition
+  //    code. isPostDemoDecline (5) only catches OPPFDN/FDNS — a contact who
+  //    bought elsewhere with disposition CXL fell through to the eligible
+  //    shapes and was classified S45_* (Aloia zrjJPmKbjX3TZpHiEuVX, live
+  //    2026-06-03). Like the post-demo decline, this is the person's
+  //    relationship stage — they exited the buying conversation — so it
+  //    suppresses S4.5 across ALL eligible shapes. Routes to loss/
+  //    reactivation (L.* / P3), not narrative nurture.
+  if (signals.confirmed_loss) {
+    return {
+      state: STATES.SUPPRESSED_CONFIRMED_LOSS,
+      confidence: scoreConfidence(STATES.SUPPRESSED_CONFIRMED_LOSS),
+      reason: {
+        rule: 'confirmed_loss',
+        matched_signals: ['confirmed_loss'],
+        signal_snapshot: signals,
+        notes: 'Confirmed competitor/not-interested loss recorded in tags (loss-reason:*, p3:not-interested*, objection-confirmed:not-interested), independent of disposition_code. Suppressed from S4.5 across all eligible shapes; route to loss/reactivation (L.*/P3), not narrative nurture.',
+      },
+    };
+  }
+
+  // 7. Already in another narrative nurture
   if (signals.in_narrative_nurture) {
     return {
       state: STATES.IN_NARRATIVE_NURTURE,
@@ -151,7 +180,7 @@ export function classifySuppression(ctx) {
     };
   }
 
-  // 7. Recent rep contact
+  // 8. Recent rep contact
   if (signals.recent_rep_contact) {
     return {
       state: STATES.RECENT_REP_CONTACT,
