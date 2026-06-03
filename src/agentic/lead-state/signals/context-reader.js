@@ -28,6 +28,14 @@
  *   ACTIVE_BOFU via bj:stage-5-committed, which is a sticky historical
  *   tag that never clears after sale. False positive avoided by reading
  *   the post-sale tag signature.
+ * v1.2 — 2026-06-03. Add isPostDemoDecline() — a recorded post-demo
+ *   decline (LP disposition_code OPPFDN / FDNS = "Full Demo No Sale").
+ *   Feeds the SUPPRESSED_POST_DEMO_DECLINE suppression state so a declined
+ *   contact is ineligible for S4.5 via ANY behavioral shape, not just
+ *   DEMO_STALL (the v0.2.3 isDemoStall fix only covered that one shape; a
+ *   decline was re-admitted through DORMANT_HIGH_INTENT on stale intent
+ *   signals). Reads disposition_code (the real field) with a legacy
+ *   `disposition` fallback.
  */
 
 // ── Tag presence ────────────────────────────────────────────────────
@@ -148,6 +156,42 @@ export function isCustomerP2(ctx) {
   return false;
 }
 
+// ── Post-demo decline (Full Demo No Sale) ───────────────────────────
+//
+// A recorded post-demo decline: the demo ran and the customer said no.
+// LP disposition_code OPPFDN ("Opportunity / Full Demo No Sale") or FDNS.
+// This is an attribute of the PERSON / relationship stage — they have
+// EXITED the buying conversation — not of one funnel. Per the Brunson
+// follow-up-funnel framing, the S4.5 Seinfeld/soap-opera nurture is for
+// the undecided "maybe," never the recorded "no." So a decline suppresses
+// S4.5 across ALL FIVE eligible behavioral shapes, not per-shape.
+//
+// Why this is a SUPPRESSION signal, not just a DEMO_STALL exclusion
+// ─────────────────────────────────────────────────────────────────
+// behavioral-signals.js v0.2.3 already excludes OPPFDN/FDNS from the
+// DEMO_STALL shape. But a declined contact with stale intent on record
+// (old estimate, historical clicks) + dormancy was re-admitted via
+// S45_DORMANT_HIGH_INTENT. The decline has to gate the whole eligible
+// set, so it lives here as a suppression signal checked before any shape.
+//
+// Field name: the real LP/context field is `disposition_code`
+// (`disposition` kept as a legacy fallback). Upper-cased for comparison.
+// NOTE: OPPFDN also appears in the isCustomerP2 commentary as a code that
+// does NOT imply closed_won — consistent here: a decline is a LOSS, routed
+// to the loss/reactivation track (S5.2 / L.*), distinct from a P2 customer.
+
+const POST_DEMO_DECLINE_DISPOSITIONS = ['OPPFDN', 'FDNS'];
+
+/** Normalised LP disposition code (disposition_code, legacy disposition). */
+function dispositionCode(ctx) {
+  const raw = ctx?.lp?.disposition_code ?? ctx?.lp?.disposition ?? '';
+  return String(raw).trim().toUpperCase();
+}
+
+export function isPostDemoDecline(ctx) {
+  return POST_DEMO_DECLINE_DISPOSITIONS.includes(dispositionCode(ctx));
+}
+
 // ── Active BOFU ─────────────────────────────────────────────────────
 //
 // BOFU = Bottom of Funnel — contact is in active conversion work and
@@ -249,8 +293,10 @@ export function snapshotSuppressionSignals(ctx) {
     legal_suppression:    hasLegalSuppression(ctx),
     active_booking:       hasActiveBooking(ctx),
     customer_p2:          isCustomerP2(ctx),
+    post_demo_decline:    isPostDemoDecline(ctx),
     active_bofu:          isInActiveBofu(ctx),
     in_narrative_nurture: inNarrativeNurture(ctx),
     recent_rep_contact:   hasRecentRepContact(ctx, 14),
+    disposition_code:     dispositionCode(ctx) || null,
   };
 }
