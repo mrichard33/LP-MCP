@@ -43,6 +43,22 @@
  *          inflating no-engagement-history DEMO_STALL contacts over the
  *          0.75 enroll bar on a phantom signal (same class as the s45.js
  *          v0.2.1 fix; pre-go-live, so no behavior change yet).
+ * v0.2.3 — 2026-06-03. DEMO_STALL must be an OPEN stall, not a decline.
+ *          (1) Split the disposition set: DEMO_STALL_OPEN (BO, 1Leg, PNQ) are
+ *          genuine "stalled but not closed" states; DEMO_DECLINE_DISPOSITIONS
+ *          (OPPFDN, FDNS = Full Demo No Sale) are recorded DECLINES and now
+ *          DISQUALIFY isDemoStall — they belong in the loss/reactivation track
+ *          (S5.2 / L.*), not the Seinfeld nurture.
+ *          (2) Fixed the disposition field name: the LP/context field is
+ *          `disposition_code`, but isDemoStall/isLongHorizon read
+ *          `lp.disposition` (nonexistent) — so the disposition never actually
+ *          gated anything and a raw OPPFDN decline passed on
+ *          demo_completed+!closed_won+aged alone. New dispositionCode() reader
+ *          checks disposition_code first (legacy `disposition` fallback).
+ *          Root cause: controlled go-live test enrolled a customer who had
+ *          explicitly declined post-demo (OPPFDN); the S4.5 workflow's entry
+ *          guard correctly bounced her, but the classifier shouldn't have
+ *          flagged her in the first place.
  */
 
 // ── Tunable thresholds (top-of-file so tuning is a one-line edit) ────
@@ -59,10 +75,22 @@ export const RECENCY_KNOWN_TOUCH_DAYS       = 60;  // a touch within N days scor
 const TRUST_OBJECTION_TYPES   = ['trust', 'competitor', 'skeptical', 'reviews', 'legitimacy', 'scam'];
 const TIMING_OBJECTION_TYPES  = ['timing', 'future', 'not-ready', 'spring', 'next-year', 'budget-timing'];
 
-// LP dispositions that indicate a demo ran and the deal stalled (did not
-// close, not a hard loss). Anchored primarily on lp.demo_completed; the
-// disposition refines the confidence signal.
-const DEMO_STALL_DISPOSITIONS = ['OPPFDN', 'FDNS', 'BO', '1Leg', 'PNQ'];
+// Post-demo disposition classes (v0.2.3).
+//   OPEN    — demo ran, deal did NOT close, but the lead is still open /
+//             non-committal. These are the genuine S4.5 DEMO_STALL targets.
+//   DECLINE — demo ran and the customer DECLINED ("Full Demo No Sale").
+//             A recorded no, not a stall. Belongs in the loss/reactivation
+//             track (S5.2 / L.*), NOT the Seinfeld nurture. Disqualifies
+//             DEMO_STALL.
+const DEMO_STALL_OPEN_DISPOSITIONS = ['BO', '1LEG', '1Leg', 'PNQ'];
+const DEMO_DECLINE_DISPOSITIONS    = ['OPPFDN', 'FDNS'];
+
+/** Normalised LP disposition code. Real field is `disposition_code`;
+ *  `disposition` kept as a legacy fallback. Upper-cased for comparison. */
+function dispositionCode(ctx) {
+  const raw = ctx?.lp?.disposition_code ?? ctx?.lp?.disposition ?? '';
+  return String(raw).trim().toUpperCase();
+}
 
 // ── time helpers ────────────────────────────────────────────────────
 
@@ -143,14 +171,24 @@ export function hasStrongIntent(ctx) {
 // ── demo stall ──────────────────────────────────────────────────────
 
 /**
- * Demo ran, deal stalled, gone quiet, and aged past the acute S5.2 window
- * but not so old it's effectively dead. Anchored on lp.demo_completed +
- * !closed_won; the disposition and demo age refine it.
+ * Demo ran, deal STALLED (still open, non-committal), gone quiet, and aged
+ * past the acute S5.2 window but not so old it's effectively dead.
+ *
+ * Anchored on lp.demo_completed + !closed_won. CRITICAL (v0.2.3): a
+ * Full-Demo-No-Sale DECLINE (disposition_code OPPFDN / FDNS) is NOT a stall —
+ * the customer was demoed and said no. Those are disqualified here and route
+ * to the loss/reactivation track instead. Only open post-demo dispositions
+ * (or demo_completed with no decline code on record) qualify.
  */
 export function isDemoStall(ctx) {
   const lp = ctx?.lp || {};
   if (lp.demo_completed !== true) return false;
   if (lp.closed_won === true) return false;
+
+  // A recorded post-demo decline is a loss, not a stall — disqualify.
+  const disp = dispositionCode(ctx);
+  if (DEMO_DECLINE_DISPOSITIONS.includes(disp)) return false;
+
   const demoAge = daysSince(lp.demo_date);
   // If we have a demo_date, enforce the aging window. If we don't, fall
   // back to days_to_demo / pipeline staleness as a soft signal.
@@ -194,8 +232,8 @@ export function isLongHorizon(ctx) {
   const types = objectionTypes(ctx);
   if (types.some(t => TIMING_OBJECTION_TYPES.includes(t))) return true;
   // LP "project not now" style dispositions can also imply a long horizon.
-  const disp = String(ctx?.lp?.disposition || '').toLowerCase();
-  return disp === 'pnq'; // Phone Not Qualified-now → long horizon nurture
+  // v0.2.3: read disposition_code (was reading nonexistent lp.disposition).
+  return dispositionCode(ctx) === 'PNQ'; // Phone Not Qualified-now → long horizon nurture
 }
 
 // ── cold ────────────────────────────────────────────────────────────
@@ -230,8 +268,7 @@ export function hasEngagementEvent(ctx) {
 
 /** A meaningful LP disposition is present (refines confidence). */
 export function hasDispositionSignal(ctx) {
-  const disp = ctx?.lp?.disposition;
-  return !!disp && String(disp).trim().length > 0;
+  return dispositionCode(ctx).length > 0;
 }
 
 /** Confirmed objection tag/intel present (empty tags already filtered out). */
@@ -265,6 +302,7 @@ export function snapshotBehavioralSignals(ctx) {
     has_strong_intent:     hasStrongIntent(ctx),
     has_engagement_history: hasEngagementHistory(ctx),
     is_demo_stall:         isDemoStall(ctx),
+    disposition_code:      dispositionCode(ctx) || null,
     objection_types:       objectionTypes(ctx),
     is_trust_recovery:     isTrustRecovery(ctx),
     is_long_horizon:       isLongHorizon(ctx),
