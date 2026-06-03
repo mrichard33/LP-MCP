@@ -38,6 +38,16 @@
  *          in between suppression and UNCLASSIFIED. Behavioral confidence
  *          scoring (signal-weighted) now in play; shapes self-floor at
  *          CONFIDENCE_FLOOR.
+ * v0.2.4 — 2026-06-03. Post-demo decline guard. behavioral-signals.js
+ *          v0.2.3 excludes Full-Demo-No-Sale dispositions (OPPFDN/FDNS)
+ *          from the DEMO_STALL shape and reads the correct field
+ *          (disposition_code). states.js adds SUPPRESSED_POST_DEMO_DECLINE
+ *          (taxonomy 13 → 14); context-reader.js adds isPostDemoDecline;
+ *          suppression.js maps it so an OPPFDN/FDNS decline suppresses S4.5
+ *          across ALL eligible shapes (not just DEMO_STALL — a declined
+ *          contact was being re-admitted via DORMANT_HIGH_INTENT). Bumping
+ *          the version string so the audit trail reflects the new taxonomy
+ *          + suppression path (the prior commits left it at v0.2.0).
  *
  * No-GPT contract
  * ───────────────
@@ -55,7 +65,7 @@ import { classifySuppression } from './shapes/suppression.js';
 import { classifyS45 } from './shapes/s45.js';
 import { classifyCold } from './shapes/cold.js';
 
-export const CLASSIFIER_VERSION = 'v0.2.0';
+export const CLASSIFIER_VERSION = 'v0.2.4';
 
 /**
  * Classify a single contact.
