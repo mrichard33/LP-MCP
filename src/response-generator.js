@@ -99,10 +99,18 @@
  *   OR "Solo Owner" (single-decision-maker household). "No" or
  *   "Uncertain" or absence of presence discussion → Path B (status=new).
  *
- *   validateResponse dispatches to three sub-validators per companion
- *   type. All three share normalizeQualifyingData which drops invalid
- *   decision_makers_present values and validates window_count >0 <1000.
- *   Past-date guards still apply for book/reschedule.
+ *   validateResponse dispatches to four sub-validators per companion
+ *   type (book/cancel/reschedule/update_appointment_status). They share
+ *   normalizeQualifyingData which drops invalid decision_makers_present
+ *   values and validates window_count >0 <1000. Past-date guards still
+ *   apply for book/reschedule.
+ *
+ *   2026-06-03 — book-then-capture: added update_appointment_status. The
+ *   in-home gate always books on a hard confirmation (status "new" when
+ *   decision-makers aren't yet confirmed), asks the decision-maker +
+ *   address questions in the same message, and when the lead answers
+ *   Yes/Solo Owner, upgrades the existing appointment "new"→"confirmed"
+ *   in place via update_appointment_status (no second appointment).
  *
  * v2.7.7 — 2026-04-30. QUALIFYING-DATA GATE ON AUTO-BOOK (PATH A vs PATH B).
  *   Mark's correction: the booking should land as "confirmed" ONLY when
@@ -504,7 +512,7 @@ PATH A version (rare for reschedule):
 Companion: reschedule_appointment with old_appointment_id, new_calendar_name (use the SAME calendar as the existing appointment unless the lead specifically asked to switch), new_start_time, status, optional qualifying_data.
 
 ═══════ COMPANION ACTION SHAPES (v2.7.8) ═══════
-Pick ONE of three companion types based on context. Only emit ONE companion_action per response.
+Pick ONE companion type based on context. Only emit ONE companion_action per response.
 
 ▼ book_appointment (initial booking via auto-book on hard confirm)
 {
@@ -548,6 +556,18 @@ Pick ONE of three companion types based on context. Only emit ONE companion_acti
   },
   "reasoning": "<old appt + new time extraction + Q1/Q2/Q3 status>"
 }
+
+▼ update_appointment_status (upgrade an existing 'new' in-home appointment to 'confirmed' after the lead confirms decision-makers)
+{
+  "action_type": "update_appointment_status",
+  "action_payload": {
+    "appointment_id": "<from EXISTING APPOINTMENTS>",
+    "status": "confirmed",
+    "qualifying_data": { "decision_makers_present": "Yes" | "Solo Owner", "window_count": <int, optional> }
+  },
+  "reasoning": "<which appointment + DM answer that justifies the upgrade>"
+}
+ONLY emit update_appointment_status to upgrade an EXISTING appointment_id taken verbatim from EXISTING APPOINTMENTS. Never invent an appointment_id. Never use it to cancel (use cancel_appointment for that). It is the book-then-capture follow-through: the in-home visit already booked as "new", and the lead has now answered the decision-maker question Yes / Solo Owner — flip that same appointment to "confirmed".
 
 ═══════ EXAMPLES — AUTO-BOOK ═══════
 
@@ -1134,12 +1154,14 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   // ─── Booking gate (BUILD HANDOFF §4) — only when a calendar is resolved ───
   const bcg = kbPack?.booking_context;
   if (bcg && bcg.requires_in_home_gate === true) {
-    parts.push(`\n═══════ IN-HOME BOOKING GATE (a rep visits the home — capture decision-makers + address) ═══════`);
-    parts.push(`This booking targets the in-home ${bcg.resolved_calendar_name} calendar (${bcg.booking_duration_minutes} min). ALWAYS book on a hard confirmation — there is no hold. Decision-maker confirmation drives the STATUS, not whether to book. Work one step per turn:`);
-    parts.push(`  On file → decision-makers: ${bcg.dm_present_value || 'not yet captured'} | address: ${bcg.address_on_file || '(none on file)'} | address confirmed: ${bcg.address_confirmed ? 'yes' : 'no'}`);
-    parts.push(`  STEP 1 — Decision-makers: if not already captured, ask whether everyone who'll be part of the decision will be present ("will both of you / all the owners be there?"). Map their answer to Yes / Solo Owner / No / Uncertain and emit it in qualifying_data.decision_makers_present once they state it.`);
-    parts.push(`  STEP 2 — Address: confirm the visit location ("want to make sure we send the team to the right place — is ${bcg.address_on_file || 'your address on file'} where you'd like the visit?"). Capture any correction. Do NOT re-ask name or phone — those are already on file.`);
-    parts.push(`  STEP 3 — Propose 2–3 real slots from CALENDAR AVAILABILITY; on a hard confirmation ALWAYS emit book_appointment with qualifying_data, and confirm back ("You're all set for {day} at {time} — you'll get a confirmation text."). STATUS: "confirmed" only when decision-makers are confirmed (Yes / Solo Owner); otherwise "new" (tentative — a human confirms). Never withhold the booking because decision-makers are unsure.`);
+    parts.push(`\n═══════ IN-HOME BOOKING GATE (a rep visits the home — BOOK FIRST, then capture decision-makers + address) ═══════`);
+    parts.push(`This booking targets the in-home ${bcg.resolved_calendar_name} calendar (${bcg.booking_duration_minutes} min). This is BOOK-THEN-CAPTURE: never hold a hot buyer, never interrogate before locking the slot. Do NOT ask the decision-maker or address questions BEFORE proposing times, and do NOT sequence one question per turn.`);
+    parts.push(`  On file → decision-makers: ${bcg.dm_present_value || 'not yet captured'} | address: ${bcg.address_on_file || '(none on file)'}`);
+    parts.push(`  ON A HARD CONFIRMATION — ALWAYS emit book_appointment immediately. Never withhold the booking. STATUS is set server-side: "confirmed" only when decision-makers were already stated Yes / Solo Owner earlier in the conversation, otherwise "new" (tentative — a human confirms). Then, IN THE SAME confirmation message, ask BOTH capture questions in one line, e.g.: "You're all set for {day} at {time}. Quick thing so we send the right crew — will everyone who's part of the decision be home, and is ${bcg.address_on_file || 'the address we have on file'} the right spot?" Personalize the address read-back from the on-file value above.`);
+    parts.push(`  UPGRADE PATH — if EXISTING APPOINTMENTS already shows an in-home appointment with status "new" AND the lead's reply now answers the decision-maker question:`);
+    parts.push(`    • Answer maps to Yes / Solo Owner → emit update_appointment_status with that appointment's appointment_id, status:"confirmed", and qualifying_data.decision_makers_present (+ window_count if newly stated). Verbal: brief confirm, e.g. "Perfect — you're confirmed for {day} at {time}. See you then."`);
+    parts.push(`    • Answer maps to No / Uncertain → keep it "new", acknowledge warmly, and do NOT emit any companion_action. A human will confirm.`);
+    parts.push(`  Never emit book_appointment when an active appointment already exists for this contact — use the UPGRADE PATH instead (re-booking is blocked by the double-book guard).`);
     parts.push(`═══════ END IN-HOME BOOKING GATE ═══════`);
   } else if (bcg && bcg.requires_in_home_gate === false) {
     parts.push(`\n═══════ PHONE BOOKING (no in-home gate) ═══════`);
@@ -1158,7 +1180,8 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   // active appt and the conversation history shows a reschedule offer.
   parts.push(`\nGenerate the ${channel} response. Follow this priority order:`);
   parts.push(`(1) CANCELLATION FLOW: if the lead expressed cancel intent for an existing appointment OR is mid-state-machine in a cancel/reschedule conversation (read EXISTING APPOINTMENTS + conversation history together), follow the CANCELLATION FLOW state machine in the system prompt. Emit cancel_appointment when the lead pushed back on reschedule (state 2 case B). Emit reschedule_appointment when the lead hard-confirmed a proposed reschedule slot (state 3). Otherwise no companion_action this turn.`);
-  parts.push(`(2) AUTO-BOOK on hard confirmation of held time (NOT in a cancel/reschedule conversation): if the lead's reply is a hard confirmation of a previously-proposed time AND BOOKING CONTEXT provides a calendar_name, check Q1/Q2/Q3. All three pass (Q3 = "Yes" OR "Solo Owner") → companion_action book_appointment status="confirmed" + PATH A message + qualifying_data. Any missing → status="new" + PATH B message. Default to PATH B when unsure. Only include qualifying_data fields the lead explicitly stated. EXCEPTION — if an IN-HOME BOOKING GATE block is present above, it GOVERNS: an in-home visit ALWAYS books on a hard confirmation (never hold). Decision-maker confirmation drives only the STATUS — status="confirmed" when decision-makers are confirmed (Yes / Solo Owner), otherwise status="new" (tentative; a human confirms). Keep asking the decision-maker + address questions to capture the field, but never withhold the booking because decision-makers are unsure or not yet captured.`);
+  parts.push(`(1.5) IN-HOME CONFIRMATION UPGRADE: if EXISTING APPOINTMENTS shows an in-home appointment with status "new" AND the lead's reply answers the decision-maker question, emit update_appointment_status — status "confirmed" when decision-makers are Yes/Solo Owner (+ write decision_makers_present), otherwise NO companion (leave it new). This is not a re-booking; never emit book_appointment when an active appointment already exists.`);
+  parts.push(`(2) AUTO-BOOK on hard confirmation of held time (NOT in a cancel/reschedule conversation): if the lead's reply is a hard confirmation of a previously-proposed time AND BOOKING CONTEXT provides a calendar_name, check Q1/Q2/Q3. All three pass (Q3 = "Yes" OR "Solo Owner") → companion_action book_appointment status="confirmed" + PATH A message + qualifying_data. Any missing → status="new" + PATH B message. Default to PATH B when unsure. Only include qualifying_data fields the lead explicitly stated. EXCEPTION — if an IN-HOME BOOKING GATE block is present above, it GOVERNS (book-then-capture): an in-home visit ALWAYS books immediately on a hard confirmation (never hold). Status="confirmed" when decision-makers were already stated Yes / Solo Owner earlier, otherwise status="new" (tentative; a human confirms). In the SAME confirmation message ask both capture questions (decision-makers + address) in one line — but never withhold the booking to ask them first. THEN, if an in-home appointment with status "new" already exists and the lead's reply answers the decision-maker question, do NOT re-book — emit update_appointment_status per (1.5) to upgrade that appointment in place (Yes/Solo Owner → "confirmed"; No/Uncertain → no companion, leave it "new").`);
   parts.push(`(3) CLOSING ACKNOWLEDGMENT: soft-confirm with caveat / pure ack / commitment to return → brief acknowledgment + EXPLICIT HOLD + STOP. No re-proposal, no link, no new ask, no HSO, no companion_action.`);
   parts.push(`(4) HUMAN CORRECTION block, if present, overrides defaults.`);
   parts.push(`(5) DEFAULT: BOOKING — ASK-FIRST PROTOCOL with TWO real specific-time slots from CALENDAR AVAILABILITY, OR fall back to link only when warranted. Apply HSO and move them ONE stage forward.`);
@@ -1230,7 +1253,7 @@ function parseJsonFromResponse(text) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// RESPONSE VALIDATION (v2.7.8 — three companion types)
+// RESPONSE VALIDATION (v2.7.8 — three companion types; 2026-06-03 — + update_appointment_status)
 // ═══════════════════════════════════════════════════════════════════
 
 const DECISION_MAKERS_VALID = new Set(['Yes', 'No', 'Solo Owner', 'Uncertain']);
@@ -1363,6 +1386,32 @@ function validateRescheduleAppointmentCompanion(cap, ca) {
   };
 }
 
+// 2026-06-03 — book-then-capture status upgrade. Validates the companion that
+// flips an EXISTING in-home appointment 'new'→'confirmed' after the lead
+// answers the decision-maker question. Requires a concrete appointment_id
+// (taken from EXISTING APPOINTMENTS — never invented); status is normalized
+// (confirmed/new); qualifying_data carried through if present. The handler
+// applies the same DM backstop as the book handler, so an un-DM-confirmed
+// 'confirmed' is downgraded server-side regardless.
+function validateUpdateAppointmentStatusCompanion(cap, ca) {
+  const appointmentId = typeof cap.appointment_id === 'string' ? cap.appointment_id.trim() : '';
+  if (!appointmentId) {
+    console.warn(`[ResponseGenerator] Dropping update_appointment_status: missing appointment_id`);
+    return null;
+  }
+  const status = normalizeBookingStatus(cap.status);
+  const qualifying_data = normalizeQualifyingData(cap.qualifying_data);
+
+  const payload = { appointment_id: appointmentId, status };
+  if (qualifying_data) payload.qualifying_data = qualifying_data;
+
+  return {
+    action_type: 'update_appointment_status',
+    action_payload: payload,
+    reasoning: typeof ca.reasoning === 'string' ? ca.reasoning.slice(0, 500) : null,
+  };
+}
+
 function validateResponse(parsed, channel) {
   if (!parsed || typeof parsed !== 'object') return null;
   if (!parsed.message || typeof parsed.message !== 'string') return null;
@@ -1387,8 +1436,9 @@ function validateResponse(parsed, channel) {
     ? parsed.frameworks_applied.filter(f => typeof f === 'string').slice(0, 4)
     : [];
 
-  // v2.7.8: dispatch companion validation by action_type. Three supported:
-  // book_appointment, cancel_appointment, reschedule_appointment. Each
+  // v2.7.8: dispatch companion validation by action_type. Four supported:
+  // book_appointment, cancel_appointment, reschedule_appointment, and
+  // update_appointment_status (2026-06-03, book-then-capture upgrade). Each
   // sub-validator handles its own shape requirements and returns null
   // (drop) on failure. Anything else is logged and dropped.
   let companionAction = null;
@@ -1403,6 +1453,8 @@ function validateResponse(parsed, channel) {
       companionAction = validateCancelAppointmentCompanion(cap, ca);
     } else if (ca.action_type === 'reschedule_appointment') {
       companionAction = validateRescheduleAppointmentCompanion(cap, ca);
+    } else if (ca.action_type === 'update_appointment_status') {
+      companionAction = validateUpdateAppointmentStatusCompanion(cap, ca);
     } else {
       console.warn(`[ResponseGenerator] Dropping unsupported companion_action.action_type="${ca.action_type}"`);
     }
@@ -1727,6 +1779,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       companionLog = `cancel:${ca.action_payload.appointment_id?.slice(0, 8) || '?'}`;
     } else if (ca.action_type === 'reschedule_appointment') {
       companionLog = `reschedule:${ca.action_payload.status}${ca.action_payload.qualifying_data ? '+qd' : ''}`;
+    } else if (ca.action_type === 'update_appointment_status') {
+      companionLog = `upgrade:${ca.action_payload.status}`;
     } else {
       companionLog = ca.action_type;
     }

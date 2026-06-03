@@ -297,8 +297,19 @@ console.log(`[ApprovalPath] v4.10 auto-reply config: ` +
 //                              old_appointment_id + new_start_time;
 //                              past-date guard on new_start_time.
 //                              Handler enforces cancel-before-book ordering.
+//   update_appointment_status — 2026-06-03 (book-then-capture). AI emits
+//                              only to upgrade an EXISTING in-home
+//                              appointment 'new'→'confirmed' after the lead
+//                              answers the decision-maker question. Requires
+//                              appointment_id from EXISTING APPOINTMENTS
+//                              (validateResponse drops it otherwise), and the
+//                              handler applies the same DM backstop as
+//                              book_appointment (never 'confirmed' without
+//                              Yes/Solo Owner). Must auto-execute so the
+//                              upgrade lands in seconds (same heartbeat as
+//                              the "you're confirmed" SMS), not on the sweep.
 //
-// Trust argument is the same across all three: the AI emits the companion
+// Trust argument is the same across all four: the AI emits the companion
 // only under verifiable, narrow conditions, AND validateResponse screens
 // for shape errors. If any guard trips, the companion is dropped before
 // it reaches this code, so anything that arrives here is safe to fire.
@@ -308,6 +319,7 @@ const COMPANION_AUTO_EXECUTE = new Set([
   'book_appointment',
   'cancel_appointment',
   'reschedule_appointment',
+  'update_appointment_status',
 ]);
 
 // ═══════════════════════════════════════════════════════════════════
@@ -811,7 +823,9 @@ export async function processApprovalQueue() {
                     ? `appointment_id="${cap.appointment_id || 'n/a'}"`
                     : companion.action_type === 'reschedule_appointment'
                       ? `old="${cap.old_appointment_id || 'n/a'}", new_calendar="${cap.new_calendar_name || 'n/a'}", new_start="${cap.new_start_time || 'n/a'}"`
-                      : '(unknown payload shape)';
+                      : companion.action_type === 'update_appointment_status'
+                        ? `appointment_id="${cap.appointment_id || 'n/a'}", status="${cap.status || 'n/a'}"`
+                        : '(unknown payload shape)';
 
                 console.log(`[ActionExecutor] ✅ Companion ${companion.action_type} inserted: id=${companionRow.id}, batch=${batchId}, seq=${companionRow.sequence_order}, ` +
                   `mode=${isAutoExecuting ? 'AUTO-EXECUTE' : 'approval-gated'}, ${payloadSummary}`);
