@@ -106,6 +106,14 @@ import {
 import { runGhlContactIdBackfill } from './admin/ghl-contact-id-backfill.js';
 import { registerGhlTriggerLinkRoutes } from './admin/ghl-trigger-links.js';
 import { registerAgenticLeadStateRoutes } from './admin/agentic-lead-states.js';
+// ─── LP Force-AddLead (manual + shared helper for no-lds_id appt failures) ──
+// v1.0.0 2026-06-03: POST /admin/lp/force-addlead creates a lead in LP via
+// the legacy addlead path with the appointment embedded + lognumber stamped,
+// for contacts that booked before LP issued their inbound entry (no lds_id).
+// Also exports addLeadWithAppointment() — the building block for the
+// syncAppointmentToLP auto-heal fallback. Root cause: Chuck Celeste
+// (dhilykpGEfeR7UdCZiT6), inbound 394813 never issued, MV could not sync.
+import { registerLPForceAddLeadRoutes } from './admin/lp-force-addlead.js';
 // ─── Lead-State Sweep (Phase 2 — periodic classify + S4.5 enroll) ──
 // Periodic invoker for the lead-state intelligence layer: classifies a
 // bounded candidate batch into agentic_lead_states and runs eligible
@@ -460,6 +468,7 @@ registerAgenticMvRefreshRoutes(app);
 registerAppointmentNotificationRoutes(app);
 registerGhlTriggerLinkRoutes(app);
 registerAgenticLeadStateRoutes(app);
+registerLPForceAddLeadRoutes(app);
 registerLeadStateSweepRoutes(app);
 
 app.listen(PORT, async () => {
