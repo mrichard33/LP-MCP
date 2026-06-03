@@ -88,10 +88,12 @@
  *        threshold scoring in the nurture orchestrator.
  */
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
-const SCORER_MODEL = process.env.MESSAGE_SCORE_MODEL || 'claude-sonnet-4-6';
+import { callLLM } from './llm-client.js';
+
+// Provider + model resolved at call time by the shared client from the
+// `message_score` fn key (decision_engine group). Legacy MESSAGE_SCORE_MODEL
+// is still honored by the client for Anthropic back-compat.
 const DEFAULT_THRESHOLD = parseFloat(process.env.MESSAGE_SCORE_THRESHOLD || '0.80');
-const TIMEOUT_MS = parseInt(process.env.MESSAGE_SCORE_TIMEOUT_MS || '15000', 10);
 
 // ─────────────────────────────────────────────────────────────────────
 // CONTROLLED FAILURE-REASON VOCABULARY
@@ -212,40 +214,20 @@ function buildUserPrompt(input) {
 // ─────────────────────────────────────────────────────────────────────
 
 async function callClaude(systemPrompt, userPrompt) {
-  if (!ANTHROPIC_API_KEY) {
-    throw new Error('ANTHROPIC_API_KEY not configured');
-  }
-
-  const body = {
-    model: SCORER_MODEL,
-    max_tokens: 500,
+  // json:true → OpenAI response_format=json_object (prompt already mandates
+  // JSON); ignored for Anthropic. Cross-model judging still holds: the scorer
+  // group can be pinned to a different provider/model than the generator.
+  const { text, raw, model } = await callLLM({
+    fn: 'message_score',
     system: systemPrompt,
-    messages: [{ role: 'user', content: userPrompt }],
-  };
-
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(TIMEOUT_MS),
+    user: userPrompt,
+    maxTokens: 500,
+    json: true,
   });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`Anthropic API ${res.status}: ${text.slice(0, 300)}`);
+  if (!text) {
+    throw new Error('LLM response missing text content');
   }
-
-  const data = await res.json();
-  const textBlock = (data.content || []).find(b => b.type === 'text');
-  if (!textBlock || !textBlock.text) {
-    throw new Error('Anthropic response missing text content');
-  }
-
-  return { rawText: textBlock.text, fullResponse: data };
+  return { rawText: text, fullResponse: raw, scorerModel: model };
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -355,7 +337,7 @@ export async function scoreMessage(input) {
   const systemPrompt = buildSystemPrompt();
   const userPrompt = buildUserPrompt(input);
 
-  const { rawText, fullResponse } = await callClaude(systemPrompt, userPrompt);
+  const { rawText, fullResponse, scorerModel } = await callClaude(systemPrompt, userPrompt);
   const { dimensions, failureReasons, rationale } = parseScoreJson(rawText);
 
   // overallScore — Math.min. A HARSH guardrail: catches a single broken
@@ -398,7 +380,7 @@ export async function scoreMessage(input) {
     dimensions,
     failureReasons,
     rationale,
-    scorerModel: SCORER_MODEL,
+    scorerModel,
     latencyMs,
     raw: fullResponse,
   };
