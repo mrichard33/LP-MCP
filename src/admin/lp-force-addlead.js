@@ -1,116 +1,65 @@
 /**
- * LP Force-AddLead Admin Endpoint — src/admin/lp-force-addlead.js
+ * LP Force-Create-Lead Admin Endpoint — src/admin/lp-force-addlead.js
  *
- * v1.0.0 (2026-06-03): NEW.
+ * v2.0.0 (2026-06-03): ENROLL IN GHL WORKFLOW 8e30ff37 (was: raw addLead).
  *
- * WHAT: Adds POST /admin/lp/force-addlead and exports the shared
- *   addLeadWithAppointment() helper.
+ *   CORRECTION over v1.0.0. v1 called LP's legacy addlead directly from
+ *   this module. That was wrong: a raw addlead returns only an in1_id
+ *   (inbound-queue id), and on its own it does NOT create a usable lead
+ *   and does NOT write lp_lead_id / lp_prospect_id back to the GHL
+ *   contact. The canonical, complete path is GHL workflow
+ *   "Send Lead to Lead Perfection" (8e30ff37-ff96-4a40-9f0d-15a6142337ba),
+ *   which:
+ *     - POSTs to http://lppost.leadperfection.com/br27/addlead as
+ *       application/json (correct content type for addlead — confirmed
+ *       working; form-encoding is only needed by SetAppointment),
+ *     - carries the appointment in-session (adate/atime) so the lead is
+ *       created WITH the MV/estimate appointment,
+ *     - stamps lognumber + User1 = GHL contact id,
+ *     - extracts the inbound id and writes it to LP Inbound Lead ID
+ *       (3YMxheIlPyhACB8zyc3W), with Wait→retry branches,
+ *   and LP's downstream inbound callback then writes the real
+ *   lp_prospect_id / lp_lead_id / Disposition back to the contact
+ *   (~60s, the Jane Jewell pattern).
  *
- * WHY (root cause): When a contact books an appointment (e.g. MV) BEFORE
- *   LeadPerfection has issued its inbound-queue entry into a real lead,
- *   the GHL contact carries only an in1_id (inbound id) and NO lds_id.
- *   The set-lp-appointment resolver (lp-appointment-sync.js) requires a
- *   real lds_id, so it fails every step, tags `lp-sync-failed`, and fires
- *   a manual-action card. Observed on Chuck Celeste (dhilykpGEfeR7UdCZiT6):
- *   inbound 394813 was never issued, so the MV for 06/11/2026 18:00 could
- *   not sync and required a hand-built curl to the legacy endpoint.
+ * WHAT: POST /admin/lp/force-addlead enrolls a GHL contact in workflow
+ *   8e30ff37 to create the LP lead (with appointment) the proper way.
+ *   Exports enrollLpLeadCreation() — the shared helper, also the building
+ *   block for the syncAppointmentToLP auto-heal fallback.
  *
- * USER-VISIBLE IMPACT: Operators can force a lead into LP — with the
- *   appointment embedded in the same call — via one HTTP POST. The same
- *   helper is the building block for the auto-heal fallback in
- *   syncAppointmentToLP (lp-appointment-sync.js — separate edit), so the
- *   failure stops requiring any manual step at all.
+ * WHY (root cause): When a contact books an appointment before LP issues
+ *   its inbound entry into a real lead, the GHL contact carries only an
+ *   in1_id and NO lds_id. The set-lp-appointment resolver requires a real
+ *   lds_id, so it fails every step and fires a manual-action card.
+ *   Observed on Chuck Celeste (dhilykpGEfeR7UdCZiT6).
  *
- * HOW: Uses the legacy LP addlead path (carries the appointment in-session
- *   via adate/atime) and stamps lognumber=<ghlContactId> so LP's inbound
- *   callback writes lds_id / lp_prospect_id back to the GHL contact —
- *   making every future sync resolve cleanly via the resolver's Step 1.
+ * USER-VISIBLE IMPACT: Operators (and the auto-heal) resolve a stuck lead
+ *   with one call that runs the proven lead-creation workflow — lead +
+ *   appointment + writeback — instead of a hand-built curl that skipped
+ *   the writeback. No LP content-type change: addlead stays JSON.
  *
  * Endpoint:
  *   POST /admin/lp/force-addlead
- *     body: { contact_id, [appointment_date], [appointment_time],
- *             [calendar_name], [force] }
- *     - date/time omitted → read from the GHL contact's Last Appt
- *       Date/Time fields.
- *     - force=true → bypass the dedup marker (re-add even if recently added).
- *     - x-admin-token header enforced ONLY when ADMIN_API_TOKEN env is set
- *       (non-breaking where unset; protect at the Railway/proxy layer too).
+ *     body: { contact_id, [force] }
+ *     - force=true → bypass the dedup marker (re-enroll even if recent).
+ *     - x-admin-token header enforced ONLY when ADMIN_API_TOKEN env is set.
  */
 
-import { addLead, extractInboundLeadId } from '../lp-client.js';
-import { updateGHLContactFields } from '../ghl.js';
 import { sendGroupMeMessage } from '../groupme.js';
 import supabase from '../supabase.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 
-// GHL custom field IDs (mirror lp-appointment-sync.js).
-const LAST_APPT_DATE_FIELD = 'x8KO5o89WPLfC7ivia3A';
-const LAST_APPT_TIME_FIELD = 'U67epWMNqjbf0SHAllEZ';
-const LP_INBOUND_ID_FIELD  = '3YMxheIlPyhACB8zyc3W';
-const LP_SOURCE_ID_FIELD    = 'k6j4IBh5IejPooSCsj49'; // "LP Source ID / Numeric Ref" = srs_id
+// "Send Lead to Lead Perfection" — canonical addlead-with-appointment +
+// writeback workflow. Overridable via env for test locations.
+const LEAD_CREATE_WORKFLOW_ID =
+  process.env.LP_LEAD_CREATE_WORKFLOW_ID || '8e30ff37-ff96-4a40-9f0d-15a6142337ba';
 
 const DEDUP_WINDOW_MIN = Number(process.env.LP_APPT_DEDUP_WINDOW_MIN || 1440);
 
 function clean(v) {
   if (v === 'null' || v === 'undefined' || v === '' || v == null) return null;
   return String(v).trim();
-}
-function getField(fields, id) {
-  const f = fields?.find(x => x.id === id);
-  return f?.value != null ? String(f.value).trim() : null;
-}
-function normalizePhone(p) { return String(p || '').replace(/\D/g, '').slice(-10); }
-function zip5(z) { const m = String(z || '').match(/\d{5}/); return m ? m[0] : (z || ''); }
-
-// → MM/DD/YYYY
-function parseApptDate(raw) {
-  if (!raw) return null;
-  const s = String(raw).trim();
-  if (s.match(/^\d{4}-\d{2}-\d{2}/)) { const [y, m, d] = s.split('T')[0].split('-'); return `${m}/${d}/${y}`; }
-  if (s.match(/^\d{2}\/\d{2}\/\d{4}$/)) return s;
-  if (/^\d{12,13}$/.test(s)) { // GHL date custom fields store epoch ms
-    const dt = new Date(Number(s));
-    if (!isNaN(dt.getTime())) {
-      return `${String(dt.getUTCMonth() + 1).padStart(2, '0')}/${String(dt.getUTCDate()).padStart(2, '0')}/${dt.getUTCFullYear()}`;
-    }
-  }
-  return s;
-}
-// → HH:MM (24h)
-function parseApptTime(raw) {
-  if (!raw) return null;
-  let t = String(raw).trim();
-  if (t.includes('T')) t = t.split('T')[1]?.slice(0, 5) || t;
-  const m = t.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
-  if (m) {
-    let h = parseInt(m[1], 10); const p = m[3].toUpperCase();
-    if (p === 'AM' && h === 12) h = 0;
-    if (p === 'PM' && h !== 12) h += 12;
-    return `${String(h).padStart(2, '0')}:${m[2]}`;
-  }
-  if (t.length > 5) t = t.slice(0, 5);
-  return t;
-}
-function normDate(raw) {
-  const us = parseApptDate(raw);
-  if (us && us.match(/^\d{2}\/\d{2}\/\d{4}$/)) { const [m, d, y] = us.split('/'); return `${y}-${m}-${d}`; }
-  return us;
-}
-
-async function ghlGetContact(contactId) {
-  if (!GHL_API_KEY) throw new Error('GHL_API_KEY not configured');
-  const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
-    method: 'GET',
-    headers: {
-      'Authorization': `Bearer ${GHL_API_KEY}`,
-      'Version': '2021-07-28',
-      'Accept': 'application/json',
-    },
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!res.ok) { const t = await res.text().catch(() => ''); throw new Error(`GHL GET /contacts/${contactId} → ${res.status}: ${t.slice(0, 200)}`); }
-  return res.json();
 }
 
 async function findMark(key) {
@@ -120,107 +69,75 @@ async function findMark(key) {
     return ((Date.now() - new Date(data.created_at).getTime()) / 60000) <= DEDUP_WINDOW_MIN ? data : null;
   } catch { return null; }
 }
-async function writeMark(key, contactId, in1Id, apptDate, apptTime) {
+async function writeMark(key, contactId) {
   try {
     await supabase.from('lp_appointment_sync_marks').upsert(
-      { dedup_key: key, contact_id: contactId, lds_id: in1Id, appt_date: apptDate, appt_time: apptTime, created_at: new Date().toISOString() },
+      { dedup_key: key, contact_id: contactId, created_at: new Date().toISOString() },
       { onConflict: 'dedup_key' });
   } catch { /* non-blocking */ }
 }
 
 /**
- * Create a lead in LP via the legacy addLead path with the appointment
- * embedded and lognumber=contactId. Shared by the admin endpoint and the
- * syncAppointmentToLP auto-heal fallback.
+ * Enroll a GHL contact in the "Send Lead to Lead Perfection" workflow
+ * (8e30ff37) to create the LP lead — with appointment — the canonical
+ * way, including inbound-id writeback and the downstream LP callback that
+ * fills lp_prospect_id / lp_lead_id / Disposition.
  *
- * Reads firstname/address/phone/srs_id straight off the GHL contact, so
- * the only required input is contactId. srs_id comes from the contact's
- * "LP Source ID / Numeric Ref" field — the same source id the original
- * inbound entry used, keeping attribution correct.
+ * Shared by the admin endpoint and the syncAppointmentToLP auto-heal.
+ * The only required input is contactId — the workflow reads everything
+ * else (address, phone, srs_id, appt date/time) off the contact.
  *
- * Dedup: writes/reads an lp_appointment_sync_marks row keyed
- * `addlead:<contactId>:<date>:<time>` so a re-fire within the window does
- * not create a second inbound entry (unless force=true).
+ * Dedup: an lp_appointment_sync_marks row keyed
+ * `create-lead:<contactId>` prevents double-enrollment within the window
+ * (unless force=true), so a webhook re-fire or repeated failure won't
+ * stack the contact through the workflow twice.
  *
- * @returns {Promise<Object>} { success, action, in1_id, appt_date, ... }
- * @throws if a required addLead field is missing or LP rejects the add.
+ * @returns {Promise<Object>} { success, action, contact_id, workflow_id }
+ * @throws if contactId missing or the GHL enrollment call fails.
  */
-export async function addLeadWithAppointment({ contactId, appointmentDate = null, appointmentTime = null, calendarName = null, force = false }) {
-  if (!contactId) throw new Error('addLeadWithAppointment: contactId required');
+export async function enrollLpLeadCreation({ contactId, calendarName = null, force = false }) {
+  if (!contactId) throw new Error('enrollLpLeadCreation: contactId required');
+  if (!GHL_API_KEY) throw new Error('GHL_API_KEY not configured');
 
-  const res = await ghlGetContact(contactId);
-  const c = res?.contact || {};
-  const fields = c.customFields || [];
-
-  const firstname = c.firstName || (c.contactName || c.name || '').split(' ')[0] || null;
-  const lastname  = c.lastName || ((c.contactName || '').split(' ').slice(1).join(' ') || null);
-  const address1  = c.address1 || null;
-  const city      = c.city || null;
-  const state     = c.state || null;
-  const zip       = zip5(c.postalCode);
-  const phone     = normalizePhone(c.phone);
-  const email     = c.email || null;
-  const srsId     = getField(fields, LP_SOURCE_ID_FIELD);
-
-  const apptDate = parseApptDate(appointmentDate || getField(fields, LAST_APPT_DATE_FIELD));
-  const apptTime = parseApptTime(appointmentTime || getField(fields, LAST_APPT_TIME_FIELD));
-
-  const missing = [];
-  if (!firstname) missing.push('firstname');
-  if (!address1)  missing.push('address1');
-  if (!city)      missing.push('city');
-  if (!state)     missing.push('state');
-  if (!zip)       missing.push('zip');
-  if (!phone)     missing.push('phone');
-  if (!srsId)     missing.push('srs_id (GHL field k6j4IBh5IejPooSCsj49)');
-  if (missing.length) throw new Error(`Cannot addLead — missing required field(s): ${missing.join(', ')}`);
-  if ((apptDate && !apptTime) || (!apptDate && apptTime)) {
-    throw new Error('appointment date and time must both be present or both absent');
-  }
-
-  const dedupKey = `addlead:${contactId}:${normDate(apptDate) || 'na'}:${apptTime || 'na'}`;
+  const dedupKey = `create-lead:${contactId}`;
   if (!force) {
     const prior = await findMark(dedupKey);
     if (prior) {
-      return { success: true, action: 'addlead_already_forced', contact_id: contactId, dedup_key: dedupKey, marked_at: prior.created_at };
+      return { success: true, action: 'create_lead_already_enrolled', contact_id: contactId, workflow_id: LEAD_CREATE_WORKFLOW_ID, dedup_key: dedupKey, marked_at: prior.created_at };
     }
   }
 
-  const payload = {
-    firstname, address1, city, state, zip, phone,
-    srs_id: srsId, lognumber: contactId, _prefer_path: 'legacy',
-  };
-  if (lastname) payload.lastname = lastname;
-  if (email)    payload.email = email;
-  if (apptDate && apptTime) { payload.apptdate = apptDate; payload.appttime = apptTime; }
-
-  const lpRes = await addLead(payload);
-  const in1Id = extractInboundLeadId(lpRes);
-
-  // Track the new inbound id on the GHL contact (best-effort, additive field write).
-  if (in1Id) {
-    await updateGHLContactFields(contactId, [{ id: LP_INBOUND_ID_FIELD, field_value: String(in1Id) }]).catch(() => {});
+  const url = `https://services.leadconnectorhq.com/contacts/${contactId}/workflow/${LEAD_CREATE_WORKFLOW_ID}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${GHL_API_KEY}`,
+      'Version': '2021-07-28',
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: JSON.stringify({ eventStartTime: new Date().toISOString() }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`GHL enroll ${contactId} → wf ${LEAD_CREATE_WORKFLOW_ID} failed: ${res.status}: ${t.slice(0, 200)}`);
   }
 
-  await writeMark(dedupKey, contactId, in1Id, apptDate, apptTime);
+  await writeMark(dedupKey, contactId);
 
   await sendGroupMeMessage(
-    `📤 LP Lead Forced (addLead)\n` +
-    `👤 ${[firstname, lastname].filter(Boolean).join(' ') || contactId}\n` +
-    `🆔 in1_id: ${in1Id || '(unparsed)'} | path: ${lpRes?._path || '?'}\n` +
-    (apptDate ? `📅 ${apptDate} ${apptTime}${calendarName ? ` | ${calendarName}` : ''}\n` : '') +
-    `🔁 lognumber stamped — LP callback will write lds_id back to GHL`
+    `🛠️ LP Lead Creation Triggered\n` +
+    `👤 contact: ${contactId}${calendarName ? ` | ${calendarName}` : ''}\n` +
+    `🔁 Enrolled in "Send Lead to Lead Perfection" (8e30ff37)\n` +
+    `→ addlead+appt (JSON) · inbound-id writeback · LP callback fills prospect/lead id (~60s)`
   ).catch(() => {});
 
   return {
     success: true,
-    action: apptDate ? 'addlead_with_appointment' : 'addlead_only',
+    action: 'enrolled_lead_creation_workflow',
     contact_id: contactId,
-    in1_id: in1Id,
-    lp_path: lpRes?._path || null,
-    appt_date: apptDate || null,
-    appt_time: apptTime || null,
-    srs_id: srsId,
+    workflow_id: LEAD_CREATE_WORKFLOW_ID,
     dedup_key: dedupKey,
   };
 }
@@ -241,12 +158,10 @@ export function registerLPForceAddLeadRoutes(app) {
     if (!contactId) return res.status(400).json({ success: false, error: 'contact_id is required' });
 
     const force = body.force === true || body.force === 'true';
-    const appointmentDate = clean(body.appointment_date || body.appointmentDate);
-    const appointmentTime = clean(body.appointment_time || body.appointmentTime);
     const calendarName = clean(body.calendar_name || body.calendarName);
 
     try {
-      const result = await addLeadWithAppointment({ contactId, appointmentDate, appointmentTime, calendarName, force });
+      const result = await enrollLpLeadCreation({ contactId, calendarName, force });
       result.elapsed_ms = Date.now() - start;
       res.json(result);
     } catch (err) {
@@ -255,5 +170,5 @@ export function registerLPForceAddLeadRoutes(app) {
     }
   });
 
-  console.log('[LP-FORCE-ADDLEAD] Registered: POST /admin/lp/force-addlead (v1.0.0)');
+  console.log('[LP-FORCE-ADDLEAD] Registered: POST /admin/lp/force-addlead (v2.0.0 — enroll wf 8e30ff37)');
 }
