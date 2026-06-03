@@ -140,6 +140,13 @@ import { classifyInbound, isShortCircuit } from './knowledge/intent-classifier.j
 import { buildKbPack, formatKbPackForPrompt } from './knowledge/kb-retriever.js';
 import { fetchFreeSlots, formatSlotsForPrompt } from './knowledge/calendar-availability.js';
 import { fetchUpcomingAppointments, formatAppointmentsForPrompt } from './knowledge/contact-appointments.js';
+import {
+  resolveBookingCalendar,
+  requiresInHomeGate,
+  durationForCalendar,
+  calendarNameForKey,
+} from './knowledge/booking-calendar-router.js';
+import { applyGHLTag } from './ghl.js';
 import supabase from './supabase.js';
 import { callLLM, resolveLLM } from './llm-client.js';
 
@@ -819,8 +826,58 @@ function extractActiveEntryTag(context) {
 function getCalendarIdFromKbPack(kbPack) {
   if (!kbPack || !kbPack.booking_context) return null;
   const bc = kbPack.booking_context;
+  // Resolver result is authoritative when present (BUILD HANDOFF §1).
+  if (bc.resolved_calendar_id) return bc.resolved_calendar_id;
   if (bc.primary && bc.primary.calendar_id) return bc.primary.calendar_id;
   return bc.calendar_id || null;
+}
+
+/**
+ * Compose the contact's on-file address into a single human string for the
+ * address-confirmation gate. Returns null when no street address is on file.
+ */
+function composeAddressOnFile(context) {
+  const L = context?.lead || {};
+  if (!L.address1) return null;
+  return [L.address1, L.city, L.state, L.postal_code].filter(Boolean).join(', ');
+}
+
+/**
+ * Stamp the funnel-position booking resolution onto an existing booking_context
+ * so it becomes the authoritative calendar + gate source for the prompt and the
+ * auto-book companion. Mutates `bc` in place. See BUILD HANDOFF §1/§4.
+ */
+function stampBookingResolution(bc, resolution, context) {
+  if (!bc || !resolution) return;
+  const requiresGate = requiresInHomeGate(resolution.calendar_key);
+  const dmValue = context?.lead?.decision_makers_present || null;
+  const addressOnFile = composeAddressOnFile(context);
+  const tags = Array.isArray(context?.lead?.current_tags) ? context.lead.current_tags : [];
+
+  bc.resolved_calendar_id   = resolution.calendar_id;
+  bc.calendar_key           = resolution.calendar_key;
+  bc.resolution_reason      = resolution.reason;
+  bc.requires_in_home_gate  = requiresGate;
+  bc.booking_duration_minutes = durationForCalendar(resolution.calendar_key);
+  bc.resolved_calendar_name = calendarNameForKey(resolution.calendar_key) || bc.calendar_name || null;
+
+  // Gate state (in-home only — phone calendars skip these).
+  bc.dm_present_value = dmValue;
+  bc.dm_confirmed     = dmValue === 'Yes' || dmValue === 'Solo Owner';
+  bc.address_on_file  = addressOnFile;
+  // Soft flag: a prior turn may have set this when the lead confirmed the
+  // address verbatim. Absent today for most contacts → the prompt asks.
+  bc.address_confirmed = tags.includes('booking:address-confirmed');
+
+  // Override the descriptor the prompt formatter renders + getCalendarIdFromKbPack
+  // reads, so the resolved calendar (not the legacy policy pick) is used end to end.
+  const primary = bc.primary || bc;
+  primary.calendar_id   = resolution.calendar_id;
+  primary.calendar_name = bc.resolved_calendar_name || primary.calendar_name;
+  primary.duration_minutes = bc.booking_duration_minutes;
+  primary.visit_type    = requiresGate ? 'in_home' : 'phone';
+  bc.calendar_id   = resolution.calendar_id;
+  bc.calendar_name = bc.resolved_calendar_name || bc.calendar_name;
 }
 
 function formatTodayForPrompt() {
@@ -1072,6 +1129,23 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     parts.push(`═══════ END EDITORIAL FEEDBACK ═══════`);
   }
 
+  // ─── Booking gate (BUILD HANDOFF §4) — only when a calendar is resolved ───
+  const bcg = kbPack?.booking_context;
+  if (bcg && bcg.requires_in_home_gate === true) {
+    parts.push(`\n═══════ IN-HOME BOOKING GATE (a rep visits the home — decision-makers + address REQUIRED) ═══════`);
+    parts.push(`This booking targets the in-home ${bcg.resolved_calendar_name} calendar (${bcg.booking_duration_minutes} min). Clear two gates IN ORDER before booking. Work one step per turn:`);
+    parts.push(`  On file → decision-makers: ${bcg.dm_present_value || 'not yet captured'} | address: ${bcg.address_on_file || '(none on file)'} | address confirmed: ${bcg.address_confirmed ? 'yes' : 'no'}`);
+    parts.push(`  STEP 1 — Decision-makers: if not already confirmed, ask whether everyone who'll be part of the decision will be present ("will both of you / all the owners be there?"). Do NOT propose times yet. Map their answer to Yes / Solo Owner / No / Uncertain and emit it in qualifying_data.decision_makers_present once they state it.`);
+    parts.push(`  STEP 2 — If decision-makers = No / Uncertain / "I'll have to check": DO NOT BOOK. This OVERRIDES the PATH B "book as new when unsure" default — for an in-home visit, unsure means HOLD, not book. Acknowledge, offer to hold the time and have them text back once they've confirmed with the other decision-maker(s), then STOP. Emit NO companion_action this turn.`);
+    parts.push(`  STEP 3 — Address: once decision-makers = Yes or Solo Owner, confirm the visit location ("want to make sure we send the team to the right place — is ${bcg.address_on_file || 'your address on file'} where you'd like the visit?"). Capture any correction. Do NOT re-ask name or phone — those are already on file.`);
+    parts.push(`  STEP 4 — Only when decision-makers (Yes/Solo Owner) AND the address are confirmed: propose 2–3 real slots from CALENDAR AVAILABILITY; on a hard confirmation emit book_appointment (status "confirmed" if Q1+Q2+Q3 pass, else "new") with qualifying_data, and confirm back ("You're all set for {day} at {time} — you'll get a confirmation text.").`);
+    parts.push(`═══════ END IN-HOME BOOKING GATE ═══════`);
+  } else if (bcg && bcg.requires_in_home_gate === false) {
+    parts.push(`\n═══════ PHONE BOOKING (no in-home gate) ═══════`);
+    parts.push(`This booking targets the ${bcg.resolved_calendar_name} phone calendar — a short call (${bcg.booking_duration_minutes} min). There is NO decision-maker or address gate: a phone call needs neither. Acknowledge, propose 2–3 real slots from CALENDAR AVAILABILITY, and on a hard confirmation emit book_appointment. Do NOT ask about decision-makers or address, and do NOT include qualifying_data.`);
+    parts.push(`═══════ END PHONE BOOKING ═══════`);
+  }
+
   parts.push(`\nTHE INBOUND MESSAGE TO RESPOND TO:`);
   parts.push(`"${triggerMessage}"`);
 
@@ -1083,7 +1157,7 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   // active appt and the conversation history shows a reschedule offer.
   parts.push(`\nGenerate the ${channel} response. Follow this priority order:`);
   parts.push(`(1) CANCELLATION FLOW: if the lead expressed cancel intent for an existing appointment OR is mid-state-machine in a cancel/reschedule conversation (read EXISTING APPOINTMENTS + conversation history together), follow the CANCELLATION FLOW state machine in the system prompt. Emit cancel_appointment when the lead pushed back on reschedule (state 2 case B). Emit reschedule_appointment when the lead hard-confirmed a proposed reschedule slot (state 3). Otherwise no companion_action this turn.`);
-  parts.push(`(2) AUTO-BOOK on hard confirmation of held time (NOT in a cancel/reschedule conversation): if the lead's reply is a hard confirmation of a previously-proposed time AND BOOKING CONTEXT provides a calendar_name, check Q1/Q2/Q3. All three pass (Q3 = "Yes" OR "Solo Owner") → companion_action book_appointment status="confirmed" + PATH A message + qualifying_data. Any missing → status="new" + PATH B message. Default to PATH B when unsure. Only include qualifying_data fields the lead explicitly stated.`);
+  parts.push(`(2) AUTO-BOOK on hard confirmation of held time (NOT in a cancel/reschedule conversation): if the lead's reply is a hard confirmation of a previously-proposed time AND BOOKING CONTEXT provides a calendar_name, check Q1/Q2/Q3. All three pass (Q3 = "Yes" OR "Solo Owner") → companion_action book_appointment status="confirmed" + PATH A message + qualifying_data. Any missing → status="new" + PATH B message. Default to PATH B when unsure. Only include qualifying_data fields the lead explicitly stated. EXCEPTION — if an IN-HOME BOOKING GATE block is present above, it GOVERNS: an unsatisfied decision-maker gate (No / Uncertain / not yet captured) means HOLD with NO companion_action (do NOT book-as-new), overriding the PATH B default; only book once the decision-maker (Yes/Solo Owner) and address gates are clear.`);
   parts.push(`(3) CLOSING ACKNOWLEDGMENT: soft-confirm with caveat / pure ack / commitment to return → brief acknowledgment + EXPLICIT HOLD + STOP. No re-proposal, no link, no new ask, no HSO, no companion_action.`);
   parts.push(`(4) HUMAN CORRECTION block, if present, overrides defaults.`);
   parts.push(`(5) DEFAULT: BOOKING — ASK-FIRST PROTOCOL with TWO real specific-time slots from CALENDAR AVAILABILITY, OR fall back to link only when warranted. Apply HSO and move them ONE stage forward.`);
@@ -1466,6 +1540,12 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       conversationContext: context.conversation_recent || [],
       ghlContactId: contactId,
       channel,
+      // v2.8: wire the post-qualification affirmative bypass (was dormant — the
+      // call site never passed contactTags, so applyPostQualificationBypass
+      // always ran with undefined tags and could never fire). With the tags
+      // threaded through, a bare "yeah"/"I will be" mid-booking no longer gets
+      // hijacked by CUSTOMER_STATUS_AFFIRMATIVE → hdl:callback-service.
+      contactTags: context.lead?.current_tags || [],
     });
   } catch (err) {
     console.error(`[ResponseGenerator] Classifier threw, defaulting to UNCLEAR: ${err.message}`);
@@ -1513,6 +1593,37 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   } catch (err) {
     console.warn(`[ResponseGenerator] KB pack build failed for ${contactId}: ${err.message} — proceeding without`);
     kbPack = null;
+  }
+
+  // ─── Booking calendar resolution + in-home gate (BUILD HANDOFF §1/§4) ───
+  // When a booking_context is attached, the funnel-position resolver is the
+  // AUTHORITATIVE source of which calendar this booking targets — it replaces
+  // the legacy policy-tree calendar choice. We stamp the resolved calendar_id,
+  // gate flags, and per-calendar duration onto booking_context so: (a)
+  // fetchFreeSlots pulls the right calendar, (b) the prompt enforces the
+  // decision-maker + address gate for in-home visits, and (c) the auto-book
+  // companion is stamped with calendar_id server-side (never the model's name).
+  let bookingResolution = null;
+  if (kbPack?.booking_context) {
+    try {
+      bookingResolution = await resolveBookingCalendar(
+        { id: contactId, tags: context.lead?.current_tags || [] },
+        // isGenericCallRequest is hard-false: CALLBACK is a tag_and_handoff
+        // intent that short-circuits to a human handoff before booking_context
+        // is ever built, so it never reaches here. Re-enabling the Confirmation
+        // Call route requires routing CALLBACK into the booking flow (net-new).
+        { isGenericCallRequest: false },
+      );
+      stampBookingResolution(kbPack.booking_context, bookingResolution, context);
+      // Mark the in-flow state so the §3 affirmative-gate bypass keeps the lead
+      // in BOOK on the next turn (e.g. a bare "yeah" answering the DM question).
+      // Fire-and-forget — must never block or fail response generation. Cleared
+      // on book success / terminal states (see appointments.js teardown).
+      applyGHLTag(contactId, 'booking:active').catch(() => {});
+    } catch (err) {
+      console.warn(`[ResponseGenerator] Booking calendar resolution failed for ${contactId}: ${err.message} — falling back to legacy booking_context`);
+      bookingResolution = null;
+    }
   }
 
   let availability = null;
@@ -1565,6 +1676,39 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   const availSummary = availability
     ? (availability.slots.length > 0 ? `${availability.slots.length}slots/${availability.slots_total_count}total` : 'empty')
     : (calendarId ? 'fetch_failed' : 'no_calendar');
+
+  // ─── Auto-book companion: server-side calendar + gate enforcement (§4/§5) ───
+  // The model is the wrong place to (a) copy an opaque calendar id, (b) know the
+  // phone-vs-in-home duration, or (c) be trusted to honor the in-home hold gate.
+  // We enforce all three here from the resolver result.
+  if (validated.companion_action?.action_type === 'book_appointment' && bookingResolution) {
+    const cap = validated.companion_action.action_payload || {};
+    const requiresGate = requiresInHomeGate(bookingResolution.calendar_key);
+
+    // (a) authoritative calendar id — never the model-echoed name (CALENDAR_MAP
+    //     maps the PPR id to "Review Session", so trusting the name misroutes).
+    cap.calendar_id = bookingResolution.calendar_id;
+    // (b) per-calendar duration (phone calls are short; default would be 90).
+    cap.duration_minutes = durationForCalendar(bookingResolution.calendar_key);
+
+    if (requiresGate) {
+      // (c) PATH B override for in-home: the existing prompt would book-as-"new"
+      //     when qualifiers are missing. Our requirement is the opposite — an
+      //     unsatisfied decision-maker gate must HOLD, not book. Drop the booking
+      //     companion unless the DM gate explicitly passes (Yes | Solo Owner).
+      const dm = cap.qualifying_data?.decision_makers_present;
+      const dmPass = dm === 'Yes' || dm === 'Solo Owner';
+      if (!dmPass) {
+        console.warn(`[ResponseGenerator] In-home gate not satisfied (decision_makers_present=${dm ?? 'absent'}) for ${contactId} on ${bookingResolution.calendar_key} — dropping book_appointment, holding the spot.`);
+        validated.companion_action = null;
+        applyGHLTag(contactId, 'booking:dm-pending').catch(() => {});
+      }
+    } else {
+      // Phone calendars (PPR, Confirmation Call): no decision-maker concept —
+      // strip qualifying_data so we never write a spurious DM value for a call.
+      if (cap.qualifying_data) delete cap.qualifying_data;
+    }
+  }
 
   // v2.7.8: companion log line now includes action_type so cancel/reschedule
   // appear distinctly in stdout.

@@ -101,11 +101,20 @@ const POST_QUALIFICATION_AFFIRMATIVE_BYPASS_INTENTS = new Set([
   'CUSTOMER_STATUS_AFFIRMATIVE',
 ]);
 
-// Tag patterns that prove the contact is past the qualification stage.
+// Tag patterns that prove the contact is past the qualification stage, OR is
+// mid-booking-exchange (where a bare "yeah"/"I will be" answers a booking
+// question, not a "yes I'm a current customer" first-touch reply).
 // ANY one of these is sufficient to trigger the bypass.
 const BYPASS_TAGS_EXACT = new Set([
   'lp-demo-completed',
   'stage:objection-handling',
+  // Active-booking signals — the affirmative belongs to the booking flow,
+  // not the customer-status gate. booking:active is set on flow entry;
+  // booking:dm-pending while a held spot awaits a decision-maker confirm.
+  'bj:stage-5-committed',
+  'stage:hot-call',
+  'booking:dm-pending',
+  'booking:active',
 ]);
 const BYPASS_TAGS_PREFIX = [
   'objection-confirmed-',
@@ -150,7 +159,7 @@ function applyPostQualificationBypass(handlers, contactTags, ghlContactId) {
     }
   }
   if (bypassed.length > 0) {
-    console.log(`[IntentClassifier] [BYPASS] post-qualification gate(s) excluded for ${ghlContactId || 'unknown'}: ${bypassed.join(', ')} — contact has at least one of lp-demo-completed / objection-confirmed-* / stage:objection-handling`);
+    console.log(`[IntentClassifier] [BYPASS] post-qualification gate(s) excluded for ${ghlContactId || 'unknown'}: ${bypassed.join(', ')} — contact has at least one of lp-demo-completed / objection-confirmed-* / stage:objection-handling / bj:stage-5-committed / stage:hot-call / booking:active / booking:dm-pending`);
   }
   return kept;
 }

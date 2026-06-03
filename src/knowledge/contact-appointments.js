@@ -145,6 +145,56 @@ export async function fetchUpcomingAppointments(contactId) {
 }
 
 /**
+ * True if the contact has a prior COMPLETED appointment on `calendarId`
+ * (i.e. the appointment happened). Used to detect "already had the PPR
+ * phone call" for booking-calendar routing (BUILD HANDOFF §0/§2): a
+ * risk-report lead who already completed the Protection Profile Review
+ * call should route to the in-home Home Protection Assessment, not be
+ * asked to book the call again.
+ *
+ * "Completed" = appointmentStatus 'showed'. We deliberately do NOT count a
+ * merely-past 'confirmed'/'new' (could be a no-show that wasn't marked) — a
+ * 'showed' status is the reliable signal the call took place.
+ *
+ * Returns false on fetch/parse error (fail-safe: route as if the call has
+ * NOT happened → the bot books the call, never wrongly skips it).
+ *
+ * @param {string} contactId — GHL contact ID
+ * @param {string} calendarId — GHL calendar ID to check for a completed appt
+ * @returns {Promise<boolean>}
+ */
+export async function hasPriorCompletedAppointment(contactId, calendarId) {
+  if (!contactId || !calendarId || !GHL_API_KEY) return false;
+  try {
+    const res = await fetch(
+      `https://services.leadconnectorhq.com/contacts/${contactId}/appointments`,
+      {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${GHL_API_KEY}`,
+          'Version': '2021-04-15',
+          'Accept': 'application/json',
+        },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      }
+    );
+    if (!res.ok) return false;
+    const data = await res.json();
+    const events = Array.isArray(data?.events)
+      ? data.events
+      : (Array.isArray(data?.appointments) ? data.appointments : []);
+    return events.some((e) => {
+      const cal = e.calendarId || e.calendar_id || null;
+      const status = String(e.appointmentStatus || e.status || '').toLowerCase();
+      return cal === calendarId && status === 'showed';
+    });
+  } catch (err) {
+    console.warn(`[ContactAppointments] hasPriorCompletedAppointment ${contactId}/${calendarId} threw: ${err.message}`);
+    return false;
+  }
+}
+
+/**
  * Format a list of upcoming appointments for inclusion in the AI prompt.
  * Returns null when input is null (fetch failed) or empty (no appts).
  * The caller decides whether to inject the block — typically only when
