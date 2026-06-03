@@ -442,6 +442,91 @@ export async function executeCancelAppointment(action) {
 }
 
 /**
+ * update_appointment_status (v1.0 — 2026-06-03): PUT
+ * /calendars/events/appointments/{id} — upgrade an EXISTING appointment's
+ * status in place (the book-then-capture path). Nearly identical to
+ * executeCancelAppointment (which also PUTs an arbitrary appointmentStatus)
+ * plus qualifying-data persistence.
+ *
+ * Why this action exists: there is no status-upgrade path today (book/cancel/
+ * reschedule only), and re-emitting book_appointment won't work — the double-
+ * book guard returns the existing row unchanged. The in-home gate now ALWAYS
+ * books on a hard confirmation (status 'new' when decision-makers aren't yet
+ * confirmed). When the lead then answers the decision-maker question with
+ * Yes / Solo Owner, this action flips that same appointment 'new'→'confirmed'
+ * in place and persists the qualifying data — no second appointment.
+ *
+ * Backstop (mirrors the book handler §A2): 'confirmed' is only honored when
+ * qualifying_data.decision_makers_present ∈ {Yes, Solo Owner}; otherwise the
+ * status is forced back to 'new' and a warn is logged. Never set 'confirmed'
+ * without decision-maker confirmation.
+ *
+ * Rule #155 reconciliation (same as the book handler): when the final status
+ * is 'confirmed' and decision_makers_present === 'Yes', set the spouse-gate
+ * release tag and drop the gate tag BEFORE the PUT. An appointment-update
+ * webhook can re-fire ghl.appointment_booked; pre-setting the release tag
+ * keeps SPOUSE_GATE_BLOCK_SOLO_BOOKING from race-cancelling the just-confirmed
+ * visit.
+ */
+export async function executeUpdateAppointmentStatus(action /*, context */) {
+  const contactId = action.target_id;
+  const payload = action.action_payload || {};
+
+  let appointmentId = payload.appointment_id;
+  let resolvedFrom = appointmentId ? 'payload' : null;
+
+  // Fallback: if no explicit appointment_id, resolve the contact's active
+  // appointment via the live GHL appointments API (reuses the cancel helper).
+  if (!appointmentId && contactId) {
+    appointmentId = await resolveActiveAppointmentId(contactId);
+    if (appointmentId) resolvedFrom = 'live_api';
+  }
+
+  if (!appointmentId) {
+    throw new Error(
+      `Missing appointment_id and live appointments API returned no active appointment for target_id=${contactId || 'none'}`
+    );
+  }
+
+  let status = payload.status || 'new';
+  const dmPresent = payload.qualifying_data?.decision_makers_present;
+  const dmConfirmed = dmPresent === 'Yes' || dmPresent === 'Solo Owner';
+
+  // Status backstop (mirror A1/A2): never set 'confirmed' without DM confirmation.
+  if (status === 'confirmed' && !dmConfirmed) {
+    console.warn(`[ActionExecutor] update_appointment_status backstop: contact ${contactId}, appointment ${appointmentId}, decision_makers_present=${dmPresent ?? 'absent'} → forcing 'new' (not confirmed).`);
+    status = 'new';
+  }
+
+  // #155 reconciliation: pre-set the spouse-gate release tag (and drop the gate
+  // tag) BEFORE the PUT so an appointment-update webhook can't race-cancel a
+  // just-confirmed visit. Only on an explicit 'Yes' confirmed upgrade.
+  if (status === 'confirmed' && dmPresent === 'Yes') {
+    await applyGHLTag(contactId, SPOUSE_RELEASE_TAG).catch((err) =>
+      console.warn(`[ActionExecutor] #155 release tag add threw for ${contactId}: ${err.message}`));
+    await removeGHLTags(contactId, [SPOUSE_GATE_TAG]).catch(() => {});
+  }
+
+  await ghlFetch('PUT', `/calendars/events/appointments/${appointmentId}`, { appointmentStatus: status });
+  console.log(`[ActionExecutor] ✅ Appointment ${appointmentId} status → ${status} [resolved_from: ${resolvedFrom}, dm=${dmPresent ?? 'absent'}]`);
+
+  // Persist qualifying data (Decision Makers Present + Window Count). Best-effort.
+  let qualifyingDataFieldsWritten = 0;
+  if (payload.qualifying_data) {
+    qualifyingDataFieldsWritten = await persistQualifyingData(contactId, payload.qualifying_data);
+  }
+
+  return {
+    action: 'appointment_status_updated',
+    appointment_id: appointmentId,
+    new_status: status,
+    decision_makers_present: dmPresent || null,
+    qualifying_data_fields_written: qualifyingDataFieldsWritten,
+    resolved_from: resolvedFrom,
+  };
+}
+
+/**
  * v1.1 — reschedule_appointment: cancel old + book new in one operation.
  *
  * Why a combined action instead of two companions:
