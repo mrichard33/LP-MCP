@@ -102,6 +102,11 @@ export const STAGE_MAP = {
 
 export const CALENDAR_MAP = {
   'Review Session':             'DQYMaJ22N6zL4SXjHukw',
+  // Alias: the booking-calendar-router names this same phone calendar
+  // "Protection Profile Review" (PPR). Both names resolve to the same id so a
+  // book_appointment that carries either name routes correctly. Routing should
+  // still prefer payload.calendar_id (stamped server-side) over the name.
+  'Protection Profile Review':  'DQYMaJ22N6zL4SXjHukw',
   'Measurement Verification':   'zEdPmkNccR2ovo3rQAd3',
   'Window Estimate':            'aJj14ONxh1oFyDcQ706O',
   'Home Protection Assessment': 'zS1wg0JqQ1zsszJyJqKX',
