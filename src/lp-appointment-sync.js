@@ -156,7 +156,13 @@ import {
   getLeadByLdsId,
   getCustomers3,
   getLeads,
+  LpTimeoutError,
 } from './lp-client.js';
+
+// Interactive resolves (MCP set_lp_appointment) pass { fast:true } to every
+// live LP read so a degraded LP fails in ~12s instead of riding the
+// 120s × 3-retry sync budget (~360s+) and blowing the 180s tool ceiling.
+const FAST = { fast: true };
 import {
   getGHLContact,
   updateGHLContactFields,
@@ -582,10 +588,15 @@ async function resolveProspectToHLCIDLead(prospect, ghlContactId) {
  * second Supabase lookup. Both may be null if the LP record didn't
  * populate those fields.
  */
-async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
+async function resolveLPLeadId(ghlContactId, contactInfo = {}, opts = {}) {
   const webhookProspectId = cleanGHLValue(contactInfo.prospectId);
   const phone = normalizePhone(contactInfo.phone || '');
   const email = cleanEmail(contactInfo.email || '');
+  const lpOpts = opts.fast ? FAST : {};
+  // Set true if any live LP read times out. The caller MUST check this:
+  // a timeout is NOT proof the lead is absent, so it must not trigger the
+  // no-lead enroll (which would duplicate a real-but-slow lead).
+  let sawTimeout = false;
 
   // ── Step 0: Supabase fast-path — two acceptance passes ───────
   try {
@@ -600,12 +611,17 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
       const fetchLiveLpLead = async (ldsId) => {
         if (lpFetchCache.has(ldsId)) return lpFetchCache.get(ldsId);
         try {
-          const result = await getLeadByLdsId(ldsId);
+          const result = await getLeadByLdsId(ldsId, lpOpts);
           const records = Array.isArray(result) ? result : [result];
           lpFetchCache.set(ldsId, records);
           return records;
         } catch (err) {
-          console.warn(`[LP-RESOLVE] Step 0 live fetch failed for lds_id=${ldsId}: ${err.message}`);
+          if (err instanceof LpTimeoutError) {
+            sawTimeout = true;
+            console.warn(`[LP-RESOLVE] Step 0 live fetch TIMED OUT for lds_id=${ldsId}: ${err.message}`);
+          } else {
+            console.warn(`[LP-RESOLVE] Step 0 live fetch failed for lds_id=${ldsId}: ${err.message}`);
+          }
           lpFetchCache.set(ldsId, null);
           return null;
         }
@@ -675,7 +691,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
       if (ghlInboundId && ghlLeadId === ghlInboundId) {
         console.warn(`[LP-RESOLVE] Step 1: GHL field matches inbound ID (${ghlLeadId}) — skipping (in1_id is not a real lds_id)`);
       } else {
-        const result = await getLeadByLdsId(ghlLeadId);
+        const result = await getLeadByLdsId(ghlLeadId, lpOpts);
         const records = Array.isArray(result) ? result : [result];
         for (const prospect of records) {
           if (!prospect) continue;
@@ -698,13 +714,18 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
       console.log(`[LP-RESOLVE] Step 1: GHL Lead ID field empty — skipping`);
     }
   } catch (err) {
-    console.warn(`[LP-RESOLVE] Step 1 GHL field check failed: ${err.message}`);
+    if (err instanceof LpTimeoutError) {
+      sawTimeout = true;
+      console.warn(`[LP-RESOLVE] Step 1 GHL field check TIMED OUT: ${err.message}`);
+    } else {
+      console.warn(`[LP-RESOLVE] Step 1 GHL field check failed: ${err.message}`);
+    }
   }
 
   // ── Step 2: Prospect ID + lognumber ───────────────────────────
   if (webhookProspectId && /^\d+$/.test(webhookProspectId)) {
     try {
-      const leadsResult = await getLeads({ cst_id: webhookProspectId, PageSize: 50 });
+      const leadsResult = await getLeads({ cst_id: webhookProspectId, PageSize: 50 }, lpOpts);
       const records = Array.isArray(leadsResult) ? leadsResult : [leadsResult];
       const allLeads = [];
       for (const prospect of records) {
@@ -730,6 +751,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
       }
       console.warn(`[LP-RESOLVE] Step 2: prospect ${webhookProspectId} has no lead with matching lognumber — falling through`);
     } catch (err) {
+      if (err instanceof LpTimeoutError) sawTimeout = true;
       console.warn(`[LP-RESOLVE] Step 2 prospect+lognumber failed for ${webhookProspectId}: ${err.message}`);
     }
   } else {
@@ -740,7 +762,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
   if (phone) {
     let prospectList = [];
     try {
-      const prospects = await getCustomers3({ phone });
+      const prospects = await getCustomers3({ phone }, lpOpts);
       prospectList = Array.isArray(prospects) ? prospects : (prospects ? [prospects] : []);
       prospectList = prospectList.filter(Boolean);
       console.log(`[LP-RESOLVE] Step 3 (last resort): GetCustomers3 by phone returned ${prospectList.length} prospect(s)`);
@@ -773,7 +795,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
   if (email) {
     let prospectList = [];
     try {
-      const prospects = await getCustomers3({ email });
+      const prospects = await getCustomers3({ email }, lpOpts);
       prospectList = Array.isArray(prospects) ? prospects : (prospects ? [prospects] : []);
       prospectList = prospectList.filter(Boolean);
       console.log(`[LP-RESOLVE] Step 4 (last resort): GetCustomers3 by email returned ${prospectList.length} prospect(s)`);
@@ -802,6 +824,10 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}) {
     console.warn(`[LP-RESOLVE] Step 4: no email available — skipping last-resort email path`);
   }
 
+  if (sawTimeout) {
+    console.warn(`[LP-RESOLVE] ⏱️ No match for ${ghlContactId} BUT an LP read timed out — returning lp_unavailable (not a confirmed no-lead)`);
+    return { lpUnavailable: true };
+  }
   console.warn(`[LP-RESOLVE] ❌ No lds_id matched for ${ghlContactId} after Step 0a/0b + Steps 1–4 chain`);
   return null;
 }
@@ -1084,7 +1110,19 @@ async function syncAppointmentToLP({
     address1,
     postalCode,
     prospectId: webhookProspectId,
-  });
+  }, FAST);
+
+  // LP was too slow to confirm — do NOT enroll (would duplicate a real,
+  // slow-to-read lead). Return a distinct status the caller/sweep can retry.
+  if (resolution?.lpUnavailable) {
+    console.warn(`[LP-APPT] ⏱️ LP unavailable while resolving ${contactId} — skipping (no enroll, no SetAppointment)`);
+    return {
+      success: false,
+      action: 'skipped_lp_unavailable',
+      contact_id: contactId,
+      detail: 'LP read timed out during resolution; not enrolling to avoid duplicate. Retry when LP latency recovers.',
+    };
+  }
 
   if (!resolution) {
     // ── Self-heal: no real lds_id yet ──────────────────────────────
@@ -1199,7 +1237,10 @@ async function syncAppointmentToLP({
     if (existing?.appointment_set && existing.appointment_date) {
       const lpNorm = normalizeDateForComparison(existing.appointment_date);
       const ghlNorm = normalizeDateForComparison(appointmentDate);
+      const todayNorm = new Date().toISOString().slice(0, 10);
+      const lpIsPast = lpNorm && lpNorm < todayNorm;
       if (lpNorm && ghlNorm && lpNorm === ghlNorm) {
+        // Same date already in LP — true no-op.
         console.log(`[LP-APPT] ⏭️ Already set on ${lpNorm} for lds_id=${ldsId}`);
         await addGHLNote(contactId,
           `[LP SYNC] Appointment already exists in LP — skipped\nLP Lead: ${ldsId} | Date: ${lpNorm}` +
@@ -1207,6 +1248,23 @@ async function syncAppointmentToLP({
         ).catch(() => {});
         await writeApptSyncMark({ dedupKey, contactId, ldsId, apptDate, apptTime });
         return { success: true, action: 'already_set_in_lp', lp_lead_id: ldsId, lp_prospect_id: prospectId, date: lpNorm, resolution_source: source, resolution_step: step };
+      }
+      if (lpIsPast && (!ghlNorm || ghlNorm === lpNorm)) {
+        // Option A: existing LP appointment is in the past and there is NO
+        // new incoming date to move it to → bare re-sync is a no-op. (A new
+        // future date falls through below to re-set.)
+        console.log(`[LP-APPT] ⏭️ Existing LP appt is past-dated (${lpNorm}) and no new date provided — no-op for lds_id=${ldsId}`);
+        await addGHLNote(contactId,
+          `[LP SYNC] Existing LP appointment is past-dated (${lpNorm}) and no new date supplied — left as-is (no re-set).\nLP Lead: ${ldsId}`
+        ).catch(() => {});
+        await writeApptSyncMark({ dedupKey, contactId, ldsId, apptDate, apptTime });
+        return { success: true, action: 'past_appointment_left_asis', lp_lead_id: ldsId, lp_prospect_id: prospectId, date: lpNorm, resolution_source: source, resolution_step: step };
+      }
+      // Otherwise (different/new incoming date, past or future existing) →
+      // fall through to lpSetAppointment, which re-sets to the new date.
+      // This is Option A: past-dated WITH a new date re-sets cleanly.
+      if (lpIsPast) {
+        console.log(`[LP-APPT] Existing LP appt past-dated (${lpNorm}); re-setting to incoming ${ghlNorm} for lds_id=${ldsId}`);
       }
     }
   } catch (err) {
