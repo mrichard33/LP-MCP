@@ -438,6 +438,15 @@ function computeHoldCooldownHours(interrupt) {
 function checkInterrupts(context) {
   const tags = context?.lead?.current_tags || [];
 
+  // TEST-CONTACT BYPASS (2026-06-04). A contact carrying this tag is NEVER
+  // suppressed by pre-gen interrupts, so QA can drive the full generate->send
+  // path even while actively texting the contact (which would otherwise trip
+  // recent_reply). TEST-ONLY — never put this tag on a real contact.
+  if (tags.includes('agentic-test-bypass')) {
+    console.log(JSON.stringify({ level: 'warn', type: 'interrupt_bypass_test_tag', ghl_contact_id: context?.lead?.ghl_contact_id, lead_name: context?.lead?.name }));
+    return null;
+  }
+
   if (tags.includes('dnc') || tags.includes('stop-seinfeld')) {
     return { status: 'suppressed_interrupt', reason: 'dnc_or_stop' };
   }
