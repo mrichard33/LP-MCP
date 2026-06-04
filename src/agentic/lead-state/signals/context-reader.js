@@ -47,6 +47,21 @@
  *   (zrjJPmKbjX3TZpHiEuVX): bought elsewhere, disposition CXL, classified
  *   S45_TRUST_RECOVERY 0.90 and auto-enrolled. Feeds the new
  *   SUPPRESSED_CONFIRMED_LOSS state.
+ * v1.4 — 2026-06-03. Add isInActiveSoapOpera() — contact is currently
+ *   inside an active soap-opera / nurture SEQUENCE (an ordered,
+ *   goal-directed narrative), read from the active-SOS stage:* tags.
+ *   Brunson (DotCom Secrets) gates the Seinfeld/Side-Filled broadcast
+ *   (= S4.5 v2) on COMPLETION of the soap opera sequence — you never run
+ *   the Seinfeld layer on a contact still inside an SOS, or the narratives
+ *   blur. inNarrativeNurture only caught the active-s4.5 tag (already on
+ *   the Seinfeld layer); isInActiveBofu only caught bottom-funnel
+ *   CONVERSION tags. Neither caught a contact mid-Indoctrination /
+ *   re-engagement / reactivation / post-appointment — ~1,300 open-P1
+ *   contacts that leaked into S4.5. Feeds the new
+ *   SUPPRESSED_ACTIVE_NARRATIVE state. DELIBERATELY EXCLUDES
+ *   stage:long-term-nurture (the post-SOS holding state = Brunson's "moved
+ *   into the broadcast list", which IS the S4.5 destination) and the
+ *   transient pre-SOS stages (stage:new-lead, stage:entry-bridge).
  */
 
 // ── Tag presence ────────────────────────────────────────────────────
@@ -304,18 +319,19 @@ export function isInActiveBofu(ctx) {
   return hasAnyTag(ctx, [...BOFU_STAGE_TAGS, ...BOFU_BUYER_TAGS, ...HOLD_TAGS]);
 }
 
-// ── In another narrative nurture ────────────────────────────────────
+// ── In another narrative nurture (already on the Seinfeld layer) ────
 //
 // Avoid two identity-framing sequences running in parallel — Mark's
 // "two overlapping Seinfeld-style nurtures will psychologically blur."
 //
-// Phase 1 known narrative nurtures:
-//   - S4.5 v2 (active-s4.5 tag)
+// This catches a contact ALREADY ON the S4.5 (Seinfeld) layer via the
+// active-s4.5 tag. It is the sibling of isInActiveSoapOpera below, which
+// catches the contact still on a PRIOR soap-opera sequence (not yet on
+// S4.5). Both feed suppression; they cover the two distinct "a narrative
+// is already running" cases.
 //
-// Phase 2 expansion: as other identity-framing sequences come online
-// (long-horizon-trust, identity-conversion-engine variants), add their
-// tags here. The list is the registry — not in agent_rules or workflow
-// configs — so adding a new narrative nurture is a one-line change.
+// Phase 2 expansion: as other broadcast-layer nurtures come online, add
+// their tags here.
 
 const NARRATIVE_NURTURE_TAGS = [
   'active-s4.5',
@@ -324,6 +340,52 @@ const NARRATIVE_NURTURE_TAGS = [
 
 export function inNarrativeNurture(ctx) {
   return hasAnyTag(ctx, NARRATIVE_NURTURE_TAGS);
+}
+
+// ── In an active soap-opera / nurture SEQUENCE (pre-Seinfeld) ───────
+//
+// Brunson follow-up-funnel doctrine (DotCom Secrets): the Seinfeld /
+// Side-Filled broadcast layer — which S4.5 v2 IS — is entered ONLY "after
+// someone has completed your soap opera sequence." The Soap Opera Sequence
+// (SOS) is the fixed, ordered, goal-directed narrative a contact runs on
+// entry; the Seinfeld layer is the ongoing broadcast they're MOVED INTO
+// once it finishes. COMPLETION is the gate. Running S4.5 on a contact still
+// inside an SOS puts two narratives on one person — narrative blur.
+//
+// The active-SOS sequences in this system, by stage:* tag:
+//   - stage:indoctrination / stage:education  — S2.x Indoctrination SOS
+//   - stage:re-engagement                     — re-engagement SOS
+//   - stage:reactivation                      — S5.x Reactivation SOS
+//   - stage:appointment-rescue                — S5.2 Appointment Rescue SOS
+//   - stage:post-appointment                  — F.x Post-Appointment SOS
+//   - stage:active-nurture-broadcast          — already a broadcast layer
+//
+// DELIBERATE EXCLUSIONS (NOT suppressed by this signal):
+//   - stage:long-term-nurture — the parked/holding state a contact reaches
+//     AFTER its SOS completes. This is exactly Brunson's "moved into the
+//     broadcast list" — the S4.5 destination — so it stays ELIGIBLE.
+//   - stage:new-lead, stage:entry-bridge — transient pre-SOS states; not an
+//     ordered narrative yet, left to the confidence floor to handle.
+//   - BOFU conversion stages (solution-pitch, negotiating, …) — already
+//     covered by isInActiveBofu; not duplicated here.
+//   - terminal stages (dnc, unresponsive, customer-onboarding) — caught by
+//     legal / cold / P2 paths.
+//
+// Note: stage:booked-main-appointment / stage:booking-main are handled by
+// hasActiveBooking (APPT_BOOKED), so they are intentionally NOT in this set.
+
+const ACTIVE_SOAP_OPERA_STAGE_TAGS = [
+  'stage:indoctrination',
+  'stage:education',
+  'stage:re-engagement',
+  'stage:reactivation',
+  'stage:appointment-rescue',
+  'stage:post-appointment',
+  'stage:active-nurture-broadcast',
+];
+
+export function isInActiveSoapOpera(ctx) {
+  return hasAnyTag(ctx, ACTIVE_SOAP_OPERA_STAGE_TAGS);
 }
 
 // ── Recent rep contact ──────────────────────────────────────────────
@@ -362,6 +424,7 @@ export function snapshotSuppressionSignals(ctx) {
     confirmed_loss:       isConfirmedLoss(ctx),
     active_bofu:          isInActiveBofu(ctx),
     in_narrative_nurture: inNarrativeNurture(ctx),
+    active_soap_opera:    isInActiveSoapOpera(ctx),
     recent_rep_contact:   hasRecentRepContact(ctx, 14),
     disposition_code:     dispositionCode(ctx) || null,
   };
