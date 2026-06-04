@@ -3,6 +3,13 @@
 // can call REST endpoints / webhooks that don't have a dedicated tool yet
 // (LP REST, decision-engine reload, GHL API, n8n webhooks, arbitrary JSON).
 //
+// SCHEMA NOTE (v2): input schema uses ONLY primitive zod types
+// (string / number / boolean), matching the other admin tools. An earlier
+// version used z.record / z.union / z.array / z.enum, which this MCP SDK
+// could not serialize to JSON Schema — that broke the entire tools/list
+// response and made ALL tools disappear on reconnect. Object-shaped inputs
+// (headers, query) are now passed as JSON strings and parsed in the handler.
+//
 // SECURITY MODEL
 //   • Secrets never travel inline. Credentials are injected server-side via
 //     named auth profiles defined in the HTTP_TOOL_PROFILES env var. The tool
@@ -24,6 +31,7 @@
 
 import { z } from 'zod';
 
+const ALLOWED_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD']);
 const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 const MAX_BODY_CHARS = 100_000;
 const DEFAULT_TIMEOUT = 30_000;
@@ -38,6 +46,21 @@ function loadProfiles() {
   } catch {
     return {};
   }
+}
+
+// Parse a JSON-object string param; throws a clear error on bad JSON.
+function parseJsonObject(str, label) {
+  if (str === undefined || str === null || str === '') return {};
+  let parsed;
+  try {
+    parsed = JSON.parse(str);
+  } catch {
+    throw new Error(`${label} must be a valid JSON object string. Received: ${String(str).slice(0, 80)}`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`${label} must be a JSON object (key/value map), not an array or scalar.`);
+  }
+  return parsed;
 }
 
 function isPrivateHost(hostname) {
@@ -72,6 +95,10 @@ function checkHost(urlObj) {
   }
 }
 
+function fail(message) {
+  return { content: [{ type: 'text', text: JSON.stringify({ error: message }, null, 2) }] };
+}
+
 export function registerHttpTools(server) {
   // Tool: http_request [READ on GET/HEAD, WRITE on POST/PUT/PATCH/DELETE]
   server.tool(
@@ -88,21 +115,25 @@ export function registerHttpTools(server) {
             'Example: "https://lp-mcp-production.up.railway.app/n8n/decision-engine/reload-rules"'
         ),
       method: z
-        .enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'])
+        .string()
         .optional()
-        .describe('HTTP method (default: GET).'),
-      headers: z
-        .record(z.string())
+        .describe('HTTP method: GET (default), POST, PUT, PATCH, DELETE, or HEAD.'),
+      headers_json: z
+        .string()
         .optional()
-        .describe('Request headers. Merged over profile headers. Do not put secrets here — use auth_profile.'),
-      query: z
-        .record(z.union([z.string(), z.number(), z.boolean()]))
+        .describe('Request headers as a JSON object string, e.g. {"Accept":"application/json"}. Do not put secrets here — use auth_profile.'),
+      query_json: z
+        .string()
         .optional()
-        .describe('Query params appended to the URL.'),
+        .describe('Query params as a JSON object string, e.g. {"limit":"50"}. Appended to the URL.'),
       body: z
-        .union([z.string(), z.record(z.any()), z.array(z.any())])
+        .string()
         .optional()
-        .describe('Request body. Objects/arrays are JSON-encoded (Content-Type set to application/json unless overridden).'),
+        .describe('Raw request body string. For JSON, pass a JSON string and set content_type to "application/json".'),
+      content_type: z
+        .string()
+        .optional()
+        .describe('Convenience: sets the Content-Type header (e.g. "application/json"). Overridden by headers_json if both set it.'),
       auth_profile: z
         .string()
         .optional()
@@ -116,11 +147,15 @@ export function registerHttpTools(server) {
         .optional()
         .describe('Required true for POST/PUT/PATCH/DELETE. Ignored for GET/HEAD.'),
     },
-    async ({ url, method, headers, query, body, auth_profile, timeout_ms, confirm }) => {
+    async ({ url, method, headers_json, query_json, body, content_type, auth_profile, timeout_ms, confirm }) => {
       const m = (method || 'GET').toUpperCase();
       const timeout = Math.min(timeout_ms || DEFAULT_TIMEOUT, MAX_TIMEOUT);
 
       try {
+        if (!ALLOWED_METHODS.has(m)) {
+          return fail(`Unsupported method "${m}". Allowed: GET, POST, PUT, PATCH, DELETE, HEAD.`);
+        }
+
         // Write-gate for mutating methods
         if (MUTATING.has(m) && confirm !== true) {
           return {
@@ -143,24 +178,17 @@ export function registerHttpTools(server) {
           };
         }
 
+        // Parse object-shaped inputs (passed as JSON strings)
+        const reqHeaders = parseJsonObject(headers_json, 'headers_json');
+        const reqQuery = parseJsonObject(query_json, 'query_json');
+
         // Resolve auth profile
         const profiles = loadProfiles();
         const profile = auth_profile ? profiles[auth_profile] : null;
         if (auth_profile && !profile) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify(
-                  {
-                    error: `Unknown auth_profile "${auth_profile}". Defined profiles: ${Object.keys(profiles).join(', ') || '(none)'}`,
-                  },
-                  null,
-                  2
-                ),
-              },
-            ],
-          };
+          return fail(
+            `Unknown auth_profile "${auth_profile}". Defined profiles: ${Object.keys(profiles).join(', ') || '(none)'}`
+          );
         }
 
         // Resolve URL — support profile base_url + relative path
@@ -170,26 +198,20 @@ export function registerHttpTools(server) {
         } else {
           finalUrl = new URL(url);
         }
-        if (query) {
-          for (const [k, v] of Object.entries(query)) finalUrl.searchParams.append(k, String(v));
-        }
+        for (const [k, v] of Object.entries(reqQuery)) finalUrl.searchParams.append(k, String(v));
 
         // SSRF / allowlist guard
         checkHost(finalUrl);
 
-        // Headers: profile first, explicit overrides win
-        const hdrs = { ...(profile?.headers || {}), ...(headers || {}) };
+        // Headers: profile first, content_type convenience, explicit overrides win
+        const hdrs = { ...(profile?.headers || {}) };
+        if (content_type) hdrs['Content-Type'] = content_type;
+        for (const [k, v] of Object.entries(reqHeaders)) hdrs[k] = String(v);
 
-        // Body
+        // Body (string only; caller pre-serializes JSON)
         let payload;
-        if (body !== undefined && m !== 'GET' && m !== 'HEAD') {
-          if (typeof body === 'string') {
-            payload = body;
-          } else {
-            payload = JSON.stringify(body);
-            const hasCT = Object.keys(hdrs).some((k) => k.toLowerCase() === 'content-type');
-            if (!hasCT) hdrs['Content-Type'] = 'application/json';
-          }
+        if (body !== undefined && body !== '' && m !== 'GET' && m !== 'HEAD') {
+          payload = body;
         }
 
         // Fire with timeout
@@ -250,18 +272,7 @@ export function registerHttpTools(server) {
         };
       } catch (err) {
         const aborted = err && err.name === 'AbortError';
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(
-                { error: aborted ? `Request timed out after ${timeout}ms` : err.message },
-                null,
-                2
-              ),
-            },
-          ],
-        };
+        return fail(aborted ? `Request timed out after ${timeout}ms` : err.message);
       }
     }
   );
