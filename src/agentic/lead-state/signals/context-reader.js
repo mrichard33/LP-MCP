@@ -62,6 +62,23 @@
  *   stage:long-term-nurture (the post-SOS holding state = Brunson's "moved
  *   into the broadcast list", which IS the S4.5 destination) and the
  *   transient pre-SOS stages (stage:new-lead, stage:entry-bridge).
+ * v1.5 — 2026-06-04. Fix hasActiveBooking() — it fired on ANY historical
+ *   lp.appointment_set=true with NO date check, so a contact whose
+ *   appointment was months in the PAST (cancelled / no-show / never-ran)
+ *   still classified APPT_BOOKED and was wrongly suppressed from S4.5.
+ *   Audit of the live APPT_BOOKED bucket (841 contacts) found only ~120
+ *   had a genuinely future appointment; ~194 had an appointment >30d past
+ *   with no demo, plus 111 demo-already-happened and 26 with a Sale row.
+ *   An appointment is "active" only while it is UPCOMING and the demo has
+ *   not yet run; once the date passes with no demo it's a no-show/cancel
+ *   (S5.2 reactivation territory), and once the demo runs the contact is
+ *   post-demo (ACTIVE_BOFU / DEMO_STALL / decline) — neither is APPT_BOOKED.
+ *   hasActiveBooking now requires appointment_date >= now − grace
+ *   (APPT_GRACE_DAYS, default 2, covers same-/next-day reschedule lag) on
+ *   the LP-field branch. The stage:booked-* TAG branch is unchanged: those
+ *   tags are set AND CLEARED by the APPT Handler workflows on booking /
+ *   completion, so they're a reliable "currently booked" signal that
+ *   doesn't drift the way a stale LP date does.
  */
 
 // ── Tag presence ────────────────────────────────────────────────────
@@ -100,19 +117,49 @@ export function hasLegalSuppression(ctx) {
 
 // ── Appointment booked ──────────────────────────────────────────────
 //
-// Three orthogonal signals — any of them = APPT_BOOKED:
-//   1. lp.appointment_set === true (LP set the appointment but demo not run)
-//   2. tag `stage:booked-main-appointment` (GHL workflow set the gate tag)
-//   3. tag `stage:booked-review` (qualification call booked)
+// A contact is APPT_BOOKED only while an appointment is genuinely ACTIVE:
+// upcoming (or within a short reschedule grace) AND the demo has not yet
+// run. Two independent signals — either is enough:
 //
-// We deliberately do NOT use lp.demo_completed — a completed demo means
-// they're past the appointment, not currently in one. Post-demo states
-// belong in ACTIVE_BOFU or S45_DEMO_STALL depending on outcome.
+//   1. LP field branch: lp.appointment_set === true
+//      AND lp.demo_completed !== true
+//      AND lp.appointment_date >= now − APPT_GRACE_DAYS
+//      The date guard is the v1.5 fix: without it, ANY historical
+//      appointment_set=true (a cancelled/no-show/long-past booking) tripped
+//      this signal and wrongly suppressed the contact from S4.5. Once the
+//      appointment date passes with no demo, the contact is a no-show/cancel
+//      (S5.2 reactivation territory), not "booked". A contact with
+//      appointment_set=true but NO appointment_date is treated as NOT an
+//      active booking on this branch (no date = can't confirm it's upcoming)
+//      — the tag branch below still covers genuinely-booked contacts.
+//
+//   2. Tag branch: stage:booked-main-appointment / stage:booked-review /
+//      stage:booking-main. These tags are SET on booking and CLEARED on
+//      completion/cancel by the APPT Handler (A.*) workflows, so they're a
+//      reliable "currently booked" signal that — unlike a stale LP date —
+//      doesn't linger after the appointment is over. Left unchanged by v1.5.
+//
+// We deliberately do NOT treat lp.demo_completed=true as a booking — a
+// completed demo means they're PAST the appointment. Post-demo states
+// belong in ACTIVE_BOFU / S45_DEMO_STALL / post-demo-decline.
+
+const APPT_GRACE_DAYS = Number(process.env.APPT_ACTIVE_GRACE_DAYS || 2);
 
 export function hasActiveBooking(ctx) {
+  // 1. LP field branch — requires an UPCOMING (or within-grace) date and no demo yet.
   if (ctx?.lp?.appointment_set === true && ctx?.lp?.demo_completed !== true) {
-    return true;
+    const apptRaw = ctx?.lp?.appointment_date;
+    if (apptRaw) {
+      const apptMs = new Date(apptRaw).getTime();
+      if (Number.isFinite(apptMs)) {
+        const graceCutoffMs = Date.now() - APPT_GRACE_DAYS * 86400000;
+        if (apptMs >= graceCutoffMs) return true;
+      }
+    }
+    // appointment_set=true but no/invalid date, or a past date → not an
+    // active booking on this branch. Fall through to the tag branch.
   }
+  // 2. Tag branch — APPT Handler gate tags (set on booking, cleared on completion).
   return hasAnyTag(ctx, [
     'stage:booked-main-appointment',
     'stage:booked-review',
