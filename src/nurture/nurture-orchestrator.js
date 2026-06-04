@@ -127,7 +127,7 @@ import { selectPrompt } from './nurture-prompt-selector.js';
 import { generateNurtureContent } from './nurture-generator.js';
 import { validateSafety, SAFETY_CODES } from './nurture-safety-validator.js';
 import { applyAutofix } from './nurture-autofix.js';
-import { writeBackToGHL, writeDraftsOnly, clearGhlDraftFields } from './nurture-writeback.js';
+import { writeBackToGHL, writeDraftsOnly, clearGhlDraftFields, writeSuppressionHold } from './nurture-writeback.js';
 import { sendGroupMeMessage } from '../groupme.js';
 import { resolveSequencePosition } from './nurture-sequence-resolver.js';
 import { buildNurtureState } from './nurture-booking-link.js';
@@ -194,6 +194,22 @@ export async function runNurtureGeneration(request) {
       }));
       await updateStatus(generation_id, interrupt.status, interrupt.reason);
       await safeClearDrafts(request.contact_id, `interrupt:${interrupt.reason}`);
+
+      // SUPPRESSION-HOLD dispatch (2026-06-04). For transient suppressions
+      // (live conversation in progress) write the Hold dynamic-wait field so
+      // the source workflow routes the contact into the Hold pen instead of
+      // dead-waiting its gate to the 24h timeout. Terminal suppressions are
+      // not held. Never fail the response over the hold write.
+      if (HOLDABLE_INTERRUPTS.has(interrupt.reason)) {
+        const cooldownHours = computeHoldCooldownHours(interrupt);
+        try {
+          await writeSuppressionHold(request.contact_id, cooldownHours);
+          console.log(`[NurtureOrch] suppression-hold ${generation_id} contact=${request.contact_id} reason=${interrupt.reason} cooldown_h=${cooldownHours}`);
+        } catch (holdErr) {
+          console.warn(`[NurtureOrch] suppression-hold write failed ${generation_id} contact=${request.contact_id}: ${holdErr.message}`);
+        }
+      }
+
       return finishResponse(generation_id, false, interrupt.reason, startedAt);
     }
   }
@@ -398,6 +414,27 @@ function extractRequestFields(body) {
  *                                                     log line shows WHY)
  *   null                                            — no interrupt, proceed
  */
+// Transient interrupt reasons that should park the contact in the Hold pen
+// and re-check later, rather than dead-waiting the source workflow's gate to
+// its 24h timeout. recent_reply only — a live conversation that will resolve.
+// dnc_or_stop / appt_booked are terminal (nothing to re-check); layer3_* are
+// left to the Decision Engine, not auto-held here.
+const HOLDABLE_INTERRUPTS = new Set(['recent_reply']);
+const HOLD_MIN_HOURS = 4;
+const HOLD_MAX_HOURS = 26;
+
+// For recent_reply, wait long enough that the 24h recent-reply window has
+// passed at re-check (+1h buffer), floored at 4h, capped at 26h. If the
+// contact replies again during the hold, the next cycle re-suppresses and
+// re-holds — the desired "keep deferring while live" behavior.
+function computeHoldCooldownHours(interrupt) {
+  if (interrupt.reason === 'recent_reply' && Number.isFinite(interrupt.ageHrs)) {
+    const withBuffer = Math.ceil(24 - interrupt.ageHrs) + 1;
+    return Math.min(HOLD_MAX_HOURS, Math.max(HOLD_MIN_HOURS, withBuffer));
+  }
+  return HOLD_MIN_HOURS;
+}
+
 function checkInterrupts(context) {
   const tags = context?.lead?.current_tags || [];
 
