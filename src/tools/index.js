@@ -7,6 +7,7 @@ import { registerTriggerTools } from './trigger-tools.js';
 import { registerAgentTools } from './agent-tools.js';
 import { registerIntelTools } from './intel-tools.js';
 import { registerRescissionTools } from './rescission-tools.js';
+import { registerLPAppointmentTools } from './lp-appointment-tools.js';
 import { registerAdminTools } from './admin/index.js';
 
 export function registerAllTools(server) {
@@ -25,6 +26,11 @@ export function registerAllTools(server) {
   // Rescission rescue tools (3) — v6.6 (2026-05-06)
   //   compute_rescission_deadline, detect_signing_date, list_federal_holidays
   registerRescissionTools(server);
+  // LP appointment write/verify tools (3) — v6.7 (2026-06-04)
+  //   set_lp_appointment (confirm-gated), force_lp_lead_creation (confirm-gated),
+  //   check_lp_inbound (read-only). Expose existing webhook-only LP appointment
+  //   logic to the MCP so ops sweeps can act on un-synced appointments.
+  registerLPAppointmentTools(server);
   // Infrastructure admin tools (17) — v5.1
   registerAdminTools(server);
 }
