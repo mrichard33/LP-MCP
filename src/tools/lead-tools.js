@@ -6,6 +6,18 @@ import supabase from '../supabase.js';
 // The raw LP blob is stored on lp_prospects (one per person) not lp_leads.
 const LP_LEAD_COLUMNS = 'lp_lead_id, lp_prospect_id, ghl_contact_id, first_name, last_name, email, phone, phone_alt, address, city, state, zip, lead_source, lead_source_detail, promoter_name, ghl_intent_bucket, ghl_entry_tag, disposition_code, disposition_label, rep_name, appointment_set, appointment_date, demo_completed, demo_date, days_to_demo, closed_won, job_value, call_count, last_contact_date, created_at_lp, updated_at_lp, synced_at, ghl_tag_applied, lp_day15_triggered';
 
+// ─── Explicit column lists for child tables (exclude raw_lp_data) ─
+// v2.1 (2026-06-04): lp_call_logs / lp_notes / lp_activities each carry a
+// raw_lp_data jsonb blob (the full LP API payload). select('*') drags that
+// TOAST column on every row. get_lead_summary and get_call_history return a
+// lead's ENTIRE history unbounded, so on a high-call lead that was N rows ×
+// full JSONB per briefing. These lists drop ONLY raw_lp_data — every
+// human-relevant field is retained, so tool output and the stats counts are
+// unchanged; the reads are just lighter (no raw-payload TOAST fetch).
+const LP_CALL_COLUMNS = 'id, lp_call_id, lp_lead_id, ghl_contact_id, call_date, call_duration_sec, call_result, call_direction, rep_id, rep_name, call_notes, recording_url, synced_at, agent_id, agent_name';
+const LP_NOTE_COLUMNS = 'id, lp_note_id, lp_lead_id, ghl_contact_id, note_body, note_type, created_by_rep_id, created_by_rep_name, created_at_lp, synced_at, note_category, ghl_note_pushed';
+const LP_ACTIVITY_COLUMNS = 'id, lp_activity_id, lp_lead_id, activity_type, activity_detail, rep_id, rep_name, activity_date, synced_at';
+
 // Tool 1: get_lead_summary
 export function registerLeadTools(server) {
 
@@ -40,11 +52,14 @@ export function registerLeadTools(server) {
         return { content: [{ type: 'text', text: 'Lead not found.' }] };
       }
 
-      // Fetch related data in parallel
+      // Fetch related data in parallel.
+      // Child-table reads project explicit columns (no raw_lp_data) — see
+      // the LP_*_COLUMNS notes above. select('*') here previously pulled the
+      // raw_lp_data jsonb blob on every call/note/activity row.
       const [calls, notes, activities, jobs] = await Promise.all([
-        supabase.from('lp_call_logs').select('*').eq('lp_lead_id', lead.lp_lead_id).order('call_date', { ascending: false }),
-        supabase.from('lp_notes').select('*').eq('lp_lead_id', lead.lp_lead_id).order('created_at_lp', { ascending: false }),
-        supabase.from('lp_activities').select('*').eq('lp_lead_id', lead.lp_lead_id).order('activity_date', { ascending: false }),
+        supabase.from('lp_call_logs').select(LP_CALL_COLUMNS).eq('lp_lead_id', lead.lp_lead_id).order('call_date', { ascending: false }),
+        supabase.from('lp_notes').select(LP_NOTE_COLUMNS).eq('lp_lead_id', lead.lp_lead_id).order('created_at_lp', { ascending: false }),
+        supabase.from('lp_activities').select(LP_ACTIVITY_COLUMNS).eq('lp_lead_id', lead.lp_lead_id).order('activity_date', { ascending: false }),
         supabase.from('lp_jobs').select('*').eq('lp_lead_id', lead.lp_lead_id),
       ]);
 
@@ -185,9 +200,10 @@ export function registerLeadTools(server) {
       lead_id: z.string().describe('LP lead ID'),
     },
     async ({ lead_id }) => {
+      // Projects explicit columns (no raw_lp_data jsonb) — see LP_CALL_COLUMNS.
       const { data, error } = await supabase
         .from('lp_call_logs')
-        .select('*')
+        .select(LP_CALL_COLUMNS)
         .eq('lp_lead_id', lead_id)
         .order('call_date', { ascending: false });
 
