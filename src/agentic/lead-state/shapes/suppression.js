@@ -1,7 +1,7 @@
 /**
  * Suppression Shape — src/agentic/lead-state/shapes/suppression.js
  *
- * Deterministic ineligibility classification. Returns one of the eight
+ * Deterministic ineligibility classification. Returns one of the nine
  * suppression states OR null (caller falls through to other shapes).
  *
  * Priority order — first match wins:
@@ -11,8 +11,9 @@
  *   4. ACTIVE_BOFU                  — in active conversion work
  *   5. SUPPRESSED_POST_DEMO_DECLINE — recorded post-demo decline (OPPFDN/FDNS)
  *   6. SUPPRESSED_CONFIRMED_LOSS    — confirmed competitor/not-interested loss (tags)
- *   7. IN_NARRATIVE_NURTURE         — already in S4.5 (or another narrative)
- *   8. RECENT_REP_CONTACT           — rep is actively working the lead (last 14d)
+ *   7. IN_NARRATIVE_NURTURE         — already ON the S4.5 (Seinfeld) layer
+ *   8. SUPPRESSED_ACTIVE_NARRATIVE  — still inside a PRIOR soap-opera sequence
+ *   9. RECENT_REP_CONTACT           — rep is actively working the lead (last 14d)
  *
  * Why this order: legal trumps everything. Then customer status —
  * a P2 customer who happens to be in an A.* appointment workflow is
@@ -32,6 +33,12 @@
  * Post-demo decline (5) before confirmed-loss (6) only because the
  * disposition-code signal is the more specific one when both fire; they
  * route to the same loss/reactivation track.
+ * IN_NARRATIVE_NURTURE (7) before SUPPRESSED_ACTIVE_NARRATIVE (8): both are
+ * "a narrative is already running" guards (Brunson: never two at once).
+ * active-s4.5 (7) means the contact is ALREADY on the Seinfeld layer — the
+ * more specific fact when both fire — so it wins the audit label; (8) means
+ * the contact is still inside a PRIOR soap-opera sequence and hasn't earned
+ * the Seinfeld layer yet (completion is the gate). Both equally block S4.5.
  * Rep contact last because it's a softer signal than the others —
  * doesn't preclude future S4.5 enrollment, just defers it.
  *
@@ -49,6 +56,7 @@ import {
   isPostDemoDecline,
   isConfirmedLoss,
   inNarrativeNurture,
+  isInActiveSoapOpera,
   hasRecentRepContact,
   snapshotSuppressionSignals,
 } from '../signals/context-reader.js';
@@ -166,7 +174,7 @@ export function classifySuppression(ctx) {
     };
   }
 
-  // 7. Already in another narrative nurture
+  // 7. Already ON the S4.5 (Seinfeld) layer
   if (signals.in_narrative_nurture) {
     return {
       state: STATES.IN_NARRATIVE_NURTURE,
@@ -175,12 +183,37 @@ export function classifySuppression(ctx) {
         rule: 'in_narrative_nurture',
         matched_signals: ['in_narrative_nurture'],
         signal_snapshot: signals,
-        notes: 'Already enrolled in S4.5 (active-s4.5 tag) or another identity-framing sequence. Avoid narrative blur.',
+        notes: 'Already on the S4.5 Seinfeld layer (active-s4.5 tag). Avoid double-enrollment / narrative blur.',
       },
     };
   }
 
-  // 8. Recent rep contact
+  // 8. Still inside a PRIOR soap-opera sequence (not yet on the Seinfeld layer)
+  //    Brunson (DotCom Secrets): the Seinfeld/Side-Filled broadcast (S4.5 v2)
+  //    is entered ONLY "after someone has completed your soap opera sequence."
+  //    Completion is the gate. A contact carrying an active-SOS stage:* tag
+  //    (indoctrination/education, re-engagement, reactivation,
+  //    appointment-rescue, post-appointment, active-nurture-broadcast) is
+  //    still inside an ordered narrative and must NOT also be dropped into
+  //    S4.5 — that's two narratives on one person. DELIBERATELY does NOT
+  //    fire on stage:long-term-nurture (the post-SOS holding state = the S4.5
+  //    destination), so those stay eligible. This is the ~1,300-contact
+  //    open-P1 leak the classifier previously missed: inNarrativeNurture only
+  //    saw active-s4.5; isInActiveBofu only saw conversion tags.
+  if (signals.active_soap_opera) {
+    return {
+      state: STATES.SUPPRESSED_ACTIVE_NARRATIVE,
+      confidence: scoreConfidence(STATES.SUPPRESSED_ACTIVE_NARRATIVE),
+      reason: {
+        rule: 'active_soap_opera_sequence',
+        matched_signals: ['active_soap_opera'],
+        signal_snapshot: signals,
+        notes: 'Contact is inside an active soap-opera/nurture sequence (stage:indoctrination/education/re-engagement/reactivation/appointment-rescue/post-appointment/active-nurture-broadcast). Brunson: the Seinfeld layer (S4.5) is entered only AFTER the soap opera completes — running both at once is narrative blur. stage:long-term-nurture is excluded (post-SOS holding = the S4.5 destination, stays eligible).',
+      },
+    };
+  }
+
+  // 9. Recent rep contact
   if (signals.recent_rep_contact) {
     return {
       state: STATES.RECENT_REP_CONTACT,
