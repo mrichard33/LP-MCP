@@ -65,7 +65,25 @@ const GETLEAD_DEFAULT_OPTIONS = parseInt(process.env.LP_GETLEAD_OPTIONS || '2611
 
 // ─── Core POST helper with retry + token refresh ─────────────────
 
-export const lpPost = async (endpoint, fields = {}, retries = 3) => {
+// LP_TIMEOUT — tagged error so interactive callers (e.g. the appointment
+// resolver) can distinguish "LP was too slow to answer" from "LP answered
+// that there is no such lead." Critical: a swallowed timeout must NOT be
+// treated as not-found, or a real-but-slow lead gets wrongly routed to the
+// no-lead enroll path and duplicated.
+export class LpTimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'LpTimeoutError';
+    this.code = 'LP_TIMEOUT';
+  }
+}
+
+const RESOLVE_FAST_TIMEOUT_MS = parseInt(process.env.LP_RESOLVE_FAST_TIMEOUT_MS || '12000', 10);
+
+// `opts.fast` → single attempt, short timeout, no retry/backoff. For
+// interactive/tool callers that must fail fast instead of riding the
+// 120s × 3-retry sync budget (which can run ~360s+ before throwing).
+export const lpPost = async (endpoint, fields = {}, retries = 3, opts = {}) => {
   const token = await getToken();
   const body  = new URLSearchParams(fields);
   const base  = LP_BASE();
@@ -74,11 +92,16 @@ export const lpPost = async (endpoint, fields = {}, retries = 3) => {
     throw new Error('LP_API_BASE_URL not configured');
   }
 
-  for (let attempt = 1; attempt <= retries; attempt++) {
+  const fast = opts.fast === true;
+  const perCallTimeoutMs = fast ? RESOLVE_FAST_TIMEOUT_MS : 120000;
+  const effectiveRetries = fast ? 1 : retries;
+
+  for (let attempt = 1; attempt <= effectiveRetries; attempt++) {
     try {
-      // 120-second timeout — LP queries on large datasets can be slow
+      // Fast callers get a short timeout; sync callers keep the 120s budget
+      // for large dataset queries.
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 120000);
+      const timeout = setTimeout(() => controller.abort(), perCallTimeoutMs);
 
       const res = await fetch(`${base}${endpoint}`, {
         method:  'POST',
@@ -124,7 +147,15 @@ export const lpPost = async (endpoint, fields = {}, retries = 3) => {
 
       return await res.json();
     } catch (err) {
-      if (attempt === retries) throw err;
+      // AbortError = our timeout fired. Re-tag so callers can branch on it.
+      const isAbort = err?.name === 'AbortError';
+      if (isAbort && fast) {
+        throw new LpTimeoutError(`LP call ${endpoint} exceeded ${perCallTimeoutMs}ms (fast path)`);
+      }
+      if (attempt === effectiveRetries) {
+        if (isAbort) throw new LpTimeoutError(`LP call ${endpoint} timed out after ${perCallTimeoutMs}ms`);
+        throw err;
+      }
       // Exponential backoff: 1s, 4s, 16s
       const delay = Math.pow(4, attempt - 1) * 1000;
       console.warn(`[LP] Attempt ${attempt} failed, retrying in ${delay}ms:`, err.message);
@@ -191,7 +222,7 @@ function _itemsFrom(result) {
  * needed for sync purposes (though sync-engine still does one for
  * freshness; that's a future optimization).
  */
-export async function getLeads(params = {}) {
+export async function getLeads(params = {}, opts = {}) {
   return withCircuit(() => lpPost('/api/Customers/GetLead', {
     startdate:   params.startdate  || '2020-01-01',
     enddate:     params.enddate    || new Date().toISOString().slice(0, 10),
@@ -202,7 +233,7 @@ export async function getLeads(params = {}) {
     StartIndex:  String(params.StartIndex || 1),
     options:     String(params.options ?? GETLEAD_DEFAULT_OPTIONS),
     SortOrder:   String(params.SortOrder ?? 0),
-  }));
+  }, 3, opts));
 }
 
 /**
@@ -346,13 +377,13 @@ export async function getLeadInfo(params = {}) {
   }));
 }
 
-export async function getCustomers3(params = {}) {
+export async function getCustomers3(params = {}, opts = {}) {
   return withCircuit(() => lpPost('/api/Customers/GetCustomers3', {
     phone:       params.phone      || '',
     email:       params.email      || '',
     lastname:    params.lastname   || '',
     prospectid:  params.prospectid || '',
-  }));
+  }, 3, opts));
 }
 
 export async function getLeadsSourceSubPromoter(type = 's') {
@@ -402,7 +433,7 @@ export async function getLead(cstId) {
  * @param {string|number} ldsId — LP Lead ID
  * @returns {Object} LP API response (array of prospect records)
  */
-export async function getLeadByLdsId(ldsId) {
+export async function getLeadByLdsId(ldsId, opts = {}) {
   return withCircuit(() => lpPost('/api/Customers/GetLead', {
     startdate:   '2000-01-01',
     enddate:     new Date().toISOString().slice(0, 10),
@@ -413,7 +444,7 @@ export async function getLeadByLdsId(ldsId) {
     StartIndex:  '1',
     options:     '0',
     SortOrder:   '0',
-  }));
+  }, 3, opts));
 }
 
 // ═══════════════════════════════════════════════════════════════════
