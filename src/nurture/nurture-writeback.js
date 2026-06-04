@@ -81,6 +81,15 @@
  *
  *   NOT called on awaiting_approval / soft_pass paths — those preserve
  *   the drafts for human review (design intent).
+ *
+ * v1.6 — 2026-06-04. DYNAMIC TIMING. calculateNextWaitHours() now reads
+ *   the generator's `output.next_wait_hours` instead of returning a flat
+ *   168. S1.1 v2 re-engagement prompt rows are the first to emit it; the
+ *   value drives the GHL "Wait" step via ai_msg_next_wait_hours so the
+ *   agentic layer can shorten cadence for warm contacts and lengthen it
+ *   for cold ones. Backward compatible: prompts that don't emit the field
+ *   (e.g. S4.5) still get 168. See the function doc-comment for the band
+ *   and terminal-touch rules.
  */
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -164,12 +173,39 @@ async function ghlUpdate(contactId, customFields) {
 }
 
 /**
- * Decide the next-wait window in hours. v1 is a flat 7 days for cool/
- * cold leads. Future versions can lean on context.intelligence (emotional
- * state, lead score velocity) to shorten cadence for warmer leads.
+ * Decide the next-wait window in hours.
+ *
+ * v1.6 — 2026-06-04. DYNAMIC TIMING. The message generator can now emit
+ *   an integer `next_wait_hours` in its JSON output (S1.1 v2 prompt rows
+ *   are the first to do so). When present, it drives the GHL "Wait" step
+ *   via the ai_msg_next_wait_hours field instead of a flat constant.
+ *
+ *   Rules:
+ *     - LLM omits it (e.g. S4.5 rows, which have no next_wait_hours in
+ *       their output_schema)   -> DEFAULT_NEXT_WAIT_HOURS (168, the prior
+ *                                 flat behavior — backward compatible).
+ *     - LLM returns 0 or less   -> 0. Terminal touch (e.g. S1.1 T5); the
+ *                                 workflow completes and never waits again.
+ *     - LLM returns 1..23       -> clamped UP to MIN_NEXT_WAIT_HOURS (24h floor).
+ *     - LLM returns >240        -> clamped DOWN to MAX_NEXT_WAIT_HOURS (240h ceiling).
+ *     - Anything non-numeric    -> DEFAULT_NEXT_WAIT_HOURS.
+ *
+ *   The band protects against a bad generation setting an absurd cadence
+ *   (2h spam or a multi-week wait). Baselines and the intended band live
+ *   in the prompt rows; this function only enforces sanity + the terminal
+ *   case so a malformed value can never escape into the workflow.
+ *
+ * @param {object} [output] — LLM-generated content; may carry next_wait_hours.
  */
-function calculateNextWaitHours() {
-  return 168;
+const DEFAULT_NEXT_WAIT_HOURS = 168;
+const MIN_NEXT_WAIT_HOURS = 24;
+const MAX_NEXT_WAIT_HOURS = 240;
+
+function calculateNextWaitHours(output = {}) {
+  const n = Number(output && output.next_wait_hours);
+  if (!Number.isFinite(n)) return DEFAULT_NEXT_WAIT_HOURS; // LLM didn't emit one
+  if (n <= 0) return 0; // terminal touch — workflow completes, no further wait
+  return Math.min(MAX_NEXT_WAIT_HOURS, Math.max(MIN_NEXT_WAIT_HOURS, Math.round(n)));
 }
 
 /**
@@ -244,7 +280,7 @@ function buildPhase1Fields(output, nextWaitHours) {
  *                                to the GHL contact field — see v1.2)
  */
 export async function writeBackToGHL(contactId, output, generationId, confidence, opts = {}) {
-  const nextWaitHours = calculateNextWaitHours();
+  const nextWaitHours = calculateNextWaitHours(output);
   const { fields: phase1Fields, usedKeys: phase1Keys } =
     buildPhase1Fields(output, nextWaitHours);
 
@@ -269,7 +305,7 @@ export async function writeBackToGHL(contactId, output, generationId, confidence
   const seqLog = opts.sequence_position !== undefined ? ` seq=${opts.sequence_position}` : '';
   const psLog = output.ps_text ? ' ps=yes' : ' ps=no';
   console.log(`[NurtureWriteback] ok contact=${contactId} gen=${generationId}${seqLog}${psLog} ` +
-    `fields_written=${phase1Fields.length + phase2Fields.length} gate=${GATE_FLIPPED}`);
+    `fields_written=${phase1Fields.length + phase2Fields.length} gate=${GATE_FLIPPED} next_wait_h=${nextWaitHours}`);
 }
 
 /**
@@ -278,7 +314,7 @@ export async function writeBackToGHL(contactId, output, generationId, confidence
  * to send. Mark approves each one manually before the gate is flipped.
  */
 export async function writeDraftsOnly(contactId, output, generationId, confidence, opts = {}) {
-  const nextWaitHours = calculateNextWaitHours();
+  const nextWaitHours = calculateNextWaitHours(output);
   const { fields, usedKeys } = buildPhase1Fields(output, nextWaitHours);
 
   // Stash generation_id + confidence in phase-1 so reviewers can match
@@ -293,7 +329,7 @@ export async function writeDraftsOnly(contactId, output, generationId, confidenc
 
   const seqLog = opts.sequence_position !== undefined ? ` seq=${opts.sequence_position}` : '';
   const psLog = output.ps_text ? ' ps=yes' : ' ps=no';
-  console.log(`[NurtureWriteback] shadow contact=${contactId} gen=${generationId}${seqLog}${psLog} fields_written=${fields.length} (gate NOT flipped)`);
+  console.log(`[NurtureWriteback] shadow contact=${contactId} gen=${generationId}${seqLog}${psLog} fields_written=${fields.length} next_wait_h=${nextWaitHours} (gate NOT flipped)`);
 }
 
 /**
@@ -347,4 +383,5 @@ export async function clearGhlDraftFields(contactId, reason = 'suppress') {
 export const _internal = {
   CLEAR_FIELDS,
   buildPhase1Fields,
+  calculateNextWaitHours,
 };
