@@ -147,6 +147,8 @@ import {
 import {
   registerEnrollExistingEligibleRoutes,
 } from './agentic/lead-state/enroll-existing-eligible.js';
+// ─── Agentic Hold-Complete (return-from-hold re-entry) ───────────
+import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
 
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -367,6 +369,7 @@ registerLlmGatewayRoutes(app);
 registerDecisionEngineRoutes(app);
 registerActionExecutorRoutes(app);
 registerStateRoutes(app);
+registerHoldCompleteRoutes(app);
 
 // ─── Executor Heartbeat (failover for n8n cron) ──────────────────
 registerExecutorHeartbeatRoutes(app);

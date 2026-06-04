@@ -120,6 +120,7 @@ export const FIELD_IDS = {
   ai_msg_send_ready:         'PMq1AzXFX3nudZgNFxbw', // Yes/No select
   ai_sms_send_ready:         'kIOFapo85KNwpq95Qhl7', // Yes/No select
   ai_msg_sequence_position:  'apoe5TFnilPriJmIzvbo', // WORKFLOW-OWNED — not written here
+  hold_dynamic_wait_hours:   'MZkFWOFDzf8OKTy2O4od', // v1.7 — Hold pen dynamic-wait / suppression-hold signal
 };
 
 // Gate values must match GHL select-field option labels exactly.
@@ -377,6 +378,29 @@ export async function clearGhlDraftFields(contactId, reason = 'suppress') {
     // on the next cycle.
     console.warn(`[NurtureWriteback] clear failed contact=${contactId} reason=${reason}: ${err.message}`);
   }
+}
+
+/**
+ * Write the suppression-hold signal for a GHL source workflow (v1.7).
+ * On a transient suppression (defer, not stop — e.g. S1.1 recent_reply),
+ * write the cooldown hours into the Hold dynamic-wait field. The source
+ * workflow releases its wait on this field having a value and routes the
+ * contact into the generic Hold pen, which waits then calls
+ * /api/agentic/hold-complete. Single numeric write: doubles as signal
+ * (has_value) and duration. Does NOT touch gates or clear drafts — the
+ * orchestrator already cleared drafts before this, so this is the LAST
+ * field GHL sees.
+ * @param {string} contactId
+ * @param {number} cooldownHours
+ */
+export async function writeSuppressionHold(contactId, cooldownHours) {
+  if (!contactId) throw new Error('writeSuppressionHold: contactId required');
+  const hours = Math.max(1, Math.round(Number(cooldownHours) || 0));
+  assertFieldIdsConfigured(['hold_dynamic_wait_hours']);
+  await ghlUpdate(contactId, [
+    { id: FIELD_IDS.hold_dynamic_wait_hours, field_value: String(hours) },
+  ]);
+  console.log(`[NurtureWriteback] suppression-hold contact=${contactId} cooldown_h=${hours} (MZkFWOFDzf8OKTy2O4od set -> Hold pen)`);
 }
 
 // Exported for tests.
