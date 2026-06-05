@@ -2,20 +2,28 @@
 //
 // Wrapper for GitHub REST API v3.
 // Requires GITHUB_PAT (repo scope) and GITHUB_REPO env vars.
+//
+// v1.1: Added optional repoOverride to support cross-repo reads
+//       (e.g. the Reece Dashboard repo) so the repo stays readable
+//       when the HL MCP service is down.
 
 const GH_API = 'https://api.github.com';
 
-const getRepo = () => {
-  const repo = process.env.GITHUB_REPO;
+const getRepo = (repoOverride) => {
+  const repo = repoOverride || process.env.GITHUB_REPO;
   if (!repo) throw new Error('GITHUB_REPO not configured');
   return repo;
 };
 
-export const ghRequest = async (method, path, body = null) => {
+// Reece Dashboard repo (cross-repo read target).
+export const getDashboardRepo = () =>
+  process.env.DASHBOARD_GITHUB_REPO || 'mrichard33/Reece-Dashboard';
+
+export const ghRequest = async (method, path, body = null, repoOverride = null) => {
   const token = process.env.GITHUB_PAT;
   if (!token) throw new Error('GITHUB_PAT not configured');
 
-  const repo = getRepo();
+  const repo = getRepo(repoOverride);
   const opts = {
     method,
     headers: {
@@ -36,11 +44,11 @@ export const ghRequest = async (method, path, body = null) => {
 };
 
 // Search code across the repo (uses search API, not repo API)
-export const ghSearchCode = async (query) => {
+export const ghSearchCode = async (query, repoOverride = null) => {
   const token = process.env.GITHUB_PAT;
   if (!token) throw new Error('GITHUB_PAT not configured');
 
-  const repo = getRepo();
+  const repo = getRepo(repoOverride);
   const q = encodeURIComponent(`${query} repo:${repo}`);
   const res = await fetch(`${GH_API}/search/code?q=${q}`, {
     headers: {
