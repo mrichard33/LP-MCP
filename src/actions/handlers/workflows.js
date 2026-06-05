@@ -31,6 +31,28 @@
  *   'json' → application/json. Use only when the destination explicitly
  *      requires JSON (non-GHL targets, future integrations).
  *
+ * v1.7 (2026-06-05) — days_since_last_contact now measures TRUE human contact.
+ *        Rewrote computeDaysSinceLastContact to read only two signals, both of
+ *        which represent an actual person↔lead interaction and neither of which
+ *        is reset by our own marketing automation:
+ *          LP  : MAX(lp_notes.created_at_lp) — rep-authored notes / call
+ *                dispositions. (Replaces lp_leads.last_contact_date /
+ *                last_call_date, which on multi-lead contacts were read with a
+ *                no-ORDER-BY .limit(1) and so could grab the wrong/null row.)
+ *          GHL : the most recent INBOUND conversation message (the lead
+ *                replying). (Replaces contact.lastActivity → dateUpdated, which
+ *                was bumped by every tag/field write the agentic system itself
+ *                made — including the re-engagement-eligible tag added moments
+ *                earlier — so it collapsed the value to ~0 and pinned the S1.1
+ *                tier to T1 regardless of real dormancy.)
+ *        Inbound-only on the GHL side is deliberate: outbound is excluded
+ *        because automation sends through the same Conversations API and would
+ *        re-introduce the self-pollution this fix removes. Result is
+ *        today − MAX(both); null when neither system has a human-contact date,
+ *        which the S1.1 workflow treats as T3 (coldest). NOTE: phone calls that
+ *        a rep makes but never logs as an LP note are not captured by this
+ *        signal — fold lp_leads.last_call_date back in if that gap matters.
+ *
  * v1.6 (2026-06-05) — Route B contact-key fix. The webhook body now sends the
  *        contact identifier as contact_id (snake_case) — the field every Reece
  *        GHL inbound-webhook trigger actually reads via its "Find Contact by
@@ -47,10 +69,10 @@
  *
  * v1.5 (2026-06-05) — Opt-in cross-system recency enrichment. When
  *        action_payload.compute_days_since_last_contact === true, Route B
- *        computes days_since_last_contact as today − MAX(GHL lastActivity,
- *        LP lp_leads.last_contact_date/last_call_date) and injects it into
- *        the webhook payload. Used by ENROLL_S1_1_V3_REENGAGEMENT so the
- *        S1.1 tier branch (T1/T2/T3) sees a real number, not a merge token.
+ *        computes days_since_last_contact and injects it into the webhook
+ *        payload. Used by ENROLL_S1_1_V3_REENGAGEMENT so the S1.1 tier branch
+ *        (T1/T2/T3) sees a real number, not a merge token. (Signal source
+ *        corrected in v1.7.)
  *
  * v1.4 (2026-05-23) — Post-success action chaining. When action_payload
  *        contains _post_success_action, enqueue that follow-up action
@@ -118,46 +140,97 @@ function buildFormBody(payload) {
 }
 
 /**
- * Compute days since the contact was last touched, across BOTH systems.
- * LP and HL are separate stores, so read each independently and take the
- * most recent touch (smaller day-count wins).
- *   GHL : contact.lastActivity (epoch ms) — falls back to dateUpdated (ISO)
- *   LP  : lp_leads.last_contact_date / last_call_date (most recent)
- * Returns an integer day count, or null if neither system has a date
- * (the S1.1 workflow treats a missing value as T3).
+ * Most recent INBOUND GHL conversation message timestamp (epoch ms) for the
+ * contact, or NaN if none. Inbound = the lead replied → unambiguous human
+ * contact that our automated outbound sends can never reset. Mirrors the
+ * proven conversation-fetch pattern in decision-engine.js countThreadTurns
+ * (Conversations API version 2021-04-15).
+ */
+async function getLastInboundMessageMs(contactId) {
+  const GHL_API_KEY = process.env.GHL_API_KEY;
+  if (!GHL_API_KEY || !contactId) return NaN;
+  const locationId = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
+
+  // Most recently updated conversation for the contact
+  const convRes = await fetch(
+    `https://services.leadconnectorhq.com/conversations/search?contactId=${contactId}&locationId=${locationId}&limit=1`,
+    {
+      headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-04-15', 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    }
+  );
+  if (!convRes.ok) {
+    console.warn(`[ActionExecutor] getLastInboundMessageMs conversation search failed for ${contactId}: ${convRes.status}`);
+    return NaN;
+  }
+  const convData = await convRes.json();
+  const conv = convData?.conversations?.[0];
+  if (!conv?.id) return NaN;
+
+  const msgRes = await fetch(
+    `https://services.leadconnectorhq.com/conversations/${conv.id}/messages`,
+    {
+      headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-04-15', 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    }
+  );
+  if (!msgRes.ok) {
+    console.warn(`[ActionExecutor] getLastInboundMessageMs messages fetch failed for conv ${conv.id}: ${msgRes.status}`);
+    return NaN;
+  }
+  const msgData = await msgRes.json();
+  const messages = msgData?.messages?.messages || [];
+
+  let latest = NaN;
+  for (const m of messages) {
+    if (String(m.direction || '').toLowerCase() !== 'inbound') continue;
+    const ms = m.dateAdded ? Date.parse(m.dateAdded) : NaN;
+    if (Number.isFinite(ms) && (!Number.isFinite(latest) || ms > latest)) latest = ms;
+  }
+  return latest;
+}
+
+/**
+ * Days since the contact was last in TRUE human contact, across both systems.
+ * Both signals represent an actual person↔lead interaction and neither is
+ * reset by our own marketing automation:
+ *   LP  : MAX(lp_notes.created_at_lp) — rep-authored notes / call dispositions
+ *   GHL : most recent INBOUND conversation message (the lead replying)
+ * Returns today − MAX(both) as an integer day count, or null if neither system
+ * has a human-contact date (the S1.1 workflow treats null as T3, the coldest
+ * tier). Both reads are independent and fail-soft — a transient error on one
+ * side simply drops that side from the MAX rather than failing enrollment.
  */
 async function computeDaysSinceLastContact(contactId) {
   const dates = [];
 
-  // GHL side — last activity on the contact record
-  try {
-    const resp = await ghlFetch('GET', `/contacts/${contactId}`);
-    const c = (resp && resp.contact) ? resp.contact : (resp || {});
-    const ghlMs = Number(c.lastActivity) || (c.dateUpdated ? Date.parse(c.dateUpdated) : NaN);
-    if (Number.isFinite(ghlMs)) dates.push(ghlMs);
-  } catch (err) {
-    console.warn(`[ActionExecutor] computeDaysSinceLastContact GHL read failed for ${contactId}: ${err.message}`);
-  }
-
-  // LP side — most recent of last_contact_date / last_call_date on lp_leads
+  // ── LP side: latest rep-authored note (incl. logged call dispositions) ──
   try {
     const { data, error } = await supabase
-      .from('lp_leads')
-      .select('last_contact_date, last_call_date')
+      .from('lp_notes')
+      .select('created_at_lp')
       .eq('ghl_contact_id', contactId)
+      .not('created_at_lp', 'is', null)
+      .order('created_at_lp', { ascending: false })
       .limit(1);
-    if (!error && Array.isArray(data) && data[0]) {
-      for (const d of [data[0].last_contact_date, data[0].last_call_date]) {
-        const ms = d ? Date.parse(d) : NaN;
-        if (Number.isFinite(ms)) dates.push(ms);
-      }
+    if (!error && Array.isArray(data) && data[0]?.created_at_lp) {
+      const ms = Date.parse(data[0].created_at_lp);
+      if (Number.isFinite(ms)) dates.push(ms);
     }
   } catch (err) {
-    console.warn(`[ActionExecutor] computeDaysSinceLastContact LP read failed for ${contactId}: ${err.message}`);
+    console.warn(`[ActionExecutor] computeDaysSinceLastContact LP notes read failed for ${contactId}: ${err.message}`);
   }
 
-  if (!dates.length) return null;
-  const mostRecent = Math.max(...dates);            // most recent touch across both systems
+  // ── GHL side: most recent inbound conversation message (lead replied) ──
+  try {
+    const inboundMs = await getLastInboundMessageMs(contactId);
+    if (Number.isFinite(inboundMs)) dates.push(inboundMs);
+  } catch (err) {
+    console.warn(`[ActionExecutor] computeDaysSinceLastContact GHL conversation read failed for ${contactId}: ${err.message}`);
+  }
+
+  if (!dates.length) return null;                   // no human contact on record → workflow treats null as T3
+  const mostRecent = Math.max(...dates);            // most recent human touch across LP notes + GHL inbound
   const days = Math.floor((Date.now() - mostRecent) / 86400000);
   return days < 0 ? 0 : days;
 }
@@ -252,7 +325,8 @@ export async function executeAddToWorkflow(action) {
 
     // Cross-system recency enrichment (opt-in). The S1.1 re-engagement
     // workflow tiers on days_since_last_contact; that number must reflect
-    // the most recent touch across BOTH LP and GHL.
+    // the most recent TRUE human contact (LP notes + GHL inbound) — see
+    // computeDaysSinceLastContact (v1.7).
     if (payload.compute_days_since_last_contact === true) {
       const dslc = await computeDaysSinceLastContact(contactId);
       if (dslc !== null) webhookPayload.days_since_last_contact = dslc;
