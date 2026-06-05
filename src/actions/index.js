@@ -118,6 +118,8 @@ import { getDispatchForClassification } from '../services/layer3-dispatch.js';
 
 // Phase 1 Intake/Routing Layer #51 — universal outbound suppression
 import { checkSuppression } from '../services/suppression-check.js';
+// Send-dedup — logical-identity idempotency for non-idempotent senders (2026-06-05)
+import { claimSendMark, releaseSendMark, makeDedupKey } from '../services/send-dedup.js';
 
 // Antifragile Validation Gate — pre-handler invariant check (2026-05-18)
 import { validateAction } from '../services/validation-gate.js';
@@ -421,6 +423,44 @@ async function executeSingleAction(action, batchContext = {}, priorBatchResults 
     };
   }
   // ═══════════════════════════════════════════════════════════════════
+  // ═══ Send-dedup gate (logical-identity idempotency) ═════════════════
+  // Runs after the validation gate, before dispatch. For send_notification
+  // and create_task, claim an atomic mark keyed on (action_type, target_id,
+  // payload hash). A near-simultaneous sibling row or a post-timeout retry
+  // produces the SAME key → claim fails → we short-circuit instead of double-
+  // sending. Fail-open (any infra error claims). The mark is released in the
+  // catch below if the handler throws, so a genuinely-failed send still
+  // retries. See src/services/send-dedup.js.
+  let _dedupKey = null;
+  if (DEDUP_ACTION_TYPES.has(action.action_type)) {
+    _dedupKey = makeDedupKey(action);
+    const claim = await claimSendMark(_dedupKey, action);
+    if (claim.duplicate) {
+      await supabase.from('agent_actions').update({
+        status: 'completed',
+        execution_result: {
+          action: 'deduped',
+          skipped: true,
+          reason: 'send_dedup',
+          dedup_key: _dedupKey,
+          first_action_id: claim.first_action_id,
+          age_ms: claim.age_ms,
+        },
+        executed_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }).eq('id', action.id);
+      console.log(
+        `[ActionExecutor] 🟰 ${action.action_type} deduped (action ${action.id}, ` +
+        `key=${_dedupKey}, first=${claim.first_action_id}, age=${claim.age_ms}ms)`
+      );
+      return {
+        action_id: action.id,
+        status: 'completed',
+        action_type: action.action_type,
+        result: { deduped: true, first_action_id: claim.first_action_id },
+      };
+    }
+  }
 
   try {
     // Base context always carries the per-batch contact cache so every handler
@@ -454,6 +494,10 @@ async function executeSingleAction(action, batchContext = {}, priorBatchResults 
       result,
     };
   } catch (err) {
+    // Release the send-dedup mark so a genuinely-failed send can retry.
+    if (_dedupKey) {
+      try { await releaseSendMark(_dedupKey, action.id); } catch (e) { /* swallow */ }
+    }
     const retries = (action.retry_count || 0) + 1;
     const max = action.max_retries || 3;
     const st = retries >= max ? 'failed' : 'pending';
@@ -504,7 +548,21 @@ const EXECUTOR_CLAIM_CHUNK   = Math.max(1, parseInt(process.env.EXECUTOR_CLAIM_C
 // executorRunning guard, freezing the whole sweep so every later action drains
 // minutes late. This race caps any single handler; on timeout the catch below
 // marks the action pending/failed and the sweep returns, releasing the guard.
-const HANDLER_TIMEOUT_MS = parseInt(process.env.EXECUTOR_HANDLER_TIMEOUT_MS || '30000', 10);
+// 2026-06-05 — raised 30000 → 60000. The 30s watchdog was SHORTER than the
+// worst-case legitimate path: ghl-rate-limiter acquireToken can wait up to its
+// own 30s fail-open, and the downstream ghlFetch adds up to 15s — ~45s total
+// under token-bucket contention. At 30s the race fired on healthy-but-queued
+// calls, marked them failed/pending, and retried; because Promise.race does
+// NOT cancel the loser, the original POST could still land → duplicate GroupMe
+// cards + lost-alert churn. 60s clears the legitimate ceiling while still
+// capping a truly hung handler (the 10-min reaper is the real backstop).
+const HANDLER_TIMEOUT_MS = parseInt(process.env.EXECUTOR_HANDLER_TIMEOUT_MS || '60000', 10);
+// Send-dedup: action types whose handlers cause an external, user-visible side
+// effect that must not double-fire. Guarded by an atomic claim on a logical-
+// identity key (action_type + target_id + payload hash) so that (a) near-
+// simultaneous sibling rows and (b) post-timeout retries collapse to a single
+// send. See src/services/send-dedup.js.
+const DEDUP_ACTION_TYPES = new Set(['send_notification', 'create_task']);
 
 // Module-level in-flight guard. Protects BOTH entry points (the n8n /execute
 // route AND the 60s in-process scheduler) from stacking into wasteful empty
