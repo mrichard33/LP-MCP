@@ -79,17 +79,44 @@
 import supabase from './supabase.js';
 import { processEvents } from './decision-engine.js';
 
+// 2026-06-05: promoted from 6-min-late FAILOVER to PRIMARY driver. The n8n
+// cron (ERnvX5hp6i90VVWc) silently went dormant on 2026-05-22 while still
+// active=true — second occurrence of the 2026-05-13 silent-dormant bug — so
+// the in-process scheduler is now the system of record for queue draining.
+// n8n, if re-armed, is redundant secondary (processSingleEvent is idempotent
+// via the processed_events table, so double-runs are correctness-safe).
+//
+// Behaviour in PRIMARY mode (default): drain whenever events are pending, on
+// HEARTBEAT_INTERVAL_MS, looping processEvents until the queue is empty.
+// Set DECISION_ENGINE_HEARTBEAT_PRIMARY_MODE=false to revert to the legacy
+// stale-gated failover behaviour without redeploying code.
+const PRIMARY_MODE = process.env.DECISION_ENGINE_HEARTBEAT_PRIMARY_MODE !== 'false';
+
+const HEARTBEAT_INTERVAL_MS = parseInt(
+  process.env.DECISION_ENGINE_HEARTBEAT_INTERVAL_MS || `${60 * 1000}`, 10
+);
+const FIRST_RUN_DELAY_MS = parseInt(
+  process.env.DECISION_ENGINE_HEARTBEAT_FIRST_RUN_DELAY_MS || `${30 * 1000}`, 10
+);
+
+// Staleness gate is only consulted when PRIMARY_MODE is off (legacy failover).
 const STALE_THRESHOLD_MS = parseInt(
   process.env.DECISION_ENGINE_STALE_THRESHOLD_MS || `${6 * 60 * 1000}`, 10
 );
-const HEARTBEAT_INTERVAL_MS = parseInt(
-  process.env.DECISION_ENGINE_HEARTBEAT_INTERVAL_MS || `${5 * 60 * 1000}`, 10
+
+// Drain loop bounds — one wake processes up to MAX_DRAIN_ITERATIONS batches of
+// DRAIN_BATCH_LIMIT, so a burst clears in a single cycle instead of one batch
+// per interval. Cap prevents an unbounded run if events arrive faster than we
+// drain (the leftover continues on the next tick).
+const MAX_DRAIN_ITERATIONS = parseInt(
+  process.env.DECISION_ENGINE_HEARTBEAT_MAX_DRAIN_ITERATIONS || '20', 10
 );
-const FIRST_RUN_DELAY_MS = parseInt(
-  process.env.DECISION_ENGINE_HEARTBEAT_FIRST_RUN_DELAY_MS || `${3 * 60 * 1000}`, 10
+const DRAIN_BATCH_LIMIT = parseInt(
+  process.env.DECISION_ENGINE_HEARTBEAT_DRAIN_BATCH_LIMIT || '50', 10
 );
 
 let intervalHandle = null;
+let isRunning = false; // reentrancy guard — prevents overlapping drain cycles
 
 /**
  * Find the most recent processed_at timestamp across all system_events.
@@ -146,8 +173,10 @@ async function checkEngineHealth() {
   }
 
   const ageMs = Date.now() - Date.parse(lastIso);
+  // PRIMARY mode: pending events alone warrant a run (no staleness wait).
+  // Legacy FAILOVER mode (PRIMARY_MODE=false): only fire once stale ≥ threshold.
   return {
-    needs_run: ageMs >= STALE_THRESHOLD_MS,
+    needs_run: PRIMARY_MODE ? true : ageMs >= STALE_THRESHOLD_MS,
     last_processed_at: lastIso,
     age_ms: ageMs,
     has_pending: true,
@@ -187,32 +216,69 @@ export async function runDecisionEngineHeartbeat({ force = false } = {}) {
   );
 
   const startedAt = Date.now();
-  let result;
+  // Drain loop: processEvents handles up to DRAIN_BATCH_LIMIT per call. Loop
+  // until the queue is empty (events_processed === 0) or MAX_DRAIN_ITERATIONS
+  // is reached, so a burst larger than one batch clears in this single wake
+  // rather than waiting HEARTBEAT_INTERVAL_MS per batch.
+  let iterations = 0;
+  let totalProcessed = 0;
+  let totalActions = 0;
+  let totalAiRouted = 0;
+  let totalDeduped = 0;
+  let lastResult = null;
   try {
-    result = await processEvents({ limit: 50 });
+    while (iterations < MAX_DRAIN_ITERATIONS) {
+      const result = await processEvents({ limit: DRAIN_BATCH_LIMIT });
+      lastResult = result;
+      iterations += 1;
+      const n = result?.events_processed || 0;
+      totalProcessed += n;
+      totalActions += result?.total_actions_created || 0;
+      totalAiRouted += result?.ai_routed || 0;
+      totalDeduped += result?.deduped || 0;
+      if (n === 0) break; // queue drained
+    }
   } catch (err) {
-    console.error(`[DecisionEngineHeartbeat] processEvents threw: ${err.message}`);
+    console.error(`[DecisionEngineHeartbeat] processEvents threw after ${iterations} iteration(s): ${err.message}`);
     return {
       skipped: false,
       fired: true,
       forced: !!force,
       error: err.message,
+      iterations,
+      events_processed: totalProcessed,
+      total_actions_created: totalActions,
       last_processed_at_before: health.last_processed_at,
       age_ms_before: health.age_ms,
       elapsed_ms: Date.now() - startedAt,
     };
   }
 
+  const capHitWithBacklog =
+    iterations >= MAX_DRAIN_ITERATIONS && (lastResult?.events_processed || 0) > 0;
+  if (capHitWithBacklog) {
+    console.warn(
+      `[DecisionEngineHeartbeat] Drain cap hit (${MAX_DRAIN_ITERATIONS} batches) with events still pending — remaining will clear on the next tick`
+    );
+  }
+
   console.log(
-    `[DecisionEngineHeartbeat] Done — ${result.events_processed || 0} processed (${result.total_actions_created || 0} actions, ${result.ai_routed || 0} AI-routed, ${result.deduped || 0} deduped), ${result.elapsed_ms}ms`
+    `[DecisionEngineHeartbeat] Done — ${totalProcessed} processed across ${iterations} batch(es) (${totalActions} actions, ${totalAiRouted} AI-routed, ${totalDeduped} deduped), ${Date.now() - startedAt}ms`
   );
   return {
     skipped: false,
     fired: true,
     forced: !!force,
+    primary_mode: PRIMARY_MODE,
+    iterations,
+    drained_fully: !capHitWithBacklog,
+    events_processed: totalProcessed,
+    total_actions_created: totalActions,
+    ai_routed: totalAiRouted,
+    deduped: totalDeduped,
     last_processed_at_before: health.last_processed_at,
     age_ms_before: health.age_ms,
-    engine_result: result,
+    engine_result: lastResult,
     elapsed_ms: Date.now() - startedAt,
   };
 }
@@ -228,19 +294,35 @@ export function startDecisionEngineHeartbeatScheduler() {
     return;
   }
 
+  // Reentrancy-guarded tick. If a previous drain is still in flight (burst
+  // larger than one cycle, or slow GHL), skip this tick instead of running a
+  // second drain in parallel. The manual /heartbeat-de route intentionally
+  // bypasses this guard; processEvents idempotency keeps that safe.
+  const tick = async (label) => {
+    if (isRunning) {
+      console.log(`[DecisionEngineHeartbeat] ${label} skipped — previous cycle still running`);
+      return;
+    }
+    isRunning = true;
+    try {
+      await runDecisionEngineHeartbeat();
+    } catch (err) {
+      console.error(`[DecisionEngineHeartbeat] ${label} failed:`, err.message);
+    } finally {
+      isRunning = false;
+    }
+  };
+
   setTimeout(() => {
-    runDecisionEngineHeartbeat().catch(err => {
-      console.error('[DecisionEngineHeartbeat] Initial run failed:', err.message);
-    });
-    intervalHandle = setInterval(() => {
-      runDecisionEngineHeartbeat().catch(err => {
-        console.error('[DecisionEngineHeartbeat] Scheduled run failed:', err.message);
-      });
-    }, HEARTBEAT_INTERVAL_MS);
+    tick('Initial run');
+    intervalHandle = setInterval(() => tick('Scheduled run'), HEARTBEAT_INTERVAL_MS);
   }, FIRST_RUN_DELAY_MS);
 
   console.log(
-    `[DecisionEngineHeartbeat] Scheduler armed: stale_threshold=${STALE_THRESHOLD_MS}ms, interval=${HEARTBEAT_INTERVAL_MS}ms, first_run_delay=${FIRST_RUN_DELAY_MS}ms`
+    `[DecisionEngineHeartbeat] Scheduler armed (${PRIMARY_MODE ? 'PRIMARY' : 'FAILOVER'} mode): ` +
+    `interval=${HEARTBEAT_INTERVAL_MS}ms, first_run_delay=${FIRST_RUN_DELAY_MS}ms, ` +
+    `drain_batch=${DRAIN_BATCH_LIMIT}, max_drain_iterations=${MAX_DRAIN_ITERATIONS}` +
+    `${PRIMARY_MODE ? '' : `, stale_threshold=${STALE_THRESHOLD_MS}ms`}`
   );
 }
 
