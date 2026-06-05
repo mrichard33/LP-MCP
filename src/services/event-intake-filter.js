@@ -151,6 +151,10 @@ const ALLOWED_TAG_ADDED_SUBTYPES = new Set([
   'rebook-reason:not-interested',   // rule W5_2_REBOOK_NOT_INTERESTED_TO_LOSS
   // ── S1.1 RE-ENGAGEMENT (2026-06-05) ──
   're-engagement-eligible',         // rule ENROLL_S1_1_V3_REENGAGEMENT
+
+  // ── Previously-dead enabled rules found in 2026-06-05 audit ──
+  'lp-route:no-show-on-us',         // rule ENROLL_S5_2_v2_NO_SHOW_ON_US (S5.2 no-show enrollment)
+  'objection:not-interested',       // rule TAG_NOT_INTERESTED_TO_SOFT_OPTOUT
   
   // ── S5.2 v2 STATE CLASSIFICATION (PR #294, 2026-05-20) ──
   // Pre-demo concern routing → APPOINTMENT_FRICTION states
