@@ -88,6 +88,37 @@
  *              Net effect: ROUTED TO notifications now correlate 1:1 with
  *              actual GHL workflow entries. v1.7's defensive UUID guard
  *              remains as a belt-and-suspenders pre-check.
+ *
+ * 2026-06-05 — v1.9: APPOINTMENT_FRICTION enrollment now requires positive
+ *              appointment evidence. ROOT CAUSE: APPOINTMENT_FRICTION.* states
+ *              (pre-demo price/timing/trust/spouse/overwhelmed) are produced by
+ *              behavioral rules on concern-expressed:* tags and by message-
+ *              analyzer friction proposals. Those producers excluded only the
+ *              FAR end (post-demo tags) and never required the NEAR end (an
+ *              appointment exists) — so cold/aged re-engagement leads
+ *              (entry:canvassing, lp-day15-handoff) with no appointment were
+ *              classified into friction and enrolled into S5.2 v2 appointment
+ *              rescue, receiving rescue cadence they never qualified for. This
+ *              contradicted the policy table itself (every friction state's
+ *              resolution_criteria is appointment_booked:true) and the
+ *              2026-05-06 segmentation doctrine (cold → TOFU, not S5.2).
+ *
+ *              FIX (single chokepoint, covers all friction producers + any
+ *              future ones): before enrolling an APPOINTMENT_FRICTION state,
+ *              contactHasAppointmentEvidence() checks LP's authoritative
+ *              lp_leads record (appointment_set / appointment_date /
+ *              demo_completed; 99.997% populated) with a live GHL appointment-
+ *              date fallback, and suppresses enrollment on a confirmed
+ *              double-negative (emitting state_enrollment_suppressed_no_appointment
+ *              for observability). Fails OPEN on error. APPOINTMENT_DISRUPTION
+ *              is deliberately NOT gated — CXL/NS/BO/1Leg dispositions are
+ *              themselves proof an appointment existed. The friction state row
+ *              is still recorded; only the wrong S5.2 enrollment is suppressed.
+ *
+ *              USER-VISIBLE IMPACT: cold leads expressing a concern no longer
+ *              receive S5.2 appointment-rescue SMS/email; legitimate booked
+ *              leads with pre-appointment friction are unaffected. Stops the
+ *              regrowth that the 2026-06-05 one-time lane cleanup cleared.
  */
 
 import supabase from '../../supabase.js';
@@ -329,7 +360,47 @@ export async function executeTransitionObjectionState(action) {
   // enrollment. If the enrollment fails (invalid workflow_id guard, GHL 4xx,
   // network timeout, etc.) the notification never fires.
   let enrollment = { enrolled: false, route: null, action_id: null };
-  if (proposedPolicy.recovery_workflow_id && Number(proposedPolicy.recovery_window_days) > 0) {
+  const wantsEnrollment =
+    proposedPolicy.recovery_workflow_id && Number(proposedPolicy.recovery_window_days) > 0;
+
+  // v1.9 — APPOINTMENT_FRICTION enrollment gate. APPOINTMENT_FRICTION states
+  // presuppose an appointment context (every friction policy's
+  // resolution_criteria is appointment_booked:true). Pre-demo concern signals
+  // (concern-expressed:* tags, message-analyzer friction proposals) can fire for
+  // cold/aged re-engagement leads that have NO appointment, wrongly enrolling
+  // them into S5.2 v2 appointment rescue. Per the 2026-05-06 segmentation
+  // doctrine, cold leads route to TOFU re-engagement, not S5.2. We require
+  // positive appointment evidence (LP's authoritative lead record, with a live
+  // GHL appointment-date double-check before suppressing) before enrolling any
+  // APPOINTMENT_FRICTION state. APPOINTMENT_DISRUPTION is intentionally NOT
+  // gated — those states are driven by LP dispositions (CXL/NS/BO/1Leg) which
+  // are themselves proof an appointment existed. The check fails OPEN on any
+  // query/fetch error so a transient outage never suppresses legitimate
+  // enrollment; it only suppresses on a confirmed double-negative.
+  let appointmentGateOk = true;
+  if (wantsEnrollment && proposedPolicy.parent_state === 'APPOINTMENT_FRICTION') {
+    appointmentGateOk = await contactHasAppointmentEvidence(contact_id);
+    if (!appointmentGateOk) {
+      await emitTransitionEvent('state_enrollment_suppressed_no_appointment', {
+        contact_id,
+        state_code: proposed_state,
+        parent_state: proposedPolicy.parent_state,
+        recovery_workflow_id: proposedPolicy.recovery_workflow_id,
+        trigger_source,
+        triggering_event_id,
+        reason: 'appointment_friction_without_appointment_evidence',
+        source_action_id: action.id,
+      });
+      enrollment = {
+        enrolled: false,
+        route: null,
+        action_id: null,
+        skip_reason: 'no_appointment_evidence',
+      };
+    }
+  }
+
+  if (wantsEnrollment && appointmentGateOk) {
     // Route is deterministic from policy: webhook_url present → Route B,
     // otherwise Route A. Pre-compute so the notification text can reference it.
     const route = proposedPolicy.recovery_webhook_url ? 'B' : 'A';
@@ -576,6 +647,67 @@ function appendSeparator(url) {
   if (!url) return null;
   if (url.endsWith('?') || url.endsWith('&')) return url;
   return url.includes('?') ? `${url}&` : `${url}?`;
+}
+
+/**
+ * v1.9 — Positive appointment-evidence check for the APPOINTMENT_FRICTION gate.
+ *
+ * Primary signal: LP's authoritative lead record (lp_leads, keyed by
+ * ghl_contact_id, same Supabase instance — no cross-instance/cross-join). Of
+ * 122,030 appointment-set leads, 122,026 carry appointment_date (99.997%), so
+ * this is a near-complete, reliable signal with negligible false-negative risk
+ * (unlike tag-based proxies, which miss ~23% of real appointment-holders).
+ *
+ * Secondary signal (only consulted when LP shows NO evidence, to cover a
+ * pure-GHL-booked lead whose LP row hasn't synced yet): the live GHL contact's
+ * LP Appointment Date custom field — the same datum the rebook-URL logic
+ * already trusts.
+ *
+ * Returns true if EITHER source shows an appointment was ever set / dated /
+ * demoed. Suppresses (returns false) ONLY on a confirmed double-negative.
+ * Fails OPEN (returns true) on any query/fetch error so a transient outage
+ * never silently suppresses a legitimate enrollment.
+ *
+ * @param {string} contact_id  GHL contact id
+ * @returns {Promise<boolean>} true = appointment context exists (allow enroll)
+ */
+async function contactHasAppointmentEvidence(contact_id) {
+  // Primary: LP authoritative lead record.
+  try {
+    const { data, error } = await supabase
+      .from('lp_leads')
+      .select('appointment_set, appointment_date, demo_completed')
+      .eq('ghl_contact_id', String(contact_id))
+      .order('updated_at_lp', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) {
+      console.warn(`[ObjectionState] lp_leads appt-evidence check failed for ${contact_id}: ${error.message} — failing open`);
+      return true; // fail open on error — never suppress on a transient outage
+    }
+    if (data && (data.appointment_set === true || data.appointment_date != null || data.demo_completed === true)) {
+      return true;
+    }
+  } catch (err) {
+    console.warn(`[ObjectionState] lp_leads appt-evidence check threw for ${contact_id}: ${err.message} — failing open`);
+    return true; // fail open
+  }
+
+  // Secondary: live GHL contact's LP Appointment Date field. Only reached when
+  // LP shows no evidence — covers pure-GHL-booked leads with a lagging LP row.
+  try {
+    const contact = await getGHLContact(contact_id);
+    const customFields = Array.isArray(contact?.customFields) ? contact.customFields : [];
+    const apptDateRaw = readCustomField(customFields, GHL_FIELD_LP_APPOINTMENT_DATE);
+    if (apptDateRaw && !isNaN(new Date(apptDateRaw).getTime())) {
+      return true; // GHL shows an appointment date → appointment context exists
+    }
+  } catch (err) {
+    console.warn(`[ObjectionState] GHL appt-date fallback failed for ${contact_id}: ${err.message} — failing open`);
+    return true; // fail open
+  }
+
+  return false; // both LP and GHL show no appointment evidence → suppress enroll
 }
 
 /**
