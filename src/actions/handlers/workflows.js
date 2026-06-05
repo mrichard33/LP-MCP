@@ -31,6 +31,13 @@
  *   'json' → application/json. Use only when the destination explicitly
  *      requires JSON (non-GHL targets, future integrations).
  *
+ * v1.5 (2026-06-05) — Opt-in cross-system recency enrichment. When
+ *        action_payload.compute_days_since_last_contact === true, Route B
+ *        computes days_since_last_contact as today − MAX(GHL lastActivity,
+ *        LP lp_leads.last_contact_date/last_call_date) and injects it into
+ *        the webhook payload. Used by ENROLL_S1_1_V3_REENGAGEMENT so the
+ *        S1.1 tier branch (T1/T2/T3) sees a real number, not a merge token.
+ *
  * v1.4 (2026-05-23) — Post-success action chaining. When action_payload
  *        contains _post_success_action, enqueue that follow-up action
  *        ONLY AFTER the GHL enrollment (Route A) or inbound webhook POST
@@ -94,6 +101,51 @@ function buildFormBody(payload) {
     }
   }
   return params.toString();
+}
+
+/**
+ * Compute days since the contact was last touched, across BOTH systems.
+ * LP and HL are separate stores, so read each independently and take the
+ * most recent touch (smaller day-count wins).
+ *   GHL : contact.lastActivity (epoch ms) — falls back to dateUpdated (ISO)
+ *   LP  : lp_leads.last_contact_date / last_call_date (most recent)
+ * Returns an integer day count, or null if neither system has a date
+ * (the S1.1 workflow treats a missing value as T3).
+ */
+async function computeDaysSinceLastContact(contactId) {
+  const dates = [];
+
+  // GHL side — last activity on the contact record
+  try {
+    const resp = await ghlFetch('GET', `/contacts/${contactId}`);
+    const c = (resp && resp.contact) ? resp.contact : (resp || {});
+    const ghlMs = Number(c.lastActivity) || (c.dateUpdated ? Date.parse(c.dateUpdated) : NaN);
+    if (Number.isFinite(ghlMs)) dates.push(ghlMs);
+  } catch (err) {
+    console.warn(`[ActionExecutor] computeDaysSinceLastContact GHL read failed for ${contactId}: ${err.message}`);
+  }
+
+  // LP side — most recent of last_contact_date / last_call_date on lp_leads
+  try {
+    const { data, error } = await supabase
+      .from('lp_leads')
+      .select('last_contact_date, last_call_date')
+      .eq('ghl_contact_id', contactId)
+      .limit(1);
+    if (!error && Array.isArray(data) && data[0]) {
+      for (const d of [data[0].last_contact_date, data[0].last_call_date]) {
+        const ms = d ? Date.parse(d) : NaN;
+        if (Number.isFinite(ms)) dates.push(ms);
+      }
+    }
+  } catch (err) {
+    console.warn(`[ActionExecutor] computeDaysSinceLastContact LP read failed for ${contactId}: ${err.message}`);
+  }
+
+  if (!dates.length) return null;
+  const mostRecent = Math.max(...dates);            // most recent touch across both systems
+  const days = Math.floor((Date.now() - mostRecent) / 86400000);
+  return days < 0 ? 0 : days;
 }
 
 /**
@@ -175,6 +227,15 @@ export async function executeAddToWorkflow(action) {
       contactId,
       ...(payload.payload || {}),
     };
+
+    // Cross-system recency enrichment (opt-in). The S1.1 re-engagement
+    // workflow tiers on days_since_last_contact; that number must reflect
+    // the most recent touch across BOTH LP and GHL.
+    if (payload.compute_days_since_last_contact === true) {
+      const dslc = await computeDaysSinceLastContact(contactId);
+      if (dslc !== null) webhookPayload.days_since_last_contact = dslc;
+      console.log(`[ActionExecutor] days_since_last_contact for ${contactId} = ${dslc === null ? 'unknown (workflow defaults to T3)' : dslc}`);
+    }
 
     let body, contentType;
     if (format === 'json') {
