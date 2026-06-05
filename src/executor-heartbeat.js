@@ -42,6 +42,16 @@
  *   within 6 minutes. The only change is we no longer fire when there
  *   is provably nothing to execute.
  *
+ * 2026-06-05 — LIMITER-HEALTH + FAILURE-RATE ALERTS.
+ *   The Jun 4/5 GHL token-starvation storm ran ~12h silently. The rate
+ *   limiter failed open on a 23-29 deep wait queue (~550 timeouts, ~169
+ *   failed actions) but the agent_actions queue itself never saturated
+ *   (actions failed fast rather than backing up), so the Phase 4
+ *   queue-depth alert below could not see it. The heartbeat now also runs
+ *   two throttled, best-effort checks every cycle: limiter health (deep
+ *   wait queue / fresh 429 / standing pause) and the executor's failure
+ *   rate over a rolling window. See src/limiter-health-alerts.js.
+ *
  * DESIGN
  * ──────
  * Failover, not parallel. The scheduler:
@@ -97,6 +107,13 @@ import supabase from './supabase.js';
 import { executeActions } from './action-executor.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { shouldAlertQueueDepth, formatQueueAlert } from './executor-queue-alerts.js';
+import { getRateLimiterStats } from './ghl-rate-limiter.js';
+import {
+  shouldAlertLimiter,
+  formatLimiterAlert,
+  shouldAlertFailedActions,
+  formatFailedActionsAlert,
+} from './limiter-health-alerts.js';
 
 // Phase 4 (2026-06-02) — queue-depth observability + alerting. A silent
 // multi-hour backlog used to be invisible; the heartbeat now surfaces
@@ -113,6 +130,37 @@ const ALERT_COOLDOWN_MS = parseInt(
 );
 
 let lastQueueAlertAt = 0;
+
+// 2026-06-05 — limiter-health + failure-rate alerting. The Jun 4/5 GHL
+// token-starvation storm ran silently for hours: the limiter failed open
+// on a deep wait queue while the agent_actions queue itself never
+// saturated, so the queue-depth alert above couldn't see it. These watch
+// the limiter directly + the executor failure rate. All thresholds are
+// env-tunable; the defaults give clear separation from normal operation
+// (baseline failed-action rate is ~1/hr; the storm peaked ~109/hr, and a
+// healthy limiter has an empty wait queue).
+const LIMITER_QUEUE_ALERT_THRESHOLD = parseInt(
+  process.env.LIMITER_QUEUE_ALERT_THRESHOLD || '15', 10
+);
+const LIMITER_TIMEOUT_DELTA_ALERT = parseInt(
+  process.env.LIMITER_TIMEOUT_DELTA_ALERT || '3', 10
+);
+const LIMITER_ALERT_COOLDOWN_MS = parseInt(
+  process.env.LIMITER_ALERT_COOLDOWN_MS || `${15 * 60 * 1000}`, 10
+);
+const FAILED_ACTION_WINDOW_MIN = parseInt(
+  process.env.FAILED_ACTION_WINDOW_MIN || '15', 10
+);
+const FAILED_ACTION_ALERT_THRESHOLD = parseInt(
+  process.env.FAILED_ACTION_ALERT_THRESHOLD || '20', 10
+);
+const FAILED_ACTION_ALERT_COOLDOWN_MS = parseInt(
+  process.env.FAILED_ACTION_ALERT_COOLDOWN_MS || `${15 * 60 * 1000}`, 10
+);
+
+let lastLimiterAlertAt = 0;
+let lastLimiterSnapshot = null; // { timedOut, total429s } — for delta math
+let lastFailedActionAlertAt = 0;
 
 const STALE_THRESHOLD_MS = parseInt(
   process.env.EXECUTOR_STALE_THRESHOLD_MS || `${6 * 60 * 1000}`, 10
@@ -194,6 +242,25 @@ async function getQueueStats() {
 }
 
 /**
+ * 2026-06-05 — recent failed-action count for the failure-rate alert.
+ * Counts agent_actions that moved to 'failed' within the window. Returns
+ * null on query error (caller treats null as "no signal").
+ */
+async function getRecentFailedCount(windowMin) {
+  const cutoffIso = new Date(Date.now() - windowMin * 60 * 1000).toISOString();
+  const { count, error } = await supabase
+    .from('agent_actions')
+    .select('id', { count: 'exact', head: true })
+    .eq('status', 'failed')
+    .gte('updated_at', cutoffIso);
+  if (error) {
+    console.warn(`[ExecutorHeartbeat] failed-count query failed: ${error.message}`);
+    return null;
+  }
+  return count || 0;
+}
+
+/**
  * Phase 4 — raise a throttled GroupMe alert when the queue is unhealthy
  * (pending over threshold OR oldest pending too old). Cooldown prevents
  * spamming every 60s heartbeat while a backlog persists. Best-effort: a
@@ -216,6 +283,68 @@ async function maybeAlertQueueDepth(stats) {
     console.error(`[ExecutorHeartbeat] queue-depth alert send failed: ${err.message}`);
   }
   return { alerted: true, reasons };
+}
+
+/**
+ * 2026-06-05 — throttled GroupMe alert when the GHL rate limiter is
+ * starved (deep wait queue, a fresh 429, or a standing pause). The
+ * snapshot is updated every cycle (even under cooldown) so the
+ * cumulative-counter deltas (timedOut, total429s) stay accurate.
+ * Best-effort: a send failure is logged, never thrown. Returns the live
+ * stats for the status route.
+ */
+async function maybeAlertLimiter() {
+  let curr;
+  try {
+    curr = getRateLimiterStats();
+  } catch (err) {
+    console.warn(`[ExecutorHeartbeat] limiter stats failed: ${err.message}`);
+    return { alerted: false, error: err.message };
+  }
+  const { alert, reasons, critical } = shouldAlertLimiter(curr, lastLimiterSnapshot, {
+    queueDepth: LIMITER_QUEUE_ALERT_THRESHOLD,
+    timedOutDelta: LIMITER_TIMEOUT_DELTA_ALERT,
+  });
+  // Update snapshot regardless of alert/cooldown so deltas stay correct.
+  lastLimiterSnapshot = { timedOut: curr?.timedOut ?? 0, total429s: curr?.total429s ?? 0 };
+
+  if (!alert) return { alerted: false, stats: curr };
+  if (Date.now() - lastLimiterAlertAt < LIMITER_ALERT_COOLDOWN_MS) {
+    return { alerted: false, suppressed: 'cooldown', reasons, stats: curr };
+  }
+  lastLimiterAlertAt = Date.now();
+  try {
+    await sendGroupMeMessage(formatLimiterAlert(curr, reasons, critical));
+    console.warn(`[ExecutorHeartbeat] limiter alert sent — ${reasons.join('; ')}`);
+  } catch (err) {
+    console.error(`[ExecutorHeartbeat] limiter alert send failed: ${err.message}`);
+  }
+  return { alerted: true, reasons, stats: curr };
+}
+
+/**
+ * 2026-06-05 — throttled GroupMe alert when the executor's failure rate
+ * spikes over a short rolling window, independent of cause (limiter, GHL
+ * 5xx, handler bug). Best-effort.
+ */
+async function maybeAlertFailedActions() {
+  const failedCount = await getRecentFailedCount(FAILED_ACTION_WINDOW_MIN);
+  if (failedCount == null) return { alerted: false };
+  const { alert, reasons } = shouldAlertFailedActions(
+    failedCount, FAILED_ACTION_WINDOW_MIN, FAILED_ACTION_ALERT_THRESHOLD
+  );
+  if (!alert) return { alerted: false, failedCount };
+  if (Date.now() - lastFailedActionAlertAt < FAILED_ACTION_ALERT_COOLDOWN_MS) {
+    return { alerted: false, suppressed: 'cooldown', failedCount, reasons };
+  }
+  lastFailedActionAlertAt = Date.now();
+  try {
+    await sendGroupMeMessage(formatFailedActionsAlert(failedCount, FAILED_ACTION_WINDOW_MIN, reasons));
+    console.warn(`[ExecutorHeartbeat] failed-action alert sent — ${reasons.join('; ')}`);
+  } catch (err) {
+    console.error(`[ExecutorHeartbeat] failed-action alert send failed: ${err.message}`);
+  }
+  return { alerted: true, failedCount, reasons };
 }
 
 /**
@@ -278,6 +407,20 @@ export async function runHeartbeat({ force = false } = {}) {
     await maybeAlertQueueDepth(queueStats);
   } catch (err) {
     console.warn(`[ExecutorHeartbeat] queue stats/alert failed: ${err.message}`);
+  }
+
+  // 2026-06-05 — limiter-health + failure-rate alerts, every cycle. Kept
+  // in independent best-effort blocks so one failing source can't suppress
+  // the others or affect action execution below.
+  try {
+    await maybeAlertLimiter();
+  } catch (err) {
+    console.warn(`[ExecutorHeartbeat] limiter alert check failed: ${err.message}`);
+  }
+  try {
+    await maybeAlertFailedActions();
+  } catch (err) {
+    console.warn(`[ExecutorHeartbeat] failed-action alert check failed: ${err.message}`);
   }
 
   const health = await checkExecutorHealth();
@@ -388,12 +531,13 @@ export function registerExecutorHeartbeatRoutes(app) {
 
   app.get('/n8n/decision-engine/heartbeat-status', async (req, res) => {
     try {
-      const [health, queueStats] = await Promise.all([
+      const [health, queueStats, failedRecent] = await Promise.all([
         checkExecutorHealth(),
         getQueueStats().catch((err) => {
           console.warn(`[ExecutorHeartbeat] queue stats failed: ${err.message}`);
           return null;
         }),
+        getRecentFailedCount(FAILED_ACTION_WINDOW_MIN).catch(() => null),
       ]);
       const alertEval = queueStats
         ? shouldAlertQueueDepth(queueStats, {
@@ -401,6 +545,23 @@ export function registerExecutorHeartbeatRoutes(app) {
             oldestAgeThresholdMs: OLDEST_AGE_ALERT_MS,
           })
         : { alert: false, reasons: [] };
+
+      // 2026-06-05 — limiter + failure-rate snapshot for the status route.
+      // Note: limiter_alert here is evaluated against lastLimiterSnapshot,
+      // which the heartbeat cycle updates; an out-of-band GET does not
+      // mutate it.
+      let limiterStats = null;
+      try { limiterStats = getRateLimiterStats(); } catch (e) { /* best-effort */ }
+      const limiterAlert = limiterStats
+        ? shouldAlertLimiter(limiterStats, lastLimiterSnapshot, {
+            queueDepth: LIMITER_QUEUE_ALERT_THRESHOLD,
+            timedOutDelta: LIMITER_TIMEOUT_DELTA_ALERT,
+          })
+        : { alert: false, reasons: [], critical: false };
+      const failedAlert = shouldAlertFailedActions(
+        failedRecent, FAILED_ACTION_WINDOW_MIN, FAILED_ACTION_ALERT_THRESHOLD
+      );
+
       res.json({
         success: true,
         ...health,
@@ -409,10 +570,24 @@ export function registerExecutorHeartbeatRoutes(app) {
         disabled: process.env.EXECUTOR_HEARTBEAT_DISABLED === 'true',
         queue_stats: queueStats,
         queue_alert: alertEval,
+        limiter_stats: limiterStats,
+        limiter_alert: limiterAlert,
+        failed_actions_recent: {
+          window_min: FAILED_ACTION_WINDOW_MIN,
+          count: failedRecent,
+          threshold: FAILED_ACTION_ALERT_THRESHOLD,
+          alert: failedAlert.alert,
+        },
         alert_thresholds: {
           pending: PENDING_ALERT_THRESHOLD,
           oldest_age_ms: OLDEST_AGE_ALERT_MS,
           cooldown_ms: ALERT_COOLDOWN_MS,
+          limiter_queue: LIMITER_QUEUE_ALERT_THRESHOLD,
+          limiter_timeout_delta: LIMITER_TIMEOUT_DELTA_ALERT,
+          limiter_cooldown_ms: LIMITER_ALERT_COOLDOWN_MS,
+          failed_action_window_min: FAILED_ACTION_WINDOW_MIN,
+          failed_action_threshold: FAILED_ACTION_ALERT_THRESHOLD,
+          failed_action_cooldown_ms: FAILED_ACTION_ALERT_COOLDOWN_MS,
         },
       });
     } catch (err) {
