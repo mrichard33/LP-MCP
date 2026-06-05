@@ -1,6 +1,6 @@
 // ─── GitHub Admin MCP Tools (Tools 23–29) ────────────────────────
 import { z } from 'zod';
-import { ghRequest, ghSearchCode } from '../../admin/github-client.js';
+import { ghRequest, ghSearchCode, getDashboardRepo } from '../../admin/github-client.js';
 
 export function registerGitHubTools(server) {
 
@@ -250,6 +250,114 @@ export function registerGitHubTools(server) {
           total_count: data.total_count,
           results,
         }, null, 2) }],
+      };
+    }
+  );
+
+  // ─── Reece Dashboard Cross-Repo Tools (read-only) ───────────────
+  // Mirror of the HL MCP dashboard_github_* tools so the Reece Dashboard
+  // repo stays readable when the HL MCP service is down.
+
+  // dashboard_github_list_files [READ]
+  server.tool(
+    'dashboard_github_list_files',
+    'CROSS-REPO: List files/directories at a path in the Reece Dashboard repo.',
+    {
+      path: z.string().optional().describe('Directory path (default: root)'),
+      branch: z.string().optional().describe('Branch name (default: "main")'),
+    },
+    async ({ path, branch }) => {
+      const dirPath = path || '';
+      const ref = branch || 'main';
+      const data = await ghRequest('GET', `/contents/${dirPath}?ref=${ref}`, null, getDashboardRepo());
+      const files = Array.isArray(data)
+        ? data.map(f => ({ name: f.name, type: f.type, size: f.size, path: f.path }))
+        : [{ name: data.name, type: data.type, size: data.size, path: data.path }];
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ repo: getDashboardRepo(), path: dirPath, branch: ref, files }, null, 2) }],
+      };
+    }
+  );
+
+  // dashboard_github_get_file [READ]
+  server.tool(
+    'dashboard_github_get_file',
+    'CROSS-REPO: Read full content of a file from the Reece Dashboard repo.',
+    {
+      path: z.string().describe('File path. Example: "src/App.tsx"'),
+      branch: z.string().optional().describe('Branch name (default: "main")'),
+    },
+    async ({ path, branch }) => {
+      if (!path) return { content: [{ type: 'text', text: 'Error: path is required.' }] };
+      const ref = branch || 'main';
+      const data = await ghRequest('GET', `/contents/${path}?ref=${ref}`, null, getDashboardRepo());
+      const content = data.content ? Buffer.from(data.content, 'base64').toString('utf-8') : '';
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ repo: getDashboardRepo(), path: data.path, sha: data.sha, size: data.size, content }, null, 2) }],
+      };
+    }
+  );
+
+  // dashboard_github_get_recent_commits [READ]
+  server.tool(
+    'dashboard_github_get_recent_commits',
+    'CROSS-REPO: Recent commit history on a branch of the Reece Dashboard repo.',
+    {
+      count: z.number().optional().describe('Number of commits (default 10, max 30)'),
+      branch: z.string().optional().describe('Branch name (default: "main")'),
+    },
+    async ({ count, branch }) => {
+      const n = Math.min(count || 10, 30);
+      const ref = branch || 'main';
+      const data = await ghRequest('GET', `/commits?sha=${ref}&per_page=${n}`, null, getDashboardRepo());
+      const commits = data.map(c => ({
+        sha: c.sha?.substring(0, 7),
+        message: c.commit?.message,
+        author: c.commit?.author?.name,
+        date: c.commit?.author?.date,
+      }));
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ repo: getDashboardRepo(), branch: ref, commits }, null, 2) }],
+      };
+    }
+  );
+
+  // dashboard_github_search_code [READ]
+  server.tool(
+    'dashboard_github_search_code',
+    'CROSS-REPO: Search for a string across all files in the Reece Dashboard repo.',
+    {
+      query: z.string().describe('Search query'),
+    },
+    async ({ query }) => {
+      if (!query) return { content: [{ type: 'text', text: 'Error: query is required.' }] };
+      const data = await ghSearchCode(query, getDashboardRepo());
+      const results = (data.items || []).map(item => ({
+        path: item.path,
+        name: item.name,
+        url: item.html_url,
+        score: item.score,
+      }));
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ repo: getDashboardRepo(), total_count: data.total_count, results }, null, 2) }],
+      };
+    }
+  );
+
+  // dashboard_github_list_branches [READ]
+  server.tool(
+    'dashboard_github_list_branches',
+    'CROSS-REPO: List all branches in the Reece Dashboard repo.',
+    {},
+    async () => {
+      const data = await ghRequest('GET', `/branches?per_page=100`, null, getDashboardRepo());
+      const branches = (Array.isArray(data) ? data : []).map(b => ({
+        name: b.name,
+        sha: b.commit?.sha?.substring(0, 7),
+        protected: b.protected,
+      }));
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ repo: getDashboardRepo(), branches, count: branches.length }, null, 2) }],
       };
     }
   );
