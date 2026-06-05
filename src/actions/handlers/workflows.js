@@ -31,6 +31,20 @@
  *   'json' → application/json. Use only when the destination explicitly
  *      requires JSON (non-GHL targets, future integrations).
  *
+ * v1.6 (2026-06-05) — Route B contact-key fix. The webhook body now sends the
+ *        contact identifier as contact_id (snake_case) — the field every Reece
+ *        GHL inbound-webhook trigger actually reads via its "Find Contact by
+ *        Contact ID" step ({{inboundWebhookRequest.contact_id}}). Previously the
+ *        body only carried contactId (camelCase), so Find Contact resolved an
+ *        empty value, took the "Contact Not Found" branch, and the contact
+ *        silently failed to enroll while the webhook still returned HTTP 200.
+ *        This is why S1.1 (dc850226-d693-4911-b255-ade8280a0815) and its
+ *        upstream feeder S1.0 (750f1b7f-e688-47fa-ba52-d0ca6d7032ab) recorded
+ *        zero real enrollments since go-live despite "completed" actions.
+ *        contactId is retained as a back-compat alias for any workflow still
+ *        referencing the camelCase field. Spread order changed so payload.payload
+ *        can never override the authoritative target id from action.target_id.
+ *
  * v1.5 (2026-06-05) — Opt-in cross-system recency enrichment. When
  *        action_payload.compute_days_since_last_contact === true, Route B
  *        computes days_since_last_contact as today − MAX(GHL lastActivity,
@@ -223,9 +237,17 @@ export async function executeAddToWorkflow(action) {
   // The Decision Engine encodes the URL in action_payload.webhook_url and
   // the merge fields in action_payload.payload (flat key/value object).
   if (webhookUrl) {
+    // Reece GHL inbound-webhook standard: destination workflows resolve the
+    // contact via a "Find Contact by Contact ID" step that reads
+    // {{inboundWebhookRequest.contact_id}} (snake_case). Send contact_id as the
+    // authoritative key. Keep contactId as a back-compat alias for any workflow
+    // still referencing the camelCase field. Spread payload.payload FIRST so a
+    // stale contact_id carried in the rule payload can never override the real
+    // target id resolved from action.target_id.
     const webhookPayload = {
-      contactId,
       ...(payload.payload || {}),
+      contact_id: contactId,
+      contactId,
     };
 
     // Cross-system recency enrichment (opt-in). The S1.1 re-engagement
