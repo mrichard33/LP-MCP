@@ -3,6 +3,20 @@
 // Maps LP Supabase fields → GHL custom field IDs.
 // ALL FIELD IDS CONFIRMED via HL MCP cache — March 24, 2026
 //
+// v6 — June 6, 2026
+// - FIX (token-starvation root cause): `lp_last_synced` is now flagged
+//   `excludeFromHash: true` and computeFieldHash() filters such fields
+//   out of the change-detection hash. Its transform returns now(), so it
+//   changed every cycle and made computeFieldHash() differ on every run
+//   for every contact — defeating change detection entirely. bulkFieldSync
+//   therefore re-pushed ALL matched contacts to GHL every cycle
+//   ("N pushed, 0 unchanged"), saturating the shared GHL rate limiter
+//   (fail-open timeouts, "GHL rate limiter unhealthy" GroupMe alerts) and
+//   firing one contact-update webhook per contact per cycle into HL MCP.
+//   The timestamp is still WRITTEN to GHL on any real push; it just no
+//   longer participates in the hash. Add future volatile fields the same
+//   way (excludeFromHash: true).
+//
 // v5 — May 12, 2026
 // - FIX: Adds canonical "LP Lead ID" write (GmAVmW6V9sekD7pVONKr).
 //   Previously the `lp_lead_id` entry routed solely to
@@ -197,9 +211,15 @@ const GHL_FIELD_MAP = {
   },
 
   // ─── SYNC METADATA ─────────────────────────────────────────────
+  // VOLATILE: transform returns now() and therefore changes on every
+  // cycle. It MUST be excluded from the change-detection hash
+  // (excludeFromHash: true) or bulkFieldSync re-pushes every contact on
+  // every run and saturates the shared GHL rate limiter. The value is
+  // still written to GHL whenever a real (substantive) change is pushed.
   lp_last_synced: {
     ghlFieldId: 'NmvZHScugBDOD2elYH1g',
     label: 'LP Last Synced',
+    excludeFromHash: true,
     transform: () => {
       const now = new Date();
       return now.toLocaleString('en-US', { timeZone: 'America/New_York' });
@@ -222,6 +242,20 @@ const GHL_FIELD_MAP = {
 // ─── Helper Functions ─────────────────────────────────────────────
 
 const PLACEHOLDER = 'FILL_IN_GHL_FIELD_ID';
+
+// GHL field IDs whose values change every cycle (e.g. sync timestamps) and
+// must be EXCLUDED from the change-detection hash. Including them makes
+// computeFieldHash() differ on every run, so every contact looks "changed"
+// and bulkFieldSync re-pushes the entire population each cycle — saturating
+// the shared GHL rate limiter (root cause of the 2026-06 token-starvation
+// storms). These fields are still WRITTEN to GHL on a real push; they just
+// don't participate in change detection. Flag new volatile fields with
+// `excludeFromHash: true` in GHL_FIELD_MAP and they are picked up here.
+const HASH_EXCLUDED_FIELD_IDS = new Set(
+  Object.values(GHL_FIELD_MAP)
+    .filter((config) => config && config.excludeFromHash && config.ghlFieldId && config.ghlFieldId !== PLACEHOLDER)
+    .map((config) => config.ghlFieldId),
+);
 
 /**
  * Build the customFields array for a GHL contact update.
@@ -251,10 +285,18 @@ export function buildGHLFieldPayload(lead) {
 
 /**
  * Compute a simple hash of the field payload for change detection.
+ *
+ * Volatile fields (HASH_EXCLUDED_FIELD_IDS — e.g. the "LP Last Synced"
+ * timestamp) are filtered out FIRST. If they are not, the hash differs on
+ * every cycle and bulkFieldSync re-pushes every contact every run, which
+ * pegs the shared GHL rate limiter. Excluded fields are still written to
+ * GHL by buildGHLFieldPayload(); they simply don't drive change detection.
  */
 export function computeFieldHash(fields) {
   if (!fields || fields.length === 0) return '';
-  const sorted = [...fields].sort((a, b) => a.id.localeCompare(b.id));
+  const hashable = fields.filter((f) => !HASH_EXCLUDED_FIELD_IDS.has(f.id));
+  if (hashable.length === 0) return '';
+  const sorted = [...hashable].sort((a, b) => a.id.localeCompare(b.id));
   return sorted.map(f => `${f.id}=${f.field_value}`).join('|');
 }
 
