@@ -119,6 +119,7 @@
 import supabase from '../../supabase.js';
 import { ghlFetch } from '../helpers.js';
 import { REMOVE_ALL_MARKETING_WF } from '../constants.js';
+import { resolveWorkflowIdByCanonicalCode } from '../../tools/admin/hl-fallback.js';
 
 /**
  * Encode a flat-ish object as application/x-www-form-urlencoded.
@@ -292,10 +293,39 @@ async function enqueuePostSuccessAction(parentAction, spec) {
   }
 }
 
+/**
+ * Resolve the target workflow_id for an action payload.
+ *
+ * Inert today: every live rule payload carries a literal workflow_id, so this
+ * returns it untouched without any registry call. Only when workflow_id is
+ * absent does it fall back to resolving canonical_code → workflow_id against
+ * the HL workflow_registry (Workflow Registry rollout, Phase 2).
+ *
+ * Fail-soft: returns null so the caller's existing "Missing workflow_id" throw
+ * path is preserved. Distinguishes the two null cases in logs — a registry
+ * read error (HL down / not configured) vs. a canonical_code with no row.
+ */
+async function resolveWorkflowTarget(payload) {
+  if (payload.workflow_id) return payload.workflow_id;
+  const code = payload.canonical_code;
+  if (!code) return null;
+  let wfId = null;
+  try {
+    wfId = await resolveWorkflowIdByCanonicalCode(code);
+  } catch (err) {
+    console.warn(`[ActionExecutor] workflow_registry lookup failed for canonical_code "${code}": ${err.message} — falling back to missing-workflow_id`);
+    return null;
+  }
+  if (!wfId) {
+    console.warn(`[ActionExecutor] no workflow_registry row for canonical_code "${code}" — cannot resolve workflow_id`);
+  }
+  return wfId;
+}
+
 export async function executeAddToWorkflow(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
-  const wfId = payload.workflow_id;
+  let wfId = payload.workflow_id;
   const webhookUrl = payload.webhook_url;
   const canonicalCode = payload.canonical_code || null;
   const canonicalName = payload.canonical_name || null;
@@ -376,6 +406,7 @@ export async function executeAddToWorkflow(action) {
   }
 
   // ── Route A: GHL API enrollment (default) ─────────────────────
+  if (!wfId) wfId = await resolveWorkflowTarget(payload); // canonical_code → registry fallback (inert while workflow_id present)
   if (!wfId) throw new Error('Missing workflow_id (or webhook_url) in action payload');
   await ghlFetch('POST', `/contacts/${contactId}/workflow/${wfId}`, {});
   console.log(`[ActionExecutor] ✅ Route A: Contact ${contactId} added to workflow: ${wfLabel} (${wfId})`);
@@ -404,9 +435,10 @@ export async function executeRemoveFromWorkflow(action) {
     await ghlFetch('POST', `/contacts/${contactId}/workflow/${REMOVE_ALL_MARKETING_WF}`, {});
     return { action: 'added_to_remove_all_workflow', contact_id: contactId };
   }
-  const wfId = payload.workflow_id;
+  let wfId = payload.workflow_id;
   const canonicalCode = payload.canonical_code || null;
   const canonicalName = payload.canonical_name || null;
+  if (!wfId) wfId = await resolveWorkflowTarget(payload); // canonical_code → registry fallback (inert while workflow_id present)
   const wfLabel = buildLogLabel(payload, wfId);
   if (!wfId) throw new Error('Missing workflow_id');
   await ghlFetch('DELETE', `/contacts/${contactId}/workflow/${wfId}`);

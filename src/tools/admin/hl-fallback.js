@@ -70,6 +70,24 @@ function esc(s) {
   return String(s).replace(/'/g, "''");
 }
 
+/**
+ * Resolve a published GHL workflow_id from a registry canonical_code.
+ *
+ * Read-only lookup against the HL Supabase workflow_registry (canonical_code
+ * is unique there). Prefers an active row, then the most recently updated.
+ * Reuses the same getHlSupabase()/run_sql path as the fallback tools.
+ *
+ * Returns the workflow_id string, or null when no row matches that code.
+ * Throws only on an actual HL/SQL error so callers can distinguish
+ * "registry unreachable" from "code not registered".
+ */
+export async function resolveWorkflowIdByCanonicalCode(canonicalCode) {
+  if (!canonicalCode) return null;
+  const q = `SELECT workflow_id FROM workflow_registry WHERE canonical_code = '${esc(canonicalCode)}' ORDER BY (status = 'active') DESC, updated_at DESC LIMIT 1`;
+  const rows = await hlRunSQL(q); // json_agg-wrapped → array | null
+  return Array.isArray(rows) && rows.length ? (rows[0].workflow_id || null) : null;
+}
+
 export function registerHlFallbackTools(server) {
 
   // hl_query [READ-ONLY] — generic escape hatch
