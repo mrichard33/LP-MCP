@@ -712,6 +712,22 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
       ANALYZE_TIMEOUT_MS,
       'buildLeadContext',
     );
+
+    // 2026-06-10 — hard-DQ guard. Once the closeout chain has confirmed a
+    // structural disqualifier (hard-disqualified) or stamped the one-shot
+    // suppressor (suppress-outbound), the analyzer must defer entirely —
+    // no AI call, no intelligence writes, no proposals. The 6/9 incident:
+    // a DQ'd lead's reply was independently classified not-interested →
+    // passive_cooling, which left him agentic-active and re-enrollable.
+    // Authoritative DQ detection stays in the intent-classifier.
+    const DQ_TERMINAL_TAGS = ['hard-disqualified', 'suppress-outbound'];
+    const dqTag = (context.lead?.current_tags || [])
+      .find(t => DQ_TERMINAL_TAGS.includes(String(t).toLowerCase()));
+    if (dqTag) {
+      console.log(`[MessageAnalyzer] Skipping ${ghlContactId} — terminal suppression tag "${dqTag}" present (hard-DQ guard)`);
+      return null;
+    }
+
     const rawAnalysis = await callClaude(messageText, context);
     const analysis = validateAnalysis(rawAnalysis);
     if (!analysis) {

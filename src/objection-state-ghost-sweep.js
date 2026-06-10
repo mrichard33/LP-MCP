@@ -145,6 +145,9 @@ const EXCLUDE_TAGS = new Set([
   // DNC / suppression
   'stop-bot', 'dnc', 'dnc-related', 'unsubscribed', 'optedOut',
   'stage:dnc', 'cooling-active',
+  // Terminal hard-DQ (closeout chain, 2026-06-10) — structurally
+  // disqualified contacts must never be ghost-recovered
+  'hard-disqualified', 'suppress-outbound',
   // Already in rescue workflow
   'active-w-S5.2', 'active-w5.2', 'active-w-S5.1', 'active-s5.2',
 ]);

@@ -42,6 +42,7 @@
  */
 
 import supabase from './supabase.js';
+import { checkSuppression } from './services/suppression-check.js';
 
 const LOOKBACK_MIN = Number(process.env.FALLTHROUGH_SWEEP_LOOKBACK_MIN || 15);
 const GRACE_MIN = Number(process.env.FALLTHROUGH_SWEEP_GRACE_MIN || 3);
@@ -220,6 +221,7 @@ export async function runFallthroughSweep({ dryRun = false } = {}) {
   let skippedStateRow = 0;
   let skippedRoutingAction = 0;
   let skippedAlreadySwept = 0;
+  let skippedSuppressed = 0;
   let errors = 0;
   const details = [];
 
@@ -229,6 +231,15 @@ export async function runFallthroughSweep({ dryRun = false } = {}) {
     try {
       if (await alreadySwept(event.id)) {
         skippedAlreadySwept++;
+        continue;
+      }
+      // 2026-06-10 — terminal-suppression guard (hard-DQ closeout chain).
+      // A hard-disqualified / suppress-outbound contact is terminally
+      // owned by the closeout; surfacing manual-review notifications for
+      // their objections would invite re-engagement.
+      const suppression = await checkSuppression(contactId);
+      if (suppression.suppressed) {
+        skippedSuppressed++;
         continue;
       }
       if (await hasStateRowSince(contactId, event.created_at)) {
@@ -268,6 +279,7 @@ export async function runFallthroughSweep({ dryRun = false } = {}) {
     skipped_state_row: skippedStateRow,
     skipped_routing_action: skippedRoutingAction,
     skipped_already_swept: skippedAlreadySwept,
+    skipped_suppressed: skippedSuppressed,
     errors,
     dry_run: !!dryRun,
     elapsed_ms: Date.now() - start,
@@ -276,7 +288,7 @@ export async function runFallthroughSweep({ dryRun = false } = {}) {
   console.log(
     `[FallthroughSweep] ${candidates.length} candidates → ${emitted} emitted, ` +
     `${skippedStateRow} skipped (state row), ${skippedRoutingAction} skipped (routing action), ` +
-    `${skippedAlreadySwept} skipped (already swept), ${errors} errors (${summary.elapsed_ms}ms)`
+    `${skippedAlreadySwept} skipped (already swept), ${skippedSuppressed} skipped (suppressed), ${errors} errors (${summary.elapsed_ms}ms)`
   );
   return summary;
 }

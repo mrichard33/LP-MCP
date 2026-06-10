@@ -175,6 +175,14 @@ const ALLOWED_TAG_ADDED_SUBTYPES = new Set([
   'lp-dnc',                         // rule 242 TAG_LPDNC_TO_HARDLOSS
   'unsubscribed',                   // rule 243 TAG_UNSUBSCRIBED_TO_HARDLOSS
   'not_interested',                 // rule 244 TAG_NOT_INTERESTED_TO_SOFT_OPTOUT
+
+  // ── HARD-DQ CLOSEOUT CHAIN (2026-06-10) ──
+  // Disqualifier closeout consumer (Robert Vandyke incident: hdl:dq-mobile
+  // had no consumer, so DQ'd leads stayed agentic-active). Three chained
+  // rules, one trigger tag each.
+  'hdl:dq-mobile',                  // rule DQ_MOBILE_FROM_HDL
+  'dq-mobile-home',                 // rule DQ_MOBILE_NORMALIZE
+  'hard-disqualified',              // rule HARD_DISQUALIFIED_CLOSEOUT
 ]);
 
 /**
