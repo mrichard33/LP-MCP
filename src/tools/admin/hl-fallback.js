@@ -70,6 +70,32 @@ function esc(s) {
   return String(s).replace(/'/g, "''");
 }
 
+export async function resolveWorkflowIdByCanonicalCode(canonicalCode) {
+  if (!canonicalCode) return null;
+  // canonical_code is unique today; ordering is defensive — prefer active, then
+  // freshest. (Registry statuses are active/draft/legacy — never 'published'.)
+  const q =
+    `SELECT workflow_id FROM workflow_registry ` +
+    `WHERE canonical_code = '${esc(canonicalCode)}' ` +
+    `ORDER BY (status = 'active') DESC, updated_at DESC LIMIT 1`;
+  let rows;
+  try {
+    rows = await hlRunSQL(q);
+  } catch (err) {
+    // HL down / not configured / RPC error — distinguishable from "no row".
+    console.warn(`[HlFallback] registry lookup FAILED for ${canonicalCode}: ${err.message}`);
+    throw err;                                     // caller decides fail-soft policy
+  }
+  // hlRunSQL pipes through unwrapSingleValue(): a single-row, single-column result
+  // collapses to the bare workflow_id STRING; no row → null. Handle array/object too.
+  let id = null;
+  if (typeof rows === 'string') id = rows || null;
+  else if (Array.isArray(rows) && rows.length) id = rows[0]?.workflow_id || null;
+  else if (rows && typeof rows === 'object') id = rows.workflow_id || null;
+  if (!id) console.warn(`[HlFallback] registry lookup: no row for canonical_code "${canonicalCode}"`);
+  return id;
+}
+
 export function registerHlFallbackTools(server) {
 
   // hl_query [READ-ONLY] — generic escape hatch
