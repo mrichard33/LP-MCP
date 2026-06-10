@@ -585,6 +585,22 @@ async function evaluateContextConditions(conditions, intelligence, event) {
         }
         break;
       }
+      case 'not_has_any_tag_prefix': {
+        const blockedPrefixes = Array.isArray(expected) ? expected : [expected];
+        if (!tags) tags = await fetchContactTags(event.ghl_contact_id);
+        // fetchContactTags always resolves to an array ([] on miss), so an
+        // unreadable tag set fails open here — same as not_has_tag_prefix:
+        // if we can't see a blocked tag, we don't block. (tags || []) guards
+        // defensively in case the contract ever changes.
+        const prefixed = (tags || []).find(t =>
+          typeof t === 'string' && blockedPrefixes.some(p => typeof p === 'string' && t.startsWith(p))
+        );
+        if (prefixed) {
+          console.log(`[Context] BLOCKED: not_has_any_tag_prefix — contact has "${prefixed}" (matches blocklist)`);
+          return false;
+        }
+        break;
+      }
       case 'custom_field_eq': {
         const fieldId = expected?.field_id;
         if (!fieldId) {
