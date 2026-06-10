@@ -31,6 +31,28 @@
  *   'json' → application/json. Use only when the destination explicitly
  *      requires JSON (non-GHL targets, future integrations).
  *
+ * v1.8 (2026-06-10) — Registry-lookup resolver (inert, fail-soft). New helper
+ *        resolveWorkflowTarget(payload) resolves the GHL workflow UUID a
+ *        workflow action targets: explicit action_payload.workflow_id wins
+ *        verbatim (every live agent_rule carries one, so this is INERT — zero
+ *        behavior change today); only when workflow_id is ABSENT and a
+ *        canonical_code is present does it look up the current published UUID
+ *        from the LP-side workflow_canonical_map mirror. Retires the RC3
+ *        stale-UUID bug class: a workflow version bump updates one mirror row
+ *        instead of every rule that hardcoded the old UUID. Wired into both
+ *        executeAddToWorkflow (Route A) and executeRemoveFromWorkflow; Route B
+ *        (inbound webhook_url) is unchanged. CROSS-SUPABASE: workflow_registry
+ *        lives in the HL Supabase; this code only has the LP client, so the
+ *        resolver reads the LP-side workflow_canonical_map mirror, kept current
+ *        by a dedicated scheduled refresh (shipped separately). FAIL-SOFT: any
+ *        mirror read error (table absent pre-DDL, transient DB error, no row)
+ *        returns null and the caller's existing "Missing workflow_id" throw is
+ *        preserved — a resolver fault can never block an enrollment that carries
+ *        an explicit workflow_id. NOTE: do NOT migrate any rule onto
+ *        canonical_code-only until the refresh job is live and the mirror is
+ *        provably current; a populated-once-then-drifting map is just another
+ *        stale pointer.
+ *
  * v1.7 (2026-06-05) — days_since_last_contact now measures TRUE human contact.
  *        Rewrote computeDaysSinceLastContact to read only two signals, both of
  *        which represent an actual person↔lead interaction and neither of which
@@ -119,7 +141,6 @@
 import supabase from '../../supabase.js';
 import { ghlFetch } from '../helpers.js';
 import { REMOVE_ALL_MARKETING_WF } from '../constants.js';
-import { resolveWorkflowIdByCanonicalCode } from '../../tools/admin/hl-fallback.js';
 
 /**
  * Encode a flat-ish object as application/x-www-form-urlencoded.
@@ -256,6 +277,64 @@ function buildLogLabel(payload, fallback) {
 }
 
 /**
+ * v1.8 — Registry-lookup resolver (inert, fail-soft).
+ *
+ * Resolves the GHL workflow UUID a workflow action should target:
+ *   1. action_payload.workflow_id present → use it verbatim. EVERY live
+ *      agent_rule carries one today, so this branch always wins and the
+ *      resolver is INERT (the mirror is never even queried). No behavior change.
+ *   2. workflow_id ABSENT but action_payload.canonical_code present → look up
+ *      the current published UUID from the LP-side workflow_canonical_map
+ *      mirror (canonical_code → workflow_id). Retires the RC3 stale-UUID bug
+ *      class: a workflow version bump updates one mirror row instead of every
+ *      rule that hardcoded the old UUID.
+ *   3. Neither present → null (caller throws "Missing workflow_id", unchanged).
+ *
+ * CROSS-SUPABASE: the canonical workflow_registry lives in the HL Supabase;
+ * this code only has the LP client, so branch 2 reads the LP-side
+ * workflow_canonical_map mirror, kept current by a dedicated scheduled refresh
+ * (separate from sync-engine). The mirror is only a trustworthy enrollment
+ * target once that refresh is live — until then no rule should be migrated onto
+ * canonical_code-only, so branch 2 stays unreached in production.
+ *
+ * FAIL-SOFT: any error reading the mirror (table absent pre-DDL, transient DB
+ * error, no matching row) returns null rather than throwing — a resolver fault
+ * can never block an enrollment that carries an explicit workflow_id.
+ *
+ * @returns {Promise<{workflowId: string|null, resolvedVia: 'payload'|'registry_map'|null}>}
+ */
+async function resolveWorkflowTarget(payload) {
+  // Branch 1 — explicit UUID wins (back-compat; every live rule hits this).
+  if (payload && payload.workflow_id) {
+    return { workflowId: payload.workflow_id, resolvedVia: 'payload' };
+  }
+
+  // Branch 2 — canonical_code → current published UUID via LP-side mirror.
+  const code = payload && payload.canonical_code;
+  if (code) {
+    try {
+      const { data, error } = await supabase
+        .from('workflow_canonical_map')
+        .select('workflow_id')
+        .eq('canonical_code', code)
+        .limit(1);
+      if (!error && Array.isArray(data) && data[0]?.workflow_id) {
+        console.log(`[ActionExecutor] resolver: ${code} → ${data[0].workflow_id} (registry_map)`);
+        return { workflowId: data[0].workflow_id, resolvedVia: 'registry_map' };
+      }
+      if (error) {
+        console.warn(`[ActionExecutor] resolver read failed for ${code}: ${error.message} — falling through to throw`);
+      }
+    } catch (err) {
+      console.warn(`[ActionExecutor] resolver threw for ${code}: ${err.message} — falling through to throw`);
+    }
+  }
+
+  // Branch 3 — nothing to resolve.
+  return { workflowId: null, resolvedVia: null };
+}
+
+/**
  * v1.4 — Post-success action chaining.
  *
  * Enqueues a follow-up agent_action AFTER the parent enrollment succeeded.
@@ -293,39 +372,10 @@ async function enqueuePostSuccessAction(parentAction, spec) {
   }
 }
 
-/**
- * Resolve the target workflow_id for an action payload.
- *
- * Inert today: every live rule payload carries a literal workflow_id, so this
- * returns it untouched without any registry call. Only when workflow_id is
- * absent does it fall back to resolving canonical_code → workflow_id against
- * the HL workflow_registry (Workflow Registry rollout, Phase 2).
- *
- * Fail-soft: returns null so the caller's existing "Missing workflow_id" throw
- * path is preserved. Distinguishes the two null cases in logs — a registry
- * read error (HL down / not configured) vs. a canonical_code with no row.
- */
-async function resolveWorkflowTarget(payload) {
-  if (payload.workflow_id) return payload.workflow_id;
-  const code = payload.canonical_code;
-  if (!code) return null;
-  let wfId = null;
-  try {
-    wfId = await resolveWorkflowIdByCanonicalCode(code);
-  } catch (err) {
-    console.warn(`[ActionExecutor] workflow_registry lookup failed for canonical_code "${code}": ${err.message} — falling back to missing-workflow_id`);
-    return null;
-  }
-  if (!wfId) {
-    console.warn(`[ActionExecutor] no workflow_registry row for canonical_code "${code}" — cannot resolve workflow_id`);
-  }
-  return wfId;
-}
-
 export async function executeAddToWorkflow(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
-  let wfId = payload.workflow_id;
+  const wfId = payload.workflow_id;
   const webhookUrl = payload.webhook_url;
   const canonicalCode = payload.canonical_code || null;
   const canonicalName = payload.canonical_name || null;
@@ -406,10 +456,14 @@ export async function executeAddToWorkflow(action) {
   }
 
   // ── Route A: GHL API enrollment (default) ─────────────────────
-  if (!wfId) wfId = await resolveWorkflowTarget(payload); // canonical_code → registry fallback (inert while workflow_id present)
-  if (!wfId) throw new Error('Missing workflow_id (or webhook_url) in action payload');
-  await ghlFetch('POST', `/contacts/${contactId}/workflow/${wfId}`, {});
-  console.log(`[ActionExecutor] ✅ Route A: Contact ${contactId} added to workflow: ${wfLabel} (${wfId})`);
+  // v1.8 — resolve the target UUID. Explicit workflow_id wins (every live rule
+  // hits this); a canonical_code-only payload falls back to the registry mirror
+  // (inert until rules are migrated). Fail-soft: an unresolved target preserves
+  // the original "Missing workflow_id" throw.
+  const { workflowId: resolvedWfId, resolvedVia } = await resolveWorkflowTarget(payload);
+  if (!resolvedWfId) throw new Error('Missing workflow_id (or webhook_url) in action payload');
+  await ghlFetch('POST', `/contacts/${contactId}/workflow/${resolvedWfId}`, {});
+  console.log(`[ActionExecutor] ✅ Route A: Contact ${contactId} added to workflow: ${wfLabel} (${resolvedWfId}${resolvedVia === 'registry_map' ? ', via registry_map' : ''})`);
 
   // v1.4 — fire chained post-success action only after GHL API confirmed enrollment
   if (postSuccessAction) {
@@ -419,11 +473,12 @@ export async function executeAddToWorkflow(action) {
   return {
     action: 'added_to_workflow',
     contact_id: contactId,
-    workflow_id: wfId,
+    workflow_id: resolvedWfId,
     workflow_name: payload.workflow_name || null,
     canonical_code: canonicalCode,
     canonical_name: canonicalName,
     route: 'A',
+    resolved_via: resolvedVia,
     post_success_action_queued: !!postSuccessAction,
   };
 }
@@ -435,14 +490,14 @@ export async function executeRemoveFromWorkflow(action) {
     await ghlFetch('POST', `/contacts/${contactId}/workflow/${REMOVE_ALL_MARKETING_WF}`, {});
     return { action: 'added_to_remove_all_workflow', contact_id: contactId };
   }
-  let wfId = payload.workflow_id;
+  // v1.8 — resolve via the same path as enrollment so add/remove stay symmetric.
+  const { workflowId: wfId, resolvedVia } = await resolveWorkflowTarget(payload);
   const canonicalCode = payload.canonical_code || null;
   const canonicalName = payload.canonical_name || null;
-  if (!wfId) wfId = await resolveWorkflowTarget(payload); // canonical_code → registry fallback (inert while workflow_id present)
   const wfLabel = buildLogLabel(payload, wfId);
   if (!wfId) throw new Error('Missing workflow_id');
   await ghlFetch('DELETE', `/contacts/${contactId}/workflow/${wfId}`);
-  console.log(`[ActionExecutor] ✅ Removed contact ${contactId} from workflow: ${wfLabel} (${wfId})`);
+  console.log(`[ActionExecutor] ✅ Removed contact ${contactId} from workflow: ${wfLabel} (${wfId}${resolvedVia === 'registry_map' ? ', via registry_map' : ''})`);
   return {
     action: 'removed',
     contact_id: contactId,
@@ -450,5 +505,6 @@ export async function executeRemoveFromWorkflow(action) {
     workflow_name: payload.workflow_name || null,
     canonical_code: canonicalCode,
     canonical_name: canonicalName,
+    resolved_via: resolvedVia,
   };
 }
