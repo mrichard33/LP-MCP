@@ -66,6 +66,11 @@ export const SUPPRESS_TAGS = [
   // Explicit one-shot suppressor (operational)
   'suppress-outbound',
 
+  // Terminal structural disqualification (hard-DQ closeout chain,
+  // 2026-06-10). Applied by rule DQ_MOBILE_NORMALIZE et al.; no
+  // reactivation path exists for these contacts.
+  'hard-disqualified',
+
   // Intake/Routing Layer (Phase 1)
   'quarantined',
 
