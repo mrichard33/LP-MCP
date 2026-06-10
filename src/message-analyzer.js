@@ -653,12 +653,27 @@ function buildContextSummary(context) {
 // VALIDATION
 // ═══════════════════════════════════════════════════════════════════
 
+// 2026-06-10 — moved-lead vocabulary. Canonical regex, duplicated in the
+// S13_LANE1_MOVED agent_rule (sql/seeds/2026-06-10_s13_reply_lanes_p1_lost_contract.sql).
+// Keep the two in sync. A "we moved / sold the house" reply is a routing
+// fork (S1.3 Lane 1 asks whether they stayed in Florida), never a refusal —
+// the override below keeps the LLM from mapping it to not-interested/suppress,
+// which is what buried the S1.3 pilot contact in P3 Cooling.
+export const MOVED_REGEX = new RegExp(
+  "(?:\\b(?:we|i)(?:'?ve)?\\s+)?\\b(?:just\\s+)?moved\\b" +
+  "|\\bsold\\s+(?:the|our|that)\\s+(?:house|home|place)\\b" +
+  "|\\bno\\s+longer\\s+(?:own|live|at)\\b" +
+  "|\\bdon'?t\\s+live\\s+there\\b" +
+  "|\\bnew\\s+(?:house|home|address)\\b",
+  'i'
+);
+
 function validateAnalysis(analysis) {
   if (!analysis || typeof analysis !== 'object') return null;
   return {
     buyer_stage: Math.max(1, Math.min(5, parseInt(analysis.buyer_stage) || 2)),
     buyer_stage_confidence: Math.max(0, Math.min(1, parseFloat(analysis.buyer_stage_confidence) || 0.5)),
-    objection_type: ['price', 'timing', 'spouse', 'trust', 'competitor', 'diy', 'not-interested'].includes(analysis.objection_type) ? analysis.objection_type : null,
+    objection_type: ['price', 'timing', 'spouse', 'trust', 'competitor', 'diy', 'not-interested', 'moved'].includes(analysis.objection_type) ? analysis.objection_type : null,
     objection_confidence: Math.max(0, Math.min(1, parseFloat(analysis.objection_confidence) || 0)),
     buying_signals: Array.isArray(analysis.buying_signals) ? analysis.buying_signals.slice(0, 5) : [],
     emotional_state: ['fear', 'frustration', 'skepticism', 'hope', 'urgency', 'neutral', 'anger'].includes(analysis.emotional_state) ? analysis.emotional_state : 'neutral',
@@ -733,6 +748,24 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
     if (!analysis) {
       console.error(`[MessageAnalyzer] Invalid analysis response for ${ghlContactId}`);
       return null;
+    }
+
+    // 2026-06-10 — moved-lead override (deterministic, post-LLM). A moved/sold
+    // message must never be treated as a refusal: it forks (stayed in FL → new
+    // TOFU lead; left → loss-reason:moved), and that decision belongs to the
+    // S1.3 Lane 1 rules + a human, not to the suppress dispatch row.
+    if (MOVED_REGEX.test(messageText)) {
+      if (analysis.objection_type === 'not-interested' || !analysis.objection_type) {
+        analysis.objection_type = 'moved';
+      }
+      if (['suppress', 'deploy_objection_handler'].includes(analysis.recommended_action)) {
+        console.log(
+          `[MessageAnalyzer] Moved-override for ${ghlContactId}: ` +
+          `recommended_action ${analysis.recommended_action} → continue_current`
+        );
+        analysis.recommended_action = 'continue_current';
+      }
+      analysis.recommended_story_arc = null;
     }
 
     // 2026-06-03 — booking-flow ownership override. When a contact is in active

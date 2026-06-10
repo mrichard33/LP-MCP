@@ -523,7 +523,12 @@ async function handleReply(req, res) {
       : [];
     const hasPauseBot = lowercasedTags.includes('pause-bot');
     const hasAgenticActive = lowercasedTags.includes('agentic-active');
-    const hasAgenticOwnership = hasPauseBot || hasAgenticActive;
+    // 2026-06-10: `awaiting:*` joins the ownership gate. When a lane rule has
+    // asked the contact a direct question (e.g. awaiting:moved-fork — "did you
+    // stay in Florida?"), a bare "yes"/"no" IS the answer and must reach the
+    // analyzer so the fork rules can route it.
+    const hasAwaitingState = lowercasedTags.some(t => t.startsWith('awaiting:'));
+    const hasAgenticOwnership = hasPauseBot || hasAgenticActive || hasAwaitingState;
 
     if (!hasAgenticOwnership) {
       // Standard trivial path — log engagement, emit low-priority event,
@@ -543,7 +548,7 @@ async function handleReply(req, res) {
     // reply in context. The reply buffer applies — this short message
     // will be combined with any other rapid-fire messages from the same
     // contact. Log which tag triggered the bypass for audit clarity.
-    const ownershipTag = hasAgenticActive ? 'agentic-active' : 'pause-bot';
+    const ownershipTag = hasAgenticActive ? 'agentic-active' : (hasPauseBot ? 'pause-bot' : 'awaiting:*');
     console.log(`[BehavioralEmitter] Trivial reply "${trimmed.slice(0, 30)}" from ${contactId} but ${ownershipTag} active → routing to analyzer (buffered)`);
   }
 

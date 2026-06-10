@@ -12,6 +12,16 @@
  *   name. Optionally also updates contact source and custom fields.
  *   Used for P2 value/source enrichment and loss intelligence.
  *
+ * ROUTE-TO-P3 CONTRACT (2026-06-10): any rule or dispatch row whose
+ * move_opportunity targets P3 as a LOSS outcome must, in the same action
+ * batch, (a) set the "Intended Loss Reason" custom field
+ * (I9CbRV0dKMfwaSlge9uU) to a valid picklist option and (b) add the
+ * mark-p1-lost tag — the L.0 P1 Loss Marker workflow (248d42f0) triggers on
+ * that tag and branches on the field to close the P1 opp lost. The contract
+ * lives in config, not here: this handler must NOT auto-stamp it, because
+ * legitimate non-loss P3 moves (Reactivation Queue, deferred monetization)
+ * route through the same action_type.
+ *
  * Extracted from action-executor.js v4.2 refactor.
  */
 

@@ -448,6 +448,20 @@ async function fetchContactTags(ghlContactId) {
   } catch { return []; }
 }
 
+async function fetchContactCustomFields(ghlContactId) {
+  const GHL_API_KEY = process.env.GHL_API_KEY;
+  if (!GHL_API_KEY || !ghlContactId) return [];
+  try {
+    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${ghlContactId}`, {
+      headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-07-28', 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data?.contact?.customFields || [];
+  } catch { return []; }
+}
+
 // v2.11 — Engagement-depth gating (see top-of-file v2.11 doc).
 async function countThreadTurns(ghlContactId, sinceMinutes = 60) {
   const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -511,6 +525,7 @@ async function evaluateContextConditions(conditions, intelligence, event) {
   const payload = event?.payload || {};
   const merged = { ...intel, ...payload };
   let tags = null;
+  let customFields = null;
 
   for (const [key, expected] of Object.entries(conditions)) {
     switch (key) {
@@ -549,6 +564,38 @@ async function evaluateContextConditions(conditions, intelligence, event) {
         const found = blocked.find(t => tags.includes(t));
         if (found) {
           console.log(`[Context] BLOCKED: not_has_any_tag — contact has "${found}" (in blocklist)`);
+          return false;
+        }
+        break;
+      }
+      case 'has_tag_prefix': {
+        if (!tags) tags = await fetchContactTags(event.ghl_contact_id);
+        if (!tags.some(t => typeof t === 'string' && t.startsWith(expected))) {
+          console.log(`[Context] BLOCKED: has_tag_prefix — no tag starts with "${expected}"`);
+          return false;
+        }
+        break;
+      }
+      case 'not_has_tag_prefix': {
+        if (!tags) tags = await fetchContactTags(event.ghl_contact_id);
+        const prefixed = tags.find(t => typeof t === 'string' && t.startsWith(expected));
+        if (prefixed) {
+          console.log(`[Context] BLOCKED: not_has_tag_prefix — contact has "${prefixed}"`);
+          return false;
+        }
+        break;
+      }
+      case 'custom_field_eq': {
+        const fieldId = expected?.field_id;
+        if (!fieldId) {
+          console.warn(`[Context] custom_field_eq requires { field_id, value }`);
+          return false;
+        }
+        if (!customFields) customFields = await fetchContactCustomFields(event.ghl_contact_id);
+        const entry = customFields.find(f => f?.id === fieldId);
+        const actual = entry?.value ?? null;
+        if (String(actual) !== String(expected.value)) {
+          console.log(`[Context] BLOCKED: custom_field_eq — field ${fieldId} is "${actual}", expected "${expected.value}"`);
           return false;
         }
         break;
@@ -646,17 +693,40 @@ async function evaluateContextConditions(conditions, intelligence, event) {
         break;
       }
       case 'payload_message_matches': {
+        // String = single regex; array = ALL must match (AND).
         const text = String(payload.message_text || '');
-        let pattern;
-        try {
-          pattern = new RegExp(expected, 'i');
-        } catch (err) {
-          console.error(`[Context] Invalid regex in payload_message_matches "${expected}": ${err.message}`);
-          return false;
+        const required = Array.isArray(expected) ? expected : [expected];
+        for (const raw of required) {
+          let pattern;
+          try {
+            pattern = new RegExp(raw, 'i');
+          } catch (err) {
+            console.error(`[Context] Invalid regex in payload_message_matches "${raw}": ${err.message}`);
+            return false;
+          }
+          if (!pattern.test(text)) {
+            console.log(`[Context] BLOCKED: payload_message_matches /${raw}/i did not match`);
+            return false;
+          }
         }
-        if (!pattern.test(text)) {
-          console.log(`[Context] BLOCKED: payload_message_matches /${expected}/i did not match`);
-          return false;
+        break;
+      }
+      case 'payload_message_not_matches': {
+        // String = single regex; array = ANY match blocks (OR).
+        const text = String(payload.message_text || '');
+        const blockedPatterns = Array.isArray(expected) ? expected : [expected];
+        for (const raw of blockedPatterns) {
+          let pattern;
+          try {
+            pattern = new RegExp(raw, 'i');
+          } catch (err) {
+            console.error(`[Context] Invalid regex in payload_message_not_matches "${raw}": ${err.message}`);
+            return false;
+          }
+          if (pattern.test(text)) {
+            console.log(`[Context] BLOCKED: payload_message_not_matches /${raw}/i matched`);
+            return false;
+          }
         }
         break;
       }
