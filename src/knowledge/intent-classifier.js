@@ -207,7 +207,7 @@ async function loadActiveHandlers() {
 
   const { data, error } = await supabase
     .from('kb_intent_handlers')
-    .select('intent_class, handler_code, bucket_type, gate_priority, description, trigger_keywords, action_type, ghl_handoff_tag, disqualifier')
+    .select('intent_class, handler_code, bucket_type, gate_priority, description, trigger_keywords, trigger_patterns, action_type, ghl_handoff_tag, disqualifier')
     .eq('active', true)
     .order('gate_priority', { ascending: true });
 
@@ -262,6 +262,40 @@ function keywordMatch(messageText, handlers) {
 
 function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// LAYER 0 — PATTERN MATCH (REGEX-FIRST, BEATS KEYWORDS)
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Try to match an inbound message against trigger_patterns (regex).
+ * Runs BEFORE keywordMatch so a precise pattern (e.g. MOVED's
+ * "\bmoved\b") beats a broad keyword on a lower-priority handler
+ * (e.g. CUSTOMER_STATUS_AFFIRMATIVE's "yes" on "Yes, we moved.").
+ * Returns the highest-priority handler with a matching pattern, or null.
+ */
+function patternMatch(messageText, handlers) {
+  if (!messageText) return null;
+  const lc = messageText.toLowerCase().trim();
+  if (!lc) return null;
+
+  // Handlers arrive sorted by gate_priority from the load query
+  for (const h of handlers) {
+    const patterns = h.trigger_patterns || [];
+    for (const p of patterns) {
+      if (!p) continue;
+      let re;
+      try {
+        re = new RegExp(p, 'i');
+      } catch (err) {
+        console.error(`[IntentClassifier] Invalid trigger_pattern on ${h.intent_class}: "${p}" — ${err.message}`);
+        continue;
+      }
+      if (re.test(lc)) return { handler: h, matched_pattern: p, method: 'pattern' };
+    }
+  }
+  return null;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -379,6 +413,20 @@ export async function classifyInbound(messageText, opts = {}) {
   // returns allHandlers unmodified — full backward compatibility for
   // legacy callers.
   const handlers = applyPostQualificationBypass(allHandlers, opts.contactTags, opts.ghlContactId);
+
+  // ─── LAYER 0: Pattern match (regex-first) ────────────────────────
+  if (!opts.skipKeywordMatch) {
+    const pm = patternMatch(messageText, handlers);
+    if (pm) {
+      const result = makeResultFromHandler(pm.handler, {
+        confidence: 0.97,
+        reasoning: `regex match: "${pm.matched_pattern}"`,
+        method: pm.method,
+      });
+      logDecision(opts.ghlContactId, messageText, result, opts.channel);
+      return result;
+    }
+  }
 
   // ─── LAYER 1: Keyword match ──────────────────────────────────────
   if (!opts.skipKeywordMatch) {
