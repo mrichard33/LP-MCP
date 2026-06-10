@@ -668,6 +668,18 @@ export const MOVED_REGEX = new RegExp(
   'i'
 );
 
+// Explicit decline (S13_LANE4) + hard DNC (rule 172) — the only messages on
+// which the S1.3 suppress-gate below lets an LLM `suppress` stand.
+export const S13_EXPLICIT_DECLINE_REGEX = new RegExp(
+  "\\bnot\\s+interested\\b|\\bno\\s+longer\\s+interested\\b|\\bno\\s+thanks?\\b" +
+  "|\\b(?:i'?m|we'?re)\\s+(?:out|good|all\\s+set)\\b|\\bnot\\s+for\\s+(?:me|us)\\b" +
+  "|\\bcount\\s+(?:me|us)\\s+out\\b" +
+  "|\\b(?:stop\\s+(?:sending|emailing|texting|messaging|calling|contacting)" +
+  "|do\\s+not\\s+contact|remove\\s+me\\s+(?:from|off)|unsubscribe" +
+  "|no\\s+further\\s+(?:emails|messages|contact|texts))\\b",
+  'i'
+);
+
 function validateAnalysis(analysis) {
   if (!analysis || typeof analysis !== 'object') return null;
   return {
@@ -766,6 +778,24 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
         analysis.recommended_action = 'continue_current';
       }
       analysis.recommended_story_arc = null;
+    }
+
+    // 2026-06-10 — S1.3 suppress-gate. In the S1.3 revival cohort, suppression
+    // decisions belong to the reply-lane rules, not the LLM: dispatch row 1 now
+    // carries the P1-lost contract, so a stray `suppress` on a neutral message
+    // ("what's the weather like" — caught live in retest) would ack the lead and
+    // then immediately suppress + P1-lose them. Only honor `suppress` when the
+    // message is an explicit decline/DNC; the lanes own every other outcome.
+    // Regexes mirror S13_LANE4 / rule 172 in the 2026-06-10 seed.
+    const isS13Cohort = (context.lead?.current_tags || [])
+      .some(t => String(t).toLowerCase().startsWith('sent:s1.3-'));
+    if (isS13Cohort && analysis.recommended_action === 'suppress'
+        && !S13_EXPLICIT_DECLINE_REGEX.test(messageText)) {
+      console.log(
+        `[MessageAnalyzer] S1.3 suppress-gate for ${ghlContactId}: ` +
+        `suppress → continue_current (no explicit decline in message)`
+      );
+      analysis.recommended_action = 'continue_current';
     }
 
     // 2026-06-03 — booking-flow ownership override. When a contact is in active
