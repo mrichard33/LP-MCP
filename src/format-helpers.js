@@ -4,6 +4,13 @@
  * Shared formatting utilities for GroupMe display.
  * Used by action-executor.js and groupme.js to render
  * human-readable phone numbers and dates.
+ *
+ * 2026-06-11 — formatDateTime now accepts a bare ISO date (YYYY-MM-DD).
+ *   GHL appointment events send startDate and start_time as separate
+ *   fields; enrichment.js v5.0 passes them as (dateStr, timeStr) so the
+ *   GroupMe 📅 line always shows date AND time. Previously a time-only
+ *   value fell through to the raw fallback and rendered "📅 2:00 PM"
+ *   with no date.
  */
 
 /**
@@ -33,6 +40,7 @@ export function formatPhone(phone) {
  * Handles multiple input formats:
  *   ISO:        2026-04-09T10:00:00+00:00 → 04/09/2026 at 10:00 AM
  *   ISO date:   2026-04-09T10:00:00       → 04/09/2026 at 10:00 AM
+ *   ISO date-only: 2026-06-24             → 06/24/2026 (+ timeStr if given)
  *   Long date:  April 8, 2026             → 04/08/2026
  *   MM/DD/YYYY: 04/08/2026                → 04/08/2026 (passthrough)
  *   With time:  04/08/2026 06:00 PM       → 04/08/2026 at 6:00 PM
@@ -59,6 +67,15 @@ export function formatDateTime(dateStr, timeStr = null) {
       const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
       timePart = `${h12}:${m} ${ampm}`;
     }
+    return timePart ? `${datePart} at ${timePart}` : datePart;
+  }
+
+  // 2026-06-11 — ISO date-only: "2026-06-24". GHL appointment payloads
+  // send startDate and start_time as SEPARATE fields; this pattern lets
+  // the caller pass them as (dateStr, timeStr) and get a combined render.
+  const isoDateOnly = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoDateOnly) {
+    datePart = `${isoDateOnly[2]}/${isoDateOnly[3]}/${isoDateOnly[1]}`;
     return timePart ? `${datePart} at ${timePart}` : datePart;
   }
 
