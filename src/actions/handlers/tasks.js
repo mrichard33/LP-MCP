@@ -5,46 +5,18 @@
  * notification combo. The note preserves the task for historical record
  * on the contact; the GroupMe ping surfaces it to the team.
  *
+ * v2.2 (2026-06-11) — REQUIRED-FIELD ENRICHMENT (resolvers v3.11 /
+ *   enrichment v5.0). Threads the GHL contact snapshot through prospect
+ *   resolution (enabling the prospect-ID write-back) and enrichment, so
+ *   AGENT TASK cards now carry Market, Src (LP Source > Subsource), loss
+ *   reason, and full appointment date+time — the "📅 2:00 PM"
+ *   date-missing bug is fixed at the enrichment layer. Interpolation
+ *   context gains the same keys notifications.js v3 exposes
+ *   ({{market}}, {{loss_reason}}, {{calc_summary}},
+ *   {{appointment_datetime}}, ...).
+ *
  * v2.1 (2026-05-14) — OPT IN TO v1.7 GROUPME DEBOUNCE.
- *   Pass { contactId, contactName } to sendGroupMeMessage so multiple
- *   tasks (or task + send_notification + send_message rich notif) for
- *   the same contact within the debounce window collapse into ONE
- *   consolidated GroupMe card. See groupme.js v1.7 header for the
- *   queue mechanics. No other behavior change.
- *
- *   Was: 1 inbound → 2 create_tasks → 2 separate GroupMe cards.
- *   Now: 1 inbound → 2 create_tasks → 1 consolidated card (5s later).
- *
  * v2.0 (2026-05-01) — RICH GROUPME NOTIFICATIONS.
- *
- * v1.0 (the version this replaces) shipped a 2-line GroupMe message:
- *   🤖 AGENT TASK: <title>
- *   Contact: <name> (<phone>)
- *
- * That format dropped the action_payload's `description` field on the
- * floor for GroupMe (description was only persisted to the GHL note).
- * Rich rules like BEHAVIORAL_APPT_CANCELLED and TRUST_BREAK_ACCURACY
- * already populate description with full context — none of it was
- * reaching the human reviewer's phone.
- *
- * v2.0 mirrors executeSendNotification's pattern: pulls
- * buildNotificationEnrichment + buildRichNotification so the GroupMe
- * message includes lead context, LP source/rep/disposition, intent
- * score/tier/barrier, inbound message preview, and appointment context.
- * The action_payload's `description` field is appended below the context
- * block so rule-specific instructions show inline. The `assigned_to`
- * field is also surfaced on its own line.
- *
- * The GHL note still gets the title + description verbatim (audit
- * trail purpose unchanged).
- *
- * Mark's complaint that surfaced this fix: he was getting "🤖 AGENT
- * TASK: LP Issue disposition — needs human review / Contact: <name>
- * (<phone>)" notifications repeatedly with no actionable context. The
- * underlying LP_DISP_ISSUE rule was also wrong (Issue is a routine LP
- * disposition, not a problem flag) — that rule is now disabled in
- * agent_rules. v2.0 is the systemic fix so the next noisy rule that
- * fires create_task at least produces a useful message.
  *
  * Extracted from action-executor.js v4.2 refactor.
  */
@@ -52,18 +24,29 @@
 import { addGHLNote } from '../../ghl.js';
 import { sendGroupMeMessage } from '../../groupme.js';
 import { interpolatePayload, isLPLeadId } from '../helpers.js';
+import { formatDateTime } from '../../format-helpers.js';
 import { resolveContactInfo, resolveLPProspectId } from '../resolvers.js';
-import { buildNotificationEnrichment, buildRichNotification } from '../enrichment.js';
+import { buildNotificationEnrichment, buildRichNotification, formatCalcSummary } from '../enrichment.js';
 
 export async function executeCreateTask(action, context) {
   const contactId = action.target_id;
 
-  // ── Pull contact info, prospect, and enrichment in parallel ───────
+  // ── Pull contact info, prospect, and enrichment ────────────────────
   // Same shape as executeSendNotification so the formatted output is
-  // visually consistent across both action types.
-  const { name, phone, lpLead, ghlContactId } = await resolveContactInfo(contactId, context);
-  const prospectId = await resolveLPProspectId(contactId);
-  const enrichment = await buildNotificationEnrichment(contactId, context, { lpLead, prospectId, ghlContactId });
+  // visually consistent across both action types. v2.2: thread the GHL
+  // contact snapshot through (zero extra API calls, enables prospect-ID
+  // write-back + market/source/reason enrichment).
+  const { name, phone, lpLead, ghlContactId, ghlContact } = await resolveContactInfo(contactId, context);
+  const prospectId = await resolveLPProspectId(contactId, { ghlContact });
+  const enrichment = await buildNotificationEnrichment(contactId, context, { lpLead, prospectId, ghlContactId, ghlContact });
+
+  // v2.2 — combined appointment date+time (never time-only) + calc summary
+  const appointmentDisplay = (enrichment.appointmentDate || enrichment.appointmentTime)
+    ? (formatDateTime(enrichment.appointmentDate || enrichment.appointmentTime,
+        enrichment.appointmentDate ? enrichment.appointmentTime : null)
+        || enrichment.appointmentDate || enrichment.appointmentTime)
+    : null;
+  const calcSummary = formatCalcSummary(enrichment);
 
   // ── Interpolate payload with full context ─────────────────────────
   // Rules use {{contact_name}} / {{startDate}} / {{startTime}} / etc.
@@ -75,6 +58,16 @@ export async function executeCreateTask(action, context) {
     contact_id: contactId,
     contact_phone: phone || '',
     lp_prospect_id: prospectId,
+    // v2.2 — same interpolation keys as notifications.js v3
+    loss_reason: enrichment.lossReason || 'not recorded',
+    market: enrichment.market || 'Unknown',
+    lp_source: enrichment.lpSource || '',
+    lp_subsource: enrichment.lpSourceDetail || '',
+    calc_windows: enrichment.calcWindows || '',
+    calc_doors: enrichment.calcDoors || '',
+    calc_estimate: enrichment.calcEstimate || '',
+    calc_summary: calcSummary || '',
+    appointment_datetime: appointmentDisplay || '',
   };
   const payload = interpolatePayload(action.action_payload, enrichedContext);
   const title = payload?.title || 'Agent task';
