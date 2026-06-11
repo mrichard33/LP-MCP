@@ -7,65 +7,46 @@
  *
  * Extracted from action-executor.js v4.2 refactor.
  *
+ * 2026-06-11 (v3) — REQUIRED-FIELD WIRING (enrichment v5.0 / classifier v1.1).
+ *   Every classified card now receives market, LP source + subsource,
+ *   loss reason, combined appointment date+time, and calculator
+ *   measurements from the enrichment layer. The GHL contact snapshot
+ *   returned by resolveContactInfo (resolvers v3.11) is threaded through
+ *   so this costs zero extra API calls — and resolveLPProspectId now
+ *   self-heals the GHL Prospect ID custom field when LP has the ID but
+ *   GHL doesn't.
+ *
+ *   Narrative templates gain new interpolation keys:
+ *     {{loss_reason}}       — humanized loss-reason:* tag ("DNC", "Mobile Home")
+ *     {{market}}            — resolved market name
+ *     {{lp_source}}         — LP Source (parent channel)
+ *     {{lp_subsource}}      — LP Subsource
+ *     {{calc_windows}}      — calculator window count
+ *     {{calc_doors}}        — calculator door count
+ *     {{calc_estimate}}     — calculator estimate amount (raw)
+ *     {{calc_summary}}      — "7 windows · est. $18,585"
+ *     {{appointment_datetime}} — "06/24/2026 at 2:00 PM"
+ *
+ *   Calculator measurements render as a 📐 line when the rule payload
+ *   sets show_estimate: true (used by the ESTIMATE_CALC_COMPLETED rules).
+ *
  * 2026-05-14 (v2) — NOTIFICATION CLASSIFIER v1.0.
  *   Canonical 4-class notification taxonomy per
- *   Reece_GroupMe_Notification_Standard_v1.md:
+ *   Reece_GroupMe_Notification_Standard_v1.md. Classified vs legacy
+ *   routing; debug class → dev channel only; narratives auto-sanitized.
  *
- *     🤖 SYSTEM EVENT          (cold, factual)
- *     🚨 SALES PRIORITY        (urgent, action required)
- *     🧠 PIPELINE INTELLIGENCE (strategic, doctrinal)
- *     🔧 DEBUG                 (internal only, dev channel)
- *
- *   Two routing paths:
- *
- *     CLASSIFIED PATH — When the rule's action_payload includes
- *     `notification_class` (or `action_verb`), the handler routes
- *     through buildClassifiedNotification() in notification-classifier.js,
- *     producing the standardized card with header, tier, status,
- *     narrative, and ref footer. Narrative is auto-sanitized to strip
- *     step numbers, "buggy fallthrough", UUIDs, and other forbidden
- *     debug-leakage patterns.
- *
- *     LEGACY PATH — Rules that haven't been migrated yet continue to
- *     use buildRichNotification (in enrichment.js). The legacy path
- *     ALSO applies sanitizeNarrative() to the message field, so even
- *     un-migrated rules can no longer leak "step #149 buggy fallthrough"
- *     to rep-facing channels.
- *
- *   CLASS 4 DEV CHANNEL: When notification_class === 'debug', the
- *   handler routes through sendToDevChannel (in notification-classifier.js),
- *   which uses GROUPME_DEV_BOT_ID and bypasses the rep-facing groupme.js
- *   entirely. If GROUPME_DEV_BOT_ID is unset, the message is logged to
- *   console and to agent_actions.execution_result only — never sent to
- *   rep-facing channels.
- *
- * 2026-05-14 — OPT IN TO v1.7 GROUPME DEBOUNCE.
- *   Pass { contactId, contactName } to sendGroupMeMessage so multiple
- *   notifications (or notification + task + send_message rich notif)
- *   for the same contact within the 5s window collapse into one
- *   consolidated GroupMe card. See groupme.js v1.7 header for queue
- *   mechanics. The recovery `ref: a${id}` footer is preserved per-line
- *   inside the consolidated card, so checkForActionRef-based retry
- *   verification still works on history lookup.
- *
- * 2026-05-13 — RECOVERABLE NON-IDEMPOTENT RETRY (executor stall fix).
- *   send_notification is in the RECOVERABLE_NON_IDEMPOTENT set (see
- *   src/actions/reaper.js). When the reaper detects a stuck action, it
- *   requeues instead of dropping. Every outbound notification appends
- *   a recovery footer `\n\nref: a${action.id}` used by checkForActionRef
- *   to detect already-sent messages on retry.
- *
+ * 2026-05-14 — OPT IN TO v1.7 GROUPME DEBOUNCE (contactId passthrough).
+ * 2026-05-13 — RECOVERABLE NON-IDEMPOTENT RETRY (ref: a${id} footer).
  * 2026-05-11 — PER-RULE COOLDOWN + WIDER LOG PREVIEW.
- *   Opt-in cooldown via payload.cooldown_minutes; execution_result.message
- *   preview raised from 200 → 600 chars.
  */
 
 import supabase from '../../supabase.js';
 import { sendGroupMeMessage } from '../../groupme.js';
 import { checkForActionRef } from '../../groupme-read.js';
 import { interpolatePayload } from '../helpers.js';
+import { formatDateTime } from '../../format-helpers.js';
 import { resolveContactInfo, resolveLPProspectId } from '../resolvers.js';
-import { buildNotificationEnrichment, buildRichNotification } from '../enrichment.js';
+import { buildNotificationEnrichment, buildRichNotification, formatCalcSummary } from '../enrichment.js';
 import {
   buildClassifiedNotification,
   isClassifiedPayload,
@@ -167,9 +148,19 @@ export async function executeSendNotification(action, context) {
   }
 
   const contactId = action.target_id;
-  const { name, phone, lpLead, ghlContactId } = await resolveContactInfo(contactId, context);
-  const prospectId = await resolveLPProspectId(contactId);
-  const enrichment = await buildNotificationEnrichment(contactId, context, { lpLead, prospectId, ghlContactId });
+  // v3 — resolvers v3.11 returns the slim GHL contact snapshot; reuse it
+  // for prospect resolution (with write-back) and enrichment.
+  const { name, phone, lpLead, ghlContactId, ghlContact } = await resolveContactInfo(contactId, context);
+  const prospectId = await resolveLPProspectId(contactId, { ghlContact });
+  const enrichment = await buildNotificationEnrichment(contactId, context, { lpLead, prospectId, ghlContactId, ghlContact });
+
+  // v3 — combined appointment date+time display (never time-only).
+  const appointmentDisplay = (enrichment.appointmentDate || enrichment.appointmentTime)
+    ? (formatDateTime(enrichment.appointmentDate || enrichment.appointmentTime,
+        enrichment.appointmentDate ? enrichment.appointmentTime : null)
+        || enrichment.appointmentDate || enrichment.appointmentTime)
+    : null;
+  const calcSummary = formatCalcSummary(enrichment);
 
   const enrichedContext = {
     ...context,
@@ -177,6 +168,16 @@ export async function executeSendNotification(action, context) {
     contact_id: contactId,
     contact_phone: phone || '',
     lp_prospect_id: prospectId,
+    // v3 — new interpolation keys for rule narratives
+    loss_reason: enrichment.lossReason || 'not recorded',
+    market: enrichment.market || 'Unknown',
+    lp_source: enrichment.lpSource || '',
+    lp_subsource: enrichment.lpSourceDetail || '',
+    calc_windows: enrichment.calcWindows || '',
+    calc_doors: enrichment.calcDoors || '',
+    calc_estimate: enrichment.calcEstimate || '',
+    calc_summary: calcSummary || '',
+    appointment_datetime: appointmentDisplay || '',
   };
 
   const payload = interpolatePayload(action.action_payload, enrichedContext);
@@ -200,6 +201,13 @@ export async function executeSendNotification(action, context) {
       phone,
       contactId,
       prospectId,
+      // v3 — required-field card (classifier v1.1)
+      market: enrichment.market,
+      lpSource: enrichment.lpSource,
+      lpSourceDetail: enrichment.lpSourceDetail,
+      lossReason: enrichment.lossReason,
+      appointmentDisplay,
+      calcSummary: payload.show_estimate ? calcSummary : null,
       tier: payload.tier || enrichment?.tier,
       status: payload.status,
       narrative: payload.narrative || payload.message,
@@ -209,9 +217,6 @@ export async function executeSendNotification(action, context) {
     });
 
     // CLASS 4 routing — debug class goes to dev channel only.
-    // Self-contained sender in notification-classifier.js bypasses
-    // groupme.js entirely so debug can never accidentally land in a
-    // rep-facing channel.
     if (isDevOnly(klass)) {
       const result = await sendToDevChannel(full);
       return {
