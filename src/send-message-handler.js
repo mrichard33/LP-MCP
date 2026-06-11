@@ -5,6 +5,30 @@
  * via channel-specific routing — webhook for SMS, Conversations API
  * for email — with cross-fallback for both.
  *
+ * v3.14 (2026-06-11) — Email reply-from via email-detail endpoint.
+ *   PROBLEM: v3.11's getReplyFromAddress(contactId, 'email') reads the
+ *   inbound message's top-level `.to` — which exists for SMS but NOT on
+ *   GHL email message objects (verified live on conversation
+ *   0nvmkjWOyBPY0fw8rT4Z: inbound email exposes only body, userId, and
+ *   meta.email.{messageIds, direction, subject}). Result: emailFrom was
+ *   never set; sender continuity rode entirely on the userId override,
+ *   which fails for (a) customer-initiated threads with no prior
+ *   outbound and (b) workflow emails whose From address differs from
+ *   the sending user's profile email.
+ *
+ *   FIX: New helper getInboundEmailToAddress(contactId) — finds the most
+ *   recent inbound email, takes meta.email.messageIds[0], fetches
+ *   GET /conversations/messages/email/{id}, and returns its `to` address
+ *   (defensive across response shapes: .to array/string, .email.to,
+ *   .emailTo). That `to` is OUR receiving mailbox — the exact address
+ *   the lead wrote to, which is the correct FROM for the reply.
+ *   Both send paths updated: sendViaConversationsAPI sets emailFrom from
+ *   it (userId override retained as secondary), and sendViaWebhook's
+ *   payload populates replyFromEmail from it for the email channel
+ *   (I.AG-IN 497e664a can bind its email step's From Email field to
+ *   {{inboundWebhookRequest.replyFromEmail}}).
+ *   Failure-soft: null → exactly v3.11 behavior (userId → GHL default).
+ *
  * v3.13 (2026-05-08) — Plumb generateResponse companion_action through
  *   the auto-fire path so reschedule / cancel / book companions actually
  *   queue when a rule has requires_approval=false.
@@ -463,6 +487,63 @@ async function getThreadOriginatorUserId(contactId) {
 }
 
 /**
+ * v3.14 — Look up the address the lead's most recent inbound EMAIL was
+ * sent TO — i.e. OUR receiving mailbox — via GHL's email-detail endpoint.
+ * The conversation-level message object does not expose to/from for
+ * email (verified live 2026-06-11), so we hop: most recent inbound email
+ * → meta.email.messageIds[0] → GET /conversations/messages/email/{id} →
+ * read its `to`. That address is the correct FROM for our reply,
+ * regardless of current contact assignment or which workflow originated
+ * the thread.
+ *
+ * Returns the address string or null on:
+ *   - no conversation / no inbound email / no messageIds
+ *   - email-detail endpoint error or unrecognized response shape
+ * Failure is non-fatal everywhere this is used.
+ */
+async function getInboundEmailToAddress(contactId) {
+  if (!contactId || !GHL_API_KEY) return null;
+
+  try {
+    const search = await ghlFetch('GET',
+      `/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`);
+    const conversations = Array.isArray(search) ? search : (search?.conversations || []);
+    if (!conversations.length) return null;
+
+    const conversationId = conversations[0].id;
+    const msgData = await ghlFetch('GET',
+      `/conversations/${conversationId}/messages?limit=20`);
+    const messages = msgData?.messages?.messages || msgData?.messages || [];
+    if (!Array.isArray(messages) || messages.length === 0) return null;
+
+    const recentInboundEmail = messages.find(m =>
+      m.direction === 'inbound' &&
+      (m.messageType === 'TYPE_EMAIL' || m.type === 3)
+    );
+    const emailId = recentInboundEmail?.meta?.email?.messageIds?.[0];
+    if (!emailId) return null;
+
+    const detail = await ghlFetch('GET', `/conversations/messages/email/${emailId}`);
+    // Defensive extraction across GHL response shapes.
+    const candidates = [
+      detail?.to,
+      detail?.email?.to,
+      detail?.emailTo,
+      detail?.emailMessage?.to,
+    ];
+    for (const c of candidates) {
+      if (Array.isArray(c) && c.length && typeof c[0] === 'string' && c[0].includes('@')) return c[0];
+      if (typeof c === 'string' && c.includes('@')) return c;
+    }
+    console.warn(`[SendMessage] v3.14: email-detail ${emailId} had no recognizable 'to' — keys: [${Object.keys(detail || {}).join(', ')}]`);
+    return null;
+  } catch (err) {
+    console.warn(`[SendMessage] getInboundEmailToAddress failed for ${contactId}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * v3.9 — Look up the SUBJECT of the most recent inbound email for a
  * contact. Used to construct "Re: <subject>" for outbound email replies
  * so the email-client threads them with the original conversation.
@@ -600,8 +681,11 @@ async function sendViaWebhook(contactId, message, channel, subject, action) {
   // v3.11 — Also fetch threadOriginatorUserId for email so the GHL
   // workflow can reassign the contact to the original thread owner
   // before sending. Run in parallel; both helpers fail-soft to null.
+  // v3.14: email uses the email-detail endpoint (conversation-level
+  // message objects carry no `.to` for email); SMS keeps the original
+  // top-level `.to` lookup, which works for that channel.
   const [replyFromAddress, threadOriginatorUserId] = await Promise.all([
-    getReplyFromAddress(contactId, channel),
+    channel === 'email' ? getInboundEmailToAddress(contactId) : getReplyFromAddress(contactId, channel),
     channel === 'email' ? getThreadOriginatorUserId(contactId) : Promise.resolve(null),
   ]);
 
@@ -727,10 +811,13 @@ async function sendViaConversationsAPI(contactId, message, channel, subject) {
     // three lookups in parallel — they hit the same /conversations and
     // /messages endpoints so GHL's edge cache de-dupes the actual API
     // load. Adds ~0ms on warm cache, ~150-300ms on cold.
+    // v3.14: replyFromAddr now resolved via the email-detail endpoint —
+    // the conversation-level message object has no `.to` for email, so
+    // getReplyFromAddress always returned null on this channel.
     const [inboundEmailMessageId, originatorUserId, replyFromAddr] = await Promise.all([
       getInboundEmailMessageId(contactId),
       getThreadOriginatorUserId(contactId),
-      getReplyFromAddress(contactId, 'email'),
+      getInboundEmailToAddress(contactId),
     ]);
 
     if (inboundEmailMessageId) {
