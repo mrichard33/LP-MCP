@@ -3,6 +3,21 @@
  *
  * Agentic Responder intelligence core.
  *
+ * v2.7.11 — 2026-06-11. GUIDE OFFER — BOOKING FAILURE EXIT.
+ *   The Hurricane Preparedness Guide becomes the bot's graceful exit when
+ *   an engaged lead can't be booked after two attempts. New system-prompt
+ *   section + per-contact GUIDE OFFER STATUS line (computed from the
+ *   hurricane-guide-{sent,offered,declined} tags) + new companion type
+ *   guide_disposition {outcome: accepted|declined}. Executed INLINE at
+ *   generation time via applyGHLTag (mirrors the booking:active pattern —
+ *   the lead's accept/decline is already fact in their inbound, so it
+ *   doesn't wait on the approval pipeline), then nulled so downstream
+ *   companion handlers never see an unknown type. Tags applied:
+ *     accepted → enroll:s2.2-chatbot + hurricane-guide-queue
+ *     declined → enroll:s2.2-chatbot + hurricane-guide-declined
+ *   Delivery itself is owned by GHL workflow U.GUIDE (0f51bc3d), which is
+ *   gate-idempotent — re-queues and regenerates cannot double-send.
+ *
  * v2.7.10 — 2026-05-05. AUTHORITATIVE ESTIMATE BLOCK + ESTIMATE QUOTING EXCEPTION.
  *   PROBLEM: On test contact 7jl9cVfry8OyQF6oI2V5, the agentic email reply
  *   referenced "$36,000 estimate in their hand" — but the actual GHL
@@ -739,6 +754,30 @@ CANCELLATION:
 ❌ Using a different calendar for the rescheduled appointment unless the lead specifically asked to switch
 ❌ Treating "I need to cancel" as a STOP / opt-out (it's about ONE appointment, not all messaging)
 
+═══════ GUIDE OFFER — BOOKING FAILURE EXIT (v2.7.11) ═══════
+The Hurricane Preparedness Guide is a free gift used as a graceful exit when booking fails — never a pitch, never a pressure move.
+
+WHEN TO OFFER — ALL must be true:
+1. The lead is engaged (replying) but you could not secure the appointment or call after TWO distinct attempts in this conversation.
+2. GUIDE OFFER STATUS in the user prompt says ELIGIBLE.
+3. The lead has not booked.
+Offer ONCE, warmly, no strings: "No problem at all — timing has to be right. Let me at least send you our free Hurricane Preparedness Guide so you have it on hand before storm season. What's the best email for that?"
+
+OUTCOMES:
+- ACCEPTED + EMAIL PROVIDED (in this message or earlier in this conversation): confirm the email back, tell them it'll hit their inbox within the hour, emit companion_action guide_disposition with outcome "accepted".
+- ACCEPTED but NO EMAIL YET: ask for the email conversationally. NO companion this turn — emit "accepted" only on the turn where the email is actually provided.
+- DECLINED or deflected: do NOT ask again or rephrase, ever. Close warmly, no strings ("Totally fine. If anything changes before storm season, just text me here.") and emit companion_action guide_disposition with outcome "declined".
+- GUIDE OFFER STATUS = OUTSTANDING: never re-offer. But if the lead now provides an email (accepting the earlier offer), emit "accepted"; if they now decline it, emit "declined".
+- GUIDE OFFER STATUS = RESOLVED: never mention the guide. Never emit guide_disposition.
+
+▼ guide_disposition companion shape
+{
+  "action_type": "guide_disposition",
+  "action_payload": { "outcome": "accepted" | "declined" },
+  "reasoning": "<which lead message constitutes the accept/decline>"
+}
+The server applies enrollment and delivery tags — never mention tags, systems, or enrollment to the lead. Guide delivery is handled separately; your only job is the conversation and the disposition.
+
 ═══════ HARD PROHIBITIONS ═══════
 - Never quote prices or estimates EXCEPT figures present in the CUSTOMER'S ACTUAL ESTIMATE (AUTHORITATIVE) block when that block is included in the user prompt. If the block is absent, the prohibition holds absolutely — do not quote, infer, or compute any dollar figure or window count from rep notes, conversation history, training-data priors, or any other source. When the block is present, you may reference the figures in it — and ONLY those figures.
 - Never make promises about discounts or deals
@@ -784,7 +823,7 @@ Return ONLY a valid JSON object. The very first character MUST be { and the very
   "frameworks_applied": ["antifragile","expert_secrets","traffic_secrets","dotcom_secrets"],
   "reasoning": "1 sentence explaining your strategy",
   "companion_action": null | {
-    "action_type": "book_appointment" | "cancel_appointment" | "reschedule_appointment",
+    "action_type": "book_appointment" | "cancel_appointment" | "reschedule_appointment" | "update_appointment_status" | "guide_disposition",
     "action_payload": { ... per shape above ... },
     "reasoning": "<extraction trace>"
   }
@@ -991,6 +1030,23 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   }
   if (context.lead.suppression_tags?.length) {
     parts.push(`Suppression Tags: ${context.lead.suppression_tags.join(', ')}`);
+  }
+
+  // v2.7.11: guide-offer gate state for the GUIDE OFFER — BOOKING FAILURE
+  // EXIT section. Computed from the three hurricane-guide-* tags so the AI
+  // never has to infer gate state from raw tag lists.
+  {
+    const gTags = context.lead.current_tags || [];
+    const gSent = gTags.includes('hurricane-guide-sent');
+    const gDeclined = gTags.includes('hurricane-guide-declined');
+    const gOffered = gTags.includes('hurricane-guide-offered');
+    if (gSent || gDeclined) {
+      parts.push(`GUIDE OFFER STATUS: RESOLVED (${gSent ? 'sent' : 'declined'}) — never mention the Hurricane Preparedness Guide.`);
+    } else if (gOffered) {
+      parts.push(`GUIDE OFFER STATUS: OUTSTANDING — already offered, unanswered. Never re-offer. If the lead provides an email now, emit guide_disposition outcome "accepted"; if they decline the guide now, emit outcome "declined".`);
+    } else {
+      parts.push(`GUIDE OFFER STATUS: ELIGIBLE — offer ONLY per the GUIDE OFFER — BOOKING FAILURE EXIT rules.`);
+    }
   }
 
   if (context.pipeline?.status) {
@@ -1412,6 +1468,24 @@ function validateUpdateAppointmentStatusCompanion(cap, ca) {
   };
 }
 
+// v2.7.11 — guide-offer disposition. Records the lead's answer to the
+// booking-failure guide offer. Executed inline in generateResponse via
+// applyGHLTag (mirrors the generation-time booking:active pattern) and
+// nulled before return so downstream companion handlers never see it.
+const GUIDE_OUTCOMES = new Set(['accepted', 'declined']);
+function validateGuideDispositionCompanion(cap, ca) {
+  const outcome = typeof cap.outcome === 'string' ? cap.outcome.trim().toLowerCase() : '';
+  if (!GUIDE_OUTCOMES.has(outcome)) {
+    console.warn(`[ResponseGenerator] Dropping guide_disposition: invalid outcome "${cap.outcome}"`);
+    return null;
+  }
+  return {
+    action_type: 'guide_disposition',
+    action_payload: { outcome },
+    reasoning: typeof ca.reasoning === 'string' ? ca.reasoning.slice(0, 500) : null,
+  };
+}
+
 function validateResponse(parsed, channel) {
   if (!parsed || typeof parsed !== 'object') return null;
   if (!parsed.message || typeof parsed.message !== 'string') return null;
@@ -1455,6 +1529,8 @@ function validateResponse(parsed, channel) {
       companionAction = validateRescheduleAppointmentCompanion(cap, ca);
     } else if (ca.action_type === 'update_appointment_status') {
       companionAction = validateUpdateAppointmentStatusCompanion(cap, ca);
+    } else if (ca.action_type === 'guide_disposition') {
+      companionAction = validateGuideDispositionCompanion(cap, ca);
     } else {
       console.warn(`[ResponseGenerator] Dropping unsupported companion_action.action_type="${ca.action_type}"`);
     }
@@ -1730,6 +1806,25 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   const availSummary = availability
     ? (availability.slots.length > 0 ? `${availability.slots.length}slots/${availability.slots_total_count}total` : 'empty')
     : (calendarId ? 'fetch_failed' : 'no_calendar');
+
+  // ─── v2.7.11: guide_disposition — apply enrollment + guide tags inline ───
+  // The lead's accept/decline is already fact by generation time (it's in
+  // THEIR inbound), so tag application mirrors the generation-time
+  // booking:active pattern rather than the post-send companion pipeline.
+  // Idempotent by design: U.GUIDE re-entry is gate-guarded and the S2.2
+  // enrollment rule is suppression-gated, so a regenerate cannot double-fire.
+  if (validated.companion_action?.action_type === 'guide_disposition') {
+    const gdOutcome = validated.companion_action.action_payload.outcome;
+    const gdTags = gdOutcome === 'accepted'
+      ? ['enroll:s2.2-chatbot', 'hurricane-guide-queue']
+      : ['enroll:s2.2-chatbot', 'hurricane-guide-declined'];
+    for (const gdTag of gdTags) {
+      applyGHLTag(contactId, gdTag).catch(err =>
+        console.warn(`[ResponseGenerator] guide_disposition tag "${gdTag}" failed for ${contactId}: ${err.message}`));
+    }
+    console.log(`[ResponseGenerator] guide_disposition=${gdOutcome} for ${contactId} → tags: ${gdTags.join(', ')}`);
+    validated.companion_action = null;
+  }
 
   // ─── Auto-book companion: server-side calendar + gate enforcement (§4/§5) ───
   // The model is the wrong place to (a) copy an opaque calendar id, (b) know the
