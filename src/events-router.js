@@ -18,7 +18,8 @@
  * handler — every call returned 404 silently. This module closes that
  * gap without changing the workflow.
  *
- * Payload contract (lenient — accepts both snake_case and camelCase):
+ * Payload contract (lenient — accepts both snake_case and camelCase,
+ * top-level OR nested under customData):
  *   {
  *     contact_id | contactId        : "GHL contact ID" (required),
  *     workflow_id | workflowId      : "GHL workflow ID" (optional),
@@ -29,6 +30,16 @@
  *
  * Dedup: per-minute idempotency_key composed from event_type + contact_id
  *        + workflow_id to absorb GHL retries without burning unique-key slots.
+ *
+ * v1.1 (2026-06-11) — Defensive customData parsing, mirroring
+ *   behavioral-emitter v2.9. GHL outbound custom webhooks auto-populate
+ *   contactId at the top level but NEST user-defined Custom Data fields
+ *   inside `customData`. v1.0 only read top-level keys, so any GHL
+ *   workflow passing event_subtype / workflow_id as Custom Data landed
+ *   with both null on the system_events row. First consumer hit:
+ *   U.STALE stale-opportunity sweeper firing /events/state_transition
+ *   with event_subtype="stale_cold_awakening". No behavioral change for
+ *   flat-JSON callers (S5.2-V2 webhook nodes).
  */
 
 import supabase from './supabase.js';
@@ -47,9 +58,17 @@ const PRIORITY_MAP = {
 async function handleEvent(eventType, req, res) {
   try {
     const payload = req.body || {};
-    const contactId = payload.contact_id || payload.contactId || null;
-    const workflowId = payload.workflow_id || payload.workflowId || null;
-    const lpLeadId = payload.lp_lead_id || payload.lpLeadId || null;
+    // v1.1: GHL custom webhooks nest user-defined Custom Data fields under
+    // `customData` while auto-populating contactId at the top level. Read
+    // both locations, top-level first (flat-JSON callers keep precedence).
+    const customData = (payload.customData || payload.custom_data || payload.customValues || {}) || {};
+    const contactId = payload.contact_id || payload.contactId
+      || customData.contact_id || customData.contactId || null;
+    const workflowId = payload.workflow_id || payload.workflowId
+      || customData.workflow_id || customData.workflowId || null;
+    const lpLeadId = payload.lp_lead_id || payload.lpLeadId
+      || customData.lp_lead_id || customData.lpLeadId || null;
+    const eventSubtype = payload.event_subtype || customData.event_subtype || null;
 
     if (!contactId && !lpLeadId) {
       return res.status(400).json({ error: 'contact_id (or lp_lead_id) required' });
@@ -71,7 +90,7 @@ async function handleEvent(eventType, req, res) {
       .from('system_events')
       .insert({
         event_type: eventType,
-        event_subtype: payload.event_subtype || null,
+        event_subtype: eventSubtype,
         source: 'ghl',
         entity_type: 'contact',
         entity_id: String(contactId || lpLeadId),
@@ -90,7 +109,7 @@ async function handleEvent(eventType, req, res) {
       return res.status(500).json({ error: 'Failed to create event', detail: error.message });
     }
 
-    console.log(`[EventsRouter] ${eventType} | contact=${contactId || lpLeadId} | workflow=${workflowId || 'none'} | event_id=${event.id}`);
+    console.log(`[EventsRouter] ${eventType} | contact=${contactId || lpLeadId} | workflow=${workflowId || 'none'} | subtype=${eventSubtype || 'none'} | event_id=${event.id}`);
     res.json({ received: true, event_id: event.id, event_type: eventType });
   } catch (err) {
     console.error(`[EventsRouter] ${eventType} threw:`, err.message);
