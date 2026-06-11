@@ -69,6 +69,12 @@
  *   events. Discovered when manual tag-adds on Mark Test failed to fire
  *   the state-transition pipeline; events were sitting in
  *   system_events_filtered with reason="tag_added_subtype_not_in_allowlist".
+ *
+ * 2026-06-11 — Calculator completion notifications:
+ *   added 'estimator-completed' so ESTIMATE_CALC_COMPLETED_TAG receives
+ *   its trigger. The workflow_completed path only fired 2x/14d vs 25
+ *   actual completions; the tag webhook arrives reliably (58 events in
+ *   system_events_filtered) but was being dropped here.
  */
 
 import supabase from '../supabase.js';
@@ -183,6 +189,12 @@ const ALLOWED_TAG_ADDED_SUBTYPES = new Set([
   'hdl:dq-mobile',                  // rule DQ_MOBILE_FROM_HDL
   'dq-mobile-home',                 // rule DQ_MOBILE_NORMALIZE
   'hard-disqualified',              // rule HARD_DISQUALIFIED_CLOSEOUT
+
+  // ── CALCULATOR COMPLETION (2026-06-11) ──
+  // Reliable completion signal. workflow_completed for the estimator
+  // workflow fired 2x/14d vs 25 real completions; this tag arrives every
+  // time but was being dropped here (58 events in system_events_filtered).
+  'estimator-completed',            // rule ESTIMATE_CALC_COMPLETED_TAG
 ]);
 
 /**
