@@ -1,14 +1,19 @@
 /**
  * Notification Classifier — src/actions/notification-classifier.js
  *
+ * v1.1 (2026-06-11) — REQUIRED-FIELD CARD per Mark's directive: every
+ * classified card now renders Market and Src (LP Source > Subsource)
+ * lines — "Unknown" when unresolvable, consistent with the
+ * Prospect: NONE absence-is-signal doctrine — plus optional Reason
+ * (loss-reason:* tag, humanized), 📅 appointment (date AND time,
+ * always together), and 📐 Estimate (calculator measurements) lines.
+ * New buildClassifiedNotification args: market, lpSource,
+ * lpSourceDetail, lossReason, appointmentDisplay, calcSummary.
+ * All optional — existing callers render unchanged minus the two new
+ * always-on lines.
+ *
  * v1.0 (2026-05-14) — Canonical 4-class notification taxonomy per
  * Reece_GroupMe_Notification_Standard_v1.md.
- *
- * Solves taxonomy drift across emitters: every GroupMe notification now
- * resolves to exactly one of four classes, each with a fixed header,
- * emoji, and tone. Debug language (step numbers, "buggy fallthrough",
- * UUID workflow IDs) is auto-stripped at the formatter layer so legacy
- * rules can't leak it into rep-facing channels.
  *
  * The four classes:
  *   system        🤖 SYSTEM EVENT          — machine-state transitions
@@ -29,11 +34,10 @@
  *   is set, the message is sent to the dev bot via sendToDevChannel
  *   (bypasses the rep-facing groupme.js entirely). When GROUPME_DEV_BOT_ID
  *   is unset, the message is console-logged only — never sent to the
- *   rep channel. This is the safer default until a dedicated dev GroupMe
- *   group is provisioned.
+ *   rep channel.
  */
 
-import { formatPhone } from '../format-helpers.js';
+import { formatPhone, formatLpSource } from '../format-helpers.js';
 
 // ══════════════════════════════════════════════════════════════════════
 // CLASS DEFINITIONS
@@ -121,11 +125,6 @@ export function validateNotification(text) {
 
 // ══════════════════════════════════════════════════════════════════════
 // AUTO-CLASSIFICATION (legacy rules without explicit class)
-//
-// Falls back to inferring the class from the rule_key and message text
-// when notification_class is not set. Lets us run the new format on
-// legacy rules without per-rule migration, while still being correct
-// most of the time.
 // ══════════════════════════════════════════════════════════════════════
 
 const DEBUG_KEYS    = /^(DEBUG_|DRIFT_|SYNC_FAIL|SCHEMA_)/i;
@@ -149,7 +148,7 @@ export function inferClassification(ruleKey = '', message = '') {
 // ══════════════════════════════════════════════════════════════════════
 
 /**
- * Build a classified notification card per the v1.0 standard.
+ * Build a classified notification card per the v1.1 standard.
  *
  * @param {object} args
  * @param {'system'|'priority'|'intelligence'|'debug'} args.notification_class
@@ -158,6 +157,12 @@ export function inferClassification(ruleKey = '', message = '') {
  * @param {string} args.phone         — raw phone (formatted internally)
  * @param {string} args.contactId     — GHL contact ID
  * @param {string} [args.prospectId]  — LP prospect ID; renders "NONE" if absent
+ * @param {string} [args.market]      — v1.1: market name; renders "Unknown" if absent
+ * @param {string} [args.lpSource]    — v1.1: LP Source (parent channel)
+ * @param {string} [args.lpSourceDetail] — v1.1: LP Subsource
+ * @param {string} [args.lossReason]  — v1.1: humanized loss reason; renders 🚫 line when present
+ * @param {string} [args.appointmentDisplay] — v1.1: pre-formatted "MM/DD/YYYY at h:mm AM" string; renders 📅 line when present
+ * @param {string} [args.calcSummary] — v1.1: e.g. "7 windows · est. $18,585"; renders 📐 line when present
  * @param {'Cold'|'Warm'|'Hot'|'Imminent'} [args.tier]
  * @param {string} [args.status]      — short status descriptor
  * @param {string} args.narrative     — 1-2 sentence doctrinal explanation
@@ -174,6 +179,12 @@ export function buildClassifiedNotification(args = {}) {
     phone,
     contactId,
     prospectId,
+    market,
+    lpSource,
+    lpSourceDetail,
+    lossReason,
+    appointmentDisplay,
+    calcSummary,
     tier,
     status,
     narrative,
@@ -208,10 +219,32 @@ export function buildClassifiedNotification(args = {}) {
     ? String(prospectId)
     : 'NONE';
   lines.push(`Prospect: ${prospectClean}`);
+
+  // v1.1 — Market and Src are required fields on every card. "Unknown"
+  // when unresolvable — absence is signal, same doctrine as Prospect.
+  lines.push(`🌍 Market: ${market || 'Unknown'}`);
+  lines.push(`📋 Src: ${formatLpSource(lpSource, lpSourceDetail) || 'Unknown'}`);
   lines.push('');
 
   lines.push(`📊 Tier: ${cleanTier}`);
   lines.push(`📌 Status: ${cleanStat}`);
+
+  // v1.1 — loss reason: the WHY behind DISQUALIFIED / loss closeouts.
+  if (lossReason) {
+    lines.push(`🚫 Reason: ${lossReason}`);
+  }
+
+  // v1.1 — appointment context: pre-formatted date+time (callers must
+  // pass a combined string; never time-only).
+  if (appointmentDisplay) {
+    lines.push(`📅 ${appointmentDisplay}`);
+  }
+
+  // v1.1 — calculator measurements (completion notifications).
+  if (calcSummary) {
+    lines.push(`📐 Estimate: ${calcSummary}`);
+  }
+
   lines.push('');
 
   // Class 2 may add "⏰ Act within" before the narrative
