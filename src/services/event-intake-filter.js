@@ -75,6 +75,14 @@
  *   its trigger. The workflow_completed path only fired 2x/14d vs 25
  *   actual completions; the tag webhook arrives reliably (58 events in
  *   system_events_filtered) but was being dropped here.
+ *
+ * 2026-06-11 — S2.2 no-email exhaustion cooling:
+ *   added 's2.2-exhausted-no-email' so S2_2_NO_EMAIL_EXHAUST_TO_COOLING
+ *   receives its trigger. S2.2 v2's no-email track applies this tag at
+ *   completion — structurally silent leads only, since repliers exit
+ *   earlier into agentic custody. The consuming rule enrolls I.COOL-3M
+ *   so P1 Stage 12 Long-Term Hold gets a deterministic re-emit for the
+ *   email-capture-focused S1.x cycle.
  */
 
 import supabase from '../supabase.js';
@@ -195,6 +203,13 @@ const ALLOWED_TAG_ADDED_SUBTYPES = new Set([
   // workflow fired 2x/14d vs 25 real completions; this tag arrives every
   // time but was being dropped here (58 events in system_events_filtered).
   'estimator-completed',            // rule ESTIMATE_CALC_COMPLETED_TAG
+
+  // ── S2.2 NO-EMAIL EXHAUSTION (2026-06-11) ──
+  // Applied by S2.2 v2's no-email completion sequence. Structurally
+  // silent leads only — repliers exit earlier into agentic custody.
+  // Consumer enrolls I.COOL-3M so Long-Term Hold has a deterministic
+  // re-emit for the email-capture S1.x cycle.
+  's2.2-exhausted-no-email',        // rule S2_2_NO_EMAIL_EXHAUST_TO_COOLING
 ]);
 
 /**
