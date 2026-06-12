@@ -127,7 +127,7 @@ import { validateAction } from '../services/validation-gate.js';
 // ─── Handlers ──────────────────────────────────────────────────────
 import { executeAddTag, executeRemoveTag, executeSetStage } from './handlers/tags.js';
 import { executeMoveOpportunity, executeUpdateOpportunity } from './handlers/opportunities.js';
-import { executeAddToWorkflow, executeRemoveFromWorkflow } from './handlers/workflows.js';
+import { executeAddToWorkflow, executeRemoveFromWorkflow, executeIssueHold } from './handlers/workflows.js';
 import { executeBookAppointment, executeCancelAppointment, executeRescheduleAppointment, executeUpdateAppointmentStatus } from './handlers/appointments.js';
 import { executeSetLPAppointment } from './handlers/lp-appointment.js';
 import { executeCreateLPLead } from './handlers/lp-lead.js';
@@ -322,6 +322,7 @@ const ACTION_HANDLERS = {
   update_opportunity: executeUpdateOpportunity,
   remove_from_workflow: executeRemoveFromWorkflow,
   add_to_workflow: executeAddToWorkflow,
+  issue_hold: executeIssueHold,                  // 2026-06-12 — universal Dynamic Hold issuer (+ brain-side serialization)
   book_appointment: executeBookAppointment,
   cancel_appointment: executeCancelAppointment,
   reschedule_appointment: executeRescheduleAppointment, // v2.7.8 — agentic reschedule (cancel old + book new)

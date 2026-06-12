@@ -115,6 +115,10 @@ const ALLOWED_EVENT_TYPES = new Set([
   'intent.stall_detected',         // 1 rule
   'agentic.handoff_started',       // 1 rule
   'agentic.handoff_ended',         // 1 rule
+  'agentic.hold_completed',        // 2026-06-12 — Dynamic Hold timeout routing
+                                   // (S13_BOOKING_PUSH_TIMEOUT_REISSUE / _TO_S22).
+                                   // agentic.hold_error is NOT listed — its intake
+                                   // emits with bypass_filter (observability only).
 
   // Quiet but rule-watched (must not drop)
   'ghl.lead_score_changed',        // 4 rules (W11_1_*)
