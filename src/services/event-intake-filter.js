@@ -83,6 +83,16 @@
  *   earlier into agentic custody. The consuming rule enrolls I.COOL-3M
  *   so P1 Stage 12 Long-Term Hold gets a deterministic re-emit for the
  *   email-capture-focused S1.x cycle.
+ *
+ * 2026-06-12 — S2.2 guide-offer enrollment producer:
+ *   added 'enroll:s2.2-chatbot' so ENROLL_S2_2_FROM_CHATBOT_NO_BOOK
+ *   receives its trigger. The responder's v2.7.11 guide-offer disposition
+ *   applies this tag on both guide accept and decline (booking-failure
+ *   exit); the consuming rule performs the actual S2.2 enrollment via
+ *   inbound webhook 72712021, suppression-gated and deduped via
+ *   active-s2.2. Without this entry the tag_added event was dropped at
+ *   intake and engaged-but-unbooked leads received the guide and then
+ *   sat unrouted — same failure mode as estimator-completed.
  */
 
 import supabase from '../supabase.js';
@@ -214,6 +224,15 @@ const ALLOWED_TAG_ADDED_SUBTYPES = new Set([
   // Consumer enrolls I.COOL-3M so Long-Term Hold has a deterministic
   // re-emit for the email-capture S1.x cycle.
   's2.2-exhausted-no-email',        // rule S2_2_NO_EMAIL_EXHAUST_TO_COOLING
+
+  // ── S2.2 GUIDE-OFFER ENROLLMENT PRODUCER (2026-06-12) ──
+  // Applied by the responder's v2.7.11 guide-offer disposition on both
+  // guide accept and decline (booking-failure exit). Consumer rule
+  // ENROLL_S2_2_FROM_CHATBOT_NO_BOOK performs the S2.2 enrollment via
+  // inbound webhook 72712021 (suppression-gated, deduped via active-s2.2)
+  // and consumes the tag. Without this entry the event was dropped at
+  // intake and engaged-but-unbooked leads received the guide, then sat.
+  'enroll:s2.2-chatbot',            // rule ENROLL_S2_2_FROM_CHATBOT_NO_BOOK
 ]);
 
 /**
