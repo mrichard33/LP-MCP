@@ -157,6 +157,23 @@ import { ghlFetch } from '../helpers.js';
 import { REMOVE_ALL_MARKETING_WF } from '../constants.js';
 import { resolveWorkflowIdByCanonicalCode } from '../../tools/admin/hl-fallback.js';
 
+// ── Universal Dynamic Hold (2026-06-12) ────────────────────────────────
+// One GHL "dumb clock" workflow (dfd3ffaa) parks a contact for hold_hours and
+// POSTs /api/agentic/hold-complete on expiry; the brain decides what happens
+// next via agentic.hold_completed rules. issue_hold is the action that starts
+// the clock. The trigger id is the workflow's inbound-webhook trigger (verify
+// against the live workflow before enabling); overridable via env.
+const GHL_HOOK_BASE = 'https://services.leadconnectorhq.com/hooks';
+const HOLD_TRIGGER_ID = process.env.AGENTIC_HOLD_TRIGGER_ID || '4ec11a08-acaa-4159-8576-6ab63cc3a788';
+// Brain-side serialization: default ON — one active hold per contact. Set
+// 'false' only if GHL-side serialization is proven sufficient (concurrency test).
+const HOLD_SERIALIZATION_ENABLED = process.env.HOLD_SERIALIZATION_ENABLED !== 'false';
+const DEFAULT_HOLD_HOURS = 72;
+// Slack past hold_hours after which an un-completed hold is treated as dead and
+// serialization releases — otherwise a lost completion (workflow unpublished,
+// contact deleted/merged, GHL hiccup) would lock the contact out of holds forever.
+const HOLD_TTL_SLACK_HOURS = 24;
+
 /**
  * Encode a flat-ish object as application/x-www-form-urlencoded.
  * Null/undefined values are dropped. Nested objects/arrays are
@@ -183,7 +200,7 @@ function buildFormBody(payload) {
  * proven conversation-fetch pattern in decision-engine.js countThreadTurns
  * (Conversations API version 2021-04-15).
  */
-async function getLastInboundMessageMs(contactId) {
+export async function getLastInboundMessageMs(contactId) {
   const GHL_API_KEY = process.env.GHL_API_KEY;
   if (!GHL_API_KEY || !contactId) return NaN;
   const locationId = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
@@ -488,6 +505,128 @@ export async function executeAddToWorkflow(action) {
     route: 'A',
     resolved_via: resolvedVia,
     post_success_action_queued: !!postSuccessAction,
+  };
+}
+
+/**
+ * Returns true if the contact already has an OPEN Dynamic Hold — a prior
+ * issue_hold action whose hold has neither completed nor aged past its TTL.
+ *
+ * "Open" = the latest non-skipped issue_hold for the contact (excluding the
+ * action currently executing) with:
+ *   - no agentic.hold_completed system_event for the contact AFTER it was issued, AND
+ *   - issued less than (hold_hours + HOLD_TTL_SLACK_HOURS) ago.
+ * An overdue completion means the GHL clock is dead, so the hold is released and
+ * a fresh one is allowed. Fail-open on query error (don't block a legitimate hold).
+ */
+async function hasActiveHold(contactId, currentActionId) {
+  try {
+    const { data: last } = await supabase
+      .from('agent_actions')
+      .select('id, action_payload, executed_at, created_at')
+      .eq('action_type', 'issue_hold')
+      .eq('target_id', contactId)
+      .in('status', ['pending', 'executing', 'completed'])
+      .neq('id', currentActionId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (!last) return false;
+
+    const issuedMs = Date.parse(last.executed_at || last.created_at);
+    if (!Number.isFinite(issuedMs)) return false;
+
+    const holdHours = Number(last.action_payload?.hold_hours) || DEFAULT_HOLD_HOURS;
+    const ttlMs = (holdHours + HOLD_TTL_SLACK_HOURS) * 3_600_000;
+    if (Date.now() - issuedMs > ttlMs) {
+      console.log(`[IssueHold] prior hold (action ${last.id}) past TTL — releasing serialization for ${contactId}`);
+      return false; // dead clock → allow a fresh hold
+    }
+
+    const { data: completion } = await supabase
+      .from('system_events')
+      .select('id')
+      .eq('event_type', 'agentic.hold_completed')
+      .eq('ghl_contact_id', contactId)
+      .gt('event_timestamp', new Date(issuedMs).toISOString())
+      .limit(1)
+      .maybeSingle();
+    if (completion) return false; // already completed → not active
+
+    return true; // open hold within TTL, no completion → active
+  } catch (err) {
+    console.warn(`[IssueHold] hasActiveHold query failed for ${contactId} (fail-open): ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * issue_hold — start the universal Dynamic Hold clock for a contact.
+ *
+ * POSTs to the Dynamic Hold inbound-webhook trigger with a JSON payload carrying
+ * the hold's purpose; on expiry GHL POSTs /api/agentic/hold-complete and the
+ * brain routes via agentic.hold_completed rules.
+ *
+ * action.action_payload (from the rule's `params`):
+ *   hold_hours    — number  (default 72)
+ *   return_to     — string  (logical label the completion rule matches on)
+ *   hold_reason   — string  (passthrough, logging)
+ *   workflow_code — string  (passthrough, logging)
+ *
+ * Brain-side serialization (HOLD_SERIALIZATION_ENABLED, default ON): if the
+ * contact already has an open hold, reject-and-log the duplicate instead of
+ * stacking a second clock. This closes the double-fire path (e.g. Lane 3 firing
+ * twice on two quick inbound replies → two 72h holds → two timeout evaluations).
+ */
+export async function executeIssueHold(action) {
+  const contactId = action.target_id;
+  if (!contactId) throw new Error('issue_hold: missing contactId');
+
+  const p = action.action_payload || {};
+  const holdHours = Number(p.hold_hours) || DEFAULT_HOLD_HOURS;
+  const returnTo = p.return_to || null;
+  const holdReason = p.hold_reason || null;
+  const workflowCode = p.workflow_code || null;
+
+  // Serialization gate
+  if (HOLD_SERIALIZATION_ENABLED && await hasActiveHold(contactId, action.id)) {
+    console.warn(`[IssueHold] serialized: contact ${contactId} already holding — duplicate rejected (return_to=${returnTo}, wf=${workflowCode})`);
+    return {
+      action: 'issue_hold_skipped_serialized',
+      contact_id: contactId,
+      return_to: returnTo,
+      reason: 'active_hold_exists',
+    };
+  }
+
+  const url = `${GHL_HOOK_BASE}/${process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca'}/webhook-trigger/${HOLD_TRIGGER_ID}`;
+  const body = JSON.stringify({
+    contact_id: contactId,
+    hold_hours: holdHours,
+    return_to: returnTo,
+    hold_reason: holdReason,
+    workflow_code: workflowCode,
+  });
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    body,
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`issue_hold POST → ${res.status}: ${text.slice(0, 200)}`);
+  }
+  console.log(`[IssueHold] ✅ contact ${contactId} held ${holdHours}h return_to=${returnTo} wf=${workflowCode || '?'} reason="${holdReason || ''}"`);
+
+  return {
+    action: 'hold_issued',
+    contact_id: contactId,
+    hold_hours: holdHours,
+    return_to: returnTo,
+    hold_reason: holdReason,
+    workflow_code: workflowCode,
   };
 }
 

@@ -167,6 +167,16 @@ import { tryClaimEvent, recordResult } from './services/idempotency.js';
 // escalation/objection/callback rules can opt out while a booking is in flight.
 import { hasActiveInHomeAppointment } from './services/layer3-dispatch.js';
 
+// Universal Hold timeout routing (2026-06-12). Two booking-push-timeout gates for
+// the S1.3 → S2.2 path, sharing the live GHL helpers already used elsewhere:
+//   - no_future_appointment    → fetchUpcomingAppointments (future-only, fail-open)
+//   - no_inbound_within_hours  → getLastInboundMessageMs (fail-OPEN)
+//   - inbound_within_hours     → getLastInboundMessageMs (fail-CLOSED — its inverse;
+//     the asymmetry guarantees at most one of the two timeout rules fires when the
+//     message layer is down. See sql/seeds/2026-06-12_s13_booking_push_timeout_hold.sql).
+import { fetchUpcomingAppointments } from './knowledge/contact-appointments.js';
+import { getLastInboundMessageMs } from './actions/handlers/workflows.js';
+
 // ═══════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════
@@ -745,6 +755,56 @@ async function evaluateContextConditions(conditions, intelligence, event) {
           }
         }
         break;
+      }
+
+      // ── Universal Hold timeout gates (2026-06-12) ──────────────────
+      // no_future_appointment: block the rule if the contact has any active
+      // future appointment. Fail-open: a null lookup (GHL error) does not block.
+      case 'no_future_appointment': {
+        if (!expected) break; // only gate when set truthy
+        const appts = await fetchUpcomingAppointments(event.ghl_contact_id);
+        if (appts && appts.length > 0) {
+          console.log(`[Context] BLOCKED: no_future_appointment — contact ${event.ghl_contact_id} has ${appts.length} upcoming`);
+          return false;
+        }
+        break; // appts === null (unknown) or [] (none) → pass
+      }
+
+      // no_inbound_within_hours: N — block if an inbound message landed within
+      // the last N hours (conversation is alive). Fail-OPEN: unknown (NaN) ⇒ pass,
+      // so a dead message layer can never block the progress branch (→ S2.2).
+      case 'no_inbound_within_hours': {
+        const hours = Number(expected);
+        if (!Number.isFinite(hours) || hours <= 0) break;
+        const lastMs = await getLastInboundMessageMs(event.ghl_contact_id);
+        if (Number.isFinite(lastMs)) {
+          const hoursSince = (Date.now() - lastMs) / 3_600_000;
+          if (hoursSince < hours) {
+            console.log(`[Context] BLOCKED: no_inbound_within_hours — inbound ${hoursSince.toFixed(1)}h ago < ${hours}h`);
+            return false;
+          }
+        }
+        break; // no inbound, or unknown → pass (fail-open)
+      }
+
+      // inbound_within_hours: N — inverse of the above (conversation alive). Block
+      // UNLESS an inbound landed within the last N hours. Fail-CLOSED: unknown (NaN)
+      // ⇒ block, so a dead message layer can never fire the re-hold branch alongside
+      // the progress branch (exactly one timeout rule wins under failure).
+      case 'inbound_within_hours': {
+        const hours = Number(expected);
+        if (!Number.isFinite(hours) || hours <= 0) break;
+        const lastMs = await getLastInboundMessageMs(event.ghl_contact_id);
+        if (!Number.isFinite(lastMs)) {
+          console.log(`[Context] BLOCKED: inbound_within_hours — inbound age unknown (fail-closed)`);
+          return false;
+        }
+        const hoursSince = (Date.now() - lastMs) / 3_600_000;
+        if (hoursSince >= hours) {
+          console.log(`[Context] BLOCKED: inbound_within_hours — last inbound ${hoursSince.toFixed(1)}h ago ≥ ${hours}h`);
+          return false;
+        }
+        break; // inbound within N hours → pass
       }
 
       default: console.warn(`[DecisionEngine] Unknown context condition: ${key}`);

@@ -1,64 +1,55 @@
 /**
- * Hold-Complete — src/agentic/hold-complete.js
+ * Hold-Complete / Hold-Error — src/agentic/hold-complete.js
  *
- * Generic "return from hold" endpoint. The GHL Hold/Cooldown workflow
- * (inbound trigger 4ec11a08-acaa-4159-8576-6ab63cc3a788) parks a contact
- * for a dynamic number of hours (field MZkFWOFDzf8OKTy2O4od), then — once
- * the wait expires — POSTs here so the agentic system can re-enter the
- * contact into whatever workflow parked it.
+ * Intake for the universal "Agentic Dynamic Hold" GHL workflow (dfd3ffaa,
+ * inbound trigger 4ec11a08-acaa-4159-8576-6ab63cc3a788, hold-hours field
+ * MZkFWOFDzf8OKTy2O4od). The Dynamic Hold is the one "dumb clock": it parks a
+ * contact for a dynamic number of hours, then POSTs here on expiry (or to
+ * /api/agentic/hold-error if its Find-Contact step fails).
  *
- * WHY THIS EXISTS
- * ───────────────
- * Before this, an agentic suppression that needed to DEFER rather than
- * stop (e.g. S1.1 recent_reply: a live human conversation is in progress)
- * had no path back. The contact dead-waited the source workflow's
- * send-ready gate to its 24h timeout and fired a false "stuck" alert.
- * Now the source workflow hands the contact to the Hold pen with a
- * cooldown + a return target, the pen waits, and this endpoint re-fires
- * the return target so the rotation resumes exactly where it left off.
+ * ARCHITECTURE (2026-06-12)
+ * ─────────────────────────
+ * The hold pen carries no judgment — purpose travels in the payload (return_to,
+ * hold_reason, workflow_code). On completion this endpoint emits an
+ * `agentic.hold_completed` system_event and the Decision Engine decides what
+ * happens next via rules keyed on event_subtype = return_to (the first consumer
+ * is the S1.3 booking-push timeout → S2.2 path). This replaces the never-fully-
+ * wired I.COOL cooling stack as the single timeout substrate.
  *
- * MULTIPURPOSE CONTRACT
- * ─────────────────────
- *   POST /api/agentic/hold-complete
- *   Authorization: Bearer <MESSAGE_ENGINE_TOKEN>   (same token the nurture
- *                                                    generate route checks)
- *   body: {
- *     contact_id:        string  (required) — GHL contact id (match key).
- *     return_to:         string  (required) — the GHL inbound-webhook
- *                                  TRIGGER ID of the workflow to re-enter
- *                                  (S1.1 = VweqELA9NqpYiD2r8qPf). The pen is
- *                                  workflow-agnostic; the source workflow
- *                                  supplies its own trigger id, so no
- *                                  per-workflow code lives here.
- *     sequence_position?: string|number — passthrough. Most workflows
- *                                  (S1.1) re-read position from their own
- *                                  dedicated field on re-entry, so optional.
- *     workflow_code?:    string  — passthrough, logging only.
- *     hold_reason?:      string  — passthrough, logging only.
- *   }
+ * BACK-COMPAT RE-FIRE (S1.1 v2 suppression-hold loop)
+ * ───────────────────────────────────────────────────
+ * The original v1.0 behavior was a fire-and-forget re-POST to the source
+ * workflow's GHL inbound-webhook trigger (S1.1 sends return_to = its real
+ * trigger id and re-reads sequence_position on re-entry). That path is still
+ * live, so we KEEP it — but only when the caller opts in:
+ *   - body.refire === true                          → always re-fire
+ *   - body.refire === false                         → never re-fire (event only)
+ *   - otherwise: re-fire iff return_to is shaped like a real GHL trigger id
+ *     (UUID / ~20-char token, NO underscores). Our logical return_to labels are
+ *     snake_case (e.g. "booking_push_timeout_s13") → never re-fired, event only.
+ * The event is ALWAYS emitted regardless of the re-fire decision.
  *
- * Always returns HTTP 200 (a GHL outbound webhook treats a non-200 as a
- * failure to retry; we never want a retry storm). Failures are reported in
- * the body as { ok:false, error }.
+ * Auth: Bearer <MESSAGE_ENGINE_TOKEN> (same token the nurture generate route
+ * checks). Always returns HTTP 200 (a GHL outbound webhook treats non-200 as a
+ * failure to retry; we never want a retry storm). Failures are reported in the
+ * body as { ok:false, error }.
  *
- * Re-entry is a fire-and-forget POST to the GHL inbound webhook for
- * return_to. GHL inbound-webhook triggers are UNAUTHENTICATED, so no
- * Authorization header is sent on the re-fire (matches the live test that
- * returned 200 with no auth).
- *
- * v1.0 — 2026-06-04. Initial. Built alongside the S1.1 v2 suppression-hold
- *   loop (nurture-orchestrator HOLDABLE_INTERRUPTS dispatch +
- *   nurture-writeback writeSuppressionHold).
+ * v2.0 — 2026-06-12. Event-emit model + hold-error route. Re-fire retained,
+ *   gated, for the S1.1 loop. (v1.0 — 2026-06-04, re-fire only.)
  */
+
+import { emitEvent } from '../event-emitter.js';
+import { sendGroupMeMessage } from '../groupme.js';
 
 const GHL_HOOK_BASE = 'https://services.leadconnectorhq.com/hooks';
 const GHL_LOC_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
 
-// A GHL inbound-webhook trigger id is a ~20-char url-safe token. This is a
-// permissive shape check only — to reject obvious garbage (empty / spaces)
-// so we never POST a malformed URL — NOT a strict length assertion.
+// A GHL inbound-webhook trigger id is a UUID or a ~20-char url-safe token.
+// Crucially it has NO underscores — our logical return_to labels are snake_case
+// (e.g. "booking_push_timeout_s13"), so the underscore is the discriminator
+// between "re-fire this trigger" (S1.1 legacy) and "event-only" (new model).
 function looksLikeTriggerId(s) {
-  return typeof s === 'string' && /^[A-Za-z0-9_-]{8,40}$/.test(s.trim());
+  return typeof s === 'string' && /^[A-Za-z0-9-]{8,40}$/.test(s.trim());
 }
 
 async function refireTrigger(triggerId, payload) {
@@ -73,18 +64,24 @@ async function refireTrigger(triggerId, payload) {
   return { ok: res.ok, status: res.status, body: text.slice(0, 200), url };
 }
 
+// Shared bearer check. Returns true if authorized (or no token configured, to
+// match the nurture generate route's behavior). Responds with 200 + error body
+// on mismatch so a GHL outbound webhook never enters a retry loop.
+function checkBearer(req, res) {
+  const token = process.env.MESSAGE_ENGINE_TOKEN;
+  if (!token) return true;
+  const auth = req.headers.authorization || '';
+  const provided = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (provided !== token) {
+    res.status(200).json({ ok: false, error: 'unauthorized' });
+    return false;
+  }
+  return true;
+}
+
 export function registerHoldCompleteRoutes(app) {
   app.post('/api/agentic/hold-complete', async (req, res) => {
-    // Auth — mirror the nurture generate route exactly (200 + error body,
-    // never a 4xx, so a GHL outbound webhook doesn't enter a retry loop).
-    const token = process.env.MESSAGE_ENGINE_TOKEN;
-    if (token) {
-      const auth = req.headers.authorization || '';
-      const provided = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-      if (provided !== token) {
-        return res.status(200).json({ ok: false, error: 'unauthorized' });
-      }
-    }
+    if (!checkBearer(req, res)) return;
 
     const body = req.body || {};
     const contactId = body.contact_id;
@@ -93,44 +90,129 @@ export function registerHoldCompleteRoutes(app) {
     if (!contactId || typeof contactId !== 'string') {
       return res.status(200).json({ ok: false, error: 'contact_id required' });
     }
-    if (!looksLikeTriggerId(returnTo)) {
-      console.warn(`[HoldComplete] bad return_to for contact=${contactId}: "${body.return_to}"`);
-      return res.status(200).json({ ok: false, error: 'return_to must be a GHL inbound-webhook trigger id' });
+    if (!returnTo) {
+      console.warn(`[HoldComplete] missing return_to for contact=${contactId}`);
+      return res.status(200).json({ ok: false, error: 'return_to required' });
     }
 
-    // Re-entry payload mirrors the shape a source workflow's inbound trigger
-    // + Fire-Self step use: contact_id is the match key; the rest is context
-    // the workflow either re-reads from its own fields (S1.1 reads its
-    // dedicated sequence-position field) or just logs.
-    const refirePayload = {
-      contact_id: contactId,
-      enrollment_reason: 'hold_complete',
-      returned_from_hold: true,
-    };
-    if (body.sequence_position !== undefined && body.sequence_position !== null && body.sequence_position !== '') {
-      refirePayload.sequence_position = body.sequence_position;
-    }
-    if (body.workflow_code) refirePayload.workflow_code = body.workflow_code;
+    const completedAt = body.completed_at || new Date().toISOString();
+    const holdHours = body.hold_hours !== undefined && body.hold_hours !== null && body.hold_hours !== ''
+      ? Number(body.hold_hours) : null;
 
-    let result;
-    try {
-      result = await refireTrigger(returnTo, refirePayload);
-    } catch (err) {
-      console.error(`[HoldComplete] re-fire threw contact=${contactId} return_to=${returnTo}: ${err.message}`);
-      return res.status(200).json({ ok: false, error: `refire_failed: ${err.message}` });
+    // ── Always emit for the Decision Engine ───────────────────────────
+    // event_subtype = return_to so completion rules match on event_pattern
+    // (no payload-equality verb needed). agentic.hold_completed is allowlisted
+    // in services/event-intake-filter.js.
+    await emitEvent({
+      event_type: 'agentic.hold_completed',
+      event_subtype: returnTo,
+      source: 'ghl_dynamic_hold',
+      entity_type: 'contact',
+      entity_id: contactId,
+      ghl_contact_id: contactId,
+      payload: {
+        contact_id: contactId,
+        return_to: returnTo,
+        hold_hours: holdHours,
+        hold_reason: body.hold_reason || null,
+        workflow_code: body.workflow_code || null,
+        completed_at: completedAt,
+      },
+      priority: 'normal',
+      idempotency_key: `hold_complete_${contactId}_${returnTo}_${completedAt}`,
+    });
+
+    // ── Back-compat re-fire (gated) ───────────────────────────────────
+    const explicitRefire = body.refire === true;
+    const explicitNoRefire = body.refire === false;
+    const shouldRefire = !explicitNoRefire && (explicitRefire || looksLikeTriggerId(returnTo));
+
+    let refire = null;
+    if (shouldRefire) {
+      const refirePayload = {
+        contact_id: contactId,
+        enrollment_reason: 'hold_complete',
+        returned_from_hold: true,
+      };
+      if (body.sequence_position !== undefined && body.sequence_position !== null && body.sequence_position !== '') {
+        refirePayload.sequence_position = body.sequence_position;
+      }
+      if (body.workflow_code) refirePayload.workflow_code = body.workflow_code;
+      try {
+        refire = await refireTrigger(returnTo, refirePayload);
+      } catch (err) {
+        console.error(`[HoldComplete] re-fire threw contact=${contactId} return_to=${returnTo}: ${err.message}`);
+        refire = { ok: false, status: 0, error: err.message };
+      }
     }
 
-    console.log(`[HoldComplete] contact=${contactId} re-fired return_to=${returnTo} ` +
-      `wf=${body.workflow_code || '?'} pos=${body.sequence_position ?? '?'} reason="${body.hold_reason || ''}" ` +
-      `-> ${result.status} ok=${result.ok}`);
+    console.log(`[HoldComplete] contact=${contactId} return_to=${returnTo} ` +
+      `wf=${body.workflow_code || '?'} reason="${body.hold_reason || ''}" ` +
+      `emitted=agentic.hold_completed refired=${shouldRefire ? (refire?.status ?? 'err') : 'no'}`);
 
     return res.status(200).json({
-      ok: result.ok,
+      ok: true,
       contact_id: contactId,
       return_to: returnTo,
-      refire_status: result.status,
+      emitted: 'agentic.hold_completed',
+      refired: shouldRefire,
+      refire_status: refire?.status ?? null,
     });
   });
 
-  console.log('[REST API] Registered: POST /api/agentic/hold-complete (hold-complete v1.0)');
+  // ── Hold-error: the Dynamic Hold's Find-Contact step failed ──────────
+  // Same shape as cooling/error: emit an observability event (bypass the intake
+  // filter — no rule consumer yet) and fire a Class 1 SYSTEM EVENT notification.
+  app.post('/api/agentic/hold-error', async (req, res) => {
+    if (!checkBearer(req, res)) return;
+
+    const body = req.body || {};
+    const contactId = body.contact_id;
+    const returnTo = typeof body.return_to === 'string' ? body.return_to.trim() : '';
+    const completedAt = body.completed_at || new Date().toISOString();
+    const failureReason = body.hold_error || body.error || 'contact_not_found_in_ghl';
+
+    if (!contactId || typeof contactId !== 'string') {
+      return res.status(200).json({ ok: false, error: 'contact_id required' });
+    }
+
+    await emitEvent({
+      event_type: 'agentic.hold_error',
+      event_subtype: returnTo || 'unknown',
+      source: 'ghl_dynamic_hold',
+      entity_type: 'contact',
+      entity_id: contactId,
+      ghl_contact_id: contactId,
+      payload: {
+        contact_id: contactId,
+        return_to: returnTo || null,
+        hold_hours: body.hold_hours ?? null,
+        hold_reason: body.hold_reason || null,
+        workflow_code: body.workflow_code || null,
+        failure_reason: failureReason,
+        completed_at: completedAt,
+      },
+      priority: 'high',
+      idempotency_key: `hold_error_${contactId}_${returnTo}_${completedAt}`,
+      bypass_filter: true, // observability only — no rule consumes hold_error yet
+    });
+
+    // Class 1 (🤖 SYSTEM EVENT) notification per docs/notification-standard-v1.md
+    try {
+      await sendGroupMeMessage(
+        `🤖 SYSTEM EVENT — HOLD ERROR\n` +
+        `Dynamic Hold could not resume contact_id=${contactId} ` +
+        `(return_to=${returnTo || '?'}, wf=${body.workflow_code || '?'}). ` +
+        `Reason: ${failureReason}. The hold clock did not return the contact to the brain — ` +
+        `the timeout routing for this contact will not fire.`
+      );
+    } catch (err) {
+      console.warn(`[HoldError] GroupMe alert failed: ${err.message}`);
+    }
+
+    console.log(`[HoldError] contact=${contactId} return_to=${returnTo || '?'} reason=${failureReason} — emitted agentic.hold_error + Class 1 notify`);
+    return res.status(200).json({ ok: true, contact_id: contactId, emitted: 'agentic.hold_error' });
+  });
+
+  console.log('[REST API] Registered: POST /api/agentic/hold-complete, POST /api/agentic/hold-error (hold v2.0)');
 }
