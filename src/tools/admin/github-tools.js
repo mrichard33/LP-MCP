@@ -1,6 +1,6 @@
 // ─── GitHub Admin MCP Tools (Tools 23–29) ────────────────────────
 import { z } from 'zod';
-import { ghRequest, ghSearchCode, getDashboardRepo, getHlRepo } from '../../admin/github-client.js';
+import { ghRequest, ghSearchCode, getDashboardRepo, getHlRepo, getN8nRepo } from '../../admin/github-client.js';
 
 export function registerGitHubTools(server) {
 
@@ -600,6 +600,252 @@ export function registerGitHubTools(server) {
       }));
       return {
         content: [{ type: 'text', text: JSON.stringify({ repo: getHlRepo(), branches, count: branches.length }, null, 2) }],
+      };
+    }
+  );
+
+  // ─── n8n Cross-Repo Tools (read + write) ────────────────────────
+  // Self-hosted n8n deployment repo (mrichard33/n8n on Railway). Uses the
+  // same GITHUB_PAT. NOTE: n8n WORKFLOWS live in n8n's Postgres DB, not in
+  // this repo — the repo holds the Railway deployment (Dockerfile/config)
+  // plus anything explicitly committed. WARNING: committing to main may
+  // redeploy/restart the live n8n instance, interrupting running workflows.
+
+  // n8n_github_list_files [READ]
+  server.tool(
+    'n8n_github_list_files',
+    'CROSS-REPO: List files/directories at a path in the self-hosted n8n repo (mrichard33/n8n).',
+    {
+      path: z.string().optional().describe('Directory path (default: root)'),
+      branch: z.string().optional().describe('Branch name (default: "main")'),
+    },
+    async ({ path, branch }) => {
+      const dirPath = path || '';
+      const ref = branch || 'main';
+      const data = await ghRequest('GET', `/contents/${dirPath}?ref=${ref}`, null, getN8nRepo());
+      const files = Array.isArray(data)
+        ? data.map(f => ({ name: f.name, type: f.type, size: f.size, path: f.path }))
+        : [{ name: data.name, type: data.type, size: data.size, path: data.path }];
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ repo: getN8nRepo(), path: dirPath, branch: ref, files }, null, 2) }],
+      };
+    }
+  );
+
+  // n8n_github_get_file [READ]
+  server.tool(
+    'n8n_github_get_file',
+    'CROSS-REPO: Read full content of a file from the self-hosted n8n repo. Returns content + sha (needed for edits).',
+    {
+      path: z.string().describe('File path. Example: "Dockerfile"'),
+      branch: z.string().optional().describe('Branch name (default: "main")'),
+    },
+    async ({ path, branch }) => {
+      if (!path) return { content: [{ type: 'text', text: 'Error: path is required.' }] };
+      const ref = branch || 'main';
+      const data = await ghRequest('GET', `/contents/${path}?ref=${ref}`, null, getN8nRepo());
+      const content = data.content ? Buffer.from(data.content, 'base64').toString('utf-8') : '';
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ repo: getN8nRepo(), path: data.path, sha: data.sha, size: data.size, content }, null, 2) }],
+      };
+    }
+  );
+
+  // n8n_github_get_recent_commits [READ]
+  server.tool(
+    'n8n_github_get_recent_commits',
+    'CROSS-REPO: Recent commit history on a branch of the self-hosted n8n repo.',
+    {
+      count: z.number().optional().describe('Number of commits (default 10, max 30)'),
+      branch: z.string().optional().describe('Branch name (default: "main")'),
+    },
+    async ({ count, branch }) => {
+      const n = Math.min(count || 10, 30);
+      const ref = branch || 'main';
+      const data = await ghRequest('GET', `/commits?sha=${ref}&per_page=${n}`, null, getN8nRepo());
+      const commits = data.map(c => ({
+        sha: c.sha?.substring(0, 7),
+        message: c.commit?.message,
+        author: c.commit?.author?.name,
+        date: c.commit?.author?.date,
+      }));
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ repo: getN8nRepo(), branch: ref, commits }, null, 2) }],
+      };
+    }
+  );
+
+  // n8n_github_search_code [READ]
+  server.tool(
+    'n8n_github_search_code',
+    'CROSS-REPO: Search for a string across all files in the self-hosted n8n repo.',
+    {
+      query: z.string().describe('Search query'),
+    },
+    async ({ query }) => {
+      if (!query) return { content: [{ type: 'text', text: 'Error: query is required.' }] };
+      const data = await ghSearchCode(query, getN8nRepo());
+      const results = (data.items || []).map(item => ({
+        path: item.path,
+        name: item.name,
+        url: item.html_url,
+        score: item.score,
+      }));
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ repo: getN8nRepo(), total_count: data.total_count, results }, null, 2) }],
+      };
+    }
+  );
+
+  // n8n_github_list_branches [READ]
+  server.tool(
+    'n8n_github_list_branches',
+    'CROSS-REPO: List all branches in the self-hosted n8n repo.',
+    {},
+    async () => {
+      const data = await ghRequest('GET', `/branches?per_page=100`, null, getN8nRepo());
+      const branches = (Array.isArray(data) ? data : []).map(b => ({
+        name: b.name,
+        sha: b.commit?.sha?.substring(0, 7),
+        protected: b.protected,
+      }));
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ repo: getN8nRepo(), branches, count: branches.length }, null, 2) }],
+      };
+    }
+  );
+
+  // n8n_github_create_or_update_file [WRITE]
+  server.tool(
+    'n8n_github_create_or_update_file',
+    'CROSS-REPO: Create or update a file in the self-hosted n8n repo. Requires confirm: true. WARNING: committing to main may redeploy/restart the live n8n instance on Railway and interrupt running workflows.',
+    {
+      path: z.string().describe('File path. Example: "Dockerfile"'),
+      content: z.string().describe('Full file content'),
+      message: z.string().describe('Commit message'),
+      sha: z.string().optional().describe('File SHA (required for updates — get from n8n_github_get_file)'),
+      branch: z.string().optional().describe('Branch name (default: "main")'),
+      confirm: z.boolean().optional().describe('Must be true to execute.'),
+    },
+    async ({ path, content, message, sha, branch, confirm }) => {
+      if (!path || !content || !message) {
+        return { content: [{ type: 'text', text: 'Error: path, content, and message are required.' }] };
+      }
+      const targetBranch = branch || 'main';
+      if (confirm !== true) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            preview: true,
+            repo: getN8nRepo(),
+            action: sha ? 'update_file' : 'create_file',
+            path,
+            branch: targetBranch,
+            message,
+            content_length: content.length,
+            warning: targetBranch === 'main'
+              ? 'WARNING: Committing to main may redeploy/restart the live n8n instance on Railway and interrupt running workflows. Set confirm: true to execute.'
+              : 'Set confirm: true to execute.',
+          }, null, 2) }],
+        };
+      }
+      const body = {
+        message,
+        content: Buffer.from(content).toString('base64'),
+        branch: targetBranch,
+      };
+      if (sha) body.sha = sha;
+      const data = await ghRequest('PUT', `/contents/${path}`, body, getN8nRepo());
+      return {
+        content: [{ type: 'text', text: JSON.stringify({
+          success: true,
+          repo: getN8nRepo(),
+          action: sha ? 'updated' : 'created',
+          path,
+          branch: targetBranch,
+          commit_sha: data.commit?.sha,
+          message,
+        }, null, 2) }],
+      };
+    }
+  );
+
+  // n8n_github_create_branch [WRITE]
+  server.tool(
+    'n8n_github_create_branch',
+    'CROSS-REPO: Create a new branch in the self-hosted n8n repo.',
+    {
+      branch_name: z.string().describe('New branch name'),
+      from_branch: z.string().optional().describe('Source branch (default: "main")'),
+    },
+    async ({ branch_name, from_branch }) => {
+      if (!branch_name) {
+        return { content: [{ type: 'text', text: 'Error: branch_name is required.' }] };
+      }
+      const source = from_branch || 'main';
+      const ref = await ghRequest('GET', `/git/ref/heads/${source}`, null, getN8nRepo());
+      const sha = ref.object.sha;
+      await ghRequest('POST', '/git/refs', {
+        ref: `refs/heads/${branch_name}`,
+        sha,
+      }, getN8nRepo());
+      return {
+        content: [{ type: 'text', text: JSON.stringify({
+          success: true,
+          repo: getN8nRepo(),
+          branch: branch_name,
+          from: source,
+          sha: sha.substring(0, 7),
+        }, null, 2) }],
+      };
+    }
+  );
+
+  // n8n_github_create_pull_request [WRITE]
+  server.tool(
+    'n8n_github_create_pull_request',
+    'CROSS-REPO: Open a pull request in the self-hosted n8n repo. Requires confirm: true.',
+    {
+      title: z.string().describe('PR title'),
+      body: z.string().optional().describe('PR description (markdown)'),
+      head: z.string().describe('Source branch'),
+      base: z.string().optional().describe('Target branch (default: "main")'),
+      confirm: z.boolean().optional().describe('Must be true to execute.'),
+    },
+    async ({ title, body, head, base, confirm }) => {
+      if (!title || !head) {
+        return { content: [{ type: 'text', text: 'Error: title and head are required.' }] };
+      }
+      const targetBase = base || 'main';
+      if (confirm !== true) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            preview: true,
+            repo: getN8nRepo(),
+            action: 'create_pull_request',
+            title,
+            head,
+            base: targetBase,
+            body_length: body?.length || 0,
+            warning: 'Set confirm: true to execute.',
+          }, null, 2) }],
+        };
+      }
+      const data = await ghRequest('POST', '/pulls', {
+        title,
+        body: body || '',
+        head,
+        base: targetBase,
+      }, getN8nRepo());
+      return {
+        content: [{ type: 'text', text: JSON.stringify({
+          success: true,
+          repo: getN8nRepo(),
+          pr_number: data.number,
+          url: data.html_url,
+          title,
+          head,
+          base: targetBase,
+        }, null, 2) }],
       };
     }
   );
