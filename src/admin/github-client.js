@@ -6,6 +6,8 @@
 // v1.2: Added optional repoOverride to support cross-repo reads
 //       (Reece Dashboard, and HL MCP repo for reverse failover) so
 //       those repos stay readable when the HL MCP service is down.
+// v1.3: Added getN8nRepo() for the self-hosted n8n deployment repo
+//       (mrichard33/n8n on Railway), accessed via the same GITHUB_PAT.
 
 const GH_API = 'https://api.github.com';
 
@@ -22,6 +24,11 @@ export const getDashboardRepo = () =>
 // HL MCP repo (cross-repo read target — reverse failover when HL MCP is down).
 export const getHlRepo = () =>
   process.env.HL_GITHUB_REPO || 'mrichard33/HL-MCP';
+
+// Self-hosted n8n deployment repo (cross-repo read/write target).
+// n8n runs on Railway from this repo; accessed via the same GITHUB_PAT.
+export const getN8nRepo = () =>
+  process.env.N8N_GITHUB_REPO || 'mrichard33/n8n';
 
 export const ghRequest = async (method, path, body = null, repoOverride = null) => {
   const token = process.env.GITHUB_PAT;
