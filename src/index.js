@@ -149,6 +149,8 @@ import {
 } from './agentic/lead-state/enroll-existing-eligible.js';
 // ─── Agentic Hold-Complete (return-from-hold re-entry) ───────────
 import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
+// ─── FB Publish Watchdog (alert on missed WF4 publish window) ────
+import { startFbPublishWatchdog } from './fb-publish-watchdog.js';
 
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -521,6 +523,7 @@ app.listen(PORT, async () => {
   startDriftDetectorScheduler();
   startLeadStateSweepScheduler();
   startNoteChangeAnalyzerScheduler();
+  startFbPublishWatchdog();
   setTimeout(() => {
     setTimeout(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, 120000);
     setInterval(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, FIELD_SYNC_INTERVAL_MS);
