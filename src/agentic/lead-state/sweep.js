@@ -68,6 +68,15 @@
  *          LEAD_STATE_REFRESH_DAYS is retained ONLY as a safety re-floor
  *          (see STALE_REFLOOR_DAYS) so a contact can't go forever without a
  *          refresh even if its lead row is dormant.
+ * v0.2.1 — 2026-06-15. Stale-refloor REACH fix. The re-floor was effectively
+ *          unreachable: the newest-synced-first lp_leads scan capped at
+ *          MAX_SCAN never reaches dormant (old-synced) leads, so their stale
+ *          classifications froze below the 0.75 enrollment floor and were
+ *          never re-scored (observed: S45 dormancy pools + a UNCLASSIFIED
+ *          batch stuck since 06-11 = self-locking S4.5 starvation). Adds a
+ *          bounded stale top-up that selects the oldest-classified contacts
+ *          directly from the classification map, independent of synced_at
+ *          ordering / MAX_SCAN.
  */
 
 import supabase from '../../supabase.js';
@@ -108,6 +117,13 @@ let sweepRunning = false;
  *     for state transitions the lead row can't signal).
  * A lead whose row is unchanged AND was classified within the re-floor is
  * SKIPPED — re-deriving its state would be identical work.
+ *
+ * STALE TOP-UP (v0.2.1): the change-detected scan above is newest-synced
+ * first and capped at MAX_SCAN, so dormant (old-synced) leads are never
+ * reached and the re-floor never fires for them. After the scan, if room
+ * remains under `limit`, top up with the oldest-classified contacts taken
+ * directly from the classification map (independent of synced_at), so stale
+ * rows actually get the periodic time-driven re-evaluation.
  */
 async function selectCandidates(limit) {
   // 1. Map of contact_id → last state_classified_at (most recent per contact).
@@ -187,6 +203,34 @@ async function selectCandidates(limit) {
     from += PAGE;
   }
 
+  // 3. STALE TOP-UP (v0.2.1) — reach the dormant tail the synced_at scan can't.
+  //    The scan above is newest-synced-first and capped at MAX_SCAN, so dormant
+  //    leads (oldest synced_at) sit beyond the cap and never trigger the
+  //    re-floor — their classifications freeze (observed 2026-06-15: S45
+  //    dormancy pools + a UNCLASSIFIED batch stuck since 06-11, confidence
+  //    frozen below the 0.75 enrollment floor = self-locking S4.5 starvation).
+  //    Pull the oldest-classified contacts straight from the classification
+  //    map (independent of synced_at ordering / MAX_SCAN) and add them until
+  //    `limit` is reached. closed_won contacts are not in scope here; the
+  //    classifier will resolve them to a suppressed state harmlessly if any
+  //    slip through. Bounded by `limit`; only runs when room remains.
+  let staleTopUp = 0;
+  if (candidates.length < limit) {
+    const stale = [];
+    for (const [id, lastAt] of classifiedAt.entries()) {
+      if (!id || seen.has(id)) continue;
+      const lastMs = lastAt ? new Date(lastAt).getTime() : 0;
+      if (lastMs < reflootCutoffMs) stale.push({ id, lastMs });
+    }
+    stale.sort((a, b) => a.lastMs - b.lastMs); // oldest classification first
+    for (const { id } of stale) {
+      if (candidates.length >= limit) break;
+      seen.add(id);
+      candidates.push(id);
+      staleTopUp++;
+    }
+  }
+
   return {
     candidates,
     scanned,
@@ -194,6 +238,7 @@ async function selectCandidates(limit) {
       never_classified: neverClassified,
       changed_since_classified: changed,
       stale_refloor: staleRefloor,
+      stale_topup: staleTopUp,
       skipped_unchanged: skippedUnchanged,
     },
   };
@@ -269,7 +314,7 @@ export async function runLeadStateSweep({ limit = SWEEP_BATCH, classifyOnly = fa
     console.log(
       `[LeadStateSweep] done: classified ${classified}/${candidates.length} ` +
       `(new ${selection.never_classified}, changed ${selection.changed_since_classified}, ` +
-      `refloor ${selection.stale_refloor}, skipped-unchanged ${selection.skipped_unchanged}), ` +
+      `refloor ${selection.stale_refloor}, stale-topup ${selection.stale_topup}, skipped-unchanged ${selection.skipped_unchanged}), ` +
       `enrolled ${enrolled}, shadow ${shadow}, errors ${errors} (${elapsed_ms}ms)`
     );
     return summary;
