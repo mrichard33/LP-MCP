@@ -16,7 +16,7 @@
  *
  * Globals (final fallback for every function):
  *   LLM_PROVIDER            'anthropic' (default) | 'openai'
- *   LLM_MODEL_ANTHROPIC     default Anthropic model (default: claude-sonnet-4-20250514)
+ *   LLM_MODEL_ANTHROPIC     default Anthropic model (default: claude-sonnet-4-6)
  *   LLM_MODEL_OPENAI        default OpenAI model    (default: gpt-5.4-mini)
  *   LLM_TIMEOUT_MS          per-call timeout ms     (default: 30000)
  *   ANTHROPIC_VERSION       anthropic-version header (default: 2023-06-01)
@@ -51,7 +51,7 @@
  *   DECISION_ENGINE_PROVIDER=openai
  *   DECISION_ENGINE_MODEL_OPENAI=gpt-5.4-mini
  *   CUSTOMER_FACING_PROVIDER=anthropic
- *   CUSTOMER_FACING_MODEL_ANTHROPIC=claude-sonnet-4-20250514
+ *   CUSTOMER_FACING_MODEL_ANTHROPIC=claude-sonnet-4-6
  *
  *   # Point ONLY the analyzer at OpenAI, leave its group on whatever it is:
  *   MESSAGE_ANALYZER_PROVIDER=openai
@@ -77,7 +77,7 @@ const GLOBAL_PROVIDER = (process.env.LLM_PROVIDER || 'anthropic').toLowerCase();
 // Last-resort provider defaults (used only when no per-function, group, or
 // global model var is set). Override via LLM_MODEL_ANTHROPIC / LLM_MODEL_OPENAI.
 const BUILTIN_DEFAULT_MODEL = {
-  anthropic: process.env.LLM_MODEL_ANTHROPIC || 'claude-sonnet-4-20250514',
+  anthropic: process.env.LLM_MODEL_ANTHROPIC || 'claude-sonnet-4-6',
   openai: process.env.LLM_MODEL_OPENAI || 'gpt-5.4-mini',
 };
 
