@@ -74,14 +74,15 @@ export async function enrollTopN({ limit = DEFAULT_ENROLL_LIMIT, dryRun = false 
     const candidates = cands || [];
     const ids = candidates.map(c => c.contact_id);
 
-    // 2. skip-if-action idempotency (one IN query).
+    // 2. skip-if-action idempotency (chunked so a large limit can't blow the URL).
     const alreadyEnqueued = new Set();
-    if (ids.length) {
+    for (let i = 0; i < ids.length; i += 150) {
+      const chunk = ids.slice(i, i + 150);
       const { data: actions, error: aErr } = await supabase
         .from('agent_actions')
         .select('target_id')
         .eq('rule_applied', RULE_APPLIED)
-        .in('target_id', ids);
+        .in('target_id', chunk);
       if (aErr) throw new Error(`skip-if-action scan failed: ${aErr.message}`);
       for (const a of actions || []) alreadyEnqueued.add(a.target_id);
     }
