@@ -147,6 +147,9 @@ import {
 import {
   registerEnrollExistingEligibleRoutes,
 } from './agentic/lead-state/enroll-existing-eligible.js';
+// ─── Lead-Selection Engine (score the book → ranked/segmented S1.3 candidates) ─
+// Manual/admin-only, no scheduler. POST /admin/lead-selection/run | /report.
+import { registerLeadSelectionRoutes } from './agentic/lead-selection/index.js';
 // ─── Agentic Hold-Complete (return-from-hold re-entry) ───────────
 import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
 // ─── FB Publish Watchdog (alert on missed WF4 publish window) ────
@@ -500,6 +503,7 @@ registerLPForceAddLeadRoutes(app);
 registerLeadStateSweepRoutes(app);
 registerNoteChangeAnalyzerRoutes(app);
 registerEnrollExistingEligibleRoutes(app);
+registerLeadSelectionRoutes(app);
 
 app.listen(PORT, async () => {
   console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
