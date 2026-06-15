@@ -46,7 +46,7 @@ re-based on columns that actually exist:
 | Component | Source | Max pts |
 |---|---|---|
 | Source close-rate | `lp_leads.lead_source_detail` / `lead_source` (lookup, default 0.5) | 25 |
-| Disposition value | `lp_leads.disposition_code` (OPPFDN>CXL>NIS>No Demo>CCC; cold `Set` own bucket) | 40 |
+| Disposition value | `lp_leads.disposition_code` (OPPFDN>FDNS>CXL>NIS/NoHome>Set>No Demo>CCC) | 40 |
 | Recency / dormancy | `daysDormant` (from `lp_notes` last note, fallback lp vintage) — mid-dormancy peak | 25 |
 | Intent | strong-intent **states** (`S45_DORMANT_HIGH_INTENT`/`S45_REAWAKENED` …); `has_strong_intent` flag is absent | 10 |
 
@@ -62,7 +62,7 @@ Appointment-West / Modernize / Porch101; **mid-low (0.35)** aggregators (Lead Gu
 | Segment | Temperature | Trigger |
 |---|---|---|
 | `WARM_OBJECTION` | warm | `SUPPRESSED_POST_DEMO_DECLINE` / `S45_DEMO_STALL` / objection present / OPPFDN / FDNS |
-| `COOLED_NOSHOW` | cool | disposition `Set`, never demo'd |
+| `COOLED_NOSHOW` | cool | disposition `Set` (never demo'd) **or** `NoHome` (not home at the door) |
 | `COLD_RECOVERABLE` | cool | CXL / NIS / No Demo with engagement history |
 | `COLD_RECOVERABLE` | cold | `SUPPRESSED_CONFIRMED_LOSS` (very stale, flag on) |
 | `COLD_NO_SIGNAL` | cold | `COLD_NO_SIGNAL` / no engagement history (lowest priority) |
@@ -71,14 +71,21 @@ Offer is **LOCKED** to "Protection Profile Review" (deliverable "Protection Prof
 "Documented Home Protection Review" (retired). No insurance-carrier / claim-outcome language anywhere.
 
 ## Exclusion gate (every exclusion is written, `enrollable=false` + `exclusion_reason`)
-`no_ghl_match` (no lp row) · `hard_disposition` (DNC/NoHome/BD) · `stop_bot` (stop-bot/dnc/unsubscribed
+`no_ghl_match` (no lp row) · `hard_disposition` (DNC/BD only) · `stop_bot` (stop-bot/dnc/unsubscribed
 tag) · `prospect_denylist` · `low_confidence` (<0.75) · `decline_recency_unknown` /
-`decline_too_fresh` (<90d) · `confirmed_loss_v2_deferred` / `loss_too_fresh` (<365d) · `s1_1_active`
-(S1.1 enrollment action or `re-engagement-eligible` tag).
+`decline_too_fresh` (<90d) · `confirmed_loss_v2_deferred` / `loss_too_fresh` (<365d) ·
+`nohome_recency_unknown` / `nohome_too_fresh` (<90d) · `s1_1_active` (S1.1 enrollment action or
+`re-engagement-eligible` tag).
 
 The **decline recency gate is load-bearing**: most classified post-demo declines have rep activity
 within 90 days (appointment confirmations, call summaries, rep SMS). Without it the engine would
 enroll actively-worked leads into an S1.3 SMS sequence.
+
+**`NoHome` is recoverable, not unqualified.** It means *"not home for the appointment"* (a missed
+in-home run — same recoverable family as `CXL`/`NIS`), **not** "non-homeowner". It is **not**
+hard-excluded; it is recency-gated on disposition (fresh ones are in active Hatch "Cancels"-board
+rehash; the classifier state can lag, so we gate on disposition, not state). Only `DNC` (legal) and
+`BD` (bad data) are hard-disposition excludes.
 
 ## Enrollment route
 S1.3 is a published `inbound_webhook` workflow but has **no** row in `ghl_workflow_webhooks` (no stored
@@ -98,6 +105,7 @@ trigger type. Idempotency: `rule_applied='S1_3_REENGAGEMENT_ENROLLMENT'` skip-if
 | `S1_REENGAGEMENT_REQUIRE_APPROVAL` | `true` | enqueued actions require human approval before the executor fires |
 | `S1_3_INCLUDE_CONFIRMED_LOSS` | `false` (v2) | include `SUPPRESSED_CONFIRMED_LOSS` (≥365d) as candidates |
 | `S1_3_STALE_DECLINE_DAYS` | `90` | post-demo decline dormancy floor |
+| `S1_3_STALE_NOSHOW_DAYS` | `90` (= decline) | `NoHome` no-show dormancy floor |
 | `S1_3_STALE_LOSS_DAYS` | `365` | confirmed-loss dormancy floor |
 | `S1_3_COOLDOWN_DAYS` | `90` | re-enrollment cooldown |
 | `S1_REENGAGEMENT_ENROLL_LIMIT` | `25` | default top-N per enroll run |
@@ -114,4 +122,5 @@ trigger type. Idempotency: `rule_applied='S1_3_REENGAGEMENT_ENROLLMENT'` skip-if
 This v1 governs the ~2.6k already-classified leads with GHL contacts — proof-of-correctness + the
 reusable scoring brain. The real S1.3 volume is the ~77k no-GHL stale leads, selected pre-import from
 `lp_leads`; that path must mirror this one at the disposition level (include stale
-OPPFDN/CXL/Set/NIS/No Demo/CCC; exclude DNC/NoHome/customer/deal-won; recency-gate declines).
+OPPFDN/CXL/Set/NIS/No Demo/CCC/**NoHome** — NoHome is ~2,973 of the no-GHL backlog and recoverable;
+exclude DNC/BD/customer/deal-won; recency-gate declines **and NoHome**).
