@@ -6,17 +6,17 @@
  * cooldown + skip-if-action idempotency + shadow-vs-live. NEVER writes to GHL
  * directly — it enqueues an add_to_workflow agent_action the executor performs.
  *
- * Enrollment route — Route A (GHL API), not Route B:
- *   S1.3 (32fa691b-…) is a published inbound_webhook workflow but is NOT in
- *   ghl_workflow_webhooks (no stored webhook URL). The executor
- *   (workflows.js executeAddToWorkflow) selects Route A when no webhook_url is
- *   present: POST /contacts/{id}/workflow/{workflow_id} via the GHL API, which
- *   works for any trigger type. So the action carries workflow_id +
- *   canonical_code and deliberately NO webhook_url.
- *   NOTE: Route A firing an inbound_webhook workflow is unproven — the seed
- *   test (10–25 contacts, flag on) must confirm the contact VISIBLY enters
- *   S1.3 and receives message #1 before any scale. If it does not, switch to
- *   the workflow's real inbound webhook URL (Route B).
+ * Enrollment route — Route B (inbound webhook), not Route A:
+ *   S1.3 (32fa691b-…) is a published inbound_webhook workflow. We enroll by
+ *   POSTing to its inbound-webhook trigger URL (S1_3_INBOUND_WEBHOOK_URL) — the
+ *   native path for an inbound_webhook trigger. The executor
+ *   (workflows.js executeAddToWorkflow) takes Route B whenever webhook_url is
+ *   present and sends contact_id (snake_case) — the field the workflow's
+ *   "Find Contact by Contact ID" step reads. The v1.6 (2026-06-05) executor fix
+ *   corrected that key, so Route B is proven (S1.0/S1.1 run on it). Verified
+ *   end-to-end on the Mark Test contact (action 118289, HTTP 200 → enrolled).
+ *   workflow_id stays in the payload only as a Route-A fallback if the webhook
+ *   URL is ever unset.
  *
  * Ships dark: S1_REENGAGEMENT_ENABLED defaults false → shadow (would-enroll,
  * writes nothing). When live, actions default to requires_approval=true for
@@ -38,8 +38,13 @@ const DEFAULT_ENROLL_LIMIT = Number(process.env.S1_REENGAGEMENT_ENROLL_LIMIT || 
 
 // S1.3 identity (verified live: published, trigger inbound_webhook).
 const S1_3_WORKFLOW_ID  = process.env.S1_3_WORKFLOW_ID || '32fa691b-2422-4727-83c9-1174801974e9';
+// Route B: S1.3 inbound-webhook trigger URL (proven path; v1.6 contact_id fix).
+const S1_3_INBOUND_WEBHOOK_URL = process.env.S1_3_INBOUND_WEBHOOK_URL ||
+  'https://services.leadconnectorhq.com/hooks/SsBG7j5KQAIP1SFP2Sca/webhook-trigger/63798eed-1bf6-4e8e-b495-bb713df77da6';
 const S1_3_CANONICAL    = 'S1.3 Stale Lead Revival';
 const RULE_APPLIED      = 'S1_3_REENGAGEMENT_ENROLLMENT';
+// Addendum 5 — optional GroupMe bot id for the per-run batch summary (skipped if unset).
+const S1_3_GROUPME_BOT_ID = process.env.S1_3_GROUPME_BOT_ID || null;
 
 let running = false;
 
@@ -134,7 +139,8 @@ export async function enrollTopN({ limit = DEFAULT_ENROLL_LIMIT, dryRun = false 
             target_entity: 'contact',
             target_id: String(contactId),
             action_payload: {
-              workflow_id: S1_3_WORKFLOW_ID,   // Route A — no webhook_url ⇒ GHL API enrollment
+              webhook_url: S1_3_INBOUND_WEBHOOK_URL, // Route B — inbound webhook (executor sends contact_id; v1.6 fix)
+              workflow_id: S1_3_WORKFLOW_ID,         // Route-A fallback only (used if webhook_url is ever unset)
               canonical_code: 'S1.3',
               canonical_name: S1_3_CANONICAL,
               payload: {
@@ -146,7 +152,7 @@ export async function enrollTopN({ limit = DEFAULT_ENROLL_LIMIT, dryRun = false 
                 score: c.score,
               },
             },
-            reasoning: `S1.3 re-engagement enrollment from lead-selection engine — rank ${c.rank}, ${c.segment} (Route A)`,
+            reasoning: `S1.3 re-engagement enrollment from lead-selection engine — rank ${c.rank}, ${c.segment} (Route B)`,
             rule_applied: RULE_APPLIED,
             status: 'pending',
             requires_approval: REQUIRE_APPROVAL,
@@ -191,6 +197,27 @@ export async function enrollTopN({ limit = DEFAULT_ENROLL_LIMIT, dryRun = false 
       }
     }
 
+    // Addendum 5 — ONE batch GroupMe summary per LIVE run (never per-contact). Fire-and-forget, non-fatal.
+    if (ENROLLMENT_ENABLED && !dryRun && enrolled > 0 && S1_3_GROUPME_BOT_ID) {
+      try {
+        const segTally = {};
+        for (const d of detail) if (d.outcome === 'enqueued') segTally[d.segment] = (segTally[d.segment] || 0) + 1;
+        const segLine = Object.entries(segTally).map(([s, n]) => `${s}: ${n}`).join(' · ') || '—';
+        const text =
+          `🔁 S1.3 Stale Lead Revival — enrollment run (Route B)\n` +
+          `Enrolled ${enrolled} · skipped ${skipped} · errors ${errors} (of ${candidates.length} scanned)\n` +
+          `Segments → ${segLine}`;
+        await fetch('https://api.groupme.com/v3/bots/post', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bot_id: S1_3_GROUPME_BOT_ID, text }),
+          signal: AbortSignal.timeout(8000),
+        });
+      } catch (gmErr) {
+        console.warn(`[LeadSelectionEnroll] GroupMe summary post failed (non-fatal): ${gmErr.message}`);
+      }
+    }
+
     const elapsed_ms = Date.now() - startedAt;
     const summary = {
       success: true,
@@ -223,7 +250,8 @@ export function enrollConfig() {
     cooldown_days: COOLDOWN_DAYS,
     enroll_limit: DEFAULT_ENROLL_LIMIT,
     workflow_id: S1_3_WORKFLOW_ID,
+    webhook_url: S1_3_INBOUND_WEBHOOK_URL,
     rule_applied: RULE_APPLIED,
-    route: 'A',
+    route: 'B',
   };
 }
