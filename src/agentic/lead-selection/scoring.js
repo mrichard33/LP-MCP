@@ -69,6 +69,8 @@ const DISPOSITION_VALUES = {
   SET: 0.55,   // cold 'Set': appointment set, never demo'd
   CCC: 0.4,
   FDNS: 0.85,  // final demo no-show — close cousin of OPPFDN
+  NOHOME: 0.6, // "not home for the appt" — recoverable no-show, ~NIS tier
+  'NO HOME': 0.6,
 };
 
 // ── CONFIG — recency curve (daysDormant → 0..1) ─────────────────────
@@ -153,6 +155,10 @@ export function segmentCandidate(stateRow, leadRow) {
   }
   // COOLED — cold 'Set': appointment set, never completed a demo
   if (disp === 'SET' && leadRow?.demo_completed !== true) {
+    return { segment: 'COOLED_NOSHOW', temperature: 'cool' };
+  }
+  // COOLED — NoHome: not home at the door (no-show); same bucket as cold 'Set'
+  if (disp === 'NOHOME' || disp === 'NO HOME') {
     return { segment: 'COOLED_NOSHOW', temperature: 'cool' };
   }
   // COLD_RECOVERABLE — cancellations / not-shown / no-demo with some history

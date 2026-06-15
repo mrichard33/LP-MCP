@@ -40,6 +40,7 @@ const DEFAULT_LIMIT = Number(process.env.LEAD_SELECTION_LIMIT || 2000);
 
 const CONFIDENCE_FLOOR     = AUTO_EXECUTE_THRESHOLD;  // 0.75 (cheap guard; inert in practice)
 const STALE_DECLINE_DAYS   = Number(process.env.S1_3_STALE_DECLINE_DAYS || 90);
+const STALE_NOSHOW_DAYS    = Number(process.env.S1_3_STALE_NOSHOW_DAYS || STALE_DECLINE_DAYS); // NoHome fuse (= decline)
 const STALE_LOSS_DAYS      = Number(process.env.S1_3_STALE_LOSS_DAYS || 365);
 const INCLUDE_CONFIRMED_LOSS = process.env.S1_3_INCLUDE_CONFIRMED_LOSS === 'true'; // default false (v2)
 
@@ -51,8 +52,13 @@ const S1_3_HARD_EXCLUDE = [
   STATES.UNCLASSIFIED,
 ];
 
-// Disposition hard-excludes (compliance / unreachable).
-const HARD_DISPOSITIONS = new Set(['DNC', 'NOHOME', 'NO HOME', 'BD']);
+// Disposition hard-excludes (compliance / bad data only).
+// NoHome is NOT here — it means "not home for the appointment" (a recoverable
+// no-show, same family as CXL/NIS), not "non-homeowner". It is recency-gated
+// below instead (fresh ones are in active Hatch rehash).
+const HARD_DISPOSITIONS = new Set(['DNC', 'BD']);
+// NoHome disposition (recency-gated, not hard-excluded). Both spacings seen in data.
+const NOHOME_DISPOSITIONS = new Set(['NOHOME', 'NO HOME']);
 // Consent kill-switch / unreachable tags.
 const STOP_TAGS = new Set(['stop-bot', 'dnc', 'unsubscribed', 'do-not-contact']);
 // S1.1 in-flight tag (exclusivity).
@@ -211,6 +217,13 @@ function evaluateExclusion({ stateRow, leadRow, tags, daysDormant, denylist, s11
   if (st === STATES.SUPPRESSED_CONFIRMED_LOSS) {
     if (!INCLUDE_CONFIRMED_LOSS) return 'confirmed_loss_v2_deferred';
     if (daysDormant == null || daysDormant < STALE_LOSS_DAYS) return 'loss_too_fresh';
+  }
+
+  // Recency gate — NoHome no-shows. Gate on DISPOSITION (not state): the classifier
+  // state can lag, and fresh NoHome leads are in active Hatch "Cancels"-board rehash.
+  if (NOHOME_DISPOSITIONS.has(disp)) {
+    if (daysDormant == null) return 'nohome_recency_unknown';
+    if (daysDormant < STALE_NOSHOW_DAYS) return 'nohome_too_fresh';
   }
 
   // S1.1 ↔ S1.3 exclusivity — one re-engagement workflow per contact.
