@@ -61,94 +61,110 @@ const S1_1_TAG = 're-engagement-eligible';
 const CLASSIFIER_VERSION_FALLBACK = 'lead-selection-v1.0';
 const NOTE_PAGE_SIZE = 1000;
 const NOTE_MAX_PAGES = 250; // safety cap (≤250k note rows scanned per run)
+// Cap ids per .in() request — a single .in() with the whole pool (hundreds of
+// 20-char ids) builds a query-string URL big enough to fail the fetch.
+const ID_CHUNK = 150;
 
 let running = false;
 
-// ── Batch enrichment helpers ────────────────────────────────────────
+/** Split an array into chunks of size n. */
+function chunkIds(arr, n = ID_CHUNK) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+}
+
+// ── Batch enrichment helpers (all chunk their .in() lists) ──────────
 
 /** Collapse lp_leads to ONE representative row per ghl_contact_id (max created_at_lp). */
-async function fetchLeadMap(ids) {
+async function fetchLeadMap(allIds) {
   const map = new Map();
-  if (!ids.length) return map;
-  const { data, error } = await supabase
-    .from('lp_leads')
-    .select('ghl_contact_id, lp_prospect_id, lead_source, lead_source_detail, disposition_code, demo_completed, created_at_lp')
-    .in('ghl_contact_id', ids);
-  if (error) throw new Error(`lp_leads join failed: ${error.message}`);
-  for (const row of data || []) {
-    const k = row.ghl_contact_id;
-    const prev = map.get(k);
-    if (!prev) { map.set(k, row); continue; }
-    // keep the newest by created_at_lp (deterministic representative)
-    const a = Date.parse(prev.created_at_lp || 0) || 0;
-    const b = Date.parse(row.created_at_lp || 0) || 0;
-    if (b >= a) map.set(k, row);
+  for (const ids of chunkIds(allIds)) {
+    const { data, error } = await supabase
+      .from('lp_leads')
+      .select('ghl_contact_id, lp_prospect_id, lead_source, lead_source_detail, disposition_code, demo_completed, created_at_lp')
+      .in('ghl_contact_id', ids);
+    if (error) throw new Error(`lp_leads join failed: ${error.message}`);
+    for (const row of data || []) {
+      const k = row.ghl_contact_id;
+      const prev = map.get(k);
+      if (!prev) { map.set(k, row); continue; }
+      // keep the newest by created_at_lp (deterministic representative)
+      const a = Date.parse(prev.created_at_lp || 0) || 0;
+      const b = Date.parse(row.created_at_lp || 0) || 0;
+      if (b >= a) map.set(k, row);
+    }
   }
   return map;
 }
 
 /** contact_id → Set(tags) from contact_tag_snapshot. */
-async function fetchTagMap(ids) {
+async function fetchTagMap(allIds) {
   const map = new Map();
-  if (!ids.length) return map;
-  const { data, error } = await supabase
-    .from('contact_tag_snapshot')
-    .select('ghl_contact_id, tags')
-    .in('ghl_contact_id', ids);
-  if (error) throw new Error(`contact_tag_snapshot read failed: ${error.message}`);
-  for (const row of data || []) {
-    const tags = Array.isArray(row.tags) ? row.tags.map(t => String(t).toLowerCase()) : [];
-    map.set(row.ghl_contact_id, new Set(tags));
+  for (const ids of chunkIds(allIds)) {
+    const { data, error } = await supabase
+      .from('contact_tag_snapshot')
+      .select('ghl_contact_id, tags')
+      .in('ghl_contact_id', ids);
+    if (error) throw new Error(`contact_tag_snapshot read failed: ${error.message}`);
+    for (const row of data || []) {
+      const tags = Array.isArray(row.tags) ? row.tags.map(t => String(t).toLowerCase()) : [];
+      map.set(row.ghl_contact_id, new Set(tags));
+    }
   }
   return map;
 }
 
 /** Set of contact_ids with an active S1.1 enrollment action (exclusivity). */
-async function fetchS11EnrolledSet(ids) {
+async function fetchS11EnrolledSet(allIds) {
   const set = new Set();
-  if (!ids.length) return set;
-  const { data, error } = await supabase
-    .from('agent_actions')
-    .select('target_id')
-    .eq('action_type', 'add_to_workflow')
-    .ilike('rule_applied', 'ENROLL_S1_1%')
-    .in('target_id', ids);
-  if (error) throw new Error(`S1.1 action scan failed: ${error.message}`);
-  for (const a of data || []) set.add(a.target_id);
+  for (const ids of chunkIds(allIds)) {
+    const { data, error } = await supabase
+      .from('agent_actions')
+      .select('target_id')
+      .eq('action_type', 'add_to_workflow')
+      .ilike('rule_applied', 'ENROLL_S1_1%')
+      .in('target_id', ids);
+    if (error) throw new Error(`S1.1 action scan failed: ${error.message}`);
+    for (const a of data || []) set.add(a.target_id);
+  }
   return set;
 }
 
 /**
- * contact_id → daysDormant. last note from lp_notes (paginated, newest-first;
- * the first row seen per contact is its max), falling back to lp vintage.
+ * contact_id → daysDormant. last note from lp_notes (chunked by id, then
+ * paginated newest-first per chunk; the first row seen per contact is its max),
+ * falling back to lp vintage.
  */
-async function fetchDaysDormantMap(ids, leadMap) {
+async function fetchDaysDormantMap(allIds, leadMap) {
   const lastNote = new Map();
-  const remaining = new Set(ids);
-  for (let page = 0; page < NOTE_MAX_PAGES && remaining.size > 0; page++) {
-    const from = page * NOTE_PAGE_SIZE;
-    const { data, error } = await supabase
-      .from('lp_notes')
-      .select('ghl_contact_id, created_at_lp')
-      .in('ghl_contact_id', ids)
-      .not('created_at_lp', 'is', null)
-      .order('created_at_lp', { ascending: false })
-      .range(from, from + NOTE_PAGE_SIZE - 1);
-    if (error) throw new Error(`lp_notes recency read failed: ${error.message}`);
-    if (!data || data.length === 0) break;
-    for (const row of data) {
-      const k = row.ghl_contact_id;
-      if (!lastNote.has(k)) { // first (newest) wins
-        lastNote.set(k, row.created_at_lp);
-        remaining.delete(k);
+  for (const ids of chunkIds(allIds)) {
+    const remaining = new Set(ids);
+    for (let page = 0; page < NOTE_MAX_PAGES && remaining.size > 0; page++) {
+      const from = page * NOTE_PAGE_SIZE;
+      const { data, error } = await supabase
+        .from('lp_notes')
+        .select('ghl_contact_id, created_at_lp')
+        .in('ghl_contact_id', ids)
+        .not('created_at_lp', 'is', null)
+        .order('created_at_lp', { ascending: false })
+        .range(from, from + NOTE_PAGE_SIZE - 1);
+      if (error) throw new Error(`lp_notes recency read failed: ${error.message}`);
+      if (!data || data.length === 0) break;
+      for (const row of data) {
+        const k = row.ghl_contact_id;
+        if (!lastNote.has(k)) { // first (newest) wins
+          lastNote.set(k, row.created_at_lp);
+          remaining.delete(k);
+        }
       }
+      if (data.length < NOTE_PAGE_SIZE) break;
     }
-    if (data.length < NOTE_PAGE_SIZE) break;
   }
 
   const now = Date.now();
   const out = new Map();
-  for (const id of ids) {
+  for (const id of allIds) {
     const noteTs = lastNote.get(id);
     const vintage = leadMap.get(id)?.created_at_lp;
     const ref = noteTs || vintage; // prefer last human touch, else lead vintage
@@ -279,11 +295,13 @@ export async function runScorePass({ limit = DEFAULT_LIMIT, dryRun = false } = {
     ranked.forEach((r, i) => { r.rank = i + 1; });
     for (const r of rows) { if (r.rank === undefined) r.rank = null; delete r._score; }
 
-    // 5. Upsert. Omit enrolled / enrollment_action_id so the enroll pass's
-    //    stamps survive re-scoring (PostgREST upsert only updates supplied cols).
+    // 5. Upsert. The candidate table is analysis output (never a GHL write), so
+    //    the score pass ALWAYS writes it — `dry_run` governs only the enroll pass.
+    //    Omit enrolled / enrollment_action_id so the enroll pass's stamps survive
+    //    re-scoring (PostgREST upsert only updates supplied columns).
     const nowIso = new Date().toISOString();
     let upserted = 0;
-    if (!dryRun) {
+    {
       const payload = rows.map(r => ({
         contact_id: r.contact_id,
         score: r.score,

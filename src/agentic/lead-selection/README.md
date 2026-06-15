@@ -35,9 +35,9 @@ curl -XPOST $HOST/admin/lead-selection/report
 curl -XPOST $HOST/admin/lead-selection/run -H 'content-type: application/json' \
   -d '{"mode":"enroll","limit":25,"dry_run":true}'
 ```
-`dry_run` governs **enrollment** side effects (no agent_actions). The score pass always upserts the
-candidate table — it is analysis output, not an external write. Score-pass `dry_run:true` skips the
-upsert (useful for a pure preview).
+`dry_run` governs **enrollment** side effects only (no agent_actions, no GHL). The score pass **always
+upserts** the candidate table regardless of `dry_run` — it is internal analysis output, never an
+external write — so `{"mode":"score","dry_run":true}` populates `agentic_reengagement_candidates`.
 
 ## Scoring (0–100 composite; each piece logged in `components`)
 The classifier's `signal_snapshot` is a state fingerprint, not a feature vector, so the score is
