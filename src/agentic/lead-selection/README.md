@@ -88,15 +88,15 @@ rehash; the classifier state can lag, so we gate on disposition, not state). Onl
 `BD` (bad data) are hard-disposition excludes.
 
 ## Enrollment route
-S1.3 is a published `inbound_webhook` workflow but has **no** row in `ghl_workflow_webhooks` (no stored
-webhook URL). The action carries `workflow_id` + `canonical_code` and **no** `webhook_url`, so the
-executor uses **Route A** (`POST /contacts/{id}/workflow/{id}` via GHL API), which works for any
-trigger type. Idempotency: `rule_applied='S1_3_REENGAGEMENT_ENROLLMENT'` skip-if-action + a 90-day
-`workflow_history['S1.3'].cooldown_until`.
-
-> Route A firing an `inbound_webhook` workflow is **unproven** — the seed test (flag on, tiny limit)
-> must confirm the contact visibly enters S1.3 and receives message #1. If not, switch to the
-> workflow's real inbound webhook URL (Route B).
+S1.3 is a published `inbound_webhook` workflow. The action carries `webhook_url`
+(`S1_3_INBOUND_WEBHOOK_URL`, its inbound-webhook trigger URL) + `workflow_id` + `canonical_code`, so
+the executor uses **Route B** (POST to the inbound-webhook trigger URL), the native path for an
+`inbound_webhook` trigger. The executor sends `contact_id` (snake_case) — the field the workflow's
+"Find Contact by Contact ID" step reads; the v1.6 (2026-06-05) executor fix corrected that key, so
+Route B is proven (S1.0/S1.1 run on it), and verified end-to-end on the Mark Test contact (action
+`118289`, HTTP 200 → enrolled + message #1). `workflow_id` remains as a Route-A fallback only, used if
+`webhook_url` is ever unset. Idempotency: `rule_applied='S1_3_REENGAGEMENT_ENROLLMENT'` skip-if-action
++ a 90-day `workflow_history['S1.3'].cooldown_until`.
 
 ## Env flags
 | Var | Default | Effect |
@@ -109,6 +109,8 @@ trigger type. Idempotency: `rule_applied='S1_3_REENGAGEMENT_ENROLLMENT'` skip-if
 | `S1_3_STALE_LOSS_DAYS` | `365` | confirmed-loss dormancy floor |
 | `S1_3_COOLDOWN_DAYS` | `90` | re-enrollment cooldown |
 | `S1_REENGAGEMENT_ENROLL_LIMIT` | `25` | default top-N per enroll run |
+| `S1_3_INBOUND_WEBHOOK_URL` | (built-in default) | Route B inbound-webhook trigger URL the executor POSTs to |
+| `S1_3_GROUPME_BOT_ID` | unset | optional GroupMe bot id for the one-per-run enrollment summary (skipped if unset) |
 | `LEAD_SELECTION_LIMIT` | `2000` | default score-pass scan limit |
 
 ## Shadow → live
