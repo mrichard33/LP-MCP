@@ -94,6 +94,8 @@ import { CALENDAR_MAP, GHL_LOCATION_ID } from '../constants.js';
 import { updateGHLContactFields, applyGHLTag, removeGHLTags } from '../../ghl.js';
 import { fetchUpcomingAppointments } from '../../knowledge/contact-appointments.js';
 import { isInHomeCalendarId } from '../../knowledge/booking-calendar-router.js';
+import { markRescheduleInflight } from '../../services/reschedule-inflight.js';
+import { executeCreateTask } from './tasks.js';
 
 // Tags cleared once a booking lands (or the flow otherwise terminates) so the
 // post-qualification affirmative-gate bypass (intent-classifier.js) doesn't
@@ -527,23 +529,36 @@ export async function executeUpdateAppointmentStatus(action /*, context */) {
 }
 
 /**
- * v1.1 — reschedule_appointment: cancel old + book new in one operation.
+ * v2 — reschedule_appointment: book new + cancel old in one operation.
  *
  * Why a combined action instead of two companions:
  *   - Keeps companion_action a single object (no multi-companion refactor)
  *   - Atomic from the AI's perspective — one decision, one outcome
- *   - Order is enforced by the handler (cancel ALWAYS before book)
+ *   - Order is enforced by the handler (BOOK ALWAYS before cancel)
  *
- * Failure modes:
- *   - Cancel fails → throw, action goes 'failed', no book attempted.
- *     Old appointment is unchanged; lead's calendar state is consistent.
- *   - Cancel succeeds, book fails → return partial-success result. Old
- *     is cancelled; new is missing. Action goes 'failed' (after
- *     max_retries); ops sees the orphaned cancellation in the audit and
- *     can manually rebook. Retrying would fail at the cancel step with
- *     "already cancelled" — no value. So we don't auto-retry here.
- *   - Both succeed → return full-success result with new appointment_id.
- *     Qualifying data persistence runs after both succeed (best-effort).
+ * v2 (2026-06-16) — BOOK-BEFORE-CANCEL. The prior order (cancel old → book new)
+ * stranded the lead with NO appointment whenever the new booking failed
+ * (GHL 400 "slot no longer available"): old was already cancelled, new never
+ * booked. That is exactly what happened to Jacqueline Virtue
+ * (fbC6JUcY9EDBrHoMiFmF). New contract:
+ *   - Book new FIRST. If it fails (non-2xx) → leave the old appointment
+ *     untouched, create a rep escalation task, return a clean failure. The
+ *     lead keeps their existing appointment; a human rebooks.
+ *   - Only after the new booking succeeds do we cancel the old slot. A failure
+ *     of the (now best-effort) cancel does NOT strand the lead — they have the
+ *     new appointment; the stale old one is surfaced for cleanup.
+ *
+ * Cold-cancel correlation (Bug 2b): immediately before cancelling the old slot
+ * we set a short-lived reschedule-in-flight marker so the
+ * ghl.appointment_cancelled webbook our own cancel emits does not trip the
+ * customer-cancellation rules (GHL_APPT_CANCELLED_REBOOK_COLD /
+ * GHL_APPT_CANCELLED_REBOOK), which guard on `not_reschedule_inflight`.
+ *
+ * Idempotency: a retry that runs after the new booking already succeeded would
+ * re-book. We avoid that by only attempting the cancel + qualifying-data steps
+ * after a successful book within the same invocation; the handler is not
+ * auto-retried past the book step (a book failure returns a terminal result, it
+ * does not throw).
  *
  * v1.1 — 2026-05-02: forwards ignore_free_slot_validation to the new
  * booking step (Jeanne Jewell pattern).
@@ -556,16 +571,7 @@ export async function executeRescheduleAppointment(action, context) {
   const oldId = payload.old_appointment_id;
   if (!oldId) throw new Error('Missing old_appointment_id');
 
-  // ─── Step 1/2: cancel the old appointment ──────────────────────────
-  console.log(`[ActionExecutor] Reschedule step 1/2: cancelling old appointment ${oldId} for contact ${contactId}`);
-  try {
-    await ghlFetch('PUT', `/calendars/events/appointments/${oldId}`, { appointmentStatus: 'cancelled' });
-  } catch (err) {
-    throw new Error(`Reschedule failed at cancel step: ${err.message}`);
-  }
-  console.log(`[ActionExecutor] ✅ Old appointment ${oldId} cancelled`);
-
-  // ─── Step 2/2: book the new appointment ────────────────────────────
+  // ─── Step 1/2: book the new appointment FIRST ──────────────────────
   const bookPayload = {
     calendar_name: payload.new_calendar_name,
     calendar_id: payload.new_calendar_id,
@@ -589,20 +595,51 @@ export async function executeRescheduleAppointment(action, context) {
     bookStartTime = built.startTime;
     bookCalendarName = built.title;
     bookStatus = built.status;
-    console.log(`[ActionExecutor] Reschedule step 2/2: booking new appointment, calendar=${built.calendarId}, start=${built.startTime}${built.ignoreFreeSlotValidation ? ', override_availability=true' : ''}`);
+    console.log(`[ActionExecutor] Reschedule step 1/2: booking new appointment FIRST, calendar=${built.calendarId}, start=${built.startTime}${built.ignoreFreeSlotValidation ? ', override_availability=true' : ''}`);
     const bookResult = await ghlFetch('POST', '/calendars/events/appointments', built.body);
     newAppointmentId = bookResult?.id || bookResult?.appointment?.id || null;
-    console.log(`[ActionExecutor] ✅ Reschedule complete: new appointment id=${newAppointmentId}, status=${built.status}`);
+    if (!newAppointmentId) throw new Error('Booking returned no appointment id');
+    console.log(`[ActionExecutor] ✅ New appointment booked id=${newAppointmentId}, status=${built.status}`);
   } catch (err) {
-    console.error(`[ActionExecutor] ⚠️ Reschedule partial failure: old ${oldId} cancelled, new booking failed: ${err.message}`);
+    // New booking failed → DO NOT cancel the old slot. The lead keeps their
+    // existing appointment. Escalate to a rep and return a clean failure.
+    console.error(`[ActionExecutor] ⚠️ Reschedule book step failed; OLD APPOINTMENT LEFT INTACT for ${contactId}: ${err.message}`);
+    const requestedSlot = payload.new_start_time || payload.appointment_date || payload.appointment_time || 'requested time';
+    await executeCreateTask({
+      target_id: contactId,
+      action_payload: {
+        title: 'RESCHEDULE FAILED — new slot unavailable, old appt intact; rep action needed',
+        description: `Agentic reschedule for {{contact_name}} could not book the new slot (${requestedSlot}). The existing appointment (${oldId}) was LEFT INTACT — the lead still has their original appointment. A rep needs to manually rebook or confirm. GHL error: ${err.message}`,
+      },
+    }, context).catch((taskErr) =>
+      console.warn(`[ActionExecutor] reschedule escalation task failed for ${contactId}: ${taskErr.message}`));
     return {
-      action: 'reschedule_partial_failure',
+      action: 'reschedule_book_failed',
       old_appointment_id: oldId,
-      old_cancelled: true,
+      old_cancelled: false,
       new_appointment_booked: false,
+      escalated: true,
       contact_id: contactId,
       error: err.message,
     };
+  }
+
+  // ─── Step 2/2: cancel the old appointment (new is confirmed) ───────
+  // Mark the contact reschedule-in-flight BEFORE the cancel so the
+  // ghl.appointment_cancelled webhook our cancel emits is not read as a
+  // customer cold/warm cancellation (Bug 2b correlation marker).
+  await markRescheduleInflight(contactId).catch((err) =>
+    console.warn(`[ActionExecutor] reschedule-inflight mark failed for ${contactId}: ${err.message}`));
+  let oldCancelled = false;
+  console.log(`[ActionExecutor] Reschedule step 2/2: cancelling old appointment ${oldId} for contact ${contactId}`);
+  try {
+    await ghlFetch('PUT', `/calendars/events/appointments/${oldId}`, { appointmentStatus: 'cancelled' });
+    oldCancelled = true;
+    console.log(`[ActionExecutor] ✅ Old appointment ${oldId} cancelled`);
+  } catch (err) {
+    // New appt is already booked, so the lead is NOT stranded. Surface the
+    // stale old appointment for manual cleanup rather than failing the action.
+    console.warn(`[ActionExecutor] ⚠️ New appt ${newAppointmentId} booked but cancelling old ${oldId} failed (lead not stranded): ${err.message}`);
   }
 
   // ─── Optional: persist qualifying data on the contact ──────────────
@@ -614,7 +651,7 @@ export async function executeRescheduleAppointment(action, context) {
   return {
     action: 'appointment_rescheduled',
     old_appointment_id: oldId,
-    old_cancelled: true,
+    old_cancelled: oldCancelled,
     new_appointment_id: newAppointmentId,
     new_appointment_booked: true,
     new_calendar_name: bookCalendarName,

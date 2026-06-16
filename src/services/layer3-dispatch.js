@@ -21,6 +21,44 @@ import supabase from '../supabase.js';
 import { fetchUpcomingAppointments } from '../knowledge/contact-appointments.js';
 import { isInHomeCalendarId } from '../knowledge/booking-calendar-router.js';
 
+// 2026-06-16 — suppress disambiguation. `recommended_action: "suppress"` is
+// overloaded: the analyzer returns it for BOTH "the customer declined" and
+// "hold outreach, the lead is booked/satisfied". The suppress dispatch row runs
+// a hard not-interested closeout (P3 move, mark-p1-lost, suppress-outbound,
+// long-term-nurture). isGenuineDecline gates that destructive path behind an
+// affirmative decline signal so a benign ack (e.g. "Thank you." after a
+// confirmed booking) is never closed as lost. Conservative by design — false
+// positives here are exactly what caused the Jacqueline Virtue misfire.
+const DECLINE_OBJECTION_TYPES = new Set(['not-interested', 'not_interested', 'opt-out', 'opt_out', 'dnc']);
+const DECLINE_ENGAGEMENT_QUALITIES = new Set(['dnc', 'disengagement']);
+// Standalone refusal phrases only. "not interested in the 10am slot" must NOT
+// match — the negative lookahead drops "not interested in ...". objection_type /
+// engagement_quality are the primary signals; text is a conservative fallback.
+const DECLINE_TEXT_PATTERNS = [
+  /^\s*stop\b/i,
+  /\bunsubscribe\b/i,
+  /\bdo not contact\b/i,
+  /\bremove me\b/i,
+  /\bleave me alone\b/i,
+  /\bnot interested\b(?!\s+in\b)/i,
+];
+
+/**
+ * True ONLY when the payload carries an affirmative decline signal. Pure (no
+ * DB/GHL) so it is unit-testable. Reads the ai.analysis_completed payload
+ * fields (objection_type, engagement_quality, message_text).
+ */
+export function isGenuineDecline(payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  const objection = typeof payload.objection_type === 'string' ? payload.objection_type.toLowerCase() : null;
+  if (objection && DECLINE_OBJECTION_TYPES.has(objection)) return true;
+  const engagement = typeof payload.engagement_quality === 'string' ? payload.engagement_quality.toLowerCase() : null;
+  if (engagement && DECLINE_ENGAGEMENT_QUALITIES.has(engagement)) return true;
+  const text = typeof payload.message_text === 'string' ? payload.message_text : '';
+  if (text && DECLINE_TEXT_PATTERNS.some((re) => re.test(text))) return true;
+  return false;
+}
+
 /**
  * True when the contact has an active in-home appointment. Returns false on
  * any error or empty result (fail-open — never block a dispatch on a transient
@@ -66,6 +104,28 @@ export async function getDispatchForClassification(payload, opts = {}) {
     if (await hasActiveInHomeAppointment(contactId)) {
       console.log(`[layer3-dispatch] fast_track_booking suppressed: contact ${contactId} already has an active in-home appointment`);
       return { dispatch: null, reason: 'in_home_appointment_exists', recommended_action: recommended };
+    }
+  }
+
+  // 2026-06-16 — suppress disambiguation guard (Jacqueline Virtue misfire).
+  // The suppress dispatch row is a hard not-interested closeout. Only proceed
+  // when there's a genuine decline signal AND the contact has no active in-home
+  // appointment; otherwise treat as a benign HOLD (no destructive closeout).
+  // The appointment hard-block defers a real "cancel + not interested" from a
+  // booked contact to the explicit cancel/decline rules, not the over-broad
+  // suppress dispatch. Fail-open: hasActiveInHomeAppointment never throws.
+  if (recommended === 'suppress') {
+    const declineSignal = isGenuineDecline(payload);
+    const hadActiveAppointment = await hasActiveInHomeAppointment(opts.contactId || null);
+    if (!declineSignal || hadActiveAppointment) {
+      console.log(`[layer3-dispatch] suppress reclassified as benign hold: contact=${opts.contactId} decline_signal=${declineSignal} had_active_appointment=${hadActiveAppointment}`);
+      return {
+        dispatch: null,
+        reason: 'benign_hold_not_a_decline',
+        recommended_action: recommended,
+        decline_signal: declineSignal,
+        had_active_appointment: hadActiveAppointment,
+      };
     }
   }
 
