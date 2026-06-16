@@ -528,8 +528,9 @@ app.listen(PORT, async () => {
   startLeadStateSweepScheduler();
   startNoteChangeAnalyzerScheduler();
   startFbPublishWatchdog();
-  setTimeout(() => {
-    setTimeout(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, 120000);
+  // First field-sync ~60s after boot (was ~9.5 min), then every 15 min.
+  setTimeout(async () => {
+    try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); }
     setInterval(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, FIELD_SYNC_INTERVAL_MS);
-  }, 450000);
+  }, 60000);
 });
