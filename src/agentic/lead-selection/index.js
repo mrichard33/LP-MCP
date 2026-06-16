@@ -17,6 +17,33 @@ import { enrollTopN, enrollConfig } from './enroll.js';
 
 export { runScorePass, getSelectionReport, enrollTopN, enrollConfig };
 
+// ── Periodic score pass (keeps agentic_reengagement_candidates fresh) ──
+// Score-only: writes the candidate table (analysis output — never a GHL write
+// or a send), so it is safe to run unattended. Enrollment stays the separate,
+// gated step (mode:'enroll'). Default ON; disable with
+// LEAD_SELECTION_SCORE_ENABLED=false. First run is offset from the field-sync
+// boot job to avoid a thundering herd.
+const LEAD_SELECTION_SCORE_ENABLED   = process.env.LEAD_SELECTION_SCORE_ENABLED !== 'false';
+const LEAD_SELECTION_SCAN_INTERVAL_MS = Number(process.env.LEAD_SELECTION_SCAN_INTERVAL_MS || 24 * 60 * 60 * 1000);
+const LEAD_SELECTION_FIRST_RUN_MS     = Number(process.env.LEAD_SELECTION_FIRST_RUN_MS || 3 * 60 * 1000);
+
+export function startLeadSelectionScheduler() {
+  if (!LEAD_SELECTION_SCORE_ENABLED) {
+    console.log('[LeadSelection] score scheduler disabled (LEAD_SELECTION_SCORE_ENABLED=false)');
+    return;
+  }
+  const runOnce = async () => {
+    try {
+      const r = await runScorePass({});
+      console.log(`[LeadSelection] scheduled score pass: ${r.enrollable} enrollable / ${r.scanned} scanned`);
+    } catch (e) {
+      console.error('[LeadSelection] scheduled score pass failed:', e.message);
+    }
+  };
+  setTimeout(() => { runOnce(); setInterval(runOnce, LEAD_SELECTION_SCAN_INTERVAL_MS); }, LEAD_SELECTION_FIRST_RUN_MS);
+  console.log(`[LeadSelection] score scheduler armed (first run ${Math.round(LEAD_SELECTION_FIRST_RUN_MS/1000)}s, then every ${Math.round(LEAD_SELECTION_SCAN_INTERVAL_MS/3600000)}h)`);
+}
+
 export function registerLeadSelectionRoutes(app) {
   // POST /admin/lead-selection/run  { dry_run?, limit?, mode? }
   app.post('/admin/lead-selection/run', async (req, res) => {
