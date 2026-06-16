@@ -8,6 +8,13 @@
  *   v4.3 (2026-05-06): allow_backward payload flag bypasses the guard for
  *   intentional backward moves (remediation, cold-cancellation rerouting).
  *
+ *   v4.4 (2026-06-16): duplicate-opportunity recovery (N1). When the create
+ *   path's POST is rejected by GHL with 400 "Can not create duplicate
+ *   opportunity for the contact" (meta.existingId), update that existing opp
+ *   in place to the target stage/status instead of failing and being reaped.
+ *   The pipeline-scoped search can miss an opp that lives in another pipeline
+ *   or hasn't propagated yet; recovering by PUT mirrors the opps.length>0 path.
+ *
  * update_opportunity (v4.1): PUT monetaryValue, source, lostReasonId, status,
  *   name. Optionally also updates contact source and custom fields.
  *   Used for P2 value/source enrichment and loss intelligence.
@@ -75,15 +82,41 @@ export async function executeMoveOpportunity(action) {
   } else {
     const contactRes = await ghlFetch('GET', `/contacts/${contactId}`);
     const name = contactRes?.contact?.name || contactRes?.contact?.firstName || 'Unknown';
-    const newOpp = await ghlFetch('POST', '/opportunities/', {
-      pipelineId,
-      pipelineStageId: stageId,
-      locationId: GHL_LOCATION_ID,
-      contactId,
-      name,
-      status: status || 'open',
-    });
-    return { action: 'created', opportunity_id: newOpp?.opportunity?.id, pipeline, stage, status };
+    try {
+      const newOpp = await ghlFetch('POST', '/opportunities/', {
+        pipelineId,
+        pipelineStageId: stageId,
+        locationId: GHL_LOCATION_ID,
+        contactId,
+        name,
+        status: status || 'open',
+      });
+      return { action: 'created', opportunity_id: newOpp?.opportunity?.id, pipeline, stage, status };
+    } catch (err) {
+      // v4.4 (2026-06-16) — Duplicate-opportunity recovery (N1).
+      // GHL permits only one open opportunity per contact and rejects the
+      // create with 400 "Can not create duplicate opportunity", carrying the
+      // colliding opp in meta.existingId. The pipeline-scoped search above
+      // missed it (different pipeline, or eventual-consistency lag). Rather
+      // than fail and get reaped, update that existing opp in place to the
+      // target stage — the outcome the rule intended. Mirrors the PUT used
+      // when opps.length > 0.
+      const m = /"existingId"\s*:\s*"([^"]+)"/.exec(err?.message || '');
+      if (m) {
+        const existingId = m[1];
+        await ghlFetch('PUT', `/opportunities/${existingId}`, { pipelineStageId: stageId, status: status || 'open' });
+        console.log(`[ActionExecutor] ♻️ move_opportunity recovered from duplicate-opp 400 — updated existing opp ${existingId} → ${pipeline}/${stage}`);
+        return {
+          action: 'updated_existing_on_duplicate',
+          opportunity_id: existingId,
+          pipeline,
+          stage,
+          status,
+          recovered_from: 'duplicate_opportunity_400',
+        };
+      }
+      throw err;
+    }
   }
 }
 

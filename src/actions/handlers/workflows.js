@@ -31,6 +31,19 @@
  *   'json' → application/json. Use only when the destination explicitly
  *      requires JSON (non-GHL targets, future integrations).
  *
+ * v2.0 (2026-06-16) — Idempotency guard on add_to_workflow. Before enrolling,
+ *        skip when the contact already carries active-<canonical_code> for the
+ *        destination workflow (S4.1 → active-s4.1). Root cause of the 2026-06-16
+ *        reaped "failures" (Kessler / Wakefield / Stanton): STAGE_4/5_ROUTE fired
+ *        add_to_workflow for contacts already in the target workflow; the Route-B
+ *        webhook POST changes nothing, never confirms, stalls past the 10-min
+ *        executor TTL, and is reaped 3/3. These rules are single add_to_workflow
+ *        routes with NO tag actions, so there was never anything to "stage-swap" —
+ *        the real fix is idempotency here. Now resolves to
+ *        {action:'skipped_already_enrolled'} instead. Fail-soft: only fires when
+ *        canonical_code is present; any contact-read error proceeds with the
+ *        enrollment so a transient GHL hiccup can never block a legitimate route.
+ *
  * v1.9 (2026-06-10) — Resolver reads HL workflow_registry directly (re-apply of
  *        the chosen design lost in the #379 merge). Branch 2 no longer queries the
  *        LP-side workflow_canonical_map mirror; it calls
@@ -309,6 +322,38 @@ function buildLogLabel(payload, fallback) {
 }
 
 /**
+ * v2.0 — Idempotency helpers.
+ *
+ * deriveActiveTag: maps a destination workflow's canonical_code to the
+ * "active-<code>" enrollment tag the routing layer stamps when a contact is
+ * in that workflow (e.g. "S4.1" → "active-s4.1"). Returns null when no
+ * canonical_code is available, which disables the guard (fail-open).
+ *
+ * isAlreadyEnrolled: live GHL read of the contact's tags; true iff the
+ * derived active tag is present. Live (not cache) is deliberate — a stale
+ * cache miss would let a duplicate enrollment through, which is the exact
+ * failure we're closing. Fail-open on any read error so a transient GHL
+ * outage can never block a legitimate first-time enrollment.
+ */
+function deriveActiveTag(canonicalCode) {
+  if (!canonicalCode || typeof canonicalCode !== 'string') return null;
+  const code = canonicalCode.trim().toLowerCase();
+  return code ? `active-${code}` : null;
+}
+
+async function isAlreadyEnrolled(contactId, activeTag) {
+  if (!activeTag) return false;
+  try {
+    const res = await ghlFetch('GET', `/contacts/${contactId}`);
+    const tags = res?.contact?.tags || [];
+    return tags.includes(activeTag);
+  } catch (err) {
+    console.warn(`[ActionExecutor] idempotency tag-read failed for ${contactId} (fail-open, will enroll): ${err.message}`);
+    return false;
+  }
+}
+
+/**
  * v1.8 — Registry-lookup resolver (inert, fail-soft).
  *
  * Resolves the GHL workflow UUID a workflow action should target:
@@ -409,6 +454,27 @@ export async function executeAddToWorkflow(action) {
   const postSuccessAction = payload._post_success_action || null;
 
   if (!contactId) throw new Error('Missing contactId');
+
+  // ── v2.0 Idempotency guard ────────────────────────────────────
+  // Skip the enrollment entirely when the contact is already in the
+  // destination workflow (active-<canonical_code> present). This prevents the
+  // duplicate Route-B webhook POSTs that change nothing, never confirm, and get
+  // reaped after the >10min executor TTL (Kessler / Wakefield / Stanton
+  // 2026-06-16). Only engages when canonical_code is present; isAlreadyEnrolled
+  // fails open on any read error so a transient GHL hiccup can't block a route.
+  const activeTag = deriveActiveTag(canonicalCode);
+  if (activeTag && await isAlreadyEnrolled(contactId, activeTag)) {
+    console.log(`[ActionExecutor] ⏭️ add_to_workflow skipped — ${contactId} already has ${activeTag} (${wfLabel})`);
+    return {
+      action: 'skipped_already_enrolled',
+      contact_id: contactId,
+      canonical_code: canonicalCode,
+      canonical_name: canonicalName,
+      active_tag: activeTag,
+      workflow_name: payload.workflow_name || null,
+      route: 'skip',
+    };
+  }
 
   // ── Route B: POST to inbound webhook URL ──────────────────────
   // Default body format: application/x-www-form-urlencoded (GHL standard).
