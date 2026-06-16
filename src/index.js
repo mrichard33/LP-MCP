@@ -148,8 +148,8 @@ import {
   registerEnrollExistingEligibleRoutes,
 } from './agentic/lead-state/enroll-existing-eligible.js';
 // ─── Lead-Selection Engine (score the book → ranked/segmented S1.3 candidates) ─
-// Manual/admin-only, no scheduler. POST /admin/lead-selection/run | /report.
-import { registerLeadSelectionRoutes } from './agentic/lead-selection/index.js';
+// Daily score-pass scheduler + admin routes. POST /admin/lead-selection/run | /report.
+import { registerLeadSelectionRoutes, startLeadSelectionScheduler } from './agentic/lead-selection/index.js';
 // ─── Agentic Hold-Complete (return-from-hold re-entry) ───────────
 import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
 // ─── FB Publish Watchdog (alert on missed WF4 publish window) ────
@@ -527,6 +527,7 @@ app.listen(PORT, async () => {
   startDriftDetectorScheduler();
   startLeadStateSweepScheduler();
   startNoteChangeAnalyzerScheduler();
+  startLeadSelectionScheduler();
   startFbPublishWatchdog();
   // First field-sync ~60s after boot (was ~9.5 min), then every 15 min.
   setTimeout(async () => {

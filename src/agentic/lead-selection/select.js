@@ -59,6 +59,10 @@ const S1_3_HARD_EXCLUDE = [
 const HARD_DISPOSITIONS = new Set(['DNC', 'BD']);
 // NoHome disposition (recency-gated, not hard-excluded). Both spacings seen in data.
 const NOHOME_DISPOSITIONS = new Set(['NOHOME', 'NO HOME']);
+// No-show / cancel family — recency-gated like NoHome. Appointment set/confirmed
+// but no demo, or cancelled. Fresh ones are in active call-center (Hatch) rehash,
+// NOT stale-revival candidates. The classifier state lags, so gate on disposition.
+const NOSHOW_DISPOSITIONS = new Set(['SET', 'CNF', 'CXL', 'NO DEMO', 'NODEMO']);
 // Consent kill-switch / unreachable tags.
 const STOP_TAGS = new Set(['stop-bot', 'dnc', 'unsubscribed', 'do-not-contact']);
 // S1.1 in-flight tag (exclusivity).
@@ -88,7 +92,7 @@ async function fetchLeadMap(allIds) {
   for (const ids of chunkIds(allIds)) {
     const { data, error } = await supabase
       .from('lp_leads')
-      .select('ghl_contact_id, lp_prospect_id, lead_source, lead_source_detail, disposition_code, demo_completed, created_at_lp')
+      .select('ghl_contact_id, lp_prospect_id, lead_source, lead_source_detail, disposition_code, demo_completed, demo_date, appointment_date, created_at_lp')
       .in('ghl_contact_id', ids);
     if (error) throw new Error(`lp_leads join failed: ${error.message}`);
     for (const row of data || []) {
@@ -209,6 +213,12 @@ function evaluateExclusion({ stateRow, leadRow, tags, daysDormant, denylist, s11
 
   // Recency gate — post-demo declines (THE load-bearing gate: keeps actively-worked leads out).
   if (st === STATES.SUPPRESSED_POST_DEMO_DECLINE) {
+    // Backstop the dormancy signal (lp_notes can be sparse) with the demo date:
+    // a demo inside the stale window means a rep just ran it — not stale yet.
+    const demoMs = leadRow.demo_date ? Date.parse(leadRow.demo_date) : NaN;
+    if (Number.isFinite(demoMs) && (Date.now() - demoMs) < STALE_DECLINE_DAYS * 86400000) {
+      return 'decline_demo_too_fresh';
+    }
     if (daysDormant == null) return 'decline_recency_unknown';
     if (daysDormant < STALE_DECLINE_DAYS) return 'decline_too_fresh';
   }
@@ -224,6 +234,20 @@ function evaluateExclusion({ stateRow, leadRow, tags, daysDormant, denylist, s11
   if (NOHOME_DISPOSITIONS.has(disp)) {
     if (daysDormant == null) return 'nohome_recency_unknown';
     if (daysDormant < STALE_NOSHOW_DAYS) return 'nohome_too_fresh';
+  }
+
+  // Recency gate — no-show / cancel family (Set/Cnf/CXL/No Demo). Gate on the
+  // appointment date when present (most direct; also catches future appts: a
+  // future date yields a negative age, which is < the window), dormancy fallback.
+  if (NOSHOW_DISPOSITIONS.has(disp)) {
+    const apptMs = leadRow.appointment_date ? Date.parse(leadRow.appointment_date) : NaN;
+    if (Number.isFinite(apptMs)) {
+      if ((Date.now() - apptMs) < STALE_NOSHOW_DAYS * 86400000) return 'noshow_appt_too_fresh';
+    } else if (daysDormant == null) {
+      return 'noshow_recency_unknown';
+    } else if (daysDormant < STALE_NOSHOW_DAYS) {
+      return 'noshow_too_fresh';
+    }
   }
 
   // S1.1 ↔ S1.3 exclusivity — one re-engagement workflow per contact.
