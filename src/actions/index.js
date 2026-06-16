@@ -116,6 +116,10 @@ import { runPool, groupByBatch } from './concurrency.js';
 import { tryAcquireLock, releaseLock } from '../services/outbound-locks.js';
 import { getDispatchForClassification } from '../services/layer3-dispatch.js';
 
+// 2026-06-16 — Layer-3 suppress telemetry + silent agentic teardown
+import { emitEvent } from '../event-emitter.js';
+import { endAgenticHandoff } from '../services/agentic-handoff.js';
+
 // Phase 1 Intake/Routing Layer #51 — universal outbound suppression
 import { checkSuppression } from '../services/suppression-check.js';
 // Send-dedup — logical-identity idempotency for non-idempotent senders (2026-06-05)
@@ -249,6 +253,30 @@ async function executeLayer3Dispatch(action /*, context */) {
       `[ActionExecutor] layer3_dispatch skipped: action=${action.id} reason=${result.reason}` +
       (result.confidence !== undefined ? ` (confidence=${result.confidence}, threshold=${result.threshold})` : '')
     );
+    // 2026-06-16 — observability for the suppress benign-hold gate. Pure
+    // telemetry (no actions queued) so a misfire-that-would-have-been is
+    // queryable. Would have surfaced the Jacqueline Virtue case immediately.
+    if (result.reason === 'benign_hold_not_a_decline') {
+      await emitEvent({
+        event_type: 'layer3.suppress_reclassified_as_hold',
+        source: 'agent_executor',
+        entity_type: 'contact',
+        entity_id: String(dispatchContactId || ''),
+        ghl_contact_id: dispatchContactId || null,
+        payload: {
+          contact_id: dispatchContactId,
+          decline_signal: result.decline_signal ?? null,
+          had_active_appointment: result.had_active_appointment ?? null,
+          recommended_action: result.recommended_action || 'suppress',
+          message_preview: String(event.payload?.message_text || event.payload?.message_preview || '').slice(0, 200),
+        },
+        priority: 'normal',
+        // No consuming rule — bypass the default-drop intake filter so this
+        // observability event lands in system_events (not system_events_filtered)
+        // and stays queryable. Marked no_matching_rules on processing (harmless).
+        bypass_filter: true,
+      }).catch((err) => console.warn(`[ActionExecutor] layer3_dispatch hold-telemetry emit failed: ${err.message}`));
+    }
     return { skipped: true, ...result };
   }
 
@@ -345,6 +373,7 @@ const ACTION_HANDLERS = {
   classify_bucket: executeClassifyBucket,        // 2026-05-13 — Phase 1 #56 bucket→workflow resolver
   transition_objection_state: executeTransitionObjectionState, // 2026-05-14 — S5.2 v2 objection-state substrate writer (Spec v1.2)
   classify_lead_state: executeClassifyLeadState, // 2026-06-02 — Phase 2 lead-state classifier + S4.5 enrollment (reactive invoker)
+  end_agentic_handoff: (action) => endAgenticHandoff(action.target_id), // 2026-06-16 — silent agentic-active teardown on terminal closeout
 };
 
 // Handlers that need the triggering event's payload injected as context.

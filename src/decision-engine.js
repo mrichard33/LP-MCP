@@ -166,6 +166,7 @@ import { tryClaimEvent, recordResult } from './services/idempotency.js';
 // the Layer-3 post-book guard uses, exposed as a context_conditions operator so
 // escalation/objection/callback rules can opt out while a booking is in flight.
 import { hasActiveInHomeAppointment } from './services/layer3-dispatch.js';
+import { isRescheduleInflight } from './services/reschedule-inflight.js';
 
 // Universal Hold timeout routing (2026-06-12). Two booking-push-timeout gates for
 // the S1.3 → S2.2 path, sharing the live GHL helpers already used elsewhere:
@@ -635,6 +636,21 @@ async function evaluateContextConditions(conditions, intelligence, event) {
         if (!expected) break; // only gate when set truthy
         if (await hasActiveInHomeAppointment(event.ghl_contact_id)) {
           console.log(`[Context] BLOCKED: not_active_in_home_appointment — contact ${event.ghl_contact_id} has an active in-home appt`);
+          return false;
+        }
+        break;
+      }
+
+      // 2026-06-16 — agent-reschedule correlation guard. Blocks customer-
+      // cancellation rules (GHL_APPT_CANCELLED_REBOOK_COLD / _REBOOK) from
+      // firing on the ghl.appointment_cancelled webhook that an agentic
+      // reschedule's own old-slot cancel emits. The reschedule handler sets a
+      // short-lived in-flight marker before cancelling. Fail-open built into
+      // the helper so a transient lookup never drops a real customer cancel.
+      case 'not_reschedule_inflight': {
+        if (!expected) break; // only gate when set truthy
+        if (await isRescheduleInflight(event.ghl_contact_id)) {
+          console.log(`[Context] BLOCKED: not_reschedule_inflight — contact ${event.ghl_contact_id} has an agent reschedule in flight`);
           return false;
         }
         break;
