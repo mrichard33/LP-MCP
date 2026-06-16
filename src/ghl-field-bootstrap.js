@@ -61,8 +61,9 @@ export async function runBulkFieldSync() {
   // 1. Field sync — push LP custom field data to GHL contacts
   try {
     const fieldStats = await bulkFieldSync(100, 200);
-    if (fieldStats.pushed > 0 || fieldStats.failed > 0) {
-      console.log(`[FieldSync] Bulk: ${fieldStats.pushed} updated, ${fieldStats.skipped} unchanged, ${fieldStats.failed} failed`);
+    if (fieldStats.pushed > 0 || fieldStats.failed > 0 || fieldStats.deferred > 0) {
+      const deferredNote = fieldStats.deferred > 0 ? `, ${fieldStats.deferred} deferred (push cap)` : '';
+      console.log(`[FieldSync] Bulk: ${fieldStats.pushed} updated, ${fieldStats.skipped} unchanged, ${fieldStats.failed} failed${deferredNote}`);
     }
   } catch (err) {
     console.warn('[FieldSync] Bulk sync failed:', err.message);

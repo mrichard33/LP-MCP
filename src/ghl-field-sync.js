@@ -35,7 +35,7 @@ let fieldSyncStats = { checked: 0, pushed: 0, skipped: 0, failed: 0, cleared: 0 
  * @param {Array} leads - All lp_leads rows for one GHL contact
  * @returns {Object} Merged lead object compatible with field map transforms
  */
-function buildMergedLead(leads) {
+export function buildMergedLead(leads) {
   if (!leads || leads.length === 0) return null;
 
   // Sort by updated_at_lp DESC — newest first
@@ -157,13 +157,20 @@ export async function syncLeadFieldsToGHL(lead, ghlContactId, storedHash) {
   if (result === true) {
     fieldSyncStats.pushed++;
 
-    // Store new hash on the NEWEST lead row for this contact
+    // Store new hash on ALL lp_leads rows for this contact — not just the
+    // newest. The change-detection hash is logically a CONTACT-level value
+    // (the merged payload covers all of a contact's leads), so writing it to
+    // every row keeps it consistent regardless of which lead is "newest". This
+    // removes the stranded-hash fragility: when a newly-synced lead becomes the
+    // newest, it inherits the contact's current hash instead of a NULL that
+    // forces a redundant push — and a legitimate re-push can't be falsely
+    // skipped by a stale per-lead hash left on an older row.
     try {
       await supabase.from('lp_leads')
         .update({ ghl_fields_hash: newHash })
-        .eq('lp_lead_id', lead.lp_lead_id);
+        .eq('ghl_contact_id', ghlContactId);
     } catch (err) {
-      console.warn(`[FieldSync] Hash update failed for ${lead.lp_lead_id}:`, err.message);
+      console.warn(`[FieldSync] Hash update failed for contact ${ghlContactId}:`, err.message);
     }
 
     return { pushed: true, hash: newHash };
@@ -178,34 +185,65 @@ export async function syncLeadFieldsToGHL(lead, ghlContactId, storedHash) {
   }
 }
 
+// Per-cycle cap on the number of GHL pushes. Without this, a population-wide
+// catch-up (e.g. after the pagination fix exposed thousands of never-synced
+// contacts) would push every changed contact in a single cycle, tripping
+// disposition-keyed agent rules and saturating the shared GHL rate limiter
+// (the 2026-06 token-starvation storm). Unchanged contacts still hash-skip for
+// free; only actual pushes count against the cap, so the backlog drains
+// gradually over successive cycles. Env-tunable; safe default below.
+const DEFAULT_MAX_PUSHES_PER_CYCLE = Math.max(
+  1,
+  parseInt(process.env.FIELD_SYNC_MAX_PUSHES_PER_CYCLE || '150', 10)
+);
+
+// Supabase caps un-ranged selects at 1000 rows (default max_rows). With >5k
+// GHL-matched leads, an un-paginated query silently processed only the 1000
+// most-recently-updated leads, leaving older contacts permanently stale and
+// producing wrong merges for contacts only partially inside the window.
+const LEAD_PAGE_SIZE = 1000;
+
 /**
  * Bulk field sync — queries ALL leads per GHL contact and merges them.
  *
  * @param {number} batchSize - Not used but kept for API compat
  * @param {number} delayMs - Delay between GHL API calls in ms (default 200)
+ * @param {number} maxPushesPerCycle - Cap on GHL pushes this cycle (env-tunable)
  * @returns {Object} { total, pushed, skipped, failed, cleared }
  */
-export async function bulkFieldSync(batchSize = 100, delayMs = 200) {
+export async function bulkFieldSync(batchSize = 100, delayMs = 200, maxPushesPerCycle = DEFAULT_MAX_PUSHES_PER_CYCLE) {
   const { configured } = getConfiguredFieldCount();
   if (configured === 0) {
     console.log('[FieldSync] No GHL fields configured — skipping bulk sync');
     return { total: 0, pushed: 0, skipped: 0, failed: 0, cleared: 0 };
   }
 
-  const stats = { total: 0, pushed: 0, skipped: 0, failed: 0, cleared: 0 };
+  const stats = { total: 0, pushed: 0, skipped: 0, failed: 0, cleared: 0, deferred: 0 };
   const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
   try {
-    // Get ALL leads with GHL matches (not just newest — we need all for aggregation)
-    const { data: allLeads, error } = await supabase
-      .from('lp_leads')
-      .select('lp_lead_id, lp_prospect_id, ghl_contact_id, ghl_fields_hash, disposition_code, disposition_label, rep_name, promoter_name, appointment_set, appointment_date, demo_completed, closed_won, job_value, lead_source, lead_source_detail, call_count, last_contact_date, updated_at_lp')
-      .not('ghl_contact_id', 'is', null)
-      .order('updated_at_lp', { ascending: false });
+    // Get ALL leads with GHL matches (not just newest — we need all for
+    // aggregation). Paginate via .range() so we are not silently capped at
+    // Supabase's 1000-row default — otherwise contacts whose leads fall
+    // outside the 1000 most-recently-updated are never synced.
+    const allLeads = [];
+    let offset = 0;
+    while (true) {
+      const { data, error } = await supabase
+        .from('lp_leads')
+        .select('lp_lead_id, lp_prospect_id, ghl_contact_id, ghl_fields_hash, disposition_code, disposition_label, rep_name, promoter_name, appointment_set, appointment_date, demo_completed, closed_won, job_value, lead_source, lead_source_detail, call_count, last_contact_date, updated_at_lp')
+        .not('ghl_contact_id', 'is', null)
+        .order('updated_at_lp', { ascending: false })
+        .range(offset, offset + LEAD_PAGE_SIZE - 1);
 
-    if (error || !allLeads) {
-      console.error('[FieldSync] Query failed:', error?.message || 'no data');
-      return stats;
+      if (error) {
+        console.error('[FieldSync] Query failed:', error.message);
+        return stats;
+      }
+      if (!data || data.length === 0) break;
+      allLeads.push(...data);
+      if (data.length < LEAD_PAGE_SIZE) break;
+      offset += LEAD_PAGE_SIZE;
     }
 
     // Group leads by GHL contact ID
@@ -217,14 +255,25 @@ export async function bulkFieldSync(batchSize = 100, delayMs = 200) {
       byContact.get(lead.ghl_contact_id).push(lead);
     }
 
-    console.log(`[FieldSync] ${allLeads.length} GHL-matched leads → ${byContact.size} unique contacts`);
+    console.log(`[FieldSync] ${allLeads.length} GHL-matched leads → ${byContact.size} unique contacts (max ${maxPushesPerCycle} pushes/cycle)`);
 
-    // Process each contact with merged data
+    // Process each contact with merged data. We iterate EVERY contact so the
+    // cheap hash-skip runs for all of them; once we've issued maxPushesPerCycle
+    // actual pushes we stop pushing (defer the rest to the next cycle) rather
+    // than breaking, so the stale backlog — not just recently-updated contacts —
+    // gets a fair turn each cycle.
     for (const [ghlContactId, leads] of byContact) {
       stats.total++;
 
       const merged = buildMergedLead(leads);
       if (!merged) continue;
+
+      // Push budget exhausted — leave this contact's hash untouched so it is
+      // re-evaluated and pushed on a later cycle.
+      if (stats.pushed >= maxPushesPerCycle) {
+        stats.deferred++;
+        continue;
+      }
 
       const result = await syncLeadFieldsToGHL(merged, ghlContactId, merged.ghl_fields_hash);
       if (result.pushed) {
@@ -241,8 +290,8 @@ export async function bulkFieldSync(batchSize = 100, delayMs = 200) {
     stats.failed++;
   }
 
-  if (stats.pushed > 0 || stats.failed > 0 || stats.cleared > 0) {
-    console.log(`[FieldSync] Bulk sync: ${stats.total} contacts, ${stats.pushed} pushed, ${stats.skipped} unchanged, ${stats.failed} failed, ${stats.cleared} stale IDs cleared`);
+  if (stats.pushed > 0 || stats.failed > 0 || stats.cleared > 0 || stats.deferred > 0) {
+    console.log(`[FieldSync] Bulk sync: ${stats.total} contacts, ${stats.pushed} pushed, ${stats.skipped} unchanged, ${stats.failed} failed, ${stats.cleared} stale IDs cleared, ${stats.deferred} deferred (push cap)`);
   }
   return stats;
 }
