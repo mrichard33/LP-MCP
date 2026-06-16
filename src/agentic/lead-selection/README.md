@@ -71,21 +71,30 @@ Offer is **LOCKED** to "Protection Profile Review" (deliverable "Protection Prof
 "Documented Home Protection Review" (retired). No insurance-carrier / claim-outcome language anywhere.
 
 ## Exclusion gate (every exclusion is written, `enrollable=false` + `exclusion_reason`)
-`no_ghl_match` (no lp row) · `hard_disposition` (DNC/BD only) · `stop_bot` (stop-bot/dnc/unsubscribed
-tag) · `prospect_denylist` · `low_confidence` (<0.75) · `decline_recency_unknown` /
-`decline_too_fresh` (<90d) · `confirmed_loss_v2_deferred` / `loss_too_fresh` (<365d) ·
-`nohome_recency_unknown` / `nohome_too_fresh` (<90d) · `s1_1_active` (S1.1 enrollment action or
-`re-engagement-eligible` tag).
+`no_ghl_match` (no lp row) · `hard_disposition` (DNC/BD only) ·
+`data_needs_never_quoted_opener` (Data — never booked; held pending a never-quoted opener) ·
+`stop_bot` (stop-bot/dnc/unsubscribed tag) · `prospect_denylist` · `low_confidence` (<0.75) ·
+`decline_recency_unknown` / `decline_too_fresh` (<90d) · `confirmed_loss_v2_deferred` /
+`loss_too_fresh` (<365d) · `appt_recency_unknown` / `appt_too_fresh` (<90d — appointment-bearing
+dispositions: Set/Cnf/CXL/No Demo/NoHome/NIS/CCC/BO/1Leg/NOC/Issue/Verif) ·
+`norehash_recency_unknown` / `norehash_hold_active` (<365d — rep-hold on its own clock) ·
+`s1_1_active` (S1.1 enrollment action or `re-engagement-eligible` tag).
 
 The **decline recency gate is load-bearing**: most classified post-demo declines have rep activity
 within 90 days (appointment confirmations, call summaries, rep SMS). Without it the engine would
 enroll actively-worked leads into an S1.3 SMS sequence.
 
-**`NoHome` is recoverable, not unqualified.** It means *"not home for the appointment"* (a missed
-in-home run — same recoverable family as `CXL`/`NIS`), **not** "non-homeowner". It is **not**
-hard-excluded; it is recency-gated on disposition (fresh ones are in active Hatch "Cancels"-board
-rehash; the classifier state can lag, so we gate on disposition, not state). Only `DNC` (legal) and
-`BD` (bad data) are hard-disposition excludes.
+**RULE #0 — dormancy is the eligibility test, not disposition.** S1.3 is the dormant/cold
+resurrection net. Disposition no longer decides eligibility; it only selects **which recency clock to
+read**. A fresh appointment-bearing lead (incl. `NoHome` — *"not home for the appointment"*, not
+"non-homeowner") is still owned by the **active lane** (call-center "Cancels"-board rehash; O.0 /
+S5.2 v2 for the objection codes `1Leg`/`NOC`); it is released into S1.3 only once it has **gone dark**
+past the window — gated on the appointment date (dormancy fallback). `NoRehash` rides its own,
+**wider** clock: gate on dormancy (an old demo can sit under a fresh, still-active hold), and active
+holds never reach here because the state gate excludes them. `Data` (never booked an appointment) is
+reactivation-eligible in principle but parked as `data_needs_never_quoted_opener` until a never-quoted
+opener variant ships (the current copy presumes a prior estimate). Only `DNC` (legal) and `BD` (bad
+data) are age-immune hard-disposition excludes.
 
 ## Enrollment route
 S1.3 is a published `inbound_webhook` workflow. The action carries `webhook_url`
@@ -105,8 +114,9 @@ Route B is proven (S1.0/S1.1 run on it), and verified end-to-end on the Mark Tes
 | `S1_REENGAGEMENT_REQUIRE_APPROVAL` | `true` | enqueued actions require human approval before the executor fires |
 | `S1_3_INCLUDE_CONFIRMED_LOSS` | `false` (v2) | include `SUPPRESSED_CONFIRMED_LOSS` (≥365d) as candidates |
 | `S1_3_STALE_DECLINE_DAYS` | `90` | post-demo decline dormancy floor |
-| `S1_3_STALE_NOSHOW_DAYS` | `90` (= decline) | `NoHome` no-show dormancy floor |
+| `S1_3_STALE_NOSHOW_DAYS` | `90` (= decline) | dormancy floor for all appointment-bearing dispositions (Set/Cnf/CXL/No Demo/NoHome/NIS/CCC/BO/1Leg/NOC/Issue/Verif) |
 | `S1_3_STALE_LOSS_DAYS` | `365` | confirmed-loss dormancy floor |
+| `S1_3_STALE_NOREHASH_DAYS` | `365` (= loss) | rep-hold (`NoRehash`) dormancy floor — wider berth, its own clock |
 | `S1_3_COOLDOWN_DAYS` | `90` | re-enrollment cooldown |
 | `S1_REENGAGEMENT_ENROLL_LIMIT` | `25` | default top-N per enroll run |
 | `S1_3_INBOUND_WEBHOOK_URL` | (built-in default) | Route B inbound-webhook trigger URL the executor POSTs to |
