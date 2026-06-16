@@ -194,7 +194,7 @@ export async function syncLeadFieldsToGHL(lead, ghlContactId, storedHash) {
 // gradually over successive cycles. Env-tunable; safe default below.
 const DEFAULT_MAX_PUSHES_PER_CYCLE = Math.max(
   1,
-  parseInt(process.env.FIELD_SYNC_MAX_PUSHES_PER_CYCLE || '150', 10)
+  parseInt(process.env.FIELD_SYNC_MAX_PUSHES_PER_CYCLE || '500', 10)
 );
 
 // Supabase caps un-ranged selects at 1000 rows (default max_rows). With >5k
@@ -257,25 +257,53 @@ export async function bulkFieldSync(batchSize = 100, delayMs = 200, maxPushesPer
 
     console.log(`[FieldSync] ${allLeads.length} GHL-matched leads → ${byContact.size} unique contacts (max ${maxPushesPerCycle} pushes/cycle)`);
 
-    // Process each contact with merged data. We iterate EVERY contact so the
-    // cheap hash-skip runs for all of them; once we've issued maxPushesPerCycle
-    // actual pushes we stop pushing (defer the rest to the next cycle) rather
-    // than breaking, so the stale backlog — not just recently-updated contacts —
-    // gets a fair turn each cycle.
+    // ── Phase 1: find the contacts that ACTUALLY need a push (no GHL calls) ──
+    // Build the merged payload + hash for every contact and compare to the stored
+    // hash. Unchanged contacts skip for free. Collecting the changed set up front
+    // lets us PRIORITISE it instead of pushing in raw recency order — raw recency
+    // order is what starved the oldest / never-synced contacts (dormant OPPFDN,
+    // CXL, etc.) behind the per-cycle cap: newest churn consumed the budget every
+    // cycle and the back never got a turn.
+    const pending = [];
     for (const [ghlContactId, leads] of byContact) {
       stats.total++;
-
       const merged = buildMergedLead(leads);
       if (!merged) continue;
 
-      // Push budget exhausted — leave this contact's hash untouched so it is
-      // re-evaluated and pushed on a later cycle.
-      if (stats.pushed >= maxPushesPerCycle) {
-        stats.deferred++;
-        continue;
-      }
+      const fields = buildGHLFieldPayload(merged);
+      if (fields.length === 0) { stats.skipped++; continue; }
 
-      const result = await syncLeadFieldsToGHL(merged, ghlContactId, merged.ghl_fields_hash);
+      const newHash = computeFieldHash(fields);
+      if (newHash === merged.ghl_fields_hash) { stats.skipped++; continue; } // unchanged — free skip
+
+      // Newest lead recency for this contact (used for fair, oldest-first draining).
+      const newestUpdate = leads.reduce((acc, l) => {
+        const t = new Date(l.updated_at_lp || 0).getTime();
+        return t > acc ? t : acc;
+      }, 0);
+
+      pending.push({
+        ghlContactId,
+        merged,
+        neverSynced: merged.ghl_fields_hash == null,
+        newestUpdate,
+      });
+    }
+
+    // ── Phase 2: prioritise, then push up to the cap ──
+    // 1) Never-synced first (true backfill: null hash — brand-new leads AND the
+    //    multi-lead stranded set).
+    // 2) Then OLDEST-updated first, so the long-tail backlog drains fairly instead
+    //    of newest-always-wins. Guarantees dormant targets reach GHL in the first
+    //    cycle(s) instead of being perpetually deferred.
+    pending.sort((a, b) => {
+      if (a.neverSynced !== b.neverSynced) return a.neverSynced ? -1 : 1;
+      return a.newestUpdate - b.newestUpdate; // oldest first
+    });
+
+    for (const c of pending) {
+      if (stats.pushed >= maxPushesPerCycle) { stats.deferred++; continue; }
+      const result = await syncLeadFieldsToGHL(c.merged, c.ghlContactId, c.merged.ghl_fields_hash);
       if (result.pushed) {
         stats.pushed++;
         await sleep(delayMs);
