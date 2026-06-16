@@ -42,6 +42,7 @@ const CONFIDENCE_FLOOR     = AUTO_EXECUTE_THRESHOLD;  // 0.75 (cheap guard; iner
 const STALE_DECLINE_DAYS   = Number(process.env.S1_3_STALE_DECLINE_DAYS || 90);
 const STALE_NOSHOW_DAYS    = Number(process.env.S1_3_STALE_NOSHOW_DAYS || STALE_DECLINE_DAYS); // NoHome fuse (= decline)
 const STALE_LOSS_DAYS      = Number(process.env.S1_3_STALE_LOSS_DAYS || 365);
+const STALE_NOREHASH_DAYS  = Number(process.env.S1_3_STALE_NOREHASH_DAYS || STALE_LOSS_DAYS); // rep-hold fuse (wide berth; honor until clearly stale)
 const INCLUDE_CONFIRMED_LOSS = process.env.S1_3_INCLUDE_CONFIRMED_LOSS === 'true'; // default false (v2)
 
 // Reactivation targets = the two decline/loss states we WANT for S1.3.
@@ -52,17 +53,39 @@ const S1_3_HARD_EXCLUDE = [
   STATES.UNCLASSIFIED,
 ];
 
-// Disposition hard-excludes (compliance / bad data only).
-// NoHome is NOT here — it means "not home for the appointment" (a recoverable
-// no-show, same family as CXL/NIS), not "non-homeowner". It is recency-gated
-// below instead (fresh ones are in active Hatch rehash).
+// ── Disposition gates — DORMANCY is the eligibility test, not disposition ──
+// Doctrine (RULE #0): S1.3 is the dormant/cold resurrection net. A lead is
+// eligible once it has gone dark past the dormancy window AND is not currently
+// active (active/customer/legal states are excluded at the query level via
+// S1_3_HARD_EXCLUDE) AND is not compliance-stopped. Disposition is NOT an
+// allow/deny filter — it only selects WHICH recency clock to read.
+
+// Compliance / bad data — age-immune, never eligible at any dormancy.
 const HARD_DISPOSITIONS = new Set(['DNC', 'BD']);
-// NoHome disposition (recency-gated, not hard-excluded). Both spacings seen in data.
-const NOHOME_DISPOSITIONS = new Set(['NOHOME', 'NO HOME']);
-// No-show / cancel family — recency-gated like NoHome. Appointment set/confirmed
-// but no demo, or cancelled. Fresh ones are in active call-center (Hatch) rehash,
-// NOT stale-revival candidates. The classifier state lags, so gate on disposition.
-const NOSHOW_DISPOSITIONS = new Set(['SET', 'CNF', 'CXL', 'NO DEMO', 'NODEMO']);
+
+// Appointment-bearing dispositions — each booked an appointment, so gate on the
+// appointment date (most direct; also catches future appts, which yield a
+// negative age < the window), dormancy as fallback. Fresh = still owned by the
+// active lane (call-center rehash; O.0 / S5.2 v2 for the objection codes
+// 1Leg/NOC); dormant = released into S1.3. Absorbs the former NOHOME + no-show
+// sets and adds the codes that were leaking fresh (1Leg/NOC/Issue/Verif/NIS/CCC/BO).
+const APPT_BEARING_DISPOSITIONS = new Set([
+  'SET', 'CNF', 'CXL', 'NO DEMO', 'NODEMO', 'NOHOME', 'NO HOME',
+  'NIS', 'CCC', 'BO', '1LEG', 'NOC', 'ISSUE', 'VERIF',
+]);
+
+// Rep-placed "do not rehash" hold. Honor it until it goes stale — gate on
+// DORMANCY (time since last activity), NOT the appointment date: the original
+// demo can be old while the hold is fresh on an active deal. Wider berth than
+// the no-show window. Active holds (hold:no-rehash tag) never reach here — the
+// state gate excludes them; this only catches stale, gone-dark holds.
+const REPHOLD_DISPOSITIONS = new Set(['NOREHASH']);
+
+// Never booked an appointment (0% appt_set). Reactivation-eligible in principle,
+// but S1.3's current copy presumes a prior estimate — a relevance miss for these.
+// Held until a "never-quoted" opener variant ships; remove from this set to
+// switch Data on (one-line flip).
+const NEEDS_NEVER_QUOTED_OPENER = new Set(['DATA']);
 // Consent kill-switch / unreachable tags.
 const STOP_TAGS = new Set(['stop-bot', 'dnc', 'unsubscribed', 'do-not-contact']);
 // S1.1 in-flight tag (exclusivity).
@@ -199,6 +222,10 @@ function evaluateExclusion({ stateRow, leadRow, tags, daysDormant, denylist, s11
   const disp = String(leadRow.disposition_code || '').trim().toUpperCase();
   if (HARD_DISPOSITIONS.has(disp)) return 'hard_disposition';
 
+  // Relevance carve-out — never-booked (no estimate to "move forward" on).
+  // Held until the never-quoted opener ships (see set definition).
+  if (NEEDS_NEVER_QUOTED_OPENER.has(disp)) return 'data_needs_never_quoted_opener';
+
   // Consent kill-switch / unreachable tags.
   if (tags) {
     for (const t of STOP_TAGS) if (tags.has(t)) return 'stop_bot';
@@ -229,25 +256,24 @@ function evaluateExclusion({ stateRow, leadRow, tags, daysDormant, denylist, s11
     if (daysDormant == null || daysDormant < STALE_LOSS_DAYS) return 'loss_too_fresh';
   }
 
-  // Recency gate — NoHome no-shows. Gate on DISPOSITION (not state): the classifier
-  // state can lag, and fresh NoHome leads are in active Hatch "Cancels"-board rehash.
-  if (NOHOME_DISPOSITIONS.has(disp)) {
-    if (daysDormant == null) return 'nohome_recency_unknown';
-    if (daysDormant < STALE_NOSHOW_DAYS) return 'nohome_too_fresh';
-  }
-
-  // Recency gate — no-show / cancel family (Set/Cnf/CXL/No Demo). Gate on the
-  // appointment date when present (most direct; also catches future appts: a
-  // future date yields a negative age, which is < the window), dormancy fallback.
-  if (NOSHOW_DISPOSITIONS.has(disp)) {
+  // Dormancy gate — appointment-bearing dispositions (appointment_date primary,
+  // dormancy fallback). Holds anything still being worked in the active lane;
+  // releases only once it has gone dark past the window.
+  if (APPT_BEARING_DISPOSITIONS.has(disp)) {
     const apptMs = leadRow.appointment_date ? Date.parse(leadRow.appointment_date) : NaN;
     if (Number.isFinite(apptMs)) {
-      if ((Date.now() - apptMs) < STALE_NOSHOW_DAYS * 86400000) return 'noshow_appt_too_fresh';
+      if ((Date.now() - apptMs) < STALE_NOSHOW_DAYS * 86400000) return 'appt_too_fresh';
     } else if (daysDormant == null) {
-      return 'noshow_recency_unknown';
+      return 'appt_recency_unknown';
     } else if (daysDormant < STALE_NOSHOW_DAYS) {
-      return 'noshow_too_fresh';
+      return 'appt_too_fresh';
     }
+  }
+
+  // Dormancy gate — rep-hold (NoRehash), on its own clock with a wider berth.
+  if (REPHOLD_DISPOSITIONS.has(disp)) {
+    if (daysDormant == null) return 'norehash_recency_unknown';
+    if (daysDormant < STALE_NOREHASH_DAYS) return 'norehash_hold_active';
   }
 
   // S1.1 ↔ S1.3 exclusivity — one re-engagement workflow per contact.
@@ -385,7 +411,9 @@ export async function runScorePass({ limit = DEFAULT_LIMIT, dryRun = false } = {
         limit,
         confidence_floor: CONFIDENCE_FLOOR,
         stale_decline_days: STALE_DECLINE_DAYS,
+        stale_noshow_days: STALE_NOSHOW_DAYS,
         stale_loss_days: STALE_LOSS_DAYS,
+        stale_norehash_days: STALE_NOREHASH_DAYS,
         include_confirmed_loss: INCLUDE_CONFIRMED_LOSS,
         hard_exclude_states: S1_3_HARD_EXCLUDE,
         tier1_offer: TIER1_OFFER,
