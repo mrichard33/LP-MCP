@@ -304,7 +304,7 @@ const QUALIFYING_TAGS = [
   'bj:stage-3-comparing', 'bj:stage-4-negotiating', 'bj:stage-5-committed',
 ];
 
-async function passesStageGate(event, rule) {
+async function passesStageGate(event, rule, intelligence) {
   if (!isBehavioralRule(rule.rule_key)) return true;
 
   const contactId = event.ghl_contact_id;
@@ -335,8 +335,8 @@ async function passesStageGate(event, rule) {
 
     const tags = contact.tags || [];
     const hasQualifyingTag = tags.some(t => QUALIFYING_TAGS.includes(t));
-    const payloadStage = event.payload?.buyer_stage;
-    const hasMinStage = payloadStage && payloadStage >= 3;
+    const stage = event.payload?.buyer_stage ?? intelligence?.buyer_stage;
+    const hasMinStage = Number.isFinite(Number(stage)) && Number(stage) >= 3;
 
     if (!hasQualifyingTag && !hasMinStage) {
       console.log(`[StageGate] BLOCKED ${rule.rule_key} for ${contactId}: not qualified`);
@@ -459,6 +459,45 @@ async function fetchContactTags(ghlContactId) {
   } catch { return []; }
 }
 
+// Demo-state resolver (2026-06-17). Authoritative-first: LP disposition (system
+// of record) -> sync-derived lp-demo-completed tag -> analyzer buyer_stage.
+// Returns 'post' | 'pre' | 'unknown'. The drift-prone stage:* tags are NOT
+// trusted here — only the disposition, the sync-derived lp-demo-completed tag,
+// and the analyzer buyer_stage decide. (Mark: tags are not always accurate.)
+//
+// VALIDATE this set against the lp_dispositions table / Master System Map before
+// merging — these are the dispositions that mean a demo actually occurred
+// (Sale will normally be excluded upstream as customer). No-show / cancel
+// dispositions are intentionally NOT here (they are APPOINTMENT_DISRUPTION and
+// route to S5.2 v2 via their own LP_DISP_* rules, not O.0).
+const DEMO_COMPLETE_DISPOSITIONS = ['FDNS', 'OPPFDN', 'Sale', '1Leg', 'BO'];
+
+async function resolveDemoState(event, intelligence) {
+  const intel = intelligence || {};
+  const ghlContactId = event?.ghl_contact_id || null;
+  // 1) LP disposition — system of record (wins when present)
+  if (ghlContactId) {
+    const { data: lpLead } = await supabase.from('lp_leads')
+      .select('disposition_code')
+      .eq('ghl_contact_id', ghlContactId)
+      .order('synced_at', { ascending: false })
+      .limit(1).maybeSingle();
+    const disp = lpLead?.disposition_code || null;
+    if (disp && DEMO_COMPLETE_DISPOSITIONS.includes(disp)) return 'post';
+  }
+  // 2) lp-demo-completed tag — sync-derived mirror of the LP disposition,
+  //    higher fidelity than stage:* tags.
+  const tags = await fetchContactTags(ghlContactId);
+  if (tags.includes('lp-demo-completed')) return 'post';
+  // 3) analyzer buyer_stage (1 indifferent .. 5 committed)
+  const bs = Number(intel.buyer_stage ?? event?.payload?.buyer_stage);
+  if (Number.isFinite(bs)) {
+    if (bs >= 5) return 'post';
+    if (bs >= 1 && bs <= 4) return 'pre';
+  }
+  return 'unknown';
+}
+
 async function fetchContactCustomFields(ghlContactId) {
   const GHL_API_KEY = process.env.GHL_API_KEY;
   if (!GHL_API_KEY || !ghlContactId) return [];
@@ -544,6 +583,14 @@ async function evaluateContextConditions(conditions, intelligence, event) {
       case 'buyer_stage_gte': if ((merged.buyer_stage || 0) < expected) return false; break;
       case 'buyer_stage_lte': if ((merged.buyer_stage || 0) > expected) return false; break;
       case 'objection_type_eq': if (merged.objection_type !== expected) return false; break;
+      case 'demo_state_eq': {
+        const state = await resolveDemoState(event, intelligence);
+        if (state !== expected) {
+          console.log(`[Context] BLOCKED: demo_state ${state} !== ${expected}`);
+          return false;
+        }
+        break;
+      }
       case 'engagement_quality_eq': if (merged.engagement_quality !== expected) return false; break;
       case 'emotional_state_eq': if (merged.emotional_state !== expected) return false; break;
       case 'entry_source_eq': if (merged.entry_source !== expected) return false; break;
@@ -880,7 +927,7 @@ async function findMatchingRules(event) {
       if (!(await evaluateContextConditions(rule.context_conditions, intelligence, event))) continue;
     }
 
-    if (!(await passesStageGate(event, rule))) continue;
+    if (!(await passesStageGate(event, rule, intelligence))) continue;
 
     matched.push(rule);
   }
