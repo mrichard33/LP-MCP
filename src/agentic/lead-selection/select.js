@@ -33,6 +33,7 @@ import supabase from '../../supabase.js';
 import { STATES, SUPPRESSION_STATES } from '../lead-state/states.js';
 import { AUTO_EXECUTE_THRESHOLD } from '../lead-state/confidence.js';
 import { loadActiveDenylist } from '../../prospect-denylist.js';
+import { loadContactSuppressions, loadHardFailureSet } from './suppression-sources.js';
 import { scoreCandidate, scoringConfig, TIER1_OFFER } from './scoring.js';
 
 // ── CONFIG (env-overridable, tunable) ───────────────────────────────
@@ -86,10 +87,24 @@ const REPHOLD_DISPOSITIONS = new Set(['NOREHASH']);
 // Held until a "never-quoted" opener variant ships; remove from this set to
 // switch Data on (one-line flip).
 const NEEDS_NEVER_QUOTED_OPENER = new Set(['DATA']);
-// Consent kill-switch / unreachable tags.
-const STOP_TAGS = new Set(['stop-bot', 'dnc', 'unsubscribed', 'do-not-contact']);
+// Consent kill-switch / unreachable tags (EXPANDED — audit 2026-06-17).
+const STOP_TAGS = new Set([
+  'stop-bot', 'dnc', 'unsubscribed', 'do-not-contact',
+  'dnc-sms', 'dnc-email', 'dnc-canvass', 'stage:dnc',   // channel-specific DNC
+]);
+// Out-of-area / disqualified-reach tags — never enroll into a FL revival campaign.
+const OUT_OF_AREA_TAGS = new Set(['dq-out-of-area', 'out-of-area', 'dq-oa']);
 // S1.1 in-flight tag (exclusivity).
 const S1_1_TAG = 're-engagement-eligible';
+
+// ── S1.3 audit remediation flags (default = enforce; flip to 'shadow' to log-only) ──
+const SUPPRESSION_GATE_MODE = process.env.S1_3_SUPPRESSION_GATE_MODE || 'enforce'; // 'enforce' | 'shadow'
+const REQUIRE_CONTACT_METHOD = process.env.S1_3_REQUIRE_CONTACT_METHOD !== 'false'; // default true
+// New audit exclusion reasons that are subject to shadow-mode (do not flip
+// enrollable when SUPPRESSION_GATE_MODE === 'shadow'). suppressed_* handled by prefix.
+const NEW_AUDIT_REASONS = new Set([
+  'no_contact_method', 'no_contact_method_after_failure', 'out_of_area',
+]);
 
 const CLASSIFIER_VERSION_FALLBACK = 'lead-selection-v1.0';
 const NOTE_PAGE_SIZE = 1000;
@@ -115,7 +130,7 @@ async function fetchLeadMap(allIds) {
   for (const ids of chunkIds(allIds)) {
     const { data, error } = await supabase
       .from('lp_leads')
-      .select('ghl_contact_id, lp_prospect_id, lead_source, lead_source_detail, disposition_code, demo_completed, demo_date, appointment_date, created_at_lp')
+      .select('ghl_contact_id, lp_prospect_id, lead_source, lead_source_detail, disposition_code, demo_completed, demo_date, appointment_date, created_at_lp, phone, email')
       .in('ghl_contact_id', ids);
     if (error) throw new Error(`lp_leads join failed: ${error.message}`);
     for (const row of data || []) {
@@ -211,12 +226,24 @@ async function fetchDaysDormantMap(allIds, leadMap) {
 
 // ── Per-candidate exclusion gate ────────────────────────────────────
 // Returns the first matching exclusion_reason, or null if enrollable.
-function evaluateExclusion({ stateRow, leadRow, tags, daysDormant, denylist, s11Set }) {
+function evaluateExclusion({ stateRow, leadRow, tags, daysDormant, denylist, s11Set,
+                            suppressionReasons = null, hasHardFailure = false }) {
   const contactId = stateRow.contact_id;
   const st = stateRow.current_state;
 
   // Enrollability (F2 reach): no matched GHL/lp row → not sendable.
   if (!leadRow) return 'no_ghl_match';
+
+  // ── NEW (audit 2026-06-17): valid-contact-method gate ──────────────
+  // No deliverable channel = nothing S1.3 can do. A prior hard SMS/email
+  // failure with no alternate channel = same. (REQUIRE_CONTACT_METHOD flag.)
+  if (REQUIRE_CONTACT_METHOD) {
+    const hasPhone = !!(leadRow.phone || leadRow.phone_e164);
+    const hasEmail = !!leadRow.email && /@/.test(String(leadRow.email)) &&
+                     !/gamil\.|\.comcom|test@|noemail/i.test(String(leadRow.email)); // junk-email guard
+    if (!hasPhone && !hasEmail) return 'no_contact_method';
+    if (hasHardFailure && !hasEmail) return 'no_contact_method_after_failure';
+  }
 
   // Compliance / unreachable disposition.
   const disp = String(leadRow.disposition_code || '').trim().toUpperCase();
@@ -229,7 +256,15 @@ function evaluateExclusion({ stateRow, leadRow, tags, daysDormant, denylist, s11
   // Consent kill-switch / unreachable tags.
   if (tags) {
     for (const t of STOP_TAGS) if (tags.has(t)) return 'stop_bot';
+    // ── NEW: out-of-area / disqualified-reach ──
+    for (const t of OUT_OF_AREA_TAGS) if (tags.has(t)) return 'out_of_area';
   }
+
+  // ── NEW: channel-aware suppression registry (DNC / opt-out / converted / complaint) ──
+  if (suppressionReasons && suppressionReasons.size > 0) {
+    return `suppressed_${[...suppressionReasons][0]}`;
+  }
+
   // Sync-health denylist (keyed on LP prospect id).
   if (leadRow.lp_prospect_id && denylist.has(String(leadRow.lp_prospect_id))) return 'prospect_denylist';
 
@@ -303,11 +338,13 @@ export async function runScorePass({ limit = DEFAULT_LIMIT, dryRun = false } = {
     const ids = candidates.map(s => s.contact_id);
 
     // 2. Batch enrichment.
-    const [leadMap, tagMap, s11Set, denylist] = await Promise.all([
+    const [leadMap, tagMap, s11Set, denylist, suppressionMap, hardFailSet] = await Promise.all([
       fetchLeadMap(ids),
       fetchTagMap(ids),
       fetchS11EnrolledSet(ids),
       loadActiveDenylist(),
+      loadContactSuppressions(ids),
+      loadHardFailureSet(ids),
     ]);
     const dormancyMap = await fetchDaysDormantMap(ids, leadMap);
 
@@ -323,8 +360,18 @@ export async function runScorePass({ limit = DEFAULT_LIMIT, dryRun = false } = {
       const tags = tagMap.get(contactId) || null;
       const daysDormant = dormancyMap.get(contactId) ?? null;
 
-      const exclusion = evaluateExclusion({ stateRow, leadRow, tags, daysDormant, denylist, s11Set });
-      const enrollable = exclusion === null;
+      const exclusion = evaluateExclusion({
+        stateRow, leadRow, tags, daysDormant, denylist, s11Set,
+        suppressionReasons: suppressionMap.get(contactId) || null,
+        hasHardFailure: hardFailSet.has(contactId),
+      });
+      // Shadow-mode (audit 2026-06-17): the NEW reasons log but do not flip
+      // enrollable until SUPPRESSION_GATE_MODE=enforce. exclusion_reason is still
+      // recorded verbatim below so exclusion_counts shows the shadow impact.
+      const isNewAuditReason = exclusion && (NEW_AUDIT_REASONS.has(exclusion) || exclusion.startsWith('suppressed_'));
+      const enrollable = SUPPRESSION_GATE_MODE === 'shadow' && isNewAuditReason
+        ? true
+        : exclusion === null;
 
       const { score, components, segment, temperature, target_offer_rung } =
         scoreCandidate(stateRow, leadRow, daysDormant);
@@ -334,8 +381,11 @@ export async function runScorePass({ limit = DEFAULT_LIMIT, dryRun = false } = {
         segmentCounts[segment] = (segmentCounts[segment] || 0) + 1;
       } else {
         excludedCount++;
-        exclusionCounts[exclusion] = (exclusionCounts[exclusion] || 0) + 1;
       }
+      // Tally the exclusion reason whenever one fired — independent of the
+      // enrollable flip — so a shadow run surfaces the new audit reasons in
+      // exclusion_counts while enrollableCount stays unchanged vs the prior run.
+      if (exclusion) exclusionCounts[exclusion] = (exclusionCounts[exclusion] || 0) + 1;
 
       rows.push({
         contact_id: contactId,

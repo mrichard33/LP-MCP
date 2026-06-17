@@ -49,10 +49,21 @@ const EVENT_TYPE_MAP = {
   workflow_exit: 'ghl.workflow_exit',
   state_transition: 'ghl.state_transition',
   routing_failure: 'ghl.routing_failure',
+  // ── NEW (audit 2026-06-17): full workflow telemetry ──
+  message_failed: 'ghl.message_failed',
+  wait_entered: 'ghl.wait_entered',
+  wait_timeout: 'ghl.wait_timeout',
+  opt_out: 'ghl.opt_out',
+  dnc_updated: 'ghl.dnc_updated',
+  opportunity_stage_changed: 'ghl.opportunity_stage_changed',
+  workflow_completed: 'ghl.workflow_completed',
 };
 
 const PRIORITY_MAP = {
   'ghl.routing_failure': 'high',
+  'ghl.message_failed': 'high',
+  'ghl.opt_out': 'high',
+  'ghl.dnc_updated': 'high',
 };
 
 async function handleEvent(eventType, req, res) {

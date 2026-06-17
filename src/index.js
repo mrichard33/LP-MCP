@@ -150,6 +150,8 @@ import {
 // ─── Lead-Selection Engine (score the book → ranked/segmented S1.3 candidates) ─
 // Daily score-pass scheduler + admin routes. POST /admin/lead-selection/run | /report.
 import { registerLeadSelectionRoutes, startLeadSelectionScheduler } from './agentic/lead-selection/index.js';
+// Workflow visibility projection sweep (system_events → membership/suppression/delivery).
+import { registerWorkflowProjectionRoutes, startWorkflowProjectionLoop } from './jobs/workflow-projection.js';
 // ─── Agentic Hold-Complete (return-from-hold re-entry) ───────────
 import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
 // ─── FB Publish Watchdog (alert on missed WF4 publish window) ────
@@ -504,6 +506,7 @@ registerLeadStateSweepRoutes(app);
 registerNoteChangeAnalyzerRoutes(app);
 registerEnrollExistingEligibleRoutes(app);
 registerLeadSelectionRoutes(app);
+registerWorkflowProjectionRoutes(app);
 
 app.listen(PORT, async () => {
   console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
@@ -528,6 +531,7 @@ app.listen(PORT, async () => {
   startLeadStateSweepScheduler();
   startNoteChangeAnalyzerScheduler();
   startLeadSelectionScheduler();
+  startWorkflowProjectionLoop();
   startFbPublishWatchdog();
   // First field-sync ~60s after boot (was ~9.5 min), then every 15 min.
   setTimeout(async () => {
