@@ -680,6 +680,23 @@ export const MOVED_REGEX = new RegExp(
   'i'
 );
 
+// Affordability override regex (2026-06-17). Hoisted to module scope so the
+// trigger phrases are unit-testable without the LLM (mirrors MOVED_REGEX).
+// Cannot-afford / no-insurance leads must never receive SA3/SA4 urgency or
+// objection-handler routing. The LLM maps these to "timing" when the lead
+// frames inability to pay as "not right now while I seek help" — plausible
+// reasoning, wrong classification for system purposes.
+//
+// TRIGGER PHRASES (all case-insensitive):
+//   "can't afford" / "cannot afford"                → unambiguous hard affordability stop
+//   "don't have homeowners insurance" / "no home insurance" → no-insurance barrier
+//   "apply for help / assistance / a grant"         → seeking external funding
+//   "my safe florida home"                          → known FL assistance program
+//
+// NOT triggered by: "it's expensive", "prices are high", "cheaper options" —
+// those are price objections (negotiation still possible → SA3 is correct).
+export const CANNOT_AFFORD_REGEX = /can'?t\s+afford|cannot\s+afford|don'?t\s+have\s+(home\s*owners?|home)\s+insurance|no\s+home\s*owners?\s+insurance|apply\s+for\s+(help|assistance|a\s+grant)|my\s+safe\s+florida\s+home/i;
+
 // Explicit decline (S13_LANE4) + hard DNC (rule 172) — the only messages on
 // which the S1.3 suppress-gate below lets an LLM `suppress` stand.
 export const S13_EXPLICIT_DECLINE_REGEX = new RegExp(
@@ -790,6 +807,40 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
         analysis.recommended_action = 'continue_current';
       }
       analysis.recommended_story_arc = null;
+    }
+    // Affordability override (2026-06-17). Cannot-afford / no-insurance leads
+    // must never receive SA3/SA4 urgency or objection-handler routing. Sending
+    // urgency or pitch messaging to someone who genuinely cannot pay is actively
+    // harmful and permanently burns trust. The LLM maps these to "timing" when
+    // the lead frames their inability to pay as "not right now while I seek help"
+    // — plausible reasoning, wrong classification for system purposes.
+    //
+    // Deterministic override wins over LLM output. Same pattern as MOVED_REGEX.
+    // Post-LLM, pre-emit. Does not suppress the analysis — just corrects the
+    // classification so deriveProposedState routes to
+    // DISENGAGEMENT.cannot_afford_pursuing_assistance and the state machine
+    // parks the lead quietly. CANNOT_AFFORD_REGEX is declared at module scope.
+    if (CANNOT_AFFORD_REGEX.test(messageText)) {
+      if (analysis.objection_type !== 'affordability') {
+        console.log(
+          `[MessageAnalyzer] Affordability-override for ${ghlContactId}: ` +
+          `objection_type ${analysis.objection_type} → affordability`
+        );
+        analysis.objection_type = 'affordability';
+        analysis.objection_confidence = 0.95;
+      }
+      // Do NOT deploy urgency or objection handlers to a cannot-afford lead.
+      // escalate_to_rep routes to a human who can discuss real financing options
+      // (OAC, county programs, My Safe Florida Home). continue_current keeps the
+      // conversation open without pushing urgency.
+      if (['deploy_objection_handler', 'advance_stage', 'fast_track_booking'].includes(analysis.recommended_action)) {
+        console.log(
+          `[MessageAnalyzer] Affordability-override for ${ghlContactId}: ` +
+          `recommended_action ${analysis.recommended_action} → escalate_to_rep`
+        );
+        analysis.recommended_action = 'escalate_to_rep';
+        analysis.recommended_story_arc = null;
+      }
     }
 
     // 2026-06-10 — S1.3 suppress-gate. In the S1.3 revival cohort, suppression
