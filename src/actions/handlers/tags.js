@@ -98,6 +98,7 @@ const NAMESPACE_EXCLUSIVE_PREFIXES = [
   'objection-confirmed:',
   'source:',            // MVI v2.6 — source:* mirrors active-entry:* (one current source per contact)
   'canvass-subtype:',   // MVI v2.7 — canvass channel (door-to-door | event | sticky), one current per contact
+  'intent-bucket:',     // Routing fix Step 2 — one current intent bucket per contact (reporting)
 ];
 
 export async function executeAddTag(action, context = {}) {
