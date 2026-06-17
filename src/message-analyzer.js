@@ -254,11 +254,12 @@ const CONVERSATION_MESSAGE_SLICE_CHARS = 1000;
 // recommended_action exactly as before. The proposal envelope is
 // ADDITIVE for one release cycle, then recommended_action can be
 // retired in Phase 5.
-const CLASSIFIER_VERSION = 'message-analyzer-v1.10';
+const CLASSIFIER_VERSION = 'message-analyzer-v1.11';
 
 const ACTION_TO_STATE_MAP = {
   // Action string                     → state code (or null = no proposal)
   objection_price:           'APPOINTMENT_FRICTION.price_anxiety_pre_demo',
+  objection_affordability:   'DISENGAGEMENT.cannot_afford_pursuing_assistance',
   objection_price_post_demo: 'POST_PROPOSAL_RESISTANCE.financing_pressure',
   objection_spouse:          'APPOINTMENT_FRICTION.spouse_uncertainty',
   objection_trust:           'APPOINTMENT_FRICTION.trust_hesitation',
@@ -278,16 +279,25 @@ function deriveProposedState(analysis) {
   // 1. Direct hit on the legacy action string (sales-system shorthand).
   const direct = ACTION_TO_STATE_MAP[analysis.recommended_action];
   if (direct) return direct;
+  // 1b. Affordability overrides recommended_action: a cannot-afford / uninsured
+  // lead pursuing outside assistance is parked quietly regardless of which
+  // handler action the LLM chose (deploy_objection_handler, escalate_to_rep,
+  // etc.). Takes precedence over engagement-quality cooling below so it is not
+  // mistaken for passive disengagement.
+  if (String(analysis.objection_type).toLowerCase() === 'affordability') {
+    return 'DISENGAGEMENT.cannot_afford_pursuing_assistance';
+  }
   // 2. Engagement-quality terminal states.
   if (analysis.engagement_quality === 'dnc') return 'DISENGAGEMENT.hard_loss';
   if (analysis.engagement_quality === 'disengagement') return 'DISENGAGEMENT.passive_cooling';
   // 3. Objection-type inference for the "deploy_objection_handler" action.
   if (analysis.recommended_action === 'deploy_objection_handler' && analysis.objection_type) {
     const t = String(analysis.objection_type).toLowerCase();
-    if (t === 'price')   return 'APPOINTMENT_FRICTION.price_anxiety_pre_demo';
-    if (t === 'spouse')  return 'APPOINTMENT_FRICTION.spouse_uncertainty';
-    if (t === 'trust')   return 'APPOINTMENT_FRICTION.trust_hesitation';
-    if (t === 'timing')  return 'APPOINTMENT_FRICTION.timing_delay';
+    if (t === 'price')         return 'APPOINTMENT_FRICTION.price_anxiety_pre_demo';
+    if (t === 'affordability') return 'DISENGAGEMENT.cannot_afford_pursuing_assistance';
+    if (t === 'spouse')        return 'APPOINTMENT_FRICTION.spouse_uncertainty';
+    if (t === 'trust')         return 'APPOINTMENT_FRICTION.trust_hesitation';
+    if (t === 'timing')        return 'APPOINTMENT_FRICTION.timing_delay';
   }
   return null;
 }
@@ -372,7 +382,7 @@ Required JSON structure:
 {
   "buyer_stage": <1-5>,
   "buyer_stage_confidence": <0.0-1.0>,
-  "objection_type": <null | "price" | "timing" | "spouse" | "trust" | "competitor" | "diy" | "not-interested">,
+  "objection_type": <null | "price" | "affordability" | "timing" | "spouse" | "trust" | "competitor" | "diy" | "not-interested">,
   "objection_confidence": <0.0-1.0>,
   "buying_signals": [<string array of detected signals>],
   "emotional_state": <"fear" | "frustration" | "skepticism" | "hope" | "urgency" | "neutral" | "anger">,
@@ -441,7 +451,8 @@ Stage 4 (Negotiating) — Decided but uncommitted. Raises specific objections OR
 Stage 5 (Committed) — Ready to buy or customer. Asks about scheduling, next steps.
 
 OBJECTION MAPPING:
-Price — "too expensive", "can't afford", "cheaper options" → Deploy SA3
+Price — "too expensive", "cheaper options", "what's your best price", price feels high but the lead could still proceed/negotiate → Deploy SA3
+Affordability — the lead states they genuinely CANNOT pay for this and is seeking outside help: "can't afford it (at all)", "no homeowners insurance", "I have no insurance", "where do I apply for help/assistance/a grant", "My Safe Florida Home", county/state repair programs. This is NOT a negotiation and NOT a price objection — pushing SA3/urgency is wrong. Classify as objection_type "affordability". Do NOT deploy SA3/SA4; the lead is parked quietly pending external funding.
 Timing — "not now", "next year", "busy season" → Deploy SA4 urgency
 Spouse — "need to talk to wife/husband/partner", ONLY when the lead explicitly says they need their partner to decide. 1Leg LP disposition = demo happened with only one spouse present. This is different from a spouse objection — 1Leg means the demo already ran.
 Trust — "how do I know", "never heard of you", company broke a promise, rep didn't follow through → Deploy SA2
@@ -459,6 +470,7 @@ CRITICAL ACCURACY RULES:
 8. PRIOR OBJECTIONS DO NOT BLOCK PROGRESS. If a lead's previous objection was "price" but they now respond affirmatively to a "want the link?" CTA, the objection has been FUNCTIONALLY RESOLVED by their acceptance. Send what was offered. Do not re-deploy SA3.
 9. RECENCY OUTWEIGHS HISTORICAL CONTEXT. The most recent outbound + inbound exchange is the highest-priority signal. LP notes and prior analyses are CONTEXT, not CONSTRAINTS. A lead can have a stage_2 history and be stage_4 right now if they've just accepted a CTA. Update your buyer_stage based on the current exchange, not the past.
 10. NEVER USE "TRUNCATION" AS AN EXCUSE. If a recent outbound message ends with "...[truncated]" but the inbound is a clear short affirmative ("Sure", "Yes"), assume the truncation cut off a CTA and apply the CTA-AFFIRMATIVE OVERRIDE. The cost of a false-positive link send is far lower than the cost of a missed legitimate CTA acceptance.
+11. AFFORDABILITY IS NOT PRICE. Distinguish "affordability" from "price". Price = the number feels high but the lead could still move forward (negotiation/value framing applies → SA3). Affordability = the lead genuinely cannot pay and/or is uninsured and is pursuing OUTSIDE assistance (grants, My Safe Florida Home, county programs) and will re-contact. For affordability, set objection_type="affordability" and do NOT deploy SA3 or SA4 urgency — surfacing urgency or downsell to someone who cannot afford it is harmful. The lead is parked quietly pending external funding. Use objection_confidence 0.9+ only when the message explicitly states inability to afford / lack of insurance / seeking assistance.
 
 LP DISPOSITION CONTEXT:
 FDNS = Full Demo, No Sale (demo ran, they said no)
@@ -685,7 +697,7 @@ function validateAnalysis(analysis) {
   return {
     buyer_stage: Math.max(1, Math.min(5, parseInt(analysis.buyer_stage) || 2)),
     buyer_stage_confidence: Math.max(0, Math.min(1, parseFloat(analysis.buyer_stage_confidence) || 0.5)),
-    objection_type: ['price', 'timing', 'spouse', 'trust', 'competitor', 'diy', 'not-interested', 'moved'].includes(analysis.objection_type) ? analysis.objection_type : null,
+    objection_type: ['price', 'affordability', 'timing', 'spouse', 'trust', 'competitor', 'diy', 'not-interested', 'moved'].includes(analysis.objection_type) ? analysis.objection_type : null,
     objection_confidence: Math.max(0, Math.min(1, parseFloat(analysis.objection_confidence) || 0)),
     buying_signals: Array.isArray(analysis.buying_signals) ? analysis.buying_signals.slice(0, 5) : [],
     emotional_state: ['fear', 'frustration', 'skepticism', 'hope', 'urgency', 'neutral', 'anger'].includes(analysis.emotional_state) ? analysis.emotional_state : 'neutral',
