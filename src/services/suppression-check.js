@@ -89,6 +89,14 @@ export const SUPPRESS_TAGS = [
   // is now the canonical "agentic in charge" signal, enforced upstream at
   // the rule level. See header comment.
   'stop-bot',
+  // Cannot-afford / no-insurance leads pursuing external assistance (2026-06-17).
+  // Set by CANNOT_AFFORD_PRE_DEMO_HOLD / MANUAL_PEGGY_CANNOT_AFFORD_FIX and by
+  // executeIssueHold when workflow_code='CANNOT_AFFORD'. Sending urgency or pitch
+  // messaging to a lead who genuinely cannot pay is actively harmful. This tag
+  // suppresses ALL agentic outbound until the hold expires and the tag is removed.
+  // The rule-level not_has_any_tag gate on AGENTIC_RESPOND_POST_CHATBOT is a
+  // second-layer backstop; this is the universal floor.
+  'cannot-afford:pursuing-assistance',
 ];
 
 // Set for O(1) intersection check

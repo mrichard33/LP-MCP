@@ -686,6 +686,43 @@ export async function executeIssueHold(action) {
   }
   console.log(`[IssueHold] ✅ contact ${contactId} held ${holdHours}h return_to=${returnTo} wf=${workflowCode || '?'} reason="${holdReason || ''}"`);
 
+  // Synchronous snapshot write for cannot-afford holds (2026-06-17).
+  // executeIssueHold only POSTs to the GHL webhook trigger — the
+  // cannot-afford:pursuing-assistance tag reaches contact_tag_snapshot only
+  // after GHL fires a tag webhook back (async, seconds to minutes). In that
+  // window, checkSuppression can't see the tag and AGENTIC_RESPOND_POST_CHATBOT
+  // fires anyway (confirmed on Peggy Webb 3OsLduUgSPHI4kgs1DRE 2026-06-17).
+  // Writing the tag directly here makes suppression instantaneous.
+  // Fail-soft: a snapshot write error does not fail the hold — the GHL webhook
+  // round-trip will eventually write the tag anyway, and the AGENTIC rule-level
+  // not_has_any_tag gate is a second-layer backstop.
+  if (workflowCode === 'CANNOT_AFFORD') {
+    try {
+      const now = new Date().toISOString();
+      // Read existing tags first so we don't overwrite unrelated tags
+      const { data: snap } = await supabase
+        .from('contact_tag_snapshot')
+        .select('tags')
+        .eq('ghl_contact_id', contactId)
+        .maybeSingle();
+      const existingTags = Array.isArray(snap?.tags) ? snap.tags : [];
+      const holdTag = 'cannot-afford:pursuing-assistance';
+      if (!existingTags.includes(holdTag)) {
+        const updatedTags = [...existingTags, holdTag];
+        await supabase
+          .from('contact_tag_snapshot')
+          .upsert(
+            { ghl_contact_id: contactId, tags: updatedTags, updated_at: now },
+            { onConflict: 'ghl_contact_id' }
+          );
+        console.log(`[IssueHold] snapshot updated: ${holdTag} added for ${contactId}`);
+      }
+    } catch (snapErr) {
+      // Fail-soft — the GHL webhook round-trip will eventually write the tag.
+      console.warn(`[IssueHold] snapshot write failed for ${contactId} (fail-soft): ${snapErr.message}`);
+    }
+  }
+
   return {
     action: 'hold_issued',
     contact_id: contactId,
