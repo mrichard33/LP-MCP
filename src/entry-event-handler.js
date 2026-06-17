@@ -40,6 +40,13 @@
 
 import { emitEvent } from './event-emitter.js';
 import { executeAddTag } from './actions/handlers/tags.js';
+import { resolveEntryFromSourceMap, entryTagSuffix } from './entry-source-map.js';
+
+// Routing fix Step 2 — map-driven entry resolution. Default OFF so a merge is
+// a no-op; flipped to 'true' on Railway `dev` only after deploy. When OFF, both
+// inferEntrySource Priority 0 and the contact_created resolver are skipped and
+// behavior is byte-for-byte unchanged.
+const ENTRY_RESOLVER_MAP_DRIVEN = process.env.ENTRY_RESOLVER_MAP_DRIVEN === 'true';
 
 // Canonical entry source names for Route B (POST /webhook/ghl/entry).
 // Adding a new entry source means adding it here AND creating a
@@ -225,12 +232,35 @@ function getCustomFieldValue(contact, fieldId) {
 
 /**
  * Infer the current entry source from contact signals.
- * Returns { source, signal, confidence } where source is one of the
- * keys of ROUTING_TAG_MAP.
+ * Returns { source, signal, confidence[, bucket] }. For heuristic matches
+ * (Priorities 1-6) `source` is one of the keys of ROUTING_TAG_MAP. For a
+ * Priority 0 map-driven match `source` is the bare entry suffix from
+ * lp_source_mapping (which may be outside ROUTING_TAG_MAP, e.g. "media") and
+ * `signal` starts with "source-map:".
  */
-function inferEntrySource(contact) {
+async function inferEntrySource(contact) {
   const tags = contact?.tags || [];
   const sourceField = (contact?.source || '').toString();
+
+  // Priority 0 (routing fix Step 2): map-driven resolution from
+  // lp_source_mapping. Gated by ENTRY_RESOLVER_MAP_DRIVEN; when it resolves it
+  // wins over every heuristic below. Flag OFF = skipped (identical behavior).
+  if (ENTRY_RESOLVER_MAP_DRIVEN) {
+    try {
+      const resolved = await resolveEntryFromSourceMap(contact);
+      const suffix = entryTagSuffix(resolved?.entryTag);
+      if (suffix) {
+        return {
+          source: suffix,
+          signal: `source-map:${resolved.matchedOn}`,
+          confidence: 'high',
+          bucket: resolved.bucket,
+        };
+      }
+    } catch (err) {
+      console.error(`[inferEntrySource] map-driven resolve failed: ${err.message} — falling through to heuristics`);
+    }
+  }
 
   // Priority 1: single existing entry:* tag (clean history → re-promote)
   const entryTags = tags.filter((t) => t.startsWith('entry:'));
@@ -349,15 +379,20 @@ async function handleEnsureRoutingTags(req, res) {
   }
 
   // 3. Infer the entry source
-  const inferred = inferEntrySource(contact);
-  if (!ROUTING_TAG_MAP[inferred.source]) {
+  const inferred = await inferEntrySource(contact);
+  // A map-driven (Priority 0) match carries the authoritative entry suffix +
+  // intent bucket straight from lp_source_mapping; that suffix may be outside
+  // ROUTING_TAG_MAP (e.g. "media"), so don't downgrade it to 'other'. The
+  // source:* tag has no equivalent in the table, so it's skipped for map hits.
+  const mapDriven = typeof inferred.signal === 'string' && inferred.signal.startsWith('source-map:');
+  if (!ROUTING_TAG_MAP[inferred.source] && !mapDriven) {
     console.warn(`[EnsureRoutingTags] unknown inferred source: ${inferred.source} — falling back to 'other'`);
     inferred.source = 'other';
     inferred.signal = `${inferred.signal}|unknown-source-fallback`;
   }
-  const sourceTag = ROUTING_TAG_MAP[inferred.source].source_tag;
+  const sourceTag = ROUTING_TAG_MAP[inferred.source]?.source_tag || null;
 
-  // 4. Write the three governance tags via the executor.
+  // 4. Write the governance tags via the executor.
   //    executeAddTag enforces:
   //      - entry:* immutability (no-op if any entry:* exists)
   //      - active-entry:* + source:* exclusivity (swap on conflict)
@@ -377,13 +412,25 @@ async function handleEnsureRoutingTags(req, res) {
         action_payload: { tag: `active-entry:${inferred.source}` },
       }),
     });
-    stepResults.push({
-      step: 'add_source',
-      result: await executeAddTag({
-        target_id: contactId,
-        action_payload: { tag: `source:${sourceTag}` },
-      }),
-    });
+    // NEW reporting tag — only present on map-driven matches.
+    if (inferred.bucket) {
+      stepResults.push({
+        step: 'add_intent_bucket',
+        result: await executeAddTag({
+          target_id: contactId,
+          action_payload: { tag: `intent-bucket:${inferred.bucket}` },
+        }),
+      });
+    }
+    if (sourceTag) {
+      stepResults.push({
+        step: 'add_source',
+        result: await executeAddTag({
+          target_id: contactId,
+          action_payload: { tag: `source:${sourceTag}` },
+        }),
+      });
+    }
   } catch (err) {
     console.error(`[EnsureRoutingTags] tag write failed for ${contactId}: ${err.message}`);
     return res.status(502).json({
@@ -410,7 +457,8 @@ async function handleEnsureRoutingTags(req, res) {
       tags_written: [
         `entry:${inferred.source}`,
         `active-entry:${inferred.source}`,
-        `source:${sourceTag}`,
+        ...(inferred.bucket ? [`intent-bucket:${inferred.bucket}`] : []),
+        ...(sourceTag ? [`source:${sourceTag}`] : []),
       ],
       step_results: stepResults,
     },
@@ -428,7 +476,8 @@ async function handleEnsureRoutingTags(req, res) {
     contact_id: contactId,
     active_entry: `active-entry:${inferred.source}`,
     entry: `entry:${inferred.source}`,
-    source: `source:${sourceTag}`,
+    source: sourceTag ? `source:${sourceTag}` : null,
+    intent_bucket: inferred.bucket ? `intent-bucket:${inferred.bucket}` : null,
     inferred,
     action_taken: 'tags_set',
     step_results: stepResults,

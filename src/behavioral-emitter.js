@@ -207,9 +207,35 @@
 import { emitEvent } from './event-emitter.js';
 import { upsertLeadIntelligence } from './context-builder.js';
 import supabase from './supabase.js';
+import { resolveEntryFromSourceMap, entryTagSuffix } from './entry-source-map.js';
+import { executeAddTag } from './actions/handlers/tags.js';
 
 const GHL_WEBHOOK_SECRET = process.env.GHL_WEBHOOK_SECRET || '';
 const GHL_API_KEY = process.env.GHL_API_KEY;
+
+// ── Routing fix Step 2 — map-driven entry routing (Insertion Point B) ──
+// Default OFF: flag OFF makes handleContactCreated byte-for-byte unchanged.
+// When ON, the resolver acts ONLY on the 6 heterogeneous "broken" source
+// subtypes whose coarse hygiene rules blanket-stamp entry:other. Every other
+// subtype is left to its precise hygiene rule. See entry-source-map.js.
+const ENTRY_RESOLVER_MAP_DRIVEN = process.env.ENTRY_RESOLVER_MAP_DRIVEN === 'true';
+
+// The 6 coarse categories whose rules (ENTRY_HYGIENE_AT_CREATION_INTERNET,
+// _ALL_AFFILIATES, _MAGAZINE, _TELEVISION, _IHEART_RADIO, _JOB_SIGNS) blanket
+// heterogeneous sources into entry:other. Values match the lowercased GHL
+// source strings those rules key on.
+const BROKEN_COARSE_SUBTYPES = new Set([
+  'internet',
+  'all affiliates',
+  'magazine',
+  'television',
+  'iheart radio',
+  'job signs',
+]);
+
+function normalizeSubtype(s) {
+  return String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
 const SELF_BASE_URL = `http://localhost:${process.env.PORT || 8080}`;
 
 // v2.7 — Reply buffer config and state
@@ -1001,6 +1027,9 @@ async function fetchGHLContact(contactId) {
       phone: c.phone || null,
       email: c.email || null,
       scoring: c.scoring || null,
+      // Routing fix Step 2 — needed by the map-driven resolver to read the
+      // LP Source / LP Subsource custom fields off the contact snapshot.
+      customFields: c.customFields || [],
     };
   } catch (err) {
     console.warn(`[BehavioralEmitter] GHL contact lookup error for ${contactId}: ${err.message}`);
@@ -1038,19 +1067,52 @@ async function handleContactCreated(req, res) {
 
   const entrySource = resolveEntrySourceFromData(tags, source);
 
+  // ── Insertion Point B (routing fix Step 2) ──────────────────────────
+  // ONLY for the 6 broken coarse subtypes, and ONLY when the flag is on:
+  // resolve the granular LP source via lp_source_mapping, stamp the correct
+  // entry/active-entry/intent-bucket tags directly, and rewrite event_subtype
+  // to the 'map-resolved' sentinel so neither the coarse rule nor
+  // ENTRY_HYGIENE_AT_CREATION_FALLBACK clobbers them. Non-broken subtypes and
+  // map misses are left exactly as today (their precise rule / the coarse
+  // fallback owns them). Flag OFF = byte-for-byte unchanged.
+  let resolvedSubtype = entrySource;
+  if (ENTRY_RESOLVER_MAP_DRIVEN && BROKEN_COARSE_SUBTYPES.has(normalizeSubtype(entrySource))) {
+    try {
+      const resolverContact = {
+        customFields: (ghlContact && ghlContact.customFields) || [],
+        source,
+      };
+      const resolved = await resolveEntryFromSourceMap(resolverContact);
+      const suffix = entryTagSuffix(resolved?.entryTag);
+      if (suffix) {
+        await executeAddTag({ target_id: contactId, action_payload: { tag: `entry:${suffix}` } });
+        await executeAddTag({ target_id: contactId, action_payload: { tag: `active-entry:${suffix}` } });
+        if (resolved.bucket) {
+          await executeAddTag({ target_id: contactId, action_payload: { tag: `intent-bucket:${resolved.bucket}` } });
+        }
+        resolvedSubtype = 'map-resolved';
+        console.log(`[BehavioralEmitter] map-resolved ${contactId}: "${entrySource}" → entry:${suffix} (bucket:${resolved.bucket}, signal source-map:${resolved.matchedOn})`);
+      } else {
+        console.log(`[BehavioralEmitter] map miss ${contactId} subtype="${entrySource}" — coarse rule falls back to entry:other`);
+      }
+    } catch (err) {
+      console.error(`[BehavioralEmitter] map-driven resolve failed for ${contactId}: ${err.message} — leaving subtype unchanged`);
+    }
+  }
+
   // 30-minute idempotency bucket — same contact within 30 min = deduped
   const timeBucket = Math.floor(Date.now() / (30 * 60 * 1000));
   const idempotencyKey = `ghl_contact_created_${contactId}_${timeBucket}`;
 
   await emitEvent({
     event_type: 'ghl.contact_created',
-    event_subtype: entrySource,
+    event_subtype: resolvedSubtype,
     source: 'ghl_webhook',
     entity_type: 'contact',
     entity_id: contactId,
     ghl_contact_id: contactId,
     payload: {
-      entry_source: entrySource,
+      entry_source: resolvedSubtype,
       contactName,
       phone,
       email,
@@ -1062,8 +1124,8 @@ async function handleContactCreated(req, res) {
     idempotency_key: idempotencyKey,
   });
 
-  console.log(`[BehavioralEmitter] Contact created: ${contactId} (source: ${entrySource}, name: ${contactName}, enriched: ${ghlContact ? 'API' : 'body'})`);
-  return res.json({ status: 'accepted', event_type: 'ghl.contact_created', entry_source: entrySource });
+  console.log(`[BehavioralEmitter] Contact created: ${contactId} (source: ${resolvedSubtype}, name: ${contactName}, enriched: ${ghlContact ? 'API' : 'body'})`);
+  return res.json({ status: 'accepted', event_type: 'ghl.contact_created', entry_source: resolvedSubtype });
 }
 
 // ═══════════════════════════════════════════════════════════════════
