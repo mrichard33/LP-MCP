@@ -83,6 +83,58 @@ import { pushLeadNotesImmediately } from './ghl-notes-sync.js';
 let _skipStats = { leads: 0, prospects: 0 };
 export function getSkipStats() { const s = { ..._skipStats }; _skipStats = { leads: 0, prospects: 0 }; return s; }
 
+// ─── Disposition baseline (inbound pre-dispositioned backfill) ───
+//
+// "Data" is the raw-lead baseline (see sync-dispositions.js
+// KNOWN_DISPOSITION_LABELS). A lead carrying anything past this set has
+// already been worked by the call center — for LP-inbound leads that means
+// it arrived ALREADY dispositioned (Set/Cnf/OPPFDN), having been booked
+// before GHL contact creation. The normal `dispositionChanged` emit covers
+// genuine state transitions, but a lead whose row first appears already at a
+// past-Data disposition (direct backfill, flat upsert, or re-synced unchanged
+// after a missed advance) never produces an `lp.disposition_changed` event,
+// so the LP_DISP_* rule family never sees it. emitInboundBackfill() closes
+// that gap. Null/'' are treated as baseline (nothing to route on).
+const BASELINE_DISPOSITIONS = new Set(['Data']);
+function isPastData(code) {
+  const c = (code == null ? '' : String(code)).trim();
+  return c !== '' && !BASELINE_DISPOSITIONS.has(c);
+}
+
+// Emit a one-time synthetic lp.disposition_changed for a lead already carrying
+// a past-Data disposition with no transition event of its own. Shared by the
+// processProspect loop and the flat-upsert path so there is a single emit
+// implementation. No-op for baseline/null dispositions; the non-dated
+// idempotency key dedups to exactly one emit per (lead, disposition).
+async function emitDispositionBackfill({
+  lpLeadId, lpProspectId, ghlContactId,
+  disposition, previousDisposition = null, leadName = null, leadSource = null,
+}) {
+  if (!isPastData(disposition)) return;
+  await emitEvent({
+    event_type: 'lp.disposition_changed',
+    event_subtype: disposition,
+    source: 'inbound-backfill',
+    entity_type: 'lead',
+    entity_id: lpLeadId,
+    ghl_contact_id: ghlContactId || null,
+    lp_lead_id: lpLeadId,
+    lp_prospect_id: lpProspectId || null,
+    payload: {
+      disposition_code: disposition,
+      previous_disposition: previousDisposition,
+      lead_name: leadName,
+      lead_source: leadSource,
+      synthetic: true,
+      reason: 'inbound_pre_dispositioned',
+    },
+    previous_state: previousDisposition ? { disposition_code: previousDisposition } : { disposition_code: 'Data' },
+    new_state: { disposition_code: disposition },
+    priority: dispositionPriority(disposition),
+    idempotency_key: `disp_${lpLeadId}_backfill_${disposition}`,
+  });
+}
+
 // ─── v10.0: Tag operation helpers ────────────────────────────────
 //
 // Thin wrappers that adapt sync-leads' call sites to the executor's
@@ -320,6 +372,26 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
 
     const newLeadGhlId = deriveLeadGhlId(lead, ghlId);
 
+    // ─── AGENTIC: synthetic disposition backfill for pre-dispositioned leads ─
+    //
+    // Fires only when the natural `dispositionChanged` emit will NOT (the lead
+    // is sitting at a past-Data disposition that produced no transition this
+    // pass). One-time per (lead, disposition): the idempotency key omits the
+    // date so a stable booked lead emits exactly once, not daily. This is the
+    // reliability backstop for LP-inbound leads booked before GHL creation —
+    // it guarantees the LP_DISP_* family sees a disposition event even when the
+    // contact was already entry-routed to E.5/S2.2. source:'inbound-backfill'
+    // keeps these distinguishable from real LP-webhook transitions.
+    const emitInboundBackfill = () => emitDispositionBackfill({
+      lpLeadId,
+      lpProspectId,
+      ghlContactId: newLeadGhlId || existing?.ghl_contact_id || null,
+      disposition: newDisposition,
+      previousDisposition,
+      leadName: `${getField(prospect, 'firstname', 'FirstName') || ''} ${getField(prospect, 'lastname', 'LastName') || ''}`.trim(),
+      leadSource: getField(lead, 'source', 'Source') || null,
+    });
+
     const recordUnchanged = existing?.updated_at_lp
       && newUpdatedAt
       && existing.updated_at_lp === newUpdatedAt
@@ -327,6 +399,10 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
 
     if (recordUnchanged && !dispositionChanged) {
       _skipStats.leads++;
+      // Reliability backstop: a stable lead sitting at a past-Data disposition
+      // that never emitted a transition still needs to reach LP_DISP_*. No-op
+      // for baseline/null dispositions and deduped after the first emit.
+      await emitInboundBackfill();
       // v10.0: route through executor (entry:* immutability respected)
       if (ghlId && !existing?.ghl_tag_applied) {
         const success = await applyTagViaExecutor(ghlId, tag);
@@ -376,6 +452,11 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
         priority: dispositionPriority(newDisposition),
         idempotency_key: `disp_${lpLeadId}_${previousDisposition || 'null'}_${newDisposition}_${new Date().toISOString().slice(0, 10)}`,
       });
+    } else {
+      // Record advanced (notes/jobs/contact-link) but disposition held steady.
+      // If it's holding at a past-Data disposition with no prior transition
+      // event, backfill it so LP_DISP_* still sees it. No-op otherwise.
+      await emitInboundBackfill();
     }
 
     // v10.0: Apply permanent entry:* tag via executor.
@@ -557,6 +638,19 @@ export async function upsertLeadFromFlat(lp, ghlId) {
   if (flatRow.ghl_contact_id == null) delete flatRow.ghl_contact_id;
 
   await supabase.from('lp_leads').upsert(flatRow, { onConflict: 'lp_lead_id' });
+
+  // Reliability backstop for the flat path: this upsert carries a disposition
+  // but emits no transition event of its own. If the lead is already past the
+  // raw-lead baseline (pre-dispositioned inbound), backfill a one-time
+  // lp.disposition_changed so the LP_DISP_* family sees it. No-op otherwise.
+  await emitDispositionBackfill({
+    lpLeadId,
+    lpProspectId,
+    ghlContactId: flatRow.ghl_contact_id || flatGhlId || null,
+    disposition: flatRow.disposition_code,
+    leadName: `${flatRow.first_name || ''} ${flatRow.last_name || ''}`.trim() || null,
+    leadSource: flatRow.lead_source || null,
+  });
 }
 
 // v9.2: Export for use by other modules (e.g., one-shot backfill scripts)

@@ -627,6 +627,28 @@ async function evaluateContextConditions(conditions, intelligence, event) {
         }
         break;
       }
+      // List form of custom_field_eq. Reads a GHL custom field's value live and
+      // passes if it is in the provided set. Shares the per-event customFields
+      // fetch with custom_field_eq (one GHL call regardless of arm count). Added
+      // for BACKSTOP_E0_OTHER_BOOKED_LEAD: some pre-dispositioned inbound leads
+      // carry their disposition only in the GHL field (URWTGtobi9a9Y7gwGxC8),
+      // with no lp_leads row, so lp_disposition_in alone cannot see them.
+      case 'custom_field_in': {
+        const fieldId = expected?.field_id;
+        const values = Array.isArray(expected?.values) ? expected.values.map(String) : null;
+        if (!fieldId || !values) {
+          console.warn(`[Context] custom_field_in requires { field_id, values: [...] }`);
+          return false;
+        }
+        if (!customFields) customFields = await fetchContactCustomFields(event.ghl_contact_id);
+        const entry = customFields.find(f => f?.id === fieldId);
+        const actual = entry?.value ?? null;
+        if (!values.includes(String(actual))) {
+          console.log(`[Context] BLOCKED: custom_field_in — field ${fieldId} is "${actual}", not in [${values.join(',')}]`);
+          return false;
+        }
+        break;
+      }
 
       // 2026-06-03 — booking-active guard. Blocks a rule from firing while the
       // contact has an active in-home appointment (booking flow owns the turn).
