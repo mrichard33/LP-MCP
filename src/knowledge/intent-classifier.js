@@ -113,10 +113,22 @@ const BOOKING_ACTIVE_BYPASS_INTENTS = new Set([
   'CUSTOMER_STATUS_NEGATIVE',
 ]);
 const BOOKING_ACTIVE_TAGS = new Set([
+  // Active booking-exchange signals (existing)
   'booking:active',
   'booking:dm-pending',
   'bj:stage-5-committed',
   'stage:hot-call',
+  // Appointment-confirmed signals — the contact is past the HDL.3 customer-
+  // detection probe that CUSTOMER_STATUS_NEGATIVE was designed to catch. A lead
+  // with a booked/confirmed appointment answering "no" is not answering "are you
+  // a current customer?" — it's about something else. Added 2026-06-18 for #75
+  // (Mark Test "No nothing has changed." misroute during S1.3 re-engagement;
+  // contact carried stage:booking-main + Appointment Status "Booked - Estimate").
+  'lp-appt-set',
+  'lp-lead-confirmed',
+  'lp-lead-issued',
+  'stage:booking-main',
+  'stage:post-appointment',
 ]);
 
 // Tag patterns that prove the contact is past the qualification stage, OR is
@@ -144,7 +156,7 @@ const BYPASS_TAGS_PREFIX = [
  * bypass list AND (b) the contact carries at least one tag matching
  * the bypass set.
  */
-function shouldBypassAffirmativeGate(handler, contactTags) {
+export function shouldBypassAffirmativeGate(handler, contactTags) {
   if (!handler) return false;
   if (!Array.isArray(contactTags) || contactTags.length === 0) return false;
 
@@ -160,12 +172,18 @@ function shouldBypassAffirmativeGate(handler, contactTags) {
     }
   }
 
-  // Surface B booking guard (CALLBACK / CUSTOMER_STATUS_NEGATIVE): suppress the
-  // callback/handoff gate ONLY while a booking is active, so the booking flow's
-  // confirmation isn't shadowed by a parallel HDL "a rep will call" send.
+  // Surface B — CALLBACK / CUSTOMER_STATUS_NEGATIVE bypass.
+  // Fires when the contact is past first-touch customer-detection: an active
+  // booking exchange (existing), a confirmed/booked appointment (2026-06-18 #75),
+  // or the objection-handling flow. Keeps the booking flow's confirmation from
+  // being shadowed by a parallel HDL "a rep will call" send, and stops a "no" /
+  // callback reply from an appointment-set lead being read as a customer-status probe.
   if (BOOKING_ACTIVE_BYPASS_INTENTS.has(handler.intent_class)) {
     for (const t of contactTags) {
-      if (typeof t === 'string' && BOOKING_ACTIVE_TAGS.has(t)) return true;
+      if (typeof t !== 'string') continue;
+      if (BOOKING_ACTIVE_TAGS.has(t)) return true;
+      // objection-confirmed-* tags (set by BEHAVIORAL_*_OBJECTION rules)
+      if (t.startsWith('objection-confirmed-')) return true;
     }
   }
 
@@ -190,7 +208,7 @@ function applyPostQualificationBypass(handlers, contactTags, ghlContactId) {
     }
   }
   if (bypassed.length > 0) {
-    console.log(`[IntentClassifier] [BYPASS] gate(s) excluded for ${ghlContactId || 'unknown'}: ${bypassed.join(', ')} — affirmative gates bypass on lp-demo-completed / objection-confirmed-* / stage:objection-handling / booking tags; CALLBACK / CUSTOMER_STATUS_NEGATIVE bypass on active-booking tags only (booking:active / booking:dm-pending / bj:stage-5-committed / stage:hot-call)`);
+    console.log(`[IntentClassifier] [BYPASS] gate(s) excluded for ${ghlContactId || 'unknown'}: ${bypassed.join(', ')} — affirmative gates: lp-demo-completed / objection-confirmed-* / stage:objection-handling / booking tags; CALLBACK / CUSTOMER_STATUS_NEGATIVE bypass: booking-active tags OR appointment-confirmed tags (lp-appt-set / lp-lead-confirmed / lp-lead-issued / stage:booking-main / stage:post-appointment) OR objection-confirmed-*`);
   }
   return kept;
 }
