@@ -27,11 +27,13 @@ const { classifyHandlerResult } = await import('../src/actions/result-status.js'
 
 // ─── Fallback copy ───────────────────────────────────────────────────
 
-test('email fallback is Randy voice and defaults a subject', () => {
+test('email fallback is rep voice and defaults a subject', () => {
   const fb = buildAiFallback('email', null);
-  assert.match(fb.message, /Randy Reece/);
+  // Rep / company voice — signs with the rep_name merge tag, never Randy's
+  // first person (locked canon: Randy is email-author voice, not the reply bot).
+  assert.match(fb.message, /\{\{custom_values\.rep_name\}\}/);
   assert.match(fb.message, /Reece Windows & Doors/);
-  assert.match(fb.message, /next business day/i);
+  assert.doesNotMatch(fb.message, /Randy/);
   assert.equal(fb.subject, 'Following up');
   // Must not embed the SMS merge tag.
   assert.doesNotMatch(fb.message, /\{\{contact\.first_name\}\}/);

@@ -270,22 +270,23 @@ The Hook earns the right to a Story. The Story sells the Offer. Hooks calibrated
 Per locked canon, the chat/SMS reply bot NEVER speaks in Randy Reece's first person. Randy is the email-only first-person voice. In these replies you are the rep / company voice — always "we / our team", never "I" as Randy, even when the KB pack indicates ac_voice_eligible and even for SA1 or SA3. Randy's founder experience (storms he's seen, cheap-window replacement jobs) may still inform the STORY, but narrate it as "our founder" / "we", not "I".
 
 ═══════ EMAIL REPLY OPENER — THREAD SENDER AWARENESS ═══════
-When replying to an email thread, the opener depends on who authored the prior
-email. This signal is supplied in the EMAIL THREAD CONTEXT block of the user
-prompt — follow it exactly:
-- Prior email = Randy (nurture, Seinfeld, indoctrination, broadcast):
-  Open with the handoff bridge: "{{custom_values.rep_name}} here — Randy asked me
-  to reach out personally after seeing your message." Then continue as the rep
-  (we / our team voice). The bridge explains why a different person is replying —
-  use it ONCE per thread, never on every subsequent exchange.
+When replying to an email thread, the opener depends on who AUTHORED (signed)
+the prior email. This signal is supplied in the EMAIL THREAD CONTEXT block of
+the user prompt — follow it exactly:
+- Prior email = a broadcast/nurture email signed by Mark or Randy:
+  Open with the handoff bridge naming that signer: "{{custom_values.rep_name}}
+  here — <Mark|Randy> asked me to reach out personally after seeing your message."
+  Then continue as the rep (we / our team voice). The bridge explains why a
+  different, personal voice is now replying to a broadcast — use it ONCE per
+  thread, never on every subsequent exchange. Use the EXACT name given in the
+  EMAIL THREAD CONTEXT block; do not substitute Randy for Mark or vice-versa.
 - Prior email = Rep (prior bot reply or manual rep send):
-  Open directly. NO Randy bridge — the rep is the established voice in this thread.
-  Example: "Thanks for getting back to us, [first name]." or respond to the
-  substance directly.
-- Unknown / not the email channel: follow standard voice rules (we / our team,
-  no Randy).
-The Randy handoff bridge is EMAIL-ONLY and only when the prior outbound was
-Randy-authored. NEVER use it on SMS or chat.
+  Open directly. NO handoff bridge — the rep is the established voice in this
+  thread. Example: "Thanks for getting back to us, [first name]." or respond to
+  the substance directly.
+- Unknown / not the email channel: follow standard voice rules (we / our team).
+The handoff bridge is EMAIL-ONLY and only when the prior outbound was a
+broadcast/nurture email. NEVER use it on SMS or chat.
 
 ═══════ TRUST MODEL — 4 LEVELS ═══════
 Sustainable trust comes from four sources:
@@ -1034,15 +1035,20 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
 
   parts.push(`\nTRAFFIC TEMPERATURE: ${trafficTemp.toUpperCase()} — calibrate hook intensity per Traffic Secrets section.`);
 
-  // v3.15: Email reply opener awareness — select the opener based on who
-  // authored the email the lead is replying to (email channel only).
+  // v3.15.1: Email reply opener awareness — select the opener based on who
+  // AUTHORED (signed) the email the lead is replying to (email channel only).
+  // Detection is sign-off based: 'mark'/'randy' = a broadcast/nurture email
+  // signed by that person; 'rep' = a prior bot reply or manual rep send.
   if (channel === 'email') {
     const senderType = opts.threadSenderType ?? 'rep';
+    const bridgeName = senderType === 'randy' ? 'Randy'
+      : senderType === 'mark' ? 'Mark'
+      : null;
     parts.push(`\nEMAIL THREAD CONTEXT:`);
-    if (senderType === 'randy') {
-      parts.push(`The email this lead is replying to was written by Randy Reece (nurture/broadcast voice). Your reply comes from the REP — open with the handoff line: "{{custom_values.rep_name}} here — Randy asked me to reach out personally after seeing your message." Then continue in rep/company (we/our team) voice. Use the Randy bridge ONCE — do not repeat it if the rep is already the established voice in the thread.`);
+    if (bridgeName) {
+      parts.push(`The email this lead is replying to was a broadcast/nurture email signed by ${bridgeName}. Your reply comes from the REP — open with the handoff bridge: "{{custom_values.rep_name}} here — ${bridgeName} asked me to reach out personally after seeing your message." Then continue in rep/company (we/our team) voice. Use the bridge ONCE — do not repeat it if the rep is already the established voice in the thread.`);
     } else {
-      parts.push(`The email this lead is replying to was written by the rep (prior bot reply or manual rep send), not Randy. Open directly as the rep — NO Randy handoff bridge. Example opener: "Thanks for getting back to us, [first name]." or simply respond to what they said.`);
+      parts.push(`The email this lead is replying to was written by the rep (prior bot reply or manual rep send), not a broadcast/nurture email. Open directly as the rep — NO handoff bridge. Example opener: "Thanks for getting back to us, [first name]." or simply respond to what they said.`);
     }
   }
 

@@ -10,9 +10,11 @@
  * any caller that needs the same templated reply.
  *
  * Copy contract:
- *   - email: Randy voice (first person, Reece brand), promises a human
- *     follow-up within the next business day. Subject defaults to "Following up"
- *     when none was already resolved.
+ *   - email: REP voice (the chat/email reply bot is the rep / company voice —
+ *     "we / our team", never Randy's first person; signs with the
+ *     {{custom_values.rep_name}} merge tag, GHL resolves it on delivery).
+ *     Promises a team follow-up and invites a reply. Subject defaults to
+ *     "Following up" when none was already resolved.
  *   - sms:   conversational, uses the {{contact.first_name}} merge tag (GHL
  *     resolves it on delivery), promises a call / invites a reply.
  *   - Neither variant trips a compliance gate or makes a specific commitment.
@@ -29,10 +31,9 @@ export function buildAiFallback(channel, subject = null) {
   if (channel === 'email') {
     return {
       message:
-        `Thanks for getting back to us — I want to make sure we get this right for you. ` +
-        `I'll have someone from our team follow up with you directly within the next business day. ` +
-        `If you'd prefer to connect sooner, feel free to reply to this email anytime.\n\n` +
-        `Randy Reece\nReece Windows & Doors`,
+        `Thanks for reaching out — we want to make sure we get back to you properly. ` +
+        `Expect a follow-up from our team shortly, or reply here anytime.\n\n` +
+        `{{custom_values.rep_name}}\nReece Windows & Doors`,
       subject: subject || 'Following up',
     };
   }
