@@ -19,6 +19,7 @@
  * Railway service — never inline). Schema lives in sql/027_leadgurus_ingest.sql.
  */
 
+import { createHash } from 'node:crypto';
 import supabase from './supabase.js';
 import { searchGHLContact, updateGHLContactFields } from './ghl.js';
 
@@ -104,17 +105,26 @@ function asArray(body) {
   return [];
 }
 
-// Resolve a lead's unique id across naming conventions; fall back to any
-// id-shaped key so an unexpected field name doesn't silently drop every row.
+// The Lead Gurus leads feed returns NO server id (verified from the live
+// payload: client_name…full_name,email,phone,…,campaign_id,ad_id,…). So if no
+// real id is present we synthesize a stable surrogate by hashing the lead's
+// identity fields — deterministic across re-runs (uses date_created, not the
+// volatile date_updated) so the upsert stays idempotent.
 function leadId(it) {
-  const v = pick(it, 'id', 'lead_id', 'leadId', 'pk', 'uuid', 'lead_pk', 'external_id');
-  if (v != null && String(v).trim() !== '') return String(v).trim();
-  for (const [k, val] of Object.entries(it || {})) {
-    if (/^(id|pk|uuid|.*_id|.*Id)$/.test(k) && val != null && String(val).trim() !== '') {
-      return String(val).trim();
-    }
-  }
-  return '';
+  const real = pick(it, 'id', 'lead_id', 'leadId', 'pk', 'uuid', 'lead_pk', 'external_id');
+  if (real != null && String(real).trim() !== '') return String(real).trim();
+  const parts = [
+    pick(it, 'date_created', 'created_at', 'created') || '',
+    String(pick(it, 'email') || '').toLowerCase().trim(),
+    digits(pick(it, 'phone', 'phone_number')),
+    pick(it, 'ad_id') || '',
+    pick(it, 'campaign_id', 'campaign') || '',
+    pick(it, 'self_book_appointment_datetime', 'self_book_datetime') || '',
+    String(pick(it, 'full_name', 'name') || '').toLowerCase().trim(),
+  ];
+  // Empty identity → no usable key (skip rather than collapse onto a blank hash).
+  if (parts.every((p) => p === '' || p === null)) return '';
+  return 'lg_' + createHash('sha1').update(parts.join('|')).digest('hex').slice(0, 24);
 }
 
 // Keep the LAST row per conflict key so a batch never contains the same key
