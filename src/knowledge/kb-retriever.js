@@ -608,6 +608,41 @@ function detectObjection(messageText) {
   return null;
 }
 
+// ── Concierge belief stack (Bot 2 migration) ─────────────────────────────────
+// Canon-locked source docs (data/kb/concierge/*.md, ingested into kb_embeddings)
+// pulled on objection/pricing turns so the responder can quote the Big Domino +
+// Three Secrets VERBATIM. Deterministic source_doc lookup (whole doc, ordered) —
+// these are tiny locked docs; we want the exact text, not a semantic top-k.
+const CONCIERGE_BELIEF_SOURCES = {
+  OBJECTION: ['reece_belief_stack', 'reece_objection_playbook'],
+  PRICING:   ['reece_belief_stack', 'reece_pricing_policy', 'reece_objection_playbook'],
+};
+
+async function getConciergeBeliefDocs(intentClass) {
+  const sources = CONCIERGE_BELIEF_SOURCES[intentClass];
+  if (!sources) return null;
+  try {
+    const { data, error } = await supabase
+      .from('kb_embeddings')
+      .select('source_doc, chunk_text, id')
+      .in('source_doc', sources)
+      .eq('active', true)
+      .order('id', { ascending: true });
+    if (error || !data || data.length === 0) return null;
+    const byDoc = new Map();
+    for (const row of data) {
+      if (!byDoc.has(row.source_doc)) byDoc.set(row.source_doc, []);
+      byDoc.get(row.source_doc).push(row.chunk_text);
+    }
+    // Preserve the canonical source order (belief stack first).
+    return sources
+      .filter((s) => byDoc.has(s))
+      .map((s) => ({ source_doc: s, text: byDoc.get(s).join('\n') }));
+  } catch {
+    return null; // additive context; never block a reply
+  }
+}
+
 /**
  * Build the full KB pack for a response generation call.
  *
@@ -645,6 +680,7 @@ export async function buildKbPack(params) {
     primary_arc: null,
     arc_options: [],
     objection_script: null,
+    belief_stack: null,
     pricing_anchor: null,
     booking_context: null,
     faqs: [],
@@ -760,6 +796,14 @@ export async function buildKbPack(params) {
     result.booking_context = resolveBookingContext(bookingCtxArgs);
   }
 
+  // Concierge belief stack (Bot 2 migration): on objection/pricing turns, attach
+  // the canon-locked belief stack + playbook (+ pricing policy for PRICING) so the
+  // responder can quote the Big Domino and the Three Secrets verbatim and route to
+  // the Protection Profile Review. Additive context; never blocks a reply.
+  if (intentClass === 'OBJECTION' || intentClass === 'PRICING') {
+    result.belief_stack = await getConciergeBeliefDocs(intentClass);
+  }
+
   if (detectedCompetitor) {
     result.competitor_intel = await getCompetitorIntel(detectedCompetitor);
   }
@@ -791,6 +835,17 @@ export function formatKbPackForPrompt(pack) {
     }
     if (Array.isArray(pack.primary_arc.do_not_say) && pack.primary_arc.do_not_say.length > 0) {
       lines.push(`  DO NOT SAY: ${JSON.stringify(pack.primary_arc.do_not_say).slice(0, 300)}`);
+    }
+    lines.push('');
+  }
+
+  if (Array.isArray(pack.belief_stack) && pack.belief_stack.length > 0) {
+    lines.push('LOCKED BELIEF STACK (Big Domino + Three Secrets — quote these lines VERBATIM, em-dashes included; never paraphrase):');
+    for (const d of pack.belief_stack) {
+      lines.push(`  [${d.source_doc}]`);
+      for (const ln of String(d.text).split('\n')) {
+        if (ln.trim()) lines.push(`  ${ln}`);
+      }
     }
     lines.push('');
   }
