@@ -24,6 +24,8 @@
  *   GET  /api/lookup/lp-lead?lead_id=...         — LP lead name + contact info lookup (no auth, cache + LP API live)
  *   POST /api/lookup/lp-lead                     — Same, with JSON body (no auth)
  *   POST /api/lookup/lp-lead-and-update-ghl-contact — Lookup LP lead + PATCH GHL contact + tag-poke for Wait-for-Condition (no auth, fire-and-forget)
+ *   GET  /api/voice/caller-context?phone=...         — Compact caller context for GHL Voice AI enrichment (no auth, cache-only, <3s)
+ *   POST /api/voice/caller-context                   — Same, with {"phone":"..."} JSON body (no auth)
  */
 
 import supabase from './supabase.js';
@@ -537,6 +539,164 @@ async function _lpLookupGhlPokeTag(contactId, tag, { fetchImpl = fetch } = {}) {
   await _lpLookupGhlRemoveTag(contactId, tag, { fetchImpl });
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// VOICE CALLER CONTEXT — compact enrichment for GHL Voice AI (Riley)
+// ═══════════════════════════════════════════════════════════════════
+//
+// Called by Riley's during-call Custom Action at call start.
+// Looks up the inbound phone number against the lp_leads Supabase cache
+// and returns a compact summary Riley can use in the first 1-2 turns:
+//   - First name (open with "Hi Mark" instead of "Hi there")
+//   - Existing customer flag (route to service vs. new lead flow)
+//   - Prior appointment / demo history (context for the conversation)
+//   - Current LP disposition (avoid re-pitching a post-demo contact)
+//   - DNC status (skip pitch, route to opt-out immediately)
+//   - Days since last contact (returning vs. cold)
+//
+// DESIGN DECISIONS:
+//   - Cache-only (no LP API live call): voice latency budget is ~3s.
+//     A Supabase query completes in ~50ms; LP API live adds 500-2000ms.
+//     Brand-new leads not yet in cache return found=false — Riley
+//     treats them as new callers, which is correct.
+//   - No GHL contact lookup in v1: spouse name lives in GHL custom
+//     field L0mb4tIiSBYYLn5fyprZ but adding a GHL API call adds ~300ms
+//     and a dependency. Riley asks for spouse fresh instead.
+//   - DNC is not stored in the lp_leads cache — it lives as GHL tags
+//     (lp-dnc:{code}, see actions/handlers/lp-dnc.js). Deriving it would
+//     require a GHL contact lookup (~300ms), so is_dnc is false in v1
+//     and real DNC enrichment is deferred to a fast-follow (same
+//     reasoning as the spouse-name deferral above).
+//   - Always 200: Voice AI Custom Actions treat non-200 as a failure
+//     that can stall the call. Every error path returns a safe default.
+//   - Phone-only lookup: GHL Voice AI passes the inbound caller ID at
+//     call start; contact.id is not available until after enrichment.
+//
+// RESPONSE CONTRACT (always 200):
+//   {
+//     found: true|false,
+//     first_name: "Mark",              // empty string if not found
+//     is_existing_customer: false,     // closed_won=true in lp_leads
+//     has_prior_appointment: true,     // appointment_set=true
+//     demo_completed: false,           // demo_completed=true
+//     disposition_code: "Set",         // raw LP code, empty if not found
+//     disposition_label: "Appointment Set",
+//     is_dnc: false,                   // v1: always false (see above)
+//     days_since_last_contact: 45,     // null if unknown
+//     lookup_method: "phone"|"none",
+//     source: "cache"|null
+//   }
+//
+// RILEY USAGE:
+//   found=false  → treat as new caller, standard greeting
+//   found=true, is_dnc=true → skip pitch, route to opt-out immediately
+//   found=true, is_existing_customer=true → "Are you calling about your
+//     existing windows, or something new?"
+//   found=true, demo_completed=true → knows they've been through an appt
+//   found=true, first_name set → "Hi [name], thanks for calling Reece"
+//   found=true, has_prior_appointment=true, demo_completed=false →
+//     "I see we've spoken before — picking up where you left off?"
+
+async function voiceCallerContextHandler(req, res) {
+  try {
+    const src = { ...(req.query || {}), ...(req.body || {}) };
+    const phoneRaw = String(src.phone || src.caller_phone || src.callerPhone || '').trim();
+    const phoneDigits = phoneRaw.replace(/\D/g, '');
+
+    // Always-200 fallback — Riley treats as new caller
+    const notFound = (reason) => res.json({
+      found: false,
+      first_name: '',
+      is_existing_customer: false,
+      has_prior_appointment: false,
+      demo_completed: false,
+      disposition_code: '',
+      disposition_label: '',
+      is_dnc: false,
+      days_since_last_contact: null,
+      lookup_method: 'none',
+      source: null,
+      reason,
+    });
+
+    if (!phoneDigits || phoneDigits.length < 10) {
+      return notFound('no_phone_supplied');
+    }
+
+    const last10 = phoneDigits.slice(-10);
+
+    // Cache-only lookup — intentionally no LP API fallback (voice latency)
+    const { data: row, error } = await supabase
+      .from('lp_leads')
+      .select(
+        'first_name, last_name, disposition_code, disposition_label, ' +
+        'closed_won, appointment_set, demo_completed, last_contact_date, ' +
+        'ghl_tag_applied'
+      )
+      .or(`phone.ilike.%${last10}%,phone_alt.ilike.%${last10}%`)
+      .order('synced_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      console.error('[VoiceCallerContext] Supabase error:', error.message);
+      return notFound('db_error');
+    }
+
+    if (!row) {
+      return notFound('no_match_in_cache');
+    }
+
+    // Days since last contact
+    let daysSinceLastContact = null;
+    if (row.last_contact_date) {
+      const diff = Date.now() - new Date(row.last_contact_date).getTime();
+      daysSinceLastContact = Math.floor(diff / (1000 * 60 * 60 * 24));
+    }
+
+    // DNC is not in the lp_leads cache — it lives as GHL tags (lp-dnc:{code}).
+    // Deriving it requires a GHL contact lookup (~300ms); deferred to fast-follow.
+    const isDnc = false;
+
+    console.log(
+      `[VoiceCallerContext] HIT phone=${last10} ` +
+      `name=${row.first_name || '?'} disp=${row.disposition_code || '?'} ` +
+      `dnc=${isDnc} appt=${row.appointment_set} demo=${row.demo_completed}`
+    );
+
+    return res.json({
+      found: true,
+      first_name: row.first_name || '',
+      is_existing_customer: row.closed_won === true,
+      has_prior_appointment: row.appointment_set === true,
+      demo_completed: row.demo_completed === true,
+      disposition_code: row.disposition_code || '',
+      disposition_label: row.disposition_label || '',
+      is_dnc: isDnc,
+      days_since_last_contact: daysSinceLastContact,
+      lookup_method: 'phone',
+      source: 'cache',
+    });
+
+  } catch (err) {
+    console.error('[VoiceCallerContext] Unhandled error:', err.message);
+    // Return safe default — never stall Riley with a 500
+    return res.json({
+      found: false,
+      first_name: '',
+      is_existing_customer: false,
+      has_prior_appointment: false,
+      demo_completed: false,
+      disposition_code: '',
+      disposition_label: '',
+      is_dnc: false,
+      days_since_last_contact: null,
+      lookup_method: 'none',
+      source: null,
+      reason: 'internal_error',
+    });
+  }
+}
+
 // ─── Active lookup-and-update handler ──────────────────────────────
 //
 // Asynchronous endpoint for the GHL standard outbound Webhook step.
@@ -813,6 +973,18 @@ export function registerRestApiRoutes(app, authenticate) {
   // lpLeadUpdateGhlContactHandler above for the full contract.
   app.post('/api/lookup/lp-lead-and-update-ghl-contact', lpLeadUpdateGhlContactHandler);
   console.log('[REST API] Registered: POST /api/lookup/lp-lead-and-update-ghl-contact (no-auth, fire-and-forget LP lookup + GHL PATCH + tag-poke)');
+
+  // ═══════════════════════════════════════════════════════════════
+  // GET+POST /api/voice/caller-context — Voice AI caller enrichment
+  // ═══════════════════════════════════════════════════════════════
+  // No auth. Called by Riley's during-call Custom Action at call start
+  // with the inbound caller phone number. Returns a compact summary
+  // (name, existing customer, appointment history, DNC, disposition)
+  // in <3s using Supabase cache only — no LP API live call.
+  // See voiceCallerContextHandler above for the full contract.
+  app.get('/api/voice/caller-context', voiceCallerContextHandler);
+  app.post('/api/voice/caller-context', voiceCallerContextHandler);
+  console.log('[REST API] Registered: GET+POST /api/voice/caller-context (no-auth, Voice AI caller enrichment)');
 
   // ═══════════════════════════════════════════════════════════════
   // POST /api/agentic/dynamic-callback-message — Dynamic SMS for HDL.2
