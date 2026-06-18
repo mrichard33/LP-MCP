@@ -57,6 +57,8 @@ const EVENT_TYPE_MAP = {
   dnc_updated: 'ghl.dnc_updated',
   opportunity_stage_changed: 'ghl.opportunity_stage_changed',
   workflow_completed: 'ghl.workflow_completed',
+  // ── NEW (2026-06-18): Riley Voice AI post-call outcome handoff ──
+  voice_call_completed: 'ghl.voice_call_completed',
 };
 
 const PRIORITY_MAP = {
@@ -64,6 +66,8 @@ const PRIORITY_MAP = {
   'ghl.message_failed': 'high',
   'ghl.opt_out': 'high',
   'ghl.dnc_updated': 'high',
+  // callback / DNC / service-question outcomes are time-sensitive
+  'ghl.voice_call_completed': 'high',
 };
 
 async function handleEvent(eventType, req, res) {
