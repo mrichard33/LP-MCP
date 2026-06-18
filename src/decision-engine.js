@@ -459,6 +459,24 @@ async function fetchContactTags(ghlContactId) {
   } catch { return []; }
 }
 
+// Single GHL fetch returning both tags and customFields. Used by resolveDemoState
+// so the Showed-outcome check and the lp-demo-completed tag check share ONE
+// GET /contacts/{id} round-trip instead of two. Mirrors the error/timeout
+// handling of fetchContactTags / fetchContactCustomFields.
+async function fetchContactSnapshot(ghlContactId) {
+  const GHL_API_KEY = process.env.GHL_API_KEY;
+  if (!GHL_API_KEY || !ghlContactId) return { tags: [], customFields: [] };
+  try {
+    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${ghlContactId}`, {
+      headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-07-28', 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return { tags: [], customFields: [] };
+    const data = await res.json();
+    return { tags: data?.contact?.tags || [], customFields: data?.contact?.customFields || [] };
+  } catch { return { tags: [], customFields: [] }; }
+}
+
 // Demo-state resolver (2026-06-17). Authoritative-first: LP disposition (system
 // of record) -> sync-derived lp-demo-completed tag -> analyzer buyer_stage.
 // Returns 'post' | 'pre' | 'unknown'. The drift-prone stage:* tags are NOT
@@ -471,6 +489,16 @@ async function fetchContactTags(ghlContactId) {
 // dispositions are intentionally NOT here (they are APPOINTMENT_DISRUPTION and
 // route to S5.2 v2 via their own LP_DISP_* rules, not O.0).
 const DEMO_COMPLETE_DISPOSITIONS = ['FDNS', 'OPPFDN', 'Sale', '1Leg', 'BO'];
+
+// GHL "Appointment Status" field (jHFRKGGsYJJFRbWwthkG; same id as
+// APPT_STATUS_FIELD in src/lp-appointment-sync.js, decoded as "Appointment Status"
+// in src/ghl-field-decoder.js). This is a rep-action field — when a rep marks the
+// appointment "Showed*" the demo physically happened, even if the LP disposition
+// hasn't caught up (sync lag). So "Showed*" => post. "No Show*"/"Cancelled*" are
+// NOT post — they are APPOINTMENT_DISRUPTION and route to S5.2 via LP_DISP_* rules.
+// Verified live 2026-06-18: "Showed - Estimate" (Nancy PpypnQog2pCs6kIRwH5a),
+// "No Show - Estimate" (Toth zBA6PzNVXRTePgvWL1sT).
+const CF_APPT_OUTCOME = 'jHFRKGGsYJJFRbWwthkG';
 
 async function resolveDemoState(event, intelligence) {
   const intel = intelligence || {};
@@ -485,9 +513,17 @@ async function resolveDemoState(event, intelligence) {
     const disp = lpLead?.disposition_code || null;
     if (disp && DEMO_COMPLETE_DISPOSITIONS.includes(disp)) return 'post';
   }
+  // One GHL fetch feeds both the appointment-outcome check (1.5) and the
+  // lp-demo-completed tag check (2).
+  const { tags, customFields } = await fetchContactSnapshot(ghlContactId);
+  // 1.5) GHL appointment outcome — authoritative rep marking, trusted ABOVE the
+  //      lp-demo-completed tag / buyer_stage but BELOW a demo-complete LP
+  //      disposition. "Showed*" means the demo physically happened even when the
+  //      LP disposition lags. No-show / cancel outcomes are intentionally NOT post.
+  const apptOutcome = String(customFields.find(f => f?.id === CF_APPT_OUTCOME)?.value || '');
+  if (/^\s*Showed/i.test(apptOutcome)) return 'post';
   // 2) lp-demo-completed tag — sync-derived mirror of the LP disposition,
   //    higher fidelity than stage:* tags.
-  const tags = await fetchContactTags(ghlContactId);
   if (tags.includes('lp-demo-completed')) return 'post';
   // 3) analyzer buyer_stage (1 indifferent .. 5 committed)
   const bs = Number(intel.buyer_stage ?? event?.payload?.buyer_stage);
