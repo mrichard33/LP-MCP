@@ -52,6 +52,8 @@ import { registerRestApiRoutes } from './rest-api.js';
 import { registerSiteStitchRoutes } from './site-stitch.js';
 // ─── I.LG — Lead Gurus Daily Pull (paid-media ingest) ────────────
 import { registerLeadGurusRoutes } from './leadgurus-ingest.js';
+// ─── I.TRACK — Site Event Collector (tracker beacon ingest) ──────
+import { registerSiteCollectRoutes } from './site-collect.js';
 // ─── Events Router (per-event-type webhook endpoints) ────────────
 import { registerEventsRouter } from './events-router.js';
 // ─── Objection-State Ghost Sweep (post-booking ghost detection) ──
@@ -504,6 +506,7 @@ registerDataFreshnessRoutes(app);
 registerAgenticMvRefreshRoutes(app);
 registerSiteStitchRoutes(app);
 registerLeadGurusRoutes(app);
+registerSiteCollectRoutes(app);
 registerAppointmentNotificationRoutes(app);
 registerGhlTriggerLinkRoutes(app);
 registerAgenticLeadStateRoutes(app);
