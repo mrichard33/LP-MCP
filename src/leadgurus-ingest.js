@@ -45,6 +45,7 @@ const ENRICH_ENABLED =
 
 // ─── Small helpers ──────────────────────────────────────────────────────────
 const digits = (s) => String(s || '').replace(/[^0-9]/g, '');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // First defined value among the candidate keys (the Lead Gurus payload field
 // names are mapped defensively so a rename doesn't silently null a column).
@@ -82,7 +83,15 @@ function addMonths(ymd, n) {
 // Normalize any list-ish API body to an array of items.
 function asArray(body) {
   if (Array.isArray(body)) return body;
-  return body?.results || body?.data || [];
+  if (Array.isArray(body?.results)) return body.results;
+  if (Array.isArray(body?.data)) return body.data;
+  // Fall back to the first array-valued property — Lead Gurus wraps the leads
+  // list under a key (e.g. { count, next, leads: [...] }) that isn't the
+  // DRF-standard `results`/`data`, so a fixed key name silently parsed empty.
+  for (const v of Object.values(body || {})) {
+    if (Array.isArray(v)) return v;
+  }
+  return [];
 }
 
 // Keep the LAST row per conflict key so a batch never contains the same key
@@ -131,15 +140,24 @@ async function lgGet(pathOrUrl, params = null) {
   const url = pathOrUrl.startsWith('http')
     ? pathOrUrl
     : `${LG_BASE}${pathOrUrl}${params ? '?' + new URLSearchParams(params).toString() : ''}`;
-  const res = await fetch(url, {
-    headers: { 'X-API-Key': LG_API_KEY, Accept: 'application/json' },
-    signal: AbortSignal.timeout(30000),
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`Lead Gurus GET ${url} → HTTP ${res.status} ${text.slice(0, 200)}`);
+  // Retry on 429, honouring Retry-After (the API throttles bursty backfills).
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, {
+      headers: { 'X-API-Key': LG_API_KEY, Accept: 'application/json' },
+      signal: AbortSignal.timeout(30000),
+    });
+    if (res.status === 429 && attempt < 5) {
+      const retryAfter = Number(res.headers.get('retry-after'));
+      const waitMs = Math.min(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : 2 ** attempt, 60) * 1000;
+      await sleep(waitMs);
+      continue;
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Lead Gurus GET ${url} → HTTP ${res.status} ${text.slice(0, 200)}`);
+    }
+    return res.json();
   }
-  return res.json();
 }
 
 // ─── Summary mapping (shared metric columns) ────────────────────────────────
@@ -242,7 +260,7 @@ function mapLead(it) {
     [pick(it, 'first_name'), pick(it, 'last_name')].filter(Boolean).join(' ') ||
     null;
   return {
-    lead_id:    String(pick(it, 'id', 'lead_id') ?? ''),
+    lead_id:    String(pick(it, 'id', 'lead_id', 'pk', 'uuid') ?? ''),
     full_name,
     email:      pick(it, 'email'),
     phone:      pick(it, 'phone', 'phone_number'),
@@ -267,9 +285,12 @@ function mapLead(it) {
   };
 }
 
-async function pullLeads({ date_after }) {
-  let url = `${LG_BASE}/api/v1/leads/?` +
-    new URLSearchParams({ client: LG_CLIENT_ID, date_after, page_size: String(LEADS_PAGE_SIZE) }).toString();
+async function pullLeads({ date_after, date_before }) {
+  // Bound the window on both ends — the leads endpoint caps a query at 90 days,
+  // so an open-ended date_after spans to "now" and 400s on older windows.
+  const qs = { client: LG_CLIENT_ID, date_after, page_size: String(LEADS_PAGE_SIZE) };
+  if (date_before) qs.date_before = date_before;
+  let url = `${LG_BASE}/api/v1/leads/?` + new URLSearchParams(qs).toString();
 
   let upserted = 0;
   let enriched = 0;
@@ -288,6 +309,7 @@ async function pullLeads({ date_after }) {
       if (ENRICH_ENABLED) enriched += await enrichLeads(rows);
     }
     url = body?.next || null; // DRF-style cursor; absolute URL when present
+    if (url) await sleep(250); // gentle pacing to stay under the rate limit
   }
   return { upserted, enriched, pages };
 }
@@ -344,7 +366,7 @@ export async function runPull({ date_after, date_before } = {}) {
   date_before = date_before || etDate(0);
 
   const summary = await upsertSummary({ date_after, date_before });
-  const leads = await pullLeads({ date_after });
+  const leads = await pullLeads({ date_after, date_before });
 
   const result = {
     ok: true, date_after, date_before, summary, leads,
