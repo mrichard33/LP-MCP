@@ -80,18 +80,41 @@ function addMonths(ymd, n) {
   return d.toISOString().slice(0, 10);
 }
 
-// Normalize any list-ish API body to an array of items.
+// Normalize any list-ish API body to an array of items. Tolerant of the
+// wrapper key (results/data/<custom>) and one level of nesting, since the
+// Lead Gurus leads feed wraps its list differently from the summary feeds.
+const isArrayOfObjects = (v) => Array.isArray(v) && (v.length === 0 || (typeof v[0] === 'object' && v[0] !== null));
 function asArray(body) {
   if (Array.isArray(body)) return body;
   if (Array.isArray(body?.results)) return body.results;
   if (Array.isArray(body?.data)) return body.data;
-  // Fall back to the first array-valued property — Lead Gurus wraps the leads
-  // list under a key (e.g. { count, next, leads: [...] }) that isn't the
-  // DRF-standard `results`/`data`, so a fixed key name silently parsed empty.
-  for (const v of Object.values(body || {})) {
-    if (Array.isArray(v)) return v;
+  if (!body || typeof body !== 'object') return [];
+  // First top-level array of objects (e.g. { count, next, leads: [...] }).
+  for (const v of Object.values(body)) {
+    if (isArrayOfObjects(v)) return v;
+  }
+  // One level deep (e.g. { next, data: { leads: [...] } }).
+  for (const v of Object.values(body)) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      for (const vv of Object.values(v)) {
+        if (isArrayOfObjects(vv)) return vv;
+      }
+    }
   }
   return [];
+}
+
+// Resolve a lead's unique id across naming conventions; fall back to any
+// id-shaped key so an unexpected field name doesn't silently drop every row.
+function leadId(it) {
+  const v = pick(it, 'id', 'lead_id', 'leadId', 'pk', 'uuid', 'lead_pk', 'external_id');
+  if (v != null && String(v).trim() !== '') return String(v).trim();
+  for (const [k, val] of Object.entries(it || {})) {
+    if (/^(id|pk|uuid|.*_id|.*Id)$/.test(k) && val != null && String(val).trim() !== '') {
+      return String(val).trim();
+    }
+  }
+  return '';
 }
 
 // Keep the LAST row per conflict key so a batch never contains the same key
@@ -260,7 +283,7 @@ function mapLead(it) {
     [pick(it, 'first_name'), pick(it, 'last_name')].filter(Boolean).join(' ') ||
     null;
   return {
-    lead_id:    String(pick(it, 'id', 'lead_id', 'pk', 'uuid') ?? ''),
+    lead_id:    leadId(it),
     full_name,
     email:      pick(it, 'email'),
     phone:      pick(it, 'phone', 'phone_number'),
@@ -297,16 +320,28 @@ async function pullLeads({ date_after, date_before }) {
   let pages = 0;
   const guard = 200; // hard cap on pages (200 × 500 = 100k leads)
 
+  let diagLogged = false;
   while (url && pages < guard) {
     const body = await lgGet(url);
     const items = asArray(body);
     pages++;
+    // One-time diagnostic: if the first page yields no usable rows, log the
+    // body/item shape so the real wrapper key + id field are visible in logs.
+    if (!diagLogged && (!items.length || !leadId(items[0]))) {
+      diagLogged = true;
+      console.warn(
+        `[I.LG] leads shape: bodyKeys=${JSON.stringify(Object.keys(body || {}))} ` +
+        `items=${items.length} firstItemKeys=${JSON.stringify(items[0] ? Object.keys(items[0]) : [])}`,
+      );
+    }
     if (items.length) {
       const rows = dedupeByKey(items.map(mapLead).filter((r) => r.lead_id), (r) => r.lead_id);
-      const { error } = await supabase.from('ft_leads').upsert(rows, { onConflict: 'lead_id' });
-      if (error) throw new Error(`ft_leads upsert: ${error.message}`);
-      upserted += rows.length;
-      if (ENRICH_ENABLED) enriched += await enrichLeads(rows);
+      if (rows.length) {
+        const { error } = await supabase.from('ft_leads').upsert(rows, { onConflict: 'lead_id' });
+        if (error) throw new Error(`ft_leads upsert: ${error.message}`);
+        upserted += rows.length;
+        if (ENRICH_ENABLED) enriched += await enrichLeads(rows);
+      }
     }
     url = body?.next || null; // DRF-style cursor; absolute URL when present
     if (url) await sleep(250); // gentle pacing to stay under the rate limit
