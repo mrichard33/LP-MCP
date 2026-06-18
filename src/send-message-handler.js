@@ -544,26 +544,34 @@ async function getInboundEmailToAddress(contactId) {
 }
 
 /**
- * v3.15 — Determine whether the most recent OUTBOUND email in the contact's
- * thread was authored by Randy (nurture/Seinfeld/broadcast voice) or by the
- * rep (manual send or a prior bot reply). The response generator uses this to
- * select the correct email opener: replying to a Randy email → the rep "Randy
- * asked me to reach out" handoff bridge; replying to a rep email → open
- * directly as the rep (no bridge).
+ * v3.15.1 — Determine the AUTHORING VOICE of the most recent OUTBOUND email in
+ * the contact's thread, so the response generator can select the correct reply
+ * opener: replying to a broadcast/nurture email (Mark- or Randy-signed) → the
+ * rep "X asked me to reach out" handoff bridge; replying to a rep/bot email →
+ * open directly as the rep (no bridge).
  *
  * Strategy mirrors getInboundEmailToAddress, but targets the most recent
  * OUTBOUND email: search conversation → messages → meta.email.messageIds[0]
- * → GET /conversations/messages/email/{id} → fingerprint body+subject.
+ * → GET /conversations/messages/email/{id} → inspect the SIGNATURE block.
  *
- * Detection (confirmed): Randy signs with his full name "Randy Reece". The
- * bot's own rep-voiced bridge reply contains "Randy asked me to reach out",
- * so we explicitly exclude that phrase — otherwise a prior bot reply would be
- * misread as Randy and the bridge would repeat on every subsequent exchange.
- *   randy → "randy reece" present AND "asked me to reach out" absent
- *   rep   → otherwise
+ * Detection — re-based on the SIGN-OFF after live validation (2026-06-18).
+ * The original body-fingerprint ("randy reece" anywhere) misfired badly: in
+ * production the nurture voice is Mark (3,664 Mark-signed emails vs 14
+ * Randy-signed), and "Randy Reece" appears as a third-person P.S. ANECDOTE
+ * ("P.S. Randy Reece's father started this company…") inside Mark-signed
+ * emails — 554 of 556 "randy reece" matches were NOT a Randy sign-off. So we
+ * key off the signature, which is always "<Name>\nReece Windows & Doors":
+ *   - "randy reece windows"  → Randy-signed   → 'randy'
+ *   - "mark reece windows"   → Mark-signed    → 'mark'
+ *   - otherwise (rep name, prior bot reply, unrecognized) → 'rep'
+ * The P.S. anecdote "Randy Reece's father" does NOT match `randy\s+reece\s+
+ * windows` (reece is followed by "'s", not "windows"), so it is correctly
+ * ignored. We also exclude the bot's own bridge phrase ("asked me to reach
+ * out") so a prior bot reply never re-triggers the bridge (once per thread).
  *
  * Returns:
- *   'randy' — outbound email was Randy-authored
+ *   'mark'  — outbound email was a Mark-signed broadcast/nurture
+ *   'randy' — outbound email was a Randy-signed broadcast/nurture
  *   'rep'   — outbound email was rep-authored (prior bot reply / manual send)
  *   null    — no prior outbound email found or lookup failed
  * Fail-open: callers treat null as 'rep' (the safe, non-aggressive opener).
@@ -592,20 +600,31 @@ async function getThreadSenderType(contactId) {
     if (!emailId) return null;
 
     const detail = await ghlFetch('GET', `/conversations/messages/email/${emailId}`);
-    const bodyText = String(
+    const rawBody = String(
       detail?.body || detail?.html || detail?.emailBody ||
       detail?.emailMessage?.body || ''
-    ).toLowerCase();
+    );
     const subjectText = String(
       detail?.subject || recentOutboundEmail?.meta?.email?.subject || ''
-    ).toLowerCase();
-    const text = `${bodyText} ${subjectText}`;
+    );
+    // Strip HTML tags to spaces so the signature "<Name><br>Reece Windows…"
+    // collapses to "<name> reece windows" regardless of markup. Match on
+    // whitespace (\s+), not newlines, since the email-detail body is HTML.
+    const text = `${rawBody} ${subjectText}`.replace(/<[^>]+>/g, ' ').toLowerCase();
 
-    const hasRandy = /randy reece/i.test(text);          // Randy signs with full name
-    const isBotBridge = /asked me to reach out/i.test(text); // the bot's own bridge reply
-    const senderType = (hasRandy && !isBotBridge) ? 'randy' : 'rep';
+    let senderType;
+    if (/asked me to reach out/i.test(text)) {
+      // The bot's own rep-voiced bridge reply — never re-trigger the bridge.
+      senderType = 'rep';
+    } else if (/randy\s+reece\s+windows/i.test(text)) {
+      senderType = 'randy';
+    } else if (/mark\s+reece\s+windows/i.test(text)) {
+      senderType = 'mark';
+    } else {
+      senderType = 'rep';
+    }
 
-    console.log(`[SendMessage] v3.15: getThreadSenderType for ${contactId}: emailId=${emailId} → ${senderType}`);
+    console.log(`[SendMessage] v3.15.1: getThreadSenderType for ${contactId}: emailId=${emailId} → ${senderType}`);
     return senderType;
   } catch (err) {
     console.warn(`[SendMessage] getThreadSenderType failed for ${contactId}: ${err.message}`);
@@ -1257,6 +1276,7 @@ export async function executeSendMessage(action, context) {
 
   // ── AI Response Generation ─────────────────────────────────────
   let generated = null;
+  let aiFallbackUsed = false; // v3.15.1: rep-voice safe fallback fired (#99)
 
   if (message) {
     console.log(`[SendMessage] Using ${payload.pre_generated ? 'pre-generated' : 'provided'} message for ${contactId} (${message.length} chars)`);
@@ -1321,13 +1341,26 @@ export async function executeSendMessage(action, context) {
         `fast: ${generated.fast_track ? 'yes' : 'no'})`);
     } catch (err) {
       console.error(`[SendMessage] AI generation failed for ${contactId}: ${err.message}`);
-      return {
-        action: 'send_message_ai_generation_failed',
-        contact_id: contactId,
-        channel,
-        reason: 'ai_generation_failed',
-        error: err.message,
-      };
+      // v3.15.1 (#99 silent non-send fix): for EMAIL, never silently complete
+      // with no send. Fall back to a safe rep-voice message so the lead always
+      // gets a reply. Rep-direct copy is always safe here — no Mark/Randy bridge
+      // (the thread-sender signal is unreliable on the failure path, and the
+      // bridge would be wrong if the prior email was rep-authored). SMS keeps
+      // the structured-failure behavior (the #99 silent non-send was email-only;
+      // the multi-line signed copy below is email-shaped).
+      if (channel === 'email') {
+        message = `Thanks for reaching out — we want to make sure we get back to you properly. Expect a follow-up from our team shortly, or reply here anytime.\n\n{{custom_values.rep_name}}\nReece Windows & Doors`;
+        aiFallbackUsed = true;
+        console.warn(`[SendMessage] v3.15.1: sending rep-voice safe fallback for ${contactId} (#99) instead of silent non-send`);
+      } else {
+        return {
+          action: 'send_message_ai_generation_failed',
+          contact_id: contactId,
+          channel,
+          reason: 'ai_generation_failed',
+          error: err.message,
+        };
+      }
     }
   }
 
@@ -1399,9 +1432,10 @@ export async function executeSendMessage(action, context) {
     const enrichment = await buildNotificationEnrichment(contactId, context, { lpLead, prospectId, ghlContactId });
 
     const channelEmoji = channel === 'sms' ? '📱' : '📧';
-    const aiLabel = generated ? '🤖 AI-GENERATED ' : '';
+    const aiLabel = generated ? '🤖 AI-GENERATED ' : (aiFallbackUsed ? '🛟 SAFE-FALLBACK ' : '');
     const fallbackFlag = sendMethod.includes('fallback') ? ' ⚠️ FALLBACK' : '';
-    const baseMessage = `${aiLabel}AGENTIC MESSAGE SENT${fallbackFlag}`;
+    const genFailFlag = aiFallbackUsed ? ' ⚠️ AI-GEN-FAILED (#99 rep-voice fallback)' : '';
+    const baseMessage = `${aiLabel}AGENTIC MESSAGE SENT${fallbackFlag}${genFailFlag}`;
 
     // Build standard rich block, then swap the leading 🤖 for the channel emoji.
     let full = buildRichNotification({ baseMessage, name, phone, contactId, prospectId, enrichment });
@@ -1466,6 +1500,7 @@ export async function executeSendMessage(action, context) {
     rule_trigger: action.rule_applied || 'manual',
     send_method: sendMethod,
     fell_back: sendMethod.includes('fallback'),
+    ai_fallback_used: aiFallbackUsed,
     conversation_id: sendResult?.conversationId || null,
     message_id: sendResult?.messageId || null,
     webhook_status: sendResult?.webhook_status || null,
