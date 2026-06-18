@@ -545,6 +545,76 @@ async function getInboundEmailToAddress(contactId) {
 }
 
 /**
+ * v3.15 — Determine whether the most recent OUTBOUND email in the contact's
+ * thread was authored by Randy (nurture/Seinfeld/broadcast voice) or by the
+ * rep (manual send or a prior bot reply). The response generator uses this to
+ * select the correct email opener: replying to a Randy email → the rep "Randy
+ * asked me to reach out" handoff bridge; replying to a rep email → open
+ * directly as the rep (no bridge).
+ *
+ * Strategy mirrors getInboundEmailToAddress, but targets the most recent
+ * OUTBOUND email: search conversation → messages → meta.email.messageIds[0]
+ * → GET /conversations/messages/email/{id} → fingerprint body+subject.
+ *
+ * Detection (confirmed): Randy signs with his full name "Randy Reece". The
+ * bot's own rep-voiced bridge reply contains "Randy asked me to reach out",
+ * so we explicitly exclude that phrase — otherwise a prior bot reply would be
+ * misread as Randy and the bridge would repeat on every subsequent exchange.
+ *   randy → "randy reece" present AND "asked me to reach out" absent
+ *   rep   → otherwise
+ *
+ * Returns:
+ *   'randy' — outbound email was Randy-authored
+ *   'rep'   — outbound email was rep-authored (prior bot reply / manual send)
+ *   null    — no prior outbound email found or lookup failed
+ * Fail-open: callers treat null as 'rep' (the safe, non-aggressive opener).
+ */
+async function getThreadSenderType(contactId) {
+  if (!contactId || !GHL_API_KEY) return null;
+
+  try {
+    const search = await ghlFetch('GET',
+      `/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`);
+    const conversations = Array.isArray(search) ? search : (search?.conversations || []);
+    if (!conversations.length) return null;
+
+    const conversationId = conversations[0].id;
+    const msgData = await ghlFetch('GET',
+      `/conversations/${conversationId}/messages?limit=20`);
+    const messages = msgData?.messages?.messages || msgData?.messages || [];
+    if (!Array.isArray(messages) || messages.length === 0) return null;
+
+    // Newest-first. Find the most recent OUTBOUND email.
+    const recentOutboundEmail = messages.find(m =>
+      m.direction === 'outbound' &&
+      (m.messageType === 'TYPE_EMAIL' || m.type === 3)
+    );
+    const emailId = recentOutboundEmail?.meta?.email?.messageIds?.[0];
+    if (!emailId) return null;
+
+    const detail = await ghlFetch('GET', `/conversations/messages/email/${emailId}`);
+    const bodyText = String(
+      detail?.body || detail?.html || detail?.emailBody ||
+      detail?.emailMessage?.body || ''
+    ).toLowerCase();
+    const subjectText = String(
+      detail?.subject || recentOutboundEmail?.meta?.email?.subject || ''
+    ).toLowerCase();
+    const text = `${bodyText} ${subjectText}`;
+
+    const hasRandy = /randy reece/i.test(text);          // Randy signs with full name
+    const isBotBridge = /asked me to reach out/i.test(text); // the bot's own bridge reply
+    const senderType = (hasRandy && !isBotBridge) ? 'randy' : 'rep';
+
+    console.log(`[SendMessage] v3.15: getThreadSenderType for ${contactId}: emailId=${emailId} → ${senderType}`);
+    return senderType;
+  } catch (err) {
+    console.warn(`[SendMessage] getThreadSenderType failed for ${contactId}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * v3.9 — Look up the SUBJECT of the most recent inbound email for a
  * contact. Used to construct "Re: <subject>" for outbound email replies
  * so the email-client threads them with the original conversation.
@@ -1223,6 +1293,20 @@ export async function executeSendMessage(action, context) {
         event_payload_keys: ctxKeys,
       };
     }
+    // v3.15: Email reply opener awareness — determine whether the prior
+    // outbound email was Randy-authored or rep-authored so the generator can
+    // pick the correct opener. Email-only; never fetched for SMS. Fail-open to
+    // 'rep' (the safe, non-aggressive opener) if the lookup is unavailable.
+    // Fetched once, before the retry loop, so a retry never re-fetches it.
+    let threadSenderType = null;
+    if (channel === 'email') {
+      try {
+        threadSenderType = await getThreadSenderType(contactId);
+      } catch (err) {
+        console.warn(`[SendMessage] threadSenderType pre-fetch failed for ${contactId}: ${err.message}`);
+      }
+    }
+
     // Issue #99: retry-then-fallback. generateResponse() throws on malformed/
     // truncated JSON, prose-only LLM output, or upstream API errors (e.g. a 400
     // credit-balance failure). Previously the single catch RETURNED an
@@ -1234,7 +1318,9 @@ export async function executeSendMessage(action, context) {
     let generationErr = null;
     for (let attempt = 1; attempt <= MAX_GENERATION_ATTEMPTS; attempt++) {
       try {
-        generated = await generateResponse(contactId, channel, triggerMessage);
+        generated = await generateResponse(contactId, channel, triggerMessage, {
+          threadSenderType: threadSenderType ?? 'rep',
+        });
 
         // ── SHORT-CIRCUIT handling (compliance gate fired) ──
         // Intentional compliance gate, NOT an error — never fall back here.
