@@ -50,6 +50,8 @@ import {
 import { registerRestApiRoutes } from './rest-api.js';
 // ─── I.STITCH — Visitor Identity Stitch & Enrichment ─────────────
 import { registerSiteStitchRoutes } from './site-stitch.js';
+// ─── I.TRACK — Site Event Collector (tracker beacon ingest) ──────
+import { registerSiteCollectRoutes } from './site-collect.js';
 // ─── Events Router (per-event-type webhook endpoints) ────────────
 import { registerEventsRouter } from './events-router.js';
 // ─── Objection-State Ghost Sweep (post-booking ghost detection) ──
@@ -501,6 +503,7 @@ app.post('/admin/backfill-ghl-contact-id-from-lognumber', async (req, res) => {
 registerDataFreshnessRoutes(app);
 registerAgenticMvRefreshRoutes(app);
 registerSiteStitchRoutes(app);
+registerSiteCollectRoutes(app);
 registerAppointmentNotificationRoutes(app);
 registerGhlTriggerLinkRoutes(app);
 registerAgenticLeadStateRoutes(app);
