@@ -85,6 +85,47 @@ function asArray(body) {
   return body?.results || body?.data || [];
 }
 
+// Keep the LAST row per conflict key so a batch never contains the same key
+// twice — Postgres rejects ON CONFLICT DO UPDATE touching a row twice in one
+// statement (PostgREST sends the whole upsert as a single statement).
+function dedupeByKey(rows, keyFn) {
+  const m = new Map();
+  for (const r of rows) m.set(keyFn(r), r);
+  return [...m.values()];
+}
+
+// Every metric/date key the summary mapping consumes. Used to locate the one
+// remaining "dimension" field (territory/channel name) generically, so the
+// ingest doesn't depend on the exact key Lead Gurus happens to use for it.
+const METRIC_SRC_KEYS = new Set([
+  'total_leads', 'leads', 'lead_count',
+  'total_spend', 'spend', 'ad_spend',
+  'cost_per_lead', 'cpl',
+  'accepted_count', 'accepted',
+  'success_count', 'success', 'success_post_count',
+  'self_book_count', 'self_books', 'self_booked',
+  'cost_per_self_book', 'cost_per_self_booked', 'cpsb',
+  'booked', 'booked_count', 'scheduled', 'scheduled_count',
+  'demos', 'demo_count', 'issues', 'issue_count',
+  'gross_sales', 'gross_sale_count', 'gross_amount', 'gross_revenue', 'gross',
+  'net_sales', 'net_sale_count', 'net_amount', 'net_revenue', 'net',
+]);
+const DATE_KEYS = new Set(['date', 'day', 'date_after', 'date_before', 'pulled_at']);
+
+// The dimension value for a territory/channel row: try the expected names, then
+// fall back to the first non-metric, non-date string field on the item.
+function detectDimension(item, preferred) {
+  for (const k of preferred) {
+    const v = item?.[k];
+    if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
+  }
+  for (const [k, v] of Object.entries(item || {})) {
+    if (METRIC_SRC_KEYS.has(k) || DATE_KEYS.has(k)) continue;
+    if (typeof v === 'string' && v.trim() !== '') return v.trim();
+  }
+  return 'unknown';
+}
+
 // ─── Lead Gurus HTTP ────────────────────────────────────────────────────────
 async function lgGet(pathOrUrl, params = null) {
   const url = pathOrUrl.startsWith('http')
@@ -124,46 +165,74 @@ function mapMetrics(item) {
 
 async function upsertSummary({ date_after, date_before }) {
   const params = { client: LG_CLIENT_ID, date_after, date_before, page_size: '1000' };
+  const out = { daily: 0, territory: 0, channel: 0, dimensions: {}, errors: [] };
 
-  // client (daily)
-  const client = asArray(await lgGet('/api/v1/summary/client/', params));
-  const dailyRows = client
-    .map((it) => ({ date: pick(it, 'date', 'day', 'date_after') || date_after, ...mapMetrics(it) }))
-    .filter((r) => r.date);
-  if (dailyRows.length) {
-    const { error } = await supabase.from('ft_daily_summary').upsert(dailyRows, { onConflict: 'date' });
-    if (error) throw new Error(`ft_daily_summary upsert: ${error.message}`);
+  // client (daily) — one row per date.
+  try {
+    const client = asArray(await lgGet('/api/v1/summary/client/', params));
+    const rows = dedupeByKey(
+      client
+        .map((it) => ({ date: pick(it, 'date', 'day', 'date_after') || date_after, ...mapMetrics(it) }))
+        .filter((r) => r.date),
+      (r) => r.date,
+    );
+    if (rows.length) {
+      const { error } = await supabase.from('ft_daily_summary').upsert(rows, { onConflict: 'date' });
+      if (error) throw new Error(error.message);
+    }
+    out.daily = rows.length;
+  } catch (e) {
+    out.errors.push(`daily: ${e.message}`);
   }
 
-  // territory
-  const territory = asArray(await lgGet('/api/v1/summary/territory/', params));
-  const terrRows = territory
-    .map((it) => ({
-      date: pick(it, 'date', 'day') || date_after,
-      territory: String(pick(it, 'territory', 'territory_name', 'name') || 'unknown'),
-      ...mapMetrics(it),
-    }))
-    .filter((r) => r.date && r.territory);
-  if (terrRows.length) {
-    const { error } = await supabase.from('ft_summary_territory').upsert(terrRows, { onConflict: 'date,territory' });
-    if (error) throw new Error(`ft_summary_territory upsert: ${error.message}`);
+  // territory — one row per (date, territory). Dimension field name detected
+  // generically so we don't depend on the exact key the API uses.
+  try {
+    const territory = asArray(await lgGet('/api/v1/summary/territory/', params));
+    const rows = dedupeByKey(
+      territory
+        .map((it) => ({
+          date: pick(it, 'date', 'day') || date_after,
+          territory: detectDimension(it, ['territory', 'territory_name', 'name', 'region', 'market', 'office']),
+          ...mapMetrics(it),
+        }))
+        .filter((r) => r.date && r.territory),
+      (r) => `${r.date}|${r.territory}`,
+    );
+    if (rows.length) {
+      const { error } = await supabase.from('ft_summary_territory').upsert(rows, { onConflict: 'date,territory' });
+      if (error) throw new Error(error.message);
+    }
+    out.territory = rows.length;
+    out.dimensions.territory = [...new Set(rows.map((r) => r.territory))].slice(0, 12);
+  } catch (e) {
+    out.errors.push(`territory: ${e.message}`);
   }
 
-  // channel
-  const channel = asArray(await lgGet('/api/v1/summary/channel/', params));
-  const chanRows = channel
-    .map((it) => ({
-      date: pick(it, 'date', 'day') || date_after,
-      channel: String(pick(it, 'channel', 'channel_name', 'name') || 'unknown'),
-      ...mapMetrics(it),
-    }))
-    .filter((r) => r.date && r.channel);
-  if (chanRows.length) {
-    const { error } = await supabase.from('ft_summary_channel').upsert(chanRows, { onConflict: 'date,channel' });
-    if (error) throw new Error(`ft_summary_channel upsert: ${error.message}`);
+  // channel — one row per (date, channel).
+  try {
+    const channel = asArray(await lgGet('/api/v1/summary/channel/', params));
+    const rows = dedupeByKey(
+      channel
+        .map((it) => ({
+          date: pick(it, 'date', 'day') || date_after,
+          channel: detectDimension(it, ['channel', 'channel_name', 'name', 'medium', 'source']),
+          ...mapMetrics(it),
+        }))
+        .filter((r) => r.date && r.channel),
+      (r) => `${r.date}|${r.channel}`,
+    );
+    if (rows.length) {
+      const { error } = await supabase.from('ft_summary_channel').upsert(rows, { onConflict: 'date,channel' });
+      if (error) throw new Error(error.message);
+    }
+    out.channel = rows.length;
+    out.dimensions.channel = [...new Set(rows.map((r) => r.channel))].slice(0, 12);
+  } catch (e) {
+    out.errors.push(`channel: ${e.message}`);
   }
 
-  return { daily: dailyRows.length, territory: terrRows.length, channel: chanRows.length };
+  return out;
 }
 
 // ─── Leads mapping + paginated pull ─────────────────────────────────────────
@@ -212,7 +281,7 @@ async function pullLeads({ date_after }) {
     const items = asArray(body);
     pages++;
     if (items.length) {
-      const rows = items.map(mapLead).filter((r) => r.lead_id);
+      const rows = dedupeByKey(items.map(mapLead).filter((r) => r.lead_id), (r) => r.lead_id);
       const { error } = await supabase.from('ft_leads').upsert(rows, { onConflict: 'lead_id' });
       if (error) throw new Error(`ft_leads upsert: ${error.message}`);
       upserted += rows.length;
