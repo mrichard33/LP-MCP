@@ -91,6 +91,25 @@ const DDL_STATEMENTS = [
      attempts int not null default 1, first_seen timestamptz not null default now(),
      last_attempt timestamptz not null default now())`,
   `create unique index if not exists uq_unmatched_visitor on public.unmatched_identities (visitor_id)`,
+  // Atomic claim encapsulated in a function: a data-modifying CTE is only legal at
+  // the top level of a statement, so it cannot live inside run_sql's SELECT-wrapper.
+  // Wrapping it in a SQL function lets us call `select * from claim_site_identify_events(n)`
+  // (a plain SELECT, safe to wrap) while the FOR UPDATE SKIP LOCKED + UPDATE run inside.
+  `create or replace function public.claim_site_identify_events(p_limit int)
+   returns setof public.site_events
+   language sql
+   as $claim$
+     with claimed as (
+       select id from public.site_events
+       where event_type = 'identify' and processed_at is null
+       order by created_at
+       limit p_limit
+       for update skip locked
+     )
+     update public.site_events s set processed_at = now()
+     from claimed c where s.id = c.id
+     returning s.*;
+   $claim$`,
 ];
 
 let schemaEnsured = false;
@@ -194,27 +213,30 @@ async function resolveContactId(ev) {
 }
 
 // ─── Unmatched backoff ─────────────────────────────────────────────────────
+// Split into separate statements: data-modifying CTEs can't be SELECT-wrapped by
+// run_sql, so we upsert (non-SELECT), read attempts (SELECT), then conditionally
+// re-queue (non-SELECT).
 async function recordUnmatched(ev) {
   const email = ev.identity_email ? `'${String(ev.identity_email).replace(/'/g, "''")}'` : 'null';
   const phone = ev.identity_phone ? `'${String(ev.identity_phone).replace(/'/g, "''")}'` : 'null';
   const vid = String(ev.visitor_id).replace(/'/g, "''");
-  const sql = `
-    with up as (
-      insert into public.unmatched_identities
-        (site_event_id, visitor_id, identity_email, identity_phone, attempts, first_seen, last_attempt)
-      values (${Number(ev.id)}, '${vid}', ${email}, ${phone}, 1, now(), now())
-      on conflict (visitor_id) do update
-        set attempts = public.unmatched_identities.attempts + 1, last_attempt = now()
-      returning attempts
-    ),
-    reque as (
-      update public.site_events set processed_at = null
-      where id = ${Number(ev.id)} and (select attempts from up) < ${MAX_MATCH_ATTEMPTS}
-      returning id
-    )
-    select (select attempts from up) as attempts, (select count(*) from reque) as requeued`;
-  const rows = await runSQL(sql);
-  return Array.isArray(rows) ? rows[0] : null;
+
+  await runSQL(`
+    insert into public.unmatched_identities
+      (site_event_id, visitor_id, identity_email, identity_phone, attempts, first_seen, last_attempt)
+    values (${Number(ev.id)}, '${vid}', ${email}, ${phone}, 1, now(), now())
+    on conflict (visitor_id) do update
+      set attempts = public.unmatched_identities.attempts + 1, last_attempt = now()`);
+
+  const rows = await runSQL(`select attempts from public.unmatched_identities where visitor_id = '${vid}'`);
+  const attempts = Array.isArray(rows) && rows[0] ? Number(rows[0].attempts) : 1;
+
+  let requeued = false;
+  if (attempts < MAX_MATCH_ATTEMPTS) {
+    await runSQL(`update public.site_events set processed_at = null where id = ${Number(ev.id)}`);
+    requeued = true;
+  }
+  return { attempts, requeued };
 }
 
 // ─── Cross-domain aggregation (visitor_links + site_events) ────────────────
@@ -347,20 +369,9 @@ export async function stitchBatch() {
   await ensureSchema();
   const fields = await ensureGhlFields();
 
-  const claimSql = `
-    with claimed as (
-      select id from public.site_events
-      where event_type = 'identify' and processed_at is null
-      order by created_at limit ${BATCH_SIZE}
-      for update skip locked
-    ),
-    upd as (
-      update public.site_events s set processed_at = now()
-      from claimed c where s.id = c.id
-      returning s.*
-    )
-    select * from upd`;
-  const claimed = await runSQL(claimSql);
+  // The data modification lives inside the function; calling it is a plain SELECT
+  // that run_sql can safely wrap and return as rows.
+  const claimed = await runSQL(`select * from public.claim_site_identify_events(${BATCH_SIZE})`);
   const rows = Array.isArray(claimed) ? claimed : [];
   if (rows.length === 0) {
     return { ok: true, claimed: 0, matched: 0, unmatched: 0, emitted: 0, high_intent: 0, elapsed_ms: Date.now() - startedAt };
