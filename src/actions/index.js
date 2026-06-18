@@ -111,6 +111,7 @@ import { getEventContext } from './resolvers.js';
 import { processApprovalQueue } from './approval-path.js';
 import { reapStuckActions } from './reaper.js';
 import { runPool, groupByBatch } from './concurrency.js';
+import { classifyHandlerResult } from './result-status.js';
 
 // MVI v2.5 — outbound dedup + Layer 3 dispatch
 import { tryAcquireLock, releaseLock } from '../services/outbound-locks.js';
@@ -510,16 +511,27 @@ async function executeSingleAction(action, batchContext = {}, priorBatchResults 
       )),
     ]);
     if (result?._context) Object.assign(batchContext, result._context);
+    // Issue #99: a handler can return a non-throwing result that still
+    // represents a failure (AI generation failed → safe fallback sent, or the
+    // legacy early-return ai_generation_failed shape). classifyHandlerResult
+    // maps those to `failed` with a populated error_message so they stop hiding
+    // under `completed` + null error_message. execution_result is preserved.
+    const { status, error_message: errorMessage } = classifyHandlerResult(result);
     await supabase.from('agent_actions').update({
-      status: 'completed',
+      status,
+      error_message: errorMessage,
       execution_result: result,
       executed_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     }).eq('id', action.id);
-    console.log(`[ActionExecutor] ✅ ${action.action_type} completed (action ${action.id}, rule: ${action.rule_applied})`);
+    if (status === 'failed') {
+      console.warn(`[ActionExecutor] ⚠️ ${action.action_type} marked failed (action ${action.id}, rule: ${action.rule_applied}): ${errorMessage}`);
+    } else {
+      console.log(`[ActionExecutor] ✅ ${action.action_type} completed (action ${action.id}, rule: ${action.rule_applied})`);
+    }
     return {
       action_id: action.id,
-      status: 'completed',
+      status,
       action_type: action.action_type,
       result,
     };
