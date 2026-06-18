@@ -48,6 +48,8 @@ import {
 } from './approval-escalation-sweep.js';
 // ─── REST API for GHL Agent Studio ───────────────────────────────
 import { registerRestApiRoutes } from './rest-api.js';
+// ─── I.STITCH — Visitor Identity Stitch & Enrichment ─────────────
+import { registerSiteStitchRoutes } from './site-stitch.js';
 // ─── Events Router (per-event-type webhook endpoints) ────────────
 import { registerEventsRouter } from './events-router.js';
 // ─── Objection-State Ghost Sweep (post-booking ghost detection) ──
@@ -498,6 +500,7 @@ app.post('/admin/backfill-ghl-contact-id-from-lognumber', async (req, res) => {
 
 registerDataFreshnessRoutes(app);
 registerAgenticMvRefreshRoutes(app);
+registerSiteStitchRoutes(app);
 registerAppointmentNotificationRoutes(app);
 registerGhlTriggerLinkRoutes(app);
 registerAgenticLeadStateRoutes(app);
