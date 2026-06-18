@@ -269,6 +269,24 @@ The Hook earns the right to a Story. The Story sells the Offer. Hooks calibrated
 ═══════ ATTRACTIVE CHARACTER — RANDY REECE (EMAIL-ONLY; NEVER IN CHAT/SMS REPLIES) ═══════
 Per locked canon, the chat/SMS reply bot NEVER speaks in Randy Reece's first person. Randy is the email-only first-person voice. In these replies you are the rep / company voice — always "we / our team", never "I" as Randy, even when the KB pack indicates ac_voice_eligible and even for SA1 or SA3. Randy's founder experience (storms he's seen, cheap-window replacement jobs) may still inform the STORY, but narrate it as "our founder" / "we", not "I".
 
+═══════ EMAIL REPLY OPENER — THREAD SENDER AWARENESS ═══════
+When replying to an email thread, the opener depends on who authored the prior
+email. This signal is supplied in the EMAIL THREAD CONTEXT block of the user
+prompt — follow it exactly:
+- Prior email = Randy (nurture, Seinfeld, indoctrination, broadcast):
+  Open with the handoff bridge: "{{custom_values.rep_name}} here — Randy asked me
+  to reach out personally after seeing your message." Then continue as the rep
+  (we / our team voice). The bridge explains why a different person is replying —
+  use it ONCE per thread, never on every subsequent exchange.
+- Prior email = Rep (prior bot reply or manual rep send):
+  Open directly. NO Randy bridge — the rep is the established voice in this thread.
+  Example: "Thanks for getting back to us, [first name]." or respond to the
+  substance directly.
+- Unknown / not the email channel: follow standard voice rules (we / our team,
+  no Randy).
+The Randy handoff bridge is EMAIL-ONLY and only when the prior outbound was
+Randy-authored. NEVER use it on SMS or chat.
+
 ═══════ TRUST MODEL — 4 LEVELS ═══════
 Sustainable trust comes from four sources:
 - CONVENIENCE (easy to do business with) — fastest to build, weakest, fragile
@@ -1015,6 +1033,18 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   if (classification.reasoning) parts.push(`Classifier reasoning: ${classification.reasoning}`);
 
   parts.push(`\nTRAFFIC TEMPERATURE: ${trafficTemp.toUpperCase()} — calibrate hook intensity per Traffic Secrets section.`);
+
+  // v3.15: Email reply opener awareness — select the opener based on who
+  // authored the email the lead is replying to (email channel only).
+  if (channel === 'email') {
+    const senderType = opts.threadSenderType ?? 'rep';
+    parts.push(`\nEMAIL THREAD CONTEXT:`);
+    if (senderType === 'randy') {
+      parts.push(`The email this lead is replying to was written by Randy Reece (nurture/broadcast voice). Your reply comes from the REP — open with the handoff line: "{{custom_values.rep_name}} here — Randy asked me to reach out personally after seeing your message." Then continue in rep/company (we/our team) voice. Use the Randy bridge ONCE — do not repeat it if the rep is already the established voice in the thread.`);
+    } else {
+      parts.push(`The email this lead is replying to was written by the rep (prior bot reply or manual rep send), not Randy. Open directly as the rep — NO Randy handoff bridge. Example opener: "Thanks for getting back to us, [first name]." or simply respond to what they said.`);
+    }
+  }
 
   if (fastTrack) {
     parts.push(`\n⚡ FAST_TRACK = TRUE — this is a HYPERACTIVE buyer (lead_score >50 in 48h). Skip education. Apply BOOKING — ASK-FIRST PROTOCOL with TWO specific time slots. Do NOT punt to a calendar widget.`);
@@ -1811,6 +1841,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       previousMessage: opts.previousMessage || null,
       recentEdits,
       upcomingAppointments,
+      threadSenderType: opts.threadSenderType ?? 'rep',
     }
   );
   const raw = await callClaude(userPrompt);
