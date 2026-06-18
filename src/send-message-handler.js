@@ -212,6 +212,7 @@ import supabase from './supabase.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken, report429 } from './ghl-rate-limiter.js';
 import { generateResponse } from './response-generator.js';
+import { buildAiFallback } from './ai-fallback.js';
 import { bumpContactCache } from './context-builder.js';
 // v3.6: rich GroupMe notification — same helpers used by tasks v2.0 +
 // notifications handlers, so all four GroupMe surfaces share one format.
@@ -1276,7 +1277,11 @@ export async function executeSendMessage(action, context) {
 
   // ── AI Response Generation ─────────────────────────────────────
   let generated = null;
-  let aiFallbackUsed = false; // v3.15.1: rep-voice safe fallback fired (#99)
+  // Issue #99: track whether we fell back to a safe templated reply after AI
+  // generation failed. Function-scoped so the final return (outside the
+  // requires_ai_generation block) can surface it to the action executor.
+  let fallbackUsed = false;
+  let fallbackError = null;
 
   if (message) {
     console.log(`[SendMessage] Using ${payload.pre_generated ? 'pre-generated' : 'provided'} message for ${contactId} (${message.length} chars)`);
@@ -1311,6 +1316,7 @@ export async function executeSendMessage(action, context) {
     // outbound email was Randy-authored or rep-authored so the generator can
     // pick the correct opener. Email-only; never fetched for SMS. Fail-open to
     // 'rep' (the safe, non-aggressive opener) if the lookup is unavailable.
+    // Fetched once, before the retry loop, so a retry never re-fetches it.
     let threadSenderType = null;
     if (channel === 'email') {
       try {
@@ -1320,47 +1326,72 @@ export async function executeSendMessage(action, context) {
       }
     }
 
-    try {
-      generated = await generateResponse(contactId, channel, triggerMessage, {
-        threadSenderType: threadSenderType ?? 'rep',
-      });
+    // Issue #99: retry-then-fallback. generateResponse() throws on malformed/
+    // truncated JSON, prose-only LLM output, or upstream API errors (e.g. a 400
+    // credit-balance failure). Previously the single catch RETURNED an
+    // ai_generation_failed object, which the executor recorded as completed +
+    // null error_message — a silent non-send. Now: retry once for transient
+    // flukes, then send a safe templated fallback so the lead always gets a
+    // reply, and surface the failure (see fallbackUsed at the return below).
+    const MAX_GENERATION_ATTEMPTS = 2;
+    let generationErr = null;
+    for (let attempt = 1; attempt <= MAX_GENERATION_ATTEMPTS; attempt++) {
+      try {
+        generated = await generateResponse(contactId, channel, triggerMessage, {
+          threadSenderType: threadSenderType ?? 'rep',
+        });
 
-      // ── SHORT-CIRCUIT handling (compliance gate fired) ──
-      if (generated.short_circuit) {
-        return await handleShortCircuit(contactId, generated, action, context);
-      }
+        // ── SHORT-CIRCUIT handling (compliance gate fired) ──
+        // Intentional compliance gate, NOT an error — never fall back here.
+        if (generated.short_circuit) {
+          return await handleShortCircuit(contactId, generated, action, context);
+        }
 
-      message = generated.message;
-      subject = generated.subject || subject;
-      console.log(`[SendMessage] AI generated: "${message.slice(0, 80)}..." ` +
-        `(intent: ${generated.intent_class || 'n/a'}, ` +
-        `arc: ${generated.story_arc}, ` +
-        `trust: L${generated.trust_level_targeted || '?'}, ` +
-        `voice: ${generated.voice_used || 'we'}, ` +
-        `kb: ${generated.kb_pack_used ? 'yes' : 'no'}, ` +
-        `fast: ${generated.fast_track ? 'yes' : 'no'})`);
-    } catch (err) {
-      console.error(`[SendMessage] AI generation failed for ${contactId}: ${err.message}`);
-      // v3.15.1 (#99 silent non-send fix): for EMAIL, never silently complete
-      // with no send. Fall back to a safe rep-voice message so the lead always
-      // gets a reply. Rep-direct copy is always safe here — no Mark/Randy bridge
-      // (the thread-sender signal is unreliable on the failure path, and the
-      // bridge would be wrong if the prior email was rep-authored). SMS keeps
-      // the structured-failure behavior (the #99 silent non-send was email-only;
-      // the multi-line signed copy below is email-shaped).
-      if (channel === 'email') {
-        message = `Thanks for reaching out — we want to make sure we get back to you properly. Expect a follow-up from our team shortly, or reply here anytime.\n\n{{custom_values.rep_name}}\nReece Windows & Doors`;
-        aiFallbackUsed = true;
-        console.warn(`[SendMessage] v3.15.1: sending rep-voice safe fallback for ${contactId} (#99) instead of silent non-send`);
-      } else {
-        return {
-          action: 'send_message_ai_generation_failed',
-          contact_id: contactId,
-          channel,
-          reason: 'ai_generation_failed',
-          error: err.message,
-        };
+        message = generated.message;
+        subject = generated.subject || subject;
+        generationErr = null;
+        console.log(`[SendMessage] AI generated (attempt ${attempt}): "${message.slice(0, 80)}..." ` +
+          `(intent: ${generated.intent_class || 'n/a'}, ` +
+          `arc: ${generated.story_arc}, ` +
+          `trust: L${generated.trust_level_targeted || '?'}, ` +
+          `voice: ${generated.voice_used || 'we'}, ` +
+          `kb: ${generated.kb_pack_used ? 'yes' : 'no'}, ` +
+          `fast: ${generated.fast_track ? 'yes' : 'no'})`);
+        break; // success — exit retry loop
+      } catch (err) {
+        generationErr = err;
+        console.warn(`[SendMessage] AI generation attempt ${attempt}/${MAX_GENERATION_ATTEMPTS} failed for ${contactId}: ${err.message}`);
+        if (attempt < MAX_GENERATION_ATTEMPTS) {
+          await new Promise(r => setTimeout(r, 1500)); // brief backoff before retry
+        }
       }
+    }
+
+    // If generation failed after all retries, use the channel-appropriate safe
+    // fallback so the contact always receives a reply and the rep gets a signal
+    // to follow up. The send path below is unchanged — only the message body is.
+    if (generationErr) {
+      console.error(`[SendMessage] AI generation exhausted ${MAX_GENERATION_ATTEMPTS} attempts for ${contactId}: ${generationErr.message} — using safe fallback`);
+      fallbackUsed = true;
+      fallbackError = generationErr;
+      generated = null; // ensure downstream metadata reflects "no AI generation"
+
+      // Safe fallback copy (src/ai-fallback.js) — neutral, opens the door,
+      // triggers no compliance gates.
+      const fb = buildAiFallback(channel, subject);
+      message = fb.message;
+      subject = fb.subject;
+
+      // Fire a GroupMe alert so the team knows a fallback went out and can
+      // follow up personally. Fire-and-forget — must never block the send.
+      sendGroupMeMessage(
+        `⚠️ AI GENERATION FAILED — FALLBACK SENT\n` +
+        `Contact: ${contactId}\n` +
+        `Channel: ${channel.toUpperCase()}\n` +
+        `Rule: ${action.rule_applied || 'manual'}\n` +
+        `Error: ${generationErr.message.slice(0, 150)}\n` +
+        `→ Safe fallback message sent. Manual follow-up recommended.`
+      ).catch(err => console.warn(`[SendMessage] GroupMe alert (fallback) failed: ${err.message}`));
     }
   }
 
@@ -1432,10 +1463,9 @@ export async function executeSendMessage(action, context) {
     const enrichment = await buildNotificationEnrichment(contactId, context, { lpLead, prospectId, ghlContactId });
 
     const channelEmoji = channel === 'sms' ? '📱' : '📧';
-    const aiLabel = generated ? '🤖 AI-GENERATED ' : (aiFallbackUsed ? '🛟 SAFE-FALLBACK ' : '');
+    const aiLabel = generated ? '🤖 AI-GENERATED ' : '';
     const fallbackFlag = sendMethod.includes('fallback') ? ' ⚠️ FALLBACK' : '';
-    const genFailFlag = aiFallbackUsed ? ' ⚠️ AI-GEN-FAILED (#99 rep-voice fallback)' : '';
-    const baseMessage = `${aiLabel}AGENTIC MESSAGE SENT${fallbackFlag}${genFailFlag}`;
+    const baseMessage = `${aiLabel}AGENTIC MESSAGE SENT${fallbackFlag}`;
 
     // Build standard rich block, then swap the leading 🤖 for the channel emoji.
     let full = buildRichNotification({ baseMessage, name, phone, contactId, prospectId, enrichment });
@@ -1500,7 +1530,6 @@ export async function executeSendMessage(action, context) {
     rule_trigger: action.rule_applied || 'manual',
     send_method: sendMethod,
     fell_back: sendMethod.includes('fallback'),
-    ai_fallback_used: aiFallbackUsed,
     conversation_id: sendResult?.conversationId || null,
     message_id: sendResult?.messageId || null,
     webhook_status: sendResult?.webhook_status || null,
@@ -1520,5 +1549,10 @@ export async function executeSendMessage(action, context) {
     companion_queued: companionResult.queued,
     companion_action_id: companionResult.action_id || null,
     companion_error: companionResult.queued ? null : (companionResult.error || companionResult.reason || null),
+    // Issue #99: surface AI-generation fallback so the executor records this
+    // send as `failed` with a populated error_message instead of silent
+    // `completed`. False/null on the happy path (no behavior change).
+    _fallback_send: fallbackUsed,
+    _generation_error: fallbackError ? fallbackError.message.slice(0, 300) : null,
   };
 }
