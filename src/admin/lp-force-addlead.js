@@ -1,6 +1,22 @@
 /**
  * LP Force-Create-Lead Admin Endpoint — src/admin/lp-force-addlead.js
  *
+ * v2.0.1 (2026-06-19): FIX GHL WORKFLOW ENROLLMENT 422 — eventStartTime timezone.
+ *
+ *   GHL's /contacts/{id}/workflow/{wfId} POST rejects eventStartTime values
+ *   with a bare Z suffix (e.g. "2026-06-19T20:14:26.135Z") and requires an
+ *   explicit timezone offset like "+00:00". Node's Date.toISOString() always
+ *   emits Z, so every self-heal enroll attempt was failing with:
+ *     422 "The event start time must be a date and time with timezone offset.
+ *          ex: 2021-06-23T03:30:00+01:00"
+ *
+ *   Fix: .toISOString().replace('Z', '+00:00') in the fetch body.
+ *
+ *   Root cause confirmed on Thomas Belcher (Lp9ELGYU4DPsz7Iq5ldg, 2026-06-19).
+ *   Every contact that booked an appointment before LP issued its inbound entry
+ *   would hit this failure path. The dedup guard then suppressed retries,
+ *   leaving the contact permanently stranded with lp-sync-failed.
+ *
  * v2.0.0 (2026-06-03): ENROLL IN GHL WORKFLOW 8e30ff37 (was: raw addLead).
  *
  *   CORRECTION over v1.0.0. v1 called LP's legacy addlead directly from
@@ -108,6 +124,12 @@ export async function enrollLpLeadCreation({ contactId, calendarName = null, for
   }
 
   const url = `https://services.leadconnectorhq.com/contacts/${contactId}/workflow/${LEAD_CREATE_WORKFLOW_ID}`;
+
+  // v2.0.1: GHL rejects eventStartTime with a bare Z suffix ("...Z") and
+  // requires an explicit timezone offset ("...+00:00"). Node's toISOString()
+  // always emits Z, so we replace it before sending.
+  const eventStartTime = new Date().toISOString().replace('Z', '+00:00');
+
   const res = await fetch(url, {
     method: 'POST',
     headers: {
@@ -116,7 +138,7 @@ export async function enrollLpLeadCreation({ contactId, calendarName = null, for
       'Content-Type': 'application/json',
       'Accept': 'application/json',
     },
-    body: JSON.stringify({ eventStartTime: new Date().toISOString() }),
+    body: JSON.stringify({ eventStartTime }),
     signal: AbortSignal.timeout(15000),
   });
   if (!res.ok) {
@@ -170,5 +192,5 @@ export function registerLPForceAddLeadRoutes(app) {
     }
   });
 
-  console.log('[LP-FORCE-ADDLEAD] Registered: POST /admin/lp/force-addlead (v2.0.0 — enroll wf 8e30ff37)');
+  console.log('[LP-FORCE-ADDLEAD] Registered: POST /admin/lp/force-addlead (v2.0.1 — fix GHL 422 timezone, enroll wf 8e30ff37)');
 }
