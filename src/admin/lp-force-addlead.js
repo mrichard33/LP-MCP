@@ -1,6 +1,29 @@
 /**
  * LP Force-Create-Lead Admin Endpoint — src/admin/lp-force-addlead.js
  *
+ * v2.1.0 (2026-06-19): FALLBACK LP SOURCE ID + PRO ID BEFORE ENROLLMENT.
+ *
+ *   Root cause (Thomas Belcher, Lp9ELGYU4DPsz7Iq5ldg): Voice-AI / agentic
+ *   booked leads arrive with NO lp_source_id and NO pro_id (source:unknown).
+ *   Workflow 8e30ff37 has a hard gate near the top — for non-canvassing
+ *   ("Other Lead") leads it checks "Source ID and Pro ID" (both must
+ *   has_value) before it will reach the addlead step. Sourceless leads fell
+ *   into the "None" branch → a task notification + note, and NO LP lead was
+ *   ever created. So even after the v2.0.1 timezone fix let enrollment
+ *   succeed, the workflow itself produced nothing for these leads.
+ *
+ *   Fix: ensureLpSourceAndProId() runs immediately before the enrollment
+ *   POST. It reads the contact and, for whichever of LP Source ID
+ *   (k6j4IBh5IejPooSCsj49) / Pro ID (BbUJ6RrdTjjEqqRA8JVx) is EMPTY, writes
+ *   the fallback (LP_FALLBACK_SOURCE_ID=830 / LP_FALLBACK_PRO_ID=5574,
+ *   both env-overridable). It only fills blanks — a lead that already
+ *   carries a real source/pro is left untouched, so attribution is never
+ *   clobbered. With both fields present the workflow passes the gate and
+ *   creates the LP lead WITH the appointment (adate/atime off the contact).
+ *
+ *   FAIL-OPEN: any error reading/writing the fields is logged and we still
+ *   attempt the enroll (a missing-field enroll is no worse than today).
+ *
  * v2.0.1 (2026-06-19): FIX GHL WORKFLOW ENROLLMENT 422 — eventStartTime timezone.
  *
  *   GHL's /contacts/{id}/workflow/{wfId} POST rejects eventStartTime values
@@ -11,11 +34,6 @@
  *          ex: 2021-06-23T03:30:00+01:00"
  *
  *   Fix: .toISOString().replace('Z', '+00:00') in the fetch body.
- *
- *   Root cause confirmed on Thomas Belcher (Lp9ELGYU4DPsz7Iq5ldg, 2026-06-19).
- *   Every contact that booked an appointment before LP issued its inbound entry
- *   would hit this failure path. The dedup guard then suppressed retries,
- *   leaving the contact permanently stranded with lp-sync-failed.
  *
  * v2.0.0 (2026-06-03): ENROLL IN GHL WORKFLOW 8e30ff37 (was: raw addLead).
  *
@@ -63,6 +81,7 @@
 
 import { sendGroupMeMessage } from '../groupme.js';
 import supabase from '../supabase.js';
+import { getGHLContact, updateGHLContactFields } from '../ghl.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 
@@ -73,9 +92,83 @@ const LEAD_CREATE_WORKFLOW_ID =
 
 const DEDUP_WINDOW_MIN = Number(process.env.LP_APPT_DEDUP_WINDOW_MIN || 1440);
 
+// ─── Fallback source / pro_id (v2.1.0) ─────────────────────────────
+// GHL custom field IDs (confirmed in src/ghl-field-map.js):
+//   LP Source ID → k6j4IBh5IejPooSCsj49  (slug: lp_source_id)
+//   Pro ID       → BbUJ6RrdTjjEqqRA8JVx  (slug: pro_id)
+// Both are flagged "SKIP DURING SYNC (set by GHL entry workflows)" in the
+// field map — the LP→GHL sync never writes them, and the Voice-AI/agentic
+// entry path doesn't either, which is why sourceless leads can't clear
+// workflow 8e30ff37's "Source ID and Pro ID" gate.
+const LP_SOURCE_ID_FIELD = 'k6j4IBh5IejPooSCsj49';
+const PRO_ID_FIELD       = 'BbUJ6RrdTjjEqqRA8JVx';
+const FALLBACK_SOURCE_ID = String(process.env.LP_FALLBACK_SOURCE_ID || '830');
+const FALLBACK_PRO_ID    = String(process.env.LP_FALLBACK_PRO_ID || '5574');
+
 function clean(v) {
   if (v === 'null' || v === 'undefined' || v === '' || v == null) return null;
   return String(v).trim();
+}
+
+function readContactField(contact, fieldId) {
+  const cf = contact?.customFields || contact?.customField || [];
+  if (!Array.isArray(cf)) return null;
+  const hit = cf.find((f) => f && (f.id === fieldId));
+  const v = hit?.value ?? hit?.field_value;
+  return v != null && String(v).trim() !== '' ? String(v).trim() : null;
+}
+
+/**
+ * v2.1.0: Ensure the contact has an LP Source ID and Pro ID before we
+ * enroll it in workflow 8e30ff37. For whichever field is empty, write the
+ * fallback (FALLBACK_SOURCE_ID / FALLBACK_PRO_ID). Only fills blanks — an
+ * existing real value is never overwritten, so lead attribution is safe.
+ *
+ * Returns a small summary object describing what (if anything) was set.
+ * FAIL-OPEN: on any read/write error, logs and returns { ok:false } so the
+ * caller still attempts enrollment.
+ */
+async function ensureLpSourceAndProId(contactId) {
+  try {
+    const contact = await getGHLContact(contactId);
+    if (!contact) {
+      console.warn(`[LP-FORCE-ADDLEAD] ensureLpSourceAndProId: contact ${contactId} not found — skipping field backfill`);
+      return { ok: false, reason: 'contact_not_found' };
+    }
+
+    const existingSource = readContactField(contact, LP_SOURCE_ID_FIELD);
+    const existingPro    = readContactField(contact, PRO_ID_FIELD);
+
+    const updates = [];
+    if (!existingSource) updates.push({ id: LP_SOURCE_ID_FIELD, field_value: FALLBACK_SOURCE_ID });
+    if (!existingPro)    updates.push({ id: PRO_ID_FIELD,       field_value: FALLBACK_PRO_ID });
+
+    if (updates.length === 0) {
+      return { ok: true, set_source: false, set_pro: false, source: existingSource, pro_id: existingPro };
+    }
+
+    const res = await updateGHLContactFields(contactId, updates);
+    const wrote = res === true;
+    if (wrote) {
+      console.log(
+        `[LP-FORCE-ADDLEAD] Backfilled missing LP gate fields on ${contactId}: ` +
+        `${!existingSource ? `lp_source_id=${FALLBACK_SOURCE_ID} ` : ''}` +
+        `${!existingPro ? `pro_id=${FALLBACK_PRO_ID}` : ''}`.trim()
+      );
+    } else {
+      console.warn(`[LP-FORCE-ADDLEAD] Field backfill for ${contactId} returned ${JSON.stringify(res)} — proceeding to enroll anyway`);
+    }
+    return {
+      ok: wrote,
+      set_source: !existingSource,
+      set_pro: !existingPro,
+      source: existingSource || FALLBACK_SOURCE_ID,
+      pro_id: existingPro || FALLBACK_PRO_ID,
+    };
+  } catch (err) {
+    console.warn(`[LP-FORCE-ADDLEAD] ensureLpSourceAndProId failed for ${contactId} (proceeding): ${err.message}`);
+    return { ok: false, reason: err.message };
+  }
 }
 
 async function findMark(key) {
@@ -98,6 +191,11 @@ async function writeMark(key, contactId) {
  * (8e30ff37) to create the LP lead — with appointment — the canonical
  * way, including inbound-id writeback and the downstream LP callback that
  * fills lp_prospect_id / lp_lead_id / Disposition.
+ *
+ * v2.1.0: before enrolling, ensureLpSourceAndProId() backfills the LP
+ * Source ID / Pro ID gate fields with fallbacks if they are missing, so
+ * sourceless Voice-AI/agentic leads pass the workflow's "Source ID and
+ * Pro ID" gate and actually reach the addlead step.
  *
  * Shared by the admin endpoint and the syncAppointmentToLP auto-heal.
  * The only required input is contactId — the workflow reads everything
@@ -122,6 +220,10 @@ export async function enrollLpLeadCreation({ contactId, calendarName = null, for
       return { success: true, action: 'create_lead_already_enrolled', contact_id: contactId, workflow_id: LEAD_CREATE_WORKFLOW_ID, dedup_key: dedupKey, marked_at: prior.created_at };
     }
   }
+
+  // v2.1.0: backfill LP Source ID / Pro ID before enrolling so the
+  // workflow's "Source ID and Pro ID" gate passes for sourceless leads.
+  const gateFields = await ensureLpSourceAndProId(contactId);
 
   const url = `https://services.leadconnectorhq.com/contacts/${contactId}/workflow/${LEAD_CREATE_WORKFLOW_ID}`;
 
@@ -151,6 +253,9 @@ export async function enrollLpLeadCreation({ contactId, calendarName = null, for
   await sendGroupMeMessage(
     `🛠️ LP Lead Creation Triggered\n` +
     `👤 contact: ${contactId}${calendarName ? ` | ${calendarName}` : ''}\n` +
+    (gateFields?.set_source || gateFields?.set_pro
+      ? `🧩 Backfilled gate fields: ${gateFields.set_source ? `srs_id=${FALLBACK_SOURCE_ID} ` : ''}${gateFields.set_pro ? `pro_id=${FALLBACK_PRO_ID}` : ''}`.trim() + `\n`
+      : '') +
     `🔁 Enrolled in "Send Lead to Lead Perfection" (8e30ff37)\n` +
     `→ addlead+appt (JSON) · inbound-id writeback · LP callback fills prospect/lead id (~60s)`
   ).catch(() => {});
@@ -161,6 +266,7 @@ export async function enrollLpLeadCreation({ contactId, calendarName = null, for
     contact_id: contactId,
     workflow_id: LEAD_CREATE_WORKFLOW_ID,
     dedup_key: dedupKey,
+    gate_fields: gateFields,
   };
 }
 
@@ -192,5 +298,5 @@ export function registerLPForceAddLeadRoutes(app) {
     }
   });
 
-  console.log('[LP-FORCE-ADDLEAD] Registered: POST /admin/lp/force-addlead (v2.0.1 — fix GHL 422 timezone, enroll wf 8e30ff37)');
+  console.log('[LP-FORCE-ADDLEAD] Registered: POST /admin/lp/force-addlead (v2.1.0 — fallback srs_id/pro_id + fix GHL 422 timezone, enroll wf 8e30ff37)');
 }
