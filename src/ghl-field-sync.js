@@ -1,7 +1,13 @@
 // ─── GHL Field Sync — src/ghl-field-sync.js ──────────────────────
 //
-// v4 — April 5, 2026
+// v5 — 2026-06-19
 // Syncs LP lead data to GHL contact custom fields with change detection.
+//
+// v5 CHANGES:
+// - After a successful push, emit lp.disposition_changed when the
+//   disposition_code has changed. Closes the Bug 1 gap where LP sync
+//   wrote CXL/CCC/BO to the GHL custom field but never fired an event,
+//   leaving CXL leads stuck in S2.2 indoctrination indefinitely.
 //
 // v4 CHANGES:
 // - Handles 'not_found' return from updateGHLContactFields (deleted GHL contacts)
@@ -23,6 +29,12 @@
 import supabase from './supabase.js';
 import { updateGHLContactFields } from './ghl.js';
 import { buildGHLFieldPayload, computeFieldHash, getConfiguredFieldCount } from './ghl-field-map.js';
+import { emitEvent, dispositionPriority } from './event-emitter.js';
+
+// GHL custom field ID for the canonical LP disposition (URWTGtobi9a9Y7gwGxC8).
+// Used to detect disposition changes from the field payload after a push so we
+// can emit lp.disposition_changed without an extra Supabase round-trip.
+const DISPOSITION_FIELD_ID = 'URWTGtobi9a9Y7gwGxC8';
 
 // Track stats per sync cycle
 let fieldSyncStats = { checked: 0, pushed: 0, skipped: 0, failed: 0, cleared: 0 };
@@ -125,10 +137,70 @@ async function clearStaleGHLContact(ghlContactId, leadIds) {
 }
 
 /**
+ * Extract the disposition code from a GHL field payload array.
+ * Returns the value of DISPOSITION_FIELD_ID, or null if not present.
+ *
+ * @param {Array} fields - Array of { id, field_value } objects
+ * @returns {string|null}
+ */
+function extractDispositionFromPayload(fields) {
+  const field = fields.find(f => f.id === DISPOSITION_FIELD_ID);
+  return field?.field_value || null;
+}
+
+/**
+ * Emit lp.disposition_changed after a successful field push if the disposition
+ * code has changed. Uses idempotency key scoped to contact + code so re-syncs
+ * cannot double-fire.
+ *
+ * Called ONLY after updateGHLContactFields returns true (confirmed push).
+ *
+ * @param {string} ghlContactId
+ * @param {string} newCode       - Disposition code being written
+ * @param {string|null} oldCode  - Prior code (null for first sync)
+ * @param {Object} lead          - Merged lead (for LP IDs)
+ */
+async function maybeEmitDispositionChanged(ghlContactId, newCode, oldCode, lead) {
+  // Only fire when the code has actually changed (or first-time write from null)
+  if (!newCode || newCode === oldCode) return;
+
+  const priority = dispositionPriority(newCode);
+  const idempotencyKey = `lp.disp.sync.${ghlContactId}.${newCode}`;
+
+  try {
+    await emitEvent({
+      event_type: 'lp.disposition_changed',
+      event_subtype: newCode,
+      source: 'lp_sync',
+      entity_type: 'contact',
+      entity_id: ghlContactId,
+      ghl_contact_id: ghlContactId,
+      lp_lead_id: lead.lp_lead_id ? String(lead.lp_lead_id) : null,
+      lp_prospect_id: lead.lp_prospect_id ? String(lead.lp_prospect_id) : null,
+      payload: {
+        disposition_code: newCode,
+        previous_disposition_code: oldCode || null,
+        source: 'field_sync',
+      },
+      previous_state: oldCode ? { disposition_code: oldCode } : null,
+      new_state: { disposition_code: newCode },
+      priority,
+      idempotency_key: idempotencyKey,
+      bypass_filter: false,
+    });
+    console.log(`[FieldSync] Emitted lp.disposition_changed:${newCode} for contact ${ghlContactId} (was: ${oldCode || 'null'})`);
+  } catch (err) {
+    // Non-fatal — field push already succeeded; log and continue
+    console.warn(`[FieldSync] Failed to emit disposition change event for ${ghlContactId}:`, err.message);
+  }
+}
+
+/**
  * Sync merged lead fields to the matched GHL contact.
  * Only calls GHL API if field values have changed since last sync.
  *
  * v4: Handles 'not_found' return — clears stale ghl_contact_id automatically.
+ * v5: Emits lp.disposition_changed when disposition_code changes.
  */
 export async function syncLeadFieldsToGHL(lead, ghlContactId, storedHash) {
   if (!ghlContactId || !lead) {
@@ -151,6 +223,9 @@ export async function syncLeadFieldsToGHL(lead, ghlContactId, storedHash) {
     return { pushed: false, hash: storedHash };
   }
 
+  // Capture the incoming disposition before the push (for change detection)
+  const incomingDisposition = extractDispositionFromPayload(fields);
+
   // Push to GHL
   const result = await updateGHLContactFields(ghlContactId, fields);
 
@@ -172,6 +247,15 @@ export async function syncLeadFieldsToGHL(lead, ghlContactId, storedHash) {
     } catch (err) {
       console.warn(`[FieldSync] Hash update failed for contact ${ghlContactId}:`, err.message);
     }
+
+    // ── v5: Emit disposition change event if code changed ──────────
+    // The merged lead's disposition_code is what was in the lp_leads cache
+    // before this push. incomingDisposition is what we just wrote to GHL.
+    // If they differ, emit the event so the Decision Engine can route correctly.
+    // When storedHash === null this is the contact's first sync — treat prior
+    // disposition as null so the event fires unconditionally for new codes.
+    const priorDisposition = storedHash === null ? null : (lead.disposition_code || null);
+    await maybeEmitDispositionChanged(ghlContactId, incomingDisposition, priorDisposition, lead);
 
     return { pushed: true, hash: newHash };
   } else if (result === 'not_found') {
