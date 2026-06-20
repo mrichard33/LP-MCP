@@ -179,7 +179,7 @@ import { callLLM, resolveLLM } from './llm-client.js';
 // `response_generator` fn key (customer_facing group). Legacy
 // RESPONSE_GENERATOR_MODEL is still honored by the client for Anthropic
 // back-compat.
-const MAX_TOKENS = parseInt(process.env.RESPONSE_GENERATOR_MAX_TOKENS || '600', 10);
+const MAX_TOKENS = parseInt(process.env.RESPONSE_GENERATOR_MAX_TOKENS || '2000', 10);
 const PROMPT_TIMEZONE = process.env.REECE_TIMEZONE || 'America/New_York';
 
 // v2.7.4: how many recent edits to inject as in-context learning examples.
@@ -1319,6 +1319,53 @@ async function callClaude(userPrompt) {
   return parseJsonFromResponse(text);
 }
 
+// Extract a top-level "key": "..." JSON string value by hand, honoring
+// backslash escapes. Returns the decoded string, or null when the key is
+// absent OR its value was truncated mid-string (no closing quote). Used only
+// for last-resort recovery of a tail-truncated response (see salvageLeadingMessage).
+function extractJsonStringField(body, key) {
+  const keyRx = new RegExp(`"${key}"\\s*:\\s*"`);
+  const m = keyRx.exec(body);
+  if (!m) return null;
+  let raw = '';
+  let closed = false;
+  for (let i = m.index + m[0].length; i < body.length; i++) {
+    const ch = body[i];
+    if (ch === '\\') {
+      if (i + 1 >= body.length) break;   // escape char itself was cut off → truncated
+      raw += ch + body[i + 1];
+      i++;
+      continue;
+    }
+    if (ch === '"') { closed = true; break; }
+    raw += ch;
+  }
+  if (!closed) return null;              // value truncated mid-string → unrecoverable
+  try {
+    return JSON.parse(`"${raw}"`);       // decode \n, \", \\ etc.
+  } catch {
+    return null;
+  }
+}
+
+// Last-resort recovery when the model's JSON object is truncated or corrupt AND
+// brace-extraction failed. Pulls a COMPLETE leading "message" (and "subject")
+// out of the partial object so a real reply still goes out instead of the
+// generic fallback. Refuses (returns null) once a companion_action has begun in
+// the captured text — a cut-off booking/cancel/reschedule action can't be
+// safely reconstructed, so those cases MUST fall back rather than send a
+// confirmation for an action that never ran.
+function salvageLeadingMessage(clean, jsonStart) {
+  const body = clean.slice(jsonStart);
+  if (/"companion_action"\s*:/.test(body)) return null;
+  const message = extractJsonStringField(body, 'message');
+  if (typeof message !== 'string' || message.length === 0) return null;
+  const out = { message };
+  const subject = extractJsonStringField(body, 'subject');
+  if (subject !== null) out.subject = subject;
+  return out;
+}
+
 function parseJsonFromResponse(text) {
   let clean = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
 
@@ -1346,6 +1393,13 @@ function parseJsonFromResponse(text) {
       }
     }
     if (jsonEnd === -1) {
+      // Tail-truncated object (model hit the token cap). Recover a complete
+      // leading message rather than dropping to the generic fallback.
+      const salvaged = salvageLeadingMessage(clean, jsonStart);
+      if (salvaged) {
+        console.warn(`[ResponseGenerator] Truncated JSON — recovered message only (${clean.length - jsonStart} chars from object start; metadata/companion dropped).`);
+        return salvaged;
+      }
       throw new Error(`Unbalanced JSON in response: ${clean.slice(jsonStart, jsonStart + 200)}`);
     }
     const extracted = clean.slice(jsonStart, jsonEnd + 1);
@@ -1356,6 +1410,13 @@ function parseJsonFromResponse(text) {
       console.warn(`[ResponseGenerator] JSON recovered from preamble (${preambleLen} chars stripped): "${preview}${preambleLen > 80 ? '...' : ''}"`);
       return parsed;
     } catch (secondErr) {
+      // Braces balanced but the body still won't parse (e.g. a bad escape).
+      // Try the same message-only salvage before giving up to the fallback.
+      const salvaged = salvageLeadingMessage(clean, jsonStart);
+      if (salvaged) {
+        console.warn(`[ResponseGenerator] Corrupt JSON body — recovered message only: ${secondErr.message}`);
+        return salvaged;
+      }
       throw new Error(`Extracted JSON failed to parse: ${secondErr.message}. First 200 chars: ${extracted.slice(0, 200)}`);
     }
   }
