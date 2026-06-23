@@ -158,6 +158,8 @@ import {
 import { registerLeadSelectionRoutes, startLeadSelectionScheduler } from './agentic/lead-selection/index.js';
 // Workflow visibility projection sweep (system_events → membership/suppression/delivery).
 import { registerWorkflowProjectionRoutes, startWorkflowProjectionLoop } from './jobs/workflow-projection.js';
+// Daily goal/variance scorecard actuals ("Monday a.m." report).
+import { registerGoalScorecardRoutes, startGoalScorecardScheduler } from './jobs/goal-scorecard-daily.js';
 // ─── Agentic Hold-Complete (return-from-hold re-entry) ───────────
 import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
 // ─── FB Publish Watchdog (alert on missed WF4 publish window) ────
@@ -516,6 +518,7 @@ registerNoteChangeAnalyzerRoutes(app);
 registerEnrollExistingEligibleRoutes(app);
 registerLeadSelectionRoutes(app);
 registerWorkflowProjectionRoutes(app);
+registerGoalScorecardRoutes(app);
 
 app.listen(PORT, async () => {
   console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
@@ -541,6 +544,7 @@ app.listen(PORT, async () => {
   startNoteChangeAnalyzerScheduler();
   startLeadSelectionScheduler();
   startWorkflowProjectionLoop();
+  startGoalScorecardScheduler();
   startFbPublishWatchdog();
   // First field-sync ~60s after boot (was ~9.5 min), then every 15 min.
   setTimeout(async () => {
