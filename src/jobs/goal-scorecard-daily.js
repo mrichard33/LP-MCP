@@ -68,9 +68,15 @@ async function fetchAllProspects(startdate, enddate) {
       StartIndex: startIndex,
     });
     const items = extractArray(res);
+    // GetLead (options=261120) paginates AND post-filters each page, so a page
+    // can return fewer than PAGE_SIZE rows while more pages remain — a
+    // `< PAGE_SIZE` break stops after page one and massively undercounts (199 of
+    // several thousand prospects observed for a full MTD window). Mirror the
+    // proven incremental-sync sweep (sync-engine.js runLeadsSweep): advance
+    // StartIndex by the rows actually returned and stop only on an empty page.
+    if (items.length === 0) break;
     prospects.push(...items);
-    if (items.length < PAGE_SIZE) break;
-    startIndex += PAGE_SIZE;
+    startIndex += items.length;
     await sleep(RATE_LIMIT_SLEEP_MS); // LP monitors for excessive use
   }
   return prospects;
