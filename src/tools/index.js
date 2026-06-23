@@ -8,6 +8,7 @@ import { registerAgentTools } from './agent-tools.js';
 import { registerIntelTools } from './intel-tools.js';
 import { registerRescissionTools } from './rescission-tools.js';
 import { registerLPAppointmentTools } from './lp-appointment-tools.js';
+import { registerDriftTools } from './drift-tools.js';
 import { registerAdminTools } from './admin/index.js';
 
 export function registerAllTools(server) {
@@ -31,6 +32,9 @@ export function registerAllTools(server) {
   //   check_lp_inbound (read-only). Expose existing webhook-only LP appointment
   //   logic to the MCP so ops sweeps can act on un-synced appointments.
   registerLPAppointmentTools(server);
+  // Drift detection tool (1) — backs the dashboard Issues-page "drift" tile.
+  //   get_drift_candidates (read-only; GHL-closed but LP-active cross-reference)
+  registerDriftTools(server);
   // Infrastructure admin tools (17) — v5.1
   registerAdminTools(server);
 }
