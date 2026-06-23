@@ -271,10 +271,24 @@ export async function upsertLeadOnly(prospect) {
     // the existing ghl_contact_id into buildLeadRow. maybeSingle() returns
     // null cleanly for brand-new leads instead of erroring.
     const { data: existing } = await supabase.from('lp_leads')
-      .select('updated_at_lp, ghl_contact_id')
+      .select('updated_at_lp, ghl_contact_id, demo_completed, appointment_set, closed_won')
       .eq('lp_lead_id', lpLeadId).maybeSingle();
 
-    if (newUpdatedAt && existing?.updated_at_lp && existing.updated_at_lp === newUpdatedAt) {
+    // Funnel-flag staleness guard (mirrors processProspect): a Sat/ApptSet/Sold
+    // flip that doesn't bump LastChangedOn must still force the upsert, or even
+    // a full re-sync (Pass 1) leaves demo_completed/appointment_set/closed_won stale.
+    const apptSetIn = getField(lead, 'apptset', 'ApptSet');
+    const satIn     = getField(lead, 'sat', 'Sat');
+    const soldIn    = getField(lead, 'sold', 'Sold');
+    const isApptSetIn = apptSetIn === 'true' || apptSetIn === true;
+    const isDemoIn    = satIn === 'true' || satIn === true;
+    const isSoldIn    = soldIn === 'true' || soldIn === true;
+    const flagsUnchanged = existing
+      && existing.appointment_set === isApptSetIn
+      && existing.demo_completed  === isDemoIn
+      && existing.closed_won      === isSoldIn;
+
+    if (newUpdatedAt && existing?.updated_at_lp && existing.updated_at_lp === newUpdatedAt && flagsUnchanged) {
       const newLeadGhlId = deriveLeadGhlId(lead, null);
       const needsGhlIdBackfill = !existing.ghl_contact_id && newLeadGhlId;
       if (!needsGhlIdBackfill) {
@@ -362,7 +376,7 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
 
     // ─── AGENTIC: Read existing state BEFORE upsert ──────────────
     const { data: existing } = await supabase.from('lp_leads')
-      .select('ghl_tag_applied, lp_day15_triggered, disposition_code, ghl_contact_id, updated_at_lp')
+      .select('ghl_tag_applied, lp_day15_triggered, disposition_code, ghl_contact_id, updated_at_lp, demo_completed, appointment_set, closed_won')
       .eq('lp_lead_id', lpLeadId).single();
 
     const previousDisposition = existing?.disposition_code || null;
@@ -392,10 +406,29 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
       leadSource: getField(lead, 'source', 'Source') || null,
     });
 
+    // ─── Funnel-flag staleness guard ────────────────────────────
+    // A Sat/ApptSet/Sold flip on the LP side does not always bump
+    // LastChangedOn or advance the disposition, so an updated_at_lp +
+    // ghl_contact_id match alone is not enough to call the row unchanged.
+    // Derive the incoming flags exactly as buildLeadRow does and force the
+    // upsert whenever the cached funnel state disagrees — otherwise
+    // demo_completed/appointment_set/closed_won rot silently.
+    const apptSetIn = getField(lead, 'apptset', 'ApptSet');
+    const satIn     = getField(lead, 'sat', 'Sat');
+    const soldIn    = getField(lead, 'sold', 'Sold');
+    const isApptSetIn = apptSetIn === 'true' || apptSetIn === true;
+    const isDemoIn    = satIn === 'true' || satIn === true;
+    const isSoldIn    = soldIn === 'true' || soldIn === true;
+    const flagsUnchanged = existing
+      && existing.appointment_set === isApptSetIn
+      && existing.demo_completed  === isDemoIn
+      && existing.closed_won      === isSoldIn;
+
     const recordUnchanged = existing?.updated_at_lp
       && newUpdatedAt
       && existing.updated_at_lp === newUpdatedAt
-      && (existing.ghl_contact_id === newLeadGhlId || (!newLeadGhlId && existing.ghl_contact_id));
+      && (existing.ghl_contact_id === newLeadGhlId || (!newLeadGhlId && existing.ghl_contact_id))
+      && flagsUnchanged;
 
     if (recordUnchanged && !dispositionChanged) {
       _skipStats.leads++;
@@ -654,4 +687,5 @@ export async function upsertLeadFromFlat(lp, ghlId) {
 }
 
 // v9.2: Export for use by other modules (e.g., one-shot backfill scripts)
-export { deriveLeadGhlId, GHL_CONTACT_ID_PATTERN };
+// buildLeadRow exported for the cohort-reconcile sweep (cache-only forced upsert).
+export { deriveLeadGhlId, GHL_CONTACT_ID_PATTERN, buildLeadRow };

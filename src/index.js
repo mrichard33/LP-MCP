@@ -109,6 +109,10 @@ import {
   registerDataFreshnessRoutes,
   startDataFreshnessMonitorScheduler,
 } from './admin/data-freshness.js';
+import {
+  registerCohortReconcileRoutes,
+  startCohortReconcileScheduler,
+} from './admin/lp-cohort-reconcile.js';
 import { runGhlContactIdBackfill } from './admin/ghl-contact-id-backfill.js';
 import { registerGhlTriggerLinkRoutes } from './admin/ghl-trigger-links.js';
 import { registerAgenticLeadStateRoutes } from './admin/agentic-lead-states.js';
@@ -505,6 +509,7 @@ app.post('/admin/backfill-ghl-contact-id-from-lognumber', async (req, res) => {
 });
 
 registerDataFreshnessRoutes(app);
+registerCohortReconcileRoutes(app);
 registerAgenticMvRefreshRoutes(app);
 registerSiteStitchRoutes(app);
 registerLeadGurusRoutes(app);
@@ -537,6 +542,7 @@ app.listen(PORT, async () => {
   startFallthroughSweepScheduler();
   startApprovalEscalationScheduler();
   startDataFreshnessMonitorScheduler();
+  startCohortReconcileScheduler();
   startExecutorHeartbeatScheduler();
   startDecisionEngineHeartbeatScheduler();
   startDriftDetectorScheduler();

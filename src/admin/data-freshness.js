@@ -40,8 +40,9 @@
  */
 
 import supabase from '../supabase.js';
-import { getJobStatusChanges, probeLeadEndpoints } from '../lp-client.js';
+import { getJobStatusChanges, probeLeadEndpoints, getLeadByLdsId, getCircuitStatus } from '../lp-client.js';
 import { sendGroupMeMessage } from '../groupme.js';
+import { extractArray, getField } from '../sync-utils.js';
 
 // ─── Configuration ──────────────────────────────────────────────────
 // Per-table freshness thresholds. Tuned to typical update cadence:
@@ -76,6 +77,12 @@ const ZERO_RECORD_RUN_LIMIT  = parseInt(process.env.FRESHNESS_ZERO_RECORD_LIMIT 
 // data_freshness_log so /n8n/admin/freshness reflects current state.
 // Set FRESHNESS_GROUPME_ALERTS_DISABLED=true on Railway to silence ops pings.
 const GROUPME_ALERTS_DISABLED = (process.env.FRESHNESS_GROUPME_ALERTS_DISABLED || 'false').toLowerCase() === 'true';
+// Field-drift probe: row-arrival freshness reported "fresh" while the demo
+// funnel flags rotted (cache demo_completed=false vs LP Sat=true). Sample N
+// recent leads, compare cached flags to a live getLeadByLdsId, and alert when
+// the count of drifted rows exceeds FRESHNESS_FIELD_DRIFT_LIMIT.
+const FIELD_DRIFT_SAMPLE = parseInt(process.env.FRESHNESS_FIELD_DRIFT_SAMPLE || '25', 10);
+const FIELD_DRIFT_LIMIT  = parseInt(process.env.FRESHNESS_FIELD_DRIFT_LIMIT  || '3', 10);
 
 // ─── Per-table check ────────────────────────────────────────────────
 
@@ -152,6 +159,88 @@ export async function checkSyncWatermarkHealth() {
   }
 }
 
+// ─── Field-level drift (funnel flags) ──────────────────────────────
+// The check that would have caught the 5-vs-21 demo gap: row-arrival
+// freshness only proves new rows land, not that demo_completed /
+// appointment_set / closed_won on existing rows match LP truth. Sample N
+// recent leads, fetch each live via getLeadByLdsId, derive the flags the
+// same way buildLeadRow does (Sat / ApptSet / Sold), and count mismatches.
+// Sequential + small sample to bound LP load; respects the circuit breaker.
+
+function deriveFlag(v) { return v === 'true' || v === true; }
+
+function findLeadByLdsId(resp, ldsId) {
+  for (const prospect of extractArray(resp)) {
+    const leads = getField(prospect, 'leads', 'Leads') || [];
+    const match = leads.find(l => String(getField(l, 'id', 'lds_id', 'LeadID')) === String(ldsId));
+    if (match) return match;
+  }
+  return null;
+}
+
+export async function checkFieldDrift({ sample = FIELD_DRIFT_SAMPLE } = {}) {
+  try {
+    const { data: rows, error } = await supabase
+      .from('lp_leads')
+      .select('lp_lead_id, demo_completed, appointment_set, closed_won')
+      .order('created_at_lp', { ascending: false })
+      .limit(sample);
+
+    if (error) return { status: 'error', error_message: error.message };
+    if (!rows || rows.length === 0) return { status: 'empty', sampled: 0, drifted: 0 };
+
+    let sampled = 0;
+    let drifted = 0;
+    let errors = 0;
+    const examples = [];
+
+    for (const row of rows) {
+      if (getCircuitStatus().circuitOpen) break; // LP failing — stop probing
+      try {
+        const resp = await getLeadByLdsId(row.lp_lead_id);
+        const lead = findLeadByLdsId(resp, row.lp_lead_id);
+        if (!lead) { errors++; continue; }
+        sampled++;
+
+        const liveDemo    = deriveFlag(getField(lead, 'sat', 'Sat'));
+        const liveApptSet = deriveFlag(getField(lead, 'apptset', 'ApptSet'));
+        const liveSold    = deriveFlag(getField(lead, 'sold', 'Sold'));
+
+        const mismatch =
+          (!!row.demo_completed)  !== liveDemo ||
+          (!!row.appointment_set) !== liveApptSet ||
+          (!!row.closed_won)      !== liveSold;
+
+        if (mismatch) {
+          drifted++;
+          if (examples.length < 10) {
+            examples.push({
+              lp_lead_id: row.lp_lead_id,
+              cache: { demo_completed: !!row.demo_completed, appointment_set: !!row.appointment_set, closed_won: !!row.closed_won },
+              live:  { demo_completed: liveDemo, appointment_set: liveApptSet, closed_won: liveSold },
+            });
+          }
+        }
+      } catch (err) {
+        errors++;
+      }
+    }
+
+    const drift_pct = sampled > 0 ? Math.round((drifted / sampled) * 100) : 0;
+    return {
+      status: drifted > FIELD_DRIFT_LIMIT ? 'drift' : 'ok',
+      sampled,
+      drifted,
+      drift_pct,
+      errors,
+      threshold: FIELD_DRIFT_LIMIT,
+      examples,
+    };
+  } catch (err) {
+    return { status: 'error', error_message: err.message };
+  }
+}
+
 // ─── Alert dedup ────────────────────────────────────────────────────
 
 async function shouldAlert(tableName) {
@@ -173,6 +262,7 @@ async function shouldAlert(tableName) {
 export async function runFreshnessCheck({ alert = true } = {}) {
   const results = await checkFreshness();
   const watermark = await checkSyncWatermarkHealth();
+  const fieldDrift = await checkFieldDrift();
   const stale = results.filter(r => r.status === 'stale' || r.status === 'empty' || r.status === 'error');
   const alerted = [];
 
@@ -257,12 +347,35 @@ export async function runFreshnessCheck({ alert = true } = {}) {
         console.warn(`[Freshness] watermark alert failed: ${err.message}`);
       }
     }
+
+    // Field-drift alert (funnel flags rotting on existing rows — the 5-vs-21 probe)
+    if (fieldDrift.status === 'drift') {
+      try {
+        if (await shouldAlert('__field_drift__')) {
+          const human = `Funnel-flag drift: ${fieldDrift.drifted}/${fieldDrift.sampled} sampled leads (${fieldDrift.drift_pct}%) have cached demo/appt/sold flags that disagree with LP (threshold ${fieldDrift.threshold}). Run POST /n8n/admin/lp-cohort-reconcile.`;
+          const sendResult = GROUPME_ALERTS_DISABLED
+            ? { sent: false, suppressed: true }
+            : await sendGroupMeMessage(`🚨 LP FIELD DRIFT\n${human}`);
+          await supabase.from('data_freshness_log').insert({
+            table_name:    '__field_drift__',
+            status:        'stale',
+            severity:      'critical',
+            error_message: sendResult?.sent ? human : `${human} [GroupMe alert suppressed by FRESHNESS_GROUPME_ALERTS_DISABLED]`,
+            alerted_at:    sendResult?.sent ? new Date().toISOString() : null,
+          });
+          if (sendResult?.sent) alerted.push('__field_drift__');
+        }
+      } catch (err) {
+        console.warn(`[Freshness] field-drift alert failed: ${err.message}`);
+      }
+    }
   }
 
   return {
     checked_at: new Date().toISOString(),
     table_results: results,
     sync_watermark: watermark,
+    field_drift: fieldDrift,
     stale_count: stale.length,
     alerted,
     groupme_alerts_disabled: GROUPME_ALERTS_DISABLED,
@@ -347,12 +460,17 @@ export function registerDataFreshnessRoutes(app) {
         checkFreshness(),
         checkSyncWatermarkHealth(),
       ]);
+      // Field-drift makes live LP calls, so it's opt-in on this quick view
+      // (?drift=1). The scheduled freshness-check always runs it.
+      const wantDrift = req.query?.drift === '1' || req.query?.drift === 'true';
+      const fieldDrift = wantDrift ? await checkFieldDrift() : null;
       const stale = results.filter(r => r.status === 'stale' || r.status === 'empty' || r.status === 'error');
       res.json({
         checked_at: new Date().toISOString(),
-        all_fresh: stale.length === 0 && watermark.status !== 'stuck',
+        all_fresh: stale.length === 0 && watermark.status !== 'stuck' && (!fieldDrift || fieldDrift.status !== 'drift'),
         stale_count: stale.length,
         sync_watermark: watermark,
+        field_drift: fieldDrift,
         groupme_alerts_disabled: GROUPME_ALERTS_DISABLED,
         results,
       });
