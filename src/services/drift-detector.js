@@ -43,7 +43,7 @@ const SCAN_INTERVAL_MS = 30 * 60 * 1000;
 const INITIAL_DELAY_MS = 5 * 60 * 1000;
 const DEFAULT_CLOSURE_TAG = 'stage:long-term-nurture';
 
-async function fetchDriftCandidates(closureTag, closedForHours) {
+async function fetchDriftCandidates(closureTag, closedForHours, limit) {
   const HL_URL = process.env.HL_MCP_URL;
   const HL_TOKEN = process.env.HL_INTERNAL_TOKEN || process.env.HL_MCP_TOKEN;
   if (!HL_URL) {
@@ -57,7 +57,11 @@ async function fetchDriftCandidates(closureTag, closedForHours) {
         'Content-Type': 'application/json',
         ...(HL_TOKEN ? { 'Authorization': `Bearer ${HL_TOKEN}` } : {}),
       },
-      body: JSON.stringify({ closure_tag: closureTag, closed_for_hours: closedForHours }),
+      body: JSON.stringify({
+        closure_tag: closureTag,
+        closed_for_hours: closedForHours,
+        ...(limit ? { limit } : {}),
+      }),
       signal: AbortSignal.timeout(30_000),
     });
     if (!res.ok) {
@@ -174,6 +178,64 @@ export async function runDriftScan({
     closed_for_hours,
     event_emitted: true,
   };
+}
+
+/**
+ * Read-only enrichment of the drift scan for the dashboard Issues page.
+ *
+ * Returns the drifted contacts (closed in GHL but LP disposition still active)
+ * shaped for the dashboard's `DriftCandidate` type:
+ *   { rows: [{ contact_id, name, reason, ghl_status, lp_status, last_lp_activity_at }] }
+ *
+ * Unlike runDriftScan() this emits NO event and writes nothing — it backs the
+ * `get_drift_candidates` MCP tool the dashboard calls (with no args → defaults).
+ * lp_leads is joined in one batched query per chunk (latest row per prospect).
+ */
+export async function getEnrichedDriftCandidates({
+  closure_tag = DEFAULT_CLOSURE_TAG,
+  closed_for_hours = DRIFT_THRESHOLD_HOURS,
+  limit = 1000,
+} = {}) {
+  const result = await fetchDriftCandidates(closure_tag, closed_for_hours, limit);
+  const candidates = result.contacts || [];
+  if (!candidates.length || !supabase) {
+    return { rows: [], scanned: candidates.length, drift: 0, closure_tag, closed_for_hours };
+  }
+
+  // Latest lp_leads row per prospect, batched (synced_at desc → first seen wins).
+  const prospectIds = [...new Set(
+    candidates.map(c => c.lp_prospect_id).filter(Boolean).map(String),
+  )];
+  const latestByProspect = {};
+  const CHUNK = 300;
+  for (let i = 0; i < prospectIds.length; i += CHUNK) {
+    const chunk = prospectIds.slice(i, i + CHUNK);
+    const { data } = await supabase
+      .from('lp_leads')
+      .select('lp_prospect_id, lp_lead_id, first_name, last_name, disposition_code, disposition_label, last_contact_date, updated_at_lp, synced_at')
+      .in('lp_prospect_id', chunk)
+      .order('synced_at', { ascending: false });
+    for (const row of (data || [])) {
+      const key = String(row.lp_prospect_id);
+      if (!latestByProspect[key]) latestByProspect[key] = row;
+    }
+  }
+
+  const rows = [];
+  for (const c of candidates) {
+    const lp = latestByProspect[String(c.lp_prospect_id)];
+    if (!lp || !ACTIVE_LP_DISPOSITIONS.includes(lp.disposition_code)) continue;
+    const name = [lp.first_name, lp.last_name].filter(Boolean).join(' ').trim() || null;
+    rows.push({
+      contact_id: c.contact_id,
+      name,
+      reason: `Closed in GHL (${closure_tag}) but LP disposition is still active`,
+      ghl_status: closure_tag,
+      lp_status: lp.disposition_label || lp.disposition_code || null,
+      last_lp_activity_at: lp.last_contact_date || lp.updated_at_lp || lp.synced_at || null,
+    });
+  }
+  return { rows, scanned: candidates.length, drift: rows.length, closure_tag, closed_for_hours };
 }
 
 export function startDriftDetectorScheduler() {
