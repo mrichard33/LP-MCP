@@ -5,28 +5,25 @@
 // API). Consumed by src/jobs/goal-scorecard-daily.js. No Supabase, no network
 // here — give it prospect records + a window, get back one market's actuals.
 //
-// SCORECARD_FIELD_MAP / JOB_STATUS_MAP below are the verified field names and
+// SCORECARD_FIELD_MAP / CANCEL_STATUSES below are the verified field names and
 // status strings from the existing sync layer (sync-leads.js, n8n-enrichment.js)
 // and a live read of lp_jobs.job_status. Everything downstream reads from these,
 // so a definition change is a one-line edit here.
 //
-// ⚠ TIE-OUT (provisional until reconciled to a real Reece Monday-a.m. export):
-//   - ko_count / ko_pct          — which job statuses count as a knockout
-//   - good_business / good_rate  — "good"/clean sold $; example shows >100% so
-//                                   it is likely an attainment ratio, not a count
-//   - close_pct                  — RESOLVED to Sold ÷ Demo (% Gross Close) per the
-//                                   Reece "By Appt Date" report; full report
-//                                   alignment (Net Issue/Net Close, by-appt-date)
-//                                   still pending
-//   - net_sales / gross_sales    — v1 net = written sold $ minus knockouts (NOT
-//                                   Paid-In-Full, which reads ~$0 mid-month);
-//                                   gross now includes knockouts. nsli/avg_sale
-//                                   derive from net, so they inherit this tie-out.
-// The funnel COUNTS (leads/issued/sets/demos/sales) and demo_pct are
-// high-confidence (flags verified against the sync layer).
+// Aligned to the Reece "Marketing Sub-Source By Appt Date" report. The funnel is
+// keyed By APPOINTMENT DATE (a lead counts in the period of its appt, not its
+// creation), and the columns/ratios mirror the report exactly:
+//   Set, Issue, Net Issue, %Issue=Issue/Set, Demo, %Demo=Demo/NetIssue,
+//   Sold, %Gross Close=Sold/Demo, Gross$, GSLI=Gross$/Issue,
+//   #Net Close, %Net Close=NetClose/Demo, Net$, NSLI=Net$/Issue.
+//
+// ⚠ TIE-OUT (provisional until reconciled to the official report):
+//   - CANCEL_STATUSES drive every "Net" column (Net Issue / Net Close / Net $).
+//     Calibrate the set against the report's gross→net haircut.
+//   - Net Issue has no dedicated LP flag; approximated as issued && !cancelled.
 
 import { getField } from '../sync-utils.js';
-import { lpCreatedDate } from '../lp-dates.js';
+import { lpDateToEastern } from '../lp-dates.js';
 
 export const SCORECARD_GETLEAD_OPTIONS = Number(process.env.SCORECARD_GETLEAD_OPTIONS || 261120);
 
@@ -43,23 +40,22 @@ export const SCORECARD_FIELD_MAP = {
   issued:      ['issued', 'Issued', 'everissued'],
   sat:         ['sat', 'Sat', 'eversat'],       // demo / sat
   sold:        ['sold', 'Sold'],
+  appt_date:   ['apptdate', 'ApptDate'],        // cohort key (By Appt Date)
   job_status:  ['jobstatus', 'JobStatus', 'job_status'],
   job_value:   ['grossamount', 'GrossAmount', 'gsa', 'GSA'],
 };
 
-// Verified against a live read of lp_jobs.job_status (June 2026).
-// PENDING is the remainder of won-and-working jobs (not NET, not KO).
-export const JOB_STATUS_MAP = {
-  NET: [
-    'Paid In Full', 'PIF Survey Ready', 'PIF NO Survey', 'Assumed Complete',
-  ],
-  KO: [ // ⚠ TIE-OUT
-    'Cancelled', 'Cancelled By Mgt', 'Dead Deal', 'Credit Decline',
-  ],
-};
-
-const NET_SET = new Set(JOB_STATUS_MAP.NET.map((s) => s.toLowerCase()));
-const KO_SET = new Set(JOB_STATUS_MAP.KO.map((s) => s.toLowerCase()));
+// Job statuses that mean a sold/issued deal did NOT stick — used to derive the
+// report's "Net" columns (Net Issue, # Net Close, Net Sale $) as gross minus
+// these. Verified against a live read of lp_jobs.job_status. ⚠ TIE-OUT — the set
+// is env-overridable (SCORECARD_CANCEL_STATUSES, comma-separated) and calibrated
+// against the report's gross→net haircut (Sold 2,842 → Net Close 2,030).
+export const CANCEL_STATUSES = (
+  process.env.SCORECARD_CANCEL_STATUSES
+    ? process.env.SCORECARD_CANCEL_STATUSES.split(',')
+    : ['Cancelled', 'Cancelled By Mgt', 'Dead Deal', 'Credit Decline']
+).map((s) => s.trim().toLowerCase()).filter(Boolean);
+const CANCEL_SET = new Set(CANCEL_STATUSES);
 
 function flag(lead, mapKey) {
   const v = getField(lead, ...SCORECARD_FIELD_MAP[mapKey]);
@@ -94,74 +90,79 @@ function money(numerator, denominator) {
 }
 
 /**
- * Compute one market's MTD actuals from LP prospect records.
+ * Compute one market's actuals from LP prospect records, By Appt Date.
  *
  * @param {object[]} prospects   GetLead prospect records (each with nested .leads[])
  * @param {object}   window      { periodStart:'YYYY-MM-DD', periodEnd:'YYYY-MM-DD' }
  * @returns {object} actuals row (sans market/as_of_date/period — caller adds those)
  */
 export function computeActuals(prospects, { periodStart, periodEnd }) {
-  let leads = 0, issued = 0, sets = 0, demos = 0, sales = 0, ko_count = 0;
-  let gross_sales = 0, net_sales = 0, pending_dollars = 0, good_business = 0;
+  let leads = 0, sets = 0, issued = 0, net_issue = 0, demos = 0, sold = 0, net_close = 0;
+  let ko_count = 0, gross_sales = 0, net_sales = 0;
   const statusTally = {};        // every job status seen → count (tie-out aid)
-  const unmappedStatuses = {};   // statuses not in NET/KO (the PENDING remainder)
 
   for (const prospect of prospects || []) {
     const leadList = getField(prospect, 'leads', 'Leads') || [];
     for (const lead of leadList) {
-      // Cohort filter: lead-date (ET calendar day) within the window.
-      const leadDate = etDateOf(lpCreatedDate(prospect, lead, getField));
-      if (!leadDate || leadDate < periodStart || leadDate > periodEnd) continue;
+      // Cohort key: APPOINTMENT date (ET calendar day) within the window.
+      const apptDate = etDateOf(lpDateToEastern(getField(lead, ...SCORECARD_FIELD_MAP.appt_date)));
+      if (!apptDate || apptDate < periodStart || apptDate > periodEnd) continue;
 
       leads += 1;
-      if (flag(lead, 'issued')) issued += 1;
-      if (flag(lead, 'set')) sets += 1;
-      if (flag(lead, 'sat')) demos += 1;
+      const isSet = flag(lead, 'set');
+      const isIssued = flag(lead, 'issued');
+      const isDemo = flag(lead, 'sat');
       const isSold = flag(lead, 'sold');
-      if (isSold) sales += 1;
 
+      // Roll up this lead's jobs → gross $, surviving (non-cancelled) $, cancel flag.
+      let leadGross = 0, leadNet = 0, hasJob = false, hasCancel = false;
       const jobs = getField(lead, 'jobs', 'Jobs') || [];
       for (const job of jobs) {
         const status = String(getField(job, ...SCORECARD_FIELD_MAP.job_status) || '').trim();
         const value = num(getField(job, ...SCORECARD_FIELD_MAP.job_value));
-        const lc = status.toLowerCase();
         statusTally[status || '(blank)'] = (statusTally[status || '(blank)'] || 0) + 1;
+        hasJob = true;
+        leadGross += value;
+        if (CANCEL_SET.has(status.toLowerCase())) { ko_count += 1; hasCancel = true; }
+        else { leadNet += value; }
+      }
+      // A deal "cancelled" when it has job(s) and none survived the cancel set.
+      const cancelled = hasJob && hasCancel && leadNet === 0;
 
-        gross_sales += value;            // total written $, before knockouts
-        if (KO_SET.has(lc)) {
-          ko_count += 1;                 // ⚠ TIE-OUT
-          continue;                      // knockouts deducted from net/good/pending
-        }
-        // Non-KO job → NET SALES (written sold, net of knockouts) + good_business.
-        // A current month's deals are rarely Paid-In-Full yet, so a "net = paid"
-        // definition reads ~$0 mid-month; v1 net = written-sold-minus-KO. The
-        // still-working subset (not yet PIF/complete) is also tracked as pending.
-        net_sales += value;              // ⚠ TIE-OUT (written sold, net of KO)
-        good_business += value;          // ⚠ TIE-OUT (v1 = non-KO sold $)
-        if (!NET_SET.has(lc)) {
-          pending_dollars += value;
-          if (status) unmappedStatuses[status] = (unmappedStatuses[status] || 0) + 1;
-        }
+      if (isSet) sets += 1;
+      if (isIssued) { issued += 1; if (!cancelled) net_issue += 1; }   // ⚠ TIE-OUT (no LP net-issue flag)
+      if (isDemo) demos += 1;
+      if (isSold) {
+        sold += 1;
+        gross_sales += leadGross;        // Gross Sale $ (incl. cancellations)
+        net_sales += leadNet;            // Net Sale $ (net of cancellations)
+        if (!cancelled) net_close += 1;  // # Net Close
       }
     }
   }
 
   return {
-    leads, issued, sets, demos, sales, ko_count,
-    good_business, gross_sales, net_sales, pending_dollars,
-    deposits: 0,                          // ⚠ TIE-OUT (job/milestone field; 0 until mapped)
-    // actual-side rates
-    demo_pct: rate(demos, issued),        // verified
-    close_pct: rate(sales, demos),        // Sold ÷ Demo (% Gross Close, per Reece report)
-    good_rate_pct: rate(good_business, gross_sales), // ⚠ TIE-OUT
-    ko_pct: rate(ko_count, sales),        // ⚠ TIE-OUT
-    nsli: money(net_sales, issued),
-    avg_sale: money(net_sales, sales),
+    leads, sets, issued, net_issue, demos, sales: sold, net_close, ko_count,
+    gross_sales, net_sales,
+    good_business: net_sales,            // clean (non-cancelled) sold $
+    pending_dollars: Math.max(0, gross_sales - net_sales),
+    deposits: 0,                         // ⚠ TIE-OUT (job/milestone field; 0 until mapped)
+    // ── Report ratios (Marketing Sub-Source By Appt Date) ──
+    pct_issue:     rate(issued, sets),       // Issue ÷ Set
+    demo_pct:      rate(demos, net_issue),   // Demo ÷ Net Issue
+    close_pct:     rate(sold, demos),        // % Gross Close = Sold ÷ Demo
+    pct_net_close: rate(net_close, demos),   // # Net Close ÷ Demo
+    good_rate_pct: rate(net_sales, gross_sales), // clean-business ratio
+    ko_pct:        rate(ko_count, sold),
+    gsli:          money(gross_sales, issued),   // Gross Sale $ ÷ Issue
+    nsli:          money(net_sales, issued),     // Net Sale $ ÷ Issue
+    avg_sale:      money(net_sales, net_close),
     raw_inputs: {
+      basis: 'appt_date',
       window: { periodStart, periodEnd },
       status_tally: statusTally,
-      pending_remainder_statuses: unmappedStatuses,
-      tie_out: ['ko_count', 'net_sales', 'gross_sales', 'good_business', 'good_rate_pct', 'close_pct', 'deposits'],
+      cancel_statuses: CANCEL_STATUSES,
+      tie_out: ['net_issue', 'net_close', 'net_sales', 'gross_sales', 'cancel_statuses'],
     },
   };
 }
