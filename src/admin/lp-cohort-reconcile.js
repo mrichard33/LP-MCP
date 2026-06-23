@@ -45,6 +45,22 @@ const COHORT_DAYS        = parseInt(process.env.RECONCILE_COHORT_DAYS || '90', 1
 const CRON_HOUR_ET       = parseInt(process.env.RECONCILE_CRON_HOUR_ET || '2', 10);
 const PAGE_SIZE          = 200;
 const RATE_LIMIT_SLEEP_MS = 250;
+// Per-prospect work is all Supabase round-trips (no per-prospect LP call — the
+// page already carries nested leads/calls/notes/jobs), so processing prospects
+// sequentially makes a full page a long chain of serial writes. Bound-concurrent
+// batching cuts page wall-clock ~Nx. Mirrors sync-engine's processInBatches.
+const RECONCILE_CONCURRENCY = parseInt(process.env.RECONCILE_CONCURRENCY || '8', 10);
+
+// Bounded-concurrency map: run fn over items, at most `concurrency` in flight.
+// Promise.allSettled per batch so one failing prospect doesn't abort the rest.
+async function processInBatches(items, concurrency, fn) {
+  const results = [];
+  for (let i = 0; i < items.length; i += concurrency) {
+    const batch = items.slice(i, i + concurrency);
+    results.push(...await Promise.allSettled(batch.map(fn)));
+  }
+  return results;
+}
 
 // ─── ET helpers ─────────────────────────────────────────────────────
 // LP windows are date-only (YYYY-MM-DD). Derive "today in ET" and the
@@ -107,17 +123,25 @@ export async function runCohortReconcile({ sinceDays = COHORT_DAYS } = {}) {
       const prospects = extractArray(resp);
       if (prospects.length === 0) break;
       pages++;
+      prospectCount += prospects.length;
 
-      for (const prospect of prospects) {
-        prospectCount++;
+      // Process the page's prospects with bounded concurrency. Each returns its
+      // lead count (or rejects → logged, contributes 0). Progress is flushed
+      // after the page so records_synced climbs visibly across a long sweep.
+      const batchResults = await processInBatches(prospects, RECONCILE_CONCURRENCY, async (prospect) => {
         try {
-          leadCount += await reconcileProspect(prospect);
+          return await reconcileProspect(prospect);
         } catch (err) {
           console.warn(`[CohortReconcile] prospect ${getField(prospect, 'cst_id', 'CstID')} failed: ${err.message}`);
+          return 0;
         }
+      });
+      for (const r of batchResults) {
+        if (r.status === 'fulfilled') leadCount += r.value || 0;
       }
 
       syncLogProgress(logId, leadCount);
+      console.log(`[CohortReconcile] Page ${pages} (StartIndex=${startIndex}) done — ${prospects.length} prospects, ${leadCount} leads cumulative`);
       startIndex += prospects.length;
       await sleep(RATE_LIMIT_SLEEP_MS);
     }
