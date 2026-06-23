@@ -15,8 +15,12 @@
 //   - good_business / good_rate  — "good"/clean sold $; example shows >100% so
 //                                   it is likely an attainment ratio, not a count
 //   - close_pct denominator      — v1 uses sales/issued; LP may use sales/demos
-// The funnel COUNTS (leads/issued/sets/demos/sales) and demo_pct/nsli/avg_sale
-// are high-confidence (flags verified against the sync layer).
+//   - net_sales / gross_sales    — v1 net = written sold $ minus knockouts (NOT
+//                                   Paid-In-Full, which reads ~$0 mid-month);
+//                                   gross now includes knockouts. nsli/avg_sale
+//                                   derive from net, so they inherit this tie-out.
+// The funnel COUNTS (leads/issued/sets/demos/sales) and demo_pct are
+// high-confidence (flags verified against the sync layer).
 
 import { getField } from '../sync-utils.js';
 import { lpCreatedDate } from '../lp-dates.js';
@@ -120,17 +124,18 @@ export function computeActuals(prospects, { periodStart, periodEnd }) {
         const lc = status.toLowerCase();
         statusTally[status || '(blank)'] = (statusTally[status || '(blank)'] || 0) + 1;
 
+        gross_sales += value;            // total written $, before knockouts
         if (KO_SET.has(lc)) {
           ko_count += 1;                 // ⚠ TIE-OUT
-          continue;                      // KO jobs excluded from $ buckets
+          continue;                      // knockouts deducted from net/good/pending
         }
-        // Non-KO job contributes to gross + good_business (⚠ TIE-OUT) and to
-        // either net (cleared/paid) or pending (still working).
-        gross_sales += value;
+        // Non-KO job → NET SALES (written sold, net of knockouts) + good_business.
+        // A current month's deals are rarely Paid-In-Full yet, so a "net = paid"
+        // definition reads ~$0 mid-month; v1 net = written-sold-minus-KO. The
+        // still-working subset (not yet PIF/complete) is also tracked as pending.
+        net_sales += value;              // ⚠ TIE-OUT (written sold, net of KO)
         good_business += value;          // ⚠ TIE-OUT (v1 = non-KO sold $)
-        if (NET_SET.has(lc)) {
-          net_sales += value;
-        } else {
+        if (!NET_SET.has(lc)) {
           pending_dollars += value;
           if (status) unmappedStatuses[status] = (unmappedStatuses[status] || 0) + 1;
         }
@@ -153,7 +158,7 @@ export function computeActuals(prospects, { periodStart, periodEnd }) {
       window: { periodStart, periodEnd },
       status_tally: statusTally,
       pending_remainder_statuses: unmappedStatuses,
-      tie_out: ['ko_count', 'good_business', 'good_rate_pct', 'close_pct', 'deposits'],
+      tie_out: ['ko_count', 'net_sales', 'gross_sales', 'good_business', 'good_rate_pct', 'close_pct', 'deposits'],
     },
   };
 }
