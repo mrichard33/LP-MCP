@@ -40,6 +40,20 @@ const DAY_PAGE_SIZE = Number(process.env.SCORECARD_DAY_PAGE_SIZE || 2000);
 // modest — LP monitors for excessive concurrent use.
 const FETCH_CONCURRENCY = Number(process.env.SCORECARD_FETCH_CONCURRENCY || 6);
 
+// Pull a lookback window before periodStart so appointments SET in a prior month
+// (and never re-touched in the appt month — no-shows, quiet reschedules) are
+// still captured. The live GetLead pull is keyed by CHANGE date, so without this
+// the by-appt-date cohort ran ~10-18% light vs the official report. Counts stay
+// scoped to the cohort window in computeActuals; only the fetch window widens.
+const PULL_LOOKBACK_DAYS = Number(process.env.SCORECARD_PULL_LOOKBACK_DAYS || 60);
+
+/** Shift a YYYY-MM-DD (ET) back by n calendar days (UTC-safe). */
+function minusDays(etDate, n) {
+  const d = new Date(`${etDate}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() - n);
+  return d.toISOString().slice(0, 10);
+}
+
 // Markets confirmed reconciled to a real Reece export → flips reconciled=true.
 // Until a market is listed here, its rows render behind the PROVISIONAL banner.
 const RECONCILED_MARKETS = new Set(
@@ -130,13 +144,14 @@ export async function computeGoalScorecard(opts = {}) {
   const periodStart = opts.period_start || monthStart(periodEnd);
   const asOfDate = periodEnd;
   const daysElapsed = daysBetween(periodStart, periodEnd);
+  const fetchStart = minusDays(periodStart, PULL_LOOKBACK_DAYS);
 
-  console.log(`[Scorecard] start window=${periodStart}..${periodEnd} options=${SCORECARD_GETLEAD_OPTIONS}`);
+  console.log(`[Scorecard] start cohort=${periodStart}..${periodEnd} fetch=${fetchStart}..${periodEnd} (lookback ${PULL_LOOKBACK_DAYS}d) options=${SCORECARD_GETLEAD_OPTIONS}`);
   const logId = await syncLogStart('market_scorecard', 'goal_scorecard_daily');
 
   let prospects;
   try {
-    prospects = await fetchAllProspects(periodStart, periodEnd);
+    prospects = await fetchAllProspects(fetchStart, periodEnd);
   } catch (err) {
     // Circuit open / timeout / partial pull → abort write, keep prior row intact.
     console.error(`[Scorecard] LP fetch failed — aborting write: ${err.message}`);
