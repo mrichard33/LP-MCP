@@ -14,7 +14,10 @@
 //   - ko_count / ko_pct          — which job statuses count as a knockout
 //   - good_business / good_rate  — "good"/clean sold $; example shows >100% so
 //                                   it is likely an attainment ratio, not a count
-//   - close_pct denominator      — v1 uses sales/issued; LP may use sales/demos
+//   - close_pct                  — RESOLVED to Sold ÷ Demo (% Gross Close) per the
+//                                   Reece "By Appt Date" report; full report
+//                                   alignment (Net Issue/Net Close, by-appt-date)
+//                                   still pending
 //   - net_sales / gross_sales    — v1 net = written sold $ minus knockouts (NOT
 //                                   Paid-In-Full, which reads ~$0 mid-month);
 //                                   gross now includes knockouts. nsli/avg_sale
@@ -149,7 +152,7 @@ export function computeActuals(prospects, { periodStart, periodEnd }) {
     deposits: 0,                          // ⚠ TIE-OUT (job/milestone field; 0 until mapped)
     // actual-side rates
     demo_pct: rate(demos, issued),        // verified
-    close_pct: rate(sales, issued),       // ⚠ TIE-OUT (may be sales/demos)
+    close_pct: rate(sales, demos),        // Sold ÷ Demo (% Gross Close, per Reece report)
     good_rate_pct: rate(good_business, gross_sales), // ⚠ TIE-OUT
     ko_pct: rate(ko_count, sales),        // ⚠ TIE-OUT
     nsli: money(net_sales, issued),
