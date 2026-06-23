@@ -35,6 +35,11 @@ const TIMEZONE = 'America/New_York';
 // union the days (dedup by cst_id). Validated against the lp_leads cache.
 const DAY_PAGE_SIZE = Number(process.env.SCORECARD_DAY_PAGE_SIZE || 2000);
 
+// Daily pulls run in small concurrent batches so a full month returns in seconds
+// (one sequential call per day took ~4 min and dropped the HTTP caller). Kept
+// modest — LP monitors for excessive concurrent use.
+const FETCH_CONCURRENCY = Number(process.env.SCORECARD_FETCH_CONCURRENCY || 6);
+
 // Markets confirmed reconciled to a real Reece export → flips reconciled=true.
 // Until a market is listed here, its rows render behind the PROVISIONAL banner.
 const RECONCILED_MARKETS = new Set(
@@ -67,34 +72,46 @@ function nextDay(etDate) {
   return d.toISOString().slice(0, 10);
 }
 
+/** Fetch one ET day's changed prospects (single page). Throws on LP failure. */
+async function fetchDayProspects(day) {
+  const res = await getLeads({
+    startdate: day, enddate: day,
+    options: SCORECARD_GETLEAD_OPTIONS,
+    PageSize: DAY_PAGE_SIZE,
+    StartIndex: 1,
+  });
+  const items = extractArray(res);
+  if (items.length >= DAY_PAGE_SIZE) {
+    // A single day filled the page — possible truncation. Surface it; raise
+    // SCORECARD_DAY_PAGE_SIZE if this ever fires for real Reece volume.
+    console.warn(`[Scorecard] day ${day} returned ${items.length} >= PageSize ${DAY_PAGE_SIZE} — possible truncation`);
+  }
+  return items;
+}
+
 /**
  * Fetch every prospect that changed within [periodStart, periodEnd], one ET day
- * at a time (see the DAY_PAGE_SIZE note above for why a single wide sweep can't).
- * Dedups across days by cst_id — a prospect that changed on several days appears
- * in several daily pulls. Throws on LP failure so the caller can abort the write.
+ * at a time (see the DAY_PAGE_SIZE note above for why a single wide sweep can't),
+ * fetched in small concurrent batches, then unioned deduped by cst_id — a
+ * prospect that changed on several days appears in several daily pulls. Throws on
+ * LP failure so the caller can abort the write.
  */
 async function fetchAllProspects(periodStart, periodEnd) {
+  const days = [];
+  for (let day = periodStart; day <= periodEnd; day = nextDay(day)) days.push(day);
+
   const byCst = new Map(); // cst_id -> prospect; flags are current as of this run
   let anon = 0;            // prospects without a cst_id get a synthetic key so none drop
-  for (let day = periodStart; day <= periodEnd; day = nextDay(day)) {
-    const res = await getLeads({
-      startdate: day, enddate: day,
-      options: SCORECARD_GETLEAD_OPTIONS,
-      PageSize: DAY_PAGE_SIZE,
-      StartIndex: 1,
-    });
-    const items = extractArray(res);
-    if (items.length >= DAY_PAGE_SIZE) {
-      // A single day filled the page — possible truncation. Surface it; raise
-      // SCORECARD_DAY_PAGE_SIZE if this ever fires for real Reece volume.
-      console.warn(`[Scorecard] day ${day} returned ${items.length} >= PageSize ${DAY_PAGE_SIZE} — possible truncation`);
+  for (let i = 0; i < days.length; i += FETCH_CONCURRENCY) {
+    const pages = await Promise.all(days.slice(i, i + FETCH_CONCURRENCY).map(fetchDayProspects));
+    for (const items of pages) {
+      for (const p of items) {
+        const cst = getField(p, 'cst_id', 'CST_ID');
+        const key = cst != null && cst !== '' ? String(cst) : `__anon_${anon++}`;
+        if (!byCst.has(key)) byCst.set(key, p);
+      }
     }
-    for (const p of items) {
-      const cst = getField(p, 'cst_id', 'CST_ID');
-      const key = cst != null && cst !== '' ? String(cst) : `__anon_${anon++}`;
-      if (!byCst.has(key)) byCst.set(key, p);
-    }
-    await sleep(RATE_LIMIT_SLEEP_MS); // LP monitors for excessive use
+    await sleep(RATE_LIMIT_SLEEP_MS); // brief pause between batches (LP monitors usage)
   }
   return [...byCst.values()];
 }
