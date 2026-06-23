@@ -19,14 +19,21 @@
 
 import supabase from '../supabase.js';
 import { getLeads } from '../lp-client.js';
-import { extractArray, PAGE_SIZE, RATE_LIMIT_SLEEP_MS, sleep } from '../sync-utils.js';
+import { extractArray, getField, RATE_LIMIT_SLEEP_MS, sleep } from '../sync-utils.js';
 import { syncLogStart, syncLogComplete } from '../sync-log.js';
 import {
   computeActuals, SCORECARD_GETLEAD_OPTIONS, DEFAULT_MARKET,
 } from './scorecard-metrics.js';
 
 const TIMEZONE = 'America/New_York';
-const MAX_PAGES = 2000; // safety bound (2000 * 200 = 400k records)
+
+// GetLead (options=261120) returns only ~one page per query and StartIndex
+// paging is non-functional, so a single wide-window sweep silently truncates to
+// ~200 records (138 of ~5,200 leads observed for a full month). We instead query
+// one ET calendar day at a time — a day's changed-prospect set sits well under
+// any per-query cap — with a PageSize large enough to hold a full day, then
+// union the days (dedup by cst_id). Validated against the lp_leads cache.
+const DAY_PAGE_SIZE = Number(process.env.SCORECARD_DAY_PAGE_SIZE || 2000);
 
 // Markets confirmed reconciled to a real Reece export → flips reconciled=true.
 // Until a market is listed here, its rows render behind the PROVISIONAL banner.
@@ -53,33 +60,43 @@ function daysBetween(start, end) {
   return Math.floor(ms / 86400000) + 1;
 }
 
+/** The ET calendar day after a YYYY-MM-DD date (UTC-safe). */
+function nextDay(etDate) {
+  const d = new Date(`${etDate}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
 /**
- * Page through GetLead for the window, returning every prospect record.
- * Throws on LP failure (circuit breaker / timeout) so the caller can abort.
+ * Fetch every prospect that changed within [periodStart, periodEnd], one ET day
+ * at a time (see the DAY_PAGE_SIZE note above for why a single wide sweep can't).
+ * Dedups across days by cst_id — a prospect that changed on several days appears
+ * in several daily pulls. Throws on LP failure so the caller can abort the write.
  */
-async function fetchAllProspects(startdate, enddate) {
-  const prospects = [];
-  let startIndex = 1;
-  for (let page = 0; page < MAX_PAGES; page += 1) {
+async function fetchAllProspects(periodStart, periodEnd) {
+  const byCst = new Map(); // cst_id -> prospect; flags are current as of this run
+  let anon = 0;            // prospects without a cst_id get a synthetic key so none drop
+  for (let day = periodStart; day <= periodEnd; day = nextDay(day)) {
     const res = await getLeads({
-      startdate, enddate,
+      startdate: day, enddate: day,
       options: SCORECARD_GETLEAD_OPTIONS,
-      PageSize: PAGE_SIZE,
-      StartIndex: startIndex,
+      PageSize: DAY_PAGE_SIZE,
+      StartIndex: 1,
     });
     const items = extractArray(res);
-    // GetLead (options=261120) paginates AND post-filters each page, so a page
-    // can return fewer than PAGE_SIZE rows while more pages remain — a
-    // `< PAGE_SIZE` break stops after page one and massively undercounts (199 of
-    // several thousand prospects observed for a full MTD window). Mirror the
-    // proven incremental-sync sweep (sync-engine.js runLeadsSweep): advance
-    // StartIndex by the rows actually returned and stop only on an empty page.
-    if (items.length === 0) break;
-    prospects.push(...items);
-    startIndex += items.length;
+    if (items.length >= DAY_PAGE_SIZE) {
+      // A single day filled the page — possible truncation. Surface it; raise
+      // SCORECARD_DAY_PAGE_SIZE if this ever fires for real Reece volume.
+      console.warn(`[Scorecard] day ${day} returned ${items.length} >= PageSize ${DAY_PAGE_SIZE} — possible truncation`);
+    }
+    for (const p of items) {
+      const cst = getField(p, 'cst_id', 'CST_ID');
+      const key = cst != null && cst !== '' ? String(cst) : `__anon_${anon++}`;
+      if (!byCst.has(key)) byCst.set(key, p);
+    }
     await sleep(RATE_LIMIT_SLEEP_MS); // LP monitors for excessive use
   }
-  return prospects;
+  return [...byCst.values()];
 }
 
 /**
