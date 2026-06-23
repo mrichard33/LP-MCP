@@ -1,4 +1,10 @@
--- LP MCP Server — Supabase RPC Functions v3.0
+-- LP MCP Server — Supabase RPC Functions v3.1
+--
+-- v3.1: Exclude NOC (Not Covered) and NIS (Not Issued) dispositions from demo
+--       counts. These are sits LP marks Sat=true but that should not count as
+--       demos for Reece metrics. Applied at the reporting/count layer only —
+--       demo_completed in lp_leads still mirrors LP faithfully. appointment_set,
+--       closed_won, and lead counts are unchanged.
 
 -- =============================================================
 -- get_source_distribution — Priority Query #1
@@ -19,7 +25,7 @@ RETURNS TABLE (
     l.lead_source_detail,
     l.lead_source,
     COUNT(*) AS lead_count,
-    COUNT(*) FILTER (WHERE l.demo_completed) AS demos_set,
+    COUNT(*) FILTER (WHERE (l.demo_completed AND l.disposition_code NOT IN ('NOC','NIS'))) AS demos_set,
     COUNT(*) FILTER (WHERE l.closed_won) AS close_count,
     ROUND(100.0 * COUNT(*) FILTER (WHERE l.closed_won) / NULLIF(COUNT(*),0), 1) AS close_rate,
     ROUND(AVG(l.job_value) FILTER (WHERE l.closed_won), 0) AS avg_job_value,
@@ -56,18 +62,18 @@ RETURNS TABLE (
     l.lead_source,
     COALESCE(m.ghl_intent_bucket, 'unmapped') AS ghl_bucket,
     COUNT(*) AS total_leads,
-    COUNT(*) FILTER (WHERE l.demo_completed) AS demos_completed,
-    ROUND(100.0 * COUNT(*) FILTER (WHERE l.demo_completed) / NULLIF(COUNT(*), 0), 1) AS demo_rate,
-    ROUND(AVG(l.days_to_demo) FILTER (WHERE l.demo_completed), 1) AS avg_days_to_demo,
-    MIN(l.days_to_demo) FILTER (WHERE l.demo_completed) AS min_days_to_demo,
-    MAX(l.days_to_demo) FILTER (WHERE l.demo_completed) AS max_days_to_demo,
-    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY l.days_to_demo) FILTER (WHERE l.demo_completed)::numeric, 1) AS median_days_to_demo
+    COUNT(*) FILTER (WHERE (l.demo_completed AND l.disposition_code NOT IN ('NOC','NIS'))) AS demos_completed,
+    ROUND(100.0 * COUNT(*) FILTER (WHERE (l.demo_completed AND l.disposition_code NOT IN ('NOC','NIS'))) / NULLIF(COUNT(*), 0), 1) AS demo_rate,
+    ROUND(AVG(l.days_to_demo) FILTER (WHERE (l.demo_completed AND l.disposition_code NOT IN ('NOC','NIS'))), 1) AS avg_days_to_demo,
+    MIN(l.days_to_demo) FILTER (WHERE (l.demo_completed AND l.disposition_code NOT IN ('NOC','NIS'))) AS min_days_to_demo,
+    MAX(l.days_to_demo) FILTER (WHERE (l.demo_completed AND l.disposition_code NOT IN ('NOC','NIS'))) AS max_days_to_demo,
+    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY l.days_to_demo) FILTER (WHERE (l.demo_completed AND l.disposition_code NOT IN ('NOC','NIS')))::numeric, 1) AS median_days_to_demo
   FROM lp_leads l
   LEFT JOIN lp_source_mapping m
     ON (m.lp_source_subdetail = l.lead_source_detail AND m.lp_source_subdetail IS NOT NULL)
     OR (m.lp_source_subdetail IS NULL AND m.lp_source_raw = l.lead_source)
   GROUP BY l.lead_source_detail, l.lead_source, m.ghl_intent_bucket
-  HAVING COUNT(*) FILTER (WHERE l.demo_completed) > 0
+  HAVING COUNT(*) FILTER (WHERE (l.demo_completed AND l.disposition_code NOT IN ('NOC','NIS'))) > 0
   ORDER BY demos_completed DESC;
 $$ LANGUAGE sql;
 
@@ -97,7 +103,7 @@ RETURNS TABLE (
     COUNT(*) AS lead_count,
     ROUND(100.0 * COUNT(*) / NULLIF(SUM(COUNT(*)) OVER (), 0), 1) AS pct_of_total,
     COUNT(*) FILTER (WHERE d.appointment_set) AS demo_set_count,
-    COUNT(*) FILTER (WHERE d.demo_completed) AS demo_completed_count,
+    COUNT(*) FILTER (WHERE d.demo_completed AND d.disposition_code NOT IN ('NOC','NIS')) AS demo_completed_count,
     ROUND(AVG(d.job_value), 0) AS avg_job_value,
     ROUND(AVG(EXTRACT(EPOCH FROM (now() - d.last_contact_date)) / 86400), 0) AS avg_days_inactive
   FROM day15_leads d
@@ -129,10 +135,10 @@ RETURNS TABLE (
     COALESCE(m.ghl_intent_bucket, 'unmapped') AS ghl_bucket,
     COUNT(*) AS total_leads,
     COUNT(*) FILTER (WHERE l.appointment_set) AS demos_set,
-    COUNT(*) FILTER (WHERE l.demo_completed) AS demos_completed,
+    COUNT(*) FILTER (WHERE (l.demo_completed AND l.disposition_code NOT IN ('NOC','NIS'))) AS demos_completed,
     COUNT(*) FILTER (WHERE l.closed_won) AS closed_won_count,
-    ROUND(100.0 * COUNT(*) FILTER (WHERE l.demo_completed) / NULLIF(COUNT(*), 0), 1) AS lead_to_demo_rate,
-    ROUND(100.0 * COUNT(*) FILTER (WHERE l.closed_won) / NULLIF(COUNT(*) FILTER (WHERE l.demo_completed), 0), 1) AS demo_to_close_rate,
+    ROUND(100.0 * COUNT(*) FILTER (WHERE (l.demo_completed AND l.disposition_code NOT IN ('NOC','NIS'))) / NULLIF(COUNT(*), 0), 1) AS lead_to_demo_rate,
+    ROUND(100.0 * COUNT(*) FILTER (WHERE l.closed_won) / NULLIF(COUNT(*) FILTER (WHERE (l.demo_completed AND l.disposition_code NOT IN ('NOC','NIS'))), 0), 1) AS demo_to_close_rate,
     ROUND(100.0 * COUNT(*) FILTER (WHERE l.closed_won) / NULLIF(COUNT(*), 0), 1) AS lead_to_close_rate,
     ROUND(AVG(l.job_value) FILTER (WHERE l.closed_won), 0) AS avg_job_value,
     ROUND(SUM(l.job_value) FILTER (WHERE l.closed_won), 0) AS total_revenue
@@ -169,12 +175,12 @@ RETURNS TABLE (
     COUNT(DISTINCT l.lp_lead_id) AS total_leads,
     SUM(l.call_count) AS total_calls,
     COUNT(*) FILTER (WHERE l.appointment_set) AS demos_set,
-    COUNT(*) FILTER (WHERE l.demo_completed) AS demos_completed,
+    COUNT(*) FILTER (WHERE (l.demo_completed AND l.disposition_code NOT IN ('NOC','NIS'))) AS demos_completed,
     COUNT(*) FILTER (WHERE l.closed_won) AS closed_won_count,
     ROUND(SUM(l.job_value) FILTER (WHERE l.closed_won), 0) AS total_revenue,
     ROUND(AVG(l.job_value) FILTER (WHERE l.closed_won), 0) AS avg_job_value,
     ROUND(100.0 * COUNT(*) FILTER (WHERE l.appointment_set) / NULLIF(COUNT(*), 0), 1) AS set_rate,
-    ROUND(100.0 * COUNT(*) FILTER (WHERE l.closed_won) / NULLIF(COUNT(*) FILTER (WHERE l.demo_completed), 0), 1) AS close_rate,
+    ROUND(100.0 * COUNT(*) FILTER (WHERE l.closed_won) / NULLIF(COUNT(*) FILTER (WHERE (l.demo_completed AND l.disposition_code NOT IN ('NOC','NIS'))), 0), 1) AS close_rate,
     ROUND(SUM(l.call_count)::NUMERIC / NULLIF(COUNT(DISTINCT l.lp_lead_id), 0), 1) AS avg_calls_per_lead
   FROM lp_leads l
   WHERE l.created_at_lp BETWEEN p_start_date AND p_end_date

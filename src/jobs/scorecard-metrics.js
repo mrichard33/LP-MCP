@@ -66,6 +66,16 @@ function flag(lead, mapKey) {
   return v === true || v === 'true';
 }
 
+// Dispositions where the rep sat the appointment (LP Sat=true) but it should
+// NOT count as a demo for Reece's metrics: NOC = Not Covered (out of service
+// area / our fault), NIS = Not Issued. demo_completed in the cache still mirrors
+// LP faithfully; this exclusion is applied only at the reporting/count layer.
+export const NON_DEMO_DISPOSITIONS = new Set(['NOC', 'NIS']);
+function isNonDemoDisposition(lead) {
+  const d = getField(lead, 'disposition', 'Disposition');
+  return d != null && NON_DEMO_DISPOSITIONS.has(String(d).trim().toUpperCase());
+}
+
 function num(v) {
   const n = parseFloat(v);
   return Number.isFinite(n) ? n : 0;
@@ -116,7 +126,7 @@ export function computeActuals(prospects, { periodStart, periodEnd }) {
       leads += 1;
       if (flag(lead, 'issued')) issued += 1;
       if (flag(lead, 'set')) sets += 1;
-      if (flag(lead, 'sat')) demos += 1;
+      if (flag(lead, 'sat') && !isNonDemoDisposition(lead)) demos += 1;
       const isSold = flag(lead, 'sold');
       if (isSold) sales += 1;
 
