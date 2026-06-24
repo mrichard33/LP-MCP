@@ -168,6 +168,11 @@ import { registerGoalScorecardRoutes, startGoalScorecardScheduler } from './jobs
 import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
 // ─── FB Publish Watchdog (alert on missed WF4 publish window) ────
 import { startFbPublishWatchdog } from './fb-publish-watchdog.js';
+import {
+  registerGhlInboundRoutes,
+  startGhlNoteSweep,
+  startGhlNoteReconciliation,
+} from './ghl-note-pipeline/index.js';
 
 const PORT = process.env.PORT || 8080;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
@@ -458,6 +463,12 @@ registerEntryEventRoutes(app);
 // ─── GHL Tag Webhook Bridge ──────────────────────────────────────
 registerGhlTagRoutes(app);
 
+// ─── GHL Inbound → LP Note pipeline ──────────────────────────────
+// Turns GHL inbound conversations into one clean facts-only LP note per
+// conversation session for the call center. GHL-only, independent of Revin.
+//   POST /ghl/inbound-message
+registerGhlInboundRoutes(app);
+
 // ─── IME MIC Integration ─────────────────────────────────────────
 registerImeRoutes(app);
 
@@ -552,6 +563,8 @@ app.listen(PORT, async () => {
   startWorkflowProjectionLoop();
   startGoalScorecardScheduler();
   startFbPublishWatchdog();
+  startGhlNoteSweep();
+  startGhlNoteReconciliation();
   // First field-sync ~60s after boot (was ~9.5 min), then every 15 min.
   setTimeout(async () => {
     try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); }
