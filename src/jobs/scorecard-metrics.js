@@ -141,6 +141,7 @@ function makeAcc() {
     // Three-bucket split of surviving (non-cancelled) sold $.
     released_dollars: 0, working_dollars: 0, other_pending: 0,
     statusTally: {},   // every job status seen → count (tie-out aid)
+    statusDollarTally: {}, // per status → sold-lead $ (calibration: which statuses hold the working/released $)
     nonDemoTally: {},  // disposition code → sits dropped from demos (tie-out aid)
   };
 }
@@ -162,11 +163,13 @@ function accumulateLead(acc, lead) {
   // and the released/working/other split of the surviving $.
   let leadGross = 0, leadNet = 0, hasJob = false, hasCancel = false;
   let leadReleased = 0, leadWorking = 0, leadOther = 0;
+  const leadStatusDollars = {};  // status → $ on this lead (committed to acc only if sold)
   const jobs = getField(lead, 'jobs', 'Jobs') || [];
   for (const job of jobs) {
     const status = String(getField(job, ...SCORECARD_FIELD_MAP.job_status) || '').trim();
     const value = num(getField(job, ...SCORECARD_FIELD_MAP.job_value));
     acc.statusTally[status || '(blank)'] = (acc.statusTally[status || '(blank)'] || 0) + 1;
+    leadStatusDollars[status || '(blank)'] = (leadStatusDollars[status || '(blank)'] || 0) + value;
     hasJob = true;
     leadGross += value;
     const lower = status.toLowerCase();
@@ -187,6 +190,9 @@ function accumulateLead(acc, lead) {
   if (isSold) {
     acc.sold += 1;
     acc.gross_sales += leadGross;         // Gross Sale $ (incl. cancellations)
+    for (const [s, v] of Object.entries(leadStatusDollars)) {
+      acc.statusDollarTally[s] = Math.round((acc.statusDollarTally[s] || 0) + v);
+    }
     acc.released_dollars += leadReleased; // released to production = Net Sales
     acc.working_dollars  += leadWorking;  // sold but held
     acc.other_pending    += leadOther;    // other in-flight, not yet released
@@ -199,7 +205,7 @@ function accumulateLead(acc, lead) {
 function finalizeActuals(acc, { periodStart, periodEnd }, extra = {}) {
   const {
     leads, sets, issued, net_issue, demos, sold, net_close, ko_count, gross_sales,
-    released_dollars, working_dollars, other_pending, statusTally, nonDemoTally,
+    released_dollars, working_dollars, other_pending, statusTally, statusDollarTally, nonDemoTally,
   } = acc;
 
   // Net Sales = released to production. Working Revenue = sold but held.
@@ -232,6 +238,7 @@ function finalizeActuals(acc, { periodStart, periodEnd }, extra = {}) {
       basis: 'appt_date',
       window: { periodStart, periodEnd },
       status_tally: statusTally,
+      status_dollar_tally: statusDollarTally,  // sold-lead $ per status (bucket calibration)
       cancel_statuses: CANCEL_STATUSES,
       released_statuses: RELEASED_STATUSES,
       working_statuses: WORKING_STATUSES,
