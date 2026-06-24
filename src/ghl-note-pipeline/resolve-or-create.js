@@ -203,9 +203,10 @@ export async function resolveOrCreateLpLead({ ghlContactId, ghlContact }) {
       if (res?.action === 'skipped_missing_fields') {
         return { outcome: 'missing_fields_deferred', detail: `missing: ${(res.missing_fields || []).join(', ')}` };
       }
-      // created | already_in_lp | (anything else that posted): note defers until
-      // the /webhook/lp callback syncs the new cst_id into lp_leads (~60s).
-      return { outcome: 'created_deferred', detail: res?.action || 'created' };
+      // lp_lead_created | already_in_lp | (anything else that posted): the note
+      // defers until the /webhook/lp callback syncs the new cst_id into lp_leads
+      // (~60s), at which point a later sweep resolves it and writes the note.
+      return { outcome: 'created_deferred', detail: res?.action || 'lp_lead_created' };
     }
   }
 }
