@@ -283,6 +283,72 @@ function escapeRegex(s) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// SHORT-TOKEN / BACKCHANNEL CONFUSION GUARD
+// ═══════════════════════════════════════════════════════════════════
+// Two related guards against a low-signal inbound silently handing off:
+//   1. A confidence FLOOR below which a semantic tag_and_handoff guess is not
+//      allowed to short-circuit into a SILENT human handoff (message:null).
+//   2. A short-token guard so pure confusion/backchannel ("Huh?", "what?", "?")
+//      never classifies as WHO_IS_THIS (an identity question) and goes silent.
+// Repro: inbound "Huh?" → semantic WHO_IS_THIS @ 0.72 → silent hdl:who-is-this
+// handoff (no SMS). Keyword/regex matches (0.95/0.97) sit above the floor and
+// are unaffected; only low-confidence semantic guesses are blocked from going
+// silent — they fall through to a normal clarifying AI reply.
+
+export const SILENT_HANDOFF_MIN_CONFIDENCE = 0.85;
+
+// Pure confusion/backchannel tokens. A message made up only of these (≤3 words,
+// no identity-question phrasing) is genuine confusion, not an identity question.
+const BACKCHANNEL_TOKENS = new Set([
+  'huh', 'what', 'wut', 'wat', 'come again', 'sorry', 'idk',
+  'hmm', 'hm', 'eh', 'pardon', 'wdym', 'meaning', 'confused',
+]);
+
+// Identity-question phrasing that legitimately means WHO_IS_THIS — if any of
+// these appear, the message is NOT mere backchannel confusion.
+const IDENTITY_PHRASES = [
+  'who is this', "who's this", 'who are you', 'who dis',
+  'do i know you', 'how did you get my number', 'how do you have my number',
+];
+
+/**
+ * True when the inbound is pure confusion/backchannel: ≤3 words made only of
+ * known confusion tokens (or bare punctuation like "?"), with NO identity-
+ * question phrasing. Such messages must not classify as WHO_IS_THIS.
+ */
+export function isBackchannelConfusion(text) {
+  if (!text) return false;
+  const lc = String(text).toLowerCase().trim();
+  if (!lc) return false;
+  // Any explicit identity-question phrasing disqualifies the backchannel guard.
+  if (IDENTITY_PHRASES.some(p => lc.includes(p))) return false;
+  // Strip punctuation to bare words; a lone "?"/"..." normalizes to empty.
+  const stripped = lc.replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+  if (stripped === '') return true; // "?", "???", "..." → pure confusion
+  const words = stripped.split(' ');
+  if (words.length > 3) return false;
+  // Whole-string match catches multi-word tokens ("come again"); otherwise
+  // every word must be a known confusion token.
+  if (BACKCHANNEL_TOKENS.has(stripped)) return true;
+  return words.every(w => BACKCHANNEL_TOKENS.has(w));
+}
+
+/**
+ * If the classifier landed on WHO_IS_THIS but the inbound is pure backchannel
+ * confusion, it's not an identity question — downgrade to UNCLEAR so the contact
+ * gets a normal clarifying reply instead of a silent hdl:who-is-this handoff.
+ */
+function downgradeIfBackchannelIdentity(result, messageText) {
+  if (result?.intent_class === 'WHO_IS_THIS' && isBackchannelConfusion(messageText)) {
+    return makeUnclearResult({
+      reasoning: `backchannel_confusion_not_identity: "${String(messageText || '').slice(0, 40)}"`,
+      method: 'short_token_guard',
+    });
+  }
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // LAYER 0 — PATTERN MATCH (REGEX-FIRST, BEATS KEYWORDS)
 // ═══════════════════════════════════════════════════════════════════
 
@@ -436,11 +502,11 @@ export async function classifyInbound(messageText, opts = {}) {
   if (!opts.skipKeywordMatch) {
     const pm = patternMatch(messageText, handlers);
     if (pm) {
-      const result = makeResultFromHandler(pm.handler, {
+      const result = downgradeIfBackchannelIdentity(makeResultFromHandler(pm.handler, {
         confidence: 0.97,
         reasoning: `regex match: "${pm.matched_pattern}"`,
         method: pm.method,
-      });
+      }), messageText);
       logDecision(opts.ghlContactId, messageText, result, opts.channel);
       return result;
     }
@@ -450,11 +516,11 @@ export async function classifyInbound(messageText, opts = {}) {
   if (!opts.skipKeywordMatch) {
     const kw = keywordMatch(messageText, handlers);
     if (kw) {
-      const result = makeResultFromHandler(kw.handler, {
+      const result = downgradeIfBackchannelIdentity(makeResultFromHandler(kw.handler, {
         confidence: 0.95,
         reasoning: `keyword match: "${kw.matched_keyword}"`,
         method: kw.method,
-      });
+      }), messageText);
       logDecision(opts.ghlContactId, messageText, result, opts.channel);
       return result;
     }
@@ -493,11 +559,27 @@ export async function classifyInbound(messageText, opts = {}) {
     return result;
   }
 
-  const result = makeResultFromHandler(matchedHandler, {
+  // Confidence floor: a low-confidence semantic guess must not short-circuit
+  // into a SILENT human handoff (tag_and_handoff → message:null). Below the
+  // floor, downgrade to UNCLEAR so the contact gets a normal clarifying reply.
+  // Keyword/regex matches never reach here, so their 0.95/0.97 are unaffected.
+  if (
+    matchedHandler.action_type === 'tag_and_handoff' &&
+    (semantic.confidence ?? 0) < SILENT_HANDOFF_MIN_CONFIDENCE
+  ) {
+    const downgraded = makeUnclearResult({
+      reasoning: `low_confidence_handoff_downgrade: ${semantic.intent_class}@${semantic.confidence}`,
+      method: 'semantic_low_confidence',
+    });
+    logDecision(opts.ghlContactId, messageText, downgraded, opts.channel);
+    return downgraded;
+  }
+
+  const result = downgradeIfBackchannelIdentity(makeResultFromHandler(matchedHandler, {
     confidence: semantic.confidence,
     reasoning: semantic.reasoning,
     method: 'semantic',
-  });
+  }), messageText);
   logDecision(opts.ghlContactId, messageText, result, opts.channel);
   return result;
 }
