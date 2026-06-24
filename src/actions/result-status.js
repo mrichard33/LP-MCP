@@ -7,34 +7,50 @@
  * generation error and RETURNED a result object, so the executor recorded a
  * "completed" send that never actually reached the contact.
  *
- * This pure predicate centralizes the rule: a result that represents an AI
- * generation failure — either the legacy early-return shape
- * (`action: 'send_message_ai_generation_failed'`) or the new
- * fallback-was-sent shape (`_fallback_send: true`) — maps to `failed` with a
- * populated `error_message`. Everything else stays `completed`.
+ * June 2026 (Mark Test repro): the same masking hid lock-suppressed sends.
+ * executeSendMessageWithLock returns `{ skipped: true, reason: ... }` when a
+ * send is blocked by the outbound lock (or universal suppression), yet that was
+ * still recorded `completed` — making suppressed sends look delivered and
+ * masking the entire silence bug. A skipped result now maps to `status:
+ * 'skipped'` (already a valid agent_actions.status enum value) so dashboards
+ * and action history stop counting it as a delivered send.
+ *
+ * This pure predicate centralizes the rule:
+ *   - AI generation failure (legacy `action: 'send_message_ai_generation_failed'`
+ *     or `_fallback_send: true`)        → `failed`
+ *   - explicitly skipped (`skipped: true`, e.g. outbound_lock_held / suppressed)
+ *                                        → `skipped`
+ *   - everything else                    → `completed`
  *
  * Dependency-free + pure so it is unit-testable in isolation.
  */
 
 /**
  * @param {any} result  the value returned by an action handler
- * @returns {{ status: 'completed'|'failed', error_message: (string|null) }}
+ * @returns {{ status: 'completed'|'failed'|'skipped', error_message: (string|null) }}
  */
 export function classifyHandlerResult(result) {
   const generationFailed =
     result?.action === 'send_message_ai_generation_failed' ||
     result?._fallback_send === true;
 
-  if (!generationFailed) {
-    return { status: 'completed', error_message: null };
+  if (generationFailed) {
+    return {
+      status: 'failed',
+      error_message:
+        result?._generation_error ||
+        result?.error ||
+        'AI generation failed — fallback sent',
+    };
   }
-  return {
-    status: 'failed',
-    error_message:
-      result?._generation_error ||
-      result?.error ||
-      'AI generation failed — fallback sent',
-  };
+
+  // Honest accounting: a handler that explicitly skipped (lock held, suppressed)
+  // never reached the contact — record it as `skipped`, not `completed`.
+  if (result?.skipped === true) {
+    return { status: 'skipped', error_message: result?.reason || 'skipped' };
+  }
+
+  return { status: 'completed', error_message: null };
 }
 
 export default { classifyHandlerResult };

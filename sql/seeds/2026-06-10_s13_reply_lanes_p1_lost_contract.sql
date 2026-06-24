@@ -348,7 +348,7 @@ VALUES (
       "\\b(contracted\\s+with\\s+(another|a\\s+different)|(signed|going|went)\\s+with\\s+(another|a\\s+different)|already\\s+(chose|picked|hired|signed|decided)|purchased\\s+(elsewhere|from\\s+(another|someone))|hired\\s+(another|someone\\s+else)|with\\s+another\\s+(company|vendor|contractor))\\b"
     ],
     "not_has_tag": "awaiting:moved-fork",
-    "not_has_any_tag": ["mark-p1-lost", "suppress-outbound"]
+    "not_has_any_tag": ["mark-p1-lost", "suppress-outbound", "agentic-active"]
   }'::jsonb,
   '[
     {"action_type": "send_message", "target_system": "ghl", "target_entity": "contact", "priority": 10,
@@ -360,7 +360,7 @@ VALUES (
        "next_step": "Read the message and reply personally"}}
   ]'::jsonb,
   false, true, 60, 'claude',
-  'During the pilot no reply ever dies in silence. Excludes all four lane regexes + rule 172''s DNC regex + rule 173''s competitor regex (those paths own the conversation). No tags or routing — pure ack + handoff.'
+  'During the pilot no reply ever dies in silence. Excludes all four lane regexes + rule 172''s DNC regex + rule 173''s competitor regex (those paths own the conversation). No tags or routing — pure ack + handoff. | 2026-06-24: added agentic-active to not_has_any_tag — the catch-all must not fire (and steal the outbound-lock slot with the "give me a moment" filler) while the agentic lane (rule 106 + LAYER3_DISPATCH) owns the conversation. Diagnosed via Mark Test 0kk3xz6.'
 )
 ON CONFLICT (rule_key) DO UPDATE SET
   rule_name = EXCLUDED.rule_name, category = EXCLUDED.category, rule_type = EXCLUDED.rule_type,

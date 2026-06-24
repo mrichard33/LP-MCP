@@ -209,6 +209,9 @@ async function executeSendMessageWithLock(action, context) {
     trigger_id,
     sender: 'agent_executor',
     message_preview: params.message || params.body,
+    // Award the slot deterministically by action priority (lower = higher
+    // priority) so the intended primary send wins over a racing sibling.
+    priority: Number.isFinite(action.priority) ? action.priority : undefined,
   });
 
   if (!lock.acquired) {
@@ -526,6 +529,8 @@ async function executeSingleAction(action, batchContext = {}, priorBatchResults 
     }).eq('id', action.id);
     if (status === 'failed') {
       console.warn(`[ActionExecutor] ⚠️ ${action.action_type} marked failed (action ${action.id}, rule: ${action.rule_applied}): ${errorMessage}`);
+    } else if (status === 'skipped') {
+      console.log(`[ActionExecutor] ⏭️ ${action.action_type} skipped (action ${action.id}, rule: ${action.rule_applied}): ${errorMessage}`);
     } else {
       console.log(`[ActionExecutor] ✅ ${action.action_type} completed (action ${action.id}, rule: ${action.rule_applied})`);
     }
@@ -683,7 +688,7 @@ export async function executeActions({ limit } = {}) {
     // ASC — matches idx_aa_priority_pull).
     const totalLimit = Math.max(1, limit || EXECUTOR_BATCH_LIMIT);
     const results = [];
-    let completed = 0, failed = 0, rejectedByValidation = 0;
+    let completed = 0, failed = 0, rejectedByValidation = 0, skipped = 0;
     let claimedTotal = 0, chunks = 0, budgetExhausted = false, usedLegacyPath = false;
 
     while (claimedTotal < totalLimit) {
@@ -703,6 +708,7 @@ export async function executeActions({ limit } = {}) {
           results.push(r);
           if (r.status === 'completed') completed++;
           else if (r.status === 'failed') failed++;
+          else if (r.status === 'skipped') skipped++;
           else if (r.status === 'rejected_by_validation') rejectedByValidation++;
         }
       }
@@ -714,7 +720,7 @@ export async function executeActions({ limit } = {}) {
 
     const elapsed = Date.now() - startTime;
     console.log(
-      `[ActionExecutor] Done: ${completed} completed, ${failed} failed, ` +
+      `[ActionExecutor] Done: ${completed} completed, ${failed} failed, ${skipped} skipped, ` +
       `${rejectedByValidation} rejected_by_validation across ${chunks} chunk(s), ` +
       `${claimedTotal} claimed (concurrency=${EXECUTOR_CONCURRENCY})` +
       `${budgetExhausted ? ' [budget exhausted]' : ''}${usedLegacyPath ? ' [legacy-select fallback]' : ''} (${elapsed}ms)`
@@ -725,6 +731,7 @@ export async function executeActions({ limit } = {}) {
       actions_executed: results.length,
       completed,
       failed,
+      skipped,
       rejected_by_validation: rejectedByValidation,
       retrying: results.filter(r => r.status === 'pending').length,
       approval_requests_sent: approvalRequestsSent,

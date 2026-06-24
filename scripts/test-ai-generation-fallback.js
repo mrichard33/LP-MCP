@@ -106,12 +106,14 @@ test('a clean message_sent maps to completed + null (happy path unchanged)', () 
   assert.equal(error_message, null);
 });
 
-test('non-send results (suppressed / blocked / deduped) stay completed', () => {
+test('non-send / non-skipped results stay completed', () => {
+  // Handler returns WITHOUT an explicit skipped flag keep mapping to completed.
+  // (The hard-suppression / blocked shapes below carry no skipped:true; the
+  // dedup path writes its own status inline and never reaches this predicate.)
   for (const r of [
     { action: 'send_message_suppressed', reason: 'hard_suppression_dnc' },
     { action: 'send_message_blocked', reason: 'tag_fetch_failed' },
     { action: 'send_message_stop_bot', reason: 'stop_bot' },
-    { action: 'deduped', skipped: true },
     { tags_added: ['agentic-active'] },
     null,
     undefined,
@@ -119,5 +121,20 @@ test('non-send results (suppressed / blocked / deduped) stay completed', () => {
     const { status, error_message } = classifyHandlerResult(r);
     assert.equal(status, 'completed');
     assert.equal(error_message, null);
+  }
+});
+
+test('explicitly-skipped results (lock held / suppressed) map to skipped — not completed', () => {
+  // June 2026 (Mark Test repro): executeSendMessageWithLock returns
+  // { skipped: true, reason } when a send is blocked by the outbound lock or
+  // the universal suppression gate. These must NOT be counted as delivered.
+  for (const r of [
+    { skipped: true, reason: 'outbound_lock_held' },
+    { skipped: true, reason: 'suppressed' },
+    { action: 'deduped', skipped: true, reason: 'send_dedup' },
+  ]) {
+    const { status, error_message } = classifyHandlerResult(r);
+    assert.equal(status, 'skipped');
+    assert.equal(error_message, r.reason);
   }
 });
