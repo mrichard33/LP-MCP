@@ -1028,7 +1028,8 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     : 'Constraints: 150-400 words. 2-4 short paragraphs. Subject line required. Merge tags as bare text (no markdown).'
   );
 
-  parts.push(`\nTODAY IS: ${formatTodayForPrompt()} (Florida / ${PROMPT_TIMEZONE}). NEVER propose a date that has already passed.`);
+  parts.push(`\n═══════ CURRENT DATE — Florida / ${PROMPT_TIMEZONE} ═══════`);
+  parts.push(`TODAY IS: ${formatTodayForPrompt()}. NEVER propose or confirm a date that has already passed. Compare every appointment and proposed slot against TODAY before calling it upcoming.`);
 
   parts.push(`\nCLASSIFICATION: ${classification.intent_class} (${classification.confidence?.toFixed(2) || 'n/a'} confidence, ${classification.classification_method})`);
   if (classification.reasoning) parts.push(`Classifier reasoning: ${classification.reasoning}`);
@@ -1141,7 +1142,19 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     parts.push(`\nLP CRM (Ground Truth):`);
     parts.push(`Disposition: ${context.lp.disposition || 'none'}${context.lp.disposition_label ? ' (' + context.lp.disposition_label + ')' : ''}`);
     if (context.lp.rep_name) parts.push(`Sales Rep: ${context.lp.rep_name}`);
-    parts.push(`Demo: ${context.lp.demo_completed ? 'YES' : 'no'} | Appointment: ${context.lp.appointment_set ? 'YES — ' + context.lp.appointment_date : 'no'}`);
+    let apptStatus = 'no';
+    if (context.lp.appointment_set || context.lp.appointment_date) {
+      const dd = context.lp.appointment_days_delta;
+      let when = '';
+      if (typeof dd === 'number') {
+        const n = Math.abs(dd);
+        if (dd < 0) when = ` — ${n} day${n === 1 ? '' : 's'} in the PAST (already passed — do NOT treat as upcoming; offer to reschedule)`;
+        else if (dd === 0) when = ' — TODAY';
+        else when = ` — in ${n} day${n === 1 ? '' : 's'} (upcoming)`;
+      }
+      apptStatus = `YES — ${context.lp.appointment_date}${when}`;
+    }
+    parts.push(`Demo: ${context.lp.demo_completed ? 'YES' : 'no'} | Appointment: ${apptStatus}`);
     if (context.lp.closed_won) parts.push(`CLOSED WON — $${context.lp.job_value}`);
     if (context.lp.lost_reason) parts.push(`LOST REASON: ${context.lp.lost_reason}`);
 
@@ -1290,6 +1303,10 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   parts.push(`\nGenerate the ${channel} response. Follow this priority order:`);
   parts.push(`(1) CANCELLATION FLOW: if the lead expressed cancel intent for an existing appointment OR is mid-state-machine in a cancel/reschedule conversation (read EXISTING APPOINTMENTS + conversation history together), follow the CANCELLATION FLOW state machine in the system prompt. Emit cancel_appointment when the lead pushed back on reschedule (state 2 case B). Emit reschedule_appointment when the lead hard-confirmed a proposed reschedule slot (state 3). Otherwise no companion_action this turn.`);
   parts.push(`(1.5) IN-HOME CONFIRMATION UPGRADE: if EXISTING APPOINTMENTS shows an in-home appointment with status "new" AND the lead's reply answers the decision-maker question, emit update_appointment_status — status "confirmed" when decision-makers are Yes/Solo Owner (+ write decision_makers_present), otherwise NO companion (leave it new). This is not a re-booking; never emit book_appointment when an active appointment already exists.`);
+  if (context.lp?.appointment_is_past === true) {
+    const n = Math.abs(context.lp.appointment_days_delta || 0);
+    parts.push(`(1.6) PAST APPOINTMENT — RESCHEDULE (GOVERNS THIS TURN): the LP appointment on ${context.lp.appointment_date} is ${n} day${n === 1 ? '' : 's'} in the PAST. Do NOT confirm it, hold it, or call it upcoming. If the lead asks about their appointment, state that date AND that it has already passed, then offer to rebook with TWO specific new slots from CALENDAR AVAILABILITY (ASK-FIRST). This overrides the auto-book/closing-ack branches below for this turn.`);
+  }
   parts.push(`(2) AUTO-BOOK on hard confirmation of held time (NOT in a cancel/reschedule conversation): if the lead's reply is a hard confirmation of a previously-proposed time AND BOOKING CONTEXT provides a calendar_name, check Q1/Q2/Q3. All three pass (Q3 = "Yes" OR "Solo Owner") → companion_action book_appointment status="confirmed" + PATH A message + qualifying_data. Any missing → status="new" + PATH B message. Default to PATH B when unsure. Only include qualifying_data fields the lead explicitly stated. EXCEPTION — if an IN-HOME BOOKING GATE block is present above, it GOVERNS (book-then-capture): an in-home visit ALWAYS books immediately on a hard confirmation (never hold). Status="confirmed" when decision-makers were already stated Yes / Solo Owner earlier, otherwise status="new" (tentative; a human confirms). In the SAME confirmation message ask both capture questions (decision-makers + address) in one line — but never withhold the booking to ask them first. THEN, if an in-home appointment with status "new" already exists and the lead's reply answers the decision-maker question, do NOT re-book — emit update_appointment_status per (1.5) to upgrade that appointment in place (Yes/Solo Owner → "confirmed"; No/Uncertain → no companion, leave it "new").`);
   parts.push(`(3) CLOSING ACKNOWLEDGMENT: soft-confirm with caveat / pure ack / commitment to return → brief acknowledgment + EXPLICIT HOLD + STOP. No re-proposal, no link, no new ask, no HSO, no companion_action.`);
   parts.push(`(4) HUMAN CORRECTION block, if present, overrides defaults.`);

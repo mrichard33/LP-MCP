@@ -71,6 +71,7 @@
  */
 
 import supabase from './supabase.js';
+import { appointmentDelta, formatDateHuman, APPOINTMENT_TZ } from './appointment-dates.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
@@ -679,8 +680,17 @@ export async function buildLeadContext(ghlContactId, options = {}) {
   const daysInStage = calculateDaysInStage(opportunity);
   const lpName = lpLead ? [lpLead.first_name, lpLead.last_name].filter(Boolean).join(' ') : null;
   const staleness = calcLpStaleness(lpLead);
+  // Date awareness: current ET date + past/future labeling for the LP
+  // appointment so the prompt never calls a past appointment "upcoming".
+  const nowInstant = new Date();
+  const apptDelta = appointmentDelta(lpLead?.appointment_date, nowInstant);
 
   const context = {
+    now: {
+      iso: nowInstant.toISOString(),
+      date_human: formatDateHuman(nowInstant),
+      tz: APPOINTMENT_TZ,
+    },
     lead: {
       ghl_contact_id: ghlContactId,
       name: ghlContact?.name || lpName || 'Unknown',
@@ -746,6 +756,9 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       source_detail: lpLead?.lead_source_detail || null,
       appointment_set: lpLead?.appointment_set || false,
       appointment_date: lpLead?.appointment_date || null,
+      // Signed whole-day delta from today (ET); negative = past. null when no appt.
+      appointment_is_past: apptDelta ? apptDelta.is_past : null,
+      appointment_days_delta: apptDelta ? apptDelta.days_delta : null,
       demo_completed: lpLead?.demo_completed || false,
       demo_date: lpLead?.demo_date || null,
       days_to_demo: lpLead?.days_to_demo || null,
