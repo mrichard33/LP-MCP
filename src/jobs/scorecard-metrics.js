@@ -80,8 +80,18 @@ export const WORKING_STATUSES = (
 const WORKING_SET = new Set(WORKING_STATUSES);
 
 function flag(lead, mapKey) {
-  const v = getField(lead, ...SCORECARD_FIELD_MAP[mapKey]);
-  return v === true || v === 'true';
+  // A lead counts if ANY mapped field is true — including the ever* companion
+  // (everset/eversat/everissued). LP clears the transient flag (e.g. `issued`)
+  // once a lead progresses or is cancelled, so the ever* field is what ties the
+  // GROSS funnel counts to the report. NOTE: getField returns the first PRESENT
+  // key, so it can't OR a transient flag with its ever* companion — we must check
+  // each field explicitly. (Confirmed via raw_inputs.issue_diag: issued=1507 vs
+  // everissued=1576 for Jun 1–23.)
+  for (const k of SCORECARD_FIELD_MAP[mapKey]) {
+    const v = getField(lead, k);
+    if (v === true || v === 'true') return true;
+  }
+  return false;
 }
 
 // Dispositions where the rep sat the appointment (LP Sat=true) but it should NOT
