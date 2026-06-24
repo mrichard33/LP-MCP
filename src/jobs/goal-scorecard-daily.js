@@ -25,11 +25,15 @@ import {
   computeActuals, SCORECARD_GETLEAD_OPTIONS, DEFAULT_MARKET,
 } from './scorecard-metrics.js';
 import {
-  resolveSellingCalendar, sellingDaysElapsed, sellingDaysInPeriod,
-  lastCompletedSellingDay, monthEnd,
+  resolveSellingCalendar, sellingDaysElapsed, sellingDaysInPeriod, lastCompletedSellingDay,
 } from '../selling-days.js';
 
 const TIMEZONE = 'America/New_York';
+
+// Selling-day calendar (Mon–Sat minus Reece closures) — drives the selling-day
+// `days_elapsed` numerator and the `working_days_in_period` denominator the
+// dashboard prorates the MTD goal against. Resolved once from env.
+const SELLING_CAL = resolveSellingCalendar(process.env);
 
 // GetLead (options=261120) returns only ~one page per query and StartIndex
 // paging is non-functional, so a single wide-window sweep silently truncates to
@@ -65,11 +69,6 @@ const RECONCILED_MARKETS = new Set(
     .split(',').map((s) => s.trim()).filter(Boolean),
 );
 
-// Selling-day calendar (Mon–Sat minus Reece closures). Drives the as-of anchor,
-// the selling-day elapsed count, and the working-days-in-period denominator so
-// the read layer prorates the goal on a consistent selling-day basis.
-const SELLING_CAL = resolveSellingCalendar();
-
 /** Today's ET calendar date as YYYY-MM-DD. */
 function todayET() {
   return new Intl.DateTimeFormat('en-CA', {
@@ -80,6 +79,13 @@ function todayET() {
 /** First-of-month for an ET YYYY-MM-DD date. */
 function monthStart(etDate) {
   return `${etDate.slice(0, 7)}-01`;
+}
+
+/** Last-of-month for an ET YYYY-MM-DD date (UTC-safe; day 0 of next month). */
+function monthEnd(etDate) {
+  const [y, m] = etDate.split('-').map(Number);
+  const d = new Date(Date.UTC(y, m, 0, 12, 0, 0)); // day 0 of month m+1 = last day of month m
+  return d.toISOString().slice(0, 10);
 }
 
 /** The ET calendar day after a YYYY-MM-DD date (UTC-safe). */
@@ -138,21 +144,26 @@ async function fetchAllProspects(periodStart, periodEnd) {
  *
  * @param {object} [opts]
  * @param {string} [opts.period_start] YYYY-MM-DD (ET). Default: first of current month.
- * @param {string} [opts.period_end]   YYYY-MM-DD (ET). Default: today.
+ * @param {string} [opts.period_end]   YYYY-MM-DD (ET). Default: last completed selling day.
  * @param {string} [opts.date]         Alias: sets period_end (and infers month start).
+ * @param {boolean} [opts.persist=true] When false, compute but DO NOT upsert — returns
+ *   the full aggregate row (incl. raw_inputs) + full per-source rows. Used by the
+ *   dashboard's period filter so a short-window recompute never overwrites the stored
+ *   MTD snapshot (conflict key is market,as_of_date).
  */
 export async function computeGoalScorecard(opts = {}) {
   const startedAt = Date.now();
-  // Default (cron) path anchors the snapshot to the last COMPLETED selling day —
-  // today is in progress, so including it would distort pace/goal math. Explicit
-  // period_end/date (backfill, tie-out) pass through verbatim.
+  const persist = opts.persist !== false;
+  // Scheduled daily run (no explicit end) snapshots through the LAST COMPLETED
+  // selling day — never partial-today — so as_of matches the dashboard's stale
+  // guard. Explicit backfill/preview keeps the caller's window end.
   const periodEnd = opts.period_end || opts.date || lastCompletedSellingDay(todayET(), SELLING_CAL);
   const periodStart = opts.period_start || monthStart(periodEnd);
   const asOfDate = periodEnd;
-  // Selling days (not calendar days) on a consistent basis for numerator and
-  // denominator: elapsed = selling days [periodStart, asOf]; working-days =
-  // selling days across the FULL month so the read layer can prorate the goal.
-  const daysElapsed = sellingDaysElapsed(periodStart, periodEnd, SELLING_CAL);
+  // Selling-day basis: numerator = selling days in [start, as_of]; denominator =
+  // selling days in the start month. Numerator and denominator share one basis so
+  // the dashboard's MTD-goal proration (elapsed/working_days) is correct.
+  const daysElapsed = sellingDaysElapsed(periodStart, asOfDate, SELLING_CAL);
   const workingDaysInPeriod = sellingDaysInPeriod(periodStart, monthEnd(periodStart), SELLING_CAL);
   const fetchStart = minusDays(periodStart, PULL_LOOKBACK_DAYS);
 
@@ -213,42 +224,72 @@ export async function computeGoalScorecard(opts = {}) {
     });
   }
 
-  const { error } = await supabase
-    .from('lp_market_scorecard_daily')
-    .upsert(rows, { onConflict: 'market,as_of_date' });
-
-  if (error) {
-    console.error(`[Scorecard] upsert failed: ${error.message}`);
-    await syncLogComplete(logId, 0, error.message);
-    return { success: false, error: error.message };
-  }
-
-  // Per-source actuals (Phase 2) — same prospect set, no extra LP calls. A failure
-  // here must NOT fail the run: the aggregate row is already written.
-  let sourceRows = 0, unmappedSources = 0;
-  try {
-    const res = await writeSourceScorecard({ markets, asOfDate, periodStart, periodEnd, daysElapsed });
-    sourceRows = res.count;
-    unmappedSources = res.unmapped;
-    console.log(`[Scorecard] source rows upserted=${sourceRows} unmapped=${unmappedSources}`);
-  } catch (err) {
-    console.warn(`[Scorecard] per-source upsert failed (aggregate kept): ${err.message}`);
+  // Compute per-source actuals (Phase 2) — same prospect set, no extra LP calls.
+  // In preview mode nothing is written; we still build the rows to return.
+  let sourceRows = 0, unmappedSources = 0, sourceRowsFull = [];
+  if (persist) {
+    const { error } = await supabase
+      .from('lp_market_scorecard_daily')
+      .upsert(rows, { onConflict: 'market,as_of_date' });
+    if (error) {
+      console.error(`[Scorecard] upsert failed: ${error.message}`);
+      await syncLogComplete(logId, 0, error.message);
+      return { success: false, error: error.message };
+    }
+    // A per-source failure must NOT fail the run: the aggregate row is already written.
+    try {
+      const res = await writeSourceScorecard({
+        markets, asOfDate, periodStart, periodEnd, daysElapsed, workingDaysInPeriod, persist: true,
+      });
+      sourceRows = res.count;
+      unmappedSources = res.unmapped;
+      sourceRowsFull = res.rows;
+      console.log(`[Scorecard] source rows upserted=${sourceRows} unmapped=${unmappedSources}`);
+    } catch (err) {
+      console.warn(`[Scorecard] per-source upsert failed (aggregate kept): ${err.message}`);
+    }
+  } else {
+    // Preview: compute source rows without writing (errors here are non-fatal).
+    try {
+      const res = await writeSourceScorecard({
+        markets, asOfDate, periodStart, periodEnd, daysElapsed, workingDaysInPeriod, persist: false,
+      });
+      sourceRows = res.count;
+      unmappedSources = res.unmapped;
+      sourceRowsFull = res.rows;
+    } catch (err) {
+      console.warn(`[Scorecard] per-source preview failed (aggregate kept): ${err.message}`);
+    }
   }
 
   const elapsed = Date.now() - startedAt;
   await syncLogComplete(logId, rows.length, null);
   const summary = rows.map((r) => `${r.market}: leads=${r.leads} demos=${r.demos} sales=${r.sales}`).join(' | ');
-  console.log(`[Scorecard] done ${summary} prospects=${prospects.length} elapsed=${elapsed}ms`);
+  console.log(`[Scorecard] done${persist ? '' : ' (preview)'} ${summary} prospects=${prospects.length} elapsed=${elapsed}ms`);
 
-  return {
+  const base = {
     success: true,
+    persisted: persist,
     period_start: periodStart,
     period_end: periodEnd,
     as_of_date: asOfDate,
+    days_elapsed: daysElapsed,
+    working_days_in_period: workingDaysInPeriod,
     markets: rows.length,
     source_rows: sourceRows,
     unmapped_sources: unmappedSources,
     prospects_scanned: prospects.length,
+    elapsed_ms: elapsed,
+  };
+
+  // Preview mode returns the FULL aggregate row(s) + full per-source rows so the
+  // dashboard can render the period directly without a stored snapshot.
+  if (!persist) {
+    return { ...base, actuals: rows[0] ?? null, rows, sources: sourceRowsFull };
+  }
+
+  return {
+    ...base,
     rows: rows.map((r) => ({
       market: r.market, leads: r.leads, raw_leads_in: r.raw_leads_in,
       issued: r.issued, sets: r.sets, demos: r.demos, sales: r.sales,
@@ -256,7 +297,6 @@ export async function computeGoalScorecard(opts = {}) {
       working_dollars: r.working_dollars, pending_total: r.pending_total,
       gross_sales: r.gross_sales, reconciled: r.reconciled,
     })),
-    elapsed_ms: elapsed,
   };
 }
 
@@ -266,9 +306,11 @@ export async function computeGoalScorecard(opts = {}) {
  * aggregate row — no extra LP calls. Resolves each source through lp_source_mapping
  * to a GHL intent bucket; rows that don't resolve are flagged raw_inputs.unmapped.
  *
- * @returns {{ count:number, unmapped:number }}
+ * @returns {{ count:number, unmapped:number, rows:object[] }}
  */
-async function writeSourceScorecard({ markets, asOfDate, periodStart, periodEnd, daysElapsed }) {
+async function writeSourceScorecard({
+  markets, asOfDate, periodStart, periodEnd, daysElapsed, workingDaysInPeriod, persist = true,
+}) {
   // Load the (small) source-mapping table once and build offline lookups that
   // mirror resolveSourceBucket: prefer the sub-source detail, then the raw source.
   const subdetailMap = new Map();   // lp_source_subdetail → ghl_intent_bucket
@@ -301,7 +343,8 @@ async function writeSourceScorecard({ markets, asOfDate, periodStart, periodEnd,
       const sub = g.sub_source == null || g.sub_source === '' ? '(none)' : g.sub_source;
       rows.push({
         market, source: src, sub_source: sub,
-        as_of_date: asOfDate, period_start: periodStart, period_end: periodEnd, days_elapsed: daysElapsed,
+        as_of_date: asOfDate, period_start: periodStart, period_end: periodEnd,
+        days_elapsed: daysElapsed, working_days_in_period: workingDaysInPeriod,
         leads: g.leads, sets: g.sets, issued: g.issued, net_issue: g.net_issue,
         demos: g.demos, sales: g.sales, net_close: g.net_close, ko_count: g.ko_count,
         gross_sales: g.gross_sales, net_sales: g.net_sales, released_dollars: g.released_dollars,
@@ -320,23 +363,29 @@ async function writeSourceScorecard({ markets, asOfDate, periodStart, periodEnd,
     }
   }
 
-  if (rows.length) {
+  if (persist && rows.length) {
     const { error } = await supabase
       .from('lp_source_scorecard_daily')
       .upsert(rows, { onConflict: 'market,source,sub_source,as_of_date' });
     if (error) throw new Error(error.message);
   }
-  return { count: rows.length, unmapped };
+  return { count: rows.length, unmapped, rows };
 }
 
 // ─── HTTP routes ─────────────────────────────────────────────────────
 export function registerGoalScorecardRoutes(app) {
   app.post('/n8n/admin/goal-scorecard-run', async (req, res) => {
     try {
+      // persist defaults true; the dashboard's period filter passes persist:false
+      // (or ?persist=false) for short-window previews that must NOT overwrite the
+      // stored MTD snapshot.
+      const persistRaw = req.body?.persist ?? req.query?.persist;
+      const persist = !(persistRaw === false || persistRaw === 'false');
       const result = await computeGoalScorecard({
         period_start: req.body?.period_start || req.query?.period_start,
         period_end: req.body?.period_end || req.query?.period_end,
         date: req.body?.date || req.query?.date,
+        persist,
       });
       res.json(result); // success=false surfaces as 200 with structured body for cron/n8n
     } catch (err) {
