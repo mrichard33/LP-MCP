@@ -827,7 +827,7 @@ async function lpLeadUpdateGhlContactHandler(req, res) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// LP INBOUND REAL-TIME CACHE REFRESH
+// LP INBOUND REAL-TIME CACHE REFRESH — v1.1
 // ═══════════════════════════════════════════════════════════════════
 //
 // POST /webhook/lp-lead-refresh
@@ -841,39 +841,65 @@ async function lpLeadUpdateGhlContactHandler(req, res) {
 // the SAME canonical writer the poller uses (processProspect) to upsert
 // lp_leads + emit lp.disposition_changed.
 //
+// v1.1 — FAST PATH (2026-06-24)
+// When the GHL webhook payload carries lp_disposition, source, and
+// source_detail, we compare them against the existing lp_leads row before
+// touching LP. If all three match AND the row is fresh enough, we skip the
+// LP API fetch entirely (~50ms vs ~7s) and only bump synced_at.
+//
+// Fast-path conditions (ALL must hold to skip the LP fetch):
+//   1. Payload carries a non-empty lp_disposition string
+//   2. Lead row EXISTS in lp_leads (no row → brand-new lead, must fetch)
+//   3. Cached disposition_code === payload lp_disposition (no change)
+//   4. Cached lead_source === payload source (or both absent)
+//   5. Cached lead_source_detail === payload source_detail (or both absent)
+//   6. synced_at is within LP_INBOUND_REFRESH_FAST_PATH_MAX_AGE_MS
+//      (default 15 min) — stale cache always fetches for safety
+//   7. LP_INBOUND_REFRESH_FORCE_FETCH env var is NOT 'true'
+//
+// When the fast path fires, only synced_at is updated (proves the webhook
+// hit on this event). No processProspect, no LP call, no GHL tag ops.
+// The polling sync remains the guaranteed catch-up tier for any fields the
+// fast path skips (appointment flags, job data, call logs, etc.).
+//
 // DESIGN
-//   - Single writer: reuses processProspect() from sync-leads.js → the
-//     real-time path and the polling path write byte-identical rows and
-//     cannot drift.
-//   - Fire-and-forget: returns 200 immediately; work runs in setImmediate
-//     so the GHL workflow never blocks on LP latency.
-//   - Best-effort fast: LP fast path (12s, single attempt). If LP is slow,
-//     the next polling cycle is the guaranteed catch-up (three-layer
-//     bounded-staleness contract).
+//   - Single writer (full path): reuses processProspect() from sync-leads.js.
+//   - Fire-and-forget: returns 200 immediately; work runs in setImmediate.
+//   - Best-effort fast: LP fast path (12s, single attempt) on full fetch.
+//     If LP is slow, the next polling cycle is the guaranteed catch-up.
 //   - Idempotent: processProspect's upsert + the disposition event's
-//     idempotency key collapse GHL webhook retries and any poll/webhook
-//     race to exactly one row state + one event.
+//     idempotency key collapse GHL webhook retries and poll/webhook races.
 //   - Feature-flagged: dark unless ENABLE_LP_INBOUND_REFRESH === 'true'.
-//   - Optional shared secret: if LP_INBOUND_REFRESH_KEY is set, the request
-//     must carry ?key=<value> (or x-refresh-key header); if unset, open
-//     mode (consistent with sibling GHL webhooks).
+//   - Optional shared secret: LP_INBOUND_REFRESH_KEY (?key= or x-refresh-key).
 //   - GHL-load lever: LP_INBOUND_REFRESH_SKIP_GHL=true runs processProspect
 //     with { skipGHL:true } (cache + disposition event only, no GHL
-//     matching/tagging) to relieve the GHL rate limiter; poller keeps tag
-//     hygiene current.
+//     matching/tagging) to relieve the GHL rate limiter.
 //
-// PAYLOAD (from GHL standard outbound Webhook step):
-//   { "lead_id": "{{inboundWebhookRequest.lead_id}}",
-//     "prospect_id": "{{inboundWebhookRequest.prospect_number}}",
-//     "ghl_contact_id": "{{contact.id}}" }   // ghl_contact_id optional
+// GHL WEBHOOK PAYLOAD (workflow 7f24f79d, "LP Lead Refresh" step):
+//   {
+//     "lead_id":       "{{inboundWebhookRequest.lead_id}}",
+//     "prospect_id":   "{{inboundWebhookRequest.prospect_number}}",
+//     "ghl_contact_id":"{{contact.id}}",
+//     "lp_disposition":"{{inboundWebhookRequest.lead_status}}",
+//     "source":        "{{inboundWebhookRequest.source}}",
+//     "source_detail": "{{inboundWebhookRequest.source_detail}}"
+//   }
 //
 // RESPONSE: always 200 { received:true, processing:'async' }, except
 //   503 when the flag is off, or 401 when the secret check fails.
+
 // In-memory burst dedup — collapses duplicate fires for the same lead in
 // a short window. Best-effort only (resets on redeploy); the upsert + event
 // idempotency are the real correctness guarantees.
 const _lpRefreshRecent = new Map(); // dedupKey -> ts(ms)
 const _LP_REFRESH_DEDUP_MS = parseInt(process.env.LP_INBOUND_REFRESH_DEDUP_MS || '8000', 10);
+
+// Fast-path max age: if synced_at is older than this, always fetch from LP
+// regardless of whether the payload fields match. Default 15 minutes.
+const _LP_REFRESH_FAST_PATH_MAX_AGE_MS = parseInt(
+  process.env.LP_INBOUND_REFRESH_FAST_PATH_MAX_AGE_MS || String(15 * 60 * 1000),
+  10,
+);
 
 async function lpLeadRefreshHandler(req, res) {
   // ─── Feature flag ───────────────────────────────────────────────
@@ -901,6 +927,11 @@ async function lpLeadRefreshHandler(req, res) {
     src.ghl_contact_id || src.ghlContactId || src.contact_id || src.contactId || ''
   ).trim();
 
+  // v1.1: payload fields for the fast path
+  const payloadDisposition  = String(src.lp_disposition  || src.lpDisposition  || '').trim();
+  const payloadSource       = String(src.source          || '').trim();
+  const payloadSourceDetail = String(src.source_detail   || src.sourceDetail   || '').trim();
+
   if (!leadId && !prospectId) {
     return res.status(400).json({ ok: false, error: 'lead_id_or_prospect_id_required' });
   }
@@ -926,7 +957,71 @@ async function lpLeadRefreshHandler(req, res) {
   // ─── Async work (after response sent) ───────────────────────────
   setImmediate(async () => {
     const t0 = Date.now();
+    const forceFetch = String(process.env.LP_INBOUND_REFRESH_FORCE_FETCH || '').toLowerCase() === 'true';
+
     try {
+      // ── v1.1 FAST PATH ────────────────────────────────────────────
+      // When the payload tells us the new disposition + source, check
+      // whether anything actually changed before calling LP. If the
+      // cached row is fresh and matches on all three fields, all we need
+      // to do is bump synced_at — no LP fetch, no processProspect.
+      if (!forceFetch && payloadDisposition && leadId) {
+        const { data: cached } = await supabase
+          .from('lp_leads')
+          .select('disposition_code, lead_source, lead_source_detail, synced_at, ghl_contact_id')
+          .eq('lp_lead_id', leadId)
+          .maybeSingle();
+
+        if (cached) {
+          // Normalise: treat null/undefined/"" as identical to absent payload ""
+          const norm = (v) => (v == null ? '' : String(v).trim());
+          const cachedDisp   = norm(cached.disposition_code);
+          const cachedSrc    = norm(cached.lead_source);
+          const cachedDetail = norm(cached.lead_source_detail);
+
+          const dispMatch   = cachedDisp   === payloadDisposition;
+          const srcMatch    = payloadSource       === '' || cachedSrc    === payloadSource;
+          const detailMatch = payloadSourceDetail === '' || cachedDetail === payloadSourceDetail;
+
+          const cacheAgeMs = cached.synced_at
+            ? now - new Date(cached.synced_at).getTime()
+            : Infinity;
+          const cacheIsFresh = cacheAgeMs <= _LP_REFRESH_FAST_PATH_MAX_AGE_MS;
+
+          if (dispMatch && srcMatch && detailMatch && cacheIsFresh) {
+            // Nothing changed — just prove the webhook hit by bumping synced_at.
+            // Also backfill ghl_contact_id if the payload carries it and the
+            // row doesn't have one yet (same link-backfill logic as the full path).
+            const updates = { synced_at: new Date().toISOString() };
+            if (payloadGhlContactId && !cached.ghl_contact_id) {
+              updates.ghl_contact_id = payloadGhlContactId;
+            }
+            await supabase.from('lp_leads').update(updates).eq('lp_lead_id', leadId);
+
+            console.log(
+              `[LP Inbound Refresh] ⚡ fast-path lead_id=${leadId} ` +
+              `disp=${payloadDisposition} src="${payloadSource}" ` +
+              `cacheAge=${Math.round(cacheAgeMs / 1000)}s — no LP fetch needed (${Date.now() - t0}ms)`
+            );
+            return;
+          }
+
+          // Log why we're falling through to the full fetch (aids debugging).
+          const reasons = [];
+          if (!dispMatch)   reasons.push(`disp ${cachedDisp}→${payloadDisposition}`);
+          if (!srcMatch)    reasons.push(`src "${cachedSrc}"→"${payloadSource}"`);
+          if (!detailMatch) reasons.push(`detail "${cachedDetail}"→"${payloadSourceDetail}"`);
+          if (!cacheIsFresh) reasons.push(`stale cache ${Math.round(cacheAgeMs / 60000)}min`);
+          console.log(
+            `[LP Inbound Refresh] fast-path miss lead_id=${leadId}: ${reasons.join(', ')} — fetching from LP`
+          );
+        } else {
+          // No cached row → brand-new lead. Must fetch.
+          console.log(`[LP Inbound Refresh] fast-path miss lead_id=${leadId}: no cached row — fetching from LP`);
+        }
+      }
+
+      // ── FULL PATH: fetch from LP + processProspect ────────────────
       const { getLeadByLdsId, getLead } = await import('./lp-client.js');
       const { processProspect } = await import('./sync-leads.js');
 
@@ -1105,8 +1200,9 @@ export function registerRestApiRoutes(app, authenticate) {
   // No auth middleware (optional shared secret enforced inside the handler).
   // Fired by GHL workflow 7f24f79d (LP Inbound Webhook) on every disposition
   // change. Feature-flagged via ENABLE_LP_INBOUND_REFRESH (503 when off).
+  // v1.1: fast path skips LP fetch when payload matches cached row.
   app.post('/webhook/lp-lead-refresh', lpLeadRefreshHandler);
-  console.log('[REST API] Registered: POST /webhook/lp-lead-refresh (no-auth, flag-gated, real-time lp_leads refresh)');
+  console.log('[REST API] Registered: POST /webhook/lp-lead-refresh (no-auth, flag-gated, real-time lp_leads refresh v1.1)');
 
   // ═══════════════════════════════════════════════════════════════
   // /api/service-area/lookup — Zip → Market routing for HDL.2
