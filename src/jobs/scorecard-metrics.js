@@ -166,6 +166,14 @@ function makeAcc() {
       issued_or_job: 0,         // issued_flag || hasJob
       issued_union: 0,          // issued_flag || sat || sold || hasJob
       dispo_issued_plus: 0,     // disposition stage rank ≥ Issued
+      // Residual hunt: the gap is cancelled-then-issued deals whose everissued LP
+      // clears. Look for a DURABLE issued-date field that survives cancellation.
+      has_issued_date: 0,            // any candidate issued-date field populated
+      issued_or_issued_date: 0,      // issued_flag || has_issued_date (candidate fix)
+      cancelled_with_issued_date: 0, // cancelled leads carrying an issued date
+      sample_lead_keys: null,        // field names of the first lead (discovery)
+      sample_cancelled_keys: null,   // field names of the first cancelled lead (discovery)
+      date_like_keys: null,          // keys whose name hints at issue/date (discovery)
     },
   };
 }
@@ -228,6 +236,32 @@ function accumulateLead(acc, lead) {
     if (isIssued || hasJob) d.issued_or_job += 1;
     if (isIssued || isSat || isSold || hasJob) d.issued_union += 1;
     if (dispoIssuedPlus) d.dispo_issued_plus += 1;
+
+    // ── Residual hunt: durable issued-date that survives cancellation ──
+    // Discovery: capture field NAMES (no values → no PII) of the first lead and the
+    // first CANCELLED lead so we can spot LP's issued-date field, plus any key that
+    // hints at issue/date.
+    const keys = Object.keys(lead || {});
+    if (!d.sample_lead_keys) d.sample_lead_keys = keys;
+    if (cancelled && !d.sample_cancelled_keys) d.sample_cancelled_keys = keys;
+    if (!d.date_like_keys) {
+      const hints = keys.filter((k) => /iss|date|dt|appt/i.test(k));
+      if (hints.length) d.date_like_keys = hints;
+    }
+    // Count: candidate durable issued-date fields populated (non-empty by value).
+    const ISSUED_DATE_KEYS = [
+      'issueddate', 'IssuedDate', 'issued_date', 'dateissued', 'DateIssued',
+      'issuedleaddate', 'IssuedLeadDate', 'issuedleadlastdate', 'IssuedLeadLastDate',
+      'ils_date', 'ilsdate', 'dtissued', 'issdate', 'issued_dt',
+    ];
+    let hasIssuedDate = false;
+    for (const k of ISSUED_DATE_KEYS) {
+      const v = lead?.[k];
+      if (v !== undefined && v !== null && v !== '') { hasIssuedDate = true; break; }
+    }
+    if (hasIssuedDate) d.has_issued_date += 1;
+    if (isIssued || hasIssuedDate) d.issued_or_issued_date += 1;
+    if (cancelled && hasIssuedDate) d.cancelled_with_issued_date += 1;
   }
 
   if (isSet) acc.sets += 1;
