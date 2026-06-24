@@ -891,6 +891,42 @@ async function evaluateContextConditions(conditions, intelligence, event) {
         break; // appts === null (unknown) or [] (none) → pass
       }
 
+      // last_active_appointment (2026-06-24): appointment-aware cancellation
+      // guard. When set truthy on a cancellation-routing rule, the rule matches
+      // ONLY if the contact has NO active appointment OTHER than the one the
+      // triggering ghl.appointment_cancelled event refers to. Prevents the full
+      // cancellation cascade (S5.2 / Reactivation / CANCELLED task / team alert)
+      // from firing when a single duplicate/per-object cancel still leaves the
+      // contact booked. Computed ONLY on cancellation events — no reads on any
+      // other event_type. Fail-CLOSED: on a null lookup, or when the cancelled
+      // id is absent and ≥1 active appt remains, we SUPPRESS — a wrongful cascade
+      // on a still-booked lead is far costlier than a missed rescue (other
+      // sweeps still catch that). This is the OPPOSITE bias from
+      // no_future_appointment above, so don't mirror its null→pass behavior.
+      case 'last_active_appointment': {
+        if (!expected) break; // only gate when set truthy
+        if (event?.event_type !== 'ghl.appointment_cancelled') break; // no read on other events
+        // Fetch the contact's active appointments at most once per event.
+        if (event._cancelActiveAppts === undefined) {
+          event._cancelActiveAppts = await fetchUpcomingAppointments(event.ghl_contact_id);
+        }
+        const active = event._cancelActiveAppts;
+        if (!Array.isArray(active)) {
+          // null/unknown (GHL error) → bias toward SUPPRESS.
+          console.log(`[Context] BLOCKED: last_active_appointment — appointment lookup unavailable for ${event.ghl_contact_id} (fail-closed suppress)`);
+          return false;
+        }
+        const cancelledId = payload.appointment_id || null;
+        const remaining = cancelledId
+          ? active.filter(a => a.appointment_id !== cancelledId)
+          : active;
+        if (remaining.length > 0) {
+          console.log(`[Context] BLOCKED: last_active_appointment — contact ${event.ghl_contact_id} still has ${remaining.length} active appointment(s)${cancelledId ? ` (excluding cancelled ${cancelledId})` : ' (cancelled id absent — biasing to suppress)'}`);
+          return false;
+        }
+        break; // 0 remaining active → this was the last appointment → pass
+      }
+
       // no_inbound_within_hours: N — block if an inbound message landed within
       // the last N hours (conversation is alive). Fail-OPEN: unknown (NaN) ⇒ pass,
       // so a dead message layer can never block the progress branch (→ S2.2).
