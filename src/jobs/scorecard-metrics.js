@@ -143,6 +143,7 @@ function makeAcc() {
     statusTally: {},   // every job status seen → count (tie-out aid)
     statusDollarTally: {}, // per status → sold-lead $ (calibration: which statuses hold the working/released $)
     nonDemoTally: {},  // disposition code → sits dropped from demos (tie-out aid)
+    openQuotesSample: [], // sample of SOLD leads carrying open-quote $ (pre-firm status) — diagnoses "Quoted on a sold lead"
   };
 }
 
@@ -195,8 +196,18 @@ function accumulateLead(acc, lead) {
     }
     acc.released_dollars += leadReleased; // released to production = Net Sales
     acc.working_dollars  += leadWorking;  // sold but held
-    acc.other_pending    += leadOther;    // other in-flight, not yet released
+    acc.other_pending    += leadOther;    // open quotes: sold lead, pre-firm job (Quoted/New/…)
     if (!cancelled) acc.net_close += 1;   // # Net Close (released or working both "stuck")
+    // Diagnostic sample (capped): a lead flagged sold whose $ landed in the open-quote
+    // bucket — i.e. its job is still pre-firm. Lets Mark see from live records whether
+    // these are stuck-sold (workflow lag) or genuine open pipeline.
+    if (leadOther > 0 && acc.openQuotesSample.length < 25) {
+      acc.openQuotesSample.push({
+        lead_id: String(getField(lead, 'id', 'lds_id', 'LeadID') || ''),
+        sold: true,
+        jobs: leadStatusDollars,
+      });
+    }
   }
 }
 
@@ -205,13 +216,17 @@ function accumulateLead(acc, lead) {
 function finalizeActuals(acc, { periodStart, periodEnd }, extra = {}) {
   const {
     leads, sets, issued, net_issue, demos, sold, net_close, ko_count, gross_sales,
-    released_dollars, working_dollars, other_pending, statusTally, statusDollarTally, nonDemoTally,
+    released_dollars, working_dollars, other_pending, statusTally, statusDollarTally,
+    nonDemoTally, openQuotesSample,
   } = acc;
 
-  // Net Sales = released to production. Working Revenue = sold but held.
-  // pending_total = everything sold, not cancelled, not yet released.
+  // Four mutually-exclusive sold-$ buckets: Released (Net Sales), Working (sold but
+  // held), Open Quotes (sold lead, job still pre-firm), Cancelled.
+  // Pending Revenue = Working ONLY — open quotes are NOT folded in (an unsigned quote
+  // is neither released nor sold-not-netted, so including it would inflate Pending).
   const net_sales = released_dollars;
-  const pending_total = working_dollars + other_pending;
+  const open_quotes = other_pending;
+  const pending_total = working_dollars;   // Pending Revenue = Working only
   const cancelled_dollars = Math.round(gross_sales - (released_dollars + working_dollars + other_pending));
 
   return {
@@ -221,7 +236,7 @@ function finalizeActuals(acc, { periodStart, periodEnd }, extra = {}) {
     good_business: net_sales,            // spec alias: Net Sales = finalized (released)
     released_dollars, working_dollars,
     pending_total,
-    pending_dollars: pending_total,      // kept for read-layer compatibility (= pending_total)
+    pending_dollars: pending_total,      // = Working only (open quotes excluded; see raw_inputs.open_quotes)
     deposits: 0,                         // ⚠ TIE-OUT (job/milestone field; 0 until mapped)
     revenue_basis: 'released/working/cancel v1',
     // ── Report ratios (Marketing Sub-Source By Appt Date) ──
@@ -244,6 +259,9 @@ function finalizeActuals(acc, { periodStart, periodEnd }, extra = {}) {
       working_statuses: WORKING_STATUSES,
       revenue_basis: 'released/working/cancel v1',
       bucket_tally: { released_dollars, working_dollars, other_pending, cancelled_dollars },
+      open_quotes,                       // = bucket_tally.other_pending; Pending excludes this
+      pending_basis: 'working_only',     // Pending Revenue = Working; open quotes shown separately
+      suspect_sold_sample: openQuotesSample, // sold leads with pre-firm $ (diagnose "Quoted on sold")
       non_demo_tally: nonDemoTally,
       tie_out: ['net_issue', 'net_close', 'net_sales', 'released_dollars',
                 'working_dollars', 'gross_sales', 'cancel_statuses'],
