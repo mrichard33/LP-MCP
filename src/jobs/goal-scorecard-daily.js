@@ -212,6 +212,18 @@ export async function computeGoalScorecard(opts = {}) {
     return { success: false, error: error.message };
   }
 
+  // Per-source actuals (Phase 2) — same prospect set, no extra LP calls. A failure
+  // here must NOT fail the run: the aggregate row is already written.
+  let sourceRows = 0, unmappedSources = 0;
+  try {
+    const res = await writeSourceScorecard({ markets, asOfDate, periodStart, periodEnd, daysElapsed });
+    sourceRows = res.count;
+    unmappedSources = res.unmapped;
+    console.log(`[Scorecard] source rows upserted=${sourceRows} unmapped=${unmappedSources}`);
+  } catch (err) {
+    console.warn(`[Scorecard] per-source upsert failed (aggregate kept): ${err.message}`);
+  }
+
   const elapsed = Date.now() - startedAt;
   await syncLogComplete(logId, rows.length, null);
   const summary = rows.map((r) => `${r.market}: leads=${r.leads} demos=${r.demos} sales=${r.sales}`).join(' | ');
@@ -223,6 +235,8 @@ export async function computeGoalScorecard(opts = {}) {
     period_end: periodEnd,
     as_of_date: asOfDate,
     markets: rows.length,
+    source_rows: sourceRows,
+    unmapped_sources: unmappedSources,
     prospects_scanned: prospects.length,
     rows: rows.map((r) => ({
       market: r.market, leads: r.leads, raw_leads_in: r.raw_leads_in,
@@ -233,6 +247,75 @@ export async function computeGoalScorecard(opts = {}) {
     })),
     elapsed_ms: elapsed,
   };
+}
+
+/**
+ * Compute per-(source, sub_source) actuals for each market and upsert them into
+ * lp_source_scorecard_daily. Same prospect set and same metric definitions as the
+ * aggregate row — no extra LP calls. Resolves each source through lp_source_mapping
+ * to a GHL intent bucket; rows that don't resolve are flagged raw_inputs.unmapped.
+ *
+ * @returns {{ count:number, unmapped:number }}
+ */
+async function writeSourceScorecard({ markets, asOfDate, periodStart, periodEnd, daysElapsed }) {
+  // Load the (small) source-mapping table once and build offline lookups that
+  // mirror resolveSourceBucket: prefer the sub-source detail, then the raw source.
+  const subdetailMap = new Map();   // lp_source_subdetail → ghl_intent_bucket
+  const rawMap = new Map();         // lp_source_raw       → ghl_intent_bucket
+  const { data: mappingRows } = await supabase
+    .from('lp_source_mapping')
+    .select('lp_source_subdetail, lp_source_raw, ghl_intent_bucket');
+  for (const m of mappingRows || []) {
+    if (m.lp_source_subdetail) subdetailMap.set(m.lp_source_subdetail, m.ghl_intent_bucket);
+    else if (m.lp_source_raw) rawMap.set(m.lp_source_raw, m.ghl_intent_bucket);
+  }
+  const resolveMapping = (subSource, source) => {
+    const bySub = subSource != null ? subdetailMap.get(subSource) : undefined;
+    if (bySub && bySub !== 'unmapped') return { bucket: bySub, unmapped: false };
+    const byRaw = source != null ? rawMap.get(source) : undefined;
+    if (byRaw && byRaw !== 'unmapped') return { bucket: byRaw, unmapped: false };
+    return { bucket: null, unmapped: true };
+  };
+
+  const rows = [];
+  let unmapped = 0;
+  for (const [market, records] of Object.entries(markets)) {
+    const groups = computeActuals(records, { periodStart, periodEnd, groupBy: ['source', 'sub_source'] });
+    for (const g of groups) {
+      const resolved = resolveMapping(g.sub_source, g.source);
+      if (resolved.unmapped) unmapped += 1;
+      // Coalesce null/empty so the (market, source, sub_source, as_of_date) upsert
+      // key is deterministic (Postgres treats NULLs as distinct in UNIQUE).
+      const src = g.source == null || g.source === '' ? '(none)' : g.source;
+      const sub = g.sub_source == null || g.sub_source === '' ? '(none)' : g.sub_source;
+      rows.push({
+        market, source: src, sub_source: sub,
+        as_of_date: asOfDate, period_start: periodStart, period_end: periodEnd, days_elapsed: daysElapsed,
+        leads: g.leads, sets: g.sets, issued: g.issued, net_issue: g.net_issue,
+        demos: g.demos, sales: g.sales, net_close: g.net_close, ko_count: g.ko_count,
+        gross_sales: g.gross_sales, net_sales: g.net_sales, released_dollars: g.released_dollars,
+        working_dollars: g.working_dollars, pending_total: g.pending_total,
+        pct_issue: g.pct_issue, demo_pct: g.demo_pct, close_pct: g.close_pct, pct_net_close: g.pct_net_close,
+        good_rate_pct: g.good_rate_pct, ko_pct: g.ko_pct, gsli: g.gsli, nsli: g.nsli, avg_sale: g.avg_sale,
+        computed_from: 'lp_api', reconciled: RECONCILED_MARKETS.has(market),
+        raw_inputs: {
+          bucket: resolved.bucket,
+          unmapped: resolved.unmapped,
+          revenue_basis: g.revenue_basis,
+          source_raw: g.source ?? null,
+          sub_source_raw: g.sub_source ?? null,
+        },
+      });
+    }
+  }
+
+  if (rows.length) {
+    const { error } = await supabase
+      .from('lp_source_scorecard_daily')
+      .upsert(rows, { onConflict: 'market,source,sub_source,as_of_date' });
+    if (error) throw new Error(error.message);
+  }
+  return { count: rows.length, unmapped };
 }
 
 // ─── HTTP routes ─────────────────────────────────────────────────────
