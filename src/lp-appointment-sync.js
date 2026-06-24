@@ -537,6 +537,38 @@ function findLeadByHLCID(leadRecords, ghlContactId, prospectIdFallback = null) {
   return { ...(bookable || matches[0]), hlcidMatched: true };
 }
 
+/**
+ * Prospect-keyed link-trusted fallback (2026-06-24). When a prospect's leads
+ * have NO lognumber matching the GHL contact, prefer an existing bookable lead
+ * for that prospect over creating/aliasing a SECOND lead (the phantom-lead root
+ * cause — lead 552399). Person/prospect id is the stable key: a prospect that
+ * already has a bookable lead should have its appointment UPDATED on that lead,
+ * never a new one created. Mirrors Step 0b's link-trusted-bookable acceptance.
+ * Returns the best bookable lead, or null if the prospect has none (then we fall
+ * through rather than alias a non-bookable lead).
+ */
+function findBookableLeadForProspect(leadRecords, prospectId) {
+  if (!Array.isArray(leadRecords) || leadRecords.length === 0) return null;
+  const candidates = [];
+  for (const lead of leadRecords) {
+    if (!lead) continue;
+    const ldsId = lead.LeadID || lead.leadid || lead.lds_id || lead.id;
+    if (!ldsId) continue;
+    const disp = lead.Disposition || lead.disposition || lead.disp_code || '';
+    if (!BOOKABLE_DISPOSITIONS.has(disp)) continue;
+    const pid = lead.ProspectID || lead.prospectid || lead.CstID || lead.cst_id || prospectId;
+    const { source: lpSource, detail: lpSourceDetail } = extractLpSource(lead);
+    candidates.push({
+      ldsId: String(ldsId),
+      prospectId: pid ? String(pid) : (prospectId ? String(prospectId) : null),
+      disp,
+      lpSource,
+      lpSourceDetail,
+    });
+  }
+  return candidates.length ? candidates[0] : null;
+}
+
 function zip5(zip) {
   if (!zip) return '';
   const m = String(zip).match(/\d{5}/);
@@ -749,7 +781,23 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}, opts = {}) {
           lpSourceDetail: best.lpSourceDetail || null,
         };
       }
-      console.warn(`[LP-RESOLVE] Step 2: prospect ${webhookProspectId} has no lead with matching lognumber — falling through`);
+      // Step 2b — prospect-keyed link-trusted fallback. No lognumber match, but
+      // the prospect already has a bookable lead → UPDATE that existing lead's
+      // appointment instead of falling through to lead creation (which aliases a
+      // phantom second lead for a prospect that already has one).
+      const trusted = findBookableLeadForProspect(allLeads, webhookProspectId);
+      if (trusted) {
+        console.log(`[LP-RESOLVE] ✅ Step 2b prospect_link_trusted_bookable: lds_id=${trusted.ldsId}, prospect=${trusted.prospectId || webhookProspectId}, disp=${trusted.disp}`);
+        return {
+          ldsId: trusted.ldsId,
+          prospectId: trusted.prospectId || webhookProspectId,
+          source: 'prospect_link_trusted_bookable',
+          step: 2,
+          lpSource: trusted.lpSource || null,
+          lpSourceDetail: trusted.lpSourceDetail || null,
+        };
+      }
+      console.warn(`[LP-RESOLVE] Step 2: prospect ${webhookProspectId} has no lead with matching lognumber or bookable lead — falling through`);
     } catch (err) {
       if (err instanceof LpTimeoutError) sawTimeout = true;
       console.warn(`[LP-RESOLVE] Step 2 prospect+lognumber failed for ${webhookProspectId}: ${err.message}`);
@@ -1205,7 +1253,10 @@ async function syncAppointmentToLP({
   if (!apptTime) throw new Error(`Cannot parse appointment time: ${appointmentTime}`);
 
   // ── Durable idempotency short-circuit (see helper comment above) ──
-  const dedupKey = `${contactId}:${ldsId}:${normalizeDateForComparison(appointmentDate)}:${apptTime}`;
+  // 2026-06-24: key includes prospectId (person-level, stable) so retry/concurrent
+  // syncs for the same prospect+date+time collapse onto one SetAppointment even if
+  // they resolved via different lead paths.
+  const dedupKey = `${contactId}:${prospectId || 'noprospect'}:${ldsId}:${normalizeDateForComparison(appointmentDate)}:${apptTime}`;
   const existingMark = await findRecentApptSyncMark(dedupKey);
   if (existingMark) {
     console.log(`[LP-APPT] ⏭️ Duplicate appointment-sync suppressed for ${dedupKey} (marked ${existingMark.created_at}) — skipping SetAppointment, note, and GroupMe`);

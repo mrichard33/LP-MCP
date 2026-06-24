@@ -237,6 +237,20 @@ function buildAppointmentBody(payload, contactId) {
 }
 
 /**
+ * True when two appointment start times refer to the same instant. Both inputs
+ * are ISO strings (the existing object's from GHL, the requested one from
+ * buildAppointmentBody). Compared on epoch ms so equivalent offsets match. If
+ * either is unparseable, treat as NOT the same time (favor reschedule over a
+ * silent no-op on bad data).
+ */
+function sameStartTime(a, b) {
+  const am = a ? Date.parse(a) : NaN;
+  const bm = b ? Date.parse(b) : NaN;
+  if (Number.isNaN(am) || Number.isNaN(bm)) return false;
+  return am === bm;
+}
+
+/**
  * v3.4 — Double-book guard. Returns an already-existing active future
  * appointment on `calendarId` for the contact, or null. Reuses the live
  * appointment lookup. On lookup failure returns null (fail-open: we'd rather
@@ -262,23 +276,52 @@ export async function executeBookAppointment(action, context) {
 
   let { body, calendarId, startTime, endTime, title, status, ignoreFreeSlotValidation } = buildAppointmentBody(payload, contactId);
 
-  // v3.4: double-book guard. The executor reaps stuck actions and can re-run a
-  // book_appointment, and the model can emit a duplicate on a re-confirm. If an
-  // active future appointment already exists on this calendar, do NOT create a
-  // second one — return the existing as a no-op success. See BUILD HANDOFF §8.
+  // v3.4 / 2026-06-24: idempotent-booking guard. The executor reaps stuck
+  // actions and can re-run a book_appointment, and the model can emit a
+  // duplicate on a re-confirm. If an active future appointment already exists
+  // on this calendar, do NOT create a second object:
+  //   • same start_time  → true no-op, return the existing id (idempotent_skip).
+  //   • different time    → RESCHEDULE the existing object in place (PUT), so the
+  //                         contact never ends up with two objects on one calendar.
+  // Only when there is no active same-calendar appointment do we POST a new one.
   const existing = await findExistingAppointmentOnCalendar(contactId, calendarId);
   if (existing) {
-    console.log(`[ActionExecutor] ⏭️  Double-book guard: contact ${contactId} already has appointment ${existing.appointment_id} on calendar ${calendarId} (start=${existing.start_time}) — skipping create.`);
+    if (sameStartTime(existing.start_time, startTime)) {
+      console.log(`[ActionExecutor] ⏭️  idempotent_skip: contact ${contactId} already has appointment ${existing.appointment_id} on calendar ${calendarId} at the requested time (${existing.start_time}) — no-op.`);
+      await removeGHLTags(contactId, BOOKING_FLOW_TAGS).catch(() => {});
+      return {
+        action: 'appointment_book_skipped_existing',
+        appointment_id: existing.appointment_id,
+        calendar_id: calendarId,
+        calendar_name: existing.calendar_name || title,
+        contact_id: contactId,
+        start_time: existing.start_time,
+        status: existing.status,
+        skipped_reason: 'idempotent_skip',
+      };
+    }
+    // Different time on the same calendar → reschedule the existing object
+    // rather than creating a second one.
+    console.log(`[ActionExecutor] ♻️  Idempotent reschedule: contact ${contactId} has appointment ${existing.appointment_id} on calendar ${calendarId} at ${existing.start_time} → moving to ${startTime} (no new object).`);
+    await ghlFetch('PUT', `/calendars/events/appointments/${existing.appointment_id}`, {
+      calendarId,
+      startTime,
+      endTime,
+    });
     await removeGHLTags(contactId, BOOKING_FLOW_TAGS).catch(() => {});
+    if (payload.qualifying_data) {
+      await persistQualifyingData(contactId, payload.qualifying_data).catch(() => {});
+    }
     return {
-      action: 'appointment_book_skipped_existing',
+      action: 'appointment_rescheduled_existing',
       appointment_id: existing.appointment_id,
       calendar_id: calendarId,
       calendar_name: existing.calendar_name || title,
       contact_id: contactId,
-      start_time: existing.start_time,
+      start_time: startTime,
+      end_time: endTime,
+      previous_start_time: existing.start_time,
       status: existing.status,
-      skipped_reason: 'active_future_appointment_exists',
     };
   }
 
@@ -590,10 +633,12 @@ export async function executeRescheduleAppointment(action, context) {
   let bookStatus = bookPayload.status || 'new';
   let bookStartTime = null;
   let bookCalendarName = null;
+  let bookCalendarId = null;
   try {
     const built = buildAppointmentBody(bookPayload, contactId);
     bookStartTime = built.startTime;
     bookCalendarName = built.title;
+    bookCalendarId = built.calendarId;
     bookStatus = built.status;
     console.log(`[ActionExecutor] Reschedule step 1/2: booking new appointment FIRST, calendar=${built.calendarId}, start=${built.startTime}${built.ignoreFreeSlotValidation ? ', override_availability=true' : ''}`);
     const bookResult = await ghlFetch('POST', '/calendars/events/appointments', built.body);
@@ -640,6 +685,32 @@ export async function executeRescheduleAppointment(action, context) {
     // New appt is already booked, so the lead is NOT stranded. Surface the
     // stale old appointment for manual cleanup rather than failing the action.
     console.warn(`[ActionExecutor] ⚠️ New appt ${newAppointmentId} booked but cancelling old ${oldId} failed (lead not stranded): ${err.message}`);
+  }
+
+  // ─── Step 2b/2: collapse any stale duplicate on the target calendar ──
+  // Guarantee a reschedule never leaves a second active object on the new
+  // calendar. If old_appointment_id was stale/wrong (or there were already
+  // duplicates), the cancel above may have missed the real lingering object.
+  // Cancel any active appointment on the target calendar that is neither the
+  // appointment we just booked nor the old id we already handled. The
+  // reschedule-inflight marker set above keeps these cancels from tripping the
+  // customer-cancellation rules. Best-effort: lookup failure is non-fatal.
+  if (bookCalendarId) {
+    try {
+      const onCalendar = await fetchUpcomingAppointments(contactId);
+      const stale = (Array.isArray(onCalendar) ? onCalendar : [])
+        .filter(a => a.calendar_id === bookCalendarId
+          && a.appointment_id
+          && a.appointment_id !== newAppointmentId
+          && a.appointment_id !== oldId);
+      for (const dup of stale) {
+        console.log(`[ActionExecutor] ♻️ Reschedule cleanup: cancelling stale duplicate ${dup.appointment_id} on calendar ${bookCalendarId} for contact ${contactId}`);
+        await ghlFetch('PUT', `/calendars/events/appointments/${dup.appointment_id}`, { appointmentStatus: 'cancelled' })
+          .catch((e) => console.warn(`[ActionExecutor] reschedule cleanup cancel ${dup.appointment_id} failed: ${e.message}`));
+      }
+    } catch (err) {
+      console.warn(`[ActionExecutor] reschedule duplicate-collapse lookup failed for ${contactId} (non-fatal): ${err.message}`);
+    }
   }
 
   // ─── Optional: persist qualifying data on the contact ──────────────
