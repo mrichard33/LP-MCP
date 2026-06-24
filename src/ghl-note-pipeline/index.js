@@ -318,6 +318,7 @@ export async function processRow(id) {
     // No new inbound text (e.g. only a reaction) → done with NO note.
     if (!hasInbound) {
       const throughIso = (latestOverall || new Date()).toISOString();
+      console.log(`[GHLNote] process(${id}) no-inbound-text → done (no note)`);
       await markDone(id, throughIso, null, false, claimed);
       return;
     }
@@ -373,6 +374,7 @@ export async function processRow(id) {
       } else {
         // No prospect yet (created / ambiguous / unavailable / error) — defer
         // for a later sweep; alert at most once per outcome; fail at MAX_ATTEMPTS.
+        console.log(`[GHLNote] process(${id}) deferred — outcome=${roc.outcome} contact=${claimed.ghl_contact_id}`);
         await deferLead(id, claimed, attempts, roc.outcome, roc.detail);
         return;
       }
@@ -401,6 +403,7 @@ export async function processRow(id) {
       });
       await persistLead(id, ldsId);
       await markDone(id, throughIso, null, true, claimed, leadAction);
+      console.log(`[GHLNote] process(${id}) shadow — msgs=${windowed.length} important=${important} lead_action=${leadAction}`);
       return;
     }
 
@@ -414,6 +417,7 @@ export async function processRow(id) {
       .select();
     if (!guard || guard.length === 0) {
       // This session's note already written — mark done, no duplicate.
+      console.log(`[GHLNote] process(${id}) dedupe hit — note already written this session`);
       await persistLead(id, ldsId);
       await markDone(id, throughIso, null, false, claimed, leadAction);
       return;
@@ -438,6 +442,7 @@ export async function processRow(id) {
 
     await persistLead(id, ldsId);
     await markDone(id, throughIso, lpNoteId, true, claimed, leadAction);
+    console.log(`[GHLNote] process(${id}) live — note written lp_note_id=${lpNoteId} important=${important} prospect=${prospectId}`);
   } catch (err) {
     console.error(`[GHLNote] process(${id}) error: ${err.message}`);
     await markError(id, attempts, err.message).catch(() => {});
@@ -458,6 +463,9 @@ let sweepRunning = false;
 async function runSweep() {
   if (sweepRunning) return;
   sweepRunning = true;
+  const t0 = Date.now();
+  let processed = 0;
+  let errors = 0;
   try {
     const cutoff = cutoffIso(DEBOUNCE_MIN);
     const { data: rows, error } = await supabase
@@ -469,28 +477,40 @@ async function runSweep() {
       .order('last_inbound_at', { ascending: true })
       .limit(25);
     if (error) {
-      console.error(`[GHLNote] sweep query failed: ${error.message}`);
+      console.error(`[GHLNote:sweep] query failed: ${error.message}`);
       return;
     }
-    if (!rows?.length) return;
+    if (!rows?.length) {
+      console.log(`[GHLNote:sweep] 0 due rows (${Date.now() - t0}ms)`);
+      return;
+    }
     for (const r of rows) {
       // Sequential to respect the GHL rate limiter and LP circuit breaker.
-      await processRow(r.id).catch((e) => console.error(`[GHLNote] process ${r.id} failed: ${e.message}`));
+      try {
+        await processRow(r.id);
+        processed++;
+      } catch (e) {
+        errors++;
+        console.error(`[GHLNote:sweep] process ${r.id} failed: ${e.message}`);
+      }
     }
   } finally {
     sweepRunning = false;
+    if (processed > 0 || errors > 0) {
+      console.log(`[GHLNote:sweep] done: ${processed} processed, ${errors} errors (${Date.now() - t0}ms)`);
+    }
   }
 }
 
 export function startGhlNoteSweep() {
   if (MODE === 'off') {
-    console.log('[GHLNote] sweep disabled (GHL_NOTE_MODE=off)');
+    console.log('[GHLNote:sweep] disabled (GHL_NOTE_MODE=off)');
     return;
   }
-  const tick = () => runSweep().catch((e) => console.error(`[GHLNote] sweep tick error: ${e.message}`));
+  const tick = () => runSweep().catch((e) => console.error(`[GHLNote:sweep] tick error: ${e.message}`));
   setTimeout(tick, 30 * 1000);
   setInterval(tick, SWEEP_SEC * 1000);
-  console.log(`[GHLNote] sweep started — debounce ${DEBOUNCE_MIN}m, interval ${SWEEP_SEC}s`);
+  console.log(`[GHLNote:sweep] started — mode=${MODE} debounce=${DEBOUNCE_MIN}m interval=${SWEEP_SEC}s`);
 }
 
 // ─── Reconciliation ──────────────────────────────────────────────
@@ -498,15 +518,24 @@ let reconRunning = false;
 async function runReconciliation() {
   if (reconRunning) return;
   reconRunning = true;
+  const t0 = Date.now();
+  let reclaimed = 0;
+  let enqueued = 0;
+  let terminalMarked = 0;
   try {
     // A) Reclaim stale claims.
     const staleCutoff = cutoffIso(STALE_CLAIM_MIN);
-    await supabase
+    const { count: reclaimCount } = await supabase
       .from('ghl_conversation_pending')
       .update({ status: 'pending', claimed_at: null, last_error: 'stale_claim_reclaimed', updated_at: new Date().toISOString() })
       .eq('status', 'processing')
       .lt('claimed_at', staleCutoff)
-      .then(() => {}, (e) => console.warn(`[GHLNote] reclaim failed: ${e.message}`));
+      .select('id', { count: 'exact', head: true })
+      .then(
+        (res) => res,
+        (e) => { console.warn(`[GHLNote:recon] reclaim failed: ${e.message}`); return { count: 0 }; }
+      );
+    reclaimed = reclaimCount || 0;
 
     // B) Enqueue dropped webhooks from the HL messages cache (~2h lookback).
     try {
@@ -531,10 +560,11 @@ async function runReconciliation() {
             p_terminal: false,
             p_reason: null,
           });
+          enqueued++;
         }
       }
     } catch (err) {
-      console.warn(`[GHLNote] dropped-webhook reconcile failed: ${err.message}`);
+      console.warn(`[GHLNote:recon] dropped-webhook reconcile failed: ${err.message}`);
     }
 
     // C) Terminal appointment events.
@@ -543,16 +573,22 @@ async function runReconciliation() {
       for (const ev of events) {
         if (!ev.contact_id) continue;
         const reason = ev.event_type === 'appointment_cancelled' ? 'appointment_cancelled' : 'appointment_booked';
-        await supabase
+        const { count } = await supabase
           .from('ghl_conversation_pending')
           .update({ terminal: true, terminal_reason: reason, updated_at: new Date().toISOString() })
           .eq('ghl_contact_id', ev.contact_id)
           .in('status', ['pending', 'processing'])
-          .then(() => {}, () => {});
+          .select('id', { count: 'exact', head: true })
+          .then((res) => res, () => ({ count: 0 }));
+        terminalMarked += count || 0;
       }
     } catch (err) {
-      console.warn(`[GHLNote] appt-event reconcile failed: ${err.message}`);
+      console.warn(`[GHLNote:recon] appt-event reconcile failed: ${err.message}`);
     }
+
+    console.log(
+      `[GHLNote:recon] done: reclaimed=${reclaimed} enqueued=${enqueued} terminal_marked=${terminalMarked} (${Date.now() - t0}ms)`
+    );
   } finally {
     reconRunning = false;
   }
@@ -560,11 +596,11 @@ async function runReconciliation() {
 
 export function startGhlNoteReconciliation() {
   if (MODE === 'off') {
-    console.log('[GHLNote] reconciliation disabled (GHL_NOTE_MODE=off)');
+    console.log('[GHLNote:recon] disabled (GHL_NOTE_MODE=off)');
     return;
   }
-  const tick = () => runReconciliation().catch((e) => console.error(`[GHLNote] recon tick error: ${e.message}`));
+  const tick = () => runReconciliation().catch((e) => console.error(`[GHLNote:recon] tick error: ${e.message}`));
   setTimeout(tick, 120 * 1000);
   setInterval(tick, RECON_MIN * 60 * 1000);
-  console.log(`[GHLNote] reconciliation started — interval ${RECON_MIN}m, stale-claim ${STALE_CLAIM_MIN}m`);
+  console.log(`[GHLNote:recon] started — interval=${RECON_MIN}m stale-claim=${STALE_CLAIM_MIN}m`);
 }
