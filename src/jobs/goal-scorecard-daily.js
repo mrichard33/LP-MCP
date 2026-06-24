@@ -24,6 +24,10 @@ import { syncLogStart, syncLogComplete } from '../sync-log.js';
 import {
   computeActuals, SCORECARD_GETLEAD_OPTIONS, DEFAULT_MARKET,
 } from './scorecard-metrics.js';
+import {
+  resolveSellingCalendar, sellingDaysElapsed, sellingDaysInPeriod,
+  lastCompletedSellingDay, monthEnd,
+} from '../selling-days.js';
 
 const TIMEZONE = 'America/New_York';
 
@@ -61,6 +65,11 @@ const RECONCILED_MARKETS = new Set(
     .split(',').map((s) => s.trim()).filter(Boolean),
 );
 
+// Selling-day calendar (Mon–Sat minus Reece closures). Drives the as-of anchor,
+// the selling-day elapsed count, and the working-days-in-period denominator so
+// the read layer prorates the goal on a consistent selling-day basis.
+const SELLING_CAL = resolveSellingCalendar();
+
 /** Today's ET calendar date as YYYY-MM-DD. */
 function todayET() {
   return new Intl.DateTimeFormat('en-CA', {
@@ -71,12 +80,6 @@ function todayET() {
 /** First-of-month for an ET YYYY-MM-DD date. */
 function monthStart(etDate) {
   return `${etDate.slice(0, 7)}-01`;
-}
-
-/** Inclusive calendar-day count between two YYYY-MM-DD dates. */
-function daysBetween(start, end) {
-  const ms = new Date(`${end}T00:00:00Z`) - new Date(`${start}T00:00:00Z`);
-  return Math.floor(ms / 86400000) + 1;
 }
 
 /** The ET calendar day after a YYYY-MM-DD date (UTC-safe). */
@@ -140,10 +143,17 @@ async function fetchAllProspects(periodStart, periodEnd) {
  */
 export async function computeGoalScorecard(opts = {}) {
   const startedAt = Date.now();
-  const periodEnd = opts.period_end || opts.date || todayET();
+  // Default (cron) path anchors the snapshot to the last COMPLETED selling day —
+  // today is in progress, so including it would distort pace/goal math. Explicit
+  // period_end/date (backfill, tie-out) pass through verbatim.
+  const periodEnd = opts.period_end || opts.date || lastCompletedSellingDay(todayET(), SELLING_CAL);
   const periodStart = opts.period_start || monthStart(periodEnd);
   const asOfDate = periodEnd;
-  const daysElapsed = daysBetween(periodStart, periodEnd);
+  // Selling days (not calendar days) on a consistent basis for numerator and
+  // denominator: elapsed = selling days [periodStart, asOf]; working-days =
+  // selling days across the FULL month so the read layer can prorate the goal.
+  const daysElapsed = sellingDaysElapsed(periodStart, periodEnd, SELLING_CAL);
+  const workingDaysInPeriod = sellingDaysInPeriod(periodStart, monthEnd(periodStart), SELLING_CAL);
   const fetchStart = minusDays(periodStart, PULL_LOOKBACK_DAYS);
 
   console.log(`[Scorecard] start cohort=${periodStart}..${periodEnd} fetch=${fetchStart}..${periodEnd} (lookback ${PULL_LOOKBACK_DAYS}d) options=${SCORECARD_GETLEAD_OPTIONS}`);
@@ -190,6 +200,7 @@ export async function computeGoalScorecard(opts = {}) {
       period_start: periodStart,
       period_end: periodEnd,
       days_elapsed: daysElapsed,
+      working_days_in_period: workingDaysInPeriod,
       ...metrics,
       raw_leads_in: rawLeadsIn,
       computed_from: 'lp_api',
