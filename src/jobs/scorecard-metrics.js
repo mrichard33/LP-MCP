@@ -144,6 +144,19 @@ function makeAcc() {
     statusDollarTally: {}, // per status → sold-lead $ (calibration: which statuses hold the working/released $)
     nonDemoTally: {},  // disposition code → sits dropped from demos (tie-out aid)
     openQuotesSample: [], // sample of SOLD leads carrying open-quote $ (pre-firm status) — diagnoses "Quoted on a sold lead"
+    // Issue-count tie-out diagnostics (read-only): candidate "issued" definitions so we
+    // can see which reconstructs the official report's gross Issue. headline `issued`
+    // is unchanged by these.
+    issueDiag: {
+      issued_flag: 0,       // current headline: issued || Issued || everissued
+      issued_only: 0,       // issued || Issued (no everissued)
+      everissued: 0,        // everissued only
+      sat: 0, sold: 0, has_job: 0,
+      issued_or_progressed: 0,  // issued_flag || sat || sold
+      issued_or_job: 0,         // issued_flag || hasJob
+      issued_union: 0,          // issued_flag || sat || sold || hasJob
+      dispo_issued_plus: 0,     // disposition stage rank ≥ Issued
+    },
   };
 }
 
@@ -185,6 +198,28 @@ function accumulateLead(acc, lead) {
   // A deal "cancelled" when it has job(s) and none survived the cancel set.
   const cancelled = hasJob && hasCancel && leadNet === 0;
 
+  // ── Issue-count tie-out diagnostics (read-only; headline `issued` unchanged) ──
+  // The report's "Issue" runs ~13% above our flag-based count, concentrated in
+  // cancelled deals — so tally each candidate definition to see which ties out.
+  {
+    const issuedField = (() => { const v = getField(lead, 'issued', 'Issued'); return v === true || v === 'true'; })();
+    const everIssued = (() => { const v = getField(lead, 'everissued', 'everIssued', 'EverIssued'); return v === true || v === 'true'; })();
+    const dispo = String(getField(lead, 'disposition', 'Disposition') || '').trim().toLowerCase();
+    const DISPO_RANK = { data: 1, set: 2, verified: 3, confirmed: 4, issued: 5, sat: 6, sold: 7 };
+    const dispoIssuedPlus = (DISPO_RANK[dispo] || 0) >= 5;
+    const d = acc.issueDiag;
+    if (isIssued) d.issued_flag += 1;
+    if (issuedField) d.issued_only += 1;
+    if (everIssued) d.everissued += 1;
+    if (isSat) d.sat += 1;
+    if (isSold) d.sold += 1;
+    if (hasJob) d.has_job += 1;
+    if (isIssued || isSat || isSold) d.issued_or_progressed += 1;
+    if (isIssued || hasJob) d.issued_or_job += 1;
+    if (isIssued || isSat || isSold || hasJob) d.issued_union += 1;
+    if (dispoIssuedPlus) d.dispo_issued_plus += 1;
+  }
+
   if (isSet) acc.sets += 1;
   if (isIssued) { acc.issued += 1; if (!cancelled) acc.net_issue += 1; }   // ⚠ TIE-OUT (no LP net-issue flag)
   if (isDemo) acc.demos += 1;
@@ -217,7 +252,7 @@ function finalizeActuals(acc, { periodStart, periodEnd }, extra = {}) {
   const {
     leads, sets, issued, net_issue, demos, sold, net_close, ko_count, gross_sales,
     released_dollars, working_dollars, other_pending, statusTally, statusDollarTally,
-    nonDemoTally, openQuotesSample,
+    nonDemoTally, openQuotesSample, issueDiag,
   } = acc;
 
   // Four mutually-exclusive sold-$ buckets: Released, Working (sold but held),
@@ -267,6 +302,7 @@ function finalizeActuals(acc, { periodStart, periodEnd }, extra = {}) {
       pending_basis: 'working_only',     // Pending Revenue = Working; open quotes shown separately
       suspect_sold_sample: openQuotesSample, // sold leads with pre-firm $ (diagnose "Quoted on sold")
       non_demo_tally: nonDemoTally,
+      issue_diag: issueDiag,             // candidate "issued" definitions (Issue tie-out)
       tie_out: ['net_issue', 'net_close', 'net_sales', 'released_dollars',
                 'working_dollars', 'gross_sales', 'cancel_statuses'],
     },
