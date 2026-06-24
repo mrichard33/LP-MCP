@@ -826,6 +826,163 @@ async function lpLeadUpdateGhlContactHandler(req, res) {
   });
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// LP INBOUND REAL-TIME CACHE REFRESH
+// ═══════════════════════════════════════════════════════════════════
+//
+// POST /webhook/lp-lead-refresh
+//
+// Real-time freshness layer for lp_leads. The GHL "LP Inbound Webhook"
+// workflow (7f24f79d) fires on every LP disposition change. Today that
+// path only routes dispositions inside GHL — nothing writes to Supabase,
+// so lp_leads only refreshes on the next LP polling cycle. This endpoint
+// closes that gap: it takes the LP lead id off the inbound payload,
+// fetches the fresh prospect from LP via /api/Customers/GetLead, and runs
+// the SAME canonical writer the poller uses (processProspect) to upsert
+// lp_leads + emit lp.disposition_changed.
+//
+// DESIGN
+//   - Single writer: reuses processProspect() from sync-leads.js → the
+//     real-time path and the polling path write byte-identical rows and
+//     cannot drift.
+//   - Fire-and-forget: returns 200 immediately; work runs in setImmediate
+//     so the GHL workflow never blocks on LP latency.
+//   - Best-effort fast: LP fast path (12s, single attempt). If LP is slow,
+//     the next polling cycle is the guaranteed catch-up (three-layer
+//     bounded-staleness contract).
+//   - Idempotent: processProspect's upsert + the disposition event's
+//     idempotency key collapse GHL webhook retries and any poll/webhook
+//     race to exactly one row state + one event.
+//   - Feature-flagged: dark unless ENABLE_LP_INBOUND_REFRESH === 'true'.
+//   - Optional shared secret: if LP_INBOUND_REFRESH_KEY is set, the request
+//     must carry ?key=<value> (or x-refresh-key header); if unset, open
+//     mode (consistent with sibling GHL webhooks).
+//   - GHL-load lever: LP_INBOUND_REFRESH_SKIP_GHL=true runs processProspect
+//     with { skipGHL:true } (cache + disposition event only, no GHL
+//     matching/tagging) to relieve the GHL rate limiter; poller keeps tag
+//     hygiene current.
+//
+// PAYLOAD (from GHL standard outbound Webhook step):
+//   { "lead_id": "{{inboundWebhookRequest.lead_id}}",
+//     "prospect_id": "{{inboundWebhookRequest.prospect_number}}",
+//     "ghl_contact_id": "{{contact.id}}" }   // ghl_contact_id optional
+//
+// RESPONSE: always 200 { received:true, processing:'async' }, except
+//   503 when the flag is off, or 401 when the secret check fails.
+// In-memory burst dedup — collapses duplicate fires for the same lead in
+// a short window. Best-effort only (resets on redeploy); the upsert + event
+// idempotency are the real correctness guarantees.
+const _lpRefreshRecent = new Map(); // dedupKey -> ts(ms)
+const _LP_REFRESH_DEDUP_MS = parseInt(process.env.LP_INBOUND_REFRESH_DEDUP_MS || '8000', 10);
+
+async function lpLeadRefreshHandler(req, res) {
+  // ─── Feature flag ───────────────────────────────────────────────
+  if (String(process.env.ENABLE_LP_INBOUND_REFRESH || '').toLowerCase() !== 'true') {
+    return res.status(503).json({ ok: false, error: 'lp_inbound_refresh_disabled' });
+  }
+
+  // ─── Optional shared secret ─────────────────────────────────────
+  const requiredKey = process.env.LP_INBOUND_REFRESH_KEY || '';
+  if (requiredKey) {
+    const provided = String(req.query?.key || req.headers['x-refresh-key'] || '').trim();
+    if (provided !== requiredKey) {
+      console.warn('[LP Inbound Refresh] rejected: bad/missing key');
+      return res.status(401).json({ ok: false, error: 'invalid_key' });
+    }
+  }
+
+  const src = { ...(req.query || {}), ...(req.body || {}) };
+  const leadId = String(src.lead_id || src.leadId || src.lds_id || src.ldsId || '').trim();
+  const prospectId = String(
+    src.prospect_id || src.prospectId || src.prospect_number || src.prospectNumber ||
+    src.cst_id || src.cstId || ''
+  ).trim();
+  const payloadGhlContactId = String(
+    src.ghl_contact_id || src.ghlContactId || src.contact_id || src.contactId || ''
+  ).trim();
+
+  if (!leadId && !prospectId) {
+    return res.status(400).json({ ok: false, error: 'lead_id_or_prospect_id_required' });
+  }
+
+  // ─── Respond 200 immediately ────────────────────────────────────
+  res.json({ received: true, lead_id: leadId || null, prospect_id: prospectId || null, processing: 'async' });
+
+  // ─── Burst dedup (best-effort) ──────────────────────────────────
+  const dedupKey = leadId || `cst:${prospectId}`;
+  const now = Date.now();
+  const last = _lpRefreshRecent.get(dedupKey);
+  if (last && (now - last) < _LP_REFRESH_DEDUP_MS) {
+    console.log(`[LP Inbound Refresh] skip duplicate within ${_LP_REFRESH_DEDUP_MS}ms: ${dedupKey}`);
+    return;
+  }
+  _lpRefreshRecent.set(dedupKey, now);
+  if (_lpRefreshRecent.size > 5000) { // opportunistic cleanup — never grow unbounded
+    for (const [k, ts] of _lpRefreshRecent) {
+      if (now - ts > _LP_REFRESH_DEDUP_MS) _lpRefreshRecent.delete(k);
+    }
+  }
+
+  // ─── Async work (after response sent) ───────────────────────────
+  setImmediate(async () => {
+    const t0 = Date.now();
+    try {
+      const { getLeadByLdsId, getLead } = await import('./lp-client.js');
+      const { processProspect } = await import('./sync-leads.js');
+
+      // /api/Customers/GetLead returns FULL prospect data (nested leads) —
+      // the exact shape processProspect expects. Prefer lds_id (the inbound
+      // webhook always carries it); fall back to cst_id.
+      let resp = null;
+      if (leadId) {
+        resp = await getLeadByLdsId(leadId, { fast: true });
+      } else {
+        resp = await getLead(prospectId);
+      }
+
+      const items = Array.isArray(resp)
+        ? resp
+        : (resp?.data || resp?.leads || resp?.results || resp?.items || []);
+      const prospect = items[0] || null;
+
+      if (!prospect) {
+        console.warn(`[LP Inbound Refresh] no LP prospect for lead_id=${leadId || '-'} prospect_id=${prospectId || '-'} — leaving to next poll`);
+        return;
+      }
+
+      // Canonical writer: upserts lp_leads, emits lp.disposition_changed,
+      // syncs children, manages entry/active-entry tags, Day-15 check.
+      const skipGhl = String(process.env.LP_INBOUND_REFRESH_SKIP_GHL || '').toLowerCase() === 'true';
+      await processProspect(prospect, { skipGHL: skipGhl });
+
+      // Optional link backfill: if processProspect could not resolve a link
+      // (no valid lognumber + no phone/email match) and GHL handed us the
+      // contact id, stamp it so the row isn't dark. Only when we keyed by
+      // lds_id (a cst_id can map to multiple leads → ambiguous).
+      if (payloadGhlContactId && leadId) {
+        const { data: row } = await supabase
+          .from('lp_leads')
+          .select('ghl_contact_id')
+          .eq('lp_lead_id', leadId)
+          .maybeSingle();
+        if (row && !row.ghl_contact_id) {
+          await supabase
+            .from('lp_leads')
+            .update({ ghl_contact_id: payloadGhlContactId })
+            .eq('lp_lead_id', leadId);
+          console.log(`[LP Inbound Refresh] backfilled ghl_contact_id=${payloadGhlContactId} for lead_id=${leadId}`);
+        }
+      }
+
+      console.log(`[LP Inbound Refresh] ✅ refreshed lead_id=${leadId || '-'} prospect_id=${prospectId || '-'} skipGHL=${skipGhl} in ${Date.now() - t0}ms`);
+    } catch (err) {
+      // Best-effort: a failure here is covered by the next polling cycle.
+      const isTimeout = err?.code === 'LP_TIMEOUT' || err?.name === 'LpTimeoutError';
+      console.error(`[LP Inbound Refresh] ${isTimeout ? 'LP timeout' : 'error'} lead_id=${leadId || '-'}: ${err.message} — next poll will catch up`);
+    }
+  });
+}
+
 export function registerRestApiRoutes(app, authenticate) {
 
   // ═══════════════════════════════════════════════════════════════
@@ -941,6 +1098,15 @@ export function registerRestApiRoutes(app, authenticate) {
   });
 
   console.log('[Webhook] Registered: POST /webhook/ghl-event');
+
+  // ═══════════════════════════════════════════════════════════════
+  // POST /webhook/lp-lead-refresh — real-time lp_leads cache refresh
+  // ═══════════════════════════════════════════════════════════════
+  // No auth middleware (optional shared secret enforced inside the handler).
+  // Fired by GHL workflow 7f24f79d (LP Inbound Webhook) on every disposition
+  // change. Feature-flagged via ENABLE_LP_INBOUND_REFRESH (503 when off).
+  app.post('/webhook/lp-lead-refresh', lpLeadRefreshHandler);
+  console.log('[REST API] Registered: POST /webhook/lp-lead-refresh (no-auth, flag-gated, real-time lp_leads refresh)');
 
   // ═══════════════════════════════════════════════════════════════
   // /api/service-area/lookup — Zip → Market routing for HDL.2
