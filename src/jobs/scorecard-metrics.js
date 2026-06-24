@@ -133,76 +133,74 @@ function money(numerator, denominator) {
   return Math.round(numerator / denominator);
 }
 
-/**
- * Compute one market's actuals from LP prospect records, By Appt Date.
- *
- * @param {object[]} prospects   GetLead prospect records (each with nested .leads[])
- * @param {object}   window      { periodStart:'YYYY-MM-DD', periodEnd:'YYYY-MM-DD' }
- * @returns {object} actuals row (sans market/as_of_date/period — caller adds those)
- */
-export function computeActuals(prospects, { periodStart, periodEnd }) {
-  let leads = 0, sets = 0, issued = 0, net_issue = 0, demos = 0, sold = 0, net_close = 0;
-  let ko_count = 0, gross_sales = 0;
-  // Three-bucket split of surviving (non-cancelled) sold $: released to production,
-  // sold-but-held (working), and any other in-flight non-cancel status.
-  let released_dollars = 0, working_dollars = 0, other_pending = 0;
-  const statusTally = {};        // every job status seen → count (tie-out aid)
-  const nonDemoTally = {};       // disposition code → sits dropped from demos (tie-out aid)
+/** A fresh accumulator for one group's funnel counters. */
+function makeAcc() {
+  return {
+    leads: 0, sets: 0, issued: 0, net_issue: 0, demos: 0, sold: 0, net_close: 0,
+    ko_count: 0, gross_sales: 0,
+    // Three-bucket split of surviving (non-cancelled) sold $.
+    released_dollars: 0, working_dollars: 0, other_pending: 0,
+    statusTally: {},   // every job status seen → count (tie-out aid)
+    nonDemoTally: {},  // disposition code → sits dropped from demos (tie-out aid)
+  };
+}
 
-  for (const prospect of prospects || []) {
-    const leadList = getField(prospect, 'leads', 'Leads') || [];
-    for (const lead of leadList) {
-      // Cohort key: APPOINTMENT date (ET calendar day) within the window.
-      const apptDate = etDateOf(lpDateToEastern(getField(lead, ...SCORECARD_FIELD_MAP.appt_date)));
-      if (!apptDate || apptDate < periodStart || apptDate > periodEnd) continue;
+/** Fold one cohort lead's funnel contribution into an accumulator (mutates acc). */
+function accumulateLead(acc, lead) {
+  acc.leads += 1;
+  const isSet = flag(lead, 'set');
+  const isIssued = flag(lead, 'issued');
+  // NOC/NIS are sits (LP Sat=true) that should not count as demos for Reece
+  // metrics; tally the excluding code so Mark can tie out the haircut.
+  const isSat = flag(lead, 'sat');
+  const nonDemoCode = isSat ? nonDemoDispositionCode(lead) : null;
+  if (nonDemoCode) acc.nonDemoTally[nonDemoCode] = (acc.nonDemoTally[nonDemoCode] || 0) + 1;
+  const isDemo = isSat && !nonDemoCode;
+  const isSold = flag(lead, 'sold');
 
-      leads += 1;
-      const isSet = flag(lead, 'set');
-      const isIssued = flag(lead, 'issued');
-      // NOC/NIS are sits (LP Sat=true) that should not count as demos for Reece
-      // metrics; tally the excluding code so Mark can tie out the haircut.
-      const isSat = flag(lead, 'sat');
-      const nonDemoCode = isSat ? nonDemoDispositionCode(lead) : null;
-      if (nonDemoCode) nonDemoTally[nonDemoCode] = (nonDemoTally[nonDemoCode] || 0) + 1;
-      const isDemo = isSat && !nonDemoCode;
-      const isSold = flag(lead, 'sold');
-
-      // Roll up this lead's jobs → gross $, surviving (non-cancelled) $, cancel flag,
-      // and the released/working/other split of the surviving $.
-      let leadGross = 0, leadNet = 0, hasJob = false, hasCancel = false;
-      let leadReleased = 0, leadWorking = 0, leadOther = 0;
-      const jobs = getField(lead, 'jobs', 'Jobs') || [];
-      for (const job of jobs) {
-        const status = String(getField(job, ...SCORECARD_FIELD_MAP.job_status) || '').trim();
-        const value = num(getField(job, ...SCORECARD_FIELD_MAP.job_value));
-        statusTally[status || '(blank)'] = (statusTally[status || '(blank)'] || 0) + 1;
-        hasJob = true;
-        leadGross += value;
-        const lower = status.toLowerCase();
-        if (CANCEL_SET.has(lower)) { ko_count += 1; hasCancel = true; }
-        else {
-          leadNet += value;
-          if (RELEASED_SET.has(lower)) leadReleased += value;
-          else if (WORKING_SET.has(lower)) leadWorking += value;
-          else leadOther += value;     // in-flight, not yet released
-        }
-      }
-      // A deal "cancelled" when it has job(s) and none survived the cancel set.
-      const cancelled = hasJob && hasCancel && leadNet === 0;
-
-      if (isSet) sets += 1;
-      if (isIssued) { issued += 1; if (!cancelled) net_issue += 1; }   // ⚠ TIE-OUT (no LP net-issue flag)
-      if (isDemo) demos += 1;
-      if (isSold) {
-        sold += 1;
-        gross_sales += leadGross;        // Gross Sale $ (incl. cancellations)
-        released_dollars += leadReleased; // released to production = Net Sales
-        working_dollars  += leadWorking;  // sold but held
-        other_pending    += leadOther;    // other in-flight, not yet released
-        if (!cancelled) net_close += 1;  // # Net Close (released or working both "stuck")
-      }
+  // Roll up this lead's jobs → gross $, surviving (non-cancelled) $, cancel flag,
+  // and the released/working/other split of the surviving $.
+  let leadGross = 0, leadNet = 0, hasJob = false, hasCancel = false;
+  let leadReleased = 0, leadWorking = 0, leadOther = 0;
+  const jobs = getField(lead, 'jobs', 'Jobs') || [];
+  for (const job of jobs) {
+    const status = String(getField(job, ...SCORECARD_FIELD_MAP.job_status) || '').trim();
+    const value = num(getField(job, ...SCORECARD_FIELD_MAP.job_value));
+    acc.statusTally[status || '(blank)'] = (acc.statusTally[status || '(blank)'] || 0) + 1;
+    hasJob = true;
+    leadGross += value;
+    const lower = status.toLowerCase();
+    if (CANCEL_SET.has(lower)) { acc.ko_count += 1; hasCancel = true; }
+    else {
+      leadNet += value;
+      if (RELEASED_SET.has(lower)) leadReleased += value;
+      else if (WORKING_SET.has(lower)) leadWorking += value;
+      else leadOther += value;     // in-flight, not yet released
     }
   }
+  // A deal "cancelled" when it has job(s) and none survived the cancel set.
+  const cancelled = hasJob && hasCancel && leadNet === 0;
+
+  if (isSet) acc.sets += 1;
+  if (isIssued) { acc.issued += 1; if (!cancelled) acc.net_issue += 1; }   // ⚠ TIE-OUT (no LP net-issue flag)
+  if (isDemo) acc.demos += 1;
+  if (isSold) {
+    acc.sold += 1;
+    acc.gross_sales += leadGross;         // Gross Sale $ (incl. cancellations)
+    acc.released_dollars += leadReleased; // released to production = Net Sales
+    acc.working_dollars  += leadWorking;  // sold but held
+    acc.other_pending    += leadOther;    // other in-flight, not yet released
+    if (!cancelled) acc.net_close += 1;   // # Net Close (released or working both "stuck")
+  }
+}
+
+/** Build the public actuals row from an accumulator. `extra` is merged in first
+ *  (e.g. group key fields like {source, sub_source} for per-source rows). */
+function finalizeActuals(acc, { periodStart, periodEnd }, extra = {}) {
+  const {
+    leads, sets, issued, net_issue, demos, sold, net_close, ko_count, gross_sales,
+    released_dollars, working_dollars, other_pending, statusTally, nonDemoTally,
+  } = acc;
 
   // Net Sales = released to production. Working Revenue = sold but held.
   // pending_total = everything sold, not cancelled, not yet released.
@@ -211,6 +209,7 @@ export function computeActuals(prospects, { periodStart, periodEnd }) {
   const cancelled_dollars = Math.round(gross_sales - (released_dollars + working_dollars + other_pending));
 
   return {
+    ...extra,
     leads, sets, issued, net_issue, demos, sales: sold, net_close, ko_count,
     gross_sales, net_sales,
     good_business: net_sales,            // spec alias: Net Sales = finalized (released)
@@ -243,4 +242,46 @@ export function computeActuals(prospects, { periodStart, periodEnd }) {
                 'working_dollars', 'gross_sales', 'cancel_statuses'],
     },
   };
+}
+
+/**
+ * Compute actuals from LP prospect records, By Appt Date.
+ *
+ * @param {object[]} prospects   GetLead prospect records (each with nested .leads[])
+ * @param {object}   opts        { periodStart, periodEnd, groupBy? }
+ * @param {string[]} [opts.groupBy]  e.g. ['source','sub_source'] → returns an ARRAY
+ *                                    of per-group rows (each carrying its key fields).
+ *                                    Omit for a single aggregate object (unchanged).
+ * @returns {object|object[]} aggregate actuals row, or per-group rows when groupBy set.
+ */
+export function computeActuals(prospects, { periodStart, periodEnd, groupBy } = {}) {
+  const grouped = Array.isArray(groupBy) && groupBy.length > 0;
+  const global = makeAcc();
+  const groups = grouped ? new Map() : null;   // key → { fields, acc }
+
+  for (const prospect of prospects || []) {
+    const leadList = getField(prospect, 'leads', 'Leads') || [];
+    for (const lead of leadList) {
+      // Cohort key: APPOINTMENT date (ET calendar day) within the window.
+      const apptDate = etDateOf(lpDateToEastern(getField(lead, ...SCORECARD_FIELD_MAP.appt_date)));
+      if (!apptDate || apptDate < periodStart || apptDate > periodEnd) continue;
+
+      accumulateLead(global, lead);
+
+      if (groups) {
+        const fields = {};
+        for (const f of groupBy) {
+          const v = getField(lead, ...(SCORECARD_FIELD_MAP[f] || [f]));
+          fields[f] = v == null || v === '' ? null : v;
+        }
+        const key = groupBy.map((f) => String(fields[f] ?? '')).join('');
+        let entry = groups.get(key);
+        if (!entry) { entry = { fields, acc: makeAcc() }; groups.set(key, entry); }
+        accumulateLead(entry.acc, lead);
+      }
+    }
+  }
+
+  if (!groups) return finalizeActuals(global, { periodStart, periodEnd });
+  return [...groups.values()].map((e) => finalizeActuals(e.acc, { periodStart, periodEnd }, e.fields));
 }
