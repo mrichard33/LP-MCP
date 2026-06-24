@@ -14,7 +14,7 @@
 
 import supabase from '../supabase.js';
 import { sendGroupMeMessage } from '../groupme.js';
-import { resolveLPLeadId } from '../lp-appointment-sync.js';
+import { getGHLContact } from '../ghl.js';
 import {
   resolveConversationId,
   getConversationMessages,
@@ -24,6 +24,7 @@ import {
 } from './hl-read.js';
 import { summarizeConversation } from './summarizer.js';
 import { writeLpNote } from './lp-write.js';
+import { classifyMatch, resolveOrCreateLpLead } from './resolve-or-create.js';
 
 // ─── Config ──────────────────────────────────────────────────────
 const MODE = (process.env.GHL_NOTE_MODE || 'shadow').toLowerCase(); // off | shadow | live
@@ -176,7 +177,8 @@ async function gatherSignals(ghlContactId) {
 }
 
 // ─── Mark helpers ────────────────────────────────────────────────
-async function markDone(id, throughIso, noteId, incrementNote, claimedRow) {
+async function markDone(id, throughIso, noteId, incrementNote, claimedRow, leadAction = null) {
+  const nowIso = new Date().toISOString();
   await supabase
     .from('ghl_conversation_pending')
     .update({
@@ -186,9 +188,57 @@ async function markDone(id, throughIso, noteId, incrementNote, claimedRow) {
       notes_written: (claimedRow.notes_written || 0) + (incrementNote ? 1 : 0),
       claimed_at: null,
       last_error: null,
-      updated_at: new Date().toISOString(),
+      lead_action: leadAction,
+      lead_action_at: leadAction ? nowIso : null,
+      updated_at: nowIso,
     })
     .eq('id', id);
+}
+
+// Maps a read-only classifyMatch() outcome to a shadow-log label.
+function classifyLabel(cls) {
+  switch (cls?.outcome) {
+    case 'resolved': return 'resolved';
+    case 'match_single': return `would_link:${cls.prospectId}`;
+    case 'ambiguous': return `would_ambiguous:${(cls.candidates || []).join('|')}`;
+    case 'lp_unavailable': return 'lp_unavailable';
+    case 'no_match': return 'would_create';
+    default: return 'unknown';
+  }
+}
+
+// Defer a row that has no LP prospect yet (lead created/ambiguous/unavailable).
+// Leaves it pending for a later sweep; alerts at most once per outcome; gives up
+// (→ failed) once attempts reach MAX_ATTEMPTS so permanently-stuck rows (e.g. an
+// un-creatable lead missing its address) stop looping.
+async function deferLead(id, claimedRow, attempts, outcome, detail) {
+  const failed = attempts >= MAX_ATTEMPTS;
+  const nowIso = new Date().toISOString();
+  await supabase
+    .from('ghl_conversation_pending')
+    .update({
+      status: failed ? 'failed' : 'pending',
+      claimed_at: null,
+      last_error: outcome,
+      lead_action: outcome,
+      lead_action_at: nowIso,
+      updated_at: nowIso,
+    })
+    .eq('id', id);
+
+  // created_deferred / lp_unavailable self-resolve, so they only alert if they
+  // exhaust retries. ambiguous / missing-fields alert once (deduped on the
+  // prior last_error), and anything alerts on final give-up.
+  const alertable = outcome === 'ambiguous_deferred' || outcome === 'missing_fields_deferred';
+  const firstTimeForOutcome = claimedRow.last_error !== outcome;
+  if (failed || (alertable && firstTimeForOutcome)) {
+    const verb = failed ? `gave up after ${attempts} attempts` : 'deferred';
+    sendGroupMeMessage(
+      `⚠️ GHL→LP lead ${verb} · row=${id} · contact=${claimedRow.ghl_contact_id} · ${outcome}` +
+        (detail ? ` · ${detail}` : ''),
+      { flushNow: true }
+    ).catch((e) => console.warn(`[GHLNote] defer alert send failed: ${e.message}`));
+  }
 }
 
 async function markError(id, attempts, message) {
@@ -276,30 +326,65 @@ export async function processRow(id) {
     const throughIso = throughDate.toISOString();
     const dedupeKey = `${claimed.ghl_conversation_id}:${throughDate.getTime()}`;
 
-    // Resolve LP prospect + gather signals + appointment state.
-    let prospectId = null;
-    let ldsId = null;
-    try {
-      const resolved = await resolveLPLeadId(claimed.ghl_contact_id, {}, { fast: true });
-      prospectId = resolved?.prospectId || null;
-      ldsId = resolved?.ldsId || null;
-    } catch (err) {
-      console.warn(`[GHLNote] LP resolve failed for ${claimed.ghl_contact_id}: ${err.message}`);
-    }
-
+    // Gather signals + appointment state (independent of LP resolution).
     const [signals, apptState] = await Promise.all([
       gatherSignals(claimed.ghl_contact_id),
       getApptStateFromLeadEvents(claimed.ghl_contact_id),
     ]);
 
-    // Summarize.
+    // Fetch the GHL contact once — phone/email feed resolve/search, and the
+    // create handler reuses it. Null is tolerated downstream.
+    let ghlContact = null;
+    try {
+      ghlContact = await getGHLContact(claimed.ghl_contact_id);
+    } catch (err) {
+      console.warn(`[GHLNote] GHL contact fetch failed for ${claimed.ghl_contact_id}: ${err.message}`);
+    }
+
+    // Resolve the LP prospect to attach the note to. If none is already linked,
+    // search → link an existing match → or create a new lead (live only).
+    let prospectId = null;
+    let ldsId = null;
+    let leadAction = null;
+
+    if (MODE === 'shadow') {
+      // Read-only: classify what we WOULD do; never touch the CRM.
+      try {
+        const cls = await classifyMatch({ ghlContactId: claimed.ghl_contact_id, ghlContact });
+        leadAction = classifyLabel(cls);
+        if (cls.outcome === 'resolved') {
+          prospectId = cls.prospectId;
+          ldsId = cls.ldsId || null;
+        }
+      } catch (err) {
+        leadAction = 'classify_error';
+        console.warn(`[GHLNote] shadow classify failed for ${claimed.ghl_contact_id}: ${err.message}`);
+      }
+    } else {
+      // MODE === 'live' — resolve / link / create.
+      const roc = await resolveOrCreateLpLead({
+        ghlContactId: claimed.ghl_contact_id,
+        ghlContact,
+      });
+      leadAction = roc.outcome;
+      if ((roc.outcome === 'resolved' || roc.outcome === 'linked') && roc.prospectId) {
+        prospectId = roc.prospectId;
+        ldsId = roc.ldsId || null;
+      } else {
+        // No prospect yet (created / ambiguous / unavailable / error) — defer
+        // for a later sweep; alert at most once per outcome; fail at MAX_ATTEMPTS.
+        await deferLead(id, claimed, attempts, roc.outcome, roc.detail);
+        return;
+      }
+    }
+
+    // Summarize (shadow always; live only once a prospect exists).
     const { note, important } = await summarizeConversation({
       messages: windowed,
       signals,
       apptState,
       nowText: nowNyText(),
     });
-
     const channelTypes = [...new Set(windowed.map((m) => m.type))];
 
     // ── Mode branch ──
@@ -312,24 +397,14 @@ export async function processRow(id) {
         important,
         channel_types: channelTypes,
         message_count: windowed.length,
+        lead_action: leadAction,
       });
       await persistLead(id, ldsId);
-      await markDone(id, throughIso, null, true, claimed);
+      await markDone(id, throughIso, null, true, claimed, leadAction);
       return;
     }
 
-    // MODE === 'live'
-    if (!prospectId) {
-      // Cannot attach without a prospect — record and stop (no retry storm).
-      await markDone(id, throughIso, null, false, claimed);
-      await supabase
-        .from('ghl_conversation_pending')
-        .update({ last_error: 'no_lp_prospect_resolved' })
-        .eq('id', id);
-      return;
-    }
-
-    // At-most-once guard per conversation-session.
+    // MODE === 'live' — at-most-once guard per conversation-session.
     const { data: guard } = await supabase
       .from('ghl_note_dedupe')
       .upsert(
@@ -340,7 +415,7 @@ export async function processRow(id) {
     if (!guard || guard.length === 0) {
       // This session's note already written — mark done, no duplicate.
       await persistLead(id, ldsId);
-      await markDone(id, throughIso, null, false, claimed);
+      await markDone(id, throughIso, null, false, claimed, leadAction);
       return;
     }
 
@@ -362,7 +437,7 @@ export async function processRow(id) {
     });
 
     await persistLead(id, ldsId);
-    await markDone(id, throughIso, lpNoteId, true, claimed);
+    await markDone(id, throughIso, lpNoteId, true, claimed, leadAction);
   } catch (err) {
     console.error(`[GHLNote] process(${id}) error: ${err.message}`);
     await markError(id, attempts, err.message).catch(() => {});
