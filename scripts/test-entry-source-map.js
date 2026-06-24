@@ -22,17 +22,23 @@ import {
   entryTagSuffix,
   __setCacheForTest,
 } from '../src/entry-source-map.js';
+import { DEFAULT_SOURCE_MAPPINGS } from '../src/sync-sources.js';
 
 const CF_LP_SUBSOURCE = 'o8h88WeFST8euBUq3Av6';
 const CF_LP_SOURCE = 'IvSDubMH0FmZmlCDy5C2';
 
 // Representative snapshot of lp_source_mapping (subset).
+// Post-2026-06-24 audit: aggregators (Lead Gurus) and offline media (TheHomeMag)
+// route E.5 (entry:other); the dead `paid-internet`/`media` buckets are retired.
+// HomeRiskReport (E.1) and Estimate Calculator (E.2) are Reece-owned carve-outs.
 const ROWS = [
-  { lp_source_subdetail: 'Lead Gurus',     lp_source_raw: null, ghl_intent_bucket: 'paid-internet',       ghl_entry_tag: 'entry:high-intent-digital', ghl_bridge_wf_id: 'W0.7' },
-  { lp_source_subdetail: 'Google Organic', lp_source_raw: null, ghl_intent_bucket: 'high-intent-digital', ghl_entry_tag: 'entry:high-intent-digital', ghl_bridge_wf_id: null },
-  { lp_source_subdetail: 'TheHomeMag',     lp_source_raw: null, ghl_intent_bucket: 'media',               ghl_entry_tag: 'entry:media',               ghl_bridge_wf_id: null },
-  { lp_source_subdetail: 'Canvass',        lp_source_raw: null, ghl_intent_bucket: 'canvassing',          ghl_entry_tag: 'entry:canvassing',          ghl_bridge_wf_id: null },
-  { lp_source_subdetail: null,             lp_source_raw: 'Internet', ghl_intent_bucket: 'other',         ghl_entry_tag: 'entry:other',               ghl_bridge_wf_id: null },
+  { lp_source_subdetail: 'Lead Gurus',          lp_source_raw: null, ghl_intent_bucket: 'other',               ghl_entry_tag: 'entry:other',                ghl_bridge_wf_id: null },
+  { lp_source_subdetail: 'Google Organic',      lp_source_raw: null, ghl_intent_bucket: 'high-intent-digital', ghl_entry_tag: 'entry:high-intent-digital',  ghl_bridge_wf_id: null },
+  { lp_source_subdetail: 'TheHomeMag',          lp_source_raw: null, ghl_intent_bucket: 'other',               ghl_entry_tag: 'entry:other',                ghl_bridge_wf_id: null },
+  { lp_source_subdetail: 'HomeRiskReport',      lp_source_raw: null, ghl_intent_bucket: 'risk-report',         ghl_entry_tag: 'entry:risk-report',          ghl_bridge_wf_id: null },
+  { lp_source_subdetail: 'Estimate Calculator', lp_source_raw: null, ghl_intent_bucket: 'estimate-calculator', ghl_entry_tag: 'entry:estimate-calculator',  ghl_bridge_wf_id: null },
+  { lp_source_subdetail: 'Canvass',             lp_source_raw: null, ghl_intent_bucket: 'canvassing',          ghl_entry_tag: 'entry:canvassing',           ghl_bridge_wf_id: null },
+  { lp_source_subdetail: null,                  lp_source_raw: 'Internet', ghl_intent_bucket: 'other',         ghl_entry_tag: 'entry:other',                ghl_bridge_wf_id: null },
 ];
 
 function withSubsource(value) {
@@ -41,10 +47,10 @@ function withSubsource(value) {
 
 test.beforeEach(() => __setCacheForTest(ROWS));
 
-test('Lead Gurus → paid-internet / entry:high-intent-digital (subdetail match)', async () => {
+test('Lead Gurus → other / entry:other (aggregator, E.5 — post-2026-06-24 audit)', async () => {
   const r = await resolveEntryFromSourceMap(withSubsource('Lead Gurus'));
-  assert.equal(r.bucket, 'paid-internet');
-  assert.equal(r.entryTag, 'entry:high-intent-digital');
+  assert.equal(r.bucket, 'other');
+  assert.equal(r.entryTag, 'entry:other');
   assert.equal(r.matchedOn, 'subdetail');
 });
 
@@ -54,10 +60,22 @@ test('Google Organic → high-intent-digital', async () => {
   assert.equal(entryTagSuffix(r.entryTag), 'high-intent-digital');
 });
 
-test('TheHomeMag → media', async () => {
+test('TheHomeMag → other (media bucket retired, routes E.5)', async () => {
   const r = await resolveEntryFromSourceMap(withSubsource('TheHomeMag'));
-  assert.equal(r.bucket, 'media');
-  assert.equal(entryTagSuffix(r.entryTag), 'media');
+  assert.equal(r.bucket, 'other');
+  assert.equal(entryTagSuffix(r.entryTag), 'other');
+});
+
+test('HomeRiskReport → risk-report (E.1 Reece-owned carve-out)', async () => {
+  const r = await resolveEntryFromSourceMap(withSubsource('HomeRiskReport'));
+  assert.equal(r.bucket, 'risk-report');
+  assert.equal(entryTagSuffix(r.entryTag), 'risk-report');
+});
+
+test('Estimate Calculator → estimate-calculator (E.2 Reece-owned carve-out)', async () => {
+  const r = await resolveEntryFromSourceMap(withSubsource('Estimate Calculator'));
+  assert.equal(r.bucket, 'estimate-calculator');
+  assert.equal(entryTagSuffix(r.entryTag), 'estimate-calculator');
 });
 
 test('Canvass → canvassing', async () => {
@@ -92,7 +110,14 @@ test('subdetail wins over raw when both are present', async () => {
   };
   const r = await resolveEntryFromSourceMap(contact);
   assert.equal(r.matchedOn, 'subdetail');
-  assert.equal(r.bucket, 'paid-internet');
+  assert.equal(r.bucket, 'other');
+});
+
+test('DEFAULT_SOURCE_MAPPINGS has no entry on a retired bucket (paid-internet / media)', () => {
+  for (const [src, m] of Object.entries(DEFAULT_SOURCE_MAPPINGS)) {
+    assert.ok(m.bucket !== 'paid-internet' && m.bucket !== 'media', `${src} maps to retired bucket "${m.bucket}"`);
+    assert.ok(!/^entry:(paid-internet|media)$/.test(m.tag), `${src} uses retired tag "${m.tag}"`);
+  }
 });
 
 test('no source signal at all → null', async () => {
@@ -102,6 +127,6 @@ test('no source signal at all → null', async () => {
 
 test('entryTagSuffix strips the entry: prefix and passes through bare suffixes', () => {
   assert.equal(entryTagSuffix('entry:high-intent-digital'), 'high-intent-digital');
-  assert.equal(entryTagSuffix('media'), 'media');
+  assert.equal(entryTagSuffix('referral'), 'referral');
   assert.equal(entryTagSuffix(null), null);
 });
