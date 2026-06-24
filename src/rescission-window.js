@@ -28,7 +28,7 @@ function toLocalDateString(date, tz = ET) {
  * Add N calendar days to a YYYY-MM-DD string. Returns new YYYY-MM-DD string.
  * Operates on a noon-UTC anchor to avoid DST edge cases.
  */
-function addDays(ymd, n) {
+export function addDays(ymd, n) {
   const [y, m, d] = ymd.split('-').map(Number);
   const anchor = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
   anchor.setUTCDate(anchor.getUTCDate() + n);
@@ -39,7 +39,7 @@ function addDays(ymd, n) {
 }
 
 /** Day-of-week (0=Sun..6=Sat) for a YYYY-MM-DD. */
-function dowFromYMD(ymd) {
+export function dowFromYMD(ymd) {
   const [y, m, d] = ymd.split('-').map(Number);
   return new Date(Date.UTC(y, m - 1, d, 12, 0, 0)).getUTCDay();
 }
@@ -49,7 +49,7 @@ const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Frid
 // ─── Federal holiday calendar (computed dynamically) ───────────────
 
 /** Nth weekday of a month, e.g., 3rd Monday (n=3, weekday=1). */
-function nthWeekdayOfMonth(year, month, weekday, n) {
+export function nthWeekdayOfMonth(year, month, weekday, n) {
   const first = new Date(Date.UTC(year, month - 1, 1, 12, 0, 0));
   const firstDOW = first.getUTCDay();
   const offset = (weekday - firstDOW + 7) % 7;
@@ -72,7 +72,7 @@ function lastMondayOfMonth(year, month) {
  *   Saturday → observed previous Friday
  *   Sunday → observed following Monday
  */
-function shiftToObserved(ymd) {
+export function shiftToObserved(ymd) {
   const dow = dowFromYMD(ymd);
   if (dow === 6) return addDays(ymd, -1); // Sat → Fri
   if (dow === 0) return addDays(ymd, 1);  // Sun → Mon
