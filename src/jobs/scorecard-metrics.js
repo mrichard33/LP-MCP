@@ -220,20 +220,24 @@ function finalizeActuals(acc, { periodStart, periodEnd }, extra = {}) {
     nonDemoTally, openQuotesSample,
   } = acc;
 
-  // Four mutually-exclusive sold-$ buckets: Released (Net Sales), Working (sold but
-  // held), Open Quotes (sold lead, job still pre-firm), Cancelled.
+  // Four mutually-exclusive sold-$ buckets: Released, Working (sold but held),
+  // Open Quotes (sold lead, job still pre-firm), Cancelled.
+  // Net Sale = Gross − Cancelled = Released + Working + Open Quotes (every non-cancelled
+  // sold $). This ties to the Reece report's "Net Sale" and is consistent with the
+  // Net Close COUNT (both span all non-cancelled deals). The Released/Working/Open split
+  // is retained as a sub-breakdown (bucket_tally) for the pipeline-risk view.
   // Pending Revenue = Working ONLY — open quotes are NOT folded in (an unsigned quote
-  // is neither released nor sold-not-netted, so including it would inflate Pending).
-  const net_sales = released_dollars;
+  // would inflate Pending).
   const open_quotes = other_pending;
   const pending_total = working_dollars;   // Pending Revenue = Working only
   const cancelled_dollars = Math.round(gross_sales - (released_dollars + working_dollars + other_pending));
+  const net_sales = released_dollars + working_dollars + other_pending;  // Gross − Cancelled
 
   return {
     ...extra,
     leads, sets, issued, net_issue, demos, sales: sold, net_close, ko_count,
     gross_sales, net_sales,
-    good_business: net_sales,            // spec alias: Net Sales = finalized (released)
+    good_business: net_sales,            // = Net Sale (non-cancelled total)
     released_dollars, working_dollars,
     pending_total,
     pending_dollars: pending_total,      // = Working only (open quotes excluded; see raw_inputs.open_quotes)
@@ -247,8 +251,8 @@ function finalizeActuals(acc, { periodStart, periodEnd }, extra = {}) {
     good_rate_pct: rate(released_dollars, gross_sales), // released ÷ gross
     ko_pct:        rate(ko_count, sold),
     gsli:          money(gross_sales, issued),       // Gross Sale $ ÷ Issue
-    nsli:          money(released_dollars, issued),  // Net (released) Sale $ ÷ Issue
-    avg_sale:      money(released_dollars, net_close),
+    nsli:          money(net_sales, issued),         // Net Sale $ ÷ Issue (ties to report NSLI)
+    avg_sale:      money(net_sales, net_close),      // Net Sale $ ÷ Net Close
     raw_inputs: {
       basis: 'appt_date',
       window: { periodStart, periodEnd },
