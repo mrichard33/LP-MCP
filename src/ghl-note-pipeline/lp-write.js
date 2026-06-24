@@ -8,9 +8,10 @@
 // model. So:
 //   • The AI-brief identity lives in the note TEXT header ("[AI BRIEF …]"),
 //     produced by the summarizer.
-//   • "important" is mapped to a dedicated LP note CATEGORY (nct_id) via
-//     GHL_NOTE_IMPORTANT_CATEGORY_ID, falling back to the standard category
-//     when no important category is configured.
+//   • "important" is encoded in the note TEXT (a "** IMPORTANT **" prefix) so
+//     it is visible to the rep regardless of LP's category column. It is ALSO
+//     mapped to a dedicated note CATEGORY (nct_id) when
+//     GHL_NOTE_IMPORTANT_CATEGORY_ID is set, otherwise the standard category.
 //   • Notes attach to the PROSPECT record (rectype 'cst', recid = prospectId).
 
 import { addNote } from '../lp-client.js';
@@ -49,10 +50,14 @@ export async function writeLpNote(prospectId, noteText, important) {
     ? IMPORTANT_CATEGORY
     : STANDARD_CATEGORY;
 
+  // Encode importance in the note text itself so it surfaces to the rep even
+  // when LP's note category column isn't surfaced in their view.
+  const notes = important ? `** IMPORTANT **\n${noteText}` : noteText;
+
   const resp = await addNote({
     rectype: 'cst',
     recid: prospectId,
-    notes: noteText,
+    notes,
     categoryId,
   });
 
