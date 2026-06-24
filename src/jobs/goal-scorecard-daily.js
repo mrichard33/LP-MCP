@@ -162,6 +162,24 @@ export async function computeGoalScorecard(opts = {}) {
   // Single Reece market today; group-by-market keeps the door open for a split.
   const markets = { [DEFAULT_MARKET]: prospects };
 
+  // Raw leads in (true top-of-funnel) — the ONE figure sourced from the CACHE,
+  // counted by creation date, not the LP-API by-appt cohort. Carries cache
+  // freshness, not LP-API freshness. Auxiliary: a failure here must NOT abort the
+  // LP-API write. Half-open range [start, nextDay(end)) covers the whole end day
+  // whether created_at_lp is a date or a timestamp.
+  let rawLeadsIn = null;
+  try {
+    const { count, error: cntErr } = await supabase
+      .from('lp_leads')
+      .select('*', { count: 'exact', head: true })
+      .gte('created_at_lp', periodStart)
+      .lt('created_at_lp', nextDay(periodEnd));
+    if (cntErr) console.warn(`[Scorecard] raw_leads_in count failed: ${cntErr.message}`);
+    else rawLeadsIn = count ?? null;   // count comes from the response header (head:true → data is null)
+  } catch (err) {
+    console.warn(`[Scorecard] raw_leads_in count threw: ${err.message}`);
+  }
+
   const rows = [];
   for (const [market, records] of Object.entries(markets)) {
     const actuals = computeActuals(records, { periodStart, periodEnd });
@@ -173,9 +191,14 @@ export async function computeGoalScorecard(opts = {}) {
       period_end: periodEnd,
       days_elapsed: daysElapsed,
       ...metrics,
+      raw_leads_in: rawLeadsIn,
       computed_from: 'lp_api',
       reconciled: RECONCILED_MARKETS.has(market),
-      raw_inputs: { ...raw_inputs, prospects_scanned: records.length },
+      raw_inputs: {
+        ...raw_inputs,
+        prospects_scanned: records.length,
+        raw_leads_basis: 'lp_leads.created_at_lp (cache)',
+      },
     });
   }
 
@@ -202,8 +225,11 @@ export async function computeGoalScorecard(opts = {}) {
     markets: rows.length,
     prospects_scanned: prospects.length,
     rows: rows.map((r) => ({
-      market: r.market, leads: r.leads, issued: r.issued, sets: r.sets,
-      demos: r.demos, sales: r.sales, net_sales: r.net_sales, reconciled: r.reconciled,
+      market: r.market, leads: r.leads, raw_leads_in: r.raw_leads_in,
+      issued: r.issued, sets: r.sets, demos: r.demos, sales: r.sales,
+      net_sales: r.net_sales, released_dollars: r.released_dollars,
+      working_dollars: r.working_dollars, pending_total: r.pending_total,
+      gross_sales: r.gross_sales, reconciled: r.reconciled,
     })),
     elapsed_ms: elapsed,
   };

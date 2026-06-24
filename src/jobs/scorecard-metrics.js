@@ -57,19 +57,53 @@ export const CANCEL_STATUSES = (
 ).map((s) => s.trim().toLowerCase()).filter(Boolean);
 const CANCEL_SET = new Set(CANCEL_STATUSES);
 
+// Sold-deal job statuses that ARE released to production → count as Net Sales.
+// ⚠ TIE-OUT — verified against a live read of lp_jobs.job_status; calibrate to the
+// official report. Env-overridable via SCORECARD_RELEASED_STATUSES (comma-separated).
+export const RELEASED_STATUSES = (
+  process.env.SCORECARD_RELEASED_STATUSES
+    ? process.env.SCORECARD_RELEASED_STATUSES.split(',')
+    : ['Rel To Production', 'RTP Await recission', 'RTP DP DUE', 'Awaiting Product']
+).map((s) => s.trim().toLowerCase()).filter(Boolean);
+const RELEASED_SET = new Set(RELEASED_STATUSES);
+
+// Sold-deal job statuses HELD pre-release (financing/HOA/docs/measure) → Working
+// Revenue. Real revenue earned but not yet bookable; a pipeline risk if it stalls.
+// ⚠ TIE-OUT — env-overridable via SCORECARD_WORKING_STATUSES (comma-separated).
+export const WORKING_STATUSES = (
+  process.env.SCORECARD_WORKING_STATUSES
+    ? process.env.SCORECARD_WORKING_STATUSES.split(',')
+    : ['HOLD - HOA', 'HOLD-Shutter Approval', 'Mgmt Hold', 'Awaiting Credit Application',
+       'Awaiting Lender', 'Awaiting Loan Docs', 'Awaiting Change Order',
+       'Awaiting Commission Sheet', 'Awaiting Paperwork', 'Out to Measure']
+).map((s) => s.trim().toLowerCase()).filter(Boolean);
+const WORKING_SET = new Set(WORKING_STATUSES);
+
 function flag(lead, mapKey) {
   const v = getField(lead, ...SCORECARD_FIELD_MAP[mapKey]);
   return v === true || v === 'true';
 }
 
-// Dispositions where the rep sat the appointment (LP Sat=true) but it should
-// NOT count as a demo for Reece's metrics: NOC = Not Covered (out of service
-// area / our fault), NIS = Not Issued. demo_completed in the cache still mirrors
-// LP faithfully; this exclusion is applied only at the reporting/count layer.
-export const NON_DEMO_DISPOSITIONS = new Set(['NOC', 'NIS']);
-function isNonDemoDisposition(lead) {
+// Dispositions where the rep sat the appointment (LP Sat=true) but it should NOT
+// count as a demo for Reece's metrics. Real LP labels (per lp_dispositions):
+//   NOC = No Contact, NIS = Not Interested - Shown.
+// demo_completed in the cache still mirrors LP faithfully; this exclusion is
+// applied only at the reporting/count layer. ⚠ TIE-OUT — env-overridable via
+// SCORECARD_NON_DEMO_DISPOSITIONS (comma-separated); confirm against the official
+// demo count before trusting demo% as reconciled.
+export const NON_DEMO_DISPOSITIONS = new Set(
+  (process.env.SCORECARD_NON_DEMO_DISPOSITIONS
+    ? process.env.SCORECARD_NON_DEMO_DISPOSITIONS.split(',')
+    : ['NOC', 'NIS']
+  ).map((s) => s.trim().toUpperCase()).filter(Boolean),
+);
+// Returns the excluding disposition code (uppercased) if this sat lead is a
+// non-demo, else null — lets the caller tally which codes drop sits from demos.
+function nonDemoDispositionCode(lead) {
   const d = getField(lead, 'disposition', 'Disposition');
-  return d != null && NON_DEMO_DISPOSITIONS.has(String(d).trim().toUpperCase());
+  if (d == null) return null;
+  const code = String(d).trim().toUpperCase();
+  return NON_DEMO_DISPOSITIONS.has(code) ? code : null;
 }
 
 function num(v) {
@@ -108,8 +142,12 @@ function money(numerator, denominator) {
  */
 export function computeActuals(prospects, { periodStart, periodEnd }) {
   let leads = 0, sets = 0, issued = 0, net_issue = 0, demos = 0, sold = 0, net_close = 0;
-  let ko_count = 0, gross_sales = 0, net_sales = 0;
+  let ko_count = 0, gross_sales = 0;
+  // Three-bucket split of surviving (non-cancelled) sold $: released to production,
+  // sold-but-held (working), and any other in-flight non-cancel status.
+  let released_dollars = 0, working_dollars = 0, other_pending = 0;
   const statusTally = {};        // every job status seen → count (tie-out aid)
+  const nonDemoTally = {};       // disposition code → sits dropped from demos (tie-out aid)
 
   for (const prospect of prospects || []) {
     const leadList = getField(prospect, 'leads', 'Leads') || [];
@@ -121,12 +159,18 @@ export function computeActuals(prospects, { periodStart, periodEnd }) {
       leads += 1;
       const isSet = flag(lead, 'set');
       const isIssued = flag(lead, 'issued');
-      // NOC/NIS are sits (LP Sat=true) that should not count as demos for Reece metrics.
-      const isDemo = flag(lead, 'sat') && !isNonDemoDisposition(lead);
+      // NOC/NIS are sits (LP Sat=true) that should not count as demos for Reece
+      // metrics; tally the excluding code so Mark can tie out the haircut.
+      const isSat = flag(lead, 'sat');
+      const nonDemoCode = isSat ? nonDemoDispositionCode(lead) : null;
+      if (nonDemoCode) nonDemoTally[nonDemoCode] = (nonDemoTally[nonDemoCode] || 0) + 1;
+      const isDemo = isSat && !nonDemoCode;
       const isSold = flag(lead, 'sold');
 
-      // Roll up this lead's jobs → gross $, surviving (non-cancelled) $, cancel flag.
+      // Roll up this lead's jobs → gross $, surviving (non-cancelled) $, cancel flag,
+      // and the released/working/other split of the surviving $.
       let leadGross = 0, leadNet = 0, hasJob = false, hasCancel = false;
+      let leadReleased = 0, leadWorking = 0, leadOther = 0;
       const jobs = getField(lead, 'jobs', 'Jobs') || [];
       for (const job of jobs) {
         const status = String(getField(job, ...SCORECARD_FIELD_MAP.job_status) || '').trim();
@@ -134,8 +178,14 @@ export function computeActuals(prospects, { periodStart, periodEnd }) {
         statusTally[status || '(blank)'] = (statusTally[status || '(blank)'] || 0) + 1;
         hasJob = true;
         leadGross += value;
-        if (CANCEL_SET.has(status.toLowerCase())) { ko_count += 1; hasCancel = true; }
-        else { leadNet += value; }
+        const lower = status.toLowerCase();
+        if (CANCEL_SET.has(lower)) { ko_count += 1; hasCancel = true; }
+        else {
+          leadNet += value;
+          if (RELEASED_SET.has(lower)) leadReleased += value;
+          else if (WORKING_SET.has(lower)) leadWorking += value;
+          else leadOther += value;     // in-flight, not yet released
+        }
       }
       // A deal "cancelled" when it has job(s) and none survived the cancel set.
       const cancelled = hasJob && hasCancel && leadNet === 0;
@@ -146,34 +196,51 @@ export function computeActuals(prospects, { periodStart, periodEnd }) {
       if (isSold) {
         sold += 1;
         gross_sales += leadGross;        // Gross Sale $ (incl. cancellations)
-        net_sales += leadNet;            // Net Sale $ (net of cancellations)
-        if (!cancelled) net_close += 1;  // # Net Close
+        released_dollars += leadReleased; // released to production = Net Sales
+        working_dollars  += leadWorking;  // sold but held
+        other_pending    += leadOther;    // other in-flight, not yet released
+        if (!cancelled) net_close += 1;  // # Net Close (released or working both "stuck")
       }
     }
   }
 
+  // Net Sales = released to production. Working Revenue = sold but held.
+  // pending_total = everything sold, not cancelled, not yet released.
+  const net_sales = released_dollars;
+  const pending_total = working_dollars + other_pending;
+  const cancelled_dollars = Math.round(gross_sales - (released_dollars + working_dollars + other_pending));
+
   return {
     leads, sets, issued, net_issue, demos, sales: sold, net_close, ko_count,
     gross_sales, net_sales,
-    good_business: net_sales,            // clean (non-cancelled) sold $
-    pending_dollars: Math.max(0, gross_sales - net_sales),
+    good_business: net_sales,            // spec alias: Net Sales = finalized (released)
+    released_dollars, working_dollars,
+    pending_total,
+    pending_dollars: pending_total,      // kept for read-layer compatibility (= pending_total)
     deposits: 0,                         // ⚠ TIE-OUT (job/milestone field; 0 until mapped)
+    revenue_basis: 'released/working/cancel v1',
     // ── Report ratios (Marketing Sub-Source By Appt Date) ──
     pct_issue:     rate(issued, sets),       // Issue ÷ Set
     demo_pct:      rate(demos, net_issue),   // Demo ÷ Net Issue
     close_pct:     rate(sold, demos),        // % Gross Close = Sold ÷ Demo
     pct_net_close: rate(net_close, demos),   // # Net Close ÷ Demo
-    good_rate_pct: rate(net_sales, gross_sales), // clean-business ratio
+    good_rate_pct: rate(released_dollars, gross_sales), // released ÷ gross
     ko_pct:        rate(ko_count, sold),
-    gsli:          money(gross_sales, issued),   // Gross Sale $ ÷ Issue
-    nsli:          money(net_sales, issued),     // Net Sale $ ÷ Issue
-    avg_sale:      money(net_sales, net_close),
+    gsli:          money(gross_sales, issued),       // Gross Sale $ ÷ Issue
+    nsli:          money(released_dollars, issued),  // Net (released) Sale $ ÷ Issue
+    avg_sale:      money(released_dollars, net_close),
     raw_inputs: {
       basis: 'appt_date',
       window: { periodStart, periodEnd },
       status_tally: statusTally,
       cancel_statuses: CANCEL_STATUSES,
-      tie_out: ['net_issue', 'net_close', 'net_sales', 'gross_sales', 'cancel_statuses'],
+      released_statuses: RELEASED_STATUSES,
+      working_statuses: WORKING_STATUSES,
+      revenue_basis: 'released/working/cancel v1',
+      bucket_tally: { released_dollars, working_dollars, other_pending, cancelled_dollars },
+      non_demo_tally: nonDemoTally,
+      tie_out: ['net_issue', 'net_close', 'net_sales', 'released_dollars',
+                'working_dollars', 'gross_sales', 'cancel_statuses'],
     },
   };
 }
