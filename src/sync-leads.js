@@ -54,6 +54,21 @@
 //   lp_leads rows (the appointment-sync false-failure on field-set
 //   leads, 2026-06-02).
 //
+// v10.2 (2026-06-29) — null-source attribution backstop.
+//   Some vendor intakes (notably the "Internet, Socius Marketing" and
+//   "Internet, Lead Gurus" paid feeds) land in LP with empty source /
+//   sourcesubdescr but a populated `promotername` of the form
+//   "Channel, Vendor". That left ~30 leads/mo with null source —
+//   invisible to revenue attribution and routed to entry:other. The
+//   three writers now resolve an EFFECTIVE source via effectiveLeadSource():
+//   native source/sourcesubdescr win; when BOTH are blank we recover the
+//   attribution from the promoter, scoped to the `internet` channel so
+//   rep-entered promoters ("Singer, Jack - ORL", "Richard, Mark") are
+//   never mistaken for a source. The derived pair flows into both the
+//   persisted columns and resolveSourceBucket(), so bucket/tag stay
+//   consistent with the stamped source. entry:* immutability still
+//   protects first-touch attribution on already-linked contacts.
+//
 // v9.3 — Disposition-changed event now emits with the lognumber-
 //   preferred GHL contact ID (`newLeadGhlId`) instead of the bare
 //   `ghlId` from prospect-level matchToGHL.
@@ -197,12 +212,63 @@ function deriveLeadGhlId(lead, fallbackGhlId) {
   return fallbackGhlId || null;
 }
 
+// ─── v10.2: Source attribution backstop (derive from LP promoter) ─
+//
+// Channels whose promoter first segment is a real LP "source" (parent
+// channel) rather than a salesperson surname. Scoped deliberately tight:
+// the active null-source leak is the "Internet, <Vendor>" paid feeds
+// (Socius Marketing, Lead Gurus). Rep-entered promoters are
+// "Surname, First - OFFICE" — their first segment is a surname, never in
+// this set, so they are left untouched. Extend this set only when a new
+// channel-prefixed vendor feed is confirmed to arrive source-less.
+const PROMOTER_SOURCE_CHANNELS = new Set(['internet']);
+
+// Parse a promoter of the form "Channel, Vendor" into { source, sourcesubdescr }
+// when Channel is a recognized source channel. Returns null otherwise (no
+// comma, blank halves, or a non-source first segment like a rep surname).
+// "Internet, Socius Marketing" → { source: 'Internet', sourcesubdescr: 'Socius Marketing' }
+function deriveSourceFromPromoter(promoterName) {
+  if (!promoterName) return null;
+  const s = String(promoterName);
+  const idx = s.indexOf(',');
+  if (idx < 0) return null;
+  const channel = s.slice(0, idx).trim();
+  const vendor = s.slice(idx + 1).trim();
+  if (!channel || !vendor) return null;
+  if (!PROMOTER_SOURCE_CHANNELS.has(channel.toLowerCase())) return null;
+  return { source: channel, sourcesubdescr: vendor };
+}
+
+// Effective LP source for a lead: the native source / sourcesubdescr when
+// either is present; otherwise the promoter-derived attribution backstop.
+// Both consumers — the persisted lp_leads columns and resolveSourceBucket() —
+// read through this so a derived pair stamps the columns AND routes the bucket
+// consistently. Returns { source, sourcesubdescr, derivedFromPromoter }.
+function effectiveLeadSource(lead) {
+  const source = getField(lead, 'source', 'Source');
+  const sourcesubdescr = getField(lead, 'sourcesubdescr', 'SourceSubDescr');
+  if (source || sourcesubdescr) {
+    return { source: source || null, sourcesubdescr: sourcesubdescr || null, derivedFromPromoter: false };
+  }
+  const derived = deriveSourceFromPromoter(getField(lead, 'promotername', 'PromoterName'));
+  if (derived) return { ...derived, derivedFromPromoter: true };
+  return { source: source || null, sourcesubdescr: sourcesubdescr || null, derivedFromPromoter: false };
+}
+
+// TEST SEAM — pure source-attribution helpers exposed for unit tests
+// (mirrors the `_internal` export convention used in entry-source-map.js).
+export const _internal = { deriveSourceFromPromoter, effectiveLeadSource, PROMOTER_SOURCE_CHANNELS };
+
 // ─── Build the lead row payload (DRY helper) ─────────────────────
 function buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId, existingGhlId = null) {
   // v10.1: never lose a previously-established link — fall back to the
   // existing ghl_contact_id when neither lognumber nor the phone/email
   // match (ghlId) resolves one this run.
   const leadGhlId = deriveLeadGhlId(lead, ghlId) || existingGhlId || null;
+
+  // v10.2: stamp the effective source (native, else promoter-derived) so the
+  // "Internet, <Vendor>" feeds stop persisting null source/sourcesubdescr.
+  const eff = effectiveLeadSource(lead);
 
   const apptSet = getField(lead, 'apptset', 'ApptSet');
   const sat = getField(lead, 'sat', 'Sat');
@@ -225,8 +291,8 @@ function buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId
       city:               getField(prospect, 'city', 'City'),
       state:              getField(prospect, 'state', 'State'),
       zip:                getField(prospect, 'zip', 'Zip'),
-      lead_source:        getField(lead, 'source', 'Source'),
-      lead_source_detail: getField(lead, 'sourcesubdescr', 'SourceSubDescr'),
+      lead_source:        eff.source,
+      lead_source_detail: eff.sourcesubdescr,
       promoter_name:      getField(lead, 'promotername', 'PromoterName'),
       ghl_intent_bucket:  bucket,
       ghl_entry_tag:      tag,
@@ -298,9 +364,11 @@ export async function upsertLeadOnly(prospect) {
       }
     }
 
+    // v10.2: resolve bucket/tag from the effective source (native, else
+    // promoter-derived) so derived-source leads route by their real channel.
+    const effSrc = effectiveLeadSource(lead);
     const { bucket, tag } = await resolveSourceBucket(
-      getField(lead, 'sourcesubdescr', 'SourceSubDescr'),
-      getField(lead, 'source', 'Source'), lpLeadId,
+      effSrc.sourcesubdescr, effSrc.source, lpLeadId,
     );
 
     const { row } = buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, null, existing?.ghl_contact_id || null);
@@ -364,9 +432,11 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
 
   for (const lead of leads) {
     const lpLeadId = String(getField(lead, 'id', 'lds_id', 'LeadID'));
+    // v10.2: resolve bucket/tag from the effective source (native, else
+    // promoter-derived) so derived-source leads route by their real channel.
+    const effSrc = effectiveLeadSource(lead);
     const { bucket, tag } = await resolveSourceBucket(
-      getField(lead, 'sourcesubdescr', 'SourceSubDescr'),
-      getField(lead, 'source', 'Source'), lpLeadId,
+      effSrc.sourcesubdescr, effSrc.source, lpLeadId,
     );
     const lpProspectId = String(getField(prospect, 'cst_id', 'CstID', 'prospectid', 'ProspectID'));
 
@@ -645,6 +715,10 @@ export async function upsertLeadFromFlat(lp, ghlId) {
   const lpProspectId = String(getField(lp, 'cst_id', 'CstID', 'ProspectID') || '');
   const flatGhlId = deriveLeadGhlId(lp, ghlId);
 
+  // v10.2: stamp the effective source (native, else promoter-derived) on the
+  // flat path too, so source-less "Internet, <Vendor>" inbound never persists null.
+  const effFlat = effectiveLeadSource(lp);
+
   const flatRow = {
     lp_lead_id:         lpLeadId,
     lp_prospect_id:     lpProspectId,
@@ -658,8 +732,9 @@ export async function upsertLeadFromFlat(lp, ghlId) {
     city:               getField(lp, 'city', 'City'),
     state:              getField(lp, 'state', 'State'),
     zip:                getField(lp, 'zip', 'Zip'),
-    lead_source:        getField(lp, 'source', 'Source'),
-    lead_source_detail: getField(lp, 'sourcesubdescr', 'SourceSubDescr'),
+    lead_source:        effFlat.source,
+    lead_source_detail: effFlat.sourcesubdescr,
+    promoter_name:      getField(lp, 'promotername', 'PromoterName'),
     disposition_code:   getField(lp, 'disposition', 'Disposition'),
     rep_name:           getField(lp, 'salesrepname', 'SalesRepName', 'rep_name'),
     created_at_lp:      lpDateToEastern(getField(lp, 'dateadded', 'DateAdded', 'entrydate', 'EntryDate')),
