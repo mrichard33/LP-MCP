@@ -168,6 +168,8 @@ import { registerGoalScorecardRoutes, startGoalScorecardScheduler } from './jobs
 import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
 // ─── FB Publish Watchdog (alert on missed WF4 publish window) ────
 import { startFbPublishWatchdog } from './fb-publish-watchdog.js';
+// ─── Five9 ESS Silence Watchdog (alert on a quiet Five9 feed) ────
+import { startFive9SilenceWatchdog } from './five9-silence-watchdog.js';
 import {
   registerGhlInboundRoutes,
   startGhlNoteSweep,
@@ -563,6 +565,7 @@ app.listen(PORT, async () => {
   startWorkflowProjectionLoop();
   startGoalScorecardScheduler();
   startFbPublishWatchdog();
+  startFive9SilenceWatchdog();
   startGhlNoteSweep();
   startGhlNoteReconciliation();
   // First field-sync ~60s after boot (was ~9.5 min), then every 15 min.
