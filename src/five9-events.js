@@ -162,10 +162,13 @@ export async function five9WebhookHandler(req, res) {
     return res.status(200).json({ ok: true, skipped: true });
   }
 
-  const rawBody = (req.body && typeof req.body === 'object') ? req.body : {};
+  // Merge query + body (body wins) so we capture the payload whether the
+  // Five9 Connector sends params in the URL query string (its per-param "URL"
+  // checkbox) or in the form body. Mirrors lp-lead-refresh's src merge.
+  const merged = { ...(req.query || {}), ...((req.body && typeof req.body === 'object') ? req.body : {}) };
   // Never persist the secret: strip it from the stored payload (it may have
-  // arrived as a body field on this connector).
-  const payload = stripSecretFields(rawBody);
+  // arrived as a query/body field on this connector).
+  const payload = stripSecretFields(merged);
   const fields = extractFields(payload);
 
   // 3. FAST ACK — insert raw row, then respond 200 immediately.
