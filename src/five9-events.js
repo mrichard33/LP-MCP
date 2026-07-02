@@ -35,6 +35,44 @@ const DEDUP_WINDOW_SEC = parseInt(process.env.FIVE9_DEDUP_WINDOW_SEC || '60', 10
 
 const SECRET_HEADER = 'x-five9-webhook-secret';
 
+// Field names under which the shared secret may arrive in the request BODY
+// or QUERY string (case-insensitive). Five9 "Connectors" send configured
+// parameters as URL/form fields — NOT as HTTP headers — so we accept the
+// secret from a body/query param too (mirrors lp-lead-refresh's ?key=).
+// These keys are always stripped from the stored payload so the secret is
+// never persisted.
+const SECRET_FIELD_KEYS = new Set([
+  'x-five9-webhook-secret',
+  'five9_webhook_secret',
+  'webhook_secret',
+  'secret',
+]);
+
+// Case-insensitive top-level lookup of the secret in a body/query object.
+function findSecretField(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  for (const [k, v] of Object.entries(obj)) {
+    if (SECRET_FIELD_KEYS.has(k.toLowerCase()) && v != null && v !== '') {
+      return typeof v === 'object' ? null : String(v);
+    }
+  }
+  return null;
+}
+
+// Return a shallow clone of the payload with any secret field(s) removed,
+// so the raw jsonb column never stores the shared secret.
+function stripSecretFields(obj) {
+  try {
+    const clone = { ...(obj || {}) };
+    for (const k of Object.keys(clone)) {
+      if (SECRET_FIELD_KEYS.has(k.toLowerCase())) clone[k] = '[redacted]';
+    }
+    return clone;
+  } catch {
+    return obj;
+  }
+}
+
 // ─── Auth ────────────────────────────────────────────────────────────
 // Constant-time compare of SHA-256 digests so buffers are always equal
 // length (timingSafeEqual throws on length mismatch) and the raw secret
@@ -85,7 +123,7 @@ export function extractFields(payload) {
       call_id:     pick(payload, ['callId', 'call_id', 'interactionId', 'interaction_id']),
       ani:         pick(payload, ['ANI', 'ani', 'callerNumber', 'from']),
       dnis:        pick(payload, ['DNIS', 'dnis', 'dialedNumber', 'to']),
-      disposition: pick(payload, ['disposition', 'dispositionName', 'disposition_name']),
+      disposition: pick(payload, ['disposition', 'dispositionName', 'disposition_name', 'disposition_id', 'dispositionId']),
     };
   } catch {
     return { event_type: null, call_id: null, ani: null, dnis: null, disposition: null };
@@ -105,8 +143,15 @@ function redactHeaders(headers) {
 
 // ─── Route handler ───────────────────────────────────────────────────
 export async function five9WebhookHandler(req, res) {
-  // 1. AUTH — missing/mismatch → 401 empty body, one warn line, no payload dump.
-  if (!secretMatches(req.headers?.[SECRET_HEADER])) {
+  // 1. AUTH — accept the secret from the x-five9-webhook-secret HEADER, or
+  //    from a body/query field (Five9 Connectors send params as URL/form
+  //    fields, not headers). Missing/mismatch → 401 empty body, one warn
+  //    line, no payload dump.
+  const providedSecret =
+    req.headers?.[SECRET_HEADER] ||
+    findSecretField(req.body) ||
+    findSecretField(req.query);
+  if (!secretMatches(providedSecret)) {
     console.warn('[Five9] rejected: bad/missing webhook secret');
     return res.status(401).end();
   }
@@ -117,7 +162,13 @@ export async function five9WebhookHandler(req, res) {
     return res.status(200).json({ ok: true, skipped: true });
   }
 
-  const payload = (req.body && typeof req.body === 'object') ? req.body : {};
+  // Merge query + body (body wins) so we capture the payload whether the
+  // Five9 Connector sends params in the URL query string (its per-param "URL"
+  // checkbox) or in the form body. Mirrors lp-lead-refresh's src merge.
+  const merged = { ...(req.query || {}), ...((req.body && typeof req.body === 'object') ? req.body : {}) };
+  // Never persist the secret: strip it from the stored payload (it may have
+  // arrived as a query/body field on this connector).
+  const payload = stripSecretFields(merged);
   const fields = extractFields(payload);
 
   // 3. FAST ACK — insert raw row, then respond 200 immediately.
