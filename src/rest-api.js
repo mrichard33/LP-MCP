@@ -35,6 +35,7 @@ import { registerNurtureRoutes } from './nurture/nurture-orchestrator.js';
 import { registerEngagementRoutes } from './nurture/nurture-engagement.js';
 import { registerAppointmentNotificationRoutes } from './notifications/appointment-notifications.js';
 import { registerContractCancellationNotificationRoutes } from './notifications/cancellation-notifications.js';
+import { five9WebhookHandler } from './five9-events.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // WEBHOOK SIGNATURE VERIFICATION (optional but recommended)
@@ -1203,6 +1204,17 @@ export function registerRestApiRoutes(app, authenticate) {
   // v1.1: fast path skips LP fetch when payload matches cached row.
   app.post('/webhook/lp-lead-refresh', lpLeadRefreshHandler);
   console.log('[REST API] Registered: POST /webhook/lp-lead-refresh (no-auth, flag-gated, real-time lp_leads refresh v1.1)');
+
+  // ═══════════════════════════════════════════════════════════════
+  // POST /webhook/five9-event — Five9 ESS webhook ingestion (Phase 1)
+  // ═══════════════════════════════════════════════════════════════
+  // Auth via x-five9-webhook-secret header (constant-time, inside the
+  // handler — mirrors lp-lead-refresh's no-middleware pattern). Fast-ack:
+  // captures raw body to five9_events_raw, returns 200 immediately, then
+  // normalizes + emits system_events in setImmediate. Kill switch:
+  // FIVE9_WEBHOOK_ENABLED=false → 200 with no insert. See src/five9-events.js.
+  app.post('/webhook/five9-event', five9WebhookHandler);
+  console.log('[REST API] Registered: POST /webhook/five9-event (header-auth, flag-gated, Five9 ESS raw capture + normalize)');
 
   // ═══════════════════════════════════════════════════════════════
   // /api/service-area/lookup — Zip → Market routing for HDL.2
