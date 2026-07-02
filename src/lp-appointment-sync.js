@@ -1,6 +1,23 @@
 /**
  * LP Appointment Sync — src/lp-appointment-sync.js
  *
+ * v5.2.1 (2026-07-01): APPLY `lp-appt-synced` ON ALL SUCCESS PATHS.
+ *
+ *   Incident (prospect 92642 / duplicate lead 554665): only the
+ *   already_in_lp_skipped_pre_resolve path applied the tag. I.LP-A clears
+ *   the tag at entry, and its post-wait "Synced" check therefore failed for
+ *   every orchestrator-synced appointment — including dedup-suppressed
+ *   re-fires — sending contacts down the fallback and, via the No-Lead-ID
+ *   backup push, into I.LP-OUT's addlead (new LP lead, blank source).
+ *
+ *   Fix: applyApptSyncedTag() (best-effort, never throws) on the four
+ *   terminal paths where LP verifiably holds the appointment —
+ *   lp_appointment_set, duplicate_sync_suppressed, already_set_in_lp, and
+ *   past_appointment_left_asis. Deliberately NOT applied on
+ *   lp_lead_creation_enrolled: there the lead + appointment are created
+ *   asynchronously by workflow 8e30ff37, so LP does not yet hold the
+ *   appointment and the tag would falsely signal "synced".
+ *
  * v5.2.0 (2026-06-03): SELF-HEAL VIA WORKFLOW 8e30ff37 ENROLLMENT.
  *
  *   Root cause (Chuck Celeste): a lead booked an appointment before LP
@@ -1071,6 +1088,23 @@ ACTION:
 }
 
 /**
+ * v5.2.1: Best-effort apply of `lp-appt-synced` after any outcome where LP
+ * verifiably holds the appointment. I.LP-A's post-wait "Synced (Exit)" check
+ * reads this tag; without it the workflow runs its fallback and can enroll
+ * the contact in I.LP-OUT (8e30ff37) -> duplicate blank-source addlead
+ * (incident 2026-07-01, prospect 92642 / lead 554665). Non-blocking.
+ */
+async function applyApptSyncedTag(contactId) {
+  if (!contactId) return;
+  try {
+    await applyGHLTag(contactId, 'lp-appt-synced');
+    console.log(`[LP-APPT] Applied lp-appt-synced tag to ${contactId}`);
+  } catch (err) {
+    console.warn(`[LP-APPT] lp-appt-synced apply failed for ${contactId}: ${err.message}`);
+  }
+}
+
+/**
  * Best-effort cleanup: remove `lp-sync-failed` tag from a GHL contact
  * after a successful resolution. The tag was applied by an earlier
  * failed attempt; with the issue now resolved, it should not persist.
@@ -1260,6 +1294,7 @@ async function syncAppointmentToLP({
   const existingMark = await findRecentApptSyncMark(dedupKey);
   if (existingMark) {
     console.log(`[LP-APPT] ⏭️ Duplicate appointment-sync suppressed for ${dedupKey} (marked ${existingMark.created_at}) — skipping SetAppointment, note, and GroupMe`);
+    await applyApptSyncedTag(contactId);
     return {
       success: true,
       action: 'duplicate_sync_suppressed',
@@ -1298,6 +1333,7 @@ async function syncAppointmentToLP({
           (lpSourceLine ? `\nSource: ${lpSourceLine}` : '')
         ).catch(() => {});
         await writeApptSyncMark({ dedupKey, contactId, ldsId, apptDate, apptTime });
+        await applyApptSyncedTag(contactId);
         return { success: true, action: 'already_set_in_lp', lp_lead_id: ldsId, lp_prospect_id: prospectId, date: lpNorm, resolution_source: source, resolution_step: step };
       }
       if (lpIsPast && (!ghlNorm || ghlNorm === lpNorm)) {
@@ -1309,6 +1345,7 @@ async function syncAppointmentToLP({
           `[LP SYNC] Existing LP appointment is past-dated (${lpNorm}) and no new date supplied — left as-is (no re-set).\nLP Lead: ${ldsId}`
         ).catch(() => {});
         await writeApptSyncMark({ dedupKey, contactId, ldsId, apptDate, apptTime });
+        await applyApptSyncedTag(contactId);
         return { success: true, action: 'past_appointment_left_asis', lp_lead_id: ldsId, lp_prospect_id: prospectId, date: lpNorm, resolution_source: source, resolution_step: step };
       }
       // Otherwise (different/new incoming date, past or future existing) →
@@ -1326,6 +1363,7 @@ async function syncAppointmentToLP({
   const result = await lpSetAppointment({ ldsId, setBy: '5686', apptDate, apptTime });
 
   await writeApptSyncMark({ dedupKey, contactId, ldsId, apptDate, apptTime });
+  await applyApptSyncedTag(contactId);
 
   const calendarSegmentGroupMe = calendarName ? ` | ${calendarName}` : '';
   const calendarLineGhlNote    = calendarName ? `\nCalendar: ${calendarName}` : '';
@@ -1707,7 +1745,7 @@ export function registerLPAppointmentSyncRoutes(app) {
     }
   });
 
-  console.log('[LP-APPT] Registered: POST /webhook/ghl/set-lp-appointment (v5.1.10 customData flatten + deep calendar lookup + inbound diagnostics)');
+  console.log('[LP-APPT] Registered: POST /webhook/ghl/set-lp-appointment (v5.2.1 lp-appt-synced on all success paths)');
   console.log('[LP-PROBE] Registered: POST /webhook/ghl/lp-probe (v5.1.2 diagnostic w/ userfields+lognumber)');
 }
 
