@@ -30,6 +30,28 @@ test('outbound_lock_held → skipped (was masked as completed)', () => {
   assert.equal(r.error_message, 'outbound_lock_held');
 });
 
+test('superseded (unsent) → skipped, not a completed send (2026-07-03)', () => {
+  const r = classifyHandlerResult({
+    action: 'send_message_superseded',
+    skipped: true,
+    reason: 'superseded_by_newer_job',
+    superseded_by: '165770',
+  });
+  assert.equal(r.status, 'skipped');
+  assert.equal(r.error_message, 'superseded_by_newer_job');
+});
+
+test('rescheduled lock-held skip still records as skipped with the lock reason', () => {
+  const r = classifyHandlerResult({
+    skipped: true,
+    reason: 'outbound_lock_held',
+    rescheduled: true,
+    retry_at: '2026-07-03T21:08:52.594Z',
+  });
+  assert.equal(r.status, 'skipped');
+  assert.equal(r.error_message, 'outbound_lock_held');
+});
+
 test('universal suppression → skipped', () => {
   const r = classifyHandlerResult({ skipped: true, reason: 'suppressed', matched_tag: 'suppress-outbound' });
   assert.equal(r.status, 'skipped');

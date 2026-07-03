@@ -1572,9 +1572,13 @@ export async function executeSendMessage(action, context) {
     const supersession = await checkNotSuperseded(contactId, String(action.id));
     if (supersession.superseded) {
       console.log(`[SendMessage] ⏭️ SUPERSEDED: ${contactId} action ${action.id} displaced by job ${supersession.by} — skipping send`);
+      // skipped: true → classifyHandlerResult records status 'skipped'
+      // (2026-07-03): nothing reached the contact, so this must not count
+      // as a completed send (Issue #99 honest-accounting rule).
       return {
         action: 'send_message_superseded',
         contact_id: contactId,
+        skipped: true,
         reason: 'superseded_by_newer_job',
         superseded_by: supersession.by,
         channel,
