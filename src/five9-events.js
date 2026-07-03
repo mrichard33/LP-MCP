@@ -24,14 +24,19 @@
  *   DNIS           = CUSTOMER number on outbound  → correlate DNIS first
  *   call_id        = Five9 call id
  *   disposition_id = numeric (negative = system, 3e14-range = custom)
- *   disposition_name, campaign_name, full_name
+ *   disposition_name, campaign_name
+ *   agent_name     = handling AGENT's full name (param formerly "full_name").
+ *                    EMPTY on system dispositions (negative ids) — the dialer
+ *                    assigned the outcome, no agent touched the call. This is
+ *                    expected, not a data bug (verified 2026-07-03: 31/31 "NA"
+ *                    rows carry a name, 0/31 system "No Answer" rows do).
  *   LPRecKey       = LP inquiry key (e.g. INQ402809) — captured, not yet joinable
  *   start_timestamp / end_timestamp = YYYYMMDDHHMMSSmmm (UTC)
  *
  * Mirrors POST /webhook/lp-lead-refresh (fast-ack + setImmediate) from
  * src/rest-api.js. NO agent rules consume these events yet — this is the
  * ingestion layer only. Substrate: sql/migrations/2026-07-02_five9_events_raw.sql
- * + 2026-07-03 enrichment columns (dashboard DDL).
+ * + 2026-07-03 enrichment columns + full_name→agent_name rename (dashboard DDL).
  */
 
 import crypto from 'crypto';
@@ -154,7 +159,10 @@ export function extractFields(payload) {
       campaign:         pick(payload, ['campaign_name', 'campaignName', 'campaign']),
       lp_rec_key:       pick(payload, ['LPRecKey', 'lp_rec_key', 'lpreckey']),
       lp_rec_type:      pick(payload, ['LPRecType', 'lp_rec_type', 'lprectype']),
-      full_name:        pick(payload, ['full_name', 'fullName']),
+      // Handling agent's name. Accepts the renamed connector param
+      // (agent_name) AND the legacy param name (full_name) so the Five9-side
+      // rename can happen independently of this deploy.
+      agent_name:       pick(payload, ['agent_name', 'agentName', 'full_name', 'fullName']),
       start_raw:        pick(payload, ['start_timestamp', 'startTimestamp']),
       end_raw:          pick(payload, ['end_timestamp', 'endTimestamp']),
     };
@@ -171,7 +179,7 @@ export function extractFields(payload) {
     return {
       event_type: null, call_id: null, ani: null, dnis: null, disposition: null,
       disposition_name: null, campaign: null, lp_rec_key: null, lp_rec_type: null,
-      full_name: null, call_start_at: null, call_end_at: null, duration_sec: null,
+      agent_name: null, call_start_at: null, call_end_at: null, duration_sec: null,
     };
   }
 }
@@ -217,7 +225,7 @@ export async function five9WebhookHandler(req, res) {
   const payload = stripSecretFields(merged);
   const fields = extractFields(payload);
 
-  const enrichedRow = {
+  const baseRow = {
     event_type:       fields.event_type,
     call_id:          fields.call_id,
     ani:              fields.ani,
@@ -227,7 +235,6 @@ export async function five9WebhookHandler(req, res) {
     campaign:         fields.campaign,
     lp_rec_key:       fields.lp_rec_key,
     lp_rec_type:      fields.lp_rec_type,
-    full_name:        fields.full_name,
     call_start_at:    fields.call_start_at,
     call_end_at:      fields.call_end_at,
     duration_sec:     fields.duration_sec,
@@ -235,37 +242,42 @@ export async function five9WebhookHandler(req, res) {
     headers: redactHeaders(req.headers),
   };
 
-  // Legacy column set — used as a fallback if the 2026-07-03 enrichment DDL
-  // has not been applied yet, so a schema lag never drops deliveries.
-  const legacyRow = {
-    event_type:  fields.event_type,
-    call_id:     fields.call_id,
-    ani:         fields.ani,
-    dnis:        fields.dnis,
-    disposition: fields.disposition,
-    payload,
-    headers: redactHeaders(req.headers),
-  };
+  // Insert cascade — makes the full_name→agent_name column rename (dashboard
+  // DDL) deployable in any order relative to this code:
+  //   1. agent_name column (post-rename schema)
+  //   2. full_name column  (pre-rename schema)
+  //   3. legacy minimal set (pre-enrichment schema) — never drop a delivery.
+  const insertAttempts = [
+    { ...baseRow, agent_name: fields.agent_name },
+    { ...baseRow, full_name: fields.agent_name },
+    {
+      event_type:  fields.event_type,
+      call_id:     fields.call_id,
+      ani:         fields.ani,
+      dnis:        fields.dnis,
+      disposition: fields.disposition,
+      payload,
+      headers: redactHeaders(req.headers),
+    },
+  ];
 
   const SELECT_COLS = 'id, received_at, event_type, call_id, ani, dnis, disposition';
 
   // 3. FAST ACK — insert raw row, then respond 200 immediately.
   let row;
   try {
-    let { data, error } = await supabase
-      .from('five9_events_raw')
-      .insert(enrichedRow)
-      .select(SELECT_COLS)
-      .single();
-
-    // Schema-lag fallback: unknown-column error → retry with legacy columns.
-    if (error && /column/i.test(error.message || '')) {
-      console.warn('[Five9] enrichment columns missing — falling back to legacy insert. Run the 2026-07-03 DDL.');
+    let data = null;
+    let error = null;
+    for (let i = 0; i < insertAttempts.length; i++) {
       ({ data, error } = await supabase
         .from('five9_events_raw')
-        .insert(legacyRow)
+        .insert(insertAttempts[i])
         .select(SELECT_COLS)
         .single());
+      if (!error) break;
+      // Only cascade on unknown-column (schema-lag) errors.
+      if (!/column/i.test(error.message || '')) break;
+      console.warn(`[Five9] insert attempt ${i + 1} hit schema lag (${error.message}) — trying fallback shape`);
     }
 
     if (error) throw error;
@@ -283,6 +295,7 @@ export async function five9WebhookHandler(req, res) {
     disposition_name: fields.disposition_name,
     campaign:         fields.campaign,
     lp_rec_key:       fields.lp_rec_key,
+    agent_name:       fields.agent_name,
     duration_sec:     fields.duration_sec,
     call_start_at:    fields.call_start_at,
     call_end_at:      fields.call_end_at,
@@ -423,6 +436,7 @@ export async function normalizeFive9Row(row) {
       disposition: row.disposition || null,
       disposition_name: row.disposition_name || null,
       campaign: row.campaign || null,
+      agent_name: row.agent_name || null,
       lp_rec_key: row.lp_rec_key || null,
       duration_sec: row.duration_sec ?? null,
       call_start_at: row.call_start_at || null,
