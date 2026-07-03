@@ -116,15 +116,26 @@ function pick(obj, keys) {
   return null;
 }
 
+// Five9 Connector variables that failed to substitute arrive as literal
+// "@Call.xxx@" strings. Treat those as absent so they never pollute
+// extracted fields (e.g. ani = "@Call.ANI@") or contact correlation.
+function unsubstituted(v) {
+  return typeof v === 'string' && /^@.+@$/.test(v.trim());
+}
+
 export function extractFields(payload) {
   try {
-    return {
+    const fields = {
       event_type:  pick(payload, ['eventType', 'event_type', 'type']),
       call_id:     pick(payload, ['callId', 'call_id', 'interactionId', 'interaction_id']),
       ani:         pick(payload, ['ANI', 'ani', 'callerNumber', 'from']),
       dnis:        pick(payload, ['DNIS', 'dnis', 'dialedNumber', 'to']),
       disposition: pick(payload, ['disposition', 'dispositionName', 'disposition_name', 'disposition_id', 'dispositionId']),
     };
+    for (const k of Object.keys(fields)) {
+      if (unsubstituted(fields[k])) fields[k] = null;
+    }
+    return fields;
   } catch {
     return { event_type: null, call_id: null, ani: null, dnis: null, disposition: null };
   }
@@ -210,10 +221,17 @@ export async function five9WebhookHandler(req, res) {
 // Best-effort, case-insensitive. Returns a system event_type or null
 // (null → unmapped, safe-default path). We don't yet know Five9's real
 // vocabulary, so match on substrings of the extracted type.
+//
+// CONNECTOR_CALL_EVENT: the Five9 Connector ("LP-MCP Event Push", trigger =
+// On Call Disposition) stamps every delivery with this generic type. Since
+// the connector only fires when a call is dispositioned, it IS a
+// disposition-set event — map it as such. Verified against live payloads
+// (five9_events_raw rows 1–167, 2026-07-03).
 export function mapEventType(rawType) {
   const t = String(rawType || '').toLowerCase();
   if (!t) return null;
   if (t.includes('disposition')) return 'five9.disposition_set';
+  if (t.includes('connector_call_event') || t.includes('connector')) return 'five9.disposition_set';
   // Ended before created so "call ended"/"interaction ended" isn't caught
   // by a broad created/call match.
   if (t.includes('end') || t.includes('complete') || t.includes('disconnect')) return 'five9.call_ended';
