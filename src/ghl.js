@@ -106,6 +106,12 @@ export async function matchToGHL(lpLead) {
 // Apply tag via POST (additive) — NEVER use PUT which replaces all tags
 export async function applyGHLTag(ghlContactId, tag) {
   if (ghlDisabled || !ghlClient || !ghlContactId) return false;
+  // 2026-07-03 — tag hygiene backstop (all callers): a tag ending in ':' is
+  // an empty namespace value (failed template interpolation). Refuse it.
+  if (typeof tag === 'string' && tag.trim().endsWith(':')) {
+    console.warn(`[GHL] tag.construction_rejected: "${tag}" for ${ghlContactId} — empty namespace value, not applied`);
+    return false;
+  }
   try {
     await ghlClient.post(`/contacts/${ghlContactId}/tags`, {
       tags: [tag],

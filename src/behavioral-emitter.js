@@ -209,6 +209,10 @@ import { upsertLeadIntelligence } from './context-builder.js';
 import supabase from './supabase.js';
 import { resolveEntryFromSourceMap, entryTagSuffix } from './entry-source-map.js';
 import { executeAddTag } from './actions/handlers/tags.js';
+// 2026-07-03 — hard message-level dedup (Steve Nkzhm incident): every inbound
+// gets a non-null message key, and the buffer flush atomically claims its
+// keys so the solo analyzePendingReplies poller can never re-analyze them.
+import { buildMessageKey, claimConsumedMessages, releaseConsumedMessages } from './services/consumed-messages.js';
 
 const GHL_WEBHOOK_SECRET = process.env.GHL_WEBHOOK_SECRET || '';
 const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -353,10 +357,13 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageTyp
     // forward into ai.analysis_completed.
     // Fix 3: latestMessageId — the inbound message_id of the most recent
     // message in the window; the outbound reply dedups against this.
-    buf = { messages: [], eventIds: [], firstSeenAt: Date.now(), timeoutId: null, latestType: null, latestMessageId: null };
+    buf = { messages: [], messageKeys: [], eventIds: [], firstSeenAt: Date.now(), timeoutId: null, latestType: null, latestMessageId: null };
     replyBuffers.set(contactId, buf);
   }
   buf.messages.push(trimmed);
+  // 2026-07-03 — per-message dedup key, parallel to buf.messages. handleReply
+  // synthesizes a key when GHL omits message_id, so this is always non-null.
+  buf.messageKeys.push(messageId || buildMessageKey(contactId, null, trimmed));
   if (typeof emittedEventId === 'number' || (typeof emittedEventId === 'string' && emittedEventId)) {
     buf.eventIds.push(emittedEventId);
   }
@@ -369,29 +376,57 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageTyp
   // most recent inbound, so dedup keys on its message_id.
   if (messageId) buf.latestMessageId = messageId;
 
-  buf.timeoutId = setTimeout(() => {
+  buf.timeoutId = setTimeout(async () => {
     // Snapshot before deleting; any messages that arrive AFTER this point
     // start a fresh buffer.
     const messages = buf.messages.slice();
+    const messageKeys = buf.messageKeys.slice();
     const eventIds = buf.eventIds.slice();
     const firstSeenAt = buf.firstSeenAt;
     const latestType = buf.latestType;
     const latestMessageId = buf.latestMessageId;
     replyBuffers.delete(contactId);
 
-    const combined = messages.length === 1 ? messages[0] : messages.join('\n');
+    // 2026-07-03 — hard dedup: atomically claim every buffered message key.
+    // Whichever consumer (this flush, or the solo analyzePendingReplies
+    // poller) claims a key first owns that message; the loser drops it.
+    // Claim happens ONCE here, before the retry loop — a retry must not
+    // re-claim its own keys. Fail-open: claim errors treat all as fresh.
+    let freshMessages = messages;
+    let freshKeys = messageKeys;
+    try {
+      const { consumed } = await claimConsumedMessages(contactId, messageKeys);
+      if (consumed.length) {
+        const consumedSet = new Set(consumed);
+        freshMessages = messages.filter((_, i) => !consumedSet.has(messageKeys[i]));
+        freshKeys = messageKeys.filter((k) => !consumedSet.has(k));
+      }
+    } catch (err) {
+      console.warn(`[ReplyBuffer] consumed-claim failed for ${contactId}: ${err.message} — proceeding unclaimed`);
+    }
+
+    if (!freshMessages.length) {
+      console.log(`[ReplyBuffer] All ${messages.length} buffered message(s) for ${contactId} already consumed by another analysis — skipping pipeline (deduped)`);
+      await markBufferEventsDeduped(eventIds, contactId);
+      return;
+    }
+
+    const combined = freshMessages.length === 1 ? freshMessages[0] : freshMessages.join('\n');
     const elapsedSec = Math.round((Date.now() - firstSeenAt) / 1000);
 
-    // v2.8: normalize messageType to 'sms' | 'email' | null for the analyzer.
+    // v2.8: normalize messageType for the analyzer.
+    // 2026-07-03: livechat no longer collapses to null (null defaulted to
+    // 'sms' at send time — the Steve Nkzhm channel flip).
     const channel = (() => {
       const lt = String(latestType || '').toLowerCase();
       if (lt.includes('email')) return 'email';
+      if (lt.includes('live_chat') || lt.includes('livechat') || lt.includes('webchat')) return 'livechat';
       if (lt.includes('sms'))   return 'sms';
       return null;
     })();
 
     console.log(
-      `[ReplyBuffer] Fired for ${contactId}: ${messages.length} message${messages.length === 1 ? '' : 's'}, ${elapsedSec}s window, channel=${channel || 'unknown'} → triggering pipeline with combined text`
+      `[ReplyBuffer] Fired for ${contactId}: ${freshMessages.length}/${messages.length} message${messages.length === 1 ? '' : 's'}, ${elapsedSec}s window, channel=${channel || 'unknown'} → triggering pipeline with combined text`
     );
 
     // v2.12: fire the pipeline and mark the source events processed ONLY after
@@ -402,15 +437,34 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageTyp
     // retry deterministic). PRE-v2.12 these events were marked processed=true
     // BEFORE the pipeline ran, so a failed/hung analysis silently dropped the
     // reply with no retry.
-    runBufferedPipelineWithRetry(contactId, combined, channel, messages, eventIds, 0, latestMessageId)
+    runBufferedPipelineWithRetry(contactId, combined, channel, freshMessages, eventIds, 0, latestMessageId, freshKeys)
       .catch(err => console.error(`[ReplyBuffer] Runner error for ${contactId}: ${err.message}`));
   }, REPLY_DEBOUNCE_MS);
+}
+
+// 2026-07-03 — terminal marker for a fully-deduped buffer window: the events
+// are processed (nothing left to analyze) with an explicit audit trail.
+async function markBufferEventsDeduped(eventIds, contactId) {
+  if (!eventIds?.length) return;
+  try {
+    await supabase
+      .from('system_events')
+      .update({
+        processed: true,
+        processed_by: 'behavioral_emitter_buffer',
+        processed_at: new Date().toISOString(),
+        action_taken: 'deduped',
+      })
+      .in('id', eventIds);
+  } catch (err) {
+    console.warn(`[ReplyBuffer] Mark-deduped failed for ${contactId}: ${err.message}`);
+  }
 }
 
 // v2.12 — Fire the agentic pipeline for a fired buffer and reconcile the source
 // events' processed state with the outcome. Retries on analyze failure with a
 // fixed delay, bounded by BUFFER_MAX_RETRIES.
-async function runBufferedPipelineWithRetry(contactId, combined, channel, messages, eventIds, attempt, messageId = null) {
+async function runBufferedPipelineWithRetry(contactId, combined, channel, messages, eventIds, attempt, messageId = null, messageKeys = []) {
   let ok = false;
   try {
     ok = await triggerAgenticPipeline(contactId, combined, channel, messageId);
@@ -425,7 +479,7 @@ async function runBufferedPipelineWithRetry(contactId, combined, channel, messag
   if (attempt + 1 < BUFFER_MAX_RETRIES) {
     console.warn(`[ReplyBuffer] Analysis failed for ${contactId} (attempt ${attempt + 1}/${BUFFER_MAX_RETRIES}) — retrying in ${BUFFER_RETRY_DELAY_MS}ms`);
     setTimeout(() => {
-      runBufferedPipelineWithRetry(contactId, combined, channel, messages, eventIds, attempt + 1, messageId)
+      runBufferedPipelineWithRetry(contactId, combined, channel, messages, eventIds, attempt + 1, messageId, messageKeys)
         .catch(err => console.error(`[ReplyBuffer] Retry runner error for ${contactId}: ${err.message}`));
     }, BUFFER_RETRY_DELAY_MS);
     return;
@@ -433,7 +487,11 @@ async function runBufferedPipelineWithRetry(contactId, combined, channel, messag
   // Exhausted in-process retries. Leave the source events processed=false on
   // purpose so the decision-engine processing cycle picks them up and re-runs
   // the analyzer (durable backstop, survives a process restart).
-  console.error(`[ReplyBuffer] Analysis still failing for ${contactId} after ${BUFFER_MAX_RETRIES} attempts — leaving events unprocessed for the processing-cycle retry (eventIds=[${eventIds.join(',')}])`);
+  // 2026-07-03: also RELEASE our consumed-message claims — without this the
+  // backstop's re-analysis would see the keys as already consumed and drop
+  // the messages, losing the reply permanently.
+  await releaseConsumedMessages(contactId, messageKeys);
+  console.error(`[ReplyBuffer] Analysis still failing for ${contactId} after ${BUFFER_MAX_RETRIES} attempts — released message claims, leaving events unprocessed for the processing-cycle retry (eventIds=[${eventIds.join(',')}])`);
 }
 
 // v2.12 — Mark the buffered reply events processed once analysis is confirmed,
@@ -512,10 +570,19 @@ async function handleReply(req, res) {
   // to the outbound dedup lock. Do NOT fall back to body.id — that is the
   // contactId fallback above and is not a message id (using it would key the
   // lock to the contact and over-suppress). Falls back to null when absent.
-  const messageId = cleanGHLValue(body.messageId) || cleanGHLValue(body.message_id) || null;
+  const rawMessageId = cleanGHLValue(body.messageId) || cleanGHLValue(body.message_id) || null;
 
   if (!contactId) return res.status(400).json({ error: 'Missing contactId in webhook payload' });
   const trimmed = messageText.trim();
+
+  // 2026-07-03 — every ghl.reply_received MUST carry a non-null message_id.
+  // GHL's inbound webhook frequently omits one; before this, message_id:null
+  // degraded the inbound idempotency key (idempotency.js) to per-event keys
+  // that never collide, letting the same physical message be analyzed twice
+  // (Steve Nkzhm incident). When absent we synthesize a deterministic key:
+  // sha1(contactId | body | 10-second bucket) — the same message seen twice
+  // inside the window maps to the same key.
+  const messageId = rawMessageId || buildMessageKey(contactId, null, trimmed);
 
   // DNC always wins, regardless of contact state — fires immediately,
   // bypasses the reply buffer (no analyzer call needed).
