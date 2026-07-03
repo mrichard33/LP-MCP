@@ -118,7 +118,7 @@ const TYPO_TARGETS = [
   'icloud.com', 'comcast.net', 'bellsouth.net', 'verizon.net', 'att.net',
   'sbcglobal.net', 'earthlink.net', 'msn.com', 'live.com',
   'tampabay.rr.com', 'cfl.rr.com',
-]);
+];
 
 // Real domains that sit at distance 1 from a TYPO_TARGET — never flag these.
 const KNOWN_GOOD_DOMAINS = new Set([
