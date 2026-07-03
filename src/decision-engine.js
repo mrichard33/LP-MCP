@@ -162,10 +162,15 @@ import { executeActionById } from './action-executor.js';
 // completion so duplicate webhook deliveries can't double-fire rules.
 import { tryClaimEvent, recordResult } from './services/idempotency.js';
 
+// 2026-07-03 — fail-closed condition telemetry (pipeline-integrity breach:
+// ~150 unearned stage moves). Emits rule.condition_failed_closed whenever a
+// rule is suppressed because the data a condition references is unreadable.
+import { emitEvent } from './event-emitter.js';
+
 // Booking-active guard (2026-06-03). Reuses the same in-home appointment lookup
 // the Layer-3 post-book guard uses, exposed as a context_conditions operator so
 // escalation/objection/callback rules can opt out while a booking is in flight.
-import { hasActiveInHomeAppointment } from './services/layer3-dispatch.js';
+import { isInHomeCalendarId } from './knowledge/booking-calendar-router.js';
 import { isRescheduleInflight } from './services/reschedule-inflight.js';
 
 // Universal Hold timeout routing (2026-06-12). Two booking-push-timeout gates for
@@ -445,18 +450,24 @@ async function fetchLeadIntelligence(ghlContactId) {
   return data;
 }
 
+// 2026-07-03 fail-closed rework: returns NULL when the tag set is UNREADABLE
+// (no key, no contact id, HTTP error, timeout) and an array (possibly empty)
+// only when we actually saw the contact. Callers in the condition evaluator
+// treat null as "referenced data missing" → the rule is suppressed instead of
+// wildcard-passing. Previously [] was returned for both "no tags" and "error",
+// which made not_has_tag* conditions silently fail open on infra blips.
 async function fetchContactTags(ghlContactId) {
   const GHL_API_KEY = process.env.GHL_API_KEY;
-  if (!GHL_API_KEY || !ghlContactId) return [];
+  if (!GHL_API_KEY || !ghlContactId) return null;
   try {
     const res = await fetch(`https://services.leadconnectorhq.com/contacts/${ghlContactId}`, {
       headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-07-28', 'Accept': 'application/json' },
       signal: AbortSignal.timeout(10000),
     });
-    if (!res.ok) return [];
+    if (!res.ok) return null;
     const data = await res.json();
     return data?.contact?.tags || [];
-  } catch { return []; }
+  } catch { return null; }
 }
 
 // Single GHL fetch returning both tags and customFields. Used by resolveDemoState
@@ -534,18 +545,19 @@ async function resolveDemoState(event, intelligence) {
   return 'unknown';
 }
 
+// 2026-07-03 fail-closed rework: NULL when unreadable (see fetchContactTags).
 async function fetchContactCustomFields(ghlContactId) {
   const GHL_API_KEY = process.env.GHL_API_KEY;
-  if (!GHL_API_KEY || !ghlContactId) return [];
+  if (!GHL_API_KEY || !ghlContactId) return null;
   try {
     const res = await fetch(`https://services.leadconnectorhq.com/contacts/${ghlContactId}`, {
       headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-07-28', 'Accept': 'application/json' },
       signal: AbortSignal.timeout(10000),
     });
-    if (!res.ok) return [];
+    if (!res.ok) return null;
     const data = await res.json();
     return data?.contact?.customFields || [];
-  } catch { return []; }
+  } catch { return null; }
 }
 
 // v2.11 — Engagement-depth gating (see top-of-file v2.11 doc).
@@ -605,19 +617,72 @@ async function countThreadTurns(ghlContactId, sinceMinutes = 60) {
   }
 }
 
-async function evaluateContextConditions(conditions, intelligence, event) {
+// 2026-07-03 — fail-closed telemetry (pipeline-integrity breach). One event
+// per (source event, rule, condition key); the deterministic idempotency key
+// dedups re-evaluations. bypass_filter so the intake filter (which has no
+// allowlist entry for this observability type) doesn't divert it.
+function emitConditionFailClosed(event, ruleKey, missingKey, detail) {
+  emitEvent({
+    event_type: 'rule.condition_failed_closed',
+    source: 'decision_engine',
+    entity_type: 'contact',
+    entity_id: String(event?.ghl_contact_id || event?.entity_id || 'unknown'),
+    ghl_contact_id: event?.ghl_contact_id || null,
+    payload: {
+      rule_key: ruleKey,
+      missing_key: missingKey,
+      detail: detail || null,
+      source_event_id: event?.id || null,
+      source_event_type: event?.event_type || null,
+    },
+    priority: 'low',
+    bypass_filter: true,
+    idempotency_key: `rule_failclosed_${event?.id || 'noevt'}_${ruleKey || 'norule'}_${missingKey}`,
+  }).catch((err) => console.warn(`[DecisionEngine] fail-closed event emit failed: ${err.message}`));
+}
+
+// 2026-07-03 — FAIL-CLOSED DOCTRINE (pipeline-integrity breach, 111 contacts):
+// any condition key that references data we cannot read (unreachable contact
+// tags, unreadable custom fields, failed appointment/LP lookups, absent
+// numeric intelligence) evaluates FALSE and suppresses the rule, with a
+// rule.condition_failed_closed event for observability. Missing data is never
+// a wildcard pass. This applies engine-wide, to every condition type,
+// including the not_* negative conditions that previously failed open by
+// design. Deliberate, documented fail-open exceptions no longer apply here.
+async function evaluateContextConditions(conditions, intelligence, event, opts = {}) {
   if (!conditions || typeof conditions !== 'object') return true;
   const intel = intelligence || {};
   const payload = event?.payload || {};
   const merged = { ...intel, ...payload };
-  let tags = null;
-  let customFields = null;
+  const ruleKey = opts.ruleKey || null;
+  let tags;            // undefined = not fetched yet; null = fetched, UNREADABLE
+  let tagsFetched = false;
+  let customFields;    // same contract
+  let customFieldsFetched = false;
+
+  const failClosed = (condKey, detail) => {
+    console.log(`[Context] FAIL-CLOSED: ${condKey} — ${detail} (rule ${ruleKey || '?'} suppressed)`);
+    emitConditionFailClosed(event, ruleKey, condKey, detail);
+    return false;
+  };
+  // Numeric reads: undefined/null/non-finite = the datum is absent → fail closed.
+  const numOrNull = (field) => {
+    const v = merged[field];
+    if (v === undefined || v === null) return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
 
   for (const [key, expected] of Object.entries(conditions)) {
     switch (key) {
-      case 'buyer_stage_eq': if ((merged.buyer_stage || 0) !== expected) return false; break;
-      case 'buyer_stage_gte': if ((merged.buyer_stage || 0) < expected) return false; break;
-      case 'buyer_stage_lte': if ((merged.buyer_stage || 0) > expected) return false; break;
+      case 'buyer_stage_eq': case 'buyer_stage_gte': case 'buyer_stage_lte': {
+        const v = numOrNull('buyer_stage');
+        if (v === null) return failClosed(key, 'buyer_stage absent from intelligence/payload');
+        if (key === 'buyer_stage_eq' && v !== expected) return false;
+        if (key === 'buyer_stage_gte' && v < expected) return false;
+        if (key === 'buyer_stage_lte' && v > expected) return false;
+        break;
+      }
       case 'objection_type_eq': if (merged.objection_type !== expected) return false; break;
       case 'demo_state_eq': {
         const state = await resolveDemoState(event, intelligence);
@@ -633,65 +698,70 @@ async function evaluateContextConditions(conditions, intelligence, event) {
       case 'recommended_action_eq': if (merged.recommended_action !== expected) return false; break;
       case 'recommended_action_neq': if (merged.recommended_action === expected) return false; break;
       case 'fast_track_eligible': if (!!merged.fast_track_eligible !== !!expected) return false; break;
-      case 'lead_score_gte': if ((merged.lead_score || 0) < expected) return false; break;
-      case 'lead_score_lte': if ((merged.lead_score || 0) > expected) return false; break;
-      case 'days_in_stage_gte': if ((merged.days_in_current_stage || 0) < expected) return false; break;
+      case 'lead_score_gte': case 'lead_score_lte': {
+        const v = numOrNull('lead_score');
+        if (v === null) return failClosed(key, 'lead_score absent from intelligence/payload');
+        if (key === 'lead_score_gte' && v < expected) return false;
+        if (key === 'lead_score_lte' && v > expected) return false;
+        break;
+      }
+      case 'days_in_stage_gte': {
+        const v = numOrNull('days_in_current_stage');
+        if (v === null) return failClosed(key, 'days_in_current_stage absent from intelligence/payload');
+        if (v < expected) return false;
+        break;
+      }
       case 'has_tag':
-        if (!tags) tags = await fetchContactTags(event.ghl_contact_id);
-        if (!tags.includes(expected)) return false; break;
       case 'not_has_tag':
-        if (!tags) tags = await fetchContactTags(event.ghl_contact_id);
-        if (tags.includes(expected)) return false; break;
-
-      case 'has_any_tag': {
-        const wanted = Array.isArray(expected) ? expected : [expected];
-        if (!tags) tags = await fetchContactTags(event.ghl_contact_id);
-        if (!wanted.some(t => tags.includes(t))) {
-          console.log(`[Context] BLOCKED: has_any_tag — none of [${wanted.join(',')}] present on contact`);
-          return false;
-        }
-        break;
-      }
-      case 'not_has_any_tag': {
-        const blocked = Array.isArray(expected) ? expected : [expected];
-        if (!tags) tags = await fetchContactTags(event.ghl_contact_id);
-        const found = blocked.find(t => tags.includes(t));
-        if (found) {
-          console.log(`[Context] BLOCKED: not_has_any_tag — contact has "${found}" (in blocklist)`);
-          return false;
-        }
-        break;
-      }
-      case 'has_tag_prefix': {
-        if (!tags) tags = await fetchContactTags(event.ghl_contact_id);
-        if (!tags.some(t => typeof t === 'string' && t.startsWith(expected))) {
-          console.log(`[Context] BLOCKED: has_tag_prefix — no tag starts with "${expected}"`);
-          return false;
-        }
-        break;
-      }
-      case 'not_has_tag_prefix': {
-        if (!tags) tags = await fetchContactTags(event.ghl_contact_id);
-        const prefixed = tags.find(t => typeof t === 'string' && t.startsWith(expected));
-        if (prefixed) {
-          console.log(`[Context] BLOCKED: not_has_tag_prefix — contact has "${prefixed}"`);
-          return false;
-        }
-        break;
-      }
+      case 'has_any_tag':
+      case 'not_has_any_tag':
+      case 'has_tag_prefix':
+      case 'not_has_tag_prefix':
       case 'not_has_any_tag_prefix': {
-        const blockedPrefixes = Array.isArray(expected) ? expected : [expected];
-        if (!tags) tags = await fetchContactTags(event.ghl_contact_id);
-        // fetchContactTags always resolves to an array ([] on miss), so an
-        // unreadable tag set fails open here — same as not_has_tag_prefix:
-        // if we can't see a blocked tag, we don't block. (tags || []) guards
-        // defensively in case the contract ever changes.
-        const prefixed = (tags || []).find(t =>
-          typeof t === 'string' && blockedPrefixes.some(p => typeof p === 'string' && t.startsWith(p))
-        );
-        if (prefixed) {
-          console.log(`[Context] BLOCKED: not_has_any_tag_prefix — contact has "${prefixed}" (matches blocklist)`);
-          return false;
+        if (!tagsFetched) { tags = await fetchContactTags(event.ghl_contact_id); tagsFetched = true; }
+        // 2026-07-03 fail-closed: an UNREADABLE tag set (null) suppresses the
+        // rule for positive AND negative tag conditions alike. The old
+        // behavior let not_has_* conditions fail open on infra blips ("if we
+        // can't see a blocked tag, we don't block") — that is exactly the
+        // wildcard-pass this rework forbids.
+        if (tags === null) return failClosed(key, 'contact tags unreadable');
+        if (key === 'has_tag') {
+          if (!tags.includes(expected)) return false;
+        } else if (key === 'not_has_tag') {
+          if (tags.includes(expected)) return false;
+        } else if (key === 'has_any_tag') {
+          const wanted = Array.isArray(expected) ? expected : [expected];
+          if (!wanted.some(t => tags.includes(t))) {
+            console.log(`[Context] BLOCKED: has_any_tag — none of [${wanted.join(',')}] present on contact`);
+            return false;
+          }
+        } else if (key === 'not_has_any_tag') {
+          const blocked = Array.isArray(expected) ? expected : [expected];
+          const found = blocked.find(t => tags.includes(t));
+          if (found) {
+            console.log(`[Context] BLOCKED: not_has_any_tag — contact has "${found}" (in blocklist)`);
+            return false;
+          }
+        } else if (key === 'has_tag_prefix') {
+          if (!tags.some(t => typeof t === 'string' && t.startsWith(expected))) {
+            console.log(`[Context] BLOCKED: has_tag_prefix — no tag starts with "${expected}"`);
+            return false;
+          }
+        } else if (key === 'not_has_tag_prefix') {
+          const prefixed = tags.find(t => typeof t === 'string' && t.startsWith(expected));
+          if (prefixed) {
+            console.log(`[Context] BLOCKED: not_has_tag_prefix — contact has "${prefixed}"`);
+            return false;
+          }
+        } else { // not_has_any_tag_prefix
+          const blockedPrefixes = Array.isArray(expected) ? expected : [expected];
+          const prefixed = tags.find(t =>
+            typeof t === 'string' && blockedPrefixes.some(p => typeof p === 'string' && t.startsWith(p))
+          );
+          if (prefixed) {
+            console.log(`[Context] BLOCKED: not_has_any_tag_prefix — contact has "${prefixed}" (matches blocklist)`);
+            return false;
+          }
         }
         break;
       }
@@ -701,7 +771,8 @@ async function evaluateContextConditions(conditions, intelligence, event) {
           console.warn(`[Context] custom_field_eq requires { field_id, value }`);
           return false;
         }
-        if (!customFields) customFields = await fetchContactCustomFields(event.ghl_contact_id);
+        if (!customFieldsFetched) { customFields = await fetchContactCustomFields(event.ghl_contact_id); customFieldsFetched = true; }
+        if (customFields === null) return failClosed(key, 'contact custom fields unreadable');
         const entry = customFields.find(f => f?.id === fieldId);
         const actual = entry?.value ?? null;
         if (String(actual) !== String(expected.value)) {
@@ -723,7 +794,8 @@ async function evaluateContextConditions(conditions, intelligence, event) {
           console.warn(`[Context] custom_field_in requires { field_id, values: [...] }`);
           return false;
         }
-        if (!customFields) customFields = await fetchContactCustomFields(event.ghl_contact_id);
+        if (!customFieldsFetched) { customFields = await fetchContactCustomFields(event.ghl_contact_id); customFieldsFetched = true; }
+        if (customFields === null) return failClosed(key, 'contact custom fields unreadable');
         const entry = customFields.find(f => f?.id === fieldId);
         const actual = entry?.value ?? null;
         if (!values.includes(String(actual))) {
@@ -739,7 +811,12 @@ async function evaluateContextConditions(conditions, intelligence, event) {
       // helper so a transient lookup error never blocks the rule.
       case 'not_active_in_home_appointment': {
         if (!expected) break; // only gate when set truthy
-        if (await hasActiveInHomeAppointment(event.ghl_contact_id)) {
+        // 2026-07-03 fail-closed: read the appointment list directly (null =
+        // lookup failed) instead of the fail-open hasActiveInHomeAppointment
+        // helper, which maps errors to "no appointment" — a wildcard pass.
+        const inHomeAppts = await fetchUpcomingAppointments(event.ghl_contact_id);
+        if (!Array.isArray(inHomeAppts)) return failClosed(key, 'appointment lookup unavailable');
+        if (inHomeAppts.some(a => isInHomeCalendarId(a.calendar_id))) {
           console.log(`[Context] BLOCKED: not_active_in_home_appointment — contact ${event.ghl_contact_id} has an active in-home appt`);
           return false;
         }
@@ -761,9 +838,19 @@ async function evaluateContextConditions(conditions, intelligence, event) {
         break;
       }
 
-      case 'buyer_stage_confidence_gte': if ((merged.buyer_stage_confidence || 0) < expected) return false; break;
+      case 'buyer_stage_confidence_gte': {
+        const v = numOrNull('buyer_stage_confidence');
+        if (v === null) return failClosed(key, 'buyer_stage_confidence absent from intelligence/payload');
+        if (v < expected) return false;
+        break;
+      }
       case 'intent_tier_eq': if (merged.intent_tier !== expected) return false; break;
-      case 'intent_score_gte': if ((merged.intent_score || 0) < expected) return false; break;
+      case 'intent_score_gte': {
+        const v = numOrNull('intent_score');
+        if (v === null) return failClosed(key, 'intent_score absent from intelligence/payload');
+        if (v < expected) return false;
+        break;
+      }
       case 'compound_pattern_eq': if (merged.compound_pattern !== expected) return false; break;
       case 'payload_field_not_null': {
         const fieldVal = payload[expected];
@@ -785,15 +872,20 @@ async function evaluateContextConditions(conditions, intelligence, event) {
         const allowed = Array.isArray(expected) ? expected : [expected];
         const ghlContactId = event.ghl_contact_id;
         if (!ghlContactId) {
-          console.log(`[Context] BLOCKED: lp_disposition_in requires ghl_contact_id`);
-          return false;
+          return failClosed(key, 'no ghl_contact_id on event');
         }
-        const { data: lpLead } = await supabase.from('lp_leads')
+        const { data: lpLead, error: lpErr } = await supabase.from('lp_leads')
           .select('disposition_code')
           .eq('ghl_contact_id', ghlContactId)
           .order('synced_at', { ascending: false })
           .limit(1).maybeSingle();
-        const disp = lpLead?.disposition_code || null;
+        // 2026-07-03 fail-closed: a failed LP lookup is missing data, not a
+        // wildcard. A contact with NO LP record (query ok, no row) has no
+        // disposition — that is also "no match" unless the rule explicitly
+        // allows null. Never treat either as a pass.
+        if (lpErr) return failClosed(key, `lp_leads lookup failed: ${lpErr.message}`);
+        if (!lpLead) return failClosed(key, 'contact has no LP record — disposition gate cannot pass');
+        const disp = lpLead.disposition_code || null;
         if (!allowed.includes(disp)) {
           console.log(`[Context] BLOCKED: lp_disposition "${disp}" not in [${allowed.join(',')}]`);
           return false;
@@ -828,7 +920,7 @@ async function evaluateContextConditions(conditions, intelligence, event) {
         }
         let anyPassed = false;
         for (const altCondition of expected) {
-          if (await evaluateContextConditions(altCondition, intelligence, event)) {
+          if (await evaluateContextConditions(altCondition, intelligence, event, opts)) {
             anyPassed = true;
             break;
           }
@@ -860,6 +952,11 @@ async function evaluateContextConditions(conditions, intelligence, event) {
       }
       case 'payload_message_not_matches': {
         // String = single regex; array = ANY match blocks (OR).
+        // 2026-07-03 fail-closed: absent message_text is missing data, not a
+        // free pass through a text blocklist.
+        if (payload.message_text === undefined || payload.message_text === null) {
+          return failClosed(key, 'payload.message_text absent');
+        }
         const text = String(payload.message_text || '');
         const blockedPatterns = Array.isArray(expected) ? expected : [expected];
         for (const raw of blockedPatterns) {
@@ -884,11 +981,15 @@ async function evaluateContextConditions(conditions, intelligence, event) {
       case 'no_future_appointment': {
         if (!expected) break; // only gate when set truthy
         const appts = await fetchUpcomingAppointments(event.ghl_contact_id);
-        if (appts && appts.length > 0) {
+        // 2026-07-03 fail-closed: null (GHL error) no longer passes — an
+        // unknown calendar must not green-light a rule that requires "no
+        // future appointment".
+        if (!Array.isArray(appts)) return failClosed(key, 'appointment lookup unavailable');
+        if (appts.length > 0) {
           console.log(`[Context] BLOCKED: no_future_appointment — contact ${event.ghl_contact_id} has ${appts.length} upcoming`);
           return false;
         }
-        break; // appts === null (unknown) or [] (none) → pass
+        break; // [] (verified none) → pass
       }
 
       // last_active_appointment (2026-06-24): appointment-aware cancellation
@@ -934,14 +1035,19 @@ async function evaluateContextConditions(conditions, intelligence, event) {
         const hours = Number(expected);
         if (!Number.isFinite(hours) || hours <= 0) break;
         const lastMs = await getLastInboundMessageMs(event.ghl_contact_id);
-        if (Number.isFinite(lastMs)) {
-          const hoursSince = (Date.now() - lastMs) / 3_600_000;
-          if (hoursSince < hours) {
-            console.log(`[Context] BLOCKED: no_inbound_within_hours — inbound ${hoursSince.toFixed(1)}h ago < ${hours}h`);
-            return false;
-          }
+        // 2026-07-03 fail-closed: NaN (message layer unreadable) no longer
+        // passes. Note: getLastInboundMessageMs returns NaN both for "lookup
+        // failed" AND "genuinely no inbound ever" — suppressing both is the
+        // conservative direction this rework mandates (the paired
+        // inbound_within_hours gate was already fail-closed, so under failure
+        // NEITHER timeout rule fires now, instead of exactly one).
+        if (!Number.isFinite(lastMs)) return failClosed(key, 'last inbound age unknown');
+        const hoursSince = (Date.now() - lastMs) / 3_600_000;
+        if (hoursSince < hours) {
+          console.log(`[Context] BLOCKED: no_inbound_within_hours — inbound ${hoursSince.toFixed(1)}h ago < ${hours}h`);
+          return false;
         }
-        break; // no inbound, or unknown → pass (fail-open)
+        break;
       }
 
       // inbound_within_hours: N — inverse of the above (conversation alive). Block
@@ -964,7 +1070,13 @@ async function evaluateContextConditions(conditions, intelligence, event) {
         break; // inbound within N hours → pass
       }
 
-      default: console.warn(`[DecisionEngine] Unknown context condition: ${key}`);
+      // 2026-07-03 fail-closed: an unknown condition key used to warn and
+      // PASS — a typo'd or not-yet-deployed operator was a wildcard. Now it
+      // suppresses the rule and emits telemetry, so a mis-authored gate can
+      // never silently stop gating.
+      default:
+        console.warn(`[DecisionEngine] Unknown context condition: ${key} — failing closed`);
+        return failClosed(key, 'unknown condition operator');
     }
   }
   return true;
@@ -993,10 +1105,21 @@ async function findMatchingRules(event) {
 
   for (const rule of rules) {
     if (!matchesPattern(event, rule.event_pattern)) continue;
-    const ruleType = rule.rule_type || 'pattern';
-    if (ruleType === 'contextual' && rule.context_conditions) {
+
+    // 2026-07-03 — STRUCTURAL FIX (pipeline-integrity breach, 111 contacts).
+    // Two silent wildcard-passes lived here:
+    //   1. Conditions were only read from rule.context_conditions, but
+    //      migrations (e.g. sql/007_behavioral_objection_stage_gates.sql)
+    //      wrote gates into rule.conditions — so the 6 BEHAVIORAL_*_OBJECTION
+    //      rules' lp_disposition_in gate NEVER executed.
+    //   2. Conditions were only evaluated when rule_type === 'contextual';
+    //      any other rule_type skipped its written conditions entirely.
+    // Now: merge BOTH columns and evaluate whenever anything is present,
+    // regardless of rule_type. A rule with a written gate always gets gated.
+    const conds = { ...(rule.conditions || {}), ...(rule.context_conditions || {}) };
+    if (Object.keys(conds).length > 0) {
       if (!intelligenceFetched) { intelligence = await fetchLeadIntelligence(event.ghl_contact_id); intelligenceFetched = true; }
-      if (!(await evaluateContextConditions(rule.context_conditions, intelligence, event))) continue;
+      if (!(await evaluateContextConditions(conds, intelligence, event, { ruleKey: rule.rule_key }))) continue;
     }
 
     if (!(await passesStageGate(event, rule, intelligence))) continue;
@@ -1023,14 +1146,19 @@ function inferChannelFromEvent(event) {
   const explicit = event.payload.channel;
   if (typeof explicit === 'string') {
     const c = explicit.toLowerCase();
-    if (c === 'sms' || c === 'email') return c;
+    if (c === 'sms' || c === 'email' || c === 'livechat') return c;
   }
   const mt = event.payload.message_type;
   if (typeof mt === 'string') {
     const m = mt.toLowerCase();
-    if (m === 'sms' || m === 'email') return m;
+    if (m === 'sms' || m === 'email' || m === 'livechat') return m;
     if (m === 'type_sms') return 'sms';
     if (m === 'type_email') return 'email';
+    // 2026-07-03 — livechat no longer collapses to null (which defaulted to
+    // 'sms' at send time and answered widget chats over SMS, Steve Nkzhm
+    // incident). The send handler inherits the final channel from the
+    // inbound conversation; this keeps the payload signal honest.
+    if (m === 'type_live_chat' || m === 'type_webchat' || m.includes('live_chat') || m.includes('livechat') || m.includes('webchat')) return 'livechat';
   }
   return null;
 }
@@ -1316,4 +1444,7 @@ export const _internal = {
   DEFAULT_PRIORITY_BY_TYPE,
   DEFAULT_ACTION_PRIORITY,
   TIME_SENSITIVE_PRIORITY,
+  // 2026-07-03 — fail-closed condition evaluation + livechat channel inference
+  evaluateContextConditions,
+  inferChannelFromEvent,
 };

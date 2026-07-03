@@ -7,6 +7,7 @@
  */
 
 import { checkLock } from './outbound-locks.js';
+import { checkAgenticSlot } from './agentic-reply-locks.js';
 
 function guard(req, res) {
   const token = process.env.MCP_AUTH_TOKEN;
@@ -27,8 +28,20 @@ export function registerInternalRoutes(app) {
       if (!contact_id || !trigger_id) {
         return res.status(400).json({ error: 'contact_id and trigger_id required' });
       }
-      const result = await checkLock(contact_id, trigger_id);
-      res.json(result);
+      // 2026-07-03 — the response now also carries the ENFORCING per-contact
+      // agentic slot (single-flight + cooldown), so external callers (HL MCP)
+      // see the same gate the executor enforces. `held` is true when either
+      // layer would block a send.
+      const [result, agentic] = await Promise.all([
+        checkLock(contact_id, trigger_id),
+        checkAgenticSlot(contact_id),
+      ]);
+      res.json({
+        ...result,
+        held: !!(result.held || agentic.held),
+        trigger_lock: { held: !!result.held },
+        agentic_slot: agentic,
+      });
     } catch (err) {
       console.error('[internal-routes] check-outbound-lock error:', err.message);
       res.status(500).json({ error: err.message });

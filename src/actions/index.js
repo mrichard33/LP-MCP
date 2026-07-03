@@ -117,12 +117,19 @@ import { classifyHandlerResult } from './result-status.js';
 import { tryAcquireLock, releaseLock } from '../services/outbound-locks.js';
 import { getDispatchForClassification } from '../services/layer3-dispatch.js';
 
+// 2026-07-03 — enforcing per-contact single-flight + cooldown (Steve Nkzhm
+// incident). Complements outbound_locks, which is per (contact, trigger_id)
+// and therefore blind to two sends with different trigger_ids.
+import { acquireAgenticSlot, releaseAgenticSlot, commitAgenticSend } from '../services/agentic-reply-locks.js';
+
 // 2026-06-16 — Layer-3 suppress telemetry + silent agentic teardown
 import { emitEvent } from '../event-emitter.js';
 import { endAgenticHandoff } from '../services/agentic-handoff.js';
 
 // Phase 1 Intake/Routing Layer #51 — universal outbound suppression
-import { checkSuppression } from '../services/suppression-check.js';
+// 2026-07-03 — checkMutationSuppression: suppress-automation / stop-bot now
+// gates ALL mutating action types, not only send_message.
+import { checkSuppression, checkMutationSuppression } from '../services/suppression-check.js';
 // Send-dedup — logical-identity idempotency for non-idempotent senders (2026-06-05)
 import { claimSendMark, releaseSendMark, makeDedupKey } from '../services/send-dedup.js';
 
@@ -204,6 +211,55 @@ async function executeSendMessageWithLock(action, context) {
     trigger_id = evt?.payload?.message_id || (evt?.id ? `evt-${evt.id}` : null);
   }
 
+  // ── Enforcing per-contact single-flight + cooldown (2026-07-03) ──
+  // At most ONE agentic reply in flight per contact; sends are spaced by
+  // MIN_AGENTIC_SEND_GAP_SEC. A job that arrives while another is in flight
+  // supersedes it (the displaced job aborts before its GHL POST — it is
+  // unsent, so nothing is recalled). A job that lands inside the cooldown is
+  // rescheduled via executeActionById: the re-run repeats this whole gate,
+  // so supersession and suppression are re-checked at send time. The timer
+  // is in-process — a restart during the (≤90s) window drops the reschedule;
+  // the action row stays visible as skipped/agentic_cooldown for forensics.
+  const agenticJobId = String(action.id ?? `job-${trigger_id || contact_id}`);
+  const slot = await acquireAgenticSlot({
+    contact_id,
+    job_id: agenticJobId,
+    trigger_id,
+    holder: 'agent_executor',
+  });
+  if (!slot.acquired && slot.reason === 'cooldown') {
+    const delayMs = Math.max(1000, (slot.retry_in_ms || 0) + 500);
+    if (Number.isFinite(Number(action.id))) {
+      console.log(
+        `[ActionExecutor] send_message inside agentic cooldown: contact=${contact_id} ` +
+        `action=${action.id} retry_at=${slot.retry_at} — rescheduling in ${Math.round(delayMs / 1000)}s`
+      );
+      const timer = setTimeout(() => {
+        executeActionById(Number(action.id)).catch((err) =>
+          console.error(`[ActionExecutor] cooldown re-run failed for action ${action.id}: ${err.message}`)
+        );
+      }, delayMs);
+      if (typeof timer.unref === 'function') timer.unref();
+    } else {
+      console.warn(
+        `[ActionExecutor] send_message inside agentic cooldown with no action id: contact=${contact_id} — skipping (cannot reschedule)`
+      );
+    }
+    return {
+      skipped: true,
+      reason: 'agentic_cooldown',
+      retry_at: slot.retry_at,
+      rescheduled: Number.isFinite(Number(action.id)),
+      contact_id,
+      trigger_id,
+    };
+  }
+  if (slot.superseded_job_id) {
+    console.log(
+      `[ActionExecutor] send_message job ${agenticJobId} superseded unsent job ${slot.superseded_job_id} for contact ${contact_id}`
+    );
+  }
+
   const lock = await tryAcquireLock({
     contact_id,
     trigger_id,
@@ -218,6 +274,8 @@ async function executeSendMessageWithLock(action, context) {
     console.log(
       `[ActionExecutor] send_message blocked by outbound lock: contact=${contact_id} trigger=${trigger_id} held_by=${lock.held_by}`
     );
+    // We hold the agentic slot but will not send — free it for the holder.
+    await releaseAgenticSlot(contact_id, agenticJobId);
     return {
       skipped: true,
       reason: 'outbound_lock_held',
@@ -230,12 +288,22 @@ async function executeSendMessageWithLock(action, context) {
 
   try {
     const result = await executeSendMessage(action, context);
+    // 'message_sent' is the only result shape where a GHL send actually
+    // happened — commit arms the per-contact cooldown. Every other outcome
+    // (blocked, suppressed, handed off, superseded, no trigger message)
+    // sent nothing, so the slot is released with no cooldown.
+    if (result?.action === 'message_sent') {
+      await commitAgenticSend(contact_id, agenticJobId);
+    } else {
+      await releaseAgenticSlot(contact_id, agenticJobId);
+    }
     return {
       ...result,
       _outbound_lock: { acquired: true, trigger_id, lock_key: lock.lock_key, reason: lock.reason },
     };
   } catch (err) {
     if (trigger_id) await releaseLock(contact_id, trigger_id);
+    await releaseAgenticSlot(contact_id, agenticJobId);
     throw err;
   }
 }
@@ -409,6 +477,33 @@ const CONTEXT_AWARE_HANDLERS = new Set([
 // EXECUTOR ENGINE
 // ═══════════════════════════════════════════════════════════════════
 
+// 2026-07-03 — action types that MUTATE contact/pipeline state and are
+// therefore gated by suppress-automation / stop-bot (agentic.action_suppressed).
+// send_message keeps its own richer gate inside executeSendMessageWithLock.
+// Deliberately NOT gated: appointment actions (cancel/reschedule may be the
+// direct fulfillment of an explicit customer request), LP DNC writes
+// (compliance must always land), notifications/tasks (rep-facing, not
+// contact-facing), and read/compute actions.
+const MUTATION_GATED_ACTION_TYPES = new Set([
+  'move_opportunity',
+  'update_opportunity',
+  'add_to_workflow',
+  'remove_from_workflow',
+  'set_stage',
+  'update_custom_fields',
+  'update_contact_email',
+  'add_tag',
+  'remove_tag',
+]);
+
+// add_tag exception: suppression/audit tags must still land on a suppressed
+// contact (they're how suppression is recorded in the first place).
+const SUPPRESSION_AUDIT_TAG_RE = /^(dnc|dnc-|do-not-contact|stop-bot|suppress-|hard-disqualified|quarantined|audit-|compliance-|loss-reason:)/i;
+
+function isSuppressionAuditTag(tag) {
+  return SUPPRESSION_AUDIT_TAG_RE.test(String(tag || ''));
+}
+
 async function executeSingleAction(action, batchContext = {}, priorBatchResults = []) {
   const handler = ACTION_HANDLERS[action.action_type];
   if (!handler) {
@@ -425,6 +520,54 @@ async function executeSingleAction(action, batchContext = {}, priorBatchResults 
     status: 'executing',
     updated_at: new Date().toISOString(),
   }).eq('id', action.id);
+
+  // ═══ Mutation suppression gate (2026-07-03) ══════════════════════
+  // suppress-automation / stop-bot blocks ALL mutating action types — not
+  // only send_message. Exception: add_tag of a suppression/audit tag (that
+  // is how suppression itself is recorded). Fail-open on infra errors,
+  // matching checkSuppression.
+  if (MUTATION_GATED_ACTION_TYPES.has(action.action_type)) {
+    const exemptTagAdd = action.action_type === 'add_tag'
+      && isSuppressionAuditTag(action.action_payload?.tag);
+    if (!exemptTagAdd) {
+      const mutationGate = await checkMutationSuppression(action.target_id);
+      if (mutationGate.suppressed) {
+        console.log(
+          `[ActionExecutor] 🚫 ${action.action_type} suppressed (action ${action.id}): ` +
+          `contact ${action.target_id} has ${mutationGate.matched_tag}`
+        );
+        emitEvent({
+          event_type: 'agentic.action_suppressed',
+          source: 'action_executor',
+          entity_type: 'contact',
+          entity_id: String(action.target_id || 'unknown'),
+          ghl_contact_id: action.target_id || null,
+          priority: 'low',
+          bypass_filter: true,
+          payload: {
+            action_type: action.action_type,
+            action_id: action.id || null,
+            rule_key: action.rule_applied || null,
+            matched_tag: mutationGate.matched_tag,
+          },
+          idempotency_key: `action_suppressed_${action.id || `${action.target_id}_${action.action_type}`}`,
+        }).catch((err) => console.warn(`[ActionExecutor] action_suppressed emit failed: ${err.message}`));
+        await supabase.from('agent_actions').update({
+          status: 'suppressed',
+          error_message: `mutation suppressed: contact has ${mutationGate.matched_tag}`,
+          execution_result: { suppressed: true, matched_tag: mutationGate.matched_tag },
+          executed_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        }).eq('id', action.id);
+        return {
+          action_id: action.id,
+          status: 'suppressed',
+          action_type: action.action_type,
+          result: { suppressed: true, matched_tag: mutationGate.matched_tag },
+        };
+      }
+    }
+  }
 
   // ═══ Antifragile Validation Gate (2026-05-18) ═══════════════════
   // Runs immediately before handler dispatch. Blocks actions that violate

@@ -154,5 +154,50 @@ export async function checkSuppression(contact_id) {
   };
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// 2026-07-03 — MUTATION suppression (pipeline-integrity breach)
+// ═══════════════════════════════════════════════════════════════════
+//
+// suppress-automation / stop-bot on a contact must block ALL mutating action
+// types (move_opportunity, workflows, stages, custom fields, non-audit tags)
+// — not only send_message. This is the tag check for that gate; the gate
+// itself lives in the action executor (src/actions/index.js).
+//
+// Same snapshot read + fail-open contract as checkSuppression above.
+
+const MUTATION_SUPPRESS_TAGS = ['suppress-automation', 'stop-bot'];
+const MUTATION_SUPPRESS_SET = new Set(MUTATION_SUPPRESS_TAGS);
+
+/**
+ * Pure predicate over a tag array (unit-testable without a DB).
+ */
+export function matchMutationSuppression(tags) {
+  if (!Array.isArray(tags)) return null;
+  return tags.find(t => MUTATION_SUPPRESS_SET.has(String(t).toLowerCase())) || null;
+}
+
+export async function checkMutationSuppression(contact_id) {
+  if (!supabase) return { suppressed: false, reason: 'no_supabase_open' };
+  if (!contact_id) return { suppressed: false, reason: 'no_contact_id_open' };
+
+  const { data, error } = await supabase
+    .from('contact_tag_snapshot')
+    .select('tags')
+    .eq('ghl_contact_id', contact_id)
+    .maybeSingle();
+
+  if (error) {
+    console.error(`[suppression-check] mutation snapshot read error for ${contact_id}: ${error.message}`);
+    return { suppressed: false, reason: 'snapshot_read_error_open' };
+  }
+  if (!data || !Array.isArray(data.tags) || data.tags.length === 0) {
+    return { suppressed: false, reason: 'no_snapshot_open' };
+  }
+
+  const matched = matchMutationSuppression(data.tags);
+  if (!matched) return { suppressed: false, reason: 'no_match' };
+  return { suppressed: true, reason: 'mutation_suppression_tag', matched_tag: matched };
+}
+
 // Exported for unit tests + introspection
-export const __testing = { SUPPRESS_SET };
+export const __testing = { SUPPRESS_SET, MUTATION_SUPPRESS_SET };

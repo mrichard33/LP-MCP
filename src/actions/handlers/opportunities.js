@@ -36,6 +36,9 @@ import { ghlFetch, isLPLeadId } from '../helpers.js';
 import { PIPELINE_IDS, STAGE_MAP, GHL_LOCATION_ID } from '../constants.js';
 import { checkForwardOnly } from '../../pipeline-guard.js';
 import { updateGHLContactFields } from '../../ghl.js';
+// 2026-07-03 (pipeline-integrity breach) — evidence-gated milestone moves.
+import { checkStageMoveEvidence } from '../stage-evidence.js';
+import { emitEvent } from '../../event-emitter.js';
 
 export async function executeMoveOpportunity(action) {
   const contactId = action.target_id;
@@ -47,6 +50,51 @@ export async function executeMoveOpportunity(action) {
   if (!pipelineId) throw new Error(`Unknown pipeline: ${pipeline}`);
   const stageId = STAGE_MAP[stage];
   if (!stageId) throw new Error(`Unknown stage: "${stage}" — fix the agent_rule`);
+
+  // ── Stage-transition evidence validator (2026-07-03) ────────────
+  // Milestone stages require real-world evidence BEFORE any move, no matter
+  // which rule requested it (BEHAVIORAL_FAST_TRACK fabricated "Appointment
+  // Booked" on AI intent; BEHAVIORAL_*_OBJECTION fabricated "Proposal
+  // Delivered" with no demo — ~150 unearned moves / 111 contacts). Demotions
+  // and un-gated stages pass straight through (required: false).
+  const evidence = await checkStageMoveEvidence(contactId, stageId);
+  if (evidence.required && !evidence.allowed) {
+    const ruleKey = action.rule_applied || null;
+    console.warn(
+      `[ActionExecutor] 🚫 move_opportunity BLOCKED by stage-transition validator: ` +
+      `contact=${contactId} stage="${stage}" rule=${ruleKey || 'manual'} ` +
+      `missing=[${(evidence.missing_evidence || []).join(', ')}]`
+    );
+    emitEvent({
+      event_type: 'opportunity.move_blocked',
+      source: 'action_executor',
+      entity_type: 'contact',
+      entity_id: String(contactId),
+      ghl_contact_id: String(contactId),
+      priority: 'normal',
+      bypass_filter: true,
+      payload: {
+        rule_key: ruleKey,
+        requested_stage: stage,
+        requested_stage_id: stageId,
+        pipeline,
+        evidence_kind: evidence.evidence_kind,
+        missing_evidence: evidence.missing_evidence,
+        facts_unreadable: evidence.facts_unreadable || false,
+        action_id: action.id || null,
+      },
+      idempotency_key: `move_blocked_${contactId}_${stageId}_${action.id || Date.now()}`,
+    }).catch((err) => console.warn(`[ActionExecutor] move_blocked event emit failed: ${err.message}`));
+    return {
+      action: 'move_blocked_no_evidence',
+      blocked_by_validator: true,
+      reason: `stage "${stage}" requires evidence (${evidence.evidence_kind}); missing: ${(evidence.missing_evidence || []).join(', ')}`,
+      contact_id: contactId,
+      pipeline,
+      requested_stage: stage,
+      missing_evidence: evidence.missing_evidence,
+    };
+  }
 
   const searchRes = await ghlFetch('GET', `/opportunities/search?location_id=${GHL_LOCATION_ID}&contact_id=${contactId}&pipeline_id=${pipelineId}`);
   const opps = searchRes?.opportunities || [];

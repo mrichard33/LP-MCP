@@ -218,10 +218,22 @@ import { bumpContactCache } from './context-builder.js';
 // notifications handlers, so all four GroupMe surfaces share one format.
 import { resolveContactInfo, resolveLPProspectId } from './actions/resolvers.js';
 import { buildNotificationEnrichment, buildRichNotification } from './actions/enrichment.js';
+// 2026-07-03 rebuild (Steve Nkzhm incident) — channel/identity inheritance,
+// AI-disclosure hard guard, per-contact supersession check.
+import { resolveReplyContext, guardDisclosure } from './agentic/reply-sender.js';
+import { checkNotSuperseded } from './services/agentic-reply-locks.js';
+import { emitEvent } from './event-emitter.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
 const GHL_SEND_MESSAGE_WEBHOOK_URL = process.env.GHL_SEND_MESSAGE_WEBHOOK_URL || '';
+
+// 2026-07-03 — direct-send master switch. true (default): agentic replies go
+// straight to the GHL Conversations API with channel + identity inherited
+// from the triggering inbound; the legacy relay-workflow webhook (497e664a)
+// is never called, not even as fallback. false: pre-rebuild routing restored
+// verbatim (instant rollback — requires workflow 497e664a still published).
+const AGENTIC_DIRECT_SEND = String(process.env.AGENTIC_DIRECT_SEND || 'true').toLowerCase() !== 'false';
 
 // v3.3: channel-specific routing.
 // SEND_PRIMARY_PATH is a global override. Per-channel knobs win.
@@ -863,7 +875,7 @@ async function sendViaWebhook(contactId, message, channel, subject, action) {
  * outbound in thread, or API failure), GHL falls back to default
  * behavior — same as v3.10. No regression.
  */
-async function sendViaConversationsAPI(contactId, message, channel, subject) {
+async function sendViaConversationsAPI(contactId, message, channel, subject, opts = {}) {
   const searchData = await ghlFetch('GET',
     `/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`);
   const conversations = Array.isArray(searchData)
@@ -879,8 +891,13 @@ async function sendViaConversationsAPI(contactId, message, channel, subject) {
   // an Email type returns 422 "no message or attachments" because GHL
   // ignores the SMS field and finds no email body. Build msgBody with
   // the correct per-channel field.
+  // 2026-07-03: 'livechat' sends type Live_Chat (reply lands in the site
+  // widget session) — message body field, no fromNumber (no phone identity
+  // in a widget thread).
   const msgBody = {
-    type: channel === 'email' ? 'Email' : 'SMS',
+    type: channel === 'email' ? 'Email'
+        : channel === 'livechat' ? 'Live_Chat'
+        : 'SMS',
     contactId,
     conversationId,
   };
@@ -945,9 +962,18 @@ async function sendViaConversationsAPI(contactId, message, channel, subject) {
     if (conversations[0].conversationProviderId) {
       msgBody.conversationProviderId = conversations[0].conversationProviderId;
     }
-  } else {
-    // SMS: body lives in msgBody.message
+  } else if (channel === 'livechat') {
+    // Live_Chat: body lives in msgBody.message; no sender number concept.
     msgBody.message = message;
+  } else {
+    // SMS: body lives in msgBody.message.
+    // 2026-07-03 — identity inheritance: fromNumber is the number the
+    // customer texted (the inbound message's `to`), resolved by
+    // reply-sender.resolveReplyContext. This replaces the legacy relay
+    // workflow's race-unsafe assign→send→restore user shuffle. When absent
+    // (no prior inbound SMS found), GHL falls back to its default sender.
+    msgBody.message = message;
+    if (opts.fromNumber) msgBody.fromNumber = opts.fromNumber;
   }
 
   const result = await ghlFetch('POST', '/conversations/messages', msgBody);
@@ -999,7 +1025,47 @@ function decidePrimaryPath(channel) {
  *   'webhook_fallback'              — Conv API primary failed, webhook saved it
  *   'conversations_api_fallback'    — webhook primary failed, Conv API saved it
  */
-async function sendWithFallback(contactId, message, channel, subject, action) {
+async function sendWithFallback(contactId, message, channel, subject, action, opts = {}) {
+  // ── 2026-07-03 direct send (AGENTIC_DIRECT_SEND, default true) ──
+  // Agentic replies go straight to the GHL Conversations API with inherited
+  // channel + identity (opts.fromNumber). The legacy relay-workflow webhook
+  // (497e664a) is NEVER called — not even as fallback — because its
+  // assign→send→restore user shuffle is exactly what produced the wrong-
+  // number sends in the Steve Nkzhm incident. One retry with backoff, then
+  // emit agentic.send_failed and throw (the executor's retry/alerting takes
+  // over; nothing is silently re-routed).
+  if (AGENTIC_DIRECT_SEND) {
+    let lastErr = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const result = await sendViaConversationsAPI(contactId, message, channel, subject, opts);
+        if (result) return { result, sendMethod: 'conversations_api' };
+        lastErr = new Error('no conversation thread found for contact');
+      } catch (err) {
+        lastErr = err;
+        console.warn(`[SendMessage] direct send attempt ${attempt}/2 failed for ${contactId} (${channel}): ${err.message}`);
+      }
+      if (attempt === 1) await new Promise((r) => setTimeout(r, 2000));
+    }
+    emitEvent({
+      event_type: 'agentic.send_failed',
+      source: 'lp_mcp',
+      entity_type: 'contact',
+      entity_id: String(contactId),
+      ghl_contact_id: String(contactId),
+      priority: 'high',
+      payload: {
+        channel,
+        from_number: opts.fromNumber || null,
+        error: (lastErr?.message || 'unknown').slice(0, 300),
+        rule_applied: action?.rule_applied || null,
+        action_id: action?.id || null,
+      },
+      idempotency_key: `agentic_send_failed_${contactId}_${Date.now()}`,
+    }).catch((err) => console.warn(`[SendMessage] send_failed event emit failed: ${err.message}`));
+    throw new Error(`Direct send failed after retry (${channel}): ${lastErr?.message || 'unknown'}`);
+  }
+
   const primary = decidePrimaryPath(channel);
 
   if (primary === 'webhook') {
@@ -1224,12 +1290,17 @@ export async function executeSendMessage(action, context) {
 
   const payload = action.action_payload || {};
   let message = payload.message || context.message || context.response_text;
-  const channel = (payload.channel || 'sms').toLowerCase();
+  let channel = (payload.channel || 'sms').toLowerCase();
   let subject = payload.subject || null;
 
   if (!message && !payload.requires_ai_generation) throw new Error('Missing message text in payload');
-  if (!['sms', 'email'].includes(channel)) {
-    throw new Error(`Invalid channel "${channel}" — must be "sms" or "email"`);
+  if (!AGENTIC_DIRECT_SEND && channel === 'livechat') {
+    // Rollback mode: the legacy webhook path has no livechat concept —
+    // restore pre-rebuild behavior verbatim (livechat collapsed to sms).
+    channel = 'sms';
+  }
+  if (!['sms', 'email', 'livechat'].includes(channel)) {
+    throw new Error(`Invalid channel "${channel}" — must be "sms", "email", or "livechat"`);
   }
 
   // ── Guardrail 1: Fetch contact tags ────────────────────────────
@@ -1274,6 +1345,38 @@ export async function executeSendMessage(action, context) {
       channel,
     };
   }
+
+  // ── Channel + identity inheritance (2026-07-03 rebuild) ─────────
+  // The reply ALWAYS inherits channel and sender identity from the
+  // triggering inbound conversation message: a livechat inbound with a
+  // fresh session is answered in the widget; an SMS inbound is answered
+  // from the exact number the customer texted (inbound `to`). This runs
+  // BEFORE generation so the model writes for the channel that will
+  // actually carry the reply. Fail-soft inside resolveReplyContext.
+  let replyContext = null;
+  if (AGENTIC_DIRECT_SEND) {
+    replyContext = await resolveReplyContext(contactId, {
+      requestedChannel: channel,
+      eventId: action.event_id || null,
+    });
+    if (!replyContext.channel) {
+      console.log(`[SendMessage] ⏭️ no sendable channel for ${contactId}: ${replyContext.reason} (origin: ${replyContext.inboundOrigin || 'none'})`);
+      return {
+        action: 'send_message_no_channel',
+        contact_id: contactId,
+        reason: replyContext.reason,
+        inbound_origin: replyContext.inboundOrigin,
+        channel: null,
+      };
+    }
+    if (replyContext.channel !== channel) {
+      console.log(`[SendMessage] channel inherited from inbound for ${contactId}: ${channel} → ${replyContext.channel} (${replyContext.reason})`);
+      channel = replyContext.channel;
+    }
+  }
+  // Livechat replies are generated with SMS constraints (short,
+  // conversational, one question) — the widget is a chat surface.
+  const generationChannel = channel === 'livechat' ? 'sms' : channel;
 
   // ── AI Response Generation ─────────────────────────────────────
   let generated = null;
@@ -1337,7 +1440,7 @@ export async function executeSendMessage(action, context) {
     let generationErr = null;
     for (let attempt = 1; attempt <= MAX_GENERATION_ATTEMPTS; attempt++) {
       try {
-        generated = await generateResponse(contactId, channel, triggerMessage, {
+        generated = await generateResponse(contactId, generationChannel, triggerMessage, {
           threadSenderType: threadSenderType ?? 'rep',
         });
 
@@ -1378,7 +1481,7 @@ export async function executeSendMessage(action, context) {
 
       // Safe fallback copy (src/ai-fallback.js) — neutral, opens the door,
       // triggers no compliance gates.
-      const fb = buildAiFallback(channel, subject);
+      const fb = buildAiFallback(generationChannel, subject);
       message = fb.message;
       subject = fb.subject;
 
@@ -1433,9 +1536,56 @@ export async function executeSendMessage(action, context) {
     }
   }
 
+  // ── AI-disclosure hard guard (2026-07-03) ──────────────────────
+  // Runs on EVERY outbound body regardless of what the generation prompt
+  // was told — the prompt alone already failed in production ("Real person
+  // here, Steve"). A body that claims the sender is human is replaced
+  // entirely with the honest disclosure fallback and flagged for review.
+  const disclosure = guardDisclosure(message);
+  if (disclosure.blocked) {
+    console.warn(`[SendMessage] 🛡️ disclosure guard triggered for ${contactId} (pattern: ${disclosure.pattern}) — body replaced`);
+    emitEvent({
+      event_type: 'agentic.disclosure_guard_triggered',
+      source: 'lp_mcp',
+      entity_type: 'contact',
+      entity_id: String(contactId),
+      ghl_contact_id: String(contactId),
+      priority: 'high',
+      payload: {
+        blocked_body: String(message).slice(0, 500),
+        matched_pattern: disclosure.pattern,
+        channel,
+        rule_applied: action.rule_applied || null,
+        action_id: action.id || null,
+      },
+      idempotency_key: `disclosure_guard_${contactId}_${Date.now()}`,
+    }).catch((err) => console.warn(`[SendMessage] disclosure event emit failed: ${err.message}`));
+    message = disclosure.body;
+  }
+
+  // ── Supersession check (2026-07-03, last gate before the POST) ──
+  // If a newer inbound arrived while we were generating, its job took the
+  // per-contact slot and THIS unsent reply is stale — skip it; the newer
+  // job replies with fuller context. Never fires after a POST, so a
+  // delivered message is never recalled.
+  if (action.id != null) {
+    const supersession = await checkNotSuperseded(contactId, String(action.id));
+    if (supersession.superseded) {
+      console.log(`[SendMessage] ⏭️ SUPERSEDED: ${contactId} action ${action.id} displaced by job ${supersession.by} — skipping send`);
+      return {
+        action: 'send_message_superseded',
+        contact_id: contactId,
+        reason: 'superseded_by_newer_job',
+        superseded_by: supersession.by,
+        channel,
+      };
+    }
+  }
+
   // ── Send (v3.3: channel-routed) ────────────────────────────────
   const { result: sendResult, sendMethod } = await sendWithFallback(
-    contactId, message, channel, subject, action
+    contactId, message, channel, subject, action,
+    { fromNumber: replyContext?.fromNumber || null }
   );
 
   // ── Companion action queue (v3.13) ─────────────────────────────
@@ -1462,7 +1612,7 @@ export async function executeSendMessage(action, context) {
     const prospectId = await resolveLPProspectId(contactId);
     const enrichment = await buildNotificationEnrichment(contactId, context, { lpLead, prospectId, ghlContactId });
 
-    const channelEmoji = channel === 'sms' ? '📱' : '📧';
+    const channelEmoji = channel === 'sms' ? '📱' : channel === 'livechat' ? '💬' : '📧';
     const aiLabel = generated ? '🤖 AI-GENERATED ' : '';
     const fallbackFlag = sendMethod.includes('fallback') ? ' ⚠️ FALLBACK' : '';
     const baseMessage = `${aiLabel}AGENTIC MESSAGE SENT${fallbackFlag}`;

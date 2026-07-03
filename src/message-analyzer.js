@@ -208,6 +208,11 @@
 import crypto from 'node:crypto';
 import { buildLeadContext, upsertLeadIntelligence } from './context-builder.js';
 import { emitEvent } from './event-emitter.js';
+// 2026-07-03 — hard message-level dedup (Steve Nkzhm incident): the solo
+// poller claims each message before analyzing so the reply-buffer flush and
+// this path can never both analyze the same inbound. DB-backed — unlike the
+// in-memory analysisCache, it holds across processes and restarts.
+import { claimConsumedMessages, releaseConsumedMessages } from './services/consumed-messages.js';
 import { callLLM, resolveLLM } from './llm-client.js';
 // Booking-flow ownership guard (2026-06-03). When a booking is in flight the
 // booking flow owns the turn — the analyzer must not divert it into objection-
@@ -954,7 +959,16 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
       priority: analysis.fast_track_eligible ? 'critical' :
                 analysis.engagement_quality === 'dnc' ? 'critical' :
                 analysis.objection_type ? 'high' : 'normal',
-      idempotency_key: `ai_analysis_${ghlContactId}_${Date.now()}`,
+      // 2026-07-03 — DETERMINISTIC key (was Date.now(), which made every
+      // re-analysis of the same inbound a brand-new event; two analyses →
+      // two ai.analysis_completed → two dispatches → two SMS, the exact
+      // Steve Nkzhm failure). Keyed on the inbound message_id so a second
+      // analysis of the same message dies at emitEvent's idempotency check.
+      // Fallback (legacy callers with no message_id): content hash + 10-min
+      // bucket — dedups near-simultaneous doubles without permanently
+      // suppressing a genuine repeat of the same text days later.
+      idempotency_key: `ai_analysis_${ghlContactId}_${messageId
+        || `${crypto.createHash('sha1').update(messageText).digest('hex').slice(0, 16)}_${Math.floor(Date.now() / 600000)}`}`,
     });
 
     // v1.8: markAnalyzed moved to entry-of-function (immediately after
@@ -1054,19 +1068,51 @@ export async function analyzePendingReplies({ limit = 10 } = {}) {
     const messageText = event.payload?.message_text || '';
     if (!contactId || !messageText) { skipped++; continue; }
 
+    // 2026-07-03 — hard dedup: claim the message before analyzing. If the
+    // reply-buffer flush (or a previous pass) already consumed it, this
+    // event's message was analyzed elsewhere — mark it deduped and move on.
+    // Solo-path claims only real ingest-time keys (payload.message_id, now
+    // always populated by handleReply); legacy events without one skip the
+    // claim and rely on the analysisCache as before.
+    const messageKey = event.payload?.message_id || null;
+    if (messageKey) {
+      const { consumed } = await claimConsumedMessages(contactId, [messageKey]);
+      if (consumed.length) {
+        skipped++;
+        await (await import('./supabase.js')).default
+          .from('system_events')
+          .update({
+            processed: true,
+            processed_by: 'message_analyzer',
+            processed_at: new Date().toISOString(),
+            action_taken: 'deduped',
+          })
+          .eq('id', event.id);
+        continue;
+      }
+    }
+
     // v1.6: derive channel from the source event's message_type so
     // analyzeMessage carries it forward into ai.analysis_completed.
     // GHL emits message_type as "Email" or "SMS" (or "TYPE_EMAIL"/
     // "TYPE_SMS" on some endpoints) — normalize to lowercase short form.
+    // 2026-07-03: livechat mapped explicitly (was: collapsed to null → 'sms'
+    // at send time, the Steve Nkzhm channel flip).
     const rawType = String(event.payload?.message_type || '').toLowerCase();
     const inboundChannel = rawType.includes('email') ? 'email'
+                         : (rawType.includes('live_chat') || rawType.includes('livechat') || rawType.includes('webchat')) ? 'livechat'
                          : rawType.includes('sms')   ? 'sms'
                          : null;
     const result = await analyzeMessage(contactId, messageText, event.id, inboundChannel, event.payload?.message_id || null);
     if (result) { analyzed++; }
     // v1.2: pass messageText to match the new (contact, message) cache key
     else if (wasRecentlyAnalyzed(contactId, messageText)) { skipped++; }
-    else { failed++; }
+    else {
+      failed++;
+      // 2026-07-03 — analysis failed after we claimed the message: release
+      // the claim so a retry (buffer or next poll) is not deduped into loss.
+      if (messageKey) await releaseConsumedMessages(contactId, [messageKey]);
+    }
 
     await (await import('./supabase.js')).default
       .from('system_events')

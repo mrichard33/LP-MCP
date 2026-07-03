@@ -106,6 +106,20 @@ export async function executeAddTag(action, context = {}) {
   const tag = action.action_payload?.tag;
   if (!contactId || !tag) throw new Error('Missing contactId or tag');
 
+  // 2026-07-03 — tag hygiene: a tag ending in ':' is a namespace with an
+  // empty value (a template variable that failed to interpolate, e.g. the
+  // bare "concern-expressed:" on the Steve Nkzhm record). Never write it.
+  if (String(tag).trim().endsWith(':')) {
+    console.warn(`[ActionExecutor] tag.construction_rejected: "${tag}" for ${contactId} — empty namespace value (rule: ${action.rule_applied || 'manual'})`);
+    return {
+      action: 'tag_construction_rejected',
+      skipped: true,
+      reason: `tag "${tag}" ends in ':' — empty namespace value`,
+      contact_id: contactId,
+      tag,
+    };
+  }
+
   const cache = context?._contactCache;
   const immutableNamespace = NAMESPACE_IMMUTABLE_PREFIXES.find((p) => tag.startsWith(p));
   const namespace = NAMESPACE_EXCLUSIVE_PREFIXES.find((p) => tag.startsWith(p));

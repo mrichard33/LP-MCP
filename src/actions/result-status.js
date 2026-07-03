@@ -44,6 +44,17 @@ export function classifyHandlerResult(result) {
     };
   }
 
+  // 2026-07-03 (pipeline-integrity breach): a stage move refused by the
+  // stage-transition evidence validator records as `blocked_by_validator`
+  // so illegitimate move requests are countable
+  // (SELECT count(*) ... WHERE status='blocked_by_validator').
+  if (result?.blocked_by_validator === true) {
+    return {
+      status: 'blocked_by_validator',
+      error_message: result?.reason || 'blocked by stage-transition validator',
+    };
+  }
+
   // Honest accounting: a handler that explicitly skipped (lock held, suppressed)
   // never reached the contact — record it as `skipped`, not `completed`.
   if (result?.skipped === true) {
