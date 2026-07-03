@@ -1,14 +1,14 @@
 /**
- * Five9 ESS Webhook Ingestion — src/five9-events.js
+ * Five9 Connector Webhook Ingestion — src/five9-events.js
  *
- * Phase 1: authenticated raw capture + fast ack + normalizer skeleton.
+ * Phase 1: authenticated raw capture + fast ack + normalizer.
  *
  * POST /webhook/five9-event
  *
- * The Five9 Event Subscription Service (ESS) POSTs call/interaction
- * events here. This module:
- *   1. Authenticates via the x-five9-webhook-secret custom header
- *      (constant-time comparison against FIVE9_WEBHOOK_SECRET).
+ * The Five9 Connector "LP-MCP Event Push" (trigger: On Call Disposition,
+ * execution: Silently/Form Submission) POSTs call events here. This module:
+ *   1. Authenticates via the x-five9-webhook-secret header OR a body/query
+ *      secret field (constant-time comparison against FIVE9_WEBHOOK_SECRET).
  *   2. Captures the FULL raw body into five9_events_raw (payload jsonb is
  *      the source of truth) and returns 200 { ok, id } IMMEDIATELY.
  *      Five9 retries on failure codes / slow acks, so we ack fast
@@ -19,9 +19,19 @@
  *      processing_error — expected during rollout while we learn Five9's
  *      real schema.
  *
+ * Live payload shape (verified 2026-07-03, five9_events_raw rows 330+):
+ *   ANI            = Reece caller ID on outbound (855/local presence)
+ *   DNIS           = CUSTOMER number on outbound  → correlate DNIS first
+ *   call_id        = Five9 call id
+ *   disposition_id = numeric (negative = system, 3e14-range = custom)
+ *   disposition_name, campaign_name, full_name
+ *   LPRecKey       = LP inquiry key (e.g. INQ402809) — captured, not yet joinable
+ *   start_timestamp / end_timestamp = YYYYMMDDHHMMSSmmm (UTC)
+ *
  * Mirrors POST /webhook/lp-lead-refresh (fast-ack + setImmediate) from
  * src/rest-api.js. NO agent rules consume these events yet — this is the
  * ingestion layer only. Substrate: sql/migrations/2026-07-02_five9_events_raw.sql
+ * + 2026-07-03 enrichment columns (dashboard DDL).
  */
 
 import crypto from 'crypto';
@@ -91,16 +101,16 @@ function secretMatches(provided) {
 }
 
 // ─── Best-effort field extraction ────────────────────────────────────
-// Five9's exact payload schema is not yet known. Try common key paths
-// case-insensitively across the top level and one level of nesting.
-// Never throws — the jsonb payload column is the source of truth.
+// Try common key paths case-insensitively across the top level and one
+// level of nesting. Never throws — the jsonb payload column is the source
+// of truth.
 function pick(obj, keys) {
   if (!obj || typeof obj !== 'object') return null;
   const wanted = keys.map(k => k.toLowerCase());
   // Top level first.
   for (const [k, v] of Object.entries(obj)) {
     if (wanted.includes(k.toLowerCase()) && v != null && v !== '') {
-      return typeof v === 'object' ? null : String(v);
+      return typeof v === 'object' ? null : String(v).trim();
     }
   }
   // One level of nesting (e.g. { event: { type: ... } }).
@@ -108,7 +118,7 @@ function pick(obj, keys) {
     if (v && typeof v === 'object' && !Array.isArray(v)) {
       for (const [k2, v2] of Object.entries(v)) {
         if (wanted.includes(k2.toLowerCase()) && v2 != null && v2 !== '') {
-          return typeof v2 === 'object' ? null : String(v2);
+          return typeof v2 === 'object' ? null : String(v2).trim();
         }
       }
     }
@@ -116,17 +126,53 @@ function pick(obj, keys) {
   return null;
 }
 
+// Five9 Connector variables that failed to substitute arrive as literal
+// "@Call.xxx@" strings. Treat those as absent so they never pollute
+// extracted fields (e.g. ani = "@Call.ANI@") or contact correlation.
+function unsubstituted(v) {
+  return typeof v === 'string' && /^@.+@$/.test(v.trim());
+}
+
+// Parse Five9's compact timestamp format YYYYMMDDHHMMSSmmm (UTC, verified
+// against received_at on live rows) → ISO string, or null.
+export function parseFive9Ts(s) {
+  const m = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{3})$/.exec(String(s || '').trim());
+  if (!m) return null;
+  const iso = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}.${m[7]}Z`;
+  return Number.isNaN(Date.parse(iso)) ? null : iso;
+}
+
 export function extractFields(payload) {
   try {
-    return {
-      event_type:  pick(payload, ['eventType', 'event_type', 'type']),
-      call_id:     pick(payload, ['callId', 'call_id', 'interactionId', 'interaction_id']),
-      ani:         pick(payload, ['ANI', 'ani', 'callerNumber', 'from']),
-      dnis:        pick(payload, ['DNIS', 'dnis', 'dialedNumber', 'to']),
-      disposition: pick(payload, ['disposition', 'dispositionName', 'disposition_name', 'disposition_id', 'dispositionId']),
+    const fields = {
+      event_type:       pick(payload, ['eventType', 'event_type', 'type']),
+      call_id:          pick(payload, ['callId', 'call_id', 'interactionId', 'interaction_id']),
+      ani:              pick(payload, ['ANI', 'ani', 'callerNumber', 'from']),
+      dnis:             pick(payload, ['DNIS', 'dnis', 'dialedNumber', 'to']),
+      disposition:      pick(payload, ['disposition_id', 'dispositionId', 'disposition']),
+      disposition_name: pick(payload, ['disposition_name', 'dispositionName']),
+      campaign:         pick(payload, ['campaign_name', 'campaignName', 'campaign']),
+      lp_rec_key:       pick(payload, ['LPRecKey', 'lp_rec_key', 'lpreckey']),
+      lp_rec_type:      pick(payload, ['LPRecType', 'lp_rec_type', 'lprectype']),
+      full_name:        pick(payload, ['full_name', 'fullName']),
+      start_raw:        pick(payload, ['start_timestamp', 'startTimestamp']),
+      end_raw:          pick(payload, ['end_timestamp', 'endTimestamp']),
     };
+    for (const k of Object.keys(fields)) {
+      if (unsubstituted(fields[k])) fields[k] = null;
+    }
+    fields.call_start_at = parseFive9Ts(fields.start_raw);
+    fields.call_end_at = parseFive9Ts(fields.end_raw);
+    fields.duration_sec = (fields.call_start_at && fields.call_end_at)
+      ? Math.max(0, Math.round((Date.parse(fields.call_end_at) - Date.parse(fields.call_start_at)) / 1000))
+      : null;
+    return fields;
   } catch {
-    return { event_type: null, call_id: null, ani: null, dnis: null, disposition: null };
+    return {
+      event_type: null, call_id: null, ani: null, dnis: null, disposition: null,
+      disposition_name: null, campaign: null, lp_rec_key: null, lp_rec_type: null,
+      full_name: null, call_start_at: null, call_end_at: null, duration_sec: null,
+    };
   }
 }
 
@@ -171,22 +217,56 @@ export async function five9WebhookHandler(req, res) {
   const payload = stripSecretFields(merged);
   const fields = extractFields(payload);
 
+  const enrichedRow = {
+    event_type:       fields.event_type,
+    call_id:          fields.call_id,
+    ani:              fields.ani,
+    dnis:             fields.dnis,
+    disposition:      fields.disposition,
+    disposition_name: fields.disposition_name,
+    campaign:         fields.campaign,
+    lp_rec_key:       fields.lp_rec_key,
+    lp_rec_type:      fields.lp_rec_type,
+    full_name:        fields.full_name,
+    call_start_at:    fields.call_start_at,
+    call_end_at:      fields.call_end_at,
+    duration_sec:     fields.duration_sec,
+    payload,
+    headers: redactHeaders(req.headers),
+  };
+
+  // Legacy column set — used as a fallback if the 2026-07-03 enrichment DDL
+  // has not been applied yet, so a schema lag never drops deliveries.
+  const legacyRow = {
+    event_type:  fields.event_type,
+    call_id:     fields.call_id,
+    ani:         fields.ani,
+    dnis:        fields.dnis,
+    disposition: fields.disposition,
+    payload,
+    headers: redactHeaders(req.headers),
+  };
+
+  const SELECT_COLS = 'id, received_at, event_type, call_id, ani, dnis, disposition';
+
   // 3. FAST ACK — insert raw row, then respond 200 immediately.
   let row;
   try {
-    const { data, error } = await supabase
+    let { data, error } = await supabase
       .from('five9_events_raw')
-      .insert({
-        event_type:  fields.event_type,
-        call_id:     fields.call_id,
-        ani:         fields.ani,
-        dnis:        fields.dnis,
-        disposition: fields.disposition,
-        payload,
-        headers: redactHeaders(req.headers),
-      })
-      .select('id, received_at, event_type, call_id, ani, dnis, disposition')
+      .insert(enrichedRow)
+      .select(SELECT_COLS)
       .single();
+
+    // Schema-lag fallback: unknown-column error → retry with legacy columns.
+    if (error && /column/i.test(error.message || '')) {
+      console.warn('[Five9] enrichment columns missing — falling back to legacy insert. Run the 2026-07-03 DDL.');
+      ({ data, error } = await supabase
+        .from('five9_events_raw')
+        .insert(legacyRow)
+        .select(SELECT_COLS)
+        .single());
+    }
 
     if (error) throw error;
     row = data;
@@ -198,9 +278,19 @@ export async function five9WebhookHandler(req, res) {
 
   res.status(200).json({ ok: true, id: row.id });
 
+  // Carry enrichment into normalization regardless of which insert path ran.
+  const normRow = { ...row, ...{
+    disposition_name: fields.disposition_name,
+    campaign:         fields.campaign,
+    lp_rec_key:       fields.lp_rec_key,
+    duration_sec:     fields.duration_sec,
+    call_start_at:    fields.call_start_at,
+    call_end_at:      fields.call_end_at,
+  } };
+
   // 4. NORMALIZE after the response (fire-and-forget).
   setImmediate(() => {
-    normalizeFive9Row(row).catch(err =>
+    normalizeFive9Row(normRow).catch(err =>
       console.error(`[Five9] normalize error raw_id=${row.id}:`, err.message),
     );
   });
@@ -208,12 +298,19 @@ export async function five9WebhookHandler(req, res) {
 
 // ─── Event-type mapping (Phase 1) ────────────────────────────────────
 // Best-effort, case-insensitive. Returns a system event_type or null
-// (null → unmapped, safe-default path). We don't yet know Five9's real
-// vocabulary, so match on substrings of the extracted type.
+// (null → unmapped, safe-default path).
+//
+// CONNECTOR_CALL_EVENT / connector*: the Five9 Connector's default stamp.
+// Its trigger is On Call Disposition, so a connector delivery IS a
+// disposition-set event. The connector is now configured to send
+// eventType=disposition explicitly, but keep the connector mapping as a
+// guard against config regression. Verified against live payloads
+// (five9_events_raw, 2026-07-03).
 export function mapEventType(rawType) {
   const t = String(rawType || '').toLowerCase();
   if (!t) return null;
   if (t.includes('disposition')) return 'five9.disposition_set';
+  if (t.includes('connector')) return 'five9.disposition_set';
   // Ended before created so "call ended"/"interaction ended" isn't caught
   // by a broad created/call match.
   if (t.includes('end') || t.includes('complete') || t.includes('disconnect')) return 'five9.call_ended';
@@ -222,14 +319,17 @@ export function mapEventType(rawType) {
 }
 
 // ─── Contact correlation ─────────────────────────────────────────────
-// Last-10-digit match on ANI against lp_leads (phone or phone_alt), most
-// recent first. Never throws; returns null when no match.
+// On OUTBOUND calls Five9's ANI is Reece's own caller ID (855 fallback or
+// local-presence DID) and DNIS is the customer's number — verified against
+// live payloads + lp_leads phone matches 2026-07-03. On inbound, ANI is the
+// customer. So: correlate DNIS first, fall back to ANI. Last-10-digit match
+// against lp_leads (phone or phone_alt), most recent first. Never throws.
 function last10(p) {
   return String(p || '').replace(/\D/g, '').slice(-10);
 }
 
-async function correlateContact(ani) {
-  const digits = last10(ani);
+async function matchPhone(number) {
+  const digits = last10(number);
   if (digits.length < 10) return null;
   try {
     const { data } = await supabase
@@ -249,6 +349,10 @@ async function correlateContact(ani) {
     console.error('[Five9] contact correlation failed:', err.message);
     return null;
   }
+}
+
+async function correlateContact(dnis, ani) {
+  return (await matchPhone(dnis)) || (await matchPhone(ani)) || null;
 }
 
 // ─── Normalizer (async, per raw row) ─────────────────────────────────
@@ -290,8 +394,8 @@ export async function normalizeFive9Row(row) {
     return;
   }
 
-  // 3b. CONTACT CORRELATION.
-  const contactMatch = await correlateContact(row.ani);
+  // 3b. CONTACT CORRELATION — DNIS first (outbound customer), ANI fallback.
+  const contactMatch = await correlateContact(row.dnis, row.ani);
 
   // 4b. EMIT via the existing mechanism. bypass_filter:true so the event
   //     lands in system_events with a real id even though no consumer rule
@@ -299,7 +403,7 @@ export async function normalizeFive9Row(row) {
   //     without a matching agent_rule.
   const emitted = await emitEvent({
     event_type: mappedType,
-    event_subtype: row.disposition || null,
+    event_subtype: row.disposition_name || row.disposition || null,
     source: 'five9-ess',
     entity_type: contactMatch?.lp_lead_id ? 'lead' : 'system',
     entity_id: contactMatch?.lp_lead_id || row.call_id || String(rawId),
@@ -317,6 +421,12 @@ export async function normalizeFive9Row(row) {
       ani: row.ani || null,
       dnis: row.dnis || null,
       disposition: row.disposition || null,
+      disposition_name: row.disposition_name || null,
+      campaign: row.campaign || null,
+      lp_rec_key: row.lp_rec_key || null,
+      duration_sec: row.duration_sec ?? null,
+      call_start_at: row.call_start_at || null,
+      call_end_at: row.call_end_at || null,
       contact_match: contactMatch,
       received_at: row.received_at,
     },
