@@ -1,6 +1,14 @@
 // src/email-scorer.js
 // Email Confidence Scoring for LP→GHL Enrichment
-// Used by sync-leads.js hook and admin/email-backfill.js
+// Used by sync-leads.js hook, admin/email-backfill.js, and admin/email-cleanup.js
+//
+// 2026-07-03: Extended hard-fail detection after the June 2026 bounce report
+// (52 bounces in 30 days). New classes: local-part blacklist (real@, noreply@,
+// askatappt@...), "fake" anywhere in local part, numeric-only local parts,
+// non-mail domains (m.facebook.com), and typo-domain detection (gmail.comm,
+// aaol.com, tamoabay.rr.com) via Levenshtein distance 1 against known
+// providers. Typo failures carry a typo_domain_suggest:<corrected> reason so
+// email-cleanup can CORRECT them instead of clearing a recoverable email.
 
 import supabase from './supabase.js';
 
@@ -30,6 +38,23 @@ const BLACKLISTED_EMAILS = new Set([
   'asdf@gmail.com',
   'xxx@gmail.com',
   'nana@gmail.com',
+  // 2026-07-03 — June bounce report additions
+  'fakegmail@gmail.com',
+  'real@gmail.com',
+  'real@yahoo.com',
+  'noreply@gmail.com',
+  'askatappt@gmail.com',
+  'nama@gmail.com',
+]);
+
+// Local-part exact blacklist — placeholder words reps/leads type to get past
+// a required field. Matched against the full local part (before the @).
+const LOCAL_PART_BLACKLIST = new Set([
+  'fake', 'fakeemail', 'fakegmail', 'real', 'none', 'noemail', 'nomail',
+  'noname', 'nope', 'na', 'test', 'testing', 'sample', 'asdf', 'qwerty',
+  'abc', 'xyz', 'xxx', 'aaa', 'nothanks', 'declined', 'refused', 'unknown',
+  'notgiven', 'noreply', 'nana', 'nama', 'email', 'gmail', 'yahoo',
+  'customer', 'homeowner', 'askatappt', 'askatappointment',
 ]);
 
 // Pattern blacklist (regex patterns — applied after exact match)
@@ -42,9 +67,23 @@ const BLACKLIST_PATTERNS = [
   /^stop@reecewindows/i,      // stop@reecewindows.com
 ];
 
+// Local-part regex hard-fails (applied to the part before the @)
+const LOCAL_PART_FAIL_PATTERNS = [
+  { re: /fake/,                    reason: 'local_contains_fake' },       // andreasfake@yahoo.com
+  { re: /^(no-?reply|donotreply)/, reason: 'noreply_local_part' },
+  { re: /^\d+$/,                   reason: 'numeric_only_local_part' },   // 123@gmail.com, 555@...
+];
+
 // Domain blacklist — company/employee domains that are NOT homeowner emails
 const COMPANY_DOMAINS = new Set([
   'reecewindows.com',
+]);
+
+// Websites people type into an email field that have no public mailboxes.
+// medic662peso@m.facebook.com bounced in the June report.
+const NON_MAIL_DOMAINS = new Set([
+  'facebook.com', 'm.facebook.com', 'instagram.com', 'tiktok.com',
+  'youtube.com', 'google.com', 'twitter.com', 'x.com', 'linkedin.com',
 ]);
 
 // Disposable email domains
@@ -62,6 +101,71 @@ const MAJOR_PROVIDERS = new Set([
   'sbcglobal.net', 'cox.net', 'charter.net', 'earthlink.net',
   'mail.com', 'protonmail.com', 'zoho.com',
 ]);
+
+// ═══════════════════════════════════════════════════════════════
+// TYPO-DOMAIN DETECTION
+// ───────────────────────────────────────────────────────────────
+// A domain at Levenshtein distance 1 from a common provider — and not
+// itself a known-good domain — is a keyboard typo, not a real mailbox.
+// June report: gmail.comm, gmail.ccom, aaol.com, tamoabay.rr.com.
+// The reason string carries the corrected address so email-cleanup can
+// FIX the contact instead of clearing a recoverable email.
+// ═══════════════════════════════════════════════════════════════
+
+// Providers worth fuzzy-matching against (high-volume in our lead base)
+const TYPO_TARGETS = [
+  'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com',
+  'icloud.com', 'comcast.net', 'bellsouth.net', 'verizon.net', 'att.net',
+  'sbcglobal.net', 'earthlink.net', 'msn.com', 'live.com',
+  'tampabay.rr.com', 'cfl.rr.com',
+]);
+
+// Real domains that sit at distance 1 from a TYPO_TARGET — never flag these.
+const KNOWN_GOOD_DOMAINS = new Set([
+  ...MAJOR_PROVIDERS,
+  ...TYPO_TARGETS,
+  'ymail.com', 'rocketmail.com', 'aim.com', 'juno.com', 'netzero.net',
+  'optonline.net', 'roadrunner.com', 'mindspring.com', 'gmx.com', 'gmx.net',
+  'fastmail.com', 'netscape.net', 'frontier.com', 'windstream.net',
+  'centurylink.net', 'embarqmail.com', 'peoplepc.com', 'tds.net', 'q.com',
+]);
+
+// TLD typos that are never legitimate — fallback for domains not close
+// enough to a TYPO_TARGET for the Levenshtein check to catch.
+const BAD_TLDS = new Set([
+  'comm', 'ccom', 'con', 'cmo', 'ocm', 'coom', 'vom', 'xom', 'clm',
+  'cim', 'cpm', 'conm', 'nett', 'orgg',
+]);
+
+/** Levenshtein distance (iterative two-row). Small strings only. */
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const curr = [i];
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+    }
+    prev = curr;
+  }
+  return prev[b.length];
+}
+
+/**
+ * Check a domain for a single-edit typo of a known provider.
+ * @returns {string|null} the corrected domain, or null if not a typo
+ */
+function detectTypoDomain(domain) {
+  if (KNOWN_GOOD_DOMAINS.has(domain)) return null;
+  for (const target of TYPO_TARGETS) {
+    if (Math.abs(domain.length - target.length) > 1) continue;
+    if (levenshtein(domain, target) === 1) return target;
+  }
+  return null;
+}
 
 // Lead sources where the homeowner self-entered the email (higher trust)
 const DIGITAL_SOURCES = new Set([
@@ -117,9 +221,38 @@ export function scoreEmail(email, context = {}) {
   // Extract parts
   const [localPart, domain] = normalized.split('@');
 
+  // Local-part exact blacklist (placeholder words)
+  if (LOCAL_PART_BLACKLIST.has(localPart)) {
+    return { score: 0, reasons: ['blacklisted_local_part'] };
+  }
+
+  // Local-part pattern hard-fails (contains "fake", noreply, numeric-only)
+  for (const { re, reason } of LOCAL_PART_FAIL_PATTERNS) {
+    if (re.test(localPart)) {
+      return { score: 0, reasons: [reason] };
+    }
+  }
+
   // Company domain (employee/canvasser email, not homeowner)
   if (COMPANY_DOMAINS.has(domain)) {
     return { score: 0, reasons: ['company_domain'] };
+  }
+
+  // Non-mail domain (facebook.com etc. — no public mailboxes exist)
+  if (NON_MAIL_DOMAINS.has(domain)) {
+    return { score: 0, reasons: ['non_mail_domain'] };
+  }
+
+  // Typo domain (gmail.comm, aaol.com, tamoabay.rr.com) — carries suggestion
+  const typoCorrection = detectTypoDomain(domain);
+  if (typoCorrection) {
+    return { score: 0, reasons: [`typo_domain_suggest:${localPart}@${typoCorrection}`] };
+  }
+
+  // Impossible TLD fallback (typo not close to a known provider)
+  const domainTld = domain.split('.').pop();
+  if (BAD_TLDS.has(domainTld)) {
+    return { score: 0, reasons: [`invalid_tld:${domainTld}`] };
   }
 
   // Disposable domain
