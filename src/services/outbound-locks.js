@@ -81,6 +81,11 @@ export async function tryAcquireLock({ contact_id, trigger_id, sender, message_p
       return {
         acquired: true,
         reason: isReleased ? 'reacquired_after_release' : 'reacquired_after_expiry',
+        // 2026-07-03 hotfix: who held the expired/released lock. Lets the send
+        // flow distinguish "our own prior attempt leaked this" (proceed — the
+        // sent marker would exist if it delivered) from "someone else presumed
+        // sent" (conservative terminal skip).
+        prior_sender: data?.sender || null,
         lock_key,
         expires_at,
       };

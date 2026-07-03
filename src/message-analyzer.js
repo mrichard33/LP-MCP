@@ -752,7 +752,12 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
   // second sees the hit and skips. See v1.8 changelog above.
   if (wasRecentlyAnalyzed(ghlContactId, messageText)) {
     console.log(`[MessageAnalyzer] Skipping ${ghlContactId} — identical message already analyzed within ${Math.round(ANALYSIS_CACHE_TTL_MS / 1000)}s (likely retry)`);
-    return null;
+    // 2026-07-03 hotfix: a dedup skip is a deliberate NO-OP, not a failure.
+    // Returning null here made /n8n/analyze-message report success:false, so
+    // the AgenticPipeline retried the skip twice and then left its source
+    // events unprocessed for yet another re-drive. The sentinel lets callers
+    // treat it as terminal success. Genuine failures still return null.
+    return { skipped: true, reason: 'recently_analyzed' };
   }
   // v1.8: claim the dedup slot BEFORE any await so a parallel caller
   // sees the write. If the analysis throws below, the slot stays
@@ -1104,9 +1109,11 @@ export async function analyzePendingReplies({ limit = 10 } = {}) {
                          : rawType.includes('sms')   ? 'sms'
                          : null;
     const result = await analyzeMessage(contactId, messageText, event.id, inboundChannel, event.payload?.message_id || null);
-    if (result) { analyzed++; }
-    // v1.2: pass messageText to match the new (contact, message) cache key
-    else if (wasRecentlyAnalyzed(contactId, messageText)) { skipped++; }
+    // 2026-07-03: the dedup sentinel ({skipped:true, reason:'recently_analyzed'})
+    // is a terminal no-op — count it skipped, keep the consumed-message claim
+    // (the message WAS handled by whoever analyzed it first).
+    if (result?.skipped) { skipped++; }
+    else if (result) { analyzed++; }
     else {
       failed++;
       // 2026-07-03 — analysis failed after we claimed the message: release
@@ -1120,9 +1127,11 @@ export async function analyzePendingReplies({ limit = 10 } = {}) {
         processed: true,
         processed_by: 'message_analyzer',
         processed_at: new Date().toISOString(),
-        action_taken: result
-          ? `ai_analyzed: stage_${result.buyer_stage}, ${result.objection_type || 'no_objection'}`
-          : 'skipped_or_failed',
+        action_taken: result?.skipped
+          ? `skipped: ${result.reason}`
+          : result
+            ? `ai_analyzed: stage_${result.buyer_stage}, ${result.objection_type || 'no_objection'}`
+            : 'skipped_or_failed',
       })
       .eq('id', event.id);
   }
@@ -1157,6 +1166,12 @@ export function registerMessageAnalyzerRoutes(app) {
     if (!contactId || !message) return res.status(400).json({ error: 'contactId and message required' });
     try {
       const result = await analyzeMessage(contactId, message, null, channel || null, message_id || null);
+      // 2026-07-03 hotfix: a dedup skip is terminal SUCCESS (the identical
+      // message was already analyzed) — success:false here made the reply
+      // buffer retry a deliberate no-op and re-drive its source events.
+      if (result?.skipped) {
+        return res.json({ success: true, deduped: true, reason: result.reason, analysis: null });
+      }
       res.json({ success: !!result, analysis: result });
     } catch (err) {
       res.status(500).json({ error: err.message });

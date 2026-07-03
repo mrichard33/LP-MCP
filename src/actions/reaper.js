@@ -288,3 +288,84 @@ export async function reapStuckActions() {
     error: exec.error || appr.error,
   };
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// PHASE 3 (2026-07-03 hotfix): Stale lock-table reaper
+//
+// Both lock tables previously self-healed ONLY lazily, at the next acquire
+// attempt for the same contact/trigger. In the 2026-07-03 evening incident
+// a watchdog-orphaned send left its agentic_reply_locks row in_flight and
+// the 21:39 redeploy killed the in-process reschedule timers — nothing ever
+// re-acquired, so the row sat until manual deletion while every later reply
+// for the contact was blocked or superseded. This sweep runs from the
+// executor heartbeat EVERY cycle (including when the action queue is empty,
+// which the in-executeActions reaper above never does).
+//
+//   agentic_reply_locks: delete in_flight rows whose locked_at is past
+//     LOCK_TTL_SEC — a crashed/abandoned holder. 'sent' rows are NEVER
+//     touched: they carry the cooldown + sent marker by design.
+//   outbound_locks: housekeeping-delete rows whose expires_at is more than
+//     OUTBOUND_LOCK_SWEEP_GRACE_SEC in the past. Expired rows are already
+//     inert for locking (tryAcquireLock reclaims them) and their
+//     presumed-sent forensic value has passed; this just keeps the table
+//     from accreting.
+// ═══════════════════════════════════════════════════════════════════
+
+import { LOCK_TTL_SEC } from '../services/agentic-reply-locks.js';
+
+const OUTBOUND_LOCK_SWEEP_GRACE_SEC = 3600;
+
+/**
+ * Pure predicate — is this agentic_reply_locks row a stale (reapable)
+ * holder? Unit-tested in scripts/test-lock-reaper.js.
+ * Only in_flight rows past TTL are stale; 'sent' rows never are.
+ */
+export function isStaleLockRow(row, nowMs, ttlSec = LOCK_TTL_SEC) {
+  if (!row || row.status !== 'in_flight') return false;
+  const lockedAtMs = Date.parse(row.locked_at);
+  if (!Number.isFinite(lockedAtMs)) return true; // unparseable = pathological, reap
+  return (nowMs - lockedAtMs) > ttlSec * 1000;
+}
+
+export async function reapStaleLocks({ ttlSec = LOCK_TTL_SEC } = {}) {
+  if (!supabase) return { agentic_reaped: 0, outbound_swept: 0 };
+  const out = { agentic_reaped: 0, outbound_swept: 0 };
+
+  try {
+    const cutoff = new Date(Date.now() - ttlSec * 1000).toISOString();
+    const { data, error } = await supabase
+      .from('agentic_reply_locks')
+      .delete()
+      .eq('status', 'in_flight')
+      .lt('locked_at', cutoff)
+      .select('contact_id, job_id');
+    if (error) throw new Error(error.message);
+    out.agentic_reaped = data?.length || 0;
+    if (out.agentic_reaped > 0) {
+      console.warn(
+        `[Reaper] released ${out.agentic_reaped} stale agentic reply lock(s): ` +
+        data.map((r) => `${r.contact_id}(job ${r.job_id})`).join(', ')
+      );
+    }
+  } catch (err) {
+    console.error(`[Reaper] stale agentic lock sweep failed: ${err.message}`);
+  }
+
+  try {
+    const cutoff = new Date(Date.now() - OUTBOUND_LOCK_SWEEP_GRACE_SEC * 1000).toISOString();
+    const { data, error } = await supabase
+      .from('outbound_locks')
+      .delete()
+      .lt('expires_at', cutoff)
+      .select('lock_key');
+    if (error) throw new Error(error.message);
+    out.outbound_swept = data?.length || 0;
+    if (out.outbound_swept > 0) {
+      console.log(`[Reaper] swept ${out.outbound_swept} long-expired outbound lock row(s)`);
+    }
+  } catch (err) {
+    console.error(`[Reaper] outbound lock sweep failed: ${err.message}`);
+  }
+
+  return out;
+}

@@ -114,8 +114,11 @@ import { runPool, groupByBatch } from './concurrency.js';
 import { classifyHandlerResult } from './result-status.js';
 
 // MVI v2.5 — outbound dedup + Layer 3 dispatch
-import { tryAcquireLock, releaseLock, checkLock, decideLockHeldReschedule, shouldKeepOutboundLock } from '../services/outbound-locks.js';
+import { tryAcquireLock, releaseLock } from '../services/outbound-locks.js';
 import { getDispatchForClassification } from '../services/layer3-dispatch.js';
+// 2026-07-03 hotfix — extracted send orchestration (defer-not-drop,
+// re-entrant slot, sent-marker dedup, finally-release)
+import { runSendMessageFlow } from './send-message-flow.js';
 
 // 2026-07-03 — enforcing per-contact single-flight + cooldown (Steve Nkzhm
 // incident). Complements outbound_locks, which is per (contact, trigger_id)
@@ -175,243 +178,38 @@ async function fetchSourceEvent(action) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// MVI v2.5 — send_message wrapper: outbound lock around the existing handler
-// Phase 1 #51 — universal suppression check runs BEFORE lock acquisition
-// ═══════════════════════════════════════════════════════════════════
+// MVI v2.5 — send_message wrapper: suppression → agentic slot → outbound
+// lock → executeSendMessage. The orchestration itself lives in
+// src/actions/send-message-flow.js (2026-07-03 hotfix extraction) so the
+// crash/race scenarios are testable with in-memory fakes; this binding
+// injects the real services.
 //
-// Order:
-//   1. checkSuppression(contact_id)  — tag-based gate (NEW 2026-05-13)
-//   2. acquireAgenticSlot            — per-contact single-flight + cooldown
-//   3. tryAcquireLock                — outbound dedup per (contact, trigger)
-//   4. executeSendMessage            — actual GHL API call
-//
-// Lock hygiene (2026-07-03 P0, agent_actions 165762/165770): every exit
-// that did NOT consume the inbound (superseded, blocked, suppressed, no
-// channel, no trigger message) releases the outbound lock — see
-// shouldKeepOutboundLock. A send blocked by a live lock is RESCHEDULED
-// (bounded polling via decideLockHeldReschedule), never terminal-skipped;
-// otherwise a leaked lock deadlocks the reply until TTL and the contact is
-// never answered. The reschedule timer is in-process — a restart drops it
-// (same accepted limitation as the cooldown reschedule below); the action
-// stays visible as skipped/outbound_lock_held + rescheduled for forensics
-// and can be re-run manually, where the presumed-sent guard keeps the
-// re-run duplicate-safe.
-
-// In-memory reschedule attempt counter for lock-held sends. Cleared on
-// restart — with the timers gone too, a fresh process starts a fresh budget.
-const lockHeldAttempts = new Map();
-
+// 2026-07-03 evening hotfix (dropped-replies incident): blocked sends are
+// now DEFERRED via a DB-persisted retry_at (status stays 'pending'), never
+// rescheduled with in-process timers (which died on every redeploy) and
+// never terminal-skipped except by supersession. Slot acquisition is atomic
+// + re-entrant, delivered-but-timed-out sends dedup via the sent marker,
+// and the slot is released in a finally on every path. See the flow module
+// header for the full story.
 async function executeSendMessageWithLock(action, context) {
-  const params = action.action_payload || {};
-  const contact_id = action.target_id;
-
-  // ── Presumed-sent guard (2026-07-03) ──
-  // Re-run of a lock-held reschedule: if the blocking lock ran to full TTL
-  // WITHOUT being released, its holder either sent (sends keep the lock by
-  // design) or hard-crashed mid-send. send_message is non-idempotent
-  // (reaper.js: NON_IDEMPOTENT_ACTION_TYPES) — drop over duplicate.
-  const priorSkip = action.status === 'skipped'
-    && action.execution_result?.reason === 'outbound_lock_held';
-  if (priorSkip) {
-    const priorTrigger = action.execution_result?.trigger_id;
-    if (priorTrigger) {
-      const prior = await checkLock(contact_id, priorTrigger);
-      const expired = prior.expires_at && Date.parse(prior.expires_at) < Date.now();
-      if (!prior.held && expired && !prior.released_at) {
-        console.warn(
-          `[ActionExecutor] send_message re-run for action ${action.id}: prior lock ` +
-          `${contact_id}:${priorTrigger} expired unreleased — holder presumed sent, skipping`
-        );
-        lockHeldAttempts.delete(action.id);
-        return {
-          skipped: true,
-          reason: 'holder_expired_unreleased_presumed_sent',
-          contact_id,
-          trigger_id: priorTrigger,
-        };
+  return runSendMessageFlow(action, context, {
+    checkSuppression,
+    resolveTriggerId: async (a, ctx) => {
+      const params = a.action_payload || {};
+      let trigger_id = params.trigger_id || ctx?.message_id || null;
+      if (!trigger_id) {
+        const evt = await fetchSourceEvent(a);
+        trigger_id = evt?.payload?.message_id || (evt?.id ? `evt-${evt.id}` : null);
       }
-    }
-  }
-
-  // Phase 1 #51 — universal suppression gate. Runs first so suppressed
-  // sends do not waste a lock slot or call GHL. Fail-open on infra errors.
-  const suppression = await checkSuppression(contact_id);
-  if (suppression.suppressed) {
-    console.log(
-      `[ActionExecutor] send_message suppressed: contact=${contact_id} ` +
-      `matched_tag=${suppression.matched_tag} all=${(suppression.all_matches || []).join(',')}`
-    );
-    return {
-      skipped: true,
-      reason: 'suppressed',
-      matched_tag: suppression.matched_tag,
-      all_matches: suppression.all_matches,
-      contact_id,
-    };
-  }
-
-  let trigger_id = params.trigger_id || context?.message_id || null;
-  if (!trigger_id) {
-    const evt = await fetchSourceEvent(action);
-    trigger_id = evt?.payload?.message_id || (evt?.id ? `evt-${evt.id}` : null);
-  }
-
-  // ── Enforcing per-contact single-flight + cooldown (2026-07-03) ──
-  // At most ONE agentic reply in flight per contact; sends are spaced by
-  // MIN_AGENTIC_SEND_GAP_SEC. A job that arrives while another is in flight
-  // supersedes it (the displaced job aborts before its GHL POST — it is
-  // unsent, so nothing is recalled). A job that lands inside the cooldown is
-  // rescheduled via executeActionById: the re-run repeats this whole gate,
-  // so supersession and suppression are re-checked at send time. The timer
-  // is in-process — a restart during the (≤90s) window drops the reschedule;
-  // the action row stays visible as skipped/agentic_cooldown for forensics.
-  const agenticJobId = String(action.id ?? `job-${trigger_id || contact_id}`);
-  const slot = await acquireAgenticSlot({
-    contact_id,
-    job_id: agenticJobId,
-    trigger_id,
-    holder: 'agent_executor',
+      return trigger_id;
+    },
+    acquireSlot: acquireAgenticSlot,
+    releaseSlot: releaseAgenticSlot,
+    commitSend: commitAgenticSend,
+    tryLock: tryAcquireLock,
+    releaseLock,
+    executeSend: executeSendMessage,
   });
-  if (!slot.acquired && slot.reason === 'cooldown') {
-    const delayMs = Math.max(1000, (slot.retry_in_ms || 0) + 500);
-    if (Number.isFinite(Number(action.id))) {
-      console.log(
-        `[ActionExecutor] send_message inside agentic cooldown: contact=${contact_id} ` +
-        `action=${action.id} retry_at=${slot.retry_at} — rescheduling in ${Math.round(delayMs / 1000)}s`
-      );
-      const timer = setTimeout(() => {
-        executeActionById(Number(action.id)).catch((err) =>
-          console.error(`[ActionExecutor] cooldown re-run failed for action ${action.id}: ${err.message}`)
-        );
-      }, delayMs);
-      if (typeof timer.unref === 'function') timer.unref();
-    } else {
-      console.warn(
-        `[ActionExecutor] send_message inside agentic cooldown with no action id: contact=${contact_id} — skipping (cannot reschedule)`
-      );
-    }
-    return {
-      skipped: true,
-      reason: 'agentic_cooldown',
-      retry_at: slot.retry_at,
-      rescheduled: Number.isFinite(Number(action.id)),
-      contact_id,
-      trigger_id,
-    };
-  }
-  if (slot.superseded_job_id) {
-    console.log(
-      `[ActionExecutor] send_message job ${agenticJobId} superseded unsent job ${slot.superseded_job_id} for contact ${contact_id}`
-    );
-  }
-
-  const lock = await tryAcquireLock({
-    contact_id,
-    trigger_id,
-    sender: 'agent_executor',
-    message_preview: params.message || params.body,
-    // Award the slot deterministically by action priority (lower = higher
-    // priority) so the intended primary send wins over a racing sibling.
-    priority: Number.isFinite(action.priority) ? action.priority : undefined,
-  });
-
-  if (!lock.acquired) {
-    console.log(
-      `[ActionExecutor] send_message blocked by outbound lock: contact=${contact_id} trigger=${trigger_id} held_by=${lock.held_by}`
-    );
-    // Reschedule past the holder (2026-07-03 P0 fix) instead of terminal-
-    // skipping — a leaked/held lock must delay the reply, not kill it.
-    //
-    // The agentic slot is deliberately KEPT while rescheduled: releasing it
-    // here deleted the row this job took over at acquire time, so the
-    // superseded older job's checkNotSuperseded saw no_row, sent its stale
-    // reply, and commitAgenticSend found no row to arm the cooldown —
-    // a stale send plus a double-send window. Held, the slot keeps older
-    // jobs superseded, newer jobs can still displace it, and it self-heals
-    // via the LOCK_TTL_SEC reclaim if this timer is lost to a restart.
-    const canReschedule = Number.isFinite(Number(action.id));
-    if (canReschedule) {
-      const attempt = lockHeldAttempts.get(action.id) || 0;
-      const decision = decideLockHeldReschedule(lock.expires_at, Date.now(), { attempt });
-      if (decision.reschedule) {
-        lockHeldAttempts.set(action.id, attempt + 1);
-        console.log(
-          `[ActionExecutor] send_message lock held: contact=${contact_id} action=${action.id} ` +
-          `attempt=${attempt + 1} — rescheduling in ${Math.round(decision.delayMs / 1000)}s (${decision.reason})`
-        );
-        const timer = setTimeout(() => {
-          executeActionById(Number(action.id)).catch((err) =>
-            console.error(`[ActionExecutor] lock-held re-run failed for action ${action.id}: ${err.message}`)
-          );
-        }, decision.delayMs);
-        if (typeof timer.unref === 'function') timer.unref();
-        return {
-          skipped: true,
-          reason: 'outbound_lock_held',
-          rescheduled: true,
-          retry_at: decision.retryAt,
-          held_by: lock.held_by,
-          lock_expires_at: lock.expires_at,
-          contact_id,
-          trigger_id,
-        };
-      }
-      console.warn(
-        `[ActionExecutor] send_message lock-held retries exhausted: contact=${contact_id} action=${action.id}`
-      );
-      lockHeldAttempts.delete(action.id);
-      await releaseAgenticSlot(contact_id, agenticJobId);
-      return {
-        skipped: true,
-        reason: 'outbound_lock_retry_exhausted',
-        rescheduled: false,
-        held_by: lock.held_by,
-        lock_expires_at: lock.expires_at,
-        contact_id,
-        trigger_id,
-      };
-    }
-    // No numeric action id — cannot reschedule; free the slot and skip.
-    await releaseAgenticSlot(contact_id, agenticJobId);
-    return {
-      skipped: true,
-      reason: 'outbound_lock_held',
-      rescheduled: false,
-      held_by: lock.held_by,
-      lock_expires_at: lock.expires_at,
-      contact_id,
-      trigger_id,
-    };
-  }
-
-  lockHeldAttempts.delete(action.id);
-
-  try {
-    const result = await executeSendMessage(action, context);
-    // 'message_sent' arms the per-contact cooldown; both it and
-    // 'send_message_handed_off' CONSUMED the inbound, so their outbound
-    // lock is kept until TTL as the post-outcome dedup. Every other
-    // outcome (blocked, suppressed, superseded, no channel, no trigger
-    // message) sent nothing — release BOTH locks so a superseding or
-    // rescheduled job is not deadlocked until lock expiry (2026-07-03 P0:
-    // agent_actions 165762/165770).
-    if (result?.action === 'message_sent') {
-      await commitAgenticSend(contact_id, agenticJobId);
-    } else {
-      await releaseAgenticSlot(contact_id, agenticJobId);
-    }
-    if (!shouldKeepOutboundLock(result?.action) && trigger_id) {
-      await releaseLock(contact_id, trigger_id, { expected_expires_at: lock.expires_at });
-    }
-    return {
-      ...result,
-      _outbound_lock: { acquired: true, trigger_id, lock_key: lock.lock_key, reason: lock.reason },
-    };
-  } catch (err) {
-    if (trigger_id) await releaseLock(contact_id, trigger_id, { expected_expires_at: lock.expires_at });
-    await releaseAgenticSlot(contact_id, agenticJobId);
-    throw err;
-  }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -758,7 +556,7 @@ async function executeSingleAction(action, batchContext = {}, priorBatchResults 
     const result = await Promise.race([
       handler(action, context),
       new Promise((_, rej) => setTimeout(
-        () => rej(new Error(`handler ${action.action_type} timed out after ${HANDLER_TIMEOUT_MS}ms`)),
+        () => rej(new Error(`handler ${action.action_type} timed out after ${HANDLER_TIMEOUT_MS}ms (action ${action.id}, retry ${action.retry_count || 0}/${action.max_retries || 3}) — handler may still be running (zombie); send_message dedups via the sent marker`)),
         HANDLER_TIMEOUT_MS,
       )),
     ]);
@@ -768,18 +566,39 @@ async function executeSingleAction(action, batchContext = {}, priorBatchResults 
     // legacy early-return ai_generation_failed shape). classifyHandlerResult
     // maps those to `failed` with a populated error_message so they stop hiding
     // under `completed` + null error_message. execution_result is preserved.
-    const { status, error_message: errorMessage } = classifyHandlerResult(result);
-    await supabase.from('agent_actions').update({
+    const { status, error_message: errorMessage, retry_at: retryAt } = classifyHandlerResult(result);
+    // 2026-07-03 hotfix: retry_at persists deferrals across restarts (the old
+    // in-process timers died on every redeploy). Writing null clears any
+    // prior deferral. The .neq('status','completed') guard keeps a stale
+    // (watchdog-orphaned zombie) writeback from downgrading a row a newer
+    // attempt already completed (FIX 6b — one terminal status, one truth).
+    const writeback = {
       status,
       error_message: errorMessage,
       execution_result: result,
+      retry_at: retryAt || null,
       executed_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
-    }).eq('id', action.id);
+    };
+    let { error: wbError } = await supabase.from('agent_actions')
+      .update(writeback).eq('id', action.id).neq('status', 'completed');
+    if (wbError && /retry_at|42703|schema cache/i.test(wbError.message || '')) {
+      // DDL-grace: retry_at column not applied yet. Deferral degrades to an
+      // immediately claimable pending row — delayed, never dropped.
+      console.warn(`[ActionExecutor] agent_actions.retry_at missing — apply sql/migrations/2026-07-03_agentic_send_hotfix.sql (action ${action.id} written without retry_at)`);
+      const { retry_at: _omit, ...legacyWriteback } = writeback;
+      ({ error: wbError } = await supabase.from('agent_actions')
+        .update(legacyWriteback).eq('id', action.id).neq('status', 'completed'));
+    }
+    if (wbError) {
+      console.error(`[ActionExecutor] writeback failed for action ${action.id}: ${wbError.message}`);
+    }
     if (status === 'failed') {
       console.warn(`[ActionExecutor] ⚠️ ${action.action_type} marked failed (action ${action.id}, rule: ${action.rule_applied}): ${errorMessage}`);
     } else if (status === 'skipped') {
       console.log(`[ActionExecutor] ⏭️ ${action.action_type} skipped (action ${action.id}, rule: ${action.rule_applied}): ${errorMessage}`);
+    } else if (status === 'pending') {
+      console.log(`[ActionExecutor] ⏸️ ${action.action_type} deferred (action ${action.id}, rule: ${action.rule_applied}): ${errorMessage} retry_at=${retryAt || 'now'}`);
     } else {
       console.log(`[ActionExecutor] ✅ ${action.action_type} completed (action ${action.id}, rule: ${action.rule_applied})`);
     }
@@ -797,13 +616,22 @@ async function executeSingleAction(action, batchContext = {}, priorBatchResults 
     const retries = (action.retry_count || 0) + 1;
     const max = action.max_retries || 3;
     const st = retries >= max ? 'failed' : 'pending';
-    await supabase.from('agent_actions').update({
+    // .neq('status','completed'): a watchdog rejection races a zombie handler
+    // that may still complete (Promise.race never cancels the loser) — never
+    // downgrade a completed row to pending/failed with a timeout error
+    // (FIX 6b). 0 rows updated ⇒ the zombie's completion won; log and accept.
+    const { data: failRows, error: failErr } = await supabase.from('agent_actions').update({
       status: st,
       error_message: err.message,
       retry_count: retries,
       executed_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
-    }).eq('id', action.id);
+    }).eq('id', action.id).neq('status', 'completed').select('id');
+    if (failErr) {
+      console.error(`[ActionExecutor] failure writeback failed for action ${action.id}: ${failErr.message}`);
+    } else if (!failRows || failRows.length === 0) {
+      console.warn(`[ActionExecutor] action ${action.id} already completed — not downgrading to ${st} (${err.message.slice(0, 120)})`);
+    }
     console.error(`[ActionExecutor] ❌ ${action.action_type} failed (action ${action.id}): ${err.message} [retry ${retries}/${max}]`);
     return {
       action_id: action.id,
@@ -882,13 +710,26 @@ async function claimActions(n) {
   if (!missing) throw new Error(`claim_agent_actions RPC failed: ${error.message}`);
 
   console.warn('[ActionExecutor] claim_agent_actions RPC missing — falling back to legacy non-claiming SELECT (single-driver only). Create the RPC to enable concurrency.');
-  const { data: rows, error: selErr } = await supabase.from('agent_actions')
+  // 2026-07-03 hotfix: mirror claim v2's retry_at gate so deferred rows are
+  // not picked up before their retry_at. Degrades to the unfiltered SELECT
+  // if the column has not been applied yet.
+  let { data: rows, error: selErr } = await supabase.from('agent_actions')
     .select('*')
     .eq('status', 'pending')
+    .or(`retry_at.is.null,retry_at.lte.${new Date().toISOString()}`)
     .order('priority', { ascending: true, nullsFirst: false })
     .order('created_at', { ascending: true })
     .order('sequence_order', { ascending: true })
     .limit(n);
+  if (selErr && /retry_at|42703|schema cache/i.test(selErr.message || '')) {
+    ({ data: rows, error: selErr } = await supabase.from('agent_actions')
+      .select('*')
+      .eq('status', 'pending')
+      .order('priority', { ascending: true, nullsFirst: false })
+      .order('created_at', { ascending: true })
+      .order('sequence_order', { ascending: true })
+      .limit(n));
+  }
   if (selErr) throw new Error(selErr.message);
   return { rows: rows || [], claimed: false };
 }

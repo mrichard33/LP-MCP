@@ -157,8 +157,21 @@ function ensureDrainer() {
   console.log(`[RateLimiter] Drainer started (interval=${REFILL_INTERVAL_MS}ms, wait_timeout=${WAIT_TIMEOUT_MS}ms)`);
 }
 
-export function acquireToken() {
+/**
+ * @param {object} [opts]
+ * @param {number} [opts.maxWaitMs]  per-caller cap on the queue wait
+ *   (2026-07-03 hotfix). Handlers that make several sequential GHL calls
+ *   (e.g. resolveReplyContext's 2-3 reads) pass a short cap so a starved /
+ *   429-paused bucket cannot stack 30s waits past the executor's 60s
+ *   handler watchdog. Default: WAIT_TIMEOUT_MS (30s), behavior unchanged
+ *   for existing callers. Fail-open either way.
+ */
+export function acquireToken(opts = {}) {
   refill();
+
+  const maxWaitMs = Number.isFinite(opts.maxWaitMs)
+    ? Math.max(250, Math.min(opts.maxWaitMs, WAIT_TIMEOUT_MS))
+    : WAIT_TIMEOUT_MS;
 
   // Fast path: token available, not paused. No queue, no waiting.
   if (!isPaused() && tokens > 0) {
@@ -196,7 +209,7 @@ export function acquireToken() {
         `(queue=${waitQueue.length}, tokens=${tokens}, paused=${isPaused()}) — failing open`
       );
       resolve();
-    }, WAIT_TIMEOUT_MS);
+    }, maxWaitMs);
 
     entry.resolve = () => {
       if (entry.resolved) return;

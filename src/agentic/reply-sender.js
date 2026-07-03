@@ -146,9 +146,30 @@ export function decideReplyChannel({
   return asResult(requestedChannel || 'sms', 'no_inbound_found');
 }
 
+// 2026-07-03 hotfix — per-dependency budgets. resolveReplyContext makes up
+// to 3 sequential GHL reads BEFORE the send; with the shared token bucket
+// starved (or 429-paused) each read used to wait the limiter's full 30s —
+// two such waits alone blew the executor's 60s handler watchdog on a send
+// that hadn't even POSTed yet. Cap each token wait and the whole context
+// fetch; on deadline the caller falls into its existing
+// context_fetch_failed_open fallback (requested channel, no fromNumber).
+const REPLY_CONTEXT_TOKEN_WAIT_MS = parseInt(process.env.REPLY_CONTEXT_TOKEN_WAIT_MS || '8000', 10);
+const REPLY_CONTEXT_DEADLINE_MS = parseInt(process.env.REPLY_CONTEXT_DEADLINE_MS || '20000', 10);
+
+function withDeadline(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => {
+      timer = setTimeout(() => rej(new Error(`${label} deadline ${ms}ms exceeded`)), ms);
+      if (typeof timer.unref === 'function') timer.unref();
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 async function ghlGet(path) {
   if (!GHL_API_KEY) throw new Error('GHL_API_KEY not configured');
-  await acquireToken();
+  await acquireToken({ maxWaitMs: REPLY_CONTEXT_TOKEN_WAIT_MS });
   const res = await fetch(`https://services.leadconnectorhq.com${path}`, {
     headers: {
       'Authorization': `Bearer ${GHL_API_KEY}`,
@@ -206,7 +227,12 @@ export async function resolveReplyContext(contactId, { requestedChannel = null, 
   let derived = { inboundOrigin: null, livechatAgeMin: null, inboundSmsTo: null };
 
   try {
-    const fetched = await fetchRecentMessages(contactId);
+    // 2026-07-03 hotfix: one overall deadline on the whole context fetch —
+    // a starved token bucket must degrade this to the fail-soft fallback
+    // below, never eat the executor's 60s handler budget pre-send.
+    const fetched = await withDeadline(
+      fetchRecentMessages(contactId), REPLY_CONTEXT_DEADLINE_MS, 'resolveReplyContext',
+    );
     conversationId = fetched.conversationId;
     derived = deriveInboundContext(fetched.messages);
   } catch (err) {
@@ -224,8 +250,12 @@ export async function resolveReplyContext(contactId, { requestedChannel = null, 
   }
 
   // Only pay for the phone lookup when the decision can hinge on it.
+  // Deadline-capped like the fetch above; on timeout treat as no-phone
+  // (contactHasPhone already fails soft to false).
   const mayNeedPhone = derived.inboundOrigin === 'livechat' || requestedChannel === 'livechat';
-  const hasPhone = mayNeedPhone ? await contactHasPhone(contactId) : true;
+  const hasPhone = mayNeedPhone
+    ? await withDeadline(contactHasPhone(contactId), REPLY_CONTEXT_DEADLINE_MS, 'contactHasPhone').catch(() => false)
+    : true;
 
   const decision = decideReplyChannel({
     requestedChannel,

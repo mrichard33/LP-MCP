@@ -89,8 +89,66 @@ test('sent + cooldown passed → reclaim_after_send (next send allowed)', () => 
   assert.equal(d.action, 'reclaim_after_send');
 });
 
-test('cooldown blocks EVERY challenger, even the job that sent (no self-bypass)', () => {
-  const row = { job_id: 'job-1', status: 'sent', locked_at: iso(-30), cooldown_until: iso(60) };
+// ── 2026-07-03 evening hotfix semantics ─────────────────────────────
+// (dropped-replies incident: delivered-but-watchdog-timed-out sends were
+// retried and churned through cooldown skips; stale retries could displace
+// newer replies; superseded_by recorded the wrong job.)
+
+test('own sent row → already_sent (retry dedup), NOT blocked_cooldown', () => {
+  // The job that sent re-acquires (its handler was watchdog-orphaned after
+  // the GHL 2xx, the action row was retried). It must complete as a dedup —
+  // never send again, never churn through cooldown skips. Cooldown still
+  // blocks every OTHER job (next test).
+  const row = {
+    job_id: 'job-1', status: 'sent', locked_at: iso(-30), cooldown_until: iso(60),
+    last_message_id: 'msg-abc', last_conversation_id: 'conv-1',
+  };
   const d = decideSlotAcquisition(row, { jobId: 'job-1', nowMs: NOW });
+  assert.equal(d.action, 'already_sent');
+  assert.equal(d.messageId, 'msg-abc');
+  assert.equal(d.conversationId, 'conv-1');
+});
+
+test('cooldown still blocks every OTHER challenger', () => {
+  const row = { job_id: 'job-1', status: 'sent', locked_at: iso(-30), cooldown_until: iso(60) };
+  const d = decideSlotAcquisition(row, { jobId: 'job-2', nowMs: NOW });
   assert.equal(d.action, 'blocked_cooldown');
+});
+
+test('own in_flight row wins over a live cooldown field (re-entrance beats cooldown check order)', () => {
+  // Pathological row shape: in_flight with a (stale) cooldown_until in the
+  // future. Re-entrance must be decided before the cooldown gate.
+  const row = { job_id: 'job-1', status: 'in_flight', locked_at: iso(-5), cooldown_until: iso(60) };
+  const d = decideSlotAcquisition(row, { jobId: 'job-1', nowMs: NOW });
+  assert.equal(d.action, 'already_held');
+});
+
+test('older numeric job meeting a NEWER live holder → yield_to_newer (stale retry never displaces the newer reply)', () => {
+  const row = { job_id: '165923', status: 'in_flight', locked_at: iso(-10), cooldown_until: null };
+  const d = decideSlotAcquisition(row, { jobId: '165910', nowMs: NOW, ttlSec: 120 });
+  assert.equal(d.action, 'yield_to_newer');
+  assert.equal(d.newerJobId, '165923');
+});
+
+test('newer numeric job meeting an OLDER live holder → supersede, recording the DISPLACED id', () => {
+  const row = { job_id: '165910', status: 'in_flight', locked_at: iso(-10), cooldown_until: null };
+  const d = decideSlotAcquisition(row, { jobId: '165923', nowMs: NOW, ttlSec: 120 });
+  assert.equal(d.action, 'supersede');
+  // Regression for the incident's self-referential row (job_id=165923,
+  // superseded_by=165923): the DISPLACED job is recorded, never the acquirer.
+  assert.equal(d.supersededJobId, '165910');
+  assert.notEqual(d.supersededJobId, '165923');
+});
+
+test('non-numeric job ids keep plain supersede semantics (no ordering)', () => {
+  const row = { job_id: 'job-9', status: 'in_flight', locked_at: iso(-10), cooldown_until: null };
+  const d = decideSlotAcquisition(row, { jobId: 'job-1', nowMs: NOW, ttlSec: 120 });
+  assert.equal(d.action, 'supersede');
+  assert.equal(d.supersededJobId, 'job-9');
+});
+
+test('older numeric job vs EXPIRED newer holder → reclaim_expired (ordering only applies to live holders)', () => {
+  const row = { job_id: '165923', status: 'in_flight', locked_at: iso(-121), cooldown_until: null };
+  const d = decideSlotAcquisition(row, { jobId: '165910', nowMs: NOW, ttlSec: 120 });
+  assert.equal(d.action, 'reclaim_expired');
 });
