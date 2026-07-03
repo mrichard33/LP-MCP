@@ -36,7 +36,8 @@
  * Mirrors POST /webhook/lp-lead-refresh (fast-ack + setImmediate) from
  * src/rest-api.js. NO agent rules consume these events yet — this is the
  * ingestion layer only. Substrate: sql/migrations/2026-07-02_five9_events_raw.sql
- * + 2026-07-03 enrichment columns + full_name→agent_name rename (dashboard DDL).
+ * + 2026-07-03 enrichment columns + column renames (dashboard DDL):
+ *   full_name → agent_name, disposition → disposition_id.
  */
 
 import crypto from 'crypto';
@@ -154,7 +155,7 @@ export function extractFields(payload) {
       call_id:          pick(payload, ['callId', 'call_id', 'interactionId', 'interaction_id']),
       ani:              pick(payload, ['ANI', 'ani', 'callerNumber', 'from']),
       dnis:             pick(payload, ['DNIS', 'dnis', 'dialedNumber', 'to']),
-      disposition:      pick(payload, ['disposition_id', 'dispositionId', 'disposition']),
+      disposition_id:   pick(payload, ['disposition_id', 'dispositionId', 'disposition']),
       disposition_name: pick(payload, ['disposition_name', 'dispositionName']),
       campaign:         pick(payload, ['campaign_name', 'campaignName', 'campaign']),
       lp_rec_key:       pick(payload, ['LPRecKey', 'lp_rec_key', 'lpreckey']),
@@ -177,7 +178,7 @@ export function extractFields(payload) {
     return fields;
   } catch {
     return {
-      event_type: null, call_id: null, ani: null, dnis: null, disposition: null,
+      event_type: null, call_id: null, ani: null, dnis: null, disposition_id: null,
       disposition_name: null, campaign: null, lp_rec_key: null, lp_rec_type: null,
       agent_name: null, call_start_at: null, call_end_at: null, duration_sec: null,
     };
@@ -230,7 +231,6 @@ export async function five9WebhookHandler(req, res) {
     call_id:          fields.call_id,
     ani:              fields.ani,
     dnis:             fields.dnis,
-    disposition:      fields.disposition,
     disposition_name: fields.disposition_name,
     campaign:         fields.campaign,
     lp_rec_key:       fields.lp_rec_key,
@@ -242,26 +242,31 @@ export async function five9WebhookHandler(req, res) {
     headers: redactHeaders(req.headers),
   };
 
-  // Insert cascade — makes the full_name→agent_name column rename (dashboard
-  // DDL) deployable in any order relative to this code:
-  //   1. agent_name column (post-rename schema)
-  //   2. full_name column  (pre-rename schema)
-  //   3. legacy minimal set (pre-enrichment schema) — never drop a delivery.
+  // Insert cascade — makes the column renames (dashboard DDL:
+  // full_name→agent_name, disposition→disposition_id) deployable in any
+  // order relative to this code. Run both RENAMEs in one batch so mixed
+  // states never occur in practice:
+  //   1. post-rename schema  (agent_name + disposition_id)
+  //   2. pre-rename schema   (full_name + disposition)
+  //   3. legacy minimal set  (pre-enrichment schema) — never drop a delivery.
   const insertAttempts = [
-    { ...baseRow, agent_name: fields.agent_name },
-    { ...baseRow, full_name: fields.agent_name },
+    { ...baseRow, agent_name: fields.agent_name, disposition_id: fields.disposition_id },
+    { ...baseRow, full_name: fields.agent_name, disposition: fields.disposition_id },
     {
       event_type:  fields.event_type,
       call_id:     fields.call_id,
       ani:         fields.ani,
       dnis:        fields.dnis,
-      disposition: fields.disposition,
+      disposition: fields.disposition_id,
       payload,
       headers: redactHeaders(req.headers),
     },
   ];
 
-  const SELECT_COLS = 'id, received_at, event_type, call_id, ani, dnis, disposition';
+  // Column-name-agnostic select: disposition/agent columns are carried into
+  // normalization from extracted fields, not from the returned row, so the
+  // select list never breaks across the renames.
+  const SELECT_COLS = 'id, received_at, event_type, call_id, ani, dnis';
 
   // 3. FAST ACK — insert raw row, then respond 200 immediately.
   let row;
@@ -292,6 +297,7 @@ export async function five9WebhookHandler(req, res) {
 
   // Carry enrichment into normalization regardless of which insert path ran.
   const normRow = { ...row, ...{
+    disposition_id:   fields.disposition_id,
     disposition_name: fields.disposition_name,
     campaign:         fields.campaign,
     lp_rec_key:       fields.lp_rec_key,
@@ -416,7 +422,7 @@ export async function normalizeFive9Row(row) {
   //     without a matching agent_rule.
   const emitted = await emitEvent({
     event_type: mappedType,
-    event_subtype: row.disposition_name || row.disposition || null,
+    event_subtype: row.disposition_name || row.disposition_id || null,
     source: 'five9-ess',
     entity_type: contactMatch?.lp_lead_id ? 'lead' : 'system',
     entity_id: contactMatch?.lp_lead_id || row.call_id || String(rawId),
@@ -433,7 +439,7 @@ export async function normalizeFive9Row(row) {
       call_id: row.call_id || null,
       ani: row.ani || null,
       dnis: row.dnis || null,
-      disposition: row.disposition || null,
+      disposition_id: row.disposition_id || null,
       disposition_name: row.disposition_name || null,
       campaign: row.campaign || null,
       agent_name: row.agent_name || null,
