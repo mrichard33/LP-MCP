@@ -114,7 +114,7 @@ import { runPool, groupByBatch } from './concurrency.js';
 import { classifyHandlerResult } from './result-status.js';
 
 // MVI v2.5 — outbound dedup + Layer 3 dispatch
-import { tryAcquireLock, releaseLock } from '../services/outbound-locks.js';
+import { tryAcquireLock, releaseLock, checkLock, decideLockHeldReschedule, shouldKeepOutboundLock } from '../services/outbound-locks.js';
 import { getDispatchForClassification } from '../services/layer3-dispatch.js';
 
 // 2026-07-03 — enforcing per-contact single-flight + cooldown (Steve Nkzhm
@@ -181,12 +181,57 @@ async function fetchSourceEvent(action) {
 //
 // Order:
 //   1. checkSuppression(contact_id)  — tag-based gate (NEW 2026-05-13)
-//   2. tryAcquireLock                — outbound dedup
-//   3. executeSendMessage            — actual GHL API call
+//   2. acquireAgenticSlot            — per-contact single-flight + cooldown
+//   3. tryAcquireLock                — outbound dedup per (contact, trigger)
+//   4. executeSendMessage            — actual GHL API call
+//
+// Lock hygiene (2026-07-03 P0, agent_actions 165762/165770): every exit
+// that did NOT consume the inbound (superseded, blocked, suppressed, no
+// channel, no trigger message) releases the outbound lock — see
+// shouldKeepOutboundLock. A send blocked by a live lock is RESCHEDULED
+// (bounded polling via decideLockHeldReschedule), never terminal-skipped;
+// otherwise a leaked lock deadlocks the reply until TTL and the contact is
+// never answered. The reschedule timer is in-process — a restart drops it
+// (same accepted limitation as the cooldown reschedule below); the action
+// stays visible as skipped/outbound_lock_held + rescheduled for forensics
+// and can be re-run manually, where the presumed-sent guard keeps the
+// re-run duplicate-safe.
+
+// In-memory reschedule attempt counter for lock-held sends. Cleared on
+// restart — with the timers gone too, a fresh process starts a fresh budget.
+const lockHeldAttempts = new Map();
 
 async function executeSendMessageWithLock(action, context) {
   const params = action.action_payload || {};
   const contact_id = action.target_id;
+
+  // ── Presumed-sent guard (2026-07-03) ──
+  // Re-run of a lock-held reschedule: if the blocking lock ran to full TTL
+  // WITHOUT being released, its holder either sent (sends keep the lock by
+  // design) or hard-crashed mid-send. send_message is non-idempotent
+  // (reaper.js: NON_IDEMPOTENT_ACTION_TYPES) — drop over duplicate.
+  const priorSkip = action.status === 'skipped'
+    && action.execution_result?.reason === 'outbound_lock_held';
+  if (priorSkip) {
+    const priorTrigger = action.execution_result?.trigger_id;
+    if (priorTrigger) {
+      const prior = await checkLock(contact_id, priorTrigger);
+      const expired = prior.expires_at && Date.parse(prior.expires_at) < Date.now();
+      if (!prior.held && expired && !prior.released_at) {
+        console.warn(
+          `[ActionExecutor] send_message re-run for action ${action.id}: prior lock ` +
+          `${contact_id}:${priorTrigger} expired unreleased — holder presumed sent, skipping`
+        );
+        lockHeldAttempts.delete(action.id);
+        return {
+          skipped: true,
+          reason: 'holder_expired_unreleased_presumed_sent',
+          contact_id,
+          trigger_id: priorTrigger,
+        };
+      }
+    }
+  }
 
   // Phase 1 #51 — universal suppression gate. Runs first so suppressed
   // sends do not waste a lock slot or call GHL. Fail-open on infra errors.
@@ -274,11 +319,64 @@ async function executeSendMessageWithLock(action, context) {
     console.log(
       `[ActionExecutor] send_message blocked by outbound lock: contact=${contact_id} trigger=${trigger_id} held_by=${lock.held_by}`
     );
-    // We hold the agentic slot but will not send — free it for the holder.
+    // Reschedule past the holder (2026-07-03 P0 fix) instead of terminal-
+    // skipping — a leaked/held lock must delay the reply, not kill it.
+    //
+    // The agentic slot is deliberately KEPT while rescheduled: releasing it
+    // here deleted the row this job took over at acquire time, so the
+    // superseded older job's checkNotSuperseded saw no_row, sent its stale
+    // reply, and commitAgenticSend found no row to arm the cooldown —
+    // a stale send plus a double-send window. Held, the slot keeps older
+    // jobs superseded, newer jobs can still displace it, and it self-heals
+    // via the LOCK_TTL_SEC reclaim if this timer is lost to a restart.
+    const canReschedule = Number.isFinite(Number(action.id));
+    if (canReschedule) {
+      const attempt = lockHeldAttempts.get(action.id) || 0;
+      const decision = decideLockHeldReschedule(lock.expires_at, Date.now(), { attempt });
+      if (decision.reschedule) {
+        lockHeldAttempts.set(action.id, attempt + 1);
+        console.log(
+          `[ActionExecutor] send_message lock held: contact=${contact_id} action=${action.id} ` +
+          `attempt=${attempt + 1} — rescheduling in ${Math.round(decision.delayMs / 1000)}s (${decision.reason})`
+        );
+        const timer = setTimeout(() => {
+          executeActionById(Number(action.id)).catch((err) =>
+            console.error(`[ActionExecutor] lock-held re-run failed for action ${action.id}: ${err.message}`)
+          );
+        }, decision.delayMs);
+        if (typeof timer.unref === 'function') timer.unref();
+        return {
+          skipped: true,
+          reason: 'outbound_lock_held',
+          rescheduled: true,
+          retry_at: decision.retryAt,
+          held_by: lock.held_by,
+          lock_expires_at: lock.expires_at,
+          contact_id,
+          trigger_id,
+        };
+      }
+      console.warn(
+        `[ActionExecutor] send_message lock-held retries exhausted: contact=${contact_id} action=${action.id}`
+      );
+      lockHeldAttempts.delete(action.id);
+      await releaseAgenticSlot(contact_id, agenticJobId);
+      return {
+        skipped: true,
+        reason: 'outbound_lock_retry_exhausted',
+        rescheduled: false,
+        held_by: lock.held_by,
+        lock_expires_at: lock.expires_at,
+        contact_id,
+        trigger_id,
+      };
+    }
+    // No numeric action id — cannot reschedule; free the slot and skip.
     await releaseAgenticSlot(contact_id, agenticJobId);
     return {
       skipped: true,
       reason: 'outbound_lock_held',
+      rescheduled: false,
       held_by: lock.held_by,
       lock_expires_at: lock.expires_at,
       contact_id,
@@ -286,23 +384,31 @@ async function executeSendMessageWithLock(action, context) {
     };
   }
 
+  lockHeldAttempts.delete(action.id);
+
   try {
     const result = await executeSendMessage(action, context);
-    // 'message_sent' is the only result shape where a GHL send actually
-    // happened — commit arms the per-contact cooldown. Every other outcome
-    // (blocked, suppressed, handed off, superseded, no trigger message)
-    // sent nothing, so the slot is released with no cooldown.
+    // 'message_sent' arms the per-contact cooldown; both it and
+    // 'send_message_handed_off' CONSUMED the inbound, so their outbound
+    // lock is kept until TTL as the post-outcome dedup. Every other
+    // outcome (blocked, suppressed, superseded, no channel, no trigger
+    // message) sent nothing — release BOTH locks so a superseding or
+    // rescheduled job is not deadlocked until lock expiry (2026-07-03 P0:
+    // agent_actions 165762/165770).
     if (result?.action === 'message_sent') {
       await commitAgenticSend(contact_id, agenticJobId);
     } else {
       await releaseAgenticSlot(contact_id, agenticJobId);
+    }
+    if (!shouldKeepOutboundLock(result?.action) && trigger_id) {
+      await releaseLock(contact_id, trigger_id, { expected_expires_at: lock.expires_at });
     }
     return {
       ...result,
       _outbound_lock: { acquired: true, trigger_id, lock_key: lock.lock_key, reason: lock.reason },
     };
   } catch (err) {
-    if (trigger_id) await releaseLock(contact_id, trigger_id);
+    if (trigger_id) await releaseLock(contact_id, trigger_id, { expected_expires_at: lock.expires_at });
     await releaseAgenticSlot(contact_id, agenticJobId);
     throw err;
   }

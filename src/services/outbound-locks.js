@@ -72,7 +72,18 @@ export async function tryAcquireLock({ contact_id, trigger_id, sender, message_p
           acquired_at: new Date().toISOString(),
         })
         .eq('lock_key', lock_key);
-      return { acquired: true, reason: 'reacquired_after_expiry', lock_key };
+      // Distinct reasons (2026-07-03): a released lock means the prior holder
+      // aborted without sending — taking it over is always safe. An expired-
+      // but-NEVER-released lock means the holder either sent (sends keep the
+      // lock until TTL by design) or hard-crashed; callers that reschedule
+      // around held locks treat that case as presumed-sent (see
+      // executeSendMessageWithLock in src/actions/index.js).
+      return {
+        acquired: true,
+        reason: isReleased ? 'reacquired_after_release' : 'reacquired_after_expiry',
+        lock_key,
+        expires_at,
+      };
     }
     // A live (non-expired, non-released) holder always blocks the challenger —
     // this is the hard "exactly one outbound per (contact,trigger)" guarantee.
@@ -82,16 +93,92 @@ export async function tryAcquireLock({ contact_id, trigger_id, sender, message_p
     console.error(`[outbound-locks] acquire error for ${lock_key}: ${error.message}`);
     return { acquired: true, reason: 'acquire_error_open', lock_key };
   }
-  return { acquired: true, lock_key };
+  return { acquired: true, lock_key, expires_at };
 }
 
-export async function releaseLock(contact_id, trigger_id) {
+/**
+ * Release a lock this caller acquired. Pass the expires_at returned by
+ * tryAcquireLock as expected_expires_at to make the release compare-and-set:
+ * if a later job reacquired the key (new expires_at), the release no-ops
+ * instead of freeing the successor's live lock. Guards against the watchdog
+ * Promise.race-loser zombie (a timed-out handler whose release fires long
+ * after its action was retried — see executeSingleAction's watchdog notes in
+ * src/actions/index.js).
+ */
+export async function releaseLock(contact_id, trigger_id, { expected_expires_at } = {}) {
   if (!supabase || !contact_id || !trigger_id) return;
-  const { error } = await supabase
+  let query = supabase
     .from('outbound_locks')
     .update({ released_at: new Date().toISOString() })
     .eq('lock_key', `${contact_id}:${trigger_id}`);
+  if (expected_expires_at) query = query.eq('expires_at', expected_expires_at);
+  const { error } = await query;
   if (error) console.error(`[outbound-locks] release error for ${contact_id}:${trigger_id}: ${error.message}`);
+}
+
+/**
+ * Pure decision: should a send blocked by a live outbound lock be
+ * rescheduled, and after what delay? No I/O; unit-tested in
+ * scripts/test-outbound-lock-reschedule.js (mirrors the decideSlotAcquisition
+ * precedent in agentic-reply-locks.js).
+ *
+ * The delay is anchored to the holder's expires_at but clamped to
+ * [minMs, maxMs]. The maxMs clamp turns a long wait into polling: after the
+ * 2026-07-03 fix, holders that abort release their lock within seconds, so a
+ * challenger sleeping the full 300s TTL would add minutes of needless reply
+ * latency. Each re-run repeats the full send gate and, if still blocked,
+ * reschedules again — attempt × maxMs comfortably carries the retry past any
+ * lock's full TTL. At maxAttempts the caller terminal-skips.
+ *
+ * @param {string|null} expiresAtIso  holder's expires_at (may be missing)
+ * @param {number} nowMs
+ * @param {object} [opts]
+ * @param {number} [opts.attempt=0]   how many reschedules already happened
+ * @returns {{ reschedule: boolean, delayMs?: number, retryAt?: string, reason: string }}
+ */
+export function decideLockHeldReschedule(expiresAtIso, nowMs, {
+  attempt = 0,
+  maxAttempts = 8,
+  minMs = 5_000,
+  maxMs = 60_000,
+  bufferMs = 1_500,
+  fallbackMs = 30_000,
+} = {}) {
+  if (attempt >= maxAttempts) {
+    return { reschedule: false, reason: 'retry_exhausted' };
+  }
+  const expiresMs = expiresAtIso ? Date.parse(expiresAtIso) : NaN;
+  let delayMs;
+  if (Number.isFinite(expiresMs)) {
+    delayMs = Math.min(maxMs, Math.max(minMs, expiresMs - nowMs + bufferMs));
+  } else {
+    delayMs = Math.min(maxMs, Math.max(minMs, fallbackMs));
+  }
+  return {
+    reschedule: true,
+    delayMs,
+    retryAt: new Date(nowMs + delayMs).toISOString(),
+    reason: Number.isFinite(expiresMs) ? 'until_lock_expiry' : 'no_expiry_fallback',
+  };
+}
+
+/**
+ * Which handler outcomes keep their outbound lock until TTL? Only the ones
+ * where the inbound was actually CONSUMED:
+ *   message_sent            — the lock's post-send dedup purpose
+ *   send_message_handed_off — handoff tags applied; a human/GHL workflow owns
+ *                             the response. Releasing would let a same-trigger
+ *                             sibling re-run, re-classify (non-deterministic),
+ *                             and drop a bot SMS on top of the handoff.
+ * Every other outcome sent nothing — the lock is released so a superseding
+ * or rescheduled job is not deadlocked until TTL (the 2026-07-03 P0:
+ * agent_actions 165762/165770, contact VZ52xEN3bsCUDWLMCHnk).
+ * Keyed on result.action (not classify-status): a fallback send rides on
+ * action 'message_sent' and must keep its lock even though it classifies as
+ * 'failed'.
+ */
+export function shouldKeepOutboundLock(resultAction) {
+  return resultAction === 'message_sent' || resultAction === 'send_message_handed_off';
 }
 
 export async function checkLock(contact_id, trigger_id) {
