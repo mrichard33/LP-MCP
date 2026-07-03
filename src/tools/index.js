@@ -10,6 +10,7 @@ import { registerRescissionTools } from './rescission-tools.js';
 import { registerLPAppointmentTools } from './lp-appointment-tools.js';
 import { registerDriftTools } from './drift-tools.js';
 import { registerAdminTools } from './admin/index.js';
+import { registerFive9Tools } from './five9-tools.js';
 
 export function registerAllTools(server) {
   // LP data tools (16)
@@ -37,4 +38,8 @@ export function registerAllTools(server) {
   registerDriftTools(server);
   // Infrastructure admin tools (17) — v5.1
   registerAdminTools(server);
+  // Five9 admin READ tools (2) — v6.8 (2026-07-03)
+  //   five9_get_campaigns, five9_get_campaign_state (read-only Admin SOAP;
+  //   writes come later behind approve_action)
+  registerFive9Tools(server);
 }
