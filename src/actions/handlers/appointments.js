@@ -96,6 +96,9 @@ import { fetchUpcomingAppointments } from '../../knowledge/contact-appointments.
 import { isInHomeCalendarId } from '../../knowledge/booking-calendar-router.js';
 import { markRescheduleInflight } from '../../services/reschedule-inflight.js';
 import { executeCreateTask } from './tasks.js';
+import { getContactCached } from '../contact-cache.js';
+import { isPlaceholderName } from '../../services/identity-extraction.js';
+import { emitEvent } from '../../event-emitter.js';
 
 // Tags cleared once a booking lands (or the flow otherwise terminates) so the
 // post-qualification affirmative-gate bypass (intent-classifier.js) doesn't
@@ -119,6 +122,56 @@ const DECISION_MAKERS_VALID_VALUES = new Set(['Yes', 'No', 'Solo Owner', 'Uncert
 const NON_ACTIVE_APPOINTMENT_STATUSES = new Set([
   'cancelled', 'canceled', 'no_show', 'noshow', 'no-show', 'invalid',
 ]);
+
+// v1.1 (Victor Lopez incident 2026-07-04) — tag stamped when the R2 hard
+// gate blocks an in-home booking at creation time, so humans can find and
+// rescue these conversations.
+const GATE_BLOCKED_TAG = 'booking:gate-blocked';
+
+function readContactCustomField(contact, fieldId) {
+  const cfs = Array.isArray(contact?.customFields) ? contact.customFields : [];
+  const f = cfs.find((x) => x?.id === fieldId);
+  const v = f?.value ?? f?.field_value ?? null;
+  return v == null || String(v).trim() === '' ? null : String(v).trim();
+}
+
+/**
+ * v1.1 — R2 hard backstop: an in-home appointment may NEVER be created
+ * without (a) a real name, (b) phone, (c) property address, (d) the
+ * decision-maker question having been asked. The response-generator's
+ * prompt gate is the primary enforcement; this catches anything that
+ * reaches the handler un-gated (raw companions, replayed actions, rules).
+ * Contact-read failure fails OPEN (loudly) — the prompt gate remains the
+ * primary control and a transient GHL error must not strand a legit
+ * booking the bot already promised.
+ */
+export async function evaluateInHomePrerequisites(contactId, payload, context) {
+  let contact;
+  try {
+    contact = await getContactCached(contactId, context?._contactCache);
+  } catch (err) {
+    console.warn(`[ActionExecutor] in-home prereq gate: contact read failed for ${contactId}: ${err.message} — failing open`);
+    return { ok: true, failOpen: true, missing: [] };
+  }
+
+  const missing = [];
+  const fullName = [contact.firstName, contact.lastName].filter(Boolean).join(' ')
+    || contact.contactName || contact.name || '';
+  if (isPlaceholderName(fullName) || isPlaceholderName(contact.firstName ?? fullName)) missing.push('real_name');
+  if (!contact.phone) missing.push('phone');
+  // Street + zip are the hard components (zip proves service area);
+  // city/state derive from the zip and never block.
+  if (!contact.address1 || !contact.postalCode) missing.push('address');
+
+  const dmField = readContactCustomField(contact, FIELD_ID_DECISION_MAKERS_PRESENT);
+  const dmInPayload = DECISION_MAKERS_VALID_VALUES.has(payload?.qualifying_data?.decision_makers_present);
+  const tags = Array.isArray(contact.tags) ? contact.tags : [];
+  const dmAsked = !!dmField || dmInPayload
+    || tags.includes('booking:dm-pending') || tags.includes('booking:dm-asked');
+  if (!dmAsked) missing.push('decision_maker_question');
+
+  return { ok: missing.length === 0, missing };
+}
 
 /**
  * v3.1 — Persist qualifying data to GHL custom fields. Returns the count
@@ -327,6 +380,38 @@ export async function executeBookAppointment(action, context) {
 
   const inHome = isInHomeCalendarId(calendarId);
   const dmPresent = payload.qualifying_data?.decision_makers_present;
+
+  // v1.1 — R2 hard gate (Victor Lopez incident 2026-07-04): never CREATE an
+  // in-home appointment without real name + phone + address + the
+  // decision-maker question asked. Runs only for fresh bookings — the
+  // double-book guard above already returned for existing appointments.
+  if (inHome) {
+    const prereq = await evaluateInHomePrerequisites(contactId, payload, context);
+    if (!prereq.ok) {
+      console.warn(`[ActionExecutor] 🚫 in-home booking BLOCKED for ${contactId} (calendar ${calendarId}): missing ${prereq.missing.join(', ')}`);
+      await applyGHLTag(contactId, GATE_BLOCKED_TAG).catch(() => {});
+      await emitEvent({
+        event_type: 'booking.gate_blocked',
+        event_subtype: prereq.missing.join(','),
+        source: 'lp_mcp',
+        entity_type: 'contact',
+        entity_id: contactId,
+        ghl_contact_id: contactId,
+        payload: { calendar_id: calendarId, requested_start_time: startTime, missing: prereq.missing },
+        priority: 'high',
+        bypass_filter: true,
+      }).catch(() => {});
+      return {
+        action: 'appointment_blocked_prerequisites',
+        blocked: true,
+        contact_id: contactId,
+        calendar_id: calendarId,
+        requested_start_time: startTime,
+        missing: prereq.missing,
+        reason: `in-home booking blocked: missing ${prereq.missing.join(', ')}`,
+      };
+    }
+  }
 
   // Deterministic status backstop (never blocks). An in-home appointment is
   // ALWAYS booked — there is no conversational hold. 'confirmed' requires

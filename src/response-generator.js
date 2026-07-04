@@ -174,6 +174,16 @@ import { CALENDAR_MAP } from './actions/constants.js';
 import { applyGHLTag } from './ghl.js';
 import supabase from './supabase.js';
 import { callLLM, resolveLLM } from './llm-client.js';
+import {
+  buildIdentityState,
+  assertBookingPrerequisites,
+  promoteIdentityToGHL,
+  checkServiceAreaZip,
+  checkServiceAreaCity,
+  geocodeStreetToZip,
+  enrichIdentityFromServiceArea,
+  EMAIL_ASKED_TAG,
+} from './services/identity-extraction.js';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy
@@ -1080,6 +1090,36 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   parts.push(`\nLEAD: ${context.lead.name}`);
   parts.push(`Entry: ${context.lead.entry_source || 'unknown'} | Lead Score: ${context.lead.lead_score} | Date Added: ${context.lead.date_added || 'unknown'}`);
 
+  // ─── v1.1 KNOWN CONTACT PROFILE (R5 — never re-ask a known field) ───
+  // Hydrated from the GHL record + everything extracted from this
+  // conversation. The bot only ever asks for fields marked NOT KNOWN.
+  if (opts.bookingGate?.known) {
+    const known = opts.bookingGate.known;
+    const dmState = opts.bookingGate.decision_maker_confirmed;
+    parts.push(`\n═══════ KNOWN CONTACT PROFILE (CRM record + this conversation) ═══════`);
+    parts.push(`Name: ${known.name || 'NOT KNOWN'}`);
+    parts.push(`Phone: ${known.phone || 'NOT KNOWN'}`);
+    parts.push(`Email: ${known.email || 'NOT KNOWN'}`);
+    parts.push(`Property address: ${known.address || 'NOT KNOWN'}`);
+    parts.push(`Decision-maker presence: ${dmState === true ? 'CONFIRMED (all decision-makers attending)' : dmState === false ? 'ANSWERED BUT PENDING/NEGATIVE (do not re-ask this turn unless they volunteer an update)' : 'NEVER ASKED'}`);
+    parts.push(`NON-NEGOTIABLE RULE: Never ask the customer for information already present in this profile — it is on file. Only a field marked NOT KNOWN may ever be asked for, one at a time, and only when the booking-gate rules below call for it.`);
+    parts.push(`═══════ END KNOWN CONTACT PROFILE ═══════`);
+  }
+
+  // ─── v1.1 SERVICE AREA STATUS (zip-verified against service_area_zips) ───
+  if (opts.serviceArea?.checked) {
+    if (opts.serviceArea.in_service_area === true) {
+      parts.push(`\nSERVICE AREA STATUS: zip ${opts.serviceArea.zip} VERIFIED IN SERVICE AREA${opts.serviceArea.city ? ` (${opts.serviceArea.city})` : ''}. If the customer provided their address or zip in this conversation and you have not yet told them, include a brief natural confirmation that they're in our service area (e.g. "Good news — ${opts.serviceArea.city || 'your area'} is right in our service area."). Say it once; never repeat it on later turns.`);
+    } else {
+      parts.push(`\nSERVICE AREA STATUS: zip ${opts.serviceArea.zip} is OUTSIDE Reece's mapped service area. Do NOT offer any in-home visit, do NOT propose appointment times, and do NOT include a booking link. Politely let them know their area is outside our current service footprint, thank them for their interest, and do not pitch further.`);
+    }
+  } else if (opts.serviceAreaTentative?.checked && opts.serviceAreaTentative.city_served === true) {
+    // City-level signal only — Reece serves at least part of this city, but
+    // coverage is by ZIP and cities are partially covered. Positive-only:
+    // never used to tell someone they're out of area, never infers a zip.
+    parts.push(`\nSERVICE AREA STATUS (TENTATIVE — city match only): ${opts.serviceAreaTentative.city} is a market Reece serves, but coverage is confirmed by zip. You may speak positively about serving ${opts.serviceAreaTentative.city}; when you ask for the zip, frame it as the final confirmation (e.g. "We're all over ${opts.serviceAreaTentative.city} — what's the zip so I can confirm you're in our coverage?"). Do NOT state they are confirmed in the service area until the zip is verified.`);
+  }
+
   const stageNum = inferBuyerStage(context);
   parts.push(`Inferred Buyer Stage: ${stageNum}/5`);
 
@@ -1284,13 +1324,41 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     parts.push(`═══════ END EDITORIAL FEEDBACK ═══════`);
   }
 
-  // ─── Booking gate (BUILD HANDOFF §4) — only when a calendar is resolved ───
+  // ─── Booking gate (BUILD HANDOFF §4 + v1.1 prerequisite gate) — only when a calendar is resolved ───
   const bcg = kbPack?.booking_context;
-  if (bcg && bcg.requires_in_home_gate === true) {
-    parts.push(`\n═══════ IN-HOME BOOKING GATE (a rep visits the home — BOOK FIRST, then capture decision-makers + address) ═══════`);
-    parts.push(`This booking targets the in-home ${bcg.resolved_calendar_name} calendar (${bcg.booking_duration_minutes} min). This is BOOK-THEN-CAPTURE: never hold a hot buyer, never interrogate before locking the slot. Do NOT ask the decision-maker or address questions BEFORE proposing times, and do NOT sequence one question per turn.`);
-    parts.push(`  On file → decision-makers: ${bcg.dm_present_value || 'not yet captured'} | address: ${bcg.address_on_file || '(none on file)'}`);
-    parts.push(`  ON A HARD CONFIRMATION — ALWAYS emit book_appointment immediately. Never withhold the booking. STATUS is set server-side: "confirmed" only when decision-makers were already stated Yes / Solo Owner earlier in the conversation, otherwise "new" (tentative — a human confirms). Then, IN THE SAME confirmation message, ask BOTH capture questions in one line, e.g.: "You're all set for {day} at {time}. Quick thing so we send the right crew — will everyone who's part of the decision be home, and is ${bcg.address_on_file || 'the address we have on file'} the right spot?" Personalize the address read-back from the on-file value above.`);
+  const idGate = opts.bookingGate || null;
+  if (bcg && bcg.requires_in_home_gate === true && idGate && !idGate.ok) {
+    // v1.1 (Victor Lopez incident 2026-07-04, R2): an in-home visit may NEVER
+    // be offered as held or booked while a hard prerequisite is missing.
+    const askOrder = ['name', 'address', 'zip', 'decision_maker_question', 'phone'];
+    const nextMissing = askOrder.find(m => idGate.missing.includes(m)) || idGate.missing[0];
+    const askText = {
+      name: 'their name ("So I can get this set up right — who do I have the pleasure of speaking with?")',
+      address: 'the property address INCLUDING zip code ("What\'s the address of the home we\'d be looking at — street and zip?") — the zip is how we confirm they\'re in our service area',
+      zip: 'the zip code of the property ("And what\'s the zip there? Just want to confirm you\'re in our service area.")',
+      decision_maker_question: 'decision-maker presence ("Will everyone who\'s part of the decision be home for the visit?")',
+      phone: 'the best phone number to reach them',
+    }[nextMissing];
+    parts.push(`\n═══════ IN-HOME BOOKING PREREQUISITES — NOT SATISFIED (GOVERNS THIS TURN) ═══════`);
+    parts.push(`This conversation is heading toward an in-home ${bcg.resolved_calendar_name} visit, but required information is still missing: ${idGate.missing.join(', ')}.`);
+    parts.push(`HARD RULES THIS TURN:`);
+    parts.push(`  • Do NOT propose, hold, or confirm any appointment time. Do NOT say a slot is "held" or that they're "set".`);
+    parts.push(`  • Do NOT emit book_appointment or any booking companion_action.`);
+    parts.push(`  • Do NOT include any booking link.`);
+    parts.push(`  • Instead, keep the conversation moving and naturally ask for ONE missing item: ${askText}. One question only — the rest come on later turns (order: name → address → decision-makers).`);
+    parts.push(`  • NEVER ask for anything the KNOWN CONTACT PROFILE already shows — those are on file.`);
+    parts.push(`  • If the lead pushes to lock a time right now, warmly explain you just need this detail to get the visit scheduled correctly, then ask it.`);
+    parts.push(`═══════ END IN-HOME BOOKING PREREQUISITES ═══════`);
+  } else if (bcg && bcg.requires_in_home_gate === true) {
+    parts.push(`\n═══════ IN-HOME BOOKING GATE — PREREQUISITES SATISFIED ═══════`);
+    parts.push(`This booking targets the in-home ${bcg.resolved_calendar_name} calendar (${bcg.booking_duration_minutes} min). Name, phone, and property address + zip are on file and the decision-maker question has been asked — you may propose times per ASK-FIRST and book on a hard confirmation.`);
+    parts.push(`  On file → decision-makers: ${bcg.dm_present_value || (idGate ? String(idGate.decision_maker_confirmed) : 'not yet captured')} | address: ${bcg.address_on_file || (idGate?.known?.address || '(none on file)')}`);
+    parts.push(`  ON A HARD CONFIRMATION — emit book_appointment. STATUS is set server-side and NEVER defaults to confirmed: "confirmed" ONLY when the lead has explicitly confirmed all decision-makers will be present (Yes / Solo Owner); pending or uncertain ("after talking with my wife", "not sure") ALWAYS books as "new".`);
+    if (idGate?.should_ask_email) {
+      parts.push(`  EMAIL (ask ONCE, this turn only, soft): no email is on file. In the same message that confirms or proposes, ask: "What's the best email to send your confirmation details to?" If they decline or ignore it, proceed without email and NEVER ask again.`);
+    } else {
+      parts.push(`  EMAIL: ${idGate?.known?.email ? `already on file (${idGate.known.email}) — NEVER ask for it.` : 'already asked once — do NOT ask again; proceed without it.'}`);
+    }
     parts.push(`  UPGRADE PATH — if EXISTING APPOINTMENTS already shows an in-home appointment with status "new" AND the lead's reply now answers the decision-maker question:`);
     parts.push(`    • Answer maps to Yes / Solo Owner → emit update_appointment_status with that appointment's appointment_id, status:"confirmed", and qualifying_data.decision_makers_present (+ window_count if newly stated). Verbal: brief confirm, e.g. "Perfect — you're confirmed for {day} at {time}. See you then."`);
     parts.push(`    • Answer maps to No / Uncertain → keep it "new", acknowledge warmly, and do NOT emit any companion_action. A human will confirm.`);
@@ -1318,7 +1386,10 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     const n = Math.abs(context.lp.appointment_days_delta || 0);
     parts.push(`(1.6) PAST APPOINTMENT — RESCHEDULE (GOVERNS THIS TURN): the LP appointment on ${context.lp.appointment_date} is ${n} day${n === 1 ? '' : 's'} in the PAST. Do NOT confirm it, hold it, or call it upcoming. If the lead asks about their appointment, state that date AND that it has already passed, then offer to rebook with TWO specific new slots from CALENDAR AVAILABILITY (ASK-FIRST). This overrides the auto-book/closing-ack branches below for this turn.`);
   }
-  parts.push(`(2) AUTO-BOOK on hard confirmation of held time (NOT in a cancel/reschedule conversation): if the lead's reply is a hard confirmation of a previously-proposed time AND BOOKING CONTEXT provides a calendar_name, check Q1/Q2/Q3. All three pass (Q3 = "Yes" OR "Solo Owner") → companion_action book_appointment status="confirmed" + PATH A message + qualifying_data. Any missing → status="new" + PATH B message. Default to PATH B when unsure. Only include qualifying_data fields the lead explicitly stated. EXCEPTION — if an IN-HOME BOOKING GATE block is present above, it GOVERNS (book-then-capture): an in-home visit ALWAYS books immediately on a hard confirmation (never hold). Status="confirmed" when decision-makers were already stated Yes / Solo Owner earlier, otherwise status="new" (tentative; a human confirms). In the SAME confirmation message ask both capture questions (decision-makers + address) in one line — but never withhold the booking to ask them first. THEN, if an in-home appointment with status "new" already exists and the lead's reply answers the decision-maker question, do NOT re-book — emit update_appointment_status per (1.5) to upgrade that appointment in place (Yes/Solo Owner → "confirmed"; No/Uncertain → no companion, leave it "new").`);
+  if (opts.bookingGate && !opts.bookingGate.ok && kbPack?.booking_context?.requires_in_home_gate === true) {
+    parts.push(`(1.7) IN-HOME PREREQUISITES NOT SATISFIED (GOVERNS THIS TURN, overrides (2) and (5)): per the IN-HOME BOOKING PREREQUISITES block above — no time proposals, no holds, no booking companion, no link. Ask for the single next missing item instead.`);
+  }
+  parts.push(`(2) AUTO-BOOK on hard confirmation of held time (NOT in a cancel/reschedule conversation): if the lead's reply is a hard confirmation of a previously-proposed time AND BOOKING CONTEXT provides a calendar_name, check Q1/Q2/Q3. All three pass (Q3 = "Yes" OR "Solo Owner") → companion_action book_appointment status="confirmed" + PATH A message + qualifying_data. Any missing → status="new" + PATH B message. Default to PATH B when unsure. Only include qualifying_data fields the lead explicitly stated. EXCEPTION — if an IN-HOME BOOKING GATE block is present above AND it says PREREQUISITES SATISFIED, it GOVERNS: book on the hard confirmation with status "confirmed" ONLY when decision-makers were already stated Yes / Solo Owner earlier, otherwise status="new" (tentative; a human confirms). If the IN-HOME BOOKING PREREQUISITES block says NOT SATISFIED, (1.7) governs instead — do not book. THEN, if an in-home appointment with status "new" already exists and the lead's reply answers the decision-maker question, do NOT re-book — emit update_appointment_status per (1.5) to upgrade that appointment in place (Yes/Solo Owner → "confirmed"; No/Uncertain → no companion, leave it "new").`);
   parts.push(`(3) CLOSING ACKNOWLEDGMENT: soft-confirm with caveat / pure ack / commitment to return → brief acknowledgment + EXPLICIT HOLD + STOP. No re-proposal, no link, no new ask, no HSO, no companion_action.`);
   parts.push(`(4) HUMAN CORRECTION block, if present, overrides defaults.`);
   parts.push(`(5) DEFAULT: BOOKING — ASK-FIRST PROTOCOL with TWO real specific-time slots from CALENDAR AVAILABILITY, OR fall back to link only when warranted. Apply HSO and move them ONE stage forward.`);
@@ -1928,6 +1999,87 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
 
   const recentEdits = await getRecentEdits(classification.intent_class, RECENT_EDITS_LIMIT);
 
+  // ─── v1.1 identity hydration + booking prerequisites (Victor Lopez incident 2026-07-04) ───
+  // R5: hydrate the known-fields state (GHL record + conversation extraction)
+  // BEFORE the bot decides what to ask — a field on the record is never asked
+  // for again. R1: promote extracted values to the GHL standard fields
+  // (best-effort, never blocks generation). R2: when an in-home booking is in
+  // play and a hard prerequisite (real name / phone / address / DM question)
+  // is missing, slots and the self-serve link are withheld this turn — the
+  // prompt block below instructs the bot to collect the missing item instead.
+  let identityState = null;
+  let bookingGate = null;
+  let serviceArea = null;
+  let serviceAreaTentative = null;
+  try {
+    identityState = await buildIdentityState(context, {
+      // LLM pass only at booking intent — every other turn runs heuristics.
+      useLLM: kbPack?.booking_context?.requires_in_home_gate === true,
+    });
+    // Street known but zip missing → try the Census geocoder (free,
+    // single-unambiguous-match rule). On success the zip is treated like
+    // extraction; on any ambiguity/failure the gate simply keeps asking
+    // the customer. NEVER inferred from city alone (Mark 2026-07-04).
+    if (identityState.identity.address_line1 && !identityState.identity.postal_code) {
+      const geo = await geocodeStreetToZip(identityState.identity.address_line1, {
+        city: identityState.identity.city,
+        state: identityState.identity.state || 'FL',
+      });
+      if (geo?.zip) {
+        identityState.identity.postal_code = geo.zip;
+        identityState.identity._source.postal_code = 'geocoded';
+      }
+    }
+    // Service-area check the moment a zip is known (address+zip outrank
+    // city/state — the zip is what proves the home is serviceable, and it
+    // backfills city/FL from service_area_zips for promotion). When only a
+    // city is known, a match against served markets gives a TENTATIVE
+    // positive signal — never used to deny service or infer a zip.
+    if (identityState.identity.postal_code) {
+      serviceArea = await checkServiceAreaZip(identityState.identity.postal_code);
+      enrichIdentityFromServiceArea(identityState.identity, serviceArea);
+    } else if (identityState.identity.city) {
+      serviceAreaTentative = await checkServiceAreaCity(identityState.identity.city);
+    }
+    bookingGate = assertBookingPrerequisites(identityState);
+    promoteIdentityToGHL(contactId, identityState, {
+      current: {
+        firstName: context.lead?.first_name,
+        lastName: context.lead?.last_name,
+        email: context.lead?.email,
+        phone: context.lead?.phone,
+        address1: context.lead?.address1,
+        city: context.lead?.city,
+        state: context.lead?.state,
+        postalCode: context.lead?.postal_code,
+      },
+      trigger: 'response_generation',
+    }).catch(err => console.warn(`[ResponseGenerator] identity promotion failed for ${contactId}: ${err.message}`));
+  } catch (err) {
+    console.warn(`[ResponseGenerator] identity state build failed for ${contactId}: ${err.message} — proceeding without gate`);
+  }
+
+  const inHomeGateRequired = kbPack?.booking_context?.requires_in_home_gate === true;
+  if (inHomeGateRequired && bookingGate && !bookingGate.ok) {
+    // Hard block (R2): no slot proposals and no self-serve booking link while
+    // a prerequisite is missing. booking_url=null flips the prompt to the
+    // NO BOOKING LINK AUTHORIZED block; availability=null suppresses slots.
+    console.log(`[ResponseGenerator] in-home booking gate BLOCKED for ${contactId}: missing ${bookingGate.missing.join(', ')}`);
+    availability = null;
+    kbPack.booking_context.booking_url = null;
+  }
+  if (inHomeGateRequired && serviceArea?.checked && serviceArea.in_service_area === false) {
+    // Verified OUT of service area: never offer an in-home visit.
+    console.log(`[ResponseGenerator] zip ${serviceArea.zip} OUT of service area for ${contactId} — in-home booking suppressed`);
+    availability = null;
+    if (kbPack?.booking_context) kbPack.booking_context.booking_url = null;
+  }
+  if (inHomeGateRequired && bookingGate?.ok && bookingGate.should_ask_email) {
+    // R4: the prompt below instructs the one-time email ask on this turn —
+    // stamp the asked-once marker now so the next turn never re-asks.
+    applyGHLTag(contactId, EMAIL_ASKED_TAG).catch(() => {});
+  }
+
   const userPrompt = buildResponsePrompt(
     context, channel, triggerMessage, kbPack, classification,
     fastTrack, trafficTemp, availability,
@@ -1937,6 +2089,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       recentEdits,
       upcomingAppointments,
       threadSenderType: opts.threadSenderType ?? 'rep',
+      identityState,
+      bookingGate,
+      serviceArea,
+      serviceAreaTentative,
     }
   );
   const raw = await callClaude(userPrompt);
