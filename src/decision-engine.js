@@ -621,6 +621,10 @@ async function countThreadTurns(ghlContactId, sinceMinutes = 60) {
 // per (source event, rule, condition key); the deterministic idempotency key
 // dedups re-evaluations. bypass_filter so the intake filter (which has no
 // allowlist entry for this observability type) doesn't divert it.
+// 2026-07-04 — keys allowed inside a conditions JSON purely as documentation.
+// Skipped by the evaluator (never evaluated, never fail-closed).
+const ANNOTATION_CONDITION_KEYS = new Set(['description', 'notes', '_comment']);
+
 function emitConditionFailClosed(event, ruleKey, missingKey, detail) {
   emitEvent({
     event_type: 'rule.condition_failed_closed',
@@ -674,6 +678,16 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
   };
 
   for (const [key, expected] of Object.entries(conditions)) {
+    // 2026-07-04 — benign annotation keys. Rule authors document conditions
+    // inline (e.g. BEHAVIORAL_DISENGAGEMENT_SEVERE carries a "description"
+    // field inside its conditions JSON). These are not operators and must
+    // not trip the unknown-operator fail-closed default — that disabled the
+    // whole rule (28 suppressions on 2026-07-03/04). Anything else unknown
+    // still fails closed.
+    if (ANNOTATION_CONDITION_KEYS.has(key)) {
+      console.log(`[Context] annotation key "${key}" skipped (not an operator) — rule ${ruleKey || '?'}`);
+      continue;
+    }
     switch (key) {
       case 'buyer_stage_eq': case 'buyer_stage_gte': case 'buyer_stage_lte': {
         const v = numOrNull('buyer_stage');
