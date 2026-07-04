@@ -116,6 +116,11 @@ import {
 import { runGhlContactIdBackfill } from './admin/ghl-contact-id-backfill.js';
 import { registerGhlTriggerLinkRoutes } from './admin/ghl-trigger-links.js';
 import { registerAgenticLeadStateRoutes } from './admin/agentic-lead-states.js';
+// ─── Guest-visitor remediation (Victor Lopez incident 2026-07-04) ──
+// One-time sweep exposed over HTTP (POST /admin/remediate-guest-visitors)
+// so it can run on Railway without shell access; shares its core with
+// scripts/remediate-guest-visitors.js.
+import { registerGuestVisitorRemediationRoutes } from './admin/guest-visitor-remediation.js';
 // ─── LP Force-AddLead (manual + shared helper for no-lds_id appt failures) ──
 // v1.0.0 2026-06-03: POST /admin/lp/force-addlead creates a lead in LP via
 // the legacy addlead path with the appointment embedded + lognumber stamped,
@@ -530,6 +535,7 @@ registerSiteCollectRoutes(app);
 registerAppointmentNotificationRoutes(app);
 registerGhlTriggerLinkRoutes(app);
 registerAgenticLeadStateRoutes(app);
+registerGuestVisitorRemediationRoutes(app);
 registerLPForceAddLeadRoutes(app);
 registerLeadStateSweepRoutes(app);
 registerNoteChangeAnalyzerRoutes(app);
