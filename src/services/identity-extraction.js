@@ -185,17 +185,47 @@ const DM_QUESTION_RE = /\b(?:decision[- ]?makers?|will (?:you both|everyone)|bot
 const NAME_WORD = "[A-Za-z][A-Za-z'’-]{1,20}";
 const BARE_NAME_RE = new RegExp(`^\\s*(${NAME_WORD})\\s+(${NAME_WORD})(?:\\s+(${NAME_WORD}))?\\s*$`);
 const STATED_NAME_RE = new RegExp(`\\b(?:my name is|this is|i(?:'|’)?m|name(?:'|’)?s)\\s+(${NAME_WORD})(?:\\s+(${NAME_WORD}))?`, 'i');
-// Words that disqualify a bare 2-word message from being a name.
+// Words that disqualify a bare 2-word message from being a name. Expanded
+// 2026-07-04 after the remediation DRY RUN caught the loose heuristic
+// planning promotions like "never mind" / "trying to" / "real person" as
+// names across the guest-visitor cohort.
 const NAME_STOPWORDS = new Set([
   'yes', 'no', 'ok', 'okay', 'sure', 'thanks', 'thank', 'you', 'please', 'hello', 'hi', 'hey',
   'good', 'morning', 'afternoon', 'evening', 'night', 'sounds', 'works', 'great', 'perfect',
-  'guest', 'visitor', 'windows', 'doors', 'window', 'door', 'quote', 'price', 'call', 'text',
+  'guest', 'visitor', 'windows', 'doors', 'window', 'door', 'quote', 'price', 'prices', 'call', 'text',
   'me', 'not', 'stop', 'saturday', 'sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
   'today', 'tomorrow', 'next', 'week', 'this', 'that', 'what', 'when', 'where', 'how', 'much',
+  'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'of', 'to', 'for', 'from', 'with', 'so',
+  'is', 'was', 'are', 'be', 'it', 'its', 'my', 'your', 'our', 'his', 'her', 'their', 'just', 'only',
+  'never', 'mind', 'need', 'needs', 'all', 'set', 'like', 'very', 'sorry', 'either', 'both',
+  'trying', 'looking', 'planning', 'talking', 'contacting', 'gathering', 'interested', 'unable',
+  'exploring', 'surfing', 'real', 'person', 'people', 'info', 'information', 'options', 'option',
+  'existing', 'one', 'two', 'three', 'four', 'five', 'free', 'gift', 'gifts', 'tax', 'credit',
+  'email', 'address', 'name', 'house', 'home', 'group', 'recommendation', 'replacement', 'process',
+  'spanish', 'english', 'supposed', 'thousand', 'hundred', 'contact', 'family', 'tree', 'wen', 'web',
+  'about', 'more', 'less', 'some', 'any', 'here', 'there', 'now', 'later', 'soon', 'still', 'also',
 ]);
 
 function looksLikeName(words) {
   return words.every(w => !NAME_STOPWORDS.has(w.toLowerCase()) && !/\d/.test(w));
+}
+
+// A bare (unprompted) name candidate must also be CAPITALIZED like a name —
+// "Victor Lopez" / "Edward Vogel" yes; "never mind" / "The existing one" no.
+// Internal caps allowed (McHale, DiMarco). Explicit "my name is …" phrasing
+// is exempt (strong evidence), and gets title-cased on write instead.
+function isCapitalizedNameWord(w) {
+  return /^[A-Z][A-Za-z'’-]{1,19}$/.test(w);
+}
+
+function titleCaseName(w) {
+  const s = String(w || '').trim();
+  if (!s) return s;
+  // Preserve deliberate internal capitalization (McHale); fix all-lower/ALL-UPPER.
+  if (/^[a-z'’-]+$/.test(s) || /^[A-Z'’-]+$/.test(s)) {
+    return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+  }
+  return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
 /**
@@ -265,14 +295,20 @@ export function heuristicExtract(messages = []) {
         const bare = seg.match(BARE_NAME_RE);
         let candidate = null;
         if (stated && stated[2] && looksLikeName([stated[1], stated[2]])) {
+          // Explicit "my name is …" — strong evidence, any casing accepted.
           candidate = [stated[1], stated[2]];
         } else if (bare) {
+          // Bare 2-3 word message — weak evidence, so it must ALSO be
+          // capitalized like a name (dry-run 2026-07-04: "never mind",
+          // "trying to", "real person" would otherwise promote as names).
           const words = [bare[1], bare[2], bare[3]].filter(Boolean);
-          if (looksLikeName(words) && !isPlaceholderName(words.join(' '))) candidate = words;
+          if (words.every(isCapitalizedNameWord) && looksLikeName(words) && !isPlaceholderName(words.join(' '))) {
+            candidate = words;
+          }
         }
         if (candidate) {
-          id.first_name = candidate[0];
-          id.last_name = candidate.slice(1).join(' ') || null;
+          id.first_name = titleCaseName(candidate[0]);
+          id.last_name = candidate.slice(1).map(titleCaseName).join(' ') || null;
           id._source.first_name = 'extracted';
           if (id.last_name) id._source.last_name = 'extracted';
         }

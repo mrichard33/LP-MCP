@@ -263,6 +263,36 @@ test('extraction: placeholder name in chat never extracted as a name', () => {
   assert.equal(id.first_name, null);
 });
 
+test('extraction: conversational fragments never extracted as names (dry-run 2026-07-04 regressions)', () => {
+  // Every one of these was a false-positive "promoted" row in the first
+  // remediation DRY RUN — each must extract NO name.
+  const fragments = [
+    'never mind', 'trying to', 'looking for', 'real person', 'all set',
+    'planning to', 'gathering info', 'interested in', 'unable to',
+    'very sorry', 'Exploring options', 'The existing one', 'In Spanish',
+    'Facebook group recommendation', 'my free gifts', 'tax credit',
+    'contact email', 'replacement options', 'family tree', 'talking to',
+    'just need prices', 'surfing the wen', "Vincent's house", 'so supposed',
+    'thirty-three thousand sixty-eight', 'Janie from', 'McHale and',
+  ];
+  for (const f of fragments) {
+    const id = heuristicExtract([f]);
+    assert.equal(id.first_name, null, `"${f}" must not extract as a name (got "${id.first_name}")`);
+  }
+});
+
+test('extraction: capitalized real names still extract; stated names title-case', () => {
+  assert.equal(heuristicExtract(['Edward Vogel']).first_name, 'Edward');
+  assert.equal(heuristicExtract(['Sharon Shively']).last_name, 'Shively');
+  assert.equal(heuristicExtract(['Victor Lopez']).first_name, 'Victor');
+  // lowercase bare names are rejected (weak evidence)…
+  assert.equal(heuristicExtract(['victor lopez']).first_name, null);
+  // …but explicit phrasing accepts any casing and normalizes it.
+  const stated = heuristicExtract(['my name is victor lopez']);
+  assert.equal(stated.first_name, 'Victor');
+  assert.equal(stated.last_name, 'Lopez');
+});
+
 // ─── merge: record wins, extraction fills gaps ─────────────────────────
 
 test('merge: record value wins; extraction fills gaps; conflicts reported', () => {
