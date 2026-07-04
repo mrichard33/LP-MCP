@@ -204,6 +204,60 @@ export async function updateGHLContactFields(ghlContactId, customFields) {
   }
 }
 
+// Standard fields the identity-promotion path may PUT. `tags` and
+// `customFields` are intentionally absent: GHL PUT /contacts/{id}
+// wholesale-replaces the tags array when a tags key is present
+// (production incidents: Kristen Nichols 2026-05-19, n8n LP Enrichment
+// v2.0 2026-05-15). scripts/test-identity-extraction.js locks this in.
+const GHL_STANDARD_FIELD_ALLOWLIST = new Set([
+  'firstName', 'lastName', 'email', 'phone', 'address1', 'city', 'state', 'postalCode',
+]);
+
+/**
+ * Update a GHL contact's STANDARD fields (name/phone/email/address) via
+ * PUT /contacts/{id}. The body is rebuilt from an allowlist so it can
+ * NEVER carry a `tags` (or `customFields`) key — see tag-wipe hazard above.
+ * Returns true on success, 'not_found' when the contact is gone, false
+ * on any other failure (mirrors updateGHLContactFields semantics).
+ */
+export async function updateGHLContactStandardFields(ghlContactId, fields) {
+  if (ghlDisabled || !ghlClient || !ghlContactId) return false;
+  if (!fields || typeof fields !== 'object') return false;
+
+  const body = {};
+  for (const [key, value] of Object.entries(fields)) {
+    if (!GHL_STANDARD_FIELD_ALLOWLIST.has(key)) {
+      if (key === 'tags') {
+        console.error(`[GHL] BLOCKED tags key in standard-field update for ${ghlContactId} — tags would be wholesale-replaced. Use applyGHLTag/removeGHLTags.`);
+      }
+      continue;
+    }
+    if (value === undefined || value === null) continue;
+    body[key] = value;
+  }
+  if (Object.keys(body).length === 0) return false;
+
+  try {
+    await ghlClient.put(`/contacts/${ghlContactId}`, body);
+    ghlFailCount = 0;
+    console.log(`[GHL] Standard fields updated for ${ghlContactId}: ${Object.keys(body).join(', ')}`);
+    return true;
+  } catch (err) {
+    if (isContactNotFound(err)) {
+      console.warn(`[GHL] Standard-field update: contact ${ghlContactId} not found — skipping`);
+      return 'not_found';
+    }
+    ghlFailCount++;
+    const status = err.response?.status || 'no response';
+    console.error(`[GHL] Standard-field update failed for ${ghlContactId}: HTTP ${status} — ${err.message}`);
+    if (ghlFailCount >= GHL_FAIL_THRESHOLD) {
+      ghlDisabled = true;
+      console.error(`[GHL] Standard-field updates disabled after ${GHL_FAIL_THRESHOLD} failures.`);
+    }
+    return false;
+  }
+}
+
 /**
  * Update a GHL contact's core email field.
  * Uses PUT /contacts/{id} with just the email field.

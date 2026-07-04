@@ -89,7 +89,7 @@ const NAMESPACE_IMMUTABLE_PREFIXES = [
 // Adding a tag from one of these auto-removes any other tag with the same
 // prefix. Keep this list conservative — adding a namespace here is a
 // behavior change for every rule that touches it.
-const NAMESPACE_EXCLUSIVE_PREFIXES = [
+export const NAMESPACE_EXCLUSIVE_PREFIXES = [
   'p3:',
   'loss-reason:',
   'stage:',
@@ -99,6 +99,7 @@ const NAMESPACE_EXCLUSIVE_PREFIXES = [
   'source:',            // MVI v2.6 — source:* mirrors active-entry:* (one current source per contact)
   'canvass-subtype:',   // MVI v2.7 — canvass channel (door-to-door | event | sticky), one current per contact
   'intent-bucket:',     // Routing fix Step 2 — one current intent bucket per contact (reporting)
+  'bj:stage-',          // Victor Lopez incident 2026-07-04 — stage-4 + stage-5 stacked; one bj stage per contact
 ];
 
 export async function executeAddTag(action, context = {}) {

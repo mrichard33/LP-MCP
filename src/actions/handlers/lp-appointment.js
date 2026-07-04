@@ -322,6 +322,18 @@ export async function executeSetLPAppointment(action, context = {}) {
   const calendarLineGhlNote    = showCalendar ? `\nCalendar: ${calendarName}` : '';
   const calendarSegmentGroupMe = showCalendar ? ` | ${calendarName}` : '';
 
+  // v1.1 (Victor Lopez incident 2026-07-04): carry the GHL appointment
+  // status through so LP-side reps see the same confirmation state GHL
+  // holds. LP's SetAppointment API has no status field — the note and
+  // GroupMe card are the parity surface. "new" = decision-maker
+  // confirmation still pending; "confirmed" = all decision-makers stated
+  // attending.
+  const ghlStatus = String(payload.ghl_status || payload.status || '').toLowerCase();
+  const statusLineGhlNote = ghlStatus
+    ? `\nGHL Status: ${ghlStatus}${ghlStatus === 'new' ? ' (decision-maker confirmation pending)' : ''}`
+    : '';
+  const statusSegmentGroupMe = ghlStatus === 'new' ? ' | ⏳ DM confirm pending' : (ghlStatus === 'confirmed' ? ' | ✅ confirmed' : '');
+
   if (!isLPLeadId(contactId)) {
     await addGHLNote(contactId,
       `[LP SYNC v4.4] Appointment set in LP\n` +
@@ -329,7 +341,8 @@ export async function executeSetLPAppointment(action, context = {}) {
       `Prospect ID: ${resolvedProspectId || 'N/A'}\n` +
       (lpSourceLine ? `Source: ${lpSourceLine}\n` : '') +
       `Date: ${apptDate}\nTime: ${apptTime}` +
-      calendarLineGhlNote
+      calendarLineGhlNote +
+      statusLineGhlNote
     ).catch(() => {});
     // 2026-06-02: LP confirmed the set (lpSetAppointment throws on LP
     // error, so reaching here means success) — apply the workflow gate
@@ -355,7 +368,7 @@ export async function executeSetLPAppointment(action, context = {}) {
     `👤 ${name || contactId}\n` +
     `📋 LP Lead: ${lpLeadId} | Prospect: ${resolvedProspectId || 'NONE'}\n` +
     (lpSourceLine ? `📋 Src: ${lpSourceLine}\n` : '') +
-    `📅 ${apptDate} ${formatApptTime12h(apptTime)}${calendarSegmentGroupMe}`
+    `📅 ${apptDate} ${formatApptTime12h(apptTime)}${calendarSegmentGroupMe}${statusSegmentGroupMe}`
   ).catch(() => {});
 
   console.log(`[LP-APPT] ✅ LP appointment set: lds_id=${lpLeadId}, ${apptDate} ${apptTime}, resolved_via=${resolutionSource}${lpSourceLine ? `, source="${lpSourceLine}"` : ''}`);

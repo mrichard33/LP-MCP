@@ -213,6 +213,7 @@ import { emitEvent } from './event-emitter.js';
 // this path can never both analyze the same inbound. DB-backed — unlike the
 // in-memory analysisCache, it holds across processes and restarts.
 import { claimConsumedMessages, releaseConsumedMessages } from './services/consumed-messages.js';
+import { runInboundIdentityPass } from './services/identity-extraction.js';
 import { callLLM, resolveLLM } from './llm-client.js';
 // Booking-flow ownership guard (2026-06-03). When a booking is in flight the
 // booking flow owns the turn — the analyzer must not divert it into objection-
@@ -793,6 +794,20 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
       console.log(`[MessageAnalyzer] Skipping ${ghlContactId} — terminal suppression tag "${dqTag}" present (hard-DQ guard)`);
       return null;
     }
+
+    // v1.1 (R1, Victor Lopez incident 2026-07-04): every inbound message also
+    // runs the deterministic identity pass — anything the prospect just
+    // provided (name, phone, address, email) is promoted to the GHL standard
+    // fields. Fire-and-forget: never blocks or fails analysis, and the
+    // current inbound is appended to the corpus in case conversation_recent
+    // hasn't caught up with this message yet.
+    runInboundIdentityPass(ghlContactId, {
+      ...context,
+      conversation_recent: [
+        ...(context.conversation_recent || []),
+        { direction: 'inbound', text: messageText },
+      ],
+    }).catch(() => {});
 
     const rawAnalysis = await callClaude(messageText, context);
     const analysis = validateAnalysis(rawAnalysis);
