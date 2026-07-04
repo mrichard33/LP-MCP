@@ -221,7 +221,7 @@ import { buildNotificationEnrichment, buildRichNotification } from './actions/en
 // 2026-07-03 rebuild (Steve Nkzhm incident) — channel/identity inheritance,
 // AI-disclosure hard guard, per-contact supersession check.
 import { resolveReplyContext, guardDisclosure } from './agentic/reply-sender.js';
-import { checkNotSuperseded } from './services/agentic-reply-locks.js';
+import { checkNotSuperseded, commitAgenticSend } from './services/agentic-reply-locks.js';
 import { emitEvent } from './event-emitter.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
@@ -1285,6 +1285,7 @@ async function queueCompanionAction(parentAction, generated) {
 // ═══════════════════════════════════════════════════════════════════
 
 export async function executeSendMessage(action, context) {
+  const _tStart = Date.now(); // 2026-07-03 hotfix: phase-timing telemetry
   const contactId = action.target_id;
   if (!contactId) throw new Error('Missing contactId (target_id)');
 
@@ -1587,94 +1588,113 @@ export async function executeSendMessage(action, context) {
   }
 
   // ── Send (v3.3: channel-routed) ────────────────────────────────
+  const _tPreSend = Date.now();
   const { result: sendResult, sendMethod } = await sendWithFallback(
     contactId, message, channel, subject, action,
     { fromNumber: replyContext?.fromNumber || null }
   );
+  const _tSent = Date.now();
 
-  // ── Companion action queue (v3.13) ─────────────────────────────
-  // generateResponse may emit a companion_action (book/cancel/reschedule).
-  // Approval-gated rules get this inserted by approval-path.js v4.6+.
-  // Auto-fire rules (requires_approval=false → straight to Phase 2) used
-  // to silently drop it; v3.13 inserts the sibling action here so the
-  // calendar actually moves when the bot says it did. Insert is failure-
-  // soft — the send already happened; rollback isn't possible.
-  let companionResult = { queued: false, reason: 'not_attempted' };
-  if (generated && generated.companion_action) {
-    companionResult = await queueCompanionAction(action, generated);
+  // ── Sent marker (2026-07-03 hotfix) — GHL 2xx IS the success ────
+  // Commit the send (status 'sent' + cooldown + message id) the moment GHL
+  // accepts it, BEFORE any post-send work. If this handler is later
+  // watchdog-orphaned (the executor's Promise.race never cancels the
+  // loser), its retry finds the marker via acquireAgenticSlot
+  // ('already_sent') and completes as a dedup instead of re-sending —
+  // action 165896 in the incident delivered and was still retried.
+  if (action.id != null) {
+    await commitAgenticSend(contactId, String(action.id), {
+      message_id: sendResult?.messageId || null,
+      conversation_id: sendResult?.conversationId || null,
+    });
   }
+  const _tCommitted = Date.now();
 
-  // ── GroupMe notification (v3.6: rich format) ───────────────────
-  // Resolve the contact's real name + phone, pull LP enrichment, and
-  // build the standard rich block. Channel emoji replaces the default
-  // 🤖 prefix; agentic-specific metadata (intent, arc, trust, voice,
-  // kb, fast, reason, channel-via, rule) is appended below the block.
-  // If any resolver fails, the notification still goes out — fall back
-  // to whatever is available.
-  try {
-    const { name, phone, lpLead, ghlContactId } = await resolveContactInfo(contactId, context);
-    const prospectId = await resolveLPProspectId(contactId);
-    const enrichment = await buildNotificationEnrichment(contactId, context, { lpLead, prospectId, ghlContactId });
-
-    const channelEmoji = channel === 'sms' ? '📱' : channel === 'livechat' ? '💬' : '📧';
-    const aiLabel = generated ? '🤖 AI-GENERATED ' : '';
-    const fallbackFlag = sendMethod.includes('fallback') ? ' ⚠️ FALLBACK' : '';
-    const baseMessage = `${aiLabel}AGENTIC MESSAGE SENT${fallbackFlag}`;
-
-    // Build standard rich block, then swap the leading 🤖 for the channel emoji.
-    let full = buildRichNotification({ baseMessage, name, phone, contactId, prospectId, enrichment });
-    full = full.replace(/^🤖 /, `${channelEmoji} `);
-
-    // Channel / send method / rule line
-    full += `\nChannel: ${channel.toUpperCase()} | Via: ${sendMethod} | Rule: ${action.rule_applied || 'manual'}`;
-
-    // Agentic generation metadata (only present when AI generated the message)
-    const agenticParts = [];
-    if (generated?.intent_class) agenticParts.push(`Intent: ${generated.intent_class}`);
-    if (generated?.story_arc) agenticParts.push(`Arc: ${generated.story_arc}`);
-    if (generated?.trust_level_targeted) agenticParts.push(`L${generated.trust_level_targeted}`);
-    if (generated?.voice_used === 'randy') agenticParts.push('Randy voice');
-    if (generated?.kb_pack_used) agenticParts.push('KB');
-    if (generated?.fast_track) agenticParts.push('⚡FAST');
-    if (agenticParts.length) full += `\n${agenticParts.join(' | ')}`;
-    if (generated?.reasoning) full += `\nReason: ${generated.reasoning}`;
-
-    // v3.13: companion action line (book/cancel/reschedule queued)
-    if (companionResult.queued) {
-      const ct = companionResult.action_type;
-      const ca = generated?.companion_action;
-      const cap = ca?.action_payload || {};
-      let companionLine = '';
-      if (ct === 'book_appointment') {
-        companionLine = `📅 Auto-booked: ${cap.calendar_name || '?'} — ${cap.start_time || '?'} (status: ${cap.status || '?'})`;
-      } else if (ct === 'cancel_appointment') {
-        companionLine = `🗓 Auto-cancelled: ${cap.appointment_id || '?'}` + (cap.reason ? ` (reason: ${String(cap.reason).slice(0, 80)})` : '');
-      } else if (ct === 'reschedule_appointment') {
-        companionLine = `🔄 Auto-rescheduled: ${cap.old_appointment_id || '?'} → ${cap.new_calendar_name || '?'} ${cap.new_start_time || '?'} (status: ${cap.status || '?'})`;
-      }
-      if (companionLine) full += `\n${companionLine}`;
-    } else if (generated?.companion_action && companionResult.reason && !companionResult.reason.startsWith('not_attempted')) {
-      // Companion was emitted but failed to queue — surface in GroupMe so
-      // the team sees the verbal-vs-reality mismatch and can intervene.
-      full += `\n⚠️ Companion ${generated.companion_action.action_type || 'unknown'} FAILED to queue: ${companionResult.reason}${companionResult.error ? ` (${companionResult.error})` : ''}`;
+  // ── Post-send tail: companion queue + rich GroupMe notification ─
+  // Fire-and-forget (2026-07-03 hotfix). This tail awaits GHL/LP reads
+  // through the shared 40/min token bucket; under bucket starvation it
+  // alone could eat the executor's 60s handler budget AFTER the message
+  // had already delivered. Nothing here may block the send result.
+  (async () => {
+    // Companion action queue (v3.13): generateResponse may emit a
+    // companion_action (book/cancel/reschedule). Insert is failure-soft —
+    // the send already happened; rollback isn't possible.
+    let companionResult = { queued: false, reason: 'not_attempted' };
+    if (generated && generated.companion_action) {
+      companionResult = await queueCompanionAction(action, generated);
     }
 
-    // Final outbound message preview — what the lead will see
-    const preview = message.length > 80 ? message.slice(0, 80) + '...' : message;
-    full += `\nMessage: "${preview}"`;
+    // GroupMe notification (v3.6: rich format). If any resolver fails,
+    // the notification still goes out — fall back to what is available.
+    try {
+      const { name, phone, lpLead, ghlContactId } = await resolveContactInfo(contactId, context);
+      const prospectId = await resolveLPProspectId(contactId);
+      const enrichment = await buildNotificationEnrichment(contactId, context, { lpLead, prospectId, ghlContactId });
 
-    await sendGroupMeMessage(full, { contactId, contactName: name }).catch(err => {
-      console.warn(`[SendMessage] GroupMe notification failed: ${err.message}`);
-    });
-  } catch (err) {
-    // Notification path failure must never break the send chain — the SMS
-    // already went out by this point. Log and move on.
-    console.warn(`[SendMessage] Rich notification build failed for ${contactId}: ${err.message}`);
-  }
+      const channelEmoji = channel === 'sms' ? '📱' : channel === 'livechat' ? '💬' : '📧';
+      const aiLabel = generated ? '🤖 AI-GENERATED ' : '';
+      const fallbackFlag = sendMethod.includes('fallback') ? ' ⚠️ FALLBACK' : '';
+      const baseMessage = `${aiLabel}AGENTIC MESSAGE SENT${fallbackFlag}`;
 
-  bumpContactCache(contactId);
+      // Build standard rich block, then swap the leading 🤖 for the channel emoji.
+      let full = buildRichNotification({ baseMessage, name, phone, contactId, prospectId, enrichment });
+      full = full.replace(/^🤖 /, `${channelEmoji} `);
+
+      // Channel / send method / rule line
+      full += `\nChannel: ${channel.toUpperCase()} | Via: ${sendMethod} | Rule: ${action.rule_applied || 'manual'}`;
+
+      // Agentic generation metadata (only present when AI generated the message)
+      const agenticParts = [];
+      if (generated?.intent_class) agenticParts.push(`Intent: ${generated.intent_class}`);
+      if (generated?.story_arc) agenticParts.push(`Arc: ${generated.story_arc}`);
+      if (generated?.trust_level_targeted) agenticParts.push(`L${generated.trust_level_targeted}`);
+      if (generated?.voice_used === 'randy') agenticParts.push('Randy voice');
+      if (generated?.kb_pack_used) agenticParts.push('KB');
+      if (generated?.fast_track) agenticParts.push('⚡FAST');
+      if (agenticParts.length) full += `\n${agenticParts.join(' | ')}`;
+      if (generated?.reasoning) full += `\nReason: ${generated.reasoning}`;
+
+      // v3.13: companion action line (book/cancel/reschedule queued)
+      if (companionResult.queued) {
+        const ct = companionResult.action_type;
+        const ca = generated?.companion_action;
+        const cap = ca?.action_payload || {};
+        let companionLine = '';
+        if (ct === 'book_appointment') {
+          companionLine = `📅 Auto-booked: ${cap.calendar_name || '?'} — ${cap.start_time || '?'} (status: ${cap.status || '?'})`;
+        } else if (ct === 'cancel_appointment') {
+          companionLine = `🗓 Auto-cancelled: ${cap.appointment_id || '?'}` + (cap.reason ? ` (reason: ${String(cap.reason).slice(0, 80)})` : '');
+        } else if (ct === 'reschedule_appointment') {
+          companionLine = `🔄 Auto-rescheduled: ${cap.old_appointment_id || '?'} → ${cap.new_calendar_name || '?'} ${cap.new_start_time || '?'} (status: ${cap.status || '?'})`;
+        }
+        if (companionLine) full += `\n${companionLine}`;
+      } else if (generated?.companion_action && companionResult.reason && !companionResult.reason.startsWith('not_attempted')) {
+        // Companion was emitted but failed to queue — surface in GroupMe so
+        // the team sees the verbal-vs-reality mismatch and can intervene.
+        full += `\n⚠️ Companion ${generated.companion_action.action_type || 'unknown'} FAILED to queue: ${companionResult.reason}${companionResult.error ? ` (${companionResult.error})` : ''}`;
+      }
+
+      // Final outbound message preview — what the lead will see
+      const preview = message.length > 80 ? message.slice(0, 80) + '...' : message;
+      full += `\nMessage: "${preview}"`;
+
+      await sendGroupMeMessage(full, { contactId, contactName: name }).catch(err => {
+        console.warn(`[SendMessage] GroupMe notification failed: ${err.message}`);
+      });
+    } catch (err) {
+      // Notification path failure must never break the send chain — the SMS
+      // already went out by this point. Log and move on.
+      console.warn(`[SendMessage] Rich notification build failed for ${contactId}: ${err.message}`);
+    }
+
+    bumpContactCache(contactId);
+  })().catch((err) => console.warn(`[SendMessage] post-send tail failed for ${contactId}: ${err.message}`));
 
   console.log(`[SendMessage] ✅ ${channel.toUpperCase()} sent to ${contactId} via ${sendMethod} (rule: ${action.rule_applied || 'manual'}, ${message.length} chars)`);
+  console.log(
+    `[SendMessage] timings contact=${contactId} action=${action.id ?? 'n/a'} ` +
+    `pre_send=${_tPreSend - _tStart}ms send=${_tSent - _tPreSend}ms commit=${_tCommitted - _tSent}ms`
+  );
 
   return {
     action: 'message_sent',
@@ -1697,12 +1717,14 @@ export async function executeSendMessage(action, context) {
     fast_track: generated?.fast_track || false,
     buyer_stage: generated?.buyer_stage || null,
     ai_reasoning: generated?.reasoning || null,
-    // v3.13: companion action audit trail
+    // v3.13/2026-07-03: companion queueing moved to the async post-send tail;
+    // its outcome is reported in the GroupMe card, not this result.
     companion_emitted: !!generated?.companion_action,
     companion_type: generated?.companion_action?.action_type || null,
-    companion_queued: companionResult.queued,
-    companion_action_id: companionResult.action_id || null,
-    companion_error: companionResult.queued ? null : (companionResult.error || companionResult.reason || null),
+    companion_status: generated?.companion_action ? 'queued_async' : null,
+    // 2026-07-03 hotfix: the sent marker was durably committed at GHL 2xx —
+    // the executor wrapper must not commit again.
+    _agentic_committed: action.id != null,
     // Issue #99: surface AI-generation fallback so the executor records this
     // send as `failed` with a populated error_message instead of silent
     // `completed`. False/null on the happy path (no behavior change).

@@ -295,7 +295,13 @@ async function triggerAgenticPipeline(contactId, messageText, channel = null, me
       console.warn(`[AgenticPipeline] Analyze returned success=false for ${contactId} (no ai.analysis_completed) — will retry`);
       return false;
     }
-    console.log(`[AgenticPipeline] Analysis complete for ${contactId}: stage=${analyzeData.analysis?.buyer_stage || '?'} (${Date.now() - start}ms)`);
+    if (analyzeData?.deduped) {
+      // 2026-07-03 hotfix: identical message already analyzed — a terminal
+      // no-op, NOT a failure. The events get marked processed; no retries.
+      console.log(`[AgenticPipeline] Analysis deduped for ${contactId} (${analyzeData.reason || 'recently_analyzed'}) — treating as terminal success`);
+    } else {
+      console.log(`[AgenticPipeline] Analysis complete for ${contactId}: stage=${analyzeData.analysis?.buyer_stage || '?'} (${Date.now() - start}ms)`);
+    }
   } catch (err) {
     console.warn(`[AgenticPipeline] Analyze error for ${contactId}: ${err.message}`);
     return false; // Let the caller / processing cycle retry

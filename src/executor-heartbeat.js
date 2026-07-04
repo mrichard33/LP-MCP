@@ -105,6 +105,7 @@
 
 import supabase from './supabase.js';
 import { executeActions } from './action-executor.js';
+import { reapStaleLocks } from './actions/reaper.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { shouldAlertQueueDepth, formatQueueAlert } from './executor-queue-alerts.js';
 import { getRateLimiterStats } from './ghl-rate-limiter.js';
@@ -421,6 +422,16 @@ export async function runHeartbeat({ force = false } = {}) {
     await maybeAlertFailedActions();
   } catch (err) {
     console.warn(`[ExecutorHeartbeat] failed-action alert check failed: ${err.message}`);
+  }
+
+  // 2026-07-03 hotfix — stale lock-table sweep, every cycle, INCLUDING when
+  // the action queue is empty (the in-executeActions reaper only runs with
+  // pending work, which is exactly when a leaked agentic_reply_locks row
+  // has no acquirer to lazily reclaim it). Best-effort like the alerts.
+  try {
+    await reapStaleLocks();
+  } catch (err) {
+    console.warn(`[ExecutorHeartbeat] stale-lock sweep failed: ${err.message}`);
   }
 
   const health = await checkExecutorHealth();

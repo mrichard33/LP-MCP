@@ -55,6 +55,20 @@ export function classifyHandlerResult(result) {
     };
   }
 
+  // 2026-07-03 hotfix — defer, don't drop. A send blocked by the agentic
+  // cooldown or a live outbound lock goes back to 'pending' with a DB-persisted
+  // retry_at (survives Railway redeploys, unlike the old in-process setTimeout
+  // reschedules that stranded the incident's replies). Deferral is NOT a
+  // failure: retry_count is untouched and the error_message is a plain
+  // 'deferred: <reason>' marker, never a timeout string.
+  if (result?.deferred === true) {
+    return {
+      status: 'pending',
+      error_message: `deferred: ${result?.reason || 'unspecified'}`,
+      retry_at: result?.retry_at || null,
+    };
+  }
+
   // Honest accounting: a handler that explicitly skipped (lock held, suppressed)
   // never reached the contact — record it as `skipped`, not `completed`.
   if (result?.skipped === true) {
