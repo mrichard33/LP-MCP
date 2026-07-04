@@ -562,6 +562,97 @@ export async function checkServiceAreaZip(zip) {
 }
 
 /**
+ * TENTATIVE city-level service-area signal. A city name matching rows in
+ * service_area_zips means Reece serves at least part of that city — enough
+ * for the bot to speak positively, NEVER enough to certify the home is
+ * in-area (cities are partially covered; the zip is the authoritative
+ * check, per Mark 2026-07-04). Deliberately does NOT return or infer any
+ * zip — city→zip is a one-to-many guess and is forbidden.
+ */
+export async function checkServiceAreaCity(city) {
+  const c = String(city || '').trim();
+  if (!c || !supabase) return { checked: false, city: c || null };
+  try {
+    const { data, error } = await supabase
+      .from('service_area_zips')
+      .select('market_code')
+      .ilike('city', c)
+      .limit(1);
+    if (error) {
+      console.warn(`[IdentityExtraction] service_area_zips city lookup error for "${c}": ${error.message}`);
+      return { checked: false, city: c };
+    }
+    return {
+      checked: true,
+      city: c,
+      city_served: Array.isArray(data) && data.length > 0,
+      market_code: data?.[0]?.market_code || null,
+      tentative: true,
+    };
+  } catch (err) {
+    console.warn(`[IdentityExtraction] service_area_zips city lookup threw for "${c}": ${err.message}`);
+    return { checked: false, city: c };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 4c. GEOCODING — street address → zip (US Census Bureau, free, no key)
+// ═══════════════════════════════════════════════════════════════════
+
+const CENSUS_GEOCODER_URL = 'https://geocoding.geo.census.gov/geocoder/locations/onelineaddress';
+const GEOCODE_TIMEOUT_MS = parseInt(process.env.GEOCODE_TIMEOUT_MS || '5000', 10);
+
+/**
+ * Parse a Census geocoder response. Returns { zip, city, state, matched }
+ * ONLY on a single unambiguous match — zero matches or 2+ candidates
+ * return null (a guessed zip would poison the service-area determinant).
+ * Pure — unit-tested against fixtures.
+ */
+export function parseCensusGeocodeResponse(json) {
+  const matches = json?.result?.addressMatches;
+  if (!Array.isArray(matches) || matches.length !== 1) return null;
+  const m = matches[0];
+  const zip = normalizeZip5(m?.addressComponents?.zip);
+  if (!zip) return null;
+  return {
+    zip,
+    city: m?.addressComponents?.city ? String(m.addressComponents.city).trim() : null,
+    state: m?.addressComponents?.state ? String(m.addressComponents.state).trim().toUpperCase() : null,
+    matched: m?.matchedAddress || null,
+  };
+}
+
+/**
+ * Resolve a street address to a zip via the US Census geocoder (free, no
+ * API key). Single-unambiguous-match rule; any error, timeout, or
+ * ambiguity returns null and the bot simply asks the customer for the zip
+ * (the existing gate fallback). State defaults to FL — every Reece market
+ * is in Florida, and the bias disambiguates street-only inputs.
+ */
+export async function geocodeStreetToZip(addressLine1, { city = null, state = 'FL' } = {}) {
+  const street = String(addressLine1 || '').trim();
+  if (!street) return null;
+  const oneLine = [street, city, state].filter(Boolean).join(', ');
+  const url = `${CENSUS_GEOCODER_URL}?address=${encodeURIComponent(oneLine)}&benchmark=Public_AR_Current&format=json`;
+  try {
+    const res = await fetch(url, {
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(GEOCODE_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      console.warn(`[IdentityExtraction] census geocode HTTP ${res.status} for "${oneLine}"`);
+      return null;
+    }
+    const parsed = parseCensusGeocodeResponse(await res.json());
+    if (parsed) console.log(`[IdentityExtraction] geocoded "${oneLine}" → zip ${parsed.zip} (${parsed.matched})`);
+    return parsed;
+  } catch (err) {
+    console.warn(`[IdentityExtraction] census geocode failed for "${oneLine}": ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * Backfill city/state from a verified in-service-area zip. This is the only
  * path that defaults state to FL — a zip inside a Reece service market IS a
  * Florida market (handoff §4.1: default "FL" only when the location resolves
@@ -642,7 +733,9 @@ export function buildPromotionPayload(current = {}, identity = {}) {
   fillIfEmpty('address1', cur.address1, identity.address_line1, src.address_line1 === 'extracted');
   fillIfEmpty('city', cur.city, identity.city, src.city === 'extracted');
   fillIfEmpty('state', cur.state, identity.state, src.state === 'extracted');
-  fillIfEmpty('postalCode', cur.postalCode, identity.postal_code, src.postal_code === 'extracted');
+  // 'geocoded' = zip resolved from the street address via the Census
+  // geocoder (single unambiguous match only) — promotable like extraction.
+  fillIfEmpty('postalCode', cur.postalCode, identity.postal_code, src.postal_code === 'extracted' || src.postal_code === 'geocoded');
 
   // TAG-WIPE GUARD: the payload is built exclusively from the allowlist
   // above, but strip defensively in case a caller mutated the object.

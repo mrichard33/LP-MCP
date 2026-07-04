@@ -179,6 +179,8 @@ import {
   assertBookingPrerequisites,
   promoteIdentityToGHL,
   checkServiceAreaZip,
+  checkServiceAreaCity,
+  geocodeStreetToZip,
   enrichIdentityFromServiceArea,
   EMAIL_ASKED_TAG,
 } from './services/identity-extraction.js';
@@ -1111,6 +1113,11 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     } else {
       parts.push(`\nSERVICE AREA STATUS: zip ${opts.serviceArea.zip} is OUTSIDE Reece's mapped service area. Do NOT offer any in-home visit, do NOT propose appointment times, and do NOT include a booking link. Politely let them know their area is outside our current service footprint, thank them for their interest, and do not pitch further.`);
     }
+  } else if (opts.serviceAreaTentative?.checked && opts.serviceAreaTentative.city_served === true) {
+    // City-level signal only — Reece serves at least part of this city, but
+    // coverage is by ZIP and cities are partially covered. Positive-only:
+    // never used to tell someone they're out of area, never infers a zip.
+    parts.push(`\nSERVICE AREA STATUS (TENTATIVE — city match only): ${opts.serviceAreaTentative.city} is a market Reece serves, but coverage is confirmed by zip. You may speak positively about serving ${opts.serviceAreaTentative.city}; when you ask for the zip, frame it as the final confirmation (e.g. "We're all over ${opts.serviceAreaTentative.city} — what's the zip so I can confirm you're in our coverage?"). Do NOT state they are confirmed in the service area until the zip is verified.`);
   }
 
   const stageNum = inferBuyerStage(context);
@@ -2003,17 +2010,36 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   let identityState = null;
   let bookingGate = null;
   let serviceArea = null;
+  let serviceAreaTentative = null;
   try {
     identityState = await buildIdentityState(context, {
       // LLM pass only at booking intent — every other turn runs heuristics.
       useLLM: kbPack?.booking_context?.requires_in_home_gate === true,
     });
+    // Street known but zip missing → try the Census geocoder (free,
+    // single-unambiguous-match rule). On success the zip is treated like
+    // extraction; on any ambiguity/failure the gate simply keeps asking
+    // the customer. NEVER inferred from city alone (Mark 2026-07-04).
+    if (identityState.identity.address_line1 && !identityState.identity.postal_code) {
+      const geo = await geocodeStreetToZip(identityState.identity.address_line1, {
+        city: identityState.identity.city,
+        state: identityState.identity.state || 'FL',
+      });
+      if (geo?.zip) {
+        identityState.identity.postal_code = geo.zip;
+        identityState.identity._source.postal_code = 'geocoded';
+      }
+    }
     // Service-area check the moment a zip is known (address+zip outrank
     // city/state — the zip is what proves the home is serviceable, and it
-    // backfills city/FL from service_area_zips for promotion).
+    // backfills city/FL from service_area_zips for promotion). When only a
+    // city is known, a match against served markets gives a TENTATIVE
+    // positive signal — never used to deny service or infer a zip.
     if (identityState.identity.postal_code) {
       serviceArea = await checkServiceAreaZip(identityState.identity.postal_code);
       enrichIdentityFromServiceArea(identityState.identity, serviceArea);
+    } else if (identityState.identity.city) {
+      serviceAreaTentative = await checkServiceAreaCity(identityState.identity.city);
     }
     bookingGate = assertBookingPrerequisites(identityState);
     promoteIdentityToGHL(contactId, identityState, {
@@ -2066,6 +2092,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       identityState,
       bookingGate,
       serviceArea,
+      serviceAreaTentative,
     }
   );
   const raw = await callClaude(userPrompt);

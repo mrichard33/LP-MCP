@@ -45,6 +45,7 @@ import {
   isPlaceholderName,
   heuristicExtract,
   buildPromotionPayload,
+  geocodeStreetToZip,
   NAME_PLACEHOLDER_TAG,
 } from '../src/services/identity-extraction.js';
 
@@ -148,7 +149,16 @@ async function remediateVictor() {
   if (!contact.address1) addr.address1 = '2885 S Oasis Dr';
   if (!contact.city) addr.city = 'Boynton Beach';
   if (!contact.state) addr.state = 'FL';
-  // Zip was never provided in the transcript — deliberately NOT guessed.
+  // Zip was never provided in the transcript — resolved via the Census
+  // geocoder (street-level, single unambiguous match only; never from city).
+  if (!contact.postalCode) {
+    const geo = await geocodeStreetToZip(contact.address1 || '2885 S Oasis Dr', {
+      city: contact.city || 'Boynton Beach',
+      state: contact.state || 'FL',
+    });
+    if (geo?.zip) addr.postalCode = geo.zip;
+    else record(VICTOR_ID, 'zip_unresolved', 'geocoder had no unambiguous match — ask the customer');
+  }
   if (Object.keys(addr).length) {
     await putStandardFields(VICTOR_ID, addr);
     record(VICTOR_ID, 'address_set', JSON.stringify(addr));
@@ -267,6 +277,15 @@ async function sweepGuestVisitors() {
     const extracted = transcript ? heuristicExtract([{ direction: 'inbound', text: transcript }]) : null;
 
     if (extracted?.first_name) {
+      // Street extracted but no zip → try the Census geocoder (street-level
+      // only, single unambiguous match; never inferred from city).
+      if (extracted.address_line1 && !extracted.postal_code && !contact.postalCode) {
+        const geo = await geocodeStreetToZip(extracted.address_line1, {
+          city: extracted.city || contact.city,
+          state: extracted.state || contact.state || 'FL',
+        });
+        if (geo?.zip) extracted.postal_code = geo.zip;
+      }
       const { payload } = buildPromotionPayload(contact, { ...extracted, _source: {
         first_name: 'extracted', last_name: 'extracted', phone: 'extracted', email: 'extracted',
         address_line1: 'extracted', city: 'extracted', state: 'extracted', postal_code: 'extracted',

@@ -298,6 +298,42 @@ test('enrichIdentityFromServiceArea backfills city + FL from a verified zip', as
   assert.equal(id2.state, null);
 });
 
+test('census geocode parse: single match → zip; ambiguous/none → null', async () => {
+  const { parseCensusGeocodeResponse } = await import('../src/services/identity-extraction.js');
+  const single = {
+    result: { addressMatches: [{
+      matchedAddress: '2885 S OASIS DR, BOYNTON BEACH, FL, 33435',
+      addressComponents: { zip: '33435', city: 'BOYNTON BEACH', state: 'FL' },
+    }] },
+  };
+  const parsed = parseCensusGeocodeResponse(single);
+  assert.equal(parsed.zip, '33435');
+  assert.equal(parsed.state, 'FL');
+  // Two candidates → never guess.
+  const multi = { result: { addressMatches: [
+    { addressComponents: { zip: '33435' } },
+    { addressComponents: { zip: '33436' } },
+  ] } };
+  assert.equal(parseCensusGeocodeResponse(multi), null);
+  // No match / malformed → null.
+  assert.equal(parseCensusGeocodeResponse({ result: { addressMatches: [] } }), null);
+  assert.equal(parseCensusGeocodeResponse({}), null);
+  assert.equal(parseCensusGeocodeResponse({ result: { addressMatches: [{ addressComponents: {} }] } }), null);
+});
+
+test('promotion: geocoded zip is promotable, fills empty postalCode only', () => {
+  const identity = {
+    address_line1: '2885 S Oasis Dr', postal_code: '33435',
+    _source: { address_line1: 'extracted', postal_code: 'geocoded' },
+  };
+  let r = buildPromotionPayload({ firstName: 'Victor', postalCode: null }, identity);
+  assert.equal(r.payload.postalCode, '33435');
+  // Existing differing zip → conflict, never overwritten.
+  r = buildPromotionPayload({ firstName: 'Victor', postalCode: '33436' }, identity);
+  assert.equal(r.payload.postalCode, undefined);
+  assert.ok(r.conflicts.find(c => c.field === 'postalCode'));
+});
+
 test('phone normalization to E.164', () => {
   assert.equal(normalizePhoneE164('5613230334'), '+15613230334');
   assert.equal(normalizePhoneE164('(561) 323-0334'), '+15613230334');
