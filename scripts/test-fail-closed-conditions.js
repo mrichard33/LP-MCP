@@ -47,6 +47,22 @@ test('unknown condition operator → false (was: warn + wildcard pass)', async (
   assert.equal(await evaluateContextConditions({ lp_dispositon_in_typo: ['Set'] }, {}, bareEvent()), false);
 });
 
+// 2026-07-04 — annotation keys are documentation, not operators. A rule with
+// a "description" field inside its conditions JSON must still fire
+// (BEHAVIORAL_DISENGAGEMENT_SEVERE was fully disabled by the fail-closed
+// default treating "description" as an unknown operator).
+test('annotation keys (description/notes/_comment) are skipped, not fail-closed', async () => {
+  assert.equal(await evaluateContextConditions(
+    { description: 'severe disengagement gate', buyer_stage_gte: 3 },
+    { buyer_stage: 4 }, bareEvent()), true);
+  assert.equal(await evaluateContextConditions(
+    { notes: 'doc', _comment: 'doc' }, {}, bareEvent()), true);
+  // real conditions still evaluated alongside annotations
+  assert.equal(await evaluateContextConditions(
+    { description: 'doc', buyer_stage_gte: 3 },
+    { buyer_stage: 2 }, bareEvent()), false);
+});
+
 test('payload_message_not_matches with NO message_text → false (text blocklist cannot pass unseen)', async () => {
   assert.equal(await evaluateContextConditions({ payload_message_not_matches: 'stop' }, {}, bareEvent()), false);
 });
