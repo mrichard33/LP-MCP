@@ -52,7 +52,9 @@ const DRY_RUN = process.argv.includes('--dry-run');
 const SKIP_VICTOR = process.argv.includes('--skip-victor');
 const LIMIT = (() => {
   const i = process.argv.indexOf('--limit');
-  return i !== -1 ? parseInt(process.argv[i + 1], 10) || 200 : 200;
+  // Cohort measured 2026-07-04: 484 cache candidates (116 whole-in-first +
+  // 368 split first/last) — default covers the full set in one run.
+  return i !== -1 ? parseInt(process.argv[i + 1], 10) || 600 : 600;
 })();
 
 const VICTOR_ID = 'XdAUR9qR42UdBre6Byrw';
@@ -208,10 +210,13 @@ async function sweepGuestVisitors() {
   }
   console.log(`\n═══ Guest-visitor sweep (cache candidates, live-verified, limit ${LIMIT}) ═══`);
 
+  // Cache schema uses first_name/last_name (verified 2026-07-04 — there is
+  // no contact_name column). The widget writes the placeholder either whole
+  // into first_name ("Guest Visitor bljpx") or split ("Guest" / "Visitor x").
   const { data, error } = await hl
     .from('contacts')
-    .select('ghl_contact_id, contact_name, tags')
-    .ilike('contact_name', 'guest visitor%')
+    .select('ghl_contact_id, first_name, last_name, tags')
+    .or('first_name.ilike.guest visitor%,and(first_name.ilike.guest,last_name.ilike.visitor%)')
     .is('deleted_at', null)
     .limit(LIMIT);
   if (error) {
