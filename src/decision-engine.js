@@ -635,7 +635,10 @@ async function countThreadTurns(ghlContactId, sinceMinutes = 60) {
 // allowlist entry for this observability type) doesn't divert it.
 // 2026-07-04 — keys allowed inside a conditions JSON purely as documentation.
 // Skipped by the evaluator (never evaluated, never fail-closed).
-const ANNOTATION_CONDITION_KEYS = new Set(['description', 'notes', '_comment']);
+// 2026-07-06 — added '_doc': CANNOT_AFFORD_PRE_DEMO_HOLD carries a _doc
+// annotation that was failing closed as an unknown operator, silently
+// suppressing the rule on every evaluation (found via E2E telemetry).
+const ANNOTATION_CONDITION_KEYS = new Set(['description', 'notes', '_comment', '_doc']);
 
 function emitConditionFailClosed(event, ruleKey, missingKey, detail) {
   emitEvent({
@@ -955,16 +958,23 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
       // v2.17 — payload_field_eq: {field, value}. Exact match against an
       // event payload field. Strings compare case-insensitively (channel
       // values arrive as 'SMS'/'sms' depending on producer); everything else
-      // is strict equality. Absent field = missing data → fail closed, per
-      // doctrine — a channel gate must not pass because the producer hasn't
-      // started emitting the field yet.
+      // is strict equality.
+      // v2.17.1 (2026-07-06 E2E finding): a null/absent field is a QUIET
+      // block, not a fail-closed. The analyzer's validated payload carries
+      // dq_detected / escalation_category as null on every normal turn —
+      // treating that as "unreadable data" sprayed ~9
+      // rule.condition_failed_closed telemetry events per analysis. The
+      // safety direction is identical either way (the rule does not fire);
+      // fail-closed telemetry stays reserved for malformed specs and
+      // genuinely unreadable sources.
       case 'payload_field_eq': {
         if (!expected || typeof expected !== 'object' || typeof expected.field !== 'string' || !('value' in expected)) {
           return failClosed(key, 'malformed spec — expected {field, value}');
         }
         const actual = payload[expected.field];
         if (actual === undefined || actual === null) {
-          return failClosed(key, `payload.${expected.field} absent`);
+          console.log(`[Context] BLOCKED: payload_field_eq — payload.${expected.field} is null/absent (wanted "${expected.value}")`);
+          return false;
         }
         const want = expected.value;
         const matches = (typeof actual === 'string' && typeof want === 'string')
