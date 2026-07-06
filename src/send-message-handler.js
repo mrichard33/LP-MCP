@@ -1641,6 +1641,49 @@ export async function executeSendMessage(action, context) {
       companionResult = await queueCompanionAction(action, generated);
     }
 
+    // 2026-07-06 — CANCEL SAVE-ATTEMPT TIMEOUT (owner requirement): when the
+    // reply is a save attempt (lead asked to cancel; bot offered to
+    // reschedule; appointment still on the calendar), arm a 24h dead-man
+    // switch. If the lead never responds about a new time, the
+    // CANCEL_TIMEOUT_UNANSWERED rule cancels the appointment anyway — a
+    // requested cancellation is never left hanging because the lead went
+    // quiet. Any inbound clears the awaiting tag
+    // (AWAITING_CANCEL_DECISION_CLEARED) and a fresh save attempt re-arms.
+    // Failure-soft: the send already happened.
+    if (generated && generated.cancel_flow_state === 'save_attempt') {
+      try {
+        const armBatch = `cancel_save_${action.id}_${Date.now()}`;
+        await supabase.from('agent_actions').insert([
+          {
+            event_id: action.event_id || null,
+            action_type: 'add_tag', target_system: 'ghl', target_entity: 'contact',
+            target_id: contactId,
+            action_payload: { tag: 'awaiting:cancel-decision' },
+            reasoning: 'Cancel save-attempt: reschedule offered in response to cancel intent — arming the unanswered-cancel timeout',
+            confidence: 1.0, rule_applied: 'CANCEL_SAVE_ATTEMPT', status: 'pending',
+            requires_approval: false, batch_id: armBatch, sequence_order: 0,
+          },
+          {
+            event_id: action.event_id || null,
+            action_type: 'issue_hold', target_system: 'ghl', target_entity: 'contact',
+            target_id: contactId,
+            action_payload: {
+              hold_hours: 24,
+              return_to: 'cancel_decision_timeout',
+              hold_reason: 'Cancel requested; reschedule offered — auto-cancel if no response',
+              workflow_code: 'CANCEL_SAVE',
+            },
+            reasoning: 'Cancel save-attempt timeout timer (24h)',
+            confidence: 1.0, rule_applied: 'CANCEL_SAVE_ATTEMPT', status: 'pending',
+            requires_approval: false, batch_id: armBatch, sequence_order: 1,
+          },
+        ]);
+        console.log(`[SendMessage] cancel save-attempt armed for ${contactId}: awaiting:cancel-decision + 24h hold (batch ${armBatch})`);
+      } catch (armErr) {
+        console.warn(`[SendMessage] cancel save-attempt arm failed for ${contactId} (fail-soft): ${armErr.message}`);
+      }
+    }
+
     // GroupMe notification (v3.6: rich format). If any resolver fails,
     // the notification still goes out — fall back to what is available.
     try {

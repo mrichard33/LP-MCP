@@ -639,6 +639,13 @@ Read the lead's reply carefully:
     Example: "Got it — life happens. We could move it to Saturday May 9 at 10 AM or Monday May 11 at 2 PM. Either of those work, or would you rather just take it off the calendar entirely?"
     DO NOT emit any companion_action this turn.
 
+▼ CANCEL FLOW STATE REPORTING (2026-07-06 — unanswered save-attempts auto-cancel)
+Whenever this turn is part of the CANCELLATION FLOW, set the top-level "cancel_flow_state" field:
+  - "save_attempt" — the lead asked to cancel and you are trying to SAVE it (STATE 1 case B, STATE 2 case A or C, or any reschedule offer made in response to cancel intent). The appointment is still on the calendar pending their decision. This arms a server-side timeout: if they never respond about a new time, the appointment is cancelled automatically — a requested cancellation must never be left hanging because the lead went quiet.
+  - "cancelled" — you emitted the cancel_appointment companion this turn.
+  - "rescheduled" — you emitted the reschedule_appointment companion this turn.
+  - null — this turn is not part of a cancellation flow.
+
 ▼ STATE 3 — HARD CONFIRMATION OF RESCHEDULE TIME (after STATE 2 case A or C)
 Lead picks one of the proposed reschedule slots. Treat as HARD CONFIRMATION but emit reschedule_appointment instead of book_appointment.
 
@@ -958,6 +965,7 @@ Return ONLY a valid JSON object. The very first character MUST be { and the very
   },
   "voice_used": "we",
   "frameworks_applied": ["antifragile","expert_secrets","traffic_secrets","dotcom_secrets"],
+  "cancel_flow_state": null | "save_attempt" | "cancelled" | "rescheduled",
   "reasoning": "1 sentence explaining your strategy",
   "companion_action": null | {
     "action_type": "book_appointment" | "cancel_appointment" | "reschedule_appointment" | "update_appointment_status" | "guide_disposition",
@@ -1857,6 +1865,14 @@ function validateResponse(parsed, channel) {
     ? parsed.frameworks_applied.filter(f => typeof f === 'string').slice(0, 4)
     : [];
 
+  // 2026-07-06 — cancel-flow state (owner requirement): a "save_attempt"
+  // (reschedule offered in response to cancel intent) arms the send-handler's
+  // auto-cancel timeout so a requested cancellation is never left hanging
+  // when the lead goes quiet.
+  const cancelFlowState = ['save_attempt', 'cancelled', 'rescheduled'].includes(parsed.cancel_flow_state)
+    ? parsed.cancel_flow_state
+    : null;
+
   // v2.7.8: dispatch companion validation by action_type. Four supported:
   // book_appointment, cancel_appointment, reschedule_appointment, and
   // update_appointment_status (2026-06-03, book-then-capture upgrade). Each
@@ -1892,6 +1908,7 @@ function validateResponse(parsed, channel) {
     hso_breakdown: parsed.hso_breakdown && typeof parsed.hso_breakdown === 'object' ? parsed.hso_breakdown : null,
     voice_used: voice,
     frameworks_applied: frameworksApplied,
+    cancel_flow_state: cancelFlowState,
     reasoning: String(parsed.reasoning || '').slice(0, 500),
     companion_action: companionAction,
   };

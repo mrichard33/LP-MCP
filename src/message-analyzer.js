@@ -468,7 +468,8 @@ When recommended_action is "escalate_to_rep" (or wrong_person for identity cases
 • "legal_media" — legal threats, injury, damage claims, or press/media inquiries. Acknowledge only.
 • "identity_ambiguous" — wrong number, deceased contact, or a minor.
 • "commercial_hoa" — commercial, multi-property, HOA, or condo-association projects.
-• "contract_change" — requests to change or CANCEL A SIGNED CONTRACT. Humans only — rescission-sensitive.
+• "contract_change" — requests to change or CANCEL A SIGNED CONTRACT (a purchase agreement they already signed). Humans only — rescission-sensitive.
+  NEGATIVE EXAMPLE: cancelling or rescheduling an APPOINTMENT ("cancel my appointment", "cancel that", "I can't make Wednesday") is NOT contract_change — appointment changes are handled conversationally by the cancellation flow; leave escalation_category null for them. contract_change requires an actual signed contract/purchase being referenced (deposit, contract, paperwork, "cancel my order").
 • "billing" — billing, payment, or refund matters.
 • "vendor_recruiting" — vendor, partnership, or recruiting inquiries.
 • "language" — a non-English conversation (e.g. Spanish) that needs a native-quality human.
