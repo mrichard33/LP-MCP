@@ -106,7 +106,9 @@ WHERE intent_class = 'CALLBACK';
 UPDATE kb_intent_handlers SET kb_key = 'HDL-STOP-01'           WHERE handler_code = 'HDL-STOP-01'           AND kb_key IS NULL;
 UPDATE kb_intent_handlers SET kb_key = 'HDL-DQ-MOBILE-01'      WHERE handler_code = 'HDL-DQ-MOBILE-01'      AND kb_key IS NULL;
 UPDATE kb_intent_handlers SET kb_key = 'HDL-DQ-RENTER-01'      WHERE handler_code = 'HDL-DQ-RENTER-01'      AND kb_key IS NULL;
-UPDATE kb_intent_handlers SET kb_key = 'HDL-DQ-INVESTMENT-01'  WHERE handler_code = 'HDL-DQ-INVESTMENT-01'  AND kb_key IS NULL;
+-- 2026-07-06: HDL-DQ-INVESTMENT-01 backfill removed — the INVESTMENT gate is
+-- retired (investment properties are normal leads; see 011 and the
+-- consolidation PR for the live-row cleanup task).
 UPDATE kb_intent_handlers SET kb_key = 'HDL-WHO-01'            WHERE handler_code = 'HDL-WHO-01'            AND kb_key IS NULL;
 UPDATE kb_intent_handlers SET kb_key = 'HDL-WRONG-01'          WHERE handler_code = 'HDL-WRONG-01'          AND kb_key IS NULL;
 UPDATE kb_intent_handlers SET kb_key = 'HDL-HUMAN-01'          WHERE handler_code = 'HDL-HUMAN-01'          AND kb_key IS NULL;

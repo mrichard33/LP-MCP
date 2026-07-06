@@ -125,6 +125,9 @@ const ALLOWED_EVENT_TYPES = new Set([
   'intent.stall_detected',         // 1 rule
   'agentic.handoff_started',       // 1 rule
   'agentic.handoff_ended',         // 1 rule
+  'agentic.out_of_area_detected',  // 2026-07-06 — rule SERVICE_AREA_EXIT (the
+                                   // Thomas rule: polite exit + suppress + P3
+                                   // the moment a zip fails the footprint).
   'agentic.hold_completed',        // 2026-06-12 — Dynamic Hold timeout routing
                                    // (S13_BOOKING_PUSH_TIMEOUT_REISSUE / _TO_S22).
                                    // agentic.hold_error is NOT listed — its intake

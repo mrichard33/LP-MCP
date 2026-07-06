@@ -450,6 +450,18 @@ export async function executeBookAppointment(action, context) {
     qualifyingDataFieldsWritten = await persistQualifyingData(contactId, payload.qualifying_data);
   }
 
+  // 2026-07-06 — one-legger policy (locked with Mark): a booking with a
+  // non-"Yes"/"Solo Owner" decision-maker answer STILL BOOKS (the question
+  // never blocks), but gets tagged one-legger-risk so the post-booking
+  // confirmation call resolves attendance. "Solo Owner" is a complete
+  // decision-making unit, not a one-legger. Best-effort; never fails the booking.
+  const dmAnswer = payload.qualifying_data?.decision_makers_present;
+  if (typeof dmAnswer === 'string' && dmAnswer !== 'Yes' && dmAnswer !== 'Solo Owner') {
+    await applyGHLTag(contactId, 'one-legger-risk').catch((err) =>
+      console.warn(`[ActionExecutor] one-legger-risk tag failed for ${contactId} (fail-soft): ${err.message}`));
+    console.log(`[ActionExecutor] one-legger-risk tagged for ${contactId} (decision_makers_present="${dmAnswer}") — booking proceeds per locked policy`);
+  }
+
   // v3.4: tear down the booking-flow tags now that a booking has landed, so the
   // affirmative-gate bypass doesn't persist for this contact. See §8 #6.
   await removeGHLTags(contactId, BOOKING_FLOW_TAGS).catch(() => {});

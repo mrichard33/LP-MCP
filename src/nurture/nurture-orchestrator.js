@@ -454,6 +454,18 @@ function checkInterrupts(context) {
     return { status: 'suppressed_interrupt', reason: 'appt_booked' };
   }
 
+  // 2026-07-06 (Bot 2/3/4 consolidation, A10 nurture pause): a follow-up:*
+  // tag means the bot PROMISED to check back at a specific time ("I'll check
+  // back next week"). A nurture send inside that window contradicts the
+  // stated promise — a stated promise beats a scheduled send. The tag is
+  // cleared by FOLLOW_UP_CLEARED_ON_REPLY (contact re-engages early) or by
+  // the follow-up re-engagement rule when the hold fires; nurture resumes
+  // after either. Deliberately NOT in SUPPRESS_TAGS — this pauses nurture
+  // only, never the conversational responder.
+  if (tags.some((t) => String(t).toLowerCase().startsWith('follow-up:'))) {
+    return { status: 'suppressed_interrupt', reason: 'follow_up_promise_window' };
+  }
+
   const recAction = context?.intelligence?.recommended_action;
   if (recAction === 'suppress') {
     return { status: 'suppressed_interrupt', reason: 'layer3_recommends_suppress' };
