@@ -589,41 +589,6 @@ async function getInboundEmailToAddress(contactId) {
  *   null    — no prior outbound email found or lookup failed
  * Fail-open: callers treat null as 'rep' (the safe, non-aggressive opener).
  */
-// 2026-07-06 (Sentinel §14) — human-takeover detection for the yield guard.
-// Returns { minutes_ago } when the most recent OUTBOUND message in the GHL
-// thread was sent by a human from the GHL app (source === 'app') within the
-// yield window; null otherwise. The bot's own sends arrive via API and
-// workflow/campaign sends carry those sources, so 'app' is the human signal.
-// Fail-open by design: unreadable conversation or missing source → null.
-const HUMAN_TAKEOVER_YIELD_MINUTES = parseInt(process.env.HUMAN_TAKEOVER_YIELD_MINUTES || '60', 10);
-
-async function getActiveHumanTakeover(contactId) {
-  if (!contactId || !GHL_API_KEY) return null;
-  try {
-    const search = await ghlFetch('GET',
-      `/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`);
-    const conversations = Array.isArray(search) ? search : (search?.conversations || []);
-    if (!conversations.length) return null;
-    const msgData = await ghlFetch('GET',
-      `/conversations/${conversations[0].id}/messages?limit=10`);
-    const messages = msgData?.messages?.messages || msgData?.messages || [];
-    if (!Array.isArray(messages) || !messages.length) return null;
-    // Newest-first. The most recent outbound decides: a human 'app' send in
-    // the window yields; anything else (API/bot, workflow, campaign, or a
-    // newer bot send after the rep's) does not.
-    const lastOutbound = messages.find(m => m.direction === 'outbound');
-    if (!lastOutbound || String(lastOutbound.source || '').toLowerCase() !== 'app') return null;
-    const sentAt = new Date(lastOutbound.dateAdded || lastOutbound.date_added || 0).getTime();
-    if (!Number.isFinite(sentAt) || sentAt <= 0) return null;
-    const minutesAgo = Math.round((Date.now() - sentAt) / 60_000);
-    if (minutesAgo > HUMAN_TAKEOVER_YIELD_MINUTES) return null;
-    return { minutes_ago: minutesAgo };
-  } catch (err) {
-    console.warn(`[SendMessage] human-takeover check failed for ${contactId}: ${err.message} — failing open`);
-    return null;
-  }
-}
-
 async function getThreadSenderType(contactId) {
   if (!contactId || !GHL_API_KEY) return null;
 
@@ -1382,29 +1347,14 @@ export async function executeSendMessage(action, context) {
     };
   }
 
-  // ── Guardrail 3.5: HUMAN-TAKEOVER YIELD (2026-07-06, Sentinel §14) ──
-  // When a human rep has replied live in the thread, the bot yields for the
-  // active conversation window — the last thing a mid-conversation rep needs
-  // is the bot talking over them. Applies to AUTO-GENERATED conversational
-  // replies only (requires_ai_generation / pre_generated); literal compliance
-  // sends (e.g. the STOP confirmation) are never yielded. Detection keys on
-  // GHL message source === 'app' (a send from the GHL app UI = a human);
-  // API/workflow/campaign sends are the system's own. Fail-OPEN: if the
-  // conversation is unreadable or source is unpopulated we send as before —
-  // this guard must never silence the bot on an infra blip.
-  if (payload.requires_ai_generation || payload.pre_generated) {
-    const takeover = await getActiveHumanTakeover(contactId).catch(() => null);
-    if (takeover) {
-      console.log(`[SendMessage] ✋ HUMAN-TAKEOVER YIELD: ${contactId} — rep replied in-thread ${takeover.minutes_ago}m ago (window ${HUMAN_TAKEOVER_YIELD_MINUTES}m); bot stands down`);
-      return {
-        action: 'send_message_human_takeover_yield',
-        contact_id: contactId,
-        reason: 'human_takeover_active_window',
-        rep_message_minutes_ago: takeover.minutes_ago,
-        channel,
-      };
-    }
-  }
+  // 2026-07-06 — HUMAN-TAKEOVER YIELD REMOVED (owner decision, same day it
+  // shipped). Sentinel §14's "bot yields when a rep replies in-thread" is
+  // overruled: the agentic bot NEVER stands down while agentic-active is
+  // present — stop-bot is the ONLY off switch (tag invariant). The detector
+  // also false-positived on transactional emails in the thread (estimate/
+  // login-code sends read as "rep active"), silencing SMS replies for the
+  // whole yield window (Mark Test, 21:17Z). Reps who take a conversation
+  // over apply stop-bot.
 
   // ── Channel + identity inheritance (2026-07-03 rebuild) ─────────
   // The reply ALWAYS inherits channel and sender identity from the
