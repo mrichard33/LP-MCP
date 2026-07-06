@@ -40,10 +40,11 @@ VALUES
   'tag_and_handoff', 'hdl:dq-mobile', true,
   'Disqualify — mobile homes outside service scope.'),
 
-('INVESTMENT',     'HDL-DQ-INVESTMENT-01', 'compliance_gate', 20,  'Investment / rental property',
-  ARRAY['rental property','airbnb','investment property','flip','renting it out'],
-  'tag_and_handoff', 'hdl:dq-investment', false,
-  'Qualify differently — different value framing required.'),
+-- 2026-07-06 (Bot 2/3/4 consolidation, locked decision): the INVESTMENT →
+-- HDL-DQ-INVESTMENT-01 compliance gate is REMOVED. Investment properties are
+-- normal leads — no DQ, no special handling, no hdl:dq-investment tag. If the
+-- live kb_intent_handlers table still carries the INVESTMENT row, delete it
+-- (manual operator task — see the consolidation PR).
 
 -- ─── Intent Routing (priority 100+, fires when no compliance gate matched) ───
 ('APPT_STATUS',    'HDL-APPT-STATUS-01',   'intent_router',  100,  'Asking about an existing appointment',

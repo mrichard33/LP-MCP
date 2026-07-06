@@ -77,6 +77,22 @@ export async function ghlFetch(method, path, body = null) {
  */
 const INTERPOLATE_FILTERS = {
   date: (val) => formatDateTimeUS(val),
+  // 2026-07-06 (Bot 2/3/4 consolidation) — follow-up bucket → hold hours.
+  // Used by the follow_up_scheduled layer3 dispatch row:
+  //   "hold_hours": "{{follow_up_bucket|follow_up_hold_hours}}"
+  // Buckets come from the analyzer's validated follow_up_bucket field.
+  // Unknown/absent bucket → null → falls back to the raw value, which the
+  // issue_hold handler rejects as non-numeric (fail-safe: no bogus hold).
+  follow_up_hold_hours: (val) => ({
+    'tomorrow': '24',
+    'few-days': '72',
+    '1week': '168',
+    '2weeks': '336',
+    '1month': '720',
+    '2months': '1440',
+    'after-holidays': '1080',
+    'seasonal': '2160',
+  }[String(val)] ?? null),
 };
 
 export function interpolate(template, context) {

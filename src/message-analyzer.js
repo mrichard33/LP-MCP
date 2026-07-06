@@ -275,6 +275,12 @@ const ACTION_TO_STATE_MAP = {
   soft_refusal:              'DISENGAGEMENT.soft_opt_out',
   hard_refusal:              'DISENGAGEMENT.hard_loss',
   // wrong_person: handled outside the state model (data hygiene)
+  // 2026-07-06 — Bot 2/3/4 consolidation actions. objection_price and
+  // busy_callback above already cover two of the seven new recommended_action
+  // values (the legacy shorthand happens to match). The rest deliberately
+  // propose no state: frustrated_fast_track / callback_request are escalation
+  // paths, guide_send is fulfillment, follow_up_scheduled is a timer — none
+  // is a buyer-state transition. deriveProposedState returns null for them.
 };
 
 // Map the validated recommended_action to a state code where possible.
@@ -395,9 +401,85 @@ Required JSON structure:
   "engagement_quality": <"meaningful" | "neutral" | "disengagement" | "dnc">,
   "fast_track_eligible": <boolean>,
   "recommended_story_arc": <null | "SA1" | "SA2" | "SA3" | "SA4" | "SA5">,
-  "recommended_action": <"advance_stage" | "deploy_objection_handler" | "fast_track_booking" | "continue_current" | "escalate_to_rep" | "suppress">,
+  "recommended_action": <"advance_stage" | "deploy_objection_handler" | "fast_track_booking" | "continue_current" | "escalate_to_rep" | "suppress" | "objection_price" | "busy_callback" | "wrong_person" | "frustrated_fast_track" | "callback_request" | "guide_send" | "follow_up_scheduled">,
+  "dq_detected": <null | "mobile-home" | "renter" | "lanai-only">,
+  "requested_fulfillment": <"in_home_estimate" | "phone_call" | "info_only" | "unspecified">,
+  "escalation_category": <null | "existing_customer_service" | "legal_media" | "identity_ambiguous" | "commercial_hoa" | "contract_change" | "billing" | "vendor_recruiting" | "language" | "compliance_adjacent">,
+  "guide_type": <null | "dhp" | "hurricane" | "energy" | "security" | "warranty" | "financing" | "reviews" | "credentials" | "booking-link" | "process">,
+  "follow_up_bucket": <null | "tomorrow" | "few-days" | "1week" | "2weeks" | "1month" | "2months" | "after-holidays" | "seasonal">,
   "reasoning": "<1-2 sentence explanation>"
 }
+
+═══════════════════════════════════════════════════════════════════
+CONVERSATION ACTIONS (Bot 2/3/4 consolidation) — WHEN TO USE EACH
+═══════════════════════════════════════════════════════════════════
+
+Seven conversation-level actions route to dedicated response playbooks. Pick the MOST SPECIFIC match; fall back to the legacy actions (advance_stage, deploy_objection_handler, continue_current…) when none applies.
+
+• objection_price — the lead is asking what it costs, requesting a ballpark, or objecting on price BEFORE having a quote ("how much", "what does it run", "give me a number", "too expensive" with no quote on file).
+  NEGATIVE EXAMPLES (do NOT classify as objection_price):
+  - Bare affirmatives answering a prior CTA ("Yes", "Sure", "Ok") — apply the CTA-AFFIRMATIVE OVERRIDE below instead.
+  - Answers about energy savings or energy bills when the prior outbound asked about energy/comfort priorities — that is discovery, not a pricing ask.
+  - Casual curiosity mid-answer ("whatever it costs, we need it done") — no pricing route.
+  - Post-demo/quote price negotiation (quote already on file) — use deploy_objection_handler with objection_type "price".
+
+• frustrated_fast_track — genuine frustration or anger AND they want resolution NOW: "how much longer", "get to the point", "too many questions", "just give me a quote already", "this is ridiculous". Emotional tone is negative. Speed matters more than qualification.
+
+• callback_request — a CALM request for a phone call: "call me", "can someone call me", "have someone reach out", "I'd rather talk on the phone". No anger. The distinction with frustrated_fast_track is EMOTIONAL TONE: calm ask = callback_request; upset demand = frustrated_fast_track. This distinction is deliberate — they get different greetings and different urgency.
+
+• busy_callback — they can't engage right now and want to be contacted later: "I'm busy", "just had a baby", "at work, hit me up later", "driving". Not angry, not asking questions — just deferring the conversation.
+
+• wrong_person — the reply indicates we are NOT talking to the intended homeowner: "wrong number", "who is this?", "there's no [name] here", someone else answering for the contact, or indications the contact is deceased or a minor (also set escalation_category "identity_ambiguous" for deceased/minor).
+
+• guide_send — they ask for information/materials to review: "send me info", "got anything I can read", "can you email me details", or accept a guide offer. Set guide_type to the best topical match: "hurricane" (storm protection), "energy" (savings/cooling), "security" (break-ins), "warranty", "financing", "reviews", "credentials" (company info/licensing), "booking-link" (they explicitly ask for a scheduling LINK), "process" (what the visit involves), or "dhp" (Documented Home Protection Guide — the default for vague/skeptical "just send me something" requests).
+
+• follow_up_scheduled — they ask to be re-contacted at a specific time: "check back next week", "reach out after the holidays", "try me in a month". Set follow_up_bucket to the closest bucket; a vague deferral with no timeframe = "1week". Buckets: tomorrow / few-days / 1week / 2weeks / 1month / 2months / after-holidays / seasonal.
+
+═══════════════════════════════════════════════════════════════════
+DISQUALIFICATION DETECTION — dq_detected (VOLUNTEERED ONLY)
+═══════════════════════════════════════════════════════════════════
+
+Set dq_detected ONLY when the lead VOLUNTEERS a disqualifying fact. Never infer it, never treat it as something to probe for — questions that hunt for disqualifiers are forbidden.
+
+• "mobile-home" — they state the property is a mobile or manufactured home.
+• "renter" — they state they rent / are not the homeowner / "I'd have to ask my landlord".
+• "lanai-only" — the project is ONLY a lanai, sunroom, screen enclosure, or patio screen (no main-structure windows or doors). "Windows plus the lanai" is NOT a DQ — main-home work qualifies.
+
+INVESTMENT PROPERTIES ARE NOT A DISQUALIFIER. "It's an investment property", "it's a rental I own", "it's not my primary residence" → dq_detected stays null and the conversation proceeds completely normally. There is no investment-property routing of any kind.
+
+When dq_detected is set, recommended_action should usually be "continue_current" — a dedicated rule handles the exit; do not also route to suppress.
+
+═══════════════════════════════════════════════════════════════════
+REQUESTED FULFILLMENT — WHAT THE LEAD EXPLICITLY ASKED FOR
+═══════════════════════════════════════════════════════════════════
+
+requested_fulfillment captures the lead's OWN stated ask this turn — it outranks funnel defaults downstream, so only set it from their words, never from inference:
+• "in_home_estimate" — they explicitly want someone to come out: "come give me an estimate", "send someone to measure", "when can you come by", "I want the quote visit".
+• "phone_call" — they explicitly want to talk by phone: "call me", "let's talk first", "can we discuss over the phone".
+• "info_only" — they explicitly want materials only: "just send me info", "email me the details, no calls".
+• "unspecified" — everything else (the default). A generic booking intent ("let's schedule", "what's next") is unspecified — the funnel default picks the appointment type.
+
+═══════════════════════════════════════════════════════════════════
+ESCALATION CATEGORIES — escalation_category (with escalate_to_rep)
+═══════════════════════════════════════════════════════════════════
+
+When recommended_action is "escalate_to_rep" (or wrong_person for identity cases), set escalation_category to the matching route:
+• "existing_customer_service" — existing customer with install problems, warranty claims, or scheduling complaints. No selling.
+• "legal_media" — legal threats, injury, damage claims, or press/media inquiries. Acknowledge only.
+• "identity_ambiguous" — wrong number, deceased contact, or a minor.
+• "commercial_hoa" — commercial, multi-property, HOA, or condo-association projects.
+• "contract_change" — requests to change or CANCEL A SIGNED CONTRACT. Humans only — rescission-sensitive.
+• "billing" — billing, payment, or refund matters.
+• "vendor_recruiting" — vendor, partnership, or recruiting inquiries.
+• "language" — a non-English conversation (e.g. Spanish) that needs a native-quality human.
+• "compliance_adjacent" — insurance-carrier specifics, claim disputes, or permit disputes.
+Otherwise leave it null.
+
+═══════════════════════════════════════════════════════════════════
+NO FABRICATED DATA — HARD RULE
+═══════════════════════════════════════════════════════════════════
+
+Every field you emit must come from what the contact ACTUALLY said or what is on file. Never default, estimate, or sentinel-fill anything: no inferred window/door counts (never ask for them either), no "whole house" → a number, no "a few" → a number, no guessed timelines, no assumed property details. If the contact didn't state it, it does not exist. Volunteered facts DO count and should be reflected (buying_signals, objection_type, dq_detected, follow_up_bucket) — the rule is against invention, not against listening.
 
 ═══════════════════════════════════════════════════════════════════
 CTA-AFFIRMATIVE OVERRIDE — HIGHEST-PRIORITY RULE
@@ -727,7 +809,24 @@ function validateAnalysis(analysis) {
     engagement_quality: ['meaningful', 'neutral', 'disengagement', 'dnc'].includes(analysis.engagement_quality) ? analysis.engagement_quality : 'neutral',
     fast_track_eligible: analysis.fast_track_eligible === true,
     recommended_story_arc: ['SA1', 'SA2', 'SA3', 'SA4', 'SA5'].includes(analysis.recommended_story_arc) ? analysis.recommended_story_arc : null,
-    recommended_action: ['advance_stage', 'deploy_objection_handler', 'fast_track_booking', 'continue_current', 'escalate_to_rep', 'suppress'].includes(analysis.recommended_action) ? analysis.recommended_action : 'continue_current',
+    recommended_action: [
+      'advance_stage', 'deploy_objection_handler', 'fast_track_booking', 'continue_current', 'escalate_to_rep', 'suppress',
+      // 2026-07-06 — Bot 2/3/4 consolidation conversation actions. Each has a
+      // layer3_action_dispatch row; see CONVERSATION ACTIONS in SYSTEM_PROMPT.
+      'objection_price', 'busy_callback', 'wrong_person', 'frustrated_fast_track', 'callback_request', 'guide_send', 'follow_up_scheduled',
+    ].includes(analysis.recommended_action) ? analysis.recommended_action : 'continue_current',
+    // 2026-07-06 — DQ detection (volunteered-only; investment property is
+    // deliberately NOT a value — investment mentions are a normal flow).
+    dq_detected: ['mobile-home', 'renter', 'lanai-only'].includes(analysis.dq_detected) ? analysis.dq_detected : null,
+    // 2026-07-06 — the lead's explicit ask this turn; outranks funnel
+    // defaults in resolveBookingCalendar. Never inferred.
+    requested_fulfillment: ['in_home_estimate', 'phone_call', 'info_only', 'unspecified'].includes(analysis.requested_fulfillment) ? analysis.requested_fulfillment : 'unspecified',
+    escalation_category: [
+      'existing_customer_service', 'legal_media', 'identity_ambiguous', 'commercial_hoa',
+      'contract_change', 'billing', 'vendor_recruiting', 'language', 'compliance_adjacent',
+    ].includes(analysis.escalation_category) ? analysis.escalation_category : null,
+    guide_type: ['dhp', 'hurricane', 'energy', 'security', 'warranty', 'financing', 'reviews', 'credentials', 'booking-link', 'process'].includes(analysis.guide_type) ? analysis.guide_type : null,
+    follow_up_bucket: ['tomorrow', 'few-days', '1week', '2weeks', '1month', '2months', 'after-holidays', 'seasonal'].includes(analysis.follow_up_bucket) ? analysis.follow_up_bucket : null,
     reasoning: String(analysis.reasoning || '').slice(0, 500),
   };
 }

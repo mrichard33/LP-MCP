@@ -103,6 +103,10 @@ const CF_LP_LOST_REASON = 'I9CbRV0dKMfwaSlge9uU';
 const CF_ESTIMATE_TOTAL = 'PqUYMgBojosjSGMBEUqX';   // dollar amount, e.g. "15775.17"
 const CF_WINDOW_COUNT   = 'h9FJTUbmUHIuD6JKmpXv';   // integer count, e.g. "12"
 const CF_DECISION_MAKERS_PRESENT = 'GH1QGGOseMKmJAMqajiN'; // select: Yes|No|Solo Owner|Uncertain
+// 2026-07-06 (Bot 2/3/4 consolidation) — Trust Level Score. Bot 2's pricing,
+// discovery, and value-first scripts branch on this (low 1-2 / neutral 3 /
+// high 4-5). Read-only here; the responder emits its own trust_level_targeted.
+const CF_TRUST_LEVEL_SCORE = 'zrghbp0ZLrOyTWc9x6Ai';
 
 // LP dispositions where stale data is high-risk (active deals).
 const LP_ACTIVE_DISPOSITIONS = new Set([
@@ -512,6 +516,37 @@ function calculateDaysInStage(opportunity) {
 
 // v2.7: Pull recent nurture history for the outbound message engine.
 // Returns the last N story arcs, the last 10 subjects, and the highest
+// 2026-07-06 (Bot 2/3/4 consolidation) — the contact's OPEN objection state,
+// if any (one-open-row invariant: exited_at IS NULL). Bot 2's Mistrust /
+// Spouse / Budget plays are TWO-TURN state machines: the responder selects
+// the turn-1 (listen/categorize) vs turn-2 (respond) script from this state,
+// advanced by the transition_objection_state action. Fail-soft: an
+// unreadable state degrades to null (single-turn behavior), never a hang.
+async function fetchOpenObjectionState(ghlContactId) {
+  if (!ghlContactId) return null;
+  try {
+    const { data, error } = await withTimeout(
+      supabase
+        .from('contact_objection_states')
+        .select('state_code, parent_state, entered_at, recovery_attempt_number')
+        .eq('contact_id', ghlContactId)
+        .is('exited_at', null)
+        .maybeSingle(),
+      'fetchOpenObjectionState',
+    );
+    if (error || !data) return null;
+    return {
+      state_code: data.state_code,
+      parent_state: data.parent_state || null,
+      entered_at: data.entered_at || null,
+      attempt_number: data.recovery_attempt_number ?? null,
+    };
+  } catch (err) {
+    console.warn(`[ContextBuilder] open objection state read failed for ${ghlContactId}: ${err.message}`);
+    return null;
+  }
+}
+
 // sequence_position observed for the requested workflow_code. Used by
 // the prompt selector (to exclude recently-used arcs) and the hard
 // blockers (to reject repeated subject lines).
@@ -624,6 +659,13 @@ export async function buildLeadContext(ghlContactId, options = {}) {
   const decisionMakersPresent = ghlContact?.customFields
     ? getCustomFieldValue(ghlContact.customFields, CF_DECISION_MAKERS_PRESENT)
     : null;
+  // 2026-07-06: Trust Level Score (1-5) for trust-adaptive scripts. Null when
+  // unset — the prompt treats unknown trust as neutral.
+  const trustLevelScore = coerceCount(
+    ghlContact?.customFields
+      ? getCustomFieldValue(ghlContact.customFields, CF_TRUST_LEVEL_SCORE)
+      : null
+  );
 
   if (cfProspectId) {
     lpLead = await fetchLPLeadByProspectId(cfProspectId);
@@ -668,12 +710,13 @@ export async function buildLeadContext(ghlContactId, options = {}) {
   }
 
   const lpLeadId = lpLead?.lp_lead_id || null;
-  const [conversation, lpNotes, lpCalls, pipelineStageInfo, nurtureHistory] = await Promise.all([
+  const [conversation, lpNotes, lpCalls, pipelineStageInfo, nurtureHistory, openObjectionState] = await Promise.all([
     (includeConversation && ghlContact) ? fetchConversation(ghlContactId, 10) : [],
     fetchLPNotes(lpLeadId),
     fetchLPCalls(lpLeadId),
     opportunity?.pipelineStageId ? resolvePipelineStage(opportunity.pipelineStageId) : null,
     fetchNurtureHistory(ghlContactId, workflow_code),
+    fetchOpenObjectionState(ghlContactId),
   ]);
 
   const tags = ghlContact?.tags || [];
@@ -707,6 +750,9 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       entry_source: parseEntrySource(tags) || intelligence?.entry_source || null,
       // Decision-maker presence for the in-home booking gate (raw GHL select).
       decision_makers_present: decisionMakersPresent,
+      // 2026-07-06: Trust Level Score (1-5, null = unknown/neutral) for
+      // Bot 2's trust-adaptive pricing / value-first / bridge scripts.
+      trust_level_score: trustLevelScore,
       current_tags: tags,
       current_stage_tag: parseStageTag(tags),
       current_buyer_tag: parseBuyerTag(tags),
@@ -728,6 +774,11 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       days_in_stage: daysInStage,
       last_status_change: opportunity?.lastStatusChangeAt || null,
     },
+
+    // 2026-07-06 (Bot 2/3/4 consolidation): the contact's open objection
+    // state, or null. Drives turn-1 vs turn-2 script selection for the
+    // two-turn objection plays (Mistrust / Spouse / Budget).
+    objection_state: openObjectionState,
 
     // v2.6: New top-level estimate block. Contains ONLY the customer's
     // actual estimate as recorded in GHL custom fields. Distinct from

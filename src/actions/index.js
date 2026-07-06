@@ -163,6 +163,10 @@ import { executeClassifyBucket } from './handlers/classify-bucket.js';
 import { executeTransitionObjectionState } from './handlers/objection-state.js';
 // Phase 2 lead-state — reactive classifier + S4.5 enrollment invoker
 import { executeClassifyLeadState } from './handlers/lead-state.js';
+// 2026-07-06 (Bot 2/3/4 consolidation) — GHL contact-note writer (escalation
+// context summaries) + dispatch-param interpolation.
+import { executeAddNote } from './handlers/notes.js';
+import { interpolatePayload } from './helpers.js';
 
 // MVI v2.5 — fetch the source event for a given action. The shared
 // getEventContext returns ONLY the spread payload (no event_id /
@@ -275,13 +279,21 @@ async function executeLayer3Dispatch(action /*, context */) {
       continue;
     }
 
+    // 2026-07-06 (Bot 2/3/4 consolidation) — interpolate dispatch params
+    // against the triggering event payload so rows can carry dynamic tokens
+    // like "follow-up:{{follow_up_bucket}}" or "send-{{guide_type}}-guide"
+    // (analyzer-emitted fields). interpolate() only matches single-word
+    // {{token}} / {{token|filter}} — GHL merge tags ({{contact.first_name}},
+    // {{trigger_link.xyz}}) contain dots and pass through UNTOUCHED. An
+    // absent token blanks to '' — executeAddTag's trailing-':' hygiene guard
+    // rejects the malformed tag rather than writing it.
     const insertRow = {
       event_id: event.id,
       action_type: tmpl.action_type,
       target_system: targetSystem,
       target_entity: targetEntity,
       target_id: String(subTargetId || ''),
-      action_payload: tmpl.params || tmpl.payload || {},
+      action_payload: interpolatePayload(tmpl.params || tmpl.payload || {}, event.payload || {}),
       reasoning: `LAYER3_DISPATCH(${dispatch.recommended_action}): ${dispatch.notes || 'data-driven dispatch'}`,
       confidence: result.confidence ?? 1.0,
       rule_applied: 'LAYER3_DISPATCH',
@@ -321,6 +333,7 @@ async function executeLayer3Dispatch(action /*, context */) {
 const ACTION_HANDLERS = {
   add_tag: executeAddTag,
   remove_tag: executeRemoveTag,
+  add_note: executeAddNote,                     // 2026-07-06 — escalation context summaries (Sentinel §7)
   set_stage: executeSetStage,                   // v4.3 — atomic stage tag swap
   move_opportunity: executeMoveOpportunity,
   update_opportunity: executeUpdateOpportunity,

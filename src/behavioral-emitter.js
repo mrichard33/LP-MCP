@@ -14,6 +14,30 @@
  * 
  * Security: All endpoints validate GHL_WEBHOOK_SECRET.
  *
+ * v2.14 (2026-07-06) — SMS-only channel gate + synchronous ownership stamp
+ *   (Bot 2/3/4 consolidation, Sentinel §2A/§14).
+ *   CHANNEL GATE: the agentic bot handles SMS only in this phase. Live chat
+ *   is a PERMANENT hard exclusion checked before any other logic (its
+ *   existing handler owns it) — a live-chat inbound produces zero agentic
+ *   events or actions. Email/Social are Phase 2: until that ships they get a
+ *   bookkeeping event (ghl.reply_channel_excluded — matched by no rule) and
+ *   an engagement timestamp, but no ownership stamp, no analyzer pipeline,
+ *   and no ghl.reply_received (so the reply backstop rule cannot fire).
+ *   DNC/STOP compliance still runs for email/social BEFORE the exclusion —
+ *   opt-outs are honored on every channel. Side effect flagged in the PR:
+ *   email replies no longer produce ai.analysis_completed events until
+ *   Phase 2 (affects any rule listening for them, e.g. S13 reply lanes,
+ *   whose contacts reply by SMS in practice).
+ *   OWNERSHIP STAMP: first SMS inbound from a contact without agentic-active
+ *   (and without stop-bot) stamps agentic-active synchronously — GHL tag
+ *   write + contact_tag_snapshot upsert (the executeIssueHold precedent) —
+ *   so the responder rules' has_tag gate (deferred A2 update) can see the
+ *   tag on the very first turn. Rule-based stamping can't do this: rule
+ *   actions execute on the ~60s sweep, invisible to same-pass and racy for
+ *   ai.analysis_completed. Agent rule AGENTIC_CONVO_OWNERSHIP_STAMP remains
+ *   as a backstop for inbound paths that bypass this emitter. Fail-soft:
+ *   stamp errors never block the reply pipeline.
+ *
  * v2.11 (2026-05-20) — Extend trivial-filter escape hatch to recognize
  *   `agentic-active` as an agentic-ownership marker in addition to
  *   `pause-bot`. The tag convention evolved between v2.5 and v2.6:
@@ -207,6 +231,8 @@
 import { emitEvent } from './event-emitter.js';
 import { upsertLeadIntelligence } from './context-builder.js';
 import supabase from './supabase.js';
+// v2.14 — synchronous agentic-active ownership stamp on first SMS inbound.
+import { applyGHLTag } from './ghl.js';
 import { resolveEntryFromSourceMap, entryTagSuffix } from './entry-source-map.js';
 import { executeAddTag } from './actions/handlers/tags.js';
 // 2026-07-03 — hard message-level dedup (Steve Nkzhm incident): every inbound
@@ -563,6 +589,91 @@ function cleanGHLValue(val) {
   return val;
 }
 
+// v2.14 — normalize a GHL messageType into the channel taxonomy the gate and
+// downstream rules key on. Distinct from the reply-buffer's analyzer
+// normalization (which predates this and collapses unknowns to null): the
+// gate must positively identify SMS, so unknown types return 'unknown' and
+// are treated as non-SMS (fail closed — an unidentifiable channel never gets
+// an agentic reply).
+function normalizeInboundChannel(messageType) {
+  const lt = String(messageType || '').toLowerCase();
+  if (lt.includes('live_chat') || lt.includes('livechat') || lt.includes('webchat')) return 'livechat';
+  if (lt.includes('email')) return 'email';
+  if (lt.includes('facebook') || lt.includes('instagram') || lt.includes('gmb') || lt.includes('whatsapp') || lt === 'fb' || lt === 'ig') return 'social';
+  if (lt.includes('sms')) return 'sms';
+  return 'unknown';
+}
+
+// v2.14 — synchronous conversation-ownership stamp (Sentinel bot gate).
+// Stamps agentic-active on the contact's first SMS inbound so the responder
+// rules' has_tag gate sees ownership on turn 1. Order of reads: local
+// contact_tag_snapshot first (cheap, usually current), then live GHL
+// (authoritative) only when the snapshot doesn't already show the tag.
+// Never stamps over stop-bot. Fail-soft everywhere: a stamp failure logs and
+// returns — the AGENTIC_CONVO_OWNERSHIP_STAMP agent rule is the async
+// backstop, and the reply pipeline must never be blocked by tag plumbing.
+// Returns the prefetched GHL contact (or null) so callers can reuse it.
+async function ensureAgenticOwnershipStamp(contactId) {
+  try {
+    const { data: snap } = await supabase
+      .from('contact_tag_snapshot')
+      .select('tags')
+      .eq('ghl_contact_id', contactId)
+      .maybeSingle();
+    const snapTags = Array.isArray(snap?.tags) ? snap.tags.map(t => String(t).toLowerCase()) : null;
+    if (snapTags && (snapTags.includes('agentic-active') || snapTags.includes('stop-bot'))) {
+      return { stamped: false, contact: null };
+    }
+  } catch (err) {
+    console.warn(`[OwnershipStamp] snapshot read failed for ${contactId}: ${err.message} — falling through to GHL read`);
+  }
+
+  const contact = await fetchGHLContact(contactId);
+  if (!contact) {
+    console.warn(`[OwnershipStamp] contact ${contactId} unreadable — stamp skipped (rule backstop will cover)`);
+    return { stamped: false, contact: null };
+  }
+  const liveTags = (contact.tags || []).map(t => String(t).toLowerCase());
+  if (liveTags.includes('agentic-active') || liveTags.includes('stop-bot')) {
+    return { stamped: false, contact };
+  }
+
+  const applied = await applyGHLTag(contactId, 'agentic-active').catch((err) => {
+    console.warn(`[OwnershipStamp] GHL tag write failed for ${contactId}: ${err.message}`);
+    return false;
+  });
+
+  // Synchronous snapshot write (executeIssueHold / Peggy Webb precedent):
+  // the GHL tag webhook round-trip takes seconds to minutes; rule gates and
+  // checkSuppression read the snapshot, so write it now. Merge, don't clobber.
+  if (applied) {
+    try {
+      const now = new Date().toISOString();
+      const { data: snap2 } = await supabase
+        .from('contact_tag_snapshot')
+        .select('tags')
+        .eq('ghl_contact_id', contactId)
+        .maybeSingle();
+      const existing = Array.isArray(snap2?.tags) ? snap2.tags : [];
+      if (!existing.includes('agentic-active')) {
+        await supabase
+          .from('contact_tag_snapshot')
+          .upsert(
+            { ghl_contact_id: contactId, tags: [...existing, 'agentic-active'], updated_at: now },
+            { onConflict: 'ghl_contact_id' }
+          );
+      }
+      console.log(`[OwnershipStamp] agentic-active stamped on ${contactId} (GHL + snapshot)`);
+    } catch (snapErr) {
+      console.warn(`[OwnershipStamp] snapshot write failed for ${contactId} (fail-soft): ${snapErr.message}`);
+    }
+    // Reflect the stamp in the returned contact so the trivial-filter
+    // ownership check sees it without another fetch.
+    contact.tags = [...(contact.tags || []), 'agentic-active'];
+  }
+  return { stamped: !!applied, contact };
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // WEBHOOK HANDLERS
 // ═══════════════════════════════════════════════════════════════════
@@ -590,17 +701,57 @@ async function handleReply(req, res) {
   // inside the window maps to the same key.
   const messageId = rawMessageId || buildMessageKey(contactId, null, trimmed);
 
-  // DNC always wins, regardless of contact state — fires immediately,
-  // bypasses the reply buffer (no analyzer call needed).
+  // v2.14 — CHANNEL GATE, live chat first (Sentinel §14: "checked before any
+  // other logic, not a tag"). Live chat is permanently excluded from the
+  // agentic bot — its existing handler owns it. No event, no stamp, nothing.
+  const channel = normalizeInboundChannel(messageType);
+  if (channel === 'livechat') {
+    console.log(`[BehavioralEmitter] live-chat inbound from ${contactId} — agentic bot permanently excluded from this channel, skipping entirely`);
+    return res.json({ status: 'skipped', reason: 'live_chat_channel_excluded' });
+  }
+
+  // DNC always wins, regardless of contact state or channel — opt-out
+  // compliance is honored everywhere. Fires immediately, bypasses the reply
+  // buffer (no analyzer call needed).
   if (isDNCSignal(trimmed)) {
     await emitEvent({
       event_type: 'ghl.reply_received', event_subtype: 'dnc', source: 'ghl_webhook',
       entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
-      payload: { message_text: trimmed, message_type: messageType, message_id: messageId, engagement_quality: 'dnc', word_count: trimmed.split(/\s+/).length },
+      payload: { message_text: trimmed, message_type: messageType, channel, message_id: messageId, engagement_quality: 'dnc', word_count: trimmed.split(/\s+/).length },
       priority: 'critical', idempotency_key: `ghl_reply_dnc_${contactId}_${Date.now()}`,
     });
     console.log(`[BehavioralEmitter] DNC reply from ${contactId}: "${trimmed.slice(0, 50)}"`);
     return res.json({ status: 'accepted', classification: 'dnc' });
+  }
+
+  // v2.14 — CHANNEL GATE, non-SMS (email / social / unidentifiable). Phase 2
+  // owns these channels; until it ships they get no ownership stamp, no
+  // analyzer pipeline, and no ghl.reply_received (which the reply backstop
+  // rule fires on). A distinct bookkeeping event type keeps the inbound
+  // visible for forensics without matching any rule, and the engagement
+  // timestamp still lands so lead intelligence doesn't go blind.
+  if (channel !== 'sms') {
+    try { await upsertLeadIntelligence(contactId, { last_reply_at: new Date().toISOString(), last_engagement_at: new Date().toISOString() }); } catch {}
+    await emitEvent({
+      event_type: 'ghl.reply_channel_excluded', event_subtype: channel, source: 'ghl_webhook',
+      entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
+      payload: { message_text: trimmed, message_type: messageType, channel, message_id: messageId, word_count: trimmed.split(/\s+/).length },
+      priority: 'low', bypass_filter: true,
+      idempotency_key: `ghl_reply_excluded_${contactId}_${messageId}`,
+    }).catch((err) => console.warn(`[BehavioralEmitter] channel-excluded event emit failed for ${contactId}: ${err.message}`));
+    console.log(`[BehavioralEmitter] ${channel} inbound from ${contactId} — agentic bot is SMS-only this phase (Phase 2 covers email/social), no stamp, no reply pipeline`);
+    return res.json({ status: 'accepted', classification: 'channel_excluded', channel });
+  }
+
+  // v2.14 — SMS confirmed: stamp conversation ownership before anything else
+  // so the responder rules' has_tag: agentic-active gate passes on turn 1.
+  // Fail-soft; returns the fetched contact for reuse by the trivial filter.
+  let stampedContact = null;
+  try {
+    const stampResult = await ensureAgenticOwnershipStamp(contactId);
+    stampedContact = stampResult.contact;
+  } catch (err) {
+    console.warn(`[OwnershipStamp] unexpected stamp error for ${contactId} (fail-soft): ${err.message}`);
   }
 
   // v2.11: Trivial filter has an agentic-ownership escape hatch.
@@ -616,7 +767,10 @@ async function handleReply(req, res) {
   // agentic-active after contact 0kk3xz6XatILy8jajymX (Mark Test) hit
   // the same v2.5 bug — see header for full diagnosis.
   if (isTrivialMessage(trimmed)) {
-    const ghlContact = await fetchGHLContact(contactId);
+    // v2.14: reuse the contact the ownership stamp already fetched (it also
+    // reflects a just-applied agentic-active). Fetch only if the stamp took
+    // the snapshot fast-path and never touched GHL.
+    const ghlContact = stampedContact || await fetchGHLContact(contactId);
     const lowercasedTags = Array.isArray(ghlContact?.tags)
       ? ghlContact.tags.map(t => String(t).toLowerCase())
       : [];
@@ -636,7 +790,7 @@ async function handleReply(req, res) {
       await emitEvent({
         event_type: 'ghl.reply_received', event_subtype: 'trivial', source: 'ghl_webhook',
         entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
-        payload: { message_text: trimmed, message_type: messageType, message_id: messageId, engagement_quality: 'neutral', word_count: trimmed.split(/\s+/).length },
+        payload: { message_text: trimmed, message_type: messageType, channel, message_id: messageId, engagement_quality: 'neutral', word_count: trimmed.split(/\s+/).length },
         priority: 'low', idempotency_key: `ghl_reply_trivial_${contactId}_${Date.now()}`,
       });
       return res.json({ status: 'accepted', classification: 'trivial' });
@@ -654,7 +808,7 @@ async function handleReply(req, res) {
   const emittedEvent = await emitEvent({
     event_type: 'ghl.reply_received', event_subtype: 'pending_analysis', source: 'ghl_webhook',
     entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
-    payload: { message_text: trimmed, message_type: messageType, message_id: messageId, word_count: trimmed.split(/\s+/).length },
+    payload: { message_text: trimmed, message_type: messageType, channel, message_id: messageId, word_count: trimmed.split(/\s+/).length },
     priority: 'high', idempotency_key: `ghl_reply_${contactId}_${Date.now()}`,
   });
   console.log(`[BehavioralEmitter] Substantive reply from ${contactId} (${trimmed.split(/\s+/).length} words, type=${messageType}) → buffered for ${REPLY_DEBOUNCE_MS}ms`);

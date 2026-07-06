@@ -712,7 +712,14 @@ export async function processApprovalQueue() {
         const channel = sendAction.action_payload?.channel || 'sms';
 
         console.log(`[ActionExecutor] Pre-generating AI response for approval ${batchId} (send_message action ${sendAction.id})`);
-        const generated = await generateResponse(sendAction.target_id, channel, triggerMessage);
+        // 2026-07-06 — prompt_hint plumb (Bot 2/3/4 consolidation): a rule or
+        // dispatch row may carry an approved script in params.prompt_hint;
+        // the generator treats it as the reply's backbone (SCRIPT DIRECTIVE).
+        const generated = await generateResponse(sendAction.target_id, channel, triggerMessage, {
+          promptHint: sendAction.action_payload?.prompt_hint || null,
+          // 2026-07-06 — request-first routing (see send-message-handler).
+          requestedFulfillment: ctx.requested_fulfillment || null,
+        });
 
         if (generated.short_circuit) {
           console.log(`[ActionExecutor] Pre-gen short-circuit (intent: ${generated.intent_class}, ` +

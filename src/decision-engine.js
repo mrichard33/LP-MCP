@@ -3,6 +3,18 @@
  *
  * The brain of the agentic system.
  *
+ * v2.17 — 2026-07-06. Three context operators for the Bot 2/3/4 consolidation
+ *   (agentic conversation system build):
+ *     - payload_field_eq {field, value} — exact payload match (strings
+ *       case-insensitive). Used by the SMS channel gate on responder rules.
+ *     - analysis_occurrence_gte / analysis_occurrence_lt {field, values|value,
+ *       count, window_days?, consecutive?} — occurrence counts over the
+ *       contact's ai.analysis_completed history in system_events. Replaces
+ *       the Conversation AI loop counters (pricing strikes, objection-family
+ *       repeats, unclear-turn loops) with reads; no DB counters. The current
+ *       event counts (events are stored before processing). All three fail
+ *       closed on malformed specs or unreadable data.
+ *
  * v2.16 — 2026-06-02. Action priority lanes for rule-created actions.
  *   createActionsFromRule now sets agent_actions.priority from a per-type
  *   default map (resolveActionPriority), so time-sensitive customer-facing
@@ -711,6 +723,18 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
       case 'entry_source_eq': if (merged.entry_source !== expected) return false; break;
       case 'recommended_action_eq': if (merged.recommended_action !== expected) return false; break;
       case 'recommended_action_neq': if (merged.recommended_action === expected) return false; break;
+      // v2.17 — not-in-list variant. The generic responder
+      // (AGENTIC_RESPOND_POST_CHATBOT) stands down for every intent whose
+      // reply is owned by a layer3 dispatch row / strike rule; a single-value
+      // neq can't express that once there are seven such intents.
+      case 'recommended_action_nin': {
+        const blocked = Array.isArray(expected) ? expected : [expected];
+        if (blocked.includes(merged.recommended_action)) {
+          console.log(`[Context] BLOCKED: recommended_action "${merged.recommended_action}" in nin-list`);
+          return false;
+        }
+        break;
+      }
       case 'fast_track_eligible': if (!!merged.fast_track_eligible !== !!expected) return false; break;
       case 'lead_score_gte': case 'lead_score_lte': {
         const v = numOrNull('lead_score');
@@ -923,6 +947,101 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
         const turnCount = await countThreadTurns(event.ghl_contact_id, 60);
         if (turnCount < expected) {
           console.log(`[Context] BLOCKED: thread_turn_count ${turnCount} < ${expected} (60-min window)`);
+          return false;
+        }
+        break;
+      }
+
+      // v2.17 — payload_field_eq: {field, value}. Exact match against an
+      // event payload field. Strings compare case-insensitively (channel
+      // values arrive as 'SMS'/'sms' depending on producer); everything else
+      // is strict equality. Absent field = missing data → fail closed, per
+      // doctrine — a channel gate must not pass because the producer hasn't
+      // started emitting the field yet.
+      case 'payload_field_eq': {
+        if (!expected || typeof expected !== 'object' || typeof expected.field !== 'string' || !('value' in expected)) {
+          return failClosed(key, 'malformed spec — expected {field, value}');
+        }
+        const actual = payload[expected.field];
+        if (actual === undefined || actual === null) {
+          return failClosed(key, `payload.${expected.field} absent`);
+        }
+        const want = expected.value;
+        const matches = (typeof actual === 'string' && typeof want === 'string')
+          ? actual.toLowerCase() === want.toLowerCase()
+          : actual === want;
+        if (!matches) {
+          console.log(`[Context] BLOCKED: payload_field_eq — payload.${expected.field} "${actual}" !== "${want}"`);
+          return false;
+        }
+        break;
+      }
+
+      // v2.17 — occurrence counting over the contact's analysis history.
+      // Replaces the Conversation AI loop counters (pricing strikes, repeated
+      // objection families, unclear-turn loops) with reads over
+      // system_events, so no DB counters are maintained.
+      //
+      //   "analysis_occurrence_gte": {
+      //     "field": "objection_type",        // key inside ai.analysis_completed payload
+      //     "values": ["price"],              // OR-set; or "value" for a single match
+      //     "count": 2,
+      //     "window_days": 30,                // optional; default unbounded
+      //     "consecutive": false              // true = the most recent N analyses ALL match
+      //   }
+      //
+      // The current event is included in the count (events are stored before
+      // processing), so "2nd pricing strike" is simply count: 2.
+      // analysis_occurrence_lt is the complement (pass while occurrences are
+      // BELOW count) so a default responder can stand down on strike turns.
+      // Malformed specs and query errors fail closed, consistent with the
+      // 2026-07-03 doctrine above.
+      case 'analysis_occurrence_gte':
+      case 'analysis_occurrence_lt': {
+        const spec = expected;
+        const wanted = spec && typeof spec === 'object'
+          ? (Array.isArray(spec.values) ? spec.values : ('value' in spec ? [spec.value] : null))
+          : null;
+        const threshold = spec ? Number(spec.count) : NaN;
+        if (!spec || typeof spec.field !== 'string' || !wanted || wanted.length === 0 || !Number.isFinite(threshold) || threshold < 1) {
+          return failClosed(key, 'malformed spec — expected {field, values|value, count, window_days?, consecutive?}');
+        }
+        if (!event?.ghl_contact_id) return failClosed(key, 'no ghl_contact_id on event');
+        const wantedSet = wanted.map(v => String(v));
+        let occurrences;
+        if (spec.consecutive === true) {
+          // Most recent N analyses must all match (e.g. 3 unclear turns in a row).
+          const { data: recent, error: recErr } = await supabase.from('system_events')
+            .select('payload')
+            .eq('event_type', 'ai.analysis_completed')
+            .eq('ghl_contact_id', event.ghl_contact_id)
+            .order('created_at', { ascending: false })
+            .limit(threshold);
+          if (recErr) return failClosed(key, `system_events lookup failed: ${recErr.message}`);
+          const allMatch = Array.isArray(recent) && recent.length >= threshold
+            && recent.every(r => wantedSet.includes(String(r?.payload?.[spec.field])));
+          occurrences = allMatch ? threshold : 0;
+        } else {
+          let query = supabase.from('system_events')
+            .select('id', { count: 'exact', head: true })
+            .eq('event_type', 'ai.analysis_completed')
+            .eq('ghl_contact_id', event.ghl_contact_id)
+            .in(`payload->>${spec.field}`, wantedSet);
+          const windowDays = Number(spec.window_days);
+          if (Number.isFinite(windowDays) && windowDays > 0) {
+            query = query.gte('created_at', new Date(Date.now() - windowDays * 86_400_000).toISOString());
+          }
+          const { count, error: cntErr } = await query;
+          if (cntErr) return failClosed(key, `system_events count failed: ${cntErr.message}`);
+          if (typeof count !== 'number') return failClosed(key, 'system_events count unavailable');
+          occurrences = count;
+        }
+        if (key === 'analysis_occurrence_gte' && occurrences < threshold) {
+          console.log(`[Context] BLOCKED: analysis_occurrence ${occurrences} < ${threshold} (${spec.field} in [${wantedSet.join(',')}])`);
+          return false;
+        }
+        if (key === 'analysis_occurrence_lt' && occurrences >= threshold) {
+          console.log(`[Context] BLOCKED: analysis_occurrence ${occurrences} >= ${threshold} (${spec.field} in [${wantedSet.join(',')}])`);
           return false;
         }
         break;
