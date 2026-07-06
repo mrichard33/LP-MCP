@@ -513,17 +513,16 @@ export async function getProofPoints(category, arcId, limit = 3) {
 
 export async function searchFaqs(messageText, channel = 'sms', limit = 3) {
   if (!messageText) return [];
-  const tsQuery = String(messageText)
+  const terms = String(messageText)
     .replace(/[^a-zA-Z0-9 ]/g, ' ')
     .trim()
     .split(/\s+/)
     .filter(w => w.length > 2)
-    .slice(0, 6)
-    .join(' & ');
+    .slice(0, 6);
 
-  if (!tsQuery) return [];
+  if (terms.length === 0) return [];
 
-  try {
+  const runSearch = async (tsQuery, label) => {
     const { data, error } = await supabase
       .from('kb_faqs')
       .select('question_pattern, canonical_answer, answer_short, story_arc, channel, tier')
@@ -531,18 +530,31 @@ export async function searchFaqs(messageText, channel = 'sms', limit = 3) {
       .in('channel', [channel, 'both'])
       .textSearch('question_pattern', tsQuery, { type: 'websearch', config: 'english' })
       .limit(limit);
-
     if (error) {
-      console.warn('[KBRetriever] searchFaqs textSearch error:', error.message);
-      return await safeFetch(
-        selectFromActive('kb_faqs', 'question_pattern, canonical_answer, answer_short, story_arc, channel, tier')
-          .in('channel', [channel, 'both'])
-          .ilike('question_pattern', `%${messageText.slice(0, 100)}%`)
-          .limit(limit),
-        'searchFaqs ilike fallback'
-      );
+      console.warn(`[KBRetriever] searchFaqs ${label} error:`, error.message);
+      return null;
     }
     return data || [];
+  };
+
+  try {
+    // AND pass first (precise), then OR the same terms when it comes back
+    // empty: one colloquial extra word ("guys", "y'all") must not zero out
+    // an exact-topic FAQ — with no FAQ in the pack the model is free to
+    // invent product claims, which is the worse failure.
+    let data = await runSearch(terms.join(' & '), 'AND pass');
+    if (data && data.length === 0 && terms.length > 1) {
+      data = await runSearch(terms.join(' OR '), 'OR fallback');
+    }
+    if (data !== null) return data;
+
+    return await safeFetch(
+      selectFromActive('kb_faqs', 'question_pattern, canonical_answer, answer_short, story_arc, channel, tier')
+        .in('channel', [channel, 'both'])
+        .ilike('question_pattern', `%${messageText.slice(0, 100)}%`)
+        .limit(limit),
+      'searchFaqs ilike fallback'
+    );
   } catch (err) {
     console.warn('[KBRetriever] searchFaqs threw:', err.message);
     return [];

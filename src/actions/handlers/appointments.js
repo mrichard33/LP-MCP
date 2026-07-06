@@ -99,6 +99,7 @@ import { executeCreateTask } from './tasks.js';
 import { getContactCached } from '../contact-cache.js';
 import { isPlaceholderName } from '../../services/identity-extraction.js';
 import { emitEvent } from '../../event-emitter.js';
+import { syncCancelledAppointmentState } from './appointment-field-sync.js';
 
 // Tags cleared once a booking lands (or the flow otherwise terminates) so the
 // post-qualification affirmative-gate bypass (intent-classifier.js) doesn't
@@ -574,12 +575,25 @@ export async function executeCancelAppointment(action) {
 
   await ghlFetch('PUT', `/calendars/events/appointments/${appointmentId}`, { appointmentStatus: newStatus });
   console.log(`[ActionExecutor] ✅ Appointment ${appointmentId} status → ${newStatus}${reason ? ` (reason: ${reason})` : ''} [resolved_from: ${resolvedFrom}]`);
+
+  // Mirror the cancellation onto the contact record + LP snapshot so
+  // downstream context never reads the cancelled appointment as upcoming.
+  // Idempotent with the ghl.appointment_cancelled webhook path; fail-soft.
+  let fieldSync = null;
+  if (action.target_id && ['cancelled', 'noshow', 'no-show'].includes(String(newStatus).toLowerCase())) {
+    fieldSync = await syncCancelledAppointmentState(action.target_id, {
+      appointmentId,
+      calendarId: payload.calendar_id || null,
+    }).catch(() => null);
+  }
+
   return {
     action: 'appointment_updated',
     appointment_id: appointmentId,
     new_status: newStatus,
     reason,
     resolved_from: resolvedFrom,
+    field_sync: fieldSync,
   };
 }
 
@@ -651,6 +665,15 @@ export async function executeUpdateAppointmentStatus(action /*, context */) {
 
   await ghlFetch('PUT', `/calendars/events/appointments/${appointmentId}`, { appointmentStatus: status });
   console.log(`[ActionExecutor] ✅ Appointment ${appointmentId} status → ${status} [resolved_from: ${resolvedFrom}, dm=${dmPresent ?? 'absent'}]`);
+
+  // Cancels/no-shows through this action get the same mirror sync as
+  // executeCancelAppointment (fail-soft, idempotent with the webhook path).
+  if (contactId && ['cancelled', 'noshow', 'no-show'].includes(String(status).toLowerCase())) {
+    await syncCancelledAppointmentState(contactId, {
+      appointmentId,
+      calendarId: payload.calendar_id || null,
+    }).catch(() => {});
+  }
 
   // Persist qualifying data (Decision Makers Present + Window Count). Best-effort.
   let qualifyingDataFieldsWritten = 0;

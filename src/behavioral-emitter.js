@@ -235,6 +235,7 @@ import supabase from './supabase.js';
 import { applyGHLTag } from './ghl.js';
 import { resolveEntryFromSourceMap, entryTagSuffix } from './entry-source-map.js';
 import { executeAddTag } from './actions/handlers/tags.js';
+import { syncCancelledAppointmentState } from './actions/handlers/appointment-field-sync.js';
 // 2026-07-03 — hard message-level dedup (Steve Nkzhm incident): every inbound
 // gets a non-null message key, and the buffer flush atomically claims its
 // keys so the solo analyzePendingReplies poller can never re-analyze them.
@@ -688,6 +689,13 @@ async function handleReply(req, res) {
   // contactId fallback above and is not a message id (using it would key the
   // lock to the contact and over-suppress). Falls back to null when absent.
   const rawMessageId = cleanGHLValue(body.messageId) || cleanGHLValue(body.message_id) || null;
+  // 2026-07-06 — from-number inheritance hardening: capture the number the
+  // lead texted (the inbound message's destination) when the webhook carries
+  // it. reply-sender's live conversation scan stays the primary fromNumber
+  // source; this persisted copy is its fallback when the scan fails open or
+  // finds no inbound SMS. Defensive across naming shapes.
+  const inboundTo = cleanGHLValue(body.to) || cleanGHLValue(body.toNumber)
+    || cleanGHLValue(body.to_number) || cleanGHLValue(body.toPhone) || null;
 
   if (!contactId) return res.status(400).json({ error: 'Missing contactId in webhook payload' });
   const trimmed = messageText.trim();
@@ -808,7 +816,7 @@ async function handleReply(req, res) {
   const emittedEvent = await emitEvent({
     event_type: 'ghl.reply_received', event_subtype: 'pending_analysis', source: 'ghl_webhook',
     entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
-    payload: { message_text: trimmed, message_type: messageType, channel, message_id: messageId, word_count: trimmed.split(/\s+/).length },
+    payload: { message_text: trimmed, message_type: messageType, channel, message_id: messageId, word_count: trimmed.split(/\s+/).length, ...(inboundTo ? { inbound_to: inboundTo } : {}) },
     priority: 'high', idempotency_key: `ghl_reply_${contactId}_${Date.now()}`,
   });
   console.log(`[BehavioralEmitter] Substantive reply from ${contactId} (${trimmed.split(/\s+/).length} words, type=${messageType}) → buffered for ${REPLY_DEBOUNCE_MS}ms`);
@@ -940,6 +948,18 @@ async function handleAppointment(req, res) {
     priority: 'high', idempotency_key: idempotencyKey,
   });
   console.log(`[BehavioralEmitter] Appointment ${eventType} for ${contactId} (calendar: ${calendarId}, date: ${startDate}, time: ${startTime}, status: ${status})`);
+
+  // 2026-07-06: mirror cancellations/no-shows onto the contact record + LP
+  // snapshot at intake — this is the single choke point every cancel passes
+  // through (agentic PUTs, rep-side GHL-UI cancels, lead cancel links all
+  // fire this webhook). Without it the appointment custom fields and
+  // lp_leads.appointment_set keep describing the cancelled visit as
+  // upcoming. Fire-and-forget: the webhook ack must not wait on GHL writes.
+  if (eventType === 'ghl.appointment_cancelled' || eventType === 'ghl.appointment_no_show') {
+    syncCancelledAppointmentState(contactId, { appointmentId, calendarId })
+      .catch(err => console.warn(`[BehavioralEmitter] cancelled-appointment field sync failed for ${contactId}: ${err.message}`));
+  }
+
   return res.json({ status: 'accepted', event_type: eventType });
 }
 
