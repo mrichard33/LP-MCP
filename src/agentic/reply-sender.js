@@ -30,6 +30,7 @@
 
 import { acquireToken, report429 } from '../ghl-rate-limiter.js';
 import { emitEvent } from '../event-emitter.js';
+import supabase from '../supabase.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
@@ -199,6 +200,33 @@ async function fetchRecentMessages(contactId) {
   return { conversationId, messages: Array.isArray(messages) ? messages : [] };
 }
 
+/**
+ * 2026-07-06 — from-number hardening. Second source for the outbound
+ * fromNumber: the inbound webhook now persists the number the lead texted
+ * as payload.inbound_to on ghl.reply_received. Used when the live
+ * conversation scan can't produce it (context fetch failed open, or no
+ * inbound SMS within the 20-message window) so the reply still goes out
+ * from the number the lead texted instead of the GHL assignedTo default.
+ * Fail-soft: any error returns null.
+ */
+async function fetchLastInboundToFromEvents(contactId) {
+  try {
+    const { data, error } = await supabase
+      .from('system_events')
+      .select('payload')
+      .eq('ghl_contact_id', contactId)
+      .eq('event_type', 'ghl.reply_received')
+      .not('payload->>inbound_to', 'is', null)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (error || !data?.length) return null;
+    const v = data[0]?.payload?.inbound_to;
+    return (typeof v === 'string' && v.trim()) ? v.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
 async function contactHasPhone(contactId) {
   try {
     const data = await ghlGet(`/contacts/${contactId}`);
@@ -237,12 +265,21 @@ export async function resolveReplyContext(contactId, { requestedChannel = null, 
     derived = deriveInboundContext(fetched.messages);
   } catch (err) {
     console.warn(`[reply-sender] resolveReplyContext fetch failed for ${contactId}: ${err.message} — falling back to requested channel`);
+    // Even fail-open, try the persisted inbound_to so the reply still
+    // threads from the number the lead texted (from-number hardening).
+    const fallbackChannel = requestedChannel || 'sms';
+    const eventInboundTo = fallbackChannel === 'sms'
+      ? await fetchLastInboundToFromEvents(contactId)
+      : null;
+    if (fallbackChannel === 'sms' && !eventInboundTo) {
+      console.warn(`[reply-sender] from_number_fallback_default for ${contactId}: no resolved fromNumber (fail-open path) — GHL will send from the assignedTo/location default`);
+    }
     return {
-      channel: requestedChannel || 'sms',
-      channelType: (requestedChannel || 'sms') === 'email' ? 'Email' : 'SMS',
+      channel: fallbackChannel,
+      channelType: fallbackChannel === 'email' ? 'Email' : 'SMS',
       downgraded: false,
       reason: 'context_fetch_failed_open',
-      fromNumber: null,
+      fromNumber: eventInboundTo,
       conversationId: null,
       inboundOrigin: null,
       livechatAgeMin: null,
@@ -287,9 +324,19 @@ export async function resolveReplyContext(contactId, { requestedChannel = null, 
     }).catch((err) => console.warn(`[reply-sender] downgrade event emit failed: ${err.message}`));
   }
 
+  // fromNumber: conversation scan first (freshest), then the persisted
+  // inbound_to from the reply event (from-number hardening 2026-07-06).
+  let fromNumber = null;
+  if (decision.channel === 'sms') {
+    fromNumber = derived.inboundSmsTo || await fetchLastInboundToFromEvents(contactId);
+    if (!fromNumber) {
+      console.warn(`[reply-sender] from_number_fallback_default for ${contactId}: no inbound SMS 'to' in the last 20 messages and no persisted inbound_to — GHL will send from the assignedTo/location default`);
+    }
+  }
+
   return {
     ...decision,
-    fromNumber: decision.channel === 'sms' ? (derived.inboundSmsTo || null) : null,
+    fromNumber,
     conversationId,
     inboundOrigin: derived.inboundOrigin,
     livechatAgeMin: derived.livechatAgeMin,

@@ -346,6 +346,7 @@ Buyer stage (#1-5) drives the MESSAGE (see BUYER STAGES); funnel stage drives th
 ═══════ COMPLIANCE HARD RULES (zero exceptions) ═══════
 - Never name an insurance carrier. Never predict claim or premium outcomes.
 - Never quote prices, ranges, or ballparks. Ever.
+- PRODUCT CLAIMS: never state that we sell, carry, install, or offer a product, material, or service unless the KB CONTEXT in this prompt confirms it. Reece sells vinyl impact windows and doors — if a lead asks about a product or frame material the KB does not confirm (aluminum, wood, etc.), answer from the FAQ MATCHES when present; otherwise use the UNKNOWN ANSWERS script above. NEVER guess or agree that we carry something.
 - NEVER advise on rescission windows, cancellation deadlines, or contract-change terms — requests to change or cancel a signed contract go to a human, and your reply contains ZERO information about rescission or deadlines.
 - No fake scarcity, no countdown pressure, no promise of price reduction. Real urgency (install lead times, permit timelines, hurricane-season math) is fine — facts, not countdowns.
 - Compliance-adjacent questions the scripts above can't cover (carrier specifics, claim disputes, permit disputes) → route to a human, never improvise.
@@ -645,6 +646,9 @@ Whenever this turn is part of the CANCELLATION FLOW, set the top-level "cancel_f
   - "cancelled" — you emitted the cancel_appointment companion this turn.
   - "rescheduled" — you emitted the reschedule_appointment companion this turn.
   - null — this turn is not part of a cancellation flow.
+
+▼ QUALIFYING DATA REPORTING (2026-07-06 — answers persist, questions never repeat)
+Whenever the lead's message STATES a decision-maker answer or a window count — on ANY turn, booking or not — also set the top-level "qualifying_data" field with what they stated ("my wife will be there too" → {"decision_makers_present": "Yes"}; "it's just me, I own the place" → {"decision_makers_present": "Solo Owner"}). Same value rules as companion qualifying_data: only the four exact decision_makers_present values, only what the lead actually said, never inferred, never defaulted. Leave the field null when the turn states neither. This persists their answer to the contact record so no one — including you — ever re-asks a question they already answered.
 
 ▼ STATE 3 — HARD CONFIRMATION OF RESCHEDULE TIME (after STATE 2 case A or C)
 Lead picks one of the proposed reschedule slots. Treat as HARD CONFIRMATION but emit reschedule_appointment instead of book_appointment.
@@ -966,6 +970,7 @@ Return ONLY a valid JSON object. The very first character MUST be { and the very
   "voice_used": "we",
   "frameworks_applied": ["antifragile","expert_secrets","traffic_secrets","dotcom_secrets"],
   "cancel_flow_state": null | "save_attempt" | "cancelled" | "rescheduled",
+  "qualifying_data": null | { "decision_makers_present": "Yes" | "No" | "Solo Owner" | "Uncertain", "window_count": <int, optional> },
   "reasoning": "1 sentence explaining your strategy",
   "companion_action": null | {
     "action_type": "book_appointment" | "cancel_appointment" | "reschedule_appointment" | "update_appointment_status" | "guide_disposition",
@@ -1486,6 +1491,7 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     parts.push(`  • Do NOT include any booking link.`);
     parts.push(`  • Instead, keep the conversation moving and naturally ask for ONE missing item: ${askText}. One question only — the rest come on later turns (order: name → address → decision-makers).`);
     parts.push(`  • NEVER ask for anything the KNOWN CONTACT PROFILE already shows — those are on file.`);
+    parts.push(`  • ALREADY-ANSWERED CHECK (decision-makers): before asking the decision-maker question, scan the CONVERSATION HISTORY. If the lead has ALREADY answered it in this conversation ("my wife will be there", "it's just me, I own the place"), do NOT ask again — treat it as answered, report the stated value in the top-level qualifying_data field, and ask the next missing item instead (or proceed if nothing else is missing). Re-asking an answered question reads as not listening and kills trust.`);
     parts.push(`  • If the lead pushes to lock a time right now, warmly explain you just need this detail to get the visit scheduled correctly, then ask it.`);
     parts.push(`═══════ END IN-HOME BOOKING PREREQUISITES ═══════`);
   } else if (bcg && bcg.requires_in_home_gate === true) {
@@ -1524,6 +1530,10 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   if (context.lp?.appointment_is_past === true) {
     const n = Math.abs(context.lp.appointment_days_delta || 0);
     parts.push(`(1.6) PAST APPOINTMENT — RESCHEDULE (GOVERNS THIS TURN): the LP appointment on ${context.lp.appointment_date} is ${n} day${n === 1 ? '' : 's'} in the PAST. Do NOT confirm it, hold it, or call it upcoming. If the lead asks about their appointment, state that date AND that it has already passed, then offer to rebook with TWO specific new slots from CALENDAR AVAILABILITY (ASK-FIRST). This overrides the auto-book/closing-ack branches below for this turn.`);
+  }
+  if (context.lp?.appointment_cancelled === true) {
+    const when = context.lp.last_appointment_date ? ` (was ${context.lp.last_appointment_date})` : '';
+    parts.push(`(1.65) CANCELLED APPOINTMENT: this lead's appointment${when} was CANCELLED. Never reference it as upcoming, never anchor anything to it ("your visit", "see you then"). The lead has NO appointment right now. Offer to rebook ONLY if the lead signals interest — do not push.`);
   }
   if (opts.bookingGate && !opts.bookingGate.ok && kbPack?.booking_context?.requires_in_home_gate === true) {
     parts.push(`(1.7) IN-HOME PREREQUISITES NOT SATISFIED (GOVERNS THIS TURN, overrides (2) and (5)): per the IN-HOME BOOKING PREREQUISITES block above — no time proposals, no holds, no booking companion, no link. Ask for the single next missing item instead.`);
@@ -1873,6 +1883,14 @@ function validateResponse(parsed, channel) {
     ? parsed.cancel_flow_state
     : null;
 
+  // 2026-07-06 — top-level qualifying data: the lead's stated decision-maker
+  // answer / window count persists on ANY turn (send-handler queues the
+  // field write), not just inside booking companions — so an answered
+  // question is never re-asked on the next booking attempt.
+  const qualifyingData = (parsed.qualifying_data && typeof parsed.qualifying_data === 'object')
+    ? normalizeQualifyingData(parsed.qualifying_data)
+    : null;
+
   // v2.7.8: dispatch companion validation by action_type. Four supported:
   // book_appointment, cancel_appointment, reschedule_appointment, and
   // update_appointment_status (2026-06-03, book-then-capture upgrade). Each
@@ -1909,6 +1927,7 @@ function validateResponse(parsed, channel) {
     voice_used: voice,
     frameworks_applied: frameworksApplied,
     cancel_flow_state: cancelFlowState,
+    qualifying_data: qualifyingData,
     reasoning: String(parsed.reasoning || '').slice(0, 500),
     companion_action: companionAction,
   };

@@ -1684,6 +1684,40 @@ export async function executeSendMessage(action, context) {
       }
     }
 
+    // 2026-07-06 — QUALIFYING DATA PERSISTENCE (Mark Test DM re-ask incident):
+    // when the lead's message stated a decision-maker answer or window count
+    // on a turn with NO booking companion, the model reports it in the
+    // top-level qualifying_data field. Persist it to the contact record so
+    // the in-home gate never re-asks an answered question. Companion turns
+    // already persist via persistQualifyingData in the appointment handlers —
+    // skip here to avoid a duplicate write. Failure-soft: the send happened.
+    if (generated && generated.qualifying_data && !generated.companion_action) {
+      try {
+        const qd = generated.qualifying_data;
+        const fields = [];
+        if (qd.decision_makers_present) {
+          fields.push({ id: 'GH1QGGOseMKmJAMqajiN', field_value: qd.decision_makers_present });
+        }
+        if (qd.window_count) {
+          fields.push({ id: 'h9FJTUbmUHIuD6JKmpXv', field_value: qd.window_count });
+        }
+        if (fields.length) {
+          await supabase.from('agent_actions').insert({
+            event_id: action.event_id || null,
+            action_type: 'update_custom_fields', target_system: 'ghl', target_entity: 'contact',
+            target_id: contactId,
+            action_payload: { fields },
+            reasoning: `Lead stated qualifying data mid-conversation (${fields.map(f => f.id === 'GH1QGGOseMKmJAMqajiN' ? `decision_makers_present=${qd.decision_makers_present}` : `window_count=${qd.window_count}`).join(', ')}) — persisting so the question is never re-asked`,
+            confidence: 1.0, rule_applied: 'QUALIFYING_DATA_PERSIST', status: 'pending',
+            requires_approval: false,
+          });
+          console.log(`[SendMessage] qualifying data queued for ${contactId}: ${fields.length} field(s)`);
+        }
+      } catch (qdErr) {
+        console.warn(`[SendMessage] qualifying data persist failed for ${contactId} (fail-soft): ${qdErr.message}`);
+      }
+    }
+
     // GroupMe notification (v3.6: rich format). If any resolver fails,
     // the notification still goes out — fall back to what is available.
     try {

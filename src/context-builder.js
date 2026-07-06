@@ -114,6 +114,15 @@ const LP_ACTIVE_DISPOSITIONS = new Set([
   'CXL', 'PNQ', 'NoRehash', 'FDNS', 'OPPFDN',
 ]);
 
+// 2026-07-06: dispositions meaning the LP-recorded appointment was
+// cancelled. lp_leads.appointment_set is only ever written true (LP
+// ingest); no cancel path resets it, so a CXL lead otherwise reads as
+// having an upcoming appointment and the responder references the
+// cancelled visit as still on the calendar (Mark Test "your visit
+// Wednesday" incident). Effective-appointment derivation lives where
+// the lp context block is assembled.
+const LP_CANCELLED_APPT_DISPOSITIONS = new Set(['CXL']);
+
 // ═══════════════════════════════════════════════════════════════════
 // IN-MEMORY CACHE
 // ═══════════════════════════════════════════════════════════════════
@@ -728,6 +737,16 @@ export async function buildLeadContext(ghlContactId, options = {}) {
   const nowInstant = new Date();
   const apptDelta = appointmentDelta(lpLead?.appointment_date, nowInstant);
 
+  // 2026-07-06: effective appointment state. The snapshot flag is stale
+  // after a cancellation (never reset by any cancel path), so treat the
+  // appointment as cancelled when the LP disposition says so OR the GHL
+  // cancel flow tagged the contact — unless a fresh booking is active
+  // (booking:active), which always wins.
+  const apptCancelled = !tags.includes('booking:active') && (
+    (!!lpLead?.appointment_set && LP_CANCELLED_APPT_DISPOSITIONS.has(lpLead?.disposition_code))
+    || tags.includes('appt-cancelled')
+  );
+
   const context = {
     now: {
       iso: nowInstant.toISOString(),
@@ -805,11 +824,17 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       promoter_name: lpLead?.promoter_name || null,
       source: lpLead?.lead_source || null,
       source_detail: lpLead?.lead_source_detail || null,
-      appointment_set: lpLead?.appointment_set || false,
-      appointment_date: lpLead?.appointment_date || null,
+      // Effective appointment state (see apptCancelled above): a cancelled
+      // appointment reads as NO appointment, with the old date preserved in
+      // last_appointment_date so prompts can say "your appointment on X was
+      // cancelled" instead of treating it as upcoming.
+      appointment_set: apptCancelled ? false : (lpLead?.appointment_set || false),
+      appointment_cancelled: apptCancelled,
+      appointment_date: apptCancelled ? null : (lpLead?.appointment_date || null),
+      last_appointment_date: apptCancelled ? (lpLead?.appointment_date || null) : null,
       // Signed whole-day delta from today (ET); negative = past. null when no appt.
-      appointment_is_past: apptDelta ? apptDelta.is_past : null,
-      appointment_days_delta: apptDelta ? apptDelta.days_delta : null,
+      appointment_is_past: apptCancelled ? null : (apptDelta ? apptDelta.is_past : null),
+      appointment_days_delta: apptCancelled ? null : (apptDelta ? apptDelta.days_delta : null),
       demo_completed: lpLead?.demo_completed || false,
       demo_date: lpLead?.demo_date || null,
       days_to_demo: lpLead?.days_to_demo || null,
