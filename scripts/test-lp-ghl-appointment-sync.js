@@ -276,11 +276,46 @@ test('dnc tag → Set noop dnc_consent, but CXL still cancels', async () => {
   assert.equal(cxlRes.outcome, 'cancelled');
 });
 
-test('appt on ANOTHER calendar → treated as none; other calendar untouched', async () => {
-  reset({ upcoming: [weAppt({ calendarId: 'gFWoSQrlKIdfRbAPV842', id: 'conf-call-1' })] }); // Conf Call (GHL-only)
+test('appt on a NON-in-home calendar (Conf Call) → does not block; other calendar untouched', async () => {
+  reset({ upcoming: [weAppt({ calendarId: 'gFWoSQrlKIdfRbAPV842', id: 'conf-call-1' })] }); // Conf Call (GHL-only, phone)
   const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
   assert.equal(res.outcome, 'created');
   assert.equal(calls.filter((c) => c.method === 'PUT').length, 0); // never touched conf-call-1
+});
+
+test('active MV or HPA appointment → Set/Cnf blocked (no duplicate WE), object untouched', async () => {
+  const HPA = 'zS1wg0JqQ1zsszJyJqKX';
+  const MV = 'zEdPmkNccR2ovo3rQAd3';
+  for (const calId of [HPA, MV]) {
+    for (const disp of ['Set', 'Cnf']) {
+      reset({ upcoming: [weAppt({ calendarId: calId, id: 'other-inhome-1', appointmentStatus: 'confirmed' })] });
+      const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead(disp) });
+      assert.equal(res.outcome, 'noop', `${disp} with active ${calId} must not create a WE`);
+      assert.equal(res.reason, 'active_other_in_home_appointment');
+      assert.equal(res.other_appointment_id, 'other-inhome-1');
+      assert.equal(mutations().length, 0, `${disp} with active ${calId} must not touch anything`);
+    }
+    // CXL: still WE-scoped — nothing to cancel, and the MV/HPA object survives.
+    reset({ upcoming: [weAppt({ calendarId: calId, id: 'other-inhome-1' })] });
+    const cxl = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('CXL') });
+    assert.equal(cxl.reason, 'nothing_to_cancel');
+    assert.equal(mutations().length, 0);
+  }
+});
+
+test('active WE alongside an MV → the WE is still reconciled, the MV untouched', async () => {
+  reset({
+    upcoming: [
+      weAppt({ startTime: OTHER_TIME_GHL }),
+      weAppt({ calendarId: 'zEdPmkNccR2ovo3rQAd3', id: 'mv-1', appointmentStatus: 'confirmed' }),
+    ],
+  });
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
+  assert.equal(res.outcome, 'rescheduled');
+  const puts = calls.filter((c) => c.method === 'PUT');
+  assert.equal(puts.length, 1);
+  assert.equal(puts[0].path, '/calendars/events/appointments/appt-1');
+  assert.equal(calls.filter((c) => c.path.includes('mv-1')).length, 0);
 });
 
 test('DEAD appt on WE calendar (statuses the upstream filter leaks) → create, never resurrect', async () => {

@@ -31,7 +31,7 @@ import { ghlFetch } from '../actions/helpers.js';
 import { GHL_LOCATION_ID } from '../actions/constants.js';
 import { getContactCached } from '../actions/contact-cache.js';
 import { fetchUpcomingAppointments } from '../knowledge/contact-appointments.js';
-import { BOOKING_CALENDARS } from '../knowledge/booking-calendar-router.js';
+import { BOOKING_CALENDARS, isInHomeCalendarId } from '../knowledge/booking-calendar-router.js';
 import { syncCancelledAppointmentState } from '../actions/handlers/appointment-field-sync.js';
 import { lpWallClockToGhlStartTime } from '../appointment-dates.js';
 
@@ -179,13 +179,32 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, toNotify = 
   // Only the Window Estimate calendar, only ACTIVE appointments (see
   // NON_ACTIVE_APPOINTMENT_STATUSES note above). GHL-only calendars
   // (Confirmation Call) are excluded by the calendar-id scope itself.
-  const weAppointments = upcoming.filter((a) =>
-    a.calendar_id === WINDOW_ESTIMATE_CALENDAR_ID
-    && !NON_ACTIVE_APPOINTMENT_STATUSES.has(String(a.status || '').toLowerCase()));
+  const active = upcoming.filter((a) =>
+    !NON_ACTIVE_APPOINTMENT_STATUSES.has(String(a.status || '').toLowerCase()));
+  const weAppointments = active.filter((a) => a.calendar_id === WINDOW_ESTIMATE_CALENDAR_ID);
   if (weAppointments.length > 1) {
     console.warn(`[LpGhlApptSync] contact ${contactId} has ${weAppointments.length} active WE appointments — reconciling the soonest, not auto-cancelling extras`);
   }
   const existing = weAppointments[0] || null; // list is soonest-first
+
+  // No active WE, but an active appointment on ANOTHER in-home calendar
+  // (Home Protection Assessment / Measurement Verification): creating a WE
+  // would double-book the home visit — e.g. bot books HPA → GHL→LP sync sets
+  // the LP appointment → LP emits Set → we'd mirror it back as a duplicate
+  // WE. Those calendars are never ours to touch (strict WE scope), so block
+  // creation and surface the mismatch instead.
+  if (!existing && kind !== 'cancel') {
+    const otherInHome = active.find((a) =>
+      a.calendar_id && a.calendar_id !== WINDOW_ESTIMATE_CALENDAR_ID && isInHomeCalendarId(a.calendar_id));
+    if (otherInHome) {
+      console.warn(`[LpGhlApptSync] contact ${contactId} has an active in-home appointment on calendar ${otherInHome.calendar_id} (${otherInHome.appointment_id}) — skipping WE ${kind} to avoid double-booking`);
+      return noop('active_other_in_home_appointment', {
+        other_calendar_id: otherInHome.calendar_id,
+        other_appointment_id: otherInHome.appointment_id,
+        other_start_time: otherInHome.start_time,
+      });
+    }
+  }
 
   const plan = planReconciliation({ kind, startTime, existing });
 

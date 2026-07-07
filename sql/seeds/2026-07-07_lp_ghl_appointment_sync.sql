@@ -14,8 +14,10 @@
 --
 -- RUNNER NOTES:
 --   * One statement per supabase_run_query call.
---   * Each statement is wrapped so it returns a confirmable count — expect
---     seeded = 1 from every call.
+--   * Bare top-level statements: the runner rejects data-modifying CTEs
+--     ("WITH clause containing a data-modifying statement must be at the
+--     top level", verified 2026-07-07). Confirm with the SELECT at the end
+--     of this file (expect 3 rows, all enabled).
 --   * Idempotent: ON CONFLICT (rule_key) DO UPDATE (safe to re-run).
 --   * After running: POST /n8n/decision-engine/reload-rules and assert
 --     rules_loaded increased by 3 (or wait ≤60s for the cache TTL).
@@ -37,68 +39,59 @@
 --   reconciler's idempotent same-time skip makes that race benign.
 -- ════════════════════════════════════════════════════════════════════
 
-WITH i AS (
-  INSERT INTO agent_rules (rule_key, rule_name, category, rule_type, event_pattern, conditions, context_conditions, action_template, requires_approval, enabled, priority, created_by, notes)
-  VALUES (
-    'LP_APPT_GHL_SYNC_SET',
-    'LP Set → GHL Window Estimate sync (create/reschedule, never downgrade)',
-    'appointment', 'pattern',
-    '{"event_type": "lp.disposition_changed", "payload": {"disposition_code": "Set"}}'::jsonb,
-    NULL, NULL,
-    '[{"action_type": "sync_lp_appointment_to_ghl", "target_system": "ghl", "target_entity": "contact", "priority": 20, "params": {"disposition_code": "Set"}}]'::jsonb,
-    false, true, 20, 'claude',
-    'LP→GHL appointment authority (2026-07-07). LP Set: create WE appointment status new, or reschedule in place if time differs; same-time no-op never downgrades a confirmed. Handler re-reads newest lp_leads row.'
+INSERT INTO agent_rules (rule_key, rule_name, category, rule_type, event_pattern, conditions, context_conditions, action_template, requires_approval, enabled, priority, created_by, notes)
+VALUES (
+  'LP_APPT_GHL_SYNC_SET',
+  'LP Set → GHL Window Estimate sync (create/reschedule, never downgrade)',
+  'appointment', 'pattern',
+  '{"event_type": "lp.disposition_changed", "payload": {"disposition_code": "Set"}}'::jsonb,
+  NULL, NULL,
+  '[{"action_type": "sync_lp_appointment_to_ghl", "target_system": "ghl", "target_entity": "contact", "priority": 20, "params": {"disposition_code": "Set"}}]'::jsonb,
+  false, true, 20, 'claude',
+  'LP→GHL appointment authority (2026-07-07). LP Set: create WE appointment status new, or reschedule in place if time differs; same-time no-op never downgrades a confirmed. Handler re-reads newest lp_leads row.'
   )
-  ON CONFLICT (rule_key) DO UPDATE SET
-    rule_name = EXCLUDED.rule_name, category = EXCLUDED.category, rule_type = EXCLUDED.rule_type,
-    event_pattern = EXCLUDED.event_pattern, conditions = EXCLUDED.conditions,
-    context_conditions = EXCLUDED.context_conditions, action_template = EXCLUDED.action_template,
-    requires_approval = EXCLUDED.requires_approval, enabled = EXCLUDED.enabled,
-    priority = EXCLUDED.priority, notes = EXCLUDED.notes, updated_at = now()
-  RETURNING 1
-)
-SELECT count(*) AS seeded FROM i;
+ON CONFLICT (rule_key) DO UPDATE SET
+  rule_name = EXCLUDED.rule_name, category = EXCLUDED.category, rule_type = EXCLUDED.rule_type,
+  event_pattern = EXCLUDED.event_pattern, conditions = EXCLUDED.conditions,
+  context_conditions = EXCLUDED.context_conditions, action_template = EXCLUDED.action_template,
+  requires_approval = EXCLUDED.requires_approval, enabled = EXCLUDED.enabled,
+  priority = EXCLUDED.priority, notes = EXCLUDED.notes, updated_at = now();
 
-WITH i AS (
-  INSERT INTO agent_rules (rule_key, rule_name, category, rule_type, event_pattern, conditions, context_conditions, action_template, requires_approval, enabled, priority, created_by, notes)
-  VALUES (
-    'LP_APPT_GHL_SYNC_CNF',
-    'LP Cnf → GHL Window Estimate sync (confirm, create-confirmed if missing)',
-    'appointment', 'pattern',
-    '{"event_type": "lp.disposition_changed", "payload": {"disposition_code": "Cnf"}}'::jsonb,
-    NULL, NULL,
-    '[{"action_type": "sync_lp_appointment_to_ghl", "target_system": "ghl", "target_entity": "contact", "priority": 20, "params": {"disposition_code": "Cnf"}}]'::jsonb,
-    false, true, 20, 'claude',
-    'LP→GHL appointment authority (2026-07-07). LP Cnf IS the confirmation authority (call center) — no DM backstop. Confirms the WE appointment (reschedule first if time differs), or creates it status confirmed if missing.'
+INSERT INTO agent_rules (rule_key, rule_name, category, rule_type, event_pattern, conditions, context_conditions, action_template, requires_approval, enabled, priority, created_by, notes)
+VALUES (
+  'LP_APPT_GHL_SYNC_CNF',
+  'LP Cnf → GHL Window Estimate sync (confirm, create-confirmed if missing)',
+  'appointment', 'pattern',
+  '{"event_type": "lp.disposition_changed", "payload": {"disposition_code": "Cnf"}}'::jsonb,
+  NULL, NULL,
+  '[{"action_type": "sync_lp_appointment_to_ghl", "target_system": "ghl", "target_entity": "contact", "priority": 20, "params": {"disposition_code": "Cnf"}}]'::jsonb,
+  false, true, 20, 'claude',
+  'LP→GHL appointment authority (2026-07-07). LP Cnf IS the confirmation authority (call center) — no DM backstop. Confirms the WE appointment (reschedule first if time differs), or creates it status confirmed if missing.'
   )
-  ON CONFLICT (rule_key) DO UPDATE SET
-    rule_name = EXCLUDED.rule_name, category = EXCLUDED.category, rule_type = EXCLUDED.rule_type,
-    event_pattern = EXCLUDED.event_pattern, conditions = EXCLUDED.conditions,
-    context_conditions = EXCLUDED.context_conditions, action_template = EXCLUDED.action_template,
-    requires_approval = EXCLUDED.requires_approval, enabled = EXCLUDED.enabled,
-    priority = EXCLUDED.priority, notes = EXCLUDED.notes, updated_at = now()
-  RETURNING 1
-)
-SELECT count(*) AS seeded FROM i;
+ON CONFLICT (rule_key) DO UPDATE SET
+  rule_name = EXCLUDED.rule_name, category = EXCLUDED.category, rule_type = EXCLUDED.rule_type,
+  event_pattern = EXCLUDED.event_pattern, conditions = EXCLUDED.conditions,
+  context_conditions = EXCLUDED.context_conditions, action_template = EXCLUDED.action_template,
+  requires_approval = EXCLUDED.requires_approval, enabled = EXCLUDED.enabled,
+  priority = EXCLUDED.priority, notes = EXCLUDED.notes, updated_at = now();
 
-WITH i AS (
-  INSERT INTO agent_rules (rule_key, rule_name, category, rule_type, event_pattern, conditions, context_conditions, action_template, requires_approval, enabled, priority, created_by, notes)
-  VALUES (
-    'LP_APPT_GHL_SYNC_CXL',
-    'LP CXL → GHL Window Estimate cancel (+ contact-field mirror)',
-    'appointment', 'pattern',
-    '{"event_type": "lp.disposition_changed", "payload": {"disposition_code": "CXL"}}'::jsonb,
-    NULL, NULL,
-    '[{"action_type": "sync_lp_appointment_to_ghl", "target_system": "ghl", "target_entity": "contact", "priority": 20, "params": {"disposition_code": "CXL"}}]'::jsonb,
-    false, true, 20, 'claude',
-    'LP→GHL appointment authority (2026-07-07). LP CXL: cancel the active WE appointment + syncCancelledAppointmentState field mirror. Deliberately NO reschedule-inflight marker — real customer cancellation, GHL_APPT_CANCELLED_REBOOK* rules should see it. No active appointment → nothing_to_cancel no-op.'
+INSERT INTO agent_rules (rule_key, rule_name, category, rule_type, event_pattern, conditions, context_conditions, action_template, requires_approval, enabled, priority, created_by, notes)
+VALUES (
+  'LP_APPT_GHL_SYNC_CXL',
+  'LP CXL → GHL Window Estimate cancel (+ contact-field mirror)',
+  'appointment', 'pattern',
+  '{"event_type": "lp.disposition_changed", "payload": {"disposition_code": "CXL"}}'::jsonb,
+  NULL, NULL,
+  '[{"action_type": "sync_lp_appointment_to_ghl", "target_system": "ghl", "target_entity": "contact", "priority": 20, "params": {"disposition_code": "CXL"}}]'::jsonb,
+  false, true, 20, 'claude',
+  'LP→GHL appointment authority (2026-07-07). LP CXL: cancel the active WE appointment + syncCancelledAppointmentState field mirror. Deliberately NO reschedule-inflight marker — real customer cancellation, GHL_APPT_CANCELLED_REBOOK* rules should see it. No active appointment → nothing_to_cancel no-op.'
   )
-  ON CONFLICT (rule_key) DO UPDATE SET
-    rule_name = EXCLUDED.rule_name, category = EXCLUDED.category, rule_type = EXCLUDED.rule_type,
-    event_pattern = EXCLUDED.event_pattern, conditions = EXCLUDED.conditions,
-    context_conditions = EXCLUDED.context_conditions, action_template = EXCLUDED.action_template,
-    requires_approval = EXCLUDED.requires_approval, enabled = EXCLUDED.enabled,
-    priority = EXCLUDED.priority, notes = EXCLUDED.notes, updated_at = now()
-  RETURNING 1
-)
-SELECT count(*) AS seeded FROM i;
+ON CONFLICT (rule_key) DO UPDATE SET
+  rule_name = EXCLUDED.rule_name, category = EXCLUDED.category, rule_type = EXCLUDED.rule_type,
+  event_pattern = EXCLUDED.event_pattern, conditions = EXCLUDED.conditions,
+  context_conditions = EXCLUDED.context_conditions, action_template = EXCLUDED.action_template,
+  requires_approval = EXCLUDED.requires_approval, enabled = EXCLUDED.enabled,
+  priority = EXCLUDED.priority, notes = EXCLUDED.notes, updated_at = now();
+
+-- Verification (run as its own call; expect 3 rows, all enabled=true):
+-- SELECT rule_key, enabled, priority FROM agent_rules WHERE rule_key LIKE 'LP_APPT_GHL_SYNC_%' ORDER BY rule_key;
