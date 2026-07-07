@@ -1745,7 +1745,42 @@ export async function executeSendMessage(action, context) {
       : NaN;
     const staleMs = (parseInt(process.env.MAX_TRIGGER_STALENESS_MIN || '10', 10)) * 60 * 1000;
 
-    // 1c — regenerate when the draft no longer reflects the thread.
+    // ── Outbound corpus: GHL thread (24h) MERGED with the pipeline's own
+    // Supabase record of what it just sent (execution_result.sent_body).
+    // 2026-07-07 duplicate incident: the GHL conversation API lags a fresh
+    // send by ~30-60s, so a job executing 17s after a sibling literally
+    // could not see the sibling's message — the Supabase record can.
+    const outboundCorpus = recentMessages
+      .filter(m => m?.direction === 'outbound' && typeof m.body === 'string' && m.body.trim())
+      .map(m => ({ body: m.body, ts: Date.parse(m.dateAdded || m.dateUpdated || '') }));
+    try {
+      const { data: sentRows } = await supabase
+        .from('agent_actions')
+        .select('created_at, execution_result')
+        .eq('target_id', contactId)
+        .eq('action_type', 'send_message')
+        .eq('status', 'completed')
+        .gte('created_at', new Date(nowMs - 24 * 60 * 60 * 1000).toISOString())
+        .order('created_at', { ascending: false })
+        .limit(15);
+      for (const r of (sentRows || [])) {
+        const body = r?.execution_result?.sent_body;
+        if (typeof body === 'string' && body.trim()) {
+          outboundCorpus.push({ body, ts: Date.parse(r.created_at) });
+        }
+      }
+    } catch (corpusErr) {
+      console.warn(`[SendMessage] sent-body corpus fetch failed for ${contactId} (fail-open): ${corpusErr.message}`);
+    }
+    const bodies24h = outboundCorpus
+      .filter(e => Number.isFinite(e.ts) && (nowMs - e.ts) <= 24 * 60 * 60 * 1000)
+      .map(e => e.body);
+    const RECENT_ANSWER_WINDOW_MS = 10 * 60 * 1000;
+    const bodiesRecent = outboundCorpus
+      .filter(e => Number.isFinite(e.ts) && (nowMs - e.ts) <= RECENT_ANSWER_WINDOW_MS)
+      .map(e => e.body);
+
+    // 1c — the draft no longer reflects the thread.
     let regenReason = null;
     if (sourceCreatedMs && Number.isFinite(newestInboundMs) && newestInboundMs > sourceCreatedMs + 2000) {
       regenReason = 'newer_inbound_mid_generation';
@@ -1753,18 +1788,43 @@ export async function executeSendMessage(action, context) {
       regenReason = 'stale_trigger';
     }
 
+    // ── YIELD TO THE NEWER JOB (2026-07-07 duplicate incident, root fix).
+    // When a newer inbound arrived after this job's trigger, that inbound
+    // has (or is about to have) its OWN reply job carrying fuller context.
+    // Regenerating here raced that job and produced two near-identical
+    // answers to the same question 32 seconds apart. If a newer
+    // ghl.reply_received exists for this contact, this stale job SKIPS —
+    // always-respond is satisfied by the newer job's reply. Fail-open: if
+    // the check errors, fall through to regeneration (a possible duplicate
+    // beats a possible silence).
+    if (regenReason === 'newer_inbound_mid_generation' && sourceEventMeta?.created_at) {
+      try {
+        const { data: newerReply } = await supabase
+          .from('system_events')
+          .select('id')
+          .eq('ghl_contact_id', contactId)
+          .eq('event_type', 'ghl.reply_received')
+          .gt('created_at', sourceEventMeta.created_at)
+          .limit(1);
+        if (Array.isArray(newerReply) && newerReply.length > 0) {
+          console.log(`[SendMessage] ⏭️ SUPERSEDED BY NEWER INBOUND: ${contactId} action ${action.id} trigger predates inbound event ${newerReply[0].id} — that inbound's own reply job answers; skipping this one`);
+          return {
+            skipped: true,
+            reason: 'superseded_by_newer_inbound',
+            newer_reply_event_id: newerReply[0].id,
+            contact_id: contactId,
+            channel,
+          };
+        }
+      } catch (yieldErr) {
+        console.warn(`[SendMessage] newer-inbound yield check failed for ${contactId} (fail-open → regenerate): ${yieldErr.message}`);
+      }
+    }
+
     // 1b — near-duplicate of an outbound already sent in the last 24h.
-    // First sends are inherently exempt: nothing matches. Uses the raw
-    // thread bodies; the contact's first name and merge tags are stripped
-    // in normalization.
-    const outbound24h = recentMessages
-      .filter(m => m?.direction === 'outbound' && typeof m.body === 'string' && m.body.trim())
-      .filter(m => {
-        const ts = Date.parse(m.dateAdded || m.dateUpdated || '');
-        return Number.isFinite(ts) && (nowMs - ts) <= 24 * 60 * 60 * 1000;
-      })
-      .map(m => m.body);
-    const dup = findNearDuplicate(message, outbound24h, { threshold: 0.9 });
+    // First sends are inherently exempt: nothing matches. The contact's
+    // first name and merge tags are stripped in normalization.
+    const dup = findNearDuplicate(message, bodies24h, { threshold: 0.9 });
     if (dup.duplicate && !regenReason) regenReason = 'duplicate_send_suppressed';
 
     if (regenReason) {
@@ -1795,10 +1855,63 @@ export async function executeSendMessage(action, context) {
         ? newestInboundMsg.body
         : (context.message_text || context.messageText || context.body || context.message_preview || message);
 
+      // NEVER-DUPLICATE-IN-A-ROW (owner directive 2026-07-07: "We never
+      // should send duplicate messages to the lead in a row. This screams
+      // that it is an AI system."): a draft that still reads as the same
+      // answer the lead received within the last 10 minutes does NOT ship
+      // — the answer is already delivered; skipping is not silence. An
+      // older match (>10 min) may ship rephrased: a re-ask hours later
+      // deserves a (differently worded) answer.
+      //
+      // Structural tightening: when the newest INBOUND already has an
+      // outbound after it (someone answered it), a further reply-class send
+      // is likely a SECOND answer to the same message, so the similarity
+      // bar drops. Calibrated on the 2026-07-07 incident messages: the real
+      // paraphrase pair measures 0.565 (token containment) while an
+      // adjacent legitimate different answer measures 0.500 — 0.55 sits
+      // between them (thin margins; env-tunable). The primary prevention
+      // for this state is the yield-to-newer-job gate above — this is the
+      // second net for sub-second webhook races. Normal first-answer case
+      // keeps the strict 0.75.
+      const newestOutboundMs = outboundCorpus.reduce((mx, e) => (Number.isFinite(e.ts) && e.ts > mx ? e.ts : mx), 0);
+      const inboundAlreadyAnswered = Number.isFinite(newestInboundMs) && newestOutboundMs > newestInboundMs;
+      const answeredThreshold = Math.min(Math.max(parseFloat(process.env.DUP_ANSWERED_THRESHOLD || '0.55') || 0.55, 0.3), 0.9);
+      const recentDupThreshold = (inboundAlreadyAnswered && isReplyClass) ? answeredThreshold : 0.75;
+      const skipIfRecentDuplicate = (candidate, stage) => {
+        const dupRecent = findNearDuplicate(candidate, bodiesRecent, { threshold: recentDupThreshold });
+        if (!dupRecent.duplicate) return null;
+        console.warn(`[SendMessage] ⏭️ DUPLICATE OF RECENT ANSWER (${stage}): ${contactId} action ${action.id} draft matches an outbound from the last 10 min at ${dupRecent.ratio?.toFixed(2)} — the lead already has this answer; skipping`);
+        emitEvent({
+          event_type: 'agentic.duplicate_send_suppressed',
+          source: 'lp_mcp', entity_type: 'contact',
+          entity_id: String(contactId), ghl_contact_id: String(contactId),
+          priority: 'normal',
+          payload: {
+            blocked_body: String(candidate).slice(0, 400),
+            matched_prior: String(dupRecent.matched || '').slice(0, 400),
+            similarity: dupRecent.ratio || null,
+            stage,
+            rule_applied: action.rule_applied || null,
+            action_id: action.id || null,
+          },
+          idempotency_key: `dup_skip_${contactId}_${action.id || Date.now()}_${stage}`,
+        }).catch(() => {});
+        return {
+          skipped: true,
+          reason: 'duplicate_skipped_recent_answer',
+          similarity: dupRecent.ratio || null,
+          contact_id: contactId,
+          channel,
+        };
+      };
+
       const priorAttempts = Number(action.execution_result?.quality_regen_attempts) || 0;
       if (priorAttempts >= 1) {
-        // A previous execution already regenerated for this action —
+        // A previous execution already regenerated for this action. If the
+        // draft still duplicates a just-delivered answer, skip; otherwise
         // send what we have rather than loop (always-respond).
+        const recentSkip = skipIfRecentDuplicate(message, 'post_retry');
+        if (recentSkip) return recentSkip;
         console.warn(`[SendMessage] quality regen already attempted for action ${action.id} — sending current draft`);
       } else {
         try {
@@ -1815,11 +1928,14 @@ export async function executeSendMessage(action, context) {
             message = regenDisclosure.blocked ? regenDisclosure.body : regenerated.message;
             subject = regenerated.subject || subject;
             generated = regenerated;
-            const dup2 = findNearDuplicate(message, outbound24h, { threshold: 0.9 });
+            const recentSkip = skipIfRecentDuplicate(message, 'post_regen');
+            if (recentSkip) return recentSkip;
+            const dup2 = findNearDuplicate(message, bodies24h, { threshold: 0.9 });
             if (dup2.duplicate) {
-              // Bounded: one regeneration. A still-similar regen ships —
-              // repetition risk loses to silence risk.
-              console.warn(`[SendMessage] regenerated draft still similar (${dup2.ratio?.toFixed(2)}) for ${contactId} — sending regenerated version anyway`);
+              // Bounded: one regeneration. A regen still similar to an OLD
+              // (>10 min) outbound ships — repetition risk loses to silence
+              // risk; the just-delivered case was handled above.
+              console.warn(`[SendMessage] regenerated draft still similar to an older outbound (${dup2.ratio?.toFixed(2)}) for ${contactId} — sending regenerated version`);
             }
           }
         } catch (regenErr) {
@@ -2035,6 +2151,12 @@ export async function executeSendMessage(action, context) {
     contact_id: contactId,
     channel,
     message_length: message.length,
+    // 2026-07-07 duplicate-send incident (14:51:23/14:51:55): the sent body
+    // is persisted in execution_result so the near-duplicate gate has a
+    // Supabase-side memory of what just went out — the GHL conversation
+    // API doesn't show a message committed seconds earlier (read lag),
+    // which is exactly how the second duplicate slipped through.
+    sent_body: String(message).slice(0, 500),
     rule_trigger: action.rule_applied || 'manual',
     send_method: sendMethod,
     fell_back: sendMethod.includes('fallback'),
