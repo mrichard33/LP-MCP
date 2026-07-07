@@ -144,6 +144,7 @@ import { executeAddTag, executeRemoveTag, executeSetStage } from './handlers/tag
 import { executeMoveOpportunity, executeUpdateOpportunity } from './handlers/opportunities.js';
 import { executeAddToWorkflow, executeRemoveFromWorkflow, executeIssueHold } from './handlers/workflows.js';
 import { executeBookAppointment, executeCancelAppointment, executeRescheduleAppointment, executeUpdateAppointmentStatus } from './handlers/appointments.js';
+import { executeSyncLpAppointmentToGhl } from './handlers/lp-ghl-appointment-sync.js';
 import { executeSetLPAppointment } from './handlers/lp-appointment.js';
 import { executeCreateLPLead } from './handlers/lp-lead.js';
 import { executeUpdateLPDNCStatus } from './handlers/lp-dnc.js';
@@ -347,6 +348,7 @@ const ACTION_HANDLERS = {
   cancel_appointment: executeCancelAppointment,
   reschedule_appointment: executeRescheduleAppointment, // v2.7.8 — agentic reschedule (cancel old + book new)
   update_appointment_status: executeUpdateAppointmentStatus, // 2026-06-03 — in-home book-then-capture status upgrade (new→confirmed)
+  sync_lp_appointment_to_ghl: executeSyncLpAppointmentToGhl, // 2026-07-07 — LP→GHL appointment authority (LP disposition Set/Cnf/CXL → WE calendar)
   create_task: executeCreateTask,
   send_notification: executeSendNotification,
   set_lp_appointment: executeSetLPAppointment,
@@ -392,6 +394,14 @@ const CONTEXT_AWARE_HANDLERS = new Set([
 // classify_lead_state (Phase 2 lead-state) also does not need event context —
 // it operates on action.target_id (the contact) and builds its own context
 // via the classifier's buildLeadContext call.
+// sync_lp_appointment_to_ghl is NOT context-aware on purpose: the
+// lp.disposition_changed payload carries neither lp_lead_id nor
+// appointment_date, so the handler re-reads the authoritative lp_leads row
+// itself (newest by created_at_lp — mirrors the engine's
+// isNewestLeadForContact gate). It is also deliberately NOT mutation-gated,
+// like the other appointment actions: LP calendar parity must land even on
+// suppressed contacts (its own consent guard skips Set/Cnf creation but
+// still processes CXL).
 
 // ═══════════════════════════════════════════════════════════════════
 // EXECUTOR ENGINE

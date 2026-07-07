@@ -58,4 +58,56 @@ export function formatDateHuman(date = new Date()) {
   }).format(date);
 }
 
+/** ET UTC-offset in minutes (DST-correct) for an instant, e.g. -240 in July, -300 in January. */
+export function etOffsetMinutes(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+    timeZoneName: 'shortOffset',
+  }).formatToParts(date);
+  const tzName = parts.find((p) => p.type === 'timeZoneName')?.value || '';
+  // 'GMT-4' / 'GMT-04:00' → minutes east of UTC (negative for ET)
+  const m = /GMT([+-])(\d{1,2})(?::(\d{2}))?/.exec(tzName);
+  if (!m) return -300;
+  return (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3] || 0));
+}
+
+/**
+ * Convert an LP `appointment_date` timestamp to a GHL startTime ISO string.
+ *
+ * LP stores the appointment's ET WALL-CLOCK digits mislabeled as UTC
+ * (verified live 2026-07-07: lp_leads "2026-07-08T10:00:00+00:00" is the GHL
+ * appointment "2026-07-08T10:00:00-04:00"). So the digits are reused verbatim
+ * and only the offset is replaced with the DST-correct ET offset for that
+ * wall-clock instant.
+ *
+ * Returns null when there is no usable time-of-day: unparseable input,
+ * date-only values ("2026-06-15+00:00"), or exact midnight — LP date-only
+ * rows normalize to UTC midnight, and no real appointment is booked at
+ * 12:00 AM, so midnight is treated as "date known, time unknown".
+ *
+ * @param {string|null|undefined} lpTimestamp  lp_leads.appointment_date
+ * @returns {string|null}  e.g. '2026-07-08T10:00:00-04:00'
+ */
+export function lpWallClockToGhlStartTime(lpTimestamp) {
+  if (!lpTimestamp) return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/.exec(String(lpTimestamp));
+  if (!m) return null;
+  const [, y, mo, d, h, mi, s = '00'] = m;
+  if (h === '00' && mi === '00' && s === '00') return null;
+
+  // Anchor: the wall-clock digits read as if they were UTC. The true instant
+  // is that anchor minus the ET offset; the offset itself must be evaluated
+  // AT the true instant, so refine once across a possible DST boundary.
+  const wallUtcMs = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s));
+  let off = etOffsetMinutes(new Date(wallUtcMs));
+  const refined = etOffsetMinutes(new Date(wallUtcMs - off * 60000));
+  if (refined !== off) off = refined;
+
+  const sign = off < 0 ? '-' : '+';
+  const abs = Math.abs(off);
+  const offStr = `${sign}${String(Math.floor(abs / 60)).padStart(2, '0')}:${String(abs % 60).padStart(2, '0')}`;
+  return `${y}-${mo}-${d}T${h}:${mi}:${s}${offStr}`;
+}
+
 export const APPOINTMENT_TZ = TZ;

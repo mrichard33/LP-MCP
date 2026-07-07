@@ -227,6 +227,7 @@ const DEFAULT_PRIORITY_BY_TYPE = {
   book_appointment: TIME_SENSITIVE_PRIORITY,
   cancel_appointment: TIME_SENSITIVE_PRIORITY,
   reschedule_appointment: TIME_SENSITIVE_PRIORITY,
+  sync_lp_appointment_to_ghl: TIME_SENSITIVE_PRIORITY, // 2026-07-07 — LP→GHL appointment authority lane
   update_lp_dnc_status: TIME_SENSITIVE_PRIORITY,
   send_notification: TIME_SENSITIVE_PRIORITY,
 };
