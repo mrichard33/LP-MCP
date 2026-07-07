@@ -39,7 +39,9 @@
  */
 
 import supabase from '../../supabase.js';
-import { updateGHLContactFields } from '../../ghl.js';
+import { updateGHLContactFields, applyGHLTag, removeGHLTags } from '../../ghl.js';
+import { fetchUpcomingAppointments } from '../../knowledge/contact-appointments.js';
+import { isGhlOnlyCalendarId } from '../../knowledge/booking-calendar-router.js';
 
 const APPT_STATUS_FIELD        = 'jHFRKGGsYJJFRbWwthkG'; // SINGLE_OPTIONS
 const LP_APPT_DATE_FIELD       = 'GL1rM4cnXBETsBkqxkZw'; // DATE
@@ -56,6 +58,29 @@ const CANCELLED_STATUS_BY_CALENDAR = {
   'zEdPmkNccR2ovo3rQAd3': 'Canceled - Measurement Verification', // MV
   'gFWoSQrlKIdfRbAPV842': 'Canceled - Conf Call',                // Confirmation Call
 };
+
+// 2026-07-07 — explicit LP-exemption marker (call-dispatch-integrity). Stamped
+// by executeBookAppointment for GHL-only calendars; reconciled off here.
+const GHL_ONLY_APPT_TAG = 'ghl-only-appointment';
+
+/**
+ * Re-derive the ghl-only-appointment tag from live calendar truth: keep it
+ * iff the contact still has an active future appointment on a GHL-only
+ * calendar (Confirmation Call). A truth-based reconcile instead of a blind
+ * removal, so cancelling a Window Estimate while a Conf Call is still
+ * upcoming keeps the tag. fetchUpcomingAppointments returns null on any API
+ * failure — treated as a no-op (never strip the tag on a transient error).
+ * Lives here (not appointments.js) so the webhook cancel choke point can call
+ * it without a circular import.
+ */
+export async function reconcileGhlOnlyApptTag(contactId) {
+  if (!contactId) return;
+  const upcoming = await fetchUpcomingAppointments(contactId);
+  if (!Array.isArray(upcoming)) return; // lookup failed — leave the tag as-is
+  const stillHasGhlOnly = upcoming.some((a) => isGhlOnlyCalendarId(a.calendar_id));
+  if (stillHasGhlOnly) await applyGHLTag(contactId, GHL_ONLY_APPT_TAG).catch(() => {});
+  else await removeGHLTags(contactId, [GHL_ONLY_APPT_TAG]).catch(() => {});
+}
 
 /**
  * @param {string} contactId GHL contact ID
@@ -105,6 +130,12 @@ export async function syncCancelledAppointmentState(contactId, opts = {}) {
     summary.errors.push(`lp_snapshot_threw:${err.message}`);
     console.warn(`[ApptFieldSync] lp_leads snapshot update threw for ${contactId}: ${err.message}`);
   }
+
+  // Every cancellation path (agentic handlers, rep-side GHL-UI cancels, lead
+  // cancel links) funnels through here — reconcile the GHL-only marker from
+  // live truth. Fire-and-forget: the mirror sync result must not depend on it.
+  reconcileGhlOnlyApptTag(contactId)
+    .catch(err => console.warn(`[ApptFieldSync] ghl-only tag reconcile failed for ${contactId}: ${err.message}`));
 
   console.log(`[ApptFieldSync] cancelled-appointment mirror sync for ${contactId}: fields=${summary.fields_synced.length ? summary.fields_synced.join(',') : 'none'} lp_snapshot=${summary.lp_snapshot_updated}${summary.errors.length ? ` errors=${summary.errors.join('|')}` : ''}`);
   return summary;

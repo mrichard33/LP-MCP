@@ -53,6 +53,21 @@ const IN_HOME_CALENDAR_IDS = new Set(
   [...IN_HOME_CALENDAR_KEYS].map((key) => BOOKING_CALENDARS[key])
 );
 
+// GHL-only calendars: appointments that exist ONLY in GHL and must never be
+// synced to LP as LP appointments. LP dispositions are lead-level while these
+// are event-level phone touches — mirroring them into LP is what lets LP
+// replays act on appointments LP never should have known about (2026-07-07
+// stale-CXL Conf Call cancellation incident). Bookings on these calendars are
+// stamped with the `ghl-only-appointment` tag as an explicit skip signal for
+// any reconciliation logic.
+export const GHL_ONLY_CALENDAR_KEYS = new Set([
+  'CONFIRMATION_CALL',
+]);
+
+const GHL_ONLY_CALENDAR_IDS = new Set(
+  [...GHL_ONLY_CALENDAR_KEYS].map((key) => BOOKING_CALENDARS[key])
+);
+
 /** True if the resolved calendar needs the decision-maker + address gate. */
 export function requiresInHomeGate(calendarKey) {
   return IN_HOME_CALENDAR_KEYS.has(calendarKey);
@@ -61,6 +76,11 @@ export function requiresInHomeGate(calendarKey) {
 /** True if `calendarId` is one of the in-home (rep-visits) calendars. */
 export function isInHomeCalendarId(calendarId) {
   return IN_HOME_CALENDAR_IDS.has(calendarId);
+}
+
+/** True if `calendarId` is a GHL-only (never-sync-to-LP) calendar. */
+export function isGhlOnlyCalendarId(calendarId) {
+  return GHL_ONLY_CALENDAR_IDS.has(calendarId);
 }
 
 /** Default appointment duration (minutes) for a resolved calendar key. */

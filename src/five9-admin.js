@@ -37,7 +37,8 @@ function authHeader() {
 }
 
 // Escape user-supplied values before embedding in the SOAP body.
-function escapeXml(s) {
+// Exported for the write-side modules under src/five9/.
+export function escapeXml(s) {
   return String(s ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')

@@ -42,6 +42,28 @@ export const KNOWN_DISPOSITION_LABELS = {
   'CC': 'Credit Check', 'OT': 'Other',
 };
 
+// Categories whose dispositions count as "terminal" for the rebook staleness
+// guard (a new booking arriving while the GHL disposition mirror still holds
+// one of these). DELIBERATELY closed_lost ONLY:
+//  - closed_won (Sale/SW): real business state — a post-sale Confirmation
+//    Call rebook must not erase it, and no cancel-branch workflow keys off it.
+//  - dead (DNC/NG): compliance-sensitive — DNC mirrors a do-not-call signal;
+//    auto-clearing could unmute suppression. A booking on a DNC lead is an
+//    anomaly for humans to review, not for an auto-clear.
+//  - active/deferred: not terminal by definition.
+const STALE_GUARD_TERMINAL_CATEGORIES = new Set(['closed_lost']);
+
+/** Category for a disposition code, or null for unknown/legacy string-only codes. */
+export function dispositionCategory(code) {
+  const entry = KNOWN_DISPOSITION_LABELS[code];
+  return entry && typeof entry === 'object' ? entry.category : null;
+}
+
+/** True if `code` is a terminal disposition the rebook staleness guard acts on. */
+export function isStaleGuardTerminalDisposition(code) {
+  return STALE_GUARD_TERMINAL_CATEGORIES.has(dispositionCategory(code));
+}
+
 export async function syncDispositions() {
   try {
     const response = await getDispositions();

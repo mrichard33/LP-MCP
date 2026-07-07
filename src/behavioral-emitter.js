@@ -236,6 +236,7 @@ import { applyGHLTag } from './ghl.js';
 import { resolveEntryFromSourceMap, entryTagSuffix } from './entry-source-map.js';
 import { executeAddTag } from './actions/handlers/tags.js';
 import { syncCancelledAppointmentState } from './actions/handlers/appointment-field-sync.js';
+import { checkDispositionStalenessOnBooking } from './services/disposition-staleness-guard.js';
 // 2026-07-03 — hard message-level dedup (Steve Nkzhm incident): every inbound
 // gets a non-null message key, and the buffer flush atomically claims its
 // keys so the solo analyzePendingReplies poller can never re-analyze them.
@@ -958,6 +959,15 @@ async function handleAppointment(req, res) {
   if (eventType === 'ghl.appointment_cancelled' || eventType === 'ghl.appointment_no_show') {
     syncCancelledAppointmentState(contactId, { appointmentId, calendarId })
       .catch(err => console.warn(`[BehavioralEmitter] cancelled-appointment field sync failed for ${contactId}: ${err.message}`));
+  }
+
+  // 2026-07-07: stale-terminal-disposition guard (CXL replay incident) — a
+  // fresh booking while the LP disposition mirror still reads CXL/NI lets LP
+  // replays cancel the brand-new appointment. Refresh or clear the mirror.
+  // Fire-and-forget: the webhook ack must never wait on GHL/LP reads.
+  if (eventType === 'ghl.appointment_booked') {
+    checkDispositionStalenessOnBooking(contactId, { calendarId, appointmentId, startTime })
+      .catch(err => console.warn(`[BehavioralEmitter] disposition staleness guard failed for ${contactId}: ${err.message}`));
   }
 
   return res.json({ status: 'accepted', event_type: eventType });
