@@ -61,6 +61,7 @@ export function channelOfMessage(m) {
  *   inboundOrigin,     // channel of the most recent inbound, or null
  *   livechatAgeMin,    // minutes since most recent inbound livechat, or null
  *   inboundSmsTo,      // `to` of the most recent inbound SMS (our number), or null
+ *   newestInboundAt,   // dateAdded of the most recent inbound (any channel), or null
  * }
  */
 export function deriveInboundContext(messages, nowMs = Date.now()) {
@@ -68,9 +69,16 @@ export function deriveInboundContext(messages, nowMs = Date.now()) {
   let inboundOrigin = null;
   let livechatAgeMin = null;
   let inboundSmsTo = null;
+  let newestInboundAt = null;
 
   for (const m of list) {
     if (m?.direction !== 'inbound') continue;
+    // Quality Pass v1.0 (Item 2): the newest inbound's timestamp feeds the
+    // quiet-hours "fresh reply" exemption — captured before the channel
+    // filter so an unclassifiable message type still counts as contact.
+    if (newestInboundAt === null) {
+      newestInboundAt = m.dateAdded || m.dateUpdated || null;
+    }
     const ch = channelOfMessage(m);
     if (!ch) continue;
     if (inboundOrigin === null) inboundOrigin = ch;
@@ -84,7 +92,7 @@ export function deriveInboundContext(messages, nowMs = Date.now()) {
     if (inboundOrigin && livechatAgeMin !== null && inboundSmsTo) break;
   }
 
-  return { inboundOrigin, livechatAgeMin, inboundSmsTo };
+  return { inboundOrigin, livechatAgeMin, inboundSmsTo, newestInboundAt };
 }
 
 /**
@@ -190,7 +198,9 @@ async function ghlGet(path) {
   return res.json();
 }
 
-async function fetchRecentMessages(contactId) {
+// Exported (Quality Pass v1.0): the send handler re-reads the thread at the
+// pre-send chokepoint for near-duplicate + mid-generation-inbound checks.
+export async function fetchRecentMessages(contactId) {
   const search = await ghlGet(`/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`);
   const conversations = Array.isArray(search) ? search : (search?.conversations || []);
   if (!conversations.length) return { conversationId: null, messages: [] };
@@ -283,6 +293,7 @@ export async function resolveReplyContext(contactId, { requestedChannel = null, 
       conversationId: null,
       inboundOrigin: null,
       livechatAgeMin: null,
+      newestInboundAt: null,
     };
   }
 
@@ -340,6 +351,7 @@ export async function resolveReplyContext(contactId, { requestedChannel = null, 
     conversationId,
     inboundOrigin: derived.inboundOrigin,
     livechatAgeMin: derived.livechatAgeMin,
+    newestInboundAt: derived.newestInboundAt || null,
   };
 }
 

@@ -463,6 +463,18 @@ export async function executeBookAppointment(action, context) {
     console.log(`[ActionExecutor] one-legger-risk tagged for ${contactId} (decision_makers_present="${dmAnswer}") — booking proceeds per locked policy`);
   }
 
+  // Quality Pass v1.0 Item 5 — persist the call purpose (why the lead wants
+  // this call: pricing_questions / general_questions / pre_visit_confirmation
+  // / requested_callback) so later confirmations and rep prep can name it.
+  // Env-gated: the "Call Purpose" GHL custom field doesn't exist yet — Mark
+  // creates it and sets CALL_PURPOSE_FIELD_ID in Railway. Best-effort.
+  if (payload.call_purpose && process.env.CALL_PURPOSE_FIELD_ID) {
+    await updateGHLContactFields(contactId, [
+      { id: process.env.CALL_PURPOSE_FIELD_ID, field_value: String(payload.call_purpose) },
+    ]).catch((err) =>
+      console.warn(`[ActionExecutor] call_purpose field write failed for ${contactId} (fail-soft): ${err.message}`));
+  }
+
   // v3.4: tear down the booking-flow tags now that a booking has landed, so the
   // affirmative-gate bypass doesn't persist for this contact. See §8 #6.
   await removeGHLTags(contactId, BOOKING_FLOW_TAGS).catch(() => {});

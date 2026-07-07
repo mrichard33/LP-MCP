@@ -189,7 +189,7 @@ VALUES (
   }'::jsonb,
   '[
     {"action_type": "send_message", "target_system": "ghl", "target_entity": "contact", "priority": 10,
-     "params": {"channel": "sms", "message": "Thanks for getting back to me — give me a moment and I''ll get you a proper answer."}},
+     "params": {"channel": "sms", "requires_ai_generation": true, "prompt_hint": "Their reply could not be auto-classified. Answer their ACTUAL message directly and helpfully RIGHT NOW — never stall, never promise a proper answer later. If their message needs a specific detail you do not have, give them what you can and say a team member will follow up with the specifics (one is being looped in). One short, real reply."}},
     {"action_type": "send_notification", "target_system": "groupme", "target_entity": "contact",
      "params": {"notification_class": "priority", "action_verb": "MOVED FORK — UNCLEAR REPLY", "tier": "Warm", "status": "Action Required",
        "message": "S1.3 moved-fork follow-up could not be auto-classified. Reply: \"{{message_text}}\"",
@@ -352,11 +352,11 @@ VALUES (
   }'::jsonb,
   '[
     {"action_type": "send_message", "target_system": "ghl", "target_entity": "contact", "priority": 10,
-     "params": {"channel": "sms", "message": "Thanks for getting back to me — give me a moment and I''ll get you a proper answer."}},
+     "params": {"channel": "sms", "requires_ai_generation": true, "prompt_hint": "Their reply matched no automated lane. Answer their ACTUAL message directly and helpfully RIGHT NOW — never stall, never promise a proper answer later. If their message needs a specific detail you do not have, give them what you can and say a team member will follow up with the specifics (one is being looped in). One short, real reply."}},
     {"action_type": "send_notification", "target_system": "groupme", "target_entity": "contact",
      "params": {"notification_class": "priority", "action_verb": "S1.3 REPLY — NEEDS HUMAN", "tier": "Warm", "status": "Review",
        "message": "S1.3 inbound matched no lane. Message: \"{{message_text}}\"",
-       "narrative": "Pilot safety net: unmatched S1.3 replies become human handoffs and classifier training data. The lead got an acknowledgment; ACTION: read and respond personally.",
+       "narrative": "Pilot safety net: unmatched S1.3 replies become human handoffs and classifier training data. The lead got a real generated answer (Quality Pass v1.0 removed the give-me-a-moment stall); ACTION: read and respond personally.",
        "next_step": "Read the message and reply personally"}}
   ]'::jsonb,
   false, true, 60, 'claude',

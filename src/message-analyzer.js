@@ -407,6 +407,7 @@ Required JSON structure:
   "escalation_category": <null | "existing_customer_service" | "legal_media" | "identity_ambiguous" | "commercial_hoa" | "contract_change" | "billing" | "vendor_recruiting" | "language" | "compliance_adjacent">,
   "guide_type": <null | "dhp" | "hurricane" | "energy" | "security" | "warranty" | "financing" | "reviews" | "credentials" | "booking-link" | "process">,
   "follow_up_bucket": <null | "tomorrow" | "few-days" | "1week" | "2weeks" | "1month" | "2months" | "after-holidays" | "seasonal">,
+  "call_purpose": <null | "pricing_questions" | "general_questions" | "pre_visit_confirmation" | "requested_callback">,
   "reasoning": "<1-2 sentence explanation>"
 }
 
@@ -434,6 +435,26 @@ Seven conversation-level actions route to dedicated response playbooks. Pick the
 • guide_send — they ask for information/materials to review: "send me info", "got anything I can read", "can you email me details", or accept a guide offer. Set guide_type to the best topical match: "hurricane" (storm protection), "energy" (savings/cooling), "security" (break-ins), "warranty", "financing", "reviews", "credentials" (company info/licensing), "booking-link" (they explicitly ask for a scheduling LINK), "process" (what the visit involves), or "dhp" (Documented Home Protection Guide — the default for vague/skeptical "just send me something" requests).
 
 • follow_up_scheduled — they ask to be re-contacted at a specific time: "check back next week", "reach out after the holidays", "try me in a month". Set follow_up_bucket to the closest bucket; a vague deferral with no timeframe = "1week". Buckets: tomorrow / few-days / 1week / 2weeks / 1month / 2months / after-holidays / seasonal.
+
+═══════════════════════════════════════════════════════════════════
+OPEN-QUESTION RULE — THE LEAD MAY BE ANSWERING THE BOT'S QUESTION
+═══════════════════════════════════════════════════════════════════
+
+Before classifying, read the LAST [outbound] in the conversation end-to-end. If it ends in a question and this inbound plausibly ANSWERS it, classify the inbound AS THAT ANSWER — never as a fresh trigger that re-fires the same flow, and never as noise.
+• Outbound: "…When's good for a quick call?" → Inbound: "You can call me tomorrow" → this IS the answer: recommended_action "callback_request" (their words: tomorrow). NEVER escalate_to_rep again for this — the escalation already happened; re-firing it re-sends the same message and reads as not listening.
+• Outbound: "…3:30 PM or 4:00 PM?" → Inbound: "4:00 PM works" → that IS the slot confirmation. The flow proceeds with 4:00 PM — never re-offer the same options.
+• Outbound asked ANY qualification question → a short inbound ("yes", "just me", "tomorrow", "the morning") is almost always the answer to it, not a new topic.
+
+═══════════════════════════════════════════════════════════════════
+CALL PURPOSE — call_purpose (WHY they want the phone call)
+═══════════════════════════════════════════════════════════════════
+
+Whenever a phone call is being requested, scheduled, or confirmed this turn (callback_request, busy_callback, or a phone-call booking), set call_purpose to WHY the lead wants it — derived from the conversation, never invented:
+• "pricing_questions" — they want the call to discuss pricing, a quote, or cost comparison ("call me about the numbers", they've been asking price questions leading into the call).
+• "general_questions" — they have product/process questions to talk through.
+• "pre_visit_confirmation" — the call confirms details before an already-booked visit.
+• "requested_callback" — they simply asked to be called back with no stated topic.
+Leave null when no call is in play this turn. Downstream renders purpose-specific confirmations ("…to go over your pricing questions") — a wrong purpose is worse than "requested_callback".
 
 ═══════════════════════════════════════════════════════════════════
 DISQUALIFICATION DETECTION — dq_detected (VOLUNTEERED ONLY)
@@ -828,6 +849,10 @@ function validateAnalysis(analysis) {
     ].includes(analysis.escalation_category) ? analysis.escalation_category : null,
     guide_type: ['dhp', 'hurricane', 'energy', 'security', 'warranty', 'financing', 'reviews', 'credentials', 'booking-link', 'process'].includes(analysis.guide_type) ? analysis.guide_type : null,
     follow_up_bucket: ['tomorrow', 'few-days', '1week', '2weeks', '1month', '2months', 'after-holidays', 'seasonal'].includes(analysis.follow_up_bucket) ? analysis.follow_up_bucket : null,
+    // Quality Pass v1.0 Item 5 — WHY the lead wants the phone call; drives
+    // purpose-specific confirmations ("your pricing call"). Never inferred
+    // beyond the conversation.
+    call_purpose: ['pricing_questions', 'general_questions', 'pre_visit_confirmation', 'requested_callback'].includes(analysis.call_purpose) ? analysis.call_purpose : null,
     reasoning: String(analysis.reasoning || '').slice(0, 500),
   };
 }
@@ -1085,6 +1110,14 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
         analysis_duration_ms: Date.now() - startTime,
         lp_data_available: context.lp?.matched || false,
         lp_fallback_used: context.lp?._fallback_used || false,
+        // Quality Pass v1.0 Item 4 — effective appointment state (PR #485
+        // derivation: cancelled reads as false) exposed to the rules layer.
+        // BEHAVIORAL_DISENGAGEMENT / _SEVERE gate on it so a lead who is
+        // merely cancelling one visit never gets loss-processed (the July 6
+        // incident: "Just cancel the appointment. I said cancel." → P1 lost
+        // + 90d cooling, re-opened two minutes later by the cancel doctrine).
+        // Emitted as a string for payload_field_eq's string comparison.
+        appointment_active: context.lp?.appointment_set === true ? 'true' : 'false',
       },
       priority: analysis.fast_track_eligible ? 'critical' :
                 analysis.engagement_quality === 'dnc' ? 'critical' :
