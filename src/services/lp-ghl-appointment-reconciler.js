@@ -4,12 +4,13 @@
  * Shared core for the `sync_lp_appointment_to_ghl` action handler and the
  * one-time backfill script (scripts/backfill-ghl-appointments.js). On an LP
  * disposition change (Set / Cnf / CXL) it converges the lead's GHL estimate
- * appointment to LP reality. The estimate appointment may live on either the
- * Window Estimate calendar or the Measurement Verification calendar (MV is
- * just a different name for the WE) — it is reconciled in place wherever it
- * lives; new appointments are always created on the WE calendar. LP IS THE
- * AUTHORITY here, which is why this module exists instead of reusing
- * book_appointment / update_appointment_status:
+ * appointment to LP reality. The estimate appointment may live on any of the
+ * three in-home calendars — Window Estimate, Measurement Verification, or
+ * Home Protection Assessment (MV and HPA are just different names for the
+ * WE) — and is reconciled in place wherever it lives; new appointments are
+ * always created on the WE calendar. LP IS THE AUTHORITY here, which is why
+ * this module exists instead of reusing book_appointment /
+ * update_appointment_status:
  *
  *   - No decision-makers backstop: the call center's Cnf in LP IS the
  *     confirmation authority; the bot-flow backstop would silently downgrade
@@ -41,12 +42,16 @@ import { lpWallClockToGhlStartTime } from '../appointment-dates.js';
 
 export const WINDOW_ESTIMATE_CALENDAR_ID = BOOKING_CALENDARS.WINDOW_ESTIMATE;
 
-// Measurement Verification is just a different name for the Window Estimate:
-// the lead's estimate appointment may live on either calendar. Reconciliation
-// targets the pool; NEW appointments are always created on the WE calendar.
+// Measurement Verification and Home Protection Assessment are just different
+// names for the Window Estimate: the lead's estimate appointment may live on
+// any of the three in-home calendars. Reconciliation targets the pool; NEW
+// appointments are always created on the WE calendar. (Deliberately an
+// explicit list, not isInHomeCalendarId: a future in-home calendar should
+// not silently join the pool.)
 export const ESTIMATE_CALENDAR_IDS = new Set([
   BOOKING_CALENDARS.WINDOW_ESTIMATE,
   BOOKING_CALENDARS.MEASUREMENT_VERIFICATION,
+  BOOKING_CALENDARS.HOME_PROTECTION_ASSESSMENT,
 ]);
 
 const APPOINTMENT_DURATION_MS = 90 * 60 * 1000;
@@ -188,11 +193,11 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, toNotify = 
     throw new Error(`appointment lookup failed for contact ${contactId} — refusing to reconcile blind`);
   }
 
-  // The ESTIMATE POOL: Measurement Verification is just a different name
-  // for the Window Estimate — the lead's estimate appointment may live on
-  // either calendar, and it is reconciled IN PLACE wherever it lives. Only
+  // The ESTIMATE POOL: MV and HPA are just different names for the Window
+  // Estimate — the lead's estimate appointment may live on any of the three
+  // in-home calendars, and it is reconciled IN PLACE wherever it lives. Only
   // ACTIVE appointments count (see NON_ACTIVE_APPOINTMENT_STATUSES note
-  // above). GHL-only calendars (Conf Call) are excluded by calendar scope.
+  // above). Phone calendars (Conf Call, PPR) are excluded by calendar scope.
   const active = upcoming.filter((a) =>
     !NON_ACTIVE_APPOINTMENT_STATUSES.has(String(a.status || '').toLowerCase()));
   const estimateAppointments = active.filter((a) => ESTIMATE_CALENDAR_IDS.has(a.calendar_id));
@@ -210,12 +215,11 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, toNotify = 
     });
   }
 
-  // No active estimate appointment, but an active appointment on another
-  // in-home calendar (Home Protection Assessment): creating a WE would
-  // double-book the home visit — e.g. bot books HPA → GHL→LP sync sets the
-  // LP appointment → LP emits Set → we'd mirror it back as a duplicate.
-  // HPA is a different appointment type and never ours to touch, so block
-  // creation and surface the mismatch instead.
+  // No active estimate appointment, but an active appointment on an in-home
+  // calendar OUTSIDE the pool: creating a WE would double-book the home
+  // visit. Today the pool covers every in-home calendar, so this only fires
+  // if a future in-home calendar is added to booking-calendar-router without
+  // being classified here — fail safe: block creation, surface the mismatch.
   if (!existing && kind !== 'cancel') {
     const otherInHome = active.find((a) =>
       a.calendar_id && !ESTIMATE_CALENDAR_IDS.has(a.calendar_id) && isInHomeCalendarId(a.calendar_id));

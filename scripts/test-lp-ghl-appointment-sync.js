@@ -283,52 +283,38 @@ test('appt on a NON-in-home calendar (Conf Call) → does not block; other calen
   assert.equal(calls.filter((c) => c.method === 'PUT').length, 0); // never touched conf-call-1
 });
 
-test('MV is the same appointment as WE: reconciled in place on the MV calendar', async () => {
+test('MV and HPA are the same appointment as WE: reconciled in place on their own calendar', async () => {
   const MV = 'zEdPmkNccR2ovo3rQAd3';
-
-  // Cnf + MV at same time, status new → confirm THAT object.
-  reset({ upcoming: [weAppt({ calendarId: MV, id: 'mv-1' })] });
-  let res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Cnf') });
-  assert.equal(res.outcome, 'status_updated');
-  assert.equal(res.appointment_id, 'mv-1');
-  assert.deepEqual(calls.filter((c) => c.method === 'PUT')[0].body, { appointmentStatus: 'confirmed' });
-
-  // Set + MV at same time → in sync, no duplicate WE created.
-  reset({ upcoming: [weAppt({ calendarId: MV, id: 'mv-1' })] });
-  res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
-  assert.equal(res.reason, 'already_in_sync');
-  assert.equal(mutations().length, 0);
-
-  // Set + MV at different time → reschedule in place, KEEPING the MV calendar.
-  reset({ upcoming: [weAppt({ calendarId: MV, id: 'mv-1', startTime: OTHER_TIME_GHL })] });
-  res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
-  assert.equal(res.outcome, 'rescheduled');
-  const put = calls.filter((c) => c.method === 'PUT')[0];
-  assert.equal(put.path, '/calendars/events/appointments/mv-1');
-  assert.equal(put.body.calendarId, MV); // never moved to the WE calendar
-
-  // CXL + MV → cancels the MV object.
-  reset({ upcoming: [weAppt({ calendarId: MV, id: 'mv-1' })] });
-  res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('CXL') });
-  assert.equal(res.outcome, 'cancelled');
-  assert.deepEqual(res.cancelled_appointment_ids, ['mv-1']);
-});
-
-test('active HPA appointment → Set/Cnf blocked (no duplicate estimate), HPA untouched', async () => {
   const HPA = 'zS1wg0JqQ1zsszJyJqKX';
-  for (const disp of ['Set', 'Cnf']) {
-    reset({ upcoming: [weAppt({ calendarId: HPA, id: 'hpa-1', appointmentStatus: 'confirmed' })] });
-    const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead(disp) });
-    assert.equal(res.outcome, 'noop', `${disp} with active HPA must not create a WE`);
-    assert.equal(res.reason, 'active_other_in_home_appointment');
-    assert.equal(res.other_appointment_id, 'hpa-1');
+
+  for (const [calId, apptId] of [[MV, 'mv-1'], [HPA, 'hpa-1']]) {
+    // Cnf + pool appt at same time, status new → confirm THAT object.
+    reset({ upcoming: [weAppt({ calendarId: calId, id: apptId })] });
+    let res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Cnf') });
+    assert.equal(res.outcome, 'status_updated');
+    assert.equal(res.appointment_id, apptId);
+    assert.deepEqual(calls.filter((c) => c.method === 'PUT')[0].body, { appointmentStatus: 'confirmed' });
+
+    // Set + pool appt at same time → in sync, no duplicate WE created.
+    reset({ upcoming: [weAppt({ calendarId: calId, id: apptId })] });
+    res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
+    assert.equal(res.reason, 'already_in_sync');
     assert.equal(mutations().length, 0);
+
+    // Set + pool appt at different time → reschedule in place, KEEPING its calendar.
+    reset({ upcoming: [weAppt({ calendarId: calId, id: apptId, startTime: OTHER_TIME_GHL })] });
+    res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
+    assert.equal(res.outcome, 'rescheduled');
+    const put = calls.filter((c) => c.method === 'PUT')[0];
+    assert.equal(put.path, `/calendars/events/appointments/${apptId}`);
+    assert.equal(put.body.calendarId, calId); // never moved to the WE calendar
+
+    // CXL + pool appt → cancels that object.
+    reset({ upcoming: [weAppt({ calendarId: calId, id: apptId })] });
+    res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('CXL') });
+    assert.equal(res.outcome, 'cancelled');
+    assert.deepEqual(res.cancelled_appointment_ids, [apptId]);
   }
-  // CXL: estimate-pool-scoped — nothing to cancel, the HPA survives.
-  reset({ upcoming: [weAppt({ calendarId: HPA, id: 'hpa-1' })] });
-  const cxl = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('CXL') });
-  assert.equal(cxl.reason, 'nothing_to_cancel');
-  assert.equal(mutations().length, 0);
 });
 
 test('WE + MV both active = duplicate anomaly: Set/Cnf touch NOTHING, CXL cancels BOTH', async () => {
