@@ -3,9 +3,14 @@
  *
  * Shared core for the `sync_lp_appointment_to_ghl` action handler and the
  * one-time backfill script (scripts/backfill-ghl-appointments.js). On an LP
- * disposition change (Set / Cnf / CXL) it converges the GHL Window Estimate
- * calendar to LP reality. LP IS THE AUTHORITY here, which is why this module
- * exists instead of reusing book_appointment / update_appointment_status:
+ * disposition change (Set / Cnf / CXL) it converges the lead's GHL estimate
+ * appointment to LP reality. The estimate appointment may live on any of the
+ * three in-home calendars — Window Estimate, Measurement Verification, or
+ * Home Protection Assessment (MV and HPA are just different names for the
+ * WE) — and is reconciled in place wherever it lives; new appointments are
+ * always created on the WE calendar. LP IS THE AUTHORITY here, which is why
+ * this module exists instead of reusing book_appointment /
+ * update_appointment_status:
  *
  *   - No decision-makers backstop: the call center's Cnf in LP IS the
  *     confirmation authority; the bot-flow backstop would silently downgrade
@@ -36,6 +41,18 @@ import { syncCancelledAppointmentState } from '../actions/handlers/appointment-f
 import { lpWallClockToGhlStartTime } from '../appointment-dates.js';
 
 export const WINDOW_ESTIMATE_CALENDAR_ID = BOOKING_CALENDARS.WINDOW_ESTIMATE;
+
+// Measurement Verification and Home Protection Assessment are just different
+// names for the Window Estimate: the lead's estimate appointment may live on
+// any of the three in-home calendars. Reconciliation targets the pool; NEW
+// appointments are always created on the WE calendar. (Deliberately an
+// explicit list, not isInHomeCalendarId: a future in-home calendar should
+// not silently join the pool.)
+export const ESTIMATE_CALENDAR_IDS = new Set([
+  BOOKING_CALENDARS.WINDOW_ESTIMATE,
+  BOOKING_CALENDARS.MEASUREMENT_VERIFICATION,
+  BOOKING_CALENDARS.HOME_PROTECTION_ASSESSMENT,
+]);
 
 const APPOINTMENT_DURATION_MS = 90 * 60 * 1000;
 
@@ -176,26 +193,36 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, toNotify = 
     throw new Error(`appointment lookup failed for contact ${contactId} — refusing to reconcile blind`);
   }
 
-  // Only the Window Estimate calendar, only ACTIVE appointments (see
-  // NON_ACTIVE_APPOINTMENT_STATUSES note above). GHL-only calendars
-  // (Confirmation Call) are excluded by the calendar-id scope itself.
+  // The ESTIMATE POOL: MV and HPA are just different names for the Window
+  // Estimate — the lead's estimate appointment may live on any of the three
+  // in-home calendars, and it is reconciled IN PLACE wherever it lives. Only
+  // ACTIVE appointments count (see NON_ACTIVE_APPOINTMENT_STATUSES note
+  // above). Phone calendars (Conf Call, PPR) are excluded by calendar scope.
   const active = upcoming.filter((a) =>
     !NON_ACTIVE_APPOINTMENT_STATUSES.has(String(a.status || '').toLowerCase()));
-  const weAppointments = active.filter((a) => a.calendar_id === WINDOW_ESTIMATE_CALENDAR_ID);
-  if (weAppointments.length > 1) {
-    console.warn(`[LpGhlApptSync] contact ${contactId} has ${weAppointments.length} active WE appointments — reconciling the soonest, not auto-cancelling extras`);
-  }
-  const existing = weAppointments[0] || null; // list is soonest-first
+  const estimateAppointments = active.filter((a) => ESTIMATE_CALENDAR_IDS.has(a.calendar_id));
+  const existing = estimateAppointments[0] || null; // list is soonest-first
 
-  // No active WE, but an active appointment on ANOTHER in-home calendar
-  // (Home Protection Assessment / Measurement Verification): creating a WE
-  // would double-book the home visit — e.g. bot books HPA → GHL→LP sync sets
-  // the LP appointment → LP emits Set → we'd mirror it back as a duplicate
-  // WE. Those calendars are never ours to touch (strict WE scope), so block
-  // creation and surface the mismatch instead.
+  // Two+ active estimate objects (e.g. one WE and one MV) is always an
+  // anomaly — the estimate appointment is a single thing. Set/Cnf can't
+  // know which object is real, so block and surface for a human. CXL
+  // proceeds and cancels ALL of them: LP says the estimate is dead, and
+  // converging to zero matches LP truth whichever object was the real one.
+  if (estimateAppointments.length > 1 && kind !== 'cancel') {
+    console.warn(`[LpGhlApptSync] ANOMALY: contact ${contactId} has ${estimateAppointments.length} active estimate appointments (${estimateAppointments.map((a) => `${a.appointment_id}@${a.calendar_id}`).join(', ')}) — skipping ${kind}, needs human cleanup`);
+    return noop('multiple_estimate_appointments', {
+      estimate_appointment_ids: estimateAppointments.map((a) => a.appointment_id),
+    });
+  }
+
+  // No active estimate appointment, but an active appointment on an in-home
+  // calendar OUTSIDE the pool: creating a WE would double-book the home
+  // visit. Today the pool covers every in-home calendar, so this only fires
+  // if a future in-home calendar is added to booking-calendar-router without
+  // being classified here — fail safe: block creation, surface the mismatch.
   if (!existing && kind !== 'cancel') {
     const otherInHome = active.find((a) =>
-      a.calendar_id && a.calendar_id !== WINDOW_ESTIMATE_CALENDAR_ID && isInHomeCalendarId(a.calendar_id));
+      a.calendar_id && !ESTIMATE_CALENDAR_IDS.has(a.calendar_id) && isInHomeCalendarId(a.calendar_id));
     if (otherInHome) {
       console.warn(`[LpGhlApptSync] contact ${contactId} has an active in-home appointment on calendar ${otherInHome.calendar_id} (${otherInHome.appointment_id}) — skipping WE ${kind} to avoid double-booking`);
       return noop('active_other_in_home_appointment', {
@@ -243,8 +270,10 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, toNotify = 
   const appointmentId = existing.appointment_id;
 
   if (plan.op === 'reschedule' || plan.op === 'reschedule_confirm') {
+    // Reschedule in place on the appointment's OWN calendar (WE or MV) —
+    // never move an object between calendars.
     await ghlFetch('PUT', `/calendars/events/appointments/${appointmentId}`, {
-      calendarId: WINDOW_ESTIMATE_CALENDAR_ID,
+      calendarId: existing.calendar_id,
       startTime,
       endTime: endTimeFor(startTime),
     });
@@ -269,15 +298,26 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, toNotify = 
     // NO reschedule-inflight marker here: an LP CXL is a real customer
     // cancellation — the rebook/rescue rules (GHL_APPT_CANCELLED_REBOOK*)
     // SHOULD see the cancellation webhook.
-    await ghlFetch('PUT', `/calendars/events/appointments/${appointmentId}`, { appointmentStatus: 'cancelled' });
-    await syncCancelledAppointmentState(contactId, {
-      appointmentId,
-      calendarId: WINDOW_ESTIMATE_CALENDAR_ID,
-    }).catch((err) => {
-      console.warn(`[LpGhlApptSync] cancelled-state field sync failed for ${contactId}: ${err.message}`);
-      return null;
-    });
-    return { ...base, outcome: 'cancelled', appointment_id: appointmentId, new_status: 'cancelled' };
+    // Cancels EVERY active estimate-pool appointment (normally exactly one;
+    // more than one is the duplicate anomaly, and LP says the estimate is
+    // dead either way).
+    for (const appt of estimateAppointments) {
+      await ghlFetch('PUT', `/calendars/events/appointments/${appt.appointment_id}`, { appointmentStatus: 'cancelled' });
+      await syncCancelledAppointmentState(contactId, {
+        appointmentId: appt.appointment_id,
+        calendarId: appt.calendar_id,
+      }).catch((err) => {
+        console.warn(`[LpGhlApptSync] cancelled-state field sync failed for ${contactId}: ${err.message}`);
+        return null;
+      });
+    }
+    return {
+      ...base,
+      outcome: 'cancelled',
+      appointment_id: appointmentId,
+      new_status: 'cancelled',
+      cancelled_appointment_ids: estimateAppointments.map((a) => a.appointment_id),
+    };
   }
 
   return noop('unknown_plan_op');
