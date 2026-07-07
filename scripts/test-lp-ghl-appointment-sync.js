@@ -24,10 +24,16 @@ process.env.GHL_API_KEY = 'test-key';
 // Intentionally NOT setting SUPABASE_* — reconciler must run without it.
 
 // ─── fetch stub (installed before import so module-load reads are safe) ──
+// Two lookup sources, mirroring live GHL (verified 2026-07-07): the legacy
+// contact-appointments endpoint only returns workflow-created appointments;
+// the v2 calendar-events list only reliably returns API-created ones. The
+// reconciler must union them.
 let calls = [];
-let upcomingAppointments = [];   // served on GET /contacts/{id}/appointments
+let upcomingAppointments = [];   // legacy: GET /contacts/{id}/appointments
+let v2Appointments = [];         // v2: GET /calendars/events?...
 let contactTags = [];            // served on GET /contacts/{id}
 let appointmentsLookupFails = false;
+let v2LookupFails = false;
 
 function jsonRes(body) {
   return {
@@ -56,6 +62,10 @@ globalThis.fetch = async (url, opts = {}) => {
     if (appointmentsLookupFails) return errRes(500, 'boom');
     return jsonRes({ events: upcomingAppointments });
   }
+  if (method === 'GET' && path.startsWith('/calendars/events?')) {
+    if (v2LookupFails) return errRes(500, 'boom');
+    return jsonRes({ events: v2Appointments });
+  }
   if (method === 'GET' && /^\/contacts\/[^/]+$/.test(path)) {
     return jsonRes({ contact: { id: 'c1', tags: contactTags } });
   }
@@ -79,11 +89,13 @@ const FUTURE = '2027-07-08T10:00:00+00:00';          // LP wall-clock (EDT era)
 const FUTURE_GHL = '2027-07-08T10:00:00-04:00';      // its GHL rendering
 const OTHER_TIME_GHL = '2027-07-08T14:00:00-04:00';
 
-function reset({ upcoming = [], tags = [], lookupFails = false } = {}) {
+function reset({ upcoming = [], v2 = [], tags = [], lookupFails = false, v2Fails = false } = {}) {
   calls = [];
   upcomingAppointments = upcoming;
+  v2Appointments = v2;
   contactTags = tags;
   appointmentsLookupFails = lookupFails;
+  v2LookupFails = v2Fails;
 }
 const mutations = () => calls.filter((c) => c.method === 'POST' || c.method === 'PUT');
 const weAppt = (over = {}) => ({
@@ -256,16 +268,52 @@ test('CXL + none → noop nothing_to_cancel', async () => {
   const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('CXL') });
   assert.equal(res.outcome, 'noop');
   assert.equal(res.reason, 'nothing_to_cancel');
-  assert.equal(calls.filter((c) => c.path.startsWith('/calendars')).length, 0);
+  assert.equal(mutations().length, 0);
 });
 
-test('appointment lookup failure → throws, NO POST (fail closed)', async () => {
+test('appointment lookup failure → throws, NO POST (fail closed) — either source', async () => {
   reset({ lookupFails: true });
   await assert.rejects(
     () => reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') }),
     /appointment lookup failed/,
   );
   assert.equal(mutations().length, 0);
+
+  reset({ v2Fails: true });
+  await assert.rejects(() => reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') }));
+  assert.equal(mutations().length, 0);
+});
+
+test('appointment visible ONLY via the v2 events API is still seen (live double-book repro)', async () => {
+  // Live 2026-07-07: the Set-created appointment was invisible to the legacy
+  // endpoint, so the Cnf leg created a duplicate. With the union, Cnf must
+  // CONFIRM the v2-only appointment instead.
+  reset({ v2: [{ id: 'v2-appt-1', calendarId: WE, startTime: FUTURE_GHL, appointmentStatus: 'new' }] });
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Cnf') });
+  assert.equal(res.outcome, 'status_updated');
+  assert.equal(res.appointment_id, 'v2-appt-1');
+  assert.equal(calls.filter((c) => c.method === 'POST').length, 0, 'must not double-book');
+});
+
+test('legacy NAIVE timestamp at the same wall time → already_in_sync (no phantom reschedule)', async () => {
+  // The legacy endpoint returns "YYYY-MM-DD HH:mm:ss" local wall time with
+  // no offset; on a UTC server Date.parse reads it as UTC and every
+  // same-time appointment would misplan as a reschedule.
+  reset({ upcoming: [weAppt({ startTime: '2027-07-08 10:00:00', appointmentStatus: 'confirmed' })] });
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Cnf') });
+  assert.equal(res.outcome, 'noop');
+  assert.equal(res.reason, 'already_in_sync');
+  assert.equal(mutations().length, 0);
+});
+
+test('same appointment in BOTH sources → deduped, single object reconciled', async () => {
+  reset({
+    upcoming: [weAppt({ id: 'dup-1', startTime: '2027-07-08 10:00:00' })],
+    v2: [{ id: 'dup-1', calendarId: WE, startTime: FUTURE_GHL, appointmentStatus: 'new' }],
+  });
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Cnf') });
+  assert.equal(res.outcome, 'status_updated'); // one confirm PUT, not multiple_estimate_appointments
+  assert.equal(calls.filter((c) => c.method === 'PUT').length, 1);
 });
 
 test('dnc tag → Set noop dnc_consent, but CXL still cancels', async () => {

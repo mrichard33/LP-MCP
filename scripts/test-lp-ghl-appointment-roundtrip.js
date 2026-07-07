@@ -35,8 +35,12 @@ process.env.GHL_API_KEY = 'test-key';
 // Intentionally NOT setting SUPABASE_*.
 
 // ─── fetch stub with a mutable "GHL calendar" ────────────────────────────
+// API-created appointments are served ONLY via the v2 calendar-events list,
+// matching live GHL (verified 2026-07-07: the legacy contact-appointments
+// endpoint does not return them) — so this round trip also proves the
+// reconciler sees its own writes through the v2 leg of the union.
 let calls = [];
-let ghlCalendar = []; // events returned on GET /contacts/{id}/appointments
+let ghlCalendar = []; // events returned on GET /calendars/events?...
 
 function jsonRes(body) {
   return {
@@ -54,6 +58,9 @@ globalThis.fetch = async (url, opts = {}) => {
   calls.push({ method, path, body });
 
   if (method === 'GET' && /^\/contacts\/[^/]+\/appointments/.test(path)) {
+    return jsonRes({ events: [] }); // legacy endpoint never sees API-created appointments
+  }
+  if (method === 'GET' && path.startsWith('/calendars/events?')) {
     return jsonRes({ events: ghlCalendar });
   }
   if (method === 'GET' && /^\/contacts\/[^/]+$/.test(path)) {
@@ -123,12 +130,12 @@ test('fixed point: Set→Cnf→CXL each converge — the second pass is mutation
   const calendarPuts = calls.filter((c) => c.method === 'PUT' && c.path.startsWith('/calendars/'));
   assert.equal(calendarPuts.length, 1);
 
-  // CXL, pass 2: the appointment is dead — nothing to cancel, no calls.
+  // CXL, pass 2: the appointment is dead — nothing to cancel, no mutations.
   calls = [];
   res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('CXL') });
   assert.equal(res.outcome, 'noop');
   assert.equal(res.reason, 'nothing_to_cancel');
-  assert.equal(calls.filter((c) => c.path.startsWith('/calendars/')).length, 0);
+  assert.equal(mutations().length, 0);
 });
 
 test('reverse-leg guard: our POSTed startTime is date-equal AND wall-time-equal to the LP row', () => {

@@ -26,10 +26,23 @@
  * does by construction, since LP is where the date came from. Proven by
  * scripts/test-lp-ghl-appointment-roundtrip.js.
  *
- * Appointment lookup FAILS CLOSED: fetchUpcomingAppointments returning null
- * means the lookup FAILED (not "no appointments") — creating on top of that
- * risks a double-book, so we throw and let the executor retry. This is a
- * deliberate deviation from the fail-open guard in handlers/appointments.js.
+ * Appointment lookup queries BOTH GHL API generations and unions them
+ * (verified live 2026-07-07): the legacy contact-appointments endpoint
+ * (Version 2021-04-15, used by fetchUpcomingAppointments) returns
+ * workflow-created appointments but NOT ones created via the v2
+ * calendar-events API — the Set-leg appointment this module itself created
+ * was invisible to it, so the Cnf leg double-booked. The v2 list
+ * (GET /calendars/events) covers API-created ones. Either source failing
+ * FAILS CLOSED: creating on top of a blind lookup risks a double-book, so
+ * we throw and let the executor retry — a deliberate deviation from the
+ * fail-open guard in handlers/appointments.js.
+ *
+ * Timestamp normalization: the legacy endpoint returns NAIVE local wall
+ * time ("2026-07-08 10:00:00", location timezone, no offset) while v2
+ * returns ISO with offset. Naive strings are re-labeled with the
+ * DST-correct ET offset before any comparison — Date.parse would otherwise
+ * read them as UTC on the (UTC) server and misplan every same-time
+ * appointment as a reschedule.
  */
 
 import { ghlFetch } from '../actions/helpers.js';
@@ -87,10 +100,24 @@ export function classifyDisposition(code) {
   return 'out_of_scope';
 }
 
-/** Epoch-equality of two ISO timestamps; unparseable → false (favors reschedule over silent no-op). */
+/**
+ * Normalize a GHL start time for comparison. v2 API returns ISO with offset
+ * (pass-through); the legacy contact-appointments endpoint returns naive
+ * local wall time ("2026-07-08 10:00:00") which must be re-labeled with the
+ * DST-correct ET offset — Date.parse reads naive strings as UTC on a UTC
+ * server, 4-5h off.
+ */
+export function normalizeGhlStartTime(s) {
+  if (!s) return s;
+  const str = String(s);
+  if (/(Z|[+-]\d{2}:?\d{2})$/.test(str)) return str; // already offset-labeled
+  return lpWallClockToGhlStartTime(str) || str;
+}
+
+/** Epoch-equality of two GHL timestamps (naive-normalized); unparseable → false (favors reschedule over silent no-op). */
 export function sameStartTime(a, b) {
-  const aMs = Date.parse(a || '');
-  const bMs = Date.parse(b || '');
+  const aMs = Date.parse(normalizeGhlStartTime(a) || '');
+  const bMs = Date.parse(normalizeGhlStartTime(b) || '');
   if (Number.isNaN(aMs) || Number.isNaN(bMs)) return false;
   return aMs === bMs;
 }
@@ -145,6 +172,60 @@ function endTimeFor(startTime) {
   return new Date(Date.parse(startTime) + APPOINTMENT_DURATION_MS).toISOString();
 }
 
+// How far ahead the v2 calendar-events window reaches. LP books at most a
+// few weeks out; 120 days is comfortably past any real appointment.
+const V2_LOOKAHEAD_MS = 120 * 24 * 3600 * 1000;
+
+/**
+ * Union of both GHL API generations' views of this contact's upcoming
+ * appointments (see module header — each endpoint misses the other
+ * family's creations). Returns the fetchUpcomingAppointments shape with
+ * start_time offset-normalized. Throws when either source fails.
+ */
+async function fetchUpcomingAppointmentsUnion(contactId) {
+  // Legacy (workflow-created appointments; naive local timestamps).
+  const legacy = await fetchUpcomingAppointments(contactId);
+  if (!Array.isArray(legacy)) {
+    throw new Error(`legacy appointment lookup failed for contact ${contactId} — refusing to reconcile blind`);
+  }
+
+  // v2 (API-created appointments; ISO-with-offset timestamps). ghlFetch
+  // throws on non-OK, which is exactly the fail-closed behavior we want.
+  const nowMs = Date.now();
+  const v2res = await ghlFetch(
+    'GET',
+    `/calendars/events?locationId=${GHL_LOCATION_ID}&contactId=${contactId}` +
+    `&startTime=${nowMs - 3600 * 1000}&endTime=${nowMs + V2_LOOKAHEAD_MS}`,
+  );
+  const v2events = Array.isArray(v2res?.events) ? v2res.events : (Array.isArray(v2res) ? v2res : []);
+
+  const byId = new Map();
+  for (const a of legacy) {
+    if (a.appointment_id) byId.set(a.appointment_id, { ...a, start_time: normalizeGhlStartTime(a.start_time) });
+  }
+  for (const e of v2events) {
+    const id = e.id || e.appointment_id || null;
+    if (!id || byId.has(id)) continue;
+    const status = String(e.appointmentStatus || e.status || '').toLowerCase();
+    const startIso = normalizeGhlStartTime(e.startTime || e.start_time || null);
+    const endIso = e.endTime || e.end_time || null;
+    // Mirror fetchUpcomingAppointments' upcoming filter: drop already-ended.
+    const endMs = endIso ? Date.parse(normalizeGhlStartTime(endIso))
+      : (startIso ? Date.parse(startIso) + APPOINTMENT_DURATION_MS : NaN);
+    if (Number.isNaN(endMs) || endMs < nowMs) continue;
+    byId.set(id, {
+      appointment_id: id,
+      calendar_id: e.calendarId || e.calendar_id || null,
+      start_time: startIso,
+      end_time: endIso,
+      status: status || 'unknown',
+      title: e.title || null,
+    });
+  }
+  return Array.from(byId.values())
+    .sort((a, b) => (Date.parse(a.start_time || '') || Infinity) - (Date.parse(b.start_time || '') || Infinity));
+}
+
 async function contactHasConsentBlock(contactId, contactCache) {
   try {
     const contact = await getContactCached(contactId, contactCache);
@@ -195,11 +276,9 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, toNotify = 
     return noop('dnc_consent');
   }
 
-  // FAIL CLOSED on lookup failure (null ≠ empty array) — see module header.
-  const upcoming = await fetchUpcomingAppointments(contactId);
-  if (!Array.isArray(upcoming)) {
-    throw new Error(`appointment lookup failed for contact ${contactId} — refusing to reconcile blind`);
-  }
+  // FAIL CLOSED on lookup failure — see module header. Unions the legacy
+  // and v2 endpoints; either failing throws (executor retries).
+  const upcoming = await fetchUpcomingAppointmentsUnion(contactId);
 
   // The ESTIMATE POOL: MV and HPA are just different names for the Window
   // Estimate — the lead's estimate appointment may live on any of the three
