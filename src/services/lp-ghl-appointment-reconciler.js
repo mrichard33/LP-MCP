@@ -56,6 +56,14 @@ export const ESTIMATE_CALENDAR_IDS = new Set([
 
 const APPOINTMENT_DURATION_MS = 90 * 60 * 1000;
 
+// GHL requires an explicit assignedUserId when ignoreFreeSlotValidation is
+// set (no slot resolution → no auto-assign; verified live 2026-07-07: 422
+// "A team member needs to be selected"). Every WE appointment since July 1
+// (607/607 in the HL mirror) is assigned to this house booking account, so
+// creates default to it; env-overridable without a deploy.
+const DEFAULT_ASSIGNED_USER_ID =
+  process.env.LP_GHL_SYNC_ASSIGNED_USER_ID || '3K6HtoPyBLWeQrrnSnCD';
+
 // Full set from handlers/appointments.js (not exported there). Required here:
 // fetchUpcomingAppointments filters only cancelled/noshow/no-show, so
 // 'canceled', 'no_show' and 'invalid' leak through — without this re-filter a
@@ -259,6 +267,7 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, toNotify = 
       endTime: endTimeFor(startTime),
       title: 'Window Estimate',
       appointmentStatus: plan.status,
+      assignedUserId: DEFAULT_ASSIGNED_USER_ID,
       toNotify,
       ignoreFreeSlotValidation: true,
     });

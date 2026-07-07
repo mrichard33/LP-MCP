@@ -188,6 +188,9 @@ test('Set + none → exactly one POST: new, toNotify, ignoreFreeSlotValidation, 
       ({ calendarId, appointmentStatus, toNotify, ignoreFreeSlotValidation, startTime }))(posts[0].body),
     { calendarId: WE, appointmentStatus: 'new', toNotify: true, ignoreFreeSlotValidation: true, startTime: FUTURE_GHL },
   );
+  // ignoreFreeSlotValidation skips GHL's slot auto-assign, so an explicit
+  // assignee is mandatory (live 422 without it).
+  assert.ok(posts[0].body.assignedUserId, 'create must carry assignedUserId');
 });
 
 test('toNotify:false lands in the POST when notifications suppressed (backfill)', async () => {
