@@ -200,12 +200,16 @@ async function ghlGet(path) {
 
 // Exported (Quality Pass v1.0): the send handler re-reads the thread at the
 // pre-send chokepoint for near-duplicate + mid-generation-inbound checks.
+// 2026-07-07 duplicate incident: limit raised 20 → 60. The 24h anti-repeat
+// window is only as deep as this fetch — a verbatim script repeat 13 hours
+// (and ~20+ messages) after its prior delivery sailed past the gate because
+// the earlier send had scrolled out of the 20-message window.
 export async function fetchRecentMessages(contactId) {
   const search = await ghlGet(`/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`);
   const conversations = Array.isArray(search) ? search : (search?.conversations || []);
   if (!conversations.length) return { conversationId: null, messages: [] };
   const conversationId = conversations[0].id;
-  const msgData = await ghlGet(`/conversations/${conversationId}/messages?limit=20`);
+  const msgData = await ghlGet(`/conversations/${conversationId}/messages?limit=60`);
   const messages = msgData?.messages?.messages || msgData?.messages || [];
   return { conversationId, messages: Array.isArray(messages) ? messages : [] };
 }

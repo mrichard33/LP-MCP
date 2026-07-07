@@ -59,6 +59,25 @@ export function similarityRatio(a, b) {
 }
 
 /**
+ * Token containment: |shared words| / |words of the shorter message|.
+ * Character Levenshtein under-scores AI paraphrases of the same answer
+ * (the 2026-07-07 duplicate pair — semantically identical, differently
+ * worded — scored only ~0.59 char-wise). Shared-vocabulary containment
+ * captures "same answer, different phrasing" better; the combined measure
+ * takes the max of both.
+ */
+export function tokenContainment(a, b) {
+  if (!a || !b) return 0;
+  const ta = new Set(a.split(' '));
+  const tb = new Set(b.split(' '));
+  if (ta.size === 0 || tb.size === 0) return 0;
+  let shared = 0;
+  const [small, large] = ta.size <= tb.size ? [ta, tb] : [tb, ta];
+  for (const t of small) if (large.has(t)) shared++;
+  return shared / small.size;
+}
+
+/**
  * @param {string} candidate            the message about to be sent
  * @param {string[]} recentOutbound     bodies of outbound messages to compare against
  * @param {object} [opts]
@@ -72,7 +91,10 @@ export function findNearDuplicate(candidate, recentOutbound, { threshold = 0.9, 
   for (const prior of recentOutbound || []) {
     const normPrior = normalizeForComparison(prior, { firstName });
     if (!normPrior) continue;
-    const ratio = similarityRatio(normCandidate, normPrior);
+    const ratio = Math.max(
+      similarityRatio(normCandidate, normPrior),
+      tokenContainment(normCandidate, normPrior),
+    );
     if (ratio >= threshold) {
       return { duplicate: true, matched: prior, ratio };
     }
@@ -80,4 +102,4 @@ export function findNearDuplicate(candidate, recentOutbound, { threshold = 0.9, 
   return { duplicate: false };
 }
 
-export default { normalizeForComparison, similarityRatio, findNearDuplicate };
+export default { normalizeForComparison, similarityRatio, tokenContainment, findNearDuplicate };
