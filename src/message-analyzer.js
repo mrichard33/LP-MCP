@@ -880,19 +880,29 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
       'buildLeadContext',
     );
 
-    // 2026-06-10 — hard-DQ guard. Once the closeout chain has confirmed a
-    // structural disqualifier (hard-disqualified) or stamped the one-shot
-    // suppressor (suppress-outbound), the analyzer must defer entirely —
-    // no AI call, no intelligence writes, no proposals. The 6/9 incident:
-    // a DQ'd lead's reply was independently classified not-interested →
-    // passive_cooling, which left him agentic-active and re-enrollable.
-    // Authoritative DQ detection stays in the intent-classifier.
-    const DQ_TERMINAL_TAGS = ['hard-disqualified', 'suppress-outbound'];
-    const dqTag = (context.lead?.current_tags || [])
-      .find(t => DQ_TERMINAL_TAGS.includes(String(t).toLowerCase()));
-    if (dqTag) {
-      console.log(`[MessageAnalyzer] Skipping ${ghlContactId} — terminal suppression tag "${dqTag}" present (hard-DQ guard)`);
+    // 2026-06-10 — hard-DQ guard, re-scoped 2026-07-07 (always-respond
+    // policy). Original 6/9 incident: a DQ'd lead's reply was independently
+    // classified not-interested → passive_cooling, leaving him re-enrollable.
+    // Owner requirement now: the bot analyzes and answers ANY inbound while
+    // it owns the conversation (agentic-active present); only stop-bot
+    // silences it. So the guard fires only when:
+    //   - stop-bot is present (kill switch always wins), OR
+    //   - a terminal tag is present AND the bot does NOT own the
+    //     conversation (agentic-active absent — the closeout chain strips
+    //     it, so genuinely closed-out contacts still skip here).
+    const lcTags = (context.lead?.current_tags || []).map(t => String(t).toLowerCase());
+    if (lcTags.includes('stop-bot')) {
+      console.log(`[MessageAnalyzer] Skipping ${ghlContactId} — stop-bot present (kill switch)`);
       return null;
+    }
+    const DQ_TERMINAL_TAGS = ['hard-disqualified', 'suppress-outbound'];
+    const dqTag = lcTags.find(t => DQ_TERMINAL_TAGS.includes(t));
+    if (dqTag && !lcTags.includes('agentic-active')) {
+      console.log(`[MessageAnalyzer] Skipping ${ghlContactId} — terminal suppression tag "${dqTag}" present and conversation not agentic-owned (hard-DQ guard)`);
+      return null;
+    }
+    if (dqTag) {
+      console.log(`[MessageAnalyzer] hard-DQ guard bypass for ${ghlContactId}: "${dqTag}" present but agentic-active owns the conversation — analyzing (always-respond policy)`);
     }
 
     // v1.1 (R1, Victor Lopez incident 2026-07-04): every inbound message also
