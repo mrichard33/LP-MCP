@@ -121,6 +121,11 @@ import { registerAgenticLeadStateRoutes } from './admin/agentic-lead-states.js';
 // so it can run on Railway without shell access; shares its core with
 // scripts/remediate-guest-visitors.js.
 import { registerGuestVisitorRemediationRoutes } from './admin/guest-visitor-remediation.js';
+// ─── LP→GHL appointment backfill (2026-07-07) ──
+// One-shot gap closer exposed over HTTP (POST /admin/backfill-ghl-appointments,
+// dry-run by default) so it can run on Railway without shell access; shares
+// its core with scripts/backfill-ghl-appointments.js.
+import { registerGhlAppointmentBackfillRoutes } from './admin/ghl-appointment-backfill.js';
 // ─── LP Force-AddLead (manual + shared helper for no-lds_id appt failures) ──
 // v1.0.0 2026-06-03: POST /admin/lp/force-addlead creates a lead in LP via
 // the legacy addlead path with the appointment embedded + lognumber stamped,
@@ -536,6 +541,7 @@ registerAppointmentNotificationRoutes(app);
 registerGhlTriggerLinkRoutes(app);
 registerAgenticLeadStateRoutes(app);
 registerGuestVisitorRemediationRoutes(app);
+registerGhlAppointmentBackfillRoutes(app); // 2026-07-07 — LP→GHL appointment backfill trigger (dry-run default)
 registerLPForceAddLeadRoutes(app);
 registerLeadStateSweepRoutes(app);
 registerNoteChangeAnalyzerRoutes(app);
