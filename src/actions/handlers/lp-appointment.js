@@ -93,6 +93,7 @@ import { getContactCached } from '../contact-cache.js';
 import { toLpApptDate, toLpApptTime, normalizeDateForComparison } from '../date-parsers.js';
 import { resolveContactInfo } from '../resolvers.js';
 import { buildRichNotification } from '../enrichment.js';
+import { isGhlOnlyCalendarId } from '../../knowledge/booking-calendar-router.js';
 
 // GHL custom field IDs used by the writeback path. Keep in sync with
 // ghl-field-map.js.
@@ -129,6 +130,25 @@ export async function executeSetLPAppointment(action, context = {}) {
   if (action.event_id) {
     const { data: evt } = await supabase.from('system_events').select('payload').eq('id', action.event_id).maybeSingle();
     if (evt?.payload) eventPayload = typeof evt.payload === 'string' ? JSON.parse(evt.payload) : evt.payload;
+  }
+
+  // 2026-07-07 — defensive GHL-only skip (call-dispatch-integrity): all
+  // set_lp_appointment rules are currently disabled, but if one is ever
+  // re-enabled it must never push a GHL-only calendar (Confirmation Call)
+  // appointment into LP. calendar_id is authoritative; calendar_name is a
+  // best-effort fallback for payloads that only carry the name. No signal at
+  // all → proceed unchanged (defense-in-depth, not a gate).
+  const evtCalendarId = payload.calendar_id || eventPayload.calendar_id || null;
+  const evtCalendarName = String(payload.calendar_name || eventPayload.calendar_name || eventPayload.title || '').trim().toLowerCase();
+  if ((evtCalendarId && isGhlOnlyCalendarId(evtCalendarId)) || evtCalendarName === 'confirmation call') {
+    console.log(`[LP-APPT] skipped_ghl_only_calendar for ${contactId} (calendar=${evtCalendarId || evtCalendarName})`);
+    return {
+      action: 'skipped_ghl_only_calendar',
+      contact_id: contactId,
+      calendar_id: evtCalendarId,
+      calendar_name: payload.calendar_name || eventPayload.calendar_name || null,
+      reason: 'GHL-only calendar — appointments on this calendar are never synced to LP',
+    };
   }
 
   let lpLeadId = null;

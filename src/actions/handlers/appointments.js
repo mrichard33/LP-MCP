@@ -93,13 +93,13 @@ import { ghlFetch, interpolatePayload } from '../helpers.js';
 import { CALENDAR_MAP, GHL_LOCATION_ID } from '../constants.js';
 import { updateGHLContactFields, applyGHLTag, removeGHLTags } from '../../ghl.js';
 import { fetchUpcomingAppointments } from '../../knowledge/contact-appointments.js';
-import { isInHomeCalendarId } from '../../knowledge/booking-calendar-router.js';
+import { isInHomeCalendarId, isGhlOnlyCalendarId } from '../../knowledge/booking-calendar-router.js';
 import { markRescheduleInflight } from '../../services/reschedule-inflight.js';
 import { executeCreateTask } from './tasks.js';
 import { getContactCached } from '../contact-cache.js';
 import { isPlaceholderName } from '../../services/identity-extraction.js';
 import { emitEvent } from '../../event-emitter.js';
-import { syncCancelledAppointmentState } from './appointment-field-sync.js';
+import { syncCancelledAppointmentState, reconcileGhlOnlyApptTag } from './appointment-field-sync.js';
 
 // Tags cleared once a booking lands (or the flow otherwise terminates) so the
 // post-qualification affirmative-gate bypass (intent-classifier.js) doesn't
@@ -128,6 +128,13 @@ const NON_ACTIVE_APPOINTMENT_STATUSES = new Set([
 // gate blocks an in-home booking at creation time, so humans can find and
 // rescue these conversations.
 const GATE_BLOCKED_TAG = 'booking:gate-blocked';
+
+// 2026-07-07 — explicit LP-exemption marker (call-dispatch-integrity): any
+// appointment on a GHL-only calendar (Confirmation Call) is stamped with this
+// tag on booking and it is removed once no GHL-only appointment remains
+// active, so reconciliation logic — code, rules, or n8n — has an unambiguous
+// "never mirror this into LP" signal.
+const GHL_ONLY_APPT_TAG = 'ghl-only-appointment';
 
 function readContactCustomField(contact, fieldId) {
   const cfs = Array.isArray(contact?.customFields) ? contact.customFields : [];
@@ -343,6 +350,9 @@ export async function executeBookAppointment(action, context) {
     if (sameStartTime(existing.start_time, startTime)) {
       console.log(`[ActionExecutor] ⏭️  idempotent_skip: contact ${contactId} already has appointment ${existing.appointment_id} on calendar ${calendarId} at the requested time (${existing.start_time}) — no-op.`);
       await removeGHLTags(contactId, BOOKING_FLOW_TAGS).catch(() => {});
+      if (isGhlOnlyCalendarId(calendarId)) {
+        await applyGHLTag(contactId, GHL_ONLY_APPT_TAG).catch(() => {});
+      }
       return {
         action: 'appointment_book_skipped_existing',
         appointment_id: existing.appointment_id,
@@ -363,6 +373,9 @@ export async function executeBookAppointment(action, context) {
       endTime,
     });
     await removeGHLTags(contactId, BOOKING_FLOW_TAGS).catch(() => {});
+    if (isGhlOnlyCalendarId(calendarId)) {
+      await applyGHLTag(contactId, GHL_ONLY_APPT_TAG).catch(() => {});
+    }
     if (payload.qualifying_data) {
       await persistQualifyingData(contactId, payload.qualifying_data).catch(() => {});
     }
@@ -461,6 +474,14 @@ export async function executeBookAppointment(action, context) {
     await applyGHLTag(contactId, 'one-legger-risk').catch((err) =>
       console.warn(`[ActionExecutor] one-legger-risk tag failed for ${contactId} (fail-soft): ${err.message}`));
     console.log(`[ActionExecutor] one-legger-risk tagged for ${contactId} (decision_makers_present="${dmAnswer}") — booking proceeds per locked policy`);
+  }
+
+  // 2026-07-07 — explicit LP-exemption marker: GHL-only calendar bookings
+  // never sync to LP; the tag is the unambiguous skip signal for any
+  // reconciliation logic. Fail-soft — the booking is the primary side effect.
+  if (isGhlOnlyCalendarId(calendarId)) {
+    await applyGHLTag(contactId, GHL_ONLY_APPT_TAG).catch((err) =>
+      console.warn(`[ActionExecutor] ${GHL_ONLY_APPT_TAG} tag apply failed for ${contactId} (fail-soft): ${err.message}`));
   }
 
   // Quality Pass v1.0 Item 5 — persist the call purpose (why the lead wants
@@ -844,6 +865,14 @@ export async function executeRescheduleAppointment(action, context) {
       console.warn(`[ActionExecutor] reschedule duplicate-collapse lookup failed for ${contactId} (non-fatal): ${err.message}`);
     }
   }
+
+  // 2026-07-07 — reconcile the GHL-only marker once from live truth: covers
+  // both the old-appointment cancel and the new booking's calendar (re-applies
+  // the tag if the new appointment is GHL-only, removes it if the reschedule
+  // moved off a GHL-only calendar). The reschedule path bypasses
+  // syncCancelledAppointmentState, so it needs its own call. Fire-and-forget.
+  reconcileGhlOnlyApptTag(contactId)
+    .catch(err => console.warn(`[ActionExecutor] ghl-only tag reconcile failed for ${contactId}: ${err.message}`));
 
   // ─── Optional: persist qualifying data on the contact ──────────────
   let qualifyingDataFieldsWritten = 0;
