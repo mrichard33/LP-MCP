@@ -102,6 +102,36 @@ export const SUPPRESS_TAGS = [
 // Set for O(1) intersection check
 const SUPPRESS_SET = new Set(SUPPRESS_TAGS);
 
+// ─── 2026-07-07 ALWAYS-RESPOND POLICY (owner requirement) ───────────
+// "The agentic bot is active and responding any time agentic-active is
+// present; only stop-bot turns it off."
+//
+// While `agentic-active` is on the contact, a DIRECT REPLY may be blocked
+// only by stop-bot and the legal/consent opt-out family below — carrier
+// compliance that cannot be waived. The operational suppressors
+// (suppress-outbound, hard-disqualified, quarantined, cooling-active,
+// cannot-afford:pursuing-assistance) keep gating outbound campaigns,
+// nurture, and re-enrollment via the default mode, but no longer silence
+// an answer to a lead who just texted us. Incidents: 2026-07-06 21:41
+// (cooling-active/suppress-outbound swallowed the aluminum-windows reply)
+// and the same-day analyzer-guard silence.
+//
+// Callers opt in with checkSuppression(id, { mode: 'agentic_reply' }) —
+// today that is ONLY the send_message flow (executeSendMessageWithLock).
+// Every other caller (resurrection eligibility, future outbound handlers)
+// keeps the full list.
+const REPLY_BLOCKING_TAGS = [
+  'stop-bot',
+  // Consent / compliance — legally binding opt-outs
+  'dnc',
+  'dnc-related',
+  'dnc-sms',
+  'do-not-contact',
+  'stage:dnc',
+  'unsubscribed',
+];
+const REPLY_BLOCKING_SET = new Set(REPLY_BLOCKING_TAGS);
+
 /**
  * Check whether outbound should be suppressed for this contact.
  *
@@ -122,7 +152,7 @@ const SUPPRESS_SET = new Set(SUPPRESS_TAGS);
  *   { suppressed: true,  reason: 'suppression_tag_match',
  *     matched_tag: 'quarantined', all_matches: ['quarantined', 'dnc'] }
  */
-export async function checkSuppression(contact_id) {
+export async function checkSuppression(contact_id, { mode = 'default' } = {}) {
   if (!supabase) return { suppressed: false, reason: 'no_supabase_open' };
   if (!contact_id) return { suppressed: false, reason: 'no_contact_id_open' };
 
@@ -139,6 +169,30 @@ export async function checkSuppression(contact_id) {
 
   if (!data || !Array.isArray(data.tags) || data.tags.length === 0) {
     return { suppressed: false, reason: 'no_snapshot_open' };
+  }
+
+  // Always-respond policy (see REPLY_BLOCKING_TAGS above): for a direct
+  // agentic reply on a contact the bot owns, only stop-bot + the consent
+  // family block. Operational suppressors are reported, not enforced.
+  if (mode === 'agentic_reply' && data.tags.includes('agentic-active')) {
+    const blocking = data.tags.filter(t => REPLY_BLOCKING_SET.has(t));
+    if (blocking.length > 0) {
+      return {
+        suppressed: true,
+        reason: 'suppression_tag_match',
+        matched_tag: blocking[0],
+        all_matches: blocking,
+      };
+    }
+    const bypassed = data.tags.filter(t => SUPPRESS_SET.has(t));
+    if (bypassed.length > 0) {
+      console.log(`[suppression-check] agentic_reply bypass for ${contact_id}: agentic-active present — operational tags [${bypassed.join(', ')}] do not block a direct reply`);
+    }
+    return {
+      suppressed: false,
+      reason: bypassed.length > 0 ? 'agentic_reply_bypass' : 'no_match',
+      bypassed_tags: bypassed,
+    };
   }
 
   const matches = data.tags.filter(t => SUPPRESS_SET.has(t));

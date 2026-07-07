@@ -197,7 +197,10 @@ async function fetchSourceEvent(action) {
 // header for the full story.
 async function executeSendMessageWithLock(action, context) {
   return runSendMessageFlow(action, context, {
-    checkSuppression,
+    // 2026-07-07 always-respond policy: a direct reply on an agentic-active
+    // contact is blocked only by stop-bot + the consent/DNC family;
+    // operational suppressors gate campaigns and re-enrollment, not answers.
+    checkSuppression: (contact_id) => checkSuppression(contact_id, { mode: 'agentic_reply' }),
     resolveTriggerId: async (a, ctx) => {
       const params = a.action_payload || {};
       let trigger_id = params.trigger_id || ctx?.message_id || null;

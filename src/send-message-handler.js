@@ -271,6 +271,39 @@ async function fetchContactTags(contactId) {
 }
 
 /**
+ * 2026-07-07 (always-respond policy) — tag resolution with fallback.
+ * Guardrail 1 used to drop the reply on a single failed GHL read. Chain:
+ *   1. live GHL read           → source 'ghl_live'
+ *   2. one immediate retry     → source 'ghl_live_retry'
+ *   3. contact_tag_snapshot    → source 'snapshot' (kept current by the
+ *      GHL tag webhook; same read the universal suppression gate and the
+ *      intake ownership stamp already trust)
+ *   4. all failed              → { tags: null } — caller DEFERS, never drops
+ */
+async function resolveContactTagsWithFallback(contactId) {
+  let tags = await fetchContactTags(contactId);
+  if (tags !== null) return { tags, source: 'ghl_live' };
+
+  tags = await fetchContactTags(contactId);
+  if (tags !== null) return { tags, source: 'ghl_live_retry' };
+
+  try {
+    const { data, error } = await supabase
+      .from('contact_tag_snapshot')
+      .select('tags')
+      .eq('ghl_contact_id', contactId)
+      .maybeSingle();
+    if (!error && data && Array.isArray(data.tags)) {
+      return { tags: data.tags, source: 'snapshot' };
+    }
+  } catch (err) {
+    console.warn(`[SendMessage] tag snapshot fallback threw for ${contactId}: ${err.message}`);
+  }
+
+  return { tags: null, source: 'unavailable' };
+}
+
+/**
  * v3.12 — Hard suppression check (compliance only).
  *
  * Hard suppression (ALWAYS blocks):
@@ -1305,15 +1338,27 @@ export async function executeSendMessage(action, context) {
   }
 
   // ── Guardrail 1: Fetch contact tags ────────────────────────────
-  const tags = await fetchContactTags(contactId);
+  // 2026-07-07 (always-respond policy): a transient GHL blip here used to
+  // fail closed and permanently DROP the reply (22:50 incident: action
+  // 170720 completed as send_message_blocked/tag_fetch_failed while GHL
+  // reads were erroring). Resolution chain: live GHL → one retry →
+  // contact_tag_snapshot fallback → if every source fails, DEFER (status
+  // stays pending, retry_at ~90s) so the reply sends when GHL recovers.
+  // A reply can be late; it must never vanish.
+  const tagResolution = await resolveContactTagsWithFallback(contactId);
+  const tags = tagResolution.tags;
   if (tags === null) {
-    console.log(`[SendMessage] ⛔ BLOCKED: Could not fetch tags for ${contactId} — failing closed`);
+    console.warn(`[SendMessage] ⏸️ DEFERRED: no tag source available for ${contactId} (GHL + snapshot both failed) — retrying in 90s instead of dropping`);
     return {
-      action: 'send_message_blocked',
+      deferred: true,
+      reason: 'tag_sources_unavailable',
+      retry_at: new Date(Date.now() + 90 * 1000).toISOString(),
       contact_id: contactId,
-      reason: 'tag_fetch_failed',
       channel,
     };
+  }
+  if (tagResolution.source !== 'ghl_live') {
+    console.log(`[SendMessage] tag resolution for ${contactId} used ${tagResolution.source}`);
   }
 
   // ── Guardrail 2: Hard suppression check (v3.12 — compliance only) ──
