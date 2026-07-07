@@ -456,6 +456,34 @@ async function fetchLPNotes(lpLeadId, limit = 8) {
   }
 }
 
+/**
+ * 2026-07-07 (owner requirement — trust through personalization): the GHL
+ * contact-record notes are the richest per-lead intel we have (canvassing
+ * observations, rep call notes, the agentic escalation summaries this
+ * system writes via add_note). Until now the responder never read them —
+ * only LP notes reached the prompt. Fetch the most recent notes so every
+ * generated reply can personalize from what the team actually knows about
+ * this person. Fail-soft: any error returns [] and generation proceeds.
+ */
+async function fetchGHLNotes(ghlContactId, limit = 6) {
+  if (!ghlContactId) return [];
+  try {
+    const data = await ghlFetch('GET', `/contacts/${ghlContactId}/notes`);
+    const notes = Array.isArray(data?.notes) ? data.notes : [];
+    return notes
+      .map(n => ({
+        text: String(n.body || '').trim().slice(0, 600),
+        date: n.dateAdded || n.date_added || '',
+      }))
+      .filter(n => n.text.length > 0)
+      .sort((a, b) => String(b.date).localeCompare(String(a.date)))
+      .slice(0, limit);
+  } catch (err) {
+    console.warn(`[ContextBuilder] GHL notes fetch failed for ${ghlContactId}:`, err.message);
+    return [];
+  }
+}
+
 async function fetchLPCalls(lpLeadId, limit = 5) {
   if (!lpLeadId) return [];
   try {
@@ -719,13 +747,14 @@ export async function buildLeadContext(ghlContactId, options = {}) {
   }
 
   const lpLeadId = lpLead?.lp_lead_id || null;
-  const [conversation, lpNotes, lpCalls, pipelineStageInfo, nurtureHistory, openObjectionState] = await Promise.all([
+  const [conversation, lpNotes, lpCalls, pipelineStageInfo, nurtureHistory, openObjectionState, ghlNotes] = await Promise.all([
     (includeConversation && ghlContact) ? fetchConversation(ghlContactId, 10) : [],
     fetchLPNotes(lpLeadId),
     fetchLPCalls(lpLeadId),
     opportunity?.pipelineStageId ? resolvePipelineStage(opportunity.pipelineStageId) : null,
     fetchNurtureHistory(ghlContactId, workflow_code),
     fetchOpenObjectionState(ghlContactId),
+    fetchGHLNotes(ghlContactId),
   ]);
 
   const tags = ghlContact?.tags || [];
@@ -780,6 +809,11 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       suppression_tags: parseSuppressionTags(tags),
       lead_score: ghlContact?.leadScore || 0,
       date_added: ghlContact?.dateAdded || null,
+      // 2026-07-07 (trust through personalization): most recent GHL
+      // contact-record notes — canvassing observations, rep call notes,
+      // agentic escalation summaries. Rendered into the generation prompt
+      // as internal intel for personalizing replies.
+      contact_notes: ghlNotes,
     },
 
     pipeline: {

@@ -1360,6 +1360,18 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     }
   }
 
+  // 2026-07-07 (owner requirement — trust through personalization): the GHL
+  // contact-record notes are read before EVERY generated reply. This is the
+  // team's accumulated knowledge of the person — use it.
+  if (context.lead?.contact_notes?.length) {
+    parts.push(`\nCONTACT NOTES (internal team notes on this person — most recent first):`);
+    context.lead.contact_notes.slice(0, 6).forEach(n => {
+      const when = n.date ? String(n.date).slice(0, 10) : '';
+      parts.push(`  [${when}] ${n.text}`);
+    });
+    parts.push(`HOW TO USE THESE NOTES: they exist so your reply lands like it comes from someone who KNOWS this person. Weave in what's relevant — their situation, spouse/family details, pets, stated preferences and constraints, prior commitments — naturally and sparingly (one personal touch beats three). NEVER mention that notes exist, never quote a note verbatim, never surface internal shorthand, rep commentary, scores, or anything that would feel like surveillance rather than attentiveness. If a note conflicts with what the lead just said, what the lead said wins. The goal is trust: show them they don't have to repeat themselves.`);
+  }
+
   if (context.intelligence?.buyer_stage) {
     parts.push(`\nPRIOR AI ANALYSIS:`);
     parts.push(`Buyer Stage: ${context.intelligence.buyer_stage} (conf: ${context.intelligence.buyer_stage_confidence})`);
