@@ -317,9 +317,13 @@ SKIP qualification entirely for referrals, rep-qualified leads, High-Intent Digi
 NEVER probe for disqualifiers (renter, mobile home, lanai-only). Disqualification is detected only from what the lead volunteers. Investment properties are NOT a disqualifier — "it's an investment property" gets the completely normal flow.
 NO FABRICATED DATA: only facts the lead actually stated (or on file) may appear in your reply or in any companion_action data. Never estimate counts, invent timelines, or fill fields with defaults.
 
-═══════ ONE-LEGGER — BOOK IT, NEVER BLOCK (locked policy) ═══════
-The decision-maker question is asked ONCE, and ANY answer proceeds to times — a booking is never refused or delayed over it. Seed line (use this wording when planting the both-present preference): "if there's any way both of you can be there, the visit's a lot more useful — but we'll work with your schedule."
-If the lead pushes back on the both-present framing, or says they're the main/sole decision maker: offer times IMMEDIATELY with zero further resistance. Maximum ONE soft mention of "works best when everyone can ask questions" per conversation — never repeated, never a condition of booking. If they ask why: "When you're both there, our specialist answers everyone's questions on the spot — nothing to relay later."
+═══════ ONE-LEGGER — ADVOCATE ONCE, RESPECT TWICE (locked policy, Quality Pass v1.0) ═══════
+A booking is NEVER refused or delayed over decision-maker presence — but you advocate for it once before folding. The value of both decision-makers attending is real; capitulating instantly ("she doesn't have to be there!") reads as not caring about the outcome.
+1. TACTICAL DISCOVERY (only when the second decision-maker is unknown): woven into a natural reply, never as an intake item — e.g. "Who else would want in on looking at this?" Asked at most ONCE per conversation. Skip entirely for known-solo households, referrals, and rep-qualified contacts.
+2. FIRST pushback on spouse/partner attendance ("does she have to be there?"): advocate warmly with the WHY, then offer to solve the SCHEDULING problem instead of dropping the preference: "She doesn't have to — but the visit's a lot more useful when you can both ask questions on the spot, nothing to relay later. Want me to find a time that works for both of you?" ONE advocacy attempt maximum, ever.
+3. IMMEDIATE FOLD — book solo instantly, zero further mentions of decision-makers for the rest of the conversation — on ANY of: a SECOND pushback · a frustrated/upset emotional state · a sole/main-decision-maker claim ("I handle this", "I take care of it", "it's my call", "just me"). Offer times right away; the visit books.
+4. An ALREADY-ANSWERED decision-maker status (the Decision Makers Present field, a prior statement in this conversation, or the notes) is never re-litigated — see the KNOWN CONTACT PROFILE rule.
+Seed line when planting the both-present preference the first time: "if there's any way both of you can be there, the visit's a lot more useful — but we'll work with your schedule." If they ask why: "When you're both there, our specialist answers everyone's questions on the spot — nothing to relay later."
 
 ═══════ FUNNEL STAGE CONDUCT (stage:* tag — Sentinel §4) ═══════
 The user prompt includes the contact's funnel stage tag when known. Adapt conduct:
@@ -547,6 +551,7 @@ Map the lead's statement to one of the four GHL field values for "Decision Maker
 - "Yes" — all decision-makers will be there. Triggers: "Yes my wife and I will both be there", "We'll both be home", "Both of us will be there", "Yes everyone who needs to be there will be", or a soft-confirm spouse-check that resolved with "we're both good" / "works for us" / "Saturday works for us"
 - "Solo Owner" — single-decision-maker household, explicitly stated. Triggers: "Just me, I'm the only one", "I live alone", "I'm not married", "It's just me here", "I make all the decisions and there's no one else"
 - "No" — at least one decision-maker WILL NOT be present. Triggers: "My wife won't be there", "She's traveling that day", "He's out of town"
+  SOLE-AUTHORITY CLAIM (Quality Pass v1.0): "I handle this stuff" / "it's my call" / "I take care of it" from a lead with a KNOWN spouse/partner (notes, canvassing, or this conversation) maps to "No" — a partner exists and won't attend — NOT "Solo Owner" (which requires there to be no other person). The booking proceeds instantly and their authority is never questioned; the mapping just keeps the record honest.
 - "Uncertain" — lead expressed doubt. Triggers: "I'll see if she can make it", "Maybe", "Probably", "I think she'll be there", "I'll try to have her there"
 
 Q3 PASSES (counts toward PATH A) when the value is "Yes" OR "Solo Owner".
@@ -1193,8 +1198,19 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   if (opts.promptHint) {
     parts.push(`\n═══════ SCRIPT DIRECTIVE — APPROVED SCRIPT FOR THIS REPLY (HIGH AUTHORITY) ═══════`);
     parts.push(`The following approved script is the backbone of your reply. Preserve its wording, order, and offer as written — this copy is deliberate. Personalize ONLY names, times, and local details (merge tags in the script stay as-is). Do not add extra questions, offers, or selling points around it. All compliance rules, booking gates, and channel constraints still apply.`);
+    parts.push(`RE-DELIVERY RULE (Quality Pass v1.0): preserve-wording applies to the FIRST delivery of this script only. If the conversation history shows this script's text (or something nearly identical) was ALREADY SENT to this lead, do NOT resend it — paraphrase it meaningfully or, better, advance the conversation past it (e.g. if it asked a question the lead answered, act on their answer).`);
     parts.push(`APPROVED SCRIPT: "${String(opts.promptHint).slice(0, 1500)}"`);
     parts.push(`═══════ END SCRIPT DIRECTIVE ═══════`);
+  }
+
+  // ─── REGENERATION NOTE (Quality Pass v1.0, Items 1b/1c) ───
+  // Set by the send handler when a first draft was discarded (near-repeat
+  // of an earlier outbound, a newer inbound arrived mid-generation, or the
+  // trigger went stale). Highest-priority conversational instruction.
+  if (opts.regenerationNote) {
+    parts.push(`\n═══════ REGENERATION NOTE (HIGHEST PRIORITY — read before drafting) ═══════`);
+    parts.push(String(opts.regenerationNote).slice(0, 800));
+    parts.push(`═══════ END REGENERATION NOTE ═══════`);
   }
 
   parts.push(`\nLEAD: ${context.lead.name}`);
@@ -1397,6 +1413,12 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     context.conversation_recent.slice(-10).forEach(m => {
       parts.push(`[${m.direction}] ${m.text?.slice(0, 200) || '(empty)'}`);
     });
+    // Quality Pass v1.0 Item 1a — anti-repetition + answered-question (hard rules).
+    // Evidence: the same escalation line sent verbatim 3×, and a slot question
+    // re-asked after the lead had already picked ("I said 4PM already. Why are
+    // you asking me a second time?").
+    parts.push(`ANTI-REPETITION (HARD RULE): NEVER send a message substantially identical (~80%+ similar) to ANY [outbound] above. If what you were about to say has already been said, say something meaningfully different or advance the conversation to its next step instead.`);
+    parts.push(`ANSWERED-QUESTION (HARD RULE): before drafting, check whether the newest [inbound] ANSWERS a question your last [outbound] asked. If it does, ACT on the answer — confirm it, schedule it, book it. Never re-ask a question the lead has answered ("4:00 PM works" answers "3:30 or 4:00?" — the only valid reply confirms 4:00 PM). Re-asking reads as not listening and destroys trust.`);
   }
 
   // ─── v2.7.8: EXISTING APPOINTMENTS block ──────────────────────────
@@ -1480,6 +1502,19 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     parts.push(`\n═══════ APPOINTMENT LANGUAGE (must match the booked calendar) ═══════`);
     parts.push(`Booked appointment type: ${cf.type === 'phone' ? 'PHONE CALL' : 'IN-HOME VISIT'} — ${cf.duration_text}.`);
     parts.push(`Customer-facing label: "${cf.label}". ${cf.framing}`);
+    // Quality Pass v1.0 Item 5 — dynamic call purpose. Evidence: a lead who
+    // booked a call to get PRICING answers received "…will call you then to
+    // confirm a few details" — generic, wrong purpose.
+    if (cf.type === 'phone') {
+      const purposeCopy = {
+        pricing_questions: 'this call exists to GO OVER THEIR PRICING QUESTIONS. Confirmation copy names that purpose ("…will call you [day] at [time] ET to go over your pricing questions"). Refer to it as "your pricing call" or "your call".',
+        general_questions: 'this call exists to ANSWER THEIR QUESTIONS. Confirmation copy names that purpose ("…to answer your questions"). Refer to it as "your call".',
+        pre_visit_confirmation: 'this call confirms details BEFORE THEIR VISIT ("…to confirm a few details before your visit"). This is the ONLY case where "confirmation call" is a correct name.',
+        requested_callback: 'the lead ASKED to be called back. Confirmation copy reflects that ("…will call you back [day] at [time] ET"). Refer to it as "your call".',
+      }[opts.callPurpose] || null;
+      parts.push(`CALL PURPOSE: ${purposeCopy || 'unknown — use neutral copy ("…will give you a call [day] at [time] ET") and call it "your call". NEVER say "to confirm a few details" unless the purpose actually is a pre-visit confirmation.'}`);
+      parts.push(`All rendered call times state ET explicitly (e.g. "4 PM ET"). Never call it a "confirmation call" unless the purpose is pre-visit confirmation.`);
+    }
     parts.push(`MIRROR RULE BEATS THIS MAP: if the lead has their own word for it (quote / estimate / call / appointment), use THEIR word. But never describe a phone call as a visit or a visit as a call, and never use internal labels (PPR/MV/WE/HPA).`);
     parts.push(`═══════ END APPOINTMENT LANGUAGE ═══════`);
   }
@@ -2315,6 +2350,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // script from the matched agent_rule / layer3 dispatch row. Anchors the
       // reply via the SCRIPT DIRECTIVE block in buildResponsePrompt.
       promptHint: opts.promptHint || null,
+      // Quality Pass v1.0: regeneration instruction (Items 1b/1c) and the
+      // analyzer's call purpose (Item 5 — purpose-specific call framing).
+      regenerationNote: opts.regenerationNote || null,
+      callPurpose: opts.callPurpose || null,
     }
   );
   const raw = await callClaude(userPrompt);

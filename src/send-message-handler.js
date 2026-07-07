@@ -220,7 +220,12 @@ import { resolveContactInfo, resolveLPProspectId } from './actions/resolvers.js'
 import { buildNotificationEnrichment, buildRichNotification } from './actions/enrichment.js';
 // 2026-07-03 rebuild (Steve Nkzhm incident) — channel/identity inheritance,
 // AI-disclosure hard guard, per-contact supersession check.
-import { resolveReplyContext, guardDisclosure } from './agentic/reply-sender.js';
+import { resolveReplyContext, guardDisclosure, fetchRecentMessages } from './agentic/reply-sender.js';
+// Conversation Quality Pass v1.0 (2026-07-07): quiet-hours hold for
+// bot-initiated sends, near-duplicate suppression, stale/mid-generation
+// regeneration.
+import { isInQuietHours, nextSendWindowOpenAt } from './services/quiet-hours.js';
+import { findNearDuplicate } from './services/message-similarity.js';
 import { checkNotSuperseded, commitAgenticSend } from './services/agentic-reply-locks.js';
 import { emitEvent } from './event-emitter.js';
 
@@ -265,6 +270,28 @@ async function fetchContactTags(contactId) {
     if (!res.ok) return null;
     const data = await res.json();
     return data?.contact?.tags || [];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Quality Pass v1.0 — source-event metadata for send classification.
+ * event_type distinguishes a direct reply (ai.analysis_completed) from a
+ * bot-initiated send (agentic.hold_completed, follow-ups, cancel-timeout);
+ * created_at is the trigger-freshness anchor for the stale-draft and
+ * mid-generation-inbound checks. Fail-soft: null on any error.
+ */
+async function fetchSourceEventMeta(eventId) {
+  if (!eventId || !supabase) return null;
+  try {
+    const { data, error } = await supabase
+      .from('system_events')
+      .select('event_type, created_at')
+      .eq('id', eventId)
+      .maybeSingle();
+    if (error) return null;
+    return data || null;
   } catch {
     return null;
   }
@@ -1235,7 +1262,7 @@ const COMPANION_AUTO_EXECUTE = new Set([
   'reschedule_appointment',
 ]);
 
-async function queueCompanionAction(parentAction, generated) {
+async function queueCompanionAction(parentAction, generated, callPurpose = null) {
   if (!generated || !generated.companion_action) {
     return { queued: false, reason: 'no_companion' };
   }
@@ -1260,6 +1287,15 @@ async function queueCompanionAction(parentAction, generated) {
   // approval-path.js v4.10 sequence_order race fix)
   const seqAfterSend = (ctype === 'book_appointment' || ctype === 'reschedule_appointment');
   const companionSeqOrder = seqAfterSend ? parentSeq + 2 : parentSeq - 1;
+
+  // Quality Pass v1.0 Item 5 — stamp the analyzer's call purpose onto
+  // phone-call bookings server-side (deterministic; the model never
+  // free-types it). The appointments handler persists it best-effort.
+  if ((ctype === 'book_appointment' || ctype === 'reschedule_appointment')
+      && callPurpose
+      && !companion.action_payload.call_purpose) {
+    companion.action_payload.call_purpose = callPurpose;
+  }
 
   try {
     const { data, error } = await supabase
@@ -1429,6 +1465,38 @@ export async function executeSendMessage(action, context) {
       channel = replyContext.channel;
     }
   }
+  // ── Quiet hours (Quality Pass v1.0 Item 2, America/New_York) ────
+  // Bot-INITIATED sends (hold returns, follow-up re-engagements, cancel
+  // dead-man confirmations — anything whose source event is not
+  // ai.analysis_completed) are held to the 8AM–9PM ET window: a 9:09 PM
+  // proactive booking push is a courtesy/TCPA violation. Direct replies to
+  // a FRESH inbound (≤15 min) are ALWAYS allowed — a lead who texts at
+  // 10 PM gets an answer at 10 PM. Held sends DEFER (retry_at = next
+  // window open) and re-enter through the staleness regeneration below —
+  // delayed, never dropped (always-respond policy). Fail-open on missing
+  // metadata: an unclassifiable reply-class send is treated as fresh.
+  const sourceEventMeta = await fetchSourceEventMeta(action.event_id);
+  const isReplyClass = sourceEventMeta?.event_type === 'ai.analysis_completed'
+    || sourceEventMeta?.event_type === 'ghl.reply_received';
+  const FRESH_REPLY_WINDOW_MS = 15 * 60 * 1000;
+  const newestInboundAtPre = replyContext?.newestInboundAt || null;
+  const freshInboundReply = isReplyClass && (
+    newestInboundAtPre === null
+    || (Date.now() - Date.parse(newestInboundAtPre)) <= FRESH_REPLY_WINDOW_MS
+  );
+  if (!freshInboundReply && isInQuietHours()) {
+    const retryAt = nextSendWindowOpenAt();
+    console.log(`[SendMessage] 🌙 QUIET HOURS: ${contactId} send is bot-initiated (source: ${sourceEventMeta?.event_type || 'unknown'}) or reply-to-stale-inbound — holding until ${retryAt}`);
+    return {
+      deferred: true,
+      reason: 'quiet_hours_hold',
+      retry_at: retryAt,
+      contact_id: contactId,
+      channel,
+      source_event_type: sourceEventMeta?.event_type || null,
+    };
+  }
+
   // Livechat replies are generated with SMS constraints (short,
   // conversational, one question) — the widget is a chat surface.
   const generationChannel = channel === 'livechat' ? 'sms' : channel;
@@ -1505,6 +1573,9 @@ export async function executeSendMessage(action, context) {
           // requested_fulfillment (from the ai.analysis_completed payload in
           // the event context) outranks funnel defaults in the calendar router.
           requestedFulfillment: context.requested_fulfillment || null,
+          // Quality Pass v1.0 Item 5 — the analyzer's call purpose drives
+          // purpose-specific call confirmations ("your pricing call").
+          callPurpose: context.call_purpose || null,
         });
 
         // ── SHORT-CIRCUIT handling (compliance gate fired) ──
@@ -1649,6 +1720,130 @@ export async function executeSendMessage(action, context) {
     }
   }
 
+  // ── Quality Pass v1.0 Items 1b/1c: freshness + anti-repetition ──
+  // Evidence: the same escalation line delivered verbatim 3× (once AFTER
+  // the lead answered it), a slot question re-asked after "4 PM works",
+  // and 20-minute-stale drafts landing mid-unrelated-exchange. Order:
+  // staleness/mid-generation-inbound first (regenerate from CURRENT
+  // thread), then near-duplicate check on whatever is about to go out.
+  // Everything here fails OPEN — a check that errors never blocks the
+  // send (always-respond policy).
+  try {
+    let recentMessages = [];
+    try {
+      const fetched = await fetchRecentMessages(contactId);
+      recentMessages = Array.isArray(fetched?.messages) ? fetched.messages : [];
+    } catch (fetchErr) {
+      console.warn(`[SendMessage] quality-pass thread fetch failed for ${contactId} (fail-open): ${fetchErr.message}`);
+    }
+
+    const nowMs = Date.now();
+    const sourceCreatedMs = sourceEventMeta?.created_at ? Date.parse(sourceEventMeta.created_at) : null;
+    const newestInboundMsg = recentMessages.find(m => m?.direction === 'inbound');
+    const newestInboundMs = newestInboundMsg
+      ? Date.parse(newestInboundMsg.dateAdded || newestInboundMsg.dateUpdated || '')
+      : NaN;
+    const staleMs = (parseInt(process.env.MAX_TRIGGER_STALENESS_MIN || '10', 10)) * 60 * 1000;
+
+    // 1c — regenerate when the draft no longer reflects the thread.
+    let regenReason = null;
+    if (sourceCreatedMs && Number.isFinite(newestInboundMs) && newestInboundMs > sourceCreatedMs + 2000) {
+      regenReason = 'newer_inbound_mid_generation';
+    } else if (sourceCreatedMs && (nowMs - sourceCreatedMs) > staleMs) {
+      regenReason = 'stale_trigger';
+    }
+
+    // 1b — near-duplicate of an outbound already sent in the last 24h.
+    // First sends are inherently exempt: nothing matches. Uses the raw
+    // thread bodies; the contact's first name and merge tags are stripped
+    // in normalization.
+    const outbound24h = recentMessages
+      .filter(m => m?.direction === 'outbound' && typeof m.body === 'string' && m.body.trim())
+      .filter(m => {
+        const ts = Date.parse(m.dateAdded || m.dateUpdated || '');
+        return Number.isFinite(ts) && (nowMs - ts) <= 24 * 60 * 60 * 1000;
+      })
+      .map(m => m.body);
+    const dup = findNearDuplicate(message, outbound24h, { threshold: 0.9 });
+    if (dup.duplicate && !regenReason) regenReason = 'duplicate_send_suppressed';
+
+    if (regenReason) {
+      console.warn(`[SendMessage] ♻️ ${regenReason} for ${contactId} (action ${action.id}) — regenerating from current thread${dup.duplicate ? ` (matched prior outbound at ratio ${dup.ratio?.toFixed(2)})` : ''}`);
+      if (regenReason === 'duplicate_send_suppressed') {
+        emitEvent({
+          event_type: 'agentic.duplicate_send_suppressed',
+          source: 'lp_mcp', entity_type: 'contact',
+          entity_id: String(contactId), ghl_contact_id: String(contactId),
+          priority: 'normal',
+          payload: {
+            blocked_body: String(message).slice(0, 400),
+            matched_prior: String(dup.matched || '').slice(0, 400),
+            similarity: dup.ratio || null,
+            rule_applied: action.rule_applied || null,
+            action_id: action.id || null,
+          },
+          idempotency_key: `dup_suppress_${contactId}_${action.id || Date.now()}`,
+        }).catch(() => {});
+      }
+
+      const regenNotes = {
+        duplicate_send_suppressed: 'Your previous draft repeated a message this conversation has ALREADY received nearly verbatim. Do not send it again — say it differently in substance, or better, advance the conversation to the next step. If the earlier message asked a question the lead has since answered, act on their answer instead of re-asking.',
+        newer_inbound_mid_generation: 'A NEW inbound message arrived after this reply was drafted. Read the conversation history end-to-end and respond to the lead\'s LATEST message — if it answers a question the earlier draft was asking, act on the answer, never re-ask.',
+        stale_trigger: 'This reply was drafted several minutes ago and the moment may have passed. Re-read the conversation history and respond to where the conversation is NOW — do not answer an old message as if it just arrived.',
+      };
+      const freshTrigger = (regenReason === 'newer_inbound_mid_generation' && newestInboundMsg?.body)
+        ? newestInboundMsg.body
+        : (context.message_text || context.messageText || context.body || context.message_preview || message);
+
+      const priorAttempts = Number(action.execution_result?.quality_regen_attempts) || 0;
+      if (priorAttempts >= 1) {
+        // A previous execution already regenerated for this action —
+        // send what we have rather than loop (always-respond).
+        console.warn(`[SendMessage] quality regen already attempted for action ${action.id} — sending current draft`);
+      } else {
+        try {
+          bumpContactCache(contactId);
+          const regenerated = await generateResponse(contactId, generationChannel, freshTrigger, {
+            threadSenderType: 'rep',
+            promptHint: payload.prompt_hint || null,
+            requestedFulfillment: context.requested_fulfillment || null,
+            callPurpose: context.call_purpose || null,
+            regenerationNote: regenNotes[regenReason],
+          });
+          if (!regenerated.short_circuit && regenerated.message) {
+            const regenDisclosure = guardDisclosure(regenerated.message);
+            message = regenDisclosure.blocked ? regenDisclosure.body : regenerated.message;
+            subject = regenerated.subject || subject;
+            generated = regenerated;
+            const dup2 = findNearDuplicate(message, outbound24h, { threshold: 0.9 });
+            if (dup2.duplicate) {
+              // Bounded: one regeneration. A still-similar regen ships —
+              // repetition risk loses to silence risk.
+              console.warn(`[SendMessage] regenerated draft still similar (${dup2.ratio?.toFixed(2)}) for ${contactId} — sending regenerated version anyway`);
+            }
+          }
+        } catch (regenErr) {
+          console.warn(`[SendMessage] quality regeneration failed for ${contactId}: ${regenErr.message} — ${regenReason === 'duplicate_send_suppressed' ? 'deferring for one retry' : 'sending original draft'}`);
+          if (regenReason === 'duplicate_send_suppressed') {
+            // Don't ship a verbatim repeat; one short deferral retries the
+            // whole flow (which will regenerate again). quality_regen_attempts
+            // in execution_result bounds this to a single loop.
+            return {
+              deferred: true,
+              reason: 'duplicate_regen_retry',
+              retry_at: new Date(Date.now() + 2 * 60 * 1000).toISOString(),
+              quality_regen_attempts: priorAttempts + 1,
+              contact_id: contactId,
+              channel,
+            };
+          }
+        }
+      }
+    }
+  } catch (qualityErr) {
+    console.warn(`[SendMessage] quality-pass checks threw for ${contactId} (fail-open): ${qualityErr.message}`);
+  }
+
   // ── Send (v3.3: channel-routed) ────────────────────────────────
   const _tPreSend = Date.now();
   const { result: sendResult, sendMethod } = await sendWithFallback(
@@ -1683,7 +1878,7 @@ export async function executeSendMessage(action, context) {
     // the send already happened; rollback isn't possible.
     let companionResult = { queued: false, reason: 'not_attempted' };
     if (generated && generated.companion_action) {
-      companionResult = await queueCompanionAction(action, generated);
+      companionResult = await queueCompanionAction(action, generated, context.call_purpose || null);
     }
 
     // 2026-07-06 — CANCEL SAVE-ATTEMPT TIMEOUT (owner requirement): when the
