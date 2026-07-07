@@ -828,7 +828,7 @@ async function lpLeadUpdateGhlContactHandler(req, res) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// LP INBOUND REAL-TIME CACHE REFRESH — v1.1
+// LP INBOUND REAL-TIME CACHE REFRESH — v1.2
 // ═══════════════════════════════════════════════════════════════════
 //
 // POST /webhook/lp-lead-refresh
@@ -919,8 +919,8 @@ async function lpLeadRefreshHandler(req, res) {
   }
 
   const src = { ...(req.query || {}), ...(req.body || {}) };
-  const leadId = String(src.lead_id || src.leadId || src.lds_id || src.ldsId || '').trim();
-  const prospectId = String(
+  let leadId = String(src.lead_id || src.leadId || src.lds_id || src.ldsId || '').trim();
+  let prospectId = String(
     src.prospect_id || src.prospectId || src.prospect_number || src.prospectNumber ||
     src.cst_id || src.cstId || ''
   ).trim();
@@ -933,15 +933,21 @@ async function lpLeadRefreshHandler(req, res) {
   const payloadSource       = String(src.source          || '').trim();
   const payloadSourceDetail = String(src.source_detail   || src.sourceDetail   || '').trim();
 
-  if (!leadId && !prospectId) {
-    return res.status(400).json({ ok: false, error: 'lead_id_or_prospect_id_required' });
+  if (!leadId && !prospectId && !payloadGhlContactId) {
+    // v1.2: no LP key AND no contact id — nothing to resolve with.
+    // Ack 200 (not 400): this endpoint is a best-effort freshness layer;
+    // a 4xx fails the GHL webhook step and pollutes execution history
+    // while fixing nothing. The polling sync remains the guaranteed
+    // catch-up tier.
+    console.warn('[LP Inbound Refresh] skipped: payload carried no lead_id, prospect_id, or ghl_contact_id');
+    return res.json({ ok: true, skipped: true, reason: 'no_resolution_key' });
   }
 
   // ─── Respond 200 immediately ────────────────────────────────────
   res.json({ received: true, lead_id: leadId || null, prospect_id: prospectId || null, processing: 'async' });
 
   // ─── Burst dedup (best-effort) ──────────────────────────────────
-  const dedupKey = leadId || `cst:${prospectId}`;
+  const dedupKey = leadId || (prospectId ? `cst:${prospectId}` : `ghl:${payloadGhlContactId}`);
   const now = Date.now();
   const last = _lpRefreshRecent.get(dedupKey);
   if (last && (now - last) < _LP_REFRESH_DEDUP_MS) {
@@ -961,6 +967,55 @@ async function lpLeadRefreshHandler(req, res) {
     const forceFetch = String(process.env.LP_INBOUND_REFRESH_FORCE_FETCH || '').toLowerCase() === 'true';
 
     try {
+      // ── v1.2 CONTACT-FALLBACK RESOLUTION ──────────────────────────
+      // The GHL payload sometimes arrives without lead_id/prospect_number
+      // (prospect-level LP events, inbound-queue leads, merge tags that
+      // render empty). ghl_contact_id is always present, so resolve the
+      // LP key from it before giving up:
+      //   Tier A — lp_leads cache link (ghl_contact_id, ~50ms)
+      //   Tier B — live GHL contact custom fields (LP Lead/Prospect ID)
+      //   Tier C — phone off the live GHL contact → _lookupLpLead
+      // Tier C is what saves the Contact-Not-Found branch (workflow step
+      // #412): the contact was just created, custom fields aren't stamped
+      // yet, but phone always is.
+      if (!leadId && !prospectId && payloadGhlContactId) {
+        const { data: linked } = await supabase
+          .from('lp_leads')
+          .select('lp_lead_id, lp_prospect_id')
+          .eq('ghl_contact_id', payloadGhlContactId)
+          .order('synced_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (linked?.lp_lead_id) leadId = String(linked.lp_lead_id);
+        else if (linked?.lp_prospect_id) prospectId = String(linked.lp_prospect_id);
+
+        if (!leadId && !prospectId) {
+          const { getGHLContact } = await import('./ghl.js');
+          const contact = await getGHLContact(payloadGhlContactId);
+          const cf = Array.isArray(contact?.customFields) ? contact.customFields : [];
+          const fieldVal = (id) => String(cf.find(f => f?.id === id)?.value ?? '').trim();
+          const cfLead = fieldVal('GmAVmW6V9sekD7pVONKr');     // LP Lead ID
+          const cfProspect = fieldVal('ZRQAVrzhtzApzLlHmT87'); // LP Prospect ID
+          if (/^\d+$/.test(cfLead)) leadId = cfLead;
+          if (!leadId && /^\d+$/.test(cfProspect)) prospectId = cfProspect;
+
+          if (!leadId && !prospectId && contact?.phone) {
+            const lk = await _lookupLpLead({ phone: contact.phone });
+            if (lk.found) {
+              if (lk.lead_id) leadId = String(lk.lead_id);
+              if (!leadId && lk.prospect_id) prospectId = String(lk.prospect_id);
+            }
+          }
+        }
+
+        if (leadId || prospectId) {
+          console.log(`[LP Inbound Refresh] resolved via contact fallback ghl=${payloadGhlContactId} → lead_id=${leadId || '-'} prospect_id=${prospectId || '-'}`);
+        } else {
+          console.warn(`[LP Inbound Refresh] unresolvable: no LP key for ghl_contact_id=${payloadGhlContactId} — skipped (next poll covers)`);
+          return;
+        }
+      }
+
       // ── v1.1 FAST PATH ────────────────────────────────────────────
       // When the payload tells us the new disposition + source, check
       // whether anything actually changed before calling LP. If the
@@ -1203,7 +1258,7 @@ export function registerRestApiRoutes(app, authenticate) {
   // change. Feature-flagged via ENABLE_LP_INBOUND_REFRESH (503 when off).
   // v1.1: fast path skips LP fetch when payload matches cached row.
   app.post('/webhook/lp-lead-refresh', lpLeadRefreshHandler);
-  console.log('[REST API] Registered: POST /webhook/lp-lead-refresh (no-auth, flag-gated, real-time lp_leads refresh v1.1)');
+  console.log('[REST API] Registered: POST /webhook/lp-lead-refresh (no-auth, flag-gated, real-time lp_leads refresh v1.2 contact-fallback)');
 
   // ═══════════════════════════════════════════════════════════════
   // POST /webhook/five9-event — Five9 ESS webhook ingestion (Phase 1)
