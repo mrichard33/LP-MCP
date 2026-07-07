@@ -28,6 +28,13 @@
 //      "lp":{"headers":{"X-Api-Key":"xxxx"}}}
 //   HTTP_TOOL_ALLOWED_HOSTS  Comma-separated hostnames. If set, only these pass.
 //   HTTP_TOOL_ALLOW_PRIVATE  "true" to permit private/link-local targets.
+//
+//   A synthetic "five9" profile is injected server-side from FIVE9_USERNAME /
+//   FIVE9_PASSWORD (Basic auth + text/xml + SOAPAction, base_url the Admin
+//   SOAP endpoint) so diagnostic Five9 calls work via auth_profile without
+//   duplicating credentials into HTTP_TOOL_PROFILES. An explicit "five9" key
+//   in the env JSON overrides the injected one. Secrets stay in headers,
+//   which this tool never reflects back.
 
 import { z } from 'zod';
 
@@ -38,14 +45,30 @@ const DEFAULT_TIMEOUT = 30_000;
 const MAX_TIMEOUT = 120_000;
 
 function loadProfiles() {
+  let profiles = {};
   const raw = process.env.HTTP_TOOL_PROFILES;
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object' ? parsed : {};
-  } catch {
-    return {};
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') profiles = parsed;
+    } catch {
+      // fall through with whatever we have — same failure mode as before
+    }
   }
+  // Synthetic five9 profile from the Five9 admin creds (see ENV note above).
+  // Env-defined "five9" wins; the Authorization value is computed here and
+  // never logged or echoed (this tool reflects only response headers).
+  if (!profiles.five9 && process.env.FIVE9_USERNAME && process.env.FIVE9_PASSWORD) {
+    profiles.five9 = {
+      base_url: process.env.FIVE9_ADMIN_WSDL_URL || 'https://api.five9.com/wsadmin/v13/AdminWebService',
+      headers: {
+        'Authorization': 'Basic ' + Buffer.from(`${process.env.FIVE9_USERNAME}:${process.env.FIVE9_PASSWORD}`).toString('base64'),
+        'Content-Type': 'text/xml;charset=UTF-8',
+        'SOAPAction': '""',
+      },
+    };
+  }
+  return profiles;
 }
 
 // Parse a JSON-object string param; throws a clear error on bad JSON.

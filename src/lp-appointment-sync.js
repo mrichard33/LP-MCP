@@ -191,6 +191,10 @@ import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken } from './ghl-rate-limiter.js';
 import { formatLpSource, formatApptTime12h } from './format-helpers.js';
 import { enrollLpLeadCreation } from './admin/lp-force-addlead.js';
+// 2026-07-07 call-dispatch-integrity: Five9 direct dispatch gate for GHL-only
+// calendars (dormant unless FIVE9_DIRECT_DISPATCH=true — see five9/list-dispatch.js).
+import { isGhlOnlyCalendarId } from './knowledge/booking-calendar-router.js';
+import { five9DispatchConfigured, dispatchConfirmationCallback } from './five9/list-dispatch.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
@@ -1695,6 +1699,53 @@ export function registerLPAppointmentSyncRoutes(app) {
           success: false,
           error: 'appointment_date and appointment_time not available (checked webhook body + GHL contact)',
         });
+      }
+
+      // ── Five9 direct dispatch gate (dormant unless FIVE9_DIRECT_DISPATCH
+      // is 'true' + list/campaign env set). GHL-only calendars (Confirmation
+      // Call): the "LP appointment" this webhook sets — A.CC-1 step 107 fires
+      // it at call time — was only ever a Dial-ASAP queue entry. When enabled,
+      // queue the callback in Five9 directly and skip lpSetAppointment
+      // entirely. Any Five9 failure falls back to the LP path below — a
+      // promised call is never silently dropped. Flag off / non-GHL-only
+      // calendar (A.WE / A.MV in-home syncs) → this block is inert and the
+      // legacy path is byte-identical.
+      if (calendarId && isGhlOnlyCalendarId(calendarId) && five9DispatchConfigured()) {
+        try {
+          const dispatch = await dispatchConfirmationCallback({
+            contactId, contactName, contactPhone,
+            appointmentDate, appointmentTime, calendarName,
+          });
+          await addGHLNote(contactId,
+            `[FIVE9 DISPATCH] Confirmation callback queued directly to Five9\n` +
+            `List: ${dispatch.list} | Campaign: ${dispatch.campaign}\n` +
+            `Requested: ${appointmentDate} ${appointmentTime}` +
+            (dispatch.call_purpose ? `\nPurpose: ${dispatch.call_purpose}` : '') +
+            `\nLP SetAppointment intentionally skipped (GHL-only calendar).`
+          ).catch(() => {});
+          console.log(`[LP-APPT] five9_direct_dispatch for ${contactId} → list "${dispatch.list}"`);
+          return res.json({
+            success: true,
+            action: 'five9_direct_dispatch',
+            contact_id: contactId,
+            calendar_id: calendarId,
+            five9_list: dispatch.list,
+            five9_campaign: dispatch.campaign,
+            call_purpose: dispatch.call_purpose,
+            lp_set_appointment_skipped: true,
+            elapsed_ms: Date.now() - startTime,
+          });
+        } catch (err) {
+          console.error(`[LP-APPT] 🚨 FIVE9 DISPATCH FAILED for ${contactId} — falling back to LP Dial-ASAP path: ${err.message}`);
+          await sendGroupMeMessage(
+            `🚨 FIVE9 DISPATCH FAILED — fell back to LP Dial-ASAP\n` +
+            `👤 ${contactName || contactId}\n` +
+            `⚠️ ${String(err.message).slice(0, 300)}\n` +
+            `Callback WILL still fire via LP. Check Five9 permissions/config (FIVE9_CALLBACK_LIST/CAMPAIGN).`,
+            { flushNow: true }
+          ).catch(() => {});
+          // fall through to syncAppointmentToLP — the LP path is the safety net
+        }
       }
 
       const result = await syncAppointmentToLP({
