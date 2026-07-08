@@ -13,15 +13,22 @@
 -- get classified as CUSTOMER_STATUS_AFFIRMATIVE and apply the service
 -- tag — that's a misroute.
 --
--- The context guard is implemented in src/response-generator.js v2.5
--- (post-classification gate). When the classifier returns one of these
--- two intents, response-generator checks that the contact actually has
--- the `pending:customer-status-check` tag. If not, it converts the
--- classification to UNCLEAR and falls through to the normal response
--- generator. See the postProcessClassification function in v2.5.
+-- The context guard lives in src/knowledge/intent-classifier.js (v1.2
+-- precondition): both handlers only stay in the active set when the
+-- contact carries the `pending:customer-status-check` tag (plus the
+-- ≤8-word answer-shape guard). Without the tag the classification
+-- downgrades to UNCLEAR and falls through to the normal responder.
+-- [2026-07-08 header fix: this comment previously attributed the guard
+-- to a "response-generator.js v2.5 postProcessClassification" that was
+-- never built.]
 --
--- This avoids needing schema-level context guards on kb_intent_handlers
--- (which would require an intent-classifier code change to honor).
+-- The tag itself is applied by the HDL.3 customer-status probe
+-- (send-message-handler.js sendCustomerStatusProbe, wired in PR #499)
+-- when a CALLBACK short-circuit resolves ambiguous, and is cleared by
+-- handleShortCircuit / approval-path.js applyHandoffInline when a gate
+-- answer routes to a concrete hdl:* queue.
+--
+-- This avoids needing schema-level context guards on kb_intent_handlers.
 -- ════════════════════════════════════════════════════════════════════
 
 INSERT INTO kb_intent_handlers
