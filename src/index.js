@@ -105,6 +105,12 @@ import { registerBulkRiskScoreRoutes } from './jobs/bulk-risk-score.js';
 // ─── Admin ──────────────────────────────────────────────────────
 import { runEmailBackfill } from './admin/email-backfill.js';
 import { registerEmailCleanupRoutes } from './admin/email-cleanup.js';
+// ─── Pending-probe TTL sweep (2026-07-08, PR #499 follow-up) ──
+// Clears stale pending:customer-status-check tags from leads who never
+// answered the HDL.3 customer-status probe. Daily scheduler is env-gated
+// (PENDING_PROBE_TTL_SWEEP_ENABLED, default off); manual dry-run route
+// POST /admin/pending-probe-ttl-sweep.
+import { registerPendingProbeTtlSweepRoutes } from './admin/pending-probe-ttl-sweep.js';
 import {
   registerDataFreshnessRoutes,
   startDataFreshnessMonitorScheduler,
@@ -541,6 +547,7 @@ registerAppointmentNotificationRoutes(app);
 registerGhlTriggerLinkRoutes(app);
 registerAgenticLeadStateRoutes(app);
 registerGuestVisitorRemediationRoutes(app);
+registerPendingProbeTtlSweepRoutes(app); // 2026-07-08 — stale pending:customer-status-check TTL sweep (scheduler env-gated, default off)
 registerGhlAppointmentBackfillRoutes(app); // 2026-07-07 — LP→GHL appointment backfill trigger (dry-run default)
 registerLPForceAddLeadRoutes(app);
 registerLeadStateSweepRoutes(app);
