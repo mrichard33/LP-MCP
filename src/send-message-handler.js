@@ -221,6 +221,15 @@ import { buildNotificationEnrichment, buildRichNotification } from './actions/en
 // 2026-07-03 rebuild (Steve Nkzhm incident) — channel/identity inheritance,
 // AI-disclosure hard guard, per-contact supersession check.
 import { resolveReplyContext, guardDisclosure, fetchRecentMessages } from './agentic/reply-sender.js';
+// 2026-07-08 — CALLBACK resolution + HDL.3 customer-status probe
+// (closes the sql/017/018 gap; see src/knowledge/callback-resolver.js).
+import {
+  resolveCallbackHandoff,
+  buildCustomerStatusProbe,
+  CUSTOMER_STATUS_PENDING_TAG,
+  CUSTOMER_STATUS_GATE_INTENT_SET,
+  CALLBACK_TAG_SALES,
+} from './knowledge/callback-resolver.js';
 // Conversation Quality Pass v1.0 (2026-07-07): quiet-hours hold for
 // bot-initiated sends, near-duplicate suppression, stale/mid-generation
 // regeneration.
@@ -408,6 +417,48 @@ async function applyContactTags(contactId, tagList) {
     return true;
   } catch (err) {
     console.warn(`[SendMessage] applyContactTags threw: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * 2026-07-08 — Remove tags from a contact. Mirror of applyContactTags for
+ * GHL's DELETE /contacts/{id}/tags endpoint. Returns true on success,
+ * false on any failure (never throws).
+ */
+async function removeContactTags(contactId, tagList) {
+  if (!contactId || !Array.isArray(tagList) || tagList.length === 0) return false;
+  if (!GHL_API_KEY) return false;
+  const filtered = tagList.filter(t => typeof t === 'string' && t.length > 0);
+  if (filtered.length === 0) return false;
+
+  try {
+    await acquireToken();
+    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/tags`, {
+      method: 'DELETE',
+      headers: {
+        'Authorization': `Bearer ${GHL_API_KEY}`,
+        'Version': '2021-07-28',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({ tags: filtered }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (res.status === 429) {
+      report429();
+      console.warn(`[SendMessage] removeContactTags 429 for ${contactId}`);
+      return false;
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      console.warn(`[SendMessage] removeContactTags ${res.status}: ${text.slice(0, 150)}`);
+      return false;
+    }
+    bumpContactCache(contactId);
+    return true;
+  } catch (err) {
+    console.warn(`[SendMessage] removeContactTags threw: ${err.message}`);
     return false;
   }
 }
@@ -1168,9 +1219,43 @@ async function sendWithFallback(contactId, message, channel, subject, action, op
 // COMPLIANCE GATE SHORT-CIRCUIT
 // ═══════════════════════════════════════════════════════════════════
 
-async function handleShortCircuit(contactId, generated, action, context) {
-  const handoffTag = generated.handoff_tag;
+async function handleShortCircuit(contactId, generated, action, context, opts = {}) {
+  let handoffTag = generated.handoff_tag;
   const isDQ = !!generated.is_disqualifier;
+  const contactTags = Array.isArray(opts.tags) ? opts.tags : [];
+
+  // ── CALLBACK resolution (2026-07-08 — closes the sql/017/018 gap) ──
+  // The classifier hands CALLBACK off with the placeholder tag
+  // hdl:callback-pending-classification, which NO GHL workflow listens on
+  // (verified live: only hdl:callback-sales → I.HDL-1 and
+  // hdl:callback-service → I.HDL-2 have tag triggers). sql/017 promised a
+  // gen-time rewrite that was never built — every CALLBACK inbound was
+  // applying a dead tag and going silent. Resolve it here:
+  //   known customer → hdl:callback-service
+  //   known lead     → hdl:callback-sales
+  //   ambiguous      → send the HDL.3 customer-status probe directly and
+  //                    apply pending:customer-status-check so the sql/018
+  //                    yes/no gates can interpret the answer.
+  let callbackBasis = null;
+  if (generated.intent_class === 'CALLBACK') {
+    if (contactTags.includes(CUSTOMER_STATUS_PENDING_TAG)) {
+      // Probe already outstanding and the lead asked for a callback again
+      // without answering it — stop asking, default to the sales queue so
+      // a human picks it up (sales can transfer a customer).
+      handoffTag = CALLBACK_TAG_SALES;
+      callbackBasis = 'probe_pending_default_sales';
+    } else {
+      const resolution = await resolveCallbackHandoff(contactId);
+      if (resolution.tag) {
+        handoffTag = resolution.tag;
+        callbackBasis = resolution.basis;
+      } else {
+        // Ambiguous — ask the probe instead of handing off.
+        return await sendCustomerStatusProbe(contactId, generated, action, context, opts);
+      }
+    }
+    console.log(`[SendMessage] CALLBACK resolved for ${contactId}: ${handoffTag} (${callbackBasis})`);
+  }
 
   const tagsToApply = [];
   if (handoffTag) tagsToApply.push(handoffTag);
@@ -1179,6 +1264,20 @@ async function handleShortCircuit(contactId, generated, action, context) {
   let tagApplied = false;
   if (tagsToApply.length > 0) {
     tagApplied = await applyContactTags(contactId, tagsToApply);
+  }
+
+  // ── Customer-status probe answered → clear the pending tag ────────
+  // The CUSTOMER_STATUS_* gates only fire while pending:customer-status-
+  // check is on the contact (intent-classifier v1.2 precondition). Once
+  // the answer routes to a concrete hdl:* queue the probe is resolved —
+  // clear the tag so a short "yes"/"no" weeks later can never re-trip it.
+  let pendingCleared = false;
+  if (
+    CUSTOMER_STATUS_GATE_INTENT_SET.has(generated.intent_class) &&
+    contactTags.includes(CUSTOMER_STATUS_PENDING_TAG)
+  ) {
+    pendingCleared = await removeContactTags(contactId, [CUSTOMER_STATUS_PENDING_TAG]);
+    console.log(`[SendMessage] customer-status probe answered by ${contactId} → ${handoffTag}; pending tag ${pendingCleared ? 'cleared' : 'CLEAR FAILED'}`);
   }
 
   const contactName = context?.contact_name || action?.action_payload?.contact_name || contactId;
@@ -1193,6 +1292,7 @@ async function handleShortCircuit(contactId, generated, action, context) {
     (generated.handler_code ? ` (${generated.handler_code})` : '') + `\n` +
     `Tags applied: ${tagSummary}${tagApplied ? '' : ' [TAG WRITE FAILED]'}\n` +
     `Method: ${generated.classification_method || 'unknown'} (${(generated.classifier_confidence || 0).toFixed(2)})\n` +
+    (callbackBasis ? `Callback basis: ${callbackBasis}\n` : '') +
     `Inbound: "${preview}"\n` +
     `→ GHL workflow on tag now owns the response.`
   ).catch(err => {
@@ -1212,7 +1312,101 @@ async function handleShortCircuit(contactId, generated, action, context) {
     is_disqualifier: isDQ,
     classifier_confidence: generated.classifier_confidence,
     classification_method: generated.classification_method,
+    callback_basis: callbackBasis,
+    pending_cleared: pendingCleared,
     reason: 'compliance_gate_handoff',
+  };
+}
+
+/**
+ * 2026-07-08 — HDL.3 customer-status probe.
+ *
+ * Fires when a CALLBACK short-circuit resolves AMBIGUOUS (no customer or
+ * lead signals on record). Applies pending:customer-status-check — the
+ * precondition the sql/018 CUSTOMER_STATUS_* gates require — then sends
+ * the probe question directly. The lead's short yes/no answer routes to
+ * hdl:callback-service / hdl:callback-sales via the gates, and
+ * handleShortCircuit clears the pending tag when that happens.
+ *
+ * Ordering: the tag is applied BEFORE the send. If the send fails and the
+ * executor retries, handleShortCircuit sees the pending tag on the retry
+ * and defaults to hdl:callback-sales — the lead always reaches a human.
+ * If TAG application fails, we don't ask a question the system can't hear
+ * the answer to — fall straight back to the sales queue.
+ */
+async function sendCustomerStatusProbe(contactId, generated, action, context, opts = {}) {
+  const rawChannel = opts.channel || generated.channel || 'sms';
+  const channel = rawChannel === 'email' ? 'email' : rawChannel === 'livechat' ? 'livechat' : 'sms';
+
+  let firstName = null;
+  try {
+    const { name } = await resolveContactInfo(contactId, context);
+    firstName = (name || '').trim().split(/\s+/)[0] || null;
+  } catch { /* fail-soft — probe copy has a no-name variant */ }
+
+  const message = buildCustomerStatusProbe(firstName);
+
+  const primed = await applyContactTags(contactId, [CUSTOMER_STATUS_PENDING_TAG]);
+  if (!primed) {
+    const fallbackApplied = await applyContactTags(contactId, [CALLBACK_TAG_SALES]);
+    console.warn(`[SendMessage] probe priming failed for ${contactId} — falling back to ${CALLBACK_TAG_SALES} (applied: ${fallbackApplied})`);
+    return {
+      action: 'send_message_handed_off',
+      contact_id: contactId,
+      channel,
+      intent_class: generated.intent_class,
+      handler_code: generated.handler_code,
+      handoff_tag: CALLBACK_TAG_SALES,
+      tags_applied: fallbackApplied ? [CALLBACK_TAG_SALES] : [],
+      is_disqualifier: false,
+      classifier_confidence: generated.classifier_confidence,
+      classification_method: generated.classification_method,
+      reason: 'probe_priming_failed_fallback_sales',
+    };
+  }
+
+  const { result: sendResult, sendMethod } = await sendWithFallback(
+    contactId, message, channel, null, action,
+    { fromNumber: opts.replyContext?.fromNumber || null }
+  );
+
+  // GHL 2xx IS the success — commit the sent marker so a watchdog retry
+  // dedups instead of re-sending (same rationale as the main send path).
+  if (action.id != null) {
+    await commitAgenticSend(contactId, String(action.id), {
+      message_id: sendResult?.messageId || null,
+      conversation_id: sendResult?.conversationId || null,
+    });
+  }
+
+  sendGroupMeMessage(
+    `❓ CUSTOMER-STATUS PROBE SENT\n` +
+    `👤 ${context?.contact_name || action?.action_payload?.contact_name || contactId}\n` +
+    `Lead asked for a callback but has no customer/lead signals on record.\n` +
+    `Tag applied: ${CUSTOMER_STATUS_PENDING_TAG}\n` +
+    `Probe: "${message.slice(0, 120)}"\n` +
+    `→ Their yes/no answer routes to hdl:callback-service / hdl:callback-sales.`
+  ).catch(err => console.warn(`[SendMessage] GroupMe (probe) failed: ${err.message}`));
+
+  console.log(`[SendMessage] ❓ CUSTOMER-STATUS PROBE sent to ${contactId} via ${sendMethod} (${channel})`);
+
+  return {
+    action: 'message_sent',
+    contact_id: contactId,
+    channel,
+    message_length: message.length,
+    sent_body: String(message).slice(0, 500),
+    rule_trigger: action.rule_applied || 'manual',
+    send_method: sendMethod,
+    conversation_id: sendResult?.conversationId || null,
+    message_id: sendResult?.messageId || null,
+    ai_generated: false,
+    intent_class: generated.intent_class,
+    classifier_method: generated.classification_method,
+    reason: 'customer_status_probe_sent',
+    customer_status_probe: true,
+    tags_applied: [CUSTOMER_STATUS_PENDING_TAG],
+    _agentic_committed: action.id != null,
   };
 }
 
@@ -1581,7 +1775,11 @@ export async function executeSendMessage(action, context) {
         // ── SHORT-CIRCUIT handling (compliance gate fired) ──
         // Intentional compliance gate, NOT an error — never fall back here.
         if (generated.short_circuit) {
-          return await handleShortCircuit(contactId, generated, action, context);
+          return await handleShortCircuit(contactId, generated, action, context, {
+            channel,
+            replyContext,
+            tags,
+          });
         }
 
         message = generated.message;
