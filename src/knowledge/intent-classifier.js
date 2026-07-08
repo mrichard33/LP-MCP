@@ -349,6 +349,64 @@ function downgradeIfBackchannelIdentity(result, messageText) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// CUSTOMER-STATUS GATE PRECONDITION (v1.2 — 2026-07-07)
+// ═══════════════════════════════════════════════════════════════════
+// The CUSTOMER_STATUS_AFFIRMATIVE / _NEGATIVE gates exist ONLY to interpret a
+// yes/no answer to the HDL.3 "are you a current Reece customer?" probe.
+// sql/018 documented a positive precondition — these gates should fire only
+// when the contact carries `pending:customer-status-check` — and claimed it
+// lived in response-generator.js v2.5. It was never implemented. Without it,
+// a bare "yes"/"no"/"i am"/"customer" ANYWHERE in a message, at ANY stage,
+// short-circuits the reply to a callback handoff.
+//
+// Incident 2026-07-07: entry-bridge lead ICO7F5W2PcN72n9pXGH7 sent a 95-word
+// affordability message ("...as much i am pissed about not being able to
+// this...") — "i am" matched CUSTOMER_STATUS_AFFIRMATIVE @0.95, the send was
+// swallowed as compliance_gate_handoff, and (the handoff holds the outbound
+// lock) the generic responder was excluded too. The lead got silence.
+//
+// FIX: require BOTH (a) the pending:customer-status-check tag AND (b) a short
+// yes/no-length answer. Otherwise downgrade to UNCLEAR → generate_response so
+// the AI answers with full context. The tag is the real gate; the length
+// check is depth-in-defense for the rare primed-but-verbose case.
+const CUSTOMER_STATUS_GATE_INTENTS = new Set([
+  'CUSTOMER_STATUS_AFFIRMATIVE',
+  'CUSTOMER_STATUS_NEGATIVE',
+]);
+const CUSTOMER_STATUS_PRECONDITION_TAG = 'pending:customer-status-check';
+// A genuine answer to the probe ("yes", "no first time", "we're current
+// customers") is a handful of words — never a paragraph. Env-tunable.
+export const CUSTOMER_STATUS_GATE_MAX_WORDS =
+  Math.min(Math.max(parseInt(process.env.CUSTOMER_STATUS_GATE_MAX_WORDS || '8', 10) || 8, 3), 20);
+
+function customerStatusWordCount(text) {
+  return String(text || '').trim().split(/\s+/).filter(Boolean).length;
+}
+
+/**
+ * The customer-status gates may only short-circuit when the contact was just
+ * asked the HDL.3 probe (carries pending:customer-status-check) AND the inbound
+ * is a short yes/no answer. Otherwise the keyword hit is incidental — downgrade
+ * to UNCLEAR so the normal responder handles the message.
+ */
+function downgradeIfCustomerStatusUnprimed(result, messageText, contactTags) {
+  if (!result || !CUSTOMER_STATUS_GATE_INTENTS.has(result.intent_class)) return result;
+  const tags = Array.isArray(contactTags) ? contactTags : [];
+  const primed = tags.includes(CUSTOMER_STATUS_PRECONDITION_TAG);
+  const wc = customerStatusWordCount(messageText);
+  const short = wc <= CUSTOMER_STATUS_GATE_MAX_WORDS;
+  if (primed && short) return result; // legitimate probe answer — gate stands
+  const why = !primed
+    ? `no ${CUSTOMER_STATUS_PRECONDITION_TAG} tag`
+    : `answer too long (${wc}w > ${CUSTOMER_STATUS_GATE_MAX_WORDS}w)`;
+  console.log(`[IntentClassifier] [CUST-STATUS-GUARD] downgraded ${result.intent_class} → UNCLEAR (${why})`);
+  return makeUnclearResult({
+    reasoning: `customer_status_gate_unprimed: ${result.intent_class} (${why})`,
+    method: 'customer_status_precondition',
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // LAYER 0 — PATTERN MATCH (REGEX-FIRST, BEATS KEYWORDS)
 // ═══════════════════════════════════════════════════════════════════
 
@@ -502,11 +560,14 @@ export async function classifyInbound(messageText, opts = {}) {
   if (!opts.skipKeywordMatch) {
     const pm = patternMatch(messageText, handlers);
     if (pm) {
-      const result = downgradeIfBackchannelIdentity(makeResultFromHandler(pm.handler, {
-        confidence: 0.97,
-        reasoning: `regex match: "${pm.matched_pattern}"`,
-        method: pm.method,
-      }), messageText);
+      const result = downgradeIfCustomerStatusUnprimed(
+        downgradeIfBackchannelIdentity(makeResultFromHandler(pm.handler, {
+          confidence: 0.97,
+          reasoning: `regex match: "${pm.matched_pattern}"`,
+          method: pm.method,
+        }), messageText),
+        messageText, opts.contactTags
+      );
       logDecision(opts.ghlContactId, messageText, result, opts.channel);
       return result;
     }
@@ -516,11 +577,14 @@ export async function classifyInbound(messageText, opts = {}) {
   if (!opts.skipKeywordMatch) {
     const kw = keywordMatch(messageText, handlers);
     if (kw) {
-      const result = downgradeIfBackchannelIdentity(makeResultFromHandler(kw.handler, {
-        confidence: 0.95,
-        reasoning: `keyword match: "${kw.matched_keyword}"`,
-        method: kw.method,
-      }), messageText);
+      const result = downgradeIfCustomerStatusUnprimed(
+        downgradeIfBackchannelIdentity(makeResultFromHandler(kw.handler, {
+          confidence: 0.95,
+          reasoning: `keyword match: "${kw.matched_keyword}"`,
+          method: kw.method,
+        }), messageText),
+        messageText, opts.contactTags
+      );
       logDecision(opts.ghlContactId, messageText, result, opts.channel);
       return result;
     }
@@ -575,11 +639,14 @@ export async function classifyInbound(messageText, opts = {}) {
     return downgraded;
   }
 
-  const result = downgradeIfBackchannelIdentity(makeResultFromHandler(matchedHandler, {
-    confidence: semantic.confidence,
-    reasoning: semantic.reasoning,
-    method: 'semantic',
-  }), messageText);
+  const result = downgradeIfCustomerStatusUnprimed(
+    downgradeIfBackchannelIdentity(makeResultFromHandler(matchedHandler, {
+      confidence: semantic.confidence,
+      reasoning: semantic.reasoning,
+      method: 'semantic',
+    }), messageText),
+    messageText, opts.contactTags
+  );
   logDecision(opts.ghlContactId, messageText, result, opts.channel);
   return result;
 }
