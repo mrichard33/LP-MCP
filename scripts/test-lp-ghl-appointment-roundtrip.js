@@ -35,12 +35,8 @@ process.env.GHL_API_KEY = 'test-key';
 // Intentionally NOT setting SUPABASE_*.
 
 // ─── fetch stub with a mutable "GHL calendar" ────────────────────────────
-// API-created appointments are served ONLY via the v2 calendar-events list,
-// matching live GHL (verified 2026-07-07: the legacy contact-appointments
-// endpoint does not return them) — so this round trip also proves the
-// reconciler sees its own writes through the v2 leg of the union.
 let calls = [];
-let ghlCalendar = []; // events returned on GET /calendars/events?...
+let ghlCalendar = []; // events returned on GET /contacts/{id}/appointments
 
 function jsonRes(body) {
   return {
@@ -58,9 +54,6 @@ globalThis.fetch = async (url, opts = {}) => {
   calls.push({ method, path, body });
 
   if (method === 'GET' && /^\/contacts\/[^/]+\/appointments/.test(path)) {
-    return jsonRes({ events: [] }); // legacy endpoint never sees API-created appointments
-  }
-  if (method === 'GET' && path.startsWith('/calendars/events?')) {
     return jsonRes({ events: ghlCalendar });
   }
   if (method === 'GET' && /^\/contacts\/[^/]+$/.test(path)) {
