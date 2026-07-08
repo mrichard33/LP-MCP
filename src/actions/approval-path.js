@@ -235,6 +235,18 @@ import { resolveContactInfo, resolveLPProspectId, getEventContext } from './reso
 import { buildNotificationEnrichment } from './enrichment.js';
 import { acquireToken, report429 } from '../ghl-rate-limiter.js';
 import { bumpContactCache } from '../context-builder.js';
+// 2026-07-08 — CALLBACK resolution parity with send-message-handler's
+// handleShortCircuit (PR #499). The pre-generation short-circuit path here
+// is TERMINAL (batch marked completed, never re-enters executeSendMessage),
+// so without this the dead placeholder tag hdl:callback-pending-
+// classification would still be applied for requires_approval rules.
+// callback-resolver.js is import-safe from this module (no circular dep).
+import {
+  resolveCallbackHandoff,
+  CUSTOMER_STATUS_PENDING_TAG,
+  CUSTOMER_STATUS_GATE_INTENT_SET,
+  CALLBACK_TAG_SALES,
+} from '../knowledge/callback-resolver.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 
@@ -364,6 +376,49 @@ async function applyContactTagsInline(contactId, tagList) {
     return true;
   } catch (err) {
     console.warn(`[ApprovalPath] applyContactTagsInline threw: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * 2026-07-08 — Remove tags from a contact. DELETE mirror of
+ * applyContactTagsInline (same rationale: no circular import on
+ * send-message-handler's removeContactTags). Returns true on success,
+ * false on any failure (never throws).
+ */
+async function removeContactTagsInline(contactId, tagList) {
+  if (!contactId || !Array.isArray(tagList) || tagList.length === 0) return false;
+  if (!GHL_API_KEY) return false;
+  const filtered = tagList.filter(t => typeof t === 'string' && t.length > 0);
+  if (filtered.length === 0) return false;
+
+  try {
+    await acquireToken();
+    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/tags`, {
+      method: 'DELETE',
+      headers: {
+        'Authorization': `Bearer ${GHL_API_KEY}`,
+        'Version': '2021-07-28',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({ tags: filtered }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (res.status === 429) {
+      report429();
+      console.warn(`[ApprovalPath] removeContactTagsInline 429 for ${contactId}`);
+      return false;
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      console.warn(`[ApprovalPath] removeContactTagsInline ${res.status}: ${text.slice(0, 150)}`);
+      return false;
+    }
+    bumpContactCache(contactId);
+    return true;
+  } catch (err) {
+    console.warn(`[ApprovalPath] removeContactTagsInline threw: ${err.message}`);
     return false;
   }
 }
@@ -581,8 +636,25 @@ async function applyHandoffInline({
   contactPhone,
   triggerMessage,
 }) {
-  const handoffTag = generated.handoff_tag || null;
+  let handoffTag = generated.handoff_tag || null;
   const isDQ = !!generated.is_disqualifier;
+
+  // ── CALLBACK resolution (2026-07-08 — parity with handleShortCircuit) ──
+  // The classifier hands CALLBACK off with the dead placeholder tag
+  // hdl:callback-pending-classification (no GHL workflow listens on it).
+  // Resolve to a live queue: known customer → hdl:callback-service, known
+  // lead → hdl:callback-sales. Ambiguous ALSO goes to sales here — this
+  // cold path has no SMS sender for the HDL.3 customer-status probe, and a
+  // human callback beats silence (sales can transfer a customer). That
+  // matches the hot path's own fallback whenever the probe can't be sent.
+  let callbackBasis = null;
+  if (generated.intent_class === 'CALLBACK') {
+    const resolution = await resolveCallbackHandoff(contactId);
+    handoffTag = resolution.tag || CALLBACK_TAG_SALES;
+    callbackBasis = resolution.tag ? resolution.basis : 'ambiguous_approval_path_default_sales';
+    console.log(`[ApprovalPath] CALLBACK resolved for ${contactId}: ${handoffTag} (${callbackBasis})`);
+  }
+
   const tagsToApply = [];
   if (handoffTag) tagsToApply.push(handoffTag);
   if (isDQ) tagsToApply.push('suppress-automation');
@@ -590,6 +662,18 @@ async function applyHandoffInline({
   let tagApplied = false;
   if (tagsToApply.length > 0) {
     tagApplied = await applyContactTagsInline(contactId, tagsToApply);
+  }
+
+  // ── Customer-status probe answered → clear the pending tag ────────
+  // Same contract as handleShortCircuit: once a CUSTOMER_STATUS_* gate
+  // answer routes to a concrete queue, pending:customer-status-check must
+  // come off so a short "yes"/"no" weeks later can never re-trip the gates.
+  // Removal is unconditional (deleting an absent tag is a harmless no-op)
+  // because this path has no contact-tag snapshot to consult.
+  let pendingCleared = false;
+  if (CUSTOMER_STATUS_GATE_INTENT_SET.has(generated.intent_class)) {
+    pendingCleared = await removeContactTagsInline(contactId, [CUSTOMER_STATUS_PENDING_TAG]);
+    console.log(`[ApprovalPath] customer-status gate answered by ${contactId} → ${handoffTag}; pending tag ${pendingCleared ? 'cleared' : 'clear no-op/failed'}`);
   }
 
   const completedAt = new Date().toISOString();
@@ -605,6 +689,8 @@ async function applyHandoffInline({
     tags_applied: tagApplied ? tagsToApply : [],
     classification_method: generated.classification_method || null,
     classifier_confidence: generated.classifier_confidence ?? null,
+    callback_basis: callbackBasis,
+    pending_cleared: pendingCleared,
     applied_at: 'queue_time_v4_5',
   };
 
@@ -632,6 +718,7 @@ async function applyHandoffInline({
     (generated.handler_code ? ` (${generated.handler_code})` : '') + `\n` +
     `Tags applied: ${tagSummary}${tagApplied ? '' : ' [TAG WRITE FAILED]'}\n` +
     `Method: ${generated.classification_method || 'unknown'} (${(generated.classifier_confidence ?? 0).toFixed(2)})\n` +
+    (callbackBasis ? `Callback basis: ${callbackBasis}\n` : '') +
     `Inbound: "${preview}"\n` +
     `→ GHL workflow on tag now owns the response. No approval card sent (nothing for human to review — handoff is mechanical).`
   , { contactId, contactName }).catch(err => {
