@@ -78,7 +78,9 @@ export async function buildProspectMarketMap(prospectIds) {
   const ids = [...new Set(prospectIds.map((p) => String(p ?? '')).filter(Boolean))];
 
   const zipByProspect = new Map(); // latest valid ZIP per prospect
-  const CHUNK = 500;
+  // Keep chunks small: a prospect has ~1.7 cached leads, and PostgREST caps a
+  // response at ~1000 rows, so 300 prospect ids (~500 rows) stays safely under it.
+  const CHUNK = 300;
   for (let i = 0; i < ids.length; i += CHUNK) {
     const slice = ids.slice(i, i + CHUNK);
     const { data, error } = await supabase
