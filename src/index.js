@@ -184,6 +184,10 @@ import { registerLeadSelectionRoutes, startLeadSelectionScheduler } from './agen
 import { registerWorkflowProjectionRoutes, startWorkflowProjectionLoop } from './jobs/workflow-projection.js';
 // Daily goal/variance scorecard actuals ("Monday a.m." report).
 import { registerGoalScorecardRoutes, startGoalScorecardScheduler } from './jobs/goal-scorecard-daily.js';
+// Nightly per-lead market assignment (feeds the per-market scorecard split).
+import { registerMarketAssignmentRoutes, startMarketAssignmentScheduler } from './jobs/market-assignment-daily.js';
+// One-shot proportional-split backfill of per-market history.
+import { registerScorecardBackfillRoutes } from './jobs/scorecard-market-backfill.js';
 // ─── Agentic Hold-Complete (return-from-hold re-entry) ───────────
 import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
 // ─── FB Publish Watchdog (alert on missed WF4 publish window) ────
@@ -561,6 +565,8 @@ registerEnrollExistingEligibleRoutes(app);
 registerLeadSelectionRoutes(app);
 registerWorkflowProjectionRoutes(app);
 registerGoalScorecardRoutes(app);
+registerMarketAssignmentRoutes(app);
+registerScorecardBackfillRoutes(app);
 
 app.listen(PORT, async () => {
   console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
@@ -587,6 +593,7 @@ app.listen(PORT, async () => {
   startNoteChangeAnalyzerScheduler();
   startLeadSelectionScheduler();
   startWorkflowProjectionLoop();
+  startMarketAssignmentScheduler();
   startGoalScorecardScheduler();
   startFbPublishWatchdog();
   startFive9SilenceWatchdog();

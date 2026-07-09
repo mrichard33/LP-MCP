@@ -24,6 +24,7 @@ import { syncLogStart, syncLogComplete } from '../sync-log.js';
 import {
   computeActuals, SCORECARD_GETLEAD_OPTIONS, DEFAULT_MARKET,
 } from './scorecard-metrics.js';
+import { buildProspectMarketMap } from './market-resolver.js';
 import {
   resolveSellingCalendar, sellingDaysElapsed, sellingDaysInPeriod, lastCompletedSellingDay,
 } from '../selling-days.js';
@@ -180,8 +181,24 @@ export async function computeGoalScorecard(opts = {}) {
     return { success: false, error: err.message, period_start: periodStart, period_end: periodEnd };
   }
 
-  // Single Reece market today; group-by-market keeps the door open for a split.
+  // Partition the cohort by each lead's resolved market (from ZIP via the cache),
+  // crediting every prospect to its market. REECE stays the company roll-up and is
+  // always written; each prospect lands in exactly one market group, so
+  // Σ(market rows) = REECE to the penny for every count/$ column. A lookup failure
+  // degrades gracefully to REECE-only for the run.
+  const cstOf = (p) => String(getField(p, 'cst_id', 'CST_ID') ?? '');
+  const reeceOnly = { [DEFAULT_MARKET]: prospects };
   const markets = { [DEFAULT_MARKET]: prospects };
+  try {
+    const marketByProspect = await buildProspectMarketMap(prospects.map(cstOf));
+    for (const p of prospects) {
+      const mk = marketByProspect.get(cstOf(p)) || 'UNASSIGNED';
+      if (mk === DEFAULT_MARKET) continue; // guard against a stray REECE key
+      (markets[mk] ||= []).push(p);
+    }
+  } catch (err) {
+    console.warn(`[Scorecard] market partition failed — REECE only this run: ${err.message}`);
+  }
 
   // Raw leads in (true top-of-funnel) — the ONE figure sourced from the CACHE,
   // counted by creation date, not the LP-API by-appt cohort. Carries cache
@@ -205,6 +222,13 @@ export async function computeGoalScorecard(opts = {}) {
   for (const [market, records] of Object.entries(markets)) {
     const actuals = computeActuals(records, { periodStart, periodEnd });
     const { raw_inputs, ...metrics } = actuals;
+    // Utility rows (UNASSIGNED / OUT_OF_AREA) are written ONLY when they carry
+    // in-cohort activity — a zero row would just be noise on the By-Market table.
+    const isUtility = market === 'UNASSIGNED' || market === 'OUT_OF_AREA';
+    const hasActivity =
+      (metrics.sets || 0) + (metrics.issued || 0) + (metrics.demos || 0) +
+      (metrics.sales || 0) + (metrics.gross_sales || 0) > 0;
+    if (isUtility && !hasActivity) continue;
     rows.push({
       market,
       as_of_date: asOfDate,
@@ -213,13 +237,15 @@ export async function computeGoalScorecard(opts = {}) {
       days_elapsed: daysElapsed,
       working_days_in_period: workingDaysInPeriod,
       ...metrics,
-      raw_leads_in: rawLeadsIn,
+      // raw_leads_in is a company-wide cache count — carry it on REECE only so the
+      // per-market rows stay summable against REECE (Σ markets excludes this aux col).
+      raw_leads_in: market === DEFAULT_MARKET ? rawLeadsIn : null,
       computed_from: 'lp_api',
       reconciled: RECONCILED_MARKETS.has(market),
       raw_inputs: {
         ...raw_inputs,
         prospects_scanned: records.length,
-        raw_leads_basis: 'lp_leads.created_at_lp (cache)',
+        raw_leads_basis: market === DEFAULT_MARKET ? 'lp_leads.created_at_lp (cache)' : 'per-market split (zip)',
       },
     });
   }
@@ -239,7 +265,7 @@ export async function computeGoalScorecard(opts = {}) {
     // A per-source failure must NOT fail the run: the aggregate row is already written.
     try {
       const res = await writeSourceScorecard({
-        markets, asOfDate, periodStart, periodEnd, daysElapsed, workingDaysInPeriod, persist: true,
+        markets: reeceOnly, asOfDate, periodStart, periodEnd, daysElapsed, workingDaysInPeriod, persist: true,
       });
       sourceRows = res.count;
       unmappedSources = res.unmapped;
@@ -252,7 +278,7 @@ export async function computeGoalScorecard(opts = {}) {
     // Preview: compute source rows without writing (errors here are non-fatal).
     try {
       const res = await writeSourceScorecard({
-        markets, asOfDate, periodStart, periodEnd, daysElapsed, workingDaysInPeriod, persist: false,
+        markets: reeceOnly, asOfDate, periodStart, periodEnd, daysElapsed, workingDaysInPeriod, persist: false,
       });
       sourceRows = res.count;
       unmappedSources = res.unmapped;
