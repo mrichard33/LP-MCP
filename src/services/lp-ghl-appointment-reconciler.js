@@ -316,11 +316,15 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, toNotify = 
 
   if (plan.op === 'reschedule' || plan.op === 'reschedule_confirm') {
     // Reschedule in place on the appointment's OWN calendar (WE or MV) —
-    // never move an object between calendars.
+    // never move an object between calendars. ignoreFreeSlotValidation
+    // matches the create path: LP's slot is reality, and GHL otherwise
+    // rejects the move with 400 "slot no longer available" when the target
+    // time looks full (verified live 2026-07-08: Mcbride, Buzzell).
     await ghlFetch('PUT', `/calendars/events/appointments/${appointmentId}`, {
       calendarId: existing.calendar_id,
       startTime,
       endTime: endTimeFor(startTime),
+      ignoreFreeSlotValidation: true,
     });
     if (plan.op === 'reschedule') {
       return { ...base, outcome: 'rescheduled', appointment_id: appointmentId, previous_start_time: existing.start_time };

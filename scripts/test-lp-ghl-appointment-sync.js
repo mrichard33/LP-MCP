@@ -220,6 +220,7 @@ test('Set + different time → one PUT reschedule (startTime, NO appointmentStat
   assert.equal(puts[0].path, '/calendars/events/appointments/appt-1');
   assert.equal(puts[0].body.startTime, FUTURE_GHL);
   assert.equal(puts[0].body.appointmentStatus, undefined);
+  assert.equal(puts[0].body.ignoreFreeSlotValidation, true); // LP slot is reality; GHL else 400s on a full target slot
 });
 
 test('Cnf + same time, status new → one PUT confirming', async () => {
