@@ -70,11 +70,23 @@ const KNOWN_LEAD_TAG_PREFIXES = [
   'objection-',
 ];
 
+// 2026-07-08 — entry-hygiene fallback values are NOT lead evidence.
+// ENTRY_HYGIENE_AT_CREATION_FALLBACK / GHL_ATTR_DIGITAL_ENTRY stamp
+// entry:other + active-entry:other on EVERY newly created contact —
+// including a truly unknown texter seconds after their first message
+// (verified live 2026-07-08 during PR #499 testing). Counting them as
+// funnel presence made resolveCallbackHandoff return funnel_tags_present
+// for everyone, so the AMBIGUOUS branch — and with it the HDL.3
+// customer-status probe — was unreachable. A real funnel entry
+// (entry:canvassing, active-entry:referral, …) remains lead evidence.
+const ENTRY_FALLBACK_TAGS = new Set(['entry:other', 'active-entry:other']);
+
 function hasKnownLeadTags(tags) {
   if (!Array.isArray(tags)) return false;
   return tags.some(t => {
     if (typeof t !== 'string') return false;
     const lc = t.toLowerCase();
+    if (ENTRY_FALLBACK_TAGS.has(lc)) return false;
     return KNOWN_LEAD_TAG_PREFIXES.some(p => lc.startsWith(p));
   });
 }
