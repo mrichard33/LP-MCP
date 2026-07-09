@@ -132,7 +132,9 @@ test('classifyDisposition: exact codes only', () => {
   assert.equal(classifyDisposition('Set'), 'set');
   assert.equal(classifyDisposition('Cnf'), 'confirm');
   assert.equal(classifyDisposition('CXL'), 'cancel');
-  for (const c of ['DNC', 'Data', 'Verif', 'NoRehash', '', null, 'set', 'CNF']) {
+  // Verif is a live Window Estimate appointment — same 'set' semantics as Set.
+  assert.equal(classifyDisposition('Verif'), 'set');
+  for (const c of ['DNC', 'Data', 'NoRehash', '', null, 'set', 'CNF', 'verif']) {
     assert.equal(classifyDisposition(c), 'out_of_scope', `code ${c}`);
   }
 });
@@ -222,6 +224,37 @@ test('Set + different time → one PUT reschedule (startTime, NO appointmentStat
   assert.equal(puts[0].body.appointmentStatus, undefined);
   assert.equal(puts[0].body.ignoreFreeSlotValidation, true); // LP slot is reality; GHL else 400s on a full target slot
   assert.ok(puts[0].body.assignedUserId); // ignoreFreeSlotValidation on a PUT requires an explicit assignee (else 422)
+});
+
+// Verif rides the exact 'set' path (create-new / never-downgrade / reschedule-keeping-status).
+test('Verif + none → exactly one POST: status new (same as Set)', async () => {
+  reset();
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Verif') });
+  assert.equal(res.outcome, 'created');
+  const posts = calls.filter((c) => c.method === 'POST');
+  assert.equal(posts.length, 1);
+  assert.equal(mutations().length, 1);
+  assert.equal(posts[0].body.appointmentStatus, 'new');
+  assert.equal(posts[0].body.startTime, FUTURE_GHL);
+});
+
+test('Verif + same time, confirmed → zero mutations (never downgrades a confirmed)', async () => {
+  reset({ upcoming: [weAppt({ appointmentStatus: 'confirmed' })] });
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Verif') });
+  assert.equal(res.outcome, 'noop');
+  assert.equal(res.reason, 'already_in_sync');
+  assert.equal(mutations().length, 0);
+});
+
+test('Verif + different time → one PUT reschedule (startTime, NO appointmentStatus)', async () => {
+  reset({ upcoming: [weAppt({ startTime: OTHER_TIME_GHL, appointmentStatus: 'confirmed' })] });
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Verif') });
+  assert.equal(res.outcome, 'rescheduled');
+  const puts = calls.filter((c) => c.method === 'PUT');
+  assert.equal(puts.length, 1);
+  assert.equal(mutations().length, 1);
+  assert.equal(puts[0].body.startTime, FUTURE_GHL);
+  assert.equal(puts[0].body.appointmentStatus, undefined); // reschedule keeps existing status
 });
 
 test('Cnf + same time, status new → one PUT confirming', async () => {
@@ -379,7 +412,7 @@ test('DEAD appt on WE calendar (statuses the upstream filter leaks) → create, 
 
 test('out-of-scope disposition → noop, zero GHL calls', async () => {
   reset();
-  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Verif') });
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('DNC') });
   assert.equal(res.reason, 'out_of_scope');
   assert.equal(calls.length, 0);
 });

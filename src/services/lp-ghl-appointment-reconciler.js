@@ -97,6 +97,10 @@ export function classifyDisposition(code) {
   if (c === 'Set') return 'set';
   if (c === 'Cnf') return 'confirm';
   if (c === 'CXL') return 'cancel';
+  // LP Verif = a live Window Estimate appointment that must exist in GHL as
+  // status 'new', exactly like Set (Mark's rule, 2026-07-09). Same 'set'
+  // semantics: create-new / reschedule-in-place / never-downgrade-a-confirmed.
+  if (c === 'Verif') return 'set';
   return 'out_of_scope';
 }
 
