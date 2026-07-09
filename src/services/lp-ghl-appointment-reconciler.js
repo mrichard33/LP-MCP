@@ -324,6 +324,7 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, toNotify = 
       calendarId: existing.calendar_id,
       startTime,
       endTime: endTimeFor(startTime),
+      assignedUserId: DEFAULT_ASSIGNED_USER_ID,
       ignoreFreeSlotValidation: true,
     });
     if (plan.op === 'reschedule') {
