@@ -132,6 +132,10 @@ import { registerGuestVisitorRemediationRoutes } from './admin/guest-visitor-rem
 // dry-run by default) so it can run on Railway without shell access; shares
 // its core with scripts/backfill-ghl-appointments.js.
 import { registerGhlAppointmentBackfillRoutes } from './admin/ghl-appointment-backfill.js';
+// LP contact auto-create backstop — flag-gated 15-min sweep + admin endpoint;
+// finds-or-creates the GHL contact for unlinked LP leads then reconciles the
+// appointment. Scheduler no-ops unless ENABLE_LP_CONTACT_BACKSTOP=true.
+import { registerLpContactBackstopRoutes } from './admin/lp-contact-backstop.js';
 // ─── LP Force-AddLead (manual + shared helper for no-lds_id appt failures) ──
 // v1.0.0 2026-06-03: POST /admin/lp/force-addlead creates a lead in LP via
 // the legacy addlead path with the appointment embedded + lognumber stamped,
@@ -549,6 +553,7 @@ registerAgenticLeadStateRoutes(app);
 registerGuestVisitorRemediationRoutes(app);
 registerPendingProbeTtlSweepRoutes(app); // 2026-07-08 — stale pending:customer-status-check TTL sweep (scheduler env-gated, default off)
 registerGhlAppointmentBackfillRoutes(app); // 2026-07-07 — LP→GHL appointment backfill trigger (dry-run default)
+registerLpContactBackstopRoutes(app); // 2026-07-09 — LP contact auto-create backstop (scheduler env-gated, default off)
 registerLPForceAddLeadRoutes(app);
 registerLeadStateSweepRoutes(app);
 registerNoteChangeAnalyzerRoutes(app);

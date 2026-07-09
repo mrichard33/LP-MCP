@@ -33,7 +33,7 @@ import supabase from '../supabase.js';
 import { reconcileLpAppointmentToGhl } from '../services/lp-ghl-appointment-reconciler.js';
 import { lpWallClockToGhlStartTime, appointmentDelta } from '../appointment-dates.js';
 
-const DISPOSITIONS = ['Set', 'Cnf', 'CXL'];
+const DISPOSITIONS = ['Set', 'Cnf', 'CXL', 'Verif'];
 const DEFAULT_HORIZON_DAYS = 14;
 
 // In-memory job registry. Map<jobId, jobState>.
