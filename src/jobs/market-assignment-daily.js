@@ -14,7 +14,9 @@ import { syncLogStart, syncLogComplete } from '../sync-log.js';
 import { getMarketMaps, resolveMarket } from './market-resolver.js';
 
 const TIMEZONE = 'America/New_York';
-const PAGE = Number(process.env.MARKET_ASSIGN_PAGE || 2000);
+// PostgREST caps a single response at ~1000 rows, so page at 1000 and advance by
+// the actual count returned (never by PAGE) — otherwise the loop stops after one page.
+const PAGE = Number(process.env.MARKET_ASSIGN_PAGE || 1000);
 
 /** Today's ET calendar date as YYYY-MM-DD. */
 function todayET() {
@@ -68,8 +70,8 @@ export async function computeMarketAssignments() {
       if (upErr) throw new Error(upErr.message);
 
       processed += data.length;
-      if (data.length < PAGE) break;
-      from += PAGE;
+      from += data.length;              // advance by the real count (PostgREST may cap < PAGE)
+      if (data.length < PAGE) break;    // a short page is the last page
     }
   } catch (err) {
     console.error(`[MarketAssign] failed after ${processed}: ${err.message}`);
