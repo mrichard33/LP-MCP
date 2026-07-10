@@ -51,10 +51,16 @@ import { extractArray, getField, normalizePhone, sleep } from '../sync-utils.js'
 import { runSQL } from './supabase-admin.js';
 
 const DEFAULT_START = '2026-01-01';
-const DISCOVER_PAGE_SIZE = 100;
+// LP's GetLead-family endpoints (GetJobStatusChanges included) return only
+// ~one page per query and StartIndex paging is NON-FUNCTIONAL — a single wide
+// window silently truncates to one page (~hundreds). The proven workaround
+// (src/jobs/goal-scorecard-daily.js) is to query ONE ET calendar day at a time
+// with a PageSize large enough to hold a full day, then union-dedup by cst_id.
+const DAY_PAGE_SIZE = Number(process.env.RTP_BACKFILL_DAY_PAGE_SIZE || 2000);
+const DISCOVER_CONCURRENCY = Number(process.env.RTP_BACKFILL_DISCOVER_CONCURRENCY || 6);
 const IN_CHUNK = 200;                 // supabase .in() batch size for presence checks
 const RATE_LIMIT_SLEEP_MS = 200;      // between prospects, matches Pass 2
-const DISCOVER_SLEEP_MS = 200;        // between discovery pages
+const DISCOVER_SLEEP_MS = 200;        // between discovery day-batches
 
 // In-memory job registry. Map<jobId, jobState>.
 const jobs = new Map();
@@ -68,6 +74,13 @@ function etDateString(d = new Date()) {
   return new Intl.DateTimeFormat('en-CA', {
     timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
   }).format(d);
+}
+
+// The ET calendar day after a YYYY-MM-DD date (UTC-safe). Mirrors the scorecard.
+function nextDay(etDate) {
+  const d = new Date(`${etDate}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
 }
 
 // A changed-job record from GetJobStatusChanges → its prospect id. Casing varies
@@ -116,50 +129,65 @@ async function reconMissingContracts() {
   }
 }
 
+// Fetch one ET day's changed jobs (single wide page). Throws on LP failure.
+async function fetchDayJobChanges(day) {
+  const res = await getJobStatusChanges({
+    startdate: day, enddate: day, options: 0, PageSize: DAY_PAGE_SIZE, StartIndex: 1,
+  });
+  const items = extractArray(res);
+  if (items.length >= DAY_PAGE_SIZE) {
+    // A single day filled the page — possible truncation. Surface it; raise
+    // RTP_BACKFILL_DAY_PAGE_SIZE if this ever fires for real volume.
+    console.warn(`[RtpJobBackfill] day ${day} returned ${items.length} >= PageSize ${DAY_PAGE_SIZE} — possible truncation`);
+  }
+  return items;
+}
+
 // ─── Phase 1: discover distinct changed-job prospects on the job axis ──
+// Iterates ONE ET day at a time (StartIndex paging is non-functional on this LP
+// endpoint — see DAY_PAGE_SIZE note), fetched in small concurrent batches, and
+// unions distinct cst_id / job_id across the whole window.
 async function discoverChangedJobProspects({ startdate, enddate, limit, job }) {
+  const days = [];
+  for (let d = startdate; d <= enddate; d = nextDay(d)) days.push(d);
+
   const prospectIds = new Set();
   const jobIds = new Set();
-  let startIndex = 1;
   let pages = 0;
   let scanned = 0;
   let error = null;
   let probeKeys = null;
 
-  while (true) {
+  for (let i = 0; i < days.length; i += DISCOVER_CONCURRENCY) {
     if (getCircuitStatus().circuitOpen) { error = 'circuit_breaker_open'; break; }
-    if (limit > 0 && scanned >= limit) break;
+    if (limit > 0 && prospectIds.size >= limit) break;
 
-    let resp;
+    const batch = days.slice(i, i + DISCOVER_CONCURRENCY);
+    let results;
     try {
-      resp = await getJobStatusChanges({
-        startdate, enddate, options: 0, PageSize: DISCOVER_PAGE_SIZE, StartIndex: startIndex,
-      });
+      results = await Promise.all(batch.map(fetchDayJobChanges));
     } catch (err) {
-      error = `getJobStatusChanges failed at StartIndex=${startIndex}: ${err.message}`;
+      error = `getJobStatusChanges failed near ${batch[0]}: ${err.message}`;
       break;
     }
 
-    const recs = extractArray(resp);
-    if (recs.length === 0) break;
-    pages++;
-
-    // Probe: log the response shape once so the identifier keys are confirmed.
-    if (!probeKeys && recs[0] && typeof recs[0] === 'object') {
-      probeKeys = Object.keys(recs[0]);
-      console.log(`[RtpJobBackfill] GetJobStatusChanges record keys: ${probeKeys.join(', ')}`);
-    }
-
-    for (const rec of recs) {
-      scanned++;
-      const pid = prospectIdOf(rec);
-      const jid = jobIdOf(rec);
-      if (pid) prospectIds.add(pid);
-      if (jid) jobIds.add(jid);
+    for (const recs of results) {
+      pages++;
+      // Probe: log the response shape once so the identifier keys are confirmed.
+      if (!probeKeys && recs[0] && typeof recs[0] === 'object') {
+        probeKeys = Object.keys(recs[0]);
+        console.log(`[RtpJobBackfill] GetJobStatusChanges record keys: ${probeKeys.join(', ')}`);
+      }
+      for (const rec of recs) {
+        scanned++;
+        const pid = prospectIdOf(rec);
+        const jid = jobIdOf(rec);
+        if (pid) prospectIds.add(pid);
+        if (jid) jobIds.add(jid);
+      }
     }
 
     if (job) { job.discovered_prospects = prospectIds.size; job.discovered_jobs = jobIds.size; }
-    startIndex += recs.length;
     await sleep(DISCOVER_SLEEP_MS);
   }
 
