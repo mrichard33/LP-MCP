@@ -75,7 +75,9 @@ export function checkBounds(row) {
   const sales = n(row.sales) || 0, demos = n(row.demos) || 0, netClose = n(row.net_close) || 0;
   if (net - gross > DOLLAR_TOL) out.push({ rule: 'bounds', market: row.market, detail: `net_sales ${net} > gross_sales ${gross}` });
   if (sales > demos) out.push({ rule: 'bounds', market: row.market, detail: `sales ${sales} > demos ${demos}` });
-  if (netClose > sales) out.push({ rule: 'bounds', market: row.market, detail: `net_close ${netClose} > sales ${sales}` });
+  // net_close ≤ sales, tolerating a ≤1 rounding wobble from the proportional-split
+  // backfill (forward LP-API rows are exact; a real overage still alerts).
+  if (netClose - sales > 1) out.push({ rule: 'bounds', market: row.market, detail: `net_close ${netClose} > sales ${sales}` });
   return out;
 }
 
