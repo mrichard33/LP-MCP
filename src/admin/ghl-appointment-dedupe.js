@@ -73,12 +73,23 @@ export function findDuplicateGroups(events) {
   return groups;
 }
 
-export async function runGhlAppointmentDedupe({ dryRun = true, horizonDays = DEFAULT_HORIZON_DAYS, job = null } = {}) {
+export async function runGhlAppointmentDedupe({ dryRun = true, horizonDays = DEFAULT_HORIZON_DAYS, contactIds = null, job = null } = {}) {
   const startMs = Date.now();
   const endMs = startMs + horizonDays * 24 * 3600 * 1000;
 
   const events = await listEstimatePoolEvents({ startMs, endMs, activeOnly: true });
-  const groups = findDuplicateGroups(events);
+  let groups = findDuplicateGroups(events);
+
+  // Optional allowlist: restrict cancellation to specific contacts (e.g. cancel
+  // only tomorrow's confirmed double-books while HOLDING same-day duplicates that
+  // may be in-flight). The window still applies; this narrows WHICH in-window
+  // duplicate groups act. Groups are keyed `${contact_id}__${startMs}`.
+  const allow = Array.isArray(contactIds) && contactIds.length ? new Set(contactIds) : null;
+  if (allow) {
+    const filtered = new Map();
+    for (const [k, v] of groups) if (allow.has(v[0]?.contact_id)) filtered.set(k, v);
+    groups = filtered;
+  }
 
   if (job) job.total = groups.size;
 
@@ -91,7 +102,11 @@ export async function runGhlAppointmentDedupe({ dryRun = true, horizonDays = DEF
     const { keep, cancel } = chooseKeep(group);
     counts.kept++;
     const contactId = keep.contact_id;
-    lines.push(`contact=${contactId} slot=${keep.start_time} keep=${keep.appointment_id}(${keep.status}) cancel=[${cancel.map((c) => `${c.appointment_id}(${c.status})`).join(', ')}]`);
+    // Flag confirmed-status cancels so a customer-facing confirmation isn't
+    // silently voided (both duplicates share the slot, but a cancel PUT can
+    // still trip GHL cancellation workflows).
+    const confirmedCancels = cancel.filter((c) => /^(confirmed|showed)$/i.test(String(c.status || '')));
+    lines.push(`contact=${contactId} slot=${keep.start_time} keep=${keep.appointment_id}(${keep.status}) cancel=[${cancel.map((c) => `${c.appointment_id}(${c.status})`).join(', ')}]${confirmedCancels.length ? ` ⚠ cancels ${confirmedCancels.length} confirmed` : ''}`);
     for (const appt of cancel) {
       counts.would_cancel++;
       try {
@@ -110,6 +125,7 @@ export async function runGhlAppointmentDedupe({ dryRun = true, horizonDays = DEF
   const summary = {
     dry_run: dryRun,
     horizon_days: horizonDays,
+    contact_ids: allow ? Array.from(allow) : null,
     scanned_events: events.length,
     ...counts,
     lines,
@@ -129,6 +145,8 @@ export function registerGhlAppointmentDedupeRoutes(app) {
     const body = req.body || {};
     const dryRun = body.dry_run !== false; // DEFAULT TRUE
     const horizonDays = parseInt(body.horizon_days, 10) || DEFAULT_HORIZON_DAYS;
+    const contactIds = Array.isArray(body.contact_ids) && body.contact_ids.length
+      ? body.contact_ids.map(String) : null;
 
     const jobId = generateJobId();
     const job = {
@@ -140,7 +158,7 @@ export function registerGhlAppointmentDedupeRoutes(app) {
 
     setImmediate(async () => {
       try {
-        await runGhlAppointmentDedupe({ dryRun, horizonDays, job });
+        await runGhlAppointmentDedupe({ dryRun, horizonDays, contactIds, job });
       } catch (err) {
         job.status = 'failed';
         job.error = String(err.message || 'unknown').slice(0, 500);

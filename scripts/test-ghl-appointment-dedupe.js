@@ -124,3 +124,21 @@ test('run: no duplicates → zero cancels', async () => {
   assert.equal(s.duplicate_groups, 0);
   assert.equal(cancels().length, 0);
 });
+
+test('run: contactIds allowlist restricts to named contacts, holds the rest', async () => {
+  seed([
+    raw({ id: 'keepA', c: 'cA', s: 'confirmed' }), raw({ id: 'dupeA', c: 'cA', s: 'new' }),   // allowed
+    raw({ id: 'keepB', c: 'cB', s: 'confirmed' }), raw({ id: 'dupeB', c: 'cB', s: 'new' }),   // HELD
+  ]);
+  const s = await runGhlAppointmentDedupe({ dryRun: false, contactIds: ['cA'] });
+  assert.equal(s.duplicate_groups, 1);            // only cA's group acted on
+  assert.deepEqual(s.contact_ids, ['cA']);
+  assert.equal(cancels().length, 1);
+  assert.match(cancels()[0].path, /\/dupeA$/);    // cB's dupe untouched
+});
+
+test('run: confirmed-status cancel is flagged in the line', async () => {
+  seed([raw({ id: 'keep', c: 'c1', s: 'confirmed' }), raw({ id: 'dupe', c: 'c1', s: 'confirmed' })]);
+  const s = await runGhlAppointmentDedupe({ dryRun: true, contactIds: ['c1'] });
+  assert.match(s.lines[0], /cancels 1 confirmed/);
+});
