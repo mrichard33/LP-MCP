@@ -188,6 +188,8 @@ import { registerGoalScorecardRoutes, startGoalScorecardScheduler } from './jobs
 import { registerMarketAssignmentRoutes, startMarketAssignmentScheduler } from './jobs/market-assignment-daily.js';
 // One-shot proportional-split backfill of per-market history.
 import { registerScorecardBackfillRoutes } from './jobs/scorecard-market-backfill.js';
+// Nightly scorecard validation + GroupMe tie-out alert.
+import { registerScorecardValidateRoutes, startScorecardValidateScheduler } from './jobs/scorecard-validate.js';
 // ─── Agentic Hold-Complete (return-from-hold re-entry) ───────────
 import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
 // ─── FB Publish Watchdog (alert on missed WF4 publish window) ────
@@ -567,6 +569,7 @@ registerWorkflowProjectionRoutes(app);
 registerGoalScorecardRoutes(app);
 registerMarketAssignmentRoutes(app);
 registerScorecardBackfillRoutes(app);
+registerScorecardValidateRoutes(app);
 
 app.listen(PORT, async () => {
   console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
@@ -595,6 +598,7 @@ app.listen(PORT, async () => {
   startWorkflowProjectionLoop();
   startMarketAssignmentScheduler();
   startGoalScorecardScheduler();
+  startScorecardValidateScheduler();
   startFbPublishWatchdog();
   startFive9SilenceWatchdog();
   startGhlNoteSweep();
