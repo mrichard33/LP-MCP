@@ -24,7 +24,7 @@ import { syncLogStart, syncLogComplete } from '../sync-log.js';
 import {
   computeActuals, SCORECARD_GETLEAD_OPTIONS, DEFAULT_MARKET,
 } from './scorecard-metrics.js';
-import { buildProspectMarketMap } from './market-resolver.js';
+import { buildProspectMarketMap, getMarketMaps } from './market-resolver.js';
 import {
   resolveSellingCalendar, sellingDaysElapsed, sellingDaysInPeriod, lastCompletedSellingDay,
 } from '../selling-days.js';
@@ -187,12 +187,30 @@ export async function computeGoalScorecard(opts = {}) {
   // Σ(market rows) = REECE to the penny for every count/$ column. A lookup failure
   // degrades gracefully to REECE-only for the run.
   const cstOf = (p) => String(getField(p, 'cst_id', 'CST_ID') ?? '');
+  const brnOf = (p) => String(getField(p, 'brn_id', 'BRN_ID') ?? '').trim().toUpperCase();
   const reeceOnly = { [DEFAULT_MARKET]: prospects };
   const markets = { [DEFAULT_MARKET]: prospects };
+  // How each prospect was attributed to a market — surfaced on REECE.raw_inputs so a
+  // run is self-verifying (branch vs zip fallback vs unassigned).
+  const resolveStats = { by_branch: 0, by_zip: 0, unassigned: 0, out_of_area: 0 };
   try {
+    // Primary: the prospect's OWN LP branch (brn_id → market). This is the intended
+    // attribution — the market map is built on branch codes (a market = one or more
+    // branches). The GetLead cohort carries brn_id even though the lp_leads cache does
+    // not, so we prefer it and fall back to zip-via-cache only when brn_id is absent
+    // or unmapped. Each prospect still lands in exactly one group → Σ markets = REECE.
+    const { branchMap } = await getMarketMaps();
     const marketByProspect = await buildProspectMarketMap(prospects.map(cstOf));
     for (const p of prospects) {
-      const mk = marketByProspect.get(cstOf(p)) || 'UNASSIGNED';
+      const byBranch = branchMap.get(brnOf(p));
+      let mk;
+      if (byBranch) { mk = byBranch; resolveStats.by_branch++; }
+      else {
+        mk = marketByProspect.get(cstOf(p)) || 'UNASSIGNED';
+        if (mk === 'UNASSIGNED') resolveStats.unassigned++;
+        else if (mk === 'OUT_OF_AREA') resolveStats.out_of_area++;
+        else resolveStats.by_zip++;
+      }
       if (mk === DEFAULT_MARKET) continue; // guard against a stray REECE key
       (markets[mk] ||= []).push(p);
     }
@@ -245,7 +263,8 @@ export async function computeGoalScorecard(opts = {}) {
       raw_inputs: {
         ...raw_inputs,
         prospects_scanned: records.length,
-        raw_leads_basis: market === DEFAULT_MARKET ? 'lp_leads.created_at_lp (cache)' : 'per-market split (zip)',
+        raw_leads_basis: market === DEFAULT_MARKET ? 'lp_leads.created_at_lp (cache)' : 'per-market (brn_id, zip fallback)',
+        ...(market === DEFAULT_MARKET ? { market_resolution: resolveStats } : {}),
       },
     });
   }
