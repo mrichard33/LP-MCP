@@ -763,4 +763,7 @@ export async function upsertLeadFromFlat(lp, ghlId) {
 
 // v9.2: Export for use by other modules (e.g., one-shot backfill scripts)
 // buildLeadRow exported for the cohort-reconcile sweep (cache-only forced upsert).
-export { deriveLeadGhlId, GHL_CONTACT_ID_PATTERN, buildLeadRow };
+// emitDispositionBackfill exported for the mirror-backfill sweep (recovered-lead
+// emits) and the LP contact backstop (rescued-lead emits) — both need the same
+// idempotency-keyed synthetic lp.disposition_changed this module already emits.
+export { deriveLeadGhlId, GHL_CONTACT_ID_PATTERN, buildLeadRow, emitDispositionBackfill };

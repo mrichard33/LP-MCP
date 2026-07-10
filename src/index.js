@@ -136,6 +136,14 @@ import { registerGhlAppointmentBackfillRoutes } from './admin/ghl-appointment-ba
 // finds-or-creates the GHL contact for unlinked LP leads then reconciles the
 // appointment. Scheduler no-ops unless ENABLE_LP_CONTACT_BACKSTOP=true.
 import { registerLpContactBackstopRoutes } from './admin/lp-contact-backstop.js';
+// Parity-hardening admin endpoints (2026-07-10): windowed mirror backfill that
+// recovers leads the incremental sync drops (emits lp.disposition_changed only
+// for recovered upcoming leads); WE calendar same-slot de-dupe; live-GHL
+// appointment count for the dashboard; live LP↔GHL parity report.
+import { registerLpMirrorBackfillRoutes } from './admin/lp-mirror-backfill.js';
+import { registerGhlAppointmentDedupeRoutes } from './admin/ghl-appointment-dedupe.js';
+import { registerGhlAppointmentCountRoutes } from './admin/ghl-appointment-count.js';
+import { registerParityReportRoutes } from './admin/parity-report.js';
 // ─── LP Force-AddLead (manual + shared helper for no-lds_id appt failures) ──
 // v1.0.0 2026-06-03: POST /admin/lp/force-addlead creates a lead in LP via
 // the legacy addlead path with the appointment embedded + lognumber stamped,
@@ -560,6 +568,10 @@ registerGuestVisitorRemediationRoutes(app);
 registerPendingProbeTtlSweepRoutes(app); // 2026-07-08 — stale pending:customer-status-check TTL sweep (scheduler env-gated, default off)
 registerGhlAppointmentBackfillRoutes(app); // 2026-07-07 — LP→GHL appointment backfill trigger (dry-run default)
 registerLpContactBackstopRoutes(app); // 2026-07-09 — LP contact auto-create backstop (scheduler env-gated, default off)
+registerLpMirrorBackfillRoutes(app); // 2026-07-10 — windowed cursor-independent mirror recovery (dry-run default)
+registerGhlAppointmentDedupeRoutes(app); // 2026-07-10 — WE same-slot de-dupe (dry-run default)
+registerGhlAppointmentCountRoutes(app); // 2026-07-10 — live-GHL appointment count for the dashboard
+registerParityReportRoutes(app); // 2026-07-10 — live LP↔GHL parity report
 registerLPForceAddLeadRoutes(app);
 registerLeadStateSweepRoutes(app);
 registerNoteChangeAnalyzerRoutes(app);
