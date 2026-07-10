@@ -79,8 +79,34 @@ export function computeParity(lpByContact, ghlByContact) {
   };
 }
 
+/**
+ * Is an LP appointment_date inside the GHL comparison window [startMs, endMs)?
+ *
+ * The SQL fetch widens its bounds ±1 day to absorb the ET-wall-clock-mislabeled-
+ * as-UTC offset, but the DIFF must re-narrow to the exact window the GHL side was
+ * read for — otherwise adjacent-day LP appointments (which GHL was never queried
+ * for) show as false "missing". Exact-time rows compare on the true instant;
+ * date-only / time-TBD rows (null start) fall back to their ET calendar day,
+ * leniently (they have no exact time to place within the day). Exported for testing.
+ */
+export function expectationInWindow(appointmentDate, startMs, endMs) {
+  const st = lpWallClockToGhlStartTime(appointmentDate);
+  if (st) {
+    const ms = Date.parse(st);
+    if (Number.isNaN(ms)) return false;
+    return ms >= startMs && ms < endMs;               // half-open
+  }
+  // Date-only / TBD: place on its ET calendar day; keep if that day overlaps
+  // the window (± the same 1-day leniency the SQL fetch uses).
+  const dayStr = String(appointmentDate || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dayStr)) return false;
+  const dayMs = Date.parse(`${dayStr}T00:00:00-04:00`);
+  if (Number.isNaN(dayMs)) return false;
+  return dayMs >= startMs - 24 * 3600 * 1000 && dayMs < endMs;
+}
+
 // ─── LP-side scan (newest lead per contact) ──────────────────────────
-async function scanLpExpectations({ fromIso, toIso }) {
+async function scanLpExpectations({ fromIso, toIso, startMs, endMs }) {
   if (!supabase) throw new Error('Supabase not configured');
   const PAGE = 1000;
   const rows = [];
@@ -102,10 +128,13 @@ async function scanLpExpectations({ fromIso, toIso }) {
     if (data.length < PAGE) break;
     from += PAGE;
   }
-  // Newest lead per contact wins (rows already created_at_lp desc).
+  // Newest lead per contact wins (rows already created_at_lp desc). Drop any
+  // expectation outside the exact GHL window — the ±1-day SQL widening is only
+  // to survive the offset mislabeling, NOT to diff adjacent days GHL wasn't read for.
   const byContact = new Map();
   for (const r of rows) {
     if (byContact.has(r.ghl_contact_id)) continue;
+    if (!expectationInWindow(r.appointment_date, startMs, endMs)) continue;
     byContact.set(r.ghl_contact_id, {
       lp_lead_id: r.lp_lead_id,
       disposition_code: r.disposition_code,
@@ -131,7 +160,7 @@ export async function runParityReport({ date = null, horizonDays = 14 } = {}) {
   const fromIso = new Date(startMs - 24 * 3600 * 1000).toISOString();
   const toIso = new Date(endMs + 24 * 3600 * 1000).toISOString();
 
-  const lpByContact = await scanLpExpectations({ fromIso, toIso });
+  const lpByContact = await scanLpExpectations({ fromIso, toIso, startMs, endMs });
 
   const events = await listEstimatePoolEvents({ startMs, endMs, activeOnly: true });
   const ghlByContact = new Map();

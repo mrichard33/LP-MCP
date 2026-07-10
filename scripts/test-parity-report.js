@@ -10,7 +10,34 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 process.env.GHL_API_KEY = 'test-key';
-const { computeParity } = await import('../src/admin/parity-report.js');
+const { computeParity, expectationInWindow } = await import('../src/admin/parity-report.js');
+
+// ═══ window filter (fix for the LP-wide / GHL-narrow asymmetry) ════════
+// Window = the 7/11 ET day: [00:00, 24:00) EDT.
+const W_START = Date.parse('2026-07-11T00:00:00-04:00');
+const W_END = W_START + 24 * 3600 * 1000;
+
+test('expectationInWindow: in-window instant kept', () => {
+  assert.equal(expectationInWindow('2026-07-11T10:00:00+00:00', W_START, W_END), true);
+});
+
+test('expectationInWindow: adjacent-day instants dropped (the phantom-missing bug)', () => {
+  assert.equal(expectationInWindow('2026-07-10T06:00:00+00:00', W_START, W_END), false); // day before
+  assert.equal(expectationInWindow('2026-07-13T14:00:00+00:00', W_START, W_END), false); // days after
+});
+
+test('expectationInWindow: half-open end — last minute in, next-day midnight out', () => {
+  // 23:59 on the window day → instant path, inside.
+  assert.equal(expectationInWindow('2026-07-11T23:59:00+00:00', W_START, W_END), true);
+  // Next-day midnight is exact-midnight → day fallback lands on endMs, excluded (half-open).
+  assert.equal(expectationInWindow('2026-07-12T00:00:00+00:00', W_START, W_END), false);
+});
+
+test('expectationInWindow: date-only/TBD row on the window day kept, adjacent dropped', () => {
+  // lpWallClockToGhlStartTime returns null for exact-midnight/date-only → day fallback.
+  assert.equal(expectationInWindow('2026-07-11', W_START, W_END), true);
+  assert.equal(expectationInWindow('2026-07-09', W_START, W_END), false);
+});
 
 const SLOT = '2026-07-11T10:00:00-04:00';
 const SLOT_UTC = '2026-07-11T14:00:00+00:00'; // same instant, different spelling
