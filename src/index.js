@@ -141,6 +141,11 @@ import { registerLpContactBackstopRoutes } from './admin/lp-contact-backstop.js'
 // for recovered upcoming leads); WE calendar same-slot de-dupe; live-GHL
 // appointment count for the dashboard; live LP↔GHL parity report.
 import { registerLpMirrorBackfillRoutes } from './admin/lp-mirror-backfill.js';
+// ─── RTP job-axis backfill (#512) ──
+// One-shot, idempotent, dry-runnable sweep that recovers post-sale RTP jobs the
+// lead-keyed sync paths structurally miss. Manual only (no scheduler):
+// POST /admin/lp-rtp-job-backfill (dry-run default).
+import { registerRtpJobBackfillRoutes } from './admin/lp-rtp-job-backfill.js';
 import { registerGhlAppointmentDedupeRoutes } from './admin/ghl-appointment-dedupe.js';
 import { registerGhlAppointmentCountRoutes } from './admin/ghl-appointment-count.js';
 import { registerParityReportRoutes } from './admin/parity-report.js';
@@ -569,6 +574,7 @@ registerPendingProbeTtlSweepRoutes(app); // 2026-07-08 — stale pending:custome
 registerGhlAppointmentBackfillRoutes(app); // 2026-07-07 — LP→GHL appointment backfill trigger (dry-run default)
 registerLpContactBackstopRoutes(app); // 2026-07-09 — LP contact auto-create backstop (scheduler env-gated, default off)
 registerLpMirrorBackfillRoutes(app); // 2026-07-10 — windowed cursor-independent mirror recovery (dry-run default)
+registerRtpJobBackfillRoutes(app); // 2026-07-10 (#512) — one-shot RTP job-axis backfill (dry-run default)
 registerGhlAppointmentDedupeRoutes(app); // 2026-07-10 — WE same-slot de-dupe (dry-run default)
 registerGhlAppointmentCountRoutes(app); // 2026-07-10 — live-GHL appointment count for the dashboard
 registerParityReportRoutes(app); // 2026-07-10 — live LP↔GHL parity report

@@ -506,6 +506,17 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
       // that never emitted a transition still needs to reach LP_DISP_*. No-op
       // for baseline/null dispositions and deduped after the first emit.
       await emitInboundBackfill();
+      // #512: job/milestone dates (esp. RTP) advance post-sale WITHOUT bumping
+      // lead.lastchangedon, so the lead row looks unchanged here while its jobs
+      // are fresh. getLeads(options=261120) includes the Job-Modified +
+      // Milestone-Updated bits, so the updated jobs are already embedded in this
+      // payload — refresh them before we `continue`, or the RTP milestone is
+      // dropped and lp_jobs/lp_job_milestones silently rot. Idempotent
+      // (onConflict on lp_job_id / lp_job_id,mdt_id), no extra LP call.
+      const jobsForRefresh = getField(lead, 'jobs', 'Jobs') || [];
+      if (jobsForRefresh.length) {
+        await Promise.all(jobsForRefresh.map(job => syncJobAndMilestones(job, lpLeadId, ghlId)));
+      }
       // v10.0: route through executor (entry:* immutability respected)
       if (ghlId && !existing?.ghl_tag_applied) {
         const success = await applyTagViaExecutor(ghlId, tag);
