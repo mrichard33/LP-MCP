@@ -90,8 +90,15 @@ const {
 const GHL_LOCATION_ID = 'SsBG7j5KQAIP1SFP2Sca';
 const LP_LEAD_ID_FIELD = 'GmAVmW6V9sekD7pVONKr';
 const LP_PROSPECT_ID_FIELD = 'ZRQAVrzhtzApzLlHmT87';
-// FUTURE mirrors the sync test: an LP wall-clock time comfortably ahead.
-const FUTURE = '2027-07-08T10:00:00+00:00';
+// FUTURE = an upcoming appointment INSIDE the backstop selection window
+// (today .. +MAX_HORIZON_DAYS). Computed relative to now so it stays in-window
+// whenever the suite runs. ~14 days out. (The old fixed 2027 literal now falls
+// outside the hardened absolute ceiling — that's the guard working.)
+const FUTURE = new Date(Date.now() + 14 * 24 * 3600 * 1000).toISOString();
+// Beyond the absolute ceiling — the garbage-date class (Sept-far-out, year-3026
+// junk) the guard must reject regardless of any horizon param.
+const ABSURD_FUTURE = '3026-06-16T18:00:00+00:00';
+const NINETY_DAYS_OUT = new Date(Date.now() + 90 * 24 * 3600 * 1000).toISOString();
 
 function reset({ search = [], searchQueue = null, full = null, upcoming = [], create400 = false } = {}) {
   calls = [];
@@ -144,6 +151,25 @@ test('selectBackstopTargets: past appointment excluded', () => {
   const sel = selectBackstopTargets(rows, { maxPerRun: 50 });
   assert.equal(sel.targets.length, 0);
   assert.equal(sel.noPhone.length, 0);
+});
+
+test('date guard: absurd-future (year 3026) excluded — never mints a garbage contact', () => {
+  const rows = [lead({ appointment_date: ABSURD_FUTURE })];
+  const sel = selectBackstopTargets(rows, { maxPerRun: 50 });
+  assert.equal(sel.targets.length, 0);
+  assert.equal(sel.eligible, 0);
+});
+
+test('date guard: beyond the absolute ceiling (~90d out) excluded even though it is "future"', () => {
+  const rows = [lead({ appointment_date: NINETY_DAYS_OUT })];
+  const sel = selectBackstopTargets(rows, { maxPerRun: 50 });
+  assert.equal(sel.targets.length, 0); // > MAX_HORIZON_DAYS (60)
+});
+
+test('date guard: in-window upcoming appointment still selected', () => {
+  const rows = [lead({ appointment_date: FUTURE })]; // ~14d out
+  const sel = selectBackstopTargets(rows, { maxPerRun: 50 });
+  assert.equal(sel.targets.length, 1);
 });
 
 // ═══ 2. Tag map + name hygiene ════════════════════════════════════════

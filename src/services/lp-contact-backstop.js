@@ -31,6 +31,7 @@ import { GHL_LOCATION_ID } from '../actions/constants.js';
 import { reconcileLpAppointmentToGhl } from './lp-ghl-appointment-reconciler.js';
 import { normalizePhone } from '../sync-utils.js';
 import { appointmentDelta } from '../appointment-dates.js';
+import { emitDispositionBackfill } from '../sync-leads.js';
 import { buildClassifiedNotification } from '../actions/notification-classifier.js';
 import { sendGroupMeMessage } from '../groupme.js';
 
@@ -43,7 +44,13 @@ const LP_PROSPECT_ID_FIELD = 'ZRQAVrzhtzApzLlHmT87';
 // Only live-appointment dispositions. NOT CXL — no value creating a contact
 // for a cancelled appointment; NOT DNC/Issue/others.
 const DISPOSITIONS = ['Set', 'Cnf', 'Verif'];
-const DEFAULT_HORIZON_DAYS = 60;
+const DEFAULT_HORIZON_DAYS = 45;
+// Absolute upper bound enforced REGARDLESS of the caller's horizon_days. This
+// — not the caller-supplied window — is the guard that keeps garbage-dated LP
+// rows (verified live: unlinked "future" appointments dated Sept 2026, and junk
+// like year 3026/2033/2029) from ever minting a contact. A mis-parameterized
+// POST /admin/lp-contact-backstop {horizon_days: 99999} cannot get past it.
+export const MAX_HORIZON_DAYS = 60;
 export const DEFAULT_MAX_PER_RUN = 50;
 
 // ─── Tag mapping (create-time only) ──────────────────────────────────
@@ -92,8 +99,12 @@ export async function scanContactBackstopCandidates({
 } = {}) {
   if (!supabase) throw new Error('Supabase not configured');
 
+  // Clamp the SQL upper bound to the absolute ceiling regardless of the caller's
+  // horizonDays — the JS gate in selectBackstopTargets re-asserts the same bound
+  // so garbage-dated rows can never slip through either layer.
+  const effHorizon = Math.min(Math.max(0, horizonDays), MAX_HORIZON_DAYS);
   const fromIso = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-  const toIso = new Date(Date.now() + (horizonDays + 1) * 24 * 3600 * 1000).toISOString();
+  const toIso = new Date(Date.now() + (effHorizon + 1) * 24 * 3600 * 1000).toISOString();
 
   const PAGE = 1000;
   const rows = [];
@@ -126,19 +137,23 @@ export async function scanContactBackstopCandidates({
  * @returns {{ targets:[{lead,superseded}], noPhone, deferredCapped, eligible }}
  */
 export function selectBackstopTargets(rows, { maxPerRun = DEFAULT_MAX_PER_RUN, limit = 0 } = {}) {
-  // Today-or-future, day-granular. Deliberately NOT lpWallClockToGhlStartTime:
-  // it returns null for date-only / exact-midnight rows ("time TBD"), which
-  // must still get a contact — the appointment follows when LP posts a real
-  // time and the LP_APPT_GHL_SYNC_* rules fire.
-  const isTodayOrFuture = (lead) => {
+  // Within-window, day-granular: today (>=0) through the ABSOLUTE ceiling
+  // (MAX_HORIZON_DAYS), independent of any caller horizon param. Rejects
+  // past-dated AND absurd-future rows (Sept-2026 stragglers, year-3026/2033
+  // junk) — this bound is the whole protection against minting garbage
+  // contacts. Deliberately NOT lpWallClockToGhlStartTime: it returns null for
+  // date-only / exact-midnight rows ("time TBD"), which must still get a
+  // contact — the appointment follows when LP posts a real time and the
+  // LP_APPT_GHL_SYNC_* rules fire.
+  const isWithinWindow = (lead) => {
     const d = appointmentDelta(lead.appointment_date);
-    return !!(d && d.days_delta >= 0);
+    return !!(d && d.days_delta >= 0 && d.days_delta <= MAX_HORIZON_DAYS);
   };
 
   const noPhone = [];
   const phoneValid = [];
   for (const lead of rows) {
-    if (!isTodayOrFuture(lead)) continue;
+    if (!isWithinWindow(lead)) continue;
     const p = normalizePhone(lead.phone);
     if (!p || p.length < 10) { noPhone.push(lead); continue; }
     phoneValid.push({ lead, phone: p });
@@ -270,6 +285,24 @@ export async function processOneLead({ lead, dryRun = false, seenPhones, contact
       .eq('lp_lead_id', lead.lp_lead_id)
       .is('ghl_contact_id', null); // never clobber a link that raced in
     if (updErr) console.warn(`[LpContactBackstop] ghl_contact_id writeback failed for lead ${lead.lp_lead_id}: ${updErr.message}`);
+  }
+
+  // Announce the disposition to the event system for every rescued lead
+  // (created OR linked). The direct reconcile below only creates the
+  // appointment; without this emit the E.0 router and the rest of the
+  // LP_DISP_* rule family never see these previously-invisible leads, which
+  // is exactly how the appointment/routing gap re-opens. Idempotency-keyed
+  // (disp_<id>_backfill_<disp>) so it never double-fires with the reconciler
+  // or a later normal-sync emit; no-op for baseline dispositions.
+  if (!dryRun) {
+    await emitDispositionBackfill({
+      lpLeadId: lead.lp_lead_id,
+      lpProspectId: lead.lp_prospect_id,
+      ghlContactId: contactId,
+      disposition: lead.disposition_code,
+      leadName: base.name || null,
+      leadSource: lead.lead_source || null,
+    }).catch((e) => console.warn(`[LpContactBackstop] disposition emit failed for lead ${lead.lp_lead_id}: ${e.message}`));
   }
 
   // Reconcile the appointment immediately — the appointment appearing is the
