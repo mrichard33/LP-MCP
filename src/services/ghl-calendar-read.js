@@ -59,7 +59,17 @@ export async function listCalendarEvents({ calendarId, startMs, endMs }) {
   const events = Array.isArray(res?.events) ? res.events
     : Array.isArray(res?.appointments) ? res.appointments
     : Array.isArray(res) ? res : [];
-  return events.map(mapEvent);
+  // GHL's /calendars/events returns events PAST the endTime we pass (verified
+  // live: a 7/11 query returned 7/12 appointments), which surfaced as false
+  // "orphans" in the parity report once the LP side was correctly narrowed.
+  // Strictly re-bound to [startMs, endMs) here so every consumer is window-
+  // accurate regardless of GHL's loose endTime handling. Half-open, matching
+  // the LP-side expectationInWindow.
+  const inWindow = (e) => {
+    const ms = Date.parse(e.start_time || '');
+    return !Number.isNaN(ms) && ms >= startMs && ms < endMs;
+  };
+  return events.map(mapEvent).filter(inWindow);
 }
 
 /**
