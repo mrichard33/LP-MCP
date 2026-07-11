@@ -20,6 +20,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+// This suite exercises the reconciler with supabase intentionally ABSENT — the
+// injected `lead` row is its only data dependency. The create-claim guard
+// (appointment-sync-claim.js) must fail-open when supabase is null; force that
+// here regardless of ambient env so its REST calls never reach the stubbed
+// global fetch and inflate the GHL POST count.
+delete process.env.SUPABASE_URL;
+delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+
 process.env.GHL_API_KEY = 'test-key';
 // Intentionally NOT setting SUPABASE_* — reconciler must run without it.
 

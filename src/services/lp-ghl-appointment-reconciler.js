@@ -46,6 +46,7 @@
  */
 
 import { ghlFetch } from '../actions/helpers.js';
+import { claimAppointmentCreate, releaseAppointmentCreate } from './appointment-sync-claim.js';
 import { GHL_LOCATION_ID } from '../actions/constants.js';
 import { getContactCached } from '../actions/contact-cache.js';
 import { fetchUpcomingAppointments } from '../knowledge/contact-appointments.js';
@@ -308,21 +309,39 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, toNotify = 
   }
 
   if (plan.op === 'create') {
-    const res = await ghlFetch('POST', '/calendars/events/appointments', {
-      calendarId: WINDOW_ESTIMATE_CALENDAR_ID,
-      locationId: GHL_LOCATION_ID,
-      contactId,
-      startTime,
-      endTime: endTimeFor(startTime),
-      title: 'Window Estimate',
-      appointmentStatus: plan.status,
-      assignedUserId: DEFAULT_ASSIGNED_USER_ID,
-      toNotify,
-      ignoreFreeSlotValidation: true,
-    });
-    const appointmentId = res?.id || res?.appointment?.id || null;
-    if (!appointmentId) console.warn(`[LpGhlApptSync] POST created appointment for ${contactId} but no id in response`);
-    return { ...base, outcome: 'created', appointment_id: appointmentId, new_status: plan.status };
+    // Cross-worker double-create guard (2026-07-11): claim (contact, slot) before
+    // POSTing. The decision-engine event dedup already blocks the common case;
+    // this backstops any create that reaches here twice — a manual re-emit, an
+    // executor retry, or two different sync rules racing — since each would
+    // otherwise read "no appointment" and POST a duplicate. FAIL-OPEN (see the
+    // claim service): a claim infra error never strands a legitimate booking.
+    const slotMs = Date.parse(startTime);
+    const claim = await claimAppointmentCreate(contactId, slotMs);
+    if (!claim.claimed) {
+      return noop('create_claim_held', { slot_ms: Number.isNaN(slotMs) ? null : slotMs });
+    }
+    try {
+      const res = await ghlFetch('POST', '/calendars/events/appointments', {
+        calendarId: WINDOW_ESTIMATE_CALENDAR_ID,
+        locationId: GHL_LOCATION_ID,
+        contactId,
+        startTime,
+        endTime: endTimeFor(startTime),
+        title: 'Window Estimate',
+        appointmentStatus: plan.status,
+        assignedUserId: DEFAULT_ASSIGNED_USER_ID,
+        toNotify,
+        ignoreFreeSlotValidation: true,
+      });
+      const appointmentId = res?.id || res?.appointment?.id || null;
+      if (!appointmentId) console.warn(`[LpGhlApptSync] POST created appointment for ${contactId} but no id in response`);
+      return { ...base, outcome: 'created', appointment_id: appointmentId, new_status: plan.status };
+    } catch (err) {
+      // Release the claim so the executor's retry (or a sibling action) can
+      // re-attempt — a failed create must not leave the slot claimed for the TTL.
+      await releaseAppointmentCreate(contactId, slotMs).catch(() => {});
+      throw err;
+    }
   }
 
   const appointmentId = existing.appointment_id;
