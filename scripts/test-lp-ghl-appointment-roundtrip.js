@@ -31,6 +31,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+// Reconciler runs with supabase intentionally absent; force the create-claim
+// guard to fail-open so its REST calls never reach the stubbed global fetch.
+delete process.env.SUPABASE_URL;
+delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+
 process.env.GHL_API_KEY = 'test-key';
 // Intentionally NOT setting SUPABASE_*.
 
