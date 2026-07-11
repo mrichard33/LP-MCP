@@ -234,7 +234,18 @@ export async function syncActivities(lpLeadId, calls, notes) {
 // Jobs are mutable (status changes) so we keep full upsert, but
 // milestones use existence check since they're append-only.
 // v7.1: Emits lp.milestone_completed events when milestone tags fire.
-export async function syncJobAndMilestones(job, lpLeadId, ghlContactId) {
+//
+// opts.suppressSideEffects (#512): upsert lp_jobs + lp_job_milestones but SKIP
+//   the GHL milestone tag (applyGHLTag) and the lp.milestone_completed event.
+//   Used by the one-shot RTP job-axis backfill: hydrating historical jobs would
+//   otherwise retroactively fire a burst of milestone tags/events for
+//   completions from weeks-to-months ago on already-sold contacts. Default
+//   false — all normal sync callers keep firing exactly as before.
+// Returns { suppressedFires } — how many genuine first-time completions had
+//   their tag/event suppressed (0 when not suppressing), for blast-radius report.
+export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {}) {
+  const { suppressSideEffects = false } = opts;
+  let suppressedFires = 0;
   if (!loggedFirstKeys.has('job')) {
     loggedFirstKeys.add('job');
     console.log('[Sync] Job record keys:', Object.keys(job).join(', '));
@@ -287,6 +298,14 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId) {
     if (actDate && !existing?.act_date && !existing?.ghl_tag_fired && ghlContactId) {
       const tag = MDT_TAG_MAP[mdtId];
       if (tag) {
+        // #512: when backfilling historical jobs, count what WOULD fire but do
+        // not touch GHL or the Decision Engine. act_date is already written
+        // above, so no future sync re-fires this completion (the guard below
+        // reads existing?.act_date on the next pass).
+        if (suppressSideEffects) {
+          suppressedFires++;
+          continue;
+        }
         const success = await applyGHLTag(ghlContactId, tag);
         if (success) {
           await supabase.from('lp_job_milestones')
@@ -311,6 +330,7 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId) {
       }
     }
   }
+  return { suppressedFires };
 }
 
 // ─── Pass 2 — syncAllChildRecords() ──────────────────────────────

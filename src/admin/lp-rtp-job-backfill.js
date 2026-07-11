@@ -31,21 +31,31 @@
  *   but a GHL match failure NEVER aborts the job upsert — the reconciliation
  *   only needs lp_jobs / lp_job_milestones populated.
  *
- *   POST /admin/lp-rtp-job-backfill  { dry_run?, start?, end?, limit? }
+ *   POST /admin/lp-rtp-job-backfill  { dry_run?, suppress_side_effects?, start?, end?, limit? }
  *     → 202 { job_id, status_url } (in-memory registry, lost on redeploy)
  *   GET  /admin/lp-rtp-job-backfill/:jobId  → progress + final summary
  *
- * DRY-RUN (default): discover + count only. Upserts nothing, hydrates nothing.
- *   Reports distinct prospects, distinct jobs, and how many discovered job_ids
- *   are NOT yet in lp_jobs (the recoverable set — expect ~368 contracts).
+ * DRY-RUN (default): discover + count + BLAST RADIUS only. Upserts nothing.
+ *   Reports distinct prospects, distinct jobs, how many discovered job_ids are
+ *   NOT yet in lp_jobs (recoverable set — expect ~368 contracts on the anchor),
+ *   and would_fire_total / would_fire_by_tag — the retroactive milestone tag +
+ *   lp.milestone_completed burst a live UNSUPPRESSED run would trigger.
+ *
+ * SIDE-EFFECT SUPPRESSION (default ON): syncJobAndMilestones normally fires a
+ *   GHL tag + lp.milestone_completed event on a first-time actdate. Hydrating
+ *   net-new historical jobs would fire that burst for RTP/Measure/Ordered/Install
+ *   completions from weeks-to-months ago on already-sold contacts. The live path
+ *   passes suppressSideEffects:true so rows are upserted but NO tag/event fires;
+ *   act_date is still written, so no FUTURE sync re-fires it. A live run with
+ *   suppress_side_effects:false is refused unless i_understand_retroactive_fires:true.
  *
  * SCOPE (gate HELD): population only. No net-vs-gross, no OUT_OF_AREA zip
- *   remap, no live current-month RTP compute. v1.0 — 2026-07-10.
+ *   remap, no live current-month RTP compute. v1.1 — 2026-07-10.
  */
 
 import supabase from '../supabase.js';
 import { getJobStatusChanges, getLead, getCircuitStatus } from '../lp-client.js';
-import { syncJobAndMilestones } from '../sync-children.js';
+import { syncJobAndMilestones, MDT_TAG_MAP } from '../sync-children.js';
 import { matchToGHL } from '../ghl.js';
 import { extractArray, getField, normalizePhone, sleep } from '../sync-utils.js';
 import { runSQL } from './supabase-admin.js';
@@ -93,6 +103,25 @@ function jobIdOf(rec) {
   const id = getField(rec, 'job_id', 'JobID', 'jobid', 'id', 'jbs_id', 'JbsID');
   return id != null && String(id) !== '0' ? String(id) : null;
 }
+function ldsIdOf(rec) {
+  const id = getField(rec, 'lds_id', 'LeadID', 'ldsid');
+  return id != null && String(id) !== '0' ? String(id) : null;
+}
+
+// The milestones on a discovered job that COULD fire a GHL tag/event if this job
+// were hydrated live — i.e. an actdate is present AND the datetype maps to a tag.
+// Mirrors the LP-side half of syncJobAndMilestones' fire guard; the warehouse
+// half (net-new act_date + GHL-linked contact) is applied in computeBlastRadius.
+function fireableMilestonesOf(rec) {
+  const out = [];
+  for (const ms of getField(rec, 'milestones', 'Milestones') || []) {
+    const mdtId = getField(ms, 'mdt_id', 'MDT_ID', 'MdtId');
+    const actd = getField(ms, 'actdate', 'ActDate', 'act_date');
+    const tag = mdtId ? MDT_TAG_MAP[mdtId] : null;
+    if (actd && tag) out.push({ mdtId, tag });
+  }
+  return out;
+}
 
 // How many of `jobIds` already exist in lp_jobs (job-axis presence), batched to
 // keep each .in() query bounded. recoverable = discovered − present.
@@ -129,6 +158,59 @@ async function reconMissingContracts() {
   }
 }
 
+// ─── Blast radius ──────────────────────────────────────────────────
+// The retroactive tag/event fires a live (unsuppressed) hydration WOULD trigger:
+// for each discovered job, a milestone fires iff (LP side) it has an actdate and
+// a tag-mapped datetype — captured in `candidateJobs` during discovery — AND
+// (warehouse side) it is NET-NEW (no existing lp_job_milestones row already
+// carrying an act_date) AND the contact is GHL-LINKED. This mirrors the guard in
+// syncJobAndMilestones. Deterministic set = contacts already linked in lp_leads;
+// the live matchToGHL fallback could link a few currently-unlinked prospects, so
+// treat this as the linked-in-warehouse figure (suppression covers all of them
+// regardless). candidateJobs: Map<jobId, { ldsId, milestones: [{ mdtId, tag }] }>
+async function computeBlastRadius(candidateJobs) {
+  const jobIds = [...candidateJobs.keys()];
+  const ldsIds = [...new Set([...candidateJobs.values()].map(v => v.ldsId).filter(Boolean))];
+
+  // Which (jobId, mdtId) already have an act_date → NOT net-new → won't fire.
+  const alreadyRecorded = new Set();
+  for (let i = 0; i < jobIds.length; i += IN_CHUNK) {
+    const chunk = jobIds.slice(i, i + IN_CHUNK);
+    const { data, error } = await supabase.from('lp_job_milestones')
+      .select('lp_job_id, mdt_id, act_date').in('lp_job_id', chunk);
+    if (error) throw new Error(`lp_job_milestones lookup failed: ${error.message}`);
+    for (const r of data || []) {
+      if (r.act_date != null) alreadyRecorded.add(`${r.lp_job_id}|${r.mdt_id}`);
+    }
+  }
+
+  // Which lead ids are GHL-linked in the warehouse.
+  const ghlLinked = new Set();
+  for (let i = 0; i < ldsIds.length; i += IN_CHUNK) {
+    const chunk = ldsIds.slice(i, i + IN_CHUNK);
+    const { data, error } = await supabase.from('lp_leads')
+      .select('lp_lead_id, ghl_contact_id').in('lp_lead_id', chunk);
+    if (error) throw new Error(`lp_leads link lookup failed: ${error.message}`);
+    for (const r of data || []) {
+      if (r.ghl_contact_id != null) ghlLinked.add(String(r.lp_lead_id));
+    }
+  }
+
+  let total = 0;
+  const byTag = {};
+  const contacts = new Set();
+  for (const [jobId, { ldsId, milestones }] of candidateJobs) {
+    if (!ldsId || !ghlLinked.has(ldsId)) continue; // no GHL contact → cannot fire
+    for (const { mdtId, tag } of milestones) {
+      if (alreadyRecorded.has(`${jobId}|${mdtId}`)) continue; // not net-new
+      total++;
+      byTag[tag] = (byTag[tag] || 0) + 1;
+      contacts.add(ldsId);
+    }
+  }
+  return { total, by_tag: byTag, ghl_linked_contacts: contacts.size };
+}
+
 // Fetch one ET day's changed jobs (single wide page). Throws on LP failure.
 async function fetchDayJobChanges(day) {
   const res = await getJobStatusChanges({
@@ -153,6 +235,11 @@ async function discoverChangedJobProspects({ startdate, enddate, limit, job }) {
 
   const prospectIds = new Set();
   const jobIds = new Set();
+  // jobId -> { ldsId, milestones: [{ mdtId, tag }] } for jobs carrying a
+  // fireable milestone (actdate + tag-mapped datetype). Dedup by jobId — a job
+  // that changed on several days appears on several day-pages; last write wins
+  // (milestones[] is the full current set each time). Feeds computeBlastRadius.
+  const candidateJobs = new Map();
   let pages = 0;
   let scanned = 0;
   let error = null;
@@ -184,6 +271,10 @@ async function discoverChangedJobProspects({ startdate, enddate, limit, job }) {
         const jid = jobIdOf(rec);
         if (pid) prospectIds.add(pid);
         if (jid) jobIds.add(jid);
+        if (jid) {
+          const fireable = fireableMilestonesOf(rec);
+          if (fireable.length) candidateJobs.set(jid, { ldsId: ldsIdOf(rec), milestones: fireable });
+        }
       }
     }
 
@@ -191,20 +282,23 @@ async function discoverChangedJobProspects({ startdate, enddate, limit, job }) {
     await sleep(DISCOVER_SLEEP_MS);
   }
 
-  return { prospectIds, jobIds, pages, scanned, probeKeys, error };
+  return { prospectIds, jobIds, candidateJobs, pages, scanned, probeKeys, error };
 }
 
 // ─── Phase 2: hydrate a prospect via GetLead and upsert its jobs ───────
-// Returns { jobsUpserted, milestonesUpserted }. GHL match failures are swallowed.
-async function hydrateAndUpsert(cstId) {
+// Returns { jobsUpserted, milestonesUpserted, suppressedFires }. GHL match
+// failures are swallowed. suppressSideEffects is threaded into
+// syncJobAndMilestones so the retroactive tag/event burst never fires.
+async function hydrateAndUpsert(cstId, { suppressSideEffects = true } = {}) {
   const result = await getLead(cstId);
   const prospects = extractArray(result);
   const prospect = prospects[0];
-  if (!prospect) return { jobsUpserted: 0, milestonesUpserted: 0 };
+  if (!prospect) return { jobsUpserted: 0, milestonesUpserted: 0, suppressedFires: 0 };
 
   const leads = getField(prospect, 'leads', 'Leads') || [];
   let jobsUpserted = 0;
   let milestonesUpserted = 0;
+  let suppressedFires = 0;
 
   for (const lead of leads) {
     const lpLeadId = String(getField(lead, 'id', 'lds_id', 'LeadID'));
@@ -223,12 +317,13 @@ async function hydrateAndUpsert(cstId) {
 
     const leadJobs = getField(lead, 'jobs', 'Jobs') || [];
     for (const jobRec of leadJobs) {
-      await syncJobAndMilestones(jobRec, lpLeadId, ghlId);
+      const res = await syncJobAndMilestones(jobRec, lpLeadId, ghlId, { suppressSideEffects });
+      suppressedFires += res?.suppressedFires || 0;
       jobsUpserted++;
       milestonesUpserted += (getField(jobRec, 'milestones', 'Milestones') || []).length;
     }
   }
-  return { jobsUpserted, milestonesUpserted };
+  return { jobsUpserted, milestonesUpserted, suppressedFires };
 }
 
 // ─── Core sweep ───────────────────────────────────────────────────────
@@ -238,7 +333,7 @@ async function hydrateAndUpsert(cstId) {
  *   recon_missing_contracts, prospects_processed, jobs_upserted,
  *   milestones_upserted, errors, error }
  */
-export async function runRtpJobBackfill({ dryRun = true, start = DEFAULT_START, end = null, limit = 0, job = null } = {}) {
+export async function runRtpJobBackfill({ dryRun = true, suppressSideEffects = true, start = DEFAULT_START, end = null, limit = 0, job = null } = {}) {
   if (!supabase) throw new Error('Supabase not configured');
 
   const startdate = start;
@@ -246,6 +341,7 @@ export async function runRtpJobBackfill({ dryRun = true, start = DEFAULT_START, 
 
   const summary = {
     dry_run: dryRun,
+    suppress_side_effects: suppressSideEffects,
     window: { startdate, enddate },
     discovered_prospects: 0,
     discovered_jobs: 0,
@@ -253,9 +349,14 @@ export async function runRtpJobBackfill({ dryRun = true, start = DEFAULT_START, 
     jobs_already_present: 0,
     recoverable_jobs: 0,
     recon_missing_contracts: null,
+    // Retroactive tag/event blast radius a live UNSUPPRESSED run would fire.
+    would_fire_total: 0,
+    would_fire_by_tag: {},
+    would_fire_ghl_contacts: 0,
     prospects_processed: 0,
     jobs_upserted: 0,
     milestones_upserted: 0,
+    suppressed_fires: 0,
     errors: 0,
     error: null,
   };
@@ -280,9 +381,21 @@ export async function runRtpJobBackfill({ dryRun = true, start = DEFAULT_START, 
   }
   summary.recon_missing_contracts = await reconMissingContracts();
 
-  console.log(`[RtpJobBackfill] Discovered ${summary.discovered_prospects} prospects / ${summary.discovered_jobs} jobs across ${summary.discover_pages} pages — recoverable jobs=${summary.recoverable_jobs}, recon missing contracts=${summary.recon_missing_contracts}`);
+  // Blast radius — the retroactive tag/event burst a live UNSUPPRESSED run would
+  // fire. Computed from discovery records (which already carry milestones[]) —
+  // no extra hydration — cross-referenced against warehouse state.
+  try {
+    const blast = await computeBlastRadius(disc.candidateJobs || new Map());
+    summary.would_fire_total = blast.total;
+    summary.would_fire_by_tag = blast.by_tag;
+    summary.would_fire_ghl_contacts = blast.ghl_linked_contacts;
+  } catch (err) {
+    errors.push({ phase: 'blast_radius', error: String(err.message || err).slice(0, 300) });
+  }
 
-  // DRY-RUN stops here: discover + count only, no hydration, no writes.
+  console.log(`[RtpJobBackfill] Discovered ${summary.discovered_prospects} prospects / ${summary.discovered_jobs} jobs across ${summary.discover_pages} pages — recoverable jobs=${summary.recoverable_jobs}, recon missing contracts=${summary.recon_missing_contracts}, would-fire=${summary.would_fire_total} on ${summary.would_fire_ghl_contacts} contacts`);
+
+  // DRY-RUN stops here: discover + count + blast radius only, no hydration, no writes.
   if (dryRun) {
     summary.errors = errors.length;
     summary.error_details = errors;
@@ -290,16 +403,19 @@ export async function runRtpJobBackfill({ dryRun = true, start = DEFAULT_START, 
     return summary;
   }
 
-  // Phase 2 — hydrate + upsert each distinct prospect.
+  // Phase 2 — hydrate + upsert each distinct prospect. suppressSideEffects
+  // (default true) upserts lp_jobs / lp_job_milestones but skips the retroactive
+  // GHL tag + lp.milestone_completed event for every backfilled completion.
   const prospectList = [...disc.prospectIds];
   if (job) { job.total = prospectList.length; job.processed = 0; }
 
   for (const cstId of prospectList) {
     if (getCircuitStatus().circuitOpen) { summary.error = summary.error || 'circuit_breaker_open'; break; }
     try {
-      const { jobsUpserted, milestonesUpserted } = await hydrateAndUpsert(cstId);
+      const { jobsUpserted, milestonesUpserted, suppressedFires } = await hydrateAndUpsert(cstId, { suppressSideEffects });
       summary.jobs_upserted += jobsUpserted;
       summary.milestones_upserted += milestonesUpserted;
+      summary.suppressed_fires += suppressedFires;
     } catch (err) {
       summary.errors++;
       errors.push({ cst_id: cstId, error: String(err.message || err).slice(0, 300) });
@@ -310,7 +426,7 @@ export async function runRtpJobBackfill({ dryRun = true, start = DEFAULT_START, 
   }
 
   summary.error_details = errors;
-  console.log(`[RtpJobBackfill] Done — ${summary.prospects_processed}/${prospectList.length} prospects, ${summary.jobs_upserted} jobs / ${summary.milestones_upserted} milestones upserted, ${summary.errors} errors`);
+  console.log(`[RtpJobBackfill] Done — ${summary.prospects_processed}/${prospectList.length} prospects, ${summary.jobs_upserted} jobs / ${summary.milestones_upserted} milestones upserted, ${summary.suppressed_fires} fires suppressed, ${summary.errors} errors`);
 
   if (job) {
     job.summary = summary;
@@ -325,15 +441,30 @@ export function registerRtpJobBackfillRoutes(app) {
   app.post('/admin/lp-rtp-job-backfill', async (req, res) => {
     const body = req.body || {};
     const dryRun = body.dry_run !== false; // DEFAULT TRUE — live requires dry_run:false
+    // DEFAULT TRUE — the backfill must NOT retroactively fire milestone tags /
+    // lp.milestone_completed events for historical completions. Turning this off
+    // for a LIVE run is a deliberate, guarded override (see below).
+    const suppressSideEffects = body.suppress_side_effects !== false;
     const start = typeof body.start === 'string' && body.start ? body.start : DEFAULT_START;
     const end = typeof body.end === 'string' && body.end ? body.end : null;
     const limit = parseInt(body.limit, 10) || 0;
 
     if (!supabase) return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
 
+    // Guard: a LIVE run with side effects ENABLED would blast retroactive tags +
+    // Decision-Engine events across weeks-to-months-old completions on already-
+    // sold contacts. Refuse unless the caller explicitly acknowledges it.
+    if (!dryRun && !suppressSideEffects && body.i_understand_retroactive_fires !== true) {
+      return res.status(400).json({
+        ok: false,
+        error: 'refusing_live_run_with_side_effects',
+        detail: 'A live backfill with suppress_side_effects:false would retroactively fire milestone tags and lp.milestone_completed events for historical completions. Run with suppress_side_effects:true (default), or pass i_understand_retroactive_fires:true to override.',
+      });
+    }
+
     const jobId = generateJobId();
     const jobState = {
-      id: jobId, status: 'running', dry_run: dryRun,
+      id: jobId, status: 'running', dry_run: dryRun, suppress_side_effects: suppressSideEffects,
       started_at: new Date().toISOString(), completed_at: null,
       total: 0, processed: 0, errors: 0,
       discovered_prospects: 0, discovered_jobs: 0,
@@ -343,7 +474,7 @@ export function registerRtpJobBackfillRoutes(app) {
 
     setImmediate(async () => {
       try {
-        await runRtpJobBackfill({ dryRun, start, end, limit, job: jobState });
+        await runRtpJobBackfill({ dryRun, suppressSideEffects, start, end, limit, job: jobState });
       } catch (err) {
         jobState.status = 'failed';
         jobState.error = String(err.message || 'unknown').slice(0, 500);
@@ -352,12 +483,12 @@ export function registerRtpJobBackfillRoutes(app) {
     });
 
     return res.status(202).json({
-      ok: true, mode: 'async', job_id: jobId, dry_run: dryRun,
+      ok: true, mode: 'async', job_id: jobId, dry_run: dryRun, suppress_side_effects: suppressSideEffects,
       window: { start, end: end || 'today' },
       status_url: `/admin/lp-rtp-job-backfill/${jobId}`,
       message: dryRun
-        ? 'Dry-run in progress (discover + count only, no writes). Poll status_url.'
-        : 'LIVE RTP job backfill in progress (idempotent upserts). Poll status_url.',
+        ? 'Dry-run in progress (discover + count + blast radius, no writes). Poll status_url.'
+        : `LIVE RTP job backfill in progress (idempotent upserts, side effects ${suppressSideEffects ? 'SUPPRESSED' : 'ENABLED'}). Poll status_url.`,
     });
   });
 
@@ -372,6 +503,7 @@ export function registerRtpJobBackfillRoutes(app) {
     const pct = jobState.total > 0 ? ((jobState.processed / jobState.total) * 100).toFixed(1) : '0.0';
     return res.json({
       ok: true, job_id: jobState.id, status: jobState.status, dry_run: jobState.dry_run,
+      suppress_side_effects: jobState.suppress_side_effects,
       started_at: jobState.started_at, completed_at: jobState.completed_at,
       total: jobState.total, processed: jobState.processed, progress_pct: pct,
       discovered_prospects: jobState.discovered_prospects, discovered_jobs: jobState.discovered_jobs,
