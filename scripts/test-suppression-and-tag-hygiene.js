@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 process.env.SUPABASE_URL = process.env.SUPABASE_URL || 'http://localhost:54321';
 process.env.SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'test-key';
 
-const { matchMutationSuppression } = await import('../src/services/suppression-check.js');
+const { matchMutationSuppression, isMutationGateExempt, isSuppressionAuditTag } = await import('../src/services/suppression-check.js');
 const { executeAddTag } = await import('../src/actions/handlers/tags.js');
 
 // ── mutation suppression predicate ──────────────────────────────────
@@ -39,6 +39,31 @@ test('unrelated tags do not match', () => {
 test('non-array input yields null (fail-open contract)', () => {
   assert.equal(matchMutationSuppression(null), null);
   assert.equal(matchMutationSuppression(undefined), null);
+});
+
+// ── mutation-gate exemptions (isMutationGateExempt) — 2026-07-11 ────────
+
+test('add_tag of a suppression/audit tag is exempt (suppression is recorded on suppressed contacts)', () => {
+  assert.equal(isSuppressionAuditTag('stop-bot'), true);
+  assert.equal(isSuppressionAuditTag('loss-reason:dnc'), true);
+  assert.equal(isSuppressionAuditTag('booked-estimate'), false);
+  assert.equal(isMutationGateExempt({ action_type: 'add_tag', action_payload: { tag: 'stop-bot' } }), true);
+  assert.equal(isMutationGateExempt({ action_type: 'add_tag', action_payload: { tag: 'booked-estimate' } }), false);
+});
+
+test('DNC-lift bypass_suppression exempts a REMOVE of the suppression stack', () => {
+  // The catch-22 fix: removing stop-bot from a stop-bot contact must be allowed.
+  assert.equal(isMutationGateExempt({ action_type: 'remove_tag', action_payload: { tag: 'stop-bot', bypass_suppression: true } }), true);
+  assert.equal(isMutationGateExempt({ action_type: 'set_stage', action_payload: { tag: 'stage:booked-main-appointment', bypass_suppression: true } }), true);
+  assert.equal(isMutationGateExempt({ action_type: 'move_opportunity', action_payload: { pipeline: 'P1', bypass_suppression: true } }), true);
+});
+
+test('a plain remove_tag (no flag) is NOT exempt — the gate still blocks it on a suppressed contact', () => {
+  assert.equal(isMutationGateExempt({ action_type: 'remove_tag', action_payload: { tag: 'stop-bot' } }), false);
+  assert.equal(isMutationGateExempt({ action_type: 'set_stage', action_payload: { tag: 'stage:x' } }), false);
+  assert.equal(isMutationGateExempt({ action_type: 'add_tag', action_payload: { tag: 'recovery:dnc-lifted', bypass_suppression: true } }), true);
+  assert.equal(isMutationGateExempt(null), false);
+  assert.equal(isMutationGateExempt({ action_type: 'remove_tag' }), false);
 });
 
 // ── trailing-colon tag rejection (runs before any I/O in the handler) ──

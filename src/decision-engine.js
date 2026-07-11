@@ -250,6 +250,15 @@ const BEHAVIORAL_RULE_PREFIXES = [
 
 const LP_DISP_PREFIX = 'LP_DISP_';
 
+// 2026-07-11 — DNC-lift on re-engagement. LP disposition codes that mean "a
+// live appointment exists" (a booking), and the codes that mean "do not
+// contact". Used by the multi-lead guard's DNC-duplicate carve-out so a stale
+// DNC lead can't bury a booking that lands on an older sibling lead of the
+// same contact. Kept in sync with classifyDisposition in
+// services/lp-ghl-appointment-reconciler.js (Set/Cnf/Verif → appointment).
+const BOOKING_DISPOSITION_CODES = new Set(['Set', 'Cnf', 'Verif']);
+const DNC_DISPOSITION_CODES = new Set(['DNC']);
+
 // v2.10: STAGE_3_PLUS_TAGS removed along with the v2.8 auto-approve bypass.
 // All approval gating now flows through the rule's own requires_approval flag.
 
@@ -432,7 +441,7 @@ async function isNewestLeadForContact(event) {
   try {
     const { data, error } = await supabase
       .from('lp_leads')
-      .select('lp_lead_id')
+      .select('lp_lead_id, disposition_code')
       .eq('ghl_contact_id', ghlContactId)
       .order('created_at_lp', { ascending: false })
       .limit(1);
@@ -441,6 +450,20 @@ async function isNewestLeadForContact(event) {
 
     const newestLeadId = data[0].lp_lead_id;
     if (String(newestLeadId) !== String(lpLeadId)) {
+      // 2026-07-11 — DNC-duplicate carve-out. The "newest lead wins" guard
+      // otherwise lets a stale duplicate lead sitting in DNC silently bury a
+      // real booking that lands on an OLDER sibling lead of the same contact
+      // (canary: Mcgee — lead 556298 "Set" buried under newer duplicate 556316
+      // "DNC", last-contacted Aug 2025). A DNC disposition must never suppress
+      // a booking. When the newest lead is DNC and THIS event is a booking
+      // disposition, let it through so the booked lead is visible to the
+      // DNC-lift + booking rules.
+      const newestDisp = String(data[0].disposition_code || '');
+      const eventDisp = String(event.event_subtype || event.payload?.disposition_code || '');
+      if (DNC_DISPOSITION_CODES.has(newestDisp) && BOOKING_DISPOSITION_CODES.has(eventDisp)) {
+        console.log(`[MultiLead] ALLOW older lead ${lpLeadId} (${eventDisp}) — newest ${newestLeadId} is ${newestDisp}; a DNC duplicate must not bury a booking`);
+        return true;
+      }
       console.log(`[MultiLead] BLOCKED event for LP lead ${lpLeadId} — newer lead ${newestLeadId} exists for GHL contact ${ghlContactId}`);
       return false;
     }
@@ -942,6 +965,21 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
         const subtype = event?.event_subtype || null;
         if (subtype !== null && blockedSubtypes.includes(subtype)) {
           console.log(`[Context] BLOCKED: event_subtype "${subtype}" in blocklist of ${blockedSubtypes.length} known subtypes`);
+          return false;
+        }
+        break;
+      }
+
+      // 2026-07-11 — event_subtype allowlist (symmetric to event_subtype_not_in).
+      // For lp.disposition_changed the event_subtype IS the disposition code, and
+      // for five9.disposition_set it is the disposition_name — so a single rule
+      // can gate on a SET of trigger subtypes that matchesPattern (equality only)
+      // cannot express. Fail-closed: an absent/unlisted subtype blocks.
+      case 'event_subtype_in': {
+        const allowedSubtypes = Array.isArray(expected) ? expected : [expected];
+        const subtypeIn = event?.event_subtype || null;
+        if (subtypeIn === null || !allowedSubtypes.includes(subtypeIn)) {
+          console.log(`[Context] BLOCKED: event_subtype "${subtypeIn}" not in allowlist [${allowedSubtypes.join(',')}]`);
           return false;
         }
         break;

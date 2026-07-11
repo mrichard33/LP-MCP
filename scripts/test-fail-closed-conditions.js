@@ -47,6 +47,32 @@ test('unknown condition operator → false (was: warn + wildcard pass)', async (
   assert.equal(await evaluateContextConditions({ lp_dispositon_in_typo: ['Set'] }, {}, bareEvent()), false);
 });
 
+// 2026-07-11 — event_subtype_in allowlist (DNC-lift trigger gate). For
+// lp.disposition_changed the event_subtype IS the disposition code; for
+// five9.disposition_set it is the disposition_name. Fail-closed on
+// absent/unlisted subtype.
+test('event_subtype_in: matches a listed subtype (LP booking codes)', async () => {
+  const ev = { id: 1, ghl_contact_id: 'c1', event_subtype: 'Cnf', payload: {} };
+  assert.equal(await evaluateContextConditions({ event_subtype_in: ['Set', 'Cnf', 'Verif'] }, {}, ev), true);
+});
+
+test('event_subtype_in: blocks an unlisted subtype (e.g. DNC)', async () => {
+  const ev = { id: 1, ghl_contact_id: 'c1', event_subtype: 'DNC', payload: {} };
+  assert.equal(await evaluateContextConditions({ event_subtype_in: ['Set', 'Cnf', 'Verif'] }, {}, ev), false);
+});
+
+test('event_subtype_in: absent subtype fails closed', async () => {
+  const ev = { id: 1, ghl_contact_id: 'c1', payload: {} }; // no event_subtype
+  assert.equal(await evaluateContextConditions({ event_subtype_in: ['Set'] }, {}, ev), false);
+});
+
+test('event_subtype_in: Five9 disposition_name allowlist', async () => {
+  const ev = { id: 1, ghl_contact_id: 'c1', event_subtype: 'Appointment Set', payload: {} };
+  assert.equal(await evaluateContextConditions({ event_subtype_in: ['Appointment Set', 'Confirmed'] }, {}, ev), true);
+  const na = { id: 1, ghl_contact_id: 'c1', event_subtype: 'NA', payload: {} };
+  assert.equal(await evaluateContextConditions({ event_subtype_in: ['Appointment Set', 'Confirmed'] }, {}, na), false);
+});
+
 // 2026-07-04 — annotation keys are documentation, not operators. A rule with
 // a "description" field inside its conditions JSON must still fire
 // (BEHAVIORAL_DISENGAGEMENT_SEVERE was fully disabled by the fail-closed

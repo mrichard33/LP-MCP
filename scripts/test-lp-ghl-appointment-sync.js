@@ -326,6 +326,32 @@ test('dnc tag → Set noop dnc_consent, but CXL still cancels', async () => {
   assert.equal(cxlRes.outcome, 'cancelled');
 });
 
+// 2026-07-11 — Bianco (546771): a DNC'd contact rep-recovered to Cnf. The
+// confirm-sync must NOT skip on dnc_consent — LP Cnf is the confirmation
+// authority + reconsent signal, and the stale DNC stack may not have drained
+// off the contact yet (DNC_LIFT_ON_REENGAGEMENT clears it in a parallel lane).
+test('DNC-lift: Cnf on a DNC-stacked contact CONFIRMS despite the consent block (Set/Verif still blocked)', async () => {
+  // Cnf + existing same-time 'new' pool appt → confirm it, even with stage:dnc/stop-bot present.
+  reset({ tags: ['stage:dnc', 'stop-bot', 'lp-dnc'], upcoming: [weAppt()] });
+  const cnfRes = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Cnf') });
+  assert.equal(cnfRes.outcome, 'status_updated');
+  assert.equal(cnfRes.new_status, 'confirmed');
+
+  // Cnf + no existing appt → create-confirmed (the DNC no longer blocks the mirror).
+  reset({ tags: ['dnc', 'stage:dnc'] });
+  const cnfCreate = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Cnf') });
+  assert.equal(cnfCreate.outcome, 'created');
+  assert.equal(cnfCreate.new_status, 'confirmed');
+
+  // Guard scope: Set and Verif are still consent-blocked (only the confirm
+  // authority is the reconsent carve-out; the lift rule clears tags for Set).
+  reset({ tags: ['dnc', 'stage:dnc'] });
+  const setBlocked = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
+  assert.equal(setBlocked.reason, 'dnc_consent');
+  const verifBlocked = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Verif') });
+  assert.equal(verifBlocked.reason, 'dnc_consent');
+});
+
 test('appt on a NON-in-home calendar (Conf Call) → does not block; other calendar untouched', async () => {
   reset({ upcoming: [weAppt({ calendarId: 'gFWoSQrlKIdfRbAPV842', id: 'conf-call-1' })] }); // Conf Call (GHL-only, phone)
   const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
