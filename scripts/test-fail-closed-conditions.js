@@ -21,7 +21,7 @@ process.env.SUPABASE_URL = process.env.SUPABASE_URL || 'http://localhost:54321';
 process.env.SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'test-key';
 
 const { _internal } = await import('../src/decision-engine.js');
-const { evaluateContextConditions, inferChannelFromEvent } = _internal;
+const { evaluateContextConditions, inferChannelFromEvent, dedupPolicy, isAppointmentSyncRule } = _internal;
 
 const bareEvent = (payload = {}) => ({ id: 1, ghl_contact_id: 'c-test', payload });
 
@@ -71,6 +71,44 @@ test('event_subtype_in: Five9 disposition_name allowlist', async () => {
   assert.equal(await evaluateContextConditions({ event_subtype_in: ['Appointment Set', 'Confirmed'] }, {}, ev), true);
   const na = { id: 1, ghl_contact_id: 'c1', event_subtype: 'NA', payload: {} };
   assert.equal(await evaluateContextConditions({ event_subtype_in: ['Appointment Set', 'Confirmed'] }, {}, na), false);
+});
+
+// 2026-07-11 — appointment-sync dedup policy (double-create guard). The
+// LP_APPT_GHL_SYNC_* rules must dedup so two near-simultaneous Cnf events can't
+// each create an appointment (canary: Sue Shanks — two confirmed 2:00 PM appts).
+// They dedup on IN-FLIGHT statuses only, so a legitimate later re-sync still fires.
+test('isAppointmentSyncRule matches the LP_APPT_GHL_SYNC_ family only', () => {
+  assert.equal(isAppointmentSyncRule('LP_APPT_GHL_SYNC_CNF'), true);
+  assert.equal(isAppointmentSyncRule('LP_APPT_GHL_SYNC_CXL'), true);
+  assert.equal(isAppointmentSyncRule('LP_DISP_CNF'), false);
+  assert.equal(isAppointmentSyncRule('BEHAVIORAL_GHOST_AFTER_BOOKING'), false);
+  assert.equal(isAppointmentSyncRule(null), false);
+});
+
+test('dedupPolicy: appointment-sync rules dedup on IN-FLIGHT statuses only (not completed)', () => {
+  const p = dedupPolicy('LP_APPT_GHL_SYNC_CNF');
+  assert.ok(p, 'appt-sync must be deduped');
+  assert.equal(p.group, null);                              // exact rule_applied match
+  assert.ok(!p.statuses.includes('completed'), 'a completed sync must NOT block a legitimate later re-sync');
+  assert.deepEqual(p.statuses, ['pending', 'pending_approval', 'approved', 'executing']);
+});
+
+test('dedupPolicy: LP_DISP rules group across the family and block on completed', () => {
+  const p = dedupPolicy('LP_DISP_CNF');
+  assert.equal(p.group, 'LP_DISP_%');
+  assert.ok(p.statuses.includes('completed'));
+});
+
+test('dedupPolicy: behavioral rules match exactly and block on completed', () => {
+  const p = dedupPolicy('BEHAVIORAL_GHOST_AFTER_BOOKING');
+  assert.equal(p.group, null);
+  assert.ok(p.statuses.includes('completed'));
+});
+
+test('dedupPolicy: un-deduped rules return null (e.g. entry hygiene, attribution)', () => {
+  assert.equal(dedupPolicy('ENTRY_HYGIENE_AT_CREATION_CANVASSING'), null);
+  assert.equal(dedupPolicy('GHL_ATTR_DIGITAL_ENTRY'), null);
+  assert.equal(dedupPolicy(null), null);
 });
 
 // 2026-07-04 — annotation keys are documentation, not operators. A rule with
