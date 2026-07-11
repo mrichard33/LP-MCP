@@ -132,7 +132,7 @@ import { endAgenticHandoff } from '../services/agentic-handoff.js';
 // Phase 1 Intake/Routing Layer #51 — universal outbound suppression
 // 2026-07-03 — checkMutationSuppression: suppress-automation / stop-bot now
 // gates ALL mutating action types, not only send_message.
-import { checkSuppression, checkMutationSuppression } from '../services/suppression-check.js';
+import { checkSuppression, checkMutationSuppression, isMutationGateExempt } from '../services/suppression-check.js';
 // Send-dedup — logical-identity idempotency for non-idempotent senders (2026-06-05)
 import { claimSendMark, releaseSendMark, makeDedupKey } from '../services/send-dedup.js';
 
@@ -161,7 +161,7 @@ import { executeComputeRiskScore } from './handlers/risk-score.js';
 import { executeCheckThrottle } from './handlers/throttle.js';
 import { executeClassifyBucket } from './handlers/classify-bucket.js';
 // S5.2 v2 (Spec v1.2) — objection-state substrate writer
-import { executeTransitionObjectionState } from './handlers/objection-state.js';
+import { executeTransitionObjectionState, executeResolveObjectionState } from './handlers/objection-state.js';
 // Phase 2 lead-state — reactive classifier + S4.5 enrollment invoker
 import { executeClassifyLeadState } from './handlers/lead-state.js';
 // 2026-07-06 (Bot 2/3/4 consolidation) — GHL contact-note writer (escalation
@@ -366,6 +366,7 @@ const ACTION_HANDLERS = {
   check_throttle: executeCheckThrottle,          // 2026-05-13 — Phase 1 #55 enrollment dedup
   classify_bucket: executeClassifyBucket,        // 2026-05-13 — Phase 1 #56 bucket→workflow resolver
   transition_objection_state: executeTransitionObjectionState, // 2026-05-14 — S5.2 v2 objection-state substrate writer (Spec v1.2)
+  resolve_objection_state: executeResolveObjectionState, // 2026-07-11 — close an open loss state (hard_loss is transition-terminal) on re-engagement
   classify_lead_state: executeClassifyLeadState, // 2026-06-02 — Phase 2 lead-state classifier + S4.5 enrollment (reactive invoker)
   end_agentic_handoff: (action) => endAgenticHandoff(action.target_id), // 2026-06-16 — silent agentic-active teardown on terminal closeout
 };
@@ -426,13 +427,9 @@ const MUTATION_GATED_ACTION_TYPES = new Set([
   'remove_tag',
 ]);
 
-// add_tag exception: suppression/audit tags must still land on a suppressed
-// contact (they're how suppression is recorded in the first place).
-const SUPPRESSION_AUDIT_TAG_RE = /^(dnc|dnc-|do-not-contact|stop-bot|suppress-|hard-disqualified|quarantined|audit-|compliance-|loss-reason:)/i;
-
-function isSuppressionAuditTag(tag) {
-  return SUPPRESSION_AUDIT_TAG_RE.test(String(tag || ''));
-}
+// Mutation-gate exemptions (isMutationGateExempt): add_tag of a suppression/
+// audit tag, or an authorized DNC-lift flagged bypass_suppression. Centralized
+// in suppression-check.js so the exemption is unit-tested as a pure predicate.
 
 async function executeSingleAction(action, batchContext = {}, priorBatchResults = []) {
   const handler = ACTION_HANDLERS[action.action_type];
@@ -457,9 +454,11 @@ async function executeSingleAction(action, batchContext = {}, priorBatchResults 
   // is how suppression itself is recorded). Fail-open on infra errors,
   // matching checkSuppression.
   if (MUTATION_GATED_ACTION_TYPES.has(action.action_type)) {
-    const exemptTagAdd = action.action_type === 'add_tag'
-      && isSuppressionAuditTag(action.action_payload?.tag);
-    if (!exemptTagAdd) {
+    // Exempt: add_tag of a suppression/audit tag (how suppression is recorded),
+    // or an authorized DNC-lift flagged bypass_suppression (it must REMOVE the
+    // stack from a stop-bot contact — see isMutationGateExempt). Every other
+    // mutation on a suppressed contact still blocks.
+    if (!isMutationGateExempt(action)) {
       const mutationGate = await checkMutationSuppression(action.target_id);
       if (mutationGate.suppressed) {
         console.log(

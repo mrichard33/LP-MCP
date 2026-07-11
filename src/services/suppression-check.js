@@ -230,6 +230,36 @@ export function matchMutationSuppression(tags) {
   return tags.find(t => MUTATION_SUPPRESS_SET.has(String(t).toLowerCase())) || null;
 }
 
+// add_tag exception: suppression/audit tags must still land on a suppressed
+// contact (they are how suppression is recorded in the first place).
+const SUPPRESSION_AUDIT_TAG_RE =
+  /^(dnc|dnc-|do-not-contact|stop-bot|suppress-|hard-disqualified|quarantined|audit-|compliance-|loss-reason:)/i;
+
+export function isSuppressionAuditTag(tag) {
+  return SUPPRESSION_AUDIT_TAG_RE.test(String(tag || ''));
+}
+
+/**
+ * Is this action exempt from the mutation-suppression gate? Pure predicate
+ * over the action row. Two exemptions:
+ *   (a) add_tag of a suppression/audit tag — that is how suppression itself is
+ *       recorded on the contact.
+ *   (b) 2026-07-11 — an authorized re-engagement lift (DNC_LIFT_ON_REENGAGEMENT)
+ *       that explicitly sets action_payload.bypass_suppression:true. The lift
+ *       must be able to REMOVE the suppression stack (stop-bot, lp-dnc, …) from
+ *       a stop-bot contact; without an exemption the DNC blocks its own removal
+ *       (the gate has no remove_tag audit-exemption, only an add_tag one) and a
+ *       re-booked lead stays suppressed forever.
+ * The flag is honored ONLY on rule-authored templates the operator controls;
+ * every other mutation on a suppressed contact still blocks.
+ */
+export function isMutationGateExempt(action) {
+  if (!action) return false;
+  if (action.action_payload?.bypass_suppression === true) return true;
+  if (action.action_type === 'add_tag' && isSuppressionAuditTag(action.action_payload?.tag)) return true;
+  return false;
+}
+
 export async function checkMutationSuppression(contact_id) {
   if (!supabase) return { suppressed: false, reason: 'no_supabase_open' };
   if (!contact_id) return { suppressed: false, reason: 'no_contact_id_open' };

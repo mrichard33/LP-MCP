@@ -460,6 +460,75 @@ export async function executeTransitionObjectionState(action) {
   };
 }
 
+/**
+ * resolve_objection_state — 2026-07-11.
+ *
+ * Close the contact's OPEN objection-state row with a resolution, WITHOUT
+ * opening a new one. This is the recovery primitive the transition machine
+ * deliberately lacks: DISENGAGEMENT.hard_loss is transition-terminal
+ * (objection_state_transitions has `hard_loss → * = allowed:false`), so
+ * executeTransitionObjectionState can never lift a hard-loss lead. When a
+ * DNC'd/hard-loss contact re-engages and re-books, DNC_LIFT_ON_REENGAGEMENT
+ * calls this to mark the loss state `recovered` so the lead is no longer held
+ * in acute-recovery/terminal deferral.
+ *
+ * params:
+ *   resolution      — one of VALID_RESOLUTIONS (default 'recovered').
+ *   only_if_state   — optional string | string[]; only resolve when the open
+ *                     state_code is in this set (guards against clobbering an
+ *                     unrelated live objection state). Non-match = benign noop.
+ *   trigger_source  — provenance for the emitted event (default 'LP_WEBHOOK').
+ */
+export async function executeResolveObjectionState(action) {
+  const contact_id = String(action.target_id || action.action_payload?.contact_id || '');
+  const params = action.action_payload || {};
+  const resolution = params.resolution || 'recovered';
+  const trigger_source = params.trigger_source || 'LP_WEBHOOK';
+  const onlyIf = Array.isArray(params.only_if_state)
+    ? params.only_if_state
+    : (params.only_if_state ? [params.only_if_state] : null);
+
+  if (!contact_id) throw new Error('resolve_objection_state: missing contact_id (target_id)');
+  if (!VALID_RESOLUTIONS.has(resolution)) {
+    throw new Error(`resolve_objection_state: invalid resolution "${resolution}"`);
+  }
+
+  await acquireContactLock(contact_id);
+
+  const { data: current, error: curErr } = await supabase
+    .from('contact_objection_states')
+    .select('id, state_code')
+    .eq('contact_id', contact_id)
+    .is('exited_at', null)
+    .maybeSingle();
+  if (curErr) throw new Error(`resolve_objection_state fetch current: ${curErr.message}`);
+
+  if (!current) return { success: true, action: 'noop', reason: 'no_open_state' };
+  if (onlyIf && !onlyIf.includes(current.state_code)) {
+    return { success: true, action: 'noop', reason: 'state_not_in_only_if', current_state: current.state_code };
+  }
+
+  const exitEvent = await emitTransitionEvent('objection_state_resolved', {
+    contact_id,
+    from: current.state_code,
+    resolution,
+    trigger_source,
+    triggering_event_id: params.triggering_event_id || action.event_id || null,
+  });
+
+  const { error: upErr } = await supabase
+    .from('contact_objection_states')
+    .update({
+      exited_at: new Date().toISOString(),
+      resolution,
+      exit_event_id: exitEvent?.id || null,
+    })
+    .eq('id', current.id);
+  if (upErr) throw new Error(`resolve_objection_state close row: ${upErr.message}`);
+
+  return { success: true, action: 'resolved', from: current.state_code, resolution };
+}
+
 // ─── helpers ─────────────────────────────────────────────────────────────
 
 async function acquireContactLock(contact_id) {

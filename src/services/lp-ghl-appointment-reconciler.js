@@ -233,8 +233,17 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, toNotify = 
 
   if (kind === 'out_of_scope') return noop('out_of_scope');
 
-  // Consent guard — creation only. CXL must still cancel.
-  if (kind !== 'cancel' && await contactHasConsentBlock(contactId, contactCache)) {
+  // Consent guard — Set/Verif creation only. Two carve-outs:
+  //   - CXL must still cancel (honoring the contact's wishes, not marketing).
+  //   - An LP 'confirm' (Cnf) is the call center's confirmation authority (see
+  //     module header) AND the reconsent signal on a DNC-lift recovery: when a
+  //     DNC'd lead is rep-recovered, LP flips DNC→Cnf. That Cnf must reach GHL
+  //     even if the stale DNC stack has not yet drained off the contact (the
+  //     DNC_LIFT_ON_REENGAGEMENT tag-clear runs in a parallel action lane).
+  //     Otherwise the DNC blocks its own lift and the confirmed booking is
+  //     never mirrored (canary: Bianco 546771 — sync skipped 'dnc_consent'
+  //     while LP truth was Cnf with a live 10:00 appointment). 2026-07-11.
+  if (kind !== 'cancel' && kind !== 'confirm' && await contactHasConsentBlock(contactId, contactCache)) {
     return noop('dnc_consent');
   }
 
