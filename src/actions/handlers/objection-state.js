@@ -526,7 +526,16 @@ export async function executeResolveObjectionState(action) {
     .eq('id', current.id);
   if (upErr) throw new Error(`resolve_objection_state close row: ${upErr.message}`);
 
-  return { success: true, action: 'resolved', from: current.state_code, resolution };
+  // Clear the GHL objection-state-code mirror field — otherwise a resolved
+  // contact keeps DISPLAYING the closed loss state (e.g. a DNC-lifted lead still
+  // reads DISENGAGEMENT.hard_loss). Best-effort: the mirror writer catches its own
+  // errors, and a stale mirror must never fail the resolve itself.
+  const mirror = await mirrorToGhlCustomFields(contact_id, '', null).catch((err) => {
+    console.warn(`[ObjectionState] resolve mirror-clear failed for ${contact_id}: ${err.message}`);
+    return null;
+  });
+
+  return { success: true, action: 'resolved', from: current.state_code, resolution, mirror_cleared: mirror?.state_set === true };
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────

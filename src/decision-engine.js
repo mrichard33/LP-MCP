@@ -272,6 +272,35 @@ function isLpDispRule(ruleKey) {
   return ruleKey.startsWith(LP_DISP_PREFIX);
 }
 
+// 2026-07-11 — LP→GHL appointment-sync rules (LP_APPT_GHL_SYNC_CNF/CXL/…). Their
+// single action is sync_lp_appointment_to_ghl, which reads GHL, plans, and (on a
+// miss) POSTs a create. Two of the SAME sync rule queued at once — e.g. a real
+// lp.disposition_changed(Cnf) plus the inbound-backfill synthetic Cnf, seen 1.7s
+// apart — each read "no appointment" and each created one, double-booking the
+// slot (canary: Sue Shanks, two confirmed 2:00 PM appts on a closed-won). These
+// rules are deduped against IN-FLIGHT actions only (see hasDuplicatePendingActions).
+const APPT_SYNC_PREFIX = 'LP_APPT_GHL_SYNC_';
+function isAppointmentSyncRule(ruleKey) {
+  if (!ruleKey) return false;
+  return ruleKey.startsWith(APPT_SYNC_PREFIX);
+}
+
+// Pure dedup policy (no I/O; unit-testable). Returns null when a rule is not
+// deduped, else the agent_actions statuses to match + an optional rule_applied
+// group pattern. LP_DISP rules group across the family and block on 'completed'
+// too; behavioral rules match exactly and also block on 'completed'; appointment-
+// sync rules match exactly but block on IN-FLIGHT statuses ONLY — a second sync
+// can't be queued while one is pending/executing (the double-create race), yet a
+// legitimate later re-sync (real reschedule after the first finished) still fires.
+const DEDUP_STATUSES_WITH_COMPLETED = ['pending', 'pending_approval', 'approved', 'executing', 'completed'];
+const DEDUP_STATUSES_INFLIGHT = ['pending', 'pending_approval', 'approved', 'executing'];
+export function dedupPolicy(ruleKey) {
+  if (isLpDispRule(ruleKey)) return { statuses: DEDUP_STATUSES_WITH_COMPLETED, group: 'LP_DISP_%' };
+  if (isBehavioralRule(ruleKey)) return { statuses: DEDUP_STATUSES_WITH_COMPLETED, group: null };
+  if (isAppointmentSyncRule(ruleKey)) return { statuses: DEDUP_STATUSES_INFLIGHT, group: null };
+  return null;
+}
+
 // v2.14: Lane fallback for legacy rows missing priority_lane. Mirrors the
 // same logic the BEFORE INSERT trigger uses (sql/021_event_priority_lanes.sql)
 // so SQL and JS sort orders agree even on rows inserted before the migration
@@ -384,8 +413,8 @@ async function passesStageGate(event, rule, intelligence) {
 async function hasDuplicatePendingActions(ruleKey, targetId) {
   if (!targetId) return false;
 
-  const needsDedup = isBehavioralRule(ruleKey) || isLpDispRule(ruleKey);
-  if (!needsDedup) return false;
+  const policy = dedupPolicy(ruleKey);
+  if (!policy) return false;
 
   const windowStart = new Date(Date.now() - DEDUP_WINDOW_MINUTES * 60 * 1000).toISOString();
 
@@ -394,11 +423,11 @@ async function hasDuplicatePendingActions(ruleKey, targetId) {
       .from('agent_actions')
       .select('id, rule_applied', { count: 'exact', head: false })
       .eq('target_id', targetId)
-      .in('status', ['pending', 'pending_approval', 'approved', 'executing', 'completed'])
+      .in('status', policy.statuses)
       .gte('created_at', windowStart);
 
-    if (isLpDispRule(ruleKey)) {
-      query = query.like('rule_applied', 'LP_DISP_%');
+    if (policy.group) {
+      query = query.like('rule_applied', policy.group);
     } else {
       query = query.eq('rule_applied', ruleKey);
     }
@@ -412,7 +441,7 @@ async function hasDuplicatePendingActions(ruleKey, targetId) {
 
     if (data && data.length > 0) {
       const existingRule = data[0].rule_applied;
-      if (isLpDispRule(ruleKey) && existingRule !== ruleKey) {
+      if (policy.group && existingRule !== ruleKey) {
         console.log(`[Dedup] GROUP BLOCKED ${ruleKey} for ${targetId}: ${existingRule} already fired in ${DEDUP_WINDOW_MINUTES}min window`);
       } else {
         console.log(`[Dedup] BLOCKED ${ruleKey} for ${targetId}: already has actions in ${DEDUP_WINDOW_MINUTES}min window`);
@@ -1629,4 +1658,7 @@ export const _internal = {
   // 2026-07-03 — fail-closed condition evaluation + livechat channel inference
   evaluateContextConditions,
   inferChannelFromEvent,
+  // 2026-07-11 — appointment-sync dedup policy (double-create guard)
+  dedupPolicy,
+  isAppointmentSyncRule,
 };
