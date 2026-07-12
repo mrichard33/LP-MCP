@@ -1,14 +1,23 @@
 // ─── Scorecard market resolver — src/jobs/market-resolver.js ───
 //
-// Resolves a lead/prospect to one of the 7 dashboard markets (or OUT_OF_AREA /
-// UNASSIGNED) from its ZIP. Leads carry no branch id in the cache, so ZIP is the
-// only signal:
+// Resolves to one of the 7 dashboard markets (or OUT_OF_AREA / UNASSIGNED) via
+// two signals, in priority order:
 //
-//   zip → service_area_zips.market_code (branch) → lp_branch_market_map → *_MKT
+//   1. BRANCH (authoritative for revenue) — a JOB carries its LP branch
+//      (lp_jobs.branch_code, from raw_lp_data->>'brp_id'). Branch → market ties
+//      the Net Report 1,710/1,710. Use resolveMarketFromBranch for jobs.
+//   2. ZIP (funnel fallback) — a LEAD carries no branch in the cache, so its
+//      market is resolved from ZIP:
+//        zip → service_area_zips.market_code (branch) → lp_branch_market_map → *_MKT
 //
-// Both the nightly assignment job (C1) and the per-market snapshot writer (C2)
-// use this so they always agree. Maps are small (≤1,060 zips, 9 branches) and
-// cached in-process with a short TTL.
+// Job/revenue attribution is branch-first, zip-fallback; lead/funnel attribution
+// is zip-only (leads genuinely have no branch). The nightly assignment job (C1)
+// resolves a job-bearing lead by its job's branch (method='brn_map') and every
+// other lead by ZIP. Maps are small (≤1,060 zips, 10 branches) and cached
+// in-process with a short TTL.
+//
+// NOTE: LP pads branch codes with trailing spaces ('ORL  ') — every branch
+// comparison/lookup here TRIMs. Getting that wrong makes ~40% look like misses.
 
 import supabase from '../supabase.js';
 
@@ -65,6 +74,101 @@ export function resolveMarket(zip, { zipMap, branchMap }) {
   const market = branchMap.get(String(branch).toUpperCase());
   if (!market) return { market_code: 'UNASSIGNED', method: 'unmapped_branch', zip: z };
   return { market_code: market, method: 'zip_lookup', zip: z };
+}
+
+/**
+ * Resolve a JOB to a market from its LP branch. Branch is authoritative for
+ * revenue attribution — it matches the Net Report 1,710/1,710. LP pads the
+ * code with trailing spaces ('ORL  '), so TRIM is mandatory.
+ * @returns {({market_code:string, method:string, branch:string}) | null} null
+ *   when the branch is empty — the caller falls back to zip.
+ */
+export function resolveMarketFromBranch(brpId, { branchMap }) {
+  const b = String(brpId ?? '').trim().toUpperCase();
+  if (!b) return null;                       // caller falls back to zip
+  const market = branchMap.get(b);
+  if (!market) return { market_code: 'UNASSIGNED', method: 'unmapped_branch', branch: b };
+  return { market_code: market, method: 'brn_map', branch: b };
+}
+
+/**
+ * Build an lp_job_id → { market_code, method, branch, lp_lead_id } map for a
+ * cohort of job ids. Branch-first (lp_jobs.branch_code, falling back to the raw
+ * brp_id/brn_id in raw_lp_data), then ZIP via the job's lead only when the job
+ * carries no branch. Mirrors buildProspectMarketMap but on the job axis, so
+ * revenue metrics attribute the way the Net Report does. Jobs absent from
+ * lp_jobs are omitted.
+ */
+export async function buildJobMarketMap(jobIds) {
+  const { zipMap, branchMap } = await getMarketMaps();
+  const ids = [...new Set((jobIds || []).map((j) => String(j ?? '')).filter(Boolean))];
+  const byJob = new Map();
+  const CHUNK = 300;
+
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const slice = ids.slice(i, i + CHUNK);
+    const { data, error } = await supabase
+      .from('lp_jobs')
+      .select('lp_job_id, lp_lead_id, branch_code, raw_lp_data')
+      .in('lp_job_id', slice);
+    if (error) throw new Error(`lp_jobs branch lookup failed: ${error.message}`);
+
+    const needZip = []; // { jobId, lp_lead_id } for branch-less jobs
+    for (const r of data || []) {
+      const jobId = String(r.lp_job_id);
+      const branch = r.branch_code || r.raw_lp_data?.brp_id || r.raw_lp_data?.brn_id;
+      const byBranch = resolveMarketFromBranch(branch, { branchMap });
+      if (byBranch) byJob.set(jobId, { ...byBranch, lp_lead_id: r.lp_lead_id });
+      else needZip.push({ jobId, lp_lead_id: r.lp_lead_id != null ? String(r.lp_lead_id) : null });
+    }
+
+    // ZIP fallback for branch-less jobs, via their lead's cached ZIP.
+    const leadIds = [...new Set(needZip.map((x) => x.lp_lead_id).filter(Boolean))];
+    const zipByLead = new Map();
+    for (let k = 0; k < leadIds.length; k += CHUNK) {
+      const ls = leadIds.slice(k, k + CHUNK);
+      const { data: leads, error: le } = await supabase
+        .from('lp_leads').select('lp_lead_id, zip').in('lp_lead_id', ls);
+      if (le) throw new Error(`lp_leads zip fallback failed: ${le.message}`);
+      for (const r of leads || []) zipByLead.set(String(r.lp_lead_id), r.zip);
+    }
+    for (const { jobId, lp_lead_id } of needZip) {
+      const res = resolveMarket(zipByLead.get(lp_lead_id), { zipMap, branchMap });
+      byJob.set(jobId, { market_code: res.market_code, method: res.method, branch: null, lp_lead_id });
+    }
+  }
+  return byJob;
+}
+
+/**
+ * Build an lp_lead_id → { branch_code, market_code } map for the given lead ids
+ * from their jobs (branch-first). A lead's revenue market follows its job's
+ * branch; when a lead has several jobs, the first non-empty branch wins (leads
+ * are ~1:1 with jobs). Leads with no job / no branch are omitted — the caller
+ * falls back to ZIP. Used by the nightly assignment job (C1).
+ */
+export async function buildLeadBranchMarketMap(leadIds) {
+  const { branchMap } = await getMarketMaps();
+  const ids = [...new Set((leadIds || []).map((l) => String(l ?? '')).filter(Boolean))];
+  const byLead = new Map();
+  const CHUNK = 300;
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const slice = ids.slice(i, i + CHUNK);
+    const { data, error } = await supabase
+      .from('lp_jobs')
+      .select('lp_lead_id, branch_code, raw_lp_data')
+      .in('lp_lead_id', slice);
+    if (error) throw new Error(`lp_jobs lead-branch lookup failed: ${error.message}`);
+    for (const r of data || []) {
+      const lead = String(r.lp_lead_id);
+      if (byLead.has(lead)) continue; // first non-empty branch wins
+      const branch = String(r.branch_code || r.raw_lp_data?.brp_id || r.raw_lp_data?.brn_id || '').trim().toUpperCase();
+      if (!branch) continue;
+      const res = resolveMarketFromBranch(branch, { branchMap });
+      if (res) byLead.set(lead, { branch_code: res.branch, market_code: res.market_code, method: res.method });
+    }
+  }
+  return byLead;
 }
 
 /**
