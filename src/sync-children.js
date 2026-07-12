@@ -279,53 +279,67 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
     if (!mdtId) continue;
     const { data: existing } = await supabase.from('lp_job_milestones')
       .select('act_date, ghl_tag_fired').eq('lp_job_id', jobId).eq('mdt_id', mdtId).single();
+
+    const actDate = getField(ms, 'actdate', 'ActDate', 'act_date');
+    const tag = MDT_TAG_MAP[mdtId];
+    // A genuine first-time completion on a GHL-linked contact fires a milestone
+    // tag — here, AND independently via milestones.js processMilestoneTriggers,
+    // which sweeps every row with act_date NOT NULL + ghl_tag_fired=false on the
+    // normal sync cycle. So suppression at write-time is NOT enough: we must set
+    // ghl_tag_fired=true IN THIS UPSERT (never a follow-up update — the ~15-min
+    // backfill interleaves with the scheduler; a gap lets the sweeper grab the
+    // row) so the sweeper also skips it. tag_suppressed_backfill keeps these
+    // distinguishable from genuinely-fired tags (ghl_tag_fired now means
+    // "fired OR deliberately suppressed"). #512.
+    const wouldFire = !!(actDate && !existing?.act_date && !existing?.ghl_tag_fired && ghlContactId && tag);
+    const suppressThisFire = wouldFire && suppressSideEffects;
+
+    const msRow = {
+      lp_job_id: jobId, lp_lead_id: lpLeadId, ghl_contact_id: ghlContactId || null,
+      mdt_id: mdtId,
+      datetype:    getField(ms, 'datetype', 'DateType'),
+      est_date:    lpDateToEastern(getField(ms, 'estdate', 'EstDate', 'est_date')),
+      act_date:    lpDateToEastern(actDate),
+      entered_by:  getField(ms, 'enteredby', 'EnteredBy', 'entered_by'),
+      entered_on:  lpDateToEastern(getField(ms, 'enteredon', 'EnteredOn', 'entered_on')),
+      synced_at:   new Date().toISOString(),
+    };
+    if (suppressThisFire) {
+      msRow.ghl_tag_fired = true;             // pre-mark so the sweeper skips it
+      msRow.tag_suppressed_backfill = true;   // audit: distinguishable from real fires
+      msRow.tag_suppressed_at = new Date().toISOString();
+    }
     try {
-      await supabase.from('lp_job_milestones').upsert({
-        lp_job_id: jobId, lp_lead_id: lpLeadId, ghl_contact_id: ghlContactId || null,
-        mdt_id: mdtId,
-        datetype:    getField(ms, 'datetype', 'DateType'),
-        est_date:    lpDateToEastern(getField(ms, 'estdate', 'EstDate', 'est_date')),
-        act_date:    lpDateToEastern(getField(ms, 'actdate', 'ActDate', 'act_date')),
-        entered_by:  getField(ms, 'enteredby', 'EnteredBy', 'entered_by'),
-        entered_on:  lpDateToEastern(getField(ms, 'enteredon', 'EnteredOn', 'entered_on')),
-        synced_at:   new Date().toISOString(),
-      }, { onConflict: 'lp_job_id, mdt_id', ignoreDuplicates: false });
+      await supabase.from('lp_job_milestones').upsert(msRow, { onConflict: 'lp_job_id, mdt_id', ignoreDuplicates: false });
     } catch (err) {
       console.warn(`[Sync] Milestone upsert failed for job ${jobId} mdt ${mdtId}:`, err.message);
       continue;
     }
-    const actDate = getField(ms, 'actdate', 'ActDate', 'act_date');
-    if (actDate && !existing?.act_date && !existing?.ghl_tag_fired && ghlContactId) {
-      const tag = MDT_TAG_MAP[mdtId];
-      if (tag) {
-        // #512: when backfilling historical jobs, count what WOULD fire but do
-        // not touch GHL or the Decision Engine. act_date is already written
-        // above, so no future sync re-fires this completion (the guard below
-        // reads existing?.act_date on the next pass).
-        if (suppressSideEffects) {
-          suppressedFires++;
-          continue;
-        }
-        const success = await applyGHLTag(ghlContactId, tag);
-        if (success) {
-          await supabase.from('lp_job_milestones')
-            .update({ ghl_tag_fired: true }).eq('lp_job_id', jobId).eq('mdt_id', mdtId);
-          console.log(`[Sync] Milestone tag fired: ${tag} for contact ${ghlContactId}`);
-          // v7.1: Emit milestone event for P2 lifecycle agent rules
-          try {
-            await emitEvent({
-              event_type: 'lp.milestone_completed',
-              source: 'lp_sync',
-              entity_type: 'contact',
-              entity_id: ghlContactId,
-              ghl_contact_id: ghlContactId,
-              payload: { mdt_id: mdtId, milestone_tag: tag, job_id: jobId, lp_lead_id: lpLeadId },
-              priority: 'normal',
-              idempotency_key: `lp_milestone_${ghlContactId}_${mdtId}_${jobId}`,
-            });
-          } catch (emitErr) {
-            console.warn(`[Sync] Milestone event emit failed for ${ghlContactId} ${mdtId}: ${emitErr.message}`);
-          }
+
+    if (suppressThisFire) {
+      suppressedFires++;
+      continue;
+    }
+    if (wouldFire) {
+      const success = await applyGHLTag(ghlContactId, tag);
+      if (success) {
+        await supabase.from('lp_job_milestones')
+          .update({ ghl_tag_fired: true }).eq('lp_job_id', jobId).eq('mdt_id', mdtId);
+        console.log(`[Sync] Milestone tag fired: ${tag} for contact ${ghlContactId}`);
+        // v7.1: Emit milestone event for P2 lifecycle agent rules
+        try {
+          await emitEvent({
+            event_type: 'lp.milestone_completed',
+            source: 'lp_sync',
+            entity_type: 'contact',
+            entity_id: ghlContactId,
+            ghl_contact_id: ghlContactId,
+            payload: { mdt_id: mdtId, milestone_tag: tag, job_id: jobId, lp_lead_id: lpLeadId },
+            priority: 'normal',
+            idempotency_key: `lp_milestone_${ghlContactId}_${mdtId}_${jobId}`,
+          });
+        } catch (emitErr) {
+          console.warn(`[Sync] Milestone event emit failed for ${ghlContactId} ${mdtId}: ${emitErr.message}`);
         }
       }
     }

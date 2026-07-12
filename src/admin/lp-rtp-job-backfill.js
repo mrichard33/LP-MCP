@@ -302,9 +302,19 @@ async function hydrateAndUpsert(cstId, { suppressSideEffects = true } = {}) {
 
   for (const lead of leads) {
     const lpLeadId = String(getField(lead, 'id', 'lds_id', 'LeadID'));
+    // Resolve the GHL link the SAME way the milestone sweeper does — it falls
+    // back to lp_leads.ghl_contact_id (milestones.js processMilestoneTriggers).
+    // Resolving from lp_leads FIRST makes the suppression set == the set the
+    // sweeper could fire, so pre-marking ghl_tag_fired covers it exactly.
     // Reconciliation only needs lp_jobs / lp_job_milestones — never let a GHL
-    // match failure abort the upsert. Prefer the lead's stored link.
-    let ghlId = getField(lead, 'ghl_contact_id', 'ghlContactId') || null;
+    // match failure abort the upsert.
+    let ghlId = null;
+    try {
+      const { data: leadRow } = await supabase.from('lp_leads')
+        .select('ghl_contact_id').eq('lp_lead_id', lpLeadId).maybeSingle();
+      ghlId = leadRow?.ghl_contact_id || null;
+    } catch (_) { ghlId = null; }
+    if (!ghlId) ghlId = getField(lead, 'ghl_contact_id', 'ghlContactId') || null;
     if (!ghlId) {
       try {
         ghlId = await matchToGHL({
