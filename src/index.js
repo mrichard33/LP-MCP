@@ -295,6 +295,20 @@ async function runMigrations() {
   } catch (err) {
     console.warn('[Migration] tag-suppression columns skipped:', err.message);
   }
+
+  // #512-market: lp_jobs.branch_code — revenue-authoritative branch for market
+  // attribution (job branch ties the Net Report 1,710/1,710; lead ZIP mis-routes
+  // 147 sold jobs to OUT_OF_AREA). Column + index here; the historical backfill
+  // lives in sql/039 (a mass UPDATE, not re-run on every boot). Additive.
+  try {
+    await supabase.rpc('exec_sql', {
+      sql: `ALTER TABLE lp_jobs ADD COLUMN IF NOT EXISTS branch_code TEXT;
+            CREATE INDEX IF NOT EXISTS idx_lp_jobs_branch_code ON lp_jobs(branch_code)`,
+    });
+    console.log('[Migration] lp_jobs.branch_code ready');
+  } catch (err) {
+    console.warn('[Migration] lp_jobs.branch_code skipped:', err.message);
+  }
 }
 
 app.get('/', (req, res) => {

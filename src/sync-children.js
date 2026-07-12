@@ -258,6 +258,10 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
       ghl_contact_id:  ghlContactId || null,
       job_status:      getField(job, 'jobstatus', 'JobStatus', 'job_status'),
       job_value:       parseFloat(getField(job, 'grossamount', 'GrossAmount', 'gsa', 'GSA') || 0) || null,
+      // #512-market: persist the LP branch (revenue-authoritative for market
+      // attribution). LP pads the code ('ORL  '), so TRIM + upper. Falls back to
+      // brn_id. Null when the job carries no branch (market resolver → zip).
+      branch_code:     (getField(job, 'brp_id', 'brn_id', 'BRP_ID', 'BrpId') || '').trim().toUpperCase() || null,
       rep_name:        getField(job, 'salesrepname', 'SalesRepName', 'rep_name'),
       created_at_lp:   lpDateToEastern(getField(job, 'entrydate', 'EntryDate')),
       updated_at_lp:   lpDateToEastern(getField(job, 'lastchangedon', 'LastChangedOn')),
