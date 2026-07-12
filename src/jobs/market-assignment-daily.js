@@ -14,10 +14,13 @@
 //
 // ENDPOINTS (registerMarketAssignmentRoutes):
 //   POST /n8n/admin/market-assignment-run   body: { }            → live full pass
-//   POST /n8n/admin/market-reresolve        body: { dry_run? }   → re-resolve;
-//        dry_run DEFAULT TRUE — reports before/after per-market deltas + the
-//        OUT_OF_AREA→branch movement and writes nothing.
-// SCHEDULER (startMarketAssignmentScheduler): daily at 05:00 ET.
+//   POST /n8n/admin/market-reresolve   body: { dry_run?, scope? } → ASYNC re-
+//        resolve (202 + status_url). dry_run DEFAULT TRUE (reports before/after
+//        per-market deltas + the OUT_OF_AREA→branch movement, writes nothing);
+//        scope DEFAULT 'job_bearing' (only leads that CAN change under branch-
+//        first — seconds, not a 219k full scan). scope:'all' for a full pass.
+//   GET  /n8n/admin/market-reresolve/:jobId → progress + final summary.
+// SCHEDULER (startMarketAssignmentScheduler): daily at 05:00 ET (scope='all').
 
 import supabase from '../supabase.js';
 import { syncLogStart, syncLogComplete } from '../sync-log.js';
@@ -35,112 +38,188 @@ function todayET() {
   }).format(new Date());
 }
 
-/**
- * Resolve and upsert market assignments for every lp_leads row. Branch-first for
- * job-bearing leads (method='brn_map'), ZIP fallback otherwise.
- * @param {object} [opts]
- * @param {boolean} [opts.dryRun=false] Compute + diff against the stored
- *   assignments and report before/after deltas, but WRITE NOTHING. The one-shot
- *   re-resolve verification path.
- * @returns {{ success:boolean, dry_run:boolean, processed:number, changed:number,
- *   method_counts?:object, market_counts?:object, before_counts?:object,
- *   transitions?:object, error?:string }}
- */
-export async function computeMarketAssignments({ dryRun = false } = {}) {
-  const startedAt = Date.now();
-  const { zipMap, branchMap } = await getMarketMaps();
-  const logId = dryRun ? null : await syncLogStart('market_assignment', 'market_assignment_daily');
-  const methodCounts = {};   // method → count (new resolution)
-  const marketCounts = {};   // market → count (AFTER)
-  const beforeCounts = {};   // market → count (currently stored)
-  const transitions = {};    // `${from}→${to}` → count (only rows whose market changed)
-  let processed = 0;
-  let changed = 0;
-  let from = 0;
+const CHUNK = 500; // per-batch cap for .in() lookups (well under PostgREST's ~1000)
 
-  try {
-    for (;;) {
-      const { data, error } = await supabase
-        .from('lp_leads')
-        .select('lp_lead_id, lp_prospect_id, zip')
-        .order('lp_lead_id', { ascending: true })
-        .range(from, from + PAGE - 1);
-      if (error) throw new Error(error.message);
-      if (!data || data.length === 0) break;
-
-      // Branch-first inputs for this page: lead → its job's branch market, and
-      // the currently-stored assignment (for the before/after delta).
-      const leadIds = data.map((r) => String(r.lp_lead_id));
-      const branchByLead = await buildLeadBranchMarketMap(leadIds);
-      const priorByLead = new Map();
-      {
-        const { data: prior, error: pe } = await supabase
-          .from('lp_lead_market_assignments')
-          .select('lead_id, resolved_market_code')
-          .in('lead_id', leadIds);
-        if (pe) throw new Error(`prior assignment lookup failed: ${pe.message}`);
-        for (const r of prior || []) priorByLead.set(String(r.lead_id), r.resolved_market_code);
-      }
-
-      const nowIso = new Date().toISOString();
-      const rows = data.map((r) => {
-        const lead = String(r.lp_lead_id);
-        // BRANCH-FIRST: a job-bearing lead follows its job's branch. Only leads
-        // with no job branch fall back to the ZIP resolver (unchanged path).
-        const branch = branchByLead.get(lead);
-        const res = branch
-          ? { market_code: branch.market_code, method: 'brn_map', zip: null, branch: branch.branch_code }
-          : { ...resolveMarket(r.zip, { zipMap, branchMap }), branch: null };
-
-        methodCounts[res.method] = (methodCounts[res.method] || 0) + 1;
-        marketCounts[res.market_code] = (marketCounts[res.market_code] || 0) + 1;
-        const prev = priorByLead.get(lead) || '(none)';
-        beforeCounts[prev] = (beforeCounts[prev] || 0) + 1;
-        if (prev !== res.market_code) {
-          changed++;
-          const key = `${prev}→${res.market_code}`;
-          transitions[key] = (transitions[key] || 0) + 1;
-        }
-
-        return {
-          lead_id: lead,
-          prospect_id: r.lp_prospect_id != null ? String(r.lp_prospect_id) : null,
-          raw_brn_id: res.branch,               // now populated for brn_map rows
-          resolved_market_code: res.market_code,
-          method: res.method,
-          zip: res.zip,
-          resolved_at: nowIso,
-        };
-      });
-
-      if (!dryRun) {
-        const { error: upErr } = await supabase
-          .from('lp_lead_market_assignments')
-          .upsert(rows, { onConflict: 'lead_id' });
-        if (upErr) throw new Error(upErr.message);
-      }
-
-      processed += data.length;
-      from += data.length;              // advance by the real count (PostgREST may cap < PAGE)
-      if (data.length < PAGE) break;    // a short page is the last page
-    }
-  } catch (err) {
-    console.error(`[MarketAssign] failed after ${processed}: ${err.message}`);
-    if (logId) await syncLogComplete(logId, processed, err.message);
-    return { success: false, dry_run: dryRun, error: err.message, processed };
-  }
-
-  if (logId) await syncLogComplete(logId, processed, null);
-  const elapsed = Date.now() - startedAt;
-  console.log(`[MarketAssign] ${dryRun ? 'DRY-RUN ' : ''}done processed=${processed} changed=${changed} methods=${JSON.stringify(methodCounts)} elapsed=${elapsed}ms`);
+function newCounters() {
   return {
-    success: true, dry_run: dryRun, processed, changed,
-    method_counts: methodCounts, market_counts: marketCounts,
-    before_counts: beforeCounts, transitions, elapsed_ms: elapsed,
+    processed: 0, changed: 0,
+    methodCounts: {},  // method → count (new resolution)
+    marketCounts: {},  // market → count (AFTER)
+    beforeCounts: {},  // market → count (currently stored)
+    transitions: {},   // `${from}→${to}` → count (only rows whose market changed)
   };
 }
 
-// ─── HTTP route ──────────────────────────────────────────────────────
+/**
+ * Resolve a batch of lead rows ({lp_lead_id, lp_prospect_id, zip}) branch-first,
+ * tally before/after deltas, and (unless dryRun) upsert lp_lead_market_assignments.
+ * Batch size must stay ≤ CHUNK so the branch/prior lookups don't exceed PostgREST.
+ */
+async function resolveAndWriteBatch(leadRows, { zipMap, branchMap, dryRun, counters }) {
+  if (!leadRows.length) return;
+  const leadIds = leadRows.map((r) => String(r.lp_lead_id));
+
+  // Branch-first inputs: lead → its job's branch market, and the currently-stored
+  // assignment (for the before/after delta).
+  const branchByLead = await buildLeadBranchMarketMap(leadIds);
+  const priorByLead = new Map();
+  const { data: prior, error: pe } = await supabase
+    .from('lp_lead_market_assignments')
+    .select('lead_id, resolved_market_code')
+    .in('lead_id', leadIds);
+  if (pe) throw new Error(`prior assignment lookup failed: ${pe.message}`);
+  for (const r of prior || []) priorByLead.set(String(r.lead_id), r.resolved_market_code);
+
+  const nowIso = new Date().toISOString();
+  const rows = leadRows.map((r) => {
+    const lead = String(r.lp_lead_id);
+    // BRANCH-FIRST: a job-bearing lead follows its job's branch. Only leads with
+    // no job branch fall back to the ZIP resolver (unchanged path).
+    const branch = branchByLead.get(lead);
+    const res = branch
+      ? { market_code: branch.market_code, method: 'brn_map', zip: null, branch: branch.branch_code }
+      : { ...resolveMarket(r.zip, { zipMap, branchMap }), branch: null };
+
+    counters.methodCounts[res.method] = (counters.methodCounts[res.method] || 0) + 1;
+    counters.marketCounts[res.market_code] = (counters.marketCounts[res.market_code] || 0) + 1;
+    const prev = priorByLead.get(lead) || '(none)';
+    counters.beforeCounts[prev] = (counters.beforeCounts[prev] || 0) + 1;
+    if (prev !== res.market_code) {
+      counters.changed++;
+      const key = `${prev}→${res.market_code}`;
+      counters.transitions[key] = (counters.transitions[key] || 0) + 1;
+    }
+
+    return {
+      lead_id: lead,
+      prospect_id: r.lp_prospect_id != null ? String(r.lp_prospect_id) : null,
+      raw_brn_id: res.branch,               // populated for brn_map rows
+      resolved_market_code: res.market_code,
+      method: res.method,
+      zip: res.zip,
+      resolved_at: nowIso,
+    };
+  });
+
+  if (!dryRun) {
+    const { error: upErr } = await supabase
+      .from('lp_lead_market_assignments')
+      .upsert(rows, { onConflict: 'lead_id' });
+    if (upErr) throw new Error(upErr.message);
+  }
+  counters.processed += leadRows.length;
+}
+
+/**
+ * The lead rows that CAN change under branch-first — i.e. leads that have a job.
+ * A lead with no job resolves by ZIP identically to before, so re-resolving it is
+ * a no-op. Deduped distinct lp_lead_id from lp_jobs, hydrated from lp_leads.
+ */
+async function getJobBearingLeadRows() {
+  const leadIdSet = new Set();
+  let from = 0;
+  for (;;) {
+    const { data, error } = await supabase
+      .from('lp_jobs')
+      .select('lp_lead_id')
+      .not('lp_lead_id', 'is', null)
+      .order('lp_lead_id', { ascending: true })
+      .range(from, from + PAGE - 1);
+    if (error) throw new Error(`job-bearing lead scan failed: ${error.message}`);
+    if (!data || data.length === 0) break;
+    for (const r of data) leadIdSet.add(String(r.lp_lead_id));
+    from += data.length;
+    if (data.length < PAGE) break;
+  }
+  const ids = [...leadIdSet];
+  const rows = [];
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const { data, error } = await supabase
+      .from('lp_leads')
+      .select('lp_lead_id, lp_prospect_id, zip')
+      .in('lp_lead_id', ids.slice(i, i + CHUNK));
+    if (error) throw new Error(`job-bearing lead hydrate failed: ${error.message}`);
+    rows.push(...(data || []));
+  }
+  return rows;
+}
+
+/**
+ * Resolve and upsert market assignments. Branch-first for job-bearing leads
+ * (method='brn_map'), ZIP fallback otherwise.
+ * @param {object} [opts]
+ * @param {boolean} [opts.dryRun=false] Compute + diff against the stored
+ *   assignments and report before/after deltas, but WRITE NOTHING.
+ * @param {'all'|'job_bearing'} [opts.scope='all'] 'all' scans every lp_leads row
+ *   (the nightly refresh). 'job_bearing' scans only leads that have a job — the
+ *   only rows branch-first can change — so an on-demand re-resolve is seconds,
+ *   not a 219k-row scan.
+ * @param {object} [opts.job] Optional async job-state to update with progress.
+ * @returns {{ success:boolean, dry_run:boolean, scope:string, processed:number,
+ *   changed:number, method_counts?:object, market_counts?:object,
+ *   before_counts?:object, transitions?:object, error?:string }}
+ */
+export async function computeMarketAssignments({ dryRun = false, scope = 'all', job = null } = {}) {
+  const startedAt = Date.now();
+  const { zipMap, branchMap } = await getMarketMaps();
+  // Only the nightly full LIVE pass writes a sync-log entry.
+  const logId = (!dryRun && scope === 'all') ? await syncLogStart('market_assignment', 'market_assignment_daily') : null;
+  const counters = newCounters();
+  const ctx = { zipMap, branchMap, dryRun, counters };
+
+  try {
+    if (scope === 'job_bearing') {
+      const leadRows = await getJobBearingLeadRows();
+      if (job) job.total = leadRows.length;
+      for (let i = 0; i < leadRows.length; i += CHUNK) {
+        await resolveAndWriteBatch(leadRows.slice(i, i + CHUNK), ctx);
+        if (job) job.processed = counters.processed;
+      }
+    } else {
+      let from = 0;
+      for (;;) {
+        const { data, error } = await supabase
+          .from('lp_leads')
+          .select('lp_lead_id, lp_prospect_id, zip')
+          .order('lp_lead_id', { ascending: true })
+          .range(from, from + PAGE - 1);
+        if (error) throw new Error(error.message);
+        if (!data || data.length === 0) break;
+        // A page is ≤ PAGE (1000); split into CHUNK batches for the .in() lookups.
+        for (let i = 0; i < data.length; i += CHUNK) {
+          await resolveAndWriteBatch(data.slice(i, i + CHUNK), ctx);
+        }
+        if (job) job.processed = counters.processed;
+        from += data.length;              // advance by the real count (PostgREST may cap < PAGE)
+        if (data.length < PAGE) break;    // a short page is the last page
+      }
+    }
+  } catch (err) {
+    console.error(`[MarketAssign] failed after ${counters.processed}: ${err.message}`);
+    if (logId) await syncLogComplete(logId, counters.processed, err.message);
+    return { success: false, dry_run: dryRun, scope, error: err.message, processed: counters.processed };
+  }
+
+  if (logId) await syncLogComplete(logId, counters.processed, null);
+  const elapsed = Date.now() - startedAt;
+  console.log(`[MarketAssign] ${dryRun ? 'DRY-RUN ' : ''}scope=${scope} done processed=${counters.processed} changed=${counters.changed} methods=${JSON.stringify(counters.methodCounts)} elapsed=${elapsed}ms`);
+  return {
+    success: true, dry_run: dryRun, scope, processed: counters.processed, changed: counters.changed,
+    method_counts: counters.methodCounts, market_counts: counters.marketCounts,
+    before_counts: counters.beforeCounts, transitions: counters.transitions, elapsed_ms: elapsed,
+  };
+}
+
+// ─── Async re-resolve job registry ───────────────────────────────────
+// In-memory (lost on redeploy). The re-resolve scans at most the job-bearing
+// cohort (~few thousand), so it completes in seconds — but it's still async so
+// no HTTP client ever blocks on it (the full-scan path would be 219k rows).
+const reresolveJobs = new Map();
+function genReresolveJobId() {
+  return `mrr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// ─── HTTP routes ──────────────────────────────────────────────────────
 export function registerMarketAssignmentRoutes(app) {
   app.post('/n8n/admin/market-assignment-run', async (req, res) => {
     try {
@@ -152,21 +231,62 @@ export function registerMarketAssignmentRoutes(app) {
     }
   });
 
-  // #512-market: one-shot re-resolve with branch-first attribution. dry_run
-  // DEFAULT TRUE — reports before/after per-market deltas (incl. OUT_OF_AREA→
-  // branch) and writes nothing. Pass { dry_run: false } to persist.
-  app.post('/n8n/admin/market-reresolve', async (req, res) => {
-    const dryRun = req.body?.dry_run !== false; // default true
-    try {
-      const result = await computeMarketAssignments({ dryRun });
-      res.json(result);
-    } catch (err) {
-      console.error('[MarketAssign] /market-reresolve error:', err.message);
-      res.status(500).json({ success: false, error: err.message });
-    }
+  // #512-market: one-shot branch-first re-resolve. ASYNC (202 + status_url) so a
+  // caller never blocks. Defaults: dry_run TRUE (reports before/after per-market
+  // deltas, writes nothing) and scope 'job_bearing' (only leads that CAN change
+  // — seconds, not a 219k full scan). Pass { dry_run:false } to persist,
+  // { scope:'all' } for a full re-resolve. Idempotent.
+  app.post('/n8n/admin/market-reresolve', (req, res) => {
+    const dryRun = req.body?.dry_run !== false;                 // default true
+    const scope = req.body?.scope === 'all' ? 'all' : 'job_bearing'; // default job_bearing
+    const jobId = genReresolveJobId();
+    const jobState = {
+      id: jobId, status: 'running', dry_run: dryRun, scope,
+      started_at: new Date().toISOString(), completed_at: null,
+      total: 0, processed: 0, summary: null, error: null,
+    };
+    reresolveJobs.set(jobId, jobState);
+
+    setImmediate(async () => {
+      try {
+        const result = await computeMarketAssignments({ dryRun, scope, job: jobState });
+        jobState.summary = result;
+        jobState.status = result.success ? 'completed' : 'completed_with_errors';
+        jobState.error = result.success ? null : (result.error || 'unknown');
+      } catch (err) {
+        jobState.status = 'failed';
+        jobState.error = String(err.message || 'unknown').slice(0, 500);
+      }
+      jobState.completed_at = new Date().toISOString();
+    });
+
+    return res.status(202).json({
+      ok: true, mode: 'async', job_id: jobId, dry_run: dryRun, scope,
+      status_url: `/n8n/admin/market-reresolve/${jobId}`,
+      message: dryRun
+        ? `Dry-run re-resolve (scope=${scope}) in progress — no writes. Poll status_url.`
+        : `LIVE re-resolve (scope=${scope}) in progress — idempotent upsert. Poll status_url.`,
+    });
   });
 
-  console.log('[MarketAssign] Routes: POST /n8n/admin/market-assignment-run, POST /n8n/admin/market-reresolve');
+  app.get('/n8n/admin/market-reresolve/:jobId', (req, res) => {
+    const j = reresolveJobs.get(req.params.jobId);
+    if (!j) {
+      return res.status(404).json({
+        ok: false, error: 'job_not_found',
+        note: 'In-memory registry — a redeploy clears it. Re-trigger (dry-run is read-only; live re-runs converge via idempotent upsert on lead_id).',
+      });
+    }
+    const pct = j.total > 0 ? ((j.processed / j.total) * 100).toFixed(1) : '0.0';
+    return res.json({
+      ok: true, job_id: j.id, status: j.status, dry_run: j.dry_run, scope: j.scope,
+      started_at: j.started_at, completed_at: j.completed_at,
+      total: j.total, processed: j.processed, progress_pct: pct,
+      summary: j.summary, error: j.error,
+    });
+  });
+
+  console.log('[MarketAssign] Routes: POST /n8n/admin/market-assignment-run, POST/GET /n8n/admin/market-reresolve');
 }
 
 // ─── Scheduler — daily at 05:00 ET (before the scorecard job) ─────────
