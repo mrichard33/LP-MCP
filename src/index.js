@@ -280,6 +280,21 @@ async function runMigrations() {
   } catch (err) {
     console.warn('[Migration] Skipped:', err.message);
   }
+
+  // #512: audit columns for the RTP job-axis backfill's side-effect suppression.
+  // When the backfill upserts a historical completion with ghl_tag_fired=true to
+  // keep the milestones.js sweeper from re-firing it, these mark the row as a
+  // deliberate suppression (vs a genuinely-fired tag). Idempotent / additive.
+  try {
+    await supabase.rpc('exec_sql', {
+      sql: `ALTER TABLE lp_job_milestones
+              ADD COLUMN IF NOT EXISTS tag_suppressed_backfill BOOLEAN NOT NULL DEFAULT FALSE,
+              ADD COLUMN IF NOT EXISTS tag_suppressed_at TIMESTAMPTZ`,
+    });
+    console.log('[Migration] lp_job_milestones tag-suppression columns ready');
+  } catch (err) {
+    console.warn('[Migration] tag-suppression columns skipped:', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
