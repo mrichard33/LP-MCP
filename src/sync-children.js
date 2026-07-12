@@ -240,12 +240,16 @@ export async function syncActivities(lpLeadId, calls, notes) {
 //   Used by the one-shot RTP job-axis backfill: hydrating historical jobs would
 //   otherwise retroactively fire a burst of milestone tags/events for
 //   completions from weeks-to-months ago on already-sold contacts. Default
-//   false — all normal sync callers keep firing exactly as before.
-// Returns { suppressedFires } — how many genuine first-time completions had
-//   their tag/event suppressed (0 when not suppressing), for blast-radius report.
+//   false — all normal sync callers keep firing exactly as before. Suppression
+//   pre-marks EVERY first-time completion (linked or not) so the milestones.js
+//   sweeper can never fire it on a later sync — see the block comment below.
+// Returns { suppressedFires, suppressedUnlinked } — first-time completions whose
+//   tag/event was suppressed, split by whether a GHL contact was linked at write
+//   time (0/0 when not suppressing). Feeds the backfill's blast-radius report.
 export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {}) {
   const { suppressSideEffects = false } = opts;
-  let suppressedFires = 0;
+  let suppressedFires = 0;      // suppressed completions on a GHL-LINKED contact
+  let suppressedUnlinked = 0;   // suppressed completions with NO contact linked yet
   if (!loggedFirstKeys.has('job')) {
     loggedFirstKeys.add('job');
     console.log('[Sync] Job record keys:', Object.keys(job).join(', '));
@@ -286,17 +290,21 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
 
     const actDate = getField(ms, 'actdate', 'ActDate', 'act_date');
     const tag = MDT_TAG_MAP[mdtId];
-    // A genuine first-time completion on a GHL-linked contact fires a milestone
-    // tag — here, AND independently via milestones.js processMilestoneTriggers,
-    // which sweeps every row with act_date NOT NULL + ghl_tag_fired=false on the
-    // normal sync cycle. So suppression at write-time is NOT enough: we must set
-    // ghl_tag_fired=true IN THIS UPSERT (never a follow-up update — the ~15-min
-    // backfill interleaves with the scheduler; a gap lets the sweeper grab the
-    // row) so the sweeper also skips it. tag_suppressed_backfill keeps these
-    // distinguishable from genuinely-fired tags (ghl_tag_fired now means
-    // "fired OR deliberately suppressed"). #512.
-    const wouldFire = !!(actDate && !existing?.act_date && !existing?.ghl_tag_fired && ghlContactId && tag);
-    const suppressThisFire = wouldFire && suppressSideEffects;
+    // A first-time completion of a tag-mapped milestone fires a GHL tag — here
+    // (only when a contact is linked NOW), AND independently via milestones.js
+    // processMilestoneTriggers, which sweeps every row with act_date NOT NULL +
+    // ghl_tag_fired=false and re-resolves the contact from lp_leads (its Bug-10
+    // fallback). So a backfilled completion written UNLINKED (ghl_tag_fired left
+    // false) is NOT safe: the sweeper resolves the lead's contact on a LATER
+    // sync and fires it — a permanent armed state a scheduler pause can't cover.
+    // Therefore suppression must NOT depend on ghlContactId: pre-mark
+    // ghl_tag_fired=true IN THIS UPSERT for EVERY first-time completion, linked
+    // or not, so no future sweep can ever match the row. tag_suppressed_backfill
+    // keeps these distinguishable from genuinely-fired tags (ghl_tag_fired now
+    // means "fired OR deliberately suppressed"). #512.
+    const isFirstCompletion = !!(actDate && !existing?.act_date && !existing?.ghl_tag_fired && tag);
+    const wouldFire = isFirstCompletion && !!ghlContactId;         // fires only if a contact is linked now
+    const suppressThisFire = isFirstCompletion && suppressSideEffects; // suppress linked OR unlinked
 
     const msRow = {
       lp_job_id: jobId, lp_lead_id: lpLeadId, ghl_contact_id: ghlContactId || null,
@@ -321,7 +329,7 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
     }
 
     if (suppressThisFire) {
-      suppressedFires++;
+      if (ghlContactId) suppressedFires++; else suppressedUnlinked++;
       continue;
     }
     if (wouldFire) {
@@ -348,7 +356,7 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
       }
     }
   }
-  return { suppressedFires };
+  return { suppressedFires, suppressedUnlinked };
 }
 
 // ─── Pass 2 — syncAllChildRecords() ──────────────────────────────

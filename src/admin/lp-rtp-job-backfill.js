@@ -196,19 +196,26 @@ async function computeBlastRadius(candidateJobs) {
     }
   }
 
-  let total = 0;
+  let total = 0;           // net-new mapped completions on a LINKED contact → would fire
+  let unlinked = 0;        // net-new mapped completions with NO linked contact → pre-marked, not fired
   const byTag = {};
   const contacts = new Set();
   for (const [jobId, { ldsId, milestones }] of candidateJobs) {
-    if (!ldsId || !ghlLinked.has(ldsId)) continue; // no GHL contact → cannot fire
+    const linked = !!ldsId && ghlLinked.has(ldsId);
     for (const { mdtId, tag } of milestones) {
       if (alreadyRecorded.has(`${jobId}|${mdtId}`)) continue; // not net-new
-      total++;
-      byTag[tag] = (byTag[tag] || 0) + 1;
-      contacts.add(ldsId);
+      if (linked) {
+        total++;
+        byTag[tag] = (byTag[tag] || 0) + 1;
+        contacts.add(ldsId);
+      } else {
+        // No GHL contact linked now, but the sweeper's lp_leads fallback could
+        // resolve it later — so the backfill pre-marks these too (#512).
+        unlinked++;
+      }
     }
   }
-  return { total, by_tag: byTag, ghl_linked_contacts: contacts.size };
+  return { total, unlinked, by_tag: byTag, ghl_linked_contacts: contacts.size };
 }
 
 // Fetch one ET day's changed jobs (single wide page). Throws on LP failure.
@@ -293,12 +300,13 @@ async function hydrateAndUpsert(cstId, { suppressSideEffects = true } = {}) {
   const result = await getLead(cstId);
   const prospects = extractArray(result);
   const prospect = prospects[0];
-  if (!prospect) return { jobsUpserted: 0, milestonesUpserted: 0, suppressedFires: 0 };
+  if (!prospect) return { jobsUpserted: 0, milestonesUpserted: 0, suppressedFires: 0, suppressedUnlinked: 0 };
 
   const leads = getField(prospect, 'leads', 'Leads') || [];
   let jobsUpserted = 0;
   let milestonesUpserted = 0;
   let suppressedFires = 0;
+  let suppressedUnlinked = 0;
 
   for (const lead of leads) {
     const lpLeadId = String(getField(lead, 'id', 'lds_id', 'LeadID'));
@@ -329,11 +337,12 @@ async function hydrateAndUpsert(cstId, { suppressSideEffects = true } = {}) {
     for (const jobRec of leadJobs) {
       const res = await syncJobAndMilestones(jobRec, lpLeadId, ghlId, { suppressSideEffects });
       suppressedFires += res?.suppressedFires || 0;
+      suppressedUnlinked += res?.suppressedUnlinked || 0;
       jobsUpserted++;
       milestonesUpserted += (getField(jobRec, 'milestones', 'Milestones') || []).length;
     }
   }
-  return { jobsUpserted, milestonesUpserted, suppressedFires };
+  return { jobsUpserted, milestonesUpserted, suppressedFires, suppressedUnlinked };
 }
 
 // ─── Core sweep ───────────────────────────────────────────────────────
@@ -363,10 +372,15 @@ export async function runRtpJobBackfill({ dryRun = true, suppressSideEffects = t
     would_fire_total: 0,
     would_fire_by_tag: {},
     would_fire_ghl_contacts: 0,
+    // Net-new mapped completions with NO contact linked now: the sweeper's
+    // lp_leads fallback could fire them on a LATER sync, so the backfill
+    // pre-marks them too. Dry-run estimate; live run reports the actual count.
+    would_premark_unlinked: 0,
     prospects_processed: 0,
     jobs_upserted: 0,
     milestones_upserted: 0,
     suppressed_fires: 0,
+    rows_premarked_unlinked: 0,
     errors: 0,
     error: null,
   };
@@ -399,11 +413,12 @@ export async function runRtpJobBackfill({ dryRun = true, suppressSideEffects = t
     summary.would_fire_total = blast.total;
     summary.would_fire_by_tag = blast.by_tag;
     summary.would_fire_ghl_contacts = blast.ghl_linked_contacts;
+    summary.would_premark_unlinked = blast.unlinked;
   } catch (err) {
     errors.push({ phase: 'blast_radius', error: String(err.message || err).slice(0, 300) });
   }
 
-  console.log(`[RtpJobBackfill] Discovered ${summary.discovered_prospects} prospects / ${summary.discovered_jobs} jobs across ${summary.discover_pages} pages — recoverable jobs=${summary.recoverable_jobs}, recon missing contracts=${summary.recon_missing_contracts}, would-fire=${summary.would_fire_total} on ${summary.would_fire_ghl_contacts} contacts`);
+  console.log(`[RtpJobBackfill] Discovered ${summary.discovered_prospects} prospects / ${summary.discovered_jobs} jobs across ${summary.discover_pages} pages — recoverable jobs=${summary.recoverable_jobs}, recon missing contracts=${summary.recon_missing_contracts}, would-fire=${summary.would_fire_total} on ${summary.would_fire_ghl_contacts} contacts, would-premark-unlinked=${summary.would_premark_unlinked}`);
 
   // DRY-RUN stops here: discover + count + blast radius only, no hydration, no writes.
   if (dryRun) {
@@ -422,10 +437,11 @@ export async function runRtpJobBackfill({ dryRun = true, suppressSideEffects = t
   for (const cstId of prospectList) {
     if (getCircuitStatus().circuitOpen) { summary.error = summary.error || 'circuit_breaker_open'; break; }
     try {
-      const { jobsUpserted, milestonesUpserted, suppressedFires } = await hydrateAndUpsert(cstId, { suppressSideEffects });
+      const { jobsUpserted, milestonesUpserted, suppressedFires, suppressedUnlinked } = await hydrateAndUpsert(cstId, { suppressSideEffects });
       summary.jobs_upserted += jobsUpserted;
       summary.milestones_upserted += milestonesUpserted;
       summary.suppressed_fires += suppressedFires;
+      summary.rows_premarked_unlinked += suppressedUnlinked;
     } catch (err) {
       summary.errors++;
       errors.push({ cst_id: cstId, error: String(err.message || err).slice(0, 300) });
@@ -436,7 +452,7 @@ export async function runRtpJobBackfill({ dryRun = true, suppressSideEffects = t
   }
 
   summary.error_details = errors;
-  console.log(`[RtpJobBackfill] Done — ${summary.prospects_processed}/${prospectList.length} prospects, ${summary.jobs_upserted} jobs / ${summary.milestones_upserted} milestones upserted, ${summary.suppressed_fires} fires suppressed, ${summary.errors} errors`);
+  console.log(`[RtpJobBackfill] Done — ${summary.prospects_processed}/${prospectList.length} prospects, ${summary.jobs_upserted} jobs / ${summary.milestones_upserted} milestones upserted, ${summary.suppressed_fires} fires suppressed (+${summary.rows_premarked_unlinked} unlinked pre-marked), ${summary.errors} errors`);
 
   if (job) {
     job.summary = summary;
