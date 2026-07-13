@@ -282,11 +282,25 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
     console.log('[Sync] Milestone record keys:', Object.keys(milestones[0]).join(', '));
   }
 
+  // ─── Batched write path (#512-perf) ──────────────────────────────
+  // Previously this did a SELECT + upsert PER milestone (~2N round-trips per
+  // job). At backfill scale (hundreds of thousands of milestones) that dominated
+  // wall-clock. Now: ONE read of the job's existing milestones, then ONE bulk
+  // upsert. The fire decision is identical, just computed in memory first.
+  const existingByMdt = new Map();
+  {
+    const { data: existingRows } = await supabase.from('lp_job_milestones')
+      .select('mdt_id, act_date, ghl_tag_fired').eq('lp_job_id', jobId);
+    for (const r of existingRows || []) existingByMdt.set(String(r.mdt_id), r);
+  }
+
+  const msRows = [];               // one row per mdt_id (deduped, last wins) for the bulk upsert
+  const rowIdxByMdt = new Map();
+  const firesToDo = [];            // non-suppressed first-time completions to fire after the upsert
   for (const ms of milestones) {
     const mdtId = getField(ms, 'mdt_id', 'MDT_ID', 'MdtId');
     if (!mdtId) continue;
-    const { data: existing } = await supabase.from('lp_job_milestones')
-      .select('act_date, ghl_tag_fired').eq('lp_job_id', jobId).eq('mdt_id', mdtId).single();
+    const existing = existingByMdt.get(String(mdtId));
 
     const actDate = getField(ms, 'actdate', 'ActDate', 'act_date');
     const tag = MDT_TAG_MAP[mdtId];
@@ -321,38 +335,58 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
       msRow.tag_suppressed_backfill = true;   // audit: distinguishable from real fires
       msRow.tag_suppressed_at = new Date().toISOString();
     }
-    try {
-      await supabase.from('lp_job_milestones').upsert(msRow, { onConflict: 'lp_job_id, mdt_id', ignoreDuplicates: false });
-    } catch (err) {
-      console.warn(`[Sync] Milestone upsert failed for job ${jobId} mdt ${mdtId}:`, err.message);
-      continue;
-    }
+
+    // Dedupe by mdt_id so the bulk upsert never hits "ON CONFLICT cannot affect
+    // row a second time" (last occurrence wins, matching the old sequential order).
+    if (rowIdxByMdt.has(mdtId)) msRows[rowIdxByMdt.get(mdtId)] = msRow;
+    else { rowIdxByMdt.set(mdtId, msRows.length); msRows.push(msRow); }
 
     if (suppressThisFire) {
       if (ghlContactId) suppressedFires++; else suppressedUnlinked++;
-      continue;
+    } else if (wouldFire) {
+      firesToDo.push({ mdtId, tag });
     }
-    if (wouldFire) {
-      const success = await applyGHLTag(ghlContactId, tag);
-      if (success) {
-        await supabase.from('lp_job_milestones')
-          .update({ ghl_tag_fired: true }).eq('lp_job_id', jobId).eq('mdt_id', mdtId);
-        console.log(`[Sync] Milestone tag fired: ${tag} for contact ${ghlContactId}`);
-        // v7.1: Emit milestone event for P2 lifecycle agent rules
+  }
+
+  if (msRows.length) {
+    const { error: bulkErr } = await supabase.from('lp_job_milestones')
+      .upsert(msRows, { onConflict: 'lp_job_id, mdt_id', ignoreDuplicates: false });
+    if (bulkErr) {
+      // Fall back to per-row upserts so one bad row can't drop the whole job's
+      // milestones (preserves the pre-batch fault isolation).
+      console.warn(`[Sync] Milestone bulk upsert failed for job ${jobId} (${bulkErr.message}) — falling back to per-row`);
+      for (const row of msRows) {
         try {
-          await emitEvent({
-            event_type: 'lp.milestone_completed',
-            source: 'lp_sync',
-            entity_type: 'contact',
-            entity_id: ghlContactId,
-            ghl_contact_id: ghlContactId,
-            payload: { mdt_id: mdtId, milestone_tag: tag, job_id: jobId, lp_lead_id: lpLeadId },
-            priority: 'normal',
-            idempotency_key: `lp_milestone_${ghlContactId}_${mdtId}_${jobId}`,
-          });
-        } catch (emitErr) {
-          console.warn(`[Sync] Milestone event emit failed for ${ghlContactId} ${mdtId}: ${emitErr.message}`);
+          await supabase.from('lp_job_milestones').upsert(row, { onConflict: 'lp_job_id, mdt_id', ignoreDuplicates: false });
+        } catch (err) {
+          console.warn(`[Sync] Milestone upsert failed for job ${jobId} mdt ${row.mdt_id}:`, err.message);
         }
+      }
+    }
+  }
+
+  // Fire the non-suppressed first-time completions (normal-sync path; EMPTY under
+  // suppressSideEffects). Sequential — applyGHLTag is rate-limited.
+  for (const { mdtId, tag } of firesToDo) {
+    const success = await applyGHLTag(ghlContactId, tag);
+    if (success) {
+      await supabase.from('lp_job_milestones')
+        .update({ ghl_tag_fired: true }).eq('lp_job_id', jobId).eq('mdt_id', mdtId);
+      console.log(`[Sync] Milestone tag fired: ${tag} for contact ${ghlContactId}`);
+      // v7.1: Emit milestone event for P2 lifecycle agent rules
+      try {
+        await emitEvent({
+          event_type: 'lp.milestone_completed',
+          source: 'lp_sync',
+          entity_type: 'contact',
+          entity_id: ghlContactId,
+          ghl_contact_id: ghlContactId,
+          payload: { mdt_id: mdtId, milestone_tag: tag, job_id: jobId, lp_lead_id: lpLeadId },
+          priority: 'normal',
+          idempotency_key: `lp_milestone_${ghlContactId}_${mdtId}_${jobId}`,
+        });
+      } catch (emitErr) {
+        console.warn(`[Sync] Milestone event emit failed for ${ghlContactId} ${mdtId}: ${emitErr.message}`);
       }
     }
   }
