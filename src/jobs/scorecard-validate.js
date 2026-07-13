@@ -54,6 +54,9 @@ export function checkTieOut(rowsAtAsOf) {
 
 /** net identity + non-negative buckets for a single row (skips rows without buckets). */
 export function checkNetIdentity(row) {
+  // RTP-net / provisional-gross rows carry no released/working/other/cancelled split — the
+  // net-identity (gross − cancelled) is a v1-basis concept and does not apply. Skip them.
+  if (typeof row.revenue_basis === 'string' && row.revenue_basis.startsWith('rtp_')) return [];
   const rel = bucket(row, 'released_dollars');
   const wrk = bucket(row, 'working_dollars');
   const oth = bucket(row, 'other_pending');

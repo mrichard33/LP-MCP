@@ -33,6 +33,14 @@ test('checkNetIdentity skips pre-bucket rows (no bucket_tally)', () => {
   assert.deepEqual(checkNetIdentity({ market: 'A', gross_sales: 1000, net_sales: 900, raw_inputs: {} }), []);
 });
 
+test('checkNetIdentity skips RTP-net rows (no released/working/cancel split applies)', () => {
+  // A realigned row: net_sales is report RTP net, and any lingering bucket_tally is a stale v1
+  // artifact that must NOT be net-identity-checked against the new basis.
+  const row = { market: 'A', revenue_basis: 'rtp_net_by_milestone_date', gross_sales: 1000, net_sales: 900,
+    raw_inputs: { bucket_tally: { released_dollars: 1, working_dollars: 1, other_pending: 1, cancelled_dollars: 999 } } };
+  assert.deepEqual(checkNetIdentity(row), []);
+});
+
 test('checkBounds flags sales>demos and net_sales>gross', () => {
   const v = checkBounds({ market: 'A', gross_sales: 100, net_sales: 200, sales: 50, demos: 40, net_close: 10 });
   assert.ok(v.some((x) => x.detail.includes('net_sales')));
