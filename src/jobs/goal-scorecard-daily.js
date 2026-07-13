@@ -25,7 +25,10 @@ import {
   computeActuals, SCORECARD_GETLEAD_OPTIONS, DEFAULT_MARKET,
 } from './scorecard-metrics.js';
 import { resolveLiveMonthRevenue, PROVISIONAL_BASIS, LIVE_MONTH_SOURCE } from './scorecard-rtp-source.js';
-import { buildProspectMarketMap, getMarketMaps, resolveMarket, normalizeZip5 } from './market-resolver.js';
+import {
+  buildProspectMarketMap, buildProspectMarketMapFromAssignments,
+  getMarketMaps, resolveMarket, normalizeZip5,
+} from './market-resolver.js';
 import {
   resolveSellingCalendar, sellingDaysElapsed, sellingDaysInPeriod, lastCompletedSellingDay,
 } from '../selling-days.js';
@@ -121,7 +124,7 @@ async function fetchDayProspects(day) {
  * prospect that changed on several days appears in several daily pulls. Throws on
  * LP failure so the caller can abort the write.
  */
-async function fetchAllProspects(periodStart, periodEnd) {
+export async function fetchAllProspects(periodStart, periodEnd) {
   const days = [];
   for (let day = periodStart; day <= periodEnd; day = nextDay(day)) days.push(day);
 
@@ -139,6 +142,79 @@ async function fetchAllProspects(periodStart, periodEnd) {
     await sleep(RATE_LIMIT_SLEEP_MS); // brief pause between batches (LP monitors usage)
   }
   return [...byCst.values()];
+}
+
+/**
+ * Partition a prospect cohort into per-market groups. REECE always holds the full
+ * cohort (company roll-up); each prospect also lands in exactly ONE market group,
+ * so Σ(market rows) = REECE for every count/$ column.
+ *
+ * Resolution order per prospect (funnel attribution now MATCHES revenue):
+ *   1. lp_lead_market_assignments — BRANCH-first, ZIP fallback (the same audit the
+ *      Net Report ties 1,710/1,710); a job-bearing lead credits its branch market.
+ *   2. inline prospect ZIP (zip → branch → market) for prospects with no assignment.
+ *   3. lp_leads cache ZIP for prospects missing both an assignment and an inline zip.
+ * A lookup failure degrades gracefully to REECE-only for the run.
+ *
+ * @returns {Promise<{ markets: Record<string, object[]>, resolveStats: object }>}
+ */
+export async function partitionProspectsByMarket(prospects) {
+  const cstOf = (p) => String(getField(p, 'cst_id', 'CST_ID') ?? '');
+  const zipOf = (p) => getField(p, 'zip', 'ZIP', 'Zip', 'zipcode', 'zip_code');
+  const markets = { [DEFAULT_MARKET]: prospects };
+  // How each prospect was attributed — surfaced on REECE.raw_inputs so a run is
+  // self-verifying (branch vs own-zip vs cache-zip vs out-of-area vs unassigned).
+  const resolveStats = { by_branch: 0, by_zip: 0, by_cache_zip: 0, out_of_area: 0, unassigned: 0 };
+  try {
+    const maps = await getMarketMaps();
+    const cstIds = prospects.map(cstOf);
+    // Branch-first per-lead attribution from the nightly assignment audit.
+    const asgMap = await buildProspectMarketMapFromAssignments(cstIds);
+    // Cache-ZIP fallback only for prospects with neither an assignment nor an inline zip.
+    const noInlineZip = prospects
+      .filter((p) => !asgMap.has(cstOf(p)) && !normalizeZip5(zipOf(p)))
+      .map(cstOf);
+    const cacheMap = noInlineZip.length ? await buildProspectMarketMap(noInlineZip) : new Map();
+    for (const p of prospects) {
+      const cst = cstOf(p);
+      const asg = asgMap.get(cst);
+      let mk;
+      if (asg && asg.market_code) {
+        mk = asg.market_code;
+        if (asg.method === 'brn_map') resolveStats.by_branch++;
+        else if (mk === 'OUT_OF_AREA') resolveStats.out_of_area++;
+        else if (mk === 'UNASSIGNED') resolveStats.unassigned++;
+        else resolveStats.by_zip++;
+      } else {
+        mk = resolveMarket(zipOf(p), maps).market_code;
+        if (mk === 'UNASSIGNED') {
+          const fromCache = cacheMap.get(cst);
+          if (fromCache && fromCache !== 'UNASSIGNED') { mk = fromCache; resolveStats.by_cache_zip++; }
+          else resolveStats.unassigned++;
+        } else if (mk === 'OUT_OF_AREA') resolveStats.out_of_area++;
+        else resolveStats.by_zip++;
+      }
+      if (mk === DEFAULT_MARKET) continue; // guard against a stray REECE key
+      (markets[mk] ||= []).push(p);
+    }
+  } catch (err) {
+    console.warn(`[Scorecard] market partition failed — REECE only this run: ${err.message}`);
+  }
+  return { markets, resolveStats };
+}
+
+/**
+ * Fetch a window's prospect cohort (with the standard pre-period lookback) and
+ * partition it by market. Shared by the daily writer and the closed-month funnel
+ * re-derive so both MEASURE per-market funnel identically (no company-total split).
+ *
+ * @returns {Promise<{ prospects: object[], markets: Record<string, object[]>, resolveStats: object }>}
+ */
+export async function fetchAndPartition({ periodStart, periodEnd }) {
+  const fetchStart = minusDays(periodStart, PULL_LOOKBACK_DAYS);
+  const prospects = await fetchAllProspects(fetchStart, periodEnd);
+  const { markets, resolveStats } = await partitionProspectsByMarket(prospects);
+  return { prospects, markets, resolveStats };
 }
 
 /**
@@ -182,41 +258,13 @@ export async function computeGoalScorecard(opts = {}) {
     return { success: false, error: err.message, period_start: periodStart, period_end: periodEnd };
   }
 
-  // Partition the cohort by each lead's resolved market (from ZIP via the cache),
-  // crediting every prospect to its market. REECE stays the company roll-up and is
-  // always written; each prospect lands in exactly one market group, so
-  // Σ(market rows) = REECE to the penny for every count/$ column. A lookup failure
-  // degrades gracefully to REECE-only for the run.
-  const cstOf = (p) => String(getField(p, 'cst_id', 'CST_ID') ?? '');
-  const zipOf = (p) => getField(p, 'zip', 'ZIP', 'Zip', 'zipcode', 'zip_code');
+  // Partition the cohort by each lead's resolved market. REECE stays the company
+  // roll-up (always written); each prospect lands in exactly one market group so
+  // Σ(market rows) = REECE to the penny for every count/$ column. Attribution is
+  // branch-first (lp_lead_market_assignments) then ZIP — matching revenue — so a
+  // job-bearing lead credits its true operating market, not its mailing ZIP.
   const reeceOnly = { [DEFAULT_MARKET]: prospects };
-  const markets = { [DEFAULT_MARKET]: prospects };
-  // How each prospect was attributed to a market — surfaced on REECE.raw_inputs so a
-  // run is self-verifying (own-zip vs cache-zip fallback vs out-of-area vs unassigned).
-  const resolveStats = { by_zip: 0, by_cache_zip: 0, out_of_area: 0, unassigned: 0 };
-  try {
-    // Primary: the prospect's OWN service ZIP (the GetLead customer record carries
-    // address1/city/state/zip at the top level), resolved zip → branch → market. This
-    // avoids the lp_leads cache join entirely, so prospects that aren't in the cache
-    // still resolve. Only prospects with a genuinely missing/invalid zip fall back to
-    // the cached lead zip. Each prospect lands in exactly one group → Σ markets = REECE.
-    const maps = await getMarketMaps();
-    const noInlineZip = prospects.filter((p) => !normalizeZip5(zipOf(p))).map(cstOf);
-    const cacheMap = noInlineZip.length ? await buildProspectMarketMap(noInlineZip) : new Map();
-    for (const p of prospects) {
-      let mk = resolveMarket(zipOf(p), maps).market_code;
-      if (mk === 'UNASSIGNED') {
-        const fromCache = cacheMap.get(cstOf(p));
-        if (fromCache && fromCache !== 'UNASSIGNED') { mk = fromCache; resolveStats.by_cache_zip++; }
-        else resolveStats.unassigned++;
-      } else if (mk === 'OUT_OF_AREA') resolveStats.out_of_area++;
-      else resolveStats.by_zip++;
-      if (mk === DEFAULT_MARKET) continue; // guard against a stray REECE key
-      (markets[mk] ||= []).push(p);
-    }
-  } catch (err) {
-    console.warn(`[Scorecard] market partition failed — REECE only this run: ${err.message}`);
-  }
+  const { markets, resolveStats } = await partitionProspectsByMarket(prospects);
 
   // Raw leads in (true top-of-funnel) — the ONE figure sourced from the CACHE,
   // counted by creation date, not the LP-API by-appt cohort. Carries cache
