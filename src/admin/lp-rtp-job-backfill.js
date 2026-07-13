@@ -16,20 +16,24 @@
  * WHAT: a one-shot, CURSOR-INDEPENDENT sweep on the JOB axis.
  *   /api/Customers/GetJobStatusChanges is NOT gated on lead-entry date, so it
  *   surfaces exactly the post-sale RTP jobs the lead-keyed paths structurally
- *   miss. We collect the distinct prospect ids (cst_id) of every changed job in
- *   the window, then hydrate each prospect via GetLead (the full embedded job
- *   shape — grossamount → job_value + the milestones[] array — which
- *   GetJobStatusChanges does NOT carry) and force-upsert through the proven,
- *   idempotent syncJobAndMilestones (Pass-2 pattern from syncAllChildRecords).
+ *   miss. Each changed-job record is a FLATTENED lead+job that already carries
+ *   the full shape we need — grossamount → job_value, jobstatus, brp_id →
+ *   branch_code, contractid, and the milestones[] array — so we force-upsert
+ *   STRAIGHT from those records through the proven, idempotent
+ *   syncJobAndMilestones. No per-prospect GetLead: the live phase is DB-only,
+ *   which is what makes it fast (GetLead contention with the incremental sync
+ *   dominated wall-clock and is now gone).
  *
  * IDEMPOTENT by construction: syncJobAndMilestones upserts onConflict
  *   'lp_job_id' (jobs) and 'lp_job_id, mdt_id' (milestones), and fires the
  *   milestone tag/event only on a genuine first-time actdate. Re-runnable with
  *   no side effects beyond freshening rows.
  *
- * GHL: ghlId is resolved as Pass 2 does (lead.ghl_contact_id else matchToGHL),
- *   but a GHL match failure NEVER aborts the job upsert — the reconciliation
- *   only needs lp_jobs / lp_job_milestones populated.
+ * GHL: ghlId is resolved from lp_leads.ghl_contact_id (batched) — the SAME
+ *   fallback the milestone sweeper uses — so the suppression set == exactly the
+ *   set the sweeper could fire. A missing link NEVER aborts the upsert (the
+ *   reconciliation only needs lp_jobs / lp_job_milestones populated); it just
+ *   buckets the row as unlinked-pre-marked.
  *
  *   POST /admin/lp-rtp-job-backfill  { dry_run?, suppress_side_effects?, start?, end?, limit? }
  *     → 202 { job_id, status_url } (in-memory registry, lost on redeploy)
@@ -54,10 +58,9 @@
  */
 
 import supabase from '../supabase.js';
-import { getJobStatusChanges, getLead, getCircuitStatus } from '../lp-client.js';
+import { getJobStatusChanges, getCircuitStatus } from '../lp-client.js';
 import { syncJobAndMilestones, MDT_TAG_MAP } from '../sync-children.js';
-import { matchToGHL } from '../ghl.js';
-import { extractArray, getField, normalizePhone, sleep } from '../sync-utils.js';
+import { extractArray, getField, sleep } from '../sync-utils.js';
 import { runSQL } from './supabase-admin.js';
 
 const DEFAULT_START = '2026-01-01';
@@ -69,7 +72,6 @@ const DEFAULT_START = '2026-01-01';
 const DAY_PAGE_SIZE = Number(process.env.RTP_BACKFILL_DAY_PAGE_SIZE || 2000);
 const DISCOVER_CONCURRENCY = Number(process.env.RTP_BACKFILL_DISCOVER_CONCURRENCY || 6);
 const IN_CHUNK = 200;                 // supabase .in() batch size for presence checks
-const RATE_LIMIT_SLEEP_MS = 200;      // between prospects, matches Pass 2
 const DISCOVER_SLEEP_MS = 200;        // between discovery day-batches
 
 // In-memory job registry. Map<jobId, jobState>.
@@ -247,6 +249,11 @@ async function discoverChangedJobProspects({ startdate, enddate, limit, job }) {
   // that changed on several days appears on several day-pages; last write wins
   // (milestones[] is the full current set each time). Feeds computeBlastRadius.
   const candidateJobs = new Map();
+  // jobId -> the FULL GetJobStatusChanges record (a flattened lead+job carrying
+  // grossamount, jobstatus, brp_id, contractid, milestones[]). The live upsert
+  // works straight off these — no per-prospect GetLead — so the backfill is
+  // DB-only (removes the LP contention that dominated wall-clock). Last day wins.
+  const jobRecordsById = new Map();
   let pages = 0;
   let scanned = 0;
   let error = null;
@@ -277,8 +284,9 @@ async function discoverChangedJobProspects({ startdate, enddate, limit, job }) {
         const pid = prospectIdOf(rec);
         const jid = jobIdOf(rec);
         if (pid) prospectIds.add(pid);
-        if (jid) jobIds.add(jid);
         if (jid) {
+          jobIds.add(jid);
+          jobRecordsById.set(jid, rec);
           const fireable = fireableMilestonesOf(rec);
           if (fireable.length) candidateJobs.set(jid, { ldsId: ldsIdOf(rec), milestones: fireable });
         }
@@ -289,60 +297,26 @@ async function discoverChangedJobProspects({ startdate, enddate, limit, job }) {
     await sleep(DISCOVER_SLEEP_MS);
   }
 
-  return { prospectIds, jobIds, candidateJobs, pages, scanned, probeKeys, error };
+  return { prospectIds, jobIds, candidateJobs, jobRecordsById, pages, scanned, probeKeys, error };
 }
 
-// ─── Phase 2: hydrate a prospect via GetLead and upsert its jobs ───────
-// Returns { jobsUpserted, milestonesUpserted, suppressedFires }. GHL match
-// failures are swallowed. suppressSideEffects is threaded into
-// syncJobAndMilestones so the retroactive tag/event burst never fires.
-async function hydrateAndUpsert(cstId, { suppressSideEffects = true } = {}) {
-  const result = await getLead(cstId);
-  const prospects = extractArray(result);
-  const prospect = prospects[0];
-  if (!prospect) return { jobsUpserted: 0, milestonesUpserted: 0, suppressedFires: 0, suppressedUnlinked: 0 };
-
-  const leads = getField(prospect, 'leads', 'Leads') || [];
-  let jobsUpserted = 0;
-  let milestonesUpserted = 0;
-  let suppressedFires = 0;
-  let suppressedUnlinked = 0;
-
-  for (const lead of leads) {
-    const lpLeadId = String(getField(lead, 'id', 'lds_id', 'LeadID'));
-    // Resolve the GHL link the SAME way the milestone sweeper does — it falls
-    // back to lp_leads.ghl_contact_id (milestones.js processMilestoneTriggers).
-    // Resolving from lp_leads FIRST makes the suppression set == the set the
-    // sweeper could fire, so pre-marking ghl_tag_fired covers it exactly.
-    // Reconciliation only needs lp_jobs / lp_job_milestones — never let a GHL
-    // match failure abort the upsert.
-    let ghlId = null;
-    try {
-      const { data: leadRow } = await supabase.from('lp_leads')
-        .select('ghl_contact_id').eq('lp_lead_id', lpLeadId).maybeSingle();
-      ghlId = leadRow?.ghl_contact_id || null;
-    } catch (_) { ghlId = null; }
-    if (!ghlId) ghlId = getField(lead, 'ghl_contact_id', 'ghlContactId') || null;
-    if (!ghlId) {
-      try {
-        ghlId = await matchToGHL({
-          phone: normalizePhone(getField(prospect, 'phone1', 'Phone1', 'phone', 'Phone')),
-          phone_alt: normalizePhone(prospect.altphones?.[0]?.phone || getField(prospect, 'Phone2', 'phone2', 'phone_alt')),
-          email: getField(prospect, 'email', 'Email'),
-        });
-      } catch (_) { ghlId = null; }
-    }
-
-    const leadJobs = getField(lead, 'jobs', 'Jobs') || [];
-    for (const jobRec of leadJobs) {
-      const res = await syncJobAndMilestones(jobRec, lpLeadId, ghlId, { suppressSideEffects });
-      suppressedFires += res?.suppressedFires || 0;
-      suppressedUnlinked += res?.suppressedUnlinked || 0;
-      jobsUpserted++;
-      milestonesUpserted += (getField(jobRec, 'milestones', 'Milestones') || []).length;
-    }
+// ─── Phase 2: GHL-link map for the discovered leads ───────────────────
+// The milestone sweeper (milestones.js) resolves a contact from
+// lp_leads.ghl_contact_id — so resolving the SAME way here makes the suppression
+// set == exactly the set the sweeper could fire. Batched one .in() per chunk;
+// no GetLead, no matchToGHL — the backfill needs neither (reconciliation only
+// wants lp_jobs / lp_job_milestones, and the GHL link only buckets the counter).
+async function buildLeadGhlMap(ldsIds) {
+  const map = new Map();
+  const ids = [...new Set(ldsIds.filter(Boolean).map(String))];
+  for (let i = 0; i < ids.length; i += IN_CHUNK) {
+    const chunk = ids.slice(i, i + IN_CHUNK);
+    const { data, error } = await supabase.from('lp_leads')
+      .select('lp_lead_id, ghl_contact_id').in('lp_lead_id', chunk);
+    if (error) throw new Error(`lp_leads link map failed: ${error.message}`);
+    for (const r of data || []) if (r.ghl_contact_id) map.set(String(r.lp_lead_id), r.ghl_contact_id);
   }
-  return { jobsUpserted, milestonesUpserted, suppressedFires, suppressedUnlinked };
+  return map;
 }
 
 // ─── Core sweep ───────────────────────────────────────────────────────
@@ -428,31 +402,49 @@ export async function runRtpJobBackfill({ dryRun = true, suppressSideEffects = t
     return summary;
   }
 
-  // Phase 2 — hydrate + upsert each distinct prospect. suppressSideEffects
-  // (default true) upserts lp_jobs / lp_job_milestones but skips the retroactive
-  // GHL tag + lp.milestone_completed event for every backfilled completion.
-  const prospectList = [...disc.prospectIds];
-  if (job) { job.total = prospectList.length; job.processed = 0; }
+  // Phase 2 — upsert straight from the discovery records. Each record is a
+  // flattened lead+job carrying grossamount / jobstatus / brp_id / contractid /
+  // milestones[], so NO per-prospect GetLead is needed — the live phase is
+  // DB-only, which removes the LP contention that dominated wall-clock.
+  // suppressSideEffects (default true) upserts lp_jobs / lp_job_milestones but
+  // skips the retroactive GHL tag + lp.milestone_completed event for every
+  // backfilled completion.
+  const jobRecords = [...(disc.jobRecordsById?.values() || [])];
+  if (job) { job.total = jobRecords.length; job.processed = 0; }
 
-  for (const cstId of prospectList) {
+  // GHL link map (sweeper-aligned) for all discovered leads — one batched pass.
+  let leadGhlMap = new Map();
+  try {
+    leadGhlMap = await buildLeadGhlMap(jobRecords.map(ldsIdOf));
+  } catch (err) {
+    errors.push({ phase: 'lead_ghl_map', error: String(err.message || err).slice(0, 300) });
+  }
+
+  const seenProspects = new Set();
+  let done = 0;
+  for (const rec of jobRecords) {
     if (getCircuitStatus().circuitOpen) { summary.error = summary.error || 'circuit_breaker_open'; break; }
+    const lpLeadId = ldsIdOf(rec);
+    const pid = prospectIdOf(rec);
+    if (pid) seenProspects.add(pid);
     try {
-      const { jobsUpserted, milestonesUpserted, suppressedFires, suppressedUnlinked } = await hydrateAndUpsert(cstId, { suppressSideEffects });
-      summary.jobs_upserted += jobsUpserted;
-      summary.milestones_upserted += milestonesUpserted;
-      summary.suppressed_fires += suppressedFires;
-      summary.rows_premarked_unlinked += suppressedUnlinked;
+      const ghlId = lpLeadId ? (leadGhlMap.get(lpLeadId) || null) : null;
+      const res = await syncJobAndMilestones(rec, lpLeadId, ghlId, { suppressSideEffects });
+      summary.jobs_upserted++;
+      summary.milestones_upserted += (getField(rec, 'milestones', 'Milestones') || []).length;
+      summary.suppressed_fires += res?.suppressedFires || 0;
+      summary.rows_premarked_unlinked += res?.suppressedUnlinked || 0;
     } catch (err) {
       summary.errors++;
-      errors.push({ cst_id: cstId, error: String(err.message || err).slice(0, 300) });
+      errors.push({ job_id: jobIdOf(rec), error: String(err.message || err).slice(0, 300) });
     }
-    summary.prospects_processed++;
-    if (job) { job.processed = summary.prospects_processed; job.errors = summary.errors; }
-    await sleep(RATE_LIMIT_SLEEP_MS);
+    done++;
+    summary.prospects_processed = seenProspects.size;
+    if (job) { job.processed = done; job.errors = summary.errors; }
   }
 
   summary.error_details = errors;
-  console.log(`[RtpJobBackfill] Done — ${summary.prospects_processed}/${prospectList.length} prospects, ${summary.jobs_upserted} jobs / ${summary.milestones_upserted} milestones upserted, ${summary.suppressed_fires} fires suppressed (+${summary.rows_premarked_unlinked} unlinked pre-marked), ${summary.errors} errors`);
+  console.log(`[RtpJobBackfill] Done — ${done}/${jobRecords.length} jobs (${seenProspects.size} prospects), ${summary.jobs_upserted} jobs / ${summary.milestones_upserted} milestones upserted, ${summary.suppressed_fires} fires suppressed (+${summary.rows_premarked_unlinked} unlinked pre-marked), ${summary.errors} errors`);
 
   if (job) {
     job.summary = summary;
