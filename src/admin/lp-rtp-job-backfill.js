@@ -160,6 +160,43 @@ async function reconMissingContracts() {
   }
 }
 
+// ─── Coverage probe ────────────────────────────────────────────────
+// Answers the decisive question: of the recon contracts still MISSING from
+// lp_jobs, how many did THIS discovery window actually surface (by contractid)?
+// A missing contract that IS in discoveredContractIds means discovery saw it but
+// it wasn't hydrated (a hydration/pagination bug); a missing contract that is NOT
+// in discoveredContractIds means the discovery AXIS/window is blind to it. Split
+// by month so the Jan-vs-May asymmetry is visible, with samples for spot-checks.
+async function computeCoverageProbe(discoveredContractIds) {
+  const out = { by_month: {}, totals: { missing: 0, discovered: 0, undiscovered: 0 },
+                sample_discovered: [], sample_undiscovered: [] };
+  let rows;
+  try {
+    rows = await runSQL(
+      `WITH jc AS (SELECT DISTINCT raw_lp_data->>'contractid' AS contractid
+                   FROM lp_jobs WHERE raw_lp_data->>'contractid' IS NOT NULL)
+       SELECT r.contractid,
+              to_char(to_date(r.milestone_date,'MM/DD/YYYY'),'YYYY-MM') AS mo
+       FROM recon_net_report_0709 r
+       LEFT JOIN jc ON jc.contractid = r.contractid
+       WHERE jc.contractid IS NULL`,
+    );
+  } catch (_) {
+    return null; // anchor absent
+  }
+  const list = Array.isArray(rows) ? rows : [];
+  for (const r of list) {
+    const cid = String(r.contractid ?? '').trim();
+    const mo = r.mo || 'unknown';
+    const seen = discoveredContractIds.has(cid);
+    const m = out.by_month[mo] || (out.by_month[mo] = { missing: 0, discovered: 0, undiscovered: 0 });
+    m.missing++; out.totals.missing++;
+    if (seen) { m.discovered++; out.totals.discovered++; if (out.sample_discovered.length < 8) out.sample_discovered.push({ contractid: cid, mo }); }
+    else { m.undiscovered++; out.totals.undiscovered++; if (out.sample_undiscovered.length < 8) out.sample_undiscovered.push({ contractid: cid, mo }); }
+  }
+  return out;
+}
+
 // ─── Blast radius ──────────────────────────────────────────────────
 // The retroactive tag/event fires a live (unsuppressed) hydration WOULD trigger:
 // for each discovered job, a milestone fires iff (LP side) it has an actdate and
@@ -254,6 +291,9 @@ async function discoverChangedJobProspects({ startdate, enddate, limit, job }) {
   // works straight off these — no per-prospect GetLead — so the backfill is
   // DB-only (removes the LP contention that dominated wall-clock). Last day wins.
   const jobRecordsById = new Map();
+  // Distinct contractids seen in discovery — feeds the coverage probe (which
+  // recon-missing contracts does this discovery window actually surface?).
+  const discoveredContractIds = new Set();
   let pages = 0;
   let scanned = 0;
   let error = null;
@@ -283,6 +323,8 @@ async function discoverChangedJobProspects({ startdate, enddate, limit, job }) {
         scanned++;
         const pid = prospectIdOf(rec);
         const jid = jobIdOf(rec);
+        const cid = getField(rec, 'contractid', 'ContractID', 'contractId');
+        if (cid != null && String(cid).trim()) discoveredContractIds.add(String(cid).trim());
         if (pid) prospectIds.add(pid);
         if (jid) {
           jobIds.add(jid);
@@ -297,7 +339,7 @@ async function discoverChangedJobProspects({ startdate, enddate, limit, job }) {
     await sleep(DISCOVER_SLEEP_MS);
   }
 
-  return { prospectIds, jobIds, candidateJobs, jobRecordsById, pages, scanned, probeKeys, error };
+  return { prospectIds, jobIds, candidateJobs, jobRecordsById, discoveredContractIds, pages, scanned, probeKeys, error };
 }
 
 // ─── Phase 2: GHL-link map for the discovered leads ───────────────────
@@ -378,6 +420,14 @@ export async function runRtpJobBackfill({ dryRun = true, suppressSideEffects = t
     errors.push({ phase: 'presence_check', error: String(err.message || err).slice(0, 300) });
   }
   summary.recon_missing_contracts = await reconMissingContracts();
+
+  // Coverage probe — does THIS discovery window actually surface the recon
+  // contracts still missing from lp_jobs? (discovered ∩ missing, by month.)
+  try {
+    summary.coverage_probe = await computeCoverageProbe(disc.discoveredContractIds || new Set());
+  } catch (err) {
+    errors.push({ phase: 'coverage_probe', error: String(err.message || err).slice(0, 300) });
+  }
 
   // Blast radius — the retroactive tag/event burst a live UNSUPPRESSED run would
   // fire. Computed from discovery records (which already carry milestones[]) —

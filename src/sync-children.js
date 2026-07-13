@@ -294,9 +294,12 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
     for (const r of existingRows || []) existingByMdt.set(String(r.mdt_id), r);
   }
 
-  const msRows = [];               // one row per mdt_id (deduped, last wins) for the bulk upsert
-  const rowIdxByMdt = new Map();
-  const firesToDo = [];            // non-suppressed first-time completions to fire after the upsert
+  // Decide per UNIQUE mdt_id (last occurrence wins). Counting/firing off this
+  // deduped map — not the raw milestones loop — is what keeps suppressedFires /
+  // suppressedUnlinked honest: a milestones[] array with a repeated datetype
+  // would otherwise increment the counter once per occurrence while only one row
+  // is written, over-reporting suppressions. #512-counterfix.
+  const decisionByMdt = new Map(); // mdt_id -> { msRow, suppress, ghlLinked, fire, tag }
   for (const ms of milestones) {
     const mdtId = getField(ms, 'mdt_id', 'MDT_ID', 'MdtId');
     if (!mdtId) continue;
@@ -336,15 +339,20 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
       msRow.tag_suppressed_at = new Date().toISOString();
     }
 
-    // Dedupe by mdt_id so the bulk upsert never hits "ON CONFLICT cannot affect
-    // row a second time" (last occurrence wins, matching the old sequential order).
-    if (rowIdxByMdt.has(mdtId)) msRows[rowIdxByMdt.get(mdtId)] = msRow;
-    else { rowIdxByMdt.set(mdtId, msRows.length); msRows.push(msRow); }
+    // Last occurrence wins (matches the old sequential order); the decision is
+    // recorded once per mdt_id so counting happens exactly once below.
+    decisionByMdt.set(mdtId, { msRow, suppress: suppressThisFire, ghlLinked: !!ghlContactId, fire: wouldFire, tag });
+  }
 
-    if (suppressThisFire) {
-      if (ghlContactId) suppressedFires++; else suppressedUnlinked++;
-    } else if (wouldFire) {
-      firesToDo.push({ mdtId, tag });
+  // Materialise the deduped rows + counts + fire list from the decision map.
+  const msRows = [];               // one row per mdt_id for the bulk upsert
+  const firesToDo = [];            // non-suppressed first-time completions to fire after the upsert
+  for (const [mdtId, d] of decisionByMdt) {
+    msRows.push(d.msRow);
+    if (d.suppress) {
+      if (d.ghlLinked) suppressedFires++; else suppressedUnlinked++;
+    } else if (d.fire) {
+      firesToDo.push({ mdtId, tag: d.tag });
     }
   }
 
