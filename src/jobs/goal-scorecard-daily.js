@@ -24,6 +24,7 @@ import { syncLogStart, syncLogComplete } from '../sync-log.js';
 import {
   computeActuals, SCORECARD_GETLEAD_OPTIONS, DEFAULT_MARKET,
 } from './scorecard-metrics.js';
+import { resolveLiveMonthRevenue, PROVISIONAL_BASIS, LIVE_MONTH_SOURCE } from './scorecard-rtp-source.js';
 import { buildProspectMarketMap, getMarketMaps, resolveMarket, normalizeZip5 } from './market-resolver.js';
 import {
   resolveSellingCalendar, sellingDaysElapsed, sellingDaysInPeriod, lastCompletedSellingDay,
@@ -266,6 +267,77 @@ export async function computeGoalScorecard(opts = {}) {
         ...(market === DEFAULT_MARKET ? { market_resolution: resolveStats } : {}),
       },
     });
+  }
+
+  // ── Realign the REVENUE columns to RTP net by milestone date ────────────────────
+  // The funnel columns above stay lp_api. Revenue is the AUTHORITATIVE metric: report-sourced
+  // RTP net (released_dollars/net_sales/good_business), with a warehouse-gross PROVISIONAL
+  // companion in its own columns — never blended. See src/jobs/scorecard-rtp-source.js.
+  // INVARIANT enforced per row: released_dollars IS NULL ⇔ revenue_basis IS NULL.
+  const rrate = (nu, de) => (de ? Math.round((nu / de) * 1000) / 10 : null);
+  const rmoney = (nu, de) => (de ? Math.round(nu / de) : null);
+  let revByMarket;
+  try {
+    revByMarket = await resolveLiveMonthRevenue({
+      periodStart, periodEnd, marketCodes: rows.map((r) => r.market),
+    });
+  } catch (err) {
+    console.error(`[Scorecard] RTP revenue resolve failed — aborting write: ${err.message}`);
+    await syncLogComplete(logId, 0, `RTP revenue resolve failed: ${err.message}`);
+    return { success: false, error: err.message, period_start: periodStart, period_end: periodEnd };
+  }
+  for (const row of rows) {
+    const rev = revByMarket.get(row.market) || {
+      released_dollars: null, revenue_basis: null, revenue_as_of: null, reconciled: false,
+      provisional_gross_dollars: null, provisional_days: null, provisional_basis: PROVISIONAL_BASIS,
+    };
+    const net = rev.released_dollars; // authoritative RTP net (null when no report — never 0)
+    // released_dollars / net_sales / good_business move together and are ALL NULL when pending
+    // (never 0) — one rule, no 0-vs-NULL ambiguity. YTD sums must COALESCE(net_sales,0) at the
+    // summation site (the dashboard's num() already coerces null→0).
+    row.released_dollars = net;
+    row.net_sales = net;
+    row.good_business = net;
+    row.working_dollars = 0;
+    row.pending_total = 0;
+    row.pending_dollars = 0;
+    row.revenue_basis = rev.revenue_basis;
+    row.revenue_as_of = rev.revenue_as_of;
+    row.reconciled = rev.reconciled;  // report-backed ⇒ reconciled (provisional banner off)
+    row.provisional_gross_dollars = rev.provisional_gross_dollars;
+    row.provisional_days = rev.provisional_days;
+    // Revenue ratios re-derived from the authoritative net (gross_sales stays funnel-basis).
+    row.nsli = net == null ? null : rmoney(net, row.issued || 0);
+    row.avg_sale = net == null ? null : rmoney(net, row.net_close || 0);
+    row.good_rate_pct = net == null ? null : rrate(net, row.gross_sales || 0);
+    // The RTP-net basis has no released/working/other/cancelled split — drop the v1 revenue
+    // buckets so the nightly validator's net-identity check skips them (they no longer describe
+    // the stored net). Funnel diagnostics (status_tally, issue_diag, …) are retained.
+    const { bucket_tally, open_quotes, status_dollar_tally, suspect_sold_sample, pending_basis,
+      ...funnelInputs } = row.raw_inputs || {};
+    row.raw_inputs = {
+      ...funnelInputs,
+      revenue_basis: rev.revenue_basis,             // overwrite the retired 'v1' label from finalizeActuals
+      provisional_basis: rev.provisional_basis,     // provisional label lives HERE, never in revenue_basis
+      revenue_as_of: rev.revenue_as_of,
+      provisional_days: rev.provisional_days,
+      provisional_gross_dollars: rev.provisional_gross_dollars,
+      live_month_source: LIVE_MONTH_SOURCE,
+    };
+    // INVARIANT — fail loudly rather than persist a row that looks authoritative but is empty.
+    // released_dollars, net_sales, good_business, and revenue_basis are all NULL together (pending)
+    // or all set together (report-backed). Never a bare 0 masquerading as pending.
+    const authNull = row.released_dollars == null;
+    if (authNull !== (row.revenue_basis == null)
+        || (row.net_sales == null) !== authNull
+        || (row.good_business == null) !== authNull) {
+      const msg = `revenue invariant violated (${row.market} ${row.as_of_date}): `
+        + `released_dollars=${row.released_dollars} net_sales=${row.net_sales} `
+        + `good_business=${row.good_business} revenue_basis=${row.revenue_basis}`;
+      console.error(`[Scorecard] ${msg}`);
+      await syncLogComplete(logId, 0, msg);
+      return { success: false, error: msg, period_start: periodStart, period_end: periodEnd };
+    }
   }
 
   // Compute per-source actuals (Phase 2) — same prospect set, no extra LP calls.

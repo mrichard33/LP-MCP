@@ -201,6 +201,8 @@ import { registerGoalScorecardRoutes, startGoalScorecardScheduler } from './jobs
 import { registerMarketAssignmentRoutes, startMarketAssignmentScheduler } from './jobs/market-assignment-daily.js';
 // One-shot proportional-split backfill of per-market history.
 import { registerScorecardBackfillRoutes } from './jobs/scorecard-market-backfill.js';
+// Net Report RTP net ingest + provisional-vs-net drift (live-month revenue realignment).
+import { registerNetReportRoutes } from './jobs/scorecard-rtp-source.js';
 // Nightly scorecard validation + GroupMe tie-out alert.
 import { registerScorecardValidateRoutes, startScorecardValidateScheduler } from './jobs/scorecard-validate.js';
 // ─── Agentic Hold-Complete (return-from-hold re-entry) ───────────
@@ -308,6 +310,42 @@ async function runMigrations() {
     console.log('[Migration] lp_jobs.branch_code ready');
   } catch (err) {
     console.warn('[Migration] lp_jobs.branch_code skipped:', err.message);
+  }
+
+  // Scorecard revenue realignment (sql/040): live-month RTP-net + provisional-gross columns,
+  // the Net Report staging table, and the source-precedence view. Additive/idempotent — the
+  // one-shot label relabels (sql/040 §C) are NOT run here (data ops, applied once via migration).
+  try {
+    await supabase.rpc('exec_sql', {
+      sql: `ALTER TABLE lp_market_scorecard_daily
+              ADD COLUMN IF NOT EXISTS revenue_as_of             DATE,
+              ADD COLUMN IF NOT EXISTS provisional_gross_dollars NUMERIC,
+              ADD COLUMN IF NOT EXISTS provisional_days          INTEGER;
+            ALTER TABLE lp_market_scorecard_daily ALTER COLUMN net_sales DROP NOT NULL;
+            ALTER TABLE lp_market_scorecard_daily ALTER COLUMN good_business DROP NOT NULL;
+            CREATE TABLE IF NOT EXISTS lp_net_report_rtp (
+              market TEXT NOT NULL, report_month DATE NOT NULL, report_as_of DATE NOT NULL,
+              released_net NUMERIC NOT NULL, rows_counted INTEGER,
+              ingested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              PRIMARY KEY (market, report_month, report_as_of));
+            CREATE INDEX IF NOT EXISTS idx_lp_net_report_rtp_month ON lp_net_report_rtp(report_month, market);
+            CREATE OR REPLACE VIEW lp_market_scorecard_resolved AS
+              SELECT DISTINCT ON (market, period_start) *
+              FROM (
+                SELECT s.*,
+                  CASE
+                    WHEN revenue_basis = 'rtp_net_by_milestone_date'               THEN 1
+                    WHEN revenue_basis = 'rtp_gross_by_milestone_date_provisional' THEN 2
+                    ELSE 9
+                  END AS source_rank
+                FROM lp_market_scorecard_daily s
+                WHERE computed_from NOT IN ('backfill_split_sql', 'backfill_split')
+              ) ranked
+              ORDER BY market, period_start, source_rank ASC, as_of_date DESC;`,
+    });
+    console.log('[Migration] scorecard revenue-realignment schema (sql/040) ready');
+  } catch (err) {
+    console.warn('[Migration] scorecard revenue-realignment schema skipped:', err.message);
   }
 }
 
@@ -616,6 +654,7 @@ registerWorkflowProjectionRoutes(app);
 registerGoalScorecardRoutes(app);
 registerMarketAssignmentRoutes(app);
 registerScorecardBackfillRoutes(app);
+registerNetReportRoutes(app);
 registerScorecardValidateRoutes(app);
 
 app.listen(PORT, async () => {
