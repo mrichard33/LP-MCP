@@ -144,21 +144,33 @@ export async function fetchAllProspects(periodStart, periodEnd) {
   return [...byCst.values()];
 }
 
+// Gate for the NIGHTLY live-month writer only: attribute the funnel BRANCH-first
+// (matches revenue) vs the legacy prospect-ZIP path. Default OFF so a deploy is
+// INERT — the nightly job keeps its pre-existing prospect-ZIP behavior until this
+// env var is flipped to 'true'. The closed-month re-derive ALWAYS measures
+// branch-first regardless of this flag (it passes branchFirst:true explicitly), so
+// the gate can be run and verified before the live-month behavior is switched on.
+const BRANCH_FIRST_NIGHTLY =
+  String(process.env.SCORECARD_BRANCH_FIRST_ATTRIBUTION || '').trim().toLowerCase() === 'true';
+
 /**
  * Partition a prospect cohort into per-market groups. REECE always holds the full
  * cohort (company roll-up); each prospect also lands in exactly ONE market group,
  * so Σ(market rows) = REECE for every count/$ column.
  *
- * Resolution order per prospect (funnel attribution now MATCHES revenue):
+ * Resolution order per prospect (when branchFirst — funnel attribution MATCHES revenue):
  *   1. lp_lead_market_assignments — BRANCH-first, ZIP fallback (the same audit the
  *      Net Report ties 1,710/1,710); a job-bearing lead credits its branch market.
  *   2. inline prospect ZIP (zip → branch → market) for prospects with no assignment.
  *   3. lp_leads cache ZIP for prospects missing both an assignment and an inline zip.
+ * With branchFirst=false, step 1 is skipped → the legacy prospect-ZIP-only behavior.
  * A lookup failure degrades gracefully to REECE-only for the run.
  *
+ * @param {object[]} prospects
+ * @param {{ branchFirst?: boolean }} [opts] branchFirst=false → legacy ZIP-only path.
  * @returns {Promise<{ markets: Record<string, object[]>, resolveStats: object }>}
  */
-export async function partitionProspectsByMarket(prospects) {
+export async function partitionProspectsByMarket(prospects, { branchFirst = true } = {}) {
   const cstOf = (p) => String(getField(p, 'cst_id', 'CST_ID') ?? '');
   const zipOf = (p) => getField(p, 'zip', 'ZIP', 'Zip', 'zipcode', 'zip_code');
   const markets = { [DEFAULT_MARKET]: prospects };
@@ -168,8 +180,9 @@ export async function partitionProspectsByMarket(prospects) {
   try {
     const maps = await getMarketMaps();
     const cstIds = prospects.map(cstOf);
-    // Branch-first per-lead attribution from the nightly assignment audit.
-    const asgMap = await buildProspectMarketMapFromAssignments(cstIds);
+    // Branch-first per-lead attribution from the nightly assignment audit (skipped
+    // when branchFirst=false → legacy prospect-ZIP behavior, deploy stays inert).
+    const asgMap = branchFirst ? await buildProspectMarketMapFromAssignments(cstIds) : new Map();
     // Cache-ZIP fallback only for prospects with neither an assignment nor an inline zip.
     const noInlineZip = prospects
       .filter((p) => !asgMap.has(cstOf(p)) && !normalizeZip5(zipOf(p)))
@@ -210,10 +223,10 @@ export async function partitionProspectsByMarket(prospects) {
  *
  * @returns {Promise<{ prospects: object[], markets: Record<string, object[]>, resolveStats: object }>}
  */
-export async function fetchAndPartition({ periodStart, periodEnd }) {
+export async function fetchAndPartition({ periodStart, periodEnd, branchFirst = true }) {
   const fetchStart = minusDays(periodStart, PULL_LOOKBACK_DAYS);
   const prospects = await fetchAllProspects(fetchStart, periodEnd);
-  const { markets, resolveStats } = await partitionProspectsByMarket(prospects);
+  const { markets, resolveStats } = await partitionProspectsByMarket(prospects, { branchFirst });
   return { prospects, markets, resolveStats };
 }
 
@@ -264,7 +277,7 @@ export async function computeGoalScorecard(opts = {}) {
   // branch-first (lp_lead_market_assignments) then ZIP — matching revenue — so a
   // job-bearing lead credits its true operating market, not its mailing ZIP.
   const reeceOnly = { [DEFAULT_MARKET]: prospects };
-  const { markets, resolveStats } = await partitionProspectsByMarket(prospects);
+  const { markets, resolveStats } = await partitionProspectsByMarket(prospects, { branchFirst: BRANCH_FIRST_NIGHTLY });
 
   // Raw leads in (true top-of-funnel) — the ONE figure sourced from the CACHE,
   // counted by creation date, not the LP-API by-appt cohort. Carries cache

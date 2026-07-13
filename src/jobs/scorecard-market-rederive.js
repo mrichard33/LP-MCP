@@ -139,7 +139,9 @@ export async function rederiveMarketFunnel(opts = {}) {
     const periodEnd = t.as_of_date; // reproduce the frozen snapshot window
     let part;
     try {
-      part = await fetchAndPartition({ periodStart, periodEnd });
+      // ALWAYS branch-first here (independent of the nightly SCORECARD_BRANCH_FIRST_
+      // ATTRIBUTION gate): the re-derive's whole purpose is a branch-first measurement.
+      part = await fetchAndPartition({ periodStart, periodEnd, branchFirst: true });
     } catch (err) {
       perMonth.push({ month: t.month, error: `re-pull failed: ${err.message}` });
       continue;
@@ -245,20 +247,92 @@ export async function rederiveMarketFunnel(opts = {}) {
   };
 }
 
-// ─── HTTP route (one-shot) ───────────────────────────────────────────
+// ─── Run persistence (fire-and-forget, pollable) ─────────────────────
+// A full re-derive re-pulls ~90 days of LP data per closed month, so it runs far
+// longer than a synchronous HTTP/MCP timeout (60s). The route therefore kicks the
+// run off in the background and writes its report to scorecard_rederive_reports;
+// the caller polls that table for status='done'. Table DDL: sql/041_scorecard_rederive_reports.sql
+// (also created idempotently on first run below).
+const REPORT_TABLE = 'scorecard_rederive_reports';
+
+async function ensureReportTable() {
+  // Defensive: create the pollable report table if the migration hasn't been applied.
+  // rpc('exec_sql') mirrors the pattern used elsewhere for one-shot DDL; a failure is
+  // non-fatal (the migration may already own the table) and surfaced in logs only.
+  try {
+    await supabase.rpc('exec_sql', {
+      sql: `CREATE TABLE IF NOT EXISTS ${REPORT_TABLE} (
+        run_id text PRIMARY KEY,
+        started_at timestamptz NOT NULL DEFAULT now(),
+        finished_at timestamptz,
+        dry_run boolean,
+        status text NOT NULL DEFAULT 'running',
+        report jsonb,
+        error text
+      );`,
+    });
+  } catch (err) {
+    console.warn(`[ScorecardRederive] ensureReportTable skipped: ${err.message}`);
+  }
+}
+
+/** Run the re-derive in the background and persist its report by run_id. */
+async function runRederiveInBackground(runId, opts) {
+  try {
+    await supabase.from(REPORT_TABLE).upsert(
+      { run_id: runId, dry_run: opts.dryRun !== false, status: 'running', report: null, error: null },
+      { onConflict: 'run_id' },
+    );
+    const result = await rederiveMarketFunnel(opts);
+    await supabase.from(REPORT_TABLE).update({
+      status: 'done', report: result, finished_at: new Date().toISOString(),
+    }).eq('run_id', runId);
+    console.log(`[ScorecardRederive] run ${runId} done (dry_run=${opts.dryRun !== false}, months=${result.months})`);
+  } catch (err) {
+    console.error(`[ScorecardRederive] run ${runId} failed: ${err.message}`);
+    await supabase.from(REPORT_TABLE).update({
+      status: 'error', error: err.message, finished_at: new Date().toISOString(),
+    }).eq('run_id', runId).then(() => {}, () => {});
+  }
+}
+
+// ─── HTTP routes ─────────────────────────────────────────────────────
 export function registerScorecardRederiveRoutes(app) {
+  // Kick off a run (fire-and-forget). Defaults dry_run=true → reports only.
   app.post('/n8n/admin/scorecard-market-rederive', async (req, res) => {
     try {
       const months = Array.isArray(req.body?.months) ? req.body.months : undefined;
       const dryRunRaw = req.body?.dry_run ?? req.query?.dry_run;
       const dryRun = !(dryRunRaw === false || dryRunRaw === 'false'); // default true (safe)
       const tolerancePct = req.body?.tolerance_pct ?? req.query?.tolerance_pct;
-      const result = await rederiveMarketFunnel({ months, dryRun, tolerancePct });
-      res.json(result);
+      const runId = `rederive_${new Date().toISOString().replace(/[:.]/g, '-')}`;
+      await ensureReportTable();
+      // Do NOT await — respond immediately; the run persists its report by run_id.
+      runRederiveInBackground(runId, { months, dryRun, tolerancePct });
+      res.status(202).json({
+        success: true, started: true, run_id: runId, dry_run: dryRun,
+        poll: `GET /n8n/admin/scorecard-market-rederive/status?run_id=${runId}`,
+        poll_sql: `SELECT status, report, error FROM ${REPORT_TABLE} WHERE run_id='${runId}'`,
+      });
     } catch (err) {
       console.error('[ScorecardRederive] error:', err.message);
       res.status(500).json({ success: false, error: err.message });
     }
   });
-  console.log('[ScorecardRederive] Route registered: POST /n8n/admin/scorecard-market-rederive');
+
+  // Poll a run's status/report.
+  app.get('/n8n/admin/scorecard-market-rederive/status', async (req, res) => {
+    try {
+      const runId = req.query?.run_id;
+      let q = supabase.from(REPORT_TABLE).select('*').order('started_at', { ascending: false }).limit(10);
+      if (runId) q = supabase.from(REPORT_TABLE).select('*').eq('run_id', runId);
+      const { data, error } = await q;
+      if (error) throw new Error(error.message);
+      res.json({ success: true, runs: data || [] });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  console.log('[ScorecardRederive] Routes registered: POST /n8n/admin/scorecard-market-rederive | GET …/status');
 }
