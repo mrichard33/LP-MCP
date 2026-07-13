@@ -207,3 +207,43 @@ export async function buildProspectMarketMap(prospectIds) {
   }
   return marketByProspect;
 }
+
+/**
+ * Build a prospect_id → { market_code, method } map from the nightly
+ * lp_lead_market_assignments audit (written by market-assignment-daily.js).
+ * That table is BRANCH-FIRST with ZIP fallback — a lead's market follows its
+ * job's branch (method='brn_map'), else its ZIP (method='zip_lookup' /
+ * 'zip_out_of_area' / 'no_address') — the SAME resolution the Net Report uses
+ * (branch ties 1,710/1,710). A prospect can have several lead assignments; a
+ * branch-resolved lead WINS over a zip-resolved one, so job-bearing funnel
+ * events attribute to their true operating market instead of the mailing ZIP.
+ *
+ * Prospects with no assignment row are omitted → the caller falls back to the
+ * inline prospect ZIP path. Used by the scorecard cohort partition (C2) so
+ * funnel attribution matches revenue attribution.
+ */
+export async function buildProspectMarketMapFromAssignments(prospectIds) {
+  const ids = [...new Set((prospectIds || []).map((p) => String(p ?? '')).filter(Boolean))];
+  const byProspect = new Map(); // prospect_id → { market_code, method }
+  const CHUNK = 300;
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const slice = ids.slice(i, i + CHUNK);
+    const { data, error } = await supabase
+      .from('lp_lead_market_assignments')
+      .select('prospect_id, resolved_market_code, method')
+      .in('prospect_id', slice);
+    if (error) throw new Error(`lp_lead_market_assignments lookup failed: ${error.message}`);
+    for (const r of data || []) {
+      const pid = String(r.prospect_id);
+      if (!pid || r.resolved_market_code == null) continue;
+      const isBranch = r.method === 'brn_map';
+      const prev = byProspect.get(pid);
+      // Branch-first-wins: a brn_map assignment overrides an existing zip one;
+      // otherwise the first assignment seen for the prospect stands.
+      if (!prev || (isBranch && prev.method !== 'brn_map')) {
+        byProspect.set(pid, { market_code: r.resolved_market_code, method: r.method });
+      }
+    }
+  }
+  return byProspect;
+}

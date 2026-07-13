@@ -199,8 +199,11 @@ import { registerWorkflowProjectionRoutes, startWorkflowProjectionLoop } from '.
 import { registerGoalScorecardRoutes, startGoalScorecardScheduler } from './jobs/goal-scorecard-daily.js';
 // Nightly per-lead market assignment (feeds the per-market scorecard split).
 import { registerMarketAssignmentRoutes, startMarketAssignmentScheduler } from './jobs/market-assignment-daily.js';
-// One-shot proportional-split backfill of per-market history.
-import { registerScorecardBackfillRoutes } from './jobs/scorecard-market-backfill.js';
+// Closed-month per-market funnel RE-DERIVE (real measurement; retires the split).
+// The legacy proportional-split backfill (scorecard-market-backfill.js) is left in
+// the tree but INTENTIONALLY UNWIRED — no metric may be produced by splitting a
+// company total across markets.
+import { registerScorecardRederiveRoutes } from './jobs/scorecard-market-rederive.js';
 // Net Report RTP net ingest + provisional-vs-net drift (live-month revenue realignment).
 import { registerNetReportRoutes } from './jobs/scorecard-rtp-source.js';
 // Nightly scorecard validation + GroupMe tie-out alert.
@@ -653,7 +656,7 @@ registerLeadSelectionRoutes(app);
 registerWorkflowProjectionRoutes(app);
 registerGoalScorecardRoutes(app);
 registerMarketAssignmentRoutes(app);
-registerScorecardBackfillRoutes(app);
+registerScorecardRederiveRoutes(app);
 registerNetReportRoutes(app);
 registerScorecardValidateRoutes(app);
 
