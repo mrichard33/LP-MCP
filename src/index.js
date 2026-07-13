@@ -321,6 +321,8 @@ async function runMigrations() {
               ADD COLUMN IF NOT EXISTS revenue_as_of             DATE,
               ADD COLUMN IF NOT EXISTS provisional_gross_dollars NUMERIC,
               ADD COLUMN IF NOT EXISTS provisional_days          INTEGER;
+            ALTER TABLE lp_market_scorecard_daily ALTER COLUMN net_sales DROP NOT NULL;
+            ALTER TABLE lp_market_scorecard_daily ALTER COLUMN good_business DROP NOT NULL;
             CREATE TABLE IF NOT EXISTS lp_net_report_rtp (
               market TEXT NOT NULL, report_month DATE NOT NULL, report_as_of DATE NOT NULL,
               released_net NUMERIC NOT NULL, rows_counted INTEGER,

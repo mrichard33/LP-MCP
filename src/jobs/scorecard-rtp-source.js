@@ -195,6 +195,48 @@ export function parseNetReportRtp(csvText, brnMap, reportAsOfOverride) {
   return { records: out, report_as_of: reportAsOf, unmapped: Object.fromEntries(unmapped) };
 }
 
+/**
+ * Restate CLOSED-month scorecard rows to the report's EXACT cent values, sourced from
+ * lp_net_report_rtp (populated by the same ingest path — one rounding policy, no ad-hoc load).
+ * Closed months had been loaded as rounded whole dollars, so the YTD hero was off by cents
+ * (e.g. Jan stored 6,941,858 vs report 6,941,857.11). This corrects released_dollars / net_sales
+ * / good_business to the report figure for every net_report_rtp row with a period_start strictly
+ * before `throughMonthStart` (default: first of the current month, so only closed months move).
+ * Utility markets (OUT_OF_AREA / UNASSIGNED) carry no report revenue and are left untouched at 0,
+ * so Σ(markets) still equals REECE to the cent.
+ *
+ * @param {string} [throughMonthStart]  YYYY-MM-01 exclusive upper bound; default current month.
+ * @returns {{ restated:number }}
+ */
+export async function restateClosedFromReport({ throughMonthStart } = {}) {
+  const bound = throughMonthStart
+    ? `DATE '${throughMonthStart}'`
+    : `date_trunc('month', CURRENT_DATE)`;
+  const sql = `
+    WITH latest AS (
+      SELECT DISTINCT ON (market, report_month) market, report_month, released_net, report_as_of
+      FROM lp_net_report_rtp
+      ORDER BY market, report_month, report_as_of DESC
+    )
+    UPDATE lp_market_scorecard_daily t
+    SET released_dollars = s.released_net,
+        net_sales        = s.released_net,
+        good_business    = s.released_net,
+        revenue_basis    = 'rtp_net_by_milestone_date',
+        raw_inputs = COALESCE(t.raw_inputs, '{}'::jsonb) || jsonb_build_object(
+          'revenue_basis', 'rtp_net_by_milestone_date',
+          'restated_from', 'net_report_exact',
+          'report_as_of', s.report_as_of)
+    FROM latest s
+    WHERE t.computed_from = 'net_report_rtp'
+      AND t.market = s.market
+      AND t.period_start = s.report_month
+      AND t.period_start < ${bound}
+    RETURNING t.id`;
+  const rows = (await runSQL(sql)) || [];
+  return { restated: Array.isArray(rows) ? rows.length : 0 };
+}
+
 export function registerNetReportRoutes(app) {
   // Raw-text body (CSV can exceed express.json()'s 100kb cap), scoped to this route.
   app.post('/n8n/admin/net-report-ingest', express.text({ type: '*/*', limit: '25mb' }), async (req, res) => {
@@ -259,7 +301,22 @@ export function registerNetReportRoutes(app) {
     }
   });
 
-  console.log('[NetReport] Routes registered: POST /n8n/admin/net-report-ingest | GET /n8n/admin/net-report-drift');
+  // Restate closed-month scorecard rows to the report's exact cent values (fixes the rounded
+  // whole-dollar closed load that left the YTD hero off by cents). Reads lp_net_report_rtp only —
+  // ingest the report first. `?through=YYYY-MM-01` bounds which months are treated as closed.
+  app.post('/n8n/admin/net-report-restate-closed', async (req, res) => {
+    try {
+      if (!supabase) return res.status(500).json({ success: false, error: 'Supabase not configured' });
+      const through = (req.query.through || '').trim() || undefined;
+      const result = await restateClosedFromReport({ throughMonthStart: through });
+      res.json({ success: true, ...result, through: through || 'current_month' });
+    } catch (err) {
+      console.error('[NetReport] restate error:', err.message);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  console.log('[NetReport] Routes registered: POST /n8n/admin/net-report-ingest | GET /n8n/admin/net-report-drift | POST /n8n/admin/net-report-restate-closed');
 }
 
 /**

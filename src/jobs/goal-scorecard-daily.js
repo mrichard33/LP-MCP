@@ -292,9 +292,12 @@ export async function computeGoalScorecard(opts = {}) {
       provisional_gross_dollars: null, provisional_days: null, provisional_basis: PROVISIONAL_BASIS,
     };
     const net = rev.released_dollars; // authoritative RTP net (null when no report — never 0)
+    // released_dollars / net_sales / good_business move together and are ALL NULL when pending
+    // (never 0) — one rule, no 0-vs-NULL ambiguity. YTD sums must COALESCE(net_sales,0) at the
+    // summation site (the dashboard's num() already coerces null→0).
     row.released_dollars = net;
-    row.net_sales = net ?? 0;         // NOT NULL summable column: 0 when pending → excluded from YTD sum
-    row.good_business = net ?? 0;
+    row.net_sales = net;
+    row.good_business = net;
     row.working_dollars = 0;
     row.pending_total = 0;
     row.pending_dollars = 0;
@@ -322,9 +325,15 @@ export async function computeGoalScorecard(opts = {}) {
       live_month_source: LIVE_MONTH_SOURCE,
     };
     // INVARIANT — fail loudly rather than persist a row that looks authoritative but is empty.
-    if ((row.released_dollars == null) !== (row.revenue_basis == null)) {
+    // released_dollars, net_sales, good_business, and revenue_basis are all NULL together (pending)
+    // or all set together (report-backed). Never a bare 0 masquerading as pending.
+    const authNull = row.released_dollars == null;
+    if (authNull !== (row.revenue_basis == null)
+        || (row.net_sales == null) !== authNull
+        || (row.good_business == null) !== authNull) {
       const msg = `revenue invariant violated (${row.market} ${row.as_of_date}): `
-        + `released_dollars=${row.released_dollars} revenue_basis=${row.revenue_basis}`;
+        + `released_dollars=${row.released_dollars} net_sales=${row.net_sales} `
+        + `good_business=${row.good_business} revenue_basis=${row.revenue_basis}`;
       console.error(`[Scorecard] ${msg}`);
       await syncLogComplete(logId, 0, msg);
       return { success: false, error: msg, period_start: periodStart, period_end: periodEnd };

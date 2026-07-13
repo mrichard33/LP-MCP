@@ -44,11 +44,16 @@ lives in **`revenue_basis`**:
 Migrate that to read **`revenue_basis`** instead. Reading `computed_from` for revenue provenance
 is now a bug: it will label a report-backed live month as `'lp_api'`.
 
-## 2. ⚠ Invariant — `released_dollars IS NULL ⇔ revenue_basis IS NULL`
+## 2. ⚠ Invariant — the three revenue columns and `revenue_basis` are NULL together
 
-Enforced in the writer (aborts on violation) and by a DB check. It guarantees a row can never
-look authoritative while being empty. **Never treat `released_dollars IS NULL` as `$0`** — it
-means *pending* (no report yet). See §4.
+`released_dollars`, `net_sales`, `good_business`, and `revenue_basis` are **all NULL together**
+(pending) or **all set together** (report-backed). Enforced in the writer (aborts on violation)
+and by a DB check:
+`(released_dollars IS NULL) = (net_sales IS NULL) = (good_business IS NULL) = (revenue_basis IS NULL)`.
+
+**Never treat a NULL revenue column as `$0`** — it means *pending* (no report yet). See §4.
+`net_sales` is **NULL when pending, never 0**, so no panel can render a bare $0 for a
+report-less month.
 
 ---
 
@@ -57,7 +62,7 @@ means *pending* (no report yet). See §4.
 | Column | Type | Meaning |
 |---|---|---|
 | `released_dollars` | numeric NULL | **Authoritative RTP net.** NULL when no report (pending) — never 0. |
-| `net_sales`, `good_business` | numeric (0-default) | Mirror `released_dollars`; **0** when pending (so YTD sums exclude the live month — §5). |
+| `net_sales`, `good_business` | numeric **NULL** | Mirror `released_dollars` exactly — **NULL when pending, not 0.** YTD sums MUST `COALESCE(net_sales,0)` at the summation site (the dashboard's `num()` already coerces null→0), so a pending live month contributes 0 to the hero without being a rendered $0. |
 | `working_dollars`, `pending_total`, `pending_dollars` | numeric | **0** under the RTP-net basis (no working/pending split). |
 | `revenue_basis` | text NULL | Revenue provenance — see §1. **Sole revenue-provenance signal.** |
 | `revenue_as_of` | date NULL | The report's coverage-end date backing `released_dollars`. NULL when pending. Render as "as of MM/DD". |
@@ -84,17 +89,17 @@ Drive display off `revenue_basis` / `revenue_as_of` / `released_dollars`:
 
 ## 5. YTD / multi-month composition (R2)
 
-Aggregate periods take the **latest snapshot per month** and **sum `net_sales`**, re-deriving
-ratios (existing behavior). Because a no-report live month has `net_sales = 0`, it **naturally
-drops out** of the authoritative YTD hero — which is correct. **Rules:**
+Aggregate periods take the **latest snapshot per month** and **sum `COALESCE(net_sales,0)`**,
+re-deriving ratios (existing behavior; `num()` already coerces null→0). Because a no-report live
+month has `net_sales = NULL → 0`, it **naturally drops out** of the authoritative YTD hero. **Rules:**
 
 - **Never** sum authoritative-closed + provisional-live into one number. The provisional live
   month is shown **separately**, badged.
 - A live month joins the hero **only** when it has a report (`revenue_basis='rtp_net_by_milestone_date'`)
   — same basis as closed months, so summing is legitimate.
-- Verified composition (July report ingested): closed Jan–Jun + July net = **$48,724,515.17**
-  from stored rows (closed months are integer-rounded; the exact-penny figure is
-  $47,814,304.43 + $910,210.17 = **$48,724,514.60**).
+- **Closed months are stored at exact cents** (restated from the Net Report via the ingest path —
+  they had been loaded as rounded whole dollars, off by up to ~$1/month). Verified composition:
+  closed Jan–Jun = **$47,814,304.43** + July net **$910,210.17** = YTD **$48,724,514.60** exactly.
 
 ## 6. Precedence view — `lp_market_scorecard_resolved`
 
@@ -105,14 +110,29 @@ One authoritative row per `(market, period_start)`, ready to read:
 Prefer this view for "the current number per market/period"; it already resolves closed→net and
 live→report-or-pending correctly.
 
-## 7. Out-of-scope notes
+## 7. ⚠ KNOWN INCONSISTENCY — `lp_source_scorecard_daily` is still on the v1 basis
 
-- **`lp_source_scorecard_daily`** (per-source funnel table) revenue remains **v1/funnel basis** —
-  source-level RTP-net attribution is not available. It is **not** the realigned metric; the
-  revenue hero must read `lp_market_scorecard_daily` / `lp_market_scorecard_resolved`.
+The per-source table (**`lp_source_scorecard_daily`**, powering the **Sources & lead-cost** view)
+still carries revenue on the **legacy `released/working/cancel v1` basis, keyed to appt/sold
+date** — a *different basis* from the RTP-net hero. Source-level RTP-net attribution is not
+available (RTP milestones attribute to branch/market, not lead source). Until it is realigned,
+**the Sources view will disagree with the hero on revenue.**
+
+- **The hero / market path does NOT read this table** — confirmed: only
+  `Reece-Dashboard/lib/queries/sources.ts` reads `lp_source_scorecard_daily`; the hero reads
+  `lp_market_scorecard_daily` / `lp_market_scorecard_resolved`. So the hero is not contaminated.
+- **Do not** wire any hero/market/YTD revenue figure to `lp_source_scorecard_daily`.
+- Tracked as follow-up **#531** for a separate realignment.
+
+## 8. Routes & config
+
 - **Ingest:** `POST /n8n/admin/net-report-ingest` (raw Net Report CSV body) → `lp_net_report_rtp`.
   A newer report supersedes provisional for its range; superseded provisional values are retained
   on prior daily rows for drift audit.
+- **Restate closed:** `POST /n8n/admin/net-report-restate-closed?through=YYYY-MM-01` — restates
+  closed-month scorecard rows to the report's exact cent values from `lp_net_report_rtp` (one
+  rounding policy, no ad-hoc load). Utility markets (OUT_OF_AREA/UNASSIGNED) carry no report
+  revenue and stay 0, so Σ(markets) = REECE to the cent.
 - **Drift:** `GET /n8n/admin/net-report-drift` — closed-month report-net vs warehouse-gross, the
   measured −25%…+30% spread. The provisional is a pace signal; do not tune it to the report.
 - **Config switch:** `SCORECARD_LIVE_MONTH_SOURCE` (default `net_report`). Flipping to

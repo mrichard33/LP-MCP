@@ -24,6 +24,13 @@ ALTER TABLE lp_market_scorecard_daily
   ADD COLUMN IF NOT EXISTS provisional_gross_dollars NUMERIC,
   ADD COLUMN IF NOT EXISTS provisional_days          INTEGER;
 
+-- net_sales / good_business must be able to hold NULL so a "no report yet" live month reads
+-- pending (NULL), never a bare $0 (which would be indistinguishable from genuinely-zero revenue
+-- and would render as $0 in any panel that sums or shows net_sales). They move WITH
+-- released_dollars: all three NULL together (pending) or all set together (report-backed).
+ALTER TABLE lp_market_scorecard_daily ALTER COLUMN net_sales    DROP NOT NULL;
+ALTER TABLE lp_market_scorecard_daily ALTER COLUMN good_business DROP NOT NULL;
+
 -- ─── B. Net Report RTP staging (one row per market × report snapshot) ───
 -- Populated by POST /n8n/admin/net-report-ingest (manual upload or scheduled drop; LP has no
 -- report API). report_as_of = the report's coverage end date. A newer snapshot supersedes an
@@ -41,8 +48,13 @@ CREATE INDEX IF NOT EXISTS idx_lp_net_report_rtp_month ON lp_net_report_rtp(repo
 
 -- ─── C. ONE-SHOT: retire legacy / mislabeled bases (guarded; preserves the invariant) ───
 -- C1. Backfill closed report rows to the correct label. They ARE report RTP net; the NULL
---     (Jan–May) and mislabeled 'v1' (June REECE) values are simply wrong metadata. Label-only:
---     no dollar column is touched, so the $47,814,304.43 closed total does not move.
+--     (Jan–May) and mislabeled 'v1' (June REECE) values are simply wrong metadata. Label-only.
+--     NOTE: closed-row VALUES are additionally restated to EXACT cents by the
+--     POST /n8n/admin/net-report-restate-closed route (reads lp_net_report_rtp — one rounding
+--     policy). The closed rows had been loaded as rounded whole dollars, leaving the YTD hero
+--     off by cents ($47,814,304.43 report vs $47,814,305 stored). Run: ingest the Net Report,
+--     then call net-report-restate-closed?through=<current-month-first>. Σ(markets)=REECE to the
+--     cent (utility markets carry no report revenue and stay 0).
 UPDATE lp_market_scorecard_daily
    SET revenue_basis = 'rtp_net_by_milestone_date'
  WHERE computed_from = 'net_report_rtp'
