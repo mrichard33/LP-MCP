@@ -14,6 +14,30 @@
  * 
  * Security: All endpoints validate GHL_WEBHOOK_SECRET.
  *
+ * v2.15 (2026-07-13) — restore agentic email replies + fix live-chat detection.
+ *   NORMALIZER: normalizeInboundChannel now strips non-alphanumerics BEFORE
+ *   matching. GHL's inbound REPLY webhook sends human-readable message types
+ *   with spaces ("Live Chat", "Chat Widget"), not the TYPE_* enum; v2.14 matched
+ *   'live_chat' (underscore), so "Live Chat" fell through to 'unknown' and 92
+ *   replies in 7 days took the generic non-SMS exclusion path.
+ *   DNC-BEFORE-LIVECHAT REORDER: DNC now runs FIRST on every channel. v2.14 put
+ *   the live-chat early-return above the DNC check, so fixing the normalizer
+ *   would have silently removed live-chat opt-out coverage; DNC now precedes
+ *   every channel decision.
+ *   EMAIL RESTORED: AGENTIC_REPLY_CHANNELS = {sms, email}. v2.14 shipped SMS-only
+ *   as "Phase 2 pending", but the downstream path was already complete
+ *   (reply-sender.decideReplyChannel → email_passthrough;
+ *   decision-engine.inferChannelFromEvent → 'email'). Live chat and social stay
+ *   excluded. MUST stay in sync with the payload_field_in channel gate on
+ *   agent_rules 106/228/310/330/333.
+ *   OWNERSHIP STAMP extended to email (was SMS-only in v2.14).
+ *   EMPTY-BODY GUARD: empty / attachment-only email bodies are routed to a human,
+ *   never handed to the analyzer (isAnswerableEmailBody). Quoted threads are
+ *   stripped on email before anything downstream sees them (stripQuotedEmail).
+ *   BUFFER NORMALIZER DEDUPLICATED: scheduleBufferedPipeline's inline channel
+ *   IIFE (a second, drifting copy with the same underscore bug) now calls
+ *   normalizeInboundChannel.
+ *
  * v2.14 (2026-07-06) — SMS-only channel gate + synchronous ownership stamp
  *   (Bot 2/3/4 consolidation, Sentinel §2A/§14).
  *   CHANNEL GATE: the agentic bot handles SMS only in this phase. Live chat
@@ -451,13 +475,10 @@ function scheduleBufferedPipeline(contactId, trimmed, emittedEventId, messageTyp
     // v2.8: normalize messageType for the analyzer.
     // 2026-07-03: livechat no longer collapses to null (null defaulted to
     // 'sms' at send time — the Steve Nkzhm channel flip).
-    const channel = (() => {
-      const lt = String(latestType || '').toLowerCase();
-      if (lt.includes('email')) return 'email';
-      if (lt.includes('live_chat') || lt.includes('livechat') || lt.includes('webchat')) return 'livechat';
-      if (lt.includes('sms'))   return 'sms';
-      return null;
-    })();
+    // v2.15 — single source of truth. This was a second, drifting copy of the
+    // normalizer and carried the same 'live_chat' underscore bug.
+    const nc = normalizeInboundChannel(latestType);
+    const channel = (nc === 'unknown' || nc === 'social') ? null : nc;
 
     console.log(
       `[ReplyBuffer] Fired for ${contactId}: ${freshMessages.length}/${messages.length} message${messages.length === 1 ? '' : 's'}, ${elapsedSec}s window, channel=${channel || 'unknown'} → triggering pipeline with combined text`
@@ -591,19 +612,59 @@ function cleanGHLValue(val) {
   return val;
 }
 
-// v2.14 — normalize a GHL messageType into the channel taxonomy the gate and
-// downstream rules key on. Distinct from the reply-buffer's analyzer
-// normalization (which predates this and collapses unknowns to null): the
-// gate must positively identify SMS, so unknown types return 'unknown' and
-// are treated as non-SMS (fail closed — an unidentifiable channel never gets
-// an agentic reply).
+// v2.15 (2026-07-13) — normalize BEFORE matching. GHL's inbound REPLY webhook
+// sends human-readable types with spaces ("Live Chat", "Chat Widget"), not the
+// TYPE_* enum the Conversations API returns. v2.14 matched 'live_chat'
+// (underscore), so "Live Chat" fell through to 'unknown' and 92 replies in 7
+// days took the generic non-SMS exclusion path instead of the intended
+// live-chat early return. Strip non-alphanumerics first, then match.
 function normalizeInboundChannel(messageType) {
-  const lt = String(messageType || '').toLowerCase();
-  if (lt.includes('live_chat') || lt.includes('livechat') || lt.includes('webchat')) return 'livechat';
+  const lt = String(messageType || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (lt.includes('livechat') || lt.includes('webchat') || lt.includes('chatwidget')) return 'livechat';
   if (lt.includes('email')) return 'email';
   if (lt.includes('facebook') || lt.includes('instagram') || lt.includes('gmb') || lt.includes('whatsapp') || lt === 'fb' || lt === 'ig') return 'social';
   if (lt.includes('sms')) return 'sms';
   return 'unknown';
+}
+
+// v2.15 — channels the agentic bot answers. Email restored: v2.14 shipped
+// SMS-only as "Phase 2 pending", but the downstream path was already complete
+// (reply-sender.decideReplyChannel → email_passthrough;
+// decision-engine.inferChannelFromEvent → 'email'). Live chat and social stay
+// excluded. MUST stay in sync with the payload_field_in channel gate on
+// agent_rules 106 / 228 / 310 / 330 / 333.
+const AGENTIC_REPLY_CHANNELS = new Set(['sms', 'email']);
+
+// v2.15 — is there anything in this email worth handing the analyzer? Rejects
+// empty bodies and attachment-only replies (GHL puts a bare
+// conversations-assets link in the body when the customer sends only a file).
+// 2 of the 8 email replies dropped between 07-06 and 07-13 had message_text: "".
+function isAnswerableEmailBody(text) {
+  const t = String(text || '')
+    .replace(/https?:\/\/\S*conversations-assets\/\S*/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return t.length >= 3;
+}
+
+// v2.15 — defensive quoted-thread strip. GHL's reply webhook normally sends only
+// the new text, but some clients inline the full thread. Cut at the first quote
+// marker so the analyzer classifies the customer's new words, not our own last
+// email echoed back at us.
+function stripQuotedEmail(text) {
+  const t = String(text || '');
+  const markers = [
+    /\n\s*On .{0,120}\bwrote:\s*\n/i,          // Gmail / Apple Mail
+    /\n\s*-{2,}\s*Original Message\s*-{2,}/i,
+    /\n\s*_{5,}\s*\n/,                          // Outlook divider
+    /\n\s*From:\s.+\n\s*Sent:\s/i,
+  ];
+  let cut = t.length;
+  for (const re of markers) {
+    const m = t.match(re);
+    if (m && m.index !== undefined && m.index < cut) cut = m.index;
+  }
+  return t.slice(0, cut).replace(/^>.*$/gm, '').trim();
 }
 
 // v2.14 — synchronous conversation-ownership stamp (Sentinel bot gate).
@@ -699,7 +760,10 @@ async function handleReply(req, res) {
     || cleanGHLValue(body.to_number) || cleanGHLValue(body.toPhone) || null;
 
   if (!contactId) return res.status(400).json({ error: 'Missing contactId in webhook payload' });
-  const trimmed = messageText.trim();
+  const channel = normalizeInboundChannel(messageType);
+  // v2.15 — strip the quoted thread on email before ANYTHING downstream sees it
+  // (event payload, message key, analyzer).
+  const trimmed = channel === 'email' ? stripQuotedEmail(messageText) : String(messageText || '').trim();
 
   // 2026-07-03 — every ghl.reply_received MUST carry a non-null message_id.
   // GHL's inbound webhook frequently omits one; before this, message_id:null
@@ -710,18 +774,11 @@ async function handleReply(req, res) {
   // inside the window maps to the same key.
   const messageId = rawMessageId || buildMessageKey(contactId, null, trimmed);
 
-  // v2.14 — CHANNEL GATE, live chat first (Sentinel §14: "checked before any
-  // other logic, not a tag"). Live chat is permanently excluded from the
-  // agentic bot — its existing handler owns it. No event, no stamp, nothing.
-  const channel = normalizeInboundChannel(messageType);
-  if (channel === 'livechat') {
-    console.log(`[BehavioralEmitter] live-chat inbound from ${contactId} — agentic bot permanently excluded from this channel, skipping entirely`);
-    return res.json({ status: 'skipped', reason: 'live_chat_channel_excluded' });
-  }
-
-  // DNC always wins, regardless of contact state or channel — opt-out
-  // compliance is honored everywhere. Fires immediately, bypasses the reply
-  // buffer (no analyzer call needed).
+  // v2.15 — DNC FIRST, on EVERY channel. v2.14 put the live-chat early-return
+  // ABOVE this, so a live-chat "STOP" was never honored here — it only worked by
+  // accident, because the broken normalizer never actually returned 'livechat'.
+  // Fixing the normalizer (2a) would have silently REMOVED live-chat opt-out
+  // coverage. DNC therefore now precedes every channel decision.
   if (isDNCSignal(trimmed)) {
     await emitEvent({
       event_type: 'ghl.reply_received', event_subtype: 'dnc', source: 'ghl_webhook',
@@ -729,17 +786,22 @@ async function handleReply(req, res) {
       payload: { message_text: trimmed, message_type: messageType, channel, message_id: messageId, engagement_quality: 'dnc', word_count: trimmed.split(/\s+/).length },
       priority: 'critical', idempotency_key: `ghl_reply_dnc_${contactId}_${Date.now()}`,
     });
-    console.log(`[BehavioralEmitter] DNC reply from ${contactId}: "${trimmed.slice(0, 50)}"`);
-    return res.json({ status: 'accepted', classification: 'dnc' });
+    console.log(`[BehavioralEmitter] DNC reply from ${contactId} (${channel}): "${trimmed.slice(0, 50)}"`);
+    return res.json({ status: 'accepted', classification: 'dnc', channel });
   }
 
-  // v2.14 — CHANNEL GATE, non-SMS (email / social / unidentifiable). Phase 2
-  // owns these channels; until it ships they get no ownership stamp, no
-  // analyzer pipeline, and no ghl.reply_received (which the reply backstop
-  // rule fires on). A distinct bookkeeping event type keeps the inbound
-  // visible for forensics without matching any rule, and the engagement
-  // timestamp still lands so lead intelligence doesn't go blind.
-  if (channel !== 'sms') {
+  // Live chat: PERMANENT hard exclusion — its existing handler owns the surface.
+  // No stamp, no event, no pipeline. (Sentinel §14.)
+  if (channel === 'livechat') {
+    console.log(`[BehavioralEmitter] live-chat inbound from ${contactId} — agentic bot permanently excluded from this channel, skipping entirely`);
+    return res.json({ status: 'skipped', reason: 'live_chat_channel_excluded' });
+  }
+
+  // v2.15 — CHANNEL GATE. SMS + Email are answered. Social and unidentifiable
+  // types are not (fail closed — an unknown channel never gets an agentic reply).
+  // Excluded inbounds still get the bookkeeping event + engagement timestamp so
+  // they stay visible for forensics.
+  if (!AGENTIC_REPLY_CHANNELS.has(channel)) {
     try { await upsertLeadIntelligence(contactId, { last_reply_at: new Date().toISOString(), last_engagement_at: new Date().toISOString() }); } catch {}
     await emitEvent({
       event_type: 'ghl.reply_channel_excluded', event_subtype: channel, source: 'ghl_webhook',
@@ -748,12 +810,27 @@ async function handleReply(req, res) {
       priority: 'low', bypass_filter: true,
       idempotency_key: `ghl_reply_excluded_${contactId}_${messageId}`,
     }).catch((err) => console.warn(`[BehavioralEmitter] channel-excluded event emit failed for ${contactId}: ${err.message}`));
-    console.log(`[BehavioralEmitter] ${channel} inbound from ${contactId} — agentic bot is SMS-only this phase (Phase 2 covers email/social), no stamp, no reply pipeline`);
+    console.log(`[BehavioralEmitter] ${channel} inbound from ${contactId} — not an agentic reply channel, no stamp, no reply pipeline`);
     return res.json({ status: 'accepted', classification: 'channel_excluded', channel });
   }
 
-  // v2.14 — SMS confirmed: stamp conversation ownership before anything else
-  // so the responder rules' has_tag: agentic-active gate passes on turn 1.
+  // v2.15 — never hand an empty/attachment-only email body to the analyzer; it
+  // has nothing to answer and would invent context. Bookkeep + let a human take it.
+  if (channel === 'email' && !isAnswerableEmailBody(trimmed)) {
+    try { await upsertLeadIntelligence(contactId, { last_reply_at: new Date().toISOString(), last_engagement_at: new Date().toISOString() }); } catch {}
+    await emitEvent({
+      event_type: 'ghl.reply_channel_excluded', event_subtype: 'email_no_body', source: 'ghl_webhook',
+      entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
+      payload: { message_text: trimmed, message_type: messageType, channel, message_id: messageId, word_count: trimmed ? trimmed.split(/\s+/).length : 0 },
+      priority: 'normal', bypass_filter: true,
+      idempotency_key: `ghl_reply_nobody_${contactId}_${messageId}`,
+    }).catch((err) => console.warn(`[BehavioralEmitter] email_no_body event emit failed for ${contactId}: ${err.message}`));
+    console.log(`[BehavioralEmitter] email inbound from ${contactId} has no answerable body (empty or attachment-only) — routed to human, no analyzer call`);
+    return res.json({ status: 'accepted', classification: 'email_no_body' });
+  }
+
+  // v2.15 — ownership stamp now runs for SMS *and* Email (v2.14 was SMS-only).
+  // Stamps agentic-active so the responder rules' has_tag gate passes on turn 1.
   // Fail-soft; returns the fetched contact for reuse by the trivial filter.
   let stampedContact = null;
   try {

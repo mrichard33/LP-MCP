@@ -77,6 +77,7 @@
  */
 
 import supabase from '../supabase.js';
+import { emitEvent } from '../event-emitter.js';
 
 // Actions in 'executing' status older than this are considered stuck.
 // 10 minutes is generous — longest legitimate handler (set_lp_appointment
@@ -92,7 +93,6 @@ const APPROVED_RECOVERY_AGE_MINUTES = 2;
 // exists yet — a retry could duplicate (LP lead, GHL task, customer SMS).
 const NON_IDEMPOTENT_ACTION_TYPES = new Set([
   'create_task',        // posts GHL note + GroupMe notification
-  'send_message',       // sends customer-facing SMS/email
   'create_lp_lead',     // 2026-05-01 — posts to LP /api/Leads/LeadAdd
 ]);
 
@@ -100,9 +100,58 @@ const NON_IDEMPOTENT_ACTION_TYPES = new Set([
 // retry budget. The handler verifies whether the action already
 // completed externally before resending. See header comment for the
 // requirements to add an action_type to this set.
+//
+// 2026-07-13 — send_message joins the recoverable set. Against this file's own
+// three requirements:
+//   (1) READ API: GHL Conversations — fetchRecentMessages(contactId).
+//   (2) IDENTIFIER: the action's own created_at. Any OUTBOUND message in the
+//       thread with dateAdded >= created_at is evidence the prior attempt
+//       landed. (A customer-facing SMS/email cannot carry a `ref:` footer the
+//       way send_notification does — the thread itself is the evidence.)
+//   (3) RETRY CHECK: executeSendMessage short-circuits on retry_count > 0 when
+//       verifyPriorSendLanded() finds such an outbound. UNVERIFIABLE does NOT
+//       send — it requeues; at budget exhaustion the reaper emits
+//       agentic.reply_dropped and a human takes the conversation.
+// Canary: action 194031 (Henrik Jensen 5wGbfMykduKgsLyi9Klt) — executor stalled
+// ~18:45–18:57 UTC 2026-07-13, the reply was failed, never retried, never
+// alerted, and the lead sat unanswered.
 const RECOVERABLE_NON_IDEMPOTENT_ACTION_TYPES = new Set([
   'send_notification',  // verified via GroupMe history check (ref footer)
+  'send_message',       // verified via GHL conversation read (see above)
 ]);
+
+// 2026-07-13 — a dead customer reply must never be silent. When a send_message
+// exhausts its recovery budget, emit a critical event; rule
+// AGENTIC_REPLY_DROPPED_ALERT turns it into a GroupMe alert + a GHL rep task.
+async function emitDroppedReply(action, errorMsg) {
+  try {
+    const { data: full } = await supabase
+      .from('agent_actions')
+      .select('target_id, rule_applied, event_id')
+      .eq('id', action.id)
+      .maybeSingle();
+    const contactId = full?.target_id || null;
+    await emitEvent({
+      event_type: 'agentic.reply_dropped',
+      source: 'reaper',
+      entity_type: 'contact',
+      entity_id: String(contactId || 'unknown'),
+      ghl_contact_id: contactId,
+      payload: {
+        action_id: action.id,
+        rule_applied: full?.rule_applied || action.rule_applied || null,
+        source_event_id: full?.event_id || null,
+        reason: errorMsg,
+      },
+      priority: 'critical',
+      bypass_filter: true,
+      idempotency_key: `agentic_reply_dropped_${action.id}`,
+    });
+    console.error(`[Reaper:executing] DROPPED CUSTOMER REPLY — action ${action.id}, contact ${contactId}. agentic.reply_dropped emitted.`);
+  } catch (err) {
+    console.error(`[Reaper:executing] failed to emit agentic.reply_dropped for action ${action.id}: ${err.message}`);
+  }
+}
 
 /**
  * Phase 1: Find actions stuck in 'executing' status for more than
@@ -184,6 +233,9 @@ async function reapStuckExecuting() {
       else requeued++;
     } else {
       failed++;
+      if (action.action_type === 'send_message') {
+        await emitDroppedReply(action, errorMsg);
+      }
     }
   }
 
