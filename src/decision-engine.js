@@ -3,6 +3,16 @@
  *
  * The brain of the agentic system.
  *
+ * v2.18 — 2026-07-13. payload_field_in {field, values: [...]} context operator —
+ *   the set form of payload_field_eq. Added so the responder rules' channel gate
+ *   (agent_rules 106/228/310/330/333) can admit BOTH sms and email in one
+ *   condition instead of a single-value payload_field_eq. Mirrors the existing
+ *   event_subtype_in / custom_field_in set operators; strings compare
+ *   case-insensitively; a null/absent field is a QUIET block, not fail-closed.
+ *   MUST be deployed live BEFORE the SQL that rewrites those rules to use it —
+ *   the switch fails closed on an unknown operator, so an early SQL land would
+ *   silence every responder rule on SMS and email.
+ *
  * v2.17 — 2026-07-06. Three context operators for the Bot 2/3/4 consolidation
  *   (agentic conversation system build):
  *     - payload_field_eq {field, value} — exact payload match (strings
@@ -1050,6 +1060,38 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
           : actual === want;
         if (!matches) {
           console.log(`[Context] BLOCKED: payload_field_eq — payload.${expected.field} "${actual}" !== "${want}"`);
+          return false;
+        }
+        break;
+      }
+
+      // v2.18 (2026-07-13) — payload_field_in: {field, values: [...]}. Set form
+      // of payload_field_eq. Needed because the responder rules' channel gate
+      // must now admit BOTH sms and email; payload_field_eq is single-value and
+      // nesting any_of for a two-value set is unreadable. Mirrors the existing
+      // event_subtype_in / custom_field_in set operators. Strings compare
+      // case-insensitively. A null/absent field is a QUIET block, not a
+      // fail-closed — same contract as payload_field_eq v2.17.1.
+      case 'payload_field_in': {
+        if (
+          !expected || typeof expected !== 'object' ||
+          typeof expected.field !== 'string' ||
+          !Array.isArray(expected.values) || expected.values.length === 0
+        ) {
+          return failClosed(key, 'malformed spec — expected {field, values: [...]}');
+        }
+        const actualIn = payload[expected.field];
+        if (actualIn === undefined || actualIn === null) {
+          console.log(`[Context] BLOCKED: payload_field_in — payload.${expected.field} is null/absent (wanted one of [${expected.values.join(',')}])`);
+          return false;
+        }
+        const matchedIn = expected.values.some((want) =>
+          (typeof actualIn === 'string' && typeof want === 'string')
+            ? actualIn.toLowerCase() === want.toLowerCase()
+            : actualIn === want
+        );
+        if (!matchedIn) {
+          console.log(`[Context] BLOCKED: payload_field_in — payload.${expected.field} "${actualIn}" not in [${expected.values.join(',')}]`);
           return false;
         }
         break;

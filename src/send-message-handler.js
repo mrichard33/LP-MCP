@@ -1543,6 +1543,38 @@ async function queueCompanionAction(parentAction, generated, callPurpose = null)
   }
 }
 
+/**
+ * 2026-07-13 — recovery verification for a reaper-requeued send.
+ * send_message is now in RECOVERABLE_NON_IDEMPOTENT_ACTION_TYPES
+ * (src/actions/reaper.js). On ANY retry we must prove the earlier attempt did
+ * not already reach the customer before we generate a second one.
+ *
+ * Evidence = any OUTBOUND message in the contact's GHL thread with
+ * dateAdded >= the action's created_at. This also (correctly) covers a human
+ * rep who jumped in: if a person already answered, the bot stands down.
+ *
+ * Returns 'landed' | 'not_landed' | 'unverifiable'.
+ * BIAS: never send when we cannot verify. A missed reply is recoverable
+ * (agentic.reply_dropped → GroupMe + rep task); a duplicate customer text is not.
+ */
+async function verifyPriorSendLanded(action) {
+  try {
+    const since = Date.parse(action.created_at);
+    if (!Number.isFinite(since)) return 'unverifiable';
+    const { messages } = await fetchRecentMessages(action.target_id);
+    if (!Array.isArray(messages) || messages.length === 0) return 'unverifiable';
+    const landed = messages.some((m) => {
+      if (m?.direction !== 'outbound') return false;
+      const ts = Date.parse(m.dateAdded || m.dateUpdated || '');
+      return Number.isFinite(ts) && ts >= since;
+    });
+    return landed ? 'landed' : 'not_landed';
+  } catch (err) {
+    console.warn(`[SendMessage] recovery verification unreadable for action ${action.id}: ${err.message}`);
+    return 'unverifiable';
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // MAIN HANDLER
 // ═══════════════════════════════════════════════════════════════════
@@ -1620,6 +1652,26 @@ export async function executeSendMessage(action, context) {
       reason: gate.reason,
       channel,
     };
+  }
+
+  // 2026-07-13 — recovery gate. Only on a retry; the first attempt is untouched.
+  if ((action.retry_count || 0) > 0) {
+    const verdict = await verifyPriorSendLanded(action);
+    if (verdict === 'landed') {
+      console.log(`[SendMessage] action ${action.id} retry — an outbound already landed after ${action.created_at}; short-circuiting (no duplicate send)`);
+      return {
+        success: true,
+        action: 'verified_already_sent',
+        contact_id: action.target_id,
+        retry_count: action.retry_count,
+        verification: 'outbound_found_after_action_created_at',
+      };
+    }
+    if (verdict === 'unverifiable') {
+      console.warn(`[SendMessage] action ${action.id} retry — cannot verify prior attempt; declining to send this cycle (duplicate risk)`);
+      throw new Error('recovery_verification_unavailable — declined to send (duplicate risk)');
+    }
+    console.log(`[SendMessage] action ${action.id} retry — verified no outbound landed after ${action.created_at}; proceeding with generation`);
   }
 
   // 2026-07-06 — HUMAN-TAKEOVER YIELD REMOVED (owner decision, same day it
