@@ -118,20 +118,43 @@ async function fetchDayProspects(day) {
 }
 
 /**
+ * Fetch one day with bounded exponential-backoff retry. LP intermittently returns
+ * 500 "Execution Timeout Expired" under load (its DB read timing out); a single
+ * such day would otherwise reject the whole month's Promise.all. dayRetries=0
+ * preserves the nightly writer's fail-fast behavior.
+ */
+async function fetchDayWithRetry(day, dayRetries) {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await fetchDayProspects(day);
+    } catch (err) {
+      if (attempt >= dayRetries) throw err;
+      const backoff = 1000 * 2 ** attempt; // 1s, 2s, 4s, …
+      console.warn(`[Scorecard] day ${day} fetch failed (attempt ${attempt + 1}/${dayRetries + 1}): ${err.message} — retry in ${backoff}ms`);
+      await sleep(backoff);
+      attempt += 1;
+    }
+  }
+}
+
+/**
  * Fetch every prospect that changed within [periodStart, periodEnd], one ET day
  * at a time (see the DAY_PAGE_SIZE note above for why a single wide sweep can't),
  * fetched in small concurrent batches, then unioned deduped by cst_id — a
  * prospect that changed on several days appears in several daily pulls. Throws on
  * LP failure so the caller can abort the write.
+ *
+ * @param {{ dayRetries?: number }} [opts] per-day retry count (default 0 = fail-fast).
  */
-export async function fetchAllProspects(periodStart, periodEnd) {
+export async function fetchAllProspects(periodStart, periodEnd, { dayRetries = 0 } = {}) {
   const days = [];
   for (let day = periodStart; day <= periodEnd; day = nextDay(day)) days.push(day);
 
   const byCst = new Map(); // cst_id -> prospect; flags are current as of this run
   let anon = 0;            // prospects without a cst_id get a synthetic key so none drop
   for (let i = 0; i < days.length; i += FETCH_CONCURRENCY) {
-    const pages = await Promise.all(days.slice(i, i + FETCH_CONCURRENCY).map(fetchDayProspects));
+    const pages = await Promise.all(days.slice(i, i + FETCH_CONCURRENCY).map((d) => fetchDayWithRetry(d, dayRetries)));
     for (const items of pages) {
       for (const p of items) {
         const cst = getField(p, 'cst_id', 'CST_ID');
@@ -223,9 +246,9 @@ export async function partitionProspectsByMarket(prospects, { branchFirst = true
  *
  * @returns {Promise<{ prospects: object[], markets: Record<string, object[]>, resolveStats: object }>}
  */
-export async function fetchAndPartition({ periodStart, periodEnd, branchFirst = true }) {
+export async function fetchAndPartition({ periodStart, periodEnd, branchFirst = true, dayRetries = 0 }) {
   const fetchStart = minusDays(periodStart, PULL_LOOKBACK_DAYS);
-  const prospects = await fetchAllProspects(fetchStart, periodEnd);
+  const prospects = await fetchAllProspects(fetchStart, periodEnd, { dayRetries });
   const { markets, resolveStats } = await partitionProspectsByMarket(prospects, { branchFirst });
   return { prospects, markets, resolveStats };
 }
