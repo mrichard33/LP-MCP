@@ -376,6 +376,10 @@ export async function computeGoalScorecard(opts = {}) {
       provisional_gross_dollars: null, provisional_days: null, provisional_basis: PROVISIONAL_BASIS,
     };
     const net = rev.released_dollars; // authoritative RTP net (null when no report — never 0)
+    // Funnel SOLD-basis net (= sold gross − cancellations = released+working+other), captured
+    // BEFORE the RTP overwrite below — it drives Good Rate on a single sold basis, matching the
+    // closed-month re-derive. NEVER mixed with RTP net.
+    const soldNet = row.net_sales;
     // released_dollars / net_sales / good_business move together and are ALL NULL when pending
     // (never 0) — one rule, no 0-vs-NULL ambiguity. YTD sums must COALESCE(net_sales,0) at the
     // summation site (the dashboard's num() already coerces null→0).
@@ -390,10 +394,12 @@ export async function computeGoalScorecard(opts = {}) {
     row.reconciled = rev.reconciled;  // report-backed ⇒ reconciled (provisional banner off)
     row.provisional_gross_dollars = rev.provisional_gross_dollars;
     row.provisional_days = rev.provisional_days;
-    // Revenue ratios re-derived from the authoritative net (gross_sales stays funnel-basis).
+    // NSLI / Avg Sale keep the authoritative RTP-net numerator (gross_sales stays funnel-basis).
     row.nsli = net == null ? null : rmoney(net, row.issued || 0);
     row.avg_sale = net == null ? null : rmoney(net, row.net_close || 0);
-    row.good_rate_pct = net == null ? null : rrate(net, row.gross_sales || 0);
+    // Good Rate — single SOLD basis: (sold gross − cancellations) ÷ sold gross. Funnel-only, so
+    // it is computable even for a report-less (pending-revenue) month.
+    row.good_rate_pct = rrate(soldNet, row.gross_sales || 0);
     // The RTP-net basis has no released/working/other/cancelled split — drop the v1 revenue
     // buckets so the nightly validator's net-identity check skips them (they no longer describe
     // the stored net). Funnel diagnostics (status_tally, issue_diag, …) are retained.
