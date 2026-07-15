@@ -160,7 +160,9 @@ export async function rederiveMarketFunnel(opts = {}) {
   const targets = await discoverClosedMonths(opts.months);
   if (!targets.length) return { success: true, months: 0, note: 'no closed net_report_rtp months' };
 
-  if (!dryRun) await ensureRtpGrossColumn();
+  // Ensure the rtp_gross_dollars column exists BEFORE loadFrozenLatest selects it —
+  // in dry-run too (the read needs it), not only on apply.
+  await ensureRtpGrossColumn();
 
   const perMonth = [];
   let monthsWritten = 0;
