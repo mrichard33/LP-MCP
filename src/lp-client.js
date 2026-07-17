@@ -702,23 +702,28 @@ export async function addLead(fields = {}) {
   const preferPath = (fields._prefer_path === 'rest') ? 'rest' : 'legacy';
   delete cleanFields._prefer_path;
 
+  // Optional legacy-path retry budget. Default 2 preserves the historical
+  // behavior for every existing caller; the canvassing webhook passes 3.
+  const attempts = Math.max(1, Number(fields._attempts) || 2);
+  delete cleanFields._attempts;
+
   console.log(`[LP] addLead → trying ${preferPath.toUpperCase()} path first: firstname=${cleanFields.firstname}, phone=${cleanFields.phone}, srs_id=${cleanFields.srs_id}, pro_id=${cleanFields.pro_id || '(none)'}, email=${cleanFields.email || '(none)'}, lognumber=${cleanFields.lognumber || '(none)'}, apptdate=${cleanFields.apptdate || '(none)'}, appttime=${cleanFields.appttime || '(none)'}`);
 
   if (preferPath === 'legacy') {
-    return _addLeadLegacyFirst(cleanFields);
+    return _addLeadLegacyFirst(cleanFields, attempts);
   }
-  return _addLeadRestFirst(cleanFields);
+  return _addLeadRestFirst(cleanFields, attempts);
 }
 
 /**
  * Legacy-first ordering: try lppost, fall back to REST on failure.
  * This is the default path as of 2026-05-02.
  */
-async function _addLeadLegacyFirst(cleanFields) {
+async function _addLeadLegacyFirst(cleanFields, attempts = 2) {
   // ─── PATH 1: Legacy lppost (preferred) ──────────────────────────
   let legacyErr = null;
   try {
-    const result = await _callLegacyAddLead(cleanFields);
+    const result = await _callLegacyAddLead(cleanFields, attempts);
     return { ...(result || {}), _path: 'legacy' };
   } catch (err) {
     legacyErr = err;
@@ -738,7 +743,7 @@ async function _addLeadLegacyFirst(cleanFields) {
  * REST-first ordering: try /api/Leads/LeadAdd, fall back to lppost.
  * Available via { _prefer_path: 'rest' } for explicit opt-in.
  */
-async function _addLeadRestFirst(cleanFields) {
+async function _addLeadRestFirst(cleanFields, attempts = 2) {
   // ─── PATH 1: REST ────────────────────────────────────────────────
   let restErr = null;
   try {
@@ -751,7 +756,7 @@ async function _addLeadRestFirst(cleanFields) {
 
   // ─── PATH 2: Legacy fallback ────────────────────────────────────
   try {
-    const result = await _callLegacyAddLead(cleanFields);
+    const result = await _callLegacyAddLead(cleanFields, attempts);
     return { ...(result || {}), _path: 'legacy', _rest_error: restErr?.message?.slice(0, 200) };
   } catch (legacyErr) {
     throw new Error(`addLead failed: REST=${restErr?.message?.slice(0, 150) || 'unknown'}; LEGACY=${legacyErr.message.slice(0, 150)}`);
@@ -783,15 +788,16 @@ async function _callRestLeadAdd(cleanFields) {
 }
 
 /**
- * Two-attempt legacy lppost call. Retries once with 2s backoff on
- * transient failures (network, 5xx). Throws on any final failure.
+ * Legacy lppost call with retries. Default 2 attempts (historical
+ * behavior); backoff is exponential (2s, 4s, 8s, ...) on transient
+ * failures (network, 5xx). Throws on any final failure.
  */
-async function _callLegacyAddLead(cleanFields) {
+async function _callLegacyAddLead(cleanFields, attempts = 2) {
   const legacyFields = _translateToLegacy(cleanFields);
   const url = LP_POST_URL();
 
   let lastErr = null;
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 30000);
@@ -824,11 +830,12 @@ async function _callLegacyAddLead(cleanFields) {
       return result || {};
     } catch (err) {
       lastErr = err;
-      if (attempt === 2) {
-        throw new Error(`lppost addlead failed after 2 attempts: ${err.message.slice(0, 200)}`);
+      if (attempt === attempts) {
+        throw new Error(`lppost addlead failed after ${attempts} attempt(s): ${err.message.slice(0, 200)}`);
       }
-      console.warn(`[LP] addLead legacy attempt ${attempt} failed, retrying in 2s: ${err.message}`);
-      await sleep(2000);
+      const backoffMs = 2000 * 2 ** (attempt - 1);
+      console.warn(`[LP] addLead legacy attempt ${attempt} failed, retrying in ${backoffMs / 1000}s: ${err.message}`);
+      await sleep(backoffMs);
     }
   }
   // Unreachable but keeps the type checker happy.

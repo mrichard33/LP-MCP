@@ -82,6 +82,8 @@ import { registerCoolingCallbackRoutes } from './cooling-callback-handler.js';
 import { registerEntryEventRoutes } from './entry-event-handler.js';
 // ─── GHL Tag Webhook Bridge (Wave 1.2) ──────────────────────────
 import { registerGhlTagRoutes } from './ghl-tag-handler.js';
+// ─── Canvassing Pilot v2 intake (I.CV → LP) ──────────────────────
+import { registerCanvassingLeadRoutes } from './canvassing-lead-handler.js';
 // ─── IME MIC Integration ─────────────────────────────────────────
 import { registerImeRoutes, startImeWorkers } from './ime/index.js';
 // ─── MVI v2.5 — Antifragile services ─────────────────────────────
@@ -573,6 +575,9 @@ registerEntryEventRoutes(app);
 
 // ─── GHL Tag Webhook Bridge ──────────────────────────────────────
 registerGhlTagRoutes(app);
+
+// ─── Canvassing Pilot v2 intake (I.CV → LP) ──────────────────────
+registerCanvassingLeadRoutes(app);
 
 // ─── GHL Inbound → LP Note pipeline ──────────────────────────────
 // Turns GHL inbound conversations into one clean facts-only LP note per

@@ -44,7 +44,7 @@ import supabase from '../../supabase.js';
 import { sendGroupMeMessage } from '../../groupme.js';
 import { checkForActionRef } from '../../groupme-read.js';
 import { interpolatePayload } from '../helpers.js';
-import { formatDateTime } from '../../format-helpers.js';
+import { formatDateTime, formatDateTimeUS } from '../../format-helpers.js';
 import { resolveContactInfo, resolveLPProspectId } from '../resolvers.js';
 import { buildNotificationEnrichment, buildRichNotification, formatCalcSummary } from '../enrichment.js';
 import {
@@ -57,6 +57,31 @@ import {
 
 const LOG_PREVIEW_CHARS = 600;
 const RECOVERY_HISTORY_LIMIT = 50;
+
+/**
+ * 2026-07-15 — Canvassing Pilot v2 (TIME CHANGE card support).
+ * Derive `{{old_appt_time}}` / `{{new_appt_time}}` interpolation keys from
+ * an event payload, rendered in ET via formatDateTimeUS. Canonical payload
+ * keys (first match wins):
+ *   old: old_appointment_time | previous_appointment_time | old_start_time
+ *   new: new_appointment_time | appointment_start_time    | new_start_time
+ * Values that don't parse pass through as-is (a Layer-3 extraction may
+ * already be a human phrase like "Thu 2:00 PM").
+ */
+export function buildApptChangeContext(eventPayload = {}) {
+  const pick = (...keys) => {
+    for (const k of keys) {
+      const v = eventPayload?.[k];
+      if (v !== undefined && v !== null && String(v).trim() !== '') return String(v);
+    }
+    return '';
+  };
+  const fmtEt = (v) => (v ? (formatDateTimeUS(v) || v) : '');
+  return {
+    old_appt_time: fmtEt(pick('old_appointment_time', 'previous_appointment_time', 'old_start_time')),
+    new_appt_time: fmtEt(pick('new_appointment_time', 'appointment_start_time', 'new_start_time')),
+  };
+}
 
 /**
  * 2026-05-11 — check whether this (rule_applied, target_id) recently
@@ -178,6 +203,8 @@ export async function executeSendNotification(action, context) {
     calc_estimate: enrichment.calcEstimate || '',
     calc_summary: calcSummary || '',
     appointment_datetime: appointmentDisplay || '',
+    // 2026-07-15 — canvass TIME CHANGE card keys (old → new in ET).
+    ...buildApptChangeContext(context),
   };
 
   const payload = interpolatePayload(action.action_payload, enrichedContext);
@@ -244,7 +271,15 @@ export async function executeSendNotification(action, context) {
   }
 
   // Rep-facing send — passes contactId for v1.7 debounce consolidation.
-  await sendGroupMeMessage(full, { contactId, contactName: name });
+  // 2026-07-15 — rules may route to a per-purpose channel ('canvass' →
+  // GROUPME_CANVASS_BOT_ID) and/or bypass the debounce with flushNow
+  // (work-queue cards like SMS-CONFIRMED / TIME CHANGE).
+  await sendGroupMeMessage(full, {
+    contactId,
+    contactName: name,
+    channel: payload.channel || undefined,
+    flushNow: payload.flushNow === true || payload.flush_now === true,
+  });
   return {
     action: 'groupme_sent',
     format: formatPath,

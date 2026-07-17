@@ -172,8 +172,12 @@ import {
   isInHomeCalendarId,
 } from './knowledge/booking-calendar-router.js';
 import { CALENDAR_MAP } from './actions/constants.js';
-import { applyGHLTag } from './ghl.js';
+import { applyGHLTag, getGHLContact } from './ghl.js';
 import supabase from './supabase.js';
+// ─── Canvassing Pilot v2 (A.CV conf flow) — time-aware reschedule options ───
+import { computeRescheduleOptions } from './reschedule-options.js';
+import { lpWallClockToGhlStartTime } from './appointment-dates.js';
+import { formatDateTimeUS } from './format-helpers.js';
 import { callLLM, resolveLLM } from './llm-client.js';
 import {
   buildIdentityState,
@@ -1180,6 +1184,19 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     parts.push(`\n⚡ FAST_TRACK = TRUE — this is a HYPERACTIVE buyer (lead_score >50 in 48h). Skip education. Apply BOOKING — ASK-FIRST PROTOCOL with TWO specific time slots. Do NOT punt to a calendar widget.`);
   }
 
+  // ─── Canvassing Pilot v2: conf-flow context (A.CV SMS confirmation) ───
+  // Server-computed values only — the bot NEVER does calendar math.
+  if (opts.confFlowContext) {
+    const cfc = opts.confFlowContext;
+    parts.push(`\n═══════ CANVASS CONFIRMATION FLOW — SERVER-COMPUTED CONTEXT ═══════`);
+    parts.push(`This contact is in the canvassing SMS confirmation flow (appointment within 48 hours).`);
+    parts.push(`Current date/time (ET): {current_datetime_et} = ${cfc.current_datetime_et}`);
+    parts.push(`Appointment being discussed (ET): {current_appt_et} = ${cfc.current_appt_et}`);
+    parts.push(`Pre-computed valid reschedule options (already exclude the declined slot, business hours enforced, phrased relative to today): {option_a} = "${cfc.option_a}", {option_b} = "${cfc.option_b}".`);
+    parts.push(`If a decision maker can't make it, offer EXACTLY these two options with the alternative-of-choice close: "No problem — would ${cfc.option_a} or ${cfc.option_b} work better for you both?" Never invent times, never show a slot menu, never more than two choices, never re-offer the declined time, never offer a past time. Their counter-preference always beats your offer. Map categories silently: morning = 10 AM, afternoon = 2 PM, evening = 6 PM.`);
+    parts.push(`═══════ END CANVASS CONFIRMATION FLOW ═══════`);
+  }
+
   if (opts.editInstruction && opts.previousMessage) {
     parts.push(`\n═══════ HUMAN CORRECTION ON PRIOR ATTEMPT — INCORPORATE THIS ═══════`);
     parts.push(`A prior generation for this exact inbound was reviewed by a human and sent back for revision.`);
@@ -2084,6 +2101,88 @@ function makeShortCircuitResult(classification, channel, triggerMessage) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// CANVASS CONFIRMATION FLOW (Pilot v2 / A.CV) — merge-key injection
+//
+// "The bot phrases, the server computes." When a contact carries BOTH
+// conf-flow-active and canvass-v2, the reply prompt receives four
+// pre-computed values — {current_datetime_et}, {current_appt_et},
+// {option_a}, {option_b} — and any of those single-brace keys the model
+// emits are substituted before dispatch. The bot never does calendar
+// math; reschedule options come from computeRescheduleOptions (DST-safe,
+// business-hours-aware, never the declined slot, never Sunday evening).
+// ═══════════════════════════════════════════════════════════════════
+
+export const CONF_FLOW_MERGE_KEYS = ['current_datetime_et', 'current_appt_et', 'option_a', 'option_b'];
+
+/**
+ * Resolve the appointment under discussion and compute the conf-flow
+ * merge values. Returns null when no appointment is known — the prompt
+ * block is then never injected and no substitution runs, so the model
+ * can't emit dangling keys.
+ *
+ * Appointment precedence:
+ *   1. context.lp.appointment_date — authoritative once LP holds the
+ *      lead. NOTE: lp_leads stores ET wall-clock digits mislabeled as
+ *      UTC; lpWallClockToGhlStartTime() restores the true instant.
+ *      (formatDateTimeUS on the raw value would shift it 4-5h.)
+ *   2. GHL custom field via CANVASS_PREFERRED_TIME_FIELD_ID (env-gated;
+ *      one extra contact fetch, only in the fresh-lead window before the
+ *      LP callback/sync lands).
+ */
+export async function buildConfFlowContext(contactId, context, { now = new Date(), fetchContact = getGHLContact } = {}) {
+  let apptInstant = null;
+
+  const lpApptRaw = context?.lp?.appointment_date;
+  if (lpApptRaw && context?.lp?.appointment_is_past !== true) {
+    const iso = lpWallClockToGhlStartTime(lpApptRaw);
+    if (iso) apptInstant = new Date(iso);
+  }
+
+  const fieldId = process.env.CANVASS_PREFERRED_TIME_FIELD_ID;
+  if (!apptInstant && fieldId) {
+    try {
+      const contact = await fetchContact(contactId);
+      const cf = Array.isArray(contact?.customFields)
+        ? contact.customFields.find((f) => f.id === fieldId)
+        : null;
+      const rawValue = cf?.value ?? cf?.fieldValue ?? null;
+      if (rawValue) {
+        const parsed = new Date(rawValue);
+        if (!Number.isNaN(parsed.getTime())) apptInstant = parsed;
+      }
+    } catch (err) {
+      console.warn(`[ResponseGenerator] conf-flow appt field fetch failed for ${contactId}: ${err.message}`);
+    }
+  }
+
+  if (!apptInstant || Number.isNaN(apptInstant.getTime())) return null;
+
+  const options = computeRescheduleOptions(apptInstant, now);
+  if (options.length < 2) return null;
+
+  return {
+    current_datetime_et: formatDateTimeUS(now),
+    current_appt_et: formatDateTimeUS(apptInstant),
+    option_a: options[0].phrase,
+    option_b: options[1].phrase,
+  };
+}
+
+/**
+ * Literal substitution of the four conf-flow merge keys (single-brace —
+ * distinct from GHL's {{double-brace}} merge tags, which pass through
+ * untouched). Exported for tests.
+ */
+export function applyConfFlowMergeKeys(text, confFlowContext) {
+  if (!text || !confFlowContext) return text;
+  let out = String(text);
+  for (const key of CONF_FLOW_MERGE_KEYS) {
+    out = out.replaceAll(`{${key}}`, confFlowContext[key] ?? '');
+  }
+  return out;
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // MAIN EXPORT (v2.7.8 — fetches upcoming appointments for cancel flow)
 // ═══════════════════════════════════════════════════════════════════
 
@@ -2134,6 +2233,23 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
 
   const hasExistingAppt = !!context.lp?.appointment_set;
   const lpDisposition   = context.lp?.disposition || null;
+
+  // ─── Canvassing Pilot v2: conf-flow merge-value injection ───
+  // Only when the contact carries BOTH gate tags; failures never block
+  // generation (the reply just goes out without the reschedule options).
+  let confFlowContext = null;
+  const confFlowTags = context.lead?.current_tags || [];
+  if (confFlowTags.includes('conf-flow-active') && confFlowTags.includes('canvass-v2')) {
+    try {
+      confFlowContext = await buildConfFlowContext(contactId, context);
+      if (!confFlowContext) {
+        console.log(`[ResponseGenerator] conf-flow active for ${contactId} but no appointment resolvable — merge keys not injected`);
+      }
+    } catch (err) {
+      console.warn(`[ResponseGenerator] conf-flow context build failed for ${contactId}: ${err.message} — proceeding without`);
+      confFlowContext = null;
+    }
+  }
 
   let kbPack = null;
   try {
@@ -2354,6 +2470,8 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // analyzer's call purpose (Item 5 — purpose-specific call framing).
       regenerationNote: opts.regenerationNote || null,
       callPurpose: opts.callPurpose || null,
+      // Canvassing Pilot v2: pre-computed conf-flow merge values.
+      confFlowContext,
     }
   );
   const raw = await callClaude(userPrompt);
@@ -2364,6 +2482,13 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   }
 
   validated.message = sanitizeMessageUrls(validated.message, channel, kbPack);
+
+  // Canvassing Pilot v2: resolve the conf-flow single-brace merge keys the
+  // model may have used. Runs here (not in the send handler) so every
+  // dispatch path — executor sends, GroupMe Edit-X regeneration — is covered.
+  if (confFlowContext) {
+    validated.message = applyConfFlowMergeKeys(validated.message, confFlowContext);
+  }
 
   const mergeTagInMessage = BARE_MERGE_TAG_RX.test(validated.message);
   const availSummary = availability
