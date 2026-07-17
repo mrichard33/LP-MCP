@@ -104,11 +104,14 @@ async function loadFrozenLatest(periodStart) {
 
 /** Build the funnel-only UPDATE payload for one market from its measured actuals. */
 function buildFunnelUpdate(measured, frozen) {
-  const { leads, sets, issued, net_issue, demos, sales, net_close, ko_count,
-    gross_sales, released_dollars, working_dollars, other_pending } = measured;
-  // Funnel SOLD net = gross − cancellations = released+working+other (all from THIS
-  // measurement — one basis, one cohort). Never released_dollars (RTP net).
-  const soldNet = n(released_dollars) + n(working_dollars) + n(other_pending);
+  const { leads, sets, issued, net_issue, demos, sales, net_close, ko_count, gross_sales } = measured;
+  // Funnel SOLD net = sold gross − cancellations, taken straight from computeActuals'
+  // net_sales (= released + working + other_pending). MUST use net_sales, not a re-sum of
+  // released/working: `other_pending` is NOT a top-level field (it lives in
+  // raw_inputs.bucket_tally), and for long-settled closed-month jobs the sold dollars land
+  // in that `other` bucket — re-summing top-level released+working alone collapses to ~0 and
+  // zeroes Good Rate. Never released_dollars (that is RTP net).
+  const soldNet = n(measured.net_sales);
   const grossSold = n(gross_sales);
   // Authoritative RTP net stays exactly as frozen (revenue untouched); it only moves to
   // the NEW measured funnel denominators for the dollars-per-event rates.
