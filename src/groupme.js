@@ -112,7 +112,29 @@ import { generateResponse } from './response-generator.js';
 
 const GROUPME_BOT_ID = process.env.GROUPME_BOT_ID || '';
 const GROUPME_GROUP_ID = process.env.GROUPME_GROUP_ID || '';
+// Per-purpose bot for the dedicated "Canvassing — SMS Confirmed" group.
+// Canvass-channel cards (SMS-CONFIRMED, TIME CHANGE, intake alerts) route
+// here; everything else stays on the main bot.
+const GROUPME_CANVASS_BOT_ID = process.env.GROUPME_CANVASS_BOT_ID || '';
 const SELF_BASE_URL = `http://localhost:${process.env.PORT || 8080}`;
+
+let warnedCanvassFallback = false;
+
+/**
+ * Resolve a logical channel name to a GroupMe bot ID. Unknown/absent
+ * channel → main bot. A configured channel whose env var is unset falls
+ * back to the main bot (warn once) so no message is ever dropped.
+ */
+function _resolveBotId(channel) {
+  if (channel === 'canvass') {
+    if (GROUPME_CANVASS_BOT_ID) return GROUPME_CANVASS_BOT_ID;
+    if (!warnedCanvassFallback) {
+      console.warn('[GroupMe] GROUPME_CANVASS_BOT_ID unset — canvass-channel messages fall back to the main bot');
+      warnedCanvassFallback = true;
+    }
+  }
+  return GROUPME_BOT_ID;
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // v1.7: DEBOUNCED CONSOLIDATION CONFIG + STATE
@@ -159,26 +181,30 @@ console.log(`[GroupMe] v1.7 debounce config: window=${NOTIFICATION_DEBOUNCE_MS}m
  *   card header. Optional; first non-null name wins for the buffer.
  * @param {boolean} [opts.flushNow]   — Force immediate send even if
  *   contactId is provided. Use for urgent operator-facing cards.
+ * @param {string} [opts.channel]     — Logical destination channel.
+ *   'canvass' → GROUPME_CANVASS_BOT_ID (falls back to the main bot with a
+ *   one-time warning when unset). Omitted/unknown → main bot.
  * @returns {Promise<{sent: boolean, reason?: string, queue_size?: number}>}
  *   sent=true: fired immediately. sent=false with reason='queued': buffered.
  *   sent=false with other reason: send failed.
  */
 export async function sendGroupMeMessage(text, opts = {}) {
-  if (!GROUPME_BOT_ID) {
+  const { contactId, contactName, flushNow, channel } = opts || {};
+  const botId = _resolveBotId(channel);
+
+  if (!botId) {
     console.log('[GroupMe] No BOT_ID — message logged only:', text.slice(0, 100));
     return { sent: false, reason: 'no_bot_id' };
   }
 
-  const { contactId, contactName, flushNow } = opts || {};
-
   // Immediate path: no contactId (system event) OR explicit flushNow
   // (approval/error/operator card). This is the v1.6-and-earlier behavior.
   if (!contactId || flushNow) {
-    return await _sendRawGroupMeMessage(text);
+    return await _sendRawGroupMeMessage(text, botId);
   }
 
   // Debounced path: queue for consolidation.
-  return _queueForConsolidation(contactId, contactName || null, text);
+  return _queueForConsolidation(contactId, contactName || null, text, channel);
 }
 
 /**
@@ -187,12 +213,12 @@ export async function sendGroupMeMessage(text, opts = {}) {
  * when a buffer's timer fires. Approval-card senders also call this
  * indirectly via sendGroupMeMessage(text) (no opts → immediate path).
  */
-async function _sendRawGroupMeMessage(text) {
+async function _sendRawGroupMeMessage(text, botId = GROUPME_BOT_ID) {
   try {
     const res = await fetch('https://api.groupme.com/v3/bots/post', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bot_id: GROUPME_BOT_ID, text: text.slice(0, 1000) }),
+      body: JSON.stringify({ bot_id: botId, text: text.slice(0, 1000) }),
       signal: AbortSignal.timeout(10000),
     });
     if (!res.ok) {
@@ -211,8 +237,12 @@ async function _sendRawGroupMeMessage(text) {
 // v1.7: DEBOUNCE QUEUE INTERNALS
 // ═══════════════════════════════════════════════════════════════════
 
-function _queueForConsolidation(contactId, contactName, text) {
-  const existing = pendingNotifications.get(contactId);
+function _queueForConsolidation(contactId, contactName, text, channel) {
+  // Buffers are keyed per channel+contact: canvass and main cards for the
+  // same contact are different operator streams and must flush to their
+  // own bots, never consolidate into one card.
+  const bufferKey = `${channel || 'main'}:${contactId}`;
+  const existing = pendingNotifications.get(bufferKey);
 
   if (existing) {
     // Buffer cap check — flush immediately if full, then open a new one
@@ -220,7 +250,7 @@ function _queueForConsolidation(contactId, contactName, text) {
     if (existing.lines.length >= MAX_CONSOLIDATED_LINES) {
       console.log(`[GroupMe] queue cap hit for contact=${contactId} (${MAX_CONSOLIDATED_LINES} lines), flushing early`);
       clearTimeout(existing.timer);
-      pendingNotifications.delete(contactId);
+      pendingNotifications.delete(bufferKey);
       // Don't await — fire-and-forget so the new buffer opens promptly
       _flushBuffer(existing).catch(err =>
         console.warn(`[GroupMe] early-cap flush failed for ${contactId}: ${err.message}`)
@@ -244,13 +274,14 @@ function _queueForConsolidation(contactId, contactName, text) {
   const buf = {
     contactId,
     contactName: contactName || null,
+    channel: channel || null,
     lines: [text],
     firstQueuedAt: Date.now(),
     timer: null,
   };
-  pendingNotifications.set(contactId, buf);
+  pendingNotifications.set(bufferKey, buf);
   buf.timer = setTimeout(() => {
-    _flushContact(contactId).catch(err =>
+    _flushContact(bufferKey).catch(err =>
       console.warn(`[GroupMe] flush timer failed for ${contactId}: ${err.message}`)
     );
   }, NOTIFICATION_DEBOUNCE_MS);
@@ -258,27 +289,30 @@ function _queueForConsolidation(contactId, contactName, text) {
   return { sent: false, reason: 'queued', queue_size: 1 };
 }
 
-async function _flushContact(contactId) {
-  const buf = pendingNotifications.get(contactId);
+async function _flushContact(bufferKey) {
+  const buf = pendingNotifications.get(bufferKey);
   if (!buf) return; // already flushed by a cap-hit path
-  pendingNotifications.delete(contactId);
+  pendingNotifications.delete(bufferKey);
   await _flushBuffer(buf);
 }
 
 async function _flushBuffer(buf) {
   const elapsed = Date.now() - buf.firstQueuedAt;
+  // Resolve the bot at flush time so env fallback behavior matches the
+  // immediate-send path.
+  const botId = _resolveBotId(buf.channel);
 
   if (buf.lines.length === 1) {
     // Single message — send as-is, no consolidation header. Caller still
     // gets the 5s delay (cost of opt-in), but the message format is
     // identical to what they passed in.
     console.log(`[GroupMe] flushed contact=${buf.contactId} lines=1 elapsed_ms=${elapsed} (single, no header)`);
-    return await _sendRawGroupMeMessage(buf.lines[0]);
+    return await _sendRawGroupMeMessage(buf.lines[0], botId);
   }
 
   const consolidated = _buildConsolidatedCard(buf);
   console.log(`[GroupMe] flushed contact=${buf.contactId} lines=${buf.lines.length} elapsed_ms=${elapsed} consolidated_chars=${consolidated.length}`);
-  return await _sendRawGroupMeMessage(consolidated);
+  return await _sendRawGroupMeMessage(consolidated, botId);
 }
 
 function _buildConsolidatedCard(buf) {
@@ -317,10 +351,11 @@ function _buildConsolidatedCard(buf) {
  */
 function snapshotPendingQueue() {
   const out = [];
-  for (const [contactId, buf] of pendingNotifications.entries()) {
+  for (const [, buf] of pendingNotifications.entries()) {
     out.push({
-      contact_id: contactId,
+      contact_id: buf.contactId,
       contact_name: buf.contactName,
+      channel: buf.channel || 'main',
       lines: buf.lines.length,
       first_queued_at: new Date(buf.firstQueuedAt).toISOString(),
       ms_in_buffer: Date.now() - buf.firstQueuedAt,

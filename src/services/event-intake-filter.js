@@ -132,6 +132,10 @@ const ALLOWED_EVENT_TYPES = new Set([
                                    // (S13_BOOKING_PUSH_TIMEOUT_REISSUE / _TO_S22).
                                    // agentic.hold_error is NOT listed — its intake
                                    // emits with bypass_filter (observability only).
+  'canvassing.lead_created',       // 2026-07-15 — Canvassing Pilot v2 intake
+                                   // (/webhooks/canvassing-lead). Consumed by the
+                                   // A.CV rule set; ACV_ENROLL_E4_NO_APPT joins at
+                                   // cutover for appointment_set=false knocks.
   'agentic.disposition_mirror_refreshed', // 2026-07-07 — stale-CXL rebook guard
                                    // (disposition-staleness-guard.js). Observability
                                    // + future rule hook; no consuming rule yet.
