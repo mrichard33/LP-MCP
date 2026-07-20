@@ -26,6 +26,31 @@
  *      routing telemetry — distinct from ghl.entry_detected so it does
  *      not trigger Route B rules.
  *
+ * v2.2 — 2026-07-20. SUPPRESSION GUARD (Fix 0a). ensure-routing-tags now
+ *        refuses to write routing tags for a contact carrying any
+ *        suppression tag (dnc, stage:dnc, dnc-sms, do-not-contact,
+ *        unsubscribed, stop-bot).
+ *
+ *        Root cause it closes: this handler was one of two paths that
+ *        resurrected a DNC'd contact in the 2026-07-20 lead-routing
+ *        audit. HARD_DISQUALIFIED_CLOSEOUT correctly purged contact
+ *        wOxHXU8Z13ZbX99KZrXR at 2026-06-16 13:09 — 45 actions,
+ *        remove_all: true, active-entry:canvassing stripped. At 22:21:28
+ *        this handler put active-entry:canvassing straight back, because
+ *        it only asked "is active-entry:* missing?" and never "should it
+ *        be?". With the entry route live again nothing prevented a later
+ *        enrollment into F.0; DNC contacts received 34 outbound marketing
+ *        messages over the following 30 days.
+ *
+ *        The conceptual error was treating a deliberate purge as drift.
+ *        On a suppressed contact the ABSENCE of active-entry:* is the
+ *        correct state. A safety net that backfills it is not a safety
+ *        net, it is a resurrection path.
+ *
+ *        The guard sits BEFORE the already-has-active-entry check so the
+ *        suppressed event fires either way — how often this path is asked
+ *        to resurrect someone is exactly the signal we lacked.
+ *
  * v2.1 — 2026-05-21. bypass_filter:true on the two v2.0 observability
  *        emits. These events are pure telemetry with no rule consumer,
  *        so applyIntakeFilter() was silently dropping them — never a
@@ -41,6 +66,7 @@
 import { emitEvent } from './event-emitter.js';
 import { executeAddTag } from './actions/handlers/tags.js';
 import { resolveEntryFromSourceMap, entryTagSuffix } from './entry-source-map.js';
+import { isSuppressed, matchedSuppressionTags } from './suppression-guard.js';
 
 // Routing fix Step 2 — map-driven entry resolution. Default OFF so a merge is
 // a no-op; flipped to 'true' on Railway `dev` only after deploy. When OFF, both
@@ -201,7 +227,7 @@ async function handleEntryEvent(req, res) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// SAFETY NET — /webhook/ghl/ensure-routing-tags  (v2.0)
+// SAFETY NET — /webhook/ghl/ensure-routing-tags  (v2.0, guarded v2.2)
 // ═══════════════════════════════════════════════════════════════════
 
 async function fetchContactRaw(contactId) {
@@ -365,6 +391,50 @@ async function handleEnsureRoutingTags(req, res) {
   }
 
   const tags = contact?.tags || [];
+
+  // 1a. v2.2 SUPPRESSION GUARD (Fix 0a) — refuse to re-arm routing state.
+  //
+  // This check comes BEFORE the already-has-active-entry short-circuit, on
+  // purpose: we want the suppressed event to fire whether or not the contact
+  // currently carries an active-entry:* tag, because how often this path is
+  // asked to resurrect a suppressed contact is the telemetry we were missing.
+  //
+  // On a suppressed contact, a MISSING active-entry:* is the correct terminal
+  // state — it is what HARD_DISQUALIFIED_CLOSEOUT / LP_DISP_DNC deliberately
+  // produced. Backfilling it treats a purge as drift and rebuilds the exact
+  // re-entry surface the closeout tore down (audit 2026-07-20, contact
+  // wOxHXU8Z13ZbX99KZrXR: purged 13:09, re-armed here at 22:21, F.0 email
+  // resumed and ran to 2026-07-18).
+  const suppressedBy = matchedSuppressionTags(tags);
+  if (isSuppressed(tags)) {
+    console.log(`[EnsureRoutingTags] 🛑 ${contactId} suppressed by [${suppressedBy.join(', ')}] — no tags written`);
+    const suppressedBucket = Math.floor(Date.now() / (60 * 1000));
+    await emitEvent({
+      event_type: 'ghl.routing_tags_suppressed',
+      event_subtype: suppressedBy[0] || 'unknown',
+      source: 'lp_mcp_safety_net',
+      entity_type: 'contact',
+      entity_id: contactId,
+      ghl_contact_id: contactId,
+      payload: {
+        suppressed_by: suppressedBy,
+        previous_tags: tags,
+        had_active_entry: tags.some((t) => typeof t === 'string' && t.startsWith('active-entry:')),
+        reason: 'contact carries a suppression tag; routing state must not be re-armed',
+      },
+      priority: 'normal',
+      idempotency_key: `routing_suppressed_${contactId}_${suppressedBucket}`,
+      // Same rationale as v2.1 — observability event with no rule consumer.
+      bypass_filter: true,
+    });
+    return res.json({
+      status: 'suppressed',
+      contact_id: contactId,
+      suppressed_by: suppressedBy,
+      action_taken: 'none',
+    });
+  }
+
   const existing = tags.find((t) => t.startsWith('active-entry:'));
 
   // 2. Already has active-entry:* — return no-op
@@ -584,6 +654,6 @@ export function registerEntryEventRoutes(app) {
 
   console.log('[EntryEvent] Route registered: POST /webhook/ghl/entry');
   console.log('[EntryEvent] Route registered: GET  /webhook/ghl/entry/sources');
-  console.log('[EntryEvent] Route registered: POST /webhook/ghl/ensure-routing-tags  (v2.0 safety net)');
+  console.log('[EntryEvent] Route registered: POST /webhook/ghl/ensure-routing-tags  (v2.0 safety net, v2.2 suppression guard)');
   console.log('[EntryEvent] Route registered: POST /webhook/ghl/branch-fired         (v2.0 observability)');
 }
