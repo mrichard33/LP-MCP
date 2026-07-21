@@ -184,8 +184,10 @@ function recordFailure() {
 export function resetCircuit() { consecutiveFailures = 0; circuitOpen = false; }
 export function getCircuitStatus() { return { consecutiveFailures, circuitOpen }; }
 
-// Wraps an LP call with circuit breaker
-async function withCircuit(fn) {
+// Wraps an LP call with circuit breaker. Exported so ad-hoc callers
+// (e.g. the lp_api_probe admin tool) share the same breaker instead of
+// bypassing it with raw lpPost calls.
+export async function withCircuit(fn) {
   checkCircuit();
   try {
     const result = await fn();
