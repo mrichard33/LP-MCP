@@ -22,6 +22,8 @@ import {
   buildModifyOutboundCampaignXml,
   buildAddRecordToListXml,
   buildDeleteRecordFromListXml,
+  decideLifecycleNoop,
+  checkConfirmToken,
 } from '../src/five9/admin-writes.js';
 
 if (!process.argv.includes('--dry')) {
@@ -56,7 +58,10 @@ const eventShape = (subtype, entityType, entityId, extra = {}) => JSON.stringify
 section('Master flag');
 line('FIVE9_WRITES_ENABLED', process.env.FIVE9_WRITES_ENABLED ?? '(unset)');
 line('five9WritesEnabled()', five9WritesEnabled());
-out.push('  All eight handlers return { skipped: true } while this is false. Ships dark.');
+out.push('  While false, every handler runs in DRY-RUN: reads + guardrails execute,');
+out.push('  the exact SOAP body is logged ([FIVE9 WRITES][DRY-RUN] ...), the audit');
+out.push('  event fires with dry_run:true, and the action completes as (dry-run).');
+out.push('  The mutating SOAP call is NEVER made until the flag is the literal "true".');
 
 section('five9_start_campaign / five9_stop_campaign / five9_reset_campaign');
 line('SOAP method', 'startCampaign | stopCampaign (forceStopCampaign when payload.force===true) | resetCampaign');
@@ -64,6 +69,14 @@ line('inner XML', buildCampaignNameXml('REHASH OUTBOUND'));
 out.push('Guardrails:');
 verdict('OUTBOUND target allowed', () => refuseIfInbound({ name: 'REHASH OUTBOUND', type: 'OUTBOUND' }));
 verdict('INBOUND target (Main Number) refused', () => refuseIfInbound({ name: 'Main Number', type: 'INBOUND' }));
+verdict('start on RUNNING campaign → skipped no-op', () => {
+  const noop = decideLifecycleNoop('start_campaign', 'RUNNING');
+  if (noop) throw new Error(`skipped: ${noop}`);
+});
+verdict('stop on NOT_RUNNING campaign → skipped no-op', () => {
+  const noop = decideLifecycleNoop('stop_campaign', 'NOT_RUNNING');
+  if (noop) throw new Error(`skipped: ${noop}`);
+});
 out.push('Audit event:');
 out.push(eventShape('start_campaign', 'five9_campaign', 'REHASH OUTBOUND'));
 
@@ -86,6 +99,8 @@ verdict('abandon 4% without override refused', () => {
 });
 verdict('unknown field (typo) refused at build time', () => buildModifyOutboundCampaignXml('X', { maxQueTime: 2 }));
 verdict('lifecycle field via patch refused', () => buildModifyOutboundCampaignXml('X', { state: 'RUNNING' }));
+verdict('confirm_token restating campaign name accepted', () => checkConfirmToken('set_outbound_campaign', { campaign_name: 'REHASH OUTBOUND', confirm_token: 'REHASH OUTBOUND' }));
+verdict('missing confirm_token refused', () => checkConfirmToken('set_outbound_campaign', { campaign_name: 'REHASH OUTBOUND' }));
 out.push('Audit event:');
 out.push(eventShape('set_outbound_campaign', 'five9_campaign', 'REHASH OUTBOUND', { compliance: '<verdict>', verify_mismatches: '<read-back drift>' }));
 
@@ -115,14 +130,17 @@ line('inner XML', buildNumbersXml(['5551234567']));
 out.push('Guardrails:');
 verdict('removal with reason accepted', () => validateDncRemovals([{ number: '5551234567', reason: 'customer re-consented in writing 2026-07-20' }]));
 verdict('removal without reason refused', () => validateDncRemovals([{ number: '5551234567' }]));
+verdict('confirm_token restating the numbers accepted', () => checkConfirmToken('remove_numbers_from_dnc', { removals: [{ number: '5551234567', reason: 'r' }], confirm_token: '5551234567' }));
+verdict('wrong confirm_token refused', () => checkConfirmToken('remove_numbers_from_dnc', { removals: [{ number: '5551234567', reason: 'r' }], confirm_token: '5550000000' }));
 out.push('Audit event (dnc_reasons carried verbatim):');
 out.push(eventShape('remove_numbers_from_dnc', 'five9_dnc', 'dnc', { dnc_reasons: '[{ number, reason }, ...]' }));
 
 section('Serialization + gate (applies to every op above)');
-out.push('  1. FIVE9_WRITES_ENABLED !== "true"  → { skipped }   (terminal, ships dark)');
-out.push('  2. outbound_locks key five9_admin:write held → { deferred, retry_at } (one write in flight fleet-wide)');
+out.push('  1. FIVE9_WRITES_ENABLED !== "true" → DRY-RUN: reads + guardrails run, envelope logged, audit event dry_run:true, action completed (dry-run). No mutation.');
+out.push('  2. outbound_locks key five9_admin:write held → { deferred, retry_at } (one write in flight fleet-wide, held in dry-run too)');
 out.push('  3. requires_approval !== true → thrown REFUSED (handler-level belt-and-braces; queue via create_agent_action → approve_action)');
-out.push('  4. INBOUND / compliance / missing DNC reason / bad payload → thrown REFUSED (loud failed status)');
+out.push('  4. INBOUND / compliance / missing DNC reason / confirm_token mismatch / bad payload → thrown REFUSED (loud failed status, in dry-run and live alike)');
+out.push('  5. start-on-RUNNING / stop-on-NOT_RUNNING → { skipped } no-op after the state read');
 
 console.log(out.join('\n'));
 console.log('\n[DRY RUN COMPLETE] No SOAP call was made. No DB row was touched.');
