@@ -23,6 +23,9 @@ import {
   PATCHABLE_FIELDS,
   MAX_RECORDS_PER_ACTION,
   executeStartCampaign,
+  decideLifecycleNoop,
+  requiredConfirmToken,
+  checkConfirmToken,
 } from '../src/five9/admin-writes.js';
 
 test('five9WritesEnabled: ships dark — unset/false off, only literal "true" on', () => {
@@ -42,22 +45,57 @@ test('five9WritesEnabled: ships dark — unset/false off, only literal "true" on
   }
 });
 
-test('flag-off short-circuit: execute resolves skipped without lock/network/creds', async () => {
-  const saved = process.env.FIVE9_WRITES_ENABLED;
+test('flag-off = DRY-RUN: reads still run (fails on missing creds here), write seam never fires', async () => {
+  // With FIVE9_WRITES_ENABLED unset the gate goes dry-run: guardrail reads
+  // execute for real (previous_state capture). In this offline env there are
+  // no creds, so the read fails loudly BEFORE any write path — proving the
+  // dry-run path cannot silently mutate and never bypasses the read gate.
+  const saved = { flag: process.env.FIVE9_WRITES_ENABLED, u: process.env.FIVE9_USERNAME, p: process.env.FIVE9_PASSWORD };
   try {
     delete process.env.FIVE9_WRITES_ENABLED;
-    const result = await executeStartCampaign({
-      id: 1,
-      action_type: 'five9_start_campaign',
-      requires_approval: true,
-      action_payload: { campaign_name: 'X' },
-    });
-    assert.equal(result.skipped, true);
-    assert.match(result.reason, /five9_writes_disabled/);
+    delete process.env.FIVE9_USERNAME;
+    delete process.env.FIVE9_PASSWORD;
+    await assert.rejects(
+      executeStartCampaign({
+        id: 1,
+        action_type: 'five9_start_campaign',
+        requires_approval: true,
+        action_payload: { campaign_name: 'X' },
+      }),
+      /credentials not configured/
+    );
   } finally {
-    if (saved === undefined) delete process.env.FIVE9_WRITES_ENABLED;
-    else process.env.FIVE9_WRITES_ENABLED = saved;
+    for (const [k, env] of [['flag', 'FIVE9_WRITES_ENABLED'], ['u', 'FIVE9_USERNAME'], ['p', 'FIVE9_PASSWORD']]) {
+      if (saved[k] === undefined) delete process.env[env];
+      else process.env[env] = saved[k];
+    }
   }
+});
+
+test('decideLifecycleNoop: start/stop preconditions, reset unconditional', () => {
+  assert.equal(decideLifecycleNoop('start_campaign', 'RUNNING'), 'already_running');
+  assert.equal(decideLifecycleNoop('start_campaign', 'NOT_RUNNING'), null);
+  assert.equal(decideLifecycleNoop('stop_campaign', 'NOT_RUNNING'), 'already_stopped');
+  assert.equal(decideLifecycleNoop('stop_campaign', 'RUNNING'), null);
+  assert.equal(decideLifecycleNoop('reset_campaign', 'RUNNING'), null);
+  assert.equal(decideLifecycleNoop('reset_campaign', 'NOT_RUNNING'), null);
+});
+
+test('confirm_token: the two highest-risk writes must restate their target verbatim', () => {
+  // set_outbound_campaign — token = campaign name
+  assert.equal(requiredConfirmToken('set_outbound_campaign', { campaign_name: 'Rehash' }), 'Rehash');
+  assert.doesNotThrow(() => checkConfirmToken('set_outbound_campaign', { campaign_name: 'Rehash', confirm_token: 'Rehash' }));
+  assert.throws(() => checkConfirmToken('set_outbound_campaign', { campaign_name: 'Rehash' }), /confirm_token mismatch/);
+  assert.throws(() => checkConfirmToken('set_outbound_campaign', { campaign_name: 'Rehash', confirm_token: 'rehash' }), /confirm_token mismatch/);
+  // remove_numbers_from_dnc — token = comma-joined numbers
+  const payload = { removals: [{ number: '5551234567', reason: 'r1' }, { number: ' 5559876543 ', reason: 'r2' }] };
+  assert.equal(requiredConfirmToken('remove_numbers_from_dnc', payload), '5551234567,5559876543');
+  assert.doesNotThrow(() => checkConfirmToken('remove_numbers_from_dnc', { ...payload, confirm_token: '5551234567,5559876543' }));
+  assert.throws(() => checkConfirmToken('remove_numbers_from_dnc', { ...payload, confirm_token: '5551234567' }), /confirm_token mismatch/);
+  assert.throws(() => checkConfirmToken('remove_numbers_from_dnc', payload), /confirm_token mismatch/);
+  // other ops are not double-gated
+  assert.equal(requiredConfirmToken('start_campaign', { campaign_name: 'X' }), null);
+  assert.doesNotThrow(() => checkConfirmToken('start_campaign', { campaign_name: 'X' }));
 });
 
 test('refuseIfInbound: INBOUND throws, OUTBOUND/AUTODIAL pass', () => {

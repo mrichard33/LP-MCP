@@ -5,10 +5,22 @@
  *   - NEVER called from MCP tools. The ONLY caller is the action executor
  *     (src/actions/handlers/five9.js) after a row went through
  *     create_agent_action(requires_approval:true) → approve_action.
- *   - Ships dark: FIVE9_WRITES_ENABLED master flag, default false — every
- *     execute function refuses (skipped) until Mark flips the Railway var.
+ *   - Ships dark: FIVE9_WRITES_ENABLED master flag, default false. While
+ *     unset, every execute runs in DRY-RUN: all reads and guardrails run
+ *     for real, the exact SOAP body is built and logged
+ *     ("[FIVE9 WRITES][DRY-RUN] <method> ..."), the audit event fires with
+ *     dry_run:true — but the mutating SOAP call is never made and the
+ *     action completes as (dry-run). Only the literal string 'true' arms
+ *     live writes.
  *   - INBOUND campaigns are immutable: start/stop/reset/modify refuse
  *     type=INBOUND. Main Number / Dispatch are never at risk from here.
+ *   - State preconditions: starting a RUNNING campaign or stopping a
+ *     NOT_RUNNING one is a skipped no-op, never a blind re-fire.
+ *   - confirm_token double-gate on the two highest-risk writes
+ *     (five9_set_outbound_campaign, five9_remove_numbers_from_dnc): the
+ *     payload must restate its target verbatim (campaign name / the
+ *     comma-joined numbers). A typo gate for the creator — the human
+ *     forgery gate remains approve_action itself.
  *   - Read-before-write + read-back: previous_state captured before the
  *     SOAP write, new_state re-read after, both carried on the
  *     five9.admin_write audit event emitted on EVERY execution — success
@@ -106,6 +118,41 @@ export function validateDncRemovals(removals) {
     if (!reason) throw new Error(`REFUSED: DNC removal of ${number} missing reason — every removal must carry a per-number reason string`);
   }
   return removals.map(r => ({ number: String(r.number).trim(), reason: String(r.reason).trim() }));
+}
+
+/* ---------------------------------------------------------------------- *
+ * confirm_token double-gate — the two highest-risk writes must restate
+ * their target verbatim in the payload. Pure, exported for tests.
+ * ---------------------------------------------------------------------- */
+
+export function requiredConfirmToken(op, payload) {
+  if (op === 'set_outbound_campaign') {
+    return String(payload?.campaign_name || '').trim();
+  }
+  if (op === 'remove_numbers_from_dnc') {
+    return (Array.isArray(payload?.removals) ? payload.removals : [])
+      .map(r => String(r?.number ?? '').trim()).filter(Boolean).join(',');
+  }
+  return null; // op not double-gated
+}
+
+export function checkConfirmToken(op, payload) {
+  const required = requiredConfirmToken(op, payload);
+  if (required === null) return;
+  if (String(payload?.confirm_token ?? '') !== required) {
+    throw new Error(`REFUSED: confirm_token mismatch for ${op} — payload.confirm_token must exactly equal "${required}" (restate the target to confirm)`);
+  }
+}
+
+/* ---------------------------------------------------------------------- *
+ * State preconditions — lifecycle ops never blind-fire a no-op transition.
+ * Pure, exported for tests.
+ * ---------------------------------------------------------------------- */
+
+export function decideLifecycleNoop(subtype, state) {
+  if (subtype === 'start_campaign' && state === 'RUNNING') return 'already_running';
+  if (subtype === 'stop_campaign' && state === 'NOT_RUNNING') return 'already_stopped';
+  return null; // reset has no precondition (valid on stopped campaigns)
 }
 
 /* ---------------------------------------------------------------------- *
@@ -274,14 +321,16 @@ function assertNoRecordFailures(method, xml) {
 }
 
 async function withFive9WriteGate({ action, subtype, entityType, entityId }, fn) {
-  // Guardrail 1 first — before lock, before any network. Terminal skip:
-  // retrying cannot succeed until the Railway config changes.
-  if (!five9WritesEnabled()) {
-    console.log(`[FIVE9 WRITES] ${subtype} refused — FIVE9_WRITES_ENABLED != true (ships dark)`);
-    return { skipped: true, reason: 'five9_writes_disabled (FIVE9_WRITES_ENABLED != true)' };
+  // Guardrail 1 — FIVE9_WRITES_ENABLED unset/false means DRY-RUN, never a
+  // mutation: reads and guardrails run for real, the exact SOAP body is
+  // built and logged, but ctx.soap short-circuits the write itself.
+  const dryRun = !five9WritesEnabled();
+  if (dryRun) {
+    console.log(`[FIVE9 WRITES][DRY-RUN] ${subtype} — FIVE9_WRITES_ENABLED != true, previewing only`);
   }
 
   // Guardrail 4 — serialize: one Five9 admin write in flight, fleet-wide.
+  // Held in dry-run too, so previews exercise the exact live path.
   const lock = await tryAcquireLock({
     contact_id: LOCK_CONTACT,
     trigger_id: LOCK_TRIGGER,
@@ -298,7 +347,23 @@ async function withFive9WriteGate({ action, subtype, entityType, entityId }, fn)
 
   // Guardrail 3 — ctx lets fn record previous/new state progressively so the
   // failure path still carries whatever was captured before the throw.
-  const ctx = { previous_state: null, new_state: null, event_extra: {} };
+  // ctx.soap is the single mutation seam: live it calls five9SoapCall, in
+  // dry-run it records + logs the envelope and returns null.
+  const ctx = {
+    dry_run: dryRun,
+    previous_state: null,
+    new_state: null,
+    event_extra: {},
+    envelopes: [],
+    soap: async (method, innerXml) => {
+      if (dryRun) {
+        ctx.envelopes.push({ method, innerXml });
+        console.log(`[FIVE9 WRITES][DRY-RUN] would send ${method}: ${innerXml}`);
+        return null;
+      }
+      return five9SoapCall(method, innerXml);
+    },
+  };
   let result = null;
   let error = null;
   try {
@@ -319,8 +384,10 @@ async function withFive9WriteGate({ action, subtype, entityType, entityId }, fn)
       action_id: action.id ?? null,
       op: subtype,
       success: !error,
+      dry_run: dryRun,
       error: error ? error.message : null,
       request: action.action_payload ?? null,
+      ...(dryRun ? { envelopes: ctx.envelopes } : {}),
       ...ctx.event_extra,
     },
     previous_state: ctx.previous_state,
@@ -331,7 +398,13 @@ async function withFive9WriteGate({ action, subtype, entityType, entityId }, fn)
   }).catch(err => console.warn(`[FIVE9 WRITES] ${subtype} audit emit failed: ${err.message}`));
 
   if (error) throw error;
-  return { ...result, previous_state: ctx.previous_state, new_state: ctx.new_state };
+  if (result?.skipped) return result; // precondition no-op — pass through untouched
+  return {
+    ...(dryRun ? { dry_run: true, envelope_preview: ctx.envelopes } : {}),
+    ...result,
+    previous_state: ctx.previous_state,
+    new_state: ctx.new_state,
+  };
 }
 
 /* ---------------------------------------------------------------------- *
@@ -348,9 +421,11 @@ async function campaignLifecycle(action, subtype, methodFor) {
     if (!hit) throw new Error(`campaign_not_found: ${name}`);
     ctx.previous_state = hit;
     refuseIfInbound(hit);
+    const noop = decideLifecycleNoop(subtype, hit.state);
+    if (noop) return { skipped: true, reason: noop, campaign: hit.name, state: hit.state };
     const method = methodFor(payload);
-    await five9SoapCall(method, buildCampaignNameXml(hit.name));
-    ctx.new_state = await getCampaignState(hit.name);
+    await ctx.soap(method, buildCampaignNameXml(hit.name));
+    if (!ctx.dry_run) ctx.new_state = await getCampaignState(hit.name);
     return { campaign: hit.name, method, state: ctx.new_state?.state ?? null };
   });
 }
@@ -374,8 +449,9 @@ export function executeSetOutboundCampaign(action) {
   const patch = payload.patch;
   if (!name) throw new Error('five9_set_outbound_campaign requires action_payload.campaign_name');
   return withFive9WriteGate({ action, subtype: 'set_outbound_campaign', entityType: 'five9_campaign', entityId: name }, async (ctx) => {
-    // Build first — payload validation errors should fire before any read.
+    // Build + token-check first — payload errors should fire before any read.
     const bodyXml = buildModifyOutboundCampaignXml(name, patch);
+    checkConfirmToken('set_outbound_campaign', payload);
     const before = await getOutboundCampaign(name);
     if (before.error) throw new Error(`campaign_not_found: ${name}`);
     ctx.previous_state = before;
@@ -385,7 +461,10 @@ export function executeSetOutboundCampaign(action) {
     if (!compliance.ok) {
       throw new Error(`REFUSED: compliance — ${compliance.violations.join('; ')} (FCC/FTC lines; requires explicit compliance_override: true)`);
     }
-    await five9SoapCall('modifyOutboundCampaign', bodyXml);
+    await ctx.soap('modifyOutboundCampaign', bodyXml);
+    if (ctx.dry_run) {
+      return { campaign: name, patched: Object.keys(patch) };
+    }
     const after = await getOutboundCampaign(name);
     ctx.new_state = after;
     // Read-back verification: report drift, never mask a landed write.
@@ -418,12 +497,12 @@ export function executeAddRecordsToList(action) {
     ctx.previous_state = await sizeOf();
     let added = 0;
     for (const values of records) {
-      const xml = await five9SoapCall('addRecordToList', buildAddRecordToListXml(listName, fieldNames, values));
-      assertNoRecordFailures('addRecordToList', xml);
+      const xml = await ctx.soap('addRecordToList', buildAddRecordToListXml(listName, fieldNames, values));
+      if (xml !== null) assertNoRecordFailures('addRecordToList', xml);
       added += 1;
     }
-    ctx.new_state = await sizeOf();
-    return { list: listName, records_added: added };
+    if (!ctx.dry_run) ctx.new_state = await sizeOf();
+    return { list: listName, records_added: ctx.dry_run ? 0 : added, records_previewed: ctx.dry_run ? added : undefined };
   });
 }
 
@@ -435,10 +514,10 @@ export function executeDeleteRecordFromList(action) {
     const bodyXml = buildDeleteRecordFromListXml(listName, payload.field_names, payload.values, payload.list_delete_mode || 'DELETE_ALL');
     const sizeOf = async () => (await getListsInfo()).lists.find(l => l.name === listName) ?? { name: listName, size: null };
     ctx.previous_state = await sizeOf();
-    const xml = await five9SoapCall('deleteRecordFromList', bodyXml);
-    assertNoRecordFailures('deleteRecordFromList', xml);
-    ctx.new_state = await sizeOf();
-    return { list: listName, record_deleted: true };
+    const xml = await ctx.soap('deleteRecordFromList', bodyXml);
+    if (xml !== null) assertNoRecordFailures('deleteRecordFromList', xml);
+    if (!ctx.dry_run) ctx.new_state = await sizeOf();
+    return { list: listName, record_deleted: !ctx.dry_run };
   });
 }
 
@@ -449,7 +528,8 @@ export function executeAddNumbersToDnc(action) {
   if (!numbers.length) throw new Error('five9_add_numbers_to_dnc requires action_payload.numbers[]');
   return withFive9WriteGate({ action, subtype: 'add_numbers_to_dnc', entityType: 'five9_dnc', entityId: 'dnc' }, async (ctx) => {
     ctx.previous_state = await checkDncForNumbers(numbers);
-    await five9SoapCall('addNumbersToDnc', buildNumbersXml(numbers));
+    await ctx.soap('addNumbersToDnc', buildNumbersXml(numbers));
+    if (ctx.dry_run) return { numbers_submitted: numbers.length };
     ctx.new_state = await checkDncForNumbers(numbers); // read-back proves the add
     return { numbers_submitted: numbers.length, now_on_dnc: ctx.new_state.on_dnc.length };
   });
@@ -458,11 +538,13 @@ export function executeAddNumbersToDnc(action) {
 export function executeRemoveNumbersFromDnc(action) {
   const payload = action.action_payload || {};
   const removals = validateDncRemovals(payload.removals); // throws before the gate — loud
+  checkConfirmToken('remove_numbers_from_dnc', payload); // restate-the-target double gate
   const numbers = removals.map(r => r.number);
   return withFive9WriteGate({ action, subtype: 'remove_numbers_from_dnc', entityType: 'five9_dnc', entityId: 'dnc' }, async (ctx) => {
     ctx.event_extra.dnc_reasons = removals; // guardrail 6: per-number reasons on the event, verbatim
     ctx.previous_state = await checkDncForNumbers(numbers);
-    await five9SoapCall('removeNumbersFromDnc', buildNumbersXml(numbers));
+    await ctx.soap('removeNumbersFromDnc', buildNumbersXml(numbers));
+    if (ctx.dry_run) return { numbers_submitted: numbers.length };
     ctx.new_state = await checkDncForNumbers(numbers); // read-back proves the removal
     return { numbers_submitted: numbers.length, still_on_dnc: ctx.new_state.on_dnc.length };
   });
