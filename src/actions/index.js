@@ -29,7 +29,7 @@
  *   originating system_events row by action.event_id when they need
  *   structural fields like event.id or event.payload.message_id.
  *
- * Supported action types (27):
+ * Supported action types (35):
  *   add_tag, remove_tag, set_stage, move_opportunity, update_opportunity,
  *   remove_from_workflow, add_to_workflow, book_appointment,
  *   cancel_appointment, reschedule_appointment, update_appointment_status,
@@ -38,7 +38,11 @@
  *   update_lp_dnc_status, update_custom_fields, update_contact_email,
  *   calculate_time_lapse_tier, send_message, layer3_dispatch, emit_event,
  *   compute_rescission_dispatch, check_eligibility, compute_risk_score,
- *   check_throttle, classify_bucket.
+ *   check_throttle, classify_bucket,
+ *   five9_start_campaign, five9_stop_campaign, five9_reset_campaign,
+ *   five9_set_outbound_campaign, five9_add_records_to_list,
+ *   five9_delete_record_from_list, five9_add_numbers_to_dnc,
+ *   five9_remove_numbers_from_dnc (2026-07-21 Phase C — gated Five9 writes).
  *
  * 2026-05-01 — added create_lp_lead (Jane recovery). Closes the
  * chatbot-in-session-booking gap that left contacts out of LP because
@@ -167,6 +171,9 @@ import { executeClassifyLeadState } from './handlers/lead-state.js';
 // 2026-07-06 (Bot 2/3/4 consolidation) — GHL contact-note writer (escalation
 // context summaries) + dispatch-param interpolation.
 import { executeAddNote } from './handlers/notes.js';
+// 2026-07-21 Phase C — Five9 gated writes (one dispatcher for all eight
+// five9_* action types; guardrails + audit live in src/five9/admin-writes.js)
+import { executeFive9Write } from './handlers/five9.js';
 import { interpolatePayload } from './helpers.js';
 
 // MVI v2.5 — fetch the source event for a given action. The shared
@@ -369,6 +376,16 @@ const ACTION_HANDLERS = {
   resolve_objection_state: executeResolveObjectionState, // 2026-07-11 — close an open loss state (hard_loss is transition-terminal) on re-engagement
   classify_lead_state: executeClassifyLeadState, // 2026-06-02 — Phase 2 lead-state classifier + S4.5 enrollment (reactive invoker)
   end_agentic_handoff: (action) => endAgenticHandoff(action.target_id), // 2026-06-16 — silent agentic-active teardown on terminal closeout
+  // 2026-07-21 Phase C — Five9 gated writes. Ships dark (FIVE9_WRITES_ENABLED
+  // unset → every one of these skips). Must be queued requires_approval=true.
+  five9_start_campaign: executeFive9Write,
+  five9_stop_campaign: executeFive9Write,
+  five9_reset_campaign: executeFive9Write,
+  five9_set_outbound_campaign: executeFive9Write,
+  five9_add_records_to_list: executeFive9Write,
+  five9_delete_record_from_list: executeFive9Write,
+  five9_add_numbers_to_dnc: executeFive9Write,
+  five9_remove_numbers_from_dnc: executeFive9Write,
 };
 
 // Handlers that need the triggering event's payload injected as context.
@@ -414,7 +431,10 @@ const CONTEXT_AWARE_HANDLERS = new Set([
 // Deliberately NOT gated: appointment actions (cancel/reschedule may be the
 // direct fulfillment of an explicit customer request), LP DNC writes
 // (compliance must always land), notifications/tasks (rep-facing, not
-// contact-facing), and read/compute actions.
+// contact-facing), and read/compute actions. The five9_* writes are also
+// NOT here — their target_id is a campaign/list name, not a GHL contact,
+// so the stop-bot contact-tag lookup doesn't apply; they carry their own
+// gates (FIVE9_WRITES_ENABLED + approve_action + fleet-wide write lock).
 const MUTATION_GATED_ACTION_TYPES = new Set([
   'move_opportunity',
   'update_opportunity',
