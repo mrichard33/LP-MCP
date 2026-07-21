@@ -1,9 +1,12 @@
 /**
  * Five9 Configuration Web Services (Admin SOAP API) client — src/five9-admin.js
  *
- * Phase A: READ-ONLY campaign visibility. No write methods exist in this
- * module yet — when they come (startCampaign/stopCampaign/resetCampaign),
- * they go behind the approve_action gate, never direct MCP calls.
+ * Phase A+B: READ coverage — campaign inventory/state (Phase A) plus full
+ * Config-API reads (Phase B): campaign configs, profiles, lists,
+ * dispositions, skills, users, DNC checks, and the async report trio.
+ * No write methods live in this module — Phase C writes are in
+ * src/five9/admin-writes.js and execute ONLY via the approve_action gate
+ * (create_agent_action → approve_action → executor), never direct MCP calls.
  *
  * Endpoint: https://api.five9.com/wsadmin/v13/AdminWebService
  * Auth: HTTP Basic with a Five9 admin user that has the
@@ -16,9 +19,10 @@
  *   FIVE9_ADMIN_WSDL_URL  optional override of the endpoint URL
  *
  * Response parsing: the API returns SOAP/XML. We deliberately parse with
- * small targeted extractors (no XML dependency) because the response
- * shapes we consume are flat <return> blocks of scalar tags. Every parsed
- * result also carries nothing invented — unknown tags are simply absent.
+ * small targeted extractors (no XML dependency). Flat <return> blocks of
+ * scalar tags go through tag(); nested blocks (campaign configs, report
+ * rows) go through the one recursive extractor parseXmlBlock(). Every
+ * parsed result carries nothing invented — unknown tags are simply absent.
  */
 
 const ENDPOINT = process.env.FIVE9_ADMIN_WSDL_URL
@@ -116,7 +120,8 @@ export async function five9SoapCall(method, innerXml = '') {
 }
 
 // Extract every <return>...</return> block from a response.
-function returnBlocks(xml) {
+// Exported for the write-side modules under src/five9/ and offline tests.
+export function returnBlocks(xml) {
   const blocks = [];
   const re = /<return>([\s\S]*?)<\/return>/g;
   let m;
@@ -125,7 +130,8 @@ function returnBlocks(xml) {
 }
 
 // Extract a single scalar tag's text from a block ('' when absent/empty).
-function tag(block, name) {
+// Exported for the write-side modules under src/five9/ and offline tests.
+export function tag(block, name) {
   const m = new RegExp(`<${name}>([\\s\\S]*?)</${name}>`).exec(block);
   return m ? decodeXml(m[1]).trim() : '';
 }
@@ -184,4 +190,282 @@ export async function getCampaignState(campaignName) {
     return { name, state: null, error: 'campaign_not_found', source: 'getCampaigns' };
   }
   return { ...hit, source: 'getCampaigns' };
+}
+
+/* ------------------------------------------------------------------------ *
+ * Phase B — nested-response parsing + full Config-API read wrappers.
+ * ------------------------------------------------------------------------ */
+
+// Guard against prototype-polluting tag names in externally-supplied XML.
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function assignParsed(obj, key, value) {
+  if (UNSAFE_KEYS.has(key)) return;
+  if (!(key in obj)) { obj[key] = value; return; }
+  if (Array.isArray(obj[key])) obj[key].push(value);
+  else obj[key] = [obj[key], value];
+}
+
+/**
+ * parseXmlBlock — THE one recursive extractor for nested <return> blocks.
+ * Element-only subset (no attributes consumed, no CDATA, no mixed content):
+ * exactly what Five9 wsadmin emits. Repeated sibling tags collapse to
+ * arrays; leaves are decoded trimmed strings; self-closing or xsi:nil
+ * elements are null. Zero XML dependencies, linear depth-counted scan.
+ */
+export function parseXmlBlock(xml) {
+  const s = String(xml ?? '');
+  const out = {};
+  const openRe = /<([A-Za-z_][\w.:-]*)((?:\s[^>]*)?)(\/?)>/g;
+  let pos = 0;
+  while (pos < s.length) {
+    openRe.lastIndex = pos;
+    const m = openRe.exec(s);
+    if (!m) break;
+    const [full, name, attrs, selfClose] = m;
+    const openEnd = m.index + full.length;
+    if (selfClose === '/' || /xsi:nil\s*=\s*"true"/.test(attrs)) {
+      assignParsed(out, name, null);
+      pos = openEnd;
+      continue;
+    }
+    // Find the matching close tag, depth-counting same-named nested tags.
+    const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pairRe = new RegExp(`<${esc}(?:\\s[^>]*)?(/?)>|</${esc}>`, 'g');
+    pairRe.lastIndex = openEnd;
+    let depth = 1, closeStart = -1, closeEnd = -1, pm;
+    while ((pm = pairRe.exec(s)) !== null) {
+      if (pm[0].startsWith('</')) {
+        depth -= 1;
+        if (depth === 0) { closeStart = pm.index; closeEnd = pairRe.lastIndex; break; }
+      } else if (pm[1] !== '/') {
+        depth += 1;
+      }
+    }
+    if (closeStart < 0) break; // malformed tail — keep what parsed cleanly
+    const inner = s.slice(openEnd, closeStart);
+    const value = /<[A-Za-z_]/.test(inner)
+      ? parseXmlBlock(inner)
+      : decodeXml(inner).trim();
+    assignParsed(out, name, value);
+    pos = closeEnd;
+  }
+  return out;
+}
+
+// Normalize a maybe-single/maybe-array/maybe-missing parsed value to an array.
+export function asArray(v) {
+  if (v === undefined || v === null) return [];
+  return Array.isArray(v) ? v : [v];
+}
+
+// Five9 timer{days,hours,minutes,seconds} (parsed strings) -> total seconds.
+export function timerToSeconds(t) {
+  if (!t || typeof t !== 'object') return null;
+  const n = (x) => { const v = parseInt(x, 10); return Number.isFinite(v) ? v : 0; };
+  return n(t.days) * 86400 + n(t.hours) * 3600 + n(t.minutes) * 60 + n(t.seconds);
+}
+
+const num = (v) => (v === undefined || v === null || v === '' ? null : Number(v));
+
+/**
+ * getOutboundCampaign — full outbound campaign config plus attached lists
+ * (lists come from the separate getListsForCampaign method, best-effort).
+ */
+export async function getOutboundCampaign(campaignName) {
+  const name = String(campaignName || '').trim();
+  if (!name) throw new Error('campaignName is required');
+  const xml = await five9SoapCall('getOutboundCampaign', `<campaignName>${escapeXml(name)}</campaignName>`);
+  const block = returnBlocks(xml)[0];
+  if (!block) return { name, error: 'campaign_not_found' };
+  const raw = parseXmlBlock(block);
+  let lists = null; // null = lookup failed; [] = genuinely no lists attached
+  try {
+    const lxml = await five9SoapCall('getListsForCampaign', `<campaignName>${escapeXml(name)}</campaignName>`);
+    lists = returnBlocks(lxml).map(parseXmlBlock).map(l => ({
+      name: l.listName ?? null,
+      priority: num(l.priority),
+      dialingPriority: num(l.dialingPriority),
+      dialingRatio: num(l.dialingRatio),
+    }));
+  } catch (err) {
+    console.warn(`[FIVE9] getListsForCampaign(${name}) failed: ${err.message}`);
+  }
+  return {
+    name: raw.name || name,
+    type: raw.type || null,
+    state: raw.state || null,
+    mode: raw.mode || null,
+    profileName: raw.profileName || null,
+    description: raw.description || null,
+    trainingMode: raw.trainingMode === 'true',
+    dialingMode: raw.dialingMode || null,
+    dialingRatio: num(raw.dialingRatio),
+    callsAgentRatio: num(raw.callsAgentRatio),
+    maxDroppedCallsPercentage: num(raw.maxDroppedCallsPercentage),
+    maxQueueTimeSeconds: timerToSeconds(raw.maxQueueTime),
+    actionOnQueueExpiration: raw.actionOnQueueExpiration ?? null,
+    monitorDroppedCalls: raw.monitorDroppedCalls === 'true',
+    lists,
+    raw,
+  };
+}
+
+/** getInboundCampaign — full inbound campaign config (normalized + raw). */
+export async function getInboundCampaign(campaignName) {
+  const name = String(campaignName || '').trim();
+  if (!name) throw new Error('campaignName is required');
+  const xml = await five9SoapCall('getInboundCampaign', `<campaignName>${escapeXml(name)}</campaignName>`);
+  const block = returnBlocks(xml)[0];
+  if (!block) return { name, error: 'campaign_not_found' };
+  const raw = parseXmlBlock(block);
+  return {
+    name: raw.name || name,
+    type: raw.type || null,
+    state: raw.state || null,
+    mode: raw.mode || null,
+    profileName: raw.profileName || null,
+    description: raw.description || null,
+    maxNumOfLines: num(raw.maxNumOfLines),
+    raw,
+  };
+}
+
+/** getCampaignProfiles — profile inventory with dial settings (retries/ANI/schedule). */
+export async function getCampaignProfiles() {
+  const xml = await five9SoapCall('getCampaignProfiles');
+  const profiles = returnBlocks(xml).map(parseXmlBlock).map(p => ({
+    name: p.name || null,
+    description: p.description || null,
+    ANI: p.ANI ?? null,
+    numberOfAttempts: num(p.numberOfAttempts),
+    dialingTimeout: num(p.dialingTimeout),
+    initialCallPriority: num(p.initialCallPriority),
+    maxCharges: num(p.maxCharges),
+    dialingSchedule: p.dialingSchedule ?? null,
+    raw: p,
+  }));
+  return { count: profiles.length, profiles };
+}
+
+/** getListsInfo — every dialing list with its record count. */
+export async function getListsInfo() {
+  const xml = await five9SoapCall('getListsInfo');
+  const lists = returnBlocks(xml).map(parseXmlBlock)
+    .map(l => ({ name: l.name || null, size: num(l.size) }))
+    .filter(l => l.name);
+  return { count: lists.length, lists };
+}
+
+/** getDispositions — full disposition inventory (nested typeParameters kept raw). */
+export async function getDispositions() {
+  const xml = await five9SoapCall('getDispositions');
+  const dispositions = returnBlocks(xml).map(parseXmlBlock);
+  return { count: dispositions.length, dispositions };
+}
+
+/** getSkills — skill inventory. */
+export async function getSkills() {
+  const xml = await five9SoapCall('getSkills');
+  const skills = returnBlocks(xml).map(parseXmlBlock).map(s => ({
+    id: num(s.id),
+    name: s.name || null,
+    description: s.description || null,
+    routeVoiceMails: s.routeVoiceMails === 'true',
+  }));
+  return { count: skills.length, skills };
+}
+
+/** getUsersGeneralInfo — user inventory (password field stripped defensively). */
+export async function getUsersGeneralInfo(pattern = '.*') {
+  const p = String(pattern || '.*');
+  const xml = await five9SoapCall('getUsersGeneralInfo', `<userNamePattern>${escapeXml(p)}</userNamePattern>`);
+  const users = returnBlocks(xml).map(parseXmlBlock).map(u => {
+    const { password, ...rest } = u; // never surface even a masked credential field
+    return rest;
+  });
+  return { count: users.length, users };
+}
+
+/**
+ * checkDncForNumbers — the response lists ONLY numbers that ARE on the DNC;
+ * we diff client-side so callers get both sides explicitly.
+ */
+export async function checkDncForNumbers(numbers) {
+  const list = (Array.isArray(numbers) ? numbers : [numbers])
+    .map(n => String(n ?? '').trim()).filter(Boolean);
+  if (!list.length) throw new Error('numbers[] is required');
+  const inner = list.map(n => `<numbers>${escapeXml(n)}</numbers>`).join('');
+  const xml = await five9SoapCall('checkDncForNumbers', inner);
+  const on_dnc = returnBlocks(xml).map(b => decodeXml(b).trim()).filter(Boolean);
+  const onSet = new Set(on_dnc);
+  return { checked: list.length, on_dnc, not_on_dnc: list.filter(n => !onSet.has(n)) };
+}
+
+/* ---- Report trio (async run → poll → fetch) ---------------------------- */
+
+/**
+ * buildReportCriteriaXml — pure builder, exported for offline tests.
+ * WSDL sequence order inside reportTimeCriteria is <end> BEFORE <start>.
+ */
+export function buildReportCriteriaXml({ startIso, endIso } = {}) {
+  if (!startIso && !endIso) return '';
+  const time =
+    (endIso ? `<end>${escapeXml(endIso)}</end>` : '') +
+    (startIso ? `<start>${escapeXml(startIso)}</start>` : '');
+  return `<criteria><time>${time}</time></criteria>`;
+}
+
+/** runReport — submits the run; returns the polling identifier. */
+export async function runReport(folderName, reportName, criteriaXml = '') {
+  const folder = String(folderName || '').trim();
+  const report = String(reportName || '').trim();
+  if (!folder || !report) throw new Error('folderName and reportName are required');
+  const xml = await five9SoapCall('runReport',
+    `<folderName>${escapeXml(folder)}</folderName><reportName>${escapeXml(report)}</reportName>${criteriaXml}`);
+  const identifier = returnBlocks(xml).map(b => decodeXml(b).trim())[0] || '';
+  if (!identifier) throw new Error('Five9 runReport: no report identifier returned');
+  return { identifier };
+}
+
+/** isReportRunning — true while the run is still executing (server-side wait ≤ timeoutSec). */
+export async function isReportRunning(identifier, timeoutSec = 5) {
+  const id = String(identifier || '').trim();
+  if (!id) throw new Error('identifier is required');
+  const xml = await five9SoapCall('isReportRunning',
+    `<identifier>${escapeXml(id)}</identifier><timeout>${Math.max(0, parseInt(timeoutSec, 10) || 0)}</timeout>`);
+  return returnBlocks(xml).map(b => decodeXml(b).trim())[0] === 'true';
+}
+
+/** getReportResult — normalized { columns, rows } from header/records/values/data. */
+export async function getReportResult(identifier) {
+  const id = String(identifier || '').trim();
+  if (!id) throw new Error('identifier is required');
+  const xml = await five9SoapCall('getReportResult', `<identifier>${escapeXml(id)}</identifier>`);
+  const block = returnBlocks(xml)[0];
+  if (!block) return { identifier: id, columns: [], rows: [] };
+  const raw = parseXmlBlock(block);
+  const columns = asArray(raw.header?.values?.data);
+  const rows = asArray(raw.records).map(r => asArray(r?.values?.data));
+  return { identifier: id, columns, rows };
+}
+
+/**
+ * runReportAndWait — submit + poll ≤ maxWaitMs (default 55s: under the 60s
+ * doctrine cap and under typical MCP client timeouts). On timeout returns
+ * { identifier, done:false } so the caller resumes via getReportResult.
+ */
+export async function runReportAndWait({ folder, name, startIso, endIso, pollMs = 5000, maxWaitMs = 55000 } = {}) {
+  const { identifier } = await runReport(folder, name, buildReportCriteriaXml({ startIso, endIso }));
+  const deadline = Date.now() + Math.max(0, maxWaitMs);
+  for (;;) {
+    if (!(await isReportRunning(identifier))) break;
+    if (Date.now() >= deadline) {
+      return { identifier, done: false, timed_out_after_ms: maxWaitMs };
+    }
+    const napMs = Math.min(pollMs, Math.max(250, deadline - Date.now()));
+    await new Promise(r => setTimeout(r, napMs));
+  }
+  const result = await getReportResult(identifier);
+  return { done: true, ...result };
 }
