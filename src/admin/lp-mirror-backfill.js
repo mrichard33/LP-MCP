@@ -119,8 +119,27 @@ export async function runLpMirrorBackfill({ dryRun = true, sinceDays = DEFAULT_S
         break;
       }
 
-      const prospects = extractArray(resp);
-      if (prospects.length === 0) break;
+      let prospects = extractArray(resp);
+      if (prospects.length === 0) {
+        // VERIFY the empty page before trusting it (2026-07-22): under load
+        // LP soft-fails by returning an EMPTY page at offsets where rows
+        // exist (a live 14-day run "completed" at exactly 150 prospects; a
+        // 1-row probe at StartIndex=151 returned data). An unverified empty
+        // page silently truncates the recovery while reporting success.
+        try {
+          const probe = extractArray(await getLeads({ startdate, enddate, options: 0, PageSize: 1, StartIndex: startIndex }));
+          if (probe.length === 0) break; // genuinely the end
+          console.warn(`[MirrorBackfill] empty page at StartIndex=${startIndex} but probe found rows — retrying smaller`);
+          prospects = extractArray(await getLeads({
+            startdate, enddate, options: 0,
+            PageSize: Math.max(10, Math.floor(PAGE_SIZE / 4)), StartIndex: startIndex,
+          }));
+          if (prospects.length === 0) prospects = probe; // worst case: one row at a time
+        } catch (err) {
+          errorMessage = `empty-page verify failed at StartIndex=${startIndex}: ${err.message}`;
+          break;
+        }
+      }
       counts.scanned_prospects += prospects.length;
 
       for (const prospect of prospects) {

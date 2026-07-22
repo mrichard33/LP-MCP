@@ -307,7 +307,31 @@ async function sweepForwardLeadDispositions(windowStart, windowEnd) {
         break;
       }
     }
-    if (!items.length) break;
+    if (!items.length) {
+      // VERIFY the empty page before trusting it (2026-07-22): under load LP
+      // soft-fails by returning an EMPTY page at offsets where rows exist
+      // (proved live — StartIndex=151 empty at PageSize 50, same offset
+      // returns a row at PageSize 1). An unverified empty page silently
+      // truncates the scan while looking like clean completion.
+      try {
+        const probe = extractArray(await getLeads({
+          startdate: changeStart, enddate: changeEnd,
+          PageSize: 1, StartIndex: startIndex,
+        }));
+        if (!probe.length) break; // genuinely the end
+        console.warn(`[CapacitySweep] empty page at startIndex=${startIndex} but probe found rows — retrying smaller`);
+        items = extractArray(await getLeads({
+          startdate: changeStart, enddate: changeEnd,
+          PageSize: Math.max(10, Math.floor(LEAD_PAGE_SIZE / 4)), StartIndex: startIndex,
+        }));
+        if (!items.length) { items = probe; } // worst case: advance one row at a time
+      } catch (err) {
+        stats.truncated_at = startIndex;
+        stats.page_error = `empty-page verify failed: ${String(err.message || err).slice(0, 150)}`;
+        console.error(`[CapacitySweep] empty-page verification failed at startIndex=${startIndex} — change sweep TRUNCATED`);
+        break;
+      }
+    }
     stats.pages++;
     stats.scanned += items.length;
 
