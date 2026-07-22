@@ -142,7 +142,7 @@ import { processMilestoneTriggers } from './milestones.js';
 import { runPass1DailyWindows } from './full-sync-pass1.js';
 import { pushNotesToGHL } from './ghl-notes-sync.js';
 
-import { SYNC_INTERVAL_MS, PAGE_SIZE, RATE_LIMIT_SLEEP_MS, sleep, extractArray, getField, loggedFirstKeys } from './sync-utils.js';
+import { SYNC_INTERVAL_MS, RATE_LIMIT_SLEEP_MS, sleep, extractArray, getField, loggedFirstKeys } from './sync-utils.js';
 import {
   ENTITY_TYPES, syncInProgress, syncStartedAt, STALE_LOCK_MINUTES,
   setSyncInProgress, setSyncStartedAt, activeLogIds,
@@ -188,6 +188,16 @@ const SYNC_TIMEOUT_MS = SYNC_TIMEOUT_MINUTES * 60 * 1000;
 // per sweep (so up to 6 cross-sweep). Tune via env if LP starts pushing back.
 const SYNC_PER_SWEEP_TIMEOUT_MS = parseInt(process.env.SYNC_PER_SWEEP_TIMEOUT_MIN || '20', 10) * 60 * 1000;
 const SYNC_PROSPECT_CONCURRENCY = parseInt(process.env.SYNC_PROSPECT_CONCURRENCY || '3', 10);
+
+// Sweep page size — 50, NOT sync-utils' PAGE_SIZE=200 (2026-07-22, capacity
+// board reconciliation): GetLead rows are enormous full prospect records and
+// LP errors OR RETURNS EMPTY for large PageSize at deep StartIndex, which is
+// indistinguishable from a completed scan — the sweep ends early and the
+// dropped changes surface as warehouse drift ("modified-since can't keep
+// up"). Deep offsets serve reliably with small requests (1-row probes at the
+// same offsets return data). Same fix as capacity-sweep #556 / mirror
+// backfill #558.
+const SYNC_PAGE_SIZE = Math.min(200, parseInt(process.env.SYNC_PAGE_SIZE || '50', 10));
 
 // v6.9: Per-prospect timeout. Caps the wall-clock budget of a single
 // processProspect call so one hung HTTP call cannot block the surrounding
@@ -472,16 +482,28 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
     console.log(`[Sync:Leads] Deny-list loaded: ${denylistSet.size} active cstIds will be skipped this sweep`);
   }
 
+  let truncatedAt = null;
   while (counts.leads < maxLeads) {
     let leads;
     try {
       leads = await getLeadData({
         startdate: since, enddate: today,
-        PageSize: PAGE_SIZE, StartIndex: startIndex,
+        PageSize: SYNC_PAGE_SIZE, StartIndex: startIndex,
       });
     } catch (err) {
-      console.error('[Sync:Leads] GetLeadData failed:', err.message);
-      break;
+      // A failed page means TRUNCATION, not completion. Retry once at a
+      // quarter of the page size (lighter response) before giving up loudly.
+      console.error(`[Sync:Leads] GetLeadData page StartIndex=${startIndex} failed: ${err.message} — retrying smaller`);
+      try {
+        leads = await getLeadData({
+          startdate: since, enddate: today,
+          PageSize: Math.max(10, Math.floor(SYNC_PAGE_SIZE / 4)), StartIndex: startIndex,
+        });
+      } catch (err2) {
+        truncatedAt = startIndex;
+        console.error(`[Sync:Leads] page StartIndex=${startIndex} failed after small-page retry — sweep TRUNCATED, changes beyond this offset NOT synced this run: ${err2.message}`);
+        break;
+      }
     }
     const items = extractArray(leads);
     if (items.length === 0) break;
@@ -624,7 +646,7 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
       `${newlyDenylisted} newly denylisted this sweep (total active denylist size now: ${denylistSet.size})`
     );
   }
-  return { counts, failed, hitCap, denylistSkipped, newlyDenylisted };
+  return { counts, failed, hitCap, denylistSkipped, newlyDenylisted, truncatedAt };
 }
 
 async function runJobChangesSweep(since, today, logIds) {
@@ -637,11 +659,20 @@ async function runJobChangesSweep(since, today, logIds) {
     try {
       jobs = await getJobStatusChanges({
         startdate: since, enddate: today,
-        PageSize: PAGE_SIZE, StartIndex: startIndex,
+        PageSize: SYNC_PAGE_SIZE, StartIndex: startIndex,
       });
     } catch (err) {
-      console.error('[Sync:JobChanges] GetJobStatusChanges failed:', err.message);
-      break;
+      // Same truncation-not-completion semantics as the leads sweep.
+      console.error(`[Sync:JobChanges] page StartIndex=${startIndex} failed: ${err.message} — retrying smaller`);
+      try {
+        jobs = await getJobStatusChanges({
+          startdate: since, enddate: today,
+          PageSize: Math.max(10, Math.floor(SYNC_PAGE_SIZE / 4)), StartIndex: startIndex,
+        });
+      } catch (err2) {
+        console.error(`[Sync:JobChanges] page StartIndex=${startIndex} failed after small-page retry — sweep TRUNCATED: ${err2.message}`);
+        break;
+      }
     }
     const items = extractArray(jobs);
     if (items.length === 0) break;
