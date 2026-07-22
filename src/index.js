@@ -201,6 +201,10 @@ import { registerWorkflowProjectionRoutes, startWorkflowProjectionLoop } from '.
 import { registerGoalScorecardRoutes, startGoalScorecardScheduler } from './jobs/goal-scorecard-daily.js';
 // Nightly per-lead market assignment (feeds the per-market scorecard split).
 import { registerMarketAssignmentRoutes, startMarketAssignmentScheduler } from './jobs/market-assignment-daily.js';
+// Appointment Capacity Board — 15-min GetSalesSchedule + forward-lead sweep,
+// nightly 23:50 ET fill snapshot, unauthenticated GET /board/capacity for the
+// dashboard TV board (sql/043).
+import { registerCapacityBoardRoutes, startCapacitySweepScheduler } from './jobs/capacity-sweep.js';
 // Closed-month per-market funnel RE-DERIVE (real measurement; retires the split).
 // The legacy proportional-split backfill (scorecard-market-backfill.js) is left in
 // the tree but INTENTIONALLY UNWIRED — no metric may be produced by splitting a
@@ -315,6 +319,47 @@ async function runMigrations() {
     console.log('[Migration] lp_jobs.branch_code ready');
   } catch (err) {
     console.warn('[Migration] lp_jobs.branch_code skipped:', err.message);
+  }
+
+  // Appointment Capacity Board substrate (sql/043 — the file is the source of
+  // truth; this boot-time mirror guarantees the schema exists before the first
+  // capacity sweep AND before the first lead upsert writes the new
+  // appointment_confirmed/appointment_verified columns. Additive/idempotent.
+  try {
+    await supabase.rpc('exec_sql', {
+      sql: `CREATE TABLE IF NOT EXISTS lp_capacity_slots (
+              slot_date        date NOT NULL,
+              slr_id           text NOT NULL,
+              rep_home_market  text NOT NULL,
+              slot_id          int  NOT NULL,
+              has_appt         boolean NOT NULL,
+              swept_at         timestamptz NOT NULL,
+              PRIMARY KEY (slot_date, slr_id, slot_id));
+            CREATE INDEX IF NOT EXISTS idx_lp_capacity_slots_date ON lp_capacity_slots(slot_date);
+            ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS appointment_confirmed boolean;
+            ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS appointment_verified  boolean;
+            CREATE OR REPLACE VIEW v_appt_board AS
+              SELECT slot_date,
+                     COALESCE(bm.market_code, 'UNRESOLVED') AS market,
+                     count(*) AS requested,
+                     count(*) FILTER (WHERE cs.has_appt) AS booked
+              FROM lp_capacity_slots cs
+              LEFT JOIN lp_branch_market_map bm
+                ON UPPER(TRIM(bm.brn_id)) = UPPER(TRIM(cs.rep_home_market))
+              GROUP BY 1, 2;
+            CREATE TABLE IF NOT EXISTS lp_appt_fill_snapshot (
+              snapshot_date date NOT NULL,
+              slot_date     date NOT NULL,
+              market        text NOT NULL,
+              requested     int  NOT NULL DEFAULT 0,
+              confirmed     int  NOT NULL DEFAULT 0,
+              set_pending   int  NOT NULL DEFAULT 0,
+              days_out      int  GENERATED ALWAYS AS (slot_date - snapshot_date) STORED,
+              PRIMARY KEY (snapshot_date, slot_date, market));`,
+    });
+    console.log('[Migration] capacity board schema (sql/043) ready');
+  } catch (err) {
+    console.warn('[Migration] capacity board schema skipped:', err.message);
   }
 
   // Scorecard revenue realignment (sql/040): live-month RTP-net + provisional-gross columns,
@@ -661,6 +706,7 @@ registerLeadSelectionRoutes(app);
 registerWorkflowProjectionRoutes(app);
 registerGoalScorecardRoutes(app);
 registerMarketAssignmentRoutes(app);
+registerCapacityBoardRoutes(app); // 2026-07-22 — TV capacity board aggregate (GET /board/capacity, unauthenticated by design)
 registerScorecardRederiveRoutes(app);
 registerNetReportRoutes(app);
 registerScorecardValidateRoutes(app);
@@ -691,6 +737,7 @@ app.listen(PORT, async () => {
   startLeadSelectionScheduler();
   startWorkflowProjectionLoop();
   startMarketAssignmentScheduler();
+  startCapacitySweepScheduler();
   startGoalScorecardScheduler();
   startScorecardValidateScheduler();
   startFbPublishWatchdog();

@@ -25,6 +25,7 @@
 import supabase from '../supabase.js';
 import { syncLogStart, syncLogComplete } from '../sync-log.js';
 import { getMarketMaps, resolveMarket, buildLeadBranchMarketMap } from './market-resolver.js';
+import { runSQL } from '../admin/supabase-admin.js';
 
 const TIMEZONE = 'America/New_York';
 // PostgREST caps a single response at ~1000 rows, so page at 1000 and advance by
@@ -145,15 +146,40 @@ async function getJobBearingLeadRows() {
 }
 
 /**
+ * Lead rows with an appointment in the forward window (today ET onward) — the
+ * capacity-sweep scope. Root cause this closes: the nightly 05:00 ET full scan
+ * is the ONLY thing that assigns markets, so an intraday-synced lead has no
+ * assignment row (→ UNRESOLVED on the board) until the next morning. The
+ * 15-min sweep calls this scope so forward-window appointments resolve within
+ * one sweep interval.
+ *
+ * TIMEZONE RULE: appointment_date is timestamptz — the predicate goes through
+ * (col AT TIME ZONE 'America/New_York')::date so evening appointments (≥8pm
+ * ET) select under their ET date, not the following UTC day. PostgREST can't
+ * express that cast, so this scope reads via the run_sql RPC.
+ */
+async function getForwardApptLeadRows() {
+  const rows = await runSQL(`
+    SELECT lp_lead_id, lp_prospect_id, zip
+    FROM lp_leads
+    WHERE appointment_date IS NOT NULL
+      AND (appointment_date AT TIME ZONE 'America/New_York')::date >= '${todayET()}'::date
+  `);
+  return Array.isArray(rows) ? rows : [];
+}
+
+/**
  * Resolve and upsert market assignments. Branch-first for job-bearing leads
  * (method='brn_map'), ZIP fallback otherwise.
  * @param {object} [opts]
  * @param {boolean} [opts.dryRun=false] Compute + diff against the stored
  *   assignments and report before/after deltas, but WRITE NOTHING.
- * @param {'all'|'job_bearing'} [opts.scope='all'] 'all' scans every lp_leads row
- *   (the nightly refresh). 'job_bearing' scans only leads that have a job — the
- *   only rows branch-first can change — so an on-demand re-resolve is seconds,
- *   not a 219k-row scan.
+ * @param {'all'|'job_bearing'|'forward_appts'} [opts.scope='all'] 'all' scans
+ *   every lp_leads row (the nightly refresh). 'job_bearing' scans only leads
+ *   that have a job — the only rows branch-first can change — so an on-demand
+ *   re-resolve is seconds, not a 219k-row scan. 'forward_appts' scans only
+ *   leads with an appointment today-ET or later (capacity-sweep scope; the
+ *   nightly 'all' run stays untouched — idempotent overlap is fine).
  * @param {object} [opts.job] Optional async job-state to update with progress.
  * @returns {{ success:boolean, dry_run:boolean, scope:string, processed:number,
  *   changed:number, method_counts?:object, market_counts?:object,
@@ -168,8 +194,10 @@ export async function computeMarketAssignments({ dryRun = false, scope = 'all', 
   const ctx = { zipMap, branchMap, dryRun, counters };
 
   try {
-    if (scope === 'job_bearing') {
-      const leadRows = await getJobBearingLeadRows();
+    if (scope === 'job_bearing' || scope === 'forward_appts') {
+      const leadRows = scope === 'job_bearing'
+        ? await getJobBearingLeadRows()
+        : await getForwardApptLeadRows();
       if (job) job.total = leadRows.length;
       for (let i = 0; i < leadRows.length; i += CHUNK) {
         await resolveAndWriteBatch(leadRows.slice(i, i + CHUNK), ctx);

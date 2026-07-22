@@ -406,6 +406,37 @@ export async function getSalesJobDetail(jobId) {
   }));
 }
 
+/**
+ * POST /api/SalesApi/GetSalesSchedule — per-date rep slot availability.
+ *
+ * VERIFIED live 2026-07-21: returns per-date
+ *   { Date, SlotsPerDay, Availability: [{ SlrId, RepName, RepHomeMarket,
+ *     Attributes: [], Slots: [{ SlotId 1|2|3, SlotDescr "M/A/E", TmsTime,
+ *     HasApptScheduled: boolean }] }] }
+ * Slots carry NO appointment id, NO lead id, NO status — the boolean is all
+ * there is. Reps carry 1–3 slots (their working schedule); SlotsPerDay=3 is a
+ * ceiling, not a count.
+ *
+ * BrnID filters by RepHomeMarket (BrnID:"FTLAU" ≡ slicing "All" by
+ * RepHomeMarket) — callers should make ONE "All" call per sweep and group
+ * client-side via lp_branch_market_map rather than calling per branch.
+ *
+ * @param {Object} params
+ * @param {string} params.StartDate — YYYY-MM-DD (ET calendar date)
+ * @param {string} params.EndDate   — YYYY-MM-DD (ET calendar date)
+ * @param {string|number} [params.SlrID=0] — 0 = all reps
+ * @param {string} [params.BrnID='All']
+ */
+export async function getSalesSchedule({ StartDate, EndDate, SlrID = 0, BrnID = 'All' } = {}) {
+  if (!StartDate || !EndDate) throw new Error('getSalesSchedule: StartDate and EndDate are required (YYYY-MM-DD)');
+  return withCircuit(() => lpPost('/api/SalesApi/GetSalesSchedule', {
+    StartDate,
+    EndDate,
+    SlrID:  String(SlrID),
+    BrnID:  String(BrnID),
+  }));
+}
+
 // ─── Convenience aliases matching sync-engine imports ────────────
 
 export const getDispositions = () => getSalesApptDispProd('d');
