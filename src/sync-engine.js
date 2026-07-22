@@ -505,8 +505,30 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
         break;
       }
     }
-    const items = extractArray(leads);
-    if (items.length === 0) break;
+    let items = extractArray(leads);
+    if (items.length === 0) {
+      // VERIFY the empty page before trusting it: under load LP soft-fails by
+      // returning an EMPTY page at offsets where rows exist (proved live
+      // 2026-07-22 — a recovery run "completed" at exactly 150 prospects
+      // while a 1-row probe at the next offset returned data). An unverified
+      // empty page truncates the sweep while looking like clean completion.
+      try {
+        const probe = extractArray(await getLeadData({
+          startdate: since, enddate: today, PageSize: 1, StartIndex: startIndex,
+        }));
+        if (probe.length === 0) break; // genuinely the end
+        console.warn(`[Sync:Leads] empty page at StartIndex=${startIndex} but probe found rows — retrying smaller`);
+        items = extractArray(await getLeadData({
+          startdate: since, enddate: today,
+          PageSize: Math.max(10, Math.floor(SYNC_PAGE_SIZE / 4)), StartIndex: startIndex,
+        }));
+        if (items.length === 0) items = probe; // worst case: advance one row at a time
+      } catch (err) {
+        truncatedAt = startIndex;
+        console.error(`[Sync:Leads] empty-page verification failed at StartIndex=${startIndex} — sweep TRUNCATED: ${err.message}`);
+        break;
+      }
+    }
 
     console.log(`[Sync:Leads] Page startIndex=${startIndex} fetched ${items.length} prospects — processing with concurrency=${SYNC_PROSPECT_CONCURRENCY}, per-prospect timeout=${SYNC_PROSPECT_TIMEOUT_MS / 1000}s`);
 
@@ -674,8 +696,26 @@ async function runJobChangesSweep(since, today, logIds) {
         break;
       }
     }
-    const items = extractArray(jobs);
-    if (items.length === 0) break;
+    let items = extractArray(jobs);
+    if (items.length === 0) {
+      // Same empty-page verification as the leads sweep — an empty page under
+      // load is not proof of completion.
+      try {
+        const probe = extractArray(await getJobStatusChanges({
+          startdate: since, enddate: today, PageSize: 1, StartIndex: startIndex,
+        }));
+        if (probe.length === 0) break; // genuinely the end
+        console.warn(`[Sync:JobChanges] empty page at StartIndex=${startIndex} but probe found rows — retrying smaller`);
+        items = extractArray(await getJobStatusChanges({
+          startdate: since, enddate: today,
+          PageSize: Math.max(10, Math.floor(SYNC_PAGE_SIZE / 4)), StartIndex: startIndex,
+        }));
+        if (items.length === 0) items = probe;
+      } catch (err) {
+        console.error(`[Sync:JobChanges] empty-page verification failed at StartIndex=${startIndex} — sweep TRUNCATED: ${err.message}`);
+        break;
+      }
+    }
 
     await processInBatches(items, SYNC_PROSPECT_CONCURRENCY, async (job) => {
       try {
