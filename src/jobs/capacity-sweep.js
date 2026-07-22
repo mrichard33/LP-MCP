@@ -60,11 +60,13 @@ const FORWARD_DAYS      = parseInt(process.env.CAPACITY_FORWARD_DAYS || '14', 10
 // LP's change-window semantics or its documented internal result cap.
 const NEAR_DAYS         = parseInt(process.env.CAPACITY_NEAR_DAYS || '2', 10);
 
-// Confirmed = appointments that will run (env-tunable). Set does NOT count —
-// unconfirmed appointments don't run. Verif does NOT count either (Mark,
-// 2026-07-22: verified is a step before confirmation, not equivalent to it).
-// Only CXL is excluded from confirmed AND set_pending (still counted in
-// appts) — DNC has nothing to do with capacity counting (Mark, 2026-07-22).
+// Disposition → bucket mapping (Mark, fix-pass 2, 2026-07-22). Every code
+// maps to exactly one bucket; anything unlisted counts in appts only:
+//   CONFIRMED [Cnf, Issue]  — will run
+//   AT-RISK   [Set, Verif]  — customer said yes; rep not dispatched until
+//                             confirmed (Verif is a step BEFORE confirmation,
+//                             not equivalent to it)
+//   EXCLUDED  [CXL, DNC]    — dead; never confirmed, never at-risk
 //
 // 'Issue' counts as CONFIRMED (discovered live 2026-07-21 ~10pm ET): LP's
 // nightly run-sheet process mass-flips tomorrow's confirmed appointments
@@ -76,7 +78,12 @@ const NEAR_DAYS         = parseInt(process.env.CAPACITY_NEAR_DAYS || '2', 10);
 // appointment_confirmed=false never counts regardless of disposition.
 const CONFIRMED_CODES = String(process.env.CAPACITY_CONFIRMED_CODES || 'Cnf,Issue')
   .split(',').map((s) => s.trim()).filter(Boolean);
-const EXCLUDED_CODES = String(process.env.CAPACITY_EXCLUDED_CODES || 'CXL')
+// At-risk = set-but-not-confirmed: the customer said yes, the rep is not
+// dispatched until confirmation. Env-tunable so bucket placement (e.g. Verif)
+// is an env flip, never a code change.
+const AT_RISK_CODES = String(process.env.CAPACITY_AT_RISK_CODES || 'Set,Verif')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+const EXCLUDED_CODES = String(process.env.CAPACITY_EXCLUDED_CODES || 'CXL,DNC')
   .split(',').map((s) => s.trim()).filter(Boolean);
 
 // Lead re-sweep paging. Rows are multi-KB full prospect records — keep pages ≤200.
@@ -169,7 +176,7 @@ function numeratorSQL(datePredicate) {
     SELECT (l.appointment_date AT TIME ZONE 'America/New_York')::date AS slot_date,
            COALESCE(a.resolved_market_code, 'UNRESOLVED') AS market,
            count(*) FILTER (WHERE ${CONF}) AS confirmed,
-           count(*) FILTER (WHERE l.disposition_code = 'Set' AND NOT (${CONF})) AS set_pending,
+           count(*) FILTER (WHERE l.disposition_code = ANY (${sqlTextArray(AT_RISK_CODES)}) AND NOT (${CONF})) AS set_pending,
            count(*) AS appts
     FROM lp_leads l
     LEFT JOIN lp_lead_market_assignments a ON a.lead_id = l.lp_lead_id
@@ -342,6 +349,21 @@ async function refreshNearWindowLeads(windowStart) {
       await sleep(RATE_LIMIT_SLEEP_MS); // LP monitors for excessive use
     }
   });
+
+  // Branch-coverage observability (fix-pass 2): branch_populated must track
+  // leads — a persistent gap means a writer path is dropping brn_id again.
+  try {
+    const cov = await runSQL(`
+      SELECT count(*) AS leads, count(lp_branch_id) AS branch_populated
+      FROM lp_leads
+      WHERE appointment_date IS NOT NULL
+        AND (appointment_date AT TIME ZONE 'America/New_York')::date
+            BETWEEN '${windowStart}'::date AND '${nearEnd}'::date`);
+    stats.branch_populated = Number(cov?.[0]?.branch_populated ?? 0);
+    console.log(`[CapacitySweep] near-window refresh: leads_refreshed=${stats.processed}/${stats.leads} failed=${stats.failed} branch_populated=${stats.branch_populated}/${cov?.[0]?.leads ?? '?'}`);
+  } catch (err) {
+    console.warn(`[CapacitySweep] branch coverage check failed: ${err.message}`);
+  }
   return stats;
 }
 
@@ -435,7 +457,7 @@ export async function runFillSnapshot(snapshotDate = todayET()) {
       SELECT (l.appointment_date AT TIME ZONE 'America/New_York')::date AS slot_date,
              COALESCE(a.resolved_market_code, 'UNRESOLVED') AS market,
              count(*) FILTER (WHERE ${CONF}) AS confirmed,
-             count(*) FILTER (WHERE l.disposition_code = 'Set' AND NOT (${CONF})) AS set_pending
+             count(*) FILTER (WHERE l.disposition_code = ANY (${sqlTextArray(AT_RISK_CODES)}) AND NOT (${CONF})) AS set_pending
       FROM lp_leads l
       LEFT JOIN lp_lead_market_assignments a ON a.lead_id = l.lp_lead_id
       WHERE l.appointment_date IS NOT NULL
@@ -578,7 +600,10 @@ let lastSnapshotDate = null;
 
 export function startCapacitySweepScheduler() {
   if (sweepTimer) return;
-  console.log(`[CapacitySweep] Scheduler started — every ${SWEEP_INTERVAL_MS / 60000} min, forward window ${FORWARD_DAYS} days; snapshot nightly at 23:50 ET`);
+  console.log(`[CapacitySweep] Scheduler started — every ${SWEEP_INTERVAL_MS / 60000} min, forward window ${FORWARD_DAYS} days, near-window ${NEAR_DAYS} days; snapshot nightly at 23:50 ET`);
+  // Effective disposition→bucket mapping (fix-pass 2): every board count
+  // derives from exactly this. Codes in none of the lists count in appts only.
+  console.log(`[CapacityBoard] disposition mapping — CONFIRMED: [${CONFIRMED_CODES.join(', ')}] | AT-RISK: [${AT_RISK_CODES.join(', ')}] | EXCLUDED: [${EXCLUDED_CODES.join(', ')}] | all other codes: appts only. Explicit appointment_confirmed boolean preferred when present.`);
 
   // First sweep shortly after boot so the board is fresh after a deploy.
   setTimeout(() => {

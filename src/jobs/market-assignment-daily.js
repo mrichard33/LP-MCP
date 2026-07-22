@@ -74,23 +74,26 @@ async function resolveAndWriteBatch(leadRows, { zipMap, branchMap, dryRun, count
   const nowIso = new Date().toISOString();
   const rows = leadRows.map((r) => {
     const lead = String(r.lp_lead_id);
-    // Resolution order (fix-pass 1, 2026-07-22):
-    //   1. Job branch (method='brn_map') — unchanged; revenue-authoritative,
-    //      ties the Net Report 1,710/1,710 (#512). Kept FIRST so revenue
-    //      attribution cannot flip on a lead/job branch disagreement.
-    //   2. Lead's own LP branch (lp_leads.lp_branch_id, method='branch') —
-    //      what LP's screens group by. Fixes funnel/capacity attribution:
-    //      the customer ZIP structurally disagrees with LP's branch view
+    // Resolution order (fix-pass 2, 2026-07-22 — Mark: branch first):
+    //   1. Lead's own LP branch (lp_leads.lp_branch_id, method='branch') —
+    //      what LP's screens group by; the board must match LP's Appointment
+    //      Overview per region, which zip attribution structurally cannot
     //      (e.g. a SAR-branch lead with a 34201 mailing zip).
-    //   3. ZIP lookup (existing fallback) when no branch is known.
+    //   2. Job branch (method='brn_map') — fallback for rows synced before
+    //      lp_branch_id existed; still ties the Net Report for revenue.
+    //      (Lead and job branch agree in practice — both are LP's own
+    //      attribution; #1 is just available on far more rows.)
+    //   3. ZIP lookup, method='zip_lookup' / 'zip_out_of_area' / 'no_address'.
+    // Re-resolution UPGRADES: every processed row is recomputed and upserted,
+    // so a zip-based assignment flips to 'branch' as soon as the branch lands.
     const branch = branchByLead.get(lead);
     const leadBranch = r.lp_branch_id
       ? resolveMarketFromBranch(r.lp_branch_id, { branchMap })
       : null;
-    const res = branch
-      ? { market_code: branch.market_code, method: 'brn_map', zip: null, branch: branch.branch_code }
-      : (leadBranch && leadBranch.method !== 'unmapped_branch')
-        ? { market_code: leadBranch.market_code, method: 'branch', zip: null, branch: leadBranch.branch }
+    const res = (leadBranch && leadBranch.method !== 'unmapped_branch')
+      ? { market_code: leadBranch.market_code, method: 'branch', zip: null, branch: leadBranch.branch }
+      : branch
+        ? { market_code: branch.market_code, method: 'brn_map', zip: null, branch: branch.branch_code }
         : { ...resolveMarket(r.zip, { zipMap, branchMap }), branch: null };
 
     counters.methodCounts[res.method] = (counters.methodCounts[res.method] || 0) + 1;

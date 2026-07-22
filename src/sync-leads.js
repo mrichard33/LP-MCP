@@ -358,7 +358,7 @@ export async function upsertLeadOnly(prospect) {
     // the existing ghl_contact_id into buildLeadRow. maybeSingle() returns
     // null cleanly for brand-new leads instead of erroring.
     const { data: existing } = await supabase.from('lp_leads')
-      .select('updated_at_lp, ghl_contact_id, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified')
+      .select('updated_at_lp, ghl_contact_id, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified, lp_branch_id')
       .eq('lp_lead_id', lpLeadId).maybeSingle();
 
     // Funnel-flag staleness guard (mirrors processProspect): a Sat/ApptSet/Sold
@@ -384,7 +384,14 @@ export async function upsertLeadOnly(prospect) {
     if (newUpdatedAt && existing?.updated_at_lp && existing.updated_at_lp === newUpdatedAt && flagsUnchanged) {
       const newLeadGhlId = deriveLeadGhlId(lead, null);
       const needsGhlIdBackfill = !existing.ghl_contact_id && newLeadGhlId;
-      if (!needsGhlIdBackfill) {
+      // Branch backfill-on-skip (fix-pass 2): a row synced before lp_branch_id
+      // existed looks "unchanged" forever (LP won't bump lastchangedon just
+      // because WE added a column), so without this the branch never lands —
+      // observed live: 20/105 of tomorrow's leads had branch after hours of
+      // refreshes. Force the upsert whenever LP provides a branch we lack.
+      const needsBranchBackfill = !existing.lp_branch_id
+        && String(getField(lead, 'brn_id', 'BrnId', 'BrnID') || '').trim() !== '';
+      if (!needsGhlIdBackfill && !needsBranchBackfill) {
         _skipStats.leads++;
         count++;
         continue;
@@ -473,7 +480,7 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
 
     // ─── AGENTIC: Read existing state BEFORE upsert ──────────────
     const { data: existing } = await supabase.from('lp_leads')
-      .select('ghl_tag_applied, lp_day15_triggered, disposition_code, ghl_contact_id, updated_at_lp, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified')
+      .select('ghl_tag_applied, lp_day15_triggered, disposition_code, ghl_contact_id, updated_at_lp, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified, lp_branch_id')
       .eq('lp_lead_id', lpLeadId).single();
 
     const previousDisposition = existing?.disposition_code || null;
@@ -527,11 +534,20 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
       && (confIn == null  || existing.appointment_confirmed === (confIn === 'true' || confIn === true))
       && (verifIn == null || existing.appointment_verified  === (verifIn === 'true' || verifIn === true));
 
+    // Branch backfill-on-skip (fix-pass 2): a row synced before lp_branch_id
+    // existed looks "unchanged" forever (LP won't bump lastchangedon because
+    // WE added a column) — observed live: 20/105 of tomorrow's leads had
+    // branch after hours of refreshes. LP providing a branch we lack forces
+    // the write.
+    const needsBranchBackfill = !existing?.lp_branch_id
+      && String(getField(lead, 'brn_id', 'BrnId', 'BrnID') || '').trim() !== '';
+
     const recordUnchanged = existing?.updated_at_lp
       && newUpdatedAt
       && existing.updated_at_lp === newUpdatedAt
       && (existing.ghl_contact_id === newLeadGhlId || (!newLeadGhlId && existing.ghl_contact_id))
-      && flagsUnchanged;
+      && flagsUnchanged
+      && !needsBranchBackfill;
 
     if (recordUnchanged && !dispositionChanged) {
       _skipStats.leads++;
