@@ -61,8 +61,10 @@ const FORWARD_DAYS      = parseInt(process.env.CAPACITY_FORWARD_DAYS || '14', 10
 const NEAR_DAYS         = parseInt(process.env.CAPACITY_NEAR_DAYS || '2', 10);
 
 // Confirmed = appointments that will run (env-tunable). Set does NOT count —
-// unconfirmed appointments don't run. CXL/DNC excluded from confirmed AND
-// set_pending but still counted in appts.
+// unconfirmed appointments don't run. Verif does NOT count either (Mark,
+// 2026-07-22: verified is a step before confirmation, not equivalent to it).
+// Only CXL is excluded from confirmed AND set_pending (still counted in
+// appts) — DNC has nothing to do with capacity counting (Mark, 2026-07-22).
 //
 // 'Issue' counts as CONFIRMED (discovered live 2026-07-21 ~10pm ET): LP's
 // nightly run-sheet process mass-flips tomorrow's confirmed appointments
@@ -72,9 +74,9 @@ const NEAR_DAYS         = parseInt(process.env.CAPACITY_NEAR_DAYS || '2', 10);
 // Excluding it zeroed the board's confirmed count every night at ~10pm.
 // The boolean-preferred count still protects: a row with explicit
 // appointment_confirmed=false never counts regardless of disposition.
-const CONFIRMED_CODES = String(process.env.CAPACITY_CONFIRMED_CODES || 'Cnf,Verif,Issue')
+const CONFIRMED_CODES = String(process.env.CAPACITY_CONFIRMED_CODES || 'Cnf,Issue')
   .split(',').map((s) => s.trim()).filter(Boolean);
-const EXCLUDED_CODES = String(process.env.CAPACITY_EXCLUDED_CODES || 'CXL,DNC')
+const EXCLUDED_CODES = String(process.env.CAPACITY_EXCLUDED_CODES || 'CXL')
   .split(',').map((s) => s.trim()).filter(Boolean);
 
 // Lead re-sweep paging. Rows are multi-KB full prospect records — keep pages ≤200.
@@ -147,7 +149,7 @@ function sqlTextArray(codes) {
  * SQL boolean: is this lp_leads row a CONFIRMED appointment?
  * Prefers the explicit GetLead confirmed boolean (appointment_confirmed) over
  * disposition-code interpretation; rows synced before 1b landed are NULL and
- * fall back to disposition codes. CXL/DNC/Issue never count as confirmed even
+ * fall back to disposition codes. Excluded codes (CXL) never count as confirmed even
  * if the boolean is still true from before the cancellation.
  */
 function confirmedExprSQL() {
