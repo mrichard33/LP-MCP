@@ -24,7 +24,7 @@
 
 import supabase from '../supabase.js';
 import { syncLogStart, syncLogComplete } from '../sync-log.js';
-import { getMarketMaps, resolveMarket, buildLeadBranchMarketMap } from './market-resolver.js';
+import { getMarketMaps, resolveMarket, resolveMarketFromBranch, buildLeadBranchMarketMap } from './market-resolver.js';
 import { runSQL } from '../admin/supabase-admin.js';
 
 const TIMEZONE = 'America/New_York';
@@ -52,7 +52,7 @@ function newCounters() {
 }
 
 /**
- * Resolve a batch of lead rows ({lp_lead_id, lp_prospect_id, zip}) branch-first,
+ * Resolve a batch of lead rows ({lp_lead_id, lp_prospect_id, zip, lp_branch_id})
  * tally before/after deltas, and (unless dryRun) upsert lp_lead_market_assignments.
  * Batch size must stay ≤ CHUNK so the branch/prior lookups don't exceed PostgREST.
  */
@@ -74,12 +74,24 @@ async function resolveAndWriteBatch(leadRows, { zipMap, branchMap, dryRun, count
   const nowIso = new Date().toISOString();
   const rows = leadRows.map((r) => {
     const lead = String(r.lp_lead_id);
-    // BRANCH-FIRST: a job-bearing lead follows its job's branch. Only leads with
-    // no job branch fall back to the ZIP resolver (unchanged path).
+    // Resolution order (fix-pass 1, 2026-07-22):
+    //   1. Job branch (method='brn_map') — unchanged; revenue-authoritative,
+    //      ties the Net Report 1,710/1,710 (#512). Kept FIRST so revenue
+    //      attribution cannot flip on a lead/job branch disagreement.
+    //   2. Lead's own LP branch (lp_leads.lp_branch_id, method='branch') —
+    //      what LP's screens group by. Fixes funnel/capacity attribution:
+    //      the customer ZIP structurally disagrees with LP's branch view
+    //      (e.g. a SAR-branch lead with a 34201 mailing zip).
+    //   3. ZIP lookup (existing fallback) when no branch is known.
     const branch = branchByLead.get(lead);
+    const leadBranch = r.lp_branch_id
+      ? resolveMarketFromBranch(r.lp_branch_id, { branchMap })
+      : null;
     const res = branch
       ? { market_code: branch.market_code, method: 'brn_map', zip: null, branch: branch.branch_code }
-      : { ...resolveMarket(r.zip, { zipMap, branchMap }), branch: null };
+      : (leadBranch && leadBranch.method !== 'unmapped_branch')
+        ? { market_code: leadBranch.market_code, method: 'branch', zip: null, branch: leadBranch.branch }
+        : { ...resolveMarket(r.zip, { zipMap, branchMap }), branch: null };
 
     counters.methodCounts[res.method] = (counters.methodCounts[res.method] || 0) + 1;
     counters.marketCounts[res.market_code] = (counters.marketCounts[res.market_code] || 0) + 1;
@@ -137,7 +149,7 @@ async function getJobBearingLeadRows() {
   for (let i = 0; i < ids.length; i += CHUNK) {
     const { data, error } = await supabase
       .from('lp_leads')
-      .select('lp_lead_id, lp_prospect_id, zip')
+      .select('lp_lead_id, lp_prospect_id, zip, lp_branch_id')
       .in('lp_lead_id', ids.slice(i, i + CHUNK));
     if (error) throw new Error(`job-bearing lead hydrate failed: ${error.message}`);
     rows.push(...(data || []));
@@ -160,7 +172,7 @@ async function getJobBearingLeadRows() {
  */
 async function getForwardApptLeadRows() {
   const rows = await runSQL(`
-    SELECT lp_lead_id, lp_prospect_id, zip
+    SELECT lp_lead_id, lp_prospect_id, zip, lp_branch_id
     FROM lp_leads
     WHERE appointment_date IS NOT NULL
       AND (appointment_date AT TIME ZONE 'America/New_York')::date >= '${todayET()}'::date
@@ -208,7 +220,7 @@ export async function computeMarketAssignments({ dryRun = false, scope = 'all', 
       for (;;) {
         const { data, error } = await supabase
           .from('lp_leads')
-          .select('lp_lead_id, lp_prospect_id, zip')
+          .select('lp_lead_id, lp_prospect_id, zip, lp_branch_id')
           .order('lp_lead_id', { ascending: true })
           .range(from, from + PAGE - 1);
         if (error) throw new Error(error.message);

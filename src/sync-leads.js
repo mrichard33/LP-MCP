@@ -284,6 +284,13 @@ function buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId
   const confirmedRaw = getField(lead, 'confirmed', 'Confirmed');
   const verifiedRaw  = getField(lead, 'verified', 'Verified');
 
+  // LP's own branch attribution for the LEAD (verified live 2026-07-22:
+  // lead-level `brn_id`, e.g. "SAR"). This is what LP's screens group by —
+  // market resolution prefers it over the customer ZIP. TRIM (LP pads with
+  // trailing spaces); absent never overwrites.
+  const brnRaw = getField(lead, 'brn_id', 'BrnId', 'BrnID');
+  const lpBranchId = brnRaw == null ? undefined : (String(brnRaw).trim().toUpperCase() || undefined);
+
   return {
     row: {
       lp_lead_id:         lpLeadId,
@@ -301,6 +308,7 @@ function buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId
       lead_source:        eff.source,
       lead_source_detail: eff.sourcesubdescr,
       promoter_name:      getField(lead, 'promotername', 'PromoterName'),
+      lp_branch_id:       lpBranchId,
       ghl_intent_bucket:  bucket,
       ghl_entry_tag:      tag,
       disposition_code:   getField(lead, 'disposition', 'Disposition'),
@@ -771,6 +779,10 @@ export async function upsertLeadFromFlat(lp, ghlId) {
     lead_source:        effFlat.source,
     lead_source_detail: effFlat.sourcesubdescr,
     promoter_name:      getField(lp, 'promotername', 'PromoterName'),
+    lp_branch_id:       (() => {
+      const b = getField(lp, 'brn_id', 'BrnId', 'BrnID');
+      return b == null ? undefined : (String(b).trim().toUpperCase() || undefined);
+    })(),
     disposition_code:   getField(lp, 'disposition', 'Disposition'),
     rep_name:           getField(lp, 'salesrepname', 'SalesRepName', 'rep_name'),
     created_at_lp:      lpDateToEastern(getField(lp, 'dateadded', 'DateAdded', 'entrydate', 'EntryDate')),
