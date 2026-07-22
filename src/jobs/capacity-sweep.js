@@ -534,8 +534,16 @@ async function buildBoardResponse(date) {
   }
 
   const lastSweepAt = sweepRows?.[0]?.last_sweep_at || null;
+  // Stale threshold: 3× the interval, floor 15 min. A full sweep (near-window
+  // refresh + change-window pages) can legitimately run LONGER than the
+  // interval — the overlap guard then skips ticks, so consecutive sweep
+  // STARTS can be ~2 intervals apart in healthy operation. 2× flagged that
+  // as stale (observed live 2026-07-22: banner at 12 min on a 5-min
+  // cadence with nothing wrong). 3× + floor keeps the flag meaningful:
+  // a genuinely dead sweep still surfaces within 15 min.
+  const staleAfterMs = Math.max(3 * SWEEP_INTERVAL_MS, 15 * 60 * 1000);
   const stale = !lastSweepAt
-    || (Date.now() - new Date(lastSweepAt).getTime()) > 2 * SWEEP_INTERVAL_MS;
+    || (Date.now() - new Date(lastSweepAt).getTime()) > staleAfterMs;
 
   return {
     date,
