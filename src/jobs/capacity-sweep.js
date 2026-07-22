@@ -103,12 +103,20 @@ function etDateOf(lpDateStr) {
   }).format(d);
 }
 
-/** Normalize a GetSalesSchedule Date value to YYYY-MM-DD. */
+/**
+ * Normalize a GetSalesSchedule Date value to YYYY-MM-DD.
+ * VERIFIED live 2026-07-21: LP returns "7/21/26" — M/D/YY with a TWO-digit
+ * year. Handle ISO, M/D/YYYY, and M/D/YY; anything else returns null (the
+ * caller skips the day rather than writing a garbage slot_date).
+ */
 function normalizeSlotDate(raw) {
   const s = String(raw ?? '').trim();
   if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
-  const mdY = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/); // M/D/YYYY fallback
-  if (mdY) return `${mdY[3]}-${mdY[1].padStart(2, '0')}-${mdY[2].padStart(2, '0')}`;
+  const mdy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2}(?:\d{2})?)(?:\D|$)/);
+  if (mdy) {
+    const year = mdy[3].length === 2 ? `20${mdy[3]}` : mdy[3];
+    return `${year}-${mdy[1].padStart(2, '0')}-${mdy[2].padStart(2, '0')}`;
+  }
   return null;
 }
 
