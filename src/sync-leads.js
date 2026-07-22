@@ -277,6 +277,13 @@ function buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId
   const isDemoCompleted = sat === 'true' || sat === true;
   const isClosedWon = sold === 'true' || sold === true;
 
+  // Capacity board: GetLead rows carry explicit confirmed/verified booleans —
+  // preferred over disposition-code interpretation for the Confirmed count.
+  // Only stamped when LP actually sent the field: an absent field must not
+  // flip a previously-true value back to false on an unrelated re-sync.
+  const confirmedRaw = getField(lead, 'confirmed', 'Confirmed');
+  const verifiedRaw  = getField(lead, 'verified', 'Verified');
+
   return {
     row: {
       lp_lead_id:         lpLeadId,
@@ -299,6 +306,12 @@ function buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId
       disposition_code:   getField(lead, 'disposition', 'Disposition'),
       rep_name:           getField(lead, 'salesrepname', 'SalesRepName'),
       appointment_set:    isApptSet,
+      // undefined values are dropped at serialization, so an absent LP field
+      // leaves the stored boolean untouched instead of overwriting it.
+      appointment_confirmed: (confirmedRaw === undefined || confirmedRaw === null)
+        ? undefined : (confirmedRaw === 'true' || confirmedRaw === true),
+      appointment_verified:  (verifiedRaw === undefined || verifiedRaw === null)
+        ? undefined : (verifiedRaw === 'true' || verifiedRaw === true),
       appointment_date:   lpDateToEastern(getField(lead, 'apptdate', 'ApptDate')),
       demo_completed:     isDemoCompleted,
       demo_date:          isDemoCompleted ? lpDateToEastern(getField(lead, 'apptdate', 'ApptDate')) : null,
@@ -337,22 +350,28 @@ export async function upsertLeadOnly(prospect) {
     // the existing ghl_contact_id into buildLeadRow. maybeSingle() returns
     // null cleanly for brand-new leads instead of erroring.
     const { data: existing } = await supabase.from('lp_leads')
-      .select('updated_at_lp, ghl_contact_id, demo_completed, appointment_set, closed_won')
+      .select('updated_at_lp, ghl_contact_id, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified')
       .eq('lp_lead_id', lpLeadId).maybeSingle();
 
     // Funnel-flag staleness guard (mirrors processProspect): a Sat/ApptSet/Sold
     // flip that doesn't bump LastChangedOn must still force the upsert, or even
     // a full re-sync (Pass 1) leaves demo_completed/appointment_set/closed_won stale.
+    // Confirmed/Verified join the guard (capacity board) — compared only when LP
+    // actually sent the field, since an absent field never overwrites.
     const apptSetIn = getField(lead, 'apptset', 'ApptSet');
     const satIn     = getField(lead, 'sat', 'Sat');
     const soldIn    = getField(lead, 'sold', 'Sold');
+    const confIn    = getField(lead, 'confirmed', 'Confirmed');
+    const verifIn   = getField(lead, 'verified', 'Verified');
     const isApptSetIn = apptSetIn === 'true' || apptSetIn === true;
     const isDemoIn    = satIn === 'true' || satIn === true;
     const isSoldIn    = soldIn === 'true' || soldIn === true;
     const flagsUnchanged = existing
       && existing.appointment_set === isApptSetIn
       && existing.demo_completed  === isDemoIn
-      && existing.closed_won      === isSoldIn;
+      && existing.closed_won      === isSoldIn
+      && (confIn == null  || existing.appointment_confirmed === (confIn === 'true' || confIn === true))
+      && (verifIn == null || existing.appointment_verified  === (verifIn === 'true' || verifIn === true));
 
     if (newUpdatedAt && existing?.updated_at_lp && existing.updated_at_lp === newUpdatedAt && flagsUnchanged) {
       const newLeadGhlId = deriveLeadGhlId(lead, null);
@@ -446,7 +465,7 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
 
     // ─── AGENTIC: Read existing state BEFORE upsert ──────────────
     const { data: existing } = await supabase.from('lp_leads')
-      .select('ghl_tag_applied, lp_day15_triggered, disposition_code, ghl_contact_id, updated_at_lp, demo_completed, appointment_set, closed_won')
+      .select('ghl_tag_applied, lp_day15_triggered, disposition_code, ghl_contact_id, updated_at_lp, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified')
       .eq('lp_lead_id', lpLeadId).single();
 
     const previousDisposition = existing?.disposition_code || null;
@@ -486,13 +505,19 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
     const apptSetIn = getField(lead, 'apptset', 'ApptSet');
     const satIn     = getField(lead, 'sat', 'Sat');
     const soldIn    = getField(lead, 'sold', 'Sold');
+    const confIn    = getField(lead, 'confirmed', 'Confirmed');
+    const verifIn   = getField(lead, 'verified', 'Verified');
     const isApptSetIn = apptSetIn === 'true' || apptSetIn === true;
     const isDemoIn    = satIn === 'true' || satIn === true;
     const isSoldIn    = soldIn === 'true' || soldIn === true;
+    // Confirmed/Verified join the guard (capacity board) — compared only when
+    // LP actually sent the field, since an absent field never overwrites.
     const flagsUnchanged = existing
       && existing.appointment_set === isApptSetIn
       && existing.demo_completed  === isDemoIn
-      && existing.closed_won      === isSoldIn;
+      && existing.closed_won      === isSoldIn
+      && (confIn == null  || existing.appointment_confirmed === (confIn === 'true' || confIn === true))
+      && (verifIn == null || existing.appointment_verified  === (verifIn === 'true' || verifIn === true));
 
     const recordUnchanged = existing?.updated_at_lp
       && newUpdatedAt
