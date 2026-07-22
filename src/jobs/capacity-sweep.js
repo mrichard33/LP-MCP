@@ -87,8 +87,15 @@ const EXCLUDED_CODES = String(process.env.CAPACITY_EXCLUDED_CODES || 'CXL,DNC')
   .split(',').map((s) => s.trim()).filter(Boolean);
 
 // Lead re-sweep paging. Rows are multi-KB full prospect records — keep pages ≤200.
-const LEAD_PAGE_SIZE   = Math.min(200, parseInt(process.env.CAPACITY_LEAD_PAGE_SIZE || '200', 10));
-const LEAD_MAX_PAGES   = parseInt(process.env.CAPACITY_LEAD_MAX_PAGES || '50', 10);
+// PageSize 50, not 200 (2026-07-22): GetLead rows are ENORMOUS full prospect
+// records (embedded jobs, milestones, payments, notes — a sold customer can be
+// hundreds of KB). At PageSize 200, LP's server times out assembling pages at
+// deeper offsets ("Execution Timeout Expired" 500s) — page 2 of the change
+// window consistently failed while a 1-row probe of the same offset returned
+// data, so everything past row ~199 was silently lost (8 of Thursday's Set
+// appointments, live repro). Smaller pages are responses LP can actually serve.
+const LEAD_PAGE_SIZE   = Math.min(200, parseInt(process.env.CAPACITY_LEAD_PAGE_SIZE || '50', 10));
+const LEAD_MAX_PAGES   = parseInt(process.env.CAPACITY_LEAD_MAX_PAGES || '80', 10);
 const LEAD_CONCURRENCY = parseInt(process.env.CAPACITY_LEAD_CONCURRENCY || '3', 10);
 const PROSPECT_TIMEOUT_MS = parseInt(process.env.SYNC_PROSPECT_TIMEOUT_SEC || '60', 10) * 1000;
 
@@ -274,8 +281,23 @@ async function sweepForwardLeadDispositions(windowStart, windowEnd) {
       });
       items = extractArray(res);
     } catch (err) {
-      console.error(`[CapacitySweep] GetLead page startIndex=${startIndex} failed: ${err.message}`);
-      break;
+      // A failed page means TRUNCATION, not completion — LP's server can
+      // 500 ("Execution Timeout") on heavy pages. Retry once at a quarter
+      // of the page size (lighter response) before giving up, and surface
+      // the truncation in stats — no silent caps.
+      console.error(`[CapacitySweep] GetLead page startIndex=${startIndex} failed: ${err.message} — retrying smaller`);
+      try {
+        const res = await getLeads({
+          startdate: changeStart, enddate: changeEnd,
+          PageSize: Math.max(10, Math.floor(LEAD_PAGE_SIZE / 4)), StartIndex: startIndex,
+        });
+        items = extractArray(res);
+      } catch (err2) {
+        stats.truncated_at = startIndex;
+        stats.page_error = String(err2.message || err2).slice(0, 200);
+        console.error(`[CapacitySweep] GetLead page startIndex=${startIndex} failed after small-page retry — change sweep TRUNCATED: ${err2.message}`);
+        break;
+      }
     }
     if (!items.length) break;
     stats.pages++;
