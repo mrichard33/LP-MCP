@@ -367,51 +367,44 @@ async function refreshNearWindowLeads(windowStart) {
   return stats;
 }
 
-// ─── Sweep orchestration ─────────────────────────────────────────────────────
+// ─── Sweep orchestration — SPLIT into fast + lead passes (2026-07-22) ────────
+//
+// The monolithic sweep took 20+ minutes end-to-end (near-window per-lead
+// refresh + change-window paging are inherently slow at polite throttle),
+// so consecutive sweep STARTS drifted far past the interval and the board's
+// freshness stamp (max swept_at) went stale in healthy operation — the
+// recurring DATA STALE banner. Split:
+//
+//   FAST pass  (every CAPACITY_SWEEP_INTERVAL_MS): slots sweep (ONE LP call)
+//              + forward market assignments. Seconds. Keeps swept_at — and
+//              therefore the board's freshness — advancing every interval.
+//   LEAD pass  (continuous loop, 60s pause between cycles): near-window
+//              per-lead refresh + change-window sweep + assignments. Runs
+//              back-to-back at whatever pace LP allows; the board's numerator
+//              is at most one cycle (~10-20 min) behind LP, and the fast
+//              pass keeps re-aggregating whatever it has landed so far.
 
-let sweepInProgress = false;
-let lastSweepSummary = null;
+let fastInProgress = false;
+let leadInProgress = false;
+let lastFastSummary = null;
+let lastLeadSummary = null;
 let lastSnapshotSummary = null;
 
-export async function runCapacitySweep() {
-  if (sweepInProgress) {
-    console.warn('[CapacitySweep] Previous sweep still running — skipping this tick');
-    return { skipped: true, reason: 'sweep_in_progress' };
-  }
-  sweepInProgress = true;
+/** Fast pass: denominator + assignments. Seconds — safe on a strict interval. */
+export async function runFastCapacityPass() {
+  if (fastInProgress) return { skipped: true, reason: 'fast_pass_in_progress' };
+  fastInProgress = true;
   const startedAt = Date.now();
   const start = todayET();
   const end = addDays(start, FORWARD_DAYS);
   const summary = { started_at: new Date().toISOString(), window: { start, end } };
-
   try {
-    // a. Denominator — slots
     try {
       summary.slots = await sweepCapacitySlots(start, end);
     } catch (err) {
       summary.slots = { error: err.message };
       console.error('[CapacitySweep] slot sweep failed:', err.message);
     }
-
-    // b'. Near-window full refresh — exact counts for the board's dates
-    try {
-      summary.near_refresh = await refreshNearWindowLeads(start);
-    } catch (err) {
-      summary.near_refresh = { error: err.message };
-      console.error('[CapacitySweep] near-window refresh failed:', err.message);
-    }
-
-    // b. Numerator — forward-window lead dispositions (catches NEW
-    // appointments farther out; the near-window refresh above covers
-    // mutations on the dates that matter most)
-    try {
-      summary.leads = await sweepForwardLeadDispositions(start, end);
-    } catch (err) {
-      summary.leads = { error: err.message };
-      console.error('[CapacitySweep] lead re-sweep failed:', err.message);
-    }
-
-    // c. Market assignments for the forward cohort (nightly 'all' run untouched)
     try {
       const assign = await computeMarketAssignments({ scope: 'forward_appts' });
       summary.assignments = {
@@ -422,14 +415,62 @@ export async function runCapacitySweep() {
       summary.assignments = { error: err.message };
       console.error('[CapacitySweep] forward market assignment failed:', err.message);
     }
-
     summary.elapsed_ms = Date.now() - startedAt;
-    lastSweepSummary = summary;
-    console.log(`[CapacitySweep] done window=${start}..${end} slots=${summary.slots?.slots ?? '?'} nearRefreshed=${summary.near_refresh?.processed ?? '?'}/${summary.near_refresh?.leads ?? '?'} leadsMatched=${summary.leads?.matched ?? '?'} elapsed=${summary.elapsed_ms}ms`);
+    lastFastSummary = summary;
+    console.log(`[CapacitySweep] fast pass done slots=${summary.slots?.slots ?? '?'} assignChanged=${summary.assignments?.changed ?? '?'} elapsed=${summary.elapsed_ms}ms`);
     return summary;
   } finally {
-    sweepInProgress = false;
+    fastInProgress = false;
   }
+}
+
+/** Lead pass: near-window refresh + change-window sweep + assignments. Slow. */
+export async function runLeadRefreshPass() {
+  if (leadInProgress) return { skipped: true, reason: 'lead_pass_in_progress' };
+  leadInProgress = true;
+  const startedAt = Date.now();
+  const start = todayET();
+  const end = addDays(start, FORWARD_DAYS);
+  const summary = { started_at: new Date().toISOString(), window: { start, end } };
+  try {
+    try {
+      summary.near_refresh = await refreshNearWindowLeads(start);
+    } catch (err) {
+      summary.near_refresh = { error: err.message };
+      console.error('[CapacitySweep] near-window refresh failed:', err.message);
+    }
+    try {
+      summary.leads = await sweepForwardLeadDispositions(start, end);
+    } catch (err) {
+      summary.leads = { error: err.message };
+      console.error('[CapacitySweep] lead re-sweep failed:', err.message);
+    }
+    // Re-assign right after the lead work so freshly-landed branches/appts
+    // resolve without waiting for the next fast tick.
+    try {
+      const assign = await computeMarketAssignments({ scope: 'forward_appts' });
+      summary.assignments = {
+        success: assign.success, processed: assign.processed, changed: assign.changed,
+        ...(assign.error ? { error: assign.error } : {}),
+      };
+    } catch (err) {
+      summary.assignments = { error: err.message };
+      console.error('[CapacitySweep] forward market assignment failed:', err.message);
+    }
+    summary.elapsed_ms = Date.now() - startedAt;
+    lastLeadSummary = summary;
+    console.log(`[CapacitySweep] lead pass done nearRefreshed=${summary.near_refresh?.processed ?? '?'}/${summary.near_refresh?.leads ?? '?'} changeMatched=${summary.leads?.matched ?? '?'} elapsed=${summary.elapsed_ms}ms`);
+    return summary;
+  } finally {
+    leadInProgress = false;
+  }
+}
+
+/** Manual full sweep (admin route): both passes, sequentially. */
+export async function runCapacitySweep() {
+  const fast = await runFastCapacityPass();
+  const leads = await runLeadRefreshPass();
+  return { fast, leads };
 }
 
 // ─── Nightly fill snapshot (23:50 ET) ────────────────────────────────────────
@@ -577,12 +618,15 @@ export function registerCapacityBoardRoutes(app) {
 
   app.get('/admin/capacity-sweep/status', (req, res) => {
     res.json({
-      sweep_in_progress: sweepInProgress,
+      fast_pass_in_progress: fastInProgress,
+      lead_pass_in_progress: leadInProgress,
       interval_ms: SWEEP_INTERVAL_MS,
       forward_days: FORWARD_DAYS,
       confirmed_codes: CONFIRMED_CODES,
+      at_risk_codes: AT_RISK_CODES,
       excluded_codes: EXCLUDED_CODES,
-      last_sweep: lastSweepSummary,
+      last_fast_pass: lastFastSummary,
+      last_lead_pass: lastLeadSummary,
       last_snapshot: lastSnapshotSummary,
     });
   });
@@ -603,23 +647,42 @@ export function registerCapacityBoardRoutes(app) {
 // ─── Schedulers ──────────────────────────────────────────────────────────────
 
 let sweepTimer = null;
+let leadLoopTimer = null;
 let snapshotTimer = null;
 let lastSnapshotDate = null;
 
+// Pause between lead-pass cycles. The loop is chained (next cycle scheduled
+// only after the previous completes), so cycles never overlap regardless of
+// how long a pass runs.
+const LEAD_LOOP_PAUSE_MS = parseInt(process.env.CAPACITY_LEAD_LOOP_PAUSE_MS || '60000', 10);
+
 export function startCapacitySweepScheduler() {
   if (sweepTimer) return;
-  console.log(`[CapacitySweep] Scheduler started — every ${SWEEP_INTERVAL_MS / 60000} min, forward window ${FORWARD_DAYS} days, near-window ${NEAR_DAYS} days; snapshot nightly at 23:50 ET`);
+  console.log(`[CapacitySweep] Scheduler started — fast pass every ${SWEEP_INTERVAL_MS / 60000} min; lead pass continuous (${LEAD_LOOP_PAUSE_MS / 1000}s between cycles); forward window ${FORWARD_DAYS} days, near-window ${NEAR_DAYS} days; snapshot nightly at 23:50 ET`);
   // Effective disposition→bucket mapping (fix-pass 2): every board count
   // derives from exactly this. Codes in none of the lists count in appts only.
   console.log(`[CapacityBoard] disposition mapping — CONFIRMED: [${CONFIRMED_CODES.join(', ')}] | AT-RISK: [${AT_RISK_CODES.join(', ')}] | EXCLUDED: [${EXCLUDED_CODES.join(', ')}] | all other codes: appts only. Explicit appointment_confirmed boolean preferred when present.`);
 
-  // First sweep shortly after boot so the board is fresh after a deploy.
+  // Fast pass: first run shortly after boot (fresh board after a deploy),
+  // then on a strict interval — it finishes in seconds, so it never overlaps.
   setTimeout(() => {
-    runCapacitySweep().catch((err) => console.error('[CapacitySweep] initial sweep failed:', err.message));
+    runFastCapacityPass().catch((err) => console.error('[CapacitySweep] initial fast pass failed:', err.message));
   }, 15000);
   sweepTimer = setInterval(() => {
-    runCapacitySweep().catch((err) => console.error('[CapacitySweep] sweep failed:', err.message));
+    runFastCapacityPass().catch((err) => console.error('[CapacitySweep] fast pass failed:', err.message));
   }, SWEEP_INTERVAL_MS);
+
+  // Lead pass: continuous chained loop — each cycle starts only after the
+  // previous one finishes, so a long cycle delays (never stacks) the next.
+  const leadLoop = async () => {
+    try {
+      await runLeadRefreshPass();
+    } catch (err) {
+      console.error('[CapacitySweep] lead pass failed:', err.message);
+    }
+    leadLoopTimer = setTimeout(leadLoop, LEAD_LOOP_PAUSE_MS);
+  };
+  leadLoopTimer = setTimeout(leadLoop, 30000);
 
   // 23:50 ET snapshot — minute-granularity check; claim the date before
   // awaiting so a slow run can't double-fire.
@@ -643,5 +706,6 @@ export function startCapacitySweepScheduler() {
 
 export function stopCapacitySweepScheduler() {
   if (sweepTimer) { clearInterval(sweepTimer); sweepTimer = null; }
+  if (leadLoopTimer) { clearTimeout(leadLoopTimer); leadLoopTimer = null; }
   if (snapshotTimer) { clearInterval(snapshotTimer); snapshotTimer = null; }
 }
