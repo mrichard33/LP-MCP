@@ -495,6 +495,54 @@ export async function runCapacitySweep() {
   return { fast, leads };
 }
 
+// ─── Hourly fill history (Mark, 2026-07-22) ──────────────────────────────────
+//
+// Hour-by-hour companion to the nightly snapshot: the board's counts for every
+// (slot_date, market) in the forward window, written at the top of each hour.
+// Insert-only. Enables trending BY TIME OF DAY ("how do Thursdays book between
+// 9am and noon?"). Bounded to the board window so junk far-future dates (the
+// year-2924 typo) never enter. days_out is computed in SQL from the ET date of
+// the snapshot hour — TIMEZONE RULE applies.
+let lastHourlySummary = null;
+
+export async function runHourlyFillSnapshot() {
+  const CONF = confirmedExprSQL();
+  const today = todayET();
+  const end = addDays(today, FORWARD_DAYS);
+  const sql = `
+    INSERT INTO lp_appt_fill_hourly (snapshot_hour, slot_date, market, requested, confirmed, set_pending, days_out)
+    SELECT date_trunc('hour', now()),
+           COALESCE(d.slot_date, n.slot_date),
+           COALESCE(d.market, n.market),
+           COALESCE(d.requested, 0),
+           COALESCE(n.confirmed, 0),
+           COALESCE(n.set_pending, 0),
+           (COALESCE(d.slot_date, n.slot_date)
+             - (date_trunc('hour', now()) AT TIME ZONE 'America/New_York')::date)
+    FROM (
+      SELECT slot_date, market, requested
+      FROM v_appt_board
+      WHERE slot_date BETWEEN '${today}'::date AND '${end}'::date
+    ) d
+    FULL OUTER JOIN (
+      SELECT (l.appointment_date AT TIME ZONE 'America/New_York')::date AS slot_date,
+             COALESCE(a.resolved_market_code, 'UNRESOLVED') AS market,
+             count(*) FILTER (WHERE ${CONF}) AS confirmed,
+             count(*) FILTER (WHERE l.disposition_code = ANY (${sqlTextArray(AT_RISK_CODES)}) AND NOT (${CONF})) AS set_pending
+      FROM lp_leads l
+      LEFT JOIN lp_lead_market_assignments a ON a.lead_id = l.lp_lead_id
+      WHERE l.appointment_date IS NOT NULL
+        AND (l.appointment_date AT TIME ZONE 'America/New_York')::date
+            BETWEEN '${today}'::date AND '${end}'::date
+      GROUP BY 1, 2
+    ) n ON n.slot_date = d.slot_date AND n.market = d.market
+    ON CONFLICT DO NOTHING`;
+  await runSQL(sql);
+  lastHourlySummary = { ran_at: new Date().toISOString() };
+  console.log('[CapacityHourly] wrote hourly fill history row set');
+  return lastHourlySummary;
+}
+
 // ─── Nightly fill snapshot (23:50 ET) ────────────────────────────────────────
 
 export async function runFillSnapshot(snapshotDate = todayET()) {
@@ -650,6 +698,7 @@ export function registerCapacityBoardRoutes(app) {
       last_fast_pass: lastFastSummary,
       last_lead_pass: lastLeadSummary,
       last_snapshot: lastSnapshotSummary,
+      last_hourly: lastHourlySummary,
     });
   });
 
@@ -663,6 +712,11 @@ export function registerCapacityBoardRoutes(app) {
     runFillSnapshot().catch((err) => console.error('[CapacitySnapshot] manual run failed:', err.message));
   });
 
+  app.post('/admin/capacity-hourly/run', (req, res) => {
+    res.status(202).json({ ok: true, mode: 'async', status_url: '/admin/capacity-sweep/status' });
+    runHourlyFillSnapshot().catch((err) => console.error('[CapacityHourly] manual run failed:', err.message));
+  });
+
   console.log('[CapacityBoard] Routes: GET /board/capacity, GET /admin/capacity-sweep/status, POST /admin/capacity-sweep/run, POST /admin/capacity-snapshot/run');
 }
 
@@ -672,6 +726,7 @@ let sweepTimer = null;
 let leadLoopTimer = null;
 let snapshotTimer = null;
 let lastSnapshotDate = null;
+let lastHourlyKey = null;
 
 // Pause between lead-pass cycles. The loop is chained (next cycle scheduled
 // only after the previous completes), so cycles never overlap regardless of
@@ -706,8 +761,9 @@ export function startCapacitySweepScheduler() {
   };
   leadLoopTimer = setTimeout(leadLoop, 30000);
 
-  // 23:50 ET snapshot — minute-granularity check; claim the date before
-  // awaiting so a slow run can't double-fire.
+  // Minute-granularity clock checks: 23:50 ET nightly snapshot + top-of-hour
+  // history write. Claim the date/hour key before awaiting so a slow run
+  // can't double-fire; ON CONFLICT DO NOTHING backstops restarts.
   snapshotTimer = setInterval(async () => {
     const parts = new Intl.DateTimeFormat('en-US', {
       timeZone: TIMEZONE, hour: '2-digit', minute: '2-digit', hour12: false,
@@ -721,6 +777,17 @@ export function startCapacitySweepScheduler() {
         await runFillSnapshot(today);
       } catch (err) {
         console.error('[CapacitySnapshot] nightly run failed:', err.message);
+      }
+    }
+    // Hourly history: fire in the first minutes of each hour (window, not an
+    // exact minute, so a busy tick or restart can't skip a whole hour).
+    const hourKey = `${today}T${String(hour).padStart(2, '0')}`;
+    if (minute < 5 && lastHourlyKey !== hourKey) {
+      lastHourlyKey = hourKey;
+      try {
+        await runHourlyFillSnapshot();
+      } catch (err) {
+        console.error('[CapacityHourly] hourly run failed:', err.message);
       }
     }
   }, 60 * 1000);

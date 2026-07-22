@@ -364,8 +364,18 @@ async function runMigrations() {
               days_out      int  GENERATED ALWAYS AS (slot_date - snapshot_date) STORED,
               PRIMARY KEY (snapshot_date, slot_date, market));
             ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS lp_branch_id text;
-            CREATE INDEX IF NOT EXISTS idx_lp_leads_branch ON lp_leads(lp_branch_id);`);
-    console.log('[Migration] capacity board schema (sql/043 + 044) ready');
+            CREATE INDEX IF NOT EXISTS idx_lp_leads_branch ON lp_leads(lp_branch_id);
+            CREATE TABLE IF NOT EXISTS lp_appt_fill_hourly (
+              snapshot_hour timestamptz NOT NULL,
+              slot_date     date NOT NULL,
+              market        text NOT NULL,
+              requested     int  NOT NULL DEFAULT 0,
+              confirmed     int  NOT NULL DEFAULT 0,
+              set_pending   int  NOT NULL DEFAULT 0,
+              days_out      int  NOT NULL,
+              PRIMARY KEY (snapshot_hour, slot_date, market));
+            CREATE INDEX IF NOT EXISTS idx_lp_appt_fill_hourly_slot ON lp_appt_fill_hourly(slot_date, snapshot_hour);`);
+    console.log('[Migration] capacity board schema (sql/043 + 044 + 045) ready');
   } catch (err) {
     console.error('[Migration] capacity board schema FAILED (board + lead upserts depend on it — apply sql/043 manually):', err.message);
   }
