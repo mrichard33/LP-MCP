@@ -60,12 +60,21 @@ const FORWARD_DAYS      = parseInt(process.env.CAPACITY_FORWARD_DAYS || '14', 10
 // LP's change-window semantics or its documented internal result cap.
 const NEAR_DAYS         = parseInt(process.env.CAPACITY_NEAR_DAYS || '2', 10);
 
-// Confirmed = Cnf + Verif equivalent (Mark, binding; env-tunable). Set does
-// NOT count — unconfirmed appointments don't run. CXL/DNC/Issue are excluded
-// from confirmed AND set_pending but still counted in appts.
-const CONFIRMED_CODES = String(process.env.CAPACITY_CONFIRMED_CODES || 'Cnf,Verif')
+// Confirmed = appointments that will run (env-tunable). Set does NOT count —
+// unconfirmed appointments don't run. CXL/DNC excluded from confirmed AND
+// set_pending but still counted in appts.
+//
+// 'Issue' counts as CONFIRMED (discovered live 2026-07-21 ~10pm ET): LP's
+// nightly run-sheet process mass-flips tomorrow's confirmed appointments
+// Cnf → disposition 'Issue' with issued=true — issued-to-rep, the strongest
+// will-run state (repro: lead 556824, a fully text-confirmed customer). The
+// cached lp_dispositions label "Issue / Problem" does not describe this flow.
+// Excluding it zeroed the board's confirmed count every night at ~10pm.
+// The boolean-preferred count still protects: a row with explicit
+// appointment_confirmed=false never counts regardless of disposition.
+const CONFIRMED_CODES = String(process.env.CAPACITY_CONFIRMED_CODES || 'Cnf,Verif,Issue')
   .split(',').map((s) => s.trim()).filter(Boolean);
-const EXCLUDED_CODES = String(process.env.CAPACITY_EXCLUDED_CODES || 'CXL,DNC,Issue')
+const EXCLUDED_CODES = String(process.env.CAPACITY_EXCLUDED_CODES || 'CXL,DNC')
   .split(',').map((s) => s.trim()).filter(Boolean);
 
 // Lead re-sweep paging. Rows are multi-KB full prospect records — keep pages ≤200.
