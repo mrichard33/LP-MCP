@@ -45,8 +45,8 @@
 
 import supabase from '../supabase.js';
 import { runSQL } from '../admin/supabase-admin.js';
-import { getSalesSchedule, getLeads } from '../lp-client.js';
-import { getField, extractArray } from '../sync-utils.js';
+import { getSalesSchedule, getLeads, getLeadByLdsId } from '../lp-client.js';
+import { getField, extractArray, sleep, RATE_LIMIT_SLEEP_MS } from '../sync-utils.js';
 import { lpDateToEastern } from '../lp-dates.js';
 import { processProspect } from '../sync-leads.js';
 import { computeMarketAssignments } from './market-assignment-daily.js';
@@ -55,6 +55,10 @@ const TIMEZONE = 'America/New_York';
 
 const SWEEP_INTERVAL_MS = parseInt(process.env.CAPACITY_SWEEP_INTERVAL_MS || '900000', 10);
 const FORWARD_DAYS      = parseInt(process.env.CAPACITY_FORWARD_DAYS || '14', 10);
+// Near-window full refresh: the dates the board is FOR (today/tomorrow) are
+// re-fetched PER LEAD every sweep, so their counts are exact regardless of
+// LP's change-window semantics or its documented internal result cap.
+const NEAR_DAYS         = parseInt(process.env.CAPACITY_NEAR_DAYS || '2', 10);
 
 // Confirmed = Cnf + Verif equivalent (Mark, binding; env-tunable). Set does
 // NOT count — unconfirmed appointments don't run. CXL/DNC/Issue are excluded
@@ -280,9 +284,53 @@ async function sweepForwardLeadDispositions(windowStart, windowEnd) {
     });
 
     startIndex += items.length;
-    if (items.length < LEAD_PAGE_SIZE) break;
+    // DIAGNOSED 2026-07-22 (drift repro): LP habitually returns slightly-short
+    // pages (199 of 200) with MORE pages behind them — StartIndex=200 on the
+    // same window returned further full rows. Treating a short page as the
+    // last page ended the sweep after page 1 and the changed prospects on
+    // pages 2+ were never fetched (the 8/3/3 evening drift). Only an EMPTY
+    // page terminates; LEAD_MAX_PAGES stays as the runaway backstop.
   }
 
+  return stats;
+}
+
+// ─── b'. Near-window full refresh — per-lead re-fetch for board dates ────────
+//
+// The change-window sweep catches new appointments but depends on LP's
+// change-date filtering + paging, which the 2026-07-22 drift repro showed to
+// be lossy at the margins (short-page truncation; LP also documents an
+// internal result cap on window queries). For the dates the board is FOR
+// (today .. today+CAPACITY_NEAR_DAYS) we don't trust the window at all:
+// every known lead with an appointment in that range is re-fetched directly
+// by lds_id and pushed through processProspect — the same writer, so the
+// confirmed/verified booleans and brn_id map exactly as on every other path.
+// ~100–200 GetLead calls per sweep, throttled.
+async function refreshNearWindowLeads(windowStart) {
+  const nearEnd = addDays(windowStart, NEAR_DAYS);
+  const rows = await runSQL(`
+    SELECT lp_lead_id
+    FROM lp_leads
+    WHERE appointment_date IS NOT NULL
+      AND (appointment_date AT TIME ZONE 'America/New_York')::date
+          BETWEEN '${windowStart}'::date AND '${nearEnd}'::date`);
+  const leadIds = (Array.isArray(rows) ? rows : []).map((r) => String(r.lp_lead_id)).filter(Boolean);
+
+  const stats = { near_end: nearEnd, leads: leadIds.length, processed: 0, failed: 0 };
+  await processInBatches(leadIds, LEAD_CONCURRENCY, async (ldsId) => {
+    try {
+      const res = await getLeadByLdsId(ldsId);
+      const prospect = extractArray(res)[0];
+      if (!prospect) return; // lead gone from LP — nothing to refresh
+      await withTimeout(processProspect(prospect), PROSPECT_TIMEOUT_MS, `lds_id=${ldsId}`);
+      stats.processed++;
+    } catch (err) {
+      stats.failed++;
+      console.warn(`[CapacitySweep] near-window refresh lds_id=${ldsId} failed: ${err.message}`);
+    } finally {
+      await sleep(RATE_LIMIT_SLEEP_MS); // LP monitors for excessive use
+    }
+  });
   return stats;
 }
 
@@ -312,7 +360,17 @@ export async function runCapacitySweep() {
       console.error('[CapacitySweep] slot sweep failed:', err.message);
     }
 
-    // b. Numerator — forward-window lead dispositions
+    // b'. Near-window full refresh — exact counts for the board's dates
+    try {
+      summary.near_refresh = await refreshNearWindowLeads(start);
+    } catch (err) {
+      summary.near_refresh = { error: err.message };
+      console.error('[CapacitySweep] near-window refresh failed:', err.message);
+    }
+
+    // b. Numerator — forward-window lead dispositions (catches NEW
+    // appointments farther out; the near-window refresh above covers
+    // mutations on the dates that matter most)
     try {
       summary.leads = await sweepForwardLeadDispositions(start, end);
     } catch (err) {
@@ -334,7 +392,7 @@ export async function runCapacitySweep() {
 
     summary.elapsed_ms = Date.now() - startedAt;
     lastSweepSummary = summary;
-    console.log(`[CapacitySweep] done window=${start}..${end} slots=${summary.slots?.slots ?? '?'} leadsMatched=${summary.leads?.matched ?? '?'} elapsed=${summary.elapsed_ms}ms`);
+    console.log(`[CapacitySweep] done window=${start}..${end} slots=${summary.slots?.slots ?? '?'} nearRefreshed=${summary.near_refresh?.processed ?? '?'}/${summary.near_refresh?.leads ?? '?'} leadsMatched=${summary.leads?.matched ?? '?'} elapsed=${summary.elapsed_ms}ms`);
     return summary;
   } finally {
     sweepInProgress = false;
