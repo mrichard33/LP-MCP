@@ -40,7 +40,12 @@ import { appointmentDelta } from '../appointment-dates.js';
 import { extractArray, getField, sleep } from '../sync-utils.js';
 
 const DEFAULT_SINCE_DAYS = 90;
-const PAGE_SIZE = 200;
+// 50, not 200 (2026-07-22): GetLead rows are enormous full prospect records
+// and LP returns EMPTY (or 500s) for large PageSize at deep StartIndex — a
+// live 14-day run scanned exactly 200 prospects (one page) and stopped,
+// silently missing the rest of the window. Deep offsets serve fine with
+// small requests. Env-tunable.
+const PAGE_SIZE = Math.min(200, parseInt(process.env.LP_MIRROR_PAGE_SIZE || '50', 10));
 const RATE_LIMIT_SLEEP_MS = 250;
 
 // In-memory job registry. Map<jobId, jobState>.

@@ -96,6 +96,9 @@ const EXCLUDED_CODES = String(process.env.CAPACITY_EXCLUDED_CODES || 'CXL,DNC')
 // appointments, live repro). Smaller pages are responses LP can actually serve.
 const LEAD_PAGE_SIZE   = Math.min(200, parseInt(process.env.CAPACITY_LEAD_PAGE_SIZE || '50', 10));
 const LEAD_MAX_PAGES   = parseInt(process.env.CAPACITY_LEAD_MAX_PAGES || '80', 10);
+// Change-window lookback (days before today ET). Default 3 self-heals recent
+// drops; raise temporarily (e.g. 14) to recover older ones.
+const CHANGE_BACK_DAYS = parseInt(process.env.CAPACITY_CHANGE_BACK_DAYS || '3', 10);
 const LEAD_CONCURRENCY = parseInt(process.env.CAPACITY_LEAD_CONCURRENCY || '3', 10);
 const PROSPECT_TIMEOUT_MS = parseInt(process.env.SYNC_PROSPECT_TIMEOUT_SEC || '60', 10) * 1000;
 
@@ -266,7 +269,12 @@ async function sweepForwardLeadDispositions(windowStart, windowEnd) {
   // GetLead cannot filter by appointment date — sweep the CHANGE window
   // (yesterday → tomorrow; overlap self-heals missed rows) and keep only
   // prospects with a lead whose appointment lands inside the forward window.
-  const changeStart = addDays(windowStart, -1);
+  // Lookback is env-tunable (2026-07-22): leads whose changes were dropped by
+  // historic sweep truncation age out of a ±1-day window and become invisible
+  // to every path (not in lp_leads → the near refresh doesn't know them).
+  // A deeper lookback re-scans them each cycle at small-page cost — the
+  // continuous lead loop absorbs the extra pages.
+  const changeStart = addDays(windowStart, -CHANGE_BACK_DAYS);
   const changeEnd   = addDays(windowStart, 1);
 
   let startIndex = 1;
