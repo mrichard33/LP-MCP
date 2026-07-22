@@ -325,9 +325,16 @@ async function runMigrations() {
   // truth; this boot-time mirror guarantees the schema exists before the first
   // capacity sweep AND before the first lead upsert writes the new
   // appointment_confirmed/appointment_verified columns. Additive/idempotent.
+  //
+  // Runs through the run_sql RPC (which THROWS on failure via runSQL), NOT the
+  // exec_sql pattern used by the older blocks above: supabase.rpc() reports
+  // failure in its { error } return without throwing, so `await` + catch never
+  // sees it — on 2026-07-22 that silently skipped this schema in production and
+  // every lead upsert failed on the missing appointment_confirmed column until
+  // the DDL was applied by hand. runSQL surfaces the failure for real.
   try {
-    await supabase.rpc('exec_sql', {
-      sql: `CREATE TABLE IF NOT EXISTS lp_capacity_slots (
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE TABLE IF NOT EXISTS lp_capacity_slots (
               slot_date        date NOT NULL,
               slr_id           text NOT NULL,
               rep_home_market  text NOT NULL,
@@ -355,11 +362,10 @@ async function runMigrations() {
               confirmed     int  NOT NULL DEFAULT 0,
               set_pending   int  NOT NULL DEFAULT 0,
               days_out      int  GENERATED ALWAYS AS (slot_date - snapshot_date) STORED,
-              PRIMARY KEY (snapshot_date, slot_date, market));`,
-    });
+              PRIMARY KEY (snapshot_date, slot_date, market));`);
     console.log('[Migration] capacity board schema (sql/043) ready');
   } catch (err) {
-    console.warn('[Migration] capacity board schema skipped:', err.message);
+    console.error('[Migration] capacity board schema FAILED (board + lead upserts depend on it — apply sql/043 manually):', err.message);
   }
 
   // Scorecard revenue realignment (sql/040): live-month RTP-net + provisional-gross columns,
