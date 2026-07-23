@@ -479,9 +479,26 @@ async function enrichFromGHLContact(contactId) {
   };
 }
 
+// Stored upper-case — compare via isBookableDisposition(), never .has() directly.
 const BOOKABLE_DISPOSITIONS = new Set([
-  'Data', 'Issue', 'Set', 'NIS', 'NIS2', 'NI', 'BO', '1Leg', 'NoHome',
+  'DATA', 'ISSUE', 'SET', 'NIS', 'NIS2', 'NI', 'BO', '1LEG', 'NOHOME',
+  // 2026-07-22 (contact CAwbNPzDvyEMiefW2axI / lead 560474, disp CCC): the
+  // confirmation family. These are appointment-BEARING states, and omitting them
+  // disabled the Step 0b / 2b link-trusted fallbacks for every canvass /
+  // field-set lead — whose lognumber never carries the GHL contact ID — firing
+  // false SYNC-FAILED cards and risking a duplicate LP lead via the self-heal
+  // enroll into wf 8e30ff37.
+  'CNF', 'CCC', 'VERIF', 'SOFT CONFIRM', 'RESET',
 ]);
+
+// Live LP and the Supabase cache disagree on disposition casing (LP returns
+// `Disposition` / `disp_code` straight from the source table; Supabase stores
+// `disposition_code`). Normalize both sides so Step 0b (Supabase) and Step 2b
+// (live LP) agree on what counts as bookable.
+function isBookableDisposition(disp) {
+  if (disp == null) return false;
+  return BOOKABLE_DISPOSITIONS.has(String(disp).trim().toUpperCase());
+}
 
 function extractHLCID(leadRecord) {
   if (!leadRecord) return null;
@@ -554,7 +571,7 @@ function findLeadByHLCID(leadRecords, ghlContactId, prospectIdFallback = null) {
   if (matches.length === 1) return { ...matches[0], hlcidMatched: true };
 
   console.warn(`[LP-RESOLVE] ⚠️ ${matches.length} leads matched HLCID=${targetId} — tiebreaking by bookable disposition`);
-  const bookable = matches.find(m => BOOKABLE_DISPOSITIONS.has(m.disp));
+  const bookable = matches.find(m => isBookableDisposition(m.disp));
   return { ...(bookable || matches[0]), hlcidMatched: true };
 }
 
@@ -576,7 +593,7 @@ function findBookableLeadForProspect(leadRecords, prospectId) {
     const ldsId = lead.LeadID || lead.leadid || lead.lds_id || lead.id;
     if (!ldsId) continue;
     const disp = lead.Disposition || lead.disposition || lead.disp_code || '';
-    if (!BOOKABLE_DISPOSITIONS.has(disp)) continue;
+    if (!isBookableDisposition(disp)) continue;
     const pid = lead.ProspectID || lead.prospectid || lead.CstID || lead.cst_id || prospectId;
     const { source: lpSource, detail: lpSourceDetail } = extractLpSource(lead);
     candidates.push({
@@ -706,7 +723,7 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}, opts = {}) {
       for (const candidate of leads) {
         if (!candidate.lp_lead_id) continue;
         const disp = candidate.disposition_code || '';
-        if (!BOOKABLE_DISPOSITIONS.has(disp)) {
+        if (!isBookableDisposition(disp)) {
           console.warn(`[LP-RESOLVE] Step 0b: lds_id=${candidate.lp_lead_id} disp=${disp || '(empty)'} not bookable — skip`);
           continue;
         }
@@ -1003,6 +1020,57 @@ async function writeApptSyncMark({ dedupKey, contactId, ldsId, apptDate, apptTim
   }
 }
 
+// ─── Exactly-once failure notification (2026-07-22) ─────────────
+// See sql/047_lp_sync_failure_notices.sql. Claim-BEFORE-send: the row is
+// inserted first and the card is sent only if this call won the primary key,
+// so concurrent webhook fires can't both notify. No TTL — an unresolved failure
+// stays claimed until the contact syncs successfully.
+//
+// On an UNKNOWN db error we return false (suppress the card) while the caller
+// still applies the tag + GHL note — so the team is still notified via the
+// I.LP-FAIL workflow and nothing is lost. Deliberate: a card must never repeat,
+// and a transient DB fault must not become a card storm. The one exception is
+// 42P01 (table missing = migration not applied yet), which fails OPEN so an
+// out-of-order deploy degrades to the old behaviour instead of going silent.
+//
+// `client` defaults to the module supabase singleton; tests inject a stub.
+async function claimFailureNotice({ noticeKey, contactId, apptDate, apptTime }, client = supabase) {
+  try {
+    const { error } = await client
+      .from('lp_sync_failure_notices')
+      .insert({ notice_key: noticeKey, contact_id: contactId, appt_date: apptDate, appt_time: apptTime });
+    if (!error) return true;
+    if (error.code === '23505') {
+      console.log(`[LP-APPT] ⏭️ Failure notice already claimed for ${noticeKey} — no repeat card`);
+      return false;
+    }
+    if (error.code === '42P01') {
+      console.error('[LP-APPT] 🚨 lp_sync_failure_notices missing — apply sql/047 — sending card UNGUARDED');
+      return true;
+    }
+    console.warn(`[LP-APPT] failure-notice claim errored (card suppressed; tag+note still applied): ${error.message}`);
+    return false;
+  } catch (err) {
+    console.warn(`[LP-APPT] failure-notice claim threw (card suppressed; tag+note still applied): ${err.message}`);
+    return false;
+  }
+}
+
+// Called from clearSyncFailedTag() — once a contact syncs cleanly, drop its
+// notices so a genuinely NEW failure later is allowed to notify again.
+async function releaseFailureNotices(contactId, client = supabase) {
+  if (!contactId) return;
+  try {
+    const { error } = await client
+      .from('lp_sync_failure_notices')
+      .delete()
+      .eq('contact_id', contactId);
+    if (error) console.warn(`[LP-APPT] failure-notice release failed for ${contactId}: ${error.message}`);
+  } catch (err) {
+    console.warn(`[LP-APPT] failure-notice release threw for ${contactId}: ${err.message}`);
+  }
+}
+
 // ─── Failure notification ──────────────────────────────────────
 
 function formatPhoneDisplay(p) {
@@ -1016,6 +1084,7 @@ async function sendSyncFailureNotification({
   address1, city, state, postalCode,
   prospectId, inboundId, ghlLeadIdField,
   appointmentDate, appointmentTime, calendarName,
+  sendCard = true,
 }) {
   const phoneDisplay = formatPhoneDisplay(contactPhone);
   const addrLine = [
@@ -1046,6 +1115,23 @@ async function sendSyncFailureNotification({
     console.log(`[LP-APPT] Applied ${LP_SYNC_FAILED_TAG} tag to ${contactId} — manual-action workflow will fire`);
   }
 
+  // Never tell a human to create a lead that already exists. Show what the
+  // Supabase link actually holds so a resolver miss is distinguishable from a
+  // genuinely missing LP lead.
+  let lpSnapshot = 'no linked LP lead in Supabase';
+  try {
+    const { data: linked } = await supabase.from('lp_leads')
+      .select('lp_lead_id, disposition_code, appointment_date')
+      .eq('ghl_contact_id', contactId)
+      .order('synced_at', { ascending: false })
+      .limit(3);
+    if (linked?.length) {
+      lpSnapshot = linked.map(r =>
+        `lead ${r.lp_lead_id} disp=${r.disposition_code || '?'} appt=${r.appointment_date ? String(r.appointment_date).slice(0, 16).replace('T', ' ') : 'none'}`
+      ).join('\n     ');
+    }
+  } catch { /* best-effort — card still sends without it */ }
+
   const card =
 `🚨 LP APPT SYNC FAILED — manual action required
 
@@ -1058,6 +1144,10 @@ async function sendSyncFailureNotification({
 
 🆔 LP IDs tried: ${idsLine}
 🔗 GHL: ${ghlLink}
+🔎 LP (Supabase link): ${lpSnapshot}
+
+⚠️ If a lead above already shows this appointment, do NOT create a new lead —
+   that is a resolver miss, not a missing appointment. Flag it to Mark instead.
 
 CHAIN RESULT — all 5 lognumber-validated steps failed:
   0 supabase+lognumber       • 1 GHL field+lognumber
@@ -1076,9 +1166,13 @@ ACTION:
   6. Remove tag '${LP_SYNC_FAILED_TAG}' from contact when resolved
      (or just re-fire this webhook — successful resolution auto-clears it)`;
 
-  await sendGroupMeMessage(card).catch((err) => {
-    console.warn(`[LP-APPT] GroupMe notification failed: ${err.message}`);
-  });
+  if (sendCard) {
+    await sendGroupMeMessage(card).catch((err) => {
+      console.warn(`[LP-APPT] GroupMe notification failed: ${err.message}`);
+    });
+  } else {
+    console.log(`[LP-APPT] Card suppressed for ${contactId} (already notified) — tag + note still applied`);
+  }
 
   await addGHLNote(contactId,
     `[LP SYNC v5.1.6] Appointment NOT synced — full lognumber-validated chain failed.\n` +
@@ -1122,6 +1216,7 @@ async function clearSyncFailedTag(contactId) {
   } catch (err) {
     console.warn(`[LP-APPT] ${LP_SYNC_FAILED_TAG} cleanup failed for ${contactId}: ${err.message}`);
   }
+  await releaseFailureNotices(contactId);
 }
 
 // ─── Main sync ──────────────────────────────────────────────────
@@ -1129,36 +1224,74 @@ async function clearSyncFailedTag(contactId) {
 /**
  * Early idempotency: does LP already hold this exact appointment?
  *
- * Field-set leads (SalesRabbit / canvassing) have the appointment set
- * in the field and synced GHL→LP *before* this webhook fires. Their LP
- * lognumber does not carry the GHL contact id, so resolveLPLeadId()
- * fails all five lognumber-validated steps and (pre-fix) fired a false
- * "SYNC FAILED — manual action required" card for an appointment LP
- * already had. The GHL contact's LP-synced fields are the fresher
- * truth in this window (the lp_leads cache lags the live LP record).
+ * Pass 1 (GHL LP-synced fields + origin tags) — original v5.x behaviour.
+ * Pass 2 (Supabase lp_leads link) — added 2026-07-22.
  *
- * Matched precisely against the incoming appointment date (not
- * ">= today"), corroborated by a confirmed status OR a field-set
- * origin tag, so a reschedule to a new date or a brand-new booking is
- * never falsely skipped. FAIL-OPEN — any error returns false so a
- * legitimate sync is never blocked.
+ * Field-set leads (SalesRabbit / canvassing) have the appointment set in the
+ * field and synced GHL→LP *before* this webhook fires. Their LP lognumber does
+ * not carry the GHL contact id, so resolveLPLeadId() fails all five
+ * lognumber-validated steps and (pre-fix) fired a false "SYNC FAILED — manual
+ * action required" card for an appointment LP already had.
+ *
+ * Pass 2 exists because pass 1 depends on GHL field hygiene and origin tags that
+ * canvass leads frequently lack (incident: contact CAwbNPzDvyEMiefW2axI, lead
+ * 560474 — LP held the appt, GHL had neither the tag nor a confirmed status).
+ * lp_leads.ghl_contact_id is written by our own sync from LP source data, so a
+ * linked row whose appointment matches the incoming one is proof LP holds it.
+ *
+ * Matched on date AND time: a same-date time change must still fall through to
+ * the resolver so SetAppointment can move it. FAIL-OPEN — any error returns
+ * false so a legitimate sync is never blocked.
+ *
+ * `client` defaults to the module supabase singleton; tests inject a stub.
  */
-async function lpAlreadyHasAppointment(contactId, incomingDateNorm) {
+async function lpAlreadyHasAppointment(contactId, incomingDateNorm, incomingTimeNorm = null, client = supabase) {
   if (!contactId || !incomingDateNorm) return false;
+
+  // ── Pass 1: GHL LP-synced fields + field-set origin ──
   try {
     const ghlRes = await ghlFetch('GET', `/contacts/${contactId}`);
     const contact = ghlRes?.contact || {};
     const fields = contact.customFields || [];
     const tags = (contact.tags || []).map(t => String(t).toLowerCase());
     const lpApptDateNorm = normalizeDateForComparison(getCustomField(fields, LP_APPOINTMENT_DATE_FIELD));
-    if (!lpApptDateNorm || lpApptDateNorm !== incomingDateNorm) return false;
-    const status = (getCustomField(fields, APPT_STATUS_FIELD) || '').toLowerCase();
-    const fieldSetOrigin = tags.includes('appt-exists') || tags.includes('salesrabbit-appt');
-    return status.includes('confirm') || fieldSetOrigin;
+    if (lpApptDateNorm && lpApptDateNorm === incomingDateNorm) {
+      const status = (getCustomField(fields, APPT_STATUS_FIELD) || '').toLowerCase();
+      const fieldSetOrigin = tags.includes('appt-exists') || tags.includes('salesrabbit-appt');
+      if (status.includes('confirm') || fieldSetOrigin) {
+        console.log(`[LP-APPT] ⏭️ Pass 1: GHL LP-synced fields show ${incomingDateNorm} already in LP for ${contactId}`);
+        return true;
+      }
+    }
   } catch (err) {
-    console.warn(`[LP-APPT] lpAlreadyHasAppointment check failed (proceeding): ${err.message}`);
-    return false;
+    console.warn(`[LP-APPT] lpAlreadyHasAppointment pass 1 failed (continuing to pass 2): ${err.message}`);
   }
+
+  // ── Pass 2: authoritative LP-side check via the Supabase link ──
+  try {
+    const { data: linked } = await client.from('lp_leads')
+      .select('lp_lead_id, appointment_date')
+      .eq('ghl_contact_id', contactId)
+      .not('appointment_date', 'is', null)
+      .order('synced_at', { ascending: false })
+      .limit(5);
+
+    for (const row of linked || []) {
+      const raw = String(row.appointment_date);
+      if (normalizeDateForComparison(raw) !== incomingDateNorm) continue;
+      const lpTime = raw.includes('T') ? raw.slice(11, 16) : null;
+      if (incomingTimeNorm && lpTime && lpTime !== incomingTimeNorm) {
+        console.log(`[LP-APPT] Pass 2: lead ${row.lp_lead_id} has ${incomingDateNorm} at ${lpTime}, incoming ${incomingTimeNorm} — time change, NOT a duplicate`);
+        continue;
+      }
+      console.log(`[LP-APPT] ⏭️ Pass 2: LP lead ${row.lp_lead_id} already holds ${incomingDateNorm}${lpTime ? ` ${lpTime}` : ''} (Supabase link) — skipping resolver + SetAppointment`);
+      return true;
+    }
+  } catch (err) {
+    console.warn(`[LP-APPT] lpAlreadyHasAppointment pass 2 failed (proceeding): ${err.message}`);
+  }
+
+  return false;
 }
 
 async function syncAppointmentToLP({
@@ -1175,7 +1308,8 @@ async function syncAppointmentToLP({
   // lognumber doesn't carry the GHL contact id, so the resolver below
   // would fail every step and fire a false "manual action" card.
   const incomingDateNorm = normalizeDateForComparison(appointmentDate);
-  if (await lpAlreadyHasAppointment(contactId, incomingDateNorm)) {
+  const incomingTimeNorm = parseApptTime(appointmentTime);
+  if (await lpAlreadyHasAppointment(contactId, incomingDateNorm, incomingTimeNorm)) {
     console.log(`[LP-APPT] ⏭️ LP already holds appt on ${incomingDateNorm} for ${contactId} (per GHL LP-synced fields) — skipping resolver + SetAppointment`);
     await applyGHLTag(contactId, 'lp-appt-synced').catch(() => {});
     await clearSyncFailedTag(contactId); // clear any prior false failure
@@ -1239,34 +1373,31 @@ async function syncAppointmentToLP({
       console.warn(`[LP-APPT] lead-creation enroll failed for ${contactId}: ${healErr.message} — falling back to manual-action card`);
     }
 
-    // Failure-path dedup: stop repeat "SYNC FAILED" cards when I.LP-A
-    // re-enters or GHL retries the webhook. Pre-fix the failure path
-    // had no dedup at all (and the success-path dedup silently no-op'd
-    // because the lp_appointment_sync_marks table didn't exist).
-    // FAIL-OPEN via findRecentApptSyncMark.
-    const failKey = `fail:${contactId}:${incomingDateNorm}:${parseApptTime(appointmentTime) || '?'}`;
-    const priorFail = await findRecentApptSyncMark(failKey);
-    if (priorFail) {
-      console.log(`[LP-APPT] ⏭️ Duplicate SYNC-FAILED suppressed for ${failKey} (marked ${priorFail.created_at}) — no repeat GroupMe card`);
-      return {
-        success: false,
-        action: 'duplicate_failure_suppressed',
-        contact_id: contactId,
-        dedup_key: failKey,
-      };
-    }
+    // Exactly-once failure notice (2026-07-22). Replaces the old failKey /
+    // lp_appointment_sync_marks path, which expired on a 24h TTL and re-carded
+    // unresolved failures daily. Claim first, send only if we won.
+    const noticeKey = `fail:${contactId}:${incomingDateNorm}:${incomingTimeNorm || '?'}`;
+    const sendCard = await claimFailureNotice({
+      noticeKey,
+      contactId,
+      apptDate: incomingDateNorm,
+      apptTime: incomingTimeNorm || null,
+    });
+
     await sendSyncFailureNotification({
       contactId, contactName, contactPhone, contactEmail,
       address1, city, state, postalCode,
       prospectId: webhookProspectId, inboundId, ghlLeadIdField,
       appointmentDate, appointmentTime, calendarName,
+      sendCard,
     });
-    await writeApptSyncMark({ dedupKey: failKey, contactId, ldsId: null, apptDate: incomingDateNorm, apptTime: parseApptTime(appointmentTime) || null });
+
     return {
       success: false,
-      action: 'skipped_no_valid_lead_id',
+      action: sendCard ? 'skipped_no_valid_lead_id' : 'skipped_no_valid_lead_id_notice_suppressed',
       contact_id: contactId,
       contact_name: contactName,
+      notice_key: noticeKey,
       attempted_steps: ['supabase+lognumber', 'ghl_field+lognumber', 'prospect+lognumber', 'phone+lognumber_lastresort', 'email+lognumber_lastresort'],
       manual_action_tag_applied: LP_SYNC_FAILED_TAG,
     };
@@ -1806,6 +1937,10 @@ export {
   extractHLCID,
   extractLpSource,
   findLeadByHLCID,
+  isBookableDisposition,
+  lpAlreadyHasAppointment,
+  claimFailureNotice,
+  releaseFailureNotices,
   probeLPForContact,
   fetchLatestAppointment,
   calendarNameFromId,
