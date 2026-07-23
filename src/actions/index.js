@@ -29,13 +29,13 @@
  *   originating system_events row by action.event_id when they need
  *   structural fields like event.id or event.payload.message_id.
  *
- * Supported action types (35):
+ * Supported action types (36):
  *   add_tag, remove_tag, set_stage, move_opportunity, update_opportunity,
  *   remove_from_workflow, add_to_workflow, book_appointment,
  *   cancel_appointment, reschedule_appointment, update_appointment_status,
  *   create_task,
  *   send_notification, set_lp_appointment, create_lp_lead,
- *   update_lp_dnc_status, update_custom_fields, update_contact_email,
+ *   update_lp_dnc_status, set_dnd, update_custom_fields, update_contact_email,
  *   calculate_time_lapse_tier, send_message, layer3_dispatch, emit_event,
  *   compute_rescission_dispatch, check_eligibility, compute_risk_score,
  *   check_throttle, classify_bucket,
@@ -152,6 +152,7 @@ import { executeSyncLpAppointmentToGhl } from './handlers/lp-ghl-appointment-syn
 import { executeSetLPAppointment } from './handlers/lp-appointment.js';
 import { executeCreateLPLead } from './handlers/lp-lead.js';
 import { executeUpdateLPDNCStatus } from './handlers/lp-dnc.js';
+import { executeSetDND } from './handlers/dnd.js';
 import { executeCreateTask } from './handlers/tasks.js';
 import { executeSendNotification } from './handlers/notifications.js';
 import { executeUpdateCustomFields, executeUpdateContactEmail } from './handlers/custom-fields.js';
@@ -361,6 +362,7 @@ const ACTION_HANDLERS = {
   set_lp_appointment: executeSetLPAppointment,
   create_lp_lead: executeCreateLPLead,           // 2026-05-01 — agentic LP push (Jane recovery)
   update_lp_dnc_status: executeUpdateLPDNCStatus, // 2026-05-01 — agentic DNC push (Charles Poulos recovery)
+  set_dnd: executeSetDND,                        // 2026-07-20 Fix 6b — GHL-side channel DND. Handler landed 2026-07-20, wired 2026-07-22.
   update_custom_fields: executeUpdateCustomFields,
   update_contact_email: executeUpdateContactEmail,
   calculate_time_lapse_tier: executeCalculateTimeLapseTier,
