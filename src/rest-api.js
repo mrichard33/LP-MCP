@@ -1117,9 +1117,12 @@ async function lpLeadRefreshHandler(req, res) {
           .eq('lp_lead_id', leadId)
           .maybeSingle();
         if (row && !row.ghl_contact_id) {
+          // legacy_unverified: the id came from the inbound GHL payload, not
+          // from identity corroboration — the resolver reclassifies it on
+          // the next sync cycle.
           await supabase
             .from('lp_leads')
-            .update({ ghl_contact_id: payloadGhlContactId })
+            .update({ ghl_contact_id: payloadGhlContactId, ghl_link_source: 'legacy_unverified' })
             .eq('lp_lead_id', leadId);
           console.log(`[LP Inbound Refresh] backfilled ghl_contact_id=${payloadGhlContactId} for lead_id=${leadId}`);
         }

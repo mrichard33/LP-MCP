@@ -421,7 +421,7 @@ export async function syncAllChildRecords(logIds, counts) {
         const prospects = extractArray(result);
         if (!prospects[0]) continue;
         const prospect = prospects[0];
-        const ghlId = lead.ghl_contact_id || await (async () => {
+        const matchedGhlId = lead.ghl_contact_id ? null : await (async () => {
           try {
             return await matchToGHL({
               phone: normalizePhone(getField(prospect, 'phone1', 'Phone1', 'phone', 'Phone')),
@@ -430,15 +430,25 @@ export async function syncAllChildRecords(logIds, counts) {
             });
           } catch (_) { return null; }
         })();
+        const ghlId = lead.ghl_contact_id || matchedGhlId;
 
+        // A link written from a fresh matchToGHL result is phone/email
+        // verified by construction — stamp its ghl_link_source accordingly.
+        // A carried-forward stored link keeps its existing classification.
         if (ghlId && !lead.ghl_tag_applied && lead.ghl_entry_tag) {
           const success = await applyGHLTag(ghlId, lead.ghl_entry_tag);
           if (success) {
             await supabase.from('lp_leads')
-              .update({ ghl_contact_id: ghlId, ghl_tag_applied: true }).eq('lp_lead_id', lead.lp_lead_id);
+              .update({
+                ghl_contact_id: ghlId,
+                ghl_tag_applied: true,
+                ...(matchedGhlId ? { ghl_link_source: 'phone_email_match' } : {}),
+              }).eq('lp_lead_id', lead.lp_lead_id);
           }
-        } else if (ghlId && !lead.ghl_contact_id) {
-          await supabase.from('lp_leads').update({ ghl_contact_id: ghlId }).eq('lp_lead_id', lead.lp_lead_id);
+        } else if (matchedGhlId && !lead.ghl_contact_id) {
+          await supabase.from('lp_leads')
+            .update({ ghl_contact_id: matchedGhlId, ghl_link_source: 'phone_email_match' })
+            .eq('lp_lead_id', lead.lp_lead_id);
         }
 
         const prospectLeads = getField(prospect, 'leads', 'Leads') || [];

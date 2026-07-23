@@ -138,6 +138,7 @@ import supabase from './supabase.js';
 import { getToken, startTokenRefreshSchedule } from './token-manager.js';
 import { getLeadData, getJobStatusChanges, getLead, testConnection } from './lp-client.js';
 import { resetGHLState, matchToGHL, applyGHLTag } from './ghl.js';
+import { resetLinkVerifyBudget, logLinkCorroborationConfig } from './services/link-corroboration.js';
 import { processMilestoneTriggers } from './milestones.js';
 import { runPass1DailyWindows } from './full-sync-pass1.js';
 import { pushNotesToGHL } from './ghl-notes-sync.js';
@@ -298,6 +299,7 @@ export async function fullSync() {
   console.log('[Sync] Starting FULL sync...');
   const startedAt = new Date();
   resetGHLState();
+  resetLinkVerifyBudget();
   loggedFirstKeys.clear();
 
   const logIds = await syncLogStartAll('full');
@@ -758,6 +760,7 @@ export async function incrementalSync() {
   console.log('[Sync] Starting incremental sync...');
   const startedAt = new Date();
   resetGHLState();
+  resetLinkVerifyBudget();
 
   try {
     const lastSyncTime = await getLastSyncTimestamp();
@@ -960,6 +963,7 @@ let syncTimer = null;
 
 export function startSyncScheduler() {
   if (!supabase) { console.warn('[Sync] Supabase not configured — sync disabled'); return; }
+  logLinkCorroborationConfig();
   console.log(`[Sync] Scheduler started — incremental sync every ${SYNC_INTERVAL_MS / 60000} minutes (timeout: ${SYNC_TIMEOUT_MINUTES}min, max leads/run: ${MAX_INCREMENTAL_LEADS})`);
 
   setTimeout(async () => {

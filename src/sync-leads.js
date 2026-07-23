@@ -93,6 +93,8 @@ import { combineNotes } from './safe-notes.js';
 import { syncCallLogs, syncNotes, syncActivities, syncJobAndMilestones } from './sync-children.js';
 import { emitEvent, dispositionPriority } from './event-emitter.js';
 import { pushLeadNotesImmediately } from './ghl-notes-sync.js';
+import { GHL_CONTACT_ID_PATTERN, lognumberCandidate } from './ghl-link-shape.js';
+import { resolveLeadGhlLink } from './services/link-corroboration.js';
 
 // ─── Skip counter for observability ──────────────────────────────
 let _skipStats = { leads: 0, prospects: 0 };
@@ -201,15 +203,18 @@ function toActiveEntryTag(entryTag) {
 }
 
 // ─── v9.2: GHL contact ID derivation from LP lognumber ───────────
-const GHL_CONTACT_ID_PATTERN = /^[A-Za-z0-9]{20}$/;
+//
+// Shape primitives now live in ghl-link-shape.js (shared with the resolver).
 
+/**
+ * @deprecated Shape-check-only adoption of lognumber as a GHL link — the
+ * mechanism behind the lead-560362 mis-binding. Use resolveLeadGhlLink()
+ * (services/link-corroboration.js), which corroborates the candidate against
+ * GHL contact identity before binding. Retained solely as the legacy
+ * derivation primitive the resolver reproduces in observe mode.
+ */
 function deriveLeadGhlId(lead, fallbackGhlId) {
-  if (!lead) return fallbackGhlId || null;
-  const ln = getField(lead, 'lognumber', 'LogNumber', 'logNumber');
-  if (ln && GHL_CONTACT_ID_PATTERN.test(String(ln).trim())) {
-    return String(ln).trim();
-  }
-  return fallbackGhlId || null;
+  return lognumberCandidate(lead) || fallbackGhlId || null;
 }
 
 // ─── v10.2: Source attribution backstop (derive from LP promoter) ─
@@ -260,11 +265,21 @@ function effectiveLeadSource(lead) {
 export const _internal = { deriveSourceFromPromoter, effectiveLeadSource, PROMOTER_SOURCE_CHANNELS };
 
 // ─── Build the lead row payload (DRY helper) ─────────────────────
-function buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId, existingGhlId = null) {
+//
+// resolvedLink ({ ghlContactId, linkSource } from resolveLeadGhlLink) is
+// authoritative when provided; linkSource null means "leave the stored
+// ghl_link_source untouched" (the key is omitted so upsert-on-conflict
+// preserves it). Without resolvedLink the legacy v10.1 derivation applies
+// and no ghl_link_source key is emitted.
+function buildLeadRow(prospect, lead, {
+  lpLeadId, lpProspectId, bucket, tag, ghlId = null, existingGhlId = null, resolvedLink = null,
+}) {
   // v10.1: never lose a previously-established link — fall back to the
   // existing ghl_contact_id when neither lognumber nor the phone/email
   // match (ghlId) resolves one this run.
-  const leadGhlId = deriveLeadGhlId(lead, ghlId) || existingGhlId || null;
+  const leadGhlId = resolvedLink
+    ? (resolvedLink.ghlContactId || existingGhlId || null)
+    : (deriveLeadGhlId(lead, ghlId) || existingGhlId || null);
 
   // v10.2: stamp the effective source (native, else promoter-derived) so the
   // "Internet, <Vendor>" feeds stop persisting null source/sourcesubdescr.
@@ -296,6 +311,9 @@ function buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId
       lp_lead_id:         lpLeadId,
       lp_prospect_id:     lpProspectId,
       ghl_contact_id:     leadGhlId,
+      // Omitted (undefined) unless the resolver classified the link this
+      // run — upsert-on-conflict then preserves the stored value.
+      ghl_link_source:    resolvedLink?.linkSource || undefined,
       first_name:         getField(prospect, 'firstname', 'FirstName', 'first_name'),
       last_name:          getField(prospect, 'lastname', 'LastName', 'last_name'),
       email:              getField(prospect, 'email', 'Email'),
@@ -358,8 +376,20 @@ export async function upsertLeadOnly(prospect) {
     // the existing ghl_contact_id into buildLeadRow. maybeSingle() returns
     // null cleanly for brand-new leads instead of erroring.
     const { data: existing } = await supabase.from('lp_leads')
-      .select('updated_at_lp, ghl_contact_id, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified, lp_branch_id')
+      .select('updated_at_lp, ghl_contact_id, ghl_link_source, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified, lp_branch_id')
       .eq('lp_lead_id', lpLeadId).maybeSingle();
+
+    // Corroborated link resolution (no matchToGHL in Pass 1, so verifiedGhlId
+    // is null — this path can only ever produce lognumber_verified /
+    // rejected_* / existing_preserved). In observe mode the returned id is
+    // the legacy derivation, so Pass 1 behavior is unchanged.
+    const resolved = await resolveLeadGhlLink({
+      lead,
+      prospect,
+      verifiedGhlId: null,
+      existingGhlId: existing?.ghl_contact_id || null,
+      existingLinkSource: existing?.ghl_link_source || null,
+    }, { lpLeadId, lpProspectId });
 
     // Funnel-flag staleness guard (mirrors processProspect): a Sat/ApptSet/Sold
     // flip that doesn't bump LastChangedOn must still force the upsert, or even
@@ -382,8 +412,7 @@ export async function upsertLeadOnly(prospect) {
       && (verifIn == null || existing.appointment_verified  === (verifIn === 'true' || verifIn === true));
 
     if (newUpdatedAt && existing?.updated_at_lp && existing.updated_at_lp === newUpdatedAt && flagsUnchanged) {
-      const newLeadGhlId = deriveLeadGhlId(lead, null);
-      const needsGhlIdBackfill = !existing.ghl_contact_id && newLeadGhlId;
+      const needsGhlIdBackfill = !existing.ghl_contact_id && resolved.ghlContactId;
       // Branch backfill-on-skip (fix-pass 2): a row synced before lp_branch_id
       // existed looks "unchanged" forever (LP won't bump lastchangedon just
       // because WE added a column), so without this the branch never lands —
@@ -392,6 +421,15 @@ export async function upsertLeadOnly(prospect) {
       const needsBranchBackfill = !existing.lp_branch_id
         && String(getField(lead, 'brn_id', 'BrnId', 'BrnID') || '').trim() !== '';
       if (!needsGhlIdBackfill && !needsBranchBackfill) {
+        // Skip path never upserts, so persist a fresh classification here or
+        // stable rows would stay unclassified through the observe soak.
+        // One-time per row: the resolver's fast path returns null once the
+        // stored source matches.
+        if (resolved.linkSource && resolved.linkSource !== existing.ghl_link_source) {
+          await supabase.from('lp_leads')
+            .update({ ghl_link_source: resolved.linkSource })
+            .eq('lp_lead_id', lpLeadId);
+        }
         _skipStats.leads++;
         count++;
         continue;
@@ -405,7 +443,11 @@ export async function upsertLeadOnly(prospect) {
       effSrc.sourcesubdescr, effSrc.source, lpLeadId,
     );
 
-    const { row } = buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, null, existing?.ghl_contact_id || null);
+    const { row } = buildLeadRow(prospect, lead, {
+      lpLeadId, lpProspectId, bucket, tag,
+      existingGhlId: existing?.ghl_contact_id || null,
+      resolvedLink: resolved,
+    });
 
     // v10.1: never overwrite an existing ghl_contact_id link with null.
     // Omitting the column from the upsert payload preserves the stored
@@ -480,7 +522,7 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
 
     // ─── AGENTIC: Read existing state BEFORE upsert ──────────────
     const { data: existing } = await supabase.from('lp_leads')
-      .select('ghl_tag_applied, lp_day15_triggered, disposition_code, ghl_contact_id, updated_at_lp, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified, lp_branch_id')
+      .select('ghl_tag_applied, lp_day15_triggered, disposition_code, ghl_contact_id, ghl_link_source, updated_at_lp, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified, lp_branch_id')
       .eq('lp_lead_id', lpLeadId).single();
 
     const previousDisposition = existing?.disposition_code || null;
@@ -488,7 +530,24 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
     const newUpdatedAt = lpDateToEastern(getField(lead, 'lastchangedon', 'LastChangedOn'));
     const dispositionChanged = newDisposition && newDisposition !== previousDisposition;
 
-    const newLeadGhlId = deriveLeadGhlId(lead, ghlId);
+    // Corroborated link resolution — runs before the unchanged-guard below
+    // (the guard compares the resolved id against the stored link; an
+    // unchanged candidate takes the resolver's zero-query fast path, so a
+    // stable re-sync never triggers verification).
+    const resolved = await resolveLeadGhlLink({
+      lead,
+      prospect,
+      verifiedGhlId: ghlId,
+      existingGhlId: existing?.ghl_contact_id || null,
+      existingLinkSource: existing?.ghl_link_source || null,
+    }, { lpLeadId, lpProspectId });
+    const newLeadGhlId = resolved.ghlContactId;
+
+    // Child records (call logs / notes / jobs) must carry the SAME contact id
+    // as the lead row. Pre-resolver they got the raw matchToGHL result while
+    // the row got the lognumber derivation — the direct mechanism behind one
+    // lead's call rows pointing at multiple unrelated contacts.
+    const childGhlId = newLeadGhlId || existing?.ghl_contact_id || null;
 
     // ─── AGENTIC: synthetic disposition backfill for pre-dispositioned leads ─
     //
@@ -550,6 +609,13 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
       && !needsBranchBackfill;
 
     if (recordUnchanged && !dispositionChanged) {
+      // Persist a fresh classification on the skip path (no upsert runs
+      // here) — one-time per row via the resolver fast path.
+      if (resolved.linkSource && resolved.linkSource !== existing?.ghl_link_source) {
+        await supabase.from('lp_leads')
+          .update({ ghl_link_source: resolved.linkSource })
+          .eq('lp_lead_id', lpLeadId);
+      }
       _skipStats.leads++;
       // Reliability backstop: a stable lead sitting at a past-Data disposition
       // that never emitted a transition still needs to reach LP_DISP_*. No-op
@@ -564,7 +630,7 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
       // (onConflict on lp_job_id / lp_job_id,mdt_id), no extra LP call.
       const jobsForRefresh = getField(lead, 'jobs', 'Jobs') || [];
       if (jobsForRefresh.length) {
-        await Promise.all(jobsForRefresh.map(job => syncJobAndMilestones(job, lpLeadId, ghlId)));
+        await Promise.all(jobsForRefresh.map(job => syncJobAndMilestones(job, lpLeadId, childGhlId)));
       }
       // v10.0: route through executor (entry:* immutability respected)
       if (ghlId && !existing?.ghl_tag_applied) {
@@ -576,9 +642,11 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
       continue;
     }
 
-    const { row, isApptSet, isDemoCompleted, isClosedWon } = buildLeadRow(
-      prospect, lead, lpLeadId, lpProspectId, bucket, tag, ghlId, existing?.ghl_contact_id || null
-    );
+    const { row, isApptSet, isDemoCompleted, isClosedWon } = buildLeadRow(prospect, lead, {
+      lpLeadId, lpProspectId, bucket, tag, ghlId,
+      existingGhlId: existing?.ghl_contact_id || null,
+      resolvedLink: resolved,
+    });
 
     // v10.1: never overwrite an existing ghl_contact_id link with null.
     if (row.ghl_contact_id == null) delete row.ghl_contact_id;
@@ -647,10 +715,10 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
     }
 
     await Promise.all([
-      syncCallLogs(lpLeadId, ghlId, calls),
-      syncNotes(lpLeadId, ghlId, notes),
+      syncCallLogs(lpLeadId, childGhlId, calls),
+      syncNotes(lpLeadId, childGhlId, notes),
       syncActivities(lpLeadId, calls, notes),
-      ...jobs.map(job => syncJobAndMilestones(job, lpLeadId, ghlId)),
+      ...jobs.map(job => syncJobAndMilestones(job, lpLeadId, childGhlId)),
     ]);
 
     if (dispositionChanged) {
@@ -773,7 +841,20 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
 export async function upsertLeadFromFlat(lp, ghlId) {
   const lpLeadId = String(getField(lp, 'lds_id', 'id', 'LeadID', 'cst_id', 'ProspectID'));
   const lpProspectId = String(getField(lp, 'cst_id', 'CstID', 'ProspectID') || '');
-  const flatGhlId = deriveLeadGhlId(lp, ghlId);
+
+  // Flat records carry prospect-level identity directly, so the record
+  // doubles as both lead and prospect for corroboration.
+  const { data: existingFlat } = await supabase.from('lp_leads')
+    .select('ghl_contact_id, ghl_link_source')
+    .eq('lp_lead_id', lpLeadId).maybeSingle();
+  const resolved = await resolveLeadGhlLink({
+    lead: lp,
+    prospect: lp,
+    verifiedGhlId: ghlId || null,
+    existingGhlId: existingFlat?.ghl_contact_id || null,
+    existingLinkSource: existingFlat?.ghl_link_source || null,
+  }, { lpLeadId, lpProspectId });
+  const flatGhlId = resolved.ghlContactId || existingFlat?.ghl_contact_id || null;
 
   // v10.2: stamp the effective source (native, else promoter-derived) on the
   // flat path too, so source-less "Internet, <Vendor>" inbound never persists null.
@@ -783,6 +864,7 @@ export async function upsertLeadFromFlat(lp, ghlId) {
     lp_lead_id:         lpLeadId,
     lp_prospect_id:     lpProspectId,
     ghl_contact_id:     flatGhlId,
+    ghl_link_source:    resolved.linkSource || undefined,
     first_name:         getField(lp, 'firstname', 'FirstName', 'first_name'),
     last_name:          getField(lp, 'lastname', 'LastName', 'last_name'),
     email:              getField(lp, 'email', 'Email'),

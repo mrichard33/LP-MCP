@@ -129,6 +129,11 @@ import { registerAgenticLeadStateRoutes } from './admin/agentic-lead-states.js';
 // so it can run on Railway without shell access; shares its core with
 // scripts/remediate-guest-visitors.js.
 import { registerGuestVisitorRemediationRoutes } from './admin/guest-visitor-remediation.js';
+// Pre-enforce link-verification sampling (POST /admin/verify-link-sample,
+// read-only vs GHL): live-verifies a random sample of cache-classified
+// rejected_* rows so the observe-mode rejection rate can be compared to a
+// live baseline before LP_LINK_CORROBORATION_MODE=enforce.
+import { registerLinkVerifySampleRoutes } from './admin/link-verify-sample.js';
 // ─── LP→GHL appointment backfill (2026-07-07) ──
 // One-shot gap closer exposed over HTTP (POST /admin/backfill-ghl-appointments,
 // dry-run by default) so it can run on Railway without shell access; shares
@@ -378,6 +383,53 @@ async function runMigrations() {
     console.log('[Migration] capacity board schema (sql/043 + 044 + 045) ready');
   } catch (err) {
     console.error('[Migration] capacity board schema FAILED (board + lead upserts depend on it — apply sql/043 manually):', err.message);
+  }
+
+  // Link corroboration + identity sync substrate (sql/046 — the file is the
+  // source of truth; this mirror guarantees the schema exists before the
+  // first lead upsert writes ghl_link_source in observe mode). runSQL (throws
+  // on failure) for the same reason as the capacity-board block above. The
+  // legacy_unverified backfill UPDATE in sql/046 is data-op-sized and is NOT
+  // mirrored here.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`ALTER TABLE lp_leads
+              ADD COLUMN IF NOT EXISTS ghl_link_source text,
+              ADD COLUMN IF NOT EXISTS ghl_identity_synced_at timestamptz,
+              ADD COLUMN IF NOT EXISTS ghl_identity_hash text;
+            CREATE INDEX IF NOT EXISTS lp_leads_ghl_link_source_idx ON lp_leads (ghl_link_source);
+            CREATE TABLE IF NOT EXISTS lp_link_conflicts (
+              id                bigserial PRIMARY KEY,
+              lp_lead_id        text NOT NULL,
+              lp_prospect_id    text,
+              lognumber_ghl_id  text,
+              verified_ghl_id   text,
+              existing_ghl_id   text,
+              resolution        text NOT NULL,
+              reason            text,
+              lp_phone          text,
+              lp_email          text,
+              ghl_phone         text,
+              ghl_email         text,
+              detail            jsonb NOT NULL DEFAULT '{}',
+              seen_count        integer NOT NULL DEFAULT 1,
+              detected_at       timestamptz NOT NULL DEFAULT now(),
+              last_seen_at      timestamptz NOT NULL DEFAULT now(),
+              resolved_at       timestamptz);
+            CREATE INDEX IF NOT EXISTS lp_link_conflicts_lead_idx ON lp_link_conflicts (lp_lead_id, detected_at DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS lp_link_conflicts_natural_key_idx
+              ON lp_link_conflicts (lp_lead_id, coalesce(lognumber_ghl_id, ''), coalesce(verified_ghl_id, ''), resolution);
+            CREATE TABLE IF NOT EXISTS lp_link_verifications (
+              lp_lead_id      text NOT NULL,
+              ghl_contact_id  text NOT NULL,
+              verdict         text NOT NULL CHECK (verdict IN ('pass', 'fail', 'no_identity')),
+              verify_source   text NOT NULL DEFAULT 'ghl_live',
+              detail          jsonb NOT NULL DEFAULT '{}',
+              verified_at     timestamptz NOT NULL DEFAULT now(),
+              PRIMARY KEY (lp_lead_id, ghl_contact_id));`);
+    console.log('[Migration] link corroboration schema (sql/046) ready');
+  } catch (err) {
+    console.error('[Migration] link corroboration schema FAILED (observe-mode lead upserts depend on it — apply sql/046 manually):', err.message);
   }
 
   // Scorecard revenue realignment (sql/040): live-month RTP-net + provisional-gross columns,
@@ -691,7 +743,9 @@ app.post('/admin/backfill-ghl-contact-id-from-lognumber', async (req, res) => {
     const concurrency = parseInt(body.concurrency || req.query.concurrency || '3', 10);
     const afterProspectId = body.after_prospect_id || body.afterProspectId
       || req.query.after_prospect_id || req.query.afterProspectId || null;
-    const results = await runGhlContactIdBackfill({ dryRun, limit, afterProspectId, concurrency });
+    const liveVerify = body.live_verify === true || req.query.live_verify === 'true';
+    const maxLiveReads = parseInt(body.max_live_reads || req.query.max_live_reads || '200', 10);
+    const results = await runGhlContactIdBackfill({ dryRun, limit, afterProspectId, concurrency, liveVerify, maxLiveReads });
     res.json(results);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -708,6 +762,7 @@ registerAppointmentNotificationRoutes(app);
 registerGhlTriggerLinkRoutes(app);
 registerAgenticLeadStateRoutes(app);
 registerGuestVisitorRemediationRoutes(app);
+registerLinkVerifySampleRoutes(app); // 2026-07-23 — pre-enforce cache-vs-live rejection sampling (read-only vs GHL)
 registerPendingProbeTtlSweepRoutes(app); // 2026-07-08 — stale pending:customer-status-check TTL sweep (scheduler env-gated, default off)
 registerGhlAppointmentBackfillRoutes(app); // 2026-07-07 — LP→GHL appointment backfill trigger (dry-run default)
 registerLpContactBackstopRoutes(app); // 2026-07-09 — LP contact auto-create backstop (scheduler env-gated, default off)

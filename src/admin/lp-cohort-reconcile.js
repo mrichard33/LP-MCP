@@ -34,6 +34,7 @@
 import supabase from '../supabase.js';
 import { getLeads, getCircuitStatus } from '../lp-client.js';
 import { buildLeadRow } from '../sync-leads.js';
+import { resolveLeadGhlLink } from '../services/link-corroboration.js';
 import { resolveSourceBucket } from '../sync-sources.js';
 import { syncCallLogs, syncNotes, syncActivities, syncJobAndMilestones } from '../sync-children.js';
 import { syncLogStart, syncLogProgress, syncLogComplete } from '../sync-log.js';
@@ -182,9 +183,19 @@ async function reconcileProspect(prospect) {
 
     // Carry the existing link forward — never null it (matches sync-leads v10.1).
     const { data: existing } = await supabase.from('lp_leads')
-      .select('ghl_contact_id')
+      .select('ghl_contact_id, ghl_link_source')
       .eq('lp_lead_id', lpLeadId).maybeSingle();
     const existingGhlId = existing?.ghl_contact_id || null;
+
+    // Route through the corroboration resolver (no matchToGHL in this sweep)
+    // so a forced re-upsert can't re-adopt an uncorroborated lognumber.
+    const resolved = await resolveLeadGhlLink({
+      lead,
+      prospect,
+      verifiedGhlId: null,
+      existingGhlId,
+      existingLinkSource: existing?.ghl_link_source || null,
+    }, { lpLeadId, lpProspectId });
 
     const { bucket, tag } = await resolveSourceBucket(
       getField(lead, 'sourcesubdescr', 'SourceSubDescr'),
@@ -193,7 +204,9 @@ async function reconcileProspect(prospect) {
 
     // ghlId = null: the sweep does not match to GHL. existingGhlId preserves
     // any link already stored.
-    const { row } = buildLeadRow(prospect, lead, lpLeadId, lpProspectId, bucket, tag, null, existingGhlId);
+    const { row } = buildLeadRow(prospect, lead, {
+      lpLeadId, lpProspectId, bucket, tag, existingGhlId, resolvedLink: resolved,
+    });
     if (row.ghl_contact_id == null) delete row.ghl_contact_id;
 
     const { error: upsertErr } = await supabase.from('lp_leads').upsert(row, { onConflict: 'lp_lead_id' });
