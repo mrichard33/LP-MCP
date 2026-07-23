@@ -289,11 +289,16 @@ export async function checkSuppressionLive(contact_id, { mode = 'default', chann
     return { ...tagResult, source: 'live' };
   }
 
+  // Both 'active' AND 'permanent' block. 'permanent' is the carrier-level
+  // STOP-keyword state — STRONGER than 'active', not absent (2026-07-23
+  // backfill lesson: the contacts who texted STOP are exactly the ones a
+  // 'active'-only check would wave through).
   const dndChannel = channel ? DND_CHANNEL_BY_SEND_CHANNEL[String(channel).toLowerCase()] : null;
-  if (dndChannel && contact.dndSettings?.[dndChannel]?.status === 'active') {
+  const dndStatus = dndChannel ? contact.dndSettings?.[dndChannel]?.status : null;
+  if (dndStatus === 'active' || dndStatus === 'permanent') {
     return {
       suppressed: true,
-      reason: 'dnd_channel_active',
+      reason: dndStatus === 'permanent' ? 'dnd_channel_permanent' : 'dnd_channel_active',
       matched_tag: `dnd:${String(channel).toLowerCase()}`,
       all_matches: [`dnd:${String(channel).toLowerCase()}`],
       source: 'live',
