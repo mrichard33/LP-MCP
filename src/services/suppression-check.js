@@ -56,6 +56,10 @@
  */
 
 import supabase from '../supabase.js';
+// 2026-07-23 Phase 5 — send-time live re-check reads the contact straight
+// from GHL (checkSuppressionLive below). No cycle: helpers.js only imports
+// the rate limiter + format helpers.
+import { ghlFetch } from '../actions/helpers.js';
 
 /**
  * The canonical list of tags that suppress agentic outbound to a contact.
@@ -133,6 +137,58 @@ const REPLY_BLOCKING_TAGS = [
 const REPLY_BLOCKING_SET = new Set(REPLY_BLOCKING_TAGS);
 
 /**
+ * 2026-07-23 Phase 5 — the ONE tag-evaluation predicate, extracted from
+ * checkSuppression so the snapshot path and the live path share it. Pure
+ * over a tag array; result shapes identical to the historical inline logic.
+ * Do not add a parallel inline definition of "suppressed" anywhere else.
+ *
+ * @param {string[]} tags  lowercased tag array
+ * @param {object} [opts]
+ * @param {string} [opts.mode]        'default' | 'agentic_reply'
+ * @param {string} [opts.logContact]  contact id for the bypass log line (the
+ *                                    historical log kept its context)
+ */
+export function matchSuppressionTags(tags, { mode = 'default', logContact = null } = {}) {
+  const t = Array.isArray(tags) ? tags : [];
+
+  // Always-respond policy (see REPLY_BLOCKING_TAGS above): for a direct
+  // agentic reply on a contact the bot owns, only stop-bot + the consent
+  // family block. Operational suppressors are reported, not enforced.
+  if (mode === 'agentic_reply' && t.includes('agentic-active')) {
+    const blocking = t.filter(x => REPLY_BLOCKING_SET.has(x));
+    if (blocking.length > 0) {
+      return {
+        suppressed: true,
+        reason: 'suppression_tag_match',
+        matched_tag: blocking[0],
+        all_matches: blocking,
+      };
+    }
+    const bypassed = t.filter(x => SUPPRESS_SET.has(x));
+    if (bypassed.length > 0 && logContact) {
+      console.log(`[suppression-check] agentic_reply bypass for ${logContact}: agentic-active present — operational tags [${bypassed.join(', ')}] do not block a direct reply`);
+    }
+    return {
+      suppressed: false,
+      reason: bypassed.length > 0 ? 'agentic_reply_bypass' : 'no_match',
+      bypassed_tags: bypassed,
+    };
+  }
+
+  const matches = t.filter(x => SUPPRESS_SET.has(x));
+  if (matches.length === 0) {
+    return { suppressed: false, reason: 'no_match' };
+  }
+
+  return {
+    suppressed: true,
+    reason: 'suppression_tag_match',
+    matched_tag: matches[0],
+    all_matches: matches,
+  };
+}
+
+/**
  * Check whether outbound should be suppressed for this contact.
  *
  * @param {string} contact_id  GHL contact ID
@@ -171,41 +227,80 @@ export async function checkSuppression(contact_id, { mode = 'default' } = {}) {
     return { suppressed: false, reason: 'no_snapshot_open' };
   }
 
-  // Always-respond policy (see REPLY_BLOCKING_TAGS above): for a direct
-  // agentic reply on a contact the bot owns, only stop-bot + the consent
-  // family block. Operational suppressors are reported, not enforced.
-  if (mode === 'agentic_reply' && data.tags.includes('agentic-active')) {
-    const blocking = data.tags.filter(t => REPLY_BLOCKING_SET.has(t));
-    if (blocking.length > 0) {
-      return {
-        suppressed: true,
-        reason: 'suppression_tag_match',
-        matched_tag: blocking[0],
-        all_matches: blocking,
-      };
-    }
-    const bypassed = data.tags.filter(t => SUPPRESS_SET.has(t));
-    if (bypassed.length > 0) {
-      console.log(`[suppression-check] agentic_reply bypass for ${contact_id}: agentic-active present — operational tags [${bypassed.join(', ')}] do not block a direct reply`);
-    }
+  return matchSuppressionTags(data.tags, { mode, logContact: contact_id });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 2026-07-23 Phase 5 — send-time LIVE re-check
+// ═══════════════════════════════════════════════════════════════════
+//
+// checkSuppression above runs at the START of the send flow; the GHL call
+// happens three steps later, and the snapshot itself lags GHL until the tag
+// webhook lands. Both measured races (BEHAVIORAL_DNC_REPLY tagging while
+// AGENTIC_ACTIVE_REPLY_BACKSTOP sent, gaps 1.09s / 0.71s, 2026-07) had the
+// blocking tag in GHL BEFORE the send — a live read at send time catches
+// them. Called immediately before deps.executeSend via the optional
+// recheckBeforeSend dep (src/actions/send-message-flow.js), gated by
+// SEND_TIME_RECHECK_ENABLED (default on; wired in src/actions/index.js).
+
+/** GHL dndSettings key per send channel. livechat has no DND channel. */
+const DND_CHANNEL_BY_SEND_CHANNEL = { sms: 'SMS', email: 'Email' };
+
+/**
+ * Live suppression check against GHL — same predicate as the snapshot path
+ * (matchSuppressionTags), evaluated over the contact's CURRENT tags, plus
+ * channel-level dndSettings.
+ *
+ * GHL DND semantics are inverted: dndSettings[Channel].status === 'active'
+ * means the DND restriction is ACTIVE, i.e. sending is BLOCKED. It is
+ * unverified whether GHL enforces DND on API-originated conversation sends,
+ * so we enforce it ourselves.
+ *
+ * FAIL-OPEN on any error (missing contact, GHL 5xx, timeout) — a fail-closed
+ * gate would turn a GHL blip into total outbound silence. Deliberately does
+ * NOT use the per-batch _contactCache: a cached read reintroduces the exact
+ * staleness this closes.
+ *
+ * @param {string} contact_id
+ * @param {object} [opts]
+ * @param {string} [opts.mode]     'default' | 'agentic_reply'
+ * @param {string} [opts.channel]  send channel ('sms' | 'email'); null/other
+ *                                 → tags-only (no dndSettings evaluation)
+ */
+export async function checkSuppressionLive(contact_id, { mode = 'default', channel = null } = {}) {
+  if (!contact_id) return { suppressed: false, reason: 'no_contact_id_open' };
+
+  let contact;
+  try {
+    const res = await ghlFetch('GET', `/contacts/${contact_id}`);
+    contact = res?.contact || res || {};
+  } catch (err) {
+    console.warn(`[suppression-check] live read failed for ${contact_id} (fail-open): ${err?.message || err}`);
+    return { suppressed: false, reason: 'live_read_error_open' };
+  }
+
+  // Live GHL tags are not normalized; the snapshot convention is lowercase.
+  const tags = Array.isArray(contact.tags)
+    ? contact.tags.map(t => String(t).trim().toLowerCase())
+    : [];
+
+  const tagResult = matchSuppressionTags(tags, { mode, logContact: contact_id });
+  if (tagResult.suppressed) {
+    return { ...tagResult, source: 'live' };
+  }
+
+  const dndChannel = channel ? DND_CHANNEL_BY_SEND_CHANNEL[String(channel).toLowerCase()] : null;
+  if (dndChannel && contact.dndSettings?.[dndChannel]?.status === 'active') {
     return {
-      suppressed: false,
-      reason: bypassed.length > 0 ? 'agentic_reply_bypass' : 'no_match',
-      bypassed_tags: bypassed,
+      suppressed: true,
+      reason: 'dnd_channel_active',
+      matched_tag: `dnd:${String(channel).toLowerCase()}`,
+      all_matches: [`dnd:${String(channel).toLowerCase()}`],
+      source: 'live',
     };
   }
 
-  const matches = data.tags.filter(t => SUPPRESS_SET.has(t));
-  if (matches.length === 0) {
-    return { suppressed: false, reason: 'no_match' };
-  }
-
-  return {
-    suppressed: true,
-    reason: 'suppression_tag_match',
-    matched_tag: matches[0],
-    all_matches: matches,
-  };
+  return { ...tagResult, source: 'live' };
 }
 
 // ═══════════════════════════════════════════════════════════════════

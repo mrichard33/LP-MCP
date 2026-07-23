@@ -167,6 +167,9 @@
 
 import supabase from '../../supabase.js';
 import { ghlFetch } from '../helpers.js';
+// 2026-07-23 suppression hardening Phase 4 — atomic snapshot write-through
+// (generalizes the 2026-06-17 Peggy Webb inline write below).
+import { applyTagsToSnapshot } from '../../services/tag-snapshot.js';
 import { REMOVE_ALL_MARKETING_WF } from '../constants.js';
 import { resolveWorkflowIdByCanonicalCode } from '../../tools/admin/hl-fallback.js';
 
@@ -696,31 +699,10 @@ export async function executeIssueHold(action) {
   // Fail-soft: a snapshot write error does not fail the hold — the GHL webhook
   // round-trip will eventually write the tag anyway, and the AGENTIC rule-level
   // not_has_any_tag gate is a second-layer backstop.
+  // Phase 4 (2026-07-23): the inline read-then-upsert (itself racy) became the
+  // atomic shared write-through; fail-soft behavior unchanged.
   if (workflowCode === 'CANNOT_AFFORD') {
-    try {
-      const now = new Date().toISOString();
-      // Read existing tags first so we don't overwrite unrelated tags
-      const { data: snap } = await supabase
-        .from('contact_tag_snapshot')
-        .select('tags')
-        .eq('ghl_contact_id', contactId)
-        .maybeSingle();
-      const existingTags = Array.isArray(snap?.tags) ? snap.tags : [];
-      const holdTag = 'cannot-afford:pursuing-assistance';
-      if (!existingTags.includes(holdTag)) {
-        const updatedTags = [...existingTags, holdTag];
-        await supabase
-          .from('contact_tag_snapshot')
-          .upsert(
-            { ghl_contact_id: contactId, tags: updatedTags, updated_at: now },
-            { onConflict: 'ghl_contact_id' }
-          );
-        console.log(`[IssueHold] snapshot updated: ${holdTag} added for ${contactId}`);
-      }
-    } catch (snapErr) {
-      // Fail-soft — the GHL webhook round-trip will eventually write the tag.
-      console.warn(`[IssueHold] snapshot write failed for ${contactId} (fail-soft): ${snapErr.message}`);
-    }
+    await applyTagsToSnapshot(contactId, { add: ['cannot-afford:pursuing-assistance'] });
   }
 
   return {

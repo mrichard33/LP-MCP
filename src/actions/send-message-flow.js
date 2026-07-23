@@ -7,12 +7,18 @@
  * whole flow is testable with in-memory fakes (scripts/test-send-flow.js) —
  * the repo's pure-core pattern, one level up.
  *
- * Gate order (unchanged from the previous wrapper):
- *   1. checkSuppression                — tag-based universal gate
+ * Gate order:
+ *   1. checkSuppression                — tag-based universal gate (snapshot)
  *   2. acquireSlot (agentic_reply_locks) — per-contact single-flight +
  *      cooldown + supersede, now atomic + re-entrant via RPC
  *   3. tryLock (outbound_locks)        — per (contact, trigger_id) dedup
- *   4. executeSend                     — the actual handler / GHL call
+ *   4. recheckBeforeSend (optional)    — 2026-07-23 Phase 5: LIVE suppression
+ *      re-check against GHL immediately before the send. Gate 1 runs at flow
+ *      START and reads the (lagging) snapshot; the GHL call happens three
+ *      steps later. Both measured 30-day races (tag landed in GHL 0.7–1.1s
+ *      before the send) are caught here. Optional dep — absent in older
+ *      tests/callers → behavior unchanged.
+ *   5. executeSend                     — the actual handler / GHL call
  *
  * What changed vs the pre-hotfix wrapper:
  *
@@ -237,7 +243,39 @@ export async function runSendMessageFlow(action, context, deps) {
       };
     }
 
-    // ── 4. The send itself ──
+    // ── 4. Send-time live re-check (Phase 5, optional dep) ──
+    // Last look at the CONTACT'S CURRENT state before the irreversible GHL
+    // call. On a block: release the outbound lock (mirrors the error path
+    // below) and terminal-skip; slotState stays 'held' so the finally
+    // releases the slot. The dep itself fails open — a null/undefined or
+    // non-suppressed result proceeds.
+    if (deps.recheckBeforeSend) {
+      let recheck = null;
+      try {
+        recheck = await deps.recheckBeforeSend(action, context);
+      } catch (err) {
+        // Fail-open — a re-check fault must never block outbound.
+        console.warn(`[ActionExecutor] send-time recheck failed for ${contact_id} (fail-open): ${err?.message || err}`);
+      }
+      if (recheck?.suppressed) {
+        console.log(
+          `[ActionExecutor] send_message blocked at send time: contact=${contact_id} ` +
+          `action=${action.id} matched_tag=${recheck.matched_tag} reason=${recheck.reason}`
+        );
+        if (trigger_id) {
+          await deps.releaseLock(contact_id, trigger_id, { expected_expires_at: lock.expires_at });
+        }
+        return {
+          skipped: true,
+          reason: 'suppressed_at_send_time',
+          matched_tag: recheck.matched_tag,
+          contact_id,
+          trigger_id,
+        };
+      }
+    }
+
+    // ── 5. The send itself ──
     try {
       const result = await deps.executeSend(action, context);
       if (result?.action === 'message_sent') {

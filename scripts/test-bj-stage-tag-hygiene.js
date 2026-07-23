@@ -38,7 +38,12 @@ globalThis.fetch = async (url, opts = {}) => {
   const { pathname } = new URL(url);
   const method = opts.method;
   const body = opts.body ? JSON.parse(opts.body) : null;
-  calls.push({ method, path: pathname, body });
+  // GHL contact calls only — the Phase 4 (2026-07-23) snapshot write-through
+  // RPC (POST /rest/v1/rpc/...) is not a GHL tag write. Same scoping as
+  // scripts/test-tag-safety.js.
+  if (pathname.startsWith('/contacts')) {
+    calls.push({ method, path: pathname, body });
+  }
   if (method === 'GET') return jsonRes({ contact: currentContact });
   return jsonRes({ ok: true });
 };

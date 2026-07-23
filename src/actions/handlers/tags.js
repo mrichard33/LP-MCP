@@ -69,6 +69,10 @@
 
 import { ghlFetch } from '../helpers.js';
 import { getContactCached, setCachedContactTags } from '../contact-cache.js';
+// 2026-07-23 suppression hardening Phase 4 — synchronous snapshot write-through
+// so suppression gates see executor tag mutations without waiting for the GHL
+// tag webhook round-trip. Fail-soft: never blocks the parent action.
+import { applyTagsToSnapshot } from '../../services/tag-snapshot.js';
 
 // TAG-WRITE CONTRACT (do not break): tag mutations are ADDITIVE.
 //   add    → POST /contacts/{id}/tags { tags: [...] }   (GHL appends)
@@ -203,6 +207,10 @@ export async function executeAddTag(action, context = {}) {
     }
   }
 
+  // Phase 4 — snapshot write-through (fail-soft). removedConflicting reflects
+  // only tags actually deleted (it is reset to [] on DELETE failure above).
+  await applyTagsToSnapshot(contactId, { add: [tag], remove: removedConflicting });
+
   return {
     tag_applied: tag,
     contact_id: contactId,
@@ -262,6 +270,8 @@ export async function executeRemoveTag(action, context = {}) {
     const cur = cache.get(contactId)?.tags || [];
     setCachedContactTags(contactId, cache, cur.filter(t => !tags.includes(t)));
   }
+  // Phase 4 — snapshot write-through (fail-soft).
+  await applyTagsToSnapshot(contactId, { remove: tags });
   if (tags.length === 1) {
     return { tag_removed: tags[0], contact_id: contactId };
   }
@@ -338,6 +348,9 @@ export async function executeSetStage(action, context = {}) {
     ...(alreadyHasNew ? [] : [newStage]),
   ];
   setCachedContactTags(contactId, cache, nextTags);
+
+  // Phase 4 — snapshot write-through (fail-soft). Atomic swap → both sides.
+  await applyTagsToSnapshot(contactId, { add: [newStage], remove: conflictingStages });
 
   console.log(`[ActionExecutor] ✅ set_stage(${contactId}) → ${newStage} (removed ${conflictingStages.length} conflicting: ${conflictingStages.join(', ') || 'none'})`);
 

@@ -372,6 +372,48 @@ test('a cleanly RELEASED prior lock never presumes sent — the reply proceeds',
   assert.equal(result.action, 'message_sent');
 });
 
+// ── Phase 5 (2026-07-23): send-time live re-check ────────────────────
+test('recheckBeforeSend suppressed: terminal skip, lock + slot released, no send', async () => {
+  const { world, deps } = makeWorld();
+  const recheckDeps = {
+    ...deps,
+    recheckBeforeSend: async () => ({ suppressed: true, matched_tag: 'dnc-sms', reason: 'suppression_tag_match' }),
+  };
+  const result = await runSendMessageFlow(makeAction(1001), {}, recheckDeps);
+  assert.equal(result.skipped, true);
+  assert.equal(result.reason, 'suppressed_at_send_time');
+  assert.equal(result.matched_tag, 'dnc-sms');
+  assert.equal(world.sends.length, 0, 'no GHL send');
+  assert.equal(world.slots.has('contact-1'), false, 'slot released via finally');
+  const lock = world.outbound.get('contact-1:trig-1');
+  assert.ok(lock?.released_at, 'outbound lock released so a later legitimate send is not deadlocked');
+});
+
+test('recheckBeforeSend not suppressed: send proceeds unchanged', async () => {
+  const { world, deps } = makeWorld();
+  const recheckDeps = {
+    ...deps,
+    recheckBeforeSend: async () => ({ suppressed: false, reason: 'no_match' }),
+  };
+  const result = await runSendMessageFlow(makeAction(1002), {}, recheckDeps);
+  assert.equal(result.action, 'message_sent');
+  assert.equal(world.sends.length, 1);
+});
+
+test('recheckBeforeSend throwing fails OPEN: the send still goes', async () => {
+  const { world, deps } = makeWorld();
+  const recheckDeps = {
+    ...deps,
+    recheckBeforeSend: async () => { throw new Error('GHL 503 mid-recheck'); },
+  };
+  const result = await runSendMessageFlow(makeAction(1003), {}, recheckDeps);
+  assert.equal(result.action, 'message_sent', 'a recheck fault must never block outbound');
+  assert.equal(world.sends.length, 1);
+});
+
+// (All pre-existing tests in this file run WITHOUT recheckBeforeSend — they
+// double as the "optional dep absent → behavior unchanged" regression.)
+
 // ── Suppression still short-circuits before any lock is taken ────────
 test('suppressed contact: no slot, no outbound lock, no send', async () => {
   const { world, deps } = makeWorld();
