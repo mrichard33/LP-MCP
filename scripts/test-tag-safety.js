@@ -42,7 +42,13 @@ globalThis.fetch = async (url, opts = {}) => {
   const { pathname } = new URL(url);
   const method = opts.method;
   const body = opts.body ? JSON.parse(opts.body) : null;
-  calls.push({ method, path: pathname, body });
+  // Record GHL contact calls only. Since 2026-07-23 (suppression hardening
+  // Phase 4) tag handlers also write through to contact_tag_snapshot via a
+  // Supabase RPC (fail-soft, POST /rest/v1/rpc/...); that call is not a GHL
+  // tag write and must not count against the additive-write invariants.
+  if (pathname.startsWith('/contacts')) {
+    calls.push({ method, path: pathname, body });
+  }
   if (method === 'GET') return jsonRes({ contact: currentContact });
   return jsonRes({ ok: true });
 };
