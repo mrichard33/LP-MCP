@@ -136,7 +136,9 @@ import { endAgenticHandoff } from '../services/agentic-handoff.js';
 // Phase 1 Intake/Routing Layer #51 — universal outbound suppression
 // 2026-07-03 — checkMutationSuppression: suppress-automation / stop-bot now
 // gates ALL mutating action types, not only send_message.
-import { checkSuppression, checkMutationSuppression, isMutationGateExempt } from '../services/suppression-check.js';
+// 2026-07-23 Phase 5 — checkSuppressionLive: send-time live re-check (gate 4
+// in send-message-flow.js), closing the snapshot-lag race (Gary Cina).
+import { checkSuppression, checkSuppressionLive, checkMutationSuppression, isMutationGateExempt } from '../services/suppression-check.js';
 // Send-dedup — logical-identity idempotency for non-idempotent senders (2026-06-05)
 import { claimSendMark, releaseSendMark, makeDedupKey } from '../services/send-dedup.js';
 
@@ -210,6 +212,54 @@ async function executeSendMessageWithLock(action, context) {
     // contact is blocked only by stop-bot + the consent/DNC family;
     // operational suppressors gate campaigns and re-enrollment, not answers.
     checkSuppression: (contact_id) => checkSuppression(contact_id, { mode: 'agentic_reply' }),
+    // 2026-07-23 Phase 5 — LIVE re-check immediately before the GHL send.
+    // Same agentic_reply mode as gate 1, but read straight from GHL (fresh
+    // tags + channel dndSettings). Kill switch: SEND_TIME_RECHECK_ENABLED
+    // (default ON; set to 'false' to disable without a redeploy revert).
+    // checkSuppressionLive fails open internally; the flow also guards.
+    recheckBeforeSend: async (a) => {
+      if (process.env.SEND_TIME_RECHECK_ENABLED === 'false') {
+        return { suppressed: false, reason: 'recheck_disabled' };
+      }
+      // Channel derivation mirrors executeSendMessage (payload.channel,
+      // default 'sms'). livechat/unknown → tags-only (no GHL DND channel).
+      const raw = String(a.action_payload?.channel || 'sms').toLowerCase();
+      const channel = raw === 'sms' || raw === 'email' ? raw : null;
+      const result = await checkSuppressionLive(a.target_id, { mode: 'agentic_reply', channel });
+      if (result.suppressed) {
+        // Silent drops are how the original nine-month gap hid — record every
+        // send-time block. Best-effort gap estimate: the snapshot's
+        // updated_at approximates when the blocking tag landed.
+        let snapshotUpdatedAt = null;
+        try {
+          const { data: snap } = await supabase
+            .from('contact_tag_snapshot')
+            .select('updated_at')
+            .eq('ghl_contact_id', a.target_id)
+            .maybeSingle();
+          snapshotUpdatedAt = snap?.updated_at || null;
+        } catch { /* best-effort only */ }
+        emitEvent({
+          event_type: 'agentic.send_blocked_at_send_time',
+          source: 'action_executor',
+          entity_type: 'contact',
+          entity_id: String(a.target_id || 'unknown'),
+          ghl_contact_id: a.target_id || null,
+          priority: 'low',
+          bypass_filter: true,
+          payload: {
+            contact_id: a.target_id || null,
+            action_id: a.id || null,
+            rule_applied: a.rule_applied || null,
+            matched_tag: result.matched_tag || null,
+            reason: result.reason,
+            snapshot_updated_at: snapshotUpdatedAt,
+          },
+          idempotency_key: `send_blocked_at_send_time_${a.id || a.target_id}`,
+        }).catch((err) => console.warn(`[ActionExecutor] send_blocked_at_send_time emit failed: ${err.message}`));
+      }
+      return result;
+    },
     resolveTriggerId: async (a, ctx) => {
       const params = a.action_payload || {};
       let trigger_id = params.trigger_id || ctx?.message_id || null;
