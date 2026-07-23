@@ -37,12 +37,15 @@
 //     to NULL only).
 //   - Stats include sample_updates (first 10) for post-run verification.
 //
-// Imports the same deriveLeadGhlId helper that sync-leads.js uses, so
-// the pattern check stays in one place.
+// Shape check comes from ghl-link-shape.js; a shape-valid lognumber is only
+// a CANDIDATE — it is verified against GHL contact identity (HL contacts
+// cache first, optional live reads with live_verify:true) before binding.
+// Uncorroborated candidates are never backfilled.
 
 import supabase from '../supabase.js';
 import { getLeads } from '../lp-client.js';
-import { deriveLeadGhlId } from '../sync-leads.js';
+import { lognumberCandidate } from '../ghl-link-shape.js';
+import { verifyLognumberCandidate } from '../services/link-corroboration.js';
 
 const DEFAULT_LIMIT = 500;
 const DEFAULT_CONCURRENCY = 3;
@@ -53,10 +56,14 @@ export async function runGhlContactIdBackfill({
   limit = DEFAULT_LIMIT,
   afterProspectId = null,
   concurrency = DEFAULT_CONCURRENCY,
+  liveVerify = false,
+  maxLiveReads = 200,
 } = {}) {
   const start = Date.now();
   const safeLimit = Math.max(1, Math.min(2000, parseInt(limit, 10) || DEFAULT_LIMIT));
   const safeConcurrency = Math.max(1, Math.min(10, parseInt(concurrency, 10) || DEFAULT_CONCURRENCY));
+  const safeMaxLiveReads = Math.max(0, parseInt(maxLiveReads, 10) || 0);
+  let liveReadsUsed = 0;
 
   console.log(
     `[GhlIdBackfill] Starting ${dryRun ? 'DRY RUN' : 'LIVE RUN'} ` +
@@ -71,6 +78,9 @@ export async function runGhlContactIdBackfill({
     backfilled: 0,
     no_match_in_lp: 0,
     no_shape_valid_lognumber: 0,
+    rejected_uncorroborated: 0,
+    rejected_conflict: 0,
+    unverifiable_skipped: 0,
     lp_api_errors: 0,
     supabase_errors: 0,
     sample_updates: [],
@@ -83,7 +93,7 @@ export async function runGhlContactIdBackfill({
   // We pull up to safeLimit * ROW_PULL_MULTIPLIER rows so we likely
   // get safeLimit unique prospects (most prospects have 1-3 leads).
   let query = supabase.from('lp_leads')
-    .select('lp_lead_id, lp_prospect_id')
+    .select('lp_lead_id, lp_prospect_id, phone, phone_alt, email')
     .is('ghl_contact_id', null);
 
   if (afterProspectId) {
@@ -113,11 +123,19 @@ export async function runGhlContactIdBackfill({
 
   // ─── Step 2: group by prospect_id (preserve insertion order) ──
   const prospectMap = new Map();
+  const identityByLeadId = new Map();
   for (const row of nullRows) {
     if (!row.lp_prospect_id || !row.lp_lead_id) continue;
     const pid = String(row.lp_prospect_id);
     if (!prospectMap.has(pid)) prospectMap.set(pid, []);
     prospectMap.get(pid).push(String(row.lp_lead_id));
+    // lp_leads already mirrors prospect identity — use it for corroboration
+    // instead of re-pairing leads with their LP parent records.
+    identityByLeadId.set(String(row.lp_lead_id), {
+      phone: row.phone || null,
+      phoneAlt: row.phone_alt || null,
+      email: row.email || null,
+    });
   }
 
   const allProspectIds = Array.from(prospectMap.keys());
@@ -165,17 +183,42 @@ export async function runGhlContactIdBackfill({
         continue;
       }
 
-      const ghlId = deriveLeadGhlId(target, null);
+      const ghlId = lognumberCandidate(target);
       if (!ghlId) {
         stats.no_shape_valid_lognumber++;
         continue;
       }
 
-      // Found a shape-valid lognumber → update (or pretend to in dry run)
+      // Corroborate before binding: HL cache first, live GHL read only when
+      // the caller opted in (live_verify) and the per-run read cap allows.
+      const allowLive = liveVerify && liveReadsUsed < safeMaxLiveReads;
+      const lpIdentity = identityByLeadId.get(String(lpLeadId))
+        || { phone: null, phoneAlt: null, email: null };
+      const verification = await verifyLognumberCandidate({
+        lpIdentity, candidateId: ghlId, allowLive, lpLeadId: String(lpLeadId),
+      });
+      if (verification.source === 'ghl_live') liveReadsUsed++;
+
+      if (verification.verdict === 'no_identity') {
+        stats.rejected_uncorroborated++;
+        continue;
+      }
+      if (verification.verdict === 'fail') {
+        stats.rejected_conflict++;
+        continue;
+      }
+      if (verification.verdict !== 'pass') {
+        // 'unknown' — cache row missing / cap reached: skip, never bind blind.
+        stats.unverifiable_skipped++;
+        continue;
+      }
+
+      // Verified candidate → update (or pretend to in dry run)
       if (!dryRun) {
         const { error: updateErr } = await supabase.from('lp_leads')
           .update({
             ghl_contact_id: ghlId,
+            ghl_link_source: 'lognumber_verified',
             synced_at: new Date().toISOString(),
           })
           .eq('lp_lead_id', lpLeadId)
@@ -228,6 +271,9 @@ export async function runGhlContactIdBackfill({
   console.log(
     `[GhlIdBackfill] Batch complete: ${stats.backfilled} backfilled, ` +
     `${stats.no_shape_valid_lognumber} no-shape-valid-lognumber, ` +
+    `${stats.rejected_uncorroborated} rejected-uncorroborated, ` +
+    `${stats.rejected_conflict} rejected-conflict, ` +
+    `${stats.unverifiable_skipped} unverifiable-skipped, ` +
     `${stats.no_match_in_lp} not-in-lp, ${stats.lp_api_errors} lp-errors, ` +
     `${stats.supabase_errors} db-errors (elapsed ${stats.elapsed_ms}ms, ` +
     `next_cursor=${stats.next_cursor})`

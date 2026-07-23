@@ -118,7 +118,7 @@ export function buildMergedLead(leads) {
 async function clearStaleGHLContact(ghlContactId, leadIds) {
   try {
     const { data } = await supabase.from('lp_leads')
-      .update({ ghl_contact_id: null, ghl_tag_applied: false, ghl_fields_hash: null })
+      .update({ ghl_contact_id: null, ghl_tag_applied: false, ghl_fields_hash: null, ghl_link_source: null })
       .eq('ghl_contact_id', ghlContactId)
       .select('lp_lead_id');
     const cleared = data?.length || 0;
