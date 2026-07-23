@@ -233,7 +233,7 @@ export function matchMutationSuppression(tags) {
 // add_tag exception: suppression/audit tags must still land on a suppressed
 // contact (they are how suppression is recorded in the first place).
 const SUPPRESSION_AUDIT_TAG_RE =
-  /^(dnc|dnc-|do-not-contact|stop-bot|suppress-|hard-disqualified|quarantined|audit-|compliance-|loss-reason:)/i;
+  /^(dnc|dnc-|do-not-contact|stop-bot|suppress[-:]|hard-disqualified|quarantined|audit-|compliance-|loss-reason:)/i;
 
 export function isSuppressionAuditTag(tag) {
   return SUPPRESSION_AUDIT_TAG_RE.test(String(tag || ''));
