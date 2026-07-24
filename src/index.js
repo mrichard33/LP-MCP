@@ -74,6 +74,8 @@ import { registerAppointmentNotificationRoutes } from './notifications/appointme
 import { registerGroupMeRoutes } from './groupme.js';
 // ─── LP Appointment Sync (GHL → LP) ────────────────────────────
 import { registerLPAppointmentSyncRoutes } from './lp-appointment-sync.js';
+// ─── LP Addlead Validation Proxy (GHL addlead → hour gate → LP) ──
+import { registerLpAddleadProxyRoutes } from './lp-addlead-proxy.js';
 // ─── Workflow Completion (tag-based self-enrichment) ─────────────
 import { registerWorkflowCompletionRoutes } from './workflow-completion-handler.js';
 // ─── Cooling Callbacks ───────────────────────────────────────────
@@ -678,6 +680,9 @@ registerGroupMeRoutes(app);
 
 // ─── LP Appointment Sync (GHL → LP) ──────────────────────────────
 registerLPAppointmentSyncRoutes(app);
+
+// ─── LP Addlead Validation Proxy (GHL addlead → hour gate → LP) ──
+registerLpAddleadProxyRoutes(app);
 
 // ─── Workflow Completion ─────────────────────────────────────────
 registerWorkflowCompletionRoutes(app);
