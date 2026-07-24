@@ -85,3 +85,57 @@ export async function updateSalesRabbitLead(salesrabbitId, fields = {}, opts = {
     return { ok: false, reason: err.message };
   }
 }
+
+/**
+ * Fetch the SalesRabbit userId for a lead — the rep the lead is assigned to.
+ * Mirrors the retired I.CC "Get Sales Rabbit Lead User ID" webhook (GET
+ * /leads/{id} → response `.data.userId`); the canvassing-intake endpoint
+ * writes the result back to the GHL "Sales Rabbit User ID" field.
+ *
+ * Never throws — a SalesRabbit outage must not affect LP intake. Returns the
+ * userId as a string, or null on missing id / missing token / any error.
+ *
+ * @param {string|number} salesrabbitId — SalesRabbit lead ID
+ * @param {object} [opts]
+ * @param {Function} [opts.fetchImpl] — injectable fetch for tests
+ * @param {string} [opts.token] — defaults to SALESRABBIT_API_TOKEN
+ * @param {number} [opts.timeoutMs]
+ * @returns {Promise<string|null>}
+ */
+export async function getSalesRabbitUserId(salesrabbitId, opts = {}) {
+  const {
+    fetchImpl = fetch,
+    token = process.env.SALESRABBIT_API_TOKEN,
+    timeoutMs = 10000,
+  } = opts;
+
+  if (!salesrabbitId) return null;
+  if (!token) {
+    console.warn('[SalesRabbit] SALESRABBIT_API_TOKEN unset — skipping user-id lookup (log-only)');
+    return null;
+  }
+
+  try {
+    const res = await fetchImpl(`${SALESRABBIT_BASE_URL}/leads/${encodeURIComponent(String(salesrabbitId))}`, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      console.warn(`[SalesRabbit] GET leads/${salesrabbitId} failed: ${res.status} ${text.slice(0, 200)}`);
+      return null;
+    }
+
+    const data = await res.json().catch(() => null);
+    const userId = data?.data?.userId;
+    return userId != null ? String(userId) : null;
+  } catch (err) {
+    console.warn(`[SalesRabbit] GET leads/${salesrabbitId} error: ${err.message}`);
+    return null;
+  }
+}
