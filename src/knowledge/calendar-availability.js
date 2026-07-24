@@ -41,6 +41,19 @@ const DEFAULT_WINDOW_DAYS = parseInt(process.env.CAL_AVAIL_WINDOW_DAYS || '14', 
 const MAX_SLOTS_RETURNED = parseInt(process.env.CAL_AVAIL_MAX_SLOTS || '12', 10);
 const FETCH_TIMEOUT_MS = 10_000;
 
+// ─── Offer-window selection knobs (v1.1 — 2026-07-24 Engelke incident) ───
+// The FETCH stays wide (CAL_AVAIL_WINDOW_DAYS, so a lead-requested far date can
+// still be matched); the OFFER is narrowed to the next 48 hours unless the lead
+// named a specific day. See selectOfferableSlots below.
+const OFFER_WINDOW_HOURS = parseInt(process.env.BOOKING_OFFER_WINDOW_HOURS || '48', 10);
+const MIN_NOTICE_HOURS = parseInt(process.env.BOOKING_MIN_NOTICE_HOURS || '4', 10);
+const ESCALATION_LADDER = (process.env.BOOKING_ESCALATION_LADDER || '48,72,96,168')
+  .split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => Number.isFinite(n) && n > 0)
+  .sort((a, b) => a - b);
+// Cap on how many slots the bot puts in front of the lead, matching the
+// current outbound copy ("two openings").
+const MAX_OFFER_SLOTS = 2;
+
 /**
  * Fetch available booking slots for a GHL calendar.
  *
@@ -209,4 +222,145 @@ export function formatSlotsForPrompt(availability) {
     lines.push('  (' + more + ' additional later slots not shown — link reveals all)');
   }
   return lines.join('\n');
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Offer-window selection (v1.1 — 2026-07-24 Engelke incident)
+// ═══════════════════════════════════════════════════════════════════
+
+/** Civil YYYY-MM-DD of an ISO instant, evaluated in tz. */
+function isoCivilDate(iso, tz) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(new Date(iso));
+  const get = (t) => parts.find((p) => p.type === t)?.value;
+  return `${get('year')}-${get('month')}-${get('day')}`;
+}
+
+/**
+ * Narrow a wide availability list to the slots the bot may OFFER this turn.
+ *
+ * Selection order (§3):
+ *   1. FLOOR      — discard anything sooner than now + minNoticeHours.
+ *   2. LEAD DAY   — if the lead named a specific day (day_and_time / day_only)
+ *                   and that date is open, offer those (the only >48h path).
+ *   3. STANDARD   — slots inside [floor, now + offerWindowHours].
+ *   4. ESCALATED  — nothing in the standard window but openings exist later:
+ *                   offer the nearest, flagged so the bot acknowledges the gap.
+ *   5. NONE       — nothing bookable at all after the floor.
+ *
+ * Returns the window metadata plus an `availability`-shaped object (same
+ * { slots, calendar_id, timezone, slots_total_count } contract) that drops
+ * straight into formatSlotsForPrompt.
+ *
+ * @param {Object|null} availability  — result of fetchFreeSlots
+ * @param {Object|null} preferred     — result of extractPreferredTime (or null)
+ * @param {Object} [opts]
+ * @param {number} [opts.minNoticeHours]   — per-call floor override (e.g. shorter for phone calendars)
+ * @param {number} [opts.offerWindowHours] — per-call window override
+ * @param {number} [opts.maxOffer]         — per-call cap override
+ * @returns {{ slots, window, escalated_to_hours, preferred_honored, availability }}
+ */
+export function selectOfferableSlots(availability, preferred, opts = {}) {
+  const none = (av) => ({
+    slots: [], window: 'none', escalated_to_hours: null, preferred_honored: false,
+    availability: av,
+  });
+  if (!availability || !Array.isArray(availability.slots)) return none(availability || null);
+
+  const tz = availability.timezone || DEFAULT_TIMEZONE;
+  const minNotice = Number.isFinite(opts.minNoticeHours) ? opts.minNoticeHours : MIN_NOTICE_HOURS;
+  const offerWindow = Number.isFinite(opts.offerWindowHours) ? opts.offerWindowHours : OFFER_WINDOW_HOURS;
+  const maxOffer = Number.isFinite(opts.maxOffer) ? opts.maxOffer : MAX_OFFER_SLOTS;
+
+  const now = Date.now();
+  const floorMs = now + minNotice * 3600_000;
+  const ms = (s) => new Date(s.iso).getTime();
+
+  // 1. Floor — a 90-min in-home visit cannot be offered for 40 min from now.
+  const afterFloor = availability.slots
+    .filter((s) => Number.isFinite(ms(s)) && ms(s) >= floorMs)
+    .sort((a, b) => ms(a) - ms(b));
+
+  const pack = (slots, window, extra = {}) => ({
+    slots: slots.slice(0, maxOffer),
+    window,
+    escalated_to_hours: null,
+    preferred_honored: false,
+    availability: {
+      slots: slots.slice(0, maxOffer),
+      calendar_id: availability.calendar_id,
+      timezone: tz,
+      slots_total_count: slots.length,
+    },
+    ...extra,
+  });
+
+  if (afterFloor.length === 0) {
+    console.log(`[OfferWindow] cal=${availability.calendar_id} window=none (0 slots after ${minNotice}h floor)`);
+    return none({
+      slots: [], calendar_id: availability.calendar_id, timezone: tz, slots_total_count: 0,
+    });
+  }
+
+  // 2. Lead-requested day — the only path that may exceed the 48h window.
+  const spec = preferred?.specificity;
+  if (preferred?.date_iso && (spec === 'day_and_time' || spec === 'day_only')) {
+    const daySlots = afterFloor.filter((s) => isoCivilDate(s.iso, tz) === preferred.date_iso);
+    if (daySlots.length) {
+      console.log(`[OfferWindow] cal=${availability.calendar_id} window=lead_requested date=${preferred.date_iso} n=${daySlots.length}`);
+      return pack(daySlots, 'lead_requested', { preferred_honored: true });
+    }
+  }
+
+  // 3. Standard 48h window.
+  const windowEndMs = now + offerWindow * 3600_000;
+  const standard = afterFloor.filter((s) => ms(s) <= windowEndMs);
+  if (standard.length) {
+    console.log(`[OfferWindow] cal=${availability.calendar_id} window=standard_48h n=${standard.length}`);
+    return pack(standard, 'standard_48h');
+  }
+
+  // 4. Escalated — nothing inside 48h, but real openings exist later. Offer the
+  //    nearest, flagged so the bot must acknowledge the gap (never a silent
+  //    jump). The escalation ladder documents the acknowledgment thresholds; we
+  //    always surface the earliest real openings rather than leave dead air.
+  const hoursOut = Math.max(1, Math.round((ms(afterFloor[0]) - now) / 3600_000));
+  const rung = ESCALATION_LADDER.find((h) => h >= hoursOut) || ESCALATION_LADDER[ESCALATION_LADDER.length - 1] || offerWindow;
+  console.log(`[OfferWindow] cal=${availability.calendar_id} window=escalated nearest=${hoursOut}h rung=${rung}h n=${afterFloor.length}`);
+  return pack(afterFloor, 'escalated', { escalated_to_hours: hoursOut });
+}
+
+/**
+ * Prompt block prepended above the CALENDAR AVAILABILITY block, describing how
+ * the offer must be framed for the selected window (§3). Returns null for the
+ * 'none' window (the caller routes to the no-availability / booking-link path)
+ * or when there is nothing to say.
+ *
+ * @param {Object} selection — result of selectOfferableSlots
+ * @param {Object|null} [preferred] — for the lead_requested {raw}
+ */
+export function buildOfferWindowPrompt(selection, preferred = null) {
+  if (!selection) return null;
+  switch (selection.window) {
+    case 'standard_48h':
+      return [
+        'OFFER WINDOW: next 48 hours. Offer exactly two of the slots listed below.',
+        'Do NOT offer, mention, or imply any date beyond this window.',
+      ].join('\n');
+    case 'lead_requested':
+      return [
+        `OFFER WINDOW: the lead specifically asked for ${preferred?.raw || 'their requested day'}, and it is open.`,
+        'Offer that slot first and by name. Do not bury it among alternatives.',
+      ].join('\n');
+    case 'escalated':
+      return [
+        `OFFER WINDOW: nothing is open in the next 48 hours; the nearest openings are`,
+        `${selection.escalated_to_hours} hours out. Say plainly that the next two days are full`,
+        `before you offer anything. Never describe a slot several days out as "soon"`,
+        `or as "our soonest opening" without that acknowledgment.`,
+      ].join('\n');
+    default:
+      return null;
+  }
 }

@@ -80,6 +80,13 @@ const GHL_FIELD_DECODER = {
   'nWDA6dvUmLZQA02v7LNi': { name: 'LP Total Appointments',   category: 'appointment', notes: 'Also "Door Count (alt)" in skill — verify which.' },
   'sKFUjCKYgCdD0KQiQGo2': { name: 'Lead/Appointment Date',   category: 'appointment' },
   '7lpRWFDM8DZbLd3viHEG': { name: 'Preferred Estimate Time', category: 'appointment' },
+  // v1.1 (2026-07-24 Engelke incident) — the lead's OWN stated time is persisted
+  // (fill-if-empty) into Preferred Estimate Time (above) plus two NEW fields.
+  // Those fields do not exist in GHL yet; once Mark creates them and sets
+  // LAST_REQUESTED_DATE_FIELD_ID / LAST_REQUESTED_TIME_WINDOW_FIELD_ID, add the
+  // real ids here so get_decoded_contact resolves them, e.g.:
+  //   '<id>': { name: 'Last Requested Date',        category: 'appointment' },
+  //   '<id>': { name: 'Last Requested Time Window', category: 'appointment' },
 
   // ─── PROJECT SCOPE ──────────────────────────────────────────────
   'h9FJTUbmUHIuD6JKmpXv': { name: 'Window Count',            category: 'project' },
