@@ -97,8 +97,9 @@ import { isInHomeCalendarId, isGhlOnlyCalendarId } from '../../knowledge/booking
 import { markRescheduleInflight } from '../../services/reschedule-inflight.js';
 import { executeCreateTask } from './tasks.js';
 import { getContactCached } from '../contact-cache.js';
-import { isPlaceholderName } from '../../services/identity-extraction.js';
+import { isPlaceholderName, EMAIL_ASKED_TAG } from '../../services/identity-extraction.js';
 import { emitEvent } from '../../event-emitter.js';
+import supabase from '../../supabase.js';
 import { syncCancelledAppointmentState, reconcileGhlOnlyApptTag } from './appointment-field-sync.js';
 
 // Tags cleared once a booking lands (or the flow otherwise terminates) so the
@@ -226,6 +227,57 @@ async function persistQualifyingData(contactId, qualifyingData) {
   } catch (err) {
     console.warn(`[ActionExecutor] qualifying_data persist threw for ${contactId}: ${err.message}`);
     return 0;
+  }
+}
+
+// v1.1 (2026-07-24 Engelke incident) — the email ask is sequenced to AFTER the
+// booking lands, as its OWN message (never bundled with the confirmation or a
+// slot offer; that dual-question was Defect 4). Kept deliberately short and
+// self-contained so it reads as a standalone follow-up.
+const POST_BOOKING_EMAIL_ASK_MESSAGE =
+  "One more thing — what's the best email to send your confirmation and appointment details to?";
+
+/**
+ * v1.1 — Queue a separate post-booking email ask when the contact still has no
+ * email and has not already been asked. Idempotent via the booking:email-asked
+ * tag (stamped on enqueue, exactly as response-generator does for the in-flow
+ * ask). The queued send passes through the agentic send cooldown
+ * (MIN_AGENTIC_SEND_GAP_SEC), so it lands AFTER the confirmation send. Best-
+ * effort — never fails the booking.
+ */
+async function enqueuePostBookingEmailAsk(contactId, action, context) {
+  try {
+    const contact = await getContactCached(contactId, context?._contactCache);
+    const email = contact?.email && String(contact.email).trim() ? String(contact.email).trim() : null;
+    const tags = Array.isArray(contact?.tags) ? contact.tags.map((t) => String(t).toLowerCase()) : [];
+    if (email) return { queued: false, reason: 'email_on_file' };
+    if (tags.includes(EMAIL_ASKED_TAG)) return { queued: false, reason: 'already_asked' };
+
+    const { error } = await supabase.from('agent_actions').insert({
+      event_id: action?.event_id || null,
+      action_type: 'send_message',
+      target_system: 'ghl',
+      target_entity: 'contact',
+      target_id: contactId,
+      action_payload: { message: POST_BOOKING_EMAIL_ASK_MESSAGE, channel: 'sms' },
+      reasoning: 'Post-booking email ask — its own message on the turn after the confirmation, once (2026-07-24 Engelke incident, Defect 4).',
+      rule_applied: 'POST_BOOKING_EMAIL_ASK',
+      confidence: 1.0,
+      status: 'pending',
+      requires_approval: false,
+      priority: 20,
+    });
+    if (error) {
+      console.warn(`[ActionExecutor] post-booking email-ask enqueue failed for ${contactId}: ${error.message}`);
+      return { queued: false, reason: 'insert_error' };
+    }
+    // Stamp asked-once NOW so a handler re-run never re-asks (the tag is the guard).
+    await applyGHLTag(contactId, EMAIL_ASKED_TAG).catch(() => {});
+    console.log(`[ActionExecutor] 📧 post-booking email ask queued for ${contactId} (${EMAIL_ASKED_TAG} stamped)`);
+    return { queued: true };
+  } catch (err) {
+    console.warn(`[ActionExecutor] post-booking email-ask threw for ${contactId} (fail-soft): ${err.message}`);
+    return { queued: false, reason: 'threw' };
   }
 }
 
@@ -499,6 +551,10 @@ export async function executeBookAppointment(action, context) {
   // v3.4: tear down the booking-flow tags now that a booking has landed, so the
   // affirmative-gate bypass doesn't persist for this contact. See §8 #6.
   await removeGHLTags(contactId, BOOKING_FLOW_TAGS).catch(() => {});
+
+  // v1.1 (2026-07-24 Engelke incident) — sequence the email ask to its own
+  // message AFTER the booking lands. Idempotent + best-effort; never blocks.
+  await enqueuePostBookingEmailAsk(contactId, action, context);
 
   return {
     action: 'appointment_booked',

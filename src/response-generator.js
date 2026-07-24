@@ -161,7 +161,19 @@
 import { buildLeadContext } from './context-builder.js';
 import { classifyInbound, isShortCircuit } from './knowledge/intent-classifier.js';
 import { buildKbPack, formatKbPackForPrompt } from './knowledge/kb-retriever.js';
-import { fetchFreeSlots, formatSlotsForPrompt } from './knowledge/calendar-availability.js';
+import {
+  fetchFreeSlots,
+  formatSlotsForPrompt,
+  selectOfferableSlots,
+  buildOfferWindowPrompt,
+} from './knowledge/calendar-availability.js';
+import {
+  extractPreferredTime,
+  matchPreferredToSlots,
+  formatPreferredTimeForPrompt,
+  persistPreferredTime,
+} from './services/preferred-time.js';
+import { hasActiveBooking } from './agentic/lead-state/signals/context-reader.js';
 import { fetchUpcomingAppointments, formatAppointmentsForPrompt } from './knowledge/contact-appointments.js';
 import {
   resolveBookingCalendar,
@@ -1465,6 +1477,11 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     const slotsBlock = formatSlotsForPrompt(availability);
     if (slotsBlock) {
       parts.push(`\n═══════ CALENDAR AVAILABILITY ═══════`);
+      // Preferred-time block first (the "you already promised X" walk-back is the
+      // most recent instruction inside it), then the 48-hour offer-window frame,
+      // then the raw slot list. See preferred-time.js / calendar-availability.js.
+      if (opts.preferredTimeBlock) parts.push(opts.preferredTimeBlock);
+      if (opts.offerWindowBlock) parts.push(opts.offerWindowBlock);
       parts.push(slotsBlock);
       parts.push(`═══════ END CALENDAR AVAILABILITY ═══════`);
     }
@@ -2322,6 +2339,32 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     }
   }
 
+  // v1.1 (2026-07-24 Engelke incident) — the FETCH above stays wide so a
+  // lead-requested far date can still be matched; the OFFER is narrowed to the
+  // next 48 hours here unless the lead named a specific day. `preferred` is the
+  // lead's OWN stated time (deterministic, no LLM); it also drives the §4
+  // acknowledgment / walk-back prompt blocks below.
+  let preferred = null;
+  let offerSelection = null;
+  let preferredMatch = null;
+  try {
+    preferred = extractPreferredTime(context.conversation_recent || []);
+    if (availability) {
+      offerSelection = selectOfferableSlots(availability, preferred, {
+        // Phone-only calendars could warrant a shorter floor; default single
+        // floor for now (BOOKING_MIN_NOTICE_HOURS). See §7b.
+      });
+      preferredMatch = matchPreferredToSlots(preferred, availability);
+      // Narrow the availability the prompt will show to the offerable window.
+      // For window 'none' this is an empty-slots object, so formatSlotsForPrompt
+      // emits the "calendar full → send the booking link" CTA (no dead air, no
+      // invented far date).
+      availability = offerSelection.availability;
+    }
+  } catch (err) {
+    console.warn(`[ResponseGenerator] offer-window selection threw for ${contactId}: ${err.message} — using unfiltered availability`);
+  }
+
   // v2.7.8: fetch active future appointments for the EXISTING APPOINTMENTS
   // prompt block. null = fetch error (treat as unknown), [] = no active
   // appts (the AI's prompt already handles "no appointments on file" via
@@ -2410,7 +2453,16 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     } else if (identityState.identity.city) {
       serviceAreaTentative = await checkServiceAreaCity(identityState.identity.city);
     }
-    bookingGate = assertBookingPrerequisites(identityState);
+    // v1.1 (2026-07-24 Engelke incident) — the email ask must never share a turn
+    // with slot selection. `bookingInFlight` is true when an in-home calendar is
+    // resolved for this turn AND no appointment has landed yet — using the same
+    // hasActiveBooking signal the message-analyzer booking-ownership override
+    // reads, so the two can't drift. Gating the single gate producer here flows
+    // to BOTH should_ask_email consumers (the prompt block and the asked-once
+    // stamp); the post-booking handler asks for email on the NEXT turn instead.
+    const bookingInFlight =
+      kbPack?.booking_context?.requires_in_home_gate === true && !hasActiveBooking(context);
+    bookingGate = assertBookingPrerequisites(identityState, { bookingInFlight });
     promoteIdentityToGHL(contactId, identityState, {
       current: {
         firstName: context.lead?.first_name,
@@ -2462,6 +2514,11 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       bookingGate,
       serviceArea,
       serviceAreaTentative,
+      // v1.1 (2026-07-24 Engelke incident) — preferred-time acknowledgment /
+      // walk-back block, then the 48-hour offer-window frame. Both render only
+      // when slots are actually shown (inside the availability block).
+      preferredTimeBlock: formatPreferredTimeForPrompt(preferred, preferredMatch),
+      offerWindowBlock: offerSelection ? buildOfferWindowPrompt(offerSelection, preferred) : null,
       // 2026-07-06 — prompt_hint plumb (Bot 2/3/4 consolidation): approved
       // script from the matched agent_rule / layer3 dispatch row. Anchors the
       // reply via the SCRIPT DIRECTIVE block in buildResponsePrompt.
@@ -2482,6 +2539,22 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   }
 
   validated.message = sanitizeMessageUrls(validated.message, channel, kbPack);
+
+  // v1.1 (2026-07-24 Engelke incident) §5b — if THIS reply accepted a specific
+  // time ("Monday at 3 PM works great"), persist it now so the commitment
+  // survives to the next turn (the value that was missing on 7/24). Fill-if-
+  // empty, fire-and-forget — never blocks the reply.
+  try {
+    const acceptedPref = extractPreferredTime([
+      ...(context.conversation_recent || []),
+      { direction: 'outbound', text: validated.message },
+    ]);
+    if (acceptedPref && acceptedPref.source === 'bot_accepted') {
+      persistPreferredTime(contactId, acceptedPref).catch(() => {});
+    }
+  } catch (err) {
+    console.warn(`[ResponseGenerator] bot-accepted preferred-time persist skipped for ${contactId}: ${err.message}`);
+  }
 
   // Canvassing Pilot v2: resolve the conf-flow single-brace merge keys the
   // model may have used. Runs here (not in the send handler) so every

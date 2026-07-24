@@ -42,6 +42,7 @@
 import { callLLM } from '../llm-client.js';
 import { emitEvent } from '../event-emitter.js';
 import { updateGHLContactStandardFields, removeGHLTags } from '../ghl.js';
+import { extractPreferredTime, persistPreferredTime } from './preferred-time.js';
 import supabase from '../supabase.js';
 
 // Live-chat widget placeholder ("Guest Visitor bljpx"). Matched against the
@@ -520,18 +521,27 @@ export async function buildIdentityState(context, { useLLM = false, extraMessage
  * state. Pure — no I/O. A field satisfied by the record passes with no
  * question asked (R5).
  *
+ * @param {object} [opts]
+ * @param {boolean} [opts.bookingInFlight=false] — true when an in-home calendar
+ *   is being offered THIS turn (slot selection in progress). The email ask is
+ *   soft and asked-once (R4); it must NEVER share a turn with slot selection
+ *   (2026-07-24 Engelke incident — the bot offered slots and asked for email in
+ *   the same message). When in flight, should_ask_email is suppressed here and
+ *   the post-booking handler asks on the following turn instead. Defaults to
+ *   {} so every existing caller is unaffected.
  * @returns {{
  *   ok: boolean,
  *   missing: string[],            // hard blockers, in ask-order
  *   appointment_status: 'confirmed'|'new',
  *   decision_maker_confirmed: true|false|'unknown',
- *   should_ask_email: boolean,    // soft — ask once, never block
+ *   should_ask_email: boolean,    // soft — ask once, never block, never with a slot offer
  *   known: object,                // field → value for prompt hydration
  * }}
  */
-export function assertBookingPrerequisites(state) {
+export function assertBookingPrerequisites(state, opts = {}) {
   const id = state?.identity || emptyIdentity();
   const tags = state?.tags || [];
+  const bookingInFlight = opts.bookingInFlight === true;
 
   const missing = [];
   const nameKnown = !!id.first_name && !isPlaceholderName([id.first_name, id.last_name].filter(Boolean).join(' '));
@@ -546,7 +556,9 @@ export function assertBookingPrerequisites(state) {
   if (!id.phone) missing.push('phone');
 
   const emailAsked = tags.includes(EMAIL_ASKED_TAG);
-  const should_ask_email = !id.email && !emailAsked;
+  // Never ask for email on a turn that is selecting/offering slots — the ask is
+  // sequenced to AFTER the appointment lands (post-booking handler).
+  const should_ask_email = !id.email && !emailAsked && !bookingInFlight;
 
   return {
     ok: missing.length === 0,
@@ -874,7 +886,22 @@ export async function promoteIdentityToGHL(contactId, state, { current = null, t
 export async function runInboundIdentityPass(contactId, context) {
   try {
     const state = await buildIdentityState(context, { useLLM: false });
-    return await promoteIdentityToGHL(contactId, state, { trigger: 'inbound_message' });
+    const result = await promoteIdentityToGHL(contactId, state, { trigger: 'inbound_message' });
+
+    // v1.1 (2026-07-24 Engelke incident) §5a — capture the lead's OWN stated
+    // time from this inbound turn and persist it to the custom fields (fill-if-
+    // empty, fire-and-forget). Uses the custom-field write path (never the
+    // standard-fields promotion, which is allowlisted and can't carry these).
+    try {
+      const preferred = extractPreferredTime(context.conversation_recent || []);
+      if (preferred && preferred.source === 'inbound') {
+        persistPreferredTime(contactId, preferred).catch(() => {});
+      }
+    } catch (err) {
+      console.warn(`[IdentityExtraction] preferred-time capture skipped for ${contactId}: ${err.message}`);
+    }
+
+    return result;
   } catch (err) {
     console.warn(`[IdentityExtraction] inbound pass failed for ${contactId}: ${err.message}`);
     return null;
