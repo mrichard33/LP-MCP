@@ -80,6 +80,7 @@ const { lpWallClockToGhlStartTime, etOffsetMinutes } = await import('../src/appo
 const {
   planReconciliation, classifyDisposition, sameStartTime,
   reconcileLpAppointmentToGhl, WINDOW_ESTIMATE_CALENDAR_ID,
+  etHourFromStartTime, BUSINESS_HOUR_START_ET, BUSINESS_HOUR_END_ET,
 } = await import('../src/services/lp-ghl-appointment-reconciler.js');
 
 const WE = WINDOW_ESTIMATE_CALENDAR_ID;
@@ -458,4 +459,71 @@ test('dry run plans but never mutates', async () => {
   assert.equal(res.reason, 'dry_run');
   assert.equal(res.planned_op, 'reschedule_confirm');
   assert.equal(mutations().length, 0);
+});
+
+// ═══ Impossible-hour guard (2026-07-22) ═══════════════════════════════
+
+test('etHourFromStartTime: reads the ET wall-clock hour digits verbatim', () => {
+  assert.equal(etHourFromStartTime('2027-07-08T06:00:00-04:00'), 6);
+  assert.equal(etHourFromStartTime('2027-01-15T19:30:00-05:00'), 19);
+  assert.equal(etHourFromStartTime('2027-07-08 22:00:00'), 22); // naive endpoint shape
+  assert.equal(etHourFromStartTime(null), null);
+  assert.equal(etHourFromStartTime('garbage'), null);
+  assert.equal(BUSINESS_HOUR_START_ET, 8);
+  assert.equal(BUSINESS_HOUR_END_ET, 20);
+});
+
+test('impossible hour: Set at 6 AM ET → noop impossible_hour, ZERO GHL calls', async () => {
+  reset();
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set', '2027-07-08T06:00:00+00:00') });
+  assert.equal(res.outcome, 'noop');
+  assert.equal(res.reason, 'impossible_hour');
+  assert.equal(res.appointment_hour_et, 6);
+  assert.equal(calls.length, 0); // blocked before contact read AND appointment lookup
+});
+
+test('impossible hour: Cnf at 2 AM ET → blocked (confirm is NOT carved out here)', async () => {
+  reset();
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Cnf', '2027-07-08T02:00:00+00:00') });
+  assert.equal(res.reason, 'impossible_hour');
+  assert.equal(res.appointment_hour_et, 2);
+  assert.equal(calls.length, 0);
+});
+
+test('impossible hour: evening side — 22:00 blocked, 19:00 allowed, 20:00 boundary blocked', async () => {
+  reset();
+  let res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set', '2027-07-08T22:00:00+00:00') });
+  assert.equal(res.reason, 'impossible_hour');
+
+  reset();
+  res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set', '2027-07-08T19:00:00+00:00') });
+  assert.equal(res.outcome, 'created'); // 7 PM is a real slot
+
+  reset();
+  res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set', '2027-07-08T20:00:00+00:00') });
+  assert.equal(res.reason, 'impossible_hour');
+  assert.equal(res.appointment_hour_et, 20);
+});
+
+test('impossible hour: 8 AM boundary is allowed; 7:30 AM is blocked', async () => {
+  reset();
+  let res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set', '2027-07-08T08:00:00+00:00') });
+  assert.equal(res.outcome, 'created');
+
+  reset();
+  res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set', '2027-07-08T07:30:00+00:00') });
+  assert.equal(res.reason, 'impossible_hour');
+  assert.equal(res.appointment_hour_et, 7);
+});
+
+test('impossible hour: CXL at 6 AM with an existing appt STILL cancels (converge to zero)', async () => {
+  reset({ upcoming: [weAppt()] });
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('CXL', '2027-07-08T06:00:00+00:00') });
+  assert.equal(res.outcome, 'cancelled');
+});
+
+test('impossible hour: midnight is null upstream → no_appointment_date, not impossible_hour', async () => {
+  reset();
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set', '2027-07-08T00:00:00+00:00') });
+  assert.equal(res.reason, 'no_appointment_date');
 });
