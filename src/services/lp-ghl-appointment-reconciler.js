@@ -70,6 +70,27 @@ export const ESTIMATE_CALENDAR_IDS = new Set([
 
 const APPOINTMENT_DURATION_MS = 90 * 60 * 1000;
 
+// ── Business-hours window (ET) for the impossible-hour guard ──────────
+// 19:00 is a real high-volume evening slot (95 canvass bookings May–Jul
+// 2026); nothing legitimate is booked at or after 20:00, and nothing
+// before 08:00. Hour 0 never reaches the guard — lpWallClockToGhlStartTime
+// normalizes exact midnight to null upstream.
+export const BUSINESS_HOUR_START_ET = 8;  // inclusive
+export const BUSINESS_HOUR_END_ET = 20;   // exclusive
+
+// ET hour of a lpWallClockToGhlStartTime output. The transform preserves
+// the LP wall-clock digits verbatim and only appends the DST-correct ET
+// offset, so the two digits after 'T' ARE the ET hour — no Date math, no
+// server-TZ dependence. Null on null/unparseable input (guard stands down;
+// planReconciliation's own date guards then apply).
+export function etHourFromStartTime(startTime) {
+  if (!startTime) return null;
+  const m = /[T ](\d{2}):/.exec(String(startTime));
+  if (!m) return null;
+  const h = Number(m[1]);
+  return h >= 0 && h <= 23 ? h : null;
+}
+
 // GHL requires an explicit assignedUserId when ignoreFreeSlotValidation is
 // set (no slot resolution → no auto-assign; verified live 2026-07-07: 422
 // "A team member needs to be selected"). Every WE appointment since July 1
@@ -233,6 +254,29 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, toNotify = 
   const noop = (reason, extra = {}) => ({ ...base, outcome: 'noop', skipped: true, reason, ...extra });
 
   if (kind === 'out_of_scope') return noop('out_of_scope');
+
+  // ── Impossible-hour guard (2026-07-22) ──────────────────────────────
+  // 88 LP leads since 2026-05-01 carried appointments at hours no rep
+  // works: canvasser AM/PM entry errors (6 PM keyed as 6 AM), MVP
+  // Marketing's direct-to-LP feed, and one stale-field I.LP-OUT addlead
+  // (John Stautinger, lead 560445 — see the Impossible-Hour root-cause
+  // doc). LP is normally the authority here, but an appointment outside
+  // business hours is not a slot Reece sells, so mirroring it only
+  // propagates the error into calendars, reminder sequences, and Five9
+  // confirmation dials. Block set AND confirm — a confirmed 6 AM is
+  // still wrong (deliberately stricter than the consent guard's confirm
+  // carve-out below). CANCEL always proceeds: converging a bad
+  // appointment to zero is the fix, not the bug. FAIL-OPEN on a
+  // null/unparseable hour — startTime=null already no-ops downstream
+  // (no_appointment_date), and exact midnight is normalized to null
+  // upstream by lpWallClockToGhlStartTime. The action handler owns the
+  // GroupMe card for this reason code; the reconciler stays supabase-free.
+  if (kind !== 'cancel') {
+    const hourEt = etHourFromStartTime(startTime);
+    if (hourEt !== null && (hourEt < BUSINESS_HOUR_START_ET || hourEt >= BUSINESS_HOUR_END_ET)) {
+      return noop('impossible_hour', { appointment_hour_et: hourEt });
+    }
+  }
 
   // Consent guard — Set/Verif creation only. Two carve-outs:
   //   - CXL must still cancel (honoring the contact's wishes, not marketing).
