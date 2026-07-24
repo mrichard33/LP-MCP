@@ -95,6 +95,7 @@ import { emitEvent, dispositionPriority } from './event-emitter.js';
 import { pushLeadNotesImmediately } from './ghl-notes-sync.js';
 import { GHL_CONTACT_ID_PATTERN, lognumberCandidate } from './ghl-link-shape.js';
 import { resolveLeadGhlLink } from './services/link-corroboration.js';
+import { shouldRenewConsent } from './services/consent-renewal.js';
 
 // ─── Skip counter for observability ──────────────────────────────
 let _skipStats = { leads: 0, prospects: 0 };
@@ -149,6 +150,57 @@ async function emitDispositionBackfill({
     new_state: { disposition_code: disposition },
     priority: dispositionPriority(disposition),
     idempotency_key: `disp_${lpLeadId}_backfill_${disposition}`,
+  });
+}
+
+// ─── Consent renewal on re-entry (Phase 2, 2026-07-24) ───────────────
+//
+// A DNC disposition normally emits lp.disposition_changed:DNC, which drives
+// LP_DISP_DNC + RECONCILE and suppresses the contact. But when a NEW consumer-
+// initiated inbound (estimator form / chatbot) lands on a prospect who was DNC
+// from PRIOR history, that inbound is a fresh, express-consent inquiry — the
+// lead is "born DNC" only because it inherited the prospect's old flag (ref
+// incident: Max Lesser, LP lead 561019 / prospect 447640, suppressed before
+// the opener landed).
+//
+// The decision predicate lives in services/consent-renewal.js (pure, unit-
+// tested). When it fires we emit consent.reestablished USING the DNC backfill
+// idempotency key (`disp_<lead>_backfill_DNC`). Reusing that key BURNS it, so
+// every later backfill re-read of this lead dedup-skips its own DNC emit
+// (emitEvent dedups on idempotency_key regardless of event_type) — the DNC
+// event never fires for a renewed lead, on this pass or any future one.
+
+// Emit the audited consent.reestablished event. Keyed on the DNC backfill
+// idempotency key so it also suppresses every future DNC emit for this lead.
+// bypass_filter: the audit trail must ALWAYS land, even before the paired
+// CONSENT_RENEWAL_ON_REENTRY rule is seeded (its only consumer).
+async function emitConsentReestablished({
+  lpLeadId, lpProspectId, ghlContactId, bucket, leadSource, leadName,
+}) {
+  return emitEvent({
+    event_type: 'consent.reestablished',
+    event_subtype: bucket || 'new_inbound_inquiry',
+    source: 'inbound-backfill',
+    entity_type: 'lead',
+    entity_id: lpLeadId,
+    ghl_contact_id: ghlContactId || null,
+    lp_lead_id: lpLeadId,
+    lp_prospect_id: lpProspectId || null,
+    payload: {
+      reason: 'new_inbound_inquiry',
+      lead_source: leadSource || null,
+      lead_name: leadName || null,
+      source_bucket: bucket || null,
+      lp_lead_id: lpLeadId,
+      prospect_id: lpProspectId || null,
+      previous_disposition: 'DNC',
+      synthetic: true,
+    },
+    previous_state: { disposition_code: 'DNC' },
+    new_state: { consent: 'reestablished' },
+    priority: 'high',
+    idempotency_key: `disp_${lpLeadId}_backfill_DNC`,
+    bypass_filter: true,
   });
 }
 
@@ -659,30 +711,55 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
       const contactId = newLeadGhlId || existing?.ghl_contact_id || null;
       const leadName = `${getField(prospect, 'firstname', 'FirstName') || ''} ${getField(prospect, 'lastname', 'LastName') || ''}`.trim();
 
-      await emitEvent({
-        event_type: 'lp.disposition_changed',
-        event_subtype: newDisposition,
-        source: 'lp_sync',
-        entity_type: 'lead',
-        entity_id: lpLeadId,
-        ghl_contact_id: contactId,
-        lp_lead_id: lpLeadId,
-        lp_prospect_id: lpProspectId,
-        payload: {
-          disposition_code: newDisposition,
-          previous_disposition: previousDisposition,
-          lead_name: leadName,
-          rep_name: getField(lead, 'salesrepname', 'SalesRepName') || null,
-          lead_source: getField(lead, 'source', 'Source') || null,
-          appointment_set: isApptSet,
-          demo_completed: isDemoCompleted,
-          closed_won: isClosedWon,
-        },
-        previous_state: previousDisposition ? { disposition_code: previousDisposition } : null,
-        new_state: { disposition_code: newDisposition },
-        priority: dispositionPriority(newDisposition),
-        idempotency_key: `disp_${lpLeadId}_${previousDisposition || 'null'}_${newDisposition}_${new Date().toISOString().slice(0, 10)}`,
-      });
+      // Phase 2 (2026-07-24): a NEW consumer inbound born DNC (inherited from
+      // the prospect's prior DNC) is consent RE-ENTRY, not suppression. Emit
+      // consent.reestablished INSTEAD of lp.disposition_changed:DNC (which
+      // would drive LP_DISP_DNC + RECONCILE, as it did on Max Lesser). The
+      // shared idempotency key also blocks every future backfill DNC emit for
+      // this lead. See shouldRenewConsent() for the full guard.
+      if (shouldRenewConsent({ existing, newDisposition, bucket, createdAt })) {
+        // Consent re-entry — emit consent.reestablished in place of the DNC
+        // disposition event. The rest of the loop body (entry:* tag, child
+        // sync) still runs: this is a real new lead, only the suppression
+        // signal is replaced.
+        await emitConsentReestablished({
+          lpLeadId,
+          lpProspectId,
+          ghlContactId: contactId,
+          bucket,
+          leadSource: getField(lead, 'source', 'Source') || null,
+          leadName,
+        });
+        console.log(
+          `[Sync] CONSENT RE-ENTRY: lead ${lpLeadId} (prospect ${lpProspectId}, ` +
+          `bucket ${bucket}) — emitted consent.reestablished, DNC disposition event suppressed`
+        );
+      } else {
+        await emitEvent({
+          event_type: 'lp.disposition_changed',
+          event_subtype: newDisposition,
+          source: 'lp_sync',
+          entity_type: 'lead',
+          entity_id: lpLeadId,
+          ghl_contact_id: contactId,
+          lp_lead_id: lpLeadId,
+          lp_prospect_id: lpProspectId,
+          payload: {
+            disposition_code: newDisposition,
+            previous_disposition: previousDisposition,
+            lead_name: leadName,
+            rep_name: getField(lead, 'salesrepname', 'SalesRepName') || null,
+            lead_source: getField(lead, 'source', 'Source') || null,
+            appointment_set: isApptSet,
+            demo_completed: isDemoCompleted,
+            closed_won: isClosedWon,
+          },
+          previous_state: previousDisposition ? { disposition_code: previousDisposition } : null,
+          new_state: { disposition_code: newDisposition },
+          priority: dispositionPriority(newDisposition),
+          idempotency_key: `disp_${lpLeadId}_${previousDisposition || 'null'}_${newDisposition}_${new Date().toISOString().slice(0, 10)}`,
+        });
+      }
     } else {
       // Record advanced (notes/jobs/contact-link) but disposition held steady.
       // If it's holding at a past-Data disposition with no prior transition

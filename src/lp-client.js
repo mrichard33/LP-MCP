@@ -569,19 +569,37 @@ export async function setAppointment({ ldsId, setBy = '5686', apptDate, apptTime
  */
 const VALID_DNC_CODES = new Set(['C', 'M', 'T', 'E', 'P']);
 
+// ─── DNC CLEAR code (Phase 2, 2026-07-24) ──────────────────────────────
+// The single-character value UpdateDNCStatus accepts to WIPE the internal
+// DNC flag (re-entry = new consent — see actions/handlers/lp-dnc.js CLEAR).
+//
+// ⚠ NOT probe-confirmed against production. The documented probe (candidate
+// clear values "N"/""/"0"/"None", the accepted one being the clear code)
+// MUTATES a live prospect's DNC on success, and the only known-DNC probe
+// target on hand — prospect 447640 (Max Lesser) — is under a valid, current
+// STOP revocation that must NOT be lifted. Confirm the exact value with a
+// safe probe against a DISPOSABLE sandbox prospect, then set LP_DNC_CLEAR_CODE.
+// Default 'N' (first UpdateDNCStatus clear candidate). A wrong value fails
+// LOUD here (LP returns Result:0 / "Error:") — never a silent mis-clear.
+export const LP_DNC_CLEAR_CODE = (process.env.LP_DNC_CLEAR_CODE || 'N').trim().toUpperCase();
+
 export async function updateDncStatus({ custid, newDncStatus, empid = '5686', phone }) {
   if (!custid) {
     throw new Error('updateDncStatus: custid (LP prospect ID) is required');
   }
   if (!newDncStatus) {
-    throw new Error('updateDncStatus: newDncStatus is required (one of: C/M/T/E/P)');
+    throw new Error('updateDncStatus: newDncStatus is required (one of: C/M/T/E/P or CLEAR)');
   }
-  const code = String(newDncStatus).trim().toUpperCase();
-  if (!VALID_DNC_CODES.has(code)) {
-    throw new Error(`updateDncStatus: invalid newDncStatus "${newDncStatus}" (must be one of: C/M/T/E/P)`);
+  const raw = String(newDncStatus).trim().toUpperCase();
+  // CLEAR path — wipe the DNC flag. Accept the literal 'CLEAR' alias or the
+  // configured clear code itself; both resolve to LP_DNC_CLEAR_CODE on the wire.
+  const isClear = raw === 'CLEAR' || raw === LP_DNC_CLEAR_CODE;
+  const code = isClear ? LP_DNC_CLEAR_CODE : raw;
+  if (!isClear && !VALID_DNC_CODES.has(code)) {
+    throw new Error(`updateDncStatus: invalid newDncStatus "${newDncStatus}" (must be one of: C/M/T/E/P or CLEAR)`);
   }
 
-  console.log(`[LP] UpdateDNCStatus: custid=${custid}, code=${code}, empid=${empid}${phone ? `, phone=${phone}` : ''}`);
+  console.log(`[LP] UpdateDNCStatus: custid=${custid}, code=${code}${isClear ? ' (CLEAR)' : ''}, empid=${empid}${phone ? `, phone=${phone}` : ''}`);
 
   const fields = {
     custid:       String(custid),
