@@ -214,6 +214,9 @@ import { registerMarketAssignmentRoutes, startMarketAssignmentScheduler } from '
 // nightly 23:50 ET fill snapshot, unauthenticated GET /board/capacity for the
 // dashboard TV board (sql/043).
 import { registerCapacityBoardRoutes, startCapacitySweepScheduler } from './jobs/capacity-sweep.js';
+// Band-level (slot_id) capacity vs GHL bookings — the dimension v_appt_board
+// aggregates away. Read-only diagnostic, authenticated, no scheduler (sql/048).
+import { registerCapacityBandRoutes } from './jobs/capacity-bands.js';
 // Closed-month per-market funnel RE-DERIVE (real measurement; retires the split).
 // The legacy proportional-split backfill (scorecard-market-backfill.js) is left in
 // the tree but INTENTIONALLY UNWIRED — no metric may be produced by splitting a
@@ -387,6 +390,47 @@ async function runMigrations() {
     console.log('[Migration] capacity board schema (sql/043 + 044 + 045) ready');
   } catch (err) {
     console.error('[Migration] capacity board schema FAILED (board + lead upserts depend on it — apply sql/043 manually):', err.message);
+  }
+
+  // Band-level capacity views (sql/048 — the file is the source of truth). Two
+  // CREATE OR REPLACE VIEWs on NEW names: v_appt_board is untouched and the TV
+  // board is unaffected. Depends on lp_capacity_slots + lp_branch_market_map,
+  // both established by the block above, so ordering here matters. runSQL
+  // (throws) rather than exec_sql (silently skips) for the same reason.
+  //
+  // Nothing else in the process depends on these views — only the read-only
+  // /admin/capacity-bands route and the get_capacity_vs_ghl tool — so a failure
+  // here logs and continues rather than blocking boot.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`
+            CREATE OR REPLACE VIEW v_appt_board_bands AS
+            SELECT cs.slot_date,
+                   COALESCE(bm.market_code, 'UNRESOLVED') AS market,
+                   cs.slot_id,
+                   CASE cs.slot_id WHEN 1 THEN 'M' WHEN 2 THEN 'A' WHEN 3 THEN 'E'
+                                   ELSE '?' END            AS band,
+                   count(*)                                AS capacity,
+                   count(*) FILTER (WHERE cs.has_appt)     AS booked,
+                   count(*) FILTER (WHERE NOT cs.has_appt) AS open_slots
+            FROM lp_capacity_slots cs
+            LEFT JOIN lp_branch_market_map bm
+              ON UPPER(TRIM(bm.brn_id)) = UPPER(TRIM(cs.rep_home_market))
+            GROUP BY 1, 2, 3, 4;
+            CREATE OR REPLACE VIEW v_capacity_submission_horizon AS
+            SELECT COALESCE(bm.market_code, 'UNRESOLVED') AS market,
+                   max(cs.slot_date)                      AS horizon_date,
+                   count(DISTINCT cs.slot_date) FILTER (
+                     WHERE cs.slot_date >= (now() AT TIME ZONE 'America/New_York')::date
+                   )                                      AS days_filed,
+                   max(cs.swept_at)                       AS last_swept_at
+            FROM lp_capacity_slots cs
+            LEFT JOIN lp_branch_market_map bm
+              ON UPPER(TRIM(bm.brn_id)) = UPPER(TRIM(cs.rep_home_market))
+            GROUP BY 1;`);
+    console.log('[Migration] capacity band views (sql/048) ready');
+  } catch (err) {
+    console.error('[Migration] capacity band views FAILED (GET /admin/capacity-bands and get_capacity_vs_ghl depend on them — apply sql/048 manually):', err.message);
   }
 
   // Link corroboration + identity sync substrate (sql/046 — the file is the
@@ -790,6 +834,10 @@ registerWorkflowProjectionRoutes(app);
 registerGoalScorecardRoutes(app);
 registerMarketAssignmentRoutes(app);
 registerCapacityBoardRoutes(app); // 2026-07-22 — TV capacity board aggregate (GET /board/capacity, unauthenticated by design)
+// 2026-07-25 — GET /admin/capacity-bands: per-band LP capacity vs GHL bookings.
+// Read-only. Takes `authenticate` (an admin diagnostic, not a kiosk feed);
+// registered separately from the board so the two stay independently removable.
+registerCapacityBandRoutes(app, authenticate);
 registerScorecardRederiveRoutes(app);
 registerNetReportRoutes(app);
 registerScorecardValidateRoutes(app);

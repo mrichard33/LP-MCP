@@ -9,6 +9,7 @@ import { registerIntelTools } from './intel-tools.js';
 import { registerRescissionTools } from './rescission-tools.js';
 import { registerLPAppointmentTools } from './lp-appointment-tools.js';
 import { registerDriftTools } from './drift-tools.js';
+import { registerCapacityTools } from './capacity-tools.js';
 import { registerAdminTools } from './admin/index.js';
 import { registerFive9Tools } from './five9-tools.js';
 
@@ -36,6 +37,12 @@ export function registerAllTools(server) {
   // Drift detection tool (1) — backs the dashboard Issues-page "drift" tile.
   //   get_drift_candidates (read-only; GHL-closed but LP-active cross-reference)
   registerDriftTools(server);
+  // Capacity diagnostics (1) — 2026-07-25
+  //   get_capacity_vs_ghl (read-only; LP per-band rep availability vs GHL
+  //   calendar bookings — the slot_id dimension /board/capacity sums away.
+  //   UNKNOWN means the market has not filed availability yet, NOT zero
+  //   capacity; those rows must never be used to gate a booking.)
+  registerCapacityTools(server);
   // Infrastructure admin tools (17) — v5.1
   registerAdminTools(server);
   // Five9 admin READ tools (12) — v6.8 Phase A (2026-07-03) + Phase B (2026-07-21)
