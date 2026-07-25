@@ -141,6 +141,10 @@ import { endAgenticHandoff } from '../services/agentic-handoff.js';
 import { checkSuppression, checkSuppressionLive, checkMutationSuppression, isMutationGateExempt } from '../services/suppression-check.js';
 // Send-dedup — logical-identity idempotency for non-idempotent senders (2026-06-05)
 import { claimSendMark, releaseSendMark, makeDedupKey } from '../services/send-dedup.js';
+// 2026-07-25 — cross-rule enrollment guard: one contact must not be added to the
+// same workflow twice within WORKFLOW_REENROLL_WINDOW_HOURS (fixes the two
+// cancellation views both enrolling into S5.2). See src/services/enrollment-dedup.js.
+import { findPriorEnrollment } from '../services/enrollment-dedup.js';
 
 // Antifragile Validation Gate — pre-handler invariant check (2026-05-18)
 import { validateAction } from '../services/validation-gate.js';
@@ -636,6 +640,42 @@ async function executeSingleAction(action, batchContext = {}, priorBatchResults 
         status: 'completed',
         action_type: action.action_type,
         result: { deduped: true, first_action_id: claim.first_action_id },
+      };
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // ═══ Enrollment-dedup gate (same contact + same workflow) ═══════════
+  // Cross-rule guard, keyed on the DESTINATION workflow (not the rule name):
+  // the LP-disposition and GHL-cancel views of one cancellation both enroll
+  // into S5.2, and nothing else dedupes across them. A prior COMPLETED
+  // add_to_workflow into the same workflow within the window → short-circuit
+  // to completed WITHOUT calling GHL. Fail-open (any infra error enrolls). This
+  // is complementary to the handler's live active-<code> tag guard.
+  if (action.action_type === 'add_to_workflow') {
+    const prior = await findPriorEnrollment(action);
+    if (prior.duplicate) {
+      await supabase.from('agent_actions').update({
+        status: 'completed',
+        execution_result: {
+          action: 'deduped',
+          skipped: true,
+          reason: 'duplicate_enrollment_window',
+          prior_action_id: prior.prior_action_id,
+          age_ms: prior.age_ms,
+        },
+        executed_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }).eq('id', action.id).neq('status', 'completed');
+      console.log(
+        `[ActionExecutor] 🟰 add_to_workflow deduped (action ${action.id}, ` +
+        `target=${action.target_id}, prior=${prior.prior_action_id}, age=${prior.age_ms}ms)`
+      );
+      return {
+        action_id: action.id,
+        status: 'completed',
+        action_type: action.action_type,
+        result: { deduped: true, prior_action_id: prior.prior_action_id },
       };
     }
   }

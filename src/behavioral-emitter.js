@@ -241,6 +241,15 @@
  *   This is Gap 1 from the agentic migration audit — prerequisite for
  *   W0.0 Master Router migration.
  *
+ * v2.15 (2026-07-25) — Sequence-aware appointment-event dedup. The v2.2 fixed
+ *   30-min wall-clock bucket only deduped webhooks that landed in the same
+ *   :00/:30 window, so any identical pair straddling a boundary produced two
+ *   keys and BOTH inserted. handleAppointment now delegates to
+ *   src/services/appt-event-dedup.js, which keys on the SLOT (not a status
+ *   bucket) and compares the last event type — so duplicate booked/cancelled
+ *   collapse while a book→cancel→rebook of the same slot still emits. Fail-open;
+ *   a deduped event skips emitEvent and both fire-and-forget side effects.
+ *
  * v2.2 — Fix duplicate GroupMe notifications.
  *   - handleAppointment idempotency key now uses 30-min buckets (was Date.now())
  *   - 'confirmed' status now emits ghl.appointment_confirmed (was ghl.appointment_booked)
@@ -265,6 +274,9 @@ import { checkDispositionStalenessOnBooking } from './services/disposition-stale
 // gets a non-null message key, and the buffer flush atomically claims its
 // keys so the solo analyzePendingReplies poller can never re-analyze them.
 import { buildMessageKey, claimConsumedMessages, releaseConsumedMessages } from './services/consumed-messages.js';
+// 2026-07-25 — sequence-aware appointment-event dedup (replaces the v2.2 fixed
+// 30-min bucket that let boundary-straddling duplicate webhooks both insert).
+import { checkApptEventDedup } from './services/appt-event-dedup.js';
 
 const GHL_WEBHOOK_SECRET = process.env.GHL_WEBHOOK_SECRET || '';
 const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -1005,10 +1017,23 @@ async function handleAppointment(req, res) {
     );
   }
 
-  // v2.2: Idempotency key uses 30-minute time buckets instead of Date.now().
-  // Same contact + calendar + status within 30 min = deduped.
-  const timeBucket = Math.floor(Date.now() / (30 * 60 * 1000));
-  const idempotencyKey = `ghl_appt_${contactId}_${calendarId}_${status}_${timeBucket}`;
+  // 2026-07-25: sequence-aware dedup (replaces the v2.2 fixed 30-min bucket).
+  // Dedupe on the slot + last event type, not a status-bearing key, so a
+  // book→cancel→rebook of the same slot still emits the rebook. Fail-open: any
+  // lookup error/timeout emits (a lost booking is worse than a duplicate event).
+  const dedup = await checkApptEventDedup({
+    contactId, calendarId, appointmentId, startDate, startTime, status, eventType,
+  });
+  if (dedup.deduped) {
+    console.log(
+      `[BehavioralEmitter] Appointment ${eventType} DEDUPED for ${contactId} `
+      + `(slotKey: ${dedup.slotKey}, matched age: ${dedup.matchedAgeMs}ms) — skipping emit + side effects`,
+    );
+    // Deduped events must NOT run emitEvent or either fire-and-forget side
+    // effect below. Return 200 (not an error) — GHL retries on non-2xx.
+    return res.json({ status: 'deduped', event_type: eventType });
+  }
+  const idempotencyKey = dedup.idempotencyKey;
 
   await emitEvent({
     event_type: eventType, event_subtype: calendarId || null, source: 'ghl_webhook',
