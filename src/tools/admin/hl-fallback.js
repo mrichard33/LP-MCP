@@ -12,63 +12,17 @@
 // All tools are READ-ONLY (SELECT/WITH only). Uses HL's run_sql RPC,
 // whose result variable is json-typed, so every SELECT is wrapped in
 // json_agg before execution.
+//
+// The client and query helpers moved to src/admin/hl-client.js
+// (2026-07-25) so non-tool consumers — src/jobs/capacity-bands.js — can
+// reach the HL warehouse without importing this tool module and its zod
+// dependency. Same lazily-memoized client, one instance for all callers.
 
 import { z } from 'zod';
-import { createClient } from '@supabase/supabase-js';
+import { getHlSupabase, assertReadOnly, hlRunSQL, esc } from '../../admin/hl-client.js';
 
-let hlClient = null;
-function getHlSupabase() {
-  if (hlClient) return hlClient;
-  const url = process.env.HL_SUPABASE_URL;
-  const key = process.env.HL_SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) {
-    throw new Error(
-      'HL fallback not configured — set HL_SUPABASE_URL and HL_SUPABASE_SERVICE_ROLE_KEY on the LP MCP service.'
-    );
-  }
-  hlClient = createClient(url, key);
-  return hlClient;
-}
-
-function assertReadOnly(q) {
-  const t = (q || '').trim();
-  const u = t.toUpperCase();
-  if (!(u.startsWith('SELECT') || u.startsWith('WITH'))) {
-    throw new Error('Read-only fallback: only SELECT / WITH queries are allowed.');
-  }
-  if (/\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|MERGE)\b/.test(u)) {
-    throw new Error('Read-only fallback: write/DDL keywords are not allowed.');
-  }
-  return t;
-}
-
-function wrapSelectForJsonAgg(queryText) {
-  const trimmed = queryText.trim();
-  const upper = trimmed.toUpperCase();
-  if (!upper.startsWith('SELECT') && !upper.startsWith('WITH')) return trimmed;
-  if (upper.includes('JSON_AGG')) return trimmed;
-  return `SELECT json_agg(t) FROM (${trimmed}) t`;
-}
-
-function unwrapSingleValue(data) {
-  if (Array.isArray(data) && data.length === 1 && typeof data[0] === 'object' && data[0] !== null) {
-    const keys = Object.keys(data[0]);
-    if (keys.length === 1) return data[0][keys[0]];
-  }
-  return data;
-}
-
-async function hlRunSQL(queryText) {
-  const supabase = getHlSupabase();
-  const wrapped = wrapSelectForJsonAgg(queryText);
-  const { data, error } = await supabase.rpc('run_sql', { query_text: wrapped });
-  if (error) throw new Error(`HL SQL error: ${error.message}`);
-  return unwrapSingleValue(data);
-}
-
-function esc(s) {
-  return String(s).replace(/'/g, "''");
-}
+// Re-exported so existing importers of this module keep working unchanged.
+export { hlRunSQL, esc };
 
 export async function resolveWorkflowIdByCanonicalCode(canonicalCode) {
   if (!canonicalCode) return null;
