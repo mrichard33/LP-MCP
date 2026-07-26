@@ -115,11 +115,50 @@ export const LP_INTAKE_SUPPRESS_TAG = 'suppress-outbound';
 // lp-backstop-created is distinct from I.LP-IN's lp-inbound so provenance is
 // auditable. Mark can tune this later — kept as one exported constant.
 export const LP_BACKSTOP_ALWAYS_TAGS = ['lp-backstop-created', 'lp-linked', 'stage:new-lead'];
+// 2026-07-26 (second pass) — coverage extended beyond Canvass/Internet/Affiliates.
+// Those three were the only mapped sources, so EVERY other lead_source fell to
+// LP_BACKSTOP_DEFAULT_TAGS and was created as `source:unknown` with no vendor
+// tag at all. Live count of unlinked disposition-"Data" leads by source:
+//
+//   Internet 80,308 (mapped) | Iheart 4,084 | Canvass 1,863 (mapped)
+//   (NULL) 1,574 | Website 1,088 | Old Source 414 | Canvass Sticky 292
+//   Simpletext 167 | Magazine 146 | Affiliates 113 (mapped) | Job Signs 28
+//
+// Iheart is the PARENT source of Simpletext — one of the five sources named in
+// the 2026-07-26 linkage handoff as structurally unlinked. Creating 4,084 of
+// those as `source:unknown` destroys the attribution the intake backstop exists
+// to restore, and re-tagging after the fact is strictly more expensive than
+// mapping them before the first contact is minted.
+//
+// Every value below is a tag that ALREADY EXISTS in GHL (verified live against
+// contacts.tags: source:radio, source:magazine, source:job-sign,
+// source:previous-customer, source:reece-direct-site, source:self-generated,
+// source:tv). No tag name is invented here — an unmapped source landing on
+// `source:unknown` is a known, reportable state; a misspelled tag is silent
+// attribution loss that no query can find.
 export const LP_BACKSTOP_TAG_MAP = {
-  Canvass:    ['entry:canvassing', 'active-entry:canvassing', 'source:canvass'],
-  Internet:   ['entry:other', 'active-entry:other', 'source:internet'],
-  Affiliates: ['entry:other', 'active-entry:other', 'source:affiliate'],
+  Canvass:          ['entry:canvassing', 'active-entry:canvassing', 'source:canvass'],
+  'Canvass Sticky': ['entry:canvassing', 'active-entry:canvassing', 'source:canvass'],
+  Internet:         ['entry:other', 'active-entry:other', 'source:internet'],
+  Affiliates:       ['entry:other', 'active-entry:other', 'source:affiliate'],
+  // iHeart is a radio network; Simpletext is its SMS vendor and also appears as
+  // a top-level lead_source in LP, so both map to the same channel.
+  Iheart:           ['entry:other', 'active-entry:other', 'source:radio'],
+  Simpletext:       ['entry:other', 'active-entry:other', 'source:radio'],
+  Television:       ['entry:other', 'active-entry:other', 'source:tv'],
+  Website:          ['entry:other', 'active-entry:other', 'source:reece-direct-site'],
+  'Main Website':   ['entry:other', 'active-entry:other', 'source:reece-direct-site'],
+  Magazine:         ['entry:other', 'active-entry:other', 'source:magazine'],
+  'Job Signs':      ['entry:other', 'active-entry:other', 'source:job-sign'],
+  PrevCust:         ['entry:other', 'active-entry:other', 'source:previous-customer'],
+  CustRef:          ['entry:other', 'active-entry:other', 'source:previous-customer'],
+  SelfGen:          ['entry:other', 'active-entry:other', 'source:self-generated'],
 };
+// DELIBERATELY UNMAPPED — these fall to source:unknown because GHL has no
+// existing tag that fits, and inventing one would be worse than reporting
+// "unknown": Newspaper (88), Mail / Direct Mail (68), Old Source (414),
+// Events 2022-2026, Show, 411 Windows, RCI, and NULL lead_source (1,574).
+// Add them here only once Mark confirms the tag name.
 const LP_BACKSTOP_DEFAULT_TAGS = ['entry:other', 'active-entry:other', 'source:unknown'];
 
 // 2026-07-26 — vendor attribution. Every purchased-media source collapsed to
@@ -128,9 +167,17 @@ const LP_BACKSTOP_DEFAULT_TAGS = ['entry:other', 'active-entry:other', 'source:u
 // Gurus and MyHomePros were indistinguishable once in GHL. The vendor rides
 // a THIRD, non-conflicting tag — same shape as `canvass-subtype:door-to-door`
 // — so the invariant is untouched and a channel is still one prefix filter.
+// Only channels with a real vendor axis appear here. Canvass is excluded (it
+// already carries canvass-subtype:*), as are single-vendor channels where the
+// detail would just restate the source.
 const SOURCE_DETAIL_PREFIX = {
   Internet: 'source:internet-',
   Affiliates: 'source:affiliate-',
+  // Iheart/Simpletext share the radio channel, so they share its vendor prefix:
+  // lead_source "Iheart" + detail "Simpletext" → source:radio-simpletext.
+  Iheart: 'source:radio-',
+  Simpletext: 'source:radio-',
+  Magazine: 'source:magazine-',
 };
 
 /** Lowercase hyphenated slug of an LP lead_source_detail. "Lead Gurus" → "lead-gurus". */
