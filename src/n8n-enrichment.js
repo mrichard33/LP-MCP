@@ -6,12 +6,58 @@
  * This endpoint does everything the 8 Code nodes did:
  * 1. Parse input params from GHL webhook body
  * 2. Get LP token (uses LP MCP's built-in token manager)
- * 3. Resolve prospect ID (from prospect_id, lead_id, OR phone/email fallback)
+ * 3. Resolve prospect ID (from prospect_id, lead_id, OR VERIFIED phone/email fallback)
  * 4. Fetch full lead data + lead info from LP API
  * 5. Build enriched record (aggregate leads, appointments, jobs, calls)
  * 6. Calculate highest stage, market, sale amounts, etc.
  * 7. Apply lp-linked + lp-enriched tags via additive POST (NEVER via PUT)
  * 8. Return customFields-only payload ready for GHL contact update
+ *
+ * v4.0 — 2026-07-26 — Verified prospect matching (cross-linked contact fix).
+ *   PROBLEM: parseGetCustomers3() returned `data[0]` — the first record LP
+ *   handed back — with NO comparison against the phone/email/lastname that
+ *   was actually searched. Any non-empty GetCustomers3 response became a
+ *   "match" and its cst_id was written onto the GHL contact. enrichFromLP()
+ *   then stamped that prospect's MOST RECENT lds_id, so every bad link
+ *   pointed at a recent, high-numbered lead.
+ *
+ *   The widest hole was the last-name-only branch, which fired when a
+ *   contact had neither phone nor email — i.e. anonymous webchat sessions
+ *   ("guest visitor 036"). It searched LP on a display-name fragment and
+ *   accepted whatever came back.
+ *
+ *   Verified live 2026-07-26 (HL Supabase, contacts grouped by custom field
+ *   GmAVmW6V9sekD7pVONKr):
+ *     lead 555698 → 5 unrelated contacts (dittus, igo, moore, perino, lewis)
+ *     lead 560432 → 4 (carmen + 3 "guest visitor" webchat sessions)
+ *     lead 558727 → 4 (3 "guest visitor" + ray na)
+ *     lead 560362 → 4 (2 "guest visitor" + wilson + miles)
+ *     lead 560043 → 3 — Sandrra Crawford inherited Paulette Hendry's
+ *                       7/27 10:00 AM appointment. Phones did not match
+ *                       (+14074920504 vs 9045348352), so this was never a
+ *                       phone collision — it was an unverified accept.
+ *
+ *   FIX:
+ *     1. parseGetCustomers3() (single record, unverified) is REPLACED by
+ *        extractArray() from sync-utils.js + pickVerifiedProspect(), which
+ *        scans ALL returned rows and accepts only one whose phone (last 10
+ *        digits) or email actually equals what we searched for.
+ *     2. The last-name-only search is REMOVED. It is unverifiable by
+ *        construction.
+ *     3. A contact with neither phone nor email is no longer resolved at
+ *        all — the endpoint returns its existing 404 instead of guessing.
+ *     4. resolved_via now reports match provenance: prospect_id | lead_id |
+ *        phone_verified | email_verified | ghl_contact_phone_verified |
+ *        ghl_contact_email_verified | unresolved | unresolved_no_identifiers
+ *
+ *   PRIOR ART: pickPhoneMatch() in src/services/lp-contact-backstop.js
+ *   already implements exactly this last-10-digit verification and rejects
+ *   a mismatching top hit. This module never received the same hardening.
+ *
+ *   GOVERNING PRINCIPLE: an unlinked contact is strictly better than a
+ *   wrongly-linked one. A 404 is recoverable — the lead is retried when LP
+ *   finishes processing it. A wrong link silently shows one homeowner
+ *   another homeowner's appointment.
  *
  * v3.0 — 2026-05-15 — Tag wipe fix.
  *   PUT /contacts/{id} with a `tags` array WHOLESALE-REPLACES the contact's
@@ -42,6 +88,7 @@
  */
 
 import { getToken } from './token-manager.js';
+import { normalizePhone, getField, extractArray } from './sync-utils.js';
 
 const LP_API_BASE = process.env.LP_API_BASE_URL || 'https://api.leadperfection.com';
 const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -121,20 +168,101 @@ function parseResponse(data) {
   return data;
 }
 
-// ─── v2.0: Phone/email fallback via GetCustomers3 ────────────────
+// ─── v4.0: VERIFIED prospect resolution ──────────────────────────
+//
+// Everything below replaces v2.0's parseGetCustomers3() → data[0] accept.
+// The contract is now: we only return a prospect we can PROVE matches the
+// identifier we searched on. Anything else returns null and the caller
+// falls through to the endpoint's 404.
 
 /**
- * Search LP by phone or email using GetCustomers3.
- * Returns the prospect ID (cst_id) if found, or null.
- * Tries phone first (most reliable match), then email.
+ * Last-10-digit comparison key for a phone, or null when there aren't
+ * enough digits to compare. LP and GHL disagree on country code and
+ * formatting; the last 10 digits are the stable key. Same convention as
+ * pickPhoneMatch() in src/services/lp-contact-backstop.js.
  */
-async function resolveProspectByPhoneEmail({ phone, email, last_name }, token) {
-  // Normalize phone: strip non-digits
-  const cleanPhone = phone ? String(phone).replace(/\D/g, '') : '';
+function phoneKey(raw) {
+  const digits = normalizePhone(raw);
+  return digits && digits.length >= 10 ? digits.slice(-10) : null;
+}
 
-  // Try phone first
-  if (cleanPhone) {
-    console.log(`[n8n/enrich] GetCustomers3 fallback: searching by phone ${cleanPhone}`);
+/**
+ * Every phone LP might have stamped on a prospect record, as last-10 keys.
+ * LP's field casing is inconsistent across endpoints (phone1/Phone1/PHONE1),
+ * hence getField's case-insensitive fallback.
+ */
+function prospectPhoneKeys(p) {
+  const raw = [
+    getField(p, 'phone', 'Phone', 'phone1', 'Phone1', 'homephone', 'HomePhone'),
+    getField(p, 'phone2', 'Phone2', 'altphone', 'AltPhone', 'workphone', 'WorkPhone'),
+    getField(p, 'phone3', 'Phone3', 'mobile', 'Mobile', 'cellphone', 'CellPhone'),
+  ];
+  return raw.map(phoneKey).filter(Boolean);
+}
+
+/** Normalized email on a prospect record, or null. */
+function prospectEmail(p) {
+  const e = getField(p, 'email', 'Email', 'emailaddress', 'EmailAddress');
+  const t = e ? String(e).trim().toLowerCase() : '';
+  return t && t.includes('@') ? t : null;
+}
+
+/** cst_id / ProspectID as a string, or null. */
+function prospectId(p) {
+  const id = getField(p, 'cst_id', 'ProspectID', 'prospectid');
+  const s = id !== null && id !== undefined ? String(id).trim() : '';
+  return s || null;
+}
+
+/**
+ * Pick the prospect that ACTUALLY matches what we searched for.
+ *
+ * Scans EVERY returned row rather than trusting row 0, and requires a
+ * concrete equality on the identifier we searched with. Returns
+ * { prospect, basis } or null.
+ *
+ * Returning null is a valid, expected outcome — it means LP gave us rows
+ * but none of them are this person. Pre-v4.0 that case silently produced a
+ * wrong link.
+ */
+function pickVerifiedProspect(list, { phone = null, email = null } = {}) {
+  const rows = Array.isArray(list) ? list : [];
+  if (rows.length === 0) return null;
+
+  const wantPhone = phone ? phoneKey(phone) : null;
+  if (wantPhone) {
+    const hit = rows.find((p) => prospectPhoneKeys(p).includes(wantPhone));
+    if (hit && prospectId(hit)) return { prospect: hit, basis: 'phone_verified' };
+  }
+
+  const wantEmail = email ? String(email).trim().toLowerCase() : null;
+  if (wantEmail && wantEmail.includes('@')) {
+    const hit = rows.find((p) => prospectEmail(p) === wantEmail);
+    if (hit && prospectId(hit)) return { prospect: hit, basis: 'email_verified' };
+  }
+
+  return null;
+}
+
+/**
+ * Resolve an LP prospect from phone and/or email, verifying every hit.
+ *
+ * Returns { prospectId, basis } or null.
+ *
+ * v4.0 — the last-name-only search was REMOVED. It was unverifiable by
+ * construction (LP can return many people named "Crawford" and we have no
+ * second factor to choose between them) and it was the direct cause of
+ * anonymous webchat contacts inheriting an unrelated prospect: with no
+ * phone and no email, the old code searched on the display-name fragment
+ * and took row 0. Callers now get null and the endpoint returns its
+ * existing 404, which is the correct outcome for a contact we cannot
+ * identify.
+ */
+async function resolveProspectByPhoneEmail({ phone, email }, token) {
+  const cleanPhone = normalizePhone(phone) || '';
+
+  if (cleanPhone.length >= 10) {
+    console.log(`[n8n/enrich] GetCustomers3: searching by phone ${cleanPhone}`);
     const result = await lpPost('/api/Customers/GetCustomers3', {
       phone: cleanPhone,
       email: '',
@@ -142,16 +270,23 @@ async function resolveProspectByPhoneEmail({ phone, email, last_name }, token) {
       prospectid: '',
     }, token);
 
-    const prospect = parseGetCustomers3(result);
-    if (prospect) {
-      console.log(`[n8n/enrich] GetCustomers3 phone match: cst_id=${prospect.cst_id}`);
-      return String(prospect.cst_id);
+    const rows = extractArray(result);
+    const match = pickVerifiedProspect(rows, { phone: cleanPhone });
+    if (match) {
+      const id = prospectId(match.prospect);
+      console.log(`[n8n/enrich] GetCustomers3 phone match VERIFIED: cst_id=${id}`);
+      return { prospectId: id, basis: match.basis };
+    }
+    if (rows.length > 0) {
+      console.warn(
+        `[n8n/enrich] GetCustomers3 phone search returned ${rows.length} row(s) but NONE carried ` +
+        `${cleanPhone} — rejecting. (Pre-v4.0 this accepted row 0 and produced a cross-linked contact.)`
+      );
     }
   }
 
-  // Try email
-  if (email) {
-    console.log(`[n8n/enrich] GetCustomers3 fallback: searching by email ${email}`);
+  if (email && String(email).includes('@')) {
+    console.log(`[n8n/enrich] GetCustomers3: searching by email ${email}`);
     const result = await lpPost('/api/Customers/GetCustomers3', {
       phone: '',
       email: email,
@@ -159,52 +294,27 @@ async function resolveProspectByPhoneEmail({ phone, email, last_name }, token) {
       prospectid: '',
     }, token);
 
-    const prospect = parseGetCustomers3(result);
-    if (prospect) {
-      console.log(`[n8n/enrich] GetCustomers3 email match: cst_id=${prospect.cst_id}`);
-      return String(prospect.cst_id);
+    const rows = extractArray(result);
+    const match = pickVerifiedProspect(rows, { email });
+    if (match) {
+      const id = prospectId(match.prospect);
+      console.log(`[n8n/enrich] GetCustomers3 email match VERIFIED: cst_id=${id}`);
+      return { prospectId: id, basis: match.basis };
+    }
+    if (rows.length > 0) {
+      console.warn(
+        `[n8n/enrich] GetCustomers3 email search returned ${rows.length} row(s) but NONE carried ` +
+        `${email} — rejecting.`
+      );
     }
   }
 
-  // Try last name (least specific, may return multiple)
-  if (last_name && !cleanPhone && !email) {
-    console.log(`[n8n/enrich] GetCustomers3 fallback: searching by lastname ${last_name}`);
-    const result = await lpPost('/api/Customers/GetCustomers3', {
-      phone: '',
-      email: '',
-      lastname: last_name,
-      prospectid: '',
-    }, token);
-
-    const prospect = parseGetCustomers3(result);
-    if (prospect) {
-      console.log(`[n8n/enrich] GetCustomers3 lastname match: cst_id=${prospect.cst_id}`);
-      return String(prospect.cst_id);
-    }
-  }
-
-  return null;
-}
-
-/**
- * Parse GetCustomers3 response — returns the first prospect record or null.
- * GetCustomers3 returns an array of prospect records.
- */
-function parseGetCustomers3(data) {
-  if (!data) return null;
-  if (Array.isArray(data)) {
-    return data.length > 0 ? data[0] : null;
-  }
-  if (data.Records && Array.isArray(data.Records)) {
-    return data.Records.length > 0 ? data.Records[0] : null;
-  }
-  if (data.cst_id || data.ProspectID) return data;
   return null;
 }
 
 // ─── Build enriched record from LP data ──────────────────────────
 
-function buildEnrichedRecord(fullData, leadInfo, prospectId, contactId) {
+function buildEnrichedRecord(fullData, leadInfo, prospectIdValue, contactId) {
   const lead = parseResponse(fullData) || {};
   const info = parseResponse(leadInfo) || {};
 
@@ -220,7 +330,7 @@ function buildEnrichedRecord(fullData, leadInfo, prospectId, contactId) {
   const safeCount = (arr) => Array.isArray(arr) ? arr.length : (arr ? 1 : 0);
 
   const enriched = {
-    lp_prospect_id: String(prospect.cst_id || prospect.ProspectID || lead.cst_id || lead.ProspectID || prospectId || ''),
+    lp_prospect_id: String(prospect.cst_id || prospect.ProspectID || lead.cst_id || lead.ProspectID || prospectIdValue || ''),
     contact_id: contactId || '',
     firstName: prospect.firstname || prospect.FirstName || lead.firstname || lead.FirstName || '',
     lastName: prospect.lastname || prospect.LastName || lead.lastname || lead.LastName || '',
@@ -423,8 +533,6 @@ export function registerN8nEnrichRoute(app) {
       const contact_id = body.contact_id || body.contactId || body.ghl_contact_id || '';
       const phone = body.phone || body.Phone || '';
       const email = body.email || body.Email || '';
-      const first_name = body.first_name || body.firstName || body.FirstName || body.firstname || '';
-      const last_name = body.last_name || body.lastName || body.LastName || body.lastname || '';
 
       if (!contact_id) {
         return res.status(400).json({ success: false, error: 'contact_id is required' });
@@ -436,11 +544,12 @@ export function registerN8nEnrichRoute(app) {
       }
 
       let resolvedProspectId = lp_prospect_id ? String(lp_prospect_id).trim() : '';
-      let resolvedVia = 'prospect_id';
+      // v4.0: resolvedVia is set only on SUCCESS, so a failed attempt can never
+      // masquerade as a resolution method in the response or the logs.
+      let resolvedVia = resolvedProspectId ? 'prospect_id' : 'unresolved';
 
-      // Resolution chain: prospect_id → lead_id → phone/email fallback
+      // Resolution chain: prospect_id → lead_id → VERIFIED phone/email fallback
       if (!resolvedProspectId && lp_lead_id) {
-        resolvedVia = 'lead_id';
         const leadLookup = await lpPost('/api/Customers/GetLead', {
           lds_id: lp_lead_id, PageSize: '1', StartIndex: '1', options: '0',
         }, token);
@@ -454,34 +563,48 @@ export function registerN8nEnrichRoute(app) {
           cst_id = String(leadLookup.Records[0].cst_id || '');
         }
 
-        if (cst_id) resolvedProspectId = cst_id;
-      }
-
-      // v2.0: Phone/email fallback via GetCustomers3
-      if (!resolvedProspectId && (phone || email || last_name)) {
-        resolvedVia = 'phone_email_fallback';
-        console.log(`[n8n/enrich] No LP IDs available — trying GetCustomers3 fallback for contact ${contact_id}`);
-        const fallbackResult = await resolveProspectByPhoneEmail({ phone, email, last_name }, token);
-        if (fallbackResult) {
-          resolvedProspectId = fallbackResult;
+        // lds_id → cst_id is an exact LP key lookup, not a search — no
+        // verification needed or possible.
+        if (cst_id) {
+          resolvedProspectId = cst_id;
+          resolvedVia = 'lead_id';
         }
       }
 
-      // v2.0: If still no prospect ID, fetch GHL contact to get phone/email and retry
+      // v4.0: VERIFIED phone/email fallback. Every hit is checked against the
+      // identifier we searched with; the unverifiable last-name search is gone.
+      if (!resolvedProspectId && (phone || email)) {
+        console.log(`[n8n/enrich] No LP IDs available — trying verified GetCustomers3 fallback for contact ${contact_id}`);
+        const fallback = await resolveProspectByPhoneEmail({ phone, email }, token);
+        if (fallback) {
+          resolvedProspectId = fallback.prospectId;
+          resolvedVia = fallback.basis;
+        }
+      }
+
+      // v4.0: Still nothing — read the GHL contact for a phone/email and retry.
+      // A contact carrying NEITHER is not identifiable. We do NOT fall back to
+      // a name search: that is precisely how anonymous webchat contacts
+      // ("guest visitor NNN") inherited unrelated prospects. Exit to the 404.
       if (!resolvedProspectId && contact_id) {
-        resolvedVia = 'ghl_contact_fallback';
-        console.log(`[n8n/enrich] No LP IDs or phone/email — fetching GHL contact ${contact_id} for phone/email`);
         try {
           const ghlContact = await ghlGet(contact_id);
           const c = ghlContact?.contact || ghlContact || {};
           const ghlPhone = c.phone || '';
           const ghlEmail = c.email || '';
-          const ghlLastName = c.lastName || '';
           if (ghlPhone || ghlEmail) {
-            const fallbackResult = await resolveProspectByPhoneEmail({
-              phone: ghlPhone, email: ghlEmail, last_name: ghlLastName,
-            }, token);
-            if (fallbackResult) resolvedProspectId = fallbackResult;
+            console.log(`[n8n/enrich] Retrying verified fallback with GHL contact ${contact_id} phone/email`);
+            const fallback = await resolveProspectByPhoneEmail({ phone: ghlPhone, email: ghlEmail }, token);
+            if (fallback) {
+              resolvedProspectId = fallback.prospectId;
+              resolvedVia = `ghl_contact_${fallback.basis}`;
+            }
+          } else {
+            resolvedVia = 'unresolved_no_identifiers';
+            console.warn(
+              `[n8n/enrich] contact ${contact_id} has NO phone and NO email — not identifiable. ` +
+              `Refusing to guess (v4.0: an unlinked contact beats a wrongly-linked one).`
+            );
           }
         } catch (e) {
           console.error('[n8n/enrich] GHL contact fetch failed:', e.message);
@@ -491,8 +614,9 @@ export function registerN8nEnrichRoute(app) {
       if (!resolvedProspectId) {
         return res.status(404).json({
           success: false,
-          error: 'Could not resolve LP prospect. Tried: prospect_id, lead_id, phone, email, GHL contact lookup. Lead may still be in LP inbound queue (not yet processed).',
+          error: 'Could not verifiably resolve LP prospect. Tried: prospect_id, lead_id, verified phone match, verified email match, GHL contact lookup. Lead may still be in LP inbound queue (not yet processed), or the contact carries no identifier we can match on.',
           contact_id,
+          resolved_via: resolvedVia,
           resolution_attempted: resolvedVia,
         });
       }
@@ -502,7 +626,7 @@ export function registerN8nEnrichRoute(app) {
         lpPost('/api/Customers/GetLeadInfo', { prospectid: resolvedProspectId }, token),
       ]);
 
-      const { enriched, rawLead, rawInfo } = buildEnrichedRecord(fullData, leadInfo, resolvedProspectId, contact_id);
+      const { enriched, rawLead } = buildEnrichedRecord(fullData, leadInfo, resolvedProspectId, contact_id);
       const lpFields = enrichFromLP(enriched, rawLead);
 
       // ─── v3.0 — Additive tag application (NEVER via PUT body) ──────
@@ -590,3 +714,12 @@ export function registerN8nEnrichRoute(app) {
     }
   });
 }
+
+// Exported for unit tests + introspection (scripts/test-enrichment-prospect-verification.js)
+export const __testing = {
+  phoneKey,
+  prospectPhoneKeys,
+  prospectEmail,
+  prospectId,
+  pickVerifiedProspect,
+};
