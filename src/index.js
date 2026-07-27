@@ -336,7 +336,8 @@ async function runMigrations() {
   // Appointment Capacity Board substrate (sql/043 — the file is the source of
   // truth; this boot-time mirror guarantees the schema exists before the first
   // capacity sweep AND before the first lead upsert writes the new
-  // appointment_confirmed/appointment_verified columns. Additive/idempotent.
+  // appointment_confirmed/appointment_verified columns, and the sql/049 LP
+  // attribution + latching outcome columns. Additive/idempotent.
   //
   // Runs through the run_sql RPC (which THROWS on failure via runSQL), NOT the
   // exec_sql pattern used by the older blocks above: supabase.rpc() reports
@@ -357,6 +358,16 @@ async function runMigrations() {
             CREATE INDEX IF NOT EXISTS idx_lp_capacity_slots_date ON lp_capacity_slots(slot_date);
             ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS appointment_confirmed boolean;
             ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS appointment_verified  boolean;
+            ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS set_by_name       text;
+            ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS confirmed_by_name text;
+            ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS verified_by_name  text;
+            ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS set_date          timestamptz;
+            ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS confirmed_date    timestamptz;
+            ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS ever_set          boolean;
+            ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS ever_confirmed    boolean;
+            ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS ever_sat          boolean;
+            ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS ever_issued       boolean;
+            ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS ever_net_issued   boolean;
             CREATE OR REPLACE VIEW v_appt_board AS
               SELECT slot_date,
                      COALESCE(bm.market_code, 'UNRESOLVED') AS market,
