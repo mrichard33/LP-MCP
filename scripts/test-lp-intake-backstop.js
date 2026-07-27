@@ -47,7 +47,15 @@ assert.equal(sourceDetailTagFor('Affiliates', 'MVP Marketing'), 'source:affiliat
 assert.equal(sourceDetailTagFor('Canvass', 'Canvass'), null, 'Canvass has canvass-subtype:* — no vendor axis');
 assert.equal(sourceDetailTagFor('Internet', 'Internet'), null, 'detail == source carries no information');
 assert.equal(sourceDetailTagFor('Internet', null), null, 'missing detail → no tag');
-assert.equal(sourceDetailTagFor('Job Signs', 'Job Signs'), null, 'unmapped source → no vendor tag');
+assert.equal(sourceDetailTagFor('Job Signs', 'Job Signs'), null, 'detail == source → no vendor tag');
+assert.equal(sourceDetailTagFor('Newspaper', 'Some Paper'), null, 'source with no vendor axis → no tag');
+
+// Iheart is the parent source of Simpletext — the pairing that was landing on
+// source:unknown for 4,084 unlinked leads before the map was extended.
+assert.equal(sourceDetailTagFor('Iheart', 'Simpletext'), 'source:radio-simpletext');
+assert.equal(sourceDetailTagFor('Simpletext', 'Simpletext'), null, 'detail == source → no vendor tag');
+assert.equal(sourceDetailTagFor('Magazine', 'Home & Garden'), 'source:magazine-home-garden');
+assert.equal(sourceDetailTagFor('Canvass Sticky', 'Anything'), null, 'canvass has no vendor axis');
 
 // ─── backstopTagsFor — THE INVARIANT ─────────────────────────────
 const countPrefix = (tags, p) => tags.filter((t) => t.startsWith(p)).length;
@@ -57,6 +65,20 @@ for (const [src, detail] of [
   ['Affiliates', 'MVP Marketing'],
   ['Canvass', 'Canvass'],
   ['Job Signs', 'Job Signs'],
+  // 2026-07-26 second pass — every newly mapped source must hold the invariant.
+  ['Canvass Sticky', 'Canvass Sticky'],
+  ['Iheart', 'Simpletext'],
+  ['Simpletext', 'Simpletext'],
+  ['Television', 'Television'],
+  ['Website', 'Google'],
+  ['Main Website', 'Google'],
+  ['Magazine', 'Home & Garden'],
+  ['PrevCust', 'PrevCust'],
+  ['CustRef', 'Customer Referral'],
+  ['SelfGen', 'SelfGen'],
+  // Deliberately unmapped — must still hold the invariant via the default tags.
+  ['Newspaper', 'Some Paper'],
+  ['Old Source', null],
   [undefined, undefined],
 ]) {
   for (const suppressOutbound of [false, true]) {
@@ -80,6 +102,41 @@ for (const [src, detail] of [
   assert.ok(tags.includes('source:internet'), 'base channel tag retained');
   assert.ok(tags.includes('source:internet-porch101'), 'vendor tag added');
   assert.ok(tags.includes('entry:other') && tags.includes('active-entry:other'));
+}
+
+// The Iheart/Simpletext regression: these were created as `source:unknown` with
+// no vendor tag until the map was extended.
+{
+  const tags = backstopTagsFor('Iheart', 'Simpletext');
+  assert.ok(tags.includes('source:radio'), 'radio channel tag present');
+  assert.ok(tags.includes('source:radio-simpletext'), 'vendor tag present');
+  assert.ok(!tags.includes('source:unknown'), 'no longer falls through to unknown');
+}
+
+// Newly mapped sources land on their real channel tag, not the default.
+for (const [src, expected] of [
+  ['Canvass Sticky', 'source:canvass'],
+  ['Television', 'source:tv'],
+  ['Website', 'source:reece-direct-site'],
+  ['Main Website', 'source:reece-direct-site'],
+  ['Magazine', 'source:magazine'],
+  ['Job Signs', 'source:job-sign'],
+  ['PrevCust', 'source:previous-customer'],
+  ['CustRef', 'source:previous-customer'],
+  ['SelfGen', 'source:self-generated'],
+]) {
+  const tags = backstopTagsFor(src, null);
+  assert.ok(tags.includes(expected), `${src} → ${expected}`);
+  assert.ok(!tags.includes('source:unknown'), `${src} must not fall through to unknown`);
+}
+
+// Canvass Sticky rides the canvassing entry tags, not entry:other.
+assert.ok(backstopTagsFor('Canvass Sticky', null).includes('active-entry:canvassing'));
+
+// Deliberately unmapped sources still resolve cleanly to the default.
+for (const src of ['Newspaper', 'Mail', 'Old Source', 'RCI', null]) {
+  const tags = backstopTagsFor(src, 'Whatever');
+  assert.ok(tags.includes('source:unknown'), `${src} → source:unknown (documented gap)`);
 }
 // Backwards compatible: old two-arg call still works (appointment-mode path).
 assert.deepEqual(
