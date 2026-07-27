@@ -357,6 +357,7 @@ async function runMigrations() {
             CREATE INDEX IF NOT EXISTS idx_lp_capacity_slots_date ON lp_capacity_slots(slot_date);
             ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS appointment_confirmed boolean;
             ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS appointment_verified  boolean;
+            ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS appointment_confirmed_at timestamptz;
             CREATE OR REPLACE VIEW v_appt_board AS
               SELECT slot_date,
                      COALESCE(bm.market_code, 'UNRESOLVED') AS market,
