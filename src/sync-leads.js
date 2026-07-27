@@ -314,7 +314,42 @@ function effectiveLeadSource(lead) {
 
 // TEST SEAM — pure source-attribution helpers exposed for unit tests
 // (mirrors the `_internal` export convention used in entry-source-map.js).
-export const _internal = { deriveSourceFromPromoter, effectiveLeadSource, PROMOTER_SOURCE_CHANNELS };
+export const _internal = {
+  deriveSourceFromPromoter, effectiveLeadSource, PROMOTER_SOURCE_CHANNELS,
+  lpBool, needsAttributionBackfill,
+};
+
+// ─── LP string-boolean coercion ──────────────────────────────────
+//
+// LP sends booleans as the strings "true"/"false". Returns undefined for an
+// absent field so the key drops at serialization and a previously-stored
+// value survives — the same contract as the appointment_confirmed mapping in
+// buildLeadRow(). Never coerces an unpopulated field to false: that would
+// assert an appointment was never confirmed when LP simply didn't send it.
+//
+// getField() already collapses '' to null, so the '' arm is belt-and-braces
+// for callers reading the raw payload directly.
+function lpBool(v) {
+  if (v === undefined || v === null || v === '') return undefined;
+  return v === 'true' || v === true;
+}
+
+// ─── Attribution backfill-on-skip (sql/049) ──────────────────────
+//
+// Both writers skip the upsert when lastchangedon is unchanged and the funnel
+// flags match. LP will never bump lastchangedon just because WE added columns,
+// so without this escape a row synced before 049 looks "unchanged" forever and
+// the attribution columns stay NULL through a full re-sync — exactly the
+// failure mode that forced the lp_branch_id backfill-on-skip below (observed
+// live: 20/105 of a day's leads had branch after hours of refreshes).
+//
+// Fires at most once per row: goes quiet as soon as the columns are populated.
+function needsAttributionBackfill(existing, lead) {
+  if (!existing) return false;
+  if (existing.set_by_name != null && existing.ever_confirmed != null) return false;
+  return getField(lead, 'setbyname', 'SetByName') != null
+    || getField(lead, 'everconfirmed', 'EverConfirmed') != null;
+}
 
 // ─── Build the lead row payload (DRY helper) ─────────────────────
 //
@@ -390,6 +425,30 @@ function buildLeadRow(prospect, lead, {
         ? undefined : (confirmedRaw === 'true' || confirmedRaw === true),
       appointment_verified:  (verifiedRaw === undefined || verifiedRaw === null)
         ? undefined : (verifiedRaw === 'true' || verifiedRaw === true),
+
+      // ─── LP attribution (sql/049, added 2026-07-27) ──────────────────
+      // LP supplies these on every lead payload; we had never mapped them.
+      // Names arrive "Last, First" — stored verbatim, normalised at read
+      // time (any write-time split is lossy for hyphenated/multi-part names).
+      // Dates go through lpDateToEastern() like every other LP date: LP sends
+      // bare UTC strings and that helper tags them +00:00 (see lp-dates.js).
+      set_by_name:       getField(lead, 'setbyname', 'SetByName') || undefined,
+      confirmed_by_name: getField(lead, 'confirmedbyname', 'ConfirmedByName') || undefined,
+      verified_by_name:  getField(lead, 'verifiedbyname', 'VerifiedByName') || undefined,
+      set_date:          lpDateToEastern(getField(lead, 'setdate', 'SetDate')) || undefined,
+      confirmed_date:    lpDateToEastern(getField(lead, 'confirmeddate', 'ConfirmedDate')) || undefined,
+
+      // ─── LP latching outcome flags ───────────────────────────────────
+      // These SURVIVE cancellation, unlike appointment_confirmed — LP clears
+      // confirmed=false when an appointment cancels, which is why no CXL row
+      // carries it. Use these for any historical question; use
+      // appointment_confirmed for current state (the capacity board).
+      ever_set:        lpBool(getField(lead, 'everset', 'EverSet')),
+      ever_confirmed:  lpBool(getField(lead, 'everconfirmed', 'EverConfirmed')),
+      ever_sat:        lpBool(getField(lead, 'eversat', 'EverSat')),
+      ever_issued:     lpBool(getField(lead, 'everissued', 'EverIssued')),
+      ever_net_issued: lpBool(getField(lead, 'evernetissued', 'EverNetIssued')),
+
       appointment_date:   lpDateToEastern(getField(lead, 'apptdate', 'ApptDate')),
       demo_completed:     isDemoCompleted,
       demo_date:          isDemoCompleted ? lpDateToEastern(getField(lead, 'apptdate', 'ApptDate')) : null,
@@ -428,7 +487,7 @@ export async function upsertLeadOnly(prospect) {
     // the existing ghl_contact_id into buildLeadRow. maybeSingle() returns
     // null cleanly for brand-new leads instead of erroring.
     const { data: existing } = await supabase.from('lp_leads')
-      .select('updated_at_lp, ghl_contact_id, ghl_link_source, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified, lp_branch_id')
+      .select('updated_at_lp, ghl_contact_id, ghl_link_source, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified, lp_branch_id, set_by_name, ever_confirmed')
       .eq('lp_lead_id', lpLeadId).maybeSingle();
 
     // Corroborated link resolution (no matchToGHL in Pass 1, so verifiedGhlId
@@ -472,7 +531,9 @@ export async function upsertLeadOnly(prospect) {
       // refreshes. Force the upsert whenever LP provides a branch we lack.
       const needsBranchBackfill = !existing.lp_branch_id
         && String(getField(lead, 'brn_id', 'BrnId', 'BrnID') || '').trim() !== '';
-      if (!needsGhlIdBackfill && !needsBranchBackfill) {
+      // Same failure mode for the 049 attribution columns.
+      const needsAttrBackfill = needsAttributionBackfill(existing, lead);
+      if (!needsGhlIdBackfill && !needsBranchBackfill && !needsAttrBackfill) {
         // Skip path never upserts, so persist a fresh classification here or
         // stable rows would stay unclassified through the observe soak.
         // One-time per row: the resolver's fast path returns null once the
@@ -574,7 +635,7 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
 
     // ─── AGENTIC: Read existing state BEFORE upsert ──────────────
     const { data: existing } = await supabase.from('lp_leads')
-      .select('ghl_tag_applied, lp_day15_triggered, disposition_code, ghl_contact_id, ghl_link_source, updated_at_lp, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified, lp_branch_id')
+      .select('ghl_tag_applied, lp_day15_triggered, disposition_code, ghl_contact_id, ghl_link_source, updated_at_lp, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified, lp_branch_id, set_by_name, ever_confirmed')
       .eq('lp_lead_id', lpLeadId).single();
 
     const previousDisposition = existing?.disposition_code || null;
@@ -653,12 +714,16 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
     const needsBranchBackfill = !existing?.lp_branch_id
       && String(getField(lead, 'brn_id', 'BrnId', 'BrnID') || '').trim() !== '';
 
+    // Same failure mode for the 049 attribution columns.
+    const needsAttrBackfill = needsAttributionBackfill(existing, lead);
+
     const recordUnchanged = existing?.updated_at_lp
       && newUpdatedAt
       && existing.updated_at_lp === newUpdatedAt
       && (existing.ghl_contact_id === newLeadGhlId || (!newLeadGhlId && existing.ghl_contact_id))
       && flagsUnchanged
-      && !needsBranchBackfill;
+      && !needsBranchBackfill
+      && !needsAttrBackfill;
 
     if (recordUnchanged && !dispositionChanged) {
       // Persist a fresh classification on the skip path (no upsert runs
