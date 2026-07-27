@@ -74,13 +74,20 @@ SELECT
   l.ever_net_issued,
   (l.disposition_code = 'CXL')                         AS cancelled,
   (l.disposition_code = 'Sale')                        AS sold,
-  (l.disposition_code NOT IN ('Set','Cnf','Verif'))    AS resolved,
+  -- 'Issue' is PENDING, not an outcome. capacity-sweep.js:71-76 documents it as
+  -- issued-to-rep — LP's nightly run sheet mass-flips tomorrow's confirmed
+  -- appointments Cnf -> Issue with issued=true, the strongest will-run state
+  -- (repro lead 556824). The appointment has not happened yet, so counting it as
+  -- resolved treats a live booking as a completed outcome and understates every
+  -- rate computed off this view. Measured 2026-07-27: 347 rows with an
+  -- appointment on/after 2026-04-05 sit in Issue.
+  (l.disposition_code NOT IN ('Set','Cnf','Verif','Issue')) AS resolved,
   (l.set_by_name IS DISTINCT FROM l.confirmed_by_name) AS separately_confirmed
 FROM lp_leads l
 WHERE l.appointment_date IS NOT NULL;
 
 COMMENT ON VIEW v_appt_attribution IS
-  'Appointments by setter and confirmer with latching LP outcome flags. Filter resolved=true before computing any rate — pending appointments are not failures. separately_confirmed distinguishes real confirmation work from LP stamping the setter as its own confirmer. resolved is NULL where disposition_code is NULL, so those rows drop out of a WHERE resolved filter.';
+  'Appointments by setter and confirmer with latching LP outcome flags. Filter resolved=true before computing any rate — pending appointments are not failures. Pending means Set, Cnf, Verif or Issue: Issue is issued-to-rep (capacity-sweep.js:71-76), a will-run appointment that has not happened yet, not an outcome. separately_confirmed distinguishes real confirmation work from LP stamping the setter as its own confirmer. resolved is NULL where disposition_code is NULL, so those rows drop out of a WHERE resolved filter.';
 
 -- ─── Index — RUN SEPARATELY ─────────────────────────────────────────────────
 -- CREATE INDEX CONCURRENTLY cannot run inside a transaction block, so this must
