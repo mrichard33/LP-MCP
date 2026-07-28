@@ -195,9 +195,40 @@ import { enrollLpLeadCreation } from './admin/lp-force-addlead.js';
 // calendars (dormant unless FIVE9_DIRECT_DISPATCH=true — see five9/list-dispatch.js).
 import { isGhlOnlyCalendarId } from './knowledge/booking-calendar-router.js';
 import { five9DispatchConfigured, dispatchConfirmationCallback } from './five9/list-dispatch.js';
+// 2026-07-28 appt-enrichment repoint: the CANONICAL rate-limited GHL client.
+// Byte-identical to the private ghlFetch below EXCEPT it calls report429() on a
+// 429 (actions/helpers.js:54-58), so a throttle actually drains the shared token
+// bucket. Used by fetchLatestAppointment ONLY — the three pre-existing private-fork
+// call sites are deliberately untouched so this PR reverts cleanly. report429()
+// pauses ALL GHL traffic process-wide for 5-15min; that side effect must not ride
+// along with a bug fix. No import cycle: helpers.js imports only ghl-rate-limiter.js
+// and format-helpers.js, neither of which imports anything from here.
+import { ghlFetch as sharedGhlFetch } from './actions/helpers.js';
+import { emitEvent } from './event-emitter.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
-const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
+// GHL_LOCATION_ID removed 2026-07-28: its only consumer was the locationId
+// query param on the broken /calendars/events/appointments call. The correct
+// route (GET /contacts/{contactId}/appointments) is contact-scoped by path and
+// takes no locationId.
+
+// ─── Appointment-enrichment flags (2026-07-28) ─────────────────────
+// Both flags ship dark and are ABSENT from Railway, so the unset case must be
+// the safe case for each — note the deliberate asymmetry:
+//   APPT_ENRICHMENT_ENABLED   unset → DISABLED. No fetch, returns null,
+//                             byte-for-byte the pre-fix observable behaviour.
+//   APPT_ENRICHMENT_LOG_ONLY  unset → LOG-ONLY. The fetch runs and is recorded
+//                             to system_events, but null is still returned to
+//                             enrichFromGHLContact. ONLY the exact string
+//                             'false' turns log-only off.
+// Read inside functions rather than frozen at import so the test script can
+// toggle per case.
+function apptEnrichmentEnabled() {
+  return (process.env.APPT_ENRICHMENT_ENABLED || 'false') === 'true';
+}
+function apptEnrichmentLogOnly() {
+  return String(process.env.APPT_ENRICHMENT_LOG_ONLY || 'true').trim().toLowerCase() !== 'false';
+}
 
 // GHL custom field IDs
 const LAST_APPT_DATE_FIELD  = 'x8KO5o89WPLfC7ivia3A';
@@ -369,6 +400,21 @@ function extractCalendarName(body) {
   return null;
 }
 
+/**
+ * DRIFTED FORK — do not copy this pattern. This is a stale duplicate of the
+ * canonical `ghlFetch` in src/actions/helpers.js:38. Verified 2026-07-28: the
+ * two differ ONLY by the `export` keyword and the missing 429 branch — this
+ * copy never calls report429(), so a throttle here never drains the shared
+ * token bucket. Module bindings are identical in both, and there is no import
+ * cycle, so the swap is safe.
+ *
+ * FOLLOW-UP (tracked): delete this fork and repoint its three remaining callers
+ * (enrichFromGHLContact + the two `GET /contacts/{id}` sites below) at the
+ * shared import. Kept out of the enrichment-repoint PR on purpose: report429()
+ * pauses ALL GHL traffic for 5-15 minutes, which is a system-wide behaviour
+ * change that must be verified against /n8n/rate-limiter/stats on its own.
+ * fetchLatestAppointment already uses the shared client (`sharedGhlFetch`).
+ */
 async function ghlFetch(method, path, body = null) {
   if (!GHL_API_KEY) throw new Error('GHL_API_KEY not configured');
   await acquireToken();
@@ -393,44 +439,202 @@ async function ghlFetch(method, path, body = null) {
   return ct.includes('application/json') ? res.json() : { status: res.status, ok: true };
 }
 
+const APPT_ENRICH_EVENT_TYPE = 'appt.enrichment_fetch';
+const apptEnrichEndpoint = (contactId) => `/contacts/${contactId}/appointments`;
+
+// One-shot latch. Emitting a 'disabled' row on every call would be ~100
+// identical zero-information rows/day AND would itself break the "flag off
+// changes nothing observable" contract. One row per process boot is all the
+// observation window needs: it distinguishes "flag off" from "not shipped".
+let disabledEnrichEventEmitted = false;
+
 /**
- * v5.1.6: Fetch the most recent appointment for a contact.
- * Used as fallback when calendar_id/calendar_name not in webhook body.
+ * ghlFetch signals HTTP failure by THROWING an Error whose message embeds both
+ * pieces we need: `GHL GET /path → 404: {body}` (actions/helpers.js:61). Nothing
+ * on that path attaches a structured status, so pull it back out for
+ * payload.http_status. The full raw message is stored alongside it, so a parse
+ * miss (network abort, 15s AbortSignal timeout, `GHL_API_KEY not configured` —
+ * none of which carry a status) degrades to http_status:null with the
+ * diagnostic text still on the row.
+ */
+function parseGhlErrorStatus(message) {
+  const m = /→\s*(\d{3})\s*:/.exec(String(message || ''));
+  return m ? Number(m[1]) : null;
+}
+
+/**
+ * Resolve {calendarId, calendarName} from a GHL appointment using the EXACT
+ * precedence enrichFromGHLContact applied inline before v5.3.0 (name map first,
+ * then raw appointment fields, then title). Extracted so the
+ * appt.enrichment_fetch payload records the same calendar_name the consumer
+ * would receive — otherwise the log-only window compares against a value
+ * production never sees.
+ */
+function resolveCalendarFromAppointment(appt) {
+  if (!appt) return { calendarId: null, calendarName: null };
+  const calendarId = appt.calendarId || appt.calendar_id || null;
+  let calendarName = calendarId ? calendarNameFromId(calendarId) : null;
+  if (!calendarName) {
+    calendarName = appt.calendarName || appt.calendar_name || appt.title || null;
+  }
+  return { calendarId, calendarName };
+}
+
+/**
+ * One system_events row per fetch outcome. FIRE-AND-FORGET at the call site:
+ * emitEvent makes two Supabase calls each bounded by EMIT_EVENT_TIMEOUT_MS
+ * (default 6000, event-emitter.js:29) = up to 12s worst case, and this sits
+ * inside the Promise.all on the set-lp-appointment webhook hot path.
+ */
+function recordEnrichmentOutcome({
+  contactId, subtype, endpoint, httpStatus, found, calendarId, calendarName, errorMessage, logOnly,
+}) {
+  return emitEvent({
+    event_type: APPT_ENRICH_EVENT_TYPE,
+    event_subtype: subtype,            // 'ok' | 'not_found' | 'error' | 'disabled'
+    source: 'lp_mcp',
+    entity_type: 'contact',
+    entity_id: contactId,
+    ghl_contact_id: contactId,
+    priority: 'low',
+    // Unique per call by construction, so the idempotency SELECT can never hit.
+    // Intentional: one row per call is the point. NOT a dedup guard.
+    idempotency_key: `enrich_${contactId}_${Date.now()}`,
+    // MANDATORY. 'appt.enrichment_fetch' is NOT in ALLOWED_EVENT_TYPES
+    // (services/event-intake-filter.js:111-166) and never will be — that list's
+    // contract is "types with >=1 consuming agent_rule" and this is pure
+    // telemetry. shouldAllowEvent() is default-DROP, so without bypass_filter
+    // every row is diverted to system_events_filtered with reason
+    // "event_type_not_in_allowlist" and the 24h observation window produces
+    // NOTHING. Same precedent as agentic.hold_error, documented verbatim at
+    // event-intake-filter.js:133-134.
+    bypass_filter: true,
+    payload: {
+      endpoint,
+      http_status: httpStatus ?? null,
+      appointment_found: Boolean(found),
+      calendar_id: calendarId || null,
+      calendar_name: calendarName || null,
+      log_only: Boolean(logOnly),
+      ...(errorMessage ? { error_message: String(errorMessage).slice(0, 500) } : {}),
+    },
+  }).catch((err) => {
+    // emitEvent already swallows internally; belt and braces so telemetry can
+    // never break appointment sync.
+    console.warn(`[LP-APPT] enrichment event emit failed for ${contactId}: ${err.message}`);
+    return null;
+  });
+}
+
+/**
+ * v5.3.0 (2026-07-28): ENDPOINT REPOINT + FLAG GATE.
  *
- * NOTE (2026-05-27): the current endpoint URL returns 404 in production
- * (see logs for "[LP-APPT] fetchLatestAppointment failed ... 404"). The
- * function still degrades gracefully — null on error, caller skips the
- * calendar field. Display-side cleanup of "| N/A" is in v5.1.9. The
- * actual endpoint fix is a separate followup; the right path is likely
- * /contacts/{contactId}/appointments but needs verification against
- * the GHL v2 docs before swapping in.
+ * Was GET /calendars/events/appointments?contactId=..&locationId=.. — which
+ * 404'd on 100% of calls since v5.1.6. Root cause was NOT a V1 sunset and NOT
+ * a token scope problem: the base is already V2 (services.leadconnectorhq.com,
+ * Version 2021-07-28). /calendars/events/appointments is a POST-only CREATION
+ * route with no contactId-filterable GET, and GET /calendars/events rejects
+ * contactId entirely (see services/lp-ghl-appointment-reconciler.js:33-38 and
+ * services/ghl-calendar-read.js:7-9 — strictly calendarId + startTime/endTime
+ * epoch-ms scoped).
  *
- * v5.1.10: should be reached much less often now — calendarId reads
- * from the flattened webhook body cover the most common cases.
+ * Correct route: GET /contacts/{contactId}/appointments. Two production call
+ * sites already use it successfully through the same shared ghlFetch —
+ * actions/stage-evidence.js:113 and actions/handlers/appointments.js:597 —
+ * which also proves the production token carries appointment read scope.
+ *
+ * Semantics UNCHANGED: most recent by startTime DESCENDING, ANY status.
+ * Deliberately NOT reusing fetchUpcomingAppointments
+ * (knowledge/contact-appointments.js:77) — it filters to future + active, the
+ * wrong shape for "what calendar was this contact last booked on".
+ *
+ * Soft-fail preserved: never throws, always returns an appointment or null.
+ * Failures now log the full ghlFetch message, which embeds status AND body.
+ *
+ * Sole consumer is enrichFromGHLContact, which reads only calendarId /
+ * calendarName off the result (never startTime, id, or assigned user).
  */
 async function fetchLatestAppointment(contactId) {
   if (!contactId) return null;
-  try {
-    const qs = new URLSearchParams({ contactId });
-    if (GHL_LOCATION_ID) qs.set('locationId', GHL_LOCATION_ID);
-    const res = await ghlFetch('GET', `/calendars/events/appointments?${qs.toString()}`);
 
-    // Response can be { events: [...] } | { appointments: [...] } | [...]
-    const list = res?.events || res?.appointments || (Array.isArray(res) ? res : null) || [];
-    if (!Array.isArray(list) || list.length === 0) return null;
-
-    const sorted = list
-      .filter(a => a && (a.startTime || a.start_time || a.startsAt))
-      .sort((a, b) => {
-        const ta = new Date(a.startTime || a.start_time || a.startsAt).getTime();
-        const tb = new Date(b.startTime || b.start_time || b.startsAt).getTime();
-        return tb - ta;
+  // ── Gate 1: master flag. Unset/'false' → identical observable behaviour to
+  // the broken version (null, no merge effect). No network, no per-call event.
+  if (!apptEnrichmentEnabled()) {
+    if (!disabledEnrichEventEmitted) {
+      disabledEnrichEventEmitted = true;
+      void recordEnrichmentOutcome({
+        contactId,
+        subtype: 'disabled',
+        endpoint: apptEnrichEndpoint(contactId),
+        httpStatus: null,
+        found: false,
+        calendarId: null,
+        calendarName: null,
+        logOnly: false,
       });
-    return sorted[0] || list[0] || null;
-  } catch (err) {
-    console.warn(`[LP-APPT] fetchLatestAppointment failed for ${contactId}: ${err.message}`);
+      console.log('[LP-APPT] appointment enrichment DISABLED (set APPT_ENRICHMENT_ENABLED=true to enable)');
+    }
     return null;
   }
+
+  const logOnly = apptEnrichmentLogOnly();
+  const endpoint = apptEnrichEndpoint(contactId);
+
+  let appt = null;
+  let subtype = 'not_found';
+  let httpStatus = null;
+  let errorMessage = null;
+
+  try {
+    const res = await sharedGhlFetch('GET', endpoint);
+    httpStatus = 200; // ghlFetch throws on every non-2xx, so reaching here is 2xx.
+
+    // Three envelopes, same handling as the two proven call sites:
+    // [...] | { events: [...] } | { appointments: [...] }
+    const list = (Array.isArray(res) ? res : null) || res?.events || res?.appointments || [];
+    const sorted = Array.isArray(list)
+      ? list
+          .filter(a => a && (a.startTime || a.start_time || a.startsAt))
+          .sort((a, b) => {
+            const ta = new Date(a.startTime || a.start_time || a.startsAt).getTime();
+            const tb = new Date(b.startTime || b.start_time || b.startsAt).getTime();
+            return tb - ta;
+          })
+      : [];
+    appt = sorted[0] || (Array.isArray(list) ? list[0] : null) || null;
+    subtype = appt ? 'ok' : 'not_found';
+  } catch (err) {
+    subtype = 'error';
+    errorMessage = err?.message || String(err);
+    httpStatus = parseGhlErrorStatus(errorMessage);
+    // err.message is `GHL GET <path> → <status>: <body>` — logging it whole
+    // satisfies "log the status code AND the response body". Not truncated here.
+    console.warn(
+      `[LP-APPT] fetchLatestAppointment ${endpoint} failed for ${contactId} ` +
+      `(status=${httpStatus ?? 'n/a'}): ${errorMessage}`
+    );
+  }
+
+  const { calendarId, calendarName } = resolveCalendarFromAppointment(appt);
+
+  if (subtype === 'ok') {
+    console.log(
+      `[LP-APPT] enrichment ok contact=${contactId} calendarId=${calendarId || '(none)'} ` +
+      `calendarName=${calendarName || '(none)'} logOnly=${logOnly}`
+    );
+  } else if (subtype === 'not_found') {
+    // Distinct from 'error': HTTP 200 with a zero-length appointment list.
+    console.log(`[LP-APPT] enrichment not_found contact=${contactId} (200, zero appointments)`);
+  }
+
+  void recordEnrichmentOutcome({
+    contactId, subtype, endpoint, httpStatus,
+    found: Boolean(appt), calendarId, calendarName, errorMessage, logOnly,
+  });
+
+  // ── Gate 2: log-only. The fetch happened and was recorded, but the consumer
+  // still sees null, so the merge in enrichFromGHLContact is unchanged.
+  return logOnly ? null : appt;
 }
 
 async function enrichFromGHLContact(contactId) {
@@ -448,18 +652,12 @@ async function enrichFromGHLContact(contactId) {
   const contact = contactRes?.contact || {};
   const fields = contact.customFields || [];
 
-  // Calendar resolution: appointment.calendarId → name map → appointment.title fallback
-  let calendarId = null;
-  let calendarName = null;
-  if (latestAppt) {
-    calendarId = latestAppt.calendarId || latestAppt.calendar_id || null;
-    if (calendarId) {
-      calendarName = calendarNameFromId(calendarId);
-    }
-    if (!calendarName) {
-      calendarName = latestAppt.calendarName || latestAppt.calendar_name || latestAppt.title || null;
-    }
-  }
+  // Calendar resolution: appointment.calendarId → name map → appointment.title
+  // fallback. Extracted to resolveCalendarFromAppointment (v5.3.0) so the
+  // appt.enrichment_fetch payload records the same calendar_name this caller
+  // receives. Behaviour is identical to the inlined v5.1.6 block it replaces,
+  // including the null-appointment case → both fields null.
+  const { calendarId, calendarName } = resolveCalendarFromAppointment(latestAppt);
 
   return {
     phone: contact.phone || null,
@@ -1943,6 +2141,11 @@ export {
   releaseFailureNotices,
   probeLPForContact,
   fetchLatestAppointment,
+  // Exported 2026-07-28 for the enrichment no-op regression lock — case 10 in
+  // scripts/test-appt-enrichment-fetch.js asserts this returns an identically
+  // shaped object while APPT_ENRICHMENT_ENABLED is off.
+  enrichFromGHLContact,
+  resolveCalendarFromAppointment,
   calendarNameFromId,
   CALENDAR_NAME_MAP,
   flattenWebhookBody,
