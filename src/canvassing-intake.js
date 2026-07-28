@@ -8,6 +8,8 @@
  * the addlead webhook, its response parser, and the SalesRabbit user-id
  * fetch. This module is their deterministic equivalent.
  *
+ * v1.1 (2026-07-28). GHL payload resolution — see resolveIntakeBody.
+ *
  * PIPELINE (sync): normalize time → validate hour → build notes → format
  * phone → addlead → parse inbound id → 200.
  * (async tail): GHL writebacks (inbound id, normalized time, notes block,
@@ -59,6 +61,87 @@ function intakeMode() {
     ? 'live' : 'shadow';
 }
 const isBlank = (v) => v == null || String(v).trim() === '';
+
+// ── GHL payload resolution ────────────────────────────────────────────
+/**
+ * GHL's standard Webhook action does NOT post customData at the top level.
+ * The body carries GHL's own contact keys (contact_id, first_name, phone,
+ * postal_code, contact_source, date_created …) PLUS every custom field
+ * keyed by its DISPLAY NAME ("Preferred Estimate Time", "Promoter",
+ * "Canvassing Notes"), and nests the step's customData under `customData`.
+ * Verified live: system_events ghl.entry_detected shape fingerprints show
+ * customData_keys holding exactly the keys the step declares, with the
+ * declared names absent from body_keys.
+ *
+ * Reading req.body flat therefore yielded undefined for every customData
+ * key that is not also a native GHL key. Only contact_id / first_name /
+ * last_name resolved, by coincidence, because GHL sends those natively.
+ * That is the root cause of 33/33 intake cards between 2026-07-24 and
+ * 2026-07-28 reporting "unparseable_time" with "no phone" and
+ * "Canvasser: ?" on leads that had a phone, a canvasser and a valid time.
+ *
+ * Resolution order per field: customData → native body key → display name.
+ * An unresolved merge token ("{{contact.promoter}}") counts as blank, so a
+ * renamed GHL field degrades to a truthful card instead of a literal one.
+ *
+ * This mirrors the defensive shape handling already used by
+ * entry-event-handler.js (resolveEntryFields) — same lesson, same house
+ * pattern; this module simply predated it.
+ */
+const UNRESOLVED_TOKEN_RE = /\{\{.*?\}\}/;
+
+export function resolveIntakeBody(raw) {
+  const body = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const cd = (body.customData || body.custom_data || body.customValues || {}) || {};
+
+  const from = (...keys) => {
+    for (const k of keys) {
+      for (const src of [cd, body]) {
+        const v = src ? src[k] : undefined;
+        if (v === null || v === undefined) continue;
+        const s = String(v).trim();
+        if (s === '' || UNRESOLVED_TOKEN_RE.test(s)) continue;
+        return v;
+      }
+    }
+    return '';
+  };
+
+  return {
+    fields: {
+      contact_id: from('contact_id', 'contactId', 'id'),
+      first_name: from('first_name', 'firstName', 'First Name'),
+      last_name: from('last_name', 'lastName', 'Last Name'),
+      address1: from('address1', 'Address 1'),
+      city: from('city', 'City'),
+      state: from('state', 'State'),
+      postal_code: from('postal_code', 'zip', 'Postal Code'),
+      phone_raw: from('phone_raw', 'phone', 'Phone'),
+      email: from('email', 'Email'),
+      preferred_estimate_time: from('preferred_estimate_time', 'Preferred Estimate Time'),
+      property_type: from('property_type', 'Property Type'),
+      window_count: from('window_count', 'Window Count'),
+      door_count: from('door_count', 'Door Count'),
+      slider_count: from('slider_count', 'Slider Count'),
+      form_notes: from('form_notes', 'canvassing_notes', 'Canvassing Notes'),
+      promoter: from('promoter', 'Promoter', 'LP Promoter Name'),
+      salesrabbit_id: from('salesrabbit_id', 'SalesRabbit ID (Pilot)', 'Sales Rabbit Lead ID'),
+      pro_id: from('pro_id', 'Pro ID'),
+      source: from('source', 'contact_source', 'Lead Source'),
+      date_created: from('date_created', 'Date Created'),
+      utm_source: from('utm_source'),
+      utm_medium: from('utm_medium'),
+      utm_campaign: from('utm_campaign'),
+      utm_content: from('utm_content'),
+      utm_term: from('utm_term'),
+    },
+    shape: {
+      body_key_count: Object.keys(body).length,
+      customData_keys: Object.keys(cd),
+      nested_customData: Object.keys(cd).length > 0,
+    },
+  };
+}
 
 // ── Time normalization ────────────────────────────────────────────────
 const WALL_RE = /^\s*(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})\s*(AM|PM)\s*$/i;
@@ -269,7 +352,7 @@ export async function writebacks({ b, plan, norm, notes, inboundId }, deps = {})
 export function registerCanvassingIntakeRoutes(app) {
   app.post('/webhook/ghl/canvassing-intake', async (req, res) => {
     const started = Date.now();
-    const b = req.body && typeof req.body === 'object' ? req.body : {};
+    const { fields: b, shape } = resolveIntakeBody(req.body);
     const mode = intakeMode();
 
     let norm, plan;
@@ -283,7 +366,11 @@ export function registerCanvassingIntakeRoutes(app) {
       plan = { action: 'omit', reason: `normalize_error:${err.message}`, hour: null };
     }
 
+    // A card is an operator interrupt — log the payload shape whenever we are
+    // about to raise one, so "the field was missing" can always be told apart
+    // from "we looked in the wrong place" without replaying the webhook.
     if (plan.action !== 'forward') {
+      console.warn(`[CANVASS-INTAKE] flagging ${b.contact_id || '?'} (${plan.reason}) shape=${JSON.stringify(shape)}`);
       if (await claimIntakeNotice({ contactId: b.contact_id, adate: norm.adate || String(b.preferred_estimate_time || '').slice(0, 10), reason: plan.reason })) {
         await sendIntakeCard({ b, plan, mode });
       }
