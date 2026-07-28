@@ -35,13 +35,37 @@
 // evening appointments (≥8pm ET) onto the next UTC day — counts for
 // "tomorrow" would silently include tonight's evening slots.
 //
+// FRESHNESS (fix-pass 2026-07-28 — the recurring false DATA STALE banner):
+//   - The stale gate is CAPACITY_STALE_AFTER_MS and is no longer derived from
+//     the sweep interval. The old max(3 × interval, 15 min) meant shortening
+//     the cadence to 5 min silently TIGHTENED the gate onto its 15-min floor —
+//     3 fast-pass cycles of slack — so three LP timeouts in a row painted DATA
+//     STALE over correct numbers. Unset, the constant reproduces the old
+//     formula exactly.
+//   - The slot sweep's ONE GetSalesSchedule call is timeout-bounded
+//     (CAPACITY_SLOTS_TIMEOUT_MS) and retried (CAPACITY_SLOTS_RETRIES). It is
+//     the sole thing advancing swept_at, and LP 500s ("Execution Timeout
+//     Expired") under our own lead-pass load are routine, not exceptional.
+//     runFastCapacityPass also carries a watchdog (CAPACITY_FAST_WATCHDOG_MS):
+//     a never-settling promise used to wedge fastInProgress permanently and
+//     the board stayed stale until redeploy.
+//   - The lead loop pauses PROPORTIONALLY to the cycle it just finished
+//     (CAPACITY_LEAD_DUTY_RATIO, floored at CAPACITY_LEAD_LOOP_PAUSE_MS,
+//     capped at CAPACITY_LEAD_MAX_PAUSE_MS) and yields to an in-flight fast
+//     pass at page/batch boundaries. A fixed 60s pause after an observed
+//     41.6-min cycle was ~97% duty on LP — the fast pass never got a quiet
+//     window, which is what made its single call fail in the first place.
+//
 // ROUTES (registerCapacityBoardRoutes):
 //   GET  /board/capacity?date=YYYY-MM-DD  — UNAUTHENTICATED read-only board
 //        aggregate (TV kiosk; counts only, zero PII).
-//   GET  /admin/capacity-sweep/status     — last sweep/snapshot summaries.
+//   GET  /admin/capacity-sweep/status     — last sweep/snapshot summaries plus
+//        freshness diagnostics (stale_after_ms, slots_fail_streak,
+//        fast_pass_running_ms, lead_duty_ratio).
 //   POST /admin/capacity-sweep/run        — manual sweep trigger (async).
 //   POST /admin/capacity-snapshot/run     — manual snapshot trigger (async).
-// SCHEDULER (startCapacitySweepScheduler): 15-min sweep + 23:50 ET snapshot.
+// SCHEDULER (startCapacitySweepScheduler): fast pass every
+// CAPACITY_SWEEP_INTERVAL_MS + continuous lead loop + 23:50 ET snapshot.
 
 import supabase from '../supabase.js';
 import { runSQL } from '../admin/supabase-admin.js';
@@ -59,6 +83,31 @@ const FORWARD_DAYS      = parseInt(process.env.CAPACITY_FORWARD_DAYS || '14', 10
 // re-fetched PER LEAD every sweep, so their counts are exact regardless of
 // LP's change-window semantics or its documented internal result cap.
 const NEAR_DAYS         = parseInt(process.env.CAPACITY_NEAR_DAYS || '2', 10);
+
+// Freshness threshold is now INDEPENDENT of sweep cadence. Coupling them meant
+// shortening the interval to 5 min silently tightened the stale gate to the
+// 15-min floor — 3 cycles of slack — so three LP timeouts in a row painted
+// DATA STALE over correct numbers. Falls back to the old formula when unset.
+const STALE_AFTER_MS = parseInt(process.env.CAPACITY_STALE_AFTER_MS || '', 10)
+  || Math.max(3 * SWEEP_INTERVAL_MS, 15 * 60 * 1000);
+
+// The fast pass's ONE LP call gets a hard timeout + retries: it is the sole
+// thing advancing the board's freshness stamp, and LP 500s under our own
+// lead-pass load ("Execution Timeout Expired") are routine, not exceptional.
+const SLOTS_TIMEOUT_MS = parseInt(process.env.CAPACITY_SLOTS_TIMEOUT_MS || '60000', 10);
+const SLOTS_RETRIES    = parseInt(process.env.CAPACITY_SLOTS_RETRIES || '3', 10);
+
+// Force-release the fast-pass lock if a pass exceeds this. Belt-and-braces for
+// a promise that never settles (the per-call timeout is the primary guard).
+const FAST_WATCHDOG_MS = parseInt(process.env.CAPACITY_FAST_WATCHDOG_MS || '600000', 10);
+
+// Lead-pass duty cycle. A fixed 60s pause after a 42-minute cycle is ~97% duty
+// on LP — the fast pass never gets a quiet window. Pause proportional to the
+// cycle just finished, floored at the old constant, capped so the numerator
+// can't fall far behind.
+const LEAD_DUTY_RATIO   = parseFloat(process.env.CAPACITY_LEAD_DUTY_RATIO || '0.25');
+const LEAD_MAX_PAUSE_MS = parseInt(process.env.CAPACITY_LEAD_MAX_PAUSE_MS || '900000', 10);
+const LEAD_YIELD_MAX_MS = parseInt(process.env.CAPACITY_LEAD_YIELD_MAX_MS || '120000', 10);
 
 // Disposition → bucket mapping (Mark, fix-pass 2, 2026-07-22). Every code
 // maps to exactly one bucket; anything unlisted counts in appts only:
@@ -198,7 +247,31 @@ function numeratorSQL(datePredicate) {
 // ─── a. Denominator sweep — GetSalesSchedule → lp_capacity_slots ─────────────
 
 async function sweepCapacitySlots(startDate, endDate) {
-  const res = await getSalesSchedule({ StartDate: startDate, EndDate: endDate, SlrID: 0, BrnID: 'All' });
+  // This ONE call is the sole thing that advances the board's freshness stamp
+  // (swept_at). Unbounded and un-retried, a single LP "Execution Timeout
+  // Expired" 500 froze the stamp for a whole interval — three in a row and the
+  // board painted DATA STALE over correct numbers.
+  let res;
+  let attempts = 0;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= SLOTS_RETRIES; attempt++) {
+    attempts = attempt;
+    try {
+      res = await withTimeout(
+        getSalesSchedule({ StartDate: startDate, EndDate: endDate, SlrID: 0, BrnID: 'All' }),
+        SLOTS_TIMEOUT_MS,
+        `GetSalesSchedule ${startDate}..${endDate}`,
+      );
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      console.warn(`[CapacitySweep] GetSalesSchedule attempt ${attempt}/${SLOTS_RETRIES} failed: ${err.message}`);
+      if (attempt < SLOTS_RETRIES) await sleep(2000 * Math.pow(3, attempt - 1)); // 2s, 6s
+    }
+  }
+  if (lastErr) throw lastErr;
+
   const days = extractArray(res);
   const sweptAt = new Date().toISOString();
 
@@ -246,7 +319,7 @@ async function sweepCapacitySlots(startDate, endDate) {
     .lt('swept_at', sweptAt);
   if (delErr) throw new Error(`lp_capacity_slots stale-row delete failed: ${delErr.message}`);
 
-  return { days: days.length, slots: rows.length, swept_at: sweptAt };
+  return { days: days.length, slots: rows.length, swept_at: sweptAt, attempts };
 }
 
 // ─── b. Numerator sweep — forward-window lead dispositions ───────────────────
@@ -259,8 +332,25 @@ function withTimeout(promise, ms, label) {
   ]).finally(() => clearTimeout(timer));
 }
 
+/**
+ * The lead pass holds LP for tens of minutes at a stretch. The fast pass makes
+ * ONE call and is the only thing advancing board freshness — let it through.
+ * Bounded so a wedged fast pass can never deadlock the lead loop.
+ */
+async function yieldToFastPass(label) {
+  const started = Date.now();
+  while (fastInProgress && Date.now() - started < LEAD_YIELD_MAX_MS) {
+    await sleep(1000);
+  }
+  const waited = Date.now() - started;
+  if (waited >= 1000) {
+    console.log(`[CapacitySweep] lead pass yielded ${Math.round(waited / 1000)}s to fast pass (${label})`);
+  }
+}
+
 async function processInBatches(items, batchSize, handler) {
   for (let i = 0; i < items.length; i += batchSize) {
+    await yieldToFastPass('lead-batch');
     await Promise.allSettled(items.slice(i, i + batchSize).map(handler));
   }
 }
@@ -281,6 +371,7 @@ async function sweepForwardLeadDispositions(windowStart, windowEnd) {
   const stats = { scanned: 0, matched: 0, processed: 0, failed: 0, pages: 0 };
 
   for (let page = 0; page < LEAD_MAX_PAGES; page++) {
+    await yieldToFastPass(`change-page ${startIndex}`);
     let items;
     try {
       const res = await getLeads({
@@ -429,16 +520,20 @@ async function refreshNearWindowLeads(windowStart) {
 // freshness stamp (max swept_at) went stale in healthy operation — the
 // recurring DATA STALE banner. Split:
 //
-//   FAST pass  (every CAPACITY_SWEEP_INTERVAL_MS): slots sweep (ONE LP call)
-//              + forward market assignments. Seconds. Keeps swept_at — and
-//              therefore the board's freshness — advancing every interval.
-//   LEAD pass  (continuous loop, 60s pause between cycles): near-window
-//              per-lead refresh + change-window sweep + assignments. Runs
-//              back-to-back at whatever pace LP allows; the board's numerator
-//              is at most one cycle (~10-20 min) behind LP, and the fast
-//              pass keeps re-aggregating whatever it has landed so far.
+//   FAST pass  (every CAPACITY_SWEEP_INTERVAL_MS): slots sweep (ONE LP call,
+//              timeout-bounded + retried) + forward market assignments.
+//              Seconds. Keeps swept_at — and therefore the board's freshness —
+//              advancing every interval.
+//   LEAD pass  (continuous loop, pause proportional to the cycle just
+//              finished): near-window per-lead refresh + change-window sweep +
+//              assignments. Runs at whatever pace LP allows and yields to an
+//              in-flight fast pass at page/batch boundaries; the board's
+//              numerator is at most one cycle behind LP, and the fast pass
+//              keeps re-aggregating whatever it has landed so far.
 
 let fastInProgress = false;
+let fastStartedAt = 0;
+let slotsFailStreak = 0;
 let leadInProgress = false;
 let lastFastSummary = null;
 let lastLeadSummary = null;
@@ -446,8 +541,18 @@ let lastSnapshotSummary = null;
 
 /** Fast pass: denominator + assignments. Seconds — safe on a strict interval. */
 export async function runFastCapacityPass() {
-  if (fastInProgress) return { skipped: true, reason: 'fast_pass_in_progress' };
+  if (fastInProgress) {
+    const runningMs = Date.now() - fastStartedAt;
+    if (runningMs < FAST_WATCHDOG_MS) {
+      return { skipped: true, reason: 'fast_pass_in_progress', running_ms: runningMs };
+    }
+    // A never-settling LP promise used to wedge this lock permanently: every
+    // later tick returned 'skipped' and the board stayed stale until redeploy.
+    console.error(`[CapacitySweep] WATCHDOG: fast pass stuck ${Math.round(runningMs / 1000)}s — force-releasing lock`);
+    fastInProgress = false;
+  }
   fastInProgress = true;
+  fastStartedAt = Date.now();
   const startedAt = Date.now();
   const start = todayET();
   const end = addDays(start, FORWARD_DAYS);
@@ -455,9 +560,12 @@ export async function runFastCapacityPass() {
   try {
     try {
       summary.slots = await sweepCapacitySlots(start, end);
+      slotsFailStreak = 0;
     } catch (err) {
-      summary.slots = { error: err.message };
-      console.error('[CapacitySweep] slot sweep failed:', err.message);
+      slotsFailStreak++;
+      summary.slots = { error: err.message, fail_streak: slotsFailStreak };
+      const level = slotsFailStreak >= 2 ? console.error : console.warn;
+      level(`[CapacitySweep] slot sweep failed (streak ${slotsFailStreak}): ${err.message} — board freshness stamp is NOT advancing`);
     }
     try {
       const assign = await computeMarketAssignments({ scope: 'forward_appts' });
@@ -677,16 +785,9 @@ async function buildBoardResponse(date) {
   }
 
   const lastSweepAt = sweepRows?.[0]?.last_sweep_at || null;
-  // Stale threshold: 3× the interval, floor 15 min. A full sweep (near-window
-  // refresh + change-window pages) can legitimately run LONGER than the
-  // interval — the overlap guard then skips ticks, so consecutive sweep
-  // STARTS can be ~2 intervals apart in healthy operation. 2× flagged that
-  // as stale (observed live 2026-07-22: banner at 12 min on a 5-min
-  // cadence with nothing wrong). 3× + floor keeps the flag meaningful:
-  // a genuinely dead sweep still surfaces within 15 min.
-  const staleAfterMs = Math.max(3 * SWEEP_INTERVAL_MS, 15 * 60 * 1000);
+  // Threshold is env-governed and independent of sweep cadence (see STALE_AFTER_MS).
   const stale = !lastSweepAt
-    || (Date.now() - new Date(lastSweepAt).getTime()) > staleAfterMs;
+    || (Date.now() - new Date(lastSweepAt).getTime()) > STALE_AFTER_MS;
 
   return {
     date,
@@ -695,6 +796,7 @@ async function buildBoardResponse(date) {
     sweep_interval_ms: SWEEP_INTERVAL_MS,
     forward_days: FORWARD_DAYS,
     stale,
+    stale_after_ms: STALE_AFTER_MS,
     offices,
     unresolved,                    // always present — may not be hidden
     totals: { ...totals, fill_pct: fillPct(totals) },
@@ -723,6 +825,12 @@ export function registerCapacityBoardRoutes(app) {
       fast_pass_in_progress: fastInProgress,
       lead_pass_in_progress: leadInProgress,
       interval_ms: SWEEP_INTERVAL_MS,
+      stale_after_ms: STALE_AFTER_MS,
+      slots_fail_streak: slotsFailStreak,
+      slots_timeout_ms: SLOTS_TIMEOUT_MS,
+      slots_retries: SLOTS_RETRIES,
+      fast_pass_running_ms: fastInProgress ? Date.now() - fastStartedAt : null,
+      lead_duty_ratio: LEAD_DUTY_RATIO,
       forward_days: FORWARD_DAYS,
       confirmed_codes: CONFIRMED_CODES,
       at_risk_codes: AT_RISK_CODES,
@@ -784,12 +892,19 @@ export function startCapacitySweepScheduler() {
   // Lead pass: continuous chained loop — each cycle starts only after the
   // previous one finishes, so a long cycle delays (never stacks) the next.
   const leadLoop = async () => {
+    let elapsed = 0;
     try {
-      await runLeadRefreshPass();
+      const summary = await runLeadRefreshPass();
+      elapsed = Number(summary?.elapsed_ms) || 0;
     } catch (err) {
       console.error('[CapacitySweep] lead pass failed:', err.message);
     }
-    leadLoopTimer = setTimeout(leadLoop, LEAD_LOOP_PAUSE_MS);
+    const pause = Math.min(
+      LEAD_MAX_PAUSE_MS,
+      Math.max(LEAD_LOOP_PAUSE_MS, Math.round(elapsed * LEAD_DUTY_RATIO)),
+    );
+    console.log(`[CapacitySweep] lead loop pausing ${Math.round(pause / 1000)}s (last cycle ${Math.round(elapsed / 1000)}s, duty ratio ${LEAD_DUTY_RATIO})`);
+    leadLoopTimer = setTimeout(leadLoop, pause);
   };
   leadLoopTimer = setTimeout(leadLoop, 30000);
 
