@@ -101,6 +101,8 @@ import { isPlaceholderName, EMAIL_ASKED_TAG } from '../../services/identity-extr
 import { emitEvent } from '../../event-emitter.js';
 import supabase from '../../supabase.js';
 import { syncCancelledAppointmentState, reconcileGhlOnlyApptTag } from './appointment-field-sync.js';
+import { findExistingAppointment, emitSlotCheckEvent, isSlotCheckEnabled } from '../../appointments/slot-check.js';
+import { claimAppointmentCreate, releaseAppointmentCreate } from '../../services/appointment-sync-claim.js';
 
 // Tags cleared once a booking lands (or the flow otherwise terminates) so the
 // post-qualification affirmative-gate bypass (intent-classifier.js) doesn't
@@ -364,21 +366,33 @@ function sameStartTime(a, b) {
 }
 
 /**
- * v3.4 — Double-book guard. Returns an already-existing active future
- * appointment on `calendarId` for the contact, or null. Reuses the live
- * appointment lookup. On lookup failure returns null (fail-open: we'd rather
- * risk a rare duplicate than block a legitimate booking on a transient API
- * error — GHL also rejects exact-overlap slots server-side).
+ * v3.4 — Double-book guard. Finds an already-existing active future appointment
+ * on `calendarId` for the contact. Reuses the live appointment lookup.
+ *
+ * Still FAIL-OPEN: on lookup failure the caller proceeds to book, because we'd
+ * rather risk a rare duplicate than block a legitimate booking on a transient
+ * API error (GHL also rejects exact-overlap slots server-side). What changed
+ * (slot-uniqueness work) is that the failure is now REPORTED rather than
+ * swallowed — `lookupFailed` lets the caller emit an appt.slot_check
+ * 'query_failed' event, so the one path that can still produce a duplicate is
+ * countable instead of invisible.
+ *
+ * @returns {Promise<{ appointment: object|null, lookupFailed: boolean }>}
  */
 async function findExistingAppointmentOnCalendar(contactId, calendarId) {
-  if (!contactId || !calendarId) return null;
+  if (!contactId || !calendarId) return { appointment: null, lookupFailed: false };
   try {
     const upcoming = await fetchUpcomingAppointments(contactId);
-    if (!Array.isArray(upcoming)) return null;
-    return upcoming.find((a) => a.calendar_id === calendarId) || null;
+    // null (not []) means the lookup itself failed — a non-ok response, a
+    // missing API key, or a timeout. An empty calendar returns [].
+    if (!Array.isArray(upcoming)) return { appointment: null, lookupFailed: true };
+    return {
+      appointment: upcoming.find((a) => a.calendar_id === calendarId) || null,
+      lookupFailed: false,
+    };
   } catch (err) {
     console.warn(`[ActionExecutor] double-book guard lookup threw for ${contactId}: ${err.message}`);
-    return null;
+    return { appointment: null, lookupFailed: true };
   }
 }
 
@@ -397,13 +411,29 @@ export async function executeBookAppointment(action, context) {
   //   • different time    → RESCHEDULE the existing object in place (PUT), so the
   //                         contact never ends up with two objects on one calendar.
   // Only when there is no active same-calendar appointment do we POST a new one.
-  const existing = await findExistingAppointmentOnCalendar(contactId, calendarId);
+  const { appointment: existing, lookupFailed } = await findExistingAppointmentOnCalendar(contactId, calendarId);
+
+  // Fail-open is preserved (we fall through and book), but no longer silent.
+  if (lookupFailed && isSlotCheckEnabled()) {
+    console.warn(`[ActionExecutor] slot check: live lookup failed for ${contactId} on ${calendarId} — booking anyway (fail-open)`);
+    await emitSlotCheckEvent('query_failed', {
+      contactId, calendarId, startTime, matched: null,
+      extra: { site: 'executeBookAppointment', stage: 'double_book_guard' },
+    });
+  }
+
   if (existing) {
     if (sameStartTime(existing.start_time, startTime)) {
       console.log(`[ActionExecutor] ⏭️  idempotent_skip: contact ${contactId} already has appointment ${existing.appointment_id} on calendar ${calendarId} at the requested time (${existing.start_time}) — no-op.`);
       await removeGHLTags(contactId, BOOKING_FLOW_TAGS).catch(() => {});
       if (isGhlOnlyCalendarId(calendarId)) {
         await applyGHLTag(contactId, GHL_ONLY_APPT_TAG).catch(() => {});
+      }
+      if (isSlotCheckEnabled()) {
+        await emitSlotCheckEvent('noop_already_exists', {
+          contactId, calendarId, startTime, matched: existing,
+          extra: { site: 'executeBookAppointment', reason: 'idempotent_skip' },
+        });
       }
       return {
         action: 'appointment_book_skipped_existing',
@@ -430,6 +460,12 @@ export async function executeBookAppointment(action, context) {
     }
     if (payload.qualifying_data) {
       await persistQualifyingData(contactId, payload.qualifying_data).catch(() => {});
+    }
+    if (isSlotCheckEnabled()) {
+      await emitSlotCheckEvent('updated', {
+        contactId, calendarId, startTime, matched: existing,
+        extra: { site: 'executeBookAppointment', reason: 'rescheduled_existing', previousStartTime: existing.start_time },
+      });
     }
     return {
       action: 'appointment_rescheduled_existing',
@@ -505,10 +541,53 @@ export async function executeBookAppointment(action, context) {
     await removeGHLTags(contactId, [SPOUSE_GATE_TAG]).catch(() => {});
   }
 
+  // Cross-worker create claim. The calendar guard above reads GHL live, but the
+  // duplicates it misses are read-after-write: I.LP-IN (or another worker)
+  // books, and this handler's read lands before GHL has propagated it. The
+  // claim is the existing answer to that window — the reconciler has taken it
+  // since 2026-07-11. It is FAIL-OPEN by design (see appointment-sync-claim.js):
+  // a claim-infra error lets the booking through rather than stranding it.
+  const slotMs = Date.parse(startTime);
+  let claimed = false;
+  if (isSlotCheckEnabled()) {
+    const claim = await claimAppointmentCreate(contactId, slotMs);
+    if (!claim.claimed) {
+      console.log(`[ActionExecutor] ⏭️  slot claim held for ${contactId}@${startTime} — another worker is creating this slot; skipping.`);
+      await emitSlotCheckEvent('noop_already_exists', {
+        contactId, calendarId, startTime, matched: null,
+        extra: { site: 'executeBookAppointment', reason: 'create_claim_held' },
+      });
+      return {
+        action: 'appointment_book_skipped_existing',
+        appointment_id: null,
+        calendar_id: calendarId,
+        calendar_name: title,
+        contact_id: contactId,
+        start_time: startTime,
+        skipped_reason: 'create_claim_held',
+      };
+    }
+    claimed = claim.reason === 'claimed';
+  }
+
   console.log(`[ActionExecutor] Booking appointment: calendar=${calendarId}, contact=${contactId}, start=${startTime}, status=${status}${ignoreFreeSlotValidation ? ', override_availability=true' : ''}`);
-  const result = await ghlFetch('POST', '/calendars/events/appointments', body);
+  let result;
+  try {
+    result = await ghlFetch('POST', '/calendars/events/appointments', body);
+  } catch (err) {
+    // Release so the executor's retry can re-attempt this slot.
+    if (claimed) await releaseAppointmentCreate(contactId, slotMs).catch(() => {});
+    throw err;
+  }
   const appointmentId = result?.id || result?.appointment?.id || null;
   console.log(`[ActionExecutor] ✅ Appointment booked: id=${appointmentId}, calendar=${title}`);
+
+  if (isSlotCheckEnabled()) {
+    await emitSlotCheckEvent('created', {
+      contactId, calendarId, startTime, matched: null,
+      extra: { site: 'executeBookAppointment', appointmentId },
+    });
+  }
 
   // v3.1: persist qualifying data after successful booking (best-effort).
   let qualifyingDataFieldsWritten = 0;
@@ -849,11 +928,47 @@ export async function executeRescheduleAppointment(action, context) {
     bookCalendarName = built.title;
     bookCalendarId = built.calendarId;
     bookStatus = built.status;
-    console.log(`[ActionExecutor] Reschedule step 1/2: booking new appointment FIRST, calendar=${built.calendarId}, start=${built.startTime}${built.ignoreFreeSlotValidation ? ', override_availability=true' : ''}`);
-    const bookResult = await ghlFetch('POST', '/calendars/events/appointments', built.body);
-    newAppointmentId = bookResult?.id || bookResult?.appointment?.id || null;
-    if (!newAppointmentId) throw new Error('Booking returned no appointment id');
-    console.log(`[ActionExecutor] ✅ New appointment booked id=${newAppointmentId}, status=${built.status}`);
+    // Slot-uniqueness gate. Unlike executeBookAppointment this path had NO live
+    // GHL read at all — it booked first and cancelled the old appointment after,
+    // so a slot already held by I.LP-IN (or by a prior reschedule) was never
+    // detected. Reuses the target appointment when the slot is already taken
+    // instead of creating a second object on it.
+    if (isSlotCheckEnabled()) {
+      const check = await findExistingAppointment({
+        contactId, calendarId: built.calendarId, startTime: built.startTime,
+      });
+
+      if (check.outcome === 'match' && check.appointment.appointment_id !== oldId) {
+        console.log(`[ActionExecutor] ⏭️  Reschedule target slot already held by ${check.appointment.appointment_id} for ${contactId} at ${built.startTime} — reusing it, no new object.`);
+        await emitSlotCheckEvent('noop_already_exists', {
+          contactId, calendarId: built.calendarId, startTime: built.startTime,
+          matched: check.appointment,
+          extra: { site: 'executeRescheduleAppointment', oldAppointmentId: oldId },
+        });
+        newAppointmentId = check.appointment.appointment_id;
+      } else if (check.outcome === 'error') {
+        // Fail-open, consistent with the booking path — but countable.
+        console.warn(`[ActionExecutor] reschedule slot check failed for ${contactId} (${check.reason}) — booking anyway (fail-open)`);
+        await emitSlotCheckEvent('query_failed', {
+          contactId, calendarId: built.calendarId, startTime: built.startTime, matched: null,
+          extra: { site: 'executeRescheduleAppointment', reason: check.reason },
+        });
+      }
+    }
+
+    if (!newAppointmentId) {
+      console.log(`[ActionExecutor] Reschedule step 1/2: booking new appointment FIRST, calendar=${built.calendarId}, start=${built.startTime}${built.ignoreFreeSlotValidation ? ', override_availability=true' : ''}`);
+      const bookResult = await ghlFetch('POST', '/calendars/events/appointments', built.body);
+      newAppointmentId = bookResult?.id || bookResult?.appointment?.id || null;
+      if (!newAppointmentId) throw new Error('Booking returned no appointment id');
+      console.log(`[ActionExecutor] ✅ New appointment booked id=${newAppointmentId}, status=${built.status}`);
+      if (isSlotCheckEnabled()) {
+        await emitSlotCheckEvent('created', {
+          contactId, calendarId: built.calendarId, startTime: built.startTime, matched: null,
+          extra: { site: 'executeRescheduleAppointment', appointmentId: newAppointmentId, oldAppointmentId: oldId },
+        });
+      }
+    }
   } catch (err) {
     // New booking failed → DO NOT cancel the old slot. The lead keeps their
     // existing appointment. Escalate to a rep and return a clean failure.

@@ -36,6 +36,7 @@ import { registerEngagementRoutes } from './nurture/nurture-engagement.js';
 import { registerAppointmentNotificationRoutes } from './notifications/appointment-notifications.js';
 import { registerContractCancellationNotificationRoutes } from './notifications/cancellation-notifications.js';
 import { five9WebhookHandler } from './five9-events.js';
+import { createAppointmentFromLpHandler } from './appointments/booking-endpoint.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // WEBHOOK SIGNATURE VERIFICATION (optional but recommended)
@@ -1273,6 +1274,21 @@ export function registerRestApiRoutes(app, authenticate) {
   // FIVE9_WEBHOOK_ENABLED=false → 200 with no insert. See src/five9-events.js.
   app.post('/webhook/five9-event', five9WebhookHandler);
   console.log('[REST API] Registered: POST /webhook/five9-event (header-auth, flag-gated, Five9 ESS raw capture + normalize)');
+
+  // ═══════════════════════════════════════════════════════════════
+  // POST /webhook/ghl/create-appointment-from-lp — delegated booking
+  // ═══════════════════════════════════════════════════════════════
+  // Lets GHL workflow I.LP-IN book through LP MCP's slot-uniqueness check
+  // instead of its native appointment_booking nodes (which all set
+  // ignoreFreeSlots:true and are the `source = workflow` half of the
+  // double-booked slots). Auth via x-appt-booking-key (constant-time, inside
+  // the handler — mirrors the five9-event pattern), fail-closed when
+  // APPT_BOOKING_ENDPOINT_KEY is unset. 503 while APPT_SLOT_CHECK_ENABLED
+  // is not 'true', so a branch wired up before enable fails loudly in the
+  // workflow rather than quietly double-booking.
+  // Returns { outcome: created|updated|noop_already_exists|error } to branch on.
+  app.post('/webhook/ghl/create-appointment-from-lp', createAppointmentFromLpHandler);
+  console.log('[REST API] Registered: POST /webhook/ghl/create-appointment-from-lp (header-auth, flag-gated, slot-checked delegated booking)');
 
   // ═══════════════════════════════════════════════════════════════
   // /api/service-area/lookup — Zip → Market routing for HDL.2
