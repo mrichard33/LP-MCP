@@ -113,6 +113,26 @@ async function resolveLdsId(contactId) {
 }
 
 /**
+ * 2026-07-29 — the contact is unreachable (deleted, or outside this token's
+ * location), so the stored link is wrong. Clear it so the orphan leaves the
+ * work set instead of being retried on every future booking.
+ *
+ * Scoped to the single contact id: this runs once per guard invocation, not in
+ * a bulk loop, so it needs no per-cycle breaker (unlike ghl-field-sync.js).
+ */
+async function clearUnreachableLink(contactId, ldsId) {
+  try {
+    const { data } = await supabase.from('lp_leads')
+      .update({ ghl_contact_id: null, ghl_tag_applied: false, ghl_fields_hash: null, ghl_link_source: null })
+      .eq('ghl_contact_id', contactId)
+      .select('lp_lead_id');
+    console.warn(`[DispGuard] GHL contact ${contactId} unreachable — cleared link from ${data?.length || 0} lp_leads row(s) (lds_id=${ldsId ?? 'none'})`);
+  } catch (err) {
+    console.warn(`[DispGuard] link clear failed for ${contactId}: ${err.message}`);
+  }
+}
+
+/**
  * Live LP disposition for a lead. Returns the code string, or null when the
  * lead/disposition can't be extracted (treated as unverifiable — no mutation).
  * Throws only what getLeadByLdsId throws (circuit open, timeout, HTTP error).
@@ -174,7 +194,13 @@ export async function checkDispositionStalenessOnBooking(contactId, { calendarId
         fieldWriteResult = await updateGHLContactFields(contactId, [
           { id: DISPOSITION_FIELD_ID, field_value: String(lpCode) },
         ]);
-        outcome = 'refreshed_from_lp';
+        // 2026-07-29: fieldWriteResult was captured for telemetry but never
+        // tested, so outcome claimed 'refreshed_from_lp' even when the write
+        // returned 'not_found' or false. Report what actually happened.
+        outcome = fieldWriteResult === true
+          ? 'refreshed_from_lp'
+          : (fieldWriteResult === 'not_found' ? 'ghl_contact_unreachable' : 'ghl_write_failed');
+        if (fieldWriteResult === 'not_found') await clearUnreachableLink(contactId, ldsId);
       } else {
         // LP still holds the same terminal code, but the contact just booked:
         // the lead re-engaged and the mirror is event-adjacent state. Clear it
@@ -182,6 +208,15 @@ export async function checkDispositionStalenessOnBooking(contactId, { calendarId
         fieldWriteResult = await updateGHLContactFields(contactId, [
           { id: DISPOSITION_FIELD_ID, field_value: '' },
         ]);
+        if (fieldWriteResult !== true) {
+          // Same defect as the branch above: don't claim the mirror was
+          // cleared when GHL rejected the write. Skip the audit note too —
+          // it would assert a clear that never happened.
+          outcome = fieldWriteResult === 'not_found' ? 'ghl_contact_unreachable' : 'ghl_write_failed';
+          if (fieldWriteResult === 'not_found') await clearUnreachableLink(contactId, ldsId);
+          console.warn(`[DispGuard] mirror clear FAILED for ${contactId} (result=${fieldWriteResult}) — stale terminal left in place`);
+          return { action: outcome, contact_id: contactId, lp_lead_id: ldsId ?? null };
+        }
         await addGHLNote(contactId,
           `[DISP GUARD] disposition mirror cleared on rebook — stale CXL guard\n` +
           `Mirror held terminal "${mirrorCode}" (LP lead ${ldsId} agrees) but the contact just booked` +

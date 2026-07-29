@@ -389,15 +389,36 @@ function buildCustomFields(lead) {
 
 async function enrichLeads(rows) {
   let n = 0;
+  let notFound = 0;
   for (const lead of rows) {
     try {
       const contact = await matchContact(lead);     // skip on no match — never create
       if (!contact) continue;
       const cf = buildCustomFields(lead);
-      if (cf.length && (await updateGHLContactFields(contact.id, cf))) n++; // customFields ONLY
+      if (!cf.length) continue;
+      // 2026-07-29: was `if (cf.length && (await updateGHLContactFields(...))) n++`.
+      // updateGHLContactFields returns the TRUTHY string 'not_found' when the
+      // contact is unreachable, so bare truthiness counted a failed write as a
+      // successful enrichment. Strict === true is the only success.
+      const result = await updateGHLContactFields(contact.id, cf); // customFields ONLY
+      if (result === true) {
+        n++;
+      } else if (result === 'not_found') {
+        // No stored link to clear — contact.id came from a live searchGHLContact
+        // against GHL_LOCATION_ID moments ago, so an unreachable contact here
+        // means the search and the write disagree about location. That is a
+        // configuration fault, not a dead contact; surface it loudly.
+        notFound++;
+        console.warn(`[I.LG] enrich lead ${lead.lead_id}: GHL contact ${contact.id} unreachable (search-derived id rejected on write) — not counted`);
+      } else {
+        console.warn(`[I.LG] enrich lead ${lead.lead_id}: GHL field write returned ${result} for ${contact.id} — not counted`);
+      }
     } catch (err) {
       console.warn(`[I.LG] enrich lead ${lead.lead_id} failed: ${err.message}`);
     }
+  }
+  if (notFound > 0) {
+    console.error(`[I.LG] ${notFound}/${rows.length} enrichment targets were unreachable — check GHL_LOCATION_ID and token scope`);
   }
   return n;
 }

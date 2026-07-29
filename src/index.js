@@ -501,10 +501,15 @@ async function runMigrations() {
     await runSQL(`ALTER TABLE lp_notes
               ADD COLUMN IF NOT EXISTS ghl_note_push_attempts integer NOT NULL DEFAULT 0,
               ADD COLUMN IF NOT EXISTS ghl_note_push_error    text,
-              ADD COLUMN IF NOT EXISTS ghl_note_push_terminal boolean NOT NULL DEFAULT false;
+              ADD COLUMN IF NOT EXISTS ghl_note_push_terminal boolean NOT NULL DEFAULT false,
+              ADD COLUMN IF NOT EXISTS note_origin            text NOT NULL DEFAULT 'lp';
             CREATE INDEX IF NOT EXISTS idx_lp_notes_pending
               ON lp_notes (created_at_lp)
-              WHERE ghl_note_pushed = false AND ghl_note_push_terminal = false;`);
+              WHERE ghl_note_pushed = false AND ghl_note_push_terminal = false;
+            CREATE INDEX IF NOT EXISTS idx_lp_notes_origin
+              ON lp_notes (note_origin) WHERE note_origin <> 'lp';
+            ALTER TABLE ghl_note_log
+              ADD COLUMN IF NOT EXISTS lp_write_confirmed boolean;`);
     console.log('[Migration] note push terminal state (sql/050) ready');
   } catch (err) {
     console.error('[Migration] note push terminal state FAILED (pushNotesToGHL selects on ghl_note_push_terminal — apply sql/050 manually):', err.message);
