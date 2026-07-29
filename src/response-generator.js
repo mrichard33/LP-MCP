@@ -1333,6 +1333,34 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     }
   }
 
+  // ─── ACKNOWLEDGMENT-ONLY CONDUCT (2026-07-29 — escalate_to_rep) ───
+  // The responder is SUPPOSED to answer an escalation — rule 106's own notes
+  // record that fast_track_booking was removed from the stand-down list on
+  // 2026-07-06 precisely so contacts got "a normal (logistics-style) reply
+  // instead of silence", and ESC_EXISTING_CUSTOMER's notes say "the responder
+  // handles the acknowledgment per its never-sell customer conduct."
+  //
+  // Its only defect was having a SINGLE mode: full sales conduct. On Kelly the
+  // analyzer said escalate_to_rep and the bot replied with a booking push
+  // stacked on top of the human escalation. Silence would have been no better
+  // — she had already been waiting four days, and going quiet again is how the
+  // company failed her in the first place. So: one acknowledgment, no selling.
+  //
+  // The blanket rule-106 stand-down shipped as a same-day stopgap. This block
+  // is what replaces it; see the post-merge SQL in the PR body.
+  const ackOnly = opts.recommendedAction === 'escalate_to_rep';
+  if (ackOnly) {
+    const owner = resolveReplySenderName(context) || (context.lp?.rep_name ? String(context.lp.rep_name) : null);
+    parts.push(`\n═══════ ACKNOWLEDGMENT-ONLY CONDUCT — HARD OVERRIDE (highest authority) ═══════`);
+    parts.push(`The analyzer routed this conversation to a HUMAN (recommended_action = escalate_to_rep${opts.escalationCategory ? `, category ${opts.escalationCategory}` : ''}). A person owns the next real move. Your ONLY job is a brief acknowledgment so the lead is not left in silence — you are NOT handling this conversation.`);
+    parts.push(`YOU MAY: confirm you received and understood what they actually said${owner ? `; name the person who now owns it (${owner})` : ''}; say a person will follow up.`);
+    parts.push(`YOU MUST NOT: propose, offer, or ask about any appointment or time. Include any link. Ask ANY question. Make any next-step ask of the lead. Use any story arc, authority injection, proof point, differentiation, or persuasion framing of any kind. Pitch or sell anything.`);
+    parts.push(`⛔ NEVER COMMIT TO A TIMELINE. Do not say today, this afternoon, tonight, tomorrow, "within the hour", "in the next N hours", "shortly", "right away", or any other promise about WHEN a human will respond. The message that caused this rule told a customer "your estimate gets to you today" — a promise this system has no ability to keep, on top of four days of silence. State that a person will follow up; never state when.`);
+    parts.push(`LENGTH: at most TWO sentences. Shorter is better. No subject-line theatrics, no sign-off flourish.`);
+    parts.push(`This overrides FAST_TRACK, the funnel stage conduct, the buyer stage, any SCRIPT DIRECTIVE, and every booking instruction elsewhere in this prompt.`);
+    parts.push(`═══════ END ACKNOWLEDGMENT-ONLY CONDUCT ═══════`);
+  }
+
   // ─── POST-APPOINTMENT CONDUCT (2026-07-29 — Kelly Callahan incident) ───
   // Derived from LP ground truth, which the concurrent rule fan-out cannot
   // write. Emitted BEFORE the fast-track directive so the ban is established
@@ -1365,7 +1393,7 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     parts.push(`═══════ END POST-APPOINTMENT CONDUCT ═══════`);
   }
 
-  if (fastTrack && !postAppt.post) {
+  if (fastTrack && !postAppt.post && !ackOnly) {
     parts.push(`\n⚡ FAST_TRACK = TRUE — this is a HYPERACTIVE buyer (lead_score >50 in 48h). Skip education. Apply BOOKING — ASK-FIRST PROTOCOL with TWO specific time slots. Do NOT punt to a calendar widget.`);
   } else if (fastTrack) {
     parts.push(`\n⚡ FAST_TRACK is set, but this contact is POST-APPOINTMENT — the fast-track BOOKING push is SUPPRESSED. Keep the urgency (reply fast, be concrete, no education filler); drop the booking ask entirely.`);
@@ -2235,6 +2263,34 @@ function bodyCarriesLink(message) {
   return URL_RX.test(s) || BARE_MERGE_TAG_RX.test(s);
 }
 
+// ─── Timeline promises in acknowledgment replies (2026-07-29) ────────
+// The prompt bans these, but a prompt is a request and this is a promise made
+// on the company's behalf. Kelly was told "your estimate gets to you today" by
+// a system with no ability to guarantee it, after four days of silence. So the
+// ban is also enforced deterministically on the generated body.
+const TIMELINE_PROMISE_PATTERNS = [
+  /\b(?:to|with)\s+you\s+today\b/i,
+  /\b(?:today|tonight|tomorrow|this\s+(?:morning|afternoon|evening))\b/i,
+  /\bwithin\s+(?:the\s+)?(?:next\s+)?(?:hour|\d+\s*(?:hours?|minutes?|days?|business\s+days?))\b/i,
+  /\bin\s+the\s+next\s+\d+\s*(?:hours?|minutes?|days?)\b/i,
+  /\b(?:right\s+away|shortly|first\s+thing|by\s+(?:end\s+of\s+day|eod|close\s+of\s+business))\b/i,
+  /\bwithin\s+\d+\s*(?:hrs?|hours?|mins?|minutes?)\b/i,
+];
+
+/**
+ * Timeline commitments found in an acknowledgment body. Pure; exported for
+ * tests. Non-empty means the reply promised WHEN a human would respond.
+ */
+export function findTimelinePromises(message) {
+  const s = String(message || '');
+  const hits = [];
+  for (const re of TIMELINE_PROMISE_PATTERNS) {
+    const m = s.match(re);
+    if (m) hits.push(m[0]);
+  }
+  return hits;
+}
+
 /**
  * Strip "at the link below"-style references when no link is present.
  * Pure; exported for tests.
@@ -2767,6 +2823,10 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // 2026-07-29: decision-time state — outranks the live read for stage tag,
       // buyer stage, and the post-appointment verdict.
       contextSnapshot,
+      // 2026-07-29: analyzer verdict, stamped at queue time. escalate_to_rep
+      // switches the responder into acknowledgment-only conduct.
+      recommendedAction: opts.recommendedAction || null,
+      escalationCategory: opts.escalationCategory || null,
       identityState,
       bookingGate,
       serviceArea,
@@ -2838,6 +2898,18 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
 
   // D5 (2026-07-29): "...is at the link below" with no link below it.
   validated.message = stripDanglingLinkReferences(validated.message);
+
+  // Acknowledgment replies must never promise WHEN a human will respond. The
+  // prompt bans it; this enforces it. Throwing routes to the retry-then-safe-
+  // fallback loop, so the lead still gets an acknowledgment — one that does
+  // not commit the company to a deadline it has not agreed to.
+  if (opts.recommendedAction === 'escalate_to_rep') {
+    const promises = findTimelinePromises(validated.message);
+    if (promises.length) {
+      console.error(`[ResponseGenerator] ⛔ timeline promise in escalation acknowledgment for ${contactId}: ${promises.join(', ')}`);
+      throw new Error(`timeline_promise_in_acknowledgment: ${promises.join(', ')}`);
+    }
+  }
 
   const mergeTagInMessage = BARE_MERGE_TAG_RX.test(validated.message);
   const availSummary = availability
