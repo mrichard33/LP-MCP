@@ -1043,7 +1043,30 @@ export function formatRepFirstName(raw) {
 }
 
 /** The contact's own rep first name, or null for company voice. Pure. */
-export function resolveReplySenderName(context) {
+// The agentic reply is sent AS THE IN-OFFICE REP — one person (Mark), from the
+// office inbox, for every contact in the location. It is NOT sent as the
+// contact's field sales rep, who never authors these emails. This is why
+// custom_values.rep_name is a single location-level global: as the SENDER it
+// was always correct. Its only defect was shipping as an unresolved merge tag
+// in the body, so we resolve it server-side and interpolate a literal name.
+//
+// Configurable because the in-office rep is a person who can change; the
+// default tracks the location's "Rep Name" custom value (SsBG7j5KQAIP1SFP2Sca
+// = "Mark"). Keep the two in sync if that value is ever changed in GHL.
+const IN_OFFICE_SENDER_NAME = process.env.AGENTIC_REPLY_SENDER_NAME || 'Mark';
+
+/** The in-office rep the agentic reply is sent as. Never the field rep. */
+export function resolveReplySenderName() {
+  return formatRepFirstName(IN_OFFICE_SENDER_NAME);
+}
+
+/**
+ * The FIELD sales rep who owns this contact's deal — the human referenced in
+ * the body ("Beverly has your file"), and the one named when a conversation is
+ * escalated. NEVER the sender: Beverly does not write these emails, Mark does.
+ * Pure.
+ */
+export function resolveOwningRepName(context) {
   const candidates = [
     context?.lead?.rep_display_name,
     context?.lead?.lp_rep_name,
@@ -1285,7 +1308,7 @@ async function getRecentEdits(intentClass, limit = RECENT_EDITS_LIMIT) {
 // PROMPT BUILDER (v2.7.8 — adds EXISTING APPOINTMENTS block)
 // ═══════════════════════════════════════════════════════════════════
 
-function buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack, trafficTemp, availability, opts = {}) {
+export function buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack, trafficTemp, availability, opts = {}) {
   const parts = [];
 
   parts.push(`CHANNEL: ${channel.toUpperCase()}`);
@@ -1302,6 +1325,12 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
 
   parts.push(`\nTRAFFIC TEMPERATURE: ${trafficTemp.toUpperCase()} — calibrate hook intensity per Traffic Secrets section.`);
 
+  // Acknowledgment-only conduct is decided BEFORE the email opener, because it
+  // suppresses the handoff bridge outright: a two-sentence escalation
+  // acknowledgment has no room for a broadcast-handoff preamble, and pushing
+  // both blocks would hand the model contradictory openers.
+  const ackOnly = opts.recommendedAction === 'escalate_to_rep';
+
   // v3.15.1: Email reply opener awareness — select the opener based on who
   // AUTHORED (signed) the email the lead is replying to (email channel only).
   // Detection is sign-off based: 'mark'/'randy' = a broadcast/nurture email
@@ -1311,13 +1340,17 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     const bridgeName = senderType === 'randy' ? 'Randy'
       : senderType === 'mark' ? 'Mark'
       : null;
-    // 2026-07-29 (Kelly Callahan incident) — resolve the ACTUAL reply sender
-    // before deciding whether a bridge is even coherent. See
-    // resolveReplySenderName above for why the location-global is never used.
-    const senderName = resolveReplySenderName(context);
+    // 2026-07-29 (Kelly Callahan incident) — the reply is sent AS THE IN-OFFICE
+    // REP (Mark), always. The nurture emails are Mark-signed too, so on the
+    // overwhelmingly common path the signer and the sender are the SAME person
+    // and a bridge is incoherent by construction. Resolved to a literal name so
+    // no merge tag can reach the body.
+    const senderName = resolveReplySenderName();
     const collision = bridgeName && sameName(bridgeName, senderName);
     parts.push(`\nEMAIL THREAD CONTEXT:`);
-    if (bridgeName && collision) {
+    if (bridgeName && ackOnly) {
+      parts.push(`The email this lead is replying to was a broadcast/nurture email signed by ${bridgeName}, but this conversation has been ESCALATED TO A HUMAN — see ACKNOWLEDGMENT-ONLY CONDUCT below. Do NOT use a handoff bridge and do NOT explain the change of voice. Acknowledge and stop.`);
+    } else if (bridgeName && collision) {
       // The nurture signer IS the reply sender. A bridge here reads
       // "Mark here — Mark asked me to reach out." No bridge is always better
       // than a self-referential one.
@@ -1325,9 +1358,9 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     } else if (bridgeName && senderName) {
       parts.push(`The email this lead is replying to was a broadcast/nurture email signed by ${bridgeName}. Your reply comes from ${senderName}, a different person — open with the handoff bridge EXACTLY as written here: "${senderName} here — ${bridgeName} asked me to reach out personally after seeing your message." Then continue in rep/company (we/our team) voice. Use the bridge ONCE — do not repeat it if the rep is already the established voice in the thread.`);
     } else if (bridgeName) {
-      // Signed nurture email, but no per-contact rep on record. Bridge in
-      // company voice rather than guessing at — or inventing — a name.
-      parts.push(`The email this lead is replying to was a broadcast/nurture email signed by ${bridgeName}. No individual rep is assigned to this contact, so reply in COMPANY voice (we / our team) — open with "We saw your reply to ${bridgeName} and wanted to get back to you personally." Never invent a rep name and never write a merge tag.`);
+      // Signed nurture email and the in-office sender name is unavailable.
+      // Bridge in company voice rather than guessing at — or inventing — a name.
+      parts.push(`The email this lead is replying to was a broadcast/nurture email signed by ${bridgeName}. Reply in COMPANY voice (we / our team) — open with "We saw your reply to ${bridgeName} and wanted to get back to you personally." Never invent a rep name and never write a merge tag.`);
     } else {
       parts.push(`The email this lead is replying to was written by the rep (prior bot reply or manual rep send), not a broadcast/nurture email. Open directly as the rep — NO handoff bridge. Example opener: "Thanks for getting back to us, [first name]." or simply respond to what they said.`);
     }
@@ -1348,9 +1381,12 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
   //
   // The blanket rule-106 stand-down shipped as a same-day stopgap. This block
   // is what replaces it; see the post-merge SQL in the PR body.
-  const ackOnly = opts.recommendedAction === 'escalate_to_rep';
+  // (ackOnly is declared above the email opener, which it also suppresses.)
   if (ackOnly) {
-    const owner = resolveReplySenderName(context) || (context.lp?.rep_name ? String(context.lp.rep_name) : null);
+    // The human who OWNS the deal — the field rep (Beverly), not the in-office
+    // sender. "Beverly has your file" is the useful sentence; "Mark has your
+    // file" is the bot naming itself.
+    const owner = resolveOwningRepName(context);
     parts.push(`\n═══════ ACKNOWLEDGMENT-ONLY CONDUCT — HARD OVERRIDE (highest authority) ═══════`);
     parts.push(`The analyzer routed this conversation to a HUMAN (recommended_action = escalate_to_rep${opts.escalationCategory ? `, category ${opts.escalationCategory}` : ''}). A person owns the next real move. Your ONLY job is a brief acknowledgment so the lead is not left in silence — you are NOT handling this conversation.`);
     parts.push(`YOU MAY: confirm you received and understood what they actually said${owner ? `; name the person who now owns it (${owner})` : ''}; say a person will follow up.`);
@@ -2291,6 +2327,75 @@ export function findTimelinePromises(message) {
   return hits;
 }
 
+// ─── Acknowledgment-body contract (2026-07-29) ───────────────────────
+// The single definition of "a valid escalation acknowledgment", shared by the
+// unit tests and the live dry-run (scripts/dryrun-escalation-ack.js) so the
+// two can never drift. Every rule here is one the Kelly Callahan send broke.
+const ACK_BOOKING_VOCAB = [
+  /\bverification\s+visit\b/i,
+  /\bre-?measure\b/i,
+  /\bspecialist\b/i,
+  /\bback\s+on\s+(?:the|your)\s+calendar\b/i,
+  /\bfinalize\s+(?:the\s+)?exact\s+pricing\b/i,
+  /\bboth\s+(?:be\s+)?(?:home|there|present)\b/i,
+  /\bdecision[-\s]makers?\b/i,
+  /\bcome\s+(?:back\s+)?out\b/i,
+  /\breschedul\w*/i,
+  /\bbook\w*\s+(?:a|an|your|another)\b/i,
+  /\bappointment\b/i,
+];
+
+/** Count sentences, tolerating "Mr." / "9 a.m." style abbreviations. */
+function countSentences(body) {
+  // Mask the periods inside abbreviations so they are not read as sentence
+  // ends, then split on real terminal punctuation.
+  const masked = String(body || '')
+    .replace(/\b(?:[A-Z]|Mr|Mrs|Ms|Dr|a\.m|p\.m)\./g, (m) => m.replace(/\./g, '<DOT>'));
+  return masked
+    .split(/[.!?]+(?:\s|$)/)
+    .map(s => s.trim())
+    .filter(Boolean).length;
+}
+
+/**
+ * Validate a generated escalation acknowledgment. Returns an array of
+ * violation strings — empty means the body satisfies the contract. Pure.
+ *
+ * @param {string} body
+ * @param {{ownerName?: string|null, maxSentences?: number}} [opts]
+ */
+export function assertAcknowledgmentBody(body, opts = {}) {
+  const s = String(body || '');
+  const v = [];
+  const { ownerName = null, maxSentences = 2 } = opts;
+
+  if (!s.trim()) return ['empty body'];
+
+  if (/asked me to reach out/i.test(s)) v.push('handoff bridge present');
+  for (const re of ACK_BOOKING_VOCAB) {
+    const m = s.match(re);
+    if (m) v.push(`booking vocabulary: "${m[0]}"`);
+  }
+  for (const t of findTimelinePromises(s)) v.push(`time commitment: "${t}"`);
+  if (s.includes('?')) v.push('contains a question');
+
+  URL_RX.lastIndex = 0;
+  const urls = s.match(URL_RX);
+  URL_RX.lastIndex = 0;
+  if (urls) v.push(`contains a URL: "${urls[0]}"`);
+  if (BARE_MERGE_TAG_RX.test(s)) v.push('contains a booking merge tag');
+
+  for (const t of findUnresolvedTokens(s)) v.push(`unresolved token: "${t}"`);
+
+  const sentences = countSentences(s);
+  if (sentences > maxSentences) v.push(`${sentences} sentences (max ${maxSentences})`);
+
+  if (ownerName && !new RegExp(`\\b${ownerName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(s)) {
+    v.push(`does not name the human owner (${ownerName})`);
+  }
+  return v;
+}
+
 /**
  * Strip "at the link below"-style references when no link is present.
  * Pure; exported for tests.
@@ -2499,11 +2604,21 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // DECISION-TIME CONTEXT above. When live state and the snapshot disagree
   // about the funnel stage, a sibling action rewrote the contact between
   // queue and send: log it and let the snapshot win.
+  // 2026-07-29 — DRY RUN. Generation is not side-effect free: it promotes
+  // identity fields to GHL, stamps booking:active / email-asked tags, persists
+  // preferred times, and emits events. Verifying conduct against a REAL
+  // customer's context (the only way to reproduce a state like Kelly's stage
+  // collision) therefore has to suppress every write, or the verification
+  // mutates the record it is verifying. dryRun gates all of them; generation
+  // itself, and the guards that run on the body, are untouched.
+  const dryRun = opts.dryRun === true;
+  if (dryRun) console.log(`[ResponseGenerator] 🧪 DRY RUN for ${contactId} — generation only, all writes suppressed`);
+
   const contextSnapshot = opts.contextSnapshot || null;
   const drift = detectContextDrift(context, contextSnapshot);
   if (drift) {
     console.warn(`[ResponseGenerator] ⚠️ context drift for ${contactId}: snapshot=${drift.snapshot_stage} live=${drift.live_stage} — generating from the SNAPSHOT`);
-    emitEvent({
+    if (!dryRun) emitEvent({
       event_type: 'rule.context_drift',
       source: 'response_generator',
       entity_type: 'contact',
@@ -2631,7 +2746,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // in BOOK on the next turn (e.g. a bare "yeah" answering the DM question).
       // Fire-and-forget — must never block or fail response generation. Cleared
       // on book success / terminal states (see appointments.js teardown).
-      applyGHLTag(contactId, 'booking:active').catch(() => {});
+      if (!dryRun) applyGHLTag(contactId, 'booking:active').catch(() => {});
     } catch (err) {
       console.warn(`[ResponseGenerator] Booking calendar resolution failed for ${contactId}: ${err.message} — falling back to legacy booking_context`);
       bookingResolution = null;
@@ -2737,7 +2852,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       // contact+zip (a re-generation for the same contact/zip re-emits the
       // same key and dedups). Fire-and-forget — never blocks generation; the
       // prompt-level suppression below still governs this reply either way.
-      if (serviceArea?.checked && serviceArea.in_service_area === false) {
+      if (serviceArea?.checked && serviceArea.in_service_area === false && !dryRun) {
         // The literal exit script is pre-resolved HERE (name included) because
         // literal rule sends do not resolve merge tags — the SERVICE_AREA_EXIT
         // rule's send_message picks this up as context.message. Guide §3.7
@@ -2773,7 +2888,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     const bookingInFlight =
       kbPack?.booking_context?.requires_in_home_gate === true && !hasActiveBooking(context);
     bookingGate = assertBookingPrerequisites(identityState, { bookingInFlight });
-    promoteIdentityToGHL(contactId, identityState, {
+    if (!dryRun) promoteIdentityToGHL(contactId, identityState, {
       current: {
         firstName: context.lead?.first_name,
         lastName: context.lead?.last_name,
@@ -2808,7 +2923,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   if (inHomeGateRequired && bookingGate?.ok && bookingGate.should_ask_email) {
     // R4: the prompt below instructs the one-time email ask on this turn —
     // stamp the asked-once marker now so the next turn never re-asks.
-    applyGHLTag(contactId, EMAIL_ASKED_TAG).catch(() => {});
+    if (!dryRun) applyGHLTag(contactId, EMAIL_ASKED_TAG).catch(() => {});
   }
 
   const userPrompt = buildResponsePrompt(
@@ -2867,7 +2982,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       { direction: 'outbound', text: validated.message },
     ]);
     if (acceptedPref && acceptedPref.source === 'bot_accepted') {
-      persistPreferredTime(contactId, acceptedPref).catch(() => {});
+      if (!dryRun) persistPreferredTime(contactId, acceptedPref).catch(() => {});
     }
   } catch (err) {
     console.warn(`[ResponseGenerator] bot-accepted preferred-time persist skipped for ${contactId}: ${err.message}`);
@@ -2922,7 +3037,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // booking:active pattern rather than the post-send companion pipeline.
   // Idempotent by design: U.GUIDE re-entry is gate-guarded and the S2.2
   // enrollment rule is suppression-gated, so a regenerate cannot double-fire.
-  if (validated.companion_action?.action_type === 'guide_disposition') {
+  if (validated.companion_action?.action_type === 'guide_disposition' && !dryRun) {
     const gdOutcome = validated.companion_action.action_payload.outcome;
     const gdTags = gdOutcome === 'accepted'
       ? ['enroll:s2.2-chatbot', 'hurricane-guide-queue']
