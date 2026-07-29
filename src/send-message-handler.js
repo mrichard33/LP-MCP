@@ -1586,8 +1586,20 @@ export async function executeSendMessage(action, context) {
 
   const payload = action.action_payload || {};
   let message = payload.message || context.message || context.response_text;
+  // 2026-07-29 (D5): rule action_templates still hardcode params.channel:"sms"
+  // even where the rule's own gate admits email — AGENTIC_RESPOND_POST_CHATBOT
+  // is the example. decision-engine.inferChannelFromEvent normally rewrites the
+  // payload from the inbound event before insert, and resolveReplyContext
+  // rewrites it again below from the actual inbound conversation, so the value
+  // here is a placeholder in every healthy path. Track whether it was ever
+  // actually specified, so an absent channel is visible in the logs instead of
+  // silently becoming SMS and shaping the generation for the wrong surface.
+  const channelExplicit = typeof payload.channel === 'string' && payload.channel.trim() !== '';
   let channel = (payload.channel || 'sms').toLowerCase();
   let subject = payload.subject || null;
+  if (!channelExplicit) {
+    console.warn(`[SendMessage] action ${action.id} carries no payload.channel — provisionally 'sms'; the inbound conversation decides below.`);
+  }
 
   if (!message && !payload.requires_ai_generation) throw new Error('Missing message text in payload');
   if (!AGENTIC_DIRECT_SEND && channel === 'livechat') {
@@ -1811,6 +1823,17 @@ export async function executeSendMessage(action, context) {
       try {
         generated = await generateResponse(contactId, generationChannel, triggerMessage, {
           threadSenderType: threadSenderType ?? 'rep',
+          // 2026-07-29 (Kelly Callahan incident) — decision-time context. This
+          // send_message was queued as sequence_order 0 but the queue drains
+          // GLOBALLY, so it executes AFTER every sibling action that mutates
+          // contact state: on Kelly it ran 50.7s after queue and 32.6s after
+          // BEHAVIORAL_FAST_TRACK overwrote stage:post-appointment with
+          // stage:booking-main, and the generator re-read the corrupted value.
+          // context_snapshot is written by the agent_actions_enrich_on_insert
+          // trigger at INSERT time and is immune to that race — on conflict it
+          // wins. Null for actions predating the trigger; the generator falls
+          // back to live state.
+          contextSnapshot: action.context_snapshot || null,
           // 2026-07-06 — prompt_hint plumb (Bot 2/3/4 consolidation): approved
           // script from the matched rule / dispatch row rides the action
           // payload and anchors the generated reply (SCRIPT DIRECTIVE block).
@@ -2172,6 +2195,9 @@ export async function executeSendMessage(action, context) {
             requestedFulfillment: context.requested_fulfillment || null,
             callPurpose: context.call_purpose || null,
             regenerationNote: regenNotes[regenReason],
+            // 2026-07-29: a regeneration is even later than the original send,
+            // so it needs the decision-time snapshot at least as much.
+            contextSnapshot: action.context_snapshot || null,
           });
           if (!regenerated.short_circuit && regenerated.message) {
             const regenDisclosure = guardDisclosure(regenerated.message);

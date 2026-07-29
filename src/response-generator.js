@@ -173,7 +173,7 @@ import {
   formatPreferredTimeForPrompt,
   persistPreferredTime,
 } from './services/preferred-time.js';
-import { hasActiveBooking } from './agentic/lead-state/signals/context-reader.js';
+import { hasActiveBooking, isPostDemoDecline } from './agentic/lead-state/signals/context-reader.js';
 import { fetchUpcomingAppointments, formatAppointmentsForPrompt } from './knowledge/contact-appointments.js';
 import {
   resolveBookingCalendar,
@@ -381,12 +381,14 @@ When replying to an email thread, the opener depends on who AUTHORED (signed)
 the prior email. This signal is supplied in the EMAIL THREAD CONTEXT block of
 the user prompt — follow it exactly:
 - Prior email = a broadcast/nurture email signed by Mark or Randy:
-  Open with the handoff bridge naming that signer: "{{custom_values.rep_name}}
-  here — <Mark|Randy> asked me to reach out personally after seeing your message."
-  Then continue as the rep (we / our team voice). The bridge explains why a
-  different, personal voice is now replying to a broadcast — use it ONCE per
-  thread, never on every subsequent exchange. Use the EXACT name given in the
-  EMAIL THREAD CONTEXT block; do not substitute Randy for Mark or vice-versa.
+  The EMAIL THREAD CONTEXT block decides whether a handoff bridge is used at all
+  and, if so, gives you the EXACT opening line already filled in with real names.
+  Follow that block verbatim. NEVER compose a bridge yourself, and NEVER write a
+  merge tag such as {{custom_values.rep_name}} into the body — every name you
+  send must be a literal name resolved for you. Where a bridge is authorized it
+  explains why a different, personal voice is now replying to a broadcast — use
+  it ONCE per thread, never on every subsequent exchange. Use the EXACT names
+  given; do not substitute Randy for Mark or vice-versa.
 - Prior email = Rep (prior bot reply or manual rep send):
   Open directly. NO handoff bridge — the rep is the established voice in this
   thread. Example: "Thanks for getting back to us, [first name]." or respond to
@@ -1001,15 +1003,140 @@ Return ONLY a valid JSON object. The very first character MUST be { and the very
 }`;
 
 // ═══════════════════════════════════════════════════════════════════
+// REPLY SENDER IDENTITY (2026-07-29 — Kelly Callahan incident)
+// ═══════════════════════════════════════════════════════════════════
+//
+// The email handoff bridge used to interpolate {{custom_values.rep_name}}, a
+// single LOCATION-LEVEL GLOBAL whose value is "Mark" for every contact in the
+// location. Every E.2 and F.0 nurture email is also signed "Mark". So both
+// slots of the bridge resolved to the same person and 7 contacts in 30 days
+// received "Mark here — Mark asked me to reach out personally."
+//
+// Two independent defects, fixed together here:
+//   1. The bridge name and the reply-sender name were never compared.
+//   2. The reply-sender slot was a merge tag, not a name — so the body LP MCP
+//      wrote contained the LITERAL string "{{custom_values.rep_name}}" and only
+//      looked correct because GHL happened to interpolate it at send time.
+//
+// resolveReplySenderName reads the CONTACT'S OWN rep, never the global:
+//   1. lead.rep_display_name  (GHL "Rep Display Name",  yxOTDIT7Um0JxkOPUbPo)
+//   2. lead.lp_rep_name       (GHL "LP Rep Name",       ML9jAe1P5eq1uSwYTV3o)
+//   3. lp.rep_name            (LP lead row — same value, survives a GHL miss)
+//   4. null → company voice. A missing name is NEVER a reason to reach for the
+//      global; "Reece here" is honest, "Mark here" to Beverly's customer is not.
+//
+// LP stores rep names "Last, First" ("Dorsett, Beverly"); the customer-facing
+// name is the first name alone.
+
+/** "Dorsett, Beverly" → "Beverly"; "Beverly Dorsett" → "Beverly". */
+export function formatRepFirstName(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  const name = s.includes(',')
+    ? s.split(',')[1]           // "Last, First" → "First"
+    : s.split(/\s+/)[0];        // "First Last"  → "First"
+  const cleaned = String(name || '').trim().split(/\s+/)[0] || '';
+  // Reject anything that isn't a plausible human name (placeholder values like
+  // "N/A", "-", or a stray merge tag must not reach a customer).
+  if (!/^[A-Za-z][A-Za-z'’-]{1,}$/.test(cleaned)) return null;
+  return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+}
+
+/** The contact's own rep first name, or null for company voice. Pure. */
+export function resolveReplySenderName(context) {
+  const candidates = [
+    context?.lead?.rep_display_name,
+    context?.lead?.lp_rep_name,
+    context?.lp?.rep_name,
+  ];
+  for (const c of candidates) {
+    const name = formatRepFirstName(c);
+    if (name) return name;
+  }
+  return null;
+}
+
+/** Case/punctuation-insensitive name comparison for the collision guard. */
+function sameName(a, b) {
+  const norm = (v) => String(v || '').toLowerCase().replace(/[^a-z]/g, '');
+  const na = norm(a);
+  return !!na && na === norm(b);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// DECISION-TIME CONTEXT (2026-07-29 — Kelly Callahan incident)
+// ═══════════════════════════════════════════════════════════════════
+//
+// One ai.analysis_completed event matches several rules and fans out into a
+// batch of actions that drains GLOBALLY, not per-rule. send_message is the one
+// action that READS contact state; the tag/stage actions all WRITE it. So the
+// reader routinely runs after the writers:
+//
+//   14:16:27  send_message QUEUED   — context_snapshot: stage:post-appointment
+//   14:16:45  BEHAVIORAL_FAST_TRACK — set_stage → stage:booking-main
+//   14:17:17  send_message EXECUTES — re-reads live state, sees booking-main
+//
+// 50.7s after queue and 32.6s after the overwrite, the generator built a
+// pre-appointment booking ask for a customer four days past a completed demo.
+// The analysis layer was right; the rule layer corrupted the state underneath
+// it. agent_actions.context_snapshot (written by the DB trigger
+// agent_actions_enrich_on_insert from lead_intelligence) is the uncorrupted
+// record of what was true at DECISION time, so on conflict it wins.
+//
+// The snapshot carries current_stage_tag and buyer_stage but NO appointment
+// facts, so the post-appointment verdict is derived from LP ground truth
+// instead — lp.demo_completed, the OPPFDN/FDNS disposition, and the
+// lp-demo-completed tag. Those live in LP and on the contact record; none of
+// the rules in this fan-out can write them, which is exactly why they are
+// trustworthy here.
+
+/** Stage tag as of decision time, preferring the snapshot. Pure. */
+function resolveStageTag(context, snapshot) {
+  return snapshot?.current_stage_tag || context?.lead?.current_stage_tag || null;
+}
+
+/**
+ * Is this contact PAST their appointment? Reads only sources the concurrent
+ * rule fan-out cannot mutate. Pure.
+ *
+ * Returns { post: boolean, reasons: string[] }.
+ */
+export function derivePostAppointment(context, snapshot = null) {
+  const reasons = [];
+  if (context?.lp?.demo_completed === true) reasons.push('lp.demo_completed');
+  if (isPostDemoDecline(context)) reasons.push(`lp.disposition:${context?.lp?.disposition_code || context?.lp?.disposition}`);
+  const tags = (context?.lead?.current_tags || []).map(t => String(t).toLowerCase());
+  if (tags.includes('lp-demo-completed')) reasons.push('tag:lp-demo-completed');
+  if (resolveStageTag(context, snapshot) === 'stage:post-appointment') reasons.push('snapshot:stage:post-appointment');
+  return { post: reasons.length > 0, reasons };
+}
+
+/**
+ * True when live contact state and the decision-time snapshot disagree about
+ * the funnel stage — i.e. a sibling action rewrote the contact mid-flight.
+ * Pure.
+ */
+export function detectContextDrift(context, snapshot) {
+  const live = context?.lead?.current_stage_tag || null;
+  const snap = snapshot?.current_stage_tag || null;
+  if (!snap || !live || snap === live) return null;
+  return { snapshot_stage: snap, live_stage: live };
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // FAST-TRACK + STAGE INFERENCE
 // ═══════════════════════════════════════════════════════════════════
 
-function inferBuyerStage(context) {
+function inferBuyerStage(context, snapshot = null) {
+  // Decision-time buyer_stage outranks the live read (see DECISION-TIME
+  // CONTEXT above): lead_intelligence can be rewritten between queue and send.
+  const snapStage = parseInt(String(snapshot?.buyer_stage ?? '').match(/\d+/)?.[0] || '0', 10);
+  if (snapStage >= 1 && snapStage <= 5) return snapStage;
   if (context.intelligence?.buyer_stage) {
     const n = parseInt(String(context.intelligence.buyer_stage).match(/\d+/)?.[0] || '0', 10);
     if (n >= 1 && n <= 5) return n;
   }
-  const stageTag = context.lead?.current_stage_tag || '';
+  const stageTag = resolveStageTag(context, snapshot) || '';
   const m = stageTag.match(/stage:(\d+)/);
   if (m) {
     const n = parseInt(m[1], 10);
@@ -1184,16 +1311,64 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     const bridgeName = senderType === 'randy' ? 'Randy'
       : senderType === 'mark' ? 'Mark'
       : null;
+    // 2026-07-29 (Kelly Callahan incident) — resolve the ACTUAL reply sender
+    // before deciding whether a bridge is even coherent. See
+    // resolveReplySenderName above for why the location-global is never used.
+    const senderName = resolveReplySenderName(context);
+    const collision = bridgeName && sameName(bridgeName, senderName);
     parts.push(`\nEMAIL THREAD CONTEXT:`);
-    if (bridgeName) {
-      parts.push(`The email this lead is replying to was a broadcast/nurture email signed by ${bridgeName}. Your reply comes from the REP — open with the handoff bridge: "{{custom_values.rep_name}} here — ${bridgeName} asked me to reach out personally after seeing your message." Then continue in rep/company (we/our team) voice. Use the bridge ONCE — do not repeat it if the rep is already the established voice in the thread.`);
+    if (bridgeName && collision) {
+      // The nurture signer IS the reply sender. A bridge here reads
+      // "Mark here — Mark asked me to reach out." No bridge is always better
+      // than a self-referential one.
+      parts.push(`The email this lead is replying to was a broadcast/nurture email signed by ${bridgeName}, and ${bridgeName} is also the rep this reply comes from. Do NOT use a handoff bridge — a person cannot hand off to themselves. Open directly as ${bridgeName}, in first person. Example opener: "Thanks for getting back to me, [first name]."`);
+    } else if (bridgeName && senderName) {
+      parts.push(`The email this lead is replying to was a broadcast/nurture email signed by ${bridgeName}. Your reply comes from ${senderName}, a different person — open with the handoff bridge EXACTLY as written here: "${senderName} here — ${bridgeName} asked me to reach out personally after seeing your message." Then continue in rep/company (we/our team) voice. Use the bridge ONCE — do not repeat it if the rep is already the established voice in the thread.`);
+    } else if (bridgeName) {
+      // Signed nurture email, but no per-contact rep on record. Bridge in
+      // company voice rather than guessing at — or inventing — a name.
+      parts.push(`The email this lead is replying to was a broadcast/nurture email signed by ${bridgeName}. No individual rep is assigned to this contact, so reply in COMPANY voice (we / our team) — open with "We saw your reply to ${bridgeName} and wanted to get back to you personally." Never invent a rep name and never write a merge tag.`);
     } else {
       parts.push(`The email this lead is replying to was written by the rep (prior bot reply or manual rep send), not a broadcast/nurture email. Open directly as the rep — NO handoff bridge. Example opener: "Thanks for getting back to us, [first name]." or simply respond to what they said.`);
     }
   }
 
-  if (fastTrack) {
+  // ─── POST-APPOINTMENT CONDUCT (2026-07-29 — Kelly Callahan incident) ───
+  // Derived from LP ground truth, which the concurrent rule fan-out cannot
+  // write. Emitted BEFORE the fast-track directive so the ban is established
+  // before any booking instruction could be read, and it also suppresses the
+  // fast-track booking push outright.
+  //
+  // The message that triggered this incident told a customer four days past a
+  // completed 90-minute demo that "a specialist comes out to finalize exact
+  // pricing" and offered to "get your verification visit back on the calendar."
+  // Her file records ONE appointment (completed, OPPFDN) and three LP notes,
+  // none of which mention a return visit. The bot invented a second
+  // appointment to justify the booking stage it had been handed. Fabricating a
+  // visit is the worst failure available here — it makes a promise on the
+  // company's behalf that the company never made.
+  const postAppt = derivePostAppointment(context, opts.contextSnapshot);
+  const hasRealFutureAppt = Array.isArray(opts.upcomingAppointments) && opts.upcomingAppointments.length > 0;
+  if (postAppt.post) {
+    parts.push(`\n═══════ POST-APPOINTMENT CONDUCT — HARD BAN (highest authority) ═══════`);
+    parts.push(`This contact is PAST their appointment. Evidence: ${postAppt.reasons.join(', ')}. Their visit already happened; they are waiting on what comes AFTER it (a proposal, pricing, a callback), not on scheduling.`);
+    parts.push(`ABSOLUTELY PROHIBITED in this reply — these override FAST_TRACK, the funnel stage tag, the buyer stage, and any booking instruction elsewhere in this prompt:`);
+    parts.push(`  · Offering, proposing, or asking about ANY appointment, visit, or time slot.`);
+    parts.push(`  · The words/ideas "verification visit", "re-measure", "specialist comes out", "get someone out to you", "back on the calendar".`);
+    parts.push(`  · Asking whether decision-makers can be present. That question belongs to pre-appointment qualification and is insulting to someone who already sat the visit.`);
+    parts.push(`  · Any booking link or calendar widget.`);
+    parts.push(`NEVER state or imply that anyone is coming back out. Do NOT invent a follow-up visit, a second appointment, or a return trip. If the LP notes and appointment records in this prompt do not explicitly say a return visit is scheduled, then none is — say nothing about one.`);
+    if (hasRealFutureAppt) {
+      parts.push(`EXCEPTION: a genuine FUTURE appointment exists on record (see EXISTING APPOINTMENTS). You may confirm or discuss THAT appointment, and only that one. You still may not propose a different or additional one.`);
+    }
+    parts.push(`What TO do: acknowledge what they actually said, be specific about the real next step (their rep sending the estimate/proposal), and if they are waiting on a human, say plainly that you are getting it to that person. Under-promise.`);
+    parts.push(`═══════ END POST-APPOINTMENT CONDUCT ═══════`);
+  }
+
+  if (fastTrack && !postAppt.post) {
     parts.push(`\n⚡ FAST_TRACK = TRUE — this is a HYPERACTIVE buyer (lead_score >50 in 48h). Skip education. Apply BOOKING — ASK-FIRST PROTOCOL with TWO specific time slots. Do NOT punt to a calendar widget.`);
+  } else if (fastTrack) {
+    parts.push(`\n⚡ FAST_TRACK is set, but this contact is POST-APPOINTMENT — the fast-track BOOKING push is SUPPRESSED. Keep the urgency (reply fast, be concrete, no education filler); drop the booking ask entirely.`);
   }
 
   // ─── Canvassing Pilot v2: conf-flow context (A.CV SMS confirmation) ───
@@ -1275,14 +1450,17 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     parts.push(`\nSERVICE AREA STATUS (TENTATIVE — city match only): ${opts.serviceAreaTentative.city} is a market Reece serves, but coverage is confirmed by zip. You may speak positively about serving ${opts.serviceAreaTentative.city}; when you ask for the zip, frame it as the final confirmation (e.g. "We're all over ${opts.serviceAreaTentative.city} — what's the zip so I can confirm you're in our coverage?"). Do NOT state they are confirmed in the service area until the zip is verified.`);
   }
 
-  const stageNum = inferBuyerStage(context);
+  const stageNum = inferBuyerStage(context, opts.contextSnapshot);
   parts.push(`Inferred Buyer Stage: ${stageNum}/5`);
 
   // ─── 2026-07-06 (Bot 2/3/4 consolidation): funnel stage, trust, objection
   // state, and the named-storm posture toggle. See FUNNEL STAGE CONDUCT,
   // TRUST MODEL, and TWO-TURN PLAYS in the system prompt.
-  if (context.lead?.current_stage_tag) {
-    parts.push(`FUNNEL STAGE TAG: ${context.lead.current_stage_tag} — apply the matching FUNNEL STAGE CONDUCT.`);
+  // 2026-07-29: decision-time stage tag, not the live one — a sibling action in
+  // the same fan-out may have rewritten it since this send was queued.
+  const decisionStageTag = resolveStageTag(context, opts.contextSnapshot);
+  if (decisionStageTag) {
+    parts.push(`FUNNEL STAGE TAG: ${decisionStageTag} — apply the matching FUNNEL STAGE CONDUCT.`);
   }
   if (context.lead?.trust_level_score != null) {
     const t = context.lead.trust_level_score;
@@ -1300,7 +1478,7 @@ function buildResponsePrompt(context, channel, triggerMessage, kbPack, classific
     parts.push(`\n⛈️ NAMED-STORM POSTURE ACTIVE (global toggle): a named storm is active or recent. Lead with empathy and service. Drop ALL persuasion framing, urgency plays, and booking pushes — answer questions, offer help, route service needs. No storm-chasing tone of any kind. Booking only if the LEAD asks for it.`);
   }
 
-  if (context.lead.current_stage_tag) parts.push(`Stage Tag: ${context.lead.current_stage_tag}`);
+  if (decisionStageTag) parts.push(`Stage Tag: ${decisionStageTag}`);
   if (context.lead.current_buyer_tag) parts.push(`Buyer Tag: ${context.lead.current_buyer_tag}`);
   if (context.lead.current_bj_tag) parts.push(`Buyer Journey: ${context.lead.current_bj_tag}`);
 
@@ -2021,6 +2199,58 @@ function validateResponse(parsed, channel) {
 const URL_RX = /https?:\/\/[^\s<>"')\]]+/g;
 const MARKDOWN_LINK_RX = /\[([^\]]*)\]\(\s*([^)]+?)\s*\)/g;
 
+// Any {{...}} token in an outbound body. The ONLY tokens we ship on purpose are
+// GHL trigger-link merge tags (BARE_MERGE_TAG_RX) — anything else is an
+// unresolved template that a customer must never see.
+const ANY_HANDLEBARS_RX = /\{\{[^}]*\}\}/g;
+
+/**
+ * Throw if the body carries a handlebars token that is not an allowlisted
+ * booking merge tag. Exported for tests.
+ */
+export function findUnresolvedTokens(message) {
+  const matches = String(message || '').match(ANY_HANDLEBARS_RX) || [];
+  return matches.filter(t => !/^\{\{trigger_link\.[A-Za-z0-9_-]+\}\}$/.test(t));
+}
+
+function assertNoUnresolvedTokens(message, contactId) {
+  const bad = findUnresolvedTokens(message);
+  if (bad.length) {
+    console.error(`[ResponseGenerator] ⛔ unresolved merge token(s) in body for ${contactId}: ${bad.join(', ')}`);
+    throw new Error(`unresolved_merge_token: ${bad.join(', ')}`);
+  }
+}
+
+// ─── Dangling link references (2026-07-29, D5) ───────────────────────
+// SMS prompts get a tracked link appended downstream; the email path never
+// did. Kelly's email ended "...is at the link below" with no link below it.
+// Copy that PROMISES a link and does not carry one is a broken message, so we
+// remove the promise rather than ship the dead end.
+const LINK_REFERENCE_RX =
+  /\s*(?:,\s*)?\b(?:is\s+|are\s+|it'?s\s+)?(?:at|via|through|using)?\s*(?:the\s+)?link\s+(?:below|here|above)\b[.!]?/gi;
+
+/** True when the body contains a real URL or an allowlisted booking merge tag. */
+function bodyCarriesLink(message) {
+  const s = String(message || '');
+  return URL_RX.test(s) || BARE_MERGE_TAG_RX.test(s);
+}
+
+/**
+ * Strip "at the link below"-style references when no link is present.
+ * Pure; exported for tests.
+ */
+export function stripDanglingLinkReferences(message) {
+  const s = String(message || '');
+  // Reset lastIndex — URL_RX is a /g regex shared across calls.
+  URL_RX.lastIndex = 0;
+  if (!s || bodyCarriesLink(s)) {
+    URL_RX.lastIndex = 0;
+    return s;
+  }
+  URL_RX.lastIndex = 0;
+  return s.replace(LINK_REFERENCE_RX, '').replace(/[ \t]{2,}/g, ' ').replace(/ +([.,!?])/g, '$1');
+}
+
 function sanitizeMessageUrls(message, channel, kbPack) {
   if (!message || typeof message !== 'string') return message;
   let out = message;
@@ -2208,6 +2438,30 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     includeConversation: true,
     skipCache: true,
   });
+
+  // 2026-07-29 (Kelly Callahan incident) — decision-time context. See
+  // DECISION-TIME CONTEXT above. When live state and the snapshot disagree
+  // about the funnel stage, a sibling action rewrote the contact between
+  // queue and send: log it and let the snapshot win.
+  const contextSnapshot = opts.contextSnapshot || null;
+  const drift = detectContextDrift(context, contextSnapshot);
+  if (drift) {
+    console.warn(`[ResponseGenerator] ⚠️ context drift for ${contactId}: snapshot=${drift.snapshot_stage} live=${drift.live_stage} — generating from the SNAPSHOT`);
+    emitEvent({
+      event_type: 'rule.context_drift',
+      source: 'response_generator',
+      entity_type: 'contact',
+      entity_id: String(contactId),
+      ghl_contact_id: contactId,
+      payload: {
+        ...drift,
+        resolution: 'snapshot_wins',
+        snapshot_at: contextSnapshot?.snapshot_at || null,
+        channel,
+      },
+      priority: 'normal',
+    }).catch(err => console.warn(`[ResponseGenerator] context_drift emit failed for ${contactId}: ${err.message}`));
+  }
 
   let classification;
   try {
@@ -2510,6 +2764,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       recentEdits,
       upcomingAppointments,
       threadSenderType: opts.threadSenderType ?? 'rep',
+      // 2026-07-29: decision-time state — outranks the live read for stage tag,
+      // buyer stage, and the post-appointment verdict.
+      contextSnapshot,
       identityState,
       bookingGate,
       serviceArea,
@@ -2562,6 +2819,25 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   if (confFlowContext) {
     validated.message = applyConfFlowMergeKeys(validated.message, confFlowContext);
   }
+
+  // ─── Unresolved-token guard (2026-07-29 — Kelly Callahan incident) ───
+  // Every send in the 30-day bridge cohort shipped a body containing the
+  // LITERAL string "{{custom_values.rep_name}}". It only ever looked right
+  // because GHL happens to interpolate custom_values at send time; any path
+  // where it does not (a raw conversations-API send, a GroupMe preview, an
+  // approval screen) ships handlebars to a customer.
+  //
+  // Deliberately an ALLOWLIST, not a blanket "no {{" rule: {{trigger_link.*}}
+  // booking links are GHL merge tags we emit ON PURPOSE (see the CANONICAL
+  // BOOKING LINK block), and banning them outright would break booking. Runs
+  // after sanitizeMessageUrls and applyConfFlowMergeKeys so every legitimate
+  // resolver has already had its turn. Throwing hands control to the retry-
+  // then-safe-fallback loop in send-message-handler: the lead still gets a
+  // reply, and it is never one with raw template syntax in it.
+  assertNoUnresolvedTokens(validated.message, contactId);
+
+  // D5 (2026-07-29): "...is at the link below" with no link below it.
+  validated.message = stripDanglingLinkReferences(validated.message);
 
   const mergeTagInMessage = BARE_MERGE_TAG_RX.test(validated.message);
   const availSummary = availability

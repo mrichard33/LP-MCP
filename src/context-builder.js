@@ -72,6 +72,8 @@
 
 import supabase from './supabase.js';
 import { appointmentDelta, formatDateHuman, APPOINTMENT_TZ } from './appointment-dates.js';
+import { stripQuotedEmail } from './email-thread.js';
+import { channelOfMessage } from './agentic/reply-sender.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
@@ -107,6 +109,15 @@ const CF_DECISION_MAKERS_PRESENT = 'GH1QGGOseMKmJAMqajiN'; // select: Yes|No|Sol
 // discovery, and value-first scripts branch on this (low 1-2 / neutral 3 /
 // high 4-5). Read-only here; the responder emits its own trust_level_targeted.
 const CF_TRUST_LEVEL_SCORE = 'zrghbp0ZLrOyTWc9x6Ai';
+// 2026-07-29 (Kelly Callahan incident) — the CONTACT'S OWN rep name. The email
+// handoff bridge used to interpolate {{custom_values.rep_name}}, a single
+// location-level global that reads "Mark" for every contact in the location, so
+// a reply to a Mark-signed nurture email opened "Mark here — Mark asked me to
+// reach out." These two per-contact fields (plus lp.rep_name from the LP lead
+// row) are the only sources that can ever name the ACTUAL rep. Read-only here;
+// response-generator.js resolveReplySenderName() owns the priority order.
+const CF_REP_DISPLAY_NAME = 'yxOTDIT7Um0JxkOPUbPo'; // "Rep Display Name"
+const CF_LP_REP_NAME      = 'ML9jAe1P5eq1uSwYTV3o'; // "LP Rep Name", e.g. "Dorsett, Beverly"
 
 // LP dispositions where stale data is high-risk (active deals).
 const LP_ACTIVE_DISPOSITIONS = new Set([
@@ -321,7 +332,17 @@ async function fetchConversation(contactId, limit = 10) {
     const messages = extractMessages(msgData);
     return messages.map(m => ({
       direction: m.direction === 1 || m.direction === 'inbound' ? 'inbound' : 'outbound',
-      text: m.body || m.message || '',
+      // 2026-07-29 (Kelly Callahan incident): email turns arrive from the
+      // conversations API with the full quoted thread, HTML markup, signature,
+      // and broadcast footer attached. behavioral-emitter strips the inbound
+      // WEBHOOK body, but these turns are re-read from GHL and were raw — so
+      // identity extraction matched a "phone" (+15346485266) out of the digits
+      // in an unsubscribe URL's time_stamp, and the generation prompt saw our
+      // own "Mark / Reece Windows & Doors" sign-off quoted back at us. Strip
+      // email turns only; SMS and live-chat bodies are already the bare text.
+      text: channelOfMessage(m) === 'email'
+        ? stripQuotedEmail(m.body || m.message || '')
+        : (m.body || m.message || ''),
       type: m.contentType || m.type || 'text',
       timestamp: m.dateAdded || m.createdAt || null,
     })).reverse();
@@ -703,6 +724,13 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       ? getCustomFieldValue(ghlContact.customFields, CF_TRUST_LEVEL_SCORE)
       : null
   );
+  // 2026-07-29: the contact's OWN rep name, for the email handoff bridge.
+  const repDisplayName = ghlContact?.customFields
+    ? getCustomFieldValue(ghlContact.customFields, CF_REP_DISPLAY_NAME)
+    : null;
+  const lpRepNameField = ghlContact?.customFields
+    ? getCustomFieldValue(ghlContact.customFields, CF_LP_REP_NAME)
+    : null;
 
   if (cfProspectId) {
     lpLead = await fetchLPLeadByProspectId(cfProspectId);
@@ -801,6 +829,11 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       // 2026-07-06: Trust Level Score (1-5, null = unknown/neutral) for
       // Bot 2's trust-adaptive pricing / value-first / bridge scripts.
       trust_level_score: trustLevelScore,
+      // 2026-07-29 (Kelly Callahan incident): per-contact rep identity. Feeds
+      // resolveReplySenderName() so the email handoff bridge can never fall
+      // back to the location-global {{custom_values.rep_name}} ("Mark").
+      rep_display_name: repDisplayName,
+      lp_rep_name: lpRepNameField,
       current_tags: tags,
       current_stage_tag: parseStageTag(tags),
       current_buyer_tag: parseBuyerTag(tags),

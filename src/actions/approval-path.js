@@ -806,6 +806,8 @@ export async function processApprovalQueue() {
           promptHint: sendAction.action_payload?.prompt_hint || null,
           // 2026-07-06 — request-first routing (see send-message-handler).
           requestedFulfillment: ctx.requested_fulfillment || null,
+          // 2026-07-29 — decision-time state (see send-message-handler).
+          contextSnapshot: sendAction.context_snapshot || null,
         });
 
         if (generated.short_circuit) {
