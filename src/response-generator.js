@@ -1312,6 +1312,21 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   const parts = [];
 
   parts.push(`CHANNEL: ${channel.toUpperCase()}`);
+
+  // ─── AUTHORSHIP (2026-07-29 — Kelly Callahan incident) ───
+  // Stated FIRST, before any context that names a person, because every
+  // identity defect in this incident was the reply appearing to come from
+  // someone who did not write it. The reply is authored by ONE person: the
+  // in-office rep. Field reps named later in this prompt are people the
+  // customer has met — they own the deal, they do not author this message.
+  {
+    const authorName = resolveReplySenderName();
+    parts.push(`\n═══════ AUTHORSHIP — WHO THIS REPLY IS FROM ═══════`);
+    parts.push(`You are writing as ${authorName || 'the Reece office team'}, the in-office rep, from the office inbox. ${authorName ? `${authorName} is the ONLY name you may sign or self-identify with.` : 'Write in company voice (we / our team) and do not self-identify by name.'}`);
+    parts.push(`Any OTHER person named anywhere in this prompt — the assigned sales rep, a rep in the notes, a name in the conversation history — is someone the customer deals with, NOT the author of this message. Never open as them ("Beverly here"), never sign as them, never write in their first person. Refer to them in the THIRD person only ("Beverly has your file", "I've flagged this to Beverly").`);
+    parts.push(`Never write a merge tag or template placeholder for a name. Every name in your reply must be a literal name given to you here.`);
+    parts.push(`═══════ END AUTHORSHIP ═══════`);
+  }
   parts.push(channel === 'sms'
     ? 'Constraints: under 160 chars ideal, 320 max. 1-3 sentences. ONE question max. Booking link = merge tag, bare (no markdown). At most ONE link.'
     : 'Constraints: 150-400 words. 2-4 short paragraphs. Subject line required. Merge tags as bare text (no markdown).'
@@ -1611,7 +1626,13 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   if (context.lp?.matched || context.lp?.disposition) {
     parts.push(`\nLP CRM (Ground Truth):`);
     parts.push(`Disposition: ${context.lp.disposition || 'none'}${context.lp.disposition_label ? ' (' + context.lp.disposition_label + ')' : ''}`);
-    if (context.lp.rep_name) parts.push(`Sales Rep: ${context.lp.rep_name}`);
+    if (context.lp.rep_name) {
+      // 2026-07-29 — label this explicitly. The field rep is a person the
+      // customer has MET; left unlabelled beside "Ground Truth", the model
+      // would sign as her or open "Beverly here". She does not write these
+      // emails and must never appear to. See AUTHORSHIP at the top of the prompt.
+      parts.push(`Sales Rep (the FIELD rep who owns this deal — NOT the author of your reply): ${context.lp.rep_name}`);
+    }
     let apptStatus = 'no';
     if (context.lp.appointment_set || context.lp.appointment_date) {
       const dd = context.lp.appointment_days_delta;

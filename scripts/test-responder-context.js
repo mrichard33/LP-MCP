@@ -298,6 +298,20 @@ test('a Randy-signed thread still gets a real bridge, with literal names', () =>
   assert.ok(!/\{\{custom_values\./.test(p), 'merge tag survived in the bridge');
 });
 
+test('AUTHORSHIP block names Mark as the only signable identity', () => {
+  const p = kellyPrompt();
+  assert.ok(/AUTHORSHIP — WHO THIS REPLY IS FROM/.test(p), 'authorship block missing');
+  assert.ok(/You are writing as Mark, the in-office rep/.test(p), 'author not declared as Mark');
+  assert.ok(/Mark is the ONLY name you may sign or self-identify with/.test(p));
+});
+
+test('the field rep is labelled as NOT the author wherever she appears', () => {
+  const p = kellyPrompt();
+  assert.ok(/NOT the author of your reply\): Dorsett, Beverly/.test(p), 'field rep not labelled');
+  assert.ok(/Never open as them \("Beverly here"\)/.test(p), 'first-person ban missing');
+  assert.ok(/Refer to them in the THIRD person only/.test(p));
+});
+
 test('Kelly fixture: no merge tag reaches the prompt', () => {
   assert.ok(!/\{\{custom_values\./.test(kellyPrompt()), 'custom_values merge tag in prompt');
 });
