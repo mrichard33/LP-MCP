@@ -277,6 +277,7 @@ import { buildMessageKey, claimConsumedMessages, releaseConsumedMessages } from 
 // 2026-07-25 — sequence-aware appointment-event dedup (replaces the v2.2 fixed
 // 30-min bucket that let boundary-straddling duplicate webhooks both insert).
 import { checkApptEventDedup } from './services/appt-event-dedup.js';
+import { stripQuotedEmail } from './email-thread.js';
 
 const GHL_WEBHOOK_SECRET = process.env.GHL_WEBHOOK_SECRET || '';
 const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -663,21 +664,14 @@ function isAnswerableEmailBody(text) {
 // the new text, but some clients inline the full thread. Cut at the first quote
 // marker so the analyzer classifies the customer's new words, not our own last
 // email echoed back at us.
-function stripQuotedEmail(text) {
-  const t = String(text || '');
-  const markers = [
-    /\n\s*On .{0,120}\bwrote:\s*\n/i,          // Gmail / Apple Mail
-    /\n\s*-{2,}\s*Original Message\s*-{2,}/i,
-    /\n\s*_{5,}\s*\n/,                          // Outlook divider
-    /\n\s*From:\s.+\n\s*Sent:\s/i,
-  ];
-  let cut = t.length;
-  for (const re of markers) {
-    const m = t.match(re);
-    if (m && m.index !== undefined && m.index < cut) cut = m.index;
-  }
-  return t.slice(0, cut).replace(/^>.*$/gm, '').trim();
-}
+//
+// 2026-07-29 (Kelly Callahan incident) — implementation MOVED to
+// src/email-thread.js so the two consumers that read message bodies back out of
+// the GHL conversations API (context-builder.fetchConversation and, through it,
+// identity extraction) get the same treatment. Behavior on plain-text webhook
+// bodies is unchanged; HTML normalization and a URL-anchored unsubscribe-footer
+// cut were added there. Re-exported under the original name so the call sites
+// below and any external importer keep working.
 
 // v2.14 — synchronous conversation-ownership stamp (Sentinel bot gate).
 // Stamps agentic-active on the contact's first SMS inbound so the responder

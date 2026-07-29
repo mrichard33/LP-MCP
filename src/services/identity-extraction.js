@@ -43,6 +43,7 @@ import { callLLM } from '../llm-client.js';
 import { emitEvent } from '../event-emitter.js';
 import { updateGHLContactStandardFields, removeGHLTags } from '../ghl.js';
 import { extractPreferredTime, persistPreferredTime } from './preferred-time.js';
+import { scrubUrlsForExtraction } from '../email-thread.js';
 import supabase from '../supabase.js';
 
 // Live-chat widget placeholder ("Guest Visitor bljpx"). Matched against the
@@ -253,9 +254,18 @@ export function heuristicExtract(messages = []) {
       continue;
     }
 
+    // 2026-07-29 (Kelly Callahan incident): blank URLs BEFORE the segment
+    // split. A URL is never a customer-supplied phone/ZIP/address, but tracked
+    // links carry long digit runs and PHONE_RE has no left anchor — the last
+    // ten digits of an unsubscribe link's `time_stamp=1785346485266` were
+    // extracted as the phone +15346485266 and raised an identity.field_conflict
+    // against her real number. Scrubbing after the split would be too late:
+    // the split delimiter is `/`, which shreds the URL into bare segments.
+    const scrubbed = scrubUrlsForExtraction(text);
+
     // Split multi-part transcripts ("a / b / c") into segments so a bare
     // name or address inside a chat-transcript custom field is still seen.
-    const segments = text.split(/\s*\/\s*|\n+/).map(s => s.trim()).filter(Boolean);
+    const segments = scrubbed.split(/\s*\/\s*|\n+/).map(s => s.trim()).filter(Boolean);
     for (const seg of segments) {
       const phoneM = seg.match(PHONE_RE);
       if (phoneM && !id.phone) {

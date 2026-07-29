@@ -700,7 +700,10 @@ async function editApprovalRequest(shortRef, editInstruction, senderName) {
   // 2. Find the send_message action
   const { data: actions, error: actErr } = await supabase
     .from('agent_actions')
-    .select('id, action_type, action_payload, target_id, event_id, rule_applied, batch_id')
+    // context_snapshot (2026-07-29): decision-time state for the regeneration —
+    // an Edit-X regen runs long after the fan-out that may have rewritten the
+    // contact's stage, so it must generate from the snapshot, not live state.
+    .select('id, action_type, action_payload, target_id, event_id, rule_applied, batch_id, context_snapshot')
     .in('id', actionIds);
 
   if (actErr) {
@@ -739,6 +742,7 @@ async function editApprovalRequest(shortRef, editInstruction, senderName) {
     regenerated = await generateResponse(contactId, channel, triggerMessage, {
       editInstruction,
       previousMessage,
+      contextSnapshot: sendMsgAction.context_snapshot || null,
     });
   } catch (err) {
     console.error(`[GroupMe] Edit regenerate failed for #${shortRef}: ${err.message}`);
