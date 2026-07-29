@@ -49,9 +49,18 @@ async function markNoteOutcome(noteId, result, attempts) {
 
   const next = (attempts || 0) + 1;
   const terminal = next >= MAX_NOTE_PUSH_ATTEMPTS;
+  // This column is the forensic trail, so it must never read as a bare
+  // stringified falsy value. addGHLNote returns null for "disabled / empty
+  // body / transient failure" and false is not in its contract at all — but
+  // String(false) would silently write "false", which tells a future reader
+  // nothing. Map every falsy shape to a named reason.
+  let reason;
+  if (result === false) reason = 'push_rejected';
+  else if (result == null) reason = 'push_failed';
+  else reason = String(result);
   await supabase.from('lp_notes').update({
     ghl_note_push_attempts: next,
-    ghl_note_push_error: String(result == null ? 'push_failed' : result).slice(0, 500),
+    ghl_note_push_error: reason.slice(0, 500),
     ghl_note_push_terminal: terminal,
   }).eq('id', noteId);
   return terminal ? 'terminal' : 'retry';
@@ -136,6 +145,8 @@ export async function pushNotesToGHL({ batchSize = 50, delayMs = 300, maxNotes =
       .not('ghl_contact_id', 'is', null)
       .eq('ghl_note_pushed', false)
       .eq('ghl_note_push_terminal', false)
+      // Echo-loop guard: never push a note that originated in GHL back to GHL.
+      .neq('note_origin', 'ghl_ai_brief')
       .not('note_body', 'is', null)
       // OLDEST FIRST — so newest notes are added last and appear at top in GHL
       .order('created_at_lp', { ascending: true, nullsFirst: false })
@@ -225,6 +236,8 @@ export async function pushLeadNotesImmediately(lpLeadId, ghlContactId) {
       .eq('lp_lead_id', lpLeadId)
       .eq('ghl_note_pushed', false)
       .eq('ghl_note_push_terminal', false)
+      // Echo-loop guard: never push a note that originated in GHL back to GHL.
+      .neq('note_origin', 'ghl_ai_brief')
       .not('note_body', 'is', null)
       .order('created_at_lp', { ascending: true, nullsFirst: false });
 
@@ -293,6 +306,8 @@ export async function countUnpushedNotes() {
       .not('ghl_contact_id', 'is', null)
       .eq('ghl_note_pushed', false)
       .eq('ghl_note_push_terminal', false)
+      // Echo-loop guard: never push a note that originated in GHL back to GHL.
+      .neq('note_origin', 'ghl_ai_brief')
       .not('note_body', 'is', null);
     if (error) return -1;
     return count || 0;

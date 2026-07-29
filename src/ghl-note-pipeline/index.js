@@ -22,7 +22,7 @@ import {
   getRecentAppointmentEvents,
   getRecentInboundFromCache,
 } from './hl-read.js';
-import { summarizeConversation } from './summarizer.js';
+import { summarizeConversation, stampNoteOrigin } from './summarizer.js';
 import { writeLpNote } from './lp-write.js';
 import { classifyMatch, resolveOrCreateLpLead } from './resolve-or-create.js';
 
@@ -34,6 +34,14 @@ const SWEEP_SEC = parseInt(process.env.GHL_NOTE_SWEEP_SEC || '90', 10);
 const RECON_MIN = parseInt(process.env.GHL_NOTE_RECON_MIN || '30', 10);
 const STALE_CLAIM_MIN = parseInt(process.env.GHL_NOTE_STALE_CLAIM_MIN || '15', 10);
 const MAX_ATTEMPTS = parseInt(process.env.GHL_NOTE_MAX_ATTEMPTS || '5', 10);
+
+// Process-lifetime write counters (2026-07-29). "written" counts LP note
+// writes attempted-and-returned; "confirmed" counts those LP accepted;
+// "with_id" counts those that came back with a parseable note id. A gap
+// between written and confirmed is impossible today (writeLpNote throws
+// otherwise) — it exists so the day LP starts returning 2xx-with-error, the
+// log line shows it instead of reporting silent success.
+const _writeStats = { written: 0, confirmed: 0, with_id: 0 };
 
 function parseTypeSet(envVal, fallback) {
   return new Set(
@@ -381,12 +389,15 @@ export async function processRow(id) {
     }
 
     // Summarize (shadow always; live only once a prospect exists).
-    const { note, important } = await summarizeConversation({
+    const { note: rawNote, important } = await summarizeConversation({
       messages: windowed,
       signals,
       apptState,
       nowText: nowNyText(),
     });
+    // Stamp GHL origin + back-reference before EITHER branch, so the shadow
+    // log's would_be_note is byte-identical to what live would have written.
+    const note = stampNoteOrigin(rawNote, claimed.ghl_contact_id);
     const channelTypes = [...new Set(windowed.map((m) => m.type))];
 
     // ── Mode branch ──
@@ -423,8 +434,10 @@ export async function processRow(id) {
       return;
     }
 
-    // Write the LP note.
-    const lpNoteId = await writeLpNote(prospectId, note, important);
+    // Write the LP note. Receipt, not a bare id — `confirmed` proves LP
+    // accepted the write even when it hands back no id (which, as of
+    // 2026-07-29, it never has: 0 of 131 rows carried an lp_note_id).
+    const { noteId: lpNoteId, confirmed, respShape } = await writeLpNote(prospectId, note, important);
 
     await supabase
       .from('ghl_note_dedupe')
@@ -436,13 +449,22 @@ export async function processRow(id) {
       ghl_contact_id: claimed.ghl_contact_id,
       lp_lead_id: ldsId,
       lp_note_id: lpNoteId,
+      lp_write_confirmed: confirmed,
       important,
       note_preview: note.slice(0, 280),
     });
 
     await persistLead(id, ldsId);
     await markDone(id, throughIso, lpNoteId, true, claimed, leadAction);
-    console.log(`[GHLNote] process(${id}) live — note written lp_note_id=${lpNoteId} important=${important} prospect=${prospectId}`);
+    _writeStats.written++;
+    if (confirmed) _writeStats.confirmed++;
+    if (lpNoteId) _writeStats.with_id++;
+    console.log(
+      `[GHLNote] process(${id}) live — note written lp_note_id=${lpNoteId || 'none'}`
+      + ` confirmed=${confirmed}${respShape ? ` resp=${respShape}` : ''}`
+      + ` important=${important} prospect=${prospectId}`
+      + ` [run: ${_writeStats.written} written / ${_writeStats.confirmed} confirmed / ${_writeStats.with_id} with id]`
+    );
   } catch (err) {
     console.error(`[GHLNote] process(${id}) error: ${err.message}`);
     await markError(id, attempts, err.message).catch(() => {});

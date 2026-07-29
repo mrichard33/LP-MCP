@@ -43,3 +43,64 @@ ALTER TABLE lp_notes
 CREATE INDEX IF NOT EXISTS idx_lp_notes_pending
   ON lp_notes (created_at_lp)
   WHERE ghl_note_pushed = false AND ghl_note_push_terminal = false;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- AMENDMENT 2026-07-29 — note origin (echo-loop fix)
+--
+-- This file was already applied when the amendment landed. Every statement is
+-- IF NOT EXISTS / idempotent, so RE-RUN 050 in full; it is a no-op for the
+-- columns above and adds the ones below.
+--
+-- The GHL→LP pipeline (src/ghl-note-pipeline/) writes an AI brief onto the LP
+-- prospect. LP's note sync then pulls it back into lp_notes, and
+-- pushNotesToGHL pushes it straight back to the GHL contact it came from,
+-- wrapped in a "📋 LP Note" header. addGHLNote's dedup cannot catch it: the
+-- wrapper changes the body, so normalizeNoteBody never matches. Confirmed
+-- live 2026-07-29 — all 56 AI BRIEF notes in lp_notes had ghl_note_pushed=true.
+--
+-- note_origin is the structural marker that breaks the loop. Stamped at ingest
+-- (src/sync-children.js syncNotes) rather than matched with a LIKE on every
+-- push, so the filter is indexable and the classification happens exactly once.
+--
+--   'lp'           note originated in Lead Perfection (default — push it)
+--   'ghl_ai_brief' note originated in GHL via the note pipeline (never push)
+--
+-- NOT NULL DEFAULT 'lp' is deliberate: a nullable column would make the push
+-- filter need `.or(is.null, neq)` because SQL NULL <> 'x' is NULL, not true.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+ALTER TABLE lp_notes
+  ADD COLUMN IF NOT EXISTS note_origin text NOT NULL DEFAULT 'lp';
+
+-- Backfill: mark the existing echoed population. Matches BOTH the legacy
+-- "[AI BRIEF" prefix (the 56 rows already in LP) and the "[GHL · AI BRIEF"
+-- prefix written from 2026-07-29 onward. Matching only the new prefix would
+-- leave the existing population echoing forever.
+UPDATE lp_notes
+   SET note_origin = 'ghl_ai_brief'
+ WHERE note_origin <> 'ghl_ai_brief'
+   AND (note_body LIKE '[AI BRIEF · %'
+        OR note_body LIKE '[GHL · AI BRIEF · %'
+        -- writeLpNote prefixes landmine notes with "** IMPORTANT **\n"
+        OR note_body LIKE '** IMPORTANT **' || chr(10) || '[AI BRIEF · %'
+        OR note_body LIKE '** IMPORTANT **' || chr(10) || '[GHL · AI BRIEF · %');
+
+CREATE INDEX IF NOT EXISTS idx_lp_notes_origin
+  ON lp_notes (note_origin)
+  WHERE note_origin <> 'lp';
+
+-- ─── Delivery receipt for GHL→LP note writes ────────────────────────────────
+--
+-- ghl_note_log.lp_note_id was NULL on all 131 rows written since the pipeline
+-- went live 2026-06-24 — LP's AddNotes API does not return an id, so there was
+-- no receipt at all and a run that silently stopped writing would have looked
+-- identical to a healthy one. lp_write_confirmed records that LP ACCEPTED the
+-- write (addNote throws on non-2xx), which is a real receipt even without an id.
+-- Nullable: NULL means "written before this column existed", which is
+-- information, and is why it is not defaulted to false.
+ALTER TABLE ghl_note_log
+  ADD COLUMN IF NOT EXISTS lp_write_confirmed boolean;
+
+-- NOTE: the note_origin backfill UPDATE above is data-op-sized and is NOT
+-- mirrored in runMigrations() — same rule sql/046 applied to its
+-- legacy_unverified backfill. The ADD COLUMNs and indexes ARE mirrored.

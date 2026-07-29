@@ -100,3 +100,44 @@ export async function summarizeConversation({ messages, signals, apptState, nowT
   if (!note) throw new Error('[GHLNote] summarizer returned empty note');
   return { note, important: data.important === true };
 }
+
+// ─── Origin stamping (2026-07-29) ────────────────────────────────
+//
+// The LP→GHL direction has always been explicit about provenance: a
+// "📋 LP Note" header plus an "LP Lead: {id}" footer. The GHL→LP direction
+// was not — "[AI BRIEF …]" tells an LP rep that an AI wrote the note, but
+// not that it originated in GoHighLevel, and gives them no way back to the
+// thread it summarizes.
+//
+// Applied deterministically here rather than by editing SYSTEM_PROMPT: the
+// header is model-generated, and a prompt instruction is a request, not a
+// guarantee. This rewrite is idempotent and leaves an already-stamped note
+// alone, so it stays correct even if the prompt is changed later to emit the
+// new form natively.
+const AI_BRIEF_HEADER = /^\[(?:GHL · )?AI BRIEF · /;
+
+/**
+ * Rewrite the brief's header to carry the GHL origin and append a
+ * back-reference footer. The existing timestamp format is preserved exactly —
+ * only the "[AI BRIEF · " prefix is replaced.
+ *
+ * @param {string} note          rendered brief from summarizeConversation
+ * @param {string} ghlContactId  contact the conversation belongs to
+ * @returns {string}
+ */
+export function stampNoteOrigin(note, ghlContactId) {
+  let out = String(note || '');
+
+  // Header: "[AI BRIEF · …" → "[GHL · AI BRIEF · …". Already-stamped notes and
+  // notes with an unexpected first line are both left as-is.
+  if (AI_BRIEF_HEADER.test(out) && !out.startsWith('[GHL · AI BRIEF · ')) {
+    out = out.replace(/^\[AI BRIEF · /, '[GHL · AI BRIEF · ');
+  }
+
+  // Footer: mirrors the "LP Lead: {id}" convention of the reverse direction.
+  if (ghlContactId && !out.includes(`GHL Contact: ${ghlContactId}`)) {
+    out = `${out}\n\nGHL Contact: ${ghlContactId}`;
+  }
+
+  return out;
+}

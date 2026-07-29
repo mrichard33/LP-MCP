@@ -147,17 +147,33 @@ export async function syncNotes(lpLeadId, ghlContactId, notes) {
 
   const existingIds = await getExistingIds('lp_notes', 'lp_note_id', noteEntries.map(e => e.noteId));
 
+  // 2026-07-29 echo-loop fix. A note the GHL→LP pipeline wrote onto the LP
+  // prospect comes back to us here; without this stamp pushNotesToGHL sends it
+  // straight back to the GHL contact it came from, wrapped in a "📋 LP Note"
+  // header that defeats addGHLNote's body-match dedup. Classify once, at
+  // ingest, so the push filter is a plain indexed equality.
+  //
+  // BOTH prefixes are matched on purpose: rows written before Task F carry the
+  // legacy "[AI BRIEF", rows after carry "[GHL · AI BRIEF". "** IMPORTANT **"
+  // is prepended by writeLpNote for landmine notes.
+  const noteOriginOf = (body) => {
+    const b = String(body || '').replace(/^\*\* IMPORTANT \*\*\s*/, '');
+    return /^\[(?:GHL · )?AI BRIEF · /.test(b) ? 'ghl_ai_brief' : 'lp';
+  };
+
   for (const { note, noteId } of noteEntries) {
     if (existingIds.has(noteId)) {
       _childSkips.notes++;
       continue;
     }
+    const noteBody = getField(note, 'note', 'notes', 'Notes', 'body', 'text', 'note_body', 'NoteBody', 'content', 'Content');
     try {
       await supabase.from('lp_notes').upsert({
         lp_note_id:          noteId,
         lp_lead_id:          lpLeadId,
         ghl_contact_id:      ghlContactId || null,
-        note_body:           getField(note, 'note', 'notes', 'Notes', 'body', 'text', 'note_body', 'NoteBody', 'content', 'Content'),
+        note_origin:         noteOriginOf(noteBody),
+        note_body:           noteBody,
         note_type:           getField(note, 'rectype', 'RecType', 'type', 'note_type'),
         note_category:       getField(note, 'category', 'Category'),
         created_by_rep_name: getField(note, 'enteredby', 'EnteredBy', 'rep_name', 'entered_by'),

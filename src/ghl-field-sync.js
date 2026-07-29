@@ -30,6 +30,7 @@ import supabase from './supabase.js';
 import { updateGHLContactFields } from './ghl.js';
 import { buildGHLFieldPayload, computeFieldHash, getConfiguredFieldCount } from './ghl-field-map.js';
 import { emitEvent, dispositionPriority } from './event-emitter.js';
+import { sendGroupMeMessage } from './groupme.js';
 
 // GHL custom field ID for the canonical LP disposition (URWTGtobi9a9Y7gwGxC8).
 // Used to detect disposition changes from the field payload after a push so we
@@ -111,18 +112,64 @@ export function buildMergedLead(leads) {
   };
 }
 
+// ─── Mass-clear circuit breaker (2026-07-29) ─────────────────────
+//
+// clearStaleGHLContact NULLs the link on lp_leads AND lp_prospects. Until
+// 2026-07-28 it only fired on 400 "Contact not found" — a genuinely deleted
+// contact, which is rare and self-limiting.
+//
+// The widened classifier (sql/050 PR) also routes HTTP 403 "The token does not
+// have access to this location" here. That is right for ONE orphan id, and
+// catastrophic for a systemic cause: a wrong GHL_LOCATION_ID or a rotated
+// token makes EVERY contact answer 403, and the bulk loop's only guard is on
+// stats.pushed — cleared was never counted against maxPushesPerCycle. One
+// cycle would have NULLed the entire link table. Trip the switch instead:
+// clearing is capped per cycle, and hitting the cap is treated as evidence of
+// a systemic fault rather than a very large number of dead contacts.
+//
+// Deleting a link is not recoverable without a rebuild, so this fails toward
+// leaving stale links in place — the audit script (scripts/audit-orphan-ghl-links.js)
+// exists to clean those deliberately, under approval.
+const MAX_CLEARS_PER_CYCLE = parseInt(process.env.FIELD_SYNC_MAX_CLEARS_PER_CYCLE || '25', 10);
+let _clearsThisCycle = 0;
+let _clearBreakerTripped = false;
+
+function resetClearBreaker() {
+  _clearsThisCycle = 0;
+  _clearBreakerTripped = false;
+}
+
 /**
- * Clear stale ghl_contact_id from ALL lp_leads rows for a deleted GHL contact.
- * Called when GHL returns 400 "Contact not found" during field sync.
+ * Clear stale ghl_contact_id from ALL lp_leads rows for an unreachable GHL
+ * contact — deleted (400/404) or outside this token's location (403).
+ *
+ * Returns -1 when the per-cycle breaker is open (nothing cleared).
  */
 async function clearStaleGHLContact(ghlContactId, leadIds) {
+  if (_clearBreakerTripped) return -1;
+  if (_clearsThisCycle >= MAX_CLEARS_PER_CYCLE) {
+    _clearBreakerTripped = true;
+    console.error(
+      `[FieldSync] MASS-CLEAR BREAKER TRIPPED — ${_clearsThisCycle} contacts reported unreachable in one cycle `
+      + `(cap ${MAX_CLEARS_PER_CYCLE}). This looks systemic (bad GHL_LOCATION_ID / rotated token), not ${_clearsThisCycle} `
+      + `dead contacts. No further links will be cleared this cycle. Verify GHL credentials, then run `
+      + `scripts/audit-orphan-ghl-links.js to clear genuine orphans deliberately.`
+    );
+    sendGroupMeMessage(
+      `⚠️ LP FieldSync mass-clear breaker tripped — ${_clearsThisCycle} GHL contacts unreachable in one cycle. `
+      + `Link clearing halted. Check GHL_LOCATION_ID / token before anything else.`
+    ).catch(() => {});
+    return -1;
+  }
+  _clearsThisCycle++;
+
   try {
     const { data } = await supabase.from('lp_leads')
       .update({ ghl_contact_id: null, ghl_tag_applied: false, ghl_fields_hash: null, ghl_link_source: null })
       .eq('ghl_contact_id', ghlContactId)
       .select('lp_lead_id');
     const cleared = data?.length || 0;
-    console.warn(`[FieldSync] Cleared stale GHL ID ${ghlContactId} from ${cleared} lp_leads rows (contact deleted from GHL)`);
+    console.warn(`[FieldSync] Cleared stale GHL ID ${ghlContactId} from ${cleared} lp_leads rows (contact unreachable — deleted, or outside this token's location)`);
 
     // Also clear from lp_prospects
     await supabase.from('lp_prospects')
@@ -259,9 +306,17 @@ export async function syncLeadFieldsToGHL(lead, ghlContactId, storedHash) {
 
     return { pushed: true, hash: newHash };
   } else if (result === 'not_found') {
-    // ─── v4: GHL contact was deleted — clean up stale references ──
+    // ─── GHL contact unreachable — deleted (400/404), or outside this
+    //     token's location (403). Clean up the stale reference, subject to
+    //     the per-cycle mass-clear breaker above.
+    const cleared = await clearStaleGHLContact(ghlContactId, lead._all_lead_ids || []);
+    if (cleared === -1) {
+      // Breaker open — treat as a failure, NOT a clear, so the row is retried
+      // once credentials are fixed rather than counted as resolved.
+      fieldSyncStats.failed++;
+      return { pushed: false, hash: storedHash };
+    }
     fieldSyncStats.cleared++;
-    await clearStaleGHLContact(ghlContactId, lead._all_lead_ids || []);
     return { pushed: false, hash: storedHash, cleared: true };
   } else {
     fieldSyncStats.failed++;
@@ -304,6 +359,9 @@ export async function bulkFieldSync(batchSize = 100, delayMs = 200, maxPushesPer
 
   const stats = { total: 0, pushed: 0, skipped: 0, failed: 0, cleared: 0, deferred: 0 };
   const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  // Fresh budget each cycle — the breaker is a per-cycle blast radius limit,
+  // not a permanent latch, so a genuine trickle of dead contacts still drains.
+  resetClearBreaker();
 
   try {
     // Get ALL leads with GHL matches (not just newest — we need all for

@@ -45,8 +45,7 @@
 
 import supabase from '../src/supabase.js';
 import { getHlSupabase } from '../src/admin/hl-client.js';
-import { ghlFetch } from '../src/actions/helpers.js';
-import { classifyGHLError } from '../src/services/ghl-error-classify.js';
+import { probeGHLContact } from '../src/services/ghl-contact-probe.js';
 
 const args = process.argv.slice(2);
 const numArg = (name, fallback) => {
@@ -57,6 +56,7 @@ const numArg = (name, fallback) => {
 
 const opt = {
   execute: args.includes('--execute'),
+  noCache: args.includes('--no-cache'),
   limit: numArg('limit', 0),          // 0 = no cap
   batch: numArg('batch', 25),         // write batch size
   cacheChunk: numArg('cache-chunk', 200),
@@ -136,18 +136,12 @@ async function cacheHits(ids) {
 }
 
 // ─── Live probe — three-way, never two-way ───────────────────────────────────
-
-/** @returns {Promise<'found'|'orphan'|'unknown'>} */
-async function probeContact(id) {
-  try {
-    await ghlFetch('GET', `/contacts/${id}`);
-    return 'found';
-  } catch (err) {
-    // ONLY an affirmative not-found (404, 400+"not found", 403 wrong-location)
-    // counts. Timeouts, 429s, 5xx and bare 403s are 'unknown' and never written.
-    return classifyGHLError(err).notFound ? 'orphan' : 'unknown';
-  }
-}
+//
+// Shared with the webhook link backfill (src/rest-api.js) via
+// src/services/ghl-contact-probe.js. ONLY an affirmative not-found (404,
+// 400+"not found", 403 wrong-location) yields 'orphan'; timeouts, 429s, 5xx and
+// bare 403s are 'unknown' and are never written.
+const probeContact = probeGHLContact;
 
 // ─── Clear (only under --execute, only for confirmed orphans) ────────────────
 
@@ -189,9 +183,11 @@ async function main() {
     console.log(`[OrphanAudit] capped to ${ids.length} ids by --limit`);
   }
 
-  const hits = await cacheHits(ids);
+  // --no-cache forces a live probe of every id. The cache short-circuit is a
+  // cost optimisation that under-reports (see the NOTE in the results block).
+  const hits = opt.noCache ? new Set() : await cacheHits(ids);
   const toProbe = ids.filter(id => !hits.has(id));
-  console.log(`[OrphanAudit] HL cache: ${hits.size} confirmed present, ${toProbe.length} to live-probe`);
+  console.log(`[OrphanAudit] HL cache: ${hits.size} accepted as present (not probed), ${toProbe.length} to live-probe${opt.noCache ? ' (--no-cache)' : ''}`);
 
   const orphans = [];
   const unknowns = [];
@@ -228,6 +224,11 @@ async function main() {
     console.log(`     These are NEVER cleared. Re-run to re-probe: ${unknowns.slice(0, 10).join(', ')}`);
   }
   console.log('  system_events: not examined, never modified (audit records).');
+  console.log(`  NOTE: ${hits.size} id(s) were accepted on an HL cache hit and NOT live-probed.`);
+  console.log('        The cache lags live GHL, so a recently-deleted contact still reads as');
+  console.log('        present. The orphan count above is therefore a LOWER BOUND, not exhaustive.');
+  console.log('        The error direction is safe (it never nulls a good link). Re-run with');
+  console.log('        --no-cache to live-probe every id when you need a complete count.');
 
   if (!opt.execute) {
     console.log('\n[OrphanAudit] DRY RUN — nothing written. Re-run with --execute to clear the orphan links above.');

@@ -36,11 +36,34 @@ function extractNoteId(resp) {
 }
 
 /**
+ * Compact, non-PII description of the AddNotes response shape, recorded when
+ * no id could be extracted. 2026-07-29: lp_note_id was NULL on all 131 rows
+ * written since the pipeline went live, and nothing captured WHY — so there
+ * was no way to tell "LP returns no id" from "our extractor is wrong". This
+ * closes that. Never includes the note body or any customer data.
+ */
+function describeRespShape(resp) {
+  if (resp == null) return 'null';
+  if (typeof resp !== 'object') return typeof resp;
+  const keys = Object.keys(resp);
+  if (keys.length === 0) return 'object{}';
+  return `object{${keys.slice(0, 10).join(',')}}`;
+}
+
+/**
  * Write the note onto the prospect record.
+ *
+ * Returns a RECEIPT rather than a bare id. `confirmed` is the load-bearing
+ * field: addNote() throws on a non-2xx (see withCircuit/lpPost in
+ * src/lp-client.js), so reaching the return means LP accepted the write. That
+ * is a genuine receipt even when `noteId` is null, and it is what distinguishes
+ * "LP does not hand back an id" from "the write silently failed" — previously
+ * indistinguishable, since both produced a NULL lp_note_id.
+ *
  * @param {string|number} prospectId  LP cst_id (from resolveLPLeadId.prospectId)
- * @param {string} noteText           the rendered [AI BRIEF …] note
+ * @param {string} noteText           the rendered [GHL · AI BRIEF …] note
  * @param {boolean} important         landmine flag → important category
- * @returns {Promise<string|null>}    the new LP note id, or null if unparseable
+ * @returns {Promise<{noteId: string|null, confirmed: boolean, respShape: string|null}>}
  */
 export async function writeLpNote(prospectId, noteText, important) {
   if (!prospectId) throw new Error('writeLpNote: prospectId is required');
@@ -61,5 +84,10 @@ export async function writeLpNote(prospectId, noteText, important) {
     categoryId,
   });
 
-  return extractNoteId(resp);
+  const noteId = extractNoteId(resp);
+  return {
+    noteId,
+    confirmed: true,                                  // addNote threw on failure
+    respShape: noteId ? null : describeRespShape(resp),
+  };
 }

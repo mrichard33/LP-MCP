@@ -36,7 +36,7 @@ import { registerEngagementRoutes } from './nurture/nurture-engagement.js';
 import { registerAppointmentNotificationRoutes } from './notifications/appointment-notifications.js';
 import { registerContractCancellationNotificationRoutes } from './notifications/cancellation-notifications.js';
 import { five9WebhookHandler } from './five9-events.js';
-import { getGHLContact } from './ghl.js';
+import { probeGHLContactTracked } from './services/ghl-contact-probe.js';
 import { LINK_SOURCE } from './services/link-corroboration.js';
 import { createAppointmentFromLpHandler } from './appointments/booking-endpoint.js';
 
@@ -1126,19 +1126,25 @@ async function lpLeadRefreshHandler(req, res) {
           // bad id here poisons lp_leads and every lp_notes / lp_call_logs row
           // that later inherits it. Confirm it is readable first.
           //
-          // Fail CLOSED: getGHLContact returns null for not-found AND for a
-          // transient read failure alike, and we cannot tell them apart here. A
-          // blip just defers the backfill to the next poll, which this whole
-          // block is already best-effort about.
-          const verified = await getGHLContact(payloadGhlContactId);
-          if (!verified) {
-            console.warn(`[LP Inbound Refresh] rejected ghl_contact_id=${payloadGhlContactId} for lead_id=${leadId} — contact not readable, not persisting`);
-          } else {
+          // THREE-WAY probe, not getGHLContact. getGHLContact returns null for
+          // not-found, transient failure AND ghlDisabled alike — and ghlDisabled
+          // latches until restart, so failing closed on null would silently stop
+          // every link backfill for the life of the process the moment the kill
+          // switch trips. probeGHLContactTracked bypasses the switch, respects
+          // the rate limiter, and raises ONE GroupMe card per outage.
+          const verdict = await probeGHLContactTracked(payloadGhlContactId, 'LP Inbound Refresh');
+          if (verdict === 'found') {
             await supabase
               .from('lp_leads')
               .update({ ghl_contact_id: payloadGhlContactId, ghl_link_source: LINK_SOURCE.WEBHOOK_VERIFIED })
               .eq('lp_lead_id', leadId);
             console.log(`[LP Inbound Refresh] backfilled ghl_contact_id=${payloadGhlContactId} for lead_id=${leadId} (live-verified)`);
+          } else if (verdict === 'orphan') {
+            console.warn(`[LP Inbound Refresh] rejected ghl_contact_id=${payloadGhlContactId} for lead_id=${leadId} — contact unreachable (deleted or another location), not persisting`);
+          } else {
+            // unknown — GHL could not answer. Never persist on a guess; the
+            // next inbound refresh retries this lead.
+            console.warn(`[LP Inbound Refresh] deferred ghl_contact_id=${payloadGhlContactId} for lead_id=${leadId} — probe inconclusive, retrying next poll`);
           }
         }
       }
