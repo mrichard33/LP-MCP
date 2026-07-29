@@ -76,14 +76,19 @@ ALTER TABLE lp_notes
 -- "[AI BRIEF" prefix (the 56 rows already in LP) and the "[GHL · AI BRIEF"
 -- prefix written from 2026-07-29 onward. Matching only the new prefix would
 -- leave the existing population echoing forever.
+--
+-- REGEX, not LIKE — and specifically \s* for the "** IMPORTANT **" separator.
+-- writeLpNote joins that prefix with "\n", but the note comes back from LP
+-- with the newline collapsed to TWO SPACES: the stored body reads
+-- "** IMPORTANT **  [AI BRIEF · ...". A LIKE on chr(10) matched only 11 of the
+-- 56 live rows (verified 2026-07-29); this form matches all 56 and mirrors the
+-- /^\*\* IMPORTANT \*\*\s*/ strip in noteOriginOf() (src/sync-children.js)
+-- exactly. Do not narrow it back to LIKE — LP's whitespace handling is the
+-- reason it cannot be a literal match.
 UPDATE lp_notes
    SET note_origin = 'ghl_ai_brief'
  WHERE note_origin <> 'ghl_ai_brief'
-   AND (note_body LIKE '[AI BRIEF · %'
-        OR note_body LIKE '[GHL · AI BRIEF · %'
-        -- writeLpNote prefixes landmine notes with "** IMPORTANT **\n"
-        OR note_body LIKE '** IMPORTANT **' || chr(10) || '[AI BRIEF · %'
-        OR note_body LIKE '** IMPORTANT **' || chr(10) || '[GHL · AI BRIEF · %');
+   AND note_body ~ '^(\*\* IMPORTANT \*\*\s*)?\[(GHL · )?AI BRIEF · ';
 
 CREATE INDEX IF NOT EXISTS idx_lp_notes_origin
   ON lp_notes (note_origin)

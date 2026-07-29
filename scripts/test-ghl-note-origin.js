@@ -88,6 +88,17 @@ test('classifies both prefixes behind the ** IMPORTANT ** wrapper', () => {
   assert.equal(noteOriginOf(`** IMPORTANT **\n${stampNoteOrigin(BRIEF, CID)}`), 'ghl_ai_brief');
 });
 
+// The shape that actually comes BACK from LP. writeLpNote joins the prefix
+// with "\n", but LP returns it with the newline collapsed to two spaces —
+// verified 2026-07-29 against the 56 live rows. A literal "\n" match found
+// only 11 of them. This is why both the classifier and the sql/050 backfill
+// use \s* rather than a fixed separator; do not tighten either.
+test('classifies the REAL round-tripped shape (newline collapsed to spaces)', () => {
+  assert.equal(noteOriginOf(`** IMPORTANT **  ${BRIEF}`), 'ghl_ai_brief');
+  assert.equal(noteOriginOf(`** IMPORTANT ** ${BRIEF}`), 'ghl_ai_brief');
+  assert.equal(noteOriginOf(`** IMPORTANT **  ${stampNoteOrigin(BRIEF, CID)}`), 'ghl_ai_brief');
+});
+
 test('a genuine LP rep note is NOT classified as GHL-origin', () => {
   assert.equal(noteOriginOf('MOBILE HOME'), 'lp');
   assert.equal(noteOriginOf('HC 07/29/2026 10:00AM'), 'lp');
