@@ -34,6 +34,7 @@ const {
   detectContextDrift,
   findUnresolvedTokens,
   stripDanglingLinkReferences,
+  findTimelinePromises,
 } = await import('../src/response-generator.js');
 
 const { stripQuotedEmail, scrubUrlsForExtraction, htmlEmailToText } =
@@ -179,6 +180,46 @@ test('link-reference stripping is repeatable (no leaky regex state)', () => {
   const first = stripDanglingLinkReferences(body);
   assert.equal(stripDanglingLinkReferences(body), first);
   assert.equal(stripDanglingLinkReferences(body), first);
+});
+
+// ── Acknowledgment-only conduct: no timeline promises ────────────────
+
+test('the exact promise made to Kelly is caught', () => {
+  // "...so your estimate gets to you today" — a deadline the system cannot keep.
+  const hits = findTimelinePromises('I am flagging this to her and her manager right now so your estimate gets to you today.');
+  assert.ok(hits.length > 0, 'the "to you today" promise was not caught');
+});
+
+test('every banned timeline phrasing is caught', () => {
+  const banned = [
+    'She will call you today.',
+    'Someone will reach out tomorrow.',
+    'We will be in touch this afternoon.',
+    'You will hear back within the hour.',
+    'Expect a call within 2 business days.',
+    'She will follow up right away.',
+    'Someone will get to this shortly.',
+    'You will have it by end of day.',
+    'A rep will call in the next 3 hours.',
+  ];
+  for (const body of banned) {
+    assert.ok(findTimelinePromises(body).length > 0, `not caught: "${body}"`);
+  }
+});
+
+test('a compliant acknowledgment passes clean', () => {
+  const ok = 'Got it, Kelly — you have been waiting on that estimate and that is on us. Beverly owns this and I have flagged it to her and her manager.';
+  assert.deepEqual(findTimelinePromises(ok), []);
+});
+
+test('acknowledgment copy is not falsely flagged for ordinary words', () => {
+  for (const body of [
+    'Thanks for getting back to me.',
+    'Beverly has your file and I have passed this along.',
+    'I hear you — a person is picking this up.',
+  ]) {
+    assert.deepEqual(findTimelinePromises(body), [], `false positive on: "${body}"`);
+  }
 });
 
 // ── B5: quoted thread + URL scrubbing ────────────────────────────────

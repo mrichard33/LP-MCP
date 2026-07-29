@@ -295,8 +295,12 @@ async function fetchSourceEventMeta(eventId) {
   if (!eventId || !supabase) return null;
   try {
     const { data, error } = await supabase
-      .from('system_events')
-      .select('event_type, created_at')
+      // payload (2026-07-29): back-compat source for recommended_action /
+      // escalation_category on actions queued BEFORE the decision-engine began
+      // stamping them into action_payload. Safe to read late — unlike contact
+      // state, a system_events payload is written once at emit and never
+      // mutated, so there is nothing here that can drift between queue and send.
+      .select('event_type, created_at, payload')
       .eq('id', eventId)
       .maybeSingle();
     if (error) return null;
@@ -1834,6 +1838,15 @@ export async function executeSendMessage(action, context) {
           // wins. Null for actions predating the trigger; the generator falls
           // back to live state.
           contextSnapshot: action.context_snapshot || null,
+          // 2026-07-29 — the analyzer's verdict, stamped at queue time by the
+          // decision engine. escalate_to_rep forces acknowledgment-only
+          // conduct: confirm receipt, name the human, sell nothing, promise no
+          // timeline. Falls back to the (immutable) source event payload for
+          // actions queued before the stamp shipped.
+          recommendedAction: payload.recommended_action
+            || sourceEventMeta?.payload?.recommended_action || null,
+          escalationCategory: payload.escalation_category
+            || sourceEventMeta?.payload?.escalation_category || null,
           // 2026-07-06 — prompt_hint plumb (Bot 2/3/4 consolidation): approved
           // script from the matched rule / dispatch row rides the action
           // payload and anchors the generated reply (SCRIPT DIRECTIVE block).
@@ -2198,6 +2211,10 @@ export async function executeSendMessage(action, context) {
             // 2026-07-29: a regeneration is even later than the original send,
             // so it needs the decision-time snapshot at least as much.
             contextSnapshot: action.context_snapshot || null,
+            recommendedAction: payload.recommended_action
+              || sourceEventMeta?.payload?.recommended_action || null,
+            escalationCategory: payload.escalation_category
+              || sourceEventMeta?.payload?.escalation_category || null,
           });
           if (!regenerated.short_circuit && regenerated.message) {
             const regenDisclosure = guardDisclosure(regenerated.message);

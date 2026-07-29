@@ -1441,6 +1441,22 @@ async function createActionsFromRule(event, rule) {
         actionPayload = { ...actionPayload, channel: eventChannel };
         console.log(`[DecisionEngine] Channel override for ${rule.rule_key}: ${tmpl.params?.channel || 'unset'} → ${eventChannel} (event ${event.id})`);
       }
+      // 2026-07-29 (Kelly Callahan follow-up) — stamp the analyzer's verdict
+      // onto the action at QUEUE time, the same discipline as context_snapshot.
+      // recommended_action drives acknowledgment-only conduct in the generator:
+      // on escalate_to_rep the responder confirms receipt and names the human
+      // who now owns it, and sells nothing. Capturing it here rather than
+      // re-reading at execution means the conduct decision cannot drift between
+      // queue and send, which is the whole lesson of this incident.
+      const recommendedAction = event.payload?.recommended_action || null;
+      const escalationCategory = event.payload?.escalation_category || null;
+      if (recommendedAction || escalationCategory) {
+        actionPayload = {
+          ...actionPayload,
+          ...(recommendedAction ? { recommended_action: recommendedAction } : {}),
+          ...(escalationCategory ? { escalation_category: escalationCategory } : {}),
+        };
+      }
     }
 
     if (targetSystem === 'ghl' && !event.ghl_contact_id) {
