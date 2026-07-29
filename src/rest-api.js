@@ -1276,19 +1276,21 @@ export function registerRestApiRoutes(app, authenticate) {
   console.log('[REST API] Registered: POST /webhook/five9-event (header-auth, flag-gated, Five9 ESS raw capture + normalize)');
 
   // ═══════════════════════════════════════════════════════════════
-  // POST /webhook/ghl/create-appointment-from-lp — delegated booking
+  // POST /webhook/ghl/book-appointment — delegated booking
   // ═══════════════════════════════════════════════════════════════
   // Lets GHL workflow I.LP-IN book through LP MCP's slot-uniqueness check
   // instead of its native appointment_booking nodes (which all set
   // ignoreFreeSlots:true and are the `source = workflow` half of the
   // double-booked slots). Auth via x-appt-booking-key (constant-time, inside
   // the handler — mirrors the five9-event pattern), fail-closed when
-  // APPT_BOOKING_ENDPOINT_KEY is unset. 503 while APPT_SLOT_CHECK_ENABLED
-  // is not 'true', so a branch wired up before enable fails loudly in the
-  // workflow rather than quietly double-booking.
-  // Returns { outcome: created|updated|noop_already_exists|error } to branch on.
-  app.post('/webhook/ghl/create-appointment-from-lp', createAppointmentFromLpHandler);
-  console.log('[REST API] Registered: POST /webhook/ghl/create-appointment-from-lp (header-auth, flag-gated, slot-checked delegated booking)');
+  // APPT_BOOKING_ENDPOINT_KEY is unset.
+  // ALWAYS returns HTTP 200 with a flat { outcome, appointmentId, message } —
+  // Mark branches on `outcome` in the GHL UI, and a non-2xx may render there as
+  // an unparseable response and cost him that branch. While
+  // APPT_SLOT_CHECK_ENABLED is not 'true' it answers outcome 'error', so a
+  // branch wired up before enable falls back to its native node.
+  app.post('/webhook/ghl/book-appointment', createAppointmentFromLpHandler);
+  console.log('[REST API] Registered: POST /webhook/ghl/book-appointment (header-auth, flag-gated, slot-checked delegated booking)');
 
   // ═══════════════════════════════════════════════════════════════
   // /api/service-area/lookup — Zip → Market routing for HDL.2

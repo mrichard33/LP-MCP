@@ -53,6 +53,12 @@ import { fetchUpcomingAppointments } from '../knowledge/contact-appointments.js'
 import { BOOKING_CALENDARS, isInHomeCalendarId } from '../knowledge/booking-calendar-router.js';
 import { syncCancelledAppointmentState } from '../actions/handlers/appointment-field-sync.js';
 import { lpWallClockToGhlStartTime } from '../appointment-dates.js';
+// NOTE: slot-check.js imports normalizeGhlStartTime from THIS module, so this
+// is an ESM import cycle. It is safe because both sides are hoisted `export
+// function` declarations and neither is called during module evaluation. Do not
+// convert either to a const arrow, and do not add module-level calls.
+import { findExistingAppointment, emitSlotCheckEvent, isSlotCheckEnabled } from '../appointments/slot-check.js';
+import { applyAppointmentFormatForContact } from '../appointments/format-contact.js';
 
 export const WINDOW_ESTIMATE_CALENDAR_ID = BOOKING_CALENDARS.WINDOW_ESTIMATE;
 
@@ -360,12 +366,41 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, toNotify = 
     // otherwise read "no appointment" and POST a duplicate. FAIL-OPEN (see the
     // claim service): a claim infra error never strands a legitimate booking.
     const slotMs = Date.parse(startTime);
+
+    // Slot-uniqueness gate. This path's own lookup above is scoped to the
+    // ESTIMATE CALENDAR POOL, so it cannot see a slot already held by I.LP-IN
+    // on the target calendar at the target minute. That is the shared check
+    // every other create site runs, so the behaviour is identical whether a
+    // booking arrives via the delegated endpoint or via a rule.
+    // FAIL-CLOSED, matching this module's existing stance (it throws on a
+    // failed lookup rather than booking blind).
+    if (isSlotCheckEnabled()) {
+      const check = await findExistingAppointment({
+        contactId, calendarId: WINDOW_ESTIMATE_CALENDAR_ID, startTime,
+      });
+      if (check.outcome === 'match') {
+        void emitSlotCheckEvent('noop_already_exists', {
+          contactId, calendarId: WINDOW_ESTIMATE_CALENDAR_ID, startTime,
+          matched: check.appointment,
+          extra: { caller: 'rule', site: 'reconcileLpAppointmentToGhl' },
+        });
+        return noop('slot_already_held', { appointment_id: check.appointment.appointment_id });
+      }
+      if (check.outcome === 'error') {
+        void emitSlotCheckEvent('query_failed', {
+          contactId, calendarId: WINDOW_ESTIMATE_CALENDAR_ID, startTime, matched: null,
+          extra: { caller: 'rule', site: 'reconcileLpAppointmentToGhl', reason: check.reason },
+        });
+        throw new Error(`slot check failed before create: ${check.reason}`);
+      }
+    }
+
     const claim = await claimAppointmentCreate(contactId, slotMs);
     if (!claim.claimed) {
       return noop('create_claim_held', { slot_ms: Number.isNaN(slotMs) ? null : slotMs });
     }
     try {
-      const res = await ghlFetch('POST', '/calendars/events/appointments', {
+      const body = {
         calendarId: WINDOW_ESTIMATE_CALENDAR_ID,
         locationId: GHL_LOCATION_ID,
         contactId,
@@ -376,9 +411,24 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, toNotify = 
         assignedUserId: DEFAULT_ASSIGNED_USER_ID,
         toNotify,
         ignoreFreeSlotValidation: true,
-      });
+      };
+
+      // Title + address. No-op unless APPT_FORMAT_ENABLED, and fails open.
+      const fmt = await applyAppointmentFormatForContact(body, contactId);
+
+      const res = await ghlFetch('POST', '/calendars/events/appointments', body);
       const appointmentId = res?.id || res?.appointment?.id || null;
       if (!appointmentId) console.warn(`[LpGhlApptSync] POST created appointment for ${contactId} but no id in response`);
+      void emitSlotCheckEvent('created', {
+        contactId, calendarId: WINDOW_ESTIMATE_CALENDAR_ID, startTime, matched: null,
+        extra: {
+          caller: 'rule',
+          site: 'reconcileLpAppointmentToGhl',
+          appointmentId,
+          resolved_title: fmt.title,
+          address_populated: fmt.addressPopulated,
+        },
+      });
       return { ...base, outcome: 'created', appointment_id: appointmentId, new_status: plan.status };
     } catch (err) {
       // Release the claim so the executor's retry (or a sibling action) can

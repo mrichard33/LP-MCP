@@ -102,6 +102,7 @@ import { emitEvent } from '../../event-emitter.js';
 import supabase from '../../supabase.js';
 import { syncCancelledAppointmentState, reconcileGhlOnlyApptTag } from './appointment-field-sync.js';
 import { findExistingAppointment, emitSlotCheckEvent, isSlotCheckEnabled } from '../../appointments/slot-check.js';
+import { applyAppointmentFormatForContact } from '../../appointments/format-contact.js';
 import { claimAppointmentCreate, releaseAppointmentCreate } from '../../services/appointment-sync-claim.js';
 
 // Tags cleared once a booking lands (or the flow otherwise terminates) so the
@@ -571,6 +572,10 @@ export async function executeBookAppointment(action, context) {
   }
 
   console.log(`[ActionExecutor] Booking appointment: calendar=${calendarId}, contact=${contactId}, start=${startTime}, status=${status}${ignoreFreeSlotValidation ? ', override_availability=true' : ''}`);
+
+  // Title + address. No-op unless APPT_FORMAT_ENABLED, and fails open.
+  const fmt = await applyAppointmentFormatForContact(body, contactId, context?._contactCache);
+
   let result;
   try {
     result = await ghlFetch('POST', '/calendars/events/appointments', body);
@@ -583,9 +588,15 @@ export async function executeBookAppointment(action, context) {
   console.log(`[ActionExecutor] ✅ Appointment booked: id=${appointmentId}, calendar=${title}`);
 
   if (isSlotCheckEnabled()) {
-    await emitSlotCheckEvent('created', {
+    void emitSlotCheckEvent('created', {
       contactId, calendarId, startTime, matched: null,
-      extra: { site: 'executeBookAppointment', appointmentId },
+      extra: {
+        caller: 'rule',
+        site: 'executeBookAppointment',
+        appointmentId,
+        resolved_title: fmt.title,
+        address_populated: fmt.addressPopulated,
+      },
     });
   }
 
@@ -940,32 +951,80 @@ export async function executeRescheduleAppointment(action, context) {
 
       if (check.outcome === 'match' && check.appointment.appointment_id !== oldId) {
         console.log(`[ActionExecutor] ⏭️  Reschedule target slot already held by ${check.appointment.appointment_id} for ${contactId} at ${built.startTime} — reusing it, no new object.`);
-        await emitSlotCheckEvent('noop_already_exists', {
+        void emitSlotCheckEvent('noop_already_exists', {
           contactId, calendarId: built.calendarId, startTime: built.startTime,
           matched: check.appointment,
-          extra: { site: 'executeRescheduleAppointment', oldAppointmentId: oldId },
+          extra: { caller: 'rule', site: 'executeRescheduleAppointment', oldAppointmentId: oldId },
         });
         newAppointmentId = check.appointment.appointment_id;
       } else if (check.outcome === 'error') {
         // Fail-open, consistent with the booking path — but countable.
         console.warn(`[ActionExecutor] reschedule slot check failed for ${contactId} (${check.reason}) — booking anyway (fail-open)`);
-        await emitSlotCheckEvent('query_failed', {
+        void emitSlotCheckEvent('query_failed', {
           contactId, calendarId: built.calendarId, startTime: built.startTime, matched: null,
-          extra: { site: 'executeRescheduleAppointment', reason: check.reason },
+          extra: { caller: 'rule', site: 'executeRescheduleAppointment', reason: check.reason },
         });
       }
     }
 
     if (!newAppointmentId) {
+      // Cross-worker create claim. executeBookAppointment and the reconciler
+      // have both taken this since 2026-07-11; this path had no claim at all,
+      // so the read-after-write window the slot check above cannot see stayed
+      // fully open on reschedules. FAIL-OPEN (see appointment-sync-claim.js).
+      const newSlotMs = Date.parse(built.startTime);
+      let rescheduleClaimed = false;
+      if (isSlotCheckEnabled()) {
+        const claim = await claimAppointmentCreate(contactId, newSlotMs);
+        if (!claim.claimed) {
+          // Another worker is mid-create on this slot. Returning rather than
+          // throwing on purpose: the throw path escalates a "new slot
+          // unavailable" task to a rep and that would be a lie — the slot is
+          // being booked right now. The old appointment stays intact either
+          // way, so the lead is never stranded.
+          console.log(`[ActionExecutor] ⏭️  reschedule slot claim held for ${contactId}@${built.startTime} — another worker is creating this slot; skipping.`);
+          void emitSlotCheckEvent('noop_already_exists', {
+            contactId, calendarId: built.calendarId, startTime: built.startTime, matched: null,
+            extra: { caller: 'rule', site: 'executeRescheduleAppointment', reason: 'create_claim_held', oldAppointmentId: oldId },
+          });
+          return {
+            action: 'reschedule_skipped_claim_held',
+            old_appointment_id: oldId,
+            old_cancelled: false,
+            new_appointment_booked: false,
+            contact_id: contactId,
+            skipped_reason: 'create_claim_held',
+          };
+        }
+        rescheduleClaimed = claim.reason === 'claimed';
+      }
+
       console.log(`[ActionExecutor] Reschedule step 1/2: booking new appointment FIRST, calendar=${built.calendarId}, start=${built.startTime}${built.ignoreFreeSlotValidation ? ', override_availability=true' : ''}`);
-      const bookResult = await ghlFetch('POST', '/calendars/events/appointments', built.body);
+
+      // Title + address. No-op unless APPT_FORMAT_ENABLED, and fails open.
+      const fmt = await applyAppointmentFormatForContact(built.body, contactId, context?._contactCache);
+
+      let bookResult;
+      try {
+        bookResult = await ghlFetch('POST', '/calendars/events/appointments', built.body);
+      } catch (err) {
+        if (rescheduleClaimed) await releaseAppointmentCreate(contactId, newSlotMs).catch(() => {});
+        throw err;
+      }
       newAppointmentId = bookResult?.id || bookResult?.appointment?.id || null;
       if (!newAppointmentId) throw new Error('Booking returned no appointment id');
       console.log(`[ActionExecutor] ✅ New appointment booked id=${newAppointmentId}, status=${built.status}`);
       if (isSlotCheckEnabled()) {
-        await emitSlotCheckEvent('created', {
+        void emitSlotCheckEvent('created', {
           contactId, calendarId: built.calendarId, startTime: built.startTime, matched: null,
-          extra: { site: 'executeRescheduleAppointment', appointmentId: newAppointmentId, oldAppointmentId: oldId },
+          extra: {
+            caller: 'rule',
+            site: 'executeRescheduleAppointment',
+            appointmentId: newAppointmentId,
+            oldAppointmentId: oldId,
+            resolved_title: fmt.title,
+            address_populated: fmt.addressPopulated,
+          },
         });
       }
     }
