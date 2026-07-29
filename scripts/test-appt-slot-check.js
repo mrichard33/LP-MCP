@@ -126,3 +126,85 @@ test('the feature flag is strictly true-only (ships dark)', () => {
   }
   process.env.APPT_SLOT_CHECK_ENABLED = prev;
 });
+
+// ─── Event contract (added with the appt.booking retarget) ──────────
+//
+// These guard the three defects that made the PR #581 emitter unobservable.
+// The most important is bypass_filter: event-intake-filter.js is a default-DROP
+// allowlist, 'appt.booking' is deliberately NOT in ALLOWED_EVENT_TYPES (that
+// list is for types with a consuming agent_rules row), so without the bypass
+// every row lands in system_events_filtered and expires in 72h — the 24h
+// observation window would produce NOTHING.
+
+test('emitSlotCheckEvent emits appt.booking with bypass_filter and a unique key', async () => {
+  const { emitSlotCheckEvent } = await import('../src/appointments/slot-check.js');
+  const calls = [];
+
+  await emitSlotCheckEvent('created', {
+    contactId: 'c1', calendarId: CAL, startTime: TARGET, matched: null,
+    extra: { caller: 'endpoint', duration_ms: 42 },
+  }, { emit: async (opts) => { calls.push(opts); return null; } });
+
+  assert.equal(calls.length, 1);
+  const e = calls[0];
+  assert.equal(e.event_type, 'appt.booking', 'retargeted from appt.slot_check');
+  assert.equal(e.event_subtype, 'created');
+  assert.equal(e.source, 'lp_mcp');
+  assert.equal(e.entity_type, 'contact');
+  assert.equal(e.entity_id, 'c1');
+  assert.equal(e.ghl_contact_id, 'c1');
+  assert.equal(e.bypass_filter, true, 'MUST bypass the default-DROP intake filter');
+  assert.ok(e.idempotency_key.startsWith('book_c1_'), 'book_<contact>_<calendar>_<epochms> prefix');
+  assert.ok(e.idempotency_key.includes('created'), 'subtype in the key so decisions do not collide');
+  assert.equal(e.payload.caller, 'endpoint');
+  assert.equal(e.payload.duration_ms, 42);
+  assert.ok('matched_appointment_id' in e.payload);
+});
+
+test('every subtype carries bypass_filter — a missed one is silently dropped', async () => {
+  const { emitSlotCheckEvent } = await import('../src/appointments/slot-check.js');
+  for (const subtype of ['created', 'updated', 'noop_already_exists', 'error', 'budget_exceeded', 'query_failed']) {
+    const calls = [];
+    await emitSlotCheckEvent(subtype, {
+      contactId: 'c1', calendarId: CAL, startTime: TARGET, matched: null,
+    }, { emit: async (o) => { calls.push(o); return null; } });
+    assert.equal(calls[0].bypass_filter, true, `${subtype} must bypass the filter`);
+    assert.equal(calls[0].event_subtype, subtype);
+  }
+});
+
+test('budget_exceeded is its own subtype, never folded into error', async () => {
+  // It is the ONLY outcome that can leave an abandoned create in flight and so
+  // produce a duplicate. It has to be countable on its own.
+  const { emitSlotCheckEvent } = await import('../src/appointments/slot-check.js');
+  const calls = [];
+  const emit = async (o) => { calls.push(o); return null; };
+  await emitSlotCheckEvent('budget_exceeded', { contactId: 'c1', calendarId: CAL, startTime: TARGET }, { emit });
+  await emitSlotCheckEvent('error', { contactId: 'c1', calendarId: CAL, startTime: TARGET }, { emit });
+  assert.equal(calls[0].event_subtype, 'budget_exceeded');
+  assert.equal(calls[1].event_subtype, 'error');
+  assert.notEqual(calls[0].idempotency_key, calls[1].idempotency_key, 'distinct keys so neither dedups the other away');
+});
+
+test('repeat decisions on the same slot do NOT collide on the idempotency key', async () => {
+  // The PR #581 key was slot_<contact>_<calendar>_<slotMs> — no subtype, no
+  // time — so only the FIRST decision per slot ever persisted.
+  const { emitSlotCheckEvent } = await import('../src/appointments/slot-check.js');
+  const keys = new Set();
+  for (let i = 0; i < 3; i++) {
+    await emitSlotCheckEvent('created', {
+      contactId: 'c1', calendarId: CAL, startTime: TARGET,
+    }, { emit: async (o) => { keys.add(o.idempotency_key); return null; } });
+    await new Promise((r) => setTimeout(r, 2));
+  }
+  assert.equal(keys.size, 3, 'each decision gets its own row');
+});
+
+test('emitSlotCheckEvent never throws, even when the emitter rejects', async () => {
+  // Observability must never be able to fail a booking. Callers `void` this, so
+  // a rejected promise would surface as an unhandled rejection.
+  const { emitSlotCheckEvent } = await import('../src/appointments/slot-check.js');
+  await assert.doesNotReject(() => emitSlotCheckEvent('error', {
+    contactId: 'c-nonexistent', calendarId: CAL, startTime: 'not-a-date', matched: null,
+  }));
+});

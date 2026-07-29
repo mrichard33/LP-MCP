@@ -137,41 +137,71 @@ export async function findExistingAppointment({ contactId, calendarId, startTime
 }
 
 /**
- * Record one slot-check decision in system_events. Best-effort: observability
- * must never be able to fail a booking.
+ * Record one booking decision in system_events. Best-effort: observability must
+ * never be able to fail a booking.
  *
- * `query_failed` is a first-class subtype, not an error swallowed into silence —
- * a fall-through create after a failed lookup is exactly the case that needs to
- * stay countable, since it is the one path that can still produce a duplicate.
+ * `budget_exceeded` is its OWN subtype, never folded into `error`. It is the one
+ * outcome that can leave an abandoned create in flight and therefore produce a
+ * duplicate, so it has to be countable on its own. `query_failed` is likewise
+ * first-class rather than swallowed — a fall-through create after a failed
+ * lookup is the other path that can still duplicate.
+ *
+ * FIRE-AND-FORGET. Callers must `void` this, never `await` it. emitEvent makes
+ * two Supabase calls, each bounded by EMIT_EVENT_TIMEOUT_MS (default 6000) —
+ * up to 12s worst case, which does not fit inside the endpoint's 8s response
+ * budget. The internal catch means a rejected promise can never surface.
  *
  * NOTE for anyone querying these: system_events.created_at is genuine UTC, so
  * bucket it with AT TIME ZONE 'America/New_York'. Do NOT apply that cast to
  * lp_call_logs.call_date or lp_leads.appointment_date — those hold LP
  * wall-clock in a timestamptz column and the cast double-shifts them 4 hours.
  *
- * @param {'created'|'updated'|'noop_already_exists'|'query_failed'} subtype
+ * @param {'created'|'updated'|'noop_already_exists'|'error'|'budget_exceeded'|'query_failed'} subtype
+ * @param {object} opts
+ * @param {object} [deps] injectable emitter for tests — ESM namespace objects
+ *   are frozen, so this mirrors claimAppointmentCreate's injectable `client`
+ *   (services/appointment-sync-claim.js) rather than trying to patch the module.
  */
-export async function emitSlotCheckEvent(subtype, { contactId, calendarId, startTime, matched, extra = {} }) {
+export async function emitSlotCheckEvent(
+  subtype,
+  { contactId, calendarId, startTime, matched, extra = {} },
+  { emit = emitEvent } = {},
+) {
   try {
     const slotMs = toEpochMs(startTime);
-    await emitEvent({
-      event_type: 'appt.slot_check',
+    await emit({
+      event_type: 'appt.booking',
       event_subtype: subtype,
       source: 'lp_mcp',
       entity_type: 'contact',
       entity_id: contactId,
       ghl_contact_id: contactId,
-      idempotency_key: `slot_${contactId}_${calendarId}_${Number.isNaN(slotMs) ? 'na' : slotMs}`,
+      // Subtype + emit time are BOTH in the key. The previous form
+      // (slot_<contact>_<calendar>_<slotMs>) carried neither, so for a given
+      // slot only the FIRST decision ever persisted — a later `updated` or
+      // `created` hit the idempotency SELECT in emitEvent and returned null
+      // silently. One row per decision is the point here; this is not a dedup
+      // guard. Same rationale as lp-appointment-sync.js:501-503.
+      idempotency_key: `book_${contactId}_${calendarId}_${Number.isNaN(slotMs) ? 'na' : slotMs}_${subtype}_${Date.now()}`,
       payload: {
         contactId,
         calendarId,
         startTime,
-        matchedAppointmentId: matched?.appointment_id || null,
+        matched_appointment_id: matched?.appointment_id || null,
         matchedStartTime: matched?.start_time || null,
         matchedStatus: matched ? readStatus(matched) : null,
         matchWindowSeconds: matchWindowSeconds(),
         ...extra,
       },
+      // MANDATORY. 'appt.booking' is NOT in ALLOWED_EVENT_TYPES
+      // (services/event-intake-filter.js:111-166) and never will be — that
+      // list's contract is "types with >=1 consuming agent_rule" and this is
+      // pure telemetry. shouldAllowEvent() is default-DROP (188,654 rows
+      // diverted in 30 days), so without bypass_filter every row lands in
+      // system_events_filtered with reason "event_type_not_in_allowlist",
+      // expires in 72h, and the observation window produces NOTHING. Precedent:
+      // agentic.hold_error, documented verbatim at event-intake-filter.js:133-134.
+      bypass_filter: true,
     });
   } catch (err) {
     console.warn(`[SlotCheck] event emit failed for ${contactId}: ${err.message}`);
