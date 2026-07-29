@@ -491,6 +491,25 @@ async function runMigrations() {
     console.error('[Migration] link corroboration schema FAILED (observe-mode lead upserts depend on it — apply sql/046 manually):', err.message);
   }
 
+  // Note-push terminal state (sql/050 — the file is the source of truth; this
+  // mirror guarantees the columns exist before initFieldSync() starts the 90s
+  // notes cycle, whose select now filters on ghl_note_push_terminal and would
+  // throw without them). runSQL (throws on failure) for the same reason as the
+  // blocks above.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`ALTER TABLE lp_notes
+              ADD COLUMN IF NOT EXISTS ghl_note_push_attempts integer NOT NULL DEFAULT 0,
+              ADD COLUMN IF NOT EXISTS ghl_note_push_error    text,
+              ADD COLUMN IF NOT EXISTS ghl_note_push_terminal boolean NOT NULL DEFAULT false;
+            CREATE INDEX IF NOT EXISTS idx_lp_notes_pending
+              ON lp_notes (created_at_lp)
+              WHERE ghl_note_pushed = false AND ghl_note_push_terminal = false;`);
+    console.log('[Migration] note push terminal state (sql/050) ready');
+  } catch (err) {
+    console.error('[Migration] note push terminal state FAILED (pushNotesToGHL selects on ghl_note_push_terminal — apply sql/050 manually):', err.message);
+  }
+
   // Scorecard revenue realignment (sql/040): live-month RTP-net + provisional-gross columns,
   // the Net Report staging table, and the source-precedence view. Additive/idempotent — the
   // one-shot label relabels (sql/040 §C) are NOT run here (data ops, applied once via migration).

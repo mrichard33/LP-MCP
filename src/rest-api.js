@@ -36,6 +36,8 @@ import { registerEngagementRoutes } from './nurture/nurture-engagement.js';
 import { registerAppointmentNotificationRoutes } from './notifications/appointment-notifications.js';
 import { registerContractCancellationNotificationRoutes } from './notifications/cancellation-notifications.js';
 import { five9WebhookHandler } from './five9-events.js';
+import { getGHLContact } from './ghl.js';
+import { LINK_SOURCE } from './services/link-corroboration.js';
 import { createAppointmentFromLpHandler } from './appointments/booking-endpoint.js';
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1118,14 +1120,26 @@ async function lpLeadRefreshHandler(req, res) {
           .eq('lp_lead_id', leadId)
           .maybeSingle();
         if (row && !row.ghl_contact_id) {
-          // legacy_unverified: the id came from the inbound GHL payload, not
-          // from identity corroboration — the resolver reclassifies it on
-          // the next sync cycle.
-          await supabase
-            .from('lp_leads')
-            .update({ ghl_contact_id: payloadGhlContactId, ghl_link_source: 'legacy_unverified' })
-            .eq('lp_lead_id', leadId);
-          console.log(`[LP Inbound Refresh] backfilled ghl_contact_id=${payloadGhlContactId} for lead_id=${leadId}`);
+          // 2026-07-29: this used to persist the payload id unvalidated (stamped
+          // legacy_unverified). That is the one writer that takes a contact id
+          // straight from an inbound webhook with no corroboration at all, and a
+          // bad id here poisons lp_leads and every lp_notes / lp_call_logs row
+          // that later inherits it. Confirm it is readable first.
+          //
+          // Fail CLOSED: getGHLContact returns null for not-found AND for a
+          // transient read failure alike, and we cannot tell them apart here. A
+          // blip just defers the backfill to the next poll, which this whole
+          // block is already best-effort about.
+          const verified = await getGHLContact(payloadGhlContactId);
+          if (!verified) {
+            console.warn(`[LP Inbound Refresh] rejected ghl_contact_id=${payloadGhlContactId} for lead_id=${leadId} — contact not readable, not persisting`);
+          } else {
+            await supabase
+              .from('lp_leads')
+              .update({ ghl_contact_id: payloadGhlContactId, ghl_link_source: LINK_SOURCE.WEBHOOK_VERIFIED })
+              .eq('lp_lead_id', leadId);
+            console.log(`[LP Inbound Refresh] backfilled ghl_contact_id=${payloadGhlContactId} for lead_id=${leadId} (live-verified)`);
+          }
         }
       }
 

@@ -94,7 +94,7 @@ import { syncCallLogs, syncNotes, syncActivities, syncJobAndMilestones } from '.
 import { emitEvent, dispositionPriority } from './event-emitter.js';
 import { pushLeadNotesImmediately } from './ghl-notes-sync.js';
 import { GHL_CONTACT_ID_PATTERN, lognumberCandidate } from './ghl-link-shape.js';
-import { resolveLeadGhlLink } from './services/link-corroboration.js';
+import { resolveLeadGhlLink, LINK_SOURCE } from './services/link-corroboration.js';
 import { shouldRenewConsent } from './services/consent-renewal.js';
 
 // ─── Skip counter for observability ──────────────────────────────
@@ -358,15 +358,49 @@ function needsAttributionBackfill(existing, lead) {
 // ghl_link_source untouched" (the key is omitted so upsert-on-conflict
 // preserves it). Without resolvedLink the legacy v10.1 derivation applies
 // and no ghl_link_source key is emitted.
+//
+// 2026-07-29 (orphan-link hardening). Two defects surfaced by the
+// Y21mrJPUGYGKIWFptVpu incident, both specific to observe mode:
+//
+//  1. link-corroboration.js returns `ghlContactId: mode === 'observe' ? legacyId
+//     : id`, and legacyId is the RAW LP lognumber. So the resolver could
+//     classify a candidate rejected_uncorroborated / rejected_conflict and we
+//     would persist it anyway. We now decline to adopt a NEW id the resolver
+//     just rejected, and keep the stored link instead.
+//  2. Several resolver paths return linkSource: null, which became `undefined`
+//     below and so omitted the key — correct for an UPDATE (preserves the
+//     stored classification) but on an INSERT it left ghl_link_source NULL next
+//     to a populated ghl_contact_id. That is exactly the untraceable state the
+//     offending row was in. New rows now get the legacy_unverified floor.
+const REJECTED_LINK_SOURCES = new Set([
+  LINK_SOURCE.REJECTED_UNCORROBORATED,
+  LINK_SOURCE.REJECTED_CONFLICT,
+]);
+
 function buildLeadRow(prospect, lead, {
   lpLeadId, lpProspectId, bucket, tag, ghlId = null, existingGhlId = null, resolvedLink = null,
 }) {
   // v10.1: never lose a previously-established link — fall back to the
   // existing ghl_contact_id when neither lognumber nor the phone/email
   // match (ghlId) resolves one this run.
-  const leadGhlId = resolvedLink
+  let leadGhlId = resolvedLink
     ? (resolvedLink.ghlContactId || existingGhlId || null)
     : (deriveLeadGhlId(lead, ghlId) || existingGhlId || null);
+
+  // Never persist an id the resolver classified as rejected. Enforce mode
+  // already does this (link-corroboration.js returns existingGhlId on those
+  // paths); this makes observe mode stop overriding it with the raw lognumber.
+  if (resolvedLink && REJECTED_LINK_SOURCES.has(resolvedLink.linkSource)
+      && leadGhlId && leadGhlId !== existingGhlId) {
+    console.warn(`[Sync] lead ${lpLeadId}: refusing ghl_contact_id=${leadGhlId} (${resolvedLink.linkSource}) — keeping ${existingGhlId || 'no link'}`);
+    leadGhlId = existingGhlId || null;
+  }
+
+  // Floor: a populated ghl_contact_id must never be written with a NULL
+  // ghl_link_source. Only applies when there is no stored row to preserve a
+  // classification from — on an existing row the key stays omitted.
+  const resolvedLinkSource = resolvedLink?.linkSource
+    || (leadGhlId && !existingGhlId ? LINK_SOURCE.LEGACY_UNVERIFIED : undefined);
 
   // v10.2: stamp the effective source (native, else promoter-derived) so the
   // "Internet, <Vendor>" feeds stop persisting null source/sourcesubdescr.
@@ -399,8 +433,9 @@ function buildLeadRow(prospect, lead, {
       lp_prospect_id:     lpProspectId,
       ghl_contact_id:     leadGhlId,
       // Omitted (undefined) unless the resolver classified the link this
-      // run — upsert-on-conflict then preserves the stored value.
-      ghl_link_source:    resolvedLink?.linkSource || undefined,
+      // run — upsert-on-conflict then preserves the stored value. A brand-new
+      // row carrying a link gets the legacy_unverified floor rather than NULL.
+      ghl_link_source:    resolvedLinkSource,
       first_name:         getField(prospect, 'firstname', 'FirstName', 'first_name'),
       last_name:          getField(prospect, 'lastname', 'LastName', 'last_name'),
       email:              getField(prospect, 'email', 'Email'),

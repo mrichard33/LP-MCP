@@ -38,6 +38,11 @@ export const LINK_SOURCE = {
   REJECTED_CONFLICT: 'rejected_conflict',
   LEGACY_UNVERIFIED: 'legacy_unverified',
   UNBOUND_REMEDIATION: 'unbound_remediation',
+  // 2026-07-29: id arrived on an inbound GHL webhook payload AND was confirmed
+  // readable by a live getGHLContact before being persisted (src/rest-api.js).
+  // Distinct from legacy_unverified, which that path used to stamp on an
+  // entirely unvalidated payload id.
+  WEBHOOK_VERIFIED: 'webhook_verified',
 };
 
 // Trust ranking for the downgrade guard: a stored rank-3 source is only ever

@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { acquireToken, report429 } from './ghl-rate-limiter.js';
+import { classifyGHLError } from './services/ghl-error-classify.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
@@ -50,10 +51,17 @@ if (ghlClient) {
   );
 }
 
+// 2026-07-29 — classification moved to src/services/ghl-error-classify.js so it
+// can be unit-tested and reused by scripts/audit-orphan-ghl-links.js. It now
+// recognises 404 and the GHL wrong-location 403 in addition to the original
+// 400 + "not found" (a bare 403 still counts as a hard failure — see that file).
+//
+// The private wrapper is KEPT so all seven call sites below are untouched. That
+// is deliberate: every one of them returns BEFORE ghlFailCount++, which is what
+// stops a bad contact id from walking the shared counter toward ghlDisabled.
+// Preserving the call sites preserves that ordering by construction.
 function isContactNotFound(err) {
-  if (err.response?.status !== 400) return false;
-  const body = JSON.stringify(err.response?.data || '').toLowerCase();
-  return body.includes('not found');
+  return classifyGHLError(err).notFound;
 }
 
 export async function searchGHLContact(params) {
@@ -355,7 +363,12 @@ function normalizeNoteBody(body) {
  * Returns the matching note id (or the string 'match' if the id is
  * absent), or null when there is no recent duplicate.
  *
- * Fail-open: any read error returns null (caller will then write).
+ * Fail-open: a genuine read hiccup returns null (caller will then write).
+ *
+ * EXCEPT not-found: if the pre-check read proves the contact is unreachable,
+ * return the sentinel 'contact_not_found' so addGHLNote can short-circuit
+ * without attempting the POST. That halves the wasted calls against the rate
+ * limiter for an orphan id (2026-07-29 incident).
  */
 async function findRecentDuplicateNote(ghlContactId, noteBody) {
   try {
@@ -381,6 +394,7 @@ async function findRecentDuplicateNote(ghlContactId, noteBody) {
     }
     return null;
   } catch (err) {
+    if (classifyGHLError(err).notFound) return 'contact_not_found';
     console.warn(`[GHL] Note dedup pre-check failed for ${ghlContactId} (writing anyway): ${err.message}`);
     return null;
   }
@@ -394,6 +408,15 @@ async function findRecentDuplicateNote(ghlContactId, noteBody) {
  * object ({ skipped: true, ... }) is returned instead of creating a
  * duplicate. Pass { dedupe: false } to force the write.
  *
+ * Returns:
+ *   data object          — note written
+ *   { skipped: true, … } — identical note already present in the dedup window
+ *   'not_found'          — contact unreachable (deleted / another location);
+ *                          PERMANENT, never retry. Truthy — test
+ *                          `=== 'not_found'` before any truthiness check.
+ *   null                 — GHL disabled, empty body, or a transient failure;
+ *                          retry later.
+ *
  * @param {string} ghlContactId
  * @param {string} noteBody
  * @param {{ dedupe?: boolean }} [options]
@@ -406,6 +429,12 @@ export async function addGHLNote(ghlContactId, noteBody, options = {}) {
 
   if (dedupe) {
     const dupId = await findRecentDuplicateNote(ghlContactId, noteBody);
+    // Sentinel FIRST — 'contact_not_found' is a truthy string, so this must be
+    // tested before the duplicate-hit check below or it reads as a dup match.
+    if (dupId === 'contact_not_found') {
+      console.warn(`[GHL] Note add: contact ${ghlContactId} not found (dedup pre-check) — skipping POST`);
+      return 'not_found';
+    }
     if (dupId) {
       console.log(`[GHL] Skipped duplicate note for ${ghlContactId} — matches existing note ${dupId} within ${NOTE_DEDUP_WINDOW_MIN}m`);
       return { skipped: true, reason: 'duplicate_note', matched_note_id: dupId };
@@ -426,8 +455,12 @@ export async function addGHLNote(ghlContactId, noteBody, options = {}) {
     return data || { success: true };
   } catch (err) {
     if (isContactNotFound(err)) {
+      // 'not_found' (not null) so callers can tell "never retry" from "retry
+      // later" — mirrors the updateGHLContactFields convention. NOTE: this is a
+      // TRUTHY string; any caller inspecting the return must test
+      // `=== 'not_found'` BEFORE a plain truthiness check.
       console.warn(`[GHL] Note add: contact ${ghlContactId} not found (deleted?) — skipping`);
-      return null;
+      return 'not_found';
     }
     ghlFailCount++;
     const status = err.response?.status || 'no response';
