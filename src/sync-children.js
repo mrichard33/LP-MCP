@@ -409,7 +409,7 @@ export async function syncAllChildRecords(logIds, counts) {
 
   while (true) {
     const { data: leads, error } = await supabase.from('lp_leads')
-      .select('lp_lead_id, lp_prospect_id, ghl_contact_id, ghl_tag_applied, ghl_entry_tag, lp_day15_triggered, created_at_lp')
+      .select('lp_lead_id, lp_prospect_id, ghl_contact_id, ghl_link_source, ghl_tag_applied, ghl_entry_tag, lp_day15_triggered, created_at_lp')
       .range(offset, offset + pageSize - 1)
       .order('created_at_lp', { ascending: false });
     if (error) throw error;
@@ -434,7 +434,13 @@ export async function syncAllChildRecords(logIds, counts) {
 
         // A link written from a fresh matchToGHL result is phone/email
         // verified by construction — stamp its ghl_link_source accordingly.
-        // A carried-forward stored link keeps its existing classification.
+        //
+        // 2026-07-29: the carried-forward case used to omit ghl_link_source
+        // entirely, so a stored link that was never classified stayed NULL
+        // forever while this write kept re-asserting the id. A populated
+        // ghl_contact_id must never sit next to a NULL source — that is what
+        // made the Y21mrJPUGYGKIWFptVpu link untraceable. Floor it at
+        // legacy_unverified; the resolver upgrades it on the next lead sync.
         if (ghlId && !lead.ghl_tag_applied && lead.ghl_entry_tag) {
           const success = await applyGHLTag(ghlId, lead.ghl_entry_tag);
           if (success) {
@@ -442,7 +448,9 @@ export async function syncAllChildRecords(logIds, counts) {
               .update({
                 ghl_contact_id: ghlId,
                 ghl_tag_applied: true,
-                ...(matchedGhlId ? { ghl_link_source: 'phone_email_match' } : {}),
+                ghl_link_source: matchedGhlId
+                  ? 'phone_email_match'
+                  : (lead.ghl_link_source || 'legacy_unverified'),
               }).eq('lp_lead_id', lead.lp_lead_id);
           }
         } else if (matchedGhlId && !lead.ghl_contact_id) {

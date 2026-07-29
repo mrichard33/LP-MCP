@@ -18,6 +18,45 @@
 import supabase from './supabase.js';
 import { addGHLNote } from './ghl.js';
 
+// ─── Terminal failure state (sql/050) ────────────────────────────────────────
+//
+// 2026-07-28: one orphan contact id (Y21mrJPUGYGKIWFptVpu, LP lead 562172) made
+// pushNotesToGHL report "0 pushed, 3 failed" on every 90s cycle forever — the
+// rows were never marked, so they were re-selected indefinitely and blocked the
+// backlog behind them. Rows are now retired two ways:
+//
+//   result === 'not_found'  → terminal immediately, ghl_contact_id NULLed, and
+//                             counted as SKIPPED (the contact is gone; this is
+//                             not a failure anyone can act on).
+//   any other falsy result  → attempts++, terminal at MAX_NOTE_PUSH_ATTEMPTS.
+//                             General poison-pill backstop: it must stop ANY
+//                             undeliverable note, not just this failure mode.
+const MAX_NOTE_PUSH_ATTEMPTS = 5;
+
+/**
+ * Record a failed push. Returns 'terminal' when the row will never be selected
+ * again, 'retry' otherwise.
+ */
+async function markNoteOutcome(noteId, result, attempts) {
+  if (result === 'not_found') {
+    await supabase.from('lp_notes').update({
+      ghl_note_push_terminal: true,
+      ghl_note_push_error: 'contact_not_found',
+      ghl_contact_id: null,
+    }).eq('id', noteId);
+    return 'terminal';
+  }
+
+  const next = (attempts || 0) + 1;
+  const terminal = next >= MAX_NOTE_PUSH_ATTEMPTS;
+  await supabase.from('lp_notes').update({
+    ghl_note_push_attempts: next,
+    ghl_note_push_error: String(result == null ? 'push_failed' : result).slice(0, 500),
+    ghl_note_push_terminal: terminal,
+  }).eq('id', noteId);
+  return terminal ? 'terminal' : 'retry';
+}
+
 /**
  * Format an LP date for display. Uses UTC extraction because LP stores
  * local time but Supabase treats it as UTC.
@@ -93,9 +132,10 @@ export async function pushNotesToGHL({ batchSize = 50, delayMs = 300, maxNotes =
   while (totalProcessed < maxNotes) {
     const { data: notes, error } = await supabase
       .from('lp_notes')
-      .select('id, lp_note_id, lp_lead_id, ghl_contact_id, note_body, note_type, note_category, created_by_rep_name, created_at_lp')
+      .select('id, lp_note_id, lp_lead_id, ghl_contact_id, note_body, note_type, note_category, created_by_rep_name, created_at_lp, ghl_note_push_attempts')
       .not('ghl_contact_id', 'is', null)
       .eq('ghl_note_pushed', false)
+      .eq('ghl_note_push_terminal', false)
       .not('note_body', 'is', null)
       // OLDEST FIRST — so newest notes are added last and appear at top in GHL
       .order('created_at_lp', { ascending: true, nullsFirst: false })
@@ -103,7 +143,9 @@ export async function pushNotesToGHL({ batchSize = 50, delayMs = 300, maxNotes =
 
     if (error) {
       console.error('[NoteSync] Query failed:', error.message);
-      if (error.message.includes('ghl_note_pushed')) {
+      if (error.message.includes('ghl_note_push_terminal') || error.message.includes('ghl_note_push_attempts')) {
+        console.error('[NoteSync] Note-push terminal columns do not exist — run migration sql/050_note_push_terminal.sql');
+      } else if (error.message.includes('ghl_note_pushed')) {
         console.error('[NoteSync] Column ghl_note_pushed does not exist — run migration sql/005_add_ghl_note_pushed.sql');
       }
       break;
@@ -125,16 +167,26 @@ export async function pushNotesToGHL({ batchSize = 50, delayMs = 300, maxNotes =
       const formattedBody = formatNoteForGHL(note);
       const result = await addGHLNote(note.ghl_contact_id, formattedBody);
 
-      if (result) {
+      // 'not_found' is a TRUTHY string — it must be tested before `if (result)`
+      // or a dead contact would be marked delivered.
+      if (result === 'not_found') {
+        stats.skipped++;
+        await markNoteOutcome(note.id, result, note.ghl_note_push_attempts);
+        console.warn(`[NoteSync] Note ${note.lp_note_id} terminal — contact ${note.ghl_contact_id} not found; link cleared`);
+      } else if (result) {
         stats.pushed++;
         await supabase.from('lp_notes')
           .update({ ghl_note_pushed: true })
           .eq('id', note.id);
+        await sleep(delayMs);
       } else {
         stats.failed++;
+        const outcome = await markNoteOutcome(note.id, result, note.ghl_note_push_attempts);
+        if (outcome === 'terminal') {
+          console.warn(`[NoteSync] Note ${note.lp_note_id} terminal after ${MAX_NOTE_PUSH_ATTEMPTS} failed attempts — giving up`);
+        }
       }
 
-      if (result) await sleep(delayMs);
       if (totalProcessed >= maxNotes) break;
     }
 
@@ -169,9 +221,10 @@ export async function pushLeadNotesImmediately(lpLeadId, ghlContactId) {
   try {
     const { data: notes, error } = await supabase
       .from('lp_notes')
-      .select('id, lp_note_id, lp_lead_id, ghl_contact_id, note_body, note_type, note_category, created_by_rep_name, created_at_lp')
+      .select('id, lp_note_id, lp_lead_id, ghl_contact_id, note_body, note_type, note_category, created_by_rep_name, created_at_lp, ghl_note_push_attempts, ghl_note_push_terminal')
       .eq('lp_lead_id', lpLeadId)
       .eq('ghl_note_pushed', false)
+      .eq('ghl_note_push_terminal', false)
       .not('note_body', 'is', null)
       .order('created_at_lp', { ascending: true, nullsFirst: false });
 
@@ -182,6 +235,12 @@ export async function pushLeadNotesImmediately(lpLeadId, ghlContactId) {
     if (!notes || notes.length === 0) return stats;
 
     for (const note of notes) {
+      // Belt-and-braces: the select already excludes terminal rows, but the
+      // fallback below would silently retarget a row whose ghl_contact_id was
+      // NULLed by a terminal not-found mark at the caller's id — re-pushing to
+      // a contact this note was never linked to. Skip them outright.
+      if (note.ghl_note_push_terminal) continue;
+
       if (!note.note_body || note.note_body.trim().length < 3) {
         stats.skipped++;
         await supabase.from('lp_notes').update({ ghl_note_pushed: true }).eq('id', note.id);
@@ -193,13 +252,22 @@ export async function pushLeadNotesImmediately(lpLeadId, ghlContactId) {
       const formattedBody = formatNoteForGHL(note);
       const result = await addGHLNote(targetContactId, formattedBody);
 
-      if (result) {
+      // 'not_found' is truthy — test the sentinel before `if (result)`.
+      if (result === 'not_found') {
+        stats.skipped++;
+        await markNoteOutcome(note.id, result, note.ghl_note_push_attempts);
+        console.warn(`[NoteSync] Note ${note.lp_note_id} terminal — contact ${targetContactId} not found; link cleared`);
+      } else if (result) {
         stats.pushed++;
         await supabase.from('lp_notes')
           .update({ ghl_note_pushed: true, ghl_contact_id: targetContactId })
           .eq('id', note.id);
       } else {
         stats.failed++;
+        const outcome = await markNoteOutcome(note.id, result, note.ghl_note_push_attempts);
+        if (outcome === 'terminal') {
+          console.warn(`[NoteSync] Note ${note.lp_note_id} terminal after ${MAX_NOTE_PUSH_ATTEMPTS} failed attempts — giving up`);
+        }
       }
     }
 
@@ -214,7 +282,8 @@ export async function pushLeadNotesImmediately(lpLeadId, ghlContactId) {
 }
 
 /**
- * Count unpushed notes for monitoring.
+ * Count unpushed notes for monitoring. Excludes terminal rows — they will never
+ * be pushed, so counting them would report a backlog that can never drain.
  */
 export async function countUnpushedNotes() {
   try {
@@ -223,6 +292,7 @@ export async function countUnpushedNotes() {
       .select('id', { count: 'exact', head: true })
       .not('ghl_contact_id', 'is', null)
       .eq('ghl_note_pushed', false)
+      .eq('ghl_note_push_terminal', false)
       .not('note_body', 'is', null);
     if (error) return -1;
     return count || 0;
