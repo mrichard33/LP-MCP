@@ -30,11 +30,14 @@ process.env.SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ||
 const {
   formatRepFirstName,
   resolveReplySenderName,
+  resolveOwningRepName,
   derivePostAppointment,
   detectContextDrift,
   findUnresolvedTokens,
   stripDanglingLinkReferences,
   findTimelinePromises,
+  assertAcknowledgmentBody,
+  buildResponsePrompt,
 } = await import('../src/response-generator.js');
 
 const { stripQuotedEmail, scrubUrlsForExtraction, htmlEmailToText } =
@@ -58,26 +61,30 @@ test('placeholder rep values never become a name', () => {
   }
 });
 
-test('resolver prefers Rep Display Name, then LP Rep Name, then lp.rep_name', () => {
-  assert.equal(resolveReplySenderName({
+test('the reply sender is the IN-OFFICE rep, never the contact field rep', () => {
+  // The agentic email is sent as Mark from the office inbox. Beverly is the
+  // field rep on Kelly's deal; she never authors these emails, so she must
+  // never appear as the sender.
+  assert.equal(resolveReplySenderName(), 'Mark');
+});
+
+test('the owning rep resolves to the contact field rep, for body references', () => {
+  assert.equal(resolveOwningRepName({
     lead: { rep_display_name: 'Bev', lp_rep_name: 'Dorsett, Beverly' },
     lp: { rep_name: 'Somebody Else' },
   }), 'Bev');
 
-  assert.equal(resolveReplySenderName({
+  assert.equal(resolveOwningRepName({
     lead: { lp_rep_name: 'Dorsett, Beverly' },
     lp: { rep_name: 'Somebody Else' },
   }), 'Beverly');
 
-  assert.equal(resolveReplySenderName({
-    lead: {},
-    lp: { rep_name: 'Dorsett, Beverly' },
-  }), 'Beverly');
+  assert.equal(resolveOwningRepName({ lead: {}, lp: { rep_name: 'Dorsett, Beverly' } }), 'Beverly');
 });
 
-test('no rep on record → null (company voice), never the location global', () => {
-  assert.equal(resolveReplySenderName({ lead: {}, lp: {} }), null);
-  assert.equal(resolveReplySenderName({}), null);
+test('no owning rep on record → null, never a fabricated name', () => {
+  assert.equal(resolveOwningRepName({ lead: {}, lp: {} }), null);
+  assert.equal(resolveOwningRepName({}), null);
 });
 
 // ── D1: unresolved merge tokens ──────────────────────────────────────
@@ -220,6 +227,153 @@ test('acknowledgment copy is not falsely flagged for ordinary words', () => {
   ]) {
     assert.deepEqual(findTimelinePromises(body), [], `false positive on: "${body}"`);
   }
+});
+
+// ── The Kelly fixture, end to end through the real prompt builder ────
+//
+// Kelly's live record still carries the exact broken state this incident
+// produced: stage:booking-main sitting alongside lp-demo-completed and
+// lp-route:post-appointment, disposition OPPFDN, and a thread whose last
+// outbound is Mark-signed. Mark Test does not reproduce any of it. These
+// assertions run the real buildResponsePrompt over that state so the
+// regression is locked into `npm test`, not left to a one-off script.
+
+const KELLY_CONTEXT = {
+  lead: {
+    ghl_contact_id: 'qaYQSOFMN0CA0wbQjMEY',
+    name: 'Kelly Callahan',
+    first_name: 'Kelly',
+    lead_score: 29,
+    // The race-corrupted live stage — what the generator actually saw.
+    current_stage_tag: 'stage:booking-main',
+    current_tags: [
+      'stage:booking-main', 'booking:active', 'fast-track:ai-detected',
+      'lp-demo-completed', 'lp-route:post-appointment', 'needs-rep-review',
+      'esc:existing-customer', 'objection-confirmed-trust',
+    ],
+    lp_rep_name: 'Dorsett, Beverly',
+  },
+  lp: {
+    matched: true,
+    rep_name: 'Dorsett, Beverly',
+    disposition: 'OPPFDN',
+    disposition_code: 'OPPFDN',
+    demo_completed: true,
+    appointment_set: true,
+    appointment_date: '2026-07-25T18:00:00+00:00',
+    appointment_days_delta: -4,
+    notes: [],
+  },
+  intelligence: { buyer_stage: 4, fast_track_eligible: true },
+  conversation_recent: [],
+};
+
+const KELLY_SNAPSHOT_FULL = { current_stage_tag: 'stage:post-appointment', buyer_stage: 4 };
+
+function kellyPrompt(extraOpts = {}) {
+  return buildResponsePrompt(
+    KELLY_CONTEXT, 'email',
+    "I have not received an estimate. I'm interested in the product, but still have not heard from Beverly.",
+    null,
+    { intent_class: 'UNCLEAR', confidence: 0.5, classification_method: 'test' },
+    true,            // fastTrack — as it was for Kelly
+    'hot',
+    null,
+    { threadSenderType: 'mark', contextSnapshot: KELLY_SNAPSHOT_FULL, ...extraOpts },
+  );
+}
+
+test('Kelly fixture: no handoff bridge — signer and sender are both Mark', () => {
+  // The nurture email is Mark-signed and the reply is sent AS Mark, so the
+  // bridge is self-referential by construction. This is the literal regression:
+  // "Mark here — Mark asked me to reach out."
+  const p = kellyPrompt();
+  assert.ok(/cannot hand off to themselves/i.test(p), 'collision branch did not fire');
+  assert.ok(!/asked me to reach out/i.test(p), 'self-referential bridge still instructed');
+});
+
+test('a Randy-signed thread still gets a real bridge, with literal names', () => {
+  const p = kellyPrompt({ threadSenderType: 'randy' });
+  assert.ok(/"Mark here — Randy asked me to reach out/.test(p), 'legitimate bridge missing or not literal');
+  assert.ok(!/\{\{custom_values\./.test(p), 'merge tag survived in the bridge');
+});
+
+test('AUTHORSHIP block names Mark as the only signable identity', () => {
+  const p = kellyPrompt();
+  assert.ok(/AUTHORSHIP — WHO THIS REPLY IS FROM/.test(p), 'authorship block missing');
+  assert.ok(/You are writing as Mark, the in-office rep/.test(p), 'author not declared as Mark');
+  assert.ok(/Mark is the ONLY name you may sign or self-identify with/.test(p));
+});
+
+test('the field rep is labelled as NOT the author wherever she appears', () => {
+  const p = kellyPrompt();
+  assert.ok(/NOT the author of your reply\): Dorsett, Beverly/.test(p), 'field rep not labelled');
+  assert.ok(/Never open as them \("Beverly here"\)/.test(p), 'first-person ban missing');
+  assert.ok(/Refer to them in the THIRD person only/.test(p));
+});
+
+test('Kelly fixture: no merge tag reaches the prompt', () => {
+  assert.ok(!/\{\{custom_values\./.test(kellyPrompt()), 'custom_values merge tag in prompt');
+});
+
+test('Kelly fixture: post-appointment wins over the live stage:booking-main tag', () => {
+  const p = kellyPrompt();
+  assert.ok(/POST-APPOINTMENT CONDUCT/.test(p), 'post-appointment block missing');
+  assert.ok(/lp\.demo_completed/.test(p), 'LP ground truth not cited as evidence');
+  // The decision-time stage, not the race-corrupted live one.
+  assert.ok(/FUNNEL STAGE TAG: stage:post-appointment/.test(p), 'live stage tag leaked into the prompt');
+  assert.ok(!/FUNNEL STAGE TAG: stage:booking-main/.test(p));
+});
+
+test('Kelly fixture: the FAST_TRACK booking push is suppressed', () => {
+  const p = kellyPrompt();
+  assert.ok(/fast-track BOOKING push is SUPPRESSED/i.test(p), 'fast-track booking push not suppressed');
+  assert.ok(!/Apply BOOKING — ASK-FIRST PROTOCOL/.test(p), 'booking protocol still instructed');
+});
+
+test('Kelly fixture: escalate_to_rep adds acknowledgment-only conduct naming Beverly', () => {
+  const p = kellyPrompt({ recommendedAction: 'escalate_to_rep', escalationCategory: 'existing_customer_service' });
+  assert.ok(/ACKNOWLEDGMENT-ONLY CONDUCT/.test(p), 'ack block missing');
+  assert.ok(/NEVER COMMIT TO A TIMELINE/.test(p), 'timeline ban missing');
+  assert.ok(/name the person who now owns it \(Beverly\)/.test(p), 'owner not resolved to Beverly');
+});
+
+test('Kelly fixture: without escalate_to_rep there is no acknowledgment block', () => {
+  assert.ok(!/ACKNOWLEDGMENT-ONLY CONDUCT/.test(kellyPrompt()));
+});
+
+// ── The acknowledgment-body contract ─────────────────────────────────
+
+test('the body actually sent to Kelly fails the acknowledgment contract', () => {
+  const sent = '{{custom_values.rep_name}} here — Mark asked me to reach out personally after seeing your message.\n\n'
+    + 'Kelly, that is not okay, and I want to be straight with you about it. You sat through a full 90-minute visit, '
+    + 'you are clearly interested, and you should have had your estimate in hand days ago.\n\n'
+    + 'Beverly Dorsett is your rep and she has your file. I am flagging this to her and her manager right now so your '
+    + 'estimate gets to you today. Would you like to get your verification visit back on the calendar?';
+  const v = assertAcknowledgmentBody(sent, { ownerName: 'Beverly' });
+  for (const expected of ['handoff bridge present', 'time commitment', 'booking vocabulary', 'contains a question', 'unresolved token']) {
+    assert.ok(v.some(x => x.includes(expected)), `contract missed "${expected}" — got: ${JSON.stringify(v)}`);
+  }
+});
+
+test('a compliant acknowledgment passes the contract clean', () => {
+  const ok = 'Got it, Kelly — you have been waiting on that estimate and that is on us. '
+    + 'Beverly has your file and I have flagged this to her and her manager.';
+  assert.deepEqual(assertAcknowledgmentBody(ok, { ownerName: 'Beverly' }), []);
+});
+
+test('the contract catches an acknowledgment that omits the human owner', () => {
+  const v = assertAcknowledgmentBody('Got it — someone will follow up on this.', { ownerName: 'Beverly' });
+  assert.ok(v.some(x => x.includes('does not name the human owner')));
+});
+
+test('the contract catches an over-long acknowledgment', () => {
+  const v = assertAcknowledgmentBody('One. Two. Three.', { maxSentences: 2 });
+  assert.ok(v.some(x => x.includes('3 sentences')), `got: ${JSON.stringify(v)}`);
+});
+
+test('the contract rejects an empty body', () => {
+  assert.deepEqual(assertAcknowledgmentBody(''), ['empty body']);
 });
 
 // ── B5: quoted thread + URL scrubbing ────────────────────────────────
