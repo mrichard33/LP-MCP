@@ -37,6 +37,7 @@
 
 import supabase from './supabase.js';
 import { sendGroupMeMessage } from './groupme.js';
+import { flattenWebhookBody } from './webhook-body.js';
 import {
   BUSINESS_HOUR_START_ET,
   BUSINESS_HOUR_END_ET,
@@ -178,7 +179,20 @@ async function forwardToLp(bodyObj) {
 export function registerLpAddleadProxyRoutes(app) {
   app.post('/webhook/ghl/lp-addlead-proxy', async (req, res) => {
     const started = Date.now();
-    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const raw = req.body && typeof req.body === 'object' ? req.body : {};
+    // Flatten GHL's nested customData before anything reads a key. Workflow
+    // 8e30ff37 step "Send Lead to Agentic System" is the same standard Webhook
+    // action type confirmed to nest declared keys on /webhooks/canvassing-lead.
+    // This route fails open, so an unflattened body reads as no_appointment,
+    // forwards {} to LP and mirrors LP's response — a silent no-op with no
+    // error surface. Not independently confirmed here; shipped separately so
+    // it can be reverted alone.
+    //
+    // Only rebuild the object when there is actually something nested. A
+    // flat body keeps its original reference, so this cannot perturb how any
+    // existing payload reaches the fail-open guard below — the blast radius
+    // is exactly the customData case that is broken today.
+    const body = raw.customData == null ? raw : flattenWebhookBody(raw);
     const mode = proxyMode();
 
     let outbound = dropControlKeys(body);
