@@ -14,6 +14,7 @@ import {
   isReportRunning,
   getReportResult,
 } from '../five9-admin.js';
+import { getUsersFullInfo } from '../five9-users-info.js';
 
 /**
  * Five9 admin READ tools — Phases A+B of programmatic Five9 control.
@@ -118,7 +119,7 @@ export function registerFive9Tools(server) {
   // Tool: five9_get_skills
   server.tool(
     'five9_get_skills',
-    'Five9 skill inventory (read-only): id, name, description, voicemail routing.',
+    'Five9 skill inventory (read-only): id, name, description, voicemail routing. This is the domain-wide skill list — to see which USERS hold which skills, call five9_get_users with include_roles: true.',
     {},
     asTool(() => getSkills())
   );
@@ -126,11 +127,14 @@ export function registerFive9Tools(server) {
   // Tool: five9_get_users
   server.tool(
     'five9_get_users',
-    'Five9 user inventory (read-only, general info): userName, full name, email, extension, active flag, profile. Password fields are stripped. Optional userNamePattern regex (Five9-side), default ".*" = everyone.',
+    'Five9 user inventory (read-only). Default returns general info only: userName, full name, email, extension, active flag, profile. Set include_roles: true to get the FULL user record instead — assigned roles (admin / agent / supervisor / reporting / contactRecordsManager), the per-role permission flags, assigned skills with levels, and agent groups. Use include_roles for any role, permission, or skill-routing audit, and to verify Five9 agent usernames still match LP rep identities (a mismatch silently breaks disposition push-back). Password fields are stripped either way. Optional userNamePattern regex (Five9-side), default ".*" = everyone — narrow it when include_roles is on, the payload is much larger.',
     {
       pattern: z.string().optional().describe('Five9 userNamePattern regex, e.g. ".*@reecewindows.com"; default ".*"'),
+      include_roles: z.boolean().optional().describe('Include roles, per-role permissions, skills, and agent groups (calls SOAP getUsersInfo instead of getUsersGeneralInfo). Default false.'),
     },
-    asTool(({ pattern }) => getUsersGeneralInfo(pattern || '.*'))
+    asTool(({ pattern, include_roles }) => (include_roles
+      ? getUsersFullInfo(pattern || '.*')
+      : getUsersGeneralInfo(pattern || '.*')))
   );
 
   // Tool: five9_check_dnc
