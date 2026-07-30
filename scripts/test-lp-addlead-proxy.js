@@ -331,3 +331,33 @@ test('dedup: two identical strips (same lognumber+adate+reason) → exactly one 
   assert.equal(lpCalls.length, 2, 'both leads still reach LP');
   assert.equal(cardCalls.length, 1, 'second card suppressed by claim (23505)');
 });
+
+// ═══ 5. GHL customData nesting ═══════════════════════════════════════════
+// Workflow 8e30ff37 "Send Lead to Agentic System" is the same standard
+// Webhook action type that nests declared keys under customData on
+// /webhooks/canvassing-lead. Unflattened, the hour gate saw an empty body,
+// read no_appointment, and forwarded nothing useful to LP — silently.
+
+test('customData-nested body: lead fields reach LP and the hour gate evaluates', async () => {
+  reset(); setMode('validate');
+  const { adate, atime, ...rest } = ICC_BODY();
+  // atime 06:00 AM is impossible_hour — only reachable once flattening works.
+  await invoke({ contact_id: '371817', customData: { ...rest, adate, atime } });
+
+  assert.equal(lpCalls.length, 1, 'forwarded to LP');
+  assert.equal(lpCalls[0].firstname, 'Jane', 'nested lead fields resolved');
+  assert.equal(lpCalls[0].srs_id, ICC_BODY().srs_id, 'nested srs_id resolved');
+  assert.equal(cardCalls.length, 1, 'hour gate fired on the nested atime');
+  assert.equal('adate' in lpCalls[0], false, 'impossible hour stripped');
+});
+
+test('flat body still wins over a same-named customData key', async () => {
+  reset(); setMode('validate');
+  await invoke({
+    ...ICC_BODY(), atime: '2:00 PM', // valid_hour at the top level
+    customData: { atime: '6:00 AM' }, // must not override
+  });
+  assert.equal(lpCalls.length, 1);
+  assert.equal(lpCalls[0].atime, '2:00 PM', 'top-level atime wins');
+  assert.equal(cardCalls.length, 0, 'no strip card — the valid hour stands');
+});

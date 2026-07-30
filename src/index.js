@@ -515,6 +515,32 @@ async function runMigrations() {
     console.error('[Migration] note push terminal state FAILED (pushNotesToGHL selects on ghl_note_push_terminal — apply sql/050 manually):', err.message);
   }
 
+  // Canvassing intake marks (sql/052 — the file is the source of truth; this
+  // mirror guarantees the table exists before the first POST /webhooks/
+  // canvassing-lead, whose duplicate pre-check reads it). The table was
+  // referenced from the day the endpoint shipped but never created, and every
+  // access is fail-open, so its absence silently disabled 24h idempotency
+  // rather than erroring — a GHL retry double-posted the lead to LP. runSQL
+  // (throws on failure) for the same reason as the blocks above.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE TABLE IF NOT EXISTS canvassing_intake_marks (
+              dedup_key              text PRIMARY KEY,
+              ghl_contact_id         text,
+              phone                  text,
+              in1_id                 text,
+              appt_date              text,
+              appt_time              text,
+              flagged_beyond_window  boolean NOT NULL DEFAULT false,
+              status                 text NOT NULL DEFAULT 'processing',
+              created_at             timestamptz NOT NULL DEFAULT now());
+            CREATE INDEX IF NOT EXISTS idx_canvassing_intake_marks_created
+              ON canvassing_intake_marks (created_at DESC);`);
+    console.log('[Migration] canvassing intake marks (sql/052) ready');
+  } catch (err) {
+    console.error('[Migration] canvassing intake marks FAILED (canvassing-lead idempotency reads it — apply sql/052 manually):', err.message);
+  }
+
   // Scorecard revenue realignment (sql/040): live-month RTP-net + provisional-gross columns,
   // the Net Report staging table, and the source-precedence view. Additive/idempotent — the
   // one-shot label relabels (sql/040 §C) are NOT run here (data ops, applied once via migration).
