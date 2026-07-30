@@ -46,7 +46,10 @@ import {
   convertCanvassAppointment,
   SEND_APPT_WHEN_BEYOND_WINDOW,
   APPT_WINDOW_HOURS,
+  APPT_WINDOW_DAYS,
+  EVENT_WINDOW_DAYS,
 } from './canvassing-time.js';
+import { flattenWebhookBody, webhookShapeFingerprint } from './webhook-body.js';
 
 // GHL custom field: "LP Inbound Lead ID". Reminder: in1_id is the LP
 // inbound-QUEUE id, not lds_id — SetAppointment can never target it.
@@ -54,6 +57,12 @@ export const FIELD_LP_INBOUND_LEAD_ID = '3YMxheIlPyhACB8zyc3W';
 
 const CANVASSING_SRS_ID = '344';
 const CANVASSING_SENDER = 'GHL-Canvassing';
+
+// Event booths post through this same intake but carry their own LP SubSource
+// ID per event (e.g. 869 = Events 2026 / Fort Myers Arts & Crafts Show). The
+// sender string follows srs_id so LP-side reporting can split booth leads from
+// door knocks without a second field.
+const EVENT_SENDER = 'GHL-Events';
 const DEDUP_WINDOW_MIN = parseInt(process.env.CANVASSING_DEDUP_WINDOW_MIN || '1440', 10);
 const MARKS_TABLE = 'canvassing_intake_marks';
 
@@ -132,12 +141,20 @@ const trim = (v) => (v === null || v === undefined ? '' : String(v).trim());
  * Structural validation only — errors here mean the GHL workflow is
  * misconfigured and should see a 4xx. Missing contact data is NOT a
  * structural error (accepted, then skipped async with an operator card).
+ *
+ * Flattens customData FIRST. GHL's standard Webhook action nests the step's
+ * declared keys under `customData` rather than posting them flat, so reading
+ * req.body directly returned undefined for every declared key — including
+ * canvass_version, a static "v2" literal that cannot fail to resolve. That
+ * read as `(empty)` and 400'd every event-form submission on 2026-07-30. Same
+ * defect, same fix as canvassing-intake.js resolveIntakeBody.
  */
-export function validateCanvassingPayload(body) {
+export function validateCanvassingPayload(rawBody) {
   const errors = [];
-  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+  if (!rawBody || typeof rawBody !== 'object' || Array.isArray(rawBody)) {
     return { ok: false, errors: ['body must be a JSON object'], normalized: null };
   }
+  const body = flattenWebhookBody(rawBody);
   const ghlContactId = trim(body.ghl_contact_id);
   if (!ghlContactId) errors.push('ghl_contact_id is required');
   const version = trim(body.canvass_version);
@@ -164,6 +181,10 @@ export function validateCanvassingPayload(body) {
       canvassing_notes: trim(body.canvassing_notes),
       promoter: trim(body.promoter),
       pro_id: trim(body.pro_id),
+      // LP SubSource ID. Absent = the door-to-door canvassing path, which
+      // falls back to CANVASSING_SRS_ID in buildLpLeadFields. Present = an
+      // event booth passing its own event's ID.
+      srs_id: trim(body.srs_id),
       salesrabbit_id: trim(body.salesrabbit_id),
       second_decision_maker: trim(body.second_decision_maker),
       spouse_name: trim(body.spouse_name),
@@ -211,6 +232,12 @@ export function buildLpLeadFields(p, appt) {
     appt && appt.adate && appt.atime &&
     (appt.status === 'ok' || (appt.status === 'beyond_window' && SEND_APPT_WHEN_BEYOND_WINDOW));
 
+  // Payload srs_id wins; absence means the door-to-door path, which has always
+  // been Canvass 344. Sender follows srs_id — never set independently, or the
+  // two can disagree and LP reporting splits one booth across two senders.
+  const srsId = p.srs_id || CANVASSING_SRS_ID;
+  const sender = srsId === CANVASSING_SRS_ID ? CANVASSING_SENDER : EVENT_SENDER;
+
   return {
     firstname: p.first_name,
     lastname: p.last_name,
@@ -219,8 +246,8 @@ export function buildLpLeadFields(p, appt) {
     state: p.state,
     zip: p.zip,
     phone: nationalPhone,
-    sender: CANVASSING_SENDER,
-    srs_id: CANVASSING_SRS_ID,
+    sender,
+    srs_id: srsId,
     productID: 'Win',
     proddescr: 'Win',
     notes: noteLines.join('\n'),
@@ -321,7 +348,12 @@ export async function processCanvassingLead(payload, deps = {}) {
     }
 
     // 3. Appointment conversion + window guard (the whole point).
-    const appt = convertCanvassAppointment({ appt_date: p.appt_date, appt_slot: p.appt_slot }, d.now());
+    const isEvent = Boolean(p.srs_id) && p.srs_id !== CANVASSING_SRS_ID;
+    const appt = convertCanvassAppointment(
+      { appt_date: p.appt_date, appt_slot: p.appt_slot },
+      d.now(),
+      isEvent ? EVENT_WINDOW_DAYS : APPT_WINDOW_DAYS,
+    );
     const apptDisplay = appt.adate && appt.atime ? `${appt.adate} at ${appt.atime}` : undefined;
 
     if (appt.status === 'unparseable' || appt.status === 'past') {
@@ -493,6 +525,12 @@ export function registerCanvassingLeadRoutes(app) {
         return res.status(401).json({ error: 'unauthorized' });
       }
     }
+
+    // Unconditional shape fingerprint. A diagnostic that only fires on the
+    // failure path can never tell you what a working sender looks like, and
+    // the Content-Type GHL actually sends is the fact hardest to recover
+    // after the fact. webhookShapeFingerprint never throws.
+    console.log('[Canvassing] inbound shape:', JSON.stringify(webhookShapeFingerprint(req)));
 
     const validation = validateCanvassingPayload(req.body);
     if (!validation.ok) {

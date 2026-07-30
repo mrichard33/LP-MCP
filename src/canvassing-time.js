@@ -31,6 +31,13 @@ import { etOffsetMinutes, APPOINTMENT_TZ } from './appointment-dates.js';
 export const APPT_WINDOW_DAYS = 2;
 export const APPT_WINDOW_HOURS = 48; // messaging/display label only
 
+// Event booths book far further out than a door knock. A home-show attendee
+// commonly takes a slot two or three weekends away, so the 2-day canvassing
+// window would return `beyond_window` on nearly every event lead and flood the
+// canvass channel with flag cards. Callers pass this explicitly; the default
+// stays 2 so the door-to-door path is unchanged.
+export const EVENT_WINDOW_DAYS = 21;
+
 // User-confirmed 2026-07-15: a beyond-window appointment is a notify, not
 // a block — the lead still posts to LP WITH adate/atime (supervisor
 // exceptions exist) and the canvass channel gets a flag card. Flip this
@@ -156,6 +163,9 @@ export function fridayExceptionDeadline(now = new Date()) {
  * @param {string} appt.appt_date — see normalizeApptDate
  * @param {string} appt.appt_slot — see normalizeApptSlot
  * @param {Date} [now]
+ * @param {number} [windowDays] — booking horizon before 'beyond_window'.
+ *   Defaults to APPT_WINDOW_DAYS (door-to-door). Event booths pass
+ *   EVENT_WINDOW_DAYS; the Friday exception applies either way.
  * @returns {{
  *   status: 'ok'|'unparseable'|'past'|'beyond_window',
  *   adate: string|null,     // MM/DD/YYYY — null only when unparseable
@@ -166,7 +176,11 @@ export function fridayExceptionDeadline(now = new Date()) {
  *   'past' and 'unparseable' → caller must NOT send adate/atime to LP.
  *   'beyond_window' → caller decides (SEND_APPT_WHEN_BEYOND_WINDOW).
  */
-export function convertCanvassAppointment({ appt_date, appt_slot } = {}, now = new Date()) {
+export function convertCanvassAppointment(
+  { appt_date, appt_slot } = {},
+  now = new Date(),
+  windowDays = APPT_WINDOW_DAYS,
+) {
   const unparseable = { status: 'unparseable', adate: null, atime: null, hoursOut: null, apptInstant: null };
 
   const atime = normalizeApptSlot(appt_slot);
@@ -189,7 +203,7 @@ export function convertCanvassAppointment({ appt_date, appt_slot } = {}, now = n
     (Date.UTC(y, m - 1, d) - Date.UTC(nowEt.year, nowEt.month - 1, nowEt.day)) / 86400000
   );
 
-  if (daysOut > APPT_WINDOW_DAYS) {
+  if (daysOut > windowDays) {
     const fridayDeadline = fridayExceptionDeadline(now);
     const withinFridayException =
       fridayDeadline !== null && apptInstant.getTime() <= fridayDeadline.getTime();
