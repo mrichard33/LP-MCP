@@ -15,15 +15,25 @@ import {
   getReportResult,
 } from '../five9-admin.js';
 import { getUsersFullInfo } from '../five9-users-info.js';
+import {
+  STATISTIC_TYPES,
+  getStatistics,
+  setSessionParameters,
+  resetSession,
+} from '../five9-supervisor.js';
 
 /**
- * Five9 admin READ tools — Phases A+B of programmatic Five9 control.
+ * Five9 READ tools.
  *
- * Every tool here is read-only against the Five9 Configuration Web Services
- * (Admin SOAP) API. Write operations (campaign start/stop/reset, dialing
- * patches, list records, DNC) live in src/five9/admin-writes.js and execute
- * ONLY through create_agent_action + approve_action — never as direct MCP
- * tools (doctrine, see src/five9-admin.js header).
+ * Two APIs are wrapped here:
+ *   - Admin SOAP (src/five9-admin.js) — configuration and saved reports.
+ *   - Supervisor SOAP (src/five9-supervisor.js) — live real-time statistics.
+ *
+ * Every tool is read-only. Write operations (campaign start/stop/reset,
+ * dialing patches, list records, DNC) live in src/five9/admin-writes.js and
+ * execute ONLY through create_agent_action + approve_action behind
+ * FIVE9_WRITES_ENABLED — never as direct MCP tools (doctrine, see the
+ * src/five9-admin.js header).
  *
  * Auth/setup requirements are documented in src/five9-admin.js.
  */
@@ -67,7 +77,7 @@ export function registerFive9Tools(server) {
   // Tool: five9_get_outbound_campaign
   server.tool(
     'five9_get_outbound_campaign',
-    'Full config of ONE Five9 OUTBOUND campaign (read-only): dialing mode (PREDICTIVE/PROGRESSIVE/PREVIEW/POWER), dialing ratio, abandon % (maxDroppedCallsPercentage), max queue time in seconds, attached lists with priorities, plus the complete raw config object. Retry/attempt settings live in the campaign profile — see five9_get_campaign_profiles.',
+    'Full config of ONE Five9 OUTBOUND campaign (read-only): dialing mode (PREDICTIVE/PROGRESSIVE/PREVIEW/POWER), dialing ratio, abandon % (maxDroppedCallsPercentage), max queue time in seconds, the agent distributionAlgorithm (RoundRobin ignores agent skill LEVEL entirely), attached lists with priorities, plus the complete raw config object. Retry/attempt settings live in the campaign profile — see five9_get_campaign_profiles.',
     {
       campaign_name: z.string().describe('Exact outbound campaign name'),
     },
@@ -95,7 +105,7 @@ export function registerFive9Tools(server) {
   // Tool: five9_get_lists
   server.tool(
     'five9_get_lists',
-    'Five9 dialing list inventory with record counts (read-only). Optional name_pattern substring filter.',
+    'Five9 dialing list inventory with record counts (read-only). Optional name_pattern substring filter. Lists repopulate at 6 AM ET daily — any count reads differently either side of that boundary.',
     {
       name_pattern: z.string().optional().describe('Case-insensitive substring filter on list name'),
     },
@@ -127,7 +137,7 @@ export function registerFive9Tools(server) {
   // Tool: five9_get_users
   server.tool(
     'five9_get_users',
-    'Five9 user inventory (read-only). Default returns general info only: userName, full name, email, extension, active flag, profile. Set include_roles: true to get the FULL user record instead — assigned roles (admin / agent / supervisor / reporting / contactRecordsManager), the per-role permission flags, assigned skills with levels, and agent groups. Use include_roles for any role, permission, or skill-routing audit, and to verify Five9 agent usernames still match LP rep identities (a mismatch silently breaks disposition push-back). Password fields are stripped either way. Optional userNamePattern regex (Five9-side), default ".*" = everyone — narrow it when include_roles is on, the payload is much larger.',
+    'Five9 user inventory (read-only). Default returns general info only: userName, full name, email, extension, active flag. Set include_roles: true to get the FULL user record instead — assigned roles (admin / agent / supervisor / reporting / crmManager), the per-role permission flags, assigned skills with levels, and agent groups. Use include_roles for any role, permission, or skill-routing audit, and to reconcile Five9 usernames against LP rep identities (LP stores setter/confirmer as denormalized "Last, First" text, so a Five9 login with no LP counterpart — or vice versa — is an attribution gap worth chasing). Password fields are stripped either way. Optional userNamePattern regex (Five9-side), default ".*" = everyone — narrow it when include_roles is on, the payload is much larger. NOTE: userProfileName is returned only when the user actually has a user profile assigned; Five9 omits the field entirely otherwise, and as of 2026-07-30 no user in this domain has one.',
     {
       pattern: z.string().optional().describe('Five9 userNamePattern regex, e.g. ".*@reecewindows.com"; default ".*"'),
       include_roles: z.boolean().optional().describe('Include roles, per-role permissions, skills, and agent groups (calls SOAP getUsersInfo instead of getUsersGeneralInfo). Default false.'),
@@ -140,7 +150,7 @@ export function registerFive9Tools(server) {
   // Tool: five9_check_dnc
   server.tool(
     'five9_check_dnc',
-    'Check which of the given phone numbers are on the Five9 domain DNC list (read-only). Returns { checked, on_dnc, not_on_dnc }. Adding/removing DNC numbers is a gated write (create_agent_action), not a tool.',
+    'Check which of the given phone numbers are on the Five9 domain DNC list (read-only). Returns { checked, on_dnc, not_on_dnc }. Caps at 200 numbers per call — batch larger sets and report the batch boundaries so a partial check is not mistaken for a full one. Adding/removing DNC numbers is a gated write (create_agent_action), not a tool.',
     {
       numbers: z.array(z.string()).min(1).max(200).describe('Phone numbers to check (10-digit or as stored in Five9)'),
     },
@@ -150,7 +160,7 @@ export function registerFive9Tools(server) {
   // Tool: five9_run_report
   server.tool(
     'five9_run_report',
-    'Run a saved Five9 report by folder + name (read-only) and wait for the result, polling up to ~55s. Returns { done:true, columns, rows } when finished, or { done:false, identifier } if still running — then call five9_get_report_result with that identifier to fetch it once ready. Optional start/end restrict the report time window.',
+    'Run a saved Five9 report by folder + name (read-only) and wait for the result, polling up to ~55s. Returns { done:true, columns, rows } when finished, or { done:false, identifier } if still running — then call five9_get_report_result with that identifier to fetch it once ready. Optional start/end restrict the report time window. For HISTORICAL reporting; for what the floor is doing right now use five9_supervisor_statistics.',
     {
       folder: z.string().describe('Report folder name, e.g. "Call Log Reports"'),
       report: z.string().describe('Saved report name inside the folder'),
@@ -182,4 +192,41 @@ export function registerFive9Tools(server) {
       return { done: true, ...result };
     })
   );
+
+  /* ---- Supervisor Web Services (live real-time telemetry) --------------- */
+
+  // Tool: five9_supervisor_statistics
+  server.tool(
+    'five9_supervisor_statistics',
+    'LIVE real-time Five9 floor telemetry via the Supervisor SOAP API (read-only) — this is "what is happening right now", as opposed to five9_run_report which is historical. statistic_type selects the view: AgentState (who is logged in, ready, on a call, in wrap-up), AgentStatistics (per-agent call counts and times for the session window), ACDStatus (live queue depth, calls waiting, longest wait per skill), CampaignState, OutboundCampaignStatistics / InboundCampaignStatistics (live dial and abandon behavior), AutodialCampaignStatistics, ListState. Returns columns + rows, plus a records array of column-keyed objects when the shapes align. The session is established and refreshed automatically. Set include_raw: true to see the unnormalized parse when a statistic type returns an unexpected shape.',
+    {
+      statistic_type: z.enum(STATISTIC_TYPES).describe('Which live statistics view to fetch'),
+      include_raw: z.boolean().optional().describe('Also return the raw parsed SOAP block — use when columns/rows come back empty or oddly shaped'),
+      rolling_period: z.enum(['Minutes5', 'Minutes10', 'Minutes15', 'Minutes30', 'Hour1', 'Today']).optional().describe('Rolling window for rate-style statistics. Default Minutes30.'),
+      statistics_range: z.enum(['CurrentDay', 'CurrentWeek', 'CurrentMonth', 'RecentPeriod', 'Interval', 'Lifetime']).optional().describe('Aggregation range for cumulative statistics. Default CurrentDay.'),
+    },
+    asTool(({ statistic_type, include_raw, rolling_period, statistics_range }) => getStatistics(statistic_type, {
+      includeRaw: Boolean(include_raw),
+      session: (rolling_period || statistics_range)
+        ? { rollingPeriod: rolling_period, statisticsRange: statistics_range }
+        : undefined,
+    }))
+  );
+
+  // Tool: five9_supervisor_session_reset
+  server.tool(
+    'five9_supervisor_session_reset',
+    'Force a fresh Five9 Supervisor API session (read-only side effect — resets only our own API view window, never campaign or agent state). Use when supervisor statistics repeatedly fault, look frozen, or another process may be holding the session. Returns the applied view settings including the DST-aware ET timezone offset actually sent.',
+    {
+      rolling_period: z.enum(['Minutes5', 'Minutes10', 'Minutes15', 'Minutes30', 'Hour1', 'Today']).optional().describe('Rolling window. Default Minutes30.'),
+      statistics_range: z.enum(['CurrentDay', 'CurrentWeek', 'CurrentMonth', 'RecentPeriod', 'Interval', 'Lifetime']).optional().describe('Aggregation range. Default CurrentDay.'),
+    },
+    asTool(({ rolling_period, statistics_range }) => resetSession({
+      rollingPeriod: rolling_period,
+      statisticsRange: statistics_range,
+    }))
+  );
+
+  // Exported for callers that want to pre-warm the session explicitly.
+  void setSessionParameters;
 }
