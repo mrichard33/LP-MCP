@@ -34,19 +34,22 @@ import {
   DEFAULT_INTAKE_MAX_PER_RUN,
   DEFAULT_INTAKE_LOOKBACK_HOURS,
   DEFAULT_INTAKE_FRESH_HOURS,
+  BACKSTOP_INTERVAL_MS,
+  INTAKE_INTERVAL_MS,
 } from '../services/lp-contact-backstop.js';
+import { notifyBackstopFailure } from '../services/backstop-notify.js';
 
 // ─── Env flags — appointment mode ────────────────────────────────────
 const BACKSTOP_ENABLED = process.env.ENABLE_LP_CONTACT_BACKSTOP === 'true';
 const MAX_PER_RUN = Math.max(1, parseInt(process.env.LP_CONTACT_BACKSTOP_MAX_PER_RUN || String(DEFAULT_MAX_PER_RUN), 10));
-const BACKSTOP_INTERVAL_MS = 15 * 60 * 1000; // every 15 min
+// BACKSTOP_INTERVAL_MS / INTAKE_INTERVAL_MS are imported from the service so the
+// scheduler and the notification card's drain-time estimate cannot drift apart.
 
 // ─── Env flags — intake mode (2026-07-26) ────────────────────────────
 const INTAKE_ENABLED = process.env.ENABLE_LP_INTAKE_BACKSTOP === 'true';
 const INTAKE_MAX_PER_RUN = Math.max(1, parseInt(process.env.LP_INTAKE_BACKSTOP_MAX_PER_RUN || String(DEFAULT_INTAKE_MAX_PER_RUN), 10));
 const INTAKE_LOOKBACK_HOURS = Math.max(1, parseInt(process.env.LP_INTAKE_BACKSTOP_LOOKBACK_HOURS || String(DEFAULT_INTAKE_LOOKBACK_HOURS), 10));
 const INTAKE_FRESH_HOURS = Math.max(0, parseInt(process.env.LP_INTAKE_BACKSTOP_FRESH_HOURS || String(DEFAULT_INTAKE_FRESH_HOURS), 10));
-const INTAKE_INTERVAL_MS = 15 * 60 * 1000;
 
 // ─── In-memory job registry (lost on redeploy — same trade-off as
 //     admin/ghl-appointment-backfill.js; the scheduler is the durable path).
@@ -65,10 +68,16 @@ export function startLpContactBackstopScheduler() {
   // First run 5 min after boot (let sync + the GHL rate limiter settle), then on interval.
   setTimeout(() => {
     runLpContactBackstop({ dryRun: false, maxPerRun: MAX_PER_RUN })
-      .catch((e) => console.error('[LpContactBackstop] Sweep failed:', e.message));
+      .catch((e) => {
+        console.error('[LpContactBackstop] Sweep failed:', e.message);
+        notifyBackstopFailure({ sweepMode: 'appointment', error: e });
+      });
     setInterval(() => {
       runLpContactBackstop({ dryRun: false, maxPerRun: MAX_PER_RUN })
-        .catch((e) => console.error('[LpContactBackstop] Sweep failed:', e.message));
+        .catch((e) => {
+          console.error('[LpContactBackstop] Sweep failed:', e.message);
+          notifyBackstopFailure({ sweepMode: 'appointment', error: e });
+        });
     }, BACKSTOP_INTERVAL_MS);
   }, 5 * 60 * 1000);
 }
@@ -100,7 +109,10 @@ export function startLpIntakeBackstopScheduler() {
     maxPerRun: INTAKE_MAX_PER_RUN,
     freshHours: INTAKE_FRESH_HOURS,
     suppressOutbound: false, // forward-only; the freshness belt handles stragglers
-  }).catch((e) => console.error('[LpIntakeBackstop] Sweep failed:', e.message));
+  }).catch((e) => {
+    console.error('[LpIntakeBackstop] Sweep failed:', e.message);
+    notifyBackstopFailure({ sweepMode: 'intake', error: e });
+  });
 
   setTimeout(() => {
     run();

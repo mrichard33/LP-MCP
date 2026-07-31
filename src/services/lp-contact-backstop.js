@@ -72,8 +72,7 @@ import { reconcileLpAppointmentToGhl } from './lp-ghl-appointment-reconciler.js'
 import { normalizePhone } from '../sync-utils.js';
 import { appointmentDelta } from '../appointment-dates.js';
 import { emitDispositionBackfill } from '../sync-leads.js';
-import { buildClassifiedNotification } from '../actions/notification-classifier.js';
-import { sendGroupMeMessage } from '../groupme.js';
+import { notifyBackstopRun } from './backstop-notify.js';
 
 // LP custom field IDs (canonical: src/actions/handlers/lp-lead.js:65,
 // src/lp-appointment-sync.js:205-207). Written as { id, field_value } —
@@ -92,6 +91,11 @@ const DEFAULT_HORIZON_DAYS = 45;
 // POST /admin/lp-contact-backstop {horizon_days: 99999} cannot get past it.
 export const MAX_HORIZON_DAYS = 60;
 export const DEFAULT_MAX_PER_RUN = 50;
+// Sweep cadence. Defined HERE rather than in admin/lp-contact-backstop.js so the
+// scheduler and the notification card's drain-time estimate ("N min to drain at
+// this cap") read the same number — a stale hardcode in the card would quietly
+// misstate how long a backlog takes to clear. admin imports these.
+export const BACKSTOP_INTERVAL_MS = 15 * 60 * 1000;
 
 // ─── Intake mode (2026-07-26) ────────────────────────────────────────
 // Disposition "Data" = a lead LP has but no appointment has been set for.
@@ -108,6 +112,8 @@ export const MAX_INTAKE_LOOKBACK_HOURS = 24 * 120;
 export const DEFAULT_INTAKE_FRESH_HOURS = 24;
 export const DEFAULT_INTAKE_MAX_PER_RUN = 25;
 export const LP_INTAKE_SUPPRESS_TAG = 'suppress-outbound';
+// Same rationale as BACKSTOP_INTERVAL_MS above.
+export const INTAKE_INTERVAL_MS = 15 * 60 * 1000;
 
 // ─── Tag mapping (create-time only) ──────────────────────────────────
 // Mirrors what I.LP-IN-created contacts carry today (verified on Lopez
@@ -616,8 +622,19 @@ async function executeOverScan(scan, { dryRun, suppressOutbound, freshHours, job
   const counts = { linked: 0, created: 0, skipped_no_phone: 0, skipped_dnc: 0, skipped_dup_in_run: 0, error: 0 };
   const lines = [];
   const errors = [];
+  const results = [];
   const seenPhones = new Set();
   let suppressedCount = 0;
+
+  // Errored leads never enter `results`, so an all-errors run would otherwise
+  // have no source to report on exactly the card where source matters most.
+  // Every error entry carries its lead's source for that reason.
+  const errEntry = (lead, error) => ({
+    lp_lead_id: lead.lp_lead_id,
+    error,
+    lead_source: lead.lead_source || null,
+    lead_source_detail: lead.lead_source_detail || null,
+  });
 
   for (const { lead } of scan.targets) {
     try {
@@ -625,10 +642,22 @@ async function executeOverScan(scan, { dryRun, suppressOutbound, freshHours, job
       counts[r.outcome] = (counts[r.outcome] || 0) + 1;
       if (r.suppressed) suppressedCount++;
       lines.push(leadLine(r));
+      // processOneLead's result carries the lead id and outcome but not the
+      // lead's attribution; the notification card needs both.
+      results.push({
+        ...r,
+        lead_source: lead.lead_source || null,
+        lead_source_detail: lead.lead_source_detail || null,
+        lp_prospect_id: lead.lp_prospect_id || null,
+      });
+      // A returned outcome:'error' (e.g. no_contact_id_after_create) bumps
+      // counts.error above without throwing, so without this the card would
+      // report a failure it could not name. Keeps counts.error === errors.length.
+      if (r.outcome === 'error') errors.push(errEntry(lead, r.error || 'unknown_error'));
     } catch (err) {
       counts.error++;
       const msg = String(err?.message || err).slice(0, 300);
-      errors.push({ lp_lead_id: lead.lp_lead_id, error: msg });
+      errors.push(errEntry(lead, msg));
       lines.push(`error              lead=${String(lead.lp_lead_id).padEnd(8)} → ${msg}`);
     }
     if (job) { job.processed++; job.errors = errors.length; }
@@ -640,7 +669,7 @@ async function executeOverScan(scan, { dryRun, suppressOutbound, freshHours, job
     lines.push(`skipped_no_phone   lead=${String(l.lp_lead_id).padEnd(8)} ${`${l.first_name || ''} ${l.last_name || ''}`.trim() || '(no name)'} phone=${l.phone || '—'}`);
   }
 
-  return { counts, lines, errors, suppressedCount };
+  return { counts, lines, results, errors, suppressedCount };
 }
 
 /**
@@ -661,7 +690,7 @@ export async function runLpContactBackstop({
 
   // Appointment mode never suppresses: these leads have a booked appointment
   // and MUST receive reminders/confirmations.
-  const { counts, lines, errors } = await executeOverScan(scan, {
+  const { counts, lines, results, errors } = await executeOverScan(scan, {
     dryRun, suppressOutbound: false, freshHours: Infinity, job,
   });
 
@@ -685,27 +714,18 @@ export async function runLpContactBackstop({
     job.completed_at = new Date().toISOString();
   }
 
-  // One intelligence-class rep summary per LIVE run with activity — no
-  // per-contact spam. Best-effort: a send failure never fails the sweep.
-  if (!dryRun && (counts.created || counts.linked || counts.skipped_dnc)) {
-    try {
-      const card = buildClassifiedNotification({
-        notification_class: 'intelligence',
-        action_verb: 'LP CONTACT BACKSTOP',
-        name: 'LP Contact Backstop sweep',
-        contactId: '—',
-        tier: 'Warm',
-        status: 'Backstop sweep',
-        narrative:
-          `Auto-create backstop swept ${scan.targets.length} unlinked LP lead(s): ` +
-          `${counts.created} created, ${counts.linked} linked, ${counts.skipped_dnc} DNC link-only, ` +
-          `${counts.skipped_no_phone} no-phone, ${scan.deferredCapped} deferred (cap ${maxPerRun}).`,
-        next_step: 'Newest lp_leads rows now linked; LP_APPT_GHL_SYNC_* rules own them going forward.',
-      });
-      await sendGroupMeMessage(card, { flushNow: true });
-    } catch (e) {
-      console.warn(`[LpContactBackstop] summary notification failed: ${e.message}`);
-    }
+  // Exception-only. A healthy sweep is silent; errors and backlog pressure
+  // are not. Never throws — the sweep's work is already committed.
+  if (!dryRun) {
+    await notifyBackstopRun({
+      sweepMode: 'appointment',
+      scan,
+      counts,
+      errors,
+      results,
+      maxPerRun,
+      intervalMin: Math.round(BACKSTOP_INTERVAL_MS / 60000),
+    });
   }
 
   return summary;
@@ -733,7 +753,7 @@ export async function runLpIntakeBackstop({
   const scan = await scanIntakeBackstopCandidates({ lookbackHours, maxPerRun, limit });
   if (job) job.total = scan.targets.length;
 
-  const { counts, lines, errors, suppressedCount } = await executeOverScan(scan, {
+  const { counts, lines, results, errors, suppressedCount } = await executeOverScan(scan, {
     dryRun, suppressOutbound, freshHours, job,
   });
 
@@ -760,28 +780,18 @@ export async function runLpIntakeBackstop({
     job.completed_at = new Date().toISOString();
   }
 
-  if (!dryRun && (counts.created || counts.linked)) {
-    try {
-      const card = buildClassifiedNotification({
-        notification_class: 'intelligence',
-        action_verb: 'LP INTAKE BACKSTOP',
-        name: 'LP Intake Backstop sweep',
-        contactId: '—',
-        tier: 'Warm',
-        status: 'Intake sweep',
-        narrative:
-          `Intake backstop swept ${scan.targets.length} unlinked "Data" lead(s) from the last ` +
-          `${scan.lookback_hours}h: ${counts.created} created, ${counts.linked} linked, ` +
-          `${suppressedCount} created SUPPRESSED (backlog or older than ${freshHours}h), ` +
-          `${counts.skipped_no_phone} no-phone, ${scan.deferredCapped} deferred (cap ${maxPerRun}).`,
-        next_step: suppressedCount
-          ? `${suppressedCount} contact(s) carry ${LP_INTAKE_SUPPRESS_TAG} — rep review before any outbound.`
-          : 'Contacts created live; ghl.contact_created routes them through normal entry hygiene.',
-      });
-      await sendGroupMeMessage(card, { flushNow: true });
-    } catch (e) {
-      console.warn(`[LpIntakeBackstop] summary notification failed: ${e.message}`);
-    }
+  // Exception-only — see runLpContactBackstop. Per-lead suppression surfaces
+  // in the card's detail lines, so it no longer needs its own next-step string.
+  if (!dryRun) {
+    await notifyBackstopRun({
+      sweepMode: 'intake',
+      scan,
+      counts,
+      errors,
+      results,
+      maxPerRun,
+      intervalMin: Math.round(INTAKE_INTERVAL_MS / 60000),
+    });
   }
 
   return summary;
