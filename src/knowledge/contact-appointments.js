@@ -23,6 +23,7 @@
  */
 
 import { CALENDAR_MAP } from '../actions/constants.js';
+import { lpWallClockToGhlStartTime } from '../appointment-dates.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 const FETCH_TIMEOUT_MS = 8000;
@@ -39,10 +40,45 @@ function calendarNameForId(calendarId) {
   return CALENDAR_ID_TO_NAME[calendarId] || calendarId;
 }
 
+/**
+ * Epoch ms for a GHL timestamp, DST-correct.
+ *
+ * GET /contacts/{id}/appointments returns NAIVE local wall time
+ * ("2026-07-31 18:30:00", no offset). Date.parse reads a naive string as UTC on
+ * a UTC server, placing every ET appointment 4-5h earlier than reality — so the
+ * `endMs < now` filter below dropped LIVE appointments hours before they ended.
+ * Every writer that consults this list (delegation endpoint, executeBookAppointment,
+ * reconcileLpAppointmentToGhl) then read "no appointment" and created a duplicate.
+ *
+ * Verified 2026-07-30/31 — Bekdemir Fx4PGx1lQz1dw33x8Ynz (17:00 ET slot, end
+ * parsed as 18:30Z, duplicate created 19:11Z), Tseng CaIL4H7D70xHCJPm7K53,
+ * Matos JYM5L5eyULXJtJLhBzsx (3 objects). In every case the duplicate landed
+ * after the phantom expiry and before the real appointment.
+ *
+ * Strings already carrying Z or an offset pass through untouched. The guard is
+ * load-bearing in both directions: lpWallClockToGhlStartTime strips and
+ * re-stamps any offset already present, so a Z value routed through it would
+ * shift 4-5h the WRONG way.
+ *
+ * NOT imported from lp-ghl-appointment-reconciler.normalizeGhlStartTime on
+ * purpose: that module imports THIS one, and slot-check.js already sits in a
+ * documented cycle with it. appointment-dates.js is a leaf, so importing
+ * lpWallClockToGhlStartTime directly adds no cycle.
+ */
+export function toEpochMsEt(value) {
+  if (!value) return NaN;
+  const str = String(value);
+  if (/(Z|[+-]\d{2}:?\d{2})$/.test(str)) return Date.parse(str);
+  return Date.parse(lpWallClockToGhlStartTime(str) || str);
+}
+
 function formatStartTimeForPrompt(iso) {
   if (!iso) return 'unknown time';
   try {
-    const d = new Date(iso);
+    // toEpochMsEt, not `new Date(iso)`: the raw naive string would render 4-5h
+    // early, i.e. the bot quoting a 6:30 PM ET appointment to the homeowner as
+    // 2:30 PM ET. NaN → Invalid Date → the `iso` fallback below, as before.
+    const d = new Date(toEpochMsEt(iso));
     if (Number.isNaN(d.getTime())) return iso;
     const formatted = new Intl.DateTimeFormat('en-US', {
       timeZone: PROMPT_TIMEZONE,
@@ -113,8 +149,8 @@ export async function fetchUpcomingAppointments(contactId) {
       const startIso = e.startTime || e.start_time || null;
       const endIso = e.endTime || e.end_time || null;
       const endMs = endIso
-        ? Date.parse(endIso)
-        : (startIso ? Date.parse(startIso) + 90 * 60_000 : NaN);
+        ? toEpochMsEt(endIso)
+        : (startIso ? toEpochMsEt(startIso) + 90 * 60_000 : NaN);
       if (Number.isNaN(endMs) || endMs < now) continue;
 
       const calendarId = e.calendarId || e.calendar_id || null;
