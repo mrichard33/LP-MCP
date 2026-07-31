@@ -92,6 +92,11 @@ const FUNCTION_GROUPS = {
   message_analyzer: 'decision_engine',   // src/message-analyzer.js
   message_score: 'decision_engine',      // src/message-content-scorer.js (legacy MESSAGE_SCORE_MODEL)
   intent_classifier: 'decision_engine',  // src/knowledge/intent-classifier.js
+  // Operational read on a backstop sweep — team GroupMe only, never a
+  // customer. There is no internal/operational tier, so it rides the
+  // decision-engine group (already pointed at a model on Railway via
+  // DECISION_ENGINE_MODEL_ANTHROPIC) rather than customer_facing.
+  backstop_insight: 'decision_engine',   // src/services/backstop-insight.js
   // customer-facing — text a human reads
   response_generator: 'customer_facing', // src/response-generator.js
   nurture_generator: 'customer_facing',  // src/nurture/nurture-generator.js
