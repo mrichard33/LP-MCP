@@ -11,17 +11,24 @@
  * LP_BACKSTOP_INSIGHT=off; the prompt itself is asserted against
  * _internal.buildUserPrompt.
  *
- * Cases 1-11 (exception gate, severity, notifyBackstopRun) belong to the
- * PRIOR handoff and are absent because that work is not in this repo.
- * Cases 16, 17 and 22 need buildBackstopCard for the same reason and are
- * marked todo below rather than deleted — un-skip them when the notify
- * module lands. Numbering follows the addendum so the two sets interleave.
+ * Cases 1-11 cover the exception gate and severity computation; 16, 17 and
+ * 22 cover buildBackstopCard. Numbering follows the addendum.
+ *
+ * buildBackstopCard is synchronous and takes `insight` as a parameter, so
+ * every card assertion here runs without a model.
  */
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { summarizeSources } from '../src/services/backstop-notify.js';
+import {
+  summarizeSources,
+  classifyRun,
+  shouldNotify,
+  buildBackstopCard,
+  __resetCooldowns,
+  MAX_DETAIL_LEADS,
+} from '../src/services/backstop-notify.js';
 import { cleanInsight, generateBackstopInsight, INSIGHT_CHAR_CAP, _internal } from '../src/services/backstop-insight.js';
 import { resolveLLM, FUNCTION_GROUPS } from '../src/llm-client.js';
 
@@ -33,6 +40,115 @@ const lead = (over = {}) => ({
   lead_source: 'Internet',
   lead_source_detail: 'Modernize',
   ...over,
+});
+
+/** Run a body with env vars forced, restoring them afterwards. */
+function withEnv(vars, fn) {
+  const prev = {};
+  for (const [k, v] of Object.entries(vars)) {
+    prev[k] = process.env[k];
+    if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+}
+
+// ─── §A classifyRun ──────────────────────────────────────────────────
+
+test('(1) clean run with no deferrals → healthy', () => {
+  const out = classifyRun({ counts: { created: 1, error: 0 }, scan: { deferredCapped: 0 } });
+  assert.equal(out.severity, 'healthy');
+  assert.equal(out.reason, 'clean_run');
+});
+
+test('(2) errors outrank backlog — failing even when deferred is non-zero', () => {
+  const out = classifyRun({ counts: { created: 3, error: 2 }, scan: { deferredCapped: 40 } });
+  assert.equal(out.severity, 'failing', 'errored leads are the more actionable fact');
+  assert.equal(out.reason, 'lead_errors');
+});
+
+test('(3) zero errors with deferrals at/over the threshold → degraded', () => {
+  assert.equal(classifyRun({ counts: { error: 0 }, scan: { deferredCapped: 1 } }).severity, 'degraded');
+  assert.equal(classifyRun({ counts: { error: 0 }, scan: { deferredCapped: 99 } }).severity, 'degraded');
+  // Threshold is configurable — 3 deferred is healthy when the bar is 5.
+  withEnv({ LP_BACKSTOP_DEFER_ALERT_THRESHOLD: '5' }, () => {
+    assert.equal(classifyRun({ counts: { error: 0 }, scan: { deferredCapped: 3 } }).severity, 'healthy');
+    assert.equal(classifyRun({ counts: { error: 0 }, scan: { deferredCapped: 5 } }).severity, 'degraded');
+  });
+});
+
+test('(4) no arguments at all → healthy, never throws', () => {
+  assert.equal(classifyRun().severity, 'healthy');
+  assert.equal(classifyRun({}).severity, 'healthy');
+});
+
+// ─── §A shouldNotify ─────────────────────────────────────────────────
+
+test('(5) healthy is silent under the default (exception) mode', () => {
+  __resetCooldowns();
+  const out = shouldNotify({ severity: 'healthy', sweepMode: 'appointment' });
+  assert.equal(out.send, false);
+  assert.equal(out.reason, 'clean_run');
+});
+
+test('(6) LP_BACKSTOP_NOTIFY_MODE=all sends even a healthy run', () => {
+  __resetCooldowns();
+  withEnv({ LP_BACKSTOP_NOTIFY_MODE: 'all' }, () => {
+    const out = shouldNotify({ severity: 'healthy', sweepMode: 'appointment' });
+    assert.equal(out.send, true);
+    assert.equal(out.reason, 'notify_all');
+  });
+});
+
+test('(7) LP_BACKSTOP_NOTIFY_MODE=off silences every severity', () => {
+  __resetCooldowns();
+  withEnv({ LP_BACKSTOP_NOTIFY_MODE: 'off' }, () => {
+    for (const severity of ['healthy', 'degraded', 'failing']) {
+      const out = shouldNotify({ severity, sweepMode: 'appointment' });
+      assert.equal(out.send, false, `${severity} must be silent when notifications are off`);
+      assert.equal(out.reason, 'notify_off');
+    }
+  });
+});
+
+test('(8) backlog alerts are cooled down — second consecutive degraded is suppressed', () => {
+  __resetCooldowns();
+  const first = shouldNotify({ severity: 'degraded', sweepMode: 'appointment' });
+  assert.equal(first.send, true);
+  assert.equal(first.reason, 'backlog_pressure');
+
+  const second = shouldNotify({ severity: 'degraded', sweepMode: 'appointment' });
+  assert.equal(second.send, false, 'chronic backlog must not alert every sweep');
+  assert.equal(second.reason, 'backlog_cooldown');
+
+  // Cooldown is per sweep mode — intake is independent of appointment.
+  assert.equal(shouldNotify({ severity: 'degraded', sweepMode: 'intake' }).send, true);
+  __resetCooldowns();
+});
+
+test('(9) errors bypass the cooldown — consecutive failing runs both send', () => {
+  __resetCooldowns();
+  const first = shouldNotify({ severity: 'failing', sweepMode: 'appointment' });
+  const second = shouldNotify({ severity: 'failing', sweepMode: 'appointment' });
+  assert.equal(first.send, true);
+  assert.equal(second.send, true, 'each errored run names different leads — never suppress');
+  assert.equal(second.reason, 'errors_bypass_cooldown');
+  __resetCooldowns();
+});
+
+test('(10) a backlog alert sends again once the cooldown has elapsed', () => {
+  __resetCooldowns();
+  const t0 = 1_000_000_000;
+  assert.equal(shouldNotify({ severity: 'degraded', sweepMode: 'intake', nowMs: t0 }).send, true);
+  // 240 min default → still suppressed at +239 min, sends at +241.
+  assert.equal(shouldNotify({ severity: 'degraded', sweepMode: 'intake', nowMs: t0 + 239 * 60000 }).send, false);
+  assert.equal(shouldNotify({ severity: 'degraded', sweepMode: 'intake', nowMs: t0 + 241 * 60000 }).send, true);
+  __resetCooldowns();
 });
 
 // ─── §B1 summarizeSources ────────────────────────────────────────────
@@ -94,6 +210,26 @@ test('(15) no touched leads → both fields undefined (card renders Unknown)', (
     { lpSource: undefined, lpSourceDetail: undefined },
   );
   assert.deepEqual(summarizeSources(), { lpSource: undefined, lpSourceDetail: undefined });
+});
+
+test('(15b) errors are a fallback only — never override touched leads', () => {
+  const errs = [{ lp_lead_id: '9', error: 'boom', lead_source: 'Iheart', lead_source_detail: 'Simpletext' }];
+
+  // Nothing touched → fall back to the errored leads' sources.
+  assert.deepEqual(
+    summarizeSources([], errs),
+    { lpSource: 'Iheart', lpSourceDetail: 'Simpletext' },
+  );
+
+  // Something touched → errors are ignored entirely.
+  assert.deepEqual(
+    summarizeSources([lead({ lp_lead_id: '1' })], errs),
+    { lpSource: 'Internet', lpSourceDetail: 'Modernize' },
+  );
+
+  // Single-argument calls keep the pre-existing contract exactly.
+  assert.deepEqual(summarizeSources([]), { lpSource: undefined, lpSourceDetail: undefined });
+  assert.deepEqual(summarizeSources([], []), { lpSource: undefined, lpSourceDetail: undefined });
 });
 
 // ─── §C cleanInsight ─────────────────────────────────────────────────
@@ -209,8 +345,172 @@ test('(27) backstop_insight is registered in the decision_engine group', () => {
   assert.ok(r.model, 'must resolve to a concrete model with no env set');
 });
 
-// ─── Pending on the prior handoff (buildBackstopCard) ────────────────
+// ─── §B buildBackstopCard ────────────────────────────────────────────
 
-test('(16) card always carries a real source on a multi-source run', { todo: 'needs buildBackstopCard from feat/backstop-exception-notifications' }, () => {});
-test('(17) every • detail line carries an " — " separated source segment', { todo: 'needs buildBackstopCard from feat/backstop-exception-notifications' }, () => {});
-test('(22) insight overrides the deterministic narrative when present', { todo: 'needs buildBackstopCard from feat/backstop-exception-notifications' }, () => {});
+const scanOf = (n, over = {}) => ({ targets: Array.from({ length: n }, (_, i) => ({ lead: { lp_lead_id: `t${i}` } })), ...over });
+
+test('(16) card always carries a real source on a multi-source run', () => {
+  const card = buildBackstopCard({
+    sweepMode: 'appointment',
+    severity: 'failing',
+    scan: scanOf(3, { deferredCapped: 0, eligible: 3 }),
+    counts: { created: 2, linked: 1, error: 1 },
+    results: [
+      lead({ lp_lead_id: '1' }),
+      lead({ lp_lead_id: '2' }),
+      lead({ lp_lead_id: '3', action: 'linked', lead_source: 'Iheart', lead_source_detail: 'Simpletext' }),
+    ],
+    errors: [],
+    maxPerRun: 50,
+  });
+  assert.match(card, /📋 Src: /);
+  assert.ok(!/📋 Src: Unknown/.test(card), `multi-source run must not render Unknown:\n${card}`);
+  assert.match(card, /Internet > Modernize \(2\)/);
+  // Multi-lead runs never claim a single contact.
+  assert.match(card, /Contact ID: —/);
+  assert.match(card, /3 lead\(s\) swept/);
+});
+
+test('(16b) single touched lead → the card carries that lead\'s real contact id', () => {
+  const card = buildBackstopCard({
+    sweepMode: 'appointment',
+    severity: 'failing',
+    scan: scanOf(2),
+    counts: { created: 1, error: 1 },
+    results: [lead({ lp_lead_id: '77', contact_id: 'ghl-abc123', name: 'Jane Doe', lp_prospect_id: 'P-9' })],
+    errors: [{ lp_lead_id: '78', error: 'GHL 500', lead_source: 'Internet', lead_source_detail: 'Modernize' }],
+    maxPerRun: 50,
+  });
+  assert.match(card, /Contact ID: ghl-abc123/);
+  assert.ok(!/Contact ID: —/.test(card), `solo run must not fall back to the em dash:\n${card}`);
+  assert.match(card, /Jane Doe/);
+  assert.match(card, /Prospect: P-9/);
+});
+
+test('(17) every • detail line carries an " — " separated source segment', () => {
+  const card = buildBackstopCard({
+    sweepMode: 'intake',
+    severity: 'degraded',
+    scan: scanOf(3, { deferredCapped: 12, eligible: 15 }),
+    counts: { created: 2, linked: 1 },
+    results: [
+      lead({ lp_lead_id: '1', contact_id: 'c1' }),
+      lead({ lp_lead_id: '2', contact_id: 'c2', action: 'linked', lead_source: 'Iheart', lead_source_detail: 'Simpletext' }),
+      lead({ lp_lead_id: '3', contact_id: 'c3', lead_source: null, lead_source_detail: null }),
+    ],
+    errors: [],
+    maxPerRun: 25,
+  });
+  const bullets = card.split('\n').filter((l) => l.startsWith('•'));
+  assert.equal(bullets.length, 3);
+  for (const b of bullets) {
+    const seg = b.replace(/^• /, '').split(' — ');
+    assert.ok(seg.length >= 3, `detail line lacks a source segment: ${b}`);
+    assert.ok(seg[1].trim().length > 0, `empty source segment: ${b}`);
+  }
+  assert.match(card, /• .* — Internet > Modernize — lead 1 → contact c1 \(created\)/);
+  assert.match(card, /• .* — Iheart > Simpletext — lead 2 → contact c2 \(linked\)/);
+  // An unresolvable source still renders — absence is signal, never a blank.
+  assert.match(card, /• .* — Unknown — lead 3/);
+});
+
+test('(17b) errored leads render a ⚠ line carrying source and the error text', () => {
+  const card = buildBackstopCard({
+    sweepMode: 'appointment',
+    severity: 'failing',
+    scan: scanOf(2),
+    counts: { created: 1, error: 1 },
+    results: [lead({ lp_lead_id: '1', contact_id: 'c1' })],
+    errors: [{ lp_lead_id: '5001', error: 'GHL 429 rate limited', lead_source: 'Internet', lead_source_detail: 'Modernize' }],
+    maxPerRun: 50,
+  });
+  assert.match(card, /⚠ lead 5001 — Internet > Modernize — GHL 429 rate limited/);
+});
+
+test('(17c) all-errors run still names its sources — the card that matters most', () => {
+  // Errored leads never enter `results`, so without the errors fallback this
+  // renders "Src: Unknown" on exactly the run where source is the finding.
+  const card = buildBackstopCard({
+    sweepMode: 'appointment',
+    severity: 'failing',
+    scan: scanOf(3),
+    counts: { created: 0, linked: 0, error: 3 },
+    results: [],
+    errors: [
+      { lp_lead_id: '1', error: 'GHL 500', lead_source: 'Internet', lead_source_detail: 'Modernize' },
+      { lp_lead_id: '2', error: 'GHL 500', lead_source: 'Internet', lead_source_detail: 'Modernize' },
+      { lp_lead_id: '3', error: 'timeout', lead_source: 'Internet', lead_source_detail: 'Modernize' },
+    ],
+    maxPerRun: 50,
+  });
+  assert.ok(!/📋 Src: Unknown/.test(card), `all-errors run lost its source:\n${card}`);
+  assert.match(card, /📋 Src: Internet > Modernize/);
+  const warns = card.split('\n').filter((l) => l.startsWith('⚠'));
+  assert.equal(warns.length, 3);
+  for (const w of warns) assert.match(w, / — Internet > Modernize — /, `⚠ line lacks source: ${w}`);
+});
+
+test('(17d) detail lines truncate at MAX_DETAIL_LEADS with an "…and N more" line', () => {
+  const many = Array.from({ length: MAX_DETAIL_LEADS + 3 }, (_, i) => lead({ lp_lead_id: String(i), contact_id: `c${i}` }));
+  const manyErrors = Array.from({ length: MAX_DETAIL_LEADS + 2 }, (_, i) => ({
+    lp_lead_id: `e${i}`, error: 'boom', lead_source: 'Internet', lead_source_detail: 'Modernize',
+  }));
+  const card = buildBackstopCard({
+    sweepMode: 'appointment',
+    severity: 'failing',
+    scan: scanOf(many.length + manyErrors.length),
+    counts: { created: many.length, error: manyErrors.length },
+    results: many,
+    errors: manyErrors,
+    maxPerRun: 50,
+  });
+  assert.equal(card.split('\n').filter((l) => l.startsWith('• ') && !l.includes('…and')).length, MAX_DETAIL_LEADS);
+  assert.match(card, /• …and 3 more/);
+  assert.equal(card.split('\n').filter((l) => l.startsWith('⚠ lead')).length, MAX_DETAIL_LEADS);
+  assert.match(card, /⚠ …and 2 more errored/);
+});
+
+test('(22) insight overrides the deterministic narrative; nextStep never varies', () => {
+  const args = {
+    sweepMode: 'appointment',
+    severity: 'degraded',
+    scan: scanOf(2, { deferredCapped: 30, eligible: 32 }),
+    counts: { created: 2 },
+    results: [lead({ lp_lead_id: '1', contact_id: 'c1' }), lead({ lp_lead_id: '2', contact_id: 'c2' })],
+    errors: [],
+    maxPerRun: 10,
+    intervalMin: 15,
+  };
+  const insight = 'Eligible leads are arriving faster than the per-run limit clears them.';
+  const withInsight = buildBackstopCard({ ...args, insight });
+  const withoutInsight = buildBackstopCard({ ...args, insight: null });
+
+  assert.ok(withInsight.includes(insight), 'model text must become the narrative');
+  assert.ok(!withInsight.includes('The per-run cap left 30 eligible'), 'template narrative must be replaced, not appended');
+  assert.match(withoutInsight, /The per-run cap left 30 eligible lead\(s\) unprocessed/);
+  // Drain-time math is derived from the interval, not hardcoded.
+  assert.match(withoutInsight, /roughly 45 min to drain/);
+
+  // nextStep is standing doctrine — identical in both cards, and it must
+  // actually RENDER: the classifier only emits "🎯 Next" for the
+  // 'intelligence' class, so these 'system' cards append it themselves.
+  const nextStepOf = (card) => card.split('\n').find((l) => l.startsWith('🎯 Next:'));
+  assert.ok(nextStepOf(withInsight), 'nextStep line missing from the insight card');
+  assert.match(nextStepOf(withInsight), /raise the cap only after confirming/);
+  assert.equal(nextStepOf(withInsight), nextStepOf(withoutInsight));
+});
+
+test('(22b) a healthy card is composable and explains why it was sent', () => {
+  const card = buildBackstopCard({
+    sweepMode: 'intake',
+    severity: 'healthy',
+    scan: scanOf(1),
+    counts: { created: 1 },
+    results: [lead({ lp_lead_id: '1', contact_id: 'c1' })],
+    errors: [],
+    maxPerRun: 25,
+  });
+  assert.match(card, /LP INTAKE BACKSTOP — RUN/);
+  assert.match(card, /LP_BACKSTOP_NOTIFY_MODE=all/);
+  assert.match(card, /📋 Src: Internet > Modernize/);
+});
