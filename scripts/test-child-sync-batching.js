@@ -73,17 +73,20 @@ function createRecorder() {
   const calls = [];
   const existing = new Map();    // table → Set(ids) that "already exist"
   const upsertFail = new Map();  // table → (payload) => errorObj | null
+  const counts = new Map();      // table → exact-count reply
+  const latest = new Map();      // table → row for the ordered .single() lookup
 
   function settle(s) {
     calls.push({ table: s.table, op: s.op, payload: s.payload, options: s.options, filters: s.filters });
     if (s.op === 'select') {
+      if (s.options?.head) return { data: null, count: counts.get(s.table) ?? 0, error: null };
       const inF = s.filters.find(f => f[0] === 'in');
       if (inF) {
         const [, col, ids] = inF;
         const have = existing.get(s.table) ?? new Set();
         return { data: ids.filter(id => have.has(id)).map(id => ({ [col]: id })), error: null };
       }
-      return s.single ? { data: null, error: null } : { data: [], error: null };
+      return s.single ? { data: latest.get(s.table) ?? null, error: null } : { data: [], error: null };
     }
     if (s.op === 'upsert') {
       const fail = upsertFail.get(s.table);
@@ -119,7 +122,9 @@ function createRecorder() {
     row:  (t) => calls.filter(c => c.table === t && c.op === 'upsert' && !Array.isArray(c.payload)),
     setExisting: (t, ids) => existing.set(t, new Set(ids)),
     failUpsert:  (t, fn)  => upsertFail.set(t, fn),
-    reset() { calls.length = 0; existing.clear(); upsertFail.clear(); },
+    setCount:    (t, n)   => counts.set(t, n),
+    setLatest:   (t, row) => latest.set(t, row),
+    reset() { calls.length = 0; existing.clear(); upsertFail.clear(); counts.clear(); latest.clear(); },
   };
 }
 
@@ -211,25 +216,54 @@ test('a failed bulk call upsert falls back to one upsert per row', async () => {
   assert.equal(rec.ops('lp_leads', 'update').length, 1, 'surviving rows still update the aggregates');
 });
 
-test('call aggregates use the distinct count and the max non-null call date', async () => {
+// Aggregates are read back from lp_call_logs, NOT derived from the LP payload.
+// perf/batch-child-sync briefly derived them; LP's getLead returns a rolling
+// ~7-day call window, so a lead with older calls had call_count truncated to the
+// window on every sync. These two tests are the guard against re-deriving them.
+test('call aggregates come from the table, not the payload — a windowed payload must not truncate call_count', async () => {
   fresh();
+  // The lead has 36 calls on file; LP only handed us 3 (the recent window).
+  rec.setCount('lp_call_logs', 36);
+  rec.setLatest('lp_call_logs', { call_date: '2026-08-01T11:15:12+00:00' });
   await syncCallLogs(LEAD, CONTACT, [
     mkCall({ id: 'c1', calldatetime: null }),
     mkCall({ id: 'c2', calldatetime: D2 }),
     mkCall({ id: 'c3', calldatetime: D1 }),
   ]);
   const updates = rec.ops('lp_leads', 'update');
-  assert.equal(updates.length, 1, 'three round-trips collapse to one update');
-  assert.deepEqual(updates[0].payload, { call_count: 3, last_contact_date: `${D2}+00:00` });
+  assert.equal(updates.length, 1);
+  assert.deepEqual(updates[0].payload, {
+    call_count: 36,                                       // NOT 3
+    last_contact_date: '2026-08-01T11:15:12+00:00',       // NOT D2
+  });
   assert.deepEqual(updates[0].filters, [['eq', 'lp_lead_id', LEAD]]);
+
+  // The exact count is a head request; the latest lookup is ordered + single.
+  const reads = rec.ops('lp_call_logs', 'select').filter(c => !c.filters.some(f => f[0] === 'in'));
+  assert.equal(reads.length, 2, 'one exact count + one ordered lookup');
+  assert.equal(reads[0].options.count, 'exact');
+  assert.equal(reads[0].options.head, true);
+  assert.ok(reads[1].filters.some(f => f[0] === 'order' && f[1] === 'call_date'));
 });
 
-test('call aggregates write null — not undefined — when every call date is null', async () => {
+test('call aggregates write null — not undefined — when the lead has no dated call', async () => {
   fresh();
+  rec.setCount('lp_call_logs', 2);
+  rec.setLatest('lp_call_logs', null);
   await syncCallLogs(LEAD, CONTACT, [mkCall({ id: 'c1', calldatetime: null }), mkCall({ id: 'c2', calldatetime: null })]);
   const [update] = rec.ops('lp_leads', 'update');
   assert.deepEqual(update.payload, { call_count: 2, last_contact_date: null });
   assert.ok('last_contact_date' in update.payload);
+});
+
+test('aggregates are not touched when no new calls were inserted', async () => {
+  fresh();
+  rec.setExisting('lp_call_logs', ['c1']);
+  rec.setCount('lp_call_logs', 36);
+  await syncCallLogs(LEAD, CONTACT, [mkCall({ id: 'c1' })]);
+  assert.equal(rec.ops('lp_leads').length, 0);
+  assert.equal(rec.ops('lp_call_logs', 'select').filter(c => c.options?.head).length, 0,
+    'the exact count must not run on a no-op sync — it is the expensive read');
 });
 
 test('an empty calls array issues zero supabase calls', async () => {
