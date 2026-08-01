@@ -20,8 +20,9 @@
 //   the shape syncJobAndMilestones has used since #512-perf
 // - raw_lp_data removal from call_logs and activities is now ACTUALLY done;
 //   the v7.0 line above described an intent that was never carried out
-// - Call aggregates derive from the LP payload instead of an exact count(*)
-//   plus an ordered lookup plus an update, per lead, per sync
+// - Call aggregates briefly derived from the LP payload; REVERTED — LP's
+//   getLead returns a rolling ~7-day call window, not the full history, so
+//   call_count was silently truncated. See the block comment in syncCallLogs.
 
 import supabase from './supabase.js';
 import { getField, normalizePhone, extractArray, loggedFirstKeys, sleep } from './sync-utils.js';
@@ -155,32 +156,33 @@ export async function syncCallLogs(lpLeadId, ghlContactId, calls) {
   }
 
   // Only update aggregates if we actually inserted new calls
+  //
+  // These stay as DB reads. perf/batch-child-sync briefly derived them from the
+  // LP payload on the premise that `calls` is the prospect's COMPLETE call list.
+  // It is not: LP's getLead returns a ROLLING ~7-DAY WINDOW. Measured on lead
+  // 563286 immediately after that deploy — 36 distinct calls on file spanning
+  // 2026-06-26..2026-08-01, of which exactly 9 fell in the last 7 days, and the
+  // payload-derived call_count wrote 9. Every lead whose history outruns the
+  // window would have had call_count silently truncated on each sync, and worse
+  // as it aged. Post-deploy mismatch rate was 1/64 leads vs 0/182 before.
+  //
+  // last_contact_date is re-read for the same reason: it is only safe to take
+  // from the payload if the payload is complete, and it isn't. The batching above
+  // is where this branch's I/O win actually comes from; these two reads are per
+  // lead only when new calls landed. Collapsing them into ONE round-trip needs a
+  // server-side aggregate (an RPC returning count + max in a single statement) —
+  // a schema change, deliberately not folded in here.
   if (newCount > 0) {
     try {
-      // Derived from the LP payload rather than re-read from Supabase. `calls` is
-      // the prospect's COMPLETE call list as LP returned it, so callEntries is the
-      // same population the exact count(*) was scanning — three round-trips
-      // (count + ordered lookup + update) collapse to one update. The exact count
-      // in particular forced a scan per lead per sync.
-      //
-      // Compared on Date.parse, not a lexicographic sort: lpDateToEastern passes
-      // through strings that already carry Z or an offset and appends +00:00 to
-      // bare ones, so a mixed-format batch would misorder as raw text.
-      let lastCallDate = null;
-      let lastCallMs = -Infinity;
-      for (const { callDatetime } of callEntries) {
-        const d = lpDateToEastern(callDatetime);
-        if (!d) continue;
-        const ms = Date.parse(d);
-        if (Number.isNaN(ms) || ms <= lastCallMs) continue;
-        lastCallMs = ms;
-        lastCallDate = d;
-      }
+      const { count } = await supabase.from('lp_call_logs')
+        .select('*', { count: 'exact', head: true }).eq('lp_lead_id', lpLeadId);
+      const { data: latest } = await supabase.from('lp_call_logs')
+        .select('call_date').eq('lp_lead_id', lpLeadId)
+        .not('call_date', 'is', null)
+        .order('call_date', { ascending: false }).limit(1).single();
       await supabase.from('lp_leads').update({
-        // Distinct ids, matching what count(*) over the table saw — LP can repeat
-        // a call in one payload, and the id fallback above can collide.
-        call_count: new Set(callEntries.map(e => e.callId)).size,
-        last_contact_date: lastCallDate,
+        call_count: count || 0,
+        last_contact_date: latest?.call_date || null,
       }).eq('lp_lead_id', lpLeadId);
     } catch (err) {
       console.warn(`[Sync] Failed to update call aggregates for lead ${lpLeadId}:`, err.message);
