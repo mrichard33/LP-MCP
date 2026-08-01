@@ -16,8 +16,49 @@
  *      will push the contact into LP's inbound queue with the appt
  *      baked in.
  *
- * Pre-check: if LP already has an appointment on the same normalized
- * date, skip the write (idempotency against retries).
+ * Pre-check: ask LP live what it holds and skip the write only when the
+ * date AND time both match (idempotency against retries). Falls back to
+ * the lp_leads cache comparison when the live read is unavailable.
+ *
+ * 2026-07-31 — LIVE LP PRE-CHECK.
+ *   The guard used to read the lp_leads Supabase cache and compare DATE
+ *   ONLY. Two defects, both duplicate-write vectors now that
+ *   GHL_APPT_LP_SYNC is the single ghl.appointment_booked → LP writeback
+ *   rule (siblings retired 2026-07-31):
+ *
+ *   1. STALE BY DESIGN. lp_leads refreshes on the ~15-minute LP polling
+ *      cycle. When the executor retries a set_lp_appointment whose LP
+ *      write already landed but whose agent_actions row failed to mark
+ *      completed, the cache still showed the old state, the guard passed,
+ *      and LP took a second write — one more LP-side appointment activity
+ *      and one more "LP Appointment Set" GroupMe card each time.
+ *   2. DATE-ONLY. normalizeDateForComparison truncates to YYYY-MM-DD, so
+ *      a same-day time change read as already_set_in_lp and was silently
+ *      dropped, leaving the appointment wrong in LP.
+ *
+ *   This is the stance slot-check.js already takes for the GHL direction:
+ *   read the other system live instead of trusting our own recorded state.
+ *   ("The already_in_sync / duplicate_sync_suppressed outcomes test LP
+ *   MCP's OWN recorded state, not whether GHL holds the slot.")
+ *
+ *   Three behaviours worth knowing, all deliberate:
+ *     • Circuit open → THROW, don't write. Mirrors checkFieldDrift's
+ *       circuit guard in admin/data-freshness.js. While LP is failing a
+ *       retry is correct and a blind write is not.
+ *     • Live lookup throws → fall through to the cache check. Fail OPEN,
+ *       deliberately unlike slot-check.js: a duplicate SetAppointment with
+ *       identical values is idempotent at LP, a stranded booking is not.
+ *       The fallback reproduces exactly the pre-2026-07-31 behaviour, so a
+ *       live-path outage can never be a regression.
+ *     • LP holds the date but no time (exact midnight — 12% of rows) →
+ *       WRITE, completing the record rather than suppressing. Cannot loop:
+ *       the LP→GHL reconciler drops midnight rows as "time TBD", so
+ *       nothing bounces back.
+ *
+ *   The already_set_in_lp result now carries `verified: 'live' | 'cache'`
+ *   so the two suppression paths are distinguishable in
+ *   agent_actions.execution_result without reading logs. Roll back with
+ *   LP_APPT_LIVE_PRECHECK_ENABLED=false (no redeploy needed).
  *
  * 2026-06-02 — CLEAN TEAM-FACING GROUPME CARD.
  *   The success GroupMe card is cleaned up to match the webhook sync
@@ -83,7 +124,8 @@
  */
 
 import supabase from '../../supabase.js';
-import { setAppointment as lpSetAppointment } from '../../lp-client.js';
+import { setAppointment as lpSetAppointment, getLeadByLdsId, getCircuitStatus } from '../../lp-client.js';
+import { extractArray, getField } from '../../sync-utils.js';
 import { resolveLPLeadId } from '../../lp-appointment-sync.js';
 import { sendGroupMeMessage } from '../../groupme.js';
 import { addGHLNote, updateGHLContactFields, applyGHLTag } from '../../ghl.js';
@@ -109,6 +151,88 @@ const FIELD_LP_LEAD_ID     = 'GmAVmW6V9sekD7pVONKr'; // lp_lead_id (real lds_id)
 // SetAppointment fallback. Never applied on the skip/failure path, so
 // its absence is an honest "agentic did NOT sync" signal.
 const LP_APPT_SYNCED_TAG = 'lp-appt-synced';
+
+// 2026-07-31 — live LP pre-check. Must be the literal 'false' to disable;
+// anything else (including unset) leaves it ON. A duplicate-suppression guard
+// that is dark by default is not a guard, and the cache-only path it replaces
+// is the defect being fixed — so the safe default is enabled.
+function isLivePrecheckEnabled() {
+  return String(process.env.LP_APPT_LIVE_PRECHECK_ENABLED ?? '').trim().toLowerCase() !== 'false';
+}
+
+/**
+ * Parse LP's `apptdate` into comparable wall-clock parts.
+ *
+ * LP returns this field in several shapes across endpoints and eras:
+ *   "2026-08-07T18:00:00", "2026-08-07 18:00:00", "8/7/2026 6:00:00 PM",
+ *   and occasionally a bare "2026-08-07" with no time at all.
+ *
+ * It is LOCAL WALL CLOCK, not UTC — do not hand it to Date.parse. Verified
+ * live 2026-07-31 against /api/Customers/GetLead: apptdate comes back as
+ * "2026-09-27T18:00:00" with no offset and no Z. appointment-dates.js says
+ * the same of the value once it lands in lp_leads ("ET WALL-CLOCK digits
+ * mislabeled as UTC"), and casting it shifts by 4-5 hours. String comparison
+ * of the normalized parts avoids the whole class of bug.
+ *
+ * @returns {{date: string, time: string|null, timeStatus: 'known'|'absent'|'unparseable'}|null}
+ *   null when no date parses at all. date is YYYY-MM-DD. time is HH:MM
+ *   24-hour when timeStatus === 'known', otherwise null:
+ *     'absent'      — LP carried no time, or exact midnight (see below)
+ *     'unparseable' — LP carried something we could not read; the caller
+ *                     writes anyway and logs, so a future LP format change
+ *                     surfaces as a bug instead of silent suppression.
+ */
+export function parseLpApptWallClock(raw) {
+  if (raw === null || raw === undefined) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+
+  const [datePart, ...rest] = s.split(/[T\s]+/);
+  // toLpApptDate first: normalizeDateForComparison's US branch requires a
+  // TWO-digit month and day, so it returns null on LP's "8/7/2026". Composing
+  // through toLpApptDate pads that to "08/07/2026" and also absorbs ISO and
+  // long form, passing null straight through for garbage.
+  const date = normalizeDateForComparison(toLpApptDate(datePart));
+  if (!date) return null;
+
+  // Strip fractional seconds and a trailing Z — LP emits ".373" on sibling
+  // timestamps (dateadded, setdate), and toLpApptTime rejects both.
+  // toLpApptTime's 12-hour branch also does not accept seconds ("6:00:00 PM"),
+  // so drop them before the AM/PM marker; its 24-hour branch tolerates them.
+  const timeRaw = rest.join(' ').trim()
+    .replace(/\.\d+/, '')
+    .replace(/Z$/i, '')
+    .replace(/^(\d{1,2}:\d{2}):\d{2}(\s*[AP]M)$/i, '$1$2')
+    .trim();
+
+  if (!timeRaw) return { date, time: null, timeStatus: 'absent' };
+
+  const time = toLpApptTime(timeRaw);
+  if (!time) return { date, time: null, timeStatus: 'unparseable' };
+
+  // Exact midnight is LP's "date known, time unknown", not a real 12:00 AM
+  // appointment — 15,890 of 128,766 appointment rows carry it (2026-07-31).
+  // Same rule lpWallClockToGhlStartTime applies in appointment-dates.js;
+  // encoding it once more here rather than inventing a second one.
+  if (time === '00:00') return { date, time: null, timeStatus: 'absent' };
+
+  return { date, time, timeStatus: 'known' };
+}
+
+/**
+ * Pull one lead out of an LP GetLead/GetLeadData response by lds_id.
+ * Lifted verbatim in shape from findLeadByLdsId in src/admin/data-freshness.js
+ * so both live-read call sites unwrap LP's nested prospect→leads envelope
+ * identically.
+ */
+function findLeadInLpResponse(resp, ldsId) {
+  for (const prospect of extractArray(resp)) {
+    const leads = getField(prospect, 'leads', 'Leads') || [];
+    const match = leads.find((l) => String(getField(l, 'id', 'lds_id', 'LeadID')) === String(ldsId));
+    if (match) return match;
+  }
+  return null;
+}
 
 // 2026-05-27 v2: helper used by the conditional calendar render below.
 // "N/A" is treated as absent so legacy callers passing the literal
@@ -285,6 +409,78 @@ export async function executeSetLPAppointment(action, context = {}) {
   const ghlDateNormalized = normalizeDateForComparison(rawDate);
   let lpSourceLine = formatLpSource(resolutionLpSource, resolutionLpSourceDetail);
 
+  // ─── LIVE LP pre-check (2026-07-31) ───────────────────────────────
+  // Ask LP what it actually holds, rather than trusting the lp_leads cache
+  // below (~15-minute polling cycle, and date-only comparison). The cache
+  // block is retained as the fallback for every path this one declines.
+  if (isLivePrecheckEnabled()) {
+    if (getCircuitStatus().circuitOpen) {
+      // LP is failing. Deferring to the executor's retry is correct here;
+      // writing blind while we cannot read is how duplicates are made.
+      // Checked BEFORE the try below on purpose — the catch there falls
+      // through to a write, which is exactly what must not happen now.
+      throw new Error('LP circuit open — deferring SetAppointment rather than writing unverified');
+    }
+    try {
+      const liveResp = await getLeadByLdsId(lpLeadId, { fast: true });
+      const liveLead = findLeadInLpResponse(liveResp, lpLeadId);
+      const liveRawAppt = liveLead ? getField(liveLead, 'apptdate', 'ApptDate') : null;
+      const liveAppt = parseLpApptWallClock(liveRawAppt);
+      if (liveAppt) {
+        // Suppress ONLY on a full date + time match. A date-only LP record
+        // ('absent') is completed by our write, not skipped: LP has the day,
+        // GHL has the time, and a duplicate carrying identical values is
+        // idempotent at LP while a timeless booking strands the rep.
+        const dateMatches = liveAppt.date === ghlDateNormalized;
+        if (dateMatches && liveAppt.timeStatus === 'known' && liveAppt.time === apptTime) {
+          console.log(`[LP-APPT] ⏭️ LIVE: LP already holds ${liveAppt.date} ${liveAppt.time} for lds_id=${lpLeadId} — suppressing duplicate write`);
+          if (!isLPLeadId(contactId)) {
+            await addGHLNote(contactId,
+              `[LP SYNC v4.5] Appointment already in LP (verified live) — skipped\n` +
+              `LP Lead ID: ${lpLeadId} | Prospect: ${resolvedProspectId || 'N/A'}\n` +
+              (lpSourceLine ? `Source: ${lpSourceLine}\n` : '') +
+              `LP holds: ${liveAppt.date} ${liveAppt.time}`
+            ).catch(() => {});
+            await applyGHLTag(contactId, LP_APPT_SYNCED_TAG).catch((err) => {
+              console.warn(`[LP-APPT] ${LP_APPT_SYNCED_TAG} tag apply failed (live already_set path, non-blocking): ${err.message}`);
+            });
+          }
+          return {
+            action: 'already_set_in_lp',
+            verified: 'live',
+            lp_lead_id: lpLeadId,
+            lp_prospect_id: resolvedProspectId,
+            lp_appointment_date: liveAppt.date,
+            lp_appointment_time: liveAppt.time,
+            ghl_appointment_date: ghlDateNormalized,
+            ghl_appointment_time: apptTime,
+            calendar_name: calendarName,
+            contact_id: contactId,
+            resolution_source: resolutionSource,
+          };
+        }
+        // Not a match — say which leg differed, so the logs distinguish a
+        // real reschedule from a parser gap.
+        if (liveAppt.timeStatus === 'unparseable') {
+          console.warn(`[LP-APPT] LIVE: could not parse LP time from apptdate="${liveRawAppt}" for lds_id=${lpLeadId} — writing ${ghlDateNormalized} ${apptTime}`);
+        } else if (!dateMatches) {
+          console.log(`[LP-APPT] LIVE: LP holds ${liveAppt.date}, writing ${ghlDateNormalized} ${apptTime} for lds_id=${lpLeadId}`);
+        } else if (liveAppt.timeStatus === 'absent') {
+          console.log(`[LP-APPT] LIVE: LP holds ${liveAppt.date} with no time — completing it with ${apptTime} for lds_id=${lpLeadId}`);
+        } else {
+          console.log(`[LP-APPT] LIVE: LP holds ${liveAppt.date} ${liveAppt.time}, writing ${ghlDateNormalized} ${apptTime} for lds_id=${lpLeadId}`);
+        }
+      }
+    } catch (err) {
+      // Fail OPEN, deliberately — unlike slot-check.js. A duplicate
+      // SetAppointment carrying identical values is idempotent at LP; a
+      // stranded booking is not. Falling through to the cache check below
+      // reproduces exactly the pre-2026-07-31 behaviour, so a live-path
+      // outage can never be worse than what shipped before this guard.
+      console.warn(`[LP-APPT] live pre-check unavailable for lds_id=${lpLeadId} (falling back to cache): ${err.message}`);
+    }
+  }
+
   try {
     const { data: existingLead } = await supabase.from('lp_leads')
       .select('appointment_set, appointment_date, lead_source, lead_source_detail')
@@ -315,6 +511,7 @@ export async function executeSetLPAppointment(action, context = {}) {
         }
         return {
           action: 'already_set_in_lp',
+          verified: 'cache',
           lp_lead_id: lpLeadId,
           lp_prospect_id: resolvedProspectId,
           lp_appointment_date: lpDateNormalized,
