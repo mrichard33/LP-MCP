@@ -13,6 +13,15 @@
 // v7.1 — MILESTONE EVENT EMISSION:
 // - When a milestone tag fires, emit lp.milestone_completed to system_events
 // - Enables P2_MILESTONE_* agent rules (IDs 113-119) for pipeline advancement
+//
+// v7.2 — BATCHED CHILD WRITES (perf/batch-child-sync):
+// - syncCallLogs / syncNotes / syncActivities build their rows, dedupe on the
+//   conflict key, and issue ONE bulk upsert each with a per-row fallback —
+//   the shape syncJobAndMilestones has used since #512-perf
+// - raw_lp_data removal from call_logs and activities is now ACTUALLY done;
+//   the v7.0 line above described an intent that was never carried out
+// - Call aggregates derive from the LP payload instead of an exact count(*)
+//   plus an ordered lookup plus an update, per lead, per sync
 
 import supabase from './supabase.js';
 import { getField, normalizePhone, extractArray, loggedFirstKeys, sleep } from './sync-utils.js';
@@ -83,46 +92,95 @@ export async function syncCallLogs(lpLeadId, ghlContactId, calls) {
   // Batch check which already exist
   const existingIds = await getExistingIds('lp_call_logs', 'lp_call_id', callEntries.map(e => e.callId));
 
-  let newCount = 0;
+  // ─── Batched write path (perf/batch-child-sync) ──────────────────
+  // Was one upsert round-trip PER call. pg_stat_statements logged 526,545
+  // single-row INSERTs into lp_call_logs at 23.0ms mean (12,088s total) over
+  // 1,386 tracked hours. Same shape as the #512-perf milestone path below: build
+  // the rows, one bulk upsert, per-row fallback so a single bad row cannot drop
+  // the lead's whole call history.
+  //
+  // raw_lp_data is NOT written. The v7.0 header above has claimed it was removed
+  // since v7.0; it never was, and that payload is the bulk of the 23ms. Nothing
+  // reads lp_call_logs.raw_lp_data — get_lead_summary / get_call_history project
+  // LP_CALL_COLUMNS (tools/lead-tools.js), which excludes it for the same TOAST
+  // cost. Omitting the key also leaves it out of the ON CONFLICT SET list, so
+  // existing rows keep the payload they already have.
+  //
+  // Keyed by lp_call_id, last occurrence wins — the same dedupe decisionByMdt
+  // does for milestones. A conflict key repeated inside ONE bulk upsert is a hard
+  // Postgres error (21000, "ON CONFLICT DO UPDATE command cannot affect row a
+  // second time") that fails the WHOLE batch; the per-row loop was immune to it.
+  const callRowsById = new Map();
   for (const { call, callId, callDatetime } of callEntries) {
     if (existingIds.has(callId)) {
       _childSkips.calls++;
       continue;
     }
-    try {
-      await supabase.from('lp_call_logs').upsert({
-        lp_call_id:        callId,
-        lp_lead_id:        lpLeadId,
-        ghl_contact_id:    ghlContactId || null,
-        call_date:         lpDateToEastern(callDatetime),
-        call_duration_sec: getField(call, 'duration', 'Duration', 'call_duration', 'callduration'),
-        call_result:       getField(call, 'resultcode', 'ResultCode', 'resultdescr', 'result'),
-        call_direction:    getField(call, 'calltype', 'CallType', 'calltypedescr', 'direction'),
-        rep_id:            getField(call, 'agent', 'emp_id', 'EmpID', 'empid', 'rep_id'),
-        rep_name:          getField(call, 'agentname', 'AgentName', 'rep_name', 'agent_name'),
-        call_notes:        getField(call, 'notes', 'Notes', 'note', 'call_notes', 'CallNotes'),
-        recording_url:     getField(call, 'recording_url', 'RecordingURL', 'recordingurl', 'recording'),
-        synced_at:         new Date().toISOString(),
-        raw_lp_data:       call,
-      }, { onConflict: 'lp_call_id' });
-      newCount++;
-    } catch (err) {
-      console.warn(`[Sync] Call upsert failed for ${callId}:`, err.message);
+    callRowsById.set(callId, {
+      lp_call_id:        callId,
+      lp_lead_id:        lpLeadId,
+      ghl_contact_id:    ghlContactId || null,
+      call_date:         lpDateToEastern(callDatetime),
+      call_duration_sec: getField(call, 'duration', 'Duration', 'call_duration', 'callduration'),
+      call_result:       getField(call, 'resultcode', 'ResultCode', 'resultdescr', 'result'),
+      call_direction:    getField(call, 'calltype', 'CallType', 'calltypedescr', 'direction'),
+      rep_id:            getField(call, 'agent', 'emp_id', 'EmpID', 'empid', 'rep_id'),
+      rep_name:          getField(call, 'agentname', 'AgentName', 'rep_name', 'agent_name'),
+      call_notes:        getField(call, 'notes', 'Notes', 'note', 'call_notes', 'CallNotes'),
+      recording_url:     getField(call, 'recording_url', 'RecordingURL', 'recordingurl', 'recording'),
+      synced_at:         new Date().toISOString(),
+    });
+  }
+  const callRows = [...callRowsById.values()];
+
+  let newCount = 0;
+  if (callRows.length) {
+    const { error: bulkErr } = await supabase.from('lp_call_logs')
+      .upsert(callRows, { onConflict: 'lp_call_id' });
+    if (bulkErr) {
+      console.warn(`[Sync] Call bulk upsert failed for lead ${lpLeadId} (${bulkErr.message}) — falling back to per-row`);
+      for (const row of callRows) {
+        try {
+          const { error } = await supabase.from('lp_call_logs')
+            .upsert(row, { onConflict: 'lp_call_id' });
+          if (error) console.warn(`[Sync] Call upsert failed for ${row.lp_call_id}:`, error.message);
+          else newCount++;
+        } catch (err) {
+          console.warn(`[Sync] Call upsert failed for ${row.lp_call_id}:`, err.message);
+        }
+      }
+    } else {
+      newCount = callRows.length;
     }
   }
 
   // Only update aggregates if we actually inserted new calls
   if (newCount > 0) {
     try {
-      const { count } = await supabase.from('lp_call_logs')
-        .select('*', { count: 'exact', head: true }).eq('lp_lead_id', lpLeadId);
-      const { data: latest } = await supabase.from('lp_call_logs')
-        .select('call_date').eq('lp_lead_id', lpLeadId)
-        .not('call_date', 'is', null)
-        .order('call_date', { ascending: false }).limit(1).single();
+      // Derived from the LP payload rather than re-read from Supabase. `calls` is
+      // the prospect's COMPLETE call list as LP returned it, so callEntries is the
+      // same population the exact count(*) was scanning — three round-trips
+      // (count + ordered lookup + update) collapse to one update. The exact count
+      // in particular forced a scan per lead per sync.
+      //
+      // Compared on Date.parse, not a lexicographic sort: lpDateToEastern passes
+      // through strings that already carry Z or an offset and appends +00:00 to
+      // bare ones, so a mixed-format batch would misorder as raw text.
+      let lastCallDate = null;
+      let lastCallMs = -Infinity;
+      for (const { callDatetime } of callEntries) {
+        const d = lpDateToEastern(callDatetime);
+        if (!d) continue;
+        const ms = Date.parse(d);
+        if (Number.isNaN(ms) || ms <= lastCallMs) continue;
+        lastCallMs = ms;
+        lastCallDate = d;
+      }
       await supabase.from('lp_leads').update({
-        call_count: count || 0,
-        last_contact_date: latest?.call_date || null,
+        // Distinct ids, matching what count(*) over the table saw — LP can repeat
+        // a call in one payload, and the id fallback above can collide.
+        call_count: new Set(callEntries.map(e => e.callId)).size,
+        last_contact_date: lastCallDate,
       }).eq('lp_lead_id', lpLeadId);
     } catch (err) {
       console.warn(`[Sync] Failed to update call aggregates for lead ${lpLeadId}:`, err.message);
@@ -161,29 +219,53 @@ export async function syncNotes(lpLeadId, ghlContactId, notes) {
     return /^\[(?:GHL · )?AI BRIEF · /.test(b) ? 'ghl_ai_brief' : 'lp';
   };
 
+  // Batched (perf/batch-child-sync) — was one round-trip per note. Deduped by
+  // lp_note_id, last occurrence wins: the id fallback above is
+  // `${lpLeadId}-${date}` with no per-note discriminator, so two same-dated notes
+  // that carry no LP id collide, and a repeated conflict key inside one bulk
+  // upsert fails the whole batch with Postgres 21000.
+  //
+  // raw_lp_data is RETAINED here, unlike calls and activities: the v7.0 removal
+  // note never covered lp_notes, and the note pipeline is the one consumer that
+  // may still want the original LP payload.
+  const noteRowsById = new Map();
   for (const { note, noteId } of noteEntries) {
     if (existingIds.has(noteId)) {
       _childSkips.notes++;
       continue;
     }
     const noteBody = getField(note, 'note', 'notes', 'Notes', 'body', 'text', 'note_body', 'NoteBody', 'content', 'Content');
-    try {
-      await supabase.from('lp_notes').upsert({
-        lp_note_id:          noteId,
-        lp_lead_id:          lpLeadId,
-        ghl_contact_id:      ghlContactId || null,
-        note_origin:         noteOriginOf(noteBody),
-        note_body:           noteBody,
-        note_type:           getField(note, 'rectype', 'RecType', 'type', 'note_type'),
-        note_category:       getField(note, 'category', 'Category'),
-        created_by_rep_name: getField(note, 'enteredby', 'EnteredBy', 'rep_name', 'entered_by'),
-        created_by_rep_id:   getField(note, 'rep_id', 'agent', 'emp_id', 'EmpID'),
-        created_at_lp:       lpDateToEastern(getField(note, 'date', 'Date', 'enteredon', 'EnteredOn', 'created_at')),
-        synced_at:           new Date().toISOString(),
-        raw_lp_data:         note,
-      }, { onConflict: 'lp_note_id' });
-    } catch (err) {
-      console.warn(`[Sync] Note upsert failed for ${noteId}:`, err.message);
+    noteRowsById.set(noteId, {
+      lp_note_id:          noteId,
+      lp_lead_id:          lpLeadId,
+      ghl_contact_id:      ghlContactId || null,
+      note_origin:         noteOriginOf(noteBody),
+      note_body:           noteBody,
+      note_type:           getField(note, 'rectype', 'RecType', 'type', 'note_type'),
+      note_category:       getField(note, 'category', 'Category'),
+      created_by_rep_name: getField(note, 'enteredby', 'EnteredBy', 'rep_name', 'entered_by'),
+      created_by_rep_id:   getField(note, 'rep_id', 'agent', 'emp_id', 'EmpID'),
+      created_at_lp:       lpDateToEastern(getField(note, 'date', 'Date', 'enteredon', 'EnteredOn', 'created_at')),
+      synced_at:           new Date().toISOString(),
+      raw_lp_data:         note,
+    });
+  }
+  const noteRows = [...noteRowsById.values()];
+
+  if (noteRows.length) {
+    const { error: bulkErr } = await supabase.from('lp_notes')
+      .upsert(noteRows, { onConflict: 'lp_note_id' });
+    if (bulkErr) {
+      console.warn(`[Sync] Note bulk upsert failed for lead ${lpLeadId} (${bulkErr.message}) — falling back to per-row`);
+      for (const row of noteRows) {
+        try {
+          const { error } = await supabase.from('lp_notes')
+            .upsert(row, { onConflict: 'lp_note_id' });
+          if (error) console.warn(`[Sync] Note upsert failed for ${row.lp_note_id}:`, error.message);
+        } catch (err) {
+          console.warn(`[Sync] Note upsert failed for ${row.lp_note_id}:`, err.message);
+        }
+      }
     }
   }
 }
@@ -209,40 +291,67 @@ export async function syncActivities(lpLeadId, calls, notes) {
 
   const existingIds = await getExistingIds('lp_activities', 'lp_activity_id', activityEntries.map(e => e.activityId));
 
+  // Batched (perf/batch-child-sync). Highest-volume writer in the sync:
+  // 1,059,937 single-row INSERTs at 11.1ms mean (11,743s) over 1,386 hours.
+  //
+  // The dedupe matters MORE here than on calls or notes. lp_activity_id is
+  // synthesized as `call-${lead}-${date}-${agent}` / `note-${lead}-${date}-${by}`,
+  // so two calls placed at the same datetime by the same agent produce ONE key
+  // even though their lp_call_ids differ. Repeated inside a single bulk upsert
+  // that is Postgres 21000 ("ON CONFLICT DO UPDATE command cannot affect row a
+  // second time") and the whole batch fails. Last occurrence wins, matching the
+  // sequential order the per-row loop used to leave behind.
+  //
+  // raw_lp_data dropped, per the v7.0 header's stated intent — activities are
+  // SYNTHESIZED from calls and notes, both of which are stored in their own
+  // tables, so the payload here was a third copy of data already persisted twice.
+  // Existing rows are untouched.
+  const activityRowsById = new Map();
   for (const entry of activityEntries) {
     if (existingIds.has(entry.activityId)) {
       _childSkips.activities++;
       continue;
     }
-    try {
-      if (entry.type === 'call') {
-        const call = entry.source;
-        await supabase.from('lp_activities').upsert({
-          lp_activity_id:  entry.activityId,
-          lp_lead_id:      lpLeadId,
-          activity_type:   'call',
-          activity_detail: getField(call, 'resultdescr', 'resultcode', 'ResultCode', 'result') || 'Call logged',
-          rep_id:          getField(call, 'agent', 'emp_id', 'EmpID', 'empid', 'rep_id'),
-          rep_name:        getField(call, 'agentname', 'AgentName', 'rep_name', 'agent_name'),
-          activity_date:   lpDateToEastern(entry.date),
-          synced_at:       new Date().toISOString(),
-          raw_lp_data:     call,
-        }, { onConflict: 'lp_activity_id' });
-      } else {
-        const note = entry.source;
-        await supabase.from('lp_activities').upsert({
-          lp_activity_id:  entry.activityId,
-          lp_lead_id:      lpLeadId,
-          activity_type:   getField(note, 'rectype', 'RecType', 'type', 'note_type') || 'note',
-          activity_detail: (getField(note, 'note', 'notes', 'Notes', 'body', 'text') || '').slice(0, 500),
-          rep_id:          null,
-          rep_name:        getField(note, 'enteredby', 'EnteredBy', 'rep_name', 'entered_by'),
-          activity_date:   lpDateToEastern(entry.date),
-          synced_at:       new Date().toISOString(),
-          raw_lp_data:     note,
-        }, { onConflict: 'lp_activity_id' });
+    if (entry.type === 'call') {
+      const call = entry.source;
+      activityRowsById.set(entry.activityId, {
+        lp_activity_id:  entry.activityId,
+        lp_lead_id:      lpLeadId,
+        activity_type:   'call',
+        activity_detail: getField(call, 'resultdescr', 'resultcode', 'ResultCode', 'result') || 'Call logged',
+        rep_id:          getField(call, 'agent', 'emp_id', 'EmpID', 'empid', 'rep_id'),
+        rep_name:        getField(call, 'agentname', 'AgentName', 'rep_name', 'agent_name'),
+        activity_date:   lpDateToEastern(entry.date),
+        synced_at:       new Date().toISOString(),
+      });
+    } else {
+      const note = entry.source;
+      activityRowsById.set(entry.activityId, {
+        lp_activity_id:  entry.activityId,
+        lp_lead_id:      lpLeadId,
+        activity_type:   getField(note, 'rectype', 'RecType', 'type', 'note_type') || 'note',
+        activity_detail: (getField(note, 'note', 'notes', 'Notes', 'body', 'text') || '').slice(0, 500),
+        rep_id:          null,
+        rep_name:        getField(note, 'enteredby', 'EnteredBy', 'rep_name', 'entered_by'),
+        activity_date:   lpDateToEastern(entry.date),
+        synced_at:       new Date().toISOString(),
+      });
+    }
+  }
+  const activityRows = [...activityRowsById.values()];
+
+  if (activityRows.length) {
+    const { error: bulkErr } = await supabase.from('lp_activities')
+      .upsert(activityRows, { onConflict: 'lp_activity_id' });
+    if (bulkErr) {
+      // Activities are derived and non-critical, so the fallback stays silent
+      // per-row as before rather than escalating.
+      for (const row of activityRows) {
+        try {
+          await supabase.from('lp_activities').upsert(row, { onConflict: 'lp_activity_id' });
+        } catch (err) { /* Non-critical */ }
       }
-    } catch (err) { /* Non-critical */ }
+    }
   }
 }
 
