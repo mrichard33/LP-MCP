@@ -39,6 +39,7 @@ import { five9WebhookHandler } from './five9-events.js';
 import { probeGHLContactTracked } from './services/ghl-contact-probe.js';
 import { LINK_SOURCE } from './services/link-corroboration.js';
 import { createAppointmentFromLpHandler } from './appointments/booking-endpoint.js';
+import { flattenWebhookBody } from './webhook-body.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // WEBHOOK SIGNATURE VERIFICATION (optional but recommended)
@@ -1158,6 +1159,77 @@ async function lpLeadRefreshHandler(req, res) {
   });
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// GHL → Agentic handoff field resolution
+// ═══════════════════════════════════════════════════════════════════
+
+// trigger_context → event_subtype. Exported so the regression test asserts
+// the real table rather than a copy that can drift.
+export const GHL_HANDOFF_SUBTYPE_MAP = {
+  'appointment_booked': 'appt:booked',
+  'appointment_cancelled': 'appt:cancelled',
+  'appointment_rescheduled': 'appt:rescheduled',
+  'appointment_completed': 'appt:completed',
+  'appointment_no_show': 'appt:no_show',
+  'disposition_changed': 'lp:disposition',
+  'stage_advanced': 'pipeline:advanced',
+  'tag_added': 'contact:tag_added',
+  'reply_received': 'contact:reply',
+  'booking_requested': 'appt:booking_requested',
+};
+
+/**
+ * Resolve the scalars /webhook/ghl-event writes onto the system_event.
+ *
+ * 2026-07-31 — GHL's standard outbound Webhook step nests every custom key
+ * under `customData` and reserves the payload root for its own contact,
+ * calendar and workflow fields (plus every custom field keyed by DISPLAY
+ * name — "LP Lead ID", "Appointment Date"). Reading trigger_context off the
+ * root therefore always missed, defaulting every handoff to event_subtype
+ * 'unknown' and matching zero rules.
+ *
+ * Verified on contact ZuBLBlXOH3i1XKkwhn59 / event 2418399 (I.LP-A
+ * appointment handoff): customData carried trigger_context
+ * 'appointment_booked' and lp_lead_id '511364' while the root carried
+ * neither. The row recorded subtype 'unknown', lp_lead_id null, priority
+ * 'normal', action_taken 'no_matching_rules' — all four consistent with
+ * root-only reads against a nested payload.
+ *
+ * flattenWebhookBody handles all four shapes GHL sends (flat, customData
+ * object, customData stringified JSON, customData [{key,value}] array) and
+ * lets a non-empty root value win, so an empty-rendering merge tag inside
+ * customData can't clobber the root contact_id — the one key both sides
+ * genuinely carry. Flat callers (n8n, curl, Custom Webhook / LC Premium) are
+ * unaffected: their root keys still resolve.
+ *
+ * Pure — does not mutate `payload`. The caller still stores the raw,
+ * unflattened body as the event's audit record.
+ */
+export function resolveGhlHandoffFields(payload) {
+  const src = flattenWebhookBody(payload);
+
+  const contactId = src.contact_id || src.contactId || '';
+  const triggerContext = src.trigger_context || src.triggerContext || 'unknown';
+  const lpLeadId = src.lp_lead_id || src.lpLeadId || null;
+
+  // An explicit event_subtype from the caller wins over the mapped
+  // trigger_context. Lets a workflow emit a subtype that has no
+  // trigger_context equivalent without touching the map, and makes the
+  // `event_subtype` key added to I.LP-A's customData on 2026-07-31
+  // authoritative rather than inert.
+  const eventSubtype = src.event_subtype || src.eventSubtype
+    || GHL_HANDOFF_SUBTYPE_MAP[triggerContext] || triggerContext;
+
+  return {
+    src,
+    contactId,
+    triggerContext,
+    lpLeadId,
+    eventSubtype,
+    priority: triggerContext.includes('appointment') ? 'high' : 'normal',
+  };
+}
+
 export function registerRestApiRoutes(app, authenticate) {
 
   // ═══════════════════════════════════════════════════════════════
@@ -1183,8 +1255,14 @@ export function registerRestApiRoutes(app, authenticate) {
   //   "calendar_name":   "Calendar name (for appointment events)",
   //   "appointment_date": "YYYY-MM-DD",
   //   "appointment_time": "HH:MM AM/PM",
+  //   "event_subtype":   "optional — overrides the trigger_context mapping",
   //   ...any additional fields specific to the trigger
   // }
+  //
+  // These keys may arrive at the payload root (n8n, curl, Custom Webhook /
+  // LC Premium) OR nested under `customData` — GHL's standard outbound
+  // Webhook step reserves the root for its own fields and nests the step's
+  // declared keys. resolveGhlHandoffFields normalises both shapes.
   //
   // Returns: { received: true, event_id: <id> }
   //
@@ -1201,28 +1279,12 @@ export function registerRestApiRoutes(app, authenticate) {
         return res.status(400).json({ error: 'Request body must be JSON' });
       }
 
-      const contactId = payload.contact_id || payload.contactId || '';
-      const triggerContext = payload.trigger_context || payload.triggerContext || 'unknown';
-      const lpLeadId = payload.lp_lead_id || payload.lpLeadId || null;
+      const { contactId, triggerContext, lpLeadId, eventSubtype, priority } =
+        resolveGhlHandoffFields(payload);
 
       if (!contactId && !lpLeadId) {
         return res.status(400).json({ error: 'Either contact_id or lp_lead_id is required' });
       }
-
-      // ─── Build event_subtype from trigger context ──────────
-      const subtypeMap = {
-        'appointment_booked': 'appt:booked',
-        'appointment_cancelled': 'appt:cancelled',
-        'appointment_rescheduled': 'appt:rescheduled',
-        'appointment_completed': 'appt:completed',
-        'appointment_no_show': 'appt:no_show',
-        'disposition_changed': 'lp:disposition',
-        'stage_advanced': 'pipeline:advanced',
-        'tag_added': 'contact:tag_added',
-        'reply_received': 'contact:reply',
-        'booking_requested': 'appt:booking_requested',
-      };
-      const eventSubtype = subtypeMap[triggerContext] || triggerContext;
 
       // ─── Dedup key: prevent duplicate events from GHL retries ──
       const idempotencyKey = `ghl_${contactId || lpLeadId}_${triggerContext}_${Math.floor(Date.now() / 60000)}`;
@@ -1250,8 +1312,10 @@ export function registerRestApiRoutes(app, authenticate) {
           entity_id: contactId || lpLeadId,
           ghl_contact_id: contactId || null,
           lp_lead_id: lpLeadId || null,
+          // The RAW, unflattened body is the audit record — store it verbatim.
+          // Only the extracted scalars above come from the flattened view.
           payload: payload,
-          priority: triggerContext.includes('appointment') ? 'high' : 'normal',
+          priority: priority,
           idempotency_key: idempotencyKey,
           event_timestamp: new Date().toISOString(),
         })
