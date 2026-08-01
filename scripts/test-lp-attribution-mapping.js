@@ -43,6 +43,12 @@ test('lpBool returns undefined for absent, never false', () => {
   assert.equal(lpBool(''), undefined);
   assert.equal(lpBool(null), undefined);
   assert.equal(lpBool(undefined), undefined);
+
+  // The mechanism, not just the value: undefined must survive as a DROPPED key
+  // through serialization. `false` here would write false to the flat path's
+  // ever_* columns on every sync and overwrite a correct stored flag.
+  assert.equal(JSON.stringify({ ever_sat: lpBool(undefined) }), '{}');
+  assert.equal(JSON.stringify({ ever_sat: lpBool('false') }), '{"ever_sat":false}');
 });
 
 // ─── The original defect ───────────────────────────────────────────
@@ -163,30 +169,83 @@ test('a lead with no attribution emits no attribution keys at all', () => {
 // Without this, the skip guards in upsertLeadOnly/processProspect drop every
 // pre-049 row forever: LP never bumps lastchangedon because WE added columns,
 // so a full re-sync would write nothing.
+//
+// The predicate reads FOUR columns (set_by_name, ever_confirmed, ever_sat,
+// raw_lp_data). Every `existing` fixture below must name all four — a missing
+// key reads as undefined, which the predicate treats as unpopulated, and the
+// assertion silently stops testing what it claims to.
+const EMPTY_EXISTING = {
+  set_by_name: null, ever_confirmed: null, ever_sat: null, raw_lp_data: null,
+};
+const FULL_EXISTING = {
+  set_by_name: 'Nunes, Dylan', ever_confirmed: true, ever_sat: false, raw_lp_data: { id: '500001' },
+};
+
 test('needsAttributionBackfill fires for a pre-049 row LP has data for', () => {
-  const existing = { set_by_name: null, ever_confirmed: null };
   const lead = { setbyname: 'Nunes, Dylan', everconfirmed: 'true' };
-  assert.equal(needsAttributionBackfill(existing, lead), true);
+  assert.equal(needsAttributionBackfill(EMPTY_EXISTING, lead), true);
 });
 
-test('needsAttributionBackfill goes quiet once the row is populated', () => {
-  const existing = { set_by_name: 'Nunes, Dylan', ever_confirmed: true };
+test('needsAttributionBackfill goes quiet once the row is fully populated', () => {
   const lead = { setbyname: 'Nunes, Dylan', everconfirmed: 'true' };
-  assert.equal(needsAttributionBackfill(existing, lead), false);
+  assert.equal(needsAttributionBackfill(FULL_EXISTING, lead), false);
 
-  // ever_confirmed=false is populated, not absent.
+  // false is populated, not absent — for both boolean columns.
   assert.equal(
-    needsAttributionBackfill({ set_by_name: 'Deer, Craig', ever_confirmed: false }, lead),
+    needsAttributionBackfill(
+      { ...FULL_EXISTING, set_by_name: 'Deer, Craig', ever_confirmed: false }, lead),
     false,
   );
 });
 
+test('needsAttributionBackfill fires when only ever_sat is missing', () => {
+  // THE defect. The original predicate returned false as soon as set_by_name
+  // and ever_confirmed were set, so a row missing only the ever_* family never
+  // forced an upsert — ~203k rows stayed NULL through every re-sync.
+  const existing = { ...FULL_EXISTING, ever_sat: null };
+  assert.equal(
+    needsAttributionBackfill(existing, { setbyname: 'Nunes, Dylan', eversat: 'true' }),
+    true,
+  );
+  // eversat alone on the LP side is enough to trigger it.
+  assert.equal(needsAttributionBackfill(existing, { eversat: 'false' }), true);
+});
+
+test('needsAttributionBackfill fires when only raw_lp_data is missing', () => {
+  // raw_lp_data is the discovery surface for unmapped LP fields (rep_id among
+  // them). A row with complete attribution but no raw payload still needs one.
+  assert.equal(
+    needsAttributionBackfill({ ...FULL_EXISTING, raw_lp_data: null },
+      { setbyname: 'Nunes, Dylan' }),
+    true,
+  );
+});
+
 test('needsAttributionBackfill does not fire when LP has nothing to give', () => {
-  const existing = { set_by_name: null, ever_confirmed: null };
-  assert.equal(needsAttributionBackfill(existing, { setbyname: '', everconfirmed: '' }), false);
-  assert.equal(needsAttributionBackfill(existing, {}), false);
+  assert.equal(
+    needsAttributionBackfill(EMPTY_EXISTING, { setbyname: '', everconfirmed: '', eversat: '' }),
+    false,
+  );
+  assert.equal(needsAttributionBackfill(EMPTY_EXISTING, {}), false);
   // No existing row means the normal insert path handles it.
   assert.equal(needsAttributionBackfill(null, { setbyname: 'Nunes, Dylan' }), false);
+});
+
+// ─── raw_lp_data persistence ───────────────────────────────────────
+test('buildLeadRow persists raw_lp_data with jobs stripped', () => {
+  // The column existed since schema.sql and was never written — 0 of 227,710
+  // rows populated — which is why no unmapped LP field could be backfilled
+  // without a fresh API pull. Jobs are excluded: already normalised into
+  // lp_jobs / lp_job_milestones.
+  const row = buildRow({
+    id: '500001', setbyname: 'Deer, Craig', someUnmappedLpField: 'abc',
+    jobs: [{ job_id: 1 }], Jobs: [{ job_id: 2 }],
+  });
+
+  assert.equal(row.raw_lp_data.someUnmappedLpField, 'abc');
+  assert.equal(row.raw_lp_data.setbyname, 'Deer, Craig');
+  assert.ok(!('jobs' in row.raw_lp_data), 'jobs must be stripped');
+  assert.ok(!('Jobs' in row.raw_lp_data), 'Jobs must be stripped');
 });
 
 // ─── getField contract this mapping leans on ───────────────────────

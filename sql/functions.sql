@@ -154,6 +154,18 @@ $$ LANGUAGE sql;
 -- =============================================================
 -- get_rep_performance — Rep analytics
 -- =============================================================
+--
+-- 2026-08-01: repaired. This returned [] for EVERY date range because it
+-- filtered `AND l.rep_id IS NOT NULL` and rep_id is NULL on 227,710 of 227,710
+-- rows — the sync never maps it and no LP source field is known. It now groups
+-- on rep_name; rep_id stays in the GROUP BY so no caller breaks.
+--
+-- DROP before CREATE is REQUIRED, not cosmetic: adding sit_rate changes the
+-- RETURNS TABLE column list, and Postgres rejects a return-type change on
+-- CREATE OR REPLACE ("cannot change return type of existing function").
+-- Verified 0 dependents in pg_depend, so the drop is safe and non-cascading.
+DROP FUNCTION IF EXISTS get_rep_performance(TIMESTAMPTZ, TIMESTAMPTZ);
+
 CREATE OR REPLACE FUNCTION get_rep_performance(p_start_date TIMESTAMPTZ, p_end_date TIMESTAMPTZ)
 RETURNS TABLE (
   rep_id              TEXT,
@@ -166,6 +178,7 @@ RETURNS TABLE (
   total_revenue       NUMERIC,
   avg_job_value       NUMERIC,
   set_rate            NUMERIC,
+  sit_rate            NUMERIC,
   close_rate          NUMERIC,
   avg_calls_per_lead  NUMERIC
 ) AS $$
@@ -180,11 +193,20 @@ RETURNS TABLE (
     ROUND(SUM(l.job_value) FILTER (WHERE l.closed_won), 0) AS total_revenue,
     ROUND(AVG(l.job_value) FILTER (WHERE l.closed_won), 0) AS avg_job_value,
     ROUND(100.0 * COUNT(*) FILTER (WHERE l.appointment_set) / NULLIF(COUNT(*), 0), 1) AS set_rate,
+    -- Sit rate = ran / scheduled. demo_date is written only when the
+    -- appointment ran; appointment_date is written on every scheduled
+    -- appointment, so it is the no-show-inclusive denominator. Healthy 65-80%.
+    ROUND(100.0 * COUNT(l.demo_date) / NULLIF(COUNT(l.appointment_date), 0), 1) AS sit_rate,
     ROUND(100.0 * COUNT(*) FILTER (WHERE l.closed_won) / NULLIF(COUNT(*) FILTER (WHERE (l.demo_completed AND l.disposition_code NOT IN ('NOC','NIS'))), 0), 1) AS close_rate,
     ROUND(SUM(l.call_count)::NUMERIC / NULLIF(COUNT(DISTINCT l.lp_lead_id), 0), 1) AS avg_calls_per_lead
   FROM lp_leads l
-  WHERE l.created_at_lp BETWEEN p_start_date AND p_end_date
-    AND l.rep_id IS NOT NULL
+  -- Anchored on appointment_date: the question is "what did this rep run in
+  -- the window", not "which leads were created in it". created_at_lp made a
+  -- lead synced today but created in 2019 invisible to every recent window.
+  WHERE l.appointment_date >= p_start_date
+    AND l.appointment_date <  p_end_date
+    AND l.rep_name IS NOT NULL
+    AND btrim(l.rep_name) <> ''
   GROUP BY l.rep_id, l.rep_name
   ORDER BY total_revenue DESC NULLS LAST;
 $$ LANGUAGE sql;

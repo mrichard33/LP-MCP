@@ -541,6 +541,118 @@ async function runMigrations() {
     console.error('[Migration] canvassing intake marks FAILED (canvassing-lead idempotency reads it — apply sql/052 manually):', err.message);
   }
 
+  // Rep + setter reporting RPCs (sql/functions.sql and sql/053 are the source
+  // of truth; this mirror lets a fresh deploy self-heal them). Unlike every
+  // other block here this one defines FUNCTIONS, not DDL — the reporting layer
+  // had drifted out of the boot path entirely, which is how get_rep_performance
+  // sat broken returning [] for every date range.
+  //
+  // The DROP is required, not cosmetic: sql/functions.sql adds sit_rate to the
+  // RETURNS TABLE, and Postgres rejects a return-type change on CREATE OR
+  // REPLACE. IF EXISTS keeps it idempotent; 0 dependents, so no CASCADE.
+  //
+  // $fn$ dollar-quoting, not $$: this string is itself inside a JS template
+  // literal and two functions are defined in one call, so the bodies need a
+  // tag that cannot collide.
+  //
+  // Nothing at boot reads these RPCs — only the MCP tool layer — so a failure
+  // logs and continues rather than blocking startup.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`
+            DROP FUNCTION IF EXISTS get_rep_performance(TIMESTAMPTZ, TIMESTAMPTZ);
+            CREATE OR REPLACE FUNCTION get_rep_performance(p_start_date TIMESTAMPTZ, p_end_date TIMESTAMPTZ)
+            RETURNS TABLE (
+              rep_id              TEXT,
+              rep_name            TEXT,
+              total_leads         BIGINT,
+              total_calls         BIGINT,
+              demos_set           BIGINT,
+              demos_completed     BIGINT,
+              closed_won_count    BIGINT,
+              total_revenue       NUMERIC,
+              avg_job_value       NUMERIC,
+              set_rate            NUMERIC,
+              sit_rate            NUMERIC,
+              close_rate          NUMERIC,
+              avg_calls_per_lead  NUMERIC
+            ) AS $fn$
+              SELECT
+                l.rep_id,
+                l.rep_name,
+                COUNT(DISTINCT l.lp_lead_id) AS total_leads,
+                SUM(l.call_count) AS total_calls,
+                COUNT(*) FILTER (WHERE l.appointment_set) AS demos_set,
+                COUNT(*) FILTER (WHERE (l.demo_completed AND l.disposition_code NOT IN ('NOC','NIS'))) AS demos_completed,
+                COUNT(*) FILTER (WHERE l.closed_won) AS closed_won_count,
+                ROUND(SUM(l.job_value) FILTER (WHERE l.closed_won), 0) AS total_revenue,
+                ROUND(AVG(l.job_value) FILTER (WHERE l.closed_won), 0) AS avg_job_value,
+                ROUND(100.0 * COUNT(*) FILTER (WHERE l.appointment_set) / NULLIF(COUNT(*), 0), 1) AS set_rate,
+                ROUND(100.0 * COUNT(l.demo_date) / NULLIF(COUNT(l.appointment_date), 0), 1) AS sit_rate,
+                ROUND(100.0 * COUNT(*) FILTER (WHERE l.closed_won) / NULLIF(COUNT(*) FILTER (WHERE (l.demo_completed AND l.disposition_code NOT IN ('NOC','NIS'))), 0), 1) AS close_rate,
+                ROUND(SUM(l.call_count)::NUMERIC / NULLIF(COUNT(DISTINCT l.lp_lead_id), 0), 1) AS avg_calls_per_lead
+              FROM lp_leads l
+              WHERE l.appointment_date >= p_start_date
+                AND l.appointment_date <  p_end_date
+                AND l.rep_name IS NOT NULL
+                AND btrim(l.rep_name) <> ''
+              GROUP BY l.rep_id, l.rep_name
+              ORDER BY total_revenue DESC NULLS LAST;
+            $fn$ LANGUAGE sql;
+
+            CREATE OR REPLACE FUNCTION get_setter_performance(
+              p_start_date TIMESTAMPTZ,
+              p_end_date   TIMESTAMPTZ,
+              p_min_appts  INT DEFAULT 5
+            )
+            RETURNS TABLE (
+              set_by_name        TEXT,
+              lead_source_detail TEXT,
+              set_channel        TEXT,
+              appts_scheduled    BIGINT,
+              appts_ran          BIGINT,
+              sit_rate           NUMERIC,
+              confirmed_count    BIGINT,
+              confirm_rate       NUMERIC,
+              closed_won_count   BIGINT,
+              close_rate_on_net  NUMERIC,
+              total_revenue      NUMERIC
+            ) AS $fn$
+              SELECT
+                l.set_by_name,
+                l.lead_source_detail,
+                CASE
+                  WHEN l.set_by_name = 'No, Setter' AND l.lead_source_detail = 'Canvass'
+                    THEN 'canvass_field'
+                  WHEN l.set_by_name = 'No, Setter'
+                    THEN 'unset_inbound'
+                  WHEN l.set_by_name = 'Integration, GoHighLevel'
+                    THEN 'integration'
+                  WHEN l.set_by_name LIKE '%- LF,%'
+                    THEN 'partner_phone'
+                  ELSE 'phone_setter'
+                END AS set_channel,
+                COUNT(*)                                   AS appts_scheduled,
+                COUNT(l.demo_date)                         AS appts_ran,
+                ROUND(100.0 * COUNT(l.demo_date) / NULLIF(COUNT(*), 0), 1) AS sit_rate,
+                COUNT(*) FILTER (WHERE l.ever_confirmed)   AS confirmed_count,
+                ROUND(100.0 * COUNT(*) FILTER (WHERE l.ever_confirmed) / NULLIF(COUNT(*), 0), 1) AS confirm_rate,
+                COUNT(*) FILTER (WHERE l.closed_won)       AS closed_won_count,
+                ROUND(100.0 * COUNT(*) FILTER (WHERE l.closed_won) / NULLIF(COUNT(l.demo_date), 0), 1) AS close_rate_on_net,
+                ROUND(SUM(l.job_value) FILTER (WHERE l.closed_won), 0) AS total_revenue
+              FROM lp_leads l
+              WHERE l.appointment_date >= p_start_date
+                AND l.appointment_date <  p_end_date
+                AND l.set_by_name IS NOT NULL
+              GROUP BY l.set_by_name, l.lead_source_detail
+              HAVING COUNT(*) >= p_min_appts
+              ORDER BY appts_scheduled DESC;
+            $fn$ LANGUAGE sql;`);
+    console.log('[Migration] rep + setter reporting RPCs (sql/functions.sql + sql/053) ready');
+  } catch (err) {
+    console.error('[Migration] reporting RPCs FAILED (get_rep_performance / get_setter_performance — apply sql/functions.sql + sql/053 manually):', err.message);
+  }
+
   // Scorecard revenue realignment (sql/040): live-month RTP-net + provisional-gross columns,
   // the Net Report staging table, and the source-precedence view. Additive/idempotent — the
   // one-shot label relabels (sql/040 §C) are NOT run here (data ops, applied once via migration).

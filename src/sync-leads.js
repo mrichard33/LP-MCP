@@ -346,9 +346,21 @@ function lpBool(v) {
 // Fires at most once per row: goes quiet as soon as the columns are populated.
 function needsAttributionBackfill(existing, lead) {
   if (!existing) return false;
-  if (existing.set_by_name != null && existing.ever_confirmed != null) return false;
+  // Fires while ANY 049-era column is still unpopulated. The original two-column
+  // test went quiet as soon as set_by_name and ever_confirmed were set, so a row
+  // missing only the ever_* family never forced an upsert — ~203k rows sat NULL
+  // through every re-sync because LP never bumps lastchangedon for columns WE
+  // added.
+  // raw_lp_data joins the predicate: it is the discovery surface for LP fields
+  // we have not mapped yet (rep_id has no known source field).
+  const complete = existing.set_by_name != null
+    && existing.ever_confirmed != null
+    && existing.ever_sat != null
+    && existing.raw_lp_data != null;
+  if (complete) return false;
   return getField(lead, 'setbyname', 'SetByName') != null
-    || getField(lead, 'everconfirmed', 'EverConfirmed') != null;
+    || getField(lead, 'everconfirmed', 'EverConfirmed') != null
+    || getField(lead, 'eversat', 'EverSat') != null;
 }
 
 // ─── Build the lead row payload (DRY helper) ─────────────────────
@@ -491,6 +503,12 @@ function buildLeadRow(prospect, lead, {
       job_value:          parseFloat(getField(lead, 'gsa', 'GSA', 'grossamount', 'GrossAmount') || 0) || null,
       created_at_lp:      lpCreatedDate(prospect, lead, getField),
       updated_at_lp:      lpDateToEastern(getField(lead, 'lastchangedon', 'LastChangedOn')),
+      // Raw LP lead payload. The column has existed since schema.sql and was
+      // never written, which is why no unmapped LP field (rep_id among them)
+      // can be backfilled without a fresh API pull. Jobs are stripped —
+      // they already normalise into lp_jobs / lp_job_milestones and would
+      // multiply row size for no read benefit.
+      raw_lp_data:        (() => { const { jobs, Jobs, ...rest } = lead; return rest; })(),
       synced_at:          new Date().toISOString(),
     },
     isApptSet,
@@ -522,7 +540,7 @@ export async function upsertLeadOnly(prospect) {
     // the existing ghl_contact_id into buildLeadRow. maybeSingle() returns
     // null cleanly for brand-new leads instead of erroring.
     const { data: existing } = await supabase.from('lp_leads')
-      .select('updated_at_lp, ghl_contact_id, ghl_link_source, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified, lp_branch_id, set_by_name, ever_confirmed')
+      .select('updated_at_lp, ghl_contact_id, ghl_link_source, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified, lp_branch_id, set_by_name, ever_confirmed, ever_sat, raw_lp_data')
       .eq('lp_lead_id', lpLeadId).maybeSingle();
 
     // Corroborated link resolution (no matchToGHL in Pass 1, so verifiedGhlId
@@ -670,7 +688,7 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
 
     // ─── AGENTIC: Read existing state BEFORE upsert ──────────────
     const { data: existing } = await supabase.from('lp_leads')
-      .select('ghl_tag_applied, lp_day15_triggered, disposition_code, ghl_contact_id, ghl_link_source, updated_at_lp, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified, lp_branch_id, set_by_name, ever_confirmed')
+      .select('ghl_tag_applied, lp_day15_triggered, disposition_code, ghl_contact_id, ghl_link_source, updated_at_lp, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified, lp_branch_id, set_by_name, ever_confirmed, ever_sat, raw_lp_data')
       .eq('lp_lead_id', lpLeadId).single();
 
     const previousDisposition = existing?.disposition_code || null;
@@ -1060,6 +1078,25 @@ export async function upsertLeadFromFlat(lp, ghlId) {
     })(),
     disposition_code:   getField(lp, 'disposition', 'Disposition'),
     rep_name:           getField(lp, 'salesrepname', 'SalesRepName', 'rep_name'),
+
+    // ─── 049 attribution + latching outcome flags (2026-08-01) ──────────
+    // Previously absent on this path entirely: a flat-path lead could never
+    // acquire set_by_name/ever_* regardless of re-sync count. Same mapping
+    // and same undefined-drops-the-key semantics as buildLeadRow. Reachable
+    // from Pass 1 too — upsertLeadOnly falls back here when a prospect has
+    // zero leads, so this was never a rare edge case.
+    set_by_name:        getField(lp, 'setbyname', 'SetByName') || undefined,
+    confirmed_by_name:  getField(lp, 'confirmedbyname', 'ConfirmedByName') || undefined,
+    verified_by_name:   getField(lp, 'verifiedbyname', 'VerifiedByName') || undefined,
+    set_date:           lpDateToEastern(getField(lp, 'setdate', 'SetDate')) || undefined,
+    confirmed_date:     lpDateToEastern(getField(lp, 'confirmeddate', 'ConfirmedDate')) || undefined,
+    ever_set:           lpBool(getField(lp, 'everset', 'EverSet')),
+    ever_confirmed:     lpBool(getField(lp, 'everconfirmed', 'EverConfirmed')),
+    ever_sat:           lpBool(getField(lp, 'eversat', 'EverSat')),
+    ever_issued:        lpBool(getField(lp, 'everissued', 'EverIssued')),
+    ever_net_issued:    lpBool(getField(lp, 'evernetissued', 'EverNetIssued')),
+    raw_lp_data:        (() => { const { jobs, Jobs, ...rest } = lp; return rest; })(),
+
     created_at_lp:      lpDateToEastern(getField(lp, 'dateadded', 'DateAdded', 'entrydate', 'EntryDate')),
     updated_at_lp:      lpDateToEastern(getField(lp, 'lastchangedon', 'LastChangedOn')),
     synced_at:          new Date().toISOString(),
