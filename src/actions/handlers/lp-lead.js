@@ -59,6 +59,7 @@ import { isLPLeadId, ghlFetch } from '../helpers.js';
 import { parseLongDate } from '../date-parsers.js';
 import { resolveContactInfo } from '../resolvers.js';
 import { buildRichNotification } from '../enrichment.js';
+import { LP_SRS, assertNotTransposed } from '../../lp-source-ids.js';
 
 // ─── GHL custom field IDs (canonical Reece location field map) ─────
 const FIELD_LP_INBOUND_LEAD_ID  = '3YMxheIlPyhACB8zyc3W'; // in1_id (LP inbound queue)
@@ -70,9 +71,16 @@ const FIELD_CONTACT_SUMMARY     = 'dDFaBRpRn2aHVZTboUeB'; // pre-built contact s
 // Default LP SubSource ID for chatbot leads. Confirmed by Mark 2026-05-01:
 // 5574 is the Reece ChatBot sub-source code. Override via env if Reece's
 // SubSource map changes. NOTE: the legacy GHL workflow Chatbot Contact
-// Created - Timeout Send Lead has srs_id=830 hardcoded in its URL — that's
-// actually pro_id. The workflow has them swapped. Don't copy that bug.
-const DEFAULT_CHATBOT_SRS_ID = process.env.LP_DEFAULT_CHATBOT_SRS_ID || '5574';
+// Created - Timeout Send Lead (I.CT, 98f54471) has srs_id=830 hardcoded in
+// its URL — that's actually pro_id. The workflow has them swapped. Don't
+// copy that bug.
+//
+// 2026-08-01: that warning is no longer advisory. The value now comes from
+// the shared registry (src/lp-source-ids.js) instead of a local literal, and
+// assertNotTransposed() below ENFORCES the note — a resolved
+// srs_id=830/pro_id=5574 pair now throws rather than writing a
+// misattributed lead into LP.
+const DEFAULT_CHATBOT_SRS_ID = process.env.LP_DEFAULT_CHATBOT_SRS_ID || LP_SRS.CHATBOT;
 
 /**
  * Read a custom field value off a GHL contact's customFields array.
@@ -256,6 +264,14 @@ export async function executeCreateLPLead(action) {
   // ─── Resolve LP source / promoter / product / notes ───────────────
   const srsId = String(payload.srs_id || readCF(ghlContact, FIELD_LP_SOURCE_ID) || DEFAULT_CHATBOT_SRS_ID);
   const proId = String(payload.pro_id || readCF(ghlContact, FIELD_LP_PROMOTER_ID) || '');
+
+  // 2026-08-01 — transposition guard. Both IDs are now fully resolved
+  // (payload → contact custom fields → default), so this is the last point
+  // at which the pair can be inspected before it reaches LP. Throws on the
+  // known I.CT swap; see src/lp-source-ids.js for why throwing beats
+  // writing. A failure here means the CONTACT carries swapped IDs in its
+  // custom fields — fix it on the contact, not in this code.
+  assertNotTransposed(srsId, proId);
   const product = String(payload.product || 'Win');
   const sender = String(payload.sender || `GHL-${ghlContact.source || 'Agentic'}`);
   const contactSummary = readCF(ghlContact, FIELD_CONTACT_SUMMARY);

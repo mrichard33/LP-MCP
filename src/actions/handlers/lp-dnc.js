@@ -57,14 +57,17 @@ import { addGHLNote, applyGHLTag, removeGHLTags } from '../../ghl.js';
 import { ghlFetch } from '../helpers.js';
 import { resolveContactInfo } from '../resolvers.js';
 import { buildRichNotification } from '../enrichment.js';
+import { LP_EMP } from '../../lp-source-ids.js';
 
 // ─── GHL custom field IDs ──────────────────────────────────────────
 const FIELD_LP_PROSPECT_ID = 'ZRQAVrzhtzApzLlHmT87';
 const FIELD_LP_LEAD_ID     = 'GmAVmW6V9sekD7pVONKr';
 
-// Default LP employee ID. 5686 = GHL system user, confirmed working
-// for setAppointment chain. Override per-action via emp_id payload.
-const DEFAULT_EMP_ID = process.env.LP_DEFAULT_EMP_ID || '5686';
+// Default LP employee ID. 5686 = "Integration, GoHighLevel" (GHL system
+// user), confirmed working for the setAppointment chain. Sourced from the
+// shared registry (src/lp-source-ids.js) as of 2026-08-01. Override per
+// deployment via LP_DEFAULT_EMP_ID, or per-action via the emp_id payload.
+const DEFAULT_EMP_ID = process.env.LP_DEFAULT_EMP_ID || LP_EMP.GHL_INTEGRATION;
 
 const DNC_LABEL = {
   C: 'Do Not Call',

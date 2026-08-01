@@ -20,6 +20,33 @@
  * date AND time both match (idempotency against retries). Falls back to
  * the lp_leads cache comparison when the live read is unavailable.
  *
+ * 2026-08-01 — APPOINTMENT CONFLICT IS A TERMINAL OUTCOME, NOT A FAILURE.
+ *   Closes the latent defect the date+time guard below opened on
+ *   2026-07-31. Correctly detecting a mismatch meant this handler then
+ *   proceeded to SetAppointment against a lead that already holds a
+ *   future appointment — a call LP rejects, because SetAppointment cannot
+ *   overwrite an existing future appointment and LP supports no
+ *   cancel-then-set. Every reschedule through this path would have
+ *   failed, tagged `lp-sync-failed`, and escalated a retry that can never
+ *   succeed. (Verified not yet triggered when this shipped: no reschedule
+ *   had come through since the 2026-07-31 deploy.)
+ *
+ *   The handler now returns `lp_appointment_conflict` instead of writing:
+ *     • Tagged `lp-appt-conflict`, NOT `lp-sync-failed`. Nothing failed
+ *       and nothing is retryable — this is an unresolvable state needing
+ *       a human in LP, and it gets its own separately-countable tag.
+ *     • Recorded `completed`, not `failed` (it returns rather than
+ *       throws). A `failed` row invites a reaper retry loop against an
+ *       endpoint that rejects it every time.
+ *     • GHL note and GroupMe card both name BOTH times and ask for a
+ *       manual LP correction.
+ *   SetAppointment is now reached only when LP holds no live appointment
+ *   — the only state the endpoint accepts.
+ *
+ *   Consequence, deliberately accepted: the GHL↔LP reschedule path has no
+ *   automated repair. Every reschedule needs a human in LP until the
+ *   product decision about two-step appointment handling is made.
+ *
  * 2026-07-31 — LIVE LP PRE-CHECK.
  *   The guard used to read the lp_leads Supabase cache and compare DATE
  *   ONLY. Two defects, both duplicate-write vectors now that
@@ -136,6 +163,8 @@ import { toLpApptDate, toLpApptTime, normalizeDateForComparison } from '../date-
 import { resolveContactInfo } from '../resolvers.js';
 import { buildRichNotification } from '../enrichment.js';
 import { isGhlOnlyCalendarId } from '../../knowledge/booking-calendar-router.js';
+import { appointmentDelta } from '../../appointment-dates.js';
+import { LP_EMP } from '../../lp-source-ids.js';
 
 // GHL custom field IDs used by the writeback path. Keep in sync with
 // ghl-field-map.js.
@@ -151,6 +180,15 @@ const FIELD_LP_LEAD_ID     = 'GmAVmW6V9sekD7pVONKr'; // lp_lead_id (real lds_id)
 // SetAppointment fallback. Never applied on the skip/failure path, so
 // its absence is an honest "agentic did NOT sync" signal.
 const LP_APPT_SYNCED_TAG = 'lp-appt-synced';
+
+// 2026-08-01 — conflict signal. Applied when LP holds a DIFFERENT live
+// appointment that SetAppointment cannot overwrite. Deliberately NOT
+// `lp-sync-failed`: nothing failed and nothing can be retried, so routing
+// it to the I.LP-FAIL retry/alert handler would be a lie. This is a
+// distinct state — "LP and GHL disagree and only a human in LP can
+// reconcile them" — and it gets its own tag so it is separately
+// countable and separately routable.
+const LP_APPT_CONFLICT_TAG = 'lp-appt-conflict';
 
 // 2026-07-31 — live LP pre-check. Must be the literal 'false' to disable;
 // anything else (including unset) leaves it ON. A duplicate-suppression guard
@@ -217,6 +255,100 @@ export function parseLpApptWallClock(raw) {
   if (time === '00:00') return { date, time: null, timeStatus: 'absent' };
 
   return { date, time, timeStatus: 'known' };
+}
+
+/**
+ * The whole decision surface of the live pre-check, as a pure function.
+ *
+ * Exported and kept dependency-free so the three outcomes are unit-testable
+ * without a DB, LP, or GHL — and so the tests exercise the REAL rule rather
+ * than a mirrored copy of it that can drift.
+ *
+ * @param {{date: string, time: string|null, timeStatus: string}|null} parsed
+ *        result of parseLpApptWallClock on LP's live apptdate
+ * @param {string} ghlDate  GHL appointment date, normalized YYYY-MM-DD
+ * @param {string} ghlTime  GHL appointment time, 24-hour HH:MM
+ * @param {Date} [now]      reference instant (injectable for tests)
+ * @returns {'already_set'|'conflict'|'write'}
+ *   'already_set' — LP already holds exactly this date AND time. Suppress
+ *                   the duplicate write; both legs must match, and neither
+ *                   'absent' nor 'unparseable' may stand in for the time.
+ *   'conflict'    — LP holds a DIFFERENT appointment that is still live
+ *                   (today or later). SetAppointment cannot overwrite an
+ *                   existing future appointment and LP supports no
+ *                   cancel-then-set, so the write would be rejected every
+ *                   time. Terminal; needs a human in LP.
+ *   'write'       — LP holds nothing, holds only a past appointment, or
+ *                   holds this date with no readable time. All three are
+ *                   states SetAppointment accepts.
+ */
+export function classifyLivePrecheck(parsed, ghlDate, ghlTime, now = new Date()) {
+  if (!parsed) return 'write';
+
+  const dateMatches = parsed.date === ghlDate;
+  if (dateMatches && parsed.timeStatus === 'known' && parsed.time === ghlTime) {
+    return 'already_set';
+  }
+
+  // days_delta === 0 (today) counts as live: an appointment later today is
+  // still a future appointment as far as LP is concerned. Erring toward
+  // 'conflict' costs one manual correction; erring the other way costs a
+  // guaranteed-failing write plus a retry loop against it.
+  const delta = appointmentDelta(parsed.date, now);
+  const lpStillLive = !!delta && delta.days_delta >= 0;
+
+  // Narrow on purpose. A date match with an 'absent' time (exact midnight —
+  // 12% of rows) or an 'unparseable' one still WRITES: the first completes a
+  // record LP is missing a time for rather than competing with it, and the
+  // second preserves the loud-log-and-write path that keeps a future LP
+  // format change surfacing as a bug instead of as silent suppression.
+  if (lpStillLive && (!dateMatches || parsed.timeStatus === 'known')) {
+    return 'conflict';
+  }
+
+  return 'write';
+}
+
+/**
+ * Current wall-clock HH:MM (24-hour) in Eastern.
+ *
+ * Derived from Intl the same way etYmd does in appointment-dates.js, NOT from
+ * an offset calculation — the offset approach has to get DST right by hand and
+ * there is no reason to re-derive that here.
+ */
+function etWallClockHhMm(now = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(now);
+  const get = (t) => parts.find((p) => p.type === t)?.value;
+  const hh = get('hour');
+  const mm = get('minute');
+  if (hh === undefined || mm === undefined) return null;
+  // Intl can render midnight as '24' in the en-US h23/h24 edge case.
+  return `${hh === '24' ? '00' : hh}:${mm}`;
+}
+
+/**
+ * True when an LP appointment is TODAY (ET) and its time has already elapsed.
+ *
+ * Pure-ish instrumentation only — this never changes the conflict decision. It
+ * marks the population that a more permissive same-day rule would serve, so
+ * that rule can later be argued from a count rather than from an assumption
+ * about whether LP evaluates "existing future appointment" at date or datetime
+ * granularity.
+ *
+ * Both sides are zero-padded 24-hour HH:MM, so string comparison is ordering-
+ * correct and avoids constructing an instant from an ET wall-clock time.
+ *
+ * @param {{date: string, time: string|null, timeStatus: string}|null} parsed
+ * @param {Date} [now]  reference instant (injectable for tests)
+ */
+export function isSameDayLpTimeElapsed(parsed, now = new Date()) {
+  if (!parsed || parsed.timeStatus !== 'known' || !parsed.time) return false;
+  const delta = appointmentDelta(parsed.date, now);
+  if (!delta || delta.days_delta !== 0) return false;
+  const nowHhMm = etWallClockHhMm(now);
+  return !!nowHhMm && parsed.time < nowHhMm;
 }
 
 /**
@@ -395,7 +527,7 @@ export async function executeSetLPAppointment(action, context = {}) {
   const apptTime = toLpApptTime(rawTime);
   if (!apptTime) throw new Error(`Appointment time did not resolve to HH:MM 24h (raw="${rawTime}")`);
 
-  const setBy = payload.set_by || '5686';
+  const setBy = payload.set_by || LP_EMP.GHL_INTEGRATION;
   // v2: don't default to literal 'N/A' — keep null so the conditional
   // render in hasMeaningfulCalendar() correctly omits the line.
   const calendarName = payload.calendar_name || eventPayload.calendar_name || eventPayload.title || null;
@@ -427,12 +559,17 @@ export async function executeSetLPAppointment(action, context = {}) {
       const liveRawAppt = liveLead ? getField(liveLead, 'apptdate', 'ApptDate') : null;
       const liveAppt = parseLpApptWallClock(liveRawAppt);
       if (liveAppt) {
+        // The whole rule lives in classifyLivePrecheck() above — one pure,
+        // unit-tested function rather than a condition duplicated between
+        // here and its tests.
+        const dateMatches = liveAppt.date === ghlDateNormalized;
+        const verdict = classifyLivePrecheck(liveAppt, ghlDateNormalized, apptTime);
+
         // Suppress ONLY on a full date + time match. A date-only LP record
         // ('absent') is completed by our write, not skipped: LP has the day,
         // GHL has the time, and a duplicate carrying identical values is
         // idempotent at LP while a timeless booking strands the rep.
-        const dateMatches = liveAppt.date === ghlDateNormalized;
-        if (dateMatches && liveAppt.timeStatus === 'known' && liveAppt.time === apptTime) {
+        if (verdict === 'already_set') {
           console.log(`[LP-APPT] ⏭️ LIVE: LP already holds ${liveAppt.date} ${liveAppt.time} for lds_id=${lpLeadId} — suppressing duplicate write`);
           if (!isLPLeadId(contactId)) {
             await addGHLNote(contactId,
@@ -459,8 +596,95 @@ export async function executeSetLPAppointment(action, context = {}) {
             resolution_source: resolutionSource,
           };
         }
-        // Not a match — say which leg differed, so the logs distinguish a
-        // real reschedule from a parser gap.
+        // ─── Unresolvable conflict (2026-08-01) ───────────────────────
+        // LP still holds a live appointment (today or later) that is NOT
+        // the one GHL has. Per the confirmed LP contract, SetAppointment
+        // cannot overwrite an existing future appointment and LP supports
+        // no cancel-then-set — so the write below would be rejected every
+        // single time, tagging lp-sync-failed and escalating a retry that
+        // can never succeed. Stop here and put a human in LP instead.
+        //
+        // This is the defect the 2026-07-31 date+time guard introduced.
+        // Before it, a same-day time change matched on DATE, returned
+        // already_set_in_lp, and skipped the write — wrong on paper, but
+        // it accidentally avoided a call LP rejects. Detecting the
+        // mismatch correctly removed that accident without adding the
+        // branch that handles it.
+        //
+        // See classifyLivePrecheck() for the exact scoping — it is narrow on
+        // purpose, and a PAST LP appointment is not a conflict at all.
+        if (verdict === 'conflict') {
+          const lpHolds  = `${liveAppt.date}${liveAppt.time ? ` ${liveAppt.time}` : ''}`;
+          const ghlHolds = `${ghlDateNormalized} ${apptTime}`;
+
+          // Instrumentation for the one population a more permissive rule
+          // would serve: a same-day conflict whose LP time has ALREADY
+          // elapsed in ET. We don't know whether LP evaluates "existing
+          // future appointment" at date or datetime granularity, so we stay
+          // conservative and count instead of guessing. Surfaced as a result
+          // field (not just a log) so it is countable straight out of
+          // agent_actions.execution_result — if this turns out to be
+          // frequent, that count is the evidence to take to Amanda.
+          const sameDayElapsed = isSameDayLpTimeElapsed(liveAppt);
+          console.warn(`[LP-APPT] ⛔ CONFLICT: LP holds ${lpHolds}, GHL holds ${ghlHolds} for lds_id=${lpLeadId} — SetAppointment cannot overwrite; escalating for manual LP correction`);
+          if (sameDayElapsed) {
+            console.warn(`[LP-APPT] ⛔ CONFLICT_SAME_DAY_ELAPSED: LP's ${liveAppt.time} today has already passed in ET for lds_id=${lpLeadId} — conservative conflict; LP may or may not have accepted a write here`);
+          }
+
+          if (!isLPLeadId(contactId)) {
+            await addGHLNote(contactId,
+              `[LP SYNC v4.6] Appointment CONFLICT — NOT synced, manual LP correction required\n` +
+              `LP Lead ID: ${lpLeadId} | Prospect: ${resolvedProspectId || 'N/A'}\n` +
+              (lpSourceLine ? `Source: ${lpSourceLine}\n` : '') +
+              `LP holds:  ${lpHolds}\n` +
+              `GHL holds: ${ghlHolds}\n` +
+              `LP's SetAppointment cannot overwrite an existing future appointment, and LP does not support ` +
+              `cancel-then-set, so this cannot be repaired automatically. Update the appointment directly in ` +
+              `Lead Perfection to match GHL.`
+            ).catch(() => {});
+            // Deliberately NOT applying LP_APPT_SYNCED_TAG: LP was not
+            // synced, and the absence of that tag is the honest signal the
+            // I.LP-A workflow gates its GHL-native fallback on.
+            await applyGHLTag(contactId, LP_APPT_CONFLICT_TAG).catch((err) => {
+              console.warn(`[LP-APPT] ${LP_APPT_CONFLICT_TAG} tag apply failed (conflict path, non-blocking): ${err.message}`);
+            });
+          }
+
+          const { name: conflictName } = await resolveContactInfo(contactId, eventPayload);
+          await sendGroupMeMessage(
+            `⛔ LP Appointment CONFLICT — manual LP fix needed\n` +
+            `👤 ${conflictName || contactId}\n` +
+            `📋 LP Lead: ${lpLeadId} | Prospect: ${resolvedProspectId || 'NONE'}\n` +
+            (lpSourceLine ? `📋 Src: ${lpSourceLine}\n` : '') +
+            `🗓️ LP holds:  ${liveAppt.date} ${liveAppt.time ? formatApptTime12h(liveAppt.time) : '(no time)'}\n` +
+            `🗓️ GHL holds: ${ghlDateNormalized} ${formatApptTime12h(apptTime)}\n` +
+            `👉 LP cannot overwrite an existing future appointment. Correct it directly in LP.`
+          ).catch(() => {});
+
+          // Terminal, and terminal on purpose: this returns (rather than
+          // throws) so the action records `completed`. Retrying cannot
+          // succeed, and a `failed` row invites a reaper retry loop
+          // against an endpoint that rejects it every time.
+          return {
+            action: 'lp_appointment_conflict',
+            verified: 'live',
+            reason: 'LP holds a different future appointment; SetAppointment cannot overwrite and cancel-then-set is unsupported',
+            lp_lead_id: lpLeadId,
+            lp_prospect_id: resolvedProspectId,
+            lp_appointment_date: liveAppt.date,
+            lp_appointment_time: liveAppt.time,
+            ghl_appointment_date: ghlDateNormalized,
+            ghl_appointment_time: apptTime,
+            // Instrumentation, not a decision input — see isSameDayLpTimeElapsed.
+            same_day_lp_time_elapsed: sameDayElapsed,
+            calendar_name: calendarName,
+            contact_id: contactId,
+            resolution_source: resolutionSource,
+          };
+        }
+
+        // Not a match, but writable — say which leg differed, so the logs
+        // distinguish a real reschedule from a parser gap.
         if (liveAppt.timeStatus === 'unparseable') {
           console.warn(`[LP-APPT] LIVE: could not parse LP time from apptdate="${liveRawAppt}" for lds_id=${lpLeadId} — writing ${ghlDateNormalized} ${apptTime}`);
         } else if (!dateMatches) {
