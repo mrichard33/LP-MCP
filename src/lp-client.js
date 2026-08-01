@@ -42,6 +42,7 @@
 // it entirely and uses /api/Customers/GetLead with options=261120.
 
 import { getToken, refreshToken, invalidateToken, getTokenStatus } from './token-manager.js';
+import { LP_EMP } from './lp-source-ids.js';
 
 const LP_BASE = () => (process.env.LP_API_BASE_URL || '').replace(/\/+$/, '');
 
@@ -507,7 +508,7 @@ export async function getLeadByLdsId(ldsId, opts = {}) {
  * @param {string} apptTime — Time in HH:MM 24-hour format
  * @returns {Object} LP API response
  */
-export async function setAppointment({ ldsId, setBy = '5686', apptDate, apptTime }) {
+export async function setAppointment({ ldsId, setBy = LP_EMP.GHL_INTEGRATION, apptDate, apptTime }) {
   if (!ldsId) throw new Error('setAppointment: ldsId (LP lead ID) is required');
   if (!apptDate) throw new Error('setAppointment: apptDate is required (MM/DD/YYYY)');
   if (!apptTime) throw new Error('setAppointment: apptTime is required (HH:MM 24h)');
@@ -583,7 +584,7 @@ const VALID_DNC_CODES = new Set(['C', 'M', 'T', 'E', 'P']);
 // LOUD here (LP returns Result:0 / "Error:") — never a silent mis-clear.
 export const LP_DNC_CLEAR_CODE = (process.env.LP_DNC_CLEAR_CODE || 'N').trim().toUpperCase();
 
-export async function updateDncStatus({ custid, newDncStatus, empid = '5686', phone }) {
+export async function updateDncStatus({ custid, newDncStatus, empid = LP_EMP.GHL_INTEGRATION, phone }) {
   if (!custid) {
     throw new Error('updateDncStatus: custid (LP prospect ID) is required');
   }

@@ -30,6 +30,22 @@
  *   • unparseable — must stay DISTINCT from 'absent'. Both fall through to the
  *     write, but conflating them means a future LP format change becomes
  *     silent mass suppression with nothing in the logs pointing at the cause.
+ *
+ * 2026-08-01 — extended to cover classifyLivePrecheck(), the three-way verdict
+ * ('already_set' | 'conflict' | 'write') that replaced the bare suppress/write
+ * boolean. The conflict outcome is the P0 fix: correctly detecting a date+time
+ * mismatch (2026-07-31) made the handler proceed to a SetAppointment that LP
+ * rejects, because SetAppointment cannot overwrite an existing future
+ * appointment and cancel-then-set is unsupported. Three things are pinned here:
+ *
+ *   • the verdict itself, called on the REAL exported rule rather than a
+ *     mirrored copy — the previous local `suppresses()` helper could drift from
+ *     the handler silently, and did not cover the conflict case at all;
+ *   • the ET day boundary, which decides whether a same-day appointment reads
+ *     as live or past. UTC-derived day math flips it at 8pm ET;
+ *   • that a conflict records `completed`, not `failed` — asserted against the
+ *     executor's real classifyHandlerResult, since a `failed` row would hand
+ *     the reaper a retry loop against an endpoint that rejects it every time.
  */
 
 // Supabase client construction in src/supabase.js reads env at import time,
@@ -41,7 +57,12 @@ process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test_dummy_key';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { parseLpApptWallClock } from '../src/actions/handlers/lp-appointment.js';
+import {
+  parseLpApptWallClock,
+  classifyLivePrecheck,
+  isSameDayLpTimeElapsed,
+} from '../src/actions/handlers/lp-appointment.js';
+import { classifyHandlerResult } from '../src/actions/result-status.js';
 
 const KNOWN = { date: '2026-08-07', time: '18:00', timeStatus: 'known' };
 const ABSENT = { date: '2026-08-07', time: null, timeStatus: 'absent' };
@@ -96,34 +117,147 @@ test('returns null when no date parses at all', () => {
   }
 });
 
-// ─── The match predicate ──────────────────────────────────────────────
-// Mirrors the condition in executeSetLPAppointment's live pre-check. Kept
-// here as an executable statement of the rule: suppression requires BOTH
-// legs, and neither 'absent' nor 'unparseable' may stand in for a match.
-const suppresses = (parsed, ghlDate, ghlTime) =>
-  !!parsed &&
-  parsed.date === ghlDate &&
-  parsed.timeStatus === 'known' &&
-  parsed.time === ghlTime;
+// ─── The pre-check verdict ────────────────────────────────────────────
+// These call the REAL exported rule, not a local copy of it. An earlier
+// version of this file mirrored the condition in a `suppresses()` helper;
+// that passed happily while the handler's behaviour changed underneath it,
+// which is exactly the drift a mirror invites.
+//
+// Every case pins `now` so the tests do not rot as the calendar moves past
+// the fixture dates.
+
+// 2026-08-01 ~noon ET. All KNOWN/ABSENT fixtures are dated 2026-08-07, i.e.
+// six days out — comfortably future relative to this.
+const NOW = new Date('2026-08-01T16:00:00Z');
 
 test('suppresses only when date AND time both match', () => {
-  assert.equal(suppresses(KNOWN, '2026-08-07', '18:00'), true);
-  assert.equal(suppresses(KNOWN, '2026-08-07', '14:00'), false, 'same-day time change must write');
-  assert.equal(suppresses(KNOWN, '2026-08-08', '18:00'), false, 'different date must write');
+  assert.equal(classifyLivePrecheck(KNOWN, '2026-08-07', '18:00', NOW), 'already_set');
+  assert.equal(classifyLivePrecheck(KNOWN, '2026-08-07', '14:00', NOW), 'conflict', 'same-day time change');
+  assert.equal(classifyLivePrecheck(KNOWN, '2026-08-08', '18:00', NOW), 'conflict', 'different date');
 });
 
-test('a date-only LP record is completed, not suppressed', () => {
+test('a mismatch against a FUTURE LP appointment is a conflict, not a write', () => {
+  // The P0 defect. LP's SetAppointment cannot overwrite an existing future
+  // appointment and LP supports no cancel-then-set, so writing here is a
+  // call LP rejects every time — which then tags lp-sync-failed and hands
+  // the reaper a retry that can never succeed.
+  assert.equal(classifyLivePrecheck(KNOWN, '2026-08-07', '14:00', NOW), 'conflict');
+  assert.equal(classifyLivePrecheck(KNOWN, '2026-08-09', '18:00', NOW), 'conflict');
+});
+
+test('a mismatch against a PAST LP appointment writes cleanly', () => {
+  // LP then holds no future appointment — the only state SetAppointment
+  // accepts — so the reschedule is not a conflict.
+  const later = new Date('2026-09-01T16:00:00Z'); // 2026-08-07 is now past
+  assert.equal(classifyLivePrecheck(KNOWN, '2026-09-15', '18:00', later), 'write');
+  assert.equal(classifyLivePrecheck(KNOWN, '2026-08-07', '14:00', later), 'write');
+});
+
+test('a date-only LP record is completed, not suppressed and not a conflict', () => {
   // LP has the day, GHL has the time. Writing fills in what LP is missing;
-  // suppressing would strand the rep with a timeless booking.
-  assert.equal(suppresses(ABSENT, '2026-08-07', '18:00'), false);
+  // suppressing would strand the rep with a timeless booking. 12% of rows.
+  assert.equal(classifyLivePrecheck(ABSENT, '2026-08-07', '18:00', NOW), 'write');
 });
 
-test('an unreadable LP time never counts as a match', () => {
+test('an unreadable LP time never counts as a match, and still writes', () => {
   // Failing into suppression would hide a parser gap behind correct-looking
-  // "already set" outcomes.
-  assert.equal(suppresses(UNPARSEABLE, '2026-08-07', '18:00'), false);
+  // "already set" outcomes; failing into conflict would turn a future LP
+  // format change into silent mass escalation.
+  assert.equal(classifyLivePrecheck(UNPARSEABLE, '2026-08-07', '18:00', NOW), 'write');
 });
 
-test('an unparseable apptdate never counts as a match', () => {
-  assert.equal(suppresses(null, '2026-08-07', '18:00'), false);
+test('a date CHANGE is a conflict even when LP carries no readable time', () => {
+  // The absent/unparseable leniency is scoped to a DATE MATCH. When the day
+  // itself moved, LP is holding a different live appointment regardless of
+  // whether we can read its time.
+  assert.equal(classifyLivePrecheck(ABSENT, '2026-08-08', '18:00', NOW), 'conflict');
+  assert.equal(classifyLivePrecheck(UNPARSEABLE, '2026-08-08', '18:00', NOW), 'conflict');
+});
+
+test('an unparseable apptdate falls through to the write', () => {
+  assert.equal(classifyLivePrecheck(null, '2026-08-07', '18:00', NOW), 'write');
+});
+
+// ─── ET day-boundary regression guard ─────────────────────────────────
+// LP wall-clock times are ET; now() and agent_actions timestamps are UTC. A
+// UTC-derived "today" flips the day boundary at 8pm ET, so a same-day LP
+// appointment reads as YESTERDAY (i.e. past → 'write') for four hours every
+// evening — landing in the branch P0 exists to prevent. Correctness here comes
+// from appointmentDelta() resolving today via etYmd() in America/New_York.
+// This test fails if anyone swaps that for a bare Date part or CURRENT_DATE.
+test('a same-day LP appointment stays a conflict late in the ET evening', () => {
+  const lateEveningET = new Date('2026-08-08T01:30:00Z'); // 9:30 PM ET on 08-07
+  assert.equal(
+    classifyLivePrecheck(KNOWN, '2026-08-07', '14:00', lateEveningET),
+    'conflict',
+    'UTC-based day math would call 2026-08-07 past here and wrongly write',
+  );
+});
+
+test('today counts as live even when the LP time has already elapsed', () => {
+  // Deliberately conservative: we do not know whether LP evaluates "existing
+  // future appointment" at date or datetime granularity, so we do not build
+  // the permissive branch on that assumption. Being wrong here costs one
+  // GroupMe card; being wrong the other way costs a rejected write plus a
+  // retry loop.
+  const eveningET = new Date('2026-08-07T23:00:00Z'); // 7:00 PM ET on 08-07
+  assert.equal(classifyLivePrecheck(KNOWN, '2026-08-07', '14:00', eveningET), 'conflict');
+});
+
+// ─── The instrumentation marker ───────────────────────────────────────
+// Never a decision input — it exists so the population a permissive same-day
+// rule would serve is countable out of agent_actions.execution_result.
+
+test('same-day elapsed marker is true only for a passed time TODAY', () => {
+  const eveningET = new Date('2026-08-07T23:00:00Z'); // 7:00 PM ET on 08-07
+  // LP holds 6:00 PM today, it is now 7:00 PM ET → elapsed.
+  assert.equal(isSameDayLpTimeElapsed(KNOWN, eveningET), true);
+
+  const morningET = new Date('2026-08-07T14:00:00Z'); // 10:00 AM ET on 08-07
+  // LP holds 6:00 PM today, it is now 10:00 AM ET → still ahead.
+  assert.equal(isSameDayLpTimeElapsed(KNOWN, morningET), false);
+});
+
+test('same-day elapsed marker is false for other days and unreadable times', () => {
+  assert.equal(isSameDayLpTimeElapsed(KNOWN, NOW), false, 'future day');
+  assert.equal(isSameDayLpTimeElapsed(KNOWN, new Date('2026-09-01T16:00:00Z')), false, 'past day');
+  assert.equal(isSameDayLpTimeElapsed(ABSENT, new Date('2026-08-07T23:00:00Z')), false, 'no time');
+  assert.equal(isSameDayLpTimeElapsed(UNPARSEABLE, new Date('2026-08-07T23:00:00Z')), false);
+  assert.equal(isSameDayLpTimeElapsed(null, NOW), false);
+});
+
+// ─── The conflict outcome must record `completed`, not `failed` ───────
+// The load-bearing P0 claim. Retrying cannot succeed, so a `failed` row would
+// invite a reaper retry loop against an endpoint that rejects it every time.
+// This asserts against the real classifier the executor uses.
+
+test('a conflict result classifies as completed, not failed', () => {
+  const conflictResult = {
+    action: 'lp_appointment_conflict',
+    verified: 'live',
+    reason: 'LP holds a different future appointment; SetAppointment cannot overwrite and cancel-then-set is unsupported',
+    lp_appointment_date: '2026-08-07',
+    lp_appointment_time: '18:00',
+    ghl_appointment_date: '2026-08-07',
+    ghl_appointment_time: '14:00',
+    same_day_lp_time_elapsed: false,
+  };
+  const { status, error_message } = classifyHandlerResult(conflictResult);
+  assert.equal(status, 'completed');
+  assert.equal(error_message, null);
+});
+
+test('the conflict result carries both times, so the card can name them', () => {
+  // The GHL note and GroupMe card both render LP's value AND GHL's value —
+  // an operator fixing this by hand in LP needs to know what to type.
+  for (const key of ['lp_appointment_date', 'lp_appointment_time', 'ghl_appointment_date', 'ghl_appointment_time']) {
+    assert.ok(key, `conflict result must carry ${key}`);
+  }
+  // And it must not accidentally set any flag that would re-route the status.
+  const conflictResult = { action: 'lp_appointment_conflict', reason: 'x' };
+  assert.equal(conflictResult.skipped, undefined);
+  assert.equal(conflictResult.deferred, undefined);
+  assert.equal(conflictResult._fallback_send, undefined);
+  assert.equal(conflictResult.blocked_by_validator, undefined);
+  assert.equal(classifyHandlerResult(conflictResult).status, 'completed');
 });

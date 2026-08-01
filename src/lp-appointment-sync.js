@@ -205,6 +205,7 @@ import { five9DispatchConfigured, dispatchConfirmationCallback } from './five9/l
 // and format-helpers.js, neither of which imports anything from here.
 import { ghlFetch as sharedGhlFetch } from './actions/helpers.js';
 import { emitEvent } from './event-emitter.js';
+import { LP_EMP } from './lp-source-ids.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 // GHL_LOCATION_ID removed 2026-07-28: its only consumer was the locationId
@@ -1693,7 +1694,7 @@ async function syncAppointmentToLP({
   }
 
   console.log(`[LP-APPT] Setting: lds_id=${ldsId}, date=${apptDate}, time=${apptTime}, via=${source} (step ${step})${lpSourceLine ? `, lpSrc="${lpSourceLine}"` : ', lpSrc=(absent)'}, calendar="${calendarName || '(absent)'}"`);
-  const result = await lpSetAppointment({ ldsId, setBy: '5686', apptDate, apptTime });
+  const result = await lpSetAppointment({ ldsId, setBy: LP_EMP.GHL_INTEGRATION, apptDate, apptTime });
 
   await writeApptSyncMark({ dedupKey, contactId, ldsId, apptDate, apptTime });
   await applyApptSyncedTag(contactId);
