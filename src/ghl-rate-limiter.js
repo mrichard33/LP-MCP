@@ -24,6 +24,29 @@
  *   without confirming GHL's per-location sustained limit, which is SHARED with
  *   the HL MCP (both servers draw on the same budget).
  *
+ * v1.3 — 2026-08-02 — Cycle decay + admin reset (47-hour agentic outage)
+ *   consecutive429Cycles had no reset path in practice: reportSuccess() was
+ *   exported in v1.1 and never called from any of the 11 report429() call
+ *   sites. The counter reached 5 in production, pinning currentPauseMs at the
+ *   900000ms MAX_PAUSE_MS ceiling — every 429 blacked out ALL GHL traffic for
+ *   15 minutes, acquireToken timed out 637 times at the full 30s each, and the
+ *   message analyzer emitted ZERO ai.analysis_completed events between
+ *   2026-07-31 23:42Z and 2026-08-02 23:05Z. The agentic bot answered nothing
+ *   for ~47 hours.
+ *
+ *   Fix: decayCycles() steps the counter back toward 0 after CYCLE_DECAY_MS
+ *   (default 10 min) with no new 429, one step per window, driven from both
+ *   the drainer and acquireToken so it runs whether or not anything queues.
+ *   Deliberately NOT wired through the 11 report429() call sites — a
+ *   single-module time-based decay cannot be forgotten at a call site, which
+ *   is precisely how v1.1 failed. reportSuccess() is retained and still works
+ *   if anyone wires it later.
+ *
+ *   Added admin: resetCycles() + POST /n8n/rate-limiter/reset-cycles to clear
+ *   a pinned counter and lift a stuck pause without bouncing the service.
+ *
+ *   ENV: GHL_RATE_CYCLE_DECAY_MS (default 600000, floor 60000).
+ *
  * v1.2 — 2026-05-23 — Global drainer + hard timeout (Scott Gies recovery)
  *   Previous version (v1.1): each caller spawned its own setInterval.
  *   The non-paused branch's interval cleared on first tick because its
@@ -79,11 +102,25 @@ const WAIT_TIMEOUT_MS = parseInt(
   process.env.RATE_LIMITER_WAIT_TIMEOUT_MS || '30000', 10
 );
 
+// v1.3 — 2026-08-02 — Time-based decay of consecutive429Cycles.
+// reportSuccess() was exported in v1.1 but never wired into ANY of the 11
+// report429() call sites, so the counter was monotonically increasing. It
+// reached 5 in production, pinning every subsequent pause at the 15-minute
+// MAX_PAUSE_MS ceiling and blacking out all GHL traffic for the agentic
+// pipeline. Decay is time-based and lives entirely inside this module, so
+// recovery no longer depends on call-site wiring that can be forgotten.
+const CYCLE_DECAY_MS = Math.max(
+  60000,
+  parseInt(process.env.GHL_RATE_CYCLE_DECAY_MS || '600000', 10)
+);
+
 let tokens = BUCKET_CAPACITY;
 let lastRefill = Date.now();
 let paused = false;
 let pauseUntil = 0;
 let consecutive429Cycles = 0;
+let last429At = 0;
+let lastCycleDecayAt = Date.now();
 const waitQueue = [];
 
 // v1.2 — single global drainer handle. Started lazily on first wait.
@@ -98,6 +135,25 @@ let stats = {
   timedOut: 0,        // v1.2 — count of fail-open timeouts
   lastReset: Date.now(),
 };
+
+// v1.3 — Step consecutive429Cycles back toward 0 once a full CYCLE_DECAY_MS
+// has elapsed with no new 429, and at most one step per window. Called from
+// both the drainer and acquireToken's entry point, so decay runs whether or
+// not anything is queued (the drainer only starts lazily on the first wait).
+function decayCycles() {
+  if (consecutive429Cycles <= 0) return;
+  const now = Date.now();
+  const since429 = now - last429At;
+  if (since429 < CYCLE_DECAY_MS) return;
+  if (now - lastCycleDecayAt < CYCLE_DECAY_MS) return;
+  lastCycleDecayAt = now;
+  consecutive429Cycles--;
+  const nextPauseMs = Math.min(BASE_PAUSE_MS * Math.max(consecutive429Cycles, 1), MAX_PAUSE_MS);
+  console.log(
+    `[RateLimiter] No 429 in ${Math.round(since429 / 1000)}s — decayed consecutive429Cycles to ` +
+    `${consecutive429Cycles} (next pause would be ${Math.round(nextPauseMs / 1000)}s)`
+  );
+}
 
 function refill() {
   const now = Date.now();
@@ -149,6 +205,7 @@ function ensureDrainer() {
   if (drainerHandle) return;
   drainerHandle = setInterval(() => {
     refill();
+    decayCycles();
     if (waitQueue.length > 0) {
       processQueue();
     }
@@ -168,6 +225,7 @@ function ensureDrainer() {
  */
 export function acquireToken(opts = {}) {
   refill();
+  decayCycles();
 
   const maxWaitMs = Number.isFinite(opts.maxWaitMs)
     ? Math.max(250, Math.min(opts.maxWaitMs, WAIT_TIMEOUT_MS))
@@ -231,6 +289,10 @@ export function report429() {
   tokens = 0;
   paused = true;
   consecutive429Cycles++;
+  // v1.3 — decay clock. Both stamps reset here so a fresh 429 restarts the
+  // full quiet window before any step-down is allowed.
+  last429At = Date.now();
+  lastCycleDecayAt = Date.now();
   const pauseMs = Math.min(BASE_PAUSE_MS * consecutive429Cycles, MAX_PAUSE_MS);
   pauseUntil = Date.now() + pauseMs;
   console.warn(
@@ -247,7 +309,30 @@ export function reportSuccess() {
   if (consecutive429Cycles > 0) {
     console.log(`[RateLimiter] GHL request succeeded! Resetting consecutive 429 counter from ${consecutive429Cycles} to 0.`);
     consecutive429Cycles = 0;
+    lastCycleDecayAt = Date.now();
   }
+}
+
+/**
+ * v1.3 — Admin: clear the escalation state without a redeploy. Before this
+ * existed, the ONLY way to unstick a pinned consecutive429Cycles was to bounce
+ * the service, because the counter is module state with no reset path wired to
+ * any call site. Clears the cycle counter and lifts any active pause.
+ */
+export function resetCycles() {
+  const previous = consecutive429Cycles;
+  const wasPaused = isPaused();
+  consecutive429Cycles = 0;
+  lastCycleDecayAt = Date.now();
+  paused = false;
+  pauseUntil = 0;
+  tokens = Math.min(2, BUCKET_CAPACITY); // same cautious restart as isPaused()
+  processQueue();
+  console.warn(
+    `[RateLimiter] resetCycles: consecutive429Cycles ${previous} → 0, ` +
+    `paused ${wasPaused} → false, tokens=${tokens}`
+  );
+  return { previous_cycles: previous, was_paused: wasPaused };
 }
 
 /**
@@ -298,6 +383,9 @@ export function getRateLimiterStats() {
     currentPauseMs: Math.min(BASE_PAUSE_MS * Math.max(consecutive429Cycles, 1), MAX_PAUSE_MS),
     drainerActive: drainerHandle !== null,
     waitTimeoutMs: WAIT_TIMEOUT_MS,
+    cycleDecayMs: CYCLE_DECAY_MS,
+    last429At: last429At || null,
+    msSinceLast429: last429At ? Date.now() - last429At : null,
     ...stats,
   };
 }
@@ -312,6 +400,13 @@ export function registerRateLimiterRoutes(app) {
   // service. Returns the count cleared + the new stats snapshot.
   app.post('/n8n/rate-limiter/drain-stuck', (req, res) => {
     const result = drainStuckWaiters();
+    res.json({ success: true, ...result, stats: getRateLimiterStats() });
+  });
+
+  // v1.3 — Admin: clear a pinned consecutive429Cycles / stuck pause without
+  // redeploying. Recovery lever for the 2026-08-02 47-hour agentic outage.
+  app.post('/n8n/rate-limiter/reset-cycles', (req, res) => {
+    const result = resetCycles();
     res.json({ success: true, ...result, stats: getRateLimiterStats() });
   });
 }
