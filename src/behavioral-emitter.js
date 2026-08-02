@@ -277,6 +277,9 @@ import { buildMessageKey, claimConsumedMessages, releaseConsumedMessages } from 
 // 2026-07-25 — sequence-aware appointment-event dedup (replaces the v2.2 fixed
 // 30-min bucket that let boundary-straddling duplicate webhooks both insert).
 import { checkApptEventDedup } from './services/appt-event-dedup.js';
+// 2026-08-02 — a 'deduped' analyzer verdict is trusted as terminal ONLY when a
+// real ai.analysis_completed for this contact exists inside this window.
+import { recentAnalysisExists, DEDUP_CONFIRM_WINDOW_MS } from './services/analysis-confirm.js';
 import { stripQuotedEmail } from './email-thread.js';
 
 const GHL_WEBHOOK_SECRET = process.env.GHL_WEBHOOK_SECRET || '';
@@ -363,7 +366,23 @@ async function triggerAgenticPipeline(contactId, messageText, channel = null, me
     if (analyzeData?.deduped) {
       // 2026-07-03 hotfix: identical message already analyzed — a terminal
       // no-op, NOT a failure. The events get marked processed; no retries.
-      console.log(`[AgenticPipeline] Analysis deduped for ${contactId} (${analyzeData.reason || 'recently_analyzed'}) — treating as terminal success`);
+      // 2026-08-02 (Engelke incident): that is only true when the CLAIM WINNER
+      // actually produced an ai.analysis_completed. When both consumers fail —
+      // as they did throughout the 429 blackout — the loser saw
+      // 'recently_analyzed', reported terminal success, and
+      // markBufferEventsProcessed marked the source events processed. The
+      // reply was dropped with no retry, no backstop, and no alert. Confirm
+      // the analysis is real before trusting the dedup.
+      const confirmed = await recentAnalysisExists(contactId);
+      if (!confirmed) {
+        console.error(
+          `[AgenticPipeline] DEDUP UNCONFIRMED for ${contactId}: analyzer reported ` +
+          `"${analyzeData.reason || 'recently_analyzed'}" but NO ai.analysis_completed exists in the ` +
+          `last ${DEDUP_CONFIRM_WINDOW_MS}ms — treating as FAILURE so the reply is retried, not dropped`
+        );
+        return false;
+      }
+      console.log(`[AgenticPipeline] Analysis deduped for ${contactId} (${analyzeData.reason || 'recently_analyzed'}) — confirmed by a real ai.analysis_completed, terminal success`);
     } else {
       console.log(`[AgenticPipeline] Analysis complete for ${contactId}: stage=${analyzeData.analysis?.buyer_stage || '?'} (${Date.now() - start}ms)`);
     }
