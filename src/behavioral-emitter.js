@@ -339,9 +339,14 @@ async function triggerAgenticPipeline(contactId, messageText, channel = null, me
   // channel for send_message actions. Null is safe (analyzer falls
   // back to the rule template's default).
   // v2.12: the analyze step's success gates whether the reply buffer may mark
-  // the source events processed. Return true ONLY when ai.analysis_completed was
-  // actually produced (analyzeData.success); a failed/hung analysis returns false
-  // so the events stay unprocessed and retriable.
+  // the source events processed. Return ok:true ONLY when ai.analysis_completed
+  // was actually produced (analyzeData.success); a failed/hung analysis returns
+  // ok:false so the events stay unprocessed and retriable.
+  // 2026-08-03: returns { ok, terminalSkip } rather than a bare boolean, so the
+  // caller can record WHY an event was terminal. terminalSkip is set only when
+  // the bot is deliberately silent (stop-bot / terminal suppression); the reply
+  // was never going to be answered, so it must not look like a dropped analysis
+  // to the silence watchdog.
   let analysisSucceeded = false;
   try {
     const analyzeRes = await fetch(`${SELF_BASE_URL}/n8n/analyze-message`, {
@@ -355,13 +360,21 @@ async function triggerAgenticPipeline(contactId, messageText, channel = null, me
     });
     if (!analyzeRes.ok) {
       console.warn(`[AgenticPipeline] Analyze failed: ${analyzeRes.status}`);
-      return false; // Analysis failed — caller retries / leaves for processing cycle
+      return { ok: false }; // Analysis failed — caller retries / leaves for processing cycle
     }
     const analyzeData = await analyzeRes.json().catch(() => ({}));
     analysisSucceeded = analyzeData?.success === true;
     if (!analysisSucceeded) {
       console.warn(`[AgenticPipeline] Analyze returned success=false for ${contactId} (no ai.analysis_completed) — will retry`);
-      return false;
+      return { ok: false };
+    }
+    // 2026-08-03: deliberate silence, checked BEFORE the dedup branch. No
+    // analysis was supposed to happen, so there is nothing to confirm and
+    // nothing to retry — asking recentAnalysisExists() here would correctly
+    // find no ai.analysis_completed and wrongly escalate a kill-switch hit.
+    if (analyzeData?.terminal_skip) {
+      console.log(`[AgenticPipeline] Bot deliberately silent for ${contactId} (${analyzeData.reason || 'terminal_skip'}) — terminal, no retry`);
+      return { ok: true, terminalSkip: analyzeData.reason || 'terminal_skip' };
     }
     if (analyzeData?.deduped) {
       // 2026-07-03 hotfix: identical message already analyzed — a terminal
@@ -380,7 +393,7 @@ async function triggerAgenticPipeline(contactId, messageText, channel = null, me
           `"${analyzeData.reason || 'recently_analyzed'}" but NO ai.analysis_completed exists in the ` +
           `last ${DEDUP_CONFIRM_WINDOW_MS}ms — treating as FAILURE so the reply is retried, not dropped`
         );
-        return false;
+        return { ok: false };
       }
       console.log(`[AgenticPipeline] Analysis deduped for ${contactId} (${analyzeData.reason || 'recently_analyzed'}) — confirmed by a real ai.analysis_completed, terminal success`);
     } else {
@@ -388,7 +401,7 @@ async function triggerAgenticPipeline(contactId, messageText, channel = null, me
     }
   } catch (err) {
     console.warn(`[AgenticPipeline] Analyze error for ${contactId}: ${err.message}`);
-    return false; // Let the caller / processing cycle retry
+    return { ok: false }; // Let the caller / processing cycle retry
   }
 
   // Step 2: Process pending events → Decision Engine creates actions
@@ -405,7 +418,7 @@ async function triggerAgenticPipeline(contactId, messageText, channel = null, me
     }
   } catch (err) {
     console.warn(`[AgenticPipeline] Process error: ${err.message}`);
-    return true; // analysis already emitted; the processing cycle will pick up the event
+    return { ok: true }; // analysis already emitted; the processing cycle will pick up the event
   }
 
   // Step 3: Execute pending actions → pre-generate response + send GroupMe approval
@@ -425,7 +438,7 @@ async function triggerAgenticPipeline(contactId, messageText, channel = null, me
   }
 
   console.log(`[AgenticPipeline] Pipeline complete for ${contactId} (${Date.now() - start}ms)`);
-  return true;
+  return { ok: true };
 }
 
 /**
@@ -553,14 +566,19 @@ async function markBufferEventsDeduped(eventIds, contactId) {
 // fixed delay, bounded by BUFFER_MAX_RETRIES.
 async function runBufferedPipelineWithRetry(contactId, combined, channel, messages, eventIds, attempt, messageId = null, messageKeys = []) {
   let ok = false;
+  let terminalSkip = null;
   try {
-    ok = await triggerAgenticPipeline(contactId, combined, channel, messageId);
+    // 2026-08-03: the pipeline returns { ok, terminalSkip } — terminalSkip is
+    // the reason the bot was deliberately silent (stop-bot / suppression tag).
+    const result = await triggerAgenticPipeline(contactId, combined, channel, messageId);
+    ok = result?.ok === true;
+    terminalSkip = result?.terminalSkip || null;
   } catch (err) {
     console.error(`[ReplyBuffer] Pipeline threw for ${contactId} (attempt ${attempt + 1}): ${err.message}`);
     ok = false;
   }
   if (ok) {
-    await markBufferEventsProcessed(eventIds, messages.length, contactId);
+    await markBufferEventsProcessed(eventIds, messages.length, contactId, terminalSkip);
     return;
   }
   if (attempt + 1 < BUFFER_MAX_RETRIES) {
@@ -583,7 +601,13 @@ async function runBufferedPipelineWithRetry(contactId, combined, channel, messag
 
 // v2.12 — Mark the buffered reply events processed once analysis is confirmed,
 // so the processing-cycle backstop doesn't re-analyze them with stale single-message context.
-async function markBufferEventsProcessed(eventIds, msgCount, contactId) {
+// 2026-08-03 — terminalSkip records a DELIBERATE silence (stop-bot / terminal
+// suppression) as `bot_silenced: <reason>` instead of the normal
+// `combined_into_reply_buffer`. The agentic-silence watchdog subtracts these
+// from its eligible-reply count: a reply the bot was never allowed to answer
+// must not read as a missed analysis. analyzePendingReplies already writes the
+// parallel `skipped: <reason>` marker for the same class of event.
+async function markBufferEventsProcessed(eventIds, msgCount, contactId, terminalSkip = null) {
   if (!eventIds?.length) return;
   try {
     await supabase
@@ -592,7 +616,9 @@ async function markBufferEventsProcessed(eventIds, msgCount, contactId) {
         processed: true,
         processed_by: 'behavioral_emitter_buffer',
         processed_at: new Date().toISOString(),
-        action_taken: `combined_into_reply_buffer (n=${msgCount})`,
+        action_taken: terminalSkip
+          ? `bot_silenced: ${terminalSkip}`
+          : `combined_into_reply_buffer (n=${msgCount})`,
       })
       .in('id', eventIds);
   } catch (err) {

@@ -78,6 +78,11 @@
 
 import supabase from './supabase.js';
 import { processEvents } from './decision-engine.js';
+import { sendGroupMeMessage } from './groupme.js';
+import {
+  shouldAlertAgenticSilence,
+  formatAgenticSilenceAlert,
+} from './agentic-silence-alerts.js';
 
 // 2026-06-05: promoted from 6-min-late FAILOVER to PRIMARY driver. The n8n
 // cron (ERnvX5hp6i90VVWc) silently went dormant on 2026-05-22 while still
@@ -111,12 +116,37 @@ const STALE_THRESHOLD_MS = parseInt(
 const MAX_DRAIN_ITERATIONS = parseInt(
   process.env.DECISION_ENGINE_HEARTBEAT_MAX_DRAIN_ITERATIONS || '20', 10
 );
+// 2026-08-03 — agentic-silence watchdog. The 47-hour outage (2026-07-31 →
+// 2026-08-02) produced ZERO ai.analysis_completed while replies kept arriving,
+// and nothing paged: every existing alarm watches a proxy (queue depth, action
+// failures, limiter health) and all of them stayed quiet because nothing backed
+// up — replies were consumed and dropped. This watches the pipeline's OUTPUT.
+const SILENCE_WINDOW_HOURS = Math.max(
+  1, parseInt(process.env.AGENTIC_SILENCE_WINDOW_HOURS || '6', 10)
+);
+// Eligible replies that must go unanswered before this pages. The literal spec
+// (any non-zero reply count) would page on one off-hours message; 2 stays quiet
+// there while still catching the real outage, which had 8 replies in 6 hours.
+const SILENCE_MIN_REPLIES = Math.max(
+  1, parseInt(process.env.AGENTIC_SILENCE_MIN_REPLIES || '2', 10)
+);
+// One page per window, not one per 60s heartbeat.
+const SILENCE_ALERT_COOLDOWN_MS = parseInt(
+  process.env.AGENTIC_SILENCE_ALERT_COOLDOWN_MS || `${6 * 60 * 60 * 1000}`, 10
+);
+
 const DRAIN_BATCH_LIMIT = parseInt(
   process.env.DECISION_ENGINE_HEARTBEAT_DRAIN_BATCH_LIMIT || '50', 10
 );
 
 let intervalHandle = null;
 let isRunning = false; // reentrancy guard — prevents overlapping drain cycles
+
+// 2026-08-03 — agentic-silence watchdog state. lastSilenceCheck is the most
+// recent computation, surfaced on the status route so the watchdog can be
+// inspected without waiting for it to fire.
+let lastSilenceAlertAt = 0;
+let lastSilenceCheck = null;
 
 /**
  * Find the most recent processed_at timestamp across all system_events.
@@ -184,6 +214,92 @@ async function checkEngineHealth() {
 }
 
 /**
+ * 2026-08-03 — Count the agentic pipeline's output vs its answerable input over
+ * the rolling window.
+ *
+ * Replies the bot was deliberately forbidden to answer are NOT missed analyses.
+ * A live check on 2026-08-02 found 4 replies / 0 analyses that were entirely
+ * correct — every one from a stop-bot / DNC contact. Counting raw replies would
+ * page critical on a healthy night, and an alarm that cries wolf gets muted,
+ * which is how the next 47-hour outage happens. Both consumer paths mark those
+ * events: `skipped: <reason>` (analyzePendingReplies) and `bot_silenced:
+ * <reason>` (the reply buffer).
+ *
+ * Counting is done in JS rather than SQL aggregates because reply volume in a
+ * 6h window is tiny and it keeps the null-action_taken case (a reply still
+ * in-flight — eligible) obviously correct.
+ *
+ * @returns {Promise<object|null>} counts, or null if the read failed.
+ */
+async function getAgenticSilenceCounts() {
+  if (!supabase) return null;
+  const since = new Date(Date.now() - SILENCE_WINDOW_HOURS * 60 * 60 * 1000).toISOString();
+  try {
+    const [analysesRes, repliesRes] = await Promise.all([
+      supabase
+        .from('system_events')
+        .select('id', { count: 'exact', head: true })
+        .eq('event_type', 'ai.analysis_completed')
+        .gte('created_at', since),
+      supabase
+        .from('system_events')
+        .select('action_taken')
+        .eq('event_type', 'ghl.reply_received')
+        .gte('created_at', since)
+        .limit(1000),
+    ]);
+    if (analysesRes.error) throw analysesRes.error;
+    if (repliesRes.error) throw repliesRes.error;
+
+    const replies = Array.isArray(repliesRes.data) ? repliesRes.data : [];
+    const isSilenced = (a) => typeof a === 'string'
+      && (a.startsWith('skipped: ') || a.startsWith('bot_silenced: '));
+    const skippedReplies = replies.filter(r => isSilenced(r?.action_taken)).length;
+
+    return {
+      analyses: analysesRes.count ?? 0,
+      eligibleReplies: replies.length - skippedReplies,
+      skippedReplies,
+      windowHours: SILENCE_WINDOW_HOURS,
+      checked_at: new Date().toISOString(),
+    };
+  } catch (err) {
+    console.warn(`[DecisionEngineHeartbeat] agentic-silence count failed: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * 2026-08-03 — throttled GroupMe alert when the agentic pipeline has produced
+ * no analyses while answerable replies arrived. Best-effort: a read failure or
+ * a send failure is logged, never thrown, and a failed read NEVER alerts —
+ * "I couldn't tell" must not page, matching the fail-open posture used
+ * throughout this subsystem.
+ */
+async function maybeAlertAgenticSilence() {
+  const counts = await getAgenticSilenceCounts();
+  if (!counts) return { alerted: false, error: 'count_failed' };
+
+  const { alert, reasons, critical } = shouldAlertAgenticSilence(counts, {
+    minReplies: SILENCE_MIN_REPLIES,
+  });
+  lastSilenceCheck = { ...counts, alert, reasons };
+
+  if (!alert) return { alerted: false, counts };
+  if (Date.now() - lastSilenceAlertAt < SILENCE_ALERT_COOLDOWN_MS) {
+    return { alerted: false, suppressed: 'cooldown', reasons, counts };
+  }
+  lastSilenceAlertAt = Date.now();
+  try {
+    await sendGroupMeMessage(formatAgenticSilenceAlert(counts, reasons));
+    console.error(`[DecisionEngineHeartbeat] AGENTIC SILENCE alert sent — ${reasons.join('; ')}`);
+  } catch (err) {
+    console.error(`[DecisionEngineHeartbeat] agentic-silence alert send failed: ${err.message}`);
+  }
+  return { alerted: true, reasons, critical, counts };
+}
+
+/**
  * One heartbeat cycle. Checks staleness, fires processEvents if needed.
  * Returns the result for logging / route response.
  */
@@ -191,6 +307,13 @@ export async function runDecisionEngineHeartbeat({ force = false } = {}) {
   if (process.env.DECISION_ENGINE_HEARTBEAT_DISABLED === 'true') {
     return { skipped: true, reason: 'DECISION_ENGINE_HEARTBEAT_DISABLED=true' };
   }
+
+  // 2026-08-03 — runs BEFORE the health/skip branch on purpose. A silent
+  // pipeline has NO pending events (replies are consumed and marked processed),
+  // so the heartbeat skips with 'no_pending_events' — exactly the state the
+  // watchdog exists to catch. Gating the check on a firing heartbeat would
+  // blind it precisely during the outage it is meant to page on.
+  await maybeAlertAgenticSilence();
 
   const health = await checkEngineHealth();
 
@@ -356,6 +479,15 @@ export function registerDecisionEngineHeartbeatRoutes(app) {
         stale_threshold_ms: STALE_THRESHOLD_MS,
         heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
         disabled: process.env.DECISION_ENGINE_HEARTBEAT_DISABLED === 'true',
+        // 2026-08-03 — agentic-silence watchdog. `last_check` is null until the
+        // first heartbeat cycle runs; ?refresh=1 computes it on demand.
+        agentic_silence: {
+          window_hours: SILENCE_WINDOW_HOURS,
+          min_replies: SILENCE_MIN_REPLIES,
+          alert_cooldown_ms: SILENCE_ALERT_COOLDOWN_MS,
+          last_alert_at: lastSilenceAlertAt || null,
+          last_check: req.query?.refresh ? await getAgenticSilenceCounts() : lastSilenceCheck,
+        },
       });
     } catch (err) {
       res.status(500).json({ success: false, error: err.message });
