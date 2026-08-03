@@ -28,14 +28,20 @@ test('equal or weaker authority does NOT override recency', () => {
   assert.equal(wins('Set', 'Cnf'), false);
 });
 
-test('Verif is inert on the authority path (ranks 0, never wins or loses)', () => {
+test('Cnf beats Verif — Verif is not the customer agreeing to a time', () => {
+  assert.equal(wins('Cnf', 'Verif'), true);
+});
+
+test('Verif ranks WITH Set, so neither outranks the other', () => {
   // lp_dispositions labels Verif "Needs Verification" — a pre-confirmation
-  // state. Omitted from the rank map, so newest-wins governs both directions
-  // and Verif siblings keep their pre-2026-08-02 behavior exactly.
+  // state, and the capacity board already groups it with Set:
+  //   CONFIRMED: [Cnf, Issue] | AT-RISK: [Set, Verif]
+  // Equal rank ⇒ newest-wins still governs Set-vs-Verif in both directions.
   assert.equal(wins('Verif', 'Set'), false);
-  assert.equal(wins('Verif', 'Cnf'), false);
-  assert.equal(wins('Cnf', 'Verif'), false);
   assert.equal(wins('Set', 'Verif'), false);
+  assert.equal(wins('Verif', 'Verif'), false);
+  // …and neither outranks a confirmation.
+  assert.equal(wins('Verif', 'Cnf'), false);
 });
 
 test('non-booking newest keeps newest-wins closed (no stale resurrection)', () => {
@@ -58,6 +64,8 @@ test('null/undefined inputs never win', () => {
   assert.equal(wins('Cnf', undefined), false);
 });
 
-test('rank map contains only the two ranked booking states', () => {
-  assert.deepEqual(Object.keys(BOOKING_AUTHORITY_RANK).sort(), ['Cnf', 'Set']);
+test('rank map covers every booking disposition, with Set and Verif tied', () => {
+  assert.deepEqual(Object.keys(BOOKING_AUTHORITY_RANK).sort(), ['Cnf', 'Set', 'Verif']);
+  assert.equal(BOOKING_AUTHORITY_RANK.Set, BOOKING_AUTHORITY_RANK.Verif);
+  assert.ok(BOOKING_AUTHORITY_RANK.Cnf > BOOKING_AUTHORITY_RANK.Set);
 });
