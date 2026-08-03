@@ -1572,15 +1572,137 @@ async function createActionsFromRule(event, rule) {
 // EVENT PROCESSING
 // ═══════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════
+// REPLY BACKSTOP (2026-08-03 — agentic silence incident)
+// ═══════════════════════════════════════════════════════════════════
+// processSingleEventInner short-circuits every ghl.reply_received:pending_analysis
+// straight to the analyzer and RETURNS before findMatchingRules ever runs. Every
+// agentic reply therefore depended on exactly one thing: the analyzer emitting
+// ai.analysis_completed. When the analyzer broke on 2026-08-03, seven inbounds
+// died in that gap and AGENTIC_ACTIVE_REPLY_BACKSTOP — the rule written for
+// precisely this — could not fire, because it is keyed on ghl.reply_received and
+// the engine never got as far as matching rules. It had fired once in seven days.
+//
+// This runs after the analyzer settles. If the analyzer produced an analysis, the
+// normal responder rules own the turn and this is a no-op. If the analyzer was
+// SILENT for any reason other than a deliberate stop, we fire the backstop so the
+// lead gets an answer.
+//
+// POLICY (Mark, 2026-08-03): the bot replies to every inbound. The ONLY reason to
+// stay silent is that the person told us to stop contacting them — stop-bot, or a
+// terminal suppression tag on a conversation the bot no longer owns. Operational
+// suppressors gate proactive sends, never a direct reply to someone who just
+// texted us. Prefer an extra message over a dropped one.
+//
+// TELEMETRY: the silent-and-unanswered case emits agentic.reply_unanswered, NOT
+// agentic.reply_dropped. The latter has an UNGATED consumer (agent_rules 341,
+// AGENTIC_REPLY_DROPPED_ALERT) that raises an Imminent GroupMe page plus a GHL
+// task reading "answer this lead manually" — correct for the reaper, which emits
+// it only when a generated customer reply died in delivery. Reusing it here would
+// page a human every time a NON-agentic contact texted during an analyzer blip,
+// including stop-bot contacts, i.e. manufacture manual outreach to people who
+// opted out. That is the exact "cries wolf on the normal case" failure that
+// agentic-silence-alerts.js (2026-08-03) was built to avoid; aggregate outage
+// paging already lives there. This event is telemetry only — no consuming rule.
+//
+// deps is an injection seam for tests only; production always uses the defaults.
+async function runReplyBackstopIfAnalyzerSilent(event, result, deps = {}) {
+  const findRules = deps.findMatchingRules || findMatchingRules;
+  const createActions = deps.createActionsFromRule || createActionsFromRule;
+  const emit = deps.emitEvent || emitEvent;
+  const db = deps.supabase || supabase;
+
+  // Analyzer succeeded → ai.analysis_completed emitted → responder rules own it.
+  if (result && !result.skipped) return;
+  // Deliberate silence. stop-bot is the kill switch; terminal suppression without
+  // agentic-active means the conversation was closed out. Both are the customer's
+  // or the rep's explicit instruction. Honor them — this is the whole exception.
+  if (result?.skipped && result.terminal) return;
+  // Another consumer already analyzed this exact message; that path owns the reply.
+  if (result?.skipped && result.reason === 'recently_analyzed') return;
+
+  const emitUnanswered = (reason) => emit({
+    event_type: 'agentic.reply_unanswered',
+    source: 'decision_engine',
+    entity_type: 'contact',
+    entity_id: String(event.ghl_contact_id || event.entity_id || 'unknown'),
+    ghl_contact_id: event.ghl_contact_id || null,
+    payload: {
+      source_event_id: event.id,
+      reason,
+      analyzer_result: result?.reason || 'failed',
+      message_preview: String(event.payload?.message_text || '').slice(0, 100),
+    },
+    priority: 'high',
+    bypass_filter: true,
+    idempotency_key: `reply_unanswered_${event.id}`,
+  }).catch(err => console.warn(`[ReplyBackstop] telemetry emit failed: ${err.message}`));
+
+  try {
+    const matched = await findRules(event);
+    const backstop = matched.filter(r => r.rule_key === 'AGENTIC_ACTIVE_REPLY_BACKSTOP');
+
+    if (backstop.length === 0) {
+      // The contact is not agentic-owned, or carries stop-bot / a consent tag.
+      // Correct silence — but record it, because "we chose not to answer" and
+      // "we failed to answer" must never again look identical in the data.
+      console.warn(
+        `[ReplyBackstop] analyzer silent for ${event.ghl_contact_id} and backstop ` +
+        `did not match — no reply will be sent (event ${event.id})`
+      );
+      emitUnanswered('analyzer_silent_and_backstop_unmatched');
+      return;
+    }
+
+    let created = 0;
+    for (const rule of backstop) {
+      const actions = await createActions(event, rule);
+      created += actions.length;
+    }
+
+    if (created === 0) {
+      // The bot OWNED this conversation and still produced nothing — suppression,
+      // outbound lock or dedup swallowed it. This is the sharpest form of the
+      // incident (we were supposed to answer and did not), so it must not be a
+      // bare console line the way the original failure was.
+      console.error(
+        `[ReplyBackstop] analyzer silent for ${event.ghl_contact_id}, backstop MATCHED ` +
+        `but created 0 actions — lead is unanswered (event ${event.id})`
+      );
+      emitUnanswered('backstop_matched_zero_actions');
+      return;
+    }
+
+    console.log(
+      `[ReplyBackstop] analyzer silent for ${event.ghl_contact_id} — fired ` +
+      `AGENTIC_ACTIVE_REPLY_BACKSTOP (${created} actions, event ${event.id})`
+    );
+    await db.from('system_events').update({
+      action_taken: `routed_to_message_analyzer → analyzer silent → AGENTIC_ACTIVE_REPLY_BACKSTOP (${created} actions)`,
+    }).eq('id', event.id);
+  } catch (err) {
+    console.error(`[ReplyBackstop] failed for event ${event.id}: ${err.message}`);
+  }
+}
+
 async function processSingleEventInner(event) {
   if (event.event_type === 'ghl.reply_received' && event.event_subtype === 'pending_analysis') {
     const contactId = event.ghl_contact_id;
     const messageText = event.payload?.message_text || '';
     if (contactId && messageText) {
       const inboundChannel = inferChannelFromEvent(event);
-      analyzeMessage(contactId, messageText, event.id, inboundChannel, event.payload?.message_id || null).catch(err => {
-        console.error(`[DecisionEngine] Analysis failed for ${contactId}:`, err.message);
-      });
+      // Still fire-and-forget — analysis takes ~7-9s and must not block the
+      // event loop. But the outcome is no longer discarded: whatever the
+      // analyzer does or fails to do, runReplyBackstopIfAnalyzerSilent decides
+      // whether this lead still gets an answer. Before 2026-08-03 a rejected
+      // promise was logged and the reply was simply lost, with the source event
+      // already marked processed so analyzePendingReplies would never retry it.
+      analyzeMessage(contactId, messageText, event.id, inboundChannel, event.payload?.message_id || null)
+        .then(result => runReplyBackstopIfAnalyzerSilent(event, result))
+        .catch(err => {
+          console.error(`[DecisionEngine] Analysis failed for ${contactId}:`, err.message);
+          return runReplyBackstopIfAnalyzerSilent(event, null);
+        });
     }
     await supabase.from('system_events').update({
       processed: true, processed_by: 'decision_engine',
@@ -1780,4 +1902,7 @@ export const _internal = {
   // 2026-08-02 — multi-lead appointment-authority policy
   olderLeadWinsOnAuthority,
   BOOKING_AUTHORITY_RANK,
+  // 2026-08-03 — agentic reply backstop (analyzer-silence incident). Takes an
+  // optional deps object so the branch logic is testable without a live DB.
+  runReplyBackstopIfAnalyzerSilent,
 };

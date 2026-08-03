@@ -179,10 +179,27 @@ async function callAnthropic({ model, system, messages, maxTokens, temperature, 
     throw new Error(`Anthropic API ${res.status}: ${t.slice(0, 300)}`);
   }
   const data = await res.json();
-  const text = (data.content || [])
+  const blocks = data.content || [];
+  const text = blocks
     .filter(b => b.type === 'text')
     .map(b => b.text)
     .join('');
+  // 2026-08-03 — EMPTY-COMPLETION GUARD (agentic silence incident).
+  // A 200 with no text block is not a usable response, but this function used
+  // to return text:'' and let the caller decide. message-analyzer's callClaude
+  // then did JSON.parse('') and threw "Unexpected end of JSON input" — an error
+  // naming neither the model nor the cause, four frames from the actual fault.
+  // That is what made a 7-hour total outage of the agentic responder look like
+  // a parser bug. The realistic cause is a model that spent the whole
+  // max_tokens budget before emitting text; the error says so explicitly.
+  if (!text.trim()) {
+    const kinds = blocks.map(b => b?.type).filter(Boolean).join(',') || 'none';
+    throw new Error(
+      `[LLMClient:${fn}] model "${model}" returned no text content ` +
+      `(stop_reason=${data.stop_reason || 'unknown'}, blocks=[${kinds}], ` +
+      `max_tokens=${maxTokens}) — raise maxTokens or check the model id`
+    );
+  }
   return { text, provider: 'anthropic', model, usage: data.usage || null, raw: data };
 }
 
@@ -215,6 +232,18 @@ async function callOpenAI({ model, system, messages, maxTokens, temperature, jso
   }
   const data = await res.json();
   const text = data.choices?.[0]?.message?.content || '';
+  // 2026-08-03 — see the empty-completion guard in callAnthropic. Symmetric on
+  // purpose: a reasoning model that exhausts max_completion_tokens before
+  // emitting content fails the same way, and flipping a group to OpenAI must
+  // not reintroduce the silent-empty-string path.
+  if (!text.trim()) {
+    const finish = data.choices?.[0]?.finish_reason || 'unknown';
+    throw new Error(
+      `[LLMClient:${fn}] model "${model}" returned no content ` +
+      `(finish_reason=${finish}, max_tokens=${maxTokens}) — ` +
+      `raise maxTokens or check the model id`
+    );
+  }
   return { text, provider: 'openai', model, usage: data.usage || null, raw: data };
 }
 

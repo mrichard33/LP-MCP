@@ -1201,14 +1201,26 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
     // blocks re-analysis for the full cache TTL even though no event was produced
     // — defeating the buffer/processing-cycle retry path.
     analysisCache.delete(buildCacheKey(ghlContactId, messageText));
+    // 2026-08-03 — bypass_filter + priority raised (agentic silence incident).
+    // event-intake-filter.js is default-DROP and ai.analysis_failed is not in
+    // ALLOWED_EVENT_TYPES, so every one of these was discarded at intake. The
+    // analyzer failed on 7 consecutive inbounds across 5 contacts over 7 hours
+    // and system_events recorded nothing — the only evidence anywhere was a
+    // console line in Railway. A failure to answer a customer is not 'low'.
     await emitEvent({
       event_type: 'ai.analysis_failed',
       source: 'message_analyzer',
       entity_type: 'contact',
       entity_id: ghlContactId,
       ghl_contact_id: ghlContactId,
-      payload: { error: err.message, message_preview: messageText?.slice(0, 50) },
-      priority: 'low',
+      payload: {
+        error: err.message,
+        message_preview: messageText?.slice(0, 50),
+        llm: resolveLLM('message_analyzer'),
+        source_event_id: eventId || null,
+      },
+      priority: 'high',
+      bypass_filter: true,
       idempotency_key: `ai_fail_${ghlContactId}_${Date.now()}`,
     });
     return null;
