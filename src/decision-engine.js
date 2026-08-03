@@ -269,6 +269,48 @@ const LP_DISP_PREFIX = 'LP_DISP_';
 const BOOKING_DISPOSITION_CODES = new Set(['Set', 'Cnf', 'Verif']);
 const DNC_DISPOSITION_CODES = new Set(['DNC']);
 
+// 2026-08-02 — booking-authority rank. Within the booking states, a later
+// state is a stronger claim on the appointment than an earlier one: Set is
+// "on the books, unconfirmed"; Cnf is "the customer agreed to this time".
+// Recency of LEAD CREATION says nothing about which appointment the customer
+// actually agreed to — canary contact 4qcX45ReKbXPbKKQTLka, three sibling
+// leads on prospect 449759 with three different Aug-5 times, where the newest
+// lead (563790, Set 13:00) buried the confirmed one (563787, Cnf 17:00) and
+// the customer was texted 1:00 PM.
+//
+// Verif is deliberately ABSENT. lp_dispositions labels it "Needs
+// Verification" — a PRE-confirmation state, not a post-confirmation one (and
+// empirically it precedes Cnf in 128 of the 210 leads that reached both over
+// 60 days). Ranking it above Cnf would reproduce a narrower version of this
+// same defect; ranking it between Set and Cnf is a guess about LP's floor
+// process nobody has confirmed. At rank 0 it neither wins nor loses here, so
+// Verif siblings keep the pre-existing newest-wins behavior untouched. It
+// REMAINS in BOOKING_DISPOSITION_CODES, so the DNC carve-out below still
+// covers it.
+//
+// Unlisted dispositions rank 0 and never win on this path.
+const BOOKING_AUTHORITY_RANK = { Set: 1, Cnf: 2 };
+
+// Pure policy (no I/O; unit-testable), mirroring the dedupPolicy convention.
+// Returns true when an OLDER sibling lead should be allowed through the
+// newest-lead guard. Two independent grounds:
+//   1. DNC carve-out (2026-07-11) — a stale DNC duplicate must never bury a
+//      booking that landed on an older sibling. Unchanged in behavior.
+//   2. Authority carve-out (2026-08-02) — when BOTH leads are in ranked
+//      booking states and this event's state outranks the newest lead's,
+//      confirmation beats recency. Requires newestRank > 0 on purpose: if the
+//      newest sibling is NOT in a ranked booking state (cancelled, Data,
+//      Verif, …) this path stays closed and newest-wins still governs, so a
+//      stale Set can never resurrect past a fresh cancellation.
+export function olderLeadWinsOnAuthority(eventDisp, newestDisp) {
+  const e = String(eventDisp || '');
+  const n = String(newestDisp || '');
+  if (DNC_DISPOSITION_CODES.has(n) && BOOKING_DISPOSITION_CODES.has(e)) return true;
+  const eventRank = BOOKING_AUTHORITY_RANK[e] ?? 0;
+  const newestRank = BOOKING_AUTHORITY_RANK[n] ?? 0;
+  return newestRank > 0 && eventRank > newestRank;
+}
+
 // v2.10: STAGE_3_PLUS_TAGS removed along with the v2.8 auto-approve bypass.
 // All approval gating now flows through the rule's own requires_approval flag.
 
@@ -499,8 +541,8 @@ async function isNewestLeadForContact(event) {
       // DNC-lift + booking rules.
       const newestDisp = String(data[0].disposition_code || '');
       const eventDisp = String(event.event_subtype || event.payload?.disposition_code || '');
-      if (DNC_DISPOSITION_CODES.has(newestDisp) && BOOKING_DISPOSITION_CODES.has(eventDisp)) {
-        console.log(`[MultiLead] ALLOW older lead ${lpLeadId} (${eventDisp}) — newest ${newestLeadId} is ${newestDisp}; a DNC duplicate must not bury a booking`);
+      if (olderLeadWinsOnAuthority(eventDisp, newestDisp)) {
+        console.log(`[MultiLead] ALLOW older lead ${lpLeadId} (${eventDisp}) — newest ${newestLeadId} is ${newestDisp}; authority beats recency`);
         return true;
       }
       console.log(`[MultiLead] BLOCKED event for LP lead ${lpLeadId} — newer lead ${newestLeadId} exists for GHL contact ${ghlContactId}`);
@@ -1719,4 +1761,7 @@ export const _internal = {
   // 2026-07-11 — appointment-sync dedup policy (double-create guard)
   dedupPolicy,
   isAppointmentSyncRule,
+  // 2026-08-02 — multi-lead appointment-authority policy
+  olderLeadWinsOnAuthority,
+  BOOKING_AUTHORITY_RANK,
 };
