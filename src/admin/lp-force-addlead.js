@@ -1,6 +1,33 @@
 /**
  * LP Force-Create-Lead Admin Endpoint — src/admin/lp-force-addlead.js
  *
+ * v2.2.0 (2026-08-03): FIX GHL WORKFLOW ENROLLMENT 422 — FRACTIONAL SECONDS.
+ *
+ *   v2.0.1 fixed half of this bug and the other half went unnoticed for two
+ *   months. GHL's /contacts/{id}/workflow/{wfId} POST rejects eventStartTime
+ *   values with a bare Z suffix AND rejects fractional seconds. v2.0.1
+ *   replaced the Z but left toISOString()'s milliseconds:
+ *     "2026-06-19T20:14:26.135+00:00"   ← still 422s
+ *   GHL's own error example carries no milliseconds:
+ *     "2021-06-23T03:30:00+01:00"
+ *
+ *   EVIDENCE THIS NEVER WORKED: writeMark() runs only after a 2xx enroll, and
+ *     SELECT * FROM lp_appointment_sync_marks WHERE dedup_key LIKE 'create-lead:%'
+ *   returns ZERO rows — against 35 'fail:' rows and hundreds of per-contact
+ *   appointment marks dating back to 2026-06-03. Not one enroll has ever
+ *   succeeded. Reproduced live 2026-08-03 on contact L0q6ASoZKJ1hXWv1b0C3
+ *   (Cynthia De Leon, chatbot lead, Riverview FL 33578, STPET market).
+ *
+ *   Fix: formatGhlEventStartTime() emits exactly YYYY-MM-DDTHH:MM:SS+00:00.
+ *   Exported so the wire format is regression-testable — this shape is the
+ *   contract with the enrollment endpoint, not an implementation detail.
+ *
+ *   NO APPOINTMENT IS EVER FABRICATED. lp-addlead-proxy.js's
+ *   planAddleadValidation() already returns { action:'forward',
+ *   reason:'no_appointment' } when adate and atime are both blank, so LP
+ *   accepts appointment-less leads today. Unbooked leads flow as unbooked
+ *   leads once enrollment itself works.
+ *
  * v2.1.0 (2026-06-19): FALLBACK LP SOURCE ID + PRO ID BEFORE ENROLLMENT.
  *
  *   Root cause (Thomas Belcher, Lp9ELGYU4DPsz7Iq5ldg): Voice-AI / agentic
@@ -34,6 +61,7 @@
  *          ex: 2021-06-23T03:30:00+01:00"
  *
  *   Fix: .toISOString().replace('Z', '+00:00') in the fetch body.
+ *   SUPERSEDED BY v2.2.0 — this fix was incomplete (milliseconds remained).
  *
  * v2.0.0 (2026-06-03): ENROLL IN GHL WORKFLOW 8e30ff37 (was: raw addLead).
  *
@@ -108,6 +136,19 @@ const FALLBACK_PRO_ID    = String(process.env.LP_FALLBACK_PRO_ID || '5574');
 function clean(v) {
   if (v === 'null' || v === 'undefined' || v === '' || v == null) return null;
   return String(v).trim();
+}
+
+/**
+ * GHL workflow-enrollment eventStartTime.
+ *
+ * MUST be exactly YYYY-MM-DDTHH:MM:SS+00:00 — no milliseconds, explicit
+ * offset, never a bare Z. Both halves matter: v2.0.1 fixed the Z and left
+ * the milliseconds, and GHL kept returning the identical 422 for two months.
+ *
+ * Exported so the wire format is regression-testable. Do not inline this.
+ */
+export function formatGhlEventStartTime(d = new Date()) {
+  return `${d.toISOString().slice(0, 19)}+00:00`;
 }
 
 function readContactField(contact, fieldId) {
@@ -188,9 +229,13 @@ async function writeMark(key, contactId) {
 
 /**
  * Enroll a GHL contact in the "Send Lead to Lead Perfection" workflow
- * (8e30ff37) to create the LP lead — with appointment — the canonical
- * way, including inbound-id writeback and the downstream LP callback that
- * fills lp_prospect_id / lp_lead_id / Disposition.
+ * (8e30ff37) to create the LP lead — with appointment when the contact has
+ * one — the canonical way, including inbound-id writeback and the downstream
+ * LP callback that fills lp_prospect_id / lp_lead_id / Disposition.
+ *
+ * v2.2.0: eventStartTime now goes out with no fractional seconds. Before
+ * this, every call threw on the GHL POST and this function had never once
+ * completed in production.
  *
  * v2.1.0: before enrolling, ensureLpSourceAndProId() backfills the LP
  * Source ID / Pro ID gate fields with fallbacks if they are missing, so
@@ -227,10 +272,9 @@ export async function enrollLpLeadCreation({ contactId, calendarName = null, for
 
   const url = `https://services.leadconnectorhq.com/contacts/${contactId}/workflow/${LEAD_CREATE_WORKFLOW_ID}`;
 
-  // v2.0.1: GHL rejects eventStartTime with a bare Z suffix ("...Z") and
-  // requires an explicit timezone offset ("...+00:00"). Node's toISOString()
-  // always emits Z, so we replace it before sending.
-  const eventStartTime = new Date().toISOString().replace('Z', '+00:00');
+  // v2.2.0: GHL rejects a bare Z suffix AND rejects fractional seconds.
+  // Exactly YYYY-MM-DDTHH:MM:SS+00:00 — see formatGhlEventStartTime().
+  const eventStartTime = formatGhlEventStartTime(new Date());
 
   const res = await fetch(url, {
     method: 'POST',
@@ -266,6 +310,7 @@ export async function enrollLpLeadCreation({ contactId, calendarName = null, for
     contact_id: contactId,
     workflow_id: LEAD_CREATE_WORKFLOW_ID,
     dedup_key: dedupKey,
+    event_start_time: eventStartTime,
     gate_fields: gateFields,
   };
 }
@@ -298,5 +343,5 @@ export function registerLPForceAddLeadRoutes(app) {
     }
   });
 
-  console.log('[LP-FORCE-ADDLEAD] Registered: POST /admin/lp/force-addlead (v2.1.0 — fallback srs_id/pro_id + fix GHL 422 timezone, enroll wf 8e30ff37)');
+  console.log('[LP-FORCE-ADDLEAD] Registered: POST /admin/lp/force-addlead (v2.2.0 — eventStartTime without fractional seconds, fallback srs_id/pro_id, enroll wf 8e30ff37)');
 }
