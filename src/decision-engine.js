@@ -278,18 +278,23 @@ const DNC_DISPOSITION_CODES = new Set(['DNC']);
 // lead (563790, Set 13:00) buried the confirmed one (563787, Cnf 17:00) and
 // the customer was texted 1:00 PM.
 //
-// Verif is deliberately ABSENT. lp_dispositions labels it "Needs
-// Verification" — a PRE-confirmation state, not a post-confirmation one (and
-// empirically it precedes Cnf in 128 of the 210 leads that reached both over
-// 60 days). Ranking it above Cnf would reproduce a narrower version of this
-// same defect; ranking it between Set and Cnf is a guess about LP's floor
-// process nobody has confirmed. At rank 0 it neither wins nor loses here, so
-// Verif siblings keep the pre-existing newest-wins behavior untouched. It
-// REMAINS in BOOKING_DISPOSITION_CODES, so the DNC carve-out below still
-// covers it.
+// Verif ranks WITH Set, not above it and not on its own tier. lp_dispositions
+// labels it "Needs Verification" — a PRE-confirmation state (it precedes Cnf
+// in 128 of the 210 leads that reached both over 60 days), and the capacity
+// board already groups it with Set for exactly this reason:
+//   CONFIRMED: [Cnf, Issue] | AT-RISK: [Set, Verif]
+// So Set and Verif are two spellings of "on the books, not yet agreed to by
+// the customer" and neither outranks the other. Cnf is the only state that
+// means the customer confirmed the time, so it is the only one that beats
+// them. Equal rank means Set-vs-Verif siblings in either direction stay
+// governed by newest-wins, unchanged.
+//
+// 2026-08-03 — Verif was briefly omitted from this map entirely (rank 0). The
+// only difference that made was leaving Cnf-over-Verif suppressed; ranking it
+// with Set closes that gap and aligns this map with the capacity board.
 //
 // Unlisted dispositions rank 0 and never win on this path.
-const BOOKING_AUTHORITY_RANK = { Set: 1, Cnf: 2 };
+const BOOKING_AUTHORITY_RANK = { Set: 1, Verif: 1, Cnf: 2 };
 
 // Pure policy (no I/O; unit-testable), mirroring the dedupPolicy convention.
 // Returns true when an OLDER sibling lead should be allowed through the
@@ -299,9 +304,9 @@ const BOOKING_AUTHORITY_RANK = { Set: 1, Cnf: 2 };
 //   2. Authority carve-out (2026-08-02) — when BOTH leads are in ranked
 //      booking states and this event's state outranks the newest lead's,
 //      confirmation beats recency. Requires newestRank > 0 on purpose: if the
-//      newest sibling is NOT in a ranked booking state (cancelled, Data,
-//      Verif, …) this path stays closed and newest-wins still governs, so a
-//      stale Set can never resurrect past a fresh cancellation.
+//      newest sibling is NOT in a ranked booking state (cancelled, Data, …)
+//      this path stays closed and newest-wins still governs, so a stale Set
+//      can never resurrect past a fresh cancellation.
 export function olderLeadWinsOnAuthority(eventDisp, newestDisp) {
   const e = String(eventDisp || '');
   const n = String(newestDisp || '');
