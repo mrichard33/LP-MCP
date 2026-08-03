@@ -916,15 +916,25 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
     //     conversation (agentic-active absent — the closeout chain strips
     //     it, so genuinely closed-out contacts still skip here).
     const lcTags = (context.lead?.current_tags || []).map(t => String(t).toLowerCase());
+    // 2026-08-03 — deliberate silence is a TERMINAL no-op, not a failure.
+    // These two guards used to `return null`, which every caller reads as
+    // "genuine failure": the reply buffer burned both BUFFER_MAX_RETRIES plus a
+    // decision-engine cycle, and — because markAnalyzed() claims the dedup slot
+    // BEFORE this point — each retry came back 'recently_analyzed', which since
+    // the 2026-08-02 dedup-confirm change logged a DEDUP UNCONFIRMED error for
+    // what is a completely normal kill-switch hit. The {skipped, terminal}
+    // sentinel routes these to the same terminal-success path the
+    // 'recently_analyzed' dedup already uses. Genuine failures (rate limit,
+    // invalid LLM response) still return null and stay retryable.
     if (lcTags.includes('stop-bot')) {
       console.log(`[MessageAnalyzer] Skipping ${ghlContactId} — stop-bot present (kill switch)`);
-      return null;
+      return { skipped: true, terminal: true, reason: 'stop_bot' };
     }
     const DQ_TERMINAL_TAGS = ['hard-disqualified', 'suppress-outbound'];
     const dqTag = lcTags.find(t => DQ_TERMINAL_TAGS.includes(t));
     if (dqTag && !lcTags.includes('agentic-active')) {
       console.log(`[MessageAnalyzer] Skipping ${ghlContactId} — terminal suppression tag "${dqTag}" present and conversation not agentic-owned (hard-DQ guard)`);
-      return null;
+      return { skipped: true, terminal: true, reason: `terminal_suppression:${dqTag}` };
     }
     if (dqTag) {
       console.log(`[MessageAnalyzer] hard-DQ guard bypass for ${ghlContactId}: "${dqTag}" present but agentic-active owns the conversation — analyzing (always-respond policy)`);
@@ -1302,6 +1312,45 @@ export async function analyzePendingReplies({ limit = 10 } = {}) {
 // EXPRESS ROUTES
 // ═══════════════════════════════════════════════════════════════════
 
+/**
+ * Map an analyzeMessage() result onto the /n8n/analyze-message response body.
+ *
+ * Exported and pure so the classification is unit-testable without booting
+ * Express or supabase — the mapping is the whole contract between the analyzer
+ * and behavioral-emitter's pipeline, and getting it wrong is what produced both
+ * the 2026-07-03 retry storm and the 2026-08-02 silent drop.
+ *
+ * Three distinct outcomes, deliberately NOT collapsed:
+ *   - deduped       — another consumer already analyzed this exact message.
+ *                     Terminal success, but ONLY if a real ai.analysis_completed
+ *                     exists; behavioral-emitter confirms before trusting it.
+ *   - terminal_skip — the bot is deliberately silent (stop-bot kill switch, or
+ *                     a terminal suppression tag without agentic-active).
+ *                     Terminal success with NO confirmation lookup, because no
+ *                     analysis was ever supposed to happen.
+ *   - success:false — a genuine failure. Retryable.
+ *
+ * @param {object|null} result  analyzeMessage()'s return value
+ * @returns {object} the JSON response body
+ */
+export function buildAnalyzeResponse(result) {
+  // 2026-07-03 hotfix: a dedup skip is terminal SUCCESS (the identical
+  // message was already analyzed) — success:false here made the reply
+  // buffer retry a deliberate no-op and re-drive its source events.
+  // 2026-08-03: split the terminal-silence case out of `deduped` so a
+  // kill-switch hit never reaches the dedup-confirmation lookup.
+  if (result?.skipped) {
+    return {
+      success: true,
+      deduped: !result.terminal,
+      terminal_skip: !!result.terminal,
+      reason: result.reason,
+      analysis: null,
+    };
+  }
+  return { success: !!result, analysis: result };
+}
+
 export function registerMessageAnalyzerRoutes(app) {
   app.post('/n8n/analyze-pending-replies', async (req, res) => {
     try {
@@ -1324,13 +1373,7 @@ export function registerMessageAnalyzerRoutes(app) {
     if (!contactId || !message) return res.status(400).json({ error: 'contactId and message required' });
     try {
       const result = await analyzeMessage(contactId, message, null, channel || null, message_id || null);
-      // 2026-07-03 hotfix: a dedup skip is terminal SUCCESS (the identical
-      // message was already analyzed) — success:false here made the reply
-      // buffer retry a deliberate no-op and re-drive its source events.
-      if (result?.skipped) {
-        return res.json({ success: true, deduped: true, reason: result.reason, analysis: null });
-      }
-      res.json({ success: !!result, analysis: result });
+      res.json(buildAnalyzeResponse(result));
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
