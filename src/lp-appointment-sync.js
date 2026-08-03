@@ -841,6 +841,21 @@ async function resolveProspectToHLCIDLead(prospect, ghlContactId) {
 }
 
 /**
+ * Move `preferLeadId` to the front of a candidate list, preserving the order of
+ * everything else. Pure; returns the input untouched when there is nothing to
+ * prefer or the preferred lead is not among the candidates (a preferred lead
+ * that is not linked to this contact in lp_leads must not be conjured into the
+ * list — it was never a candidate).
+ */
+export function preferCandidate(candidates, preferLeadId) {
+  if (!Array.isArray(candidates) || !preferLeadId) return candidates;
+  const want = String(preferLeadId);
+  const idx = candidates.findIndex((c) => String(c?.lp_lead_id ?? '') === want);
+  if (idx <= 0) return candidates;   // absent (-1) or already first (0)
+  return [candidates[idx], ...candidates.slice(0, idx), ...candidates.slice(idx + 1)];
+}
+
+/**
  * v5.1.7 chain — see file header for full priority rationale.
  *
  *   Step 0 (Supabase cache, lognumber-validated)             ← 0a
@@ -856,6 +871,23 @@ async function resolveProspectToHLCIDLead(prospect, ghlContactId) {
  * caller can render source on the GroupMe notification without a
  * second Supabase lookup. Both may be null if the LP record didn't
  * populate those fields.
+ *
+ * 2026-08-03 — opts.preferLeadId REORDERS the Step-0 candidate list; it does
+ * NOT bypass the chain. The contact-scoped appointment-authority owner is a
+ * value that won an arbitration and carries ZERO LP-side validation, so
+ * short-circuiting to it could write an appointment onto a lead that is
+ * Sold/DNC/CXL, deleted in LP, linked to a different contact
+ * (lp_leads.ghl_contact_id is a Supabase-side derivation — see
+ * ghl_link_source's rejected_* values), or on a different prospect. Trying it
+ * FIRST through the existing 0a/0b gates gets the stability without giving up
+ * a single check: if the owner fails validation the loop just continues to the
+ * next candidate exactly as before.
+ *
+ * This also happens to fix the instability that produced the 2026-08-02
+ * incident's flip-flop — resolution_source went
+ * supabase_link_trusted_bookable → supabase_hlcid_validated twenty minutes
+ * apart on one contact — because the candidate list below is ordered by
+ * synced_at, which churns on every ~15-minute LP poll.
  */
 async function resolveLPLeadId(ghlContactId, contactInfo = {}, opts = {}) {
   const webhookProspectId = cleanGHLValue(contactInfo.prospectId);
@@ -869,11 +901,15 @@ async function resolveLPLeadId(ghlContactId, contactInfo = {}, opts = {}) {
 
   // ── Step 0: Supabase fast-path — two acceptance passes ───────
   try {
-    const { data: leads } = await supabase.from('lp_leads')
+    const { data: rawLeads } = await supabase.from('lp_leads')
       .select('lp_lead_id, lp_prospect_id, disposition_code, synced_at')
       .eq('ghl_contact_id', ghlContactId)
       .order('synced_at', { ascending: false })
       .limit(5);
+
+    // Authority owner first, everything else in its existing synced_at order.
+    // Reordering only — both acceptance passes below still apply in full.
+    const leads = preferCandidate(rawLeads, opts.preferLeadId);
 
     if (leads?.length) {
       const lpFetchCache = new Map();

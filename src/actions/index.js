@@ -469,10 +469,13 @@ const CONTEXT_AWARE_HANDLERS = new Set([
 // it operates on action.target_id (the contact) and builds its own context
 // via the classifier's buildLeadContext call.
 // sync_lp_appointment_to_ghl is NOT context-aware on purpose: the
-// lp.disposition_changed payload carries neither lp_lead_id nor
+// lp.disposition_changed PAYLOAD carries neither lp_lead_id nor
 // appointment_date, so the handler re-reads the authoritative lp_leads row
-// itself (newest by created_at_lp — mirrors the engine's
-// isNewestLeadForContact gate). It is also deliberately NOT mutation-gated,
+// itself. (2026-08-03: it resolves that row from the EVENT's own lead —
+// system_events.entity_id, read via action.event_id — not from newest-by-
+// created_at_lp. The payload is thin; the event row is not. The old comment
+// here said otherwise and helped keep a newest-lead-wins defect alive.)
+// It is also deliberately NOT mutation-gated,
 // like the other appointment actions: LP calendar parity must land even on
 // suppressed contacts (its own consent guard skips Set/Cnf creation but
 // still processes CXL).

@@ -13,8 +13,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { _internal } from '../src/decision-engine.js';
+import { BOOKING_AUTHORITY_RANK as SERVICE_RANK }
+  from '../src/services/contact-appointment-authority.js';
 
 const { olderLeadWinsOnAuthority: wins, BOOKING_AUTHORITY_RANK } = _internal;
+
+test('the event gate and the contact-scoped claim share ONE rank map', () => {
+  // 2026-08-03 — the map moved to services/contact-appointment-authority.js and
+  // is imported here. Reference identity, not deep equality: two maps that
+  // merely happen to agree today would let the gate and the claim drift into
+  // disagreeing about which sibling owns a contact's appointment — the exact
+  // class of divergence the authority table exists to end.
+  assert.equal(BOOKING_AUTHORITY_RANK, SERVICE_RANK);
+});
 
 test('canary regression: Cnf on an older lead beats Set on the newest', () => {
   // 563787 Cnf @17:00 (older) vs 563790 Set @13:00 (newest) — the pair that

@@ -194,6 +194,10 @@ import { emitEvent } from './event-emitter.js';
 // escalation/objection/callback rules can opt out while a booking is in flight.
 import { isInHomeCalendarId } from './knowledge/booking-calendar-router.js';
 import { isRescheduleInflight } from './services/reschedule-inflight.js';
+// 2026-08-03 — one rank scale, shared with the contact-scoped appointment
+// claim. See the BOOKING_AUTHORITY_RANK note below.
+import { BOOKING_AUTHORITY_RANK as SERVICE_BOOKING_AUTHORITY_RANK }
+  from './services/contact-appointment-authority.js';
 
 // Universal Hold timeout routing (2026-06-12). Two booking-push-timeout gates for
 // the S1.3 → S2.2 path, sharing the live GHL helpers already used elsewhere:
@@ -294,7 +298,14 @@ const DNC_DISPOSITION_CODES = new Set(['DNC']);
 // with Set closes that gap and aligns this map with the capacity board.
 //
 // Unlisted dispositions rank 0 and never win on this path.
-const BOOKING_AUTHORITY_RANK = { Set: 1, Verif: 1, Cnf: 2 };
+//
+// 2026-08-03 — the map MOVED to services/contact-appointment-authority.js and
+// is imported here. The contact-scoped claim and this event gate must rank
+// dispositions identically or they can disagree about which sibling lead owns
+// a contact's appointment — the exact class of divergence that table exists to
+// end. One definition, imported by both. The service is a leaf and must never
+// import this module back.
+const BOOKING_AUTHORITY_RANK = SERVICE_BOOKING_AUTHORITY_RANK;
 
 // Pure policy (no I/O; unit-testable), mirroring the dedupPolicy convention.
 // Returns true when an OLDER sibling lead should be allowed through the

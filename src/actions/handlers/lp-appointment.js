@@ -163,8 +163,10 @@ import { toLpApptDate, toLpApptTime, normalizeDateForComparison } from '../date-
 import { resolveContactInfo } from '../resolvers.js';
 import { buildRichNotification } from '../enrichment.js';
 import { isGhlOnlyCalendarId } from '../../knowledge/booking-calendar-router.js';
-import { appointmentDelta } from '../../appointment-dates.js';
+import { appointmentDelta, lpWallClockToGhlStartTime } from '../../appointment-dates.js';
 import { LP_EMP } from '../../lp-source-ids.js';
+import { claimAppointmentAuthority, isAuthorityEnforced }
+  from '../../services/contact-appointment-authority.js';
 
 // GHL custom field IDs used by the writeback path. Keep in sync with
 // ghl-field-map.js.
@@ -189,6 +191,31 @@ const LP_APPT_SYNCED_TAG = 'lp-appt-synced';
 // reconcile them" — and it gets its own tag so it is separately
 // countable and separately routable.
 const LP_APPT_CONFLICT_TAG = 'lp-appt-conflict';
+
+/**
+ * The LP lead that currently holds appointment authority for this GHL contact,
+ * or null. Used ONLY to reorder resolveLPLeadId's Step-0 candidates — never to
+ * skip its validation (see the preferLeadId note on resolveLPLeadId).
+ *
+ * Best-effort by construction: a missing table (deploy-before-DDL), a missing
+ * row, or any read error all return null and the resolver runs in its usual
+ * order. There is nothing to fail closed about — this only changes the ORDER
+ * candidates are tried in, and every candidate still faces the same gates.
+ */
+async function getAppointmentAuthorityOwner(contactId) {
+  if (!supabase || !contactId) return null;
+  try {
+    const { data, error } = await supabase
+      .from('contact_appointment_authority')
+      .select('owner_lp_lead_id')
+      .eq('ghl_contact_id', contactId)
+      .maybeSingle();
+    if (error || !data?.owner_lp_lead_id) return null;
+    return String(data.owner_lp_lead_id);
+  } catch {
+    return null;
+  }
+}
 
 // 2026-07-31 — live LP pre-check. Must be the literal 'false' to disable;
 // anything else (including unset) leaves it ON. A duplicate-suppression guard
@@ -430,7 +457,22 @@ export async function executeSetLPAppointment(action, context = {}) {
 
     const phone = (ghlContact?.phone || '').replace(/\D/g, '').slice(-10);
     const email = ghlContact?.email || '';
-    const resolution = await resolveLPLeadId(contactId, { phone, email });
+    // 2026-08-03 — prefer the contact's appointment-authority owner, but only
+    // as a REORDERING of resolveLPLeadId's Step-0 candidates. The owner won an
+    // arbitration; it has not been validated against LP. Deliberately NOT a
+    // short-circuit — see the preferLeadId note on resolveLPLeadId. Best-effort:
+    // a lookup failure just means the chain runs in its usual order.
+    //
+    // Gated on APPT_AUTHORITY_ENFORCE like every other authority behaviour, so
+    // "ships dark" means what it says: while the flag is off this handler
+    // resolves exactly as it did before. Reordering is safe (every candidate
+    // still faces the same 0a/0b gates), but it is still a behaviour change,
+    // and a dark soak that quietly changes behaviour is not a dark soak.
+    const authorityOwnerId = isAuthorityEnforced()
+      ? await getAppointmentAuthorityOwner(contactId)
+      : null;
+    const resolution = await resolveLPLeadId(contactId, { phone, email },
+      authorityOwnerId ? { preferLeadId: authorityOwnerId } : {});
 
     if (!resolution) {
       const { name } = await resolveContactInfo(contactId, eventPayload);
@@ -748,6 +790,90 @@ export async function executeSetLPAppointment(action, context = {}) {
     }
   } catch (err) {
     console.warn(`[LP-APPT] LP pre-check failed for ${lpLeadId}: ${err.message}`);
+  }
+
+  // ─── Appointment authority (2026-08-03) ───────────────────────────
+  // Claimed HERE and not earlier, on purpose: every return above this point
+  // (skipped_ghl_only_calendar, skipped_no_valid_lead_id, already_set_in_lp,
+  // lp_appointment_conflict) writes nothing to LP, and recording an owner for a
+  // write that never happened is a lie — in the conflict case it would also
+  // record an appointment_start LP explicitly refused.
+  //
+  // Skipped entirely when the target is an LP lead id rather than a GHL
+  // contact: the table's PK is ghl_contact_id, and a row keyed on an lds_id
+  // could never be found again by release/record.
+  //
+  // NOTE this does NOT make lp_appointment_conflict repairable. LP's
+  // SetAppointment still cannot overwrite an existing future appointment and LP
+  // still supports no cancel-then-set. What authority changes is WHICH lead we
+  // write to: the contact's owner rather than whichever sibling the resolver
+  // happened to land on. When the OWNER itself holds a different future
+  // appointment, the conflict above stands and still needs a human in LP.
+  if (!isLPLeadId(contactId)) {
+    const claim = await claimAppointmentAuthority({
+      contactId,
+      leadId: lpLeadId,
+      dispositionCode: null,          // a GHL booking is not an LP disposition
+      rank: 0,
+      appointmentStart: lpWallClockToGhlStartTime(`${ghlDateNormalized}T${apptTime}:00`),
+      prospectId: resolvedProspectId,
+      source: 'ghl_booking',
+    });
+
+    if (!claim.granted) {
+      if (claim.retryable) {
+        // Infra, not arbitration — throw so the executor retries rather than
+        // recording a terminal row for a write we never attempted.
+        throw new Error(`set_lp_appointment: appointment authority unavailable for ${contactId} (retryable)`);
+      }
+
+      const ownerLine = claim.ownerLeadId || 'unknown';
+      console.warn(`[LP-APPT] ⛔ AUTHORITY DENIED: lead ${lpLeadId} does not hold appointment authority for ${contactId} (owner ${ownerLine}) — not writing to LP`);
+
+      await addGHLNote(contactId,
+        `[LP SYNC v4.6] Appointment NOT synced — another LP lead holds appointment authority\n` +
+        `Attempted LP Lead: ${lpLeadId} | Prospect: ${resolvedProspectId || 'N/A'}\n` +
+        `Authority owner:   ${ownerLine}\n` +
+        `GHL holds: ${ghlDateNormalized} ${apptTime}\n` +
+        `This contact's appointment is owned by a different LP lead, so writing this one ` +
+        `would produce the multi-lead collision this guard exists to prevent. Reconcile the ` +
+        `duplicate leads in Lead Perfection, then re-fire.`
+      ).catch(() => {});
+      // Same tag as the conflict path on purpose: both mean "LP was not synced,
+      // a human is needed", and I.LP-A gates its GHL-native fallback on the
+      // ABSENCE of lp-appt-synced. The new signal is the
+      // appointment.authority_denied EVENT, not a new tag (the tag is a
+      // symptom; the denial is the fact).
+      await applyGHLTag(contactId, LP_APPT_CONFLICT_TAG).catch((err) => {
+        console.warn(`[LP-APPT] ${LP_APPT_CONFLICT_TAG} tag apply failed (authority path, non-blocking): ${err.message}`);
+      });
+
+      const { name: deniedName } = await resolveContactInfo(contactId, eventPayload);
+      await sendGroupMeMessage(
+        `⛔ LP Appointment NOT synced — appointment authority denied\n` +
+        `👤 ${deniedName || contactId}\n` +
+        `📋 Attempted LP Lead: ${lpLeadId} | Prospect: ${resolvedProspectId || 'NONE'}\n` +
+        `📋 Authority owner: ${ownerLine}\n` +
+        `🗓️ GHL holds: ${ghlDateNormalized} ${formatApptTime12h(apptTime)}\n` +
+        `👉 Two LP leads are fighting over one contact's appointment. Reconcile them in LP.`
+      ).catch(() => {});
+
+      // Terminal, and terminal on purpose — same reasoning as
+      // lp_appointment_conflict above: this RETURNS rather than throws, so the
+      // action records `completed`. A retry cannot change the arbitration.
+      return {
+        action: 'authority_denied',
+        reason: 'another LP lead holds appointment authority for this contact',
+        lp_lead_id: lpLeadId,
+        lp_prospect_id: resolvedProspectId,
+        owner_lp_lead_id: claim.ownerLeadId,   // advisory — see the service header
+        ghl_appointment_date: ghlDateNormalized,
+        ghl_appointment_time: apptTime,
+        calendar_name: calendarName,
+        contact_id: contactId,
+        resolution_source: resolutionSource,
+      };
+    }
   }
 
   // ─── Write to LP ──────────────────────────────────────────────────
