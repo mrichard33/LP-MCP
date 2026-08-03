@@ -28,6 +28,15 @@
  *   'passthrough' — no validation, pure forward. The kill switch: reverts
  *                   behavior without touching GHL.
  *
+ * NOTES ENRICHMENT (env LP_ADDLEAD_NOTES_MODE, default 'shadow' — see
+ * notesMode() below): the ONE field this proxy may rewrite on the forward path.
+ * `notes` arrives as {{contact.contact_summary}}, written by a ChatGPT node
+ * whose prompt reads a field vocabulary that only partly overlaps what the
+ * agentic system writes and never references the chat transcript. On 'live' /
+ * 'augment' the deterministic builder in services/agentic-lead-notes.js
+ * replaces or extends it. Ships on 'shadow', which logs and changes nothing.
+ * Contract 2 (fail-open) covers it: any error or timeout forwards unchanged.
+ *
  * DORMANT ID BACKSTOP: if the body carries an `appt_id` key that is blank
  * while adate is present, treat as invalid (contamination signature —
  * John Stautinger, lead 560445). Enforced ONLY when the key exists; GHL
@@ -38,6 +47,7 @@
 import supabase from './supabase.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { flattenWebhookBody } from './webhook-body.js';
+import { fetchAndBuildAgenticNotes, isWeakNotes } from './services/agentic-lead-notes.js';
 import {
   BUSINESS_HOUR_START_ET,
   BUSINESS_HOUR_END_ET,
@@ -50,6 +60,33 @@ const LP_FORWARD_TIMEOUT_MS = Number(process.env.LP_ADDLEAD_TIMEOUT_MS || 30000)
 function proxyMode() {
   const m = String(process.env.LP_ADDLEAD_PROXY_MODE || 'shadow').toLowerCase();
   return m === 'validate' || m === 'passthrough' ? m : 'shadow';
+}
+
+/**
+ * Agentic-notes enrichment (env LP_ADDLEAD_NOTES_MODE, default 'shadow'):
+ *   'shadow'  — build the notes and LOG them, inject NOTHING. First-deploy
+ *               default; the real output is readable before any setter sees it.
+ *   'live'    — replace `notes` when the incoming value is blank or weak.
+ *   'augment' — same as 'live' when weak; when the incoming brief is healthy,
+ *               APPEND only the deterministic sections it lacks (transcript,
+ *               objection code, trust score, market) instead of replacing it.
+ *   'off'     — skip entirely, no GHL fetch. Kill switch.
+ */
+function notesMode() {
+  const m = String(process.env.LP_ADDLEAD_NOTES_MODE || 'shadow').toLowerCase();
+  return m === 'live' || m === 'augment' || m === 'off' ? m : 'shadow';
+}
+
+// Hard ceiling on the enrichment fetch. The proxy is a synchronous hop on the
+// intake artery; enrichment must never be why a lead is slow to reach LP.
+const NOTES_ENRICH_TIMEOUT_MS = Number(process.env.LP_NOTES_ENRICH_TIMEOUT_MS || 3000);
+
+/** Resolve null at the ceiling. The timer is cleared either way so a fast
+ *  build never holds the event loop open for the full timeout. */
+function raceWithNullTimeout(promise, ms) {
+  let timer;
+  const ceiling = new Promise((resolve) => { timer = setTimeout(() => resolve(null), ms); });
+  return Promise.race([promise, ceiling]).finally(() => clearTimeout(timer));
 }
 
 /**
@@ -215,10 +252,59 @@ export function registerLpAddleadProxyRoutes(app) {
       }
     }
 
+    // ── Agentic notes enrichment ────────────────────────────────────────
+    // A rich brief already on the body (canvassing, or a healthy ChatGPT-node
+    // output) is never clobbered: 'live' only replaces a weak one, and
+    // 'augment' appends to a healthy one rather than overwriting it.
+    // isWeakNotes() also catches an unresolved "{{contact.contact_summary}}"
+    // merge token, which is the exact failure mode on agentic leads today.
+    //
+    // hasAppointment is read off the OUTBOUND body, not off plan.reason: under
+    // 'passthrough' no validation ran, and under 'shadow' a strip-planned lead
+    // still forwards its appointment. The body is what LP actually receives.
+    //
+    // FAIL-OPEN, matching the validation posture above. Any error, timeout, or
+    // null build forwards the body untouched.
+    const nMode = notesMode();
+    let notesAction = 'skipped';
+    if (nMode !== 'off' && !isBlank(body.lognumber)) {
+      const weak = isWeakNotes(outbound.notes);
+      // 'augment' is the only mode that touches a healthy brief. 'shadow'
+      // builds in both cases so the true before/after is visible in logs
+      // before anything is enforced.
+      const enriches = weak || nMode === 'augment';
+      if (enriches || nMode === 'shadow') {
+        const augmentFrom = weak ? null : outbound.notes;
+        const kind = augmentFrom ? 'augmented' : 'injected';
+        try {
+          const built = await raceWithNullTimeout(
+            fetchAndBuildAgenticNotes(body.lognumber, {
+              hasAppointment: !isBlank(outbound.adate),
+              augmentFrom,
+            }),
+            NOTES_ENRICH_TIMEOUT_MS
+          );
+          if (!built) {
+            notesAction = 'no_build';
+          } else if (nMode === 'shadow') {
+            notesAction = `shadow_${kind}(${built.length})`;
+            console.log(`[LP-PROXY] 🕶️ NOTES SHADOW log=${body.lognumber} — NOT sent:\n${built}`);
+          } else {
+            outbound = { ...outbound, notes: built };
+            notesAction = `${kind}(${built.length})`;
+          }
+        } catch (err) {
+          notesAction = 'error';
+          console.warn(`[LP-PROXY] notes enrichment threw — forwarding unchanged: ${err.message}`);
+        }
+      }
+    }
+
     try {
       const lp = await forwardToLp(outbound);
       console.log(
         `[LP-PROXY] ${body.sender || '?'} log=${body.lognumber || '?'} mode=${mode} ` +
+        `notes=${nMode}/${notesAction} ` +
         `plan=${plan.action}/${plan.reason} lp=${lp.status} ${Date.now() - started}ms`
       );
       res.status(lp.status).type(lp.contentType).send(lp.raw);
@@ -231,7 +317,7 @@ export function registerLpAddleadProxyRoutes(app) {
     }
   });
 
-  console.log(`[LP-PROXY] Registered: POST /webhook/ghl/lp-addlead-proxy (mode=${proxyMode()}, target=${LP_ADDLEAD_URL})`);
+  console.log(`[LP-PROXY] Registered: POST /webhook/ghl/lp-addlead-proxy (mode=${proxyMode()}, notes=${notesMode()}, target=${LP_ADDLEAD_URL})`);
 }
 
-export const _internal = { proxyMode };
+export const _internal = { proxyMode, notesMode };
