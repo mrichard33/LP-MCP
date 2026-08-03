@@ -139,6 +139,17 @@ const ALLOWED_EVENT_TYPES = new Set([
   'agentic.disposition_mirror_refreshed', // 2026-07-07 — stale-CXL rebook guard
                                    // (disposition-staleness-guard.js). Observability
                                    // + future rule hook; no consuming rule yet.
+  'agentic.reply_unanswered',      // 2026-08-03 — agent_rules 345
+                                   // AGENTIC_REPLY_UNANSWERED_ALERT pages on
+                                   // reason=backstop_matched_zero_actions. The
+                                   // producer (runReplyBackstopIfAnalyzerSilent)
+                                   // already emits with bypass_filter, so this
+                                   // entry is defense in depth, not plumbing:
+                                   // if that flag is ever dropped the alert
+                                   // would die silently at intake — which is
+                                   // precisely how the 2026-08-03 outage stayed
+                                   // invisible for seven hours (ai.analysis_failed
+                                   // emitted without it, 39 dropped in 14 days).
 
   // Quiet but rule-watched (must not drop)
   'ghl.lead_score_changed',        // 4 rules (W11_1_*)
