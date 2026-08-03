@@ -690,11 +690,12 @@ async function executeSingleAction(action, batchContext = {}, priorBatchResults 
     if (CONTEXT_AWARE_HANDLERS.has(action.action_type)) {
       context = { ...(await getEventContext(action)), ...batchContext };
     }
+    const handlerTimeoutMs = resolveHandlerTimeoutMs(action.action_type);
     const result = await Promise.race([
       handler(action, context),
       new Promise((_, rej) => setTimeout(
-        () => rej(new Error(`handler ${action.action_type} timed out after ${HANDLER_TIMEOUT_MS}ms (action ${action.id}, retry ${action.retry_count || 0}/${action.max_retries || 3}) — handler may still be running (zombie); send_message dedups via the sent marker`)),
-        HANDLER_TIMEOUT_MS,
+        () => rej(new Error(`handler ${action.action_type} timed out after ${handlerTimeoutMs}ms (action ${action.id}, retry ${action.retry_count || 0}/${action.max_retries || 3}) — handler may still be running (zombie); send_message dedups via the sent marker`)),
+        handlerTimeoutMs,
       )),
     ]);
     if (result?._context) Object.assign(batchContext, result._context);
@@ -818,6 +819,36 @@ const EXECUTOR_CLAIM_CHUNK   = Math.max(1, parseInt(process.env.EXECUTOR_CLAIM_C
 // cards + lost-alert churn. 60s clears the legitimate ceiling while still
 // capping a truly hung handler (the 10-min reaper is the real backstop).
 const HANDLER_TIMEOUT_MS = parseInt(process.env.EXECUTOR_HANDLER_TIMEOUT_MS || '60000', 10);
+
+// 2026-08-02 — per-handler watchdog overrides. The 60s global ceiling is
+// shorter than the legitimate worst case for set_lp_appointment: it runs the
+// five-step LP lead-resolution chain, then LP SetAppointment, and on a miss
+// falls through to enrolling the contact in GHL workflow 8e30ff37 — each leg
+// carrying its own rate-limiter wait. Action 266883 (contact
+// 4qcX45ReKbXPbKKQTLka) died at exactly 60000ms as a zombie on retry 2/3, so
+// the GHL→LP writeback of a live appointment never landed while the customer
+// was mid-reschedule. Same reasoning as the 2026-06-05 30s→60s raise, scoped
+// to the one handler that needs it instead of raising the global ceiling for
+// every handler. Still well under the 10-min reaper age, which remains the
+// real backstop. NOTE: set_lp_appointment is deliberately NOT added to
+// DEDUP_ACTION_TYPES — the syncAppointmentToLP orchestrator carries its own
+// LP-side duplicate guard (already_in_lp / already_set_in_lp /
+// duplicate_sync_suppressed), and a payload-hash dedup would collapse a
+// genuine later reschedule for the same contact.
+const HANDLER_TIMEOUT_OVERRIDES_MS = {
+  set_lp_appointment: Math.max(
+    HANDLER_TIMEOUT_MS,
+    parseInt(process.env.EXECUTOR_LP_APPOINTMENT_TIMEOUT_MS || '120000', 10),
+  ),
+};
+
+// Pure resolver (unit-testable). Falls back to the global ceiling for every
+// action type without an explicit override.
+export function resolveHandlerTimeoutMs(actionType) {
+  const override = HANDLER_TIMEOUT_OVERRIDES_MS[actionType];
+  return Number.isFinite(override) && override > 0 ? override : HANDLER_TIMEOUT_MS;
+}
+
 // Send-dedup: action types whose handlers cause an external, user-visible side
 // effect that must not double-fire. Guarded by an atomic claim on a logical-
 // identity key (action_type + target_id + payload hash) so that (a) near-
