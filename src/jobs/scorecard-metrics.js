@@ -96,7 +96,10 @@ function flag(lead, mapKey) {
 
 // Dispositions where the rep sat the appointment (LP Sat=true) but it should NOT
 // count as a demo for Reece's metrics. Real LP labels (per lp_dispositions):
-//   NOC = No Contact, NIS = Not Interested - Shown.
+//   NOC = No Contact, NIS = Not Interested - Shown, 1Leg = One Leg Present
+//   (only one spouse at the appointment — a sit, but NOT a demo in any Reece
+//   demo count or rate, matching the LP Appointment Statistics report where
+//   Sit (Demo) and 1leg are separate columns).
 // demo_completed in the cache still mirrors LP faithfully; this exclusion is
 // applied only at the reporting/count layer. ⚠ TIE-OUT — env-overridable via
 // SCORECARD_NON_DEMO_DISPOSITIONS (comma-separated); confirm against the official
@@ -104,7 +107,7 @@ function flag(lead, mapKey) {
 export const NON_DEMO_DISPOSITIONS = new Set(
   (process.env.SCORECARD_NON_DEMO_DISPOSITIONS
     ? process.env.SCORECARD_NON_DEMO_DISPOSITIONS.split(',')
-    : ['NOC', 'NIS']
+    : ['NOC', 'NIS', '1LEG']
   ).map((s) => s.trim().toUpperCase()).filter(Boolean),
 );
 // Returns the excluding disposition code (uppercased) if this sat lead is a
