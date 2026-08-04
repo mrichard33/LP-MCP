@@ -78,7 +78,9 @@ const ANCHOR_RE = new RegExp(`^\\s*(${MARKET_CODES.join('|')})\\s+(\\d+)\\s+(.*)
 // (prosp#, street numbers) can't match; '$0' / '0.00' allowed. Digit
 // lookarounds keep fragments of longer numbers ('0' inside '2026') out.
 const MONEY_B_RE = /(?<![\d,.])\(?\$?(?:\d{1,3}(?:,\d{3})+(?:\.\d{2})?|\d+\.\d{2}|0)\)?(?![\d.])/g;
-const DATE_RE = /\d{1,2}\/\d{1,2}\/\d{4}/g;
+// 2- or 4-digit years — Report A's production PDF prints detail dates as
+// 'MM/DD/YY'; B is produced by the same C1Report engine, so accept both.
+const DATE_RE = /\d{1,2}\/\d{1,2}\/\d{2,4}/g;
 const PHONE_RE = /\(?\d{3}\)?[- .]\d{3}[- .]\d{4}/;
 const EMAIL_RE = /[^\s@]+@[^\s@]+\.[^\s@]+/;
 
