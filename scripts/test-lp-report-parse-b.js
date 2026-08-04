@@ -30,7 +30,7 @@ import { dirname, join } from 'node:path';
 
 import {
   KNOWN_STATUSES, STATUS_BUCKET_MAP, classifyStatus,
-  parseJobsByStatus, flagDuplicates, validateJobsByStatus, sumByBucket,
+  parseJobsByStatus, flagDuplicates, validateJobsByStatus, sumByBucket, dupReviewRows,
 } from '../src/jobs/lp-report-parse-b.js';
 
 const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), 'fixtures/lp-reports/report-b-jobs-by-status.txt');
@@ -155,6 +155,34 @@ test('sumByBucket rolls count + cents per bucket', () => {
   assert.deepEqual(buckets.get('hoa'), { count: 1, cents: 2150000 });
   assert.deepEqual(buckets.get('other_pending'), { count: 3, cents: 4000000 });
   assert.deepEqual(buckets.get('excluded'), { count: 1, cents: 0 });
+});
+
+test('dup_review rows are excluded from bucket totals by default but retained (ruled 2026-08-04)', () => {
+  // A doctored duplicate of the HOA row: same Prosp# + same contract date.
+  const dupLine = 'ORL    445566   Maria Gonzalez        (407) 555-1212   maria@example.com   6/10/2026   HOLD - HOA        21,500';
+  const doctored = SYNTHETIC
+    .replace(dupLine, `${dupLine}\n${dupLine}`)
+    .replace('Total # Records: 5    Total: 61,500', 'Total # Records: 6    Total: 83,000');
+  const parsed = parseJobsByStatus(doctored);
+  flagDuplicates(parsed.rows);
+
+  // Parse-integrity ties are on ALL rows — the PDF prints the dups.
+  assert.equal(validateJobsByStatus(parsed).ok, true);
+  assert.equal(parsed.rows.length, 6);
+
+  // Reporting default: both flagged rows held OUT of the hoa bucket…
+  const buckets = sumByBucket(parsed.rows);
+  assert.equal(buckets.get('hoa'), undefined);
+  assert.deepEqual(buckets.get('other_pending'), { count: 3, cents: 4000000 });
+
+  // …restorable explicitly (the raw-PDF sum)…
+  const raw = sumByBucket(parsed.rows, { includeDupReview: true });
+  assert.deepEqual(raw.get('hoa'), { count: 2, cents: 4300000 });
+
+  // …and surfaced, never dropped.
+  const held = dupReviewRows(parsed.rows);
+  assert.equal(held.length, 2);
+  assert.ok(held.every((r) => r.prosp_number === '445566'));
 });
 
 test('golden: fixture ties to the report footer (skipped until fixture exists)', (t) => {

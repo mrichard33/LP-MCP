@@ -180,18 +180,25 @@ export async function ingestReportPdf({ reportType, buffer, source = 'n8n' }) {
   }
 
   // 7. Snapshot payload. A: the PDF's own declared range. B: point-in-time.
+  //    B's header gross EXCLUDES dup_review rows (ruled 2026-08-04: dups are
+  //    retained + surfaced, never counted into bucket totals). row_count
+  //    stays the full inserted-row count — it feeds the RPC insert assertion.
   const reportDate = isA ? null : (parsed.header.reportDate ?? todayET());
   const netTotal = isA
     ? parsed.rows.reduce((a, r) => a + (r.net_cents ?? 0), 0)
     : null;
   const grossTotal = isA
     ? parsed.rows.reduce((a, r) => a + (r.gross_cents ?? 0), 0)
-    : parsed.rows.reduce((a, r) => a + (r.total_gross_cents ?? 0), 0);
+    : parsed.rows.reduce((a, r) => a + (r.dup_review ? 0 : (r.total_gross_cents ?? 0)), 0);
   const snapshot = {
     report_type: reportType,
     period_start: isA ? parsed.header.periodStart : reportDate,
     period_end: isA ? parsed.header.periodEnd : reportDate,
     report_generated_at: null,
+    // ET date the report was generated — the lp_report_facts time-series
+    // axis. Best-effort from the PDF's printed run date, else B's report
+    // date, else the ingest date.
+    as_of_date: parsed.header.reportGeneratedAt ?? reportDate ?? todayET(),
     file_sha256: sha,
     storage_path: storagePath,
     row_count: parsed.rows.length,
@@ -264,14 +271,56 @@ export function registerLpReportRoutes(app) {
       if (error) throw new Error(error.message);
       const { data: current } = await supabase
         .from('scorecard_report_snapshots')
-        .select('report_type, period_start, period_end, row_count, net_total_cents, gross_total_cents, ingested_at')
+        .select('id, report_type, period_start, period_end, row_count, net_total_cents, gross_total_cents, ingested_at')
         .eq('is_current', true)
         .order('ingested_at', { ascending: false }).limit(10);
-      res.json({ success: true, recent: log || [], current: current || [] });
+      // dup_review rows are excluded from bucket totals (ruled 2026-08-04)
+      // but never dropped — this is their human-review surface.
+      const currentB = (current || []).find((s) => s.report_type === 'jobs_by_status');
+      let dupReview = [];
+      if (currentB) {
+        const { data: dups } = await supabase
+          .from('scorecard_report_rows_b')
+          .select('prosp_number, customer_name, market, status_raw, bucket, contract_date, total_gross_cents, lender')
+          .eq('snapshot_id', currentB.id).eq('dup_review', true)
+          .order('prosp_number');
+        dupReview = dups || [];
+      }
+      // Current-facts summary — grain counts + the as_of span per report type
+      // (the lp_report_facts time series accumulating).
+      const { data: factRows } = await supabase
+        .from('lp_report_facts')
+        .select('report_type, as_of_date')
+        .eq('is_current', true);
+      const facts = {};
+      for (const f of factRows || []) {
+        const acc = facts[f.report_type] || { grains: 0, as_of_min: f.as_of_date, as_of_max: f.as_of_date };
+        acc.grains += 1;
+        if (f.as_of_date < acc.as_of_min) acc.as_of_min = f.as_of_date;
+        if (f.as_of_date > acc.as_of_max) acc.as_of_max = f.as_of_date;
+        facts[f.report_type] = acc;
+      }
+      res.json({ success: true, recent: log || [], current: current || [], dup_review: dupReview, facts });
     } catch (err) {
       res.status(500).json({ success: false, error: err.message });
     }
   });
 
-  console.log('[LPReport] Routes registered: POST /n8n/admin/lp-report-ingest/{jobs-by-milestone|jobs-by-status} | GET /n8n/admin/lp-report-ingest/status');
+  // Rebuild one snapshot's facts from its raw rows (raw wins — the recon's
+  // manual escape hatch). Same auth as ingest.
+  app.post('/n8n/admin/lp-report-facts-rebuild', async (req, res) => {
+    try {
+      if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
+      if (!supabase) return res.status(500).json({ success: false, error: 'Supabase not configured' });
+      const snapshotId = String(req.query.snapshot_id || '').trim();
+      if (!snapshotId) return res.status(400).json({ success: false, error: 'snapshot_id query param required' });
+      const { data, error } = await supabase.rpc('scorecard_rebuild_facts', { p_snapshot_id: snapshotId });
+      if (error) throw new Error(error.message);
+      res.json({ success: true, snapshot_id: snapshotId, fact_rows: data });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  console.log('[LPReport] Routes registered: POST /n8n/admin/lp-report-ingest/{jobs-by-milestone|jobs-by-status} | GET /n8n/admin/lp-report-ingest/status | POST /n8n/admin/lp-report-facts-rebuild');
 }
