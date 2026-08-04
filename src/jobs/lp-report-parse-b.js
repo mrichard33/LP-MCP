@@ -312,10 +312,20 @@ export function validateJobsByStatus(parsed) {
   return { ok: v.length === 0, violations: v };
 }
 
-/** { bucket → { count, cents } } roll-up (recon's b_internal + goldens). */
-export function sumByBucket(rows) {
+/**
+ * { bucket → { count, cents } } roll-up (recon's b_internal + goldens).
+ *
+ * RULED 2026-08-04: dup_review rows are EXCLUDED from bucket totals by
+ * default — a data-entry duplicate silently counted into Good Business is
+ * the same defect class as a subtotal-row leak. The rows are RETAINED in
+ * scorecard_report_rows_b and surfaced for review (dupReviewRows + the
+ * status route); pass { includeDupReview: true } for the raw-PDF sum the
+ * footer tie uses.
+ */
+export function sumByBucket(rows, { includeDupReview = false } = {}) {
   const out = new Map();
   for (const r of rows) {
+    if (!includeDupReview && r.dup_review) continue;
     const key = r.bucket ?? 'UNKNOWN';
     const acc = out.get(key) || { count: 0, cents: 0 };
     acc.count += 1;
@@ -323,4 +333,9 @@ export function sumByBucket(rows) {
     out.set(key, acc);
   }
   return out;
+}
+
+/** The rows held out of bucket totals, for the human-review surface. */
+export function dupReviewRows(rows) {
+  return rows.filter((r) => r.dup_review);
 }
