@@ -227,6 +227,11 @@ import { registerNetReportRoutes } from './jobs/scorecard-rtp-source.js';
 // LP scheduled-report PDF ingest (Report A Net Sales / Report B GB split) — n8n
 // posts raw PDF bytes; parse/validate/write happens here, fail-closed.
 import { registerLpReportRoutes } from './jobs/lp-report-ingest.js';
+// Daily 07:00 ET cross-source recon for the ingested LP reports.
+import { registerLpReportReconRoutes, startLpReportReconScheduler } from './jobs/lp-report-recon.js';
+// 07:30 ET missing-report watchdog — watches the OUTCOME table, independent
+// of every pipeline stage (LP schedule / Gmail / n8n / ingest route).
+import { startLpReportWatchdog } from './jobs/lp-report-watchdog.js';
 // Nightly scorecard validation + GroupMe tie-out alert.
 import { registerScorecardValidateRoutes, startScorecardValidateScheduler } from './jobs/scorecard-validate.js';
 // ─── Agentic Hold-Complete (return-from-hold re-entry) ───────────
@@ -1017,6 +1022,7 @@ registerCapacityBandRoutes(app, authenticate);
 registerScorecardRederiveRoutes(app);
 registerNetReportRoutes(app);
 registerLpReportRoutes(app);
+registerLpReportReconRoutes(app);
 registerScorecardValidateRoutes(app);
 
 app.listen(PORT, async () => {
@@ -1048,6 +1054,8 @@ app.listen(PORT, async () => {
   startCapacitySweepScheduler();
   startGoalScorecardScheduler();
   startScorecardValidateScheduler();
+  startLpReportReconScheduler();
+  startLpReportWatchdog();
   startFbPublishWatchdog();
   startFive9SilenceWatchdog();
   startGhlNoteSweep();
