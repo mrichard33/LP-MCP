@@ -1,5 +1,5 @@
 /**
- * Guards for src/jobs/lp-report-parse-a.js — "Jobs by Milestone Date" (Ordered/Actual).
+ * Guards for src/jobs/lp-report-parse-a.js — "Jobs by Milestone Date" (RTP/Actual).
  *
  * Invariants under guard:
  *   • Money-column order is DERIVED from the printed column header (the first
@@ -15,8 +15,16 @@
  *   • A misclassified line (subtotal counted as detail, detail counted
  *     twice) breaks a validation gate — the file can NEVER pass while a
  *     row leaked.
- *   • Truncated files (no footer) and wrong-parameter runs (not Ordered/Actual)
- *     are rejected, not partially ingested.
+ *   • Truncated files (no footer) and wrong-parameter runs (not RTP/Actual)
+ *     are rejected, not partially ingested — and the rejection logs every
+ *     sub-check (milestone_ok / mode_ok), not just a truncated header.
+ *   • Header validation is CONTENT-matched: the optional 'All Sales' line
+ *     may be present, absent, or reordered without affecting any gate
+ *     (2026-08-04 regression class: a positional theory wasted a cycle).
+ *   • display_rounding: a whole-dollar-rendered PDF may print subtotals
+ *     computed from unrounded values; the allowance is capped at $1 × rows
+ *     in the group, logged in `reconciliations` on every use, and never
+ *     applies when any cell carries cents.
  *   • Branch → market roll-up follows lp_branch_market_map (BOCA→FTLAU_MKT).
  *
  * Golden-file assertions (row count 288, net $7,502,745.76, Orlando
@@ -44,9 +52,10 @@ const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), 'fixtures/lp-repor
 // branch column labelled 'Mkt', money printed Net | Gross | Paid | Balance.
 const SYNTHETIC = `Reece Windows & Doors
 Jobs By Milestone Date
-For Jobs with the Milestone 'Ordered'
+For Jobs with the Milestone 'RTP'
 from Wednesday, July 1, 2026 through Friday, July 31, 2026
 Sort By: Sales Rep
+All Sales
 Mode: Actual
 Job                                          Contract                      Net    Total    Total   Balance
 Number   Customer Name   Address   City       Date       RTP    Mkt  Product    Amount   Gross     Paid      Due
@@ -133,7 +142,7 @@ test('M/D/YYYY period line (From:/To:) also parses', () => {
 test('money printed without cents parses to exact cents and all ties pass', () => {
   const noCents = `Reece Windows & Doors
 Jobs By Milestone Date
-For Jobs with the Milestone 'Ordered'
+For Jobs with the Milestone 'RTP'
 from Wednesday, July 1, 2026 through Friday, July 31, 2026
 Mode: Actual
 Job                                          Contract                      Net    Total    Total   Balance
@@ -198,26 +207,72 @@ test('truncated file (footer gone) is rejected', () => {
   assert.equal(check.ok, false);
 });
 
-test("wrong parameters (milestone 'RTP' — the spec assumption, not the production feed) are rejected", () => {
-  const rtp = SYNTHETIC
-    .replace("For Jobs with the Milestone 'Ordered'", "For Jobs with the Milestone 'RTP'");
-  const check = validateJobsByMilestone(parseJobsByMilestone(rtp));
+test("wrong parameters (milestone 'Ordered' — the misconfigured 2026-08-04 schedule) are rejected, with every sub-check logged", () => {
+  const ordered = SYNTHETIC
+    .replace("For Jobs with the Milestone 'RTP'", "For Jobs with the Milestone 'Ordered'");
+  const check = validateJobsByMilestone(parseJobsByMilestone(ordered));
   const hit = check.violations.find((v) => v.rule === 'wrong_report_parameters');
   assert.ok(hit, 'expected wrong_report_parameters');
-  assert.equal(hit.detail.milestone, 'RTP');
-  assert.equal(hit.detail.expected_milestone, 'Ordered');
+  assert.equal(hit.detail.milestone, 'Ordered');
+  assert.equal(hit.detail.expected_milestone, 'RTP');
+  assert.equal(hit.detail.milestone_ok, false);
+  assert.equal(hit.detail.mode, 'Actual');
+  assert.equal(hit.detail.mode_ok, true);
   assert.equal(check.ok, false);
 
   // …but an explicit expectedMilestone override accepts it.
-  assert.equal(validateJobsByMilestone(parseJobsByMilestone(rtp), { expectedMilestone: 'RTP' }).ok, true);
+  assert.equal(validateJobsByMilestone(parseJobsByMilestone(ordered), { expectedMilestone: 'Ordered' }).ok, true);
 });
 
-test('wrong parameters (Projected, no Actual) are rejected', () => {
+test('wrong parameters (Projected, no Actual) are rejected with mode_ok:false', () => {
   const projected = SYNTHETIC
-    .replace("For Jobs with the Milestone 'Ordered'", "For Jobs with the Milestone 'Install'")
+    .replace("For Jobs with the Milestone 'RTP'", "For Jobs with the Milestone 'Install'")
     .replace('Mode: Actual', 'Mode: Projected');
   const check = validateJobsByMilestone(parseJobsByMilestone(projected));
+  const hit = check.violations.find((v) => v.rule === 'wrong_report_parameters');
+  assert.ok(hit, 'expected wrong_report_parameters');
+  assert.equal(hit.detail.milestone_ok, false);
+  assert.equal(hit.detail.mode, 'Projected');
+  assert.equal(hit.detail.mode_ok, false);
+  assert.equal(check.ok, false);
+});
+
+test("mode check is ANCHORED to 'Mode:' — a stray 'Actual' elsewhere in the header cannot satisfy it", () => {
+  // 'Mode: Projected' + the word 'Actual' in another header line: the old
+  // unanchored /\bActual\b/ passed this; the anchored check must not.
+  const sneaky = SYNTHETIC
+    .replace('Mode: Actual', 'Mode: Projected')
+    .replace('Sort By: Sales Rep', 'Sort By: Sales Rep (Actual)');
+  const parsed = parseJobsByMilestone(sneaky);
+  assert.equal(parsed.header.mode, 'Projected');
+  assert.equal(parsed.header.declaresActual, false);
+  const check = validateJobsByMilestone(parsed);
   assert.ok(check.violations.map((v) => v.rule).includes('wrong_report_parameters'));
+});
+
+test("header validation is content-matched: 'All Sales' present, absent, or reordered — all pass (id=5 regression)", () => {
+  // Present (SYNTHETIC includes it).
+  assert.equal(validateJobsByMilestone(parseJobsByMilestone(SYNTHETIC)).ok, true);
+
+  // Absent.
+  const without = SYNTHETIC.replace('All Sales\n', '');
+  assert.equal(validateJobsByMilestone(parseJobsByMilestone(without)).ok, true);
+
+  // Reordered: 'All Sales' after 'Mode: Actual'.
+  const reordered = SYNTHETIC
+    .replace('All Sales\n', '')
+    .replace('Mode: Actual', 'Mode: Actual\nAll Sales');
+  assert.equal(validateJobsByMilestone(parseJobsByMilestone(reordered)).ok, true);
+});
+
+test('wrong_period: backfill-declared period must match the header (shared validator, no fork)', () => {
+  const parsed = parseJobsByMilestone(SYNTHETIC); // declares 2026-07-01..31
+  assert.equal(validateJobsByMilestone(parsed, { expectedPeriod: { start: '2026-07-01', end: '2026-07-31' } }).ok, true);
+  const check = validateJobsByMilestone(parsed, { expectedPeriod: { start: '2026-06-01', end: '2026-06-30' } });
+  const hit = check.violations.find((v) => v.rule === 'wrong_period');
+  assert.ok(hit, 'expected wrong_period');
+  assert.equal(hit.detail.declared_start, '2026-07-01');
+  assert.equal(hit.detail.expected_start, '2026-06-01');
   assert.equal(check.ok, false);
 });
 
@@ -330,7 +385,11 @@ Rep, Foxtrot
 test('real production layout (2026-08-04, sanitized): every gate passes', () => {
   const parsed = parseJobsByMilestone(REAL_LAYOUT);
 
+  // The capture predates the LP schedule fix — it declares 'Ordered', so the
+  // gate check below runs with an explicit override. Everything structural
+  // (columns, subtotals, wrapped names, footer) is byte-faithful regardless.
   assert.equal(parsed.header.milestone, 'Ordered');
+  assert.equal(parsed.header.mode, 'Actual');
   assert.equal(parsed.header.declaresActual, true);
   assert.deepEqual(parsed.header.moneyColumnOrder, ['net', 'gross', 'paid', 'balance']);
   assert.equal(parsed.header.periodStart, '2026-08-03');
@@ -360,7 +419,7 @@ test('real production layout (2026-08-04, sanitized): every gate passes', () => 
   assert.equal(wrapped.customer_name, 'India/Juliet, Jay & Raisa');
   assert.equal(wrapped.sales_rep, 'Rep, Foxtrot');
 
-  const check = validateJobsByMilestone(parsed);
+  const check = validateJobsByMilestone(parsed, { expectedMilestone: 'Ordered' });
   assert.deepEqual(check.violations, []);
   assert.equal(check.ok, true);
 });
@@ -371,9 +430,72 @@ test('a dropped rep subtotal is a violation, not a silent hole in the guard', ()
     '                                                                                                                                     34,832    34,832       1      34,831\n\n\n',
     '\n\n',
   );
-  const check = validateJobsByMilestone(parseJobsByMilestone(holed));
+  const check = validateJobsByMilestone(parseJobsByMilestone(holed), { expectedMilestone: 'Ordered' });
   const hit = check.violations.find((v) => v.rule === 'rep_subtotal_missing');
   assert.ok(hit, `expected rep_subtotal_missing in ${check.violations.map((v) => v.rule)}`);
   assert.equal(hit.detail.rep, 'Rep, Bravo');
   assert.equal(check.ok, false);
+});
+
+// ── display_rounding — the id=4 $1.00 case (2026-08-04) ─────────────────────
+// LP renders this PDF in whole dollars but computes subtotals from unrounded
+// values: "Inlay, Katie" printed net $57,227 while her displayed rows summed
+// $57,226, and the grand total carried the same $1. The allowance is bounded
+// ($1 × rows in the group), whole-dollar-gated, and LOGGED on every use.
+
+/** REAL_LAYOUT with Rep Bravo's row displayed $1 below its printed subtotal — the id=4 shape. */
+const ROUNDED_LAYOUT = REAL_LAYOUT
+  .replace(
+    '36369     Echo, Judith                     4805 Sample Rd            North Port             06/11/26   08/03/26   SAR     Win        34,832    34,832       1      34,831',
+    '36369     Echo, Judith                     4805 Sample Rd            North Port             06/11/26   08/03/26   SAR     Win        34,831    34,832       1      34,831',
+  );
+
+test('display_rounding: $1 whole-dollar subtotal drift passes within cap and is logged as a reconciliation', () => {
+  const check = validateJobsByMilestone(parseJobsByMilestone(ROUNDED_LAYOUT), { expectedMilestone: 'Ordered' });
+  // Footer net (252,908) now also sits $1 above the displayed-row sum — the
+  // same drift propagates, exactly as in id=4.
+  assert.deepEqual(check.violations, [], `unexpected violations: ${JSON.stringify(check.violations)}`);
+  assert.equal(check.ok, true);
+
+  const sub = check.reconciliations.find((r) => r.scope === 'rep_subtotal');
+  assert.ok(sub, 'expected a rep_subtotal display_rounding reconciliation');
+  assert.equal(sub.class, 'display_rounding');
+  assert.equal(sub.detail.rep, 'Rep, Bravo');
+  assert.equal(sub.detail.column_field, 'net');
+  assert.equal(sub.detail.delta_cents, 100);
+  assert.equal(sub.detail.cap_cents, 100); // 1 row in the group → $1 cap
+
+  const foot = check.reconciliations.find((r) => r.scope === 'footer_total');
+  assert.ok(foot, 'expected a footer_total display_rounding reconciliation');
+  assert.equal(foot.detail.delta_cents, 100);
+  assert.equal(foot.detail.cap_cents, 900); // 9 rows → $9 cap
+});
+
+test('display_rounding: drift beyond the $1-per-row cap still fails closed', () => {
+  // Rep Bravo has ONE row → cap $1. Print the row $2 low: past the cap.
+  const past = REAL_LAYOUT.replace(
+    '36369     Echo, Judith                     4805 Sample Rd            North Port             06/11/26   08/03/26   SAR     Win        34,832    34,832       1      34,831',
+    '36369     Echo, Judith                     4805 Sample Rd            North Port             06/11/26   08/03/26   SAR     Win        34,830    34,832       1      34,831',
+  );
+  const check = validateJobsByMilestone(parseJobsByMilestone(past), { expectedMilestone: 'Ordered' });
+  const hit = check.violations.find((v) => v.rule === 'rep_subtotal_mismatch');
+  assert.ok(hit, 'expected rep_subtotal_mismatch');
+  assert.equal(hit.detail.delta_cents, 200);
+  assert.equal(hit.detail.cap_cents, 100);
+  assert.equal(check.ok, false);
+});
+
+test('display_rounding: never applies when the group carries cents — exact tie required (SYNTHETIC, $1 off)', () => {
+  // SYNTHETIC prints cents everywhere; a $1 drift there is a parse defect,
+  // not display rounding.
+  const off = SYNTHETIC.replace(
+    '                                                                        1,800.00    2,000.00       0.00    1,800.00',
+    '                                                                        1,801.00    2,000.00       0.00    1,800.00',
+  );
+  const check = validateJobsByMilestone(parseJobsByMilestone(off));
+  const hit = check.violations.find((v) => v.rule === 'rep_subtotal_mismatch');
+  assert.ok(hit, 'expected rep_subtotal_mismatch');
+  assert.equal(hit.detail.whole_dollar_group, false);
+  assert.equal(check.ok, false);
+  assert.equal((check.reconciliations ?? []).length, 0);
 });

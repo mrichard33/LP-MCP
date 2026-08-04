@@ -2,11 +2,12 @@
 // src/jobs/lp-report-parse-a.js
 //
 // Input: pdftotext -layout output of LP's scheduled "Jobs by Milestone Date"
-// PDF (milestone=Ordered, mode=Actual — the original spec said RTP; the real
-// scheduled run declares 'Ordered'). Output: detail rows (NET dollars by
+// PDF (milestone=RTP, mode=Actual — the LP schedule was briefly misconfigured
+// to 'Ordered' on 2026-08-04, since corrected; the expected milestone is an
+// ingest-supplied option, default RTP). Output: detail rows (NET dollars by
 // milestone date — the scorecard's Net Sales feed) plus everything needed to
-// validate the file closed. Rows keep the rtp_date field name (schema
-// compatibility); it holds the milestone ('Ordered') date column.
+// validate the file closed. Rows keep the rtp_date field name; it holds the
+// milestone date column.
 //
 // LINE CLASSIFIER (structure the report prints, in order):
 //   detail       leading numeric Job Number
@@ -58,9 +59,12 @@ const money = (tok) => parseMoneyCents(tok);
 /** All strict money tokens on a line, as cents, with their character offsets. */
 function moneyTokens(line) {
   const out = [];
-  for (const m of line.matchAll(MONEY_RE)) out.push({ cents: money(m[0]), at: m.index });
+  for (const m of line.matchAll(MONEY_RE)) out.push({ cents: money(m[0]), at: m.index, text: m[0] });
   return out;
 }
+
+/** Did this money token render an explicit decimal ('1,234.56' / '15,000.00')? */
+const hasRenderedCents = (tok) => /\.\d{1,2}\)?$/.test(String(tok).trim());
 
 /**
  * Cell-wise money for subtotal/total lines: split on -layout's 2+-space
@@ -69,13 +73,17 @@ function moneyTokens(line) {
  * cells of '1' and '200' (paid column, whole dollars), which strict matching
  * silently dropped, taking two reps' double-count ties with it. All-cells-
  * money keeps the classification safe: any prose on the line disqualifies it.
- * @returns {number[]|null} cents per cell, or null if any cell is not money
+ * `rendersCents` records whether ANY cell printed explicit decimals — the
+ * display_rounding allowance applies only to whole-dollar RENDERINGS, and
+ * '15,000.00' is not one ('15,000' is).
+ * @returns {{cents:number[], rendersCents:boolean}|null} null if any cell is not money
  */
 function allMoneyCells(segment) {
   const cells = segment.trim().split(/\s{2,}/).filter(Boolean);
   if (!cells.length) return null;
   const cents = cells.map((c) => parseMoneyCents(c));
-  return cents.every((c) => c != null) ? cents : null;
+  if (!cents.every((c) => c != null)) return null;
+  return { cents, rendersCents: cells.some(hasRenderedCents) };
 }
 
 function isRepHeader(line) {
@@ -151,9 +159,9 @@ export function parseJobsByMilestone(text) {
   const lines = String(text ?? '').split('\n');
 
   const rows = [];
-  const repSubtotals = [];   // { rep, cents: number[] } in printed order
+  const repSubtotals = [];   // { rep, cents: number[], rendersCents } in printed order
   const headerLines = [];    // everything before the first detail line
-  let footer = { recordCount: null, totalCents: null };
+  let footer = { recordCount: null, totalCents: null, rendersCents: false };
   let currentRep = null;
   let sawDetail = false;
   let reportGeneratedAt = null;
@@ -173,14 +181,14 @@ export function parseJobsByMilestone(text) {
       // Money cells sit right of the record count — cell-wise, so no-cents
       // grand totals (bare integers) parse. Slicing past recMatch keeps the
       // record count itself out of the money run.
-      const cents = allMoneyCells(line.slice(recMatch.index + recMatch[0].length));
-      if (cents?.length) footer.totalCents = cents;
+      const cells = allMoneyCells(line.slice(recMatch.index + recMatch[0].length));
+      if (cells?.cents.length) { footer.totalCents = cells.cents; footer.rendersCents = cells.rendersCents; }
       continue;
     }
     const totalsMatch = line.match(/^\s*(grand\s+)?totals?\b\s*:?/i);
     if (totalsMatch) {
-      const cents = allMoneyCells(line.slice(totalsMatch[0].length));
-      if (cents?.length) footer.totalCents = cents;
+      const cells = allMoneyCells(line.slice(totalsMatch[0].length));
+      if (cells?.cents.length) { footer.totalCents = cells.cents; footer.rendersCents = cells.rendersCents; }
       continue;
     }
 
@@ -197,6 +205,7 @@ export function parseJobsByMilestone(text) {
       let monies = null;
       let product = null;
       let firstMoneyAt = null;
+      let rowRendersCents = false;
       if (branchMatch) {
         const afterStart = branchMatch.index + branchMatch[0].length;
         const cells = [];
@@ -213,6 +222,7 @@ export function parseJobsByMilestone(text) {
           monies = run.map((c) => parseMoneyCents(c.text));
           firstMoneyAt = run[0].at;
           product = cells.slice(0, firstMoneyIdx).map((c) => c.text).join(' ').trim() || null;
+          rowRendersCents = run.some((c) => hasRenderedCents(c.text));
         }
       } else {
         // Branchless row (quarantined upstream) — strict tokens only.
@@ -220,6 +230,7 @@ export function parseJobsByMilestone(text) {
         if (toks.length >= 2) {
           monies = toks.map((t) => t.cents);
           firstMoneyAt = toks[0].at;
+          rowRendersCents = toks.some((t) => hasRenderedCents(t.text));
         }
       }
 
@@ -244,6 +255,7 @@ export function parseJobsByMilestone(text) {
           branch_code_raw: branchMatch ? branchMatch[0] : null,
           product,
           _monies: monies, // assigned to fields once the column order is derived
+          _renders_cents: rowRendersCents, // transient: display_rounding gate input
           sales_rep: currentRep,
         });
         lastDetailRow = rows[rows.length - 1];
@@ -254,9 +266,9 @@ export function parseJobsByMilestone(text) {
     // All-money-cells line = the current rep's printed subtotal. Cell-wise
     // (not MONEY_RE) because subtotal cells can be bare integers — '1',
     // '200' in the first production PDF.
-    const subCents = allMoneyCells(line);
-    if (subCents && subCents.length >= 2) {
-      repSubtotals.push({ rep: currentRep, cents: subCents });
+    const subCells = allMoneyCells(line);
+    if (subCells && subCells.cents.length >= 2) {
+      repSubtotals.push({ rep: currentRep, cents: subCells.cents, rendersCents: subCells.rendersCents });
       lastDetailRow = null;
       continue;
     }
@@ -313,16 +325,22 @@ export function parseJobsByMilestone(text) {
     periodEnd ??= headerDates[headerDates.length - 1] ?? null;
   }
 
-  // Declared milestone — the real scheduled run prints
-  // "For Jobs with the Milestone 'Ordered'" (first production PDF,
-  // 2026-08-04; the original spec assumed RTP).
+  // Declared milestone — "For Jobs with the Milestone 'RTP'". Content-matched
+  // anywhere in the header block: optional lines (e.g. 'All Sales') and
+  // reordering never shift it.
   const milestoneMatch = headerText.match(/Milestone\s+'([^']+)'/i);
+  // Declared mode — anchored to the 'Mode:' label. The old unanchored
+  // /\bActual\b/ would have passed a Projected run whose header merely
+  // contained the word 'Actual' somewhere.
+  const modeMatch = headerText.match(/Mode:\s*([A-Za-z]+)/i);
+  const mode = modeMatch ? modeMatch[1] : null;
 
   return {
     header: {
       text: headerText,
       milestone: milestoneMatch ? milestoneMatch[1] : null,
-      declaresActual: /\bActual\b/i.test(headerText),
+      mode,
+      declaresActual: mode != null && mode.toLowerCase() === 'actual',
       periodStart,
       periodEnd,
       moneyColumnOrder,
@@ -336,31 +354,78 @@ export function parseJobsByMilestone(text) {
 
 const DEFAULT_ORDER = ['gross', 'net', 'paid', 'balance'];
 
+/** True when every value in the list is whole-dollar cents (n × 100). */
+const allWholeDollar = (centsList) => centsList.every((c) => c == null || c % 100 === 0);
+
 /**
  * Validation gates — ALL must pass or the file writes nothing (fail-closed).
  * Every violation carries both sides so the ingest log answers "what broke"
  * without re-opening the PDF. Subtotal/footer ties compare column-by-column
  * in the PRINTED (derived) order — printed totals sum printed columns.
- * @returns {{ ok:boolean, violations:Array<{rule:string, detail:object}> }}
+ *
+ * `reconciliations` records every tolerance the validator granted — today
+ * only class 'display_rounding': LP renders whole dollars in this PDF but
+ * computes subtotals from unrounded values, so Σ(displayed rows) can differ
+ * from a printed subtotal by design (id=4, 2026-08-04: exactly $1.00). The
+ * allowance applies ONLY when every cell involved is whole-dollar, is capped
+ * at $1 × rows-in-group, and is logged on every invocation — beyond the cap,
+ * or with any cents-bearing cell present, the tie fails closed exactly as
+ * before. Never widen the general tolerance instead.
+ *
+ * opts:
+ *   expectedMilestone  declared milestone required (default 'RTP')
+ *   expectedPeriod     { start, end } ISO dates the header must declare —
+ *                      used by the backfill route so a mislabeled month can
+ *                      never land under the wrong period (rule wrong_period)
+ * @returns {{ ok:boolean, violations:Array<{rule:string, detail:object}>,
+ *             reconciliations:Array<{class:string, scope:string, detail:object}> }}
  */
 export function validateJobsByMilestone(parsed, opts = {}) {
   const v = [];
+  const recon = [];
   const { header, rows, repSubtotals, footer } = parsed;
   const order = header.moneyColumnOrder ?? DEFAULT_ORDER;
-  const expectedMilestone = opts.expectedMilestone ?? 'Ordered';
+  const expectedMilestone = opts.expectedMilestone ?? 'RTP';
 
   // 1. Wrong report parameters — a Projected run or a different milestone
-  //    would parse cleanly and lie. The production schedule runs milestone
-  //    'Ordered' + Mode 'Actual' (verified against the first production PDF,
-  //    2026-08-04 — the original spec assumed RTP, which would have rejected
-  //    every real file). Reject anything else.
+  //    would parse cleanly and lie. The schedule must run milestone 'RTP' +
+  //    Mode 'Actual' (the expected milestone is caller-overridable). On
+  //    failure, log EVERY sub-check's result — a truncated header alone cost
+  //    a debugging round on 2026-08-04.
   const milestoneOk = header.milestone != null
     && header.milestone.toLowerCase() === String(expectedMilestone).toLowerCase();
-  if (!milestoneOk || !header.declaresActual) {
-    v.push({ rule: 'wrong_report_parameters', detail: { milestone: header.milestone, expected_milestone: expectedMilestone, declaresActual: header.declaresActual, header: header.text.slice(0, 500) } });
+  const modeOk = header.declaresActual === true;
+  if (!milestoneOk || !modeOk) {
+    v.push({
+      rule: 'wrong_report_parameters',
+      detail: {
+        milestone: header.milestone,
+        expected_milestone: expectedMilestone,
+        milestone_ok: milestoneOk,
+        mode: header.mode ?? null,
+        expected_mode: 'Actual',
+        mode_ok: modeOk,
+        declaresActual: header.declaresActual,
+        header: header.text.slice(0, 500),
+      },
+    });
   }
   if (!header.periodStart || !header.periodEnd) {
     v.push({ rule: 'missing_period', detail: { periodStart: header.periodStart, periodEnd: header.periodEnd } });
+  }
+  // 1a. Declared period must match the caller's expectation (backfill: the
+  //     admin says which month this file is; a wrong file must not land).
+  if (opts.expectedPeriod && header.periodStart && header.periodEnd) {
+    const { start, end } = opts.expectedPeriod;
+    if ((start && header.periodStart !== start) || (end && header.periodEnd !== end)) {
+      v.push({
+        rule: 'wrong_period',
+        detail: {
+          declared_start: header.periodStart, declared_end: header.periodEnd,
+          expected_start: start ?? null, expected_end: end ?? null,
+        },
+      });
+    }
   }
 
   // 1b. Unrecognized money-column header — assigning by guess could transpose
@@ -378,21 +443,42 @@ export function validateJobsByMilestone(parsed, opts = {}) {
   // 2. Rep subtotal tie — EXACT cents, column-by-column (printed order) for
   //    as many columns as the subtotal prints. The double-count guard: any
   //    detail/subtotal misclassification breaks at least one rep's tie.
+  //    Sole exception: the bounded display_rounding allowance (header note).
   const byRep = new Map();
+  const rowsByRep = new Map();
   for (const r of rows) {
     const key = r.sales_rep ?? '';
     const acc = byRep.get(key) || order.map(() => 0);
     order.forEach((f, i) => { acc[i] += r[`${f}_cents`] ?? 0; });
     byRep.set(key, acc);
+    rowsByRep.set(key, (rowsByRep.get(key) || []).concat(r));
   }
   const subtotalReps = new Set();
   for (const sub of repSubtotals) {
-    subtotalReps.add(sub.rep ?? '');
-    const acc = byRep.get(sub.rep ?? '') || order.map(() => 0);
+    const key = sub.rep ?? '';
+    subtotalReps.add(key);
+    const acc = byRep.get(key) || order.map(() => 0);
+    const groupRows = rowsByRep.get(key) || [];
     sub.cents.forEach((printed, i) => {
-      if (i < order.length && printed !== acc[i]) {
-        v.push({ rule: 'rep_subtotal_mismatch', detail: { rep: sub.rep, column: i, column_field: order[i], printed_cents: printed, computed_cents: acc[i] } });
+      if (i >= order.length || printed === acc[i]) return;
+      const field = order[i];
+      const delta = Math.abs(printed - acc[i]);
+      const capCents = 100 * groupRows.length;
+      // Whole-dollar RENDERING, not whole-dollar values: '15,000.00' printed
+      // cents and must tie exactly; '15,000' did not and may drift ≤$1/row.
+      const wholeDollarGroup = groupRows.length > 0
+        && !sub.rendersCents
+        && groupRows.every((r) => !r._renders_cents)
+        && printed % 100 === 0
+        && allWholeDollar(groupRows.map((r) => r[`${field}_cents`]));
+      if (wholeDollarGroup && delta <= capCents) {
+        recon.push({
+          class: 'display_rounding', scope: 'rep_subtotal',
+          detail: { rep: sub.rep, column: i, column_field: field, printed_cents: printed, computed_cents: acc[i], delta_cents: delta, cap_cents: capCents, group_rows: groupRows.length },
+        });
+        return;
       }
+      v.push({ rule: 'rep_subtotal_mismatch', detail: { rep: sub.rep, column: i, column_field: field, printed_cents: printed, computed_cents: acc[i], delta_cents: delta, cap_cents: capCents, whole_dollar_group: wholeDollarGroup } });
     });
   }
   // 2b. Every rep with detail rows must have a captured subtotal — a dropped
@@ -413,22 +499,38 @@ export function validateJobsByMilestone(parsed, opts = {}) {
   }
 
   // 4. Footer money tie — ±1¢ (LP's own rounding), matched column-wise in
-  //    printed order.
+  //    printed order, with the same bounded display_rounding allowance when
+  //    the whole report renders a column in whole dollars.
   if (footer.totalCents && footer.totalCents.length) {
     const sums = order.map(() => 0);
     for (const r of rows) {
       order.forEach((f, i) => { sums[i] += r[`${f}_cents`] ?? 0; });
     }
     footer.totalCents.forEach((printed, i) => {
-      if (i < order.length && Math.abs(printed - sums[i]) > 1) {
-        v.push({ rule: 'footer_total_mismatch', detail: { column: i, column_field: order[i], printed_cents: printed, computed_cents: sums[i] } });
+      if (i >= order.length) return;
+      const delta = Math.abs(printed - sums[i]);
+      if (delta <= 1) return;
+      const field = order[i];
+      const capCents = 100 * rows.length;
+      const wholeDollarColumn = rows.length > 0
+        && !footer.rendersCents
+        && rows.every((r) => !r._renders_cents)
+        && printed % 100 === 0
+        && allWholeDollar(rows.map((r) => r[`${field}_cents`]));
+      if (wholeDollarColumn && delta <= capCents) {
+        recon.push({
+          class: 'display_rounding', scope: 'footer_total',
+          detail: { column: i, column_field: field, printed_cents: printed, computed_cents: sums[i], delta_cents: delta, cap_cents: capCents, rows: rows.length },
+        });
+        return;
       }
+      v.push({ rule: 'footer_total_mismatch', detail: { column: i, column_field: field, printed_cents: printed, computed_cents: sums[i], delta_cents: delta, cap_cents: capCents, whole_dollar_column: wholeDollarColumn } });
     });
   } else {
     v.push({ rule: 'missing_footer_total', detail: { expected: 'grand total money line' } });
   }
 
-  return { ok: v.length === 0, violations: v };
+  return { ok: v.length === 0, violations: v, reconciliations: recon };
 }
 
 /** Per-market net roll-up (branch → market via the supplied map), in cents. */

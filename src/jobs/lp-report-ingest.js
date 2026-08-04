@@ -106,7 +106,7 @@ async function alertGroupMe(text) {
  * never throws for content problems (those are logged + returned), only
  * for infra failures the route maps to 5xx.
  */
-export async function ingestReportPdf({ reportType, buffer, source = 'n8n' }) {
+export async function ingestReportPdf({ reportType, buffer, source = 'n8n', expectedPeriod = null }) {
   const started = Date.now();
   if (!supabase) throw new Error('Supabase not configured');
   const sha = sha256Hex(buffer);
@@ -149,11 +149,18 @@ export async function ingestReportPdf({ reportType, buffer, source = 'n8n' }) {
     throw err;
   }
 
-  // 4-5. Parse + validate (pure).
+  // 4-5. Parse + validate (pure). Expected milestone is config, default RTP —
+  // the 2026-08-04 'Ordered' default was a regression against a briefly
+  // misconfigured LP schedule and rejected every correct file.
   const isA = reportType === 'jobs_by_milestone';
   const parsed = isA ? parseJobsByMilestone(text) : parseJobsByStatus(text);
   if (!isA) flagDuplicates(parsed.rows);
-  const { ok, violations } = isA ? validateJobsByMilestone(parsed) : validateJobsByStatus(parsed);
+  const { ok, violations, reconciliations } = isA
+    ? validateJobsByMilestone(parsed, {
+        expectedMilestone: (process.env.LP_REPORT_EXPECTED_MILESTONE || 'RTP').trim(),
+        expectedPeriod,
+      })
+    : validateJobsByStatus(parsed);
   if (!ok) {
     const reason = violations[0].rule;
     await quarantineRows(reportType, sha,
@@ -226,9 +233,14 @@ export async function ingestReportPdf({ reportType, buffer, source = 'n8n' }) {
     .rpc('scorecard_ingest_snapshot', { p_snapshot: snapshot, p_rows: rows });
   if (rpcErr) throw new Error(`ingest RPC failed: ${rpcErr.message}`);
 
-  await done('success', { snapshot_id: snapshotId });
-  console.log(`[LPReport] ${reportType} ingested: ${rows.length} rows, ${isA ? `net ${centsToDollars(netTotal)}` : `gross ${centsToDollars(grossTotal)}`}, snapshot ${snapshotId}`);
-  return { success: true, snapshot_id: snapshotId, rows: rows.length, sha256: sha };
+  // Granted tolerances (display_rounding) are logged on SUCCESS too — the
+  // allowance must stay visible on every invocation, never silent.
+  await done('success', {
+    snapshot_id: snapshotId,
+    detail: reconciliations?.length ? { reconciliations } : null,
+  });
+  console.log(`[LPReport] ${reportType} ingested: ${rows.length} rows, ${isA ? `net ${centsToDollars(netTotal)}` : `gross ${centsToDollars(grossTotal)}`}, snapshot ${snapshotId}${reconciliations?.length ? `, ${reconciliations.length} display_rounding reconciliation(s)` : ''}`);
+  return { success: true, snapshot_id: snapshotId, rows: rows.length, sha256: sha, reconciliations: reconciliations ?? [] };
 }
 
 function authorized(req) {
@@ -260,6 +272,67 @@ export function registerLpReportRoutes(app) {
       }
     });
   }
+
+  // Historical backfill — the identical pipeline (ingestReportPdf, shared
+  // validators) with a caller-declared expected period; a mismatched header
+  // fails with wrong_period. Bridges successful jobs_by_milestone snapshots
+  // into the lp_net_report_rtp month-freeze path. See lp-report-backfill.js.
+  for (const [slug, reportType] of Object.entries(REPORT_TYPES)) {
+    app.post(`/n8n/admin/lp-report-ingest/backfill/${slug}`, rawPdf, async (req, res) => {
+      try {
+        if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
+        if (!Buffer.isBuffer(req.body) || !req.body.length) {
+          return res.status(400).json({ success: false, error: 'POST the raw PDF bytes as the request body (Content-Type: application/pdf)' });
+        }
+        const { runReportBackfill } = await import('./lp-report-backfill.js');
+        const result = await runReportBackfill({
+          reportType,
+          buffer: req.body,
+          expectedStart: String(req.query.expected_start || '').trim(),
+          expectedEnd: String(req.query.expected_end || '').trim(),
+          source: String(req.query.source || 'backfill'),
+        });
+        res.json(result);
+      } catch (err) {
+        console.error(`[LPReport] ${slug} backfill error:`, err.message);
+        res.status(500).json({ success: false, error: err.message });
+      }
+    });
+  }
+
+  // n8n failure telemetry. The workflows POST here when the ingest call
+  // itself failed (transport error, timeout) or returned success:false —
+  // previously a 404 because /events/* only serves GHL contact events, which
+  // masked the real failure reason three debugging cycles in a row. Writes to
+  // scorecard_ingest_log (the table that already records ingest failures) and
+  // alerts GroupMe for transport-class failures LP-MCP never saw. ALWAYS 200
+  // on handled errors — a failure-reporting path must never fail its caller.
+  app.post('/events/lp_report_ingest_failed', express.json({ limit: '256kb' }), async (req, res) => {
+    try {
+      if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const slug = String(body.report || '').trim();
+      const reportType = REPORT_TYPES[slug] ?? slug ?? null;
+      const reason = String(body.failure_reason || 'unknown').slice(0, 120);
+      await logIngest({
+        report_type: reportType || 'unknown',
+        file_sha256: typeof body.sha256 === 'string' && body.sha256 ? body.sha256 : null,
+        status: 'failed',
+        failure_reason: `n8n_${reason}`.slice(0, 120),
+        detail: { ...body, source: 'n8n_telemetry' },
+        source: 'n8n_telemetry',
+      });
+      // LP-MCP already alerted for failures it saw itself; transport-class
+      // failures (no sha) are the ones only n8n knows about.
+      if (!body.sha256) {
+        await alertGroupMe(`⚠️ LP report ingest TRANSPORT failure (${body.workflow || 'n8n'} / ${slug || '?'}): ${reason}. The PDF never reached LP-MCP — check n8n execution history.`);
+      }
+      res.json({ success: true });
+    } catch (err) {
+      console.error('[LPReport] telemetry event error:', err.message);
+      res.json({ success: true, logged: false, error: err.message });
+    }
+  });
 
   app.get('/n8n/admin/lp-report-ingest/status', async (req, res) => {
     try {
@@ -322,5 +395,5 @@ export function registerLpReportRoutes(app) {
     }
   });
 
-  console.log('[LPReport] Routes registered: POST /n8n/admin/lp-report-ingest/{jobs-by-milestone|jobs-by-status} | GET /n8n/admin/lp-report-ingest/status | POST /n8n/admin/lp-report-facts-rebuild');
+  console.log('[LPReport] Routes registered: POST /n8n/admin/lp-report-ingest/{jobs-by-milestone|jobs-by-status} | POST /n8n/admin/lp-report-ingest/backfill/{…} | POST /events/lp_report_ingest_failed | GET /n8n/admin/lp-report-ingest/status | POST /n8n/admin/lp-report-facts-rebuild');
 }
