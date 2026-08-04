@@ -41,16 +41,20 @@ export function centsToDollars(cents) {
 }
 
 /**
- * Parse an LP report date ('M/D/YYYY' or 'MM/DD/YYYY') to ISO 'YYYY-MM-DD'.
+ * Parse an LP report date to ISO 'YYYY-MM-DD'. Detail rows print 2-digit
+ * years ('05/16/26' — verified against the first production PDF, 2026-08-04);
+ * header/footer lines print 4-digit. Two-digit years land in 2000–2069 —
+ * LP has no pre-2000 report data.
  * @returns {string|null}
  */
 export function parseDateMDY(raw) {
-  const m = String(raw ?? '').trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  const m = String(raw ?? '').trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{2}|\d{4})$/);
   if (!m) return null;
   const [, mo, d, y] = m;
   const mm = Number(mo), dd = Number(d);
   if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return null;
-  return `${y}-${String(mm).padStart(2, '0')}-${String(dd).padStart(2, '0')}`;
+  const yyyy = y.length === 4 ? y : String(Number(y) < 70 ? 2000 + Number(y) : 1900 + Number(y));
+  return `${yyyy}-${String(mm).padStart(2, '0')}-${String(dd).padStart(2, '0')}`;
 }
 
 const MONTH_NAMES = {

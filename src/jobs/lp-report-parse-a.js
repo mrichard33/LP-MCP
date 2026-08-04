@@ -2,9 +2,11 @@
 // src/jobs/lp-report-parse-a.js
 //
 // Input: pdftotext -layout output of LP's scheduled "Jobs by Milestone Date"
-// PDF (milestone=RTP, mode=Actual). Output: detail rows (NET dollars by RTP
-// date — the scorecard's Net Sales feed) plus everything needed to validate
-// the file closed.
+// PDF (milestone=Ordered, mode=Actual — the original spec said RTP; the real
+// scheduled run declares 'Ordered'). Output: detail rows (NET dollars by
+// milestone date — the scorecard's Net Sales feed) plus everything needed to
+// validate the file closed. Rows keep the rtp_date field name (schema
+// compatibility); it holds the milestone ('Ordered') date column.
 //
 // LINE CLASSIFIER (structure the report prints, in order):
 //   detail       leading numeric Job Number
@@ -37,7 +39,9 @@ import { parseMoneyCents, parseDateMDY, parseDateAny } from './lp-report-common.
 // street number or ZIP. Detail-row money is parsed cell-wise right of the
 // branch column instead (see below), so no-cents renderings still land.
 const MONEY_RE = /(?<![\d,.])\(?\$?(?:\d{1,3}(?:,\d{3})+(?:\.\d{2})?|\d+\.\d{2})\)?(?!\d)/g;
-const DATE_RE = /\d{1,2}\/\d{1,2}\/\d{4}/g;
+// Detail rows print 2-digit years ('05/16/26'), header/footer 4-digit —
+// both verified against the first production PDF (2026-08-04).
+const DATE_RE = /\d{1,2}\/\d{1,2}\/\d{2,4}/g;
 const LONG_DATE_RE = /(?:[A-Za-z]+,\s*)?(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s*\d{4}/g;
 // Printed run timestamp ('8/4/2026 6:00:12 AM' etc.) — best-effort, non-gating.
 const PRINTED_AT_RE = /(\d{1,2}\/\d{1,2}\/\d{4})[ ,]+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?/i;
@@ -56,6 +60,22 @@ function moneyTokens(line) {
   const out = [];
   for (const m of line.matchAll(MONEY_RE)) out.push({ cents: money(m[0]), at: m.index });
   return out;
+}
+
+/**
+ * Cell-wise money for subtotal/total lines: split on -layout's 2+-space
+ * column gaps and require EVERY cell to parse as money. Unlike MONEY_RE this
+ * accepts bare small integers — the first production PDF printed subtotal
+ * cells of '1' and '200' (paid column, whole dollars), which strict matching
+ * silently dropped, taking two reps' double-count ties with it. All-cells-
+ * money keeps the classification safe: any prose on the line disqualifies it.
+ * @returns {number[]|null} cents per cell, or null if any cell is not money
+ */
+function allMoneyCells(segment) {
+  const cells = segment.trim().split(/\s{2,}/).filter(Boolean);
+  if (!cells.length) return null;
+  const cents = cells.map((c) => parseMoneyCents(c));
+  return cents.every((c) => c != null) ? cents : null;
 }
 
 function isRepHeader(line) {
@@ -137,6 +157,7 @@ export function parseJobsByMilestone(text) {
   let currentRep = null;
   let sawDetail = false;
   let reportGeneratedAt = null;
+  let lastDetailRow = null; // wrapped-name continuation target
 
   for (const line of lines) {
     if (!line.trim()) continue;
@@ -149,13 +170,17 @@ export function parseJobsByMilestone(text) {
     const recMatch = line.match(/Total\s*#?\s*Records\s*:?\s*([\d,]+)/i);
     if (recMatch) {
       footer.recordCount = Number(recMatch[1].replace(/,/g, ''));
-      const toks = moneyTokens(line);
-      if (toks.length) footer.totalCents = toks.map((t) => t.cents);
+      // Money cells sit right of the record count — cell-wise, so no-cents
+      // grand totals (bare integers) parse. Slicing past recMatch keeps the
+      // record count itself out of the money run.
+      const cents = allMoneyCells(line.slice(recMatch.index + recMatch[0].length));
+      if (cents?.length) footer.totalCents = cents;
       continue;
     }
-    if (/^\s*(grand\s+)?totals?\b/i.test(line)) {
-      const toks = moneyTokens(line);
-      if (toks.length) footer.totalCents = toks.map((t) => t.cents);
+    const totalsMatch = line.match(/^\s*(grand\s+)?totals?\b\s*:?/i);
+    if (totalsMatch) {
+      const cents = allMoneyCells(line.slice(totalsMatch[0].length));
+      if (cents?.length) footer.totalCents = cents;
       continue;
     }
 
@@ -221,19 +246,31 @@ export function parseJobsByMilestone(text) {
           _monies: monies, // assigned to fields once the column order is derived
           sales_rep: currentRep,
         });
+        lastDetailRow = rows[rows.length - 1];
         continue;
       }
     }
 
-    // Money-tokens-only line = the current rep's printed subtotal.
-    const stripped = line.replace(MONEY_RE, '').trim();
-    const toks = moneyTokens(line);
-    if (toks.length && (stripped === '' || /^totals?:?$/i.test(stripped))) {
-      repSubtotals.push({ rep: currentRep, cents: toks.map((t) => t.cents) });
+    // All-money-cells line = the current rep's printed subtotal. Cell-wise
+    // (not MONEY_RE) because subtotal cells can be bare integers — '1',
+    // '200' in the first production PDF.
+    const subCents = allMoneyCells(line);
+    if (subCents && subCents.length >= 2) {
+      repSubtotals.push({ rep: currentRep, cents: subCents });
+      lastDetailRow = null;
       continue;
     }
 
-    if (isRepHeader(line)) { currentRep = line.trim(); continue; }
+    if (isRepHeader(line)) {
+      // A letters-only line right after a detail row, indented off the left
+      // margin, is a WRAPPED customer name ('Hernandez/Hodzic, Jay &' /
+      // '   Raisa'), not a rep header — rep group headers print flush-left.
+      if (/^\s/.test(line) && lastDetailRow) {
+        lastDetailRow.customer_name = [lastDetailRow.customer_name, line.trim()].filter(Boolean).join(' ');
+        continue;
+      }
+      if (/^\S/.test(line)) { currentRep = line.trim(); lastDetailRow = null; continue; }
+    }
     if (!sawDetail) headerLines.push(line.trim());
   }
 
@@ -276,10 +313,15 @@ export function parseJobsByMilestone(text) {
     periodEnd ??= headerDates[headerDates.length - 1] ?? null;
   }
 
+  // Declared milestone — the real scheduled run prints
+  // "For Jobs with the Milestone 'Ordered'" (first production PDF,
+  // 2026-08-04; the original spec assumed RTP).
+  const milestoneMatch = headerText.match(/Milestone\s+'([^']+)'/i);
+
   return {
     header: {
       text: headerText,
-      declaresRtp: /\bRTP\b/i.test(headerText),
+      milestone: milestoneMatch ? milestoneMatch[1] : null,
       declaresActual: /\bActual\b/i.test(headerText),
       periodStart,
       periodEnd,
@@ -301,15 +343,21 @@ const DEFAULT_ORDER = ['gross', 'net', 'paid', 'balance'];
  * in the PRINTED (derived) order — printed totals sum printed columns.
  * @returns {{ ok:boolean, violations:Array<{rule:string, detail:object}> }}
  */
-export function validateJobsByMilestone(parsed) {
+export function validateJobsByMilestone(parsed, opts = {}) {
   const v = [];
   const { header, rows, repSubtotals, footer } = parsed;
   const order = header.moneyColumnOrder ?? DEFAULT_ORDER;
+  const expectedMilestone = opts.expectedMilestone ?? 'Ordered';
 
-  // 1. Wrong report parameters — a Projected run or a non-RTP milestone would
-  //    parse cleanly and lie. Reject unless the header declares RTP + Actual.
-  if (!header.declaresRtp || !header.declaresActual) {
-    v.push({ rule: 'wrong_report_parameters', detail: { declaresRtp: header.declaresRtp, declaresActual: header.declaresActual, header: header.text.slice(0, 500) } });
+  // 1. Wrong report parameters — a Projected run or a different milestone
+  //    would parse cleanly and lie. The production schedule runs milestone
+  //    'Ordered' + Mode 'Actual' (verified against the first production PDF,
+  //    2026-08-04 — the original spec assumed RTP, which would have rejected
+  //    every real file). Reject anything else.
+  const milestoneOk = header.milestone != null
+    && header.milestone.toLowerCase() === String(expectedMilestone).toLowerCase();
+  if (!milestoneOk || !header.declaresActual) {
+    v.push({ rule: 'wrong_report_parameters', detail: { milestone: header.milestone, expected_milestone: expectedMilestone, declaresActual: header.declaresActual, header: header.text.slice(0, 500) } });
   }
   if (!header.periodStart || !header.periodEnd) {
     v.push({ rule: 'missing_period', detail: { periodStart: header.periodStart, periodEnd: header.periodEnd } });
@@ -337,13 +385,24 @@ export function validateJobsByMilestone(parsed) {
     order.forEach((f, i) => { acc[i] += r[`${f}_cents`] ?? 0; });
     byRep.set(key, acc);
   }
+  const subtotalReps = new Set();
   for (const sub of repSubtotals) {
+    subtotalReps.add(sub.rep ?? '');
     const acc = byRep.get(sub.rep ?? '') || order.map(() => 0);
     sub.cents.forEach((printed, i) => {
       if (i < order.length && printed !== acc[i]) {
         v.push({ rule: 'rep_subtotal_mismatch', detail: { rep: sub.rep, column: i, column_field: order[i], printed_cents: printed, computed_cents: acc[i] } });
       }
     });
+  }
+  // 2b. Every rep with detail rows must have a captured subtotal — a dropped
+  //     subtotal line (misclassified or unparsed) is a hole in the
+  //     double-count guard, not a pass. Caught live on the first production
+  //     PDF, where strict money matching dropped two reps' subtotals.
+  for (const rep of byRep.keys()) {
+    if (!subtotalReps.has(rep)) {
+      v.push({ rule: 'rep_subtotal_missing', detail: { rep, rows: rows.filter((r) => (r.sales_rep ?? '') === rep).length } });
+    }
   }
 
   // 3. Footer record count — exact.

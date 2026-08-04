@@ -1,5 +1,5 @@
 /**
- * Guards for src/jobs/lp-report-parse-a.js — "Jobs by Milestone Date" (RTP/Actual).
+ * Guards for src/jobs/lp-report-parse-a.js — "Jobs by Milestone Date" (Ordered/Actual).
  *
  * Invariants under guard:
  *   • Money-column order is DERIVED from the printed column header (the first
@@ -15,7 +15,7 @@
  *   • A misclassified line (subtotal counted as detail, detail counted
  *     twice) breaks a validation gate — the file can NEVER pass while a
  *     row leaked.
- *   • Truncated files (no footer) and wrong-parameter runs (not RTP/Actual)
+ *   • Truncated files (no footer) and wrong-parameter runs (not Ordered/Actual)
  *     are rejected, not partially ingested.
  *   • Branch → market roll-up follows lp_branch_market_map (BOCA→FTLAU_MKT).
  *
@@ -44,7 +44,7 @@ const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), 'fixtures/lp-repor
 // branch column labelled 'Mkt', money printed Net | Gross | Paid | Balance.
 const SYNTHETIC = `Reece Windows & Doors
 Jobs By Milestone Date
-For Jobs with the Milestone 'RTP'
+For Jobs with the Milestone 'Ordered'
 from Wednesday, July 1, 2026 through Friday, July 31, 2026
 Sort By: Sales Rep
 Mode: Actual
@@ -133,7 +133,7 @@ test('M/D/YYYY period line (From:/To:) also parses', () => {
 test('money printed without cents parses to exact cents and all ties pass', () => {
   const noCents = `Reece Windows & Doors
 Jobs By Milestone Date
-For Jobs with the Milestone 'RTP'
+For Jobs with the Milestone 'Ordered'
 from Wednesday, July 1, 2026 through Friday, July 31, 2026
 Mode: Actual
 Job                                          Contract                      Net    Total    Total   Balance
@@ -198,21 +198,23 @@ test('truncated file (footer gone) is rejected', () => {
   assert.equal(check.ok, false);
 });
 
-test("wrong parameters (milestone 'Ordered', as production actually sent) are rejected", () => {
-  // The real misconfigured run relabels the milestone-date column too.
-  const ordered = SYNTHETIC
-    .replace("For Jobs with the Milestone 'RTP'", "For Jobs with the Milestone 'Ordered'")
-    .replace('Date       RTP    Mkt', 'Date   Ordered    Mkt');
-  const check = validateJobsByMilestone(parseJobsByMilestone(ordered));
+test("wrong parameters (milestone 'RTP' — the spec assumption, not the production feed) are rejected", () => {
+  const rtp = SYNTHETIC
+    .replace("For Jobs with the Milestone 'Ordered'", "For Jobs with the Milestone 'RTP'");
+  const check = validateJobsByMilestone(parseJobsByMilestone(rtp));
   const hit = check.violations.find((v) => v.rule === 'wrong_report_parameters');
   assert.ok(hit, 'expected wrong_report_parameters');
-  assert.equal(hit.detail.declaresRtp, false);
+  assert.equal(hit.detail.milestone, 'RTP');
+  assert.equal(hit.detail.expected_milestone, 'Ordered');
   assert.equal(check.ok, false);
+
+  // …but an explicit expectedMilestone override accepts it.
+  assert.equal(validateJobsByMilestone(parseJobsByMilestone(rtp), { expectedMilestone: 'RTP' }).ok, true);
 });
 
 test('wrong parameters (Projected, no Actual) are rejected', () => {
   const projected = SYNTHETIC
-    .replace("For Jobs with the Milestone 'RTP'", "For Jobs with the Milestone 'Install'")
+    .replace("For Jobs with the Milestone 'Ordered'", "For Jobs with the Milestone 'Install'")
     .replace('Mode: Actual', 'Mode: Projected');
   const check = validateJobsByMilestone(parseJobsByMilestone(projected));
   assert.ok(check.violations.map((v) => v.rule).includes('wrong_report_parameters'));
@@ -265,4 +267,113 @@ test('golden: July 2026 fixture ties to the report footer (skipped until fixture
   assert.equal(byMarket.get('ORL_MKT'), 115842400);   // Orlando 1,158,424.00
   assert.equal(byMarket.get('FTLAU_MKT'), 13531708);  // Fort Lauderdale roll-up 135,317.08
   assert.ok(!byMarket.has('UNMAPPED'), 'no branch may fall out of the market map');
+});
+
+// ── Real production layout (2026-08-04), sanitized ──────────────────────────
+// Structurally byte-faithful to the first real scheduled PDF (pdftotext
+// -layout): 2-digit detail years, no-cents money, bare-integer subtotal
+// cells ('1', '200'), a wrapped customer name on an indented continuation
+// line, per-rep groups, and the real footer/timestamp lines. Names and
+// addresses are fake; every number and column offset quirk is real.
+const REAL_LAYOUT = `                                                                Jobs By Milestone Date
+                                                                       For Jobs with the Milestone 'Ordered'
+                                                            from Monday, August 3, 2026 through Monday, August 3, 2026
+                                                                                Sort By: Sales Rep
+                                                                                      All Sales
+                                                                                   Mode: Actual
+
+
+
+Job                                                                                        Contract                                    Net    Total     Total    Balance
+Number    Customer Name                    Address                   City                    Date      Ordered    Mkt     Product   Amount    Gross      Paid        Due
+
+Rep, Alpha
+35978     Alpha , Linda/David              12808 Example Dr          Riverview              05/16/26   08/03/26   STPET   Win        21,000    21,000   10,500     10,500
+36479     BRAVO, LAWRENCE                  902 SAMPLE CT             SUN CITY CENTER        06/16/26   08/03/26   STPET   Win        21,500    21,500    2,000     19,500
+36788     Charlie, Edgar                   721 53rd Ave S            Saint Petersburg       07/09/26   08/03/26   STPET   Win        15,000    15,000       1      14,999
+36791     Delta, Rickey & Stacie           387 Sample Cir            Oldsmar                07/09/26   08/03/26   STPET   Win        26,000    26,000   13,000     13,000
+                                                                                                                                     83,500    83,500   25,501     57,999
+
+
+Rep, Bravo
+36369     Echo, Judith                     4805 Sample Rd            North Port             06/11/26   08/03/26   SAR     Win        34,832    34,832       1      34,831
+                                                                                                                                     34,832    34,832       1      34,831
+
+
+Rep, Charlie
+36222     Foxtrot, Wendell & Lorlan        22005 Sample Way          Land O Lakes           06/02/26   08/03/26   STPET   Door       15,550    15,550    7,775       7,775
+                                                                                                                                     15,550    15,550    7,775       7,775
+
+
+Rep, Delta
+36365     Golf, Mead                       8946 Sample Loop          Sarasota               06/09/26   08/03/26   SAR     Win        77,544    78,645   39,323     39,322
+                                                                                                                                     77,544    78,645   39,323     39,322
+
+
+Rep, Echo
+36887     Hotel, Luiz & Celia              5125 Sample Blvd          Tampa                  07/08/26   08/03/26   STPET   Win        23,588    23,588   11,794     11,794
+                                                                                                                                     23,588    23,588   11,794     11,794
+
+
+Rep, Foxtrot
+35562     India/Juliet, Jay &              3610 103rd ave n          Clearwater             04/22/26   08/03/26   STPET   Win        17,894    17,900     200      17,700
+          Raisa
+                                                                                                                                     17,894    17,900     200      17,700
+
+
+                 Total # Records:      9                                                                                            252,908   254,015   84,594    169,421
+
+
+8/4/2026 4:42:58 PM                                                                 Page 1 of 1                                                           User:Example User
+`;
+
+test('real production layout (2026-08-04, sanitized): every gate passes', () => {
+  const parsed = parseJobsByMilestone(REAL_LAYOUT);
+
+  assert.equal(parsed.header.milestone, 'Ordered');
+  assert.equal(parsed.header.declaresActual, true);
+  assert.deepEqual(parsed.header.moneyColumnOrder, ['net', 'gross', 'paid', 'balance']);
+  assert.equal(parsed.header.periodStart, '2026-08-03');
+  assert.equal(parsed.header.periodEnd, '2026-08-03');
+  assert.equal(parsed.header.reportGeneratedAt, '2026-08-04');
+
+  assert.equal(parsed.rows.length, 9);
+  assert.equal(parsed.repSubtotals.length, 6, 'all six rep subtotals captured, including bare-integer cells');
+  assert.equal(parsed.footer.recordCount, 9);
+  assert.deepEqual(parsed.footer.totalCents, [25290800, 25401500, 8459400, 16942100]);
+
+  // 2-digit years land in 2026, both date columns.
+  const r1 = parsed.rows[0];
+  assert.equal(r1.contract_date, '2026-05-16');
+  assert.equal(r1.rtp_date, '2026-08-03');
+  assert.equal(r1.net_cents, 2100000);
+  assert.equal(r1.sales_rep, 'Rep, Alpha');
+
+  // Bare-integer money in a detail row ('1' paid) parses as exact dollars.
+  const wilcox = parsed.rows.find((r) => r.job_number === '36788');
+  assert.equal(wilcox.paid_cents, 100);
+  assert.equal(wilcox.balance_cents, 1499900);
+
+  // Wrapped customer name: the indented continuation line joins the row
+  // above instead of being taken for a rep header.
+  const wrapped = parsed.rows.find((r) => r.job_number === '35562');
+  assert.equal(wrapped.customer_name, 'India/Juliet, Jay & Raisa');
+  assert.equal(wrapped.sales_rep, 'Rep, Foxtrot');
+
+  const check = validateJobsByMilestone(parsed);
+  assert.deepEqual(check.violations, []);
+  assert.equal(check.ok, true);
+});
+
+test('a dropped rep subtotal is a violation, not a silent hole in the guard', () => {
+  // Remove one rep subtotal line entirely — rep_subtotal_missing must fire.
+  const holed = REAL_LAYOUT.replace(
+    '                                                                                                                                     34,832    34,832       1      34,831\n\n\n',
+    '\n\n',
+  );
+  const check = validateJobsByMilestone(parseJobsByMilestone(holed));
+  const hit = check.violations.find((v) => v.rule === 'rep_subtotal_missing');
+  assert.ok(hit, `expected rep_subtotal_missing in ${check.violations.map((v) => v.rule)}`);
+  assert.equal(hit.detail.rep, 'Rep, Bravo');
+  assert.equal(check.ok, false);
 });
