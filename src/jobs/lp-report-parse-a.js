@@ -19,21 +19,28 @@
 //
 // PURE: no I/O, no env. The ingest orchestrator supplies text and consumes
 // { header, rows, repSubtotals, footer }. All money is CENTS (see
-// lp-report-common.parseMoneyCents). Column order on a detail line is
-//   Job# Customer Address City ContractDate RTPDate Branch Product
-//   Gross Net Paid Balance
-// Money/date/branch cells are matched by PATTERN, not position, so modest
-// layout drift shifts nothing — and when drift does break parsing, the
-// validators below catch it and the file is rejected (fail-closed), never
-// mis-ingested.
+// lp-report-common.parseMoneyCents).
+//
+// MONEY COLUMN ORDER IS DERIVED FROM THE PRINTED COLUMN HEADER, never
+// hardcoded. The first production PDF (2026-08-04) printed
+//   Net Amount | Total Gross | Total Paid | Balance Due
+// while the original spec assumed Gross | Net | Paid | Balance — a hardcoded
+// order would have silently transposed net and gross (and every tie would
+// still pass, because subtotals sum the same printed columns). If the header
+// cannot be recognized, validation fails with money_columns_unrecognized:
+// layout drift stops the pipeline, it never guesses (fail-closed).
 
-import { parseMoneyCents, parseDateMDY } from './lp-report-common.js';
+import { parseMoneyCents, parseDateMDY, parseDateAny } from './lp-report-common.js';
 
-// Money cells on Report A always carry cents ('1,158,424.00') — requiring the
-// decimal point keeps street numbers and ZIPs from ever matching, and the
-// digit lookarounds keep a match from starting mid-number ('1234.56' → '234.56').
-const MONEY_RE = /(?<![\d,.])\(?\$?\d{1,3}(?:,\d{3})*\.\d{2}\)?(?!\d)/g;
+// Strict money (comma-grouped or explicit cents) — used on subtotal/footer
+// lines and as the branchless fallback, where a bare integer could be a
+// street number or ZIP. Detail-row money is parsed cell-wise right of the
+// branch column instead (see below), so no-cents renderings still land.
+const MONEY_RE = /(?<![\d,.])\(?\$?(?:\d{1,3}(?:,\d{3})+(?:\.\d{2})?|\d+\.\d{2})\)?(?!\d)/g;
 const DATE_RE = /\d{1,2}\/\d{1,2}\/\d{4}/g;
+const LONG_DATE_RE = /(?:[A-Za-z]+,\s*)?(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s*\d{4}/g;
+// Printed run timestamp ('8/4/2026 6:00:12 AM' etc.) — best-effort, non-gating.
+const PRINTED_AT_RE = /(\d{1,2}\/\d{1,2}\/\d{4})[ ,]+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?/i;
 
 // Verbatim LP branch codes (lp_branch_market_map.brn_id). RFED included even
 // though it rarely reports — a code missing here would swallow that branch's
@@ -44,7 +51,7 @@ const BRANCH_RE = new RegExp(`\\b(${BRANCH_CODES.join('|')})\\b`);
 
 const money = (tok) => parseMoneyCents(tok);
 
-/** All money tokens on a line, as cents, with their character offsets. */
+/** All strict money tokens on a line, as cents, with their character offsets. */
 function moneyTokens(line) {
   const out = [];
   for (const m of line.matchAll(MONEY_RE)) out.push({ cents: money(m[0]), at: m.index });
@@ -56,8 +63,63 @@ function isRepHeader(line) {
   if (!t || /\d/.test(t)) return false;
   if (!/^[A-Za-z][A-Za-z.,'\- ]*$/.test(t)) return false;
   // Column/page headers are letters-only too — exclude by vocabulary.
-  if (/\b(total|customer|address|city|branch|product|gross|net|paid|balance|milestone|page|records|job|date|report)\b/i.test(t)) return false;
+  if (/\b(total|customer|address|city|branch|mkt|product|gross|net|paid|balance|amount|due|milestone|page|records|job|date|report|number)\b/i.test(t)) return false;
   return true;
+}
+
+// ── money-column order, derived from the printed column header ──────────────
+const COL_VOCAB = new Set(['net', 'gross', 'paid', 'balance', 'total', 'amount', 'due']);
+
+/** Trailing run of column-vocabulary words at the end of a line ('mkt product amount gross paid due' → ['amount','gross','paid','due']). */
+function trailingVocabRun(line) {
+  const words = String(line).trim().split(/\s+/);
+  const run = [];
+  for (let i = words.length - 1; i >= 0; i--) {
+    const w = words[i].toLowerCase().replace(/[^a-z]/g, '');
+    if (!COL_VOCAB.has(w)) break;
+    run.unshift(w);
+  }
+  return run;
+}
+
+function labelToField(words) {
+  const s = new Set(words);
+  if (s.has('gross')) return 'gross';
+  if (s.has('net')) return 'net';
+  if (s.has('paid')) return 'paid';
+  if (s.has('balance') || s.has('due')) return 'balance';
+  return null;
+}
+
+/**
+ * Derive the printed money-column order from the header block.
+ * Recognizes the two-line compound header LP actually prints
+ *   …  Net    Total    Total   Balance
+ *   …  Amount  Gross    Paid     Due
+ * (labels paired positionally — -layout preserves left-to-right order even
+ * when absolute offsets drift) and the flat single-line form
+ *   …  Gross  Net  Paid  Balance
+ * Returns exactly-4 distinct fields (e.g. ['net','gross','paid','balance'])
+ * or null — null fails validation, it never falls back to a guess.
+ * @returns {string[]|null}
+ */
+export function deriveMoneyColumnOrder(headerLines) {
+  for (let i = 0; i + 1 < headerLines.length; i++) {
+    const top = trailingVocabRun(headerLines[i]);
+    const bot = trailingVocabRun(headerLines[i + 1]);
+    if (top.length === 4 && bot.length === 4) {
+      const fields = top.map((t, k) => labelToField([t, bot[k]]));
+      if (!fields.includes(null) && new Set(fields).size === 4) return fields;
+    }
+  }
+  for (const line of headerLines) {
+    const run = trailingVocabRun(line);
+    if (run.length === 4) {
+      const fields = run.map((w) => labelToField([w]));
+      if (!fields.includes(null) && new Set(fields).size === 4) return fields;
+    }
+  }
+  return null;
 }
 
 /**
@@ -74,9 +136,15 @@ export function parseJobsByMilestone(text) {
   let footer = { recordCount: null, totalCents: null };
   let currentRep = null;
   let sawDetail = false;
+  let reportGeneratedAt = null;
 
   for (const line of lines) {
     if (!line.trim()) continue;
+
+    if (!reportGeneratedAt) {
+      const printed = line.match(PRINTED_AT_RE);
+      if (printed) reportGeneratedAt = parseDateMDY(printed[1]);
+    }
 
     const recMatch = line.match(/Total\s*#?\s*Records\s*:?\s*([\d,]+)/i);
     if (recMatch) {
@@ -92,43 +160,69 @@ export function parseJobsByMilestone(text) {
     }
 
     const detail = line.match(/^\s*(\d{3,})\s+(.*)$/);
-    if (detail && moneyTokens(line).length >= 2) {
-      sawDetail = true;
+    if (detail) {
       const jobNumber = detail[1];
-      const dates = [...line.matchAll(DATE_RE)].map((m) => ({ iso: parseDateMDY(m[0]), at: m.index }));
-      const monies = moneyTokens(line);
       const branchMatch = line.match(BRANCH_RE);
 
-      // Text between the job number and the first date = Customer | Address | City
-      // (column gaps in -layout are 2+ spaces).
-      const preDateEnd = dates.length ? dates[0].at : (branchMatch ? branchMatch.index : monies[0].at);
-      const nameCells = line
-        .slice(line.indexOf(jobNumber) + jobNumber.length, preDateEnd)
-        .split(/\s{2,}/).map((s) => s.trim()).filter(Boolean);
-
-      // Product sits between the branch cell and the first money cell.
+      // Money is parsed CELL-WISE right of the branch column: split the
+      // post-branch segment on -layout's 2+-space column gaps and take the
+      // trailing run of money-parseable cells. Bare integers are money HERE
+      // (LP can print totals without cents) but nowhere left of the branch,
+      // so street numbers / ZIPs / job numbers can never match.
+      let monies = null;
       let product = null;
-      if (branchMatch && monies.length) {
-        product = line.slice(branchMatch.index + branchMatch[0].length, monies[0].at).trim() || null;
+      let firstMoneyAt = null;
+      if (branchMatch) {
+        const afterStart = branchMatch.index + branchMatch[0].length;
+        const cells = [];
+        for (const m of line.slice(afterStart).matchAll(/\S+(?: \S+)*/g)) {
+          cells.push({ text: m[0], at: afterStart + m.index });
+        }
+        let firstMoneyIdx = cells.length;
+        for (let i = cells.length - 1; i >= 0; i--) {
+          if (parseMoneyCents(cells[i].text) == null) break;
+          firstMoneyIdx = i;
+        }
+        const run = cells.slice(firstMoneyIdx);
+        if (run.length >= 2) {
+          monies = run.map((c) => parseMoneyCents(c.text));
+          firstMoneyAt = run[0].at;
+          product = cells.slice(0, firstMoneyIdx).map((c) => c.text).join(' ').trim() || null;
+        }
+      } else {
+        // Branchless row (quarantined upstream) — strict tokens only.
+        const toks = moneyTokens(line);
+        if (toks.length >= 2) {
+          monies = toks.map((t) => t.cents);
+          firstMoneyAt = toks[0].at;
+        }
       }
 
-      rows.push({
-        job_number: jobNumber,
-        customer_name: nameCells[0] ?? null,
-        address: nameCells[1] ?? null,
-        city: nameCells[2] ?? null,
-        contract_date: dates[0]?.iso ?? null,
-        rtp_date: dates[1]?.iso ?? dates[0]?.iso ?? null,
-        branch_code_raw: branchMatch ? branchMatch[0] : null,
-        product,
-        // Printed order: Gross Net Paid Balance. Net is the metric.
-        gross_cents: monies[0]?.cents ?? null,
-        net_cents: monies[1]?.cents ?? null,
-        paid_cents: monies[2]?.cents ?? null,
-        balance_cents: monies[3]?.cents ?? null,
-        sales_rep: currentRep,
-      });
-      continue;
+      if (monies) {
+        sawDetail = true;
+        const dates = [...line.matchAll(DATE_RE)].map((m) => ({ iso: parseDateMDY(m[0]), at: m.index }));
+
+        // Text between the job number and the first date = Customer | Address | City
+        // (column gaps in -layout are 2+ spaces).
+        const preDateEnd = dates.length ? dates[0].at : (branchMatch ? branchMatch.index : firstMoneyAt);
+        const nameCells = line
+          .slice(line.indexOf(jobNumber) + jobNumber.length, preDateEnd)
+          .split(/\s{2,}/).map((s) => s.trim()).filter(Boolean);
+
+        rows.push({
+          job_number: jobNumber,
+          customer_name: nameCells[0] ?? null,
+          address: nameCells[1] ?? null,
+          city: nameCells[2] ?? null,
+          contract_date: dates[0]?.iso ?? null,
+          rtp_date: dates[1]?.iso ?? dates[0]?.iso ?? null,
+          branch_code_raw: branchMatch ? branchMatch[0] : null,
+          product,
+          _monies: monies, // assigned to fields once the column order is derived
+          sales_rep: currentRep,
+        });
+        continue;
+      }
     }
 
     // Money-tokens-only line = the current rep's printed subtotal.
@@ -143,16 +237,54 @@ export function parseJobsByMilestone(text) {
     if (!sawDetail) headerLines.push(line.trim());
   }
 
+  // Column order comes from the printed header; rows get their money fields
+  // only once the order is known. Unrecognized header → all money fields
+  // null → money_columns_unrecognized (+ rows_missing_net) in validation.
+  const moneyColumnOrder = deriveMoneyColumnOrder(headerLines);
+  for (const r of rows) {
+    const m = r._monies;
+    delete r._monies;
+    if (moneyColumnOrder) {
+      // Money columns are rightmost — with an extra leading numeric cell
+      // (e.g. a purely numeric product) the TRAILING four are the money.
+      const use = m.length > moneyColumnOrder.length ? m.slice(-moneyColumnOrder.length) : m;
+      moneyColumnOrder.forEach((f, k) => { r[`${f}_cents`] = use[k] ?? null; });
+    }
+    for (const f of ['gross', 'net', 'paid', 'balance']) r[`${f}_cents`] ??= null;
+  }
+
   // Declared parameters + period come from the pre-detail header block.
+  // Period: prefer the explicit range line — 'from Monday, August 3, 2026
+  // through …' (the real scheduled run) or 'From: 7/1/2026  To: 7/31/2026' —
+  // falling back to all header dates sorted.
   const headerText = headerLines.join('\n');
-  const headerDates = [...headerText.matchAll(DATE_RE)].map((m) => parseDateMDY(m[0])).filter(Boolean).sort();
+  let periodStart = null;
+  let periodEnd = null;
+  for (const hl of headerLines) {
+    const m = hl.match(/\bfrom:?\s+(.+?)\s+(?:through|thru|to):?\s+(.+)$/i);
+    if (!m) continue;
+    const s = parseDateAny(m[1]);
+    const e = parseDateAny(m[2]);
+    if (s && e) { periodStart = s; periodEnd = e; break; }
+  }
+  if (!periodStart || !periodEnd) {
+    const headerDates = [
+      ...[...headerText.matchAll(DATE_RE)].map((m) => parseDateMDY(m[0])),
+      ...[...headerText.matchAll(LONG_DATE_RE)].map((m) => parseDateAny(m[0])),
+    ].filter(Boolean).sort();
+    periodStart ??= headerDates[0] ?? null;
+    periodEnd ??= headerDates[headerDates.length - 1] ?? null;
+  }
+
   return {
     header: {
       text: headerText,
       declaresRtp: /\bRTP\b/i.test(headerText),
       declaresActual: /\bActual\b/i.test(headerText),
-      periodStart: headerDates[0] ?? null,
-      periodEnd: headerDates[headerDates.length - 1] ?? null,
+      periodStart,
+      periodEnd,
+      moneyColumnOrder,
+      reportGeneratedAt,
     },
     rows,
     repSubtotals,
@@ -160,15 +292,19 @@ export function parseJobsByMilestone(text) {
   };
 }
 
+const DEFAULT_ORDER = ['gross', 'net', 'paid', 'balance'];
+
 /**
  * Validation gates — ALL must pass or the file writes nothing (fail-closed).
  * Every violation carries both sides so the ingest log answers "what broke"
- * without re-opening the PDF.
+ * without re-opening the PDF. Subtotal/footer ties compare column-by-column
+ * in the PRINTED (derived) order — printed totals sum printed columns.
  * @returns {{ ok:boolean, violations:Array<{rule:string, detail:object}> }}
  */
 export function validateJobsByMilestone(parsed) {
   const v = [];
   const { header, rows, repSubtotals, footer } = parsed;
+  const order = header.moneyColumnOrder ?? DEFAULT_ORDER;
 
   // 1. Wrong report parameters — a Projected run or a non-RTP milestone would
   //    parse cleanly and lie. Reject unless the header declares RTP + Actual.
@@ -179,28 +315,33 @@ export function validateJobsByMilestone(parsed) {
     v.push({ rule: 'missing_period', detail: { periodStart: header.periodStart, periodEnd: header.periodEnd } });
   }
 
+  // 1b. Unrecognized money-column header — assigning by guess could transpose
+  //     net and gross while every tie still passes. Stop instead.
+  if (!header.moneyColumnOrder && rows.length) {
+    v.push({ rule: 'money_columns_unrecognized', detail: { expected: 'column header naming Net/Gross/Paid/Balance', header: header.text.slice(0, 500) } });
+  }
+
   if (!rows.length) v.push({ rule: 'no_detail_rows', detail: { rows: 0 } });
   const noNet = rows.filter((r) => r.net_cents == null);
   if (noNet.length) {
     v.push({ rule: 'rows_missing_net', detail: { count: noNet.length, sample: noNet.slice(0, 3).map((r) => r.job_number) } });
   }
 
-  // 2. Rep subtotal tie — EXACT cents, column-by-column for as many columns
-  //    as the subtotal prints. The double-count guard: any detail/subtotal
-  //    misclassification breaks at least one rep's tie.
+  // 2. Rep subtotal tie — EXACT cents, column-by-column (printed order) for
+  //    as many columns as the subtotal prints. The double-count guard: any
+  //    detail/subtotal misclassification breaks at least one rep's tie.
   const byRep = new Map();
   for (const r of rows) {
     const key = r.sales_rep ?? '';
-    const acc = byRep.get(key) || [0, 0, 0, 0];
-    acc[0] += r.gross_cents ?? 0; acc[1] += r.net_cents ?? 0;
-    acc[2] += r.paid_cents ?? 0; acc[3] += r.balance_cents ?? 0;
+    const acc = byRep.get(key) || order.map(() => 0);
+    order.forEach((f, i) => { acc[i] += r[`${f}_cents`] ?? 0; });
     byRep.set(key, acc);
   }
   for (const sub of repSubtotals) {
-    const acc = byRep.get(sub.rep ?? '') || [0, 0, 0, 0];
+    const acc = byRep.get(sub.rep ?? '') || order.map(() => 0);
     sub.cents.forEach((printed, i) => {
-      if (i < 4 && printed !== acc[i]) {
-        v.push({ rule: 'rep_subtotal_mismatch', detail: { rep: sub.rep, column: i, printed_cents: printed, computed_cents: acc[i] } });
+      if (i < order.length && printed !== acc[i]) {
+        v.push({ rule: 'rep_subtotal_mismatch', detail: { rep: sub.rep, column: i, column_field: order[i], printed_cents: printed, computed_cents: acc[i] } });
       }
     });
   }
@@ -212,16 +353,16 @@ export function validateJobsByMilestone(parsed) {
     v.push({ rule: 'footer_count_mismatch', detail: { printed: footer.recordCount, parsed: rows.length } });
   }
 
-  // 4. Footer money tie — ±1¢ (LP's own rounding), matched column-wise.
+  // 4. Footer money tie — ±1¢ (LP's own rounding), matched column-wise in
+  //    printed order.
   if (footer.totalCents && footer.totalCents.length) {
-    const sums = [0, 0, 0, 0];
+    const sums = order.map(() => 0);
     for (const r of rows) {
-      sums[0] += r.gross_cents ?? 0; sums[1] += r.net_cents ?? 0;
-      sums[2] += r.paid_cents ?? 0; sums[3] += r.balance_cents ?? 0;
+      order.forEach((f, i) => { sums[i] += r[`${f}_cents`] ?? 0; });
     }
     footer.totalCents.forEach((printed, i) => {
-      if (i < 4 && Math.abs(printed - sums[i]) > 1) {
-        v.push({ rule: 'footer_total_mismatch', detail: { column: i, printed_cents: printed, computed_cents: sums[i] } });
+      if (i < order.length && Math.abs(printed - sums[i]) > 1) {
+        v.push({ rule: 'footer_total_mismatch', detail: { column: i, column_field: order[i], printed_cents: printed, computed_cents: sums[i] } });
       }
     });
   } else {
