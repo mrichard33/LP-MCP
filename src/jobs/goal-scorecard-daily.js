@@ -619,10 +619,55 @@ export function registerGoalScorecardRoutes(app) {
 // ─── Scheduler — daily at 06:00 ET ───────────────────────────────────
 let scorecardTimer = null;
 let lastRunDate = null; // ET date string of the last successful daily run
+let lastWatchdogAlertDate = null; // ET date of the last missing-snapshot alert
+
+// Freshness watchdog (added after the Jul 31–Aug 4 outage, when the daily
+// snapshot silently stopped for five days and surfaced only as wrong numbers
+// on the leadership scorecard). Selling-day-aware: from 07:00 ET onward —
+// after the 06:00 run window — the expected snapshot for the last COMPLETED
+// selling day must exist. If it doesn't, ping GroupMe once per ET day and
+// keep pinging daily until a snapshot lands. Alert-only by design: no
+// self-healing runs, no restarts. Kill switch: SCORECARD_WATCHDOG_DISABLED.
+const WATCHDOG_DISABLED =
+  (process.env.SCORECARD_WATCHDOG_DISABLED || 'false').toLowerCase() === 'true';
+
+async function checkSnapshotFreshness(today) {
+  if (WATCHDOG_DISABLED || lastWatchdogAlertDate === today) return;
+  const expectedAsOf = lastCompletedSellingDay(today, SELLING_CAL);
+  try {
+    const { data, error } = await supabase
+      .from('lp_market_scorecard_daily')
+      .select('as_of_date')
+      .eq('market', DEFAULT_MARKET)
+      .gte('as_of_date', expectedAsOf)
+      .limit(1);
+    if (error) {
+      console.error('[Scorecard] watchdog query failed:', error.message);
+      return;
+    }
+    if (data && data.length > 0) return; // healthy
+
+    lastWatchdogAlertDate = today; // once per ET day, re-alerts tomorrow if still missing
+    const msg =
+      `⚠️ SCORECARD SNAPSHOT MISSING — lp_market_scorecard_daily has no row for ` +
+      `${expectedAsOf} (last completed selling day). The 06:00 ET daily job did not ` +
+      `write today; the dashboard is showing its "no data yet" state. ` +
+      `Check LP-MCP logs, then backfill via POST /n8n/admin/goal-scorecard-run.`;
+    console.error(`[Scorecard] watchdog: ${msg}`);
+    try {
+      const { sendGroupMeMessage } = await import('../groupme.js');
+      await sendGroupMeMessage(msg);
+    } catch (gmErr) {
+      console.error('[Scorecard] watchdog GroupMe send failed:', gmErr.message);
+    }
+  } catch (err) {
+    console.error('[Scorecard] watchdog threw:', err.message);
+  }
+}
 
 export function startGoalScorecardScheduler() {
   if (scorecardTimer) return;
-  console.log('[Scorecard] Scheduler started — daily run at 06:00 ET');
+  console.log('[Scorecard] Scheduler started — daily run at 06:00 ET (+ 07:00 ET freshness watchdog)');
 
   const checkAndRun = async () => {
     const now = new Date();
@@ -639,9 +684,14 @@ export function startGoalScorecardScheduler() {
         console.error('[Scorecard] daily run failed:', err.message);
       }
     }
+    // Watchdog window: any check from 07:00 ET onward (covers deploys that
+    // boot mid-day — a fresh process still verifies today's snapshot exists).
+    if (hour >= 7) {
+      await checkSnapshotFreshness(today);
+    }
   };
 
-  // Check every 5 minutes; fires once when the ET hour is 06.
+  // Check every 5 minutes; fires the run once when the ET hour is 06.
   scorecardTimer = setInterval(checkAndRun, 5 * 60 * 1000);
 }
 
