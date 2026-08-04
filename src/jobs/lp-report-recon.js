@@ -22,6 +22,11 @@
 //                            same month. ADVISORY. Known July-2026 residual
 //                            (2 records / $14,957) is a NAMED exception —
 //                            accepted and annotated, not hidden.
+//   facts_vs_raw_a/_b        lp_report_facts vs fresh aggregates from the
+//                            raw rows, per current snapshot. FAIL-grade —
+//                            facts are a projection, raw rows win; on
+//                            divergence facts are rebuilt (recorded 'warn'
+//                            if the rebuild converges, 'fail' otherwise).
 //
 // There is NO LP API for "Sales Efficiency By Market" (verified against
 // lp-client.js) — the monthly SE tie-out stays a documented manual step.
@@ -69,7 +74,12 @@ export function compareBuckets(lhs, rhs, { toleranceCents = 0, namedExceptions =
       break;
     }
   }
-  const ok = dCount === 0 && Math.abs(dCents) <= toleranceCents;
+  // Totals alone would let offsetting per-key deltas cancel (a row counted in
+  // the WRONG bucket nets to zero) — every key must tie unless a named
+  // exception explains the total. Count deltas are never tolerated.
+  const perKeyOk = applied.length > 0
+    || deltas.every((d) => d.d_count === 0 && Math.abs(d.d_cents) <= toleranceCents);
+  const ok = dCount === 0 && Math.abs(dCents) <= toleranceCents && perKeyOk;
   return { ok, deltas, total_delta: { count: dCount, cents: dCents }, applied_exceptions: applied };
 }
 
@@ -104,17 +114,86 @@ async function alertGroupMe(text) {
   }
 }
 
-/** Bucket roll-up of a B snapshot's rows via SQL (428 rows — one round trip). */
+/**
+ * Bucket roll-up of a B snapshot's rows via SQL (428 rows — one round trip).
+ * dup_review rows are EXCLUDED from bucket sums (ruled 2026-08-04) and
+ * returned separately — the pass condition accounts for them explicitly.
+ */
 async function bucketSumsFromDb(snapshotId) {
   const rows = (await runSQL(`
     SELECT bucket, COUNT(*)::int AS count, COALESCE(SUM(total_gross_cents), 0)::bigint AS cents
-    FROM scorecard_report_rows_b WHERE snapshot_id = '${snapshotId}' GROUP BY bucket`)) || [];
+    FROM scorecard_report_rows_b WHERE snapshot_id = '${snapshotId}' AND NOT dup_review GROUP BY bucket`)) || [];
   const out = {};
   for (const r of rows) out[r.bucket ?? 'NULL'] = { count: Number(r.count), cents: Number(r.cents) };
-  return out;
+  const dup = (await runSQL(`
+    SELECT COUNT(*)::int AS count, COALESCE(SUM(total_gross_cents), 0)::bigint AS cents
+    FROM scorecard_report_rows_b WHERE snapshot_id = '${snapshotId}' AND dup_review`)) || [];
+  const dupReview = { count: Number(dup[0]?.count ?? 0), cents: Number(dup[0]?.cents ?? 0) };
+  return { buckets: out, dupReview };
 }
 
-/** Run all four checks for today; returns the per-check results. */
+/**
+ * facts_vs_raw — lp_report_facts must equal the same aggregates computed
+ * fresh from the raw rows (the facts table is a projection, never a second
+ * truth). FAIL-grade. On mismatch the raw rows win: rebuild via
+ * scorecard_rebuild_facts, re-compare, and record 'warn' (rebuilt clean —
+ * the write path mis-projected, investigate) or 'fail' (still divergent).
+ */
+async function factsVsRawCheck(reconDate, snapshotId, reportType) {
+  const key = reportType === 'jobs_by_milestone' ? 'facts_vs_raw_a' : 'facts_vs_raw_b';
+  const rawSql = reportType === 'jobs_by_milestone'
+    ? `SELECT r.market, COALESCE(r.branch_code_raw, '') AS branch, m.metric, '' AS bucket,
+              CASE m.metric WHEN 'net_sales' THEN COALESCE(SUM(r.net_cents), 0)
+                            ELSE COALESCE(SUM(r.gross_cents), 0) END::bigint AS cents,
+              COUNT(*)::int AS count
+       FROM scorecard_report_rows_a r
+       CROSS JOIN (VALUES ('net_sales'), ('gross_sold')) AS m(metric)
+       WHERE r.snapshot_id = '${snapshotId}'
+       GROUP BY r.market, r.branch_code_raw, m.metric`
+    : `SELECT market, COALESCE(branch_code_raw, '') AS branch,
+              CASE WHEN dup_review THEN 'dup_review_pending'
+                   WHEN bucket = 'excluded' THEN 'pipeline_excluded'
+                   ELSE 'good_business_open' END AS metric,
+              CASE WHEN dup_review THEN '' ELSE bucket END AS bucket,
+              COALESCE(SUM(total_gross_cents), 0)::bigint AS cents, COUNT(*)::int AS count
+       FROM scorecard_report_rows_b
+       WHERE snapshot_id = '${snapshotId}'
+       GROUP BY 1, 2, 3, 4`;
+
+  const toSide = (rows) => {
+    const out = {};
+    for (const r of rows) out[`${r.market}|${r.branch}|${r.metric}|${r.bucket}`] = { count: Number(r.count), cents: Number(r.cents) };
+    return out;
+  };
+  const fetchBoth = async () => {
+    const raw = toSide((await runSQL(rawSql)) || []);
+    const facts = toSide(((await runSQL(`
+      SELECT market, COALESCE(branch_code_raw, '') AS branch, metric,
+             COALESCE(bucket, '') AS bucket, value_cents AS cents, value_count AS count
+      FROM lp_report_facts WHERE snapshot_id = '${snapshotId}'`)) || []));
+    return { raw, facts, cmp: compareBuckets(facts, raw) };
+  };
+
+  let { raw, facts, cmp } = await fetchBoth();
+  if (cmp.ok) {
+    return writeResult(reconDate, key, 'pass', { snapshot_id: snapshotId, grains: Object.keys(raw).length });
+  }
+
+  // Raw wins — rebuild and re-compare.
+  const { error: rbErr } = await supabase.rpc('scorecard_rebuild_facts', { p_snapshot_id: snapshotId });
+  const before = { deltas: cmp.deltas, facts, raw };
+  if (!rbErr) ({ raw, facts, cmp } = await fetchBoth());
+  const status = !rbErr && cmp.ok ? 'warn' : 'fail';
+  await alertGroupMe(status === 'warn'
+    ? `⚠️ LP report recon (${key}): lp_report_facts diverged from raw rows for snapshot ${snapshotId} — rebuilt clean from raw. The write-path projection mis-projected; investigate before trusting facts written today.`
+    : `🚨 LP report recon FAIL (${key}): lp_report_facts diverges from raw rows for snapshot ${snapshotId} and rebuild ${rbErr ? `errored: ${rbErr.message}` : 'did not converge'}. Raw rows are the truth — do not read facts for this snapshot.`);
+  return writeResult(reconDate, key, status, {
+    snapshot_id: snapshotId, rebuilt: !rbErr, rebuild_error: rbErr?.message ?? null,
+    before, after_deltas: cmp.deltas,
+  });
+}
+
+/** Run all the checks for today; returns the per-check results. */
 export async function runLpReportRecon({ reconDate } = {}) {
   if (!supabase) throw new Error('Supabase not configured');
   const date = reconDate || todayET();
@@ -125,17 +204,21 @@ export async function runLpReportRecon({ reconDate } = {}) {
   if (!snapB) {
     results.push(await writeResult(date, 'b_internal', 'skipped', { reason: 'no current jobs_by_status snapshot' }));
     results.push(await writeResult(date, 'b_vs_warehouse_status', 'skipped', { reason: 'no current jobs_by_status snapshot' }));
+    results.push(await writeResult(date, 'facts_vs_raw_b', 'skipped', { reason: 'no current jobs_by_status snapshot' }));
   } else {
-    const buckets = await bucketSumsFromDb(snapB.id);
+    const { buckets, dupReview } = await bucketSumsFromDb(snapB.id);
     const rowCount = Object.values(buckets).reduce((a, b) => a + b.count, 0);
     const centsSum = Object.values(buckets).reduce((a, b) => a + b.cents, 0);
     const nullBuckets = buckets.NULL?.count ?? 0;
-    const okInternal = rowCount === snapB.row_count
+    // Header row_count is ALL inserted rows; header gross excludes dup_review
+    // (ruled 2026-08-04) — so buckets + dups must reconstruct the count while
+    // the cents tie is dup-exclusive on both sides.
+    const okInternal = rowCount + dupReview.count === snapB.row_count
       && centsSum === Number(snapB.gross_total_cents ?? 0)
       && nullBuckets === 0;
     const comparison = {
-      snapshot_id: snapB.id, buckets,
-      rows: { db: rowCount, header: snapB.row_count },
+      snapshot_id: snapB.id, buckets, dup_review: dupReview,
+      rows: { db: rowCount, dup_review: dupReview.count, header: snapB.row_count },
       cents: { db: centsSum, header: Number(snapB.gross_total_cents ?? 0) },
       null_buckets: nullBuckets,
     };
@@ -164,6 +247,8 @@ export async function runLpReportRecon({ reconDate } = {}) {
       report: buckets, warehouse: whBuckets, deltas: cmp.deltas,
       warehouse_statuses_outside_report_map: unmappedWh,
     }));
+
+    results.push(await factsVsRawCheck(date, snapB.id, 'jobs_by_status'));
   }
 
   // ── a_vs_warehouse_rtp_gross + a_vs_net_report ──
@@ -171,8 +256,11 @@ export async function runLpReportRecon({ reconDate } = {}) {
   if (!snapA) {
     results.push(await writeResult(date, 'a_vs_warehouse_rtp_gross', 'skipped', { reason: 'no current jobs_by_milestone snapshot' }));
     results.push(await writeResult(date, 'a_vs_net_report', 'skipped', { reason: 'no current jobs_by_milestone snapshot' }));
+    results.push(await writeResult(date, 'facts_vs_raw_a', 'skipped', { reason: 'no current jobs_by_milestone snapshot' }));
     return { recon_date: date, results };
   }
+
+  results.push(await factsVsRawCheck(date, snapA.id, 'jobs_by_milestone'));
 
   const marketRows = (await runSQL(`
     SELECT market, COUNT(*)::int AS count, COALESCE(SUM(net_cents), 0)::bigint AS net_cents
