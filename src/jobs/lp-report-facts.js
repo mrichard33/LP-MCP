@@ -32,6 +32,8 @@ const KNOWN_TYPES = new Set([
   'jobs_by_milestone', 'jobs_by_status',
   // CSV-era sources (2026-08-05) — see sql/migrations/2026-08-05_lp_csv_history.sql
   'job_status_ytd', 'lead_disposition', 'source_cost',
+  // report 137 (2026-08-05) — see sql/migrations/2026-08-05_sales_efficiency.sql
+  'sales_efficiency',
 ]);
 
 export function expectedFacts(reportType, rows) {
@@ -69,6 +71,18 @@ export function expectedFacts(reportType, rows) {
       if (r.appt_date != null) bump(r.market, r.brn_id_raw || null, 'sets', null, null, 1, true);
       if ((r.gsa_cents ?? 0) > 0) bump(r.market, r.brn_id_raw || null, 'sold', null, r.gsa_cents, 1, false);
       if ((r.net_cents ?? 0) > 0) bump(r.market, r.brn_id_raw || null, 'net_sold', null, r.net_cents, 1, false);
+    } else if (reportType === 'sales_efficiency') {
+      // Per-market funnel + buckets. net_sold emitted only when the row
+      // carries net figures (MTD pulls do not — the counts_only guard).
+      const b = r.branch_code_raw ?? null;
+      bump(r.market, b, 'issued', null, null, r.num_issued ?? 0, true);
+      bump(r.market, b, 'sat', null, null, r.num_sat ?? 0, true);
+      bump(r.market, b, 'sold', null, r.gsa_cents ?? 0, r.num_sold ?? 0, false);
+      if (r.num_net != null) bump(r.market, b, 'net_sold', null, r.nsa_cents ?? 0, r.num_net, false);
+      bump(r.market, b, 'cancelled', null, r.cancelled_cents ?? 0, r.num_cancelled ?? 0, false);
+      bump(r.market, b, 'credit_decline', null, r.cd_cents ?? 0, r.num_cd ?? 0, false);
+      bump(r.market, b, 'working_open', null, r.working_cents ?? 0, r.num_working ?? 0, false);
+      bump(r.market, b, 'hold', null, r.hold_cents ?? 0, r.num_hold ?? 0, false);
     } else {
       // source_cost: company-level control-total facts (market 'REECE').
       bump('REECE', null, 'leads', null, null, r.num_raw ?? 0, true);

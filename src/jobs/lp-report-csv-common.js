@@ -64,7 +64,7 @@ export function csvToObjects(text, requiredColumns = []) {
 export function parseCsvDate(raw) {
   const s = String(raw ?? '').trim();
   if (!s) return null;
-  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?$/);
+  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?)?$/i);
   if (!m) return null;
   const mm = Number(m[1]), dd = Number(m[2]);
   if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return null;

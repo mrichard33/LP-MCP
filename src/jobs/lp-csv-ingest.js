@@ -26,13 +26,17 @@ import express from 'express';
 import supabase from '../supabase.js';
 import { getMarketMaps } from './market-resolver.js';
 import { sha256Hex, todayET, centsToDollars } from './lp-report-common.js';
-import { logIngest, quarantineRows, alertGroupMe } from './lp-report-ingest.js';
+import { logIngest, quarantineRows, alertGroupMe, extractPdfText, NoTextLayerError } from './lp-report-ingest.js';
 import { parseJobStatusCsv, validateJobStatusCsv } from './lp-report-parse-job-status.js';
 import {
   parseLeadDispositionCsv, validateLeadDispositionCsv, resolveLeadMarkets,
   leadDispositionControlTotals,
 } from './lp-report-parse-lead-disposition.js';
 import { parseSourceCostCsv, validateSourceCostCsv } from './lp-report-parse-source-cost.js';
+import {
+  parseSalesEfficiencyCsv, parseSalesEfficiencyPdf, resolveSalesEfficiencyMarkets,
+  computeSalesEfficiencyTotals, validateSalesEfficiency,
+} from './lp-report-parse-sales-efficiency.js';
 
 const INGEST_SECRET = (process.env.LP_REPORT_INGEST_SECRET || '').trim();
 const STORAGE_BUCKET = 'lp-reports';
@@ -42,6 +46,7 @@ export const CSV_REPORT_TYPES = {
   'job-status': 'job_status_ytd',
   'lead-disposition': 'lead_disposition',
   'source-cost': 'source_cost',
+  'sales-efficiency': 'sales_efficiency',
 };
 
 /** Slugs whose PDF variant has no parser yet — fail closed until a sample arrives. */
@@ -151,10 +156,13 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
       snapshot_id: extra.snapshot_id ?? null, source, duration_ms: Date.now() - started,
     });
 
-  // 1. Idempotency — same bytes twice is a clean no-op.
+  // 1. Idempotency — same bytes twice is a clean no-op. Only FINALIZED
+  //    snapshots count: an aborted chunked ingest (begin succeeded, finalize
+  //    rejected) must not block the corrected retry.
   const { data: dup, error: dupErr } = await supabase
     .from('scorecard_report_snapshots')
     .select('id').eq('report_type', reportType).eq('file_sha256', sha)
+    .not('finalized_at', 'is', null)
     .maybeSingle();
   if (dupErr) throw new Error(`duplicate check failed: ${dupErr.message}`);
   if (dup) {
@@ -269,6 +277,25 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
       }
       rows = parsed.rows;
       controlTotals = v.totals;
+    } else if (reportType === 'sales_efficiency') {
+      parsed = parseSalesEfficiencyCsv(text);
+      const v = validateSalesEfficiency(parsed, { expectedTotals, todayIso: todayET() });
+      if (!v.ok) {
+        return await fail(v.violations[0].rule, { violations: v.violations },
+          `${v.violations[0].rule} (+${v.violations.length - 1} more).`);
+      }
+      const maps = await getMarketMaps();
+      const unmapped = resolveSalesEfficiencyMarkets(parsed.rows, maps);
+      if (unmapped.length) {
+        await quarantineRows(reportType, sha, unmapped.map((row) => ({ reason: 'unmapped_branch', row })));
+        const branches = [...new Set(unmapped.map((r) => r.branch_code_raw))];
+        await done('failed', { failure_reason: 'unmapped_branch', detail: { count: unmapped.length, branches } });
+        await alertGroupMe(`⚠️ LP CSV ingest REJECTED (${reportType}): unmapped branch ${branches.join(', ')}. Add to lp_branch_market_map, then re-send.`);
+        return { success: false, failure_reason: 'unmapped_branch', branches, sha256: sha };
+      }
+      rows = parsed.rows;
+      controlTotals = expectedTotals ?? computeSalesEfficiencyTotals(parsed.rows, parsed.mode);
+      extraDetail = { mode: parsed.mode, reconciliations: v.reconciliations };
     } else {
       throw new Error(`unknown CSV report type ${reportType}`);
     }
@@ -316,6 +343,125 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
   }
 }
 
+/**
+ * Sales Efficiency (137) PDF ingest — the REAL parser path (unlike the
+ * lead-disposition / source-cost stubs). Same pipeline shape: sha256 →
+ * duplicate check → archive FIRST → text layer → parse (column bands) →
+ * validate (Total-row checksum, MTD counts_only guard) → market resolution →
+ * chunked load → finalize (fail-closed). PDF dollars are whole — control
+ * totals are the parser's own sums (chunk-integrity guard); cents-exact
+ * assertions belong to the CSV path.
+ */
+export async function ingestSalesEfficiencyPdf({ buffer, source = 'n8n' }) {
+  const started = Date.now();
+  const reportType = 'sales_efficiency';
+  if (!supabase) throw new Error('Supabase not configured');
+  const sha = sha256Hex(buffer);
+  const done = (status, extra = {}) =>
+    logIngest({
+      report_type: reportType, file_sha256: sha, status,
+      failure_reason: extra.failure_reason ?? null, detail: extra.detail ?? null,
+      snapshot_id: extra.snapshot_id ?? null, source, duration_ms: Date.now() - started,
+    });
+
+  const { data: dup, error: dupErr } = await supabase
+    .from('scorecard_report_snapshots')
+    .select('id').eq('report_type', reportType).eq('file_sha256', sha)
+    .not('finalized_at', 'is', null)
+    .maybeSingle();
+  if (dupErr) throw new Error(`duplicate check failed: ${dupErr.message}`);
+  if (dup) {
+    await done('duplicate', { snapshot_id: dup.id });
+    return { success: true, duplicate: true, snapshot_id: dup.id, sha256: sha };
+  }
+
+  const storagePath = `${reportType}/${todayET()}/${sha}.pdf`;
+  const { error: upErr } = await supabase.storage
+    .from(STORAGE_BUCKET)
+    .upload(storagePath, buffer, { contentType: 'application/pdf', upsert: true });
+  if (upErr) throw new Error(`storage archive failed: ${upErr.message}`);
+
+  let text;
+  try {
+    text = await extractPdfText(buffer);
+  } catch (err) {
+    if (err instanceof NoTextLayerError) {
+      await done('no_text_layer', { failure_reason: 'no_text_layer', detail: { message: err.message, storage_path: storagePath } });
+      await alertGroupMe(`⚠️ LP report 137 ingest STOPPED: PDF has no text layer (scanned image?). Archived at ${storagePath}. OCR is not permitted.`);
+      return { success: false, failure_reason: 'no_text_layer', sha256: sha };
+    }
+    throw err;
+  }
+
+  const parsed = parseSalesEfficiencyPdf(text);
+  const v = validateSalesEfficiency(parsed, { todayIso: todayET() });
+  if (!v.ok) {
+    const reason = v.violations[0].rule;
+    await done('failed', { failure_reason: reason, detail: { violations: v.violations } });
+    await alertGroupMe(`⚠️ LP report 137 ingest REJECTED: ${reason} (+${v.violations.length - 1} more). Nothing written. Archived at ${storagePath}.`);
+    return { success: false, failure_reason: reason, violations: v.violations, sha256: sha };
+  }
+
+  const maps = await getMarketMaps();
+  const unmapped = resolveSalesEfficiencyMarkets(parsed.rows, maps);
+  if (unmapped.length) {
+    await quarantineRows(reportType, sha, unmapped.map((row) => ({ reason: 'unmapped_branch', row })));
+    const branches = [...new Set(unmapped.map((r) => r.branch_code_raw))];
+    await done('failed', { failure_reason: 'unmapped_branch', detail: { count: unmapped.length, branches } });
+    await alertGroupMe(`⚠️ LP report 137 ingest REJECTED: unmapped branch ${branches.join(', ')}. Add to lp_branch_market_map, then re-send.`);
+    return { success: false, failure_reason: 'unmapped_branch', branches, sha256: sha };
+  }
+
+  if (!parsed.header.periodStart || !parsed.header.periodEnd) {
+    await done('failed', { failure_reason: 'missing_period', detail: { header: parsed.header } });
+    await alertGroupMe(`⚠️ LP report 137 ingest REJECTED: appointment-date window missing from the header. Archived at ${storagePath}.`);
+    return { success: false, failure_reason: 'missing_period', sha256: sha };
+  }
+
+  const controlTotals = computeSalesEfficiencyTotals(parsed.rows, parsed.mode);
+  const snapshotPayload = {
+    report_type: reportType,
+    period_start: parsed.header.periodStart,
+    period_end: parsed.header.periodEnd,
+    file_sha256: sha,
+    storage_path: storagePath,
+    row_count: parsed.rows.length,
+    as_of_date: todayET(),
+    source_format: 'pdf',
+    control_totals: controlTotals,
+  };
+  const { data: snapshotId, error: beginErr } = await supabase
+    .rpc('lp_csv_ingest_begin', { p_snapshot: snapshotPayload });
+  if (beginErr) throw new Error(`ingest begin failed: ${beginErr.message}`);
+
+  try {
+    await loadChunked(snapshotId, parsed.rows.map((r) => ({
+      row_num: r.row_num, branch_code_raw: r.branch_code_raw, market: r.market,
+      num_issued: r.num_issued ?? null, num_net_issued: r.num_net_issued ?? null,
+      num_sat: r.num_sat ?? null, num_sold: r.num_sold ?? null, gsa_cents: r.gsa_cents ?? null,
+      num_net: parsed.mode === 'full' ? (r.num_net ?? null) : null,
+      nsa_cents: parsed.mode === 'full' ? (r.nsa_cents ?? null) : null,
+      num_working: r.num_working ?? null, working_cents: r.working_cents ?? null,
+      num_cd: r.num_cd ?? null, cd_cents: r.cd_cents ?? null,
+      num_cancelled: r.num_cancelled ?? null, cancelled_cents: r.cancelled_cents ?? null,
+      num_hold: r.num_hold ?? null, hold_cents: r.hold_cents ?? null,
+    })));
+    const { data: factRows, error: finErr } = await supabase
+      .rpc('lp_csv_ingest_finalize', { p_snapshot_id: snapshotId });
+    if (finErr) throw new Error(finErr.message);
+    await done('success', {
+      snapshot_id: snapshotId,
+      detail: { mode: parsed.mode, control_totals: controlTotals, fact_rows: factRows, reconciliations: v.reconciliations },
+    });
+    console.log(`[LPCsv] sales_efficiency PDF ingested: ${parsed.rows.length} rows, mode ${parsed.mode}, gross ${centsToDollars(controlTotals.gsa_cents ?? 0)}, snapshot ${snapshotId}`);
+    return { success: true, snapshot_id: snapshotId, rows: parsed.rows.length, mode: parsed.mode, fact_rows: factRows, sha256: sha, reconciliations: v.reconciliations };
+  } catch (err) {
+    await done('failed', { failure_reason: 'finalize_assertion', snapshot_id: snapshotId, detail: { message: err.message } });
+    await alertGroupMe(`⚠️ LP report 137 ingest REJECTED: ${err.message}. Snapshot ${snapshotId} left non-current. Archived at ${storagePath}.`);
+    return { success: false, failure_reason: 'finalize_assertion', message: err.message, snapshot_id: snapshotId, sha256: sha };
+  }
+}
+
 function authorized(req) {
   if (!INGEST_SECRET) return true;
   const provided = req.headers['x-ghl-signature'] || req.headers['x-webhook-secret'] || '';
@@ -344,10 +490,27 @@ export function registerLpCsvRoutes(app) {
     });
   }
 
+  const rawPdf = express.raw({ type: ['application/pdf', 'application/octet-stream'], limit: '25mb' });
+
+  // Sales Efficiency (137) — REAL PDF pipeline (parser built from the
+  // 2026-08-05 sample; column-band layout, Total-row checksum, MTD guard).
+  app.post('/n8n/admin/lp-report-ingest/sales-efficiency', rawPdf, async (req, res) => {
+    try {
+      if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
+      if (!Buffer.isBuffer(req.body) || !req.body.length) {
+        return res.status(400).json({ success: false, error: 'POST the raw PDF bytes as the request body (Content-Type: application/pdf)' });
+      }
+      const result = await ingestSalesEfficiencyPdf({ buffer: req.body, source: String(req.query.source || 'n8n') });
+      res.json(result);
+    } catch (err) {
+      console.error('[LPCsv] sales-efficiency ingest error:', err.message);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
   // Future PDF ingest for reports C/D — FAIL CLOSED until a sample PDF
   // exists to build the parser from. The PDF is archived (it IS the sample),
   // the rejection is logged, GroupMe alerts, and nothing is written.
-  const rawPdf = express.raw({ type: ['application/pdf', 'application/octet-stream'], limit: '25mb' });
   for (const [slug, reportType] of Object.entries(PDF_PENDING_TYPES)) {
     app.post(`/n8n/admin/lp-report-ingest/${slug}`, rawPdf, async (req, res) => {
       try {
@@ -376,5 +539,5 @@ export function registerLpCsvRoutes(app) {
     });
   }
 
-  console.log('[LPCsv] Routes registered: POST /n8n/admin/lp-csv-ingest/{job-status|lead-disposition|source-cost} | POST /n8n/admin/lp-report-ingest/{lead-disposition|source-cost} (parser_pending)');
+  console.log('[LPCsv] Routes registered: POST /n8n/admin/lp-csv-ingest/{job-status|lead-disposition|source-cost|sales-efficiency} | POST /n8n/admin/lp-report-ingest/sales-efficiency (137, live parser) | POST /n8n/admin/lp-report-ingest/{lead-disposition|source-cost} (parser_pending)');
 }

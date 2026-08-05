@@ -18,10 +18,21 @@ import { todayET, hourET } from './lp-report-common.js';
 
 const DISABLED = !!(process.env.LP_REPORT_WATCHDOG_DISABLED || '').trim();
 
+// All five daily reports (cadence: docs/lp-report-cadence.md). A type that
+// has NEVER successfully ingested is skipped — "not yet scheduled by Mark"
+// must not alarm daily; the first successful ingest arms its watch.
 const WATCHED = [
-  { type: 'jobs_by_milestone', label: 'Report A "Jobs by Milestone Date" (Net Sales)', schedule: '6:00 ET' },
-  { type: 'jobs_by_status', label: 'Report B "Jobs By Status" (Good Business split)', schedule: '6:15 ET' },
+  { type: 'jobs_by_milestone', label: 'Report 134 "Jobs by Milestone Date" (Net Sales)', schedule: '6:00 ET' },
+  { type: 'jobs_by_status', label: 'Report 133 "Jobs By Status" (Good Business split)', schedule: '6:15 ET' },
+  { type: 'lead_disposition', label: 'Report 135 "Lead Disposition Detail" (leads/funnel/source)', schedule: '6:30 ET' },
+  { type: 'source_cost', label: 'Report 136 "Marketing Sub-Source Cost" (marketing cost)', schedule: '6:45 ET' },
+  { type: 'sales_efficiency', label: 'Report 137 "Sales Efficiency By Market" (per-market funnel)', schedule: '7:00 ET' },
 ];
+
+// The 2026-08-05 manual CSV backfills would otherwise arm those types
+// immediately and alarm every morning until Mark schedules the LP emails.
+// A type arms only after its first SCHEDULED ingest (ingest-log success with
+// source 'n8n') — manual/backfill sources never arm the watch.
 
 let watchdogTimer = null;
 const lastAlertDate = new Map(); // report_type → ET date already alerted
@@ -45,6 +56,18 @@ export async function checkLpReportFreshness({ alert = true } = {}) {
   const missing = [];
 
   for (const { type, label, schedule } of WATCHED) {
+    // Armed only after the first scheduled (n8n-sourced) success — see header.
+    const { data: armed, error: armErr } = await supabase
+      .from('scorecard_ingest_log')
+      .select('id')
+      .eq('report_type', type).eq('status', 'success').eq('source', 'n8n')
+      .limit(1).maybeSingle();
+    if (armErr) {
+      console.error('[LPReportWatchdog] arm check failed:', armErr.message);
+      continue;
+    }
+    if (!armed) continue;
+
     const { data, error } = await supabase
       .from('scorecard_report_snapshots')
       .select('ingested_at')
@@ -66,7 +89,7 @@ export async function checkLpReportFreshness({ alert = true } = {}) {
       await sendGroupMeMessage(
         `⏰ LP report MISSING: ${label} has not ingested today (${today} ET). ` +
         `Expected via scheduled email ~${schedule}. Last ingest: ${lastEtDay ?? 'never'}. ` +
-        `Check, in order: LP's scheduled email fired → Gmail received it → n8n workflow active (I.LPRA/I.LPRB) → ` +
+        `Check, in order: LP's scheduled email fired → Gmail received it → n8n workflow active (I.LPR router / I.LPRA-E) → ` +
         `GET /n8n/admin/lp-report-ingest/status for a rejection.`,
       );
     } catch (err) {

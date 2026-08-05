@@ -28,8 +28,13 @@
 //                            divergence facts are rebuilt (recorded 'warn'
 //                            if the rebuild converges, 'fail' otherwise).
 //
-// There is NO LP API for "Sales Efficiency By Market" (verified against
-// lp-client.js) — the monthly SE tie-out stays a documented manual step.
+// Report 137 "Sales Efficiency By Market" now ingests directly
+// (lp-csv-ingest.js, 2026-08-05) — the SE tie-out is automated here:
+//   se_internal              GSA − Cancelled − CD − Working − Hold vs NSA,
+//                            with the named $246,768 bucket residual.
+//   se_hold_vs_job_status    137's Hold bucket vs Job Status YTD's HOA —
+//                            two independently generated reports; named
+//                            tolerance Δ1 job / $8,785 (verified 2026-08-05).
 
 import express from 'express';
 import supabase from '../supabase.js';
@@ -46,6 +51,15 @@ const RECON_ENABLED = (process.env.LP_REPORT_RECON_ENABLED || 'true').trim() !==
 export const NAMED_RECON_EXCEPTIONS = {
   SE_RESIDUAL_2026_07: { records: 2, cents: 1495700, month: '2026-07' },
 };
+
+// Report 137 named artifacts (verified against the 2026-08-05 YTD export):
+// the report's own buckets do not foot to NSA — GSA − Cancelled − CD −
+// Working − Hold leaves a $246,768.00 residual. Recorded with its own code,
+// NEVER absorbed into a bucket to force a tie.
+export const SE_BUCKET_RESIDUAL = { records: 0, cents: 24676800 };
+// 137 Hold vs Job Status YTD HOA: Δ1 job / $8,785.00 between two
+// independently generated reports — a named tolerance, not a failure.
+export const SE_HOLD_VS_HOA_TOLERANCE = { records: 1, cents: 878500 };
 
 /**
  * Pure comparison of two { key → { count, cents } } shapes.
@@ -312,6 +326,70 @@ export async function runLpReportRecon({ reconDate } = {}) {
       report_as_of: asOf, deltas: cmp.deltas, total_delta: cmp.total_delta,
       report_total: centsToDollars(aNetTotal),
     }, cmp.applied_exceptions.length ? { applied: cmp.applied_exceptions } : null));
+  }
+
+  // ── Report 137 (sales_efficiency) checks ──────────────────────────────────
+  const snapSe = await currentSnapshot('sales_efficiency');
+  if (!snapSe) {
+    results.push(await writeResult(date, 'se_internal', 'skipped', { reason: 'no current sales_efficiency snapshot' }));
+    results.push(await writeResult(date, 'se_hold_vs_job_status_hoa', 'skipped', { reason: 'no current sales_efficiency snapshot' }));
+  } else {
+    const seSums = (await runSQL(`
+      SELECT COALESCE(SUM(gsa_cents),0)::bigint AS gsa,
+             COALESCE(SUM(nsa_cents),0)::bigint AS nsa,
+             COUNT(*) FILTER (WHERE nsa_cents IS NOT NULL) AS net_rows,
+             COALESCE(SUM(cancelled_cents),0)::bigint AS cancelled,
+             COALESCE(SUM(cd_cents),0)::bigint AS cd,
+             COALESCE(SUM(working_cents),0)::bigint AS working,
+             COALESCE(SUM(hold_cents),0)::bigint AS hold,
+             COALESCE(SUM(num_hold),0)::bigint AS hold_count
+      FROM lp_sales_efficiency_history WHERE snapshot_id = '${snapSe.id}'`))?.[0];
+
+    // se_internal: the report's own bucket identity. GSA − Cancelled − CD −
+    // Working − Hold vs NSA — carries the named $246,768 residual. Skipped on
+    // counts_only (MTD) snapshots, which have no net figures at all.
+    if (!seSums || Number(seSums.net_rows) === 0) {
+      results.push(await writeResult(date, 'se_internal', 'skipped', { reason: 'counts_only snapshot (MTD pull — no net figures)' }));
+    } else {
+      const residualCents = Number(seSums.gsa) - Number(seSums.cancelled) - Number(seSums.cd)
+        - Number(seSums.working) - Number(seSums.hold) - Number(seSums.nsa);
+      const cmpSe = compareBuckets(
+        { residual: { count: 0, cents: residualCents } },
+        { residual: { count: 0, cents: 0 } },
+        { namedExceptions: { SE_BUCKET_RESIDUAL } },
+      );
+      results.push(await writeResult(date, 'se_internal', cmpSe.ok ? 'pass' : 'warn', {
+        note: 'GSA − Cancelled − CreditDecline − Working − Hold vs NSA (report 137 internal identity)',
+        residual_cents: residualCents, residual: centsToDollars(residualCents),
+      }, cmpSe.applied_exceptions.length ? { applied: cmpSe.applied_exceptions } : null));
+      if (!cmpSe.ok) {
+        await alertGroupMe(`⚠️ LP recon: report 137 bucket residual ${centsToDollars(residualCents)} does not match the named SE_BUCKET_RESIDUAL exception ($246,768.00). Investigate before trusting 137-sourced net figures.`);
+      }
+    }
+
+    // se_hold_vs_job_status_hoa: two independent reports, one truth.
+    const snapJs = await currentSnapshot('job_status_ytd');
+    if (!snapJs) {
+      results.push(await writeResult(date, 'se_hold_vs_job_status_hoa', 'skipped', { reason: 'no current job_status_ytd snapshot' }));
+    } else {
+      const hoa = (await runSQL(`
+        SELECT COUNT(*)::bigint AS n, COALESCE(SUM(gross_cents),0)::bigint AS cents
+        FROM lp_job_status_history WHERE snapshot_id = '${snapJs.id}' AND bucket = 'hoa'`))?.[0];
+      const cmpHold = compareBuckets(
+        { hoa_hold: { count: Number(seSums?.hold_count ?? 0), cents: Number(seSums?.hold ?? 0) } },
+        { hoa_hold: { count: Number(hoa?.n ?? 0), cents: Number(hoa?.cents ?? 0) } },
+        { namedExceptions: { SE_HOLD_VS_HOA_TOLERANCE } },
+      );
+      results.push(await writeResult(date, 'se_hold_vs_job_status_hoa', cmpHold.ok ? 'pass' : 'warn', {
+        note: '137 Hold bucket vs Job Status YTD HOA — independent-report integrity check (named Δ1/$8,785 tolerance)',
+        se_hold: { count: Number(seSums?.hold_count ?? 0), cents: Number(seSums?.hold ?? 0) },
+        job_status_hoa: { count: Number(hoa?.n ?? 0), cents: Number(hoa?.cents ?? 0) },
+        deltas: cmpHold.deltas, total_delta: cmpHold.total_delta,
+      }, cmpHold.applied_exceptions.length ? { applied: cmpHold.applied_exceptions } : null));
+      if (!cmpHold.ok) {
+        await alertGroupMe(`⚠️ LP recon: report 137 Hold vs Job Status HOA diverges beyond the named Δ1/$8,785 tolerance — see scorecard_recon_results (se_hold_vs_job_status_hoa).`);
+      }
+    }
   }
 
   return { recon_date: date, results };
