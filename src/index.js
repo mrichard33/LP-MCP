@@ -227,6 +227,7 @@ import { registerNetReportRoutes } from './jobs/scorecard-rtp-source.js';
 // LP scheduled-report PDF ingest (Report A Net Sales / Report B GB split) — n8n
 // posts raw PDF bytes; parse/validate/write happens here, fail-closed.
 import { registerLpReportRoutes } from './jobs/lp-report-ingest.js';
+import { registerLpCsvRoutes } from './jobs/lp-csv-ingest.js';
 // Daily 07:00 ET cross-source recon for the ingested LP reports.
 import { registerLpReportReconRoutes, startLpReportReconScheduler } from './jobs/lp-report-recon.js';
 // 07:30 ET missing-report watchdog — watches the OUTCOME table, independent
@@ -1022,6 +1023,7 @@ registerCapacityBandRoutes(app, authenticate);
 registerScorecardRederiveRoutes(app);
 registerNetReportRoutes(app);
 registerLpReportRoutes(app);
+registerLpCsvRoutes(app);
 registerLpReportReconRoutes(app);
 registerScorecardValidateRoutes(app);
 
