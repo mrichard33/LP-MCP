@@ -68,3 +68,37 @@ test('projection: null net counts as 0, never NaN', () => {
   assert.equal(byMarket.get('SAR_MKT').cents, 500);
   assert.equal(byMarket.get('REECE').cents, 500);
 });
+
+// ── §2 (2026-08-05): the Net — Released hero was blank for a live month ─────
+// lp_market_scorecard_daily.released_dollars is sourced ONLY from
+// lp_net_report_rtp, and the ONLY writer of that table was this backfill
+// route. A daily jobs_by_milestone snapshot therefore never produced a row:
+// Aug 1–31 sat current with net $702,506 while the hero read "report pending"
+// and lp_net_report_rtp's newest row was July.
+
+test('the daily ingest path projects into lp_net_report_rtp — not just the backfill', async () => {
+  const ingestSrc = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), '../src/jobs/lp-report-ingest.js'),
+    'utf8',
+  );
+  assert.match(
+    ingestSrc,
+    /projectSnapshotToNetReport/,
+    'ingestReportPdf must bridge jobs_by_milestone snapshots into lp_net_report_rtp',
+  );
+  // The projection is exported (it used to be module-private, which is why
+  // only the backfill could reach it).
+  const mod = await import('../src/jobs/lp-report-backfill.js');
+  assert.equal(typeof mod.projectSnapshotToNetReport, 'function');
+});
+
+test('report_as_of never claims coverage past the generation date', async () => {
+  const { coverageEndOf } = await import('../src/jobs/lp-report-backfill.js');
+  // LP prints the SCHEDULED window: a pull run Aug 5 declares period_end Aug 31.
+  assert.equal(coverageEndOf('2026-08-31', '2026-08-05'), '2026-08-05');
+  // A closed month generated later keeps its own end date.
+  assert.equal(coverageEndOf('2026-07-31', '2026-08-05'), '2026-07-31');
+  // Same-day pulls are unchanged; a missing as_of falls back to the declared end.
+  assert.equal(coverageEndOf('2026-08-05', '2026-08-05'), '2026-08-05');
+  assert.equal(coverageEndOf('2026-08-31', null), '2026-08-31');
+});

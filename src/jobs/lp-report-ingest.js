@@ -233,14 +233,43 @@ export async function ingestReportPdf({ reportType, buffer, source = 'n8n', expe
     .rpc('scorecard_ingest_snapshot', { p_snapshot: snapshot, p_rows: rows });
   if (rpcErr) throw new Error(`ingest RPC failed: ${rpcErr.message}`);
 
+  // 9. Bridge into the Net — Released hero. lp_market_scorecard_daily
+  //    .released_dollars is sourced ONLY from lp_net_report_rtp, and until now
+  //    the only writer of that table was the historical backfill route — so a
+  //    current-month jobs_by_milestone snapshot with a perfectly good net total
+  //    left the hero rendering "report pending" (2026-08-05 §2: Aug 1–31 net
+  //    $702,507 current, lp_net_report_rtp latest row July). Dynamic import
+  //    keeps the module cycle broken (backfill imports this file).
+  //
+  //    The snapshot is already durable and promoted at this point; a failing
+  //    projection is reported and alerted, never silently swallowed, and never
+  //    retracts a good snapshot.
+  let netProjection = null;
+  if (reportType === 'jobs_by_milestone') {
+    try {
+      const { projectSnapshotToNetReport } = await import('./lp-report-backfill.js');
+      netProjection = await projectSnapshotToNetReport(snapshotId);
+    } catch (err) {
+      netProjection = { projected: false, reason: 'projection_failed', error: err.message };
+      console.error(`[LPReport] net-report projection failed for ${snapshotId}: ${err.message}`);
+      await alertGroupMe(`⚠️ LP report ${reportType} ingested (snapshot ${snapshotId}) but the Net — Released projection FAILED: ${err.message}. The dashboard hero will read "report pending" until this is fixed.`);
+    }
+  }
+
   // Granted tolerances (display_rounding) are logged on SUCCESS too — the
   // allowance must stay visible on every invocation, never silent.
   await done('success', {
     snapshot_id: snapshotId,
-    detail: reconciliations?.length ? { reconciliations } : null,
+    detail: reconciliations?.length || netProjection
+      ? { ...(reconciliations?.length ? { reconciliations } : {}), ...(netProjection ? { net_projection: netProjection } : {}) }
+      : null,
   });
-  console.log(`[LPReport] ${reportType} ingested: ${rows.length} rows, ${isA ? `net ${centsToDollars(netTotal)}` : `gross ${centsToDollars(grossTotal)}`}, snapshot ${snapshotId}${reconciliations?.length ? `, ${reconciliations.length} display_rounding reconciliation(s)` : ''}`);
-  return { success: true, snapshot_id: snapshotId, rows: rows.length, sha256: sha, reconciliations: reconciliations ?? [] };
+  console.log(`[LPReport] ${reportType} ingested: ${rows.length} rows, ${isA ? `net ${centsToDollars(netTotal)}` : `gross ${centsToDollars(grossTotal)}`}, snapshot ${snapshotId}${reconciliations?.length ? `, ${reconciliations.length} display_rounding reconciliation(s)` : ''}${netProjection?.projected ? `, net-report projected ${netProjection.total_net} as of ${netProjection.report_as_of}` : ''}`);
+  return {
+    success: true, snapshot_id: snapshotId, rows: rows.length, sha256: sha,
+    reconciliations: reconciliations ?? [],
+    ...(netProjection ? { net_projection: netProjection } : {}),
+  };
 }
 
 function authorized(req) {
