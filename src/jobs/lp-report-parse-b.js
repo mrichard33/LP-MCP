@@ -135,7 +135,7 @@ export function parseJobsByStatus(text) {
   const lines = String(text ?? '').split('\n');
   const rows = [];
   const headerLines = [];
-  let footer = { recordCount: null, totalCents: null };
+  let footer = { recordCount: null, totalCents: null, rendersCents: false };
   let current = null; // row under construction (notes may still accumulate)
 
   const flush = () => { if (current) { rows.push(current.row); current = null; } };
@@ -148,14 +148,22 @@ export function parseJobsByStatus(text) {
     if (recMatch) {
       flush();
       footer.recordCount = Number(recMatch[1].replace(/,/g, ''));
-      const toks = [...line.matchAll(MONEY_B_RE)].map((m) => parseMoneyCents(m[0]));
-      if (toks.length) footer.totalCents = toks[toks.length - 1];
+      const toks = [...line.matchAll(MONEY_B_RE)];
+      if (toks.length) {
+        const last = toks[toks.length - 1][0];
+        footer.totalCents = parseMoneyCents(last);
+        footer.rendersCents = /\.\d{1,2}\)?$/.test(last);
+      }
       continue;
     }
     if (/^\s*(grand\s+)?totals?\b/i.test(line)) {
       flush();
-      const toks = [...line.matchAll(MONEY_B_RE)].map((m) => parseMoneyCents(m[0]));
-      if (toks.length) footer.totalCents = toks[toks.length - 1];
+      const toks = [...line.matchAll(MONEY_B_RE)];
+      if (toks.length) {
+        const last = toks[toks.length - 1][0];
+        footer.totalCents = parseMoneyCents(last);
+        footer.rendersCents = /\.\d{1,2}\)?$/.test(last);
+      }
       continue;
     }
 
@@ -182,11 +190,13 @@ export function parseJobsByStatus(text) {
       // Money strictly AFTER the status cell (notes money can't leak in).
       let totalGross = null;
       let lender = null;
+      let rowRendersCents = false;
       if (statusHit) {
         const afterStatus = segment.slice(statusHit.end);
         const monies = [...afterStatus.matchAll(MONEY_B_RE)];
         if (monies.length) {
           totalGross = parseMoneyCents(monies[0][0]);
+          rowRendersCents = /\.\d{1,2}\)?$/.test(monies[0][0]);
           lender = afterStatus.slice(monies[0].index + monies[0][0].length).trim() || null;
         }
       }
@@ -214,6 +224,7 @@ export function parseJobsByStatus(text) {
           status_raw: statusHit ? statusHit.status : null,
           bucket: statusHit ? classifyStatus(statusHit.status) : null,
           total_gross_cents: totalGross,
+          _renders_cents: rowRendersCents, // transient: display_rounding gate input
           lender,
           notes_raw: null,
           dup_review: false,
@@ -277,10 +288,16 @@ export function flagDuplicates(rows) {
 /**
  * Validation gates — all must pass or nothing writes (fail-closed).
  * Unknown statuses are reported here AND quarantined row-by-row upstream.
- * @returns {{ ok:boolean, violations:Array<{rule:string, detail:object}> }}
+ * The footer tie carries the same bounded `display_rounding` allowance as
+ * Report A (see lp-report-parse-a.js): whole-dollar-rendered PDFs may print
+ * a footer computed from unrounded values, capped at $1 × row count and
+ * logged on every invocation; beyond that, or with cents present, fail closed.
+ * @returns {{ ok:boolean, violations:Array<{rule:string, detail:object}>,
+ *             reconciliations:Array<{class:string, scope:string, detail:object}> }}
  */
 export function validateJobsByStatus(parsed) {
   const v = [];
+  const recon = [];
   const { rows, footer } = parsed;
 
   if (!rows.length) v.push({ rule: 'no_detail_rows', detail: { rows: 0 } });
@@ -304,14 +321,30 @@ export function validateJobsByStatus(parsed) {
 
   if (footer.totalCents != null) {
     const sum = rows.reduce((a, r) => a + (r.total_gross_cents ?? 0), 0);
-    if (Math.abs(footer.totalCents - sum) > 1) {
-      v.push({ rule: 'footer_total_mismatch', detail: { printed_cents: footer.totalCents, computed_cents: sum } });
+    const delta = Math.abs(footer.totalCents - sum);
+    if (delta > 1) {
+      const capCents = 100 * rows.length;
+      // Whole-dollar RENDERING, not whole-dollar values — '15,000.00' printed
+      // cents and must tie exactly (±1¢); '15,000' did not.
+      const wholeDollar = rows.length > 0
+        && !footer.rendersCents
+        && rows.every((r) => !r._renders_cents)
+        && footer.totalCents % 100 === 0
+        && rows.every((r) => r.total_gross_cents == null || r.total_gross_cents % 100 === 0);
+      if (wholeDollar && delta <= capCents) {
+        recon.push({
+          class: 'display_rounding', scope: 'footer_total',
+          detail: { printed_cents: footer.totalCents, computed_cents: sum, delta_cents: delta, cap_cents: capCents, rows: rows.length },
+        });
+      } else {
+        v.push({ rule: 'footer_total_mismatch', detail: { printed_cents: footer.totalCents, computed_cents: sum, delta_cents: delta, cap_cents: capCents, whole_dollar_column: wholeDollar } });
+      }
     }
   } else {
     v.push({ rule: 'missing_footer_total', detail: { expected: 'grand total money line' } });
   }
 
-  return { ok: v.length === 0, violations: v };
+  return { ok: v.length === 0, violations: v, reconciliations: recon };
 }
 
 /**
