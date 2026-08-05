@@ -21,6 +21,7 @@
 import express from 'express';
 import supabase from '../supabase.js';
 import { runSQL } from '../admin/supabase-admin.js';
+import { parseCsv } from './lp-report-csv-common.js';
 
 /** Company roll-up market code (mirrors scorecard-metrics.DEFAULT_MARKET). */
 const REECE = 'REECE';
@@ -118,25 +119,8 @@ export async function computeProvisionalRtpGross({ periodStart, periodEnd, since
 // LP exposes no report API, so the authoritative RTP net enters via a manual upload or a
 // scheduled drop of the Net Report CSV. Reporting layer only — nothing writes back to LP.
 
-/** Minimal RFC-4180-ish CSV parser (handles quoted fields, embedded commas, "" escapes). */
-function parseCsv(text) {
-  const rows = [];
-  let row = [], field = '', inQ = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (inQ) {
-      if (c === '"') {
-        if (text[i + 1] === '"') { field += '"'; i++; } else inQ = false;
-      } else field += c;
-    } else if (c === '"') inQ = true;
-    else if (c === ',') { row.push(field); field = ''; }
-    else if (c === '\r') { /* skip */ }
-    else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
-    else field += c;
-  }
-  if (field.length || row.length) { row.push(field); rows.push(row); }
-  return rows;
-}
+// parseCsv moved to lp-report-csv-common.js (shared with the LP CSV export
+// parsers) — same implementation, one copy.
 
 const monthKeyOf = (mdy) => {
   // 'M/D/YYYY' → 'YYYY-MM-01'

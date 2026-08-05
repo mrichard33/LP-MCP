@@ -72,13 +72,13 @@ export async function extractPdfText(buffer) {
   }
 }
 
-async function logIngest(entry) {
+export async function logIngest(entry) {
   if (!supabase) return;
   const { error } = await supabase.from('scorecard_ingest_log').insert(entry);
   if (error) console.error('[LPReport] ingest-log write failed:', error.message);
 }
 
-async function quarantineRows(reportType, sha, items) {
+export async function quarantineRows(reportType, sha, items) {
   if (!supabase || !items.length) return;
   const { error } = await supabase.from('scorecard_ingest_quarantine').insert(
     items.map(({ reason, row }) => ({
@@ -92,7 +92,7 @@ async function quarantineRows(reportType, sha, items) {
   if (error) console.error('[LPReport] quarantine write failed:', error.message);
 }
 
-async function alertGroupMe(text) {
+export async function alertGroupMe(text) {
   try {
     const { sendGroupMeMessage } = await import('../groupme.js');
     await sendGroupMeMessage(text);

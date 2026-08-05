@@ -28,28 +28,60 @@ export function factKey({ market, branch_code_raw, metric, bucket }) {
  * @returns {Map<string, {market:string, branch_code_raw:string|null, metric:string,
  *                        bucket:string|null, cents:number, count:number}>} keyed by factKey
  */
+const KNOWN_TYPES = new Set([
+  'jobs_by_milestone', 'jobs_by_status',
+  // CSV-era sources (2026-08-05) — see sql/migrations/2026-08-05_lp_csv_history.sql
+  'job_status_ytd', 'lead_disposition', 'source_cost',
+]);
+
 export function expectedFacts(reportType, rows) {
-  if (reportType !== 'jobs_by_milestone' && reportType !== 'jobs_by_status') {
+  if (!KNOWN_TYPES.has(reportType)) {
     throw new Error(`expectedFacts: unknown report_type ${reportType}`);
   }
   const out = new Map();
-  const add = (market, branch, metric, bucket, cents) => {
-    const entry = { market, branch_code_raw: branch ?? null, metric, bucket: bucket ?? null, cents: 0, count: 0 };
+  // addOne: one source row into one grain (count += 1, PDF-era shape).
+  // addAgg: pre-aggregated counts (source_cost), where value_count is a Σ.
+  const bump = (market, branch, metric, bucket, cents, count, centsIsNull) => {
+    const entry = { market, branch_code_raw: branch ?? null, metric, bucket: bucket ?? null, cents: centsIsNull ? null : 0, count: 0 };
     const key = factKey(entry);
     const acc = out.get(key) || entry;
-    acc.cents += cents ?? 0;
-    acc.count += 1;
+    if (!centsIsNull) acc.cents += cents ?? 0;
+    acc.count += count;
     out.set(key, acc);
   };
+  const add = (market, branch, metric, bucket, cents) => bump(market, branch, metric, bucket, cents, 1, false);
 
   for (const r of rows) {
     if (reportType === 'jobs_by_milestone') {
       add(r.market, r.branch_code_raw, 'net_sales', null, r.net_cents);
       add(r.market, r.branch_code_raw, 'gross_sold', null, r.gross_cents);
-    } else {
+    } else if (reportType === 'jobs_by_status') {
       if (r.dup_review) add(r.market, r.branch_code_raw, 'dup_review_pending', null, r.total_gross_cents);
       else if (r.bucket === 'excluded') add(r.market, r.branch_code_raw, 'pipeline_excluded', 'excluded', r.total_gross_cents);
       else add(r.market, r.branch_code_raw, 'good_business_open', r.bucket, r.total_gross_cents);
+    } else if (reportType === 'job_status_ytd') {
+      // Buckets keep their identity (incl. 'permit'); excluded rows are the
+      // released/production track.
+      const metric = r.bucket === 'excluded' ? 'pipeline_excluded' : 'good_business_open';
+      add(r.market, r.branch_code_raw, metric, r.bucket, r.gross_cents);
+    } else if (reportType === 'lead_disposition') {
+      bump(r.market, r.brn_id_raw || null, 'leads', null, null, 1, true);
+      if (r.appt_date != null) bump(r.market, r.brn_id_raw || null, 'sets', null, null, 1, true);
+      if ((r.gsa_cents ?? 0) > 0) bump(r.market, r.brn_id_raw || null, 'sold', null, r.gsa_cents, 1, false);
+      if ((r.net_cents ?? 0) > 0) bump(r.market, r.brn_id_raw || null, 'net_sold', null, r.net_cents, 1, false);
+    } else {
+      // source_cost: company-level control-total facts (market 'REECE').
+      bump('REECE', null, 'leads', null, null, r.num_raw ?? 0, true);
+      bump('REECE', null, 'sets', null, null, r.num_set ?? 0, true);
+      bump('REECE', null, 'confirmed', null, null, r.num_cnf ?? 0, true);
+      bump('REECE', null, 'issued', null, null, r.num_issued ?? 0, true);
+      bump('REECE', null, 'sat', null, null, r.num_sat ?? 0, true);
+      bump('REECE', null, 'sold', null, null, r.num_sold ?? 0, true);
+      bump('REECE', null, 'net_sold', null, null, r.num_net_sold ?? 0, true);
+      bump('REECE', null, 'gross_sold', null, r.gsa_cents, 1, false);
+      bump('REECE', null, 'net_sales', null, r.nsa_cents, 1, false);
+      bump('REECE', null, 'marketing_cost', null, r.mcost_cents, 1, false);
+      bump('REECE', null, 'working_amount', null, r.working_cents, 1, false);
     }
   }
   return out;
