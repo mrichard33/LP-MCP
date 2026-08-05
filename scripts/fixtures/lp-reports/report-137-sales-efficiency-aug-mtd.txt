@@ -1,0 +1,29 @@
+                                                                 Sales       Efficiency            By    Market
+                                                                For Appointment Dates Between Sat 08/01/26 and Mon 08/31/26
+                                                               Market: ALL Sort By: By STD  Group By: By Market Grade: ALL
+                                                                                                                                                           NSLI
+              Gross     Net                Close             Working          Credit Decline       Canceled         Hold-HOA               Net             NCP
+    By Market   Iss     Iss  Demo    %OTD  %STD   %Vol    %Cnt       %Vol     %Cnt      %Vol     %Cnt      %Vol   %Cnt      %Vol      %Cnt      %Vol
+    BOCA          9       7      5        1        85,415    1       85,415
+                       78%    71%     11%   20%    85,415 100%        100%
+    FTLAU        13      13      9        1        95,698                                           1     95,698
+                      100%    69%      8%   11%    95,698                                       100%       100%
+    FTMYR        76      38     35       14       471,954    13     443,511                         1     28,443
+                       50%    92%     18%   40%    33,711  93%         94%                        7%         6%
+    JAX          42      23     19        4        60,948    2       29,625    2        31,323
+                       55%    83%     10%   21%    15,237  50%         49%   50%          51%
+    LAKE          7       2      2        2        41,390    1       15,675                                          1      25,715                         3,674
+                       29%    100%    29%  100%    20,695  50%         38%                                        50%         62%
+    MIAMI         5       3      1
+                       60%    33%
+    ORL          55      25     18        5        65,671    5       65,671
+                       45%    72%      9%   28%    13,134 100%        100%
+    SAR          44      29     28       10       161,676    6       92,520                                          4      69,156                         1,572
+                       66%    97%     23%   36%    16,168  60%         57%                                        40%         43%
+    STPET        47      25     19        3        59,750    2       53,350                                          1       6,400                          136
+                       53%    76%      6%   16%    19,917  67%         89%                                        33%         11%
+                298     165    136       40      1,042,502   30     785,767    2        31,323      2    124,141     6     101,271                          340
+    Total:
+                       55%    82%     13%   29%    26,063  75%         75%    5%           3%     5%        12%   15%         10%
+    8/5/2026 2:22PM                                                              Page 1 of 1                                                         Mark Richard
+    C1.C1Report.Section

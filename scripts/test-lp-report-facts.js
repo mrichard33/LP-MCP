@@ -81,7 +81,9 @@ test('Report B: dup rows only in dup_review_pending, excluded only in pipeline_e
 });
 
 test('unknown report type throws', () => {
-  assert.throws(() => expectedFacts('sales_efficiency', []), /unknown report_type/);
+  // sales_efficiency became a known type 2026-08-05 (report 137) — the
+  // tripwire moves to a genuinely unknown name.
+  assert.throws(() => expectedFacts('sales_velocity', []), /unknown report_type/);
 });
 
 // ── CSV-era sources (2026-08-05) — mirrors of the new SQL branches ──

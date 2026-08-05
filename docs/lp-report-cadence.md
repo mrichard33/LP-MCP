@@ -21,20 +21,21 @@ way duplicates occur; replace behavior is asserted live (see the 2026-08-05
 accuracy report §6) and enforced by the partial unique index
 `scorecard_report_snapshots_current_idx`.
 
-## The schedule
+## The schedule (revised 2026-08-05 — five reports, scope corrections applied)
 
-| Report | LP schedule | Feeds | Cadence |
-|---|---|---|---|
-| **Jobs by Milestone Date** (RTP, Actual) — Report A | ~6:00 ET daily (existing) | Goal & Pace, Net—Released, Funnel Sales | Month-to-date daily + prior month through business day 5 |
-| **Jobs By Status** — Report B | ~6:15 ET daily (existing) | Good Business split (monthly cohort) | Point-in-time daily (existing behavior) |
-| **Job Status Report** (open jobs) — Report C′ source for `job_status_ytd` | new | Net (Good Business) Breakdown: HOA / Permit / Other pending | **Full YTD daily** — it is a stock snapshot, not a period cohort |
-| **Lead Disposition Detail** — I.LPRC | ~6:30 ET daily (new) | Leads row, Issue %, funnel counts, source analysis | Month-to-date daily + monthly full-YTD validation pull |
-| **Marketing Sub Source Cost Anlysis 2** — I.LPRD | ~6:45 ET daily (new) | Sold This Period (NumSold/NumNetSold, GSA/NSA), NSLI, marketing ROI | Month-to-date daily + monthly full-YTD validation pull |
+| Report | LP ID | Time ET | Scope | Feeds |
+|---|---|---|---|---|
+| **Jobs by Milestone Date** (RTP, Actual) | 134 | 6:00 | **MTD** + prior month through business day 5 (flow — month-anchored self-heals backdated RTP) | Net Released, Goal & Pace |
+| **Jobs By Status** | 133 | 6:15 | **YTD** (changed from MTD — a stock metric; the Aug MTD pull returned 38 jobs vs 242 actually open, ~85% understatement) | Open backlog, HOA/Permit/Other |
+| **Lead Disposition Detail** | 135 | 6:30 | **MTD daily + YTD weekly** validation | Leads by market, dispositions, source |
+| **Marketing Sub Source Cost Anlysis 2** | 136 | 6:45 | **YTD** (changed from MTD — MTD returns $0 for Net Sales, NSLI, Total Cost, Cost/Lead) | Marketing cost, cost-per-lead |
+| **Sales Efficiency By Market** | 137 | 7:00 | **YTD daily** (MTD has an entirely blank Net column and garbage NSLI); pin the end date to **yesterday** — a future EDate widens the window past the sibling reports | Per-market Issued/Sat/Sold/**Cancelled**/NSA/NSLI |
 
-All to `lp-reports@reecewindowsmail.com`, staggered 6:00 / 6:15 / 6:30 / 6:45 ET.
-n8n polls the inbox every 15 minutes (worst-case ~15 min ingest latency; one poll
-window can pick up multiple reports — each Gmail trigger matches only its own
-subject filter, so that is safe).
+All to `lp-reports@reecewindowsmail.com`. Ingestion is the single **I.LPR
+router** (one Gmail trigger, routes on the `_133_`…`_137_` report ID in the
+attachment filename — subject strings retired); it polls every 15 minutes
+(worst-case ~15 min latency; multiple reports in one poll window are safe —
+each item routes independently).
 
 ## Format: PDF-only is confirmed — consequences
 
