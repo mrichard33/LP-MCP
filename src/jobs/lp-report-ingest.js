@@ -114,6 +114,41 @@ export async function extractPdfText(buffer) {
   }
 }
 
+/**
+ * pdftotext -bbox-layout — word-level COORDINATES, not reflowed text.
+ *
+ * Report 135 cannot be parsed from -layout output. Continuation fragments from
+ * different columns interleave on the same physical line:
+ *
+ *     Giovinazzo 450036 (561)251-2931 08/03/26 9807 Pavarotti Ter Apt 202 Internet Internet,
+ *     MyHomePros
+ *     Data 7 Answering
+ *     mamag418@gmail.com Machine Boynton Beach, FL 33437 MyHomePros
+ *
+ * `Answering` and `Machine` are one Last Result value, but `Machine` prints on a
+ * line that also carries the email and the address. Any line-joining parser
+ * mangles that. Clustering by x-coordinate puts `Machine` in the Result band
+ * regardless of which line it printed on.
+ *
+ * Same poppler binary and the same text-layer assertion as extractPdfText — no
+ * new dependency.
+ */
+export async function extractPdfBboxXml(buffer) {
+  const tmp = join(tmpdir(), `lp-report-${randomUUID()}.pdf`);
+  await writeFile(tmp, buffer);
+  try {
+    const fonts = await execFileP('pdffonts', [tmp], { maxBuffer: 4 * 1024 * 1024 });
+    const fontRows = fonts.stdout.split('\n').slice(2).filter((l) => l.trim());
+    if (!fontRows.length) {
+      throw new NoTextLayerError('PDF has no text layer (pdffonts lists zero fonts) — scanned image? OCR is not permitted.');
+    }
+    const { stdout } = await execFileP('pdftotext', ['-bbox-layout', tmp, '-'], { maxBuffer: 256 * 1024 * 1024 });
+    return stdout;
+  } finally {
+    await unlink(tmp).catch(() => {});
+  }
+}
+
 export async function logIngest(entry) {
   if (!supabase) return;
   const { error } = await supabase.from('scorecard_ingest_log').insert(entry);
