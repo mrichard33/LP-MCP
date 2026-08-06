@@ -1,7 +1,7 @@
 /**
  * Five9 admin write handler — src/actions/handlers/five9.js
  *
- * One dispatcher for all eight five9_* write action types. The real work
+ * One dispatcher for all twelve five9_* write action types. The real work
  * (guardrails, serialization lock, read-before-write, audit events) lives
  * in src/five9/admin-writes.js — this file is only the executor-facing
  * seam plus the belt-and-braces approval check.
@@ -21,6 +21,11 @@ import {
   executeDeleteRecordFromList,
   executeAddNumbersToDnc,
   executeRemoveNumbersFromDnc,
+  // 2026-08-05 Phase D — user skills + campaign profile create
+  executeUserSkillAdd,
+  executeUserSkillModify,
+  executeUserSkillRemove,
+  executeCreateCampaignProfile,
 } from '../../five9/admin-writes.js';
 
 const FIVE9_WRITE_OPS = {
@@ -32,6 +37,11 @@ const FIVE9_WRITE_OPS = {
   five9_delete_record_from_list: executeDeleteRecordFromList,
   five9_add_numbers_to_dnc: executeAddNumbersToDnc,
   five9_remove_numbers_from_dnc: executeRemoveNumbersFromDnc,
+  // 2026-08-05 Phase D
+  five9_user_skill_add: executeUserSkillAdd,
+  five9_user_skill_modify: executeUserSkillModify,
+  five9_user_skill_remove: executeUserSkillRemove,
+  five9_create_campaign_profile: executeCreateCampaignProfile,
 };
 
 export async function executeFive9Write(action) {

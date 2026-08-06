@@ -53,9 +53,13 @@ import {
   getCampaigns,
   getCampaignState,
   getOutboundCampaign,
+  getCampaignProfiles,
   getListsInfo,
   checkDncForNumbers,
 } from '../five9-admin.js';
+// 2026-08-05 Phase D — read-before-write for user-skill ops. getUsersFullInfo
+// takes a Five9 userNamePattern regex and returns assigned skills with levels.
+import { getUsersFullInfo } from '../five9-users-info.js';
 import { tryAcquireLock, releaseLock, decideLockHeldReschedule } from '../services/outbound-locks.js';
 import { emitEvent } from '../event-emitter.js';
 
@@ -104,6 +108,31 @@ export function checkCompliancePatch(patch, { complianceOverride = false } = {})
 }
 
 /* ---------------------------------------------------------------------- *
+ * Guardrail 7 (2026-08-05 Phase D) — attempts ceiling on campaign profiles.
+ * Same spirit as the abandon-rate line: a number that is defensible at 8 is
+ * not defensible at 100. The live `Data Leads` profile was found at 100
+ * attempts per record, driving five campaigns.
+ * Override is deliberate and audited, never a default.
+ * ---------------------------------------------------------------------- */
+
+export const MAX_PROFILE_ATTEMPTS_LIMIT = Math.max(
+  1,
+  parseInt(process.env.FIVE9_MAX_PROFILE_ATTEMPTS || '12', 10),
+);
+
+export function checkProfileCompliance(profile, { complianceOverride = false } = {}) {
+  const violations = [];
+  const n = profile?.numberOfAttempts;
+  if (n !== undefined && n !== null && Number(n) > MAX_PROFILE_ATTEMPTS_LIMIT) {
+    violations.push(`numberOfAttempts ${n} > ${MAX_PROFILE_ATTEMPTS_LIMIT}`);
+  }
+  if (violations.length && complianceOverride !== true) {
+    return { ok: false, violations };
+  }
+  return { ok: true, violations, overridden: violations.length > 0 };
+}
+
+/* ---------------------------------------------------------------------- *
  * Guardrail 6 — DNC removals need a per-number reason.
  * ---------------------------------------------------------------------- */
 
@@ -132,6 +161,14 @@ export function requiredConfirmToken(op, payload) {
   if (op === 'remove_numbers_from_dnc') {
     return (Array.isArray(payload?.removals) ? payload.removals : [])
       .map(r => String(r?.number ?? '').trim()).filter(Boolean).join(',');
+  }
+  // 2026-08-05 Phase D — a campaign profile is shared. `Data Leads` alone
+  // serves five campaigns, so one typo here is a five-campaign blast radius.
+  // Restating the profile name is the typo gate; approve_action stays the
+  // human gate. (The modify op itself lands in the follow-up PR — see the
+  // Phase D note in docs; this rule is inert until then.)
+  if (op === 'modify_campaign_profile') {
+    return String(payload?.profile_name || '').trim();
   }
   return null; // op not double-gated
 }
@@ -206,15 +243,47 @@ const OUTBOUND_CAMPAIGN_FIELD_ORDER = [
   'useTelemarketingMaxQueTimeEq1',
 ];
 
-// v1 patch whitelist: the dialing-settings surface only. Anything else
-// (state, type, profileName, ...) is refused loudly — no typo pass-through.
+// v2 patch whitelist (2026-08-05 Phase D). Still the dialing/routing surface
+// only — `state`, `type`, and `trainingMode` stay refused; lifecycle has its
+// own ops and training mode is not an agentic decision.
+//
+// Added in v2, all of them already present in OUTBOUND_CAMPAIGN_FIELD_ORDER
+// and already accepted by modifyOutboundCampaign — v1 simply never allowed
+// them through:
+//   distributionAlgorithm   — DIAL ASAP ran RoundRobin, which ignores skill
+//                             LEVEL, on the highest-yield campaign
+//   previewDialImmediately  — false + 2min maxPreviewTime on a speed-to-lead
+//                             campaign is agent-hesitation latency by config
+//   profileName             — required to move a campaign onto a per-tier
+//                             profile without recreating the campaign
+//   dialingPriority, callAnalysisMode, actionOnAnswerMachine,
+//   limitPreviewTime, distributionTimeFrame — round out the surface
 export const PATCHABLE_FIELDS = new Set([
   'dialingMode', 'dialingRatio', 'callsAgentRatio', 'maxDroppedCallsPercentage',
   'maxQueueTime', 'maxPreviewTime', 'actionOnQueueExpiration',
   'monitorDroppedCalls', 'dialNumberOnTimeout', 'useTelemarketingMaxQueTimeEq1',
+  'distributionAlgorithm', 'previewDialImmediately', 'profileName',
+  'dialingPriority', 'callAnalysisMode', 'actionOnAnswerMachine',
+  'limitPreviewTime', 'distributionTimeFrame',
 ]);
 
 const TIMER_FIELDS = new Set(['maxQueueTime', 'maxPreviewTime']);
+
+// Phase C defect (fixed here): actionOnQueueExpiration was already in the v1
+// whitelist, but the builder ran escapeXml() over it. It is a complex type
+// ({ actionType: 'DROP_CALL' }), so it serialized as the literal string
+// "[object Object]". Any v1 patch touching it was malformed. These two fields
+// emit a nested <actionType> element instead.
+const COMPLEX_ACTION_FIELDS = new Set(['actionOnQueueExpiration', 'actionOnAnswerMachine']);
+
+export function actionFieldXml(tagName, value) {
+  const actionType = typeof value === 'string' ? value : value?.actionType;
+  const at = String(actionType ?? '').trim();
+  if (!at) {
+    throw new Error(`${tagName}: expected { actionType: "..." } or a string, got ${JSON.stringify(value)}`);
+  }
+  return `<${tagName}><actionType>${escapeXml(at)}</actionType></${tagName}>`;
+}
 
 export function buildModifyOutboundCampaignXml(campaignName, patch) {
   const name = String(campaignName || '').trim();
@@ -232,9 +301,13 @@ export function buildModifyOutboundCampaignXml(campaignName, patch) {
   for (const field of OUTBOUND_CAMPAIGN_FIELD_ORDER) {
     const v = merged[field];
     if (v === undefined || v === null) continue;
-    xml += TIMER_FIELDS.has(field)
-      ? secondsToTimerXml(field, v)
-      : `<${field}>${escapeXml(v)}</${field}>`;
+    if (TIMER_FIELDS.has(field)) {
+      xml += secondsToTimerXml(field, v);
+    } else if (COMPLEX_ACTION_FIELDS.has(field)) {
+      xml += actionFieldXml(field, v);
+    } else {
+      xml += `<${field}>${escapeXml(v)}</${field}>`;
+    }
   }
   return `<campaign>${xml}</campaign>`;
 }
@@ -298,6 +371,94 @@ export function buildDeleteRecordFromListXml(listName, fieldNames, values, listD
     `</listDeleteSettings>` +
     recordXml(values)
   );
+}
+
+/* ---------------------------------------------------------------------- *
+ * Phase D builders — user skills + campaign profiles.
+ *
+ * FIELD ORDER BELOW IS WSDL-DERIVED, quoted from the live v13 schema on
+ * 2026-08-06 (api.five9.com/wsadmin/v13/AdminWebService?wsdl). Read-response
+ * order was NOT used to derive it. Both sequences are flat — neither type
+ * uses xs:extension, so there is no base sequence to emit first.
+ *
+ *   <xs:complexType name="campaignProfileInfo"><xs:sequence>
+ *     ANI, description, dialingSchedule, dialingTimeout,
+ *     initialCallPriority, maxCharges, name, numberOfAttempts
+ *
+ *   <xs:complexType name="userSkill"><xs:sequence>
+ *     id, level, skillName, userName
+ *
+ * NOTE: in userSkill, <level> is the ONE element without minOccurs="0" —
+ * it is schema-required on every userSkill* call, including remove. We never
+ * send <id>; userName + skillName are the natural key.
+ * ---------------------------------------------------------------------- */
+
+const USER_SKILL_FIELD_ORDER = ['id', 'level', 'skillName', 'userName'];
+
+// `dialingSchedule` is a nested complex type and is deliberately NOT patchable
+// in v1 — only scalars are emitted. It stays in the order array so the
+// sequence stays a faithful copy of the WSDL.
+const CAMPAIGN_PROFILE_FIELD_ORDER = [
+  'ANI', 'description', 'dialingSchedule', 'dialingTimeout',
+  'initialCallPriority', 'maxCharges', 'name', 'numberOfAttempts',
+];
+
+export const PROFILE_PATCHABLE_FIELDS = new Set([
+  'description', 'ANI', 'numberOfAttempts', 'dialingTimeout',
+  'initialCallPriority', 'maxCharges',
+]);
+
+export const SKILL_LEVEL_MIN = 1;
+export const SKILL_LEVEL_MAX = 9;
+
+// getUsersFullInfo takes a Five9-side regex. Anchor + escape so "jflanders"
+// cannot match "jflanders2" and a dot in an email-style login stays literal.
+export function exactUserPattern(userName) {
+  return `^${String(userName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`;
+}
+
+export function buildUserSkillXml(userSkill) {
+  const userName = String(userSkill?.userName || '').trim();
+  const skillName = String(userSkill?.skillName || '').trim();
+  if (!userName) throw new Error('userSkill.userName is required');
+  if (!skillName) throw new Error('userSkill.skillName is required');
+
+  // <level> is schema-required (the only element in the type without
+  // minOccurs="0"), so it is never optional here.
+  const lvl = parseInt(userSkill?.level, 10);
+  if (!Number.isFinite(lvl) || lvl < SKILL_LEVEL_MIN || lvl > SKILL_LEVEL_MAX) {
+    throw new Error(`userSkill.level must be ${SKILL_LEVEL_MIN}–${SKILL_LEVEL_MAX}, got ${userSkill?.level}`);
+  }
+
+  const merged = { level: lvl, skillName, userName };
+  let xml = '';
+  for (const field of USER_SKILL_FIELD_ORDER) {
+    const v = merged[field];
+    if (v === undefined || v === null) continue;
+    xml += `<${field}>${escapeXml(v)}</${field}>`;
+  }
+  return `<userSkill>${xml}</userSkill>`;
+}
+
+export function buildCampaignProfileXml(profileName, patch) {
+  const name = String(profileName || '').trim();
+  if (!name) throw new Error('profile_name is required');
+  if (!patch || typeof patch !== 'object' || !Object.keys(patch).length) {
+    throw new Error('patch with at least one field is required');
+  }
+  for (const key of Object.keys(patch)) {
+    if (!PROFILE_PATCHABLE_FIELDS.has(key)) {
+      throw new Error(`REFUSED: "${key}" is not a patchable campaign profile field (allowed: ${[...PROFILE_PATCHABLE_FIELDS].join(', ')})`);
+    }
+  }
+  const merged = { name, ...patch };
+  let xml = '';
+  for (const field of CAMPAIGN_PROFILE_FIELD_ORDER) {
+    const v = merged[field];
+    if (v === undefined || v === null) continue;
+    xml += `<${field}>${escapeXml(v)}</${field}>`;
+  }
+  return `<campaignProfile>${xml}</campaignProfile>`;
 }
 
 /* ---------------------------------------------------------------------- *
@@ -548,4 +709,149 @@ export function executeRemoveNumbersFromDnc(action) {
     ctx.new_state = await checkDncForNumbers(numbers); // read-back proves the removal
     return { numbers_submitted: numbers.length, still_on_dnc: ctx.new_state.on_dnc.length };
   });
+}
+
+/* ---------------------------------------------------------------------- *
+ * Phase D executes — user skills.
+ *
+ * All three ops take the same <userSkill> object (WSDL-confirmed: the
+ * userSkillAdd / userSkillModify / userSkillRemove request wrappers each
+ * hold exactly one element, name="userSkill" type="tns:userSkill").
+ *
+ * Read-before-write reads the ONE user by exact-match pattern, so the audit
+ * event carries that user's full skill set before and after. Skill routing is
+ * the difference between a staffed queue and an 8-minute hold; the diff needs
+ * to be legible six months later.
+ * ---------------------------------------------------------------------- */
+
+async function readUserSkills(userName) {
+  const res = await getUsersFullInfo(exactUserPattern(userName));
+  const users = res?.users || [];
+  const hit = users.find(u => String(u.userName).toLowerCase() === String(userName).toLowerCase());
+  if (!hit) return { userName, found: false, skills: [] };
+  return { userName: hit.userName, found: true, active: hit.active, skills: hit.skills || [] };
+}
+
+// five9-users-info.js normalizes the wire tag <skillName> to `name`.
+const heldSkill = (skills, skillName) =>
+  (skills || []).find(s => String(s.name) === skillName) || null;
+
+function userSkillOp(action, subtype, method) {
+  const payload = action.action_payload || {};
+  const userName = String(payload.user_name || '').trim();
+  const skillName = String(payload.skill_name || '').trim();
+  if (!userName) throw new Error(`${subtype} requires action_payload.user_name`);
+  if (!skillName) throw new Error(`${subtype} requires action_payload.skill_name`);
+
+  return withFive9WriteGate(
+    { action, subtype, entityType: 'five9_user_skill', entityId: `${userName}:${skillName}` },
+    async (ctx) => {
+      const before = await readUserSkills(userName);
+      if (!before.found) throw new Error(`user_not_found: ${userName}`);
+      ctx.previous_state = before;
+
+      const held = heldSkill(before.skills, skillName);
+      if (subtype === 'user_skill_add' && held) {
+        return { skipped: true, reason: 'already_holds_skill', user: userName, skill: skillName };
+      }
+      if ((subtype === 'user_skill_remove' || subtype === 'user_skill_modify') && !held) {
+        return { skipped: true, reason: 'does_not_hold_skill', user: userName, skill: skillName };
+      }
+
+      // <level> is schema-required on every userSkill* call. Add/modify take it
+      // from the payload; remove has nothing to change it to, so it restates
+      // the level the user currently holds.
+      const level = subtype === 'user_skill_remove' ? (held?.level ?? SKILL_LEVEL_MIN) : payload.level;
+      const bodyXml = buildUserSkillXml({ userName, skillName, level });
+
+      await ctx.soap(method, bodyXml);
+      if (ctx.dry_run) return { user: userName, skill: skillName, method };
+
+      const after = await readUserSkills(userName);
+      ctx.new_state = after;
+      const nowHeld = !!heldSkill(after.skills, skillName);
+      const expected = subtype !== 'user_skill_remove';
+      ctx.event_extra.verified = nowHeld === expected;
+      return {
+        user: userName,
+        skill: skillName,
+        method,
+        verified: nowHeld === expected,
+        skill_count: after.skills.length,
+      };
+    },
+  );
+}
+
+export function executeUserSkillAdd(action) {
+  return userSkillOp(action, 'user_skill_add', 'userSkillAdd');
+}
+
+export function executeUserSkillModify(action) {
+  return userSkillOp(action, 'user_skill_modify', 'userSkillModify');
+}
+
+export function executeUserSkillRemove(action) {
+  return userSkillOp(action, 'user_skill_remove', 'userSkillRemove');
+}
+
+/* ---------------------------------------------------------------------- *
+ * Phase D executes — campaign profiles.
+ *
+ * Only CREATE ships in this PR. The modify op is held back: its request
+ * wrapper (<xs:complexType name="modifyCampaignProfile">) sits past the
+ * 100k-char response cap on every WSDL build we can reach, so the name of its
+ * single child element is unverified. createCampaignProfile IS verified —
+ * <xs:element minOccurs="0" name="campaignProfile" type="tns:campaignProfileInfo"/>
+ * — and the sibling ops in this family disagree with each other on that name
+ * (modifyCampaignProfileFilterOrder uses "campaignProfile",
+ * modifyCampaignProfileCrmCriteria uses "profileName"), so it is not safely
+ * inferable. See the PR body for the one-command follow-up.
+ *
+ * Create needs no confirm_token: a new profile is attached to nothing until a
+ * separate five9_set_outbound_campaign patch moves a campaign onto it.
+ * ---------------------------------------------------------------------- */
+
+async function readProfile(profileName) {
+  const res = await getCampaignProfiles();
+  const list = res?.profiles || [];
+  return list.find(p => String(p.name).toLowerCase() === String(profileName).toLowerCase()) || null;
+}
+
+export function executeCreateCampaignProfile(action) {
+  const payload = action.action_payload || {};
+  const name = String(payload.profile_name || '').trim();
+  const profile = payload.profile;
+  if (!name) throw new Error('five9_create_campaign_profile requires action_payload.profile_name');
+  if (!profile || typeof profile !== 'object') {
+    throw new Error('five9_create_campaign_profile requires action_payload.profile');
+  }
+
+  return withFive9WriteGate(
+    { action, subtype: 'create_campaign_profile', entityType: 'five9_campaign_profile', entityId: name },
+    async (ctx) => {
+      const bodyXml = buildCampaignProfileXml(name, profile);
+      const existing = await readProfile(name);
+      // Check before assigning previous_state: the gate returns `skipped`
+      // results untouched, so state set here would be dropped anyway.
+      if (existing) {
+        return { skipped: true, reason: 'profile_already_exists', profile: name };
+      }
+      ctx.previous_state = existing;
+
+      const compliance = checkProfileCompliance(profile, {
+        complianceOverride: payload.compliance_override === true,
+      });
+      ctx.event_extra.compliance = compliance;
+      if (!compliance.ok) {
+        throw new Error(`REFUSED: compliance — ${compliance.violations.join('; ')} (attempts ceiling; requires explicit compliance_override: true)`);
+      }
+
+      await ctx.soap('createCampaignProfile', bodyXml);
+      if (ctx.dry_run) return { profile: name, created: false, previewed: true };
+
+      ctx.new_state = await readProfile(name);
+      return { profile: name, created: !!ctx.new_state };
+    },
+  );
 }
