@@ -600,9 +600,19 @@ test('maxQueueTime verifies off the already-normalized seconds field', () => {
   assert.equal(drift[0].actual, 30);
 });
 
-test('maxPreviewTime is not surfaced by the reader, so it stays unverified', () => {
-  // Documents current reality: absent from the normalized read means skipped,
-  // NOT silently passed on a value we never looked at.
+test('maxPreviewTime verifies through raw — it was wrongly hardcoded as skipped', () => {
+  // The old code hardcoded maxPreviewTime to undefined, annotated "not
+  // surfaced in normalized read". raw.maxPreviewTime is present on every
+  // outbound campaign, so that skip reported verified:true for a field nothing
+  // had looked at — the same lie as a permanent verified:false, just quieter.
+  const after = { raw: { maxPreviewTime: { days: '0', hours: '0', minutes: '0', seconds: '20' } } };
+  assert.deepEqual(verifyPatchReadBack({ maxPreviewTime: 20 }, after), [], 'a matching 20s preview must verify clean');
+  const drift = verifyPatchReadBack({ maxPreviewTime: 20 }, { raw: { maxPreviewTime: { minutes: '2', seconds: '0' } } });
+  assert.equal(drift.length, 1, 'a genuine preview-time drift must surface');
+  assert.equal(drift[0].field, 'maxPreviewTime');
+  assert.equal(drift[0].expected, 20);
+  assert.equal(drift[0].actual, 120);
+  // Genuinely absent from the read-back is still skipped, not falsely passed.
   assert.deepEqual(verifyPatchReadBack({ maxPreviewTime: 10 }, { raw: {} }), []);
 });
 

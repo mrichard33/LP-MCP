@@ -708,18 +708,30 @@ export function executeResetCampaign(action) {
  *
  * Found live on action 283332 (2026-08-06, CRMRedialTimeout 2h → 300s): the
  * write was correct, the read-back was {hours:'0',minutes:'5'}, and it still
- * reported verified:false. In practice CRMRedialTimeout was the only field
- * exposed — maxQueueTime resolves to the already-normalized
- * maxQueueTimeSeconds, and maxPreviewTime is not surfaced by the reader at all
- * — but the timer branch covers all three, because TIMER_FIELDS is exactly the
- * tns:timer set and those two exemptions are properties of the current reader
- * rather than of the protocol.
+ * reported verified:false.
+ *
+ * All three TIMER_FIELDS now verify. maxQueueTime resolves through the
+ * reader's already-converted maxQueueTimeSeconds; CRMRedialTimeout and
+ * maxPreviewTime resolve through raw and normalize here. maxPreviewTime was
+ * previously hardcoded to undefined and skipped — see the comment at the
+ * resolution site for why that was wrong.
  */
 export function verifyPatchReadBack(patch, after) {
   const mismatches = [];
   for (const [field, expected] of Object.entries(patch || {})) {
-    const actual = field === 'maxQueueTime' ? after?.maxQueueTimeSeconds
-      : field === 'maxPreviewTime' ? undefined // not surfaced in normalized read
+    // maxQueueTime is the one field the reader renames: it is surfaced already
+    // converted, as maxQueueTimeSeconds. Everything else is read under its own
+    // name, falling back to the raw SOAP config.
+    //
+    // maxPreviewTime USED to be hardcoded to undefined here, annotated "not
+    // surfaced in normalized read". That was false: raw.maxPreviewTime is
+    // present on every outbound campaign (2026-08-06 — {days:0,hours:0,
+    // minutes:0,seconds:20} on DIAL ASAP and After DIAL ASAP alike). The skip
+    // silently reported verified:true for a field nothing had looked at, which
+    // is the same lie as a permanent verified:false, just quieter. Removed —
+    // it now resolves through raw and normalizes in the timer branch below.
+    const actual = field === 'maxQueueTime'
+      ? after?.maxQueueTimeSeconds
       : after?.[field] ?? after?.raw?.[field];
     if (actual === undefined) continue;
     if (TIMER_FIELDS.has(field)) {
