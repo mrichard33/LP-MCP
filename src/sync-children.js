@@ -23,6 +23,17 @@
 // - Call aggregates briefly derived from the LP payload; REVERTED — LP's
 //   getLead returns a rolling ~7-day call window, not the full history, so
 //   call_count was silently truncated. See the block comment in syncCallLogs.
+//
+// v7.3 — MILESTONE ACHIEVEMENT GATE + RICHER EVENT PAYLOAD (2026-08-06):
+// - A milestone with act_date in the FUTURE is scheduled, not achieved. The
+//   fire test now runs through isMilestoneAchieved() (src/milestone-gate.js).
+//   209 rows carried a future act_date and 56 had already fired, including 6
+//   "Install End" fires for installs ending as late as 2026-12-29. The row is
+//   still written with its future date; only the tag + event are held back,
+//   and processMilestoneTriggers fires it on the day it lands.
+// - lp.milestone_completed payload now carries datetype, act_date, job_value
+//   and branch_code — needed by the P2 rules (opportunity value, market
+//   attribution) and to disambiguate the mdt_id 'X' collision downstream.
 
 import supabase from './supabase.js';
 import { getField, normalizePhone, extractArray, loggedFirstKeys, sleep } from './sync-utils.js';
@@ -32,12 +43,20 @@ import { matchToGHL, applyGHLTag } from './ghl.js';
 import { emitEvent } from './event-emitter.js';
 import { combineNotes } from './safe-notes.js';
 import { getLead } from './lp-client.js';
+import { isMilestoneAchieved } from './milestone-gate.js';
 
 // ─── Skip counter for observability ──────────────────────────────
 let _childSkips = { calls: 0, notes: 0, activities: 0 };
 export function getChildSkipStats() { const s = { ..._childSkips }; _childSkips = { calls: 0, notes: 0, activities: 0 }; return s; }
 
 // ─── Milestone Tag Map (mdt_id → GHL tag) ────────────────────────
+// NOTE: duplicated in src/milestones.js — the two must stay in step.
+// KNOWN DEFECT (2026-08-06): LP uses mdt_id 'X' for TWO datetypes,
+// 'Inspection Ready' (4,772 rows) and 'Snap and Trim' (580), so every
+// Inspection Ready completion fires lp-milestone-snap-trim. Neither is a
+// customer-facing beat, so this is a reporting defect; fixing it needs the
+// map keyed on mdt_id + datetype AND the (lp_job_id, mdt_id) conflict key
+// widened. Tracked separately.
 export const MDT_TAG_MAP = {
   R: 'lp-milestone-rtp',          M: 'lp-milestone-measure',
   O: 'lp-milestone-quoted',       H: 'lp-milestone-hoa-approved',
@@ -382,17 +401,25 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
     console.log('[Sync] Job record keys:', Object.keys(job).join(', '));
   }
   const jobId = String(getField(job, 'id', 'job_id', 'JobID'));
+
+  // Hoisted out of the upsert literal (v7.3) so the milestone event payload
+  // below can carry them. The P2 rules need job_value for the opportunity's
+  // monetary value and branch_code for market attribution; before this they
+  // had to re-query lp_jobs to get either.
+  const jobValue = parseFloat(getField(job, 'grossamount', 'GrossAmount', 'gsa', 'GSA') || 0) || null;
+  // #512-market: persist the LP branch (revenue-authoritative for market
+  // attribution). LP pads the code ('ORL  '), so TRIM + upper. Falls back to
+  // brn_id. Null when the job carries no branch (market resolver → zip).
+  const branchCode = (getField(job, 'brp_id', 'brn_id', 'BRP_ID', 'BrpId') || '').trim().toUpperCase() || null;
+
   try {
     await supabase.from('lp_jobs').upsert({
       lp_job_id:       jobId,
       lp_lead_id:      lpLeadId,
       ghl_contact_id:  ghlContactId || null,
       job_status:      getField(job, 'jobstatus', 'JobStatus', 'job_status'),
-      job_value:       parseFloat(getField(job, 'grossamount', 'GrossAmount', 'gsa', 'GSA') || 0) || null,
-      // #512-market: persist the LP branch (revenue-authoritative for market
-      // attribution). LP pads the code ('ORL  '), so TRIM + upper. Falls back to
-      // brn_id. Null when the job carries no branch (market resolver → zip).
-      branch_code:     (getField(job, 'brp_id', 'brn_id', 'BRP_ID', 'BrpId') || '').trim().toUpperCase() || null,
+      job_value:       jobValue,
+      branch_code:     branchCode,
       rep_name:        getField(job, 'salesrepname', 'SalesRepName', 'rep_name'),
       created_at_lp:   lpDateToEastern(getField(job, 'entrydate', 'EntryDate')),
       updated_at_lp:   lpDateToEastern(getField(job, 'lastchangedon', 'LastChangedOn')),
@@ -433,7 +460,25 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
     const existing = existingByMdt.get(String(mdtId));
 
     const actDate = getField(ms, 'actdate', 'ActDate', 'act_date');
+    const actDateEt = lpDateToEastern(actDate);
+    const dateType = getField(ms, 'datetype', 'DateType');
     const tag = MDT_TAG_MAP[mdtId];
+
+    // v7.3 ACHIEVEMENT GATE — act_date alone is NOT a completion.
+    // LP is routinely used to record SCHEDULED actuals: the coordinator books
+    // the install and stamps act_date with the future date. Measured
+    // 2026-08-06: 209 rows carried a future act_date, 56 had already fired,
+    // including 6 "Install End" fires for installs ending as late as
+    // 2026-12-29 (plus corrupt 2206 / 2046 entries). See src/milestone-gate.js.
+    //
+    // The row is still WRITTEN with its future act_date — that data is real
+    // and reporting wants it. Only the tag + event are held. Because
+    // `existing.act_date` will then be non-null on the next sync, this inline
+    // path will never re-fire it; processMilestoneTriggers (src/milestones.js)
+    // is what picks it up on the day it actually lands. That sweeper carries
+    // the same gate, so the two paths cannot disagree.
+    const achieved = isMilestoneAchieved(actDateEt);
+
     // A first-time completion of a tag-mapped milestone fires a GHL tag — here
     // (only when a contact is linked NOW), AND independently via milestones.js
     // processMilestoneTriggers, which sweeps every row with act_date NOT NULL +
@@ -446,16 +491,16 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
     // or not, so no future sweep can ever match the row. tag_suppressed_backfill
     // keeps these distinguishable from genuinely-fired tags (ghl_tag_fired now
     // means "fired OR deliberately suppressed"). #512.
-    const isFirstCompletion = !!(actDate && !existing?.act_date && !existing?.ghl_tag_fired && tag);
+    const isFirstCompletion = !!(actDate && achieved && !existing?.act_date && !existing?.ghl_tag_fired && tag);
     const wouldFire = isFirstCompletion && !!ghlContactId;         // fires only if a contact is linked now
     const suppressThisFire = isFirstCompletion && suppressSideEffects; // suppress linked OR unlinked
 
     const msRow = {
       lp_job_id: jobId, lp_lead_id: lpLeadId, ghl_contact_id: ghlContactId || null,
       mdt_id: mdtId,
-      datetype:    getField(ms, 'datetype', 'DateType'),
+      datetype:    dateType,
       est_date:    lpDateToEastern(getField(ms, 'estdate', 'EstDate', 'est_date')),
-      act_date:    lpDateToEastern(actDate),
+      act_date:    actDateEt,
       entered_by:  getField(ms, 'enteredby', 'EnteredBy', 'entered_by'),
       entered_on:  lpDateToEastern(getField(ms, 'enteredon', 'EnteredOn', 'entered_on')),
       synced_at:   new Date().toISOString(),
@@ -468,7 +513,10 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
 
     // Last occurrence wins (matches the old sequential order); the decision is
     // recorded once per mdt_id so counting happens exactly once below.
-    decisionByMdt.set(mdtId, { msRow, suppress: suppressThisFire, ghlLinked: !!ghlContactId, fire: wouldFire, tag });
+    decisionByMdt.set(mdtId, {
+      msRow, suppress: suppressThisFire, ghlLinked: !!ghlContactId, fire: wouldFire,
+      tag, dateType, actDateEt,
+    });
   }
 
   // Materialise the deduped rows + counts + fire list from the decision map.
@@ -479,7 +527,7 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
     if (d.suppress) {
       if (d.ghlLinked) suppressedFires++; else suppressedUnlinked++;
     } else if (d.fire) {
-      firesToDo.push({ mdtId, tag: d.tag });
+      firesToDo.push({ mdtId, tag: d.tag, dateType: d.dateType, actDateEt: d.actDateEt });
     }
   }
 
@@ -502,13 +550,16 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
 
   // Fire the non-suppressed first-time completions (normal-sync path; EMPTY under
   // suppressSideEffects). Sequential — applyGHLTag is rate-limited.
-  for (const { mdtId, tag } of firesToDo) {
+  for (const { mdtId, tag, dateType, actDateEt } of firesToDo) {
     const success = await applyGHLTag(ghlContactId, tag);
     if (success) {
       await supabase.from('lp_job_milestones')
         .update({ ghl_tag_fired: true }).eq('lp_job_id', jobId).eq('mdt_id', mdtId);
       console.log(`[Sync] Milestone tag fired: ${tag} for contact ${ghlContactId}`);
       // v7.1: Emit milestone event for P2 lifecycle agent rules
+      // v7.3: payload carries datetype (disambiguates the mdt_id 'X' collision),
+      //       act_date, job_value and branch_code so the P2 rules can set the
+      //       opportunity value and market without a second query.
       try {
         await emitEvent({
           event_type: 'lp.milestone_completed',
@@ -516,7 +567,16 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
           entity_type: 'contact',
           entity_id: ghlContactId,
           ghl_contact_id: ghlContactId,
-          payload: { mdt_id: mdtId, milestone_tag: tag, job_id: jobId, lp_lead_id: lpLeadId },
+          payload: {
+            mdt_id: mdtId,
+            datetype: dateType || null,
+            milestone_tag: tag,
+            act_date: actDateEt || null,
+            job_id: jobId,
+            lp_lead_id: lpLeadId,
+            job_value: jobValue,
+            branch_code: branchCode,
+          },
           priority: 'normal',
           idempotency_key: `lp_milestone_${ghlContactId}_${mdtId}_${jobId}`,
         });
