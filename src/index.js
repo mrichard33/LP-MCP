@@ -235,6 +235,8 @@ import { registerLpReportReconRoutes, startLpReportReconScheduler } from './jobs
 import { startLpReportWatchdog } from './jobs/lp-report-watchdog.js';
 // Nightly scorecard validation + GroupMe tie-out alert.
 import { registerScorecardValidateRoutes, startScorecardValidateScheduler } from './jobs/scorecard-validate.js';
+// 2026-08-06 Phase E — daily Five9 config snapshot + change log (ships dark)
+import { registerFive9SnapshotRoutes, startFive9ConfigSnapshotScheduler } from './jobs/five9-config-snapshot.js';
 // ─── Agentic Hold-Complete (return-from-hold re-entry) ───────────
 import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
 // ─── FB Publish Watchdog (alert on missed WF4 publish window) ────
@@ -697,6 +699,44 @@ async function runMigrations() {
   } catch (err) {
     console.warn('[Migration] scorecard revenue-realignment schema skipped:', err.message);
   }
+
+  // 2026-08-06 Phase E — Five9 config snapshot history (sql/055). Mirrored so a
+  // fresh deploy self-heals. Indexes are PLAIN here, not CONCURRENTLY: that
+  // keyword cannot run inside a transaction block and there is no code path in
+  // this repo that runs statements outside one. On a fresh deploy the tables are
+  // empty, so a blocking build is instantaneous. The CONCURRENTLY forms live in
+  // sql/055 under a RUN SEPARATELY banner for the existing-table case.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE TABLE IF NOT EXISTS five9_config_snapshots (
+      id             bigserial PRIMARY KEY,
+      snapshot_date  date        NOT NULL DEFAULT (now() AT TIME ZONE 'America/New_York')::date,
+      captured_at    timestamptz NOT NULL DEFAULT now(),
+      entity_type    text        NOT NULL,
+      entity_name    text        NOT NULL,
+      config         jsonb       NOT NULL,
+      config_hash    text        NOT NULL,
+      CONSTRAINT five9_config_snapshots_uniq UNIQUE (snapshot_date, entity_type, entity_name)
+    );
+    CREATE TABLE IF NOT EXISTS five9_config_changes (
+      id                   bigserial PRIMARY KEY,
+      detected_at          timestamptz NOT NULL DEFAULT now(),
+      entity_type          text        NOT NULL,
+      entity_name          text        NOT NULL,
+      field_path           text        NOT NULL,
+      previous_value       jsonb,
+      new_value            jsonb,
+      previous_snapshot_id bigint REFERENCES five9_config_snapshots(id) ON DELETE SET NULL,
+      new_snapshot_id      bigint REFERENCES five9_config_snapshots(id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_f9_snap_entity_date
+      ON five9_config_snapshots (entity_type, entity_name, snapshot_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_f9_changes_detected
+      ON five9_config_changes (detected_at DESC);`);
+    console.log('[Migration] five9 config snapshot schema (sql/055) ready');
+  } catch (err) {
+    console.error('[Migration] five9 config snapshot schema FAILED (snapshot job depends on it — apply sql/055 manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
@@ -1026,6 +1066,7 @@ registerLpReportRoutes(app);
 registerLpCsvRoutes(app);
 registerLpReportReconRoutes(app);
 registerScorecardValidateRoutes(app);
+registerFive9SnapshotRoutes(app, authenticate);
 
 app.listen(PORT, async () => {
   console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
@@ -1056,6 +1097,7 @@ app.listen(PORT, async () => {
   startCapacitySweepScheduler();
   startGoalScorecardScheduler();
   startScorecardValidateScheduler();
+  startFive9ConfigSnapshotScheduler();
   startLpReportReconScheduler();
   startLpReportWatchdog();
   startFbPublishWatchdog();

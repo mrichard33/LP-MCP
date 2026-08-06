@@ -15,6 +15,7 @@ import {
   getReportResult,
 } from '../five9-admin.js';
 import { getUsersFullInfo } from '../five9-users-info.js';
+import supabase from '../supabase.js';
 import {
   STATISTIC_TYPES,
   getStatistics,
@@ -229,4 +230,32 @@ export function registerFive9Tools(server) {
 
   // Exported for callers that want to pre-warm the session explicitly.
   void setSessionParameters;
+
+  // Tool: five9_config_history — 2026-08-06 Phase E
+  server.tool(
+    'five9_config_history',
+    'HISTORICAL Five9 configuration record (read-only): daily snapshots of every campaign, campaign profile, list, skill, user and disposition, plus a field-level change log of what differed between days. This is the HISTORY, not live state — five9_get_campaign_profiles / five9_get_outbound_campaign / five9_get_campaigns remain the authority for what is configured right now. Use this to answer "when did this change" and "what did it look like last week", including changes made by a human in the Five9 admin UI, which leave no trace in the five9.admin_write audit events. Set changes_only:true for the change log instead of the snapshots.',
+    {
+      entity_type: z.string().optional().describe('Filter: campaign_outbound, campaign_inbound, campaign_profile, list, skill, user, disposition'),
+      entity_name: z.string().optional().describe('Filter: exact entity name, e.g. "Data Leads"'),
+      days: z.number().optional().describe('Lookback window in days (default 30)'),
+      changes_only: z.boolean().optional().describe('Return five9_config_changes rows (what changed) instead of full snapshots'),
+    },
+    asTool(async ({ entity_type, entity_name, days, changes_only }) => {
+      if (!supabase) throw new Error('Supabase not configured');
+      const lookback = Number.isFinite(days) && days > 0 ? Math.floor(days) : 30;
+      const since = new Date(Date.now() - lookback * 86400000);
+      const table = changes_only ? 'five9_config_changes' : 'five9_config_snapshots';
+      let q = supabase.from(table).select('*');
+      if (entity_type) q = q.eq('entity_type', entity_type);
+      if (entity_name) q = q.eq('entity_name', entity_name);
+      q = changes_only
+        ? q.gte('detected_at', since.toISOString()).order('detected_at', { ascending: false })
+        : q.gte('snapshot_date', since.toISOString().slice(0, 10)).order('snapshot_date', { ascending: false });
+      const { data, error } = await q.limit(500);
+      if (error) throw new Error(error.message);
+      return { source: table, lookback_days: lookback, count: (data || []).length, rows: data || [] };
+    })
+  );
+
 }
