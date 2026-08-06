@@ -4,7 +4,7 @@
 // POST /n8n/admin/lp-csv-ingest/lead-disposition  (Lead Disposition Detail)
 // POST /n8n/admin/lp-csv-ingest/source-cost       (Marketing Sub-Source Cost 2)
 // POST /n8n/admin/lp-report-ingest/lead-disposition  (135 PDF — LIVE parser)
-// POST /n8n/admin/lp-report-ingest/source-cost       (136 PDF — parser_pending)
+// POST /n8n/admin/lp-report-ingest/source-cost       (136 PDF — LIVE parser)
 //
 // Mirrors lp-report-ingest.js: sha256 → duplicate check → ARCHIVE FIRST →
 // parse → validate → market resolution → chunked RPC load
@@ -13,11 +13,11 @@
 // ONE tx with the is_current promotion, so a bad load never becomes
 // visible. GroupMe gets failures only.
 //
-// The CSVs are today a manual backfill (LP's scheduler is PDF-only,
-// confirmed 2026-08-05). Report 135's PDF parser went live 2026-08-06, built
-// and pinned against the real emailed file (100 pages, 1,194 rows). Report
-// 136's PDF endpoint still fails closed with parser_pending until a sample
-// lets us build its parser — the archived PDF is that sample.
+// The CSVs are today a manual backfill (LP's scheduler is PDF-only, confirmed
+// 2026-08-05). Reports 135 and 136 both went live 2026-08-06, built and pinned
+// against their real emailed files (135: 100 pages / 1,194 rows; 136: 2 pages /
+// 37 sub-source rows, Grand Total Raw 1,194 — the same population). All five LP
+// reports now parse from the scheduled PDF.
 //
 // HTTP CONTRACT: deterministic content failures return 200 with
 // { success:false, failure_reason }; transport/infra errors stay 5xx.
@@ -38,6 +38,9 @@ import {
   parseLeadDispositionPdf, validateLeadDispositionPdf,
 } from './lp-report-parse-lead-disposition-pdf.js';
 import {
+  parseSourceCostPdf, validateSourceCostPdf, computeSourceCostPdfTotals,
+} from './lp-report-parse-source-cost-pdf.js';
+import {
   parseSalesEfficiencyCsv, parseSalesEfficiencyPdf, resolveSalesEfficiencyMarkets,
   computeSalesEfficiencyTotals, validateSalesEfficiency,
 } from './lp-report-parse-sales-efficiency.js';
@@ -53,11 +56,13 @@ export const CSV_REPORT_TYPES = {
   'sales-efficiency': 'sales_efficiency',
 };
 
-/** Slugs whose PDF variant has no parser yet — fail closed until a sample arrives.
- *  `lead-disposition` (135) graduated 2026-08-06: it has a live parser below. */
-export const PDF_PENDING_TYPES = {
-  'source-cost': 'source_cost',
-};
+/**
+ * Slugs whose PDF variant has no parser yet — fail closed until a sample
+ * arrives. EMPTY as of 2026-08-06: 135 and 136 both graduated to live parsers,
+ * so all five LP reports now parse. The loop below is kept because the next new
+ * report will need exactly this behaviour on its first arrival.
+ */
+export const PDF_PENDING_TYPES = {};
 
 /**
  * Market map for Job Status rows: cst_id → { market, method, brn, lead_id }.
@@ -480,6 +485,123 @@ export async function ingestLeadDispositionPdf({ buffer, source = 'n8n' }) {
   };
 }
 
+/**
+ * Report 136 "Marketing Sub-Source Cost Analysis 2" PDF ingest.
+ *
+ * Reuses lp_source_cost_history — the PDF's columns are a strict SUBSET of the
+ * CSV's, so a parallel table would be duplication. `num_cnf` and `num_net_sold`
+ * are written NULL, not 0: the PDF has no such columns, and a zero would read
+ * as "nothing confirmed / nothing netted" on the company control-total
+ * authority.
+ *
+ * Promotion goes through lp_source_cost_pdf_finalize, which asserts the NINE
+ * columns the PDF prints. The CSV path keeps lp_csv_ingest_finalize and its
+ * eleven cents-exact assertions — this must not weaken that.
+ */
+export async function ingestSourceCostPdf({ buffer, source = 'n8n' }) {
+  const started = Date.now();
+  const reportType = 'source_cost';
+  if (!supabase) throw new Error('Supabase not configured');
+  const sha = sha256Hex(buffer);
+  const done = (status, extra = {}) =>
+    logIngest({
+      report_type: reportType, file_sha256: sha, status,
+      failure_reason: extra.failure_reason ?? null, detail: extra.detail ?? null,
+      snapshot_id: extra.snapshot_id ?? null, source, duration_ms: Date.now() - started,
+    });
+
+  const { data: dup, error: dupErr } = await supabase
+    .from('scorecard_report_snapshots')
+    .select('id').eq('report_type', reportType).eq('file_sha256', sha)
+    .not('finalized_at', 'is', null)
+    .maybeSingle();
+  if (dupErr) throw new Error(`duplicate check failed: ${dupErr.message}`);
+  if (dup) {
+    await done('duplicate', { snapshot_id: dup.id });
+    return { success: true, duplicate: true, snapshot_id: dup.id, sha256: sha };
+  }
+
+  const storagePath = `${reportType}/${todayET()}/${sha}.pdf`;
+  const { error: upErr } = await supabase.storage
+    .from(STORAGE_BUCKET)
+    .upload(storagePath, buffer, { contentType: 'application/pdf', upsert: true });
+  if (upErr) throw new Error(`storage archive failed: ${upErr.message}`);
+
+  let text;
+  try {
+    text = await extractPdfText(buffer);
+  } catch (err) {
+    if (err instanceof NoTextLayerError) {
+      await done('no_text_layer', { failure_reason: 'no_text_layer', detail: { message: err.message, storage_path: storagePath } });
+      await alertGroupMe(`⚠️ LP report 136 ingest STOPPED: PDF has no text layer (scanned image?). Archived at ${storagePath}. OCR is not permitted.`);
+      return { success: false, failure_reason: 'no_text_layer', sha256: sha };
+    }
+    throw err;
+  }
+
+  const parsed = parseSourceCostPdf(text);
+  const v = validateSourceCostPdf(parsed);
+  if (!v.ok) {
+    const reason = v.violations[0].rule;
+    await done('failed', { failure_reason: reason, detail: { violations: v.violations } });
+    await alertGroupMe(`⚠️ LP report 136 ingest REJECTED: ${reason}${v.violations.length > 1 ? ` (+${v.violations.length - 1} more)` : ''}. Nothing written. Archived at ${storagePath}.`);
+    return { success: false, failure_reason: reason, violations: v.violations, sha256: sha };
+  }
+
+  // PDF field names → the CSV table's columns. Demo is the CSV's `sat`.
+  const rows = parsed.rows.map((r) => ({
+    row_num: r.row_num,
+    sub_source: r.sub_source,
+    num_raw: r.raw, num_set: r.set, num_issued: r.issued, num_sat: r.demo, num_sold: r.sold,
+    num_cnf: null, num_net_sold: null,   // absent from this report — NOT zero
+    gsa_cents: r.gross_cents, nsa_cents: r.net_sales_cents,
+    mcost_cents: r.total_cost_cents, working_cents: r.working_cents,
+  }));
+  const t = computeSourceCostPdfTotals(parsed.rows);
+  const snapshotPayload = {
+    report_type: reportType,
+    period_start: parsed.header.periodStart,
+    period_end: parsed.header.periodEnd,
+    file_sha256: sha,
+    storage_path: storagePath,
+    row_count: rows.length,
+    as_of_date: parsed.header.asOf ?? todayET(),
+    source_format: 'pdf',
+    scope: parsed.header.scope,
+    control_totals: {
+      num_raw: t.raw, num_set: t.set, num_issued: t.issued, num_sat: t.demo, num_sold: t.sold,
+      gsa_cents: t.gross_cents, nsa_cents: t.net_sales_cents,
+      mcost_cents: t.total_cost_cents, working_cents: t.working_cents,
+    },
+  };
+  const { data: snapshotId, error: beginErr } = await supabase
+    .rpc('lp_csv_ingest_begin', { p_snapshot: snapshotPayload });
+  if (beginErr) throw new Error(`ingest begin failed: ${beginErr.message}`);
+
+  try {
+    await loadChunked(snapshotId, rows);
+  } catch (err) {
+    await done('failed', { failure_reason: 'row_load_failed', detail: { message: err.message }, snapshot_id: snapshotId });
+    throw err;
+  }
+
+  const { error: finErr } = await supabase.rpc('lp_source_cost_pdf_finalize', { p_snapshot_id: snapshotId });
+  if (finErr) {
+    await done('failed', { failure_reason: 'finalize_failed', detail: { message: finErr.message }, snapshot_id: snapshotId });
+    await alertGroupMe(`⚠️ LP report 136 ingest FAILED at finalize: ${finErr.message}. Nothing promoted.`);
+    return { success: false, failure_reason: 'finalize_failed', sha256: sha };
+  }
+
+  await done(v.reconciliations.length ? 'succeeded_with_warnings' : 'succeeded', {
+    snapshot_id: snapshotId,
+    detail: v.reconciliations.length ? { reconciliations: v.reconciliations.slice(0, 50) } : null,
+  });
+  return {
+    success: true, snapshot_id: snapshotId, sha256: sha,
+    rows: rows.length, scope: parsed.header.scope, grand_total_raw: parsed.printedTotals.raw,
+  };
+}
+
 export async function ingestSalesEfficiencyPdf({ buffer, source = 'n8n' }) {
   const started = Date.now();
   const reportType = 'sales_efficiency';
@@ -651,7 +773,22 @@ export function registerLpCsvRoutes(app) {
     }
   });
 
-  // Future PDF ingest for report 136 — FAIL CLOSED until its parser exists.
+  // Report 136 — live parser (strict fifteen-cell rows, Grand Total gate).
+  app.post('/n8n/admin/lp-report-ingest/source-cost', rawPdf, async (req, res) => {
+    try {
+      if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
+      if (!Buffer.isBuffer(req.body) || !req.body.length) {
+        return res.status(400).json({ success: false, error: 'POST the raw PDF bytes as the request body (Content-Type: application/pdf)' });
+      }
+      const result = await ingestSourceCostPdf({ buffer: req.body, source: String(req.query.source || 'n8n') });
+      res.json(result);
+    } catch (err) {
+      console.error('[LPCsv] source-cost ingest error:', err.message);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // First-arrival fail-closed path for any FUTURE report without a parser.
   // The PDF is archived (it IS the sample), the rejection is logged, GroupMe
   // alerts, and nothing is written.
   for (const [slug, reportType] of Object.entries(PDF_PENDING_TYPES)) {
@@ -682,5 +819,5 @@ export function registerLpCsvRoutes(app) {
     });
   }
 
-  console.log('[LPCsv] Routes registered: POST /n8n/admin/lp-csv-ingest/{job-status|lead-disposition|source-cost|sales-efficiency} | POST /n8n/admin/lp-report-ingest/{sales-efficiency|lead-disposition} (137/135, live parsers) | POST /n8n/admin/lp-report-ingest/source-cost (parser_pending)');
+  console.log('[LPCsv] Routes registered: POST /n8n/admin/lp-csv-ingest/{job-status|lead-disposition|source-cost|sales-efficiency} | POST /n8n/admin/lp-report-ingest/{sales-efficiency|lead-disposition|source-cost} (137/135/136, live parsers)');
 }
