@@ -167,6 +167,23 @@ out.push('  [NO-OP] profile name already exists -> { skipped: profile_already_ex
 out.push('Audit event:');
 out.push(eventShape('create_campaign_profile', 'five9_campaign_profile', 'Data-Hot', { compliance: '<verdict>' }));
 
+section('five9_modify_campaign_profile (modifyCampaignProfile — confirm_token REQUIRED)');
+line('SOAP method', 'modifyCampaignProfile');
+line('wrapper', 'SAME <campaignProfile> element as createCampaignProfile (WSDL-verified 2026-08-06)');
+line('inner XML', buildCampaignProfileXml('Data Leads', { numberOfAttempts: 8 }));
+out.push('Guardrails:');
+verdict('attempts ceiling refuses 100 without override',
+  () => { const c = checkProfileCompliance({ numberOfAttempts: 100 }); if (!c.ok) throw new Error(c.violations.join('; ')); return c; });
+verdict('rollback to 100 WITH compliance_override accepted',
+  () => checkProfileCompliance({ numberOfAttempts: 100 }, { complianceOverride: true }));
+verdict('confirm_token restating the profile name accepted',
+  () => checkConfirmToken('modify_campaign_profile', { profile_name: 'Data Leads', confirm_token: 'Data Leads' }));
+verdict('confirm_token mismatch refused',
+  () => checkConfirmToken('modify_campaign_profile', { profile_name: 'Data Leads', confirm_token: 'wrong' }));
+verdict('nested dialingSchedule refused (not patchable in v1)', () => buildCampaignProfileXml('Data Leads', { dialingSchedule: {} }));
+out.push('Audit event (previous_state carries the pre-patch profile, incl. numberOfAttempts):');
+out.push(eventShape('modify_campaign_profile', 'five9_campaign_profile', 'Data Leads', { compliance: '<verdict>', verify_mismatches: '<read-back drift>' }));
+
 section('Complex-type serialization (Phase C defect, fixed 2026-08-05)');
 out.push('  Phase C whitelisted actionOnQueueExpiration but ran escapeXml() over it, so it');
 out.push('  serialized as the literal string "[object Object]". Now:');

@@ -389,3 +389,63 @@ test('buildModifyOutboundCampaignXml: lifecycle fields stay refused after the v2
     assert.equal(PATCHABLE_FIELDS.has(field), true, `${field} should be patchable in v2`);
   }
 });
+
+/* ---------------------------------------------------------------------- *
+ * Phase D-2 (2026-08-06) — five9_modify_campaign_profile.
+ * The modifyCampaignProfile request wrapper is WSDL-verified as a single
+ * child element name="campaignProfile" type="tns:campaignProfileInfo",
+ * identical to createCampaignProfile — hence one shared builder.
+ * ---------------------------------------------------------------------- */
+
+test('buildCampaignProfileXml: one body serves BOTH create and modify — <campaignProfile>, never <profileName>', () => {
+  // Regression guard: modifyCampaignProfile takes the same wrapper as
+  // createCampaignProfile. A future "fix" to <profileName> would be a fault.
+  const patch = { numberOfAttempts: 8 };
+  const xml = buildCampaignProfileXml('Data Leads', patch);
+  assert.match(xml, /^<campaignProfile>/);
+  assert.match(xml, /<\/campaignProfile>$/);
+  assert.doesNotMatch(xml, /<profileName>/);
+  // byte-identical regardless of which op consumes it
+  assert.equal(xml, buildCampaignProfileXml('Data Leads', patch));
+});
+
+test('buildCampaignProfileXml: modify patch keeps WSDL order — ANI before name before numberOfAttempts', () => {
+  const xml = buildCampaignProfileXml('Data Leads', { numberOfAttempts: 8, ANI: '7275133151' });
+  // patch key order is numberOfAttempts-first; emitted order must NOT follow it
+  const order = ['<ANI>', '<name>', '<numberOfAttempts>'];
+  const idx = order.map(t => xml.indexOf(t));
+  assert.ok(idx.every(i => i >= 0), `all fields present: ${xml}`);
+  for (let i = 1; i < idx.length; i++) {
+    assert.ok(idx[i] > idx[i - 1], `${order[i]} must come after ${order[i - 1]} (WSDL sequence): ${xml}`);
+  }
+  assert.match(xml, /<name>Data Leads<\/name>/);
+});
+
+test('buildCampaignProfileXml: nested dialingSchedule stays non-patchable on the modify path', () => {
+  assert.throws(
+    () => buildCampaignProfileXml('Data Leads', { dialingSchedule: {} }),
+    /REFUSED: "dialingSchedule" is not a patchable campaign profile field/,
+  );
+  assert.equal(PROFILE_PATCHABLE_FIELDS.has('dialingSchedule'), false);
+});
+
+test('modify_campaign_profile: confirm_token is required and case-sensitive', () => {
+  assert.equal(requiredConfirmToken('modify_campaign_profile', { profile_name: 'Data Leads' }), 'Data Leads');
+  assert.doesNotThrow(() =>
+    checkConfirmToken('modify_campaign_profile', { profile_name: 'Data Leads', confirm_token: 'Data Leads' }));
+  assert.throws(
+    () => checkConfirmToken('modify_campaign_profile', { profile_name: 'Data Leads', confirm_token: 'data leads' }),
+    /confirm_token mismatch/,
+  );
+});
+
+test('modify_campaign_profile: attempts ceiling refuses the live Data Leads value without override', () => {
+  assert.equal(MAX_PROFILE_ATTEMPTS_LIMIT, 12);
+  assert.equal(checkProfileCompliance({ numberOfAttempts: 8 }).ok, true);
+  assert.equal(checkProfileCompliance({ numberOfAttempts: 100 }).ok, false);
+  // Rolling BACK to 100 is itself over the line — the rollback payload must
+  // carry compliance_override:true. That is deliberate, not an oversight.
+  const rollback = checkProfileCompliance({ numberOfAttempts: 100 }, { complianceOverride: true });
+  assert.equal(rollback.ok, true);
+  assert.equal(rollback.overridden, true);
+});

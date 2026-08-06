@@ -29,7 +29,7 @@
  *   originating system_events row by action.event_id when they need
  *   structural fields like event.id or event.payload.message_id.
  *
- * Supported action types (40):
+ * Supported action types (41):
  *   add_tag, remove_tag, set_stage, move_opportunity, update_opportunity,
  *   remove_from_workflow, add_to_workflow, book_appointment,
  *   cancel_appointment, reschedule_appointment, update_appointment_status,
@@ -45,7 +45,9 @@
  *   five9_remove_numbers_from_dnc (2026-07-21 Phase C — gated Five9 writes),
  *   five9_user_skill_add, five9_user_skill_modify, five9_user_skill_remove,
  *   five9_create_campaign_profile
- *   (2026-08-05 Phase D — skill routing + campaign profiles).
+ *   (2026-08-05 Phase D — skill routing + campaign profiles),
+ *   five9_modify_campaign_profile (2026-08-06 Phase D-2 — WSDL-verified
+ *   modifyCampaignProfile wrapper; completes the Phase D profile surface).
  *
  * 2026-05-01 — added create_lp_lead (Jane recovery). Closes the
  * chatbot-in-session-booking gap that left contacts out of LP because
@@ -453,6 +455,7 @@ const ACTION_HANDLERS = {
   five9_user_skill_modify: executeFive9Write,
   five9_user_skill_remove: executeFive9Write,
   five9_create_campaign_profile: executeFive9Write,
+  five9_modify_campaign_profile: executeFive9Write, // 2026-08-06 Phase D-2
 };
 
 // Handlers that need the triggering event's payload injected as context.
