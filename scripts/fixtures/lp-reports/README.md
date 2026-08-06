@@ -43,3 +43,41 @@ What lives here is the `pdftotext -layout` TEXT with contact fields masked.
 
 If a future month's report is used instead of July 2026, update the golden
 constants in both test files to that month's printed footer values.
+
+---
+
+## Report 135 — Lead Disposition Detail (`-bbox-layout`, not `-layout`)
+
+135 is parsed by COORDINATE CLUSTERING, so its fixture is `pdftotext
+-bbox-layout` XML rather than `-layout` text. `-layout` is unusable here:
+continuation fragments from different columns interleave on the same physical
+line, so `Answering` / `Machine` (one Last Result) is split by an email and an
+address printed between its two words.
+
+Committed: `report-135-lead-disposition-p1-6.bbox.xml.gz` — pages 1–6 of the
+real 2026-08-06 file, redacted, gzipped (31 KB). Those six pages carry the
+complete unlabeled band and its bare `Totals: 70`, blank last names, a malformed
+wrapping phone, mid-token email wraps, a duplicate Prosp #, and `Can't Do
+Project`. They deliberately STOP before `Grand Totals:`, so the same fixture
+doubles as the truncated-file fail-closed test.
+
+The full-file goldens (1,194 rows; band totals 70/49/51/201/136/31/33/240/138/245)
+skip unless you drop the whole redacted file in as
+`report-135-lead-disposition-full.bbox.xml`. It is not committed — 651 KB
+gzipped, far past this directory's norm.
+
+### Producing them
+
+```sh
+pdftotext -bbox-layout _135_*.pdf 135.xml
+node scripts/redact-bbox.mjs 135.xml report-135-lead-disposition-full.bbox.xml
+node scripts/redact-bbox.mjs 135.xml p1-6.xml 6 && gzip -9 p1-6.xml
+```
+
+Redaction is STRUCTURE-PRESERVING and that is not optional: it masks glyphs
+only, never coordinates, token counts or line-wrap points. It must leave
+numbers, `Totals:` lines, band labels, the column header and page furniture
+untouched — those are what the goldens assert, and an earlier pass that masked
+them turned `BOCA` into `Bxxx` and `49` into `55`. Verify by parsing the
+redacted file: it must produce the identical 1,194 rows, ten bands and zero
+warnings as the original.
