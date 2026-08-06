@@ -58,14 +58,33 @@ export function sumSnapshotNetByMarket(rows) {
 }
 
 /**
- * Project a jobs_by_milestone snapshot into lp_net_report_rtp — the staging
- * table the month-freeze mechanism reads. Whole-month snapshots only: the
- * declared period must sit inside one calendar month.
+ * Coverage end of a snapshot: how far the data actually reaches.
+ *
+ * LP prints the SCHEDULED window, so a month-to-date pull run on Aug 5 declares
+ * `period_end = 2026-08-31` — a date that has not happened. `report_as_of` must
+ * never claim coverage past the generation date, because everything downstream
+ * reads it as "the report covers through here": `computeAuthoritativeRtpNet`
+ * takes max(report_as_of) as the winning snapshot, and the provisional tail is
+ * the days AFTER it. An uncapped future end would silently swallow the rest of
+ * the month as already-reported and freeze the figure until Sep 1.
  */
-async function projectSnapshotToNetReport(snapshotId) {
+export const coverageEndOf = (periodEnd, asOfDate) =>
+  asOfDate && asOfDate < periodEnd ? asOfDate : periodEnd;
+
+/**
+ * Project a jobs_by_milestone snapshot into lp_net_report_rtp — the staging
+ * table the month-freeze mechanism reads, and the ONLY source of the
+ * dashboard's Net — Released hero (lp_market_scorecard_daily.released_dollars).
+ * Whole-month snapshots only: the declared period must sit inside one calendar
+ * month. Exported because the DAILY ingest path calls it too — see
+ * lp-report-ingest.js; when only the backfill called it, a current-month
+ * snapshot could carry a perfectly good net total and the hero still rendered
+ * "report pending" (2026-08-05 §2).
+ */
+export async function projectSnapshotToNetReport(snapshotId) {
   const { data: snap, error: snapErr } = await supabase
     .from('scorecard_report_snapshots')
-    .select('id, report_type, period_start, period_end')
+    .select('id, report_type, period_start, period_end, as_of_date')
     .eq('id', snapshotId).single();
   if (snapErr) throw new Error(`snapshot read failed: ${snapErr.message}`);
   if (snap.report_type !== 'jobs_by_milestone') {
@@ -75,6 +94,7 @@ async function projectSnapshotToNetReport(snapshotId) {
   if (monthStartOf(snap.period_end) !== reportMonth) {
     throw new Error(`snapshot spans months (${snap.period_start}..${snap.period_end}) — backfill one calendar month per report`);
   }
+  const reportAsOf = coverageEndOf(snap.period_end, snap.as_of_date);
 
   const { data: rows, error: rowsErr } = await supabase
     .from('scorecard_report_rows_a')
@@ -86,7 +106,7 @@ async function projectSnapshotToNetReport(snapshotId) {
   const records = [...byMarket.entries()].map(([market, agg]) => ({
     market,
     report_month: reportMonth,
-    report_as_of: snap.period_end,
+    report_as_of: reportAsOf,
     released_net: Math.round(agg.cents) / 100,
     rows_counted: market === REECE ? (rows || []).length : agg.rows,
   }));
@@ -98,7 +118,8 @@ async function projectSnapshotToNetReport(snapshotId) {
   return {
     projected: true,
     report_month: reportMonth,
-    report_as_of: snap.period_end,
+    report_as_of: reportAsOf,
+    period_end: snap.period_end,
     markets: records.length - 1,
     total_net: centsToDollars(byMarket.get(REECE)?.cents ?? 0),
   };
@@ -173,7 +194,10 @@ export async function runReportBackfill({ reportType, buffer, expectedStart, exp
     let projection = { projected: false, reason: 'not_jobs_by_milestone' };
     let freeze = { frozen: false, reason: 'not_projected' };
     if (reportType === 'jobs_by_milestone') {
-      projection = await projectSnapshotToNetReport(ingest.snapshot_id);
+      // ingestReportPdf now projects every jobs_by_milestone snapshot itself
+      // (the daily path needs it too); reuse its result rather than repeating
+      // the identical upsert.
+      projection = ingest.net_projection ?? await projectSnapshotToNetReport(ingest.snapshot_id);
       if (projection.projected) freeze = await freezeClosedMonth(projection.report_month);
     }
 

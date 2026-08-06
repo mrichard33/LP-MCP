@@ -31,11 +31,36 @@ accuracy report §6) and enforced by the partial unique index
 | **Marketing Sub Source Cost Anlysis 2** | 136 | 6:45 | **YTD** (changed from MTD — MTD returns $0 for Net Sales, NSLI, Total Cost, Cost/Lead) | Marketing cost, cost-per-lead |
 | **Sales Efficiency By Market** | 137 | 7:00 | **YTD daily** (MTD has an entirely blank Net column and garbage NSLI); pin the end date to **yesterday** — a future EDate widens the window past the sibling reports | Per-market Issued/Sat/Sold/**Cancelled**/NSA/NSLI |
 
-All to `lp-reports@reecewindowsmail.com`. Ingestion is the single **I.LPR
-router** (one Gmail trigger, routes on the `_133_`…`_137_` report ID in the
-attachment filename — subject strings retired); it polls every 15 minutes
-(worst-case ~15 min latency; multiple reports in one poll window are safe —
-each item routes independently).
+### Scope is part of snapshot identity (2026-08-05)
+
+Every snapshot carries a `scope` (`mtd` · `ytd` · `month` · `custom`) derived
+from its declared range vs its generation date, and the replace-on-overlap rule
+applies only WITHIN a scope family (`ytd` alone; `mtd`+`month` together;
+`custom` alone). A YTD pull and an MTD pull of the same report are different
+reports about different windows, not competing versions of one, so both stay
+current. This is what makes a mis-scheduled MTD pull harmless: on 2026-08-05 an
+MTD Sales Efficiency PDF retired the YTD snapshot and blanked Gross / Net /
+Cancellations on the dashboard. It cannot recur.
+
+Reads pick ONE snapshot per report type per view: flow metrics (issued, sat,
+sold count, gross, cancellations) from the scope matching the view; cohort-
+mature metrics (net sold, NSA, NSLI) only from a snapshot that actually carries
+them — an MTD pull's blank Net column renders "still maturing", never a
+borrowed YTD figure and never $0.
+
+All to `lp-reports@reecewindowsmail.com`. Ingestion is **five independent
+workflows** — `I.LPRA` (134) · `I.LPRB` (133) · `I.LPRC` (135) · `I.LPRD` (136)
+· `I.LPRE` (137) — each polling Gmail every 15 minutes on a broad query
+(sender + `has:attachment filename:pdf`, no subject dependence) and selecting
+its own report by the `_133_`…`_137_` ID in the attachment filename.
+
+The single combined router was tried and **rolled back on 2026-08-05**: when
+all five reports arrived in one poll window it handled one and the rest were
+dropped. Five triggers cannot drop a sibling's report, and the filename-ID
+guard examines every message in the poll and every attachment in each message,
+so simultaneous arrivals all flow. A report type that stops arriving is caught
+by the LP-MCP watchdog, which arms per report type after that type's first
+scheduled success.
 
 ## Format: PDF-only is confirmed — consequences
 
