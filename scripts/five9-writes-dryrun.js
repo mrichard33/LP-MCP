@@ -110,6 +110,20 @@ verdict('missing confirm_token refused', () => checkConfirmToken('set_outbound_c
 out.push('Audit event:');
 out.push(eventShape('set_outbound_campaign', 'five9_campaign', 'REHASH OUTBOUND', { compliance: '<verdict>', verify_mismatches: '<read-back drift>' }));
 
+section('five9_set_outbound_campaign — CRMRedialTimeout (Phase E)');
+line('SOAP method', 'modifyOutboundCampaign');
+line('inner XML', buildModifyOutboundCampaignXml('DIAL ASAP', { CRMRedialTimeout: 300 }));
+line('note', 'tns:baseOutboundCampaign field — emits as a timer struct, never a bare integer');
+out.push('Guardrails:');
+verdict('redial floor accepts the intended 300s (5 min)', () => checkCompliancePatch({ CRMRedialTimeout: 300 }));
+verdict('redial floor refuses 60s without override',
+  () => { const c = checkCompliancePatch({ CRMRedialTimeout: 60 }); if (!c.ok) throw new Error(c.violations.join('; ')); return c; });
+verdict('60s WITH compliance_override accepted', () => checkCompliancePatch({ CRMRedialTimeout: 60 }, { complianceOverride: true }));
+verdict('order-array membership does not grant patchability (analyzeLevel)',
+  () => buildModifyOutboundCampaignXml('DIAL ASAP', { analyzeLevel: '20' }));
+out.push('Audit event:');
+out.push(eventShape('set_outbound_campaign', 'five9_campaign', 'DIAL ASAP', { compliance: '<verdict>' }));
+
 section('five9_add_records_to_list (addRecordToList, ≤50 records/action)');
 line('SOAP method', 'addRecordToList');
 line('inner XML', buildAddRecordToListXml('Claude Callbacks', ['number1', 'first_name', 'last_name'], ['5551234567', 'Jane', 'Doe']));

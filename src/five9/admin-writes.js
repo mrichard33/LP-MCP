@@ -91,6 +91,16 @@ export function refuseIfInbound(campaign) {
 export const MAX_QUEUE_TIME_SEC_LIMIT = 2;
 export const MAX_ABANDON_PCT_LIMIT = 3;
 
+// Guardrail 8 (2026-08-06 Phase E) — floor on CRMRedialTimeout. Shortening the
+// redial gate is the whole point of the speed-to-lead change, but there is a
+// line past which "fast follow-up" is just repeat-dialing the same consumer.
+// 300s (5 min) is the intended operational value and the floor sits exactly
+// there, so the intended change passes and anything tighter is deliberate.
+export const MIN_CRM_REDIAL_SEC_LIMIT = Math.max(
+  0,
+  parseInt(process.env.FIVE9_MIN_CRM_REDIAL_SEC || '300', 10),
+);
+
 export function checkCompliancePatch(patch, { complianceOverride = false } = {}) {
   const violations = [];
   const q = patch?.maxQueueTime;
@@ -100,6 +110,10 @@ export function checkCompliancePatch(patch, { complianceOverride = false } = {})
   const a = patch?.maxDroppedCallsPercentage;
   if (a !== undefined && a !== null && Number(a) > MAX_ABANDON_PCT_LIMIT) {
     violations.push(`abandon ${a}% > ${MAX_ABANDON_PCT_LIMIT}%`);
+  }
+  const r = patch?.CRMRedialTimeout;
+  if (r !== undefined && r !== null && Number(r) < MIN_CRM_REDIAL_SEC_LIMIT) {
+    violations.push(`CRMRedialTimeout ${r}s < ${MIN_CRM_REDIAL_SEC_LIMIT}s`);
   }
   if (violations.length && complianceOverride !== true) {
     return { ok: false, violations };
@@ -229,10 +243,29 @@ export function secondsToTimerXml(tagName, totalSeconds) {
  * position: campaign base fields, then baseOutboundCampaign, then
  * outboundCampaign extension fields (WSDL-verified order below).
  */
-const OUTBOUND_CAMPAIGN_FIELD_ORDER = [
+// FULL xs:sequence for tns:outboundCampaign, WSDL-verified 2026-08-06 against
+// api.five9.com/wsadmin/v13. The inheritance chain is four levels deep and
+// JAXB unmarshals base-type fields BEFORE extension fields, so every level's
+// sequence must appear in order even when only one field from it is sent.
+//
+// v1 of this array skipped tns:generalCampaign and tns:baseOutboundCampaign
+// entirely. That was harmless only because nothing in either level was
+// patchable. CRMRedialTimeout (baseOutboundCampaign, position 2) is the first
+// field from those levels to become patchable — hence the correction here.
+//
+// NOTE: presence in this array does NOT make a field patchable. This is a
+// faithful copy of the WSDL sequence; PATCHABLE_FIELDS is the permission list,
+// and the two are deliberately different sizes.
+export const OUTBOUND_CAMPAIGN_FIELD_ORDER = [
   // tns:campaign base sequence
   'description', 'mode', 'name', 'profileName', 'state', 'trainingMode', 'type',
-  // tns:baseOutboundCampaign sequence — none patchable in v1
+  // tns:generalCampaign sequence — none patchable
+  'autoRecord', 'callWrapup', 'ftpHost', 'ftpPassword', 'ftpUser',
+  'recordingNameAsSid', 'useFtp',
+  // tns:baseOutboundCampaign sequence — CRMRedialTimeout patchable as of Phase E
+  'analyzeLevel', 'CRMRedialTimeout', 'dnisAsAni', 'enableListDialingRatios',
+  'listDialingMode', 'noOutOfNumbersAlert', 'stateDialingRule',
+  'timeZoneAssignment',
   // tns:outboundCampaign extension sequence
   'actionOnAnswerMachine', 'actionOnQueueExpiration', 'callAnalysisMode',
   'callsAgentRatio', 'dialNumberOnTimeout', 'dialingMode', 'dialingPriority',
@@ -264,9 +297,15 @@ export const PATCHABLE_FIELDS = new Set([
   'distributionAlgorithm', 'previewDialImmediately', 'profileName',
   'dialingPriority', 'callAnalysisMode', 'actionOnAnswerMachine',
   'limitPreviewTime', 'distributionTimeFrame',
+  // v3 (2026-08-06 Phase E) — CRMRedialTimeout: the minimum time before the
+  // same CRM record may be dialed again by this campaign. Both DIAL ASAP and
+  // After DIAL ASAP sat at 2 hours, which is what put an hour-plus gap between
+  // a new lead's first and second call.
+  'CRMRedialTimeout',
 ]);
 
-const TIMER_FIELDS = new Set(['maxQueueTime', 'maxPreviewTime']);
+// tns:timer struct fields — serialized via secondsToTimerXml, never escapeXml.
+const TIMER_FIELDS = new Set(['maxQueueTime', 'maxPreviewTime', 'CRMRedialTimeout']);
 
 // Phase C defect (fixed here): actionOnQueueExpiration was already in the v1
 // whitelist, but the builder ran escapeXml() over it. It is a complex type
