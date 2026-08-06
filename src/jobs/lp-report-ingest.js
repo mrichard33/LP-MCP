@@ -33,7 +33,7 @@ import { randomUUID } from 'node:crypto';
 
 import supabase from '../supabase.js';
 import { getMarketMaps } from './market-resolver.js';
-import { sha256Hex, contentSha256, resolveRowMarket, todayET, centsToDollars } from './lp-report-common.js';
+import { sha256Hex, contentSha256, isUniqueViolation, resolveRowMarket, todayET, centsToDollars } from './lp-report-common.js';
 import { parseJobsByMilestone, validateJobsByMilestone } from './lp-report-parse-a.js';
 import { parseJobsByStatus, flagDuplicates, validateJobsByStatus } from './lp-report-parse-b.js';
 
@@ -152,7 +152,61 @@ export async function extractPdfBboxXml(buffer) {
 export async function logIngest(entry) {
   if (!supabase) return;
   const { error } = await supabase.from('scorecard_ingest_log').insert(entry);
-  if (error) console.error('[LPReport] ingest-log write failed:', error.message);
+  if (error) {
+    // Loud on purpose. This write used to fail silently against the status
+    // CHECK constraint, so every successful 135 and 136 ingest logged NOTHING
+    // while the snapshot landed and promoted — the ingest feed and the watchdog
+    // saw an empty morning that had in fact worked.
+    console.error(
+      `[LPReport] ingest-log write FAILED (${entry?.report_type}/${entry?.status}): ${error.message}`,
+    );
+  }
+}
+
+/**
+ * Find the snapshot that already holds this report, for the duplicate path.
+ * Content identity is checked first: it is the authoritative key for CSV, where
+ * two pulls of one period differ byte-for-byte because every row embeds
+ * CurrentDateTime, so file_sha256 cannot see them as the same report.
+ *
+ * @returns {Promise<{id: string, matchedOn: 'content_sha256'|'file_sha256'}|null>}
+ */
+export async function findExistingSnapshot({ reportType, fileSha, contentSha }) {
+  if (!supabase) return null;
+  for (const [column, value] of [['content_sha256', contentSha], ['file_sha256', fileSha]]) {
+    if (!value) continue;
+    const { data } = await supabase
+      .from('scorecard_report_snapshots')
+      .select('id').eq('report_type', reportType).eq(column, value)
+      .maybeSingle();
+    if (data) return { id: data.id, matchedOn: column };
+  }
+  return null;
+}
+
+/**
+ * Turn a unique violation into the benign duplicate response (§A), or return
+ * null when the error is something else and the caller should throw.
+ *
+ * FAIL-CLOSED ON THIS PATH. The RPC aborted its transaction, so nothing was
+ * written: no snapshot, no child rows, and the existing snapshot's is_current /
+ * finalized_at / period_closed_at are untouched with no other snapshot demoted.
+ *
+ * `success` MUST be true. n8n routes anything else to failure telemetry, and a
+ * duplicate is not a failure — it is the system already holding the answer.
+ */
+export async function duplicateResponse(err, { reportType, fileSha, contentSha, done }) {
+  if (!isUniqueViolation(err)) return null;
+  const hit = await findExistingSnapshot({ reportType, fileSha, contentSha });
+  const matchedOn = hit?.matchedOn ?? (contentSha ? 'content_sha256' : 'file_sha256');
+  await done('duplicate', {
+    snapshot_id: hit?.id ?? null,
+    detail: { matched_on: matchedOn, constraint: err.details ?? err.message ?? null },
+  });
+  return {
+    success: true, duplicate: true,
+    snapshot_id: hit?.id ?? null, matched_on: matchedOn, sha256: fileSha,
+  };
 }
 
 export async function quarantineRows(reportType, sha, items) {
@@ -338,7 +392,15 @@ export async function ingestReportPdf({ reportType, buffer, source = 'n8n', expe
   // 8. One transaction: snapshot + rows + count assertion + is_current flip.
   const { data: snapshotId, error: rpcErr } = await supabase
     .rpc('scorecard_ingest_snapshot', { p_snapshot: snapshot, p_rows: rows });
-  if (rpcErr) throw new Error(`ingest RPC failed: ${rpcErr.message}`);
+  if (rpcErr) {
+    // A unique violation here means a concurrent request won the race — the
+    // report is already stored, so this is a duplicate, not a failure (§A).
+    const dupRes = await duplicateResponse(rpcErr, {
+      reportType, fileSha: sha, contentSha: snapshot.content_sha256, done,
+    });
+    if (dupRes) return dupRes;
+    throw new Error(`ingest RPC failed: ${rpcErr.message}`);
+  }
 
   // 9. Bridge into the Net — Released hero. lp_market_scorecard_daily
   //    .released_dollars is sourced ONLY from lp_net_report_rtp, and until now
