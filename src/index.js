@@ -729,10 +729,14 @@ async function runMigrations() {
       previous_snapshot_id bigint REFERENCES five9_config_snapshots(id) ON DELETE SET NULL,
       new_snapshot_id      bigint REFERENCES five9_config_snapshots(id) ON DELETE SET NULL
     );
+    ALTER TABLE five9_config_changes
+      ADD COLUMN IF NOT EXISTS detection text NOT NULL DEFAULT 'cross_day';
     CREATE INDEX IF NOT EXISTS idx_f9_snap_entity_date
       ON five9_config_snapshots (entity_type, entity_name, snapshot_date DESC);
     CREATE INDEX IF NOT EXISTS idx_f9_changes_detected
-      ON five9_config_changes (detected_at DESC);`);
+      ON five9_config_changes (detected_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_f9_changes_detection
+      ON five9_config_changes (detection, detected_at DESC);`);
     console.log('[Migration] five9 config snapshot schema (sql/055) ready');
   } catch (err) {
     console.error('[Migration] five9 config snapshot schema FAILED (snapshot job depends on it — apply sql/055 manually):', err.message);
