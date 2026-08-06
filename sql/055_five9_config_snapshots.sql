@@ -54,10 +54,11 @@ CREATE TABLE IF NOT EXISTS five9_config_changes (
 );
 
 -- ─── Indexes — RUN SEPARATELY ───────────────────────────────────────────────
--- CREATE INDEX CONCURRENTLY cannot run inside a transaction block, so these
--- must NOT be executed as part of the migration above. Apply each on its own
--- via the Supabase MCP execute_sql tool (NOT apply_migration, which wraps in a
--- transaction), or in the dashboard SQL editor:
+-- See sql/README.md for the canonical DDL rule. CREATE INDEX CONCURRENTLY
+-- cannot run inside a transaction block, so these must NOT be executed as part
+-- of the migration above, and must NOT go through apply_migration (which wraps
+-- one). Apply each on its own via MCP execute_sql or the dashboard SQL editor.
+-- These two tables are new and empty, so either path is fine here:
 --
 --   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_f9_snap_entity_date
 --     ON five9_config_snapshots (entity_type, entity_name, snapshot_date DESC);

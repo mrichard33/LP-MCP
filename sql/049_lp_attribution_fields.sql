@@ -90,10 +90,11 @@ COMMENT ON VIEW v_appt_attribution IS
   'Appointments by setter and confirmer with latching LP outcome flags. Filter resolved=true before computing any rate — pending appointments are not failures. Pending means Set, Cnf, Verif or Issue: Issue is issued-to-rep (capacity-sweep.js:71-76), a will-run appointment that has not happened yet, not an outcome. separately_confirmed distinguishes real confirmation work from LP stamping the setter as its own confirmer. resolved is NULL where disposition_code is NULL, so those rows drop out of a WHERE resolved filter.';
 
 -- ─── Index — RUN SEPARATELY ─────────────────────────────────────────────────
--- CREATE INDEX CONCURRENTLY cannot run inside a transaction block, so this must
--- NOT be executed as part of the migration above. Apply it on its own via the
--- Supabase MCP execute_sql tool (NOT apply_migration, which wraps in a
--- transaction):
+-- See sql/README.md for the canonical DDL rule. CREATE INDEX CONCURRENTLY
+-- cannot run inside a transaction block, so this must NOT be executed as part
+-- of the migration above, and must NOT go through apply_migration (which wraps
+-- one). MCP execute_sql works; the dashboard is the better call here because
+-- lp_leads is populated and the build holds a session while it runs:
 --
 --   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lp_leads_set_by_name
 --     ON lp_leads (set_by_name, appointment_date)
