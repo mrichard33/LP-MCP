@@ -33,7 +33,7 @@ import { randomUUID } from 'node:crypto';
 
 import supabase from '../supabase.js';
 import { getMarketMaps } from './market-resolver.js';
-import { sha256Hex, resolveRowMarket, todayET, centsToDollars } from './lp-report-common.js';
+import { sha256Hex, contentSha256, resolveRowMarket, todayET, centsToDollars } from './lp-report-common.js';
 import { parseJobsByMilestone, validateJobsByMilestone } from './lp-report-parse-a.js';
 import { parseJobsByStatus, flagDuplicates, validateJobsByStatus } from './lp-report-parse-b.js';
 
@@ -41,10 +41,52 @@ const execFileP = promisify(execFile);
 const INGEST_SECRET = (process.env.LP_REPORT_INGEST_SECRET || '').trim();
 const STORAGE_BUCKET = 'lp-reports';
 
+/**
+ * URL slug → canonical report_type. Only the two PDF-parsed reports get an
+ * ingest ROUTE here, but the map must cover all five, because the n8n telemetry
+ * endpoint resolves failure reports through it too.
+ */
 export const REPORT_TYPES = {
   'jobs-by-milestone': 'jobs_by_milestone',
   'jobs-by-status': 'jobs_by_status',
 };
+
+/**
+ * Every slug the telemetry endpoint may see, canonicalised.
+ *
+ * WHY THIS EXISTS. The telemetry handler resolved `REPORT_TYPES[slug] ?? slug`,
+ * and REPORT_TYPES held only the two routed reports — so a failure reported for
+ * any of the other three was logged under its RAW HYPHENATED slug. The ingest
+ * log ended up carrying both spellings of the same report, with every failure
+ * double-counted under two keys:
+ *
+ *   lead_disposition  11 failed   ·  lead-disposition  12 failed
+ *   source_cost       12 failed   ·  source-cost       12 failed
+ *   sales_efficiency   1 failed   ·  sales-efficiency   1 failed
+ *
+ * Anything grouping the log by report_type saw two half-populated reports
+ * instead of one. One canonical key per report, always.
+ */
+export const REPORT_TYPE_SLUGS = {
+  ...REPORT_TYPES,
+  'lead-disposition': 'lead_disposition',
+  'source-cost': 'source_cost',
+  'sales-efficiency': 'sales_efficiency',
+  'job-status': 'job_status_ytd',
+  'job-status-ytd': 'job_status_ytd',
+};
+
+/**
+ * Canonicalise any inbound report identifier. Known slugs map explicitly;
+ * anything unrecognised still gets hyphens folded to underscores so a new
+ * report can never open a second key for an existing one. Unknown reports stay
+ * VISIBLE (returned, not dropped) — they just cannot fragment a known one.
+ */
+export function canonicalReportType(slug) {
+  const s = String(slug ?? '').trim().toLowerCase();
+  if (!s) return null;
+  return REPORT_TYPE_SLUGS[s] ?? s.replace(/-/g, '_');
+}
 
 export class NoTextLayerError extends Error {
   constructor(msg) { super(msg); this.name = 'NoTextLayerError'; }
@@ -201,7 +243,10 @@ export async function ingestReportPdf({ reportType, buffer, source = 'n8n', expe
     report_type: reportType,
     period_start: isA ? parsed.header.periodStart : reportDate,
     period_end: isA ? parsed.header.periodEnd : reportDate,
-    report_generated_at: null,
+    // The PDF's printed run date. This was hardcoded null on every snapshot,
+    // which is why nothing could distinguish a genuine re-run from a redundant
+    // re-fetch of the same report.
+    report_generated_at: parsed.header.reportGeneratedAt ?? null,
     // ET date the report was generated — the lp_report_facts time-series
     // axis. Best-effort from the PDF's printed run date, else B's report
     // date, else the ingest date.
@@ -212,6 +257,33 @@ export async function ingestReportPdf({ reportType, buffer, source = 'n8n', expe
     net_total_cents: netTotal,
     gross_total_cents: grossTotal,
   };
+
+  // CONTENT identity — see contentSha256. The byte hash above already rejected
+  // a literal re-POST; this rejects the same logical report arriving as
+  // different bytes, which is what produced eight jobs_by_milestone snapshots
+  // for one period (all 30 rows, all net $702,506, all distinct file hashes).
+  snapshot.content_sha256 = contentSha256({
+    reportType,
+    periodStart: snapshot.period_start,
+    periodEnd: snapshot.period_end,
+    asOfDate: snapshot.as_of_date,
+    scope: snapshot.scope ?? null,
+    rows: parsed.rows,
+  });
+  const { data: sameContent, error: contentErr } = await supabase
+    .from('scorecard_report_snapshots')
+    .select('id, ingested_at')
+    .eq('report_type', reportType)
+    .eq('content_sha256', snapshot.content_sha256)
+    .maybeSingle();
+  if (contentErr) throw new Error(`content-identity check failed: ${contentErr.message}`);
+  if (sameContent) {
+    await done('duplicate', {
+      snapshot_id: sameContent.id,
+      detail: { matched_on: 'content_sha256', file_sha256: sha, note: 're-render of an already-ingested report' },
+    });
+    return { success: true, duplicate: true, snapshot_id: sameContent.id, sha256: sha };
+  }
   const rows = isA
     ? parsed.rows.map((r) => ({
         job_number: r.job_number, customer_name: r.customer_name, address: r.address,
@@ -341,8 +413,17 @@ export function registerLpReportRoutes(app) {
       if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
       const body = req.body && typeof req.body === 'object' ? req.body : {};
       const slug = String(body.report || '').trim();
-      const reportType = REPORT_TYPES[slug] ?? slug ?? null;
-      const reason = String(body.failure_reason || 'unknown').slice(0, 120);
+      const reportType = canonicalReportType(slug);
+      // n8n stringifies its reason, but a non-string slipping through used to
+      // land in the log as the literal `n8n_[object Object]`.
+      const rawReason = body.failure_reason;
+      const reason = String(
+        typeof rawReason === 'string' || typeof rawReason === 'number'
+          ? rawReason
+          : rawReason == null
+            ? 'unknown'
+            : JSON.stringify(rawReason),
+      ).slice(0, 120);
       await logIngest({
         report_type: reportType || 'unknown',
         file_sha256: typeof body.sha256 === 'string' && body.sha256 ? body.sha256 : null,

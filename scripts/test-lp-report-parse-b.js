@@ -98,6 +98,67 @@ test('wrapped status re-joins: Awaiting Change + Order, money from the anchor li
   assert.equal(wrapped.notes_raw, null); // 'Order' was consumed, not noted
 });
 
+/**
+ * Verbatim reproduction of the live failure, prosp 419732 (JAX), 2026-08-06 —
+ * reconstructed from the quarantined row, not invented.
+ *
+ * TWO columns wrapped on the same physical row: the status `Awaiting Change
+ * Order` split after `Awaiting Change`, and the email `gsellsharon046@gmail.com`
+ * broke at the same boundary — so the email's trailing `m` opened the
+ * continuation line AHEAD of the status remainder. findWrappedStatus required
+ * the remainder to open that line, so it bailed; status_raw and (because money
+ * is gated on the status) total_gross_cents both came back null.
+ */
+const TWO_COLUMNS_WRAP = `Reece Windows & Doors
+Jobs By Status
+Report Date: 8/6/2026
+
+JAX    419732   Gsell, John & Sharon              (386)256-8165   8/3/2026   Awaiting Change   12,950.00   gsellsharon046@gmail.co
+m                                    Order
+Total # Records: 1    Total: 12,950.00
+`;
+
+test('status AND email wrap together: the leading fragment no longer hides the status', () => {
+  const parsed = parseJobsByStatus(TWO_COLUMNS_WRAP);
+  const r = parsed.rows.find((x) => x.prosp_number === '419732');
+  // Before the fix this row failed the ingest twice — `unmapped_status`, plus a
+  // footer_total_mismatch of exactly its $12,950 (printed $1,182,939 vs
+  // computed $1,169,989 across 48 rows) — and report 133 produced no snapshot
+  // at all for a day.
+  assert.equal(r.status_raw, 'Awaiting Change Order');
+  assert.equal(r.bucket, classifyStatus('Awaiting Change Order'));
+  assert.equal(r.total_gross_cents, 1295000);
+  // The token the break split is re-joined, not silently kept as ...@gmail.co
+  assert.equal(r.email, 'gsellsharon046@gmail.com');
+  // The continuation line is row data — never a note, never a name fragment.
+  assert.equal(r.notes_raw, null);
+  assert.equal(r.customer_name, 'Gsell, John & Sharon');
+  // Separate live defect the same quarantined row exposed: PHONE_RE required a
+  // separator after the area code, so LP's compact `(386)256-8165` never
+  // matched — phone came back null and the number stayed glued to the name.
+  assert.equal(r.phone, '(386)256-8165');
+  // And the file ties again: 1 record, $12,950 on both sides.
+  const v = validateJobsByStatus(parsed);
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+});
+
+test('a leading fragment never invents a status where the row has none', () => {
+  const UNKNOWN_AFTER_FRAGMENT = `Reece Windows & Doors
+Jobs By Status
+
+SAR    445588   Pat Newman            (941) 555-9876   6/20/2026   Sideways Nonsense   12,000   pat@example.co
+m                                    Whatever
+Total # Records: 1    Total: 12,000
+`;
+  const parsed = parseJobsByStatus(UNKNOWN_AFTER_FRAGMENT);
+  const r = parsed.rows[0];
+  // No known status head sits on the anchor line, so nothing is guessed — the
+  // row still fails closed rather than being quietly bucketed.
+  assert.equal(r.status_raw, null);
+  assert.equal(r.bucket, null);
+  assert.equal(validateJobsByStatus(parsed).ok, false);
+});
+
 test('note-noise: MSRP $21,750 stays in notes_raw, never in total_gross', () => {
   const { rows } = parseJobsByStatus(SYNTHETIC);
   const noisy = rows.find((r) => r.prosp_number === '445588');
