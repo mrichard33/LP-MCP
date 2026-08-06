@@ -26,8 +26,18 @@
 --   DROP INDEX CONCURRENTLY IF EXISTS agent_actions_idem_uniq;
 --   ALTER TABLE agent_actions DROP COLUMN IF EXISTS idempotency_key;
 --
--- DDL is dashboard-only per project doctrine. Run this in the Supabase SQL
--- editor. Do not execute via MCP.
+-- HOW TO APPLY: see sql/README.md for the canonical rule. For this file
+-- specifically: the BEGIN/COMMIT block below is additive and may go through MCP
+-- apply_migration, but the CREATE INDEX CONCURRENTLY after it must NOT — that
+-- keyword cannot run inside a transaction, and apply_migration wraps one. Use
+-- MCP execute_sql or the dashboard for it. agent_actions is populated, so the
+-- dashboard is the better call: the build holds a session while it runs.
+--
+-- (This note previously read "DDL is dashboard-only per project doctrine. Do
+-- not execute via MCP." That was over-broad — it was really about the
+-- CONCURRENTLY statement — and it contradicted sql/049 and four migrations
+-- under sql/migrations/ that explicitly permit apply_migration. Corrected
+-- 2026-08-06; the rule now lives in one place.)
 -- ============================================================================
 
 BEGIN;
