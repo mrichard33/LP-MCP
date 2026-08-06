@@ -5,6 +5,9 @@
  * backward in a pipeline. Used by action-executor.js to ensure
  * milestone-driven P2 advancement is always forward.
  *
+ * v2.1 — P2 stage 3 relabelled "Released to Production (RTP)" in GHL
+ *        2026-08-06 (was "Financing Approved"). Comment only; the stage ID
+ *        and every position index are unchanged by a GHL rename.
  * v2.0 — Canonicalized to Antifragile (TOFU/MOFU/BOFU/SOFU) post-rename
  *        2026-05-06. Pairs with allow_backward bypass in handler.
  * v1.0 — Initial build. Stage positions from live GHL pipeline data.
@@ -31,9 +34,19 @@ const STAGE_POSITIONS = {
   '36ccbca0-c57f-466a-bd66-c7aa2a91e79d': 11,  // 11. Long-Term Hold
 
   // P2 — Client Lifecycle (8 stages, positions 0-7)
+  //
+  // The LP milestones that drive these do NOT arrive in stage order. Median
+  // days from RTP, measured over 2,158 jobs Jan–Aug 2026:
+  //   M Measure −3 · H HOA 0 · R RTP 0 · O Quoted +4 · K Ordered +10
+  //   U Permit Submit +14 · P Permit Issued +21 · V/E/G Received +39
+  //   S Start +49 · F Install End +49 · C Completion +55 · B Insp Passed +57
+  // So Ordered (+10) pushes a job to position 4 BEFORE Permit Issued (+21)
+  // asks for position 3. That backward request is blocked here, by design.
+  // Message triggers must therefore key on the lp-milestone-* TAG, which
+  // always lands, not on a GHL pipeline_stage_updated event, which does not.
   'fec39f2e-ba39-4536-95b2-bbac7ca6c454': 0,   // 1. Contract Signed
   'b7fc445c-a969-42b1-9a7a-eda5c89f25a5': 1,   // 2. Financing Pending
-  '375089e1-aaa5-429f-8c4c-5e01058fa8f8': 2,   // 3. Financing Approved
+  '375089e1-aaa5-429f-8c4c-5e01058fa8f8': 2,   // 3. Released to Production (RTP)
   '561f35fe-3632-40e9-bf0d-b9061bdf2589': 3,   // 4. Permitting & HOA
   '6b89bc8d-067a-41fb-a76c-fc0c9feaaf92': 4,   // 5. In Production
   'd852ba71-c6f5-422b-9c74-33b6036c69a5': 5,   // 6. Install Scheduled

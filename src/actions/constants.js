@@ -67,7 +67,19 @@ export const STAGE_MAP = {
   'Contract Signed':                     'fec39f2e-ba39-4536-95b2-bbac7ca6c454',
   'Financing Pending':                   'b7fc445c-a969-42b1-9a7a-eda5c89f25a5',
   // Build Authorization
-  'Financing Approved':                  '375089e1-aaa5-429f-8c4c-5e01058fa8f8',
+  //
+  // 2026-08-06 RENAME: stage 375089e1 is now "3. Released to Production (RTP)"
+  // in GHL. It was "3. Financing Approved", which was the wrong noun — the
+  // event that actually lands a job here is the LP RTP milestone (mdt_id=R),
+  // meaning the contract cleared verification and was released to production.
+  // RTP is also the event LP's Net revenue report is keyed on. Financing
+  // approval is a precondition, not the milestone.
+  //
+  // The stage ID is unchanged by a GHL rename, so nothing breaks either way;
+  // this map just stops lying about what the stage means. New rules use the
+  // canonical name. 'Financing Approved' is retained below as a legacy alias
+  // because agent_rules rows and older seeds still carry it.
+  'Released to Production (RTP)':        '375089e1-aaa5-429f-8c4c-5e01058fa8f8',
   'Permitting & HOA':                    '561f35fe-3632-40e9-bf0d-b9061bdf2589',
   // Build Execution
   'In Production':                       '6b89bc8d-067a-41fb-a76c-fc0c9feaaf92',
@@ -79,6 +91,9 @@ export const STAGE_MAP = {
   // P2 — Legacy aliases
   'Closed Won (Contract Signed)':            'fec39f2e-ba39-4536-95b2-bbac7ca6c454',
   'Financing Pending / Document Collection': 'b7fc445c-a969-42b1-9a7a-eda5c89f25a5',
+  'Financing Approved':                      '375089e1-aaa5-429f-8c4c-5e01058fa8f8',
+  'Released to Production':                  '375089e1-aaa5-429f-8c4c-5e01058fa8f8',
+  'RTP':                                     '375089e1-aaa5-429f-8c4c-5e01058fa8f8',
   'HOA / Permit In Progress':                '561f35fe-3632-40e9-bf0d-b9061bdf2589',
   'Production / Manufacturing':              '6b89bc8d-067a-41fb-a76c-fc0c9feaaf92',
   'Referral & Expansion Opportunity':        '053a0020-0f96-4a22-8717-8814c3ca1ff8',
