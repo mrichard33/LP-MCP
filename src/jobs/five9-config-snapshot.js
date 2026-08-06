@@ -24,6 +24,19 @@
 //   array in unstable order, the change log fires daily on that entity — which
 //   is worse than no change log at all. UNSTABLE-HASH DETECTION below is the
 //   canary for exactly that, and it is why a same-day re-run is worth running.
+//   The canary reports `unstable_entities: [{entity_type, entity_name,
+//   differing_paths}]`, not just a count: the whole point is to name the
+//   entities so the ordering can be fixed BEFORE the change log starts firing,
+//   and a bare integer cannot be acted on.
+//
+// LOCKED ENTITIES
+//   An object held open in the Five9 admin UI reads back as a SOAP fault
+//   ("... is already locked"). That is a transient, expected condition, so it
+//   is its own state (`locked` / `entities_locked`) rather than an error — a
+//   frequently-edited campaign would otherwise be a permanent error in every
+//   run, and a permanently-red benign signal just teaches people to ignore the
+//   field. It is still a capture GAP for that entity that day: no snapshot row
+//   is written, so the next successful run diffs against the last good one.
 //
 // VOLATILE FIELDS
 //   `size` is stripped from `list` configs BEFORE hashing (record counts change
@@ -134,11 +147,60 @@ export function diffConfigs(prev, next, prefix = '') {
   return rows;
 }
 
+/**
+ * A Five9 entity held open in the admin UI reads back as a SOAP fault
+ * ("... is already locked"), not as data. That is a TRANSIENT, EXPECTED
+ * condition — somebody is editing the campaign — and it is categorically
+ * different from a read that failed.
+ *
+ * It gets its own state rather than living in errors[] because a campaign that
+ * is edited often would otherwise show up as a permanent error in every single
+ * run. A permanently-red signal that is actually benign is the same failure
+ * mode as a `verified` flag that is always false: it trains everyone to stop
+ * reading the field. Locked entities are reported, counted separately, and
+ * kept out of the degraded-event denominator.
+ */
+export function isLockedError(message) {
+  return /\balready locked\b/i.test(String(message ?? ''));
+}
+
+/** Cap on paths reported per unstable entity. The total count is always exact. */
+export const UNSTABLE_PATH_CAP = 25;
+
+/**
+ * Identify an entity whose hash changed within a single day.
+ *
+ * The count alone is unactionable: "unstable_hashes: 11" out of 272 entities
+ * gives no way to find the eleven, and therefore no way to fix the unstable
+ * ordering before the change log starts firing on them daily. Both configs are
+ * already in hand at the call site, so the differing paths cost nothing but
+ * were being discarded.
+ *
+ * Paths are the diagnostic that matters: an array coming back in a different
+ * order shows up as a run of bracket-indexed siblings (includeNumbers[3],
+ * includeNumbers[4], ...), which is immediately distinguishable from a real
+ * edit landing on a named field. Values are deliberately NOT included — they
+ * are already recorded in five9_config_changes for real changes, and this
+ * summary travels into an event payload.
+ */
+export function unstableEntry(entity_type, entity_name, prevConfig, nextConfig, cap = UNSTABLE_PATH_CAP) {
+  const paths = diffConfigs(prevConfig, nextConfig).map((d) => d.field_path);
+  const entry = {
+    entity_type,
+    entity_name,
+    differing_paths: paths.slice(0, cap),
+    differing_path_count: paths.length,
+  };
+  // Never truncate silently — a capped list must say so, or it reads as complete.
+  if (paths.length > cap) entry.truncated = true;
+  return entry;
+}
+
 /* ---------------------------------------------------------------------- *
  * Collection — every reader already exists; this only sequences them.
  * ---------------------------------------------------------------------- */
 
-async function collectEntities(errors) {
+async function collectEntities(errors, locked) {
   const entities = [];
   const push = (entity_type, entity_name, config) => {
     if (entity_name) entities.push({ entity_type, entity_name: String(entity_name), config });
@@ -148,8 +210,16 @@ async function collectEntities(errors) {
     try {
       await fn();
     } catch (err) {
-      console.warn(`[Five9Snapshot] ${label} failed: ${err.message}`);
-      errors.push({ entity: label, error: err.message });
+      // A lock is somebody editing in the admin UI, not a failure — see
+      // isLockedError. It is still a capture GAP for that entity today, so it
+      // is reported, just not as an error.
+      if (isLockedError(err.message)) {
+        console.warn(`[Five9Snapshot] ${label} LOCKED in the Five9 admin UI — not captured this run: ${err.message}`);
+        locked.push({ entity: label, reason: err.message });
+      } else {
+        console.warn(`[Five9Snapshot] ${label} failed: ${err.message}`);
+        errors.push({ entity: label, error: err.message });
+      }
     }
     if (SOAP_DELAY_MS) await sleep(SOAP_DELAY_MS);
   };
@@ -204,19 +274,20 @@ export async function runFive9ConfigSnapshot() {
   const startedAt = Date.now();
   const snapshot_date = todayET();
   const errors = [];
+  const locked = [];
 
   if (!supabase) {
-    const summary = { snapshot_date, entities_captured: 0, changes_detected: 0, unstable_hashes: 0, errors: [{ entity: 'supabase', error: 'Supabase not configured' }] };
+    const summary = { snapshot_date, entities_captured: 0, changes_detected: 0, unstable_hashes: 0, unstable_entities: [], entities_locked: 0, locked: [], errors: [{ entity: 'supabase', error: 'Supabase not configured' }] };
     console.error('[Five9Snapshot] Supabase not configured — aborting');
     lastRun = { ...summary, finished_at: new Date().toISOString() };
     return summary;
   }
 
-  const entities = await collectEntities(errors);
-  console.log(`[Five9Snapshot] collected ${entities.length} entities (${errors.length} read errors)`);
+  const entities = await collectEntities(errors, locked);
+  console.log(`[Five9Snapshot] collected ${entities.length} entities (${errors.length} read errors, ${locked.length} locked)`);
 
   let changes_detected = 0;
-  let unstable_hashes = 0;
+  const unstable_entities = [];
   const snapshotRows = [];
 
   for (const e of entities) {
@@ -263,7 +334,7 @@ export async function runFive9ConfigSnapshot() {
   } catch (err) {
     console.error(`[Five9Snapshot] snapshot upsert failed: ${err.message}`);
     errors.push({ entity: 'snapshot_upsert', error: err.message });
-    const summary = { snapshot_date, entities_captured: 0, changes_detected: 0, unstable_hashes: 0, errors, elapsed_ms: Date.now() - startedAt };
+    const summary = { snapshot_date, entities_captured: 0, changes_detected: 0, unstable_hashes: 0, unstable_entities: [], entities_locked: locked.length, locked, errors, elapsed_ms: Date.now() - startedAt };
     lastRun = { ...summary, finished_at: new Date().toISOString() };
     return summary;
   }
@@ -280,9 +351,11 @@ export async function runFive9ConfigSnapshot() {
       // Same-day re-run produced a DIFFERENT hash. Either a real change landed
       // between runs, or an array came back in a different order. The latter
       // would make the change log fire on everything from tomorrow onward, so
-      // it is worth a loud line rather than a silent skip.
-      unstable_hashes += 1;
-      console.warn(`[Five9Snapshot] UNSTABLE HASH — ${e.entity_type}/${e.entity_name} changed within ${snapshot_date}; if this is not a real edit, an array is coming back in unstable order`);
+      // it is worth a loud line rather than a silent skip — and it must name
+      // the entity and the paths, or there is no way to act on the count.
+      const entry = unstableEntry(e.entity_type, e.entity_name, prior.config, e.config);
+      unstable_entities.push(entry);
+      console.warn(`[Five9Snapshot] UNSTABLE HASH — ${e.entity_type}/${e.entity_name} changed within ${snapshot_date} at ${entry.differing_path_count} path(s): ${entry.differing_paths.join(', ')}${entry.truncated ? ', …' : ''}; if this is not a real edit, an array is coming back in unstable order`);
       continue;
     }
 
@@ -315,15 +388,22 @@ export async function runFive9ConfigSnapshot() {
     snapshot_date,
     entities_captured: snapshotRows.length,
     changes_detected,
-    unstable_hashes,
+    unstable_hashes: unstable_entities.length,
+    // The identities behind the count. Without these the count is unactionable.
+    unstable_entities,
+    entities_locked: locked.length,
+    locked,
     errors,
     elapsed_ms: Date.now() - startedAt,
   };
-  console.log(`[Five9Snapshot] ${snapshot_date}: ${summary.entities_captured} captured, ${changes_detected} changes, ${unstable_hashes} unstable, ${errors.length} errors (${summary.elapsed_ms}ms)`);
+  console.log(`[Five9Snapshot] ${snapshot_date}: ${summary.entities_captured} captured, ${changes_detected} changes, ${summary.unstable_hashes} unstable, ${locked.length} locked, ${errors.length} errors (${summary.elapsed_ms}ms)`);
 
-  // Degraded when more than half the reads failed. bypass_filter is required:
-  // applyIntakeFilter drops event types with no active rule consumer, and this
-  // type has none — without it the degraded signal disappears silently.
+  // Degraded when more than half the reads failed. Locked entities are NOT
+  // errors and stay out of this count — an admin holding a campaign open is a
+  // capture gap, not a broken job, and must not drift the run toward a
+  // degraded alert. bypass_filter is required: applyIntakeFilter drops event
+  // types with no active rule consumer, and this type has none — without it
+  // the degraded signal disappears silently.
   if (errors.length && errors.length > Math.max(1, snapshotRows.length) / 2) {
     await emitEvent({
       event_type: 'five9.config_snapshot_degraded',
