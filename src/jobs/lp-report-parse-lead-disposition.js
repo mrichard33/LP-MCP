@@ -26,7 +26,7 @@
 
 import { parseMoneyCents } from './lp-report-common.js';
 import { resolveMarketFromBranch, resolveMarket } from './market-resolver.js';
-import { csvToObjects, parseCsvDate, parseCount } from './lp-report-csv-common.js';
+import { csvToObjects, parseCsvDate, parseCount , parseCsvDateTimeET } from './lp-report-csv-common.js';
 
 const REQUIRED = ['id', 'Category', 'entrydate', 'src_id', 'brn_id', 'SourceSubDescr',
   'dspdescr', 'GSA', 'NetAmount', 'ApptDate', 'JobStatus', 'Zip', 'SDate', 'EDate'];
@@ -37,11 +37,17 @@ const REQUIRED = ['id', 'Category', 'entrydate', 'src_id', 'brn_id', 'SourceSubD
  */
 export function parseLeadDispositionCsv(text) {
   const { rows: raw } = csvToObjects(text, REQUIRED);
-  let periodStart = null, periodEnd = null, asOf = null;
+  let periodStart = null, periodEnd = null, asOf = null, generatedAt = null;
   const rows = raw.map((r, i) => {
     periodStart ??= parseCsvDate(r.SDate);
     periodEnd ??= parseCsvDate(r.EDate);
-    asOf ??= parseCsvDate(r.CurrentDateTime);
+    // Full timestamp, not just the date: this is the coverage-as-of value
+    // behind is_partial_month, and truncating it loses the only signal of how
+    // much of the period the file actually contains.
+    if (!generatedAt) {
+      const gen = parseCsvDateTimeET(r.CurrentDateTime);
+      if (gen) { generatedAt = gen; asOf ??= parseCsvDate(r.CurrentDateTime); }
+    }
     return {
       row_num: i + 1,
       lp_lead_id: String(r.id ?? '').trim(),
@@ -64,7 +70,14 @@ export function parseLeadDispositionCsv(text) {
       brn_id_raw: String(r.brn_id ?? '').trim(),
     };
   });
-  return { rows, header: { periodStart, periodEnd, asOf } };
+  return {
+    rows,
+    header: {
+      periodStart, periodEnd, asOf,
+      generatedAt: generatedAt?.iso ?? null,
+      generatedAtTruncated: Boolean(generatedAt && generatedAt.isMidnight && !generatedAt.hadTime),
+    },
+   };
 }
 
 /**

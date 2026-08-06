@@ -1,9 +1,9 @@
-"id","District","Market","custname","Status","MostRecentNoteHOA","phone","email","address","TotalGross","ContractDate","brn_id","SDate","EDate","CurrentDateTime","UseColor","FullName","xbrn_id","xSortBy"
-"100341","Southeast","BOCA","Xxxxxxx Xxxxx","Hold - HOA","HOA board meets the second Tuesday.
+"id","cst_id","contractid","District","Market","custname","Status","descr","MostRecentNoteHOA","contractdate","grossamount","NETDATE","statusdate","FinAmount","RepName","FinCo","phone","email","address","brn_id","SDate","EDate","CurrentDateTime","UseColor","FullName","xbrn_id","xSortBy"
+"100341","C-88101","J-100201","Southeast","BOCA","Xxxxxxx Xxxxx","Hold - HOA","Hold - HOA","HOA board meets the second Tuesday.
 Submitted packet 7/28, awaiting ARC review.
-Homeowner will call once approved.","555-555-5555","xxxxxxxx@example.com","1 Xxxxx Xxx","41250.00","7/14/2026","BOCA","8/1/2026","8/31/2026","8/6/2026 6:15:03 AM","True","Xxxx Xxxxxxx","ALL","By Status"
-"100342","Southwest","FTMYR","Xxxxx Xxxxxxxx","Hold - Permit","Permit submitted 7/30. County backlog ~3 weeks.","555-555-5555","xxxxx@example.com","2 Xxxxx Xxx","28900.0000","7/16/2026","FTMYR","8/1/2026","8/31/2026","8/6/2026 6:15:03 AM","True","Xxxx Xxxxxxx","ALL","By Status"
-"100343","Central","ORL","Xxxxxxxx Xxxx","Await Rep","","555-555-5555","xxxxxxxx@example.com","3 Xxxxx Xxx","15000","7/19/2026","ORL","8/1/2026","8/31/2026","8/6/2026 6:15:03 AM","True","Xxxx Xxxxxxx","ALL","By Status"
-"100344","Southeast","BOCA","Xxxx Xxxxxxxxx","Hold - HOA","Association requires two neighbour sign-offs.
-First obtained 8/2.","555-555-5555","xxxx@example.com","4 Xxxxx Xxx","33475.50","7/22/2026","BOCA","8/1/2026","8/31/2026","8/6/2026 6:15:03 AM","True","Xxxx Xxxxxxx","ALL","By Status"
-"100345","West","STPET","Xxxxxx Xxxxx","Credit Decline","","555-555-5555","xxxxxx@example.com","5 Xxxxx Xxx","0.0000","7/25/2026","STPET","8/1/2026","8/31/2026","8/6/2026 6:15:03 AM","True","Xxxx Xxxxxxx","ALL","By Status"
+Homeowner will call once approved.","7/14/2026","41250.00","","8/1/2026","41250.00","Xxxx X","Greensky","555-555-5555","xxxxxxxx@example.com","1 Xxxxx Xxx","BOCA","8/1/2026","8/31/2026","8/6/2026 6:15:03 AM","True","Xxxx Xxxxxxx","ALL","By Status"
+"100342","C-88102","J-100202","Southwest","FTMYR","Xxxxx Xxxxxxxx","Hold - Permit","Hold - Permit","Permit submitted 7/30. County backlog ~3 weeks.","7/16/2026","28900.0000","","8/2/2026","28900.0000","Xxxx X","Service Finance","555-555-5555","xxxxx@example.com","2 Xxxxx Xxx","FTMYR","8/1/2026","8/31/2026","8/6/2026 6:15:03 AM","True","Xxxx Xxxxxxx","ALL","By Status"
+"100343","C-88103","J-100203","Central","ORL","Xxxxxxxx Xxxx","Await Rep","Await Rep","","7/19/2026","15000","","8/3/2026","15000","Xxxx X","Cash","555-555-5555","xxxxxxxx@example.com","3 Xxxxx Xxx","ORL","8/1/2026","8/31/2026","8/6/2026 6:15:03 AM","True","Xxxx Xxxxxxx","ALL","By Status"
+"100344","C-88104","J-100204","Southeast","BOCA","Xxxx Xxxxxxxxx","Hold - HOA","Hold - HOA","Association requires two neighbour sign-offs.
+First obtained 8/2.","7/22/2026","33475.50","","8/4/2026","33475.50","Xxxx X","Greensky","555-555-5555","xxxx@example.com","4 Xxxxx Xxx","BOCA","8/1/2026","8/31/2026","8/6/2026 6:15:03 AM","True","Xxxx Xxxxxxx","ALL","By Status"
+"100345","C-88105","J-100205","West","STPET","Xxxxxx Xxxxx","Credit Decline","Credit Decline","","7/25/2026","0.0000","","8/5/2026","0.0000","Xxxx X","Service Finance","555-555-5555","xxxxxx@example.com","5 Xxxxx Xxx","STPET","8/1/2026","8/31/2026","8/6/2026 6:15:03 AM","True","Xxxx Xxxxxxx","ALL","By Status"

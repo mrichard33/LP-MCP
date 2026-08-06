@@ -33,7 +33,7 @@
 // CSV carries cents and asserts exactly.
 
 import { parseMoneyCents, parseDateMDY } from './lp-report-common.js';
-import { csvToObjects, parseCsvDate, parseCount } from './lp-report-csv-common.js';
+import { csvToObjects, parseCsvDate, parseCount , parseCsvDateTimeET } from './lp-report-csv-common.js';
 import { resolveMarketFromBranch } from './market-resolver.js';
 
 // Verbatim branch labels 137 prints (Grouper / row label). RFED appears when
@@ -50,11 +50,17 @@ const CSV_REQUIRED = ['Grouper', 'NumIssued', 'NumSale', 'NumNetIssued', 'NumSat
  */
 export function parseSalesEfficiencyCsv(text) {
   const { rows: raw } = csvToObjects(text, CSV_REQUIRED);
-  let periodStart = null, periodEnd = null, asOf = null;
+  let periodStart = null, periodEnd = null, asOf = null, generatedAt = null;
   const rows = raw.map((r, i) => {
     periodStart ??= parseCsvDate(r.SDate);
     periodEnd ??= parseCsvDate(r.EDate);
-    asOf ??= parseCsvDate(r.CurrentDateTime);
+    // Full timestamp, not just the date: this is the coverage-as-of value
+    // behind is_partial_month, and truncating it loses the only signal of how
+    // much of the period the file actually contains.
+    if (!generatedAt) {
+      const gen = parseCsvDateTimeET(r.CurrentDateTime);
+      if (gen) { generatedAt = gen; asOf ??= parseCsvDate(r.CurrentDateTime); }
+    }
     return {
       row_num: i + 1,
       branch_code_raw: String(r.Grouper ?? '').trim(),
@@ -75,7 +81,15 @@ export function parseSalesEfficiencyCsv(text) {
       hold_cents: parseMoneyCents(r.GSAHold) ?? 0,
     };
   });
-  return { rows, header: { periodStart, periodEnd, asOf }, mode: 'full' };
+  return {
+    rows,
+    header: {
+      periodStart, periodEnd, asOf,
+      generatedAt: generatedAt?.iso ?? null,
+      generatedAtTruncated: Boolean(generatedAt && generatedAt.isMidnight && !generatedAt.hadTime),
+    },
+    mode: 'full',
+  };
 }
 
 // ── PDF parsing ─────────────────────────────────────────────────────────────

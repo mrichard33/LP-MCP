@@ -419,3 +419,64 @@ test('134 CSV rejects a file whose header is not 134 at all', () => {
   assert.throws(() => parseMilestoneCsv(read('report-136-source-cost.csv')),
     /CSV missing required columns/);
 });
+
+// ── every fixture is really ingestible, and every parser reports coverage ───
+//
+// Two regressions this catches, both of which were live in the first cut of
+// this work:
+//
+//   1. A fixture that FINGERPRINTS but does not PARSE. The 133 and 135 fixtures
+//      originally carried only the discriminator columns, so routing tests
+//      passed while the file would have been rejected `csv_shape_unrecognized`
+//      on a real ingest.
+//   2. A parser that drops CurrentDateTime's time. Three of the five still used
+//      the date-only parseCsvDate, so their snapshots got report_generated_at
+//      NULL, is_partial_month NULL, and could therefore NEVER close a period —
+//      the closing pull would land and change nothing.
+
+test('every committed CSV fixture parses with its report\'s real parser', async () => {
+  const parsers = {
+    job_status_ytd: (await import('../src/jobs/lp-report-parse-job-status.js')).parseJobStatusCsv,
+    jobs_by_milestone: parseMilestoneCsv,
+    lead_disposition: (await import('../src/jobs/lp-report-parse-lead-disposition.js')).parseLeadDispositionCsv,
+    source_cost: parseSourceCostCsv,
+    sales_efficiency: (await import('../src/jobs/lp-report-parse-sales-efficiency.js')).parseSalesEfficiencyCsv,
+  };
+  const fixtures = [
+    'report-133-jobs-by-status.csv', 'report-134-jobs-by-milestone.csv',
+    'report-135-lead-disposition.csv', 'report-136-source-cost.csv',
+    'report-137-sales-efficiency-ytd.csv',
+  ];
+  for (const file of fixtures) {
+    const text = read(file);
+    // Routing and parsing must agree: whatever the header says it is, that
+    // report's parser must accept it.
+    const { reportType } = detectReportFromHeader(parseCsv(text)[0]);
+    const parsed = parsers[reportType](text);
+    assert.ok(parsed.rows.length > 0, `${file} → ${reportType} produced no rows`);
+  }
+});
+
+test('§D every CSV parser surfaces CurrentDateTime WITH its time', async () => {
+  const parsers = {
+    job_status_ytd: (await import('../src/jobs/lp-report-parse-job-status.js')).parseJobStatusCsv,
+    jobs_by_milestone: parseMilestoneCsv,
+    lead_disposition: (await import('../src/jobs/lp-report-parse-lead-disposition.js')).parseLeadDispositionCsv,
+    source_cost: parseSourceCostCsv,
+    sales_efficiency: (await import('../src/jobs/lp-report-parse-sales-efficiency.js')).parseSalesEfficiencyCsv,
+  };
+  for (const file of [
+    'report-133-jobs-by-status.csv', 'report-134-jobs-by-milestone.csv',
+    'report-135-lead-disposition.csv', 'report-136-source-cost.csv',
+    'report-137-sales-efficiency-ytd.csv',
+  ]) {
+    const text = read(file);
+    const { reportType } = detectReportFromHeader(parseCsv(text)[0]);
+    const { header } = parsers[reportType](text);
+
+    assert.ok(header.generatedAt, `${reportType} must report generatedAt — NULL can never close a period`);
+    assert.equal(header.generatedAtTruncated, false, `${reportType} lost the time component`);
+    assert.notEqual(header.generatedAt.slice(11), '00:00:00.000Z',
+      `${reportType} landed as midnight — that is the truncation bug`);
+  }
+});
