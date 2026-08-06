@@ -37,6 +37,9 @@ import {
   // 2026-08-06 Phase E
   MIN_CRM_REDIAL_SEC_LIMIT,
   OUTBOUND_CAMPAIGN_FIELD_ORDER,
+  // 2026-08-06 Phase E-2 — timer read-back verification
+  timerStructToSeconds,
+  verifyPatchReadBack,
 } from '../src/five9/admin-writes.js';
 
 test('five9WritesEnabled: ships dark — unset/false off, only literal "true" on', () => {
@@ -520,4 +523,103 @@ test('every PATCHABLE_FIELD has a position in OUTBOUND_CAMPAIGN_FIELD_ORDER', ()
   // emits — no error, just a patch that does nothing.
   const missing = [...PATCHABLE_FIELDS].filter(f => !OUTBOUND_CAMPAIGN_FIELD_ORDER.includes(f));
   assert.deepEqual(missing, [], `whitelisted fields absent from the order array: ${missing.join(', ')}`);
+});
+
+/* ---------------------------------------------------------------------- *
+ * Phase E-2 (2026-08-06) — tns:timer read-back verification.
+ *
+ * Regression origin: action 283332 set CRMRedialTimeout on DIAL ASAP from
+ * 2h to 300s. The write landed correctly and Five9 read it back as
+ * {days:'0',hours:'0',minutes:'5',seconds:'0'} — which IS 300 seconds — but
+ * the verifier compared String(struct) to String(300), i.e. "[object Object]"
+ * to "300", and reported verified:false. A permanent false negative on the
+ * one field that says a gated write actually landed.
+ * ---------------------------------------------------------------------- */
+
+test('timerStructToSeconds: struct forms', () => {
+  assert.equal(timerStructToSeconds({ days: '0', hours: '0', minutes: '5', seconds: '0' }), 300);
+  assert.equal(timerStructToSeconds({ days: '0', hours: '2', minutes: '0', seconds: '0' }), 7200);
+  assert.equal(timerStructToSeconds({ days: '1', hours: '0', minutes: '0', seconds: '0' }), 86400);
+  // Partial structs: absent keys count as zero, matching the read-path helper.
+  assert.equal(timerStructToSeconds({ minutes: '5' }), 300);
+  assert.equal(timerStructToSeconds({}), 0);
+});
+
+test('timerStructToSeconds: scalar forms the write side produces', () => {
+  // A patch value arrives as an integer, or as a numeric string off JSON.
+  assert.equal(timerStructToSeconds(300), 300);
+  assert.equal(timerStructToSeconds('300'), 300);
+  assert.equal(timerStructToSeconds(0), 0);
+});
+
+test('timerStructToSeconds: unrecognizable input is null, not a silent zero', () => {
+  assert.equal(timerStructToSeconds(null), null);
+  assert.equal(timerStructToSeconds(undefined), null);
+  assert.equal(timerStructToSeconds('abc'), null);
+  assert.equal(timerStructToSeconds('12abc'), null);
+  assert.equal(timerStructToSeconds(NaN), null);
+  assert.equal(timerStructToSeconds(true), null);
+});
+
+test('REGRESSION action 283332: a correct timer write verifies clean', () => {
+  // Exactly the shape Five9 returned on 2026-08-06.
+  const after = { raw: { CRMRedialTimeout: { days: '0', hours: '0', minutes: '5', seconds: '0' } } };
+  const mismatches = verifyPatchReadBack({ CRMRedialTimeout: 300 }, after);
+  assert.deepEqual(mismatches, [], 'a landed 300s write must not report drift');
+  assert.equal(mismatches.length === 0, true, 'verified must be true');
+});
+
+test('timer read-back: a genuinely wrong timer is still caught', () => {
+  // The fix must not blanket-pass timers. 2h read back against a 300s patch
+  // is real drift and has to surface.
+  const after = { raw: { CRMRedialTimeout: { days: '0', hours: '2', minutes: '0', seconds: '0' } } };
+  const mismatches = verifyPatchReadBack({ CRMRedialTimeout: 300 }, after);
+  assert.equal(mismatches.length, 1);
+  assert.equal(mismatches[0].field, 'CRMRedialTimeout');
+  assert.equal(mismatches[0].expected, 300);
+  assert.equal(mismatches[0].actual, 7200);
+  // The raw struct is carried so an operator can see what Five9 actually sent.
+  assert.deepEqual(mismatches[0].actual_raw, { days: '0', hours: '2', minutes: '0', seconds: '0' });
+});
+
+test('timer read-back: an unnormalizable read-back is reported, not passed', () => {
+  // Silently calling an unreadable read-back "verified" is the same defect in
+  // a new shape, so it must surface rather than skip.
+  const mismatches = verifyPatchReadBack({ CRMRedialTimeout: 300 }, { raw: { CRMRedialTimeout: 'garbage' } });
+  assert.equal(mismatches.length, 1);
+  assert.equal(mismatches[0].actual, null);
+  assert.equal(mismatches[0].actual_raw, 'garbage');
+});
+
+test('maxQueueTime verifies off the already-normalized seconds field', () => {
+  // maxQueueTime never hit the [object Object] bug — the reader surfaces
+  // maxQueueTimeSeconds. Both directions must keep working.
+  assert.deepEqual(verifyPatchReadBack({ maxQueueTime: 2 }, { maxQueueTimeSeconds: 2 }), []);
+  const drift = verifyPatchReadBack({ maxQueueTime: 2 }, { maxQueueTimeSeconds: 30 });
+  assert.equal(drift.length, 1);
+  assert.equal(drift[0].actual, 30);
+});
+
+test('maxPreviewTime is not surfaced by the reader, so it stays unverified', () => {
+  // Documents current reality: absent from the normalized read means skipped,
+  // NOT silently passed on a value we never looked at.
+  assert.deepEqual(verifyPatchReadBack({ maxPreviewTime: 10 }, { raw: {} }), []);
+});
+
+test('non-timer fields keep exact string comparison', () => {
+  assert.deepEqual(verifyPatchReadBack({ dialingRatio: 10 }, { dialingRatio: 10 }), []);
+  const drift = verifyPatchReadBack({ dialingRatio: 10 }, { dialingRatio: 12 });
+  assert.deepEqual(drift, [{ field: 'dialingRatio', expected: 10, actual: 12 }]);
+  // A field absent from the read-back is skipped, not reported as drift.
+  assert.deepEqual(verifyPatchReadBack({ dialingRatio: 10 }, { raw: {} }), []);
+});
+
+test('mixed patch: timer and non-timer fields verify independently', () => {
+  const after = {
+    raw: { CRMRedialTimeout: { days: '0', hours: '0', minutes: '5', seconds: '0' } },
+    dialingRatio: 12,
+  };
+  const mismatches = verifyPatchReadBack({ CRMRedialTimeout: 300, dialingRatio: 10 }, after);
+  assert.equal(mismatches.length, 1, 'only the genuinely drifted field should surface');
+  assert.equal(mismatches[0].field, 'dialingRatio');
 });
