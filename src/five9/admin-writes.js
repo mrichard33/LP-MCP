@@ -165,8 +165,7 @@ export function requiredConfirmToken(op, payload) {
   // 2026-08-05 Phase D — a campaign profile is shared. `Data Leads` alone
   // serves five campaigns, so one typo here is a five-campaign blast radius.
   // Restating the profile name is the typo gate; approve_action stays the
-  // human gate. (The modify op itself lands in the follow-up PR — see the
-  // Phase D note in docs; this rule is inert until then.)
+  // human gate. (Live as of Phase D-2, 2026-08-06.)
   if (op === 'modify_campaign_profile') {
     return String(payload?.profile_name || '').trim();
   }
@@ -798,18 +797,41 @@ export function executeUserSkillRemove(action) {
 /* ---------------------------------------------------------------------- *
  * Phase D executes — campaign profiles.
  *
- * Only CREATE ships in this PR. The modify op is held back: its request
- * wrapper (<xs:complexType name="modifyCampaignProfile">) sits past the
- * 100k-char response cap on every WSDL build we can reach, so the name of its
- * single child element is unverified. createCampaignProfile IS verified —
- * <xs:element minOccurs="0" name="campaignProfile" type="tns:campaignProfileInfo"/>
- * — and the sibling ops in this family disagree with each other on that name
- * (modifyCampaignProfileFilterOrder uses "campaignProfile",
- * modifyCampaignProfileCrmCriteria uses "profileName"), so it is not safely
- * inferable. See the PR body for the one-command follow-up.
+ * RESOLVED 2026-08-06 (Phase D-2). Both ops take the SAME wrapper, verified
+ * against the live v13 WSDL:
  *
- * Create needs no confirm_token: a new profile is attached to nothing until a
- * separate five9_set_outbound_campaign patch moves a campaign onto it.
+ *   <xs:complexType name="modifyCampaignProfile"><xs:sequence>
+ *     <xs:element minOccurs="0" name="campaignProfile"
+ *                 type="tns:campaignProfileInfo"/>
+ *
+ * ...identical to createCampaignProfile, so buildCampaignProfileXml is reused
+ * unchanged for both.
+ *
+ * FETCH NOTE (do not re-derive this): the WSDL endpoint requires a `user`
+ * QUERY parameter — a bare "?wsdl" with no credentials 403s with faultstring
+ * 'No user name ("user") parameter provided'. The param is NOT validated, so
+ * any value works and no Basic auth is needed for the document itself.
+ * The document is ~962KB on a SINGLE line, so line-oriented grep finds
+ * nothing — extract with a DOTALL regex, not grep.
+ * SEPARATELY: the LP-MCP http_request tool caps response bodies at 100,000
+ * chars (MAX_BODY_CHARS, src/tools/admin/http-tools.js), which is what
+ * actually blocked Phase D — this type sits past that cut on every WSDL
+ * build, with or without auth. Fetch from a host without that cap:
+ *   curl -s "https://api.five9.com/wsadmin/v13/AdminWebService?wsdl&user=x" \
+ *     | python3 -c "import re,sys; \
+ *         print(re.search(r'<xs:complexType name=\"NAME\">.*?</xs:complexType>', \
+ *         sys.stdin.read(), re.S).group(0))"
+ *
+ * The naming inconsistency across this op family is real but not ambiguous:
+ * every op taking a full campaignProfileInfo OBJECT uses "campaignProfile"
+ * (create, modify); ops taking a profile NAME string use either
+ * "profileName" (ModifyCrmCriteria, ModifyDispositions) or "campaignProfile"
+ * as xs:string (ModifyFilterOrder). Do not relitigate.
+ *
+ * MODIFY is confirm_token-gated (restate the profile name) because a profile
+ * is shared — `Data Leads` serves five campaigns. CREATE is not: a new profile
+ * is attached to nothing until a separate five9_set_outbound_campaign patch
+ * moves a campaign onto it.
  * ---------------------------------------------------------------------- */
 
 async function readProfile(profileName) {
@@ -852,6 +874,55 @@ export function executeCreateCampaignProfile(action) {
 
       ctx.new_state = await readProfile(name);
       return { profile: name, created: !!ctx.new_state };
+    },
+  );
+}
+
+export function executeModifyCampaignProfile(action) {
+  const payload = action.action_payload || {};
+  const name = String(payload.profile_name || '').trim();
+  const patch = payload.patch;
+  if (!name) throw new Error('five9_modify_campaign_profile requires action_payload.profile_name');
+
+  return withFive9WriteGate(
+    { action, subtype: 'modify_campaign_profile', entityType: 'five9_campaign_profile', entityId: name },
+    async (ctx) => {
+      // Build + token-check first — payload errors fire before any read.
+      const bodyXml = buildCampaignProfileXml(name, patch);
+      checkConfirmToken('modify_campaign_profile', payload);
+
+      const before = await readProfile(name);
+      if (!before) throw new Error(`profile_not_found: ${name}`);
+      ctx.previous_state = before;
+
+      const compliance = checkProfileCompliance(patch, {
+        complianceOverride: payload.compliance_override === true,
+      });
+      ctx.event_extra.compliance = compliance;
+      if (!compliance.ok) {
+        throw new Error(`REFUSED: compliance — ${compliance.violations.join('; ')} (attempts ceiling; requires explicit compliance_override: true)`);
+      }
+
+      await ctx.soap('modifyCampaignProfile', bodyXml);
+      if (ctx.dry_run) return { profile: name, patched: Object.keys(patch) };
+
+      const after = await readProfile(name);
+      ctx.new_state = after;
+      // Read-back verification: report drift, never mask a landed write.
+      const verify_mismatches = [];
+      for (const [field, expected] of Object.entries(patch)) {
+        const actual = after?.[field] ?? after?.raw?.[field];
+        if (actual !== undefined && String(actual) !== String(expected)) {
+          verify_mismatches.push({ field, expected, actual });
+        }
+      }
+      ctx.event_extra.verify_mismatches = verify_mismatches;
+      return {
+        profile: name,
+        patched: Object.keys(patch),
+        verified: verify_mismatches.length === 0,
+        verify_mismatches,
+      };
     },
   );
 }
