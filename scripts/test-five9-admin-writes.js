@@ -34,6 +34,9 @@ import {
   actionFieldXml,
   PROFILE_PATCHABLE_FIELDS,
   MAX_PROFILE_ATTEMPTS_LIMIT,
+  // 2026-08-06 Phase E
+  MIN_CRM_REDIAL_SEC_LIMIT,
+  OUTBOUND_CAMPAIGN_FIELD_ORDER,
 } from '../src/five9/admin-writes.js';
 
 test('five9WritesEnabled: ships dark — unset/false off, only literal "true" on', () => {
@@ -448,4 +451,73 @@ test('modify_campaign_profile: attempts ceiling refuses the live Data Leads valu
   const rollback = checkProfileCompliance({ numberOfAttempts: 100 }, { complianceOverride: true });
   assert.equal(rollback.ok, true);
   assert.equal(rollback.overridden, true);
+});
+
+/* ---------------------------------------------------------------------- *
+ * Phase E (2026-08-06) — CRMRedialTimeout patchability.
+ * The field lives in tns:baseOutboundCampaign, a level the v1 order array
+ * skipped entirely. It is a tns:timer struct, not a scalar.
+ * ---------------------------------------------------------------------- */
+
+test('buildModifyOutboundCampaignXml: CRMRedialTimeout serializes as a timer struct, not an integer', () => {
+  const xml = buildModifyOutboundCampaignXml('DIAL ASAP', { CRMRedialTimeout: 300 });
+  assert.match(
+    xml,
+    /<CRMRedialTimeout><days>0<\/days><hours>0<\/hours><minutes>5<\/minutes><seconds>0<\/seconds><\/CRMRedialTimeout>/,
+  );
+  // the failure mode this guards: a bare integer
+  assert.doesNotMatch(xml, /<CRMRedialTimeout>300<\/CRMRedialTimeout>/);
+});
+
+test('buildModifyOutboundCampaignXml: CRMRedialTimeout precedes the outboundCampaign extension', () => {
+  // baseOutboundCampaign comes before the outboundCampaign extension in the chain
+  const xml = buildModifyOutboundCampaignXml('DIAL ASAP', { CRMRedialTimeout: 300, dialingRatio: 10 });
+  assert.ok(
+    xml.indexOf('<CRMRedialTimeout>') < xml.indexOf('<dialingRatio>'),
+    `CRMRedialTimeout must precede dialingRatio (WSDL sequence): ${xml}`,
+  );
+});
+
+test('buildModifyOutboundCampaignXml: campaign base precedes CRMRedialTimeout', () => {
+  // profileName is tns:campaign (level 1); CRMRedialTimeout is baseOutboundCampaign (level 3)
+  const xml = buildModifyOutboundCampaignXml('DIAL ASAP', { profileName: 'X', CRMRedialTimeout: 300 });
+  assert.ok(
+    xml.indexOf('<profileName>') < xml.indexOf('<CRMRedialTimeout>'),
+    `profileName must precede CRMRedialTimeout (WSDL sequence): ${xml}`,
+  );
+});
+
+test('checkCompliancePatch: CRMRedialTimeout floor — 300s is the intended value and passes', () => {
+  assert.equal(MIN_CRM_REDIAL_SEC_LIMIT, 300);
+  assert.equal(checkCompliancePatch({ CRMRedialTimeout: 300 }).ok, true);
+  assert.equal(checkCompliancePatch({ CRMRedialTimeout: 60 }).ok, false);
+  const ov = checkCompliancePatch({ CRMRedialTimeout: 60 }, { complianceOverride: true });
+  assert.equal(ov.ok, true);
+  assert.equal(ov.overridden, true);
+  // Strict === true, consistent with the other two lines
+  assert.equal(checkCompliancePatch({ CRMRedialTimeout: 60 }, { complianceOverride: 'true' }).ok, false);
+  // absent from the patch = not judged
+  assert.equal(checkCompliancePatch({ dialingMode: 'POWER' }).ok, true);
+});
+
+test('REGRESSION: order-array membership does NOT grant patchability', () => {
+  // The single most important test in Phase E. generalCampaign and
+  // baseOutboundCampaign fields were added to OUTBOUND_CAMPAIGN_FIELD_ORDER so
+  // the sequence is faithful to the WSDL. That must not make them writable.
+  for (const field of ['autoRecord', 'analyzeLevel', 'listDialingMode', 'stateDialingRule', 'timeZoneAssignment']) {
+    assert.ok(OUTBOUND_CAMPAIGN_FIELD_ORDER.includes(field), `${field} should be in the order array`);
+    assert.equal(PATCHABLE_FIELDS.has(field), false, `${field} must NOT be patchable`);
+    assert.throws(
+      () => buildModifyOutboundCampaignXml('DIAL ASAP', { [field]: 'X' }),
+      new RegExp(`REFUSED: "${field}" is not a patchable outbound campaign field`),
+      `${field} must be refused at build time`,
+    );
+  }
+});
+
+test('every PATCHABLE_FIELD has a position in OUTBOUND_CAMPAIGN_FIELD_ORDER', () => {
+  // A field in the whitelist but missing from the order array silently never
+  // emits — no error, just a patch that does nothing.
+  const missing = [...PATCHABLE_FIELDS].filter(f => !OUTBOUND_CAMPAIGN_FIELD_ORDER.includes(f));
+  assert.deepEqual(missing, [], `whitelisted fields absent from the order array: ${missing.join(', ')}`);
 });
