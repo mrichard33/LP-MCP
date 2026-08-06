@@ -21,8 +21,10 @@ import {
   diffConfigs,
   VOLATILE_FIELDS,
   isLockedError,
-  unstableEntry,
-  UNSTABLE_PATH_CAP,
+  sameDayDeltaEntry,
+  SAME_DAY_PATH_CAP,
+  buildChangeRows,
+  priorKey,
   sortUnorderedArrays,
   isTimerStruct,
   normalizeTimers,
@@ -120,16 +122,16 @@ test('diffConfigs: identical configs produce no rows, key order included', () =>
   assert.equal(diffConfigs({ numberOfAttempts: 100 }, { numberOfAttempts: 8 })[0].new_value, 8);
 });
 
-// ─── Unstable-hash identity ────────────────────────────────────────────────
+// ─── Same-day delta identity ───────────────────────────────────────────────
 //
-// A bare count is unactionable: "unstable_hashes: 11" out of 272 entities
-// gives no way to find the eleven, and so no way to fix the unstable ordering
-// before the change log starts firing on them daily.
+// A bare count is unactionable: "11 of 272" gives no way to find the eleven.
+// The helper now takes the already-computed diff rows, so the runner does not
+// diff twice — it needs those same rows to write change rows.
 
-test('unstableEntry: names the entity and the differing paths, not just a count', () => {
-  const prev = { name: 'DIAL ASAP', dialingRatio: 2 };
-  const next = { name: 'DIAL ASAP', dialingRatio: 3 };
-  const e = unstableEntry('campaign_outbound', 'DIAL ASAP', prev, next);
+const rows = (...paths) => paths.map((p) => ({ field_path: p, previous_value: 1, new_value: 2 }));
+
+test('sameDayDeltaEntry: names the entity and the differing paths, not just a count', () => {
+  const e = sameDayDeltaEntry('campaign_outbound', 'DIAL ASAP', rows('dialingRatio'));
   assert.equal(e.entity_type, 'campaign_outbound');
   assert.equal(e.entity_name, 'DIAL ASAP');
   assert.deepEqual(e.differing_paths, ['dialingRatio']);
@@ -137,35 +139,37 @@ test('unstableEntry: names the entity and the differing paths, not just a count'
   assert.equal(e.truncated, undefined, 'a complete list must not be flagged truncated');
 });
 
-test('unstableEntry: a reordered array is reported as bracket-indexed siblings', () => {
-  // This is the signature that distinguishes unstable ordering from a real
-  // edit — the whole diagnostic value of reporting paths instead of a count.
-  const prev = { includeNumbers: ['5551110000', '5552220000', '5553330000'] };
-  const next = { includeNumbers: ['5553330000', '5551110000', '5552220000'] };
-  const e = unstableEntry('list', 'Data Leads', prev, next);
-  assert.deepEqual(e.differing_paths, ['includeNumbers[0]', 'includeNumbers[1]', 'includeNumbers[2]']);
-  assert.equal(e.differing_path_count, 3);
+test('sameDayDeltaEntry: path shape separates reordering noise from a real edit', () => {
+  // This is the ONLY discriminator, and it is a reading of the data rather
+  // than something the job can decide before persisting.
+  const noise = sameDayDeltaEntry('user', 'someone', rows('role_permissions.admin[0].type', 'role_permissions.admin[1].type'));
+  assert.equal(noise.has_named_path, false, 'all bracket-indexed = consistent with unstable order');
+
+  // The reproduction: action 283639 on DIAL ASAP, one named scalar path.
+  const edit = sameDayDeltaEntry('campaign_outbound', 'DIAL ASAP', rows('raw.previewDialImmediately'));
+  assert.equal(edit.has_named_path, true, 'a named scalar means something was edited');
+
+  const mixed = sameDayDeltaEntry('user', 'someone', rows('role_permissions.admin[0].type', 'raw.active'));
+  assert.equal(mixed.has_named_path, true, 'one named path is enough to warrant a look');
 });
 
-test('unstableEntry: no values are included — the summary travels into an event payload', () => {
-  const e = unstableEntry('list', 'Data Leads', { includeNumbers: ['5551110000'] }, { includeNumbers: ['5559998888'] });
-  assert.deepEqual(Object.keys(e).sort(), ['differing_path_count', 'differing_paths', 'entity_name', 'entity_type']);
+test('sameDayDeltaEntry: no values are included — the summary travels into an event payload', () => {
+  const e = sameDayDeltaEntry('list', 'Data Leads', [{ field_path: 'includeNumbers[0]', previous_value: '5551110000', new_value: '5559998888' }]);
   assert.equal(JSON.stringify(e).includes('5559998888'), false, 'phone numbers must not ride along in the summary');
 });
 
-test('unstableEntry: a capped list says so — never silently truncated', () => {
-  const prev = {}, next = {};
-  for (let i = 0; i < UNSTABLE_PATH_CAP + 10; i++) { prev[`f${i}`] = i; next[`f${i}`] = i + 1; }
-  const e = unstableEntry('user', 'someone', prev, next);
-  assert.equal(e.differing_paths.length, UNSTABLE_PATH_CAP, 'reported paths are capped');
-  assert.equal(e.differing_path_count, UNSTABLE_PATH_CAP + 10, 'but the total count stays exact');
+test('sameDayDeltaEntry: a capped list says so — never silently truncated', () => {
+  const many = rows(...Array.from({ length: SAME_DAY_PATH_CAP + 10 }, (_, i) => `f${i}`));
+  const e = sameDayDeltaEntry('user', 'someone', many);
+  assert.equal(e.differing_paths.length, SAME_DAY_PATH_CAP, 'reported paths are capped');
+  assert.equal(e.differing_path_count, SAME_DAY_PATH_CAP + 10, 'but the total count stays exact');
   assert.equal(e.truncated, true);
 });
 
-test('unstableEntry: identical configs yield an empty, honest entry', () => {
-  const e = unstableEntry('skill', 'Sales', { a: 1 }, { a: 1 });
-  assert.deepEqual(e.differing_paths, []);
-  assert.equal(e.differing_path_count, 0);
+test('sameDayDeltaEntry: tolerates an empty or missing diff', () => {
+  assert.deepEqual(sameDayDeltaEntry('skill', 'Sales', []).differing_paths, []);
+  assert.equal(sameDayDeltaEntry('skill', 'Sales', []).has_named_path, false);
+  assert.doesNotThrow(() => sameDayDeltaEntry('skill', 'Sales', undefined));
 });
 
 // ─── Locked entities ───────────────────────────────────────────────────────
@@ -291,4 +295,96 @@ test('normalizeTimers: recurses, and leaves the stored config untouched', () => 
   assert.equal(out.dialingRatio, '50', 'non-timers pass through');
   assert.equal(out.callWrapup.enabled, 'true');
   assert.deepEqual(config, snapshot, 'hash-only: the input config is never mutated');
+});
+
+// ─── Persistence: a same-day delta must be WRITTEN, not discarded ──────────
+//
+// THE REPRODUCTION. Action 283639 set previewDialImmediately false -> true on
+// DIAL ASAP at 2026-08-06 19:44:50Z. The preceding snapshot ran 19:42:40Z
+// holding `false`. The next run detected the delta, counted it as an "unstable
+// hash", and dropped it — five9_config_changes stayed empty for a change
+// attributable to the second. Detecting a change and declining to record it is
+// the one behavior a change log cannot have.
+
+const priorMap = (...rows) => new Map(rows.map((r) => [priorKey(r.entity_type, r.entity_name), r]));
+
+test('REGRESSION 283639: a same-day edit is persisted, not discarded', () => {
+  const prior = {
+    id: 42, snapshot_date: '2026-08-06', entity_type: 'campaign_outbound', entity_name: 'DIAL ASAP',
+    config: { raw: { previewDialImmediately: 'false' } }, config_hash: 'old',
+  };
+  const entity = {
+    entity_type: 'campaign_outbound', entity_name: 'DIAL ASAP',
+    config: { raw: { previewDialImmediately: 'true' } }, config_hash: 'new',
+  };
+  const { changeRows, same_day_delta_entities } = buildChangeRows([entity], priorMap(prior), '2026-08-06');
+
+  assert.equal(changeRows.length, 1, 'the change MUST be written — this is the whole fix');
+  assert.equal(changeRows[0].field_path, 'raw.previewDialImmediately');
+  assert.equal(changeRows[0].previous_value, 'false');
+  assert.equal(changeRows[0].new_value, 'true');
+  assert.equal(changeRows[0].detection, 'same_day', 'tagged with how it was found');
+  // The canary still fires — it just no longer decides anything.
+  assert.equal(same_day_delta_entities.length, 1);
+  assert.equal(same_day_delta_entities[0].has_named_path, true);
+});
+
+test('same-day rows carry a NULL previous_snapshot_id', () => {
+  // The snapshot table is UNIQUE per (date, type, name) and this run's upsert
+  // already overwrote that row with the NEW config, so the id would resolve to
+  // the wrong value. previous_value carries the truth instead.
+  const prior = { id: 42, snapshot_date: '2026-08-06', entity_type: 'list', entity_name: 'L', config: { a: 1 }, config_hash: 'old' };
+  const { changeRows } = buildChangeRows(
+    [{ entity_type: 'list', entity_name: 'L', config: { a: 2 }, config_hash: 'new' }],
+    priorMap(prior), '2026-08-06',
+  );
+  assert.equal(changeRows[0].previous_snapshot_id, null);
+});
+
+test('cross-day rows keep the FK and are tagged cross_day', () => {
+  const prior = { id: 42, snapshot_date: '2026-08-05', entity_type: 'list', entity_name: 'L', config: { a: 1 }, config_hash: 'old' };
+  const { changeRows, same_day_delta_entities } = buildChangeRows(
+    [{ entity_type: 'list', entity_name: 'L', config: { a: 2 }, config_hash: 'new' }],
+    priorMap(prior), '2026-08-06',
+  );
+  assert.equal(changeRows[0].detection, 'cross_day');
+  assert.equal(changeRows[0].previous_snapshot_id, 42, 'the prior snapshot is still intact across days');
+  assert.deepEqual(same_day_delta_entities, [], 'not a same-day delta');
+});
+
+test('reordering noise is persisted too — tagged, not suppressed', () => {
+  // Noise still gets rows. Filtering it is a query over field_path, which is
+  // exactly the point: the job no longer decides what is worth keeping.
+  const prior = {
+    id: 7, snapshot_date: '2026-08-06', entity_type: 'user', entity_name: 'u',
+    config: { role_permissions: { admin: [{ type: 'A' }, { type: 'B' }] } }, config_hash: 'old',
+  };
+  const entity = {
+    entity_type: 'user', entity_name: 'u',
+    config: { role_permissions: { admin: [{ type: 'B' }, { type: 'A' }] } }, config_hash: 'new',
+  };
+  const { changeRows, same_day_delta_entities } = buildChangeRows([entity], priorMap(prior), '2026-08-06');
+  assert.ok(changeRows.length > 0, 'noise is recorded rather than dropped');
+  assert.ok(changeRows.every((r) => r.detection === 'same_day'));
+  assert.ok(changeRows.every((r) => /\[\d+\]/.test(r.field_path)), 'all bracket-indexed');
+  assert.equal(same_day_delta_entities[0].has_named_path, false, 'canary reads it as reordering');
+});
+
+test('buildChangeRows: unchanged and first-sighting entities produce nothing', () => {
+  const prior = { id: 1, snapshot_date: '2026-08-05', entity_type: 'list', entity_name: 'L', config: { a: 1 }, config_hash: 'same' };
+  assert.deepEqual(
+    buildChangeRows([{ entity_type: 'list', entity_name: 'L', config: { a: 1 }, config_hash: 'same' }], priorMap(prior), '2026-08-06').changeRows,
+    [], 'identical hash short-circuits',
+  );
+  assert.deepEqual(
+    buildChangeRows([{ entity_type: 'list', entity_name: 'NEW', config: { a: 1 }, config_hash: 'x' }], new Map(), '2026-08-06').changeRows,
+    [], 'a first sighting is not a change',
+  );
+  assert.deepEqual(buildChangeRows(undefined, new Map(), '2026-08-06').changeRows, []);
+});
+
+test('priorKey: NUL separator cannot be forged by entity names', () => {
+  // "a" + "b.c" and "a.b" + "c" must never collide.
+  assert.notEqual(priorKey('campaign', 'x'), priorKey('campaignx', ''));
+  assert.equal(priorKey('user', 'a@b.com'), priorKey('user', 'a@b.com'));
 });
