@@ -20,6 +20,9 @@ import {
   stripVolatile,
   diffConfigs,
   VOLATILE_FIELDS,
+  isLockedError,
+  unstableEntry,
+  UNSTABLE_PATH_CAP,
 } from '../src/jobs/five9-config-snapshot.js';
 
 // ─── Canonical serialization ───────────────────────────────────────────────
@@ -112,4 +115,72 @@ test('diffConfigs: identical configs produce no rows, key order included', () =>
   // the live fixture: Data Leads was set to 8 via action 282756 on 2026-08-06
   assert.deepEqual(diffConfigs({ numberOfAttempts: 8 }, { numberOfAttempts: 8 }), []);
   assert.equal(diffConfigs({ numberOfAttempts: 100 }, { numberOfAttempts: 8 })[0].new_value, 8);
+});
+
+// ─── Unstable-hash identity ────────────────────────────────────────────────
+//
+// A bare count is unactionable: "unstable_hashes: 11" out of 272 entities
+// gives no way to find the eleven, and so no way to fix the unstable ordering
+// before the change log starts firing on them daily.
+
+test('unstableEntry: names the entity and the differing paths, not just a count', () => {
+  const prev = { name: 'DIAL ASAP', dialingRatio: 2 };
+  const next = { name: 'DIAL ASAP', dialingRatio: 3 };
+  const e = unstableEntry('campaign_outbound', 'DIAL ASAP', prev, next);
+  assert.equal(e.entity_type, 'campaign_outbound');
+  assert.equal(e.entity_name, 'DIAL ASAP');
+  assert.deepEqual(e.differing_paths, ['dialingRatio']);
+  assert.equal(e.differing_path_count, 1);
+  assert.equal(e.truncated, undefined, 'a complete list must not be flagged truncated');
+});
+
+test('unstableEntry: a reordered array is reported as bracket-indexed siblings', () => {
+  // This is the signature that distinguishes unstable ordering from a real
+  // edit — the whole diagnostic value of reporting paths instead of a count.
+  const prev = { includeNumbers: ['5551110000', '5552220000', '5553330000'] };
+  const next = { includeNumbers: ['5553330000', '5551110000', '5552220000'] };
+  const e = unstableEntry('list', 'Data Leads', prev, next);
+  assert.deepEqual(e.differing_paths, ['includeNumbers[0]', 'includeNumbers[1]', 'includeNumbers[2]']);
+  assert.equal(e.differing_path_count, 3);
+});
+
+test('unstableEntry: no values are included — the summary travels into an event payload', () => {
+  const e = unstableEntry('list', 'Data Leads', { includeNumbers: ['5551110000'] }, { includeNumbers: ['5559998888'] });
+  assert.deepEqual(Object.keys(e).sort(), ['differing_path_count', 'differing_paths', 'entity_name', 'entity_type']);
+  assert.equal(JSON.stringify(e).includes('5559998888'), false, 'phone numbers must not ride along in the summary');
+});
+
+test('unstableEntry: a capped list says so — never silently truncated', () => {
+  const prev = {}, next = {};
+  for (let i = 0; i < UNSTABLE_PATH_CAP + 10; i++) { prev[`f${i}`] = i; next[`f${i}`] = i + 1; }
+  const e = unstableEntry('user', 'someone', prev, next);
+  assert.equal(e.differing_paths.length, UNSTABLE_PATH_CAP, 'reported paths are capped');
+  assert.equal(e.differing_path_count, UNSTABLE_PATH_CAP + 10, 'but the total count stays exact');
+  assert.equal(e.truncated, true);
+});
+
+test('unstableEntry: identical configs yield an empty, honest entry', () => {
+  const e = unstableEntry('skill', 'Sales', { a: 1 }, { a: 1 });
+  assert.deepEqual(e.differing_paths, []);
+  assert.equal(e.differing_path_count, 0);
+});
+
+// ─── Locked entities ───────────────────────────────────────────────────────
+
+test('isLockedError: a Five9 admin-UI lock is recognized, whatever wraps it', () => {
+  assert.equal(isLockedError('Five9 getOutboundCampaign fault: CAMPAIGN is already locked'), true);
+  assert.equal(isLockedError('CAMPAIGN is already locked by jflanders'), true);
+  assert.equal(isLockedError('Already Locked'), true);
+});
+
+test('isLockedError: real failures are NOT swallowed as locks', () => {
+  // Misclassifying a genuine failure as a benign lock would hide it from the
+  // degraded-alert denominator, which is the whole reason the split exists.
+  assert.equal(isLockedError('Five9 getOutboundCampaign: HTTP 401 — bad FIVE9_USERNAME/FIVE9_PASSWORD'), false);
+  assert.equal(isLockedError('Five9 getOutboundCampaign fault: campaign not found'), false);
+  assert.equal(isLockedError('request timed out'), false);
+  assert.equal(isLockedError('deadlock detected'), false, 'substring "lock" alone must not match');
+  assert.equal(isLockedError(''), false);
+  assert.equal(isLockedError(null), false);
+  assert.equal(isLockedError(undefined), false);
 });
