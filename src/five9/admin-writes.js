@@ -56,6 +56,7 @@ import {
   getCampaignProfiles,
   getListsInfo,
   checkDncForNumbers,
+  timerToSeconds,
 } from '../five9-admin.js';
 // 2026-08-05 Phase D — read-before-write for user-skill ops. getUsersFullInfo
 // takes a Five9 userNamePattern regex and returns assigned skills with levels.
@@ -236,6 +237,30 @@ export function secondsToTimerXml(tagName, totalSeconds) {
 }
 
 /**
+ * Inverse of secondsToTimerXml, for read-back verification.
+ *
+ * Five9 ACCEPTS an integer of seconds on write but RETURNS tns:timer as a
+ * {days,hours,minutes,seconds} struct on read. The two sides of a read-back
+ * comparison are therefore different shapes and must be normalized before
+ * they can be compared at all.
+ *
+ * Struct arithmetic is delegated to timerToSeconds (src/five9-admin.js) rather
+ * than reimplemented — that function already backs maxQueueTimeSeconds on the
+ * read path and has its own tests. This wrapper adds only the scalar forms the
+ * WRITE side produces (a patch value is a number, or a numeric string off a
+ * JSON payload). Returns null when the value is not a recognizable timer.
+ */
+export function timerStructToSeconds(t) {
+  if (t === null || t === undefined) return null;
+  if (typeof t === 'number') return Number.isFinite(t) ? t : null;
+  if (typeof t === 'string') {
+    const s = t.trim();
+    return /^\d+$/.test(s) ? Number(s) : null;
+  }
+  return timerToSeconds(t); // objects → struct math; anything else → null
+}
+
+/**
  * modifyOutboundCampaign body. There is NO "setOutboundCampaign" in the
  * WSDL — the modify op takes a tns:outboundCampaign object and (per Five9
  * Config API semantics) changes only the fields supplied. All fields are
@@ -252,6 +277,31 @@ export function secondsToTimerXml(tagName, totalSeconds) {
 // entirely. That was harmless only because nothing in either level was
 // patchable. CRMRedialTimeout (baseOutboundCampaign, position 2) is the first
 // field from those levels to become patchable — hence the correction here.
+//
+// ALL FOUR LEVELS ARE QUOTED FROM THE WSDL, not inferred from a read response.
+// Re-verified 2026-08-06 by extracting each xs:sequence and concatenating them
+// in inheritance order (note: that is NOT the order they appear in the
+// document — offsets below are where each type is DEFINED):
+//
+//   tns:campaign               defined @ 42,369  …  7 fields
+//   tns:generalCampaign        defined @ 41,624  …  7 fields
+//   tns:baseOutboundCampaign   defined @ 40,695* …  8 fields
+//   tns:outboundCampaign       defined @ 44,807* … 17 fields
+//                                                = 39 fields, byte-identical
+//                                                  to the array below
+//
+// CRMRedialTimeout lands at index 15 overall — second within
+// baseOutboundCampaign, immediately after analyzeLevel.
+//
+// * An earlier pass reported these two levels as unreachable behind the
+//   http_request 100k cap. That was wrong: all four types sit inside the first
+//   100k chars and the cap never applied to this chain. The real cause was an
+//   extraction regex anchored on `<xs:complexType name="X">`, which cannot
+//   match baseOutboundCampaign (abstract="true") or outboundCampaign
+//   (final="extension restriction") — exactly the two that came back empty,
+//   and an empty match is indistinguishable from a truncated fetch. Nothing
+//   about this ordering was ever unverifiable. See the FETCH NOTE in the
+//   Phase D profile section for the corrected pattern.
 //
 // NOTE: presence in this array does NOT make a field patchable. This is a
 // faithful copy of the WSDL sequence; PATCHABLE_FIELDS is the permission list,
@@ -642,6 +692,54 @@ export function executeResetCampaign(action) {
   return campaignLifecycle(action, 'reset_campaign', () => 'resetCampaign');
 }
 
+/**
+ * Read-back verification for a modifyOutboundCampaign patch: report drift,
+ * never mask a landed write. Returns the mismatch rows; empty === verified.
+ *
+ * Pure and exported so the comparison can be tested against a simulated
+ * read-back without standing up the write gate — this is the function that
+ * decides whether `verified` is true, so it needs direct coverage.
+ *
+ * tns:timer fields are the subtle case. They are WRITTEN as an integer of
+ * seconds and READ BACK as a {days,hours,minutes,seconds} struct, so a naive
+ * String(actual) !== String(expected) compares "[object Object]" against "300"
+ * and is true forever — a PERMANENT false negative on the one field that says
+ * a gated write actually landed.
+ *
+ * Found live on action 283332 (2026-08-06, CRMRedialTimeout 2h → 300s): the
+ * write was correct, the read-back was {hours:'0',minutes:'5'}, and it still
+ * reported verified:false. In practice CRMRedialTimeout was the only field
+ * exposed — maxQueueTime resolves to the already-normalized
+ * maxQueueTimeSeconds, and maxPreviewTime is not surfaced by the reader at all
+ * — but the timer branch covers all three, because TIMER_FIELDS is exactly the
+ * tns:timer set and those two exemptions are properties of the current reader
+ * rather than of the protocol.
+ */
+export function verifyPatchReadBack(patch, after) {
+  const mismatches = [];
+  for (const [field, expected] of Object.entries(patch || {})) {
+    const actual = field === 'maxQueueTime' ? after?.maxQueueTimeSeconds
+      : field === 'maxPreviewTime' ? undefined // not surfaced in normalized read
+      : after?.[field] ?? after?.raw?.[field];
+    if (actual === undefined) continue;
+    if (TIMER_FIELDS.has(field)) {
+      const a = timerStructToSeconds(actual);
+      const e = timerStructToSeconds(expected);
+      // A timer that will not normalize is NOT a pass. Silently treating an
+      // unreadable read-back as verified is the same defect in a new shape,
+      // so it is reported rather than skipped.
+      if (a === null || e === null || a !== e) {
+        mismatches.push({ field, expected: e ?? expected, actual: a, actual_raw: actual });
+      }
+      continue;
+    }
+    if (String(actual) !== String(expected)) {
+      mismatches.push({ field, expected, actual });
+    }
+  }
+  return mismatches;
+}
+
 export function executeSetOutboundCampaign(action) {
   const payload = action.action_payload || {};
   const name = String(payload.campaign_name || '').trim();
@@ -666,16 +764,7 @@ export function executeSetOutboundCampaign(action) {
     }
     const after = await getOutboundCampaign(name);
     ctx.new_state = after;
-    // Read-back verification: report drift, never mask a landed write.
-    const verify_mismatches = [];
-    for (const [field, expected] of Object.entries(patch)) {
-      const actual = field === 'maxQueueTime' ? after.maxQueueTimeSeconds
-        : field === 'maxPreviewTime' ? undefined // not surfaced in normalized read
-        : after[field] ?? after.raw?.[field];
-      if (actual !== undefined && String(actual) !== String(expected)) {
-        verify_mismatches.push({ field, expected, actual });
-      }
-    }
+    const verify_mismatches = verifyPatchReadBack(patch, after);
     ctx.event_extra.verify_mismatches = verify_mismatches;
     return { campaign: name, patched: Object.keys(patch), verified: verify_mismatches.length === 0, verify_mismatches };
   });
@@ -854,12 +943,21 @@ export function executeUserSkillRemove(action) {
  * nothing — extract with a DOTALL regex, not grep.
  * SEPARATELY: the LP-MCP http_request tool caps response bodies at 100,000
  * chars (MAX_BODY_CHARS, src/tools/admin/http-tools.js), which is what
- * actually blocked Phase D — this type sits past that cut on every WSDL
- * build, with or without auth. Fetch from a host without that cap:
+ * actually blocked Phase D — modifyCampaignProfile sits at offset ~142,593,
+ * past that cut on every WSDL build, with or without auth. Fetch from a host
+ * without that cap:
  *   curl -s "https://api.five9.com/wsadmin/v13/AdminWebService?wsdl&user=x" \
  *     | python3 -c "import re,sys; \
- *         print(re.search(r'<xs:complexType name=\"NAME\">.*?</xs:complexType>', \
+ *         print(re.search(r'<xs:complexType[^>]*\bname=\"NAME\"[^>]*>.*?</xs:complexType>', \
  *         sys.stdin.read(), re.S).group(0))"
+ *
+ * USE THAT EXACT PATTERN. An earlier version anchored on
+ * `<xs:complexType name="NAME">`, which matches only types whose FIRST
+ * attribute is `name` — it silently returns nothing for any abstract or final
+ * type (`<xs:complexType abstract="true" name="...">`). A no-match is
+ * indistinguishable from a truncated fetch, so the failure reads as "past the
+ * 100k cap" when the type is really sitting well inside it. That misread cost
+ * a full detour on the outboundCampaign chain; see OUTBOUND_CAMPAIGN_FIELD_ORDER.
  *
  * The naming inconsistency across this op family is real but not ambiguous:
  * every op taking a full campaignProfileInfo OBJECT uses "campaignProfile"
