@@ -81,7 +81,13 @@ const MONEY_B_RE = /(?<![\d,.])\(?\$?(?:\d{1,3}(?:,\d{3})+(?:\.\d{2})?|\d+\.\d{2
 // 2- or 4-digit years — Report A's production PDF prints detail dates as
 // 'MM/DD/YY'; B is produced by the same C1Report engine, so accept both.
 const DATE_RE = /\d{1,2}\/\d{1,2}\/\d{2,4}/g;
-const PHONE_RE = /\(?\d{3}\)?[- .]\d{3}[- .]\d{4}/;
+// Parenthesized form allows NO separator after the area code — LP prints
+// `(386)256-8165` as often as `(407) 555-1212`, and the old pattern required a
+// separator after the `)`, so the compact form never matched: `phone` came back
+// null and the number stayed glued to `customer_name` (seen on the live
+// quarantined row for prosp 419732). The bare form still requires separators,
+// or it would match any run of ten digits.
+const PHONE_RE = /\(\d{3}\)[- .]?\d{3}[- .]?\d{4}|\d{3}[- .]\d{3}[- .]\d{4}/;
 const EMAIL_RE = /[^\s@]+@[^\s@]+\.[^\s@]+/;
 
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -112,16 +118,51 @@ function findStatus(line) {
  * common words like 'Credit' from matching spuriously.
  */
 function findWrappedStatus(segment, nextLine) {
-  const cont = String(nextLine ?? '').trim();
+  const cont = String(nextLine ?? '').replace(/^\s*/, '').replace(/\s+$/, '');
   if (!cont) return null;
+
+  // TWO columns can wrap on the same row. Observed 2026-08-06, prosp 419732
+  // (JAX): the status `Awaiting Change Order` split across lines AND the email
+  // `gsellsharon046@gmail.com` broke at the same boundary, so the email's
+  // trailing `m` opened the continuation line ahead of the status remainder:
+  //
+  //     JAX  419732  Gsell, John & Sharon  (386)256-8165  8/3/2026  Awaiting Change  12,950.00  gsellsharon046@gmail.co
+  //     m                                    Order
+  //
+  // This function used to require the remainder to OPEN that line, so it bailed
+  // and the row came back with status_raw null and total_gross_cents null (money
+  // is gated on the status). That failed the ingest twice over — `unmapped_status`
+  // on the row, plus a footer_total_mismatch of exactly that row's $12,950
+  // (printed $1,182,939 vs computed $1,169,989 across 48 rows) — and report 133
+  // produced no snapshot at all for a day.
+  //
+  // A leading fragment is now tolerated: one short, space-free token followed by
+  // a wide column gap. It is returned so the caller can re-join the token the
+  // break split, and so the whole line is consumed rather than kept as a note.
+  const lead = cont.match(/^(\S{1,24})(\s{2,})(?=\S)/);
+  const candidates = lead
+    ? [{ body: cont, offset: 0, frag: null },
+       { body: cont.slice(lead[0].length), offset: lead[0].length, frag: lead[1] }]
+    : [{ body: cont, offset: 0, frag: null }];
+
   for (const s of STATUSES_BY_LENGTH) {
     const words = s.split(' ');
     for (let cut = words.length - 1; cut >= 1; cut--) {
       const head = words.slice(0, cut).join(' ');
       const rest = words.slice(cut).join(' ');
-      if (cont !== rest && !cont.startsWith(`${rest}  `)) continue;
-      const m = segment.match(new RegExp(`(?<![A-Za-z])${escapeRe(head)}(?![A-Za-z])`));
-      if (m) return { status: s, at: m.index, end: m.index + head.length, restLen: rest.length };
+      for (const c of candidates) {
+        if (c.body !== rest && !c.body.startsWith(`${rest}  `)) continue;
+        const m = segment.match(new RegExp(`(?<![A-Za-z])${escapeRe(head)}(?![A-Za-z])`));
+        if (!m) continue;
+        return {
+          status: s,
+          at: m.index,
+          end: m.index + head.length,
+          // Consume the fragment and the gap too, so neither becomes a note.
+          restLen: c.offset + rest.length,
+          frag: c.frag,
+        };
+      }
     }
   }
   return null;
@@ -179,11 +220,15 @@ export function parseJobsByStatus(text) {
       const emailM = segment.match(EMAIL_RE);
       let statusHit = findStatus(segment);
       let consumedNextLen = 0;
+      // A token from another column that broke at the same boundary; re-joined
+      // onto the value it was cut from (see findWrappedStatus).
+      let wrapFrag = null;
       if (!statusHit) {
         const wrapped = findWrappedStatus(segment, lines[i + 1]);
         if (wrapped) {
           statusHit = wrapped;
           consumedNextLen = wrapped.restLen; // strip the completion off the next line's notes
+          wrapFrag = wrapped.frag;
         }
       }
 
@@ -218,7 +263,10 @@ export function parseJobsByStatus(text) {
           prosp_number: prosp,
           customer_name: customer,
           phone: phoneM ? phoneM[0] : null,
-          email: emailM ? emailM[0] : null,
+          // Re-join the token the column break split. The email is the last
+          // column and so the one that wraps; without this it is silently
+          // truncated (…@gmail.co for …@gmail.com).
+          email: emailM ? `${emailM[0]}${wrapFrag ?? ''}` : null,
           contract_date: dateM ? parseDateMDY(dateM[0]) : null,
           branch_code_raw: branch,
           status_raw: statusHit ? statusHit.status : null,
