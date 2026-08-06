@@ -26,6 +26,14 @@ import {
   decideLifecycleNoop,
   requiredConfirmToken,
   checkConfirmToken,
+  // 2026-08-05 Phase D
+  buildUserSkillXml,
+  buildCampaignProfileXml,
+  checkProfileCompliance,
+  exactUserPattern,
+  actionFieldXml,
+  PROFILE_PATCHABLE_FIELDS,
+  MAX_PROFILE_ATTEMPTS_LIMIT,
 } from '../src/five9/admin-writes.js';
 
 test('five9WritesEnabled: ships dark — unset/false off, only literal "true" on', () => {
@@ -218,4 +226,166 @@ test('buildDeleteRecordFromListXml: settings order, delete mode enum, null value
 
 test('MAX_RECORDS_PER_ACTION is the documented 50-record cap', () => {
   assert.equal(MAX_RECORDS_PER_ACTION, 50);
+});
+
+/* ---------------------------------------------------------------------- *
+ * Phase D (2026-08-05) — user skills, campaign profiles, and the Phase C
+ * complex-type serialization regression.
+ * ---------------------------------------------------------------------- */
+
+test('buildUserSkillXml: WSDL xs:sequence order — id, level, skillName, userName', () => {
+  const xml = buildUserSkillXml({ userName: 'cdeer', skillName: 'Dispatch', level: 2 });
+  assert.equal(xml, '<userSkill><level>2</level><skillName>Dispatch</skillName><userName>cdeer</userName></userSkill>');
+  // <id> is never sent — userName + skillName are the natural key
+  assert.doesNotMatch(xml, /<id>/);
+  // level precedes skillName precedes userName (WSDL sequence, not payload order)
+  const order = ['<level>', '<skillName>', '<userName>'];
+  const idx = order.map(t => xml.indexOf(t));
+  for (let i = 1; i < idx.length; i++) {
+    assert.ok(idx[i] > idx[i - 1], `${order[i]} must come after ${order[i - 1]}: ${xml}`);
+  }
+});
+
+test('buildUserSkillXml: userName and skillName are both required', () => {
+  assert.throws(() => buildUserSkillXml({ skillName: 'Dispatch', level: 1 }), /userName is required/);
+  assert.throws(() => buildUserSkillXml({ userName: 'cdeer', level: 1 }), /skillName is required/);
+  assert.throws(() => buildUserSkillXml({ userName: '  ', skillName: 'Dispatch', level: 1 }), /userName is required/);
+});
+
+test('buildUserSkillXml: level is schema-required and bounded 1–9', () => {
+  assert.throws(() => buildUserSkillXml({ userName: 'cdeer', skillName: 'Dispatch', level: 0 }), /level must be/);
+  assert.throws(() => buildUserSkillXml({ userName: 'cdeer', skillName: 'Dispatch', level: 10 }), /level must be/);
+  // omitted level is NOT allowed — <level> is the one element in the WSDL
+  // userSkill type without minOccurs="0"
+  assert.throws(() => buildUserSkillXml({ userName: 'cdeer', skillName: 'Dispatch' }), /level must be/);
+  assert.doesNotThrow(() => buildUserSkillXml({ userName: 'cdeer', skillName: 'Dispatch', level: 3 }));
+  assert.match(buildUserSkillXml({ userName: 'cdeer', skillName: 'Dispatch', level: 9 }), /<level>9<\/level>/);
+});
+
+test('exactUserPattern: anchored and regex-escaped so jflanders cannot match jflanders2', () => {
+  assert.equal(exactUserPattern('jflanders'), '^jflanders$');
+  // a dot in an email-style login stays literal
+  assert.equal(exactUserPattern('r.lymych@x.com'), '^r\\.lymych@x\\.com$');
+  const re = new RegExp(exactUserPattern('jflanders'));
+  assert.equal(re.test('jflanders'), true);
+  assert.equal(re.test('jflanders2'), false);
+  assert.equal(re.test('xjflanders'), false);
+});
+
+test('buildCampaignProfileXml: WSDL xs:sequence order — name lands seventh, not first', () => {
+  const xml = buildCampaignProfileXml('Data Leads', { numberOfAttempts: 8, ANI: '7275133151' });
+  assert.match(xml, /^<campaignProfile>/);
+  assert.match(xml, /<\/campaignProfile>$/);
+  // ANI, ..., name, numberOfAttempts — the read-response order was NOT reversed
+  const order = ['<ANI>', '<name>', '<numberOfAttempts>'];
+  const idx = order.map(t => xml.indexOf(t));
+  assert.ok(idx.every(i => i >= 0), `all fields present: ${xml}`);
+  for (let i = 1; i < idx.length; i++) {
+    assert.ok(idx[i] > idx[i - 1], `${order[i]} must come after ${order[i - 1]} (WSDL sequence): ${xml}`);
+  }
+});
+
+test('buildCampaignProfileXml: refuses non-whitelisted fields and empty patches', () => {
+  assert.throws(
+    () => buildCampaignProfileXml('Data Leads', { dialingSchedule: {} }),
+    /REFUSED: "dialingSchedule" is not a patchable campaign profile field/,
+  );
+  assert.throws(() => buildCampaignProfileXml('Data Leads', { name: 'Renamed' }), /REFUSED: "name"/);
+  assert.throws(() => buildCampaignProfileXml('Data Leads', {}), /at least one field/);
+  assert.throws(() => buildCampaignProfileXml('', { ANI: '1' }), /profile_name is required/);
+  assert.equal(PROFILE_PATCHABLE_FIELDS.has('dialingSchedule'), false);
+});
+
+test('checkProfileCompliance: attempts ceiling mirrors the abandon-rate line', () => {
+  assert.equal(MAX_PROFILE_ATTEMPTS_LIMIT, 12);
+  assert.equal(checkProfileCompliance({ numberOfAttempts: 12 }).ok, true);
+  // the live Data Leads value
+  const over = checkProfileCompliance({ numberOfAttempts: 100 });
+  assert.equal(over.ok, false);
+  assert.equal(over.violations.length, 1);
+  const ov = checkProfileCompliance({ numberOfAttempts: 100 }, { complianceOverride: true });
+  assert.equal(ov.ok, true);
+  assert.equal(ov.overridden, true);
+  // Strict === true: truthy lookalikes do NOT override
+  assert.equal(checkProfileCompliance({ numberOfAttempts: 100 }, { complianceOverride: 'true' }).ok, false);
+  assert.equal(checkProfileCompliance({ numberOfAttempts: 100 }, { complianceOverride: 1 }).ok, false);
+  // Fields absent from the patch are not judged
+  assert.equal(checkProfileCompliance({ ANI: '7275133151' }).ok, true);
+});
+
+test('confirm_token: modify_campaign_profile restates the profile name', () => {
+  assert.equal(requiredConfirmToken('modify_campaign_profile', { profile_name: 'Data Leads' }), 'Data Leads');
+  assert.doesNotThrow(() =>
+    checkConfirmToken('modify_campaign_profile', { profile_name: 'Data Leads', confirm_token: 'Data Leads' }));
+  // wrong case is a mismatch — exact restatement only
+  assert.throws(
+    () => checkConfirmToken('modify_campaign_profile', { profile_name: 'Data Leads', confirm_token: 'data leads' }),
+    /confirm_token mismatch/,
+  );
+  assert.throws(
+    () => checkConfirmToken('modify_campaign_profile', { profile_name: 'Data Leads' }),
+    /confirm_token mismatch/,
+  );
+});
+
+test('actionFieldXml: complex action fields emit a nested <actionType>', () => {
+  assert.equal(
+    actionFieldXml('actionOnQueueExpiration', { actionType: 'DROP_CALL' }),
+    '<actionOnQueueExpiration><actionType>DROP_CALL</actionType></actionOnQueueExpiration>',
+  );
+  // a bare string is accepted as shorthand
+  assert.equal(
+    actionFieldXml('actionOnAnswerMachine', 'HANGUP'),
+    '<actionOnAnswerMachine><actionType>HANGUP</actionType></actionOnAnswerMachine>',
+  );
+  assert.throws(() => actionFieldXml('actionOnQueueExpiration', {}), /expected \{ actionType/);
+  assert.throws(() => actionFieldXml('actionOnQueueExpiration', ''), /expected \{ actionType/);
+});
+
+test('buildModifyOutboundCampaignXml: REGRESSION — actionOnQueueExpiration is not "[object Object]"', () => {
+  // Phase C whitelisted this field but ran escapeXml() over it, so every v1
+  // patch touching it serialized the literal string "[object Object]".
+  const xml = buildModifyOutboundCampaignXml('Rehash', {
+    actionOnQueueExpiration: { actionType: 'DROP_CALL' },
+  });
+  assert.match(xml, /<actionOnQueueExpiration><actionType>DROP_CALL<\/actionType><\/actionOnQueueExpiration>/);
+  assert.doesNotMatch(xml, /\[object Object\]/);
+});
+
+test('buildModifyOutboundCampaignXml: v2 whitelist fields land at their sequence positions', () => {
+  const xml = buildModifyOutboundCampaignXml('DIAL ASAP', {
+    profileName: 'Data-Hot',
+    distributionAlgorithm: 'LongestReadyTime',
+    previewDialImmediately: true,
+    callAnalysisMode: 'FAX_AND_ANSWERING_MACHINE',
+    dialingPriority: 1,
+    limitPreviewTime: true,
+    distributionTimeFrame: 'minutes15',
+  });
+  // base sequence (name, profileName) precedes the outboundCampaign extension
+  const order = [
+    '<name>', '<profileName>', '<callAnalysisMode>', '<dialingPriority>',
+    '<distributionAlgorithm>', '<distributionTimeFrame>', '<limitPreviewTime>',
+    '<previewDialImmediately>',
+  ];
+  const idx = order.map(t => xml.indexOf(t));
+  assert.ok(idx.every(i => i >= 0), `all fields present: ${xml}`);
+  for (let i = 1; i < idx.length; i++) {
+    assert.ok(idx[i] > idx[i - 1], `${order[i]} must come after ${order[i - 1]} (WSDL sequence): ${xml}`);
+  }
+});
+
+test('buildModifyOutboundCampaignXml: lifecycle fields stay refused after the v2 widening', () => {
+  for (const field of ['state', 'type', 'trainingMode']) {
+    assert.throws(
+      () => buildModifyOutboundCampaignXml('Rehash', { [field]: 'X' }),
+      new RegExp(`REFUSED: "${field}" is not a patchable outbound campaign field`),
+      `${field} must stay refused`,
+    );
+    assert.equal(PATCHABLE_FIELDS.has(field), false);
+  }
+  // and the v2 additions ARE allowed
+  for (const field of ['distributionAlgorithm', 'previewDialImmediately', 'profileName']) {
+    assert.equal(PATCHABLE_FIELDS.has(field), true, `${field} should be patchable in v2`);
+  }
 });

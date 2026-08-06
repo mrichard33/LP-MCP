@@ -29,7 +29,7 @@
  *   originating system_events row by action.event_id when they need
  *   structural fields like event.id or event.payload.message_id.
  *
- * Supported action types (36):
+ * Supported action types (40):
  *   add_tag, remove_tag, set_stage, move_opportunity, update_opportunity,
  *   remove_from_workflow, add_to_workflow, book_appointment,
  *   cancel_appointment, reschedule_appointment, update_appointment_status,
@@ -42,7 +42,10 @@
  *   five9_start_campaign, five9_stop_campaign, five9_reset_campaign,
  *   five9_set_outbound_campaign, five9_add_records_to_list,
  *   five9_delete_record_from_list, five9_add_numbers_to_dnc,
- *   five9_remove_numbers_from_dnc (2026-07-21 Phase C — gated Five9 writes).
+ *   five9_remove_numbers_from_dnc (2026-07-21 Phase C — gated Five9 writes),
+ *   five9_user_skill_add, five9_user_skill_modify, five9_user_skill_remove,
+ *   five9_create_campaign_profile
+ *   (2026-08-05 Phase D — skill routing + campaign profiles).
  *
  * 2026-05-01 — added create_lp_lead (Jane recovery). Closes the
  * chatbot-in-session-booking gap that left contacts out of LP because
@@ -442,6 +445,14 @@ const ACTION_HANDLERS = {
   five9_delete_record_from_list: executeFive9Write,
   five9_add_numbers_to_dnc: executeFive9Write,
   five9_remove_numbers_from_dnc: executeFive9Write,
+  // 2026-08-05 Phase D — user skills + campaign profile create. Same gate,
+  // same dispatcher. Target ids are usernames / profile names, not GHL
+  // contacts, so these stay out of MUTATION_GATED_ACTION_TYPES with the rest
+  // of five9_*.
+  five9_user_skill_add: executeFive9Write,
+  five9_user_skill_modify: executeFive9Write,
+  five9_user_skill_remove: executeFive9Write,
+  five9_create_campaign_profile: executeFive9Write,
 };
 
 // Handlers that need the triggering event's payload injected as context.

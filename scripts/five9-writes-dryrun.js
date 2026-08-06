@@ -24,6 +24,12 @@ import {
   buildDeleteRecordFromListXml,
   decideLifecycleNoop,
   checkConfirmToken,
+  // 2026-08-05 Phase D
+  buildUserSkillXml,
+  buildCampaignProfileXml,
+  checkProfileCompliance,
+  exactUserPattern,
+  actionFieldXml,
 } from '../src/five9/admin-writes.js';
 
 if (!process.argv.includes('--dry')) {
@@ -135,12 +141,45 @@ verdict('wrong confirm_token refused', () => checkConfirmToken('remove_numbers_f
 out.push('Audit event (dnc_reasons carried verbatim):');
 out.push(eventShape('remove_numbers_from_dnc', 'five9_dnc', 'dnc', { dnc_reasons: '[{ number, reason }, ...]' }));
 
+section('five9_user_skill_add / five9_user_skill_modify / five9_user_skill_remove (userSkillAdd|Modify|Remove)');
+line('SOAP methods', 'userSkillAdd / userSkillModify / userSkillRemove — all three take one <userSkill> (WSDL-confirmed)');
+line('inner XML', buildUserSkillXml({ userName: 'cdeer', skillName: 'Dispatch', level: 2 }));
+line('read-before-write pattern', exactUserPattern('cdeer') + '  (anchored + escaped: "jflanders" cannot match "jflanders2")');
+out.push('Guardrails:');
+verdict('level within 1-9 accepted', () => buildUserSkillXml({ userName: 'cdeer', skillName: 'Dispatch', level: 9 }));
+verdict('level 10 refused', () => buildUserSkillXml({ userName: 'cdeer', skillName: 'Dispatch', level: 10 }));
+verdict('omitted level refused (schema-required element)', () => buildUserSkillXml({ userName: 'cdeer', skillName: 'Dispatch' }));
+verdict('missing skill_name refused', () => buildUserSkillXml({ userName: 'cdeer', level: 1 }));
+out.push('  [NO-OP] adding a skill the user already holds -> { skipped: already_holds_skill }');
+out.push('  [NO-OP] removing/modifying a skill the user does not hold -> { skipped: does_not_hold_skill }');
+out.push('Audit event (previous/new state = that user\'s full skill set before/after):');
+out.push(eventShape('user_skill_add', 'five9_user_skill', 'cdeer:Dispatch', { verified: '<bool: skill held == expected>' }));
+
+section('five9_create_campaign_profile (createCampaignProfile)');
+line('SOAP method', 'createCampaignProfile');
+line('inner XML', buildCampaignProfileXml('Data-Hot', { numberOfAttempts: 8, ANI: '7275133151', description: 'per-tier profile' }));
+out.push('Guardrails:');
+verdict('numberOfAttempts within ceiling accepted', () => checkProfileCompliance({ numberOfAttempts: 12 }));
+verdict('numberOfAttempts 100 refused (live Data Leads value)', () => { const c = checkProfileCompliance({ numberOfAttempts: 100 }); if (!c.ok) throw new Error(c.violations.join('; ')); return c; });
+verdict('nested dialingSchedule refused (not patchable in v1)', () => buildCampaignProfileXml('P', { dialingSchedule: {} }));
+verdict('renaming via patch refused', () => buildCampaignProfileXml('P', { name: 'Renamed' }));
+out.push('  [NO-OP] profile name already exists -> { skipped: profile_already_exists }');
+out.push('Audit event:');
+out.push(eventShape('create_campaign_profile', 'five9_campaign_profile', 'Data-Hot', { compliance: '<verdict>' }));
+
+section('Complex-type serialization (Phase C defect, fixed 2026-08-05)');
+out.push('  Phase C whitelisted actionOnQueueExpiration but ran escapeXml() over it, so it');
+out.push('  serialized as the literal string "[object Object]". Now:');
+line('  actionOnQueueExpiration', actionFieldXml('actionOnQueueExpiration', { actionType: 'DROP_CALL' }));
+line('  in a full patch', buildModifyOutboundCampaignXml('REHASH OUTBOUND', { actionOnQueueExpiration: { actionType: 'DROP_CALL' } }));
+
 section('Serialization + gate (applies to every op above)');
 out.push('  1. FIVE9_WRITES_ENABLED !== "true" → DRY-RUN: reads + guardrails run, envelope logged, audit event dry_run:true, action completed (dry-run). No mutation.');
 out.push('  2. outbound_locks key five9_admin:write held → { deferred, retry_at } (one write in flight fleet-wide, held in dry-run too)');
 out.push('  3. requires_approval !== true → thrown REFUSED (handler-level belt-and-braces; queue via create_agent_action → approve_action)');
 out.push('  4. INBOUND / compliance / missing DNC reason / confirm_token mismatch / bad payload → thrown REFUSED (loud failed status, in dry-run and live alike)');
 out.push('  5. start-on-RUNNING / stop-on-NOT_RUNNING → { skipped } no-op after the state read');
+out.push('  6. skill add-when-held / remove-when-unheld, profile create-when-exists → { skipped } no-op after the read');
 
 console.log(out.join('\n'));
 console.log('\n[DRY RUN COMPLETE] No SOAP call was made. No DB row was touched.');
