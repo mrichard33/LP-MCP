@@ -136,6 +136,15 @@ const ALLOWED_EVENT_TYPES = new Set([
                                    // (/webhooks/canvassing-lead). Consumed by the
                                    // A.CV rule set; ACV_ENROLL_E4_NO_APPT joins at
                                    // cutover for appointment_set=false knocks.
+  'affiliate.lead_created',        // 2026-08-07 — affiliate lead intake
+                                   // (/webhooks/affiliate-lead). Observability +
+                                   // future rule hook; no consuming rule yet.
+                                   // Listed at ship time deliberately: the
+                                   // allowlist is default-DROP, so without this
+                                   // entry every affiliate lead event lands in
+                                   // system_events_filtered and the pilot's
+                                   // per-affiliate comparison has no event trail
+                                   // to read.
   'agentic.disposition_mirror_refreshed', // 2026-07-07 — stale-CXL rebook guard
                                    // (disposition-staleness-guard.js). Observability
                                    // + future rule hook; no consuming rule yet.
