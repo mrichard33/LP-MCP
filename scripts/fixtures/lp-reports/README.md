@@ -86,50 +86,66 @@ warnings as the original.
 
 ## CSV fixtures (the go-forward format)
 
-LP now schedules CSV exports, so CSV is the format all five reports arrive in
-and the PDF fixtures above are legacy. `scripts/test-lp-csv-cutover.js` runs
-against these.
+LP now schedules CSV exports, so CSV is the format all six reports arrive in and
+the PDF fixtures above are legacy. `scripts/test-lp-csv-cutover.js` and
+`scripts/test-lp-report-parse-appt-stats.js` run against these.
 
 | File | Report | Provenance |
 |---|---|---|
+| `report-138-appt-stats-jan.csv` | 138 Appointment Stats by Sales Rep with Source | **REAL** — January 2026, 345 rows, 79 reps, 17 sources |
+| `report-137-sales-efficiency-jan.csv` | 137 Sales Efficiency | **REAL** — January 2026, 9 branch rows |
 | `report-137-sales-efficiency-ytd.csv` | 137 Sales Efficiency | **REAL** — the 2026-08-05 YTD export, 10 branch rows, cents-exact |
-| `report-133-jobs-by-status.csv` | 133 Jobs By Status | synthetic |
-| `report-134-jobs-by-milestone.csv` | 134 Jobs by Milestone Date | synthetic |
-| `report-135-lead-disposition.csv` | 135 Lead Disposition Detail | synthetic |
-| `report-136-source-cost.csv` | 136 Marketing Sub-Source Cost 2 | synthetic |
+| `report-136-source-cost-jan.csv` | 136 Marketing Sub-Source Cost 2 | **REAL** — January 2026, 66 sub-sources |
+| `report-135-lead-disposition-jan-slice.csv` | 135 Lead Disposition Detail 2 | **REAL, SLICED** — 338 of January's 10,032 rows |
+| `report-134-jobs-by-milestone-mar.csv` | 134 Jobs by Milestone Date | **REAL** — March 2026, 365 rows |
+| `report-133-jobs-by-status.csv` | 133 Jobs By Status | synthetic — no real export has been supplied |
+| `report-134-jobs-by-milestone.csv` | 134 Jobs by Milestone Date | synthetic (superseded by the March file above; kept for its money-notation cases) |
+| `report-135-lead-disposition.csv` | 135 Lead Disposition Detail | synthetic (superseded by the slice above) |
+| `report-136-source-cost.csv` | 136 Marketing Sub-Source Cost 2 | synthetic (superseded by the January file above) |
 
-### Why four of them are synthetic, and what that costs
+### What the real fixtures pin
 
-The raw 133/134/135/136 CSVs from the 2026-08-06 03:00 batch were not available
-when these were written, and 135 carries name, phone, email and street address
-for ~1,194 people while 133 carries customer names, phones, emails and free-text
-HOA notes. Inventing numbers that *look* like a real export and committing them
-as if they were real is worse than having no fixture — so these four are openly
-synthetic: correct headers, correct column order, LP's real value *shapes*, and
-every structural property the parsers must handle. They do not carry real
-figures and no test asserts a business total against them.
+- **138** — the January sit rates by source, asserted exactly: Internet 736/914,
+  Canvass 607/853, PrevCust 38/40, CustRef 20/21, Magazine 35/43,
+  Affiliates 38/48. Also the twelve `(SalesRep Unknown)` rows (59 issued, 3 sat,
+  1,822 sets), the mixed `int`/`0.0000` money forms in `GSA`/`NSA`, the constant
+  `Dsp1..Dsp10` label ordering, the repeated static `Footer` legend, and the two
+  control identities `Σ NumDsp1..10 == NumIssued` and
+  `NumIssued + NumOther == NumSet`, both of which hold on all 345 rows.
+- **137 January** — the period the PDF parser rejected as
+  `unexpected_band_count_11`. It also carries RFED and no JAX, which is the case
+  a hard nine-market gate would have failed.
+- **136 January** — the blank-`descr` unattributed bucket and duplicate
+  sub-source names on distinct rows.
+- **135 slice** — all 22 `Category` values, all 16 `src_id` values, and 64
+  blank-`brn_id` rows (the `UNASSIGNED` bucket that must never be dropped).
 
-What they DO pin, and pin genuinely:
+Note that **133 is the report with newlines inside quoted fields**
+(`MostRecentNoteHOA`), not 135 — January's 135 export contains none. The
+synthetic 133 fixture is still the one that pins that behaviour, and it stays
+until a real 133 export is supplied.
 
-- **133** — newlines inside quoted `MostRecentNoteHOA` fields. The file is 10
-  physical lines and 5 records; anything that splits on `\n` corrupts it.
-- **134** — the three money notations LP mixes in ONE column (`21750.00`,
-  `17250`, `0.0000`) plus rows with genuine cents (`27310.47`, `33475.83`) that
-  must survive parsing.
-- **135** — the discriminator columns and the `0.0000` money form.
-- **136** — the blank-`descr` row (a real unattributed sub-source bucket, 3 raw
-  leads) and duplicate sub-source names on distinct rows.
+### Why 135 is a slice
 
-### Replacing them with the real thing
+The full January export is 4.3 MB and carries name, phone, email and street
+address for 10,032 people. Committing it whole is far past this directory's norm
+and is not worth the exposure, so the slice keeps every structural property the
+parser must handle and drops the bulk. Company-total goldens that need the whole
+file — Σ136 `NumRaw` = 10,032 = 135's full record count — skip unless the full
+redacted file is dropped in as `report-135-lead-disposition-jan-full.csv`, the
+same arrangement the bbox fixture above uses.
 
-Drop the real export in under the same filename and the tests tighten
-automatically — they assert structure, not the synthetic values. Redact first;
-PII in the repo is not approved:
+### Producing or replacing one
 
-1. Save the scheduled-email attachment as `report-1NN-<slug>.csv`.
-2. Replace names, phones, emails and street addresses with synthetic values.
-   **Preserve row count, column count and order, embedded newlines, and every
-   numeric value exactly** — those are what the goldens assert.
+Raw exports are **never** committed. Redact first:
+
+1. Save the scheduled-email attachment.
+2. Replace customer names, phones, emails and street addresses with synthetic
+   values. **Preserve row count, column count and order, embedded newlines, and
+   every numeric value exactly** — those are what the goldens assert.
+   Employee names stay: `Salesrep` (138) and `SalesRepName` (134) are not
+   customer PII, and rep-level goldens depend on them. Only `FullName` — the
+   report runner — is replaced.
 3. `npm test` — the suite must stay green. If a total moves, the redaction
    touched a number and must be redone.
 

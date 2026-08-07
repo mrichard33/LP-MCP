@@ -64,6 +64,10 @@ import {
   parseSalesEfficiencyCsv, parseSalesEfficiencyPdf, resolveSalesEfficiencyMarkets,
   computeSalesEfficiencyTotals, validateSalesEfficiency,
 } from './lp-report-parse-sales-efficiency.js';
+import {
+  parseApptStatsCsv, validateApptStatsCsv, sitRateBy, APPT_STATS_PARSER_VERSION,
+  SALESREP_UNKNOWN,
+} from './lp-report-parse-appt-stats.js';
 
 const INGEST_SECRET = (process.env.LP_REPORT_INGEST_SECRET || '').trim();
 const STORAGE_BUCKET = 'lp-reports';
@@ -173,6 +177,110 @@ export async function buildJobStatusMarketMap(cstIds) {
   return { snapshotId, byCst, ambiguities };
 }
 
+/**
+ * 138 vs 137 for the same period — RECORDED, NEVER GATED.
+ *
+ * These two are the pair worth comparing. Both count activity in the window
+ * (appointments issued), so they should very nearly tie, and a drift is
+ * informative rather than expected. January 2026 measured issued 2,029 vs
+ * 2,023, net issued 1,786 vs 1,782, sat 1,566 vs 1,565, sale 488 vs 488 —
+ * sales tie exactly and issued is short by 6, most plausibly appointments with
+ * no rep assignment, which 137 still places by market and 138 cannot place at
+ * all.
+ *
+ * 136 is deliberately NOT the comparison. It is cohort-based (leads created in
+ * the window) against 138's activity basis, so divergence there is expected and
+ * a check can never fail informatively. It also cannot be done by source: 136's
+ * only source column is `descr`, the SUB-source, against 138's `Src_id`, the
+ * source — 61 values against 17, with no clean bridge.
+ *
+ * Advisory only. A missing 137 snapshot, or any query failure, records null
+ * rather than disturbing an otherwise good 138 ingest.
+ */
+async function crossCheckSalesEfficiency(periodStart, periodEnd, totals) {
+  if (!periodStart || !periodEnd) return null;
+  try {
+    const { data: snaps, error: snapErr } = await supabase
+      .from('scorecard_report_snapshots')
+      .select('id')
+      .eq('report_type', 'sales_efficiency').eq('is_current', true)
+      .eq('period_start', periodStart).eq('period_end', periodEnd)
+      .order('ingested_at', { ascending: false }).limit(1);
+    if (snapErr || !snaps?.length) {
+      return { compared: false, reason: snapErr ? 'lookup_failed' : 'no_current_137_snapshot' };
+    }
+    const { data, error } = await supabase
+      .from('lp_sales_efficiency_history')
+      .select('num_issued, num_net_issued, num_sat, num_sold')
+      .eq('snapshot_id', snaps[0].id);
+    if (error || !data?.length) return { compared: false, reason: 'no_137_rows' };
+    const se = data.reduce((a, r) => ({
+      num_issued: a.num_issued + (r.num_issued ?? 0),
+      num_net_issued: a.num_net_issued + (r.num_net_issued ?? 0),
+      num_sat: a.num_sat + (r.num_sat ?? 0),
+      num_sale: a.num_sale + (r.num_sold ?? 0),
+    }), { num_issued: 0, num_net_issued: 0, num_sat: 0, num_sale: 0 });
+    const deltas = {};
+    for (const k of Object.keys(se)) deltas[k] = (totals[k] ?? 0) - se[k];
+    return { compared: true, snapshot_id: snaps[0].id, sales_efficiency: se, appt_stats: {
+      num_issued: totals.num_issued, num_net_issued: totals.num_net_issued,
+      num_sat: totals.num_sat, num_sale: totals.num_sale }, deltas };
+  } catch (err) {
+    return { compared: false, reason: 'lookup_failed', message: err.message };
+  }
+}
+
+/**
+ * Pre-begin idempotency probe, shared by all four chunked ingest paths.
+ *
+ * ══ WHY THERE IS NO `finalized_at IS NOT NULL` FILTER HERE ══
+ *
+ * There used to be one, so that an aborted chunked ingest could not block its
+ * own corrected retry. But the DB constraint on (report_type, file_sha256)
+ * carries no such filter, and that mismatch was the bug: when begin succeeded
+ * and finalize failed, the orphan row kept the key with finalized_at NULL, this
+ * probe skipped past it, lp_csv_ingest_begin raised 23505, and duplicateResponse
+ * answered `success: true, duplicate: true` pointing at a snapshot holding
+ * nothing. The caller was told the re-send had landed when nothing had — the
+ * exact way a remediation re-send of a bad month reads as repaired while the bad
+ * snapshot stays live.
+ *
+ * The probe now matches the constraint, and the unfinalized case is named rather
+ * than disguised: HTTP 200 (the file is fine; replaying it would only repeat
+ * this) but success:false, so it cannot be mistaken for a landed ingest.
+ * Clearing the orphan is an operator action — nothing is deleted here.
+ *
+ * @returns {Promise<object|null>} a response to return immediately, or null to proceed
+ */
+async function probeExistingSnapshot(reportType, sha, done) {
+  const { data: dup, error: dupErr } = await supabase
+    .from('scorecard_report_snapshots')
+    .select('id, finalized_at, is_current').eq('report_type', reportType).eq('file_sha256', sha)
+    .maybeSingle();
+  if (dupErr) throw new Error(`duplicate check failed: ${dupErr.message}`);
+  if (!dup) return null;
+
+  if (!dup.finalized_at) {
+    await done('failed', {
+      snapshot_id: dup.id,
+      failure_reason: 'orphaned_snapshot',
+      detail: {
+        matched_on: 'file_sha256', is_current: Boolean(dup.is_current),
+        message: 'an earlier ingest of these bytes began but never finalized; '
+          + 'it holds the unique key, so this re-send cannot land until it is cleared',
+      },
+    });
+    return {
+      success: false, rejected: true, reason: 'orphaned_snapshot',
+      failure_reason: 'orphaned_snapshot',
+      snapshot_id: dup.id, matched_on: 'file_sha256', sha256: sha,
+    };
+  }
+
+  await done('duplicate', { snapshot_id: dup.id, detail: { matched_on: 'file_sha256' } });
+  return { success: true, duplicate: true, snapshot_id: dup.id, matched_on: 'file_sha256', sha256: sha };
+}
+
 async function loadChunked(snapshotId, rows) {
   let inserted = 0;
   for (let i = 0; i < rows.length; i += ROW_CHUNK) {
@@ -203,19 +311,10 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
       snapshot_id: extra.snapshot_id ?? null, source, duration_ms: Date.now() - started,
     });
 
-  // 1. Idempotency — same bytes twice is a clean no-op. Only FINALIZED
-  //    snapshots count: an aborted chunked ingest (begin succeeded, finalize
-  //    rejected) must not block the corrected retry.
-  const { data: dup, error: dupErr } = await supabase
-    .from('scorecard_report_snapshots')
-    .select('id').eq('report_type', reportType).eq('file_sha256', sha)
-    .not('finalized_at', 'is', null)
-    .maybeSingle();
-  if (dupErr) throw new Error(`duplicate check failed: ${dupErr.message}`);
-  if (dup) {
-    await done('duplicate', { snapshot_id: dup.id, detail: { matched_on: 'file_sha256' } });
-    return { success: true, duplicate: true, snapshot_id: dup.id, matched_on: 'file_sha256', sha256: sha };
-  }
+  // 1. Idempotency — same bytes twice is a clean no-op, and an unfinalized
+  //    match is an orphan rather than a duplicate. See probeExistingSnapshot.
+  const existing = await probeExistingSnapshot(reportType, sha, done);
+  if (existing) return existing;
 
   // 2. Archive FIRST.
   const storagePath = `${reportType}/${todayET()}/${sha}.csv`;
@@ -389,6 +488,40 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
       controlTotals = computeMilestoneTotals(parsed.rows);
       extraDetail = { reconciliations: v.reconciliations, unmapped_columns: parsed.unmappedColumns };
       parserVersion = MILESTONE_CSV_PARSER_VERSION;
+    } else if (reportType === 'appt_stats_by_rep_source') {
+      parsed = parseApptStatsCsv(text);
+      const v = validateApptStatsCsv(parsed, expectedTotals);
+      if (!v.ok) {
+        return await fail(v.violations[0].rule, { violations: v.violations, computed: v.totals },
+          `${v.violations[0].rule} (+${v.violations.length - 1} more).`);
+      }
+      // NO MARKET RESOLUTION. 138 carries no branch column, so its rows cannot
+      // go through lp_branch_market_map and produce no lp_report_facts. That is
+      // by design, not an omission — scorecard_rebuild_facts simply matches none
+      // of its six source tables and returns 0.
+      rows = parsed.rows;
+      controlTotals = v.totals;
+      parserVersion = APPT_STATS_PARSER_VERSION;
+      extraDetail = {
+        disposition_labels: parsed.dispositionLabels,
+        alias_disagreements: parsed.aliasDisagreements.length,
+        warnings: v.warnings,
+        rep_count: new Set(rows.map((r) => r.salesrep_raw)).size,
+        source_count: new Set(rows.map((r) => r.src_id_raw)).size,
+        // Rep-level numbers are only trustworthy from ISSUE onward. LP sets a
+        // large share of appointments before a rep is assigned and files them
+        // under its own '(SalesRep Unknown)' label — 12 rows and 1,822 sets in
+        // January 2026. Counted here so any set-count tile grouped by rep can
+        // show the bucket rather than dropping or redistributing it.
+        salesrep_unknown: rows.filter((r) => r.salesrep_raw === SALESREP_UNKNOWN)
+          .reduce((a, r) => ({
+            rows: a.rows + 1, num_set: a.num_set + r.num_set,
+            num_issued: a.num_issued + r.num_issued, num_sat: a.num_sat + r.num_sat,
+          }), { rows: 0, num_set: 0, num_issued: 0, num_sat: 0 }),
+        sit_rate_by_source: sitRateBy(rows, 'src_id_raw'),
+        cross_report: await crossCheckSalesEfficiency(
+          parsed.header.periodStart, parsed.header.periodEnd, v.totals),
+      };
     } else {
       throw new Error(`unknown CSV report type ${reportType}`);
     }
@@ -515,16 +648,8 @@ export async function ingestLeadDispositionPdf({ buffer, source = 'n8n' }) {
       snapshot_id: extra.snapshot_id ?? null, source, duration_ms: Date.now() - started,
     });
 
-  const { data: dup, error: dupErr } = await supabase
-    .from('scorecard_report_snapshots')
-    .select('id').eq('report_type', reportType).eq('file_sha256', sha)
-    .not('finalized_at', 'is', null)
-    .maybeSingle();
-  if (dupErr) throw new Error(`duplicate check failed: ${dupErr.message}`);
-  if (dup) {
-    await done('duplicate', { snapshot_id: dup.id, detail: { matched_on: 'file_sha256' } });
-    return { success: true, duplicate: true, snapshot_id: dup.id, matched_on: 'file_sha256', sha256: sha };
-  }
+  const existing = await probeExistingSnapshot(reportType, sha, done);
+  if (existing) return existing;
 
   const storagePath = `${reportType}/${todayET()}/${sha}.pdf`;
   const { error: upErr } = await supabase.storage
@@ -648,16 +773,8 @@ export async function ingestSourceCostPdf({ buffer, source = 'n8n' }) {
       snapshot_id: extra.snapshot_id ?? null, source, duration_ms: Date.now() - started,
     });
 
-  const { data: dup, error: dupErr } = await supabase
-    .from('scorecard_report_snapshots')
-    .select('id').eq('report_type', reportType).eq('file_sha256', sha)
-    .not('finalized_at', 'is', null)
-    .maybeSingle();
-  if (dupErr) throw new Error(`duplicate check failed: ${dupErr.message}`);
-  if (dup) {
-    await done('duplicate', { snapshot_id: dup.id, detail: { matched_on: 'file_sha256' } });
-    return { success: true, duplicate: true, snapshot_id: dup.id, matched_on: 'file_sha256', sha256: sha };
-  }
+  const existing = await probeExistingSnapshot(reportType, sha, done);
+  if (existing) return existing;
 
   const storagePath = `${reportType}/${todayET()}/${sha}.pdf`;
   const { error: upErr } = await supabase.storage
@@ -763,16 +880,8 @@ export async function ingestSalesEfficiencyPdf({ buffer, source = 'n8n' }) {
       snapshot_id: extra.snapshot_id ?? null, source, duration_ms: Date.now() - started,
     });
 
-  const { data: dup, error: dupErr } = await supabase
-    .from('scorecard_report_snapshots')
-    .select('id').eq('report_type', reportType).eq('file_sha256', sha)
-    .not('finalized_at', 'is', null)
-    .maybeSingle();
-  if (dupErr) throw new Error(`duplicate check failed: ${dupErr.message}`);
-  if (dup) {
-    await done('duplicate', { snapshot_id: dup.id, detail: { matched_on: 'file_sha256' } });
-    return { success: true, duplicate: true, snapshot_id: dup.id, matched_on: 'file_sha256', sha256: sha };
-  }
+  const existing = await probeExistingSnapshot(reportType, sha, done);
+  if (existing) return existing;
 
   const storagePath = `${reportType}/${todayET()}/${sha}.pdf`;
   const { error: upErr } = await supabase.storage

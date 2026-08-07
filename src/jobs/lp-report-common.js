@@ -227,8 +227,15 @@ export function contentSha256({
  * The `x`-prefix rule covers LP's parameter echoes (xBrn_id, xSortBy,
  * xGrouper, xGrade, xSetter, …). Header case varies between reports, so the
  * test is case-insensitive. No LP DATA column begins with `x`.
+ *
+ * `footer` is here because report 138 stamps a static legend on EVERY row
+ * ('1Leg=1 Leg Wife or Husband Missing;    NoHome=No-Show;    …') decoding its
+ * disposition buckets. It is documentation, not data — one distinct value
+ * across all 345 rows of the January export. Left in the hash, an LP wording
+ * change to that legend would fork the digest of every row at once and
+ * spuriously supersede a perfectly good snapshot.
  */
-const VOLATILE_COLUMNS = new Set(['currentdatetime', 'usecolor', 'fullname', 'empname']);
+const VOLATILE_COLUMNS = new Set(['currentdatetime', 'usecolor', 'fullname', 'empname', 'footer']);
 
 function isVolatileKey(k) {
   if (k.startsWith('_')) return true;          // parser-transient, e.g. _renders_cents
