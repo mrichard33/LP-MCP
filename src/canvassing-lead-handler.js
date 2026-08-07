@@ -198,7 +198,24 @@ export function validateCanvassingPayload(rawBody) {
       // E.4 rule.
       appt_date: trim(body.appt_date),
       appt_slot: trim(body.appt_slot),
-      utm: body.utm && typeof body.utm === 'object' ? body.utm : null,
+      // GHL's Webhook action posts a FLAT key per customData entry — it has no
+      // way to express a nested object. Workflow 7e01702d sends utm_source and
+      // utm_medium flat, so the object-only read below resolved to null and the
+      // UTM note line never rendered: event attribution never reached LP notes
+      // at all. Accept the nested shape first (any caller that can send it), then
+      // fall back to assembling one from the flat keys. All-blank stays null so
+      // buildLpLeadFields still omits the line rather than printing an empty
+      // "UTM: source= medium= campaign= term=".
+      utm: (() => {
+        if (body.utm && typeof body.utm === 'object' && !Array.isArray(body.utm)) return body.utm;
+        const flat = {
+          source: trim(body.utm_source),
+          medium: trim(body.utm_medium),
+          campaign: trim(body.utm_campaign),
+          term: trim(body.utm_term),
+        };
+        return Object.values(flat).some(Boolean) ? flat : null;
+      })(),
       consent_date: trim(body.consent_date),
     },
   };
@@ -217,7 +234,30 @@ export function buildLpLeadFields(p, appt) {
   const proId = p.pro_id || (/^\d+$/.test(p.promoter) ? p.promoter : '');
 
   const utm = p.utm || {};
+
+  // Job size is the single most useful fact for the setter working the lead and
+  // the rep dispatched to the home, and it must never depend on a canvasser or
+  // booth staffer having retyped it into the free-text box. All three have been
+  // captured on the form and normalized into the payload since v2, but until
+  // 2026-08-07 their only consumer was the SalesRabbit update in step 7 — and
+  // the event workflow (7e01702d) sends no salesrabbit_id, so on that path the
+  // counts reached nothing whatsoever. The legacy path
+  // (src/canvassing-intake.js buildCanvassingNotes) always sent them; the v2
+  // rewrite dropped them.
+  //
+  // Blank counts are OMITTED rather than printed empty. The legacy template
+  // emits a fixed 7-line block that renders "Door Count:" with nothing after it
+  // on a partially filled form, which reads to a setter as "asked, answered
+  // zero" instead of "not captured". Same labels, different blank handling —
+  // deliberate.
+  const projectLines = [
+    p.window_count && `Window Count: ${p.window_count}`,
+    p.door_count && `Door Count: ${p.door_count}`,
+    p.slider_count && `Slider Count: ${p.slider_count}`,
+  ].filter(Boolean);
+
   const noteLines = [
+    ...projectLines,
     p.canvassing_notes,
     p.reason_for_interest && `Reason for interest: ${p.reason_for_interest}`,
     p.spouse_name && `Spouse/co-owner: ${p.spouse_name}`,
