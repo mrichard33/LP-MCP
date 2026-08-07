@@ -35,6 +35,21 @@
 //   se_hold_vs_job_status    137's Hold bucket vs Job Status YTD's HOA —
 //                            two independently generated reports; named
 //                            tolerance Δ1 job / $8,785 (verified 2026-08-05).
+//
+// CROSS-REPORT OBSERVABILITY (§F). Recorded, never enforced — neither can
+// return 'fail', neither alerts, neither can block a send:
+//   lead_count_vs_source_raw 135 record count vs summed 136 NumRaw over the
+//                            SAME window. Tied at 1,194 on the 2026-08-06 MTD
+//                            pull; 4 apart at YTD on 2026-08-07. Advisory.
+//   se_gsa_vs_milestone_gross 137 per-market GSA vs 134 summed GrossAmount.
+//                            EXPECTED TO DIFFER — different milestone bases,
+//                            measured at 1.1×–3× and negative for two markets
+//                            in August. Do not add a threshold; it would fire
+//                            on everything forever.
+//
+// Both pair on the WINDOW, not the scope label, and write 'skipped' with the
+// windows each side actually had when no shared window exists — which is the
+// common case, since 135 is pulled MTD daily and 136 YTD.
 
 import express from 'express';
 import supabase from '../supabase.js';
@@ -107,6 +122,42 @@ async function currentSnapshot(reportType) {
   if (error) throw new Error(`snapshot read failed: ${error.message}`);
   return data;
 }
+
+/** Every current snapshot for a report type, newest window first. */
+async function currentSnapshots(reportType) {
+  const { data, error } = await supabase
+    .from('scorecard_report_snapshots')
+    .select('id, period_start, period_end, scope, row_count')
+    .eq('report_type', reportType).eq('is_current', true)
+    .order('period_end', { ascending: false });
+  if (error) throw new Error(`snapshot read failed: ${error.message}`);
+  return data || [];
+}
+
+/**
+ * Find two reports describing the SAME window.
+ *
+ * Cross-report checks cannot use currentSnapshot(): it returns one snapshot per
+ * type by newest period_start, and two report types are rarely on the same
+ * window. 135 is pulled MTD daily and YTD weekly while 136 is YTD, so on any
+ * given morning the newest 135 and the newest 136 usually describe different
+ * spans — comparing them would manufacture a difference out of the calendar.
+ *
+ * Match on the window itself, not the scope label: scope is derived per report
+ * and the same span can carry different labels. Newest matching window wins.
+ *
+ * @returns {{lhs: object, rhs: object}|null}
+ */
+export function pairOnWindow(lhsSnaps, rhsSnaps) {
+  for (const l of lhsSnaps) {
+    const r = rhsSnaps.find((x) => x.period_start === l.period_start && x.period_end === l.period_end);
+    if (r) return { lhs: l, rhs: r };
+  }
+  return null;
+}
+
+/** Compact description of what windows a side actually had, for skip reasons. */
+export const windowList = (snaps) => snaps.map((s) => `${s.period_start}..${s.period_end}(${s.scope})`);
 
 async function writeResult(reconDate, reconType, status, comparison, namedExceptions = null) {
   const { error } = await supabase
@@ -392,7 +443,121 @@ export async function runLpReportRecon({ reconDate } = {}) {
     }
   }
 
+  // ══ CROSS-REPORT OBSERVABILITY (§F) ══════════════════════════════════════
+  //
+  // The two checks below are RECORDED, NEVER ENFORCED. They never return
+  // 'fail', never alert, and never touch a send. They exist because the five LP
+  // reports describe overlapping slices of one business and nothing else
+  // notices when they stop agreeing — a divergence no single file's own control
+  // totals can contradict.
+  //
+  // Both are deliberately quiet: see the note on each for why a threshold would
+  // be worse than useless.
+  results.push(...await runCrossReportRecon(date));
+
   return { recon_date: date, results };
+}
+
+/**
+ * §F cross-report reconciliations. Observability only — the caller must be able
+ * to trust that nothing here can fail a file or page anyone.
+ */
+async function runCrossReportRecon(date) {
+  const out = [];
+
+  // ── lead_count_vs_source_raw: 135 record count vs summed 136 NumRaw ──────
+  //
+  // Two reports over the SAME lead population, generated independently. They
+  // tied at 1,194 on the 2026-08-06 MTD pull; at YTD on 2026-08-07 they sat 4
+  // apart (78,557 vs 78,561). Small drift is LP-side timing and is worth
+  // seeing, not worth failing on — hence 'warn' as the ceiling.
+  const ldSnaps = await currentSnapshots('lead_disposition');
+  const scSnaps = await currentSnapshots('source_cost');
+  const pair = pairOnWindow(ldSnaps, scSnaps);
+
+  if (!pair) {
+    // The common case, not an error: 135 is pulled MTD daily and YTD weekly
+    // while 136 is YTD, so a shared window often does not exist. Recorded so
+    // that "no result" and "never ran" stay distinguishable.
+    out.push(await writeResult(date, 'lead_count_vs_source_raw', 'skipped', {
+      reason: 'no shared window between current lead_disposition and source_cost snapshots',
+      lead_disposition_windows: windowList(ldSnaps),
+      source_cost_windows: windowList(scSnaps),
+    }));
+  } else {
+    const raw = (await runSQL(`
+      SELECT COALESCE(SUM(num_raw),0)::bigint AS n
+      FROM lp_source_cost_history WHERE snapshot_id = '${pair.rhs.id}'`))?.[0];
+    const leadCount = Number(pair.lhs.row_count ?? 0);
+    const sourceRaw = Number(raw?.n ?? 0);
+    const delta = leadCount - sourceRaw;
+    out.push(await writeResult(date, 'lead_count_vs_source_raw', delta === 0 ? 'pass' : 'warn', {
+      note: '135 record count vs summed 136 NumRaw over the same window — independent views of one lead population. Advisory: drift is signal, never a rejection.',
+      window: { period_start: pair.lhs.period_start, period_end: pair.lhs.period_end },
+      lead_disposition: { snapshot_id: pair.lhs.id, scope: pair.lhs.scope, record_count: leadCount },
+      source_cost: { snapshot_id: pair.rhs.id, scope: pair.rhs.scope, sum_num_raw: sourceRaw },
+      delta,
+    }));
+  }
+
+  // ── se_gsa_vs_milestone_gross: 137 per-market GSA vs 134 summed gross ────
+  //
+  // These count DIFFERENT MILESTONE BASES and are expected to differ — measured
+  // 2026-08-07 at ratios of 1.1×–3× across every market, and negative for ORL
+  // and STPET in August. There is no threshold that would not fire on
+  // everything forever, so this records the delta and stops. Do not add an
+  // alert here; do not "tune" it until it ties. If someone later wants a
+  // signal, the honest one is a change in the ratio over time, not its size.
+  const seSnaps = await currentSnapshots('sales_efficiency');
+  const msSnaps = await currentSnapshots('jobs_by_milestone');
+  const gsaPair = pairOnWindow(seSnaps, msSnaps);
+
+  if (!gsaPair) {
+    out.push(await writeResult(date, 'se_gsa_vs_milestone_gross', 'skipped', {
+      reason: 'no shared window between current sales_efficiency and jobs_by_milestone snapshots',
+      sales_efficiency_windows: windowList(seSnaps),
+      jobs_by_milestone_windows: windowList(msSnaps),
+    }));
+  } else {
+    const seRows = await runSQL(`
+      SELECT market, COALESCE(SUM(gsa_cents),0)::bigint AS cents
+      FROM lp_sales_efficiency_history WHERE snapshot_id = '${gsaPair.lhs.id}' GROUP BY market`) || [];
+    const msRows = await runSQL(`
+      SELECT market, COALESCE(SUM(gross_cents),0)::bigint AS cents
+      FROM scorecard_report_rows_a WHERE snapshot_id = '${gsaPair.rhs.id}' GROUP BY market`) || [];
+
+    const seByMarket = new Map(seRows.map((r) => [r.market, Number(r.cents)]));
+    const msByMarket = new Map(msRows.map((r) => [r.market, Number(r.cents)]));
+
+    // Union, not intersection. An inner join silently loses a market that only
+    // one report knows about — and a market missing from one side is exactly
+    // the kind of thing this check exists to surface. Same doctrine that makes
+    // an unknown 137 Grouper an UNRESOLVED bucket instead of a dropped row.
+    const markets = [...new Set([...seByMarket.keys(), ...msByMarket.keys()])].sort();
+    const perMarket = markets.map((market) => {
+      const se = seByMarket.get(market) ?? null;
+      const ms = msByMarket.get(market) ?? null;
+      return {
+        market,
+        se_gsa_cents: se, milestone_gross_cents: ms,
+        delta_cents: se !== null && ms !== null ? se - ms : null,
+        ratio: se !== null && ms ? Number((se / ms).toFixed(3)) : null,
+      };
+    });
+
+    out.push(await writeResult(date, 'se_gsa_vs_milestone_gross', 'warn', {
+      note: 'EXPECTED TO DIFFER — 137 GSA and 134 GrossAmount count different milestone bases. Recorded for observability; never gated, never alerted. A large delta is not a defect.',
+      window: { period_start: gsaPair.lhs.period_start, period_end: gsaPair.lhs.period_end },
+      sales_efficiency: { snapshot_id: gsaPair.lhs.id, scope: gsaPair.lhs.scope },
+      jobs_by_milestone: { snapshot_id: gsaPair.rhs.id, scope: gsaPair.rhs.scope },
+      per_market: perMarket,
+      markets_only_in_137: markets.filter((m) => !msByMarket.has(m)),
+      markets_only_in_134: markets.filter((m) => !seByMarket.has(m)),
+      total_delta_cents: perMarket.reduce((a, r) => a + (r.delta_cents ?? 0), 0),
+    }));
+  }
+
+  return out;
 }
 
 export function registerLpReportReconRoutes(app) {
