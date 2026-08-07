@@ -176,9 +176,59 @@ test('field map: attribution, consent, appointment, phone, _attempts', () => {
   // promoter is a name, not numeric → no pro_id; lands in notes + UTM
   assert.equal(fields.pro_id, undefined);
   assert.match(fields.notes, /fogging since the last storm/);
+  // Regression guard, 2026-08-07: counts were captured on the form and sent in
+  // the webhook body but never reached LP notes. On the event path (workflow
+  // 7e01702d, no salesrabbit_id) they reached nothing at all. If these come
+  // back, the setter is calling blind on job size — do not delete them.
+  assert.match(fields.notes, /Window Count: 15/);
+  assert.match(fields.notes, /Door Count: 1/);
+  assert.match(fields.notes, /Slider Count: 2/);
+  // spouse_name was already wired into noteLines but nothing asserted it landed
+  // in `notes` — the only spouse assertion in this suite is on the SalesRabbit
+  // call, which never fires on the event path. Guard it here.
+  assert.match(fields.notes, /Spouse\/co-owner: Paloma/);
+  // Counts lead the block — job size must not sit below free text.
+  assert.ok(
+    fields.notes.indexOf('Window Count: 15') < fields.notes.indexOf('fogging since the last storm'),
+    'project counts must precede the canvasser free-text notes'
+  );
   assert.match(fields.notes, /Reason for interest: fogged glass/);
   assert.match(fields.notes, /Promoter: Jordan P/);
   assert.match(fields.notes, /UTM: source=canvassing medium=field campaign=Jordan P term=33446/);
+});
+
+test('field map: blank counts are omitted, not printed empty', () => {
+  const p = validPayload({ door_count: '', slider_count: '' });
+  const appt = convertCanvassAppointment({ appt_date: p.appt_date, appt_slot: p.appt_slot }, NOW);
+  const fields = buildLpLeadFields(p, appt);
+  assert.match(fields.notes, /Window Count: 15/);
+  assert.equal(/Door Count/.test(fields.notes), false);
+  assert.equal(/Slider Count/.test(fields.notes), false);
+  // No empty lines left behind by the filter.
+  assert.equal(/\n\s*\n/.test(fields.notes), false);
+});
+
+test('validation: flat utm_* keys assemble into the utm object (event workflow shape)', () => {
+  // Exactly what GHL workflow 7e01702d posts: flat keys, no nested utm object.
+  const { normalized } = validateCanvassingPayload({
+    ghl_contact_id: 'CONTACT123',
+    canvass_version: 'v2',
+    utm_source: 'event',
+    utm_medium: 'staffer',
+  });
+  assert.equal(normalized.utm.source, 'event');
+  assert.equal(normalized.utm.medium, 'staffer');
+
+  // Nested still wins when a caller can send it.
+  const nested = validateCanvassingPayload({
+    ghl_contact_id: 'C2', canvass_version: 'v2',
+    utm: { source: 'canvassing', medium: 'field' }, utm_source: 'ignored',
+  });
+  assert.equal(nested.normalized.utm.source, 'canvassing');
+
+  // All-blank stays null so the note line is omitted, not printed empty.
+  const none = validateCanvassingPayload({ ghl_contact_id: 'C3', canvass_version: 'v2' });
+  assert.equal(none.normalized.utm, null);
 });
 
 test('field map: blank email omitted; numeric promoter becomes pro_id', () => {
