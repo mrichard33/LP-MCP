@@ -20,20 +20,40 @@
 // reports now parse from the scheduled PDF.
 //
 // HTTP CONTRACT: deterministic content failures return 200 with
-// { success:false, failure_reason }; transport/infra errors stay 5xx.
+// { success:false, rejected:true, reason }; transport/infra errors stay 5xx.
+//
+// A DUPLICATE IS NOT A FAILURE. Re-sending a report that already landed returns
+// 200 { success:true, duplicate:true, snapshot_id, matched_on } and writes one
+// `duplicate` log row. success MUST be true — n8n routes anything else to
+// failure telemetry, and paging on a benign no-op trains people to ignore the
+// alarm. Nothing is written on that path: no snapshot, no child rows, and the
+// existing snapshot's is_current / finalized_at / period_closed_at are
+// untouched with no other snapshot demoted.
+//
+// 5xx IS RESERVED FOR INFRASTRUCTURE — DB unreachable, storage down, unhandled
+// panic — because 5xx is the only thing n8n replays. Returning it for a
+// content problem is what turned one file into
+// `duplicate ×3 → success ×1 → finalize_assertion ×2 → 500`.
 
 import express from 'express';
 
 import supabase from '../supabase.js';
 import { getMarketMaps } from './market-resolver.js';
-import { sha256Hex, todayET, centsToDollars } from './lp-report-common.js';
-import { logIngest, quarantineRows, alertGroupMe, extractPdfText, extractPdfBboxXml, NoTextLayerError } from './lp-report-ingest.js';
+import { sha256Hex, contentSha256, resolveRowMarket, todayET, centsToDollars } from './lp-report-common.js';
+import { logIngest, quarantineRows, alertGroupMe, duplicateResponse, extractPdfText, extractPdfBboxXml, NoTextLayerError } from './lp-report-ingest.js';
 import { parseJobStatusCsv, validateJobStatusCsv } from './lp-report-parse-job-status.js';
 import {
   parseLeadDispositionCsv, validateLeadDispositionCsv, resolveLeadMarkets,
   leadDispositionControlTotals,
 } from './lp-report-parse-lead-disposition.js';
-import { parseSourceCostCsv, validateSourceCostCsv } from './lp-report-parse-source-cost.js';
+import { parseSourceCostCsv, validateSourceCostCsv, computeSourceCostTotals } from './lp-report-parse-source-cost.js';
+import {
+  parseMilestoneCsv, validateMilestoneCsv, computeMilestoneTotals,
+  PARSER_VERSION as MILESTONE_CSV_PARSER_VERSION,
+} from './lp-report-parse-milestone-csv.js';
+import {
+  parseCsv, detectReportFromHeader, CONTENT_SORT_KEYS,
+} from './lp-report-csv-common.js';
 import {
   parseLeadDispositionPdf, validateLeadDispositionPdf,
 } from './lp-report-parse-lead-disposition-pdf.js';
@@ -49,11 +69,29 @@ const INGEST_SECRET = (process.env.LP_REPORT_INGEST_SECRET || '').trim();
 const STORAGE_BUCKET = 'lp-reports';
 const ROW_CHUNK = 1500;
 
+/**
+ * Bucket for a 137 Grouper that lp_branch_market_map does not know (§F).
+ * An explicit label, never a drop: the revenue stays counted and visibly
+ * unattributed, which is recoverable. A dropped row is not.
+ */
+export const UNRESOLVED_MARKET = 'UNRESOLVED';
+
+/**
+ * Slug → report type for the CSV routes.
+ *
+ * The slug is now only a HINT. Since the CSV cutover the header fingerprint
+ * decides which report a file is (§C), so any of these slugs accepts any LP CSV
+ * and routes it correctly — which is what lets one n8n workflow post every
+ * attachment without knowing what it holds. `jobs-by-milestone` joins the list
+ * because 134 had no CSV route at all; it is the fifth report in an existing
+ * route family, not a new endpoint shape, and emphatically not a batch route.
+ */
 export const CSV_REPORT_TYPES = {
   'job-status': 'job_status_ytd',
   'lead-disposition': 'lead_disposition',
   'source-cost': 'source_cost',
   'sales-efficiency': 'sales_efficiency',
+  'jobs-by-milestone': 'jobs_by_milestone',
 };
 
 /**
@@ -153,7 +191,7 @@ async function loadChunked(snapshotId, rows) {
  * ingestReportPdf: content problems are logged + returned (never thrown),
  * infra failures throw and the route maps them to 5xx.
  */
-export async function ingestCsv({ reportType, text, source = 'manual', expectedTotals = null }) {
+export async function ingestCsv({ reportType, text, source = 'manual', expectedTotals = null, expectedPeriod = null }) {
   const started = Date.now();
   if (!supabase) throw new Error('Supabase not configured');
   const buffer = Buffer.from(text, 'utf8');
@@ -175,8 +213,8 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
     .maybeSingle();
   if (dupErr) throw new Error(`duplicate check failed: ${dupErr.message}`);
   if (dup) {
-    await done('duplicate', { snapshot_id: dup.id });
-    return { success: true, duplicate: true, snapshot_id: dup.id, sha256: sha };
+    await done('duplicate', { snapshot_id: dup.id, detail: { matched_on: 'file_sha256' } });
+    return { success: true, duplicate: true, snapshot_id: dup.id, matched_on: 'file_sha256', sha256: sha };
   }
 
   // 2. Archive FIRST.
@@ -189,11 +227,14 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
   const fail = async (reason, detail, alert) => {
     await done('failed', { failure_reason: reason, detail });
     await alertGroupMe(`⚠️ LP CSV ingest REJECTED (${reportType}): ${alert} Nothing promoted — see scorecard_ingest_log. Archived at ${storagePath}.`);
-    return { success: false, failure_reason: reason, sha256: sha };
+    // `rejected` is the §B contract: a content-level "no" is a 200 with a
+    // machine-readable reason, never a 5xx. Only a 5xx makes n8n replay, and
+    // replaying a deterministically-bad file just repeats the rejection.
+    return { success: false, rejected: true, reason, failure_reason: reason, sha256: sha };
   };
 
   // 3. Parse + validate + market resolution, per type.
-  let parsed, rows, controlTotals, extraDetail = {};
+  let parsed, rows, controlTotals, parserVersion = null, extraDetail = {};
   try {
     if (reportType === 'job_status_ytd') {
       parsed = parseJobStatusCsv(text);
@@ -261,7 +302,7 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
         const branches = [...new Set(unmappedBranch.map((r) => r.brn_id_raw))];
         await done('failed', { failure_reason: 'unmapped_branch', detail: { count: unmappedBranch.length, branches } });
         await alertGroupMe(`⚠️ LP CSV ingest REJECTED (${reportType}): ${unmappedBranch.length} row(s) with unmapped branch ${branches.join(', ')}. Add to lp_branch_market_map, then re-send.`);
-        return { success: false, failure_reason: 'unmapped_branch', branches, sha256: sha };
+        return { success: false, rejected: true, reason: 'unmapped_branch', failure_reason: 'unmapped_branch', branches, sha256: sha };
       }
       rows = parsed.rows.map((r) => ({
         row_num: r.row_num, lp_lead_id: r.lp_lead_id, entry_date: r.entry_date,
@@ -296,15 +337,58 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
       const maps = await getMarketMaps();
       const unmapped = resolveSalesEfficiencyMarkets(parsed.rows, maps);
       if (unmapped.length) {
-        await quarantineRows(reportType, sha, unmapped.map((row) => ({ reason: 'unmapped_branch', row })));
+        // UNRESOLVED, NOT REJECTED (§F). 137 is nine or ten company-wide rows;
+        // dropping one loses a whole market's revenue from every downstream
+        // total, and rejecting the file loses all ten. An unknown Grouper is
+        // named, counted, quarantined for follow-up and alerted — the money
+        // stays visible and attributable to "we don't know which market".
+        //
+        // Validated against lp_branch_market_map, never a hardcoded list: the
+        // map already carries RFED (→ FTLAU_MKT), which a nine-market literal
+        // would have bucketed as UNRESOLVED on every single file.
         const branches = [...new Set(unmapped.map((r) => r.branch_code_raw))];
-        await done('failed', { failure_reason: 'unmapped_branch', detail: { count: unmapped.length, branches } });
-        await alertGroupMe(`⚠️ LP CSV ingest REJECTED (${reportType}): unmapped branch ${branches.join(', ')}. Add to lp_branch_market_map, then re-send.`);
-        return { success: false, failure_reason: 'unmapped_branch', branches, sha256: sha };
+        for (const r of unmapped) r.market = UNRESOLVED_MARKET;
+        await quarantineRows(reportType, sha, unmapped.map((row) => ({ reason: 'unresolved_branch', row })));
+        await alertGroupMe(`⚠️ LP report 137: unknown Grouper ${branches.join(', ')} — ${unmapped.length} row(s) landed as ${UNRESOLVED_MARKET}, NOT dropped. Add to lp_branch_market_map and re-send to reattribute.`);
+        extraDetail.unresolved_branches = branches;
       }
       rows = parsed.rows;
       controlTotals = expectedTotals ?? computeSalesEfficiencyTotals(parsed.rows, parsed.mode);
-      extraDetail = { mode: parsed.mode, reconciliations: v.reconciliations };
+      extraDetail = { ...extraDetail, mode: parsed.mode, reconciliations: v.reconciliations };
+    } else if (reportType === 'jobs_by_milestone') {
+      parsed = parseMilestoneCsv(text);
+      const v = validateMilestoneCsv(parsed);
+      if (!v.ok) {
+        return await fail(v.violations[0].rule, { violations: v.violations },
+          `${v.violations[0].rule} (+${v.violations.length - 1} more).`);
+      }
+      // Branch → market stays FAIL-CLOSED here, unlike 137. This report is
+      // per-job revenue feeding Net Released; an unattributed job silently
+      // changes a market's released dollars, and there are hundreds of rows to
+      // hide in rather than 137's nine.
+      const maps = await getMarketMaps();
+      const unmappedRows = [];
+      for (const r of parsed.rows) {
+        r.market = resolveRowMarket(r.branch_code_raw, maps.branchMap);
+        if (!r.market) unmappedRows.push(r);
+      }
+      if (unmappedRows.length) {
+        await quarantineRows(reportType, sha, unmappedRows.map((row) => ({ reason: 'unmapped_branch', row })));
+        const branches = [...new Set(unmappedRows.map((r) => r.branch_code_raw))];
+        await done('failed', { failure_reason: 'unmapped_branch', detail: { count: unmappedRows.length, branches } });
+        await alertGroupMe(`⚠️ LP CSV ingest REJECTED (${reportType}): unmapped branch ${branches.join(', ')}. Add to lp_branch_market_map, then re-send.`);
+        return { success: false, rejected: true, reason: 'unmapped_branch', failure_reason: 'unmapped_branch', branches, sha256: sha };
+      }
+      rows = parsed.rows.map((r) => ({
+        job_number: r.job_number, customer_name: r.customer_name, address: r.address,
+        city: r.city, contract_date: r.contract_date, rtp_date: r.rtp_date,
+        branch_code_raw: r.branch_code_raw, market: r.market, product: r.product,
+        gross_cents: r.gross_cents, net_cents: r.net_cents,
+        paid_cents: r.paid_cents, balance_cents: r.balance_cents, sales_rep: r.sales_rep,
+      }));
+      controlTotals = computeMilestoneTotals(parsed.rows);
+      extraDetail = { reconciliations: v.reconciliations, unmapped_columns: parsed.unmappedColumns };
+      parserVersion = MILESTONE_CSV_PARSER_VERSION;
     } else {
       throw new Error(`unknown CSV report type ${reportType}`);
     }
@@ -316,11 +400,35 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
   }
 
   // 4. Chunked load: begin → rows×N → finalize (the fail-closed gate).
+  //
+  // content_sha256 is the authoritative dedup key for CSV (§E). It hashes the
+  // parsed rows and the window, excluding the volatile echo columns, with rows
+  // sorted on a stable business key so LP's sort-order parameters cannot fork
+  // identity. includeAsOf is false because a re-pull of the same period IS the
+  // same report even though its CurrentDateTime moved — the very case
+  // file_sha256 cannot see, since those bytes differ every time.
+  const contentSha = contentSha256({
+    reportType,
+    periodStart: parsed.header.periodStart,
+    periodEnd: parsed.header.periodEnd,
+    scope: null,
+    rows,
+    parserVersion,
+    includeAsOf: false,
+    sortKeys: CONTENT_SORT_KEYS[reportType] ?? null,
+  });
+
   const snapshotPayload = {
     report_type: reportType,
     period_start: parsed.header.periodStart,
     period_end: parsed.header.periodEnd,
+    // Full timestamp, not a date: this is the coverage-as-of value that decides
+    // is_partial_month, and truncating it to midnight is what made every 134
+    // snapshot claim it was generated at 00:00.
+    report_generated_at: parsed.header.generatedAt ?? null,
     file_sha256: sha,
+    content_sha256: contentSha,
+    parser_version: parserVersion,
     storage_path: storagePath,
     row_count: rows.length,
     as_of_date: parsed.header.asOf ?? parsed.header.periodEnd ?? todayET(),
@@ -331,9 +439,28 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
     return await fail('missing_period', { header: parsed.header }, 'SDate/EDate missing from the export.');
   }
 
+  // The period comes from the FILE (§D). A caller that disagrees is working
+  // from a different file than the one it sent, and guessing which is right is
+  // how a month's revenue lands under the wrong month.
+  if (expectedPeriod
+      && (expectedPeriod.start !== snapshotPayload.period_start
+       || expectedPeriod.end !== snapshotPayload.period_end)) {
+    return await fail('period_mismatch', {
+      caller: expectedPeriod,
+      file: { start: snapshotPayload.period_start, end: snapshotPayload.period_end },
+    }, `caller declared ${expectedPeriod.start}..${expectedPeriod.end}, file says ${snapshotPayload.period_start}..${snapshotPayload.period_end}.`);
+  }
+
   const { data: snapshotId, error: beginErr } = await supabase
     .rpc('lp_csv_ingest_begin', { p_snapshot: snapshotPayload });
-  if (beginErr) throw new Error(`ingest begin failed: ${beginErr.message}`);
+  if (beginErr) {
+    // 23505 here means the same report already landed — benign (§A), not a 500.
+    const dupRes = await duplicateResponse(beginErr, {
+      reportType, fileSha: sha, contentSha: snapshotPayload.content_sha256, done,
+    });
+    if (dupRes) return dupRes;
+    throw new Error(`ingest begin failed: ${beginErr.message}`);
+  }
 
   try {
     await loadChunked(snapshotId, rows);
@@ -348,7 +475,7 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
     // stays non-current and inert. Log + alert, return 200 success:false.
     await done('failed', { failure_reason: 'finalize_assertion', snapshot_id: snapshotId, detail: { message: err.message, ...extraDetail } });
     await alertGroupMe(`⚠️ LP CSV ingest REJECTED (${reportType}): ${err.message}. Snapshot ${snapshotId} left non-current. Archived at ${storagePath}.`);
-    return { success: false, failure_reason: 'finalize_assertion', message: err.message, snapshot_id: snapshotId, sha256: sha };
+    return { success: false, rejected: true, reason: 'finalize_assertion', failure_reason: 'finalize_assertion', message: err.message, snapshot_id: snapshotId, sha256: sha };
   }
 }
 
@@ -395,8 +522,8 @@ export async function ingestLeadDispositionPdf({ buffer, source = 'n8n' }) {
     .maybeSingle();
   if (dupErr) throw new Error(`duplicate check failed: ${dupErr.message}`);
   if (dup) {
-    await done('duplicate', { snapshot_id: dup.id });
-    return { success: true, duplicate: true, snapshot_id: dup.id, sha256: sha };
+    await done('duplicate', { snapshot_id: dup.id, detail: { matched_on: 'file_sha256' } });
+    return { success: true, duplicate: true, snapshot_id: dup.id, matched_on: 'file_sha256', sha256: sha };
   }
 
   const storagePath = `${reportType}/${todayET()}/${sha}.pdf`;
@@ -412,7 +539,7 @@ export async function ingestLeadDispositionPdf({ buffer, source = 'n8n' }) {
     if (err instanceof NoTextLayerError) {
       await done('no_text_layer', { failure_reason: 'no_text_layer', detail: { message: err.message, storage_path: storagePath } });
       await alertGroupMe(`⚠️ LP report 135 ingest STOPPED: PDF has no text layer (scanned image?). Archived at ${storagePath}. OCR is not permitted.`);
-      return { success: false, failure_reason: 'no_text_layer', sha256: sha };
+      return { success: false, rejected: true, reason: 'no_text_layer', failure_reason: 'no_text_layer', sha256: sha };
     }
     throw err;
   }
@@ -423,7 +550,7 @@ export async function ingestLeadDispositionPdf({ buffer, source = 'n8n' }) {
     const reason = v.violations[0].rule;
     await done('failed', { failure_reason: reason, detail: { violations: v.violations } });
     await alertGroupMe(`⚠️ LP report 135 ingest REJECTED: ${reason}${v.violations.length > 1 ? ` (+${v.violations.length - 1} more)` : ''}. Nothing written. Archived at ${storagePath}.`);
-    return { success: false, failure_reason: reason, violations: v.violations, sha256: sha };
+    return { success: false, rejected: true, reason: reason, failure_reason: reason, violations: v.violations, sha256: sha };
   }
 
   const snapshotPayload = {
@@ -443,7 +570,14 @@ export async function ingestLeadDispositionPdf({ buffer, source = 'n8n' }) {
   };
   const { data: snapshotId, error: beginErr } = await supabase
     .rpc('lp_csv_ingest_begin', { p_snapshot: snapshotPayload });
-  if (beginErr) throw new Error(`ingest begin failed: ${beginErr.message}`);
+  if (beginErr) {
+    // 23505 here means the same report already landed — benign (§A), not a 500.
+    const dupRes = await duplicateResponse(beginErr, {
+      reportType, fileSha: sha, contentSha: snapshotPayload.content_sha256, done,
+    });
+    if (dupRes) return dupRes;
+    throw new Error(`ingest begin failed: ${beginErr.message}`);
+  }
 
   try {
     // Dedicated loader — lp_csv_ingest_rows dispatches `lead_disposition` to the
@@ -456,8 +590,12 @@ export async function ingestLeadDispositionPdf({ buffer, source = 'n8n' }) {
       if (error) throw new Error(`row load failed at chunk ${i / ROW_CHUNK}: ${error.message}`);
     }
   } catch (err) {
+    // Content failure, not infrastructure: the log row is written and the
+    // snapshot stays non-current and inert. Re-throwing made this a 500 too,
+    // which is the only thing n8n replays — one bad file became a retry storm.
     await done('failed', { failure_reason: 'row_load_failed', detail: { message: err.message }, snapshot_id: snapshotId });
-    throw err;
+    await alertGroupMe(`⚠️ LP CSV ingest REJECTED (${reportType}): row load failed — ${err.message}. Snapshot ${snapshotId} left non-current.`);
+    return { success: false, rejected: true, reason: 'row_load_failed', failure_reason: 'row_load_failed', message: err.message, snapshot_id: snapshotId, sha256: sha };
   }
 
   const { error: finErr } = await supabase.rpc('lp_lead_disposition_pdf_finalize', {
@@ -466,7 +604,7 @@ export async function ingestLeadDispositionPdf({ buffer, source = 'n8n' }) {
   if (finErr) {
     await done('failed', { failure_reason: 'finalize_failed', detail: { message: finErr.message }, snapshot_id: snapshotId });
     await alertGroupMe(`⚠️ LP report 135 ingest FAILED at finalize: ${finErr.message}. Nothing promoted.`);
-    return { success: false, failure_reason: 'finalize_failed', sha256: sha };
+    return { success: false, rejected: true, reason: 'finalize_failed', failure_reason: 'finalize_failed', sha256: sha };
   }
 
   // Warnings are reconciliations, never rejections.
@@ -517,8 +655,8 @@ export async function ingestSourceCostPdf({ buffer, source = 'n8n' }) {
     .maybeSingle();
   if (dupErr) throw new Error(`duplicate check failed: ${dupErr.message}`);
   if (dup) {
-    await done('duplicate', { snapshot_id: dup.id });
-    return { success: true, duplicate: true, snapshot_id: dup.id, sha256: sha };
+    await done('duplicate', { snapshot_id: dup.id, detail: { matched_on: 'file_sha256' } });
+    return { success: true, duplicate: true, snapshot_id: dup.id, matched_on: 'file_sha256', sha256: sha };
   }
 
   const storagePath = `${reportType}/${todayET()}/${sha}.pdf`;
@@ -534,7 +672,7 @@ export async function ingestSourceCostPdf({ buffer, source = 'n8n' }) {
     if (err instanceof NoTextLayerError) {
       await done('no_text_layer', { failure_reason: 'no_text_layer', detail: { message: err.message, storage_path: storagePath } });
       await alertGroupMe(`⚠️ LP report 136 ingest STOPPED: PDF has no text layer (scanned image?). Archived at ${storagePath}. OCR is not permitted.`);
-      return { success: false, failure_reason: 'no_text_layer', sha256: sha };
+      return { success: false, rejected: true, reason: 'no_text_layer', failure_reason: 'no_text_layer', sha256: sha };
     }
     throw err;
   }
@@ -545,7 +683,7 @@ export async function ingestSourceCostPdf({ buffer, source = 'n8n' }) {
     const reason = v.violations[0].rule;
     await done('failed', { failure_reason: reason, detail: { violations: v.violations } });
     await alertGroupMe(`⚠️ LP report 136 ingest REJECTED: ${reason}${v.violations.length > 1 ? ` (+${v.violations.length - 1} more)` : ''}. Nothing written. Archived at ${storagePath}.`);
-    return { success: false, failure_reason: reason, violations: v.violations, sha256: sha };
+    return { success: false, rejected: true, reason: reason, failure_reason: reason, violations: v.violations, sha256: sha };
   }
 
   // PDF field names → the CSV table's columns. Demo is the CSV's `sat`.
@@ -576,20 +714,31 @@ export async function ingestSourceCostPdf({ buffer, source = 'n8n' }) {
   };
   const { data: snapshotId, error: beginErr } = await supabase
     .rpc('lp_csv_ingest_begin', { p_snapshot: snapshotPayload });
-  if (beginErr) throw new Error(`ingest begin failed: ${beginErr.message}`);
+  if (beginErr) {
+    // 23505 here means the same report already landed — benign (§A), not a 500.
+    const dupRes = await duplicateResponse(beginErr, {
+      reportType, fileSha: sha, contentSha: snapshotPayload.content_sha256, done,
+    });
+    if (dupRes) return dupRes;
+    throw new Error(`ingest begin failed: ${beginErr.message}`);
+  }
 
   try {
     await loadChunked(snapshotId, rows);
   } catch (err) {
+    // Content failure, not infrastructure: the log row is written and the
+    // snapshot stays non-current and inert. Re-throwing made this a 500 too,
+    // which is the only thing n8n replays — one bad file became a retry storm.
     await done('failed', { failure_reason: 'row_load_failed', detail: { message: err.message }, snapshot_id: snapshotId });
-    throw err;
+    await alertGroupMe(`⚠️ LP CSV ingest REJECTED (${reportType}): row load failed — ${err.message}. Snapshot ${snapshotId} left non-current.`);
+    return { success: false, rejected: true, reason: 'row_load_failed', failure_reason: 'row_load_failed', message: err.message, snapshot_id: snapshotId, sha256: sha };
   }
 
   const { error: finErr } = await supabase.rpc('lp_source_cost_pdf_finalize', { p_snapshot_id: snapshotId });
   if (finErr) {
     await done('failed', { failure_reason: 'finalize_failed', detail: { message: finErr.message }, snapshot_id: snapshotId });
     await alertGroupMe(`⚠️ LP report 136 ingest FAILED at finalize: ${finErr.message}. Nothing promoted.`);
-    return { success: false, failure_reason: 'finalize_failed', sha256: sha };
+    return { success: false, rejected: true, reason: 'finalize_failed', failure_reason: 'finalize_failed', sha256: sha };
   }
 
   await done(v.reconciliations.length ? 'succeeded_with_warnings' : 'succeeded', {
@@ -621,8 +770,8 @@ export async function ingestSalesEfficiencyPdf({ buffer, source = 'n8n' }) {
     .maybeSingle();
   if (dupErr) throw new Error(`duplicate check failed: ${dupErr.message}`);
   if (dup) {
-    await done('duplicate', { snapshot_id: dup.id });
-    return { success: true, duplicate: true, snapshot_id: dup.id, sha256: sha };
+    await done('duplicate', { snapshot_id: dup.id, detail: { matched_on: 'file_sha256' } });
+    return { success: true, duplicate: true, snapshot_id: dup.id, matched_on: 'file_sha256', sha256: sha };
   }
 
   const storagePath = `${reportType}/${todayET()}/${sha}.pdf`;
@@ -638,7 +787,7 @@ export async function ingestSalesEfficiencyPdf({ buffer, source = 'n8n' }) {
     if (err instanceof NoTextLayerError) {
       await done('no_text_layer', { failure_reason: 'no_text_layer', detail: { message: err.message, storage_path: storagePath } });
       await alertGroupMe(`⚠️ LP report 137 ingest STOPPED: PDF has no text layer (scanned image?). Archived at ${storagePath}. OCR is not permitted.`);
-      return { success: false, failure_reason: 'no_text_layer', sha256: sha };
+      return { success: false, rejected: true, reason: 'no_text_layer', failure_reason: 'no_text_layer', sha256: sha };
     }
     throw err;
   }
@@ -649,7 +798,7 @@ export async function ingestSalesEfficiencyPdf({ buffer, source = 'n8n' }) {
     const reason = v.violations[0].rule;
     await done('failed', { failure_reason: reason, detail: { violations: v.violations } });
     await alertGroupMe(`⚠️ LP report 137 ingest REJECTED: ${reason} (+${v.violations.length - 1} more). Nothing written. Archived at ${storagePath}.`);
-    return { success: false, failure_reason: reason, violations: v.violations, sha256: sha };
+    return { success: false, rejected: true, reason: reason, failure_reason: reason, violations: v.violations, sha256: sha };
   }
 
   const maps = await getMarketMaps();
@@ -659,13 +808,13 @@ export async function ingestSalesEfficiencyPdf({ buffer, source = 'n8n' }) {
     const branches = [...new Set(unmapped.map((r) => r.branch_code_raw))];
     await done('failed', { failure_reason: 'unmapped_branch', detail: { count: unmapped.length, branches } });
     await alertGroupMe(`⚠️ LP report 137 ingest REJECTED: unmapped branch ${branches.join(', ')}. Add to lp_branch_market_map, then re-send.`);
-    return { success: false, failure_reason: 'unmapped_branch', branches, sha256: sha };
+    return { success: false, rejected: true, reason: 'unmapped_branch', failure_reason: 'unmapped_branch', branches, sha256: sha };
   }
 
   if (!parsed.header.periodStart || !parsed.header.periodEnd) {
     await done('failed', { failure_reason: 'missing_period', detail: { header: parsed.header } });
     await alertGroupMe(`⚠️ LP report 137 ingest REJECTED: appointment-date window missing from the header. Archived at ${storagePath}.`);
-    return { success: false, failure_reason: 'missing_period', sha256: sha };
+    return { success: false, rejected: true, reason: 'missing_period', failure_reason: 'missing_period', sha256: sha };
   }
 
   const controlTotals = computeSalesEfficiencyTotals(parsed.rows, parsed.mode);
@@ -682,7 +831,14 @@ export async function ingestSalesEfficiencyPdf({ buffer, source = 'n8n' }) {
   };
   const { data: snapshotId, error: beginErr } = await supabase
     .rpc('lp_csv_ingest_begin', { p_snapshot: snapshotPayload });
-  if (beginErr) throw new Error(`ingest begin failed: ${beginErr.message}`);
+  if (beginErr) {
+    // 23505 here means the same report already landed — benign (§A), not a 500.
+    const dupRes = await duplicateResponse(beginErr, {
+      reportType, fileSha: sha, contentSha: snapshotPayload.content_sha256, done,
+    });
+    if (dupRes) return dupRes;
+    throw new Error(`ingest begin failed: ${beginErr.message}`);
+  }
 
   try {
     await loadChunked(snapshotId, parsed.rows.map((r) => ({
@@ -708,7 +864,7 @@ export async function ingestSalesEfficiencyPdf({ buffer, source = 'n8n' }) {
   } catch (err) {
     await done('failed', { failure_reason: 'finalize_assertion', snapshot_id: snapshotId, detail: { message: err.message } });
     await alertGroupMe(`⚠️ LP report 137 ingest REJECTED: ${err.message}. Snapshot ${snapshotId} left non-current. Archived at ${storagePath}.`);
-    return { success: false, failure_reason: 'finalize_assertion', message: err.message, snapshot_id: snapshotId, sha256: sha };
+    return { success: false, rejected: true, reason: 'finalize_assertion', failure_reason: 'finalize_assertion', message: err.message, snapshot_id: snapshotId, sha256: sha };
   }
 }
 
@@ -729,10 +885,27 @@ export function registerLpCsvRoutes(app) {
         if (typeof req.body !== 'string' || !req.body.length) {
           return res.status(400).json({ success: false, error: 'POST the CSV text as the request body (Content-Type: text/csv)' });
         }
+        // THE HEADER DECIDES, NOT THE SLUG (§C). CSV attachments are all named
+        // `_<YYMMDDHHMMSS>_Export.csv`, so the report ID that PDF filenames
+        // carried is gone and n8n can no longer route by name. The slug is now
+        // only a hint; the file's own header row is authoritative.
+        let resolved;
+        try {
+          resolved = detectReportFromHeader(parseCsv(req.body)[0] ?? []);
+        } catch (err) {
+          console.warn(`[LPCsv] ${slug}: ${err.failureReason ?? err.message}`, err.detail ?? '');
+          return res.json({
+            success: false, rejected: true, reason: err.failureReason ?? 'unknown_report_fingerprint',
+            failure_reason: err.failureReason ?? 'unknown_report_fingerprint', detail: err.detail ?? null,
+          });
+        }
+        if (resolved.reportType !== reportType) {
+          console.warn(`[LPCsv] ${slug}: header says ${resolved.reportType}, routing there instead`);
+        }
         const result = await ingestCsv({
-          reportType, text: req.body, source: String(req.query.source || 'manual'),
+          reportType: resolved.reportType, text: req.body, source: String(req.query.source || 'manual'),
         });
-        res.json(result);
+        res.json({ ...result, report_type: resolved.reportType, lp_report_id: resolved.lpReportId });
       } catch (err) {
         console.error(`[LPCsv] ${slug} ingest error:`, err.message);
         res.status(500).json({ success: false, error: err.message });

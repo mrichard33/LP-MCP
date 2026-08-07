@@ -236,3 +236,41 @@ test('known branch labels cover the CSV fixture exactly', () => {
   const p = parseSalesEfficiencyCsv(CSV_TEXT);
   for (const r of p.rows) assert.ok(SE_BRANCH_LABELS.includes(r.branch_code_raw), r.branch_code_raw);
 });
+
+// ── §G  the 13-band Total row is only trustworthy while the period is open ──
+//
+// FIELD_SETS[13] assumes the missing (count, volume) pair is the LAST one, Net.
+// That holds for a month still accumulating, where net requires completion. It
+// does NOT hold for a closed month with an empty bucket: March 2026 printed no
+// Hold-HOA activity, so Net slid into the Hold slot and $8,357,993 of net sales
+// was stored as hold_cents with nsa_cents NULL — silently. The band count alone
+// cannot say which pair is absent, so coverage decides whether to trust it.
+
+test('§G a closed-month 13-band file is REJECTED, not silently relabelled', () => {
+  const asClosed = PDF_TEXT
+    .replaceAll('8/5/2026 2:22PM', '9/3/2026 6:00PM');   // run AFTER 8/31
+  const p = parseSalesEfficiencyPdf(asClosed);
+  assert.equal(p.mode, 'unparseable');
+  assert.equal(p.error, 'unexpected_band_count_13');
+  assert.equal(p.detail.period_end, '2026-08-31');
+  assert.equal(p.detail.printed_at, '2026-09-03');
+});
+
+test('§G an in-flight month still parses counts_only — the legitimate case', () => {
+  const p = parseSalesEfficiencyPdf(PDF_TEXT);
+  assert.equal(p.mode, 'counts_only');
+  assert.equal(p.header.asOf, '2026-08-05', 'the printed run stamp is now read');
+});
+
+test('§G no run date means coverage cannot be proven — fail closed', () => {
+  const undated = PDF_TEXT.replaceAll('8/5/2026 2:22PM', '');
+  const p = parseSalesEfficiencyPdf(undated);
+  assert.equal(p.mode, 'unparseable');
+  assert.equal(p.error, 'unexpected_band_count_13');
+});
+
+test('§G the PDF parser is marked legacy and points at the CSV path', () => {
+  const src = readFileSync('src/jobs/lp-report-parse-sales-efficiency.js', 'utf8');
+  assert.match(src, /LEGACY \/ FROZEN/, 'the freeze must be stated in the file');
+  assert.match(src, /do\s*\n?\s*\*?\s*not recalibrate bands from the header/i);
+});

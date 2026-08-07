@@ -16,8 +16,26 @@
 // duplicates — totals still tie. Row identity is (snapshot, row_num);
 // every row is kept verbatim, including blanks.
 
-import { parseMoneyCents } from './lp-report-common.js';
-import { csvToObjects, parseCsvDate, parseCount } from './lp-report-csv-common.js';
+import { parseCsvMoneyCents } from './lp-report-common.js';
+import { csvToObjects, parseCsvDate, parseCsvDateTimeET, parseCount } from './lp-report-csv-common.js';
+
+/**
+ * The label for a row LP prints with a blank `descr`.
+ *
+ * These are REAL DATA — an unattributed sub-source bucket, carrying 3 raw leads
+ * in the 2026-08-06 export. Storing NULL made them indistinguishable from a
+ * parse failure and invited a downstream reader to skip them; naming the bucket
+ * keeps the leads counted and attributable to "we don't know".
+ */
+export const UNATTRIBUTED = 'UNATTRIBUTED';
+
+/** Money cell → cents, tracking sub-cent loss for the §F gate. */
+function money(raw, sink, column) {
+  const parsed = parseCsvMoneyCents(raw);
+  if (parsed === null) return 0;
+  if (parsed.subCent) sink.push(column);
+  return parsed.cents;
+}
 
 const REQUIRED = ['descr', 'NumRaw', 'NumSet', 'NumCnf', 'NumIssued', 'NumSat',
   'NumSold', 'NumNetSold', 'GSA', 'NSA', 'MCost', 'WorkingAmount', 'SDate', 'EDate'];
@@ -28,14 +46,20 @@ const REQUIRED = ['descr', 'NumRaw', 'NumSet', 'NumCnf', 'NumIssued', 'NumSat',
  */
 export function parseSourceCostCsv(text) {
   const { rows: raw } = csvToObjects(text, REQUIRED);
-  let periodStart = null, periodEnd = null, asOf = null;
+  let periodStart = null, periodEnd = null, asOf = null, generatedAt = null;
+  const subCentColumns = [];
   const rows = raw.map((r, i) => {
     periodStart ??= parseCsvDate(r.SDate);
     periodEnd ??= parseCsvDate(r.EDate);
-    asOf ??= parseCsvDate(r.CurrentDateTime);
+    // Full timestamp, not just the date: it is the coverage-as-of value that
+    // decides is_partial_month. asOf keeps the date form for scope derivation.
+    if (!generatedAt) {
+      const gen = parseCsvDateTimeET(r.CurrentDateTime);
+      if (gen) { generatedAt = gen; asOf ??= parseCsvDate(r.CurrentDateTime); }
+    }
     return {
       row_num: i + 1,
-      sub_source: String(r.descr ?? '').trim() || null,
+      sub_source: String(r.descr ?? '').trim() || UNATTRIBUTED,
       num_raw: parseCount(r.NumRaw) ?? 0,
       num_set: parseCount(r.NumSet) ?? 0,
       num_cnf: parseCount(r.NumCnf) ?? 0,
@@ -43,13 +67,21 @@ export function parseSourceCostCsv(text) {
       num_sat: parseCount(r.NumSat) ?? 0,
       num_sold: parseCount(r.NumSold) ?? 0,
       num_net_sold: parseCount(r.NumNetSold) ?? 0,
-      gsa_cents: parseMoneyCents(r.GSA) ?? 0,
-      nsa_cents: parseMoneyCents(r.NSA) ?? 0,
-      mcost_cents: parseMoneyCents(r.MCost) ?? 0,
-      working_cents: parseMoneyCents(r.WorkingAmount) ?? 0,
+      gsa_cents: money(r.GSA, subCentColumns, 'GSA'),
+      nsa_cents: money(r.NSA, subCentColumns, 'NSA'),
+      mcost_cents: money(r.MCost, subCentColumns, 'MCost'),
+      working_cents: money(r.WorkingAmount, subCentColumns, 'WorkingAmount'),
     };
   });
-  return { rows, header: { periodStart, periodEnd, asOf } };
+  return {
+    rows,
+    header: {
+      periodStart, periodEnd, asOf,
+      generatedAt: generatedAt?.iso ?? null,
+      generatedAtTruncated: Boolean(generatedAt && generatedAt.isMidnight && !generatedAt.hadTime),
+    },
+    subCentColumns: [...new Set(subCentColumns)],
+  };
 }
 
 /** Column sums — the control totals the finalize RPC re-asserts. All cents/counts. */

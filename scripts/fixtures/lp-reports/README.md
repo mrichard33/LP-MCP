@@ -81,3 +81,56 @@ untouched — those are what the goldens assert, and an earlier pass that masked
 them turned `BOCA` into `Bxxx` and `49` into `55`. Verify by parsing the
 redacted file: it must produce the identical 1,194 rows, ten bands and zero
 warnings as the original.
+
+---
+
+## CSV fixtures (the go-forward format)
+
+LP now schedules CSV exports, so CSV is the format all five reports arrive in
+and the PDF fixtures above are legacy. `scripts/test-lp-csv-cutover.js` runs
+against these.
+
+| File | Report | Provenance |
+|---|---|---|
+| `report-137-sales-efficiency-ytd.csv` | 137 Sales Efficiency | **REAL** — the 2026-08-05 YTD export, 10 branch rows, cents-exact |
+| `report-133-jobs-by-status.csv` | 133 Jobs By Status | synthetic |
+| `report-134-jobs-by-milestone.csv` | 134 Jobs by Milestone Date | synthetic |
+| `report-135-lead-disposition.csv` | 135 Lead Disposition Detail | synthetic |
+| `report-136-source-cost.csv` | 136 Marketing Sub-Source Cost 2 | synthetic |
+
+### Why four of them are synthetic, and what that costs
+
+The raw 133/134/135/136 CSVs from the 2026-08-06 03:00 batch were not available
+when these were written, and 135 carries name, phone, email and street address
+for ~1,194 people while 133 carries customer names, phones, emails and free-text
+HOA notes. Inventing numbers that *look* like a real export and committing them
+as if they were real is worse than having no fixture — so these four are openly
+synthetic: correct headers, correct column order, LP's real value *shapes*, and
+every structural property the parsers must handle. They do not carry real
+figures and no test asserts a business total against them.
+
+What they DO pin, and pin genuinely:
+
+- **133** — newlines inside quoted `MostRecentNoteHOA` fields. The file is 10
+  physical lines and 5 records; anything that splits on `\n` corrupts it.
+- **134** — the three money notations LP mixes in ONE column (`21750.00`,
+  `17250`, `0.0000`) plus rows with genuine cents (`27310.47`, `33475.83`) that
+  must survive parsing.
+- **135** — the discriminator columns and the `0.0000` money form.
+- **136** — the blank-`descr` row (a real unattributed sub-source bucket, 3 raw
+  leads) and duplicate sub-source names on distinct rows.
+
+### Replacing them with the real thing
+
+Drop the real export in under the same filename and the tests tighten
+automatically — they assert structure, not the synthetic values. Redact first;
+PII in the repo is not approved:
+
+1. Save the scheduled-email attachment as `report-1NN-<slug>.csv`.
+2. Replace names, phones, emails and street addresses with synthetic values.
+   **Preserve row count, column count and order, embedded newlines, and every
+   numeric value exactly** — those are what the goldens assert.
+3. `npm test` — the suite must stay green. If a total moves, the redaction
+   touched a number and must be redone.
+
+Same doctrine as the PDF fixtures above: mask glyphs, never structure.

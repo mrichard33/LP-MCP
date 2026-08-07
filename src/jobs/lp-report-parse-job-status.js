@@ -26,7 +26,7 @@
 // of 940 rows carry it).
 
 import { parseMoneyCents } from './lp-report-common.js';
-import { csvToObjects, parseCsvDate } from './lp-report-csv-common.js';
+import { csvToObjects, parseCsvDate, parseCsvDateTimeET } from './lp-report-csv-common.js';
 
 /** Verbatim LP status → bucket. All 23 statuses in the 2026-08-05 export. */
 export const JOB_STATUS_BUCKET_MAP = {
@@ -71,11 +71,17 @@ const REQUIRED = ['cst_id', 'contractid', 'contractdate', 'grossamount', 'NETDAT
  */
 export function parseJobStatusCsv(text) {
   const { rows: raw } = csvToObjects(text, REQUIRED);
-  let periodStart = null, periodEnd = null, asOf = null;
+  let periodStart = null, periodEnd = null, asOf = null, generatedAt = null;
   const rows = raw.map((r) => {
     periodStart ??= parseCsvDate(r.SDate);
     periodEnd ??= parseCsvDate(r.EDate);
-    asOf ??= parseCsvDate(r.CurrentDateTime);
+    // Full timestamp, not just the date: this is the coverage-as-of value
+    // behind is_partial_month, and truncating it loses the only signal of how
+    // much of the period the file actually contains.
+    if (!generatedAt) {
+      const gen = parseCsvDateTimeET(r.CurrentDateTime);
+      if (gen) { generatedAt = gen; asOf ??= parseCsvDate(r.CurrentDateTime); }
+    }
     const status_raw = String(r.descr ?? '').trim();
     return {
       cst_id: String(r.cst_id ?? '').trim(),
@@ -94,7 +100,14 @@ export function parseJobStatusCsv(text) {
       notes_raw: String(r.UNotes ?? '').trim() || null,
     };
   });
-  return { rows, header: { periodStart, periodEnd, asOf } };
+  return {
+    rows,
+    header: {
+      periodStart, periodEnd, asOf,
+      generatedAt: generatedAt?.iso ?? null,
+      generatedAtTruncated: Boolean(generatedAt && generatedAt.isMidnight && !generatedAt.hadTime),
+    },
+   };
 }
 
 /**

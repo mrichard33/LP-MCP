@@ -46,14 +46,18 @@ test('parse: integer-dollar and cents GSA both land as exact cents', () => {
   assert.equal(header.periodEnd, '2026-08-05');
 });
 
-test('parse: duplicate descr rows and blank descr rows are kept', () => {
+test('parse: duplicate descr rows are kept, blank descr becomes UNATTRIBUTED', () => {
+  // The blank-descr row is REAL DATA — an unattributed sub-source bucket
+  // carrying 3 raw leads in the 2026-08-06 export. It used to store NULL, which
+  // is indistinguishable from a parse failure and invites a reader to skip it.
+  // Naming the bucket keeps those leads counted (§F).
   const { rows } = parseSourceCostCsv(csv(
     row({ descr: 'Customer Referral' }),
     row({ descr: 'Customer Referral', NumRaw: '96' }),
     row({ descr: '' }),
   ));
   assert.equal(rows.length, 3);
-  assert.equal(rows[2].sub_source, null);
+  assert.equal(rows[2].sub_source, 'UNATTRIBUTED');
   assert.deepEqual(rows.map((r) => r.row_num), [1, 2, 3]);
 });
 

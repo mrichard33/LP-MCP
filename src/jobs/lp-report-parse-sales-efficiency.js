@@ -33,7 +33,7 @@
 // CSV carries cents and asserts exactly.
 
 import { parseMoneyCents, parseDateMDY } from './lp-report-common.js';
-import { csvToObjects, parseCsvDate, parseCount } from './lp-report-csv-common.js';
+import { csvToObjects, parseCsvDate, parseCount , parseCsvDateTimeET } from './lp-report-csv-common.js';
 import { resolveMarketFromBranch } from './market-resolver.js';
 
 // Verbatim branch labels 137 prints (Grouper / row label). RFED appears when
@@ -50,11 +50,17 @@ const CSV_REQUIRED = ['Grouper', 'NumIssued', 'NumSale', 'NumNetIssued', 'NumSat
  */
 export function parseSalesEfficiencyCsv(text) {
   const { rows: raw } = csvToObjects(text, CSV_REQUIRED);
-  let periodStart = null, periodEnd = null, asOf = null;
+  let periodStart = null, periodEnd = null, asOf = null, generatedAt = null;
   const rows = raw.map((r, i) => {
     periodStart ??= parseCsvDate(r.SDate);
     periodEnd ??= parseCsvDate(r.EDate);
-    asOf ??= parseCsvDate(r.CurrentDateTime);
+    // Full timestamp, not just the date: this is the coverage-as-of value
+    // behind is_partial_month, and truncating it loses the only signal of how
+    // much of the period the file actually contains.
+    if (!generatedAt) {
+      const gen = parseCsvDateTimeET(r.CurrentDateTime);
+      if (gen) { generatedAt = gen; asOf ??= parseCsvDate(r.CurrentDateTime); }
+    }
     return {
       row_num: i + 1,
       branch_code_raw: String(r.Grouper ?? '').trim(),
@@ -75,7 +81,15 @@ export function parseSalesEfficiencyCsv(text) {
       hold_cents: parseMoneyCents(r.GSAHold) ?? 0,
     };
   });
-  return { rows, header: { periodStart, periodEnd, asOf }, mode: 'full' };
+  return {
+    rows,
+    header: {
+      periodStart, periodEnd, asOf,
+      generatedAt: generatedAt?.iso ?? null,
+      generatedAtTruncated: Boolean(generatedAt && generatedAt.isMidnight && !generatedAt.hadTime),
+    },
+    mode: 'full',
+  };
 }
 
 // ── PDF parsing ─────────────────────────────────────────────────────────────
@@ -100,13 +114,29 @@ function parseWindow(text) {
   return { periodStart: parseDateMDY(m[1]), periodEnd: parseDateMDY(m[2]) };
 }
 
+/** Parse the page-footer run stamp: '8/5/2026 2:22PM' → '2026-08-05'. */
+function parsePrintedAt(text) {
+  const m = text.match(/(\d{1,2}\/\d{1,2}\/\d{4})\s+\d{1,2}:\d{2}\s*[AP]M/i);
+  return m ? parseDateMDY(m[1]) : null;
+}
+
 /**
  * Parse the 137 PDF (pdftotext -layout output).
+ *
+ * ══ LEGACY / FROZEN — new ingests are CSV ══
+ * LP now schedules CSV exports, and parseSalesEfficiencyCsv above is the
+ * go-forward path: it reads named columns and cannot slide a value into the
+ * wrong field. This band parser exists only to replay the 18 PDF snapshots
+ * already in history. Do not extend it, do not add FIELD_SETS entries, and do
+ * not recalibrate bands from the header — repair mislabeled history by
+ * re-sending the period as CSV, which supersedes via normal promotion.
  *
  * Column bands come from the Total row: with the NSLI band dropped, an
  * even count of remaining bands pairs up (count, volume) right-to-left
  * after the three leading singles (Gross Iss, Net Iss, Demo) and one
  * Close pair — i.e. 13 data bands = counts_only (no Net), 15 = full.
+ * The 13 case is only trustworthy while the period is still open; see the
+ * fail-closed gate below.
  *
  * @returns {{ rows: object[], header: {periodStart, periodEnd, asOf},
  *             mode: 'full'|'counts_only', totals: object }}
@@ -148,6 +178,30 @@ export function parseSalesEfficiencyPdf(text) {
   if (!fields) {
     return { rows: [], header: { periodStart, periodEnd, asOf: null }, mode: 'unparseable', totals: null, error: `unexpected_band_count_${dataBands.length}` };
   }
+
+  // ── FAIL CLOSED ON THE AMBIGUOUS 13 (§G) ─────────────────────────────────
+  // A 13-band Total row means ONE (count, volume) pair did not print, and the
+  // count alone cannot say WHICH. FIELD_SETS[13] assumes the absent pair is the
+  // last one, Net — true for a month still in flight, where net requires
+  // completion. It is NOT true for a closed month with an empty bucket: March
+  // 2026 printed no Hold-HOA activity, so Net slid into the Hold slot and
+  // $8,357,993 of net sales was stored as hold_cents with nsa_cents NULL, with
+  // no complaint. That silent guess is the defect.
+  //
+  // The file states its own run date in the page footer, so coverage decides
+  // it: a run at or before period_end is still accumulating and may legitimately
+  // lack Net; a run after period_end describes a closed period and MUST print
+  // all six pairs. No run date means we cannot prove partial coverage — reject.
+  const printedAt = parsePrintedAt(text);
+  const partialCoverage = Boolean(printedAt && periodEnd && printedAt <= periodEnd);
+  if (dataBands.length === 13 && !partialCoverage) {
+    return {
+      rows: [], header: { periodStart, periodEnd, asOf: printedAt }, mode: 'unparseable', totals: null,
+      error: 'unexpected_band_count_13',
+      detail: { printed_at: printedAt, period_end: periodEnd, bands: 13 },
+    };
+  }
+
   const mode = dataBands.length === 15 ? 'full' : 'counts_only';
   const bandEdges = dataBands.map((t) => t.end);
   const nsliEdge = totalTokens[totalTokens.length - 1].end;
@@ -192,7 +246,7 @@ export function parseSalesEfficiencyPdf(text) {
     totals[f] = f.endsWith('_cents') ? parseMoneyCents(t.text) : parseCount(t.text);
   });
 
-  return { rows, header: { periodStart, periodEnd, asOf: null }, mode, totals, misaligned };
+  return { rows, header: { periodStart, periodEnd, asOf: printedAt }, mode, totals, misaligned };
 }
 
 /**
