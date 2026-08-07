@@ -33,8 +33,8 @@
  *     errors — better to double-process during infra issues than drop a lead).
  *   - Appointment arrives as appt_date + appt_slot (ET wall-clock by
  *     definition — see canvassing-time.js). Never invent a time.
- *   - LP addLead legacy path, srs_id from the affiliate registry, 3 attempts
- *     w/ exponential backoff; tolerant in1_id parse; failures card an operator
+ *   - LP addLead legacy path, srs_id supplied by the workflow, 3 attempts w/
+ *     exponential backoff; tolerant in1_id parse; failures card an operator
  *     channel instead of dying silently.
  *   - in1_id written back to GHL field "LP Inbound Lead ID";
  *     affiliate.lead_created emitted for the Decision Engine.
@@ -70,75 +70,42 @@ import { FIELD_LP_INBOUND_LEAD_ID } from './canvassing-lead-handler.js';
 export { FIELD_LP_INBOUND_LEAD_ID };
 
 // ═══════════════════════════════════════════════════════════════════
-// Attribution registry — FAILS CLOSED
+// Attribution
 // ═══════════════════════════════════════════════════════════════════
 
 /**
- * Affiliate → LP SubSource registry, from env AFFILIATE_SRS_MAP (JSON object
- * mapping affiliate_code → srs_id string), e.g. {"lead-pilot":"871"}.
+ * ATTRIBUTION COMES FROM THE PAYLOAD.
+ *
+ * The GHL workflow sends srs_id (the LP SubSource ID) alongside affiliate_code
+ * as customData, and this handler posts what it is given. Same shape as the
+ * canvassing event-booth path, which carries a per-event srs_id.
  *
  * Mark's decision 2026-08-07: ONE SubSource PER AFFILIATE, from day one. A
  * shared pilot bucket cannot be split later without rewriting attribution
  * history — see sql/054_consolidate_source_mappings.sql for what that costs.
+ * That decision is unchanged; only WHERE the ID lives moved, from an env
+ * registry to the workflow itself, so onboarding an affiliate is a pure GHL
+ * change with no deploy and no infra edit.
  *
- * FAILS CLOSED. An unknown affiliate_code is a 400, never a fallback. Falling
- * back to canvassing 344 would silently file affiliate leads under Canvass and
- * destroy the exact comparison this pilot exists to produce.
+ * The trade-off Mark accepted (2026-08-07, after the registry shipped in
+ * PR #643): the handler cannot tell a correct SubSource ID from a plausible
+ * wrong one, so a mistyped literal in the workflow misattributes silently and
+ * permanently — no 400, no card. src/lp-source-ids.js documents that exact
+ * failure mode costing 670 leads across two source records. Verify a new
+ * affiliate's first live lead lands under the SubSource you expect BEFORE
+ * letting volume through; there is no server-side net under it.
  *
- * pro_id is NOT sent. srs_id answers WHERE the lead came from, which is the
- * affiliate; pro_id answers WHO procured it and belongs to an LP promoter
- * employee record that affiliates do not have. src/lp-source-ids.js documents
- * the transposition that cost 670 leads across two source records — do not
- * invent a pro_id to fill the slot.
- *
- * Parsed ONCE at module load inside try/catch: malformed JSON logs loudly and
- * yields an EMPTY map, so every lead 400s visibly rather than one lead quietly
- * landing under the wrong source.
+ * What this handler still refuses to do is INVENT attribution:
+ *   - there is no default srs_id and no fallback constant, so a workflow that
+ *     omits srs_id gets a 400 rather than quietly borrowing another source's
+ *     identity (canvassing's own path defaults to 344 when srs_id is absent —
+ *     deliberately not copied, because for an affiliate that default would be
+ *     the single worst possible wrong answer);
+ *   - pro_id is NOT sent at all. srs_id answers WHERE the lead came from,
+ *     which is the affiliate; pro_id answers WHO procured it and belongs to an
+ *     LP promoter employee record that affiliates do not have. Never invent one
+ *     to fill the slot.
  */
-function parseAffiliateSrsMap(raw) {
-  if (raw === undefined || raw === null || !String(raw).trim()) return {};
-  try {
-    const parsed = JSON.parse(String(raw));
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error('AFFILIATE_SRS_MAP must be a JSON object');
-    }
-    const out = {};
-    for (const [code, srs] of Object.entries(parsed)) {
-      const c = String(code || '').trim().toLowerCase();
-      const s = String(srs === null || srs === undefined ? '' : srs).trim();
-      if (c && s) out[c] = s;
-    }
-    return out;
-  } catch (err) {
-    console.error(
-      `[Affiliate] AFFILIATE_SRS_MAP is MALFORMED (${err.message}) — registry is EMPTY and ` +
-      'every affiliate lead will be rejected with 400 until it is fixed. This is deliberate: ' +
-      'a silent fallback would misattribute affiliate leads to Canvass 344.'
-    );
-    return {};
-  }
-}
-
-const AFFILIATE_SRS_MAP = parseAffiliateSrsMap(process.env.AFFILIATE_SRS_MAP);
-
-// Startup line §9 verification reads: zero codes means the JSON is malformed
-// or the var is unset, and no affiliate lead can post until that is fixed.
-console.log(
-  `[Affiliate] SubSource registry loaded: ${Object.keys(AFFILIATE_SRS_MAP).length} affiliate code(s)` +
-  `${Object.keys(AFFILIATE_SRS_MAP).length ? ` [${Object.keys(AFFILIATE_SRS_MAP).join(', ')}]` : ' — route will 400 every lead'}`
-);
-
-/** Resolve an affiliate_code to its LP SubSource ID, or null when unknown. */
-export function resolveAffiliateSrsId(affiliateCode) {
-  const key = String(affiliateCode === null || affiliateCode === undefined ? '' : affiliateCode)
-    .trim().toLowerCase();
-  return (key && AFFILIATE_SRS_MAP[key]) || null;
-}
-
-/** Registered affiliate codes (diagnostics + error messages). */
-export function knownAffiliateCodes() {
-  return Object.keys(AFFILIATE_SRS_MAP);
-}
 
 export const AFFILIATE_SENDER = 'GHL-Affiliate';
 export const AFFILIATE_VERSION = 'v1';
@@ -300,19 +267,21 @@ export function validateAffiliatePayload(rawBody) {
     errors.push(`affiliate_version must be "${AFFILIATE_VERSION}" (got "${version || '(empty)'}")`);
   }
 
-  // FAIL CLOSED. An affiliate_code absent from the registry is a hard 400 —
-  // never a fallback to canvassing 344. This gate is the single thing standing
-  // between a mistyped workflow literal and permanently misattributed leads.
+  // affiliate_code is the pilot's audit key — it stamps every mark row, card,
+  // and emitted event, so a per-affiliate volume/failure query never has to
+  // join out. Required, but its VALUE is not checked against anything.
   const affiliateCode = trim(body.affiliate_code).toLowerCase();
-  const srsId = resolveAffiliateSrsId(affiliateCode);
-  if (!affiliateCode) {
-    errors.push('affiliate_code is required');
-  } else if (!srsId) {
-    const known = knownAffiliateCodes();
-    errors.push(
-      `affiliate_code "${affiliateCode}" is not in AFFILIATE_SRS_MAP ` +
-      `(known: ${known.length ? known.join(', ') : '(none — registry empty or malformed)'})`
-    );
+  if (!affiliateCode) errors.push('affiliate_code is required');
+
+  // srs_id is required to be PRESENT and is otherwise taken at face value —
+  // there is no allowlist and no registry. Presence alone is gated because
+  // there is no legitimate default: LP addLead rejects a blank srs_id anyway,
+  // and a loud 400 naming the missing key beats a 202 followed by an async LP
+  // error. Deliberately NOT mirroring canvassing's `p.srs_id || '344'` — for an
+  // affiliate lead that fallback is the single worst possible wrong answer.
+  const srsId = trim(body.srs_id);
+  if (!srsId) {
+    errors.push('srs_id is required (the LP SubSource ID for this affiliate; there is no default)');
   }
 
   if (errors.length) return { ok: false, errors, normalized: null };
@@ -412,10 +381,12 @@ export function buildAffiliateLeadFields(p, appt) {
     zip: p.zip,
     phone: nationalPhone,
     sender: AFFILIATE_SENDER,
-    // Resolved from the registry by the validator. NO pro_id key at all —
-    // srs_id is WHERE, pro_id is WHO, and affiliates have no LP promoter
-    // record. Never invent one to fill the slot.
-    srs_id: p.srs_id || '',
+    // Straight from the payload — the workflow owns attribution. No fallback
+    // constant here on purpose: `|| '344'` would turn a workflow that forgot
+    // srs_id into a silent stream of Canvass-attributed affiliate leads. NO
+    // pro_id key at all either — srs_id is WHERE, pro_id is WHO, and affiliates
+    // have no LP promoter record. Never invent one to fill the slot.
+    srs_id: p.srs_id,
     productID: 'Win',
     proddescr: 'Win',
     notes,

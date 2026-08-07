@@ -1,15 +1,18 @@
 /**
  * test-affiliate-lead-handler.js — POST /webhooks/affiliate-lead pipeline.
  *
- * Exercises the fail-closed SubSource registry, validation, the 24h
- * idempotency marks, the LP field map, state normalization, the consent
- * key-existence switch, the partial-appointment guard, the failure paths, and
- * the derived appointment_set on the emitted event — all against injected
- * mocks (no network, no DB).
+ * Exercises validation, payload-supplied attribution, the 24h idempotency
+ * marks, the LP field map, state normalization, the consent key-existence
+ * switch, the partial-appointment guard, the failure paths, and the derived
+ * appointment_set on the emitted event — all against injected mocks (no
+ * network, no DB).
  *
- * The single most important test in this file is the unknown-affiliate_code
- * guard: it is what stands between a mistyped GHL workflow literal and
- * permanently misattributed affiliate leads.
+ * srs_id is supplied by the GHL workflow and taken at face value: the handler
+ * cannot tell a correct SubSource ID from a plausible wrong one, so a typo in
+ * the workflow misattributes silently (Mark's call, 2026-08-07). What IS still
+ * guarded — and what the two ATTRIBUTION tests below exist to keep guarded — is
+ * that the handler never INVENTS attribution: a missing srs_id is a 400, and
+ * the canvassing SubSource 344 appears nowhere in the module as a fallback.
  */
 
 import test from 'node:test';
@@ -20,9 +23,10 @@ import assert from 'node:assert/strict';
 delete process.env.SUPABASE_URL;
 delete process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// The registry parses ONCE at module load — this must be set before the import
-// below, not after.
-process.env.AFFILIATE_SRS_MAP = '{"lead-pilot":"871","second-affiliate":"872"}';
+// Attribution is NOT configured by env — the workflow sends srs_id. Deleted
+// explicitly so a stale AFFILIATE_SRS_MAP in the ambient environment could
+// never make these tests pass for the wrong reason.
+delete process.env.AFFILIATE_SRS_MAP;
 process.env.AFFILIATE_WINDOW_DAYS = '21';
 
 const {
@@ -30,7 +34,6 @@ const {
   buildAffiliateLeadFields,
   processAffiliateLead,
   findRecentAffiliateMark,
-  resolveAffiliateSrsId,
   normalizeState,
   consentGranted,
   AFFILIATE_SENDER,
@@ -49,6 +52,7 @@ function validPayload(overrides = {}) {
   const { normalized } = validateAffiliatePayload({
     affiliate_version: 'v1',
     affiliate_code: 'lead-pilot',
+    srs_id: '871',
     ghl_contact_id: 'CONTACT123',
     first_name: 'Test',
     last_name: 'Homeowner',
@@ -153,36 +157,36 @@ function mockDeps({ addLeadImpl, client } = {}) {
 
 // ─── 1. Structural gates ────────────────────────────────────────
 
-test('validation: structural gates are ghl_contact_id + affiliate_version + affiliate_code', () => {
+test('validation: structural gates are ghl_contact_id + affiliate_version + affiliate_code + srs_id', () => {
   assert.equal(validateAffiliatePayload(null).ok, false);
   assert.equal(validateAffiliatePayload('nope').ok, false);
 
+  const base = { affiliate_version: 'v1', affiliate_code: 'lead-pilot', srs_id: '871' };
+
   // Missing ghl_contact_id.
-  const noId = validateAffiliatePayload({ affiliate_version: 'v1', affiliate_code: 'lead-pilot' });
+  const noId = validateAffiliatePayload({ ...base });
   assert.equal(noId.ok, false);
   assert.ok(noId.errors.some((e) => /ghl_contact_id/.test(e)));
 
   // Wrong affiliate_version — must be exactly "v1".
-  const badVersion = validateAffiliatePayload({
-    ghl_contact_id: 'X', affiliate_version: 'v2', affiliate_code: 'lead-pilot',
-  });
+  const badVersion = validateAffiliatePayload({ ...base, ghl_contact_id: 'X', affiliate_version: 'v2' });
   assert.equal(badVersion.ok, false);
   assert.ok(badVersion.errors.some((e) => /affiliate_version/.test(e)));
 
   // Absent affiliate_version reports "(empty)" rather than swallowing it.
-  const noVersion = validateAffiliatePayload({ ghl_contact_id: 'X', affiliate_code: 'lead-pilot' });
+  const noVersion = validateAffiliatePayload({
+    ghl_contact_id: 'X', affiliate_code: 'lead-pilot', srs_id: '871',
+  });
   assert.equal(noVersion.ok, false);
   assert.ok(noVersion.errors.some((e) => /\(empty\)/.test(e)));
 
-  // Missing affiliate_code.
-  const noCode = validateAffiliatePayload({ ghl_contact_id: 'X', affiliate_version: 'v1' });
+  // Missing affiliate_code — the pilot's per-affiliate audit key.
+  const noCode = validateAffiliatePayload({ ghl_contact_id: 'X', affiliate_version: 'v1', srs_id: '871' });
   assert.equal(noCode.ok, false);
   assert.ok(noCode.errors.some((e) => /affiliate_code is required/.test(e)));
 
   // Missing contact data is NOT a structural failure — accepted, skipped async.
-  const minimal = validateAffiliatePayload({
-    ghl_contact_id: 'X', affiliate_version: 'v1', affiliate_code: 'lead-pilot',
-  });
+  const minimal = validateAffiliatePayload({ ...base, ghl_contact_id: 'X' });
   assert.equal(minimal.ok, true);
   assert.equal(minimal.normalized.ghl_contact_id, 'X');
 });
@@ -197,6 +201,7 @@ test('validation: reads customData (GHL standard Webhook action nests declared k
       ghl_contact_id: 'CD1',
       affiliate_version: 'v1',
       affiliate_code: 'lead-pilot',
+      srs_id: '871',
       first_name: 'Ada',
     },
   });
@@ -207,7 +212,7 @@ test('validation: reads customData (GHL standard Webhook action nests declared k
   // Stringified customData is the same story.
   const stringified = validateAffiliatePayload({
     customData: JSON.stringify({
-      ghl_contact_id: 'CD2', affiliate_version: 'v1', affiliate_code: 'lead-pilot',
+      ghl_contact_id: 'CD2', affiliate_version: 'v1', affiliate_code: 'lead-pilot', srs_id: '871',
     }),
   });
   assert.equal(stringified.ok, true);
@@ -219,6 +224,7 @@ test('validation: trims payload strings and lowercases affiliate_code', () => {
     ghl_contact_id: ' C1 ',
     affiliate_version: 'v1',
     affiliate_code: ' Lead-Pilot ',
+    srs_id: ' 871 ',
     first_name: '  Ada ',
     appt_slot: ' 2:00 pm ',
   });
@@ -230,41 +236,58 @@ test('validation: trims payload strings and lowercases affiliate_code', () => {
 
 // ─── 2. Attribution regression guard (THE important one) ────────
 
-test('ATTRIBUTION: unknown affiliate_code is REJECTED and never falls back to 344', () => {
+test('ATTRIBUTION: a missing srs_id is REJECTED — no default, never a fallback to 344', () => {
   const bad = validateAffiliatePayload({
     ghl_contact_id: 'X',
     affiliate_version: 'v1',
-    affiliate_code: 'nope',
+    affiliate_code: 'lead-pilot',
+    // srs_id deliberately absent
     first_name: 'Test', phone_raw: '9545551234', address1: '1 Main',
     city: 'Delray Beach', state: 'FL', zip: '33446',
   });
 
-  assert.equal(bad.ok, false, 'an unregistered affiliate_code must fail closed');
-  assert.equal(bad.normalized, null, 'no payload may survive an unknown affiliate_code');
-  assert.ok(
-    bad.errors.some((e) => /not in AFFILIATE_SRS_MAP/.test(e)),
-    'the error must name the registry so the operator knows where to fix it'
-  );
-  // The error lists the known codes — but must never leak a usable fallback.
+  assert.equal(bad.ok, false, 'a payload with no srs_id must fail closed');
+  assert.equal(bad.normalized, null, 'no payload may survive a missing srs_id');
+  assert.ok(bad.errors.some((e) => /srs_id is required/.test(e)));
+  // Blank is the same as absent.
   assert.equal(
-    bad.errors.some((e) => /344/.test(e)), false,
-    'canvassing 344 must not appear anywhere on the unknown-code path'
+    validateAffiliatePayload({
+      ghl_contact_id: 'X', affiliate_version: 'v1', affiliate_code: 'lead-pilot', srs_id: '   ',
+    }).ok,
+    false
   );
 
-  // And the registry itself resolves nothing for an unknown code.
-  assert.equal(resolveAffiliateSrsId('nope'), null);
-  assert.equal(resolveAffiliateSrsId(''), null);
-  assert.equal(resolveAffiliateSrsId(undefined), null);
+  // THE guard that has to survive every future refactor: there is no fallback
+  // constant anywhere on this path. Canvassing does `p.srs_id || '344'`, and
+  // copying that here would turn a workflow that forgot srs_id into a silent
+  // stream of Canvass-attributed affiliate leads — unfixable after the fact
+  // without rewriting attribution history.
+  const blank = buildAffiliateLeadFields({ ...validPayload(), srs_id: '' }, null);
+  assert.equal(blank.srs_id, '', 'a blank srs_id must stay blank, never become 344');
+  assert.notEqual(blank.srs_id, '344');
+});
+
+test('ATTRIBUTION: module contains no hardcoded canvassing SubSource', async () => {
+  // Belt-and-suspenders on the test above: catches a 344 default reintroduced
+  // anywhere in the module, including on a path no test happens to exercise.
+  const { readFile } = await import('node:fs/promises');
+  const src = await readFile(new URL('../src/affiliate-lead-handler.js', import.meta.url), 'utf8');
+  const code = src
+    .replace(/\/\*[\s\S]*?\*\//g, '')   // strip block comments
+    .replace(/^\s*\/\/.*$/gm, '');      // strip line comments
+  assert.equal(
+    /344/.test(code), false,
+    'the canvassing SubSource 344 must not appear in affiliate handler code'
+  );
 });
 
 // ─── 3. Field map: attribution shape ────────────────────────────
 
-test('field map: srs_id from registry, sender GHL-Affiliate, and NO pro_id key', () => {
+test('field map: srs_id passed through from payload, sender GHL-Affiliate, NO pro_id key', () => {
   const p = validPayload();
   const fields = buildAffiliateLeadFields(p, apptFor(p));
 
-  assert.equal(fields.srs_id, '871', 'srs_id must come from AFFILIATE_SRS_MAP');
-  assert.notEqual(fields.srs_id, '344', 'affiliate leads must never carry the canvassing SubSource');
+  assert.equal(fields.srs_id, '871', 'srs_id must be the value the workflow sent');
   assert.equal(fields.sender, AFFILIATE_SENDER);
   assert.equal(fields.sender, 'GHL-Affiliate');
 
@@ -273,9 +296,10 @@ test('field map: srs_id from registry, sender GHL-Affiliate, and NO pro_id key',
   // src/lp-source-ids.js documents the transposition that cost 670 leads.
   assert.equal('pro_id' in fields, false, 'pro_id must not be present at all');
 
-  // A second registered affiliate resolves to its own SubSource — one bucket
-  // per affiliate, never a shared pilot bucket.
-  const p2 = validPayload({ affiliate_code: 'second-affiliate' });
+  // A second affiliate carries its own SubSource — one bucket per affiliate,
+  // never a shared pilot bucket. Nothing server-side needs to change to onboard
+  // one; the workflow supplies the ID.
+  const p2 = validPayload({ affiliate_code: 'second-affiliate', srs_id: '872' });
   assert.equal(buildAffiliateLeadFields(p2, apptFor(p2)).srs_id, '872');
 
   // Standard LP shape carried over from the canvassing field map.
@@ -349,7 +373,7 @@ test('validation + field map: flat utm_* keys assemble and ride real LP fields',
 
   // Nested still wins when a caller can send it.
   const nested = validateAffiliatePayload({
-    ghl_contact_id: 'C2', affiliate_version: 'v1', affiliate_code: 'lead-pilot',
+    ghl_contact_id: 'C2', affiliate_version: 'v1', affiliate_code: 'lead-pilot', srs_id: '871',
     utm: { source: 'nested-wins' }, utm_source: 'ignored',
   });
   assert.equal(nested.normalized.utm.source, 'nested-wins');
@@ -367,7 +391,7 @@ test('field map: blank utm keys are omitted; all-blank stays null', () => {
 
   // No utm at all → normalized.utm is null and no utm_* field is emitted.
   const none = validateAffiliatePayload({
-    ghl_contact_id: 'C3', affiliate_version: 'v1', affiliate_code: 'lead-pilot',
+    ghl_contact_id: 'C3', affiliate_version: 'v1', affiliate_code: 'lead-pilot', srs_id: '871',
   });
   assert.equal(none.normalized.utm, null);
   const bare = buildAffiliateLeadFields(none.normalized, null);
