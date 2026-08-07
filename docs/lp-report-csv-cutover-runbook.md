@@ -169,6 +169,39 @@ all as CSV.
   closed-month PDF with a 13-band Total row is exactly the March defect. Send
   that period as CSV instead. The PDF parser is frozen.
 
+## Cross-report reconciliations — read them, do not act on them
+
+Two checks in the daily 07:00 ET recon (`src/jobs/lp-report-recon.js`) compare
+one report against another. Both are **observability only**: neither can return
+`fail`, neither alerts, and neither can block a send.
+
+```sql
+SELECT recon_date, recon_type, status, comparison
+  FROM scorecard_recon_results
+ WHERE recon_type IN ('lead_count_vs_source_raw', 'se_gsa_vs_milestone_gross')
+ ORDER BY recon_date DESC, recon_type;
+```
+
+**`lead_count_vs_source_raw`** — 135 record count vs summed 136 `NumRaw` over
+the same window. Two independent views of one lead population, so a tie is the
+happy case and drift is worth a look. They tied at 1,194 on the 2026-08-06 MTD
+pull; at YTD on 2026-08-07 they sat 4 apart (78,557 vs 78,561). A handful of
+records is LP-side timing. A jump into the hundreds means one of the two feeds
+is missing a chunk of days — that is worth chasing, by hand, not by alarm.
+
+**`se_gsa_vs_milestone_gross`** — 137 per-market `GSA` vs 134 summed
+`GrossAmount`. **A large delta here is NOT a defect.** The two reports count
+different milestone bases; measured 2026-08-07 the ratio ran 1.1×–3× across
+every market and went *negative* for ORL and STPET in August. There is no
+threshold that would not fire on everything forever, which is why there isn't
+one. Read `per_market` when someone asks why two dashboards disagree; ignore it
+otherwise.
+
+Both pair on the **window**, not the scope label. When no shared window exists —
+common, since 135 is pulled MTD daily and 136 YTD — the row is written as
+`skipped` listing the windows each side actually had, so "no result" never looks
+like "never ran".
+
 ## Out of scope / still Mark's
 
 - Scheduling the `[BOPM]`/`[EOPM]` closing pull inside LeadPerfection.
