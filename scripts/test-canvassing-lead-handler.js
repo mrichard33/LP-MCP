@@ -173,7 +173,7 @@ test('field map: attribution, consent, appointment, phone, _attempts', () => {
   assert.equal(fields.appttime, '2:00 PM');
   assert.equal(fields.email, 'test@example.com');
   assert.equal(fields._attempts, 3);
-  // promoter is a name, not numeric → no pro_id; lands in notes + UTM
+  // promoter is a name, not numeric → no pro_id; lands in notes instead
   assert.equal(fields.pro_id, undefined);
   assert.match(fields.notes, /fogging since the last storm/);
   // Regression guard, 2026-08-07: counts were captured on the form and sent in
@@ -194,7 +194,42 @@ test('field map: attribution, consent, appointment, phone, _attempts', () => {
   );
   assert.match(fields.notes, /Reason for interest: fogged glass/);
   assert.match(fields.notes, /Promoter: Jordan P/);
-  assert.match(fields.notes, /UTM: source=canvassing medium=field campaign=Jordan P term=33446/);
+
+  // UTM rides real LP columns, never note text. It briefly shipped as a
+  // "UTM: source=..." note line; that line is gone and must not come back —
+  // notes are what the setter reads on the call.
+  assert.equal(fields.utm_source, 'canvassing');
+  assert.equal(fields.utm_medium, 'field');
+  assert.equal(fields.utm_campaign, 'Jordan P');
+  assert.equal(fields.utm_term, '33446');
+  assert.equal(/UTM:/.test(fields.notes), false, 'UTM must not appear in notes');
+});
+
+test('field map: blank utm keys are omitted, not sent empty', () => {
+  // Event-workflow shape: only source and medium are ever populated there.
+  const p = validPayload({ utm: { source: 'event', medium: 'staffer' } });
+  const appt = convertCanvassAppointment({ appt_date: p.appt_date, appt_slot: p.appt_slot }, NOW);
+  const fields = buildLpLeadFields(p, appt);
+  assert.equal(fields.utm_source, 'event');
+  assert.equal(fields.utm_medium, 'staffer');
+  assert.equal('utm_campaign' in fields, false);
+  assert.equal('utm_term' in fields, false);
+
+  // No utm at all → no utm_* fields, and still no note line.
+  const bare = buildLpLeadFields(validPayload({ utm: null }), appt);
+  assert.equal('utm_source' in bare, false);
+  assert.equal('utm_medium' in bare, false);
+  assert.equal(/UTM/.test(bare.notes), false);
+});
+
+test('field map: lognumber and User1 both carry the GHL contact id', () => {
+  // Both are how LP links its lead back to the GHL contact ({{contact.id}} in
+  // the workflow). ghl_contact_id is a structural requirement — validation 400s
+  // without it — so neither can ever go out blank.
+  const fields = buildLpLeadFields(validPayload(), null);
+  assert.equal(fields.lognumber, 'CONTACT123');
+  assert.equal(fields.User1, 'CONTACT123');
+  assert.equal(fields.lognumber, fields.User1);
 });
 
 test('field map: blank counts are omitted, not printed empty', () => {
@@ -226,7 +261,7 @@ test('validation: flat utm_* keys assemble into the utm object (event workflow s
   });
   assert.equal(nested.normalized.utm.source, 'canvassing');
 
-  // All-blank stays null so the note line is omitted, not printed empty.
+  // All-blank stays null so buildLpLeadFields emits no utm_* fields at all.
   const none = validateCanvassingPayload({ ghl_contact_id: 'C3', canvass_version: 'v2' });
   assert.equal(none.normalized.utm, null);
 });

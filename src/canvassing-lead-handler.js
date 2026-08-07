@@ -200,12 +200,11 @@ export function validateCanvassingPayload(rawBody) {
       appt_slot: trim(body.appt_slot),
       // GHL's Webhook action posts a FLAT key per customData entry — it has no
       // way to express a nested object. Workflow 7e01702d sends utm_source and
-      // utm_medium flat, so the object-only read below resolved to null and the
-      // UTM note line never rendered: event attribution never reached LP notes
-      // at all. Accept the nested shape first (any caller that can send it), then
-      // fall back to assembling one from the flat keys. All-blank stays null so
-      // buildLpLeadFields still omits the line rather than printing an empty
-      // "UTM: source= medium= campaign= term=".
+      // utm_medium flat, so an object-only read resolved to null and event
+      // attribution never reached LP at all. Accept the nested shape first (any
+      // caller that can send it), then fall back to assembling one from the flat
+      // keys. All-blank stays null, and buildLpLeadFields omits every utm_*
+      // field rather than posting empty strings.
       utm: (() => {
         if (body.utm && typeof body.utm === 'object' && !Array.isArray(body.utm)) return body.utm;
         const flat = {
@@ -264,8 +263,6 @@ export function buildLpLeadFields(p, appt) {
     p.second_decision_maker && `Second decision maker: ${p.second_decision_maker}`,
     p.dm_confirmed_at_door && `DM confirmed at door: ${p.dm_confirmed_at_door}`,
     p.promoter && `Promoter: ${p.promoter}`,
-    (utm.source || utm.medium || utm.campaign || utm.term) &&
-      `UTM: source=${utm.source || ''} medium=${utm.medium || ''} campaign=${utm.campaign || ''} term=${utm.term || ''}`,
   ].filter(Boolean);
 
   const includeAppt =
@@ -299,6 +296,23 @@ export function buildLpLeadFields(p, appt) {
     ConsentDate: p.consent_date || new Date().toISOString(),
     ...(p.email ? { email: p.email } : {}),
     ...(proId ? { pro_id: proId } : {}),
+    // Attribution belongs in LP's own utm columns, not in note text. It briefly
+    // shipped as a "UTM: source=... medium=..." note line (2026-08-07); that
+    // line is gone. Notes are what the setter reads on the call, and a trailing
+    // machine-readable string is noise there — worse, it padded the field with
+    // "campaign= term=" on the event path, where only source and medium are
+    // ever populated. As real fields the data is queryable in LP instead of
+    // buried in free text, and it matches what the legacy door-knock path has
+    // always sent (src/canvassing-intake.js buildAddleadBody).
+    //
+    // Each key is omitted when blank rather than sent empty — same doctrine as
+    // email and pro_id above. Deliberately NOT defaulting utm_source to
+    // 'canvassing' the way the legacy path does: this handler serves event
+    // booths too, and inventing an attribution value is worse than sending none.
+    ...(utm.source ? { utm_source: utm.source } : {}),
+    ...(utm.medium ? { utm_medium: utm.medium } : {}),
+    ...(utm.campaign ? { utm_campaign: utm.campaign } : {}),
+    ...(utm.term ? { utm_term: utm.term } : {}),
     ...(includeAppt ? { apptdate: appt.adate, appttime: appt.atime } : {}),
     _attempts: 3,
   };
