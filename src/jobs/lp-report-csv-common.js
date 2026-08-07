@@ -203,6 +203,18 @@ export const REPORT_FINGERPRINTS = [
     discriminators: ['descr', 'NumRaw', 'NumSet', 'NumCnf', 'MCost', 'WorkingAmount'] },
   { reportType: 'sales_efficiency', lpReportId: '137',
     discriminators: ['Grouper', 'NumIssued', 'NSLI', 'ClosingPct', 'NumJSC1', 'jbs1'] },
+  // 138 is the canonical Reece-series id. LP also exposes this report as
+  // ReportView `Rpt=229` — that number is only for building an on-demand URL
+  // and is deliberately absent from slugs, tables and logs. (Same two-series
+  // arrangement as 134, which is `Rpt=140`.)
+  //
+  // 137 and 138 both count issued appointments, so the sets were checked
+  // against the real headers rather than assumed: 137's discriminators hit
+  // only `NumIssued` on a 138 header, 136's hit only `NumSet`, and 138's hit
+  // exactly one column on any other report. test-lp-csv-cutover.js asserts
+  // that disjointness in both directions.
+  { reportType: 'appt_stats_by_rep_source', lpReportId: '138',
+    discriminators: ['Salesrep', 'Src_id', 'NumNetIssued', 'NumDsp1', 'Dsp1', 'Footer'] },
 ];
 
 /**
@@ -227,14 +239,34 @@ export function detectReportFromHeader(header) {
 
 /**
  * Row sort keys per report — the business key that makes content identity
- * independent of LP's sort-order parameters (§E). Keyed by report_type and
- * expressed in RAW CSV header names, since identity is computed over the
- * projection of the file, not the parsed row shape.
+ * independent of LP's sort-order parameters (§E).
+ *
+ * ⚠ THESE ARE MATCHED AGAINST THE ROWS contentSha256 IS ACTUALLY GIVEN, and
+ * ingestCsv hands it the PARSED rows, not the raw header-keyed ones. A key that
+ * names a raw CSV column therefore matches no field, `sortKeys` finds nothing to
+ * sort on, and the report is hashed in file order.
+ *
+ * The five entries below marked (inert) are in exactly that state: they name raw
+ * header columns (`id`, `contractid`, `descr`, `Grouper`) while the parsed rows
+ * carry `cst_id`, `job_number`, `sub_source`, `branch_code_raw`. Their sorting
+ * has never taken effect, so LP flipping `xSortBy` on one of those reports would
+ * fork its content hash today. The §E test in test-lp-csv-cutover.js passes
+ * because it feeds csvToObjects output — raw rows — rather than parser output.
+ *
+ * NOT repaired here, deliberately: correcting the five would change the digest
+ * of every existing snapshot, so the next ingest of any period would read as new
+ * content and supersede a perfectly good row. That is a migration with a blast
+ * radius, not a one-line fix, and it wants its own change.
+ *
+ * 138 is new and has no history to disturb, so its key names parsed fields and
+ * actually sorts.
  */
 export const CONTENT_SORT_KEYS = {
-  job_status_ytd: ['id'],
-  jobs_by_milestone: ['contractid'],
-  lead_disposition: ['id'],
-  source_cost: ['descr'],
-  sales_efficiency: ['Grouper'],
+  job_status_ytd: ['id'],            // (inert — parsed rows carry cst_id)
+  jobs_by_milestone: ['contractid'], // (inert — parsed rows carry job_number)
+  lead_disposition: ['id'],          // (inert — parsed rows carry lp_lead_id)
+  source_cost: ['descr'],            // (inert — parsed rows carry sub_source)
+  sales_efficiency: ['Grouper'],     // (inert — parsed rows carry branch_code_raw)
+  // 138's grain is one row per (rep, source); neither column alone is unique.
+  appt_stats_by_rep_source: ['salesrep_raw', 'src_id_raw'],
 };

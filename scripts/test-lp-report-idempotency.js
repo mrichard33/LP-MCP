@@ -52,17 +52,35 @@ test('PDF path: a repeat of the SAME file is a success no-op, not a new snapshot
   assert.match(branch, /return/);
 });
 
-test('CSV/PDF chunked path: duplicate check ignores UNFINALIZED snapshots', () => {
-  // A snapshot whose finalize failed (fail-closed gate) leaves a row holding
-  // the sha. Retrying the same file must be allowed to complete rather than
-  // being reported as an already-ingested duplicate — hence the
-  // finalized_at NOT NULL filter on every duplicate probe.
-  const probes = CSV.match(/\.eq\('file_sha256'[\s\S]{0,220}?maybeSingle\(\)/g) ?? [];
+test('CSV/PDF chunked path: an UNFINALIZED snapshot is an ORPHAN, not a duplicate', () => {
+  // This probe used to filter on `finalized_at IS NOT NULL`, so that a snapshot
+  // whose finalize failed could not block a retry of the same file. The intent
+  // was right; the filter never delivered it. The unique constraint on
+  // (report_type, file_sha256) carries no such filter, so the retry sailed past
+  // the probe straight into a 23505 — and duplicateResponse then reported that
+  // as a benign duplicate pointing at a snapshot holding nothing.
+  //
+  // The retry still cannot land while the orphan holds the key. What changed is
+  // that it now SAYS so: success:false + rejected:true + orphaned_snapshot,
+  // still HTTP 200 so n8n does not replay a file that is not at fault. Silence
+  // was the defect — a remediation re-send read as landed while the bad
+  // snapshot stayed current.
+  const probes = (CSV.match(/\.from\('scorecard_report_snapshots'\)[\s\S]{0,320}?maybeSingle\(\)/g) ?? [])
+    .filter((p) => p.includes("file_sha256"));
   assert.ok(probes.length > 0, 'the chunked path must probe for duplicates');
   for (const p of probes) {
-    assert.match(p, /not\('finalized_at',\s*'is',\s*null\)/,
-      'each duplicate probe must only match FINALIZED snapshots');
+    assert.ok(!/not\('finalized_at',\s*'is',\s*null\)/.test(p),
+      'no probe may filter on finalized_at — the unique constraint does not');
+    assert.match(p, /finalized_at/,
+      'but each probe must READ finalized_at, to tell an orphan from a duplicate');
   }
+
+  const helper = CSV.slice(CSV.indexOf('async function probeExistingSnapshot'));
+  const body = helper.slice(0, helper.indexOf('\n}'));
+  assert.match(body, /orphaned_snapshot/, 'the orphan is named');
+  assert.match(body, /rejected:\s*true/, 'and is a 200-shaped rejection, not a 500');
+  assert.ok(body.indexOf('!dup.finalized_at') < body.indexOf("done('duplicate'"),
+    'the orphan branch is reached before anything can be logged as a duplicate');
 });
 
 test('the database backstops dedup: UNIQUE (report_type, file_sha256)', () => {

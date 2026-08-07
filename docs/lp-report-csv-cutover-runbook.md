@@ -3,10 +3,18 @@
 **Status:** built / migration applied → verify + remediate · **Owner:** Mark · **Updated:** 2026-08-06
 
 LP can now schedule CSV exports as email attachments, so CSV becomes the ingest
-format for all five reports and the PDF parsers become legacy. This runbook is
+format for all six reports and the PDF parsers become legacy. This runbook is
 the operator half: verify the CSV path end to end, then repair the history that
 the PDF parsers got wrong — by re-sending periods as CSV, not by editing or
 deleting anything.
+
+**Six, not five, as of 2026-08-07:** report **138 Appointment Stats by Sales Rep
+with Source** now ingests. It is the only export carrying both gross and net
+issued at source grain, which is what makes a gross-basis sit rate by source —
+and the only sit rate by REP we have — computable at all. It needs no n8n
+change: `I.LPRA`'s CSV branch already posts every CSV, and LP-MCP resolves 138
+from its header. It has **no market column**, so it produces no
+`lp_report_facts` and must never be used for market attribution.
 
 > **Scope guardrail:** NO DELETES. Superseded snapshots demote to non-current
 > history through the normal promotion path and stay forever — that is the
@@ -168,6 +176,25 @@ all as CSV.
 - **`unexpected_band_count_13` from a PDF replay.** Expected and correct — a
   closed-month PDF with a 13-band Total row is exactly the March defect. Send
   that period as CSV instead. The PDF parser is frozen.
+- **`orphaned_snapshot` — READ THIS ONE BEFORE RE-SENDING ANYTHING.** It means a
+  previous ingest of the same bytes called `lp_csv_ingest_begin` successfully and
+  then failed at finalize. That dead row still holds
+  `(report_type, file_sha256)`, so the re-send cannot land until someone clears
+  it. Nothing is deleted automatically; the snapshot is inert and non-current, so
+  no reader sees it, but it does block its own replacement.
+
+  This used to be reported as `success: true, duplicate: true`, which is the
+  dangerous part — a remediation re-send of a bad month came back looking like it
+  had landed while the bad snapshot stayed live. If you are re-sending a month to
+  repair it, a `duplicate: true` response means the content was **already
+  identical** and there was nothing to repair; an `orphaned_snapshot` response
+  means the repair did **not** happen.
+- **`disposition_alias_disagreement` on 138.** A warning, never a rejection. LP
+  prints each disposition twice — once positionally (`NumDsp1..10`, labelled by
+  `Dsp1..10`) and once under a fixed name (`Num1Leg`, `NumNoHome`, …). The parser
+  decodes by label, because a label travels with its count; the fixed names are
+  the cross-check. A disagreement means LP reordered the `Dsp` slots, which is
+  worth knowing but does not make the file unreadable.
 
 ## Cross-report reconciliations — read them, do not act on them
 

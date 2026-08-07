@@ -326,14 +326,27 @@ function finalizeActuals(acc, { periodStart, periodEnd }, extra = {}) {
     deposits: 0,                         // ⚠ TIE-OUT (job/milestone field; 0 until mapped)
     revenue_basis: 'released/working/cancel v1',
     // ── Report ratios (Marketing Sub-Source By Appt Date) ──
+    //
+    // EVERY RATE HERE USES GROSS ISSUED AS ITS DENOMINATOR. LP's own printed
+    // columns do not: its NSLI is NSA ÷ NumNetIssued and its ClosingPct is
+    // NumNet ÷ NumNetIssued, both net-issue based. Verified against the real
+    // January 2026 137 export, where the printed NSLI matches NSA ÷ net issued
+    // to four decimals on every branch (BOCA 457,581 ÷ 100 = 4575.8100).
+    //
+    // Netting out cancellations before dividing flatters everything, because a
+    // cancelled appointment leaves the denominator but the numerator never had
+    // it. Company January: sit 1,566 ÷ 2,029 = 77.2% on gross against
+    // 1,566 ÷ 1,786 = 87.7% on LP's basis, and NSLI $4,314.84 against $4,901.91
+    // — a 13.6% overstatement that flows straight into leads-needed, since
+    // issues_needed = goal ÷ NSLI.
     pct_issue:     rate(issued, sets),       // Issue ÷ Set
-    demo_pct:      rate(demos, net_issue),   // Demo ÷ Net Issue
+    demo_pct:      rate(demos, issued),      // Demo ÷ GROSS Issue — the sit rate
     close_pct:     rate(sold, demos),        // % Gross Close = Sold ÷ Demo
     pct_net_close: rate(net_close, demos),   // # Net Close ÷ Demo
     good_rate_pct: rate(released_dollars, gross_sales), // released ÷ gross
     ko_pct:        rate(ko_count, sold),
     gsli:          money(gross_sales, issued),       // Gross Sale $ ÷ Issue
-    nsli:          money(net_sales, issued),         // Net Sale $ ÷ Issue (ties to report NSLI)
+    nsli:          money(net_sales, issued),         // Net Sale $ ÷ GROSS Issue
     avg_sale:      money(net_sales, net_close),      // Net Sale $ ÷ Net Close
     raw_inputs: {
       basis: 'appt_date',

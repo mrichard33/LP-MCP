@@ -354,11 +354,45 @@ test('§A/§B every ingest RPC raise site is duplicate-guarded before it throws'
 test('§A the duplicate response says success:true — n8n must not page on it', () => {
   const src = readFileSync('src/jobs/lp-report-ingest.js', 'utf8');
   const fn = src.slice(src.indexOf('export async function duplicateResponse'));
+  const body = fn.slice(0, fn.indexOf('\n}'));
   assert.match(fn, /success:\s*true/, 'a duplicate is benign');
   assert.match(fn, /duplicate:\s*true/, 'and is identified as one');
   assert.match(fn, /matched_on/, 'and says which key matched');
-  assert.ok(!/success:\s*false/.test(fn.slice(0, fn.indexOf('\n}'))),
-    'nothing on this path may report failure');
+
+  // This path used to forbid `success: false` outright. It no longer can: an
+  // UNFINALIZED match is not a duplicate, it is the corpse of an ingest whose
+  // begin succeeded and whose finalize failed, and reporting it as benign is
+  // what let a remediation re-send read as landed while nothing changed.
+  // The rule is narrower now — the ONLY failure admitted here is that orphan,
+  // and it must still be a 200-shaped rejection so n8n does not replay.
+  const failures = body.match(/success:\s*false[^}]*\}/g) ?? [];
+  assert.equal(failures.length, 1, 'exactly one failure shape on this path: the orphan');
+  assert.match(failures[0], /rejected:\s*true/, 'the orphan is a rejection, not a 500');
+  assert.match(failures[0], /orphaned_snapshot/, 'and names itself');
+});
+
+test('§A an UNFINALIZED match is an orphan, never a benign duplicate', () => {
+  const src = readFileSync('src/jobs/lp-report-ingest.js', 'utf8');
+  const finder = src.slice(src.indexOf('export async function findExistingSnapshot'));
+  assert.match(finder.slice(0, finder.indexOf('\n}')), /finalized_at/,
+    'the probe must return finalized_at — the orphan test depends on it');
+
+  const dup = src.slice(src.indexOf('export async function duplicateResponse'));
+  const guard = dup.indexOf('!hit.finalizedAt');
+  assert.ok(guard > 0, 'duplicateResponse branches on the unfinalized case');
+  assert.ok(guard < dup.indexOf("await done('duplicate'"),
+    'and does so BEFORE it can log a duplicate');
+});
+
+test('§A the pre-begin probe matches the DB constraint, filter for filter', () => {
+  const src = readFileSync('src/jobs/lp-csv-ingest.js', 'utf8');
+  // The constraint on (report_type, file_sha256) has no finalized_at predicate.
+  // A probe that carries one disagrees with it, and that disagreement is exactly
+  // how an orphan slipped past the probe into a 23505 reported as benign.
+  assert.ok(!/not\('finalized_at', 'is', null\)/.test(src),
+    'no probe may filter on finalized_at — the unique constraint does not');
+  assert.equal((src.match(/probeExistingSnapshot\(reportType, sha, done\)/g) ?? []).length, 5,
+    'one shared helper, called from all four chunked ingest paths');
 });
 
 test('§B content-level failures return 200 with rejected:true and a reason', () => {

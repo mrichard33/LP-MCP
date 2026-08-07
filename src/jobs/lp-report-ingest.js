@@ -169,7 +169,11 @@ export async function logIngest(entry) {
  * two pulls of one period differ byte-for-byte because every row embeds
  * CurrentDateTime, so file_sha256 cannot see them as the same report.
  *
- * @returns {Promise<{id: string, matchedOn: 'content_sha256'|'file_sha256'}|null>}
+ * `finalized_at` comes back with the row because an UNFINALIZED match is not a
+ * duplicate at all — it is the corpse of an ingest whose begin succeeded and
+ * whose finalize failed. See duplicateResponse below.
+ *
+ * @returns {Promise<{id: string, matchedOn: 'content_sha256'|'file_sha256', finalizedAt: string|null, isCurrent: boolean}|null>}
  */
 export async function findExistingSnapshot({ reportType, fileSha, contentSha }) {
   if (!supabase) return null;
@@ -177,9 +181,15 @@ export async function findExistingSnapshot({ reportType, fileSha, contentSha }) 
     if (!value) continue;
     const { data } = await supabase
       .from('scorecard_report_snapshots')
-      .select('id').eq('report_type', reportType).eq(column, value)
+      .select('id, finalized_at, is_current').eq('report_type', reportType).eq(column, value)
       .maybeSingle();
-    if (data) return { id: data.id, matchedOn: column };
+    if (data) {
+      return {
+        id: data.id, matchedOn: column,
+        finalizedAt: data.finalized_at ?? null,
+        isCurrent: Boolean(data.is_current),
+      };
+    }
   }
   return null;
 }
@@ -194,11 +204,49 @@ export async function findExistingSnapshot({ reportType, fileSha, contentSha }) 
  *
  * `success` MUST be true. n8n routes anything else to failure telemetry, and a
  * duplicate is not a failure — it is the system already holding the answer.
+ *
+ * ══ THE ORPHAN CASE — a duplicate that is NOT benign ══
+ *
+ * The chunked paths probe for an existing snapshot before calling begin, and
+ * that probe used to filter on `finalized_at IS NOT NULL` so an aborted ingest
+ * could not block its own corrected retry. The DB constraint on
+ * (report_type, file_sha256) carries no such filter, so the two disagreed:
+ * when begin succeeded and finalize failed, the orphan row kept the key with
+ * finalized_at NULL, the retry's probe skipped straight past it, begin raised
+ * 23505, and this function reported `duplicate: true` pointing at a snapshot
+ * that holds nothing and is not current.
+ *
+ * The caller was then told the re-send had landed when nothing had — which is
+ * precisely how a remediation re-send of a bad month would read as repaired
+ * while the bad snapshot stayed live. The probes now match the constraint (no
+ * finalized_at filter), and an unfinalized match is reported here as an ORPHAN
+ * instead of a duplicate: still HTTP 200 and still no n8n replay, because the
+ * file is fine and replaying it would only repeat this, but visibly NOT a
+ * success. Clearing the orphan is an operator action; nothing is deleted here.
  */
 export async function duplicateResponse(err, { reportType, fileSha, contentSha, done }) {
   if (!isUniqueViolation(err)) return null;
   const hit = await findExistingSnapshot({ reportType, fileSha, contentSha });
   const matchedOn = hit?.matchedOn ?? (contentSha ? 'content_sha256' : 'file_sha256');
+
+  if (hit && !hit.finalizedAt) {
+    await done('failed', {
+      snapshot_id: hit.id,
+      failure_reason: 'orphaned_snapshot',
+      detail: {
+        matched_on: matchedOn, is_current: hit.isCurrent,
+        constraint: err.details ?? err.message ?? null,
+        message: 'an earlier ingest of these bytes began but never finalized; '
+          + 'it holds the unique key, so this re-send cannot land until it is cleared',
+      },
+    });
+    return {
+      success: false, rejected: true, reason: 'orphaned_snapshot',
+      failure_reason: 'orphaned_snapshot',
+      snapshot_id: hit.id, matched_on: matchedOn, sha256: fileSha,
+    };
+  }
+
   await done('duplicate', {
     snapshot_id: hit?.id ?? null,
     detail: { matched_on: matchedOn, constraint: err.details ?? err.message ?? null },
