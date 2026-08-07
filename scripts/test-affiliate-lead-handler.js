@@ -157,7 +157,7 @@ function mockDeps({ addLeadImpl, client } = {}) {
 
 // ─── 1. Structural gates ────────────────────────────────────────
 
-test('validation: structural gates are ghl_contact_id + affiliate_version + affiliate_code + srs_id', () => {
+test('validation: structural gates are ghl_contact_id + affiliate_version + srs_id', () => {
   assert.equal(validateAffiliatePayload(null).ok, false);
   assert.equal(validateAffiliatePayload('nope').ok, false);
 
@@ -180,15 +180,56 @@ test('validation: structural gates are ghl_contact_id + affiliate_version + affi
   assert.equal(noVersion.ok, false);
   assert.ok(noVersion.errors.some((e) => /\(empty\)/.test(e)));
 
-  // Missing affiliate_code — the pilot's per-affiliate audit key.
-  const noCode = validateAffiliatePayload({ ghl_contact_id: 'X', affiliate_version: 'v1', srs_id: '871' });
-  assert.equal(noCode.ok, false);
-  assert.ok(noCode.errors.some((e) => /affiliate_code is required/.test(e)));
+  // affiliate_code is deliberately NOT a structural gate — see the dedicated
+  // test below.
 
   // Missing contact data is NOT a structural failure — accepted, skipped async.
   const minimal = validateAffiliatePayload({ ...base, ghl_contact_id: 'X' });
   assert.equal(minimal.ok, true);
   assert.equal(minimal.normalized.ghl_contact_id, 'X');
+});
+
+test('validation: affiliate_code is optional — a blank one still validates', () => {
+  // Attribution lives entirely in srs_id, which the workflow sends directly.
+  // affiliate_code is an audit label, so a workflow that does not set it must
+  // not have its leads rejected — it degrades to a blank label instead.
+  const { ok, normalized } = validateAffiliatePayload({
+    ghl_contact_id: 'C1',
+    affiliate_version: 'v1',
+    srs_id: '829',
+  });
+  assert.equal(ok, true);
+  assert.equal(normalized.affiliate_code, '');
+});
+
+test('pipeline: a lead with no affiliate_code posts normally and degrades to null', async () => {
+  const { deps, calls } = mockDeps();
+  const result = await processAffiliateLead(validPayload({ affiliate_code: '' }), deps);
+
+  assert.equal(result.outcome, 'ok');
+  assert.equal(calls.addLead.length, 1, 'a codeless lead must still reach LP');
+  assert.equal(calls.addLead[0].srs_id, '871', 'attribution is unaffected by a missing code');
+
+  // "not provided" is NULL, not an empty string, in both the audit row and the
+  // event payload — matches submitted_by and keeps GROUP BY readable.
+  assert.equal(deps.client._rows.get('CONTACT123').affiliate_code, null);
+  assert.equal(calls.events[0].payload.affiliate_code, null);
+  assert.equal(calls.events[0].payload.srs_id, '871');
+
+  // The success card must not read "Affiliate lead () posted to LP".
+  const card = calls.groupme.find((g) => g.text.includes('AFFILIATE LEAD CREATED'));
+  assert.ok(card);
+  assert.equal(/\(\)/.test(card.text), false, 'no empty parens on the operator card');
+  assert.match(card.text, /Affiliate lead posted to LP/);
+
+  // With a code, the parenthesised form is still used.
+  const { deps: d2, calls: c2 } = mockDeps();
+  await processAffiliateLead(validPayload(), d2);
+  assert.match(
+    c2.groupme.find((g) => g.text.includes('AFFILIATE LEAD CREATED')).text,
+    /Affiliate lead \(lead-pilot\) posted to LP/
+  );
+  assert.equal(d2.client._rows.get('CONTACT123').affiliate_code, 'lead-pilot');
 });
 
 test('validation: reads customData (GHL standard Webhook action nests declared keys)', () => {
