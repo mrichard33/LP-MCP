@@ -267,11 +267,13 @@ export function validateAffiliatePayload(rawBody) {
     errors.push(`affiliate_version must be "${AFFILIATE_VERSION}" (got "${version || '(empty)'}")`);
   }
 
-  // affiliate_code is the pilot's audit key — it stamps every mark row, card,
+  // affiliate_code is an audit label only — it stamps every mark row, card,
   // and emitted event, so a per-affiliate volume/failure query never has to
-  // join out. Required, but its VALUE is not checked against anything.
+  // join out. NOT required (2026-08-07): attribution lives entirely in
+  // srs_id, which the workflow sends directly, so a missing code degrades
+  // to a blank label rather than blocking the lead. When present, its VALUE
+  // is still not checked against anything.
   const affiliateCode = trim(body.affiliate_code).toLowerCase();
-  if (!affiliateCode) errors.push('affiliate_code is required');
 
   // srs_id is required to be PRESENT and is otherwise taken at face value —
   // there is no allowlist and no registry. Presence alone is gated because
@@ -465,7 +467,10 @@ export async function processAffiliateLead(payload, deps = {}) {
   const markBase = {
     dedup_key: p.ghl_contact_id,
     ghl_contact_id: p.ghl_contact_id,
-    affiliate_code: p.affiliate_code,
+    // NULL rather than '' when the workflow sends no code: the column is
+    // nullable, "not provided" is not the same as "provided as empty", and a
+    // GROUP BY on this column stays readable.
+    affiliate_code: p.affiliate_code || null,
     phone: p.phone_raw,
   };
 
@@ -652,7 +657,11 @@ export async function processAffiliateLead(payload, deps = {}) {
       ghl_contact_id: p.ghl_contact_id,
       payload: {
         ghl_contact_id: p.ghl_contact_id,
-        affiliate_code: p.affiliate_code,
+        // null, not '', when absent — matches submitted_by below and gives a
+        // future agent_rule a clean existence check. No rule consumes this
+        // event yet, so settling the shape now costs nothing; changing it
+        // after one does would be a contract break.
+        affiliate_code: p.affiliate_code || null,
         srs_id: fields.srs_id,
         // DERIVED server-side: did an appointment actually post to LP? Computed
         // truth, never a client assertion — an affiliate can send appointment
@@ -675,12 +684,15 @@ export async function processAffiliateLead(payload, deps = {}) {
         action_verb: 'AFFILIATE LEAD CREATED',
         payload: p,
         appointmentDisplay: apptDisplay,
-        narrative: `Affiliate lead (${p.affiliate_code}) posted to LP${in1Id ? ` (inbound #${in1Id})` : ''}${apptDisplay ? ' as Set' : ' without an appointment'}.`,
+        // The code is parenthesised only when there is one — a blank
+        // affiliate_code is legal (attribution rides srs_id), and "Affiliate
+        // lead () posted to LP" reads like a bug on the operator's card.
+        narrative: `Affiliate lead${p.affiliate_code ? ` (${p.affiliate_code})` : ''} posted to LP${in1Id ? ` (inbound #${in1Id})` : ''}${apptDisplay ? ' as Set' : ' without an appointment'}.`,
       }),
       cardOpts()
     );
 
-    console.log(`[Affiliate] ${p.ghl_contact_id} (${p.affiliate_code} → srs_id ${fields.srs_id}) → LP ok in1_id=${in1Id || '(none)'} appt=${appt.status}`);
+    console.log(`[Affiliate] ${p.ghl_contact_id} (${p.affiliate_code || '(no code)'} → srs_id ${fields.srs_id}) → LP ok in1_id=${in1Id || '(none)'} appt=${appt.status}`);
     return { outcome: 'ok', in1_id: in1Id || null, appt_status: appt.status };
   } catch (err) {
     // Belt-and-suspenders: nothing above should throw, but a webhook pipeline
