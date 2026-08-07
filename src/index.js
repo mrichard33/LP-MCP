@@ -88,6 +88,8 @@ import { registerEntryEventRoutes } from './entry-event-handler.js';
 import { registerGhlTagRoutes } from './ghl-tag-handler.js';
 // ─── Canvassing Pilot v2 intake (I.CV → LP) ──────────────────────
 import { registerCanvassingLeadRoutes } from './canvassing-lead-handler.js';
+// ─── Affiliate lead intake (per-affiliate GHL form → LP) ─────────
+import { registerAffiliateLeadRoutes } from './affiliate-lead-handler.js';
 // ─── IME MIC Integration ─────────────────────────────────────────
 import { registerImeRoutes, startImeWorkers } from './ime/index.js';
 // ─── MVI v2.5 — Antifragile services ─────────────────────────────
@@ -973,6 +975,13 @@ registerGhlTagRoutes(app);
 
 // ─── Canvassing Pilot v2 intake (I.CV → LP) ──────────────────────
 registerCanvassingLeadRoutes(app);
+
+// ─── Affiliate lead intake (per-affiliate GHL form → LP) ─────────
+// Deliberately separate from the canvassing route: different dedup table,
+// different sender, its own fail-closed SubSource registry, and a 21-day
+// booking window. See src/affiliate-lead-handler.js.
+//   POST /webhooks/affiliate-lead
+registerAffiliateLeadRoutes(app);
 
 // ─── GHL Inbound → LP Note pipeline ──────────────────────────────
 // Turns GHL inbound conversations into one clean facts-only LP note per

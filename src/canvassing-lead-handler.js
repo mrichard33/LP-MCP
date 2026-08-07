@@ -50,6 +50,7 @@ import {
   EVENT_WINDOW_DAYS,
 } from './canvassing-time.js';
 import { flattenWebhookBody, webhookShapeFingerprint } from './webhook-body.js';
+import { buildLeadNoteLines } from './services/lead-note-lines.js';
 
 // GHL custom field: "LP Inbound Lead ID". Reminder: in1_id is the LP
 // inbound-QUEUE id, not lds_id — SetAppointment can never target it.
@@ -244,26 +245,19 @@ export function buildLpLeadFields(p, appt) {
   // (src/canvassing-intake.js buildCanvassingNotes) always sent them; the v2
   // rewrite dropped them.
   //
-  // Blank counts are OMITTED rather than printed empty. The legacy template
-  // emits a fixed 7-line block that renders "Door Count:" with nothing after it
-  // on a partially filled form, which reads to a setter as "asked, answered
-  // zero" instead of "not captured". Same labels, different blank handling —
-  // deliberate.
-  const projectLines = [
-    p.window_count && `Window Count: ${p.window_count}`,
-    p.door_count && `Door Count: ${p.door_count}`,
-    p.slider_count && `Slider Count: ${p.slider_count}`,
-  ].filter(Boolean);
-
-  const noteLines = [
-    ...projectLines,
+  // The counts-lead-the-block rule and the omit-blanks rule now live in
+  // services/lead-note-lines.js, shared with the affiliate intake route. They
+  // were extracted rather than copied precisely because this block already
+  // drifted once: two copies means the next notes fix gets made once and
+  // forgotten once.
+  const notes = buildLeadNoteLines(p, [
     p.canvassing_notes,
     p.reason_for_interest && `Reason for interest: ${p.reason_for_interest}`,
     p.spouse_name && `Spouse/co-owner: ${p.spouse_name}`,
     p.second_decision_maker && `Second decision maker: ${p.second_decision_maker}`,
     p.dm_confirmed_at_door && `DM confirmed at door: ${p.dm_confirmed_at_door}`,
     p.promoter && `Promoter: ${p.promoter}`,
-  ].filter(Boolean);
+  ]);
 
   const includeAppt =
     appt && appt.adate && appt.atime &&
@@ -287,7 +281,7 @@ export function buildLpLeadFields(p, appt) {
     srs_id: srsId,
     productID: 'Win',
     proddescr: 'Win',
-    notes: noteLines.join('\n'),
+    notes,
     lognumber: p.ghl_contact_id,
     User1: p.ghl_contact_id,
     HasConsent: 'true',
