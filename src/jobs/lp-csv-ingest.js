@@ -41,7 +41,10 @@ import supabase from '../supabase.js';
 import { getMarketMaps } from './market-resolver.js';
 import { sha256Hex, contentSha256, resolveRowMarket, todayET, centsToDollars } from './lp-report-common.js';
 import { logIngest, quarantineRows, alertGroupMe, duplicateResponse, extractPdfText, extractPdfBboxXml, NoTextLayerError } from './lp-report-ingest.js';
-import { parseJobStatusCsv, validateJobStatusCsv } from './lp-report-parse-job-status.js';
+import {
+  parseJobStatusCsv, validateJobStatusCsv,
+  JOB_STATUS_PARSER_VERSION,
+} from './lp-report-parse-job-status.js';
 import {
   parseLeadDispositionCsv, validateLeadDispositionCsv, resolveLeadMarkets,
   leadDispositionControlTotals,
@@ -107,74 +110,29 @@ export const CSV_REPORT_TYPES = {
 export const PDF_PENDING_TYPES = {};
 
 /**
- * Market map for Job Status rows: cst_id → { market, method, brn, lead_id }.
- * The Job Status export has NO branch column (LP report gap — flagged as a
- * recommendation to add one); market comes from the cst_id → Lead
- * Disposition id join against the CURRENT lead_disposition snapshot.
+ * Resolve one 133 row's branch code to a market.
  *
- * A cst_id can match several lead rows (lead id repeats). Preference:
- *   1. a row with Category 'Sale-Contract Signed' (a job implies a sale)
- *   2. a row with a real branch over one without
- *   3. latest entry_date
- * When surviving candidates still disagree on market (4 FTMYR-vs-SAR cases
- * on 2026-08-05), the winner is taken and the disagreement reported in
- * ambiguities — advisory, not file-failing.
+ * The Job Status export USED to carry no branch column, so market came from a
+ * cst_id → Lead Disposition (135) id join against the current 135 snapshot.
+ * The shipped export carries District and Market natively, so that join is gone
+ * along with its whole failure surface: 133 no longer needs a current 135
+ * snapshot to know its own branch, and the ambiguity/unmatched machinery the
+ * join required has no remaining purpose.
+ *
+ * Market leads, District is the fallback: Market is populated on all 525 rows of
+ * the March export, District is blank on 3 and disagrees with Market on 4.
+ *
+ * Validated against lp_branch_market_map, never a hardcoded list — the map
+ * already carries RFED (→ FTLAU_MKT) alongside BOCA/FTLAU/MIAMI, and a
+ * nine-market literal would have bucketed RFED as UNRESOLVED on every file.
+ *
+ * @returns {{market: string, method: string, code: string|null}}
  */
-export async function buildJobStatusMarketMap(cstIds) {
-  const { data: snaps, error: snapErr } = await supabase
-    .from('scorecard_report_snapshots')
-    .select('id, period_start, period_end, as_of_date')
-    .eq('report_type', 'lead_disposition').eq('is_current', true)
-    .order('period_end', { ascending: false }).limit(1);
-  if (snapErr) throw new Error(`lead snapshot lookup failed: ${snapErr.message}`);
-  if (!snaps?.length) return { snapshotId: null, byCst: new Map(), ambiguities: [] };
-  const snapshotId = snaps[0].id;
-
-  const ids = [...new Set(cstIds.filter(Boolean))];
-  const byCst = new Map();
-  const ambiguities = [];
-  const CHUNK = 300;
-  for (let i = 0; i < ids.length; i += CHUNK) {
-    const slice = ids.slice(i, i + CHUNK);
-    const { data, error } = await supabase
-      .from('lp_lead_disposition_history')
-      .select('lp_lead_id, brn_id_raw, market, market_method, category, entry_date')
-      .eq('snapshot_id', snapshotId)
-      .in('lp_lead_id', slice);
-    if (error) throw new Error(`lead join lookup failed: ${error.message}`);
-    const grouped = new Map();
-    for (const r of data || []) {
-      const list = grouped.get(r.lp_lead_id) || [];
-      list.push(r);
-      grouped.set(r.lp_lead_id, list);
-    }
-    for (const [cstId, list] of grouped) {
-      const rank = (r) => [
-        r.category === 'Sale-Contract Signed' ? 1 : 0,
-        r.brn_id_raw && r.brn_id_raw !== '0' ? 1 : 0,
-        r.entry_date || '',
-      ];
-      list.sort((a, b) => {
-        const ra = rank(a), rb = rank(b);
-        for (let k = 0; k < ra.length; k++) {
-          if (ra[k] !== rb[k]) return ra[k] > rb[k] ? -1 : 1;
-        }
-        return 0;
-      });
-      const winner = list[0];
-      const markets = [...new Set(list.map((r) => r.market))];
-      if (markets.length > 1) {
-        ambiguities.push({ cst_id: cstId, markets, chosen: winner.market });
-      }
-      byCst.set(cstId, {
-        market: winner.market,
-        method: 'lead_join',
-        branch_code_raw: winner.brn_id_raw || null,
-        lead_id: winner.lp_lead_id,
-      });
-    }
-  }
-  return { snapshotId, byCst, ambiguities };
+export function resolveJobStatusMarket(row, branchMap) {
+  const code = row.market_code_raw || row.district_raw || null;
+  const market = code ? resolveRowMarket(code, branchMap) : null;
+  if (!market) return { market: UNRESOLVED_MARKET, method: 'unresolved_branch', code };
+  return { market, method: 'branch_native', code };
 }
 
 /**
@@ -344,48 +302,70 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
         return await fail(v.violations[0].rule, { violations: v.violations },
           `${v.violations[0].rule} (+${v.violations.length - 1} more).`);
       }
-      const { snapshotId: leadSnap, byCst, ambiguities } =
-        await buildJobStatusMarketMap(parsed.rows.map((r) => r.cst_id));
-      if (!leadSnap) {
-        return await fail('lead_snapshot_missing',
-          { message: 'no current lead_disposition snapshot to join markets from — ingest Lead Disposition first' },
-          'no current lead_disposition snapshot — ingest Lead Disposition first.');
-      }
-      const unmatched = [];
+      // UNRESOLVED, NOT REJECTED — the 137 doctrine (§F), for the same reason:
+      // an unknown branch code is a mapping gap, not a corrupt file. The row's
+      // money stays visible and attributable to "we don't know which market"
+      // rather than being dropped or taking the other 524 rows down with it.
+      const { branchMap } = await getMarketMaps();
+      const unresolved = [];
       rows = parsed.rows.map((r) => {
-        const hit = byCst.get(r.cst_id);
-        if (!hit) unmatched.push(r.cst_id);
+        const { market, method, code } = resolveJobStatusMarket(r, branchMap);
+        if (method === 'unresolved_branch') unresolved.push(r);
         return {
-          cst_id: r.cst_id,
-          lead_id: hit?.lead_id ?? null,
+          row_num: r.row_num,
+          lp_id: r.lp_id,
+          job_id: r.job_id,
           contract_id: r.contract_id,
           customer_name: r.customer_name,
           phone: r.phone,
+          city: r.city,
           contract_date: r.contract_date,
-          net_date: r.net_date,
-          status_date: r.status_date,
           status_raw: r.status_raw,
           bucket: r.bucket,
           gross_cents: r.gross_cents,
-          fin_cents: r.fin_cents,
-          rep_name: r.rep_name,
-          fin_co: r.fin_co,
-          branch_code_raw: hit?.branch_code_raw ?? null,
-          // Unmatched jobs land in UNASSIGNED — visible, never dropped, and
-          // named individually in the ingest log detail.
-          market: hit?.market ?? 'UNASSIGNED',
-          market_method: hit ? hit.method : 'unmatched_lead',
+          total_due_cents: r.total_due_cents,
+          sub_source: r.sub_source,
+          product_ids: r.product_ids,
+          finance_sources: r.finance_sources,
+          district_raw: r.district_raw,
+          market_code_raw: r.market_code_raw,
+          branch_code_raw: code,
+          market,
+          market_method: method,
           notes_raw: r.notes_raw,
+          // The semantic, stored in the data rather than implied by a filename:
+          // this file is every job whose CONTRACT DATE falls in the period, at
+          // whatever status it has now — not a snapshot of what is still open.
+          cohort_basis: 'contract_date',
         };
       });
+      if (unresolved.length) {
+        const branches = [...new Set(unresolved.map((r) => r.market_code_raw || r.district_raw))];
+        await quarantineRows(reportType, sha, unresolved.map((row) => ({ reason: 'unresolved_branch', row })));
+        await alertGroupMe(`⚠️ LP report 133: unknown branch ${branches.join(', ')} — ${unresolved.length} row(s) landed as ${UNRESOLVED_MARKET}, NOT dropped. Add to lp_branch_market_map and re-send to reattribute.`);
+        extraDetail.unresolved_branches = branches;
+      }
       const bucketTally = {};
       for (const r of rows) bucketTally[r.bucket] = (bucketTally[r.bucket] || 0) + 1;
+      // Every bucket is asserted, not just the two open ones. Under a cohort
+      // export the terminal buckets carry most of the file, so leaving them
+      // unchecked would let the largest counts drift silently.
       controlTotals = {
         gross_cents: rows.reduce((a, r) => a + (r.gross_cents ?? 0), 0),
         hoa_count: bucketTally.hoa ?? 0,
         permit_count: bucketTally.permit ?? 0,
+        other_pending_count: bucketTally.other_pending ?? 0,
+        in_production_count: bucketTally.in_production ?? 0,
+        completed_count: bucketTally.completed ?? 0,
+        lost_count: bucketTally.lost ?? 0,
       };
-      extraDetail = { unmatched_cst_ids: unmatched, join_ambiguities: ambiguities, bucket_tally: bucketTally, lead_snapshot_id: leadSnap };
+      extraDetail = {
+        ...extraDetail,
+        bucket_tally: bucketTally,
+        cohort_basis: 'contract_date',
+        sub_cent_columns: parsed.subCentColumns,
+      };
+      parserVersion = JOB_STATUS_PARSER_VERSION;
     } else if (reportType === 'lead_disposition') {
       parsed = parseLeadDispositionCsv(text);
       const v = validateLeadDispositionCsv(parsed);

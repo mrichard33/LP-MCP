@@ -40,7 +40,7 @@ import { resolveMarketFromBranch } from './market-resolver.js';
 // active. An unknown label fails closed upstream (unmapped_branch).
 export const SE_BRANCH_LABELS = ['BOCA', 'FTLAU', 'FTMYR', 'JAX', 'LAKE', 'MIAMI', 'ORL', 'RFED', 'SAR', 'STPET'];
 
-const CSV_REQUIRED = ['Grouper', 'NumIssued', 'NumSale', 'NumNetIssued', 'NumSat', 'GSA',
+export const CSV_REQUIRED = ['Grouper', 'NumIssued', 'NumSale', 'NumNetIssued', 'NumSat', 'GSA',
   'NumNet', 'NSA', 'NumWorking', 'NumCD', 'NumCancelled', 'NumHold',
   'GSAWorking', 'GSACD', 'GSACancelled', 'GSAHold', 'SDate', 'EDate'];
 

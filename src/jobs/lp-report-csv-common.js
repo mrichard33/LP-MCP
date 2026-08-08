@@ -77,9 +77,57 @@ export function csvToObjects(text, requiredColumns = []) {
 }
 
 /**
+ * Case-insensitive column reader.
+ *
+ * The older parsers index rows by exact header name, which is safe for reports
+ * whose headers we have seen across many months. detectReportFromHeader already
+ * matches case-insensitively, so a file that ROUTES to a parser could still
+ * fail inside it purely on casing — a parser must not be stricter than the
+ * router that dispatched to it. 138 established this; 133 adopted it when its
+ * export changed shape underneath the parser.
+ *
+ * @param {string[]} header
+ * @returns {(row: Record<string,string>, name: string) => (string|undefined)}
+ */
+export function columnReader(header) {
+  const byLower = new Map();
+  for (const h of header) byLower.set(String(h).trim().toLowerCase(), h);
+  return (row, name) => {
+    const key = byLower.get(String(name).toLowerCase());
+    return key === undefined ? undefined : row[key];
+  };
+}
+
+/**
+ * Fail a file closed on a MISSING required column, comparing case-insensitively.
+ * The companion to columnReader: csvToObjects' own check is case-SENSITIVE, so
+ * parsers that read case-insensitively must call csvToObjects(text) with no
+ * required list and come through here instead.
+ *
+ * Throws the same message shape csvToObjects throws, so the ingest gate's
+ * `csv_shape_unrecognized` path is unchanged.
+ *
+ * @param {string[]} header
+ * @param {string[]} required
+ */
+export function assertRequiredColumns(header, required) {
+  const present = new Set(header.map((h) => String(h).trim().toLowerCase()));
+  const missing = required.filter((c) => !present.has(String(c).toLowerCase()));
+  if (missing.length) {
+    throw new Error(`CSV missing required columns (${missing.join(', ')})`);
+  }
+}
+
+/**
  * Parse an LP CSV date-or-datetime cell to ISO 'YYYY-MM-DD'. The exports
  * print plain 'M/D/YYYY' for most dates but 'M/D/YYYY HH:MM' for
  * appointment slots and report timestamps — the time part is dropped.
+ *
+ * TWO-DIGIT YEARS ARE REJECTED here (they return null), which is deliberate for
+ * the header/period columns this was written for. Detail columns that print
+ * 'MM/DD/YY' — report 133's ContractDate — must use parseDateMDY from
+ * lp-report-common.js instead, or every row silently loses its date.
+ *
  * @returns {string|null}
  */
 export function parseCsvDate(raw) {

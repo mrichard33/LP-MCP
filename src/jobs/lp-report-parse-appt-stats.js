@@ -27,7 +27,10 @@
 // 4-decimal form in the same column).
 
 import { parseCsvMoneyCents } from './lp-report-common.js';
-import { csvToObjects, parseCsvDate, parseCsvDateTimeET, parseCount } from './lp-report-csv-common.js';
+import {
+  csvToObjects, parseCsvDate, parseCsvDateTimeET, parseCount,
+  columnReader, assertRequiredColumns,
+} from './lp-report-csv-common.js';
 
 /** Bumped when a parse change should let corrected output re-land and supersede. */
 export const APPT_STATS_PARSER_VERSION = 'appt-stats-csv-v1';
@@ -84,26 +87,8 @@ const ALIAS_LABELS = {
  * rejected wholesale. Extra columns we do not know about are harmless — they
  * ride into the content hash and are ignored.
  */
-const REQUIRED = ['Salesrep', 'Src_id', 'NumSet', 'NumIssued', 'NumNetIssued',
+export const REQUIRED = ['Salesrep', 'Src_id', 'NumSet', 'NumIssued', 'NumNetIssued',
   'NumSat', 'NumSale', 'SDate', 'EDate'];
-
-/**
- * Case-insensitive column reader.
- *
- * Every other CSV parser here indexes rows by exact header name, which is safe
- * for reports whose headers we have seen across many months. 138 has been seen
- * once. detectReportFromHeader already matches case-insensitively, so a file
- * that ROUTES to this parser could still fail inside it purely on casing — the
- * parser must not be stricter than the router that dispatched to it.
- */
-function columnReader(header) {
-  const byLower = new Map();
-  for (const h of header) byLower.set(String(h).trim().toLowerCase(), h);
-  return (row, name) => {
-    const key = byLower.get(String(name).toLowerCase());
-    return key === undefined ? undefined : row[key];
-  };
-}
 
 /** Money cell → cents, tracking sub-cent loss for the §F gate. */
 function money(raw, sink, column) {
@@ -124,11 +109,7 @@ export function parseApptStatsCsv(text) {
   // reject a file on casing alone that detectReportFromHeader had already
   // matched and routed here — the parser being stricter than its own router.
   const { header, rows: raw } = csvToObjects(text);
-  const present = new Set(header.map((h) => String(h).trim().toLowerCase()));
-  const missing = REQUIRED.filter((c) => !present.has(c.toLowerCase()));
-  if (missing.length) {
-    throw new Error(`CSV missing required columns (${missing.join(', ')})`);
-  }
+  assertRequiredColumns(header, REQUIRED);
   const get = columnReader(header);
   let periodStart = null, periodEnd = null, asOf = null, generatedAt = null;
   const subCentColumns = [];

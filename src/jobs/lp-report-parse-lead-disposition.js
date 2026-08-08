@@ -28,7 +28,7 @@ import { parseMoneyCents } from './lp-report-common.js';
 import { resolveMarketFromBranch, resolveMarket } from './market-resolver.js';
 import { csvToObjects, parseCsvDate, parseCount , parseCsvDateTimeET } from './lp-report-csv-common.js';
 
-const REQUIRED = ['id', 'Category', 'entrydate', 'src_id', 'brn_id', 'SourceSubDescr',
+export const REQUIRED = ['id', 'Category', 'entrydate', 'src_id', 'brn_id', 'SourceSubDescr',
   'dspdescr', 'GSA', 'NetAmount', 'ApptDate', 'JobStatus', 'Zip', 'SDate', 'EDate'];
 
 /**

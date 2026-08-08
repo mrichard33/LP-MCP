@@ -37,7 +37,7 @@ function money(raw, sink, column) {
   return parsed.cents;
 }
 
-const REQUIRED = ['descr', 'NumRaw', 'NumSet', 'NumCnf', 'NumIssued', 'NumSat',
+export const REQUIRED = ['descr', 'NumRaw', 'NumSet', 'NumCnf', 'NumIssued', 'NumSat',
   'NumSold', 'NumNetSold', 'GSA', 'NSA', 'MCost', 'WorkingAmount', 'SDate', 'EDate'];
 
 /**

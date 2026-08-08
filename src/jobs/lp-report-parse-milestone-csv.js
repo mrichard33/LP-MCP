@@ -33,7 +33,7 @@ import { csvToObjects, parseCsvDate, parseCsvDateTimeET } from './lp-report-csv-
 export const PARSER_VERSION = 'milestone-csv-v1';
 
 /** Confirmed by the report fingerprint (§C) — absence rejects the file. */
-const REQUIRED = ['contractid', 'MilestoneDate', 'NetAmount', 'GrossAmount', 'brp_id', 'MdtDescr'];
+export const REQUIRED = ['contractid', 'MilestoneDate', 'NetAmount', 'GrossAmount', 'brp_id', 'MdtDescr'];
 
 /**
  * Descriptive columns, by LP's known header spellings. First hit wins; no hit
