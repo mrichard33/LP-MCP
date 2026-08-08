@@ -5,6 +5,24 @@
 -- Author:  2026-08-07
 -- Type:    Read-path indexes only. No schema change, no data change.
 --
+-- STATUS:  APPLIED 2026-08-08. All three indexes built and verified valid.
+--          Measured results are recorded against each statement below.
+--
+-- ---------------------------------------------------------------------------
+-- CORRECTION 2026-08-08
+-- ---------------------------------------------------------------------------
+-- The originally committed version of this file had two defects, both fixed
+-- here so the file matches what was actually applied:
+--
+--   1. `CREATE EXTENSION IF NOT EXISTS pg_trgm;` installed into the default
+--      schema. Supabase convention places extensions in the `extensions`
+--      schema. Now qualified, with the operator class qualified to match.
+--
+--   2. The header comment on statement 1 claimed Postgres "cannot prove a
+--      parameterised predicate matches a partial index predicate." That was
+--      overstated and the related claim used to justify the code changes in
+--      PR #648 was simply WRONG. See the note under statement 1.
+--
 -- ---------------------------------------------------------------------------
 -- HOW TO RUN — IMPORTANT
 -- ---------------------------------------------------------------------------
@@ -21,9 +39,6 @@
 -- If a CONCURRENTLY build fails part-way it leaves an INVALID index behind.
 -- Check with the verification query at the bottom of this file and DROP the
 -- invalid index before retrying.
---
--- Expected build time on the current instance: under 60 seconds each.
--- Expected added storage: ~35 MB total.
 -- ---------------------------------------------------------------------------
 
 
@@ -45,23 +60,30 @@
 --   ORDER BY created_at_lp ASC NULLS LAST
 --   LIMIT $2 OFFSET $3
 --
--- lp_notes carries 221,990 rows in 428 MB and has indexes only on
--- (id), (lp_note_id), (lp_lead_id) and (ghl_contact_id). Nothing covers
--- ghl_note_pushed or created_at_lp, so each drain cycle reads the whole
--- table and then sorts it, just to return one page.
+-- lp_notes carries 221,990 rows in 428 MB and had indexes only on
+-- (id), (lp_note_id), (lp_lead_id) and (ghl_contact_id). Nothing covered
+-- ghl_note_pushed or created_at_lp, so each drain cycle read the whole table
+-- and then sorted it, just to return one page.
 --
--- Index design note: this is a plain composite index rather than a partial
--- index with `WHERE ghl_note_pushed = false`. PostgREST parameterises the
--- boolean, and Postgres cannot prove a parameterised predicate matches a
--- partial index predicate under a generic plan. Putting the boolean in as
--- the leading index column makes it an index *condition* instead, which
--- matches for any parameter value. The IS NOT NULL filters are left as
--- cheap heap filters applied to the handful of rows the LIMIT actually
--- fetches.
+-- Index design note: the boolean is the LEADING INDEX COLUMN rather than a
+-- partial-index predicate. PostgREST parameterises it, and a parameterised
+-- value is not guaranteed to be available for predicate proving at plan time
+-- under a generic plan. As a leading column it becomes an index *condition*,
+-- which matches for any parameter value. This is a robustness choice, not a
+-- claim that the partial form would definitely fail.
 --
 -- Leading column order matters: ghl_note_pushed first (equality), then
 -- created_at_lp (the ORDER BY). That lets the planner walk the index in
--- sort order and stop at the LIMIT, with no sort node at all.
+-- sort order and stop at the LIMIT, with no sort node.
+--
+-- MEASURED AFTER APPLYING: 11,658 ms -> 117 ms.
+--   Limit -> Index Scan using idx_lp_notes_push_queue, no Sort node.
+--
+-- KNOWN RESIDUAL: the plan still shows "Rows Removed by Filter: 133,391" and
+-- ~121,000 buffer hits to return 44 rows, because the two IS NOT NULL
+-- conditions are heap filters rather than index conditions. There is roughly
+-- another order of magnitude available by adding them to the index predicate.
+-- Not done here — it should be measured on its own, not bundled.
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lp_notes_push_queue
   ON public.lp_notes (ghl_note_pushed, created_at_lp);
@@ -90,14 +112,14 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lp_notes_push_queue
 -- in inconsistent formats across LP sync vintages, so an exact match is not
 -- reliable. That is a reasonable design, but it means the pattern carries a
 -- LEADING wildcard. A plain btree index cannot serve a leading wildcard, so
--- the existing idx_lp_leads_phone is dead weight on this path, and phone_alt
--- has no index at all. Both branches of the OR fall back to a sequential
--- scan of all 229,548 rows.
+-- the existing idx_lp_leads_phone was dead weight on this path, and phone_alt
+-- had no index at all. Both branches of the OR fell back to a sequential scan
+-- of all 229,548 rows.
 --
--- A trigram GIN index is the correct structure here: it indexes every
--- 3-character substring, so a leading-wildcard LIKE/ILIKE becomes an index
--- lookup. A 10-digit search string yields 8 trigrams, which is more than
--- enough selectivity against a 229K-row table.
+-- A trigram GIN index is the correct structure: it indexes every 3-character
+-- substring, so a leading-wildcard LIKE/ILIKE becomes an index lookup. A
+-- 10-digit search string yields 8 trigrams, ample selectivity against 229K
+-- rows.
 --
 -- The alternative fix would be to normalise phone storage to bare digits and
 -- switch the callers to .eq(). That is the better long-term answer, but it
@@ -105,16 +127,19 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lp_notes_push_queue
 -- ceiling, needs a Claude Code handoff). These indexes deliver the same
 -- latency win with no code change and no data migration, and they remain
 -- useful even after any future normalisation.
+--
+-- MEASURED AFTER APPLYING: 281 ms -> 1.3 ms, ~10,000 buffers -> 60.
+--   Limit -> Sort -> Bitmap Heap Scan -> BitmapOr over both _trgm indexes.
 
--- pg_trgm ships with Supabase but is not enabled by default on every project.
+-- Supabase convention: extensions live in the `extensions` schema, not public.
 -- Safe to re-run.
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA extensions;
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lp_leads_phone_trgm
-  ON public.lp_leads USING gin (phone gin_trgm_ops);
+  ON public.lp_leads USING gin (phone extensions.gin_trgm_ops);
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lp_leads_phone_alt_trgm
-  ON public.lp_leads USING gin (phone_alt gin_trgm_ops);
+  ON public.lp_leads USING gin (phone_alt extensions.gin_trgm_ops);
 
 
 -- ===========================================================================
@@ -135,6 +160,11 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lp_leads_phone_alt_trgm
 --     'idx_lp_leads_phone_alt_trgm'
 --   );
 --
+--   Confirmed 2026-08-08: all valid.
+--     idx_lp_notes_push_queue      5,248 kB
+--     idx_lp_leads_phone_trgm      9,880 kB
+--     idx_lp_leads_phone_alt_trgm  2,504 kB
+--
 -- 2. Confirm the planner actually picks them up.
 --
 --   EXPLAIN (ANALYZE, BUFFERS)
@@ -151,15 +181,14 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lp_leads_phone_alt_trgm
 --   WHERE phone ILIKE '%5615551234%' OR phone_alt ILIKE '%5615551234%'
 --   ORDER BY synced_at DESC
 --   LIMIT 1;
---   -- expect: Bitmap Index Scan on the two _trgm indexes, no Seq Scan
+--   -- expect: BitmapOr across both _trgm indexes, no Seq Scan
 --
 -- 3. Reset the statement counters so the next read is a clean before/after.
---    Do this only after confirming step 2.
+--    Done 2026-08-08 19:10 UTC.
 --
 --   SELECT pg_stat_statements_reset();
 --
--- 4. Re-check 24-48 hours later — the two patterns should have dropped out
---    of the top of this list entirely.
+-- 4. Re-check 24-48 hours later.
 --
 --   SELECT round((total_exec_time/3600000)::numeric, 2) AS db_hours,
 --          calls,
@@ -170,19 +199,54 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lp_leads_phone_alt_trgm
 --   LIMIT 15;
 --
 -- ===========================================================================
--- NOT INCLUDED HERE — tracked separately
+-- WHAT THE PR #648 COMMIT MESSAGES GOT WRONG — read before trusting them
 -- ===========================================================================
--- These came out of the same audit but are not index work and should not be
--- bundled into this file:
+-- PR #648 justified two code changes in src/executor-heartbeat.js with the
+-- claim that PostgREST's `NOT (col IS NULL)` rendering does not match a
+-- partial index declared `WHERE col IS NOT NULL`, and therefore degraded to
+-- a sequential scan.
 --
---   * The LP instance is a Micro (256 MB shared_buffers, ~1 GB RAM) holding
---     a 6.1 GB database. Table cache hit rate is 67%. This is the dominant
---     cost and the likely root of the 120-second query stalls seen in
---     pg_stat_statements max_exec_time. Compute upgrade, not SQL.
+-- That claim is FALSE. Verified directly on 2026-08-08:
 --
---   * 129 unused non-unique indexes on this database (98 MB) impose write
---     amplification on the highest-insert tables. Needs a per-index review
---     before any DROP.
+--   EXPLAIN SELECT processed_at FROM system_events
+--   WHERE NOT processed_at IS NULL ORDER BY processed_at DESC LIMIT 1;
+--   -> Index Only Scan using idx_se_processed_at, 5 buffers, 0.13 ms
+--
+--   EXPLAIN SELECT executed_at FROM agent_actions
+--   WHERE NOT executed_at IS NULL ORDER BY executed_at DESC LIMIT 1;
+--   -> Index Only Scan using idx_aa_executed_at, 5 buffers, 0.10 ms
+--
+-- Postgres's predicate prover handles the negated NullTest correctly against
+-- both partial indexes. The `.gte(col, EPOCH)` rewrite shipped in PR #648 is
+-- behaviourally identical and harmless, but it was not the fix it was
+-- described as.
+--
+-- The real cause of those two statements consuming 85 of 244 database hours
+-- was FREQUENCY against a cache-starved instance: ~91,000 calls each on a
+-- Micro (256 MB shared_buffers, 6.1 GB database, 67% table cache hit rate).
+-- Mean 1,212 ms with a min of 0.03 ms and a max of 119,542 ms — the spread
+-- is an I/O queueing signature, not a bad plan. The 5-minute observability
+-- sampling in PR #648 is what actually fixed it.
+--
+-- Practical consequence: do NOT rewrite other `.not(col,'is',null)` call
+-- sites on the strength of that reasoning. src/decision-engine-heartbeat.js
+-- line 159 was queued for exactly that change and it is NOT warranted — the
+-- query now measures 0.05 ms mean.
+--
+-- ===========================================================================
+-- STILL OUTSTANDING — tracked separately
+-- ===========================================================================
+--   * lp_call_logs has no index on synced_at. A periodic job seq-scans the
+--     911 MB table pulling ~614 MB off disk per run to return ~28 rows,
+--     flushing the entire buffer pool each time. See sql/058.
+--
+--   * Compute: upgraded Micro -> Small on 2026-08-08 (512 MB shared_buffers,
+--     1.5 GB effective_cache_size, 90 connections). The database is 6.1 GB,
+--     so the working set still exceeds RAM. Re-evaluate after 24-48 hours of
+--     post-fix data before considering Medium.
+--
+--   * 129 unused non-unique indexes (98 MB) impose write amplification on the
+--     highest-insert tables. Needs per-index review before any DROP.
 --
 --   * No retention policy on system_events, system_events_filtered,
 --     lp_activities, or five9_events_raw. system_events_filtered holds
