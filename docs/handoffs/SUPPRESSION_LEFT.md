@@ -1,7 +1,20 @@
 # Claude Code Handoff — Move the suppression check left
 
 **Prepared:** 2026-08-08
-**Status: BLOCKED on a ruling from Mark.** §2 is the fork. Do not start §3 until it is answered.
+**Last revised:** 2026-08-08 — the fork in §2 has been RULED. Status updated from BLOCKED to actionable.
+
+> ## ✅ THE RULING IS MADE — §2 IS RESOLVED, DO NOT WAIT ON IT
+>
+> This document originally blocked on a question: *is `suppress-automation` supposed to block mutations?* **Mark ruled: it is not.** Option (A). It is removed from `MUTATION_SUPPRESS_TAGS`; `stop-bot` stays.
+>
+> The deciding evidence — 95% of applications come from `AUTOMATION_SUPPRESS_ON_BOOKING`, a 48h post-booking marketing pause, and the tag blocked its own removal (963 blocked removals) — is recorded in **`ITEM1_UNBLOCK_DOOR_FINAL.md`**, which is the implementation spec for that half of the work.
+>
+> **What remains live in THIS document:**
+> - **§3** — the `stop-bot` move-left work across seven rules. Unaffected by the ruling, still worth doing, not covered elsewhere.
+> - **§4** — the `HARD_DISQUALIFIED_CLOSEOUT` bug. Still open. Note that its second candidate fix has since been superseded; see the ⚠️ in §4.
+> - **§1** — how the gate works. Still accurate.
+>
+> §2 and §5 are kept as the reasoning record. Do not act on §5's numbers without reading the note at the top of it.
 
 ---
 
@@ -9,7 +22,7 @@
 
 I told Mark this change would remove "~35–40% of all action volume." **That number does not survive verification.** Correcting it before anyone builds against it.
 
-The reasoning was: 34,487 actions per 30 days end in `mutation suppressed`, they're created and then discarded, so suppress them earlier and the volume disappears. The first two clauses are true. The conclusion is not, because it assumed every suppressed action *should* have been suppressed. Most of them hinge on an unresolved question about a single tag.
+The reasoning was: 34,487 actions per 30 days end in `mutation suppressed`, they're created and then discarded, so suppress them earlier and the volume disappears. The first two clauses are true. The conclusion is not, because it assumed every suppressed action *should* have been suppressed.
 
 Actual breakdown of the 34,487, by what blocked them:
 
@@ -21,16 +34,15 @@ Actual breakdown of the 34,487, by what blocked them:
 
 Only the `stop-bot` slice is unambiguously "should never have fired." That is **8,538 actions/month, about 7.7% of the 111,320 total** — a real win, but a fifth of what I said.
 
-The other 74% is not a performance problem. It is a policy question that has to be answered before it can be called waste.
-
 ---
 
 ## §1 — How the gate actually works
 
-`src/services/suppression-check.js`. The `mutation suppressed` outcome comes from `checkMutationSuppression`, which matches exactly two tags:
+`src/services/suppression-check.js`. The `mutation suppressed` outcome comes from `checkMutationSuppression`, which matched exactly two tags:
 
 ```js
 const MUTATION_SUPPRESS_TAGS = ['suppress-automation', 'stop-bot'];
+// post-ruling this becomes ['stop-bot'] — see ITEM1_UNBLOCK_DOOR_FINAL.md §1a
 ```
 
 The gate itself lives in the action executor (`src/actions/index.js`) and blocks **all mutating action types** — `move_opportunity`, workflow add/remove, `set_stage`, custom fields, and non-audit tags.
@@ -40,52 +52,35 @@ The gate itself lives in the action executor (`src/actions/index.js`) and blocks
 1. **`add_tag` of a suppression/audit tag is exempt.** Matched by `SUPPRESSION_AUDIT_TAG_RE` — `dnc*`, `do-not-contact`, `stop-bot`, `suppress*`, `hard-disqualified`, `quarantined`, `audit-`, `compliance-`, `loss-reason:`. This is how suppression gets recorded on a contact in the first place.
 2. **`action_payload.bypass_suppression === true` is exempt.** Used by `DNC_LIFT_ON_REENGAGEMENT` so the lift can *remove* the suppression stack from a `stop-bot` contact. Without it the DNC blocks its own removal.
 
-⚠️ **There is no `remove_tag` audit exemption.** The code says so explicitly. This is the source of the probable bug in §4.
+⚠️ **There is no `remove_tag` audit exemption.** This is the source of the bug in §4. A **narrow** one is added in `ITEM1_UNBLOCK_DOOR_FINAL.md` §1c — narrow because a broad one would let any rule strip a consent tag.
 
 ---
 
-## §2 — THE FORK. Mark must rule before any code changes.
+## §2 — The fork *(RESOLVED — retained as the reasoning record)*
 
-**Is `suppress-automation` supposed to block mutations?**
-
-The codebase contradicts itself, and 25,527 actions a month hang on the answer.
+**Was `suppress-automation` supposed to block mutations?** The codebase contradicted itself, and 25,527 actions a month hung on the answer.
 
 **Evidence it should NOT block:**
 
-- `suppress-automation` was deliberately **removed** from `SUPPRESS_TAGS` on 2026-05-14, described in the file header as a *"legacy GHL workflow throttle."* The stated reason: `agentic-active` became the canonical "agentic is in charge" signal, and re-gating on the legacy tags "was silently dropping valid sends."
-- Mark's own v4.3 operating instructions state: *"Never reintroduce `pause-bot`/`suppress-automation` as blockers."*
-- 1,780 of 2,195 affected contacts (81%) carry `suppress-automation` **without** `stop-bot`. These are not leads who asked us to stop.
+- Deliberately **removed** from `SUPPRESS_TAGS` on 2026-05-14, described in the file header as a *"legacy GHL workflow throttle."* The stated reason: `agentic-active` became the canonical "agentic is in charge" signal, and re-gating on the legacy tags "was silently dropping valid sends."
+- Mark's v4.3 operating instructions: *"Never reintroduce `pause-bot`/`suppress-automation` as blockers."*
+- 1,780 of 2,195 affected contacts (81%) carry it **without** `stop-bot`. Not leads who asked us to stop.
 
 **Evidence it SHOULD block:**
 
-- The mutation gate was added deliberately on 2026-07-03 — *after* the May removal — and the header calls the thing it fixed a *"pipeline-integrity breach."* Someone hit a real problem and this was the fix.
+- The mutation gate was added deliberately on 2026-07-03 — *after* the May removal — and the header calls the thing it fixed a *"pipeline-integrity breach."*
 
-Both cannot be right. Either:
+**Resolved to (A): it is legacy and must not gate mutations.** The decisive evidence came from asking what actually applies the tag: 4,591 of 4,837 applications (95%) come from `AUTOMATION_SUPPRESS_ON_BOOKING` — a 48-hour post-booking marketing pause on a *converting* lead, not a disqualification. Of 3,729 carriers, zero are customers. And it was self-sealing: 963 removal attempts blocked against 1,459 successful, because `remove_tag` has no exemption. A 48-hour pause had become permanent.
 
-- **(A) It is legacy and should not gate mutations.** Then ~25,500 mutations a month are being silently dropped and the system is *under*-routing 1,780 contacts. This is a **correctness bug, not waste**, and the fix is to remove `suppress-automation` from `MUTATION_SUPPRESS_TAGS`. Note this would *increase* executed actions and GHL API load, the opposite of the original goal.
-- **(B) It is intentional.** Then it is genuine waste and the fix is to move it left into `context_conditions` so the rules never fire.
+`stop-bot` remains in the gate, which preserves whatever the 2026-07-03 breach was protecting for the tag that actually matters.
 
-**Do not guess.** The answer inverts the work. Ask Mark, and if he is unsure, find the 2026-07-03 incident that prompted the gate before deciding.
-
-Useful context query — who are these contacts and are they otherwise active?
-
-```sql
-SELECT t.ghl_contact_id,
-       'stop-bot' = ANY(t.tags)      AS has_stop_bot,
-       'agentic-active' = ANY(t.tags) AS has_agentic_active,
-       array_length(t.tags, 1)        AS tag_count
-FROM contact_tag_snapshot t
-WHERE 'suppress-automation' = ANY(t.tags) AND NOT ('stop-bot' = ANY(t.tags))
-LIMIT 50;
-```
-
-If a large share also carry `agentic-active`, that strongly favours **(A)** — the bot is nominally in charge of those contacts while every mutation against them is being dropped.
+Consequence, and it is the opposite of an optimisation: **~25,500 mutations a month that were being dropped will now execute.** Action volume and GHL API load go UP. Full spec and rollout in `ITEM1_UNBLOCK_DOOR_FINAL.md`.
 
 ---
 
-## §3 — The work that is safe regardless of the ruling
+## §3 — The `stop-bot` work — LIVE, unaffected by the ruling
 
-The `stop-bot` slice — **8,538 actions/month** — needs no ruling. `stop-bot` is a lead-initiated kill switch. Rules that route, enrol, or re-tag a contact who explicitly told us to stop should not fire at all.
+The `stop-bot` slice — **8,538 actions/month** — needed no ruling and still needs doing. `stop-bot` is a lead-initiated kill switch. Rules that route, enrol, or re-tag a contact who explicitly told us to stop should not fire at all.
 
 ### Target rules, measured over 30 days
 
@@ -98,6 +93,8 @@ The `stop-bot` slice — **8,538 actions/month** — needs no ruling. `stop-bot`
 | `LP_DISP_CNF` | 1,273 | 2,780 | 45.8% |
 | `LP_DISP_OPPFDN` | 1,054 | 3,540 | 29.8% |
 | `STATE_ENROLLMENT` | 604 | 954 | 63.3% |
+
+*(Those totals were measured pre-ruling and include the `suppress-automation` share. After Item 1 ships, re-measure before deciding a rule is worth gating — the `stop-bot`-only portion is what this section addresses.)*
 
 ### The change, per rule
 
@@ -126,7 +123,7 @@ Before touching any rule, check what its `action_template` actually does. **Do n
                             || '{"not_has_any_tag": ["stop-bot"]}'::jsonb
    WHERE rule_key = '<RULE>';
    ```
-   ⚠️ If the rule **already has** `not_has_any_tag`, this overwrites it. Read first, union the arrays, then write.
+   ⚠️ If the rule **already has** `not_has_any_tag`, this overwrites it. Read first, union the arrays, then write. This applies doubly after Item 1, which adds `active-entry:canvassing` and `suppress-automation` to nurture-enrollment rules.
 3. Reload: `POST .../n8n/decision-engine/reload-rules`. Assert the `rules_loaded` delta.
 4. Wait one full cycle. Confirm suppressed count for that rule drops and **total non-suppressed output is unchanged**:
    ```sql
@@ -153,7 +150,7 @@ WHERE conditions IS NOT NULL AND context_conditions IS NOT NULL AND enabled
 
 ---
 
-## §4 — A probable correctness bug found on the way
+## §4 — A probable correctness bug found on the way — STILL OPEN
 
 `HARD_DISQUALIFIED_CLOSEOUT` is **84.4% suppressed** — 4,843 of 5,738 actions. Of those, 3,703 are `remove_tag` and 1,140 are `remove_from_workflow`.
 
@@ -161,12 +158,10 @@ This rule's job is to close out a hard-disqualified contact: strip their workflo
 
 **Do not "fix" this by moving it left.** Adding `not_has_any_tag` would cement the bug — the rule would stop firing instead of being blocked, and the contacts stay dirty either way. Symptom silenced, problem preserved.
 
-Two candidate fixes, needs a decision:
+⚠️ **Candidate fixes — the second one has changed since this was written:**
 
-- Set `bypass_suppression: true` on the closeout's `remove_tag` / `remove_from_workflow` actions, same mechanism `DNC_LIFT` uses. Narrow, uses existing machinery.
-- Add a `remove_tag` audit exemption to `isMutationGateExempt` mirroring the `add_tag` one. Broader, affects every rule.
-
-Prefer the first — narrower blast radius, no shared-code change.
+- **Preferred:** set `bypass_suppression: true` on the closeout's `remove_tag` / `remove_from_workflow` actions, same mechanism `DNC_LIFT` uses. Narrow, uses existing machinery.
+- ~~Add a `remove_tag` audit exemption mirroring the `add_tag` one.~~ **Do not do this as originally written.** A broad exemption over `SUPPRESSION_AUDIT_TAG_RE` would let any rule strip `dnc`, `do-not-contact` or `stop-bot`. `ITEM1_UNBLOCK_DOOR_FINAL.md` §1c ships a **narrow** operational-only allow-list instead — and note `hard-disqualified` is deliberately **not** on it, so that list does not resolve this bug. The `bypass_suppression` route remains the right fix here.
 
 **Verify the symptom before fixing.** If closeout has been blocked for months, those contacts should still carry the workflow tags it tried to strip:
 
@@ -180,25 +175,36 @@ A high count confirms it. A near-zero count means something else is cleaning the
 
 ---
 
-## §5 — Honest expected outcome
+## §5 — Expected outcome *(superseded by the ruling — read the note)*
 
-If §2 resolves to **(B) intentional** and all of §3 lands cleanly:
+> ⚠️ Written before the fork was resolved. The ruling went to **(A)**, so the branch below that predicted a ~30% *reduction* does not apply. Retained to show what was weighed.
+
+If §2 had resolved to **(B) intentional** and all of §3 landed:
 
 - ~8,500 actions/month removed with certainty (`stop-bot` slice)
-- up to ~25,500 more if the `suppress-automation` gate is also moved left
-- best case ~34,000 of 111,320, roughly **30%** of action volume — with the corresponding drop in `agent_actions` writes, executor claims, trigger fires and GHL API calls
+- up to ~25,500 more if the `suppress-automation` gate were also moved left
+- best case ~34,000 of 111,320, roughly **30%** of action volume
 
-If §2 resolves to **(A) legacy**, action volume **goes up**, not down, because 25,500 mutations that should have run will start running. That is the right outcome if it is the true one, but it is the opposite of an optimisation and Mark should know that before choosing.
+**§2 resolved to (A), so action volume goes UP, not down** — ~25,500 mutations that should have run will start running. Correct outcome, opposite direction. The `stop-bot` work in §3 still removes ~8,500/month and remains a genuine reduction.
 
-**The floor is ~7.7%, not 35–40%.** Everything above that floor depends on the ruling.
+---
+
+## Related documents
+
+| Document | Covers |
+|---|---|
+| `ITEM1_UNBLOCK_DOOR_FINAL.md` | **The `suppress-automation` ruling, implemented** — gate change, canvassing gate, narrow `remove_tag` exemption, backfill, TTL |
+| `ITEM1_ADDENDUM_canvassing_gate.md` | `active-entry:other` question; `active-entry:*` invariant breach |
+| `UNBLOCK_DOOR_AND_NURTURE.md` | Item 2 (feed S4.5) and Item 3 (restore objection routing) |
 
 ---
 
 ## Working rules
 
 1. **MCP is reality.** Every figure here was measured on 2026-08-08. If a query disagrees, the query wins.
-2. **One rule at a time, verify between each.** Completed-action count must hold steady; only the suppressed count should fall.
-3. **Never gate a rule that sets `bypass_suppression: true`.** That strands DNC contacts permanently.
-4. **Reload the Decision Engine after every `agent_rules` change** and assert the `rules_loaded` delta.
-5. Feature branch off `main`, PR, Mark merges. Never commit to `main`.
-6. `node --check` is a parse, not verification — see `test/executor-heartbeat.smoke.test.js` for the pattern.
+2. **Re-measure after Item 1 ships.** The §3 totals include the `suppress-automation` share and will shift.
+3. **One rule at a time, verify between each.** Completed-action count must hold steady; only the suppressed count should fall.
+4. **Never gate a rule that sets `bypass_suppression: true`.** That strands DNC contacts permanently.
+5. **Reload the Decision Engine after every `agent_rules` change** and assert the `rules_loaded` delta.
+6. Feature branch off `main`, PR, Mark merges. Never commit to `main`.
+7. `node --check` is a parse, not verification — see `test/executor-heartbeat.smoke.test.js` for the pattern.
