@@ -52,6 +52,58 @@
  *   wait queue / fresh 429 / standing pause) and the executor's failure
  *   rate over a rolling window. See src/limiter-health-alerts.js.
  *
+ * 2026-08-07 — DATABASE LOAD REDUCTION.
+ *   pg_stat_statements showed this file was the single largest consumer
+ *   of LP Supabase execution time: two of its queries accounted for 85
+ *   of the database's 244 total hours since 2026-06-04, or 35% of
+ *   everything the database did.
+ *
+ *     194,032 s over  90,290 calls — getRecentFailedCount() exact count
+ *     111,146 s over  91,698 calls — getMostRecentExecutionAt()
+ *
+ *   Neither is a slow query. Run by hand the failed count plans as an
+ *   Index Only Scan and returns in 0.113 ms. Three things compounded:
+ *
+ *     1. Frequency. The Phase 2 change below dropped the interval to 60s
+ *        so the executor could drain the queue continuously. Correct for
+ *        execution — but it also multiplied six observability queries by
+ *        the same factor, feeding alerts whose cooldowns are 15 and 30
+ *        minutes. Most of those readings were discarded unread.
+ *
+ *     2. Query shape. PostgREST renders .not('col','is',null) as
+ *        NOT (col IS NULL). idx_aa_executed_at is a PARTIAL index
+ *        (WHERE executed_at IS NOT NULL) and Postgres's predicate prover
+ *        does not reliably match a negated NullTest against that
+ *        predicate — so the plan degraded to a sequential scan of all
+ *        289,272 rows. A strict comparison (>= epoch) does imply
+ *        IS NOT NULL and matches the partial index.
+ *
+ *     3. Cache pressure. The LP instance is a Micro — 256 MB
+ *        shared_buffers against a 6.1 GB database, 67% table cache hit
+ *        rate. Those two statements dragged ~33 TB off disk. Warm they
+ *        run in 0.02 ms; IO-starved they have hit 119,863 ms. That
+ *        two-minute tail is the same event that surfaces as sync
+ *        timeouts and analyzer silent drops.
+ *
+ *   Changes made here (execution cadence deliberately NOT touched — the
+ *   executor still runs every 60s):
+ *     a. hasPendingActions() uses a LIMIT 1 existence probe instead of
+ *        an exact count. It only ever asked "> 0".
+ *     b. getMostRecentExecutionAt() uses .gte(executed_at, EPOCH) so the
+ *        partial index applies.
+ *     c. getQueueStats() and getRecentFailedCount() sample every 5 min
+ *        (HEARTBEAT_OBSERVABILITY_INTERVAL_MS) instead of every cycle,
+ *        with last-known values cached and returned in between. No alert
+ *        can be missed: every alert cooldown is longer than the sample
+ *        interval. The limiter check reads in-process state, not the
+ *        database, so it still runs every cycle.
+ *
+ *   Still outstanding after this change (tracked separately):
+ *     - The same NOT (col IS NULL) pattern on system_events.processed_at
+ *       in decision-engine.js — 68,325 s over 89,838 calls.
+ *     - The Micro instance itself. This change removes the load that was
+ *       making the undersizing acute; it does not fix the undersizing.
+ *
  * DESIGN
  * ──────
  * Failover, not parallel. The scheduler:
@@ -82,6 +134,10 @@
  *                        n8n's 5-min cadence a 1-min buffer.
  *   HEARTBEAT_INTERVAL_MS — how often this scheduler wakes up. Default
  *                           5min — same as n8n cadence.
+ *   HEARTBEAT_OBSERVABILITY_INTERVAL_MS — how often the DB-backed queue
+ *                           stats + failed-action count are sampled.
+ *                           Default 5min. Set to 0 to sample every cycle
+ *                           (pre-2026-08-07 behavior).
  *   FIRST_RUN_DELAY_MS — initial wait on boot. Default 3min — gives
  *                        the server time to settle, n8n a chance to
  *                        fire first if it's healthy, and the reaper
@@ -93,6 +149,7 @@
  *     Forces a heartbeat check immediately (subject to staleness gate).
  *     Pass { force: true } in body to bypass both the pending-action
  *     gate AND the staleness gate and run executeActions unconditionally.
+ *     force: true also forces a fresh observability sample.
  *
  * OBSERVABILITY
  * ─────────────
@@ -101,6 +158,8 @@
  *     result summary (completed/failed/retrying counts)
  *   - On skip: logs the reason (`no_pending_actions` or `n8n_healthy`)
  *     and most-recent executed_at age in seconds when applicable
+ *   - queue_stats carries `sampled_at` and `stale` so a cached reading
+ *     is never mistaken for a live one
  */
 
 import supabase from './supabase.js';
@@ -175,21 +234,62 @@ const HEARTBEAT_INTERVAL_MS = parseInt(
   // executeActions prevents the route + timer from stacking.
   process.env.EXECUTOR_HEARTBEAT_INTERVAL_MS || '60000', 10
 );
-const FIRST_RUN_DELAY_MS = parseInt(
-  process.env.EXECUTOR_HEARTBEAT_FIRST_RUN_DELAY_MS || `${3 * 60 * 1000}`, 10
+
+// 2026-08-07 — decouple observability sampling from execution cadence.
+// The 60s interval above is right for DRAINING the queue. It is not right
+// for the DB-backed telemetry queries wrapped around it: those feed alerts
+// with 15- and 30-minute cooldowns, so a once-per-minute sample produced
+// readings nothing consumed while accounting for ~35% of all LP database
+// execution time. Sampling every 5 minutes cannot delay an alert by more
+// than one sample, which is well inside every cooldown.
+//
+// Set to 0 to restore per-cycle sampling without a redeploy.
+const OBSERVABILITY_INTERVAL_MS = parseInt(
+  process.env.HEARTBEAT_OBSERVABILITY_INTERVAL_MS || `${5 * 60 * 1000}`, 10
 );
 
+// Epoch sentinel. Used in place of .not('executed_at','is',null) — a strict
+// comparison implies IS NOT NULL, which lets Postgres match the partial index
+// idx_aa_executed_at (WHERE executed_at IS NOT NULL). The negated-NullTest
+// form that PostgREST generates does not match it and degrades to a seq scan.
+const EPOCH_ISO = '1970-01-01T00:00:00.000Z';
+
 let intervalHandle = null;
+
+// Cached observability sample. Returned between DB samples so callers always
+// have a reading; `sampled_at` / `stale` let them tell fresh from cached.
+let lastQueueStats = null;
+let lastQueueStatsAt = 0;
+let lastFailedCount = null;
+let lastFailedCountAt = 0;
+
+/**
+ * Should the DB-backed observability queries run this cycle?
+ * Always true when the interval is 0 (per-cycle mode) or on first run.
+ */
+function shouldSampleObservability(lastSampleAt) {
+  if (OBSERVABILITY_INTERVAL_MS <= 0) return true;
+  if (!lastSampleAt) return true;
+  return Date.now() - lastSampleAt >= OBSERVABILITY_INTERVAL_MS;
+}
 
 /**
  * Find the most recent executed_at timestamp across all agent_actions.
  * Returns ISO string or null if no actions have ever executed.
+ *
+ * 2026-08-07 — was .not('executed_at','is',null), which PostgREST renders
+ * as NOT (executed_at IS NULL). That form does not match the partial index
+ * idx_aa_executed_at and the planner fell back to a sequential scan of
+ * 289,272 rows, ~91,700 times (111,146 s of database time). A strict
+ * comparison against the epoch is logically identical — any non-null
+ * timestamp is >= 1970-01-01 — and Postgres proves it implies IS NOT NULL,
+ * so the partial index applies and this becomes an index scan with LIMIT 1.
  */
 async function getMostRecentExecutionAt() {
   const { data, error } = await supabase
     .from('agent_actions')
     .select('executed_at')
-    .not('executed_at', 'is', null)
+    .gte('executed_at', EPOCH_ISO)
     .order('executed_at', { ascending: false })
     .limit(1);
   if (error) {
@@ -207,26 +307,46 @@ async function getMostRecentExecutionAt() {
  * statuses (pending_approval, completed, failed, rejected, cancelled)
  * are not executor work — pending_approval waits for GroupMe approval,
  * the others are terminal.
+ *
+ * 2026-08-07 — was `count: 'exact', head: true`. The caller only ever
+ * asked whether the result was > 0, but an exact count makes Postgres
+ * visit every matching row. A LIMIT 1 existence probe answers the same
+ * question and stops at the first hit. Behavior is identical, including
+ * the fail-open branch below.
  */
 async function hasPendingActions() {
-  const { count, error } = await supabase
+  const { data, error } = await supabase
     .from('agent_actions')
-    .select('id', { count: 'exact', head: true })
-    .in('status', ['pending', 'executing']);
+    .select('id')
+    .in('status', ['pending', 'executing'])
+    .limit(1);
   if (error) {
-    console.warn(`[ExecutorHeartbeat] pending count failed: ${error.message}`);
+    console.warn(`[ExecutorHeartbeat] pending probe failed: ${error.message}`);
     // Fail-open: assume there might be work. Worst case is a benign
     // failover fire that finds nothing — same as old behavior.
     return true;
   }
-  return (count || 0) > 0;
+  return (data?.length || 0) > 0;
 }
 
 /**
  * Phase 4 — queue health snapshot for observability + alerting.
  * Returns pending depth, oldest-pending age, and executing count.
+ *
+ * 2026-08-07 — now sampled on OBSERVABILITY_INTERVAL_MS rather than every
+ * cycle. Pass { force: true } to bypass the sample gate (used by the
+ * /heartbeat-status route and by forced heartbeats, which must be live).
+ * Between samples the last reading is returned with stale: true.
  */
-async function getQueueStats() {
+async function getQueueStats({ force = false } = {}) {
+  if (!force && !shouldSampleObservability(lastQueueStatsAt) && lastQueueStats) {
+    return {
+      ...lastQueueStats,
+      sampled_at: new Date(lastQueueStatsAt).toISOString(),
+      stale: true,
+    };
+  }
+
   const [pendingRes, oldestRes, executingRes] = await Promise.all([
     supabase.from('agent_actions').select('id', { count: 'exact', head: true }).eq('status', 'pending'),
     supabase.from('agent_actions').select('created_at').eq('status', 'pending')
@@ -239,15 +359,36 @@ async function getQueueStats() {
   const oldestAgeMs = oldestPendingAt ? Date.now() - Date.parse(oldestPendingAt) : null;
   const executingCount = executingRes.count || 0;
 
-  return { pendingCount, oldestPendingAt, oldestAgeMs, executingCount };
+  lastQueueStats = { pendingCount, oldestPendingAt, oldestAgeMs, executingCount };
+  lastQueueStatsAt = Date.now();
+
+  return {
+    ...lastQueueStats,
+    sampled_at: new Date(lastQueueStatsAt).toISOString(),
+    stale: false,
+  };
 }
 
 /**
  * 2026-06-05 — recent failed-action count for the failure-rate alert.
  * Counts agent_actions that moved to 'failed' within the window. Returns
  * null on query error (caller treats null as "no signal").
+ *
+ * 2026-08-07 — sampled on OBSERVABILITY_INTERVAL_MS. This was the single
+ * most expensive statement on the LP database: 194,032 s across 90,290
+ * calls. The query itself is fine (Index Only Scan via idx_aa_status_updated,
+ * 0.113 ms warm) — it was the once-a-minute cadence against a cache-starved
+ * instance that made it the top cost. The alert it feeds has a 15-minute
+ * cooldown, so a 5-minute sample loses nothing.
+ *
+ * The window is measured from now() at sample time, so a cached reading is
+ * only reused inside the sample interval and never stretches the window.
  */
-async function getRecentFailedCount(windowMin) {
+async function getRecentFailedCount(windowMin, { force = false } = {}) {
+  if (!force && !shouldSampleObservability(lastFailedCountAt) && lastFailedCount !== null) {
+    return lastFailedCount;
+  }
+
   const cutoffIso = new Date(Date.now() - windowMin * 60 * 1000).toISOString();
   const { count, error } = await supabase
     .from('agent_actions')
@@ -258,7 +399,10 @@ async function getRecentFailedCount(windowMin) {
     console.warn(`[ExecutorHeartbeat] failed-count query failed: ${error.message}`);
     return null;
   }
-  return count || 0;
+
+  lastFailedCount = count || 0;
+  lastFailedCountAt = Date.now();
+  return lastFailedCount;
 }
 
 /**
@@ -268,6 +412,7 @@ async function getRecentFailedCount(windowMin) {
  * send failure is logged, never thrown.
  */
 async function maybeAlertQueueDepth(stats) {
+  if (!stats) return { alerted: false };
   const { alert, reasons } = shouldAlertQueueDepth(stats, {
     pendingThreshold: PENDING_ALERT_THRESHOLD,
     oldestAgeThresholdMs: OLDEST_AGE_ALERT_MS,
@@ -293,6 +438,10 @@ async function maybeAlertQueueDepth(stats) {
  * cumulative-counter deltas (timedOut, total429s) stay accurate.
  * Best-effort: a send failure is logged, never thrown. Returns the live
  * stats for the status route.
+ *
+ * Note: getRateLimiterStats() reads in-process memory, not the database,
+ * so this check is not part of the 2026-08-07 sampling change — it still
+ * runs every cycle and costs nothing.
  */
 async function maybeAlertLimiter() {
   let curr;
@@ -327,10 +476,16 @@ async function maybeAlertLimiter() {
  * 2026-06-05 — throttled GroupMe alert when the executor's failure rate
  * spikes over a short rolling window, independent of cause (limiter, GHL
  * 5xx, handler bug). Best-effort.
+ *
+ * 2026-08-07 — only evaluates on a fresh sample. A cached count is not
+ * re-tested, so the alert cannot double-fire off one reading.
  */
 async function maybeAlertFailedActions() {
+  const sampledNow = shouldSampleObservability(lastFailedCountAt);
   const failedCount = await getRecentFailedCount(FAILED_ACTION_WINDOW_MIN);
   if (failedCount == null) return { alerted: false };
+  if (!sampledNow) return { alerted: false, failedCount, cached: true };
+
   const { alert, reasons } = shouldAlertFailedActions(
     failedCount, FAILED_ACTION_WINDOW_MIN, FAILED_ACTION_ALERT_THRESHOLD
   );
@@ -400,19 +555,22 @@ export async function runHeartbeat({ force = false } = {}) {
     return { skipped: true, reason: 'EXECUTOR_HEARTBEAT_DISABLED=true' };
   }
 
-  // Phase 4 — queue observability + throttled backlog alert, every cycle
-  // (independent of whether we fire the executor). Best-effort.
+  // Phase 4 — queue observability + throttled backlog alert. Best-effort.
+  // 2026-08-07: sampled on OBSERVABILITY_INTERVAL_MS rather than every
+  // cycle. A forced heartbeat always takes a live sample.
   let queueStats = null;
   try {
-    queueStats = await getQueueStats();
-    await maybeAlertQueueDepth(queueStats);
+    queueStats = await getQueueStats({ force });
+    if (!queueStats.stale) await maybeAlertQueueDepth(queueStats);
   } catch (err) {
     console.warn(`[ExecutorHeartbeat] queue stats/alert failed: ${err.message}`);
   }
 
-  // 2026-06-05 — limiter-health + failure-rate alerts, every cycle. Kept
-  // in independent best-effort blocks so one failing source can't suppress
-  // the others or affect action execution below.
+  // 2026-06-05 — limiter-health + failure-rate alerts. Kept in independent
+  // best-effort blocks so one failing source can't suppress the others or
+  // affect action execution below. The limiter check reads in-process state
+  // and stays on every cycle; the failure-rate check is DB-backed and
+  // follows the sample interval.
   try {
     await maybeAlertLimiter();
   } catch (err) {
@@ -514,7 +672,7 @@ export function startExecutorHeartbeatScheduler() {
   }, FIRST_RUN_DELAY_MS);
 
   console.log(
-    `[ExecutorHeartbeat] Scheduler armed: stale_threshold=${STALE_THRESHOLD_MS}ms, interval=${HEARTBEAT_INTERVAL_MS}ms, first_run_delay=${FIRST_RUN_DELAY_MS}ms`
+    `[ExecutorHeartbeat] Scheduler armed: stale_threshold=${STALE_THRESHOLD_MS}ms, interval=${HEARTBEAT_INTERVAL_MS}ms, observability_interval=${OBSERVABILITY_INTERVAL_MS}ms, first_run_delay=${FIRST_RUN_DELAY_MS}ms`
   );
 }
 
@@ -523,10 +681,13 @@ export function startExecutorHeartbeatScheduler() {
  *   POST /n8n/decision-engine/heartbeat
  *     Manually trigger a heartbeat check. Body: { force?: boolean }.
  *     If force=true, bypasses both the pending-action gate and the
- *     staleness gate and runs executeActions unconditionally.
+ *     staleness gate and runs executeActions unconditionally. It also
+ *     forces a live observability sample.
  *
  *   GET /n8n/decision-engine/heartbeat-status
  *     Returns the current health state without firing the executor.
+ *     Always samples live — this route exists to answer "what is true
+ *     right now", so it is deliberately exempt from the sample interval.
  */
 export function registerExecutorHeartbeatRoutes(app) {
   app.post('/n8n/decision-engine/heartbeat', async (req, res) => {
@@ -544,11 +705,11 @@ export function registerExecutorHeartbeatRoutes(app) {
     try {
       const [health, queueStats, failedRecent] = await Promise.all([
         checkExecutorHealth(),
-        getQueueStats().catch((err) => {
+        getQueueStats({ force: true }).catch((err) => {
           console.warn(`[ExecutorHeartbeat] queue stats failed: ${err.message}`);
           return null;
         }),
-        getRecentFailedCount(FAILED_ACTION_WINDOW_MIN).catch(() => null),
+        getRecentFailedCount(FAILED_ACTION_WINDOW_MIN, { force: true }).catch(() => null),
       ]);
       const alertEval = queueStats
         ? shouldAlertQueueDepth(queueStats, {
@@ -578,6 +739,7 @@ export function registerExecutorHeartbeatRoutes(app) {
         ...health,
         stale_threshold_ms: STALE_THRESHOLD_MS,
         heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
+        observability_interval_ms: OBSERVABILITY_INTERVAL_MS,
         disabled: process.env.EXECUTOR_HEARTBEAT_DISABLED === 'true',
         queue_stats: queueStats,
         queue_alert: alertEval,
