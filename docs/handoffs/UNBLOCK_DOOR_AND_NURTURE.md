@@ -1,13 +1,27 @@
-# Claude Code Handoff — Unblock the door, feed the nurture layer, restore objection routing
+# Claude Code Handoff — Feed the nurture layer, restore objection routing
 
 **Prepared:** 2026-08-08
-**Supersedes the open question in PR #653.** That handoff blocked on a ruling about `suppress-automation`. The ruling is made below, with the evidence that decided it.
+**Last revised:** 2026-08-08 — Item 1 removed, see below.
 
-Three items, strictly ordered. **Item 1 must ship and be verified before Item 2**, because Item 2 routes leads through the door Item 1 opens.
+> ## ⛔ ITEM 1 HAS MOVED — DO NOT IMPLEMENT IT FROM THIS DOCUMENT
+>
+> The `suppress-automation` ruling stands (recorded below, unchanged). **The Item 1 implementation spec that used to live here has been removed because it contained a compliance defect.**
+>
+> The removed version widened `isSuppressionAuditTag` to cover `remove_tag`. That regex matches `dnc`, `do-not-contact` and `stop-bot`, so it would have let **any rule strip a consent tag** off a contact with no explicit opt-in. The add/remove asymmetry in that function is deliberate: adding suppression is always safe, removing it is not. `DNC_LIFT_ON_REENGAGEMENT` declares `bypass_suppression: true` precisely so the opt-in is the audit trail.
+>
+> It also sized the backfill at ~3,137. The real cohort is **1,525** — 1,956 of the carriers are `active-entry:canvassing` and must be excluded.
+>
+> **The current, correct Item 1 is `docs/handoffs/ITEM1_UNBLOCK_DOOR_FINAL.md`.** Use only that.
+
+**This document now covers Items 2 and 3 only.**
+
+Item 1 must still ship and verify **before** Item 2, because Item 2 routes leads through the door Item 1 opens.
 
 ---
 
 ## Ruling on `suppress-automation`: it must stop blocking mutations
+
+*(Retained here as the reasoning record. The implementation lives in `ITEM1_UNBLOCK_DOOR_FINAL.md`.)*
 
 ### What the tag actually means
 
@@ -19,9 +33,9 @@ Three items, strictly ordered. **Item 1 must ship and be verified before Item 2*
 | `LP_DISP_DNC` | 243 | 2026-04-15 | 2026-06-25 |
 | `MANUAL_TEST_CLEANUP` | 3 | — | — |
 
-`AUTOMATION_SUPPRESS_ON_BOOKING` fires when a lead **books an appointment**. It is the 48-hour post-booking marketing pause referenced in `suppression-check.js`. It is a courtesy pause on a *converting* lead — not a disqualification, not a compliance signal.
+`AUTOMATION_SUPPRESS_ON_BOOKING` fires when a lead **books an appointment**. It is the 48-hour post-booking marketing pause referenced in `suppression-check.js` — a courtesy pause on a *converting* lead, not a disqualification and not a compliance signal.
 
-Confirmed against the contact population: of 3,729 contacts carrying it, **zero are customers**, only 176 are `hard-disqualified`, and only 273 are consent-blocked. **3,137 are cleanly reachable** with no compliance reason of any kind.
+Confirmed against the contact population: of 3,729 contacts carrying it, **zero are customers**, only 176 are `hard-disqualified`, only 273 are consent-blocked. **3,137 are cleanly reachable** with no compliance reason of any kind.
 
 ### It is a closed loop
 
@@ -33,7 +47,7 @@ Confirmed against the contact population: of 3,729 contacts carrying it, **zero 
 | Currently carrying | 3,729 |
 | …of which also `agentic-active` | **3,052** |
 
-`isMutationGateExempt` exempts `add_tag` of an audit tag but **has no `remove_tag` exemption** — the code says so explicitly. So `suppress-automation` blocks its own removal. A 48-hour pause has become permanent for 3,729 contacts, and the bot is nominally in charge of 3,052 of them while every mutation against them is silently dropped.
+`isMutationGateExempt` exempts `add_tag` of an audit tag but has no `remove_tag` exemption, so `suppress-automation` blocks its own removal. A 48-hour pause became permanent for 3,729 contacts, and the bot is nominally in charge of 3,052 of them while every mutation against them is silently dropped.
 
 ### The codebase already ruled three times
 
@@ -47,104 +61,9 @@ Against one dissent: `MUTATION_SUPPRESS_TAGS`, added 2026-07-03 to fix a *"pipel
 
 **Remove `suppress-automation` from `MUTATION_SUPPRESS_TAGS`. Keep `stop-bot`.**
 
-`stop-bot` is a lead-initiated kill switch and stays exactly as it is — whatever the 2026-07-03 breach was, the gate still covers it for the tag that matters.
+`stop-bot` is a lead-initiated kill switch and stays exactly as it is.
 
-**This is not "delete the booking pause."** Pausing marketing on someone who just booked is correct: a Seinfeld email two hours after booking is a bad experience and off-framework. The defect is **scope** — a marketing pause was wired to block *every* mutation (stage moves, tag hygiene, opportunity updates, appointment sync) instead of *nurture enrollment*. The pause gets re-expressed correctly in Item 2.
-
----
-
-# ITEM 1 — Unblock the door
-
-### 1a. Narrow the mutation gate
-
-`src/services/suppression-check.js`:
-
-```js
-// BEFORE
-const MUTATION_SUPPRESS_TAGS = ['suppress-automation', 'stop-bot'];
-
-// AFTER
-// 2026-08-08 — `suppress-automation` removed. It is applied by
-// AUTOMATION_SUPPRESS_ON_BOOKING as a 48h post-booking marketing pause
-// (4,591 of 4,837 applications), NOT a disqualification: of 3,729 carriers,
-// zero are customers and 3,137 have no compliance tag of any kind.
-//
-// As a mutation blocker it was self-sealing — remove_tag has no audit
-// exemption, so the tag blocked its own removal (963 blocked removals
-// against 1,459 successful ones). A 48-hour pause became permanent for
-// 3,729 contacts, 3,052 of whom carry agentic-active.
-//
-// Three other call sites already treat this tag as a non-blocker
-// (SUPPRESS_TAGS 2026-05-14, send-message-handler v3.12, suppression-guard).
-// The booking pause it represents is re-expressed as a nurture-enrollment
-// gate in Item 2 — scoped to marketing, which is what it was always for.
-//
-// stop-bot stays. It is lead-initiated and universal.
-const MUTATION_SUPPRESS_TAGS = ['stop-bot'];
-```
-
-Update `scripts/test-suppression-and-tag-hygiene.js` — it asserts `matchMutationSuppression(['suppress-automation'])` returns the tag. Invert that assertion and add one proving `stop-bot` still matches.
-
-### 1b. Give `remove_tag` an audit exemption
-
-Without this the 3,729 backlog cannot self-clear and the loop can re-form.
-
-In `isMutationGateExempt`, mirror the existing `add_tag` exemption:
-
-```js
-if ((action.action_type === 'add_tag' || action.action_type === 'remove_tag')
-    && isSuppressionAuditTag(action.action_payload?.tag)) return true;
-```
-
-`SUPPRESSION_AUDIT_TAG_RE` already matches `suppress-`, so this covers it. Reason: removing a suppression tag is how suppression *ends*; a gate that blocks its own release is a trap, which is exactly what the 963 blocked removals show.
-
-### 1c. Backfill the stuck 3,729
-
-Once 1a and 1b are deployed, clear the tag from contacts whose booking pause has long expired. **Do not blanket-clear.** Exclude anyone with a live compliance or DQ signal:
-
-```sql
-SELECT ghl_contact_id FROM contact_tag_snapshot
-WHERE 'suppress-automation' = ANY(tags)
-  AND NOT ('stop-bot' = ANY(tags))
-  AND NOT ('dnc' = ANY(tags)) AND NOT ('do-not-contact' = ANY(tags))
-  AND NOT ('dnc-sms' = ANY(tags)) AND NOT ('stage:dnc' = ANY(tags))
-  AND NOT ('unsubscribed' = ANY(tags))
-  AND NOT ('hard-disqualified' = ANY(tags));
-```
-
-Expect ~3,137. Run it in **batches of 200** with a pause between, and watch the GHL rate limiter — the June token-starvation incident came from exactly this kind of bulk tag operation. Do not run it inside the executor; use a script with the limiter in front.
-
-### 1d. Make the pause actually expire
-
-`AUTOMATION_SUPPRESS_ON_BOOKING` has no TTL. Add a sweep (or a `pg_cron` job once installed) that removes `suppress-automation` from any contact whose booking is more than 48 hours old. Without this the population rebuilds at ~4,600/year.
-
-### Verification — do not proceed to Item 2 until all four pass
-
-```sql
--- 1. suppressed actions should collapse
-SELECT status, count(*) FROM agent_actions
-WHERE created_at > now() - interval '2 hours' GROUP BY status;
--- expect 'skipped'/'suppressed' share to drop sharply vs the ~42% baseline
-
--- 2. enrollment into S5.2 should start passing
-SELECT status, count(*) FROM agent_actions
-WHERE action_type='add_to_workflow' AND created_at > now() - interval '2 hours'
-GROUP BY status;
--- baseline was 60.8% blocked
-
--- 3. stop-bot must STILL block
-SELECT count(*) FROM agent_actions a
-JOIN contact_tag_snapshot t ON t.ghl_contact_id = a.target_id
-WHERE a.created_at > now() - interval '2 hours'
-  AND 'stop-bot' = ANY(t.tags) AND a.status = 'completed'
-  AND a.action_type NOT IN ('add_tag','remove_tag');
--- expect 0 (excluding bypass_suppression lifts)
-
--- 4. backlog clearing
-SELECT count(*) FROM contact_tag_snapshot WHERE 'suppress-automation' = ANY(tags);
-```
-
-⚠️ **Expect action volume and GHL API calls to RISE.** That is the intended outcome — ~25,500 mutations a month that were being dropped will now execute. Watch `getRateLimiterStats` for the first 24 hours. If the limiter queue deepens, throttle the 1c backfill first, not the live path.
+**This is not "delete the booking pause."** Pausing marketing on someone who just booked is correct — a Seinfeld email two hours after booking is a bad experience and off-framework. The defect is **scope**: a marketing pause was wired to block *every* mutation (stage moves, tag hygiene, opportunity updates, appointment sync) instead of *nurture enrollment*. It gets re-expressed correctly in Item 2's `context_conditions`.
 
 ---
 
@@ -178,15 +97,20 @@ priority:        ~60 (below objection routing, above generic nurture)
   "not_has_any_tag": [
     "customer", "lp-sale", "stop-bot", "do-not-contact", "dnc", "dnc-sms",
     "stage:dnc", "unsubscribed", "hard-disqualified", "suppress-automation",
-    "active-s4.5"
+    "active-entry:canvassing", "active-s4.5"
+  ],
+  "has_any_tag": [
+    "active-entry:estimate-calculator", "active-entry:high-intent-digital",
+    "active-entry:referral", "active-entry:chatbot", "active-entry:other"
   ],
   "no_future_appointment": true
 }
 ```
 
-Two things to note in that list:
+Notes on that block:
 
 - **`suppress-automation` is here.** This is where the booking pause belongs — gating *nurture enrollment*, which is what it was always for. Item 1 removes it as a universal mutation blocker; this restores its real purpose in the correct scope.
+- **The `has_any_tag` clause is required, not optional.** Mark's rule is that a canvassing lead becomes marketable only after re-entering with a **new** `active-entry:*`. A negative gate alone is unsafe: 193 contacts carry `entry:canvassing` with **no** `active-entry:*` at all (tag stripped, never replaced), and a negative-only gate would read that absence as re-entry. See `ITEM1_ADDENDUM_canvassing_gate.md` for the full reasoning and the open question about `active-entry:other`.
 - **`no_future_appointment`** is already implemented and in production use on `TRUST_REBUILD_HOLD_COMPLETE_TO_S1_1`. Do not Seinfeld someone with a booking on the calendar.
 - **`active-s4.5`** prevents double-enrollment. Confirm the actual active-tag convention for S4.5 before using this literal.
 
@@ -213,6 +137,8 @@ WHERE action_type='add_to_workflow'
   AND created_at > now() - interval '24 hours'
 GROUP BY status;
 ```
+
+Then re-run the canvassing guarantee from `ITEM1_ADDENDUM_canvassing_gate.md`. Any row is stop-the-line.
 
 Ramp deliberately. S4.5 is an **email** motion — Randy is the Attractive Character and brand law restricts him to email and video, never SMS. Going from 58 to several thousand enrollments in a day is a deliverability risk on a domain that has not carried that volume. **Cap the first week** (a few hundred), watch bounce and complaint rates, then lift.
 
@@ -272,6 +198,16 @@ Zero means the rule is correct and waiting. Leave it alone.
 Nothing in this handoff blocks that, and the sequencing is favourable: Items 1–3 fix *distribution*, and the Avatar improves *conversion* on traffic that reaches S1.3. Doing them in that order means the video launches into a funnel whose door is open rather than one dropping 60% of enrollments.
 
 Worth knowing before the shoot: among contacts who currently receive any message, the reply rate is ~37%. The creative is working. This is a distribution problem sitting on top of working creative, which is why Items 1–3 come first.
+
+---
+
+# Related documents
+
+| Document | Covers |
+|---|---|
+| `ITEM1_UNBLOCK_DOOR_FINAL.md` | **Item 1 — the authoritative implementation spec** |
+| `ITEM1_ADDENDUM_canvassing_gate.md` | The `active-entry:other` question and the `active-entry:*` invariant breach |
+| `SUPPRESSION_LEFT.md` | The `stop-bot` move-left work and the `HARD_DISQUALIFIED_CLOSEOUT` bug |
 
 ---
 
