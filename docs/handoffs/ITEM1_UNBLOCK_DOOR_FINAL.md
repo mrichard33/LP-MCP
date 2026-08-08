@@ -1,19 +1,23 @@
 # Claude Code Handoff — Item 1 (FINAL): Unblock the door, canvassing-safe
 
 **Prepared:** 2026-08-08
-**Approved by Mark:** proceed with unblocking, with two additions — protect `active-entry:canvassing` leads from sends, and fix the `remove_tag` exemption.
-**This supersedes Item 1 of PR #654.** Two things in that version were wrong or incomplete. Both are corrected below and called out explicitly.
+**Last revised:** 2026-08-08 — §1b rewritten with Mark's re-entry rule. This file is now self-contained.
+**Approved by Mark:** proceed with unblocking, with two additions — do not market canvassing leads until they re-enter, and fix the `remove_tag` exemption.
+
+**This is the authoritative Item 1 spec.** It supersedes Item 1 of `UNBLOCK_DOOR_AND_NURTURE.md`, which contained a compliance defect and has had that section removed.
+
+`ITEM1_ADDENDUM_canvassing_gate.md` is a companion, not a correction — it holds two open findings (the `active-entry:other` question and the `active-entry:*` invariant breach). The gate spec itself now lives here in §1b.
 
 ---
 
-## Corrections to PR #654
+## What was wrong in the earlier version
 
-### Correction 1 — the `remove_tag` exemption I specced was a compliance hole
+### 1 — the `remove_tag` exemption was a compliance hole
 
-PR #654 said to widen the existing exemption like this:
+The earlier spec said to widen the existing exemption:
 
 ```js
-// ❌ DO NOT DO THIS — from PR #654
+// ❌ DO NOT DO THIS
 if ((action.action_type === 'add_tag' || action.action_type === 'remove_tag')
     && isSuppressionAuditTag(action.action_payload?.tag)) return true;
 ```
@@ -24,15 +28,17 @@ if ((action.action_type === 'add_tag' || action.action_type === 'remove_tag')
 /^(dnc|dnc-|do-not-contact|stop-bot|suppress[-:]|hard-disqualified|quarantined|audit-|compliance-|loss-reason:)/i
 ```
 
-It matches `dnc`, `do-not-contact` and `stop-bot`. Exempting `remove_tag` against it would let **any** rule strip a consent tag off a contact with no explicit opt-in.
+It matches `dnc`, `do-not-contact` and `stop-bot`. Exempting `remove_tag` against it would let **any** rule strip a consent tag with no explicit opt-in.
 
-**The add/remove asymmetry is deliberate and correct.** Adding a suppression tag is always safe — it makes the system quieter. Removing one is not symmetric: it makes the system louder against someone who may have legally opted out. That is precisely why `DNC_LIFT_ON_REENGAGEMENT` has to declare `bypass_suppression: true` — the opt-in is the audit trail.
+**The add/remove asymmetry is deliberate.** Adding a suppression tag is always safe — it makes the system quieter. Removing one is not symmetric: it makes the system louder against someone who may have legally opted out. That is why `DNC_LIFT_ON_REENGAGEMENT` declares `bypass_suppression: true` — the opt-in *is* the audit trail. Corrected in §1c.
 
-The corrected fix is a **separate, narrow allow-list** covering operational suppressors only. See §1c.
+### 2 — the backfill cohort was wrong
 
-### Correction 2 — the backfill cohort was wrong
+Sized at ~3,137. **1,956 of the 3,729 carriers (52%) are `active-entry:canvassing`.** Real cohort: **1,525**.
 
-PR #654 sized it at ~3,137. **1,956 of the 3,729 carriers (52%) are `active-entry:canvassing`.** With canvassing excluded the real cohort is **1,525**.
+### 3 — the canvassing gate was negative-only
+
+`not_has_any_tag: ["active-entry:canvassing"]` is unsafe. Corrected in §1b.
 
 ---
 
@@ -45,11 +51,12 @@ PR #654 sized it at ~3,137. **1,956 of the 3,729 carriers (52%) are `active-entr
 | …**also `active-entry:canvassing`** | **1,956 (52%)** |
 | …clean of compliance/DQ tags | 3,137 |
 | **Final backfill cohort (canvassing excluded)** | **1,525** |
-| `active-entry:canvassing` total | 6,064 |
-| …also `agentic-active` | 3,854 |
-| …with `canvass-marketing-complete` | 195 |
+| `active-entry:canvassing` total | 6,065 |
+| `entry:canvassing` total | 6,416 |
+| …re-entered with a new `active-entry:*` | **295** |
+| …**`entry:canvassing` with NO `active-entry:*` at all** | **193** |
 
-Canvassing is the largest entry bucket in the system — 6,064 contacts, roughly half the snapshot population. Only 195 have completed the canvassing marketing cycle. Releasing automated marketing onto the other ~5,870 mid-cycle would collide with the canvassers working those doors.
+Canvassing is the largest entry bucket in the system, roughly half the snapshot population.
 
 ---
 
@@ -91,11 +98,19 @@ Update `scripts/test-suppression-and-tag-hygiene.js` — it currently asserts `m
 
 ---
 
-# §1b — Protect canvassing leads from outbound
+# §1b — Canvassing: market only after genuine re-entry
 
-Mark's requirement: do not send to active canvassing leads.
+### Mark's rule
 
-⚠️ **The exclusion cannot live in the backfill.** §1a is a global code change — once `suppress-automation` stops gating mutations, it stops gating them for canvassing contacts too, whether or not we clear their tag. Leaving the tag on them protects nothing. **The protection has to sit on the send path.**
+> Market a canvassing lead only after it re-enters the system with a **new** `active-entry:*` tag and no longer carries `active-entry:canvassing`.
+
+This matches the system's own invariant: `active-entry:*` is the **current** source and is swapped on re-entry; `entry:*` is permanent attribution. A canvassing lead who later fills out the calculator becomes `active-entry:estimate-calculator` / `entry:canvassing` — they have self-identified through a new channel and marketing is appropriate. While the canvasser is still working the door, it is not.
+
+**`canvass-marketing-complete` is NOT a graduation signal.** All 195 contacts carrying it still carry `active-entry:canvassing`. Ignore it for gating.
+
+### ⚠️ Where the protection must live
+
+**Not in the backfill.** §1a is a global code change — once `suppress-automation` stops gating mutations it stops gating them for canvassing contacts too, tag or no tag. Leaving the tag on them protects nothing. The protection sits on the **send path**.
 
 ### The universal floor
 
@@ -104,32 +119,70 @@ Add to `SUPPRESS_TAGS` in `src/services/suppression-check.js`:
 ```js
   // 2026-08-08 — canvassing leads are worked door-to-door by a human
   // canvasser. Automated marketing on top of an active canvassing cycle
-  // competes with the person standing on the doorstep. 6,064 contacts carry
-  // this; only 195 have canvass-marketing-complete, so the large majority are
-  // mid-cycle.
+  // competes with the person standing on the doorstep. 6,065 contacts carry
+  // this — the largest entry bucket in the system.
   //
-  // Deliberately placed in SUPPRESS_TAGS (the default mode) and NOT in
+  // Deliberately in SUPPRESS_TAGS (default mode) and NOT in
   // REPLY_BLOCKING_TAGS: if a canvassed homeowner texts us back, the bot
   // should still answer. This blocks proactive outbound and nurture, not a
   // direct reply — matching the 2026-07-07 always-respond policy.
   'active-entry:canvassing',
 ```
 
-This gives exactly the semantics asked for. `checkSuppression(id, { mode: 'default' })` blocks proactive sends. `mode: 'agentic_reply'` on an `agentic-active` contact still lets a direct reply through, because `active-entry:canvassing` is not in `REPLY_BLOCKING_SET`.
+### The rule-level gate — MUST be two-clause
 
-### Defence in depth at the rule layer
+⚠️ **A negative gate alone is unsafe and would violate Mark's rule.**
 
-Mirroring the existing pattern (`AGENTIC_RESPOND_POST_CHATBOT` carries a rule-level `not_has_any_tag` backstop over the universal floor), add to the `context_conditions` of every nurture-enrollment rule — including the S4.5 rule when Item 2 ships:
+| Cohort | Contacts | Marketable? |
+|---|---:|---|
+| `active-entry:canvassing` present | 6,065 | ❌ No |
+| `entry:canvassing` + new `active-entry:*` | **295** | ✅ Yes — genuine re-entry |
+| `entry:canvassing` + **no `active-entry:*` at all** | **193** | ❌ **No — did not re-enter** |
+
+Those 193 had `active-entry:canvassing` stripped and never replaced. They are canvassing leads with a **missing** tag, not leads who came back through a new channel. `not_has_any_tag: ["active-entry:canvassing"]` reads that absence as re-entry and would market to all 193 — the exact outcome the rule prevents.
+
+Require a new `active-entry:*` to be **present**:
 
 ```json
-{ "not_has_any_tag": ["active-entry:canvassing", "suppress-automation"] }
+{
+  "not_has_any_tag": ["active-entry:canvassing", "suppress-automation"],
+  "has_any_tag": [
+    "active-entry:estimate-calculator",
+    "active-entry:high-intent-digital",
+    "active-entry:referral",
+    "active-entry:chatbot",
+    "active-entry:other"
+  ]
+}
 ```
 
-**This is also where the booking pause belongs.** §1a removes `suppress-automation` as a universal mutation blocker; this line restores it in its correct scope — gating nurture enrollment, which is what it was always for.
+Both clauses required. The first excludes active canvassing; the second proves a real re-entry rather than a tag going missing.
 
-### Open question for Mark — do NOT decide unilaterally
+`suppress-automation` sits in the negative clause deliberately — **this is where the booking pause belongs.** §1a removes it as a universal mutation blocker; this restores its real purpose, gating nurture enrollment.
 
-`canvass-marketing-complete` exists on 195 contacts, which implies a graduation path out of the canvassing cycle. If that tag is the intended "safe to market to now" signal, the gate should be `active-entry:canvassing AND NOT canvass-marketing-complete` rather than a blanket block, and those 195 should flow. Confirm the intent before choosing. The blanket block is the safe default until then.
+Apply to every nurture-enrollment rule, including the S4.5 rule when Item 2 ships. This mirrors the existing pattern where `AGENTIC_RESPOND_POST_CHATBOT` carries a rule-level backstop over the universal floor.
+
+**Enumerate the live values before writing** — do not trust the list above to be complete:
+
+```sql
+SELECT t AS active_entry, count(*) FROM contact_tag_snapshot, unnest(tags) t
+WHERE t LIKE 'active-entry:%' GROUP BY t ORDER BY 2 DESC;
+```
+
+If a new entry bucket ships later and is not added here, those leads are silently excluded from marketing. Leave a comment on the rule saying the list must be maintained alongside the E.x entry bridges.
+
+### ⚠️ Confirm `active-entry:other` with Mark before shipping
+
+243 of the 295 re-entries (**82%**) land in `active-entry:other`. Before treating that as a marketing trigger, confirm what writes it:
+
+- A genuine catch-all entry bridge for a real low-volume source → marketing is appropriate.
+- The router's **fallback** when it cannot classify a source → then it means "we don't know," not "they re-entered," and marketing 243 canvassing leads on that basis is not what Mark asked for.
+
+`active-entry:other` is 3,494 contacts system-wide, the second-largest bucket, and there are 544 unmapped LP sources — a fallback is plausible. **If it is a fallback, drop it from `has_any_tag`;** the marketable cohort becomes 52, which is small but correct and grows as classification improves.
+
+### Coverage gap to be aware of
+
+`SUPPRESS_TAGS` is a flat list and cannot express the two-clause condition. So the floor blocks the 6,065 active canvassing contacts — the large majority of the risk — while **the 193 missing-tag contacts are caught only by the rule-level `has_any_tag` clause.** Every nurture-enrollment rule must carry it. If a nurture path is added later without it, those 193 leak. See §A2 of the addendum for the durable fix.
 
 ---
 
@@ -226,10 +279,10 @@ Expected: **1,525**.
 
 - Batches of **200**, with a pause between.
 - Run from a script with the GHL rate limiter in front. **Not** through the executor.
-- Watch `getRateLimiterStats()` between batches. The June 4/5 token-starvation incident came from exactly this shape of bulk tag operation, and it ran ~12 hours silently.
+- Watch `getRateLimiterStats()` between batches. The June 4/5 token-starvation incident came from exactly this shape of bulk tag operation and ran ~12 hours silently.
 - Stop immediately if the limiter wait queue exceeds 15 (the existing `LIMITER_QUEUE_ALERT_THRESHOLD`).
 
-Canvassing contacts keep their `suppress-automation` tag. That is now cosmetic for mutations, and §1b is what actually protects them. Revisit once the canvassing cycle question in §1b is answered.
+Canvassing contacts keep their `suppress-automation` tag. That is now cosmetic for mutations; §1b is what actually protects them.
 
 ---
 
@@ -263,18 +316,33 @@ WHERE a.created_at > now() - interval '2 hours'
   AND a.action_type NOT IN ('add_tag','remove_tag');
 -- expect 0
 
--- 4. THE CANVASSING GUARANTEE — no outbound to active canvassing leads
-SELECT count(*) FROM agent_actions a
+-- 4. THE CANVASSING GUARANTEE — run this FIRST, any row is stop-the-line.
+-- Keys on entry:canvassing (permanent attribution), NOT active-entry:canvassing,
+-- so it also catches the 193 contacts whose active-entry tag went missing.
+-- Direct replies are exempt by design — inspect any row before calling it a
+-- failure.
+SELECT a.id, a.rule_applied, a.action_type, a.target_id
+FROM agent_actions a
 JOIN contact_tag_snapshot t ON t.ghl_contact_id = a.target_id
 WHERE a.action_type IN ('send_message','add_to_workflow')
-  AND a.status='completed'
-  AND 'active-entry:canvassing' = ANY(t.tags)
-  AND a.created_at > now() - interval '2 hours';
--- expect 0, EXCEPT direct replies (mode='agentic_reply'), which are allowed
--- by design. Inspect any rows before treating them as failures.
+  AND a.status = 'completed'
+  AND a.created_at > now() - interval '2 hours'
+  AND 'entry:canvassing' = ANY(t.tags)
+  AND NOT EXISTS (
+    SELECT 1 FROM unnest(t.tags) x
+    WHERE x LIKE 'active-entry:%' AND x <> 'active-entry:canvassing'
+  );
+-- expect 0
+
+-- 5. POSITIVE CONTROL — genuine re-entries must NOT be blocked
+SELECT count(*) FROM contact_tag_snapshot t
+WHERE 'entry:canvassing' = ANY(t.tags)
+  AND EXISTS (SELECT 1 FROM unnest(t.tags) x
+              WHERE x LIKE 'active-entry:%' AND x <> 'active-entry:canvassing');
+-- expect ~295 (or ~52 if active-entry:other is excluded)
 ```
 
-Check #4 first and treat any unexpected row as a stop-the-line event.
+Checks 4 and 5 must both pass. The first proves nothing leaks; the second proves the gate is not simply blocking everyone.
 
 **After the backfill:**
 
@@ -300,11 +368,22 @@ Watch the rate limiter for the first 24 hours. If it deepens, throttle the §1d 
 
 ---
 
+# Related documents
+
+| Document | Covers |
+|---|---|
+| `ITEM1_ADDENDUM_canvassing_gate.md` | `active-entry:other` question; `active-entry:*` invariant breach (1,209 contacts) |
+| `UNBLOCK_DOOR_AND_NURTURE.md` | Items 2 and 3, plus the `suppress-automation` reasoning record |
+| `SUPPRESSION_LEFT.md` | `stop-bot` move-left work; `HARD_DISQUALIFIED_CLOSEOUT` bug |
+
+---
+
 # Working rules
 
 1. §1a–§1c ship together. §1d only after they verify. §1e can follow.
 2. **The negative tests in §1c are the compliance boundary.** Do not weaken them.
-3. Never gate a rule that sets `bypass_suppression: true` — both `DNC_LIFT_ON_REENGAGEMENT_*` rules must keep firing on `stop-bot` contacts.
-4. Reload the Decision Engine after any `agent_rules` change; assert the `rules_loaded` delta.
-5. `node --check` is a parse, not verification — see `test/executor-heartbeat.smoke.test.js`.
-6. Feature branch off `main`, PR, Mark merges. Never commit to `main`.
+3. **The `has_any_tag` clause in §1b is not optional.** Without it, 193 contacts leak.
+4. Never gate a rule that sets `bypass_suppression: true` — both `DNC_LIFT_ON_REENGAGEMENT_*` rules must keep firing on `stop-bot` contacts.
+5. Reload the Decision Engine after any `agent_rules` change; assert the `rules_loaded` delta.
+6. `node --check` is a parse, not verification — see `test/executor-heartbeat.smoke.test.js`.
+7. Feature branch off `main`, PR, Mark merges. Never commit to `main`.
