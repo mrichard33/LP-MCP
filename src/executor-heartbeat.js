@@ -104,6 +104,33 @@
  *     - The Micro instance itself. This change removes the load that was
  *       making the undersizing acute; it does not fix the undersizing.
  *
+ * 2026-08-08 — HOTFIX: restore FIRST_RUN_DELAY_MS.
+ *   The 2026-08-07 change above was delivered as a whole-file rewrite, and
+ *   it silently dropped the `const FIRST_RUN_DELAY_MS` declaration while
+ *   leaving both of its use sites intact (the setTimeout delay in
+ *   startExecutorHeartbeatScheduler and the "Scheduler armed" log line).
+ *   The constant stayed described in the TUNING block below, which made
+ *   the omission easy to miss on review.
+ *
+ *   Deploy b493f767 (commit 7f2d64e, PR #648) CRASHED on boot:
+ *
+ *     ReferenceError: FIRST_RUN_DELAY_MS is not defined
+ *         at startExecutorHeartbeatScheduler (src/executor-heartbeat.js:672:6)
+ *         at Server.<anonymous> (src/index.js:1102:3)
+ *
+ *   The entire LP MCP service went down with it for 52 minutes (17:53 to
+ *   18:45 UTC) — MCP server, sync engine, Decision Engine, Action
+ *   Executor, every admin route — because the scheduler is armed from the
+ *   server's listen callback and the throw was not caught there.
+ *   Recovered by rolling Railway back to the PR #647 deployment.
+ *
+ *   Why CI did not catch it: the required check is `node --check`, which
+ *   is a parse. An undeclared identifier is a runtime ReferenceError, not
+ *   a syntax error, so the file parsed clean. A parse check cannot catch
+ *   this class of defect in a whole-file rewrite — only loading the
+ *   module and calling its exported entry points can. See
+ *   test/executor-heartbeat.smoke.test.js, added alongside this fix.
+ *
  * DESIGN
  * ──────
  * Failover, not parallel. The scheduler:
@@ -246,6 +273,15 @@ const HEARTBEAT_INTERVAL_MS = parseInt(
 // Set to 0 to restore per-cycle sampling without a redeploy.
 const OBSERVABILITY_INTERVAL_MS = parseInt(
   process.env.HEARTBEAT_OBSERVABILITY_INTERVAL_MS || `${5 * 60 * 1000}`, 10
+);
+
+// 2026-08-08 hotfix — this declaration was dropped in the PR #648 rewrite
+// while both of its use sites survived, crashing the service on boot with
+// ReferenceError: FIRST_RUN_DELAY_MS is not defined. Do not remove: it is
+// read in startExecutorHeartbeatScheduler() below, both as the setTimeout
+// delay and in the "Scheduler armed" log line.
+const FIRST_RUN_DELAY_MS = parseInt(
+  process.env.EXECUTOR_HEARTBEAT_FIRST_RUN_DELAY_MS || `${3 * 60 * 1000}`, 10
 );
 
 // Epoch sentinel. Used in place of .not('executed_at','is',null) — a strict
@@ -652,6 +688,13 @@ export async function runHeartbeat({ force = false } = {}) {
 /**
  * Start the in-process heartbeat scheduler. Idempotent — calling twice
  * is a no-op.
+ *
+ * NOTE: index.js calls this from the server's listen callback, which is
+ * not wrapped in try/catch. Anything that throws synchronously here takes
+ * the entire process down — that is exactly how the 2026-08-08
+ * FIRST_RUN_DELAY_MS regression became a full outage rather than a
+ * degraded heartbeat. Keep this function free of anything that can throw
+ * at call time.
  */
 export function startExecutorHeartbeatScheduler() {
   if (intervalHandle) return;
@@ -740,6 +783,7 @@ export function registerExecutorHeartbeatRoutes(app) {
         stale_threshold_ms: STALE_THRESHOLD_MS,
         heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
         observability_interval_ms: OBSERVABILITY_INTERVAL_MS,
+        first_run_delay_ms: FIRST_RUN_DELAY_MS,
         disabled: process.env.EXECUTOR_HEARTBEAT_DISABLED === 'true',
         queue_stats: queueStats,
         queue_alert: alertEval,
