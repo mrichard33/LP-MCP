@@ -1,97 +1,101 @@
-# ADDENDUM to ITEM1_UNBLOCK_DOOR_FINAL.md — §1b canvassing gate, corrected
+# Companion to ITEM1_UNBLOCK_DOOR_FINAL.md — open findings
 
 **Prepared:** 2026-08-08
-**Read this instead of §1b in `ITEM1_UNBLOCK_DOOR_FINAL.md`.** Everything else in that document stands unchanged.
+**Last revised:** 2026-08-08 — §A1 RULED by Mark. Gate spec moved into the parent document.
+
+> **The canvassing gate spec now lives in `ITEM1_UNBLOCK_DOOR_FINAL.md` §1b**, which is self-contained. This file is no longer a correction to it — it holds three findings that came out of the same investigation and need their own work.
+>
+> | | |
+> |---|---|
+> | **§A1** | `active-entry:other` — **RULED: it is a fallback.** Drop it from the gate. Fixing it is real work; scoped below. |
+> | **§A2** | `active-entry:*` invariant breach — 1,209 contacts have none |
+> | **§A3** | `lp_unmapped_sources.lead_count` is a broken counter |
 
 ---
 
-## Mark's rule
+## §A1 — `active-entry:other` is a fallback. RULED.
 
-> "I only want to market a canvassing lead after it re-enters our system with a new `active-entry:*` tag and no longer the tag `active-entry:canvassing`."
+**Mark's ruling: it is a fallback that needs fixing.** Two consequences, one immediate and one structural.
 
-This is the right rule and it matches the system's own invariant: `active-entry:*` is the **current** source and is swapped on re-entry, while `entry:*` is permanent attribution. A canvassing lead who later fills out the calculator becomes `active-entry:estimate-calculator` / `entry:canvassing`, and at that point they have self-identified through a new channel. Marketing them is appropriate. Marketing them while a canvasser is still working the door is not.
+### Immediate — it comes out of the gate
 
-**It also settles the open question from §1b.** `canvass-marketing-complete` is **not** a graduation signal — all 195 contacts carrying it still carry `active-entry:canvassing`. Ignore it for gating purposes, exactly as Mark's rule does.
-
----
-
-## ⚠️ The gate must be POSITIVE, not negative
-
-This is the correction. `not_has_any_tag: ["active-entry:canvassing"]` **is not safe** and would violate the intent of the rule.
-
-Measured population:
-
-| Cohort | Contacts | Marketable under Mark's rule? |
-|---|---:|---|
-| `active-entry:canvassing` present | 6,065 | ❌ No |
-| `entry:canvassing`, new `active-entry:*` present | **295** | ✅ Yes — genuine re-entry |
-| `entry:canvassing`, **no `active-entry:*` at all** | **193** | ❌ **No — did not re-enter** |
-
-Those 193 contacts had `active-entry:canvassing` stripped and never replaced. They are canvassing leads with a **missing** tag, not leads who came back through a new channel. A negative gate reads "canvassing tag absent" as "re-entered" and would market to all 193 — the precise outcome the rule exists to prevent.
-
-### The correct gate
-
-Require a new `active-entry:*` to be **present**, not merely require the canvassing one to be absent:
+Drop `active-entry:other` from the `has_any_tag` clause in `ITEM1_UNBLOCK_DOOR_FINAL.md` §1b. The clause becomes:
 
 ```json
 {
-  "not_has_any_tag": ["active-entry:canvassing"],
+  "not_has_any_tag": ["active-entry:canvassing", "suppress-automation"],
   "has_any_tag": [
     "active-entry:estimate-calculator",
     "active-entry:high-intent-digital",
     "active-entry:referral",
-    "active-entry:chatbot",
-    "active-entry:other"
+    "active-entry:chatbot"
   ]
 }
 ```
 
-Both clauses are required. The first excludes active canvassing; the second proves a real re-entry happened rather than a tag going missing.
+Marketable canvassing re-entry cohort: **295 → 52.**
 
-**Before writing this, enumerate the live values** — do not trust the list above to be complete:
+| New `active-entry:*` | Contacts | In gate? |
+|---|---:|---|
+| `active-entry:other` | 243 | ❌ **dropped — fallback** |
+| `active-entry:referral` | 28 | ✅ |
+| `active-entry:high-intent-digital` | 10 | ✅ |
+| `active-entry:estimate-calculator` | 9 | ✅ |
+| `active-entry:chatbot` | 5 | ✅ |
+
+### The evidence that makes this more than a technicality
+
+Joining the 3,494 `active-entry:other` contacts back to their LP lead source:
+
+| LP `lead_source_detail` | Contacts on `other` |
+|---|---:|
+| Lead Gurus | 1,232 |
+| *(no LP lead found)* | 697 |
+| Modernize | 466 |
+| MyHomePros | 293 |
+| MVP Marketing | 218 |
+| HomeBuddy | 71 |
+| **Canvass Sticky** | **64** |
+| Porch101 | 55 |
+| Prolific Marketing | 39 |
+| Simpletext | 33 |
+
+**64 of them are `Canvass Sticky` — canvassing leads sitting in the fallback bucket.** Had `active-entry:other` stayed in the gate, those 64 would have been marketed as "re-entered." That is a direct breach of Mark's rule, produced entirely by the fallback. This is not a hypothetical risk; it is 64 contacts today.
+
+Note also that ~80% of the 3,494 have a resolvable LP source. Only 697 are genuinely unknown.
+
+### Structural — stop assigning the fallback
+
+`active-entry:other` is 3,494 contacts, the second-largest entry bucket. **All routing checks `active-entry:*`**, so every one of those contacts routes to a generic path instead of the entry bridge that matches how they actually arrived. That degrades E.x bridge selection, story-arc choice, and source attribution simultaneously.
+
+Three pieces of work, in order:
+
+**1. Map the sources that matter.** `lp_unmapped_sources` holds 544 unmapped combinations, none reviewed. Map `lead_source_detail` → entry bucket for the sources carrying real current volume:
+
+| `lead_source_detail` | Leads, last 90 days |
+|---|---:|
+| Modernize | 5,301 |
+| Lead Gurus | 3,942 |
+| Canvass | 3,922 |
+| MyHomePros | 2,365 |
+| Porch101 | 992 |
+| Simpletext | 570 |
+| Google PPC Windows | 452 |
+| Contractor Appointment-West | 231 |
+
+⚠️ **Prioritise by 90-day volume, not by `lp_unmapped_sources.lead_count`** — that column is broken, see §A3. Ranking by it would send you to map "Contractor Appointment Rev Share" first, which has produced **32 leads in 90 days**.
+
+**2. Reclassify the existing 3,494.** ~2,800 have a resolvable LP source and can be re-derived. The 64 `Canvass Sticky` contacts should become `active-entry:canvassing`, which also removes them from the marketable cohort permanently rather than by gate exclusion. Run behind the rate limiter in batches, same discipline as the §1d backfill.
+
+**3. Make the fallback loud.** A silent fallback is what let 3,494 contacts accumulate unnoticed. When the router cannot classify a source it should still assign `active-entry:other` — never fail the contact — but also emit a `system_event` so the unmapped source surfaces. Weekly, not per-lead; the point is visibility, not noise.
+
+**Do not gate on `active-entry:other` anywhere else either.** Grep `agent_rules` for it before shipping:
 
 ```sql
-SELECT t AS active_entry, count(*) FROM contact_tag_snapshot, unnest(tags) t
-WHERE t LIKE 'active-entry:%' GROUP BY t ORDER BY 2 DESC;
+SELECT rule_key FROM agent_rules
+WHERE enabled AND (conditions::text ILIKE '%active-entry:other%'
+                OR context_conditions::text ILIKE '%active-entry:other%');
 ```
-
-If a new entry bucket ships later and is not added here, those leads are silently excluded from marketing. That failure mode is quiet, so leave a comment on the rule saying the list must be maintained alongside the E.x entry bridges.
-
-### Placement
-
-Unchanged from §1b: the universal floor goes in `SUPPRESS_TAGS` (default mode), **not** `REPLY_BLOCKING_TAGS`, so a canvassed homeowner who texts us still gets an answer. The rule-level gate above is defence in depth on nurture-enrollment rules.
-
-Note that `SUPPRESS_TAGS` is a flat list and cannot express the two-clause condition. So:
-
-- **`SUPPRESS_TAGS`** keeps the simple `'active-entry:canvassing'` entry — that correctly blocks the 6,065 active canvassing leads, which is the large majority of the risk.
-- **The 193 no-tag contacts are not covered by that floor.** They are caught by the rule-level `has_any_tag` clause. Every nurture-enrollment rule must carry it. If a nurture path is added later without it, those 193 leak.
-
-A cleaner long-term fix is §A2 below — repair the invariant so the 193 stop existing.
-
----
-
-## §A1 — `active-entry:other` is doing most of the work. Confirm it before shipping.
-
-Of the 295 genuine re-entries:
-
-| New `active-entry:*` | Contacts |
-|---|---:|
-| `active-entry:other` | **243** |
-| `active-entry:referral` | 28 |
-| `active-entry:high-intent-digital` | 10 |
-| `active-entry:estimate-calculator` | 9 |
-| `active-entry:chatbot` | 5 |
-
-**82% of re-entries land in `other`.** Before treating that as a marketing trigger, confirm what writes it. Two very different possibilities:
-
-- It is a genuine catch-all entry bridge (E.x) for a real, low-volume source → marketing is appropriate.
-- It is the router's **fallback** when it cannot classify a source → then `active-entry:other` means "we don't know," not "they re-entered," and marketing 243 canvassing leads on that basis is not what Mark asked for.
-
-This matters: `active-entry:other` is 3,494 contacts system-wide, the second-largest bucket. Combined with **544 unmapped LP sources**, a classification fallback is plausible.
-
-**If `other` turns out to be a fallback, drop it from the `has_any_tag` list.** The marketable cohort then becomes 52 contacts rather than 295 — small, but correct, and it stays correct as the properly-classified buckets grow.
-
-Ask Mark. Do not decide this one in code.
 
 ---
 
@@ -113,47 +117,41 @@ Breakdown of the 1,209:
 | Has some other `entry:*` | 269 |
 | Has `entry:canvassing` | **193** |
 
-The "exactly one" half of the invariant holds perfectly, which is good news — it means the gate above is unambiguous for the 10,914 contacts that have a tag. But 10% of the snapshot is unrouteable by any `active-entry:*`-based rule, and **all routing checks `active-entry:*`**. These contacts are invisible to the routing layer.
+The "exactly one" half holds perfectly, which is why the gate in §1b is unambiguous for the 10,914 that have a tag. But 10% of the snapshot is unrouteable by any `active-entry:*`-based rule, and all routing checks `active-entry:*`. These contacts are invisible to the routing layer.
 
-This is out of scope for Item 1 and should not delay it. Log it as its own investigation:
+Out of scope for Item 1; should not delay it. Its own investigation:
 
 1. What strips `active-entry:*` without replacing it? Look for `remove_tag` actions on `active-entry:*` with no paired `add_tag`.
-2. Are the 747 with no `entry:*` either simply pre-dating the entry-tag system? Check their `created_at`.
-3. A repair sweep could re-derive `active-entry:*` from `entry:*` where the latter exists — 462 of the 1,209 have one. That would shrink the leak surface for the gate above from 193 to 0.
+2. Are the 747 with no `entry:*` simply pre-dating the entry-tag system? Check their `created_at`.
+3. A repair sweep could re-derive `active-entry:*` from `entry:*` where it exists — 462 of the 1,209 qualify. That would shrink the §1b leak surface from 193 to 0 and is the durable fix for it.
+
+This shares a root cause with §A1: both are the routing layer losing track of where a lead came from. Worth doing them together.
 
 ---
 
-## Verification — replaces check #4 in the parent document
+## §A3 — `lp_unmapped_sources.lead_count` is a broken counter
 
-```sql
--- THE CANVASSING GUARANTEE. Any row here is stop-the-line.
--- Blocks both active canvassing AND canvassing leads whose active-entry
--- tag went missing (the 193). Direct replies are exempt by design —
--- inspect any row before treating it as a failure.
-SELECT a.id, a.rule_applied, a.action_type, a.target_id
-FROM agent_actions a
-JOIN contact_tag_snapshot t ON t.ghl_contact_id = a.target_id
-WHERE a.action_type IN ('send_message','add_to_workflow')
-  AND a.status = 'completed'
-  AND a.created_at > now() - interval '2 hours'
-  AND 'entry:canvassing' = ANY(t.tags)
-  AND NOT EXISTS (
-    SELECT 1 FROM unnest(t.tags) x
-    WHERE x LIKE 'active-entry:%' AND x <> 'active-entry:canvassing'
-  );
--- expect 0
-```
+It is incrementing per sync cycle rather than per distinct lead, so it overstates by roughly an order of magnitude and the error scales with how long a source has existed — which means it systematically over-ranks old, dead sources.
 
-Note this checks `entry:canvassing` (permanent attribution), not `active-entry:canvassing`. That is deliberate — it catches the 193 missing-tag contacts that a check on the active tag alone would miss.
+| `source_subdetail` | `lead_count` says | Actual `lp_leads` | Last 90 days |
+|---|---:|---:|---:|
+| Contractor Appointment Rev Share | 211,656 | 28,162 | **32** |
+| MyHomePros | 131,397 | 5,974 | 2,365 |
+| Porch101 | 90,854 | 6,216 | 992 |
+| Canvass Sticky | 52,950 | 3,233 | 106 |
 
-Positive control — confirm genuine re-entries are NOT being blocked:
+The top figure exceeds the entire `lp_leads` table (229,548 rows), which is the tell.
 
-```sql
-SELECT count(*) FROM contact_tag_snapshot t
-WHERE 'entry:canvassing' = ANY(t.tags)
-  AND EXISTS (SELECT 1 FROM unnest(t.tags) x
-              WHERE x LIKE 'active-entry:%' AND x <> 'active-entry:canvassing');
--- expect ~295 (or ~52 if active-entry:other is excluded per §A1)
-```
+Also every row has `reviewed = false` — the review workflow the table implies has never been used.
 
-Both checks must pass. The first proves nothing leaks; the second proves the gate is not simply blocking everyone.
+**Impact:** anyone prioritising source-mapping work from this column maps dead sources first. Fix the increment to be per distinct `lp_lead_id`, or drop the column and compute volume from `lp_leads` on demand. Until then, treat the column as unusable and rank by the 90-day query in §A1.
+
+---
+
+## Verification — canvassing guarantee
+
+Both checks live in `ITEM1_UNBLOCK_DOOR_FINAL.md` under "Verification" (checks 4 and 5). Two notes on why they are shaped the way they are:
+
+**Check 4 keys on `entry:canvassing`, not `active-entry:canvassing`.** `entry:*` is permanent attribution, so it stays on a contact forever — that is precisely what makes it a reliable net. It catches the 193 whose `active-entry:canvassing` was stripped and never replaced; a check on the active tag alone cannot see them. The check does not over-fire on genuine re-entries, because its second clause requires the absence of *any* non-canvassing `active-entry:*` — a lead who really came back has one, and drops out of the result.
+
+**Check 5 is the positive control**, and its expected value changes with this ruling: **~52, not ~295**, now that `active-entry:other` is excluded. If it returns ~295, the gate still has the fallback in it.
