@@ -21,7 +21,7 @@ process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test-key';
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 
 import {
   parseCsv, csvToObjects, detectReportFromHeader, parseCsvDateTimeET,
@@ -31,17 +31,73 @@ import {
   parseCsvMoneyCents, parseMoneyCents, parseMoneyCentsExact,
   contentSha256, isUniqueViolation,
 } from '../src/jobs/lp-report-common.js';
-import { parseMilestoneCsv, validateMilestoneCsv, computeMilestoneTotals } from '../src/jobs/lp-report-parse-milestone-csv.js';
-import { parseSourceCostCsv } from '../src/jobs/lp-report-parse-source-cost.js';
+import {
+  parseMilestoneCsv, validateMilestoneCsv, computeMilestoneTotals,
+  REQUIRED as MILESTONE_REQUIRED,
+} from '../src/jobs/lp-report-parse-milestone-csv.js';
+import {
+  parseSourceCostCsv, validateSourceCostCsv, REQUIRED as SOURCE_COST_REQUIRED,
+} from '../src/jobs/lp-report-parse-source-cost.js';
+import {
+  parseJobStatusCsv, validateJobStatusCsv, REQUIRED as JOB_STATUS_REQUIRED,
+} from '../src/jobs/lp-report-parse-job-status.js';
+import {
+  parseLeadDispositionCsv, validateLeadDispositionCsv, REQUIRED as LEAD_DISP_REQUIRED,
+} from '../src/jobs/lp-report-parse-lead-disposition.js';
+import {
+  parseSalesEfficiencyCsv, validateSalesEfficiency, CSV_REQUIRED as SALES_EFF_REQUIRED,
+} from '../src/jobs/lp-report-parse-sales-efficiency.js';
+import {
+  parseApptStatsCsv, validateApptStatsCsv, REQUIRED as APPT_STATS_REQUIRED,
+} from '../src/jobs/lp-report-parse-appt-stats.js';
 
 const FIX = 'scripts/fixtures/lp-reports';
 const read = (f) => readFileSync(`${FIX}/${f}`, 'utf8');
+
+/**
+ * Every report's parse contract in one place: the columns it demands, the
+ * function that parses, the function that validates.
+ *
+ * Exported REQUIRED lists are what make the structural test below possible —
+ * without them a parser's column demands are invisible to anything but the
+ * parser, which is exactly how 133 drifted.
+ */
+const REGISTRY = {
+  job_status_ytd: {
+    required: JOB_STATUS_REQUIRED, parse: parseJobStatusCsv, validate: validateJobStatusCsv,
+  },
+  jobs_by_milestone: {
+    required: MILESTONE_REQUIRED, parse: parseMilestoneCsv, validate: validateMilestoneCsv,
+  },
+  lead_disposition: {
+    required: LEAD_DISP_REQUIRED, parse: parseLeadDispositionCsv, validate: validateLeadDispositionCsv,
+  },
+  source_cost: {
+    required: SOURCE_COST_REQUIRED, parse: parseSourceCostCsv, validate: (p) => validateSourceCostCsv(p),
+  },
+  sales_efficiency: {
+    required: SALES_EFF_REQUIRED, parse: parseSalesEfficiencyCsv, validate: (p) => validateSalesEfficiency(p, {}),
+  },
+  appt_stats_by_rep_source: {
+    required: APPT_STATS_REQUIRED, parse: parseApptStatsCsv, validate: (p) => validateApptStatsCsv(p),
+  },
+};
+
+/** Every committed CSV fixture, discovered — a new one is covered on drop. */
+const CSV_FIXTURES = readdirSync(FIX).filter((f) => f.endsWith('.csv')).sort();
+
+/** Physical lines, ignoring the trailing newline at EOF. */
+const physicalLines = (text) => {
+  const lines = text.split(/\r?\n/);
+  if (lines[lines.length - 1] === '') lines.pop();
+  return lines.length;
+};
 
 // ── §C  header fingerprint routing ──────────────────────────────────────────
 
 test('§C every one of the five reports resolves from its header alone', () => {
   const cases = [
-    ['report-133-jobs-by-status.csv', 'job_status_ytd', '133'],
+    ['report-133-job-status-mar.csv', 'job_status_ytd', '133'],
     ['report-134-jobs-by-milestone.csv', 'jobs_by_milestone', '134'],
     ['report-135-lead-disposition.csv', 'lead_disposition', '135'],
     ['report-136-source-cost.csv', 'source_cost', '136'],
@@ -84,18 +140,22 @@ test('§C every fingerprinted report has a deterministic content sort key', () =
 // ── §C  RFC-4180: embedded newlines ─────────────────────────────────────────
 
 test('§C 133 record count differs from line count — newlines live inside quotes', () => {
-  const text = read('report-133-jobs-by-status.csv');
+  const text = read('report-133-job-status-mar.csv');
   const records = parseCsv(text);
-  const physicalLines = text.split('\n').length;
-  assert.ok(records.length < physicalLines,
-    `records (${records.length}) must be fewer than lines (${physicalLines})`);
-  assert.equal(records.length - 1, 5, 'five data rows');
+  assert.equal(records.length - 1, 525, 'the March export has 525 data rows');
+  assert.ok(records.length < physicalLines(text),
+    `records (${records.length}) must be fewer than lines (${physicalLines(text)})`);
 
-  // The note survived intact, newlines and all — a \n split would have made
-  // this row four broken records.
+  // Notes survive intact, newlines and all — a \n split would have turned each
+  // of these into several broken records and truncated the file.
   const { rows } = csvToObjects(text);
-  assert.match(rows[0].MostRecentNoteHOA, /HOA board meets the second Tuesday\.\nSubmitted packet/);
-  assert.equal(rows[0].MostRecentNoteHOA.split('\n').length, 3);
+  // 65 raw cells carry a newline; 62 still do after the parser trims, the other
+  // three wrapping only at the very start or end of the note.
+  const wrapped = rows.filter((r) => /\n/.test(r.MostRecentNoteHOA ?? ''));
+  assert.equal(wrapped.length, 65, '65 notes wrap in the March export');
+  assert.ok(wrapped[0].MostRecentNoteHOA.split('\n').length >= 2);
+  // Every row still has all 28 columns — the proof no record was split.
+  assert.ok(records.slice(1).every((r) => r.length === 28), 'a wrapped cell broke a record');
 });
 
 test('§C a UTF-8 BOM never contaminates the first header name', () => {
@@ -468,49 +528,101 @@ test('134 CSV rejects a file whose header is not 134 at all', () => {
 //      NULL, is_partial_month NULL, and could therefore NEVER close a period —
 //      the closing pull would land and change nothing.
 
-test('every committed CSV fixture parses with its report\'s real parser', async () => {
-  const parsers = {
-    job_status_ytd: (await import('../src/jobs/lp-report-parse-job-status.js')).parseJobStatusCsv,
-    jobs_by_milestone: parseMilestoneCsv,
-    lead_disposition: (await import('../src/jobs/lp-report-parse-lead-disposition.js')).parseLeadDispositionCsv,
-    source_cost: parseSourceCostCsv,
-    sales_efficiency: (await import('../src/jobs/lp-report-parse-sales-efficiency.js')).parseSalesEfficiencyCsv,
-  };
-  const fixtures = [
-    'report-133-jobs-by-status.csv', 'report-134-jobs-by-milestone.csv',
-    'report-135-lead-disposition.csv', 'report-136-source-cost.csv',
-    'report-137-sales-efficiency-ytd.csv',
-  ];
-  for (const file of fixtures) {
+// ── THE STRUCTURAL TEST — fingerprint and parser must not drift apart ───────
+//
+// This is the guard that would have caught report 133 before production. Its
+// fingerprint had already been re-keyed to the NEW export (`id`, `District`,
+// `Market`, `custname`, `Status`, `MostRecentNoteHOA`) while its REQUIRED still
+// demanded `cst_id` / `NETDATE` / `statusdate` / `FinAmount` / `descr` /
+// `RepName` / `FinCo` from the OLD one. So the router accepted every file and
+// the parser then refused it — `csv_shape_unrecognized` on every single send,
+// with the two halves of the contract each individually looking correct.
+//
+// Nothing short of running BOTH halves against the same bytes finds that. Each
+// fixture is therefore taken through the whole chain:
+//
+//   1. detectReportFromHeader resolves it to exactly one report,
+//   2. that report's REQUIRED is a SUBSET of the fixture's real header,
+//      compared case-insensitively (the router matches that way, so a parser
+//      that is stricter is a parser that rejects files the router accepted),
+//   3. the parser runs to completion and validate() returns ok.
+//
+// Fixtures are DISCOVERED from disk, not listed, so a new export dropped into
+// the directory is covered without touching this file.
+
+test('structural: every fixture fingerprints, satisfies its parser\'s REQUIRED, parses and validates', () => {
+  assert.ok(CSV_FIXTURES.length >= 6, 'fixture directory looks empty — check FIX path');
+  const seen = new Set();
+
+  for (const file of CSV_FIXTURES) {
     const text = read(file);
-    // Routing and parsing must agree: whatever the header says it is, that
-    // report's parser must accept it.
-    const { reportType } = detectReportFromHeader(parseCsv(text)[0]);
-    const parsed = parsers[reportType](text);
+    const header = parseCsv(text)[0];
+
+    // 1. routing
+    const { reportType } = detectReportFromHeader(header);
+    const entry = REGISTRY[reportType];
+    assert.ok(entry, `${file} routed to ${reportType}, which has no REGISTRY entry`);
+    seen.add(reportType);
+
+    // 2. REQUIRED ⊆ header, case-insensitively — the missing set is printed,
+    //    because "which column" is the entire diagnostic value of this failure.
+    const present = new Set(header.map((h) => String(h).trim().toLowerCase()));
+    const missing = entry.required.filter((c) => !present.has(String(c).toLowerCase()));
+    assert.deepEqual(missing, [],
+      `${file} → ${reportType}: parser REQUIRED demands ${JSON.stringify(missing)}, `
+      + 'which the shipped export does not have. Fingerprint and parser have drifted.');
+
+    // 3. parse + validate
+    const parsed = entry.parse(text);
     assert.ok(parsed.rows.length > 0, `${file} → ${reportType} produced no rows`);
+    const v = entry.validate(parsed);
+    assert.equal(v.ok, true,
+      `${file} → ${reportType} failed validation: ${JSON.stringify(v.violations)}`);
+  }
+
+  // All six reports are represented; a report losing its last fixture is itself
+  // a regression, not a quietly smaller test.
+  assert.deepEqual([...seen].sort(), Object.keys(REGISTRY).sort());
+});
+
+// ── §C  only 133 wraps ──────────────────────────────────────────────────────
+//
+// 133 prints free-text HOA notes with literal newlines inside the quoted cell,
+// so its record count and physical line count legitimately differ (525 records
+// across 728 lines in March). Every other report is one line per record.
+//
+// Both directions are asserted. A future export that STARTS wrapping is caught
+// as loudly as a 133 parse that stops handling it — the failure mode there is
+// silent truncation, which looks like a smaller month rather than a bug.
+
+test('§C 133 is the only report with newlines inside quoted fields', () => {
+  for (const file of CSV_FIXTURES) {
+    const text = read(file);
+    const { reportType } = detectReportFromHeader(parseCsv(text)[0]);
+    const records = REGISTRY[reportType].parse(text).rows.length;
+    const lines = physicalLines(text);
+
+    if (reportType === 'job_status_ytd') {
+      assert.notEqual(lines, records + 1,
+        `${file}: 133 must carry embedded newlines — ${records} records over ${lines} lines`);
+      assert.ok(lines > records + 1, `${file}: more records than lines is impossible`);
+    } else {
+      assert.equal(lines, records + 1,
+        `${file} (${reportType}): ${records} records over ${lines} lines — this export has `
+        + 'started wrapping cells and the parser must be checked for silent truncation');
+    }
   }
 });
 
-test('§D every CSV parser surfaces CurrentDateTime WITH its time', async () => {
-  const parsers = {
-    job_status_ytd: (await import('../src/jobs/lp-report-parse-job-status.js')).parseJobStatusCsv,
-    jobs_by_milestone: parseMilestoneCsv,
-    lead_disposition: (await import('../src/jobs/lp-report-parse-lead-disposition.js')).parseLeadDispositionCsv,
-    source_cost: parseSourceCostCsv,
-    sales_efficiency: (await import('../src/jobs/lp-report-parse-sales-efficiency.js')).parseSalesEfficiencyCsv,
-  };
-  for (const file of [
-    'report-133-jobs-by-status.csv', 'report-134-jobs-by-milestone.csv',
-    'report-135-lead-disposition.csv', 'report-136-source-cost.csv',
-    'report-137-sales-efficiency-ytd.csv',
-  ]) {
+test('§D every CSV parser surfaces CurrentDateTime WITH its time', () => {
+  for (const file of CSV_FIXTURES) {
     const text = read(file);
     const { reportType } = detectReportFromHeader(parseCsv(text)[0]);
-    const { header } = parsers[reportType](text);
+    const { header } = REGISTRY[reportType].parse(text);
 
-    assert.ok(header.generatedAt, `${reportType} must report generatedAt — NULL can never close a period`);
-    assert.equal(header.generatedAtTruncated, false, `${reportType} lost the time component`);
+    assert.ok(header.generatedAt, `${file}: ${reportType} must report generatedAt — NULL can never close a period`);
+    assert.equal(header.generatedAtTruncated, false, `${file}: ${reportType} lost the time component`);
     assert.notEqual(header.generatedAt.slice(11), '00:00:00.000Z',
-      `${reportType} landed as midnight — that is the truncation bug`);
+      `${file}: ${reportType} landed as midnight — that is the truncation bug`);
   }
 });

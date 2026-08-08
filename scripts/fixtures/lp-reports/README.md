@@ -95,10 +95,13 @@ the PDF fixtures above are legacy. `scripts/test-lp-csv-cutover.js` and
 | `report-138-appt-stats-jan.csv` | 138 Appointment Stats by Sales Rep with Source | **REAL** — January 2026, 345 rows, 79 reps, 17 sources |
 | `report-137-sales-efficiency-jan.csv` | 137 Sales Efficiency | **REAL** — January 2026, 9 branch rows |
 | `report-137-sales-efficiency-ytd.csv` | 137 Sales Efficiency | **REAL** — the 2026-08-05 YTD export, 10 branch rows, cents-exact |
+| `report-137-sales-efficiency-feb.csv` | 137 Sales Efficiency | **REAL** — February 2026, 9 branch rows |
 | `report-136-source-cost-jan.csv` | 136 Marketing Sub-Source Cost 2 | **REAL** — January 2026, 66 sub-sources |
+| `report-136-source-cost-feb.csv` | 136 Marketing Sub-Source Cost 2 | **REAL** — February 2026, 68 sub-sources |
 | `report-135-lead-disposition-jan-slice.csv` | 135 Lead Disposition Detail 2 | **REAL, SLICED** — 338 of January's 10,032 rows |
+| `report-135-lead-disposition-feb-slice.csv` | 135 Lead Disposition Detail 2 | **REAL, SLICED** — 400 of February's 12,444 rows |
 | `report-134-jobs-by-milestone-mar.csv` | 134 Jobs by Milestone Date | **REAL** — March 2026, 365 rows |
-| `report-133-jobs-by-status.csv` | 133 Jobs By Status | synthetic — no real export has been supplied |
+| `report-133-job-status-mar.csv` | 133 Jobs By Status | **REAL** — March 2026, 525 rows, 729 physical lines |
 | `report-134-jobs-by-milestone.csv` | 134 Jobs by Milestone Date | synthetic (superseded by the March file above; kept for its money-notation cases) |
 | `report-135-lead-disposition.csv` | 135 Lead Disposition Detail | synthetic (superseded by the slice above) |
 | `report-136-source-cost.csv` | 136 Marketing Sub-Source Cost 2 | synthetic (superseded by the January file above) |
@@ -119,11 +122,15 @@ the PDF fixtures above are legacy. `scripts/test-lp-csv-cutover.js` and
   sub-source names on distinct rows.
 - **135 slice** — all 22 `Category` values, all 16 `src_id` values, and 64
   blank-`brn_id` rows (the `UNASSIGNED` bucket that must never be dropped).
-
-Note that **133 is the report with newlines inside quoted fields**
-(`MostRecentNoteHOA`), not 135 — January's 135 export contains none. The
-synthetic 133 fixture is still the one that pins that behaviour, and it stays
-until a real 133 export is supplied.
+- **133 March** — the real export, and the reason the parser was rewritten on
+  2026-08-07. It pins: 525 records against 729 physical lines (newlines inside
+  quoted `MostRecentNoteHOA` — **133 is the only report that does this**, not
+  135); the 14 shipped statuses and their buckets, footing `completed` 331 +
+  `lost` 167 + `in_production` 25 + `hoa` 1 + `permit` 1 = 525; `ContractDate`'s
+  **two-digit year** (`03/01/26`), which `parseCsvDate` rejects and `parseDateMDY`
+  does not; `TotalDue`'s four-decimal form on 478 rows and its 18 **negative**
+  values; a duplicate `id` (414605 on two jobs) proving `lp_id` is not a row key;
+  and `contractid` = `'NEW'` on 8 rows.
 
 ### Why 135 is a slice
 
@@ -137,16 +144,39 @@ same arrangement the bbox fixture above uses.
 
 ### Producing or replacing one
 
-Raw exports are **never** committed. Redact first:
+Raw exports are **never** committed. Redact with the script — it encodes the
+rules below per report and identifies the report by HEADER FINGERPRINT, never by
+filename, so a renamed export cannot be redacted against the wrong column list:
 
-1. Save the scheduled-email attachment.
-2. Replace customer names, phones, emails and street addresses with synthetic
-   values. **Preserve row count, column count and order, embedded newlines, and
-   every numeric value exactly** — those are what the goldens assert.
-   Employee names stay: `Salesrep` (138) and `SalesRepName` (134) are not
-   customer PII, and rep-level goldens depend on them. Only `FullName` — the
-   report runner — is replaced.
-3. `npm test` — the suite must stay green. If a total moves, the redaction
+```sh
+node scripts/redact-lp-csv.mjs ~/Downloads/_260807120011_Export.csv \
+     scripts/fixtures/lp-reports/report-133-job-status-mar.csv
+node scripts/redact-lp-csv.mjs ~/Downloads/_135_Export.csv \
+     scripts/fixtures/lp-reports/report-135-lead-disposition-feb-slice.csv --slice 400
+```
+
+The rules it applies:
+
+1. Customer names, phones, emails, street addresses and city become synthetic
+   (`Surname0000, Given0000`, `(555)555-0000`, `person0000@example.com`,
+   `City0000`). Free text — 133's `MostRecentNoteHOA` — has its **letters**
+   masked with the digits, punctuation and **embedded newlines left intact**.
+2. **Row count, column count and order, embedded newlines, and every numeric
+   value survive exactly** — those are what the goldens assert.
+3. Employee names stay: `Salesrep` (138), `SalesRepName` / `Manager` (134) are
+   not customer PII and rep-level goldens depend on them. Only the report
+   RUNNER is replaced — `FullName` / `fullname` → `Dana Whitfield`, `EmpName`
+   (136) → `dwhitfield`.
+4. `npm test` — the suite must stay green. If a total moves, the redaction
    touched a number and must be redone.
 
-Same doctrine as the PDF fixtures above: mask glyphs, never structure.
+Same doctrine as the PDF fixtures above: mask glyphs, never structure. The
+structural test in `scripts/test-lp-csv-cutover.js` re-parses every committed
+fixture with its own report's parser and requires `validate()` to pass, so a
+redaction that damaged a file fails the suite rather than sitting unnoticed.
+
+### Still outstanding
+
+The **133 January export (484 rows)** has not been supplied. When it arrives,
+redact it to `report-133-job-status-jan.csv` and add it to the fixture table in
+`test-lp-csv-cutover.js` — the structural test picks it up with no other change.
