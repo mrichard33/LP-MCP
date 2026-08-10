@@ -177,6 +177,13 @@ $function$;
 
 -- ── (b) the reaper must learn the new type as well ──────────────────────────
 --
+-- SUPERSEDED-BY(lp_csv_reap_orphan_snapshots): 2026-08-10_snapshot_empty_release.sql
+--
+-- The version below is kept as the record of what was applied at this point in
+-- the day, but it is NOT the definition in force. Its predicate
+-- (finalized_at IS NULL AND source_format = 'csv') was wrong on both counts and
+-- was replaced hours later — see the newer file. Do not read this as current.
+--
 -- Found the hard way, minutes after (a) was applied: the orphan left by the
 -- failed 134 attempts passed lp_csv_reap_orphan_snapshots' source_format='csv'
 -- predicate and was STILL skipped, because that function decides "did this

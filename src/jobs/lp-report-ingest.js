@@ -226,6 +226,56 @@ export async function findExistingSnapshot({ reportType, fileSha, contentSha }) 
  * file is fine and replaying it would only repeat this, but visibly NOT a
  * success. Clearing the orphan is an operator action; nothing is deleted here.
  */
+/**
+ * Rows actually loaded for a snapshot. `null` = we cannot tell (unknown type or
+ * the lookup failed), which every caller must treat as "assume it has rows" —
+ * guessing empty is how a good snapshot would get released.
+ *
+ * Backed by the SQL lp_snapshot_row_count so the JS probe path and the reaper
+ * agree on what "empty" means.
+ */
+export async function snapshotRowCount(snapshotId) {
+  if (!supabase || !snapshotId) return null;
+  const { data, error } = await supabase.rpc('lp_snapshot_row_count', { p_snapshot_id: snapshotId });
+  if (error) {
+    console.error(`[LPReport] row-count probe failed for ${snapshotId}: ${error.message}`);
+    return null;
+  }
+  return data == null ? null : Number(data);
+}
+
+/**
+ * A matched snapshot that holds NO rows is not a duplicate — it is a corpse
+ * still holding the unique key.
+ *
+ * ══ THE FALSE SUCCESS THIS EXISTS TO STOP ══
+ *
+ * Observed 2026-08-10: eight consecutive uploads of 138 January/February
+ * returned `{success: true, duplicate: true, matched_on: 'content_sha256'}`
+ * while NOTHING landed. The disposition gate had rejected an earlier attempt
+ * AFTER lp_csv_ingest_begin committed, so a zero-row snapshot survived holding
+ * the content hash, and every later post matched it and was told it was fine.
+ *
+ * A duplicate response means "these bytes are already stored". If the snapshot
+ * they matched is empty, that claim is false. Release the corpse and let the
+ * ingest proceed.
+ *
+ * @returns {Promise<boolean>} true when the snapshot was released (caller proceeds)
+ */
+export async function releaseIfEmpty(snapshotId, reason) {
+  const rows = await snapshotRowCount(snapshotId);
+  if (rows == null || rows > 0) return false;   // unknown or populated → leave it
+  const { error } = await supabase.rpc('lp_csv_release_snapshot', {
+    p_snapshot_id: snapshotId, p_reason: reason,
+  });
+  if (error) {
+    console.error(`[LPReport] could not release empty snapshot ${snapshotId}: ${error.message}`);
+    return false;
+  }
+  console.warn(`[LPReport] released EMPTY snapshot ${snapshotId} (${reason}) — it was holding a unique key against a zero-row load`);
+  return true;
+}
+
 export async function duplicateResponse(err, { reportType, fileSha, contentSha, done }) {
   if (!isUniqueViolation(err)) return null;
   const hit = await findExistingSnapshot({ reportType, fileSha, contentSha });
@@ -246,6 +296,31 @@ export async function duplicateResponse(err, { reportType, fileSha, contentSha, 
       success: false, rejected: true, reason: 'orphaned_snapshot',
       failure_reason: 'orphaned_snapshot',
       snapshot_id: hit.id, matched_on: matchedOn, sha256: fileSha,
+    };
+  }
+
+  // Before calling it a duplicate, make sure the thing it matched actually
+  // holds the data. An empty match is a stale collision, not a duplicate.
+  //
+  // This attempt still does not land — the key is only released now, after the
+  // insert already failed — so it must NOT report success. It is a rejection
+  // that says "re-send and it will work", in the same 200-shaped vocabulary as
+  // orphaned_snapshot: a 5xx would make n8n replay a file that is not at fault.
+  if (hit?.id && await releaseIfEmpty(hit.id, `stale collision on ${matchedOn}: zero rows loaded`)) {
+    await done('failed', {
+      snapshot_id: hit.id,
+      failure_reason: 'stale_empty_snapshot',
+      detail: {
+        matched_on: matchedOn, is_current: hit.isCurrent,
+        constraint: err.details ?? err.message ?? null,
+        message: 'these bytes collided with a snapshot holding ZERO rows — it has now been '
+          + 'released, so re-sending this file will land. It was never a duplicate.',
+      },
+    });
+    return {
+      success: false, rejected: true, reason: 'stale_empty_snapshot',
+      failure_reason: 'stale_empty_snapshot',
+      snapshot_id: hit.id, matched_on: matchedOn, sha256: fileSha, released: true,
     };
   }
 

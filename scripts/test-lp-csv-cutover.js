@@ -425,10 +425,21 @@ test('§A the duplicate response says success:true — n8n must not page on it',
   // what let a remediation re-send read as landed while nothing changed.
   // The rule is narrower now — the ONLY failure admitted here is that orphan,
   // and it must still be a 200-shaped rejection so n8n does not replay.
+  // TWO failure shapes now, and both are 200-shaped rejections:
+  //   orphaned_snapshot    — began, never finalized, still holds the key
+  //   stale_empty_snapshot — collided with a snapshot holding ZERO rows; the
+  //                          key is released here, so a re-send lands
+  // The second exists because eight consecutive 138 uploads on 2026-08-10 were
+  // told `duplicate: true` against empty snapshots while nothing landed. A
+  // duplicate claims "these bytes are already stored"; against a zero-row
+  // snapshot that claim is false, and a false success is worse than a rejection.
   const failures = body.match(/success:\s*false[^}]*\}/g) ?? [];
-  assert.equal(failures.length, 1, 'exactly one failure shape on this path: the orphan');
-  assert.match(failures[0], /rejected:\s*true/, 'the orphan is a rejection, not a 500');
-  assert.match(failures[0], /orphaned_snapshot/, 'and names itself');
+  assert.equal(failures.length, 2, 'exactly two failure shapes: the orphan and the stale empty');
+  for (const f of failures) {
+    assert.match(f, /rejected:\s*true/, `a 200-shaped rejection, not a 500: ${f.slice(0, 60)}`);
+  }
+  assert.ok(failures.some((f) => /orphaned_snapshot/.test(f)), 'the orphan names itself');
+  assert.ok(failures.some((f) => /stale_empty_snapshot/.test(f)), 'the stale empty names itself');
 });
 
 test('§A an UNFINALIZED match is an orphan, never a benign duplicate', () => {
@@ -661,6 +672,11 @@ function latestFunctionSource(fnName) {
     const body = readFileSync(`${dir}/${f}`, 'utf8');
     const at = body.indexOf(`CREATE OR REPLACE FUNCTION public.${fnName}(`);
     if (at === -1) continue;
+    // Filename order alone is not enough: same-day migrations sort by SLUG, so
+    // a later-applied file can sort before an earlier one and be shadowed by it
+    // (…_snapshot_empty_release vs …_jobs_by_milestone_csv_rows). A file that
+    // declares its own definition superseded is skipped outright.
+    if (body.includes(`SUPERSEDED-BY(${fnName})`)) continue;
     const end = body.indexOf('$function$;', at);
     found = { file: f, src: body.slice(at, end === -1 ? undefined : end) };
   }
@@ -683,6 +699,7 @@ test('§5 every CSV slug is wired through ALL five layers', () => {
   const rows = latestFunctionSource('lp_csv_ingest_rows');
   const finalize = latestFunctionSource('lp_csv_ingest_finalize');
   const reaper = latestFunctionSource('lp_csv_reap_orphan_snapshots');
+  const rowCount = latestFunctionSource('lp_snapshot_row_count');
 
   for (const t of types) {
     // 1. JS dispatch — otherwise the file is parsed by nothing.
@@ -698,19 +715,31 @@ test('§5 every CSV slug is wired through ALL five layers', () => {
     // 4. finalize row-count branch — otherwise "non-CSV report_type".
     assert.match(finalize.src, new RegExp(`s\\.report_type = '${t}'`),
       `${t}: no lp_csv_ingest_finalize branch (${finalize.file})`);
-    // 5. reaper branch — otherwise its orphans are silently never cleared.
-    assert.match(reaper.src, new RegExp(`r\\.report_type = '${t}'`),
-      `${t}: no lp_csv_reap_orphan_snapshots branch (${reaper.file}) — orphans of this type are unreapable`);
+    // 5. row-count branch — otherwise its empties cannot be counted, so the
+    //    reaper skips them AND the duplicate probe cannot tell an empty match
+    //    from a real one. ONE ladder, used by both.
+    assert.match(rowCount.src, new RegExp(`v_type = '${t}'`),
+      `${t}: no lp_snapshot_row_count branch (${rowCount.file}) — its empties are invisible to the reaper and to the duplicate probe`);
   }
 });
 
-test("§5 the reaper's unknown-type arm complains instead of skipping mutely", () => {
-  const { src } = latestFunctionSource('lp_csv_reap_orphan_snapshots');
-  const elseArm = src.slice(src.lastIndexOf('ELSE'));
-  assert.match(elseArm, /RAISE WARNING/,
-    'an unreapable type must announce itself — a silent CONTINUE reads as "nothing to reap"');
-  assert.match(src, /source_format = 'csv'/,
-    'and the csv scope stays: PDF snapshots rest at finalized_at IS NULL permanently, 6 of them is_current');
+test('§5 an uncountable type is skipped LOUDLY, by both the reaper and the counter', () => {
+  const reaper = latestFunctionSource('lp_csv_reap_orphan_snapshots').src;
+  const counter = latestFunctionSource('lp_snapshot_row_count').src;
+
+  // The reaper no longer carries its own per-type ladder — it delegates to
+  // lp_snapshot_row_count, so there is ONE place a new type must be taught
+  // rather than two that can disagree.
+  assert.match(reaper, /lp_snapshot_row_count\(/, 'the reaper delegates row counting');
+  assert.ok(!/r\.report_type = '/.test(reaper),
+    'and keeps no second copy of the type ladder');
+
+  // An unknown type must reach the reaper as NULL and be skipped with a
+  // warning. Returning 0 there would abandon a snapshot holding real data.
+  assert.match(counter.slice(counter.lastIndexOf('ELSE')), /RETURN NULL/,
+    'the counter returns NULL for a type it does not know — never 0');
+  assert.match(reaper, /v_rows IS NULL[\s\S]{0,200}?RAISE WARNING/,
+    'and the reaper announces that skip rather than passing over it mutely');
 });
 
 // ── §7: cohort_basis is REPORTED and STORED from one source ────────────────
@@ -781,4 +810,69 @@ test('§6 every ingest route is signature-guarded, and the fail-open is LOUD', (
     'the supplied signature value is never interpolated into a log line');
   assert.match(common, /provided \? 'mismatched' : 'absent'/,
     'the rejection log distinguishes a wrong signature from a missing one, without printing either');
+});
+
+// ── Addendum A/B: an EMPTY snapshot is never a duplicate ───────────────────
+//
+// The highest-priority finding of the 2026-08-10 backfill. POSTing 138 January
+// and February returned `{success: true, duplicate: true, matched_on:
+// 'content_sha256'}` against snapshots holding ZERO rows. Eight consecutive
+// uploads looked successful while nothing landed — the worst possible failure
+// mode, because it is indistinguishable from working.
+//
+// Cause: the disposition gate rejected AFTER lp_csv_ingest_begin committed, so
+// the row survived holding content_sha256 and every later post matched it.
+
+test('A a zero-row match is released, never reported as a duplicate', () => {
+  const csvSrc = readFileSync('src/jobs/lp-csv-ingest.js', 'utf8');
+  const pdfSrc = readFileSync('src/jobs/lp-report-ingest.js', 'utf8');
+
+  // Pre-begin probe: the emptiness check comes FIRST, before either verdict,
+  // so the same request goes on to ingest rather than being told a comfortable
+  // lie or bounced back.
+  const decide = csvSrc.slice(csvSrc.indexOf('async function decideOnExistingSnapshot'));
+  const body = decide.slice(0, decide.indexOf('\n}'));
+  assert.match(body, /releaseIfEmpty\(/, 'the probe checks for an empty match');
+  assert.ok(body.indexOf('releaseIfEmpty(') < body.indexOf('!dup.finalized_at'),
+    'and does so BEFORE deciding orphan-vs-duplicate');
+  assert.ok(body.indexOf('releaseIfEmpty(') < body.indexOf("done('duplicate'"),
+    'and before anything can be logged as a duplicate');
+
+  // 23505 backstop: by then the insert has already failed, so this attempt
+  // cannot land — it must reject rather than claim success.
+  const dup = pdfSrc.slice(pdfSrc.indexOf('export async function duplicateResponse'));
+  const dupBody = dup.slice(0, dup.indexOf('\n}\n'));
+  assert.ok(dupBody.indexOf('releaseIfEmpty(') < dupBody.indexOf("done('duplicate'"),
+    'the empty check precedes the duplicate log on the 23505 path too');
+  assert.match(dupBody, /stale_empty_snapshot/, 'and it is named, not silently swallowed');
+});
+
+test('B releaseIfEmpty treats an UNKNOWN row count as populated, never as empty', () => {
+  const src = readFileSync('src/jobs/lp-report-ingest.js', 'utf8');
+  const fn = src.slice(src.indexOf('export async function releaseIfEmpty'));
+  const body = fn.slice(0, fn.indexOf('\n}'));
+  // Guessing "empty" on a lookup failure or an unrecognised report type would
+  // release a snapshot holding real data. null must fail SAFE.
+  assert.match(body, /rows == null \|\| rows > 0/, 'null or populated → leave it alone');
+
+  const counter = src.slice(src.indexOf('export async function snapshotRowCount'));
+  assert.match(counter.slice(0, counter.indexOf('\n}')), /lp_snapshot_row_count/,
+    'row counting is delegated to the SQL function the reaper uses, so the two agree');
+});
+
+test('B the reaper predicates on ZERO ROWS, not on finalized_at or source_format', () => {
+  const { src, file } = latestFunctionSource('lp_csv_reap_orphan_snapshots');
+
+  // Both original filters were wrong. The two snapshots that blocked the
+  // backfill were FINALIZED and empty; four more empties are PDF. Neither
+  // "unfinalized" nor "CSV" describes the defect.
+  assert.ok(!/finalized_at IS NULL/.test(src),
+    `the reaper must not filter on finalized_at — the blockers were finalized (${file})`);
+  assert.ok(!/source_format = 'csv'/.test(src),
+    `nor on source_format — four of the empties are PDF (${file})`);
+
+  assert.match(src, /lp_snapshot_row_count\(/, 'it predicates on rows actually loaded');
+  assert.match(src, /v_rows IS NULL/, 'and skips a type it cannot count rather than assuming zero');
+  assert.match(src, /v_rowless_ok/,
+    'legitimately row-less types are an explicit named carve-out, not a format filter');
 });
