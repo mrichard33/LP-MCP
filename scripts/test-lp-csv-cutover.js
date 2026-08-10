@@ -639,3 +639,146 @@ test('§D every CSV parser surfaces CurrentDateTime WITH its time', () => {
       `${file}: ${reportType} landed as midnight — that is the truncation bug`);
   }
 });
+
+// ── a chunked report type must be wired EVERYWHERE, not just somewhere ──────
+//
+// Report 134 was registered as a CSV slug, given an ingestCsv branch, a parser,
+// a lp_csv_ingest_begin whitelist entry and BOTH lp_csv_ingest_finalize
+// branches — and still failed every ingest, because lp_csv_ingest_rows had no
+// branch for it. begin accepted the snapshot, the row load hit the ELSE and
+// threw, and the snapshot stayed behind holding both unique keys. Then the
+// orphan could not even be reaped, because lp_csv_reap_orphan_snapshots' own
+// per-type ladder did not know the type either and skipped it.
+//
+// Five places have to agree. This test is the thing that notices when they stop.
+
+/** Latest definition of a SQL function across sql/migrations (date-ordered names). */
+function latestFunctionSource(fnName) {
+  const dir = 'sql/migrations';
+  const files = readdirSync(dir).filter((f) => f.endsWith('.sql')).sort();
+  let found = null;
+  for (const f of files) {
+    const body = readFileSync(`${dir}/${f}`, 'utf8');
+    const at = body.indexOf(`CREATE OR REPLACE FUNCTION public.${fnName}(`);
+    if (at === -1) continue;
+    const end = body.indexOf('$function$;', at);
+    found = { file: f, src: body.slice(at, end === -1 ? undefined : end) };
+  }
+  assert.ok(found, `no migration defines ${fnName}`);
+  return found;
+}
+
+test('§5 every CSV slug is wired through ALL five layers', () => {
+  const csvSrc = readFileSync('src/jobs/lp-csv-ingest.js', 'utf8');
+
+  const map = csvSrc.slice(
+    csvSrc.indexOf('export const CSV_REPORT_TYPES = {'),
+    csvSrc.indexOf('};', csvSrc.indexOf('export const CSV_REPORT_TYPES = {')),
+  );
+  const types = [...map.matchAll(/'[\w-]+':\s*'(\w+)'/g)].map((m) => m[1]);
+  assert.ok(types.length >= 5, `expected the registered CSV report types, got ${types.join(',')}`);
+  assert.ok(types.includes('jobs_by_milestone'), '134 is a CSV report type');
+
+  const begin = latestFunctionSource('lp_csv_ingest_begin');
+  const rows = latestFunctionSource('lp_csv_ingest_rows');
+  const finalize = latestFunctionSource('lp_csv_ingest_finalize');
+  const reaper = latestFunctionSource('lp_csv_reap_orphan_snapshots');
+
+  for (const t of types) {
+    // 1. JS dispatch — otherwise the file is parsed by nothing.
+    assert.match(csvSrc, new RegExp(`reportType === '${t}'`),
+      `${t}: ingestCsv has no dispatch branch`);
+    // 2. begin whitelist — otherwise the snapshot is refused outright.
+    assert.ok(begin.src.includes(`'${t}'`),
+      `${t}: missing from lp_csv_ingest_begin's report_type whitelist (${begin.file})`);
+    // 3. rows branch — THE 134 BUG. Without it begin succeeds, the row load
+    //    throws, and every attempt leaves an orphan holding both unique keys.
+    assert.match(rows.src, new RegExp(`v_type = '${t}'`),
+      `${t}: no lp_csv_ingest_rows branch (${rows.file}) — ingests will orphan`);
+    // 4. finalize row-count branch — otherwise "non-CSV report_type".
+    assert.match(finalize.src, new RegExp(`s\\.report_type = '${t}'`),
+      `${t}: no lp_csv_ingest_finalize branch (${finalize.file})`);
+    // 5. reaper branch — otherwise its orphans are silently never cleared.
+    assert.match(reaper.src, new RegExp(`r\\.report_type = '${t}'`),
+      `${t}: no lp_csv_reap_orphan_snapshots branch (${reaper.file}) — orphans of this type are unreapable`);
+  }
+});
+
+test("§5 the reaper's unknown-type arm complains instead of skipping mutely", () => {
+  const { src } = latestFunctionSource('lp_csv_reap_orphan_snapshots');
+  const elseArm = src.slice(src.lastIndexOf('ELSE'));
+  assert.match(elseArm, /RAISE WARNING/,
+    'an unreapable type must announce itself — a silent CONTINUE reads as "nothing to reap"');
+  assert.match(src, /source_format = 'csv'/,
+    'and the csv scope stays: PDF snapshots rest at finalized_at IS NULL permanently, 6 of them is_current');
+});
+
+// ── §7: cohort_basis is REPORTED and STORED from one source ────────────────
+//
+// The 133 response carried cohort_basis:'contract_date' while
+// scorecard_report_snapshots.cohort_basis was NULL on every 133 snapshot:
+// lp_csv_ingest_begin has always read the key, and snapshotPayload never sent
+// it. The row-level column was populated the whole time, which is exactly why
+// nobody noticed the snapshot-level one was not.
+
+test('§7 cohort_basis reaches the SNAPSHOT, not just the row and the response', () => {
+  const src = readFileSync('src/jobs/lp-csv-ingest.js', 'utf8');
+
+  const payload = src.slice(src.indexOf('const snapshotPayload = {'));
+  const csvPayload = payload.slice(0, payload.indexOf('  };'));
+  assert.match(csvPayload, /cohort_basis:/,
+    'the CSV snapshotPayload must carry cohort_basis — lp_csv_ingest_begin reads it');
+  assert.match(csvPayload, /cohort_basis:\s*cohortBasis/,
+    'and must take it from the shared variable, not a second literal');
+
+  // One constant, so row / snapshot / response cannot drift apart again.
+  assert.match(src, /export const COHORT_BASIS_CONTRACT_DATE = 'contract_date'/);
+  const literals = src.match(/cohort_basis: 'contract_date'/g) ?? [];
+  assert.equal(literals.length, 0,
+    'no bare literal: every cohort_basis assignment goes through COHORT_BASIS_CONTRACT_DATE or cohortBasis');
+
+  // The response spreads extraDetail, so this is the value the caller is told.
+  const job133 = src.slice(src.indexOf("reportType === 'job_status_ytd'"), src.indexOf("reportType === 'lead_disposition'"));
+  assert.match(job133, /cohortBasis = COHORT_BASIS_CONTRACT_DATE/,
+    '133 sets the snapshot-level basis');
+  assert.match(job133, /cohort_basis: cohortBasis/,
+    'and reports the same variable it stores');
+});
+
+// ── §6: the ingest signature check, and why it fails open ──────────────────
+
+test('§6 every ingest route is signature-guarded, and the fail-open is LOUD', () => {
+  const common = readFileSync('src/jobs/lp-report-common.js', 'utf8');
+  const csvSrc = readFileSync('src/jobs/lp-csv-ingest.js', 'utf8');
+  const pdfSrc = readFileSync('src/jobs/lp-report-ingest.js', 'utf8');
+
+  // Every route that writes must call the guard. Counting them stops a new
+  // route being added without one.
+  const csvGuards = (csvSrc.match(/if \(!authorized\(req\)\)/g) ?? []).length;
+  const pdfGuards = (pdfSrc.match(/if \(!authorized\(req\)\)/g) ?? []).length;
+  assert.ok(csvGuards >= 5, `every CSV ingest route guarded (found ${csvGuards})`);
+  assert.ok(pdfGuards >= 3, `PDF ingest + /events routes guarded (found ${pdfGuards})`);
+  assert.equal((csvSrc.match(/'bad signature'/g) ?? []).length, csvGuards, 'each guard 401s');
+
+  // Both modules share ONE implementation — two copies would drift.
+  for (const [name, src] of [['csv', csvSrc], ['pdf', pdfSrc]]) {
+    assert.match(src, /ingestAuthorized\(req, '/, `${name} defers to the shared guard`);
+    assert.ok(!/const INGEST_SECRET =/.test(src), `${name} does not keep its own copy of the secret`);
+  }
+
+  // The fail-open is deliberate — flipping it while the var is unset would 401
+  // every n8n workflow at once — but it must never again be silent.
+  const guard = common.slice(common.indexOf('export function ingestAuthorized'));
+  assert.match(guard.slice(0, guard.indexOf('\n}')), /warnUnauthenticatedIngest/,
+    'an unconfigured secret warns rather than passing quietly');
+  assert.match(common, /LP_REPORT_INGEST_STRICT/,
+    'and there is an opt-in that refuses to serve unauthenticated at all');
+  // The VALUE must never be interpolated — it may be a near-miss of the real
+  // secret, and logs are less protected than the environment. Testing it as a
+  // boolean (`${provided ? 'mismatched' : 'absent'}`) is fine and is what the
+  // rejection line does; `${provided}` is what must never appear.
+  assert.ok(!/\$\{\s*provided\s*\}/.test(common),
+    'the supplied signature value is never interpolated into a log line');
+  assert.match(common, /provided \? 'mismatched' : 'absent'/,
+    'the rejection log distinguishes a wrong signature from a missing one, without printing either');
+});
