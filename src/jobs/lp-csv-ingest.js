@@ -39,7 +39,10 @@ import express from 'express';
 
 import supabase from '../supabase.js';
 import { getMarketMaps } from './market-resolver.js';
-import { sha256Hex, contentSha256, resolveRowMarket, todayET, centsToDollars } from './lp-report-common.js';
+import {
+  sha256Hex, contentSha256, resolveRowMarket, todayET, centsToDollars,
+  ingestAuthorized, assertIngestAuthConfigured,
+} from './lp-report-common.js';
 import { logIngest, quarantineRows, alertGroupMe, duplicateResponse, extractPdfText, extractPdfBboxXml, NoTextLayerError } from './lp-report-ingest.js';
 import {
   parseJobStatusCsv, validateJobStatusCsv,
@@ -72,7 +75,13 @@ import {
   SALESREP_UNKNOWN,
 } from './lp-report-parse-appt-stats.js';
 
-const INGEST_SECRET = (process.env.LP_REPORT_INGEST_SECRET || '').trim();
+/**
+ * Report 133's scoping semantic: every job whose CONTRACT DATE falls in the
+ * period, at whatever status it now has — NOT a snapshot of what is still open.
+ * One constant so the row column, the snapshot column and the HTTP response
+ * cannot drift apart; they did, and the snapshot column silently stayed NULL.
+ */
+export const COHORT_BASIS_CONTRACT_DATE = 'contract_date';
 const STORAGE_BUCKET = 'lp-reports';
 const ROW_CHUNK = 1500;
 
@@ -340,6 +349,13 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
 
   // 3. Parse + validate + market resolution, per type.
   let parsed, rows, controlTotals, parserVersion = null, extraDetail = {};
+  // How the file was scoped, when the file says so. Snapshot-level, distinct
+  // from the per-row copy: lp_job_status_history.cohort_basis was populated from
+  // the row objects while scorecard_report_snapshots.cohort_basis stayed NULL on
+  // every 133 snapshot, because lp_csv_ingest_begin reads a key snapshotPayload
+  // never carried. One variable now feeds the row, the snapshot AND the
+  // response, so the three cannot disagree again.
+  let cohortBasis = null;
   try {
     if (reportType === 'job_status_ytd') {
       parsed = parseJobStatusCsv(text);
@@ -384,7 +400,7 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
           // The semantic, stored in the data rather than implied by a filename:
           // this file is every job whose CONTRACT DATE falls in the period, at
           // whatever status it has now — not a snapshot of what is still open.
-          cohort_basis: 'contract_date',
+          cohort_basis: COHORT_BASIS_CONTRACT_DATE,
         };
       });
       if (unresolved.length) {
@@ -407,10 +423,11 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
         completed_count: bucketTally.completed ?? 0,
         lost_count: bucketTally.lost ?? 0,
       };
+      cohortBasis = COHORT_BASIS_CONTRACT_DATE;
       extraDetail = {
         ...extraDetail,
         bucket_tally: bucketTally,
-        cohort_basis: 'contract_date',
+        cohort_basis: cohortBasis,
         sub_cent_columns: parsed.subCentColumns,
       };
       parserVersion = JOB_STATUS_PARSER_VERSION;
@@ -595,6 +612,11 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
     as_of_date: parsed.header.asOf ?? parsed.header.periodEnd ?? todayET(),
     source_format: 'csv',
     control_totals: controlTotals,
+    // lp_csv_ingest_begin has always read this key; nothing ever sent it, so
+    // scorecard_report_snapshots.cohort_basis was NULL on every 133 snapshot
+    // while the response cheerfully reported 'contract_date'. NULL for the
+    // types that have no cohort semantic — an unknown is not a false.
+    cohort_basis: cohortBasis,
   };
   if (!snapshotPayload.period_start || !snapshotPayload.period_end) {
     return await fail('missing_period', { header: parsed.header }, 'SDate/EDate missing from the export.');
@@ -1023,13 +1045,11 @@ export async function ingestSalesEfficiencyPdf({ buffer, source = 'n8n' }) {
   }
 }
 
-function authorized(req) {
-  if (!INGEST_SECRET) return true;
-  const provided = req.headers['x-ghl-signature'] || req.headers['x-webhook-secret'] || '';
-  return provided === INGEST_SECRET;
-}
+/** See ingestAuthorized in lp-report-common.js — including why it fails OPEN. */
+const authorized = (req) => ingestAuthorized(req, 'lp-csv-ingest');
 
 export function registerLpCsvRoutes(app) {
+  assertIngestAuthConfigured('lp-csv-ingest');
   // CSV text bodies — the Lead Disposition YTD export runs ~20MB.
   const csvText = express.text({ type: ['text/csv', 'text/plain', 'application/octet-stream'], limit: '60mb' });
 

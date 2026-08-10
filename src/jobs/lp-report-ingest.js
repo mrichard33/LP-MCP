@@ -33,12 +33,14 @@ import { randomUUID } from 'node:crypto';
 
 import supabase from '../supabase.js';
 import { getMarketMaps } from './market-resolver.js';
-import { sha256Hex, contentSha256, isUniqueViolation, resolveRowMarket, todayET, centsToDollars } from './lp-report-common.js';
+import {
+  sha256Hex, contentSha256, isUniqueViolation, resolveRowMarket, todayET, centsToDollars,
+  ingestAuthorized, assertIngestAuthConfigured,
+} from './lp-report-common.js';
 import { parseJobsByMilestone, validateJobsByMilestone } from './lp-report-parse-a.js';
 import { parseJobsByStatus, flagDuplicates, validateJobsByStatus } from './lp-report-parse-b.js';
 
 const execFileP = promisify(execFile);
-const INGEST_SECRET = (process.env.LP_REPORT_INGEST_SECRET || '').trim();
 const STORAGE_BUCKET = 'lp-reports';
 
 /**
@@ -489,13 +491,14 @@ export async function ingestReportPdf({ reportType, buffer, source = 'n8n', expe
   };
 }
 
-function authorized(req) {
-  if (!INGEST_SECRET) return true;
-  const provided = req.headers['x-ghl-signature'] || req.headers['x-webhook-secret'] || '';
-  return provided === INGEST_SECRET;
-}
+/**
+ * Guards the PDF ingest routes AND /events/lp_report_ingest_failed.
+ * See ingestAuthorized in lp-report-common.js — including why it fails OPEN.
+ */
+const authorized = (req) => ingestAuthorized(req, 'lp-report-ingest');
 
 export function registerLpReportRoutes(app) {
+  assertIngestAuthConfigured('lp-report-ingest');
   // Raw bytes, route-scoped (PDFs blow through express.json's cap).
   const rawPdf = express.raw({ type: ['application/pdf', 'application/octet-stream'], limit: '25mb' });
 

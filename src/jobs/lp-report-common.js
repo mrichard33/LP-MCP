@@ -273,3 +273,75 @@ export function hourET(d = new Date()) {
   }).formatToParts(d);
   return Number(parts.find((p) => p.type === 'hour')?.value ?? -1);
 }
+
+// ─── Ingest-route authentication ─────────────────────────────────────────────
+//
+// Shared by lp-csv-ingest.js and lp-report-ingest.js. It lives HERE rather than
+// in either of them because lp-csv-ingest already imports from lp-report-ingest,
+// and putting it in the latter would close a require cycle.
+//
+// ══ THE CHECK FAILS OPEN WHEN UNCONFIGURED — AND SAID NOTHING ══
+//
+// Verified 2026-08-10: a POST carrying the literal placeholder
+// `x-ghl-signature: PASTE_SIGNATURE` was accepted and wrote 484 rows. Not a
+// missing check — authorized() is called by every CSV ingest route, every PDF
+// ingest route and /events/*, each returning 401 on a mismatch. The cause is
+// that LP_REPORT_INGEST_SECRET is unset, so the guard returns true for
+// anything, silently. A control that disables itself without saying so reads
+// exactly like a control that is working.
+//
+// The fail-open default is KEPT deliberately: flipping to fail-closed while the
+// variable is unset would 401 every n8n workflow at once and take the whole
+// report pipeline down. Enforcement is enabled by SETTING the variable — no
+// code change — after confirming every caller sends the same value.
+
+export const INGEST_SECRET = (process.env.LP_REPORT_INGEST_SECRET || '').trim();
+
+/** Opt-in: refuse to register ingest routes at all without a configured secret. */
+const INGEST_STRICT = /^(1|true|yes)$/i.test((process.env.LP_REPORT_INGEST_STRICT || '').trim());
+
+let unauthenticatedWarned = false;
+
+/** Say it once per process, loudly. Per-request would drown the logs. */
+export function warnUnauthenticatedIngest(where) {
+  if (unauthenticatedWarned) return;
+  unauthenticatedWarned = true;
+  console.error(
+    `[SECURITY] ${where}: LP_REPORT_INGEST_SECRET is NOT SET — the ingest routes are accepting `
+    + 'UNAUTHENTICATED writes on a public host. Any caller can post arbitrary report bytes into '
+    + 'the scorecard. Set LP_REPORT_INGEST_SECRET to the value the n8n workflows already send in '
+    + 'x-ghl-signature; enforcement turns on the moment it is set. Set LP_REPORT_INGEST_STRICT=true '
+    + 'to make an unset secret a hard startup failure instead.',
+  );
+}
+
+/**
+ * The shared header check. Returns true to allow.
+ * Logs rejections, never the supplied value — it may be a near-miss of the real
+ * secret and the logs are less protected than the environment.
+ */
+export function ingestAuthorized(req, where) {
+  const provided = req.headers['x-ghl-signature'] || req.headers['x-webhook-secret'] || '';
+  if (!INGEST_SECRET) {
+    warnUnauthenticatedIngest(where);
+    return true;
+  }
+  if (provided === INGEST_SECRET) return true;
+  console.warn(`[${where}] REJECTED unauthenticated ingest: ${req.method} ${req.originalUrl} from ${req.ip} (signature ${provided ? 'mismatched' : 'absent'})`);
+  return false;
+}
+
+/** Announce the auth posture at route registration, not on the first POST. */
+export function assertIngestAuthConfigured(where) {
+  if (INGEST_SECRET) {
+    console.log(`[${where}] ingest signature enforcement ACTIVE`);
+    return;
+  }
+  if (INGEST_STRICT) {
+    throw new Error(
+      `${where}: LP_REPORT_INGEST_STRICT is set but LP_REPORT_INGEST_SECRET is empty — refusing to `
+      + 'register unauthenticated ingest routes.',
+    );
+  }
+  warnUnauthenticatedIngest(where);
+}
