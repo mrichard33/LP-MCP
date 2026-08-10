@@ -43,7 +43,7 @@ import {
   sha256Hex, contentSha256, resolveRowMarket, todayET, centsToDollars,
   ingestAuthorized, assertIngestAuthConfigured,
 } from './lp-report-common.js';
-import { logIngest, quarantineRows, alertGroupMe, duplicateResponse, extractPdfText, extractPdfBboxXml, NoTextLayerError } from './lp-report-ingest.js';
+import { logIngest, quarantineRows, alertGroupMe, duplicateResponse, releaseIfEmpty, extractPdfText, extractPdfBboxXml, NoTextLayerError } from './lp-report-ingest.js';
 import {
   parseJobStatusCsv, validateJobStatusCsv,
   JOB_STATUS_PARSER_VERSION,
@@ -275,6 +275,18 @@ async function probeExistingContentSnapshot(reportType, contentSha, done) {
  * The unfinalized branch MUST be reached before anything can log a duplicate.
  */
 async function decideOnExistingSnapshot(dup, { matchedOn, sha, done }) {
+  // ── an EMPTY match is not a duplicate, and not an orphan either ──────────
+  //
+  // Checked FIRST, before either verdict. A snapshot holding zero rows is a
+  // corpse still holding the unique key, whether or not it finalized — and on
+  // 2026-08-10 eight consecutive 138 uploads were told `duplicate: true`
+  // against exactly that while nothing landed. Releasing it here, BEFORE begin,
+  // means this same request goes on to ingest normally: the caller gets a real
+  // success rather than a comforting lie or a bounce.
+  if (await releaseIfEmpty(dup.id, `stale collision on ${matchedOn}: zero rows loaded`)) {
+    return null; // proceed with the ingest — the key is free
+  }
+
   if (!dup.finalized_at) {
     await done('failed', {
       snapshot_id: dup.id,
