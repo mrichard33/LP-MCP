@@ -235,6 +235,9 @@ import { registerLpReportReconRoutes, startLpReportReconScheduler } from './jobs
 // 07:30 ET missing-report watchdog — watches the OUTCOME table, independent
 // of every pipeline stage (LP schedule / Gmail / n8n / ingest route).
 import { startLpReportWatchdog } from './jobs/lp-report-watchdog.js';
+// Clears chunked ingests that began and never finalized. They hold the snapshot
+// unique keys, so each one rejects its own corrected re-send until released.
+import { startLpCsvOrphanReaper } from './jobs/lp-csv-orphan-reaper.js';
 // Nightly scorecard validation + GroupMe tie-out alert.
 import { registerScorecardValidateRoutes, startScorecardValidateScheduler } from './jobs/scorecard-validate.js';
 // 2026-08-06 Phase E — daily Five9 config snapshot + change log (ships dark)
@@ -1113,6 +1116,7 @@ app.listen(PORT, async () => {
   startFive9ConfigSnapshotScheduler();
   startLpReportReconScheduler();
   startLpReportWatchdog();
+  startLpCsvOrphanReaper();
   startFbPublishWatchdog();
   startFive9SilenceWatchdog();
   startGhlNoteSweep();

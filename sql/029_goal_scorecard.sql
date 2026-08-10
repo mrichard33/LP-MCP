@@ -24,9 +24,16 @@
 -- Idempotent — safe to re-run.
 
 -- ─── EDITABLE goal config ────────────────────────────────────────────────────────
+-- ⚠ monthly_goal_dollars IS NET. Net = LP NSA, never GSA. Every goal comparison
+-- in Reece-Dashboard reads a net actual, and the NSLI chain divides this goal by
+-- a net-over-gross-issued rate (NSA ÷ NumIssued) — goal and rate numerator must
+-- be the same currency or every derived Issued/Leads/Demo target rescales too.
+-- The basis is recorded per row in goal_basis, added by Reece-Dashboard
+-- db/migrations/0019_goal_net_basis.sql (this table is created here but read and
+-- written by that repo). Enforced app-side in lib/scorecard/goalBasis.ts.
 create table if not exists scorecard_goals (
   market                text primary key,            -- 'REECE' (or future split key)
-  monthly_goal_dollars  numeric  not null default 0,
+  monthly_goal_dollars  numeric  not null default 0,  -- NET sales dollars (NSA) — see above
   working_days          integer  not null default 26,
   target_close_pct      numeric  not null default 30.0,
   target_good_rate_pct  numeric  not null default 70.0,

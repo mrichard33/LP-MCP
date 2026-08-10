@@ -99,6 +99,22 @@
 BEGIN;
 
 -- ── (a) new columns on lp_job_status_history ────────────────────────────────
+--
+-- ⚠️ INCOMPLETE — `city` IS MISSING FROM THIS LIST AND IS ADDED BY
+--    sql/migrations/2026-08-10_job_status_city_and_orphan_reaper.sql.
+--
+-- Section (f) below writes lp_csv_ingest_rows to INSERT `city` into this table
+-- and to read it out of the jsonb recordset, and the parser emits it — but the
+-- column was never added here. Every chunked 133 ingest therefore failed at
+-- chunk 0 ("column \"city\" of relation \"lp_job_status_history\" does not
+-- exist") from 2026-08-09 until the 08-10 migration, each failure leaving an
+-- orphaned snapshot that blocked its own retry.
+--
+-- Do NOT add `city` here. This file records what was actually applied on
+-- 2026-08-08; the fix belongs to the migration that made it. Anyone rebuilding
+-- from migrations in order must apply 2026-08-10 as well, or they recreate the
+-- same gap.
+--
 ALTER TABLE lp_job_status_history
   ADD COLUMN IF NOT EXISTS row_num          integer,
   ADD COLUMN IF NOT EXISTS lp_id            text,

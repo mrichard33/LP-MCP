@@ -207,19 +207,96 @@ test('both control identities hold on every row of the real export', { skip: !te
   assert.equal(validateApptStatsCsv(p).ok, true);
 });
 
-test('a row that breaks Σ NumDsp == NumIssued is REJECTED', { skip: !text && 'fixture absent' }, () => {
-  const broken = mutate((hdr, rows) => { rows[1][hdr.indexOf('NumDsp7')] = '999'; });
-  const v = validateApptStatsCsv(parseApptStatsCsv(broken));
-  assert.equal(v.ok, false);
-  assert.equal(v.violations[0].rule, 'disposition_sum_mismatch');
-});
+// ── the two arithmetic identities: WARN, do not reject ─────────────────────
+//
+// These asserted `v.ok === false` until 2026-08-10. Both identities were
+// generalised from a single month (January 2026, 345 rows, zero breaches) and do
+// not hold across all months — on 2026-08-10 they rejected 60 files in a day and
+// report 138 had not landed since 08-08. A control total earns the right to fail
+// a file closed by being a rule of the source system, not by having held in the
+// one sample that was checked. The arithmetic is still recorded, per row.
 
-test('a row that breaks NumIssued + NumOther == NumSet is REJECTED', { skip: !text && 'fixture absent' }, () => {
-  const broken = mutate((hdr, rows) => { rows[1][hdr.indexOf('NumOther')] = '12345'; });
-  const v = validateApptStatsCsv(parseApptStatsCsv(broken));
-  assert.equal(v.ok, false);
-  assert.ok(v.violations.some((x) => x.rule === 'set_partition_mismatch'));
-});
+test('a row that breaks Σ NumDsp == NumIssued still INGESTS, with the delta recorded',
+  { skip: !text && 'fixture absent' }, () => {
+    const broken = mutate((hdr, rows) => { rows[1][hdr.indexOf('NumDsp7')] = '999'; });
+    const parsed = parseApptStatsCsv(broken);
+    const v = validateApptStatsCsv(parsed);
+
+    assert.equal(v.ok, true, 'the file is accepted');
+    assert.ok(!v.violations.some((x) => x.rule === 'disposition_sum_mismatch'),
+      'and this is no longer a violation');
+
+    const w = v.warnings.find((x) => x.rule === 'disposition_sum_mismatch');
+    assert.ok(w, 'it is surfaced as a warning');
+    assert.equal(w.detail.rows, 1, 'exactly the row we broke');
+
+    // 999 replaced NumDsp7 on row 1, so the delta is 999 minus what was there.
+    const orig = parseApptStatsCsv(text).rows[0];
+    const origDsp7 = orig.dispositions[parsed.dispositionLabels[6]] ?? 0;
+    assert.equal(w.detail.net_delta, 999 - origDsp7, 'the delta is exact and signed');
+    assert.equal(w.detail.abs_delta, Math.abs(999 - origDsp7));
+    assert.equal(w.detail.deltas[parsed.rows[0].row_num], w.detail.net_delta,
+      'and is recorded against the row that carries it');
+    assert.equal(w.detail.sample[0].dispositions_total - w.detail.sample[0].num_issued,
+      w.detail.net_delta, 'the sample carries both sides of the comparison');
+  });
+
+test('a row that breaks NumIssued + NumOther == NumSet still INGESTS, with the delta recorded',
+  { skip: !text && 'fixture absent' }, () => {
+    const broken = mutate((hdr, rows) => { rows[1][hdr.indexOf('NumOther')] = '12345'; });
+    const parsed = parseApptStatsCsv(broken);
+    const v = validateApptStatsCsv(parsed);
+
+    assert.equal(v.ok, true, 'the file is accepted');
+    assert.ok(!v.violations.some((x) => x.rule === 'set_partition_mismatch'),
+      'and this is no longer a violation');
+
+    const w = v.warnings.find((x) => x.rule === 'set_partition_mismatch');
+    assert.ok(w, 'it is surfaced as a warning');
+    assert.equal(w.detail.rows, 1);
+
+    const r = parsed.rows[0];
+    assert.equal(w.detail.net_delta, (r.num_issued + r.num_other) - r.num_set,
+      'the delta is exact and signed');
+    assert.equal(w.detail.deltas[r.row_num], w.detail.net_delta);
+  });
+
+test('a file breaking BOTH identities on many rows still ingests, deltas aggregated',
+  { skip: !text && 'fixture absent' }, () => {
+    // The case that matters operationally: not one doctored row but a month
+    // whose shape simply differs from January's. It must land.
+    const broken = mutate((hdr, rows) => {
+      for (let i = 1; i < rows.length; i++) {
+        rows[i][hdr.indexOf('NumDsp7')] = '7';
+        rows[i][hdr.indexOf('NumOther')] = '3';
+      }
+    });
+    const v = validateApptStatsCsv(parseApptStatsCsv(broken));
+    assert.equal(v.ok, true, 'a wholly non-conforming month is still ingested');
+
+    for (const rule of ['disposition_sum_mismatch', 'set_partition_mismatch']) {
+      const w = v.warnings.find((x) => x.rule === rule);
+      assert.ok(w, `${rule} is reported`);
+      assert.ok(w.detail.rows > 1, 'across many rows');
+      assert.equal(Object.keys(w.detail.deltas).length, w.detail.rows,
+        'every breaching row has its delta recorded, not just the sampled ones');
+      assert.ok(w.detail.sample.length <= 50, 'the full-detail sample stays bounded');
+      assert.equal(w.detail.truncated_sample, w.detail.rows > 50,
+        'and says so when it is truncated');
+      assert.ok(w.detail.abs_delta >= Math.abs(w.detail.net_delta),
+        'abs_delta cannot be smaller than |net_delta|');
+    }
+  });
+
+test('structural faults are still REJECTED — the downgrade is scoped to the two identities',
+  { skip: !text && 'fixture absent' }, () => {
+    // sat_exceeds_issued is a BOUND, not an identity: more sat than issued is
+    // impossible rather than merely unexplained. It stays fail-closed.
+    const broken = mutate((hdr, rows) => { rows[1][hdr.indexOf('NumSat')] = '99999'; });
+    const v = validateApptStatsCsv(parseApptStatsCsv(broken));
+    assert.equal(v.ok, false);
+    assert.ok(v.violations.some((x) => x.rule === 'sat_exceeds_issued'));
+  });
 
 test('an empty file is rejected, never accepted as zero', { skip: !text && 'fixture absent' }, () => {
   const headerOnly = emit([parseCsv(text)[0]]);
