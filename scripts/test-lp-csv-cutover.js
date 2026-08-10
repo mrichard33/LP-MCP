@@ -453,6 +453,19 @@ test('§A the pre-begin probe matches the DB constraint, filter for filter', () 
     'no probe may filter on finalized_at — the unique constraint does not');
   assert.equal((src.match(/probeExistingSnapshot\(reportType, sha, done\)/g) ?? []).length, 5,
     'one shared helper, called from all four chunked ingest paths');
+
+  // The table has TWO unique keys and the second one is the one that fired:
+  // scorecard_report_snapshots_content_uq on (report_type, content_sha256).
+  // It cannot be probed alongside file_sha256 — the content hash is taken over
+  // the parsed rows — so it gets its own probe, immediately before begin.
+  assert.equal((src.match(/probeExistingContentSnapshot\(/g) ?? []).length, 2,
+    'one content probe, defined once and called once from ingestCsv');
+  const contentFn = src.slice(src.indexOf('async function probeExistingContentSnapshot'));
+  const contentBody = contentFn.slice(0, contentFn.indexOf('\n}'));
+  assert.match(contentBody, /finalized_at/,
+    'the content probe reads finalized_at too — an orphan on either key is an orphan');
+  assert.ok(!/not\('finalized_at'/.test(contentBody),
+    'and no more filters on it than the file probe does');
 });
 
 test('§B content-level failures return 200 with rejected:true and a reason', () => {

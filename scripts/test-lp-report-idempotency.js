@@ -75,12 +75,38 @@ test('CSV/PDF chunked path: an UNFINALIZED snapshot is an ORPHAN, not a duplicat
       'but each probe must READ finalized_at, to tell an orphan from a duplicate');
   }
 
-  const helper = CSV.slice(CSV.indexOf('async function probeExistingSnapshot'));
+  // The decision itself now lives in ONE place, shared by the file-key and
+  // content-key probes, so the two cannot drift apart on the rule that matters.
+  const helper = CSV.slice(CSV.indexOf('async function decideOnExistingSnapshot'));
   const body = helper.slice(0, helper.indexOf('\n}'));
+  assert.ok(body.length > 0, 'the shared orphan-vs-duplicate decision exists');
   assert.match(body, /orphaned_snapshot/, 'the orphan is named');
   assert.match(body, /rejected:\s*true/, 'and is a 200-shaped rejection, not a 500');
   assert.ok(body.indexOf('!dup.finalized_at') < body.indexOf("done('duplicate'"),
     'the orphan branch is reached before anything can be logged as a duplicate');
+
+  // ...and every probe routes through it rather than deciding for itself.
+  for (const probe of ['probeExistingSnapshot', 'probeExistingContentSnapshot']) {
+    const fn = CSV.slice(CSV.indexOf(`async function ${probe}`));
+    assert.match(fn.slice(0, fn.indexOf('\n}')), /return decideOnExistingSnapshot\(/,
+      `${probe} defers to the shared decision`);
+  }
+});
+
+test('BOTH unique keys are probed before begin, not just file_sha256', () => {
+  // scorecard_report_snapshots has two unique keys. The pre-parse probe can only
+  // cover file_sha256, because content_sha256 is a hash of the parsed rows and
+  // does not exist yet. Every one of the 17 report-133 orphan rejections on
+  // 2026-08-09/10 matched on content_sha256 — the key nothing was probing.
+  assert.match(CSV, /\.eq\('content_sha256',/,
+    'the content key is probed, not merely written');
+
+  const ingest = CSV.slice(CSV.indexOf('export async function ingestCsv'));
+  const contentProbe = ingest.indexOf('probeExistingContentSnapshot(');
+  const begin = ingest.indexOf("rpc('lp_csv_ingest_begin'");
+  assert.ok(contentProbe > 0, 'ingestCsv probes the content key');
+  assert.ok(contentProbe < begin,
+    'and does so BEFORE begin — after it, the 23505 has already been raised');
 });
 
 test('the database backstops dedup: UNIQUE (report_type, file_sha256)', () => {

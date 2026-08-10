@@ -206,7 +206,10 @@ async function crossCheckSalesEfficiency(periodStart, periodEnd, totals) {
  * The probe now matches the constraint, and the unfinalized case is named rather
  * than disguised: HTTP 200 (the file is fine; replaying it would only repeat
  * this) but success:false, so it cannot be mistaken for a landed ingest.
- * Clearing the orphan is an operator action — nothing is deleted here.
+ *
+ * Clearing the orphan is not done here, but it is no longer purely manual
+ * either: lp_csv_reap_orphan_snapshots marks abandoned ones on the 5-minute
+ * heartbeat and releases both keys. See src/jobs/lp-csv-orphan-reaper.js.
  *
  * @returns {Promise<object|null>} a response to return immediately, or null to proceed
  */
@@ -217,13 +220,58 @@ async function probeExistingSnapshot(reportType, sha, done) {
     .maybeSingle();
   if (dupErr) throw new Error(`duplicate check failed: ${dupErr.message}`);
   if (!dup) return null;
+  return decideOnExistingSnapshot(dup, { matchedOn: 'file_sha256', sha, done });
+}
 
+/**
+ * The SECOND unique key, and the one that was actually firing.
+ *
+ * scorecard_report_snapshots carries two unique keys, not one:
+ * UNIQUE (report_type, file_sha256) and the partial index
+ * scorecard_report_snapshots_content_uq on (report_type, content_sha256).
+ * probeExistingSnapshot covers only the first, because content_sha256 is a hash
+ * of the PARSED rows and does not exist until parsing is done — long after the
+ * pre-begin probe runs.
+ *
+ * So a re-export of the same month with a byte-level difference (LP stamps a
+ * generation time into the file) has a NEW file_sha256 but the SAME
+ * content_sha256. The pre-probe saw nothing, and the collision surfaced as a
+ * 23505 inside lp_csv_ingest_begin — caught by duplicateResponse, which named it
+ * correctly, but only after a snapshot row had been attempted. Every one of the
+ * 17 report-133 `orphaned_snapshot` rejections on 2026-08-09/10 matched on
+ * content_sha256, not file_sha256.
+ *
+ * This closes that gap: same decision, same vocabulary, run at the point where
+ * the content hash first exists. The 23505 path stays as the backstop.
+ */
+async function probeExistingContentSnapshot(reportType, contentSha, done) {
+  if (!contentSha) return null;
+  const { data: dup, error: dupErr } = await supabase
+    .from('scorecard_report_snapshots')
+    .select('id, finalized_at, is_current').eq('report_type', reportType).eq('content_sha256', contentSha)
+    .maybeSingle();
+  if (dupErr) throw new Error(`content duplicate check failed: ${dupErr.message}`);
+  if (!dup) return null;
+  return decideOnExistingSnapshot(dup, { matchedOn: 'content_sha256', sha: contentSha, done });
+}
+
+/**
+ * The shared orphan-vs-duplicate decision, on whichever key matched.
+ *
+ * Deliberately ONE function rather than a copy per probe: the rule that an
+ * unfinalized match is an orphan and not a benign duplicate is the fix for a
+ * real incident (a remediation re-send reading as landed while the bad snapshot
+ * stayed current), and two copies of it would drift.
+ *
+ * The unfinalized branch MUST be reached before anything can log a duplicate.
+ */
+async function decideOnExistingSnapshot(dup, { matchedOn, sha, done }) {
   if (!dup.finalized_at) {
     await done('failed', {
       snapshot_id: dup.id,
       failure_reason: 'orphaned_snapshot',
       detail: {
-        matched_on: 'file_sha256', is_current: Boolean(dup.is_current),
+        matched_on: matchedOn, is_current: Boolean(dup.is_current),
         message: 'an earlier ingest of these bytes began but never finalized; '
           + 'it holds the unique key, so this re-send cannot land until it is cleared',
       },
@@ -231,12 +279,12 @@ async function probeExistingSnapshot(reportType, sha, done) {
     return {
       success: false, rejected: true, reason: 'orphaned_snapshot',
       failure_reason: 'orphaned_snapshot',
-      snapshot_id: dup.id, matched_on: 'file_sha256', sha256: sha,
+      snapshot_id: dup.id, matched_on: matchedOn, sha256: sha,
     };
   }
 
-  await done('duplicate', { snapshot_id: dup.id, detail: { matched_on: 'file_sha256' } });
-  return { success: true, duplicate: true, snapshot_id: dup.id, matched_on: 'file_sha256', sha256: sha };
+  await done('duplicate', { snapshot_id: dup.id, detail: { matched_on: matchedOn } });
+  return { success: true, duplicate: true, snapshot_id: dup.id, matched_on: matchedOn, sha256: sha };
 }
 
 async function loadChunked(snapshotId, rows) {
@@ -564,10 +612,20 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
     }, `caller declared ${expectedPeriod.start}..${expectedPeriod.end}, file says ${snapshotPayload.period_start}..${snapshotPayload.period_end}.`);
   }
 
+  // The content key can only be probed here — it is a hash of the PARSED rows,
+  // so it does not exist at the pre-parse probe above. See
+  // probeExistingContentSnapshot: this is the key that was actually colliding.
+  const existingByContent = await probeExistingContentSnapshot(
+    reportType, snapshotPayload.content_sha256, done);
+  if (existingByContent) return existingByContent;
+
   const { data: snapshotId, error: beginErr } = await supabase
     .rpc('lp_csv_ingest_begin', { p_snapshot: snapshotPayload });
   if (beginErr) {
     // 23505 here means the same report already landed — benign (§A), not a 500.
+    // Still reachable despite both probes: neither runs in the same transaction
+    // as the insert, so a concurrent ingest of the same file can still win the
+    // race. The DB stays the arbiter.
     const dupRes = await duplicateResponse(beginErr, {
       reportType, fileSha: sha, contentSha: snapshotPayload.content_sha256, done,
     });
@@ -580,8 +638,16 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
     const { data: factRows, error: finErr } = await supabase
       .rpc('lp_csv_ingest_finalize', { p_snapshot_id: snapshotId });
     if (finErr) throw new Error(finErr.message);
-    await done('success', { snapshot_id: snapshotId, detail: { ...extraDetail, control_totals: controlTotals, fact_rows: factRows } });
-    console.log(`[LPCsv] ${reportType} ingested: ${rows.length} rows, snapshot ${snapshotId}, ${factRows} fact rows`);
+    // A warned file is NOT a clean one. The CSV path used to write 'success'
+    // unconditionally, so the only way to tell a file that broke an arithmetic
+    // identity from one that did not was to read detail->'warnings'. That was
+    // survivable while warnings were rare; it stopped being survivable when the
+    // two 138 identities were downgraded from rejections to warnings, since the
+    // warning is now the ONLY signal that a month came in with a delta.
+    const warned = Array.isArray(extraDetail.warnings) && extraDetail.warnings.length > 0;
+    await done(warned ? 'succeeded_with_warnings' : 'success',
+      { snapshot_id: snapshotId, detail: { ...extraDetail, control_totals: controlTotals, fact_rows: factRows } });
+    console.log(`[LPCsv] ${reportType} ingested${warned ? ` WITH ${extraDetail.warnings.length} warning(s)` : ''}: ${rows.length} rows, snapshot ${snapshotId}, ${factRows} fact rows`);
     return { success: true, snapshot_id: snapshotId, rows: rows.length, fact_rows: factRows, sha256: sha, ...extraDetail };
   } catch (err) {
     // Assertion failures inside finalize are content failures: the snapshot

@@ -197,26 +197,79 @@ function dispositionTotal(row) {
   return Object.values(row.dispositions ?? {}).reduce((a, n) => a + n, 0);
 }
 
+/** Full-detail rows carried per warning. Aggregates below are never truncated. */
+const DELTA_SAMPLE_LIMIT = 50;
+
 /**
- * Fail-closed validation.
+ * Roll a list of per-row breaches into ONE warning: complete deltas, bounded size.
+ *
+ * `deltas` is every row's signed delta keyed by row_num — one small integer per
+ * row, so a wholly broken 345-row file costs a few KB rather than the ~1,000
+ * violation objects the old un-capped violation path would have serialised into
+ * scorecard_ingest_log.detail. `sample` carries the first few in full for
+ * eyeballing; `rows`, `net_delta` and `abs_delta` are exact regardless.
+ */
+function deltaWarning(rule, breaches, note) {
+  const deltas = {};
+  let net = 0;
+  let abs = 0;
+  for (const b of breaches) {
+    deltas[b.row_num] = b.delta;
+    net += b.delta;
+    abs += Math.abs(b.delta);
+  }
+  return {
+    rule,
+    detail: {
+      rows: breaches.length,
+      net_delta: net,
+      abs_delta: abs,
+      deltas,
+      sample: breaches.slice(0, DELTA_SAMPLE_LIMIT),
+      truncated_sample: breaches.length > DELTA_SAMPLE_LIMIT,
+      note,
+    },
+  };
+}
+
+/**
+ * Validation. Structural faults fail the file closed; the two arithmetic
+ * identities record a delta and let it through.
  *
  * LP CSV exports print no footer, no grand total and no per-band subtotals, so
  * the sum-ties-to-printed-footer gate every PDF parser leans on is simply
- * unavailable. 138 hands back something better: two exact arithmetic
- * identities, verified on all 345 rows of the January 2026 export.
+ * unavailable. 138 appeared to hand back something better — two exact identities:
  *
  *     Σ NumDsp1..NumDsp10  ==  NumIssued     the dispositions partition issued
  *     NumIssued + NumOther ==  NumSet        NumOther is set-but-not-issued
  *
- * These are self-consistency, not an external tie, but they are strong: any
- * column slide, dropped slot or mis-zipped label breaks one of them. That
- * restores a real control total to a report that prints none.
+ * ══ WHY THESE TWO ARE WARNINGS AND NOT VIOLATIONS ══
  *
- * NumSat <= NumIssued also holds throughout and is checked as a sanity bound.
+ * Both were verified against exactly ONE month — January 2026, 345 rows, zero
+ * breaches — and generalised from there. They do not hold across all months. On
+ * 2026-08-10 they rejected 60 files in a day, and report 138 had not landed since
+ * 08-08: an identity observed once was failing files closed on every month that
+ * did not share January's shape.
  *
- * The alias cross-check is deliberately a WARNING, not a violation. The
- * label-driven decode is correct by construction; a disagreement means LP moved
- * something and we want it visible, not that this file is unparseable.
+ * A control total earns the right to fail a file closed by being a rule of the
+ * source system, not by having been true in the sample we happened to check. The
+ * arithmetic is still worth knowing — a column slide or mis-zipped label still
+ * breaks it — so the delta is recorded per row and surfaced as
+ * succeeded_with_warnings. What changed is who decides: the identity now reports,
+ * and a human rules on it, rather than silently keeping a month out of the
+ * scorecard.
+ *
+ * Re-promoting either to a violation requires evidence across months, not one.
+ *
+ * Still fail-closed, because these are structural rather than arithmetic:
+ * empty_file, sat_exceeds_issued (a bound, not an identity — more sat than
+ * issued is impossible, not merely unexplained), unknown_control_key and
+ * control_total_mismatch (the caller's own declared totals disagreeing with the
+ * file it sent is a caller bug, and finalize re-asserts them anyway).
+ *
+ * The alias cross-check remains a WARNING. The label-driven decode is correct by
+ * construction; a disagreement means LP moved something and we want it visible,
+ * not that this file is unparseable.
  */
 export function validateApptStatsCsv(parsed, expectedTotals = null) {
   const violations = [];
@@ -225,20 +278,23 @@ export function validateApptStatsCsv(parsed, expectedTotals = null) {
 
   if (!rows.length) violations.push({ rule: 'empty_file', detail: 'no data rows' });
 
+  const dispositionBreaches = [];
+  const partitionBreaches = [];
+
   for (const r of rows) {
     const dsp = dispositionTotal(r);
     if (dsp !== r.num_issued) {
-      violations.push({
-        rule: 'disposition_sum_mismatch',
-        detail: { row_num: r.row_num, salesrep: r.salesrep_raw, src_id: r.src_id_raw,
-          dispositions_total: dsp, num_issued: r.num_issued },
+      dispositionBreaches.push({
+        row_num: r.row_num, salesrep: r.salesrep_raw, src_id: r.src_id_raw,
+        dispositions_total: dsp, num_issued: r.num_issued,
+        delta: dsp - r.num_issued,
       });
     }
     if (r.num_issued + r.num_other !== r.num_set) {
-      violations.push({
-        rule: 'set_partition_mismatch',
-        detail: { row_num: r.row_num, salesrep: r.salesrep_raw, src_id: r.src_id_raw,
-          num_issued: r.num_issued, num_other: r.num_other, num_set: r.num_set },
+      partitionBreaches.push({
+        row_num: r.row_num, salesrep: r.salesrep_raw, src_id: r.src_id_raw,
+        num_issued: r.num_issued, num_other: r.num_other, num_set: r.num_set,
+        delta: (r.num_issued + r.num_other) - r.num_set,
       });
     }
     if (r.num_sat > r.num_issued) {
@@ -247,6 +303,17 @@ export function validateApptStatsCsv(parsed, expectedTotals = null) {
         detail: { row_num: r.row_num, num_sat: r.num_sat, num_issued: r.num_issued },
       });
     }
+  }
+
+  if (dispositionBreaches.length) {
+    warnings.push(deltaWarning('disposition_sum_mismatch', dispositionBreaches,
+      'Σ NumDsp1..NumDsp10 != NumIssued on these rows. delta = dispositions_total - num_issued. '
+      + 'Recorded, not rejected: this identity was validated against January 2026 only and does not hold across all months.'));
+  }
+  if (partitionBreaches.length) {
+    warnings.push(deltaWarning('set_partition_mismatch', partitionBreaches,
+      'NumIssued + NumOther != NumSet on these rows. delta = (num_issued + num_other) - num_set. '
+      + 'Recorded, not rejected: same single-month provenance as disposition_sum_mismatch.'));
   }
 
   if (parsed.aliasDisagreements?.length) {
