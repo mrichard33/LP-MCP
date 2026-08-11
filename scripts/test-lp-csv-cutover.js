@@ -876,3 +876,61 @@ test('B the reaper predicates on ZERO ROWS, not on finalized_at or source_format
   assert.match(src, /v_rowless_ok/,
     'legitimately row-less types are an explicit named carve-out, not a format filter');
 });
+
+test('C promotion is ordered by COVERAGE, not by arrival order', () => {
+  const { src, file } = latestFunctionSource('lp_csv_ingest_finalize');
+
+  // Promotion was last-writer-wins. Harmless while LP sent one file per period;
+  // the rolling daily schedule (t1=[BOCM]&t2=[DAYOFFSET(-1)]) sends ~30 files per
+  // report per month, all sharing a period_start and differing only in
+  // period_end. Production already shows the failure: job_status_ytd took
+  // period_end Aug 10 -> Aug 31 -> Aug 10 across three arrivals on 2026-08-10/11,
+  // so whichever landed last became current regardless of how much of the period
+  // it actually covered.
+  assert.match(src, /v_keep_end/,
+    `finalize must compare the incoming period_end against the incumbent's (${file})`);
+  assert.match(src, /v_keep_end > s\.period_end/,
+    'a snapshot covering strictly LESS of the period must not displace the current one');
+
+  // Refusing has to be visible. A silent skip is indistinguishable from a file
+  // that never arrived, which is the failure mode this whole change exists to end.
+  const guard = src.slice(src.indexOf('IF v_keep_id IS NOT NULL'));
+  assert.match(guard.slice(0, guard.indexOf('END IF;')), /lp_log_supersede/,
+    'a refused arrival is logged as superseded, not dropped silently');
+
+  // Equal coverage must still win: a corrected same-day re-send has to be able to
+  // replace its predecessor. Only a strict `>` preserves that.
+  assert.ok(!/v_keep_end >= s\.period_end/.test(src),
+    'equal coverage must still win — a corrected re-send replaces its predecessor');
+});
+
+test('C an inverted period is refused before a daterange is built from it', () => {
+  const { src, file } = latestFunctionSource('lp_csv_ingest_finalize');
+
+  // [BOCM] with [DAYOFFSET(-1)] on the 1st of a month asks for "this month so
+  // far, through yesterday" and yields 2026-09-01..2026-08-31. The promotion step
+  // builds daterange(period_start, period_end) to find what this snapshot
+  // displaces, and an inverted range raises "range lower bound must be less than
+  // or equal to range upper bound" — after the rows are already loaded.
+  // Verified against the prior definition: it fails exactly that way.
+  assert.match(src, /s\.period_end < s\.period_start/,
+    `finalize must reject an inverted period (${file})`);
+
+  // Compare positions in CODE, not prose — the comment above the guard names
+  // daterange() while explaining what it prevents, and would otherwise register
+  // as the first occurrence.
+  const code = src.replace(/--[^\n]*/g, '');
+  assert.ok(code.indexOf('s.period_end < s.period_start') < code.indexOf('daterange('),
+    'the check has to come BEFORE the first daterange, or it cannot prevent the raise');
+
+  // The cheap rejection belongs upstream, where it costs one logged line instead
+  // of a 500 out of the middle of promotion.
+  const csvSrc = readFileSync('src/jobs/lp-csv-ingest.js', 'utf8');
+  assert.match(csvSrc, /inverted_period/,
+    'lp-csv-ingest.js rejects it before the rows are loaded');
+  // Anchor on the CALL inside ingestCsv, not on the helper's definition further
+  // up the file.
+  assert.ok(csvSrc.indexOf('inverted_period')
+            < csvSrc.indexOf('const existingByContent = await probeExistingContentSnapshot('),
+    'and does so before any snapshot work begins');
+});

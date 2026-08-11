@@ -58,7 +58,7 @@ export function nthWeekdayOfMonth(year, month, weekday, n) {
 }
 
 /** Last Monday of a month. */
-function lastMondayOfMonth(year, month) {
+export function lastMondayOfMonth(year, month) {
   const lastDay = new Date(Date.UTC(year, month, 0, 12, 0, 0)).getUTCDate();
   const last = new Date(Date.UTC(year, month - 1, lastDay, 12, 0, 0));
   const dow = last.getUTCDay();
