@@ -8,31 +8,82 @@
  * Selling-day definition (config, env-overridable):
  *   - Default weekly pattern: Mon–Sat are selling days; Sunday is not.
  *     Override with SCORECARD_SELLING_DAYS=mon,tue,wed,thu,fri,sat
- *   - A Reece closure (holiday) list, excluded even when Mon–Sat. Default set:
- *     New Year's Day (Jan 1), Independence Day (Jul 4), Thanksgiving (4th Thu
- *     Nov), Christmas (Dec 25). Override with SCORECARD_HOLIDAYS=YYYY-MM-DD,...
+ *   - A Reece closure (holiday) list, excluded even when Mon–Sat. Eight closures:
+ *     New Year's Day, Memorial Day, Independence Day, Labor Day, Thanksgiving,
+ *     the day after Thanksgiving, Christmas Eve and Christmas Day.
+ *     Override with SCORECARD_HOLIDAYS=YYYY-MM-DD,...
  *
  * NOTE: Juneteenth is intentionally a SELLING day, so June 2026 = 26 selling
- * days (matches the official Reece report). Holidays here are showroom-closure
- * days, NOT the federal-holiday calendar in rescission-window.js — so we do not
- * apply OPM observed-day shifts (a closure is on the actual day; a holiday that
- * lands on a Sunday is already non-selling).
+ * days (matches the official Reece report). These are showroom-closure days,
+ * NOT the federal-holiday calendar in rescission-window.js: Columbus Day and
+ * Veterans Day stay selling days, while the day after Thanksgiving and Christmas
+ * Eve are closures despite not being federal holidays.
+ *
+ * Fixed-date closures ARE shifted to the nearest weekday when they fall on a
+ * weekend (Sat → prior Fri, Sun → next Mon), matching the dashboard. This module
+ * previously listed only four closures and applied no shift, which put it four
+ * selling days a year ahead of the read side — May, Sep, Nov and Dec 2026 each
+ * counted one day too many (309/yr here vs 305 in the dashboard). Since this is
+ * the module that WRITES days_elapsed and working_days_in_period, every
+ * target-to-date in those months was being computed against the wrong
+ * denominator. August happened to agree, which is why it went unnoticed.
+ *
+ * ⚠ This is the server-side source of truth. Its read-side mirror is
+ * lib/date/holidays.ts in the dashboard; the two lists must stay identical.
  *
  * Pure functions only — no I/O, no side effects. Unit-testable.
  */
 
-import { addDays, dowFromYMD, nthWeekdayOfMonth } from './rescission-window.js';
+import {
+  addDays, dowFromYMD, nthWeekdayOfMonth, lastMondayOfMonth, shiftToObserved,
+} from './rescission-window.js';
 
 const DOW_NAMES = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
 
-/** Default closure days for a year: New Year's, July 4, Thanksgiving, Christmas. */
-function defaultHolidays(year) {
+/**
+ * Frozen closure lists (YYYY-MM-DD, observed dates already applied).
+ *
+ * Must stay identical to REECE_HOLIDAYS in the dashboard's lib/date/holidays.ts.
+ * That file is the read-side mirror; this module is what actually writes
+ * days_elapsed and working_days_in_period onto lp_market_scorecard_daily, so a
+ * disagreement here is the one that reaches the numbers.
+ */
+const FROZEN_HOLIDAYS = {
+  2026: [
+    '2026-01-01', // New Year's Day (Thu)
+    '2026-05-25', // Memorial Day (Mon)
+    '2026-07-03', // Independence Day — observed (Fri; Jul 4 falls on Sat)
+    '2026-09-07', // Labor Day (Mon)
+    '2026-11-26', // Thanksgiving (Thu)
+    '2026-11-27', // Day after Thanksgiving (Fri)
+    '2026-12-24', // Christmas Eve (Thu)
+    '2026-12-25', // Christmas Day (Fri)
+  ],
+};
+
+/**
+ * Computed fallback for years not frozen above — same pattern, so a future year
+ * never silently degrades to "no closures". Freeze new years here and validate
+ * against the working_days column in scorecard_goals_monthly.
+ */
+function computedHolidays(year) {
+  const thanksgiving = nthWeekdayOfMonth(year, 11, 4, 4);
   return new Set([
-    `${year}-01-01`,                  // New Year's Day
-    `${year}-07-04`,                  // Independence Day
-    nthWeekdayOfMonth(year, 11, 4, 4), // Thanksgiving — 4th Thursday Nov
-    `${year}-12-25`,                  // Christmas Day
+    shiftToObserved(`${year}-01-01`),   // New Year's Day
+    lastMondayOfMonth(year, 5),         // Memorial Day — last Monday of May
+    shiftToObserved(`${year}-07-04`),   // Independence Day
+    nthWeekdayOfMonth(year, 9, 1, 1),   // Labor Day — 1st Monday of September
+    thanksgiving,                       // Thanksgiving — 4th Thursday of November
+    addDays(thanksgiving, 1),           // Day after Thanksgiving
+    shiftToObserved(`${year}-12-24`),   // Christmas Eve
+    shiftToObserved(`${year}-12-25`),   // Christmas Day
   ]);
+}
+
+/** Reece closure days for a year. Frozen list when present, else computed. */
+function defaultHolidays(year) {
+  const frozen = FROZEN_HOLIDAYS[year];
+  return frozen ? new Set(frozen) : computedHolidays(year);
 }
 
 /**
