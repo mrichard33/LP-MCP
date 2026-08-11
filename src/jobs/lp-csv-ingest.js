@@ -634,6 +634,23 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
     return await fail('missing_period', { header: parsed.header }, 'SDate/EDate missing from the export.');
   }
 
+  // An end before its start is not a period. This is reachable from the LP
+  // scheduler, not just from a corrupt file: t1=[BOCM]&t2=[DAYOFFSET(-1)] run on
+  // the 1st of a month asks for "this month so far, through yesterday" and yields
+  // 2026-09-01..2026-08-31. Downstream, lp_csv_ingest_finalize builds
+  // daterange(period_start, period_end) to find what this snapshot displaces, and
+  // an inverted range raises "range lower bound must be less than or equal to
+  // range upper bound" — a 500 out of the promotion step, after the rows have
+  // already been loaded. Reject it here instead, so it is one logged line and the
+  // day's other reports are unaffected.
+  if (snapshotPayload.period_end < snapshotPayload.period_start) {
+    return await fail('inverted_period', {
+      period_start: snapshotPayload.period_start,
+      period_end: snapshotPayload.period_end,
+    }, `file declares ${snapshotPayload.period_start}..${snapshotPayload.period_end}; end precedes start. `
+     + 'Check the LP schedule — a DAYOFFSET(-1) end on the 1st of the month produces this.');
+  }
+
   // The period comes from the FILE (§D). A caller that disagrees is working
   // from a different file than the one it sent, and guessing which is right is
   // how a month's revenue lands under the wrong month.
