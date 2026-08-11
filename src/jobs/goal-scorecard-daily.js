@@ -60,6 +60,27 @@ const FETCH_CONCURRENCY = Number(process.env.SCORECARD_FETCH_CONCURRENCY || 6);
 // scoped to the cohort window in computeActuals; only the fetch window widens.
 const PULL_LOOKBACK_DAYS = Number(process.env.SCORECARD_PULL_LOOKBACK_DAYS || 60);
 
+/**
+ * Per-day retries for the SCHEDULED writer.
+ *
+ * ⚠️ This was 0, and it is why the feed was dark. `fetchDayWithRetry` was
+ * written for exactly one error — LP returning
+ * `500 Execution Timeout Expired` when its own DB read times out — and then
+ * nobody turned it on: `fetchAllProspects` defaults `dayRetries` to 0 and
+ * `computeGoalScorecard` passed nothing.
+ *
+ * The writer fetches ~70 ET days (60-day lookback plus the month) through
+ * `Promise.all`, so ONE flaky day rejects the entire run and aborts the write.
+ * From lp_sync_log, every scheduled run 08-05 → 08-11 failed on that error
+ * except 08-08 and the 08-11 03:28 catch-up — a coin-flip that has to come up
+ * heads ~70 times in a row.
+ *
+ * Three retries at 1s/2s/4s costs at most ~7s per flaky day and turns a
+ * single-day blip into a non-event. It does NOT paper over a genuine outage:
+ * if LP is really down, all four attempts fail and the run still aborts.
+ */
+const SCHEDULED_DAY_RETRIES = Number(process.env.SCORECARD_DAY_RETRIES || 3);
+
 /** Shift a YYYY-MM-DD (ET) back by n calendar days (UTC-safe). */
 function minusDays(etDate, n) {
   const d = new Date(`${etDate}T00:00:00Z`);
@@ -286,7 +307,9 @@ export async function computeGoalScorecard(opts = {}) {
 
   let prospects;
   try {
-    prospects = await fetchAllProspects(fetchStart, periodEnd);
+    prospects = await fetchAllProspects(fetchStart, periodEnd, {
+      dayRetries: opts.dayRetries ?? SCHEDULED_DAY_RETRIES,
+    });
   } catch (err) {
     // Circuit open / timeout / partial pull → abort write, keep prior row intact.
     console.error(`[Scorecard] LP fetch failed — aborting write: ${err.message}`);
@@ -687,10 +710,17 @@ const MAX_ATTEMPTS_PER_DAY = 3;
  *
  * Returns: 'ok' | 'failed' | 'slow' | 'in_flight' | 'capped'.
  */
-export function createRunGuard({ timeoutMs, maxAttemptsPerDay, log = console } = {}) {
+export function createRunGuard({
+  timeoutMs,
+  maxAttemptsPerDay,
+  minGapMs = 0,
+  log = console,
+  now = () => Date.now(),
+} = {}) {
   let inFlight = null; // the underlying work promise, or null
   let attempts = { date: null, n: 0 };
   let lastSuccess = null; // ET date string of the last SUCCESSFUL run
+  let lastAttemptAt = null; // epoch ms, for the spacing rule below
 
   return {
     get busy() {
@@ -716,7 +746,31 @@ export function createRunGuard({ timeoutMs, maxAttemptsPerDay, log = console } =
         log.warn(`[Scorecard] ${why}: ${maxAttemptsPerDay} attempts already made today — standing down until tomorrow`);
         return 'capped';
       }
+      // ── SPACING, NOT JUST A CAP ──────────────────────────────────────
+      //
+      // The scheduler polls every 5 minutes and the 06:00 gate is
+      // `hour === 6 && lastRunDate !== today`. Because a failure correctly
+      // leaves the day reclaimable, a failing run retried at 06:00, 06:05 and
+      // 06:10 — spending the whole daily budget inside ten minutes, every
+      // attempt landing in the same bad window.
+      //
+      // Live proof, 2026-08-11: three runs at 10:03, 10:08 and 10:13 UTC, all
+      // failing `LP API 500: Execution Timeout Expired`, and then the job stood
+      // down for the rest of the day. LP recovers — 08-08 10:00 and 08-11 03:28
+      // both succeeded — so the attempts were not wasted because LP was down,
+      // they were wasted because they were bunched.
+      //
+      // A cap without spacing just makes the storm short. The gap is what makes
+      // the cap useful: if LP is unwell at 06:00 and healthy by 09:00, the
+      // 09:00 attempt is the one that lands.
+      const sinceLast = lastAttemptAt == null ? Infinity : now() - lastAttemptAt;
+      if (sinceLast < minGapMs) {
+        const waitMin = Math.ceil((minGapMs - sinceLast) / 60000);
+        log.warn(`[Scorecard] ${why}: last attempt was ${Math.round(sinceLast / 60000)}m ago — holding ${waitMin}m more before retrying`);
+        return 'too_soon';
+      }
 
+      lastAttemptAt = now();
       const attempt = (attempts.n += 1);
 
       // The run owns its own lifecycle. It never rejects — the outcome is the
@@ -760,6 +814,9 @@ export function createRunGuard({ timeoutMs, maxAttemptsPerDay, log = console } =
 const runGuard = createRunGuard({
   timeoutMs: RUN_TIMEOUT_MS,
   maxAttemptsPerDay: MAX_ATTEMPTS_PER_DAY,
+  // Spacing lives in the guard so EVERY caller inherits it — the 06:00 gate
+  // used to retry every 5 minutes because only the watchdog was spaced.
+  minGapMs: CATCHUP_MIN_GAP_MS,
 });
 
 async function attemptDailyRun(today, why) {
@@ -833,9 +890,7 @@ async function checkSnapshotFreshness(today) {
     // for the rest of the day. A gap between attempts is what makes the cap
     // useful: if LP is unwell at 07:00 and healthy by noon, the noon attempt is
     // the one that lands.
-    const sinceLast = lastCatchupAt == null ? Infinity : Date.now() - lastCatchupAt;
-    if (sinceLast >= CATCHUP_MIN_GAP_MS) {
-      lastCatchupAt = Date.now();
+    {
       console.warn(`[Scorecard] watchdog: no row for ${expectedAsOf} — running the daily job now (the 06:00 ET window was missed or the run failed)`);
       const outcome = await attemptDailyRun(today, 'watchdog catch-up');
 
@@ -843,8 +898,8 @@ async function checkSnapshotFreshness(today) {
       // exactly what happened on 2026-08-11: the alert fired at 120s and the
       // job finished fine at 338s. Say nothing and let the next poll see the
       // row — the in-flight lock guarantees we are not racing it.
-      if (outcome === 'slow' || outcome === 'in_flight') {
-        console.log(`[Scorecard] watchdog: a run is in flight for ${expectedAsOf} — deferring the verdict to the next poll`);
+      if (outcome === 'slow' || outcome === 'in_flight' || outcome === 'too_soon') {
+        console.log(`[Scorecard] watchdog: ${expectedAsOf} unresolved but a retry is in flight or held (${outcome}) — deferring the verdict to the next poll`);
         return;
       }
 

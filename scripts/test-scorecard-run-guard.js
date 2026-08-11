@@ -157,3 +157,73 @@ test('counts the real outage', () => {
 test('no snapshot at all is null — a worse statement than zero', () => {
   assert.equal(stalenessLagSellingDays(null, '2026-08-10', CAL), null);
 });
+
+// ── Spacing: a cap without a gap just makes the storm short ────────────────
+//
+// The scheduler polls every 5 minutes and the 06:00 gate is
+// `hour === 6 && lastRunDate !== today`. Because a failure correctly leaves the
+// day reclaimable, a failing run retried at 06:00, 06:05 and 06:10 — spending
+// the entire daily budget inside ten minutes, every attempt landing in the same
+// bad window, and then standing down until tomorrow.
+//
+// Live, 2026-08-11 (lp_sync_log): runs at 10:03, 10:08 and 10:13 UTC, all
+// failing `LP API 500: Execution Timeout Expired`. LP recovers — 08-08 10:00
+// and 08-11 03:28 both succeeded — so those attempts were not wasted because LP
+// was down. They were wasted because they were bunched.
+
+test('a second attempt inside the gap is held, and costs nothing', async () => {
+  let clock = 0;
+  const g = createRunGuard({
+    timeoutMs: 50, maxAttemptsPerDay: 3, minGapMs: 60_000, log: quiet, now: () => clock,
+  });
+  const fail = async () => { throw new Error('LP API 500'); };
+
+  assert.equal(await g.attempt('2026-08-11', 'first', fail), 'failed');
+  assert.equal(g.attemptsOn('2026-08-11'), 1);
+
+  clock += 5 * 60 * 1000 / 60;             // 5 seconds later — well inside the gap
+  assert.equal(await g.attempt('2026-08-11', 'poll', fail), 'too_soon');
+  assert.equal(g.attemptsOn('2026-08-11'), 1, 'a held attempt must not spend the budget');
+});
+
+test('once the gap elapses the retry proceeds', async () => {
+  let clock = 0;
+  const g = createRunGuard({
+    timeoutMs: 50, maxAttemptsPerDay: 3, minGapMs: 60_000, log: quiet, now: () => clock,
+  });
+  const fail = async () => { throw new Error('LP API 500'); };
+
+  assert.equal(await g.attempt('2026-08-11', 'first', fail), 'failed');
+  clock += 60_000;
+  assert.equal(await g.attempt('2026-08-11', 'later', fail), 'failed');
+  assert.equal(g.attemptsOn('2026-08-11'), 2);
+});
+
+test('REGRESSION: three daily attempts cannot burn inside one bad window', async () => {
+  // The 2026-08-11 sequence, replayed. With spacing, a 5-minute poll across the
+  // 06:00 hour spends ONE attempt, not three — leaving two for the hours when
+  // LP is healthy again.
+  let clock = 0;
+  const g = createRunGuard({
+    timeoutMs: 50, maxAttemptsPerDay: 3, minGapMs: 60 * 60 * 1000, log: quiet, now: () => clock,
+  });
+  const fail = async () => { throw new Error('LP API 500'); };
+
+  for (let i = 0; i < 12; i++) {           // the whole 06:00 hour, polled every 5m
+    await g.attempt('2026-08-11', 'daily 06:00 ET', fail);
+    clock += 5 * 60 * 1000;
+  }
+  assert.equal(g.attemptsOn('2026-08-11'), 1, 'one bad window costs one attempt');
+
+  // Three hours on, LP is healthy: the budget is still there to use.
+  clock += 3 * 60 * 60 * 1000;
+  assert.equal(await g.attempt('2026-08-11', 'watchdog catch-up', async () => {}), 'ok');
+  assert.equal(g.lastSuccessDate, '2026-08-11');
+});
+
+test('spacing is off by default, so unspaced callers are unaffected', async () => {
+  const g = createRunGuard({ timeoutMs: 50, maxAttemptsPerDay: 3, log: quiet });
+  const fail = async () => { throw new Error('nope'); };
+  assert.equal(await g.attempt('2026-08-11', 'a', fail), 'failed');
+  assert.equal(await g.attempt('2026-08-11', 'b', fail), 'failed');
+});
