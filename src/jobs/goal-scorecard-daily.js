@@ -618,7 +618,84 @@ export function registerGoalScorecardRoutes(app) {
 
 // ─── Scheduler — daily at 06:00 ET ───────────────────────────────────
 let scorecardTimer = null;
-let lastRunDate = null; // ET date string of the last successful daily run
+let lastRunDate = null; // ET date string of the last SUCCESSFUL daily run
+let lastCatchupAt = null; // epoch ms of the watchdog's last catch-up attempt
+
+/** Minimum spacing between watchdog catch-up attempts. */
+const CATCHUP_MIN_GAP_MS = Number(process.env.GOAL_SCORECARD_CATCHUP_GAP_MS || 60 * 60 * 1000);
+
+/**
+ * How long one run may take before it is abandoned.
+ *
+ * The LP API degrades: on 2026-08-10 the lead sync was fetching ONE prospect per
+ * page (164 leads in 16.5 min) with `empty page at StartIndex=N but probe found
+ * rows — retrying smaller` firing continuously, and a manual
+ * POST /n8n/admin/goal-scorecard-run returned nothing after 240s. Without a
+ * bound, the 06:00 run simply runs past its own hour and the day is lost.
+ */
+const RUN_TIMEOUT_MS = Number(process.env.GOAL_SCORECARD_TIMEOUT_MS || 120_000);
+
+/** Attempts per ET day, so a persistently sick API cannot become a run-storm. */
+const MAX_ATTEMPTS_PER_DAY = 3;
+
+let attemptsToday = { date: null, n: 0 };
+let inFlight = false;
+
+/**
+ * One guarded attempt at the daily run. Returns true only on success.
+ *
+ * ══ WHY THE SLOT IS CLAIMED ON SUCCESS, NOT ON ATTEMPT ══
+ *
+ * This used to read `lastRunDate = today` BEFORE awaiting, to avoid a double
+ * fire. The cost was that any failure — or any hang — burned the whole day: the
+ * guard said "already ran today" when nothing had been written. Combined with a
+ * firing window of exactly one hour, that is how lp_market_scorecard_daily
+ * stopped at 2026-08-07 while the report snapshots stayed current.
+ *
+ * The double-fire it was protecting against is now handled by `inFlight` (one
+ * run at a time) and by the per-day attempt cap, both of which are honest about
+ * what happened. `lastRunDate` means what it says again: the last day this
+ * actually succeeded.
+ *
+ * ⚠️ The timeout frees the SCHEDULER, not the underlying request — there is no
+ * AbortController plumbed through lp-client, so an abandoned run may still be
+ * in flight against LP. `inFlight` is what stops a second one stacking on it.
+ */
+async function attemptDailyRun(today, why) {
+  if (inFlight) {
+    console.warn(`[Scorecard] ${why}: a run is already in flight — not stacking another`);
+    return false;
+  }
+  if (attemptsToday.date !== today) attemptsToday = { date: today, n: 0 };
+  if (attemptsToday.n >= MAX_ATTEMPTS_PER_DAY) {
+    console.warn(`[Scorecard] ${why}: ${MAX_ATTEMPTS_PER_DAY} attempts already made today — standing down until tomorrow`);
+    return false;
+  }
+
+  attemptsToday.n += 1;
+  inFlight = true;
+  let timer;
+  try {
+    await Promise.race([
+      computeGoalScorecard(),
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`run exceeded ${RUN_TIMEOUT_MS}ms — LP API is likely degraded`)),
+          RUN_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    lastRunDate = today; // success, and only success
+    console.log(`[Scorecard] ${why}: run succeeded (attempt ${attemptsToday.n}/${MAX_ATTEMPTS_PER_DAY})`);
+    return true;
+  } catch (err) {
+    console.error(`[Scorecard] ${why}: run FAILED (attempt ${attemptsToday.n}/${MAX_ATTEMPTS_PER_DAY}): ${err.message}`);
+    return false; // the day stays reclaimable
+  } finally {
+    clearTimeout(timer);
+    inFlight = false;
+  }
+}
 let lastWatchdogAlertDate = null; // ET date of the last missing-snapshot alert
 
 // Freshness watchdog (added after the Jul 31–Aug 4 outage, when the daily
@@ -647,12 +724,51 @@ async function checkSnapshotFreshness(today) {
     }
     if (data && data.length > 0) return; // healthy
 
+    // ── SELF-HEAL BEFORE ALERTING ────────────────────────────────────────
+    //
+    // The daily run fires only while the ET hour is exactly 6. If the process
+    // is not alive in that window the day is simply lost — and this service
+    // restarts on every Railway deploy, so losing the window is routine, not
+    // exotic. That is how lp_market_scorecard_daily stopped at 2026-08-07
+    // while the report snapshots ran current through 08-10: three consecutive
+    // days missed, each one alerted and none retried.
+    //
+    // The watchdog already knows the one thing that matters — the expected row
+    // is absent — so it should RUN the job, not just describe the hole. Alert
+    // only if the catch-up itself fails; a hole that healed is not an incident.
+    //
+    // SPACED retries, not one-and-done. The watchdog polls every 5 minutes, so
+    // an ungated catch-up would burn all three daily attempts inside a quarter
+    // hour — every one of them against the same sick API, and then stand down
+    // for the rest of the day. A gap between attempts is what makes the cap
+    // useful: if LP is unwell at 07:00 and healthy by noon, the noon attempt is
+    // the one that lands.
+    const sinceLast = lastCatchupAt == null ? Infinity : Date.now() - lastCatchupAt;
+    if (sinceLast >= CATCHUP_MIN_GAP_MS) {
+      lastCatchupAt = Date.now();
+      console.warn(`[Scorecard] watchdog: no row for ${expectedAsOf} — running the daily job now (the 06:00 ET window was missed or the run failed)`);
+      const ok = await attemptDailyRun(today, 'watchdog catch-up');
+      if (ok) {
+        const { data: healed } = await supabase
+          .from('lp_market_scorecard_daily')
+          .select('as_of_date')
+          .eq('market', DEFAULT_MARKET)
+          .gte('as_of_date', expectedAsOf)
+          .limit(1);
+        if (healed && healed.length > 0) {
+          console.log(`[Scorecard] watchdog: catch-up run succeeded for ${expectedAsOf}`);
+          return; // healed — nothing to page anyone about
+        }
+      }
+    }
+
     lastWatchdogAlertDate = today; // once per ET day, re-alerts tomorrow if still missing
     const msg =
       `⚠️ SCORECARD SNAPSHOT MISSING — lp_market_scorecard_daily has no row for ` +
-      `${expectedAsOf} (last completed selling day). The 06:00 ET daily job did not ` +
-      `write today; the dashboard is showing its "no data yet" state. ` +
-      `Check LP-MCP logs, then backfill via POST /n8n/admin/goal-scorecard-run.`;
+      `${expectedAsOf} (last completed selling day). The 06:00 ET run did not write, ` +
+      `AND the watchdog's catch-up run did not fix it — so this is a real failure, ` +
+      `not a missed window. The dashboard is showing its "no data yet" state. ` +
+      `Check LP-MCP logs, then retry via POST /n8n/admin/goal-scorecard-run.`;
     console.error(`[Scorecard] watchdog: ${msg}`);
     try {
       const { sendGroupMeMessage } = await import('../groupme.js');
@@ -677,12 +793,7 @@ export function startGoalScorecardScheduler() {
     const hour = Number(parts.find((p) => p.type === 'hour')?.value ?? -1);
     const today = todayET();
     if (hour === 6 && lastRunDate !== today) {
-      lastRunDate = today; // claim the slot before awaiting (avoids double-fire)
-      try {
-        await computeGoalScorecard();
-      } catch (err) {
-        console.error('[Scorecard] daily run failed:', err.message);
-      }
+      await attemptDailyRun(today, 'daily 06:00 ET');
     }
     // Watchdog window: any check from 07:00 ET onward (covers deploys that
     // boot mid-day — a fresh process still verifies today's snapshot exists).
