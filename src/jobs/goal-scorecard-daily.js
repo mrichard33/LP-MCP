@@ -779,6 +779,25 @@ let lastWatchdogAlertDate = null; // ET date of the last missing-snapshot alert
 const WATCHDOG_DISABLED =
   (process.env.SCORECARD_WATCHDOG_DISABLED || 'false').toLowerCase() === 'true';
 
+/**
+ * How many SELLING days the data is behind, given the newest as-of we have and
+ * the one we expected.
+ *
+ * `sellingDaysElapsed` counts INCLUSIVE of both endpoints, so the gap between
+ * them is one less — a snapshot that already reaches the expected day is 0
+ * behind, not 1. Sundays and Reece closures are not lateness. Null when no
+ * snapshot exists at all, which is a different (worse) statement than "0".
+ *
+ * Exported for the test: this is a one-line arithmetic with an off-by-one in it,
+ * and an alert that overstates the outage by a day is how a missed morning gets
+ * mistaken for the Jul 31–Aug 4 five-day outage.
+ */
+export function stalenessLagSellingDays(actualAsOf, expectedAsOf, cal) {
+  if (!actualAsOf) return null;
+  if (actualAsOf >= expectedAsOf) return 0;
+  return Math.max(0, sellingDaysElapsed(actualAsOf, expectedAsOf, cal) - 1);
+}
+
 async function checkSnapshotFreshness(today) {
   if (WATCHDOG_DISABLED || lastWatchdogAlertDate === today) return;
   const expectedAsOf = lastCompletedSellingDay(today, SELLING_CAL);
@@ -844,13 +863,73 @@ async function checkSnapshotFreshness(today) {
     }
 
     lastWatchdogAlertDate = today; // once per ET day, re-alerts tomorrow if still missing
+
+    // How far behind we actually are. Only queried on the failure path — the
+    // healthy path already returned. Without this the alert can say "missing"
+    // but not "missing for how long", and one missed morning reads exactly like
+    // the five-day outage of Jul 31–Aug 4.
+    let actualAsOf = null;
+    try {
+      const { data: latest } = await supabase
+        .from('lp_market_scorecard_daily')
+        .select('as_of_date')
+        .eq('market', DEFAULT_MARKET)
+        .order('as_of_date', { ascending: false })
+        .limit(1);
+      actualAsOf = latest?.[0]?.as_of_date ?? null;
+    } catch (lagErr) {
+      console.error('[Scorecard] watchdog lag lookup failed:', lagErr.message);
+    }
+    const lagDays = stalenessLagSellingDays(actualAsOf, expectedAsOf, SELLING_CAL);
+    const lagPhrase = lagDays == null
+      ? 'no snapshot has ever been written'
+      : `${lagDays} selling day${lagDays === 1 ? '' : 's'} behind (last: ${actualAsOf})`;
+
     const msg =
       `⚠️ SCORECARD SNAPSHOT MISSING — lp_market_scorecard_daily has no row for ` +
-      `${expectedAsOf} (last completed selling day). The 06:00 ET run did not write, ` +
-      `AND the watchdog's catch-up run did not fix it — so this is a real failure, ` +
+      `${expectedAsOf} (last completed selling day) — ${lagPhrase}. The 06:00 ET run did not ` +
+      `write, AND the watchdog's catch-up run did not fix it — so this is a real failure, ` +
       `not a missed window. The dashboard is showing its "no data yet" state. ` +
       `Check LP-MCP logs, then retry via POST /n8n/admin/goal-scorecard-run.`;
     console.error(`[Scorecard] watchdog: ${msg}`);
+
+    // ── A LOG LINE IS NOT A SIGNAL ───────────────────────────────────────
+    //
+    // console.error and GroupMe are both fire-and-forget: nothing stores them,
+    // nothing can query them, and nobody was reading either. That is how three
+    // consecutive missed days (2026-08-08 → 08-10) passed unnoticed while the
+    // dashboard served four-day-old numbers as current.
+    //
+    // `bypass_filter: true` is LOAD-BEARING. emitEvent runs applyIntakeFilter
+    // BEFORE the idempotency check and silently returns {filtered:true} on a
+    // drop — an infrastructure alert that can itself be filtered out is the
+    // exact failure mode this exists to end.
+    //
+    // Keyed on the missing day, so re-checking every 5 minutes records the
+    // incident once rather than 288 times, and a second missing day is its own
+    // event rather than a duplicate.
+    try {
+      const { emitEvent } = await import('../event-emitter.js');
+      await emitEvent({
+        event_type: 'scorecard.snapshot_stale',
+        event_subtype: lagDays == null ? 'unknown' : `${lagDays}d`,
+        source: 'lp_mcp',
+        entity_type: 'market',
+        entity_id: DEFAULT_MARKET,
+        payload: {
+          expected_as_of: expectedAsOf,
+          actual_as_of: actualAsOf,
+          lag_selling_days: lagDays,
+          detail: msg,
+        },
+        priority: 'high',
+        idempotency_key: `scorecard_stale:${expectedAsOf}`,
+        bypass_filter: true,
+      });
+    } catch (evErr) {
+      console.error('[Scorecard] watchdog event emit failed:', evErr.message);
+    }
+
     try {
       const { sendGroupMeMessage } = await import('../groupme.js');
       await sendGroupMeMessage(msg);

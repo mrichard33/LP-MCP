@@ -21,7 +21,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createRunGuard } from '../src/jobs/goal-scorecard-daily.js';
+import { createRunGuard, stalenessLagSellingDays } from '../src/jobs/goal-scorecard-daily.js';
+import { resolveSellingCalendar } from '../src/selling-days.js';
 
 /** Silent logger so the suite output stays readable. */
 const quiet = { log() {}, warn() {}, error() {} };
@@ -122,4 +123,37 @@ test('a rejected slow run does not leave an unhandled rejection or a stuck lock'
   await g.settled();
   assert.equal(g.busy, false);
   assert.equal(g.lastSuccessDate, null);
+});
+
+// ── Staleness lag, in SELLING days ─────────────────────────────────────────
+//
+// The alert now says how far behind we are, not just that something is missing.
+// One missed morning must not read like the Jul 31–Aug 4 five-day outage, and
+// `sellingDaysElapsed` is inclusive of both endpoints — so the gap is one less
+// than the count, which is exactly the sort of off-by-one that ships quietly.
+
+const CAL = resolveSellingCalendar({
+  SCORECARD_SELLING_DAYS: 'mon,tue,wed,thu,fri,sat',
+  SCORECARD_HOLIDAYS: 'none',
+});
+
+test('data reaching the expected day is 0 behind, not 1', () => {
+  assert.equal(stalenessLagSellingDays('2026-08-10', '2026-08-10', CAL), 0);
+  // Ahead of expectation (a same-morning write) is still 0, never negative.
+  assert.equal(stalenessLagSellingDays('2026-08-11', '2026-08-10', CAL), 0);
+});
+
+test('Sunday is not lateness', () => {
+  // Sat 08-08 data, expected Mon 08-10. Sunday 08-09 is not a selling day, so
+  // exactly one selling day was missed.
+  assert.equal(stalenessLagSellingDays('2026-08-08', '2026-08-10', CAL), 1);
+});
+
+test('counts the real outage', () => {
+  // Fri 08-07 data against Mon 08-10: Sat 08-08 and Mon 08-10 = 2.
+  assert.equal(stalenessLagSellingDays('2026-08-07', '2026-08-10', CAL), 2);
+});
+
+test('no snapshot at all is null — a worse statement than zero', () => {
+  assert.equal(stalenessLagSellingDays(null, '2026-08-10', CAL), null);
 });
