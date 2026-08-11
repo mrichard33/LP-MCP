@@ -625,21 +625,32 @@ let lastCatchupAt = null; // epoch ms of the watchdog's last catch-up attempt
 const CATCHUP_MIN_GAP_MS = Number(process.env.GOAL_SCORECARD_CATCHUP_GAP_MS || 60 * 60 * 1000);
 
 /**
- * How long one run may take before it is abandoned.
+ * How long a run may take before the scheduler stops WAITING on it.
  *
  * The LP API degrades: on 2026-08-10 the lead sync was fetching ONE prospect per
  * page (164 leads in 16.5 min) with `empty page at StartIndex=N but probe found
  * rows — retrying smaller` firing continuously, and a manual
  * POST /n8n/admin/goal-scorecard-run returned nothing after 240s. Without a
  * bound, the 06:00 run simply runs past its own hour and the day is lost.
+ *
+ * ⚠️ 120_000 was a GUESS, and it was wrong. Measured in production on
+ * 2026-08-11: a healthy full run over 18,908 prospects takes **338 seconds**.
+ * The deadline fired at 120s, the watchdog declared "this is a real failure,
+ * not a missed window" and paged GroupMe — and then the run finished
+ * successfully 3.5 minutes later and wrote all ten market rows.
+ *
+ * Slow is not hung. The deadline is now set above the observed healthy run with
+ * room to spare, and passing it is a WARNING rather than a verdict — see
+ * `attemptDailyRun`.
  */
-const RUN_TIMEOUT_MS = Number(process.env.GOAL_SCORECARD_TIMEOUT_MS || 120_000);
+const RUN_TIMEOUT_MS = Number(process.env.GOAL_SCORECARD_TIMEOUT_MS || 600_000);
 
 /** Attempts per ET day, so a persistently sick API cannot become a run-storm. */
 const MAX_ATTEMPTS_PER_DAY = 3;
 
-let attemptsToday = { date: null, n: 0 };
-let inFlight = false;
+// Attempt accounting and the in-flight lock live in the guard below, which owns
+// them together — the lock has to outlive the deadline, and a promise is the
+// only thing that knows when the actual work finished.
 
 /**
  * One guarded attempt at the daily run. Returns true only on success.
@@ -657,44 +668,104 @@ let inFlight = false;
  * what happened. `lastRunDate` means what it says again: the last day this
  * actually succeeded.
  *
- * ⚠️ The timeout frees the SCHEDULER, not the underlying request — there is no
- * AbortController plumbed through lp-client, so an abandoned run may still be
- * in flight against LP. `inFlight` is what stops a second one stacking on it.
+ * ══ WHY THE DEADLINE DOES NOT DECIDE THE OUTCOME ══
+ *
+ * `Promise.race` does not cancel the loser, and there is no AbortController
+ * plumbed through lp-client. The first version raced the run against a timeout
+ * and treated losing that race as failure — which produced, live on
+ * 2026-08-11: a deadline at 120s, `run FAILED (attempt 1/3)`, a GroupMe page
+ * reading "this is a real failure, not a missed window" … and then the run
+ * completing normally at 338s and writing every row. The alert was false, the
+ * attempt was spent on a run that worked, and worst of all the `finally`
+ * released the in-flight lock while the work was still hammering the LP API,
+ * so the next watchdog poll could stack a second run on top of the first.
+ *
+ * So: the RUN owns the outcome and the lock; the deadline only decides how long
+ * the caller waits for an answer. Passing it returns `'slow'` — not a failure,
+ * not something to page anyone about. When the work eventually settles it
+ * records its own success or failure, and only then releases the lock.
+ *
+ * Returns: 'ok' | 'failed' | 'slow' | 'in_flight' | 'capped'.
  */
-async function attemptDailyRun(today, why) {
-  if (inFlight) {
-    console.warn(`[Scorecard] ${why}: a run is already in flight — not stacking another`);
-    return false;
-  }
-  if (attemptsToday.date !== today) attemptsToday = { date: today, n: 0 };
-  if (attemptsToday.n >= MAX_ATTEMPTS_PER_DAY) {
-    console.warn(`[Scorecard] ${why}: ${MAX_ATTEMPTS_PER_DAY} attempts already made today — standing down until tomorrow`);
-    return false;
-  }
+export function createRunGuard({ timeoutMs, maxAttemptsPerDay, log = console } = {}) {
+  let inFlight = null; // the underlying work promise, or null
+  let attempts = { date: null, n: 0 };
+  let lastSuccess = null; // ET date string of the last SUCCESSFUL run
 
-  attemptsToday.n += 1;
-  inFlight = true;
-  let timer;
-  try {
-    await Promise.race([
-      computeGoalScorecard(),
-      new Promise((_resolve, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(`run exceeded ${RUN_TIMEOUT_MS}ms — LP API is likely degraded`)),
-          RUN_TIMEOUT_MS,
+  return {
+    get busy() {
+      return inFlight != null;
+    },
+    get lastSuccessDate() {
+      return lastSuccess;
+    },
+    attemptsOn(date) {
+      return attempts.date === date ? attempts.n : 0;
+    },
+    /** Resolves once the work settles — used by tests to await the real thing. */
+    settled() {
+      return inFlight ?? Promise.resolve();
+    },
+    async attempt(today, why, work) {
+      if (inFlight) {
+        log.warn(`[Scorecard] ${why}: a run is already in flight — not stacking another`);
+        return 'in_flight';
+      }
+      if (attempts.date !== today) attempts = { date: today, n: 0 };
+      if (attempts.n >= maxAttemptsPerDay) {
+        log.warn(`[Scorecard] ${why}: ${maxAttemptsPerDay} attempts already made today — standing down until tomorrow`);
+        return 'capped';
+      }
+
+      const attempt = (attempts.n += 1);
+
+      // The run owns its own lifecycle. It never rejects — the outcome is the
+      // resolved value — so abandoning the wait below cannot orphan a rejection.
+      const run = Promise.resolve()
+        .then(work)
+        .then(() => {
+          lastSuccess = today; // success, and only success
+          log.log(`[Scorecard] ${why}: run succeeded (attempt ${attempt}/${maxAttemptsPerDay})`);
+          return true;
+        })
+        .catch((err) => {
+          log.error(`[Scorecard] ${why}: run FAILED (attempt ${attempt}/${maxAttemptsPerDay}): ${err.message}`);
+          return false; // the day stays reclaimable
+        })
+        .finally(() => {
+          inFlight = null; // released when the WORK ends, not when the wait does
+        });
+      inFlight = run;
+
+      let timer;
+      const deadline = new Promise((resolve) => {
+        timer = setTimeout(() => resolve('slow'), timeoutMs);
+      });
+      const outcome = await Promise.race([run, deadline]);
+      clearTimeout(timer);
+
+      if (outcome === 'slow') {
+        log.warn(
+          `[Scorecard] ${why}: still running after ${timeoutMs}ms (attempt ${attempt}/${maxAttemptsPerDay}) — ` +
+            `leaving it in flight; a healthy full run measured 338s on 2026-08-11. ` +
+            `The lock stays held, so nothing will stack on it.`,
         );
-      }),
-    ]);
-    lastRunDate = today; // success, and only success
-    console.log(`[Scorecard] ${why}: run succeeded (attempt ${attemptsToday.n}/${MAX_ATTEMPTS_PER_DAY})`);
-    return true;
-  } catch (err) {
-    console.error(`[Scorecard] ${why}: run FAILED (attempt ${attemptsToday.n}/${MAX_ATTEMPTS_PER_DAY}): ${err.message}`);
-    return false; // the day stays reclaimable
-  } finally {
-    clearTimeout(timer);
-    inFlight = false;
-  }
+        return 'slow';
+      }
+      return outcome ? 'ok' : 'failed';
+    },
+  };
+}
+
+const runGuard = createRunGuard({
+  timeoutMs: RUN_TIMEOUT_MS,
+  maxAttemptsPerDay: MAX_ATTEMPTS_PER_DAY,
+});
+
+async function attemptDailyRun(today, why) {
+  const outcome = await runGuard.attempt(today, why, () => computeGoalScorecard());
+  lastRunDate = runGuard.lastSuccessDate ?? lastRunDate;
+  return outcome;
 }
 let lastWatchdogAlertDate = null; // ET date of the last missing-snapshot alert
 
@@ -747,8 +818,18 @@ async function checkSnapshotFreshness(today) {
     if (sinceLast >= CATCHUP_MIN_GAP_MS) {
       lastCatchupAt = Date.now();
       console.warn(`[Scorecard] watchdog: no row for ${expectedAsOf} — running the daily job now (the 06:00 ET window was missed or the run failed)`);
-      const ok = await attemptDailyRun(today, 'watchdog catch-up');
-      if (ok) {
+      const outcome = await attemptDailyRun(today, 'watchdog catch-up');
+
+      // A run still working is not a run that failed. Paging on 'slow' is
+      // exactly what happened on 2026-08-11: the alert fired at 120s and the
+      // job finished fine at 338s. Say nothing and let the next poll see the
+      // row — the in-flight lock guarantees we are not racing it.
+      if (outcome === 'slow' || outcome === 'in_flight') {
+        console.log(`[Scorecard] watchdog: a run is in flight for ${expectedAsOf} — deferring the verdict to the next poll`);
+        return;
+      }
+
+      if (outcome === 'ok') {
         const { data: healed } = await supabase
           .from('lp_market_scorecard_daily')
           .select('as_of_date')
