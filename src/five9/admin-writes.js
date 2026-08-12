@@ -566,6 +566,11 @@ export function buildDeleteRecordFromListXml(listName, fieldNames, values, listD
  * the DOTALL-regex method in the Phase D FETCH NOTE below. Read-response
  * order was NOT used to derive it.
  *
+ * Every type behind this op is quoted verbatim in
+ * docs/five9/phase-f-wsdl-v13.md — including the two ops this one pairs with
+ * (isImportRunning / getListImportResult) and the rollback path. Read that
+ * before changing anything here.
+ *
  *   <xs:complexType name="asyncDeleteRecordsFromList"><xs:sequence>
  *     <xs:element minOccurs="0" name="listName" type="xs:string"/>
  *     <xs:element minOccurs="0" name="listDeleteSettings" type="tns:listDeleteSettings"/>
