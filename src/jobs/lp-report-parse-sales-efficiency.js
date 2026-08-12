@@ -1,8 +1,13 @@
-// ─── Sales Efficiency By Market (LP report 137) parser — src/jobs/lp-report-parse-sales-efficiency.js ───
+// ─── Sales Efficiency (LP report 137) parser — src/jobs/lp-report-parse-sales-efficiency.js ───
 //
 // PURE (market resolution takes a preloaded branch map). Report 137 is the
-// ONLY per-market source of Issued / Sat / Sold / Cancelled / NSA. Two
-// formats:
+// ONLY per-market source of Issued / Sat / Sold / Cancelled / NSA.
+//
+// VARIANTS: LP re-groups this same report by Market, by Setter and by Source,
+// and all three export an IDENTICAL header — the grouping shows up only in the
+// `xGrouper` echo column, which resolveVariant reads off row 1. The CSV parser
+// takes the resolved variant and changes exactly one thing: what `Grouper`
+// means. See REPORT_VARIANTS in lp-report-csv-common.js. Two formats:
 //
 //   CSV  (manual export, cents)      — one row per branch, rich columns.
 //   PDF  (scheduled daily, dollars)  — grid, TWO physical lines per market
@@ -45,10 +50,28 @@ export const CSV_REQUIRED = ['Grouper', 'NumIssued', 'NumSale', 'NumNetIssued', 
   'GSAWorking', 'GSACD', 'GSACancelled', 'GSAHold', 'SDate', 'EDate'];
 
 /**
+ * Which field the `Grouper` column becomes, per variant.
+ *
+ * One branch, not a second parser: every money and count column on a By Setter
+ * export is byte-identical to By Market. The ONLY differences are what the row
+ * label means and whether it may be resolved to a market — so those are the
+ * only two things that vary here.
+ */
+const SE_ROW_LABEL_FIELD = {
+  sales_efficiency: 'branch_code_raw',
+  sales_efficiency_by_setter: 'setter_name_raw',
+};
+
+/**
  * Parse the 137 CSV export (cents-exact).
+ *
+ * @param {string} text
+ * @param {{variant?: string}} [opts] effective report_type from resolveVariant;
+ *   decides the row-label field. Defaults to the By Market shape.
  * @returns {{ rows: object[], header: {periodStart, periodEnd, asOf}, mode: 'full' }}
  */
-export function parseSalesEfficiencyCsv(text) {
+export function parseSalesEfficiencyCsv(text, { variant = 'sales_efficiency' } = {}) {
+  const labelField = SE_ROW_LABEL_FIELD[variant] ?? 'branch_code_raw';
   const { rows: raw } = csvToObjects(text, CSV_REQUIRED);
   let periodStart = null, periodEnd = null, asOf = null, generatedAt = null;
   const rows = raw.map((r, i) => {
@@ -63,7 +86,7 @@ export function parseSalesEfficiencyCsv(text) {
     }
     return {
       row_num: i + 1,
-      branch_code_raw: String(r.Grouper ?? '').trim(),
+      [labelField]: String(r.Grouper ?? '').trim(),
       num_issued: parseCount(r.NumIssued) ?? 0,
       num_net_issued: parseCount(r.NumNetIssued) ?? 0,
       num_sat: parseCount(r.NumSat) ?? 0,
@@ -252,6 +275,13 @@ export function parseSalesEfficiencyPdf(text) {
 /**
  * Resolve markets in place; returns rows with a real-but-unmapped branch
  * label (caller quarantines + fails the file — never silently UNASSIGNED).
+ *
+ * BY MARKET ONLY. Setters do not belong to markets, so the By Setter variant
+ * must not reach this function at all — the caller skips it rather than this
+ * function guarding against it, because a guard here would leave a `market`
+ * field on setter rows for someone to read as meaningful. Passing setter rows
+ * in is what put 29 lead sources into lp_sales_efficiency_history as
+ * UNRESOLVED on 2026-08-11.
  */
 export function resolveSalesEfficiencyMarkets(rows, maps) {
   const unmapped = [];

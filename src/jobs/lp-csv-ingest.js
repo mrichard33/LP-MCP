@@ -58,7 +58,7 @@ import {
   PARSER_VERSION as MILESTONE_CSV_PARSER_VERSION,
 } from './lp-report-parse-milestone-csv.js';
 import {
-  parseCsv, detectReportFromHeader, CONTENT_SORT_KEYS,
+  parseCsv, detectReportFromHeader, resolveVariant, CONTENT_SORT_KEYS,
 } from './lp-report-csv-common.js';
 import {
   parseLeadDispositionPdf, validateLeadDispositionPdf,
@@ -322,6 +322,41 @@ async function loadChunked(snapshotId, rows) {
 }
 
 /**
+ * Archive a recognised-but-unstored variant and stop (§C.2, middle tier).
+ *
+ * This is NOT a failure and must not travel the `fail()` path, which alerts.
+ * The file is archived so the decision to store it later can be made against
+ * real history rather than a note, and one log row records that it arrived —
+ * but no snapshot is created, so nothing can supersede a real one.
+ *
+ * Archived under its own prefix: a By Source export sitting beside the By
+ * Market snapshots in `sales_efficiency/` is exactly the confusion this whole
+ * change exists to end.
+ */
+export async function archiveUnstoredVariant({ reportType, variant, text, source = 'manual' }) {
+  const started = Date.now();
+  if (!supabase) throw new Error('Supabase not configured');
+  const buffer = Buffer.from(text, 'utf8');
+  const sha = sha256Hex(buffer);
+  const slug = String(variant).trim().toLowerCase().replace(/[^a-z0-9]+/g, '_');
+  const storagePath = `${reportType}__unstored_${slug}/${todayET()}/${sha}.csv`;
+  const { error: upErr } = await supabase.storage
+    .from(STORAGE_BUCKET)
+    .upload(storagePath, buffer, { contentType: 'text/csv', upsert: true });
+  if (upErr) throw new Error(`storage archive failed: ${upErr.message}`);
+  await logIngest({
+    report_type: reportType, file_sha256: sha, status: 'skipped', failure_reason: null,
+    detail: { variant, reason: 'known_unstored_variant', storage_path: storagePath },
+    snapshot_id: null, source, duration_ms: Date.now() - started,
+  });
+  console.log(`[LPCsv] ${reportType} variant "${variant}" archived, not stored: ${storagePath}`);
+  return {
+    success: true, stored: false, variant, reason: 'known_unstored_variant',
+    storage_path: storagePath, sha256: sha,
+  };
+}
+
+/**
  * Run the full pipeline for one CSV. Same result contract as
  * ingestReportPdf: content problems are logged + returned (never thrown),
  * infra failures throw and the route maps them to 5xx.
@@ -483,15 +518,23 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
       }
       rows = parsed.rows;
       controlTotals = v.totals;
-    } else if (reportType === 'sales_efficiency') {
-      parsed = parseSalesEfficiencyCsv(text);
+    } else if (reportType === 'sales_efficiency' || reportType === 'sales_efficiency_by_setter') {
+      // Both 137 variants land here. Column parsing, validation and the control
+      // totals are identical — only the row label differs, and only By Market
+      // gets resolved to a market. See REPORT_VARIANTS in lp-report-csv-common.
+      const bySetter = reportType === 'sales_efficiency_by_setter';
+      parsed = parseSalesEfficiencyCsv(text, { variant: reportType });
       const v = validateSalesEfficiency(parsed, { expectedTotals, todayIso: todayET() });
       if (!v.ok) {
         return await fail(v.violations[0].rule, { violations: v.violations },
           `${v.violations[0].rule} (+${v.violations.length - 1} more).`);
       }
-      const maps = await getMarketMaps();
-      const unmapped = resolveSalesEfficiencyMarkets(parsed.rows, maps);
+      // Setters have no market. resolveSalesEfficiencyMarkets is not called at
+      // all on this path — not called and its result discarded — so a setter
+      // row can never acquire a `market` field for someone downstream to trust,
+      // and the unmapped-branch alert cannot fire on 26 setter names each
+      // morning.
+      const unmapped = bySetter ? [] : resolveSalesEfficiencyMarkets(parsed.rows, await getMarketMaps());
       if (unmapped.length) {
         // UNRESOLVED, NOT REJECTED (§F). 137 is nine or ten company-wide rows;
         // dropping one loses a whole market's revenue from every downstream
@@ -1127,23 +1170,49 @@ export function registerLpCsvRoutes(app) {
         // `_<YYMMDDHHMMSS>_Export.csv`, so the report ID that PDF filenames
         // carried is gone and n8n can no longer route by name. The slug is now
         // only a hint; the file's own header row is authoritative.
-        let resolved;
+        //
+        // …AND THE HEADER IS NOT ALWAYS ENOUGH (§C.2). 137's By Market, By
+        // Setter and By Source exports share one header byte for byte, so the
+        // fingerprint answers "which report" and resolveVariant answers "which
+        // grouping" off row 1's `xGrouper`. Parsed once here and reused for
+        // both — the header row and the first data row come out of the same
+        // pass, and a 20MB export should not be tokenised twice to learn two
+        // things about it.
+        let resolved, variant;
         try {
-          resolved = detectReportFromHeader(parseCsv(req.body)[0] ?? []);
+          const grid = parseCsv(req.body);
+          resolved = detectReportFromHeader(grid[0] ?? []);
+          variant = resolveVariant(resolved.reportType, grid[0] ?? [], grid[1] ?? []);
         } catch (err) {
-          console.warn(`[LPCsv] ${slug}: ${err.failureReason ?? err.message}`, err.detail ?? '');
+          const reason = err.failureReason ?? 'unknown_report_fingerprint';
+          console.warn(`[LPCsv] ${slug}: ${reason}`, err.detail ?? '');
           return res.json({
-            success: false, rejected: true, reason: err.failureReason ?? 'unknown_report_fingerprint',
-            failure_reason: err.failureReason ?? 'unknown_report_fingerprint', detail: err.detail ?? null,
+            success: false, rejected: true, reason,
+            failure_reason: reason, detail: err.detail ?? null,
           });
         }
         if (resolved.reportType !== reportType) {
           console.warn(`[LPCsv] ${slug}: header says ${resolved.reportType}, routing there instead`);
         }
-        const result = await ingestCsv({
-          reportType: resolved.reportType, text: req.body, source: String(req.query.source || 'manual'),
+        const source = String(req.query.source || 'manual');
+        // Middle tier: recognised, deliberately not stored. Archive + log, no
+        // alert, no snapshot — and in particular no rows in a table whose grain
+        // this file does not share.
+        if (variant.knownUnstored) {
+          const skipped = await archiveUnstoredVariant({
+            reportType: resolved.reportType, variant: variant.variant, text: req.body, source,
+          });
+          return res.json({ ...skipped, report_type: resolved.reportType, lp_report_id: resolved.lpReportId });
+        }
+        const effectiveType = variant.reportType;
+        if (effectiveType !== resolved.reportType) {
+          console.log(`[LPCsv] ${slug}: xGrouper "${variant.variant}" → ${effectiveType}`);
+        }
+        const result = await ingestCsv({ reportType: effectiveType, text: req.body, source });
+        res.json({
+          ...result, report_type: effectiveType, lp_report_id: resolved.lpReportId,
+          ...(variant.variant ? { variant: variant.variant } : {}),
         });
-        res.json({ ...result, report_type: resolved.reportType, lp_report_id: resolved.lpReportId });
       } catch (err) {
         console.error(`[LPCsv] ${slug} ingest error:`, err.message);
         res.status(500).json({ success: false, error: err.message });
