@@ -450,6 +450,77 @@ export async function getReportResult(identifier) {
   return { identifier: id, columns, rows };
 }
 
+/* ------------------------------------------------------------------------ *
+ * Async IMPORT job triad (2026-08-12 Phase F) — the list-import sibling of
+ * the report triad above. asyncAddRecordsToList / asyncDeleteRecordsFromList
+ * return a job handle rather than a result, and these are how you follow it.
+ *
+ * Read-only, so they live here with the rest of the Config-API readers; the
+ * gated write that submits the job lives in src/five9/admin-writes.js.
+ *
+ * WSDL-derived 2026-08-12 (api.five9.com/wsadmin/v13/AdminWebService?wsdl).
+ * The identifier wrapper is the subtle part and does NOT match the report
+ * ops: reports take a FLAT <identifier> string plus <timeout>, imports take a
+ * NESTED tns:importIdentifier (a complexType whose only child is itself named
+ * `identifier`) plus <waitTime>:
+ *
+ *   <xs:complexType name="isImportRunning"><xs:sequence>
+ *     <xs:element minOccurs="0" name="identifier" type="tns:importIdentifier"/>
+ *     <xs:element minOccurs="0" name="waitTime" type="xs:long"/>
+ *   <xs:complexType name="importIdentifier"><xs:sequence>
+ *     <xs:element minOccurs="0" name="identifier" type="xs:string"/>
+ *
+ * Hence the double nesting below. Flattening it is an unmarshalling fault.
+ * ------------------------------------------------------------------------ */
+
+/** tns:importIdentifier wrapper (+ optional waitTime). Exported for tests. */
+export function buildImportIdentifierXml(identifier, { waitTimeSec } = {}) {
+  const id = String(identifier || '').trim();
+  if (!id) throw new Error('identifier is required');
+  const wait = Number.isFinite(Number(waitTimeSec))
+    ? `<waitTime>${Math.max(0, Math.floor(Number(waitTimeSec)))}</waitTime>`
+    : '';
+  return `<identifier><identifier>${escapeXml(id)}</identifier></identifier>${wait}`;
+}
+
+/** isImportRunning — true while the import is still executing (server-side wait ≤ waitTimeSec). */
+export async function isImportRunning(identifier, waitTimeSec = 5) {
+  const xml = await five9SoapCall('isImportRunning',
+    buildImportIdentifierXml(identifier, { waitTimeSec }));
+  return returnBlocks(xml).map(b => decodeXml(b).trim())[0] === 'true';
+}
+
+/**
+ * getListImportResult — normalized tns:listImportResult. `success`,
+ * `uploadErrorsCount` and `failureMessage` come from the basicImportResult
+ * base; `listRecordsDeleted` is the authoritative count of what the job
+ * actually removed, and is what a bulk delete verifies against (a list-size
+ * delta alone is noisy — these lists take an incremental feed and repopulate
+ * at 6 AM ET). `raw` is kept so the audit event can carry importTroubles etc.
+ */
+export async function getListImportResult(identifier) {
+  const xml = await five9SoapCall('getListImportResult',
+    buildImportIdentifierXml(identifier));
+  const block = returnBlocks(xml)[0];
+  if (!block) return { identifier: String(identifier || ''), found: false, raw: null };
+  const raw = parseXmlBlock(block);
+  return {
+    identifier: String(identifier || ''),
+    found: true,
+    success: String(raw.success ?? '') === 'true',
+    listName: raw.listName || null,
+    listRecordsDeleted: num(raw.listRecordsDeleted),
+    listRecordsInserted: num(raw.listRecordsInserted),
+    crmRecordsInserted: num(raw.crmRecordsInserted),
+    crmRecordsUpdated: num(raw.crmRecordsUpdated),
+    uploadErrorsCount: num(raw.uploadErrorsCount),
+    uploadDuplicatesCount: num(raw.uploadDuplicatesCount),
+    failureMessage: raw.failureMessage || null,
+    importTroubles: asArray(raw.importTroubles),
+    raw,
+  };
+}
+
 /**
  * runReportAndWait — submit + poll ≤ maxWaitMs (default 55s: under the 60s
  * doctrine cap and under typical MCP client timeouts). On timeout returns

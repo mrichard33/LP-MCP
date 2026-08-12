@@ -29,7 +29,7 @@
  *   originating system_events row by action.event_id when they need
  *   structural fields like event.id or event.payload.message_id.
  *
- * Supported action types (41):
+ * Supported action types (45):
  *   add_tag, remove_tag, set_stage, move_opportunity, update_opportunity,
  *   remove_from_workflow, add_to_workflow, book_appointment,
  *   cancel_appointment, reschedule_appointment, update_appointment_status,
@@ -47,7 +47,10 @@
  *   five9_create_campaign_profile
  *   (2026-08-05 Phase D — skill routing + campaign profiles),
  *   five9_modify_campaign_profile (2026-08-06 Phase D-2 — WSDL-verified
- *   modifyCampaignProfile wrapper; completes the Phase D profile surface).
+ *   modifyCampaignProfile wrapper; completes the Phase D profile surface),
+ *   five9_async_delete_records_from_list (2026-08-12 Phase F — BULK list
+ *   deletion; the only five9_* op that defers mid-flight while the async
+ *   import job runs, then re-enters to verify).
  *
  * 2026-05-01 — added create_lp_lead (Jane recovery). Closes the
  * chatbot-in-session-booking gap that left contacts out of LP because
@@ -183,7 +186,7 @@ import { executeClassifyLeadState } from './handlers/lead-state.js';
 // 2026-07-06 (Bot 2/3/4 consolidation) — GHL contact-note writer (escalation
 // context summaries) + dispatch-param interpolation.
 import { executeAddNote } from './handlers/notes.js';
-// 2026-07-21 Phase C — Five9 gated writes (one dispatcher for all eight
+// 2026-07-21 Phase C — Five9 gated writes (one dispatcher for all fourteen
 // five9_* action types; guardrails + audit live in src/five9/admin-writes.js)
 import { executeFive9Write } from './handlers/five9.js';
 import { interpolatePayload } from './helpers.js';
@@ -445,6 +448,10 @@ const ACTION_HANDLERS = {
   five9_set_outbound_campaign: executeFive9Write,
   five9_add_records_to_list: executeFive9Write,
   five9_delete_record_from_list: executeFive9Write,
+  // 2026-08-12 Phase F — bulk list deletion. Same gate, same dispatcher, but
+  // it can return { deferred: true, retry_at } mid-job; classifyHandlerResult
+  // parks it as pending without burning retry_count.
+  five9_async_delete_records_from_list: executeFive9Write,
   five9_add_numbers_to_dnc: executeFive9Write,
   five9_remove_numbers_from_dnc: executeFive9Write,
   // 2026-08-05 Phase D — user skills + campaign profile create. Same gate,

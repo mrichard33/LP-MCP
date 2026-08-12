@@ -57,6 +57,12 @@ import {
   getListsInfo,
   checkDncForNumbers,
   timerToSeconds,
+  returnBlocks,
+  tag,
+  // 2026-08-12 Phase F — async import job triad (read-only followers for the
+  // job handle asyncDeleteRecordsFromList returns).
+  isImportRunning,
+  getListImportResult,
 } from '../five9-admin.js';
 // 2026-08-05 Phase D — read-before-write for user-skill ops. getUsersFullInfo
 // takes a Five9 userNamePattern regex and returns assigned skills with levels.
@@ -148,6 +154,90 @@ export function checkProfileCompliance(profile, { complianceOverride = false } =
 }
 
 /* ---------------------------------------------------------------------- *
+ * Guardrail 9 (2026-08-12 Phase F) — ceilings on BULK list deletion.
+ *
+ * asyncDeleteRecordsFromList is the highest-blast-radius write in this file:
+ * one approved action can empty a dialing list, and there is no true undo
+ * (see the rollback note on executeAsyncDeleteRecordsFromList — re-adding
+ * restores dial keys, never the non-key columns Five9 held).
+ *
+ * Two independent lines, because they catch different failures:
+ *   - the ABSOLUTE ceiling catches "this cohort is far bigger than anyone
+ *     intended to delete in one action";
+ *   - the PROPORTION line catches a bad cohort query that nukes the list
+ *     instead of the intended subset. A 1,500-record delete is unremarkable
+ *     against a 40,000-record list and catastrophic against a 2,000-record
+ *     one, and the absolute ceiling cannot tell those apart.
+ *
+ * `limit` is injectable so the ceiling is testable without re-importing the
+ * module — MAX_LIST_DELETE_LIMIT is frozen at module load like every other
+ * numeric limit here, so process.env cannot move it after import.
+ * Override is deliberate and audited, never a default.
+ * ---------------------------------------------------------------------- */
+
+export const MAX_LIST_DELETE_LIMIT = Math.max(
+  1,
+  parseInt(process.env.FIVE9_MAX_LIST_DELETE || '2000', 10),
+);
+
+// >50% of the list is a cohort-query failure until proven otherwise.
+export const MAX_LIST_DELETE_PROPORTION = 0.5;
+
+export function checkListDeleteCompliance(
+  { requested, listSize } = {},
+  { complianceOverride = false, limit = MAX_LIST_DELETE_LIMIT } = {},
+) {
+  const violations = [];
+  const n = Number(requested);
+  if (Number.isFinite(n) && n > limit) {
+    violations.push(`${n} records > ${limit} per-action ceiling (FIVE9_MAX_LIST_DELETE)`);
+  }
+  // listSize null/unknown (list not found in getListsInfo) is NOT a pass —
+  // an unreadable denominator means the proportion line cannot be evaluated,
+  // and silently skipping it is the same lie as a permanent false negative.
+  const size = Number(listSize);
+  if (!Number.isFinite(size) || size <= 0) {
+    violations.push(`list size unknown (${listSize}) — proportion guard cannot be evaluated`);
+  } else if (Number.isFinite(n) && n > size * MAX_LIST_DELETE_PROPORTION) {
+    const pct = ((n / size) * 100).toFixed(1);
+    violations.push(
+      `${n} of ${size} records = ${pct}% > ${MAX_LIST_DELETE_PROPORTION * 100}% of the list`,
+    );
+  }
+  if (violations.length && complianceOverride !== true) {
+    return { ok: false, violations };
+  }
+  return { ok: true, violations, overridden: violations.length > 0 };
+}
+
+/* ---------------------------------------------------------------------- *
+ * Guardrail 10 (2026-08-12 Phase F) — declared-count gate on bulk deletes.
+ * The payload must state how many records it believes it is deleting, and
+ * that number must equal the records actually serialized. A silent off-by-N
+ * on a delete is unrecoverable, so the two are reconciled before the SOAP
+ * body is ever sent.
+ * ---------------------------------------------------------------------- */
+
+export function assertDeclaredRecordCount(expected, actual) {
+  if (expected === undefined || expected === null || expected === '') {
+    throw new Error(
+      'REFUSED: bulk list deletion requires action_payload.expected_record_count — ' +
+      'restate how many records you intend to delete',
+    );
+  }
+  if (!Number.isInteger(Number(expected)) || Number(expected) < 0) {
+    throw new Error(`REFUSED: expected_record_count must be a non-negative integer (got ${JSON.stringify(expected)})`);
+  }
+  if (Number(expected) !== Number(actual)) {
+    throw new Error(
+      `REFUSED: expected_record_count ${expected} !== ${actual} records in payload — ` +
+      'a miscounted bulk delete is unrecoverable',
+    );
+  }
+  return Number(actual);
+}
+
+/* ---------------------------------------------------------------------- *
  * Guardrail 6 — DNC removals need a per-number reason.
  * ---------------------------------------------------------------------- */
 
@@ -183,6 +273,13 @@ export function requiredConfirmToken(op, payload) {
   // human gate. (Live as of Phase D-2, 2026-08-06.)
   if (op === 'modify_campaign_profile') {
     return String(payload?.profile_name || '').trim();
+  }
+  // 2026-08-12 Phase F — bulk deletion outranks every write above it. One
+  // approved action can remove thousands of records with no lossless undo,
+  // so the creator restates the list name verbatim. approve_action remains
+  // the human gate; this is the typo gate.
+  if (op === 'async_delete_records_from_list') {
+    return String(payload?.list_name || '').trim();
   }
   return null; // op not double-gated
 }
@@ -462,6 +559,160 @@ export function buildDeleteRecordFromListXml(listName, fieldNames, values, listD
 }
 
 /* ---------------------------------------------------------------------- *
+ * Phase F builders (2026-08-12) — BULK async list deletion.
+ *
+ * FIELD ORDER BELOW IS WSDL-DERIVED, quoted from the live v13 schema on
+ * 2026-08-12 (api.five9.com/wsadmin/v13/AdminWebService?wsdl), fetched with
+ * the DOTALL-regex method in the Phase D FETCH NOTE below. Read-response
+ * order was NOT used to derive it.
+ *
+ * Every type behind this op is quoted verbatim in
+ * docs/five9/phase-f-wsdl-v13.md — including the two ops this one pairs with
+ * (isImportRunning / getListImportResult) and the rollback path. Read that
+ * before changing anything here.
+ *
+ *   <xs:complexType name="asyncDeleteRecordsFromList"><xs:sequence>
+ *     <xs:element minOccurs="0" name="listName" type="xs:string"/>
+ *     <xs:element minOccurs="0" name="listDeleteSettings" type="tns:listDeleteSettings"/>
+ *     <xs:element minOccurs="0" name="importData" type="tns:importData"/>
+ *
+ * THE RECORD PAYLOAD IS <importData>/<values>/<item>, NOT <record>/<fields>.
+ * This is the one place the sync and async delete ops genuinely diverge, and
+ * getting it backwards is an unmarshalling fault, so read the two side by
+ * side before "fixing" it:
+ *
+ *   sync  deleteRecordFromList      → record      : tns:recordData
+ *         recordData                → repeated <fields>       (xs:string)
+ *   async asyncDeleteRecordsFromList→ importData  : tns:importData
+ *         importData                → repeated <values>       (ns1:stringArray)
+ *         stringArray               → repeated <item>         (xs:string)
+ *
+ * So the file header's "<fields> not <values>" rule is a statement about
+ * tns:recordData — true for the SYNC ops it was written for, and not
+ * transferable here. The async <values> is also NOT list-dispatch's <values>
+ * (that one matches the report-row type); it is ns1:stringArray, one <values>
+ * per record and one <item> per column. The governing rule is unchanged and
+ * settles it: new code follows the WSDL.
+ *
+ * The first two children are byte-identical to the sync op, so
+ * fieldsMappingXml and the listDeleteSettings block are reused as-is rather
+ * than re-derived.
+ * ---------------------------------------------------------------------- */
+
+/**
+ * WSDL xs:sequence for the asyncDeleteRecordsFromList request wrapper.
+ * NOTE: presence in this array does NOT imply patchable — it records the
+ * order JAXB unmarshals in, nothing about what callers may set.
+ */
+export const ASYNC_DELETE_FIELD_ORDER = ['listName', 'listDeleteSettings', 'importData'];
+
+/**
+ * WSDL xs:sequence for tns:listDeleteSettings, in INHERITANCE order: JAXB
+ * unmarshals the basicImportSettings base fields BEFORE the extension's
+ * listDeleteMode, and an out-of-order element is an unmarshalling fault.
+ * We emit only fieldsMapping / skipHeaderLine / listDeleteMode, but they must
+ * sit in these relative slots.
+ * NOTE: presence in this array does NOT imply patchable.
+ */
+export const LIST_DELETE_SETTINGS_FIELD_ORDER = [
+  // --- tns:basicImportSettings (base) ---
+  'allowDataCleanup',
+  'callbackAuthProfileName',
+  'callbackFormat',
+  'callbackUrl',
+  'countryCode',
+  'failOnFieldParseError',
+  'fieldsMapping',
+  'reportEmail',
+  'separator',
+  'skipHeaderLine', // schema-REQUIRED (no minOccurs=0)
+  // --- tns:listDeleteSettings (extension) ---
+  'listDeleteMode',
+];
+
+/**
+ * WSDL xs:sequence for the asyncAddRecordsToList request wrapper — carried
+ * for the ROLLBACK path only. Nothing in this module executes it.
+ * NOTE: presence in this array does NOT imply patchable.
+ */
+export const ASYNC_ADD_FIELD_ORDER = [
+  'listName',
+  'listUpdateSettings',
+  'importData',
+  'resetDispositionsInCampaignsImportData',
+];
+
+// tns:importData is repeated <values>, each an ns1:stringArray of <item>.
+// One <values> per record, one <item> per column. Nulls serialize as empty
+// <item></item>, same convention as recordXml's empty <fields>.
+function importDataXml(records) {
+  return `<importData>${records.map(row =>
+    `<values>${row.map(v => `<item>${escapeXml(v ?? '')}</item>`).join('')}</values>`
+  ).join('')}</importData>`;
+}
+
+// Shared shape validation for the two async list bodies.
+function assertImportRecords(fieldNames, records) {
+  if (!Array.isArray(fieldNames) || !fieldNames.length) {
+    throw new Error(`fieldsMapping/values mismatch: ${fieldNames?.length ?? 0} fields vs records`);
+  }
+  if (!Array.isArray(records) || !records.length) {
+    throw new Error('records is required: [[values...], ...]');
+  }
+  records.forEach((row, i) => {
+    if (!Array.isArray(row) || row.length !== fieldNames.length) {
+      throw new Error(
+        `fieldsMapping/values mismatch at record ${i}: ${fieldNames.length} fields vs ${Array.isArray(row) ? row.length : 0} values`,
+      );
+    }
+  });
+}
+
+export function buildAsyncDeleteRecordsFromListXml(listName, fieldNames, records, listDeleteMode = 'DELETE_ALL') {
+  const list = String(listName || '').trim();
+  if (!list) throw new Error('list_name is required');
+  assertImportRecords(fieldNames, records);
+  if (!LIST_DELETE_MODES.has(listDeleteMode)) {
+    throw new Error(`invalid list_delete_mode "${listDeleteMode}" (allowed: ${[...LIST_DELETE_MODES].join(', ')})`);
+  }
+  return (
+    `<listName>${escapeXml(list)}</listName>` +
+    `<listDeleteSettings>${fieldsMappingXml(fieldNames)}` +
+    `<skipHeaderLine>false</skipHeaderLine>` +
+    `<listDeleteMode>${listDeleteMode}</listDeleteMode>` +
+    `</listDeleteSettings>` +
+    importDataXml(records)
+  );
+}
+
+/**
+ * asyncAddRecordsToList body — built for the ROLLBACK payload only, never
+ * executed here. Deliberately NOT registered as an action type: re-adding
+ * keys is an operator decision made with a list export in hand, not an
+ * automated undo. See the rollback note on executeAsyncDeleteRecordsFromList.
+ *
+ * Settings block mirrors buildAddRecordToListXml (listUpdateSettings extends
+ * the same basicImportSettings base, so fieldsMapping/skipHeaderLine keep
+ * their slots and the extension fields follow in xs:sequence order).
+ */
+export function buildAsyncAddRecordsToListXml(listName, fieldNames, records) {
+  const list = String(listName || '').trim();
+  if (!list) throw new Error('list_name is required');
+  assertImportRecords(fieldNames, records);
+  return (
+    `<listName>${escapeXml(list)}</listName>` +
+    `<listUpdateSettings>${fieldsMappingXml(fieldNames)}` +
+    `<skipHeaderLine>false</skipHeaderLine>` +
+    `<cleanListBeforeUpdate>false</cleanListBeforeUpdate>` +
+    `<crmAddMode>ADD_NEW</crmAddMode>` +
+    `<crmUpdateMode>UPDATE_FIRST</crmUpdateMode>` +
+    `<listAddMode>ADD_FIRST</listAddMode>` +
+    `</listUpdateSettings>` +
+    importDataXml(records)
+  );
+}
+
+/* ---------------------------------------------------------------------- *
  * Phase D builders — user skills + campaign profiles.
  *
  * FIELD ORDER BELOW IS WSDL-DERIVED, quoted from the live v13 schema on
@@ -569,7 +820,19 @@ function assertNoRecordFailures(method, xml) {
   }
 }
 
-async function withFive9WriteGate({ action, subtype, entityType, entityId }, fn) {
+/**
+ * idempotencySuffix (2026-08-12 Phase F): the audit event's idempotency_key is
+ * per-action, and emitEvent SKIPS SILENTLY on a duplicate key. That is correct
+ * for every op that executes in one pass, but an op that defers and re-enters
+ * (async_delete_records_from_list) would emit its submission event, then have
+ * every later event — including the COMPLETION event carrying new_state,
+ * listRecordsDeleted and verified — silently dropped as a duplicate. The
+ * evidence the write actually landed is exactly what we'd lose.
+ *
+ * Passing a per-pass suffix keeps each pass independently auditable. Omitted
+ * (every pre-Phase-F op) the key is byte-identical to before.
+ */
+async function withFive9WriteGate({ action, subtype, entityType, entityId, idempotencySuffix }, fn) {
   // Guardrail 1 — FIVE9_WRITES_ENABLED unset/false means DRY-RUN, never a
   // mutation: reads and guardrails run for real, the exact SOAP body is
   // built and logged, but ctx.soap short-circuits the write itself.
@@ -643,7 +906,9 @@ async function withFive9WriteGate({ action, subtype, entityType, entityId }, fn)
     new_state: ctx.new_state,
     priority: 'normal',
     bypass_filter: true,
-    idempotency_key: action.id ? `five9_write_${action.id}_${subtype}` : null,
+    idempotency_key: action.id
+      ? `five9_write_${action.id}_${subtype}${idempotencySuffix ? `_${idempotencySuffix}` : ''}`
+      : null,
   }).catch(err => console.warn(`[FIVE9 WRITES] ${subtype} audit emit failed: ${err.message}`));
 
   if (error) throw error;
@@ -819,6 +1084,332 @@ export function executeDeleteRecordFromList(action) {
     if (!ctx.dry_run) ctx.new_state = await sizeOf();
     return { list: listName, record_deleted: !ctx.dry_run };
   });
+}
+
+/* ---------------------------------------------------------------------- *
+ * Phase F execute (2026-08-12) — BULK async list deletion.
+ *
+ * WHY THIS EXISTS: five9_delete_record_from_list removes ONE record per
+ * approval-gated action. Purging the ~3,850 records mis-loaded into
+ * `Sale - Completed 0-2yrs` on 2026-08-07/08 that way is hundreds of
+ * approvals. This is the bulk path, with guardrails sized to the fact that
+ * it is the highest-blast-radius write in this file.
+ *
+ * THE ASYNC WRINKLE: asyncDeleteRecordsFromList returns a JOB HANDLE, not a
+ * result. The fleet-wide write lock (five9_admin:write) must NOT be held for
+ * the life of the job, so this op submits under the lock, polls briefly,
+ * then RELEASES and defers — returning { deferred: true, retry_at } so the
+ * executor re-enters and resumes polling. Same contract the gate already
+ * uses for lock contention (see decideLockHeldReschedule above) and that
+ * result-status.js maps to status:'pending' with retry_count untouched.
+ *
+ * The in-action poll budget is deliberately ~22s, NOT the ~55s used by
+ * runReportAndWait: the executor's handler watchdog is 60s
+ * (HANDLER_TIMEOUT_MS, src/actions/index.js), and a 55s poll leaves no room
+ * for the submit plus two getListsInfo reads before the watchdog kills the
+ * handler as a zombie. Re-entry makes a long single poll unnecessary anyway.
+ *
+ * RE-ENTRY SAFETY — the one thing that must never break: on resume the job
+ * id is read from action.execution_result and the SOAP submit is SKIPPED. A
+ * re-submit would be a second bulk delete. The executor writes
+ * execution_result on every pass and claimActions re-selects it with
+ * select('*'), so the handle survives the deferral.
+ * ---------------------------------------------------------------------- */
+
+// Server-side long-poll per isImportRunning call, and the total in-action
+// budget. Both well inside the 60s handler watchdog.
+const IMPORT_POLL_WAIT_SEC = 5;
+const IMPORT_POLL_BUDGET_MS = 22_000;
+
+/**
+ * When a job is still running at the end of a pass, how long before the
+ * executor should re-enter. Pure + exported for tests, same shape and spirit
+ * as decideLockHeldReschedule.
+ *
+ * `attempt` is carried on execution_result, NOT action.retry_count — a
+ * deferral deliberately leaves retry_count untouched, so the retry budget is
+ * never burned by a slow-but-healthy Five9 job. The attempts ceiling is what
+ * stops a wedged job deferring forever.
+ */
+export function decideImportPollReschedule(attempt, now = Date.now(), {
+  maxAttempts = 40, baseMs = 15_000, maxMs = 120_000,
+} = {}) {
+  const n = Math.max(0, parseInt(attempt, 10) || 0);
+  if (n >= maxAttempts) {
+    return { reschedule: false, attempt: n, reason: 'five9_import_poll_attempts_exhausted' };
+  }
+  const delayMs = Math.min(maxMs, baseMs * Math.pow(2, Math.min(n, 3)));
+  return {
+    reschedule: true,
+    attempt: n + 1,
+    delayMs,
+    retryAt: new Date(now + delayMs).toISOString(),
+    reason: 'five9_import_running',
+  };
+}
+
+/**
+ * ROLLBACK IS KEYS-ONLY. Read this before trusting rollback_payload.
+ *
+ * The descriptor below re-adds the SAME DIAL KEYS via asyncAddRecordsToList.
+ * That restores what the dialer needs to call the number again — and NOTHING
+ * ELSE. Every non-key column Five9 held on those records (dispositions, call
+ * history, attempt counters, agent notes, custom fields not in field_names)
+ * is gone the moment the delete lands and is NOT recoverable from this
+ * payload. A true restore requires a list export taken BEFORE the delete.
+ *
+ * The presence of a rollback_payload on the audit event must not be read as
+ * "this was a reversible operation." It was not.
+ */
+const ROLLBACK_CAVEAT =
+  'KEYS ONLY — re-adding these records restores the dial keys but NOT the ' +
+  'non-key columns Five9 held (dispositions, call history, attempt counts, ' +
+  'notes, unmapped custom fields). A true restore requires a list export ' +
+  'taken BEFORE the delete. Do not treat this as a lossless undo.';
+
+/**
+ * Read-back verification for a bulk delete: three numbers must agree — what
+ * the payload declared, what Five9's listImportResult says it deleted, and
+ * how far the list size actually moved. Returns the mismatch rows; empty
+ * === verified.
+ *
+ * Pure and exported for the same reason verifyPatchReadBack is: this is the
+ * function that decides whether `verified` is true, so it needs direct
+ * coverage rather than being reachable only through a live SOAP round-trip.
+ *
+ * A missing number is a MISMATCH, never a skip. Treating an unreadable
+ * read-back as verified is the same lie as a permanent false negative, just
+ * quieter — the precedent is verifyPatchReadBack's timer branch.
+ *
+ * listRecordsDeleted is the authoritative signal. size_delta corroborates it
+ * and is inherently noisier: these lists take a small incremental feed and
+ * repopulate at 6 AM ET, so a delta measured across that boundary can differ
+ * from the delete count without either number being wrong. That is exactly
+ * why it is REPORTED rather than thrown on.
+ */
+export function verifyListDeleteCounts({ declared, deletedReported, sizeDelta } = {}) {
+  const mismatches = [];
+  if (deletedReported === null || deletedReported === undefined) {
+    mismatches.push({ field: 'listRecordsDeleted', expected: declared, actual: null });
+  } else if (Number(deletedReported) !== Number(declared)) {
+    mismatches.push({ field: 'listRecordsDeleted', expected: declared, actual: deletedReported });
+  }
+  if (sizeDelta === null || sizeDelta === undefined) {
+    mismatches.push({ field: 'size_delta', expected: declared, actual: null });
+  } else if (Number(sizeDelta) !== Number(declared)) {
+    mismatches.push({ field: 'size_delta', expected: declared, actual: sizeDelta });
+  }
+  return mismatches;
+}
+
+function buildRollbackDescriptor(listName, fieldNames, records) {
+  return {
+    method: 'asyncAddRecordsToList',
+    list_name: listName,
+    field_names: fieldNames,
+    records,
+    record_count: records.length,
+    keys_only: true,
+    caveat: ROLLBACK_CAVEAT,
+    envelope: buildAsyncAddRecordsToListXml(listName, fieldNames, records),
+  };
+}
+
+// <return><identifier>…</identifier></return> off asyncDeleteRecordsFromList.
+function extractImportIdentifier(xml) {
+  const block = returnBlocks(xml)[0];
+  return block ? tag(block, 'identifier') : '';
+}
+
+export async function executeAsyncDeleteRecordsFromList(action) {
+  const payload = action.action_payload || {};
+  const listName = String(payload.list_name || '').trim();
+  if (!listName) throw new Error('five9_async_delete_records_from_list requires action_payload.list_name');
+  const fieldNames = payload.field_names;
+  const records = payload.records;
+  const listDeleteMode = payload.list_delete_mode || 'DELETE_ALL';
+
+  // Build + token-check + count-reconcile BEFORE any read, and before the
+  // resume branch: payload errors fire first, and a malformed payload must
+  // never quietly resume a job it no longer describes.
+  const bodyXml = buildAsyncDeleteRecordsFromListXml(listName, fieldNames, records, listDeleteMode);
+  checkConfirmToken('async_delete_records_from_list', payload);
+  const declared = assertDeclaredRecordCount(payload.expected_record_count, records.length);
+
+  // Resume state from a prior deferred pass.
+  const prior = action.execution_result || {};
+  const resumeJobId = prior.five9_job_id ? String(prior.five9_job_id) : null;
+  const pollAttempt = Math.max(0, parseInt(prior.poll_attempt, 10) || 0);
+
+  const gateResult = await withFive9WriteGate(
+    {
+      action,
+      subtype: 'async_delete_records_from_list',
+      entityType: 'five9_list',
+      entityId: listName,
+      // Per-pass suffix so the completion event is never dropped as a
+      // duplicate of the submission event.
+      idempotencySuffix: resumeJobId ? `poll${pollAttempt}` : 'submit',
+    },
+    async (ctx) => {
+      const sizeOf = async () =>
+        (await getListsInfo()).lists.find(l => l.name === listName) ?? { name: listName, size: null };
+
+      const rollback = buildRollbackDescriptor(listName, fieldNames, records);
+      ctx.event_extra.rollback_payload = rollback;
+      ctx.event_extra.rollback_is_keys_only = true;
+      ctx.event_extra.rollback_caveat = ROLLBACK_CAVEAT;
+      ctx.event_extra.expected_record_count = declared;
+
+      // Poll this pass's budget, then either defer or read + verify the
+      // result. Split out so the submitting pass can catch everything it
+      // throws (see the re-submit hazard note at the call site).
+      const followJob = async (jobId) => {
+        const deadline = Date.now() + IMPORT_POLL_BUDGET_MS;
+        let running = true;
+        for (;;) {
+          running = await isImportRunning(jobId, IMPORT_POLL_WAIT_SEC);
+          if (!running || Date.now() >= deadline) break;
+          // isImportRunning blocks server-side for waitTime, but do not rely
+          // on that: if Five9 returns immediately this loop would otherwise
+          // spin hot for the whole budget. Same client-side nap
+          // runReportAndWait keeps for the same reason.
+          const napMs = Math.min(IMPORT_POLL_WAIT_SEC * 1000, Math.max(250, deadline - Date.now()));
+          await new Promise(r => setTimeout(r, napMs));
+        }
+
+        if (running) {
+          const d = decideImportPollReschedule(pollAttempt, Date.now());
+          if (!d.reschedule) {
+            throw new Error(`Five9 asyncDeleteRecordsFromList: job ${jobId} still running after ${d.attempt} poll attempts — check the list and getListImportResult before any retry`);
+          }
+          return {
+            deferred: true,
+            retry_at: d.retryAt,
+            reason: d.reason,
+            five9_job_id: jobId,
+            poll_attempt: d.attempt,
+            list: listName,
+          };
+        }
+
+        // ---------- job finished: read the result and verify ----------
+        const jobResult = await getListImportResult(jobId);
+        ctx.event_extra.import_result = jobResult;
+        if (jobResult.found && jobResult.success === false) {
+          throw new Error(`Five9 asyncDeleteRecordsFromList: job ${jobId} reported failure — ${jobResult.failureMessage || 'no failureMessage'}`);
+        }
+        if (Number(jobResult.uploadErrorsCount) > 0) {
+          throw new Error(`Five9 asyncDeleteRecordsFromList: job ${jobId} reports ${jobResult.uploadErrorsCount} upload error(s)`);
+        }
+
+        ctx.new_state = await sizeOf();
+
+        // A count disagreement is REPORTED (verified:false carrying all three
+        // numbers), never thrown and never silently passed. See
+        // verifyListDeleteCounts for the reasoning.
+        const deletedReported = jobResult.listRecordsDeleted;
+        const sizeDelta = (ctx.previous_state?.size != null && ctx.new_state?.size != null)
+          ? ctx.previous_state.size - ctx.new_state.size
+          : null;
+        const verify_mismatches = verifyListDeleteCounts({ declared, deletedReported, sizeDelta });
+        const verified = verify_mismatches.length === 0;
+        ctx.event_extra.verified = verified;
+        ctx.event_extra.verify_mismatches = verify_mismatches;
+        ctx.event_extra.deleted_expected = declared;
+        ctx.event_extra.deleted_reported = deletedReported;
+        ctx.event_extra.size_delta = sizeDelta;
+
+        return {
+          list: listName,
+          five9_job_id: jobId,
+          list_delete_mode: listDeleteMode,
+          deleted_expected: declared,
+          deleted_reported: deletedReported,
+          size_delta: sizeDelta,
+          verified,
+          verify_mismatches,
+          rollback_payload: rollback,
+          rollback_is_keys_only: true,
+        };
+      };
+
+      let jobId = resumeJobId;
+
+      if (!jobId) {
+        // ---------- submission pass ----------
+        ctx.previous_state = await sizeOf();
+
+        const compliance = checkListDeleteCompliance(
+          { requested: declared, listSize: ctx.previous_state.size },
+          { complianceOverride: payload.compliance_override === true },
+        );
+        ctx.event_extra.compliance = compliance;
+        if (!compliance.ok) {
+          throw new Error(`REFUSED: compliance — ${compliance.violations.join('; ')} (bulk list deletion ceilings; requires explicit compliance_override: true)`);
+        }
+
+        const submitXml = await ctx.soap('asyncDeleteRecordsFromList', bodyXml);
+        if (submitXml === null) {
+          // Dry-run: the real envelope was built and logged, nothing was
+          // submitted, and there is no job to poll.
+          return {
+            list: listName,
+            records_previewed: declared,
+            list_delete_mode: listDeleteMode,
+            rollback_payload: rollback,
+            rollback_is_keys_only: true,
+          };
+        }
+        assertNoRecordFailures('asyncDeleteRecordsFromList', submitXml);
+        jobId = extractImportIdentifier(submitXml);
+        if (!jobId) {
+          throw new Error('Five9 asyncDeleteRecordsFromList: response carried no import identifier — job state unknown, do NOT resubmit without checking the list');
+        }
+      } else {
+        // ---------- resume pass: NEVER re-submit ----------
+        ctx.previous_state = prior.previous_state ?? null;
+        ctx.event_extra.resumed = true;
+      }
+      ctx.event_extra.five9_job_id = jobId;
+
+      // The job now EXISTS. Until its id reaches execution_result, nothing
+      // downstream may throw: the executor's catch path does not write
+      // execution_result, so a throw here would leave the next attempt with
+      // no job id — and it would re-submit, deleting twice. On the
+      // submitting pass we therefore convert ANY downstream failure into a
+      // deferral (which does persist the id); from the next pass onward the
+      // id is durable and throwing is safe.
+      const submittedThisPass = !resumeJobId;
+      try {
+        return await followJob(jobId);
+      } catch (err) {
+        if (!submittedThisPass) throw err;
+        const d = decideImportPollReschedule(pollAttempt, Date.now());
+        ctx.event_extra.deferred_after_submit_error = err.message;
+        console.warn(`[FIVE9 WRITES] async_delete_records_from_list: job ${jobId} submitted but unverified (${err.message}) — deferring to persist the job id rather than risking a re-submit`);
+        return {
+          deferred: true,
+          retry_at: d.retryAt || new Date(Date.now() + 15_000).toISOString(),
+          reason: 'five9_import_unverified_after_submit',
+          five9_job_id: jobId,
+          poll_attempt: d.attempt,
+          list: listName,
+          submit_error: err.message,
+        };
+      }
+    },
+  );
+
+  // A lock-contention deferral is produced by the gate BEFORE fn runs, so it
+  // carries no job context. On a resume pass that would strip the job id from
+  // execution_result and the NEXT pass would re-submit — a second bulk
+  // delete. Re-attach it. (When there is no job yet, re-submitting later is
+  // the correct behavior, so the id is only restored when one exists.)
+  if (gateResult?.deferred === true && !gateResult.five9_job_id && resumeJobId) {
+    return { ...gateResult, five9_job_id: resumeJobId, poll_attempt: pollAttempt, list: listName };
+  }
+  return gateResult;
 }
 
 export function executeAddNumbersToDnc(action) {
