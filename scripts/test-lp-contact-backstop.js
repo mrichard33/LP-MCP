@@ -94,7 +94,18 @@ const LP_PROSPECT_ID_FIELD = 'ZRQAVrzhtzApzLlHmT87';
 // (today .. +MAX_HORIZON_DAYS). Computed relative to now so it stays in-window
 // whenever the suite runs. ~14 days out. (The old fixed 2027 literal now falls
 // outside the hardened absolute ceiling — that's the guard working.)
-const FUTURE = new Date(Date.now() + 14 * 24 * 3600 * 1000).toISOString();
+// ⚠️ The TIME OF DAY must be pinned too, not just the date. This used to be a
+// bare `Date.now() + 14d`, which inherits the wall-clock hour of whenever the
+// suite runs — so the reconciler's business-hours guard
+// (BUSINESS_HOUR_START_ET 8 .. BUSINESS_HOUR_END_ET 20, exclusive) rejected it
+// with 'impossible_hour' on any run after ~8pm ET or before 8am ET. That made
+// four tests pass or fail by clock. 16:00 UTC is noon ET in summer and 11:00 ET
+// in winter — mid-window under either offset.
+const FUTURE = (() => {
+  const d = new Date(Date.now() + 14 * 24 * 3600 * 1000);
+  d.setUTCHours(16, 0, 0, 0);
+  return d.toISOString();
+})();
 // Beyond the absolute ceiling — the garbage-date class (Sept-far-out, year-3026
 // junk) the guard must reject regardless of any horizon param.
 const ABSURD_FUTURE = '3026-06-16T18:00:00+00:00';
@@ -113,10 +124,16 @@ function reset({ search = [], searchQueue = null, full = null, upcoming = [], cr
 const posts = (p) => calls.filter((c) => c.method === 'POST' && c.path === p);
 const contactCreates = () => calls.filter((c) => c.method === 'POST' && c.path === '/contacts/');
 const mutations = () => calls.filter((c) => c.method === 'POST' || c.method === 'PUT');
+// `created_at_lp` defaults to JUST NOW. Without it the field is undefined, the
+// lead reads as indefinitely old, and every creation picks up
+// `suppress-outbound` (DEFAULT_INTAKE_FRESH_HOURS = 24) — which silently
+// changed what the tag-mapping test below was asserting. A fresh lead is the
+// normal case; the stale case is covered explicitly at the end of this file.
 const lead = (over = {}) => ({
   lp_lead_id: '555360', lp_prospect_id: '900001', disposition_code: 'Set',
   appointment_date: FUTURE, first_name: 'Jane', last_name: 'Blust',
-  phone: '(239) 555-1234', lead_source: 'Canvass', ...over,
+  phone: '(239) 555-1234', lead_source: 'Canvass',
+  created_at_lp: new Date().toISOString(), ...over,
 });
 
 // ═══ 1. Pure selection ════════════════════════════════════════════════
@@ -305,4 +322,25 @@ test('(8) dry-run → search GETs allowed, zero POST/PUT anywhere', async () => 
   assert.equal(mutations().length, 0, 'no-match dry-run must not mutate');
   assert.equal(contactCreates().length, 0);
   assert.equal(r.outcome, 'created'); // planned create, no contact yet
+});
+
+// ═══ Speed-to-lead suppression (the behaviour that surfaced the stale fixture)
+test('a lead older than the freshness window is created with suppress-outbound', async () => {
+  // "A lead that filled out a form days ago must not receive a speed-to-lead
+  // text as if it just arrived." Asserted here rather than left to leak into an
+  // unrelated tag-mapping test.
+  reset({ search: [] });
+  const stale = lead({
+    created_at_lp: new Date(Date.now() - 72 * 3600 * 1000).toISOString(),
+  });
+  const r = await processOneLead({ lead: stale, contactCache: new Map() });
+  assert.equal(r.outcome, 'created');
+  assert.ok(contactCreates()[0].body.tags.includes('suppress-outbound'));
+});
+
+test('a fresh lead is NOT suppressed — the guard is age-based, not always-on', async () => {
+  reset({ search: [] });
+  const r = await processOneLead({ lead: lead(), contactCache: new Map() });
+  assert.equal(r.outcome, 'created');
+  assert.ok(!contactCreates()[0].body.tags.includes('suppress-outbound'));
 });

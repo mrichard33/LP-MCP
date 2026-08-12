@@ -106,11 +106,15 @@
 -- evidence; a source-system accounting identity is a contract. LP guarantees
 -- no such contract, so this stays an observation.
 --
--- Useful corollary: `net_sales_cents` (gross − cancelled − cd) and
--- `nsa_cents + working_cents + hold_cents` are two routes to the same figure,
--- and they differ by EXACTLY the waterfall delta. January: $8,715,862 vs
--- $8,754,813 = +$38,951, which is January's delta to the cent. The subtraction
--- is authoritative; the sum is the check.
+-- ⚠️ CORRECTED 2026-08-12b — see 2026-08-12b_cohort_disposition_split.sql.
+-- This paragraph originally called `net_sales_cents` (gross − cancelled − cd)
+-- and `nsa_cents + working_cents + hold_cents` "two routes to the same figure".
+-- That states as an IDENTITY what the section above proves is only an
+-- OBSERVATION, and it is the one mistake this file exists to prevent. Correct
+-- statement: the subtraction DEFINES Net Sales; the sum is what LP separately
+-- reports; the difference between them is the delta, carried and never
+-- resolved into either side. January: $8,715,862 defined vs $8,754,813
+-- observed = a +$38,951 gap, which is January's delta to the cent.
 --
 -- ROLLBACK:
 --   DROP VIEW IF EXISTS lp_cohort_reobservation;

@@ -51,8 +51,24 @@ const {
   chooseKeep, findDuplicateGroups, runGhlAppointmentDedupe,
 } = await import('../src/admin/ghl-appointment-dedupe.js');
 
-const SLOT = '2026-07-11T10:00:00-04:00';
-const SLOT2 = '2026-07-11T14:00:00-04:00';
+// AMENDED 2026-08-12 — these were hardcoded at 2026-07-11 and the `run:` tests
+// had been failing silently since that date passed. `runGhlAppointmentDedupe`
+// scans FORWARD from Date.now() over a 45-day horizon, and
+// `listCalendarEvents` re-bounds the result to [startMs, endMs) client-side, so
+// a fixture pinned to a past date is filtered out and the loop legitimately
+// finds zero groups. The pure `chooseKeep` / `findDuplicateGroups` tests never
+// noticed, because they never enter the window.
+//
+// Derived from now so the suite cannot expire again. Two distinct slots inside
+// the horizon; the exact instants do not matter, only that they differ and both
+// fall in [now, now+45d).
+const inHorizon = (days, hours) => {
+  const d = new Date(Date.now() + days * 86400000);
+  d.setUTCHours(hours, 0, 0, 0);
+  return d.toISOString();
+};
+const SLOT = inHorizon(2, 14);
+const SLOT2 = inHorizon(3, 18);
 // Mapped shape (what findDuplicateGroups/chooseKeep consume directly).
 const ev = (o) => ({ appointment_id: o.id, calendar_id: WE, contact_id: o.c, start_time: o.t || SLOT, status: o.s || 'new', date_added: o.added || '2026-07-01T00:00:00Z' });
 // Raw GHL /calendars/events shape (what the fetch stub returns; mapEvent maps it).

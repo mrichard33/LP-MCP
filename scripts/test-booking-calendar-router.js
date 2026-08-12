@@ -39,11 +39,17 @@ test('estimate-calculator entry → Measurement Verification (in-home, gated)', 
   assert.equal(requiresInHomeGate(r.calendar_key), true);
 });
 
-test('default booking → Window Estimate (in-home, gated)', async () => {
+// AMENDED 2026-08-12. The default moved from Window Estimate to the
+// low-commitment PPR phone call — Sentinel §3C, which the router documents as
+// "supersedes the old default_window_estimate". The test still asserted the
+// superseded behaviour, so it had been failing since that change. A
+// low-signal entry (chatbot / web / offline media / no active-entry) is now
+// offered a call, not a 90-minute in-home visit, and so is NOT in-home gated.
+test('default booking → Protection Profile Review (phone, ungated)', async () => {
   const r = await resolveBookingCalendar({ id: 'c3', tags: [] });
-  assert.equal(r.calendar_key, 'WINDOW_ESTIMATE');
-  assert.equal(r.reason, 'default_window_estimate');
-  assert.equal(requiresInHomeGate(r.calendar_key), true);
+  assert.equal(r.calendar_key, 'PROTECTION_PROFILE_REVIEW');
+  assert.equal(r.reason, 'default_ppr_low_signal_entry');
+  assert.equal(requiresInHomeGate(r.calendar_key), false);
 });
 
 test('first-match-wins: risk-report beats estimate-calculator', async () => {
@@ -70,7 +76,10 @@ test('HPA is gated (in-home), phone calendars are not', () => {
 
 test('durations: phone calendars are short, in-home are 90', () => {
   assert.equal(durationForCalendar('CONFIRMATION_CALL'), 15);
-  assert.equal(durationForCalendar('PROTECTION_PROFILE_REVIEW'), 30);
+  // AMENDED 2026-08-12: PPR is a 15-minute call, not 30. The router's duration
+  // table and its customer-facing copy block ('15 minutes') already agreed;
+  // only this assertion was stale.
+  assert.equal(durationForCalendar('PROTECTION_PROFILE_REVIEW'), 15);
   assert.equal(durationForCalendar('WINDOW_ESTIMATE'), 90);
   assert.equal(durationForCalendar('MEASUREMENT_VERIFICATION'), 90);
   assert.equal(durationForCalendar('HOME_PROTECTION_ASSESSMENT'), 90);
