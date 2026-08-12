@@ -33,7 +33,7 @@ import {
 } from '../src/jobs/cohort-reobservation.js';
 
 const cohort = (over = {}) => ({
-  contract_month: '2026-06-01',
+  appointment_month: '2026-06-01',
   last_observed_on: '2026-08-09',
   days_since_observed: 3,
   cohort_age_days: 72,
@@ -68,7 +68,7 @@ test('says nothing when every cohort is fresh', () => {
 test('a stale CURRENT month blames the daily ingest, not a missing export', () => {
   const status = {
     stale_count: 1,
-    stale: [cohort({ contract_month: '2026-08-01', reason: 'current_month', days_since_observed: 4 })],
+    stale: [cohort({ appointment_month: '2026-08-01', reason: 'current_month', days_since_observed: 4 })],
   };
   const text = buildStaleAlert(status);
   assert.match(text, /daily report-137 email may have stopped/);
@@ -82,8 +82,8 @@ test('stale PRIOR cohorts name the months and say which way the error runs', () 
   const status = {
     stale_count: 2,
     stale: [
-      cohort({ contract_month: '2026-06-01', days_since_observed: 40 }),
-      cohort({ contract_month: '2026-07-01', days_since_observed: 38 }),
+      cohort({ appointment_month: '2026-06-01', days_since_observed: 40 }),
+      cohort({ appointment_month: '2026-07-01', days_since_observed: 38 }),
     ],
   };
   const text = buildStaleAlert(status);
@@ -98,8 +98,8 @@ test('both failures in one check are reported as both, not merged', () => {
   const status = {
     stale_count: 2,
     stale: [
-      cohort({ contract_month: '2026-08-01', reason: 'current_month', days_since_observed: 5 }),
-      cohort({ contract_month: '2026-05-01', days_since_observed: 60 }),
+      cohort({ appointment_month: '2026-08-01', reason: 'current_month', days_since_observed: 5 }),
+      cohort({ appointment_month: '2026-05-01', days_since_observed: 60 }),
     ],
   };
   const text = buildStaleAlert(status);
@@ -109,9 +109,9 @@ test('both failures in one check are reported as both, not merged', () => {
 });
 
 test('month names are correct at both ends of the year', () => {
-  const jan = buildStaleAlert({ stale_count: 1, stale: [cohort({ contract_month: '2026-01-01', days_since_observed: 99 })] });
+  const jan = buildStaleAlert({ stale_count: 1, stale: [cohort({ appointment_month: '2026-01-01', days_since_observed: 99 })] });
   assert.match(jan, /Jan 2026/);
-  const dec = buildStaleAlert({ stale_count: 1, stale: [cohort({ contract_month: '2026-12-01', days_since_observed: 99 })] });
+  const dec = buildStaleAlert({ stale_count: 1, stale: [cohort({ appointment_month: '2026-12-01', days_since_observed: 99 })] });
   assert.match(dec, /Dec 2026/);
 });
 
@@ -142,7 +142,7 @@ test('its remedy is to REMOVE a schedule, not add one', () => {
 test('a blockage and stale cohorts are both reported, blockage first', () => {
   const text = buildStaleAlert({
     stale_count: 1,
-    stale: [cohort({ contract_month: '2026-06-01', days_since_observed: 40 })],
+    stale: [cohort({ appointment_month: '2026-06-01', days_since_observed: 40 })],
     blocking_full_month_export: blocked,
   });
   assert.match(text, /BLOCKING/);

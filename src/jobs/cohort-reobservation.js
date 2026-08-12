@@ -114,7 +114,7 @@ export async function detectBlockingFullMonthExport() {
 export async function getCohortReobservationStatus() {
   const rows =
     (await runSQL(`
-      SELECT contract_month::text        AS contract_month,
+      SELECT appointment_month::text     AS appointment_month,
              last_observed_on::text      AS last_observed_on,
              days_since_observed,
              cohort_age_days,
@@ -122,7 +122,7 @@ export async function getCohortReobservationStatus() {
              hold_cents,
              reason
         FROM lp_cohort_reobservation
-       ORDER BY contract_month
+       ORDER BY appointment_month
     `)) || [];
 
   const cohorts = rows.map((r) => {
@@ -157,7 +157,7 @@ export async function getCohortReobservationStatus() {
 
 /** "Feb 2026 (34d)" — compact enough for a GroupMe line. */
 function describe(c) {
-  const [y, m] = c.contract_month.split('-');
+  const [y, m] = c.appointment_month.split('-');
   const names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   return `${names[Number(m) - 1] ?? m} ${y} (${c.days_since_observed}d)`;
 }
