@@ -33,11 +33,18 @@
 -- LP's suffix sits on the SURNAME, not the first name: 'Deer - LF, Craig',
 -- not 'Deer, Craig - LF'. Strip only the ' - LF' token and leave every other
 -- suffix alone — market suffixes like ' - ORL' are real and must survive.
+--
+-- \y, NOT \b. Postgres Advanced Regular Expressions spell a word boundary
+-- \y; inside an ARE, \b is the BACKSPACE character. Written with \b this
+-- pattern looks for 'LF' followed by a literal backspace, matches nothing,
+-- and every label passes through unchanged while partner_guess returns NULL
+-- forever — no error, just a roster that never collapses a rename. Caught on
+-- 2026-08-13 by running the function rather than reading it.
 CREATE OR REPLACE FUNCTION lp_setter_canonical(p_raw text)
 RETURNS text
 LANGUAGE sql IMMUTABLE
 AS $$
-  SELECT btrim(regexp_replace(COALESCE(p_raw, ''), '\s*-\s*LF\b', '', 'gi'));
+  SELECT btrim(regexp_replace(COALESCE(p_raw, ''), '\s*-\s*LF\y', '', 'gi'));
 $$;
 
 COMMENT ON FUNCTION lp_setter_canonical(text) IS
@@ -47,11 +54,41 @@ CREATE OR REPLACE FUNCTION lp_setter_partner_guess(p_raw text)
 RETURNS text
 LANGUAGE sql IMMUTABLE
 AS $$
-  SELECT CASE WHEN COALESCE(p_raw, '') ~* '\s*-\s*LF\b' THEN 'LightFire' END;
+  SELECT CASE WHEN COALESCE(p_raw, '') ~* '\s*-\s*LF\y' THEN 'LightFire' END;
 $$;
 
 COMMENT ON FUNCTION lp_setter_partner_guess(text) IS
   'Partner implied by the raw label''s suffix, or NULL when the label carries none. A GUESS: an agent LP has not yet renamed reads as NULL, which is exactly why lp_setter_roster.partner is set once per canonical_name and not re-derived per row.';
+
+-- ── (a.1) the rule checks itself ────────────────────────────────────────────
+-- There is no SQL test harness in this repo, and the \b/\y bug was invisible
+-- to review — the function applied cleanly and returned its input. So the
+-- assertions live here and run on every apply. All nine ran green 2026-08-13.
+DO $$
+DECLARE c record;
+BEGIN
+  FOR c IN SELECT * FROM (VALUES
+    ('Deer - LF, Craig',    'Deer, Craig',         'LightFire'),
+    ('Martin - LF, Kyle',   'Martin, Kyle',        'LightFire'),
+    ('Martin, Kyle',        'Martin, Kyle',         NULL),
+    ('Green-LF, Devon',     'Green, Devon',        'LightFire'),  -- no spaces
+    ('deer - lf, craig',    'deer, craig',         'LightFire'),  -- lowercase
+    ('Viner, Alfred - ORL', 'Viner, Alfred - ORL',  NULL),        -- market kept
+    ('Bock, Myron - STP',   'Bock, Myron - STP',    NULL),
+    ('Smith - LFX, John',   'Smith - LFX, John',    NULL),        -- LFX ≠ LF
+    ('Wolff, Ralf',         'Wolff, Ralf',          NULL)         -- 'lf' in-word
+  ) AS t(raw, expect_canon, expect_partner) LOOP
+    IF lp_setter_canonical(c.raw) IS DISTINCT FROM c.expect_canon THEN
+      RAISE EXCEPTION 'lp_setter_canonical(%) = %, expected %',
+        c.raw, lp_setter_canonical(c.raw), c.expect_canon;
+    END IF;
+    IF lp_setter_partner_guess(c.raw) IS DISTINCT FROM c.expect_partner THEN
+      RAISE EXCEPTION 'lp_setter_partner_guess(%) = %, expected %',
+        c.raw, lp_setter_partner_guess(c.raw), c.expect_partner;
+    END IF;
+  END LOOP;
+END;
+$$;
 
 -- ── (b) the roster ──────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS lp_setter_roster (
