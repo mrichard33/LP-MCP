@@ -1,81 +1,49 @@
--- ─────────────────────────────────────────────────────────────────────────────
--- ⚠️ SUPERSEDED BEFORE IT WAS EVER APPLIED. DO NOT RUN THIS FILE.
+-- ─── 2026-08-13b · promotion by PROVEN coverage, not by declared period_end ──
 --
--- Verified against the live database on 2026-08-13: neither guard below was
--- present (has_recency_guard = false, has_inverted_guard = false), so nothing
--- this file describes was ever true of production. Applying §I as written would
--- have made things worse — it ranks coverage by the DECLARED period_end, so a
--- partial file claiming Aug 1–31 would win and then refuse every honest daily
--- file for the rest of the month.
+-- WHAT THIS IS. The definitive rewrite of lp_csv_ingest_finalize. It supersedes
+-- sql/migrations/2026-08-11_rolling_window_promotion.sql, which was written and
+-- reviewed but NEVER APPLIED — verified 2026-08-13 against the live database:
 --
--- The version that actually shipped is
--- sql/migrations/2026-08-13b_promotion_proven_coverage.sql, which carries both
--- guards forward and ranks by PROVEN coverage instead. This file is kept only
--- as the record of the reasoning it got right.
--- ─────────────────────────────────────────────────────────────────────────────
+--   SELECT position('v_keep_end' in pg_get_functiondef(p.oid)) > 0, ...
+--   → has_recency_guard = false, has_inverted_guard = false
 --
--- 2026-08-11 — rolling-window promotion: coverage recency, and inverted periods
+-- So the live function was still last-writer-wins, and the trace shows it:
+-- c1fc176f (period_end 2026-08-31) was demoted by fe5df304 (period_end
+-- 2026-08-10). Everything the 08-11 migration described as current behaviour
+-- was in fact aspirational. This migration is what actually goes on.
 --
--- WHY
+-- WHAT IT CARRIES FORWARD, unchanged from the 08-11 draft:
+--   • the inverted-period guard — LP is moving to t1=[BOCM]&t2=[DAYOFFSET(-1)],
+--     which on the 1st of a month yields 2026-09-01..2026-08-31. daterange()
+--     raises on that AFTER the rows are loaded: a 500 rather than a diagnosis.
+--     This breaks on a known date and the guard turns it into a clear refusal.
+--   • §I coverage recency — promotion ordered by how much of the period a file
+--     covers, not by which file arrived last, so a re-send or out-of-order
+--     delivery cannot silently roll the dashboard backwards.
+--   • control totals and row counts — byte-identical to the 2026-08-07
+--     definition. Nothing about validation changes here.
 --
--- LP is moving the daily reports to t1=[BOCM]&t2=[DAYOFFSET(-1)], early morning.
--- Every daily file then shares a period_start and differs only in period_end, so
--- a report accumulates ~30 files a month instead of one.
---
--- The promotion key already handles that and does NOT need changing. The live
--- unique index is (report_type, scope, period_start) WHERE is_current — it does
--- not include period_end — and lp_csv_ingest_finalize demotes on daterange
--- OVERLAP within the {mtd, month} scope family. Verified in production on
--- 2026-08-11: for period_start = 2026-08-01, scope = 'mtd', jobs_by_milestone had
--- taken period_end values Aug 31 -> Aug 10 -> Aug 10 and job_status_ytd five
--- values across Aug 31/Aug 10, with exactly one is_current row each and the
--- priors preserved as history. Rolling files already supersede correctly.
---
--- Two real gaps remain.
---
--- (1) Promotion is last-writer-wins, with no coverage ordering. The same
---     production trace shows job_status_ytd going period_end Aug 10 -> Aug 31 ->
---     Aug 10: whichever file arrived last became current regardless of how much
---     of the period it covered. With one file a month that was harmless. With
---     thirty, any re-send or out-of-order delivery silently rolls the dashboard
---     backwards, and nothing logs that it happened.
---
--- (2) daterange(period_start, period_end) raises on an inverted range, and the
---     new schedule produces one. On the 1st of a month, [BOCM] is the 1st and
---     [DAYOFFSET(-1)] is the last day of the PRIOR month, giving
---     2026-09-01..2026-08-31. That throws inside the promotion step, after the
---     rows have been loaded — a 500 rather than a diagnosis.
---
--- WHAT THIS DOES
---
--- Rewrites lp_csv_ingest_finalize with two guards and no other change; the
--- control-total and row-count logic is byte-identical to the 2026-08-07
--- definition it replaces.
---
---   §I  coverage recency — a snapshot covering strictly LESS of the period than
---       the current one is kept as history instead of promoted, and the refusal
---       is recorded through lp_log_supersede so it appears in scorecard_ingest_log
---       as a 'superseded' row rather than vanishing. Equal coverage still wins:
---       a same-day corrected re-send must be able to replace its predecessor.
---
---   inverted periods — refused before the daterange is built.
---
--- SCOPE: the CSV path only. scorecard_ingest_snapshot (the legacy PDF single-tx
--- path) carries the same daterange-overlap block and is deliberately untouched —
--- LP no longer sends PDFs, that path takes no rolling files, and rewriting it
--- would be churn on a route nothing exercises. If PDF ingest is ever revived,
--- both guards need porting there too.
+-- WHAT IT CHANGES (§I.b, and the reason this is a new migration rather than the
+-- old one applied as-is): coverage is measured by PROVEN period_end, not
+-- declared period_end. See the inline comment at §I.b — applying §I in its
+-- original form would have turned a self-healing mistake into a month-long
+-- freeze of the current month.
 --
 -- IDEMPOTENT: CREATE OR REPLACE only. No DDL, no data change.
 --
--- ROLLBACK: re-apply the lp_csv_ingest_finalize definition from
--- sql/migrations/2026-08-07_job_status_cohort_realign.sql. Nothing else here
--- needs reverting; snapshots demoted by §I stay valid history either way.
+-- ROLLBACK: re-apply lp_csv_ingest_finalize from
+-- sql/migrations/2026-08-07_job_status_cohort_realign.sql — that is the
+-- definition currently live. Snapshots demoted or kept by §I stay valid history
+-- either way.
 --
 -- AFTER RUNNING: node scripts/test-lp-csv-cutover.js
+--
+-- SCOPE: the CSV path only. scorecard_ingest_snapshot (the legacy PDF single-tx
+-- path) carries the same daterange-overlap block and is deliberately untouched.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 BEGIN;
+
 
 CREATE OR REPLACE FUNCTION public.lp_csv_ingest_finalize(p_snapshot_id uuid)
 RETURNS integer LANGUAGE plpgsql AS $function$
@@ -89,6 +57,9 @@ DECLARE
   v_closed   boolean;
   v_keep_id  uuid;
   v_keep_end date;
+  v_keep_par boolean;
+  v_in_end   date;
+  v_keep_eff date;
   d          record;
 BEGIN
   SELECT * INTO s FROM scorecard_report_snapshots WHERE id = p_snapshot_id FOR UPDATE;
@@ -102,9 +73,11 @@ BEGIN
   -- An end before its start is not a period. The promotion step below builds
   -- daterange(period_start, period_end) to find what this snapshot displaces,
   -- and an inverted range raises "range lower bound must be less than or equal
-  -- to range upper bound" AFTER the rows are loaded. lp-csv-ingest.js rejects
-  -- this shape earlier and more cheaply (failure_reason 'inverted_period'); this
-  -- is the backstop for any caller that does not go through it.
+  -- to range upper bound" AFTER the rows are loaded. LP is moving to
+  -- t1=[BOCM]&t2=[DAYOFFSET(-1)], which on the 1st of a month yields
+  -- 2026-09-01..2026-08-31 — so this fires on a known date. lp-csv-ingest.js
+  -- rejects the shape earlier and more cheaply (failure_reason
+  -- 'inverted_period'); this is the backstop for any other caller.
   IF s.period_end < s.period_start THEN
     RAISE EXCEPTION 'lp_csv_ingest_finalize: snapshot % declares an inverted period % .. % — refusing to promote',
       p_snapshot_id, s.period_start, s.period_end;
@@ -221,28 +194,47 @@ BEGIN
   UPDATE scorecard_report_snapshots SET finalized_at = now() WHERE id = p_snapshot_id;
 
   -- §I: the current snapshot is the one that covers the MOST of the period, not
-  -- the one that arrived last.
-  --
-  -- Promotion has always been last-writer-wins. That was harmless while LP sent
-  -- one file per period, but the daily rolling schedule
-  -- (t1=[BOCM]&t2=[DAYOFFSET(-1)]) sends ~30 files per report per month, all
-  -- sharing a period_start and differing only in period_end. Under last-writer,
-  -- any re-send or out-of-order delivery of an earlier file silently rolls the
-  -- dashboard backwards. It is already observable: job_status_ytd went
+  -- the one that arrived last. Promotion was last-writer-wins, which was
+  -- harmless while LP sent one file per period. The daily rolling schedule
+  -- sends ~30 files per report per month, all sharing a period_start and
+  -- differing only in period_end, so any re-send or out-of-order delivery
+  -- silently rolled the dashboard backwards. Observed: job_status_ytd went
   -- period_end Aug 10 -> Aug 31 -> Aug 10 across three arrivals on 2026-08-10/11.
   --
-  -- Equal coverage still wins, deliberately: a same-day corrected re-send must be
-  -- able to replace its predecessor. Only STRICTLY less coverage is refused.
-  SELECT id, period_end INTO v_keep_id, v_keep_end
+  -- §I.b (2026-08-13): only PROVEN coverage may block a promotion.
+  --
+  -- period_end alone is not coverage. A file generated on the 10th with
+  -- t2=[EOCM] declares period_end 2026-08-31 and is flagged is_partial_month —
+  -- it claims three weeks it cannot contain. Ranking on the raw period_end
+  -- would let that file win, and then every honest daily file (Aug 1..12,
+  -- Aug 1..13, ...) covers "strictly less" and is refused for the rest of the
+  -- month, converting a self-healing mistake into a month-long freeze. Live
+  -- example: snapshot c1fc176f, period_end 2026-08-31, is_partial_month true,
+  -- generated 2026-08-10.
+  --
+  -- So an incumbent blocks only if its coverage is PROVEN and strictly exceeds
+  -- the incoming file's proven coverage. A partial incumbent never blocks; a
+  -- partial newcomer never displaces a complete incumbent that already reaches
+  -- as far. Preferring proven-less over unproven-more is the conservative
+  -- direction and the one that cannot stall. Equal coverage still wins, so a
+  -- same-day corrected re-send can replace its predecessor.
+  SELECT id, period_end, is_partial_month INTO v_keep_id, v_keep_end, v_keep_par
     FROM scorecard_report_snapshots
    WHERE report_type = s.report_type
      AND daterange(period_start, period_end, '[]') && daterange(s.period_start, s.period_end, '[]')
      AND (scope = s.scope OR (scope IN ('mtd', 'month') AND s.scope IN ('mtd', 'month')))
      AND is_current AND id <> p_snapshot_id
-   ORDER BY period_end DESC, report_generated_at DESC NULLS LAST, ingested_at DESC
+   ORDER BY (is_partial_month IS FALSE) DESC, period_end DESC,
+            report_generated_at DESC NULLS LAST, ingested_at DESC
    LIMIT 1;
 
-  IF v_keep_id IS NOT NULL AND v_keep_end > s.period_end THEN
+  -- IS FALSE, not NOT: unknown coverage (NULL) is not proven coverage.
+  v_in_end   := CASE WHEN s.is_partial_month IS FALSE THEN s.period_end END;
+  v_keep_eff := CASE WHEN v_keep_par IS FALSE THEN v_keep_end END;
+
+  IF v_keep_id IS NOT NULL
+     AND v_keep_eff IS NOT NULL
+     AND (v_in_end IS NULL OR v_keep_eff > v_in_end) THEN
     -- Keep it as history, exactly like a demoted prior day: the rows stay, the
     -- facts are built, and is_current stays false so nothing reads it as live.
     -- scorecard_rebuild_facts copies s.is_current onto every fact it writes, so
@@ -289,9 +281,10 @@ COMMIT;
 
 -- ── Verification ────────────────────────────────────────────────────────────
 --
--- 1. The guards are present on the live definition:
+-- 1. Both guards are present on the LIVE definition. Both must be true — they
+--    were both false before this migration.
 --
--- SELECT position('v_keep_end' in pg_get_functiondef(p.oid)) > 0 AS has_recency_guard,
+-- SELECT position('v_keep_eff' in pg_get_functiondef(p.oid)) > 0 AS has_recency_guard,
 --        position('inverted period' in pg_get_functiondef(p.oid)) > 0 AS has_inverted_guard
 --   FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
 --  WHERE n.nspname = 'public' AND p.proname = 'lp_csv_ingest_finalize';
@@ -303,9 +296,22 @@ COMMIT;
 --   FROM scorecard_report_snapshots WHERE is_current
 --  GROUP BY 1,2,3 HAVING count(*) > 1;
 --
--- 3. The current MTD snapshot is the widest-covering one, not the last to land:
+-- 3. No PARTIAL snapshot is current while a complete one covering the same
+--    period exists as history. MUST return zero rows.
 --
--- SELECT report_type, period_start, period_end, is_current, ingested_at
+-- SELECT cur.id, cur.period_start, cur.period_end, cur.is_partial_month
+--   FROM scorecard_report_snapshots cur
+--   JOIN scorecard_report_snapshots hist
+--     ON hist.report_type = cur.report_type
+--    AND hist.period_start = cur.period_start
+--    AND hist.is_partial_month IS FALSE
+--    AND NOT hist.is_current
+--  WHERE cur.is_current AND cur.is_partial_month IS NOT FALSE
+--    AND hist.period_end >= cur.period_end;
+--
+-- 4. The current MTD snapshot is the widest PROVEN-covering one:
+--
+-- SELECT report_type, period_end, is_partial_month, is_current, ingested_at
 --   FROM scorecard_report_snapshots
 --  WHERE scope = 'mtd' AND period_start = date_trunc('month', now())::date
 --  ORDER BY report_type, ingested_at;

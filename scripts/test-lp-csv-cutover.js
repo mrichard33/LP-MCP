@@ -888,9 +888,37 @@ test('C promotion is ordered by COVERAGE, not by arrival order', () => {
   // so whichever landed last became current regardless of how much of the period
   // it actually covered.
   assert.match(src, /v_keep_end/,
-    `finalize must compare the incoming period_end against the incumbent's (${file})`);
-  assert.match(src, /v_keep_end > s\.period_end/,
+    `finalize must compare the incoming coverage against the incumbent's (${file})`);
+  assert.match(src, /v_keep_eff > v_in_end/,
     'a snapshot covering strictly LESS of the period must not displace the current one');
+
+  // §I.b (2026-08-13) — COVERAGE IS NOT period_end.
+  //
+  // The first draft of this guard (2026-08-11, never applied) compared the raw
+  // period_end. That is wrong in a way that turns a self-healing mistake into a
+  // month-long outage: a file generated on the 10th with t2=[EOCM] declares
+  // period_end 2026-08-31 and is flagged is_partial_month, so it would win on
+  // raw period_end and then refuse every honest daily file (Aug 1..12, Aug
+  // 1..13, …) for the rest of the month. Live example: snapshot c1fc176f.
+  //
+  // So both sides of the comparison must be gated on PROVEN coverage.
+  assert.match(src, /v_in_end\s*:=\s*CASE WHEN s\.is_partial_month IS FALSE/,
+    'the incoming file may only claim the coverage it can prove');
+  assert.match(src, /v_keep_eff\s*:=\s*CASE WHEN v_keep_par IS FALSE/,
+    'and an incumbent may only block on coverage it can prove');
+  assert.ok(!/v_keep_end > s\.period_end/.test(src),
+    'the raw period_end comparison must be gone — a partial file would win it');
+
+  // IS FALSE, not NOT: unknown coverage (NULL) is not proven coverage. `NOT
+  // is_partial_month` is NULL for an unknown file, which would make the CASE
+  // fall through and silently treat unknown as proven.
+  assert.ok(!/CASE WHEN NOT s\.is_partial_month/.test(src),
+    'unknown coverage must not be read as proven — IS FALSE, never NOT');
+
+  // A partial incumbent must never outrank a complete one in the search itself,
+  // or the guard never sees the file it should have kept.
+  assert.match(src, /ORDER BY \(is_partial_month IS FALSE\) DESC/,
+    'proven-coverage snapshots are considered before partial ones');
 
   // Refusing has to be visible. A silent skip is indistinguishable from a file
   // that never arrived, which is the failure mode this whole change exists to end.
@@ -900,7 +928,7 @@ test('C promotion is ordered by COVERAGE, not by arrival order', () => {
 
   // Equal coverage must still win: a corrected same-day re-send has to be able to
   // replace its predecessor. Only a strict `>` preserves that.
-  assert.ok(!/v_keep_end >= s\.period_end/.test(src),
+  assert.ok(!/v_keep_eff >= v_in_end/.test(src),
     'equal coverage must still win — a corrected re-send replaces its predecessor');
 });
 
