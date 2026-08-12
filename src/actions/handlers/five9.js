@@ -1,7 +1,7 @@
 /**
  * Five9 admin write handler — src/actions/handlers/five9.js
  *
- * One dispatcher for all thirteen five9_* write action types. The real work
+ * One dispatcher for all fourteen five9_* write action types. The real work
  * (guardrails, serialization lock, read-before-write, audit events) lives
  * in src/five9/admin-writes.js — this file is only the executor-facing
  * seam plus the belt-and-braces approval check.
@@ -28,6 +28,9 @@ import {
   executeCreateCampaignProfile,
   // 2026-08-06 Phase D-2 — modifyCampaignProfile wrapper WSDL-verified
   executeModifyCampaignProfile,
+  // 2026-08-12 Phase F — bulk async list deletion (confirm_token + declared
+  // count + volume ceiling + proportion guard; defers while the job runs)
+  executeAsyncDeleteRecordsFromList,
 } from '../../five9/admin-writes.js';
 
 const FIVE9_WRITE_OPS = {
@@ -37,6 +40,8 @@ const FIVE9_WRITE_OPS = {
   five9_set_outbound_campaign: executeSetOutboundCampaign,
   five9_add_records_to_list: executeAddRecordsToList,
   five9_delete_record_from_list: executeDeleteRecordFromList,
+  // 2026-08-12 Phase F — the BULK sibling of delete_record_from_list.
+  five9_async_delete_records_from_list: executeAsyncDeleteRecordsFromList,
   five9_add_numbers_to_dnc: executeAddNumbersToDnc,
   five9_remove_numbers_from_dnc: executeRemoveNumbersFromDnc,
   // 2026-08-05 Phase D

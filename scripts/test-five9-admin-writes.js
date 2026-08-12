@@ -40,7 +40,20 @@ import {
   // 2026-08-06 Phase E-2 — timer read-back verification
   timerStructToSeconds,
   verifyPatchReadBack,
+  // 2026-08-12 Phase F — bulk async list deletion
+  buildAsyncDeleteRecordsFromListXml,
+  buildAsyncAddRecordsToListXml,
+  checkListDeleteCompliance,
+  assertDeclaredRecordCount,
+  decideImportPollReschedule,
+  verifyListDeleteCounts,
+  executeAsyncDeleteRecordsFromList,
+  MAX_LIST_DELETE_LIMIT,
+  MAX_LIST_DELETE_PROPORTION,
+  ASYNC_DELETE_FIELD_ORDER,
+  LIST_DELETE_SETTINGS_FIELD_ORDER,
 } from '../src/five9/admin-writes.js';
+import { buildImportIdentifierXml } from '../src/five9-admin.js';
 
 test('five9WritesEnabled: ships dark — unset/false off, only literal "true" on', () => {
   const saved = process.env.FIVE9_WRITES_ENABLED;
@@ -632,4 +645,318 @@ test('mixed patch: timer and non-timer fields verify independently', () => {
   const mismatches = verifyPatchReadBack({ CRMRedialTimeout: 300, dialingRatio: 10 }, after);
   assert.equal(mismatches.length, 1, 'only the genuinely drifted field should surface');
   assert.equal(mismatches[0].field, 'dialingRatio');
+});
+
+/* ------------------------------------------------------------------------ *
+ * Phase F (2026-08-12) — BULK async list deletion.
+ *
+ * Someone bulk-loaded ~3,850 records into `Sale - Completed 0-2yrs` on
+ * 2026-08-07/08, a large subset of them Fort Myers previous customers that
+ * had no business in an east-coast previous-customer motion. Purging them one
+ * approval-gated action at a time was the only option before this op.
+ *
+ * These tests pin the two things most likely to be "corrected" back into
+ * bugs: the importData/values/item payload shape (which differs from the SYNC
+ * delete op's record/fields, and from list-dispatch's unrelated <values>),
+ * and the guardrails that stand between a cohort query and an emptied list.
+ * ------------------------------------------------------------------------ */
+
+test('buildAsyncDeleteRecordsFromListXml: WSDL xs:sequence order, base before extension', () => {
+  const xml = buildAsyncDeleteRecordsFromListXml(
+    'Sale - Completed 0-2yrs', ['number1'], [['5551234567'], ['5559876543']],
+  );
+  assert.match(xml, /^<listName>Sale - Completed 0-2yrs<\/listName>/);
+  const order = ['<listName>', '<listDeleteSettings>', '<fieldsMapping>', '<skipHeaderLine>', '<listDeleteMode>', '</listDeleteSettings>', '<importData>'];
+  const idx = order.map(t => xml.indexOf(t));
+  assert.ok(idx.every(i => i >= 0), `all elements present: ${xml}`);
+  for (let i = 1; i < idx.length; i++) {
+    assert.ok(idx[i] > idx[i - 1], `${order[i]} must follow ${order[i - 1]} (WSDL sequence): ${xml}`);
+  }
+  // The order arrays record the schema, including fields we never emit.
+  assert.deepEqual(ASYNC_DELETE_FIELD_ORDER, ['listName', 'listDeleteSettings', 'importData']);
+  // skipHeaderLine is the last BASE field; listDeleteMode is the extension.
+  assert.equal(LIST_DELETE_SETTINGS_FIELD_ORDER.at(-1), 'listDeleteMode');
+  assert.equal(LIST_DELETE_SETTINGS_FIELD_ORDER.at(-2), 'skipHeaderLine');
+  assert.ok(LIST_DELETE_SETTINGS_FIELD_ORDER.indexOf('fieldsMapping') < LIST_DELETE_SETTINGS_FIELD_ORDER.indexOf('skipHeaderLine'));
+});
+
+test('buildAsyncDeleteRecordsFromListXml: payload is importData/values/item — NOT record/fields', () => {
+  const xml = buildAsyncDeleteRecordsFromListXml('L', ['number1'], [['555'], ['666']]);
+  // One <values> per record, one <item> per column.
+  assert.match(xml, /<importData><values><item>555<\/item><\/values><values><item>666<\/item><\/values><\/importData>$/);
+  // REGRESSION GUARD: the async op must never emit the SYNC op's shape. The
+  // Phase F handoff asserted "<fields>, not <values>" — true for tns:recordData
+  // (the sync deleteRecordFromList), false here: asyncDeleteRecordsFromList
+  // takes tns:importData, whose children are <values> of ns1:stringArray.
+  assert.doesNotMatch(xml, /<record>/);
+  assert.doesNotMatch(xml, /<fields>/);
+  // ...and the sync builder must still emit the sync shape, unchanged.
+  const sync = buildDeleteRecordFromListXml('L', ['number1'], ['555']);
+  assert.match(sync, /<record><fields>555<\/fields><\/record>$/);
+  assert.doesNotMatch(sync, /<importData>/);
+});
+
+test('buildAsyncDeleteRecordsFromListXml: key=true only on number1, columns numbered from 1', () => {
+  const xml = buildAsyncDeleteRecordsFromListXml('L', ['number1', 'notes', 'number2'], [['5551234567', 'x', '5559999999']]);
+  assert.match(xml, /<fieldsMapping><columnNumber>1<\/columnNumber><fieldName>number1<\/fieldName><key>true<\/key><\/fieldsMapping>/);
+  assert.match(xml, /<fieldsMapping><columnNumber>2<\/columnNumber><fieldName>notes<\/fieldName><key>false<\/key><\/fieldsMapping>/);
+  // number2 is a phone column but NOT the dial key — same convention as the
+  // sync builders and list-dispatch.
+  assert.match(xml, /<fieldsMapping><columnNumber>3<\/columnNumber><fieldName>number2<\/fieldName><key>false<\/key><\/fieldsMapping>/);
+  assert.equal((xml.match(/<key>true<\/key>/g) || []).length, 1);
+});
+
+test('buildAsyncDeleteRecordsFromListXml: nulls become empty items, values are escaped', () => {
+  const xml = buildAsyncDeleteRecordsFromListXml('L', ['number1', 'notes'], [['555', null], ['666', undefined]]);
+  assert.match(xml, /<values><item>555<\/item><item><\/item><\/values>/);
+  assert.match(xml, /<values><item>666<\/item><item><\/item><\/values>/);
+  const esc = buildAsyncDeleteRecordsFromListXml('L & Co', ['number1'], [['<script>&']]);
+  assert.match(esc, /<listName>L &amp; Co<\/listName>/);
+  assert.match(esc, /<item>&lt;script&gt;&amp;<\/item>/);
+});
+
+test('buildAsyncDeleteRecordsFromListXml: mode enum enforced, shape mismatches throw', () => {
+  assert.match(
+    buildAsyncDeleteRecordsFromListXml('L', ['number1'], [['5']], 'DELETE_EXCEPT_FIRST'),
+    /<listDeleteMode>DELETE_EXCEPT_FIRST<\/listDeleteMode>/,
+  );
+  assert.doesNotThrow(() => buildAsyncDeleteRecordsFromListXml('L', ['number1'], [['5']], 'DELETE_IF_SOLE_CRM_MATCH'));
+  assert.throws(() => buildAsyncDeleteRecordsFromListXml('L', ['number1'], [['5']], 'NUKE_EVERYTHING'), /invalid list_delete_mode/);
+  assert.throws(() => buildAsyncDeleteRecordsFromListXml('', ['number1'], [['5']]), /list_name is required/);
+  assert.throws(() => buildAsyncDeleteRecordsFromListXml('L', ['number1'], []), /records is required/);
+  assert.throws(() => buildAsyncDeleteRecordsFromListXml('L', [], [['5']]), /mismatch/);
+  // A ragged row is caught with its index — a silently truncated record on a
+  // bulk DELETE is exactly the unrecoverable case.
+  assert.throws(() => buildAsyncDeleteRecordsFromListXml('L', ['a', 'b'], [['1', '2'], ['3']]), /mismatch at record 1/);
+});
+
+test('buildAsyncAddRecordsToListXml: rollback body carries listUpdateSettings + importData', () => {
+  const xml = buildAsyncAddRecordsToListXml('L', ['number1'], [['555']]);
+  const order = ['<listName>', '<listUpdateSettings>', '<fieldsMapping>', '<skipHeaderLine>', '<cleanListBeforeUpdate>', '<crmAddMode>', '<crmUpdateMode>', '<listAddMode>', '</listUpdateSettings>', '<importData>'];
+  const idx = order.map(t => xml.indexOf(t));
+  assert.ok(idx.every(i => i >= 0), `all elements present: ${xml}`);
+  for (let i = 1; i < idx.length; i++) {
+    assert.ok(idx[i] > idx[i - 1], `${order[i]} must follow ${order[i - 1]}: ${xml}`);
+  }
+  assert.match(xml, /<importData><values><item>555<\/item><\/values><\/importData>$/);
+  assert.doesNotMatch(xml, /<listDeleteMode>/);
+});
+
+test('buildImportIdentifierXml: importIdentifier is DOUBLE-nested, unlike the report ops', () => {
+  // tns:isImportRunning takes identifier: tns:importIdentifier, and
+  // importIdentifier's only child is itself named `identifier`. Flattening
+  // this to a single <identifier> is an unmarshalling fault.
+  assert.equal(buildImportIdentifierXml('abc123'), '<identifier><identifier>abc123</identifier></identifier>');
+  assert.equal(
+    buildImportIdentifierXml('abc123', { waitTimeSec: 5 }),
+    '<identifier><identifier>abc123</identifier></identifier><waitTime>5</waitTime>',
+  );
+  assert.equal(buildImportIdentifierXml('a', { waitTimeSec: -3 }), '<identifier><identifier>a</identifier></identifier><waitTime>0</waitTime>');
+  assert.throws(() => buildImportIdentifierXml(''), /identifier is required/);
+});
+
+test('requiredConfirmToken: bulk deletion is confirm_token-gated on the list name', () => {
+  assert.equal(
+    requiredConfirmToken('async_delete_records_from_list', { list_name: 'Sale - Completed 0-2yrs' }),
+    'Sale - Completed 0-2yrs',
+  );
+  // The single-record sync delete is deliberately NOT gated — one record is
+  // not a blast radius. Bulk is.
+  assert.equal(requiredConfirmToken('delete_record_from_list', { list_name: 'X' }), null);
+  assert.throws(
+    () => checkConfirmToken('async_delete_records_from_list', { list_name: 'A', confirm_token: 'B' }),
+    /confirm_token mismatch/,
+  );
+  assert.doesNotThrow(
+    () => checkConfirmToken('async_delete_records_from_list', { list_name: 'A', confirm_token: 'A' }),
+  );
+});
+
+test('assertDeclaredRecordCount: missing or mismatched declared count refuses', () => {
+  assert.equal(assertDeclaredRecordCount(2, 2), 2);
+  assert.throws(() => assertDeclaredRecordCount(undefined, 2), /requires action_payload\.expected_record_count/);
+  assert.throws(() => assertDeclaredRecordCount(null, 2), /requires action_payload\.expected_record_count/);
+  assert.throws(() => assertDeclaredRecordCount('', 2), /requires action_payload\.expected_record_count/);
+  assert.throws(() => assertDeclaredRecordCount(3, 2), /expected_record_count 3 !== 2/);
+  assert.throws(() => assertDeclaredRecordCount(1.5, 2), /non-negative integer/);
+  assert.throws(() => assertDeclaredRecordCount(-1, 2), /non-negative integer/);
+  assert.throws(() => assertDeclaredRecordCount('abc', 2), /non-negative integer/);
+  // A string that IS the right integer is accepted — payloads arrive as JSON.
+  assert.equal(assertDeclaredRecordCount('2', 2), 2);
+});
+
+test('checkListDeleteCompliance: absolute ceiling refuses without override, passes with it', () => {
+  assert.equal(MAX_LIST_DELETE_LIMIT, 2000, 'FIVE9_MAX_LIST_DELETE default');
+  const big = { requested: 2500, listSize: 100000 };
+  const refused = checkListDeleteCompliance(big);
+  assert.equal(refused.ok, false);
+  assert.match(refused.violations.join(';'), /2500 records > 2000 per-action ceiling/);
+  const overridden = checkListDeleteCompliance(big, { complianceOverride: true });
+  assert.equal(overridden.ok, true);
+  assert.equal(overridden.overridden, true, 'override must be recorded on the audit event');
+  // Injectable limit — MAX_LIST_DELETE_LIMIT is frozen at module load, so the
+  // env var cannot be moved after import (same as MAX_PROFILE_ATTEMPTS_LIMIT).
+  assert.equal(checkListDeleteCompliance({ requested: 50, listSize: 100000 }, { limit: 10 }).ok, false);
+  assert.equal(checkListDeleteCompliance({ requested: 50, listSize: 100000 }, { limit: 100 }).ok, true);
+});
+
+test('checkListDeleteCompliance: proportion guard catches the cohort query that nukes the list', () => {
+  assert.equal(MAX_LIST_DELETE_PROPORTION, 0.5);
+  // 1,500 of 40,000 is unremarkable; 1,500 of 2,000 is the list.
+  assert.equal(checkListDeleteCompliance({ requested: 1500, listSize: 40000 }).ok, true);
+  const nuke = checkListDeleteCompliance({ requested: 1500, listSize: 2000 });
+  assert.equal(nuke.ok, false);
+  assert.match(nuke.violations.join(';'), /1500 of 2000 records = 75\.0% > 50% of the list/);
+  assert.equal(checkListDeleteCompliance({ requested: 1500, listSize: 2000 }, { complianceOverride: true }).ok, true);
+  // Exactly 50% passes; one over does not.
+  assert.equal(checkListDeleteCompliance({ requested: 1000, listSize: 2000 }).ok, true);
+  assert.equal(checkListDeleteCompliance({ requested: 1001, listSize: 2000 }).ok, false);
+  // Against the live 2026-08-12 list (3,879) the proportion line bites at
+  // 1,940 — BEFORE the 2,000 absolute ceiling. Both guards are load-bearing.
+  assert.equal(checkListDeleteCompliance({ requested: 1950, listSize: 3879 }).ok, false);
+});
+
+test('checkListDeleteCompliance: an unknown list size is a refusal, not a pass', () => {
+  // getListsInfo not finding the list yields size null. Skipping the
+  // proportion check there would be the same lie as a permanent false
+  // negative — it refuses instead.
+  for (const listSize of [null, undefined, 0, 'abc']) {
+    const r = checkListDeleteCompliance({ requested: 10, listSize });
+    assert.equal(r.ok, false, `size ${JSON.stringify(listSize)} must refuse`);
+    assert.match(r.violations.join(';'), /list size unknown|proportion guard cannot be evaluated/);
+  }
+});
+
+test('decideImportPollReschedule: backs off, then stops deferring forever', () => {
+  const now = Date.parse('2026-08-12T12:00:00Z');
+  const first = decideImportPollReschedule(0, now);
+  assert.equal(first.reschedule, true);
+  assert.equal(first.attempt, 1, 'attempt counter advances so the ceiling is reachable');
+  assert.equal(first.reason, 'five9_import_running');
+  assert.equal(first.retryAt, new Date(now + 15_000).toISOString());
+  // Monotonic backoff, clamped.
+  const delays = [0, 1, 2, 3, 4, 10].map(a => decideImportPollReschedule(a, now).delayMs);
+  for (let i = 1; i < delays.length; i++) assert.ok(delays[i] >= delays[i - 1], `backoff must not shrink: ${delays}`);
+  assert.ok(delays.every(d => d <= 120_000), `clamped to maxMs: ${delays}`);
+  // A wedged job eventually stops deferring instead of parking forever.
+  const done = decideImportPollReschedule(40, now);
+  assert.equal(done.reschedule, false);
+  assert.equal(done.reason, 'five9_import_poll_attempts_exhausted');
+  assert.equal(decideImportPollReschedule(3, now, { maxAttempts: 3 }).reschedule, false);
+});
+
+test('verifyListDeleteCounts: agreement verifies, disagreement REPORTS and never throws', () => {
+  // All three agree — verified.
+  assert.deepEqual(verifyListDeleteCounts({ declared: 2, deletedReported: 2, sizeDelta: 2 }), []);
+  // Five9 deleted fewer than asked: reported, with both numbers, not thrown.
+  const short = verifyListDeleteCounts({ declared: 500, deletedReported: 480, sizeDelta: 480 });
+  assert.equal(short.length, 2);
+  assert.deepEqual(short[0], { field: 'listRecordsDeleted', expected: 500, actual: 480 });
+  assert.deepEqual(short[1], { field: 'size_delta', expected: 500, actual: 480 });
+  // The delete count is right but the list moved by less — the incremental
+  // feed landed mid-job. Reported on size_delta alone, so the operator can
+  // see WHICH signal disagreed rather than a bare verified:false.
+  const feed = verifyListDeleteCounts({ declared: 2, deletedReported: 2, sizeDelta: 1 });
+  assert.deepEqual(feed, [{ field: 'size_delta', expected: 2, actual: 1 }]);
+});
+
+test('verifyListDeleteCounts: an unreadable count is a mismatch, never a silent pass', () => {
+  // The quiet-lie case: if listRecordsDeleted or the size delta cannot be
+  // read, "no mismatch found" would report verified:true for something
+  // nothing looked at. Both null cases must surface.
+  assert.deepEqual(
+    verifyListDeleteCounts({ declared: 2, deletedReported: null, sizeDelta: 2 }),
+    [{ field: 'listRecordsDeleted', expected: 2, actual: null }],
+  );
+  assert.deepEqual(
+    verifyListDeleteCounts({ declared: 2, deletedReported: 2, sizeDelta: null }),
+    [{ field: 'size_delta', expected: 2, actual: null }],
+  );
+  assert.equal(verifyListDeleteCounts({ declared: 2 }).length, 2, 'both unreadable → both reported');
+  // Numeric strings off the SOAP parse still compare by value.
+  assert.deepEqual(verifyListDeleteCounts({ declared: 2, deletedReported: '2', sizeDelta: '2' }), []);
+});
+
+test('executeAsyncDeleteRecordsFromList: payload errors fire BEFORE any read or lock', async () => {
+  // Every rejection below happens before withFive9WriteGate is entered, so
+  // they need no creds, no DB and no network — which is exactly the point:
+  // a malformed bulk-delete payload must never reach the write path, and
+  // must never acquire the fleet-wide lock on its way to failing.
+  const base = {
+    id: 1,
+    action_type: 'five9_async_delete_records_from_list',
+    requires_approval: true,
+  };
+  const ok = {
+    list_name: 'L',
+    field_names: ['number1'],
+    records: [['555'], ['666']],
+    confirm_token: 'L',
+    expected_record_count: 2,
+  };
+  await assert.rejects(
+    executeAsyncDeleteRecordsFromList({ ...base, action_payload: { ...ok, list_name: '' } }),
+    /requires action_payload\.list_name/,
+  );
+  // Builder validation precedes the token check.
+  await assert.rejects(
+    executeAsyncDeleteRecordsFromList({ ...base, action_payload: { ...ok, list_delete_mode: 'NUKE' } }),
+    /invalid list_delete_mode/,
+  );
+  await assert.rejects(
+    executeAsyncDeleteRecordsFromList({ ...base, action_payload: { ...ok, records: [['555'], ['666', 'x']] } }),
+    /mismatch at record 1/,
+  );
+  // confirm_token must restate the list name verbatim.
+  await assert.rejects(
+    executeAsyncDeleteRecordsFromList({ ...base, action_payload: { ...ok, confirm_token: 'l' } }),
+    /confirm_token mismatch/,
+  );
+  await assert.rejects(
+    executeAsyncDeleteRecordsFromList({ ...base, action_payload: { ...ok, confirm_token: undefined } }),
+    /confirm_token mismatch/,
+  );
+  // ...and the declared count must reconcile with what was serialized.
+  await assert.rejects(
+    executeAsyncDeleteRecordsFromList({ ...base, action_payload: { ...ok, expected_record_count: undefined } }),
+    /requires action_payload\.expected_record_count/,
+  );
+  await assert.rejects(
+    executeAsyncDeleteRecordsFromList({ ...base, action_payload: { ...ok, expected_record_count: 3 } }),
+    /expected_record_count 3 !== 2/,
+  );
+});
+
+test('executeAsyncDeleteRecordsFromList: a well-formed payload reaches the read gate, not a mutation', async () => {
+  // With the flag off and no creds, a VALID payload gets past every pure
+  // guardrail and dies on the read-before-write (getListsInfo) — proving the
+  // guardrails passed it through rather than short-circuiting, and that the
+  // dry-run path still cannot mutate. Same shape as the Phase C ships-dark
+  // test above.
+  const saved = { flag: process.env.FIVE9_WRITES_ENABLED, u: process.env.FIVE9_USERNAME, p: process.env.FIVE9_PASSWORD };
+  try {
+    delete process.env.FIVE9_WRITES_ENABLED;
+    delete process.env.FIVE9_USERNAME;
+    delete process.env.FIVE9_PASSWORD;
+    await assert.rejects(
+      executeAsyncDeleteRecordsFromList({
+        id: 1,
+        action_type: 'five9_async_delete_records_from_list',
+        requires_approval: true,
+        action_payload: {
+          list_name: 'Sale - Completed 0-2yrs',
+          field_names: ['number1'],
+          records: [['5551234567'], ['5559876543']],
+          confirm_token: 'Sale - Completed 0-2yrs',
+          expected_record_count: 2,
+        },
+      }),
+      /credentials not configured/,
+    );
+  } finally {
+    for (const [k, env] of [['flag', 'FIVE9_WRITES_ENABLED'], ['u', 'FIVE9_USERNAME'], ['p', 'FIVE9_PASSWORD']]) {
+      if (saved[k] === undefined) delete process.env[env];
+      else process.env[env] = saved[k];
+    }
+  }
 });
