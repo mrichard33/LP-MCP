@@ -689,6 +689,40 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
     const { data: factRows, error: finErr } = await supabase
       .rpc('lp_csv_ingest_finalize', { p_snapshot_id: snapshotId });
     if (finErr) throw new Error(finErr.message);
+
+    // Bridge into the Net — Released hero, exactly as the PDF path does
+    // (lp-report-ingest.js §9).
+    //
+    // THE DEFECT THIS CLOSES (found 2026-08-12). `lp_market_scorecard_daily`'s
+    // `released_dollars` and `revenue_as_of` are sourced ONLY from
+    // `lp_net_report_rtp`, and the PDF path has projected into it since
+    // 2026-08-05. The CSV path never did. So when LP moved report 134 from the
+    // Report Scheduler (PDF) to the Export Scheduler (CSV), every ingest after
+    // the cutover stored a perfectly good snapshot — rows, facts, control
+    // totals, all green — while `revenue_as_of` stayed frozen at the last PDF's
+    // 2026-08-06 and the dashboard kept reporting a date six days stale.
+    //
+    // Silent by construction: the snapshot succeeds, so nothing fails, alerts,
+    // or retries. Only the derived date stops moving.
+    //
+    // Dynamic import keeps the module cycle broken (lp-report-backfill imports
+    // lp-report-ingest, which this file imports).
+    //
+    // The snapshot is already durable and promoted at this point; a failing
+    // projection is reported and alerted, never silently swallowed, and never
+    // retracts a good snapshot.
+    let netProjection = null;
+    if (reportType === 'jobs_by_milestone') {
+      try {
+        const { projectSnapshotToNetReport } = await import('./lp-report-backfill.js');
+        netProjection = await projectSnapshotToNetReport(snapshotId);
+      } catch (err) {
+        netProjection = { projected: false, reason: 'projection_failed', error: err.message };
+        console.error(`[LPCsv] net-report projection failed for ${snapshotId}: ${err.message}`);
+        await alertGroupMe(`⚠️ LP report ${reportType} ingested (snapshot ${snapshotId}) but the Net — Released projection FAILED: ${err.message}. The dashboard hero will read a stale revenue_as_of until this is fixed.`);
+      }
+    }
+
     // A warned file is NOT a clean one. The CSV path used to write 'success'
     // unconditionally, so the only way to tell a file that broke an arithmetic
     // identity from one that did not was to read detail->'warnings'. That was
@@ -697,9 +731,9 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
     // warning is now the ONLY signal that a month came in with a delta.
     const warned = Array.isArray(extraDetail.warnings) && extraDetail.warnings.length > 0;
     await done(warned ? 'succeeded_with_warnings' : 'success',
-      { snapshot_id: snapshotId, detail: { ...extraDetail, control_totals: controlTotals, fact_rows: factRows } });
-    console.log(`[LPCsv] ${reportType} ingested${warned ? ` WITH ${extraDetail.warnings.length} warning(s)` : ''}: ${rows.length} rows, snapshot ${snapshotId}, ${factRows} fact rows`);
-    return { success: true, snapshot_id: snapshotId, rows: rows.length, fact_rows: factRows, sha256: sha, ...extraDetail };
+      { snapshot_id: snapshotId, detail: { ...extraDetail, control_totals: controlTotals, fact_rows: factRows, ...(netProjection ? { net_projection: netProjection } : {}) } });
+    console.log(`[LPCsv] ${reportType} ingested${warned ? ` WITH ${extraDetail.warnings.length} warning(s)` : ''}: ${rows.length} rows, snapshot ${snapshotId}, ${factRows} fact rows${netProjection?.projected ? `, net-report projected ${netProjection.total_net} as of ${netProjection.report_as_of}` : ''}`);
+    return { success: true, snapshot_id: snapshotId, rows: rows.length, fact_rows: factRows, sha256: sha, ...extraDetail, ...(netProjection ? { net_projection: netProjection } : {}) };
   } catch (err) {
     // Assertion failures inside finalize are content failures: the snapshot
     // stays non-current and inert. Log + alert, return 200 success:false.
