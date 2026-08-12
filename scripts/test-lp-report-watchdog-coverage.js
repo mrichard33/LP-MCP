@@ -37,7 +37,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 import { WATCHED } from '../src/jobs/lp-report-watchdog.js';
-import { REPORT_FINGERPRINTS } from '../src/jobs/lp-report-csv-common.js';
+import { REPORT_FINGERPRINTS, REPORT_VARIANTS } from '../src/jobs/lp-report-csv-common.js';
 
 const WATCHDOG = readFileSync('src/jobs/lp-report-watchdog.js', 'utf8');
 const GROUPME = readFileSync('src/groupme.js', 'utf8');
@@ -54,7 +54,16 @@ const WATCHDOG_CODE = strip(WATCHDOG);
  * would look unlandable if this guard checked slugs, which is exactly the
  * wrong answer for a feed that ingests daily.
  */
-const landable = new Set(REPORT_FINGERPRINTS.map((f) => f.reportType));
+// …AND THE FINGERPRINT IS NOT ALWAYS ENOUGH EITHER. 137's By Market and By
+// Setter share one header, so they share one fingerprint; the grouping resolves
+// off the `xGrouper` DATA column via resolveVariant, and a variant lands under
+// its own report_type. A landability check that consulted fingerprints alone
+// would call `sales_efficiency_by_setter` unlandable and refuse to let it be
+// watched — the same wrong answer, one level down, that the slug check gave 138.
+const landable = new Set([
+  ...REPORT_FINGERPRINTS.map((f) => f.reportType),
+  ...Object.values(REPORT_VARIANTS).flatMap((spec) => Object.values(spec.map)),
+]);
 const watchedTypes = WATCHED.map((w) => w.type);
 
 // ─── The watched set matches what actually lands ────────────────────
@@ -68,6 +77,21 @@ test('every watched type is one the ingest layer can actually resolve', () => {
       landable.has(type),
       `WATCHED type "${type}" is not in REPORT_FINGERPRINTS — it can never ingest, so it will alarm every day and guard nothing`,
     );
+  }
+});
+
+test('every 137 variant that lands as its own type is watched', () => {
+  // A variant is a separate FEED — its own LP schedule, its own failure mode.
+  // `knownUnstored` variants (By Source) are deliberately excluded: they are
+  // archived and logged and store no rows, so there is nothing to go stale.
+  for (const [base, spec] of Object.entries(REPORT_VARIANTS)) {
+    for (const type of Object.values(spec.map)) {
+      assert.ok(
+        watchedTypes.includes(type),
+        `${base} variant "${type}" lands as its own report_type but is not watched — ` +
+          `a schedule that never runs and one that silently stops look identical`,
+      );
+    }
   }
 });
 
@@ -152,8 +176,22 @@ test('arming still requires a scheduled (n8n-sourced) success', () => {
 test('the ingest route still honours ?source=n8n, which is what arms a watch', () => {
   // Anti-vacuity for the workflow-side half of this fix. If the route stopped
   // reading the query param, every feed would silently disarm again.
+  //
+  // ⚠️ REPAIRED 2026-08-13, and it was failing BEFORE this branch touched
+  // anything. The assertion pinned one SYNTACTIC SHAPE — the inline object
+  // property `source: String(req.query.source || 'manual')` — and the route
+  // has since been refactored to lift it into a local:
+  //
+  //     const source = String(req.query.source || 'manual');
+  //
+  // Identical behaviour, and the guard went red anyway. A structural test that
+  // fails on a behaviour-preserving refactor teaches people to ignore it, which
+  // costs more than the bug it was watching for. It now accepts either form
+  // while still asserting the two things that matter: the query param IS read,
+  // and it defaults to 'manual' rather than to 'n8n' (which would let a manual
+  // backfill arm a watch — the exact failure the arming gate exists to stop).
   const CSV = readFileSync('src/jobs/lp-csv-ingest.js', 'utf8');
-  assert.match(CSV, /source: String\(req\.query\.source \|\| 'manual'\)/);
+  assert.match(CSV, /(?:source:|const source =)\s*String\(req\.query\.source \|\| 'manual'\)/);
 });
 
 // ─── Alert routing ──────────────────────────────────────────────────
@@ -182,7 +220,9 @@ test('the fingerprint registry still describes the whole feed set', () => {
   // the watched list shrinking in step with it.
   assert.ok(REPORT_FINGERPRINTS.length >= 6,
     'REPORT_FINGERPRINTS has fewer entries than there are LP report feeds');
-  assert.ok(WATCHED.length >= 6, 'WATCHED shrank — a feed lost its guard');
+  // Seven guards over six fingerprints: 137 is two scheduled feeds sharing one
+  // header (By Market, By Setter), and each needs its own watch.
+  assert.ok(WATCHED.length >= 7, 'WATCHED shrank — a feed lost its guard');
   // Reports 133–138 are the live series; a gap means one was dropped.
   const ids = REPORT_FINGERPRINTS.map((f) => f.lpReportId).sort();
   assert.deepEqual(ids, ['133', '134', '135', '136', '137', '138']);

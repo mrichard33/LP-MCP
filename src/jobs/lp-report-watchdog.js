@@ -46,6 +46,26 @@ const WATCHED = [
   { type: 'lead_disposition', label: 'Report 135 "Lead Disposition Detail" (leads/funnel/source)', schedule: '6:30 ET' },
   { type: 'source_cost', label: 'Report 136 "Marketing Sub-Source Cost" (marketing cost)', schedule: '6:45 ET' },
   { type: 'sales_efficiency', label: 'Report 137 "Sales Efficiency By Market" (per-market funnel)', schedule: '7:00 ET' },
+  // 137 NEEDS TWO SCHEDULED RUNS, and they are two feeds, not one.
+  //
+  // By Market and By Setter export a BYTE-IDENTICAL header; only the `xGrouper`
+  // echo column distinguishes them, which is why resolveVariant reads row 1 and
+  // routes on the DATA value (REPORT_VARIANTS, lp-report-csv-common.js). That
+  // routing has been in place since 2026-08-13 and works — but no By Setter file
+  // has ever landed, because the LP-side schedule for it does not exist yet.
+  //
+  // Watching it is what makes that absence audible. Without an entry here, a
+  // schedule that is never created and a schedule that silently stops look
+  // identical from this side: nothing ingests, and nothing says so.
+  //
+  // ⚠️ It arms only after its first n8n-sourced success (see UNARMED_SENTINEL
+  // below), so adding it does NOT start a daily alarm for a feed that has never
+  // run. It stays in `unarmed` until the schedule exists, which is the honest
+  // state and is separately reported.
+  { type: 'sales_efficiency_by_setter', label: 'Report 137 "Sales Efficiency By Setter" (call-center cohort)', schedule: '7:05 ET' },
+  // TIER 1, not secondary. Under the v4 contract 138 owns the call-center
+  // funnel outright, so its ingest has to be as reliable as 137's — same guard,
+  // same alert path, no "it's only supporting data" exemption.
   { type: 'appt_stats_by_rep_source', label: 'Report 138 "Appointment Stats by Sales Rep with Source"', schedule: '7:15 ET' },
 ];
 
