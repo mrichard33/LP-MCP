@@ -285,6 +285,95 @@ export function detectReportFromHeader(header) {
   return { reportType: matches[0].reportType, lpReportId: matches[0].lpReportId };
 }
 
+// ─── Variant routing (§C.2) ─────────────────────────────────────────────────
+//
+// Some LP reports emit BYTE-IDENTICAL headers for what are semantically
+// different reports. 137 is the case: "By Market", "By Setter" and "By Source"
+// are the same report re-grouped, so `Grouper` holds a branch code on one, a
+// setter name on the next and a lead source on the third — and the header row
+// cannot tell them apart. detectReportFromHeader is therefore necessary but not
+// sufficient, and is deliberately left alone: it answers "which report", and
+// this answers "which grouping of it".
+//
+// The discriminator is `xGrouper`, one of LP's echo columns — a DATA column,
+// present on every row, absent from the header. Resolution has to read row 1.
+//
+// Left unrouted, a By Setter file lands in lp_sales_efficiency_history with
+// setter names in branch_code_raw, and — because content identity is keyed on
+// report_type — can take `is_current` from the By Market snapshot the Scorecard
+// reads. That is a market-level revenue number silently becoming a setter-level
+// one. This already happened once: the By Source export ingested 2026-08-11 put
+// 29 rows of lead sources (Bing PPC, HomeBuddy, Modernize …) into the market
+// table, every one of them UNRESOLVED.
+
+export const REPORT_VARIANTS = {
+  sales_efficiency: {
+    column: 'xGrouper',
+    map: {
+      'by market': 'sales_efficiency',
+      'by setter': 'sales_efficiency_by_setter',
+    },
+    // Recognised, deliberately NOT stored. These files are archived and logged
+    // and nothing more — no rows, no alert. Keeping this list explicit is what
+    // lets the unknown-variant alert stay loud: an operator who sees one is
+    // seeing a grouping nobody has decided about yet, not a Tuesday.
+    knownUnstored: ['by source'],
+  },
+};
+
+/** Normalised form for variant comparison — LP's echo casing is not stable. */
+const variantKey = (raw) => String(raw ?? '').trim().toLowerCase();
+
+/**
+ * Resolve a report VARIANT from the first data row, for reports whose header
+ * fingerprint is identical across groupings.
+ *
+ * Fails CLOSED. An unrecognised value throws rather than defaulting to the
+ * market variant, because defaulting is precisely what writes setter names into
+ * branch_code_raw. Note this is a different question from §F's
+ * UNRESOLVED-not-rejected doctrine for unknown BRANCH codes: an unmapped branch
+ * is a mapping gap inside a file we understand, while an unmapped variant means
+ * we do not know what the file IS, and there is no safe table to put it in.
+ *
+ * Reports absent from REPORT_VARIANTS pass through untouched — the other five
+ * have no xGrouper and must not start failing.
+ *
+ * @param {string} reportType  as returned by detectReportFromHeader
+ * @param {string[]} header    row 0
+ * @param {string[]} firstDataRow  row 1 — the echo columns repeat on every row
+ * @returns {{reportType: string, variant: string|null, knownUnstored: boolean}}
+ * @throws {Error} 'unknown_report_variant' when the column is missing or unmapped
+ */
+export function resolveVariant(reportType, header, firstDataRow) {
+  const spec = REPORT_VARIANTS[reportType];
+  if (!spec) return { reportType, variant: null, knownUnstored: false };
+
+  const idx = (header ?? []).findIndex(
+    (h) => variantKey(h) === variantKey(spec.column),
+  );
+  const raw = idx === -1 ? undefined : firstDataRow?.[idx];
+  const value = variantKey(raw);
+
+  const fail = (detail) => {
+    const err = new Error('unknown_report_variant');
+    err.failureReason = 'unknown_report_variant';
+    err.detail = { report_type: reportType, column: spec.column, ...detail };
+    throw err;
+  };
+
+  if (idx === -1) fail({ reason: 'column_absent', header_columns: header?.length ?? 0 });
+  if (!value) fail({ reason: 'value_empty' });
+
+  const mapped = spec.map[value];
+  if (mapped) return { reportType: mapped, variant: value, knownUnstored: false };
+
+  if ((spec.knownUnstored ?? []).includes(value)) {
+    return { reportType, variant: value, knownUnstored: true };
+  }
+
+  return fail({ reason: 'value_unmapped', value, known: Object.keys(spec.map) });
+}
+
 /**
  * Row sort keys per report — the business key that makes content identity
  * independent of LP's sort-order parameters (§E).
@@ -317,4 +406,7 @@ export const CONTENT_SORT_KEYS = {
   sales_efficiency: ['Grouper'],     // (inert — parsed rows carry branch_code_raw)
   // 138's grain is one row per (rep, source); neither column alone is unique.
   appt_stats_by_rep_source: ['salesrep_raw', 'src_id_raw'],
+  // Like 138 and unlike the five above: new, no history to disturb, and named
+  // for the field the PARSER emits — so this one actually sorts.
+  sales_efficiency_by_setter: ['setter_name_raw'],
 };
