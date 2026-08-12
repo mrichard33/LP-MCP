@@ -116,9 +116,20 @@ const GROUPME_GROUP_ID = process.env.GROUPME_GROUP_ID || '';
 // Canvass-channel cards (SMS-CONFIRMED, TIME CHANGE, intake alerts) route
 // here; everything else stays on the main bot.
 const GROUPME_CANVASS_BOT_ID = process.env.GROUPME_CANVASS_BOT_ID || '';
+// Per-purpose bot for low-volume OPERATIONAL alarms — feed-freshness and the
+// like, where being seen matters more than being near the lead traffic.
+//
+// Added 2026-08-12. Report 134 stopped ingesting for six days; the watchdog
+// alerted correctly every morning into the main channel, which carries
+// hundreds of per-lead cards plus a repeating queue-backlog ping, and the
+// alarm was never seen. The outage surfaced when a person read a stale date
+// on a dashboard. Unset until a group exists — and unset is harmless, because
+// the fallback below keeps every message on the main bot.
+const GROUPME_OPS_BOT_ID = process.env.GROUPME_OPS_BOT_ID || '';
 const SELF_BASE_URL = `http://localhost:${process.env.PORT || 8080}`;
 
 let warnedCanvassFallback = false;
+let warnedOpsFallback = false;
 
 /**
  * Resolve a logical channel name to a GroupMe bot ID. Unknown/absent
@@ -131,6 +142,13 @@ function _resolveBotId(channel) {
     if (!warnedCanvassFallback) {
       console.warn('[GroupMe] GROUPME_CANVASS_BOT_ID unset — canvass-channel messages fall back to the main bot');
       warnedCanvassFallback = true;
+    }
+  }
+  if (channel === 'ops') {
+    if (GROUPME_OPS_BOT_ID) return GROUPME_OPS_BOT_ID;
+    if (!warnedOpsFallback) {
+      console.warn('[GroupMe] GROUPME_OPS_BOT_ID unset — ops-channel messages fall back to the main bot');
+      warnedOpsFallback = true;
     }
   }
   return GROUPME_BOT_ID;
