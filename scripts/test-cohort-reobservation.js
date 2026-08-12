@@ -114,3 +114,43 @@ test('month names are correct at both ends of the year', () => {
   const dec = buildStaleAlert({ stale_count: 1, stale: [cohort({ contract_month: '2026-12-01', days_since_observed: 99 })] });
   assert.match(dec, /Dec 2026/);
 });
+
+// ═══ The blocking current-month export ════════════════════════════════
+
+const blocked = { id: 'abc', period_start: '2026-08-01', period_end: '2026-08-31', scope: 'mtd' };
+
+test('a blocking current-month export is reported even when nothing is stale', () => {
+  // It is not a missing observation — it is an active blockage, and it can be
+  // the ONLY thing wrong. Gating it behind stale_count would hide it entirely
+  // for the ~2 days before the current month also trips its own threshold.
+  const text = buildStaleAlert({ stale_count: 0, stale: [], blocking_full_month_export: blocked });
+  assert.ok(text);
+  assert.match(text, /BLOCKING the daily report-137 ingest/);
+  assert.match(text, /2026-08-01 → 2026-08-31/);
+});
+
+test('its remedy is to REMOVE a schedule, not add one', () => {
+  // The whole reason this is separated from staleness: the two failures point
+  // in opposite directions. Telling someone to go ask LP for more exports when
+  // the problem is that one export should not exist would waste the day.
+  const text = buildStaleAlert({ stale_count: 0, stale: [], blocking_full_month_export: blocked });
+  assert.match(text, /remove the month-scoped LP export for the CURRENT month/i);
+  assert.match(text, /CLOSED months only/);
+  assert.doesNotMatch(text, /Needs an LP schedule/);
+});
+
+test('a blockage and stale cohorts are both reported, blockage first', () => {
+  const text = buildStaleAlert({
+    stale_count: 1,
+    stale: [cohort({ contract_month: '2026-06-01', days_since_observed: 40 })],
+    blocking_full_month_export: blocked,
+  });
+  assert.match(text, /BLOCKING/);
+  assert.match(text, /Jun 2026 \(40d\)/);
+  // Order matters: the blockage is actively breaking ingest right now.
+  assert.ok(text.indexOf('BLOCKING') < text.indexOf('Jun 2026'));
+});
+
+test('no blockage and no staleness stays silent', () => {
+  assert.equal(buildStaleAlert({ stale_count: 0, stale: [], blocking_full_month_export: null }), null);
+});

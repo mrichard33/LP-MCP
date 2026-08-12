@@ -63,6 +63,47 @@ export const REOBSERVATION_STALE_DAYS = 35;
 export const CURRENT_MONTH_STALE_DAYS = 2;
 
 /**
+ * ⚠️ THE ONE WAY A WELL-INTENTIONED LP SCHEDULE BREAKS THE DAILY INGEST.
+ *
+ * `lp_csv_ingest_finalize` demotes on daterange OVERLAP within the {mtd, month}
+ * scope FAMILY, and since 2026-08-11 it also refuses to promote a snapshot
+ * covering strictly LESS of the period than the current one.
+ *
+ * Both rules are right. Together they mean a month-scoped export for the
+ * CURRENT month is poison:
+ *
+ *   1. An Aug 1–31 file lands mid-month. It overlaps the daily rolling window
+ *      (Aug 1–12) and its period_end is later, so it wins and demotes it.
+ *   2. Every subsequent daily file — Aug 1–13, Aug 1–14, … — now covers
+ *      strictly LESS than Aug 31, so coverage-recency REFUSES to promote it.
+ *   3. The current month freezes for the rest of the month on a file generated
+ *      mid-month that claims to cover all of it.
+ *
+ * Verified against the live function 2026-08-12. Closed months are unaffected —
+ * Jul 1–31 does not overlap Aug 1–12 — and a re-pull of the SAME closed month
+ * is equal coverage, which still wins, so maturation works exactly as intended.
+ *
+ * So: schedule month-scoped exports for CLOSED months only. This detects the
+ * mistake if it is made, because the symptom (a dashboard that quietly stops
+ * advancing) looks nothing like the cause.
+ */
+export async function detectBlockingFullMonthExport() {
+  const rows =
+    (await runSQL(`
+      SELECT id::text, period_start::text, period_end::text, as_of_date::text, scope
+        FROM scorecard_report_snapshots
+       WHERE report_type = 'sales_efficiency'
+         AND is_current
+         AND scope IN ('mtd', 'month')
+         AND period_start = date_trunc('month', CURRENT_DATE)::date
+         AND period_end > CURRENT_DATE
+       ORDER BY period_end DESC
+       LIMIT 1
+    `)) || [];
+  return rows[0] || null;
+}
+
+/**
  * Read `lp_cohort_reobservation` and mark which cohorts have gone stale.
  *
  * The view already answers WHICH cohorts still need re-pulling and why (the
@@ -101,10 +142,15 @@ export async function getCohortReobservationStatus() {
   });
 
   const stale = cohorts.filter((c) => c.stale);
+  const blockingFullMonth = await detectBlockingFullMonthExport();
   return {
     cohorts,
     stale,
     stale_count: stale.length,
+    // Non-null means a current-month export is blocking the daily rolling file.
+    // See detectBlockingFullMonthExport — the symptom is a dashboard that
+    // quietly stops advancing, which looks nothing like the cause.
+    blocking_full_month_export: blockingFullMonth,
     checked_at: new Date().toISOString().slice(0, 10),
   };
 }
@@ -117,6 +163,29 @@ function describe(c) {
 }
 
 export function buildStaleAlert(status) {
+  const blocked = status.blocking_full_month_export;
+  if (!status.stale_count && !blocked) return null;
+
+  // Reported FIRST and separately: this is not a missing observation, it is an
+  // active blockage, and the fix is to delete an LP schedule rather than add
+  // one. Conflating it with staleness would send someone to ask LP for MORE
+  // exports when the problem is that one of them should not exist.
+  if (blocked) {
+    const lines = [
+      `⚠️ A current-month export is BLOCKING the daily report-137 ingest.`,
+      `Snapshot covers ${blocked.period_start} → ${blocked.period_end}, past today. ` +
+        `Every daily file now covers strictly less of that period, so promotion ` +
+        `refuses them and the current month has stopped advancing.`,
+      `Fix: remove the month-scoped LP export for the CURRENT month. ` +
+        `Month-scoped exports are for CLOSED months only.`,
+    ];
+    if (!status.stale_count) return lines.join('\n');
+    return [lines.join('\n'), '', buildStaleLines(status)].join('\n');
+  }
+  return buildStaleLines(status);
+}
+
+function buildStaleLines(status) {
   if (!status.stale_count) return null;
   const current = status.stale.filter((c) => c.reason === 'current_month');
   const prior = status.stale.filter((c) => c.reason !== 'current_month');

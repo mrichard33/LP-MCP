@@ -102,6 +102,30 @@ Nothing on our side needs to change when these start arriving, verified
 that pair yields `2026-09-01..2026-08-31` — an end before its start, which the
 ingest rejects as `inverted_period`.
 
+⚠️⚠️ **CLOSED MONTHS ONLY. Never schedule a month-scoped export for the CURRENT
+month.** This is the one well-intentioned schedule that breaks the daily ingest,
+and the symptom looks nothing like the cause.
+
+`lp_csv_ingest_finalize` demotes on daterange OVERLAP within the `{mtd, month}`
+scope family, and since 2026-08-11 it also refuses to promote a snapshot
+covering strictly LESS of the period than the current one. Both rules are
+correct. Together:
+
+1. An `Aug 1–31` export lands mid-month. It overlaps the daily rolling window
+   (`Aug 1–12`) and its `period_end` is later, so it wins and demotes it.
+2. Every subsequent daily file — `Aug 1–13`, `Aug 1–14`, … — now covers strictly
+   less than `Aug 31`, so coverage-recency **refuses to promote it**.
+3. The current month freezes for the rest of the month, on a file generated
+   mid-month that claims to cover all of it. The dashboard quietly stops
+   advancing; nothing errors.
+
+Verified against the live function 2026-08-12. Closed months are unaffected —
+`Jul 1–31` does not overlap `Aug 1–12` — and a re-pull of the SAME closed month
+is *equal* coverage, which still wins, so maturation works exactly as intended.
+
+`I.LPRG` detects this condition and alerts separately from staleness, because
+the remedy is the opposite: **remove** an export rather than add one.
+
 **The monitor.** `I.LPRG Cohort Re-observation Monitor` (n8n
 `NjIimzOjiuuddigd`) checks daily and alerts GroupMe when a cohort goes
 unobserved — >2 days for the current month (the daily 137 email has stopped),
