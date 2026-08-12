@@ -60,6 +60,56 @@ because it is generated *after* `period_end` it is the snapshot that closes the
 period. Without it, `period_closed_at` stays NULL forever and every closed month
 is represented by a file that stops partway through its last day.
 
+## Schedule change — the cohort re-observation exports (§8, 2026-08-12)
+
+The `[BOPM]`/`[EOPM]` closing pull above re-observes the **most recent closed
+month, once**. Cohort maturation needs more than that.
+
+Net Sales — Gross Written − Cancellations − Financing Denied — matures DOWNWARD
+as losses land. Measured 2026-08-12 as a share of gross written:
+
+| cohort age | <1mo | 1mo | 2mo | 3mo | 4–7mo |
+|---|---|---|---|---|---|
+| Net Sales ÷ Gross | 84.8% | 76.3% | 70.4% | 69.1% | 69–73% |
+
+A cohort observed once freezes at its FIRST, HIGHEST reading. July would hold
+76.3% forever instead of settling toward ~70%, and the retention history would
+be wrong in the flattering direction — the dangerous one, because nothing about
+the number looks broken.
+
+**Add a recurring monthly report-137 export for every still-open cohort month**,
+using explicit `t1`/`t2` date ranges (a full calendar month: first day → last
+day). As of 2026-08-12 that is Feb–Jul; each still holds working or hold dollars,
+so each is still moving. `lp_cohort_reobservation` lists exactly which months
+qualify at any moment.
+
+Nothing on our side needs to change when these start arriving, verified
+2026-08-12:
+
+- **I.LPRE is scope-agnostic.** Its Gmail query matches the subject and any
+  `.csv`, with no `newer_than` or read-status filter, so a monthly export is
+  picked up like any other.
+- **Scope comes from the FILE, not the email.** `lp_derive_scope()` returns
+  `'month'` when `period_start` is the first of a month and `period_end` its
+  last day, so a monthly export self-classifies into `lp_cohort_maturation`
+  (which filters `scope IN ('month','mtd')`).
+- **Supersession is already the retention model.** The unique index
+  `(report_type, scope, period_start)` on current snapshots demotes the prior
+  snapshot for that month to history — and that demoted history IS the
+  maturation series.
+
+⚠️ Use explicit month ranges, not `[BOCM]`/`[DAYOFFSET(-1)]`. Run on the 1st,
+that pair yields `2026-09-01..2026-08-31` — an end before its start, which the
+ingest rejects as `inverted_period`.
+
+**The monitor.** `I.LPRG Cohort Re-observation Monitor` (n8n
+`NjIimzOjiuuddigd`) checks daily and alerts GroupMe when a cohort goes
+unobserved — >2 days for the current month (the daily 137 email has stopped),
+>35 days for a prior cohort (the monthly export is missing). It cannot re-pull;
+LP has no report API, so its only job is to make the gap loud. Until these
+exports are scheduled it is the one thing standing between a frozen cohort and
+a silently wrong retention curve.
+
 ## Smoke test — verify
 
 Run in order. Each step is independently checkable; stop if one fails.
