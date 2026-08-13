@@ -16,11 +16,15 @@
  *     type=INBOUND. Main Number / Dispatch are never at risk from here.
  *   - State preconditions: starting a RUNNING campaign or stopping a
  *     NOT_RUNNING one is a skipped no-op, never a blind re-fire.
- *   - confirm_token double-gate on the two highest-risk writes
- *     (five9_set_outbound_campaign, five9_remove_numbers_from_dnc): the
- *     payload must restate its target verbatim (campaign name / the
- *     comma-joined numbers). A typo gate for the creator — the human
- *     forgery gate remains approve_action itself.
+ *   - confirm_token double-gate on the highest-risk writes: the payload must
+ *     restate its target verbatim. A typo gate for the creator — the human
+ *     forgery gate remains approve_action itself. requiredConfirmToken() is
+ *     the authority on which ops carry it and what the token must be; as of
+ *     Phase G that is set_outbound_campaign (campaign name),
+ *     remove_numbers_from_dnc (the comma-joined numbers),
+ *     modify_campaign_profile (profile name), async_delete_records_from_list
+ *     (list name), modify_ivr_script (script name), and
+ *     remove_dnis_from_campaign (campaign name).
  *   - Read-before-write + read-back: previous_state captured before the
  *     SOAP write, new_state re-read after, both carried on the
  *     five9.admin_write audit event emitted on EVERY execution — success
@@ -63,6 +67,13 @@ import {
   // job handle asyncDeleteRecordsFromList returns).
   isImportRunning,
   getListImportResult,
+  // 2026-08-13 Phase G — config-surface reads used for read-before-write,
+  // name-collision checks, the DNIS-steal guard, and read-back verification.
+  getIVRScripts,
+  getPrompts,
+  getDnisMap,
+  getCampaignDNISList,
+  getInboundCampaign,
 } from '../five9-admin.js';
 // 2026-08-05 Phase D — read-before-write for user-skill ops. getUsersFullInfo
 // takes a Five9 userNamePattern regex and returns assigned skills with levels.
@@ -280,6 +291,18 @@ export function requiredConfirmToken(op, payload) {
   // the human gate; this is the typo gate.
   if (op === 'async_delete_records_from_list') {
     return String(payload?.list_name || '').trim();
+  }
+  // 2026-08-13 Phase G — an IVR script is the routing itself. Rewriting one
+  // that a RUNNING inbound campaign answers on changes what every caller
+  // hears, with no staging step between save and live.
+  if (op === 'modify_ivr_script') {
+    return String(payload?.name || '').trim();
+  }
+  // 2026-08-13 Phase G — removing a DNIS dead-ends a live marketing number:
+  // calls to it stop reaching the campaign the moment this lands, and the
+  // number looks fine from the outside. Restate the campaign.
+  if (op === 'remove_dnis_from_campaign') {
+    return String(payload?.campaign_name || '').trim();
   }
   return null; // op not double-gated
 }
@@ -1614,6 +1637,788 @@ export function executeCreateCampaignProfile(action) {
 
       ctx.new_state = await readProfile(name);
       return { profile: name, created: !!ctx.new_state };
+    },
+  );
+}
+
+/* ---------------------------------------------------------------------- *
+ * Phase G (2026-08-13) — config surface writes: IVR scripts, inbound
+ * campaigns, the default IVR schedule, DNIS assignment, and TTS prompts.
+ *
+ * FIELD ORDER BELOW IS WSDL-DERIVED, quoted from the live v13 schema on
+ * 2026-08-13 (api.five9.com/wsadmin/v13/AdminWebService?wsdl&user=x — plain
+ * ?wsdl returns a 403 SOAP Fault, the &user=x suffix is what makes it
+ * fetchable). Read-response order was NOT used to derive any of it. Verbatim
+ * extracts: docs/five9/phase-g-wsdl-v13.md
+ *
+ *   <xs:complexType name="ivrScriptDef"><xs:sequence>
+ *     description, name, xmlDefinition          ← name is SECOND
+ *
+ *   <xs:complexType name="campaignCallWrapup"><xs:sequence>
+ *     agentNotReady, dispostionName, enabled, reasonCodeName, timeout
+ *
+ *   inboundCampaign flattened (campaign → generalCampaign → inboundCampaign):
+ *     description, mode, name, profileName, state, trainingMode, type,
+ *     autoRecord, callWrapup, ftpHost, ftpPassword, ftpUser,
+ *     recordingNameAsSid, useFtp, defaultIvrSchedule, maxNumOfLines
+ *
+ * THREE THINGS HERE LOOK LIKE BUGS AND ARE NOT.
+ *
+ * 1. `dispostionName` is misspelled — in Five9's schema, not ours. It occurs
+ *    exactly once in the whole 961KB document; the correctly spelled
+ *    `dispositionName` occurs 9 times on OTHER types, which is precisely what
+ *    makes this one look like our typo. Emitting the correct spelling raises
+ *    no error and silently sets no wrapup disposition. Do not "fix" it.
+ *
+ * 2. createIVRScript takes ONLY <name>. The definition cannot ride along, so
+ *    creating a working script is necessarily createIVRScript followed by
+ *    modifyIVRScript — two calls, not atomic. executeCreateIvrScript owns
+ *    that seam and compensates with deleteIVRScript when the second fails.
+ *
+ * 3. `DNISList` is capitalised, and inboundCampaign carries
+ *    final="extension restriction" (so the anchored complexType regex cannot
+ *    match it — see the doc's fetch note).
+ *
+ * deleteIVRScript is used ONLY as create-compensation. It is deliberately not
+ * in FIVE9_WRITE_OPS: nothing can queue a script deletion as an action.
+ * ---------------------------------------------------------------------- */
+
+export const IVR_SCRIPT_DEF_FIELD_ORDER = ['description', 'name', 'xmlDefinition'];
+
+export const CAMPAIGN_CALL_WRAPUP_FIELD_ORDER = [
+  'agentNotReady', 'dispostionName', 'enabled', 'reasonCodeName', 'timeout',
+];
+
+export const INBOUND_CAMPAIGN_FIELD_ORDER = [
+  // tns:campaign base sequence
+  'description', 'mode', 'name', 'profileName', 'state', 'trainingMode', 'type',
+  // tns:generalCampaign sequence
+  'autoRecord', 'callWrapup', 'ftpHost', 'ftpPassword', 'ftpUser',
+  'recordingNameAsSid', 'useFtp',
+  // tns:inboundCampaign sequence
+  'defaultIvrSchedule', 'maxNumOfLines',
+];
+
+// Presence in the order array does NOT make a field settable — same rule as
+// OUTBOUND_CAMPAIGN_FIELD_ORDER. The FTP trio and `state` stay in the array
+// because it is a faithful copy of the WSDL sequence; they are not settable.
+export const INBOUND_CAMPAIGN_SETTABLE_FIELDS = new Set([
+  'description', 'mode', 'name', 'trainingMode', 'type',
+  'autoRecord', 'callWrapup', 'useFtp', 'maxNumOfLines',
+]);
+
+export const WRAPUP_DEFAULT_DISPOSITION = 'No Disposition';
+export const WRAPUP_DEFAULT_SECONDS = 180; // 3 min — matches house campaigns
+
+// Same anchoring/escaping as exactUserPattern: Five9 name patterns are
+// regexes on the IVR-script endpoint too, so "Canvass" must not match
+// "Canvass Confirmation". Aliased rather than duplicated.
+export const exactNamePattern = exactUserPattern;
+
+/**
+ * assertWellFormedXml — structural well-formedness check for an IVR script
+ * definition, run BEFORE the SOAP call so a truncated or mismatched document
+ * is refused here rather than half-applied there.
+ *
+ * This is a tag-balance scan, NOT a validating parser: it catches unclosed,
+ * mismatched, and malformed tags — the realistic ways a pasted script arrives
+ * broken — and does not check namespaces, entities, or the Five9 IVR schema
+ * itself. Five9 remains the authority on whether the script is *valid*; this
+ * only refuses input that is not even *XML*. The repo has no XML dependency
+ * (see the five9-admin.js header) and this is not worth adding one for.
+ */
+export function assertWellFormedXml(xml, label = 'xml_definition') {
+  const s = String(xml ?? '');
+  if (!s.trim()) throw new Error(`REFUSED: ${label} is empty`);
+
+  // Remove the constructs that legitimately contain angle brackets, so the
+  // tag scan below cannot trip over their contents.
+  const stripped = s
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, '')
+    .replace(/<\?[\s\S]*?\?>/g, '')
+    .replace(/<!DOCTYPE[^>[]*(?:\[[\s\S]*?\])?[^>]*>/gi, '');
+
+  const stack = [];
+  const tagRe = /<\s*(\/?)\s*([A-Za-z_][\w.:-]*)((?:"[^"]*"|'[^']*'|[^>"'])*?)(\/?)\s*>/g;
+  let m;
+  let cursor = 0;
+  while ((m = tagRe.exec(stripped)) !== null) {
+    // A stray '<' between two well-formed tags is itself malformed.
+    if (stripped.slice(cursor, m.index).includes('<')) {
+      throw new Error(`REFUSED: ${label} is not well-formed XML — malformed tag near character ${cursor}`);
+    }
+    cursor = tagRe.lastIndex;
+    const closing = m[1];
+    const tagName = m[2];
+    const selfClosing = m[4];
+    if (closing) {
+      const open = stack.pop();
+      if (open !== tagName) {
+        throw new Error(
+          `REFUSED: ${label} is not well-formed XML — </${tagName}> closes ${open ? `<${open}>` : 'nothing'}`,
+        );
+      }
+    } else if (!selfClosing) {
+      stack.push(tagName);
+    }
+  }
+  if (stripped.slice(cursor).includes('<')) {
+    throw new Error(`REFUSED: ${label} is not well-formed XML — malformed tag near character ${cursor}`);
+  }
+  if (stack.length) {
+    throw new Error(`REFUSED: ${label} is not well-formed XML — unclosed <${stack[stack.length - 1]}>`);
+  }
+  if (!/<[A-Za-z_]/.test(stripped)) {
+    throw new Error(`REFUSED: ${label} contains no XML elements`);
+  }
+}
+
+/**
+ * checkDnisSteal — P1 attribution guard. Reassigning a number that already
+ * belongs to another campaign silently re-routes a live marketing line: the
+ * number keeps working, so nothing looks broken, and every call from that
+ * source is attributed to the wrong campaign from then on. Refused unless the
+ * payload carries compliance_override === true.
+ *
+ * A number already on the target campaign is not a conflict — that is a
+ * no-op re-add, not a steal.
+ */
+export function checkDnisSteal(dnisList, assignments, targetCampaign, { complianceOverride = false } = {}) {
+  const target = String(targetCampaign || '').toLowerCase();
+  const conflicts = [];
+  for (const number of dnisList) {
+    const owner = assignments?.[number];
+    if (owner && String(owner).toLowerCase() !== target) {
+      conflicts.push({ dnis: number, current_campaign: owner });
+    }
+  }
+  const violations = conflicts.map(c => `${c.dnis} currently routes to "${c.current_campaign}"`);
+  if (violations.length && complianceOverride !== true) {
+    return { ok: false, violations, conflicts };
+  }
+  return { ok: true, violations, conflicts, overridden: violations.length > 0 };
+}
+
+/* ---- Phase G pure builders --------------------------------------------- */
+
+// createIVRScript and deleteIVRScript both take a bare <name>.
+export function buildIvrScriptNameXml(name) {
+  const n = String(name || '').trim();
+  if (!n) throw new Error('script name is required');
+  return `<name>${escapeXml(n)}</name>`;
+}
+
+// modifyIVRScript takes <scriptDef> holding a full ivrScriptDef.
+export function buildIvrScriptDefXml(scriptName, { description, xmlDefinition } = {}) {
+  const name = String(scriptName || '').trim();
+  if (!name) throw new Error('script name is required');
+  const merged = { description, name, xmlDefinition };
+  let xml = '';
+  for (const field of IVR_SCRIPT_DEF_FIELD_ORDER) {
+    const v = merged[field];
+    if (v === undefined || v === null) continue;
+    xml += `<${field}>${escapeXml(v)}</${field}>`;
+  }
+  return `<scriptDef>${xml}</scriptDef>`;
+}
+
+export function buildCallWrapupXml(wrapup = {}) {
+  let xml = '';
+  for (const field of CAMPAIGN_CALL_WRAPUP_FIELD_ORDER) {
+    const v = wrapup[field];
+    if (v === undefined || v === null) continue;
+    // timeout is tns:timer{days,hours,minutes,seconds}, not a scalar.
+    xml += field === 'timeout'
+      ? secondsToTimerXml('timeout', v)
+      : `<${field}>${escapeXml(v)}</${field}>`;
+  }
+  return `<callWrapup>${xml}</callWrapup>`;
+}
+
+export function buildInboundCampaignXml(campaign) {
+  const name = String(campaign?.name || '').trim();
+  if (!name) throw new Error('campaign name is required');
+  for (const key of Object.keys(campaign)) {
+    if (!INBOUND_CAMPAIGN_SETTABLE_FIELDS.has(key)) {
+      throw new Error(`REFUSED: "${key}" is not a settable inbound campaign field (allowed: ${[...INBOUND_CAMPAIGN_SETTABLE_FIELDS].join(', ')})`);
+    }
+  }
+  let xml = '';
+  for (const field of INBOUND_CAMPAIGN_FIELD_ORDER) {
+    const v = campaign[field];
+    if (v === undefined || v === null) continue;
+    xml += field === 'callWrapup'
+      ? buildCallWrapupXml(v)
+      : `<${field}>${escapeXml(v)}</${field}>`;
+  }
+  return `<campaign>${xml}</campaign>`;
+}
+
+// addDNISToCampaign / removeDNISFromCampaign — note the capitalised DNISList.
+export function buildCampaignDnisXml(campaignName, dnis) {
+  const name = String(campaignName || '').trim();
+  if (!name) throw new Error('campaign_name is required');
+  const list = (Array.isArray(dnis) ? dnis : [dnis])
+    .map(n => String(n ?? '').trim()).filter(Boolean);
+  if (!list.length) throw new Error('dnis[] is required');
+  return `<campaignName>${escapeXml(name)}</campaignName>` +
+    list.map(n => `<DNISList>${escapeXml(n)}</DNISList>`).join('');
+}
+
+// setDefaultIVRSchedule — params / isVisualModeEnabled / isChatEnabled are
+// all minOccurs="0" and deliberately not sent: this op exists to point a
+// campaign at a script, and sending visual-mode flags we did not compute
+// would overwrite whatever the domain has set.
+export function buildSetDefaultIvrScheduleXml(campaignName, scriptName) {
+  const campaign = String(campaignName || '').trim();
+  const script = String(scriptName || '').trim();
+  if (!campaign) throw new Error('campaign_name is required');
+  if (!script) throw new Error('script_name is required');
+  return `<campaignName>${escapeXml(campaign)}</campaignName><scriptName>${escapeXml(script)}</scriptName>`;
+}
+
+// addPromptTTS takes promptInfo + ttsInfo as two sibling elements.
+//   promptInfo: description, languages[], name, type
+//   ttsInfo:    language, sayAs, sayAsFormat, text, voice
+export function buildPromptTtsXml({ name, description, text, language = 'en-US' } = {}) {
+  const promptName = String(name || '').trim();
+  if (!promptName) throw new Error('prompt name is required');
+  const body = String(text ?? '');
+  if (!body.trim()) throw new Error('prompt text is required');
+  const lang = String(language || 'en-US').trim();
+
+  let prompt = '';
+  if (description !== undefined && description !== null) {
+    prompt += `<description>${escapeXml(description)}</description>`;
+  }
+  prompt += `<languages>${escapeXml(lang)}</languages>`;
+  prompt += `<name>${escapeXml(promptName)}</name>`;
+  prompt += '<type>TTSGenerated</type>';
+
+  // sayAs / sayAsFormat left unsent: 'Default' is the schema default and a
+  // plain spoken sentence wants no say-as coercion.
+  const tts = `<language>${escapeXml(lang)}</language><text>${escapeXml(body)}</text>`;
+
+  return `<prompt>${prompt}</prompt><ttsInfo>${tts}</ttsInfo>`;
+}
+
+/* ---- Phase G read-before-write helpers ---------------------------------- */
+
+async function readIvrScript(scriptName, { includeDefinition = false } = {}) {
+  const res = await getIVRScripts({
+    namePattern: exactNamePattern(scriptName),
+    includeDefinition,
+  });
+  const scripts = res?.scripts || [];
+  return scripts.find(s => String(s.name).toLowerCase() === String(scriptName).toLowerCase()) || null;
+}
+
+async function readPrompt(promptName) {
+  const res = await getPrompts();
+  const prompts = res?.prompts || [];
+  return prompts.find(p => String(p.name).toLowerCase() === String(promptName).toLowerCase()) || null;
+}
+
+async function readCampaignByName(campaignName) {
+  const { campaigns } = await getCampaigns();
+  return campaigns.find(c => String(c.name).toLowerCase() === String(campaignName).toLowerCase()) || null;
+}
+
+/**
+ * readIvrScriptUsage — which inbound campaigns answer on this script.
+ *
+ * The attached script sits at defaultIvrSchedule.ivrSchedule.scriptName —
+ * TWO levels down, not defaultIvrSchedule.scriptName. Walks campaigns
+ * serially, matching the house Five9 fan-out rule (see the module header:
+ * concurrent admin session limits are undisclosed).
+ */
+async function readIvrScriptUsage(scriptName) {
+  const { campaigns } = await getCampaigns({ type: 'INBOUND' });
+  const target = String(scriptName).toLowerCase();
+  const used_by = [];
+  const unreadable = [];
+  for (const campaign of campaigns) {
+    try {
+      const cfg = await getInboundCampaign(campaign.name);
+      const attached = cfg?.raw?.defaultIvrSchedule?.ivrSchedule?.scriptName;
+      if (attached && String(attached).toLowerCase() === target) {
+        used_by.push({ campaign: campaign.name, state: campaign.state });
+      }
+    } catch (err) {
+      // A campaign we cannot read is not evidence the script is unused.
+      unreadable.push({ campaign: campaign.name, error: err.message });
+    }
+  }
+  return {
+    used_by,
+    running: used_by.filter(c => c.state === 'RUNNING'),
+    ...(unreadable.length ? { unreadable } : {}),
+  };
+}
+
+/* ---- Phase G executors -------------------------------------------------- */
+
+export function executeCreateIvrScript(action) {
+  const payload = action.action_payload || {};
+  const name = String(payload.name || '').trim();
+  const xmlDefinition = payload.xml_definition;
+  if (!name) throw new Error('five9_create_ivr_script requires action_payload.name');
+  if (typeof xmlDefinition !== 'string') {
+    throw new Error('five9_create_ivr_script requires action_payload.xml_definition (string)');
+  }
+
+  return withFive9WriteGate(
+    { action, subtype: 'create_ivr_script', entityType: 'five9_ivr_script', entityId: name },
+    async (ctx) => {
+      // Validate and build before any network call — payload errors fire first.
+      assertWellFormedXml(xmlDefinition, 'xml_definition');
+      const defXml = buildIvrScriptDefXml(name, {
+        description: payload.description,
+        xmlDefinition,
+      });
+
+      const existing = await readIvrScript(name);
+      if (existing) {
+        return { skipped: true, reason: 'ivr_script_already_exists', script: name };
+      }
+      ctx.previous_state = null;
+
+      await ctx.soap('createIVRScript', buildIvrScriptNameXml(name));
+      if (ctx.dry_run) {
+        return { script: name, created: false, previewed: true, steps: ['createIVRScript', 'modifyIVRScript'] };
+      }
+
+      try {
+        await ctx.soap('modifyIVRScript', defXml);
+      } catch (err) {
+        // Step 1 landed and step 2 did not: an empty shell now holds the name
+        // and would block every retry. Remove it — and report plainly whether
+        // that worked, because a failed compensation left silent is worse
+        // than no compensation at all.
+        let compensated = false;
+        let compensationError = null;
+        try {
+          await ctx.soap('deleteIVRScript', buildIvrScriptNameXml(name));
+          compensated = true;
+        } catch (deleteErr) {
+          compensationError = deleteErr.message;
+        }
+        ctx.event_extra.compensation = { attempted: true, compensated, error: compensationError };
+        throw new Error(
+          `five9_create_ivr_script: the definition write failed for "${name}" (${err.message}) — ` +
+          (compensated
+            ? 'the empty script was deleted, so the name is free to retry'
+            : `and the empty script could NOT be deleted (${compensationError}). Delete "${name}" in the Five9 UI before retrying`),
+        );
+      }
+
+      const after = await readIvrScript(name);
+      const verified = !!after;
+      ctx.new_state = after ? { name: after.name, description: after.description } : null;
+      ctx.event_extra.verified = verified;
+      return {
+        script: name,
+        created: verified,
+        verified,
+        steps: ['createIVRScript', 'modifyIVRScript'],
+        definition_bytes: xmlDefinition.length,
+        rollback_payload: {
+          method: 'deleteIVRScript',
+          name,
+          note: 'Not queueable as an action — delete via the Five9 UI, or park the script by renaming it.',
+        },
+      };
+    },
+  );
+}
+
+export function executeModifyIvrScript(action) {
+  const payload = action.action_payload || {};
+  const name = String(payload.name || '').trim();
+  const xmlDefinition = payload.xml_definition;
+  if (!name) throw new Error('five9_modify_ivr_script requires action_payload.name');
+  if (typeof xmlDefinition !== 'string') {
+    throw new Error('five9_modify_ivr_script requires action_payload.xml_definition (string)');
+  }
+
+  return withFive9WriteGate(
+    { action, subtype: 'modify_ivr_script', entityType: 'five9_ivr_script', entityId: name },
+    async (ctx) => {
+      assertWellFormedXml(xmlDefinition, 'xml_definition');
+      const defXml = buildIvrScriptDefXml(name, {
+        description: payload.description,
+        xmlDefinition,
+      });
+      checkConfirmToken('modify_ivr_script', payload);
+
+      // Prior definition is the rollback material — read it WITH the XML.
+      const before = await readIvrScript(name, { includeDefinition: true });
+      if (!before) throw new Error(`ivr_script_not_found: ${name}`);
+      ctx.previous_state = {
+        name: before.name,
+        description: before.description,
+        definition_bytes: (before.xmlDefinition || '').length,
+      };
+
+      const usage = await readIvrScriptUsage(name);
+      ctx.event_extra.usage = usage;
+      // A script on more than one RUNNING campaign has a blast radius wider
+      // than the one line the author is thinking about.
+      const compliance = usage.running.length > 1 && payload.compliance_override !== true
+        ? { ok: false, violations: [`script is live on ${usage.running.length} RUNNING campaigns: ${usage.running.map(c => c.campaign).join(', ')}`] }
+        : { ok: true, violations: [], overridden: usage.running.length > 1 };
+      ctx.event_extra.compliance = compliance;
+      if (!compliance.ok) {
+        throw new Error(`REFUSED: compliance — ${compliance.violations.join('; ')} (requires explicit compliance_override: true)`);
+      }
+
+      const rollback_payload = {
+        method: 'modifyIVRScript',
+        name,
+        xml_definition: before.xmlDefinition ?? null,
+        captured_at_bytes: (before.xmlDefinition || '').length,
+        note: before.xmlDefinition
+          ? 'Re-applying this restores the exact prior definition.'
+          : 'PRIOR DEFINITION NOT CAPTURED — Five9 returned no xmlDefinition. This is not a usable rollback.',
+      };
+      ctx.event_extra.rollback_payload = rollback_payload;
+
+      await ctx.soap('modifyIVRScript', defXml);
+      if (ctx.dry_run) {
+        return { script: name, modified: false, previewed: true, usage, rollback_payload };
+      }
+
+      const after = await readIvrScript(name, { includeDefinition: true });
+      ctx.new_state = after
+        ? { name: after.name, description: after.description, definition_bytes: (after.xmlDefinition || '').length }
+        : null;
+      const verified = (after?.xmlDefinition ?? null) === xmlDefinition;
+      ctx.event_extra.verified = verified;
+      return {
+        script: name,
+        modified: true,
+        verified,
+        ...(verified ? {} : { verify_mismatches: [{ field: 'xmlDefinition', expected_bytes: xmlDefinition.length, actual_bytes: (after?.xmlDefinition || '').length }] }),
+        usage,
+        rollback_payload,
+      };
+    },
+  );
+}
+
+export function executeCreateInboundCampaign(action) {
+  const payload = action.action_payload || {};
+  const name = String(payload.name || '').trim();
+  if (!name) throw new Error('five9_create_inbound_campaign requires action_payload.name');
+
+  const mode = String(payload.mode || 'BASIC').toUpperCase();
+  if (mode !== 'BASIC' && mode !== 'ADVANCED') {
+    throw new Error(`five9_create_inbound_campaign: mode must be BASIC or ADVANCED, got ${payload.mode}`);
+  }
+  const maxLines = parseInt(payload.max_lines, 10);
+  if (!Number.isFinite(maxLines) || maxLines < 1) {
+    throw new Error(`five9_create_inbound_campaign: max_lines must be a positive integer, got ${payload.max_lines}`);
+  }
+  const wrapupSeconds = payload.wrapup_minutes === undefined || payload.wrapup_minutes === null
+    ? WRAPUP_DEFAULT_SECONDS
+    : Math.round(Number(payload.wrapup_minutes) * 60);
+  if (!Number.isFinite(wrapupSeconds) || wrapupSeconds < 0) {
+    throw new Error(`five9_create_inbound_campaign: wrapup_minutes must be a non-negative number, got ${payload.wrapup_minutes}`);
+  }
+
+  return withFive9WriteGate(
+    { action, subtype: 'create_inbound_campaign', entityType: 'five9_campaign', entityId: name },
+    async (ctx) => {
+      const campaign = {
+        name,
+        type: 'INBOUND',
+        mode,
+        maxNumOfLines: maxLines,
+        autoRecord: payload.auto_record === true,
+        // Explicit rather than omitted: these are the two fields most likely
+        // to be wrong-by-default on a hand-made campaign.
+        trainingMode: false,
+        useFtp: false,
+        callWrapup: {
+          agentNotReady: true,
+          dispostionName: WRAPUP_DEFAULT_DISPOSITION, // sic — see the header
+          enabled: true,
+          timeout: wrapupSeconds,
+        },
+        ...(payload.description ? { description: payload.description } : {}),
+      };
+      const bodyXml = buildInboundCampaignXml(campaign);
+
+      const existing = await readCampaignByName(name);
+      if (existing) {
+        return { skipped: true, reason: 'campaign_already_exists', campaign: name, type: existing.type };
+      }
+      ctx.previous_state = null;
+
+      await ctx.soap('createInboundCampaign', bodyXml);
+      if (ctx.dry_run) return { campaign: name, created: false, previewed: true, mode, max_lines: maxLines };
+
+      // createInboundCampaignResponse is empty — the read-back IS the result.
+      const after = await readCampaignByName(name);
+      ctx.new_state = after;
+      const verified = !!after && String(after.type).toUpperCase() === 'INBOUND';
+      ctx.event_extra.verified = verified;
+      return {
+        campaign: name,
+        created: !!after,
+        verified,
+        mode,
+        max_lines: maxLines,
+        auto_record: campaign.autoRecord,
+        wrapup_seconds: wrapupSeconds,
+        rollback_payload: {
+          steps: [
+            { action_type: 'five9_stop_campaign', payload: { campaign_name: name } },
+            { action_type: 'five9_remove_dnis_from_campaign', payload: { campaign_name: name, dnis: [], confirm_token: name } },
+          ],
+          note: 'No delete op is exposed in this phase. deleteCampaign exists in the WSDL but is not implemented — stop it, strip its DNIS, and remove it via the Five9 UI.',
+        },
+      };
+    },
+  );
+}
+
+export function executeSetDefaultIvrSchedule(action) {
+  const payload = action.action_payload || {};
+  const campaignName = String(payload.campaign_name || '').trim();
+  const scriptName = String(payload.script_name || '').trim();
+  if (!campaignName) throw new Error('five9_set_default_ivr_schedule requires action_payload.campaign_name');
+  if (!scriptName) throw new Error('five9_set_default_ivr_schedule requires action_payload.script_name');
+
+  return withFive9WriteGate(
+    { action, subtype: 'set_default_ivr_schedule', entityType: 'five9_campaign', entityId: campaignName },
+    async (ctx) => {
+      const bodyXml = buildSetDefaultIvrScheduleXml(campaignName, scriptName);
+
+      const campaign = await readCampaignByName(campaignName);
+      if (!campaign) throw new Error(`campaign_not_found: ${campaignName}`);
+      if (String(campaign.type).toUpperCase() !== 'INBOUND') {
+        throw new Error(`REFUSED: ${campaignName} is ${campaign.type}, not INBOUND — an IVR schedule only applies to inbound campaigns`);
+      }
+      const script = await readIvrScript(scriptName);
+      if (!script) throw new Error(`ivr_script_not_found: ${scriptName}`);
+
+      const before = await getInboundCampaign(campaignName);
+      const priorScript = before?.raw?.defaultIvrSchedule?.ivrSchedule?.scriptName ?? null;
+      ctx.previous_state = { campaign: campaignName, scriptName: priorScript, state: campaign.state };
+
+      if (priorScript && String(priorScript).toLowerCase() === scriptName.toLowerCase()) {
+        return { skipped: true, reason: 'already_attached', campaign: campaignName, script: scriptName };
+      }
+
+      const rollback_payload = priorScript
+        ? { action_type: 'five9_set_default_ivr_schedule', payload: { campaign_name: campaignName, script_name: priorScript } }
+        : { note: `No prior script was attached to "${campaignName}" — rollback means detaching, which this phase exposes no op for.` };
+      ctx.event_extra.rollback_payload = rollback_payload;
+
+      await ctx.soap('setDefaultIVRSchedule', bodyXml);
+      if (ctx.dry_run) {
+        return { campaign: campaignName, script: scriptName, previous_script: priorScript, previewed: true, rollback_payload };
+      }
+
+      const after = await getInboundCampaign(campaignName);
+      const nowScript = after?.raw?.defaultIvrSchedule?.ivrSchedule?.scriptName ?? null;
+      ctx.new_state = { campaign: campaignName, scriptName: nowScript };
+      const verified = !!nowScript && String(nowScript).toLowerCase() === scriptName.toLowerCase();
+      ctx.event_extra.verified = verified;
+      return {
+        campaign: campaignName,
+        script: scriptName,
+        previous_script: priorScript,
+        verified,
+        ...(verified ? {} : { verify_mismatches: [{ field: 'defaultIvrSchedule.ivrSchedule.scriptName', expected: scriptName, actual: nowScript }] }),
+        rollback_payload,
+      };
+    },
+  );
+}
+
+export function executeAddDnisToCampaign(action) {
+  const payload = action.action_payload || {};
+  const campaignName = String(payload.campaign_name || '').trim();
+  const dnis = (Array.isArray(payload.dnis) ? payload.dnis : [])
+    .map(n => String(n ?? '').trim()).filter(Boolean);
+  if (!campaignName) throw new Error('five9_add_dnis_to_campaign requires action_payload.campaign_name');
+  if (!dnis.length) throw new Error('five9_add_dnis_to_campaign requires a non-empty action_payload.dnis[]');
+
+  return withFive9WriteGate(
+    { action, subtype: 'add_dnis_to_campaign', entityType: 'five9_campaign', entityId: campaignName },
+    async (ctx) => {
+      const bodyXml = buildCampaignDnisXml(campaignName, dnis);
+
+      const campaign = await readCampaignByName(campaignName);
+      if (!campaign) throw new Error(`campaign_not_found: ${campaignName}`);
+      if (String(campaign.type).toUpperCase() !== 'INBOUND') {
+        throw new Error(`REFUSED: ${campaignName} is ${campaign.type}, not INBOUND — DNIS route inbound calls`);
+      }
+
+      // refresh:true — the steal guard must never read a cached map. A DNIS
+      // reassigned since the map was built is exactly the case this catches.
+      const map = await getDnisMap({ refresh: true });
+      const before = await getCampaignDNISList(campaignName);
+      ctx.previous_state = { campaign: campaignName, dnis: before.dnis, count: before.count };
+
+      const steal = checkDnisSteal(dnis, map.assignments, campaignName, {
+        complianceOverride: payload.compliance_override === true,
+      });
+      ctx.event_extra.compliance = steal;
+      ctx.event_extra.current_assignments = steal.conflicts;
+      if (!steal.ok) {
+        throw new Error(
+          `REFUSED: DNIS reassignment — ${steal.violations.join('; ')}. ` +
+          'Moving a live number silently re-routes a marketing line and breaks its attribution; ' +
+          'requires explicit compliance_override: true',
+        );
+      }
+
+      const alreadyOn = dnis.filter(n => before.dnis.includes(n));
+      if (alreadyOn.length === dnis.length) {
+        return { skipped: true, reason: 'all_dnis_already_assigned', campaign: campaignName, dnis };
+      }
+
+      const rollback_payload = {
+        action_type: 'five9_remove_dnis_from_campaign',
+        payload: {
+          campaign_name: campaignName,
+          dnis: dnis.filter(n => !alreadyOn.includes(n)),
+          confirm_token: campaignName,
+        },
+        note: 'Removes only the numbers this action added, not any that were already assigned.',
+      };
+      ctx.event_extra.rollback_payload = rollback_payload;
+
+      await ctx.soap('addDNISToCampaign', bodyXml);
+      if (ctx.dry_run) {
+        return { campaign: campaignName, dnis, previewed: true, conflicts: steal.conflicts, rollback_payload };
+      }
+
+      const after = await getCampaignDNISList(campaignName);
+      ctx.new_state = { campaign: campaignName, dnis: after.dnis, count: after.count };
+      const missing = dnis.filter(n => !after.dnis.includes(n));
+      const verified = missing.length === 0;
+      ctx.event_extra.verified = verified;
+      return {
+        campaign: campaignName,
+        dnis_requested: dnis,
+        dnis_added: dnis.filter(n => !alreadyOn.includes(n)),
+        already_assigned: alreadyOn,
+        count_before: before.count,
+        count_after: after.count,
+        verified,
+        ...(verified ? {} : { verify_mismatches: missing.map(n => ({ dnis: n, expected: 'assigned', actual: 'absent' })) }),
+        overridden_conflicts: steal.conflicts,
+        rollback_payload,
+      };
+    },
+  );
+}
+
+export function executeRemoveDnisFromCampaign(action) {
+  const payload = action.action_payload || {};
+  const campaignName = String(payload.campaign_name || '').trim();
+  const dnis = (Array.isArray(payload.dnis) ? payload.dnis : [])
+    .map(n => String(n ?? '').trim()).filter(Boolean);
+  if (!campaignName) throw new Error('five9_remove_dnis_from_campaign requires action_payload.campaign_name');
+  if (!dnis.length) throw new Error('five9_remove_dnis_from_campaign requires a non-empty action_payload.dnis[]');
+
+  return withFive9WriteGate(
+    { action, subtype: 'remove_dnis_from_campaign', entityType: 'five9_campaign', entityId: campaignName },
+    async (ctx) => {
+      const bodyXml = buildCampaignDnisXml(campaignName, dnis);
+      checkConfirmToken('remove_dnis_from_campaign', payload);
+
+      const campaign = await readCampaignByName(campaignName);
+      if (!campaign) throw new Error(`campaign_not_found: ${campaignName}`);
+
+      const before = await getCampaignDNISList(campaignName);
+      ctx.previous_state = { campaign: campaignName, dnis: before.dnis, count: before.count, state: campaign.state };
+
+      const present = dnis.filter(n => before.dnis.includes(n));
+      if (!present.length) {
+        return { skipped: true, reason: 'no_matching_dnis_assigned', campaign: campaignName, dnis };
+      }
+
+      const rollback_payload = {
+        action_type: 'five9_add_dnis_to_campaign',
+        payload: { campaign_name: campaignName, dnis: present },
+        note: 'Re-adds only the numbers actually removed. The numbers become unassigned in the meantime — inbound calls to them do not reach this campaign until this is applied.',
+      };
+      ctx.event_extra.rollback_payload = rollback_payload;
+
+      await ctx.soap('removeDNISFromCampaign', bodyXml);
+      if (ctx.dry_run) {
+        return { campaign: campaignName, dnis, previewed: true, rollback_payload };
+      }
+
+      const after = await getCampaignDNISList(campaignName);
+      ctx.new_state = { campaign: campaignName, dnis: after.dnis, count: after.count };
+      const stillPresent = present.filter(n => after.dnis.includes(n));
+      const verified = stillPresent.length === 0;
+      ctx.event_extra.verified = verified;
+      return {
+        campaign: campaignName,
+        dnis_requested: dnis,
+        dnis_removed: present,
+        not_assigned: dnis.filter(n => !present.includes(n)),
+        count_before: before.count,
+        count_after: after.count,
+        verified,
+        ...(verified ? {} : { verify_mismatches: stillPresent.map(n => ({ dnis: n, expected: 'absent', actual: 'still assigned' })) }),
+        rollback_payload,
+      };
+    },
+  );
+}
+
+export function executeCreatePromptTts(action) {
+  const payload = action.action_payload || {};
+  const name = String(payload.name || '').trim();
+  if (!name) throw new Error('five9_create_prompt_tts requires action_payload.name');
+  if (typeof payload.text !== 'string' || !payload.text.trim()) {
+    throw new Error('five9_create_prompt_tts requires a non-empty action_payload.text');
+  }
+
+  return withFive9WriteGate(
+    { action, subtype: 'create_prompt_tts', entityType: 'five9_prompt', entityId: name },
+    async (ctx) => {
+      const bodyXml = buildPromptTtsXml({
+        name,
+        description: payload.description,
+        text: payload.text,
+        language: payload.language,
+      });
+
+      const existing = await readPrompt(name);
+      if (existing) {
+        return { skipped: true, reason: 'prompt_already_exists', prompt: name, type: existing.type };
+      }
+      ctx.previous_state = null;
+
+      await ctx.soap('addPromptTTS', bodyXml);
+      if (ctx.dry_run) return { prompt: name, created: false, previewed: true };
+
+      // addPromptTTSResponse is empty — the read-back IS the result.
+      const after = await readPrompt(name);
+      ctx.new_state = after;
+      const verified = !!after;
+      ctx.event_extra.verified = verified;
+      return {
+        prompt: name,
+        created: verified,
+        verified,
+        language: String(payload.language || 'en-US').trim(),
+        rollback_payload: {
+          method: 'deletePrompt',
+          name,
+          note: 'deletePrompt exists in the WSDL but is not implemented in this phase — park the prompt by renaming it in the Five9 UI.',
+        },
+      };
     },
   );
 }

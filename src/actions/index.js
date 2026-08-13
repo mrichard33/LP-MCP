@@ -463,6 +463,16 @@ const ACTION_HANDLERS = {
   five9_user_skill_remove: executeFive9Write,
   five9_create_campaign_profile: executeFive9Write,
   five9_modify_campaign_profile: executeFive9Write, // 2026-08-06 Phase D-2
+  // 2026-08-13 Phase G — config surface. Same gate, same dispatcher. Target
+  // ids are script/campaign/prompt names, so like the rest of five9_* these
+  // stay out of MUTATION_GATED_ACTION_TYPES.
+  five9_create_ivr_script: executeFive9Write,
+  five9_modify_ivr_script: executeFive9Write,
+  five9_create_inbound_campaign: executeFive9Write,
+  five9_set_default_ivr_schedule: executeFive9Write,
+  five9_add_dnis_to_campaign: executeFive9Write,
+  five9_remove_dnis_from_campaign: executeFive9Write,
+  five9_create_prompt_tts: executeFive9Write,
 };
 
 // Handlers that need the triggering event's payload injected as context.

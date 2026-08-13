@@ -30,6 +30,16 @@ import {
   checkProfileCompliance,
   exactUserPattern,
   actionFieldXml,
+  // 2026-08-13 Phase G — config surface
+  buildIvrScriptNameXml,
+  buildIvrScriptDefXml,
+  buildInboundCampaignXml,
+  buildCampaignDnisXml,
+  buildSetDefaultIvrScheduleXml,
+  buildPromptTtsXml,
+  assertWellFormedXml,
+  checkDnisSteal,
+  requiredConfirmToken,
 } from '../src/five9/admin-writes.js';
 
 if (!process.argv.includes('--dry')) {
@@ -203,6 +213,83 @@ out.push('  Phase C whitelisted actionOnQueueExpiration but ran escapeXml() over
 out.push('  serialized as the literal string "[object Object]". Now:');
 line('  actionOnQueueExpiration', actionFieldXml('actionOnQueueExpiration', { actionType: 'DROP_CALL' }));
 line('  in a full patch', buildModifyOutboundCampaignXml('REHASH OUTBOUND', { actionOnQueueExpiration: { actionType: 'DROP_CALL' } }));
+
+section('Phase G (2026-08-13) — config surface: the Canvass Confirmation build');
+out.push('  These six ops build inbound routing end to end. Shown in the order they');
+out.push('  must execute, each verified by read-back before the next is queued.');
+
+out.push('\n① five9_create_prompt_tts — addPromptTTS');
+line('inner XML', buildPromptTtsXml({
+  name: 'Canvass Confirmation Greeting',
+  description: 'Inbound canvass confirmation line greeting',
+  text: 'Thanks for calling Reece Windows and Doors.',
+}));
+out.push('  promptInfo sequence: description, languages[], name, type — then a SIBLING ttsInfo.');
+
+out.push('\n② five9_create_ivr_script — createIVRScript THEN modifyIVRScript (two calls, not atomic)');
+line('step 1 inner XML', buildIvrScriptNameXml('Canvass Confirmation Routing'));
+line('step 2 inner XML', buildIvrScriptDefXml('Canvass Confirmation Routing', {
+  description: 'Canvass confirmation inbound routing',
+  xmlDefinition: '<ivrScript><play prompt="Canvass Confirmation Greeting"/></ivrScript>',
+}));
+out.push('  createIVRScript accepts ONLY <name> — the definition CANNOT ride along (WSDL');
+out.push('  verified). If step 2 fails, an empty shell holds the name and blocks every');
+out.push('  retry, so the executor compensates with deleteIVRScript and reports whether');
+out.push('  that succeeded. deleteIVRScript is NOT queueable as an action.');
+verdict('well-formed definition accepted', () => { assertWellFormedXml('<ivrScript><play/></ivrScript>'); return { ok: true }; });
+verdict('truncated definition refused', () => assertWellFormedXml('<ivrScript><play na'));
+verdict('mismatched close refused', () => assertWellFormedXml('<ivrScript><play></ivrScript>'));
+
+out.push('\n③ five9_create_inbound_campaign — createInboundCampaign');
+line('inner XML', buildInboundCampaignXml({
+  name: 'Canvass Confirmation - Inbound',
+  type: 'INBOUND', mode: 'BASIC', maxNumOfLines: 10, autoRecord: true,
+  trainingMode: false, useFtp: false,
+  callWrapup: { agentNotReady: true, dispostionName: 'No Disposition', enabled: true, timeout: 180 },
+}));
+out.push('  16-field flattened sequence: campaign → generalCampaign → inboundCampaign.');
+out.push('  dispostionName is misspelled IN FIVE9\'S SCHEMA. Emitting the correct spelling');
+out.push('  raises no error and silently sets no wrapup disposition. Do not "fix" it.');
+verdict('ftpPassword refused (in the WSDL order array, NOT settable)', () => buildInboundCampaignXml({ name: 'X', ftpPassword: 'p' }));
+verdict('state refused (live state is not a create-time field)', () => buildInboundCampaignXml({ name: 'X', state: 'RUNNING' }));
+
+out.push('\n④ five9_set_default_ivr_schedule — setDefaultIVRSchedule');
+line('inner XML', buildSetDefaultIvrScheduleXml('Canvass Confirmation - Inbound', 'Canvass Confirmation Routing'));
+out.push('  Prior scriptName goes to rollback_payload. The attached script is read at');
+out.push('  defaultIvrSchedule.ivrSchedule.scriptName — TWO levels down.');
+
+out.push('\n⑤ five9_add_dnis_to_campaign — addDNISToCampaign');
+line('inner XML', buildCampaignDnisXml('Canvass Confirmation - Inbound', ['9045550000']));
+out.push('  DNIS-steal guard (P1 — attribution). Assignments are re-read with refresh:true;');
+out.push('  a cached map is exactly how a since-reassigned number would slip through.');
+const ASSIGNMENTS = { '9045551234': 'Main Number', '9045559999': 'Canvass Confirmation - Inbound' };
+verdict('unassigned spare accepted',
+  () => { const c = checkDnisSteal(['9045550000'], ASSIGNMENTS, 'Canvass Confirmation - Inbound'); if (!c.ok) throw new Error(c.violations.join('; ')); return c; });
+verdict('number already on the TARGET campaign is a no-op re-add, not a steal',
+  () => { const c = checkDnisSteal(['9045559999'], ASSIGNMENTS, 'Canvass Confirmation - Inbound'); if (!c.ok) throw new Error(c.violations.join('; ')); return c; });
+verdict('number owned by ANOTHER campaign refused',
+  () => { const c = checkDnisSteal(['9045551234'], ASSIGNMENTS, 'Canvass Confirmation - Inbound'); if (!c.ok) throw new Error(c.violations.join('; ')); return c; });
+verdict('same steal WITH compliance_override accepted',
+  () => checkDnisSteal(['9045551234'], ASSIGNMENTS, 'Canvass Confirmation - Inbound', { complianceOverride: true }));
+
+out.push('\n⑥ five9_start_campaign — existing Phase C op, unchanged');
+line('inner XML', buildCampaignNameXml('Canvass Confirmation - Inbound'));
+
+out.push('\nfive9_modify_ivr_script / five9_remove_dnis_from_campaign — the two Phase G double-gates');
+line('modify_ivr_script token', requiredConfirmToken('modify_ivr_script', { name: 'Canvass Confirmation Routing' }));
+line('remove_dnis token', requiredConfirmToken('remove_dnis_from_campaign', { campaign_name: 'Canvass Confirmation - Inbound' }));
+verdict('modify_ivr_script confirm_token restating the script name accepted',
+  () => checkConfirmToken('modify_ivr_script', { name: 'Canvass Confirmation Routing', confirm_token: 'Canvass Confirmation Routing' }));
+verdict('modify_ivr_script confirm_token mismatch refused',
+  () => checkConfirmToken('modify_ivr_script', { name: 'Canvass Confirmation Routing', confirm_token: 'wrong' }));
+verdict('remove_dnis confirm_token must be the CAMPAIGN, not the numbers',
+  () => checkConfirmToken('remove_dnis_from_campaign', { campaign_name: 'Canvass Confirmation - Inbound', confirm_token: '9045550000' }));
+out.push('  modify_ivr_script additionally refuses a script live on >1 RUNNING campaign');
+out.push('  without compliance_override, and captures the prior xmlDefinition first.');
+out.push('Audit event (previous_state carries the pre-write config; rollback_payload rides on the event):');
+out.push(eventShape('add_dnis_to_campaign', 'five9_campaign', 'Canvass Confirmation - Inbound', {
+  compliance: '<steal verdict>', current_assignments: '<conflict table>', rollback_payload: '<symmetric remove>', verified: '<bool>',
+}));
 
 section('Serialization + gate (applies to every op above)');
 out.push('  1. FIVE9_WRITES_ENABLED !== "true" → DRY-RUN: reads + guardrails run, envelope logged, audit event dry_run:true, action completed (dry-run). No mutation.');
