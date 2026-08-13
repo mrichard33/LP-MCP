@@ -52,6 +52,22 @@ import {
   MAX_LIST_DELETE_PROPORTION,
   ASYNC_DELETE_FIELD_ORDER,
   LIST_DELETE_SETTINGS_FIELD_ORDER,
+  // 2026-08-13 Phase G — config surface (IVR / inbound campaign / DNIS / TTS)
+  buildIvrScriptNameXml,
+  buildIvrScriptDefXml,
+  buildCallWrapupXml,
+  buildInboundCampaignXml,
+  buildCampaignDnisXml,
+  buildSetDefaultIvrScheduleXml,
+  buildPromptTtsXml,
+  assertWellFormedXml,
+  checkDnisSteal,
+  exactNamePattern,
+  IVR_SCRIPT_DEF_FIELD_ORDER,
+  CAMPAIGN_CALL_WRAPUP_FIELD_ORDER,
+  INBOUND_CAMPAIGN_FIELD_ORDER,
+  INBOUND_CAMPAIGN_SETTABLE_FIELDS,
+  WRAPUP_DEFAULT_DISPOSITION,
 } from '../src/five9/admin-writes.js';
 import { buildImportIdentifierXml } from '../src/five9-admin.js';
 
@@ -959,4 +975,217 @@ test('executeAsyncDeleteRecordsFromList: a well-formed payload reaches the read 
       else process.env[env] = saved[k];
     }
   }
+});
+
+/* ---------------------------------------------------------------------- *
+ * Phase G (2026-08-13) — config surface: IVR scripts, inbound campaigns,
+ * the default IVR schedule, DNIS assignment, TTS prompts.
+ *
+ * Field order is WSDL-derived; verbatim schema in
+ * docs/five9/phase-g-wsdl-v13.md. The tests that matter most here are the
+ * ones pinning things that look wrong and are not.
+ * ---------------------------------------------------------------------- */
+
+test('THE TYPO IS FIVE9\'S: campaignCallWrapup emits dispostionName, not dispositionName', () => {
+  // Occurs exactly once in the 961KB schema; the correct spelling occurs 9
+  // times on OTHER types, which is what makes this look like our mistake.
+  // Emitting the correct spelling raises no error and silently sets no
+  // wrapup disposition — so this test exists to stop a well-meaning fix.
+  assert.equal(CAMPAIGN_CALL_WRAPUP_FIELD_ORDER[1], 'dispostionName');
+  assert.ok(!CAMPAIGN_CALL_WRAPUP_FIELD_ORDER.includes('dispositionName'),
+    'the correctly-spelled field is NOT in the WSDL sequence');
+
+  const xml = buildCallWrapupXml({
+    agentNotReady: true, dispostionName: 'No Disposition', enabled: true, timeout: 180,
+  });
+  assert.match(xml, /<dispostionName>No Disposition<\/dispostionName>/);
+  assert.ok(!/<dispositionName>/.test(xml), 'must never emit the correct spelling');
+  // timeout is tns:timer, not a scalar — all four parts, always.
+  assert.match(xml, /<timeout><days>0<\/days><hours>0<\/hours><minutes>3<\/minutes><seconds>0<\/seconds><\/timeout>/);
+  assert.equal(xml, '<callWrapup><agentNotReady>true</agentNotReady><dispostionName>No Disposition</dispostionName><enabled>true</enabled><timeout><days>0</days><hours>0</hours><minutes>3</minutes><seconds>0</seconds></timeout></callWrapup>');
+});
+
+test('buildIvrScriptDefXml: xs:sequence puts description BEFORE name', () => {
+  // Alphabetical, like every sequence in this schema. Assuming name leads is
+  // the natural mistake and produces an unmarshalling fault.
+  assert.deepEqual(IVR_SCRIPT_DEF_FIELD_ORDER, ['description', 'name', 'xmlDefinition']);
+  const xml = buildIvrScriptDefXml('Canvass Confirmation Routing', {
+    description: 'Inbound canvass line',
+    xmlDefinition: '<ivr><play/></ivr>',
+  });
+  assert.equal(xml,
+    '<scriptDef><description>Inbound canvass line</description><name>Canvass Confirmation Routing</name>' +
+    '<xmlDefinition>&lt;ivr&gt;&lt;play/&gt;&lt;/ivr&gt;</xmlDefinition></scriptDef>');
+  // The definition must be escaped, never passed through raw.
+  assert.ok(!xml.includes('<ivr>'), 'xmlDefinition must be entity-escaped');
+
+  // description is optional; omitting it must not shift the others.
+  const bare = buildIvrScriptDefXml('X', { xmlDefinition: '<a/>' });
+  assert.equal(bare, '<scriptDef><name>X</name><xmlDefinition>&lt;a/&gt;</xmlDefinition></scriptDef>');
+  assert.throws(() => buildIvrScriptDefXml('  '), /script name is required/);
+  assert.equal(buildIvrScriptNameXml('Canvass'), '<name>Canvass</name>');
+  assert.throws(() => buildIvrScriptNameXml(''), /script name is required/);
+});
+
+test('buildInboundCampaignXml: 16-field flattened sequence, base types first', () => {
+  // campaign -> generalCampaign -> inboundCampaign. JAXB unmarshals base
+  // fields before extension fields; out of order is a fault.
+  assert.equal(INBOUND_CAMPAIGN_FIELD_ORDER.length, 16);
+  assert.deepEqual(INBOUND_CAMPAIGN_FIELD_ORDER.slice(0, 7),
+    ['description', 'mode', 'name', 'profileName', 'state', 'trainingMode', 'type']);
+  assert.deepEqual(INBOUND_CAMPAIGN_FIELD_ORDER.slice(-2), ['defaultIvrSchedule', 'maxNumOfLines']);
+  // The line-count field is maxNumOfLines, NOT maxLines.
+  assert.ok(INBOUND_CAMPAIGN_FIELD_ORDER.includes('maxNumOfLines'));
+  assert.ok(!INBOUND_CAMPAIGN_FIELD_ORDER.includes('maxLines'));
+
+  // Keys deliberately supplied in the WRONG order — emission must follow the
+  // WSDL sequence, not Object.keys.
+  const xml = buildInboundCampaignXml({
+    maxNumOfLines: 10, autoRecord: true, name: 'Canvass Confirmation - Inbound',
+    type: 'INBOUND', mode: 'BASIC', trainingMode: false, useFtp: false,
+    callWrapup: { agentNotReady: true, dispostionName: 'No Disposition', enabled: true, timeout: 180 },
+  });
+  const order = ['<mode>', '<name>', '<trainingMode>', '<type>', '<autoRecord>', '<callWrapup>', '<useFtp>', '<maxNumOfLines>'];
+  const idx = order.map(t => xml.indexOf(t));
+  assert.ok(idx.every(i => i >= 0), `all fields present: ${xml}`);
+  for (let i = 1; i < idx.length; i++) {
+    assert.ok(idx[i] > idx[i - 1], `${order[i]} must follow ${order[i - 1]} (WSDL sequence): ${xml}`);
+  }
+  assert.match(xml, /^<campaign>/);
+  assert.match(xml, /<\/campaign>$/);
+});
+
+test('REGRESSION: inbound order-array membership does NOT grant settability', () => {
+  // Same invariant as OUTBOUND_CAMPAIGN_FIELD_ORDER. The array is a faithful
+  // copy of the WSDL; the Set is the permission list, and they differ on
+  // purpose. FTP credentials and live state are in one and not the other.
+  for (const field of ['ftpHost', 'ftpPassword', 'ftpUser', 'state', 'profileName', 'defaultIvrSchedule', 'recordingNameAsSid']) {
+    assert.ok(INBOUND_CAMPAIGN_FIELD_ORDER.includes(field), `${field} should be in the order array`);
+    assert.equal(INBOUND_CAMPAIGN_SETTABLE_FIELDS.has(field), false, `${field} must NOT be settable`);
+    assert.throws(
+      () => buildInboundCampaignXml({ name: 'X', [field]: 'v' }),
+      new RegExp(`REFUSED: "${field}" is not a settable inbound campaign field`),
+      `${field} must be refused at build time`,
+    );
+  }
+});
+
+test('every INBOUND_CAMPAIGN_SETTABLE_FIELD has a position in the order array', () => {
+  // A settable field missing from the order array silently never emits — no
+  // error, just a campaign created without it.
+  const missing = [...INBOUND_CAMPAIGN_SETTABLE_FIELDS].filter(f => !INBOUND_CAMPAIGN_FIELD_ORDER.includes(f));
+  assert.deepEqual(missing, [], `settable fields absent from the order array: ${missing.join(', ')}`);
+});
+
+test('buildCampaignDnisXml: DNISList is capitalised and repeats per number', () => {
+  const xml = buildCampaignDnisXml('Canvass Confirmation - Inbound', ['9045551234', ' 9045559999 ']);
+  assert.equal(xml,
+    '<campaignName>Canvass Confirmation - Inbound</campaignName>' +
+    '<DNISList>9045551234</DNISList><DNISList>9045559999</DNISList>');
+  assert.ok(!/<dnisList>|<dnis>/.test(xml), 'the element is DNISList, not dnis/dnisList');
+  assert.throws(() => buildCampaignDnisXml('X', []), /dnis\[\] is required/);
+  assert.throws(() => buildCampaignDnisXml('X', ['  ']), /dnis\[\] is required/);
+  assert.throws(() => buildCampaignDnisXml('', ['9045551234']), /campaign_name is required/);
+});
+
+test('buildSetDefaultIvrScheduleXml + buildPromptTtsXml: sequence order', () => {
+  assert.equal(
+    buildSetDefaultIvrScheduleXml('Canvass Confirmation - Inbound', 'Canvass Confirmation Routing'),
+    '<campaignName>Canvass Confirmation - Inbound</campaignName><scriptName>Canvass Confirmation Routing</scriptName>',
+  );
+  assert.throws(() => buildSetDefaultIvrScheduleXml('', 'S'), /campaign_name is required/);
+  assert.throws(() => buildSetDefaultIvrScheduleXml('C', ''), /script_name is required/);
+
+  // promptInfo: description, languages[], name, type — then a sibling ttsInfo.
+  const xml = buildPromptTtsXml({ name: 'Canvass Greeting', description: 'Inbound greeting', text: 'Thanks for calling.' });
+  assert.equal(xml,
+    '<prompt><description>Inbound greeting</description><languages>en-US</languages>' +
+    '<name>Canvass Greeting</name><type>TTSGenerated</type></prompt>' +
+    '<ttsInfo><language>en-US</language><text>Thanks for calling.</text></ttsInfo>');
+  assert.throws(() => buildPromptTtsXml({ name: 'X', text: '   ' }), /prompt text is required/);
+  assert.throws(() => buildPromptTtsXml({ name: '', text: 'hi' }), /prompt name is required/);
+});
+
+test('assertWellFormedXml: catches the ways a pasted script actually arrives broken', () => {
+  assert.doesNotThrow(() => assertWellFormedXml('<ivr><menu key="1"/><play>hi</play></ivr>'));
+  assert.doesNotThrow(() => assertWellFormedXml('<?xml version="1.0"?><!-- note --><ivr><![CDATA[<not a tag>]]></ivr>'));
+  // A '>' inside an attribute value must not terminate the tag early.
+  assert.doesNotThrow(() => assertWellFormedXml('<ivr><node cond="a > b"/></ivr>'));
+
+  assert.throws(() => assertWellFormedXml(''), /is empty/);
+  assert.throws(() => assertWellFormedXml('   '), /is empty/);
+  assert.throws(() => assertWellFormedXml('<ivr><play></ivr>'), /<\/ivr> closes <play>/);
+  assert.throws(() => assertWellFormedXml('<ivr><play>'), /unclosed <play>/);
+  assert.throws(() => assertWellFormedXml('<ivr>'), /unclosed <ivr>/);
+  assert.throws(() => assertWellFormedXml('</ivr>'), /closes nothing/);
+  assert.throws(() => assertWellFormedXml('plain text'), /contains no XML elements/);
+  // Truncation mid-tag — the realistic copy/paste failure.
+  assert.throws(() => assertWellFormedXml('<ivr><play na'), /not well-formed XML/);
+  assert.throws(() => assertWellFormedXml('<ivr>< broken></ivr>'), /not well-formed XML/);
+  // The label appears in the message so the operator knows which field failed.
+  assert.throws(() => assertWellFormedXml('<a>', 'xml_definition'), /REFUSED: xml_definition/);
+});
+
+test('checkDnisSteal: a number owned by another campaign is refused without override', () => {
+  const assignments = {
+    '9045551234': 'Main Number',
+    '9045559999': 'Canvass Confirmation - Inbound',
+  };
+
+  // Clean: unassigned number onto the target campaign.
+  const clean = checkDnisSteal(['9045550000'], assignments, 'Canvass Confirmation - Inbound');
+  assert.equal(clean.ok, true);
+  assert.deepEqual(clean.conflicts, []);
+
+  // Already on the TARGET campaign is a no-op re-add, not a steal.
+  const sameCampaign = checkDnisSteal(['9045559999'], assignments, 'Canvass Confirmation - Inbound');
+  assert.equal(sameCampaign.ok, true);
+  assert.deepEqual(sameCampaign.conflicts, []);
+
+  // Owned by a DIFFERENT campaign — this is the P1 case.
+  const steal = checkDnisSteal(['9045551234'], assignments, 'Canvass Confirmation - Inbound');
+  assert.equal(steal.ok, false);
+  assert.deepEqual(steal.conflicts, [{ dnis: '9045551234', current_campaign: 'Main Number' }]);
+  assert.match(steal.violations[0], /9045551234 currently routes to "Main Number"/);
+
+  // Override is the ONLY way through, and it must be exactly true.
+  assert.equal(checkDnisSteal(['9045551234'], assignments, 'C', { complianceOverride: true }).ok, true);
+  assert.equal(checkDnisSteal(['9045551234'], assignments, 'C', { complianceOverride: true }).overridden, true);
+  for (const truthy of ['true', 1, {}, 'yes']) {
+    assert.equal(checkDnisSteal(['9045551234'], assignments, 'C', { complianceOverride: truthy }).ok, false,
+      `compliance_override must be identity-true, not merely truthy (${JSON.stringify(truthy)})`);
+  }
+  // Campaign match is case-insensitive — Five9 names are not case-normalised.
+  assert.equal(checkDnisSteal(['9045559999'], assignments, 'canvass confirmation - inbound').ok, true);
+});
+
+test('confirm_token: the two Phase G ops restate their target verbatim', () => {
+  // modify_ivr_script — token is the script name.
+  assert.equal(requiredConfirmToken('modify_ivr_script', { name: 'Canvass Confirmation Routing' }), 'Canvass Confirmation Routing');
+  assert.doesNotThrow(() => checkConfirmToken('modify_ivr_script', { name: 'Canvass Confirmation Routing', confirm_token: 'Canvass Confirmation Routing' }));
+  assert.throws(() => checkConfirmToken('modify_ivr_script', { name: 'Canvass Confirmation Routing' }), /confirm_token mismatch/);
+  assert.throws(() => checkConfirmToken('modify_ivr_script', { name: 'Canvass Confirmation Routing', confirm_token: 'canvass confirmation routing' }), /confirm_token mismatch/);
+
+  // remove_dnis_from_campaign — token is the campaign name, NOT the numbers.
+  const payload = { campaign_name: 'Canvass Confirmation - Inbound', dnis: ['9045551234'] };
+  assert.equal(requiredConfirmToken('remove_dnis_from_campaign', payload), 'Canvass Confirmation - Inbound');
+  assert.doesNotThrow(() => checkConfirmToken('remove_dnis_from_campaign', { ...payload, confirm_token: 'Canvass Confirmation - Inbound' }));
+  assert.throws(() => checkConfirmToken('remove_dnis_from_campaign', { ...payload, confirm_token: '9045551234' }), /confirm_token mismatch/);
+
+  // The rest of Phase G is single-gated: creates are attached to nothing yet,
+  // and add_dnis carries the steal guard instead.
+  for (const op of ['create_ivr_script', 'create_inbound_campaign', 'set_default_ivr_schedule', 'add_dnis_to_campaign', 'create_prompt_tts']) {
+    assert.equal(requiredConfirmToken(op, { name: 'X', campaign_name: 'X' }), null, `${op} must not be double-gated`);
+    assert.doesNotThrow(() => checkConfirmToken(op, { name: 'X' }));
+  }
+});
+
+test('exactNamePattern: anchors and escapes so a prefix cannot match a longer name', () => {
+  assert.equal(exactNamePattern('Canvass'), '^Canvass$');
+  assert.equal(exactNamePattern, exactUserPattern, 'aliased, not duplicated');
+  // Regex metacharacters in a script name stay literal.
+  assert.equal(exactNamePattern('Main (v2).ivr'), '^Main \\(v2\\)\\.ivr$');
+  const re = new RegExp(exactNamePattern('Canvass'));
+  assert.equal(re.test('Canvass'), true);
+  assert.equal(re.test('Canvass Confirmation'), false, 'a prefix must not match a longer script name');
 });

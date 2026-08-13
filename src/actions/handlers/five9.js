@@ -1,7 +1,7 @@
 /**
  * Five9 admin write handler — src/actions/handlers/five9.js
  *
- * One dispatcher for all fourteen five9_* write action types. The real work
+ * One dispatcher for all twenty-one five9_* write action types. The real work
  * (guardrails, serialization lock, read-before-write, audit events) lives
  * in src/five9/admin-writes.js — this file is only the executor-facing
  * seam plus the belt-and-braces approval check.
@@ -31,6 +31,15 @@ import {
   // 2026-08-12 Phase F — bulk async list deletion (confirm_token + declared
   // count + volume ceiling + proportion guard; defers while the job runs)
   executeAsyncDeleteRecordsFromList,
+  // 2026-08-13 Phase G — config surface: IVR scripts, inbound campaigns,
+  // the default IVR schedule, DNIS assignment, and TTS prompts.
+  executeCreateIvrScript,
+  executeModifyIvrScript,
+  executeCreateInboundCampaign,
+  executeSetDefaultIvrSchedule,
+  executeAddDnisToCampaign,
+  executeRemoveDnisFromCampaign,
+  executeCreatePromptTts,
 } from '../../five9/admin-writes.js';
 
 const FIVE9_WRITE_OPS = {
@@ -51,6 +60,19 @@ const FIVE9_WRITE_OPS = {
   five9_create_campaign_profile: executeCreateCampaignProfile,
   // 2026-08-06 Phase D-2
   five9_modify_campaign_profile: executeModifyCampaignProfile,
+  // 2026-08-13 Phase G — the config surface. Together these build inbound
+  // routing end to end (prompt → script → campaign → schedule → DNIS), which
+  // is why they are ordered that way in the Phase 3 execution sequence.
+  // NOTE: deleteIVRScript is used INTERNALLY by create as compensation when
+  // its second call fails. It is deliberately absent from this map — nothing
+  // can queue a script deletion as an action.
+  five9_create_ivr_script: executeCreateIvrScript,
+  five9_modify_ivr_script: executeModifyIvrScript,
+  five9_create_inbound_campaign: executeCreateInboundCampaign,
+  five9_set_default_ivr_schedule: executeSetDefaultIvrSchedule,
+  five9_add_dnis_to_campaign: executeAddDnisToCampaign,
+  five9_remove_dnis_from_campaign: executeRemoveDnisFromCampaign,
+  five9_create_prompt_tts: executeCreatePromptTts,
 };
 
 export async function executeFive9Write(action) {

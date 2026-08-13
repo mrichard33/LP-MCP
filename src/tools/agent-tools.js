@@ -1,6 +1,32 @@
 import { z } from 'zod';
 import supabase from '../supabase.js';
 
+/**
+ * resolveRequiresApproval — queue-time enforcement for Five9 admin writes.
+ * Pure, exported for offline tests (scripts/test-agent-action-approval.js).
+ *
+ * 2026-08-13 Phase G. Until now this was documentation only: the
+ * create_agent_action action_type description said Five9 writes "MUST be
+ * queued with requires_approval: true", and the sole enforcement was
+ * executeFive9Write refusing at EXECUTION time — by which point the row had
+ * been claimed, flipped to 'executing', and burned a retry, three times,
+ * before failing. Coercing here means a bypassed row never enters the queue
+ * armed in the first place.
+ *
+ * Prefix-matched on purpose: a future five9_* op is covered the day it is
+ * added, without anyone remembering to extend a list. That is exactly the
+ * kind of list that goes stale — the executor's own FIVE9_WRITE_OPS map is
+ * the authority on which ops exist, and this does not try to duplicate it.
+ */
+export function resolveRequiresApproval(actionType, requested) {
+  const isFive9Write = String(actionType || '').startsWith('five9_');
+  return {
+    isFive9Write,
+    requiresApproval: isFive9Write ? true : (requested || false),
+    coerced: isFive9Write && requested !== true,
+  };
+}
+
 export function registerAgentTools(server) {
 
   // ───────────────────────────────────────────────────
@@ -136,7 +162,7 @@ export function registerAgentTools(server) {
     'Queue an agent action for execution. Actions can auto-execute or require human approval.',
     {
       event_id: z.number().describe('ID of the triggering system event'),
-      action_type: z.string().describe('Action type. Common: add_tag, remove_tag, set_stage, update_custom_fields, update_contact_email, move_opportunity, update_opportunity, add_to_workflow, remove_from_workflow, send_message, create_task, send_notification, book_appointment, reschedule_appointment, cancel_appointment, emit_event, layer3_dispatch. Five9 admin writes (five9_start_campaign, five9_stop_campaign, five9_reset_campaign, five9_set_outbound_campaign, five9_add_records_to_list, five9_delete_record_from_list, five9_async_delete_records_from_list, five9_add_numbers_to_dnc, five9_remove_numbers_from_dnc, five9_user_skill_add, five9_user_skill_modify, five9_user_skill_remove, five9_create_campaign_profile, five9_modify_campaign_profile) MUST be queued with requires_approval: true and only execute when FIVE9_WRITES_ENABLED is set. five9_async_delete_records_from_list is BULK deletion: it additionally requires action_payload.confirm_token (restate list_name verbatim) and action_payload.expected_record_count, and refuses above FIVE9_MAX_LIST_DELETE or >50% of the list without compliance_override: true. Do NOT use update_contact — unimplemented in the executor and historically wiped tags via PUT. See LP MCP src/actions/index.js ACTION_HANDLERS for the full registry.'),
+      action_type: z.string().describe('Action type. Common: add_tag, remove_tag, set_stage, update_custom_fields, update_contact_email, move_opportunity, update_opportunity, add_to_workflow, remove_from_workflow, send_message, create_task, send_notification, book_appointment, reschedule_appointment, cancel_appointment, emit_event, layer3_dispatch. Five9 admin writes (five9_start_campaign, five9_stop_campaign, five9_reset_campaign, five9_set_outbound_campaign, five9_add_records_to_list, five9_delete_record_from_list, five9_async_delete_records_from_list, five9_add_numbers_to_dnc, five9_remove_numbers_from_dnc, five9_user_skill_add, five9_user_skill_modify, five9_user_skill_remove, five9_create_campaign_profile, five9_modify_campaign_profile, and the Phase G config surface: five9_create_ivr_script, five9_modify_ivr_script, five9_create_inbound_campaign, five9_set_default_ivr_schedule, five9_add_dnis_to_campaign, five9_remove_dnis_from_campaign, five9_create_prompt_tts) MUST be queued with requires_approval: true and only execute when FIVE9_WRITES_ENABLED is set. Any action_type starting with five9_ is COERCED to requires_approval: true at queue time regardless of what you pass, so a five9 write always waits for approve_action. five9_modify_ivr_script requires action_payload.confirm_token (restate the script name verbatim) and refuses a script live on more than one RUNNING campaign without compliance_override: true. five9_remove_dnis_from_campaign requires confirm_token (restate the campaign name) because removing a DNIS dead-ends a live number. five9_add_dnis_to_campaign REFUSES any number currently assigned to a different campaign without compliance_override: true — reassigning a live number silently re-routes a marketing line and breaks its attribution. five9_async_delete_records_from_list is BULK deletion: it additionally requires action_payload.confirm_token (restate list_name verbatim) and action_payload.expected_record_count, and refuses above FIVE9_MAX_LIST_DELETE or >50% of the list without compliance_override: true. Do NOT use update_contact — unimplemented in the executor and historically wiped tags via PUT. See LP MCP src/actions/index.js ACTION_HANDLERS for the full registry.'),
       target_system: z.string().describe('Target: ghl, lp, n8n, groupme, notion'),
       target_entity: z.string().describe('Entity type: contact, opportunity, workflow, task'),
       target_id: z.string().describe('ID of entity being acted on'),
@@ -152,7 +178,9 @@ export function registerAgentTools(server) {
     },
     async (params) => {
       try {
-        const status = params.requires_approval ? 'pending_approval' : 'pending';
+        const { requiresApproval, coerced: approvalCoerced } =
+          resolveRequiresApproval(params.action_type, params.requires_approval);
+        const status = requiresApproval ? 'pending_approval' : 'pending';
         const insertRow = {
           event_id: params.event_id,
           action_type: params.action_type,
@@ -165,7 +193,7 @@ export function registerAgentTools(server) {
           confidence: params.confidence || null,
           rule_applied: params.rule_applied || null,
           status,
-          requires_approval: params.requires_approval || false,
+          requires_approval: requiresApproval,
           batch_id: params.batch_id || null,
           sequence_order: params.sequence_order || 0,
         };
@@ -182,7 +210,7 @@ export function registerAgentTools(server) {
           .single();
 
         if (error) return { content: [{ type: 'text', text: `Error: ${error.message}` }] };
-        return { content: [{ type: 'text', text: JSON.stringify({ status: 'queued', action_id: data.id, action_type: data.action_type, action_status: data.status, target_id: data.target_id, priority: data.priority, requires_approval: params.requires_approval || false }, null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'queued', action_id: data.id, action_type: data.action_type, action_status: data.status, target_id: data.target_id, priority: data.priority, requires_approval: requiresApproval, ...(approvalCoerced ? { approval_coerced: true, note: 'Five9 admin writes are always queued requires_approval:true — this action is waiting on approve_action.' } : {}) }, null, 2) }] };
       } catch (err) {
         return { content: [{ type: 'text', text: `Exception: ${err.message}` }] };
       }
