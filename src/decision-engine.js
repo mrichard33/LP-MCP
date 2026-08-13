@@ -139,6 +139,8 @@
  *   falls back to payload.message_type (GHL's native field on
  *   ghl.reply_received). Returns null when neither resolves cleanly,
  *   in which case the rule template's value wins.
+ *   (2026-08-13: moved to src/channel-inference.js so the Layer 3 fan-out
+ *   path can share it without closing an import cycle. Behavior unchanged.)
  *
  * v2.12 — 2026-05-04. MVI Antifragile: inbound idempotency guard.
  *   Every event now claims a row in processed_events before any rule
@@ -208,6 +210,8 @@ import { BOOKING_AUTHORITY_RANK as SERVICE_BOOKING_AUTHORITY_RANK }
 //     message layer is down. See sql/seeds/2026-06-12_s13_booking_push_timeout_hold.sql).
 import { fetchUpcomingAppointments } from './knowledge/contact-appointments.js';
 import { getLastInboundMessageMs } from './actions/handlers/workflows.js';
+// 2026-08-13 — shared with actions/index.executeLayer3Dispatch (see module header).
+import { inferChannelFromEvent } from './channel-inference.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -1452,27 +1456,10 @@ async function shouldRequireApproval(rule /*, event */) {
 // ACTION CREATION
 // ═══════════════════════════════════════════════════════════════════
 
-function inferChannelFromEvent(event) {
-  if (!event?.payload) return null;
-  const explicit = event.payload.channel;
-  if (typeof explicit === 'string') {
-    const c = explicit.toLowerCase();
-    if (c === 'sms' || c === 'email' || c === 'livechat') return c;
-  }
-  const mt = event.payload.message_type;
-  if (typeof mt === 'string') {
-    const m = mt.toLowerCase();
-    if (m === 'sms' || m === 'email' || m === 'livechat') return m;
-    if (m === 'type_sms') return 'sms';
-    if (m === 'type_email') return 'email';
-    // 2026-07-03 — livechat no longer collapses to null (which defaulted to
-    // 'sms' at send time and answered widget chats over SMS, Steve Nkzhm
-    // incident). The send handler inherits the final channel from the
-    // inbound conversation; this keeps the payload signal honest.
-    if (m === 'type_live_chat' || m === 'type_webchat' || m.includes('live_chat') || m.includes('livechat') || m.includes('webchat')) return 'livechat';
-  }
-  return null;
-}
+// 2026-08-13 — inferChannelFromEvent moved to src/channel-inference.js so the
+// Layer 3 fan-out path (actions/index.executeLayer3Dispatch) can share it
+// without closing an import cycle. Imported at the top of this file; still
+// re-exported through _internal below, unchanged.
 
 async function createActionsFromRule(event, rule) {
   const targetId = event.ghl_contact_id || event.entity_id || '';

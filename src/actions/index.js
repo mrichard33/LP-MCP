@@ -128,6 +128,11 @@ import { classifyHandlerResult } from './result-status.js';
 // MVI v2.5 — outbound dedup + Layer 3 dispatch
 import { tryAcquireLock, releaseLock } from '../services/outbound-locks.js';
 import { getDispatchForClassification } from '../services/layer3-dispatch.js';
+// 2026-08-13 — the same channel resolver the decision engine uses on the rule-
+// template path. Lives in its own module because decision-engine.js imports
+// this file (via the action-executor.js shim), so importing it back would
+// close a cycle.
+import { inferChannelFromEvent } from '../channel-inference.js';
 // 2026-07-03 hotfix — extracted send orchestration (defer-not-drop,
 // re-entrant slot, sent-marker dedup, finally-release)
 import { runSendMessageFlow } from './send-message-flow.js';
@@ -361,13 +366,39 @@ async function executeLayer3Dispatch(action /*, context */) {
     // {{trigger_link.xyz}}) contain dots and pass through UNTOUCHED. An
     // absent token blanks to '' — executeAddTag's trailing-':' hygiene guard
     // rejects the malformed tag rather than writing it.
+    let actionPayload = interpolatePayload(tmpl.params || tmpl.payload || {}, event.payload || {});
+
+    // 2026-08-13 — stamp the REAL channel from the triggering event, mirroring
+    // what decision-engine.createActionsFromRule already does for rule
+    // templates. This fan-out path copied dispatch params verbatim, and six
+    // layer3_action_dispatch rows hardcoded "channel": "sms" — so every email
+    // inbound owned by Layer 3 was answered by SMS (all 4 follow_up_scheduled
+    // email replies in 90 days; Andrea, 2026-08-12). The damage was not only
+    // delivery: send-message-handler gates the EMAIL THREAD CONTEXT block and
+    // the email generation constraints on channel === 'email', so the reply was
+    // WRITTEN for SMS too — no subject, no opener bridge, no signature.
+    //
+    // Spread rather than mutate: interpolatePayload returns the ORIGINAL params
+    // object when the event payload is empty, so assigning would write through
+    // into the fetched dispatch row.
+    if (tmpl.action_type === 'send_message') {
+      const eventChannel = inferChannelFromEvent(event);
+      if (eventChannel && actionPayload.channel !== eventChannel) {
+        console.log(
+          `[ActionExecutor] layer3 channel override (${dispatch.recommended_action}): ` +
+          `${tmpl.params?.channel || 'unset'} → ${eventChannel} (event ${event.id})`
+        );
+        actionPayload = { ...actionPayload, channel: eventChannel };
+      }
+    }
+
     const insertRow = {
       event_id: event.id,
       action_type: tmpl.action_type,
       target_system: targetSystem,
       target_entity: targetEntity,
       target_id: String(subTargetId || ''),
-      action_payload: interpolatePayload(tmpl.params || tmpl.payload || {}, event.payload || {}),
+      action_payload: actionPayload,
       reasoning: `LAYER3_DISPATCH(${dispatch.recommended_action}): ${dispatch.notes || 'data-driven dispatch'}`,
       confidence: result.confidence ?? 1.0,
       rule_applied: 'LAYER3_DISPATCH',
