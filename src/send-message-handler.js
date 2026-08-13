@@ -211,7 +211,7 @@
 import supabase from './supabase.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken, report429 } from './ghl-rate-limiter.js';
-import { generateResponse } from './response-generator.js';
+import { generateResponse, getReplySenderAllowlist, isRandyName } from './response-generator.js';
 import { buildAiFallback } from './ai-fallback.js';
 import { bumpContactCache } from './context-builder.js';
 // v3.6: rich GroupMe notification — same helpers used by tasks v2.0 +
@@ -698,13 +698,89 @@ async function getInboundEmailToAddress(contactId) {
  * ignored. We also exclude the bot's own bridge phrase ("asked me to reach
  * out") so a prior bot reply never re-triggers the bridge (once per thread).
  *
- * Returns:
- *   'mark'  — outbound email was a Mark-signed broadcast/nurture
- *   'randy' — outbound email was a Randy-signed broadcast/nurture
- *   'rep'   — outbound email was rep-authored (prior bot reply / manual send)
- *   null    — no prior outbound email found or lookup failed
- * Fail-open: callers treat null as 'rep' (the safe, non-aggressive opener).
+ * 2026-08-13 — Randy signs TWO ways and the pattern only caught one. The
+ * sign-off is sometimes the first name alone and sometimes the full name:
+ *   "Randy\nReece Windows & Doors"       → "randy reece windows"       ✔ caught
+ *   "Randy Reece\nReece Windows & Doors" → "randy reece reece windows" ✘ missed
+ * The second cannot match `randy\s+reece\s+windows`: after "randy reece" the
+ * next token is "reece", not "windows", and there is no second "randy" to
+ * restart from. So 85 of 99 Randy-signed threads in the 90 days to 2026-08-13
+ * were classified 'rep' — no bridgeName, so the lead got a reply from Mark
+ * with no explanation of the voice change. `randy(?:\s+reece)?\s+reece\s+
+ * windows` catches both (the optional group backtracks to empty for the
+ * first form).
+ *
+ * Re-validated against production before shipping, same discipline as the
+ * 2026-06-18 re-base: the widened pattern matches 99 emails (vs 14), the 85
+ * newly caught ones contain NO Mark sign-off, and the 5 emails matching both
+ * Randy and Mark already matched the old pattern too (they carry two
+ * signature blocks — a template artifact), so no classification changes.
+ * Purely additive.
+ *
+ * Returns { type, name } (2026-08-13 — was a bare string):
+ *   { type: 'randy',   name: 'Randy' } — Randy-signed broadcast → handoff bridge
+ *   { type: 'person',  name }          — signed by an agentic-inbox sender
+ *   { type: 'company', name: null }    — company/team-signed, nobody to inherit
+ *   { type: 'rep',     name: null }    — prior bot reply / manual send / unknown
+ *   null                               — no prior outbound email, or lookup failed
+ * Fail-open: callers treat null as 'rep' (the safe, non-aggressive opener), and
+ * normalizeThreadSender still accepts the legacy bare strings.
  */
+/** Escape a name for safe interpolation into a RegExp. */
+function escapeForRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Sign-off matcher for a given first name, allowing an optional surname:
+ *   "Mark\nReece Windows & Doors"       → "mark reece windows"
+ *   "Randy Reece\nReece Windows & Doors" → "randy reece reece windows"
+ * Also accepts the "Reece Home Protection" brand, which some broadcasts use.
+ */
+function signOffPattern(firstName) {
+  return new RegExp(
+    `${escapeForRegExp(String(firstName).toLowerCase())}(?:\\s+[a-z'’-]+)?\\s+reece\\s+(?:windows|home\\s+protection)`,
+    'i'
+  );
+}
+
+// A broadcast sent in the company's name with no person to answer as.
+const COMPANY_SIGNOFF = /reece\s+home\s+protection|the\s+reece\s+team/i;
+
+/**
+ * The pure classification half of getThreadSenderType. Takes the tag-stripped,
+ * lowercased body+subject of the most recent outbound email and returns
+ * { type, name }:
+ *
+ *   { type: 'randy',   name: 'Randy' }  broadcast signed by Randy → bridge
+ *   { type: 'person',  name: 'Mark'  }  signed by someone who works this inbox
+ *   { type: 'company', name: null    }  company/team-signed, nobody to inherit
+ *   { type: 'rep',     name: null    }  prior bot reply, manual send, unknown
+ *
+ * Exported for unit tests (no GHL required). `allowlist` defaults to the
+ * configured agentic senders; only those names produce a 'person' verdict, so
+ * a field rep whose name reaches a template is answered in company voice
+ * rather than impersonated. Randy is checked FIRST and can therefore never be
+ * classified 'person', whatever the allowlist says.
+ *
+ * Order matters: the bot's own bridge phrase wins over any sign-off, so a
+ * prior bot reply never re-triggers the bridge (once per thread).
+ */
+export function classifyThreadSenderText(text, opts = {}) {
+  const t = String(text || '');
+  if (/asked me to reach out/i.test(t)) return { type: 'rep', name: null };
+  if (/randy(?:\s+reece)?\s+reece\s+windows/i.test(t)) return { type: 'randy', name: 'Randy' };
+
+  const allowlist = Array.isArray(opts.allowlist) ? opts.allowlist : getReplySenderAllowlist();
+  for (const name of allowlist) {
+    if (!name || isRandyName(name)) continue;
+    if (signOffPattern(name).test(t)) return { type: 'person', name };
+  }
+
+  if (COMPANY_SIGNOFF.test(t)) return { type: 'company', name: null };
+  return { type: 'rep', name: null };
+}
+
 async function getThreadSenderType(contactId) {
   if (!contactId || !GHL_API_KEY) return null;
 
@@ -741,19 +817,12 @@ async function getThreadSenderType(contactId) {
     // whitespace (\s+), not newlines, since the email-detail body is HTML.
     const text = `${rawBody} ${subjectText}`.replace(/<[^>]+>/g, ' ').toLowerCase();
 
-    let senderType;
-    if (/asked me to reach out/i.test(text)) {
-      // The bot's own rep-voiced bridge reply — never re-trigger the bridge.
-      senderType = 'rep';
-    } else if (/randy\s+reece\s+windows/i.test(text)) {
-      senderType = 'randy';
-    } else if (/mark\s+reece\s+windows/i.test(text)) {
-      senderType = 'mark';
-    } else {
-      senderType = 'rep';
-    }
+    const senderType = classifyThreadSenderText(text);
 
-    console.log(`[SendMessage] v3.15.1: getThreadSenderType for ${contactId}: emailId=${emailId} → ${senderType}`);
+    console.log(
+      `[SendMessage] v3.16: getThreadSenderType for ${contactId}: emailId=${emailId} → ` +
+      `${senderType.type}${senderType.name ? ` (${senderType.name})` : ''}`
+    );
     return senderType;
   } catch (err) {
     console.warn(`[SendMessage] getThreadSenderType failed for ${contactId}: ${err.message}`);
@@ -1871,8 +1940,19 @@ export async function executeSendMessage(action, context) {
   // actually carry the reply. Fail-soft inside resolveReplyContext.
   let replyContext = null;
   if (AGENTIC_DIRECT_SEND) {
+    // 2026-08-13 — pass null, not the provisional 'sms', when the payload never
+    // specified a channel. decideReplyChannel's first branch is
+    // (!requestedChannel && inboundOrigin === 'email') → email_passthrough; with
+    // a defaulted 'sms' that branch was unreachable and the request fell through
+    // to origin_email_requested_other, where the "upstream signal" wins — except
+    // for these actions there was no upstream signal, only a template default.
+    // That is why deleting the hardcoded "channel": "sms" from the dispatch rows
+    // does nothing on its own: the default is re-applied here before the
+    // inbound conversation is ever consulted. The SMS, livechat and no-inbound
+    // branches are unaffected (each ignores requestedChannel or already
+    // defaults it to 'sms').
     replyContext = await resolveReplyContext(contactId, {
-      requestedChannel: channel,
+      requestedChannel: channelExplicit ? channel : null,
       eventId: action.event_id || null,
     });
     if (!replyContext.channel) {
