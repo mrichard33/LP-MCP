@@ -99,6 +99,7 @@ import { executeCreateTask } from './tasks.js';
 import { getContactCached } from '../contact-cache.js';
 import { isPlaceholderName, EMAIL_ASKED_TAG } from '../../services/identity-extraction.js';
 import { emitEvent } from '../../event-emitter.js';
+import { etAppointmentParts } from '../../appointment-dates.js';
 import supabase from '../../supabase.js';
 import { syncCancelledAppointmentState, reconcileGhlOnlyApptTag } from './appointment-field-sync.js';
 import { findExistingAppointment, emitSlotCheckEvent, isSlotCheckEnabled } from '../../appointments/slot-check.js';
@@ -728,6 +729,78 @@ export async function executeBookAppointment(action, context) {
   // v3.4: tear down the booking-flow tags now that a booking has landed, so the
   // affirmative-gate bypass doesn't persist for this contact. See §8 #6.
   await removeGHLTags(contactId, BOOKING_FLOW_TAGS).catch(() => {});
+
+  // 2026-08-13 — LP writeback through the agentic layer.
+  //
+  // Rule 112 GHL_APPT_LP_SYNC (enabled, priority 15) queues set_lp_appointment
+  // on ghl.appointment_booked. Until now this path never emitted that event, so
+  // the rule had simply never been fed: on contact lGQ0WjsMU2zmoq9MsVJH the
+  // only events for the appointment were appt.booking (telemetry) and
+  // ghl.workflow_handoff, and LP was carried ~6 minutes later by the GHL-native
+  // fallback I.LP-A instead.
+  //
+  // Why not build a rule on appt.booking, which already fires here: it is
+  // documented as pure telemetry (slot-check.js), it also fires from
+  // reconcileLpAppointmentToGhl — the LP→GHL direction, so a rule on it would
+  // push LP's own appointments back at LP — and its payload uses `startTime`
+  // (camelCase), which is in NONE of executeSetLPAppointment's date branches.
+  // It would fall through to the contact's last_appointment_start_date and
+  // silently sync a STALE date rather than failing loudly.
+  //
+  // Shape below mirrors a real GHL webhook row (reference event 2820152) so the
+  // handler parses it identically whichever producer it came from. calendar_id
+  // is emitted because it is authoritative for the GHL-only skip; calendar_name
+  // and title both carry the clean calendar name (the handler falls back
+  // title → calendar name), never the model's "<calendar> - <lead>" title.
+  // ghl_status drives the decision-maker line on the LP note and GroupMe card.
+  //
+  // Two owners by design: I.LP-A stays as the backstop it was built to be. The
+  // paths interlock — set_lp_appointment returns already_set_in_lp when LP
+  // holds the same date and time, and I.LP-A exits early on lp-appt-synced.
+  // This path is primary because it fires in seconds rather than the workflow's
+  // 15-minute wait and resolves the LP lead through a five-step chain the GHL
+  // workflow does not have.
+  //
+  // Best-effort, exactly like every other side effect in this branch: a failed
+  // emit must never fail a booking that has already landed in GHL.
+  try {
+    const etParts = etAppointmentParts(startTime);
+    const cleanCalendarName = payload.calendar_name
+      || Object.keys(CALENDAR_MAP).find((n) => CALENDAR_MAP[n] === calendarId)
+      || title;
+    const bookedContact = await getContactCached(contactId, context?._contactCache).catch(() => null);
+    const contactName = [bookedContact?.firstName, bookedContact?.lastName].filter(Boolean).join(' ')
+      || bookedContact?.contactName || bookedContact?.name || null;
+
+    await emitEvent({
+      event_type: 'ghl.appointment_booked',
+      event_subtype: 'created',
+      source: 'lp_mcp',
+      entity_type: 'contact',
+      entity_id: contactId,
+      ghl_contact_id: contactId,
+      payload: {
+        title: cleanCalendarName,
+        status: 'booked',
+        end_time: null,
+        startDate: etParts?.startDate || null,
+        start_time: etParts?.startTime12h || null,
+        calendar_id: calendarId,
+        calendar_name: cleanCalendarName,
+        contactName,
+        appointment_id: appointmentId,
+        ghl_status: status,
+      },
+      // One event per created appointment. The executor can re-run a
+      // book_appointment (reaper requeue, duplicate companion), and the
+      // idempotent-skip branch above returns before reaching here, but a
+      // genuine double-create would otherwise queue LP sync twice.
+      idempotency_key: appointmentId ? `ghl_appt_booked:${appointmentId}` : null,
+    });
+    console.log(`[ActionExecutor] 📤 ghl.appointment_booked emitted for ${contactId} (appt ${appointmentId}, ${cleanCalendarName} ${etParts?.startDate} ${etParts?.startTime12h}, ghl_status=${status}) → rule 112 GHL_APPT_LP_SYNC`);
+  } catch (err) {
+    console.warn(`[ActionExecutor] ghl.appointment_booked emit failed for ${contactId} (fail-soft, I.LP-A remains the backstop): ${err.message}`);
+  }
 
   // 2026-08-13 — if the lead was told "text you right back" because the inline
   // booking didn't land in time, this is where that promise gets kept. Must run
