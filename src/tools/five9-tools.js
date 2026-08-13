@@ -13,6 +13,13 @@ import {
   runReportAndWait,
   isReportRunning,
   getReportResult,
+  // 2026-08-13 Phase G — config surface (IVR / DNIS / prompts / domain)
+  getIVRScripts,
+  getDNISList,
+  getCampaignDNISList,
+  getDnisMap,
+  getPrompts,
+  getVCCConfiguration,
 } from '../five9-admin.js';
 import { getUsersFullInfo } from '../five9-users-info.js';
 import supabase from '../supabase.js';
@@ -192,6 +199,69 @@ export function registerFive9Tools(server) {
       const result = await getReportResult(identifier);
       return { done: true, ...result };
     })
+  );
+
+  /* ---- Phase G (2026-08-13): config surface ----------------------------- */
+
+  // Tool: five9_get_ivr_scripts
+  server.tool(
+    'five9_get_ivr_scripts',
+    'Five9 IVR script inventory (read-only). Returns name + description per script. name_pattern is a Five9-SIDE REGEX (default ".*" = every script), not a substring — anchor it (e.g. "^Canvass.*") to narrow. Set include_definition: true to also get the full xmlDefinition, which is REFUSED above 3 matching scripts because script XML is large; narrow name_pattern first. Note the API has no names-only mode — it always sends every matching definition — so a wide pattern is a large fetch even when definitions are stripped from the reply.',
+    {
+      name_pattern: z.string().optional().describe('Five9-side regex on script name, e.g. "^Canvass.*"; default ".*"'),
+      include_definition: z.boolean().optional().describe('Include the full xmlDefinition per script. Refused above 3 matches. Default false.'),
+      limit: z.number().int().min(1).max(200).optional().describe('Max scripts to return (default 20)'),
+    },
+    asTool(async ({ name_pattern, include_definition, limit }) => {
+      const out = await getIVRScripts({
+        namePattern: name_pattern || '.*',
+        includeDefinition: Boolean(include_definition),
+      });
+      const cap = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 20;
+      if (out.count <= cap) return out;
+      return { ...out, returned: cap, truncated: true, scripts: out.scripts.slice(0, cap) };
+    })
+  );
+
+  // Tool: five9_get_dnis_list
+  server.tool(
+    'five9_get_dnis_list',
+    'Five9 DNIS (inbound phone number) inventory (read-only). Four modes: no arguments returns every DNIS in the domain; unassigned_only: true returns the spare numbers not attached to any campaign — this is how you find a free number for a new inbound line; campaign_name returns the DNIS assigned to that one campaign; map: true returns the full { number -> campaign } ownership map plus the unassigned list, which is what you need before reassigning any number. map walks every INBOUND campaign serially and is cached for the process lifetime — every reply carries fetched_at, and refresh: true re-reads it.',
+    {
+      unassigned_only: z.boolean().optional().describe('Return only DNIS not assigned to any campaign (the spares). Default false.'),
+      campaign_name: z.string().optional().describe('Exact campaign name — return only that campaign\'s DNIS'),
+      map: z.boolean().optional().describe('Return the full { dnis -> campaign } ownership map plus unassigned. Default false.'),
+      refresh: z.boolean().optional().describe('map mode only: bypass the cached map and re-read from Five9'),
+    },
+    asTool(({ unassigned_only, campaign_name, map, refresh }) => {
+      if (map) return getDnisMap({ refresh: Boolean(refresh) });
+      if (campaign_name) return getCampaignDNISList(campaign_name);
+      return getDNISList({ selectUnassigned: Boolean(unassigned_only) });
+    })
+  );
+
+  // Tool: five9_get_prompts
+  server.tool(
+    'five9_get_prompts',
+    'Five9 prompt inventory (read-only): name, description, type (TTSGenerated / PreRecorded), and languages. Use this to see what greeting/menu audio already exists before creating another. The Five9 API takes no filter here, so name_pattern is applied client-side as a case-insensitive substring over the full list.',
+    {
+      name_pattern: z.string().optional().describe('Case-insensitive substring filter on prompt name (applied client-side)'),
+    },
+    asTool(async ({ name_pattern }) => {
+      const out = await getPrompts();
+      if (!name_pattern) return out;
+      const q = String(name_pattern).toLowerCase();
+      const prompts = out.prompts.filter(p => (p.name || '').toLowerCase().includes(q));
+      return { count: prompts.length, filtered_from: out.count, prompts };
+    })
+  );
+
+  // Tool: five9_get_vcc_configuration
+  server.tool(
+    'five9_get_vcc_configuration',
+    'Five9 domain-level configuration (read-only): domain id/name, recording / report / transcript servers, campaign settings (priority and ratio enabled, graceful agent state transition), misc VCC options, the state dialing rule, and timezone assignment. This is the domain-wide posture — per-campaign settings live in five9_get_outbound_campaign / five9_get_inbound_campaign. Read-only by design: modifyVCCConfiguration exists in the API but is deliberately not implemented.',
+    {},
+    asTool(() => getVCCConfiguration())
   );
 
   /* ---- Supervisor Web Services (live real-time telemetry) --------------- */

@@ -15,6 +15,15 @@ import {
   buildReportCriteriaXml,
   returnBlocks,
   tag,
+  // 2026-08-13 Phase G — config surface
+  promptBlocks,
+  assertResponseSize,
+  assertIvrDefinitionLimit,
+  getDnisMap,
+  invalidateDnisMap,
+  __setDnisMapCacheForTest,
+  MAX_IVR_DEFINITIONS,
+  MAX_IVR_RESPONSE_BYTES,
 } from '../src/five9-admin.js';
 
 test('parseXmlBlock: flat scalar block', () => {
@@ -105,4 +114,106 @@ test('returnBlocks/tag: exported extractors still behave (regression)', () => {
   assert.equal(tag(blocks[0], 'name'), 'A');
   assert.equal(tag(blocks[1], 'name'), 'B&C');
   assert.equal(tag(blocks[0], 'missing'), '');
+});
+
+/* ---------------------------------------------------------------------- *
+ * Phase G (2026-08-13) — config surface reads.
+ *
+ * These pin the three WSDL findings that a reasonable reader would
+ * otherwise get wrong, each of which fails silently rather than loudly.
+ * Verbatim schema: docs/five9/phase-g-wsdl-v13.md
+ * ---------------------------------------------------------------------- */
+
+test('promptBlocks: getPrompts wraps in <prompts>, and returnBlocks finds NOTHING there', () => {
+  // Verbatim shape: <xs:element name="prompts" maxOccurs="unbounded"
+  // type="tns:promptInfo"/> — getPrompts is the ONE op in this client whose
+  // response is not <return>. Reaching for returnBlocks here yields an empty
+  // list that reads exactly like "this domain has no prompts".
+  const xml =
+    '<ns2:getPromptsResponse>' +
+    '<prompts><description>Main greeting</description><languages>en-US</languages>' +
+    '<name>Canvass Greeting</name><type>TTSGenerated</type></prompts>' +
+    '<prompts><description>Fallback</description><languages>en-US</languages>' +
+    '<languages>es-MX</languages><name>Canvass Fallback</name><type>PreRecorded</type></prompts>' +
+    '</ns2:getPromptsResponse>';
+
+  assert.deepEqual(returnBlocks(xml), [], 'returnBlocks must not match this response');
+
+  const blocks = promptBlocks(xml);
+  assert.equal(blocks.length, 2);
+
+  const parsed = blocks.map(parseXmlBlock);
+  assert.equal(parsed[0].name, 'Canvass Greeting');
+  assert.equal(parsed[0].type, 'TTSGenerated');
+  // languages is maxOccurs="unbounded": one language parses scalar, two parse
+  // as an array. asArray is what makes the shapes agree downstream.
+  assert.deepEqual(asArray(parsed[0].languages), ['en-US']);
+  assert.deepEqual(asArray(parsed[1].languages), ['en-US', 'es-MX']);
+  assert.deepEqual(promptBlocks('<ns2:getPromptsResponse/>'), []);
+});
+
+test('assertIvrDefinitionLimit: refuses above the ceiling, and names the pattern', () => {
+  assert.doesNotThrow(() => assertIvrDefinitionLimit(0, '^Canvass.*'));
+  assert.doesNotThrow(() => assertIvrDefinitionLimit(MAX_IVR_DEFINITIONS, '^Canvass.*'));
+  assert.throws(
+    () => assertIvrDefinitionLimit(MAX_IVR_DEFINITIONS + 1, '.*'),
+    /REFUSED: include_definition matched 4 scripts \(ceiling 3\) for name_pattern "\.\*"/,
+  );
+  // The limit is a parameter so a caller can tighten it, never widen it silently.
+  assert.throws(() => assertIvrDefinitionLimit(2, 'x', 1), /matched 2 scripts \(ceiling 1\)/);
+});
+
+test('assertResponseSize: opt-in ceiling, and the marker survives for the caller', () => {
+  // No ceiling configured => never throws, whatever the size. This is what
+  // keeps every pre-Phase-G caller's behaviour identical.
+  assert.doesNotThrow(() => assertResponseSize('getCampaigns', 50_000_000, undefined));
+  assert.doesNotThrow(() => assertResponseSize('getCampaigns', 50_000_000, 0));
+  // A missing content-length parses to NaN and must not be treated as oversize.
+  assert.doesNotThrow(() => assertResponseSize('getIVRScripts', NaN, 100));
+  assert.doesNotThrow(() => assertResponseSize('getIVRScripts', 100, 100));
+
+  assert.throws(
+    () => assertResponseSize('getIVRScripts', 101, 100),
+    /Five9 getIVRScripts: response is 101 bytes, over the 100-byte ceiling/,
+  );
+  // five9SoapCall keys off this marker to re-throw the refusal verbatim
+  // instead of relabelling it a network error.
+  try {
+    assertResponseSize('getIVRScripts', 101, 100);
+    assert.fail('should have thrown');
+  } catch (err) {
+    assert.equal(err.five9Oversize, true);
+  }
+  assert.ok(MAX_IVR_RESPONSE_BYTES > 0);
+});
+
+test('getDnisMap: cache is served without network and carries fetched_at', async () => {
+  // No credentials are configured in this process, so any real SOAP call
+  // throws. A resolved value therefore proves the cache short-circuited.
+  const seeded = {
+    fetched_at: '2026-08-13T00:00:00.000Z',
+    inbound_campaigns: 2,
+    assigned_count: 2,
+    assignments: { '9045551234': 'Main Number', '9045559999': 'Canvass Confirmation - Inbound' },
+    by_campaign: { 'Main Number': ['9045551234'], 'Canvass Confirmation - Inbound': ['9045559999'] },
+    unassigned_count: 1,
+    unassigned: ['9045550000'],
+  };
+  try {
+    __setDnisMapCacheForTest(seeded);
+    const hit = await getDnisMap();
+    assert.equal(hit, seeded);
+    assert.equal(hit.fetched_at, '2026-08-13T00:00:00.000Z');
+    assert.equal(hit.assignments['9045559999'], 'Canvass Confirmation - Inbound');
+    assert.deepEqual(hit.unassigned, ['9045550000']);
+
+    // refresh must NOT be served from cache — it has to attempt a real read,
+    // which fails here for want of credentials. That failure is the proof.
+    await assert.rejects(() => getDnisMap({ refresh: true }), /credentials not configured/);
+
+    invalidateDnisMap();
+    await assert.rejects(() => getDnisMap(), /credentials not configured/);
+  } finally {
+    invalidateDnisMap();
+  }
 });
