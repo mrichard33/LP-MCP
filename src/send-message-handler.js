@@ -698,6 +698,25 @@ async function getInboundEmailToAddress(contactId) {
  * ignored. We also exclude the bot's own bridge phrase ("asked me to reach
  * out") so a prior bot reply never re-triggers the bridge (once per thread).
  *
+ * 2026-08-13 — Randy signs TWO ways and the pattern only caught one. The
+ * sign-off is sometimes the first name alone and sometimes the full name:
+ *   "Randy\nReece Windows & Doors"       → "randy reece windows"       ✔ caught
+ *   "Randy Reece\nReece Windows & Doors" → "randy reece reece windows" ✘ missed
+ * The second cannot match `randy\s+reece\s+windows`: after "randy reece" the
+ * next token is "reece", not "windows", and there is no second "randy" to
+ * restart from. So 85 of 99 Randy-signed threads in the 90 days to 2026-08-13
+ * were classified 'rep' — no bridgeName, so the lead got a reply from Mark
+ * with no explanation of the voice change. `randy(?:\s+reece)?\s+reece\s+
+ * windows` catches both (the optional group backtracks to empty for the
+ * first form).
+ *
+ * Re-validated against production before shipping, same discipline as the
+ * 2026-06-18 re-base: the widened pattern matches 99 emails (vs 14), the 85
+ * newly caught ones contain NO Mark sign-off, and the 5 emails matching both
+ * Randy and Mark already matched the old pattern too (they carry two
+ * signature blocks — a template artifact), so no classification changes.
+ * Purely additive.
+ *
  * Returns:
  *   'mark'  — outbound email was a Mark-signed broadcast/nurture
  *   'randy' — outbound email was a Randy-signed broadcast/nurture
@@ -705,6 +724,22 @@ async function getInboundEmailToAddress(contactId) {
  *   null    — no prior outbound email found or lookup failed
  * Fail-open: callers treat null as 'rep' (the safe, non-aggressive opener).
  */
+/**
+ * The pure classification half of getThreadSenderType. Takes the tag-stripped,
+ * lowercased body+subject of the most recent outbound email; returns
+ * 'rep' | 'randy' | 'mark'. Exported for unit tests (no GHL required).
+ *
+ * Order matters: the bot's own bridge phrase wins over any sign-off, so a
+ * prior bot reply never re-triggers the bridge.
+ */
+export function classifyThreadSenderText(text) {
+  const t = String(text || '');
+  if (/asked me to reach out/i.test(t)) return 'rep';
+  if (/randy(?:\s+reece)?\s+reece\s+windows/i.test(t)) return 'randy';
+  if (/mark\s+reece\s+windows/i.test(t)) return 'mark';
+  return 'rep';
+}
+
 async function getThreadSenderType(contactId) {
   if (!contactId || !GHL_API_KEY) return null;
 
@@ -741,17 +776,7 @@ async function getThreadSenderType(contactId) {
     // whitespace (\s+), not newlines, since the email-detail body is HTML.
     const text = `${rawBody} ${subjectText}`.replace(/<[^>]+>/g, ' ').toLowerCase();
 
-    let senderType;
-    if (/asked me to reach out/i.test(text)) {
-      // The bot's own rep-voiced bridge reply — never re-trigger the bridge.
-      senderType = 'rep';
-    } else if (/randy\s+reece\s+windows/i.test(text)) {
-      senderType = 'randy';
-    } else if (/mark\s+reece\s+windows/i.test(text)) {
-      senderType = 'mark';
-    } else {
-      senderType = 'rep';
-    }
+    const senderType = classifyThreadSenderText(text);
 
     console.log(`[SendMessage] v3.15.1: getThreadSenderType for ${contactId}: emailId=${emailId} → ${senderType}`);
     return senderType;
