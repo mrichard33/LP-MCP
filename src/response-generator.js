@@ -1103,7 +1103,12 @@ export function formatRepFirstName(raw) {
 // Configurable because the in-office rep is a person who can change; the
 // default tracks the location's "Rep Name" custom value (SsBG7j5KQAIP1SFP2Sca
 // = "Mark"). Keep the two in sync if that value is ever changed in GHL.
-const IN_OFFICE_SENDER_NAME = process.env.AGENTIC_REPLY_SENDER_NAME || 'Mark';
+// 2026-08-13 — read per call, NOT captured at module load. This is the name the
+// customer sees; pinning it at import meant changing the in-office rep in
+// Railway required a redeploy to take effect. It is a config change now.
+function configuredInOfficeSenderName() {
+  return process.env.AGENTIC_REPLY_SENDER_NAME || 'Mark';
+}
 
 // 2026-08-13 — Randy is the broadcast email and video voice. He is NEVER the
 // author of an agentic reply; he may only be REFERENCED in third person inside
@@ -1124,16 +1129,108 @@ export function isRandyName(name) {
 
 /** The in-office rep the agentic reply is sent as. Never the field rep. */
 export function resolveReplySenderName() {
-  const configured = formatRepFirstName(IN_OFFICE_SENDER_NAME);
+  const raw = configuredInOfficeSenderName();
+  const configured = formatRepFirstName(raw);
   if (isRandyName(configured)) {
     console.warn(
-      `[ResponseGenerator] ⛔ AGENTIC_REPLY_SENDER_NAME is set to "${IN_OFFICE_SENDER_NAME}" — ` +
+      `[ResponseGenerator] ⛔ AGENTIC_REPLY_SENDER_NAME is set to "${raw}" — ` +
       `Randy is the broadcast voice and can never author an agentic reply. ` +
       `Falling back to "${DEFAULT_IN_OFFICE_SENDER}". Fix the env var.`
     );
     return formatRepFirstName(DEFAULT_IN_OFFICE_SENDER);
   }
   return configured;
+}
+
+// ─── Who may author an agentic email reply ──────────────────────────
+// The sender universe is exactly {company voice, the in-office rep}. An email
+// reply comes from the company or from Mark — never from Randy, who is the
+// broadcast voice and appears only in third person inside a handoff bridge.
+//
+// AGENTIC_REPLY_SENDER_ALLOWLIST names the people who actually work the
+// agentic inbox, so a thread they signed can be answered in their own first
+// person. Anyone else detected in a thread's sign-off falls to COMPANY VOICE,
+// not to the in-office rep: a field sales rep does not read this inbox and
+// cannot follow through, and resolveOwningRepName's rule stands — Beverly does
+// not write these emails. Unset defaults to the configured in-office sender
+// alone, so behavior is unchanged until the list is populated.
+export function getReplySenderAllowlist() {
+  const raw = process.env.AGENTIC_REPLY_SENDER_ALLOWLIST;
+  const configured = resolveReplySenderName();
+  const names = (typeof raw === 'string' && raw.trim() !== '')
+    ? raw.split(',').map(formatRepFirstName)
+    : [configured];
+  // Randy can never be allowlisted into authorship, however the env is set.
+  const cleaned = names.filter((n) => n && !isRandyName(n));
+  if (cleaned.length !== names.filter(Boolean).length) {
+    console.warn(
+      `[ResponseGenerator] ⛔ AGENTIC_REPLY_SENDER_ALLOWLIST names Randy — dropped. ` +
+      `Randy is the broadcast voice and can never author an agentic reply.`
+    );
+  }
+  return cleaned.length ? cleaned : [configured].filter(Boolean);
+}
+
+/**
+ * Normalize a thread-sender verdict to { type, name }. Accepts the legacy bare
+ * strings ('rep' | 'randy' | 'mark') so any caller that has not been updated
+ * still behaves correctly.
+ */
+export function normalizeThreadSender(threadSender) {
+  if (threadSender && typeof threadSender === 'object') {
+    return { type: threadSender.type || 'rep', name: threadSender.name || null };
+  }
+  const s = String(threadSender || 'rep').toLowerCase();
+  if (s === 'randy') return { type: 'randy', name: 'Randy' };
+  if (s === 'mark') return { type: 'person', name: 'Mark' };
+  if (s === 'company') return { type: 'company', name: null };
+  return { type: 'rep', name: null };
+}
+
+/**
+ * Who this email reply is FROM, and whether it opens with a handoff bridge.
+ *
+ *   senderName === null  → company voice ("we / our team"), no personal signature
+ *   bridgeName !== null  → open with the handoff bridge, naming that person in
+ *                          THIRD person ("Randy asked me to reach out")
+ *   inherited === true   → the sender came from the thread's own sign-off, so
+ *                          the reply continues as that person in first person
+ *
+ * Randy is unreachable as an author here by construction: a Randy sign-off
+ * classifies as type 'randy' (never 'person', so it cannot reach the inherit
+ * branch), the allowlist drops him, and resolveReplySenderName guards the
+ * configured value. Pure.
+ */
+export function resolveEmailSender(threadSender) {
+  const inOffice = resolveReplySenderName();
+  const ts = normalizeThreadSender(threadSender);
+
+  // The lead is replying to a Randy-signed broadcast. Randy does not answer —
+  // the in-office rep does, and says so. This is the canonical bridge.
+  if (ts.type === 'randy') {
+    return { senderName: inOffice, bridgeName: 'Randy', inherited: false };
+  }
+
+  // A person signed the thread. Answer as them only if they work this inbox.
+  if (ts.type === 'person') {
+    const name = formatRepFirstName(ts.name);
+    if (name && !isRandyName(name) && getReplySenderAllowlist().some((a) => sameName(a, name))) {
+      return { senderName: name, bridgeName: null, inherited: true };
+    }
+    // Detected a human who does not work this inbox (or Randy slipping through
+    // a legacy 'person' verdict). Company voice — never sign as someone who
+    // cannot answer the reply, and never silently substitute the in-office rep
+    // for a name the lead has already seen.
+    return { senderName: null, bridgeName: null, inherited: false };
+  }
+
+  // Team/company-signed broadcast with no personal name to inherit.
+  if (ts.type === 'company') {
+    return { senderName: null, bridgeName: null, inherited: false };
+  }
+
+  // Prior bot reply, manual rep send, or nothing detectable → in-office rep.
+  return { senderName: inOffice, bridgeName: null, inherited: false };
 }
 
 /**
@@ -1424,34 +1521,39 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
 
   // v3.15.1: Email reply opener awareness — select the opener based on who
   // AUTHORED (signed) the email the lead is replying to (email channel only).
-  // Detection is sign-off based: 'mark'/'randy' = a broadcast/nurture email
-  // signed by that person; 'rep' = a prior bot reply or manual rep send.
+  //
+  // 2026-08-13 — the reply now INHERITS the sender from the thread instead of
+  // always being the configured in-office rep. If the prior outbound was signed
+  // by the team, the reply comes from the team; if it was signed by someone who
+  // works this inbox, it continues as that person. The sender universe is
+  // exactly {company voice, the in-office rep} — see resolveEmailSender. Randy
+  // is never the author under any branch; he is referenced in third person by
+  // the bridge, which is correct and on-canon.
   if (channel === 'email') {
-    const senderType = opts.threadSenderType ?? 'rep';
-    const bridgeName = senderType === 'randy' ? 'Randy'
-      : senderType === 'mark' ? 'Mark'
-      : null;
-    // 2026-07-29 (Kelly Callahan incident) — the reply is sent AS THE IN-OFFICE
-    // REP (Mark), always. The nurture emails are Mark-signed too, so on the
-    // overwhelmingly common path the signer and the sender are the SAME person
-    // and a bridge is incoherent by construction. Resolved to a literal name so
-    // no merge tag can reach the body.
-    const senderName = resolveReplySenderName();
-    const collision = bridgeName && sameName(bridgeName, senderName);
+    const { senderName, bridgeName, inherited } = resolveEmailSender(opts.threadSenderType);
     parts.push(`\nEMAIL THREAD CONTEXT:`);
     if (bridgeName && ackOnly) {
       parts.push(`The email this lead is replying to was a broadcast/nurture email signed by ${bridgeName}, but this conversation has been ESCALATED TO A HUMAN — see ACKNOWLEDGMENT-ONLY CONDUCT below. Do NOT use a handoff bridge and do NOT explain the change of voice. Acknowledge and stop.`);
-    } else if (bridgeName && collision) {
-      // The nurture signer IS the reply sender. A bridge here reads
-      // "Mark here — Mark asked me to reach out." No bridge is always better
-      // than a self-referential one.
-      parts.push(`The email this lead is replying to was a broadcast/nurture email signed by ${bridgeName}, and ${bridgeName} is also the rep this reply comes from. Do NOT use a handoff bridge — a person cannot hand off to themselves. Open directly as ${bridgeName}, in first person. Example opener: "Thanks for getting back to me, [first name]."`);
     } else if (bridgeName && senderName) {
-      parts.push(`The email this lead is replying to was a broadcast/nurture email signed by ${bridgeName}. Your reply comes from ${senderName}, a different person — open with the handoff bridge EXACTLY as written here: "${senderName} here — ${bridgeName} asked me to reach out personally after seeing your message." Then continue in rep/company (we/our team) voice. Use the bridge ONCE — do not repeat it if the rep is already the established voice in the thread.`);
+      // The canonical Randy flow: a workflow sent the broadcast as Randy, the
+      // lead replied, and the in-office rep answers — saying Randy asked them
+      // to. Randy is named in THIRD person and never authors.
+      parts.push(`The email this lead is replying to was a broadcast/nurture email signed by ${bridgeName}. Your reply comes from ${senderName}, a different person — open with the handoff bridge EXACTLY as written here: "${senderName} here — ${bridgeName} asked me to reach out personally after seeing your message." Then continue in rep/company (we/our team) voice. Use the bridge ONCE — do not repeat it if the rep is already the established voice in the thread. Write as ${senderName}: ${bridgeName} is being referred to in the third person and is NEVER the author of this reply.`);
     } else if (bridgeName) {
       // Signed nurture email and the in-office sender name is unavailable.
       // Bridge in company voice rather than guessing at — or inventing — a name.
-      parts.push(`The email this lead is replying to was a broadcast/nurture email signed by ${bridgeName}. Reply in COMPANY voice (we / our team) — open with "We saw your reply to ${bridgeName} and wanted to get back to you personally." Never invent a rep name and never write a merge tag.`);
+      parts.push(`The email this lead is replying to was a broadcast/nurture email signed by ${bridgeName}. Reply in COMPANY voice (we / our team) — open with "We saw your reply to ${bridgeName} and wanted to get back to you personally." ${bridgeName} is referred to in the third person and is NEVER the author of this reply. Never invent a rep name and never write a merge tag.`);
+    } else if (!senderName) {
+      // Team/company-signed broadcast, or a personal signature belonging to
+      // someone who does not work this inbox. Answer as the company rather than
+      // signing as a person who cannot follow through on the reply.
+      parts.push(`The email this lead is replying to carries no personal signature you can answer as — it was sent in the company's name. Reply in COMPANY voice (we / our team) and do NOT sign it with any personal name. Do NOT invent a rep name and never write a merge tag. Open by responding to what they actually said. Example opener: "Thanks for getting back to us, [first name]."`);
+    } else if (inherited) {
+      // The thread is already signed by this person and they work this inbox.
+      // A bridge here would read "Mark here — Mark asked me to reach out"; the
+      // 2026-07-29 collision bug. Structurally impossible now (a bridge is only
+      // ever Randy, who can never be the sender) but the instruction stands.
+      parts.push(`The email this lead is replying to was signed by ${senderName}, and this reply also comes from ${senderName} — the same person continuing their own thread. Do NOT use a handoff bridge; a person cannot hand off to themselves. Open directly as ${senderName}, in first person. Example opener: "Thanks for getting back to me, [first name]."`);
     } else {
       parts.push(`The email this lead is replying to was written by the rep (prior bot reply or manual rep send), not a broadcast/nurture email. Open directly as the rep — NO handoff bridge. Example opener: "Thanks for getting back to us, [first name]." or simply respond to what they said.`);
     }

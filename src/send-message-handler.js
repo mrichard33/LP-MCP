@@ -211,7 +211,7 @@
 import supabase from './supabase.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken, report429 } from './ghl-rate-limiter.js';
-import { generateResponse } from './response-generator.js';
+import { generateResponse, getReplySenderAllowlist, isRandyName } from './response-generator.js';
 import { buildAiFallback } from './ai-fallback.js';
 import { bumpContactCache } from './context-builder.js';
 // v3.6: rich GroupMe notification — same helpers used by tasks v2.0 +
@@ -717,27 +717,68 @@ async function getInboundEmailToAddress(contactId) {
  * signature blocks — a template artifact), so no classification changes.
  * Purely additive.
  *
- * Returns:
- *   'mark'  — outbound email was a Mark-signed broadcast/nurture
- *   'randy' — outbound email was a Randy-signed broadcast/nurture
- *   'rep'   — outbound email was rep-authored (prior bot reply / manual send)
- *   null    — no prior outbound email found or lookup failed
- * Fail-open: callers treat null as 'rep' (the safe, non-aggressive opener).
+ * Returns { type, name } (2026-08-13 — was a bare string):
+ *   { type: 'randy',   name: 'Randy' } — Randy-signed broadcast → handoff bridge
+ *   { type: 'person',  name }          — signed by an agentic-inbox sender
+ *   { type: 'company', name: null }    — company/team-signed, nobody to inherit
+ *   { type: 'rep',     name: null }    — prior bot reply / manual send / unknown
+ *   null                               — no prior outbound email, or lookup failed
+ * Fail-open: callers treat null as 'rep' (the safe, non-aggressive opener), and
+ * normalizeThreadSender still accepts the legacy bare strings.
  */
+/** Escape a name for safe interpolation into a RegExp. */
+function escapeForRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Sign-off matcher for a given first name, allowing an optional surname:
+ *   "Mark\nReece Windows & Doors"       → "mark reece windows"
+ *   "Randy Reece\nReece Windows & Doors" → "randy reece reece windows"
+ * Also accepts the "Reece Home Protection" brand, which some broadcasts use.
+ */
+function signOffPattern(firstName) {
+  return new RegExp(
+    `${escapeForRegExp(String(firstName).toLowerCase())}(?:\\s+[a-z'’-]+)?\\s+reece\\s+(?:windows|home\\s+protection)`,
+    'i'
+  );
+}
+
+// A broadcast sent in the company's name with no person to answer as.
+const COMPANY_SIGNOFF = /reece\s+home\s+protection|the\s+reece\s+team/i;
+
 /**
  * The pure classification half of getThreadSenderType. Takes the tag-stripped,
- * lowercased body+subject of the most recent outbound email; returns
- * 'rep' | 'randy' | 'mark'. Exported for unit tests (no GHL required).
+ * lowercased body+subject of the most recent outbound email and returns
+ * { type, name }:
+ *
+ *   { type: 'randy',   name: 'Randy' }  broadcast signed by Randy → bridge
+ *   { type: 'person',  name: 'Mark'  }  signed by someone who works this inbox
+ *   { type: 'company', name: null    }  company/team-signed, nobody to inherit
+ *   { type: 'rep',     name: null    }  prior bot reply, manual send, unknown
+ *
+ * Exported for unit tests (no GHL required). `allowlist` defaults to the
+ * configured agentic senders; only those names produce a 'person' verdict, so
+ * a field rep whose name reaches a template is answered in company voice
+ * rather than impersonated. Randy is checked FIRST and can therefore never be
+ * classified 'person', whatever the allowlist says.
  *
  * Order matters: the bot's own bridge phrase wins over any sign-off, so a
- * prior bot reply never re-triggers the bridge.
+ * prior bot reply never re-triggers the bridge (once per thread).
  */
-export function classifyThreadSenderText(text) {
+export function classifyThreadSenderText(text, opts = {}) {
   const t = String(text || '');
-  if (/asked me to reach out/i.test(t)) return 'rep';
-  if (/randy(?:\s+reece)?\s+reece\s+windows/i.test(t)) return 'randy';
-  if (/mark\s+reece\s+windows/i.test(t)) return 'mark';
-  return 'rep';
+  if (/asked me to reach out/i.test(t)) return { type: 'rep', name: null };
+  if (/randy(?:\s+reece)?\s+reece\s+windows/i.test(t)) return { type: 'randy', name: 'Randy' };
+
+  const allowlist = Array.isArray(opts.allowlist) ? opts.allowlist : getReplySenderAllowlist();
+  for (const name of allowlist) {
+    if (!name || isRandyName(name)) continue;
+    if (signOffPattern(name).test(t)) return { type: 'person', name };
+  }
+
+  if (COMPANY_SIGNOFF.test(t)) return { type: 'company', name: null };
+  return { type: 'rep', name: null };
 }
 
 async function getThreadSenderType(contactId) {
@@ -778,7 +819,10 @@ async function getThreadSenderType(contactId) {
 
     const senderType = classifyThreadSenderText(text);
 
-    console.log(`[SendMessage] v3.15.1: getThreadSenderType for ${contactId}: emailId=${emailId} → ${senderType}`);
+    console.log(
+      `[SendMessage] v3.16: getThreadSenderType for ${contactId}: emailId=${emailId} → ` +
+      `${senderType.type}${senderType.name ? ` (${senderType.name})` : ''}`
+    );
     return senderType;
   } catch (err) {
     console.warn(`[SendMessage] getThreadSenderType failed for ${contactId}: ${err.message}`);

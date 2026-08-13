@@ -17,7 +17,28 @@ import assert from 'node:assert/strict';
 process.env.SUPABASE_URL = process.env.SUPABASE_URL || 'http://localhost:54321';
 process.env.SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'test-key';
 
-const { isRandyName, formatRepFirstName } = await import('../src/response-generator.js');
+const {
+  isRandyName, formatRepFirstName, resolveReplySenderName,
+  getReplySenderAllowlist, resolveEmailSender, normalizeThreadSender,
+} = await import('../src/response-generator.js');
+
+/** Run fn with env vars set, restoring them afterwards. */
+function withEnv(vars, fn) {
+  const prev = {};
+  for (const [k, v] of Object.entries(vars)) {
+    prev[k] = process.env[k];
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
 
 // ── isRandyName ──────────────────────────────────────────────────────
 
@@ -82,4 +103,117 @@ test('a normal configured sender is returned unchanged', async () => {
 
 test('unset falls back to the Mark default', async () => {
   assert.equal(await senderNameWithEnv(undefined), 'Mark');
+});
+
+// ── The env is read per call, not captured at import ─────────────────
+// A Railway change to the in-office rep must take effect without a redeploy.
+
+test('AGENTIC_REPLY_SENDER_NAME is re-read on every call', () => {
+  const a = withEnv({ AGENTIC_REPLY_SENDER_NAME: 'Brad' }, () => resolveReplySenderName());
+  const b = withEnv({ AGENTIC_REPLY_SENDER_NAME: 'Dana' }, () => resolveReplySenderName());
+  assert.equal(a, 'Brad');
+  assert.equal(b, 'Dana', 'the value was captured at module load, not read per call');
+});
+
+test('the Randy guard still fires on a per-call read', () => {
+  assert.equal(withEnv({ AGENTIC_REPLY_SENDER_NAME: 'Randy' }, () => resolveReplySenderName()), 'Mark');
+});
+
+// ── Allowlist ────────────────────────────────────────────────────────
+
+test('unset allowlist defaults to the configured in-office sender alone', () => {
+  const list = withEnv(
+    { AGENTIC_REPLY_SENDER_NAME: 'Mark', AGENTIC_REPLY_SENDER_ALLOWLIST: undefined },
+    () => getReplySenderAllowlist()
+  );
+  assert.deepEqual(list, ['Mark']);
+});
+
+test('allowlist parses a comma-separated list', () => {
+  const list = withEnv(
+    { AGENTIC_REPLY_SENDER_NAME: 'Mark', AGENTIC_REPLY_SENDER_ALLOWLIST: 'Mark, Brad ,Dana' },
+    () => getReplySenderAllowlist()
+  );
+  assert.deepEqual(list, ['Mark', 'Brad', 'Dana']);
+});
+
+test('Randy is dropped from the allowlist however it is configured', () => {
+  const list = withEnv(
+    { AGENTIC_REPLY_SENDER_NAME: 'Mark', AGENTIC_REPLY_SENDER_ALLOWLIST: 'Randy,Mark' },
+    () => getReplySenderAllowlist()
+  );
+  assert.deepEqual(list, ['Mark']);
+  const onlyRandy = withEnv(
+    { AGENTIC_REPLY_SENDER_NAME: 'Mark', AGENTIC_REPLY_SENDER_ALLOWLIST: 'Randy' },
+    () => getReplySenderAllowlist()
+  );
+  assert.ok(!onlyRandy.some(isRandyName), 'Randy must never be an allowed author');
+});
+
+// ── normalizeThreadSender accepts legacy bare strings ────────────────
+
+test('legacy string verdicts still normalize', () => {
+  assert.deepEqual(normalizeThreadSender('randy'), { type: 'randy', name: 'Randy' });
+  assert.deepEqual(normalizeThreadSender('mark'), { type: 'person', name: 'Mark' });
+  assert.deepEqual(normalizeThreadSender('rep'), { type: 'rep', name: null });
+  assert.deepEqual(normalizeThreadSender(null), { type: 'rep', name: null });
+});
+
+// ── resolveEmailSender — the four tiers ──────────────────────────────
+
+const asMark = (fn) => withEnv(
+  { AGENTIC_REPLY_SENDER_NAME: 'Mark', AGENTIC_REPLY_SENDER_ALLOWLIST: 'Mark' }, fn
+);
+
+test('Randy-signed thread → Mark authors, Randy named in the bridge', () => {
+  const r = asMark(() => resolveEmailSender({ type: 'randy', name: 'Randy' }));
+  assert.equal(r.senderName, 'Mark', 'the reply is authored by the in-office rep');
+  assert.equal(r.bridgeName, 'Randy', 'Randy is the third-person subject of the bridge');
+  assert.equal(r.inherited, false);
+  assert.ok(!isRandyName(r.senderName), 'Randy must never be the author');
+});
+
+test('Mark-signed thread → Mark continues in first person, no bridge', () => {
+  const r = asMark(() => resolveEmailSender({ type: 'person', name: 'Mark' }));
+  assert.equal(r.senderName, 'Mark');
+  assert.equal(r.bridgeName, null, 'a person cannot hand off to themselves');
+  assert.equal(r.inherited, true);
+});
+
+test('non-allowlisted person → company voice, NOT that person and NOT Mark', () => {
+  const r = asMark(() => resolveEmailSender({ type: 'person', name: 'Beverly' }));
+  assert.equal(r.senderName, null, 'company voice — no personal signature');
+  assert.equal(r.bridgeName, null);
+});
+
+test('company-signed thread → company voice', () => {
+  const r = asMark(() => resolveEmailSender({ type: 'company', name: null }));
+  assert.equal(r.senderName, null);
+  assert.equal(r.bridgeName, null);
+});
+
+test('rep/undetectable thread → the configured in-office sender', () => {
+  for (const v of [{ type: 'rep', name: null }, null, undefined, 'rep']) {
+    const r = asMark(() => resolveEmailSender(v));
+    assert.equal(r.senderName, 'Mark');
+    assert.equal(r.bridgeName, null);
+    assert.equal(r.inherited, false);
+  }
+});
+
+test('a Randy verdict can never yield Randy as the author, even mislabelled', () => {
+  // Defensive: a legacy/mislabelled {type:'person', name:'Randy'} must still
+  // not author as Randy — it falls to company voice.
+  const r = asMark(() => resolveEmailSender({ type: 'person', name: 'Randy' }));
+  assert.ok(!isRandyName(r.senderName), 'Randy authored a reply');
+  assert.equal(r.senderName, null);
+});
+
+test('even with Randy configured everywhere, the author is never Randy', () => {
+  const r = withEnv(
+    { AGENTIC_REPLY_SENDER_NAME: 'Randy', AGENTIC_REPLY_SENDER_ALLOWLIST: 'Randy' },
+    () => resolveEmailSender({ type: 'randy', name: 'Randy' })
+  );
+  assert.equal(r.senderName, 'Mark');
+  assert.equal(r.bridgeName, 'Randy');
 });
