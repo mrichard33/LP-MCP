@@ -65,14 +65,27 @@ function decodeXml(s) {
 
 /**
  * assertResponseSize — opt-in response ceiling, exported so it is provable
- * offline. five9SoapCall applies it twice: once on the declared
- * content-length (so an oversized body is never read into memory at all),
- * and once on the actual text for servers that omit the header.
+ * offline. five9SoapCall applies it twice: on the declared content-length,
+ * and on the actual body text.
  *
  * 2026-08-13 Phase G: getIVRScripts has no names-only mode — every match
  * carries its full xmlDefinition — so a wide namePattern can return a body
  * far larger than anything else this client fetches. The ceiling turns that
  * into a clear error instead of a 20s timeout or a memory spike.
+ *
+ * WHICH OF THE TWO CHECKS ACTUALLY FIRES, measured against the live domain
+ * on 2026-08-13 rather than assumed: Five9 returns LARGE getIVRScripts
+ * responses with `transfer-encoding: chunked` and **no content-length at
+ * all** (small responses do carry it). A missing header parses to NaN, which
+ * this function deliberately treats as "unknown, not oversize" — so on the
+ * exact responses the ceiling exists for, the pre-read check is a no-op and
+ * the body-length check is the one doing the work.
+ *
+ * The pre-read check is kept because it costs nothing and does fire on the
+ * ops that declare a length, but do NOT read it as a guarantee that an
+ * oversized body is never buffered. For a chunked response it is: fetch
+ * completes → body is read in full → then we refuse. The protection is
+ * against handing a huge string onward, not against receiving it.
  */
 export function assertResponseSize(method, size, maxBytes) {
   if (!maxBytes || !Number.isFinite(size) || size <= maxBytes) return;
@@ -116,9 +129,12 @@ export async function five9SoapCall(method, innerXml = '', { maxBytes } = {}) {
       body: envelope,
       signal: controller.signal,
     });
-    // Fail before reading the body when the server already declared it too big.
+    // Best-effort early refusal: only fires when the server declared a
+    // length. Five9 sends large getIVRScripts responses chunked with no
+    // content-length, so for those this is a no-op — see assertResponseSize.
     assertResponseSize(method, parseInt(res.headers.get('content-length') || '', 10), maxBytes);
     text = await res.text();
+    // The check that actually enforces the ceiling in practice.
     assertResponseSize(method, text.length, maxBytes);
   } catch (err) {
     // The ceiling is a deliberate refusal, not a transport failure — let it
