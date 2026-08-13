@@ -98,5 +98,51 @@ export function expectedFacts(reportType, rows) {
       bump('REECE', null, 'working_amount', null, r.working_cents, 1, false);
     }
   }
+
+  // ── Report 135 lead-grain metrics — a SECOND grain over the same rows ──
+  //
+  // `leads` above is a ROW count, and 135 is emitted at lead × disposition-
+  // state grain: history holds 243,917 rows over 72,570 distinct leads, and
+  // one lead's rows can carry different entry_dates (5,464 do, up to 12).
+  // So the row count cannot answer "how many leads", and NumSuperseded —
+  // LP's own count of duplicate records folded into a survivor — cannot be
+  // read off a row either. Both need the lead grain, and both are published
+  // separately rather than by changing what `leads` means.
+  //
+  // TWO FOLDS, and getting either wrong inflates the number:
+  //
+  //  1. MAX per lead, not Σ over rows. NumSuperseded repeats on every row of
+  //     a lead, so summing rows gives ~15,670 against a true 4,347 — 3.6×.
+  //
+  //  2. ONE OWNING BRANCH per lead. 429 leads appear under more than one
+  //     (market, branch) inside a snapshot, and these facts are consumed
+  //     ADDITIVELY — the dashboard sums a market's branch rows. Folding per
+  //     branch would count those leads once per branch: 72,862 distinct /
+  //     4,370 superseded against a true 72,570 / 4,347. Each lead is
+  //     therefore assigned to the branch of its LOWEST row_num — first
+  //     appearance in the file, deterministic — which makes both metrics sum
+  //     exactly to the company figure.
+  //
+  // Mirrors the lead-grain INSERT in scorecard_rebuild_facts()
+  // (sql/migrations/2026-08-13d_lead_grain_supersedes.sql).
+  if (reportType === 'lead_disposition') {
+    const owner = new Map(); // lp_lead_id → { market, branch, rowNum } at lowest row_num
+    const maxSup = new Map(); // lp_lead_id → MAX(num_superseded)
+    for (const r of rows) {
+      const id = String(r.lp_lead_id ?? '').trim();
+      if (!id) continue; // parser already reports id-less rows; they cannot be folded
+      const rowNum = r.row_num ?? Number.MAX_SAFE_INTEGER;
+      const prev = owner.get(id);
+      if (!prev || rowNum < prev.rowNum) {
+        owner.set(id, { market: r.market, branch: r.brn_id_raw || null, rowNum });
+      }
+      maxSup.set(id, Math.max(maxSup.get(id) ?? 0, r.num_superseded ?? 0));
+    }
+    for (const [id, o] of owner) {
+      bump(o.market, o.branch, 'leads_distinct', null, null, 1, true);
+      bump(o.market, o.branch, 'leads_superseded', null, null, maxSup.get(id) ?? 0, true);
+    }
+  }
+
   return out;
 }

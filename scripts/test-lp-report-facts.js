@@ -139,6 +139,65 @@ test('lead_disposition: leads count every row; sets/sold/net_sold are filtered; 
   assert.equal(leadCount, ROWS_LD.length);
 });
 
+// Report 135 at LEAD grain (2026-08-13d). Built so that BOTH wrong folds are
+// caught by the same fixture:
+//
+//   L1  one lead, three rows, NumSuperseded repeated → Σ over rows would say 4
+//   L2  one lead spanning two branches               → per-branch fold would
+//                                                      count it twice
+//
+// Against live data those two mistakes read as 15,670 (vs 4,347) and
+// 72,862 / 4,370 (vs 72,570 / 4,347) respectively — both plausible enough on a
+// screen that nothing but a test catches them.
+const ROWS_LD_GRAIN = [
+  { row_num: 1, lp_lead_id: 'L1', num_superseded: 0, market: 'ORL_MKT', brn_id_raw: 'ORL', appt_date: null, gsa_cents: 0, net_cents: 0 },
+  { row_num: 2, lp_lead_id: 'L1', num_superseded: 2, market: 'ORL_MKT', brn_id_raw: 'ORL', appt_date: null, gsa_cents: 0, net_cents: 0 },
+  { row_num: 3, lp_lead_id: 'L1', num_superseded: 2, market: 'ORL_MKT', brn_id_raw: 'ORL', appt_date: null, gsa_cents: 0, net_cents: 0 },
+  // L2 first appears under LAKE (row_num 4) — that is its owning branch.
+  { row_num: 4, lp_lead_id: 'L2', num_superseded: 1, market: 'ORL_MKT', brn_id_raw: 'LAKE', appt_date: null, gsa_cents: 0, net_cents: 0 },
+  { row_num: 5, lp_lead_id: 'L2', num_superseded: 1, market: 'ORL_MKT', brn_id_raw: 'ORL', appt_date: null, gsa_cents: 0, net_cents: 0 },
+  { row_num: 6, lp_lead_id: 'L3', num_superseded: 0, market: 'SAR_MKT', brn_id_raw: 'SAR', appt_date: null, gsa_cents: 0, net_cents: 0 },
+];
+
+test('lead_disposition lead grain: MAX per lead, and one owning branch per lead', () => {
+  const facts = expectedFacts('lead_disposition', ROWS_LD_GRAIN);
+  const k = (market, branch, metric) => factKey({ market, branch_code_raw: branch, metric, bucket: null });
+  const count = (market, branch, metric) => facts.get(k(market, branch, metric))?.count;
+
+  // FOLD 1 — MAX per lead, not Σ over rows. L1's three rows carry 0,2,2.
+  assert.equal(count('ORL_MKT', 'ORL', 'leads_superseded'), 2); // not 4
+  // FOLD 2 — L2 is owned by LAKE (its lowest row_num) and counted ONCE.
+  assert.equal(count('ORL_MKT', 'LAKE', 'leads_distinct'), 1);
+  assert.equal(count('ORL_MKT', 'LAKE', 'leads_superseded'), 1);
+  assert.equal(count('ORL_MKT', 'ORL', 'leads_distinct'), 1); // L1 only — NOT L2 as well
+  // A lead with no supersedes still publishes, at zero — absent would read as
+  // unmeasured on the dashboard, which is a different claim.
+  assert.equal(count('SAR_MKT', 'SAR', 'leads_distinct'), 1);
+  assert.equal(count('SAR_MKT', 'SAR', 'leads_superseded'), 0);
+
+  // ADDITIVITY is the whole point: these are summed across a market's branches
+  // by the dashboard, so the branch rows must total the company figure exactly.
+  const total = (metric) => [...facts.values()].filter((f) => f.metric === metric).reduce((a, f) => a + f.count, 0);
+  assert.equal(total('leads_distinct'), 3);   // L1, L2, L3 — not 4
+  assert.equal(total('leads_superseded'), 3); // 2 + 1 + 0 — not 6
+
+  // The row-count basis is UNCHANGED. `leads` still counts every row, including
+  // both of L2's, so the two grains stay independently readable.
+  assert.equal(total('leads'), ROWS_LD_GRAIN.length);
+  assert.equal(count('ORL_MKT', 'ORL', 'leads'), 4);
+});
+
+test('lead_disposition lead grain: rows with no lp_lead_id publish no lead-grain fact', () => {
+  // ROWS_LD carries no ids — the parser reports those separately, and a row
+  // that cannot be attributed to a lead must not invent one.
+  const facts = expectedFacts('lead_disposition', ROWS_LD);
+  assert.equal([...facts.values()].filter((f) => f.metric === 'leads_distinct').length, 0);
+  assert.equal([...facts.values()].filter((f) => f.metric === 'leads_superseded').length, 0);
+  // …while the row-count metrics are untouched by the new block.
+  const leadCount = [...facts.values()].filter((f) => f.metric === 'leads').reduce((a, f) => a + f.count, 0);
+  assert.equal(leadCount, ROWS_LD.length);
+});
+
 const ROWS_SC = [ // source_cost
   { num_raw: 100, num_set: 50, num_cnf: 40, num_issued: 30, num_sat: 20, num_sold: 10, num_net_sold: 8,
     gsa_cents: 25000000, nsa_cents: 20000000, mcost_cents: 100000, working_cents: 0 },
