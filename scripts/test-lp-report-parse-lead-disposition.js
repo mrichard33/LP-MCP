@@ -117,3 +117,66 @@ test('validate: missing id and unparseable entrydate fail closed', () => {
   assert.equal(badDate.ok, false);
   assert.ok(badDate.violations.some((v) => v.rule === 'bad_entry_date'));
 });
+
+// ── Contact fields (2026-08-13f) ─────────────────────────────────────────────
+//
+// These five columns were in the file from the start and the parser dropped
+// them, which is why lead contact data only ever existed in the PDF-era
+// lp_lead_disposition_rows and died with the CSV cutover. HEADER above is the
+// real live layout and already carried every one of them.
+
+test('contact: Phone / Email / Address1 / lastname / FirstName are extracted', () => {
+  const { rows } = parseLeadDispositionCsv(csv(row({
+    id: '5001', lastname: "O'Brien", FirstName: 'Dana',
+    Phone: '(941) 555-0134', Email: 'Dana.OBrien@Example.COM', Address1: '42 Bay St',
+  })));
+  const r = rows[0];
+  assert.equal(r.last_name, "O'Brien");
+  assert.equal(r.first_name, 'Dana');
+  assert.equal(r.phone, '(941) 555-0134');
+  assert.equal(r.address, '42 Bay St');
+  // VERBATIM, not lowercased. The canvasser audit turns on what was actually
+  // typed, so normalising at write time would destroy the only evidence.
+  assert.equal(r.email, 'Dana.OBrien@Example.COM');
+});
+
+test('contact: blank cells are null, never empty string', () => {
+  // A lead with no email is a real and common case — 10% of channel-sourced
+  // leads. It must be distinguishable from '' so a read path cannot count it.
+  const { rows } = parseLeadDispositionCsv(csv(row({ Email: '', Phone: '  ' })));
+  assert.equal(rows[0].email, null);
+  assert.equal(rows[0].phone, null);
+});
+
+// The OTHER 135 layout: no contact columns, and City/State CAPITALISED. Headers
+// are keyed exactly and never lowercased, so `r.city` is undefined here — which
+// is precisely how the two layouts are told apart, and how the live feed was
+// confirmed to be the contact-bearing one (live city is populated).
+const SLIM_HEADER = 'id,Category,lastresult,dspdescr,NumDials,sds_id,PromoterName,entrydate,src_id,SourceSubDescr,srcdescr,City,State,Zip,brn_id,ApptDate,JobStatus,GSA,NetAmount,SDate,EDate,CurrentDateTime,UseColor,FullName,xsrc_id,xsrs_id,xPromoter,xSetter,xSortBy';
+const slimRow = (over = {}) => {
+  const base = {
+    id: '7001', Category: 'Killed', lastresult: 'NI', dspdescr: 'Data-Data Only - No Appt',
+    NumDials: '3', sds_id: '2', PromoterName: '', entrydate: '1/6/2026', src_id: 'Internet',
+    SourceSubDescr: 'Modernize', srcdescr: 'Internet', City: 'Orlando', State: 'FL',
+    Zip: '32801', brn_id: 'ORL', ApptDate: '', JobStatus: '', GSA: '0', NetAmount: '0',
+    SDate: '1/1/2026', EDate: '8/5/2026', CurrentDateTime: '8/5/2026 10:31', UseColor: 'TRUE',
+    FullName: 'Mark Richard', xsrc_id: 'ALL', xsrs_id: 'ALL', xPromoter: 'ALL',
+    xSetter: 'ALL', xSortBy: '',
+  };
+  return SLIM_HEADER.split(',').map((h) => ({ ...base, ...over })[h] ?? '').join(',');
+};
+
+test('contact: the SLIM layout still ingests, with contact fields null', () => {
+  const { rows } = parseLeadDispositionCsv([SLIM_HEADER, slimRow()].join('\n'));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].lp_lead_id, '7001');
+  // Absent columns are NULL — "this layout did not carry it", not "no email".
+  for (const f of ['last_name', 'first_name', 'phone', 'email', 'address']) {
+    assert.equal(rows[0][f], null, `${f} should be null under the slim layout`);
+  }
+  // The tell: City/State are capitalised here, so the exact-keyed lookup of
+  // `city` misses and lands null. Live snapshots have city POPULATED, which is
+  // what proves the daily feed is the contact-bearing layout.
+  assert.equal(rows[0].city, null);
+  assert.equal(rows[0].zip, '32801'); // Zip is capitalised in BOTH layouts
+});
