@@ -110,4 +110,43 @@ export function lpWallClockToGhlStartTime(lpTimestamp) {
   return `${y}-${mo}-${d}T${h}:${mi}:${s}${offStr}`;
 }
 
+/**
+ * Split a GHL appointment start time into the ET calendar date and ET
+ * wall-clock time that GHL's own appointment webhooks carry.
+ *
+ * GHL emits these two fields on the `ghl.appointment_booked` webhook as
+ * `startDate` ("2026-08-20") and `start_time` ("2:00 PM"), and downstream
+ * consumers — notably executeSetLPAppointment, which pushes the appointment
+ * into LP — parse that exact shape. Anything emitting that event from inside
+ * LP MCP has to produce the same two strings, so this is the one place that
+ * knows how.
+ *
+ * Both values are in ET because that is what the webhook carries and what LP
+ * stores. The input is an absolute instant (an ISO string with an offset, as
+ * built by buildAppointmentBody), so the conversion is DST-correct for free —
+ * do NOT hand-roll this against a fixed -04:00, which is EDT-only and silently
+ * shifts every appointment booked between November and March.
+ *
+ * @param {string|Date} startTime  ISO 8601 with offset, or a Date
+ * @returns {{ startDate: string, startTime12h: string }|null}
+ *          null when the input is missing or unparseable
+ */
+export function etAppointmentParts(startTime) {
+  if (!startTime) return null;
+  const d = startTime instanceof Date ? startTime : new Date(startTime);
+  if (Number.isNaN(d.getTime())) return null;
+
+  const { y, m, d: day } = etYmd(d);
+  const startDate = `${y}-${String(m).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+
+  // en-US h:mm A in ET. Normalize the narrow/non-breaking spaces some ICU
+  // builds emit between the minutes and the meridiem, and upper-case the
+  // meridiem, so the output is always exactly "2:00 PM".
+  const startTime12h = new Intl.DateTimeFormat('en-US', {
+    timeZone: TZ, hour: 'numeric', minute: '2-digit', hour12: true,
+  }).format(d).replace(/\s+/g, ' ').trim().toUpperCase();
+
+  return { startDate, startTime12h };
+}
+
 export const APPOINTMENT_TZ = TZ;

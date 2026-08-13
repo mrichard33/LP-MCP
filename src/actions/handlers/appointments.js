@@ -99,6 +99,7 @@ import { executeCreateTask } from './tasks.js';
 import { getContactCached } from '../contact-cache.js';
 import { isPlaceholderName, EMAIL_ASKED_TAG } from '../../services/identity-extraction.js';
 import { emitEvent } from '../../event-emitter.js';
+import { etAppointmentParts } from '../../appointment-dates.js';
 import supabase from '../../supabase.js';
 import { syncCancelledAppointmentState, reconcileGhlOnlyApptTag } from './appointment-field-sync.js';
 import { findExistingAppointment, emitSlotCheckEvent, isSlotCheckEnabled } from '../../appointments/slot-check.js';
@@ -240,6 +241,11 @@ async function persistQualifyingData(contactId, qualifyingData) {
 const POST_BOOKING_EMAIL_ASK_MESSAGE =
   "One more thing — what's the best email to send your confirmation and appointment details to?";
 
+// 2026-08-13 — tag guard for the deferred confirmation. Stamped on enqueue so a
+// handler re-run or a reaper requeue can never text the lead two confirmations
+// for one booking. Mirrors the EMAIL_ASKED_TAG discipline above.
+const DEFERRED_CONFIRM_TAG = 'booking:confirm-queued';
+
 /**
  * v1.1 — Queue a separate post-booking email ask when the contact still has no
  * email and has not already been asked. Idempotent via the booking:email-asked
@@ -280,6 +286,88 @@ async function enqueuePostBookingEmailAsk(contactId, action, context) {
     return { queued: true };
   } catch (err) {
     console.warn(`[ActionExecutor] post-booking email-ask threw for ${contactId} (fail-soft): ${err.message}`);
+    return { queued: false, reason: 'threw' };
+  }
+}
+
+/**
+ * 2026-08-13 — Send the confirmation the lead was promised but never got.
+ *
+ * When send-message-handler books inline it normally confirms in the same turn.
+ * If that inline attempt times out or hits a transient failure, the lead is sent
+ * honest hold copy instead ("let me get that time nailed down and text you right
+ * back") and the booking is left for the executor. Without this, the executor
+ * books it and NOBODY tells the lead — a promise made and silently dropped,
+ * which is worse than the confirm-too-early bug it replaced.
+ *
+ * The confirmation text is the model's own, captured at generation time and
+ * stamped onto this action's payload, so there is no re-generation and no drift
+ * from the on-brand copy.
+ *
+ * Re-reads the payload from the row rather than trusting the one this handler
+ * was called with: on the timeout path the stamp lands WHILE this execution is
+ * already in flight, so the in-memory payload predates it.
+ *
+ * Priority 10 places it ahead of the post-booking email ask (20). Both pass
+ * through the agentic send cooldown, so they land in order and never bundle.
+ * Best-effort — never fails a booking that already succeeded.
+ */
+async function enqueueDeferredConfirmation(contactId, action, context) {
+  if (!action?.id || !contactId) return { queued: false, reason: 'no_action_id' };
+  try {
+    const { data: row } = await supabase
+      .from('agent_actions')
+      .select('action_payload')
+      .eq('id', action.id)
+      .maybeSingle();
+
+    const deferred = row?.action_payload?.deferred_confirmation;
+    const message = deferred?.message ? String(deferred.message).trim() : '';
+    if (!message) return { queued: false, reason: 'none_pending' };
+
+    const contact = await getContactCached(contactId, context?._contactCache).catch(() => null);
+    const tags = Array.isArray(contact?.tags) ? contact.tags.map((t) => String(t).toLowerCase()) : [];
+    if (tags.includes(DEFERRED_CONFIRM_TAG)) {
+      return { queued: false, reason: 'already_queued' };
+    }
+
+    const { error } = await supabase.from('agent_actions').insert({
+      event_id: action.event_id || null,
+      action_type: 'send_message',
+      target_system: 'ghl',
+      target_entity: 'contact',
+      target_id: contactId,
+      action_payload: { message, channel: deferred.channel || 'sms' },
+      reasoning: `Deferred booking confirmation — the inline booking did not land in time, the lead was sent hold copy, and this keeps that promise (companion action ${action.id}).`,
+      rule_applied: 'DEFERRED_BOOKING_CONFIRMATION',
+      confidence: 1.0,
+      status: 'pending',
+      requires_approval: false,
+      priority: 10,
+    });
+    if (error) {
+      console.warn(`[ActionExecutor] deferred confirmation enqueue failed for ${contactId}: ${error.message}`);
+      return { queued: false, reason: 'insert_error' };
+    }
+
+    // Stamp asked-once NOW so a re-run can't double-send, and clear the key so
+    // the row no longer advertises an outstanding confirmation.
+    await applyGHLTag(contactId, DEFERRED_CONFIRM_TAG).catch(() => {});
+    const cleared = { ...(row.action_payload || {}) };
+    delete cleared.deferred_confirmation;
+    const { error: clearErr } = await supabase.from('agent_actions')
+      .update({ action_payload: cleared, updated_at: new Date().toISOString() })
+      .eq('id', action.id);
+    if (clearErr) {
+      // The tag is the real idempotency guard; a stale key just means the row
+      // still advertises a confirmation that has already been queued.
+      console.warn(`[ActionExecutor] deferred confirmation key clear failed for action ${action.id}: ${clearErr.message}`);
+    }
+
+    console.log(`[ActionExecutor] 📨 deferred booking confirmation queued for ${contactId} — promise kept`);
+    return { queued: true };
+  } catch (err) {
+    console.warn(`[ActionExecutor] deferred confirmation threw for ${contactId} (fail-soft): ${err.message}`);
     return { queued: false, reason: 'threw' };
   }
 }
@@ -642,12 +730,91 @@ export async function executeBookAppointment(action, context) {
   // affirmative-gate bypass doesn't persist for this contact. See §8 #6.
   await removeGHLTags(contactId, BOOKING_FLOW_TAGS).catch(() => {});
 
+  // 2026-08-13 — LP writeback through the agentic layer.
+  //
+  // Rule 112 GHL_APPT_LP_SYNC (enabled, priority 15) queues set_lp_appointment
+  // on ghl.appointment_booked. Until now this path never emitted that event, so
+  // the rule had simply never been fed: on contact lGQ0WjsMU2zmoq9MsVJH the
+  // only events for the appointment were appt.booking (telemetry) and
+  // ghl.workflow_handoff, and LP was carried ~6 minutes later by the GHL-native
+  // fallback I.LP-A instead.
+  //
+  // Why not build a rule on appt.booking, which already fires here: it is
+  // documented as pure telemetry (slot-check.js), it also fires from
+  // reconcileLpAppointmentToGhl — the LP→GHL direction, so a rule on it would
+  // push LP's own appointments back at LP — and its payload uses `startTime`
+  // (camelCase), which is in NONE of executeSetLPAppointment's date branches.
+  // It would fall through to the contact's last_appointment_start_date and
+  // silently sync a STALE date rather than failing loudly.
+  //
+  // Shape below mirrors a real GHL webhook row (reference event 2820152) so the
+  // handler parses it identically whichever producer it came from. calendar_id
+  // is emitted because it is authoritative for the GHL-only skip; calendar_name
+  // and title both carry the clean calendar name (the handler falls back
+  // title → calendar name), never the model's "<calendar> - <lead>" title.
+  // ghl_status drives the decision-maker line on the LP note and GroupMe card.
+  //
+  // Two owners by design: I.LP-A stays as the backstop it was built to be. The
+  // paths interlock — set_lp_appointment returns already_set_in_lp when LP
+  // holds the same date and time, and I.LP-A exits early on lp-appt-synced.
+  // This path is primary because it fires in seconds rather than the workflow's
+  // 15-minute wait and resolves the LP lead through a five-step chain the GHL
+  // workflow does not have.
+  //
+  // Best-effort, exactly like every other side effect in this branch: a failed
+  // emit must never fail a booking that has already landed in GHL.
+  try {
+    const etParts = etAppointmentParts(startTime);
+    const cleanCalendarName = payload.calendar_name
+      || Object.keys(CALENDAR_MAP).find((n) => CALENDAR_MAP[n] === calendarId)
+      || title;
+    const bookedContact = await getContactCached(contactId, context?._contactCache).catch(() => null);
+    const contactName = [bookedContact?.firstName, bookedContact?.lastName].filter(Boolean).join(' ')
+      || bookedContact?.contactName || bookedContact?.name || null;
+
+    await emitEvent({
+      event_type: 'ghl.appointment_booked',
+      event_subtype: 'created',
+      source: 'lp_mcp',
+      entity_type: 'contact',
+      entity_id: contactId,
+      ghl_contact_id: contactId,
+      payload: {
+        title: cleanCalendarName,
+        status: 'booked',
+        end_time: null,
+        startDate: etParts?.startDate || null,
+        start_time: etParts?.startTime12h || null,
+        calendar_id: calendarId,
+        calendar_name: cleanCalendarName,
+        contactName,
+        appointment_id: appointmentId,
+        ghl_status: status,
+      },
+      // One event per created appointment. The executor can re-run a
+      // book_appointment (reaper requeue, duplicate companion), and the
+      // idempotent-skip branch above returns before reaching here, but a
+      // genuine double-create would otherwise queue LP sync twice.
+      idempotency_key: appointmentId ? `ghl_appt_booked:${appointmentId}` : null,
+    });
+    console.log(`[ActionExecutor] 📤 ghl.appointment_booked emitted for ${contactId} (appt ${appointmentId}, ${cleanCalendarName} ${etParts?.startDate} ${etParts?.startTime12h}, ghl_status=${status}) → rule 112 GHL_APPT_LP_SYNC`);
+  } catch (err) {
+    console.warn(`[ActionExecutor] ghl.appointment_booked emit failed for ${contactId} (fail-soft, I.LP-A remains the backstop): ${err.message}`);
+  }
+
+  // 2026-08-13 — if the lead was told "text you right back" because the inline
+  // booking didn't land in time, this is where that promise gets kept. Must run
+  // BEFORE the email ask so the confirmation lands first. No-ops when the
+  // booking confirmed in-turn (the normal path).
+  const deferredConfirmation = await enqueueDeferredConfirmation(contactId, action, context);
+
   // v1.1 (2026-07-24 Engelke incident) — sequence the email ask to its own
   // message AFTER the booking lands. Idempotent + best-effort; never blocks.
   await enqueuePostBookingEmailAsk(contactId, action, context);
 
   return {
     action: 'appointment_booked',
+    deferred_confirmation_queued: !!deferredConfirmation.queued,
     appointment_id: appointmentId,
     calendar_id: calendarId,
     calendar_name: title,
