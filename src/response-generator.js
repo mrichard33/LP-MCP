@@ -229,6 +229,7 @@ import supabase from './supabase.js';
 // ─── Canvassing Pilot v2 (A.CV conf flow) — time-aware reschedule options ───
 import { computeRescheduleOptions } from './reschedule-options.js';
 import { lpWallClockToGhlStartTime } from './appointment-dates.js';
+import { PREREQUISITE_ASK_INSTRUCTION, resolveNextMissing } from './appointments/prerequisite-ask.js';
 import { formatDateTimeUS } from './format-helpers.js';
 import { callLLM, resolveLLM } from './llm-client.js';
 import {
@@ -1867,15 +1868,11 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   if (bcg && bcg.requires_in_home_gate === true && idGate && !idGate.ok) {
     // v1.1 (Victor Lopez incident 2026-07-04, R2): an in-home visit may NEVER
     // be offered as held or booked while a hard prerequisite is missing.
-    const askOrder = ['name', 'address', 'zip', 'decision_maker_question', 'phone'];
-    const nextMissing = askOrder.find(m => idGate.missing.includes(m)) || idGate.missing[0];
-    const askText = {
-      name: 'their name ("So I can get this set up right — who do I have the pleasure of speaking with?")',
-      address: 'the property address INCLUDING zip code ("What\'s the address of the home we\'d be looking at — street and zip?") — the zip is how we confirm they\'re in our service area',
-      zip: 'the zip code of the property ("And what\'s the zip there? Just want to confirm you\'re in our service area.")',
-      decision_maker_question: 'decision-maker presence ("Will everyone who\'s part of the decision be home for the visit?")',
-      phone: 'the best phone number to reach them',
-    }[nextMissing];
+    // Ask order + copy live in appointments/prerequisite-ask.js so this gate and
+    // the inline-booking failure path (send-message-handler) ask for the same
+    // thing in the same words. Behavior here is unchanged by the extraction.
+    const nextMissing = resolveNextMissing(idGate.missing) || idGate.missing[0];
+    const askText = PREREQUISITE_ASK_INSTRUCTION[nextMissing];
     parts.push(`\n═══════ IN-HOME BOOKING PREREQUISITES — NOT SATISFIED (GOVERNS THIS TURN) ═══════`);
     parts.push(`This conversation is heading toward an in-home ${bcg.resolved_calendar_name} visit, but required information is still missing: ${idGate.missing.join(', ')}.`);
     parts.push(`HARD RULES THIS TURN:`);

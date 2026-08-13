@@ -237,6 +237,7 @@ import { isInQuietHours, nextSendWindowOpenAt } from './services/quiet-hours.js'
 import { findNearDuplicate } from './services/message-similarity.js';
 import { checkNotSuperseded, commitAgenticSend } from './services/agentic-reply-locks.js';
 import { emitEvent } from './event-emitter.js';
+import { prerequisiteAskMessage } from './appointments/prerequisite-ask.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY || '';
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
@@ -1460,7 +1461,168 @@ const COMPANION_AUTO_EXECUTE = new Set([
   'reschedule_appointment',
 ]);
 
+// ═══════════════════════════════════════════════════════════════════
+// INLINE BOOKING (2026-08-13) — book before we promise
+// ═══════════════════════════════════════════════════════════════════
+//
+// Honest copy for the paths where a booking is still expected but hasn't
+// landed yet. Promises a follow-up and nothing else; the deferred
+// confirmation (below) is what keeps that promise.
+const BOOKING_HOLD_MESSAGE = 'Let me get that time nailed down and text you right back.';
+
+// The inline booking is a single GHL POST plus a couple of contact reads —
+// normally a few seconds. This bound exists only so a pathological GHL stall
+// can't eat the executor's ~60s handler budget and get the whole send reaped.
+// It is a safety net, NOT an expected branch: if it starts firing regularly
+// that is a signal to investigate GHL latency, not to raise the bound.
+const INLINE_BOOK_TIMEOUT_MS = Number(process.env.INLINE_BOOK_TIMEOUT_MS || 20000);
+
+// executeBookAppointment outcomes that mean an appointment demonstrably
+// EXISTS, so the lead may be told it's booked:
+//   appointment_booked                 — created, id returned
+//   appointment_rescheduled_existing   — object exists, moved in place
+//   appointment_book_skipped_existing  — idempotent_skip (already on the
+//                                        calendar) or create_claim_held
+//                                        (another worker is creating this
+//                                        exact slot for this contact)
+const BOOKING_LANDED_ACTIONS = new Set([
+  'appointment_booked',
+  'appointment_rescheduled_existing',
+  'appointment_book_skipped_existing',
+]);
+
+function bookingLanded(execResult) {
+  return !!execResult && BOOKING_LANDED_ACTIONS.has(execResult.action);
+}
+
+/** Reject after ms so a stalled GHL call can't hold the send hostage. */
+function withTimeoutMs(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label}_timeout_${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Book NOW, before the lead is told anything.
+ *
+ * WHY THIS EXISTS (2026-08-13, contact lGQ0WjsMU2zmoq9MsVJH): the companion
+ * was inserted from the fire-and-forget post-send tail, i.e. AFTER the SMS had
+ * already gone out, and then waited for the next executor heartbeat. On that
+ * trace the lead was told "you're locked in" at 16:45:39 and the appointment
+ * was created at 16:48:32 — 2m53s of a promise with nothing behind it, and no
+ * message that walks it back if the booking fails. sequence_order could never
+ * have fixed this: a row inserted after its parent ran cannot precede it.
+ *
+ * WHY THIS IS SAFE NOW — this deliberately reverses approval-path.js v4.10,
+ * which put booking after the send because the calendar write re-pointed the
+ * contact's assigned user and the SMS then fired from the calendar owner's
+ * number, breaking the lead's thread. GHL workflow 497e664a no longer resolves
+ * the sender that way: every SMS branch — (954) 280-8890, (954) 371-0083, and
+ * Default — now wraps the send in Save Current Assigned User ID → Assign to
+ * <pinned user> → Send SMS Reply → Assign Original User, selecting the user
+ * from `replyFromPhone` (computed here from the lead's last inbound, see
+ * sendViaWebhook). A calendar write can no longer move the From number.
+ * NOTE the scope of that evidence: it covers SMS. Live Chat (workflow steps
+ * 22→23) has no save/assign wrap, but a widget session carries no phone
+ * identity to hop, so the v4.10 symptom has no equivalent there.
+ *
+ * Returns { landed, execResult, actionId, deferred } — `deferred` means the
+ * booking is still expected but hasn't landed, so the caller sends hold copy
+ * and executeBookAppointment will send the confirmation when it does land.
+ */
+async function bookInlineBeforeConfirm(parentAction, generated, callPurpose, channel, confirmationMessage) {
+  const inserted = await insertCompanionAction(parentAction, generated, callPurpose);
+  if (!inserted.queued) return { landed: false, deferred: false, insert: inserted };
+
+  const actionId = inserted.action_id;
+
+  try {
+    const { executeActionById } = await import('./actions/index.js');
+    await withTimeoutMs(executeActionById(actionId), INLINE_BOOK_TIMEOUT_MS, 'inline_book');
+  } catch (err) {
+    console.warn(`[SendMessage] inline booking did not complete for action ${actionId}: ${err.message}`);
+  }
+
+  // The row is authoritative, not the return value — and re-reading is also
+  // what closes the timeout boundary: an execution we stopped waiting on may
+  // have completed in the meantime.
+  const { data: row } = await supabase
+    .from('agent_actions')
+    .select('status, execution_result')
+    .eq('id', actionId)
+    .maybeSingle();
+
+  const execResult = row?.execution_result || null;
+
+  if (row?.status === 'completed' && bookingLanded(execResult)) {
+    return { landed: true, deferred: false, execResult, actionId };
+  }
+
+  // Blocked by the R2 prerequisite gate: nothing was created and no retry will
+  // create it, so there is no confirmation to defer. The caller asks for the
+  // missing item instead.
+  if (execResult?.action === 'appointment_blocked_prerequisites') {
+    return { landed: false, deferred: false, blocked: execResult, execResult, actionId };
+  }
+
+  // A row that already reached 'completed' without landing and without being
+  // blocked is an outcome this function doesn't recognize. Nothing will retry
+  // it, so a deferred confirmation would never fire — stamping one would only
+  // make the GroupMe card promise a follow-up that cannot happen. Leave it
+  // unstamped so the card says so and a human picks it up.
+  if (row?.status === 'completed') {
+    console.warn(`[SendMessage] booking action ${actionId} completed with an unrecognized outcome (${execResult?.action || 'none'}) — no confirmation deferred`);
+    return { landed: false, deferred: false, execResult, actionId };
+  }
+
+  // Still expected to land (timed out, or a transient failure the executor will
+  // retry). Stamp the confirmation onto the row so executeBookAppointment sends
+  // it when the booking succeeds — the lead has been promised a follow-up and
+  // must not be left in silence. The handler re-reads this key at enqueue time,
+  // so stamping it while an abandoned execution is still in flight still works.
+  const stamped = await stampDeferredConfirmation(actionId, confirmationMessage, channel);
+  return { landed: false, deferred: stamped, execResult, actionId };
+}
+
+/**
+ * Record the confirmation the lead is owed once this booking lands.
+ * Best-effort: if the stamp fails the lead still got honest hold copy, and the
+ * booking still completes — they just don't get the automatic follow-up.
+ */
+async function stampDeferredConfirmation(actionId, message, channel) {
+  if (!actionId || !message) return false;
+  try {
+    const { data: row } = await supabase
+      .from('agent_actions')
+      .select('action_payload')
+      .eq('id', actionId)
+      .maybeSingle();
+    if (!row) return false;
+    const payload = { ...(row.action_payload || {}) };
+    payload.deferred_confirmation = { message, channel: channel || 'sms' };
+    const { error } = await supabase
+      .from('agent_actions')
+      .update({ action_payload: payload, updated_at: new Date().toISOString() })
+      .eq('id', actionId);
+    if (error) {
+      console.warn(`[SendMessage] deferred confirmation stamp failed for action ${actionId}: ${error.message}`);
+      return false;
+    }
+    console.log(`[SendMessage] 📌 deferred confirmation stamped on action ${actionId} — will send when the booking lands`);
+    return true;
+  } catch (err) {
+    console.warn(`[SendMessage] deferred confirmation stamp threw for action ${actionId}: ${err.message}`);
+    return false;
+  }
+}
+
 async function queueCompanionAction(parentAction, generated, callPurpose = null) {
+  return insertCompanionAction(parentAction, generated, callPurpose);
+}
+
+async function insertCompanionAction(parentAction, generated, callPurpose = null) {
   if (!generated || !generated.companion_action) {
     return { queued: false, reason: 'no_companion' };
   }
@@ -1481,9 +1643,10 @@ async function queueCompanionAction(parentAction, generated, callPurpose = null)
   }
 
   const parentSeq = typeof parentAction.sequence_order === 'number' ? parentAction.sequence_order : 0;
-  // book / reschedule run AFTER send_message; cancel runs BEFORE (mirrors
-  // approval-path.js v4.10 sequence_order race fix)
-  const seqAfterSend = (ctype === 'book_appointment' || ctype === 'reschedule_appointment');
+  // 2026-08-13: book_appointment now executes INLINE, before the send, so it
+  // genuinely runs first and seq reflects that. cancel has always run first.
+  // reschedule keeps v4.10's parentSeq + 2 — it is not on the inline path.
+  const seqAfterSend = (ctype === 'reschedule_appointment');
   const companionSeqOrder = seqAfterSend ? parentSeq + 2 : parentSeq - 1;
 
   // Quality Pass v1.0 Item 5 — stamp the analyzer's call purpose onto
@@ -2253,6 +2416,40 @@ export async function executeSendMessage(action, context) {
     console.warn(`[SendMessage] quality-pass checks threw for ${contactId} (fail-open): ${qualityErr.message}`);
   }
 
+  // ── Book BEFORE we promise (2026-08-13) ────────────────────────
+  // The generated message for a booking turn says "you're locked in". Make
+  // that true before it goes out: execute the booking now and let its outcome
+  // decide what the lead is actually told. See bookInlineBeforeConfirm for the
+  // trace this fixes and why reversing v4.10's ordering is safe.
+  let inlineBooking = null;
+  if (generated?.companion_action?.action_type === 'book_appointment') {
+    try {
+      // Pass `message`, not generated.message: by this point the disclosure
+      // guard and quality pass may have rewritten it, and the deferred
+      // confirmation must be the copy we would actually have sent.
+      inlineBooking = await bookInlineBeforeConfirm(
+        action, generated, context.call_purpose || null, channel, message
+      );
+    } catch (bookErr) {
+      // Never let this throw past here: the lead is mid-conversation and the
+      // worst acceptable outcome is honest hold copy, not a dropped turn.
+      console.warn(`[SendMessage] inline booking threw for ${contactId} (fail-soft): ${bookErr.message}`);
+      inlineBooking = { landed: false, deferred: false, threw: true };
+    }
+
+    if (!inlineBooking.landed) {
+      if (inlineBooking.blocked) {
+        // R2 gate blocked it deliberately — no appointment is coming, so the
+        // hold copy would be a promise we can't keep. Ask for what's missing.
+        message = prerequisiteAskMessage(inlineBooking.blocked.missing);
+        console.warn(`[SendMessage] 🚫 booking blocked for ${contactId} (missing: ${(inlineBooking.blocked.missing || []).join(', ')}) — sending prerequisite ask instead of confirmation`);
+      } else {
+        message = BOOKING_HOLD_MESSAGE;
+        console.warn(`[SendMessage] ⏳ booking not landed for ${contactId} — sending hold copy (deferred_confirmation=${inlineBooking.deferred})`);
+      }
+    }
+  }
+
   // ── Send (v3.3: channel-routed) ────────────────────────────────
   const _tPreSend = Date.now();
   const { result: sendResult, sendMethod } = await sendWithFallback(
@@ -2285,8 +2482,24 @@ export async function executeSendMessage(action, context) {
     // Companion action queue (v3.13): generateResponse may emit a
     // companion_action (book/cancel/reschedule). Insert is failure-soft —
     // the send already happened; rollback isn't possible.
+    //
+    // 2026-08-13: book_appointment is NOT queued here any more — it already
+    // ran inline, before the send (see bookInlineBeforeConfirm). Re-queuing it
+    // would book the contact a second time. cancel and reschedule are
+    // unchanged and still queue from this tail.
     let companionResult = { queued: false, reason: 'not_attempted' };
-    if (generated && generated.companion_action) {
+    if (inlineBooking) {
+      companionResult = {
+        queued: !!inlineBooking.actionId,
+        action_id: inlineBooking.actionId || null,
+        action_type: 'book_appointment',
+        inline: true,
+        landed: inlineBooking.landed,
+        deferred: !!inlineBooking.deferred,
+        blocked: !!inlineBooking.blocked,
+        reason: inlineBooking.actionId ? undefined : (inlineBooking.insert?.reason || 'inline_insert_failed'),
+      };
+    } else if (generated && generated.companion_action) {
       companionResult = await queueCompanionAction(action, generated, context.call_purpose || null);
     }
 
@@ -2404,7 +2617,20 @@ export async function executeSendMessage(action, context) {
         const cap = ca?.action_payload || {};
         let companionLine = '';
         if (ct === 'book_appointment') {
-          companionLine = `📅 Auto-booked: ${cap.calendar_name || '?'} — ${cap.start_time || '?'} (status: ${cap.status || '?'})`;
+          const slot = `${cap.calendar_name || '?'} — ${cap.start_time || '?'} (status: ${cap.status || '?'})`;
+          // 2026-08-13: the booking ran inline, so this line reports what
+          // actually happened rather than what was queued. A blocked or
+          // not-yet-landed booking must never read as "Auto-booked".
+          if (companionResult.blocked) {
+            companionLine = `🚫 Booking BLOCKED (prerequisites): ${slot} — lead was asked for the missing detail instead`;
+          } else if (companionResult.inline && !companionResult.landed) {
+            companionLine = `⏳ Booking NOT yet landed: ${slot} — lead got hold copy` +
+              (companionResult.deferred
+                ? `; confirmation will send when it lands`
+                : `; ⚠️ NO deferred confirmation stamped — lead may need a manual follow-up`);
+          } else {
+            companionLine = `📅 Auto-booked: ${slot}`;
+          }
         } else if (ct === 'cancel_appointment') {
           companionLine = `🗓 Auto-cancelled: ${cap.appointment_id || '?'}` + (cap.reason ? ` (reason: ${String(cap.reason).slice(0, 80)})` : '');
         } else if (ct === 'reschedule_appointment') {

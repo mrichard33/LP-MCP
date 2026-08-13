@@ -55,6 +55,35 @@
  *   No other behavior change. Pairs with response-generator v2.7.9
  *   which updates the PATH B / reschedule PATH B verbal templates.
  *
+ *   [2026-08-13 — THE CONSTRAINT ABOVE HAS DISSOLVED. Read this before
+ *   reasoning about booking order anywhere in the codebase.]
+ *   v4.10's whole premise was that the calendar write re-points the
+ *   contact's effective send-from user. GHL workflow 497e664a ("Send
+ *   Reply") no longer resolves the sender that way. Every SMS branch —
+ *   (954) 280-8890, (954) 371-0083, and Default — now wraps the send in
+ *     Save Current Assigned User ID → Assign to <pinned user>
+ *       → Send SMS Reply → Assign Original User
+ *   and selects that user from `replyFromPhone`, which LP MCP computes
+ *   from the lead's most recent inbound (see sendViaWebhook in
+ *   send-message-handler.js). The contact's live assignment — the thing a
+ *   calendar write changes — no longer determines the From number, so
+ *   booking first can no longer break the lead's thread.
+ *
+ *   The auto-fire path acted on this: send-message-handler now executes
+ *   book_appointment INLINE, before the send, so the lead is never told
+ *   "you're locked in" before the appointment exists (contact
+ *   lGQ0WjsMU2zmoq9MsVJH, 2026-08-13 — confirmation at 16:45:39, booking
+ *   at 16:48:32). See bookInlineBeforeConfirm.
+ *
+ *   THIS path is deliberately left alone. It inserts in Phase 1 and fires
+ *   in Phase 2 of the SAME heartbeat, so its parentSeq + 2 genuinely
+ *   orders execution and its exposure is ~500ms rather than minutes — a
+ *   different, much smaller problem than the one the auto-fire path had.
+ *   Scope note on the evidence: the workflow inspection covers SMS. Live
+ *   Chat (workflow steps 22→23) has no save/assign wrap, but a widget
+ *   session carries no phone identity to hop, so the v4.10 symptom has no
+ *   equivalent there.
+ *
  * v4.9 (2026-04-30) — COMPANION_AUTO_EXECUTE expanded for cancel/reschedule.
  *   Pairs with response-generator v2.7.8's cancellation flow, which can
  *   now emit two new companion types:
