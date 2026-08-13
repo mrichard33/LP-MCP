@@ -4,6 +4,8 @@
  * Phase A+B: READ coverage — campaign inventory/state (Phase A) plus full
  * Config-API reads (Phase B): campaign configs, profiles, lists,
  * dispositions, skills, users, DNC checks, and the async report trio.
+ * Phase G (2026-08-13) adds the config surface: IVR scripts, DNIS inventory
+ * and ownership map, prompts, and domain configuration.
  * No write methods live in this module — Phase C writes are in
  * src/five9/admin-writes.js and execute ONLY via the approve_action gate
  * (create_agent_action → approve_action → executor), never direct MCP calls.
@@ -62,10 +64,33 @@ function decodeXml(s) {
 }
 
 /**
+ * assertResponseSize — opt-in response ceiling, exported so it is provable
+ * offline. five9SoapCall applies it twice: once on the declared
+ * content-length (so an oversized body is never read into memory at all),
+ * and once on the actual text for servers that omit the header.
+ *
+ * 2026-08-13 Phase G: getIVRScripts has no names-only mode — every match
+ * carries its full xmlDefinition — so a wide namePattern can return a body
+ * far larger than anything else this client fetches. The ceiling turns that
+ * into a clear error instead of a 20s timeout or a memory spike.
+ */
+export function assertResponseSize(method, size, maxBytes) {
+  if (!maxBytes || !Number.isFinite(size) || size <= maxBytes) return;
+  const err = new Error(
+    `Five9 ${method}: response is ${size} bytes, over the ${maxBytes}-byte ceiling — narrow the request (e.g. a tighter name_pattern)`,
+  );
+  err.five9Oversize = true;
+  throw err;
+}
+
+/**
  * Low-level SOAP call. Returns the raw XML response body on success.
  * Throws with a readable message on HTTP errors, SOAP Faults, or timeout.
+ *
+ * opts.maxBytes — optional response ceiling (see assertResponseSize).
+ * Omitted by every pre-Phase-G caller, so their behaviour is unchanged.
  */
-export async function five9SoapCall(method, innerXml = '') {
+export async function five9SoapCall(method, innerXml = '', { maxBytes } = {}) {
   if (!credsConfigured()) {
     throw new Error('Five9 admin credentials not configured (FIVE9_USERNAME / FIVE9_PASSWORD Railway env vars)');
   }
@@ -91,8 +116,14 @@ export async function five9SoapCall(method, innerXml = '') {
       body: envelope,
       signal: controller.signal,
     });
+    // Fail before reading the body when the server already declared it too big.
+    assertResponseSize(method, parseInt(res.headers.get('content-length') || '', 10), maxBytes);
     text = await res.text();
+    assertResponseSize(method, text.length, maxBytes);
   } catch (err) {
+    // The ceiling is a deliberate refusal, not a transport failure — let it
+    // through verbatim rather than relabelling it a network error.
+    if (err?.five9Oversize) throw err;
     throw new Error(err.name === 'AbortError'
       ? `Five9 admin API timeout after ${TIMEOUT_MS}ms (${method})`
       : `Five9 admin API network error (${method}): ${err.message}`);
@@ -400,6 +431,212 @@ export async function checkDncForNumbers(numbers) {
   const on_dnc = returnBlocks(xml).map(b => decodeXml(b).trim()).filter(Boolean);
   const onSet = new Set(on_dnc);
   return { checked: list.length, on_dnc, not_on_dnc: list.filter(n => !onSet.has(n)) };
+}
+
+/* ------------------------------------------------------------------------ *
+ * Phase G (2026-08-13) — config-surface reads: IVR scripts, DNIS inventory,
+ * prompts, and domain configuration.
+ *
+ * FETCH NOTE. Every element order and response wrapper below was read from
+ * the live v13 schema on 2026-08-13 —
+ *   https://api.five9.com/wsadmin/v13/AdminWebService?wsdl&user=x
+ *   HTTP 200, 961,700 bytes, 20,205 lines
+ * — using the flexible DOTALL pattern `<xs:complexType[^>]*\bname="X"` from
+ * the Phase D FETCH NOTE, never the anchored one, and never read-response
+ * order. Full verbatim extracts: docs/five9/phase-g-wsdl-v13.md
+ *
+ * Three findings drive the shapes here, and each is a silent-failure trap:
+ *
+ *  1. getPrompts takes NO parameters (`<xs:sequence/>`) and its response
+ *     wraps results in <prompts>, NOT <return>. returnBlocks() finds nothing
+ *     on this one op — hence promptBlocks() below. Name filtering is
+ *     therefore client-side; there is no server-side pattern to pass.
+ *
+ *  2. getIVRScripts always returns the full xmlDefinition for every match.
+ *     There is no names-only mode, so `includeDefinition: false` still pays
+ *     the full download and only trims what we hand back. namePattern IS a
+ *     Five9-side regex, so narrowing it is the only real lever on size.
+ *
+ *  3. getDNISList/getCampaignDNISList return bare strings in <return>, not
+ *     structs — map them with decodeXml, not parseXmlBlock.
+ * ------------------------------------------------------------------------ */
+
+// Ceiling for the one op that can return an unbounded payload. A module
+// constant on purpose: this phase adds no env vars.
+export const MAX_IVR_RESPONSE_BYTES = 4_000_000;
+
+// Above this many matches, returning script XML is refused outright.
+export const MAX_IVR_DEFINITIONS = 3;
+
+// Serial fan-out spacing for the DNIS map. Matches the deliberate house
+// precedent in src/jobs/five9-config-snapshot.js (FIVE9_SNAPSHOT_DELAY_MS,
+// 250ms): concurrent Five9 admin session limits are undisclosed, so we walk
+// campaigns one at a time rather than probing them. See the note in
+// src/five9/admin-writes.js.
+const DNIS_MAP_DELAY_MS = 250;
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * assertIvrDefinitionLimit — pure guard, exported for offline tests.
+ * Script XML is large; asking for every definition at once is almost always
+ * a mistake, so it is refused rather than truncated.
+ */
+export function assertIvrDefinitionLimit(matchCount, namePattern, limit = MAX_IVR_DEFINITIONS) {
+  if (matchCount > limit) {
+    throw new Error(
+      `REFUSED: include_definition matched ${matchCount} scripts (ceiling ${limit}) for name_pattern "${namePattern}" — IVR script XML is large; narrow the pattern to ${limit} or fewer scripts`,
+    );
+  }
+}
+
+/**
+ * promptBlocks — the getPrompts-only extractor. Its response element is
+ * <prompts>, so returnBlocks() (which looks for <return>) returns [] here.
+ * Exported so that difference stays pinned by a test.
+ */
+export function promptBlocks(xml) {
+  const blocks = [];
+  const re = /<prompts>([\s\S]*?)<\/prompts>/g;
+  let m;
+  while ((m = re.exec(xml)) !== null) blocks.push(m[1]);
+  return blocks;
+}
+
+/**
+ * getIVRScripts — IVR script inventory. namePattern is a Five9-side regex
+ * (default ".*" = every script). Definitions are stripped unless asked for;
+ * see finding 2 above for why that does not reduce the download.
+ */
+export async function getIVRScripts({ namePattern = '.*', includeDefinition = false } = {}) {
+  const pattern = String(namePattern || '.*');
+  const xml = await five9SoapCall(
+    'getIVRScripts',
+    `<namePattern>${escapeXml(pattern)}</namePattern>`,
+    { maxBytes: MAX_IVR_RESPONSE_BYTES },
+  );
+  const parsed = returnBlocks(xml).map(parseXmlBlock).filter(s => s.name);
+  if (includeDefinition) assertIvrDefinitionLimit(parsed.length, pattern);
+  const scripts = parsed.map(s => ({
+    name: s.name,
+    description: s.description ?? null,
+    ...(includeDefinition ? { xmlDefinition: s.xmlDefinition ?? null } : {}),
+  }));
+  return {
+    count: scripts.length,
+    name_pattern: pattern,
+    includes_definition: includeDefinition,
+    scripts,
+  };
+}
+
+/** getDNISList — every DNIS in the domain, or only the unassigned spares. */
+export async function getDNISList({ selectUnassigned = false } = {}) {
+  const xml = await five9SoapCall(
+    'getDNISList',
+    `<selectUnassigned>${selectUnassigned ? 'true' : 'false'}</selectUnassigned>`,
+  );
+  const dnis = returnBlocks(xml).map(b => decodeXml(b).trim()).filter(Boolean);
+  return { count: dnis.length, unassigned_only: selectUnassigned, dnis };
+}
+
+/** getCampaignDNISList — the DNIS assigned to one campaign. */
+export async function getCampaignDNISList(campaignName) {
+  const name = String(campaignName || '').trim();
+  if (!name) throw new Error('campaignName is required');
+  const xml = await five9SoapCall('getCampaignDNISList', `<campaignName>${escapeXml(name)}</campaignName>`);
+  const dnis = returnBlocks(xml).map(b => decodeXml(b).trim()).filter(Boolean);
+  return { campaign: name, count: dnis.length, dnis };
+}
+
+/* DNIS map cache — process-lifetime, with fetched_at surfaced on every read
+ * so a stale answer is always self-dating, plus an explicit refresh path.
+ * Mirrors the src/entry-source-map.js cache shape (invalidator + test seam).
+ * A partial map is deliberately NOT cached: a campaign that errored would
+ * otherwise read as "has no DNIS" for the life of the process. */
+let _dnisMapCache = null;
+
+export function invalidateDnisMap() { _dnisMapCache = null; }
+
+export function __setDnisMapCacheForTest(value) { _dnisMapCache = value; }
+
+/**
+ * getDnisMap — which campaign owns each number, plus the unassigned spares.
+ * Walks every INBOUND campaign serially (see DNIS_MAP_DELAY_MS). The
+ * unassigned side comes from Five9's own selectUnassigned rather than being
+ * derived by subtraction, so the two are independent readings.
+ */
+export async function getDnisMap({ refresh = false } = {}) {
+  if (_dnisMapCache && !refresh) return _dnisMapCache;
+
+  const { campaigns } = await getCampaigns({ type: 'INBOUND' });
+  const assignments = {};
+  const by_campaign = {};
+  const errors = [];
+
+  for (const [i, campaign] of campaigns.entries()) {
+    if (i > 0) await sleep(DNIS_MAP_DELAY_MS);
+    try {
+      const { dnis } = await getCampaignDNISList(campaign.name);
+      by_campaign[campaign.name] = dnis;
+      for (const number of dnis) assignments[number] = campaign.name;
+    } catch (err) {
+      errors.push({ campaign: campaign.name, error: err.message });
+    }
+  }
+
+  if (campaigns.length) await sleep(DNIS_MAP_DELAY_MS);
+  const spare = await getDNISList({ selectUnassigned: true });
+
+  const result = {
+    fetched_at: new Date().toISOString(),
+    inbound_campaigns: campaigns.length,
+    assigned_count: Object.keys(assignments).length,
+    assignments,
+    by_campaign,
+    unassigned_count: spare.count,
+    unassigned: spare.dnis,
+    ...(errors.length ? { partial: true, errors } : {}),
+  };
+
+  if (!errors.length) _dnisMapCache = result;
+  return result;
+}
+
+/** getPrompts — full prompt inventory. Takes no arguments; see finding 1. */
+export async function getPrompts() {
+  const xml = await five9SoapCall('getPrompts');
+  const prompts = promptBlocks(xml).map(parseXmlBlock).map(p => ({
+    name: p.name || null,
+    description: p.description ?? null,
+    type: p.type || null,
+    languages: asArray(p.languages),
+  })).filter(p => p.name);
+  return { count: prompts.length, prompts };
+}
+
+/**
+ * getVCCConfiguration — domain-level configuration. Surfaced because it is
+ * the only API view of recording/transcript servers and the domain dialing
+ * rules; modifyVCCConfiguration exists but is deliberately not implemented.
+ */
+export async function getVCCConfiguration() {
+  const xml = await five9SoapCall('getVCCConfiguration');
+  const block = returnBlocks(xml)[0];
+  if (!block) return { error: 'vcc_configuration_unavailable' };
+  const raw = parseXmlBlock(block);
+  return {
+    domainId: raw.domainId ?? null,
+    domainName: raw.domainName ?? null,
+    recordingsServer: raw.recordingsServer ?? null,
+    reportsServer: raw.reportsServer ?? null,
+    transcriptsServer: raw.transcriptsServer ?? null,
+    campaignsSettings: raw.campaignsSettings ?? null,
+    miscOptions: raw.miscOptions ?? null,
+    stateDialingRule: raw.stateDialingRule ?? null,
+    timeZoneAssignment: raw.timeZoneAssignment ?? null,
+    raw,
+  };
 }
 
 /* ---- Report trio (async run → poll → fetch) ---------------------------- */

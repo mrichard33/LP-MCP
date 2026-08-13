@@ -45,9 +45,12 @@ export function registerAllTools(server) {
   registerCapacityTools(server);
   // Infrastructure admin tools (17) — v5.1
   registerAdminTools(server);
-  // Five9 admin READ tools (12) — v6.8 Phase A (2026-07-03) + Phase B (2026-07-21)
-  //   campaigns/state/configs/profiles/lists/dispositions/skills/users/DNC/reports
-  //   (all read-only Admin SOAP; writes execute only via the approve_action gate —
+  // Five9 READ tools (19) — Phase A (2026-07-03) + Phase B (2026-07-21)
+  //   + supervisor/config-history (Phase E) + Phase G config surface (2026-08-13)
+  //   campaigns/state/configs/profiles/lists/dispositions/skills/users/DNC/reports,
+  //   live supervisor telemetry, config history, and the config surface:
+  //   IVR scripts / DNIS inventory + ownership map / prompts / domain config
+  //   (all read-only; writes execute only via the approve_action gate —
   //   see src/five9/admin-writes.js)
   registerFive9Tools(server);
 }
