@@ -168,8 +168,15 @@ test('assertResponseSize: opt-in ceiling, and the marker survives for the caller
   // keeps every pre-Phase-G caller's behaviour identical.
   assert.doesNotThrow(() => assertResponseSize('getCampaigns', 50_000_000, undefined));
   assert.doesNotThrow(() => assertResponseSize('getCampaigns', 50_000_000, 0));
-  // A missing content-length parses to NaN and must not be treated as oversize.
+  // A missing content-length parses to NaN and must not be treated as
+  // oversize. This is not a hypothetical: measured live 2026-08-13, Five9
+  // returns large getIVRScripts responses with `transfer-encoding: chunked`
+  // and NO content-length, so NaN is the normal case on exactly the
+  // responses the ceiling exists for. Throwing here would refuse every large
+  // read outright; the body-length check below is what enforces the limit.
   assert.doesNotThrow(() => assertResponseSize('getIVRScripts', NaN, 100));
+  assert.doesNotThrow(() => assertResponseSize('getIVRScripts', parseInt('', 10), 100),
+    'a header that is absent entirely must behave the same way');
   assert.doesNotThrow(() => assertResponseSize('getIVRScripts', 100, 100));
 
   assert.throws(
