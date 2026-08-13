@@ -1105,9 +1105,35 @@ export function formatRepFirstName(raw) {
 // = "Mark"). Keep the two in sync if that value is ever changed in GHL.
 const IN_OFFICE_SENDER_NAME = process.env.AGENTIC_REPLY_SENDER_NAME || 'Mark';
 
+// 2026-08-13 — Randy is the broadcast email and video voice. He is NEVER the
+// author of an agentic reply; he may only be REFERENCED in third person inside
+// a handoff bridge ("Randy asked me to reach out"). Authorship is already
+// correct in code — voice is pinned to 'we' for sms/chat and the email sender
+// is always the in-office rep — but the sender name is an env var, so the one
+// remaining path to a Randy-authored email runs through config, with no code
+// review in the way. If AGENTIC_REPLY_SENDER_NAME were ever set to Randy, the
+// bridge-collision branch below would instruct the model to "open directly as
+// Randy, in first person" on an email replying to a Randy-signed nurture.
+// Guard it here so the invariant holds regardless of environment.
+const DEFAULT_IN_OFFICE_SENDER = 'Mark';
+
+/** True for any casing/spelling of Randy. Exported so callers share one test. */
+export function isRandyName(name) {
+  return String(name || '').trim().toLowerCase() === 'randy';
+}
+
 /** The in-office rep the agentic reply is sent as. Never the field rep. */
 export function resolveReplySenderName() {
-  return formatRepFirstName(IN_OFFICE_SENDER_NAME);
+  const configured = formatRepFirstName(IN_OFFICE_SENDER_NAME);
+  if (isRandyName(configured)) {
+    console.warn(
+      `[ResponseGenerator] ⛔ AGENTIC_REPLY_SENDER_NAME is set to "${IN_OFFICE_SENDER_NAME}" — ` +
+      `Randy is the broadcast voice and can never author an agentic reply. ` +
+      `Falling back to "${DEFAULT_IN_OFFICE_SENDER}". Fix the env var.`
+    );
+    return formatRepFirstName(DEFAULT_IN_OFFICE_SENDER);
+  }
+  return configured;
 }
 
 /**
