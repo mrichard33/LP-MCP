@@ -238,9 +238,18 @@ async function executeSendMessageWithLock(action, context) {
       if (process.env.SEND_TIME_RECHECK_ENABLED === 'false') {
         return { suppressed: false, reason: 'recheck_disabled' };
       }
-      // Channel derivation mirrors executeSendMessage (payload.channel,
-      // default 'sms'). livechat/unknown → tags-only (no GHL DND channel).
-      const raw = String(a.action_payload?.channel || 'sms').toLowerCase();
+      // Channel derivation mirrors executeSendMessage. livechat/unknown/absent
+      // → tags-only (no GHL DND channel).
+      //
+      // 2026-08-13 — an ABSENT channel no longer defaults to 'sms' here. After
+      // the Layer 3 fan-out fix the payload carries the real channel on every
+      // healthy path, but when it cannot be resolved the send handler still
+      // picks the channel from the inbound conversation — and it may pick
+      // email. Assuming 'sms' would then gate an email send on the contact's
+      // SMS DND setting: the wrong channel's suppression, either blocking a
+      // legitimate email or letting one through on a stale SMS check. Falling
+      // back to tags-only is the honest read when we genuinely do not know.
+      const raw = String(a.action_payload?.channel || '').toLowerCase();
       const channel = raw === 'sms' || raw === 'email' ? raw : null;
       const result = await checkSuppressionLive(a.target_id, { mode: 'agentic_reply', channel });
       if (result.suppressed) {

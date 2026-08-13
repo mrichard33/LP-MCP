@@ -1871,8 +1871,19 @@ export async function executeSendMessage(action, context) {
   // actually carry the reply. Fail-soft inside resolveReplyContext.
   let replyContext = null;
   if (AGENTIC_DIRECT_SEND) {
+    // 2026-08-13 — pass null, not the provisional 'sms', when the payload never
+    // specified a channel. decideReplyChannel's first branch is
+    // (!requestedChannel && inboundOrigin === 'email') → email_passthrough; with
+    // a defaulted 'sms' that branch was unreachable and the request fell through
+    // to origin_email_requested_other, where the "upstream signal" wins — except
+    // for these actions there was no upstream signal, only a template default.
+    // That is why deleting the hardcoded "channel": "sms" from the dispatch rows
+    // does nothing on its own: the default is re-applied here before the
+    // inbound conversation is ever consulted. The SMS, livechat and no-inbound
+    // branches are unaffected (each ignores requestedChannel or already
+    // defaults it to 'sms').
     replyContext = await resolveReplyContext(contactId, {
-      requestedChannel: channel,
+      requestedChannel: channelExplicit ? channel : null,
       eventId: action.event_id || null,
     });
     if (!replyContext.channel) {

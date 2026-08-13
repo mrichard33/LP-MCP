@@ -81,6 +81,46 @@ test('requested livechat with no livechat inbound at all → SMS when phone exis
   assert.equal(noPhone.channel, null);
 });
 
+// ── UNSPECIFIED requested channel (2026-08-13) ───────────────────────
+// executeSendMessage used to pass its provisional 'sms' default as the
+// requested channel, so "the template said nothing" was indistinguishable
+// from "the template asked for SMS". It now passes null. These lock in the
+// difference — the whole reason a Layer 3 email reply went out as a text.
+
+test('no requested channel + email inbound → email (passthrough, not the sms default)', () => {
+  const d = decideReplyChannel({ requestedChannel: null, inboundOrigin: 'email' });
+  assert.equal(d.channel, 'email');
+  assert.equal(d.channelType, 'Email');
+  assert.equal(d.reason, 'email_passthrough');
+  assert.equal(d.downgraded, false);
+});
+
+test('EXPLICIT sms + email inbound still crosses channels (deliberate, unchanged)', () => {
+  // A genuine upstream sms signal on an email thread keeps the pre-existing
+  // cross-channel behavior. Only the *absent* channel changed meaning.
+  const d = decideReplyChannel({ requestedChannel: 'sms', inboundOrigin: 'email', hasPhone: true });
+  assert.equal(d.channel, 'sms');
+  assert.equal(d.reason, 'origin_email_requested_other');
+});
+
+test('no requested channel + sms inbound → sms (unchanged)', () => {
+  const d = decideReplyChannel({ requestedChannel: null, inboundOrigin: 'sms', hasPhone: true });
+  assert.equal(d.channel, 'sms');
+  assert.equal(d.reason, 'inherit_sms');
+});
+
+test('no requested channel + no inbound → sms (unchanged fallback)', () => {
+  const d = decideReplyChannel({ requestedChannel: null, inboundOrigin: null, hasPhone: true });
+  assert.equal(d.channel, 'sms');
+  assert.equal(d.reason, 'no_inbound_found');
+});
+
+test('no requested channel + fresh livechat inbound → livechat (unchanged)', () => {
+  const d = decideReplyChannel({ requestedChannel: null, inboundOrigin: 'livechat', hasPhone: true, livechatAgeMin: 2, ttlMin: 15 });
+  assert.equal(d.channel, 'livechat');
+  assert.equal(d.reason, 'livechat_fresh');
+});
+
 // ── channelOfMessage / deriveInboundContext (identity inheritance) ──
 
 test('channelOfMessage maps GHL messageType values', () => {
