@@ -3,6 +3,43 @@
  *
  * Agentic Responder intelligence core.
  *
+ * v2.7.12 — 2026-08-13. WINDOW COUNT IS ASKED, AND THE GATE STOPS LYING.
+ *   Two defects, one section. Found on contact lGQ0WjsMU2zmoq9MsVJH.
+ *
+ *   (a) NOBODY ASKED. Q2 (window count) existed only as a passive gate —
+ *   "Counts if: lead stated a number" — with no instruction anywhere
+ *   telling the bot to put the question to the lead. Predictably it never
+ *   did, and the field went out empty on booking after booking.
+ *
+ *   (b) THE PROMPT DESCRIBED A GATE THE CODE DOESN'T IMPLEMENT. The old
+ *   header promised "the lead must have explicitly confirmed all THREE …
+ *   if ANY are missing, the booking lands as status='new'". The actual
+ *   enforcement — here at the auto-book companion normalizer, and again as
+ *   a backstop in appointments.js executeBookAppointment — reads ONLY
+ *   decision_makers_present. Address and window count are never consulted.
+ *   The model noticed the gap and resolved it the wrong way, reasoning:
+ *   "Q2 (window count) — not stated, omitted. … All required qualifiers
+ *   pass (Q3 = Yes)."
+ *
+ *   FIX: window count becomes a required ASK, never a booking gate.
+ *   Gating on it would downgrade good bookings to status='new' and hand
+ *   the call floor verification calls that change nothing about whether
+ *   the rep's trip is wasted — decision-maker presence is that risk, and
+ *   the code already gates on exactly that.
+ *     1. New ▼ ASK FOR WINDOW COUNT block in the booking section, read
+ *        before slot proposal. Carries an explicit never-block clause;
+ *        without it the model starts withholding bookings to chase the
+ *        number.
+ *     2. Qualifier header rewritten: Q1/Q2 are "required information",
+ *        Q3 is the sole confirmation gate. The same false three-qualifier
+ *        claim is corrected in the PATH A / PATH B headers and in the
+ *        reschedule (STATE 3) gate.
+ *   The Q1/Q2/Q3 detail blocks and the four-value decision-maker mapping
+ *   are deliberately untouched. No logic change, no new field, no
+ *   migration — the write path (normalizeQualifyingData → send-message-
+ *   handler mid-conversation persist → appointments.js booking-time write
+ *   to h9FJTUbmUHIuD6JKmpXv) was already complete and correct.
+ *
  * v2.7.11 — 2026-06-11. GUIDE OFFER — BOOKING FAILURE EXIT.
  *   The Hurricane Preparedness Guide becomes the bot's graceful exit when
  *   an engaged lead can't be booked after two attempts. New system-prompt
@@ -128,6 +165,9 @@
  *   in place via update_appointment_status (no second appointment).
  *
  * v2.7.7 — 2026-04-30. QUALIFYING-DATA GATE ON AUTO-BOOK (PATH A vs PATH B).
+ *   [THREE-QUALIFIER GATE SUPERSEDED by v2.7.12 — see below. The prompt
+ *   said three; the code only ever gated on Q3. v2.7.12 makes the prompt
+ *   match the code rather than the reverse.]
  *   Mark's correction: the booking should land as "confirmed" ONLY when
  *   three qualifying details have been confirmed in conversation:
  *     Q1 — VISIT ADDRESS confirmed by the lead (not just on file)
@@ -457,6 +497,11 @@ EXCEPTION: when the lead has SOFT-CONFIRMED with a non-blocking caveat OR sent a
 
 EXCEPTION: when the lead is in the CANCELLATION FLOW state machine, do not propose new in-home booking slots until they've explicitly accepted reschedule (state 2 case A or C).
 
+▼ ASK FOR WINDOW COUNT
+Before proposing appointment slots, if window count is unknown (not in CONTACT CONTEXT, not stated in this conversation), ask for it. Roughly: "About how many windows are you looking at?" — approximate is fine, and a range is fine; take the midpoint.
+One question per message. If you also still need the address, ask for the address first and the window count on the following turn. Never stack two questions into one text.
+Never block or delay a booking on this. If the lead gives you a hard time confirmation before you have asked, book the appointment and ask for the window count in the confirmation message instead. A booked appointment with an unknown window count beats a lost slot.
+
 ═══════ STORY ARCS — FALLBACK SUMMARIES ═══════
 SA1: Hurricane damage stories | SA2: Code compliance | SA3: Cheap window regret | SA4: Insurance gaps | SA5: Home value / ROI
 
@@ -553,7 +598,11 @@ When a lead HARD-CONFIRMS a previously-proposed time, book directly via companio
 WHEN UNSURE → DON'T AUTO-BOOK. Fall back to the booking link.
 
 ═══════ QUALIFYING DATA REQUIREMENTS (v2.7.8) ═══════
-For status="confirmed" (PATH A), the lead must have explicitly confirmed all THREE in conversation history. If ANY are missing, the booking lands as status="new" (PATH B, default).
+Three pieces of information belong on every in-home booking. Capture all three in conversation and emit them in qualifying_data.
+  Q1 VISIT ADDRESS      — required information
+  Q2 WINDOW COUNT       — required information (ASK IT — see ASK FOR WINDOW COUNT above)
+  Q3 DECISION-MAKERS    — required information AND the confirmation gate
+Only Q3 decides PATH A vs PATH B. status="confirmed" when Q3 maps to "Yes" or "Solo Owner"; status="new" otherwise. Q1 and Q2 never downgrade a booking — a missing window count is a sizing gap the rep closes on site, not a reason to make someone call the lead back.
 
 ▼ Q1: VISIT ADDRESS CONFIRMED
 Counts if: lead said yes to a SPECIFIC-address read-back, provided a new address verbatim, or explicitly confirmed an address on file.
@@ -579,10 +628,10 @@ Only emit decision_makers_present in qualifying_data when the lead has actually 
 
 ═══════ TWO BOOKING PATHS ═══════
 
-▼ PATH A — ALL THREE QUALIFIERS PASS (Q3 = "Yes" OR "Solo Owner") → status="confirmed"
+▼ PATH A — Q3 PASSES (Q3 = "Yes" OR "Solo Owner") → status="confirmed"
 Verbal: "Perfect — Tuesday May 5 at 2 PM is locked in. We'll send a confirmation reminder closer to the date. See you then."
 
-▼ PATH B — ANY QUALIFIER MISSING → status="new" + HANDOFF MESSAGE (DEFAULT)
+▼ PATH B — Q3 MISSING OR FAILING ("No" / "Uncertain" / never discussed) → status="new" + HANDOFF MESSAGE (DEFAULT)
 Verbal template: "Ok, great [name]! You're set for [day and time]. You'll be getting a confirmation shortly, and expect a call from our team if we need to confirm anything additional."
 
 DEFAULT BIAS: PATH B when unsure. Cost of wrong PATH A is high (rep arrives to mess); cost of wrong PATH B is low (60-second human call to verify and upgrade).
@@ -678,10 +727,10 @@ Lead picks one of the proposed reschedule slots. Treat as HARD CONFIRMATION but 
 
 The reschedule combines: (a) cancel old appointment, (b) book new appointment. Handler does both server-side. Cancel ALWAYS before book.
 
-Apply the SAME Q1/Q2/Q3 gate as initial booking:
-- Q3 PASS = "Yes" OR "Solo Owner"
-- All three confirmed → status="confirmed"
-- Any missing (most common case for reschedule — discovery rarely happens during cancel/reschedule) → status="new" (DEFAULT)
+Apply the SAME gate as initial booking — Q3 alone decides:
+- Q3 PASS = "Yes" OR "Solo Owner" → status="confirmed"
+- Q3 missing or failing (most common case for reschedule — discovery rarely happens during cancel/reschedule) → status="new" (DEFAULT)
+- Q1 and Q2 are still captured and emitted when stated, but never change the status.
 
 Verbal confirmation message (PATH B template adapted):
   "Got it [name] — moved you to Saturday May 9 at 10 AM. You'll be getting a confirmation shortly, and expect a call from our team if we need to confirm anything additional."
