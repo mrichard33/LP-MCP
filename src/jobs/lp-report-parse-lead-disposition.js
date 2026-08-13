@@ -61,6 +61,32 @@ export function parseLeadDispositionCsv(text) {
       city: String(r.city ?? '').trim() || null,
       state: String(r.state ?? '').trim() || null,
       zip: String(r.Zip ?? '').trim() || null,
+      // ── Contact fields (2026-08-13) ──────────────────────────────────────
+      //
+      // These columns were ALWAYS in the file. The parser simply never named
+      // them, so `Phone`, `Email`, `Address1`, `lastname` and `FirstName` were
+      // discarded at parse time and the only copy of lead contact data lived in
+      // lp_lead_disposition_rows — a PDF-era table that stopped filling at the
+      // 2026-08-10 CSV cutover. That made a canvasser data-quality audit a
+      // frozen one-off and made phone-based duplicate work impossible, when the
+      // data had been arriving daily the whole time.
+      //
+      // ⚠️ TWO 135 LAYOUTS EXIST and only one carries these. The slim export
+      // (see scripts/fixtures/lp-reports/report-135-lead-disposition.csv) has
+      // no contact columns AND capitalises City/State, which is exactly how you
+      // can tell them apart: `header` is keyed EXACTLY, never lowercased
+      // (lp-report-csv-common.js), so under the slim layout `r.city` is
+      // undefined and city lands null. Every field here therefore degrades to
+      // null rather than throwing — a slim file must still ingest.
+      //
+      // Stored verbatim (trimmed only). Normalisation belongs at read time; a
+      // lowercased-at-write email cannot be shown back as the canvasser typed
+      // it, and "what did they actually enter" is the whole question.
+      last_name: String(r.lastname ?? '').trim() || null,
+      first_name: String(r.FirstName ?? '').trim() || null,
+      phone: String(r.Phone ?? '').trim() || null,
+      email: String(r.Email ?? '').trim() || null,
+      address: String(r.Address1 ?? '').trim() || null,
       num_dials: parseCount(r.NumDials),
       num_superseded: parseCount(r.NumSuperseded),
       appt_date: parseCsvDate(r.ApptDate),

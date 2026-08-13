@@ -500,6 +500,10 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
         category: r.category, dsp_descr: r.dsp_descr, last_result: r.last_result,
         src_id: r.src_id, sub_source: r.sub_source, promoter: r.promoter,
         city: r.city, state: r.state, zip: r.zip,
+        // Contact fields — present in the standard 135 layout, null under the
+        // slim one. See the parser for how the two are told apart.
+        last_name: r.last_name, first_name: r.first_name,
+        phone: r.phone, email: r.email, address: r.address,
         num_dials: r.num_dials, num_superseded: r.num_superseded,
         appt_date: r.appt_date, job_status: r.job_status,
         gsa_cents: r.gsa_cents, net_cents: r.net_cents,
