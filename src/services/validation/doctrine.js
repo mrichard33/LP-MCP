@@ -49,6 +49,7 @@ import {
 import {
   checkNotificationChannelMatch,
   checkDncNarrativeMatchesTrigger,
+  checkSendMessageChannelMatchesTrigger,
 } from './invariants/channel-integrity.js';
 
 import {
@@ -92,6 +93,7 @@ const isAddLossReasonTag = (a) =>
   isAddTag(a) && String(a.action_payload?.tag || '').toLowerCase().startsWith('loss-reason:');
 
 const isSendNotification = (a) => a.action_type === 'send_notification';
+const isSendMessage = (a) => a.action_type === 'send_message';
 
 // SF-1 applies to any executed action whose rule_applied is a real rule
 // (skip synthetic dispatchers handled inside the check).
@@ -217,6 +219,23 @@ export const INVARIANTS = [
     applies_to: isSendNotification,
     check: checkDncNarrativeMatchesTrigger,
     docs_anchor: 'CI-2',
+  },
+  {
+    key: 'CI-3',
+    name: 'send_message_channel_matches_trigger',
+    category: 'CHANNEL_INTEGRITY',
+    // WARN, deliberately — NOT a candidate for upgrade to BLOCK. The gate runs
+    // immediately before handler dispatch, so a BLOCK drops the reply entirely
+    // (rejected_by_validation). Silencing a lead is strictly worse for the
+    // customer than answering on the wrong channel, and it is the exact failure
+    // the always-respond policy exists to prevent. A mismatch means a new bug in
+    // the queueing path: page the operator, do not silence the lead.
+    severity: 'WARN',
+    framework_citation:
+      'Channel fidelity — a reply belongs on the channel the customer used. Layer 3 dispatch hardcoded "channel":"sms", answering every email inbound it owned by SMS (Andrea, 2026-08-12). Channel must come from the source event, not a template default',
+    applies_to: isSendMessage,
+    check: checkSendMessageChannelMatchesTrigger,
+    docs_anchor: 'CI-3',
   },
 
   // ─── ENTRY_SOURCE_COHERENCE (v2 — 2026-05-19) ────────────────────────

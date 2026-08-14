@@ -227,9 +227,108 @@ export async function checkDncNarrativeMatchesTrigger(action, ctx = {}) {
   };
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// CI-3 — send_message_channel_matches_trigger (WARN)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// CI-1 and CI-2 check what a notification SAYS about a channel. CI-3 checks
+// the channel a reply is actually SENT ON — the outbound selection itself,
+// which nothing validated until now.
+//
+// Why: for the 90 days to 2026-08-13 every email inbound owned by Layer 3
+// was answered by SMS. executeLayer3Dispatch copied dispatch params verbatim
+// and six layer3_action_dispatch rows hardcoded "channel": "sms", so the
+// action was queued claiming SMS on an email thread — four
+// follow_up_scheduled replies, most recently Andrea on 2026-08-12, who
+// emailed "I will decide before Monday" and got a text back. The damage was
+// not only delivery: send-message-handler gates the email prompt block and
+// the email generation constraints on channel === 'email', so the reply was
+// WRITTEN for the wrong surface too.
+//
+// That defect is fixed at the source — both queue paths now stamp the
+// channel from the triggering event — so this invariant is a regression
+// guard, not the fix. It exists so the next path that queues a send_message
+// with a contradicting channel is visible immediately rather than after
+// another 90 days of wrong-channel replies.
+//
+// SEVERITY IS WARN, DELIBERATELY. Do not "upgrade" this to BLOCK without
+// reading this paragraph. The gate runs immediately before handler dispatch,
+// and a BLOCK sets status='rejected_by_validation' — the reply is DROPPED.
+// Silently dropping a lead's reply is the precise failure the always-respond
+// policy exists to prevent ("A reply can be late; it must never vanish"), and
+// it is strictly worse for the customer than a reply arriving on the wrong
+// channel. A mismatch here means a new bug in the queueing path; it should
+// page the operator, not silence the lead. CI-1 ships WARN for the same
+// observe-before-blocking reason.
+//
+// Fails OPEN on every unknown: no source event, event not found, no channel
+// resolvable from either side. Only an explicit, confident contradiction
+// fails.
+
+// detectChannel (shared with CI-1/CI-2) and the send path speak different
+// vocabularies: detectChannel says 'chat', the send path says 'livechat'.
+// Normalize to compare. Deliberately NOT refactored into one helper —
+// detectChannel also emits 'call'/'unknown', which have no meaning as a
+// send_message channel, and CI-1/CI-2 depend on its current vocabulary.
+function normalizeChannelForComparison(channel) {
+  const c = String(channel || '').toLowerCase();
+  if (c === 'livechat' || c === 'chat' || c === 'webchat') return 'chat';
+  if (c === 'sms' || c === 'text') return 'sms';
+  if (c === 'email') return 'email';
+  return null;
+}
+
+export async function checkSendMessageChannelMatchesTrigger(action, ctx = {}) {
+  if (action.action_type !== 'send_message') {
+    return { passed: true, reason: 'not_applicable' };
+  }
+
+  // No channel claimed → the send handler resolves it from the inbound
+  // conversation, which is the correct behavior. Nothing to contradict.
+  const payloadChannel = normalizeChannelForComparison(action.action_payload?.channel);
+  if (!payloadChannel) return { passed: true, reason: 'no_payload_channel_open' };
+
+  if (!action.event_id) return { passed: true, reason: 'no_source_event_open' };
+
+  // ctx.sourceEvent lets the branch logic be exercised without a live DB
+  // (same convention as decision-engine's optional deps object). Production
+  // never passes it — validateAction only supplies priorBatchResults.
+  const event = ctx.sourceEvent ?? await loadSourceEvent(action.event_id);
+  if (!event) return { passed: true, reason: 'event_not_found_open' };
+
+  const eventChannel = normalizeChannelForComparison(detectChannel(event.payload || {}));
+  // 'call'/'unknown' normalize to null — a voice event says nothing about
+  // which channel a follow-up message belongs on.
+  if (!eventChannel) return { passed: true, reason: 'event_channel_unknown_open' };
+
+  if (payloadChannel === eventChannel) {
+    return { passed: true, reason: 'channel_matches_trigger' };
+  }
+
+  return {
+    passed: false,
+    reason:
+      `send_message is queued on "${payloadChannel}" but the triggering event arrived on ` +
+      `"${eventChannel}". A reply must go back on the channel the customer used. This also ` +
+      `shapes the copy: the generator applies email formatting and the email thread context ` +
+      `only when the channel is email, so a mis-stamped channel produces a reply written for ` +
+      `the wrong surface (no subject, no signature). Channel must come from the source event, ` +
+      `not from a rule or dispatch-row default.`,
+    context_snapshot: {
+      event_id: event.id,
+      event_type: event.event_type,
+      event_channel: eventChannel,
+      payload_channel: payloadChannel,
+      raw_payload_channel: action.action_payload?.channel ?? null,
+      rule_applied: action.rule_applied || null,
+    },
+  };
+}
+
 // Exported for unit tests
 export const __testing = {
   loadSourceEvent,
   detectChannel,
   detectChannelMentions,
+  normalizeChannelForComparison,
 };
