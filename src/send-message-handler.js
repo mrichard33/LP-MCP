@@ -292,10 +292,19 @@ async function fetchContactTags(contactId) {
  * created_at is the trigger-freshness anchor for the stale-draft and
  * mid-generation-inbound checks. Fail-soft: null on any error.
  */
-async function fetchSourceEventMeta(eventId) {
-  if (!eventId || !supabase) return null;
+async function fetchSourceEventMeta(eventId, deps = {}) {
+  const db = deps.client !== undefined ? deps.client : supabase;
+  if (!eventId || !db) return null;
   try {
-    const { data, error } = await supabase
+    const { data, error } = await db
+      // 2026-08-14 — .from('system_events') was MISSING here from 2026-08-06
+      // (PR #626) until now. supabase.select() is not a method on the client,
+      // so every call threw TypeError into the catch below and returned null.
+      // Every consumer degraded silently; the loudest was the quiet-hours gate,
+      // which reads event_type to tell a fresh REPLY from a bot-INITIATED send
+      // and therefore classified every reply as bot-initiated and held it until
+      // 8 AM. Do not remove the table name.
+      .from('system_events')
       // payload (2026-07-29): back-compat source for recommended_action /
       // escalation_category on actions queued BEFORE the decision-engine began
       // stamping them into action_payload. Safe to read late — unlike contact
@@ -304,9 +313,15 @@ async function fetchSourceEventMeta(eventId) {
       .select('event_type, created_at, payload')
       .eq('id', eventId)
       .maybeSingle();
-    if (error) return null;
+    if (error) {
+      console.warn(`[SendMessage] source event meta read failed for event ${eventId}: ${error.message}`);
+      return null;
+    }
     return data || null;
-  } catch {
+  } catch (err) {
+    // Was a bare `catch {}`. Silence is what let a TypeError masquerade as
+    // "no metadata" for eight days — log it so the next one surfaces.
+    console.warn(`[SendMessage] source event meta threw for event ${eventId}: ${err.message}`);
     return null;
   }
 }
@@ -1978,17 +1993,35 @@ export async function executeSendMessage(action, context) {
   // a FRESH inbound (≤15 min) are ALWAYS allowed — a lead who texts at
   // 10 PM gets an answer at 10 PM. Held sends DEFER (retry_at = next
   // window open) and re-enter through the staleness regeneration below —
-  // delayed, never dropped (always-respond policy). Fail-open on missing
-  // metadata: an unclassifiable reply-class send is treated as fresh.
+  // delayed, never dropped (always-respond policy).
+  //
+  // 2026-08-14 — this block claimed to "fail open on missing metadata" and did
+  // the opposite: freshInboundReply was `isReplyClass && (...)`, so a null
+  // lookup made every send look bot-initiated and held it. Combined with the
+  // missing .from() above, that held EVERY reply overnight for eight days.
+  // The fix restores the documented intent, but on POSITIVE EVIDENCE rather
+  // than a blanket pass: an inbound inside the fresh window is itself proof
+  // this is a reply, whatever the event lookup did. A blanket pass would let a
+  // genuine 10 PM proactive push through on a transient DB blip, which is the
+  // courtesy/TCPA violation the window exists to prevent.
   const sourceEventMeta = await fetchSourceEventMeta(action.event_id);
+  const sourceEventMetaUnavailable = Boolean(action.event_id) && sourceEventMeta === null;
   const isReplyClass = sourceEventMeta?.event_type === 'ai.analysis_completed'
     || sourceEventMeta?.event_type === 'ghl.reply_received';
   const FRESH_REPLY_WINDOW_MS = 15 * 60 * 1000;
   const newestInboundAtPre = replyContext?.newestInboundAt || null;
-  const freshInboundReply = isReplyClass && (
-    newestInboundAtPre === null
-    || (Date.now() - Date.parse(newestInboundAtPre)) <= FRESH_REPLY_WINDOW_MS
-  );
+  const hasFreshInbound = newestInboundAtPre !== null
+    && (Date.now() - Date.parse(newestInboundAtPre)) <= FRESH_REPLY_WINDOW_MS;
+  const freshInboundReply = isReplyClass
+    // Known reply class: an unknown inbound time still counts as fresh (the
+    // pre-existing fail-open on newestInboundAt).
+    ? (newestInboundAtPre === null || hasFreshInbound)
+    // Unknown class because the lookup failed: only a demonstrably fresh
+    // inbound earns the exemption.
+    : (sourceEventMetaUnavailable && hasFreshInbound);
+  if (sourceEventMetaUnavailable && hasFreshInbound) {
+    console.warn(`[SendMessage] source event meta unavailable for ${contactId} — treating as a fresh reply on inbound age (${newestInboundAtPre})`);
+  }
   // QA bypass (2026-08-14): named test contacts send at any hour so the full
   // loop — including bot-initiated hold returns and follow-up re-engagements,
   // which are exactly what the 8AM–9PM window suppresses — can be exercised
@@ -2801,3 +2834,11 @@ export async function executeSendMessage(action, context) {
     _generation_error: fallbackError ? fallbackError.message.slice(0, 300) : null,
   };
 }
+
+// Test-only surface (mirrors the _internal convention in src/decision-engine.js
+// and src/notifications/*). Not part of the runtime API.
+export const _internal = {
+  // 2026-08-14 — exported so the missing-.from() regression is coverable. Takes
+  // an injectable client so a test can assert WHICH table is queried.
+  fetchSourceEventMeta,
+};
