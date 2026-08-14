@@ -2078,6 +2078,11 @@ export async function executeSendMessage(action, context) {
       try {
         generated = await generateResponse(contactId, generationChannel, triggerMessage, {
           threadSenderType: threadSenderType ?? 'rep',
+          // 2026-08-14 — the line this reply goes out from decides the sign-off
+          // (Mark's direct number vs the shared Reece team number). Same value
+          // the send itself uses, so the signature can never disagree with the
+          // number the customer sees. Null resolves to the shared-team identity.
+          fromNumber: replyContext?.fromNumber || null,
           // 2026-07-29 (Kelly Callahan incident) — decision-time context. This
           // send_message was queued as sequence_order 0 but the queue drains
           // GLOBALLY, so it executes AFTER every sibling action that mutates
@@ -2455,6 +2460,7 @@ export async function executeSendMessage(action, context) {
           bumpContactCache(contactId);
           const regenerated = await generateResponse(contactId, generationChannel, freshTrigger, {
             threadSenderType: 'rep',
+            fromNumber: replyContext?.fromNumber || null,
             promptHint: payload.prompt_hint || null,
             requestedFulfillment: context.requested_fulfillment || null,
             callPurpose: context.call_purpose || null,

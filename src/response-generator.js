@@ -1142,6 +1142,74 @@ export function resolveReplySenderName() {
   return configured;
 }
 
+// ─── SMS sender identity, by the number the reply goes out from ─────
+//
+// 2026-08-14 (owner requirement). Two outbound SMS numbers carry two different
+// identities:
+//   (954) 280-8890 — Mark's direct line.      Replies sign "— Mark".
+//   (954) 371-0083 — the shared Reece team line. Replies sign "— Reece Team".
+//     If a customer asks who they are speaking with, the name to give is still
+//     Mark, but the reply must ALSO say it is a shared team number. Letting a
+//     customer believe one person owns a line several people work is the kind
+//     of small dishonesty that costs trust the moment the next reply sounds
+//     like someone else.
+//
+// This is a SIGNATURE/identity split only. The body voice is unchanged on both
+// numbers: 'we' stays pinned in validateResponse, so nothing about how the
+// sentences are written changes.
+//
+// An unknown or unresolvable number resolves to the TEAM identity. fromNumber
+// comes from a live GHL conversation scan that can fail, and on a failed scan
+// GHL sends from the location/assignedTo default — which is not necessarily
+// Mark's line. A wrong "— Mark" is a worse error than a correct-but-generic
+// "— Reece Team", so the fallback never claims a specific person.
+//
+// Numbers are env-tunable (AGENTIC_SMS_NUMBER_MARK / AGENTIC_SMS_NUMBER_TEAM)
+// and read per call, so a number change is a config change, not a redeploy.
+const SMS_NUMBER_MARK_DEFAULT = '9542808890';
+const SMS_NUMBER_TEAM_DEFAULT = '9543710083';
+const TEAM_SIGNATURE = 'Reece Team';
+
+/** Last 10 digits of any phone format, or null. "+1 (954) 280-8890" → "9542808890". */
+export function last10Digits(raw) {
+  const digits = String(raw ?? '').replace(/\D/g, '');
+  return digits.length >= 10 ? digits.slice(-10) : null;
+}
+
+/**
+ * Which identity a reply carries, based on the number it goes out from.
+ *
+ * @param {string|null} fromNumber  the number the customer texted (our number)
+ * @returns {{persona:'mark'|'team', signature:string, shared:boolean,
+ *            nameIfAsked:string, matched:boolean}}
+ */
+export function resolveSmsSenderIdentity(fromNumber) {
+  // Reuses resolveReplySenderName so the Randy guard applies here too and the
+  // name stays consistent with the email path.
+  const personName = resolveReplySenderName() || 'Mark';
+  const n = last10Digits(fromNumber);
+
+  const markNumber = last10Digits(process.env.AGENTIC_SMS_NUMBER_MARK || SMS_NUMBER_MARK_DEFAULT);
+  if (n && markNumber && n === markNumber) {
+    return {
+      persona: 'mark',
+      signature: personName,
+      shared: false,
+      nameIfAsked: personName,
+      matched: true,
+    };
+  }
+
+  const teamNumber = last10Digits(process.env.AGENTIC_SMS_NUMBER_TEAM || SMS_NUMBER_TEAM_DEFAULT);
+  return {
+    persona: 'team',
+    signature: TEAM_SIGNATURE,
+    shared: true,
+    nameIfAsked: personName,
+    matched: Boolean(n && teamNumber && n === teamNumber),
+  };
+}
+
 // ─── Who may author an agentic email reply ──────────────────────────
 // The sender universe is exactly {company voice, the in-office rep}. An email
 // reply comes from the company or from Mark — never from Randy, who is the
@@ -1499,6 +1567,26 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     parts.push(`Any OTHER person named anywhere in this prompt — the assigned sales rep, a rep in the notes, a name in the conversation history — is someone the customer deals with, NOT the author of this message. Never open as them ("Beverly here"), never sign as them, never write in their first person. Refer to them in the THIRD person only ("Beverly has your file", "I've flagged this to Beverly").`);
     parts.push(`Never write a merge tag or template placeholder for a name. Every name in your reply must be a literal name given to you here.`);
     parts.push(`═══════ END AUTHORSHIP ═══════`);
+  }
+
+  // ─── WHICH NUMBER THIS GOES OUT FROM (2026-08-14) ───
+  // Signature-level identity split. Body voice is untouched — 'we' stays
+  // pinned in validateResponse — so this only decides the sign-off and what
+  // the bot says when a customer asks who they are talking to.
+  if (channel === 'sms') {
+    const ident = resolveSmsSenderIdentity(opts.fromNumber);
+    parts.push(`\n═══════ WHICH LINE THIS REPLY GOES OUT FROM ═══════`);
+    if (ident.shared) {
+      parts.push(`This reply goes out from the SHARED Reece team line${ident.matched ? '' : ' (the sending number could not be confirmed, so treat it as the shared line)'}. End the message with the sign-off "— ${ident.signature}".`);
+      parts.push(`If the customer asks who they are talking to, asks for your name, or addresses you by a name: give the name ${ident.nameIfAsked}, AND tell them plainly that this is a shared team number so more than one person may answer. Both halves, every time — a name without the shared-line caveat is misleading the moment someone else replies.`);
+      parts.push(`Do NOT volunteer the shared-line explanation when they have not asked. It is an honest answer to a question, not an opener.`);
+    } else {
+      parts.push(`This reply goes out from ${ident.signature}'s direct line. End the message with the sign-off "— ${ident.signature}".`);
+      parts.push(`If the customer asks who they are talking to or asks for your name, the answer is ${ident.signature}. Do not describe this as a shared or team number — it is not.`);
+    }
+    parts.push(`The sign-off is IDENTITY, not a flourish: include it even on a short reply, and even where this prompt tells you to keep things brief. Use it ONCE, at the very end, and never sign with any other name.`);
+    parts.push(`Your BODY voice does not change: keep writing in "we / our team" voice. The sign-off is the only place this identity appears.`);
+    parts.push(`═══════ END LINE IDENTITY ═══════`);
   }
   parts.push(channel === 'sms'
     ? 'Constraints: under 160 chars ideal, 320 max. 1-3 sentences. ONE question max. Booking link = merge tag, bare (no markdown). At most ONE link.'
@@ -3130,6 +3218,11 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       recentEdits,
       upcomingAppointments,
       threadSenderType: opts.threadSenderType ?? 'rep',
+      // 2026-08-14: the number this reply goes out from, resolved by the send
+      // handler from the lead's last inbound SMS. Decides the sign-off only
+      // (Mark's line vs the shared team line) — see resolveSmsSenderIdentity.
+      // Null is safe: it resolves to the shared-team identity.
+      fromNumber: opts.fromNumber || null,
       // 2026-07-29: decision-time state — outranks the live read for stage tag,
       // buyer stage, and the post-appointment verdict.
       contextSnapshot,
