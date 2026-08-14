@@ -246,7 +246,7 @@ import { resolveContactInfo, resolveLPProspectId } from './actions/resolvers.js'
 import { buildNotificationEnrichment, buildRichNotification } from './actions/enrichment.js';
 // 2026-07-03 rebuild (Steve Nkzhm incident) — channel/identity inheritance,
 // AI-disclosure hard guard, per-contact supersession check.
-import { resolveReplyContext, guardDisclosure, fetchRecentMessages } from './agentic/reply-sender.js';
+import { resolveReplyContext, guardDisclosure, fetchRecentMessages, channelOfMessage } from './agentic/reply-sender.js';
 // 2026-07-08 — CALLBACK resolution + HDL.3 customer-status probe
 // (closes the sql/017/018 gap; see src/knowledge/callback-resolver.js).
 import {
@@ -1932,18 +1932,61 @@ async function insertCompanionAction(parentAction, generated, callPurpose = null
  * BIAS: never send when we cannot verify. A missed reply is recoverable
  * (agentic.reply_dropped → GroupMe + rep task); a duplicate customer text is not.
  */
-async function verifyPriorSendLanded(action) {
+/**
+ * How long to wait between recovery-verification retries, and how long to keep
+ * waiting before giving up on verification and sending anyway.
+ */
+const RECOVERY_VERIFY_RETRY_MS = parseInt(process.env.RECOVERY_VERIFY_RETRY_MS || '120000', 10);
+const RECOVERY_VERIFY_MAX_WAIT_MS = parseInt(process.env.RECOVERY_VERIFY_MAX_WAIT_MS || '1800000', 10);
+
+/**
+ * The pure half of the recovery check: did MY previous attempt already deliver?
+ * Exported for unit tests (no GHL required).
+ *
+ * 2026-08-14 — narrowed from "any outbound since action.created_at". Two
+ * defects, both of which ended with the lead getting nothing:
+ *
+ *   ANCHOR. created_at is when the action was QUEUED, not when it last ran. A
+ *   deferred action (quiet hours, cooldown, lock) retries hours later, so the
+ *   window swallowed unrelated traffic — a nurture email or a rep's manual
+ *   reply read as "my send landed", the action short-circuited as
+ *   verified_already_sent, and the reply was never sent AND never flagged. We
+ *   now anchor to executed_at (the PRIOR attempt's timestamp, present because
+ *   the executor claims rows with select('*')), falling back to created_at.
+ *
+ *   CHANNEL. Any outbound counted, so an SMS could satisfy a pending EMAIL
+ *   send. Now the channel must match, via the shared channelOfMessage.
+ *
+ * @returns {'landed'|'not_landed'|'unverifiable'}
+ */
+export function classifyPriorSend({ messages, since, channel } = {}) {
+  if (!Number.isFinite(since)) return 'unverifiable';
+  if (!Array.isArray(messages) || messages.length === 0) return 'unverifiable';
+  const want = channel === 'livechat' ? 'livechat' : channel; // compared as-is
+  const landed = messages.some((m) => {
+    if (m?.direction !== 'outbound') return false;
+    const ts = Date.parse(m.dateAdded || m.dateUpdated || '');
+    if (!Number.isFinite(ts) || ts < since) return false;
+    if (!want) return true;                     // unknown channel → time only
+    const mc = channelOfMessage(m);
+    return mc === null || mc === want;          // unknown message channel → don't veto
+  });
+  return landed ? 'landed' : 'not_landed';
+}
+
+/** The anchor for "did my previous attempt deliver?" — prior run, not queue time. */
+export function recoveryAnchorMs(action) {
+  const prior = Date.parse(action?.executed_at || '');
+  if (Number.isFinite(prior)) return prior;
+  return Date.parse(action?.created_at || '');
+}
+
+async function verifyPriorSendLanded(action, channel) {
   try {
-    const since = Date.parse(action.created_at);
+    const since = recoveryAnchorMs(action);
     if (!Number.isFinite(since)) return 'unverifiable';
     const { messages } = await fetchRecentMessages(action.target_id);
-    if (!Array.isArray(messages) || messages.length === 0) return 'unverifiable';
-    const landed = messages.some((m) => {
-      if (m?.direction !== 'outbound') return false;
-      const ts = Date.parse(m.dateAdded || m.dateUpdated || '');
-      return Number.isFinite(ts) && ts >= since;
-    });
-    return landed ? 'landed' : 'not_landed';
+    return classifyPriorSend({ messages, since, channel });
   } catch (err) {
     console.warn(`[SendMessage] recovery verification unreadable for action ${action.id}: ${err.message}`);
     return 'unverifiable';
@@ -2043,22 +2086,63 @@ export async function executeSendMessage(action, context) {
 
   // 2026-07-13 — recovery gate. Only on a retry; the first attempt is untouched.
   if ((action.retry_count || 0) > 0) {
-    const verdict = await verifyPriorSendLanded(action);
+    const anchorMs = recoveryAnchorMs(action);
+    const anchorIso = Number.isFinite(anchorMs) ? new Date(anchorMs).toISOString() : 'unknown';
+    // This gate runs BEFORE resolveReplyContext, so `channel` here is still the
+    // provisional payload value. Only constrain the match when the payload
+    // actually specified one — a guessed 'sms' could miss a real email delivery
+    // and wave through a duplicate, which is the one thing this gate exists to
+    // stop. Same explicit-vs-defaulted distinction the send path already draws.
+    const verifyChannel = channelExplicit ? channel : null;
+    const verdict = await verifyPriorSendLanded(action, verifyChannel);
     if (verdict === 'landed') {
-      console.log(`[SendMessage] action ${action.id} retry — an outbound already landed after ${action.created_at}; short-circuiting (no duplicate send)`);
+      console.log(`[SendMessage] action ${action.id} retry — a ${verifyChannel || 'any'} outbound already landed after ${anchorIso}; short-circuiting (no duplicate send)`);
       return {
         success: true,
         action: 'verified_already_sent',
         contact_id: action.target_id,
         retry_count: action.retry_count,
-        verification: 'outbound_found_after_action_created_at',
+        verification: 'outbound_found_after_prior_attempt',
+        anchor: anchorIso,
+        channel: verifyChannel,
       };
     }
     if (verdict === 'unverifiable') {
-      console.warn(`[SendMessage] action ${action.id} retry — cannot verify prior attempt; declining to send this cycle (duplicate risk)`);
-      throw new Error('recovery_verification_unavailable — declined to send (duplicate risk)');
+      // 2026-08-14 — DEFER, don't drop. This used to throw, which increments
+      // retry_count; at max_retries the action was marked `failed` and the
+      // lead got nothing (action 313767). A guard against duplicates was
+      // vetoing the always-respond policy merely because GHL was unreadable.
+      //
+      // classifyHandlerResult maps deferred → status 'pending' with a
+      // persisted retry_at and leaves retry_count UNTOUCHED, so the reply is
+      // delayed rather than spending its retry budget. Same shape as the
+      // tag_sources_unavailable fallback above.
+      const ageMs = Date.now() - Date.parse(action.created_at || '');
+      if (!Number.isFinite(ageMs) || ageMs < RECOVERY_VERIFY_MAX_WAIT_MS) {
+        const retryAt = new Date(Date.now() + RECOVERY_VERIFY_RETRY_MS).toISOString();
+        console.warn(`[SendMessage] action ${action.id} retry — cannot verify prior attempt; deferring to ${retryAt} (duplicate risk, will retry)`);
+        return {
+          deferred: true,
+          reason: 'recovery_verification_unavailable',
+          retry_at: retryAt,
+          contact_id: action.target_id,
+          channel,
+        };
+      }
+      // Past the bound. Send. The AUTHORITATIVE duplicate check is the
+      // Supabase sent marker: had this job delivered, acquireAgenticSlot would
+      // have returned 'already_sent' and we would never have reached this
+      // handler at all. The residual risk is only the narrow
+      // delivered-but-marker-never-written race, and a rare duplicate is the
+      // better failure than a guaranteed dropped reply.
+      console.error(
+        `[SendMessage] ⚠️ action ${action.id} — recovery verification still unavailable after ` +
+        `${Math.round(ageMs / 60000)}min; SENDING ANYWAY rather than dropping the reply ` +
+        `(sent marker says this job never delivered)`
+      );
+    } else {
+      console.log(`[SendMessage] action ${action.id} retry — verified no ${verifyChannel || 'any'} outbound landed after ${anchorIso}; proceeding with generation`);
     }
-    console.log(`[SendMessage] action ${action.id} retry — verified no outbound landed after ${action.created_at}; proceeding with generation`);
   }
 
   // 2026-07-06 — HUMAN-TAKEOVER YIELD REMOVED (owner decision, same day it
