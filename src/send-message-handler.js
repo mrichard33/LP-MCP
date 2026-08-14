@@ -259,7 +259,10 @@ import {
 // Conversation Quality Pass v1.0 (2026-07-07): quiet-hours hold for
 // bot-initiated sends, near-duplicate suppression, stale/mid-generation
 // regeneration.
-import { isInQuietHours, nextSendWindowOpenAt, isQuietHoursBypassed } from './services/quiet-hours.js';
+import {
+  isInQuietHours, nextSendWindowOpenAt, isQuietHoursBypassed,
+  isHourGatedChannel, shouldHoldForQuietHours,
+} from './services/quiet-hours.js';
 import { findNearDuplicate } from './services/message-similarity.js';
 import { checkNotSuperseded, commitAgenticSend } from './services/agentic-reply-locks.js';
 import { emitEvent } from './event-emitter.js';
@@ -2148,10 +2151,26 @@ export async function executeSendMessage(action, context) {
   // which are exactly what the 8AM–9PM window suppresses — can be exercised
   // after hours. Inert for every contact not in QUIET_HOURS_BYPASS_CONTACT_IDS.
   const quietHoursBypassed = isQuietHoursBypassed(contactId);
-  if (quietHoursBypassed && !freshInboundReply && isInQuietHours()) {
-    console.log(`[SendMessage] 🌙 QUIET HOURS BYPASSED for test contact ${contactId} (QUIET_HOURS_BYPASS_CONTACT_IDS) — sending now`);
+
+  // 2026-08-14 (owner decision) — EMAIL IS NOT HOUR-GATED. The window exists
+  // for the courtesy/TCPA line on channels that buzz a phone at 9 PM. TCPA
+  // governs calls and texts; email falls under CAN-SPAM, which sets no
+  // time-of-day limit. An email lands in an inbox the lead opens when they
+  // choose, so holding one overnight bought no courtesy and only made the bot
+  // look slow — action 313727 was an email reply deferred to 12:00 UTC.
+  // SMS and livechat are unchanged: they still hold outside 8AM–9PM ET.
+  const inQuietHours = isInQuietHours();
+  const hourGated = isHourGatedChannel(channel);
+  const wouldHold = shouldHoldForQuietHours({
+    channel, inQuietHours, freshInboundReply, bypassed: false,
+  });
+
+  if (!hourGated && !freshInboundReply && inQuietHours) {
+    console.log(`[SendMessage] 🌙 quiet hours are in effect, but channel=email is not hour-gated — sending to ${contactId} now`);
   }
-  if (!quietHoursBypassed && !freshInboundReply && isInQuietHours()) {
+  if (wouldHold && quietHoursBypassed) {
+    console.log(`[SendMessage] 🌙 QUIET HOURS BYPASSED for test contact ${contactId} (QUIET_HOURS_BYPASS_CONTACT_IDS) — sending now`);
+  } else if (wouldHold) {
     const retryAt = nextSendWindowOpenAt();
     console.log(`[SendMessage] 🌙 QUIET HOURS: ${contactId} send is bot-initiated (source: ${sourceEventMeta?.event_type || 'unknown'}) or reply-to-stale-inbound — holding until ${retryAt}`);
     return {
