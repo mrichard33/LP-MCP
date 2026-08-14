@@ -587,42 +587,180 @@ async function fetchLeadIntelligence(ghlContactId) {
   return data;
 }
 
-// 2026-07-03 fail-closed rework: returns NULL when the tag set is UNREADABLE
-// (no key, no contact id, HTTP error, timeout) and an array (possibly empty)
-// only when we actually saw the contact. Callers in the condition evaluator
-// treat null as "referenced data missing" → the rule is suppressed instead of
-// wildcard-passing. Previously [] was returned for both "no tags" and "error",
-// which made not_has_tag* conditions silently fail open on infra blips.
-async function fetchContactTags(ghlContactId) {
-  const GHL_API_KEY = process.env.GHL_API_KEY;
-  if (!GHL_API_KEY || !ghlContactId) return null;
-  try {
-    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${ghlContactId}`, {
-      headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-07-28', 'Accept': 'application/json' },
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data?.contact?.tags || [];
-  } catch { return null; }
+// ═══════════════════════════════════════════════════════════════════
+// CONTACT SNAPSHOT — one GHL read per EVENT (2026-08-14)
+// ═══════════════════════════════════════════════════════════════════
+//
+// 2026-07-03 established the fail-closed doctrine: an UNREADABLE contact read
+// (null) suppresses the rule instead of wildcard-passing. That doctrine is
+// correct and is NOT relaxed here — the same code path evaluates
+// `not_has_tag: stop-bot`, and failing open there would text people who
+// explicitly opted out.
+//
+// The 2026-08-13 defect was that we MANUFACTURED the unreadability. Three
+// readers (tags, customFields, and the combined snapshot behind resolveDemoState)
+// each issued their own `GET /contacts/{id}`, with no retry and a cache scoped
+// to a single evaluateContextConditions call — i.e. ONE RULE. findMatchingRules
+// calls it per rule, so one ai.analysis_completed drove ~20 identical GETs for
+// the same contact inside a few hundred ms. That self-inflicted burst is the
+// likely source of the transient failures it then fail-closed on.
+//
+// Canary: contact gUihunGyOa6SiGbJCJ3K (Maria) asked whether we carry French
+// doors at 2026-08-13T23:50Z. The analyzer succeeded; AGENTIC_RESPOND_POST_CHATBOT
+// was suppressed with "contact tags unreadable"; zero send_message actions were
+// queued; the lead got silence. Fleet-wide the same detail ran 3.6k–12.9k
+// events/day over the preceding 14 days.
+//
+// Resolution chain (source is carried on the result so callers can tell tiers
+// apart): ghl_live → ghl_live_retry → snapshot → null.
+const CONTACT_SNAPSHOT_MAX_ATTEMPTS = 3;
+const CONTACT_SNAPSHOT_BACKOFF_MS = [250, 750];   // after attempt 1, after attempt 2
+const CONTACT_SNAPSHOT_MAX_RETRY_AFTER_MS = 2000; // ignore server hints longer than this
+
+// Parity with normalizeTag in src/ghl-tag-handler.js and normalize() in
+// src/services/tag-snapshot.js — the exact transform contact_tag_snapshot rows
+// are WRITTEN with. Used only on the snapshot tier (see the tag branch).
+function normalizeTagValue(value) {
+  return String(value ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
-// Single GHL fetch returning both tags and customFields. Used by resolveDemoState
-// so the Showed-outcome check and the lp-demo-completed tag check share ONE
-// GET /contacts/{id} round-trip instead of two. Mirrors the error/timeout
-// handling of fetchContactTags / fetchContactCustomFields.
-async function fetchContactSnapshot(ghlContactId) {
-  const GHL_API_KEY = process.env.GHL_API_KEY;
-  if (!GHL_API_KEY || !ghlContactId) return { tags: [], customFields: [] };
+const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Retry only what can plausibly succeed on a second try. 429 and 5xx are the
+// rate-limit/infra classes this fix exists for; AbortError and network throws
+// are the timeout class. A 404 is a REAL ANSWER — the contact does not exist —
+// and must fail closed immediately rather than deferring forever behind a
+// snapshot row that outlived the contact.
+function isRetryableSnapshotStatus(status) {
+  return status === 429 || (status >= 500 && status <= 599);
+}
+
+function snapshotRetryDelayMs(res, attempt) {
+  const header = res?.headers?.get?.('retry-after');
+  if (header) {
+    const seconds = Number(header);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      const ms = seconds * 1000;
+      if (ms <= CONTACT_SNAPSHOT_MAX_RETRY_AFTER_MS) return ms;
+    }
+  }
+  return CONTACT_SNAPSHOT_BACKOFF_MS[attempt - 1] ?? 0;
+}
+
+// Last-resort tag source. contact_tag_snapshot is kept current by the GHL tag
+// webhook and is already trusted by suppression-check.js, the validation
+// invariants, lead-selection and the send handler. Mirrors the shipped
+// precedent resolveContactTagsWithFallback in src/send-message-handler.js
+// ("A reply can be late; it must never vanish").
+//
+// customFields is NULL here on purpose: the snapshot table stores tags only, and
+// returning [] would read as "verified no custom fields" — which would silently
+// turn custom_field_eq's fail-closed into a quiet false. Unknown must stay
+// unknown.
+async function readContactTagSnapshot(ghlContactId, db) {
+  if (!db || !ghlContactId) return null;
   try {
-    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${ghlContactId}`, {
-      headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-07-28', 'Accept': 'application/json' },
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!res.ok) return { tags: [], customFields: [] };
-    const data = await res.json();
-    return { tags: data?.contact?.tags || [], customFields: data?.contact?.customFields || [] };
-  } catch { return { tags: [], customFields: [] }; }
+    const { data, error } = await db
+      .from('contact_tag_snapshot')
+      .select('tags, updated_at')
+      .eq('ghl_contact_id', ghlContactId)
+      .maybeSingle();
+    if (error || !data || !Array.isArray(data.tags)) return null;
+    const ageMin = data.updated_at
+      ? Math.round((Date.now() - new Date(data.updated_at).getTime()) / 60000)
+      : null;
+    console.warn(
+      `[Context] contact snapshot for ${ghlContactId} served from contact_tag_snapshot ` +
+      `(${data.tags.length} tags, ${ageMin === null ? 'age unknown' : `${ageMin}m old`}) — GHL unreadable`
+    );
+    return { tags: data.tags, customFields: null, source: 'snapshot' };
+  } catch (err) {
+    console.warn(`[Context] tag snapshot fallback threw for ${ghlContactId}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Resolve a contact's tags + custom fields, with bounded retry and a
+ * contact_tag_snapshot fallback.
+ *
+ * @returns {Promise<{tags: string[], customFields: object[]|null, source: string}|null>}
+ *   null means UNREADABLE (callers fail closed). An empty tags array means
+ *   VERIFIED-NO-TAGS and must still evaluate — that distinction is load-bearing.
+ */
+async function resolveContactSnapshot(ghlContactId, deps = {}) {
+  const doFetch = deps.fetch || fetch;
+  const db = deps.supabase !== undefined ? deps.supabase : supabase;
+  const sleep = deps.sleep || sleepMs;
+  const GHL_API_KEY = process.env.GHL_API_KEY;
+
+  // No contact id: nothing to read and nothing to look up. Fail closed, as today.
+  if (!ghlContactId) return null;
+  // No key configured: the contact is not the problem, so the snapshot is still
+  // a legitimate source. Same reasoning as 401/403 below.
+  if (!GHL_API_KEY) return readContactTagSnapshot(ghlContactId, db);
+
+  for (let attempt = 1; attempt <= CONTACT_SNAPSHOT_MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await doFetch(`https://services.leadconnectorhq.com/contacts/${ghlContactId}`, {
+        headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-07-28', 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(10000),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        return {
+          tags: data?.contact?.tags || [],
+          customFields: data?.contact?.customFields || [],
+          source: attempt === 1 ? 'ghl_live' : 'ghl_live_retry',
+        };
+      }
+
+      // Definitive: the contact is not there. Never retry, never fall back —
+      // a snapshot row for a contact GHL no longer knows about is not evidence.
+      if (res.status === 404) return null;
+
+      // Credentials/permissions. Says nothing about THIS contact, so the
+      // snapshot is a valid source, but retrying the same bad key is pointless.
+      if (res.status === 401 || res.status === 403) {
+        console.warn(`[Context] contact snapshot ${res.status} for ${ghlContactId} — not retryable, trying snapshot`);
+        return readContactTagSnapshot(ghlContactId, db);
+      }
+
+      if (!isRetryableSnapshotStatus(res.status) || attempt === CONTACT_SNAPSHOT_MAX_ATTEMPTS) {
+        if (isRetryableSnapshotStatus(res.status)) {
+          console.warn(`[Context] contact snapshot exhausted ${CONTACT_SNAPSHOT_MAX_ATTEMPTS} attempts for ${ghlContactId}: ${res.status}`);
+        }
+        return readContactTagSnapshot(ghlContactId, db);
+      }
+
+      console.warn(`[Context] contact snapshot retry ${attempt}/${CONTACT_SNAPSHOT_MAX_ATTEMPTS} for ${ghlContactId}: ${res.status}`);
+      await sleep(snapshotRetryDelayMs(res, attempt));
+    } catch (err) {
+      // AbortError (timeout) and network throws are the retryable throw class.
+      if (attempt === CONTACT_SNAPSHOT_MAX_ATTEMPTS) {
+        console.warn(`[Context] contact snapshot exhausted ${CONTACT_SNAPSHOT_MAX_ATTEMPTS} attempts for ${ghlContactId}: ${err.name || 'error'}`);
+        return readContactTagSnapshot(ghlContactId, db);
+      }
+      console.warn(`[Context] contact snapshot retry ${attempt}/${CONTACT_SNAPSHOT_MAX_ATTEMPTS} for ${ghlContactId}: ${err.name || err.message}`);
+      await sleep(CONTACT_SNAPSHOT_BACKOFF_MS[attempt - 1] ?? 0);
+    }
+  }
+  return readContactTagSnapshot(ghlContactId, db);
+}
+
+/**
+ * Per-event memo over resolveContactSnapshot. Mirrors the event._cancelActiveAppts
+ * pattern already used in the last_active_appointment branch.
+ *
+ * Memoizing a NULL result is deliberate: one failed read then fails all ~20
+ * rules for that event, instead of 20 rules each firing their own failed read
+ * and deepening the burst that caused the failure.
+ */
+async function getContactSnapshot(event, deps = {}) {
+  if (event._contactSnapshot !== undefined) return event._contactSnapshot;
+  event._contactSnapshot = await resolveContactSnapshot(event?.ghl_contact_id || null, deps);
+  return event._contactSnapshot;
 }
 
 // Demo-state resolver (2026-06-17). Authoritative-first: LP disposition (system
@@ -648,12 +786,13 @@ const DEMO_COMPLETE_DISPOSITIONS = ['FDNS', 'OPPFDN', 'Sale', '1Leg', 'BO'];
 // "No Show - Estimate" (Toth zBA6PzNVXRTePgvWL1sT).
 const CF_APPT_OUTCOME = 'jHFRKGGsYJJFRbWwthkG';
 
-async function resolveDemoState(event, intelligence) {
+async function resolveDemoState(event, intelligence, deps = {}) {
   const intel = intelligence || {};
+  const db = deps.supabase !== undefined ? deps.supabase : supabase;
   const ghlContactId = event?.ghl_contact_id || null;
   // 1) LP disposition — system of record (wins when present)
-  if (ghlContactId) {
-    const { data: lpLead } = await supabase.from('lp_leads')
+  if (ghlContactId && db) {
+    const { data: lpLead } = await db.from('lp_leads')
       .select('disposition_code')
       .eq('ghl_contact_id', ghlContactId)
       .order('synced_at', { ascending: false })
@@ -662,8 +801,18 @@ async function resolveDemoState(event, intelligence) {
     if (disp && DEMO_COMPLETE_DISPOSITIONS.includes(disp)) return 'post';
   }
   // One GHL fetch feeds both the appointment-outcome check (1.5) and the
-  // lp-demo-completed tag check (2).
-  const { tags, customFields } = await fetchContactSnapshot(ghlContactId);
+  // lp-demo-completed tag check (2) — and, since 2026-08-14, is shared with
+  // every condition on this event via the per-event memo.
+  //
+  // FAIL-OPEN PRESERVED (deliberate): the old fetchContactSnapshot returned
+  // { tags: [], customFields: [] } on error, NOT null, so an unreadable contact
+  // fell through to buyer_stage rather than suppressing the demo-state check.
+  // That is a fail-open on this path and is out of scope for this PR — mapping
+  // null to the empty shape HERE ONLY keeps outward behavior identical. Tracked
+  // as a follow-up; do not "fix" it without its own review.
+  const snapshot = await getContactSnapshot(event, deps);
+  const tags = snapshot === null ? [] : snapshot.tags;
+  const customFields = snapshot === null ? [] : (snapshot.customFields || []);
   // 1.5) GHL appointment outcome — authoritative rep marking, trusted ABOVE the
   //      lp-demo-completed tag / buyer_stage but BELOW a demo-complete LP
   //      disposition. "Showed*" means the demo physically happened even when the
@@ -680,21 +829,6 @@ async function resolveDemoState(event, intelligence) {
     if (bs >= 1 && bs <= 4) return 'pre';
   }
   return 'unknown';
-}
-
-// 2026-07-03 fail-closed rework: NULL when unreadable (see fetchContactTags).
-async function fetchContactCustomFields(ghlContactId) {
-  const GHL_API_KEY = process.env.GHL_API_KEY;
-  if (!GHL_API_KEY || !ghlContactId) return null;
-  try {
-    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${ghlContactId}`, {
-      headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-07-28', 'Accept': 'application/json' },
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data?.contact?.customFields || [];
-  } catch { return null; }
 }
 
 // v2.11 — Engagement-depth gating (see top-of-file v2.11 doc).
@@ -766,6 +900,13 @@ async function countThreadTurns(ghlContactId, sinceMinutes = 60) {
 const ANNOTATION_CONDITION_KEYS = new Set(['description', 'notes', '_comment', '_doc']);
 
 function emitConditionFailClosed(event, ruleKey, missingKey, detail) {
+  // 2026-08-14 — accumulate on the event (same memo slot family as
+  // _contactSnapshot / _cancelActiveAppts) so the responder-silence telemetry
+  // below can name WHICH rules were suppressed instead of just reporting silence.
+  if (event && ruleKey) {
+    if (!event._failClosedRules) event._failClosedRules = new Set();
+    event._failClosedRules.add(ruleKey);
+  }
   emitEvent({
     event_type: 'rule.condition_failed_closed',
     source: 'decision_engine',
@@ -799,7 +940,10 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
   const payload = event?.payload || {};
   const merged = { ...intel, ...payload };
   const ruleKey = opts.ruleKey || null;
-  let tags;            // undefined = not fetched yet; null = fetched, UNREADABLE
+  // 2026-08-14: both now resolve through the per-event memo (getContactSnapshot),
+  // so these locals no longer own a fetch — they just unpack one shared read.
+  let tags;            // undefined = not resolved yet; null = resolved, UNREADABLE
+  let tagSource = null;// which tier tags came from: ghl_live | ghl_live_retry | snapshot
   let tagsFetched = false;
   let customFields;    // same contract
   let customFieldsFetched = false;
@@ -839,7 +983,7 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
       }
       case 'objection_type_eq': if (merged.objection_type !== expected) return false; break;
       case 'demo_state_eq': {
-        const state = await resolveDemoState(event, intelligence);
+        const state = await resolveDemoState(event, intelligence, opts.deps);
         if (state !== expected) {
           console.log(`[Context] BLOCKED: demo_state ${state} !== ${expected}`);
           return false;
@@ -884,44 +1028,73 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
       case 'has_tag_prefix':
       case 'not_has_tag_prefix':
       case 'not_has_any_tag_prefix': {
-        if (!tagsFetched) { tags = await fetchContactTags(event.ghl_contact_id); tagsFetched = true; }
+        if (!tagsFetched) {
+          const snapshot = await getContactSnapshot(event, opts.deps);
+          tags = snapshot === null ? null : snapshot.tags;
+          tagSource = snapshot === null ? null : snapshot.source;
+          tagsFetched = true;
+        }
         // 2026-07-03 fail-closed: an UNREADABLE tag set (null) suppresses the
         // rule for positive AND negative tag conditions alike. The old
         // behavior let not_has_* conditions fail open on infra blips ("if we
         // can't see a blocked tag, we don't block") — that is exactly the
         // wildcard-pass this rework forbids.
         if (tags === null) return failClosed(key, 'contact tags unreadable');
+
+        // 2026-08-14 — SNAPSHOT-TIER CASE NORMALIZATION (compliance-critical).
+        // contact_tag_snapshot stores tags normalized (trim/lowercase/collapse,
+        // see normalizeTag in src/ghl-tag-handler.js); live GHL returns them raw
+        // and this evaluator compares case-SENSITIVELY. Across enabled rules 11
+        // of 844 tag expressions are non-lowercase, and every one of them sits
+        // in a not_has_any_tag position — including "optedOut" in 6 rules
+        // (OBJECTION_ROUTE_*, TRUST_REBUILD_*, BEHAVIORAL_GHOST_AFTER_BOOKING,
+        // APPT_FRICTION_*). Comparing "optedOut" raw against a snapshot holding
+        // "optedout" would report the tag ABSENT and let those rules re-engage
+        // people who opted out. So on the snapshot tier we normalize BOTH sides.
+        //
+        // The live tiers are left byte-identical on purpose — normalizing them
+        // would change which rules match today, which is a separate decision.
+        const onSnapshot = tagSource === 'snapshot';
+        const cmp = onSnapshot ? normalizeTagValue : (v) => v;
+        const cmpTags = onSnapshot
+          ? tags.map(t => (typeof t === 'string' ? normalizeTagValue(t) : t))
+          : tags;
+
         if (key === 'has_tag') {
-          if (!tags.includes(expected)) return false;
+          if (!cmpTags.includes(cmp(expected))) return false;
         } else if (key === 'not_has_tag') {
-          if (tags.includes(expected)) return false;
+          if (cmpTags.includes(cmp(expected))) return false;
         } else if (key === 'has_any_tag') {
-          const wanted = Array.isArray(expected) ? expected : [expected];
-          if (!wanted.some(t => tags.includes(t))) {
+          const wanted = (Array.isArray(expected) ? expected : [expected]).map(cmp);
+          if (!wanted.some(t => cmpTags.includes(t))) {
             console.log(`[Context] BLOCKED: has_any_tag — none of [${wanted.join(',')}] present on contact`);
             return false;
           }
         } else if (key === 'not_has_any_tag') {
-          const blocked = Array.isArray(expected) ? expected : [expected];
-          const found = blocked.find(t => tags.includes(t));
+          const blocked = (Array.isArray(expected) ? expected : [expected]).map(cmp);
+          const found = blocked.find(t => cmpTags.includes(t));
           if (found) {
             console.log(`[Context] BLOCKED: not_has_any_tag — contact has "${found}" (in blocklist)`);
             return false;
           }
         } else if (key === 'has_tag_prefix') {
-          if (!tags.some(t => typeof t === 'string' && t.startsWith(expected))) {
-            console.log(`[Context] BLOCKED: has_tag_prefix — no tag starts with "${expected}"`);
+          const wantedPrefix = cmp(expected);
+          if (!cmpTags.some(t => typeof t === 'string' && t.startsWith(wantedPrefix))) {
+            console.log(`[Context] BLOCKED: has_tag_prefix — no tag starts with "${wantedPrefix}"`);
             return false;
           }
         } else if (key === 'not_has_tag_prefix') {
-          const prefixed = tags.find(t => typeof t === 'string' && t.startsWith(expected));
+          const blockedPrefix = cmp(expected);
+          const prefixed = cmpTags.find(t => typeof t === 'string' && t.startsWith(blockedPrefix));
           if (prefixed) {
             console.log(`[Context] BLOCKED: not_has_tag_prefix — contact has "${prefixed}"`);
             return false;
           }
         } else { // not_has_any_tag_prefix
-          const blockedPrefixes = Array.isArray(expected) ? expected : [expected];
-          const prefixed = tags.find(t =>
+          const blockedPrefixes = (Array.isArray(expected) ? expected : [expected]).map(
+            p => (typeof p === 'string' ? cmp(p) : p)
+          );
+          const prefixed = cmpTags.find(t =>
             typeof t === 'string' && blockedPrefixes.some(p => typeof p === 'string' && t.startsWith(p))
           );
           if (prefixed) {
@@ -937,7 +1110,15 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
           console.warn(`[Context] custom_field_eq requires { field_id, value }`);
           return false;
         }
-        if (!customFieldsFetched) { customFields = await fetchContactCustomFields(event.ghl_contact_id); customFieldsFetched = true; }
+        if (!customFieldsFetched) {
+          // Same per-event read as the tag branch. NOTE: the snapshot tier
+          // carries customFields === null (contact_tag_snapshot stores tags
+          // only), so custom-field conditions still fail closed there — that
+          // is correct, unknown must stay unknown.
+          const snapshot = await getContactSnapshot(event, opts.deps);
+          customFields = snapshot === null ? null : snapshot.customFields;
+          customFieldsFetched = true;
+        }
         if (customFields === null) return failClosed(key, 'contact custom fields unreadable');
         const entry = customFields.find(f => f?.id === fieldId);
         const actual = entry?.value ?? null;
@@ -960,7 +1141,15 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
           console.warn(`[Context] custom_field_in requires { field_id, values: [...] }`);
           return false;
         }
-        if (!customFieldsFetched) { customFields = await fetchContactCustomFields(event.ghl_contact_id); customFieldsFetched = true; }
+        if (!customFieldsFetched) {
+          // Same per-event read as the tag branch. NOTE: the snapshot tier
+          // carries customFields === null (contact_tag_snapshot stores tags
+          // only), so custom-field conditions still fail closed there — that
+          // is correct, unknown must stay unknown.
+          const snapshot = await getContactSnapshot(event, opts.deps);
+          customFields = snapshot === null ? null : snapshot.customFields;
+          customFieldsFetched = true;
+        }
         if (customFields === null) return failClosed(key, 'contact custom fields unreadable');
         const entry = customFields.find(f => f?.id === fieldId);
         const actual = entry?.value ?? null;
@@ -1672,6 +1861,88 @@ async function runReplyBackstopIfAnalyzerSilent(event, result, deps = {}) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// RESPONDER SILENCE — analyzer succeeded, nobody replied (2026-08-14)
+// ═══════════════════════════════════════════════════════════════════
+//
+// runReplyBackstopIfAnalyzerSilent covers the case where the ANALYZER goes
+// silent. It returns early on `result && !result.skipped`, so the opposite
+// failure — analyzer SUCCEEDS, ai.analysis_completed is emitted, and then every
+// responder rule fails closed on an unreadable contact read — produced no
+// record at all. That is exactly what happened to gUihunGyOa6SiGbJCJ3K on
+// 2026-08-13: 3 actions created (layer3 + stage apply), zero send_message, and
+// nothing in the data said a lead had been left hanging.
+const RESPONDER_RULE_KEY = 'AGENTIC_RESPOND_POST_CHATBOT';
+
+// Turns where a send_message is CORRECTLY absent because a layer3 dispatch row
+// owns the reply instead. Read live off rule 106 so the two cannot drift; this
+// literal is only the fallback for when the rule can't be read. Live value as
+// of 2026-08-14.
+const RESPONDER_STAND_DOWN_FALLBACK = [
+  'objection_price', 'busy_callback', 'wrong_person', 'frustrated_fast_track',
+  'callback_request', 'guide_send', 'follow_up_scheduled',
+];
+
+async function responderStandDownActions(deps = {}) {
+  try {
+    const rules = await (deps.loadRules || loadRules)();
+    const rule = (rules || []).find(r => r.rule_key === RESPONDER_RULE_KEY);
+    if (!rule) return RESPONDER_STAND_DOWN_FALLBACK;
+    const conds = { ...(rule.conditions || {}), ...(rule.context_conditions || {}) };
+    const nin = conds.recommended_action_nin;
+    return Array.isArray(nin) && nin.length > 0 ? nin : RESPONDER_STAND_DOWN_FALLBACK;
+  } catch {
+    return RESPONDER_STAND_DOWN_FALLBACK;
+  }
+}
+
+/**
+ * TELEMETRY ONLY. Deliberately has NO consuming rule, and deliberately does not
+ * emit agentic.reply_dropped: agent_rules 341 (AGENTIC_REPLY_DROPPED_ALERT) has
+ * conditions = {} — completely ungated — and pages GroupMe, so routing this to
+ * it would page on every stand-down turn. Same reasoning as the 2026-08-03
+ * backstop comment above: aggregate outage detection lives in
+ * src/agentic-silence-alerts.js, not here.
+ *
+ * Measured volume before shipping: 5 qualifying events over the 3 days to
+ * 2026-08-14 (of 52 analyses), 2 of which also carried a fail-closed read.
+ */
+async function emitResponderSilenceIfUnanswered(event, allActions, deps = {}) {
+  if (event?.event_type !== 'ai.analysis_completed') return;
+  if ((allActions || []).some(a => a?.action_type === 'send_message')) return;
+
+  const recommended = event?.payload?.recommended_action || null;
+  const standDown = await responderStandDownActions(deps);
+  if (recommended && standDown.includes(recommended)) return;
+
+  const emit = deps.emitEvent || emitEvent;
+  const failClosedRules = event._failClosedRules ? [...event._failClosedRules] : [];
+
+  console.error(
+    `[ResponderSilence] analyzer succeeded for ${event.ghl_contact_id} but no send_message ` +
+    `was created (event ${event.id}, recommended_action=${recommended || 'none'}, ` +
+    `fail_closed=[${failClosedRules.join(',')}])`
+  );
+
+  await emit({
+    event_type: 'agentic.reply_unanswered',
+    source: 'decision_engine',
+    entity_type: 'contact',
+    entity_id: String(event.ghl_contact_id || event.entity_id || 'unknown'),
+    ghl_contact_id: event.ghl_contact_id || null,
+    payload: {
+      source_event_id: event.id,
+      reason: 'responder_created_no_send',
+      recommended_action: recommended,
+      fail_closed_rules: failClosedRules,
+      message_preview: String(event.payload?.message_text || '').slice(0, 100),
+    },
+    priority: 'high',
+    bypass_filter: true,
+    idempotency_key: `reply_unanswered_responder_${event.id}`,
+  }).catch(err => console.warn(`[ResponderSilence] telemetry emit failed: ${err.message}`));
+}
+
 async function processSingleEventInner(event) {
   if (event.event_type === 'ghl.reply_received' && event.event_subtype === 'pending_analysis') {
     const contactId = event.ghl_contact_id;
@@ -1716,6 +1987,9 @@ async function processSingleEventInner(event) {
       processed: true, processed_by: 'decision_engine',
       processed_at: new Date().toISOString(), action_taken: 'no_matching_rules',
     }).eq('id', event.id);
+    // Zero matched rules on a completed analysis is the same outcome as matching
+    // rules that produce no send_message: the lead is unanswered.
+    await emitResponderSilenceIfUnanswered(event, []);
     return { event_id: event.id, matched_rules: 0, actions_created: 0 };
   }
 
@@ -1736,6 +2010,11 @@ async function processSingleEventInner(event) {
     processed_at: new Date().toISOString(),
     action_taken: actionNote,
   }).eq('id', event.id);
+
+  // Rules matched and fired, but if none of them queued a send_message this is
+  // still a lead sitting in silence (the gUihunGyOa6SiGbJCJ3K shape: layer3 and
+  // a stage apply fired, the responder did not).
+  await emitResponderSilenceIfUnanswered(event, allActions);
 
   return {
     event_id: event.id, matched_rules: matchedRules.length,
@@ -1892,4 +2171,15 @@ export const _internal = {
   // 2026-08-03 — agentic reply backstop (analyzer-silence incident). Takes an
   // optional deps object so the branch logic is testable without a live DB.
   runReplyBackstopIfAnalyzerSilent,
+  // 2026-08-14 — per-event contact snapshot (tag-read burst incident). All take
+  // an optional deps object ({ fetch, supabase, sleep, loadRules, emitEvent })
+  // so retry/fallback tiers are testable without a live GHL or DB.
+  resolveContactSnapshot,
+  getContactSnapshot,
+  normalizeTagValue,
+  resolveDemoState,
+  emitResponderSilenceIfUnanswered,
+  responderStandDownActions,
+  RESPONDER_STAND_DOWN_FALLBACK,
+  CONTACT_SNAPSHOT_MAX_ATTEMPTS,
 };
