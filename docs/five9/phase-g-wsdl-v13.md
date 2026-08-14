@@ -36,6 +36,46 @@ password is involved. The 403 is easy to misread as "the proxy blocked me" or
 "we need credentials"; it is neither. The Phase F note recorded the URL with
 `&user=x` already, but not why it is load-bearing.
 
+## The schema is not the authority on requiredness
+
+**`inboundCampaign/defaultIvrSchedule` is `minOccurs="0"` and is NOT optional.**
+Phase G read the schema and shaped `five9_create_inbound_campaign` and
+`five9_set_default_ivr_schedule` as two independent steps: create the campaign,
+then attach a script. Five9 refused, live, on action 316167 (2026-08-14):
+
+```
+Five9 createInboundCampaign fault: "campaign.defaultIvrSchedule" is required, but is "null"
+```
+
+An inbound campaign cannot be created without a script already attached, so the
+script must ride along on the create. `five9_create_inbound_campaign` therefore
+requires `action_payload.script_name`;
+`five9_set_default_ivr_schedule` remains useful for *re-pointing* an existing
+campaign, which is what it was always good for.
+
+The general lesson, and the reason this section leads: every other note in this
+file treats the WSDL as ground truth for *shape*, and that still holds — field
+order, element names, and nesting have all been correct. But `minOccurs` tells
+you what the **schema** permits, not what the **server** accepts. Where the two
+disagree, only a live call finds out. Do not infer optionality from
+`minOccurs="0"` for a field that is semantically load-bearing.
+
+The stored shape, read back from the live `Confirmation - Inbound` campaign —
+note that `ivrSchedule` carries only `scriptName`, with no `name`:
+
+```
+defaultIvrSchedule: {
+  ivrSchedule: { scriptName: "Confirmation After hrs" },
+  visualModeSettings: { visualModeEnabled: "true", callbackEnabled: "true",
+                        cssTheme: "a", xFrameOption: "DENY", ... }
+}
+```
+
+`visualModeSettings` is deliberately not emitted on create: the live campaigns
+carry real values there, and sending flags we did not compute would overwrite
+them. Same reasoning as `setDefaultIVRSchedule` not sending
+`isVisualModeEnabled` / `isChatEnabled`.
+
 ## Four findings worth carrying forward
 
 1. **The IVR ops are SINGULAR, and create cannot carry the definition.**

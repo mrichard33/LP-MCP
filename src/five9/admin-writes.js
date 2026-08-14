@@ -1702,10 +1702,21 @@ export const INBOUND_CAMPAIGN_FIELD_ORDER = [
 // Presence in the order array does NOT make a field settable — same rule as
 // OUTBOUND_CAMPAIGN_FIELD_ORDER. The FTP trio and `state` stay in the array
 // because it is a faithful copy of the WSDL sequence; they are not settable.
+//
+// 2026-08-14: defaultIvrSchedule MOVED INTO this set. It was excluded on the
+// reading that minOccurs="0" meant optional. It is not — see the
+// RUNTIME-REQUIRED note on buildDefaultIvrScheduleXml below. A campaign
+// cannot be created without it.
 export const INBOUND_CAMPAIGN_SETTABLE_FIELDS = new Set([
   'description', 'mode', 'name', 'trainingMode', 'type',
-  'autoRecord', 'callWrapup', 'useFtp', 'maxNumOfLines',
+  'autoRecord', 'callWrapup', 'useFtp', 'defaultIvrSchedule', 'maxNumOfLines',
 ]);
+
+// tns:ivrScriptSchedule sequence. `name` and `scriptParameters` are both
+// minOccurs="0" and we send neither: the live Confirmation - Inbound campaign
+// carries only <scriptName> under <ivrSchedule>, so that is the shape Five9
+// actually stores for a default row.
+export const IVR_SCRIPT_SCHEDULE_FIELD_ORDER = ['name', 'scriptName', 'scriptParameters'];
 
 export const WRAPUP_DEFAULT_DISPOSITION = 'No Disposition';
 export const WRAPUP_DEFAULT_SECONDS = 180; // 3 min — matches house campaigns
@@ -1836,6 +1847,40 @@ export function buildCallWrapupXml(wrapup = {}) {
   return `<callWrapup>${xml}</callWrapup>`;
 }
 
+/**
+ * buildDefaultIvrScheduleXml — the two-level defaultIvrSchedule wrapper.
+ *
+ * RUNTIME-REQUIRED, SCHEMA-OPTIONAL. The WSDL marks
+ * inboundCampaign/defaultIvrSchedule minOccurs="0", and Phase G read that as
+ * optional. Five9 disagrees. Verified against the live domain 2026-08-14,
+ * action 316167:
+ *
+ *   Five9 createInboundCampaign fault:
+ *     "campaign.defaultIvrSchedule" is required, but is "null"
+ *
+ * So an inbound campaign cannot be created without a script attached, and
+ * create/attach cannot be two steps the way the Phase G ops were first shaped.
+ * The schema is not the authority on requiredness here; the server is.
+ *
+ * Emits only <ivrSchedule><scriptName>. visualModeSettings is a sibling under
+ * inboundIvrScriptSchedule and is deliberately NOT sent — the live campaigns
+ * carry real values there (visualModeEnabled, callbackEnabled, xFrameOption),
+ * and sending flags we did not compute would overwrite whatever the domain
+ * has set. Same reasoning as setDefaultIVRSchedule not sending
+ * isVisualModeEnabled / isChatEnabled.
+ */
+export function buildDefaultIvrScheduleXml(schedule) {
+  const scriptName = String(schedule?.scriptName || '').trim();
+  if (!scriptName) throw new Error('defaultIvrSchedule.scriptName is required');
+  let inner = '';
+  for (const field of IVR_SCRIPT_SCHEDULE_FIELD_ORDER) {
+    const v = schedule[field];
+    if (v === undefined || v === null) continue;
+    inner += `<${field}>${escapeXml(v)}</${field}>`;
+  }
+  return `<defaultIvrSchedule><ivrSchedule>${inner}</ivrSchedule></defaultIvrSchedule>`;
+}
+
 export function buildInboundCampaignXml(campaign) {
   const name = String(campaign?.name || '').trim();
   if (!name) throw new Error('campaign name is required');
@@ -1848,9 +1893,11 @@ export function buildInboundCampaignXml(campaign) {
   for (const field of INBOUND_CAMPAIGN_FIELD_ORDER) {
     const v = campaign[field];
     if (v === undefined || v === null) continue;
-    xml += field === 'callWrapup'
-      ? buildCallWrapupXml(v)
-      : `<${field}>${escapeXml(v)}</${field}>`;
+    // Two nested complex types; everything else is a scalar. Running
+    // escapeXml over an object yields "[object Object]" — the Phase C defect.
+    if (field === 'callWrapup') xml += buildCallWrapupXml(v);
+    else if (field === 'defaultIvrSchedule') xml += buildDefaultIvrScheduleXml(v);
+    else xml += `<${field}>${escapeXml(v)}</${field}>`;
   }
   return `<campaign>${xml}</campaign>`;
 }
@@ -2112,6 +2159,16 @@ export function executeCreateInboundCampaign(action) {
   const name = String(payload.name || '').trim();
   if (!name) throw new Error('five9_create_inbound_campaign requires action_payload.name');
 
+  // Five9 rejects createInboundCampaign without a default IVR script, despite
+  // the WSDL marking defaultIvrSchedule minOccurs="0" — see
+  // buildDefaultIvrScheduleXml. Creating the campaign and attaching the script
+  // cannot be two steps, so script_name is required here rather than deferred
+  // to five9_set_default_ivr_schedule.
+  const scriptName = String(payload.script_name || '').trim();
+  if (!scriptName) {
+    throw new Error('five9_create_inbound_campaign requires action_payload.script_name — Five9 refuses to create an inbound campaign with a null defaultIvrSchedule, so the script must be attached at creation (five9_set_default_ivr_schedule can re-point it afterwards)');
+  }
+
   const mode = String(payload.mode || 'BASIC').toUpperCase();
   if (mode !== 'BASIC' && mode !== 'ADVANCED') {
     throw new Error(`five9_create_inbound_campaign: mode must be BASIC or ADVANCED, got ${payload.mode}`);
@@ -2146,6 +2203,7 @@ export function executeCreateInboundCampaign(action) {
           enabled: true,
           timeout: wrapupSeconds,
         },
+        defaultIvrSchedule: { scriptName },
         ...(payload.description ? { description: payload.description } : {}),
       };
       const bodyXml = buildInboundCampaignXml(campaign);
@@ -2154,20 +2212,42 @@ export function executeCreateInboundCampaign(action) {
       if (existing) {
         return { skipped: true, reason: 'campaign_already_exists', campaign: name, type: existing.type };
       }
+      // A missing script is a Five9 fault three retries deep; catch it here as
+      // one clear refusal instead.
+      const script = await readIvrScript(scriptName);
+      if (!script) throw new Error(`ivr_script_not_found: ${scriptName}`);
       ctx.previous_state = null;
 
       await ctx.soap('createInboundCampaign', bodyXml);
-      if (ctx.dry_run) return { campaign: name, created: false, previewed: true, mode, max_lines: maxLines };
+      if (ctx.dry_run) {
+        return { campaign: name, created: false, previewed: true, mode, max_lines: maxLines, script: scriptName };
+      }
 
       // createInboundCampaignResponse is empty — the read-back IS the result.
       const after = await readCampaignByName(name);
       ctx.new_state = after;
-      const verified = !!after && String(after.type).toUpperCase() === 'INBOUND';
+      // Read the attached script back too: it is now part of what this op
+      // writes, so "created" alone would under-report a half-right campaign.
+      const cfg = after ? await getInboundCampaign(name) : null;
+      const attachedScript = cfg?.raw?.defaultIvrSchedule?.ivrSchedule?.scriptName ?? null;
+      const scriptAttached = !!attachedScript
+        && String(attachedScript).toLowerCase() === scriptName.toLowerCase();
+      const verified = !!after
+        && String(after.type).toUpperCase() === 'INBOUND'
+        && scriptAttached;
       ctx.event_extra.verified = verified;
       return {
         campaign: name,
         created: !!after,
         verified,
+        script: scriptName,
+        script_attached: attachedScript,
+        ...(verified ? {} : {
+          verify_mismatches: [
+            ...(after ? [] : [{ field: 'campaign', expected: name, actual: null }]),
+            ...(scriptAttached ? [] : [{ field: 'defaultIvrSchedule.ivrSchedule.scriptName', expected: scriptName, actual: attachedScript }]),
+          ],
+        }),
         mode,
         max_lines: maxLines,
         auto_record: campaign.autoRecord,
