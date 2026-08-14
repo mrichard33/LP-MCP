@@ -5,6 +5,32 @@
  * via channel-specific routing — webhook for SMS, Conversations API
  * for email — with cross-fallback for both.
  *
+ * v3.17 (2026-08-14) — Email replies are REPLY ALL.
+ *   PROBLEM: the reply went only to the contact. Everyone else on the
+ *   inbound was discarded — getInboundEmailToAddress fetched the inbound's
+ *   `to` array and kept `to[0]` (our own mailbox) as the outbound emailFrom,
+ *   dropping every other recipient on the floor. A spouse the lead copied,
+ *   or a rep who was looped into the thread, silently fell off the moment
+ *   the bot answered. No emailCc/emailBcc was set anywhere in the codebase.
+ *
+ *   FIX: getInboundEmailAddresses(contactId) replaces it, returning
+ *   { replyFrom, cc } from the SAME single email-detail fetch — no extra
+ *   API round trip. cc is built by buildReplyAllCc: everyone on the
+ *   inbound's To + Cc, minus two addresses that must never appear —
+ *     - our own receiving mailbox: our reply would arrive back as a fresh
+ *       inbound and the bot would answer it (self-sustaining loop)
+ *     - the lead: GHL already addresses the To via contactId
+ *   Other Reece addresses are deliberately KEPT so a looped-in rep stays
+ *   looped in. Set as msgBody.emailCc (GHL: "Addresses to copy. Email only.").
+ *
+ *   COMPLIANCE NOTE: CC'd addresses are not GHL contacts, so the DNC /
+ *   stop-bot / suppression checks — all contact-keyed — do not cover them.
+ *   They are people already party to the thread. The full list is logged and
+ *   persisted to execution_result.email_cc on every send, which is the only
+ *   durable record of who was emailed. execution_result.email_message_id is
+ *   now stored alongside it (previously logged but never persisted), so
+ *   in-thread delivery is verifiable from the DB rather than Railway logs.
+ *
  * v3.14 (2026-06-11) — Email reply-from via email-detail endpoint.
  *   PROBLEM: v3.11's getReplyFromAddress(contactId, 'email') reads the
  *   inbound message's top-level `.to` — which exists for SMS but NOT on
@@ -645,46 +671,119 @@ async function getThreadOriginatorUserId(contactId) {
  *   - email-detail endpoint error or unrecognized response shape
  * Failure is non-fatal everywhere this is used.
  */
-async function getInboundEmailToAddress(contactId) {
-  if (!contactId || !GHL_API_KEY) return null;
+/**
+ * Normalize any address-ish value into a flat list of bare, lowercased
+ * addresses. GHL returns these as an array, a single string, or a
+ * comma-joined string depending on shape, and either bare ("a@b.com") or
+ * display-form ("Jane Doe <a@b.com>"). Pure.
+ */
+export function parseAddressList(value) {
+  const out = [];
+  const push = (raw) => {
+    if (typeof raw !== 'string') return;
+    const angled = raw.match(/<([^>]+)>/);
+    const addr = (angled ? angled[1] : raw).trim().toLowerCase();
+    // Reject display names, empty slots and anything that isn't an address.
+    if (/^[^\s@,]+@[^\s@,]+\.[^\s@,]+$/.test(addr)) out.push(addr);
+  };
+  if (Array.isArray(value)) value.forEach((v) => parseAddressList(v).forEach((a) => out.push(a)));
+  else if (typeof value === 'string') value.split(',').forEach(push);
+  return out;
+}
+
+/**
+ * Reply-all recipient list for an inbound email. Pure — the I/O lives in
+ * getInboundEmailAddresses.
+ *
+ * Everyone who was on the inbound (To + Cc) carries onto the reply, EXCEPT:
+ *   - our own receiving mailbox (`replyFrom`), which becomes the outbound
+ *     FROM. CC'ing ourselves would land our own reply back in the inbox as a
+ *     fresh inbound and the agentic bot would answer it — a self-sustaining
+ *     loop. This exclusion is not optional.
+ *   - the sender (`from`), i.e. the lead: GHL already addresses the outbound
+ *     To them via contactId, so CC'ing them would duplicate the recipient.
+ *
+ * Other Reece addresses are deliberately KEPT: a rep looped into the thread
+ * stays looped in. Order is preserved (To before Cc) and duplicates collapse.
+ */
+export function buildReplyAllCc({ to = [], cc = [], from = null, replyFrom = null } = {}) {
+  const exclude = new Set([from, replyFrom].filter(Boolean).map((s) => String(s).toLowerCase()));
+  const seen = new Set();
+  const out = [];
+  for (const addr of [...to, ...cc]) {
+    if (exclude.has(addr) || seen.has(addr)) continue;
+    seen.add(addr);
+    out.push(addr);
+  }
+  return out;
+}
+
+/**
+ * The inbound email's addresses, in one fetch:
+ *   { replyFrom, cc }
+ *
+ * `replyFrom` is OUR receiving mailbox — the exact address the customer
+ * emailed — used as the outbound emailFrom (v3.14 behavior, unchanged).
+ * `cc` is the reply-all list (see buildReplyAllCc).
+ *
+ * Returns { replyFrom: null, cc: [] } on any miss or error; every caller
+ * treats that as "send a plain reply", so a GHL blip degrades to today's
+ * behavior rather than dropping the send.
+ */
+async function getInboundEmailAddresses(contactId) {
+  const EMPTY = { replyFrom: null, cc: [] };
+  if (!contactId || !GHL_API_KEY) return EMPTY;
 
   try {
     const search = await ghlFetch('GET',
       `/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${contactId}`);
     const conversations = Array.isArray(search) ? search : (search?.conversations || []);
-    if (!conversations.length) return null;
+    if (!conversations.length) return EMPTY;
 
     const conversationId = conversations[0].id;
     const msgData = await ghlFetch('GET',
       `/conversations/${conversationId}/messages?limit=20`);
     const messages = msgData?.messages?.messages || msgData?.messages || [];
-    if (!Array.isArray(messages) || messages.length === 0) return null;
+    if (!Array.isArray(messages) || messages.length === 0) return EMPTY;
 
     const recentInboundEmail = messages.find(m =>
       m.direction === 'inbound' &&
       (m.messageType === 'TYPE_EMAIL' || m.type === 3)
     );
     const emailId = recentInboundEmail?.meta?.email?.messageIds?.[0];
-    if (!emailId) return null;
+    if (!emailId) return EMPTY;
 
     const detail = await ghlFetch('GET', `/conversations/messages/email/${emailId}`);
-    // Defensive extraction across GHL response shapes.
-    const candidates = [
-      detail?.to,
-      detail?.email?.to,
-      detail?.emailTo,
-      detail?.emailMessage?.to,
-    ];
-    for (const c of candidates) {
-      if (Array.isArray(c) && c.length && typeof c[0] === 'string' && c[0].includes('@')) return c[0];
-      if (typeof c === 'string' && c.includes('@')) return c;
+    // Defensive extraction across GHL response shapes — the email-detail
+    // payload has been seen nested under .email and .emailMessage as well as
+    // flat, so probe each and take the first that yields addresses.
+    const pick = (...paths) => {
+      for (const p of paths) {
+        const list = parseAddressList(p);
+        if (list.length) return list;
+      }
+      return [];
+    };
+    const to = pick(detail?.to, detail?.email?.to, detail?.emailTo, detail?.emailMessage?.to);
+    const cc = pick(detail?.cc, detail?.email?.cc, detail?.emailCc, detail?.emailMessage?.cc);
+    const from = pick(detail?.from, detail?.email?.from, detail?.emailFrom, detail?.emailMessage?.from)[0] || null;
+
+    if (!to.length) {
+      console.warn(`[SendMessage] v3.14: email-detail ${emailId} had no recognizable 'to' — keys: [${Object.keys(detail || {}).join(', ')}]`);
+      return EMPTY;
     }
-    console.warn(`[SendMessage] v3.14: email-detail ${emailId} had no recognizable 'to' — keys: [${Object.keys(detail || {}).join(', ')}]`);
-    return null;
+
+    const replyFrom = to[0];
+    return { replyFrom, cc: buildReplyAllCc({ to, cc, from, replyFrom }) };
   } catch (err) {
-    console.warn(`[SendMessage] getInboundEmailToAddress failed for ${contactId}: ${err.message}`);
-    return null;
+    console.warn(`[SendMessage] getInboundEmailAddresses failed for ${contactId}: ${err.message}`);
+    return EMPTY;
   }
+}
+
+/** Back-compat wrapper: just OUR receiving mailbox from the inbound email. */
+async function getInboundEmailToAddress(contactId) {
+  return (await getInboundEmailAddresses(contactId)).replyFrom;
 }
 
 /**
@@ -1121,11 +1220,12 @@ async function sendViaConversationsAPI(contactId, message, channel, subject, opt
     // v3.14: replyFromAddr now resolved via the email-detail endpoint —
     // the conversation-level message object has no `.to` for email, so
     // getReplyFromAddress always returned null on this channel.
-    const [inboundEmailMessageId, originatorUserId, replyFromAddr] = await Promise.all([
+    const [inboundEmailMessageId, originatorUserId, inboundAddrs] = await Promise.all([
       getInboundEmailMessageId(contactId),
       getThreadOriginatorUserId(contactId),
-      getInboundEmailToAddress(contactId),
+      getInboundEmailAddresses(contactId),
     ]);
+    const replyFromAddr = inboundAddrs.replyFrom;
 
     if (inboundEmailMessageId) {
       msgBody.emailMessageId = inboundEmailMessageId;
@@ -1152,6 +1252,22 @@ async function sendViaConversationsAPI(contactId, message, channel, subject, opt
     }
     if (!originatorUserId && !replyFromAddr) {
       console.warn(`[SendMessage] v3.11: no prior outbound + no inbound email found for ${contactId} — sender will default to current assignedTo user (first agentic send in thread)`);
+    }
+
+    // 2026-08-14 — reply ALL. Everyone who was on the inbound (To + Cc) stays
+    // on the reply, so a spouse the lead copied or a rep who was looped in
+    // does not silently fall off the thread. Our own receiving mailbox and
+    // the lead are excluded upstream in buildReplyAllCc — the first would
+    // loop (our reply arrives as a fresh inbound and the bot answers it) and
+    // the second is already the To via contactId.
+    //
+    // NOTE: CC'd addresses are not GHL contacts, so the DNC / stop-bot /
+    // suppression checks — all contact-keyed — do not cover them. They are
+    // people already party to this thread, and the full list is logged on
+    // every send so there is an audit trail of exactly who was emailed.
+    if (inboundAddrs.cc.length) {
+      msgBody.emailCc = inboundAddrs.cc;
+      console.log(`[SendMessage] v3.17: reply-all for ${contactId} — cc(${inboundAddrs.cc.length})=[${inboundAddrs.cc.join(', ')}]`);
     }
 
     // conversationProviderId is REQUIRED for in-thread email reply on
@@ -1182,6 +1298,11 @@ async function sendViaConversationsAPI(contactId, message, channel, subject, opt
     conversationId,
     messageId: result?.messageId || result?.id || null,
     status: result?.status || 'sent',
+    // 2026-08-14 — durable audit trail for reply-all. Railway logs roll off;
+    // execution_result does not. Absent for non-email and for plain replies
+    // with nobody else on the thread.
+    ...(msgBody.emailCc?.length ? { emailCc: msgBody.emailCc } : {}),
+    ...(msgBody.emailMessageId ? { emailMessageId: msgBody.emailMessageId } : {}),
   };
 }
 
@@ -2809,6 +2930,14 @@ export async function executeSendMessage(action, context) {
     conversation_id: sendResult?.conversationId || null,
     message_id: sendResult?.messageId || null,
     webhook_status: sendResult?.webhook_status || null,
+    // 2026-08-14 — email threading + reply-all audit trail. email_message_id
+    // is the inbound id GHL turns into In-Reply-To/References (null means the
+    // reply threaded on "Re:" subject alone). email_cc is exactly who else
+    // received this reply; CC'd addresses are not contacts, so this is the
+    // only durable record that they were emailed. Both null/absent for SMS
+    // and for plain replies with nobody else on the thread.
+    email_message_id: sendResult?.emailMessageId || null,
+    email_cc: sendResult?.emailCc || null,
     ai_generated: !!generated,
     intent_class: generated?.intent_class || null,
     classifier_method: generated?.classification_method || null,
