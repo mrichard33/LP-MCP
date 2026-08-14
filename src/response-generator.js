@@ -1210,6 +1210,32 @@ export function resolveSmsSenderIdentity(fromNumber) {
   };
 }
 
+/**
+ * Has this thread already been signed with `signature`?
+ *
+ * Drives the sign-off rule: sign once to establish who is texting, then stop.
+ * Signing every message reads like a form letter rather than a person.
+ *
+ * Matches the SIGN-OFF FORM only — a dash followed by the name at the END of
+ * the message. A bare name match would be wrong in both directions here:
+ * outbound copy addresses the customer by first name constantly ("Hey Mark,
+ * good to hear from you"), and one of our own test contacts is literally named
+ * Mark. Only the trailing "— Mark" counts as a signature.
+ *
+ * @param {Array<{direction:string, text:string}>|null} conversation
+ * @param {string} signature
+ */
+export function threadCarriesSignOff(conversation, signature) {
+  if (!Array.isArray(conversation) || !signature) return false;
+  const escaped = String(signature).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // em dash, en dash, or hyphen + optional space + the name, at the very end
+  // (allowing trailing punctuation/whitespace).
+  const rx = new RegExp(`[—–-]\\s*${escaped}\\s*[.!]?\\s*$`, 'i');
+  return conversation.some(m =>
+    m?.direction === 'outbound' && rx.test(String(m.text || '').trim())
+  );
+}
+
 // ─── Who may author an agentic email reply ──────────────────────────
 // The sender universe is exactly {company voice, the in-office rep}. An email
 // reply comes from the company or from Mark — never from Randy, who is the
@@ -1575,17 +1601,30 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // the bot says when a customer asks who they are talking to.
   if (channel === 'sms') {
     const ident = resolveSmsSenderIdentity(opts.fromNumber);
+    const alreadySigned = threadCarriesSignOff(context.conversation_recent, ident.signature);
     parts.push(`\n═══════ WHICH LINE THIS REPLY GOES OUT FROM ═══════`);
     if (ident.shared) {
-      parts.push(`This reply goes out from the SHARED Reece team line${ident.matched ? '' : ' (the sending number could not be confirmed, so treat it as the shared line)'}. End the message with the sign-off "— ${ident.signature}".`);
-      parts.push(`If the customer asks who they are talking to, asks for your name, or addresses you by a name: give the name ${ident.nameIfAsked}, AND tell them plainly that this is a shared team number so more than one person may answer. Both halves, every time — a name without the shared-line caveat is misleading the moment someone else replies.`);
+      parts.push(`This reply goes out from the SHARED Reece team line${ident.matched ? '' : ' (the sending number could not be confirmed, so treat it as the shared line)'}.`);
+      parts.push(`If the customer asks who they are talking to, asks for your name, or addresses you by a name: give the name ${ident.nameIfAsked}, AND tell them plainly that this is a shared team number so more than one person may answer. Both halves, every time — a name without the shared-line caveat is misleading the moment someone else replies. Answer that in the BODY of the message; it is not a sign-off.`);
       parts.push(`Do NOT volunteer the shared-line explanation when they have not asked. It is an honest answer to a question, not an opener.`);
     } else {
-      parts.push(`This reply goes out from ${ident.signature}'s direct line. End the message with the sign-off "— ${ident.signature}".`);
-      parts.push(`If the customer asks who they are talking to or asks for your name, the answer is ${ident.signature}. Do not describe this as a shared or team number — it is not.`);
+      parts.push(`This reply goes out from ${ident.signature}'s direct line.`);
+      parts.push(`If the customer asks who they are talking to or asks for your name, the answer is ${ident.signature} — say it in the BODY of the message. Do not describe this as a shared or team number; it is not.`);
     }
-    parts.push(`The sign-off is IDENTITY, not a flourish: include it even on a short reply, and even where this prompt tells you to keep things brief. Use it ONCE, at the very end, and never sign with any other name.`);
-    parts.push(`Your BODY voice does not change: keep writing in "we / our team" voice. The sign-off is the only place this identity appears.`);
+
+    // SIGN-OFF (2026-08-14, owner correction): a signature on EVERY message
+    // reads like a form letter, not a person. Real reps sign the first text so
+    // the customer knows who is writing, then stop. So: sign once, on the first
+    // substantive reply of the thread, and never again.
+    parts.push(`\nSIGN-OFF RULE — this decides whether you end the message with "— ${ident.signature}".`);
+    if (alreadySigned) {
+      parts.push(`DO NOT SIGN THIS MESSAGE. This thread already carries "— ${ident.signature}" on an earlier outbound, so the customer already knows who they are talking to. Re-signing every message reads like a form letter instead of a person.`);
+    } else {
+      parts.push(`Nothing in this thread has been signed yet. If this reply is SUBSTANTIVE — it answers a question, moves the conversation, or opens a topic — end it with "— ${ident.signature}", once, at the very end, to establish who is texting.`);
+      parts.push(`If this reply is only a short acknowledgment or a pleasantry ("Got it.", "Sounds good.", "You as well."), DO NOT sign it. A signature would outweigh the message. Leave it unsigned and sign the next substantive reply instead.`);
+    }
+    parts.push(`Never sign with any name other than "${ident.signature}", and never sign more than once in a message.`);
+    parts.push(`Your BODY voice does not change either way: keep writing in "we / our team" voice.`);
     parts.push(`═══════ END LINE IDENTITY ═══════`);
   }
   parts.push(channel === 'sms'
