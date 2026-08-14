@@ -14,6 +14,15 @@
  * Direct replies to a fresh inbound are ALWAYS allowed at any hour (the
  * caller makes that determination; this module only answers time questions).
  *
+ * CHANNEL SCOPE (2026-08-14, owner decision): SMS and livechat only. EMAIL IS
+ * NOT HOUR-GATED. The window exists for the courtesy/TCPA line on channels
+ * that buzz a phone at 9 PM; TCPA governs calls and texts, while email falls
+ * under CAN-SPAM, which sets no time-of-day limit. An email lands in an inbox
+ * the lead opens when they choose, so holding one overnight bought no
+ * courtesy and only delayed the answer. This module still only answers time
+ * questions — the channel exemption is applied by the caller
+ * (send-message-handler.executeSendMessage).
+ *
  * DST-safe: all wall-clock math goes through Intl.DateTimeFormat with
  * timeZone (same pattern as src/appointment-dates.js etYmd) — the UTC
  * offset is derived per-instant via timeZoneName:'shortOffset', so
@@ -142,4 +151,43 @@ export function isQuietHoursBypassed(contactId) {
     .includes(wanted);
 }
 
-export default { isInQuietHours, nextSendWindowOpenAt, isQuietHoursBypassed };
+/**
+ * Is this channel subject to the quiet-hours window at all?
+ *
+ * SMS and livechat: yes — they buzz a phone, which is what the courtesy/TCPA
+ * line protects. Email: NO (2026-08-14, owner decision) — it lands in an inbox
+ * the lead opens when they choose, and email is CAN-SPAM territory, which sets
+ * no time-of-day limit. Unknown/absent channel gates by default: the safe
+ * direction is to hold, since an ungated unknown could be an SMS.
+ */
+export function isHourGatedChannel(channel) {
+  return String(channel || '').trim().toLowerCase() !== 'email';
+}
+
+/**
+ * The whole hold decision, as one pure predicate. Takes `inQuietHours` as an
+ * input rather than reading the clock so it is deterministic under test;
+ * callers pass isInQuietHours().
+ *
+ * Holds only when ALL of these are true:
+ *   - the channel is hour-gated (email never is)
+ *   - the send is not answering a fresh inbound (those go at any hour)
+ *   - we are inside the quiet window
+ *   - the contact is not on the QA bypass list
+ */
+export function shouldHoldForQuietHours({
+  channel,
+  inQuietHours = false,
+  freshInboundReply = false,
+  bypassed = false,
+} = {}) {
+  if (!isHourGatedChannel(channel)) return false;
+  if (freshInboundReply) return false;
+  if (!inQuietHours) return false;
+  return !bypassed;
+}
+
+export default {
+  isInQuietHours, nextSendWindowOpenAt, isQuietHoursBypassed,
+  isHourGatedChannel, shouldHoldForQuietHours,
+};

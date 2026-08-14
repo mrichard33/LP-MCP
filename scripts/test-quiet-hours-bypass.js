@@ -16,7 +16,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-const { isQuietHoursBypassed, isInQuietHours } = await import('../src/services/quiet-hours.js');
+const {
+  isQuietHoursBypassed, isInQuietHours, isHourGatedChannel, shouldHoldForQuietHours,
+} = await import('../src/services/quiet-hours.js');
 
 const TEST_ID = '61LmNFIppYRWUzNyIJbq';
 const REAL_ID = 'gUihunGyOa6SiGbJCJ3K';
@@ -114,4 +116,70 @@ test('isInQuietHours still honors the configured window regardless of the allowl
     if (priorEnd === undefined) delete process.env.QUIET_HOURS_END;
     else process.env.QUIET_HOURS_END = priorEnd;
   }
+});
+
+// ── channel scope: email is not hour-gated (2026-08-14) ─────────────
+// The window is a courtesy/TCPA line for channels that buzz a phone at 9 PM.
+// TCPA covers calls and texts; email is CAN-SPAM, which sets no time-of-day
+// limit, and it lands in an inbox the lead opens when they choose. Holding an
+// email overnight bought no courtesy and only delayed the answer.
+
+test('email is never hour-gated; sms and livechat are', () => {
+  assert.equal(isHourGatedChannel('email'), false);
+  assert.equal(isHourGatedChannel('Email'), false, 'case-insensitive');
+  assert.equal(isHourGatedChannel('  EMAIL  '), false, 'whitespace/case must not re-gate email');
+  assert.equal(isHourGatedChannel('sms'), true);
+  assert.equal(isHourGatedChannel('livechat'), true);
+});
+
+test('an unknown or absent channel gates by default', () => {
+  // Safe direction: an ungated unknown could be an SMS.
+  for (const ch of [undefined, null, '', 'something-new']) {
+    assert.equal(isHourGatedChannel(ch), true, `ungated unknown channel: ${JSON.stringify(ch)}`);
+  }
+});
+
+test('a bot-initiated EMAIL inside the quiet window is NOT held', () => {
+  assert.equal(shouldHoldForQuietHours({
+    channel: 'email', inQuietHours: true, freshInboundReply: false, bypassed: false,
+  }), false, 'email must send at any hour');
+});
+
+test('a bot-initiated SMS inside the quiet window IS held', () => {
+  assert.equal(shouldHoldForQuietHours({
+    channel: 'sms', inQuietHours: true, freshInboundReply: false, bypassed: false,
+  }), true, 'the TCPA/courtesy line must stay on for SMS');
+});
+
+test('livechat keeps the hold too', () => {
+  assert.equal(shouldHoldForQuietHours({
+    channel: 'livechat', inQuietHours: true, freshInboundReply: false, bypassed: false,
+  }), true);
+});
+
+test('a fresh inbound reply is never held, on any channel', () => {
+  for (const channel of ['sms', 'livechat', 'email']) {
+    assert.equal(shouldHoldForQuietHours({
+      channel, inQuietHours: true, freshInboundReply: true, bypassed: false,
+    }), false, `held a fresh reply on ${channel}`);
+  }
+});
+
+test('outside the window nothing is held', () => {
+  for (const channel of ['sms', 'livechat', 'email']) {
+    assert.equal(shouldHoldForQuietHours({
+      channel, inQuietHours: false, freshInboundReply: false, bypassed: false,
+    }), false);
+  }
+});
+
+test('the QA bypass still exempts a gated channel', () => {
+  assert.equal(shouldHoldForQuietHours({
+    channel: 'sms', inQuietHours: true, freshInboundReply: false, bypassed: true,
+  }), false);
+});
+
+test('defaults are safe: no args holds nothing, quiet sms holds', () => {
+  assert.equal(shouldHoldForQuietHours(), false, 'not in quiet hours by default');
+  assert.equal(shouldHoldForQuietHours({ channel: 'sms', inQuietHours: true }), true);
 });
