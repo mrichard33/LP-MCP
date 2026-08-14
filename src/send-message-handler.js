@@ -233,7 +233,7 @@ import {
 // Conversation Quality Pass v1.0 (2026-07-07): quiet-hours hold for
 // bot-initiated sends, near-duplicate suppression, stale/mid-generation
 // regeneration.
-import { isInQuietHours, nextSendWindowOpenAt } from './services/quiet-hours.js';
+import { isInQuietHours, nextSendWindowOpenAt, isQuietHoursBypassed } from './services/quiet-hours.js';
 import { findNearDuplicate } from './services/message-similarity.js';
 import { checkNotSuperseded, commitAgenticSend } from './services/agentic-reply-locks.js';
 import { emitEvent } from './event-emitter.js';
@@ -1989,7 +1989,15 @@ export async function executeSendMessage(action, context) {
     newestInboundAtPre === null
     || (Date.now() - Date.parse(newestInboundAtPre)) <= FRESH_REPLY_WINDOW_MS
   );
-  if (!freshInboundReply && isInQuietHours()) {
+  // QA bypass (2026-08-14): named test contacts send at any hour so the full
+  // loop — including bot-initiated hold returns and follow-up re-engagements,
+  // which are exactly what the 8AM–9PM window suppresses — can be exercised
+  // after hours. Inert for every contact not in QUIET_HOURS_BYPASS_CONTACT_IDS.
+  const quietHoursBypassed = isQuietHoursBypassed(contactId);
+  if (quietHoursBypassed && !freshInboundReply && isInQuietHours()) {
+    console.log(`[SendMessage] 🌙 QUIET HOURS BYPASSED for test contact ${contactId} (QUIET_HOURS_BYPASS_CONTACT_IDS) — sending now`);
+  }
+  if (!quietHoursBypassed && !freshInboundReply && isInQuietHours()) {
     const retryAt = nextSendWindowOpenAt();
     console.log(`[SendMessage] 🌙 QUIET HOURS: ${contactId} send is bot-initiated (source: ${sourceEventMeta?.event_type || 'unknown'}) or reply-to-stale-inbound — holding until ${retryAt}`);
     return {

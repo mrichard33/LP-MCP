@@ -21,6 +21,17 @@
  *
  * Env: QUIET_HOURS_START (default '21:00'), QUIET_HOURS_END (default
  * '08:00') — ET wall-clock 'HH:MM'. Mark can tune without a deploy.
+ *
+ * QUIET_HOURS_BYPASS_CONTACT_IDS (2026-08-14) — comma-separated GHL contact
+ * ids exempt from the hold. QA only: it exists so the full loop, including
+ * bot-INITIATED sends (hold returns, follow-up re-engagements), can be
+ * exercised after 9 PM ET against a test contact. Deliberately an id
+ * allowlist rather than a global switch or a tag:
+ *   - a global switch (start === end) would disable the TCPA/courtesy line
+ *     for every real customer;
+ *   - a tag would need a GHL read on the send path, which can fail, and a
+ *     failed read must never be the reason a real customer gets a 10 PM text.
+ * An id list is inert for everyone not named in it and costs no I/O.
  */
 
 const TZ = 'America/New_York';
@@ -109,4 +120,26 @@ export function nextSendWindowOpenAt(now = new Date()) {
   return openAt.toISOString();
 }
 
-export default { isInQuietHours, nextSendWindowOpenAt };
+/**
+ * True when this contact is exempt from the quiet-hours hold.
+ *
+ * Read per call, not captured at module load, so the allowlist can be changed
+ * in Railway without a redeploy — same reasoning as configuredInOfficeSenderName
+ * in src/response-generator.js.
+ *
+ * @param {string|null} contactId  GHL contact id
+ */
+export function isQuietHoursBypassed(contactId) {
+  if (!contactId) return false;
+  const raw = process.env.QUIET_HOURS_BYPASS_CONTACT_IDS;
+  if (!raw) return false;
+  const wanted = String(contactId).trim();
+  if (!wanted) return false;
+  return String(raw)
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .includes(wanted);
+}
+
+export default { isInQuietHours, nextSendWindowOpenAt, isQuietHoursBypassed };
