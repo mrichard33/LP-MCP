@@ -246,7 +246,11 @@ line('inner XML', buildInboundCampaignXml({
   type: 'INBOUND', mode: 'BASIC', maxNumOfLines: 10, autoRecord: true,
   trainingMode: false, useFtp: false,
   callWrapup: { agentNotReady: true, dispostionName: 'No Disposition', enabled: true, timeout: 180 },
+  defaultIvrSchedule: { scriptName: 'Canvass Conf After hrs' },
 }));
+out.push('  defaultIvrSchedule is minOccurs="0" in the WSDL and REQUIRED by the server');
+out.push('  ("campaign.defaultIvrSchedule is required, but is null" — live, action 316167),');
+out.push('  so script_name is required on create. set_default_ivr_schedule RE-POINTS.');
 out.push('  16-field flattened sequence: campaign → generalCampaign → inboundCampaign.');
 out.push('  dispostionName is misspelled IN FIVE9\'S SCHEMA. Emitting the correct spelling');
 out.push('  raises no error and silently sets no wrapup disposition. Do not "fix" it.');

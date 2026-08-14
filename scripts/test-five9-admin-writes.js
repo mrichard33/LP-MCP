@@ -57,6 +57,8 @@ import {
   buildIvrScriptDefXml,
   buildCallWrapupXml,
   buildInboundCampaignXml,
+  buildDefaultIvrScheduleXml,
+  IVR_SCRIPT_SCHEDULE_FIELD_ORDER,
   buildCampaignDnisXml,
   buildSetDefaultIvrScheduleXml,
   buildPromptTtsXml,
@@ -1059,7 +1061,10 @@ test('REGRESSION: inbound order-array membership does NOT grant settability', ()
   // Same invariant as OUTBOUND_CAMPAIGN_FIELD_ORDER. The array is a faithful
   // copy of the WSDL; the Set is the permission list, and they differ on
   // purpose. FTP credentials and live state are in one and not the other.
-  for (const field of ['ftpHost', 'ftpPassword', 'ftpUser', 'state', 'profileName', 'defaultIvrSchedule', 'recordingNameAsSid']) {
+  // 2026-08-14: defaultIvrSchedule was in this list and has been removed —
+  // Five9 requires it at create time despite minOccurs="0". Everything else
+  // here is still order-array-but-not-settable.
+  for (const field of ['ftpHost', 'ftpPassword', 'ftpUser', 'state', 'profileName', 'recordingNameAsSid']) {
     assert.ok(INBOUND_CAMPAIGN_FIELD_ORDER.includes(field), `${field} should be in the order array`);
     assert.equal(INBOUND_CAMPAIGN_SETTABLE_FIELDS.has(field), false, `${field} must NOT be settable`);
     assert.throws(
@@ -1188,4 +1193,68 @@ test('exactNamePattern: anchors and escapes so a prefix cannot match a longer na
   const re = new RegExp(exactNamePattern('Canvass'));
   assert.equal(re.test('Canvass'), true);
   assert.equal(re.test('Canvass Confirmation'), false, 'a prefix must not match a longer script name');
+});
+
+/* ---------------------------------------------------------------------- *
+ * 2026-08-14 — defaultIvrSchedule is RUNTIME-REQUIRED, schema-optional.
+ *
+ * Phase G read minOccurs="0" as optional and left defaultIvrSchedule out of
+ * the settable set, shaping create and attach as two separate ops. Five9
+ * refused, live, on action 316167:
+ *
+ *   Five9 createInboundCampaign fault:
+ *     "campaign.defaultIvrSchedule" is required, but is "null"
+ *
+ * These pin the corrected shape so the two-step reading cannot come back.
+ * ---------------------------------------------------------------------- */
+
+test('defaultIvrSchedule is settable — the WSDL says optional and the server does not', () => {
+  assert.equal(INBOUND_CAMPAIGN_SETTABLE_FIELDS.has('defaultIvrSchedule'), true,
+    'Five9 rejects createInboundCampaign without it, minOccurs="0" notwithstanding');
+  // Still a faithful copy of the WSDL sequence, still position 15 of 16.
+  assert.equal(INBOUND_CAMPAIGN_FIELD_ORDER.indexOf('defaultIvrSchedule'), 14);
+  assert.deepEqual(INBOUND_CAMPAIGN_FIELD_ORDER.slice(-2), ['defaultIvrSchedule', 'maxNumOfLines']);
+});
+
+test('buildDefaultIvrScheduleXml: two-level wrapper, scriptName only', () => {
+  assert.deepEqual(IVR_SCRIPT_SCHEDULE_FIELD_ORDER, ['name', 'scriptName', 'scriptParameters']);
+  // The live Confirmation - Inbound campaign stores exactly this shape.
+  assert.equal(
+    buildDefaultIvrScheduleXml({ scriptName: 'Canvass Conf After hrs' }),
+    '<defaultIvrSchedule><ivrSchedule><scriptName>Canvass Conf After hrs</scriptName></ivrSchedule></defaultIvrSchedule>',
+  );
+  // visualModeSettings is a sibling of ivrSchedule and must NOT be emitted —
+  // sending flags we did not compute would overwrite the domain's settings.
+  assert.ok(!buildDefaultIvrScheduleXml({ scriptName: 'X' }).includes('visualModeSettings'));
+  assert.throws(() => buildDefaultIvrScheduleXml({}), /defaultIvrSchedule\.scriptName is required/);
+  assert.throws(() => buildDefaultIvrScheduleXml({ scriptName: '  ' }), /scriptName is required/);
+  assert.throws(() => buildDefaultIvrScheduleXml(null), /scriptName is required/);
+});
+
+test('buildInboundCampaignXml: the nested schedule lands in WSDL position, not stringified', () => {
+  const xml = buildInboundCampaignXml({
+    name: 'Canvass Confirmation - Inbound', type: 'INBOUND', mode: 'BASIC',
+    maxNumOfLines: 10, autoRecord: true, trainingMode: false, useFtp: false,
+    callWrapup: { agentNotReady: true, dispostionName: 'No Disposition', enabled: true, timeout: 180 },
+    defaultIvrSchedule: { scriptName: 'Canvass Conf After hrs' },
+  });
+  // The Phase C defect: an object through escapeXml serializes as
+  // "[object Object]" with no error. Both nested types must be built, not escaped.
+  assert.ok(!xml.includes('[object Object]'), `nested types must not be stringified: ${xml}`);
+  assert.match(xml, /<defaultIvrSchedule><ivrSchedule><scriptName>Canvass Conf After hrs<\/scriptName><\/ivrSchedule><\/defaultIvrSchedule>/);
+
+  // xs:sequence: defaultIvrSchedule after useFtp, before maxNumOfLines.
+  const order = ['<callWrapup>', '<useFtp>', '<defaultIvrSchedule>', '<maxNumOfLines>'];
+  const idx = order.map(t => xml.indexOf(t));
+  assert.ok(idx.every(i => i >= 0), `all present: ${xml}`);
+  for (let i = 1; i < idx.length; i++) {
+    assert.ok(idx[i] > idx[i - 1], `${order[i]} must follow ${order[i - 1]}: ${xml}`);
+  }
+});
+
+test('every INBOUND_CAMPAIGN_SETTABLE_FIELD still has a position in the order array', () => {
+  // Re-asserted after widening the set: a settable field missing from the
+  // order array silently never emits.
+  const missing = [...INBOUND_CAMPAIGN_SETTABLE_FIELDS].filter(f => !INBOUND_CAMPAIGN_FIELD_ORDER.includes(f));
+  assert.deepEqual(missing, [], `settable fields absent from the order array: ${missing.join(', ')}`);
 });
