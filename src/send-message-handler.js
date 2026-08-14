@@ -563,6 +563,48 @@ async function ghlFetch(method, path, body = null) {
  * (or vice versa) when the conversation has both.
  */
 /**
+ * The id of the LEAD'S ACTUAL REPLY inside a conversation message record.
+ *
+ * 2026-08-14 — GHL COLLAPSES AN EMAIL THREAD INTO ONE RECORD. When a lead
+ * replies to a nurture email, GHL appends the reply's id to the EXISTING
+ * OUTBOUND record, flips `direction` to 'inbound', and leaves the original
+ * nurture as the stored `body`. The record then carries several ids, OLDEST
+ * FIRST:
+ *
+ *   meta.email.messageIds: [ "<our nurture>", "<the lead's reply>" ]
+ *
+ * Verified on the live Edward Lavigne thread (contact dHl5G5AtPuAXun9Gc3Ab,
+ * conversation NiHDHHP8HZ0QDRSvYefr): the unsubscribe URL embedded in that
+ * record's own body carries message_id=2igFEmDEMTlbZhdpHoIc, which is
+ * element [0] — proving [0] is OUR outbound send, not their reply. The same
+ * shape holds on the other collapsed record in that conversation.
+ *
+ * Taking [0] therefore made every reply on a collapsed thread:
+ *   - thread under the email WE sent (In-Reply-To pointed at our nurture),
+ *     so it landed in a different Gmail thread than the lead's message; and
+ *   - resolve emailFrom from the nurture's `to` — the LEAD'S OWN ADDRESS —
+ *     so we asked GHL to send the reply from the customer's address; and
+ *   - hand reply-all the nurture's recipient list instead of the reply's,
+ *     which is why the cc was always empty.
+ *
+ * Uncollapsed records carry a single id, where last === [0], so this is a
+ * no-op on the ordinary path.
+ *
+ * NOTE: getThreadSenderType deliberately does NOT use this — it searches
+ * `direction === 'outbound'` records and WANTS the prior outbound's
+ * signature, so [0] is correct there. The two differ on purpose.
+ *
+ * @param {any} msg a GHL conversation message record
+ * @returns {string|null}
+ */
+export function inboundReplyEmailId(msg) {
+  const ids = msg?.meta?.email?.messageIds;
+  if (!Array.isArray(ids) || ids.length === 0) return null;
+  const last = ids[ids.length - 1];
+  return typeof last === 'string' && last.trim() !== '' ? last : null;
+}
+
+/**
  * v3.10 — Look up the GHL message ID of the most recent inbound email
  * for a contact. Used as the `emailMessageId` field on the outbound
  * Conv API send, which tells GHL to stamp In-Reply-To and References
@@ -593,14 +635,14 @@ async function getInboundEmailMessageId(contactId) {
     const messages = msgData?.messages?.messages || msgData?.messages || [];
     if (!Array.isArray(messages) || messages.length === 0) return null;
 
-    // Newest-first. Find the most recent inbound EMAIL and return its
-    // top-level GHL id. Mirrors getInboundEmailSubject's filter; we
-    // intentionally return id rather than meta.email.subject here.
+    // Newest-first. Find the most recent inbound EMAIL and return the id of
+    // the LEAD'S REPLY within it (see inboundReplyEmailId — a collapsed
+    // thread's [0] is our own outbound nurture, not their reply).
     const recentInboundEmail = messages.find(m =>
       m.direction === 'inbound' &&
       (m.messageType === 'TYPE_EMAIL' || m.type === 3)
     );
-    return recentInboundEmail?.meta?.email?.messageIds?.[0] || null;
+    return inboundReplyEmailId(recentInboundEmail);
   } catch (err) {
     console.warn(`[SendMessage] getInboundEmailMessageId failed for ${contactId}: ${err.message}`);
     return null;
@@ -753,7 +795,12 @@ async function getInboundEmailAddresses(contactId) {
       m.direction === 'inbound' &&
       (m.messageType === 'TYPE_EMAIL' || m.type === 3)
     );
-    const emailId = recentInboundEmail?.meta?.email?.messageIds?.[0];
+    // The LEAD'S reply, not our nurture — see inboundReplyEmailId. Reading
+    // [0] here resolved the recipient list of OUR OWN outbound email, whose
+    // `to` is the lead's address: we then set that as emailFrom (asking GHL
+    // to send from the customer's own address) and handed reply-all the wrong
+    // recipient list, which is why the cc was always empty.
+    const emailId = inboundReplyEmailId(recentInboundEmail);
     if (!emailId) return EMPTY;
 
     const detail = await ghlFetch('GET', `/conversations/messages/email/${emailId}`);
@@ -777,6 +824,20 @@ async function getInboundEmailAddresses(contactId) {
     }
 
     const replyFrom = to[0];
+
+    // Canary for a future GHL shape change. On a genuine inbound reply, `from`
+    // is the LEAD and `to` is our receiving mailbox. If `from` instead matches
+    // the address we are about to send from, we picked an OUTBOUND id — which
+    // is the 2026-08-14 collapsed-thread bug — and both the threading id and
+    // the cc list would be wrong. Log rather than fail: a plain reply still
+    // beats no reply.
+    if (from && replyFrom && from.toLowerCase() === replyFrom.toLowerCase()) {
+      console.warn(
+        `[SendMessage] v3.18: email-detail ${emailId} looks OUTBOUND (from === to[0] === ${from}) ` +
+        `for ${contactId} — threading and reply-all may be wrong; check meta.email.messageIds ordering`
+      );
+    }
+
     return { replyFrom, cc: buildReplyAllCc({ to, cc, from, replyFrom }) };
   } catch (err) {
     console.warn(`[SendMessage] getInboundEmailAddresses failed for ${contactId}: ${err.message}`);
@@ -914,6 +975,12 @@ async function getThreadSenderType(contactId) {
     if (!Array.isArray(messages) || messages.length === 0) return null;
 
     // Newest-first. Find the most recent OUTBOUND email.
+    //
+    // 2026-08-14 — this one KEEPS messageIds[0] and must NOT use
+    // inboundReplyEmailId. It searches outbound records and wants the prior
+    // outbound's SIGNATURE, so the oldest id (our own send) is exactly right.
+    // The threading/address helpers take the LAST id because they want the
+    // lead's reply. The two differ on purpose; see inboundReplyEmailId.
     const recentOutboundEmail = messages.find(m =>
       m.direction === 'outbound' &&
       (m.messageType === 'TYPE_EMAIL' || m.type === 3)

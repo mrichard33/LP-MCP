@@ -20,7 +20,8 @@ import assert from 'node:assert/strict';
 process.env.SUPABASE_URL = process.env.SUPABASE_URL || 'http://localhost:54321';
 process.env.SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'test-key';
 
-const { parseAddressList, buildReplyAllCc } = await import('../src/send-message-handler.js');
+const { parseAddressList, buildReplyAllCc, inboundReplyEmailId } =
+  await import('../src/send-message-handler.js');
 
 // ── parseAddressList ─────────────────────────────────────────────────
 
@@ -109,4 +110,67 @@ test('end-to-end shape: parse then build, from a realistic inbound', () => {
     ['beverly@reecewindows.com', 'husband@aol.com'],
     'reply-all keeps the rep and the spouse, drops our mailbox and the lead'
   );
+});
+
+// ── inboundReplyEmailId — which id in a collapsed thread? ────────────
+// GHL collapses an email thread into ONE record: when a lead replies to a
+// nurture, GHL appends the reply's id to the existing OUTBOUND record, flips
+// direction to 'inbound', and keeps the original nurture as the body. The ids
+// are oldest-first, so [0] is OUR send and the last is the lead's reply.
+//
+// Fixtures below are the real ids from the Edward Lavigne thread
+// (contact dHl5G5AtPuAXun9Gc3Ab, conversation NiHDHHP8HZ0QDRSvYefr), where
+// taking [0] threaded our reply under our own nurture and resolved the
+// outbound From to the lead's own address.
+
+const OUR_NURTURE = '2igFEmDEMTlbZhdpHoIc';   // messageIds[0] — our send
+const LEADS_REPLY = 'Y1WdPKKLTZ5hmgKFddq3';   // messageIds[1] — their reply
+
+test('collapsed thread → the LEAD\'S reply id, not our nurture', () => {
+  const collapsed = { meta: { email: { messageIds: [OUR_NURTURE, LEADS_REPLY], direction: 'inbound' } } };
+  assert.equal(inboundReplyEmailId(collapsed), LEADS_REPLY);
+  assert.notEqual(inboundReplyEmailId(collapsed), OUR_NURTURE, 'threading to our own nurture is the bug');
+});
+
+test('uncollapsed record (single id) is unchanged', () => {
+  const plain = { meta: { email: { messageIds: [LEADS_REPLY] } } };
+  assert.equal(inboundReplyEmailId(plain), LEADS_REPLY, 'last === [0] on the ordinary path');
+});
+
+test('three-deep collapse still returns the newest', () => {
+  const deep = { meta: { email: { messageIds: ['a1', 'b2', 'c3'] } } };
+  assert.equal(inboundReplyEmailId(deep), 'c3');
+});
+
+test('missing / empty / malformed messageIds → null (callers fail soft)', () => {
+  for (const msg of [
+    undefined, null, {}, { meta: {} }, { meta: { email: {} } },
+    { meta: { email: { messageIds: [] } } },
+    { meta: { email: { messageIds: 'not-an-array' } } },
+    { meta: { email: { messageIds: [null] } } },
+    { meta: { email: { messageIds: ['  '] } } },
+  ]) {
+    assert.equal(inboundReplyEmailId(msg), null, `expected null for ${JSON.stringify(msg)}`);
+  }
+});
+
+// ── the end-to-end shape this bug produced ──────────────────────────
+
+test('reading the LEAD\'S reply yields a real cc; reading ours yields none', () => {
+  const OURS = 'mark@send.getreecewindows.com';
+  const LEAD = 'lavigneedward78@gmail.com';
+  const ALSO = 'cindy@example.com';           // the "+1" on the live reply
+
+  // Correct: the lead's reply — to us (+1), from the lead.
+  const fromReply = buildReplyAllCc({
+    to: [OURS, ALSO], cc: [], from: LEAD, replyFrom: OURS,
+  });
+  assert.deepEqual(fromReply, [ALSO], 'the second recipient must stay on the thread');
+
+  // The bug: our own nurture — to the lead, from us. replyFrom becomes the
+  // LEAD'S address (which we then set as emailFrom) and the cc is empty.
+  const fromNurture = buildReplyAllCc({
+    to: [LEAD], cc: [], from: OURS, replyFrom: LEAD,
+  });
+  assert.deepEqual(fromNurture, [], 'reading our own send is why cc was always empty');
 });
