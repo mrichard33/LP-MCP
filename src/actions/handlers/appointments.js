@@ -420,7 +420,18 @@ function buildAppointmentBody(payload, contactId) {
   }
 
   const title = payload.title || payload.calendar_name || 'Appointment';
-  const status = payload.status || 'new';
+  // 2026-08-15 (Mark, LOCKED): EVERY appointment this system creates is born
+  // 'new' (unconfirmed). A caller-supplied 'confirmed' is IGNORED at creation.
+  // Confirmation is a separate, explicit transition owned by
+  // update_appointment_status, which already gates on
+  // decision_makers_present ∈ {Yes, Solo Owner}. Before this, a model-authored
+  // companion could assert 'confirmed' on a booking whose existence had never
+  // been verified (contact gUihunGyOa6SiGbJCJ3K, action 320924).
+  const requestedStatus = payload.status || 'new';
+  const status = 'new';
+  if (requestedStatus !== 'new') {
+    console.warn(`[ActionExecutor] appointment status forced to 'new' at creation (requested '${requestedStatus}') — confirmation is a separate transition.`);
+  }
   const assignedUserId = payload.assigned_user_id || null;
   const ignoreFreeSlotValidation = !!payload.ignore_free_slot_validation;
 
@@ -592,6 +603,17 @@ export async function executeBookAppointment(action, context) {
         priority: 'high',
         bypass_filter: true,
       }).catch(() => {});
+      // 2026-08-15 — a blocked booking used to end here silently while the
+      // agent_actions row still read `completed` (action 320913, contact
+      // gUihunGyOa6SiGbJCJ3K). Nothing was created and nobody was told.
+      await executeCreateTask({
+        target_id: contactId,
+        action_payload: {
+          title: 'BOOKING BLOCKED — prerequisites missing, NO appointment created',
+          description: `Agentic in-home booking for {{contact_name}} was blocked for ${startTime}: missing ${prereq.missing.join(', ')}. NO appointment exists on the calendar. The lead may believe they are booked — verify and book manually.`,
+        },
+      }, context).catch((taskErr) =>
+        console.warn(`[ActionExecutor] blocked-booking escalation task failed for ${contactId}: ${taskErr.message}`));
       return {
         action: 'appointment_blocked_prerequisites',
         blocked: true,
@@ -661,6 +683,26 @@ export async function executeBookAppointment(action, context) {
 
   console.log(`[ActionExecutor] Booking appointment: calendar=${calendarId}, contact=${contactId}, start=${startTime}, status=${status}${ignoreFreeSlotValidation ? ', override_availability=true' : ''}`);
 
+  // 2026-08-15 — the person name in an appointment title comes from the GHL
+  // contact record ONLY, never from the action payload. The model-authored
+  // title for contact gUihunGyOa6SiGbJCJ3K read "Window Estimate - Maria
+  // Laing"; "Laing" was inherited from a cross-contaminated LP prospect lookup
+  // (Yvonne Laing, LP lead 566250). An LP-derived surname must never reach a
+  // customer-visible artifact. No name on the record → calendar name alone.
+  try {
+    const titleContact = await getContactCached(contactId, context?._contactCache);
+    const ghlName = [titleContact?.firstName, titleContact?.lastName].filter(Boolean).join(' ').trim();
+    const calName = payload.calendar_name
+      || Object.keys(CALENDAR_MAP).find((n) => CALENDAR_MAP[n] === calendarId)
+      || 'Appointment';
+    body.title = ghlName ? `${calName} - ${ghlName}` : calName;
+    if (!ghlName) {
+      console.warn(`[ActionExecutor] appointment title: contact ${contactId} has no name on the GHL record — using calendar name alone rather than a payload-supplied name.`);
+    }
+  } catch (err) {
+    console.warn(`[ActionExecutor] appointment title rebuild failed for ${contactId}: ${err.message} — leaving payload title.`);
+  }
+
   // Title + address. No-op unless APPT_FORMAT_ENABLED, and fails open.
   const fmt = await applyAppointmentFormatForContact(body, contactId, context?._contactCache);
 
@@ -670,10 +712,59 @@ export async function executeBookAppointment(action, context) {
   } catch (err) {
     // Release so the executor's retry can re-attempt this slot.
     if (claimed) await releaseAppointmentCreate(contactId, slotMs).catch(() => {});
+    // 2026-08-15 — a failed booking used to be silent. Action 320924 for
+    // contact gUihunGyOa6SiGbJCJ3K died on GHL 400 "The slot you have selected
+    // is no longer available" and nobody was told; the lead had already been
+    // led to believe she was booked. Escalate BEFORE rethrowing.
+    await applyGHLTag(contactId, 'booking:failed').catch(() => {});
+    await emitEvent({
+      event_type: 'booking.create_failed',
+      event_subtype: 'ghl_post_error',
+      source: 'lp_mcp',
+      entity_type: 'contact',
+      entity_id: contactId,
+      ghl_contact_id: contactId,
+      payload: { calendar_id: calendarId, requested_start_time: startTime, error: err.message },
+      priority: 'critical',
+      bypass_filter: true,
+    }).catch(() => {});
+    await executeCreateTask({
+      target_id: contactId,
+      action_payload: {
+        title: 'BOOKING FAILED — lead has NO appointment, rep action needed',
+        description: `Agentic booking for {{contact_name}} failed on the ${payload.calendar_name || title} calendar at ${startTime}. NO appointment exists. The lead may already believe they are booked — call and rebook. GHL error: ${err.message}`,
+      },
+    }, context).catch((taskErr) =>
+      console.warn(`[ActionExecutor] failed-booking escalation task failed for ${contactId}: ${taskErr.message}`));
     throw err;
   }
+
+  // 2026-08-15 — READ-BACK VERIFICATION. A booking is not "booked" until GHL
+  // hands the object back. Everything below this point is a promise to the
+  // lead — the ghl.appointment_booked emit that drives LP sync, the deferred
+  // confirmation text, the email ask — and none of it may fire on an
+  // unverified create.
   const appointmentId = result?.id || result?.appointment?.id || null;
-  console.log(`[ActionExecutor] ✅ Appointment booked: id=${appointmentId}, calendar=${title}`);
+  if (!appointmentId) {
+    if (claimed) await releaseAppointmentCreate(contactId, slotMs).catch(() => {});
+    throw new Error(`Booking POST returned no appointment id for ${contactId} at ${startTime} — treating as failed`);
+  }
+  let verified = null;
+  for (let attempt = 1; attempt <= 2 && !verified; attempt++) {
+    try {
+      const v = await ghlFetch('GET', `/calendars/events/appointments/${appointmentId}`);
+      const appt = v?.appointment || v || {};
+      if (appt.id) verified = appt;
+    } catch (err) {
+      console.warn(`[ActionExecutor] appointment read-back attempt ${attempt} failed for ${appointmentId}: ${err.message}`);
+    }
+    if (!verified && attempt === 1) await new Promise((r) => setTimeout(r, 1000));
+  }
+  if (!verified) {
+    if (claimed) await releaseAppointmentCreate(contactId, slotMs).catch(() => {});
+    throw new Error(`Appointment ${appointmentId} could not be read back from GHL after create — treating as failed rather than confirming to the lead`);
+  }
+  console.log(`[ActionExecutor] ✅ Appointment booked AND verified: id=${appointmentId}, status=${verified.appointmentStatus || status}, start=${verified.startTime || startTime}, calendar=${title}`);
 
   if (isSlotCheckEnabled()) {
     void emitSlotCheckEvent('created', {
