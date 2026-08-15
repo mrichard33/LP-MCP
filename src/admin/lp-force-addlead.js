@@ -48,6 +48,12 @@
  *   clobbered. With both fields present the workflow passes the gate and
  *   creates the LP lead WITH the appointment (adate/atime off the contact).
  *
+ *   ⚠️ 2026-08-15: the two field NAMES above are backwards — k6j4… carries
+ *   pro_id (830) and BbUJ… carries srs_id (5574). The env vars were renamed
+ *   accordingly: LP_FALLBACK_SOURCE_ID is DEAD, replaced by
+ *   LP_FALLBACK_SRS_ID (which feeds BbUJ…), and LP_FALLBACK_PRO_ID now feeds
+ *   k6j4… rather than BbUJ…. See the constant block below. Values unchanged.
+ *
  *   FAIL-OPEN: any error reading/writing the fields is logged and we still
  *   attempt the enroll (a missing-field enroll is no worse than today).
  *
@@ -110,6 +116,7 @@
 import { sendGroupMeMessage } from '../groupme.js';
 import supabase from '../supabase.js';
 import { getGHLContact, updateGHLContactFields } from '../ghl.js';
+import { LP_SRS, LP_PRO, assertNotTransposed } from '../lp-source-ids.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 
@@ -120,18 +127,32 @@ const LEAD_CREATE_WORKFLOW_ID =
 
 const DEDUP_WINDOW_MIN = Number(process.env.LP_APPT_DEDUP_WINDOW_MIN || 1440);
 
-// ─── Fallback source / pro_id (v2.1.0) ─────────────────────────────
-// GHL custom field IDs (confirmed in src/ghl-field-map.js):
-//   LP Source ID → k6j4IBh5IejPooSCsj49  (slug: lp_source_id)
-//   Pro ID       → BbUJ6RrdTjjEqqRA8JVx  (slug: pro_id)
-// Both are flagged "SKIP DURING SYNC (set by GHL entry workflows)" in the
-// field map — the LP→GHL sync never writes them, and the Voice-AI/agentic
+// ─── Fallback attribution fields (v2.1.0; names corrected 2026-08-15) ──
+// GHL custom field IDs. The two GHL field LABELS are misleading and this
+// module inherited the confusion:
+//   k6j4IBh5IejPooSCsj49 — GHL label "LP Source ID / Numeric Ref", but the
+//                          value it carries for chatbot leads is 830, which
+//                          is LP_PRO.CHATBOT — the PROMOTER id.
+//   BbUJ6RrdTjjEqqRA8JVx — GHL label "Pro ID", but the value it carries is
+//                          5574, which is LP_SRS.CHATBOT — the SUBSOURCE id.
+// Cross-checked against src/actions/handlers/lp-lead.js:67
+// (FIELD_LP_SOURCE_ID = 'BbUJ6RrdTjjEqqRA8JVx' // srs_id) and
+// src/ghl-note-pipeline/resolve-or-create.js (CHATBOT_SRS_ID = '5574').
+//
+// The VALUES written here have always been correct. Only the local constant
+// names and the GroupMe label were backwards, which made the log claim
+// "srs_id=830" — the promoter id announced as the subsource, the exact shape
+// of the I.CT transposition that misrouted 670 leads. Renamed so the next
+// reader is not misled. DO NOT swap which value goes to which field.
+//
+// Both fields are flagged "SKIP DURING SYNC (set by GHL entry workflows)" in
+// the field map — the LP→GHL sync never writes them, and the Voice-AI/agentic
 // entry path doesn't either, which is why sourceless leads can't clear
 // workflow 8e30ff37's "Source ID and Pro ID" gate.
-const LP_SOURCE_ID_FIELD = 'k6j4IBh5IejPooSCsj49';
-const PRO_ID_FIELD       = 'BbUJ6RrdTjjEqqRA8JVx';
-const FALLBACK_SOURCE_ID = String(process.env.LP_FALLBACK_SOURCE_ID || '830');
-const FALLBACK_PRO_ID    = String(process.env.LP_FALLBACK_PRO_ID || '5574');
+const PRO_ID_FIELD  = 'k6j4IBh5IejPooSCsj49';   // holds pro_id  (LP promoter)
+const SRS_ID_FIELD  = 'BbUJ6RrdTjjEqqRA8JVx';   // holds srs_id  (LP subsource)
+const FALLBACK_PRO_ID = String(process.env.LP_FALLBACK_PRO_ID || LP_PRO.CHATBOT);
+const FALLBACK_SRS_ID = String(process.env.LP_FALLBACK_SRS_ID || LP_SRS.CHATBOT);
 
 function clean(v) {
   if (v === 'null' || v === 'undefined' || v === '' || v == null) return null;
@@ -160,10 +181,11 @@ function readContactField(contact, fieldId) {
 }
 
 /**
- * v2.1.0: Ensure the contact has an LP Source ID and Pro ID before we
- * enroll it in workflow 8e30ff37. For whichever field is empty, write the
- * fallback (FALLBACK_SOURCE_ID / FALLBACK_PRO_ID). Only fills blanks — an
- * existing real value is never overwritten, so lead attribution is safe.
+ * v2.1.0: Ensure the contact has an LP subsource (srs_id) and promoter
+ * (pro_id) before we enroll it in workflow 8e30ff37. For whichever field is
+ * empty, write the fallback (FALLBACK_SRS_ID / FALLBACK_PRO_ID). Only fills
+ * blanks — an existing real value is never overwritten, so lead attribution
+ * is safe.
  *
  * Returns a small summary object describing what (if anything) was set.
  * FAIL-OPEN: on any read/write error, logs and returns { ok:false } so the
@@ -177,15 +199,25 @@ async function ensureLpSourceAndProId(contactId) {
       return { ok: false, reason: 'contact_not_found' };
     }
 
-    const existingSource = readContactField(contact, LP_SOURCE_ID_FIELD);
-    const existingPro    = readContactField(contact, PRO_ID_FIELD);
+    const existingPro = readContactField(contact, PRO_ID_FIELD);
+    const existingSrs = readContactField(contact, SRS_ID_FIELD);
+
+    // 2026-08-15 — fail loud rather than enrol a lead whose attribution is the
+    // known I.CT transposition. Throwing here is better than an LP lead
+    // written under the wrong source: attribution history cannot be rewritten
+    // after the fact. FAIL-OPEN on everything else is preserved by the
+    // surrounding try/catch, but this one is deliberate and must escape it —
+    // see the rethrow guard below.
+    const effSrs = existingSrs || FALLBACK_SRS_ID;
+    const effPro = existingPro || FALLBACK_PRO_ID;
+    assertNotTransposed(effSrs, effPro);
 
     const updates = [];
-    if (!existingSource) updates.push({ id: LP_SOURCE_ID_FIELD, field_value: FALLBACK_SOURCE_ID });
-    if (!existingPro)    updates.push({ id: PRO_ID_FIELD,       field_value: FALLBACK_PRO_ID });
+    if (!existingPro) updates.push({ id: PRO_ID_FIELD, field_value: FALLBACK_PRO_ID });
+    if (!existingSrs) updates.push({ id: SRS_ID_FIELD, field_value: FALLBACK_SRS_ID });
 
     if (updates.length === 0) {
-      return { ok: true, set_source: false, set_pro: false, source: existingSource, pro_id: existingPro };
+      return { ok: true, set_srs: false, set_pro: false, srs_id: existingSrs, pro_id: existingPro };
     }
 
     const res = await updateGHLContactFields(contactId, updates);
@@ -193,7 +225,7 @@ async function ensureLpSourceAndProId(contactId) {
     if (wrote) {
       console.log(
         `[LP-FORCE-ADDLEAD] Backfilled missing LP gate fields on ${contactId}: ` +
-        `${!existingSource ? `lp_source_id=${FALLBACK_SOURCE_ID} ` : ''}` +
+        `${!existingSrs ? `srs_id=${FALLBACK_SRS_ID} ` : ''}` +
         `${!existingPro ? `pro_id=${FALLBACK_PRO_ID}` : ''}`.trim()
       );
     } else {
@@ -201,12 +233,15 @@ async function ensureLpSourceAndProId(contactId) {
     }
     return {
       ok: wrote,
-      set_source: !existingSource,
+      set_srs: !existingSrs,
       set_pro: !existingPro,
-      source: existingSource || FALLBACK_SOURCE_ID,
+      srs_id: existingSrs || FALLBACK_SRS_ID,
       pro_id: existingPro || FALLBACK_PRO_ID,
     };
   } catch (err) {
+    // A transposition assertion is NOT a fail-open condition — misattributed
+    // LP leads are unfixable. Everything else keeps the historical fail-open.
+    if (/LP attribution transposed/i.test(err.message)) throw err;
     console.warn(`[LP-FORCE-ADDLEAD] ensureLpSourceAndProId failed for ${contactId} (proceeding): ${err.message}`);
     return { ok: false, reason: err.message };
   }
@@ -297,8 +332,8 @@ export async function enrollLpLeadCreation({ contactId, calendarName = null, for
   await sendGroupMeMessage(
     `🛠️ LP Lead Creation Triggered\n` +
     `👤 contact: ${contactId}${calendarName ? ` | ${calendarName}` : ''}\n` +
-    (gateFields?.set_source || gateFields?.set_pro
-      ? `🧩 Backfilled gate fields: ${gateFields.set_source ? `srs_id=${FALLBACK_SOURCE_ID} ` : ''}${gateFields.set_pro ? `pro_id=${FALLBACK_PRO_ID}` : ''}`.trim() + `\n`
+    (gateFields?.set_srs || gateFields?.set_pro
+      ? `🧩 Backfilled gate fields: ${gateFields.set_srs ? `srs_id=${FALLBACK_SRS_ID} ` : ''}${gateFields.set_pro ? `pro_id=${FALLBACK_PRO_ID}` : ''}`.trim() + `\n`
       : '') +
     `🔁 Enrolled in "Send Lead to Lead Perfection" (8e30ff37)\n` +
     `→ addlead+appt (JSON) · inbound-id writeback · LP callback fills prospect/lead id (~60s)`
