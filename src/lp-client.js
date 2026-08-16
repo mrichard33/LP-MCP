@@ -690,6 +690,20 @@ const LEGACY_FIELD_MAP = {
   appttime:  'atime',
 };
 
+// 2026-08-15 — SETTER ON THE ADDLEAD PATH.
+// setAppointment() stamps set_by = LP_EMP.GHL_INTEGRATION (5686, "Integration,
+// GoHighLevel") on every appointment it sets. A lead created WITH its
+// appointment through legacy addlead — the canvassing path and the chatbot
+// self-heal path — passes no setter at all, so LP records whatever its own
+// default is. Contact gUihunGyOa6SiGbJCJ3K went through exactly this path.
+//
+// The addlead field name for a setter is NOT documented and NOT confirmed.
+// LP silently drops unrecognised keys, so guessing would ship a no-op that
+// looks like a fix. This stays OFF until Amanda confirms the key; then set
+// LP_ADDLEAD_SETTER_FIELD in Railway and it takes effect with no code change.
+// Unset (the default) reproduces today's behaviour exactly.
+const LP_ADDLEAD_SETTER_FIELD = (process.env.LP_ADDLEAD_SETTER_FIELD || '').trim();
+
 function _translateToLegacy(restFields) {
   const out = {};
   for (const [k, v] of Object.entries(restFields || {})) {
@@ -758,6 +772,15 @@ export async function addLead(fields = {}) {
   // behavior for every existing caller; the canvassing webhook passes 3.
   const attempts = Math.max(1, Number(fields._attempts) || 2);
   delete cleanFields._attempts;
+
+  // 2026-08-15 — stamp the GHL integration as the setter when the lead is
+  // being created WITH an appointment. No-op unless LP_ADDLEAD_SETTER_FIELD
+  // names a key LP actually accepts. An explicit caller-supplied value wins.
+  if (LP_ADDLEAD_SETTER_FIELD && cleanFields.apptdate && cleanFields.appttime
+      && !cleanFields[LP_ADDLEAD_SETTER_FIELD]) {
+    cleanFields[LP_ADDLEAD_SETTER_FIELD] = String(LP_EMP.GHL_INTEGRATION);
+    console.log(`[LP] addLead: stamping setter ${LP_ADDLEAD_SETTER_FIELD}=${LP_EMP.GHL_INTEGRATION} (Integration, GoHighLevel)`);
+  }
 
   console.log(`[LP] addLead → trying ${preferPath.toUpperCase()} path first: firstname=${cleanFields.firstname}, phone=${cleanFields.phone}, srs_id=${cleanFields.srs_id}, pro_id=${cleanFields.pro_id || '(none)'}, email=${cleanFields.email || '(none)'}, lognumber=${cleanFields.lognumber || '(none)'}, apptdate=${cleanFields.apptdate || '(none)'}, appttime=${cleanFields.appttime || '(none)'}`);
 
