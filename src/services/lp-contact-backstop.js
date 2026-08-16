@@ -400,7 +400,30 @@ export function selectBackstopTargets(rows, {
 }
 
 // ─── GHL contact I/O (all via ghlFetch) ──────────────────────────────
-/** Pick the phone-matching contact from a search result, verifying last-10 digits when the projection carries a phone. */
+/**
+ * Pick the phone-matching contact from a search result.
+ *
+ * 2026-08-15 — CROSS-CONTAMINATION FIX. The previous fallback
+ * `return list[0]?.phone ? null : list[0]` accepted the top fuzzy hit whenever
+ * that hit carried no phone in the search projection. GHL's /contacts/?query=
+ * projection frequently omits phone, so the guard INVERTED: instead of
+ * rejecting an unverified match it accepted an arbitrary one. Every
+ * chat-widget "guest visitor" record has no phone, which is why they dominate
+ * the contaminated set.
+ *
+ * Live evidence: LP lead 566250 (Yvonne Laing, 904-487-0668) and LP lead
+ * 567020 (Lisa Walsh, 352-812-1262) both carry ghl_contact_id
+ * ARLDieKRvguzUoTJqLue. Yvonne's lead was additionally stamped onto five
+ * unrelated GHL contacts across Aug 11-13: 3w0U57LXmhLlfgSLfRee,
+ * 41SRO1JJR60Qsq7wadfj, 81PpkO2mcAdPve2Ajdlm, gUihunGyOa6SiGbJCJ3K,
+ * EJycC69RYzoWYjZyi7JO.
+ *
+ * There is now NO unverified acceptance path. Returns:
+ *   { contact, verified: true }    — last-10 digits matched in the projection
+ *   { candidate, verified: false } — a hit exists but carries no phone; the
+ *                                    caller MUST confirm via a full GET
+ *   null                           — nothing usable
+ */
 function pickPhoneMatch(contacts, normalizedPhone) {
   const list = Array.isArray(contacts) ? contacts : [];
   if (list.length === 0) return null;
@@ -409,17 +432,35 @@ function pickPhoneMatch(contacts, normalizedPhone) {
     const cp = normalizePhone(c?.phone);
     return cp && cp.slice(-10) === want;
   });
-  if (exact) return exact;
-  // No contact carries a matching phone in the projection: only accept the top
-  // hit when it has no phone at all (trust the phone query); a mismatching
-  // phone is a false positive we must not link.
-  return list[0]?.phone ? null : list[0];
+  if (exact) return { contact: exact, verified: true };
+  const candidate = list.find((c) => c?.id && !c?.phone);
+  if (candidate) return { candidate, verified: false };
+  return null;
 }
 
 async function searchByPhone(normalizedPhone) {
   const q = encodeURIComponent(normalizedPhone);
   const res = await ghlFetch('GET', `/contacts/?query=${q}&locationId=${GHL_LOCATION_ID}`);
-  return pickPhoneMatch(res?.contacts, normalizedPhone);
+  const pick = pickPhoneMatch(res?.contacts, normalizedPhone);
+  if (!pick) return null;
+  if (pick.verified) return pick.contact;
+
+  // Unverified candidate: the search projection carried no phone. Confirm
+  // against the full contact record before linking anything. A mismatch OR a
+  // read failure returns null — creating a duplicate contact is a recoverable
+  // annoyance; stamping one lead's LP identity onto a different person is not.
+  const want = normalizedPhone.slice(-10);
+  try {
+    const full = await ghlFetch('GET', `/contacts/${pick.candidate.id}`);
+    const contact = full?.contact || full || {};
+    const cp = normalizePhone(contact?.phone);
+    if (cp && cp.slice(-10) === want) return contact;
+    console.warn(`[LpContactBackstop] REJECTED unverified match ${pick.candidate.id} for ${normalizedPhone} (contact phone: ${contact?.phone || 'none'}) — not linking`);
+    return null;
+  } catch (err) {
+    console.warn(`[LpContactBackstop] verification read failed for ${pick.candidate.id}: ${err.message} — refusing to link`);
+    return null;
+  }
 }
 
 /** Custom-field stamps needed on an existing contact (only where currently empty). */
