@@ -546,7 +546,25 @@ export async function getIVRScripts({ namePattern = '.*', includeDefinition = fa
   };
 }
 
-/** getDNISList — every DNIS in the domain, or only the unassigned spares. */
+/**
+ * getDNISList — Five9's selectUnassigned is a FILTER, not an include-all flag.
+ *
+ * selectUnassigned=false returns the ASSIGNED numbers only; it does NOT return
+ * every DNIS in the domain, which is what this docstring used to claim. The two
+ * modes return disjoint sets and you need both to see the whole inventory.
+ *
+ * Measured against the live domain 2026-08-14:
+ *   selectUnassigned=false → 266 numbers, including 2394930774 (assigned to
+ *                            "Canvass Confirmation - Inbound")
+ *   selectUnassigned=true  →   2 numbers, 9548337877 and 5995670260,
+ *                            NEITHER of which appears in the 266
+ *
+ * The practical trap: reading the no-argument list as "every number we own"
+ * silently omits the spares, so a number can look absent from the domain when
+ * it is merely unassigned. Union the two calls, or use getDnisMap, which reads
+ * the assigned side by walking campaigns and the spare side from
+ * selectUnassigned=true — independent readings, neither derived by subtraction.
+ */
 export async function getDNISList({ selectUnassigned = false } = {}) {
   const xml = await five9SoapCall(
     'getDNISList',
