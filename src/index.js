@@ -61,6 +61,11 @@ import {
   registerGhostSweepRoutes,
   startGhostSweepScheduler,
 } from './objection-state-ghost-sweep.js';
+// ─── Appointment Parity Watchdog (LP<->GHL appointment sync) ─────
+import {
+  registerAppointmentParityRoutes,
+  startAppointmentParityScheduler,
+} from './jobs/appointment-parity-watchdog.js';
 // ─── Objection Fall-Through Sweep (post-routing miss detection) ──
 import {
   registerFallthroughSweepRoutes,
@@ -942,6 +947,12 @@ registerEventsRouter(app);
 // Feeds the BEHAVIORAL_GHOST_AFTER_BOOKING STATE_CLASSIFICATION rule.
 registerGhostSweepRoutes(app);
 
+// ─── Appointment Parity Watchdog ─────────────────────────────────
+// POST /n8n/appointments/parity-check — on-demand bidirectional
+// LP<->GHL appointment reconciliation. Dry-run unless PARITY_AUTOHEAL
+// is 'true'; reports the divergence classes and their findings.
+registerAppointmentParityRoutes(app);
+
 // ─── Objection Fall-Through Sweep ────────────────────────────────
 // 2026-05-20 (Option 1 Step 4): detects intent.objection_detected
 // events where NO routing rule (new state classifier OR legacy Rules
@@ -1100,6 +1111,7 @@ app.listen(PORT, async () => {
   startImeWorkers();
   startPauseWorkflowSweepScheduler();
   startGhostSweepScheduler();
+  startAppointmentParityScheduler();
   startFallthroughSweepScheduler();
   startApprovalEscalationScheduler();
   startDataFreshnessMonitorScheduler();
