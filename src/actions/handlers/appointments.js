@@ -141,6 +141,19 @@ const GATE_BLOCKED_TAG = 'booking:gate-blocked';
 // "never mirror this into LP" signal.
 const GHL_ONLY_APPT_TAG = 'ghl-only-appointment';
 
+// 2026-08-17 — stamped when a booking is refused because the lead already
+// holds an active appointment on another calendar. Distinct from
+// GATE_BLOCKED_TAG (missing in-home prerequisites) so the two block reasons
+// stay separable in GHL.
+const EXISTING_APPT_BLOCKED_TAG = 'booking:blocked-existing-appointment';
+
+// Owner rule (Mark, 2026-08-17): a lead never holds more than ONE active
+// appointment at a time. Kill switch rather than a hard constant because this
+// refuses bookings the system previously accepted — if it turns out to block a
+// legitimate flow, ONE_APPT_PER_CONTACT=false restores the old calendar-scoped
+// behaviour without a deploy. Default ON.
+const ONE_APPT_PER_CONTACT = (process.env.ONE_APPT_PER_CONTACT ?? 'true') !== 'false';
+
 // 2026-08-16 — RATE-LIMITER BUDGET FOR THE BOOKING PATH.
 //
 // executeBookAppointment makes several sequential rate-limited GHL calls, and
@@ -511,20 +524,40 @@ function sameStartTime(a, b) {
  *
  * @returns {Promise<{ appointment: object|null, lookupFailed: boolean }>}
  */
-async function findExistingAppointmentOnCalendar(contactId, calendarId) {
-  if (!contactId || !calendarId) return { appointment: null, lookupFailed: false };
+/**
+ * 2026-08-17 — widened from calendar-scoped to CONTACT-scoped.
+ *
+ * The guard used to look only at the target calendar, so a contact could hold
+ * one active appointment per calendar and still satisfy it. Verified live:
+ * contact mcZ8OFDfZndBUgEdcnO2 held a Confirmation Call at 1:00 PM, a Window
+ * Estimate at 3:00 PM and a Measurement Verification at 3:00 PM on the same
+ * day (2026-07-24), all active, none of which the old guard could see.
+ *
+ * Owner rule (Mark, 2026-08-17): a lead never holds more than ONE active
+ * appointment at a time.
+ *
+ * Returns BOTH halves so the caller can keep the existing same-calendar
+ * semantics (idempotent skip / reschedule in place — neither of which creates
+ * a second object) and separately block a cross-calendar create.
+ *
+ * @returns {Promise<{ sameCalendar: object|null, otherCalendar: object|null, lookupFailed: boolean }>}
+ */
+async function findExistingAppointments(contactId, calendarId) {
+  const none = { sameCalendar: null, otherCalendar: null, lookupFailed: false };
+  if (!contactId || !calendarId) return none;
   try {
     const upcoming = await fetchUpcomingAppointments(contactId);
     // null (not []) means the lookup itself failed — a non-ok response, a
     // missing API key, or a timeout. An empty calendar returns [].
-    if (!Array.isArray(upcoming)) return { appointment: null, lookupFailed: true };
+    if (!Array.isArray(upcoming)) return { ...none, lookupFailed: true };
     return {
-      appointment: upcoming.find((a) => a.calendar_id === calendarId) || null,
+      sameCalendar: upcoming.find((a) => a.calendar_id === calendarId) || null,
+      otherCalendar: upcoming.find((a) => a.calendar_id !== calendarId) || null,
       lookupFailed: false,
     };
   } catch (err) {
     console.warn(`[ActionExecutor] double-book guard lookup threw for ${contactId}: ${err.message}`);
-    return { appointment: null, lookupFailed: true };
+    return { ...none, lookupFailed: true };
   }
 }
 
@@ -543,7 +576,7 @@ export async function executeBookAppointment(action, context) {
   //   • different time    → RESCHEDULE the existing object in place (PUT), so the
   //                         contact never ends up with two objects on one calendar.
   // Only when there is no active same-calendar appointment do we POST a new one.
-  const { appointment: existing, lookupFailed } = await findExistingAppointmentOnCalendar(contactId, calendarId);
+  const { sameCalendar: existing, otherCalendar, lookupFailed } = await findExistingAppointments(contactId, calendarId);
 
   // Fail-open is preserved (we fall through and book), but no longer silent.
   if (lookupFailed && isSlotCheckEnabled()) {
@@ -609,6 +642,69 @@ export async function executeBookAppointment(action, context) {
       end_time: endTime,
       previous_start_time: existing.start_time,
       status: existing.status,
+    };
+  }
+
+  // 2026-08-17 — ONE ACTIVE APPOINTMENT PER LEAD (Mark, owner rule).
+  //
+  // Nothing above created a second object: the same-calendar branches either
+  // no-op or move the existing appointment in place. This branch is the case
+  // the old calendar-scoped guard could not see — an active appointment on a
+  // DIFFERENT calendar. Creating here is the only path that leaves a lead
+  // holding two, so it is refused.
+  //
+  // BLOCK, never replace (Mark's explicit choice over cancel-and-recreate).
+  // The alternative would let a 15-minute Confirmation Call cancel a booked
+  // in-home Window Estimate — the demo is the revenue event and must never be
+  // destroyed by an automated booking. A human decides which one survives.
+  //
+  // Deliberately BEFORE the in-home prerequisite gate: if we are not going to
+  // book, there is no reason to spend a contact read evaluating whether we
+  // could have.
+  //
+  // The returned action is NOT in send-message-handler's BOOKING_LANDED_ACTIONS
+  // allowlist, so the lead is never told they are booked. That allowlist is
+  // why a new outcome string is safe to add here.
+  if (otherCalendar && ONE_APPT_PER_CONTACT) {
+    console.warn(`[ActionExecutor] 🚫 booking BLOCKED for ${contactId}: already holds active appointment ${otherCalendar.appointment_id} on calendar ${otherCalendar.calendar_id} at ${otherCalendar.start_time} — refusing to create a second on ${calendarId}.`);
+    await applyGHLTag(contactId, EXISTING_APPT_BLOCKED_TAG).catch(() => {});
+    await emitEvent({
+      event_type: 'booking.blocked_existing_appointment',
+      event_subtype: otherCalendar.calendar_id || 'unknown_calendar',
+      source: 'lp_mcp',
+      entity_type: 'contact',
+      entity_id: contactId,
+      ghl_contact_id: contactId,
+      payload: {
+        requested_calendar_id: calendarId,
+        requested_start_time: startTime,
+        existing_appointment_id: otherCalendar.appointment_id,
+        existing_calendar_id: otherCalendar.calendar_id,
+        existing_start_time: otherCalendar.start_time,
+        existing_status: otherCalendar.status,
+      },
+      priority: 'high',
+      bypass_filter: true,
+    }).catch(() => {});
+    await executeCreateTask({
+      target_id: contactId,
+      action_payload: {
+        title: 'BOOKING BLOCKED — lead already has an appointment',
+        description: `Agentic booking for {{contact_name}} on the ${payload.calendar_name || title} calendar at ${startTime} was refused: the lead already holds an active appointment (${otherCalendar.calendar_name || otherCalendar.calendar_id}) at ${otherCalendar.start_time}. A lead may only hold one appointment at a time, so NOTHING was created and the existing appointment is untouched. If the new time is the right one, cancel the existing appointment first and then rebook.`,
+      },
+    }, context).catch((taskErr) =>
+      console.warn(`[ActionExecutor] existing-appointment block escalation task failed for ${contactId}: ${taskErr.message}`));
+    return {
+      action: 'appointment_blocked_existing_appointment',
+      blocked: true,
+      contact_id: contactId,
+      calendar_id: calendarId,
+      requested_start_time: startTime,
+      existing_appointment_id: otherCalendar.appointment_id,
+      existing_calendar_id: otherCalendar.calendar_id,
+      existing_calendar_name: otherCalendar.calendar_name || null,
+      existing_start_time: otherCalendar.start_time,
+      reason: `lead already holds an active appointment on calendar ${otherCalendar.calendar_id} at ${otherCalendar.start_time} — one appointment per lead`,
     };
   }
 
