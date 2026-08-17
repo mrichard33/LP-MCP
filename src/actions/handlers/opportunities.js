@@ -34,11 +34,78 @@
 
 import { ghlFetch, isLPLeadId } from '../helpers.js';
 import { PIPELINE_IDS, STAGE_MAP, GHL_LOCATION_ID } from '../constants.js';
-import { checkForwardOnly } from '../../pipeline-guard.js';
+import { checkForwardOnly, getStagePosition } from '../../pipeline-guard.js';
 import { updateGHLContactFields } from '../../ghl.js';
 // 2026-07-03 (pipeline-integrity breach) — evidence-gated milestone moves.
 import { checkStageMoveEvidence } from '../stage-evidence.js';
 import { emitEvent } from '../../event-emitter.js';
+
+// ─── v5.0 (2026-08-16): one-open-opportunity-per-pipeline invariant ──
+// Standing rule (Mark): a contact must never hold more than one OPEN
+// opportunity in the same pipeline. Two things broke it.
+//
+// (1) Concurrency. The milestone burst on contact PIDxmWzCs35NHgW85vOW
+//     queued 12 move_opportunity actions inside 60s. Search + create was
+//     never atomic, so each could find nothing and each could POST.
+// (2) opps[0]. GHL returns opportunities in creation order, so when
+//     duplicates already exist the OLDEST — usually the stalest stage —
+//     was the one being moved and guarded against.
+//
+// Audit 2026-08-16: 28 contacts / 68 open opps across P1, P2, P3.
+//
+// The lock is IN-PROCESS, keyed contact+pipeline. The action executor is a
+// single Node process, so this closes the real race. It is NOT distributed
+// — if the executor is ever sharded, replace with Postgres advisory locks.
+// The map holds the CHAINED tail promise, not `current` — comparing against
+// `current` on the way out would never match, and the entry would leak one
+// slot per (contact, pipeline) for the life of the process. Deleting only
+// when the tail is still ours means a waiter that queued behind us keeps the
+// chain intact.
+const _oppLocks = new Map();
+async function withOpportunityLock(key, fn) {
+  const prior = _oppLocks.get(key) || Promise.resolve();
+  let release;
+  const current = new Promise((res) => { release = res; });
+  const tail = prior.then(() => current);
+  _oppLocks.set(key, tail);
+  await prior.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (_oppLocks.get(key) === tail) _oppLocks.delete(key);
+  }
+}
+
+// Rank duplicates furthest-along-first and report them. Unknown stage
+// positions sort last. Creation order breaks ties.
+function pickPrimaryOpp(openOpps, contactId, pipeline) {
+  if (openOpps.length <= 1) return openOpps;
+  const sorted = [...openOpps].sort((a, b) => {
+    const pa = getStagePosition(a.pipelineStageId);
+    const pb = getStagePosition(b.pipelineStageId);
+    if (pa !== pb) return (pb ?? -1) - (pa ?? -1);
+    return new Date(a.createdAt || 0) - new Date(b.createdAt || 0);
+  });
+  console.warn(`[ActionExecutor] ⚠️ ${openOpps.length} open ${pipeline} opportunities for contact ${contactId} — acting on ${sorted[0].id}; duplicates: ${sorted.slice(1).map(o => o.id).join(', ')}`);
+  emitEvent({
+    event_type: 'opportunity.duplicate_detected',
+    source: 'action_executor',
+    entity_type: 'contact',
+    entity_id: String(contactId),
+    ghl_contact_id: String(contactId),
+    priority: 'normal',
+    bypass_filter: true,
+    payload: {
+      pipeline,
+      open_count: openOpps.length,
+      primary_opportunity_id: sorted[0].id,
+      duplicate_opportunity_ids: sorted.slice(1).map(o => o.id),
+    },
+    idempotency_key: `opp_dupe_${contactId}_${pipeline}_${new Date().toISOString().slice(0, 10)}`,
+  }).catch((err) => console.warn(`[ActionExecutor] duplicate_detected emit failed: ${err.message}`));
+  return sorted;
+}
 
 export async function executeMoveOpportunity(action) {
   const contactId = action.target_id;
@@ -96,8 +163,12 @@ export async function executeMoveOpportunity(action) {
     };
   }
 
+  return await withOpportunityLock(`${contactId}:${pipelineId}`, async () => {
   const searchRes = await ghlFetch('GET', `/opportunities/search?location_id=${GHL_LOCATION_ID}&contact_id=${contactId}&pipeline_id=${pipelineId}`);
-  const opps = searchRes?.opportunities || [];
+  // v5.0: OPEN opps only — a lost/won opp in this pipeline is history, not a
+  // move target, and must not suppress the create path.
+  const openOpps = (searchRes?.opportunities || []).filter(o => (o.status || 'open') === 'open');
+  const opps = pickPrimaryOpp(openOpps, contactId, pipeline);
   if (opps.length > 0) {
     // v4.0: Forward-only guard — prevent backward pipeline movement
     // v4.3: allow_backward: true in payload bypasses the guard for intentional
@@ -166,6 +237,7 @@ export async function executeMoveOpportunity(action) {
       throw err;
     }
   }
+  });
 }
 
 /**

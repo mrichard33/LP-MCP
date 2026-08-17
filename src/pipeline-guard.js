@@ -91,3 +91,13 @@ export function checkForwardOnly(currentStageId, targetStageId) {
   // Forward — allow
   return { allowed: true, currentPos, targetPos, reason: 'forward_move' };
 }
+
+/**
+ * Position of a stage within its pipeline, or null when unknown.
+ * Added 2026-08-16 so the opportunity handler can rank duplicate open opps
+ * and act on the furthest-along one instead of whichever GHL returns first.
+ */
+export function getStagePosition(stageId) {
+  const pos = STAGE_POSITIONS[stageId];
+  return pos === undefined ? null : pos;
+}
