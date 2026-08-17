@@ -37,12 +37,14 @@ import { ghlFetch } from './helpers.js';
  * @param {boolean} [opts.force]  bypass the cache (re-GET + overwrite)
  * @returns {Promise<object>} normalized contact
  */
-export async function getContactCached(contactId, cache, { force = false } = {}) {
+export async function getContactCached(contactId, cache, { force = false, maxWaitMs } = {}) {
   cache = cache || new Map();
   if (!force && cache.has(contactId)) {
     return cache.get(contactId);
   }
-  const res = await ghlFetch('GET', `/contacts/${contactId}`);
+  // maxWaitMs caps the rate-limiter queue wait for THIS read (see ghlFetch).
+  // Omitted → the historical 30s default. A cache hit above never waits at all.
+  const res = await ghlFetch('GET', `/contacts/${contactId}`, null, { maxWaitMs });
   const contact = res?.contact || res || {};
   cache.set(contactId, contact);
   return contact;

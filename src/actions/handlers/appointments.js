@@ -141,6 +141,38 @@ const GATE_BLOCKED_TAG = 'booking:gate-blocked';
 // "never mirror this into LP" signal.
 const GHL_ONLY_APPT_TAG = 'ghl-only-appointment';
 
+// 2026-08-16 — RATE-LIMITER BUDGET FOR THE BOOKING PATH.
+//
+// executeBookAppointment makes several sequential rate-limited GHL calls, and
+// the executor kills a handler at EXECUTOR_HANDLER_TIMEOUT_MS (60s). The
+// limiter's default queue wait is 30s per call, so a single 429 pause — which
+// drains the bucket for 5 minutes — makes two calls enough to blow the
+// watchdog. Observed live 2026-08-16: one 429 at 00:10:36 put the bucket in a
+// 5-minute pause; a test booking spent ~54s reaching its POST and the handler
+// was killed at 60s.
+//
+// The limiter FAILS OPEN at the cap, so a shorter wait never drops a call — it
+// stops queueing sooner and proceeds. Capping the calls this handler owns keeps
+// a booking inside the watchdog instead of being killed mid-flight.
+//
+// Scoped deliberately to the POST, the read-back, and the title read — the
+// window where a kill is actually harmful. A kill BEFORE the POST creates
+// nothing and is safe; a kill AFTER it leaves an appointment that the retry's
+// double-book guard has to reconcile. The double-book guard's own lookup
+// (fetchUpcomingAppointments) bypasses the limiter entirely, so it is already
+// exempt and needs no cap.
+//
+// 8s × 3 capped calls = 24s, comfortably inside the 60s watchdog while still
+// allowing a real queue to drain under normal load.
+// Parsed defensively: Math.max(1000, NaN) is NaN, not 1000, so a typo'd env
+// value would produce NaN — which acquireToken treats as "not finite" and
+// silently reverts to the 30s default, i.e. the exact behaviour this constant
+// exists to prevent. An unparseable value falls back to the 8s default instead.
+const BOOKING_TOKEN_WAIT_MS = (() => {
+  const parsed = parseInt(process.env.BOOKING_TOKEN_WAIT_MS ?? '', 10);
+  return Number.isFinite(parsed) ? Math.max(1000, parsed) : 8000;
+})();
+
 function readContactCustomField(contact, fieldId) {
   const cfs = Array.isArray(contact?.customFields) ? contact.customFields : [];
   const f = cfs.find((x) => x?.id === fieldId);
@@ -690,7 +722,7 @@ export async function executeBookAppointment(action, context) {
   // (Yvonne Laing, LP lead 566250). An LP-derived surname must never reach a
   // customer-visible artifact. No name on the record → calendar name alone.
   try {
-    const titleContact = await getContactCached(contactId, context?._contactCache);
+    const titleContact = await getContactCached(contactId, context?._contactCache, { maxWaitMs: BOOKING_TOKEN_WAIT_MS });
     const ghlName = [titleContact?.firstName, titleContact?.lastName].filter(Boolean).join(' ').trim();
     const calName = payload.calendar_name
       || Object.keys(CALENDAR_MAP).find((n) => CALENDAR_MAP[n] === calendarId)
@@ -708,7 +740,7 @@ export async function executeBookAppointment(action, context) {
 
   let result;
   try {
-    result = await ghlFetch('POST', '/calendars/events/appointments', body);
+    result = await ghlFetch('POST', '/calendars/events/appointments', body, { maxWaitMs: BOOKING_TOKEN_WAIT_MS });
   } catch (err) {
     // Release so the executor's retry can re-attempt this slot.
     if (claimed) await releaseAppointmentCreate(contactId, slotMs).catch(() => {});
@@ -752,7 +784,7 @@ export async function executeBookAppointment(action, context) {
   let verified = null;
   for (let attempt = 1; attempt <= 2 && !verified; attempt++) {
     try {
-      const v = await ghlFetch('GET', `/calendars/events/appointments/${appointmentId}`);
+      const v = await ghlFetch('GET', `/calendars/events/appointments/${appointmentId}`, null, { maxWaitMs: BOOKING_TOKEN_WAIT_MS });
       const appt = v?.appointment || v || {};
       if (appt.id) verified = appt;
     } catch (err) {

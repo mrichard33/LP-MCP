@@ -35,9 +35,23 @@ export function isLPLeadId(id) {
 // GHL FETCH WRAPPER — rate-limited, 429-aware, 15s timeout
 // ═══════════════════════════════════════════════════════════════════
 
-export async function ghlFetch(method, path, body = null) {
+/**
+ * @param {object} [rateOpts]  NOTE: named `rateOpts`, not `opts` — the fetch
+ *   options object below already owns the name `opts` in this scope.
+ * @param {number} [rateOpts.maxWaitMs]  per-call cap on the rate-limiter queue
+ *   wait, forwarded to acquireToken. Handlers that make SEVERAL sequential
+ *   GHL calls should pass a short cap so a 429-paused bucket cannot stack
+ *   30s waits past the executor's 60s handler watchdog — the same reasoning
+ *   as the 2026-07-03 reply-context hotfix, which added maxWaitMs but only
+ *   wired it into agentic/reply-sender.js.
+ *
+ *   Omitted → WAIT_TIMEOUT_MS (30s), i.e. byte-identical behaviour for every
+ *   existing caller. The limiter fails OPEN at the cap either way, so a
+ *   shorter wait never drops the call — it just stops queueing sooner.
+ */
+export async function ghlFetch(method, path, body = null, rateOpts = {}) {
   if (!GHL_API_KEY) throw new Error('GHL_API_KEY not configured');
-  await acquireToken();
+  await acquireToken({ maxWaitMs: rateOpts.maxWaitMs });
   const url = `https://services.leadconnectorhq.com${path}`;
   const opts = {
     method,
