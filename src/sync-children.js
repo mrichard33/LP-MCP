@@ -44,6 +44,7 @@ import { emitEvent } from './event-emitter.js';
 import { combineNotes } from './safe-notes.js';
 import { getLead } from './lp-client.js';
 import { isMilestoneAchieved } from './milestone-gate.js';
+import { selectFurthestMilestone } from './milestone-order.js';
 
 // ─── Skip counter for observability ──────────────────────────────
 let _childSkips = { calls: 0, notes: 0, activities: 0 };
@@ -548,6 +549,31 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
     }
   }
 
+  // ─── v7.4 MILESTONE COLLAPSE (2026-08-16) ────────────────────────
+  // A returning customer linked for the first time delivers the ENTIRE job
+  // history in one pass, and every completion reads as a first completion.
+  // Contact PIDxmWzCs35NHgW85vOW replayed 12 milestones (Dec 2024 → Apr
+  // 2025) in six seconds, queueing 24 actions that walked the P2 opp
+  // through seven stages and left it at Install Scheduled — BEHIND the
+  // Referral & Expansion it had already reached. The forward-only guard
+  // cannot hold at that rate: GHL's opportunity search returns a stale
+  // pipelineStageId under rapid successive writes.
+  //
+  // TAGS STILL FIRE FOR EVERY MILESTONE. They are the durable record and
+  // C.1/C.2 trigger on them (see the P2_MILESTONE_PERMIT_SUBMIT rule note:
+  // "C.1 must trigger on lp-milestone-permit-submit, not on
+  // pipeline_stage_updated"). Only the EVENT collapses — one
+  // lp.milestone_completed for the furthest-along milestone, so exactly one
+  // P2 stage move is requested.
+  //
+  // Real-time progress delivers one milestone per pass, where firesToDo has
+  // length 1 and this is a no-op. The collapse only engages on replay.
+  const emitMdtId = selectFurthestMilestone(firesToDo);
+  const collapsedFrom = firesToDo.map(f => f.mdtId).filter(m => m !== emitMdtId);
+  if (collapsedFrom.length > 0) {
+    console.log(`[Sync] Milestone collapse: job ${jobId} had ${firesToDo.length} first-time completions — emitting ${emitMdtId || 'NONE'} only; tag-only for [${collapsedFrom.join(', ')}]`);
+  }
+
   // Fire the non-suppressed first-time completions (normal-sync path; EMPTY under
   // suppressSideEffects). Sequential — applyGHLTag is rate-limited.
   for (const { mdtId, tag, dateType, actDateEt } of firesToDo) {
@@ -556,6 +582,9 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
       await supabase.from('lp_job_milestones')
         .update({ ghl_tag_fired: true }).eq('lp_job_id', jobId).eq('mdt_id', mdtId);
       console.log(`[Sync] Milestone tag fired: ${tag} for contact ${ghlContactId}`);
+      // v7.4 collapse gate — tag landed above; only the furthest-along
+      // milestone proceeds to the event.
+      if (mdtId !== emitMdtId) continue;
       // v7.1: Emit milestone event for P2 lifecycle agent rules
       // v7.3: payload carries datetype (disambiguates the mdt_id 'X' collision),
       //       act_date, job_value and branch_code so the P2 rules can set the
@@ -576,6 +605,8 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
             lp_lead_id: lpLeadId,
             job_value: jobValue,
             branch_code: branchCode,
+            collapsed_from: collapsedFrom,
+            collapsed_count: collapsedFrom.length,
           },
           priority: 'normal',
           idempotency_key: `lp_milestone_${ghlContactId}_${mdtId}_${jobId}`,
