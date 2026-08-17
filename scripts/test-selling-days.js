@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 
 import {
   resolveSellingCalendar, isSellingDay, sellingDaysElapsed,
-  sellingDaysInPeriod, lastCompletedSellingDay, monthEnd,
+  sellingDaysInPeriod, lastCompletedSellingDay, previousCalendarDay, monthEnd,
 } from '../src/selling-days.js';
 
 // Default calendar (Mon–Sat; New Year's / Jul 4 / Thanksgiving / Christmas).
@@ -51,6 +51,32 @@ test('lastCompletedSellingDay: Sunday → Saturday', () => {
 
 test('lastCompletedSellingDay: Tuesday → Monday', () => {
   assert.equal(lastCompletedSellingDay('2026-06-23', cal), '2026-06-22');
+});
+
+// ── Snapshot anchor: previous CALENDAR day (ruling 2026-08-17) ──────────────
+//
+// Sundays are outside the selling calendar but not outside the business —
+// they're a bonus day: sales count, pace does not move. The snapshot anchor is
+// therefore plain yesterday, NOT lastCompletedSellingDay; the two differ
+// exactly on Mondays, which is the day the scorecard spent claiming Saturday's
+// date while Sunday's sales sat invisible until Tuesday.
+
+test('previousCalendarDay: Monday → Sunday (NOT the prior Saturday)', () => {
+  assert.equal(previousCalendarDay('2026-08-17'), '2026-08-16');
+  assert.notEqual(previousCalendarDay('2026-08-17'), lastCompletedSellingDay('2026-08-17', cal));
+});
+
+test('previousCalendarDay: month boundary rolls correctly', () => {
+  assert.equal(previousCalendarDay('2026-09-01'), '2026-08-31');
+});
+
+test('a Sunday snapshot endpoint widens coverage without moving the pace basis', () => {
+  // Elapsed selling days through Sun 8/16 equals elapsed through Sat 8/15 —
+  // the endpoint is covered, but contributes nothing to elapsed.
+  assert.equal(
+    sellingDaysElapsed('2026-08-01', '2026-08-16', cal),
+    sellingDaysElapsed('2026-08-01', '2026-08-15', cal),
+  );
 });
 
 test('July 2026 excludes Independence Day OBSERVED (Fri Jul 3)', () => {

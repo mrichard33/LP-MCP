@@ -165,6 +165,22 @@ export function lastCompletedSellingDay(today, cal) {
   return cur; // fallback — should never hit with a sane calendar
 }
 
+/**
+ * The last COMPLETED calendar day — plain yesterday (ET).
+ *
+ * Distinct from `lastCompletedSellingDay`, and the distinction is the whole
+ * point (ruling 2026-08-17): Sundays are excluded from the SELLING calendar —
+ * they never count toward elapsed days or targets — but business still happens
+ * on them, as a bonus day. Snapshots therefore reach through yesterday, always;
+ * the selling calendar is only ever the basis for pace math. Anchoring
+ * snapshot coverage to the selling calendar is how the scorecard spent every
+ * Monday claiming Saturday's date while Sunday's sales sat invisible until
+ * Tuesday.
+ */
+export function previousCalendarDay(today) {
+  return addDays(today, -1);
+}
+
 /** Last calendar day of the month containing a YYYY-MM-DD (ET-safe). */
 export function monthEnd(ymd) {
   const [y, m] = ymd.split('-').map(Number);
