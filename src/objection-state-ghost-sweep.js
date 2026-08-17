@@ -5,9 +5,9 @@
  * contacts who match the "ghost after booking" pattern:
  *   - had an appointment booked (ghl.workflow_handoff with appt:booked
  *     OR system_events.event_type='ghl.appointment_booked')
- *   - appointment_date passed at least GHOST_MIN_HOURS ago
- *   - appointment_date passed at most GHOST_MAX_HOURS ago (so we don't
- *     re-emit forever)
+ *   - THE SCHEDULED APPOINTMENT START passed at least GHOST_MIN_HOURS ago
+ *   - THE SCHEDULED APPOINTMENT START passed at most GHOST_MAX_HOURS ago
+ *     (so we don't re-emit forever)
  *   - NO LP disposition change has been observed since the appointment
  *   - NO inbound reply since the appointment
  *   - NO post-appointment disposition in lp_leads (v3 — 2026-05-21)
@@ -24,8 +24,68 @@
  * classification source — single chokepoint, single audit trail.
  *
  * Each candidate is emitted with an idempotency_key keyed by
- * contact_id + day-bucket so the sweep is safe to run on a tight
- * cadence without spamming duplicate events.
+ * contact_id + appointment fingerprint + day-bucket so the sweep is
+ * safe to run on a tight cadence without spamming duplicate events,
+ * while still re-evaluating cleanly after a rebook.
+ *
+ * ---------------------------------------------------------------------
+ * 2026-08-17 (v4): TIME-ANCHOR FIX — THE CLASS-OF-BUG FIX.
+ *
+ * ROOT CAUSE: v1–v3 selected candidates by BOOKING-EVENT timestamp
+ * (`system_events.event_timestamp`) and then treated that timestamp as
+ * if it were the appointment time. It is not. It is the moment the
+ * booking was recorded. Every downstream check ("disposition since",
+ * "inbound since") was therefore anchored to the booking, not to the
+ * appointment.
+ *
+ * CONSEQUENCE: any lead who books further out than GHOST_MIN_HOURS and
+ * stays quiet — which is the NORMAL, HEALTHY pattern for a canvassed
+ * lead booking 3–7 days ahead — was classified as having ghosted an
+ * appointment that had not happened yet. The emitted payload even
+ * asserted `appointment_pending: true` while classifying the contact
+ * as a ghost, and named its own metric `hours_since_booking`.
+ *
+ * OBSERVED (2026-08-17 audit, trailing 30d, resolvable subset only):
+ * 21 of 25 emissions fired while the appointment was still in the
+ * future — an ~84% false-positive rate. Worst case fired 2 hours
+ * BEFORE the appointment. Example: contact zKSSENAAskI95ARwCuK6
+ * (LP prospect 232016) — booked 8/14 for an 8/19 10:00 AM confirmed
+ * estimate, swept 8/17 at 51.5h "since booking", classified
+ * ghost_after_booking, enrolled in S5.2 with the appointment still
+ * two days out and LP disposition Cnf.
+ *
+ * v4 CHANGES:
+ *   1. resolveApptStart() — reads the SCHEDULED start out of the
+ *      booking payload, handling every shape the two event types
+ *      produce, and converts ET wall-clock to a real UTC instant
+ *      (DST-safe). This is the only time anchor used from here on.
+ *   2. The GHOST_MIN/MAX window is applied to the APPOINTMENT START,
+ *      not the booking timestamp. The SQL prefilter widens to a
+ *      booking lookback (GHOST_BOOKING_LOOKBACK_DAYS) purely so that
+ *      far-out bookings are still visible to the JS gate.
+ *   3. HARD GATE: an appointment whose start is in the future can
+ *      never be a ghost. Skipped and counted.
+ *   4. FAIL CLOSED on an unresolvable appointment start. An unknown
+ *      appointment time is exactly the ambiguity that produced this
+ *      bug — we do not guess.
+ *   5. LATEST-BOOKING-WINS: candidates are deduped to the newest
+ *      booking event per contact. Without this, a rebooked contact
+ *      would still be ghosted off their STALE booking event (whose
+ *      appointment time IS in the past) — the same false positive
+ *      through a side door.
+ *   6. All activity checks ("disposition since", "inbound since") now
+ *      anchor to the appointment start, which is what "since the
+ *      appointment" was always supposed to mean.
+ *   7. Payload renamed to honest field names: appointment_start,
+ *      hours_since_appointment. The false `appointment_pending: true`
+ *      assertion is removed.
+ *
+ * NOTE: the appointment-tag family (appt-exists, booked-estimate,
+ * appt:window-estimate, …) is deliberately NOT added to EXCLUDE_TAGS.
+ * Those tags survive a real no-show, so excluding them would suppress
+ * legitimate ghost detection. The date gate is the correct guard
+ * because it self-resolves once the appointment actually passes.
+ * ---------------------------------------------------------------------
  *
  * 2026-05-21 (v3): SECOND DEFENSE LAYER. Bypass the event-bus null-
  * ghl_id problem by reading lp_leads directly. The v2 fix relied on
@@ -44,6 +104,7 @@
  * independent of the event bus and of GHL tag state.
  *
  * Layered defense order (cheapest-first):
+ *   0. resolveApptStart + window gate (v4) — pure arithmetic, no I/O
  *   1. hasDispositionSince     — event bus, by ghl_contact_id (still useful when populated)
  *   2. hasInboundSince         — event bus, inbound replies
  *   3. hasPostApptDispositionInLPLeads (v3) — direct lp_leads check, sidesteps event bus
@@ -65,8 +126,9 @@
  * blocks the false positive. Both gates were missing in v1.
  *
  * Tuning knobs (env or defaults below):
- *   GHOST_MIN_HOURS=24
- *   GHOST_MAX_HOURS=72
+ *   GHOST_MIN_HOURS=24                 (hours since APPOINTMENT START)
+ *   GHOST_MAX_HOURS=72                 (hours since APPOINTMENT START)
+ *   GHOST_BOOKING_LOOKBACK_DAYS=120    (how far back to scan booking events)
  *   GHOST_SWEEP_BATCH=200
  *   GHOST_SWEEP_INTERVAL_MS=4h
  */
@@ -77,6 +139,7 @@ import { getGHLContact } from './ghl.js';
 
 const GHOST_MIN_HOURS = Number(process.env.GHOST_MIN_HOURS || 24);
 const GHOST_MAX_HOURS = Number(process.env.GHOST_MAX_HOURS || 72);
+const GHOST_BOOKING_LOOKBACK_DAYS = Number(process.env.GHOST_BOOKING_LOOKBACK_DAYS || 120);
 const GHOST_SWEEP_BATCH = Number(process.env.GHOST_SWEEP_BATCH || 200);
 const GHOST_SWEEP_INTERVAL_MS = Number(process.env.GHOST_SWEEP_INTERVAL_MS || 4 * 60 * 60 * 1000);
 
@@ -85,6 +148,10 @@ const APPT_SUBTYPES = ['appt:booked', 'appointment_booked'];
 
 const DISPOSITION_EVENT_TYPES = ['lp.disposition_changed'];
 const INBOUND_EVENT_TYPES = ['ghl.reply_received', 'sms.received'];
+
+// The business runs in ET. Appointment payloads carry ET wall-clock
+// times with no offset, so they must be converted against this zone.
+const ET_TZ = 'America/New_York';
 
 // v3 — disposition codes that mean "the appointment time has passed
 // with a known outcome." Any contact whose lp_leads cache shows ANY
@@ -132,6 +199,10 @@ const POST_APPT_DISPOSITION_CODES = new Set([
 //                               optedOut, stage:dnc, cooling-active
 //   - Already-in-rescue:        active-w-S5.2, active-w5.2, active-w-S5.1,
 //                               active-s5.2
+//
+// v4 note: appointment-EXISTS tags are intentionally absent — see the
+// v4 header block. They persist through a genuine no-show, so gating
+// on them would suppress real ghosts. Time is the correct gate.
 const EXCLUDE_TAGS = new Set([
   // Sat / post-demo
   'stage:post-appointment',
@@ -152,20 +223,174 @@ const EXCLUDE_TAGS = new Set([
   'active-w-S5.2', 'active-w5.2', 'active-w-S5.1', 'active-s5.2',
 ]);
 
-async function findApptCandidates(now) {
-  const cutoffMax = new Date(now.getTime() - GHOST_MAX_HOURS * 3600 * 1000).toISOString();
-  const cutoffMin = new Date(now.getTime() - GHOST_MIN_HOURS * 3600 * 1000).toISOString();
+/* ------------------------------------------------------------------ *
+ * v4 — appointment-time resolution (ET wall clock → UTC instant)
+ * ------------------------------------------------------------------ */
 
-  // Pull appointment_booked events in the window. The decision engine + filter
-  // layer use event_timestamp as the canonical time; we mirror that here.
+/**
+ * Minutes by which ET wall-clock leads real UTC at a given instant.
+ * Derived from Intl so DST is handled without a tz dependency.
+ */
+function etOffsetMinutes(date) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: ET_TZ,
+    hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+  const p = {};
+  for (const { type, value } of dtf.formatToParts(date)) p[type] = value;
+  const hour = p.hour === '24' ? 0 : Number(p.hour);
+  const asIfUtc = Date.UTC(
+    Number(p.year), Number(p.month) - 1, Number(p.day),
+    hour, Number(p.minute), Number(p.second),
+  );
+  return (asIfUtc - date.getTime()) / 60000;
+}
+
+/**
+ * Convert an ET wall-clock date/time into a UTC instant, DST-safe.
+ * Two-pass: guess, measure the offset at the guess, correct, re-check.
+ */
+function etWallToInstant(y, mo, d, h, mi) {
+  const naive = Date.UTC(y, mo - 1, d, h, mi, 0);
+  let instant = naive;
+  for (let i = 0; i < 2; i++) {
+    const off = etOffsetMinutes(new Date(instant));
+    const next = naive - off * 60000;
+    if (next === instant) break;
+    instant = next;
+  }
+  return new Date(instant);
+}
+
+/** Parse "6:00 PM" / "18:00" / "10:00 AM" → { h, mi } or null. */
+function parseClock(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const m = raw.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)?$/i);
+  if (!m) return null;
+  let h = Number(m[1]);
+  const mi = Number(m[2]);
+  const mer = m[3] ? m[3].toUpperCase() : null;
+  if (mer === 'PM' && h < 12) h += 12;
+  if (mer === 'AM' && h === 12) h = 0;
+  if (h > 23 || mi > 59) return null;
+  return { h, mi };
+}
+
+/** Parse "2026-08-19" → { y, mo, d } or null. */
+function parseYmd(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const m = raw.trim().match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return null;
+  return { y: Number(m[1]), mo: Number(m[2]), d: Number(m[3]) };
+}
+
+/**
+ * v4 — resolve the SCHEDULED appointment start from a booking event.
+ *
+ * Handles every payload shape the two candidate event types emit:
+ *
+ *   ghl.appointment_booked
+ *     payload.startDate  "2026-08-19"   +  payload.start_time "10:00 AM"
+ *
+ *   ghl.workflow_handoff (appt:booked)
+ *     payload.calendar.startTime          "2026-08-19T10:00:00"  (naive ET)
+ *     payload.customData.appointment_date "2026-08-19"
+ *       + payload.customData.appointment_time "10:00 AM"
+ *     payload["Last Appointment Start Date"] / ["... Start Time"]
+ *
+ * A string carrying an explicit offset or Z is parsed as an absolute
+ * instant. A naive string is interpreted as ET wall time.
+ *
+ * Returns a Date, or null when nothing usable is present. Callers MUST
+ * treat null as fail-closed.
+ */
+export function resolveApptStart(appt) {
+  const p = appt && appt.payload;
+  if (!p || typeof p !== 'object') return null;
+
+  const cal = p.calendar && typeof p.calendar === 'object' ? p.calendar : {};
+  const cd = p.customData && typeof p.customData === 'object' ? p.customData : {};
+
+  // 1. Full datetime strings, most trustworthy first.
+  const isoCandidates = [cal.startTime, p.start_time_iso, p.startTime];
+  for (const raw of isoCandidates) {
+    if (!raw || typeof raw !== 'string') continue;
+    const s = raw.trim();
+    if (!/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(s)) continue;
+    if (/(Z|[+-]\d{2}:?\d{2})$/.test(s)) {
+      const dt = new Date(s);
+      if (!Number.isNaN(dt.getTime())) return dt;
+      continue;
+    }
+    const ymd = parseYmd(s);
+    const clock = parseClock(s.slice(11, 16));
+    if (ymd && clock) return etWallToInstant(ymd.y, ymd.mo, ymd.d, clock.h, clock.mi);
+  }
+
+  // 2. Split date + clock pairs (ET wall time).
+  const pairs = [
+    [p.startDate, p.start_time],
+    [cd.appointment_date, cd.appointment_time],
+    [p['Last Appointment Start Date'], p['Last Appointment Start Time']],
+    [p['LP Appointment Date'], p['LP Appointment Time']],
+  ];
+  for (const [dateRaw, timeRaw] of pairs) {
+    const ymd = parseYmd(dateRaw);
+    if (!ymd) continue;
+    const clock = parseClock(timeRaw);
+    if (!clock) continue;
+    return etWallToInstant(ymd.y, ymd.mo, ymd.d, clock.h, clock.mi);
+  }
+
+  return null;
+}
+
+/**
+ * v4 — collapse candidates to the NEWEST booking event per contact.
+ *
+ * Critical: a contact who rebooked has an older booking event whose
+ * appointment time has already passed. Evaluating that stale event
+ * re-creates the exact false positive this version fixes. Only the
+ * current appointment can be ghosted.
+ */
+function pickLatestBookingPerContact(events) {
+  const byContact = new Map();
+  let superseded = 0;
+  for (const e of events) {
+    const id = e.ghl_contact_id;
+    if (!id) continue;
+    const prev = byContact.get(id);
+    if (!prev) {
+      byContact.set(id, e);
+      continue;
+    }
+    superseded++;
+    if (new Date(e.event_timestamp) > new Date(prev.event_timestamp)) {
+      byContact.set(id, e);
+    }
+  }
+  return { latest: [...byContact.values()], superseded };
+}
+
+async function findApptCandidates(now) {
+  // v4 — the SQL filter is now only a coarse prefilter on BOOKING time.
+  // Bookings can be made far in advance, so the lookback must be wide
+  // enough that a far-out appointment is still visible when its start
+  // finally lands in the ghost window. The real window test is applied
+  // in JS against the resolved APPOINTMENT START.
+  const bookingFloor = new Date(
+    now.getTime() - GHOST_BOOKING_LOOKBACK_DAYS * 24 * 3600 * 1000,
+  ).toISOString();
+
   const { data, error } = await supabase
     .from('system_events')
     .select('id, ghl_contact_id, event_type, event_subtype, event_timestamp, payload')
     .in('event_type', APPT_EVENT_TYPES)
-    .gte('event_timestamp', cutoffMax)
-    .lte('event_timestamp', cutoffMin)
+    .gte('event_timestamp', bookingFloor)
     .not('ghl_contact_id', 'is', null)
-    .order('event_timestamp', { ascending: true })
+    .order('event_timestamp', { ascending: false })
     .limit(GHOST_SWEEP_BATCH);
 
   if (error) throw new Error(`ghost sweep candidate query: ${error.message}`);
@@ -298,9 +523,18 @@ async function findExcludedTag(contactId) {
 export async function runGhostSweep({ dryRun = false } = {}) {
   const start = Date.now();
   const now = new Date();
-  const candidates = await findApptCandidates(now);
+  const rawCandidates = await findApptCandidates(now);
+
+  // v4 — only the current appointment per contact is eligible.
+  const { latest: candidates, superseded } = pickLatestBookingPerContact(rawCandidates);
+
+  const minMs = GHOST_MIN_HOURS * 3600 * 1000;
+  const maxMs = GHOST_MAX_HOURS * 3600 * 1000;
 
   let emitted = 0;
+  let skippedFutureAppt = 0;
+  let skippedOutsideWindow = 0;
+  let skippedUnresolvedApptTime = 0;
   let skippedActivity = 0;
   let skippedHasState = 0;
   let skippedPostApptDispo = 0;
@@ -315,11 +549,65 @@ export async function runGhostSweep({ dryRun = false } = {}) {
     const contactId = appt.ghl_contact_id;
     if (!contactId) continue;
     try {
-      if (await hasDispositionSince(contactId, appt.event_timestamp)) {
+      // ---- v4 GATE 0: the appointment itself. -----------------------
+      const apptStart = resolveApptStart(appt);
+
+      // FAIL CLOSED. An unknown appointment time is precisely the
+      // ambiguity that caused the v1–v3 false-positive wave.
+      if (!apptStart) {
+        skippedUnresolvedApptTime++;
+        if (dryRun) {
+          details.push({
+            contact_id: contactId,
+            appt_id: appt.id,
+            decision: 'skipped_unresolved_appt_time',
+            event_type: appt.event_type,
+          });
+        }
+        continue;
+      }
+
+      const elapsedMs = now.getTime() - apptStart.getTime();
+
+      // A future appointment can never have been ghosted.
+      if (elapsedMs < 0) {
+        skippedFutureAppt++;
+        if (dryRun) {
+          details.push({
+            contact_id: contactId,
+            appt_id: appt.id,
+            decision: 'skipped_future_appointment',
+            appointment_start: apptStart.toISOString(),
+            hours_until_appointment: Number((-elapsedMs / 3600000).toFixed(2)),
+          });
+        }
+        continue;
+      }
+
+      // Outside the ghost window: too fresh, or too stale to re-open.
+      if (elapsedMs < minMs || elapsedMs > maxMs) {
+        skippedOutsideWindow++;
+        if (dryRun) {
+          details.push({
+            contact_id: contactId,
+            appt_id: appt.id,
+            decision: 'skipped_outside_window',
+            appointment_start: apptStart.toISOString(),
+            hours_since_appointment: Number((elapsedMs / 3600000).toFixed(2)),
+          });
+        }
+        continue;
+      }
+
+      // v4 — every "since" check below anchors to the APPOINTMENT,
+      // which is what "since the appointment" always meant.
+      const since = apptStart.toISOString();
+
+      if (await hasDispositionSince(contactId, since)) {
         skippedActivity++;
         continue;
       }
-      if (await hasInboundSince(contactId, appt.event_timestamp)) {
+      if (await hasInboundSince(contactId, since)) {
         skippedActivity++;
         continue;
       }
@@ -359,14 +647,25 @@ export async function runGhostSweep({ dryRun = false } = {}) {
         continue;
       }
 
+      const hoursSinceAppointment = Number((elapsedMs / 3600000).toFixed(2));
+
       if (dryRun) {
         emitted++;
-        details.push({ contact_id: contactId, appt_id: appt.id, would_emit: true });
+        details.push({
+          contact_id: contactId,
+          appt_id: appt.id,
+          appointment_start: apptStart.toISOString(),
+          hours_since_appointment: hoursSinceAppointment,
+          would_emit: true,
+        });
         continue;
       }
 
-      // Per-day bucket idempotency so re-runs don't spam duplicates.
+      // v4 — idempotency keyed by the APPOINTMENT as well as the day,
+      // so a rebook gets a fresh evaluation instead of being
+      // suppressed by a same-day bucket from the prior appointment.
       const dayBucket = new Date().toISOString().slice(0, 10);
+      const apptFingerprint = apptStart.toISOString().slice(0, 13);
       const result = await emitEvent({
         event_type: 'confirmation_unacknowledged',
         event_subtype: 'ghost_after_booking',
@@ -375,13 +674,14 @@ export async function runGhostSweep({ dryRun = false } = {}) {
         entity_id: contactId,
         ghl_contact_id: contactId,
         payload: {
-          appointment_pending: true,
+          appointment_start: apptStart.toISOString(),
           appointment_event_id: appt.id,
-          appointment_timestamp: appt.event_timestamp,
-          hours_since_booking: (now.getTime() - new Date(appt.event_timestamp).getTime()) / 3600000,
+          booking_timestamp: appt.event_timestamp,
+          hours_since_appointment: hoursSinceAppointment,
+          sweep_version: 'v4',
         },
         priority: 'normal',
-        idempotency_key: `ghost_sweep_${contactId}_${dayBucket}`,
+        idempotency_key: `ghost_sweep_${contactId}_${apptFingerprint}_${dayBucket}`,
         bypass_filter: true,
       });
       if (result && result.filtered !== true) emitted++;
@@ -393,8 +693,13 @@ export async function runGhostSweep({ dryRun = false } = {}) {
 
   const summary = {
     success: true,
+    booking_events_scanned: rawCandidates.length,
     candidates: candidates.length,
+    superseded_bookings_collapsed: superseded,
     emitted,
+    skipped_future_appointment: skippedFutureAppt,
+    skipped_outside_window: skippedOutsideWindow,
+    skipped_unresolved_appt_time: skippedUnresolvedApptTime,
     skipped_recent_activity: skippedActivity,
     skipped_has_open_state: skippedHasState,
     skipped_post_appt_dispo: skippedPostApptDispo,
@@ -402,13 +707,17 @@ export async function runGhostSweep({ dryRun = false } = {}) {
     skipped_fetch_failed: skippedFetchFailed,
     errors,
     dry_run: !!dryRun,
+    window_hours: [GHOST_MIN_HOURS, GHOST_MAX_HOURS],
+    anchored_on: 'appointment_start',
     elapsed_ms: Date.now() - start,
   };
   if (skippedPostApptDispo > 0) summary.post_appt_dispo_breakdown = postApptDispoCounts;
   if (skippedExcludedTag > 0) summary.exclusion_breakdown = exclusionCounts;
   if (dryRun) summary.details = details;
   console.log(
-    `[GhostSweep] ${candidates.length} candidates → ${emitted} emitted, ` +
+    `[GhostSweep v4] ${rawCandidates.length} booking events → ${candidates.length} current → ${emitted} emitted, ` +
+    `${skippedFutureAppt} skipped (future appt), ${skippedOutsideWindow} skipped (outside window), ` +
+    `${skippedUnresolvedApptTime} skipped (unresolved appt time), ` +
     `${skippedActivity} skipped (activity), ${skippedHasState} skipped (open state), ` +
     `${skippedPostApptDispo} skipped (post-appt dispo), ` +
     `${skippedExcludedTag} skipped (excluded tag), ${skippedFetchFailed} skipped (fetch failed), ` +
@@ -428,7 +737,7 @@ export function startGhostSweepScheduler() {
       runGhostSweep().catch(err => console.error('[GhostSweep] scheduled run failed:', err.message));
     }, GHOST_SWEEP_INTERVAL_MS);
   }, 180000);
-  console.log(`[GhostSweep] Scheduler armed: ${GHOST_MIN_HOURS}–${GHOST_MAX_HOURS}h window, ${GHOST_SWEEP_INTERVAL_MS / 60000}min cadence`);
+  console.log(`[GhostSweep] Scheduler armed: ${GHOST_MIN_HOURS}–${GHOST_MAX_HOURS}h post-APPOINTMENT window, ${GHOST_BOOKING_LOOKBACK_DAYS}d booking lookback, ${GHOST_SWEEP_INTERVAL_MS / 60000}min cadence`);
 }
 
 export function registerGhostSweepRoutes(app) {
