@@ -163,11 +163,22 @@ export function validateRequest(body, statuses = ENABLED_NOTIFICATION_STATUSES) 
     );
   }
 
+  // ALLOW_EMPTY fields are OPTIONAL, not "required but may be blank". GHL omits
+  // a customData key entirely when its merge tag resolves to empty — it does NOT
+  // send `lp_source=`. The old predicate still demanded `raw !== undefined` for
+  // these, so a contact with no LP source produced
+  //   422 ["'lp_source' is required", "'lp_subsource' is required"]
+  // and the notification never generated. Proven live 2026-08-17: omitting the
+  // two keys 422s, sending them as empty strings passes.
+  //
+  // Every other field keeps the old strict behaviour — undefined, null, and
+  // whitespace-only all still fail.
   const ALLOW_EMPTY = new Set(['lp_source', 'lp_subsource']);
   for (const key of REQUIRED_FIELDS) {
     if (key === 'status') continue;
+    if (ALLOW_EMPTY.has(key)) continue;
     const raw = body[key];
-    const present = raw !== undefined && raw !== null && (ALLOW_EMPTY.has(key) || String(raw).trim() !== '');
+    const present = raw !== undefined && raw !== null && String(raw).trim() !== '';
     if (!present) errors.push(`'${key}' is required`);
   }
 
@@ -534,12 +545,42 @@ function isFeatureEnabled() {
   return process.env.ENABLE_ENHANCED_APPT_NOTIFICATIONS === 'true';
 }
 
+/**
+ * Bearer check. On failure returns a NON-SECRET fingerprint of what arrived so
+ * the audit row can distinguish the two real-world causes without ever
+ * recording the token:
+ *
+ *   provided_len: 0   → header present but empty after "Bearer ". This is what
+ *                       an unresolved GHL merge tag produces — the workflow
+ *                       sends `Bearer {{custom_values.message_engine_token}}`
+ *                       and GHL renders an empty string when the custom-value
+ *                       KEY does not exist. The value can look correct in the
+ *                       GHL UI and still fail this way.
+ *   provided_len: n>0 → a real token arrived and did not match. Genuine
+ *                       rotation drift between Railway and GHL.
+ *   header_present:false → GHL never sent the header at all.
+ *
+ * Lengths and booleans only. Never the token, never a prefix of it.
+ */
 function checkBearerAuth(req) {
   const token = process.env.MESSAGE_ENGINE_TOKEN;
   if (!token) return { ok: true };
   const auth = req.headers.authorization || '';
+  const headerPresent = auth.length > 0;
+  const scheme = auth.startsWith('Bearer ') ? 'bearer' : (headerPresent ? 'other' : 'none');
   const provided = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-  if (provided !== token) return { ok: false };
+  if (provided !== token) {
+    return {
+      ok: false,
+      fingerprint: {
+        header_present: headerPresent,
+        scheme,
+        provided_len: provided == null ? null : provided.length,
+        expected_len: token.length,
+        provided_trimmed_len: provided == null ? null : provided.trim().length,
+      },
+    };
+  }
   return { ok: true };
 }
 
@@ -574,14 +615,57 @@ export function registerAppointmentNotificationRoutes(app) {
       });
     }
 
+    // Parse BEFORE the auth gate so a rejected request can still record which
+    // contact it was for. Parsing is pure — no I/O, no side effects.
+    const merged = extractRequestFields(req.body || {});
+
     const authCheck = checkBearerAuth(req);
     if (!authCheck.ok) {
+      const fp = authCheck.fingerprint || {};
+      console.warn(
+        `[ApptNotif] AUTH FAILED contact=${merged.contact_id || '(none)'} ` +
+        `header_present=${fp.header_present} scheme=${fp.scheme} ` +
+        `provided_len=${fp.provided_len} expected_len=${fp.expected_len}` +
+        (fp.provided_len === 0 ? ' — EMPTY BEARER: the GHL custom value did not resolve' : ''),
+      );
+      await logAudit({
+        notification_id: crypto.randomUUID(),
+        contact_id: String(merged.contact_id || '(unauthenticated)'),
+        status: String(merged.status || '(unknown)'),
+        calendar_id: merged.calendar_id || null,
+        appointment_title: merged.appointment_title || null,
+        lp_source: merged.lp_source || null,
+        lp_subsource: merged.lp_subsource || null,
+        email_body: null,
+        sms_body: null,
+        ghl_writeback_at: null,
+        model_used: null,
+        data_gaps: fp,
+        error: 'auth_failed:bearer_mismatch',
+      });
       return res.status(401).json({ ok: false, error: 'unauthorized' });
     }
 
-    const merged = extractRequestFields(req.body || {});
     const { valid, errors, normalized } = validateRequest(merged);
     if (!valid) {
+      console.warn(
+        `[ApptNotif] VALIDATION FAILED contact=${merged.contact_id || '(none)'}: ${errors.join('; ')}`,
+      );
+      await logAudit({
+        notification_id: crypto.randomUUID(),
+        contact_id: String(merged.contact_id || '(missing)'),
+        status: String(merged.status || '(unknown)'),
+        calendar_id: merged.calendar_id || null,
+        appointment_title: merged.appointment_title || null,
+        lp_source: merged.lp_source || null,
+        lp_subsource: merged.lp_subsource || null,
+        email_body: null,
+        sms_body: null,
+        ghl_writeback_at: null,
+        model_used: null,
+        data_gaps: { validation_errors: errors },
+        error: `validation_failed:${errors.join('; ')}`.slice(0, 2000),
+      });
       return res.status(422).json({ ok: false, error: 'validation_failed', detail: errors });
     }
 
