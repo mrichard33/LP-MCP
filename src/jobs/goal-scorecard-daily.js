@@ -30,7 +30,7 @@ import {
   getMarketMaps, resolveMarket, normalizeZip5,
 } from './market-resolver.js';
 import {
-  resolveSellingCalendar, sellingDaysElapsed, sellingDaysInPeriod, lastCompletedSellingDay,
+  resolveSellingCalendar, sellingDaysElapsed, sellingDaysInPeriod, previousCalendarDay,
 } from '../selling-days.js';
 
 const TIMEZONE = 'America/New_York';
@@ -279,7 +279,7 @@ export async function fetchAndPartition({ periodStart, periodEnd, branchFirst = 
  *
  * @param {object} [opts]
  * @param {string} [opts.period_start] YYYY-MM-DD (ET). Default: first of current month.
- * @param {string} [opts.period_end]   YYYY-MM-DD (ET). Default: last completed selling day.
+ * @param {string} [opts.period_end]   YYYY-MM-DD (ET). Default: yesterday (last completed calendar day).
  * @param {string} [opts.date]         Alias: sets period_end (and infers month start).
  * @param {boolean} [opts.persist=true] When false, compute but DO NOT upsert — returns
  *   the full aggregate row (incl. raw_inputs) + full per-source rows. Used by the
@@ -289,10 +289,16 @@ export async function fetchAndPartition({ periodStart, periodEnd, branchFirst = 
 export async function computeGoalScorecard(opts = {}) {
   const startedAt = Date.now();
   const persist = opts.persist !== false;
-  // Scheduled daily run (no explicit end) snapshots through the LAST COMPLETED
-  // selling day — never partial-today — so as_of matches the dashboard's stale
-  // guard. Explicit backfill/preview keeps the caller's window end.
-  const periodEnd = opts.period_end || opts.date || lastCompletedSellingDay(todayET(), SELLING_CAL);
+  // Scheduled daily run (no explicit end) snapshots through YESTERDAY — the
+  // last completed CALENDAR day, never partial-today. NOT the last completed
+  // selling day: Sundays are outside the selling calendar (they add nothing to
+  // elapsed days or targets) but business still happens on them, and anchoring
+  // coverage to the selling calendar made every Monday claim Saturday's date
+  // while Sunday's sales sat invisible until Tuesday (ruling 2026-08-17 — see
+  // previousCalendarDay). daysElapsed below still counts SELLING days, so a
+  // Sunday/holiday endpoint widens coverage without moving the pace basis.
+  // Explicit backfill/preview keeps the caller's window end.
+  const periodEnd = opts.period_end || opts.date || previousCalendarDay(todayET());
   const periodStart = opts.period_start || monthStart(periodEnd);
   const asOfDate = periodEnd;
   // Selling-day basis: numerator = selling days in [start, as_of]; denominator =
@@ -857,7 +863,10 @@ export function stalenessLagSellingDays(actualAsOf, expectedAsOf, cal) {
 
 async function checkSnapshotFreshness(today) {
   if (WATCHDOG_DISABLED || lastWatchdogAlertDate === today) return;
-  const expectedAsOf = lastCompletedSellingDay(today, SELLING_CAL);
+  // Expect a row for YESTERDAY, matching computeGoalScorecard's anchor. If this
+  // stayed on the selling calendar the watchdog would never notice a missing
+  // Sunday row — the exact day the anchor change exists to cover.
+  const expectedAsOf = previousCalendarDay(today);
   try {
     const { data, error } = await supabase
       .from('lp_market_scorecard_daily')
@@ -942,7 +951,7 @@ async function checkSnapshotFreshness(today) {
 
     const msg =
       `⚠️ SCORECARD SNAPSHOT MISSING — lp_market_scorecard_daily has no row for ` +
-      `${expectedAsOf} (last completed selling day) — ${lagPhrase}. The 06:00 ET run did not ` +
+      `${expectedAsOf} (yesterday) — ${lagPhrase}. The 06:00 ET run did not ` +
       `write, AND the watchdog's catch-up run did not fix it — so this is a real failure, ` +
       `not a missed window. The dashboard is showing its "no data yet" state. ` +
       `Check LP-MCP logs, then retry via POST /n8n/admin/goal-scorecard-run.`;
