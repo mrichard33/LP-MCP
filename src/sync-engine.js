@@ -896,21 +896,31 @@ async function runJobChangesSweep(since, today, logIds) {
   const counts = { jobs: 0, milestones: 0 };
   let failed = 0;
   let startIndex = 1;
+  // v6.13: deep-offset mode, ported from runLeadsSweep (#709). This sweep was
+  // left on the pre-fix path deliberately as the control arm; it has served
+  // that purpose and still logs the untreated 3-calls-per-row pattern.
+  let deepOffsetMode = false;
+  let deepOffsetSince = null;
+  let scanned = 0;
+  const sweepStartedAt = Date.now();
 
   while (true) {
     let jobs;
+    const fetchSize = deepOffsetMode ? 1 : SYNC_PAGE_SIZE;
     try {
       jobs = await getJobStatusChanges({
         startdate: since, enddate: today,
-        PageSize: SYNC_PAGE_SIZE, StartIndex: startIndex,
+        PageSize: fetchSize, StartIndex: startIndex,
       });
     } catch (err) {
-      // Same truncation-not-completion semantics as the leads sweep.
+      // Same truncation-not-completion semantics as the leads sweep. An ERROR
+      // page is a genuine failure, so a retry is warranted here — unlike the
+      // deterministic empty-page path below.
       console.error(`[Sync:JobChanges] page StartIndex=${startIndex} failed: ${err.message} — retrying smaller`);
       try {
         jobs = await getJobStatusChanges({
           startdate: since, enddate: today,
-          PageSize: Math.max(10, Math.floor(SYNC_PAGE_SIZE / 4)), StartIndex: startIndex,
+          PageSize: Math.max(1, Math.floor(fetchSize / 4)), StartIndex: startIndex,
         });
       } catch (err2) {
         console.error(`[Sync:JobChanges] page StartIndex=${startIndex} failed after small-page retry — sweep TRUNCATED: ${err2.message}`);
@@ -919,24 +929,30 @@ async function runJobChangesSweep(since, today, logIds) {
     }
     let items = extractArray(jobs);
     if (items.length === 0) {
-      // Same empty-page verification as the leads sweep — an empty page under
-      // load is not proof of completion.
+      // In deep-offset mode this fetch WAS the 1-row probe, so empty is
+      // authoritative — that is the end of the window.
+      if (deepOffsetMode) break;
+      // Same empty-page verification as the leads sweep — an empty page is not
+      // proof of completion.
       try {
         const probe = extractArray(await getJobStatusChanges({
           startdate: since, enddate: today, PageSize: 1, StartIndex: startIndex,
         }));
         if (probe.length === 0) break; // genuinely the end
-        console.warn(`[Sync:JobChanges] empty page at StartIndex=${startIndex} but probe found rows — retrying smaller`);
-        items = extractArray(await getJobStatusChanges({
-          startdate: since, enddate: today,
-          PageSize: Math.max(10, Math.floor(SYNC_PAGE_SIZE / 4)), StartIndex: startIndex,
-        }));
-        if (items.length === 0) items = probe;
+        // v6.13: a PageSize=1 probe returning a row proves LP is up and
+        // serving; the empty multi-row page is DETERMINISTIC deep-offset
+        // behavior. Keep the probe row as this page's work and drop to
+        // PageSize=1 for the rest of the sweep — 1 LP call per row, not 3.
+        deepOffsetMode = true;
+        deepOffsetSince = startIndex;
+        console.warn(`[Sync:JobChanges] deep-offset detected at StartIndex=${startIndex} (empty page, probe returned rows) — switching to PageSize=1 for the remainder of this sweep`);
+        items = probe;
       } catch (err) {
         console.error(`[Sync:JobChanges] empty-page verification failed at StartIndex=${startIndex} — sweep TRUNCATED: ${err.message}`);
         break;
       }
     }
+    scanned += items.length;
 
     await processInBatches(items, SYNC_PROSPECT_CONCURRENCY, async (job) => {
       try {
@@ -956,6 +972,13 @@ async function runJobChangesSweep(since, today, logIds) {
     await sleep(RATE_LIMIT_SLEEP_MS);
   }
 
+  if (deepOffsetMode) {
+    const mins = (Date.now() - sweepStartedAt) / 60000;
+    console.log(
+      `[Sync:JobChanges] Deep-offset mode engaged at StartIndex=${deepOffsetSince} — ` +
+      `${scanned} rows scanned at 1 LP call/row, ${(scanned / Math.max(0.1, mins)).toFixed(1)} rows/min`
+    );
+  }
   return { counts, failed };
 }
 

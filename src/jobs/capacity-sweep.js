@@ -369,14 +369,25 @@ async function sweepForwardLeadDispositions(windowStart, windowEnd) {
 
   let startIndex = 1;
   const stats = { scanned: 0, matched: 0, processed: 0, failed: 0, pages: 0 };
+  // v6.13: deep-offset mode, ported from runLeadsSweep (#709).
+  let deepOffsetMode = false;
+  let deepOffsetSince = null;
 
-  for (let page = 0; page < LEAD_MAX_PAGES; page++) {
+  // v6.13: the budget is now in ROWS, not pages. Deep-offset mode fetches one
+  // row per call, so the old page-count bound would have silently cut coverage
+  // by the page-size factor (80 pages x 50 = 4000 rows collapsing to 80 rows).
+  // LEAD_MAX_ROWS preserves the original row coverage; the loop can never run
+  // more iterations than rows because an empty page always terminates it.
+  const LEAD_MAX_ROWS = LEAD_MAX_PAGES * LEAD_PAGE_SIZE;
+
+  while (stats.scanned < LEAD_MAX_ROWS) {
     await yieldToFastPass(`change-page ${startIndex}`);
     let items;
+    const fetchSize = deepOffsetMode ? 1 : LEAD_PAGE_SIZE;
     try {
       const res = await getLeads({
         startdate: changeStart, enddate: changeEnd,
-        PageSize: LEAD_PAGE_SIZE, StartIndex: startIndex,
+        PageSize: fetchSize, StartIndex: startIndex,
       });
       items = extractArray(res);
     } catch (err) {
@@ -388,7 +399,7 @@ async function sweepForwardLeadDispositions(windowStart, windowEnd) {
       try {
         const res = await getLeads({
           startdate: changeStart, enddate: changeEnd,
-          PageSize: Math.max(10, Math.floor(LEAD_PAGE_SIZE / 4)), StartIndex: startIndex,
+          PageSize: Math.max(1, Math.floor(fetchSize / 4)), StartIndex: startIndex,
         });
         items = extractArray(res);
       } catch (err2) {
@@ -399,6 +410,9 @@ async function sweepForwardLeadDispositions(windowStart, windowEnd) {
       }
     }
     if (!items.length) {
+      // v6.13: in deep-offset mode this fetch WAS the 1-row probe, so empty is
+      // authoritative — that is the end of the window.
+      if (deepOffsetMode) break;
       // VERIFY the empty page before trusting it (2026-07-22): under load LP
       // soft-fails by returning an EMPTY page at offsets where rows exist
       // (proved live — StartIndex=151 empty at PageSize 50, same offset
@@ -410,12 +424,14 @@ async function sweepForwardLeadDispositions(windowStart, windowEnd) {
           PageSize: 1, StartIndex: startIndex,
         }));
         if (!probe.length) break; // genuinely the end
-        console.warn(`[CapacitySweep] empty page at startIndex=${startIndex} but probe found rows — retrying smaller`);
-        items = extractArray(await getLeads({
-          startdate: changeStart, enddate: changeEnd,
-          PageSize: Math.max(10, Math.floor(LEAD_PAGE_SIZE / 4)), StartIndex: startIndex,
-        }));
-        if (!items.length) { items = probe; } // worst case: advance one row at a time
+        // v6.13: the probe returning a row proves LP is up and serving; the
+        // empty multi-row page is DETERMINISTIC deep-offset behavior, not
+        // load. Keep the probe row as this page's work and drop to PageSize=1
+        // for the remainder — 1 LP call per row instead of 3.
+        deepOffsetMode = true;
+        deepOffsetSince = startIndex;
+        console.warn(`[CapacitySweep] deep-offset detected at startIndex=${startIndex} (empty page, probe returned rows) — switching to PageSize=1 for the remainder of this sweep`);
+        items = probe;
       } catch (err) {
         stats.truncated_at = startIndex;
         stats.page_error = `empty-page verify failed: ${String(err.message || err).slice(0, 150)}`;
@@ -452,9 +468,17 @@ async function sweepForwardLeadDispositions(windowStart, windowEnd) {
     // same window returned further full rows. Treating a short page as the
     // last page ended the sweep after page 1 and the changed prospects on
     // pages 2+ were never fetched (the 8/3/3 evening drift). Only an EMPTY
-    // page terminates; LEAD_MAX_PAGES stays as the runaway backstop.
+    // page terminates; the LEAD_MAX_ROWS budget stays as the runaway backstop.
   }
 
+  if (deepOffsetMode) {
+    stats.deep_offset_from = deepOffsetSince;
+    console.log(`[CapacitySweep] deep-offset mode engaged at startIndex=${deepOffsetSince} — ${stats.scanned} rows scanned at 1 LP call/row`);
+  }
+  if (stats.scanned >= LEAD_MAX_ROWS) {
+    stats.row_budget_exhausted = LEAD_MAX_ROWS;
+    console.warn(`[CapacitySweep] change sweep hit the ${LEAD_MAX_ROWS}-row budget — scan bounded, remaining rows NOT scanned this pass`);
+  }
   return stats;
 }
 
