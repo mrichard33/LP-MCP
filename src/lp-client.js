@@ -481,6 +481,66 @@ export async function getLeadByLdsId(ldsId, opts = {}) {
   }, 3, opts));
 }
 
+/**
+ * POST /api/Downloads/GetLeadsByCQDID — the dialer feed for one call queue.
+ *
+ * Returns the leads in queue `cqdId` that are available to be dialed, one
+ * row per lead: Cst_ID, Lds_ID, Cqd_ID, Phone/2/3, names, Source,
+ * SubSourceDescr, Product, CurrentDisposition, NumDialingAttempts,
+ * LastCallDatetime, LastCallResult. Queue membership is DERIVED lead state
+ * (queues are views) — this endpoint is read-only and there is no companion
+ * "put a lead in a queue" write; the only re-queue primitive is LeadAdd.
+ *
+ * Row windows are 1-indexed inclusive [startrow, endrow] over a contiguous
+ * ROW_NUMBER — verified live 2026-08-18. LP caps pulls at 1000 rows.
+ *
+ * @param {number|string} cqdId    — call queue id (SalesApi/GetSalesApptDispProd type=q)
+ * @param {number} [startrow=1]    — first row, 1-indexed inclusive
+ * @param {number} [endrow=1000]   — last row, inclusive (max 1000-row window)
+ */
+export async function getLeadsByCQDID(cqdId, startrow = 1, endrow = 1000, opts = {}) {
+  if (!cqdId) throw new Error('getLeadsByCQDID: cqdId is required');
+  return withCircuit(() => lpPost('/api/Downloads/GetLeadsByCQDID', {
+    cqd_id:   String(cqdId),
+    startrow: String(startrow),
+    endrow:   String(endrow),
+  }, 3, opts));
+}
+
+/**
+ * POST /api/Customers/GetCustomersByProspectID — minimal prospect read.
+ *
+ * Quick prospect search returning Prospect ID, name, address and phone.
+ * This is the read-back used to VERIFY an UpdateProspectInfo write took —
+ * cheap compared to the full GetLead payload.
+ */
+export async function getCustomersByProspectID(prospectId, opts = {}) {
+  if (!prospectId) throw new Error('getCustomersByProspectID: prospectId is required');
+  return withCircuit(() => lpPost('/api/Customers/GetCustomersByProspectID', {
+    prospectid: String(prospectId),
+  }, 3, opts));
+}
+
+/**
+ * POST /api/Leads/GetInboundLeadInfo — inbound-queue status by lognumber.
+ *
+ * The live confirmation read after an addlead: workflow and agentic pushes
+ * stamp lognumber = GHL contact ID, so the contact ID is the match key.
+ * Same call check_lp_inbound exposes over MCP.
+ */
+export async function getInboundLeadInfo({ lognumber, startdate, enddate, pageSize = 50 } = {}, opts = {}) {
+  if (!lognumber) throw new Error('getInboundLeadInfo: lognumber is required');
+  const fmt = (d) => `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}/${d.getFullYear()}`;
+  const today = new Date();
+  return withCircuit(() => lpPost('/api/Leads/GetInboundLeadInfo', {
+    startdate:  startdate || fmt(new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000)),
+    enddate:    enddate || fmt(today),
+    lognumber:  String(lognumber),
+    PageSize:   String(pageSize),
+    StartIndex: '1',
+  }, 3, opts));
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Phase 2 Write Endpoints
 // ═══════════════════════════════════════════════════════════════════
@@ -627,6 +687,79 @@ export async function updateDncStatus({ custid, newDncStatus, empid = LP_EMP.GHL
   }
 
   console.log(`[LP] UpdateDNCStatus SUCCESS: custid=${custid}, code=${code}, response: ${JSON.stringify(item).slice(0, 200)}`);
+  return item;
+}
+
+// ─── UpdateProspectInfo (2026-08-18 — the prospect-repair primitive) ─────
+//
+// LP dedupes a second LeadAdd onto the existing prospect and does NOT update
+// prospect-level address from the later push (proven live on prospect 452653:
+// the estimator push carried "4360 Washington Place" and the prospect kept a
+// blank address). /api/Customers/UpdateProspectInfo is the ONLY way to repair
+// the prospect record; a re-push never does it. Do NOT use UpdateCustomer —
+// it only accepts firstname/lastname/phone.
+//
+// CAUTION (write semantics): UpdateProspectInfo OVERWRITES the fields you
+// send. Sending an empty string over a populated LP field blanks it. So this
+// wrapper only ever transmits fields with real values — enforced by
+// buildProspectUpdateFields, which is exported for its own test.
+
+export const LP_UPDATE_PROSPECT_EMPNAME = (process.env.LP_UPDATE_PROSPECT_EMPNAME || 'lpservice').trim();
+
+const PROSPECT_UPDATABLE_FIELDS = ['firstname', 'lastname', 'address1', 'address2', 'city', 'state', 'zip', 'phone', 'email'];
+
+/**
+ * Build the field map for UpdateProspectInfo, keeping ONLY fields with real
+ * (non-blank) values. Pure — unit tested in scripts/test-lp-callback-requeue.js.
+ */
+export function buildProspectUpdateFields(updates = {}) {
+  const out = {};
+  for (const key of PROSPECT_UPDATABLE_FIELDS) {
+    const v = updates[key];
+    if (v === null || v === undefined) continue;
+    const s = String(v).trim();
+    if (s === '') continue; // never send an empty string over a populated LP field
+    out[key] = s;
+  }
+  return out;
+}
+
+/**
+ * POST /api/Customers/UpdateProspectInfo — update prospect-level identity
+ * fields. Caller should read back via getCustomersByProspectID to confirm
+ * the write took (LP returns generic OK shapes).
+ *
+ * @param {Object} p
+ * @param {string|number} p.custnumber — LP prospect ID (required)
+ * @param {Object} p.updates          — candidate fields; blanks are stripped
+ * @param {string} [p.empname]        — LP employee name (required by LP; doc default "lpservice")
+ */
+export async function updateProspectInfo({ custnumber, updates = {}, empname = LP_UPDATE_PROSPECT_EMPNAME } = {}) {
+  if (!custnumber) throw new Error('updateProspectInfo: custnumber (LP prospect ID) is required');
+  const fields = buildProspectUpdateFields(updates);
+  if (Object.keys(fields).length === 0) {
+    throw new Error('updateProspectInfo: no non-blank fields to update — refusing a no-op write');
+  }
+
+  console.log(`[LP] UpdateProspectInfo: custnumber=${custnumber}, fields=[${Object.keys(fields).join(', ')}], empname=${empname}`);
+
+  const result = await withCircuit(() => lpPost('/api/Customers/UpdateProspectInfo', {
+    custnumber: String(custnumber),
+    ...fields,
+    empname,
+  }));
+
+  const item = Array.isArray(result) ? (result[0] || {}) : (result || {});
+  const resultCode = item.Result ?? item.result ?? null;
+  const message    = item.Message ?? item.message ?? '';
+  const looksLikeError =
+    resultCode === 0 ||
+    (typeof message === 'string' && /^\s*Error\s*:/i.test(message));
+  if (looksLikeError) {
+    throw new Error(`LP UpdateProspectInfo error (custnumber=${custnumber}): ${message || '(no message)'}`);
+  }
+
+  console.log(`[LP] UpdateProspectInfo SUCCESS: custnumber=${custnumber}, response: ${JSON.stringify(item).slice(0, 200)}`);
   return item;
 }
 

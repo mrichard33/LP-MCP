@@ -170,6 +170,7 @@ import { executeBookAppointment, executeCancelAppointment, executeRescheduleAppo
 import { executeSyncLpAppointmentToGhl } from './handlers/lp-ghl-appointment-sync.js';
 import { executeSetLPAppointment } from './handlers/lp-appointment.js';
 import { executeCreateLPLead } from './handlers/lp-lead.js';
+import { executeLpCallbackRequeue } from './handlers/lp-requeue.js';
 import { executeUpdateLPDNCStatus } from './handlers/lp-dnc.js';
 import { executeSetDND } from './handlers/dnd.js';
 import { executeCreateTask } from './handlers/tasks.js';
@@ -463,6 +464,7 @@ const ACTION_HANDLERS = {
   send_notification: executeSendNotification,
   set_lp_appointment: executeSetLPAppointment,
   create_lp_lead: executeCreateLPLead,           // 2026-05-01 — agentic LP push (Jane recovery)
+  lp_callback_requeue: executeLpCallbackRequeue, // 2026-08-18 — callback_request → LP re-queue (the push IS the dial trigger)
   update_lp_dnc_status: executeUpdateLPDNCStatus, // 2026-05-01 — agentic DNC push (Charles Poulos recovery)
   set_dnd: executeSetDND,                        // 2026-07-20 Fix 6b — GHL-side channel DND. Handler landed 2026-07-20, wired 2026-07-22.
   update_custom_fields: executeUpdateCustomFields,
