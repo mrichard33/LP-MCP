@@ -71,6 +71,15 @@ import {
   registerLpRequeueVerifyRoutes,
   startLpRequeueVerifyScheduler,
 } from './jobs/lp-requeue-verify.js';
+// ─── LP Addlead Address Hold + Prospect Address Backfill (Section D) ──
+import {
+  registerLpAddleadHoldRoutes,
+  startLpAddleadHoldScheduler,
+} from './jobs/lp-addlead-hold-sweeper.js';
+import {
+  registerLpAddressBackfillRoutes,
+  startLpAddressBackfillScheduler,
+} from './jobs/lp-address-backfill.js';
 // ─── Objection Fall-Through Sweep (post-routing miss detection) ──
 import {
   registerFallthroughSweepRoutes,
@@ -770,6 +779,33 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] sync hash gate substrate FAILED (hash gate runs ungated — apply sql/059 manually):', err.message);
   }
+
+  // Addlead address hold (sql/060 — the file is the source of truth; this
+  // mirror guarantees the table exists before the address gate's first hold
+  // and before the hold sweeper's first pass). The gate fails open without
+  // it (a lead is never dropped), but a fresh deploy should self-heal.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE TABLE IF NOT EXISTS lp_addlead_address_hold (
+              id              bigserial PRIMARY KEY,
+              ghl_contact_id  text NOT NULL,
+              payload         jsonb NOT NULL,
+              missing_fields  text[] NOT NULL,
+              attempts        int NOT NULL DEFAULT 0,
+              next_attempt_at timestamptz NOT NULL,
+              released_at     timestamptz,
+              release_reason  text,
+              lp_in1_id       text,
+              created_at      timestamptz DEFAULT now()
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_lp_addlead_address_hold_active
+              ON lp_addlead_address_hold (ghl_contact_id) WHERE released_at IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_lp_addlead_address_hold_due
+              ON lp_addlead_address_hold (next_attempt_at) WHERE released_at IS NULL;`);
+    console.log('[Migration] addlead address hold substrate (sql/060) ready');
+  } catch (err) {
+    console.error('[Migration] addlead address hold substrate FAILED (address gate holds disabled — apply sql/060 manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
@@ -978,6 +1014,15 @@ registerAppointmentParityRoutes(app);
 // window. A promised call is never silently dropped.
 registerLpRequeueVerifyRoutes(app);
 
+// ─── LP Addlead Address Hold + Prospect Address Backfill ─────────
+// 2026-08-18 (Section D): POST /n8n/lp-addlead-hold/sweep works the
+// hold-and-enrich queue (never drop — exhausted holds forward stamped);
+// POST /n8n/lp-address-backfill/sweep repairs blank LP prospect addresses
+// from GHL via UpdateProspectInfo with read-back verification;
+// GET /n8n/lp-address-backfill/dry-run-count is the shadow report number.
+registerLpAddleadHoldRoutes(app);
+registerLpAddressBackfillRoutes(app);
+
 // ─── Objection Fall-Through Sweep ────────────────────────────────
 // 2026-05-20 (Option 1 Step 4): detects intent.objection_detected
 // events where NO routing rule (new state classifier OR legacy Rules
@@ -1138,6 +1183,8 @@ app.listen(PORT, async () => {
   startGhostSweepScheduler();
   startAppointmentParityScheduler();
   startLpRequeueVerifyScheduler();
+  startLpAddleadHoldScheduler();
+  startLpAddressBackfillScheduler();
   startFallthroughSweepScheduler();
   startApprovalEscalationScheduler();
   startDataFreshnessMonitorScheduler();

@@ -48,6 +48,7 @@ import supabase from './supabase.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { flattenWebhookBody } from './webhook-body.js';
 import { fetchAndBuildAgenticNotes, isWeakNotes } from './services/agentic-lead-notes.js';
+import { applyAddressGate } from './services/lp-address-gate.js';
 import {
   BUSINESS_HOUR_START_ET,
   BUSINESS_HOUR_END_ET,
@@ -202,7 +203,7 @@ async function sendStripCard({ body, plan, mode }) {
   ).catch((err) => console.warn(`[LP-PROXY] GroupMe card failed: ${err.message}`));
 }
 
-async function forwardToLp(bodyObj) {
+export async function forwardToLp(bodyObj) {
   const res = await fetch(LP_ADDLEAD_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Accept': '*/*' },
@@ -250,6 +251,39 @@ export function registerLpAddleadProxyRoutes(app) {
         outbound = dropControlKeys(body);
         plan = { action: 'forward', reason: `validation_error:${err.message}`, hour: null };
       }
+    }
+
+    // ── Address completeness gate (Section D, 2026-08-18) ───────────────
+    // D1: the LP push is the dial trigger and LP never repairs a prospect
+    // from a later push, so the FIRST push must carry a complete address.
+    // Hold-and-enrich, never drop: incomplete → fill from the GHL contact
+    // (lognumber = contact id) → still incomplete → park in
+    // lp_addlead_address_hold (the sweeper retries, then forwards anyway
+    // stamped "INCOMPLETE ADDRESS ON FILE"). Ships LP_ADDRESS_GATE_MODE=
+    // shadow: evaluates + logs, forwards everything. applyAddressGate is
+    // fail-open by construction — any internal error forwards untouched.
+    let gate = null;
+    try {
+      gate = await applyAddressGate(outbound);
+      if (gate.action === 'hold') {
+        console.log(
+          `[LP-PROXY] ${body.sender || '?'} log=${body.lognumber || '?'} mode=${mode} ` +
+          `plan=${plan.action}/${plan.reason} address_gate=HELD missing=[${gate.missing.join(',')}] ${Date.now() - started}ms`
+        );
+        // No LP response exists for a held lead — Contract 1 (response
+        // fidelity) applies to forwarded bodies only. GHL's "Extract
+        // Inbound Lead ID" finds no "lead added:" prefix in this body, so
+        // downstream id-writeback simply doesn't run; the sweeper writes
+        // the in1_id to the contact when the hold releases.
+        res.status(200).type('application/json').send(JSON.stringify({
+          status: 'HELD',
+          message: `address hold: lead parked for enrichment (missing ${gate.missing.join(', ')})`,
+        }));
+        return;
+      }
+      if (gate.body !== outbound) outbound = gate.body; // enriched fields flow to LP
+    } catch (err) {
+      console.error(`[LP-PROXY] address gate threw — forwarding untouched: ${err.message}`);
     }
 
     // ── Agentic notes enrichment ────────────────────────────────────────
@@ -305,6 +339,7 @@ export function registerLpAddleadProxyRoutes(app) {
       console.log(
         `[LP-PROXY] ${body.sender || '?'} log=${body.lognumber || '?'} mode=${mode} ` +
         `notes=${nMode}/${notesAction} ` +
+        `address_gate=${gate ? `${gate.mode}/${gate.reason}${gate.would_hold ? '/WOULD_HOLD' : ''}` : 'skipped'} ` +
         `plan=${plan.action}/${plan.reason} lp=${lp.status} ${Date.now() - started}ms`
       );
       res.status(lp.status).type(lp.contentType).send(lp.raw);

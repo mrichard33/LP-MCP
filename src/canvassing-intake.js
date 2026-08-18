@@ -256,6 +256,18 @@ export function buildAddleadBody(b, notes, plan, norm) {
     HasConsent: 'true', ConsentDate: b.date_created || '',
     TextOptIn: 'true', EmailOptIn: 'true',
   };
+  // D5 path audit (2026-08-18): this path posts DIRECT to LP and bypasses
+  // both the addlead proxy's address gate and lp-client addLead's required-
+  // field validation. A canvassed lead is captured standing at the home, so
+  // a blank address here is a capture bug — surface it loudly rather than
+  // letting it poison the prospect silently (LP never repairs a prospect
+  // from a later push).
+  {
+    const missingAddr = ['address1', 'city', 'state', 'zip'].filter((k) => !String(body[k] || '').trim());
+    if (missingAddr.length) {
+      console.error(`[CANVASS-INTAKE] ⚠️ addlead body missing address field(s) [${missingAddr.join(', ')}] for contact ${body.lognumber || '?'} — forwarding anyway (canvassing path is ungated); prospect will need UpdateProspectInfo backfill`);
+    }
+  }
   if (plan.action === 'forward') {
     body.adate = norm.adate;
     body.atime = norm.atime;
