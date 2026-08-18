@@ -39,6 +39,39 @@
  *   2. Window Count (h9FJTUbmUHIuD6JKmpXv) is read as a first-class field.
  *      Job size is the single most useful fact for a setter and must not
  *      depend on whether an LLM happened to mention it in prose.
+ *
+ * v1.1 (2026-08-18) — REACH no longer invents a contact preference.
+ *   PROBLEM: F.PREFERRED_CONTACT pointed at jv6c5Lie982duxVX5TNv and rendered
+ *   `prefers ${value}`. That field is "Incoming Message Channel" — the surface
+ *   the lead ARRIVED on. It was mislabelled "Preferred Contact Method" in
+ *   src/ghl-field-decoder.js (v1.0–v1.4) and this file inherited the error at
+ *   face value, per the WHY BY FIELD ID note above: the ID was right, the NAME
+ *   was never verified, and the rendering was built on the name.
+ *
+ *   The output goes to LP `notes` — the last thing a setter reads before
+ *   dialing. Live distribution of the field: SMS 580, Live Chat 732, Chat
+ *   Widget 132, Instagram DM 27, Facebook Messenger 25. So 580 leads whose only
+ *   action was to text us were briefed to the call floor as "prefers SMS",
+ *   which reads as "do not phone this person". No lead ever said that.
+ *
+ *   Reference contact C5DqkOUqoRvHT86dia4H (Elena, 2026-08-18): brief read
+ *   "REACH: prefers Live Chat, English, via 2026_chatbot / footer_widget, bot
+ *   exit agentic, P1 Stage 1" against a Decision Timeline of ASAP and four
+ *   leaking windows.
+ *
+ *   FIX: constant renamed F.PREFERRED_CONTACT → F.INCOMING_CHANNEL; the REACH
+ *   line renders `came in via ${value}`. Arrival channel is genuinely useful to
+ *   a setter, so the value is kept under wording that matches what it means
+ *   rather than removed.
+ *
+ *   NOTE: GHL has no real contact-preference field as of this date. If one is
+ *   created, add it to the decoder as a NEW id and restore a "prefers" line
+ *   sourced from it — do not re-point this constant.
+ *
+ *   STANDING LESSON: a field ID being stable does not make the label attached
+ *   to it true. Any rendering that turns a raw value into a CLAIM about the
+ *   lead ("prefers", "wants", "refused") needs the field's meaning confirmed in
+ *   the GHL UI first, not just its ID confirmed on a contact.
  */
 
 const F = {
@@ -54,7 +87,9 @@ const F = {
   TRUST_SCORE:       'zrghbp0ZLrOyTWc9x6Ai',
   OBJECTION:         'ATvhIO4G5UvI93nRDsnY',
   CHATBOT_EXIT:      'KsMdYWa9GmtLinA05jZW',
-  PREFERRED_CONTACT: 'jv6c5Lie982duxVX5TNv',
+  // v1.1 — was PREFERRED_CONTACT. Same id, correct name: this is the channel
+  // the lead arrived on, NOT a preference. See header v1.1.
+  INCOMING_CHANNEL:  'jv6c5Lie982duxVX5TNv',
   LANGUAGE:          '3vQsf4lNxL0LrDpgHY9Q',
   PRODUCT_INTEREST:  'yjW7vPy2PYaircO0Amqn', // renders "Impact Windows"
   WINDOW_COUNT:      'h9FJTUbmUHIuD6JKmpXv',
@@ -182,8 +217,11 @@ function buildSections(contact, opts = {}) {
     g(F.EMOTIONAL_ARC) ? `Arc ${g(F.EMOTIONAL_ARC)}` : null,
   ].filter(Boolean).join('; '));
 
+  // v1.1: "came in via", NOT "prefers". This field is the arrival channel; it
+  // says nothing about how the lead wants to be reached, and phrasing it as a
+  // preference told the floor not to dial 580 SMS-origin leads. See header v1.1.
   push('REACH', [
-    g(F.PREFERRED_CONTACT) ? `prefers ${g(F.PREFERRED_CONTACT)}` : null,
+    g(F.INCOMING_CHANNEL) ? `came in via ${g(F.INCOMING_CHANNEL)}` : null,
     language,
     g(F.SOURCE_DETAIL) && g(F.SOURCE_WIDGET)
       ? `via ${g(F.SOURCE_DETAIL)} / ${g(F.SOURCE_WIDGET)}`
