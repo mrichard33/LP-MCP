@@ -516,9 +516,19 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
   // v6.11: hash-gate + soft-fail state
   let unchangedSkipped = 0;      // enforce: skipped; shadow: would-skip
   let scanned = 0;               // prospects fetched this sweep (changed or not)
-  let softFailStreak = 0;        // consecutive soft-fail pages
-  let cleanStreak = 0;           // consecutive clean first-try pages
-  let pageSize = SYNC_PAGE_SIZE; // adaptive: shrinks on soft-fail, recovers on clean pages
+  let softFailStreak = 0;        // consecutive ERROR pages (genuine failures only)
+  let pageSize = SYNC_PAGE_SIZE; // shrinks on genuine error pages
+  // v6.12: deep-offset mode. STICKY for the rest of the sweep once LP's
+  // deterministic empty-page behavior is proven at this depth (see the
+  // empty-page branch below). In this mode every fetch is PageSize=1:
+  // ONE LP call per row instead of the full-size-fetch → probe → retry
+  // triple that made deep pages cost 3 calls each.
+  let deepOffsetMode = false;
+  let deepOffsetSince = null;
+  // v6.12: hash-gate diagnostics — why the gate did or didn't match.
+  let gateStored = 0;   // prospects that had a stored hash to compare against
+  let gateAbsent = 0;   // prospects with NO stored hash (never hashed / mixed rows)
+  let gateMatched = 0;  // stored hash === freshly computed hash
 
   // v6.10: Load active deny-list once at sweep start. New denylist
   // transitions added mid-sweep (via recordProspectFailure return) are
@@ -533,24 +543,28 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
   let truncatedAt = null;
   while (counts.leads < maxLeads && scanned < MAX_SCANNED_LEADS) {
     let leads;
+    // v6.12: in deep-offset mode LP only serves one row at a time here, so
+    // ask for exactly that. Anything larger comes back empty and costs a
+    // wasted round trip.
+    const fetchSize = deepOffsetMode ? 1 : pageSize;
     try {
       leads = await getLeadData({
         startdate: since, enddate: today,
-        PageSize: pageSize, StartIndex: startIndex,
+        PageSize: fetchSize, StartIndex: startIndex,
       });
     } catch (err) {
-      // A failed page means TRUNCATION, not completion. v6.11: back off,
-      // THEN retry once at a quarter of the page size — instant retries
-      // against an LP that is already failing under load are themselves load.
+      // A failed page means TRUNCATION, not completion. An ERROR page is a
+      // genuine failure (LP refused the request), so backoff is correct HERE
+      // and only here — unlike the empty-page path below, which is
+      // deterministic and must never sleep.
       softFailStreak++;
-      cleanStreak = 0;
       const failBackoff = Math.min(SYNC_SOFTFAIL_BACKOFF_MAX_MS, SYNC_SOFTFAIL_BACKOFF_BASE_MS * 2 ** Math.min(softFailStreak - 1, 4));
       console.error(`[Sync:Leads] GetLeadData page StartIndex=${startIndex} failed: ${err.message} — backing off ${failBackoff}ms, retrying smaller`);
       await sleep(failBackoff);
       try {
         leads = await getLeadData({
           startdate: since, enddate: today,
-          PageSize: Math.max(10, Math.floor(pageSize / 4)), StartIndex: startIndex,
+          PageSize: Math.max(1, Math.floor(fetchSize / 4)), StartIndex: startIndex,
         });
       } catch (err2) {
         truncatedAt = startIndex;
@@ -565,26 +579,26 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
       // 2026-07-22 — a recovery run "completed" at exactly 150 prospects
       // while a 1-row probe at the next offset returned data). An unverified
       // empty page truncates the sweep while looking like clean completion.
+      // v6.12: in deep-offset mode this fetch WAS the 1-row probe, so an
+      // empty result is authoritative — that is the end of the window.
+      if (deepOffsetMode) break;
       try {
         const probe = extractArray(await getLeadData({
           startdate: since, enddate: today, PageSize: 1, StartIndex: startIndex,
         }));
         if (probe.length === 0) break; // genuinely the end
-        // v6.11: LP soft-failed under load — back off before the retry and
-        // shrink the WORKING page size for the rest of the sweep, instead of
-        // paying a doomed full-size call on every subsequent page (the
-        // measured 3-calls-per-prospect crawl).
-        softFailStreak++;
-        cleanStreak = 0;
-        pageSize = Math.max(10, Math.floor(pageSize / 2));
-        const backoff = Math.min(SYNC_SOFTFAIL_BACKOFF_MAX_MS, SYNC_SOFTFAIL_BACKOFF_BASE_MS * 2 ** Math.min(softFailStreak - 1, 4));
-        console.warn(`[Sync:Leads] empty page at StartIndex=${startIndex} but probe found rows — backing off ${backoff}ms, pageSize now ${pageSize}`);
-        await sleep(backoff);
-        items = extractArray(await getLeadData({
-          startdate: since, enddate: today,
-          PageSize: pageSize, StartIndex: startIndex,
-        }));
-        if (items.length === 0) items = probe; // worst case: advance one row at a time
+        // v6.12: NEVER back off here. A PageSize=1 probe that returns a row
+        // in the same breath is positive proof LP is up and serving — the
+        // empty multi-row page is DETERMINISTIC deep-offset behavior, not
+        // load. Sleeping against it buys nothing and (measured 2026-08-18)
+        // multiplied per-row cost ~4x, turning truncation into an hour-long
+        // scheduler block. Instead: keep the probe row as this page's work
+        // and switch to PageSize=1 for the rest of the sweep, so every
+        // subsequent row costs ONE call rather than three.
+        deepOffsetMode = true;
+        deepOffsetSince = startIndex;
+        console.warn(`[Sync:Leads] deep-offset detected at StartIndex=${startIndex} (empty page, probe returned rows) — switching to PageSize=1 for the remainder of this sweep, no backoff`);
+        items = probe;
       } catch (err) {
         truncatedAt = startIndex;
         console.error(`[Sync:Leads] empty-page verification failed at StartIndex=${startIndex} — sweep TRUNCATED: ${err.message}`);
@@ -592,16 +606,12 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
       }
     }
 
-    // v6.11: page-size recovery — 5 consecutive clean first-try pages grow
-    // the working size back toward SYNC_PAGE_SIZE and decay the fail streak.
-    if (softFailStreak > 0) {
-      cleanStreak++;
-      if (cleanStreak >= 5) {
-        softFailStreak = Math.max(0, softFailStreak - 1);
-        pageSize = Math.min(SYNC_PAGE_SIZE, pageSize * 2);
-        cleanStreak = 0;
-      }
-    }
+    // v6.12: a page that served rows on the first try clears the ERROR
+    // streak outright (it only governs genuine-error backoff). Deep-offset
+    // mode is deliberately NOT unwound here — LP's refusal is positional, so
+    // re-probing multi-row pages every page would just re-buy the waste. The
+    // next sweep starts fresh at StartIndex=1 with the full page size.
+    softFailStreak = 0;
     scanned += items.length;
 
     // v6.11: hash gate — ONE Supabase read per page (not per prospect) to
@@ -682,7 +692,18 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
       let payloadHash = null;
       if (SYNC_HASH_GATE_MODE !== 'off') {
         payloadHash = stableHash(lead);
-        if (priorHashes.get(cstIdStr) === payloadHash) {
+        // v6.12: diagnostics — separate "no stored hash yet" (gate CANNOT
+        // match) from "stored hash differs" (gate matched a real change).
+        // Without this split a low skip rate is unreadable: it looks the
+        // same whether hashes aren't populated or the data genuinely moved.
+        const prior = priorHashes.get(cstIdStr);
+        if (prior == null) {
+          gateAbsent++;
+        } else {
+          gateStored++;
+          if (prior === payloadHash) gateMatched++;
+        }
+        if (prior === payloadHash) {
           unchangedSkipped++;
           if (SYNC_HASH_GATE_MODE === 'enforce') return null;
         }
@@ -762,7 +783,8 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
         `${unchangedSkipped} unchanged-${SYNC_HASH_GATE_MODE === 'enforce' ? 'skipped' : 'flagged'} (gate=${SYNC_HASH_GATE_MODE}), ` +
         `${failed} failed (${timedOut} timeout), ` +
         `${denylistSkipped} denylist-skipped (${newlyDenylisted} newly denied), ` +
-        `pageSize=${pageSize}, scanned=${scanned}, elapsed ${elapsedMin}min`
+        `pageSize=${deepOffsetMode ? `1(deep@${deepOffsetSince})` : pageSize}, scanned=${scanned}, ` +
+        `rows/min=${(scanned / Math.max(0.1, (now - sweepStartedAt) / 60000)).toFixed(1)}, elapsed ${elapsedMin}min`
       );
       lastHeartbeat = now;
     }
@@ -780,6 +802,22 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
   }
   if (unchangedSkipped > 0) {
     console.log(`[Sync:Leads] Hash gate (${SYNC_HASH_GATE_MODE}): ${unchangedSkipped} unchanged prospects ${SYNC_HASH_GATE_MODE === 'enforce' ? 'skipped' : 'would skip'}`);
+  }
+  // v6.12: gate diagnostics. A low skip rate is only meaningful alongside
+  // how many prospects HAD a stored hash to compare against.
+  if (SYNC_HASH_GATE_MODE !== 'off' && (gateStored > 0 || gateAbsent > 0)) {
+    const matchPct = gateStored > 0 ? ((gateMatched / gateStored) * 100).toFixed(0) : 'n/a';
+    console.log(
+      `[Sync:Leads] Hash gate diagnostics — ${gateStored} with stored hash (${gateMatched} matched, ${matchPct}%), ` +
+      `${gateAbsent} without a stored hash (cannot match; first pass or mixed-hash rows)`
+    );
+  }
+  if (deepOffsetMode) {
+    const mins = (Date.now() - sweepStartedAt) / 60000;
+    console.log(
+      `[Sync:Leads] Deep-offset mode engaged at StartIndex=${deepOffsetSince} — ` +
+      `${scanned} rows scanned at 1 LP call/row, ${(scanned / Math.max(0.1, mins)).toFixed(1)} rows/min`
+    );
   }
   if (timedOut > 0) {
     console.warn(`[Sync:Leads] ${timedOut} prospects timed out (>${SYNC_PROSPECT_TIMEOUT_MS / 1000}s each) — counted as failed, sweep continued`);
