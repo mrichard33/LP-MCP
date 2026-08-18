@@ -64,6 +64,85 @@ function isContactNotFound(err) {
   return classifyGHLError(err).notFound;
 }
 
+// Default confirming read for verifySearchHit. Injectable so the verifier —
+// the guard that decides whether one person's LP identity may be written onto
+// another person's contact — is unit-testable without stubbing axios.
+async function defaultReadContact(contactId) {
+  const { data } = await ghlClient.get(`/contacts/${contactId}`);
+  return data?.contact || data || {};
+}
+
+/**
+ * 2026-08-18 — IDENTITY VERIFICATION FOR CONTACT SEARCH.
+ *
+ * searchGHLContact used to `return data?.contacts?.[0]` — GHL's TOP FUZZY HIT,
+ * with no check that it is the person we searched for. /contacts/?query= is a
+ * fuzzy search: the first row for a phone query is not guaranteed to carry
+ * that phone. This was strictly worse than the pre-2026-08-15 backstop bug,
+ * which at least rejected a hit whose phone visibly mismatched.
+ *
+ * The harm is not a bad read — matchToGHL() feeds this straight into
+ * lp_leads.ghl_contact_id, and ghl-field-sync then stamps lp_lead_id /
+ * lp_prospect_id onto whatever contact that points at. One wrong hit writes
+ * one person's LP identity onto another person's contact record.
+ *
+ * Verified live 2026-08-17: LP lead 566492 / prospect 173050 belongs to Wanda
+ * Mitchell (727-242-1300), yet three unrelated GHL contacts created that day
+ * all carried it — sec88eZHKCgAjTAlOCEw ("Guest Visitor", no phone),
+ * LMJisCHTqvIAu3FvtEgf (margoth mowers, 813-484-7756) and
+ * UiDhtcz0x1BpRjSG7POo (Randal Barger, 561-389-8065). None is Wanda. The same
+ * lead appeared against 5 distinct contacts in system_events on one day.
+ *
+ * This ALSO repairs a false premise downstream: link-corroboration.js takes
+ * matchToGHL's result as `verifiedGhlId` and upgrades link strength to
+ * PHONE_EMAIL_MATCH when it agrees with the stored link. Two unverified fuzzy
+ * hits agreeing does not make either one correct, so that layer could never
+ * compensate for this. After this change the name is finally accurate.
+ *
+ * FAIL CLOSED, the same rule as lp-contact-backstop.js pickPhoneMatch: an
+ * unverifiable match is not a match. An unlinked lead is recoverable — the
+ * next sync retries it. A mis-linked identity is not.
+ */
+export async function verifySearchHit(list, params, readContact = defaultReadContact) {
+  if (!Array.isArray(list) || list.length === 0) return null;
+
+  const wantPhone = params.phone ? normalizePhone(params.phone).slice(-10) : '';
+  const wantEmail = params.email ? String(params.email).trim().toLowerCase() : '';
+  if (wantPhone.length < 10 && !wantEmail) return null;
+
+  const phoneOf = (c) => normalizePhone(c?.phone).slice(-10);
+  const emailOf = (c) => String(c?.email || '').trim().toLowerCase();
+
+  const matches = (c) => (wantPhone.length === 10 && phoneOf(c) === wantPhone)
+    || (!!wantEmail && emailOf(c) === wantEmail);
+
+  // 1. The identifier is present in the projection and matches.
+  const exact = list.find(matches);
+  if (exact) return exact;
+
+  // 2. The projection omitted the field we searched on (GHL routinely does,
+  //    and every chat-widget "guest visitor" record has no phone). Confirm
+  //    against the full contact record before accepting. A mismatch OR a read
+  //    failure returns null.
+  const blank = (c) => (wantPhone.length === 10 ? !c?.phone : true)
+    && (wantEmail ? !c?.email : true);
+  const candidate = list.find((c) => c?.id && blank(c));
+  if (!candidate) {
+    console.warn(`[GHL] REJECTED unverified search hit for ${wantPhone || wantEmail} — ${list.length} result(s), none matching`);
+    return null;
+  }
+
+  try {
+    const full = await readContact(candidate.id);
+    if (matches(full)) return { ...candidate, ...full };
+    console.warn(`[GHL] REJECTED unverified search hit ${candidate.id} for ${wantPhone || wantEmail} (record: phone=${full?.phone || 'none'} email=${full?.email || 'none'}) — not linking`);
+    return null;
+  } catch (err) {
+    console.warn(`[GHL] verification read failed for ${candidate.id}: ${err.message} — refusing to link`);
+    return null;
+  }
+}
+
 export async function searchGHLContact(params) {
   if (ghlDisabled || !ghlClient) return null;
   try {
@@ -72,7 +151,8 @@ export async function searchGHLContact(params) {
       params: { query, locationId: process.env.GHL_LOCATION_ID },
     });
     ghlFailCount = 0;
-    const match = data?.contacts?.[0] || null;
+    const list = Array.isArray(data?.contacts) ? data.contacts : [];
+    const match = await verifySearchHit(list, params);
     if (match && !loggedFirstMatch) {
       loggedFirstMatch = true;
       console.log(`[GHL] First search hit: query="${query}" → contactId=${match.id}`);
