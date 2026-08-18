@@ -413,22 +413,35 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
   // brn_id. Null when the job carries no branch (market resolver → zip).
   const branchCode = (getField(job, 'brp_id', 'brn_id', 'BRP_ID', 'BrpId') || '').trim().toUpperCase() || null;
 
-  try {
-    await supabase.from('lp_jobs').upsert({
-      lp_job_id:       jobId,
-      lp_lead_id:      lpLeadId,
-      ghl_contact_id:  ghlContactId || null,
-      job_status:      getField(job, 'jobstatus', 'JobStatus', 'job_status'),
-      job_value:       jobValue,
-      branch_code:     branchCode,
-      rep_name:        getField(job, 'salesrepname', 'SalesRepName', 'rep_name'),
-      created_at_lp:   lpDateToEastern(getField(job, 'entrydate', 'EntryDate')),
-      updated_at_lp:   lpDateToEastern(getField(job, 'lastchangedon', 'LastChangedOn')),
-      synced_at:       new Date().toISOString(),
-      raw_lp_data:     job,
-    }, { onConflict: 'lp_job_id' });
-  } catch (err) {
-    console.warn(`[Sync] Job upsert failed for ${jobId}:`, err.message);
+  // The try/catch that used to wrap this was DEAD CODE: supabase-js resolves
+  // with { error }, it does not throw. A failed lp_jobs upsert was therefore
+  // silent, and the only visible symptom was the milestone bulk upsert failing
+  // its FK against a parent row that never landed — which then "fell back to
+  // per-row" and failed identically, losing every milestone for the job.
+  // Destructure the error, name the violated constraint, and stop: milestone
+  // work against a missing parent cannot succeed, so continuing only produces
+  // noise that masks this line.
+  const { error: jobErr } = await supabase.from('lp_jobs').upsert({
+    lp_job_id:       jobId,
+    lp_lead_id:      lpLeadId,
+    ghl_contact_id:  ghlContactId || null,
+    job_status:      getField(job, 'jobstatus', 'JobStatus', 'job_status'),
+    job_value:       jobValue,
+    branch_code:     branchCode,
+    rep_name:        getField(job, 'salesrepname', 'SalesRepName', 'rep_name'),
+    created_at_lp:   lpDateToEastern(getField(job, 'entrydate', 'EntryDate')),
+    updated_at_lp:   lpDateToEastern(getField(job, 'lastchangedon', 'LastChangedOn')),
+    synced_at:       new Date().toISOString(),
+    raw_lp_data:     job,
+  }, { onConflict: 'lp_job_id' });
+  if (jobErr) {
+    console.error(
+      `[Sync] Job upsert FAILED for job ${jobId} (lead ${lpLeadId}) — ` +
+      `code=${jobErr.code || 'none'} message="${jobErr.message}" ` +
+      `details="${jobErr.details || ''}" hint="${jobErr.hint || ''}" ` +
+      `— skipping milestones for this job (parent row absent)`
+    );
+    return { suppressedFires, suppressedUnlinked };
   }
 
   const milestones = getField(job, 'milestones', 'Milestones') || [];
