@@ -166,11 +166,37 @@ test('only a demonstrably live feed counts as a blind spot', () => {
 
 // ─── The arming gate still means what it says ───────────────────────
 
-test('arming still requires a scheduled (n8n-sourced) success', () => {
-  // Loosening this to "any success" would let a manual backfill arm a watch —
-  // the failure mode the gate was built for. The fix belongs upstream, in the
-  // workflows passing ?source=n8n, not in weakening the gate.
-  assert.match(WATCHDOG_CODE, /\.eq\('report_type', type\)\.eq\('status', 'success'\)\.eq\('source', 'n8n'\)/);
+test('arming still requires a scheduled (n8n-sourced) ingest', () => {
+  // WHAT THIS GUARD IS ACTUALLY FOR: stopping a MANUAL backfill from arming a
+  // watch — the 2026-08-05 failure mode. That protection lives entirely in the
+  // SOURCE dimension, and it is asserted unconditionally below.
+  //
+  // ⚠️ AMENDED 2026-08-18. This previously pinned the exact literal
+  //     .eq('report_type', type).eq('status', 'success').eq('source', 'n8n')
+  // and its comment said the fix belonged upstream in the workflows passing
+  // ?source=n8n. That advice is now stale on the evidence: the workflows DO
+  // pass the parameter (scorecard_ingest_log has 6 n8n-sourced rows for
+  // appt_stats_by_rep_source, latest 2026-08-18 11:00:47Z), and report 138
+  // still could not arm — because every one of those rows lands
+  // 'succeeded_with_warnings', never the bare 'success' the literal demanded.
+  // The upstream fix was made and did not help; the status literal was the
+  // second, independent blocker.
+  //
+  // So the guard now asserts the INVARIANT rather than one spelling of it:
+  //   1. the source gate is intact (this is the manual-backfill protection),
+  //   2. arming is still gated on status — not removed altogether,
+  //   3. the accepted statuses are ONLY the two success-shaped ones. A
+  //      'failed'/'duplicate'/'superseded' row must never arm a watch.
+  assert.match(WATCHDOG_CODE, /\.eq\('source', 'n8n'\)/,
+    'source gate removed — a manual backfill could arm a watch');
+  assert.match(WATCHDOG_CODE, /\.in\('status', ARMING_STATUSES\)/,
+    'arming is no longer gated on status at all');
+  assert.match(WATCHDOG_CODE, /const ARMING_STATUSES = \['success', 'succeeded_with_warnings'\];/,
+    'ARMING_STATUSES must accept exactly the two success-shaped statuses');
+  for (const forbidden of ['failed', 'duplicate', 'superseded', 'reaped']) {
+    assert.ok(!new RegExp(`ARMING_STATUSES = \\[[^\\]]*'${forbidden}'`).test(WATCHDOG_CODE),
+      `'${forbidden}' must never arm a watch`);
+  }
 });
 
 test('the ingest route still honours ?source=n8n, which is what arms a watch', () => {
