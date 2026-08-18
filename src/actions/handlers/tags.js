@@ -4,6 +4,42 @@
  * GHL contact tag mutation. Additive POST, never PUT (GHL overwrites on PUT).
  * Batch remove supported to avoid 429s on large removals (v3.2).
  *
+ * MVI v2.8 (2026-08-18) — Fallback values may not displace specific ones.
+ *   A tag that is a namespace's KNOWN FALLBACK (currently only
+ *   `active-entry:other`) is now a no-op when the contact already carries a
+ *   different tag in that namespace. Specific → fallback is blocked; fallback
+ *   → specific still swaps normally, and a contact with nothing in the
+ *   namespace still receives the fallback.
+ *
+ *   ROOT CAUSE this closes: `active-entry:other` is a FALLBACK, not a source.
+ *   sync-leads.js processProspect() ends every prospect sync by resolving the
+ *   NEWEST LP lead's source and calling executeAddTag(active-entry:<x>) —
+ *   toActiveEntryTag() maps an unresolved/unmapped LP source to
+ *   `active-entry:other`. Exclusivity then faithfully DELETEd the contact's
+ *   correct tag. A chatbot lead the agentic layer itself pushed into LP came
+ *   back on the next sync with a null `source` and demoted its own
+ *   attribution.
+ *
+ *   Measured 2026-08-18: of 558 contacts carrying entry:chatbot, 30 carried
+ *   active-entry:other, and 22 of those 30 had an LP lead resolving to
+ *   ghl_entry_tag='entry:other'. Reference contact C5DqkOUqoRvHT86dia4H —
+ *   agentic hygiene wrote active-entry:chatbot at 16:36:17Z (agent_actions
+ *   328152); lp_leads 568072 (lead_source NULL) synced at 17:57:55Z and the
+ *   tag was gone. 17 of the 30 occurred in the preceding 30 days, so this is
+ *   live and accruing, not historical.
+ *
+ *   WHY HERE AND NOT IN sync-leads.js: same rationale the v2.6 note below
+ *   gives for moving exclusivity into the executor. LP sync is the caller that
+ *   surfaced it, but any rule, workflow, script, or manual op that adds
+ *   `active-entry:other` demotes attribution the same way. Fixing the one
+ *   caller leaves the other callers to remember. This makes it an invariant.
+ *
+ *   ROUTING IMPACT: every routing decision in the system reads active-entry:*,
+ *   never entry:*. A demoted contact routes as "other" forever.
+ *
+ *   NOT A SUPPRESSION CHANGE — no DNC, stop-bot, or consent semantics are
+ *   touched. Behavior on a failed contact read is unchanged (blind add).
+ *
  * MVI v2.7 (2026-05-21) — Add canvass-subtype:* to exclusive prefixes.
  *   canvass-subtype:{door-to-door|event|sticky} is logically exclusive
  *   (one current canvass channel per contact). Re-entry through a
@@ -106,6 +142,23 @@ export const NAMESPACE_EXCLUSIVE_PREFIXES = [
   'bj:stage-',          // Victor Lopez incident 2026-07-04 — stage-4 + stage-5 stacked; one bj stage per contact
 ];
 
+// MVI v2.8 — the known FALLBACK value for an exclusive namespace: the tag a
+// resolver emits when it could not determine a real value. A fallback carries
+// no routing information, so it must never evict a specific sibling that does.
+//
+// Semantics (exclusivity still applies in every other direction):
+//   specific → fallback   NO-OP   (this guard; the specific tag survives)
+//   fallback → specific   SWAP    (normal exclusivity; the fallback is removed)
+//   nothing  → fallback   ADD     (a fallback beats an empty namespace)
+//   fallback → fallback   NO-OP   (already-present path)
+//
+// Keyed by namespace prefix so a second namespace can be added without
+// touching the guard. Add an entry ONLY for a value that is genuinely a
+// resolver's "I don't know" — not for a legitimate low-priority value.
+export const NAMESPACE_FALLBACK_VALUES = {
+  'active-entry:': 'active-entry:other',
+};
+
 export async function executeAddTag(action, context = {}) {
   const contactId = action.target_id;
   const tag = action.action_payload?.tag;
@@ -159,6 +212,30 @@ export async function executeAddTag(action, context = {}) {
         immutable: true,
         existing_in_namespace: existingInNamespace,
         reason: 'immutable namespace already populated',
+      };
+    }
+  }
+
+  // MVI v2.8 — FALLBACK GUARD: a namespace's fallback value must not evict a
+  // specific sibling. Runs BEFORE exclusivity so the DELETE never happens.
+  // Requires a successful read (currentTags non-null); on a read failure we
+  // keep the historical blind-add behavior rather than guessing.
+  if (namespace && currentTags && NAMESPACE_FALLBACK_VALUES[namespace] === tag) {
+    const specificSiblings = currentTags.filter(
+      (t) => t.startsWith(namespace) && t !== tag,
+    );
+    if (specificSiblings.length > 0) {
+      console.log(
+        `[ActionExecutor] fallback guard: contact=${contactId} ns=${namespace} keeping=[${specificSiblings.join(',')}] — skipping add of fallback ${tag} (rule: ${action.rule_applied || 'manual'})`
+      );
+      return {
+        action: 'no_op',
+        contact_id: contactId,
+        tag_skipped: tag,
+        namespace,
+        fallback_blocked: true,
+        existing_in_namespace: specificSiblings,
+        reason: 'fallback value would displace a specific tag in the same namespace',
       };
     }
   }
