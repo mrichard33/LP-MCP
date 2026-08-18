@@ -1,6 +1,29 @@
 /**
  * Five9 List Dispatch — src/five9/list-dispatch.js
  *
+ * ═══════════════════════════════════════════════════════════════════════
+ * BREAK-GLASS ONLY (architecture decision, Mark, 2026-08-18). Lead
+ * Perfection is the ONLY writer into the Five9 LP_ASAP list; the agentic
+ * system never inserts records into Five9 lists. The dialer feed
+ * (POST /api/Downloads/GetLeadsByCQDID) carries Cst_ID + Lds_ID — the LP
+ * identifiers that tie a dialed record back to the LP lead and drive the
+ * agent's preview screen pop and the AddCallHistory write-back. A record
+ * written directly through this module carries NO Cst_ID/Lds_ID: it is an
+ * orphan the agent cannot work, and because LP_ASAP is LP-fed, LP may
+ * match and overwrite it (observed live: agent_action 330019 wrote
+ * 2246501321 into LP_ASAP "successfully" and the list size never changed —
+ * Five9 UPDATED an existing LP-owned record). When a lead should be
+ * dialed, make the LP push correct and let LP feed LP_ASAP → DIAL ASAP;
+ * latency is not a reason to bypass LP (lead 567746: LP creation to dial
+ * in 4 seconds).
+ *
+ * This module's ONLY remaining legitimate role: LP unreachable AND a call
+ * already promised to a customer. Any use of it is an INCIDENT, not a
+ * workflow. Do not extend it, do not wire dispatchConfirmationCallback
+ * into the callback path, do not set FIVE9_DIRECT_DISPATCH, and do not
+ * build an auto-approve carve-out for five9_add_records_to_list.
+ * ═══════════════════════════════════════════════════════════════════════
+ *
  * Write-side Five9 Configuration Web Services (Admin SOAP) client for the
  * direct confirmation-callback dispatch. DORMANT unless FIVE9_DIRECT_DISPATCH
  * is explicitly 'true' AND both FIVE9_CALLBACK_LIST and

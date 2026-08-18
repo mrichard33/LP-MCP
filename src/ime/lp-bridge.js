@@ -29,5 +29,14 @@ export async function addLeadFromIME(woData, woId) {
     user1:          String(woId),    // store IME WO ID in user1 for later lookup
   };
 
+  // D5 path audit (2026-08-18): this path bypasses the addlead proxy's
+  // address gate and lp-client addLead's required-field validation. IME work
+  // orders carry a job address by construction; a blank one is upstream data
+  // loss — surface it loudly (LP never repairs a prospect from a later push).
+  const missingAddr = ['address1', 'city', 'state', 'zip'].filter((k) => !String(fields[k] || '').trim());
+  if (missingAddr.length) {
+    console.error(`[IME-LP] ⚠️ addlead for WO ${woId} missing address field(s) [${missingAddr.join(', ')}] — forwarding anyway (IME path is ungated); prospect will need UpdateProspectInfo backfill`);
+  }
+
   return lpPost('/api/Leads/AddLead', fields);
 }
