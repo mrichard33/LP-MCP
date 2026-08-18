@@ -66,6 +66,11 @@ import {
   registerAppointmentParityRoutes,
   startAppointmentParityScheduler,
 } from './jobs/appointment-parity-watchdog.js';
+// ─── LP Callback Re-queue Verification (promised-call closer) ────
+import {
+  registerLpRequeueVerifyRoutes,
+  startLpRequeueVerifyScheduler,
+} from './jobs/lp-requeue-verify.js';
 // ─── Objection Fall-Through Sweep (post-routing miss detection) ──
 import {
   registerFallthroughSweepRoutes,
@@ -966,6 +971,13 @@ registerGhostSweepRoutes(app);
 // is 'true'; reports the divergence classes and their findings.
 registerAppointmentParityRoutes(app);
 
+// ─── LP Callback Re-queue Verification ───────────────────────────
+// 2026-08-18 (handoff C4): POST /n8n/lp-requeue/verify-sweep — verify
+// every completed lp_callback_requeue became dialable (new lds issued via
+// LP's ~60s callback) or escalate a priority GroupMe inside the bounded
+// window. A promised call is never silently dropped.
+registerLpRequeueVerifyRoutes(app);
+
 // ─── Objection Fall-Through Sweep ────────────────────────────────
 // 2026-05-20 (Option 1 Step 4): detects intent.objection_detected
 // events where NO routing rule (new state classifier OR legacy Rules
@@ -1125,6 +1137,7 @@ app.listen(PORT, async () => {
   startPauseWorkflowSweepScheduler();
   startGhostSweepScheduler();
   startAppointmentParityScheduler();
+  startLpRequeueVerifyScheduler();
   startFallthroughSweepScheduler();
   startApprovalEscalationScheduler();
   startDataFreshnessMonitorScheduler();

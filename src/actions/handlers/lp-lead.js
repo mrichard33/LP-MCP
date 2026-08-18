@@ -319,6 +319,10 @@ export async function executeCreateLPLead(action) {
   // Conditional optional fields — only set when populated.
   if (email)     leadFields.email = email;
   if (proId)     leadFields.pro_id = proId;
+  // 2026-08-18 — re-queue marker passthrough (lp_callback_requeue delegates
+  // its no-LP-lead branch here). user1 is taken (GHL contact id / HLCID);
+  // user2 carries "requeue:callback:<ISO8601>", a zero-reporting-weight flag.
+  if (payload.user2) leadFields.user2 = String(payload.user2);
   if (adate && atime) {
     leadFields.apptdate = adate;             // REST naming → translates to adate for legacy
     leadFields.appttime = atime;             // REST naming → translates to atime for legacy

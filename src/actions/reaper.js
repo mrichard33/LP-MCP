@@ -94,6 +94,7 @@ const APPROVED_RECOVERY_AGE_MINUTES = 2;
 const NON_IDEMPOTENT_ACTION_TYPES = new Set([
   'create_task',        // posts GHL note + GroupMe notification
   'create_lp_lead',     // 2026-05-01 — posts to LP /api/Leads/LeadAdd
+  'lp_callback_requeue', // 2026-08-18 — posts to LP LeadAdd (re-queue); a stalled retry would double-add
 ]);
 
 // 2026-05-13 — Recoverable non-idempotent: requeue on stall within
