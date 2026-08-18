@@ -43,7 +43,7 @@ const CHUNK = 500; // per-batch cap for .in() lookups (well under PostgREST's ~1
 
 function newCounters() {
   return {
-    processed: 0, changed: 0,
+    processed: 0, changed: 0, written: 0,
     methodCounts: {},  // method → count (new resolution)
     marketCounts: {},  // market → count (AFTER)
     beforeCounts: {},  // market → count (currently stored)
@@ -66,10 +66,10 @@ async function resolveAndWriteBatch(leadRows, { zipMap, branchMap, dryRun, count
   const priorByLead = new Map();
   const { data: prior, error: pe } = await supabase
     .from('lp_lead_market_assignments')
-    .select('lead_id, resolved_market_code')
+    .select('lead_id, resolved_market_code, method, raw_brn_id, prospect_id')
     .in('lead_id', leadIds);
   if (pe) throw new Error(`prior assignment lookup failed: ${pe.message}`);
-  for (const r of prior || []) priorByLead.set(String(r.lead_id), r.resolved_market_code);
+  for (const r of prior || []) priorByLead.set(String(r.lead_id), r);
 
   const nowIso = new Date().toISOString();
   const rows = leadRows.map((r) => {
@@ -98,7 +98,8 @@ async function resolveAndWriteBatch(leadRows, { zipMap, branchMap, dryRun, count
 
     counters.methodCounts[res.method] = (counters.methodCounts[res.method] || 0) + 1;
     counters.marketCounts[res.market_code] = (counters.marketCounts[res.market_code] || 0) + 1;
-    const prev = priorByLead.get(lead) || '(none)';
+    const priorRow = priorByLead.get(lead) || null;
+    const prev = priorRow ? priorRow.resolved_market_code : '(none)';
     counters.beforeCounts[prev] = (counters.beforeCounts[prev] || 0) + 1;
     if (prev !== res.market_code) {
       counters.changed++;
@@ -106,7 +107,7 @@ async function resolveAndWriteBatch(leadRows, { zipMap, branchMap, dryRun, count
       counters.transitions[key] = (counters.transitions[key] || 0) + 1;
     }
 
-    return {
+    const next = {
       lead_id: lead,
       prospect_id: r.lp_prospect_id != null ? String(r.lp_prospect_id) : null,
       raw_brn_id: res.branch,               // populated for brn_map rows
@@ -115,13 +116,27 @@ async function resolveAndWriteBatch(leadRows, { zipMap, branchMap, dryRun, count
       zip: res.zip,
       resolved_at: nowIso,
     };
+    // Diff-writes: only rows whose ASSIGNMENT differs get written. The job
+    // previously rewrote the entire table nightly (232,272 rows on
+    // 2026-08-17) to change a handful. resolved_at now means "last time the
+    // assignment changed", not "last time the job ran".
+    next.__dirty = !priorRow
+      || priorRow.resolved_market_code !== next.resolved_market_code
+      || priorRow.method !== next.method
+      || (priorRow.raw_brn_id || null) !== (next.raw_brn_id || null)
+      || (priorRow.prospect_id || null) !== (next.prospect_id || null);
+    return next;
   });
 
   if (!dryRun) {
-    const { error: upErr } = await supabase
-      .from('lp_lead_market_assignments')
-      .upsert(rows, { onConflict: 'lead_id' });
-    if (upErr) throw new Error(upErr.message);
+    const dirty = rows.filter((x) => x.__dirty).map(({ __dirty, ...rest }) => rest);
+    if (dirty.length > 0) {
+      const { error: upErr } = await supabase
+        .from('lp_lead_market_assignments')
+        .upsert(dirty, { onConflict: 'lead_id' });
+      if (upErr) throw new Error(upErr.message);
+    }
+    counters.written += dirty.length;
   }
   counters.processed += leadRows.length;
 }
@@ -243,11 +258,11 @@ export async function computeMarketAssignments({ dryRun = false, scope = 'all', 
     return { success: false, dry_run: dryRun, scope, error: err.message, processed: counters.processed };
   }
 
-  if (logId) await syncLogComplete(logId, counters.processed, null);
+  if (logId) await syncLogComplete(logId, counters.written, null);
   const elapsed = Date.now() - startedAt;
-  console.log(`[MarketAssign] ${dryRun ? 'DRY-RUN ' : ''}scope=${scope} done processed=${counters.processed} changed=${counters.changed} methods=${JSON.stringify(counters.methodCounts)} elapsed=${elapsed}ms`);
+  console.log(`[MarketAssign] ${dryRun ? 'DRY-RUN ' : ''}scope=${scope} done processed=${counters.processed} changed=${counters.changed} written=${counters.written} methods=${JSON.stringify(counters.methodCounts)} elapsed=${elapsed}ms`);
   return {
-    success: true, dry_run: dryRun, scope, processed: counters.processed, changed: counters.changed,
+    success: true, dry_run: dryRun, scope, processed: counters.processed, changed: counters.changed, written: counters.written,
     method_counts: counters.methodCounts, market_counts: counters.marketCounts,
     before_counts: counters.beforeCounts, transitions: counters.transitions, elapsed_ms: elapsed,
   };
