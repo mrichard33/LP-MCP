@@ -634,7 +634,7 @@ export async function upsertLeadOnly(prospect) {
 // v10.0: Tag operations route through executor handlers (immutability +
 //        exclusivity enforced; manual stale-tag list removed).
 
-export async function processProspect(prospect, { skipGHL = false } = {}) {
+export async function processProspect(prospect, { skipGHL = false, payloadHash = null } = {}) {
   if (!loggedFirstKeys.has('prospect')) {
     loggedFirstKeys.add('prospect');
     console.log('[Sync] Prospect record keys:', Object.keys(prospect).join(', '));
@@ -658,7 +658,7 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
 
   const leads = allLeads;
   if (leads.length === 0) {
-    await upsertLeadFromFlat(prospect, ghlId);
+    await upsertLeadFromFlat(prospect, ghlId, payloadHash);
     return { calls: 0, notes: 0, jobs: 0, milestones: 0 };
   }
 
@@ -688,7 +688,7 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
 
     // ─── AGENTIC: Read existing state BEFORE upsert ──────────────
     const { data: existing } = await supabase.from('lp_leads')
-      .select('ghl_tag_applied, lp_day15_triggered, disposition_code, ghl_contact_id, ghl_link_source, updated_at_lp, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified, lp_branch_id, set_by_name, ever_confirmed, ever_sat, raw_lp_data')
+      .select('ghl_tag_applied, lp_day15_triggered, disposition_code, ghl_contact_id, ghl_link_source, updated_at_lp, demo_completed, appointment_set, closed_won, appointment_confirmed, appointment_verified, lp_branch_id, set_by_name, ever_confirmed, ever_sat, raw_lp_data, lp_payload_hash')
       .eq('lp_lead_id', lpLeadId).single();
 
     const previousDisposition = existing?.disposition_code || null;
@@ -786,6 +786,16 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
           .update({ ghl_link_source: resolved.linkSource })
           .eq('lp_lead_id', lpLeadId);
       }
+      // v6.11: stamp the sweep-computed prospect payload hash on the skip
+      // path too — the hash gate skips a prospect only when ALL its rows
+      // agree, so a stable lead must not be left holding a stale hash.
+      // One-time per hash value; no-op once stamped. Absent (null) on the
+      // webhook/full-sync paths, which leave the stored hash untouched.
+      if (payloadHash && existing?.lp_payload_hash !== payloadHash) {
+        await supabase.from('lp_leads')
+          .update({ lp_payload_hash: payloadHash })
+          .eq('lp_lead_id', lpLeadId);
+      }
       _skipStats.leads++;
       // Reliability backstop: a stable lead sitting at a past-Data disposition
       // that never emitted a transition still needs to reach LP_DISP_*. No-op
@@ -820,6 +830,10 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
 
     // v10.1: never overwrite an existing ghl_contact_id link with null.
     if (row.ghl_contact_id == null) delete row.ghl_contact_id;
+
+    // v6.11: hash gate substrate — key omitted when absent (webhook/full-
+    // sync callers pass no hash) so the stored column is left untouched.
+    if (payloadHash) row.lp_payload_hash = payloadHash;
 
     const { error: upsertErr } = await supabase.from('lp_leads').upsert(row, { onConflict: 'lp_lead_id' });
     if (upsertErr) throw new Error(`Lead upsert failed for ${lpLeadId}: ${upsertErr.message}`);
@@ -1033,7 +1047,9 @@ export async function processProspect(prospect, { skipGHL = false } = {}) {
 }
 
 // Fallback: upsert from flat data (when LP returns non-nested response)
-export async function upsertLeadFromFlat(lp, ghlId) {
+// v6.11: payloadHash (optional) is the sweep-computed prospect payload hash;
+// omitted by the full-sync caller so the stored hash stays untouched there.
+export async function upsertLeadFromFlat(lp, ghlId, payloadHash = null) {
   const lpLeadId = String(getField(lp, 'lds_id', 'id', 'LeadID', 'cst_id', 'ProspectID'));
   const lpProspectId = String(getField(lp, 'cst_id', 'CstID', 'ProspectID') || '');
 
@@ -1104,6 +1120,10 @@ export async function upsertLeadFromFlat(lp, ghlId) {
 
   // v10.1: never overwrite an existing ghl_contact_id link with null.
   if (flatRow.ghl_contact_id == null) delete flatRow.ghl_contact_id;
+
+  // v6.11: hash gate substrate — key omitted when absent so the stored
+  // column is left untouched on non-sweep paths.
+  if (payloadHash) flatRow.lp_payload_hash = payloadHash;
 
   await supabase.from('lp_leads').upsert(flatRow, { onConflict: 'lp_lead_id' });
 

@@ -134,6 +134,7 @@
 // This file contains only: fullSync, incrementalSync, handleWebhookEvent,
 // scheduler, and process signal handlers.
 
+import { createHash } from 'node:crypto';
 import supabase from './supabase.js';
 import { getToken, startTokenRefreshSchedule } from './token-manager.js';
 import { getLeadData, getJobStatusChanges, getLead, testConnection } from './lp-client.js';
@@ -206,6 +207,45 @@ const SYNC_PAGE_SIZE = Math.min(200, parseInt(process.env.SYNC_PAGE_SIZE || '50'
 // finish in 1-3s, so this only fires on pathological cases. Override:
 // SYNC_PROSPECT_TIMEOUT_SEC=N.
 const SYNC_PROSPECT_TIMEOUT_MS = parseInt(process.env.SYNC_PROSPECT_TIMEOUT_SEC || '60', 10) * 1000;
+
+// v6.11: Hash gate. Skip processProspect entirely when the LP payload is
+// byte-identical to what we last processed (sha256 over sorted-key JSON,
+// stored on lp_leads.lp_payload_hash). GetLead options=261120 returns the
+// FULL prospect including embedded notes/calls/jobs/milestones, so a
+// matching hash proves the lead AND its children are unchanged. Modes:
+//   off     — legacy behavior, no hashing
+//   shadow  — compute + persist hashes, log would-skip counts, process everything
+//   enforce — skip unchanged prospects (skips do NOT consume the leads cap)
+// Default shadow: the first pass populates hashes; flip to enforce via
+// Railway env once shadow counts look sane.
+const SYNC_HASH_GATE_MODE = (process.env.SYNC_HASH_GATE_MODE || 'shadow').toLowerCase();
+
+// v6.11: Scan ceiling — bounds prospects FETCHED per sweep (changed or not)
+// so an enforce-mode sweep over a mostly-unchanged window can't page forever.
+// Distinct from MAX_INCREMENTAL_LEADS, which caps CHANGED leads processed.
+const MAX_SCANNED_LEADS = parseInt(process.env.MAX_SCANNED_LEADS || '5000', 10);
+
+// v6.11: Soft-fail backoff. When LP returns an empty page where rows exist
+// (load-induced soft-fail, proved live 2026-07-22 and again 2026-08-17) or a
+// page request errors, WAIT before retrying — the instant probe/retry storm
+// (3 LP calls per prospect, measured 98 leads in 16.8min) is itself load.
+const SYNC_SOFTFAIL_BACKOFF_BASE_MS = parseInt(process.env.SYNC_SOFTFAIL_BACKOFF_BASE_MS || '2000', 10);
+const SYNC_SOFTFAIL_BACKOFF_MAX_MS = parseInt(process.env.SYNC_SOFTFAIL_BACKOFF_MAX_MS || '30000', 10);
+
+// ─── Payload Hash (v6.11) ─────────────────────────────────────────
+//
+// Deterministic hash of an LP payload: JSON.stringify with recursively
+// sorted keys so key-order jitter from LP can't fake a change.
+function stableHash(obj) {
+  const sortKeys = (v) => {
+    if (Array.isArray(v)) return v.map(sortKeys);
+    if (v && typeof v === 'object') {
+      return Object.keys(v).sort().reduce((acc, k) => { acc[k] = sortKeys(v[k]); return acc; }, {});
+    }
+    return v;
+  };
+  return createHash('sha256').update(JSON.stringify(sortKeys(obj))).digest('hex');
+}
 
 // ─── Bounded-Parallel Helper (v6.5) ──────────────────────────────
 //
@@ -473,6 +513,12 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
   let startIndex = 1;
   const sweepStartedAt = Date.now();
   let lastHeartbeat = sweepStartedAt;
+  // v6.11: hash-gate + soft-fail state
+  let unchangedSkipped = 0;      // enforce: skipped; shadow: would-skip
+  let scanned = 0;               // prospects fetched this sweep (changed or not)
+  let softFailStreak = 0;        // consecutive soft-fail pages
+  let cleanStreak = 0;           // consecutive clean first-try pages
+  let pageSize = SYNC_PAGE_SIZE; // adaptive: shrinks on soft-fail, recovers on clean pages
 
   // v6.10: Load active deny-list once at sweep start. New denylist
   // transitions added mid-sweep (via recordProspectFailure return) are
@@ -485,21 +531,26 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
   }
 
   let truncatedAt = null;
-  while (counts.leads < maxLeads) {
+  while (counts.leads < maxLeads && scanned < MAX_SCANNED_LEADS) {
     let leads;
     try {
       leads = await getLeadData({
         startdate: since, enddate: today,
-        PageSize: SYNC_PAGE_SIZE, StartIndex: startIndex,
+        PageSize: pageSize, StartIndex: startIndex,
       });
     } catch (err) {
-      // A failed page means TRUNCATION, not completion. Retry once at a
-      // quarter of the page size (lighter response) before giving up loudly.
-      console.error(`[Sync:Leads] GetLeadData page StartIndex=${startIndex} failed: ${err.message} — retrying smaller`);
+      // A failed page means TRUNCATION, not completion. v6.11: back off,
+      // THEN retry once at a quarter of the page size — instant retries
+      // against an LP that is already failing under load are themselves load.
+      softFailStreak++;
+      cleanStreak = 0;
+      const failBackoff = Math.min(SYNC_SOFTFAIL_BACKOFF_MAX_MS, SYNC_SOFTFAIL_BACKOFF_BASE_MS * 2 ** Math.min(softFailStreak - 1, 4));
+      console.error(`[Sync:Leads] GetLeadData page StartIndex=${startIndex} failed: ${err.message} — backing off ${failBackoff}ms, retrying smaller`);
+      await sleep(failBackoff);
       try {
         leads = await getLeadData({
           startdate: since, enddate: today,
-          PageSize: Math.max(10, Math.floor(SYNC_PAGE_SIZE / 4)), StartIndex: startIndex,
+          PageSize: Math.max(10, Math.floor(pageSize / 4)), StartIndex: startIndex,
         });
       } catch (err2) {
         truncatedAt = startIndex;
@@ -519,16 +570,65 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
           startdate: since, enddate: today, PageSize: 1, StartIndex: startIndex,
         }));
         if (probe.length === 0) break; // genuinely the end
-        console.warn(`[Sync:Leads] empty page at StartIndex=${startIndex} but probe found rows — retrying smaller`);
+        // v6.11: LP soft-failed under load — back off before the retry and
+        // shrink the WORKING page size for the rest of the sweep, instead of
+        // paying a doomed full-size call on every subsequent page (the
+        // measured 3-calls-per-prospect crawl).
+        softFailStreak++;
+        cleanStreak = 0;
+        pageSize = Math.max(10, Math.floor(pageSize / 2));
+        const backoff = Math.min(SYNC_SOFTFAIL_BACKOFF_MAX_MS, SYNC_SOFTFAIL_BACKOFF_BASE_MS * 2 ** Math.min(softFailStreak - 1, 4));
+        console.warn(`[Sync:Leads] empty page at StartIndex=${startIndex} but probe found rows — backing off ${backoff}ms, pageSize now ${pageSize}`);
+        await sleep(backoff);
         items = extractArray(await getLeadData({
           startdate: since, enddate: today,
-          PageSize: Math.max(10, Math.floor(SYNC_PAGE_SIZE / 4)), StartIndex: startIndex,
+          PageSize: pageSize, StartIndex: startIndex,
         }));
         if (items.length === 0) items = probe; // worst case: advance one row at a time
       } catch (err) {
         truncatedAt = startIndex;
         console.error(`[Sync:Leads] empty-page verification failed at StartIndex=${startIndex} — sweep TRUNCATED: ${err.message}`);
         break;
+      }
+    }
+
+    // v6.11: page-size recovery — 5 consecutive clean first-try pages grow
+    // the working size back toward SYNC_PAGE_SIZE and decay the fail streak.
+    if (softFailStreak > 0) {
+      cleanStreak++;
+      if (cleanStreak >= 5) {
+        softFailStreak = Math.max(0, softFailStreak - 1);
+        pageSize = Math.min(SYNC_PAGE_SIZE, pageSize * 2);
+        cleanStreak = 0;
+      }
+    }
+    scanned += items.length;
+
+    // v6.11: hash gate — ONE Supabase read per page (not per prospect) to
+    // load stored payload hashes for this page's cstIds. Fails open: a
+    // prefetch error means the page processes ungated.
+    //
+    // Keyed on lp_prospect_id, NOT lp_lead_id: lp_leads is one row per LEAD
+    // (lp_lead_id = lds_id; only the zero-lead flat path falls back to the
+    // cst_id), so a prospect maps to several rows. The prospect counts as
+    // hashed only when ALL its rows carry the same hash — a mixed set means
+    // an interrupted prior run and must read as "changed" (fail-safe
+    // reprocess, never a wrongful skip).
+    const priorHashes = new Map();
+    if (SYNC_HASH_GATE_MODE !== 'off') {
+      try {
+        const ids = items.map(l => String(l.cst_id || l.CstID || l.prospectid || l.ProspectID)).filter(Boolean);
+        const { data: hashRows, error: hashErr } = await supabase.from('lp_leads')
+          .select('lp_prospect_id, lp_payload_hash').in('lp_prospect_id', ids);
+        if (hashErr) throw new Error(hashErr.message);
+        for (const h of hashRows || []) {
+          const pid = String(h.lp_prospect_id);
+          if (!priorHashes.has(pid)) priorHashes.set(pid, h.lp_payload_hash);
+          else if (priorHashes.get(pid) !== h.lp_payload_hash) priorHashes.set(pid, null);
+        }
+      } catch (e) {
+        priorHashes.clear();
+        console.warn(`[Sync:Leads] hash prefetch failed (${e.message}) — page processes ungated`);
       }
     }
 
@@ -575,9 +675,22 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
         return null;
       }
 
+      // v6.11: hash gate. Identical payload = nothing changed on the lead
+      // OR its embedded children. shadow: count and fall through. enforce:
+      // skip entirely — zero LP/GHL/Supabase work, and the skip does NOT
+      // consume MAX_INCREMENTAL_LEADS (only changed leads count).
+      let payloadHash = null;
+      if (SYNC_HASH_GATE_MODE !== 'off') {
+        payloadHash = stableHash(lead);
+        if (priorHashes.get(cstIdStr) === payloadHash) {
+          unchangedSkipped++;
+          if (SYNC_HASH_GATE_MODE === 'enforce') return null;
+        }
+      }
+
       try {
         const result = await withProspectTimeout(
-          processProspect(lead),
+          processProspect(lead, { payloadHash }),
           SYNC_PROSPECT_TIMEOUT_MS,
           `cstId=${cstId}`,
         );
@@ -646,9 +759,10 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
       const elapsedMin = ((now - sweepStartedAt) / 60000).toFixed(1);
       console.log(
         `[Sync:Leads] Heartbeat — ${counts.leads} leads processed, ` +
+        `${unchangedSkipped} unchanged-${SYNC_HASH_GATE_MODE === 'enforce' ? 'skipped' : 'flagged'} (gate=${SYNC_HASH_GATE_MODE}), ` +
         `${failed} failed (${timedOut} timeout), ` +
         `${denylistSkipped} denylist-skipped (${newlyDenylisted} newly denied), ` +
-        `elapsed ${elapsedMin}min`
+        `pageSize=${pageSize}, scanned=${scanned}, elapsed ${elapsedMin}min`
       );
       lastHeartbeat = now;
     }
@@ -661,6 +775,12 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
   if (hitCap) {
     console.log(`[Sync:Leads] Hit MAX_INCREMENTAL_LEADS cap (${maxLeads}) — stopping. Will continue in next run.`);
   }
+  if (scanned >= MAX_SCANNED_LEADS) {
+    console.log(`[Sync:Leads] Hit MAX_SCANNED_LEADS ceiling (${MAX_SCANNED_LEADS}) — stopping. Window continues next run.`);
+  }
+  if (unchangedSkipped > 0) {
+    console.log(`[Sync:Leads] Hash gate (${SYNC_HASH_GATE_MODE}): ${unchangedSkipped} unchanged prospects ${SYNC_HASH_GATE_MODE === 'enforce' ? 'skipped' : 'would skip'}`);
+  }
   if (timedOut > 0) {
     console.warn(`[Sync:Leads] ${timedOut} prospects timed out (>${SYNC_PROSPECT_TIMEOUT_MS / 1000}s each) — counted as failed, sweep continued`);
   }
@@ -670,7 +790,7 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
       `${newlyDenylisted} newly denylisted this sweep (total active denylist size now: ${denylistSet.size})`
     );
   }
-  return { counts, failed, hitCap, denylistSkipped, newlyDenylisted, truncatedAt };
+  return { counts, failed, hitCap, denylistSkipped, newlyDenylisted, unchangedSkipped, scanned, truncatedAt };
 }
 
 async function runJobChangesSweep(since, today, logIds) {
@@ -802,6 +922,7 @@ export async function incrementalSync() {
     // v6.10: deny-list counters surfaced to the orchestrator log.
     let denylistSkipped = 0;
     let newlyDenylisted = 0;
+    let unchangedSkipped = 0;
 
     if (leadsRes.status === 'fulfilled' && leadsRes.value) {
       const r = leadsRes.value;
@@ -815,6 +936,7 @@ export async function incrementalSync() {
       hitCap = r.hitCap;
       denylistSkipped = r.denylistSkipped || 0;
       newlyDenylisted = r.newlyDenylisted || 0;
+      unchangedSkipped = r.unchangedSkipped || 0;
     } else {
       const reason = leadsRes.reason?.message || 'leadsSweep failed';
       // v6.6: Log partial-progress counts even though the sweep didn't
@@ -900,7 +1022,7 @@ export async function incrementalSync() {
     // v6.10: append deny-list summary to the final orchestrator log
     // line. Always shown so a zero-count sweep also makes it visible
     // that the gate ran.
-    const denylistSummary = ` | deny-list: ${denylistSkipped} skipped, ${newlyDenylisted} newly denied`;
+    const denylistSummary = ` | deny-list: ${denylistSkipped} skipped, ${newlyDenylisted} newly denied | hash-gate(${SYNC_HASH_GATE_MODE}): ${unchangedSkipped} unchanged`;
     console.log(`[Sync] Incremental sync complete — ${counts.leads} leads, ${counts.calls} calls, ${counts.notes} notes, ${counts.jobs} jobs, ${failed} failed${hitCap ? ' (CAPPED)' : ''}${denylistSummary} (${Math.round(duration / 1000)}s)`);
     return counts;
 

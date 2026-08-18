@@ -752,6 +752,19 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] five9 config snapshot schema FAILED (snapshot job depends on it — apply sql/055 manually):', err.message);
   }
+
+  // Hash gate substrate (sql/059 — the file is the source of truth; this
+  // mirror guarantees the column exists before the first gated sweep, whose
+  // hash prefetch and lead upserts reference lp_payload_hash). The sweep
+  // fails open without it, but a fresh deploy should self-heal rather than
+  // run permanently ungated.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`ALTER TABLE lp_leads ADD COLUMN IF NOT EXISTS lp_payload_hash text;`);
+    console.log('[Migration] sync hash gate substrate (sql/059) ready');
+  } catch (err) {
+    console.error('[Migration] sync hash gate substrate FAILED (hash gate runs ungated — apply sql/059 manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
