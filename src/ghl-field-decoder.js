@@ -48,6 +48,32 @@
 //   other Nurture-prefixed fields (nurture_pillar, nurture_topic_name,
 //   nurture_week) would have suggested. Documented here so future
 //   investigators don't re-derive the wrong guess from the pattern.
+//
+// v1.5 (2026-08-18) — Corrected jv6c5Lie982duxVX5TNv. It was labelled
+//   "Preferred Contact Method" (category 'project'); GHL's own workflow
+//   builder renders it as "Incoming Message Channel". Moved to category
+//   'source' because it records the surface a lead ARRIVED on, not a
+//   preference the lead expressed.
+//
+//   Confirmed two ways: (1) the condition picker on workflow
+//   6cd679ff-a8a0-4c22-9948-83c38a41e157 (B.T-AB Tagged Agentic Active)
+//   displays the field name directly; (2) the live value distribution is
+//   a list of inbound channels, not preferences — Live Chat 732, SMS 580,
+//   Chat Widget 132, Instagram DM 27, Facebook Messenger 25.
+//
+//   This mislabel had a downstream consumer: agentic-lead-notes.js was
+//   rendering "prefers <value>" into the LP setter brief, telling the call
+//   floor that 580 SMS-origin leads preferred not to be phoned. Fixed in
+//   the same branch.
+//
+//   NO genuine "Preferred Contact Method" field exists under another ID as
+//   of this date. If one is created, add a NEW entry — do not repurpose
+//   this one.
+//
+//   STANDING LESSON: this entry was a guess that survived three revisions
+//   because nothing ever compared it to the GHL UI. Any entry here without
+//   a `notes` line citing where the name came from should be treated as
+//   unverified until checked against Settings → Custom Fields.
 
 const GHL_FIELD_DECODER = {
 
@@ -94,7 +120,6 @@ const GHL_FIELD_DECODER = {
   'YWhoVixgPtvEDzSXcMpJ': { name: 'Window Count (alt) / Gross Sale Amount', category: 'project', notes: 'CONFLICT: skill says Window Count alt; ghl-field-map.js says Gross Sale Amount. Verify.' },
   'L0mb4tIiSBYYLn5fyprZ': { name: 'Spouse/Partner Name',     category: 'project' },
   '3vQsf4lNxL0LrDpgHY9Q': { name: 'Language',                category: 'project' },
-  'jv6c5Lie982duxVX5TNv': { name: 'Preferred Contact Method', category: 'project' },
 
   // ─── DEMO / SALE ────────────────────────────────────────────────
   'j84cNc7Rk6BkiYdZwuOO': { name: 'LP Demo Completed',       category: 'demo_sale' },
@@ -120,6 +145,19 @@ const GHL_FIELD_DECODER = {
   '7Vda0K4fV1pgv536QbnA': { name: 'First Source Subcategory', category: 'source' },
   'OG40TXRFB8pnHmRxKW0T': { name: 'First Source Detail',     category: 'source' },
   'VzT4gnmdqmoAblLugjEu': { name: 'First Source Widget',     category: 'source' },
+  // v1.5 (2026-08-18) — was mislabelled "Preferred Contact Method" (category
+  // 'project') from v1.0 through v1.4. GHL's workflow-builder condition picker
+  // renders it as "Incoming Message Channel"; the value set is a list of inbound
+  // surfaces, not stated preferences. Do NOT render this as a preference to reps
+  // or setters — it says where the lead came in, nothing about how they want to
+  // be reached. NOTE: two writers stamp the same web surface differently
+  // ("Live Chat" 732 vs "Chat Widget" 132), and both are still active as of
+  // 2026-08-18, so any equality check on this field needs to cover both. They
+  // are NOT interchangeable downstream: "Live Chat" contacts hold a live widget
+  // session (88% have inbound TYPE_LIVE_CHAT messages, 29% have a phone), while
+  // "Chat Widget" is a form capture (0% have live-chat messages, 98% have a
+  // phone). Verified against the messages table 2026-08-18.
+  'jv6c5Lie982duxVX5TNv': { name: 'Incoming Message Channel', category: 'source', notes: 'Channel the lead ARRIVED on — not a stated preference. Name read directly from the GHL workflow-builder condition picker 2026-08-18. Values seen live: Live Chat, SMS, Chat Widget, Instagram DM, Facebook Messenger.' },
 
   // ─── ENGAGEMENT / RECENCY ──────────────────────────────────────
   '6wVFsNmhO44BbAFycdQz': { name: 'LP Last Contact',         category: 'engagement' },
