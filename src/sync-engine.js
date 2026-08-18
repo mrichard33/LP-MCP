@@ -232,6 +232,67 @@ const MAX_SCANNED_LEADS = parseInt(process.env.MAX_SCANNED_LEADS || '5000', 10);
 const SYNC_SOFTFAIL_BACKOFF_BASE_MS = parseInt(process.env.SYNC_SOFTFAIL_BACKOFF_BASE_MS || '2000', 10);
 const SYNC_SOFTFAIL_BACKOFF_MAX_MS = parseInt(process.env.SYNC_SOFTFAIL_BACKOFF_MAX_MS || '30000', 10);
 
+// v6.13: Sync window cursor. The incremental window's start was truncated to
+// a DATE (`.slice(0, 10)`), so every run re-scanned everything changed since
+// MIDNIGHT — a window that grows all day (219 rows by 20:00Z on 2026-08-18)
+// and makes each sweep slower than the last. #709 made re-scanned rows cheap;
+// it did not stop the re-scan. Modes:
+//   date      — legacy midnight-truncated window
+//   timestamp — real timestamp cursor (see the overlap note below)
+// Default `date`: LP's tolerance for a time component in `startdate` is
+// UNVERIFIED (no call site in this repo has ever sent one), so the new path
+// ships dark and is probed at runtime before use.
+const SYNC_WINDOW_MODE = (process.env.SYNC_WINDOW_MODE || 'date').toLowerCase();
+
+// v6.13: MANDATORY overlap, and the reason the cursor is not exact.
+//
+// getLastSyncTimestamp() returns the last successful run's completed_at, but a
+// sweep READS across [started_at .. completed_at] — ~22min at present. A lead
+// changed while the sweep was already past its page is invisible to that run,
+// so a cursor set exactly at completed_at would skip it FOREVER. The date
+// truncation currently masks this (everything since midnight is re-scanned);
+// narrowing the window exposes it. The overlap must therefore exceed the
+// longest expected sweep. Default 60min > the 22.5min observed 2026-08-18.
+// Even at 60min this is a ~20x reduction against a 20-hour end-of-day window.
+const SYNC_WINDOW_OVERLAP_MIN = parseInt(process.env.SYNC_WINDOW_OVERLAP_MIN || '60', 10);
+
+// Wire format for the timestamped startdate. LP is a .NET-style API and its
+// accepted format is unverified from this codebase; 'space' sends
+// "YYYY-MM-DD HH:mm:ss", 'iso' sends "YYYY-MM-DDTHH:mm:ss". Either way the
+// value is probed before the run commits to it.
+const SYNC_WINDOW_TS_FORMAT = (process.env.SYNC_WINDOW_TS_FORMAT || 'space').toLowerCase();
+
+function formatLpWindowStart(date) {
+  const iso = date.toISOString().slice(0, 19); // YYYY-MM-DDTHH:mm:ss
+  return SYNC_WINDOW_TS_FORMAT === 'iso' ? iso : iso.replace('T', ' ');
+}
+
+// Build the window start. Returns the legacy date string unless timestamp mode
+// is on AND LP accepts the timestamped value — verified with ONE cheap 1-row
+// call before the sweeps start. Fails safe: any error falls back to the date
+// window for this run, so an LP that rejects the format degrades to today's
+// behavior instead of failing the sync.
+async function resolveWindowStart(lastSyncTime, enddate) {
+  const dateSince = lastSyncTime.toISOString().slice(0, 10);
+  if (SYNC_WINDOW_MODE !== 'timestamp') return { since: dateSince, kind: 'date' };
+
+  const cursor = new Date(lastSyncTime.getTime() - SYNC_WINDOW_OVERLAP_MIN * 60000);
+  // Never let the cursor run past the legacy start — the date window is the
+  // conservative bound, and widening it here would be a regression.
+  if (cursor.toISOString().slice(0, 10) < dateSince) {
+    console.warn(`[Sync] Window cursor ${cursor.toISOString()} predates the date window ${dateSince} (overlap ${SYNC_WINDOW_OVERLAP_MIN}min) — using the date window`);
+    return { since: dateSince, kind: 'date' };
+  }
+  const tsSince = formatLpWindowStart(cursor);
+  try {
+    await getLeadData({ startdate: tsSince, enddate, PageSize: 1, StartIndex: 1 });
+    return { since: tsSince, kind: 'timestamp' };
+  } catch (err) {
+    console.error(`[Sync] LP rejected timestamped startdate "${tsSince}" (${err.message}) — falling back to the date window ${dateSince} for this run`);
+    return { since: dateSince, kind: 'date' };
+  }
+}
+
 // ─── Payload Hash (v6.11) ─────────────────────────────────────────
 //
 // Deterministic hash of an LP payload: JSON.stringify with recursively
@@ -929,10 +990,12 @@ export async function incrementalSync() {
     }
 
     const logIds = await syncLogStartAll('incremental', ['leads', 'calls', 'notes', 'jobs', 'milestones', 'activities']);
-    const since = lastSyncTime.toISOString().slice(0, 10);
     const today = new Date().toISOString().slice(0, 10);
+    // v6.13: real timestamp cursor when enabled and accepted by LP; the
+    // legacy midnight-truncated date otherwise.
+    const { since, kind: windowKind } = await resolveWindowStart(lastSyncTime, today);
 
-    console.log(`[Sync] Incremental window: ${since} → ${today} (max ${MAX_INCREMENTAL_LEADS} leads, prospect concurrency ${SYNC_PROSPECT_CONCURRENCY}, per-sweep timeout ${SYNC_PER_SWEEP_TIMEOUT_MS / 60000}min, per-prospect timeout ${SYNC_PROSPECT_TIMEOUT_MS / 1000}s)`);
+    console.log(`[Sync] Incremental window: ${since} → ${today} [${windowKind}${windowKind === 'timestamp' ? `, overlap ${SYNC_WINDOW_OVERLAP_MIN}min` : ''}] (max ${MAX_INCREMENTAL_LEADS} leads, prospect concurrency ${SYNC_PROSPECT_CONCURRENCY}, per-sweep timeout ${SYNC_PER_SWEEP_TIMEOUT_MS / 60000}min, per-prospect timeout ${SYNC_PROSPECT_TIMEOUT_MS / 1000}s)`);
 
     // v6.5: Run leads + job-changes in parallel, each with its own
     // per-sweep timeout. Promise.allSettled isolates failures so one
