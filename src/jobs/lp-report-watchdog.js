@@ -75,10 +75,17 @@ const WATCHED = [
 // source 'n8n') — manual/backfill sources never arm the watch.
 //
 // That gate is right in intent and was unreachable in practice: the CSV route
-// defaults `source` to 'manual' (lp-csv-ingest.js) and the n8n workflows post
+// defaults `source` to 'manual' (lp-csv-ingest.js) and the n8n workflows posted
 // without `?source=n8n`, so after the CSV cutover NOTHING could arm. The
 // workflows now pass the parameter; `reportUnarmed` below exists so that if
 // they ever stop, the blind spot announces itself instead of failing open.
+//
+// 2026-08-18 — a SECOND, separate reason a type could not arm, found after the
+// parameter fix landed: the arm check matched status 'success' exactly, while
+// report 138 lands 'succeeded_with_warnings' on every n8n ingest. The source
+// parameter was never the blocker for 138; the status literal was. See
+// ARMING_STATUSES at the arm check below. Do not "fix" this by suppressing the
+// warnings — the warning is the delta signal.
 const UNARMED_SENTINEL = '__unarmed__';
 /** An unarmed type is only worth reporting if it is demonstrably still alive. */
 const RECENTLY_ACTIVE_DAYS = 7;
@@ -130,10 +137,19 @@ export async function checkLpReportFreshness({ alert = true } = {}) {
 
   for (const { type, label, schedule } of WATCHED) {
     // Armed only after the first scheduled (n8n-sourced) success — see header.
+    // ARMING STATUSES: 'succeeded_with_warnings' counts. Report 138
+    // (appt_stats_by_rep_source) has posted with ?source=n8n since the workflow
+    // fix — 6 rows, most recently 2026-08-18 11:00:47Z — but EVERY one lands
+    // 'succeeded_with_warnings', never the bare 'success' the other four watched
+    // types produce. An exact .eq('status','success') therefore could never arm
+    // it, and the missing-report alarm for a TIER 1 report stayed silent while
+    // the feed itself was healthy. The warning is a real signal and is
+    // deliberately NOT suppressed elsewhere; it just must not gate the guard.
+    const ARMING_STATUSES = ['success', 'succeeded_with_warnings'];
     const { data: armed, error: armErr } = await supabase
       .from('scorecard_ingest_log')
       .select('id')
-      .eq('report_type', type).eq('status', 'success').eq('source', 'n8n')
+      .eq('report_type', type).in('status', ARMING_STATUSES).eq('source', 'n8n')
       .limit(1).maybeSingle();
     if (armErr) {
       console.error('[LPReportWatchdog] arm check failed:', armErr.message);
