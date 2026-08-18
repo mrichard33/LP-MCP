@@ -247,6 +247,7 @@ import { buildNotificationEnrichment, buildRichNotification } from './actions/en
 // 2026-07-03 rebuild (Steve Nkzhm incident) — channel/identity inheritance,
 // AI-disclosure hard guard, per-contact supersession check.
 import { resolveReplyContext, guardDisclosure, fetchRecentMessages, channelOfMessage } from './agentic/reply-sender.js';
+import { guardOutboundPhones } from './outbound-phone-guard.js';
 // 2026-07-08 — CALLBACK resolution + HDL.3 customer-status probe
 // (closes the sql/017/018 gap; see src/knowledge/callback-resolver.js).
 import {
@@ -1417,6 +1418,66 @@ function decidePrimaryPath(channel) {
  *   'conversations_api_fallback'    — webhook primary failed, Conv API saved it
  */
 async function sendWithFallback(contactId, message, channel, subject, action, opts = {}) {
+  // ── Outbound phone guard (2026-08-18 — invented-phone incident) ────────
+  // A LAYER3_DISPATCH reply told a customer the main office line is
+  // (954) 282-0505 — a number that exists nowhere in any repo and is not
+  // among Five9's assigned DNIS. This is the LAST gate before the POST, on
+  // EVERY customer-facing outbound through this module: the body may only
+  // contain phone numbers explicitly supplied to this send (the resolved
+  // service phone via opts.allowedPhones, the sending line, the contact's
+  // own number). Anything else refuses the send — a hallucinated number
+  // reaching a customer is worse than silence. Guard internals fail OPEN
+  // (an exception in the guard itself never blocks a send); a positive
+  // match fails CLOSED. LP_PHONE_GUARD_MODE: enforce (default) | shadow
+  // (alert but send — rollback lever) | off.
+  const phoneGuardMode = String(process.env.LP_PHONE_GUARD_MODE || 'enforce').toLowerCase();
+  if (phoneGuardMode !== 'off') {
+    let phoneGuard = null;
+    try {
+      const allowed = [
+        ...(Array.isArray(opts.allowedPhones) ? opts.allowedPhones : []),
+        opts.fromNumber || null,
+      ];
+      phoneGuard = guardOutboundPhones(message, allowed);
+    } catch (guardErr) {
+      console.warn(`[SendMessage] phone guard threw for ${contactId} (fail-open): ${guardErr.message}`);
+    }
+    if (phoneGuard?.blocked) {
+      const offendingList = phoneGuard.offending.map((o) => o.raw).join(', ');
+      console.error(`[SendMessage] ⛔ PHONE GUARD ${phoneGuardMode === 'shadow' ? 'WOULD REFUSE (shadow)' : 'REFUSED'} send for ${contactId}: body contains unlisted phone number(s) [${offendingList}] — allowed: [${phoneGuard.allowed_digits.join(', ') || 'none'}]`);
+      emitEvent({
+        event_type: 'agentic.phone_guard_triggered',
+        source: 'lp_mcp',
+        entity_type: 'contact',
+        entity_id: String(contactId),
+        ghl_contact_id: String(contactId),
+        priority: 'high',
+        payload: {
+          mode: phoneGuardMode,
+          channel,
+          offending: phoneGuard.offending,
+          allowed_digits: phoneGuard.allowed_digits,
+          blocked_body: String(message).slice(0, 500),
+          rule_applied: action?.rule_applied || null,
+          action_id: action?.id || null,
+        },
+        idempotency_key: `phone_guard_${contactId}_${Date.now()}`,
+      }).catch((err) => console.warn(`[SendMessage] phone guard event emit failed: ${err.message}`));
+      sendGroupMeMessage(
+        `🚫 PHONE GUARD ${phoneGuardMode === 'shadow' ? '(SHADOW — message still sent)' : '— SEND REFUSED'}\n` +
+        `Contact: ${contactId}\n` +
+        `Channel: ${channel.toUpperCase()}\n` +
+        `Rule: ${action?.rule_applied || 'manual'}\n` +
+        `Unlisted number(s): ${offendingList}\n` +
+        `Draft: "${String(message).slice(0, 300)}"\n` +
+        `→ ${phoneGuardMode === 'shadow' ? 'Review the draft — enforce mode would have blocked it.' : 'Nothing was sent. Manual follow-up needed.'}`
+      ).catch((err) => console.warn(`[SendMessage] GroupMe alert (phone guard) failed: ${err.message}`));
+      if (phoneGuardMode !== 'shadow') {
+        throw new Error(`phone_guard_refused: body contains unlisted phone number(s) [${offendingList}]`);
+      }
+    }
+  }
+
   // ── 2026-07-03 direct send (AGENTIC_DIRECT_SEND, default true) ──
   // Agentic replies go straight to the GHL Conversations API with inherited
   // channel + identity (opts.fromNumber). The legacy relay-workflow webhook
@@ -1647,7 +1708,14 @@ async function sendCustomerStatusProbe(contactId, generated, action, context, op
 
   const { result: sendResult, sendMethod } = await sendWithFallback(
     contactId, message, channel, null, action,
-    { fromNumber: opts.replyContext?.fromNumber || null }
+    {
+      fromNumber: opts.replyContext?.fromNumber || null,
+      // 2026-08-18 phone guard: same allowed set as the main send path.
+      allowedPhones: [
+        generated?.resolved_service_phone || null,
+        generated?.contact_known_phone || null,
+      ].filter(Boolean),
+    }
   );
 
   // GHL 2xx IS the success — commit the sent marker so a watchdog retry
@@ -2872,7 +2940,16 @@ export async function executeSendMessage(action, context) {
   const _tPreSend = Date.now();
   const { result: sendResult, sendMethod } = await sendWithFallback(
     contactId, message, channel, subject, action,
-    { fromNumber: replyContext?.fromNumber || null }
+    {
+      fromNumber: replyContext?.fromNumber || null,
+      // 2026-08-18 phone guard: the only numbers this body may contain — the
+      // market service phone this generation resolved and the contact's own
+      // known number. The sending line is added inside sendWithFallback.
+      allowedPhones: [
+        generated?.resolved_service_phone || null,
+        generated?.contact_known_phone || null,
+      ].filter(Boolean),
+    }
   );
   const _tSent = Date.now();
 

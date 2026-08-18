@@ -245,6 +245,7 @@ import {
 // 2026-07-06 (Bot 2/3/4 consolidation) — out-of-area exit event (the Thomas
 // rule): consumed by the SERVICE_AREA_EXIT agent rule.
 import { emitEvent } from './event-emitter.js';
+import { resolveServicePhone } from './services/market-phone.js';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy
@@ -1834,6 +1835,19 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     parts.push(`\nSERVICE AREA STATUS (TENTATIVE — city match only): ${opts.serviceAreaTentative.city} is a market Reece serves, but coverage is confirmed by zip. You may speak positively about serving ${opts.serviceAreaTentative.city}; when you ask for the zip, frame it as the final confirmation (e.g. "We're all over ${opts.serviceAreaTentative.city} — what's the zip so I can confirm you're in our coverage?"). Do NOT state they are confirmed in the service area until the zip is verified.`);
   }
 
+  // ─── 2026-08-18 (invented-phone incident): the ONLY phone number the model
+  // may ever state. Resolved from the contact's zip via service_area_zips →
+  // service_markets (GENERAL fallback), same wording as the
+  // agentic-callback-message dispatch prompt. The LAYER3_DISPATCH send path
+  // previously carried a prompt_hint with no number and the model filled the
+  // gap with an invented one — (954) 282-0505 reached a customer. The
+  // send-path phone guard enforces this ban after generation; this block is
+  // what makes compliant generation possible in the first place.
+  if (opts.servicePhoneDisplay) {
+    parts.push(`\nDispatch phone number (use this format VERBATIM in the message): ${opts.servicePhoneDisplay}`);
+    parts.push(`PHONE NUMBER RULE (HARD): if this reply gives the customer any phone number to call, it must be EXACTLY the dispatch phone number above, formatted exactly as shown. NEVER state, invent, or "recall" any other phone number — no main office line, no direct line, no alternate number, under any circumstances. A reply containing any other phone number will be refused by the send guard and the customer gets nothing.`);
+  }
+
   const stageNum = inferBuyerStage(context, opts.contextSnapshot);
   parts.push(`Inferred Buyer Stage: ${stageNum}/5`);
 
@@ -3227,6 +3241,20 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     console.warn(`[ResponseGenerator] identity state build failed for ${contactId}: ${err.message} — proceeding without gate`);
   }
 
+  // ─── 2026-08-18 (invented-phone incident): resolve the market dispatch
+  // phone for this contact so the prompt can pin the ONLY number the model is
+  // allowed to state. Market comes from the verified zip (or the tentative
+  // city match); everything else — including resolver failure — lands on the
+  // GENERAL line. Never blocks generation.
+  let servicePhone = null;
+  try {
+    servicePhone = await resolveServicePhone(
+      serviceArea?.market_code || serviceAreaTentative?.market_code || null
+    );
+  } catch (err) {
+    console.warn(`[ResponseGenerator] service phone resolve failed for ${contactId}: ${err.message}`);
+  }
+
   const inHomeGateRequired = kbPack?.booking_context?.requires_in_home_gate === true;
   if (inHomeGateRequired && bookingGate && !bookingGate.ok) {
     // Hard block (R2): no slot proposals and no self-serve booking link while
@@ -3273,6 +3301,9 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
       bookingGate,
       serviceArea,
       serviceAreaTentative,
+      // 2026-08-18 (invented-phone incident): the only phone number the model
+      // may state — resolved from zip → service_area_zips → service_markets.
+      servicePhoneDisplay: servicePhone?.phone_display || null,
       // v1.1 (2026-07-24 Engelke incident) — preferred-time acknowledgment /
       // walk-back block, then the 48-hour offer-window frame. Both render only
       // when slots are actually shown (inside the availability block).
@@ -3478,6 +3509,12 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     availability_total_open: availability ? availability.slots_total_count : 0,
     edits_used_in_prompt: recentEdits.length,
     is_regenerate: !!opts.editInstruction,
+    // 2026-08-18 (invented-phone incident): the resolved market phone this
+    // generation was authorized to state, plus the contact's own known number
+    // (a reply may legitimately echo it back — "we'll call you at …"). The
+    // send handler passes both to the outbound phone guard as allowed numbers.
+    resolved_service_phone: servicePhone?.phone_display || null,
+    contact_known_phone: identityState?.identity?.phone || context?.lead?.phone || null,
     ...validated,
   };
 }
