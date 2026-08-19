@@ -198,3 +198,78 @@ test('probe: an empty response never counts as acceptance', () => {
   assert.equal(probeVerdict(0, 0), 'date', 'empty day window proves nothing');
   assert.equal(probeVerdict(0, 1), 'date', 'baseline empty is inconclusive regardless');
 });
+
+// ─── v6.15: both bounds must carry the same granularity ──────────
+//
+// Duplicates formatLpWindowEnd and the inversion guard in
+// resolveWindowStart. VERIFIED AGAINST LP LIVE on 2026-08-19
+// (GetLead, options=261120) — this table is measured, not assumed:
+//
+//   startdate              enddate                 result
+//   2026-08-18             2026-08-18              rows
+//   2026-08-18 21:15:15    2026-08-18              []   <- the v6.13 bug
+//   2026-08-18 21:15:15    2026-08-19              rows
+//   2026-08-18 00:00:00    2026-08-18              rows
+//   2026-08-18 21:15:15    2026-08-18 23:59:59     rows
+//   2026-08-18 23:59:58    2026-08-18 23:59:59     []   (a real 1s window)
+//
+// The last row is the proof that LP honours the time component: a server
+// truncating startdate to its date would have returned the whole day there.
+function formatLpWindowEnd(dateStr, fmt = 'space') {
+  const ts = `${dateStr} 23:59:59`;
+  return fmt === 'iso' ? ts.replace(' ', 'T') : ts;
+}
+function windowIsInverted(since, until) {
+  return since >= until;
+}
+
+test('REGRESSION: a timestamped start is never paired with a date-only end', () => {
+  // The exact pair v6.13 put on the wire. LP read the bare end date as
+  // 00:00:00, inverting the window, and answered with an empty 200 — which the
+  // sweep recorded as a clean run having scanned nothing.
+  const badStart = '2026-08-18 21:15:15';
+  const badEnd = '2026-08-18';
+  assert.ok(badStart > badEnd,
+    'sanity: the timestamped start sorts AFTER the bare end date');
+  // The fix: the end bound is timestamped to match.
+  const goodEnd = formatLpWindowEnd(badEnd);
+  assert.equal(goodEnd, '2026-08-18 23:59:59');
+  assert.ok(!windowIsInverted(badStart, goodEnd),
+    'a matched-granularity end must not invert the window');
+});
+
+test('the inversion guard catches a start at or past the end', () => {
+  const end = formatLpWindowEnd('2026-08-18');
+  assert.ok(windowIsInverted('2026-08-18 21:15:15', '2026-08-18'), 'the v6.13 pair');
+  assert.ok(windowIsInverted('2026-08-18 23:59:59', end), 'start exactly at end');
+  assert.ok(!windowIsInverted('2026-08-18 23:59:58', end), 'a 1-second window is valid');
+  assert.ok(!windowIsInverted('2026-08-18 00:00:00', end), 'a full-day window is valid');
+});
+
+test('both bounds carry the same format under either wire style', () => {
+  for (const fmt of ['space', 'iso']) {
+    const start = formatLpWindowStart(new Date('2026-08-19T01:15:15.000Z'), fmt);
+    const end = formatLpWindowEnd('2026-08-18', fmt);
+    const sep = fmt === 'iso' ? 'T' : ' ';
+    assert.ok(start.includes(sep) && end.includes(sep),
+      `${fmt}: both bounds must use the same separator`);
+    assert.equal(start.length, end.length, `${fmt}: both bounds must be the same shape`);
+    assert.ok(!windowIsInverted(start, end), `${fmt}: window must not invert`);
+  }
+});
+
+test('why the v6.14 probe could not have caught this', () => {
+  // The probe validated the timestamped form using midnight, which is the ONE
+  // start value that can never invert against a date-only end. It proved the
+  // format parsed and nothing whatsoever about the bounds.
+  // Midnight is the only start LP accepted against a bare end date (measured:
+  // "2026-08-18 00:00:00" -> "2026-08-18" returned rows), because it is the one
+  // value that is not strictly LATER than the end read as 00:00:00.
+  // Every other start time is, and every one of them returns empty — the probe
+  // never tried a single one, which is why the guard, not the probe, is the
+  // real defense.
+  for (const t of ['00:00:01', '12:00:00', '21:15:15', '23:59:59']) {
+    assert.ok(windowIsInverted(`2026-08-18 ${t}`, '2026-08-18'),
+      `${t} against a bare end date inverts — unprobed by v6.14`);
+  }
+});

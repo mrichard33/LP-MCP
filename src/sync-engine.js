@@ -287,56 +287,92 @@ function formatLpWindowStart(date) {
   return SYNC_WINDOW_TS_FORMAT === 'iso' ? ts.replace(' ', 'T') : ts;
 }
 
-// Build the window start. Returns the legacy date string unless timestamp mode
-// is on AND LP is PROVEN to honour a time component in `startdate`.
+// Build the window BOUNDS. Returns the legacy date pair unless timestamp mode is
+// on and the probe accepts it.
 //
-// v6.14 — why the probe is a COMPARISON and not a single call. The earlier
-// version issued one 1-row call with the timestamped value and treated
-// "it didn't throw" as acceptance. That is not evidence: LP answers a startdate
-// it mangles — or one that has been shifted into the future by a timezone bug —
-// with an empty 200, which is indistinguishable from a genuinely empty window.
-// The sweep would then silently read nothing and record a clean run.
+// v6.15 — BOTH BOUNDS MUST CARRY THE SAME GRANULARITY. Verified against LP
+// live on 2026-08-19 (GetLead, options=261120):
 //
-// So we compare two calls that MUST agree: the plain date window, and the SAME
-// instant written in timestamp form (midnight of that date). If the date window
-// returns a row and its timestamped equivalent returns none, LP did not parse
-// the time component and we fall back. If the date window is itself empty the
-// probe proves nothing — and timestamp mode would save nothing either — so we
-// fall back there too. A server that silently TRUNCATES the time passes this
-// probe; that degrades to the date window's coverage, which is safe (wider),
-// just not cheaper.
-async function resolveWindowStart(lastSyncTime, enddate) {
+//   startdate              enddate                 result
+//   2026-08-18             2026-08-18              rows
+//   2026-08-18 21:15:15    2026-08-18              [] ← EMPTY
+//   2026-08-18 21:15:15    2026-08-19              rows
+//   2026-08-18 00:00:00    2026-08-18              rows
+//   2026-08-18 21:15:15    2026-08-18 23:59:59     rows
+//   2026-08-18 23:59:58    2026-08-18 23:59:59     [] (a real 1-second window)
+//
+// LP DOES honour a time component — the last row proves it, because a server
+// truncating `startdate` to its date would have returned the whole day there.
+// What fails is a timestamped `startdate` against a DATE-ONLY `enddate`: LP
+// evaluates the bare date at 00:00:00, so any same-day start later than
+// midnight inverts the window and returns an empty 200. v6.13 sent exactly
+// that pair ("2026-08-18 21:15:15" → "2026-08-18") and the sweep read nothing.
+//
+// Two defenses, in order of reliability:
+//   1. STRUCTURAL — timestamp mode timestamps the end bound too, so the two
+//      bounds can never disagree about granularity.
+//   2. ASSERTED — an explicit start-past-end check. This is what would have
+//      caught the v6.13 bug before a single page was fetched; a probe could
+//      not, for the reason below.
+//
+// Why the v6.14 probe missed it: it validated the timestamped form using
+// midnight ("<date> 00:00:00"), which is the ONE start value that can never
+// invert against a date-only end. It proved the format parsed and nothing
+// about the window. The probe below is therefore honestly scoped — it is a
+// FORMAT check against a control window that must be non-empty, and the
+// inversion guard, not the probe, is what protects the bounds.
+function formatLpWindowEnd(dateStr) {
+  const ts = `${dateStr} 23:59:59`;
+  return SYNC_WINDOW_TS_FORMAT === 'iso' ? ts.replace(' ', 'T') : ts;
+}
+
+async function resolveWindowStart(lastSyncTime, dateEnd) {
   const dateSince = etDateString(lastSyncTime); // ET, not UTC — LP windows are Eastern
-  if (SYNC_WINDOW_MODE !== 'timestamp') return { since: dateSince, kind: 'date' };
+  const dateWindow = { since: dateSince, until: dateEnd, kind: 'date' };
+  if (SYNC_WINDOW_MODE !== 'timestamp') return dateWindow;
 
   const cursor = new Date(lastSyncTime.getTime() - SYNC_WINDOW_OVERLAP_MIN * 60000);
   // Never let the cursor run past the legacy start — the date window is the
   // conservative bound, and widening it here would be a regression.
   if (etDateString(cursor) < dateSince) {
     console.warn(`[Sync] Window cursor ${cursor.toISOString()} predates the date window ${dateSince} (overlap ${SYNC_WINDOW_OVERLAP_MIN}min) — using the date window`);
-    return { since: dateSince, kind: 'date' };
+    return dateWindow;
   }
-  const tsSince = formatLpWindowStart(cursor);
-  const equivTs = SYNC_WINDOW_TS_FORMAT === 'iso' ? `${dateSince}T00:00:00` : `${dateSince} 00:00:00`;
 
-  let baseRows, equivRows;
+  const tsSince = formatLpWindowStart(cursor);
+  const tsUntil = formatLpWindowEnd(dateEnd);
+
+  // Defense 2. Both bounds are now "YYYY-MM-DD HH:mm:ss" (or the ISO variant),
+  // so a lexical compare IS a chronological compare. An inverted window is the
+  // failure that returns an empty 200 and reads as a clean run.
+  if (tsSince >= tsUntil) {
+    console.error(`[Sync] Window is inverted or empty: start "${tsSince}" is not before end "${tsUntil}" — using the date window ${dateSince} → ${dateEnd}`);
+    return dateWindow;
+  }
+
+  // Format probe. The control spans the same ground as the date window, so it
+  // MUST return rows whenever the date window would; if it does not, LP did not
+  // parse the timestamped form. An empty control proves nothing either way, and
+  // timestamp mode would save nothing over an empty day, so that falls back too.
+  const controlSince = SYNC_WINDOW_TS_FORMAT === 'iso' ? `${dateSince}T00:00:00` : `${dateSince} 00:00:00`;
+  let baseRows, controlRows;
   try {
-    baseRows  = extractArray(await getLeadData({ startdate: dateSince, enddate, PageSize: 1, StartIndex: 1 })).length;
-    equivRows = extractArray(await getLeadData({ startdate: equivTs,  enddate, PageSize: 1, StartIndex: 1 })).length;
+    baseRows    = extractArray(await getLeadData({ startdate: dateSince,    enddate: dateEnd, PageSize: 1, StartIndex: 1 })).length;
+    controlRows = extractArray(await getLeadData({ startdate: controlSince, enddate: tsUntil, PageSize: 1, StartIndex: 1 })).length;
   } catch (err) {
-    console.error(`[Sync] Window probe failed (${err.message}) — falling back to the date window ${dateSince} for this run`);
-    return { since: dateSince, kind: 'date' };
+    console.error(`[Sync] Window probe failed (${err.message}) — falling back to the date window ${dateSince} → ${dateEnd} for this run`);
+    return dateWindow;
   }
 
   if (baseRows === 0) {
-    console.log(`[Sync] Window probe inconclusive — the date window ${dateSince}→${enddate} is itself empty, so an empty timestamped result proves nothing; using the date window`);
-    return { since: dateSince, kind: 'date' };
+    console.log(`[Sync] Window probe inconclusive — the date window ${dateSince} → ${dateEnd} is itself empty, so an empty timestamped result proves nothing; using the date window`);
+    return dateWindow;
   }
-  if (equivRows === 0) {
-    console.error(`[Sync] LP returned 0 rows for the timestamped equivalent "${equivTs}" but ${baseRows} for "${dateSince}" — the time component is NOT honoured; using the date window`);
-    return { since: dateSince, kind: 'date' };
+  if (controlRows === 0) {
+    console.error(`[Sync] LP returned 0 rows for the timestamped control "${controlSince}" → "${tsUntil}" but ${baseRows} for "${dateSince}" → "${dateEnd}" — the timestamped form is NOT honoured; using the date window`);
+    return dateWindow;
   }
-  return { since: tsSince, kind: 'timestamp' };
+  return { since: tsSince, until: tsUntil, kind: 'timestamp' };
 }
 
 // ─── Payload Hash (v6.11) ─────────────────────────────────────────
@@ -609,7 +645,7 @@ export async function fullSync() {
 // Both sweeps share the same idempotency guarantees as the legacy code —
 // every upsert keys on lp_lead_id / lp_job_id / mdt_id so retries and
 // concurrent writes converge to the same state.
-async function runLeadsSweep(since, today, logIds, maxLeads) {
+async function runLeadsSweep(since, windowEnd, logIds, maxLeads) {
   const counts = { leads: 0, calls: 0, notes: 0, jobs: 0, milestones: 0, activities: 0 };
   let failed = 0;
   let timedOut = 0;
@@ -656,7 +692,7 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
     const fetchSize = deepOffsetMode ? 1 : pageSize;
     try {
       leads = await getLeadData({
-        startdate: since, enddate: today,
+        startdate: since, enddate: windowEnd,
         PageSize: fetchSize, StartIndex: startIndex,
       });
     } catch (err) {
@@ -670,7 +706,7 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
       await sleep(failBackoff);
       try {
         leads = await getLeadData({
-          startdate: since, enddate: today,
+          startdate: since, enddate: windowEnd,
           PageSize: Math.max(1, Math.floor(fetchSize / 4)), StartIndex: startIndex,
         });
       } catch (err2) {
@@ -691,7 +727,7 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
       if (deepOffsetMode) break;
       try {
         const probe = extractArray(await getLeadData({
-          startdate: since, enddate: today, PageSize: 1, StartIndex: startIndex,
+          startdate: since, enddate: windowEnd, PageSize: 1, StartIndex: startIndex,
         }));
         if (probe.length === 0) break; // genuinely the end
         // v6.12: NEVER back off here. A PageSize=1 probe that returns a row
@@ -938,7 +974,7 @@ async function runLeadsSweep(since, today, logIds, maxLeads) {
   return { counts, failed, hitCap, denylistSkipped, newlyDenylisted, unchangedSkipped, scanned, truncatedAt };
 }
 
-async function runJobChangesSweep(since, today, logIds) {
+async function runJobChangesSweep(since, windowEnd, logIds) {
   const counts = { jobs: 0, milestones: 0 };
   let failed = 0;
   let startIndex = 1;
@@ -955,7 +991,7 @@ async function runJobChangesSweep(since, today, logIds) {
     const fetchSize = deepOffsetMode ? 1 : SYNC_PAGE_SIZE;
     try {
       jobs = await getJobStatusChanges({
-        startdate: since, enddate: today,
+        startdate: since, enddate: windowEnd,
         PageSize: fetchSize, StartIndex: startIndex,
       });
     } catch (err) {
@@ -965,7 +1001,7 @@ async function runJobChangesSweep(since, today, logIds) {
       console.error(`[Sync:JobChanges] page StartIndex=${startIndex} failed: ${err.message} — retrying smaller`);
       try {
         jobs = await getJobStatusChanges({
-          startdate: since, enddate: today,
+          startdate: since, enddate: windowEnd,
           PageSize: Math.max(1, Math.floor(fetchSize / 4)), StartIndex: startIndex,
         });
       } catch (err2) {
@@ -982,7 +1018,7 @@ async function runJobChangesSweep(since, today, logIds) {
       // proof of completion.
       try {
         const probe = extractArray(await getJobStatusChanges({
-          startdate: since, enddate: today, PageSize: 1, StartIndex: startIndex,
+          startdate: since, enddate: windowEnd, PageSize: 1, StartIndex: startIndex,
         }));
         if (probe.length === 0) break; // genuinely the end
         // v6.13: a PageSize=1 probe returning a row proves LP is up and
@@ -1068,9 +1104,12 @@ export async function incrementalSync() {
     const today = etDateString();
     // v6.13: real timestamp cursor when enabled and accepted by LP; the
     // legacy midnight-truncated date otherwise.
-    const { since, kind: windowKind } = await resolveWindowStart(lastSyncTime, today);
+    // v6.15: `until` is the END bound the sweeps must use. In timestamp mode it
+    // is timestamped to match `since` — a timestamped start against a bare date
+    // end is read by LP as ending at 00:00:00 and returns an empty 200.
+    const { since, until: windowEnd, kind: windowKind } = await resolveWindowStart(lastSyncTime, today);
 
-    console.log(`[Sync] Incremental window: ${since} → ${today} [${windowKind}${windowKind === 'timestamp' ? `, overlap ${SYNC_WINDOW_OVERLAP_MIN}min` : ''}] (max ${MAX_INCREMENTAL_LEADS} leads, prospect concurrency ${SYNC_PROSPECT_CONCURRENCY}, per-sweep timeout ${SYNC_PER_SWEEP_TIMEOUT_MS / 60000}min, per-prospect timeout ${SYNC_PROSPECT_TIMEOUT_MS / 1000}s)`);
+    console.log(`[Sync] Incremental window: ${since} → ${windowEnd} [${windowKind}${windowKind === 'timestamp' ? `, overlap ${SYNC_WINDOW_OVERLAP_MIN}min` : ''}] (max ${MAX_INCREMENTAL_LEADS} leads, prospect concurrency ${SYNC_PROSPECT_CONCURRENCY}, per-sweep timeout ${SYNC_PER_SWEEP_TIMEOUT_MS / 60000}min, per-prospect timeout ${SYNC_PROSPECT_TIMEOUT_MS / 1000}s)`);
 
     // v6.5: Run leads + job-changes in parallel, each with its own
     // per-sweep timeout. Promise.allSettled isolates failures so one
@@ -1080,12 +1119,12 @@ export async function incrementalSync() {
     console.log('[Sync] Running parallel sweeps: leads + job-changes');
     const [leadsRes, jobsRes] = await Promise.allSettled([
       runWithTimeout(
-        () => runLeadsSweep(since, today, logIds, MAX_INCREMENTAL_LEADS),
+        () => runLeadsSweep(since, windowEnd, logIds, MAX_INCREMENTAL_LEADS),
         SYNC_PER_SWEEP_TIMEOUT_MS,
         'leadsSweep'
       ),
       runWithTimeout(
-        () => runJobChangesSweep(since, today, logIds),
+        () => runJobChangesSweep(since, windowEnd, logIds),
         SYNC_PER_SWEEP_TIMEOUT_MS,
         'jobChangesSweep'
       ),
