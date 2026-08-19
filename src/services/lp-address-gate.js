@@ -38,10 +38,15 @@
  * DIRECT website-form → LP feed (empty sender, lognumber is a site session
  * UUID, not a GHL contact id) that never transits GHL or this proxy. That
  * class is unreachable by this gate; the D3 backfill sweep is its repair.
+ *
+ * 2026-08-18 — isChatbotOriginated() now recognises srs_id 830, the real
+ * "Reece ChatBot" SubSource, and keeps 5574 as a legacy alias. See the
+ * function body and src/lp-source-ids.js v2.0.
  */
 
 import supabase from '../supabase.js';
 import { getGHLContact } from '../ghl.js';
+import { LP_SRS } from '../lp-source-ids.js';
 
 export const ADDRESS_FIELDS = ['address1', 'city', 'state', 'zip'];
 export const INCOMPLETE_NOTES_STAMP = 'INCOMPLETE ADDRESS ON FILE';
@@ -75,14 +80,37 @@ export function missingAddressFields(body) {
 }
 
 /**
+ * SubSource IDs that mark a body as chatbot-originated.
+ *
+ * 830 is the live "Reece ChatBot" SubSource (source "Website"). It became
+ * the value chatbot pushes actually carry when src/lp-source-ids.js was
+ * corrected on 2026-08-18 — before that the registry emitted 5574, which
+ * resolves to nothing in LP.
+ *
+ * 5574 is retained as a LEGACY ALIAS, not out of caution but because real
+ * rows carry it: two leads were pushed with srs_id 5574 while the wrong
+ * value was live, and any addlead replayed from a held or re-queued
+ * payload captured in that window still carries it. Dropping the alias
+ * would make this gate stop recognising them as chatbot leads mid-flight.
+ * It can be removed once no held/re-queue payload predates 2026-08-18.
+ *
+ * 749 ("Chat (REECE WEBSITE)") is the legacy chatbot SubSource row and is
+ * the same surface for the purposes of this gate.
+ */
+export const CHATBOT_SRS_IDS = new Set([
+  LP_SRS.CHATBOT,  // '830' — current
+  '5574',          // legacy alias, see above
+  '749',           // legacy "Chat (REECE WEBSITE)"
+]);
+
+/**
  * Pure: chatbot-originated heuristic. The chatbot paths stamp either a
- * chatbot-flavored sender or the Reece ChatBot sub-source (srs_id 5574,
- * src/lp-source-ids.js LP_SRS.CHATBOT).
+ * chatbot-flavored sender or a Reece ChatBot sub-source.
  */
 export function isChatbotOriginated(body) {
   const b = body || {};
   if (/chatbot/i.test(String(b.sender || ''))) return true;
-  if (String(b.srs_id || '') === '5574') return true;
+  if (CHATBOT_SRS_IDS.has(String(b.srs_id || ''))) return true;
   return false;
 }
 
@@ -229,6 +257,7 @@ export default {
   applyAddressGate,
   missingAddressFields,
   isChatbotOriginated,
+  CHATBOT_SRS_IDS,
   looksLikeGhlContactId,
   enrichBodyFromGhl,
   holdLead,

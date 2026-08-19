@@ -49,6 +49,50 @@
  *   - Email is conditionally included only when present.
  *   - lp-client.js addLead now defaults to LEGACY-FIRST path ordering,
  *     which preserves srs_id/pro_id attribution that REST silently dropped.
+ *
+ * ═════════════════════════════════════════════════════════════════════
+ * v1.3 (2026-08-18) — THE FIELD CONSTANTS WERE SWAPPED. This is the root
+ * cause of the whole chatbot-attribution failure; everything else was a
+ * symptom.
+ *
+ * FIELD_LP_SOURCE_ID pointed at BbUJ6RrdTjjEqqRA8JVx and
+ * FIELD_LP_PROMOTER_ID at k6j4IBh5IejPooSCsj49. Both are backwards:
+ *
+ *   BbUJ6RrdTjjEqqRA8JVx  holds the PRO ID     (Elena: 5574)
+ *   k6j4IBh5IejPooSCsj49  holds the LP SOURCE  (Elena: 830)
+ *
+ * Two independent sources agree, and the code was the only dissenter:
+ *   - Notion "UTM Parameters" — Chatbot Leads: LP Source ID 830, Pro ID 5574
+ *   - src/ghl-field-decoder.js — BbUJ… "Pro ID", k6j4… "LP Source ID"
+ *
+ * So every push read the promoter into the srs_id slot and the subsource
+ * into the pro_id slot. LP then received srs_id=5574 (not a SubSource —
+ * resolves to blank) and pro_id=830 (a real promoter — "Godlewski, Paul").
+ * That is exactly what Elena's LP record shows: no source, no subsource,
+ * and a promoter who never touched the lead.
+ *
+ * ALSO IN v1.3, correcting v1.2 from earlier the same day:
+ *   - pro_id is NOT dropped for digital sources. v1.2 removed it on the
+ *     reasoning that a self-serve lead has no promoter. Backwards: the
+ *     Notion table gives every digital channel a FIXED per-channel
+ *     pseudo-promoter (chatbot 5574, calculator-landing 5862,
+ *     calculator-directmail 5396) — that is how LP segments self-serve
+ *     traffic in promoter reporting. CANVASSING is the row with no static
+ *     Pro ID, because its promoter is a real varying human passed per
+ *     lead. resolvePromoterForSource() now fills the registry pair when
+ *     the contact carries none, and an explicit value always wins.
+ *
+ * RETAINED FROM v1.2 (both still correct):
+ *   - Chatbot SubSource default is 830, from the registry.
+ *   - LP notes carry the full agentic setter brief rather than the AI
+ *     Short Summary alone. Elena's LP note was one sentence while her
+ *     contact held window count 4, Decision Timeline ASAP, a price
+ *     objection, trust score 4/10, Marion county and an 8-turn transcript.
+ *
+ * IF THE GUARD THROWS on a contact: the contact's custom fields are
+ * genuinely swapped. Fix the contact. Do not "fix" the constants below —
+ * they now match the Notion table and the decoder.
+ * ═════════════════════════════════════════════════════════════════════
  */
 
 import supabase from '../../supabase.js';
@@ -59,27 +103,25 @@ import { isLPLeadId, ghlFetch } from '../helpers.js';
 import { parseLongDate } from '../date-parsers.js';
 import { resolveContactInfo } from '../resolvers.js';
 import { buildRichNotification } from '../enrichment.js';
-import { LP_SRS, assertNotTransposed } from '../../lp-source-ids.js';
+import { LP_SRS, assertNotTransposed, resolvePromoterForSource } from '../../lp-source-ids.js';
+// v1.2 — the deterministic call-center brief. Pure builder + a fetch
+// wrapper that returns null on ANY failure, so this stays fail-soft.
+import { buildAgenticLeadNotes, isWeakNotes } from '../../services/agentic-lead-notes.js';
 
 // ─── GHL custom field IDs (canonical Reece location field map) ─────
+// v1.3: SOURCE and PROMOTER were swapped here from the file's creation
+// until 2026-08-18. Verified against Notion "UTM Parameters" AND
+// src/ghl-field-decoder.js — both agree with the mapping below.
+// DO NOT SWAP THESE BACK.
 const FIELD_LP_INBOUND_LEAD_ID  = '3YMxheIlPyhACB8zyc3W'; // in1_id (LP inbound queue)
 const FIELD_LP_LEAD_ID          = 'GmAVmW6V9sekD7pVONKr'; // real lds_id
-const FIELD_LP_SOURCE_ID        = 'BbUJ6RrdTjjEqqRA8JVx'; // srs_id (LP SubSource)
-const FIELD_LP_PROMOTER_ID      = 'k6j4IBh5IejPooSCsj49'; // pro_id (LP Promoter / employee)
-const FIELD_CONTACT_SUMMARY     = 'dDFaBRpRn2aHVZTboUeB'; // pre-built contact summary
+const FIELD_LP_SOURCE_ID        = 'k6j4IBh5IejPooSCsj49'; // srs_id — LP SubSource (3-digit)
+const FIELD_LP_PROMOTER_ID      = 'BbUJ6RrdTjjEqqRA8JVx'; // pro_id — LP Promoter (4-digit)
+const FIELD_CONTACT_SUMMARY     = 'dDFaBRpRn2aHVZTboUeB'; // AI Short Summary (brief fallback)
 
-// Default LP SubSource ID for chatbot leads. Confirmed by Mark 2026-05-01:
-// 5574 is the Reece ChatBot sub-source code. Override via env if Reece's
-// SubSource map changes. NOTE: the legacy GHL workflow Chatbot Contact
-// Created - Timeout Send Lead (I.CT, 98f54471) has srs_id=830 hardcoded in
-// its URL — that's actually pro_id. The workflow has them swapped. Don't
-// copy that bug.
-//
-// 2026-08-01: that warning is no longer advisory. The value now comes from
-// the shared registry (src/lp-source-ids.js) instead of a local literal, and
-// assertNotTransposed() below ENFORCES the note — a resolved
-// srs_id=830/pro_id=5574 pair now throws rather than writing a
-// misattributed lead into LP.
+// Default LP SubSource ID for chatbot leads. Sourced from the registry
+// (830 = "Reece ChatBot"). Override via env only if Reece's SubSource map
+// changes — and confirm against the Notion "UTM Parameters" table first.
 const DEFAULT_CHATBOT_SRS_ID = process.env.LP_DEFAULT_CHATBOT_SRS_ID || LP_SRS.CHATBOT;
 
 /**
@@ -156,6 +198,35 @@ function resolveAppointment(payload, eventPayload, ghlContact, includeAppt) {
   const atime = String(rawTime).trim();
 
   return { adate, atime };
+}
+
+/**
+ * v1.2 — resolve the LP `notes` payload.
+ *
+ * Priority: explicit payload.notes → full agentic setter brief → AI Short
+ * Summary → generic stub. The brief is built from the contact we already
+ * fetched, so this costs no extra GHL call.
+ *
+ * buildAgenticLeadNotes is a pure function over the contact object and
+ * never throws on missing fields (each section is dropped when empty), but
+ * it is wrapped anyway: a malformed brief must never block a lead reaching
+ * LP. Losing detail in the note is recoverable; losing the lead is not.
+ */
+function resolveNotes(payload, ghlContact, contactId, hasAppointment) {
+  if (payload.notes) return String(payload.notes);
+
+  let brief = null;
+  try {
+    brief = buildAgenticLeadNotes(ghlContact, { hasAppointment });
+  } catch (err) {
+    console.warn(`[LP-CREATE] brief build failed for ${contactId} (falling back to short summary): ${err.message}`);
+  }
+  if (brief && !isWeakNotes(brief)) return brief;
+
+  const contactSummary = readCF(ghlContact, FIELD_CONTACT_SUMMARY);
+  if (contactSummary) return contactSummary;
+
+  return `Lead from GHL Agentic system. Contact ID: ${contactId}. See chat history in GHL for details.`;
 }
 
 export async function executeCreateLPLead(action) {
@@ -249,7 +320,7 @@ export async function executeCreateLPLead(action) {
     });
     await sendGroupMeMessage(skipMsg).catch(() => {});
     await addGHLNote(contactId,
-      `[LP CREATE v1.1] Skipped — required field(s) missing: ${missing.join(', ')}\n` +
+      `[LP CREATE v1.3] Skipped — required field(s) missing: ${missing.join(', ')}\n` +
       `Lead cannot be pushed to Lead Perfection until these are populated.\n` +
       `Add the missing fields in GHL; the next appointment_booked event will retry the push.`
     ).catch(() => {});
@@ -262,30 +333,38 @@ export async function executeCreateLPLead(action) {
   }
 
   // ─── Resolve LP source / promoter / product / notes ───────────────
+  // v1.3: FIELD_LP_SOURCE_ID / FIELD_LP_PROMOTER_ID were swapped until
+  // today. See the header. srs_id is 3-digit, pro_id is 4-digit.
   const srsId = String(payload.srs_id || readCF(ghlContact, FIELD_LP_SOURCE_ID) || DEFAULT_CHATBOT_SRS_ID);
-  const proId = String(payload.pro_id || readCF(ghlContact, FIELD_LP_PROMOTER_ID) || '');
+  const contactProId = String(payload.pro_id || readCF(ghlContact, FIELD_LP_PROMOTER_ID) || '');
 
-  // 2026-08-01 — transposition guard. Both IDs are now fully resolved
-  // (payload → contact custom fields → default), so this is the last point
-  // at which the pair can be inspected before it reaches LP. Throws on the
-  // known I.CT swap; see src/lp-source-ids.js for why throwing beats
-  // writing. A failure here means the CONTACT carries swapped IDs in its
-  // custom fields — fix it on the contact, not in this code.
-  assertNotTransposed(srsId, proId);
+  // Transposition guard, BEFORE the registry fills anything in — so it
+  // inspects what the contact actually carries rather than what we would
+  // have substituted. A throw here means the CONTACT's custom fields are
+  // swapped: fix the contact, not this file.
+  assertNotTransposed(srsId, contactProId);
+
+  // v1.3 — every digital channel has a FIXED per-channel pseudo-promoter
+  // in the Notion "UTM Parameters" table (chatbot 5574, calculator-landing
+  // 5862, calculator-directmail 5396). An explicit value on the contact or
+  // payload always wins, so canvassing and events keep the real human
+  // promoter they pass per lead.
+  const proId = resolvePromoterForSource(srsId, contactProId);
+  const proIdFromRegistry = !contactProId && !!proId;
+
   const product = String(payload.product || 'Win');
   const sender = String(payload.sender || `GHL-${ghlContact.source || 'Agentic'}`);
-  const contactSummary = readCF(ghlContact, FIELD_CONTACT_SUMMARY);
-  const notes = String(
-    payload.notes ||
-    contactSummary ||
-    `Lead from GHL Agentic system. Contact ID: ${contactId}. See chat history in GHL for details.`
-  );
 
   // ─── Resolve appointment (optional, default include) ──────────────
   const includeAppt = payload.include_appt !== false;
   const appt = resolveAppointment(payload, eventPayload, ghlContact, includeAppt);
   const adate = appt?.adate || '';
   const atime = appt?.atime || '';
+
+  // v1.2 — full setter brief. Resolved after the appointment so the brief's
+  // header line ("appointment attached." vs "NO APPOINTMENT. Call to book.")
+  // reflects what we are actually sending LP.
+  const notes = resolveNotes(payload, ghlContact, contactId, !!(adate && atime));
 
   // ─── Build payload ───────────────────────────────────────────────
   // Use REST-style names; lp-client's addLead translates to legacy
@@ -382,12 +461,16 @@ export async function executeCreateLPLead(action) {
     pathTaken === 'legacy' ? 'lppost (legacy — primary path, preserves srs/pro)'
     : pathTaken === 'rest' ? 'REST /api/Leads/LeadAdd (fallback path)'
     : 'unknown';
+  const proLine = proId
+    ? `${proId}${proIdFromRegistry ? ' (from channel registry)' : ''}`
+    : '(none)';
   await addGHLNote(contactId,
-    `[LP CREATE v1.1] Lead pushed to Lead Perfection inbound queue\n` +
+    `[LP CREATE v1.3] Lead pushed to Lead Perfection inbound queue\n` +
     `LP Inbound ID (in1_id): ${inboundId}\n` +
     `Path: ${pathLabel}\n` +
-    `srs_id: ${srsId} | pro_id: ${proId || '(none)'} | product: ${product} | sender: ${sender}\n` +
+    `srs_id: ${srsId} | pro_id: ${proLine} | product: ${product} | sender: ${sender}\n` +
     `Email: ${email || '(none — LP accepts emailless leads)'}\n` +
+    `Notes sent: ${notes.length} chars (full agentic setter brief)\n` +
     `${apptLine}\n` +
     `LP will issue real lds_id within ~60s and the LP-Inbound Webhook callback will write lp_lead_id + lp_prospect_id back to this contact.`
   ).catch(() => {});
@@ -410,7 +493,7 @@ export async function executeCreateLPLead(action) {
   });
   await sendGroupMeMessage(successMsg).catch(() => {});
 
-  console.log(`[LP-CREATE] ✅ Lead pushed to LP (${pathTaken}): in1_id=${inboundId} for contact ${contactId} (srs=${srsId}, pro=${proId || 'none'}, email=${email || 'none'}, appt=${adate ? `${adate} ${atime}` : 'none'})`);
+  console.log(`[LP-CREATE] ✅ Lead pushed to LP (${pathTaken}): in1_id=${inboundId} for contact ${contactId} (srs=${srsId}, pro=${proId || 'none'}${proIdFromRegistry ? ':registry' : ''}, email=${email || 'none'}, notes=${notes.length}ch, appt=${adate ? `${adate} ${atime}` : 'none'})`);
 
   return {
     action: 'lp_lead_created',
@@ -419,8 +502,10 @@ export async function executeCreateLPLead(action) {
     path: pathTaken,
     srs_id: srsId,
     pro_id: proId || null,
+    pro_id_from_registry: proIdFromRegistry,
     email: email || null,
     product,
+    notes_chars: notes.length,
     appt_date: adate || null,
     appt_time: atime || null,
     appt_included: !!(adate && atime),

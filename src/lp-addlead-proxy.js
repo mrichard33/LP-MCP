@@ -37,6 +37,12 @@
  * replaces or extends it. Ships on 'shadow', which logs and changes nothing.
  * Contract 2 (fail-open) covers it: any error or timeout forwards unchanged.
  *
+ * ATTRIBUTION FALLBACK (v1.1, 2026-08-18 — env LP_ATTRIBUTION_FALLBACK_MODE,
+ * default 'live'): the SECOND field group this proxy may rewrite. When a
+ * GHL-originated addlead arrives with no usable srs_id, the lead is stamped
+ * srs_id=830 / pro_id=5574 (Reece ChatBot) rather than reaching LP
+ * unattributed. Mark's ruling, 2026-08-18. See applyAttributionFallback().
+ *
  * DORMANT ID BACKSTOP: if the body carries an `appt_id` key that is blank
  * while adate is present, treat as invalid (contamination signature —
  * John Stautinger, lead 560445). Enforced ONLY when the key exists; GHL
@@ -49,6 +55,7 @@ import { sendGroupMeMessage } from './groupme.js';
 import { flattenWebhookBody } from './webhook-body.js';
 import { fetchAndBuildAgenticNotes, isWeakNotes } from './services/agentic-lead-notes.js';
 import { applyAddressGate } from './services/lp-address-gate.js';
+import { LP_SRS, LP_PRO } from './lp-source-ids.js';
 import {
   BUSINESS_HOUR_START_ET,
   BUSINESS_HOUR_END_ET,
@@ -76,6 +83,28 @@ function proxyMode() {
 function notesMode() {
   const m = String(process.env.LP_ADDLEAD_NOTES_MODE || 'shadow').toLowerCase();
   return m === 'live' || m === 'augment' || m === 'off' ? m : 'shadow';
+}
+
+/**
+ * Attribution fallback (env LP_ATTRIBUTION_FALLBACK_MODE):
+ *   'live'   — stamp the fallback pair onto unattributed leads. DEFAULT.
+ *   'shadow' — log what WOULD be stamped, forward unchanged.
+ *   'off'    — skip entirely. Kill switch.
+ *
+ * WHY THIS DEFAULTS 'live' AND THE OTHER TWO GATES DEFAULT 'shadow'. The
+ * house pattern is shadow-first, and it is the right default when a gate can
+ * SUPPRESS something (an appointment, a whole lead). This gate cannot. It
+ * only ever fills a field that is empty, and the status quo it replaces is
+ * already broken: 211 LP leads carry srs_id=0 today, 40 of them in the last
+ * 30 days. Shadow mode here would mean knowingly writing more unattributed
+ * leads while watching a log say so. It is also the only one of the three
+ * whose damage is unrepairable — LP exposes no write endpoint that accepts
+ * srs_id, so a lead that lands unattributed stays that way unless someone
+ * edits it by hand in the LP UI.
+ */
+function attributionFallbackMode() {
+  const m = String(process.env.LP_ATTRIBUTION_FALLBACK_MODE || 'live').toLowerCase();
+  return m === 'shadow' || m === 'off' ? m : 'live';
 }
 
 // Hard ceiling on the enrichment fetch. The proxy is a synchronous hop on the
@@ -109,6 +138,60 @@ export function hourFromLpAtime(atime) {
 
 function isBlank(v) {
   return v == null || String(v).trim() === '';
+}
+
+/**
+ * An srs_id is USABLE only if it is a non-blank, non-zero integer that is not
+ * an unresolved merge token.
+ *
+ * The "0" case is the one that matters and the one a plain blank-check misses.
+ * LP does not reject srs_id=0 — it accepts the lead and resolves it to no
+ * source and no sourcesubdescr, which is exactly the state of Elena's lead
+ * 568072 and 210 others. A workflow that ships `srs_id=` empty and a workflow
+ * that ships `srs_id=0` produce the identical broken outcome, so both must
+ * trigger the fallback.
+ */
+export function isUsableAttributionId(v) {
+  if (isBlank(v)) return false;
+  const s = String(v).trim();
+  if (/\{\{.*?\}\}/.test(s)) return false;   // unresolved GHL merge token
+  if (!/^\d+$/.test(s)) return false;
+  return Number(s) > 0;
+}
+
+/**
+ * Pure. Stamp the Reece ChatBot pair onto a body that carries no usable
+ * source attribution.
+ *
+ * RULE (Mark, 2026-08-18): "Anytime our GHL system books an appointment or
+ * creates a lead that has no source and subsource then the fallback would be
+ * Reece Chatbot srs_id=830 / pro_id=5574."
+ *
+ * Scope is deliberately narrow — this fills, it never overrides:
+ *   - usable srs_id present            → untouched, whatever it is
+ *   - srs_id missing/0/token           → srs_id=830 AND pro_id=5574
+ *   - srs_id missing but pro_id present→ still stamps both, because a pro_id
+ *     without a srs_id cannot be trusted to identify a channel and the pair
+ *     is what LP reports on. The original pro_id is returned in `replaced`
+ *     so the log and card record what was overwritten.
+ *
+ * Returns { body, applied, reason, before }.
+ */
+export function applyAttributionFallback(body) {
+  const b = body || {};
+  const srs = b.srs_id;
+  const pro = b.pro_id;
+
+  if (isUsableAttributionId(srs)) {
+    return { body: b, applied: false, reason: 'srs_id_present', before: null };
+  }
+
+  return {
+    body: { ...b, srs_id: LP_SRS.CHATBOT, pro_id: LP_PRO.CHATBOT },
+    applied: true,
+    reason: isBlank(srs) ? 'srs_id_blank' : `srs_id_unusable:${String(srs).trim()}`,
+    before: { srs_id: isBlank(srs) ? null : String(srs).trim(), pro_id: isBlank(pro) ? null : String(pro).trim() },
+  };
 }
 
 /**
@@ -253,6 +336,32 @@ export function registerLpAddleadProxyRoutes(app) {
       }
     }
 
+    // ── Attribution fallback (2026-08-18) ───────────────────────────────
+    // Runs BEFORE the address gate so a held-and-later-released payload is
+    // already attributed when the sweeper forwards it. Fail-open like every
+    // other stage: a throw here leaves the body exactly as it was.
+    const aMode = attributionFallbackMode();
+    let attribution = { applied: false, reason: 'skipped' };
+    if (aMode !== 'off') {
+      try {
+        const result = applyAttributionFallback(outbound);
+        if (result.applied && aMode === 'live') {
+          outbound = result.body;
+          attribution = { applied: true, reason: result.reason, before: result.before };
+        } else if (result.applied) {
+          attribution = { applied: false, reason: `shadow_would_stamp:${result.reason}`, before: result.before };
+          console.log(
+            `[LP-PROXY] 🕶️ ATTRIBUTION SHADOW log=${body.lognumber || '?'} sender="${body.sender || ''}" ` +
+            `would stamp srs_id=${LP_SRS.CHATBOT}/pro_id=${LP_PRO.CHATBOT} (was ${JSON.stringify(result.before)})`
+          );
+        } else {
+          attribution = { applied: false, reason: result.reason };
+        }
+      } catch (err) {
+        console.error(`[LP-PROXY] attribution fallback threw — forwarding untouched: ${err.message}`);
+      }
+    }
+
     // ── Address completeness gate (Section D, 2026-08-18) ───────────────
     // D1: the LP push is the dial trigger and LP never repairs a prospect
     // from a later push, so the FIRST push must carry a complete address.
@@ -268,6 +377,7 @@ export function registerLpAddleadProxyRoutes(app) {
       if (gate.action === 'hold') {
         console.log(
           `[LP-PROXY] ${body.sender || '?'} log=${body.lognumber || '?'} mode=${mode} ` +
+          `attribution=${aMode}/${attribution.reason} ` +
           `plan=${plan.action}/${plan.reason} address_gate=HELD missing=[${gate.missing.join(',')}] ${Date.now() - started}ms`
         );
         // No LP response exists for a held lead — Contract 1 (response
@@ -338,6 +448,7 @@ export function registerLpAddleadProxyRoutes(app) {
       const lp = await forwardToLp(outbound);
       console.log(
         `[LP-PROXY] ${body.sender || '?'} log=${body.lognumber || '?'} mode=${mode} ` +
+        `attribution=${aMode}/${attribution.reason}${attribution.applied ? `→${LP_SRS.CHATBOT}/${LP_PRO.CHATBOT}` : ''} ` +
         `notes=${nMode}/${notesAction} ` +
         `address_gate=${gate ? `${gate.mode}/${gate.reason}${gate.would_hold ? '/WOULD_HOLD' : ''}` : 'skipped'} ` +
         `plan=${plan.action}/${plan.reason} lp=${lp.status} ${Date.now() - started}ms`
@@ -352,7 +463,7 @@ export function registerLpAddleadProxyRoutes(app) {
     }
   });
 
-  console.log(`[LP-PROXY] Registered: POST /webhook/ghl/lp-addlead-proxy (mode=${proxyMode()}, notes=${notesMode()}, target=${LP_ADDLEAD_URL})`);
+  console.log(`[LP-PROXY] Registered: POST /webhook/ghl/lp-addlead-proxy (mode=${proxyMode()}, notes=${notesMode()}, attribution=${attributionFallbackMode()}, target=${LP_ADDLEAD_URL})`);
 }
 
-export const _internal = { proxyMode, notesMode };
+export const _internal = { proxyMode, notesMode, attributionFallbackMode };
