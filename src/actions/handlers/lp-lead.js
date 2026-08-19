@@ -49,6 +49,37 @@
  *   - Email is conditionally included only when present.
  *   - lp-client.js addLead now defaults to LEGACY-FIRST path ordering,
  *     which preserves srs_id/pro_id attribution that REST silently dropped.
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * v1.2 (2026-08-18) — three changes, all ruled by Mark after reading the
+ * LP record for C5DqkOUqoRvHT86dia4H (Elena) directly.
+ *
+ * 1. CHATBOT SUBSOURCE IS 830, NOT 5574. The default now comes from the
+ *    corrected registry. See src/lp-source-ids.js v2.0 for the evidence:
+ *    830 resolves to "Reece ChatBot" (100 leads, 33 in the last 30 days),
+ *    5574 resolves to nothing (2 leads ever, both blank). 830 collides
+ *    with Promoter 830 "Godlewski, Paul", which is what made the original
+ *    pairing look transposed when it was correct.
+ *
+ * 2. pro_id IS DROPPED FOR SELF-SERVE SOURCES. Mark: "pro_id is really
+ *    for when there is a canvasser." A promoter is the human who PROCURED
+ *    the lead. A chatbot lead procures itself. Sending pro_id=830 credited
+ *    Godlewski with six leads he never canvassed — every Godlewski lead in
+ *    LP is GHL-originated. Canvassing, home shows and telemarketing keep
+ *    their promoter; that is what the field is for.
+ *
+ * 3. LP NOTES NOW CARRY THE FULL SETTER BRIEF. Previously `notes` fell
+ *    back to the AI Short Summary field alone, so the rep saw one
+ *    sentence: "Interested in pricing for storm windows in Marion County;
+ *    water leaking in four windows; contact email ...". Everything else
+ *    the agentic system had captured on that contact — window count, ASAP
+ *    decision timeline, price objection, trust score, market/county, the
+ *    full chat transcript — never reached LP. buildAgenticLeadNotes()
+ *    already assembles exactly that brief and was only wired into
+ *    src/lp-addlead-proxy.js. Now this path uses it too, with the short
+ *    summary retained as the fallback when the brief comes back weak or
+ *    the contact read fails.
+ * ─────────────────────────────────────────────────────────────────────
  */
 
 import supabase from '../../supabase.js';
@@ -59,27 +90,22 @@ import { isLPLeadId, ghlFetch } from '../helpers.js';
 import { parseLongDate } from '../date-parsers.js';
 import { resolveContactInfo } from '../resolvers.js';
 import { buildRichNotification } from '../enrichment.js';
-import { LP_SRS, assertNotTransposed } from '../../lp-source-ids.js';
+import { LP_SRS, assertNotTransposed, dropPromoterForSelfServe } from '../../lp-source-ids.js';
+// v1.2 — the deterministic call-center brief. Pure builder + a fetch
+// wrapper that returns null on ANY failure, so this stays fail-soft.
+import { buildAgenticLeadNotes, isWeakNotes } from '../../services/agentic-lead-notes.js';
 
 // ─── GHL custom field IDs (canonical Reece location field map) ─────
 const FIELD_LP_INBOUND_LEAD_ID  = '3YMxheIlPyhACB8zyc3W'; // in1_id (LP inbound queue)
 const FIELD_LP_LEAD_ID          = 'GmAVmW6V9sekD7pVONKr'; // real lds_id
 const FIELD_LP_SOURCE_ID        = 'BbUJ6RrdTjjEqqRA8JVx'; // srs_id (LP SubSource)
 const FIELD_LP_PROMOTER_ID      = 'k6j4IBh5IejPooSCsj49'; // pro_id (LP Promoter / employee)
-const FIELD_CONTACT_SUMMARY     = 'dDFaBRpRn2aHVZTboUeB'; // pre-built contact summary
+const FIELD_CONTACT_SUMMARY     = 'dDFaBRpRn2aHVZTboUeB'; // AI Short Summary (brief fallback)
 
-// Default LP SubSource ID for chatbot leads. Confirmed by Mark 2026-05-01:
-// 5574 is the Reece ChatBot sub-source code. Override via env if Reece's
-// SubSource map changes. NOTE: the legacy GHL workflow Chatbot Contact
-// Created - Timeout Send Lead (I.CT, 98f54471) has srs_id=830 hardcoded in
-// its URL — that's actually pro_id. The workflow has them swapped. Don't
-// copy that bug.
-//
-// 2026-08-01: that warning is no longer advisory. The value now comes from
-// the shared registry (src/lp-source-ids.js) instead of a local literal, and
-// assertNotTransposed() below ENFORCES the note — a resolved
-// srs_id=830/pro_id=5574 pair now throws rather than writing a
-// misattributed lead into LP.
+// Default LP SubSource ID for chatbot leads. v1.2: sourced from the
+// corrected registry (830 = "Reece ChatBot"). Override via env only if
+// Reece's SubSource map changes — and verify in SETUP → CUSTOMERS →
+// SOURCE SUBS before you do.
 const DEFAULT_CHATBOT_SRS_ID = process.env.LP_DEFAULT_CHATBOT_SRS_ID || LP_SRS.CHATBOT;
 
 /**
@@ -156,6 +182,35 @@ function resolveAppointment(payload, eventPayload, ghlContact, includeAppt) {
   const atime = String(rawTime).trim();
 
   return { adate, atime };
+}
+
+/**
+ * v1.2 — resolve the LP `notes` payload.
+ *
+ * Priority: explicit payload.notes → full agentic setter brief → AI Short
+ * Summary → generic stub. The brief is built from the contact we already
+ * fetched, so this costs no extra GHL call.
+ *
+ * buildAgenticLeadNotes is a pure function over the contact object and
+ * never throws on missing fields (each section is dropped when empty), but
+ * it is wrapped anyway: a malformed brief must never block a lead reaching
+ * LP. Losing detail in the note is recoverable; losing the lead is not.
+ */
+function resolveNotes(payload, ghlContact, contactId, hasAppointment) {
+  if (payload.notes) return String(payload.notes);
+
+  let brief = null;
+  try {
+    brief = buildAgenticLeadNotes(ghlContact, { hasAppointment });
+  } catch (err) {
+    console.warn(`[LP-CREATE] brief build failed for ${contactId} (falling back to short summary): ${err.message}`);
+  }
+  if (brief && !isWeakNotes(brief)) return brief;
+
+  const contactSummary = readCF(ghlContact, FIELD_CONTACT_SUMMARY);
+  if (contactSummary) return contactSummary;
+
+  return `Lead from GHL Agentic system. Contact ID: ${contactId}. See chat history in GHL for details.`;
 }
 
 export async function executeCreateLPLead(action) {
@@ -249,7 +304,7 @@ export async function executeCreateLPLead(action) {
     });
     await sendGroupMeMessage(skipMsg).catch(() => {});
     await addGHLNote(contactId,
-      `[LP CREATE v1.1] Skipped — required field(s) missing: ${missing.join(', ')}\n` +
+      `[LP CREATE v1.2] Skipped — required field(s) missing: ${missing.join(', ')}\n` +
       `Lead cannot be pushed to Lead Perfection until these are populated.\n` +
       `Add the missing fields in GHL; the next appointment_booked event will retry the push.`
     ).catch(() => {});
@@ -263,29 +318,40 @@ export async function executeCreateLPLead(action) {
 
   // ─── Resolve LP source / promoter / product / notes ───────────────
   const srsId = String(payload.srs_id || readCF(ghlContact, FIELD_LP_SOURCE_ID) || DEFAULT_CHATBOT_SRS_ID);
-  const proId = String(payload.pro_id || readCF(ghlContact, FIELD_LP_PROMOTER_ID) || '');
+  const rawProId = String(payload.pro_id || readCF(ghlContact, FIELD_LP_PROMOTER_ID) || '');
+
+  // v1.2 — pro_id is for canvassers, home shows and telemarketers: a human
+  // who PROCURED the lead. Self-serve digital sources have none, so the
+  // field is dropped rather than populated. Sending it credited promoter
+  // 830 (Godlewski, Paul) for six chatbot leads he never worked.
+  const proId = dropPromoterForSelfServe(srsId, rawProId);
+  const proIdDropped = !!rawProId && !proId;
 
   // 2026-08-01 — transposition guard. Both IDs are now fully resolved
   // (payload → contact custom fields → default), so this is the last point
   // at which the pair can be inspected before it reaches LP. Throws on the
-  // known I.CT swap; see src/lp-source-ids.js for why throwing beats
-  // writing. A failure here means the CONTACT carries swapped IDs in its
-  // custom fields — fix it on the contact, not in this code.
-  assertNotTransposed(srsId, proId);
+  // known swap; see src/lp-source-ids.js for why throwing beats writing.
+  // A failure here means the CONTACT carries swapped IDs in its custom
+  // fields — fix it on the contact, not in this code.
+  //
+  // v1.2: checked against rawProId, BEFORE the self-serve drop. Otherwise
+  // dropping pro_id would mask a genuinely transposed pair by emptying the
+  // very field the guard inspects.
+  assertNotTransposed(srsId, rawProId);
+
   const product = String(payload.product || 'Win');
   const sender = String(payload.sender || `GHL-${ghlContact.source || 'Agentic'}`);
-  const contactSummary = readCF(ghlContact, FIELD_CONTACT_SUMMARY);
-  const notes = String(
-    payload.notes ||
-    contactSummary ||
-    `Lead from GHL Agentic system. Contact ID: ${contactId}. See chat history in GHL for details.`
-  );
 
   // ─── Resolve appointment (optional, default include) ──────────────
   const includeAppt = payload.include_appt !== false;
   const appt = resolveAppointment(payload, eventPayload, ghlContact, includeAppt);
   const adate = appt?.adate || '';
   const atime = appt?.atime || '';
+
+  // v1.2 — full setter brief. Resolved after the appointment so the brief's
+  // header line ("appointment attached." vs "NO APPOINTMENT. Call to book.")
+  // reflects what we are actually sending LP.
+  const notes = resolveNotes(payload, ghlContact, contactId, !!(adate && atime));
 
   // ─── Build payload ───────────────────────────────────────────────
   // Use REST-style names; lp-client's addLead translates to legacy
@@ -382,12 +448,18 @@ export async function executeCreateLPLead(action) {
     pathTaken === 'legacy' ? 'lppost (legacy — primary path, preserves srs/pro)'
     : pathTaken === 'rest' ? 'REST /api/Leads/LeadAdd (fallback path)'
     : 'unknown';
+  const proLine = proId
+    ? proId
+    : proIdDropped
+      ? `(dropped — srs_id ${srsId} is self-serve; pro_id ${rawProId} on the contact was not sent)`
+      : '(none)';
   await addGHLNote(contactId,
-    `[LP CREATE v1.1] Lead pushed to Lead Perfection inbound queue\n` +
+    `[LP CREATE v1.2] Lead pushed to Lead Perfection inbound queue\n` +
     `LP Inbound ID (in1_id): ${inboundId}\n` +
     `Path: ${pathLabel}\n` +
-    `srs_id: ${srsId} | pro_id: ${proId || '(none)'} | product: ${product} | sender: ${sender}\n` +
+    `srs_id: ${srsId} | pro_id: ${proLine} | product: ${product} | sender: ${sender}\n` +
     `Email: ${email || '(none — LP accepts emailless leads)'}\n` +
+    `Notes sent: ${notes.length} chars (full agentic setter brief)\n` +
     `${apptLine}\n` +
     `LP will issue real lds_id within ~60s and the LP-Inbound Webhook callback will write lp_lead_id + lp_prospect_id back to this contact.`
   ).catch(() => {});
@@ -410,7 +482,7 @@ export async function executeCreateLPLead(action) {
   });
   await sendGroupMeMessage(successMsg).catch(() => {});
 
-  console.log(`[LP-CREATE] ✅ Lead pushed to LP (${pathTaken}): in1_id=${inboundId} for contact ${contactId} (srs=${srsId}, pro=${proId || 'none'}, email=${email || 'none'}, appt=${adate ? `${adate} ${atime}` : 'none'})`);
+  console.log(`[LP-CREATE] ✅ Lead pushed to LP (${pathTaken}): in1_id=${inboundId} for contact ${contactId} (srs=${srsId}, pro=${proId || (proIdDropped ? `dropped:${rawProId}` : 'none')}, email=${email || 'none'}, notes=${notes.length}ch, appt=${adate ? `${adate} ${atime}` : 'none'})`);
 
   return {
     action: 'lp_lead_created',
@@ -419,8 +491,10 @@ export async function executeCreateLPLead(action) {
     path: pathTaken,
     srs_id: srsId,
     pro_id: proId || null,
+    pro_id_dropped: proIdDropped ? rawProId : null,
     email: email || null,
     product,
+    notes_chars: notes.length,
     appt_date: adate || null,
     appt_time: atime || null,
     appt_included: !!(adate && atime),
