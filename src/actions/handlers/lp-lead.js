@@ -50,36 +50,49 @@
  *   - lp-client.js addLead now defaults to LEGACY-FIRST path ordering,
  *     which preserves srs_id/pro_id attribution that REST silently dropped.
  *
- * ─────────────────────────────────────────────────────────────────────
- * v1.2 (2026-08-18) — three changes, all ruled by Mark after reading the
- * LP record for C5DqkOUqoRvHT86dia4H (Elena) directly.
+ * ═════════════════════════════════════════════════════════════════════
+ * v1.3 (2026-08-18) — THE FIELD CONSTANTS WERE SWAPPED. This is the root
+ * cause of the whole chatbot-attribution failure; everything else was a
+ * symptom.
  *
- * 1. CHATBOT SUBSOURCE IS 830, NOT 5574. The default now comes from the
- *    corrected registry. See src/lp-source-ids.js v2.0 for the evidence:
- *    830 resolves to "Reece ChatBot" (100 leads, 33 in the last 30 days),
- *    5574 resolves to nothing (2 leads ever, both blank). 830 collides
- *    with Promoter 830 "Godlewski, Paul", which is what made the original
- *    pairing look transposed when it was correct.
+ * FIELD_LP_SOURCE_ID pointed at BbUJ6RrdTjjEqqRA8JVx and
+ * FIELD_LP_PROMOTER_ID at k6j4IBh5IejPooSCsj49. Both are backwards:
  *
- * 2. pro_id IS DROPPED FOR SELF-SERVE SOURCES. Mark: "pro_id is really
- *    for when there is a canvasser." A promoter is the human who PROCURED
- *    the lead. A chatbot lead procures itself. Sending pro_id=830 credited
- *    Godlewski with six leads he never canvassed — every Godlewski lead in
- *    LP is GHL-originated. Canvassing, home shows and telemarketing keep
- *    their promoter; that is what the field is for.
+ *   BbUJ6RrdTjjEqqRA8JVx  holds the PRO ID     (Elena: 5574)
+ *   k6j4IBh5IejPooSCsj49  holds the LP SOURCE  (Elena: 830)
  *
- * 3. LP NOTES NOW CARRY THE FULL SETTER BRIEF. Previously `notes` fell
- *    back to the AI Short Summary field alone, so the rep saw one
- *    sentence: "Interested in pricing for storm windows in Marion County;
- *    water leaking in four windows; contact email ...". Everything else
- *    the agentic system had captured on that contact — window count, ASAP
- *    decision timeline, price objection, trust score, market/county, the
- *    full chat transcript — never reached LP. buildAgenticLeadNotes()
- *    already assembles exactly that brief and was only wired into
- *    src/lp-addlead-proxy.js. Now this path uses it too, with the short
- *    summary retained as the fallback when the brief comes back weak or
- *    the contact read fails.
- * ─────────────────────────────────────────────────────────────────────
+ * Two independent sources agree, and the code was the only dissenter:
+ *   - Notion "UTM Parameters" — Chatbot Leads: LP Source ID 830, Pro ID 5574
+ *   - src/ghl-field-decoder.js — BbUJ… "Pro ID", k6j4… "LP Source ID"
+ *
+ * So every push read the promoter into the srs_id slot and the subsource
+ * into the pro_id slot. LP then received srs_id=5574 (not a SubSource —
+ * resolves to blank) and pro_id=830 (a real promoter — "Godlewski, Paul").
+ * That is exactly what Elena's LP record shows: no source, no subsource,
+ * and a promoter who never touched the lead.
+ *
+ * ALSO IN v1.3, correcting v1.2 from earlier the same day:
+ *   - pro_id is NOT dropped for digital sources. v1.2 removed it on the
+ *     reasoning that a self-serve lead has no promoter. Backwards: the
+ *     Notion table gives every digital channel a FIXED per-channel
+ *     pseudo-promoter (chatbot 5574, calculator-landing 5862,
+ *     calculator-directmail 5396) — that is how LP segments self-serve
+ *     traffic in promoter reporting. CANVASSING is the row with no static
+ *     Pro ID, because its promoter is a real varying human passed per
+ *     lead. resolvePromoterForSource() now fills the registry pair when
+ *     the contact carries none, and an explicit value always wins.
+ *
+ * RETAINED FROM v1.2 (both still correct):
+ *   - Chatbot SubSource default is 830, from the registry.
+ *   - LP notes carry the full agentic setter brief rather than the AI
+ *     Short Summary alone. Elena's LP note was one sentence while her
+ *     contact held window count 4, Decision Timeline ASAP, a price
+ *     objection, trust score 4/10, Marion county and an 8-turn transcript.
+ *
+ * IF THE GUARD THROWS on a contact: the contact's custom fields are
+ * genuinely swapped. Fix the contact. Do not "fix" the constants below —
+ * they now match the Notion table and the decoder.
+ * ═════════════════════════════════════════════════════════════════════
  */
 
 import supabase from '../../supabase.js';
@@ -90,22 +103,25 @@ import { isLPLeadId, ghlFetch } from '../helpers.js';
 import { parseLongDate } from '../date-parsers.js';
 import { resolveContactInfo } from '../resolvers.js';
 import { buildRichNotification } from '../enrichment.js';
-import { LP_SRS, assertNotTransposed, dropPromoterForSelfServe } from '../../lp-source-ids.js';
+import { LP_SRS, assertNotTransposed, resolvePromoterForSource } from '../../lp-source-ids.js';
 // v1.2 — the deterministic call-center brief. Pure builder + a fetch
 // wrapper that returns null on ANY failure, so this stays fail-soft.
 import { buildAgenticLeadNotes, isWeakNotes } from '../../services/agentic-lead-notes.js';
 
 // ─── GHL custom field IDs (canonical Reece location field map) ─────
+// v1.3: SOURCE and PROMOTER were swapped here from the file's creation
+// until 2026-08-18. Verified against Notion "UTM Parameters" AND
+// src/ghl-field-decoder.js — both agree with the mapping below.
+// DO NOT SWAP THESE BACK.
 const FIELD_LP_INBOUND_LEAD_ID  = '3YMxheIlPyhACB8zyc3W'; // in1_id (LP inbound queue)
 const FIELD_LP_LEAD_ID          = 'GmAVmW6V9sekD7pVONKr'; // real lds_id
-const FIELD_LP_SOURCE_ID        = 'BbUJ6RrdTjjEqqRA8JVx'; // srs_id (LP SubSource)
-const FIELD_LP_PROMOTER_ID      = 'k6j4IBh5IejPooSCsj49'; // pro_id (LP Promoter / employee)
+const FIELD_LP_SOURCE_ID        = 'k6j4IBh5IejPooSCsj49'; // srs_id — LP SubSource (3-digit)
+const FIELD_LP_PROMOTER_ID      = 'BbUJ6RrdTjjEqqRA8JVx'; // pro_id — LP Promoter (4-digit)
 const FIELD_CONTACT_SUMMARY     = 'dDFaBRpRn2aHVZTboUeB'; // AI Short Summary (brief fallback)
 
-// Default LP SubSource ID for chatbot leads. v1.2: sourced from the
-// corrected registry (830 = "Reece ChatBot"). Override via env only if
-// Reece's SubSource map changes — and verify in SETUP → CUSTOMERS →
-// SOURCE SUBS before you do.
+// Default LP SubSource ID for chatbot leads. Sourced from the registry
+// (830 = "Reece ChatBot"). Override via env only if Reece's SubSource map
+// changes — and confirm against the Notion "UTM Parameters" table first.
 const DEFAULT_CHATBOT_SRS_ID = process.env.LP_DEFAULT_CHATBOT_SRS_ID || LP_SRS.CHATBOT;
 
 /**
@@ -304,7 +320,7 @@ export async function executeCreateLPLead(action) {
     });
     await sendGroupMeMessage(skipMsg).catch(() => {});
     await addGHLNote(contactId,
-      `[LP CREATE v1.2] Skipped — required field(s) missing: ${missing.join(', ')}\n` +
+      `[LP CREATE v1.3] Skipped — required field(s) missing: ${missing.join(', ')}\n` +
       `Lead cannot be pushed to Lead Perfection until these are populated.\n` +
       `Add the missing fields in GHL; the next appointment_booked event will retry the push.`
     ).catch(() => {});
@@ -317,27 +333,24 @@ export async function executeCreateLPLead(action) {
   }
 
   // ─── Resolve LP source / promoter / product / notes ───────────────
+  // v1.3: FIELD_LP_SOURCE_ID / FIELD_LP_PROMOTER_ID were swapped until
+  // today. See the header. srs_id is 3-digit, pro_id is 4-digit.
   const srsId = String(payload.srs_id || readCF(ghlContact, FIELD_LP_SOURCE_ID) || DEFAULT_CHATBOT_SRS_ID);
-  const rawProId = String(payload.pro_id || readCF(ghlContact, FIELD_LP_PROMOTER_ID) || '');
+  const contactProId = String(payload.pro_id || readCF(ghlContact, FIELD_LP_PROMOTER_ID) || '');
 
-  // v1.2 — pro_id is for canvassers, home shows and telemarketers: a human
-  // who PROCURED the lead. Self-serve digital sources have none, so the
-  // field is dropped rather than populated. Sending it credited promoter
-  // 830 (Godlewski, Paul) for six chatbot leads he never worked.
-  const proId = dropPromoterForSelfServe(srsId, rawProId);
-  const proIdDropped = !!rawProId && !proId;
+  // Transposition guard, BEFORE the registry fills anything in — so it
+  // inspects what the contact actually carries rather than what we would
+  // have substituted. A throw here means the CONTACT's custom fields are
+  // swapped: fix the contact, not this file.
+  assertNotTransposed(srsId, contactProId);
 
-  // 2026-08-01 — transposition guard. Both IDs are now fully resolved
-  // (payload → contact custom fields → default), so this is the last point
-  // at which the pair can be inspected before it reaches LP. Throws on the
-  // known swap; see src/lp-source-ids.js for why throwing beats writing.
-  // A failure here means the CONTACT carries swapped IDs in its custom
-  // fields — fix it on the contact, not in this code.
-  //
-  // v1.2: checked against rawProId, BEFORE the self-serve drop. Otherwise
-  // dropping pro_id would mask a genuinely transposed pair by emptying the
-  // very field the guard inspects.
-  assertNotTransposed(srsId, rawProId);
+  // v1.3 — every digital channel has a FIXED per-channel pseudo-promoter
+  // in the Notion "UTM Parameters" table (chatbot 5574, calculator-landing
+  // 5862, calculator-directmail 5396). An explicit value on the contact or
+  // payload always wins, so canvassing and events keep the real human
+  // promoter they pass per lead.
+  const proId = resolvePromoterForSource(srsId, contactProId);
+  const proIdFromRegistry = !contactProId && !!proId;
 
   const product = String(payload.product || 'Win');
   const sender = String(payload.sender || `GHL-${ghlContact.source || 'Agentic'}`);
@@ -449,12 +462,10 @@ export async function executeCreateLPLead(action) {
     : pathTaken === 'rest' ? 'REST /api/Leads/LeadAdd (fallback path)'
     : 'unknown';
   const proLine = proId
-    ? proId
-    : proIdDropped
-      ? `(dropped — srs_id ${srsId} is self-serve; pro_id ${rawProId} on the contact was not sent)`
-      : '(none)';
+    ? `${proId}${proIdFromRegistry ? ' (from channel registry)' : ''}`
+    : '(none)';
   await addGHLNote(contactId,
-    `[LP CREATE v1.2] Lead pushed to Lead Perfection inbound queue\n` +
+    `[LP CREATE v1.3] Lead pushed to Lead Perfection inbound queue\n` +
     `LP Inbound ID (in1_id): ${inboundId}\n` +
     `Path: ${pathLabel}\n` +
     `srs_id: ${srsId} | pro_id: ${proLine} | product: ${product} | sender: ${sender}\n` +
@@ -482,7 +493,7 @@ export async function executeCreateLPLead(action) {
   });
   await sendGroupMeMessage(successMsg).catch(() => {});
 
-  console.log(`[LP-CREATE] ✅ Lead pushed to LP (${pathTaken}): in1_id=${inboundId} for contact ${contactId} (srs=${srsId}, pro=${proId || (proIdDropped ? `dropped:${rawProId}` : 'none')}, email=${email || 'none'}, notes=${notes.length}ch, appt=${adate ? `${adate} ${atime}` : 'none'})`);
+  console.log(`[LP-CREATE] ✅ Lead pushed to LP (${pathTaken}): in1_id=${inboundId} for contact ${contactId} (srs=${srsId}, pro=${proId || 'none'}${proIdFromRegistry ? ':registry' : ''}, email=${email || 'none'}, notes=${notes.length}ch, appt=${adate ? `${adate} ${atime}` : 'none'})`);
 
   return {
     action: 'lp_lead_created',
@@ -491,7 +502,7 @@ export async function executeCreateLPLead(action) {
     path: pathTaken,
     srs_id: srsId,
     pro_id: proId || null,
-    pro_id_dropped: proIdDropped ? rawProId : null,
+    pro_id_from_registry: proIdFromRegistry,
     email: email || null,
     product,
     notes_chars: notes.length,
