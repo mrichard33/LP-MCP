@@ -1,71 +1,99 @@
 /**
  * LP attribution ID registry — src/lp-source-ids.js
  *
- * srs_id = LP SubSource (WHERE the lead came from)  — SETUP → CUSTOMERS → SOURCE SUBS
- * pro_id = LP Promoter employee ID (WHO procured it) — a different table entirely
+ * srs_id = LP SubSource   (WHERE the lead came from) — SETUP → CUSTOMERS → SOURCE SUBS
+ * pro_id = LP Promoter ID (WHO is credited)          — a different table entirely
  *
- * ─────────────────────────────────────────────────────────────────────
- * v2.0 (2026-08-18) — CHATBOT srs_id CORRECTED TO 830. The previous
- * values were inverted, and the guard below enforced the inversion.
+ * ═════════════════════════════════════════════════════════════════════
+ * v2.1 (2026-08-18) — CANONICAL SOURCE OF TRUTH IS THE NOTION
+ * "UTM Parameters" DATABASE (Marketing & Content →
+ * 30a68239-dd72-8081-9867-f10333ef320e). Every pair below is copied from
+ * it. Do not derive these from code, from LP row inspection, or from
+ * reasoning about which number "looks like" a SubSource. Read the table.
  *
- * WHY THE OLD VALUES WERE WRONG. 830 exists in BOTH LP tables:
- *   SubSource 830 = "Reece ChatBot"      (source "Website")
- *   Promoter  830 = "Godlewski, Paul"
- * That collision is almost certainly what made the original I.CT pairing
- * look transposed. It wasn't. `srs_id=830` was right all along.
+ *   Name                                LP Source ID   Pro ID
+ *   ─────────────────────────────────   ────────────   ──────
+ *   Chatbot Leads                            830        5574
+ *   Estimate Calculator - Landing Page       842        5862
+ *   Estimate Calculator - Direct Mail        837        5396
+ *   Canvassing Leads                         344        (none — dynamic)
+ *   Reece Charity Event                      847        (none)
  *
- * EVIDENCE (live lp_leads, pulled 2026-08-18):
- *   srs_id 830  → source "Website", sourcesubdescr "Reece ChatBot"
- *                 100 leads, 33 in the last 30 days, still flowing.
- *                 Sits inside the coherent 3-digit Website SubSource block:
- *                 533 Google, 534 Facebook, 535 Instagram, 536 Flyer on Door,
- *                 537 Radio, 538 TV, 539 Mail, 540 Newspaper, 541 Home Show,
- *                 542 Previous Customer, 543 Customer Referral, 544 Magazine,
- *                 545 Billboard, 830 Reece ChatBot, 842 Website Estimate Calculator.
- *   srs_id 5574 → source "", sourcesubdescr "". TWO leads, EVER. Both blank.
- *                 5574 is not in the SubSource table at all; LP stores the
- *                 integer and resolves nothing.
+ * THE RULE, corrected. pro_id is NOT "only when a canvasser is involved".
+ * It is the inverse: the DIGITAL channels each carry a FIXED per-channel
+ * pseudo-promoter, which is how LP segments self-serve sources in
+ * promoter-level reporting. Canvassing is the one WITHOUT a static Pro ID,
+ * because its promoter is a real, varying human passed per lead — which is
+ * why the canvassing row's utm_campaign is `{{contact.promotor}}` rather
+ * than a constant.
  *
- * Ruled by Mark 2026-08-18 after reading the LP record directly.
+ * Sanity check on the ID ranges, which is the fastest way to catch a swap:
+ *   SubSource IDs are 3-digit  — 344, 533-545, 830, 837, 842, 847
+ *   Promoter IDs are 4-digit   — 5396, 5574, 5686, 5862
+ * A 4-digit value in the srs_id slot is a transposition. Always.
  *
- * CONSEQUENCE OF THE OLD VALUES: every agentic chatbot push after
- * 2026-08-01 sent srs_id=5574 (no attribution) and pro_id=830, which
- * credited promoter Godlewski, Paul. All six Godlewski leads in LP are
- * GHL-originated (each carries a 20-char GHL contact ID as lognumber);
- * he never canvassed one.
+ * ─── HISTORY, so nobody re-derives the wrong answer a third time ───
  *
- * IF YOU ARE ABOUT TO "FIX" THIS BACK: don't. Read SETUP → CUSTOMERS →
- * SOURCE SUBS in the LP UI first. The number you want is the one whose
- * description is "Reece ChatBot". As of 2026-08-18 that is 830.
- * ─────────────────────────────────────────────────────────────────────
+ * v1.0 (2026-08-01) had CHATBOT srs_id 5574 / pro_id 830 — exactly
+ * reversed — and shipped a guard that THREW on the correct pair. Result:
+ * chatbot pushes sent 5574 into the SubSource slot (resolves to nothing in
+ * LP: 2 leads ever, both with blank source and blank sourcesubdescr) and
+ * 830 into the promoter slot, where LP resolved it to "Godlewski, Paul".
+ * All six Godlewski leads in LP are GHL-originated; he never worked one.
  *
- * HISTORICAL NOTE (v1.0, superseded). This file was created on 2026-08-01
- * in the belief that GHL workflow I.CT (98f54471) had shipped
- * `srs_id=830&pro_id=5574` backwards, splitting one bot across
- * "Chat (REECE WEBSITE)" (srs_id 749) and "Reece ChatBot" (srs_id 830).
- * The split was real. The diagnosis of which side was wrong was not:
- * 749 and 830 are two different SubSource rows, and the fix was to
- * consolidate onto 830 — not to abandon it for a number that resolves
- * to nothing.
+ * v2.0 (2026-08-18, same day, superseded within hours) corrected srs_id to
+ * 830 but then removed LP_PRO.CHATBOT entirely and added a
+ * dropPromoterForSelfServe() helper, on the reasoning that a self-serve
+ * lead has no promoter. That reasoning was wrong and the Notion table says
+ * so: self-serve is precisely where the fixed Pro ID lives. Both the
+ * constant and the helper are gone again in v2.1.
  *
- * Never inline these values again.
+ * WHAT MADE THIS HARD, recorded so the next person is faster:
+ *   1. 830 exists in BOTH tables — SubSource 830 "Reece ChatBot" AND
+ *      Promoter 830 "Godlewski, Paul". Looking up 830 and finding a person
+ *      does not mean 830 is a promoter ID.
+ *   2. The field constants in lp-lead.js were themselves swapped
+ *      (see that file, v1.3), so reading a contact's custom fields
+ *      reproduced the inversion rather than exposing it.
+ *   3. Two SubSource rows describe the same bot — 749 "Chat (REECE
+ *      WEBSITE)" and 830 "Reece ChatBot". The consolidation target is 830.
+ *
+ * Never inline these values again. If a value here disagrees with the
+ * Notion table, the Notion table wins and this file is stale.
+ * ═════════════════════════════════════════════════════════════════════
  */
 
+/** LP SubSource IDs (3-digit). Source: Notion "UTM Parameters". */
 export const LP_SRS = {
-  // LP SubSource "Reece ChatBot" — source "Website". Verified against the
-  // live SubSource table 2026-08-18. Was '5574' (invalid) v1.0–v1.x.
-  CHATBOT: '830',
+  CHATBOT: '830',              // "Reece ChatBot" — source "Website"
+  CALCULATOR_LANDING: '842',   // "Website Estimate Calculator" — source "Main Website"
+  CALCULATOR_DIRECTMAIL: '837',
+  CANVASSING: '344',           // "Canvass"
+  CHARITY_EVENT: '847',
+  CHATBOT_LEGACY: '749',       // "Chat (REECE WEBSITE)" — pre-consolidation chatbot row
 };
 
+/**
+ * LP Promoter IDs (4-digit). Source: Notion "UTM Parameters".
+ *
+ * These are fixed per-channel pseudo-promoters for self-serve digital
+ * sources. Canvassing and events are deliberately absent: their promoter
+ * is a real person and is passed per-lead, not from this registry.
+ */
 export const LP_PRO = {
-  // Promoters are the people who PROCURE a lead — canvassers, home-show
-  // staff, telemarketers. A chatbot lead has no promoter, so there is no
-  // CHATBOT entry here by design.
-  //
-  // Do NOT add one. Sending pro_id on a self-serve web lead credits a
-  // human for work they did not do and corrupts promoter-level reporting.
-  // See dropPromoterForSelfServe() below and the caller in
-  // src/actions/handlers/lp-lead.js.
+  CHATBOT: '5574',
+  CALCULATOR_LANDING: '5862',
+  CALCULATOR_DIRECTMAIL: '5396',
+};
+
+/**
+ * The canonical srs_id → pro_id pairing. Use resolvePromoterForSource()
+ * rather than reading this directly.
+ */
+export const SRS_TO_PRO = {
+  [LP_SRS.CHATBOT]: LP_PRO.CHATBOT,
+  [LP_SRS.CALCULATOR_LANDING]: LP_PRO.CALCULATOR_LANDING,
+  [LP_SRS.CALCULATOR_DIRECTMAIL]: LP_PRO.CALCULATOR_DIRECTMAIL,
 };
 
 /**
@@ -78,69 +106,54 @@ export const LP_EMP = {
 };
 
 /**
- * SubSource IDs that represent a self-serve digital surface: the lead
- * arrived on its own and no human procured it. pro_id must be omitted for
- * these (Mark's ruling, 2026-08-18: "pro_id is really for when there is a
- * canvasser").
+ * Resolve the pro_id to send for a given srs_id.
  *
- * Add to this set when a new self-serve SubSource is created in LP.
- */
-export const SELF_SERVE_SRS_IDS = new Set([
-  '830',  // Reece ChatBot
-  '842',  // Website Estimate Calculator
-  '749',  // Chat (REECE WEBSITE) — legacy chatbot row, still receives stragglers
-]);
-
-/**
- * Return the pro_id that should actually be sent, given the resolved
- * srs_id. Returns '' for self-serve digital sources so the caller omits
- * the field entirely.
- *
- * Canvassing, home shows and telemarketing keep their promoter — that is
- * the whole point of the field.
+ * An explicitly supplied proId always wins — canvassing and events pass a
+ * real promoter per lead and must never be overridden. When none is
+ * supplied and the source is a known digital channel, the registry pair is
+ * used. Otherwise returns '' and the caller omits the field.
  *
  * @param {string|number} srsId  resolved LP SubSource ID
- * @param {string|number} proId  resolved LP Promoter ID (may be blank)
+ * @param {string|number} [proId] explicitly supplied promoter, if any
  * @returns {string} the pro_id to send, or '' to omit
  */
-export function dropPromoterForSelfServe(srsId, proId) {
-  if (!proId) return '';
-  if (SELF_SERVE_SRS_IDS.has(String(srsId))) return '';
-  return String(proId);
+export function resolvePromoterForSource(srsId, proId) {
+  if (proId) return String(proId);
+  return SRS_TO_PRO[String(srsId)] || '';
 }
 
 /**
  * Guard the known transposition. Throw rather than misattribute.
  *
- * v2.0 — the expected pair is INVERTED from v1.0. The transposed shape is
- * now `srs_id=5574 / pro_id=830`: a SubSource slot holding a number that
- * resolves to nothing, and a promoter slot holding the real SubSource ID.
- * That is precisely what the v1.0 registry produced, so this guard now
- * catches its own predecessor's output.
- *
- * Deliberately narrow: it fires only on that exact pair, not on any
- * unfamiliar combination. A broad "does this look wrong" heuristic would
- * reject the legitimate non-chatbot srs/pro pairs that flow through
- * create_lp_lead from contact custom fields.
+ * v2.1 — generalised from a single hardcoded pair to the structural rule,
+ * because this exact swap has now been made twice in opposite directions
+ * and a narrow check caught neither. SubSource IDs are 3-digit and
+ * Promoter IDs are 4-digit, so a 4-digit srs_id paired with a 3-digit
+ * pro_id is a transposition regardless of which channel it came from.
  *
  * Throwing is the correct failure mode: the action goes `failed`, the
- * reaper does not retry create_lp_lead (marked non-idempotent 2026-05-01),
- * and GroupMe escalates — all far better than silently writing a lead into
- * LP under the wrong source, which cannot be corrected after the fact.
- * LP exposes no write endpoint that accepts srs_id; UpdateProspectInfo
- * covers name/address/phone/email only, so a misattributed lead can only
- * be repaired by hand in the LP UI.
+ * reaper does not retry create_lp_lead (non-idempotent since 2026-05-01),
+ * and GroupMe escalates. Far better than silently writing a lead under the
+ * wrong source — LP exposes NO write endpoint that accepts srs_id
+ * (UpdateProspectInfo covers name/address/phone/email only), so a
+ * misattributed lead can only ever be repaired by hand in the LP UI.
  *
  * @param {string|number} srsId  resolved LP SubSource ID
  * @param {string|number} proId  resolved LP Promoter ID
- * @throws {Error} when the pair is the known transposition
+ * @throws {Error} when the pair looks transposed
  */
 export function assertNotTransposed(srsId, proId) {
-  if (String(srsId) === '5574' && String(proId) === LP_SRS.CHATBOT) {
+  const s = String(srsId || '');
+  const p = String(proId || '');
+  if (!s || !p) return;
+  if (!/^\d+$/.test(s) || !/^\d+$/.test(p)) return;
+
+  if (s.length >= 4 && p.length === 3) {
     throw new Error(
-      `LP attribution transposed: srs_id=${srsId}/pro_id=${proId}. ` +
-      `5574 is not a SubSource (it resolves to blank in LP); ${LP_SRS.CHATBOT} is ` +
-      `"Reece ChatBot". Expected srs_id=${LP_SRS.CHATBOT} with no pro_id.`
+      `LP attribution transposed: srs_id=${s}/pro_id=${p}. LP SubSource IDs ` +
+      `are 3-digit and Promoter IDs are 4-digit, so these are the wrong way ` +
+      `round. Canonical pairs live in the Notion "UTM Parameters" table — ` +
+      `chatbot is srs_id=${LP_SRS.CHATBOT}/pro_id=${LP_PRO.CHATBOT}.`
     );
   }
 }
@@ -148,8 +161,8 @@ export function assertNotTransposed(srsId, proId) {
 export default {
   LP_SRS,
   LP_PRO,
+  SRS_TO_PRO,
   LP_EMP,
-  SELF_SERVE_SRS_IDS,
-  dropPromoterForSelfServe,
+  resolvePromoterForSource,
   assertNotTransposed,
 };
