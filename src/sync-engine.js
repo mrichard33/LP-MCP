@@ -262,35 +262,81 @@ const SYNC_WINDOW_OVERLAP_MIN = parseInt(process.env.SYNC_WINDOW_OVERLAP_MIN || 
 // value is probed before the run commits to it.
 const SYNC_WINDOW_TS_FORMAT = (process.env.SYNC_WINDOW_TS_FORMAT || 'space').toLowerCase();
 
+// v6.14: LP evaluates its date windows in EASTERN, not UTC. Every window value
+// we send must therefore be formatted in America/New_York. See etDateString in
+// src/admin/lp-cohort-reconcile.js, which already documents this contract.
+function etDateString(d = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(d);
+}
+
+// ET wall-clock "YYYY-MM-DD HH:mm:ss" (or ISO-style with a T separator).
+function etTimestampString(d = new Date()) {
+  const p = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  }).formatToParts(d).reduce((a, x) => { a[x.type] = x.value; return a; }, {});
+  // Intl can emit hour '24' at midnight in some runtimes; normalise to '00'.
+  const hh = p.hour === '24' ? '00' : p.hour;
+  return `${p.year}-${p.month}-${p.day} ${hh}:${p.minute}:${p.second}`;
+}
+
 function formatLpWindowStart(date) {
-  const iso = date.toISOString().slice(0, 19); // YYYY-MM-DDTHH:mm:ss
-  return SYNC_WINDOW_TS_FORMAT === 'iso' ? iso : iso.replace('T', ' ');
+  const ts = etTimestampString(date); // ET wall clock — LP reads it as Eastern
+  return SYNC_WINDOW_TS_FORMAT === 'iso' ? ts.replace(' ', 'T') : ts;
 }
 
 // Build the window start. Returns the legacy date string unless timestamp mode
-// is on AND LP accepts the timestamped value — verified with ONE cheap 1-row
-// call before the sweeps start. Fails safe: any error falls back to the date
-// window for this run, so an LP that rejects the format degrades to today's
-// behavior instead of failing the sync.
+// is on AND LP is PROVEN to honour a time component in `startdate`.
+//
+// v6.14 — why the probe is a COMPARISON and not a single call. The earlier
+// version issued one 1-row call with the timestamped value and treated
+// "it didn't throw" as acceptance. That is not evidence: LP answers a startdate
+// it mangles — or one that has been shifted into the future by a timezone bug —
+// with an empty 200, which is indistinguishable from a genuinely empty window.
+// The sweep would then silently read nothing and record a clean run.
+//
+// So we compare two calls that MUST agree: the plain date window, and the SAME
+// instant written in timestamp form (midnight of that date). If the date window
+// returns a row and its timestamped equivalent returns none, LP did not parse
+// the time component and we fall back. If the date window is itself empty the
+// probe proves nothing — and timestamp mode would save nothing either — so we
+// fall back there too. A server that silently TRUNCATES the time passes this
+// probe; that degrades to the date window's coverage, which is safe (wider),
+// just not cheaper.
 async function resolveWindowStart(lastSyncTime, enddate) {
-  const dateSince = lastSyncTime.toISOString().slice(0, 10);
+  const dateSince = etDateString(lastSyncTime); // ET, not UTC — LP windows are Eastern
   if (SYNC_WINDOW_MODE !== 'timestamp') return { since: dateSince, kind: 'date' };
 
   const cursor = new Date(lastSyncTime.getTime() - SYNC_WINDOW_OVERLAP_MIN * 60000);
   // Never let the cursor run past the legacy start — the date window is the
   // conservative bound, and widening it here would be a regression.
-  if (cursor.toISOString().slice(0, 10) < dateSince) {
+  if (etDateString(cursor) < dateSince) {
     console.warn(`[Sync] Window cursor ${cursor.toISOString()} predates the date window ${dateSince} (overlap ${SYNC_WINDOW_OVERLAP_MIN}min) — using the date window`);
     return { since: dateSince, kind: 'date' };
   }
   const tsSince = formatLpWindowStart(cursor);
+  const equivTs = SYNC_WINDOW_TS_FORMAT === 'iso' ? `${dateSince}T00:00:00` : `${dateSince} 00:00:00`;
+
+  let baseRows, equivRows;
   try {
-    await getLeadData({ startdate: tsSince, enddate, PageSize: 1, StartIndex: 1 });
-    return { since: tsSince, kind: 'timestamp' };
+    baseRows  = extractArray(await getLeadData({ startdate: dateSince, enddate, PageSize: 1, StartIndex: 1 })).length;
+    equivRows = extractArray(await getLeadData({ startdate: equivTs,  enddate, PageSize: 1, StartIndex: 1 })).length;
   } catch (err) {
-    console.error(`[Sync] LP rejected timestamped startdate "${tsSince}" (${err.message}) — falling back to the date window ${dateSince} for this run`);
+    console.error(`[Sync] Window probe failed (${err.message}) — falling back to the date window ${dateSince} for this run`);
     return { since: dateSince, kind: 'date' };
   }
+
+  if (baseRows === 0) {
+    console.log(`[Sync] Window probe inconclusive — the date window ${dateSince}→${enddate} is itself empty, so an empty timestamped result proves nothing; using the date window`);
+    return { since: dateSince, kind: 'date' };
+  }
+  if (equivRows === 0) {
+    console.error(`[Sync] LP returned 0 rows for the timestamped equivalent "${equivTs}" but ${baseRows} for "${dateSince}" — the time component is NOT honoured; using the date window`);
+    return { since: dateSince, kind: 'date' };
+  }
+  return { since: tsSince, kind: 'timestamp' };
 }
 
 // ─── Payload Hash (v6.11) ─────────────────────────────────────────
@@ -1013,7 +1059,13 @@ export async function incrementalSync() {
     }
 
     const logIds = await syncLogStartAll('incremental', ['leads', 'calls', 'notes', 'jobs', 'milestones', 'activities']);
-    const today = new Date().toISOString().slice(0, 10);
+    // v6.14: ET, not UTC. From 20:00 ET the UTC calendar date is ALREADY
+    // TOMORROW in Eastern, so this asked LP for a window that had not begun —
+    // LP returned an empty first page and the sweep exited in ~8s having
+    // scanned nothing. Measured: 96 consecutive zero-record runs across
+    // 21:00-23:59 ET, against ~400 lead changes and ~590 note creations that
+    // LP itself records in that band over 30 days.
+    const today = etDateString();
     // v6.13: real timestamp cursor when enabled and accepted by LP; the
     // legacy midnight-truncated date otherwise.
     const { since, kind: windowKind } = await resolveWindowStart(lastSyncTime, today);
