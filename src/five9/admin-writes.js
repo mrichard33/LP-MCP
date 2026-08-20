@@ -755,12 +755,12 @@ export function buildAsyncAddRecordsToListXml(listName, fieldNames, records) {
  * send <id>; userName + skillName are the natural key.
  * ---------------------------------------------------------------------- */
 
-const USER_SKILL_FIELD_ORDER = ['id', 'level', 'skillName', 'userName'];
+export const USER_SKILL_FIELD_ORDER = ['id', 'level', 'skillName', 'userName'];
 
 // `dialingSchedule` is a nested complex type and is deliberately NOT patchable
 // in v1 — only scalars are emitted. It stays in the order array so the
 // sequence stays a faithful copy of the WSDL.
-const CAMPAIGN_PROFILE_FIELD_ORDER = [
+export const CAMPAIGN_PROFILE_FIELD_ORDER = [
   'ANI', 'description', 'dialingSchedule', 'dialingTimeout',
   'initialCallPriority', 'maxCharges', 'name', 'numberOfAttempts',
 ];
