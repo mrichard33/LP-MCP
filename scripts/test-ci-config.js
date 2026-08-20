@@ -26,7 +26,13 @@ import {
   allowProbableLp,
   nextRetryAt,
 } from '../src/ci/config.js';
-import { teamFromName, isCanvassConfirmation } from './seed-ci-maps.js';
+import {
+  teamFromName,
+  teamFromEmail,
+  deriveTeam,
+  isServiceAccount,
+  isCanvassConfirmation,
+} from './seed-ci-maps.js';
 
 const FLAG_KEYS = [
   'CALL_INTEL_LP_WRITES',
@@ -193,4 +199,67 @@ test('isCanvassConfirmation matches by live-name content, case-insensitively', (
   assert.equal(isCanvassConfirmation('Canvass Outbound'), false);
   assert.equal(isCanvassConfirmation('Confirmation Calls'), false);
   assert.equal(isCanvassConfirmation(''), false);
+});
+
+// The live 2026-08-20 campaign list contains BOTH of these. Matching the
+// canvass line must not also catch the ordinary confirmation line, and the
+// canvass row's key must be the full live name — the handoff's shorthand
+// "Canvass Confirmation" is the dial PROFILE name and matches no campaign.
+test('the live canvass line matches and the ordinary confirmation line does not', () => {
+  assert.equal(isCanvassConfirmation('Canvass Confirmation - Inbound'), true);
+  assert.equal(isCanvassConfirmation('Confirmation - Inbound'), false);
+  assert.equal(isCanvassConfirmation('Conf - Next Day'), false);
+});
+
+test('teamFromEmail: measured live-domain patterns, no overlap', () => {
+  assert.equal(teamFromEmail('ssmith@lightfirepartners.com'), 'lightfire');
+  assert.equal(teamFromEmail('craigdlfpc@gmail.com'), 'lightfire');
+  assert.equal(teamFromEmail('daanaelfpc@gmail.com'), 'lightfire');
+  assert.equal(teamFromEmail('r.lymych@reecewindows.com'), 'reece');
+  assert.equal(teamFromEmail('J.Nunes@Reecewindows.com'), 'reece');   // live casing varies
+  assert.equal(teamFromEmail('dylannunes.reece@gmail.com'), 'reece');
+  // Deliberately undecided — a different entity, and unlabelled personal mail.
+  assert.equal(teamFromEmail('brian@reecebuilders.com'), null);
+  assert.equal(teamFromEmail('hilla0616@gmail.com'), null);
+  assert.equal(teamFromEmail(''), null);
+  assert.equal(teamFromEmail(null), null);
+});
+
+// THE DEFECT THIS GUARDS: measured 2026-08-20, zero of 48 live Five9 users
+// carry an LP-name suffix, so a name-only rule with a 'reece' fallback
+// labelled nine demonstrably-LightFire agents as Reece — silently, on every
+// note and every report.
+test('deriveTeam: LightFire agents never come back as reece', () => {
+  assert.equal(deriveTeam({ firstName: 'Shakeriah', lastName: 'Smith', EMail: 'ssmith@lightfirepartners.com' }), 'lightfire');
+  assert.equal(deriveTeam({ firstName: 'Craig', lastName: 'Deer', EMail: 'craigdlfpc@gmail.com' }), 'lightfire');
+  assert.equal(deriveTeam({ firstName: 'Carla', lastName: 'Wright', EMail: 'carlawlfpc@gmail.com' }), 'lightfire');
+});
+
+test('deriveTeam: suffix wins over email when present', () => {
+  assert.equal(deriveTeam({ firstName: 'Jane', lastName: 'Doe - NC', EMail: 'jane.reece@gmail.com' }), 'north_carolina');
+  assert.equal(deriveTeam({ firstName: 'Jane', lastName: 'Doe - FTM', EMail: 'jane@reecewindows.com' }), 'ftm');
+});
+
+test("deriveTeam: undecidable agents are 'unknown', never a guessed team", () => {
+  assert.equal(deriveTeam({ firstName: 'Brian', lastName: 'Lovette', EMail: 'brian@reecebuilders.com' }), 'unknown');
+  assert.equal(deriveTeam({ firstName: 'April', lastName: 'Hill', EMail: 'hilla0616@gmail.com' }), 'unknown');
+  assert.equal(deriveTeam({ firstName: 'Nobody', lastName: 'Here' }), 'unknown');
+  assert.equal(deriveTeam({}), 'unknown');
+});
+
+test('isServiceAccount: the six non-agent logins are excluded, real agents are not', () => {
+  for (const userName of [
+    'ETG - Reece Windows',
+    'LeadPerfectio@reecewindows.com',
+    'LeadPerfectioASAP@reecewindows.com',
+    'svc-reece-api',
+    'reecewindowsvcc@outboundani.com',
+    'reecewindowsapi@outboundani.com',
+  ]) {
+    assert.equal(isServiceAccount({ userName }), true, `${userName} must be skipped`);
+  }
+  for (const userName of ['cavril', 'rjakob', 'ssmith3', 'm.richard@reecewindows.com']) {
+    assert.equal(isServiceAccount({ userName }), false, `${userName} must be seeded`);
+  }
+  assert.equal(isServiceAccount({}), false);
 });

@@ -16,10 +16,13 @@
  *     (4075126443 → lightfire). 954-800-8906 is deliberately NOT seeded —
  *     PHASE 0 item 2b (identify that destination) is still open.
  *
- * Team derivation (handoff decision #5, deterministic): a name suffix of
- * " - LF" → lightfire, " - NC" → north_carolina, " - FTM" → ftm; agents with
- * no suffix → reece (ci_agent_map default); campaigns with no suffix →
- * team NULL (team then comes from the agent map at classification time).
+ * Team derivation (deterministic, in order): the handoff's LP-name suffix
+ * (" - LF" → lightfire, " - NC" → north_carolina, " - FTM" → ftm), then the
+ * email domain, then 'unknown'. It never falls back to a real team — see the
+ * block comment on deriveTeam() for why the suffix rule alone silently
+ * mislabels nine LightFire agents on this domain. Campaigns keep the suffix
+ * rule only, and no match leaves team NULL (team then comes from the agent
+ * map at classification time). Six non-agent service logins are skipped.
  *
  * match_strategy: 'phone' for every campaign EXCEPT canvass-confirmation
  * campaigns, which get 'canvass_correlation' (on those calls the ANI is the
@@ -49,12 +52,37 @@
 
 const EXECUTE = process.argv.includes('--execute');
 
-// ─── team derivation (handoff decision #5) ──────────────────────────────────
+// ─── team derivation ────────────────────────────────────────────────────────
+//
+// Handoff decision #5 names `- LF` / `- NC` / `- FTM` suffixes, but it calls
+// them **LP**-name suffixes and that convention does NOT exist on the Five9
+// side: measured 2026-08-20 against the live domain, ZERO of 48 Five9 users
+// carry one. Deriving team from the Five9 name alone therefore silently
+// returns the same answer for everybody — and with the old 'reece' fallback
+// that answer was wrong for nine agents who are demonstrably LightFire
+// (2 @lightfirepartners.com + 7 *lfpc@gmail.com). Mis-attributing every
+// LightFire call to Reece in every note and every report is exactly the
+// silent-corruption class the lp_setter_roster header warns about.
+//
+// So: keep the suffix rule FIRST (it is correct whenever it does fire, e.g.
+// if an agent is later renamed to match the LP convention), then fall back to
+// the email domain, which IS a reliable signal in this domain. Anything the
+// rules cannot decide becomes 'unknown' — never a guess — which routes the
+// call to review per decision #5, and is reported for human assignment.
 
 const TEAM_SUFFIXES = [
   [/\s*-\s*LF$/i, 'lightfire'],
   [/\s*-\s*NC$/i, 'north_carolina'],
   [/\s*-\s*FTM$/i, 'ftm'],
+];
+
+// Email → team. Measured against the live domain 2026-08-20; every pattern
+// below is present on real users, and none of them overlap.
+const TEAM_EMAIL_RULES = [
+  [/@lightfirepartners\.com$/i, 'lightfire'],
+  [/lfpc@gmail\.com$/i, 'lightfire'],       // LightFire Partners call-centre gmails
+  [/@reecewindows\.com$/i, 'reece'],
+  [/\.reece@gmail\.com$/i, 'reece'],        // the ".reece@gmail.com" agent convention
 ];
 
 export function teamFromName(name) {
@@ -63,6 +91,55 @@ export function teamFromName(name) {
     if (re.test(s)) return team;
   }
   return null;
+}
+
+export function teamFromEmail(email) {
+  const s = String(email || '').trim();
+  if (!s) return null;
+  for (const [re, team] of TEAM_EMAIL_RULES) {
+    if (re.test(s)) return team;
+  }
+  return null;
+}
+
+/**
+ * Full derivation for one live Five9 user: LP-name suffix, then email, then
+ * 'unknown'. Never defaults to a real team — an unmapped agent must surface
+ * as review, not as a confident wrong answer.
+ *
+ * Deliberately NOT decided here: @reecebuilders.com (a different entity with
+ * no slot in the reece|lightfire|north_carolina|ftm enum) and the unlabelled
+ * personal gmails from the 2026-07-30 onboarding batch. Both land 'unknown'
+ * and are printed for Mark to assign.
+ */
+export function deriveTeam(user) {
+  const name = [user?.firstName, user?.lastName].filter(Boolean).join(' ') || user?.fullName || '';
+  return teamFromName(name)
+    || teamFromName(user?.userName)
+    || teamFromEmail(user?.EMail || user?.email)
+    || 'unknown';
+}
+
+/**
+ * Non-agent logins: integration service accounts and the outbound-ANI
+ * carrier logins. They never take a customer call, so seeding them as agents
+ * would put six rows of noise in a table whose whole job is agent identity.
+ * Listed explicitly and echoed in every run's output so the exclusion is
+ * auditable rather than invisible — and a service account that somehow DOES
+ * appear on a call is simply absent from the map, which yields team
+ * 'unknown' → review, the safe outcome either way.
+ */
+const SERVICE_ACCOUNT_USERNAMES = new Set([
+  'ETG - Reece Windows',
+  'LeadPerfectio@reecewindows.com',
+  'LeadPerfectioASAP@reecewindows.com',
+  'svc-reece-api',
+  'reecewindowsvcc@outboundani.com',
+  'reecewindowsapi@outboundani.com',
+]);
+
+export function isServiceAccount(user) {
+  return SERVICE_ACCOUNT_USERNAMES.has(String(user?.userName || ''));
 }
 
 // Canvass-correlation selector, run over the LIVE campaign list only.
@@ -87,6 +164,7 @@ async function main() {
   const { users } = await getUsersGeneralInfo('.*');
   const agentRows = [];
   const undecidedAgents = [];
+  const skippedServiceAccounts = [];
   for (const u of users) {
     const id = u.id || u.userId || null;
     const name = [u.firstName, u.lastName].filter(Boolean).join(' ') || u.userName || null;
@@ -94,15 +172,22 @@ async function main() {
       undecidedAgents.push({ reason: 'no Five9 user id in SOAP response', user: u.userName || JSON.stringify(u).slice(0, 120) });
       continue;
     }
+    if (isServiceAccount(u)) {
+      skippedServiceAccounts.push(name || u.userName);
+      continue;
+    }
     agentRows.push({
       agent_five9_id: String(id),
       agent_name: name,
-      team: teamFromName(name) || teamFromName(u.userName) || 'reece',
+      team: deriveTeam(u),
       active: u.active === undefined ? true : String(u.active) === 'true',
     });
     // lp_emp_id is not derivable from Five9 — it stays NULL until mapped by
     // hand or a later join; nothing in v1 depends on it.
   }
+  // An 'unknown' team is a real seed outcome, not a failure — but it means
+  // that agent's calls all route to review, so it needs eyes before volume.
+  const unknownTeamAgents = agentRows.filter((r) => r.team === 'unknown');
 
   // ─── campaigns ─────────────────────────────────────────────────────────────
   const { campaigns } = await getCampaigns();
@@ -119,6 +204,18 @@ async function main() {
   console.log(`ci_agent_map — ${agentRows.length} proposed rows (from ${users.length} live Five9 users):`);
   for (const r of agentRows) {
     console.log(`  ${r.agent_five9_id}  ${String(r.agent_name).padEnd(32)} team=${r.team}${r.active ? '' : '  (inactive)'}`);
+  }
+  const byTeam = agentRows.reduce((acc, r) => ({ ...acc, [r.team]: (acc[r.team] || 0) + 1 }), {});
+  console.log(`  team totals: ${Object.entries(byTeam).map(([t, n]) => `${t}=${n}`).join('  ')}`);
+
+  if (skippedServiceAccounts.length) {
+    console.log(`\n  SKIPPED — ${skippedServiceAccounts.length} non-agent service login(s), never seeded:`);
+    for (const n of skippedServiceAccounts) console.log(`    ${n}`);
+  }
+  if (unknownTeamAgents.length) {
+    console.log(`\n  TEAM UNKNOWN — ${unknownTeamAgents.length} agent(s) no rule could decide. Seeded as 'unknown',`);
+    console.log(`  which sends every one of their calls to review. Assign these by hand before volume:`);
+    for (const r of unknownTeamAgents) console.log(`    ${r.agent_five9_id}  ${r.agent_name}`);
   }
   if (undecidedAgents.length) {
     console.log(`\n  UNDECIDED — ${undecidedAgents.length} user(s) the rule could not map (NOT seeded; resolve by hand):`);
