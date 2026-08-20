@@ -806,6 +806,187 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] addlead address hold substrate FAILED (address gate holds disabled — apply sql/060 manually):', err.message);
   }
+
+  // Call Intelligence substrate (sql/061 — the file is the source of truth;
+  // this mirror guarantees the ci_* tables exist before the pipeline workers
+  // land in PRs 2–6). Everything is additive and ci_-prefixed; no existing
+  // table or view is touched. The claim-path index is mirrored as a plain
+  // CREATE INDEX IF NOT EXISTS — never CONCURRENTLY here (run_sql wraps in a
+  // transaction); on any deploy where this mirror creates the schema the
+  // table is empty, and the CONCURRENTLY form stays in sql/061 under its
+  // RUN SEPARATELY banner for the populated-table case.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE TABLE IF NOT EXISTS ci_calls (
+              id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+              five9_call_id     text NOT NULL,
+              five9_session_id  text,
+              call_start        timestamptz NOT NULL,
+              call_end          timestamptz,
+              duration_seconds  integer,
+              direction         text,
+              ani               text,
+              dnis              text,
+              customer_phone    text,
+              customer_phone_e164 text,
+              campaign          text,
+              skill             text,
+              disposition       text,
+              agent_five9_id    text,
+              agent_name        text,
+              team              text NOT NULL DEFAULT 'unknown',
+              was_transferred   boolean DEFAULT false,
+              raw_metadata      jsonb,
+              eligible          boolean NOT NULL DEFAULT true,
+              ineligible_reason text,
+              status            text NOT NULL DEFAULT 'discovered'
+                                CHECK (status IN ('discovered','fetched','transcribed','analyzed',
+                                                  'matched','syncing','completed','skipped','review','failed')),
+              status_detail     text,
+              review_reason     text,
+              attempts          integer NOT NULL DEFAULT 0,
+              next_retry_at     timestamptz,
+              locked_until      timestamptz,
+              locked_by         text,
+              created_at        timestamptz NOT NULL DEFAULT now(),
+              updated_at        timestamptz NOT NULL DEFAULT now(),
+              UNIQUE (five9_call_id)
+            );
+            CREATE TABLE IF NOT EXISTS ci_recordings (
+              id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+              call_id          uuid NOT NULL REFERENCES ci_calls(id),
+              five9_recording_id text,
+              source           text NOT NULL CHECK (source IN ('sftp','manual','five9_api')),
+              source_filename  text,
+              file_sha256      text,
+              file_bytes       bigint,
+              mime              text,
+              channels         integer,
+              storage_path     text,
+              fetched_at       timestamptz DEFAULT now(),
+              purged_at        timestamptz,
+              UNIQUE (call_id, source_filename)
+            );
+            CREATE TABLE IF NOT EXISTS ci_transcripts (
+              id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+              call_id            uuid NOT NULL UNIQUE REFERENCES ci_calls(id),
+              engine             text NOT NULL,
+              engine_model       text NOT NULL,
+              language           text,
+              diarization_method text NOT NULL CHECK (diarization_method IN ('stereo_channels','none')),
+              transcript_text    text NOT NULL,
+              segments           jsonb,
+              confidence         numeric,
+              low_confidence     boolean NOT NULL DEFAULT false,
+              audio_seconds      integer,
+              created_at         timestamptz NOT NULL DEFAULT now()
+            );
+            CREATE TABLE IF NOT EXISTS ci_summaries (
+              id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+              call_id         uuid NOT NULL REFERENCES ci_calls(id),
+              model           text NOT NULL,
+              prompt_version  text NOT NULL,
+              schema_version  text NOT NULL,
+              output          jsonb NOT NULL,
+              summary_text    text NOT NULL,
+              outcome         text NOT NULL,
+              outcome_confidence numeric NOT NULL,
+              review_flags    text[] NOT NULL DEFAULT '{}',
+              usage           jsonb,
+              is_current      boolean NOT NULL DEFAULT true,
+              created_at      timestamptz NOT NULL DEFAULT now()
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS ci_summaries_current_uq
+              ON ci_summaries (call_id) WHERE is_current;
+            CREATE TABLE IF NOT EXISTS ci_matches (
+              id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+              call_id      uuid NOT NULL UNIQUE REFERENCES ci_calls(id),
+              lp_cst_id    integer,
+              lp_lds_id    integer,
+              ghl_contact_id text,
+              method       text NOT NULL,
+              tier         text NOT NULL CHECK (tier IN ('exact','high','probable','ambiguous','none')),
+              confidence   numeric,
+              candidates   jsonb,
+              evidence     jsonb,
+              decided_by   text NOT NULL DEFAULT 'auto' CHECK (decided_by IN ('auto','human')),
+              decided_at   timestamptz NOT NULL DEFAULT now()
+            );
+            CREATE TABLE IF NOT EXISTS ci_syncs (
+              id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+              call_id         uuid NOT NULL REFERENCES ci_calls(id),
+              target          text NOT NULL CHECK (target IN ('lp','ghl')),
+              status          text NOT NULL DEFAULT 'pending'
+                              CHECK (status IN ('pending','shadow','synced','failed','skipped')),
+              idempotency_key text NOT NULL UNIQUE,
+              note_body       text,
+              request         jsonb,
+              response        jsonb,
+              external_ref    text,
+              error           text,
+              attempts        integer NOT NULL DEFAULT 0,
+              synced_at       timestamptz,
+              created_at      timestamptz NOT NULL DEFAULT now(),
+              UNIQUE (call_id, target)
+            );
+            CREATE TABLE IF NOT EXISTS ci_agent_map (
+              agent_five9_id  text PRIMARY KEY,
+              agent_name      text,
+              lp_emp_id       integer,
+              team            text NOT NULL DEFAULT 'reece',
+              active          boolean NOT NULL DEFAULT true,
+              updated_at      timestamptz NOT NULL DEFAULT now()
+            );
+            CREATE TABLE IF NOT EXISTS ci_campaign_map (
+              campaign          text PRIMARY KEY,
+              team              text,
+              eligible          boolean NOT NULL DEFAULT true,
+              excluded_dispositions text[] NOT NULL DEFAULT '{}',
+              match_strategy    text NOT NULL DEFAULT 'phone',
+              updated_at        timestamptz NOT NULL DEFAULT now()
+            );
+            CREATE TABLE IF NOT EXISTS ci_transfer_target_map (
+              dnis        text PRIMARY KEY,
+              team        text NOT NULL,
+              label       text,
+              updated_at  timestamptz NOT NULL DEFAULT now()
+            );
+            CREATE TABLE IF NOT EXISTS ci_events (
+              id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+              call_id    uuid REFERENCES ci_calls(id),
+              stage      text NOT NULL,
+              event      text NOT NULL,
+              detail     jsonb,
+              created_at timestamptz NOT NULL DEFAULT now()
+            );
+            CREATE TABLE IF NOT EXISTS ci_qa_reviews (
+              id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+              call_id       uuid NOT NULL REFERENCES ci_calls(id),
+              reviewer      text NOT NULL,
+              transcript_ok boolean, summary_ok boolean, outcome_ok boolean, match_ok boolean,
+              notes         text,
+              created_at    timestamptz NOT NULL DEFAULT now()
+            );
+            CREATE INDEX IF NOT EXISTS ci_calls_status_retry_idx
+              ON ci_calls (status, next_retry_at, call_start);
+            CREATE OR REPLACE VIEW v_ci_pipeline_health AS
+            SELECT status, count(*) AS calls,
+                   min(call_start AT TIME ZONE 'America/New_York') AS oldest_et,
+                   max(call_start AT TIME ZONE 'America/New_York') AS newest_et
+            FROM ci_calls GROUP BY status;
+            CREATE OR REPLACE VIEW v_ci_review_queue AS
+            SELECT c.id, c.five9_call_id, c.call_start AT TIME ZONE 'America/New_York' AS call_et,
+                   c.agent_name, c.team, c.customer_phone_e164, c.disposition,
+                   c.review_reason, s.summary_text, s.outcome, m.tier, m.candidates
+            FROM ci_calls c
+            LEFT JOIN ci_summaries s ON s.call_id = c.id AND s.is_current
+            LEFT JOIN ci_matches   m ON m.call_id = c.id
+            WHERE c.status = 'review'
+            ORDER BY c.call_start;`);
+    console.log('[Migration] call intelligence substrate (sql/061) ready');
+  } catch (err) {
+    console.error('[Migration] call intelligence substrate FAILED (CI pipeline tables missing, PRs 2+ workers cannot run — apply sql/061 manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
