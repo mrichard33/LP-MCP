@@ -1061,6 +1061,23 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] call intelligence claim function FAILED (worker runs unleased, single-driver — apply sql/063 manually):', err.message);
   }
+
+  // CI agent join-by-login (sql/064 — the file is the source of truth). This
+  // domain's Call Log has NO agent-id column: it carries the login ('jmanieri')
+  // and the display name ('Shari Walker - LF'). ci_agent_map was seeded keyed
+  // on the numeric Five9 id, which appears nowhere in the report, so without
+  // this column the map cannot be joined and every call falls to team
+  // 'unknown'. Additive.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`ALTER TABLE ci_calls     ADD COLUMN IF NOT EXISTS agent_username text;
+            ALTER TABLE ci_agent_map ADD COLUMN IF NOT EXISTS agent_username text;
+            CREATE INDEX IF NOT EXISTS ci_agent_map_username_idx
+              ON ci_agent_map (agent_username);`);
+    console.log('[Migration] call intelligence agent join-by-login (sql/064) ready');
+  } catch (err) {
+    console.error('[Migration] call intelligence agent join-by-login FAILED (agent map unjoinable, teams fall to unknown — apply sql/064 manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {

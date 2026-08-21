@@ -190,11 +190,24 @@ export function describeRecording({ fullPath, fileBytes, root, cfg = getConfig()
  * direct, self-describing signal and beats mapping a transfer-leg DNIS. Order:
  * ivr_module → agent map → campaign map → 'unknown' (→ review). 'unknown' is a
  * real answer here; a guessed team silently mis-attributes a partner's calls.
+ *
+ * The agent map is consulted by LOGIN first. Verified 2026-08-21: neither the
+ * Call Log nor a recording filename carries the numeric Five9 user id, so an
+ * id-only lookup here is unreachable in production and every agent call would
+ * fall through to the campaign map. The login is the identifier both sources
+ * actually share (see sql/064). `agentMap` may be keyed either way — pass the
+ * username-keyed map; `usernameMap` is accepted separately for callers that
+ * hold both.
  */
-export function classifyTeam({ ivrModule, agentFive9Id, campaign }, { transferTargets = [], agentMap = new Map(), campaignMap = new Map() } = {}) {
+export function classifyTeam({ ivrModule, agentUsername, agentFive9Id, campaign }, { transferTargets = [], agentMap = new Map(), usernameMap = null, campaignMap = new Map() } = {}) {
   if (ivrModule) {
     const hit = transferTargets.find((t) => t.label && t.label === ivrModule);
     if (hit) return { team: hit.team, source: 'ivr_module' };
+  }
+  const byUsername = usernameMap || agentMap;
+  if (agentUsername && byUsername.has(agentUsername)) {
+    const t = byUsername.get(agentUsername)?.team;
+    if (t && t !== 'unknown') return { team: t, source: 'agent_map' };
   }
   if (agentFive9Id && agentMap.has(agentFive9Id)) {
     const t = agentMap.get(agentFive9Id)?.team;

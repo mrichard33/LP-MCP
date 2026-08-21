@@ -216,6 +216,25 @@ test('without a module, the agent map then the campaign map decide', () => {
   );
 });
 
+test('the agent map resolves by LOGIN — the only id the report and filenames share', () => {
+  // Verified live 2026-08-21: no agent-id column exists in the Call Log, and a
+  // recording filename carries the username too. Keyed on the numeric id, this
+  // branch never fires and every agent call falls to the campaign map.
+  const agentMap = new Map([['swalker1', { team: 'lightfire' }]]);
+  assert.deepEqual(
+    classifyTeam({ agentUsername: 'swalker1' }, { agentMap }),
+    { team: 'lightfire', source: 'agent_map' },
+  );
+  // The module still outranks it.
+  assert.deepEqual(
+    classifyTeam(
+      { ivrModule: 'Transfer to Lightfire', agentUsername: 'swalker1' },
+      { agentMap, transferTargets: [{ label: 'Transfer to Lightfire', team: 'lightfire' }] },
+    ),
+    { team: 'lightfire', source: 'ivr_module' },
+  );
+});
+
 test("an agent mapped 'unknown' does not satisfy classification — it falls through", () => {
   const agentMap = new Map([['a1', { team: 'unknown' }]]);
   const campaignMap = new Map([['Main Number', { team: 'reece' }]]);

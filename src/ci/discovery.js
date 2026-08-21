@@ -29,6 +29,7 @@ import {
   last10,
   last4,
 } from './time.js';
+import { teamFromName, stripTeamSuffix, normalizeAgentField } from './teams.js';
 
 const LOG = '[CIDiscovery]';
 
@@ -56,7 +57,16 @@ const COLUMN_ALIASES = {
   campaign: ['campaign'],
   skill: ['skill', 'skill name'],
   disposition: ['disposition', 'disposition name'],
-  agentName: ['agent', 'agent name'],
+  // TWO DISTINCT COLUMNS, verified live 2026-08-21. AGENT is the Five9 login
+  // ('jmanieri'); AGENT NAME is the display name ('John Manieri', and on
+  // partner agents 'Shari Walker - LF'). They are not interchangeable: the
+  // login is what joins to ci_agent_map, and the display name is what carries
+  // the team suffix. Listing 'agent' under agentName would silently resolve
+  // the display field to the login column.
+  agentUsername: ['agent'],
+  agentName: ['agent name'],
+  // NOTE: this domain's Call Log has NO agent-id column, so agent_five9_id
+  // cannot be read from the report — the login is the join key instead.
   agentId: ['agent id', 'agentid'],
   recordings: ['recordings', 'recording'],
 };
@@ -111,11 +121,20 @@ export function parseRecordingSegments(text) {
   return out;
 }
 
-/** Zip a positional report row into a named object using a resolved index. */
+/**
+ * Zip a positional report row into a named object using a resolved index.
+ *
+ * A JSON null must come out as null, not the string 'null'. The live Call Log
+ * returns null (not '') for every empty cell — AGENT NAME on an agentless leg,
+ * DISPOSITION on a transfer leg, RECORDINGS on a no-answer — so a bare
+ * String() here would write the four characters "null" into ci_calls, where it
+ * is truthy and sails past every emptiness check downstream.
+ */
 export function zipRow(row, index) {
   const out = {};
   for (const [field, at] of Object.entries(index)) {
-    out[field] = row[at] === undefined ? null : String(row[at]).trim();
+    const cell = row[at];
+    out[field] = cell === undefined || cell === null ? null : String(cell).trim();
   }
   return out;
 }
@@ -165,7 +184,7 @@ export function evaluateEligibility(call, campaignRow, cfg) {
   // Transfer legs are agentless by nature and are still in scope — they
   // classify by IVR module instead. Only a NON-transfer call with no agent is
   // ineligible (a queue abandon, an IVR-only call).
-  if (!call.agent_name && !call.agent_five9_id && !call.was_transferred) {
+  if (!call.agent_name && !call.agent_username && !call.agent_five9_id && !call.was_transferred) {
     return { eligible: false, reason: 'no_agent' };
   }
   if (campaignRow && campaignRow.eligible === false) {
@@ -195,13 +214,31 @@ export function buildCallRow(legs, campaignRow, cfg) {
     return { row: null, reject: 'unparseable_timestamp' };
   }
 
-  const durationSeconds = legs
+  // A no-answer dial has CALL TIME '00:00:00' — a real, parsed duration of
+  // zero, NOT a missing one. Collapsing the two ('|| null') would file every
+  // routine no-answer under ineligible_reason 'no_duration', which is the
+  // bucket that means "the report gave us something we could not parse". The
+  // review queue would fill with no-answers and a genuine parse regression
+  // would be invisible inside them. Empty list → null; otherwise the max,
+  // zero included.
+  const legSeconds = legs
     .map((l) => durationToSeconds(l.duration))
-    .filter((n) => Number.isFinite(n))
-    .reduce((a, b) => Math.max(a, b), 0) || null;
+    .filter((n) => Number.isFinite(n));
+  const durationSeconds = legSeconds.length ? Math.max(...legSeconds) : null;
 
   const segments = legs.flatMap((l) => parseRecordingSegments(l.recordings));
   const wasTransferred = isTransferGroup(legs);
+
+  // Five9 writes '[None]' for an agentless leg rather than leaving the cell
+  // empty. Left raw it is a truthy "name" that sails past the no_agent check.
+  const agentUsername = normalizeAgentField(primary.agentUsername);
+  const agentDisplay = normalizeAgentField(primary.agentName);
+
+  // The display name carries the team suffix on partner agents ('Shari
+  // Walker - LF'), which is handoff decision #5's rule and the most direct
+  // signal available at discovery. Store the person's name without the
+  // suffix so it matches the seeded ci_agent_map row.
+  const suffixTeam = teamFromName(agentDisplay);
 
   const row = {
     five9_call_id: primary.callId,
@@ -216,8 +253,10 @@ export function buildCallRow(legs, campaignRow, cfg) {
     campaign: primary.campaign || null,
     skill: primary.skill || null,
     disposition: primary.disposition || null,
-    agent_five9_id: primary.agentId || null,
-    agent_name: primary.agentName || null,
+    agent_five9_id: normalizeAgentField(primary.agentId),
+    agent_username: agentUsername,
+    agent_name: agentDisplay ? stripTeamSuffix(agentDisplay) : null,
+    team: suffixTeam || 'unknown',
     was_transferred: wasTransferred,
     raw_metadata: {
       legs,

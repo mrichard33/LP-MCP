@@ -50,57 +50,26 @@
  * hand for agents/campaigns that no longer exist in Five9 are left alone.
  */
 
-const EXECUTE = process.argv.includes('--execute');
+import { teamFromName as _teamFromName, teamFromEmail as _teamFromEmail } from '../src/ci/teams.js';
 
+const EXECUTE = process.argv.includes('--execute');
 // ─── team derivation ────────────────────────────────────────────────────────
 //
-// Handoff decision #5 names `- LF` / `- NC` / `- FTM` suffixes, but it calls
-// them **LP**-name suffixes and that convention does NOT exist on the Five9
-// side: measured 2026-08-20 against the live domain, ZERO of 48 Five9 users
-// carry one. Deriving team from the Five9 name alone therefore silently
-// returns the same answer for everybody — and with the old 'reece' fallback
-// that answer was wrong for nine agents who are demonstrably LightFire
-// (2 @lightfirepartners.com + 7 *lfpc@gmail.com). Mis-attributing every
-// LightFire call to Reece in every note and every report is exactly the
-// silent-corruption class the lp_setter_roster header warns about.
+// The rules live in src/ci/teams.js — ONE home, shared with discovery, so a
+// load-bearing mapping rule cannot drift between the seed and the pipeline.
+// Re-exported here because they are part of this script's documented contract
+// and scripts/test-ci-config.js imports them from this module.
 //
-// So: keep the suffix rule FIRST (it is correct whenever it does fire, e.g.
-// if an agent is later renamed to match the LP convention), then fall back to
-// the email domain, which IS a reliable signal in this domain. Anything the
-// rules cannot decide becomes 'unknown' — never a guess — which routes the
-// call to review per decision #5, and is reported for human assignment.
-
-const TEAM_SUFFIXES = [
-  [/\s*-\s*LF$/i, 'lightfire'],
-  [/\s*-\s*NC$/i, 'north_carolina'],
-  [/\s*-\s*FTM$/i, 'ftm'],
-];
-
-// Email → team. Measured against the live domain 2026-08-20; every pattern
-// below is present on real users, and none of them overlap.
-const TEAM_EMAIL_RULES = [
-  [/@lightfirepartners\.com$/i, 'lightfire'],
-  [/lfpc@gmail\.com$/i, 'lightfire'],       // LightFire Partners call-centre gmails
-  [/@reecewindows\.com$/i, 'reece'],
-  [/\.reece@gmail\.com$/i, 'reece'],        // the ".reece@gmail.com" agent convention
-];
-
-export function teamFromName(name) {
-  const s = String(name || '').trim();
-  for (const [re, team] of TEAM_SUFFIXES) {
-    if (re.test(s)) return team;
-  }
-  return null;
-}
-
-export function teamFromEmail(email) {
-  const s = String(email || '').trim();
-  if (!s) return null;
-  for (const [re, team] of TEAM_EMAIL_RULES) {
-    if (re.test(s)) return team;
-  }
-  return null;
-}
+// CORRECTION (2026-08-21): an earlier revision of this file asserted the
+// `- LF` / `- NC` / `- FTM` suffixes did not exist on the Five9 side, because
+// zero of 48 users from getUsersGeneralInfo carried one. True of the USER
+// RECORDS, false of the CALL LOG — the report's AGENT NAME column returns
+// 'Shari Walker - LF' live. Both signals are real and they agree: the nine
+// agents the email rule classifies as lightfire are the same nine the suffix
+// identifies. The seed still derives from the user record (no suffix
+// available there), so email remains its primary signal; discovery reads the
+// suffix directly.
+export { teamFromName, teamFromEmail } from '../src/ci/teams.js';
 
 /**
  * Full derivation for one live Five9 user: LP-name suffix, then email, then
@@ -114,9 +83,9 @@ export function teamFromEmail(email) {
  */
 export function deriveTeam(user) {
   const name = [user?.firstName, user?.lastName].filter(Boolean).join(' ') || user?.fullName || '';
-  return teamFromName(name)
-    || teamFromName(user?.userName)
-    || teamFromEmail(user?.EMail || user?.email)
+  return _teamFromName(name)
+    || _teamFromName(user?.userName)
+    || _teamFromEmail(user?.EMail || user?.email)
     || 'unknown';
 }
 
@@ -206,6 +175,9 @@ async function main() {
     }
     agentRows.push({
       agent_five9_id: String(id),
+      // The LOGIN is the join key: this domain's Call Log has no agent-id
+      // column, so agent_five9_id alone makes the map unjoinable (sql/064).
+      agent_username: u.userName || null,
       agent_name: name,
       team: deriveTeam(u),
       active: u.active === undefined ? true : String(u.active) === 'true',
