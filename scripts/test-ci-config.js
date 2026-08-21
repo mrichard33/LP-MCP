@@ -157,7 +157,7 @@ test('numeric tunables: defaults, garbage fallback, floor clamping', () => {
   assert.equal(d.maxAttempts, 5);
   assert.equal(d.recordingWaitHours, 6);
   assert.equal(d.audioRetentionDays, 7);
-  assert.equal(d.sftp.port, 22);
+  assert.equal(d.sftp.port, 2282);   // v2: ETG's archive, not the generic 22
   assert.equal(d.lpNoteCategoryId, 1);
 
   const garbage = parseConfig({ CALL_INTEL_MIN_SECONDS: 'banana', CALL_INTEL_BATCH_SIZE: '' });
@@ -167,6 +167,61 @@ test('numeric tunables: defaults, garbage fallback, floor clamping', () => {
   const floored = parseConfig({ CALL_INTEL_BATCH_SIZE: '0', CALL_INTEL_MAX_ATTEMPTS: '-3' });
   assert.equal(floored.batchSize, 1);
   assert.equal(floored.maxAttempts, 1);
+});
+
+// THE DEFECT THIS GUARDS: the repo's usual boolean idiom is `=== 'true'`
+// (opt-in). Applied here it would make an unset CI_SFTP_READONLY mean
+// WRITABLE — against a third party's recording archive that the account holds
+// rwxrwxrwx over and that is the system of record for every recording. Only
+// the literal 'false' may disarm the guard.
+test('sftp.readOnly defaults TRUE and only literal false disarms it', () => {
+  for (const v of [undefined, '', '   ', 'garbage', 'no', '0', 'FALSE_', 'true', 'TRUE']) {
+    const env = { CI_SFTP_READONLY: v };
+    if (v === undefined) delete env.CI_SFTP_READONLY;
+    assert.equal(parseConfig(env).sftp.readOnly, true, `${JSON.stringify(v)} must stay read-only`);
+  }
+  assert.equal(parseConfig({}).sftp.readOnly, true, 'empty env must be read-only');
+  // Only an explicit, unambiguous opt-out flips it.
+  for (const v of ['false', 'FALSE', ' false ']) {
+    assert.equal(parseConfig({ CI_SFTP_READONLY: v }).sftp.readOnly, false, `${JSON.stringify(v)} disarms`);
+  }
+});
+
+// THE DEFECT THIS GUARDS: the correct offset is NEGATIVE. Routing it through
+// intFloor (Math.max(floor, n)) would clamp -300 to 0 for any floor >= 0 and
+// silently shift every filename-derived timestamp five hours, breaking the
+// campaign+ANI+time join for every recording.
+test('recordingTzOffsetMin keeps its negative sign and is never clamped', () => {
+  assert.equal(parseConfig({}).recordingTzOffsetMin, -300);
+  assert.equal(parseConfig({ CI_RECORDING_TZ_OFFSET_MIN: '-300' }).recordingTzOffsetMin, -300);
+  assert.equal(parseConfig({ CI_RECORDING_TZ_OFFSET_MIN: '-240' }).recordingTzOffsetMin, -240);
+  assert.equal(parseConfig({ CI_RECORDING_TZ_OFFSET_MIN: '0' }).recordingTzOffsetMin, 0);
+  assert.equal(parseConfig({ CI_RECORDING_TZ_OFFSET_MIN: 'banana' }).recordingTzOffsetMin, -300);
+  assert.ok(parseConfig({}).recordingTzOffsetMin < 0, 'EST offset must remain negative');
+});
+
+test('SFTP config: v2 names, real defaults, password stays secret', () => {
+  const d = parseConfig({}).sftp;
+  assert.equal(d.host, 'nas1.etgts.com');
+  assert.equal(d.port, 2282);
+  assert.equal(d.user, 'Five9reece');
+  assert.equal(d.root, '/Five9/Recordings');
+  assert.equal(d.password, null, 'password must never carry a default');
+  // The v1 names are gone — a stale reference must not silently read undefined.
+  assert.equal('key' in d, false);
+  assert.equal('path' in d, false);
+  const o = parseConfig({ CI_SFTP_HOST: 'h', CI_SFTP_PORT: '22', CI_SFTP_USER: 'u', CI_SFTP_PASSWORD: 'p', CI_SFTP_ROOT: '/r' }).sftp;
+  assert.deepEqual([o.host, o.port, o.user, o.password, o.root], ['h', 22, 'u', 'p', '/r']);
+});
+
+test('v2 recording-join tunables: defaults and floors', () => {
+  const d = parseConfig({});
+  assert.equal(d.recordingMatchWindowS, 180);
+  assert.equal(d.minRecordingBytes, 8000);
+  assert.equal(d.transferRecordingEnabledFrom, null);
+  assert.equal(parseConfig({ CI_RECORDING_MATCH_WINDOW_S: '0' }).recordingMatchWindowS, 1);
+  assert.equal(parseConfig({ CI_MIN_RECORDING_BYTES: 'x' }).minRecordingBytes, 8000);
+  assert.equal(parseConfig({ CI_TRANSFER_RECORDING_ENABLED_FROM: '2026-08-19' }).transferRecordingEnabledFrom, '2026-08-19');
 });
 
 test('nextRetryAt: 5min × 2^attempts, capped at 6h', () => {

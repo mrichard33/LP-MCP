@@ -151,9 +151,37 @@ export function isCanvassConfirmation(campaignName) {
 // The one verified transfer-target decision (handoff §17). 954-800-8906 is
 // NOT here on purpose: PHASE 0 2b (identify it, fix its recording setting)
 // is still open, and seeding an unidentified destination guesses.
+// label is NOT a description — it is the IVR module string as it appears in
+// the recording filename ('..._Transfer to Lightfire.wav'), and it is the
+// PRIMARY team classifier, matched against ci_recordings.ivr_module ahead of
+// the agent and campaign maps. A human-readable label here would match
+// nothing and send every LightFire transfer leg to team 'unknown' → review.
+// Provenance: 4075126443 verified as the LF canvass-confirmation transfer
+// destination on 2026-08-19; module string verified in the archive 2026-08-20.
 const TRANSFER_TARGETS = [
-  { dnis: '4075126443', team: 'lightfire', label: 'LightFire canvass-confirmation transfer leg (verified 2026-08-19)' },
+  { dnis: '4075126443', team: 'lightfire', label: 'Transfer to Lightfire' },
 ];
+
+/**
+ * Refuse to write anywhere but the LP MCP Supabase instance.
+ *
+ * On 2026-08-20 the ci-audio bucket was created in the HL warehouse because
+ * this repo's SUPABASE_URL pointed there and nothing checked. The ci_* family
+ * lives ONLY on the LP instance; writing it elsewhere silently splits the
+ * subsystem across two databases. lp_leads is the probe because it is
+ * LP-instance-only and always present.
+ */
+async function assertLpInstance(supabase) {
+  const host = process.env.SUPABASE_URL ? new URL(process.env.SUPABASE_URL).host : '(unset)';
+  const { error } = await supabase.from('lp_leads').select('id').limit(1);
+  if (error) {
+    console.error(`Refusing to write: SUPABASE_URL points at ${host}, which does not look like the LP MCP instance.`);
+    console.error(`  probe: SELECT id FROM lp_leads LIMIT 1 -> ${error.message}`);
+    console.error('  The ci_* tables live on the LP instance only. Point SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY at it and re-run.');
+    process.exit(1);
+  }
+  console.log(`  target instance OK (${host}, lp_leads reachable)`);
+}
 
 async function main() {
   const { getUsersGeneralInfo, getCampaigns } = await import('../src/five9-admin.js');
@@ -257,6 +285,7 @@ async function main() {
     console.error('Supabase not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY missing).');
     process.exit(1);
   }
+  await assertLpInstance(supabase);
 
   const upsert = async (table, rows, onConflict) => {
     if (!rows.length) return;
