@@ -53,6 +53,8 @@
  * module is wired to a live route, but new code follows the WSDL.
  */
 
+import { readFileSync } from 'node:fs';
+
 import {
   five9SoapCall,
   escapeXml,
@@ -529,6 +531,166 @@ export function actionFieldXml(tagName, value) {
   return `<${tagName}><actionType>${escapeXml(at)}</actionType></${tagName}>`;
 }
 
+/* ---------------------------------------------------------------------- *
+ * PR3 (2026-08-21) — buildFromSchema: one serializer, read from the WSDL.
+ *
+ * Every builder above this line is a hand transcription of an xs:sequence.
+ * That is roughly a day of WSDL archaeology per operation, and the failure
+ * mode is silent: a transcription slip does not fail locally, it ships and
+ * comes back as a Five9 500 three retries deep. wsdl-schema.json (PR1) made
+ * the sequence machine-readable, so the transcription step can go away.
+ *
+ * WHAT IT ENFORCES, and why each one is a throw rather than a warning:
+ *   - element order            — JAXB rejects out-of-order elements outright.
+ *   - minOccurs=1 present      — the server's error for a missing required
+ *                                element names the TYPE, not the field.
+ *   - no unknown payload keys  — this is the typo gate. Five9 ignores an
+ *                                element it does not recognise, so a
+ *                                misspelled field is not an error there: the
+ *                                write "succeeds" having silently set
+ *                                nothing. Catching it here is the only place
+ *                                it is catchable.
+ *
+ * TYPE DISPATCH IS SCHEMA-DRIVEN, NOT A HARD-CODED FIELD LIST. The three
+ * cases the hand-written builders special-case by name are all visible in
+ * the artifact as the field's `type`:
+ *   tns:timer                 → secondsToTimerXml  (see the asymmetry note
+ *                               on that function: Five9 ACCEPTS an integer of
+ *                               seconds and RETURNS a struct, so recursing
+ *                               into {days,hours,minutes,seconds} would emit
+ *                               what the read side produces, not what the
+ *                               write side takes)
+ *   any other tns: complexType → recurse, wrapped in the field's own element.
+ *                               This is what covers callWrapup,
+ *                               defaultIvrSchedule, and the campaignDialingAction
+ *                               pair — actionOnQueueExpiration with
+ *                               { actionType } emits exactly what
+ *                               actionFieldXml emits, because actionArgument
+ *                               and maxWaitTime are absent and therefore
+ *                               omitted.
+ *   anything else              → scalar. xs: builtins and tns: SIMPLE types
+ *                               (the enums: dialingMode, mediaType, …) both
+ *                               land here, which is correct — a simpleType is
+ *                               a restricted scalar, not a nested element.
+ *
+ * WHERE IT DOES NOT GO. If a type needs a serializer this generic path
+ * cannot express, the registry entry names a custom builder instead of
+ * bending buildFromSchema to fit. Two live examples: actionFieldXml also
+ * accepts a bare string (buildFromSchema requires the object form, since a
+ * string is not a tns:campaignDialingAction), and the list-record bodies
+ * emit a positional <fieldsMapping>/<fields> pairing that is not an
+ * xs:sequence walk at all.
+ *
+ * MISSPELLINGS SURVIVE BY CONSTRUCTION. dispostionName, userProfileNamePatern,
+ * intlligentRouting and maxAlowed are Five9's, not ours; reading names from
+ * the artifact reproduces them without anyone having to remember. Asserted in
+ * scripts/test-five9-op-registry.js rather than left to chance.
+ * ---------------------------------------------------------------------- */
+
+const SCHEMA_URL = new URL('./wsdl-schema.json', import.meta.url);
+let _wsdlSchema = null;
+
+/** The PR1 artifact, parsed once. */
+export function wsdlSchema() {
+  if (!_wsdlSchema) _wsdlSchema = JSON.parse(readFileSync(SCHEMA_URL, 'utf8'));
+  return _wsdlSchema;
+}
+
+/**
+ * A complexType's fields, inheritance-flattened, base sequence first —
+ * the order JAXB unmarshals in, and the order the hand-written
+ * *_FIELD_ORDER arrays were transcribed into by hand.
+ */
+export function flattenType(typeName, schema = wsdlSchema(), seen = new Set()) {
+  const t = schema.complexTypes[typeName];
+  if (!t) throw new Error(`buildFromSchema: complexType "${typeName}" is not in wsdl-schema.json`);
+  if (seen.has(typeName)) throw new Error(`buildFromSchema: inheritance cycle at ${typeName}`);
+  seen.add(typeName);
+  const inherited = t.extends ? flattenType(t.extends, schema, seen) : [];
+  return inherited.concat(t.fields);
+}
+
+function serializeOne(field, value, schema, path) {
+  if (field.type === 'timer') return secondsToTimerXml(field.name, value);
+
+  if (schema.complexTypes[field.type]) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      throw new Error(
+        `buildFromSchema(${path}): "${field.name}" is tns:${field.type}, a complex type — ` +
+        `expected an object, got ${Array.isArray(value) ? 'an array' : typeof value}`
+      );
+    }
+    return buildFromSchema(field.type, value, { wrapper: field.name, path });
+  }
+
+  return `<${field.name}>${escapeXml(value)}</${field.name}>`;
+}
+
+function serializeField(field, value, schema, path) {
+  if (field.maxOccurs === 'unbounded') {
+    const items = Array.isArray(value) ? value : [value];
+    if (!items.length) {
+      throw new Error(`buildFromSchema(${path}): "${field.name}" is repeatable but the array is empty`);
+    }
+    return items.map((v) => serializeOne(field, v, schema, path)).join('');
+  }
+  if (Array.isArray(value)) {
+    throw new Error(
+      `buildFromSchema(${path}): "${field.name}" is not repeatable ` +
+      `(maxOccurs=${field.maxOccurs ?? 1}) — got an array`
+    );
+  }
+  return serializeOne(field, value, schema, path);
+}
+
+/**
+ * Serialize `payload` as tns:<typeName>, in WSDL xs:sequence order.
+ *
+ * @param {string} typeName  a complexType name in wsdl-schema.json
+ * @param {object} payload   field name → value; absent optional fields omitted
+ * @param {object} [opts]
+ * @param {string|null} [opts.wrapper]  element to wrap the body in (the
+ *        operation's childElement — e.g. `campaignProfile` for
+ *        createCampaignProfile). Omit for a bare body.
+ * @returns {string} XML
+ */
+export function buildFromSchema(typeName, payload, { wrapper = null, path = typeName } = {}) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error(`buildFromSchema(${path}): payload must be an object`);
+  }
+  const schema = wsdlSchema();
+  const fields = flattenType(typeName, schema);
+  const known = new Set(fields.map((f) => f.name));
+
+  // The typo gate. Five9 silently ignores an element it does not know, so an
+  // unknown key here is a write that reports success and sets nothing.
+  for (const key of Object.keys(payload)) {
+    if (!known.has(key)) {
+      throw new Error(
+        `buildFromSchema(${path}): "${key}" is not a field of tns:${typeName} ` +
+        `(schema fields: ${[...known].join(', ')})`
+      );
+    }
+  }
+
+  let xml = '';
+  for (const field of fields) {
+    const v = payload[field.name];
+    if (v === undefined || v === null) {
+      if (field.minOccurs >= 1) {
+        throw new Error(
+          `buildFromSchema(${path}): required field "${field.name}" ` +
+          `(minOccurs=${field.minOccurs}) is missing`
+        );
+      }
+      continue;
+    }
+    xml += serializeField(field, v, schema, `${path}.${field.name}`);
+  }
+
+  return wrapper ? `<${wrapper}>${xml}</${wrapper}>` : xml;
+}
+
 export function buildModifyOutboundCampaignXml(campaignName, patch) {
   const name = String(campaignName || '').trim();
   if (!name) throw new Error('campaign_name is required');
@@ -796,6 +958,14 @@ export const USER_SKILL_FIELD_ORDER = ['id', 'level', 'skillName', 'userName'];
 // `dialingSchedule` is a nested complex type and is deliberately NOT patchable
 // in v1 — only scalars are emitted. It stays in the order array so the
 // sequence stays a faithful copy of the WSDL.
+//
+// PR3 (2026-08-21): this array is NO LONGER AN INPUT TO ANY BUILDER.
+// buildCampaignProfileXml now reads the sequence from wsdl-schema.json via
+// buildFromSchema, so it cannot drift from the WSDL by construction. The array
+// survives as the FROZEN EXPECTATION that pins the sequence: the retro-
+// validation in test-five9-wsdl-schema.js diffs it against the artifact, which
+// is what would catch a schema REGENERATION silently reordering or dropping a
+// field. Deleting it would delete that tripwire, not dead weight.
 export const CAMPAIGN_PROFILE_FIELD_ORDER = [
   'ANI', 'description', 'dialingSchedule', 'dialingTimeout',
   'initialCallPriority', 'maxCharges', 'name', 'numberOfAttempts',
@@ -849,14 +1019,18 @@ export function buildCampaignProfileXml(profileName, patch) {
       throw new Error(`REFUSED: "${key}" is not a patchable campaign profile field (allowed: ${[...PROFILE_PATCHABLE_FIELDS].join(', ')})`);
     }
   }
-  const merged = { name, ...patch };
-  let xml = '';
-  for (const field of CAMPAIGN_PROFILE_FIELD_ORDER) {
-    const v = merged[field];
-    if (v === undefined || v === null) continue;
-    xml += `<${field}>${escapeXml(v)}</${field}>`;
-  }
-  return `<campaignProfile>${xml}</campaignProfile>`;
+  // PR3 (2026-08-21) — first op migrated onto buildFromSchema. The guards
+  // above are unchanged and stay here: PROFILE_PATCHABLE_FIELDS is a
+  // PERMISSION list, deliberately narrower than the schema, and buildFromSchema
+  // only knows what the schema permits. It runs second, so a non-patchable but
+  // schema-valid key (`name`, `dialingSchedule`) still refuses with the same
+  // REFUSED message it always did.
+  //
+  // Proven byte-identical to the hand-written xs:sequence loop it replaces
+  // across every single-field patch, every field pair, both key orders of the
+  // full patch, and all four rejection paths — see
+  // scripts/test-five9-op-registry.js ("byte-identical migration").
+  return buildFromSchema('campaignProfileInfo', { name, ...patch }, { wrapper: 'campaignProfile' });
 }
 
 /* ---------------------------------------------------------------------- *
