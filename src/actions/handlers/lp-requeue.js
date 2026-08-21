@@ -48,7 +48,12 @@ import { executeCreateLPLead } from './lp-lead.js';
 // GHL custom field ids (canonical Reece location field map — same ids as lp-lead.js)
 const FIELD_LP_INBOUND_LEAD_ID = '3YMxheIlPyhACB8zyc3W'; // in1_id
 const FIELD_LP_LEAD_ID         = 'GmAVmW6V9sekD7pVONKr'; // lds_id
-const FIELD_LP_SOURCE_ID       = 'BbUJ6RrdTjjEqqRA8JVx'; // srs_id
+// Corrected 2026-08-21: this pointed at BbUJ6RrdTjjEqqRA8JVx, which is the
+// PROMOTER field (4-digit pro_id), so the srs_id fallback read a promoter id
+// and re-queued the lead under the wrong source. srs_id lives in k6j4… —
+// see src/lp-source-ids.js v2.1 (SubSource 3-digit, Promoter 4-digit) and
+// the reference mapping in lp-lead.js:118-119.
+const FIELD_LP_SOURCE_ID       = 'k6j4IBh5IejPooSCsj49'; // srs_id — LP SubSource (3-digit)
 
 function readCF(contact, fieldId) {
   const arr = contact?.customFields || [];

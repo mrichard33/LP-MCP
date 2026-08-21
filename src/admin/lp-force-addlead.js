@@ -1,6 +1,40 @@
 /**
  * LP Force-Create-Lead Admin Endpoint — src/admin/lp-force-addlead.js
  *
+ * v2.3.0 (2026-08-21): THE TWO GHL FIELD CONSTANTS WERE INVERTED. Live
+ * production defect — force-addlead threw on every canvass contact.
+ *
+ *   src/lp-source-ids.js was corrected to v2.1 on 2026-08-18 (canonical
+ *   values from the Notion "UTM Parameters" table: chatbot srs_id=830,
+ *   pro_id=5574) and states the structural rule — LP SubSource IDs are
+ *   3-digit and LP Promoter IDs are 4-digit. This module still encoded the
+ *   pre-v2.1 understanding and had SRS_ID_FIELD / PRO_ID_FIELD named
+ *   backwards. Before v2.1 the two errors cancelled and the wire values
+ *   happened to be right; after v2.1 they do not.
+ *
+ *   Verified live 2026-08-21 on canvass contacts 424VpfdtIa1yUyP1ZYNa and
+ *   rL81tAIiSMMqBroWNg2S:
+ *     k6j4IBh5IejPooSCsj49 = 344         (3-digit) → srs_id, LP SubSource
+ *     BbUJ6RrdTjjEqqRA8JVx = 5339 / 2460 (4-digit) → pro_id, LP Promoter
+ *   344 is LP_SRS.CANVASSING, and the 4-digit values are per-canvasser
+ *   promoters ("Blyth, Timothy - FTM" / "Peloke, Kenneth - FTM").
+ *
+ *   TWO LIVE SYMPTOMS, both closed by the swap:
+ *     1. Every fallback backfill wrote FALLBACK_PRO_ID (5574) into the
+ *        SubSource field and FALLBACK_SRS_ID (830) into the Promoter field.
+ *     2. ensureLpSourceAndProId() read existingSrs from BbUJ… (5339) and
+ *        existingPro from k6j4… (344), then called
+ *        assertNotTransposed('5339','344'). A 4-digit srs paired with a
+ *        3-digit pro trips the guard, and that throw is deliberately
+ *        re-raised past the fail-open catch — so it aborted the admin
+ *        endpoint, the syncAppointmentToLP auto-heal, and the
+ *        force_lp_lead_creation MCP tool alike.
+ *
+ *   Only WHICH FIELD each fallback is written to changed. The fallback
+ *   VALUES are untouched — they come from LP_PRO.CHATBOT / LP_SRS.CHATBOT,
+ *   which v2.1 already made correct. src/actions/handlers/lp-lead.js:118-119
+ *   is the reference implementation; it got this right on 2026-08-18.
+ *
  * v2.2.0 (2026-08-03): FIX GHL WORKFLOW ENROLLMENT 422 — FRACTIONAL SECONDS.
  *
  *   v2.0.1 fixed half of this bug and the other half went unnoticed for two
@@ -42,17 +76,20 @@
  *   Fix: ensureLpSourceAndProId() runs immediately before the enrollment
  *   POST. It reads the contact and, for whichever of LP Source ID
  *   (k6j4IBh5IejPooSCsj49) / Pro ID (BbUJ6RrdTjjEqqRA8JVx) is EMPTY, writes
- *   the fallback (LP_FALLBACK_SOURCE_ID=830 / LP_FALLBACK_PRO_ID=5574,
+ *   the fallback (LP_FALLBACK_SRS_ID=830 / LP_FALLBACK_PRO_ID=5574,
  *   both env-overridable). It only fills blanks — a lead that already
  *   carries a real source/pro is left untouched, so attribution is never
  *   clobbered. With both fields present the workflow passes the gate and
  *   creates the LP lead WITH the appointment (adate/atime off the contact).
  *
- *   ⚠️ 2026-08-15: the two field NAMES above are backwards — k6j4… carries
- *   pro_id (830) and BbUJ… carries srs_id (5574). The env vars were renamed
- *   accordingly: LP_FALLBACK_SOURCE_ID is DEAD, replaced by
- *   LP_FALLBACK_SRS_ID (which feeds BbUJ…), and LP_FALLBACK_PRO_ID now feeds
- *   k6j4… rather than BbUJ…. See the constant block below. Values unchanged.
+ *   ⚠️ 2026-08-15 — SUPERSEDED BY v2.3.0; read that first. This paragraph
+ *   originally claimed the two field names above were backwards, and the env
+ *   vars were renamed on the strength of that claim. The claim WAS the
+ *   inversion. What survives it: LP_FALLBACK_SOURCE_ID is DEAD — the live
+ *   name is LP_FALLBACK_SRS_ID, and it feeds k6j4… (the SubSource field),
+ *   while LP_FALLBACK_PRO_ID feeds BbUJ… (the Promoter field). Neither is
+ *   set in Railway, so both values come from the registry. The values were
+ *   never wrong; only the destination field was.
  *
  *   FAIL-OPEN: any error reading/writing the fields is logged and we still
  *   attempt the enroll (a missing-field enroll is no worse than today).
@@ -127,30 +164,32 @@ const LEAD_CREATE_WORKFLOW_ID =
 
 const DEDUP_WINDOW_MIN = Number(process.env.LP_APPT_DEDUP_WINDOW_MIN || 1440);
 
-// ─── Fallback attribution fields (v2.1.0; names corrected 2026-08-15) ──
-// GHL custom field IDs. The two GHL field LABELS are misleading and this
-// module inherited the confusion:
-//   k6j4IBh5IejPooSCsj49 — GHL label "LP Source ID / Numeric Ref", but the
-//                          value it carries for chatbot leads is 830, which
-//                          is LP_PRO.CHATBOT — the PROMOTER id.
-//   BbUJ6RrdTjjEqqRA8JVx — GHL label "Pro ID", but the value it carries is
-//                          5574, which is LP_SRS.CHATBOT — the SUBSOURCE id.
-// Cross-checked against src/actions/handlers/lp-lead.js:67
-// (FIELD_LP_SOURCE_ID = 'BbUJ6RrdTjjEqqRA8JVx' // srs_id) and
-// src/ghl-note-pipeline/resolve-or-create.js (CHATBOT_SRS_ID = '5574').
+// ─── Fallback attribution fields (v2.1.0; mapping corrected v2.3.0) ────
+// GHL custom field IDs, verified against live contact data 2026-08-21 and
+// against the structural rule in src/lp-source-ids.js v2.1 — LP SubSource
+// IDs are 3-digit, LP Promoter IDs are 4-digit:
+//   k6j4IBh5IejPooSCsj49 — GHL label "LP Source ID / Numeric Ref". Carries
+//                          srs_id, the LP SUBSOURCE (3-digit). Canvass
+//                          contacts hold 344 (LP_SRS.CANVASSING).
+//   BbUJ6RrdTjjEqqRA8JVx — GHL label "Pro ID". Carries pro_id, the LP
+//                          PROMOTER (4-digit). Canvass contacts hold a
+//                          per-canvasser value (5339, 2460, …).
+// The reference implementation is src/actions/handlers/lp-lead.js:118-119
+// (FIELD_LP_SOURCE_ID = 'k6j4…' // srs_id, FIELD_LP_PROMOTER_ID = 'BbUJ…'
+// // pro_id). src/ghl-field-map.js and src/ghl-field-decoder.js agree.
 //
-// The VALUES written here have always been correct. Only the local constant
-// names and the GroupMe label were backwards, which made the log claim
-// "srs_id=830" — the promoter id announced as the subsource, the exact shape
-// of the I.CT transposition that misrouted 670 leads. Renamed so the next
-// reader is not misled. DO NOT swap which value goes to which field.
+// The VALUES written here have always been correct — they come from the
+// registry, and v2.1 corrected the registry. What was wrong until v2.3.0 is
+// WHICH FIELD each was written to. Before swapping these back, read a live
+// canvass contact: a 4-digit value in k6j4… or a 3-digit value in BbUJ… is
+// the transposition, always.
 //
 // Both fields are flagged "SKIP DURING SYNC (set by GHL entry workflows)" in
 // the field map — the LP→GHL sync never writes them, and the Voice-AI/agentic
 // entry path doesn't either, which is why sourceless leads can't clear
 // workflow 8e30ff37's "Source ID and Pro ID" gate.
-const PRO_ID_FIELD  = 'k6j4IBh5IejPooSCsj49';   // holds pro_id  (LP promoter)
-const SRS_ID_FIELD  = 'BbUJ6RrdTjjEqqRA8JVx';   // holds srs_id  (LP subsource)
+const SRS_ID_FIELD  = 'k6j4IBh5IejPooSCsj49';   // srs_id — LP SubSource (3-digit)
+const PRO_ID_FIELD  = 'BbUJ6RrdTjjEqqRA8JVx';   // pro_id — LP Promoter  (4-digit)
 const FALLBACK_PRO_ID = String(process.env.LP_FALLBACK_PRO_ID || LP_PRO.CHATBOT);
 const FALLBACK_SRS_ID = String(process.env.LP_FALLBACK_SRS_ID || LP_SRS.CHATBOT);
 
@@ -378,5 +417,5 @@ export function registerLPForceAddLeadRoutes(app) {
     }
   });
 
-  console.log('[LP-FORCE-ADDLEAD] Registered: POST /admin/lp/force-addlead (v2.2.0 — eventStartTime without fractional seconds, fallback srs_id/pro_id, enroll wf 8e30ff37)');
+  console.log('[LP-FORCE-ADDLEAD] Registered: POST /admin/lp/force-addlead (v2.3.0 — corrected srs_id/pro_id field mapping, eventStartTime without fractional seconds, fallback srs_id/pro_id, enroll wf 8e30ff37)');
 }

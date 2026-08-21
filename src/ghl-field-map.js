@@ -227,6 +227,11 @@ const GHL_FIELD_MAP = {
   },
 
   // ─── SKIP DURING SYNC (set by GHL entry workflows) ─────────────
+  // Inspected 2026-08-21 against live contact data — both mappings below are
+  // CORRECT and must stay as they are. The invariant that proves it, from
+  // src/lp-source-ids.js v2.1: LP SubSource ids are 3-digit and LP Promoter
+  // ids are 4-digit. A 4-digit value in lp_source_id, or a 3-digit one in
+  // pro_id, is a transposition — not a reason to swap these ghlFieldIds.
   lp_source_id: {
     ghlFieldId: 'k6j4IBh5IejPooSCsj49',
     label: 'LP Source ID',

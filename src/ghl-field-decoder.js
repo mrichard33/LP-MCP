@@ -81,7 +81,7 @@ const GHL_FIELD_DECODER = {
   'ZRQAVrzhtzApzLlHmT87': { name: 'LP Prospect ID',          category: 'identity', notes: 'Stable person-level LP ID. Use for cross-system lookups.' },
   'GmAVmW6V9sekD7pVONKr': { name: 'LP Lead ID',              category: 'identity', notes: 'Opportunity-level LP ID. May contain inbound queue ID until resolved.' },
   '3YMxheIlPyhACB8zyc3W': { name: 'LP Inbound Lead ID',      category: 'identity', notes: 'Returned by LP addlead — in1_id, NOT the real lds_id.' },
-  'BbUJ6RrdTjjEqqRA8JVx': { name: 'Pro ID / LP Lead ID',     category: 'identity', notes: 'CONFLICT: ghl-field-map.js calls this "Pro ID"; intelligence skill calls it "LP Lead ID". Verify in GHL UI before relying on it.' },
+  'BbUJ6RrdTjjEqqRA8JVx': { name: 'Pro ID (LP Promoter)',    category: 'identity', notes: 'pro_id — the LP Promoter id (4-digit). Confirmed 2026-08-20 (Mark) and against live canvass contacts 2026-08-21 (5339, 2460 — per-canvasser). The old "LP Lead ID" reading was wrong; lds_id lives in GmAVmW6V9sekD7pVONKr.' },
   '69vctRrUluWZDZ605wgM': { name: 'LP Lead ID (alt)',        category: 'identity', notes: 'Possibly legacy/deprecated alias.' },
   '7Stmj4lgCuDPv6zmfWVU': { name: 'External UUID',           category: 'identity' },
   'yII9akTft1RKOG0Ri4Q9': { name: 'LP Last Appointment ID',  category: 'identity', notes: 'Per ghl-field-map.js v4.' },
@@ -236,7 +236,7 @@ const GHL_FIELD_DECODER = {
   'KcXVXLmMdwca7O4QJ5lZ': { name: 'Canvassing Notes',        category: 'canvassing' },
 
   // ─── MISC / NUMERIC REFS ───────────────────────────────────────
-  'k6j4IBh5IejPooSCsj49': { name: 'LP Source ID / Numeric Ref', category: 'misc' },
+  'k6j4IBh5IejPooSCsj49': { name: 'LP SubSource ID (srs_id)', category: 'misc', notes: 'srs_id — the LP SubSource id (3-digit). Canvass contacts hold 344; chatbot 830. Pairs with the 4-digit Pro ID in BbUJ6RrdTjjEqqRA8JVx.' },
 };
 
 /**
