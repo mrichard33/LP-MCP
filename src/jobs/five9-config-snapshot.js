@@ -54,6 +54,22 @@
 //   field. It is still a capture GAP for that entity that day: no snapshot row
 //   is written, so the next successful run diffs against the last good one.
 //
+// CREDENTIALS ARE NEVER PERSISTED (vcc_configuration, added 2026-08-21)
+//   The domain VCC config is the one snapshotted entity that carries
+//   passwords — recordingsServer, reportsServer and transcriptsServer each
+//   hold one, and each block appears twice in the reader's output (promoted
+//   to the top level, and again under `raw`). getVCCConfiguration redacts
+//   them at the source via redactPasswords(), so what reaches this job is
+//   already [REDACTED] and there is no second redaction step here to forget.
+//
+//   Empty passwords stay empty rather than becoming [REDACTED]: Reece runs no
+//   Reports Server by design, and that blank is a legitimate posture worth
+//   having on record, not an anomaly to paper over. The useful consequence is
+//   that a blank→configured transition still shows up in the change log; the
+//   accepted cost is that a password ROTATION does not, since both sides read
+//   [REDACTED]. Storing the credential to make rotations diffable is exactly
+//   what this must not do.
+//
 // VOLATILE FIELDS
 //   `size` is stripped from `list` configs BEFORE hashing (record counts change
 //   every day by design — lists repopulate at 6 AM ET) but is KEPT in the
@@ -82,6 +98,7 @@ import {
   getListsInfo,
   getDispositions,
   getSkills,
+  getVCCConfiguration,
   timerToSeconds,
 } from '../five9-admin.js';
 import { getUsersFullInfo } from '../five9-users-info.js';
@@ -97,6 +114,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // name, so it can never collide. Exported so callers build the same key.
 export const NUL_SEP = '\u0000';
 export const priorKey = (entity_type, entity_name) => `${entity_type}${NUL_SEP}${entity_name}`;
+
+/**
+ * entity_name for the vcc_configuration singleton.
+ *
+ * Every other entity type is a collection keyed by its own Five9 name. VCC
+ * config is one object per domain, so it needs a name chosen rather than read.
+ * A FIXED literal, deliberately — not domainName or domainId. Those are
+ * fields OF the config, and using one as the row key would mean a domain
+ * rename reads as "the old entity vanished and a new one appeared" instead of
+ * as the one-field diff it actually is, breaking continuity of the change log
+ * at exactly the moment it matters most.
+ */
+export const VCC_ENTITY_NAME = 'domain';
 
 /* ---------------------------------------------------------------------- *
  * Pure helpers — exported so tests need no Supabase, no Five9, no network.
@@ -428,6 +458,16 @@ async function collectEntities(errors, locked) {
   });
   await attempt('users', async () => {
     for (const u of (await getUsersFullInfo('.*'))?.users || []) push('user', u.userName, u);
+  });
+  await attempt('vcc_configuration', async () => {
+    const vcc = await getVCCConfiguration();
+    // The reader returns { error } instead of throwing when the SOAP body
+    // carries no <return> block. Throw so it lands in errors[] like any other
+    // failed read — persisting the error object as a config would write a
+    // junk snapshot row AND emit a change-log entry for every field of the
+    // real config "disappearing".
+    if (vcc?.error) throw new Error(vcc.error);
+    push('vcc_configuration', VCC_ENTITY_NAME, vcc);
   });
 
   return entities;

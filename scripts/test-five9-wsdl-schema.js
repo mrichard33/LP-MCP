@@ -168,7 +168,11 @@ test('every shipped write op exists in the v13 schema', () => {
   const shipped = [
     'startCampaign', 'stopCampaign', 'resetCampaign', 'modifyOutboundCampaign',
     'addRecordToList', 'deleteRecordFromList', 'asyncDeleteRecordsFromList',
-    'addNumbersToDnc', 'removeNumbersFromDnc',
+    // addNumbersToDnc only. removeNumbersFromDnc still EXISTS in v13 and is
+    // deliberately absent from this list: the action type behind it was
+    // deleted on 2026-08-21, so it is no longer a shipped op and must not be
+    // asserted as one. Re-adding it here would quietly re-legitimize it.
+    'addNumbersToDnc',
     'userSkillAdd', 'userSkillModify', 'userSkillRemove',
     'createCampaignProfile', 'modifyCampaignProfile',
     'createIVRScript', 'modifyIVRScript', 'createInboundCampaign',

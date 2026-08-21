@@ -16,6 +16,9 @@
  * resolveRequiresApproval closes that at the door. These tests pin the two
  * properties that matter: five9_* can never be queued unarmed, and nothing
  * else is affected.
+ *
+ * 2026-08-21 — also pins ACTION_HANDLERS membership, so that an op deleted by
+ * ruling (five9_remove_numbers_from_dnc) cannot be quietly reintroduced.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -26,6 +29,8 @@ process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test-key';
 const { resolveRequiresApproval } = await import('../src/tools/agent-tools.js');
 
 // Every five9_* action type registered in src/actions/handlers/five9.js.
+// Twenty of them as of 2026-08-21, when five9_remove_numbers_from_dnc was
+// deleted (see REMOVED_ACTION_TYPES below).
 const FIVE9_WRITE_TYPES = [
   'five9_start_campaign',
   'five9_stop_campaign',
@@ -35,7 +40,6 @@ const FIVE9_WRITE_TYPES = [
   'five9_delete_record_from_list',
   'five9_async_delete_records_from_list',
   'five9_add_numbers_to_dnc',
-  'five9_remove_numbers_from_dnc',
   'five9_user_skill_add',
   'five9_user_skill_modify',
   'five9_user_skill_remove',
@@ -84,6 +88,46 @@ test('a five9_* op that does not exist yet is covered the day it is added', () =
   // stale the first time someone adds an op and forgets it.
   assert.equal(resolveRequiresApproval('five9_some_future_op', false).requiresApproval, true);
   assert.equal(resolveRequiresApproval('five9_', false).requiresApproval, true);
+});
+
+/**
+ * D1 (2026-08-21) — five9_remove_numbers_from_dnc is DELETED, not gated.
+ *
+ * The distinction matters for what these assert. A gated op still resolves to
+ * a handler and fails inside it; a deleted one never resolves at all, so
+ * executeSingleAction's `if (!handler)` branch marks the row failed with
+ * "Unknown action type" without ever entering Five9 code. That is the
+ * intended end state, and the reason the test pins ABSENCE from the registry
+ * rather than a particular refusal message.
+ */
+const REMOVED_ACTION_TYPES = ['five9_remove_numbers_from_dnc'];
+
+test('D1 — removed action types are absent from ACTION_HANDLERS entirely', async () => {
+  const { ACTION_HANDLERS } = await import('../src/actions/index.js');
+  for (const actionType of REMOVED_ACTION_TYPES) {
+    assert.equal(
+      Object.hasOwn(ACTION_HANDLERS, actionType), false,
+      `${actionType} must not be registered — DNC removal is not an operation this system offers`,
+    );
+    // This is the exact lookup executeSingleAction performs; undefined is what
+    // sends the row down the "Unknown action type" path.
+    assert.equal(ACTION_HANDLERS[actionType], undefined);
+  }
+});
+
+test('D1 — the registry holds exactly the 56 documented action types', async () => {
+  const { ACTION_HANDLERS } = await import('../src/actions/index.js');
+  const types = Object.keys(ACTION_HANDLERS);
+  // The header comment in src/actions/index.js enumerates these by name. It
+  // had drifted to a stated 45 while the registry held 57; pinning the count
+  // here is what makes the next drift a test failure instead of a surprise.
+  assert.equal(types.length, 56);
+  assert.equal(types.filter(t => t.startsWith('five9_')).length, 20);
+  // Every type the coercion loop covers must actually be dispatchable.
+  for (const actionType of FIVE9_WRITE_TYPES) {
+    assert.equal(typeof ACTION_HANDLERS[actionType], 'function', `${actionType} is asserted below but not registered`);
+  }
+  assert.equal(FIVE9_WRITE_TYPES.length, 20);
 });
 
 test('non-Five9 actions keep their caller-supplied value exactly', () => {

@@ -1,7 +1,7 @@
 /**
  * Five9 admin write handler — src/actions/handlers/five9.js
  *
- * One dispatcher for all twenty-one five9_* write action types. The real work
+ * One dispatcher for all twenty five9_* write action types. The real work
  * (guardrails, serialization lock, read-before-write, audit events) lives
  * in src/five9/admin-writes.js — this file is only the executor-facing
  * seam plus the belt-and-braces approval check.
@@ -20,7 +20,6 @@ import {
   executeAddRecordsToList,
   executeDeleteRecordFromList,
   executeAddNumbersToDnc,
-  executeRemoveNumbersFromDnc,
   // 2026-08-05 Phase D — user skills + campaign profiles
   executeUserSkillAdd,
   executeUserSkillModify,
@@ -52,7 +51,12 @@ const FIVE9_WRITE_OPS = {
   // 2026-08-12 Phase F — the BULK sibling of delete_record_from_list.
   five9_async_delete_records_from_list: executeAsyncDeleteRecordsFromList,
   five9_add_numbers_to_dnc: executeAddNumbersToDnc,
-  five9_remove_numbers_from_dnc: executeRemoveNumbersFromDnc,
+  // NOTE: DNC REMOVAL IS NOT AN OP AND MUST NOT BE RE-ADDED. Removed
+  // 2026-08-21 by explicit ruling: Reece does not take numbers off DNC under
+  // any circumstance, so there is no gate, override, or justification path
+  // that makes it available — the action type simply does not exist. A
+  // queued five9_remove_numbers_from_dnc now fails as an unknown action type,
+  // which is the intended outcome, not a regression to fix.
   // 2026-08-05 Phase D
   five9_user_skill_add: executeUserSkillAdd,
   five9_user_skill_modify: executeUserSkillModify,
