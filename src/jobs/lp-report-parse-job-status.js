@@ -50,11 +50,19 @@ import {
 } from './lp-report-csv-common.js';
 
 /** Bumped when a parse change should let corrected output re-land and supersede. */
-export const JOB_STATUS_PARSER_VERSION = 'job-status-csv-v2';
+export const JOB_STATUS_PARSER_VERSION = 'job-status-csv-v3';
 
 /**
  * Verbatim LP status → bucket. All 14 statuses observed in the March 2026
  * export, plus the pre-release holds carried forward from the earlier one.
+ *
+ * ADDED 2026-08-21: 'Await Customer'. LP introduced it without notice and it
+ * fail-closed the 133 ingest for four consecutive days (8/18–8/21) — 1 row on
+ * the first day, 2 on each of the rest. It is a pre-release hold (the job is
+ * parked waiting on the homeowner: job 59522 carried the note "Per REP- Hold
+ * off for two weeks as the HO is making changes on contract"), so it buckets
+ * to other_pending alongside 'Await Rep' and 'Mgmt Hold' and therefore COUNTS
+ * INTO open Good Business. That is the deliberate ruling, not a default.
  *
  * The vocabulary is six buckets, not four. `excluded` used to mean "released to
  * the production track" AND double as the dumping ground for anything that was
@@ -90,6 +98,7 @@ export const JOB_STATUS_BUCKET_MAP = {
   'Awaiting Loan Docs': 'other_pending',
   'Awaiting Lender': 'other_pending',
   'Awaiting Par Sheet': 'other_pending',
+  'Await Customer': 'other_pending',
   'Mgmt Hold': 'other_pending',
   // released / production track — NOT pending Good Business, NOT terminal
   'Rel To Production': 'in_production',
