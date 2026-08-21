@@ -15,16 +15,20 @@
  *   - INBOUND campaigns are immutable: start/stop/reset/modify refuse
  *     type=INBOUND. Main Number / Dispatch are never at risk from here.
  *   - State preconditions: starting a RUNNING campaign or stopping a
- *     NOT_RUNNING one is a skipped no-op, never a blind re-fire.
+ *     NOT_RUNNING one is a skipped no-op, never a blind re-fire. Resetting a
+ *     RUNNING one is different in kind — it REFUSES (Guardrail 11), because
+ *     the request is dangerous rather than already-satisfied.
  *   - confirm_token double-gate on the highest-risk writes: the payload must
  *     restate its target verbatim. A typo gate for the creator — the human
  *     forgery gate remains approve_action itself. requiredConfirmToken() is
  *     the authority on which ops carry it and what the token must be; as of
- *     Phase G that is set_outbound_campaign (campaign name),
- *     remove_numbers_from_dnc (the comma-joined numbers),
- *     modify_campaign_profile (profile name), async_delete_records_from_list
- *     (list name), modify_ivr_script (script name), and
- *     remove_dnis_from_campaign (campaign name).
+ *     2026-08-21 that is set_outbound_campaign (campaign name),
+ *     reset_campaign (campaign name), modify_campaign_profile (profile name),
+ *     async_delete_records_from_list (list name), modify_ivr_script (script
+ *     name), and remove_dnis_from_campaign (campaign name).
+ *   - DNC is ADD-ONLY. There is no removal op and no gate that yields one;
+ *     five9_remove_numbers_from_dnc was deleted on 2026-08-21. Do not
+ *     reintroduce it.
  *   - Read-before-write + read-back: previous_state captured before the
  *     SOAP write, new_state re-read after, both carried on the
  *     five9.admin_write audit event emitted on EVERY execution — success
@@ -35,8 +39,6 @@
  *   - Compliance: maxQueueTime > 2s or abandon (maxDroppedCallsPercentage)
  *     > 3% refused unless the action payload carries compliance_override
  *     === true (FCC/FTC abandonment-rate lines).
- *   - DNC removals require a per-number reason string, logged verbatim to
- *     the audit event.
  *
  * SOAP bodies are built by pure exported builders (offline snapshot tests
  * in scripts/test-five9-admin-writes.js). Element order follows the WSDL
@@ -248,35 +250,35 @@ export function assertDeclaredRecordCount(expected, actual) {
   return Number(actual);
 }
 
-/* ---------------------------------------------------------------------- *
- * Guardrail 6 — DNC removals need a per-number reason.
- * ---------------------------------------------------------------------- */
-
-export function validateDncRemovals(removals) {
-  if (!Array.isArray(removals) || !removals.length) {
-    throw new Error('five9_remove_numbers_from_dnc requires removals: [{ number, reason }]');
-  }
-  for (const r of removals) {
-    const number = String(r?.number ?? '').trim();
-    const reason = String(r?.reason ?? '').trim();
-    if (!number) throw new Error('REFUSED: DNC removal entry missing number');
-    if (!reason) throw new Error(`REFUSED: DNC removal of ${number} missing reason — every removal must carry a per-number reason string`);
-  }
-  return removals.map(r => ({ number: String(r.number).trim(), reason: String(r.reason).trim() }));
-}
+/* Guardrail 6 — RETIRED 2026-08-21, number not reused.
+ *
+ * It required a per-number written reason on every DNC removal. The op it
+ * guarded (five9_remove_numbers_from_dnc) has been deleted outright rather
+ * than tightened, so validateDncRemovals went with it — see the block above
+ * executeAddNumbersToDnc. The number is left vacant so that Guardrail 6 in
+ * any older audit event, commit message, or handoff still resolves to the
+ * thing it actually meant.
+ */
 
 /* ---------------------------------------------------------------------- *
- * confirm_token double-gate — the two highest-risk writes must restate
- * their target verbatim in the payload. Pure, exported for tests.
+ * confirm_token double-gate — the highest-risk writes must restate their
+ * target verbatim in the payload. Six ops as of 2026-08-21; the branches
+ * below are the authority on which. Pure, exported for tests.
  * ---------------------------------------------------------------------- */
 
 export function requiredConfirmToken(op, payload) {
   if (op === 'set_outbound_campaign') {
     return String(payload?.campaign_name || '').trim();
   }
-  if (op === 'remove_numbers_from_dnc') {
-    return (Array.isArray(payload?.removals) ? payload.removals : [])
-      .map(r => String(r?.number ?? '').trim()).filter(Boolean).join(',');
+  // 2026-08-21 — resetCampaign clears dispositions and list positions for an
+  // ENTIRE campaign: every record in it becomes re-dialable at once. On
+  // `Previous Customer` or `Data Leads` that is a mass re-dial event with TCPA
+  // exposure and a support-queue spike behind it, and nothing about the
+  // approval prompt made that visible — reset reads like the mildest of the
+  // three lifecycle ops next to start and stop. Restating the campaign name
+  // is what makes the blast radius legible to the approver.
+  if (op === 'reset_campaign') {
+    return String(payload?.campaign_name || '').trim();
   }
   // 2026-08-05 Phase D — a campaign profile is shared. `Data Leads` alone
   // serves five campaigns, so one typo here is a five-campaign blast radius.
@@ -323,7 +325,31 @@ export function checkConfirmToken(op, payload) {
 export function decideLifecycleNoop(subtype, state) {
   if (subtype === 'start_campaign' && state === 'RUNNING') return 'already_running';
   if (subtype === 'stop_campaign' && state === 'NOT_RUNNING') return 'already_stopped';
-  return null; // reset has no precondition (valid on stopped campaigns)
+  return null; // reset's precondition is a REFUSAL, not a no-op — see below
+}
+
+/* ---------------------------------------------------------------------- *
+ * Guardrail 11 (2026-08-21) — resetCampaign refuses a RUNNING campaign.
+ *
+ * Distinct from decideLifecycleNoop on purpose. Those two preconditions
+ * describe transitions that are already satisfied, so skipping is the honest
+ * answer. This one is the opposite: resetting a live campaign is a state the
+ * caller must not be in, so it throws rather than returning { skipped }. A
+ * silent skip here would read as "nothing needed doing" when what actually
+ * happened is that a dangerous request was declined.
+ *
+ * Reset while RUNNING re-arms every record underneath an actively dialing
+ * campaign — agents start getting the re-dials mid-shift, with no pause in
+ * between to notice. Stop first, reset, then start: three approved actions,
+ * each individually visible, instead of one that quietly does all three.
+ *
+ * Pure and exported for offline tests.
+ * ---------------------------------------------------------------------- */
+
+export function checkResetCampaignState(campaignName, state) {
+  if (String(state || '').toUpperCase() === 'RUNNING') {
+    throw new Error(`REFUSED: reset_campaign on a RUNNING campaign — ${campaignName} is dialing now, and resetting it makes every record in it immediately re-dialable underneath the agents on it. Stop the campaign, reset it, then start it again as separate approved actions.`);
+  }
 }
 
 /* ---------------------------------------------------------------------- *
@@ -953,11 +979,20 @@ async function campaignLifecycle(action, subtype, methodFor) {
   const name = String(payload.campaign_name || '').trim();
   if (!name) throw new Error(`${subtype} requires action_payload.campaign_name`);
   return withFive9WriteGate({ action, subtype, entityType: 'five9_campaign', entityId: name }, async (ctx) => {
+    // Token-checked INSIDE the gate, like every other double-gated op bar
+    // one: a refusal here still emits a five9.admin_write event with
+    // success:false, so a fumbled reset attempt on a live campaign leaves a
+    // record instead of vanishing. No-op for start/stop — requiredConfirmToken
+    // returns null for both.
+    checkConfirmToken(subtype, payload);
     const { campaigns } = await getCampaigns();
     const hit = campaigns.find(c => c.name.toLowerCase() === name.toLowerCase());
     if (!hit) throw new Error(`campaign_not_found: ${name}`);
     ctx.previous_state = hit;
     refuseIfInbound(hit);
+    // Guardrail 11 — read the LIVE state before resetting. getCampaigns
+    // already carries it, so this costs no extra SOAP call.
+    if (subtype === 'reset_campaign') checkResetCampaignState(hit.name, hit.state);
     const noop = decideLifecycleNoop(subtype, hit.state);
     if (noop) return { skipped: true, reason: noop, campaign: hit.name, state: hit.state };
     const method = methodFor(payload);
@@ -1449,20 +1484,21 @@ export function executeAddNumbersToDnc(action) {
   });
 }
 
-export function executeRemoveNumbersFromDnc(action) {
-  const payload = action.action_payload || {};
-  const removals = validateDncRemovals(payload.removals); // throws before the gate — loud
-  checkConfirmToken('remove_numbers_from_dnc', payload); // restate-the-target double gate
-  const numbers = removals.map(r => r.number);
-  return withFive9WriteGate({ action, subtype: 'remove_numbers_from_dnc', entityType: 'five9_dnc', entityId: 'dnc' }, async (ctx) => {
-    ctx.event_extra.dnc_reasons = removals; // guardrail 6: per-number reasons on the event, verbatim
-    ctx.previous_state = await checkDncForNumbers(numbers);
-    await ctx.soap('removeNumbersFromDnc', buildNumbersXml(numbers));
-    if (ctx.dry_run) return { numbers_submitted: numbers.length };
-    ctx.new_state = await checkDncForNumbers(numbers); // read-back proves the removal
-    return { numbers_submitted: numbers.length, still_on_dnc: ctx.new_state.on_dnc.length };
-  });
-}
+/* DNC REMOVAL IS NOT IMPLEMENTED, AND THIS IS NOT AN OVERSIGHT.
+ *
+ * executeRemoveNumbersFromDnc existed from Phase C (2026-07-21) until
+ * 2026-08-21, gated behind a per-number written reason (the old Guardrail 6)
+ * and a confirm_token restating the numbers. It never fired.
+ *
+ * It is gone by explicit ruling rather than tightened: Reece does not take a
+ * number off DNC under any circumstance, so there is no reason string, no
+ * compliance_override, and no approver who can authorize one. A gate implies
+ * a legitimate path through it; there isn't one. `removeNumbersFromDnc` is
+ * still a real SOAP method on the Five9 side — nothing here can reach it.
+ *
+ * addNumbersToDnc above is unaffected: adding to DNC is always allowed and
+ * needs no justification.
+ */
 
 /* ---------------------------------------------------------------------- *
  * Phase D executes — user skills.

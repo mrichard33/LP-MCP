@@ -649,16 +649,70 @@ export async function getPrompts() {
   return { count: prompts.length, prompts };
 }
 
+export const REDACTED = '[REDACTED]';
+
+/**
+ * redactPasswords — replace every non-empty `password` value with [REDACTED],
+ * anywhere in the structure. Pure; never mutates its input.
+ *
+ * WHY A RECURSIVE WALK AND NOT THREE NAMED FIELDS. getVCCConfiguration returns
+ * each server block TWICE: once promoted to the top level, and again inside
+ * `raw`, which is the whole parsed SOAP block. A redaction that only walked
+ * the three named top-level keys would ship as fixed and still hand over both
+ * live passwords through raw.recordingsServer.password. Walking the structure
+ * also covers any fourth copy Five9 adds later without anyone re-deriving this.
+ *
+ * EMPTY STRINGS ARE LEFT ALONE, deliberately. Blanket-redacting would turn
+ * reportsServer.password ("" — Reece runs no Reports Server, by design) into
+ * "[REDACTED]", which reads as "a password is set here" and is simply false.
+ * Leaving "" intact keeps the distinction the caller actually needs: an empty
+ * value means unset, [REDACTED] means set-but-not-shown. It also keeps the
+ * config-snapshot change log able to catch a blank→configured transition,
+ * which is a real posture change worth seeing. The cost — a password ROTATION
+ * is invisible, since both sides are [REDACTED] — is accepted: storing the
+ * credential to make rotations diffable is the thing this exists to prevent.
+ */
+function redactPasswordValue(v) {
+  if (typeof v === 'string') return v === '' ? '' : REDACTED;
+  // parseXmlBlock collapses repeated sibling elements into an array, so a
+  // <password> that ever appeared twice in one block would arrive as
+  // ['secret', ...] and walk straight past a string-only check.
+  if (Array.isArray(v)) return v.map(redactPasswordValue);
+  // Anything else (null, a number, a nested object) is left to the ordinary
+  // walk rather than coerced: a non-string here means Five9 changed the shape,
+  // and flattening it to "[REDACTED]" would hide that.
+  return redactPasswords(v);
+}
+
+export function redactPasswords(value) {
+  if (Array.isArray(value)) return value.map(redactPasswords);
+  if (value === null || typeof value !== 'object') return value;
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    out[k] = k === 'password' ? redactPasswordValue(v) : redactPasswords(v);
+  }
+  return out;
+}
+
 /**
  * getVCCConfiguration — domain-level configuration. Surfaced because it is
  * the only API view of recording/transcript servers and the domain dialing
  * rules; modifyVCCConfiguration exists but is deliberately not implemented.
+ *
+ * Passwords are redacted HERE, at the source, rather than at each call site.
+ * Before 2026-08-21 this returned recordingsServer and transcriptsServer
+ * passwords in cleartext to every caller — the MCP read tool put both into
+ * any transcript that asked for domain config. Redacting in the reader means
+ * a future consumer is safe by default instead of safe by remembering.
+ * Nothing needs the real value: the one credential the fleet actually uses
+ * (the nas1 recordings SFTP) is supplied by CI_SFTP_PASSWORD, not read back
+ * from here — see src/ci/config.js.
  */
 export async function getVCCConfiguration() {
   const xml = await five9SoapCall('getVCCConfiguration');
   const block = returnBlocks(xml)[0];
   if (!block) return { error: 'vcc_configuration_unavailable' };
-  const raw = parseXmlBlock(block);
+  const raw = redactPasswords(parseXmlBlock(block));
   return {
     domainId: raw.domainId ?? null,
     domainName: raw.domainName ?? null,

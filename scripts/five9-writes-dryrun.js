@@ -16,7 +16,7 @@ import {
   five9WritesEnabled,
   refuseIfInbound,
   checkCompliancePatch,
-  validateDncRemovals,
+  checkResetCampaignState,
   buildCampaignNameXml,
   buildNumbersXml,
   buildModifyOutboundCampaignXml,
@@ -93,6 +93,26 @@ verdict('stop on NOT_RUNNING campaign → skipped no-op', () => {
   const noop = decideLifecycleNoop('stop_campaign', 'NOT_RUNNING');
   if (noop) throw new Error(`skipped: ${noop}`);
 });
+out.push('Guardrail 11 (2026-08-21) — reset_campaign is double-gated:');
+out.push('  resetCampaign clears dispositions and list positions for the WHOLE campaign;');
+out.push('  every record in it becomes re-dialable at once. On Previous Customer or Data');
+out.push('  Leads that is a mass re-dial with TCPA exposure behind it. Unlike start/stop,');
+out.push('  a RUNNING target REFUSES rather than skipping — the request is dangerous, not');
+out.push('  already-satisfied. Stop, reset, start = three separately approved actions.');
+line('  required confirm_token', requiredConfirmToken('reset_campaign', { campaign_name: 'REHASH OUTBOUND' }));
+verdict('reset with confirm_token restating the campaign accepted',
+  () => checkConfirmToken('reset_campaign', { campaign_name: 'REHASH OUTBOUND', confirm_token: 'REHASH OUTBOUND' }));
+verdict('reset with NO confirm_token refused',
+  () => checkConfirmToken('reset_campaign', { campaign_name: 'REHASH OUTBOUND' }));
+verdict('reset with mismatched confirm_token refused',
+  () => checkConfirmToken('reset_campaign', { campaign_name: 'REHASH OUTBOUND', confirm_token: 'rehash outbound' }));
+verdict('reset on a NOT_RUNNING campaign proceeds',
+  () => { checkResetCampaignState('REHASH OUTBOUND', 'NOT_RUNNING'); return { ok: true }; });
+verdict('reset on a RUNNING campaign refused',
+  () => checkResetCampaignState('REHASH OUTBOUND', 'RUNNING'));
+out.push('  start/stop are NOT confirm_token-gated — requiredConfirmToken returns null:');
+line('  start_campaign token', String(requiredConfirmToken('start_campaign', { campaign_name: 'REHASH OUTBOUND' })));
+line('  stop_campaign token', String(requiredConfirmToken('stop_campaign', { campaign_name: 'REHASH OUTBOUND' })));
 out.push('Audit event:');
 out.push(eventShape('start_campaign', 'five9_campaign', 'REHASH OUTBOUND'));
 
@@ -154,16 +174,14 @@ line('inner XML', buildNumbersXml(['5551234567', '5559876543']));
 out.push('Audit event (previous/new state = checkDncForNumbers before/after):');
 out.push(eventShape('add_numbers_to_dnc', 'five9_dnc', 'dnc'));
 
-section('five9_remove_numbers_from_dnc (removeNumbersFromDnc — per-number reason REQUIRED)');
-line('SOAP method', 'removeNumbersFromDnc');
-line('inner XML', buildNumbersXml(['5551234567']));
-out.push('Guardrails:');
-verdict('removal with reason accepted', () => validateDncRemovals([{ number: '5551234567', reason: 'customer re-consented in writing 2026-07-20' }]));
-verdict('removal without reason refused', () => validateDncRemovals([{ number: '5551234567' }]));
-verdict('confirm_token restating the numbers accepted', () => checkConfirmToken('remove_numbers_from_dnc', { removals: [{ number: '5551234567', reason: 'r' }], confirm_token: '5551234567' }));
-verdict('wrong confirm_token refused', () => checkConfirmToken('remove_numbers_from_dnc', { removals: [{ number: '5551234567', reason: 'r' }], confirm_token: '5550000000' }));
-out.push('Audit event (dnc_reasons carried verbatim):');
-out.push(eventShape('remove_numbers_from_dnc', 'five9_dnc', 'dnc', { dnc_reasons: '[{ number, reason }, ...]' }));
+section('DNC removal — NO SUCH OP (removed 2026-08-21)');
+out.push('  five9_remove_numbers_from_dnc was registered from Phase C (2026-07-21) until');
+out.push('  2026-08-21, behind a per-number written reason and a confirm_token restating');
+out.push('  the numbers. It never fired. It is now DELETED rather than tightened: Reece');
+out.push('  does not take a number off DNC under any circumstance, so there is no reason');
+out.push('  string, no compliance_override, and no approver who can authorize one.');
+out.push('  Queuing that action_type now fails as an unknown action type. DNC is');
+out.push('  add-only; five9_add_numbers_to_dnc above is unaffected.');
 
 section('five9_user_skill_add / five9_user_skill_modify / five9_user_skill_remove (userSkillAdd|Modify|Remove)');
 line('SOAP methods', 'userSkillAdd / userSkillModify / userSkillRemove — all three take one <userSkill> (WSDL-confirmed)');
@@ -299,8 +317,8 @@ section('Serialization + gate (applies to every op above)');
 out.push('  1. FIVE9_WRITES_ENABLED !== "true" → DRY-RUN: reads + guardrails run, envelope logged, audit event dry_run:true, action completed (dry-run). No mutation.');
 out.push('  2. outbound_locks key five9_admin:write held → { deferred, retry_at } (one write in flight fleet-wide, held in dry-run too)');
 out.push('  3. requires_approval !== true → thrown REFUSED (handler-level belt-and-braces; queue via create_agent_action → approve_action)');
-out.push('  4. INBOUND / compliance / missing DNC reason / confirm_token mismatch / bad payload → thrown REFUSED (loud failed status, in dry-run and live alike)');
-out.push('  5. start-on-RUNNING / stop-on-NOT_RUNNING → { skipped } no-op after the state read');
+out.push('  4. INBOUND / compliance / reset-on-RUNNING / confirm_token mismatch / bad payload → thrown REFUSED (loud failed status, in dry-run and live alike)');
+out.push('  5. start-on-RUNNING / stop-on-NOT_RUNNING → { skipped } no-op after the state read (reset-on-RUNNING REFUSES instead — Guardrail 11)');
 out.push('  6. skill add-when-held / remove-when-unheld, profile create-when-exists → { skipped } no-op after the read');
 
 console.log(out.join('\n'));

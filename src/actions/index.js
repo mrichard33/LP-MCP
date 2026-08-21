@@ -29,28 +29,50 @@
  *   originating system_events row by action.event_id when they need
  *   structural fields like event.id or event.payload.message_id.
  *
- * Supported action types (45):
- *   add_tag, remove_tag, set_stage, move_opportunity, update_opportunity,
- *   remove_from_workflow, add_to_workflow, book_appointment,
- *   cancel_appointment, reschedule_appointment, update_appointment_status,
- *   create_task,
- *   send_notification, set_lp_appointment, create_lp_lead,
- *   update_lp_dnc_status, set_dnd, update_custom_fields, update_contact_email,
- *   calculate_time_lapse_tier, send_message, layer3_dispatch, emit_event,
- *   compute_rescission_dispatch, check_eligibility, compute_risk_score,
- *   check_throttle, classify_bucket,
- *   five9_start_campaign, five9_stop_campaign, five9_reset_campaign,
- *   five9_set_outbound_campaign, five9_add_records_to_list,
- *   five9_delete_record_from_list, five9_add_numbers_to_dnc,
- *   five9_remove_numbers_from_dnc (2026-07-21 Phase C — gated Five9 writes),
- *   five9_user_skill_add, five9_user_skill_modify, five9_user_skill_remove,
- *   five9_create_campaign_profile
- *   (2026-08-05 Phase D — skill routing + campaign profiles),
- *   five9_modify_campaign_profile (2026-08-06 Phase D-2 — WSDL-verified
- *   modifyCampaignProfile wrapper; completes the Phase D profile surface),
- *   five9_async_delete_records_from_list (2026-08-12 Phase F — BULK list
- *   deletion; the only five9_* op that defers mid-flight while the async
- *   import job runs, then re-enters to verify).
+ * Supported action types (56 — ACTION_HANDLERS is the authority; this list
+ * was re-derived from it on 2026-08-21, when it had drifted to a stated 45
+ * and was missing all seven Phase G ops plus nine others):
+ *
+ *   GHL contact + pipeline (12):
+ *     add_tag, remove_tag, add_note, set_stage, move_opportunity,
+ *     update_opportunity, add_to_workflow, remove_from_workflow,
+ *     update_custom_fields, update_contact_email, set_dnd, issue_hold
+ *   Appointments (5):
+ *     book_appointment, cancel_appointment, reschedule_appointment,
+ *     update_appointment_status, sync_lp_appointment_to_ghl
+ *   LP (4):
+ *     set_lp_appointment, create_lp_lead, update_lp_dnc_status,
+ *     lp_callback_requeue
+ *   Messaging + notification (3):
+ *     send_message, send_notification, create_task
+ *   Orchestration + compute (7):
+ *     layer3_dispatch, emit_event, check_eligibility, check_throttle,
+ *     compute_risk_score, calculate_time_lapse_tier, classify_bucket
+ *   State machines (5):
+ *     compute_rescission_dispatch, transition_objection_state,
+ *     resolve_objection_state, classify_lead_state, end_agentic_handoff
+ *   Five9 gated writes (20 — every one behind FIVE9_WRITES_ENABLED +
+ *   approve_action; see src/five9/admin-writes.js):
+ *     2026-07-21 Phase C — five9_start_campaign, five9_stop_campaign,
+ *       five9_reset_campaign, five9_set_outbound_campaign,
+ *       five9_add_records_to_list, five9_delete_record_from_list,
+ *       five9_add_numbers_to_dnc
+ *     2026-08-05 Phase D — five9_user_skill_add, five9_user_skill_modify,
+ *       five9_user_skill_remove, five9_create_campaign_profile
+ *     2026-08-06 Phase D-2 — five9_modify_campaign_profile (WSDL-verified
+ *       modifyCampaignProfile wrapper; completes the Phase D profile surface)
+ *     2026-08-12 Phase F — five9_async_delete_records_from_list (BULK list
+ *       deletion; the only five9_* op that defers mid-flight while the async
+ *       import job runs, then re-enters to verify)
+ *     2026-08-13 Phase G — five9_create_ivr_script, five9_modify_ivr_script,
+ *       five9_create_inbound_campaign, five9_set_default_ivr_schedule,
+ *       five9_add_dnis_to_campaign, five9_remove_dnis_from_campaign,
+ *       five9_create_prompt_tts
+ *
+ *   NOT an action type, and not to be re-added: five9_remove_numbers_from_dnc.
+ *   Registered 2026-07-21, removed 2026-08-21 by explicit ruling — Reece does
+ *   not remove numbers from DNC under any circumstance, so this is a deletion
+ *   rather than a gate. Queuing it now fails as an unknown action type.
  *
  * 2026-05-01 — added create_lp_lead (Jane recovery). Closes the
  * chatbot-in-session-booking gap that left contacts out of LP because
@@ -445,7 +467,10 @@ async function executeLayer3Dispatch(action /*, context */) {
 }
 
 // ─── Handler registry ──────────────────────────────────────────────
-const ACTION_HANDLERS = {
+// Exported so scripts/test-agent-action-approval.js can assert the registry's
+// exact membership offline — specifically that five9_remove_numbers_from_dnc
+// is absent and therefore resolves to "Unknown action type".
+export const ACTION_HANDLERS = {
   add_tag: executeAddTag,
   remove_tag: executeRemoveTag,
   add_note: executeAddNote,                     // 2026-07-06 — escalation context summaries (Sentinel §7)
@@ -495,7 +520,8 @@ const ACTION_HANDLERS = {
   // parks it as pending without burning retry_count.
   five9_async_delete_records_from_list: executeFive9Write,
   five9_add_numbers_to_dnc: executeFive9Write,
-  five9_remove_numbers_from_dnc: executeFive9Write,
+  // five9_remove_numbers_from_dnc was removed 2026-08-21 — DNC removal is not
+  // an operation this system offers. See the note in handlers/five9.js.
   // 2026-08-05 Phase D — user skills + campaign profile create. Same gate,
   // same dispatcher. Target ids are usernames / profile names, not GHL
   // contacts, so these stay out of MUTATION_GATED_ACTION_TYPES with the rest

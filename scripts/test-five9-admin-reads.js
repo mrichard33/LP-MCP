@@ -24,7 +24,100 @@ import {
   __setDnisMapCacheForTest,
   MAX_IVR_DEFINITIONS,
   MAX_IVR_RESPONSE_BYTES,
+  // 2026-08-21 — VCC credential redaction
+  redactPasswords,
+  REDACTED,
 } from '../src/five9-admin.js';
+
+/* ── VCC password redaction ────────────────────────────────────────────────
+ *
+ * getVCCConfiguration used to hand back recordingsServer and
+ * transcriptsServer passwords in cleartext to every caller, which in practice
+ * meant into any MCP transcript that asked for domain config.
+ *
+ * The shape below mirrors the LIVE response as read on 2026-08-21, with
+ * invented credentials: three server blocks, each appearing TWICE (promoted
+ * to the top level, and again under `raw`). The duplication is the whole
+ * point — a redaction walking only the three named top-level keys passes a
+ * naive test and still leaks both passwords through raw.
+ */
+const SECRET_RECORDINGS = 'rec-pw-must-never-appear';
+const SECRET_TRANSCRIPTS = 'txn-pw-must-never-appear';
+
+function liveShapedVccResponse() {
+  const servers = {
+    recordingsServer: { hostName: 'nas1.example.com', password: SECRET_RECORDINGS, userName: 'svcRecordings' },
+    // Reece runs no Reports Server by design — all three fields blank.
+    reportsServer: { hostName: '', password: '', userName: '' },
+    transcriptsServer: { hostName: 'proxy.example.net', password: SECRET_TRANSCRIPTS, userName: 'svcTranscripts' },
+  };
+  return {
+    domainId: '137613',
+    domainName: 'Example Domain',
+    ...servers,
+    miscOptions: { defaultCampaign: 'Main Number', voicemailTimeout: '20' },
+    raw: { domainId: '137613', domainName: 'Example Domain', ...servers },
+  };
+}
+
+test('redactPasswords: no password value survives ANYWHERE in the serialized output', () => {
+  const serialized = JSON.stringify(redactPasswords(liveShapedVccResponse()));
+  // The assertion that matters. Checking only the top-level keys is exactly
+  // the miss this guards against, so search the whole document — that also
+  // catches a third copy if Five9 ever adds one.
+  assert.equal(serialized.includes(SECRET_RECORDINGS), false, 'recordings password leaked');
+  assert.equal(serialized.includes(SECRET_TRANSCRIPTS), false, 'transcripts password leaked');
+});
+
+test('redactPasswords: the nested raw duplicate is redacted, not just the top level', () => {
+  const out = redactPasswords(liveShapedVccResponse());
+  assert.equal(out.recordingsServer.password, REDACTED);
+  assert.equal(out.transcriptsServer.password, REDACTED);
+  // The copy a top-level-only redaction would have missed.
+  assert.equal(out.raw.recordingsServer.password, REDACTED);
+  assert.equal(out.raw.transcriptsServer.password, REDACTED);
+});
+
+test('redactPasswords: an EMPTY password stays empty — unset must not read as set', () => {
+  const out = redactPasswords(liveShapedVccResponse());
+  // Blanket-redacting would turn Reece's deliberately-absent Reports Server
+  // into "[REDACTED]", i.e. into a claim that a credential is configured.
+  assert.equal(out.reportsServer.password, '');
+  assert.equal(out.raw.reportsServer.password, '');
+  // ...and would also destroy the change log's ability to see a blank server
+  // become a configured one.
+  assert.notEqual(redactPasswords({ password: 'x' }).password, '');
+  assert.equal(redactPasswords({ password: 'x' }).password, REDACTED);
+});
+
+test('redactPasswords: everything that is not a password is preserved exactly', () => {
+  const input = liveShapedVccResponse();
+  const out = redactPasswords(input);
+  assert.equal(out.recordingsServer.hostName, 'nas1.example.com');
+  assert.equal(out.recordingsServer.userName, 'svcRecordings');
+  assert.equal(out.reportsServer.hostName, '');
+  assert.equal(out.domainId, '137613');
+  assert.deepEqual(out.miscOptions, { defaultCampaign: 'Main Number', voicemailTimeout: '20' });
+  // Key PRESENCE is preserved: a caller can still see that a password field
+  // exists and whether one is set, just not what it is.
+  assert.ok(Object.hasOwn(out.recordingsServer, 'password'));
+  // Pure — the caller's object is never mutated.
+  assert.equal(input.recordingsServer.password, SECRET_RECORDINGS);
+});
+
+test('redactPasswords: walks arrays and tolerates odd shapes', () => {
+  assert.deepEqual(redactPasswords([{ password: 'a' }, { password: '' }]), [{ password: REDACTED }, { password: '' }]);
+  assert.deepEqual(redactPasswords({ a: [{ b: { password: 'deep' } }] }), { a: [{ b: { password: REDACTED } }] });
+  // Non-string passwords are left alone rather than coerced — a null or an
+  // object there means Five9 changed the shape, and silently stringifying it
+  // to "[REDACTED]" would hide that.
+  assert.deepEqual(redactPasswords({ password: null }), { password: null });
+  for (const v of [null, undefined, 3, 'str', true]) assert.deepEqual(redactPasswords(v), v);
+  // parseXmlBlock collapses repeated siblings into an array, so a password
+  // arriving as ['secret'] must not walk past a string-only check.
+  assert.deepEqual(redactPasswords({ password: ['secret', ''] }), { password: [REDACTED, ''] });
+  assert.equal(JSON.stringify(redactPasswords({ raw: { password: ['secret'] } })).includes('secret'), false);
+});
 
 test('parseXmlBlock: flat scalar block', () => {
   const out = parseXmlBlock('<name>Rehash</name><state>RUNNING</state><dialingRatio>2</dialingRatio>');

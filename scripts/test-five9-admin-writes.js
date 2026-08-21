@@ -13,7 +13,7 @@ import {
   five9WritesEnabled,
   refuseIfInbound,
   checkCompliancePatch,
-  validateDncRemovals,
+  checkResetCampaignState,
   buildCampaignNameXml,
   buildNumbersXml,
   secondsToTimerXml,
@@ -117,30 +117,48 @@ test('flag-off = DRY-RUN: reads still run (fails on missing creds here), write s
   }
 });
 
-test('decideLifecycleNoop: start/stop preconditions, reset unconditional', () => {
+test('decideLifecycleNoop: start/stop preconditions; reset never becomes a no-op', () => {
   assert.equal(decideLifecycleNoop('start_campaign', 'RUNNING'), 'already_running');
   assert.equal(decideLifecycleNoop('start_campaign', 'NOT_RUNNING'), null);
   assert.equal(decideLifecycleNoop('stop_campaign', 'NOT_RUNNING'), 'already_stopped');
   assert.equal(decideLifecycleNoop('stop_campaign', 'RUNNING'), null);
+  // Reset stays OUT of the no-op path in both states on purpose: its RUNNING
+  // precondition is a refusal (checkResetCampaignState), and a { skipped }
+  // return would misreport a declined dangerous request as "nothing to do".
   assert.equal(decideLifecycleNoop('reset_campaign', 'RUNNING'), null);
   assert.equal(decideLifecycleNoop('reset_campaign', 'NOT_RUNNING'), null);
 });
 
-test('confirm_token: the two highest-risk writes must restate their target verbatim', () => {
+test('Guardrail 11 — checkResetCampaignState refuses a RUNNING campaign', () => {
+  assert.throws(() => checkResetCampaignState('Data Leads', 'RUNNING'), /REFUSED: reset_campaign on a RUNNING campaign/);
+  assert.throws(() => checkResetCampaignState('Data Leads', 'running'), /REFUSED/, 'state comparison is case-insensitive');
+  // The refusal has to say what to do instead, or it just reads as broken.
+  assert.match(
+    (() => { try { checkResetCampaignState('Data Leads', 'RUNNING'); return ''; } catch (e) { return e.message; } })(),
+    /Stop the campaign, reset it, then start it again/,
+  );
+  // Anything not RUNNING proceeds — including states this code has never seen.
+  for (const state of ['NOT_RUNNING', '', null, undefined, 'PENDING']) {
+    assert.doesNotThrow(() => checkResetCampaignState('Data Leads', state), `state ${JSON.stringify(state)} must not refuse`);
+  }
+});
+
+test('confirm_token: the highest-risk writes must restate their target verbatim', () => {
   // set_outbound_campaign — token = campaign name
   assert.equal(requiredConfirmToken('set_outbound_campaign', { campaign_name: 'Rehash' }), 'Rehash');
   assert.doesNotThrow(() => checkConfirmToken('set_outbound_campaign', { campaign_name: 'Rehash', confirm_token: 'Rehash' }));
   assert.throws(() => checkConfirmToken('set_outbound_campaign', { campaign_name: 'Rehash' }), /confirm_token mismatch/);
   assert.throws(() => checkConfirmToken('set_outbound_campaign', { campaign_name: 'Rehash', confirm_token: 'rehash' }), /confirm_token mismatch/);
-  // remove_numbers_from_dnc — token = comma-joined numbers
-  const payload = { removals: [{ number: '5551234567', reason: 'r1' }, { number: ' 5559876543 ', reason: 'r2' }] };
-  assert.equal(requiredConfirmToken('remove_numbers_from_dnc', payload), '5551234567,5559876543');
-  assert.doesNotThrow(() => checkConfirmToken('remove_numbers_from_dnc', { ...payload, confirm_token: '5551234567,5559876543' }));
-  assert.throws(() => checkConfirmToken('remove_numbers_from_dnc', { ...payload, confirm_token: '5551234567' }), /confirm_token mismatch/);
-  assert.throws(() => checkConfirmToken('remove_numbers_from_dnc', payload), /confirm_token mismatch/);
-  // other ops are not double-gated
+  // reset_campaign — token = campaign name (2026-08-21, Guardrail 11)
+  assert.equal(requiredConfirmToken('reset_campaign', { campaign_name: 'Previous Customer' }), 'Previous Customer');
+  assert.doesNotThrow(() => checkConfirmToken('reset_campaign', { campaign_name: 'Previous Customer', confirm_token: 'Previous Customer' }));
+  assert.throws(() => checkConfirmToken('reset_campaign', { campaign_name: 'Previous Customer' }), /confirm_token mismatch/);
+  assert.throws(() => checkConfirmToken('reset_campaign', { campaign_name: 'Previous Customer', confirm_token: 'previous customer' }), /confirm_token mismatch/);
+  // start/stop stay UNgated — reset is the dangerous one of the three.
   assert.equal(requiredConfirmToken('start_campaign', { campaign_name: 'X' }), null);
   assert.doesNotThrow(() => checkConfirmToken('start_campaign', { campaign_name: 'X' }));
+  assert.equal(requiredConfirmToken('stop_campaign', { campaign_name: 'X' }), null);
+  assert.doesNotThrow(() => checkConfirmToken('stop_campaign', { campaign_name: 'X' }));
 });
 
 test('refuseIfInbound: INBOUND throws, OUTBOUND/AUTODIAL pass', () => {
@@ -170,14 +188,18 @@ test('checkCompliancePatch: FCC/FTC boundaries', () => {
   assert.equal(checkCompliancePatch({ dialingMode: 'POWER' }).ok, true);
 });
 
-test('validateDncRemovals: per-number reason is mandatory', () => {
-  assert.throws(() => validateDncRemovals([]), /requires removals/);
-  assert.throws(() => validateDncRemovals(undefined), /requires removals/);
-  assert.throws(() => validateDncRemovals([{ number: '5551234567' }]), /missing reason/);
-  assert.throws(() => validateDncRemovals([{ number: '5551234567', reason: '   ' }]), /missing reason/);
-  assert.throws(() => validateDncRemovals([{ reason: 'typo entry' }]), /missing number/);
-  const ok = validateDncRemovals([{ number: ' 5551234567 ', reason: ' customer re-consented 2026-07-20 ' }]);
-  assert.deepEqual(ok, [{ number: '5551234567', reason: 'customer re-consented 2026-07-20' }]);
+test('DNC removal has no surviving code path (removed 2026-08-21)', async () => {
+  // The op was deleted rather than gated — Reece does not take numbers off
+  // DNC. If either of these ever resolves again, someone has reintroduced the
+  // capability, which is the thing this test exists to catch.
+  const mod = await import('../src/five9/admin-writes.js');
+  assert.equal(mod.executeRemoveNumbersFromDnc, undefined, 'the executor must stay deleted');
+  assert.equal(mod.validateDncRemovals, undefined, 'its reason-string guard must stay deleted');
+  // Guardrail 6's number is retired, not recycled: no op may claim it by
+  // silently re-acquiring a confirm_token contract under the old name.
+  assert.equal(requiredConfirmToken('remove_numbers_from_dnc', { removals: [{ number: '5551234567' }] }), null);
+  // Adding to DNC is untouched and still needs no justification.
+  assert.equal(typeof mod.executeAddNumbersToDnc, 'function');
 });
 
 test('buildCampaignNameXml: snapshot + escaping + required', () => {

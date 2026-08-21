@@ -28,7 +28,10 @@ import {
   sortUnorderedArrays,
   isTimerStruct,
   normalizeTimers,
+  VCC_ENTITY_NAME,
 } from '../src/jobs/five9-config-snapshot.js';
+import { readFile } from 'node:fs/promises';
+import { redactPasswords } from '../src/five9-admin.js';
 
 // ─── Canonical serialization ───────────────────────────────────────────────
 
@@ -387,4 +390,62 @@ test('priorKey: NUL separator cannot be forged by entity names', () => {
   // "a" + "b.c" and "a.b" + "c" must never collide.
   assert.notEqual(priorKey('campaign', 'x'), priorKey('campaignx', ''));
   assert.equal(priorKey('user', 'a@b.com'), priorKey('user', 'a@b.com'));
+});
+
+// ─── vcc_configuration coverage (2026-08-21) ───────────────────────────────
+
+test('vcc_configuration is collected by the snapshot job', async () => {
+  // collectEntities is not exported (it makes SOAP calls), so this pins the
+  // wiring at the source level: the reader must be imported and pushed under
+  // the vcc_configuration entity type. A rename or an accidental deletion of
+  // that attempt() block fails here.
+  const src = await readFile(new URL('../src/jobs/five9-config-snapshot.js', import.meta.url), 'utf8');
+  assert.match(src, /getVCCConfiguration/, 'the VCC reader must be imported');
+  assert.match(src, /push\('vcc_configuration', VCC_ENTITY_NAME/, 'it must be pushed as a snapshotted entity');
+  assert.equal(VCC_ENTITY_NAME, 'domain');
+});
+
+test('vcc_configuration: a snapshot carries [REDACTED], never a real password', () => {
+  // What the job actually receives, post-redaction at the reader.
+  const config = redactPasswords({
+    domainId: '137613',
+    recordingsServer: { hostName: 'nas1.example.com', password: 'never-store-me', userName: 'svc' },
+    reportsServer: { hostName: '', password: '', userName: '' },
+    raw: { recordingsServer: { hostName: 'nas1.example.com', password: 'never-store-me', userName: 'svc' } },
+  });
+  // The persisted `config` jsonb is this object verbatim — so the assertion
+  // that matters is over the whole serialized row, not selected keys.
+  assert.equal(JSON.stringify(config).includes('never-store-me'), false, 'a credential reached the snapshot row');
+  assert.equal(config.recordingsServer.password, '[REDACTED]');
+  assert.equal(config.raw.recordingsServer.password, '[REDACTED]');
+  // Hashing must not resurrect it either.
+  assert.equal(canonicalJson(config).includes('never-store-me'), false);
+  assert.match(configHash('vcc_configuration', config), /^[0-9a-f]{64}$/);
+});
+
+test('vcc_configuration: an all-empty reportsServer round-trips intact', () => {
+  // Part B point 3 — blank is a legitimate posture (Reece runs no Reports
+  // Server), so it must be stored as-is: not dropped, not null-coerced, not
+  // turned into [REDACTED].
+  const config = redactPasswords({ reportsServer: { hostName: '', password: '', userName: '' } });
+  assert.deepEqual(config.reportsServer, { hostName: '', password: '', userName: '' });
+  // It survives canonicalization and hashing as a present, empty object...
+  assert.equal(canonicalJson(config), '{"reportsServer":{"hostName":"","password":"","userName":""}}');
+  // ...and is NOT hash-equal to the same config with the block absent, which
+  // is what "not filtered out" has to mean to be worth anything.
+  assert.notEqual(configHash('vcc_configuration', config), configHash('vcc_configuration', {}));
+});
+
+test('vcc_configuration: a blank server becoming configured shows in the change log', () => {
+  // The payoff for leaving empty passwords empty. A rotation stays invisible
+  // (both sides [REDACTED]) — accepted — but standing up a Reports Server is
+  // a real posture change and must be visible.
+  const before = redactPasswords({ reportsServer: { hostName: '', password: '', userName: '' } });
+  const after = redactPasswords({ reportsServer: { hostName: 'reports.example.com', password: 'new-secret', userName: 'svcReports' } });
+  const diffs = diffConfigs(before, after);
+  const paths = diffs.map(d => d.field_path).sort();
+  assert.deepEqual(paths, ['reportsServer.hostName', 'reportsServer.password', 'reportsServer.userName']);
+  const pw = diffs.find(d => d.field_path === 'reportsServer.password');
+  assert.deepEqual([pw.previous_value, pw.new_value], ['', '[REDACTED]']);
+  assert.equal(JSON.stringify(diffs).includes('new-secret'), false, 'a credential reached the change log');
 });
