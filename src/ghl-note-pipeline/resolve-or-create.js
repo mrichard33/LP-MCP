@@ -31,13 +31,22 @@ import { upsertLeadOnly } from '../sync-leads.js';
 import { executeCreateLPLead } from '../actions/handlers/lp-lead.js';
 import { getGHLContact, updateGHLContactFields } from '../ghl.js';
 import { getField, normalizePhone } from '../sync-utils.js';
+import { LP_SRS } from '../lp-source-ids.js';
 
 // Mirrors the (non-exported) constant in src/actions/handlers/lp-lead.js:65 —
 // the GHL custom field that holds the real LP lds_id.
 const FIELD_LP_LEAD_ID = 'GmAVmW6V9sekD7pVONKr';
 // Pinned per product decision: leads originated from inbound messages are
-// attributed to the LP ChatBot sub-source (no pro_id).
-const CHATBOT_SRS_ID = '5574';
+// attributed to the LP ChatBot sub-source.
+//
+// Corrected 2026-08-21: this was inlined as '5574', which src/lp-source-ids.js
+// v2.1 (2026-08-18) established is the chatbot PROMOTER id, not its SubSource —
+// so every create pushed a promoter id into the srs_id slot, where LP resolves
+// it to nothing. Read it from the registry rather than inlining it; that file
+// is the canonical source and says so. Nor is this source promoter-less: v2.1
+// records that each digital channel carries a FIXED pseudo-promoter, and
+// executeCreateLPLead resolves it via resolvePromoterForSource() — 830 → 5574.
+const CHATBOT_SRS_ID = LP_SRS.CHATBOT;
 
 // ─── Prospect field readers (LP responses vary in casing) ────────
 function prospectId(p) {
