@@ -60,15 +60,17 @@ const EXECUTE = process.argv.includes('--execute');
 // Re-exported here because they are part of this script's documented contract
 // and scripts/test-ci-config.js imports them from this module.
 //
-// CORRECTION (2026-08-21): an earlier revision of this file asserted the
-// `- LF` / `- NC` / `- FTM` suffixes did not exist on the Five9 side, because
-// zero of 48 users from getUsersGeneralInfo carried one. True of the USER
-// RECORDS, false of the CALL LOG — the report's AGENT NAME column returns
-// 'Shari Walker - LF' live. Both signals are real and they agree: the nine
-// agents the email rule classifies as lightfire are the same nine the suffix
-// identifies. The seed still derives from the user record (no suffix
-// available there), so email remains its primary signal; discovery reads the
-// suffix directly.
+// CORRECTION (2026-08-21): earlier revisions of this file claimed the
+// `- LF` / `- NC` / `- FTM` suffixes were absent from the Five9 user record
+// and present only in the call log. Both claims are wrong. Verified against
+// all 54 live users, the suffix rides on lastName ('Lovette - NC',
+// 'Walker - LF'), so deriveTeam() below sees it and the suffix rule fires
+// here exactly as it does in discovery.
+//
+// The cost of getting this wrong was real: the map seeded 2026-08-20 by an
+// email-only revision left all ten North Carolina agents in 'unknown',
+// headed for review on every call, with their team written plainly in their
+// own name field. See src/ci/teams.js for the full note.
 export { teamFromName, teamFromEmail } from '../src/ci/teams.js';
 
 /**
@@ -76,10 +78,14 @@ export { teamFromName, teamFromEmail } from '../src/ci/teams.js';
  * 'unknown'. Never defaults to a real team — an unmapped agent must surface
  * as review, not as a confident wrong answer.
  *
- * Deliberately NOT decided here: @reecebuilders.com (a different entity with
- * no slot in the reece|lightfire|north_carolina|ftm enum) and the unlabelled
- * personal gmails from the 2026-07-30 onboarding batch. Both land 'unknown'
- * and are printed for Mark to assign.
+ * The suffix carries the @reecebuilders.com accounts and the unlabelled
+ * personal gmails from the 2026-07-30 onboarding batch — they are the North
+ * Carolina team and their names say so, so neither needs an email rule. Note
+ * there is no CHECK constraint on ci_agent_map.team; 'north_carolina' and
+ * 'ftm' store fine, and an earlier comment here claiming otherwise was wrong.
+ *
+ * What genuinely lands 'unknown' is anything with neither signal — currently
+ * one ETG helpdesk login, which is not one of the teams. Printed for Mark.
  */
 export function deriveTeam(user) {
   const name = [user?.firstName, user?.lastName].filter(Boolean).join(' ') || user?.fullName || '';

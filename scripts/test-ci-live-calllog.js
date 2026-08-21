@@ -140,6 +140,19 @@ test('a LightFire agent call classifies to lightfire, with the suffix stripped o
   assert.equal(stripTeamSuffix('Shari Walker - LF'), 'Shari Walker');
 });
 
+test('the NC suffix classifies too — the case that left 10 agents in review', () => {
+  // ci_agent_map seeded 2026-08-20 by an email-only rule put the whole North
+  // Carolina team in 'unknown', because their addresses are @reecebuilders.com
+  // or unlabelled personal gmails. The suffix was in their names all along.
+  assert.equal(teamFromName('Brian Lovette - NC'), 'north_carolina');
+  assert.equal(teamFromName('Anna Parris - NC'), 'north_carolina');
+  assert.equal(stripTeamSuffix('Brian Lovette - NC'), 'Brian Lovette');
+  // Suffix matching is anchored: a name merely containing the letters is not
+  // a team, or 'Vincent' would read as north_carolina.
+  assert.equal(teamFromName('NC Vincent'), null);
+  assert.equal(teamFromName('Lance Ford'), null);
+});
+
 test('a Reece agent call has no suffix and stays unknown for the map to resolve', () => {
   const { row } = buildCallRow([zip(AGENT_CALL)], null, CFG);
   assert.equal(row.team, 'unknown', 'no suffix → the agent/campaign map decides, never a guess');
