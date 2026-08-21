@@ -15,8 +15,9 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
     "@supabase/supabase-js": "^2.49.4",
-    "express": "^4.21.2",
+    "axios": "^1.7.9",
     "dotenv": "^16.4.7",
-    "axios": "^1.7.9"
+    "express": "^4.21.2",
+    "ssh2-sftp-client": "^11.0.0"
   }
 }

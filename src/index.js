@@ -262,6 +262,8 @@ import { startLpCsvOrphanReaper } from './jobs/lp-csv-orphan-reaper.js';
 import { registerScorecardValidateRoutes, startScorecardValidateScheduler } from './jobs/scorecard-validate.js';
 // 2026-08-06 Phase E — daily Five9 config snapshot + change log (ships dark)
 import { registerFive9SnapshotRoutes, startFive9ConfigSnapshotScheduler } from './jobs/five9-config-snapshot.js';
+import { registerCiRoutes } from './ci/routes.js';
+import { startCiWorkerScheduler } from './ci/worker.js';
 // ─── Agentic Hold-Complete (return-from-hold re-entry) ───────────
 import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
 // ─── FB Publish Watchdog (alert on missed WF4 publish window) ────
@@ -1019,6 +1021,46 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] call intelligence v2 recording join FAILED (recording ingest cannot match calls — apply sql/062 manually):', err.message);
   }
+
+  // CI worker claim function (sql/063 — the file is the source of truth). The
+  // claim is a data-modifying CTE, which is only legal at the top level of a
+  // statement, and runSQL wraps what it is given in a SELECT — so the locking
+  // lives inside a SQL function and the call site stays a plain SELECT. The
+  // worker falls back to a non-claiming SELECT without it (single-driver
+  // only), so a fresh deploy should self-heal rather than run unleased.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE OR REPLACE FUNCTION claim_ci_calls(
+              p_statuses      text[],
+              p_limit         integer,
+              p_lease_seconds integer,
+              p_worker        text
+            )
+            RETURNS SETOF ci_calls
+            LANGUAGE sql
+            AS $fn$
+              WITH claimed AS (
+                SELECT id FROM ci_calls
+                WHERE status = ANY(p_statuses)
+                  AND eligible
+                  AND (next_retry_at IS NULL OR next_retry_at <= now())
+                  AND (locked_until  IS NULL OR locked_until  <  now())
+                ORDER BY call_start
+                LIMIT GREATEST(1, p_limit)
+                FOR UPDATE SKIP LOCKED
+              )
+              UPDATE ci_calls c
+              SET locked_until = now() + make_interval(secs => GREATEST(30, p_lease_seconds)),
+                  locked_by    = p_worker,
+                  updated_at   = now()
+              FROM claimed cl
+              WHERE c.id = cl.id
+              RETURNING c.*;
+            $fn$;`);
+    console.log('[Migration] call intelligence claim function (sql/063) ready');
+  } catch (err) {
+    console.error('[Migration] call intelligence claim function FAILED (worker runs unleased, single-driver — apply sql/063 manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
@@ -1379,6 +1421,7 @@ registerLpCsvRoutes(app);
 registerLpReportReconRoutes(app);
 registerScorecardValidateRoutes(app);
 registerFive9SnapshotRoutes(app, authenticate);
+registerCiRoutes(app, authenticate);            // 2026-08-21 — Call Intelligence ingest (PR 2; worker ships disarmed)
 
 app.listen(PORT, async () => {
   console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
@@ -1414,6 +1457,7 @@ app.listen(PORT, async () => {
   startGoalScorecardScheduler();
   startScorecardValidateScheduler();
   startFive9ConfigSnapshotScheduler();
+  startCiWorkerScheduler();
   startLpReportReconScheduler();
   startLpReportWatchdog();
   startLpCsvOrphanReaper();
