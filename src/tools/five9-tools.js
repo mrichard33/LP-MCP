@@ -20,6 +20,26 @@ import {
   getDnisMap,
   getPrompts,
   getVCCConfiguration,
+  // 2026-08-21 Phase H PR4 — the consolidated config-read surface. Thirteen
+  // operations reach the MCP through ONE tool (five9_get_config), not
+  // thirteen; see CONFIG_ENTITIES below for why.
+  getSkillsInfo,
+  getAgentGroups,
+  getCallVariables,
+  getCallVariableGroups,
+  getWebConnectors,
+  getDialingRules,
+  getContactFields,
+  getReasonCodeByType,
+  getCampaignStrategies,
+  getCampaignProfileFilter,
+  getCampaignProfileDispositions,
+  getSpeedDialNumbers,
+  getCallCountersState,
+  getContactRecords,
+  getListImportResult,
+  getCrmImportResult,
+  getDispositionsImportResult,
 } from '../five9-admin.js';
 import { getUsersFullInfo, getUserProfiles, getUserProfile } from '../five9-users-info.js';
 import supabase from '../supabase.js';
@@ -45,6 +65,98 @@ import {
  *
  * Auth/setup requirements are documented in src/five9-admin.js.
  */
+
+/* ---------------------------------------------------------------------- *
+ * Phase H PR4 (2026-08-21) — the consolidated config-read surface.
+ *
+ * WHY ONE TOOL AND NOT THIRTEEN. LP-MCP exposed 112 tools before this
+ * tranche. Tool-selection accuracy degrades as that list grows, and the cost
+ * is paid on EVERY LP-MCP call — LP sync, GHL work, anything that never
+ * touches Five9. Thirteen more tools to reach thirteen operations that are
+ * all "name pattern in, list out" would be a real, permanent tax for no new
+ * capability. So the shape is the discriminator: five9_get_config takes an
+ * entity_type and dispatches.
+ *
+ * Each entry names the SOAP operation it reaches and the argument shape,
+ * because the three EXACT-name operations do not take a pattern and behave
+ * differently when name_pattern is omitted (they refuse).
+ *
+ * Exported so scripts/test-five9-config-reads.js can drive every reader over
+ * a stubbed transport and assert the element that goes on the wire, rather
+ * than only the shape that comes back.
+ * ---------------------------------------------------------------------- */
+export const CONFIG_ENTITIES = Object.freeze({
+  skill: {
+    operation: 'getSkillsInfo', patternField: 'skillNamePattern', exact: false,
+    read: ({ name_pattern }) => getSkillsInfo({ namePattern: name_pattern }),
+  },
+  agent_group: {
+    operation: 'getAgentGroups', patternField: 'groupNamePattern', exact: false,
+    read: ({ name_pattern }) => getAgentGroups({ namePattern: name_pattern }),
+  },
+  call_variable: {
+    operation: 'getCallVariables', patternField: 'namePattern', exact: false,
+    read: ({ name_pattern, group_name }) => getCallVariables({ namePattern: name_pattern, groupName: group_name }),
+  },
+  call_variable_group: {
+    operation: 'getCallVariableGroups', patternField: 'namePattern', exact: false,
+    read: ({ name_pattern }) => getCallVariableGroups({ namePattern: name_pattern }),
+  },
+  web_connector: {
+    operation: 'getWebConnectors', patternField: 'namePattern', exact: false,
+    read: ({ name_pattern }) => getWebConnectors({ namePattern: name_pattern }),
+  },
+  dialing_rule: {
+    operation: 'getDialingRules', patternField: 'namePattern', exact: false,
+    read: ({ name_pattern }) => getDialingRules({ namePattern: name_pattern }),
+  },
+  contact_field: {
+    operation: 'getContactFields', patternField: 'namePattern', exact: false,
+    read: ({ name_pattern }) => getContactFields({ namePattern: name_pattern }),
+  },
+  reason_code: {
+    operation: 'getReasonCodeByType', patternField: 'reasonCodeName', exact: false,
+    read: ({ name_pattern, type }) => getReasonCodeByType({ namePattern: name_pattern, type }),
+  },
+  prompt: {
+    // Takes no argument at all — the filter is client-side.
+    operation: 'getPrompts', patternField: null, exact: false,
+    read: async ({ name_pattern }) => {
+      const out = await getPrompts();
+      if (!name_pattern) return out;
+      const q = String(name_pattern).toLowerCase();
+      const prompts = (out.prompts || []).filter((p) => String(p?.name ?? '').toLowerCase().includes(q));
+      return { count: prompts.length, prompts, filtered_client_side: true };
+    },
+  },
+  campaign_strategy: {
+    operation: 'getCampaignStrategies', patternField: 'campaignName', exact: true,
+    read: ({ name_pattern }) => getCampaignStrategies(name_pattern),
+  },
+  campaign_profile_filter: {
+    operation: 'getCampaignProfileFilter', patternField: 'profileName', exact: true,
+    read: ({ name_pattern }) => getCampaignProfileFilter(name_pattern),
+  },
+  campaign_profile_dispositions: {
+    operation: 'getCampaignProfileDispositions', patternField: 'profileName', exact: true,
+    read: ({ name_pattern }) => getCampaignProfileDispositions(name_pattern),
+  },
+  speed_dial: {
+    operation: 'getSpeedDialNumbers', patternField: null, exact: false,
+    read: () => getSpeedDialNumbers(),
+  },
+});
+
+export const CONFIG_ENTITY_TYPES = Object.freeze(Object.keys(CONFIG_ENTITIES));
+
+/** Job-status readers behind five9_get_import_result. All take an identifier. */
+export const IMPORT_RESULT_READERS = Object.freeze({
+  list: { operation: 'getListImportResult', read: (id) => getListImportResult(id) },
+  crm: { operation: 'getCrmImportResult', read: (id) => getCrmImportResult(id) },
+  dispositions: { operation: 'getDispositionsImportResult', read: (id) => getDispositionsImportResult(id) },
+});
+
+export const IMPORT_JOB_TYPES = Object.freeze(Object.keys(IMPORT_RESULT_READERS));
 
 // Shared handler wrapper: JSON-stringified payloads, errors returned not thrown.
 function asTool(fn) {
@@ -345,6 +457,83 @@ export function registerFive9Tools(server) {
       if (error) throw new Error(error.message);
       return { source: table, lookback_days: lookback, count: (data || []).length, rows: data || [] };
     })
+  );
+
+  /* ---- Phase H PR4 (2026-08-21) — consolidated reads (4 tools, 20 ops) -- */
+
+  // Tool: five9_get_config — 13 SOAP operations behind one entity_type.
+  server.tool(
+    'five9_get_config',
+    'Five9 configuration reader (read-only) — ONE tool covering thirteen config surfaces, selected by entity_type. ' +
+    'PATTERN entity types take an optional name_pattern (a Five9-side REGEX, not a substring); omit it to list everything: ' +
+    '"skill" (getSkillsInfo — full skill info; five9_get_skills is the lighter inventory), ' +
+    '"agent_group", "call_variable" (also takes group_name to scope to one variable group), "call_variable_group", ' +
+    '"web_connector" (agent-desktop connectors — the URL each one posts live call and contact data to; this is the read behind Guardrail 13), ' +
+    '"dialing_rule", "contact_field" (the Five9 contact DB schema), ' +
+    '"reason_code" (also takes type: NOT_READY or LOGOUT), and "prompt" (the operation takes no argument, so name_pattern filters client-side as a substring). ' +
+    'EXACT-NAME entity types REQUIRE name_pattern and pass it verbatim as an exact name, not a pattern: ' +
+    '"campaign_strategy" (a campaign name — dial pacing), "campaign_profile_filter" and "campaign_profile_dispositions" (both a campaign PROFILE name). ' +
+    'NO-ARGUMENT entity types ignore name_pattern entirely: "speed_dial". ' +
+    'An unknown entity_type is refused with the valid list rather than defaulting to anything. ' +
+    'Note there is deliberately no singular variant tool (getSkill / getDisposition / getUserInfo / getAgentGroup): each is the exact-name twin of a pattern reader that already ships, so exact lookup is just an anchored pattern here.',
+    {
+      entity_type: z.enum(CONFIG_ENTITY_TYPES).describe('Which configuration surface to read'),
+      name_pattern: z.string().optional().describe('Five9-side regex for pattern types (omit = all). REQUIRED and passed verbatim as an EXACT name for campaign_strategy, campaign_profile_filter, campaign_profile_dispositions. Substring filter for prompt. Ignored for speed_dial.'),
+      group_name: z.string().optional().describe('call_variable only: exact call-variable group name to scope the read to'),
+      type: z.enum(['NOT_READY', 'LOGOUT']).optional().describe('reason_code only: filter by reason code type'),
+    },
+    asTool(async ({ entity_type, name_pattern, group_name, type }) => {
+      const entry = CONFIG_ENTITIES[entity_type];
+      // Never default: an unknown type names the valid set instead.
+      if (!entry) {
+        throw new Error(`unknown entity_type "${entity_type}" — valid: ${CONFIG_ENTITY_TYPES.join(', ')}`);
+      }
+      if (entry.exact && !String(name_pattern ?? '').trim()) {
+        throw new Error(`entity_type "${entity_type}" reads ONE named target: name_pattern is required and is passed verbatim as an exact ${entry.patternField}, not as a pattern`);
+      }
+      const out = await entry.read({ name_pattern, group_name, type });
+      return { entity_type, operation: entry.operation, ...out };
+    })
+  );
+
+  // Tool: five9_get_import_result — 3 job-status operations, one identifier.
+  server.tool(
+    'five9_get_import_result',
+    'Status of a Five9 async import job (read-only). All three job types take the identifier Five9 returned when the job was submitted: job_type "list" (getListImportResult — the one five9_async_delete_records_from_list defers on; listRecordsDeleted is the authoritative count of what a bulk delete actually removed), "crm" (getCrmImportResult), "dispositions" (getDispositionsImportResult). Returns { found, success, failureMessage, importTroubles, ...counts }. found:false means Five9 does not recognize the identifier — usually a job that never submitted, not one that failed.',
+    {
+      job_type: z.enum(IMPORT_JOB_TYPES).describe('Which import job status to read'),
+      identifier: z.string().describe('The job identifier Five9 returned at submission'),
+    },
+    asTool(async ({ job_type, identifier }) => {
+      const entry = IMPORT_RESULT_READERS[job_type];
+      if (!entry) throw new Error(`unknown job_type "${job_type}" — valid: ${IMPORT_JOB_TYPES.join(', ')}`);
+      const out = await entry.read(identifier);
+      return { job_type, operation: entry.operation, ...out };
+    })
+  );
+
+  // Tool: five9_get_contact_records
+  server.tool(
+    'five9_get_contact_records',
+    'Query the Five9 contact database by lookup criteria (read-only). Kept separate from five9_get_config because it takes a QUERY, not a name pattern. ' +
+    'LP REMAINS THE SYSTEM OF RECORD FOR CONTACT DATA — this exists to verify what Five9 currently holds (e.g. reconciling a number the dialer is calling against the LP lead), never to treat Five9 as truth. If the two disagree, LP is right and the Five9 copy is stale. That is also why every contact-DB WRITE is denied: a third divergent copy is the failure mode.',
+    {
+      criteria: z.array(z.object({
+        field: z.string().describe('Five9 contact field name, e.g. "number1"'),
+        value: z.string().describe('Value to match'),
+      })).min(1).describe('One or more { field, value } criteria (AND-ed by Five9)'),
+      contact_id_field: z.string().optional().describe('Optional contact ID field name for the lookup'),
+    },
+    asTool(({ criteria, contact_id_field }) =>
+      getContactRecords({ contactIdField: contact_id_field, criteria }))
+  );
+
+  // Tool: five9_get_call_counters_state
+  server.tool(
+    'five9_get_call_counters_state',
+    'LIVE Five9 call counter telemetry (read-only, takes no arguments). Distinct from the config reads in both shape and freshness: these values change per-second, where a config read is "current until somebody edits it". Returns the counters plus captured_at, because a counter without a timestamp is not interpretable. For richer live floor telemetry (agent state, queue depth, abandon behavior) use five9_supervisor_statistics.',
+    {},
+    asTool(() => getCallCountersState())
   );
 
 }

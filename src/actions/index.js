@@ -51,7 +51,7 @@
  *   State machines (5):
  *     compute_rescission_dispatch, transition_objection_state,
  *     resolve_objection_state, classify_lead_state, end_agentic_handoff
- *   Five9 gated writes (24 — every one behind FIVE9_WRITES_ENABLED +
+ *   Five9 gated writes (37 — every one behind FIVE9_WRITES_ENABLED +
  *   approve_action; see src/five9/admin-writes.js):
  *     2026-07-21 Phase C — five9_start_campaign, five9_stop_campaign,
  *       five9_reset_campaign, five9_set_outbound_campaign,
@@ -74,7 +74,19 @@
  *       writes; modify REPLACES the whole struct, so it read-modify-writes,
  *       and both carry Guardrail 12's admin/supervisor role-grant gate)
  *
+ *     2026-08-21 Phase H PR4 — five9_create_web_connector,
+ *       five9_modify_web_connector (both behind Guardrail 13, the
+ *       destination allow-list); and campaign composition:
+ *       five9_create_outbound_campaign, five9_add_lists_to_campaign,
+ *       five9_remove_lists_from_campaign, five9_modify_campaign_lists,
+ *       five9_add_skills_to_campaign, five9_remove_skills_from_campaign,
+ *       five9_add_dispositions_to_campaign,
+ *       five9_reset_campaign_dispositions, five9_set_campaign_strategies,
+ *       five9_create_list, five9_reset_list_position
+ *
  *   NOT an action type, and not to be re-added: five9_remove_numbers_from_dnc.
+ *   NOT an action type pending an authoritative payroll disposition mapping:
+ *   five9_remove_dispositions_from_campaign (built, unregistered).
  *   Registered 2026-07-21, removed 2026-08-21 by explicit ruling — Reece does
  *   not remove numbers from DNC under any circumstance, so this is a deletion
  *   rather than a gate. Queuing it now fails as an unknown action type.
@@ -553,6 +565,31 @@ export const ACTION_HANDLERS = {
   five9_modify_user_profile_user_list: executeFive9Write,
   five9_create_user_profile: executeFive9Write,
   five9_modify_user_profile: executeFive9Write,
+  // 2026-08-21 Phase H PR4 — web connectors + campaign composition. Same
+  // gate, same dispatcher. Target ids are connector / campaign / list names,
+  // so like the rest of five9_* these stay out of
+  // MUTATION_GATED_ACTION_TYPES.
+  //
+  // The web-connector pair carries Guardrail 13 (destination allow-list,
+  // FIVE9_WEBCONNECTOR_ALLOWED_HOSTS, fail-closed, no compliance_override).
+  // The composition ops mostly refuse while the target campaign is RUNNING.
+  //
+  // five9_remove_dispositions_from_campaign is deliberately ABSENT: it is
+  // built but unregistered because its payroll guard has no authoritative
+  // source. See handlers/five9.js for the full reasoning.
+  five9_create_web_connector: executeFive9Write,
+  five9_modify_web_connector: executeFive9Write,
+  five9_create_outbound_campaign: executeFive9Write,
+  five9_add_lists_to_campaign: executeFive9Write,
+  five9_remove_lists_from_campaign: executeFive9Write,
+  five9_modify_campaign_lists: executeFive9Write,
+  five9_add_skills_to_campaign: executeFive9Write,
+  five9_remove_skills_from_campaign: executeFive9Write,
+  five9_add_dispositions_to_campaign: executeFive9Write,
+  five9_reset_campaign_dispositions: executeFive9Write,
+  five9_set_campaign_strategies: executeFive9Write,
+  five9_create_list: executeFive9Write,
+  five9_reset_list_position: executeFive9Write,
 };
 
 // Handlers that need the triggering event's payload injected as context.

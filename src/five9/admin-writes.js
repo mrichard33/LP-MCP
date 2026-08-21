@@ -80,6 +80,12 @@ import {
   getDnisMap,
   getCampaignDNISList,
   getInboundCampaign,
+  // 2026-08-21 Phase H PR4 — read-before-write and existence checks for the
+  // web-connector pair and the campaign-composition tranche.
+  getWebConnector,
+  getSkills,
+  getDispositions,
+  getCampaignStrategies,
 } from '../five9-admin.js';
 // 2026-08-05 Phase D — read-before-write for user-skill ops. getUsersFullInfo
 // takes a Five9 userNamePattern regex and returns assigned skills with levels.
@@ -318,8 +324,48 @@ export function requiredConfirmToken(op, payload) {
   if (op === 'create_user_profile' || op === 'modify_user_profile') {
     return String(payload?.profile_name || '').trim();
   }
+  // 2026-08-21 Phase H PR4 — a web connector posts live call and contact data
+  // from the agent desktop. Guardrail 13 constrains WHERE it can post; the
+  // token is the typo gate on WHICH connector is being rewritten, and modify
+  // additionally re-checks it against Five9's own spelling of the live name.
+  if (op === 'create_web_connector' || op === 'modify_web_connector') {
+    return String(payload?.connector_name || '').trim();
+  }
+  // 2026-08-21 Phase H PR4 — campaign composition. Each of these changes what
+  // a campaign dials, who it routes to, or how it paces, and every one of them
+  // lands on a named campaign whose blast radius is the whole floor working
+  // it. Restating the campaign is what makes that legible to the approver.
+  // create_list is deliberately absent: a new list is empty and attached to
+  // nothing, so there is no target to confirm.
+  if (CAMPAIGN_TOKEN_OPS.has(op)) {
+    return String(payload?.campaign_name || '').trim();
+  }
   return null; // op not double-gated
 }
+
+/**
+ * Ops whose confirm_token is the campaign name. A Set rather than a chain of
+ * `if`s because this group grows per tranche and the group IS the rule.
+ *
+ * reset_list_position is in here on the CAMPAIGN name, not a list name. The
+ * Phase H PR4 handoff specified "confirm_token on the LIST name", but the v13
+ * schema is unambiguous — resetListPosition takes exactly one argument,
+ * <campaignName> — so the op is campaign-scoped and a list-name token would
+ * confirm a target the call never receives. Schema wins (standing rule).
+ */
+export const CAMPAIGN_TOKEN_OPS = Object.freeze(new Set([
+  'create_outbound_campaign',
+  'add_lists_to_campaign',
+  'remove_lists_from_campaign',
+  'modify_campaign_lists',
+  'add_skills_to_campaign',
+  'remove_skills_from_campaign',
+  'add_dispositions_to_campaign',
+  'remove_dispositions_from_campaign',
+  'reset_campaign_dispositions',
+  'set_campaign_strategies',
+  'reset_list_position',
+]));
 
 export function checkConfirmToken(op, payload) {
   const required = requiredConfirmToken(op, payload);
@@ -3323,4 +3369,954 @@ export function executeModifyUserProfile(action) {
       };
     },
   );
+}
+
+/* ====================================================================== *
+ * Phase H PR4 (2026-08-21) — Guardrail 13: web connector destination
+ * allow-list.
+ *
+ * WHY THIS EXISTS AT ALL. PR3 classified createWebConnector and
+ * modifyWebConnector as `denied`, with the reason: "posts live call and
+ * contact data to an arbitrary URL from the agent desktop; there is no
+ * destination allow-list." Mark ruled the pair allowed on 2026-08-21. The
+ * denial's REASONING was not waived — it is answered, by building the
+ * allow-list it said was missing. If this guardrail is ever weakened, the
+ * ops go back to `denied`; they are not independently safe.
+ *
+ * deleteWebConnector stays denied under DELETE_RULE.
+ *
+ * FAIL CLOSED. FIVE9_WEBCONNECTOR_ALLOWED_HOSTS unset means the allow-list is
+ * EMPTY, and an empty allow-list REFUSES EVERY DESTINATION. It never means
+ * "allow all". A missing env var must disable the feature, not open it.
+ *
+ * NO compliance_override PATH. Every other gated op here has one; this one
+ * deliberately does not. An override would reintroduce exactly the
+ * arbitrary-URL hole the denial was about, one approved action at a time. A
+ * new destination goes into the env var deliberately, by a human editing
+ * Railway — which is also the only record of the decision.
+ * ====================================================================== */
+
+export const WEBCONNECTOR_ALLOWED_HOSTS_ENV = 'FIVE9_WEBCONNECTOR_ALLOWED_HOSTS';
+
+/** The four keyValuePair blocks on tns:webConnector (all maxOccurs="unbounded"). */
+export const WEBCONNECTOR_KV_BLOCKS = Object.freeze([
+  'constants', 'postConstants', 'variables', 'postVariables',
+]);
+
+/**
+ * Parse the allow-list. Unset / empty / whitespace → an EMPTY Set, which
+ * refuses everything. Comma-separated hostnames, case-insensitive.
+ */
+export function webConnectorAllowedHosts(raw = process.env[WEBCONNECTOR_ALLOWED_HOSTS_ENV]) {
+  if (raw instanceof Set) return raw;
+  return new Set(
+    String(raw ?? '')
+      .split(',')
+      .map((h) => h.trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+// Percent-encoding is the cheapest way to smuggle a second destination past a
+// substring check, so every value is examined decoded as well as raw.
+function decodeMaybe(v) {
+  try { return decodeURIComponent(String(v ?? '')); } catch { return String(v ?? ''); }
+}
+
+/**
+ * Does this value look like it is trying to be a destination? Deliberately
+ * BROAD: anything carrying a scheme separator or a protocol-relative prefix
+ * is sent to the validator, which refuses whatever it cannot prove safe.
+ * A false positive costs a refusal the operator can fix; a false negative
+ * ships an exfiltration path.
+ */
+// A protocol-relative destination is not always at the start of the value —
+// inside startPageText it appears as <img src="//host/x">. Requiring a dotted
+// hostname after the // keeps an ordinary "// comment" from being flagged,
+// while still catching the embedded form.
+const PROTOCOL_RELATIVE_RE = /(^|[\s"'=(,;])\/\/[a-z0-9-]+(\.[a-z0-9-]+)+/i;
+
+export function looksLikeDestination(value) {
+  const raw = String(value ?? '');
+  const dec = decodeMaybe(raw);
+  return /:\/\//.test(raw) || /:\/\//.test(dec) ||
+    PROTOCOL_RELATIVE_RE.test(raw) || PROTOCOL_RELATIVE_RE.test(dec);
+}
+
+// An IP literal can never be a legitimate Reece destination, and a numeric
+// host is the classic way to dodge a name-based allow-list.
+function isIpLiteralHost(host) {
+  if (!host) return true;
+  if (host.startsWith('[')) return true;              // IPv6 literal, e.g. [::1]
+  if (/^[0-9.]+$/.test(host)) return true;            // dotted-quad or bare integer
+  if (host.split('.').some((label) => /^0x/i.test(label))) return true; // hex form
+  return false;
+}
+
+/**
+ * Validate ONE destination against the allow-list. Pure; every refusal
+ * carries the specific reason so an approver can see what was wrong.
+ */
+export function validateWebConnectorDestination(value, allowedHosts = webConnectorAllowedHosts()) {
+  const allow = webConnectorAllowedHosts(allowedHosts);
+  const raw = String(value ?? '').trim();
+  if (!raw) return { ok: false, reason: 'empty destination' };
+
+  let u;
+  try {
+    u = new URL(decodeMaybe(raw));
+  } catch {
+    // Protocol-relative ("//host/path") and every other unparseable form land
+    // here. Refusing is correct: we cannot prove the scheme, so we cannot
+    // prove it is https.
+    return { ok: false, reason: `"${raw}" is not a parseable absolute URL (a protocol-relative or malformed destination cannot be proven https)` };
+  }
+
+  // https ONLY, checked before the host: an agent desktop posting live call
+  // and contact data in plaintext is unacceptable regardless of destination.
+  if (u.protocol !== 'https:') {
+    return { ok: false, reason: `scheme "${u.protocol}" is not https: — call and contact data must never leave the agent desktop in plaintext` };
+  }
+  if (u.username || u.password) {
+    return { ok: false, reason: 'embedded credentials (user:pass@host) in the destination' };
+  }
+  if (u.port) {
+    return { ok: false, reason: `non-standard port ":${u.port}" — only the default https port is allowed` };
+  }
+
+  const host = u.hostname.toLowerCase();
+  if (isIpLiteralHost(host)) {
+    return { ok: false, reason: `IP-literal host "${u.hostname}" — destinations must be named hosts on the allow-list` };
+  }
+  if (!allow.size) {
+    return { ok: false, reason: `${WEBCONNECTOR_ALLOWED_HOSTS_ENV} is unset or empty — the allow-list refuses every destination (fail closed; it never means "allow all")` };
+  }
+  // EXACT match only. Suffix matching would let "evil-example.com" pass an
+  // entry of "example.com", which is the whole class of bug this prevents.
+  if (!allow.has(host)) {
+    return { ok: false, reason: `host "${host}" is not in ${WEBCONNECTOR_ALLOWED_HOSTS_ENV} (exact match only — no suffix matching; allowed: ${[...allow].join(', ')})` };
+  }
+  return { ok: true, host };
+}
+
+/**
+ * Guardrail 13 — check EVERY destination a connector can reach, not just
+ * `url`. A second URL hidden in a POST constant defeats a check that only
+ * reads the primary field, so all four keyValuePair blocks are walked.
+ *
+ * startPageText is checked too. It is not one of the four blocks the ruling
+ * named, but it is a free-text field rendered in the agent desktop, so a URL
+ * in it is reachable for exactly the same reason — the ruling's stated
+ * principle ("a second destination hidden in X defeats a check that only
+ * reads url") applies to it unchanged. Called out in the PR body.
+ */
+export function checkWebConnectorDestinations(connector, { allowedHosts } = {}) {
+  const allow = webConnectorAllowedHosts(allowedHosts);
+  const violations = [];
+  const checked = [];
+
+  const examine = (label, value) => {
+    const verdict = validateWebConnectorDestination(value, allow);
+    checked.push({ at: label, value: String(value ?? ''), ok: verdict.ok });
+    if (!verdict.ok) violations.push(`${label}: ${verdict.reason}`);
+  };
+
+  const url = connector?.url;
+  if (url === undefined || url === null || String(url).trim() === '') {
+    violations.push('url: missing — a web connector with no destination cannot be validated, so it cannot be approved');
+  } else {
+    examine('url', url);
+  }
+
+  for (const block of WEBCONNECTOR_KV_BLOCKS) {
+    const rows = Array.isArray(connector?.[block])
+      ? connector[block]
+      : (connector?.[block] ? [connector[block]] : []);
+    rows.forEach((row, i) => {
+      const value = row?.value;
+      if (value === undefined || value === null) return;
+      if (!looksLikeDestination(value)) return; // a plain call variable, not a destination
+      examine(`${block}[${i}]${row?.key ? ` (${row.key})` : ''}`, value);
+    });
+  }
+
+  if (looksLikeDestination(connector?.startPageText)) {
+    examine('startPageText', connector.startPageText);
+  }
+
+  return {
+    ok: violations.length === 0,
+    violations,
+    checked,
+    allowed_hosts: [...allow],
+    // Recorded on the audit event so the absence of an override is visible in
+    // the record, not just in this file.
+    override_available: false,
+  };
+}
+
+/* ---------------------------------------------------------------------- *
+ * Web connector read-modify-write.
+ *
+ * modifyWebConnector is built as a FULL-OBJECT REPLACE. Every modify* op in
+ * this API that takes a named complexType has replaced the whole struct —
+ * modifyUserProfile most recently, where omitting `roles` revokes every
+ * grant. The schema gives no basis to expect webConnector to behave
+ * differently (the operation takes one <connector> of tns:webConnector, the
+ * same shape create takes), so it read-modify-writes: read live, overlay the
+ * named changes, serialize complete, re-read and diff against intent.
+ * ---------------------------------------------------------------------- */
+
+/**
+ * Rebuild the exact schema-shaped struct Five9 last returned, from the raw
+ * parsed block rather than the reader's normalized view. The normalized view
+ * coerces booleans (`x === 'true'`), which turns an ABSENT field into an
+ * explicit false — and on a full-object replace an invented false is a
+ * silent setting change. The raw block preserves absent-vs-false.
+ */
+export function webConnectorFromRead(read) {
+  const raw = read?.raw;
+  if (!raw || typeof raw !== 'object') return null;
+  const out = {};
+  for (const f of flattenType('webConnector')) {
+    const v = raw[f.name];
+    if (v === undefined || v === null) continue;
+    if (f.maxOccurs === 'unbounded') {
+      const items = Array.isArray(v) ? v : [v];
+      if (items.length) out[f.name] = items;
+      continue;
+    }
+    out[f.name] = v;
+  }
+  return out;
+}
+
+/**
+ * Overlay `changes` onto the live struct. The name is pinned to Five9's own
+ * spelling: renaming through modify would be a rename, and renames are
+ * denied for the same attribution reason campaigns are.
+ */
+export function mergeWebConnector(existing, changes = {}) {
+  const base = webConnectorFromRead(existing);
+  if (!base) {
+    throw new Error('REFUSED: read-before-write returned no parseable webConnector body — refusing to replace a struct we could not read');
+  }
+  if (!changes || typeof changes !== 'object' || Array.isArray(changes)) {
+    throw new Error('five9_modify_web_connector requires action_payload.changes as an object');
+  }
+  const known = new Set(flattenType('webConnector').map((f) => f.name));
+  for (const key of Object.keys(changes)) {
+    if (!known.has(key)) {
+      throw new Error(`REFUSED: unknown webConnector field "${key}" — webConnector carries exactly ${[...known].sort().join(', ')}`);
+    }
+  }
+  if (Object.hasOwn(changes, 'name') && String(changes.name) !== String(base.name)) {
+    throw new Error(`REFUSED: five9_modify_web_connector cannot rename a connector (live name "${base.name}", changes.name "${changes.name}") — create the new one and retire the old one deliberately`);
+  }
+  return { ...base, ...changes, name: base.name };
+}
+
+/** Read-back diff — reports drift on CHANGED and UNTOUCHED fields alike. */
+export function verifyWebConnectorReadBack(submitted, after, changedKeys = []) {
+  const canon = (v) => (v === undefined || v === null ? null : JSON.stringify(v));
+  const actualRaw = after?.raw ?? {};
+  const mismatches = [];
+  for (const [field, expected] of Object.entries(submitted || {})) {
+    const actual = actualRaw[field];
+    if (canon(expected) === canon(actual)) continue;
+    mismatches.push({
+      field,
+      untouched: !changedKeys.includes(field),
+      expected,
+      actual: actual ?? null,
+    });
+  }
+  return mismatches;
+}
+
+export function executeCreateWebConnector(action) {
+  const payload = action.action_payload || {};
+  const name = String(payload.connector_name || '').trim();
+  const connector = payload.connector;
+  if (!name) throw new Error('five9_create_web_connector requires action_payload.connector_name');
+  if (!connector || typeof connector !== 'object' || Array.isArray(connector)) {
+    throw new Error('five9_create_web_connector requires action_payload.connector as an object');
+  }
+
+  return withFive9WriteGate(
+    { action, subtype: 'create_web_connector', entityType: 'five9_web_connector', entityId: name },
+    async (ctx) => {
+      checkConfirmToken('create_web_connector', payload);
+      const submitted = { ...connector, name };
+
+      // Guardrail 13 BEFORE the existence read: a refusal should not depend on
+      // whether the name happens to be free.
+      const destinations = checkWebConnectorDestinations(submitted);
+      ctx.event_extra.destination_check = destinations;
+      if (!destinations.ok) {
+        throw new Error(`REFUSED: Guardrail 13 — ${destinations.violations.join('; ')}`);
+      }
+
+      const existing = await getWebConnector(name);
+      ctx.previous_state = existing;
+      if (existing) {
+        // REFUSE rather than skip: createWebConnector on a live name would
+        // either fault or silently replace a connector nobody reviewed.
+        throw new Error(`REFUSED: a web connector named "${existing.name}" already exists — use five9_modify_web_connector, or pick a different name`);
+      }
+
+      await ctx.soap('createWebConnector', buildFromSchema('webConnector', submitted, { wrapper: 'connector' }));
+      if (ctx.dry_run) return { connector: name, created: false, previewed: true, destination_check: destinations };
+
+      ctx.new_state = await getWebConnector(name);
+      return { connector: name, created: !!ctx.new_state, destination_check: destinations };
+    },
+  );
+}
+
+export function executeModifyWebConnector(action) {
+  const payload = action.action_payload || {};
+  const name = String(payload.connector_name || '').trim();
+  const changes = payload.changes;
+  if (!name) throw new Error('five9_modify_web_connector requires action_payload.connector_name');
+  if (!changes || typeof changes !== 'object' || Array.isArray(changes) || !Object.keys(changes).length) {
+    throw new Error('five9_modify_web_connector requires action_payload.changes with at least one field');
+  }
+
+  return withFive9WriteGate(
+    { action, subtype: 'modify_web_connector', entityType: 'five9_web_connector', entityId: name },
+    async (ctx) => {
+      checkConfirmToken('modify_web_connector', payload);
+
+      const existing = await getWebConnector(name);
+      if (!existing) throw new Error(`web_connector_not_found: ${name}`);
+      ctx.previous_state = existing;
+
+      // Re-check the token against Five9's OWN spelling, like
+      // modify_user_profile: that makes it a check on the target rather than
+      // on the payload's internal consistency.
+      if (String(payload.confirm_token ?? '') !== existing.name) {
+        throw new Error(`REFUSED: confirm_token mismatch for modify_web_connector — payload.confirm_token must exactly equal the live connector name "${existing.name}" (including case)`);
+      }
+
+      const merged = mergeWebConnector(existing, changes);
+
+      // Guardrail 13 runs on the MERGED struct, not on `changes`: the live
+      // connector may already carry a destination that is no longer allowed,
+      // and a full-object replace re-submits it.
+      const destinations = checkWebConnectorDestinations(merged);
+      ctx.event_extra.destination_check = destinations;
+      if (!destinations.ok) {
+        throw new Error(`REFUSED: Guardrail 13 — ${destinations.violations.join('; ')}`);
+      }
+
+      const changedKeys = Object.keys(changes);
+      ctx.event_extra.changed_fields = changedKeys;
+      ctx.event_extra.replace_semantics = 'full-object replace (read-modify-write); every field is re-submitted, not patched';
+
+      await ctx.soap('modifyWebConnector', buildFromSchema('webConnector', merged, { wrapper: 'connector' }));
+      if (ctx.dry_run) {
+        return { connector: existing.name, modified: false, previewed: true, changed_fields: changedKeys, destination_check: destinations };
+      }
+
+      ctx.new_state = await getWebConnector(name);
+      const verify_mismatches = verifyWebConnectorReadBack(merged, ctx.new_state, changedKeys);
+      ctx.event_extra.verify_mismatches = verify_mismatches;
+      return {
+        connector: existing.name,
+        modified: true,
+        changed_fields: changedKeys,
+        verified: verify_mismatches.length === 0,
+        ...(verify_mismatches.length ? { verify_mismatches } : {}),
+        destination_check: destinations,
+      };
+    },
+  );
+}
+
+/* ====================================================================== *
+ * Phase H PR4 (2026-08-21) — campaign composition.
+ *
+ * Lists, skills, dispositions and strategies: what a campaign dials, who it
+ * routes to, and how fast. All of it lands on a campaign the floor is
+ * working, which is why almost every op here refuses while the target is
+ * RUNNING — the exception is documented per-op.
+ *
+ * SCHEMA NOTE. Every request wrapper in this section IS a complexType in
+ * wsdl-schema.json (addListsToCampaign carries campaignName + repeated
+ * lists, and so on), so buildFromSchema walks the wrapper directly and there
+ * is no hand-written field order in this tranche. That is the mechanism PR3
+ * built, used as intended.
+ * ====================================================================== */
+
+/**
+ * Refuse an op while its campaign is RUNNING.
+ *
+ * Same shape as Guardrail 11 (checkResetCampaignState) and same reasoning:
+ * the request is DANGEROUS, not already-satisfied, so it refuses rather than
+ * skipping. Changing what a live campaign dials, or who it routes to,
+ * underneath the agents currently on it is not a change you make and then
+ * discover — stop it first, change it, start it, as separately approved
+ * actions.
+ */
+export function refuseIfCampaignRunning(op, campaign) {
+  const state = String(campaign?.state || '').toUpperCase();
+  if (state === 'RUNNING') {
+    throw new Error(`REFUSED: ${op} on a RUNNING campaign — "${campaign?.name}" is live and agents are working it; stop the campaign, make the change, and restart it as separately approved actions`);
+  }
+}
+
+/**
+ * Shared spine for the composition ops: read the campaign, refuse INBOUND,
+ * check the token, optionally refuse RUNNING, then let the op build its body.
+ *
+ * `build` receives (ctx, campaign, payload) and returns the inner XML. It may
+ * also perform its own reads (existence checks, read-modify-write) — those
+ * run after the state guards so a RUNNING refusal never costs extra SOAP
+ * calls.
+ */
+async function campaignCompositionOp(action, subtype, {
+  method, build, refuseWhileRunning = true, readBack = null,
+}) {
+  const payload = action.action_payload || {};
+  const name = String(payload.campaign_name || '').trim();
+  if (!name) throw new Error(`five9_${subtype} requires action_payload.campaign_name`);
+
+  return withFive9WriteGate(
+    { action, subtype, entityType: 'five9_campaign', entityId: name },
+    async (ctx) => {
+      checkConfirmToken(subtype, payload);
+      const { campaigns } = await getCampaigns();
+      const hit = campaigns.find((c) => c.name.toLowerCase() === name.toLowerCase());
+      if (!hit) throw new Error(`campaign_not_found: ${name}`);
+      ctx.previous_state = hit;
+      refuseIfInbound(hit);
+      if (refuseWhileRunning) refuseIfCampaignRunning(subtype, hit);
+
+      const { xml, result = {} } = await build(ctx, hit, payload);
+      await ctx.soap(method, xml);
+      if (ctx.dry_run) return { campaign: hit.name, method, previewed: true, ...result };
+
+      if (readBack) ctx.new_state = await readBack(hit, payload);
+      return { campaign: hit.name, method, ...result };
+    },
+  );
+}
+
+// Every composition op takes a non-empty array of names; an empty array is a
+// no-op the caller almost certainly did not mean, and buildFromSchema refuses
+// an empty repeatable anyway. Refusing here makes the message specific.
+function requireNonEmptyList(value, label, op) {
+  const items = Array.isArray(value) ? value.filter((v) => String(v ?? '').trim()) : [];
+  if (!items.length) throw new Error(`five9_${op} requires action_payload.${label} as a non-empty array`);
+  return items;
+}
+
+/**
+ * Attached-list names for a campaign.
+ *
+ * Returns NULL when the lookup failed, [] when the campaign genuinely has no
+ * lists. getOutboundCampaign is explicit about that distinction (it fetches
+ * lists through a second getListsForCampaign call and leaves `lists` null if
+ * that call throws), and collapsing the two would be a fail-open: a failed
+ * read would report "nothing attached", which on a REPLACE means "nothing
+ * would be detached" — exactly the reassurance you must not invent.
+ */
+async function attachedListNames(campaignName) {
+  const cfg = await getOutboundCampaign(campaignName);
+  const rows = cfg?.lists ?? cfg?.raw?.lists ?? null;
+  if (rows === null || rows === undefined) return null;
+  return asArray(rows).map((l) => String(l?.listName ?? l?.name ?? l ?? '').trim()).filter(Boolean);
+}
+
+/**
+ * Skill names attached to a campaign. getOutboundCampaign does not normalize
+ * skills, so this reads the raw block. Returns [] when the block carries no
+ * skills — which for this API is indistinguishable from "none attached", and
+ * is why the last-skill guard treats an unreadable set as unsafe rather than
+ * as empty (see executeRemoveSkillsFromCampaign).
+ */
+async function attachedSkillNames(campaignName) {
+  const cfg = await getOutboundCampaign(campaignName);
+  const rows = cfg?.skills ?? cfg?.raw?.skills ?? null;
+  if (rows === null || rows === undefined) return [];
+  return asArray(rows).map((s) => String(s?.skillName ?? s?.name ?? s ?? '').trim()).filter(Boolean);
+}
+
+/* -- createOutboundCampaign -------------------------------------------- */
+
+/**
+ * five9_create_outbound_campaign — creates STOPPED, always.
+ *
+ * Two guards beyond the token:
+ *   1. profileName must name an EXISTING campaign profile. Five9 will accept
+ *      a campaign whose profile does not resolve, and the failure surfaces
+ *      later as a campaign that will not dial.
+ *   2. state is forced to NOT_RUNNING. A campaign that starts dialing the
+ *      moment it is created has never been reviewed in the state it runs in;
+ *      starting it is five9_start_campaign, separately approved.
+ */
+export function executeCreateOutboundCampaign(action) {
+  const payload = action.action_payload || {};
+  const name = String(payload.campaign_name || '').trim();
+  const campaign = payload.campaign;
+  if (!name) throw new Error('five9_create_outbound_campaign requires action_payload.campaign_name');
+  if (!campaign || typeof campaign !== 'object' || Array.isArray(campaign)) {
+    throw new Error('five9_create_outbound_campaign requires action_payload.campaign as an object');
+  }
+
+  return withFive9WriteGate(
+    { action, subtype: 'create_outbound_campaign', entityType: 'five9_campaign', entityId: name },
+    async (ctx) => {
+      checkConfirmToken('create_outbound_campaign', payload);
+
+      const { campaigns } = await getCampaigns();
+      if (campaigns.some((c) => c.name.toLowerCase() === name.toLowerCase())) {
+        throw new Error(`REFUSED: a campaign named "${name}" already exists — campaign names key DNIS→source attribution, so they are never reused`);
+      }
+
+      const profileName = String(campaign.profileName ?? '').trim();
+      if (!profileName) {
+        throw new Error('REFUSED: create_outbound_campaign requires campaign.profileName — a campaign with no profile has no retry or dial settings and will not dial');
+      }
+      const { profiles } = await getCampaignProfiles();
+      const known = asArray(profiles).map((p) => String(p?.name ?? '').trim().toLowerCase());
+      if (!known.includes(profileName.toLowerCase())) {
+        throw new Error(`REFUSED: campaign profile "${profileName}" does not exist (known: ${known.filter(Boolean).join(', ') || 'none readable'}) — Five9 accepts an unresolvable profile and the campaign then silently fails to dial`);
+      }
+
+      // Forced, not defaulted: an explicit RUNNING in the payload is a refusal,
+      // not something to quietly overwrite.
+      const requestedState = String(campaign.state ?? '').trim().toUpperCase();
+      if (requestedState && requestedState !== 'NOT_RUNNING') {
+        throw new Error(`REFUSED: create_outbound_campaign creates only with state=NOT_RUNNING (payload asked for "${campaign.state}") — start it with five9_start_campaign as a separately approved action`);
+      }
+      const submitted = { ...campaign, name, state: 'NOT_RUNNING' };
+      ctx.event_extra.forced_state = 'NOT_RUNNING';
+
+      await ctx.soap('createOutboundCampaign', buildFromSchema('outboundCampaign', submitted, { wrapper: 'campaign' }));
+      if (ctx.dry_run) return { campaign: name, created: false, previewed: true, profileName };
+
+      ctx.new_state = await getOutboundCampaign(name).catch(() => null);
+      return { campaign: name, created: !!ctx.new_state, profileName, state: 'NOT_RUNNING' };
+    },
+  );
+}
+
+/* -- lists ------------------------------------------------------------- */
+
+// tns:listState carries campaignName/listName plus optional dialing priority
+// and ratio. Callers pass either a bare list name or the full struct.
+function toListState(entry, campaignName, op) {
+  if (typeof entry === 'string') {
+    const listName = entry.trim();
+    if (!listName) throw new Error(`five9_${op}: empty list name`);
+    return { campaignName, listName };
+  }
+  if (!entry || typeof entry !== 'object') {
+    throw new Error(`five9_${op}: each list must be a name or a { listName, dialingPriority?, dialingRatio?, priority? } object`);
+  }
+  const listName = String(entry.listName ?? entry.name ?? '').trim();
+  if (!listName) throw new Error(`five9_${op}: each list entry requires listName`);
+  const out = { campaignName, listName };
+  for (const k of ['dialingPriority', 'dialingRatio', 'priority']) {
+    if (entry[k] !== undefined && entry[k] !== null) out[k] = entry[k];
+  }
+  return out;
+}
+
+async function assertListsExist(names, op) {
+  const { lists } = await getListsInfo();
+  const known = new Set(asArray(lists).map((l) => String(l?.name ?? '').trim().toLowerCase()));
+  const missing = names.filter((n) => !known.has(n.toLowerCase()));
+  if (missing.length) {
+    throw new Error(`REFUSED: five9_${op} names ${missing.length} list(s) that do not exist: ${missing.join(', ')} — Five9 accepts an unknown list silently and the campaign then dials nothing from it`);
+  }
+}
+
+export function executeAddListsToCampaign(action) {
+  return campaignCompositionOp(action, 'add_lists_to_campaign', {
+    method: 'addListsToCampaign',
+    build: async (ctx, campaign, payload) => {
+      const entries = requireNonEmptyList(payload.lists, 'lists', 'add_lists_to_campaign');
+      const states = entries.map((e) => toListState(e, campaign.name, 'add_lists_to_campaign'));
+      await assertListsExist(states.map((s) => s.listName), 'add_lists_to_campaign');
+      const before = await attachedListNames(campaign.name);
+      ctx.event_extra.lists_before = before; // null = could not read, not "none attached"
+      return {
+        xml: buildFromSchema('addListsToCampaign', { campaignName: campaign.name, lists: states }),
+        result: { lists_added: states.map((s) => s.listName), lists_before: before },
+      };
+    },
+    readBack: (campaign) => getOutboundCampaign(campaign.name).catch(() => null),
+  });
+}
+
+export function executeRemoveListsFromCampaign(action) {
+  return campaignCompositionOp(action, 'remove_lists_from_campaign', {
+    method: 'removeListsFromCampaign',
+    build: async (ctx, campaign, payload) => {
+      const entries = requireNonEmptyList(payload.lists, 'lists', 'remove_lists_from_campaign');
+      const states = entries.map((e) => toListState(e, campaign.name, 'remove_lists_from_campaign'));
+      const before = await attachedListNames(campaign.name);
+      ctx.event_extra.lists_before = before; // null = could not read, not "none attached"
+      return {
+        xml: buildFromSchema('removeListsFromCampaign', { campaignName: campaign.name, lists: states }),
+        result: { lists_removed: states.map((s) => s.listName), lists_before: before },
+      };
+    },
+    readBack: (campaign) => getOutboundCampaign(campaign.name).catch(() => null),
+  });
+}
+
+/**
+ * five9_modify_campaign_lists — REPLACES the campaign's entire list set.
+ *
+ * Read-modify-write is not optional here: the op is a replace, so a payload
+ * naming two lists on a campaign that currently carries five DETACHES the
+ * other three. The read-before-write is captured on the audit event so the
+ * detachment is visible in the record even when it was intended.
+ */
+export function executeModifyCampaignLists(action) {
+  return campaignCompositionOp(action, 'modify_campaign_lists', {
+    method: 'modifyCampaignLists',
+    build: async (ctx, campaign, payload) => {
+      const entries = requireNonEmptyList(payload.lists, 'lists', 'modify_campaign_lists');
+      const states = entries.map((e) => toListState(e, campaign.name, 'modify_campaign_lists'));
+      await assertListsExist(states.map((s) => s.listName), 'modify_campaign_lists');
+
+      const before = await attachedListNames(campaign.name);
+      // A REPLACE whose current set could not be read is a replace whose blast
+      // radius is unknown. Refusing is the only honest option: reporting an
+      // empty lists_detached here would tell the approver nothing is being
+      // detached, which is precisely the thing we cannot establish.
+      if (before === null) {
+        throw new Error(`REFUSED: could not read the lists currently attached to "${campaign.name}" — modifyCampaignLists REPLACES the whole set, so proceeding would detach an unknown number of lists`);
+      }
+      const submitted = states.map((s) => s.listName);
+      const detached = before.filter((b) => !submitted.some((s) => s.toLowerCase() === b.toLowerCase()));
+      ctx.event_extra.lists_before = before;
+      ctx.event_extra.lists_detached = detached;
+      ctx.event_extra.replace_semantics = 'modifyCampaignLists REPLACES the whole list set — anything absent from the payload is detached';
+
+      return {
+        xml: buildFromSchema('modifyCampaignLists', { campaignName: campaign.name, lists: states }),
+        result: { lists_before: before, lists_after_intended: submitted, lists_detached: detached },
+      };
+    },
+    readBack: (campaign) => getOutboundCampaign(campaign.name).catch(() => null),
+  });
+}
+
+/* -- skills ------------------------------------------------------------ */
+
+async function assertSkillsExist(names, op) {
+  const { skills } = await getSkills();
+  const known = new Set(asArray(skills).map((s) => String(s?.name ?? '').trim().toLowerCase()));
+  const missing = names.filter((n) => !known.has(n.toLowerCase()));
+  if (missing.length) {
+    throw new Error(`REFUSED: five9_${op} names ${missing.length} skill(s) that do not exist: ${missing.join(', ')}`);
+  }
+}
+
+export function executeAddSkillsToCampaign(action) {
+  return campaignCompositionOp(action, 'add_skills_to_campaign', {
+    method: 'addSkillsToCampaign',
+    build: async (ctx, campaign, payload) => {
+      const skills = requireNonEmptyList(payload.skills, 'skills', 'add_skills_to_campaign');
+      await assertSkillsExist(skills, 'add_skills_to_campaign');
+      const before = await attachedSkillNames(campaign.name);
+      ctx.event_extra.skills_before = before;
+      return {
+        xml: buildFromSchema('addSkillsToCampaign', { campaignName: campaign.name, skills }),
+        result: { skills_added: skills, skills_before: before },
+      };
+    },
+    readBack: (campaign) => getOutboundCampaign(campaign.name).catch(() => null),
+  });
+}
+
+/**
+ * five9_remove_skills_from_campaign — the one composition op that is allowed
+ * to run against a RUNNING campaign, and the one with an extra guard.
+ *
+ * Removing SOME skills from a live campaign is a routing change. Removing the
+ * LAST one strands every call already queued on it: there is no skill left to
+ * route them to, and they sit until they abandon. So this refuses when the
+ * removal would empty the skill set on a RUNNING campaign, and allows the
+ * same removal once the campaign is stopped.
+ */
+export function executeRemoveSkillsFromCampaign(action) {
+  return campaignCompositionOp(action, 'remove_skills_from_campaign', {
+    method: 'removeSkillsFromCampaign',
+    refuseWhileRunning: false, // the LAST-skill guard below is the real check
+    build: async (ctx, campaign, payload) => {
+      const skills = requireNonEmptyList(payload.skills, 'skills', 'remove_skills_from_campaign');
+      const before = await attachedSkillNames(campaign.name);
+      const lower = new Set(skills.map((s) => s.toLowerCase()));
+      const remaining = before.filter((s) => !lower.has(s.toLowerCase()));
+      ctx.event_extra.skills_before = before;
+      ctx.event_extra.skills_remaining = remaining;
+
+      if (String(campaign.state || '').toUpperCase() === 'RUNNING') {
+        // Fail SAFE, not open: an unreadable skill set on a live campaign
+        // means we cannot prove this removal leaves anything to route to.
+        if (!before.length) {
+          throw new Error(`REFUSED: could not read the skills currently on RUNNING campaign "${campaign.name}" — the last-skill guard cannot be evaluated, and a removal that strands every queued call is not something to take on trust. Stop the campaign first.`);
+        }
+        if (!remaining.length) {
+          throw new Error(`REFUSED: removing ${skills.join(', ')} would leave "${campaign.name}" with NO skills while it is RUNNING — every call already queued on it would be stranded with nothing to route to. Stop the campaign first.`);
+        }
+      }
+      return {
+        xml: buildFromSchema('removeSkillsFromCampaign', { campaignName: campaign.name, skills }),
+        result: { skills_removed: skills, skills_before: before, skills_remaining: remaining },
+      };
+    },
+    readBack: (campaign) => getOutboundCampaign(campaign.name).catch(() => null),
+  });
+}
+
+/* -- dispositions ------------------------------------------------------ */
+
+async function assertDispositionsExist(names, op) {
+  const { dispositions } = await getDispositions();
+  const known = new Set(asArray(dispositions).map((d) => String(d?.name ?? '').trim().toLowerCase()));
+  const missing = names.filter((n) => !known.has(n.toLowerCase()));
+  if (missing.length) {
+    throw new Error(`REFUSED: five9_${op} names ${missing.length} disposition(s) that do not exist: ${missing.join(', ')}`);
+  }
+}
+
+/**
+ * five9_add_dispositions_to_campaign — the one op in this tranche with no
+ * RUNNING refusal.
+ *
+ * Adding a disposition is additive: it widens what an agent can select and
+ * cannot change how any existing call is counted. That is a different act
+ * from removing one, which is why the pair is not symmetric.
+ */
+export function executeAddDispositionsToCampaign(action) {
+  return campaignCompositionOp(action, 'add_dispositions_to_campaign', {
+    method: 'addDispositionsToCampaign',
+    refuseWhileRunning: false,
+    build: async (ctx, campaign, payload) => {
+      const dispositions = requireNonEmptyList(payload.dispositions, 'dispositions', 'add_dispositions_to_campaign');
+      await assertDispositionsExist(dispositions, 'add_dispositions_to_campaign');
+      const body = { campaignName: campaign.name, dispositions };
+      if (payload.is_skip_preview_disposition !== undefined) {
+        body.isSkipPreviewDisposition = payload.is_skip_preview_disposition === true;
+      }
+      return {
+        xml: buildFromSchema('addDispositionsToCampaign', body),
+        result: { dispositions_added: dispositions },
+      };
+    },
+    readBack: (campaign) => getOutboundCampaign(campaign.name).catch(() => null),
+  });
+}
+
+/**
+ * five9_remove_dispositions_from_campaign — BUILT, DELIBERATELY UNREGISTERED.
+ *
+ * The Phase H PR4 ruling requires this op to refuse any disposition named in
+ * the CC payroll bonus mapping, because removing one silently changes what
+ * the call centre gets paid for. That guard needs an authoritative list of
+ * which dispositions are payroll-relevant.
+ *
+ * NO SUCH LIST EXISTS. Searched 2026-08-21: no Bonus_Structure.md in any of
+ * the six repos, no payroll/bonus/commission table in Supabase (only
+ * lp_dispositions, which carries category / is_recoverable / reactivation_
+ * track and nothing about pay), and no CC payroll audit script. The two
+ * authoritative Notion documents — "Call Center Bonus Structure (weekly
+ * payroll)" and "Call Center Payroll — Weekly (do this every Monday)" —
+ * describe the bonus math in full and derive ALL of it from three Lead
+ * Perfection reports (Security > Export > Call Center > Setter Payroll, and
+ * two Report Generator reports). Payroll is computed from LP demo counts,
+ * not from Five9 dispositions. The only disposition either document names is
+ * "no-rehash", and it is named precisely because the reports MISCOUNT it —
+ * and the two documents contradict each other on which direction to correct
+ * ("added to the demo-count/bonus totals" vs "no-rehash leads removed from
+ * setter bonus").
+ *
+ * So the guard has no source. Per the ruling: build it, leave it
+ * unregistered. A guard keyed on a made-up list would read as protection
+ * while protecting nothing — worse than no op at all, because the next person
+ * would trust it.
+ *
+ * TO REGISTER: define the mapping somewhere authoritative (a Supabase table
+ * keyed on Five9 disposition name is the obvious home, since it has to be
+ * queryable at execute time), point PAYROLL_PROTECTED_DISPOSITIONS at it, add
+ * the action type to FIVE9_WRITE_OPS / ACTION_HANDLERS / the approval test,
+ * and flip the OP_CLASSIFICATION row from `not-built` to `shipped`.
+ */
+export const PAYROLL_PROTECTED_DISPOSITIONS = Object.freeze({
+  available: false,
+  source: null,
+  names: Object.freeze([]),
+  reason: 'No authoritative CC payroll disposition mapping exists as of 2026-08-21. Payroll is computed from Lead Perfection reports, not Five9 dispositions; the only disposition the payroll documents name is "no-rehash", and they contradict each other on how it is corrected.',
+});
+
+export function checkPayrollDispositions(names, mapping = PAYROLL_PROTECTED_DISPOSITIONS) {
+  if (!mapping?.available) {
+    return {
+      ok: false,
+      unenforceable: true,
+      violations: [`the CC payroll disposition guard has no authoritative source — ${mapping?.reason ?? 'mapping unavailable'}`],
+    };
+  }
+  const protectedSet = new Set(mapping.names.map((n) => String(n).toLowerCase()));
+  const hits = names.filter((n) => protectedSet.has(String(n).toLowerCase()));
+  return {
+    ok: hits.length === 0,
+    unenforceable: false,
+    violations: hits.map((n) => `"${n}" is in the CC payroll bonus mapping (${mapping.source}) — removing it changes what the floor is paid for`),
+  };
+}
+
+export function executeRemoveDispositionsFromCampaign(action) {
+  return campaignCompositionOp(action, 'remove_dispositions_from_campaign', {
+    method: 'removeDispositionsFromCampaign',
+    refuseWhileRunning: false,
+    build: async (ctx, campaign, payload) => {
+      const dispositions = requireNonEmptyList(payload.dispositions, 'dispositions', 'remove_dispositions_from_campaign');
+      const verdict = checkPayrollDispositions(dispositions);
+      ctx.event_extra.payroll_check = verdict;
+      if (!verdict.ok) {
+        throw new Error(`REFUSED: ${verdict.violations.join('; ')}`);
+      }
+      return {
+        xml: buildFromSchema('removeDispositionsFromCampaign', { campaignName: campaign.name, dispositions }),
+        result: { dispositions_removed: dispositions, payroll_check: verdict },
+      };
+    },
+    readBack: (campaign) => getOutboundCampaign(campaign.name).catch(() => null),
+  });
+}
+
+/**
+ * five9_reset_campaign_dispositions — same blast radius as Guardrail 11,
+ * scoped to dispositions: clearing them makes every record carrying one
+ * re-dialable. Refuses while RUNNING for exactly that reason.
+ *
+ * `after` / `before` are optional dateTime bounds that narrow the reset to a
+ * window; passing neither resets the whole campaign's dispositions.
+ */
+export function executeResetCampaignDispositions(action) {
+  return campaignCompositionOp(action, 'reset_campaign_dispositions', {
+    method: 'resetCampaignDispositions',
+    build: async (ctx, campaign, payload) => {
+      const dispositions = requireNonEmptyList(payload.dispositions, 'dispositions', 'reset_campaign_dispositions');
+      await assertDispositionsExist(dispositions, 'reset_campaign_dispositions');
+      const body = { campaignName: campaign.name, dispositions };
+      if (payload.after) body.after = payload.after;
+      if (payload.before) body.before = payload.before;
+      ctx.event_extra.window = { after: payload.after ?? null, before: payload.before ?? null };
+      if (!payload.after && !payload.before) {
+        ctx.event_extra.window_note = 'no after/before bound — every record carrying these dispositions becomes re-dialable';
+      }
+      return {
+        xml: buildFromSchema('resetCampaignDispositions', body),
+        result: { dispositions_reset: dispositions, after: payload.after ?? null, before: payload.before ?? null },
+      };
+    },
+  });
+}
+
+/* -- strategies -------------------------------------------------------- */
+
+/**
+ * five9_set_campaign_strategies — dial pacing. This is the compliance-exposed
+ * dimension of a campaign (it governs how aggressively Five9 dials against
+ * agent availability, which is what abandonment rate is downstream of), so it
+ * refuses while RUNNING rather than re-pacing a live campaign mid-shift.
+ */
+export function executeSetCampaignStrategies(action) {
+  return campaignCompositionOp(action, 'set_campaign_strategies', {
+    method: 'setCampaignStrategies',
+    build: async (ctx, campaign, payload) => {
+      const strategies = payload.campaign_strategies ?? payload.strategies;
+      if (!strategies || typeof strategies !== 'object') {
+        throw new Error('five9_set_campaign_strategies requires action_payload.campaign_strategies (a tns:campaignStrategies object, i.e. { strategies: [...] })');
+      }
+      const wrapped = Array.isArray(strategies) ? { strategies } : strategies;
+      if (!asArray(wrapped.strategies).length) {
+        throw new Error('five9_set_campaign_strategies requires at least one strategy in campaign_strategies.strategies');
+      }
+      const before = await getCampaignStrategies(campaign.name).catch(() => null);
+      ctx.event_extra.strategies_before = before;
+      ctx.event_extra.replace_semantics = 'setCampaignStrategies REPLACES the campaign strategy set';
+      return {
+        xml: buildFromSchema('setCampaignStrategies', { campaignName: campaign.name, campaignStrategies: wrapped }),
+        result: { strategy_count: asArray(wrapped.strategies).length, strategies_before: before },
+      };
+    },
+    readBack: (campaign) => getCampaignStrategies(campaign.name).catch(() => null),
+  });
+}
+
+/* -- lists: create + position ------------------------------------------ */
+
+/**
+ * five9_create_list — the only `enabled` op in this tranche.
+ *
+ * A new list is EMPTY and attached to NOTHING: it cannot dial anyone, change
+ * what any campaign dials, or affect a live call. approve_action alone is the
+ * right amount of ceremony. Populating it (five9_add_records_to_list) and
+ * attaching it (five9_add_lists_to_campaign) are the gated steps.
+ */
+export function executeCreateList(action) {
+  const payload = action.action_payload || {};
+  const listName = String(payload.list_name || '').trim();
+  if (!listName) throw new Error('five9_create_list requires action_payload.list_name');
+
+  return withFive9WriteGate(
+    { action, subtype: 'create_list', entityType: 'five9_list', entityId: listName },
+    async (ctx) => {
+      const { lists } = await getListsInfo();
+      const existing = asArray(lists).find((l) => String(l?.name ?? '').toLowerCase() === listName.toLowerCase());
+      if (existing) {
+        // Already-satisfied, not dangerous: skip rather than refuse.
+        return { skipped: true, reason: 'list_already_exists', list: existing.name, size: existing.size };
+      }
+      ctx.previous_state = null;
+
+      await ctx.soap('createList', buildFromSchema('createList', { listName }));
+      if (ctx.dry_run) return { list: listName, created: false, previewed: true };
+
+      const after = await getListsInfo();
+      ctx.new_state = asArray(after.lists).find((l) => String(l?.name ?? '').toLowerCase() === listName.toLowerCase()) ?? null;
+      return { list: listName, created: !!ctx.new_state };
+    },
+  );
+}
+
+/**
+ * five9_reset_list_position — rewinds a campaign's dialing position so its
+ * lists are worked from the top again.
+ *
+ * SCHEMA CONTRADICTION, REPORTED. The PR4 handoff specified "confirm_token on
+ * the LIST name; refuse while any campaign using the list is RUNNING". The
+ * v13 schema says resetListPosition takes exactly one argument and it is
+ * <campaignName> — there is no list argument to key a list-name token on, and
+ * "any campaign using the list" is not a set this operation can address. The
+ * op is campaign-scoped, so the token restates the CAMPAIGN and the guard
+ * refuses that campaign while it is RUNNING. Standing rule: the schema wins.
+ *
+ * The intent survives the correction — rewinding position on a live campaign
+ * re-dials records the floor already worked, which is exactly what the
+ * handoff's RUNNING refusal was protecting against.
+ */
+export function executeResetListPosition(action) {
+  return campaignCompositionOp(action, 'reset_list_position', {
+    method: 'resetListPosition',
+    build: async (ctx, campaign) => {
+      const lists = await attachedListNames(campaign.name);
+      ctx.event_extra.lists_affected = lists; // null = could not read, not "none attached"
+      return {
+        xml: buildFromSchema('resetListPosition', { campaignName: campaign.name }),
+        result: { lists_affected: lists },
+      };
+    },
+  });
 }

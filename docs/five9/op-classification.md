@@ -54,14 +54,14 @@ action type, or as a reader in `src/five9-admin.js`), `not-built` otherwise.
 | reads | 59 |
 | writes | 123 |
 | `enabled` | 19 |
-| `gated` | 42 |
-| `denied` | 42 |
+| `gated` | 44 |
+| `denied` | 40 |
 | `skip` | 79 |
-| shipped today | 50 |
-| registered action types | 24 |
+| shipped today | 79 |
+| registered action types | 37 |
 
 **No new operation is registered by this PR.** The registry ships seeded with
-exactly the 24 action types that already existed, and one of them —
+exactly the 37 action types that already existed, and one of them —
 `five9_create_campaign_profile` — migrated onto `buildFromSchema`.
 Tiers below are the *proposal* for later tranches, not a description of what is
 live. Each tranche is its own reviewable PR against a builder that has already
@@ -90,9 +90,9 @@ Sorted by name. A registered operation shows its action type beneath it.
 
 | operation | kind | tier | status | reason |
 |---|---|---|---|---|
-| `addDispositionsToCampaign` | write | **gated** | not-built | Guard: confirm_token restating the campaign name; dispositions drive CC payroll bonus math, so the set a campaign offers is not a silent change. |
+| `addDispositionsToCampaign`<br>→ `five9_add_dispositions_to_campaign` | write | **gated** | shipped | Shipped as five9_add_dispositions_to_campaign: confirm_token restating the campaign name, refuses an unknown disposition. The one composition op with NO RUNNING refusal — adding a disposition is additive, widening what an agent can select, and cannot change how any existing call is counted. That asymmetry with removal is deliberate. |
 | `addDNISToCampaign`<br>→ `five9_add_dnis_to_campaign` | write | **gated** | shipped | Shipped as five9_add_dnis_to_campaign: REFUSES a number currently assigned to a different campaign without compliance_override, because reassigning a live number silently re-routes a marketing line and breaks its attribution. |
-| `addListsToCampaign` | write | **gated** | not-built | Guard: confirm_token restating the campaign name, and refuse while the campaign is RUNNING — adding a list changes what is dialing underneath the agents on it. |
+| `addListsToCampaign`<br>→ `five9_add_lists_to_campaign` | write | **gated** | shipped | Shipped as five9_add_lists_to_campaign: confirm_token restating the campaign name, refuses while RUNNING, and refuses a list name that does not exist — Five9 accepts an unknown list silently and the campaign then dials nothing from it. |
 | `addNumbersToDnc`<br>→ `five9_add_numbers_to_dnc` | write | **enabled** | shipped | Shipped as five9_add_numbers_to_dnc. DNC is ADD-ONLY by ruling. |
 | `addPromptTTS`<br>→ `five9_create_prompt_tts` | write | **enabled** | shipped | Shipped as five9_create_prompt_tts — a new TTS prompt is referenced by nothing until a script points at it. |
 | `addPromptWav` | write | **skip** | not-built | Binary audio upload; no agentic path produces a WAV, and TTS already covers the prompt need. |
@@ -100,7 +100,7 @@ Sorted by name. A registered operation shows its action type beneath it.
 | `addRecordToList`<br>→ `five9_add_records_to_list` | write | **enabled** | shipped | Shipped as five9_add_records_to_list, capped at MAX_RECORDS_PER_ACTION (50) per action. |
 | `addRecordToListSimple` | write | **skip** | not-built | Redundant with addRecordToList, which ships; a second builder for the same effect is maintenance with no new capability. |
 | `addSkillAudioFile` | write | **skip** | not-built | Audio asset management; a Five9-UI task with no agentic path that produces the file. |
-| `addSkillsToCampaign` | write | **gated** | not-built | Guard: confirm_token restating the campaign name; refuse while RUNNING. |
+| `addSkillsToCampaign`<br>→ `five9_add_skills_to_campaign` | write | **gated** | shipped | Shipped as five9_add_skills_to_campaign: confirm_token restating the campaign name, refuses while RUNNING, refuses an unknown skill name. |
 | `addToList` | write | **gated** | not-built | Guard: confirm_token restating the list name plus expected_record_count — inline bulk add, reviewable at approval time. |
 | `addToListCsv` | write | **gated** | not-built | Guard: confirm_token restating the list name plus expected_record_count; the CSV rides inline, so the approver can see what is being added. |
 | `addToListFtp` | write | **denied** | not-built | The payload is a file on a remote FTP host, so approve_action has nothing to review — there is no artifact of what would be written. |
@@ -119,14 +119,14 @@ Sorted by name. A registered operation shows its action type beneath it.
 | `createDisposition` | write | **gated** | not-built | Guard: confirm_token restating the disposition name, and refuse a name colliding with an existing one — CC payroll bonus math keys on disposition NAMES. |
 | `createInboundCampaign`<br>→ `five9_create_inbound_campaign` | write | **enabled** | shipped | Shipped as five9_create_inbound_campaign; requires action_payload.script_name because Five9 refuses to create one with a null defaultIvrSchedule. |
 | `createIVRScript`<br>→ `five9_create_ivr_script` | write | **enabled** | shipped | Shipped as five9_create_ivr_script. createIVRScript takes ONLY <name>, so the executor owns the create→modify seam and compensates with deleteIVRScript when the second call fails. |
-| `createList` | write | **enabled** | not-built | A new list is empty and attached to nothing until a separate approved action adds it to a campaign; nothing dials as a result of this call. |
-| `createOutboundCampaign` | write | **gated** | not-built | Guard: confirm_token restating the new campaign name, refuse unless profileName names an existing campaign profile, and create only with state=NOT_RUNNING. |
+| `createList`<br>→ `five9_create_list` | write | **enabled** | shipped | Shipped as five9_create_list, the only `enabled` op in the PR4 tranche: a new list is empty and attached to nothing, so it cannot dial anyone or change what any campaign dials. Populating it (five9_add_records_to_list) and attaching it (five9_add_lists_to_campaign) are the gated steps. Creating one that already exists is a skipped no-op, not a refusal. |
+| `createOutboundCampaign`<br>→ `five9_create_outbound_campaign` | write | **gated** | shipped | Shipped as five9_create_outbound_campaign: confirm_token restating the new campaign name, refuses a name that already exists (campaign names key DNIS→source attribution), refuses unless campaign.profileName names an existing campaign profile (Five9 accepts an unresolvable profile and the campaign then silently fails to dial), and creates only with state=NOT_RUNNING — an explicit RUNNING in the payload is a refusal, not something to overwrite. Starting it is five9_start_campaign, separately approved. |
 | `createReasonCode` | write | **gated** | not-built | Guard: confirm_token restating the reason code name — adherence reporting keys on the name, the same hazard that denies renameDisposition. |
 | `createSkill` | write | **enabled** | not-built | A new skill routes nothing until a separate approved action assigns it to a user or campaign. |
 | `createSpeedDialNumber` | write | **skip** | not-built | NEW SURFACE, flagged for Mark. Schema is {code, number, description} — an agent-desktop dialling shortcut with no routing or compliance effect. Proposed skip: no agentic need identified. |
 | `createUser` | write | **gated** | not-built | Guard: confirm_token restating the user name, plus the Guardrail 12 role check — a new user carrying admin or supervisor needs compliance_override AND a written legal_basis. |
 | `createUserProfile`<br>→ `five9_create_user_profile` | write | **gated** | shipped | Shipped as five9_create_user_profile: confirm_token restating the profile name plus Guardrail 12 on any submitted roles block granting admin or supervisor. |
-| `createWebConnector` | write | **denied** | not-built | A web connector posts live call and contact data to an arbitrary URL from the agent desktop; there is no destination allow-list, so creating one agentically is an exfiltration path with no review of where the data goes. |
+| `createWebConnector`<br>→ `five9_create_web_connector` | write | **gated** | shipped | Shipped as five9_create_web_connector. Ruled allowed 2026-08-21; PR3’s denial (“there is no destination allow-list”) is ANSWERED, not waived — Guardrail 13 is that allow-list. confirm_token restating the connector name; https-only; hostname must EXACTLY match a FIVE9_WEBCONNECTOR_ALLOWED_HOSTS entry (no suffix matching); embedded credentials, non-standard ports and IP-literal hosts refused; the same check applied to every value in constants / postConstants / variables / postVariables / startPageText, because a second destination hidden in a POST constant defeats a check that only reads url. Unset env var means an EMPTY allow-list, which refuses everything — never “allow all”. Deliberately NO compliance_override path: an override would reintroduce the arbitrary-URL hole one approved action at a time. If Guardrail 13 is ever weakened, this row goes back to denied. |
 | `deleteAgentGroup` | write | **denied** | not-built | Every delete* operation is denied: Five9 has no undo and no audit trail, so a wrong target is unrecoverable and unattributable. |
 | `deleteAllFromList` | write | **denied** | not-built | Every delete* operation is denied: Five9 has no undo and no audit trail, so a wrong target is unrecoverable and unattributable. |
 | `deleteCallVariable` | write | **denied** | not-built | Every delete* operation is denied: Five9 has no undo and no audit trail, so a wrong target is unrecoverable and unattributable. |
@@ -152,68 +152,68 @@ Sorted by name. A registered operation shows its action type beneath it.
 | `deleteUserProfile` | write | **denied** | not-built | Every delete* operation is denied: Five9 has no undo and no audit trail, so a wrong target is unrecoverable and unattributable. |
 | `deleteWebConnector` | write | **denied** | not-built | Every delete* operation is denied: Five9 has no undo and no audit trail, so a wrong target is unrecoverable and unattributable. |
 | `forceStopCampaign` | write | **enabled** | shipped | Reached through five9_stop_campaign when action_payload.force === true; deliberately not a separate action type. |
-| `getAgentGroup` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getAgentGroups` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getApiVersions` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
+| `getAgentGroup` | read | **skip** | not-built | Singular variant of a pattern reader that already ships; exactUserPattern() covers exact lookup. A separate tool would be zero new capability at the cost of a tool slot. |
+| `getAgentGroups` | read | **skip** | shipped | Read — shipped inside the five9_get_config MCP tool (entity_type dispatch), not as a tool of its own. Reads are direct MCP tools, never agent actions. |
+| `getApiVersions` | read | **skip** | not-built | Read — no identified consumer. |
 | `getAutodialCampaign` | read | **denied** | not-built | Reece does not run autodial campaigns (carried-forward ruling, covers the whole autodial family). It is a read, so it could never be an action type; the ruling is recorded here so the family reads as one decision. |
-| `getAvailableLocales` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getCallCountersState` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getCallVariableGroups` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getCallVariables` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
+| `getAvailableLocales` | read | **skip** | not-built | Read — no identified consumer. |
+| `getCallCountersState` | read | **skip** | shipped | Read — shipped as the five9_get_call_counters_state MCP tool. Kept OUT of five9_get_config on purpose: it is live per-second telemetry, where every config read is “current until somebody edits it”, so folding it in would blur two different freshness contracts. |
+| `getCallVariableGroups` | read | **skip** | shipped | Read — shipped inside the five9_get_config MCP tool (entity_type dispatch), not as a tool of its own. Reads are direct MCP tools, never agent actions. |
+| `getCallVariables` | read | **skip** | shipped | Read — shipped inside the five9_get_config MCP tool (entity_type dispatch), not as a tool of its own. Reads are direct MCP tools, never agent actions. |
 | `getCampaignDNISList` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
-| `getCampaignProfileDispositions` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getCampaignProfileFilter` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
+| `getCampaignProfileDispositions` | read | **skip** | shipped | Read — shipped inside the five9_get_config MCP tool (entity_type dispatch), not as a tool of its own. Reads are direct MCP tools, never agent actions. |
+| `getCampaignProfileFilter` | read | **skip** | shipped | Read — shipped inside the five9_get_config MCP tool (entity_type dispatch), not as a tool of its own. Reads are direct MCP tools, never agent actions. |
 | `getCampaignProfiles` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
 | `getCampaigns` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
 | `getCampaignState` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
-| `getCampaignStrategies` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getConfigurationTranslations` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getContactFields` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getContactRecords` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getCrmImportResult` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getDialingRules` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getDisposition` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
+| `getCampaignStrategies` | read | **skip** | shipped | Read — shipped inside the five9_get_config MCP tool (entity_type dispatch), not as a tool of its own. Reads are direct MCP tools, never agent actions. |
+| `getConfigurationTranslations` | read | **skip** | not-built | Read — no identified consumer. |
+| `getContactFields` | read | **skip** | shipped | Read — shipped inside the five9_get_config MCP tool (entity_type dispatch), not as a tool of its own. Reads are direct MCP tools, never agent actions. |
+| `getContactRecords` | read | **skip** | shipped | Read — shipped as the five9_get_contact_records MCP tool. Kept separate from five9_get_config because it takes a QUERY (lookupCriteria), not a name pattern. LP remains the system of record for contact data; this verifies what Five9 holds, never treats it as truth — the same reasoning that denies every contact-DB write. |
+| `getCrmImportResult` | read | **skip** | shipped | Read — shipped inside the five9_get_import_result MCP tool (job_type dispatch), alongside getListImportResult. |
+| `getDialingRules` | read | **skip** | shipped | Read — shipped inside the five9_get_config MCP tool (entity_type dispatch), not as a tool of its own. Reads are direct MCP tools, never agent actions. |
+| `getDisposition` | read | **skip** | not-built | Singular variant of a pattern reader that already ships; exactUserPattern() covers exact lookup. A separate tool would be zero new capability at the cost of a tool slot. |
 | `getDispositions` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
-| `getDispositionsImportResult` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
+| `getDispositionsImportResult` | read | **skip** | shipped | Read — shipped inside the five9_get_import_result MCP tool (job_type dispatch), alongside getListImportResult. |
 | `getDNISList` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
 | `getInboundCampaign` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
 | `getIvrIcons` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. NEW SURFACE — never considered before PR3. |
 | `getIvrScriptOwnership` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. NEW SURFACE — never considered before PR3. |
 | `getIVRScripts` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
-| `getListImportResult` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
+| `getListImportResult` | read | **skip** | shipped | Read — the existing reader, now also exposed through the five9_get_import_result MCP tool (job_type: "list"); folded in rather than duplicated. |
 | `getListsForCampaign` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
 | `getListsInfo` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
-| `getLocale` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
+| `getLocale` | read | **skip** | not-built | Read — no identified consumer. |
 | `getOutboundCampaign` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
 | `getPrompt` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getPrompts` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
+| `getPrompts` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. Also reachable as five9_get_config({ entity_type: 'prompt' }), where name_pattern filters client-side because the operation takes no argument. |
 | `getReasonCode` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getReasonCodeByType` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
+| `getReasonCodeByType` | read | **skip** | shipped | Read — shipped inside the five9_get_config MCP tool (entity_type dispatch), not as a tool of its own. Reads are direct MCP tools, never agent actions. |
 | `getReportResult` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
-| `getReportResultCsv` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getSkill` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getSkillAudioFiles` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getSkillInfo` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
+| `getReportResultCsv` | read | **skip** | not-built | getReportResult already ships; the CSV variant is the same data in a different encoding. |
+| `getSkill` | read | **skip** | not-built | Singular variant of a pattern reader that already ships; exactUserPattern() covers exact lookup. A separate tool would be zero new capability at the cost of a tool slot. |
+| `getSkillAudioFiles` | read | **skip** | not-built | Binary audio payload; no agentic consumer, matching the existing skip on the corresponding write ops. |
+| `getSkillInfo` | read | **skip** | not-built | Singular variant of a pattern reader that already ships; exactUserPattern() covers exact lookup. A separate tool would be zero new capability at the cost of a tool slot. |
 | `getSkills` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
-| `getSkillsInfo` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getSkillVoicemailGreeting` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getSpeedDialNumbers` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. NEW SURFACE — never considered before PR3. |
-| `getUserGeneralInfo` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
-| `getUserInfo` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
+| `getSkillsInfo` | read | **skip** | shipped | Read — shipped inside the five9_get_config MCP tool (entity_type dispatch), not as a tool of its own. Reads are direct MCP tools, never agent actions. |
+| `getSkillVoicemailGreeting` | read | **skip** | not-built | Binary audio payload; no agentic consumer, matching the existing skip on the corresponding write ops. |
+| `getSpeedDialNumbers` | read | **skip** | shipped | Read — shipped inside the five9_get_config MCP tool (entity_type dispatch), not as a tool of its own. Reads are direct MCP tools, never agent actions. |
+| `getUserGeneralInfo` | read | **skip** | not-built | Singular variant of a pattern reader that already ships; exactUserPattern() covers exact lookup. A separate tool would be zero new capability at the cost of a tool slot. |
+| `getUserInfo` | read | **skip** | not-built | Singular variant of a pattern reader that already ships; exactUserPattern() covers exact lookup. A separate tool would be zero new capability at the cost of a tool slot. |
 | `getUserProfile` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
 | `getUserProfiles` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. Takes Five9’s misspelled userProfileNamePatern. |
 | `getUsersGeneralInfo` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
 | `getUsersInfo` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
-| `getUserVoicemailGreeting` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
+| `getUserVoicemailGreeting` | read | **skip** | not-built | Binary audio payload; no agentic consumer, matching the existing skip on the corresponding write ops. |
 | `getVCCConfiguration` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
-| `getWebConnectors` | read | **skip** | not-built | Read — available if needed; no reader built, and reads are never agent actions. |
+| `getWebConnectors` | read | **skip** | shipped | Read — shipped inside the five9_get_config MCP tool (entity_type dispatch), not as a tool of its own. Reads are direct MCP tools, never agent actions. |
 | `isImportRunning` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
 | `isReportRunning` | read | **skip** | shipped | Read — already wrapped by a reader in src/five9-admin.js; direct MCP tool, never an agent action. |
 | `modifyAgentGroup` | write | **gated** | not-built | Guard: confirm_token restating the group name — group membership decides supervisor visibility and reporting rollups. |
 | `modifyAutodialCampaign` | write | **denied** | not-built | Reece does not run autodial campaigns (carried-forward ruling, covers the whole autodial family). |
 | `modifyCallVariable` | write | **gated** | not-built | Guard: confirm_token restating the variable name, and refuse a change to a variable referenced by a shipped IVR script or list mapping. |
 | `modifyCallVariablesGroup` | write | **gated** | not-built | Guard: confirm_token restating the group name, and refuse a rename that would orphan variables resolving through it. |
-| `modifyCampaignLists` | write | **gated** | not-built | Guard: confirm_token restating the campaign name; this REPLACES the list set, so it must read-before-write and refuse while the campaign is RUNNING. |
+| `modifyCampaignLists`<br>→ `five9_modify_campaign_lists` | write | **gated** | shipped | Shipped as five9_modify_campaign_lists: confirm_token restating the campaign name, refuses while RUNNING. REPLACES the whole list set, so it read-modify-writes and records lists_detached (anything absent from the payload) on the audit event — naming two lists on a campaign carrying five detaches the other three. |
 | `modifyCampaignProfile`<br>→ `five9_modify_campaign_profile` | write | **gated** | shipped | Shipped as five9_modify_campaign_profile: confirm_token restating the profile name, because a profile is shared — `Data Leads` alone serves five campaigns. |
 | `modifyCampaignProfileCrmCriteria` | write | **gated** | not-built | Guard: confirm_token restating the profile name, and refuse while any campaign on the profile is RUNNING — CRM criteria decide WHICH records dial, so this is a compliance-exposed selection change. |
 | `modifyCampaignProfileDispositions` | write | **gated** | not-built | Guard: confirm_token restating the profile name, and refuse removal of any disposition in the CC payroll bonus mapping. |
@@ -234,24 +234,24 @@ Sorted by name. A registered operation shows its action type beneath it.
 | `modifyUserProfileSkills`<br>→ `five9_modify_user_profile_skills` | write | **enabled** | shipped | Shipped as five9_modify_user_profile_skills — the narrow patch: {profile_name, add_skills[], remove_skills[]}, cannot touch a role grant. |
 | `modifyUserProfileUserList`<br>→ `five9_modify_user_profile_user_list` | write | **enabled** | shipped | Shipped as five9_modify_user_profile_user_list — the narrow patch: {profile_name, add_users[], remove_users[]}, cannot touch a role grant. |
 | `modifyVCCConfiguration` | write | **denied** | not-built | Tenant-wide configuration: one call changes settings for every campaign, agent and list at once, and there is no narrower operation to scope an approval to the field actually being changed. |
-| `modifyWebConnector` | write | **denied** | not-built | Repointing an existing connector’s URL is the same exfiltration path as creating one, without even the appearance of a new object. |
+| `modifyWebConnector`<br>→ `five9_modify_web_connector` | write | **gated** | shipped | Shipped as five9_modify_web_connector, under the same Guardrail 13 as create — repointing an existing connector is the same exfiltration path, so the allow-list is what makes both allowable. Built as a FULL-OBJECT REPLACE: read-modify-write, serialize complete, re-read and diff on changed AND untouched fields. Guardrail 13 runs on the MERGED struct, not on the submitted changes, because a replace re-submits a destination the live connector already carried. confirm_token restating the connector name, re-checked inside the executor against Five9’s own spelling of the live name. |
 | `removeDisposition` | write | **denied** | not-built | CC payroll bonus math reads disposition names; removing one silently corrupts payroll history. |
-| `removeDispositionsFromCampaign` | write | **gated** | not-built | Guard: confirm_token restating the campaign name, and refuse any disposition named in the CC payroll bonus mapping. |
+| `removeDispositionsFromCampaign` | write | **gated** | not-built | BUILT (executeRemoveDispositionsFromCampaign) but DELIBERATELY UNREGISTERED — no action type resolves to it, so queuing five9_remove_dispositions_from_campaign fails as unknown. Its required guard is “refuse any disposition in the CC payroll bonus mapping”, and no such mapping exists: searched 2026-08-21 across all six repos (no Bonus_Structure.md), Supabase (no payroll/bonus/commission table; lp_dispositions carries category / is_recoverable / reactivation_track and nothing about pay), and Notion. The two authoritative payroll documents derive EVERY bonus from three Lead Perfection reports rather than from Five9 dispositions, and the only disposition either names is “no-rehash” — which they contradict each other on (“added to the demo-count/bonus totals” vs “no-rehash leads removed from setter bonus”). A guard keyed on a guessed list would read as protection while protecting nothing. To register: give the mapping an authoritative home, point PAYROLL_PROTECTED_DISPOSITIONS at it, and wire the six touch-points. |
 | `removeDNISFromCampaign`<br>→ `five9_remove_dnis_from_campaign` | write | **gated** | shipped | Shipped as five9_remove_dnis_from_campaign: confirm_token restating the campaign name, because removing a DNIS dead-ends a live number that still looks fine from the outside. |
 | `removeIvrIcons` | write | **skip** | not-built | NEW SURFACE, flagged for Mark. Cosmetic, as setIvrIcons — proposed skip. |
 | `removeIvrScriptOwnership` | write | **skip** | not-built | NEW SURFACE, flagged for Mark. Clears the othersCanCopy flag set by setIvrScriptOwnership — proposed skip for the same reason. |
-| `removeListsFromCampaign` | write | **gated** | not-built | Guard: confirm_token restating the campaign name, and refuse while the campaign is RUNNING. |
+| `removeListsFromCampaign`<br>→ `five9_remove_lists_from_campaign` | write | **gated** | shipped | Shipped as five9_remove_lists_from_campaign: confirm_token restating the campaign name, refuses while RUNNING. The attached-list set before the change rides on the audit event. |
 | `removeNumbersFromDnc` | write | **denied** | not-built | Ruled by Mark 2026-08-21 and removed outright: Reece does not take numbers off DNC under any circumstance, so there is no gate, override, or reason string that yields it. The action type five9_remove_numbers_from_dnc must stay an unknown action type. |
 | `removeSkillAudioFile` | write | **skip** | not-built | Audio asset management; a Five9-UI task with no agentic path that produces the file. |
-| `removeSkillsFromCampaign` | write | **gated** | not-built | Guard: confirm_token restating the campaign name, and refuse removal of the last skill on a RUNNING campaign — that strands every queued call on it. |
+| `removeSkillsFromCampaign`<br>→ `five9_remove_skills_from_campaign` | write | **gated** | shipped | Shipped as five9_remove_skills_from_campaign: confirm_token restating the campaign name. Does NOT blanket-refuse while RUNNING — it carries the sharper guard instead: removing the LAST skill on a RUNNING campaign is refused, because every call already queued on it would be stranded with nothing to route to. The same removal is allowed once the campaign is stopped. |
 | `removeSpeedDialNumber` | write | **skip** | not-built | NEW SURFACE, flagged for Mark. Removes a desktop shortcut by code; proposed skip for the same reason as createSpeedDialNumber. Note it is remove*, not delete*, and destroys no history. |
 | `renameCampaign` | write | **denied** | not-built | DNIS→campaign→source attribution keys on campaign names; a rename silently re-buckets every historical call. |
 | `renameDisposition` | write | **denied** | not-built | CC payroll bonus math reads disposition names; a rename silently corrupts payroll history. |
 | `resetCampaign`<br>→ `five9_reset_campaign` | write | **gated** | shipped | Shipped as five9_reset_campaign: confirm_token restating the campaign name, and REFUSES a RUNNING campaign — reset clears dispositions and list positions, making every record re-dialable at once. |
-| `resetCampaignDispositions` | write | **gated** | not-built | Guard: confirm_token restating the campaign name and refuse while RUNNING — same re-dialable-at-once blast radius as resetCampaign, scoped to dispositions. |
-| `resetListPosition` | write | **gated** | not-built | Guard: confirm_token restating the list name, and refuse while any campaign using the list is RUNNING — rewinding the position re-dials the list from the top. (The v1 handoff called this resetListPositions, plural, which does not exist in v13.) |
+| `resetCampaignDispositions`<br>→ `five9_reset_campaign_dispositions` | write | **gated** | shipped | Shipped as five9_reset_campaign_dispositions: confirm_token restating the campaign name, refuses while RUNNING — same re-dialable-at-once blast radius as Guardrail 11, scoped to dispositions. Optional after/before dateTime bounds narrow the reset; passing neither is recorded on the audit event as the unbounded case. |
+| `resetListPosition`<br>→ `five9_reset_list_position` | write | **gated** | shipped | Shipped as five9_reset_list_position: confirm_token restating the CAMPAIGN name, refuses while that campaign is RUNNING — rewinding position re-dials records the floor already worked. SCHEMA CORRECTION: the PR4 handoff specified a token on the LIST name and a refusal while “any campaign using the list” is RUNNING, but v13 resetListPosition takes exactly one argument, <campaignName>. There is no list argument to key a token on, so the op is campaign-scoped and the token follows. Schema wins (standing rule). (The v1 handoff called this resetListPositions, plural, which does not exist in v13.) |
 | `runReport` | read | **skip** | shipped | Read-path: starts a report run and returns a handle; mutates no configuration. Already wrapped by runReport / runReportAndWait in src/five9-admin.js. |
-| `setCampaignStrategies` | write | **gated** | not-built | Guard: confirm_token restating the campaign name and refuse while RUNNING — a strategy governs dial pacing, which is the compliance-exposed dimension. |
+| `setCampaignStrategies`<br>→ `five9_set_campaign_strategies` | write | **gated** | shipped | Shipped as five9_set_campaign_strategies: confirm_token restating the campaign name, refuses while RUNNING — a strategy governs dial pacing, which is what abandonment rate is downstream of, so it is the compliance-exposed dimension. REPLACES the strategy set; the prior set rides on the audit event. |
 | `setDefaultIVRSchedule`<br>→ `five9_set_default_ivr_schedule` | write | **enabled** | shipped | Shipped as five9_set_default_ivr_schedule — the sanctioned way to re-point an inbound campaign, since modifyInboundCampaign is denied. |
 | `setDialingRules` | write | **denied** | not-built | State dialing rules — currently REGION — are the TCPA/state-calling-hours enforcement surface; changing them agentically moves a compliance boundary. |
 | `setIvrIcons` | write | **skip** | not-built | NEW SURFACE, flagged for Mark. Icons are the visual representation of a script in the Five9 IVR designer and have no runtime effect on routing; proposed skip as cosmetic. |

@@ -45,6 +45,23 @@ import {
   executeModifyUserProfileUserList,
   executeCreateUserProfile,
   executeModifyUserProfile,
+  // 2026-08-21 Phase H PR4 — web connectors (Guardrail 13) and campaign
+  // composition. NOTE the absentee: executeRemoveDispositionsFromCampaign is
+  // built in admin-writes.js and deliberately NOT imported here — see the map
+  // below.
+  executeCreateWebConnector,
+  executeModifyWebConnector,
+  executeCreateOutboundCampaign,
+  executeAddListsToCampaign,
+  executeRemoveListsFromCampaign,
+  executeModifyCampaignLists,
+  executeAddSkillsToCampaign,
+  executeRemoveSkillsFromCampaign,
+  executeAddDispositionsToCampaign,
+  executeResetCampaignDispositions,
+  executeSetCampaignStrategies,
+  executeCreateList,
+  executeResetListPosition,
 } from '../../five9/admin-writes.js';
 
 const FIVE9_WRITE_OPS = {
@@ -91,6 +108,41 @@ const FIVE9_WRITE_OPS = {
   five9_modify_user_profile_user_list: executeModifyUserProfileUserList,
   five9_create_user_profile: executeCreateUserProfile,
   five9_modify_user_profile: executeModifyUserProfile,
+  // 2026-08-21 Phase H PR4 — web connectors. Both carry Guardrail 13: the
+  // destination allow-list (FIVE9_WEBCONNECTOR_ALLOWED_HOSTS) that PR3's
+  // `denied` ruling said was missing. There is deliberately no
+  // compliance_override path on either — an override would reintroduce the
+  // arbitrary-URL hole one approved action at a time. deleteWebConnector is
+  // NOT here and stays denied under DELETE_RULE.
+  five9_create_web_connector: executeCreateWebConnector,
+  five9_modify_web_connector: executeModifyWebConnector,
+  // 2026-08-21 Phase H PR4 — campaign composition: what a campaign dials, who
+  // it routes to, how it paces. Almost all refuse while the target is
+  // RUNNING; the exceptions are add_dispositions (purely additive) and
+  // remove_skills (which carries the sharper last-skill guard instead).
+  five9_create_outbound_campaign: executeCreateOutboundCampaign,
+  five9_add_lists_to_campaign: executeAddListsToCampaign,
+  five9_remove_lists_from_campaign: executeRemoveListsFromCampaign,
+  five9_modify_campaign_lists: executeModifyCampaignLists,
+  five9_add_skills_to_campaign: executeAddSkillsToCampaign,
+  five9_remove_skills_from_campaign: executeRemoveSkillsFromCampaign,
+  five9_add_dispositions_to_campaign: executeAddDispositionsToCampaign,
+  five9_reset_campaign_dispositions: executeResetCampaignDispositions,
+  five9_set_campaign_strategies: executeSetCampaignStrategies,
+  five9_create_list: executeCreateList,
+  five9_reset_list_position: executeResetListPosition,
+  // NOT REGISTERED, ON PURPOSE: five9_remove_dispositions_from_campaign.
+  // executeRemoveDispositionsFromCampaign is BUILT in admin-writes.js, but its
+  // required guard — refuse any disposition in the CC payroll bonus mapping —
+  // has no authoritative source. Searched 2026-08-21: no Bonus_Structure.md in
+  // any repo, no payroll table in Supabase, and the two authoritative Notion
+  // payroll documents derive every bonus from Lead Perfection reports rather
+  // than Five9 dispositions (and contradict each other on the one disposition
+  // they do name). A guard keyed on a guessed list would read as protection
+  // while protecting nothing, so the op stays unreachable: queuing
+  // five9_remove_dispositions_from_campaign fails as an unknown action type,
+  // which is the intended outcome. See PAYROLL_PROTECTED_DISPOSITIONS for what
+  // registering it would take.
 };
 
 export async function executeFive9Write(action) {

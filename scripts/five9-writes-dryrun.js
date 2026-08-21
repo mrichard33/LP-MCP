@@ -49,6 +49,19 @@ import {
   exactUserAlternationPattern,
   MIN_LEGAL_BASIS_CHARS,
   USER_PROFILE_FIELD_ORDER,
+  // 2026-08-21 Phase H PR4 — Guardrail 13 + web connectors + campaign composition
+  buildFromSchema,
+  checkWebConnectorDestinations,
+  validateWebConnectorDestination,
+  webConnectorAllowedHosts,
+  mergeWebConnector,
+  verifyWebConnectorReadBack,
+  refuseIfCampaignRunning,
+  checkPayrollDispositions,
+  PAYROLL_PROTECTED_DISPOSITIONS,
+  WEBCONNECTOR_ALLOWED_HOSTS_ENV,
+  WEBCONNECTOR_KV_BLOCKS,
+  CAMPAIGN_TOKEN_OPS,
 } from '../src/five9/admin-writes.js';
 import { USER_PROFILE_NAME_PATTERN_ELEMENT } from '../src/five9-users-info.js';
 
@@ -417,13 +430,189 @@ out.push(eventShape('modify_user_profile', 'five9_user_profile', 'Level 1 Setter
   changed_fields: '<keys of action_payload.changes>', verify_mismatches: '<read-back drift, incl. UNTOUCHED fields>',
 }));
 
+/* ====================================================================== *
+ * Phase H PR4 (2026-08-21)
+ * ====================================================================== */
+
+const ALLOW_DEMO = 'lp-mcp-production.up.railway.app';
+const RUNNING = { name: 'DIAL ASAP', state: 'RUNNING', type: 'OUTBOUND' };
+const STOPPED = { name: 'REHASH OUTBOUND', state: 'NOT_RUNNING', type: 'OUTBOUND' };
+
+section('Guardrail 13 — web connector destination allow-list');
+line(WEBCONNECTOR_ALLOWED_HOSTS_ENV, process.env[WEBCONNECTOR_ALLOWED_HOSTS_ENV] ?? '(unset)');
+line('parsed allow-list size', webConnectorAllowedHosts().size);
+out.push('  UNSET OR EMPTY = EMPTY ALLOW-LIST = REFUSES EVERYTHING. It never means "allow all".');
+out.push('  There is deliberately NO compliance_override path — an override would reintroduce');
+out.push('  the arbitrary-URL hole PR3 denied these ops for, one approved action at a time.');
+out.push(`  Blocks checked beyond url: ${WEBCONNECTOR_KV_BLOCKS.join(', ')}, startPageText`);
+out.push(`Verdicts against a demo allow-list of "${ALLOW_DEMO}":`);
+for (const [label, url] of [
+  ['https on an allow-listed host', `https://${ALLOW_DEMO}/five9/event`],
+  ['http:// on the SAME host', `http://${ALLOW_DEMO}/five9/event`],
+  ['off-list host', 'https://webhook.site/abc'],
+  ['suffix attack vs an example.com entry', 'https://evil-example.com/x'],
+  ['subdomain of an allow-listed host', `https://a.${ALLOW_DEMO}/x`],
+  ['embedded credentials', `https://user:pass@${ALLOW_DEMO}/x`],
+  ['non-standard port', `https://${ALLOW_DEMO}:8443/x`],
+  ['IPv4 literal', 'https://10.0.0.5/x'],
+  ['IPv6 literal', 'https://[::1]/x'],
+  ['protocol-relative (scheme unprovable)', `//${ALLOW_DEMO}/x`],
+]) {
+  const v = validateWebConnectorDestination(url, ALLOW_DEMO);
+  out.push(`  [${v.ok ? 'PASS' : 'REFUSED'}] ${label} → ${v.ok ? url : v.reason}`);
+}
+out.push('  A SECOND destination hidden in a keyValuePair block is caught too:');
+const hidden = checkWebConnectorDestinations({
+  url: `https://${ALLOW_DEMO}/ok`,
+  postVariables: [{ key: 'ani', value: 'Call.ANI' }, { key: 'mirror', value: 'https://webhook.site/steal' }],
+  constants: [{ key: 'encoded', value: 'https%3A%2F%2Fwebhook.site%2Fsteal' }],
+}, { allowedHosts: ALLOW_DEMO });
+out.push(`  [${hidden.ok ? 'PASS' : 'REFUSED'}] url allow-listed but postVariables/constants smuggle a mirror → ${hidden.violations.join(' | ')}`);
+out.push('  (A plain call variable like Call.ANI is not URL-shaped and is not examined.)');
+line('  fail-closed with an EMPTY allow-list', JSON.stringify(checkWebConnectorDestinations({ url: `https://${ALLOW_DEMO}/ok` }, { allowedHosts: '' }).violations));
+
+section('five9_create_web_connector (createWebConnector — gated, Guardrail 13)');
+line('SOAP method', 'createWebConnector');
+line('inner XML', buildFromSchema('webConnector', {
+  name: 'LP-MCP Event Push', description: 'Push agent-desktop call events to LP-MCP',
+  url: `https://${ALLOW_DEMO}/webhook/five9-event`, postMethod: true, trigger: 'OnCallAccepted',
+  postVariables: [{ key: 'ani', value: 'Call.ANI' }],
+}, { wrapper: 'connector' }));
+out.push('Guardrails:');
+line('  required confirm_token', requiredConfirmToken('create_web_connector', { connector_name: 'LP-MCP Event Push' }));
+verdict('confirm_token restating the connector name accepted',
+  () => checkConfirmToken('create_web_connector', { connector_name: 'LP-MCP Event Push', confirm_token: 'LP-MCP Event Push' }));
+verdict('confirm_token mismatch refused',
+  () => checkConfirmToken('create_web_connector', { connector_name: 'LP-MCP Event Push', confirm_token: 'lp-mcp event push' }));
+out.push('  Guardrail 13 runs BEFORE the name-collision read, so a bad destination refuses');
+out.push('  regardless of whether the name happens to be free. A colliding name REFUSES');
+out.push('  (not skips): createWebConnector on a live name would replace something unreviewed.');
+out.push('Audit event:');
+out.push(eventShape('create_web_connector', 'five9_web_connector', 'LP-MCP Event Push', { destination_check: '<Guardrail 13 verdict incl. every value checked>' }));
+
+section('five9_modify_web_connector (modifyWebConnector — FULL-OBJECT REPLACE)');
+out.push('Every modify* op in this API taking a named complexType has REPLACED the whole');
+out.push('struct — modifyUserProfile most recently, where omitting `roles` revokes every');
+out.push('grant. Built the same way: read live, overlay changes, serialize complete,');
+out.push('re-read and diff on changed AND untouched fields.');
+const liveConn = { name: 'LP-MCP Event Push', raw: {
+  name: 'LP-MCP Event Push', url: `https://${ALLOW_DEMO}/webhook/five9-event`,
+  postMethod: 'true', trigger: 'OnCallAccepted', description: 'existing description',
+  postVariables: [{ key: 'ani', value: 'Call.ANI' }],
+} };
+const merged = mergeWebConnector(liveConn, { description: 'Updated by LP-MCP' });
+line('SOAP method', 'modifyWebConnector');
+line('inner XML (merged)', buildFromSchema('webConnector', merged, { wrapper: 'connector' }));
+out.push('Guardrails:');
+line('  required confirm_token', requiredConfirmToken('modify_web_connector', { connector_name: 'LP-MCP Event Push' }));
+out.push('  The token is ALSO re-checked inside the executor against Five9’s own spelling of');
+out.push('  the live connector, so it verifies the target rather than the payload’s spelling.');
+verdict('unknown webConnector field refused rather than silently dropped',
+  () => mergeWebConnector(liveConn, { notAField: 1 }));
+verdict('rename through modify refused',
+  () => mergeWebConnector(liveConn, { name: 'Something Else' }));
+out.push('  Guardrail 13 runs on the MERGED struct, not on `changes`: a replace re-submits');
+out.push('  whatever destination the live connector already carried.');
+line('  untouched-field drift is reported too', JSON.stringify(
+  verifyWebConnectorReadBack(merged, { raw: { ...liveConn.raw, description: 'Updated by LP-MCP', trigger: 'OnCallEnded' } }, ['description'])));
+out.push('Audit event:');
+out.push(eventShape('modify_web_connector', 'five9_web_connector', 'LP-MCP Event Push', {
+  destination_check: '<Guardrail 13 verdict>', changed_fields: '<keys of action_payload.changes>',
+  replace_semantics: 'full-object replace (read-modify-write)', verify_mismatches: '<read-back drift, incl. UNTOUCHED fields>',
+}));
+
+section('Campaign composition — the RUNNING refusal (shared guard)');
+out.push('Changing what a live campaign dials, or who it routes to, underneath the agents');
+out.push('currently on it is not a change you make and then discover. Same shape as');
+out.push('Guardrail 11: the request is DANGEROUS, not already-satisfied, so it REFUSES');
+out.push('rather than skipping.');
+verdict('RUNNING campaign refused', () => refuseIfCampaignRunning('add_lists_to_campaign', RUNNING));
+verdict('NOT_RUNNING campaign proceeds', () => refuseIfCampaignRunning('add_lists_to_campaign', STOPPED) ?? 'proceeds');
+line('ops carrying a campaign-name confirm_token', [...CAMPAIGN_TOKEN_OPS].join(', '));
+
+const COMPOSITION = [
+  ['five9_create_outbound_campaign', 'createOutboundCampaign',
+    () => buildFromSchema('outboundCampaign', { name: 'NEW REHASH', profileName: 'Data Leads', state: 'NOT_RUNNING', type: 'OUTBOUND' }, { wrapper: 'campaign' }),
+    'REFUSES a duplicate name, REFUSES an unknown profileName, and creates ONLY with state=NOT_RUNNING (an explicit RUNNING is a refusal, not an overwrite).'],
+  ['five9_add_lists_to_campaign', 'addListsToCampaign',
+    () => buildFromSchema('addListsToCampaign', { campaignName: STOPPED.name, lists: [{ campaignName: STOPPED.name, listName: 'Data Leads', dialingPriority: 1 }] }),
+    'Refuses while RUNNING; refuses a list name that does not exist (Five9 accepts an unknown list silently).'],
+  ['five9_remove_lists_from_campaign', 'removeListsFromCampaign',
+    () => buildFromSchema('removeListsFromCampaign', { campaignName: STOPPED.name, lists: [{ campaignName: STOPPED.name, listName: 'Data Leads' }] }),
+    'Refuses while RUNNING. The attached-list set before the change rides on the audit event.'],
+  ['five9_modify_campaign_lists', 'modifyCampaignLists',
+    () => buildFromSchema('modifyCampaignLists', { campaignName: STOPPED.name, lists: [{ campaignName: STOPPED.name, listName: 'Data Leads' }] }),
+    'REPLACES the whole list set — read-modify-write, and lists_detached is recorded so an unintended detachment is visible in the record. Refuses while RUNNING.'],
+  ['five9_add_skills_to_campaign', 'addSkillsToCampaign',
+    () => buildFromSchema('addSkillsToCampaign', { campaignName: STOPPED.name, skills: ['Setter'] }),
+    'Refuses while RUNNING; refuses an unknown skill name.'],
+  ['five9_remove_skills_from_campaign', 'removeSkillsFromCampaign',
+    () => buildFromSchema('removeSkillsFromCampaign', { campaignName: STOPPED.name, skills: ['Setter'] }),
+    'NO blanket RUNNING refusal — the guard is narrower: removing the LAST skill on a RUNNING campaign is refused (every queued call would be stranded with nothing to route to). Allowed once stopped.'],
+  ['five9_add_dispositions_to_campaign', 'addDispositionsToCampaign',
+    () => buildFromSchema('addDispositionsToCampaign', { campaignName: RUNNING.name, dispositions: ['Appointment Set'] }),
+    'The one composition op with NO RUNNING refusal: adding a disposition is additive and cannot change how an existing call is counted. Refuses an unknown disposition.'],
+  ['five9_reset_campaign_dispositions', 'resetCampaignDispositions',
+    () => buildFromSchema('resetCampaignDispositions', { campaignName: STOPPED.name, dispositions: ['No Answer'], after: '2026-08-01T00:00:00Z' }),
+    'Refuses while RUNNING — same re-dialable-at-once blast radius as Guardrail 11, scoped to dispositions. Omitting after/before is the unbounded case and is flagged on the event.'],
+  ['five9_set_campaign_strategies', 'setCampaignStrategies',
+    () => buildFromSchema('setCampaignStrategies', { campaignName: STOPPED.name, campaignStrategies: { strategies: [{ name: 'Daytime', enabled: true, startAfterTimeMins: 30 }] } }),
+    'Refuses while RUNNING — a strategy governs dial pacing, which is what abandonment rate is downstream of. REPLACES the strategy set.'],
+  ['five9_create_list', 'createList',
+    () => buildFromSchema('createList', { listName: 'Rehash 2026-08' }),
+    'The only `enabled` op in this tranche and the only one with NO confirm_token: a new list is empty and attached to nothing. Creating one that exists is a skipped no-op.'],
+  ['five9_reset_list_position', 'resetListPosition',
+    () => buildFromSchema('resetListPosition', { campaignName: STOPPED.name }),
+    'SCHEMA CORRECTION: the PR4 handoff specified a confirm_token on the LIST name, but v13 resetListPosition takes exactly one argument, <campaignName>. There is no list argument to key a token on, so the token restates the CAMPAIGN and the guard refuses that campaign while RUNNING. Schema wins.'],
+];
+for (const [actionType, method, buildBody, note] of COMPOSITION) {
+  const subtype = actionType.replace(/^five9_/, '');
+  section(`${actionType} (${method})`);
+  line('SOAP method', method);
+  line('inner XML', buildBody());
+  line('required confirm_token', String(requiredConfirmToken(subtype, { campaign_name: STOPPED.name })));
+  out.push(`Guard: ${note}`);
+  verdict('confirm_token mismatch refused',
+    () => checkConfirmToken(subtype, { campaign_name: STOPPED.name, confirm_token: 'wrong name' }));
+  out.push('Audit event:');
+  out.push(eventShape(subtype, subtype === 'create_list' ? 'five9_list' : 'five9_campaign',
+    subtype === 'create_list' ? 'Rehash 2026-08' : STOPPED.name));
+}
+
+section('five9_remove_dispositions_from_campaign — BUILT, DELIBERATELY UNREGISTERED');
+line('SOAP method', 'removeDispositionsFromCampaign');
+line('inner XML', buildFromSchema('removeDispositionsFromCampaign', { campaignName: STOPPED.name, dispositions: ['NoRehash'] }));
+out.push('This op is the 14th in the PR4 tranche and the ONLY one not registered. Its');
+out.push('required guard — refuse any disposition in the CC payroll bonus mapping — needs');
+out.push('an authoritative list of which dispositions are payroll-relevant, and no such');
+out.push('list exists. Searched 2026-08-21: no Bonus_Structure.md in any of the six repos;');
+out.push('no payroll / bonus / commission table in Supabase (lp_dispositions carries');
+out.push('category, is_recoverable and reactivation_track, nothing about pay); no CC');
+out.push('payroll audit script. The two authoritative Notion payroll documents derive');
+out.push('EVERY bonus from three Lead Perfection reports rather than from Five9');
+out.push('dispositions, and the only disposition either names is "no-rehash" — which they');
+out.push('CONTRADICT each other on ("added to the demo-count/bonus totals" vs "no-rehash');
+out.push('leads removed from setter bonus").');
+line('mapping available?', PAYROLL_PROTECTED_DISPOSITIONS.available);
+line('mapping source', String(PAYROLL_PROTECTED_DISPOSITIONS.source));
+out.push('  The guard REFUSES while unenforceable rather than passing — a mapping-less');
+out.push('  guard that quietly allowed would be the worst of the three outcomes:');
+line('  checkPayrollDispositions(["NoRehash"])', JSON.stringify(checkPayrollDispositions(['NoRehash'])));
+out.push('  Queuing five9_remove_dispositions_from_campaign fails as an UNKNOWN ACTION');
+out.push('  TYPE — it is absent from ACTION_HANDLERS and from OP_REGISTRY. That is the');
+out.push('  intended outcome, not a regression to fix. To register it: give the mapping an');
+out.push('  authoritative home (a Supabase table keyed on Five9 disposition name is the');
+out.push('  obvious one, since the guard must query it at execute time), point');
+out.push('  PAYROLL_PROTECTED_DISPOSITIONS at it, and wire the six touch-points.');
+
 section('Serialization + gate (applies to every op above)');
 out.push('  1. FIVE9_WRITES_ENABLED !== "true" → DRY-RUN: reads + guardrails run, envelope logged, audit event dry_run:true, action completed (dry-run). No mutation.');
 out.push('  2. outbound_locks key five9_admin:write held → { deferred, retry_at } (one write in flight fleet-wide, held in dry-run too)');
 out.push('  3. requires_approval !== true → thrown REFUSED (handler-level belt-and-braces; queue via create_agent_action → approve_action)');
 out.push('  4. INBOUND / compliance / reset-on-RUNNING / confirm_token mismatch / bad payload → thrown REFUSED (loud failed status, in dry-run and live alike)');
 out.push('  5. start-on-RUNNING / stop-on-NOT_RUNNING → { skipped } no-op after the state read (reset-on-RUNNING REFUSES instead — Guardrail 11)');
-out.push('  6. skill add-when-held / remove-when-unheld, profile create-when-exists → { skipped } no-op after the read');
+out.push('  6. skill add-when-held / remove-when-unheld, profile create-when-exists, create_list-when-exists → { skipped } no-op after the read');
+out.push('  7. Guardrail 13 (web connectors) has NO compliance_override — an off-list, non-https, credentialed, ported or IP-literal destination REFUSES unconditionally, and an unset FIVE9_WEBCONNECTOR_ALLOWED_HOSTS refuses everything.');
 
 console.log(out.join('\n'));
 console.log('\n[DRY RUN COMPLETE] No SOAP call was made. No DB row was touched.');
