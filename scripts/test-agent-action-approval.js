@@ -59,6 +59,24 @@ const FIVE9_WRITE_TYPES = [
   'five9_modify_user_profile_user_list',
   'five9_create_user_profile',
   'five9_modify_user_profile',
+  // 2026-08-21 Phase H PR4 — web connectors (Guardrail 13) + campaign
+  // composition. NOTE five9_remove_dispositions_from_campaign is absent: it is
+  // built but unregistered (no authoritative CC payroll disposition mapping),
+  // and REMOVED_ACTION_TYPES-style absence is asserted in
+  // test-five9-op-registry.js.
+  'five9_create_web_connector',
+  'five9_modify_web_connector',
+  'five9_create_outbound_campaign',
+  'five9_add_lists_to_campaign',
+  'five9_remove_lists_from_campaign',
+  'five9_modify_campaign_lists',
+  'five9_add_skills_to_campaign',
+  'five9_remove_skills_from_campaign',
+  'five9_add_dispositions_to_campaign',
+  'five9_reset_campaign_dispositions',
+  'five9_set_campaign_strategies',
+  'five9_create_list',
+  'five9_reset_list_position',
 ];
 
 test('every five9_* write is coerced to requires_approval:true, however it was queued', () => {
@@ -135,19 +153,41 @@ test('D1 — removed action types are absent from ACTION_HANDLERS entirely', asy
   }
 });
 
-test('D1 — the registry holds exactly the 60 documented action types', async () => {
+test('D1 — the registry holds exactly the 73 documented action types', async () => {
   const { ACTION_HANDLERS } = await import('../src/actions/index.js');
   const types = Object.keys(ACTION_HANDLERS);
   // The header comment in src/actions/index.js enumerates these by name. It
   // had drifted to a stated 45 while the registry held 57; pinning the count
   // here is what makes the next drift a test failure instead of a surprise.
-  assert.equal(types.length, 60);
-  assert.equal(types.filter(t => t.startsWith('five9_')).length, 24);
+  // 2026-08-21 Phase H PR4: 60 → 73, five9_* 24 → 37 (web connector pair +
+  // 11 campaign-composition ops).
+  assert.equal(types.length, 73);
+  assert.equal(types.filter(t => t.startsWith('five9_')).length, 37);
   // Every type the coercion loop covers must actually be dispatchable.
   for (const actionType of FIVE9_WRITE_TYPES) {
     assert.equal(typeof ACTION_HANDLERS[actionType], 'function', `${actionType} is asserted below but not registered`);
   }
-  assert.equal(FIVE9_WRITE_TYPES.length, 24);
+  assert.equal(FIVE9_WRITE_TYPES.length, 37);
+});
+
+test('PR4 — the web connector pair and composition ops are covered, by name', () => {
+  // Named explicitly for the same reason as Phase G and H above: deleting one
+  // from FIVE9_WRITE_TYPES must not quietly drop its coverage. The web
+  // connector pair matters most here — a connector posts live call and
+  // contact data off the agent desktop, so the coercion is what guarantees a
+  // human sees the destination before it executes.
+  for (const actionType of [
+    'five9_create_web_connector', 'five9_modify_web_connector',
+    'five9_create_outbound_campaign', 'five9_add_lists_to_campaign',
+    'five9_remove_lists_from_campaign', 'five9_modify_campaign_lists',
+    'five9_add_skills_to_campaign', 'five9_remove_skills_from_campaign',
+    'five9_add_dispositions_to_campaign', 'five9_reset_campaign_dispositions',
+    'five9_set_campaign_strategies', 'five9_create_list',
+    'five9_reset_list_position',
+  ]) {
+    assert.equal(resolveRequiresApproval(actionType, false).requiresApproval, true, actionType);
+    assert.equal(resolveRequiresApproval(actionType, false).coerced, true, actionType);
+  }
 });
 
 test('non-Five9 actions keep their caller-supplied value exactly', () => {

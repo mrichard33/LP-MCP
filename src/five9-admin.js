@@ -865,3 +865,272 @@ export async function runReportAndWait({ folder, name, startIso, endIso, pollMs 
   const result = await getReportResult(identifier);
   return { done: true, ...result };
 }
+
+/* ====================================================================== *
+ * Phase H PR4 (2026-08-21) — config-read surface.
+ *
+ * Every reader below is *name pattern in, list out* and is reached through
+ * ONE MCP tool (five9_get_config), not one tool per operation. LP-MCP was
+ * already at 112 tools before this tranche and tool-selection accuracy
+ * degrades as that list grows — a cost paid on every LP-MCP call, including
+ * LP sync and GHL work that never touches Five9. Thirteen operations behind
+ * one `entity_type` discriminator is the whole point; see
+ * src/tools/five9-tools.js.
+ *
+ * The SINGULAR variants of these (getSkill, getDisposition, getUserInfo,
+ * getUserGeneralInfo, getSkillInfo, getAgentGroup) are deliberately NOT
+ * wrapped. Each takes an exact name where the plural takes a pattern, and
+ * exactNamePattern() already converts a name into an anchored, escaped
+ * pattern — so a singular wrapper would be zero new capability at the cost
+ * of a tool slot. Recorded as `skip` in OP_CLASSIFICATION.
+ * ====================================================================== */
+
+// Every pattern reader here takes a Five9-side REGEX, not a substring. An
+// omitted pattern means ".*" (list everything), which is what each of these
+// operations does with an empty argument anyway.
+const patternXml = (field, value) =>
+  `<${field}>${escapeXml(String(value ?? '.*'))}</${field}>`;
+
+/**
+ * getWebConnectors — agent-desktop web connectors.
+ *
+ * SECURITY-RELEVANT READ. A connector posts live call and contact data from
+ * the agent desktop to whatever URL it names, so this reader is also the
+ * read-before-write for five9_modify_web_connector and the evidence
+ * Guardrail 13 checks. The four keyValuePair blocks (constants,
+ * postConstants, variables, postVariables) are normalized to arrays because
+ * a SECOND destination can hide in any of them — a check that reads only
+ * `url` is not a check.
+ */
+export async function getWebConnectors({ namePattern } = {}) {
+  const xml = await five9SoapCall('getWebConnectors', patternXml('namePattern', namePattern));
+  const connectors = returnBlocks(xml).map(parseXmlBlock).map(c => ({
+    name: c.name || null,
+    description: c.description || null,
+    url: c.url || null,
+    trigger: c.trigger || null,
+    postMethod: c.postMethod === 'true',
+    executeInBrowser: c.executeInBrowser === 'true',
+    addWorksheet: c.addWorksheet === 'true',
+    agentApplication: c.agentApplication || null,
+    ctiWebServices: c.ctiWebServices || null,
+    startPageText: c.startPageText || null,
+    clearTriggerDispositions: c.clearTriggerDispositions === 'true',
+    triggerDispositions: asArray(c.triggerDispositions),
+    constants: asArray(c.constants),
+    postConstants: asArray(c.postConstants),
+    variables: asArray(c.variables),
+    postVariables: asArray(c.postVariables),
+    raw: c,
+  })).filter(c => c.name);
+  return { count: connectors.length, connectors };
+}
+
+/** getWebConnector — exact-name lookup built on the pattern reader. */
+export async function getWebConnector(name) {
+  const target = String(name || '').trim();
+  if (!target) return null;
+  const { connectors } = await getWebConnectors({ namePattern: exactNamePatternRegex(target) });
+  return connectors.find(c => c.name.toLowerCase() === target.toLowerCase()) || null;
+}
+
+/**
+ * exactNamePatternRegex — anchored, escaped pattern for an exact name.
+ * Duplicated deliberately from admin-writes.exactUserPattern rather than
+ * imported: five9-admin.js is the LOWER layer (admin-writes imports from
+ * here, not the reverse), and an import back up would be a cycle.
+ */
+export function exactNamePatternRegex(name) {
+  return `^${String(name ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`;
+}
+
+/** getSkillsInfo — skills with their full info block (pattern reader). */
+export async function getSkillsInfo({ namePattern } = {}) {
+  const xml = await five9SoapCall('getSkillsInfo', patternXml('skillNamePattern', namePattern));
+  const skills = returnBlocks(xml).map(parseXmlBlock);
+  return { count: skills.length, skills };
+}
+
+/** getAgentGroups — agent group inventory (pattern reader). */
+export async function getAgentGroups({ namePattern } = {}) {
+  const xml = await five9SoapCall('getAgentGroups', patternXml('groupNamePattern', namePattern));
+  const groups = returnBlocks(xml).map(parseXmlBlock);
+  return { count: groups.length, groups };
+}
+
+/**
+ * getCallVariables — call variables, optionally scoped to one group.
+ * groupName is a SECOND filter, not a pattern: Five9 takes it as an exact
+ * group name and omits it entirely when absent.
+ */
+export async function getCallVariables({ namePattern, groupName } = {}) {
+  const group = String(groupName ?? '').trim();
+  const xml = await five9SoapCall('getCallVariables',
+    patternXml('namePattern', namePattern) +
+    (group ? `<groupName>${escapeXml(group)}</groupName>` : ''));
+  const variables = returnBlocks(xml).map(parseXmlBlock);
+  return { count: variables.length, variables };
+}
+
+/** getCallVariableGroups — call variable group inventory (pattern reader). */
+export async function getCallVariableGroups({ namePattern } = {}) {
+  const xml = await five9SoapCall('getCallVariableGroups', patternXml('namePattern', namePattern));
+  const groups = returnBlocks(xml).map(parseXmlBlock);
+  return { count: groups.length, groups };
+}
+
+/** getDialingRules — dialing rule inventory (pattern reader). */
+export async function getDialingRules({ namePattern } = {}) {
+  const xml = await five9SoapCall('getDialingRules', patternXml('namePattern', namePattern));
+  const rules = returnBlocks(xml).map(parseXmlBlock);
+  return { count: rules.length, rules };
+}
+
+/** getContactFields — the Five9 contact DB schema (pattern reader). */
+export async function getContactFields({ namePattern } = {}) {
+  const xml = await five9SoapCall('getContactFields', patternXml('namePattern', namePattern));
+  const fields = returnBlocks(xml).map(parseXmlBlock);
+  return { count: fields.length, fields };
+}
+
+/**
+ * getReasonCodeByType — reason codes. `reasonCodeName` is a pattern;
+ * `type` (NOT_READY / LOGOUT) is an optional enum filter, omitted when
+ * absent so the call returns every type.
+ */
+export async function getReasonCodeByType({ namePattern, type } = {}) {
+  const t = String(type ?? '').trim();
+  const xml = await five9SoapCall('getReasonCodeByType',
+    patternXml('reasonCodeName', namePattern) +
+    (t ? `<type>${escapeXml(t)}</type>` : ''));
+  const codes = returnBlocks(xml).map(parseXmlBlock);
+  return { count: codes.length, codes };
+}
+
+/**
+ * getCampaignStrategies — dial-pacing strategies for ONE campaign.
+ * Takes an EXACT campaign name, not a pattern (schema: campaignName).
+ */
+export async function getCampaignStrategies(campaignName) {
+  const name = String(campaignName || '').trim();
+  if (!name) throw new Error('campaign_name is required for entity_type "campaign_strategy"');
+  const xml = await five9SoapCall('getCampaignStrategies', `<campaignName>${escapeXml(name)}</campaignName>`);
+  const strategies = returnBlocks(xml).map(parseXmlBlock);
+  return { campaignName: name, count: strategies.length, strategies };
+}
+
+/** getCampaignProfileFilter — ONE profile's record filter (exact profileName). */
+export async function getCampaignProfileFilter(profileName) {
+  const name = String(profileName || '').trim();
+  if (!name) throw new Error('profile_name is required for entity_type "campaign_profile_filter"');
+  const xml = await five9SoapCall('getCampaignProfileFilter', `<profileName>${escapeXml(name)}</profileName>`);
+  const blocks = returnBlocks(xml).map(parseXmlBlock);
+  return { profileName: name, count: blocks.length, filter: blocks[0] ?? null, raw: blocks };
+}
+
+/** getCampaignProfileDispositions — ONE profile's dispositions (exact profileName). */
+export async function getCampaignProfileDispositions(profileName) {
+  const name = String(profileName || '').trim();
+  if (!name) throw new Error('profile_name is required for entity_type "campaign_profile_dispositions"');
+  const xml = await five9SoapCall('getCampaignProfileDispositions', `<profileName>${escapeXml(name)}</profileName>`);
+  const dispositions = returnBlocks(xml).map(b => (/<[A-Za-z_]/.test(b) ? parseXmlBlock(b) : decodeXml(b).trim()));
+  return { profileName: name, count: dispositions.length, dispositions };
+}
+
+/** getSpeedDialNumbers — speed dial inventory. Takes no argument. */
+export async function getSpeedDialNumbers() {
+  const xml = await five9SoapCall('getSpeedDialNumbers');
+  const numbers = returnBlocks(xml).map(b => (/<[A-Za-z_]/.test(b) ? parseXmlBlock(b) : decodeXml(b).trim()));
+  return { count: numbers.length, numbers };
+}
+
+/**
+ * getCallCountersState — LIVE dialer telemetry, not configuration.
+ * Takes no argument. Kept out of five9_get_config on purpose: its freshness
+ * semantics are per-second, where every config read is "current until
+ * somebody edits it".
+ */
+export async function getCallCountersState() {
+  const xml = await five9SoapCall('getCallCountersState');
+  const counters = returnBlocks(xml).map(parseXmlBlock);
+  return { count: counters.length, counters, captured_at: new Date().toISOString() };
+}
+
+/** getCrmImportResult — job status for a CRM import (same identifier shape as list). */
+export async function getCrmImportResult(identifier) {
+  const xml = await five9SoapCall('getCrmImportResult', buildImportIdentifierXml(identifier));
+  const block = returnBlocks(xml)[0];
+  if (!block) return { identifier: String(identifier || ''), found: false, raw: null };
+  const raw = parseXmlBlock(block);
+  return {
+    identifier: String(identifier || ''),
+    found: true,
+    success: String(raw.success ?? '') === 'true',
+    crmRecordsInserted: num(raw.crmRecordsInserted),
+    crmRecordsUpdated: num(raw.crmRecordsUpdated),
+    uploadErrorsCount: num(raw.uploadErrorsCount),
+    uploadDuplicatesCount: num(raw.uploadDuplicatesCount),
+    failureMessage: raw.failureMessage || null,
+    importTroubles: asArray(raw.importTroubles),
+    raw,
+  };
+}
+
+/** getDispositionsImportResult — job status for a dispositions import. */
+export async function getDispositionsImportResult(identifier) {
+  const xml = await five9SoapCall('getDispositionsImportResult', buildImportIdentifierXml(identifier));
+  const block = returnBlocks(xml)[0];
+  if (!block) return { identifier: String(identifier || ''), found: false, raw: null };
+  const raw = parseXmlBlock(block);
+  return {
+    identifier: String(identifier || ''),
+    found: true,
+    success: String(raw.success ?? '') === 'true',
+    uploadErrorsCount: num(raw.uploadErrorsCount),
+    failureMessage: raw.failureMessage || null,
+    importTroubles: asArray(raw.importTroubles),
+    raw,
+  };
+}
+
+/**
+ * buildLookupCriteriaXml — tns:crmLookupCriteria for getContactRecords.
+ * Sequence order is contactIdField then the repeated criteria, each a
+ * tns:crmFieldCriterion of { field, value }.
+ */
+export function buildLookupCriteriaXml({ contactIdField, criteria } = {}) {
+  const rows = Array.isArray(criteria) ? criteria : [];
+  if (!rows.length) throw new Error('lookup_criteria requires at least one { field, value } criterion');
+  for (const r of rows) {
+    if (!r || !String(r.field ?? '').trim()) {
+      throw new Error('each lookup criterion requires a non-empty "field"');
+    }
+  }
+  const idField = String(contactIdField ?? '').trim();
+  return '<lookupCriteria>' +
+    (idField ? `<contactIdField>${escapeXml(idField)}</contactIdField>` : '') +
+    rows.map(r =>
+      `<criteria><field>${escapeXml(String(r.field).trim())}</field>` +
+      `<value>${escapeXml(r.value ?? '')}</value></criteria>`
+    ).join('') +
+    '</lookupCriteria>';
+}
+
+/**
+ * getContactRecords — query the Five9 contact DB by lookup criteria.
+ *
+ * NOT a config read and deliberately not folded into five9_get_config: it
+ * takes a query, not a name pattern. LP REMAINS THE SYSTEM OF RECORD for
+ * contact data — this exists to verify what Five9 currently holds, never to
+ * treat Five9 as truth. (Same reasoning that makes every contact-DB WRITE
+ * `denied` in OP_CLASSIFICATION: a third divergent copy is the failure mode.)
+ */
+export async function getContactRecords(lookupCriteria) {
+  const xml = await five9SoapCall('getContactRecords', buildLookupCriteriaXml(lookupCriteria));
+  const blocks = returnBlocks(xml).map(parseXmlBlock);
+  return {
+    count: blocks.length,
+    records: blocks,
+    system_of_record: 'LP — Five9 contact data is a copy, not truth',
+  };
+}

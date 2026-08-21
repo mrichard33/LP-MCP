@@ -385,15 +385,50 @@ test('every gated registry entry declares what makes it gated', () => {
   // And the confirm_token set must match requiredConfirmToken()'s reality.
   const tokened = OP_REGISTRY.filter((e) => e.confirmToken).map((e) => e.actionType).sort();
   assert.deepEqual(tokened, [
+    // Phase H PR4 — campaign composition. Every one restates the campaign
+    // name; create_list is deliberately absent (a new list is empty and
+    // attached to nothing, so there is no target to confirm).
+    'five9_add_dispositions_to_campaign',
+    'five9_add_lists_to_campaign',
+    'five9_add_skills_to_campaign',
     'five9_async_delete_records_from_list',
+    // Phase H PR4 — web connectors; both restate the connector name.
+    'five9_create_outbound_campaign',
     'five9_create_user_profile',
+    'five9_create_web_connector',
+    'five9_modify_campaign_lists',
     'five9_modify_campaign_profile',
     'five9_modify_ivr_script',
     'five9_modify_user_profile',
+    'five9_modify_web_connector',
     'five9_remove_dnis_from_campaign',
+    'five9_remove_lists_from_campaign',
+    'five9_remove_skills_from_campaign',
     'five9_reset_campaign',
+    'five9_reset_campaign_dispositions',
+    'five9_reset_list_position',
+    'five9_set_campaign_strategies',
     'five9_set_outbound_campaign',
   ]);
+});
+
+test('PR4 — every registry confirmToken agrees with requiredConfirmToken()', async () => {
+  // The registry is a DECLARATION; requiredConfirmToken() is what actually
+  // runs. A tranche that declares a token it never enforces would read as
+  // gated and behave as enabled, which is the failure this pins.
+  const { requiredConfirmToken } = await import('../src/five9/admin-writes.js');
+  for (const e of OP_REGISTRY) {
+    const subtype = e.actionType.replace(/^five9_/, '');
+    const payload = { campaign_name: 'C', profile_name: 'P', list_name: 'L', name: 'N', connector_name: 'W' };
+    const actual = requiredConfirmToken(subtype, payload);
+    if (e.confirmToken) {
+      assert.equal(actual, payload[e.confirmToken],
+        `${e.actionType} declares confirmToken "${e.confirmToken}" but requiredConfirmToken() returned ${JSON.stringify(actual)}`);
+    } else {
+      assert.equal(actual, null,
+        `${e.actionType} declares no confirmToken but requiredConfirmToken() demands ${JSON.stringify(actual)}`);
+    }
+  }
 });
 
 test('the registry matches the handler map that is actually wired up', async () => {
@@ -401,14 +436,60 @@ test('the registry matches the handler map that is actually wired up', async () 
   const live = Object.keys(ACTION_HANDLERS).filter((k) => k.startsWith('five9_')).sort();
   const registered = OP_REGISTRY.map((e) => e.actionType).sort();
   assert.deepEqual(registered, live, 'registry and ACTION_HANDLERS have diverged');
-  assert.equal(live.length, 24, 'PR3 registers NO new operation — 24 in, 24 out');
+  // PR3 registered 24 and no more. PR4 adds 13: the web connector pair plus
+  // 11 campaign-composition ops. The number is pinned so the NEXT tranche
+  // moves it deliberately, in that PR, rather than by accident here.
+  assert.equal(live.length, 37, 'PR4 = PR3’s 24 + 13 new action types');
+});
+
+test('PR4 — removeDispositionsFromCampaign is BUILT but UNREGISTERED', async () => {
+  // The op exists in admin-writes.js and must stay unreachable: its required
+  // guard (refuse any disposition in the CC payroll bonus mapping) has no
+  // authoritative source, and a guard keyed on a guessed list reads as
+  // protection while protecting nothing. This pins BOTH halves — the executor
+  // exists, and nothing can queue it.
+  const writes = await import('../src/five9/admin-writes.js');
+  assert.equal(typeof writes.executeRemoveDispositionsFromCampaign, 'function',
+    'the executor must remain built, so registering it later is a wiring change, not a rewrite');
+
+  const { ACTION_HANDLERS } = await import('../src/actions/index.js');
+  assert.equal(Object.hasOwn(ACTION_HANDLERS, 'five9_remove_dispositions_from_campaign'), false,
+    'must not be queueable while its payroll guard has no source');
+  assert.equal(
+    OP_REGISTRY.some((e) => e.actionType === 'five9_remove_dispositions_from_campaign'), false,
+    'must not appear in OP_REGISTRY');
+  assert.equal(OP_CLASSIFICATION.removeDispositionsFromCampaign.status, 'not-built',
+    'classification must report it as not shipped');
+
+  // And the guard itself must refuse rather than pass while unenforceable —
+  // the failure mode to prevent is a mapping-less guard that quietly allows.
+  const verdict = writes.checkPayrollDispositions(['NoRehash']);
+  assert.equal(verdict.ok, false, 'an unenforceable payroll guard must REFUSE, never allow');
+  assert.equal(verdict.unenforceable, true);
 });
 
 test('the registry declares buildFromSchema for exactly the migrated ops', () => {
-  // One op migrated in PR3. When the next tranche lands this number moves —
-  // deliberately, in that PR, not by accident in this one.
+  // PR3 migrated one op (plus its modify sibling). PR4 adds 13 more, all of
+  // them schema-walked: every request wrapper in that tranche is itself a
+  // complexType, so there is no hand-written field order in it at all.
   const migrated = OP_REGISTRY.filter((e) => e.builder === 'buildFromSchema').map((e) => e.actionType).sort();
-  assert.deepEqual(migrated, ['five9_create_campaign_profile', 'five9_modify_campaign_profile']);
+  assert.deepEqual(migrated, [
+    'five9_add_dispositions_to_campaign',
+    'five9_add_lists_to_campaign',
+    'five9_add_skills_to_campaign',
+    'five9_create_campaign_profile',
+    'five9_create_list',
+    'five9_create_outbound_campaign',
+    'five9_create_web_connector',
+    'five9_modify_campaign_lists',
+    'five9_modify_campaign_profile',
+    'five9_modify_web_connector',
+    'five9_remove_lists_from_campaign',
+    'five9_remove_skills_from_campaign',
+    'five9_reset_campaign_dispositions',
+    'five9_reset_list_position',
+    'five9_set_campaign_strategies',
+  ]);
 });
 
 /* ====================================================================== *
@@ -611,10 +692,15 @@ test('the four v9.5 ghost operations stay absent', () => {
 });
 
 test('the two never-considered surfaces are classified and flagged', () => {
-  for (const op of ['createSpeedDialNumber', 'getSpeedDialNumbers', 'removeSpeedDialNumber']) {
+  for (const op of ['createSpeedDialNumber', 'removeSpeedDialNumber']) {
     assert.ok(OP_CLASSIFICATION[op], `${op} unclassified`);
     assert.match(OP_CLASSIFICATION[op].reason, /NEW SURFACE|available if needed/);
   }
+  // getSpeedDialNumbers stopped being a never-considered surface in PR4: it
+  // ships inside five9_get_config. Its row is asserted here rather than
+  // dropped, so the surface stays covered by a test either way.
+  assert.equal(OP_CLASSIFICATION.getSpeedDialNumbers.status, 'shipped');
+  assert.match(OP_CLASSIFICATION.getSpeedDialNumbers.reason, /five9_get_config/);
   for (const op of [
     'getIvrIcons', 'setIvrIcons', 'removeIvrIcons',
     'getIvrScriptOwnership', 'setIvrScriptOwnership', 'removeIvrScriptOwnership',
