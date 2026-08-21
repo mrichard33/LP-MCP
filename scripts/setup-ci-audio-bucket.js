@@ -31,11 +31,32 @@ export const CI_AUDIO_BUCKET = 'ci-audio';
 
 const EXECUTE = process.argv.includes('--execute');
 
+/**
+ * Refuse to touch anything but the LP MCP Supabase instance.
+ *
+ * This guard exists because of a real incident: on 2026-08-20 this script
+ * created ci-audio in the HL warehouse, because SUPABASE_URL pointed there
+ * and nothing checked. The bucket had to be deleted and recreated on the LP
+ * instance. lp_leads is the probe — LP-instance-only and always present.
+ */
+async function assertLpInstance() {
+  const host = process.env.SUPABASE_URL ? new URL(process.env.SUPABASE_URL).host : '(unset)';
+  const { error } = await supabase.from('lp_leads').select('id').limit(1);
+  if (error) {
+    console.error(`Refusing to proceed: SUPABASE_URL points at ${host}, which does not look like the LP MCP instance.`);
+    console.error(`  probe: SELECT id FROM lp_leads LIMIT 1 -> ${error.message}`);
+    console.error(`  The '${CI_AUDIO_BUCKET}' bucket belongs on the LP instance, next to lp-reports.`);
+    process.exit(1);
+  }
+  console.log(`Target instance OK (${host}, lp_leads reachable).`);
+}
+
 async function main() {
   if (!supabase) {
     console.error('Supabase not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY missing).');
     process.exit(1);
   }
+  await assertLpInstance();
 
   const { data: existing, error: getErr } = await supabase.storage.getBucket(CI_AUDIO_BUCKET);
   if (existing) {

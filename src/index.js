@@ -987,6 +987,38 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] call intelligence substrate FAILED (CI pipeline tables missing, PRs 2+ workers cannot run — apply sql/061 manually):', err.message);
   }
+
+  // Call Intelligence v2 recording→call join (sql/062 — the file is the
+  // source of truth). Kept as its own block rather than folded into the 061
+  // mirror above so each block still mirrors exactly one file: on a fresh
+  // deploy 061 creates the v1 shape and this alters it forward. The Call ID
+  // is not in the recording filename, so a recording is inserted unlinked and
+  // matched on campaign+ANI+time afterwards — hence call_id nullable and
+  // uniqueness on source_path. Purely additive; no DROP TABLE.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`ALTER TABLE ci_recordings ALTER COLUMN call_id DROP NOT NULL;
+            ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS source_path         text;
+            ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS campaign_dir        text;
+            ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS date_dir            text;
+            ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS ani                 text;
+            ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS agent_username      text;
+            ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS ivr_module          text;
+            ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS filename_clock_text text;
+            ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS recorded_at         timestamptz;
+            ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS match_method        text;
+            ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS match_confidence    numeric;
+            ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS excluded            boolean NOT NULL DEFAULT false;
+            ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS excluded_reason     text;
+            ALTER TABLE ci_recordings DROP CONSTRAINT IF EXISTS ci_recordings_call_id_source_filename_key;
+            CREATE UNIQUE INDEX IF NOT EXISTS ci_recordings_source_path_uq
+              ON ci_recordings (source_path);
+            ALTER TABLE ci_campaign_map ADD COLUMN IF NOT EXISTS excluded_ivr_modules text[] NOT NULL DEFAULT
+              '{ThirdPartyTransfer,ThirdPartyTransfer2,"Third Party Transfer"}';`);
+    console.log('[Migration] call intelligence v2 recording join (sql/062) ready');
+  } catch (err) {
+    console.error('[Migration] call intelligence v2 recording join FAILED (recording ingest cannot match calls — apply sql/062 manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
