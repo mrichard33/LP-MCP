@@ -21,7 +21,7 @@ import {
   getPrompts,
   getVCCConfiguration,
 } from '../five9-admin.js';
-import { getUsersFullInfo } from '../five9-users-info.js';
+import { getUsersFullInfo, getUserProfiles, getUserProfile } from '../five9-users-info.js';
 import supabase from '../supabase.js';
 import {
   STATISTIC_TYPES,
@@ -253,6 +253,25 @@ export function registerFive9Tools(server) {
       const q = String(name_pattern).toLowerCase();
       const prompts = out.prompts.filter(p => (p.name || '').toLowerCase().includes(q));
       return { count: prompts.length, filtered_from: out.count, prompts };
+    })
+  );
+
+  // Tool: five9_get_user_profiles
+  server.tool(
+    'five9_get_user_profiles',
+    'Five9 user-profile inventory (read-only). A user profile is a named bundle of ROLES, skills and membership attached to many users at once — so a profile granting admin hands admin to every user carrying it. Omit profile_name (or pass empty) to list ALL profiles; pass it for an exact single lookup. Either way the response includes each profile\'s roles block — roles.assigned is the list of roles the profile grants, roles.permissions the per-role permission flags — so a role audit needs no second call. Also returns skills[] (which skills the profile\'s agents can be routed to) and users[] (which usernames carry it). Live as of 2026-08-21: two profiles exist — "Level 1 Setter Profile" (5 users) and "Level 2 Setter Profile" (1 user) — both granting agent only, no admin and no supervisor. To go the other direction (which profile does a given USER have), call five9_get_users, which returns userProfileName. Writes to profiles are gated action types, never this tool: five9_modify_user_profile_skills and five9_modify_user_profile_user_list are the narrow patches, five9_create_user_profile / five9_modify_user_profile the full-object writes.',
+    {
+      profile_name: z.string().optional().describe('Exact profile name for a single lookup, e.g. "Level 1 Setter Profile". Omit to list every profile.'),
+    },
+    asTool(async ({ profile_name }) => {
+      const name = String(profile_name || '').trim();
+      if (!name) {
+        return { ...(await getUserProfiles()), lookup: 'all' };
+      }
+      const profile = await getUserProfile(name);
+      return profile
+        ? { count: 1, profiles: [profile], lookup: 'exact' }
+        : { count: 0, profiles: [], lookup: 'exact', not_found: name };
     })
   );
 

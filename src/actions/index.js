@@ -29,7 +29,7 @@
  *   originating system_events row by action.event_id when they need
  *   structural fields like event.id or event.payload.message_id.
  *
- * Supported action types (56 — ACTION_HANDLERS is the authority; this list
+ * Supported action types (60 — ACTION_HANDLERS is the authority; this list
  * was re-derived from it on 2026-08-21, when it had drifted to a stated 45
  * and was missing all seven Phase G ops plus nine others):
  *
@@ -51,7 +51,7 @@
  *   State machines (5):
  *     compute_rescission_dispatch, transition_objection_state,
  *     resolve_objection_state, classify_lead_state, end_agentic_handoff
- *   Five9 gated writes (20 — every one behind FIVE9_WRITES_ENABLED +
+ *   Five9 gated writes (24 — every one behind FIVE9_WRITES_ENABLED +
  *   approve_action; see src/five9/admin-writes.js):
  *     2026-07-21 Phase C — five9_start_campaign, five9_stop_campaign,
  *       five9_reset_campaign, five9_set_outbound_campaign,
@@ -68,6 +68,11 @@
  *       five9_create_inbound_campaign, five9_set_default_ivr_schedule,
  *       five9_add_dnis_to_campaign, five9_remove_dnis_from_campaign,
  *       five9_create_prompt_tts
+ *     2026-08-21 Phase H — five9_modify_user_profile_skills,
+ *       five9_modify_user_profile_user_list (narrow patches — prefer these),
+ *       five9_create_user_profile, five9_modify_user_profile (full-object
+ *       writes; modify REPLACES the whole struct, so it read-modify-writes,
+ *       and both carry Guardrail 12's admin/supervisor role-grant gate)
  *
  *   NOT an action type, and not to be re-added: five9_remove_numbers_from_dnc.
  *   Registered 2026-07-21, removed 2026-08-21 by explicit ruling — Reece does
@@ -541,6 +546,13 @@ export const ACTION_HANDLERS = {
   five9_add_dnis_to_campaign: executeFive9Write,
   five9_remove_dnis_from_campaign: executeFive9Write,
   five9_create_prompt_tts: executeFive9Write,
+  // 2026-08-21 Phase H — user profiles. Same gate, same dispatcher. Target
+  // ids are profile names, so like the rest of five9_* these stay out of
+  // MUTATION_GATED_ACTION_TYPES.
+  five9_modify_user_profile_skills: executeFive9Write,
+  five9_modify_user_profile_user_list: executeFive9Write,
+  five9_create_user_profile: executeFive9Write,
+  five9_modify_user_profile: executeFive9Write,
 };
 
 // Handlers that need the triggering event's payload injected as context.

@@ -317,3 +317,119 @@ test('getDnisMap: cache is served without network and carries fetched_at', async
     invalidateDnisMap();
   }
 });
+
+/* ── Part A: user-profile reads (2026-08-21 Phase H) ──────────────────────
+ *
+ * These drive the real readers over a stubbed transport, so they prove the
+ * exact SOAP element that goes on the wire and the exact shape that comes
+ * back — not just that a helper function is pure.
+ */
+
+const PROFILE_BLOCK = (name, extra = '') =>
+  `<return><name>${name}</name><description>d-${name}</description><IEXScheduled>false</IEXScheduled>` +
+  '<roles><agent><alwaysRecorded>true</alwaysRecorded><attachVmToEmail>false</attachVmToEmail>' +
+  '<permissions><type>CanRunWebClient</type><value>true</value></permissions>' +
+  '<sendEmailOnVm>false</sendEmailOnVm></agent></roles>' +
+  `${extra}</return>`;
+
+function stubFive9(handler) {
+  const savedFetch = globalThis.fetch;
+  const saved = { u: process.env.FIVE9_USERNAME, p: process.env.FIVE9_PASSWORD };
+  process.env.FIVE9_USERNAME = 'test-user';
+  process.env.FIVE9_PASSWORD = 'test-pass';
+  const sent = [];
+  globalThis.fetch = async (_url, opts) => {
+    sent.push(String(opts?.body ?? ''));
+    const body = handler(String(opts?.body ?? ''));
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => null },      // Five9 sends these chunked, no length
+      text: async () => `<soapenv:Envelope><soapenv:Body>${body}</soapenv:Body></soapenv:Envelope>`,
+    };
+  };
+  return {
+    sent,
+    restore() {
+      globalThis.fetch = savedFetch;
+      for (const [k, env] of [['u', 'FIVE9_USERNAME'], ['p', 'FIVE9_PASSWORD']]) {
+        if (saved[k] === undefined) delete process.env[env]; else process.env[env] = saved[k];
+      }
+    },
+  };
+}
+
+test('Part A — an empty/omitted pattern returns ALL profiles', async () => {
+  const { getUserProfiles } = await import('../src/five9-users-info.js');
+  const stub = stubFive9(() => PROFILE_BLOCK('Level 1 Setter Profile') + PROFILE_BLOCK('Level 2 Setter Profile'));
+  try {
+    for (const arg of [undefined, '', null]) {
+      const out = await getUserProfiles(arg);
+      assert.equal(out.count, 2, `pattern ${JSON.stringify(arg)} must list everything`);
+      assert.deepEqual(out.profiles.map(p => p.name), ['Level 1 Setter Profile', 'Level 2 Setter Profile']);
+    }
+    // The misspelled element, and `.*` rather than "" — an empty string is not
+    // a reliable match-all on this API.
+    for (const body of stub.sent) {
+      assert.match(body, /<userProfileNamePatern>\.\*<\/userProfileNamePatern>/);
+      assert.match(body, /<ser:getUserProfiles>/);
+    }
+  } finally { stub.restore(); }
+});
+
+test('Part A — a named lookup returns exactly one, by exact name', async () => {
+  const { getUserProfile } = await import('../src/five9-users-info.js');
+  const stub = stubFive9(() => PROFILE_BLOCK('Level 1 Setter Profile'));
+  try {
+    const p = await getUserProfile('Level 1 Setter Profile');
+    assert.equal(p.name, 'Level 1 Setter Profile');
+    assert.equal(stub.sent.length, 1);
+    // Singular op, and the element here is spelled correctly — only the
+    // PATTERN one is misspelled in the WSDL.
+    assert.match(stub.sent[0], /<ser:getUserProfile>/);
+    assert.match(stub.sent[0], /<userProfileName>Level 1 Setter Profile<\/userProfileName>/);
+  } finally { stub.restore(); }
+});
+
+test('Part A — a missing profile reads back as null, not as a throw', async () => {
+  const { getUserProfile } = await import('../src/five9-users-info.js');
+  const stub = stubFive9(() => '');  // no <return> block
+  try {
+    // The write-side existence guard depends on this being data, not an error.
+    assert.equal(await getUserProfile('No Such Profile'), null);
+  } finally { stub.restore(); }
+  await assert.rejects(() => getUserProfile('  '), /profileName is required/);
+});
+
+test('Part A — the response carries the roles block, so no second call is needed', async () => {
+  const { getUserProfiles } = await import('../src/five9-users-info.js');
+  const stub = stubFive9(() => PROFILE_BLOCK(
+    'Level 1 Setter Profile',
+    '<skills>Dispatch</skills><skills>Rehash</skills><users>dellis1</users><users>jdennis1</users>',
+  ));
+  try {
+    const [p] = (await getUserProfiles()).profiles;
+    // The question that matters before anyone modifies a profile: what does
+    // it GRANT? Answerable from this one response.
+    assert.deepEqual(p.roles.assigned, ['agent']);
+    assert.deepEqual(p.roles.permissions.agent, [{ type: 'CanRunWebClient', value: true }]);
+    assert.deepEqual(p.skills, ['Dispatch', 'Rehash']);
+    assert.deepEqual(p.users, ['dellis1', 'jdennis1']);
+    assert.equal(p.description, 'd-Level 1 Setter Profile');
+    assert.equal(p.IEXScheduled, false);
+    // raw is retained — it is the lossless base modifyUserProfile rebuilds from.
+    assert.equal(p.raw.roles.agent.alwaysRecorded, 'true');
+  } finally { stub.restore(); }
+});
+
+test('Part A — an admin-granting profile is legible from the read alone', async () => {
+  const { getUserProfiles } = await import('../src/five9-users-info.js');
+  const stub = stubFive9(() =>
+    '<return><name>Privileged</name><roles><admin><permissions><type>ManageUsers</type><value>true</value></permissions></admin></roles></return>');
+  try {
+    const [p] = (await getUserProfiles('Priv.*')).profiles;
+    assert.deepEqual(p.roles.assigned, ['admin']);
+    assert.deepEqual(p.roles.permissions.admin, [{ type: 'ManageUsers', value: true }]);
+    assert.match(stub.sent[0], /<userProfileNamePatern>Priv\.\*<\/userProfileNamePatern>/);
+  } finally { stub.restore(); }
+});

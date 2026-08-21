@@ -40,7 +40,17 @@ import {
   assertWellFormedXml,
   checkDnisSteal,
   requiredConfirmToken,
+  // 2026-08-21 Phase H — user profiles
+  buildUserProfileXml,
+  buildModifyUserProfileSkillsXml,
+  buildModifyUserProfileUserListXml,
+  checkRoleGrant,
+  isRolePopulated,
+  exactUserAlternationPattern,
+  MIN_LEGAL_BASIS_CHARS,
+  USER_PROFILE_FIELD_ORDER,
 } from '../src/five9/admin-writes.js';
+import { USER_PROFILE_NAME_PATTERN_ELEMENT } from '../src/five9-users-info.js';
 
 if (!process.argv.includes('--dry')) {
   console.error('Refusing to run without --dry. Usage: node scripts/five9-writes-dryrun.js --dry');
@@ -311,6 +321,100 @@ out.push('  without compliance_override, and captures the prior xmlDefinition fi
 out.push('Audit event (previous_state carries the pre-write config; rollback_payload rides on the event):');
 out.push(eventShape('add_dnis_to_campaign', 'five9_campaign', 'Canvass Confirmation - Inbound', {
   compliance: '<steal verdict>', current_assignments: '<conflict table>', rollback_payload: '<symmetric remove>', verified: '<bool>',
+}));
+
+section('Phase H (2026-08-21) — user profiles');
+out.push('  Reece runs two: "Level 1 Setter Profile" (5 LightFire agents) and');
+out.push('  "Level 2 Setter Profile" (1 NC hire). Verified live 2026-08-21: both grant');
+out.push('  AGENT ONLY — no admin, no supervisor on either.');
+out.push('  Read side is a direct MCP tool (five9_get_user_profiles), not an action.');
+line('  read pattern element', `<${USER_PROFILE_NAME_PATTERN_ELEMENT}> — Five9 misspells "Pattern", one t; emitted verbatim`);
+
+out.push('\n① five9_modify_user_profile_skills — modifyUserProfileSkills (NARROW PATCH)');
+line('inner XML', buildModifyUserProfileSkillsXml('Level 1 Setter Profile', ['Dispatch'], ['Legacy Skill']));
+verdict('at least one of add/remove required — both empty refused', () => {
+  const a = [], r = [];
+  if (!a.length && !r.length) throw new Error('an empty patch is a no-op that still burns an approval');
+});
+out.push('  [REFUSED] unknown profile_name → user_profile_not_found (read-before-write, not Five9\'s error)');
+out.push('  Cannot touch a role grant at all — this is the op to prefer.');
+
+out.push('\n② five9_modify_user_profile_user_list — modifyUserProfileUserList (NARROW PATCH)');
+line('inner XML', buildModifyUserProfileUserListXml('Level 1 Setter Profile', ['dellis1'], ['tguthrie']));
+line('add_users existence probe', exactUserAlternationPattern(['dellis1', 'jdennis1']));
+out.push('  Every add_users name is checked against getUsersGeneralInfo FIRST: Five9');
+out.push('  accepts an unknown username here without erroring, so a typo would report');
+out.push('  success and silently leave the setter without the profile.');
+out.push('  [REFUSED] unknown username in add_users → named explicitly in the error');
+out.push('  remove_users is NOT existence-checked — removing an absent user is a');
+out.push('  harmless no-op, and refusing it would block cleanup after an account is deleted.');
+
+out.push('\n③ five9_create_user_profile / ④ five9_modify_user_profile (FULL-OBJECT WRITES)');
+line('  userProfile WSDL order', USER_PROFILE_FIELD_ORDER.join(' → '));
+line('inner XML (agent-only profile)', buildUserProfileXml({
+  name: 'Level 1 Setter Profile',
+  description: 'LightFire setters',
+  IEXScheduled: false,
+  roles: { agent: { alwaysRecorded: true, attachVmToEmail: false, sendEmailOnVm: false, permissions: [{ type: 'CanRunWebClient', value: true }] } },
+  skills: ['Dispatch'],
+  users: ['dellis1', 'jdennis1'],
+}));
+out.push('  modifyUserProfile REPLACES THE WHOLE STRUCT — a field omitted from the');
+out.push('  submitted object is DROPPED, not left alone. Read-modify-write is mandatory,');
+out.push('  and it rebuilds from the RAW read: the normalized read collapses <roles> and');
+out.push('  loses agentRole\'s three schema-required booleans (alwaysRecorded,');
+out.push('  attachVmToEmail, sendEmailOnVm), which would silently reset recording and');
+out.push('  voicemail behavior for every user carrying the profile.');
+verdict('agentRole missing a schema-required boolean refused at build time',
+  () => buildUserProfileXml({ name: 'P', roles: { agent: { permissions: [] } } }));
+verdict('unknown userProfile field refused (never appended out of order)',
+  () => buildUserProfileXml({ name: 'P', notAField: 1 }));
+verdict('unknown role key refused rather than silently dropped',
+  () => buildUserProfileXml({ name: 'P', roles: { wizard: {} } }));
+
+out.push('\nGuardrail 12 — role-grant protection (admin / supervisor):');
+line('  MIN_LEGAL_BASIS_CHARS', MIN_LEGAL_BASIS_CHARS);
+const BASIS = 'Approved by Mark 2026-08-21 for the NC supervisor onboarding';
+verdict('agent-only roles need no override', () => checkRoleGrant({ agent: { permissions: [] } }));
+verdict('roles absent entirely needs no override', () => checkRoleGrant(undefined));
+verdict('empty admin object {} is NOT a grant (indistinguishable from absent once serialized)',
+  () => { const c = checkRoleGrant({ admin: {} }); if (!c.ok) throw new Error(c.violations.join('; ')); return c; });
+verdict('admin with EMPTY permissions[] IS a grant — attaching the role is the grant',
+  () => { const c = checkRoleGrant({ admin: { permissions: [] } }); if (!c.ok) throw new Error(c.violations.join('; ')); return c; });
+verdict('admin grant with NO override refused',
+  () => { const c = checkRoleGrant({ admin: { permissions: [{ type: 'X', value: true }] } }); if (!c.ok) throw new Error(c.violations.join('; ')); return c; });
+verdict('admin grant with override but NO legal_basis refused',
+  () => { const c = checkRoleGrant({ admin: { permissions: [] } }, { complianceOverride: true }); if (!c.ok) throw new Error(c.violations.join('; ')); return c; });
+verdict('admin grant with override + too-short legal_basis refused',
+  () => { const c = checkRoleGrant({ admin: { permissions: [] } }, { complianceOverride: true, legalBasis: 'ok' }); if (!c.ok) throw new Error(c.violations.join('; ')); return c; });
+verdict('supervisor grant with override + written legal_basis ACCEPTED',
+  () => checkRoleGrant({ supervisor: { permissions: [] } }, { complianceOverride: true, legalBasis: BASIS }));
+out.push('  The legal_basis is persisted VERBATIM to the audit event. Per the Phase H');
+out.push('  finding that v13 has no getAgentAuditReport — the Admin API has no audit');
+out.push('  trail at all — that event is the ONLY record this grant will ever have.');
+out.push('  Checked against the SUBMITTED changes.roles, never the merged result:');
+out.push('  carrying an existing grant forward through RMW is not a new grant, and');
+out.push('  gating it would train the gate out of people within a week.');
+line('  isRolePopulated(undefined)', isRolePopulated(undefined));
+line('  isRolePopulated({})', isRolePopulated({}));
+line('  isRolePopulated({permissions:[]})', isRolePopulated({ permissions: [] }));
+
+out.push('\nconfirm_token on the full-object pair:');
+line('  create token', requiredConfirmToken('create_user_profile', { profile_name: 'Level 1 Setter Profile' }));
+line('  modify token', requiredConfirmToken('modify_user_profile', { profile_name: 'Level 1 Setter Profile' }));
+verdict('create confirm_token restating the profile name accepted',
+  () => checkConfirmToken('create_user_profile', { profile_name: 'Level 1 Setter Profile', confirm_token: 'Level 1 Setter Profile' }));
+verdict('modify confirm_token mismatch refused',
+  () => checkConfirmToken('modify_user_profile', { profile_name: 'Level 1 Setter Profile', confirm_token: 'level 1 setter profile' }));
+out.push('  modify ALSO re-checks the token against the LIVE profile name inside the');
+out.push('  executor, so it verifies the target rather than the payload\'s own spelling.');
+out.push('  The narrow patches are deliberately NOT token-gated — they cannot grant a role:');
+line('  modify_user_profile_skills token', String(requiredConfirmToken('modify_user_profile_skills', { profile_name: 'X' })));
+line('  modify_user_profile_user_list token', String(requiredConfirmToken('modify_user_profile_user_list', { profile_name: 'X' })));
+out.push('Audit event (legal_basis + role_grant ride on the event; deleteUserProfile is NOT an op):');
+out.push(eventShape('modify_user_profile', 'five9_user_profile', 'Level 1 Setter Profile', {
+  role_grant: '<verdict incl. granted[] and legal_basis>', legal_basis: '<verbatim justification>',
+  changed_fields: '<keys of action_payload.changes>', verify_mismatches: '<read-back drift, incl. UNTOUCHED fields>',
 }));
 
 section('Serialization + gate (applies to every op above)');
