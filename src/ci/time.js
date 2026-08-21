@@ -35,6 +35,12 @@ const validYmd = (y, month, day) => {
   return probe.getUTCMonth() === month - 1 && probe.getUTCDate() === day;
 };
 
+/** Three-letter month abbreviations → 0-based index, for the RFC-822 shape. */
+const MONTHS = {
+  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+};
+
 /** Wall-clock component ranges. Hours are 0–23 after meridiem folding. */
 const validHms = (h, min, s) =>
   Number.isFinite(h) && Number.isFinite(min) && Number.isFinite(s) &&
@@ -88,8 +94,21 @@ export function parsePacificReportTimestamp(text) {
   const s = String(text ?? '').trim();
   if (!s) return null;
 
+  // RFC-822-ish, and THE FORMAT THIS DOMAIN ACTUALLY EMITS (verified against
+  // the live Call Log 2026-08-21): 'Fri, 21 Aug 2026 09:00:12'. The leading
+  // weekday is optional. This case is first because it is the real one — the
+  // two below are defensive, for a differently-configured saved report.
+  let m = /^(?:[A-Za-z]{3},\s*)?(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(s);
+  if (m) {
+    const month = MONTHS[m[2].toLowerCase()];
+    if (month === undefined) return null;
+    const [day, y, h, min, sec] = [int(m[1]), int(m[3]), int(m[4]), int(m[5]), int(m[6] ?? 0)];
+    if (!validYmd(y, month + 1, day) || !validHms(h, min, sec)) return null;
+    return pacificWallClockToUtc(y, month, day, h, min, sec);
+  }
+
   // ISO-ish: YYYY-MM-DD[ T]HH:MM[:SS]
-  let m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(s);
+  m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(s);
   if (m) {
     const [y, month, day, h, min, sec] = [int(m[1]), int(m[2]), int(m[3]), int(m[4]), int(m[5]), int(m[6] ?? 0)];
     if (!validYmd(y, month, day) || !validHms(h, min, sec)) return null;
