@@ -70,8 +70,25 @@ import {
   INBOUND_CAMPAIGN_FIELD_ORDER,
   INBOUND_CAMPAIGN_SETTABLE_FIELDS,
   WRAPUP_DEFAULT_DISPOSITION,
+  // 2026-08-21 Phase H — user profiles
+  buildUserProfileXml,
+  buildModifyUserProfileSkillsXml,
+  buildModifyUserProfileUserListXml,
+  checkRoleGrant,
+  isRolePopulated,
+  exactUserAlternationPattern,
+  assertUserProfileExists,
+  assertSomethingToDo,
+  checkAddUsersKnown,
+  mergeUserProfile,
+  MIN_LEGAL_BASIS_CHARS,
+  executeModifyUserProfileSkills,
+  executeModifyUserProfileUserList,
+  executeCreateUserProfile,
+  executeModifyUserProfile,
 } from '../src/five9/admin-writes.js';
 import { buildImportIdentifierXml } from '../src/five9-admin.js';
+import { readFile } from 'node:fs/promises';
 
 test('five9WritesEnabled: ships dark — unset/false off, only literal "true" on', () => {
   const saved = process.env.FIVE9_WRITES_ENABLED;
@@ -1279,4 +1296,303 @@ test('every INBOUND_CAMPAIGN_SETTABLE_FIELD still has a position in the order ar
   // order array silently never emits.
   const missing = [...INBOUND_CAMPAIGN_SETTABLE_FIELDS].filter(f => !INBOUND_CAMPAIGN_FIELD_ORDER.includes(f));
   assert.deepEqual(missing, [], `settable fields absent from the order array: ${missing.join(', ')}`);
+});
+
+/* ── Phase H (2026-08-21) — user profiles ───────────────────────────────── */
+
+const AGENT_ROLE = {
+  alwaysRecorded: 'true', attachVmToEmail: 'false', sendEmailOnVm: 'false',
+  permissions: [{ type: 'CanRunWebClient', value: 'true' }],
+};
+
+test('Part A — the read pattern element carries Five9\'s misspelling verbatim', async () => {
+  const { USER_PROFILE_NAME_PATTERN_ELEMENT, MATCH_ALL_PATTERN } = await import('../src/five9-users-info.js');
+  // "Patern", one t — per the v13 WSDL, same class as dispostionName. Pinned
+  // here so a well-meaning spelling fix fails loudly instead of silently
+  // sending an element the server does not know.
+  assert.equal(USER_PROFILE_NAME_PATTERN_ELEMENT, 'userProfileNamePatern');
+  assert.notEqual(USER_PROFILE_NAME_PATTERN_ELEMENT, 'userProfileNamePattern');
+  // Five9 admin name patterns are regexes, so match-all is `.*`, not "".
+  assert.equal(MATCH_ALL_PATTERN, '.*');
+});
+
+test('Part A — normalizeUserProfile exposes the roles block without a second call', async () => {
+  const { normalizeUserProfile } = await import('../src/five9-users-info.js');
+  const p = normalizeUserProfile({
+    name: 'Level 1 Setter Profile',
+    description: 'LightFire setters',
+    IEXScheduled: 'false',
+    roles: { agent: { permissions: [{ type: 'CanRunWebClient', value: 'true' }] } },
+    skills: ['Dispatch', 'Rehash'],
+    users: ['dellis1', 'jdennis1'],
+  });
+  assert.equal(p.name, 'Level 1 Setter Profile');
+  // The whole point of the read: a caller can see what the profile GRANTS.
+  assert.deepEqual(p.roles.assigned, ['agent']);
+  assert.deepEqual(p.roles.permissions.agent, [{ type: 'CanRunWebClient', value: true }]);
+  assert.deepEqual(p.skills, ['Dispatch', 'Rehash']);
+  assert.deepEqual(p.users, ['dellis1', 'jdennis1']);
+  assert.equal(p.IEXScheduled, false);
+  // raw is retained because it is the lossless base a modify rebuilds from.
+  assert.ok(p.raw && p.raw.roles);
+});
+
+test('Part A — an admin-granting profile is visible as such from the read alone', async () => {
+  const { normalizeUserProfile } = await import('../src/five9-users-info.js');
+  const p = normalizeUserProfile({ name: 'P', roles: { admin: { permissions: [] }, agent: AGENT_ROLE } });
+  assert.deepEqual(p.roles.assigned.sort(), ['admin', 'agent']);
+});
+
+test('Part B — both lists empty is refused', () => {
+  assert.throws(
+    () => assertSomethingToDo('five9_modify_user_profile_skills', 'add_skills', [], 'remove_skills', []),
+    /at least one of action_payload.add_skills\[\] or action_payload.remove_skills\[\]/,
+  );
+  assert.throws(
+    () => assertSomethingToDo('five9_modify_user_profile_user_list', 'add_users', undefined, 'remove_users', null),
+    /an empty patch is a no-op that still burns an approval/,
+  );
+  assert.doesNotThrow(() => assertSomethingToDo('x', 'add_skills', ['A'], 'remove_skills', []));
+  assert.doesNotThrow(() => assertSomethingToDo('x', 'add_skills', [], 'remove_skills', ['B']));
+});
+
+test('Part B — an unknown profile_name is refused by us, not by Five9', () => {
+  assert.throws(
+    () => assertUserProfileExists('modify_user_profile_skills', 'Levl 1 Setter Profile', null),
+    /user_profile_not_found: Levl 1 Setter Profile/,
+  );
+  const live = { name: 'Level 1 Setter Profile' };
+  assert.equal(assertUserProfileExists('modify_user_profile_skills', 'Level 1 Setter Profile', live), live);
+});
+
+test('Part B — modify_user_profile_user_list refuses a username not in the user inventory', () => {
+  const known = new Set(['dellis1', 'jdennis1', 'ggordon']);
+  assert.doesNotThrow(() => checkAddUsersKnown(['dellis1', 'ggordon'], known));
+  assert.deepEqual(checkAddUsersKnown(['dellis1'], known), { checked: 1, found: 1 });
+  // The typo case this exists for — Five9 would accept it silently.
+  assert.throws(() => checkAddUsersKnown(['dellis1', 'delis1'], known), /unknown Five9 username\(s\) in add_users: delis1/);
+  assert.throws(() => checkAddUsersKnown(['nobody'], known), /unknown Five9 username\(s\)/);
+  // An empty add list is not an error — remove-only is a legitimate patch.
+  assert.doesNotThrow(() => checkAddUsersKnown([], known));
+});
+
+test('Part B — the batch existence probe is anchored and escaped', () => {
+  assert.equal(exactUserAlternationPattern(['dellis1', 'jdennis1']), '^(?:dellis1|jdennis1)$');
+  // Anchoring is what stops "jflanders" matching "jflanders2", same rule as
+  // exactUserPattern; escaping stops a dotted username matching anything.
+  assert.equal(exactUserAlternationPattern(['a.b']), '^(?:a\\.b)$');
+  assert.throws(() => exactUserAlternationPattern([]), /names\[\] is required/);
+});
+
+test('Part C — RMW: every untouched field survives byte-for-byte into the request', () => {
+  // The raw read of a live profile — this is the lossless base.
+  const base = {
+    description: 'LightFire setters',
+    IEXScheduled: 'false',
+    locale: 'en-US',
+    name: 'Level 1 Setter Profile',
+    roles: { agent: AGENT_ROLE },
+    skills: ['Dispatch', 'Rehash'],
+    users: ['dellis1', 'jdennis1', 'ggordon'],
+  };
+  // A caller changes ONLY the description.
+  const merged = mergeUserProfile(base, { description: 'LightFire setters (L1)' }, base.name);
+  const xml = buildUserProfileXml(merged);
+
+  // The change landed...
+  assert.match(xml, /<description>LightFire setters \(L1\)<\/description>/);
+  // ...and nothing else was dropped. modifyUserProfile REPLACES the struct, so
+  // an omission here is a deletion: skills vanish, members detach, roles are
+  // revoked. Assert each survivor explicitly.
+  assert.match(xml, /<locale>en-US<\/locale>/);
+  assert.match(xml, /<skills>Dispatch<\/skills><skills>Rehash<\/skills>/);
+  assert.match(xml, /<users>dellis1<\/users><users>jdennis1<\/users><users>ggordon<\/users>/);
+  // agentRole's three minOccurs="1" booleans in particular — the ones the
+  // NORMALIZED read would have dropped.
+  assert.match(xml, /<alwaysRecorded>true<\/alwaysRecorded>/);
+  assert.match(xml, /<attachVmToEmail>false<\/attachVmToEmail>/);
+  assert.match(xml, /<sendEmailOnVm>false<\/sendEmailOnVm>/);
+  assert.match(xml, /<permissions><type>CanRunWebClient<\/type><value>true<\/value><\/permissions>/);
+  // WSDL sequence order, end to end.
+  assert.match(xml, /^<userProfile><description>.*<IEXScheduled>.*<locale>.*<name>.*<roles>.*<skills>.*<users>.*<\/userProfile>$/);
+});
+
+test('Part C — a rename cannot ride in through changes', () => {
+  const merged = mergeUserProfile({ name: 'Level 1 Setter Profile' }, { name: 'Something Else' }, 'Level 1 Setter Profile');
+  // Renaming via modify would orphan every user pointing at the old name.
+  assert.equal(merged.name, 'Level 1 Setter Profile');
+});
+
+test('Part C — agentRole missing a required boolean is refused at build time', () => {
+  // Would otherwise silently reset recording/voicemail for every member.
+  assert.throws(() => buildUserProfileXml({ name: 'P', roles: { agent: { permissions: [] } } }), /agent.alwaysRecorded is schema-required/);
+  assert.throws(
+    () => buildUserProfileXml({ name: 'P', roles: { agent: { alwaysRecorded: 'true', attachVmToEmail: 'false', permissions: [] } } }),
+    /agent.sendEmailOnVm is schema-required/,
+  );
+  assert.doesNotThrow(() => buildUserProfileXml({ name: 'P', roles: { agent: AGENT_ROLE } }));
+});
+
+test('Part C — unknown fields are refused, never appended out of order', () => {
+  assert.throws(() => buildUserProfileXml({ name: 'P', notAField: 1 }), /unknown userProfile field\(s\) notAField/);
+  assert.throws(() => buildUserProfileXml({ name: 'P', roles: { wizard: {} } }), /unknown role key\(s\) wizard/);
+  assert.throws(() => buildUserProfileXml({ name: 'P', mediaTypeConfig: { nope: 1 } }), /unknown mediaTypeConfig field\(s\) nope/);
+  assert.throws(() => buildUserProfileXml({}), /userProfile.name is required/);
+});
+
+test('Part C — mediaTypeConfig keeps Five9\'s two misspellings verbatim', () => {
+  const xml = buildUserProfileXml({
+    name: 'P',
+    mediaTypeConfig: { mediaTypes: [{ enabled: 'true', intlligentRouting: 'false', maxAlowed: '3', type: 'CHAT' }] },
+  });
+  // intlligentRouting / maxAlowed are misspelled in Five9's schema, not ours.
+  assert.match(xml, /<intlligentRouting>false<\/intlligentRouting>/);
+  assert.match(xml, /<maxAlowed>3<\/maxAlowed>/);
+  assert.equal(xml.includes('intelligentRouting'), false);
+  assert.equal(xml.includes('maxAllowed'), false);
+  assert.match(xml, /<mediaTypes><enabled>true<\/enabled><intlligentRouting>false<\/intlligentRouting><maxAlowed>3<\/maxAlowed><type>CHAT<\/type><\/mediaTypes>/);
+});
+
+test('Guardrail 12 — admin/supervisor grants need BOTH override and a written legal_basis', () => {
+  const BASIS = 'Approved by Mark 2026-08-21 for the NC supervisor onboarding';
+  const adminGrant = { admin: { permissions: [{ type: 'X', value: true }] } };
+
+  // Neither.
+  let v = checkRoleGrant(adminGrant);
+  assert.equal(v.ok, false);
+  assert.deepEqual(v.granted, ['admin']);
+  assert.equal(v.violations.length, 2, 'both the override and the legal_basis must be reported as missing');
+
+  // Override only.
+  v = checkRoleGrant(adminGrant, { complianceOverride: true });
+  assert.equal(v.ok, false);
+  assert.match(v.violations.join(' '), /legal_basis/);
+
+  // legal_basis only.
+  v = checkRoleGrant(adminGrant, { legalBasis: BASIS });
+  assert.equal(v.ok, false);
+  assert.match(v.violations.join(' '), /compliance_override/);
+
+  // A token justification does not count.
+  assert.equal(checkRoleGrant(adminGrant, { complianceOverride: true, legalBasis: 'ok' }).ok, false);
+  assert.equal(checkRoleGrant(adminGrant, { complianceOverride: true, legalBasis: '   ' }).ok, false);
+
+  // Both, properly.
+  v = checkRoleGrant(adminGrant, { complianceOverride: true, legalBasis: BASIS });
+  assert.equal(v.ok, true);
+  // The verdict carries the justification VERBATIM — this object is what the
+  // executor puts on the audit event, and per the Phase H finding that v13 has
+  // no audit-trail operation, that event is the only record of the grant.
+  assert.equal(v.legal_basis, BASIS);
+  assert.deepEqual(v.granted, ['admin']);
+
+  // supervisor is gated identically, and both at once are reported together.
+  assert.equal(checkRoleGrant({ supervisor: { permissions: [] } }).ok, false);
+  assert.deepEqual(
+    checkRoleGrant({ admin: { permissions: [] }, supervisor: { permissions: [] } }).granted,
+    ['admin', 'supervisor'],
+  );
+  assert.equal(MIN_LEGAL_BASIS_CHARS, 20);
+});
+
+test('Guardrail 12 — what counts as a grant, and what does not', () => {
+  // Absent / null / {} are all indistinguishable from "not granted" once
+  // serialized, so none of them trips the gate.
+  assert.equal(isRolePopulated(undefined), false);
+  assert.equal(isRolePopulated(null), false);
+  assert.equal(isRolePopulated({}), false);
+  // But attaching the role with no fine-grained permissions IS attaching the
+  // role — this is the case a laxer reading would have let through.
+  assert.equal(isRolePopulated({ permissions: [] }), true);
+  assert.equal(isRolePopulated({ permissions: [{ type: 'X', value: true }] }), true);
+
+  assert.equal(checkRoleGrant({ admin: {} }).ok, true, '{} is not a grant');
+  assert.equal(checkRoleGrant({ admin: { permissions: [] } }).ok, false, 'an attached admin role IS a grant');
+
+  // Non-gated roles never require anything.
+  for (const roles of [{ agent: AGENT_ROLE }, { reporting: { permissions: [] } }, { crmManager: { permissions: [] } }, undefined, null, {}]) {
+    assert.equal(checkRoleGrant(roles).ok, true, JSON.stringify(roles));
+  }
+});
+
+test('Guardrail 12 — de-escalation and carry-forward are NOT gated', () => {
+  // The gate reads the SUBMITTED changes.roles, never the merged result.
+  // Carrying an existing admin grant forward untouched means changes.roles is
+  // absent, so nothing trips — if it did, every routine edit to a privileged
+  // profile would demand a legal_basis and the gate would be trained out of
+  // people within a week.
+  const liveBase = { name: 'P', roles: { admin: { permissions: [{ type: 'X', value: true }] }, agent: AGENT_ROLE } };
+  const merged = mergeUserProfile(liveBase, { description: 'new text' }, 'P');
+  assert.equal(checkRoleGrant(undefined).ok, true, 'changes.roles absent — not a new grant');
+  // ...and the carried-forward grant really is still in the request.
+  assert.match(buildUserProfileXml(merged), /<admin><permissions>/);
+  // Dropping admin is de-escalation and is always allowed.
+  assert.equal(checkRoleGrant({ agent: AGENT_ROLE }).ok, true);
+});
+
+test('Part C — confirm_token is required on BOTH create and modify', () => {
+  const NAME = 'Level 1 Setter Profile';
+  assert.equal(requiredConfirmToken('create_user_profile', { profile_name: NAME }), NAME);
+  assert.equal(requiredConfirmToken('modify_user_profile', { profile_name: NAME }), NAME);
+  for (const op of ['create_user_profile', 'modify_user_profile']) {
+    assert.doesNotThrow(() => checkConfirmToken(op, { profile_name: NAME, confirm_token: NAME }));
+    assert.throws(() => checkConfirmToken(op, { profile_name: NAME }), /confirm_token mismatch/, `${op} with no token`);
+    assert.throws(() => checkConfirmToken(op, { profile_name: NAME, confirm_token: 'level 1 setter profile' }), /confirm_token mismatch/, `${op} case mismatch`);
+  }
+  // The narrow patches are deliberately NOT token-gated — they cannot grant a role.
+  assert.equal(requiredConfirmToken('modify_user_profile_skills', { profile_name: NAME }), null);
+  assert.equal(requiredConfirmToken('modify_user_profile_user_list', { profile_name: NAME }), null);
+});
+
+test('Part H — every profile op reads before it writes (dry-run mutates nothing)', async () => {
+  // Same proof as the Phase C dry-run test: with the flag off AND no creds,
+  // each op must fail on its READ, which can only happen if the read runs
+  // before any mutation. A payload-shape refusal here would mean the read was
+  // skipped, so the payloads below are all valid.
+  const saved = { flag: process.env.FIVE9_WRITES_ENABLED, u: process.env.FIVE9_USERNAME, p: process.env.FIVE9_PASSWORD };
+  try {
+    delete process.env.FIVE9_WRITES_ENABLED;
+    delete process.env.FIVE9_USERNAME;
+    delete process.env.FIVE9_PASSWORD;
+    const NAME = 'Level 1 Setter Profile';
+    const cases = [
+      ['five9_modify_user_profile_skills', executeModifyUserProfileSkills, { profile_name: NAME, add_skills: ['Dispatch'] }],
+      ['five9_modify_user_profile_user_list', executeModifyUserProfileUserList, { profile_name: NAME, add_users: ['dellis1'] }],
+      ['five9_create_user_profile', executeCreateUserProfile, { profile_name: NAME, confirm_token: NAME, profile: { name: NAME, roles: { agent: AGENT_ROLE } } }],
+      ['five9_modify_user_profile', executeModifyUserProfile, { profile_name: NAME, confirm_token: NAME, changes: { description: 'x' } }],
+    ];
+    for (const [action_type, fn, action_payload] of cases) {
+      await assert.rejects(
+        fn({ id: 1, action_type, requires_approval: true, action_payload }),
+        /credentials not configured/,
+        `${action_type} must fail on the read, proving nothing mutates in dry-run`,
+      );
+    }
+  } finally {
+    for (const [k, env] of [['flag', 'FIVE9_WRITES_ENABLED'], ['u', 'FIVE9_USERNAME'], ['p', 'FIVE9_PASSWORD']]) {
+      if (saved[k] === undefined) delete process.env[env];
+      else process.env[env] = saved[k];
+    }
+  }
+});
+
+test('Part C — payload-shape refusals fire before the gate is even entered', () => {
+  // These throw synchronously, so no lock is taken and no read is attempted.
+  assert.throws(() => executeModifyUserProfile({ action_payload: { profile_name: 'P' } }), /requires action_payload.changes/);
+  assert.throws(() => executeModifyUserProfile({ action_payload: { profile_name: 'P', changes: {} } }), /empty changes/);
+  assert.throws(() => executeCreateUserProfile({ action_payload: { profile_name: 'P' } }), /requires action_payload.profile/);
+  assert.throws(() => executeModifyUserProfileSkills({ action_payload: {} }), /requires action_payload.profile_name/);
+  assert.throws(() => executeModifyUserProfileUserList({ action_payload: { profile_name: 'P' } }), /at least one of/);
+});
+
+test('Part C — the executors wire legal_basis onto the audit event', async () => {
+  // A source-level assertion, and honest about it: it proves the assignment
+  // exists on both full-object ops, not that Supabase stored the row. The
+  // value itself is pinned by the checkRoleGrant test above. This matters
+  // because "accepts a legal_basis and discards it" would satisfy every
+  // behavioural test while destroying the only record the grant will have.
+  const src = await readFile(new URL('../src/five9/admin-writes.js', import.meta.url), 'utf8');
+  const assignments = src.match(/ctx\.event_extra\.legal_basis = roleGrant\.legal_basis/g) || [];
+  assert.equal(assignments.length, 2, 'both create_user_profile and modify_user_profile must persist legal_basis');
+  assert.match(src, /ctx\.event_extra\.role_grant = roleGrant/);
 });

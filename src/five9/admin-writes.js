@@ -65,6 +65,8 @@ import {
   timerToSeconds,
   returnBlocks,
   tag,
+  asArray,
+  getUsersGeneralInfo,
   // 2026-08-12 Phase F — async import job triad (read-only followers for the
   // job handle asyncDeleteRecordsFromList returns).
   isImportRunning,
@@ -79,7 +81,7 @@ import {
 } from '../five9-admin.js';
 // 2026-08-05 Phase D — read-before-write for user-skill ops. getUsersFullInfo
 // takes a Five9 userNamePattern regex and returns assigned skills with levels.
-import { getUsersFullInfo } from '../five9-users-info.js';
+import { getUsersFullInfo, getUserProfile } from '../five9-users-info.js';
 import { tryAcquireLock, releaseLock, decideLockHeldReschedule } from '../services/outbound-locks.js';
 import { emitEvent } from '../event-emitter.js';
 
@@ -305,6 +307,14 @@ export function requiredConfirmToken(op, payload) {
   // number looks fine from the outside. Restate the campaign.
   if (op === 'remove_dnis_from_campaign') {
     return String(payload?.campaign_name || '').trim();
+  }
+  // 2026-08-21 Phase H — a user profile is shared by construction: "Level 1
+  // Setter Profile" carries five agents at once, so a mistake lands on all of
+  // them simultaneously. modify additionally re-checks the token against the
+  // LIVE profile name inside the executor, which is what makes it a check on
+  // the target rather than on the payload's own spelling.
+  if (op === 'create_user_profile' || op === 'modify_user_profile') {
+    return String(payload?.profile_name || '').trim();
   }
   return null; // op not double-gated
 }
@@ -2583,6 +2593,559 @@ export function executeModifyCampaignProfile(action) {
         patched: Object.keys(patch),
         verified: verify_mismatches.length === 0,
         verify_mismatches,
+      };
+    },
+  );
+}
+
+/* ====================================================================== *
+ * Phase H (2026-08-21) — USER PROFILES.
+ *
+ * A user profile is a named bundle of roles, skills and membership attached
+ * to many users at once. Reece runs two: "Level 1 Setter Profile" (5
+ * LightFire agents) and "Level 2 Setter Profile" (1 NC hire).
+ *
+ * FOUR OPS, TWO RISK CLASSES.
+ *
+ *   NARROW PATCHES — modifyUserProfileSkills / modifyUserProfileUserList.
+ *   Genuine patches: each takes a profile name plus add/remove lists and
+ *   touches nothing else. These cover the actual day-to-day work (onboard a
+ *   setter onto Level 1, adjust which skills its agents route to) and cannot
+ *   alter a role grant at all. Prefer them; reach for the pair below only
+ *   when the profile's own definition has to change.
+ *
+ *   FULL-OBJECT WRITES — createUserProfile / modifyUserProfile. Both take one
+ *   complete <userProfile>. modifyUserProfile REPLACES THE WHOLE STRUCT: any
+ *   field omitted from the submitted object is not "left alone", it is
+ *   dropped. Omit skills and the profile's skills vanish; omit users and
+ *   every member is detached; omit roles and every grant it carries is
+ *   revoked. Read-modify-write is therefore mandatory, not stylistic, and it
+ *   must be built from the RAW read (see the next note).
+ *
+ * WHY RMW USES profile.raw AND NOT THE NORMALIZED READ. normalizeUserProfile
+ * collapses <roles> to { assigned, permissions } for readability, which drops
+ * agentRole's three schema-REQUIRED booleans (alwaysRecorded, attachVmToEmail,
+ * sendEmailOnVm — all minOccurs="1"). Rebuilding a modify from the normalized
+ * shape would emit an agent role missing three required elements: either a
+ * JAXB unmarshalling fault, or worse, a silent reset of three recording and
+ * voicemail settings on every agent carrying the profile. The raw parsed
+ * block is the only lossless base.
+ *
+ * FIELD ORDER IS WSDL-DERIVED (src/five9/wsdl-schema.json, v13.0.00/13,
+ * generated from the live WSDL rather than hand-transcribed):
+ *
+ *   userProfile:    description, IEXScheduled, locale, mediaTypeConfig,
+ *                   name, roles, skills[], users[]
+ *   userRoles:      admin, agent, crmManager, reporting, supervisor
+ *   agentRole:      alwaysRecorded, attachVmToEmail, permissions[], sendEmailOnVm
+ *   other roles:    permissions[]
+ *   *Permission:    type, value
+ *   mediaTypeConfig: mediaTypes[]
+ *   mediaTypeItem:  enabled, intlligentRouting, maxAlowed, type
+ *
+ * TWO MORE FIVE9 MISSPELLINGS, BOTH LOAD-BEARING: `intlligentRouting` and
+ * `maxAlowed` on mediaTypeItem, exactly as `dispostionName` on
+ * campaignCallWrapup and `userProfileNamePatern` on the read side. Emitting
+ * the correct spelling sends an element the server does not know. Do not
+ * "fix" them, and do not let a linter fix them.
+ * ====================================================================== */
+
+export const USER_PROFILE_FIELD_ORDER = [
+  'description', 'IEXScheduled', 'locale', 'mediaTypeConfig', 'name', 'roles', 'skills', 'users',
+];
+export const USER_ROLES_FIELD_ORDER = ['admin', 'agent', 'crmManager', 'reporting', 'supervisor'];
+export const ROLE_FIELD_ORDER = {
+  admin: ['permissions'],
+  agent: ['alwaysRecorded', 'attachVmToEmail', 'permissions', 'sendEmailOnVm'],
+  crmManager: ['permissions'],
+  reporting: ['permissions'],
+  supervisor: ['permissions'],
+};
+// agentRole's minOccurs="1" elements — a modify that drops these silently
+// resets recording/voicemail behavior for every user carrying the profile.
+export const AGENT_ROLE_REQUIRED_FIELDS = ['alwaysRecorded', 'attachVmToEmail', 'sendEmailOnVm'];
+export const MEDIA_TYPE_ITEM_FIELD_ORDER = ['enabled', 'intlligentRouting', 'maxAlowed', 'type'];
+const MEDIA_TYPE_ITEM_BOOLEANS = new Set(['enabled', 'intlligentRouting']);
+
+const xmlBool = (v) => String(v === true || v === 'true');
+
+function permissionsXml(perms) {
+  return asArray(perms).map((p) => {
+    const type = String(p?.type ?? '').trim();
+    if (!type) throw new Error('REFUSED: permission entry missing type');
+    return `<permissions><type>${escapeXml(type)}</type><value>${xmlBool(p?.value)}</value></permissions>`;
+  }).join('');
+}
+
+function roleXml(roleName, node) {
+  const order = ROLE_FIELD_ORDER[roleName];
+  if (!order) throw new Error(`REFUSED: unknown role "${roleName}" — userRoles carries exactly ${USER_ROLES_FIELD_ORDER.join(', ')}`);
+  const n = (node && typeof node === 'object') ? node : {};
+  let inner = '';
+  for (const f of order) {
+    if (f === 'permissions') { inner += permissionsXml(n.permissions); continue; }
+    const v = n[f];
+    if (v === undefined || v === null || v === '') {
+      throw new Error(`REFUSED: ${roleName}.${f} is schema-required (minOccurs="1") and missing — submitting the role without it silently resets that setting for every user carrying this profile. Carry it forward from the read-before-write.`);
+    }
+    inner += `<${f}>${xmlBool(v)}</${f}>`;
+  }
+  return `<${roleName}>${inner}</${roleName}>`;
+}
+
+export function buildUserRolesXml(roles) {
+  if (roles === undefined) return '';
+  if (roles === null) return '<roles/>';
+  if (typeof roles !== 'object' || Array.isArray(roles)) throw new Error('REFUSED: roles must be an object');
+  const unknown = Object.keys(roles).filter(k => !USER_ROLES_FIELD_ORDER.includes(k));
+  if (unknown.length) {
+    throw new Error(`REFUSED: unknown role key(s) ${unknown.join(', ')} — refusing rather than dropping them silently`);
+  }
+  let inner = '';
+  for (const r of USER_ROLES_FIELD_ORDER) {
+    if (!Object.hasOwn(roles, r)) continue; // absent = role not granted
+    inner += roleXml(r, roles[r]);
+  }
+  return `<roles>${inner}</roles>`;
+}
+
+export function buildMediaTypeConfigXml(cfg) {
+  if (cfg === undefined) return '';
+  if (cfg === null) return '<mediaTypeConfig/>';
+  if (typeof cfg !== 'object' || Array.isArray(cfg)) throw new Error('REFUSED: mediaTypeConfig must be an object');
+  const unknown = Object.keys(cfg).filter(k => k !== 'mediaTypes');
+  if (unknown.length) {
+    throw new Error(`REFUSED: unknown mediaTypeConfig field(s) ${unknown.join(', ')} — mediaTypeConfig carries only mediaTypes[]`);
+  }
+  const items = asArray(cfg.mediaTypes).map((it) => {
+    const src = (it && typeof it === 'object') ? it : {};
+    const bad = Object.keys(src).filter(k => !MEDIA_TYPE_ITEM_FIELD_ORDER.includes(k));
+    if (bad.length) throw new Error(`REFUSED: unknown mediaTypeItem field(s) ${bad.join(', ')}`);
+    let inner = '';
+    for (const f of MEDIA_TYPE_ITEM_FIELD_ORDER) {
+      const v = src[f];
+      if (v === undefined || v === null || v === '') continue;
+      inner += `<${f}>${MEDIA_TYPE_ITEM_BOOLEANS.has(f) ? xmlBool(v) : escapeXml(v)}</${f}>`;
+    }
+    return `<mediaTypes>${inner}</mediaTypes>`;
+  }).join('');
+  return `<mediaTypeConfig>${items}</mediaTypeConfig>`;
+}
+
+/**
+ * buildUserProfileXml — the COMPLETE <userProfile> element, in WSDL order.
+ *
+ * Used by BOTH createUserProfile and modifyUserProfile: the WSDL request
+ * wrappers are identical (one element, name="userProfile", type="userProfile"),
+ * exactly as create/modifyCampaignProfile share buildCampaignProfileXml.
+ *
+ * Refuses any field it has no order for rather than appending it. An
+ * out-of-order element is a JAXB unmarshalling fault, and a silently dropped
+ * one is worse — on modify it is a deletion.
+ */
+export function buildUserProfileXml(profile) {
+  if (!profile || typeof profile !== 'object') throw new Error('userProfile object is required');
+  const name = String(profile.name ?? '').trim();
+  if (!name) throw new Error('userProfile.name is required');
+  const unknown = Object.keys(profile).filter(k => !USER_PROFILE_FIELD_ORDER.includes(k));
+  if (unknown.length) {
+    throw new Error(`REFUSED: unknown userProfile field(s) ${unknown.join(', ')} — userProfile carries exactly ${USER_PROFILE_FIELD_ORDER.join(', ')}`);
+  }
+  let inner = '';
+  for (const f of USER_PROFILE_FIELD_ORDER) {
+    if (!Object.hasOwn(profile, f)) continue;
+    const v = profile[f];
+    if (f === 'roles') { inner += buildUserRolesXml(v); continue; }
+    if (f === 'mediaTypeConfig') { inner += buildMediaTypeConfigXml(v); continue; }
+    if (f === 'skills' || f === 'users') {
+      inner += asArray(v)
+        .map(s => String(s ?? '').trim()).filter(Boolean)
+        .map(s => `<${f}>${escapeXml(s)}</${f}>`).join('');
+      continue;
+    }
+    if (v === null || v === undefined) continue;
+    inner += `<${f}>${f === 'IEXScheduled' ? xmlBool(v) : escapeXml(v)}</${f}>`;
+  }
+  return `<userProfile>${inner}</userProfile>`;
+}
+
+export function buildModifyUserProfileSkillsXml(profileName, addSkills, removeSkills) {
+  const name = String(profileName || '').trim();
+  if (!name) throw new Error('profile_name is required');
+  const list = (arr, tag) => asArray(arr)
+    .map(s => String(s ?? '').trim()).filter(Boolean)
+    .map(s => `<${tag}>${escapeXml(s)}</${tag}>`).join('');
+  return `<userProfileName>${escapeXml(name)}</userProfileName>${list(addSkills, 'addSkills')}${list(removeSkills, 'removeSkills')}`;
+}
+
+export function buildModifyUserProfileUserListXml(profileName, addUsers, removeUsers) {
+  const name = String(profileName || '').trim();
+  if (!name) throw new Error('profile_name is required');
+  const list = (arr, tag) => asArray(arr)
+    .map(s => String(s ?? '').trim()).filter(Boolean)
+    .map(s => `<${tag}>${escapeXml(s)}</${tag}>`).join('');
+  return `<userProfileName>${escapeXml(name)}</userProfileName>${list(addUsers, 'addUsers')}${list(removeUsers, 'removeUsers')}`;
+}
+
+/* ---------------------------------------------------------------------- *
+ * Guardrail 12 (2026-08-21) — role-grant protection.
+ *
+ * A profile granting `admin` or `supervisor` hands that access to EVERY user
+ * carrying it, domain-wide, the moment the write lands. That is the same
+ * class of exposure already sitting open and un-reviewed on ssmith3 and
+ * swebster; this op family must not become a second, automated way to
+ * create it.
+ *
+ * Deliberately STRICTER than the bulk-delete gate. That one takes
+ * compliance_override + confirm_token + a numeric ceiling. This one adds a
+ * written legal_basis, persisted verbatim to the audit event, because the
+ * blast radius is domain-wide admin AND — per the Phase H finding that the
+ * v13 Admin API has no audit-trail operation at all (getAgentAuditReport
+ * does not exist) — that audit event is the ONLY record this grant will ever
+ * have. There is nothing to reconstruct it from afterwards.
+ *
+ * WHAT COUNTS AS POPULATED. Absent, null, or {} is fine — {} is
+ * indistinguishable from absent once serialized. Anything with content is a
+ * grant and needs the override, INCLUDING { permissions: [] }: attaching the
+ * admin role with no fine-grained permissions still attaches the admin role.
+ *
+ * WHAT IS CHECKED. The `changes.roles` a caller SUBMITS, never the merged
+ * result. Carrying an existing grant forward untouched through a
+ * read-modify-write is not a new grant and must not trip the gate — if it
+ * did, every routine edit to an already-privileged profile would demand a
+ * legal_basis and the gate would be trained out of people within a week.
+ * Dropping a role is de-escalation and is always allowed.
+ * ---------------------------------------------------------------------- */
+
+export const ROLE_GRANT_GATED_ROLES = ['admin', 'supervisor'];
+
+// A justification has to actually justify. One character satisfies "a string
+// is present" while recording nothing, and this event is the only record.
+export const MIN_LEGAL_BASIS_CHARS = Math.max(
+  1,
+  parseInt(process.env.FIVE9_MIN_LEGAL_BASIS_CHARS || '20', 10),
+);
+
+export function isRolePopulated(node) {
+  if (node === undefined || node === null) return false;
+  if (typeof node !== 'object') return true;
+  return Object.keys(node).length > 0;
+}
+
+export function checkRoleGrant(rolesBlock, { complianceOverride = false, legalBasis = '' } = {}) {
+  const granted = ROLE_GRANT_GATED_ROLES.filter(r => isRolePopulated(rolesBlock?.[r]));
+  if (!granted.length) return { ok: true, granted: [], violations: [], legal_basis: null };
+  const basis = String(legalBasis ?? '').trim();
+  const violations = [];
+  if (complianceOverride !== true) {
+    violations.push(`grants ${granted.join(' + ')} — requires explicit compliance_override: true`);
+  }
+  if (basis.length < MIN_LEGAL_BASIS_CHARS) {
+    violations.push(`grants ${granted.join(' + ')} — requires a written legal_basis of at least ${MIN_LEGAL_BASIS_CHARS} characters, recorded verbatim on the audit event (the Admin API has no audit trail of its own, so this is the only record)`);
+  }
+  return {
+    ok: violations.length === 0,
+    granted,
+    violations,
+    legal_basis: basis || null,
+    overridden: violations.length === 0,
+  };
+}
+
+/** Anchored alternation so a batch of usernames costs ONE read, not N. */
+export function exactUserAlternationPattern(names) {
+  const list = asArray(names).map(n => String(n ?? '').trim()).filter(Boolean);
+  if (!list.length) throw new Error('names[] is required');
+  return `^(?:${list.map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})$`;
+}
+
+/* ---------------------------------------------------------------------- *
+ * Phase H executes — user profiles.
+ *
+ * All four share one existence guard: read the profile by exact name FIRST
+ * and refuse if it is absent, rather than letting Five9's own error be the
+ * only signal. A mistyped profile name is the most likely way any of these
+ * goes wrong, and modifyUserProfileUserList in particular can accept a
+ * request that does nothing useful without complaining loudly.
+ * ---------------------------------------------------------------------- */
+
+/**
+ * The existence guard, pure and exported so it is provable offline.
+ * Every profile op reads by exact name FIRST and refuses when absent, rather
+ * than letting Five9's own error be the only signal — a mistyped profile name
+ * is the likeliest way any of these goes wrong.
+ */
+export function assertUserProfileExists(subtype, profileName, profile) {
+  if (!profile) {
+    throw new Error(`REFUSED: user_profile_not_found: ${profileName} — read five9_get_user_profiles and restate the name exactly (${subtype})`);
+  }
+  return profile;
+}
+
+async function readUserProfileOrThrow(subtype, profileName) {
+  return assertUserProfileExists(subtype, profileName, await getUserProfile(profileName));
+}
+
+/**
+ * Cross-check the usernames being ADDED against the live user inventory.
+ * Pure over the known set, so the refusal is testable without a SOAP call.
+ *
+ * Five9 accepts an unknown username on modifyUserProfileUserList without
+ * erroring: the call reports success and the profile simply never lands on
+ * anybody. A typo would look like a completed onboarding.
+ */
+export function checkAddUsersKnown(addUsers, knownUserNames) {
+  const known = knownUserNames instanceof Set ? knownUserNames : new Set(asArray(knownUserNames).map(String));
+  const wanted = asArray(addUsers).map(u => String(u ?? '').trim()).filter(Boolean);
+  const missing = wanted.filter(u => !known.has(u));
+  if (missing.length) {
+    throw new Error(`REFUSED: unknown Five9 username(s) in add_users: ${missing.join(', ')} — verified against getUsersGeneralInfo before submitting, because Five9 accepts an unknown username here without erroring and the profile simply never lands`);
+  }
+  return { checked: wanted.length, found: wanted.length };
+}
+
+/**
+ * Merge a modify's `changes` onto the RAW read. Pure and exported because
+ * this function IS the read-modify-write contract: modifyUserProfile replaces
+ * the whole struct, so every field of `base` that `changes` does not name has
+ * to survive into the submitted object untouched.
+ *
+ * `name` is pinned to the live profile's own spelling — a rename via this
+ * path would read as "create a different profile and orphan this one".
+ */
+export function mergeUserProfile(base, changes, liveName) {
+  const b = (base && typeof base === 'object') ? base : {};
+  const c = (changes && typeof changes === 'object') ? changes : {};
+  return { ...b, ...c, name: liveName };
+}
+
+const trimmedList = (v) => asArray(v).map(s => String(s ?? '').trim()).filter(Boolean);
+
+export function assertSomethingToDo(subtype, addField, addList, removeField, removeList) {
+  if (!asArray(addList).length && !asArray(removeList).length) {
+    throw new Error(`REFUSED: ${subtype} requires at least one of action_payload.${addField}[] or action_payload.${removeField}[] to be non-empty — an empty patch is a no-op that still burns an approval`);
+  }
+}
+
+export function executeModifyUserProfileSkills(action) {
+  const payload = action.action_payload || {};
+  const name = String(payload.profile_name || '').trim();
+  if (!name) throw new Error('five9_modify_user_profile_skills requires action_payload.profile_name');
+  const addSkills = trimmedList(payload.add_skills);
+  const removeSkills = trimmedList(payload.remove_skills);
+  assertSomethingToDo('five9_modify_user_profile_skills', 'add_skills', addSkills, 'remove_skills', removeSkills);
+
+  return withFive9WriteGate(
+    { action, subtype: 'modify_user_profile_skills', entityType: 'five9_user_profile', entityId: name },
+    async (ctx) => {
+      const before = await readUserProfileOrThrow('modify_user_profile_skills', name);
+      ctx.previous_state = { name: before.name, skills: before.skills, roles: before.roles.assigned };
+
+      const bodyXml = buildModifyUserProfileSkillsXml(before.name, addSkills, removeSkills);
+      await ctx.soap('modifyUserProfileSkills', bodyXml);
+      if (ctx.dry_run) return { profile: before.name, add_skills: addSkills, remove_skills: removeSkills, previewed: true };
+
+      const after = await getUserProfile(before.name);
+      ctx.new_state = after ? { name: after.name, skills: after.skills, roles: after.roles.assigned } : null;
+      const now = new Set(after?.skills || []);
+      const verify_mismatches = [
+        ...addSkills.filter(s => !now.has(s)).map(s => ({ skill: s, expected: 'present', actual: 'absent' })),
+        ...removeSkills.filter(s => now.has(s)).map(s => ({ skill: s, expected: 'absent', actual: 'present' })),
+      ];
+      ctx.event_extra.verify_mismatches = verify_mismatches;
+      return {
+        profile: before.name,
+        add_skills: addSkills,
+        remove_skills: removeSkills,
+        skill_count: after?.skills?.length ?? null,
+        verified: verify_mismatches.length === 0,
+        ...(verify_mismatches.length ? { verify_mismatches } : {}),
+      };
+    },
+  );
+}
+
+export function executeModifyUserProfileUserList(action) {
+  const payload = action.action_payload || {};
+  const name = String(payload.profile_name || '').trim();
+  if (!name) throw new Error('five9_modify_user_profile_user_list requires action_payload.profile_name');
+  const addUsers = trimmedList(payload.add_users);
+  const removeUsers = trimmedList(payload.remove_users);
+  assertSomethingToDo('five9_modify_user_profile_user_list', 'add_users', addUsers, 'remove_users', removeUsers);
+
+  return withFive9WriteGate(
+    { action, subtype: 'modify_user_profile_user_list', entityType: 'five9_user_profile', entityId: name },
+    async (ctx) => {
+      const before = await readUserProfileOrThrow('modify_user_profile_user_list', name);
+      ctx.previous_state = { name: before.name, users: before.users, roles: before.roles.assigned };
+
+      // Every username being ADDED must exist. Five9 does not reliably error
+      // on an unknown one, so a typo would report success and silently leave
+      // the setter without the profile — the failure mode this guard exists
+      // for. One anchored-alternation read covers the whole batch.
+      if (addUsers.length) {
+        const res = await getUsersGeneralInfo(exactUserAlternationPattern(addUsers));
+        const known = new Set((res?.users || []).map(u => String(u.userName ?? '')));
+        // Membership is confirmed LOCALLY against the returned names, so an
+        // over-matching pattern cannot manufacture a false positive.
+        ctx.event_extra.add_users_verified = checkAddUsersKnown(addUsers, known);
+      }
+      // removeUsers is deliberately NOT existence-checked: removing a user
+      // who is already absent is a harmless no-op, and refusing it would
+      // block cleanup of a profile that outlived a deleted account.
+
+      const bodyXml = buildModifyUserProfileUserListXml(before.name, addUsers, removeUsers);
+      await ctx.soap('modifyUserProfileUserList', bodyXml);
+      if (ctx.dry_run) return { profile: before.name, add_users: addUsers, remove_users: removeUsers, previewed: true };
+
+      const after = await getUserProfile(before.name);
+      ctx.new_state = after ? { name: after.name, users: after.users, roles: after.roles.assigned } : null;
+      const now = new Set(after?.users || []);
+      const verify_mismatches = [
+        ...addUsers.filter(u => !now.has(u)).map(u => ({ user: u, expected: 'member', actual: 'absent' })),
+        ...removeUsers.filter(u => now.has(u)).map(u => ({ user: u, expected: 'absent', actual: 'member' })),
+      ];
+      ctx.event_extra.verify_mismatches = verify_mismatches;
+      return {
+        profile: before.name,
+        add_users: addUsers,
+        remove_users: removeUsers,
+        member_count: after?.users?.length ?? null,
+        verified: verify_mismatches.length === 0,
+        ...(verify_mismatches.length ? { verify_mismatches } : {}),
+      };
+    },
+  );
+}
+
+export function executeCreateUserProfile(action) {
+  const payload = action.action_payload || {};
+  const name = String(payload.profile_name || '').trim();
+  if (!name) throw new Error('five9_create_user_profile requires action_payload.profile_name');
+  const profile = payload.profile;
+  if (!profile || typeof profile !== 'object') {
+    throw new Error('five9_create_user_profile requires action_payload.profile (the full userProfile object)');
+  }
+
+  return withFive9WriteGate(
+    { action, subtype: 'create_user_profile', entityType: 'five9_user_profile', entityId: name },
+    async (ctx) => {
+      checkConfirmToken('create_user_profile', payload);
+
+      // On create there is no "before" to diff against, so the role check
+      // runs over the WHOLE submitted roles block rather than a delta.
+      const roleGrant = checkRoleGrant(profile.roles, {
+        complianceOverride: payload.compliance_override === true,
+        legalBasis: payload.legal_basis,
+      });
+      ctx.event_extra.role_grant = roleGrant;
+      if (roleGrant.legal_basis) ctx.event_extra.legal_basis = roleGrant.legal_basis;
+      if (!roleGrant.ok) {
+        throw new Error(`REFUSED: role grant — ${roleGrant.violations.join('; ')}`);
+      }
+
+      const bodyXml = buildUserProfileXml({ ...profile, name });
+
+      const existing = await getUserProfile(name);
+      if (existing) return { skipped: true, reason: 'user_profile_already_exists', profile: name };
+      ctx.previous_state = null;
+
+      await ctx.soap('createUserProfile', bodyXml);
+      if (ctx.dry_run) return { profile: name, created: false, previewed: true, role_grant: roleGrant };
+
+      const after = await getUserProfile(name);
+      ctx.new_state = after;
+      return { profile: name, created: !!after, roles_granted: after?.roles?.assigned ?? [], role_grant: roleGrant };
+    },
+  );
+}
+
+/**
+ * modifyUserProfile — READ-MODIFY-WRITE, mandatory.
+ *
+ * The API replaces the whole struct, so the submitted object is rebuilt from
+ * the raw read and only the fields named in changes are overlaid. Every
+ * untouched field is carried forward byte-for-byte; anything omitted from
+ * the merge would be a deletion, not a no-op.
+ */
+export function executeModifyUserProfile(action) {
+  const payload = action.action_payload || {};
+  const name = String(payload.profile_name || '').trim();
+  if (!name) throw new Error('five9_modify_user_profile requires action_payload.profile_name');
+  const changes = payload.changes;
+  if (!changes || typeof changes !== 'object' || Array.isArray(changes)) {
+    throw new Error('five9_modify_user_profile requires action_payload.changes (an object of userProfile fields to overlay)');
+  }
+  if (!Object.keys(changes).length) {
+    throw new Error('REFUSED: five9_modify_user_profile with empty changes — an empty patch is a no-op that still burns an approval');
+  }
+
+  return withFive9WriteGate(
+    { action, subtype: 'modify_user_profile', entityType: 'five9_user_profile', entityId: name },
+    async (ctx) => {
+      checkConfirmToken('modify_user_profile', payload);
+
+      // Only the roles a caller SUBMITS are gated. Carrying an existing grant
+      // forward untouched is not a new grant — see Guardrail 12.
+      const roleGrant = checkRoleGrant(changes.roles, {
+        complianceOverride: payload.compliance_override === true,
+        legalBasis: payload.legal_basis,
+      });
+      ctx.event_extra.role_grant = roleGrant;
+      if (roleGrant.legal_basis) ctx.event_extra.legal_basis = roleGrant.legal_basis;
+      if (!roleGrant.ok) {
+        throw new Error(`REFUSED: role grant — ${roleGrant.violations.join('; ')}`);
+      }
+
+      const before = await readUserProfileOrThrow('modify_user_profile', name);
+      ctx.previous_state = before;
+
+      // confirm_token must restate the EXISTING profile's name verbatim, not
+      // merely the payload's own spelling — that is what makes it a check on
+      // the live target rather than a check on itself.
+      if (String(payload.confirm_token ?? '') !== String(before.name ?? '')) {
+        throw new Error(`REFUSED: confirm_token must exactly equal the existing profile name "${before.name}" (Five9's spelling, including case)`);
+      }
+
+      // RMW from the RAW block: the normalized read drops agentRole's three
+      // schema-required booleans, and rebuilding from it would reset them.
+      const base = (before.raw && typeof before.raw === 'object') ? before.raw : {};
+      const merged = mergeUserProfile(base, changes, before.name);
+      const bodyXml = buildUserProfileXml(merged);
+      ctx.event_extra.changed_fields = Object.keys(changes);
+
+      await ctx.soap('modifyUserProfile', bodyXml);
+      if (ctx.dry_run) {
+        return { profile: before.name, modified: false, previewed: true, changed_fields: Object.keys(changes), role_grant: roleGrant };
+      }
+
+      const after = await getUserProfile(before.name);
+      ctx.new_state = after;
+
+      // Verify against INTENT: every field named in changes must read back as
+      // submitted, and the fields that were NOT touched must be unchanged.
+      const canon = (v) => JSON.stringify(v ?? null);
+      const verify_mismatches = [];
+      for (const f of Object.keys(changes)) {
+        const expected = merged[f];
+        const actual = after?.raw?.[f];
+        if (canon(expected) !== canon(actual)) verify_mismatches.push({ field: f, expected, actual });
+      }
+      for (const f of USER_PROFILE_FIELD_ORDER) {
+        if (Object.hasOwn(changes, f)) continue;
+        if (canon(base[f]) !== canon(after?.raw?.[f])) {
+          verify_mismatches.push({ field: f, untouched: true, expected: base[f], actual: after?.raw?.[f] });
+        }
+      }
+      ctx.event_extra.verify_mismatches = verify_mismatches;
+      return {
+        profile: before.name,
+        modified: true,
+        changed_fields: Object.keys(changes),
+        roles_granted: after?.roles?.assigned ?? [],
+        verified: verify_mismatches.length === 0,
+        ...(verify_mismatches.length ? { verify_mismatches } : {}),
+        role_grant: roleGrant,
       };
     },
   );

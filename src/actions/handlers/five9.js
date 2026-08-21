@@ -1,7 +1,7 @@
 /**
  * Five9 admin write handler — src/actions/handlers/five9.js
  *
- * One dispatcher for all twenty five9_* write action types. The real work
+ * One dispatcher for all twenty-four five9_* write action types. The real work
  * (guardrails, serialization lock, read-before-write, audit events) lives
  * in src/five9/admin-writes.js — this file is only the executor-facing
  * seam plus the belt-and-braces approval check.
@@ -39,6 +39,12 @@ import {
   executeAddDnisToCampaign,
   executeRemoveDnisFromCampaign,
   executeCreatePromptTts,
+  // 2026-08-21 Phase H — user profiles. The two narrow patches are the
+  // day-to-day ops; the full-object pair carries Guardrail 12 (role grants).
+  executeModifyUserProfileSkills,
+  executeModifyUserProfileUserList,
+  executeCreateUserProfile,
+  executeModifyUserProfile,
 } from '../../five9/admin-writes.js';
 
 const FIVE9_WRITE_OPS = {
@@ -77,6 +83,14 @@ const FIVE9_WRITE_OPS = {
   five9_add_dnis_to_campaign: executeAddDnisToCampaign,
   five9_remove_dnis_from_campaign: executeRemoveDnisFromCampaign,
   five9_create_prompt_tts: executeCreatePromptTts,
+  // 2026-08-21 Phase H — user profiles. Prefer the two narrow patches: they
+  // cover onboarding a setter and adjusting skill routing, and cannot touch a
+  // role grant at all. The full-object pair REPLACES the whole struct, so it
+  // read-modify-writes and is gated on role grants (Guardrail 12).
+  five9_modify_user_profile_skills: executeModifyUserProfileSkills,
+  five9_modify_user_profile_user_list: executeModifyUserProfileUserList,
+  five9_create_user_profile: executeCreateUserProfile,
+  five9_modify_user_profile: executeModifyUserProfile,
 };
 
 export async function executeFive9Write(action) {

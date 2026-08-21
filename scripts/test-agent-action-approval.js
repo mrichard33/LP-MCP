@@ -29,8 +29,9 @@ process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test-key';
 const { resolveRequiresApproval } = await import('../src/tools/agent-tools.js');
 
 // Every five9_* action type registered in src/actions/handlers/five9.js.
-// Twenty of them as of 2026-08-21, when five9_remove_numbers_from_dnc was
-// deleted (see REMOVED_ACTION_TYPES below).
+// Twenty-four of them as of 2026-08-21: twenty-one shipped, minus
+// five9_remove_numbers_from_dnc (deleted — see REMOVED_ACTION_TYPES below),
+// plus the four Phase H user-profile ops.
 const FIVE9_WRITE_TYPES = [
   'five9_start_campaign',
   'five9_stop_campaign',
@@ -53,6 +54,11 @@ const FIVE9_WRITE_TYPES = [
   'five9_add_dnis_to_campaign',
   'five9_remove_dnis_from_campaign',
   'five9_create_prompt_tts',
+  // 2026-08-21 Phase H — user profiles
+  'five9_modify_user_profile_skills',
+  'five9_modify_user_profile_user_list',
+  'five9_create_user_profile',
+  'five9_modify_user_profile',
 ];
 
 test('every five9_* write is coerced to requires_approval:true, however it was queued', () => {
@@ -80,6 +86,20 @@ test('the Phase G config surface is covered — all seven, by name', () => {
     'five9_remove_dnis_from_campaign', 'five9_create_prompt_tts',
   ]) {
     assert.equal(resolveRequiresApproval(actionType, false).requiresApproval, true, actionType);
+  }
+});
+
+test('the Phase H user-profile surface is covered — all four, by name', () => {
+  // Named explicitly for the same reason as Phase G above: deleting one from
+  // FIVE9_WRITE_TYPES must not quietly drop its coverage. These matter more
+  // than most — five9_modify_user_profile can grant domain-wide admin, and
+  // the coercion is what guarantees a human sees it before it executes.
+  for (const actionType of [
+    'five9_modify_user_profile_skills', 'five9_modify_user_profile_user_list',
+    'five9_create_user_profile', 'five9_modify_user_profile',
+  ]) {
+    assert.equal(resolveRequiresApproval(actionType, false).requiresApproval, true, actionType);
+    assert.equal(resolveRequiresApproval(actionType, false).coerced, true, actionType);
   }
 });
 
@@ -115,19 +135,19 @@ test('D1 — removed action types are absent from ACTION_HANDLERS entirely', asy
   }
 });
 
-test('D1 — the registry holds exactly the 56 documented action types', async () => {
+test('D1 — the registry holds exactly the 60 documented action types', async () => {
   const { ACTION_HANDLERS } = await import('../src/actions/index.js');
   const types = Object.keys(ACTION_HANDLERS);
   // The header comment in src/actions/index.js enumerates these by name. It
   // had drifted to a stated 45 while the registry held 57; pinning the count
   // here is what makes the next drift a test failure instead of a surprise.
-  assert.equal(types.length, 56);
-  assert.equal(types.filter(t => t.startsWith('five9_')).length, 20);
+  assert.equal(types.length, 60);
+  assert.equal(types.filter(t => t.startsWith('five9_')).length, 24);
   // Every type the coercion loop covers must actually be dispatchable.
   for (const actionType of FIVE9_WRITE_TYPES) {
     assert.equal(typeof ACTION_HANDLERS[actionType], 'function', `${actionType} is asserted below but not registered`);
   }
-  assert.equal(FIVE9_WRITE_TYPES.length, 20);
+  assert.equal(FIVE9_WRITE_TYPES.length, 24);
 });
 
 test('non-Five9 actions keep their caller-supplied value exactly', () => {
