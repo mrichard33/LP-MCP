@@ -92,6 +92,14 @@ const FUNCTION_GROUPS = {
   message_analyzer: 'decision_engine',   // src/message-analyzer.js
   message_score: 'decision_engine',      // src/message-content-scorer.js (legacy MESSAGE_SCORE_MODEL)
   intent_classifier: 'decision_engine',  // src/knowledge/intent-classifier.js
+  // Call Intelligence — structured extraction from a call transcript.
+  // NOTE the env trap: the legacy `<FN>_MODEL` var for this key is
+  // CI_ANALYSIS_MODEL, and per the resolution rules above it is read as the
+  // ANTHROPIC model. Setting it to an OpenAI id (the handoff's original
+  // default was 'gpt-4o-mini') sends that id to Anthropic. Point this fn at
+  // OpenAI with CI_ANALYSIS_PROVIDER + CI_ANALYSIS_MODEL_OPENAI, or leave it
+  // on the decision_engine group. See src/ci/analyze.js.
+  ci_analysis: 'decision_engine',        // src/ci/analyze.js
   // Operational read on a backstop sweep — team GroupMe only, never a
   // customer. There is no internal/operational tier, so it rides the
   // decision-engine group (already pointed at a model on Railway via

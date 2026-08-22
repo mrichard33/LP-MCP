@@ -80,8 +80,14 @@ export function parseConfig(env = process.env) {
     transferRecordingEnabledFrom: env.CI_TRANSFER_RECORDING_ENABLED_FROM || null,
 
     transcribeModel: env.CI_TRANSCRIBE_MODEL || 'gpt-4o-mini-transcribe',
-    analysisModel: env.CI_ANALYSIS_MODEL || 'gpt-4o-mini',
     promptVersion: env.CI_PROMPT_VERSION || 'v1',
+
+    // Which channel of a 2-channel recording is the agent. UNVERIFIED against
+    // a real Five9 stereo file — see the warning on agentChannel() in
+    // transcribe.js. Wrong, it swaps the speaker label on every labelled line
+    // of every transcript without failing, so it is a named, testable value
+    // rather than a constant inside the merge.
+    stereoAgentChannel: intSigned(env.CI_STEREO_AGENT_CHANNEL, 0) === 1 ? 1 : 0,
 
     sftp: {
       host: env.CI_SFTP_HOST || 'nas1.etgts.com',

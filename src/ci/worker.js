@@ -23,6 +23,8 @@ import { runSQL } from '../admin/supabase-admin.js';
 import { getConfig, nextRetryAt } from './config.js';
 import { createSftpAdapter, createManualAdapter, describeRecording, matchRecordingToCall, storeAudio, sha256Hex } from './recordings.js';
 import { dateDirFor, last4 } from './time.js';
+import { transcribeCall, createOpenAITranscriber, createStorageAudioLoader } from './transcribe.js';
+import { analyzeTranscript } from './analyze.js';
 
 const LOG = '[CIWorker]';
 
@@ -225,6 +227,136 @@ export async function stageFetchRecording(call, { db = supabase, cfg = getConfig
 }
 
 /**
+ * Insert a ci_summaries row as the current one.
+ *
+ * ci_summaries_current_uq is `UNIQUE (call_id) WHERE is_current`, so a re-run
+ * MUST demote the existing row before inserting or the insert violates the
+ * index. Demote-then-insert (never delete): the superseded analysis stays as
+ * the audit trail of what the pipeline previously believed about this call,
+ * which is the whole reason the table is append-only with a current flag
+ * instead of one mutable row.
+ *
+ * Not a transaction — PostgREST gives us no cross-statement one. The failure
+ * mode is therefore "demoted but not inserted", i.e. a call with no current
+ * summary. That is loud and recoverable (the stage re-runs and inserts one);
+ * the opposite order would risk violating the index and failing the insert
+ * every time, which is neither.
+ */
+export async function insertCurrentSummary(db, callId, row) {
+  const { error: demoteErr } = await db
+    .from('ci_summaries')
+    .update({ is_current: false })
+    .eq('call_id', callId)
+    .eq('is_current', true);
+  if (demoteErr) throw new Error(`ci_summaries demote failed: ${demoteErr.message}`);
+
+  const { error } = await db.from('ci_summaries').insert({ ...row, is_current: true });
+  if (error) throw new Error(`ci_summaries insert failed: ${error.message}`);
+}
+
+/**
+ * Stage: fetched → transcribed.
+ *
+ * A call can own several recording files (holds split one conversation into
+ * segments); transcribeCall orders and concatenates them. The audio object is
+ * NOT purged here — §6 purges after the transcript is committed AND the
+ * retention window has passed, which is purgeExpiredAudio's job, not this
+ * stage's. Deleting it here would destroy the only copy we control the moment
+ * a transcript we might still reject is written.
+ */
+export async function stageTranscribe(call, { db = supabase, cfg = getConfig(), transcriber, loadAudio, now = new Date() } = {}) {
+  const { data: recordings, error } = await db
+    .from('ci_recordings')
+    .select('*')
+    .eq('call_id', call.id)
+    .eq('excluded', false);
+  if (error) throw new Error(`ci_recordings read failed: ${error.message}`);
+
+  if (!recordings || recordings.length === 0) {
+    // Reached 'fetched' with nothing linked — an inconsistency, not a retry
+    // case. A human should see why rather than the worker spinning on backoff.
+    await sendToReview(db, call, 'transcribe', 'no_recording_rows', { note: 'call is fetched but has no usable ci_recordings' });
+    return { outcome: 'review', reason: 'no_recording_rows' };
+  }
+
+  const row = await transcribeCall(call, recordings, {
+    transcriber: transcriber || createOpenAITranscriber(),
+    loadAudio: loadAudio || createStorageAudioLoader({ db }),
+    cfg,
+  });
+
+  const { error: insErr } = await db
+    .from('ci_transcripts')
+    .upsert(row, { onConflict: 'call_id' });
+  if (insErr) throw new Error(`ci_transcripts upsert failed: ${insErr.message}`);
+
+  await advance(db, call, 'transcribe', 'transcribed', {
+    diarization: row.diarization_method,
+    audio_seconds: row.audio_seconds,
+    low_confidence: row.low_confidence,
+    segments: Array.isArray(row.segments) ? row.segments.length : 0,
+    phone: last4(call.ani),
+  });
+  return { outcome: 'advanced', to: 'transcribed', low_confidence: row.low_confidence };
+}
+
+/**
+ * Stage: transcribed → analyzed.
+ *
+ * An invalid AI output after MAX_ANALYSIS_ATTEMPTS is a REVIEW outcome, not a
+ * failure: retrying it on backoff would burn tokens re-asking a model that has
+ * already declined to answer in the required shape twice. §7 names the reason
+ * `ai_output_invalid`.
+ *
+ * A valid analysis that trips a review trigger still gets STORED and still
+ * advances — the summary is real and a reviewer needs to read it. The call
+ * then goes to review carrying its flags, rather than being discarded.
+ */
+export async function stageAnalyze(call, { db = supabase, cfg = getConfig(), callJson, now = new Date() } = {}) {
+  const { data: transcript, error } = await db
+    .from('ci_transcripts')
+    .select('*')
+    .eq('call_id', call.id)
+    .maybeSingle();
+  if (error) throw new Error(`ci_transcripts read failed: ${error.message}`);
+  if (!transcript) {
+    await sendToReview(db, call, 'analyze', 'no_transcript', { note: 'call is transcribed but has no ci_transcripts row' });
+    return { outcome: 'review', reason: 'no_transcript' };
+  }
+
+  const result = await analyzeTranscript(call, transcript, {
+    cfg,
+    ...(callJson ? { callJson } : {}),
+  });
+
+  if (!result.ok) {
+    await sendToReview(db, call, 'analyze', result.reason, {
+      attempts: result.attempts,
+      // The schema errors, not the model's text — a rejected response can
+      // contain transcript fragments, and §-logging keeps content out of logs.
+      errors: (result.errors || []).slice(0, 10),
+    });
+    return { outcome: 'review', reason: result.reason };
+  }
+
+  await insertCurrentSummary(db, call.id, result.row);
+
+  const flags = result.row.review_flags || [];
+  if (flags.length > 0) {
+    await sendToReview(db, call, 'analyze', flags[0], { review_flags: flags, outcome: result.row.outcome });
+    return { outcome: 'review', reason: flags[0], review_flags: flags };
+  }
+
+  await advance(db, call, 'analyze', 'analyzed', {
+    outcome: result.row.outcome,
+    confidence: result.row.outcome_confidence,
+    attempts: result.attempts,
+    phone: last4(call.ani),
+  });
+  return { outcome: 'advanced', to: 'analyzed' };
+}
+
+/**
  * Pick the recording that best fits a call, using the same never-guess rules
  * as matchRecordingToCall but oriented recording-per-call.
  */
@@ -253,18 +385,22 @@ export function bestRecordingForCall(call, recordings, windowSeconds = 180) {
  * of as calls quietly marked complete.
  */
 const NOT_YET_IMPLEMENTED = {
-  fetched: 'transcribe (PR 3)',
-  transcribed: 'analyze (PR 3)',
   analyzed: 'match (PR 4)',
   matched: 'sync (PR 5)',
   syncing: 'sync completion (PR 5)',
 };
 
 /** Dispatch one claimed call to its stage handler. */
-export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapter, now = new Date() } = {}) {
+export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapter, transcriber, loadAudio, callJson, now = new Date() } = {}) {
   try {
     if (call.status === 'discovered') {
       return await stageFetchRecording(call, { db, cfg, adapter, now });
+    }
+    if (call.status === 'fetched') {
+      return await stageTranscribe(call, { db, cfg, transcriber, loadAudio, now });
+    }
+    if (call.status === 'transcribed') {
+      return await stageAnalyze(call, { db, cfg, callJson, now });
     }
     const pending = NOT_YET_IMPLEMENTED[call.status];
     if (pending) {
@@ -287,7 +423,7 @@ export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapt
  */
 let ticking = false;
 
-export async function runTick({ db = supabase, cfg = getConfig(), adapter, limit, now = new Date() } = {}) {
+export async function runTick({ db = supabase, cfg = getConfig(), adapter, transcriber, loadAudio, callJson, limit, now = new Date() } = {}) {
   if (ticking) return { ok: true, skipped: 'already_running' };
   ticking = true;
   const startedAt = Date.now();
@@ -297,7 +433,7 @@ export async function runTick({ db = supabase, cfg = getConfig(), adapter, limit
 
     const outcomes = {};
     for (const call of batch.rows) {
-      const r = await advanceOne(call, { db, cfg, adapter, now });
+      const r = await advanceOne(call, { db, cfg, adapter, transcriber, loadAudio, callJson, now });
       outcomes[r.outcome] = (outcomes[r.outcome] || 0) + 1;
     }
     console.log(`${LOG} tick: claimed ${batch.rows.length}${batch.claimed ? '' : ' (UNLEASED fallback)'} → ${JSON.stringify(outcomes)} in ${Date.now() - startedAt}ms`);

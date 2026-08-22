@@ -17,22 +17,30 @@
 -- map. agent_five9_id stays the primary key — it is the stable identity, and
 -- a login can be renamed — but the username becomes the join column.
 --
--- SECOND CORRECTION, recorded here because it reverses a claim in PR #725:
--- that PR concluded the " - LF" / " - NC" / " - FTM" suffixes from handoff
--- decision #5 did not exist on the Five9 side, because zero of 48 users from
--- getUsersGeneralInfo carried one. True of the USER RECORDS, false of the
--- CALL LOG — AGENT NAME returns 'Shari Walker - LF' live. Both signals are
--- real and they agree: the nine agents the email rule classified as lightfire
--- are the same nine the suffix identifies. Discovery now reads the suffix
--- directly (it is what the dialer recorded against the call) and falls back
--- to the map.
+-- SECOND CORRECTION, recorded here because it reverses a claim in PR #725 --
+-- and because the first version of THIS comment got it wrong too. PR #725
+-- concluded the " - LF" / " - NC" / " - FTM" suffixes from handoff decision
+-- #5 did not exist on the Five9 side; this file then claimed they existed in
+-- the call log but not in the user records. Neither is true.
+--
+-- Verified 2026-08-21 across all 54 live users: the suffix is on lastName in
+-- the user record ('Lovette - NC', 'Walker - LF') AND in the call log's AGENT
+-- NAME. Both sources carry it.
+--
+-- The consequence was not cosmetic. ci_agent_map as seeded 2026-08-20
+-- classified by email only, leaving all ten North Carolina agents in
+-- 'unknown' — every one of their calls bound for the review queue — with
+-- their team spelled out in their own name field. Re-seeded 2026-08-21 with
+-- the suffix rule: 48 agents, unknown 11 -> 1 (one ETG helpdesk login, which
+-- is genuinely not one of the teams).
 --
 -- Mirrored in runMigrations() (src/index.js). Additive; no data is rewritten
 -- and no existing column changes type or nullability.
 --
--- AFTER RUNNING: re-run scripts/seed-ci-maps.js to populate agent_username on
--- the 42 seeded rows. Until then the map still resolves nothing, so team
--- classification leans on the AGENT NAME suffix and the campaign map.
+-- AFTER RUNNING: re-seed so agent_username is populated — without it the map
+-- resolves nothing and classification leans on the AGENT NAME suffix and the
+-- campaign map. DONE 2026-08-21: 48 agents, every row carrying a login,
+-- lightfire 14 / reece 23 / north_carolina 10 / unknown 1.
 --
 -- ROLLBACK:
 --   DROP INDEX IF EXISTS ci_agent_map_username_idx;

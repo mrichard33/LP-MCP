@@ -6,20 +6,31 @@
  * Duplicating a load-bearing mapping rule is how partners' calls get
  * mis-attributed, so both callers import from here.
  *
- * ── WHY THIS FILE EXISTS AT ALL, AND A CORRECTION ──────────────────────────
+ * ── WHY THIS FILE EXISTS AT ALL, AND TWO CORRECTIONS ───────────────────────
  * PR #725 concluded the handoff's " - LF" / " - NC" / " - FTM" suffixes did
  * not exist on the Five9 side, because zero of 48 users returned by
- * getUsersGeneralInfo carried one. That was true of the USER RECORDS and false
- * of the CALL LOG: verified live 2026-08-21, the report's AGENT NAME column
- * returns 'Shari Walker - LF', 'Craig Deer - LF', 'Carla Wright - LF' — the
- * suffix is right there, exactly as handoff decision #5 said.
+ * getUsersGeneralInfo carried one. That conclusion is WRONG, and an earlier
+ * revision of this comment repeated it in a softer form ("true of the user
+ * records, false of the call log"). That was wrong too.
  *
- * So both signals are real and they agree. The suffix is authoritative when
- * present (it is what the dialer itself records against the call); the email
- * domain is the fallback used at seed time, where no suffix is available. The
- * nine agents the email rule classified as lightfire are the same nine the
- * suffix identifies, which is a useful independent confirmation that the
- * seeded map is correct.
+ * Verified live 2026-08-21 against all 54 users: the suffix is in the USER
+ * RECORD as well, carried on lastName —
+ *
+ *     firstName 'Brian'  lastName 'Lovette - NC'   fullName 'Brian Lovette - NC'
+ *     firstName 'Shari'  lastName 'Walker - LF'    fullName 'Shari Walker - LF'
+ *
+ * — and in the call log's AGENT NAME. BOTH sources carry it. Whatever the
+ * original 48-user check looked at, it was not lastName or fullName.
+ *
+ * This is not cosmetic. The map seeded on 2026-08-20 classified by email
+ * ONLY, which left the entire North Carolina team — ten agents whose emails
+ * are @reecebuilders.com or unlabelled personal gmails — sitting in
+ * 'unknown', i.e. bound for the review queue on every call. Their team was
+ * spelled out in their own name field the whole time. Re-seeded 2026-08-21:
+ * unknown went 11 -> 1.
+ *
+ * Order of authority: suffix first (both sources carry it, and it is what the
+ * dialer records against the call), email domain as fallback, then 'unknown'.
  *
  * Pure module: no env, no clients, no import-time work.
  */
