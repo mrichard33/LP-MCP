@@ -48,6 +48,30 @@ export function assertSpan(from, to) {
   }
 }
 
+/**
+ * Where a reviewed call should resume, based on what it actually produced.
+ *
+ * Walks backwards from the last artifact: a current summary means analysis
+ * succeeded, so re-run matching; a transcript means re-run analysis; a
+ * recording means re-run transcription; nothing means start at the fetch.
+ *
+ * Deriving from artifacts rather than from review_reason means a renamed
+ * reason string cannot silently send a call back to the wrong stage — and a
+ * call that was reviewed for a reason unrelated to its stage (a DNC flag, say)
+ * still resumes where it left off instead of re-transcribing from scratch.
+ */
+export async function resumeStatusFor(db, callId) {
+  const has = async (table, extra = (q) => q) => {
+    const { data, error } = await extra(db.from(table).select('call_id').eq('call_id', callId)).limit(1);
+    if (error) throw new Error(`${table} probe failed: ${error.message}`);
+    return (data || []).length > 0;
+  };
+  if (await has('ci_summaries', (q) => q.eq('is_current', true))) return 'analyzed';
+  if (await has('ci_transcripts')) return 'transcribed';
+  if (await has('ci_recordings')) return 'fetched';
+  return 'discovered';
+}
+
 export function registerCiRoutes(app, authenticate) {
   const guards = typeof authenticate === 'function' ? [authenticate] : [];
 
@@ -168,9 +192,127 @@ export function registerCiRoutes(app, authenticate) {
     }
   });
 
+  /**
+   * GET /ci/review — the queue, newest first.
+   *
+   * Reads v_ci_review_queue (sql/061). Deliberately does NOT return transcript
+   * text or note bodies: §10 keeps call content out of anything but the
+   * dedicated read, and this endpoint exists to triage, not to browse
+   * conversations.
+   */
+  app.get('/ci/review', ...guards, async (req, res) => {
+    try {
+      const limit = Math.min(200, Math.max(1, parseInt(req.query.limit || '50', 10) || 50));
+      const { data, error } = await supabase
+        .from('v_ci_review_queue')
+        .select('*')
+        .order('call_start', { ascending: false })
+        .limit(limit);
+      if (error) throw new Error(error.message);
+      res.json({ ok: true, count: (data || []).length, rows: data || [] });
+    } catch (err) {
+      console.error(`${LOG} GET /ci/review failed: ${err.message}`);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  /**
+   * POST /ci/review/:call_id/resolve { action, lp_cst_id?, lp_lds_id?,
+   *                                    ghl_contact_id?, note }
+   *
+   * A human's ruling on a queued call. §11 actions:
+   *   set_match  record the correct IDs and re-queue for sync
+   *   skip       this call should never sync (wrong number, test, personal)
+   *   retry      put it back at its current stage and let the worker re-run
+   *   fail       give up on it, with the reason on the record
+   *
+   * set_match writes a ci_matches row with decided_by='human'. That row does
+   * not overwrite the system's — both are kept, and the human one is newer, so
+   * the audit trail shows what the matcher thought AND what a person decided.
+   */
+  app.post('/ci/review/:call_id/resolve', ...guards, async (req, res) => {
+    try {
+      const callId = String(req.params.call_id || '').trim();
+      if (!callId) throw new BadRequest('call_id is required');
+
+      const { action, lp_cst_id: cstId, lp_lds_id: ldsId, ghl_contact_id: ghlId, note } = req.body || {};
+      const ACTIONS = new Set(['set_match', 'skip', 'retry', 'fail']);
+      if (!ACTIONS.has(action)) {
+        throw new BadRequest(`action must be one of ${[...ACTIONS].join('|')}`);
+      }
+
+      const { data: call, error: callErr } = await supabase
+        .from('ci_calls').select('*').eq('id', callId).maybeSingle();
+      if (callErr) throw new Error(callErr.message);
+      if (!call) throw new BadRequest(`no ci_calls row for id ${callId}`);
+
+      let nextStatus;
+      if (action === 'set_match') {
+        if (cstId == null && ldsId == null && !ghlId) {
+          // A "correction" that names no record is not a correction. Refusing
+          // is better than writing an empty human match that later reads as
+          // an authoritative decision.
+          throw new BadRequest('set_match needs at least one of lp_cst_id, lp_lds_id, ghl_contact_id');
+        }
+        const { error: mErr } = await supabase.from('ci_matches').insert({
+          call_id: callId,
+          lp_cst_id: cstId ?? null,
+          lp_lds_id: ldsId ?? null,
+          ghl_contact_id: ghlId ?? null,
+          method: 'human_review',
+          tier: 'exact',
+          confidence: 1.0,
+          candidates: [],
+          evidence: { note: note ?? null, resolved_via: 'POST /ci/review/:call_id/resolve' },
+          decided_by: 'human',
+        });
+        if (mErr) throw new Error(`ci_matches insert failed: ${mErr.message}`);
+        nextStatus = 'matched';
+      } else if (action === 'skip') {
+        nextStatus = 'skipped';
+      } else if (action === 'retry') {
+        // Resume from the furthest stage this call actually reached, derived
+        // from the artifacts on disk rather than from a remembered status.
+        // ci_calls has no "stage before review" column, and inferring it from
+        // review_reason would break the moment a reason string is renamed.
+        nextStatus = await resumeStatusFor(supabase, callId);
+      } else {
+        nextStatus = 'failed';
+      }
+
+      const patch = {
+        status: nextStatus,
+        review_reason: action === 'fail' ? (note || call.review_reason) : null,
+        status_detail: note ? String(note).slice(0, 500) : null,
+        locked_until: null,
+        locked_by: null,
+        next_retry_at: null,
+      };
+      if (action === 'retry') patch.attempts = 0;
+
+      const { error: upErr } = await supabase.from('ci_calls').update(patch).eq('id', callId);
+      if (upErr) throw new Error(`ci_calls update failed: ${upErr.message}`);
+
+      await supabase.from('ci_events').insert({
+        call_id: callId,
+        stage: 'review',
+        event: 'resolved',
+        detail: { action, to: nextStatus, by: 'human', has_note: Boolean(note) },
+      });
+
+      console.log(`${LOG} review resolve: call ${callId} ${action} → ${nextStatus}`);
+      res.json({ ok: true, call_id: callId, action, status: nextStatus });
+    } catch (err) {
+      if (err instanceof BadRequest) return res.status(400).json({ ok: false, error: err.message });
+      console.error(`${LOG} POST /ci/review/:call_id/resolve failed: ${err.message}`);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
   const cfg = getConfig();
   console.log(
-    `${LOG} Routes: POST /ci/discover, POST /ci/tick, POST /ci/backfill` +
+    `${LOG} Routes: POST /ci/discover, POST /ci/tick, POST /ci/backfill,` +
+    ` GET /ci/review, POST /ci/review/:call_id/resolve` +
     `${guards.length ? ' (authenticated)' : ' (UNAUTHENTICATED — no middleware passed)'}` +
     ` [mode=${cfg.mode}, sftp=${cfg.sftp.readOnly ? 'read-only' : 'WRITABLE — MISCONFIGURED'}]`,
   );

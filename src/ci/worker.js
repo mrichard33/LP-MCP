@@ -25,6 +25,7 @@ import { createSftpAdapter, createManualAdapter, describeRecording, matchRecordi
 import { dateDirFor, last4 } from './time.js';
 import { transcribeCall, createOpenAITranscriber, createStorageAudioLoader } from './transcribe.js';
 import { analyzeTranscript } from './analyze.js';
+import { matchCall } from './match.js';
 
 const LOG = '[CIWorker]';
 
@@ -357,6 +358,83 @@ export async function stageAnalyze(call, { db = supabase, cfg = getConfig(), cal
 }
 
 /**
+ * Stage: analyzed → matched.
+ *
+ * Records the decision in ci_matches EVEN WHEN it resolves to nothing. An
+ * unmatched call with no ci_matches row is indistinguishable from a call the
+ * matcher never reached; a row with tier 'none' says "we looked, and this is
+ * what we found", which is what reconciliation and the review queue need.
+ *
+ * `decided_by` is 'system' here. The review endpoint writes 'human' rows for
+ * the same call, and the newest row wins — that is how a human correction
+ * survives a re-run of this stage.
+ */
+export async function stageMatch(call, { db = supabase, cfg = getConfig(), now = new Date() } = {}) {
+  const { data: summary, error: sumErr } = await db
+    .from('ci_summaries')
+    .select('*')
+    .eq('call_id', call.id)
+    .eq('is_current', true)
+    .maybeSingle();
+  if (sumErr) throw new Error(`ci_summaries read failed: ${sumErr.message}`);
+
+  const { data: campaignRow, error: campErr } = await db
+    .from('ci_campaign_map')
+    .select('*')
+    .eq('campaign', call.campaign)
+    .maybeSingle();
+  if (campErr) throw new Error(`ci_campaign_map read failed: ${campErr.message}`);
+
+  const result = await matchCall(call, { db, analysis: summary?.output ?? null, campaignRow, cfg });
+
+  const { error: insErr } = await db.from('ci_matches').insert({
+    call_id: call.id,
+    lp_cst_id: result.lp.prospectId ?? null,
+    lp_lds_id: result.target.rectype === 'ils' ? result.target.recid : (result.lp.leadId ?? null),
+    ghl_contact_id: result.ghl.ghlContactId ?? null,
+    method: result.lp.method,
+    tier: result.lp.tier,
+    confidence: TIER_CONFIDENCE[result.lp.tier] ?? null,
+    // Candidates are kept so a reviewer sees what the matcher was choosing
+    // between. Trimmed to identity fields — this table is not a copy of LP.
+    candidates: (result.lp.candidates || []).slice(0, 20).map((c) => ({
+      lp_prospect_id: c.lp_prospect_id ?? null,
+      lp_lead_id: c.lp_lead_id ?? null,
+      last_activity_at: c.last_activity_at ?? null,
+      appointment_date: c.appointment_date ?? null,
+    })),
+    evidence: {
+      reason: result.lp.reason,
+      note_target: result.target,
+      ghl: { tier: result.ghl.tier, method: result.ghl.method, reason: result.ghl.reason },
+      canvass_strategy: campaignRow?.match_strategy ?? null,
+    },
+    decided_by: 'system',
+  });
+  if (insErr) throw new Error(`ci_matches insert failed: ${insErr.message}`);
+
+  if (result.review) {
+    await sendToReview(db, call, 'match', result.review, {
+      lp_tier: result.lp.tier,
+      candidates: (result.lp.candidates || []).length,
+      phone: last4(call.ani),
+    });
+    return { outcome: 'review', reason: result.review, tier: result.lp.tier };
+  }
+
+  await advance(db, call, 'match', 'matched', {
+    lp_tier: result.lp.tier,
+    ghl_tier: result.ghl.tier,
+    rectype: result.target.rectype,
+    phone: last4(call.ani),
+  });
+  return { outcome: 'advanced', to: 'matched', tier: result.lp.tier };
+}
+
+/** Confidence stamped on a ci_matches row, by tier. Ordinal, not probability. */
+const TIER_CONFIDENCE = { exact: 1.0, high: 0.9, probable: 0.6, ambiguous: 0.3, none: 0 };
+
+/**
  * Pick the recording that best fits a call, using the same never-guess rules
  * as matchRecordingToCall but oriented recording-per-call.
  */
@@ -385,7 +463,6 @@ export function bestRecordingForCall(call, recordings, windowSeconds = 180) {
  * of as calls quietly marked complete.
  */
 const NOT_YET_IMPLEMENTED = {
-  analyzed: 'match (PR 4)',
   matched: 'sync (PR 5)',
   syncing: 'sync completion (PR 5)',
 };
@@ -401,6 +478,9 @@ export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapt
     }
     if (call.status === 'transcribed') {
       return await stageAnalyze(call, { db, cfg, callJson, now });
+    }
+    if (call.status === 'analyzed') {
+      return await stageMatch(call, { db, cfg, now });
     }
     const pending = NOT_YET_IMPLEMENTED[call.status];
     if (pending) {

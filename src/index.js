@@ -1078,6 +1078,22 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] call intelligence agent join-by-login FAILED (agent map unjoinable, teams fall to unknown — apply sql/064 manually):', err.message);
   }
+
+  // CI matching indexes (sql/065 — the file is the source of truth). §8 phone
+  // matching probes lp_prospects, which had no phone index at all: 140,600
+  // rows scanned per matched call, twice. Plain (not CONCURRENT) builds because
+  // runMigrations cannot run CONCURRENTLY inside a transaction; IF NOT EXISTS
+  // makes it a no-op once built. Additive — no column or row changes.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE INDEX IF NOT EXISTS idx_lp_prospects_phone     ON lp_prospects (phone);
+            CREATE INDEX IF NOT EXISTS idx_lp_prospects_phone_alt ON lp_prospects (phone_alt);
+            CREATE INDEX IF NOT EXISTS idx_lp_leads_phone_alt     ON lp_leads (phone_alt);
+            CREATE INDEX IF NOT EXISTS idx_lp_leads_prospect_id   ON lp_leads (lp_prospect_id);`);
+    console.log('[Migration] call intelligence matching indexes (sql/065) ready');
+  } catch (err) {
+    console.error('[Migration] call intelligence matching indexes FAILED (LP phone match will seq-scan 140k rows per call — apply sql/065 manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
