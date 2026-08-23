@@ -66,10 +66,40 @@ test('(1) clean run with no deferrals → healthy', () => {
   assert.equal(out.reason, 'clean_run');
 });
 
-test('(2) errors outrank backlog — failing even when deferred is non-zero', () => {
-  const out = classifyRun({ counts: { created: 3, error: 2 }, scan: { deferredCapped: 40 } });
+// 2026-08-23 (#292/#291): errors still outrank backlog, but only once they
+// clear the AGGREGATE bar (>=3 errors AND >20% of processed). A run failing 2
+// of 5 leads used to be 'failing'; during the #222 drain that shape fires every
+// 15 minutes forever. Below the bar the run is silent and the leads live in
+// lp_sync_errors instead — see persistSweepErrors().
+test('(2) errors outrank backlog when they clear the aggregate bar', () => {
+  const out = classifyRun({ counts: { created: 3, error: 4 }, scan: { deferredCapped: 40, processed: 10 } });
   assert.equal(out.severity, 'failing', 'errored leads are the more actionable fact');
-  assert.equal(out.reason, 'lead_errors');
+  assert.equal(out.reason, 'lead_error_rate');
+  assert.equal(out.errorRate, 0.4);
+});
+
+test('(2b) errors under the aggregate bar are silent, not failing', () => {
+  // 2 of 5 = 40% rate, but only 2 errors — under the 3-error floor.
+  const fewErrors = classifyRun({ counts: { created: 3, error: 2 }, scan: { processed: 5 } });
+  assert.equal(fewErrors.severity, 'healthy');
+  assert.equal(fewErrors.reason, 'errors_below_threshold');
+  assert.equal(fewErrors.errorCount, 2, 'still counted, just not alerted');
+
+  // 4 errors clears the floor but 4/100 = 4% is under the 20% rate bar. This is
+  // the drain shape: a few unavoidable transient GHL failures in a large run.
+  const lowRate = classifyRun({ counts: { created: 96, error: 4 }, scan: { processed: 100 } });
+  assert.equal(lowRate.severity, 'healthy');
+  assert.equal(lowRate.reason, 'errors_below_threshold');
+
+  // Backlog still wins over sub-threshold errors — it is the louder fact then.
+  const withBacklog = classifyRun({ counts: { error: 2 }, scan: { deferredCapped: 40, processed: 5 } });
+  assert.equal(withBacklog.severity, 'degraded');
+});
+
+test('(2c) a run that processed nothing but errored is 100%, not 0%', () => {
+  const out = classifyRun({ counts: { error: 3 }, scan: { processed: 0 } });
+  assert.equal(out.errorRate, 1);
+  assert.equal(out.severity, 'failing');
 });
 
 test('(3) zero errors with deferrals at/over the threshold → degraded', () => {
@@ -131,13 +161,46 @@ test('(8) backlog alerts are cooled down — second consecutive degraded is supp
   __resetCooldowns();
 });
 
-test('(9) errors bypass the cooldown — consecutive failing runs both send', () => {
+// 2026-08-23 (#292/#291): failing runs used to bypass the cooldown outright.
+// A 95,702-lead drain sweeping every 15 min turns that into a card every 15 min
+// for the length of the drain. Debounced per sweep mode instead — safe now that
+// persistSweepErrors() writes every errored lead to lp_sync_errors, so a
+// suppressed card loses a notification, not the record.
+test('(9) failing runs are debounced per sweep mode — N failures, ONE card', () => {
   __resetCooldowns();
   const first = shouldNotify({ severity: 'failing', sweepMode: 'appointment' });
-  const second = shouldNotify({ severity: 'failing', sweepMode: 'appointment' });
   assert.equal(first.send, true);
-  assert.equal(second.send, true, 'each errored run names different leads — never suppress');
-  assert.equal(second.reason, 'errors_bypass_cooldown');
+  assert.equal(first.reason, 'lead_error_rate');
+
+  // Nine more failing runs inside the window must produce no further cards.
+  for (let i = 0; i < 9; i++) {
+    const next = shouldNotify({ severity: 'failing', sweepMode: 'appointment' });
+    assert.equal(next.send, false, `failing run ${i + 2} must not re-alert inside the window`);
+    assert.equal(next.reason, 'error_cooldown');
+  }
+
+  // Independent per sweep mode — an intake failure is its own signal.
+  assert.equal(shouldNotify({ severity: 'failing', sweepMode: 'intake' }).send, true);
+  __resetCooldowns();
+});
+
+test('(9b) a failing alert sends again once the error cooldown has elapsed', () => {
+  __resetCooldowns();
+  const t0 = 1_000_000_000;
+  assert.equal(shouldNotify({ severity: 'failing', sweepMode: 'intake', nowMs: t0 }).send, true);
+  // 60 min default → still suppressed at +59 min, sends again at +61.
+  assert.equal(shouldNotify({ severity: 'failing', sweepMode: 'intake', nowMs: t0 + 59 * 60000 }).send, false);
+  assert.equal(shouldNotify({ severity: 'failing', sweepMode: 'intake', nowMs: t0 + 61 * 60000 }).send, true);
+  __resetCooldowns();
+});
+
+test('(9c) error and backlog cooldowns are independent keys', () => {
+  __resetCooldowns();
+  assert.equal(shouldNotify({ severity: 'failing', sweepMode: 'appointment' }).send, true);
+  // A failing alert must not consume the backlog budget for the same mode.
+  const backlog = shouldNotify({ severity: 'degraded', sweepMode: 'appointment' });
+  assert.equal(backlog.send, true);
+  assert.equal(backlog.reason, 'backlog_pressure');
   __resetCooldowns();
 });
 
