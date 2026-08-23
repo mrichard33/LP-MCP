@@ -112,6 +112,11 @@ export const MAX_INTAKE_LOOKBACK_HOURS = 24 * 120;
 export const DEFAULT_INTAKE_FRESH_HOURS = 24;
 export const DEFAULT_INTAKE_MAX_PER_RUN = 25;
 export const LP_INTAKE_SUPPRESS_TAG = 'suppress-outbound';
+
+// #292: how many errored leads the job summary carries as a ready-made sample.
+// The full list stays in `errors`; every one of them is persisted to
+// lp_sync_errors regardless, so the sample is a convenience, not the record.
+export const ERROR_SAMPLE_SIZE = 10;
 // Same rationale as BACKSTOP_INTERVAL_MS above.
 export const INTAKE_INTERVAL_MS = 15 * 60 * 1000;
 
@@ -659,7 +664,60 @@ function leadLine(r) {
  * per-lead guarantees (sequential GHL I/O, error isolation, no-phone
  * reporting) can never drift apart between them.
  */
-async function executeOverScan(scan, { dryRun, suppressOutbound, freshHours, job }) {
+/**
+ * Persist per-lead sweep failures (2026-08-23, issue #292).
+ *
+ * Before this, an errored lead survived only in the in-memory job registry
+ * (cleared by any redeploy), in `summary.errors` (dies with the process), and
+ * in at most MAX_DETAIL_LEADS lines on one GroupMe card. Nothing was queryable
+ * afterwards, so "which leads did the drain fail on?" had no answer — the same
+ * blind spot that let #222 hide for a month. The 95,702-lead backlog drain
+ * makes that unacceptable: at MAX_DETAIL_LEADS=5 per card, a run that fails
+ * hundreds of leads reports five of them and forgets the rest.
+ *
+ * Reuses lp_sync_errors (sql/016) rather than inventing a table — same shape,
+ * same reader (supabase_get_sync_errors, src/tools/admin/supabase-tools.js),
+ * same auto-resolve helper. sync_type carries the sweep mode so backstop rows
+ * are separable from ingestion rows:
+ *   backstop_intake | backstop_appointment
+ *
+ * Best-effort and never throws: the sweep's work is already committed, and a
+ * telemetry write must not take down a drain. Skipped entirely on dry runs —
+ * a dry run mutates nothing, including this table.
+ */
+export async function persistSweepErrors(errors, { sweepMode, dryRun, db = supabase } = {}) {
+  if (dryRun || !errors || errors.length === 0) return { persisted: 0 };
+  if (!db) return { persisted: 0 };
+  try {
+    const rows = errors.map((e) => ({
+      lp_lead_id: e.lp_lead_id != null ? String(e.lp_lead_id) : null,
+      lp_prospect_id: e.lp_prospect_id != null ? String(e.lp_prospect_id) : null,
+      error_message: String(e.error || 'unknown_error').slice(0, 2000),
+      error_stack: null,
+      sync_type: `backstop_${sweepMode}`,
+      retry_count: 0,
+      resolved: false,
+    }));
+    const { error } = await db.from('lp_sync_errors').insert(rows);
+    if (error) {
+      console.warn(`[LpContactBackstop] error persistence failed (${sweepMode}): ${error.message}`);
+      return { persisted: 0, persist_error: error.message };
+    }
+    return { persisted: rows.length };
+  } catch (err) {
+    console.warn(`[LpContactBackstop] error persistence threw (${sweepMode}): ${err.message}`);
+    return { persisted: 0, persist_error: String(err.message || err) };
+  }
+}
+
+/**
+ * `processLead` is injectable so the per-lead error-isolation contract (#292)
+ * can be exercised with a lead that genuinely throws, without GHL I/O. The
+ * production callers never pass it — they get processOneLead.
+ */
+export async function executeOverScan(scan, {
+  dryRun, suppressOutbound, freshHours, job, processLead = processOneLead,
+}) {
   const counts = { linked: 0, created: 0, skipped_no_phone: 0, skipped_dnc: 0, skipped_dup_in_run: 0, error: 0 };
   const lines = [];
   const errors = [];
@@ -672,6 +730,8 @@ async function executeOverScan(scan, { dryRun, suppressOutbound, freshHours, job
   // Every error entry carries its lead's source for that reason.
   const errEntry = (lead, error) => ({
     lp_lead_id: lead.lp_lead_id,
+    // Carried for lp_sync_errors persistence (#292) as well as the card.
+    lp_prospect_id: lead.lp_prospect_id || null,
     error,
     lead_source: lead.lead_source || null,
     lead_source_detail: lead.lead_source_detail || null,
@@ -679,7 +739,7 @@ async function executeOverScan(scan, { dryRun, suppressOutbound, freshHours, job
 
   for (const { lead } of scan.targets) {
     try {
-      const r = await processOneLead({ lead, dryRun, seenPhones, contactCache: new Map(), suppressOutbound, freshHours });
+      const r = await processLead({ lead, dryRun, seenPhones, contactCache: new Map(), suppressOutbound, freshHours });
       counts[r.outcome] = (counts[r.outcome] || 0) + 1;
       if (r.suppressed) suppressedCount++;
       lines.push(leadLine(r));
@@ -735,6 +795,9 @@ export async function runLpContactBackstop({
     dryRun, suppressOutbound: false, freshHours: Infinity, job,
   });
 
+  // #292: persist before summarising, so error_persistence reflects reality.
+  const persistence = await persistSweepErrors(errors, { sweepMode: 'appointment', dryRun });
+
   const summary = {
     mode: 'appointment',
     dry_run: dryRun,
@@ -745,6 +808,12 @@ export async function runLpContactBackstop({
     processed: scan.targets.length,
     deferred_capped: scan.deferredCapped,
     counts,
+    // #292: explicit count + bounded sample, so a caller reading the job
+    // summary sees the failure volume without having to length-check `errors`.
+    error_count: errors.length,
+    error_rate: scan.targets.length > 0 ? errors.length / scan.targets.length : 0,
+    error_sample: errors.slice(0, ERROR_SAMPLE_SIZE),
+    error_persistence: persistence,
     errors,
     lines,
   };
@@ -798,6 +867,9 @@ export async function runLpIntakeBackstop({
     dryRun, suppressOutbound, freshHours, job,
   });
 
+  // #292: persist before summarising, so error_persistence reflects reality.
+  const persistence = await persistSweepErrors(errors, { sweepMode: 'intake', dryRun });
+
   const summary = {
     mode: 'intake',
     dry_run: dryRun,
@@ -811,6 +883,11 @@ export async function runLpIntakeBackstop({
     deferred_capped: scan.deferredCapped,
     suppressed: suppressedCount,
     counts,
+    // #292 — see runLpContactBackstop.
+    error_count: errors.length,
+    error_rate: scan.targets.length > 0 ? errors.length / scan.targets.length : 0,
+    error_sample: errors.slice(0, ERROR_SAMPLE_SIZE),
+    error_persistence: persistence,
     errors,
     lines,
   };

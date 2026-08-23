@@ -65,6 +65,33 @@ export const DEFAULT_COOLDOWN_MIN = 240;
 export const DEFAULT_FAILURE_COOLDOWN_MIN = 60;
 export const MAX_DETAIL_LEADS = 5;
 
+// ─── Aggregate failure alerting (2026-08-23, issues #292 / #291) ─────
+//
+// Errors used to mean severity 'failing' at errorCount > 0, AND they bypassed
+// the cooldown outright ("they are rare and each names different leads"). That
+// held while sweeps ran 25 leads at a time. It stops holding for the 95,702-
+// lead #222 drain: a sweep every 15 minutes, each with a handful of unavoidable
+// transient GHL failures, posts a card every 15 minutes for the length of the
+// drain — the exact channel-destroying noise #291 flags, and it would drown the
+// cards that matter.
+//
+// So alert on AGGREGATE failure instead: a run must fail at least
+// DEFAULT_MIN_ERROR_COUNT leads AND exceed DEFAULT_ERROR_RATE_THRESHOLD of what
+// it processed, and then only once per DEFAULT_ERROR_COOLDOWN_MIN per sweep
+// mode. Below that bar the run is silent — which is now safe in a way it was
+// not before, because every errored lead is persisted to lp_sync_errors by
+// persistSweepErrors() and is queryable long after the card would have scrolled
+// away. Silence is no longer forgetting.
+//
+// Plain constants, not env reads: this ships with no new configuration (a
+// deliberate constraint of this change). Both are parameters of classifyRun so
+// tests pin behaviour without touching process.env.
+export const DEFAULT_ERROR_RATE_THRESHOLD = 0.2;   // >20% of processed leads
+export const DEFAULT_MIN_ERROR_COUNT = 3;          // floor: 1/2 of 2 isn't a trend
+export const DEFAULT_ERROR_COOLDOWN_MIN = 60;
+
+const errorCooldownMs = () => DEFAULT_ERROR_COOLDOWN_MIN * 60000;
+
 const notifyMode = () => String(process.env.LP_BACKSTOP_NOTIFY_MODE || DEFAULT_NOTIFY_MODE).toLowerCase();
 const deferThreshold = () => Math.max(1, parseInt(process.env.LP_BACKSTOP_DEFER_ALERT_THRESHOLD || String(DEFAULT_DEFER_THRESHOLD), 10));
 const cooldownMs = () => Math.max(0, parseInt(process.env.LP_BACKSTOP_ALERT_COOLDOWN_MIN || String(DEFAULT_COOLDOWN_MIN), 10)) * 60000;
@@ -80,30 +107,67 @@ export function __resetCooldowns() { lastAlertAt.clear(); }
 /**
  * Severity of a completed run. Errors outrank backlog: a run can be both,
  * and errored leads are the more actionable fact.
- *   failing  — leads errored; those leads are still unlinked.
+ *   failing  — errors crossed the aggregate bar (count AND rate). Those leads
+ *              are still unlinked, and the shape says systemic, not transient.
  *   degraded — the per-run cap left eligible leads unprocessed.
- *   healthy  — everything attempted succeeded. Silent by default.
+ *   healthy  — nothing worth a card. Covers both a clean run and a run whose
+ *              errors stayed under the aggregate bar; `reason` distinguishes
+ *              them, and either way the errored leads are in lp_sync_errors.
+ *
+ * `errorRate` is always returned so the card can state the shape of the
+ * failure rather than just its count.
  */
-export function classifyRun({ counts = {}, scan = {} } = {}) {
+export function classifyRun({
+  counts = {},
+  scan = {},
+  processed = null,
+  errorRateThreshold = DEFAULT_ERROR_RATE_THRESHOLD,
+  minErrorCount = DEFAULT_MIN_ERROR_COUNT,
+} = {}) {
   const errorCount = counts.error || 0;
+  const total = Number.isFinite(processed)
+    ? processed
+    : (Array.isArray(scan.targets) ? scan.targets.length : (scan.processed || 0));
+  // A run that processed nothing but still errored is 100% failed, not 0%.
+  const errorRate = total > 0 ? errorCount / total : (errorCount > 0 ? 1 : 0);
   const deferred = scan.deferredCapped || 0;
-  if (errorCount > 0) return { severity: 'failing', reason: 'lead_errors' };
-  if (deferred >= deferThreshold()) return { severity: 'degraded', reason: 'backlog_pressure' };
-  return { severity: 'healthy', reason: 'clean_run' };
+
+  if (errorCount >= minErrorCount && errorRate >= errorRateThreshold) {
+    return { severity: 'failing', reason: 'lead_error_rate', errorCount, errorRate, processed: total };
+  }
+  if (deferred >= deferThreshold()) {
+    return { severity: 'degraded', reason: 'backlog_pressure', errorCount, errorRate, processed: total };
+  }
+  if (errorCount > 0) {
+    // Persisted, queryable, below the alert bar. Deliberately silent (#291).
+    return { severity: 'healthy', reason: 'errors_below_threshold', errorCount, errorRate, processed: total };
+  }
+  return { severity: 'healthy', reason: 'clean_run', errorCount, errorRate, processed: total };
 }
 
 /**
- * Gate. Mutates cooldown state when it returns send:true for a degraded run,
- * so callers must call this exactly once per run. Chronic backlog would
- * otherwise alert every 15 minutes — exactly the noise this removes. Errors
- * bypass the cooldown: they are rare and each names different leads.
+ * Gate. Mutates cooldown state when it returns send:true for a degraded OR a
+ * failing run, so callers must call this exactly once per run. Chronic backlog
+ * would otherwise alert every 15 minutes — exactly the noise this removes.
+ *
+ * 2026-08-23 (#292/#291): failing runs are now debounced per sweep mode too,
+ * rather than bypassing the cooldown. N failing runs inside the window produce
+ * ONE card, not N. Losing the extra cards costs nothing now that every errored
+ * lead is written to lp_sync_errors — see the header note above.
  */
 export function shouldNotify({ severity, sweepMode, nowMs = Date.now() }) {
   const mode = notifyMode();
   if (mode === 'off') return { send: false, reason: 'notify_off' };
   if (mode === 'all') return { send: true, reason: 'notify_all' };
   if (severity === 'healthy') return { send: false, reason: 'clean_run' };
-  if (severity === 'failing') return { send: true, reason: 'errors_bypass_cooldown' };
+
+  if (severity === 'failing') {
+    const errKey = `${sweepMode}:errors`;
+    const lastErr = lastAlertAt.get(errKey) || 0;
+    if (nowMs - lastErr < errorCooldownMs()) return { send: false, reason: 'error_cooldown' };
+    lastAlertAt.set(errKey, nowMs);
+    return { send: true, reason: 'lead_error_rate' };
+  }
 
   const key = `${sweepMode}:backlog`;
   const last = lastAlertAt.get(key) || 0;
@@ -170,13 +234,18 @@ export function buildBackstopCard({
   let nextStep;
 
   if (severity === 'failing') {
+    const pct = processed > 0 ? Math.round(((counts.error || 0) / processed) * 100) : 100;
     verb = `${label} — ERRORS`;
-    status = `${counts.error} lead(s) failed`;
+    status = `${counts.error} lead(s) failed (${pct}%)`;
     narrative =
-      `${counts.error} of ${processed} lead(s) failed mid-sweep and still have no GHL contact — ` +
+      `${counts.error} of ${processed} lead(s) — ${pct}% — failed mid-sweep and still have no GHL contact: ` +
       `no speed-to-lead, no routing, invisible to the dashboard until a later sweep succeeds. ` +
-      `${counts.created || 0} created, ${counts.linked || 0} linked this run.`;
-    nextStep = 'Same leads erroring next sweep means systemic, not transient — check the error text below before touching the sweep config.';
+      `${counts.created || 0} created, ${counts.linked || 0} linked this run. ` +
+      `Every failed lead is recorded in lp_sync_errors (sync_type ${sweepMode === 'intake' ? 'backstop_intake' : 'backstop_appointment'}), ` +
+      `not just the ${MAX_DETAIL_LEADS} shown below.`;
+    nextStep =
+      `Query lp_sync_errors for the full list — this card is debounced to one per ${DEFAULT_ERROR_COOLDOWN_MIN} min per sweep mode, ` +
+      `so treat it as a signal to go look, not as the complete record.`;
   } else if (severity === 'degraded') {
     const drainMin = maxPerRun > 0 ? Math.ceil((deferred / maxPerRun) * intervalMin) : null;
     verb = `${label} — BACKLOG`;
@@ -238,16 +307,16 @@ export function buildBackstopCard({
  */
 export async function notifyBackstopRun({ sweepMode, scan, counts, errors, results, maxPerRun, intervalMin = 15 }) {
   try {
-    const { severity } = classifyRun({ counts, scan });
+    const { severity, errorRate } = classifyRun({ counts, scan });
     const gate = shouldNotify({ severity, sweepMode });
-    if (!gate.send) return { sent: false, severity, reason: gate.reason };
+    if (!gate.send) return { sent: false, severity, reason: gate.reason, errorRate };
 
     const insight = await generateBackstopInsight({ sweepMode, severity, counts, scan, errors, results, maxPerRun });
     const card = buildBackstopCard({ sweepMode, severity, scan, counts, errors, results, maxPerRun, intervalMin, insight });
     if (!card) return { sent: false, severity, reason: 'no_card' };
 
     await sendGroupMeMessage(card, { flushNow: true });
-    return { sent: true, severity, reason: gate.reason, insight_used: Boolean(insight) };
+    return { sent: true, severity, reason: gate.reason, errorRate, insight_used: Boolean(insight) };
   } catch (e) {
     console.warn(`[BackstopNotify] ${sweepMode} run notification failed: ${e.message}`);
     return { sent: false, reason: 'send_failed' };
