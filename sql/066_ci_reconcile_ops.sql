@@ -31,6 +31,16 @@
 -- Mirrored in runMigrations() (src/index.js). CREATE OR REPLACE VIEW keeps the
 -- view's name and permissions; no table is altered and no row is rewritten.
 --
+-- ⚠ THIS FILE SUPERSEDES sql/061's DEFINITION OF v_ci_review_queue.
+-- CREATE OR REPLACE VIEW can add trailing columns but CANNOT DROP one, so
+-- re-applying sql/061 verbatim after this has run fails with
+-- "cannot drop columns from view" — this view now has 13 columns, sql/061
+-- declares 12. Observed live on the 2026-08-23 deploy, where the sql/061
+-- migration block failed for exactly this reason. That block no longer creates
+-- the view (see the note in runMigrations); this file is its sole owner. To
+-- apply sql/061 by hand on a database where 066 has run, either skip its view
+-- statement or DROP VIEW v_ci_review_queue first and re-apply 066 after.
+--
 -- ROLLBACK:
 --   DROP INDEX IF EXISTS ci_recordings_call_id_idx;
 --   -- and restore the sql/061 body of v_ci_review_queue (plain LEFT JOIN)
