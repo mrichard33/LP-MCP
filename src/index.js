@@ -1094,6 +1094,33 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] call intelligence matching indexes FAILED (LP phone match will seq-scan 140k rows per call — apply sql/065 manually):', err.message);
   }
+
+  // CI reconciliation support (sql/066 — the file is the source of truth).
+  // v_ci_review_queue joined ci_matches without picking a row; now that the
+  // table is append-only (system row + human correction), a plain join lists
+  // the same call twice with disagreeing verdicts. LATERAL takes the newest.
+  // Also indexes the per-call recording lookup reconciliation performs.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE OR REPLACE VIEW v_ci_review_queue AS
+            SELECT c.id, c.five9_call_id,
+                   (c.call_start AT TIME ZONE 'America/New_York') AS call_et,
+                   c.agent_name, c.team, c.customer_phone_e164, c.disposition,
+                   c.review_reason, s.summary_text, s.outcome,
+                   m.tier, m.candidates, m.decided_by
+              FROM ci_calls c
+              LEFT JOIN ci_summaries s ON s.call_id = c.id AND s.is_current
+              LEFT JOIN LATERAL (
+                     SELECT tier, candidates, decided_by FROM ci_matches
+                      WHERE call_id = c.id ORDER BY decided_at DESC LIMIT 1
+                   ) m ON true
+             WHERE c.status = 'review'
+             ORDER BY c.call_start;
+            CREATE INDEX IF NOT EXISTS ci_recordings_call_id_idx ON ci_recordings (call_id);`);
+    console.log('[Migration] call intelligence reconciliation support (sql/066) ready');
+  } catch (err) {
+    console.error('[Migration] call intelligence reconciliation support FAILED (review queue may list a call twice — apply sql/066 manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
