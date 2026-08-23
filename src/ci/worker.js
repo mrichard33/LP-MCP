@@ -26,6 +26,7 @@ import { dateDirFor, last4 } from './time.js';
 import { transcribeCall, createOpenAITranscriber, createStorageAudioLoader } from './transcribe.js';
 import { analyzeTranscript } from './analyze.js';
 import { matchCall } from './match.js';
+import { syncCall } from './sync.js';
 
 const LOG = '[CIWorker]';
 
@@ -435,6 +436,82 @@ export async function stageMatch(call, { db = supabase, cfg = getConfig(), now =
 const TIER_CONFIDENCE = { exact: 1.0, high: 0.9, probable: 0.6, ambiguous: 0.3, none: 0 };
 
 /**
+ * Stage: matched → completed.
+ *
+ * Reads the NEWEST ci_matches row for the call, which is how a human
+ * correction outranks the matcher: the review endpoint appends a
+ * decided_by='human' row, and this picks that one up on the retry.
+ *
+ * Completion is not conditional on a CRM accepting the note. A call whose
+ * writes were skipped (shadow, or a tier below the threshold) is still
+ * COMPLETED — the pipeline did everything it was asked to. Only a genuine
+ * delivery failure holds the call back for retry, and only until attempts run
+ * out. Treating "shadow skipped" as incomplete would park every call in the
+ * subsystem for as long as the flags stay off, which is the normal state.
+ */
+export async function stageSync(call, { db = supabase, cfg = getConfig(), lpClient, ghlClient, now = new Date() } = {}) {
+  const { data: match, error: mErr } = await db
+    .from('ci_matches')
+    .select('*')
+    .eq('call_id', call.id)
+    .order('decided_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (mErr) throw new Error(`ci_matches read failed: ${mErr.message}`);
+  if (!match) {
+    await sendToReview(db, call, 'sync', 'no_match_row', { note: 'call is matched but has no ci_matches row' });
+    return { outcome: 'review', reason: 'no_match_row' };
+  }
+
+  const { data: summary, error: sErr } = await db
+    .from('ci_summaries')
+    .select('*')
+    .eq('call_id', call.id)
+    .eq('is_current', true)
+    .maybeSingle();
+  if (sErr) throw new Error(`ci_summaries read failed: ${sErr.message}`);
+  if (!summary) {
+    await sendToReview(db, call, 'sync', 'no_summary', { note: 'call is matched but has no current ci_summaries row' });
+    return { outcome: 'review', reason: 'no_summary' };
+  }
+
+  const result = await syncCall(call, summary, match, { db, cfg, lpClient, ghlClient });
+
+  // A target that failed and has NOT exhausted its attempts gets another go.
+  const retryable = ['lp', 'ghl'].filter((t) => result[t]?.failed && !result[t]?.terminal);
+  if (retryable.length > 0) {
+    await releaseLease(db, call.id, { next_retry_at: nextRetryAt(call.attempts || 0, now).toISOString() });
+    return { outcome: 'deferred', reason: `sync_retry_${retryable.join('_')}`, result };
+  }
+
+  const terminal = ['lp', 'ghl'].filter((t) => result[t]?.terminal);
+  if (terminal.length > 0) {
+    await sendToReview(db, call, 'sync', 'sync_failed', {
+      targets: terminal,
+      phone: last4(call.ani),
+    });
+    return { outcome: 'review', reason: 'sync_failed', result };
+  }
+
+  await advance(db, call, 'sync', 'completed', {
+    lp: describeSync(result.lp),
+    ghl: describeSync(result.ghl),
+    phone: last4(call.ani),
+  });
+  return { outcome: 'advanced', to: 'completed', result };
+}
+
+/** One-word outcome per target, for the event log. */
+function describeSync(r) {
+  if (!r) return 'none';
+  if (r.synced) return 'synced';
+  if (r.shadow) return 'shadow';
+  if (r.skipped) return `skipped:${r.reason}`;
+  if (r.failed) return 'failed';
+  return 'unknown';
+}
+
+/**
  * Pick the recording that best fits a call, using the same never-guess rules
  * as matchRecordingToCall but oriented recording-per-call.
  */
@@ -462,13 +539,10 @@ export function bestRecordingForCall(call, recordings, windowSeconds = 180) {
  * an unfinished pipeline shows up in the health view as work waiting instead
  * of as calls quietly marked complete.
  */
-const NOT_YET_IMPLEMENTED = {
-  matched: 'sync (PR 5)',
-  syncing: 'sync completion (PR 5)',
-};
+const NOT_YET_IMPLEMENTED = {};
 
 /** Dispatch one claimed call to its stage handler. */
-export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapter, transcriber, loadAudio, callJson, now = new Date() } = {}) {
+export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapter, transcriber, loadAudio, callJson, lpClient, ghlClient, now = new Date() } = {}) {
   try {
     if (call.status === 'discovered') {
       return await stageFetchRecording(call, { db, cfg, adapter, now });
@@ -481,6 +555,9 @@ export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapt
     }
     if (call.status === 'analyzed') {
       return await stageMatch(call, { db, cfg, now });
+    }
+    if (call.status === 'matched') {
+      return await stageSync(call, { db, cfg, lpClient, ghlClient, now });
     }
     const pending = NOT_YET_IMPLEMENTED[call.status];
     if (pending) {
@@ -503,7 +580,7 @@ export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapt
  */
 let ticking = false;
 
-export async function runTick({ db = supabase, cfg = getConfig(), adapter, transcriber, loadAudio, callJson, limit, now = new Date() } = {}) {
+export async function runTick({ db = supabase, cfg = getConfig(), adapter, transcriber, loadAudio, callJson, lpClient, ghlClient, limit, now = new Date() } = {}) {
   if (ticking) return { ok: true, skipped: 'already_running' };
   ticking = true;
   const startedAt = Date.now();
@@ -513,7 +590,7 @@ export async function runTick({ db = supabase, cfg = getConfig(), adapter, trans
 
     const outcomes = {};
     for (const call of batch.rows) {
-      const r = await advanceOne(call, { db, cfg, adapter, transcriber, loadAudio, callJson, now });
+      const r = await advanceOne(call, { db, cfg, adapter, transcriber, loadAudio, callJson, lpClient, ghlClient, now });
       outcomes[r.outcome] = (outcomes[r.outcome] || 0) + 1;
     }
     console.log(`${LOG} tick: claimed ${batch.rows.length}${batch.claimed ? '' : ' (UNLEASED fallback)'} → ${JSON.stringify(outcomes)} in ${Date.now() - startedAt}ms`);

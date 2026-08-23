@@ -18,6 +18,7 @@ import { getConfig } from './config.js';
 import { discoverCalls } from './discovery.js';
 import { runTick } from './worker.js';
 import { createManualAdapter, storeAudio, sha256Hex, describeRecording } from './recordings.js';
+import { reconcileDay, pipelineHealth } from './reconcile.js';
 
 const LOG = '[CIRoutes]';
 
@@ -309,10 +310,48 @@ export function registerCiRoutes(app, authenticate) {
     }
   });
 
+  /**
+   * POST /ci/reconcile { date }
+   *
+   * Completeness check for one day against the Call Log's own RECORDINGS
+   * column. Idempotent: a re-run over an unchanged day records nothing new.
+   */
+  app.post('/ci/reconcile', ...guards, async (req, res) => {
+    try {
+      const date = String(req.body?.date ?? '').trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new BadRequest('date must be YYYY-MM-DD');
+      const summary = await reconcileDay({ date });
+      res.json({ ok: true, ...summary });
+    } catch (err) {
+      if (err instanceof BadRequest) return res.status(400).json({ ok: false, error: err.message });
+      console.error(`${LOG} POST /ci/reconcile failed: ${err.message}`);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  /**
+   * GET /ci/health — status histogram, sync counts, gaps, estimated spend.
+   *
+   * Reports the WRITE POSTURE alongside the counts. "Why did nothing sync?" is
+   * answered by mode=shadow far more often than by a fault, and a health
+   * endpoint that omits the flags invites a hunt for a bug that is not there.
+   */
+  app.get('/ci/health', ...guards, async (req, res) => {
+    try {
+      const sinceHours = Math.min(720, Math.max(1, parseInt(req.query.hours || '24', 10) || 24));
+      const health = await pipelineHealth({ sinceHours });
+      res.json({ ok: true, ...health });
+    } catch (err) {
+      console.error(`${LOG} GET /ci/health failed: ${err.message}`);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
   const cfg = getConfig();
   console.log(
     `${LOG} Routes: POST /ci/discover, POST /ci/tick, POST /ci/backfill,` +
-    ` GET /ci/review, POST /ci/review/:call_id/resolve` +
+    ` GET /ci/review, POST /ci/review/:call_id/resolve,` +
+    ` POST /ci/reconcile, GET /ci/health` +
     `${guards.length ? ' (authenticated)' : ' (UNAUTHENTICATED — no middleware passed)'}` +
     ` [mode=${cfg.mode}, sftp=${cfg.sftp.readOnly ? 'read-only' : 'WRITABLE — MISCONFIGURED'}]`,
   );
