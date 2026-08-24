@@ -32,6 +32,8 @@ import {
   isTransferGroup,
   evaluateEligibility,
   buildCallRow,
+  teamFromAgentMap,
+  loadAgentMap,
   pullWindow,
   discoverCalls,
   REPORT_ROW_CAP,
@@ -56,13 +58,16 @@ function reportStub(rows, columns = HEADERS) {
 }
 
 /** Minimal Supabase double: records what was upserted. */
-function dbStub({ campaignRows = [], upsertResult } = {}) {
+function dbStub({ campaignRows = [], agentRows = [], upsertResult } = {}) {
   const calls = { upserts: [] };
   const db = {
     _calls: calls,
     from(table) {
       if (table === 'ci_campaign_map') {
         return { select: async () => ({ data: campaignRows, error: null }) };
+      }
+      if (table === 'ci_agent_map') {
+        return { select: async () => ({ data: agentRows, error: null }) };
       }
       return {
         upsert(rows, opts) {
@@ -221,6 +226,157 @@ test('recording segments and expected count land in raw_metadata', () => {
   assert.equal(out.raw_metadata.expected_recording_count, 2);
   assert.equal(out.raw_metadata.recording_segments.length, 2);
   assert.equal(out.raw_metadata.legs.length, 1, 'raw legs retained verbatim');
+});
+
+// ─── team resolution: suffix → ci_agent_map → unknown ───────────────────────
+//
+// THE TRAP THIS GUARDS. teamFromName() only matches the ' - LF' / ' - NC' /
+// ' - FTM' suffixes the dialer puts on PARTNER agents. Reece's own in-house
+// agents carry no suffix at all, so before the map fallback existed every one
+// of their calls resolved to team 'unknown' and was flagged unknown_team into
+// review — measured live 2026-08-24: 15 of 31 eligible calls at 'unknown', 10
+// of them belonging to five named Reece agents whose ci_agent_map rows said
+// 'reece' the whole time.
+//
+// The ORDER is the load-bearing part. Suffix stays FIRST: it is what the
+// dialer recorded against this specific call and it is how partner agents are
+// identified. The map is the fallback, never the override.
+
+const TEAM_HEADERS = ['CALL ID', 'TIMESTAMP', 'CALL TIME', 'CALL TYPE', 'ANI', 'DNIS', 'CAMPAIGN', 'SKILL', 'DISPOSITION', 'AGENT', 'AGENT NAME', 'RECORDINGS'];
+
+/** A report row carrying BOTH agent columns — the login and the display name. */
+function teamRow({ agent = 'jflanders', agentName = 'Jamal Flanders' } = {}) {
+  return ['300000010270792', '2026-08-05 14:30:12', '00:02:15', 'Outbound',
+    '9419203087', '7275551234', 'Main Number', '', 'Appointment Set', agent, agentName, ''];
+}
+
+/**
+ * The live map's shape as loadAgentMap() returns it: keys folded to lowercase,
+ * the row's own agent_username left verbatim — mixed case included, because
+ * that is what the Five9 user records actually hold.
+ */
+const AGENT_MAP = new Map([
+  ['jflanders', { agent_username: 'jflanders', agent_name: 'Jamal Flanders', team: 'reece' }],
+  ['bleadbeater2254', { agent_username: 'Bleadbeater2254', agent_name: 'Brandon Leadbeater', team: 'reece' }],
+  ['swalker1', { agent_username: 'swalker1', agent_name: 'Shari Walker', team: 'lightfire' }],
+  ['etghelpdesk', { agent_username: 'etghelpdesk', agent_name: 'ETG Helpdesk', team: 'unknown' }],
+]);
+
+function shapeWithMap(overrides, agentMap = AGENT_MAP) {
+  const { index } = resolveColumns(TEAM_HEADERS);
+  return buildCallRow([zipRow(teamRow(overrides), index)], null, CFG, agentMap).row;
+}
+
+test('the SUFFIX wins over the agent map when the two disagree', () => {
+  // swalker1 is mapped 'lightfire', but this call's AGENT NAME carries ' - NC'.
+  // The dialer's own label for the call is the authority.
+  const out = shapeWithMap({ agent: 'swalker1', agentName: 'Shari Walker - NC' });
+  assert.equal(out.team, 'north_carolina', 'suffix is first in the order of authority');
+  assert.equal(out.agent_name, 'Shari Walker', 'stored without the suffix');
+});
+
+test('the agent map resolves a Reece agent who has no suffix', () => {
+  const out = shapeWithMap({ agent: 'jflanders', agentName: 'Jamal Flanders' });
+  assert.equal(out.team, 'reece', 'the review-queue blocker: was unknown before the fallback');
+  assert.equal(out.agent_username, 'jflanders');
+});
+
+test('the login match is case-insensitive on the CALL side', () => {
+  for (const login of ['Bleadbeater2254', 'bleadbeater2254', 'BLEADBEATER2254']) {
+    const out = shapeWithMap({ agent: login, agentName: 'Brandon Leadbeater' });
+    assert.equal(out.team, 'reece', `login '${login}' must resolve`);
+  }
+});
+
+test('an unknown login falls through to unknown rather than throwing', () => {
+  const out = shapeWithMap({ agent: 'nosuchlogin', agentName: 'Nobody At All' });
+  assert.equal(out.team, 'unknown');
+});
+
+test('an agentless leg resolves to unknown, and normalizeAgentField still applies', () => {
+  for (const sentinel of ['[None]', '', 'n/a']) {
+    const out = shapeWithMap({ agent: sentinel, agentName: sentinel });
+    assert.equal(out.team, 'unknown', `'${sentinel}' must not become a team`);
+    assert.equal(out.agent_username, null, `'${sentinel}' is not a login`);
+    assert.equal(out.agent_name, null, `'${sentinel}' is not a name`);
+  }
+});
+
+test('an agent mapped to team unknown STAYS unknown', () => {
+  // The one ETG helpdesk login is genuinely not on any of the teams. The
+  // fallback must not promote it to a real team.
+  const out = shapeWithMap({ agent: 'etghelpdesk', agentName: 'ETG Helpdesk' });
+  assert.equal(out.team, 'unknown');
+});
+
+test('a map row with a null/blank team does not write an empty team', () => {
+  const map = new Map([['ghost', { agent_username: 'ghost', team: null }]]);
+  assert.equal(shapeWithMap({ agent: 'ghost', agentName: 'Ghost' }, map).team, 'unknown');
+  const blank = new Map([['ghost', { agent_username: 'ghost', team: '   ' }]]);
+  assert.equal(shapeWithMap({ agent: 'ghost', agentName: 'Ghost' }, blank).team, 'unknown');
+});
+
+test('buildCallRow is PURE: no agent map given is unknown, never a lookup', () => {
+  // The signature takes the map as an ARGUMENT. If this ever reads Supabase it
+  // would do so once per call — 5000 round trips on a capped window.
+  const { index } = resolveColumns(TEAM_HEADERS);
+  const { row: out } = buildCallRow([zipRow(teamRow(), index)], null, CFG);
+  assert.equal(out.team, 'unknown');
+  assert.equal(teamFromAgentMap(null, 'jflanders'), null);
+  assert.equal(teamFromAgentMap(undefined, 'jflanders'), null);
+  assert.equal(teamFromAgentMap(AGENT_MAP, null), null);
+});
+
+test('loadAgentMap folds the STORED username to lowercase and skips blanks', async () => {
+  const m = await loadAgentMap(dbStub({
+    agentRows: [
+      { agent_username: 'Bleadbeater2254', team: 'reece' },
+      { agent_username: 'Mcole2321', team: 'reece' },
+      { agent_username: 'C.Garner@reecewindows.com', team: 'reece' },
+      { agent_username: null, team: 'lightfire' },
+      { agent_username: '   ', team: 'lightfire' },
+    ],
+  }));
+  assert.equal(m.size, 3, 'the two username-less rows are skipped, never keyed on ""');
+  assert.equal(m.get('bleadbeater2254').team, 'reece');
+  assert.equal(m.get('mcole2321').team, 'reece');
+  assert.equal(m.get('c.garner@reecewindows.com').team, 'reece');
+  assert.equal(m.get(''), undefined, 'a blank key would answer for every agentless leg');
+});
+
+test('loadAgentMap reports a read failure instead of returning an empty map', async () => {
+  // An empty map is indistinguishable from "nobody is mapped" — it would send
+  // every call to review silently. Fail loudly instead.
+  const db = { from: () => ({ select: async () => ({ data: null, error: { message: 'permission denied' } }) }) };
+  await assert.rejects(() => loadAgentMap(db), /ci_agent_map read failed: permission denied/);
+});
+
+test('discoverCalls threads the agent map from load through to the shaped row', async () => {
+  const db = dbStub({ agentRows: [{ agent_username: 'JFlanders', team: 'reece' }] });
+  await discoverCalls({
+    from: new Date('2026-08-05T00:00:00Z'),
+    to: new Date('2026-08-05T06:00:00Z'),
+    deps: {
+      cfg: CFG, supabase: db, campaignMap: new Map(),
+      runReportAndWait: async () => ({ done: true, columns: TEAM_HEADERS, rows: [teamRow()] }),
+    },
+  });
+  const up = db._calls.upserts.at(-1);
+  assert.equal(up.rows[0].team, 'reece', 'loaded from ci_agent_map, not hardcoded');
+});
+
+test('an injected agent map overrides the loader, like campaignMap does', async () => {
+  const db = dbStub({ agentRows: [{ agent_username: 'jflanders', team: 'reece' }] });
+  await discoverCalls({
+    from: new Date('2026-08-05T00:00:00Z'),
+    to: new Date('2026-08-05T06:00:00Z'),
+    deps: {
+      cfg: CFG, supabase: db, campaignMap: new Map(),
+      agentMap: new Map([['jflanders', { team: 'lightfire' }]]),
+      runReportAndWait: async () => ({ done: true, columns: TEAM_HEADERS, rows: [teamRow()] }),
+    },
+  });
+  assert.equal(db._calls.upserts.at(-1).rows[0].team, 'lightfire');
 });
 
 // ─── the row cap ────────────────────────────────────────────────────────────
