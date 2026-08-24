@@ -40,8 +40,13 @@
  * Proven live: recording ANI 3213050187 belongs to Pro ID 5296, GIAN CROSS,
  * ORL market — a canvasser, matched as a customer.
  *
- * So before ANY phone-tier match, the ANI is checked against the ci_canvassers
- * roster (sql/067). A hit does NOT produce a match: it routes the call to
+ * So before ANY phone-tier match, THE CUSTOMER'S NUMBER is checked against the
+ * ci_canvassers roster (sql/067) — the same number the phone tier is about to
+ * search on, which is the only number a guard on that tier can meaningfully
+ * check. On an inbound canvass call that number IS the ANI, so the behaviour
+ * this guard was built for is unchanged; on an outbound call it is now the DNIS,
+ * i.e. the number actually dialled, which is the one that could belong to a
+ * canvasser. A hit does NOT produce a match: it routes the call to
  * review with `canvasser_ani` and records which canvasser it hit. It
  * deliberately does NOT try to work out who the customer really was —
  * correlating a canvass call to its customer is the canvass_correlation
@@ -409,9 +414,16 @@ export async function matchCall(call, { db = supabase, analysis = null, campaign
 
     // THE GUARD, and note what it does NOT cover: list-carried ids. Those are
     // real LP ids the dialing record supplied, tier 'exact', nothing inferred
-    // from the ANI at all — a canvasser's phone in the ANI does not make them
-    // wrong. The guard is specifically about the PHONE tier, which is the one
-    // that reads the ANI as the customer's number.
+    // from a phone number at all — a canvasser's phone on the call does not
+    // make them wrong. The guard is specifically about the PHONE tier, which
+    // is the one that resolves a number to a person.
+    //
+    // THE NUMBER CHECKED IS call.customer_phone — set by discovery.js's
+    // customerNumberFor(): the ANI on inbound, the DNIS on everything else.
+    // That is deliberately the SAME expression findLpByPhone() is handed six
+    // lines below. The guard and the lookup it guards must never resolve
+    // different numbers, or the guard checks one person and the matcher
+    // resolves another.
     const canvassers = hasListIds ? [] : canvasserMatches(canvasserPhones, call.customer_phone || call.ani);
 
     if (canvassers.length) {
@@ -471,10 +483,16 @@ export async function matchCall(call, { db = supabase, analysis = null, campaign
  * call is expected and is not queue-worthy.
  */
 export function reviewReasonFor(lp, call) {
-  // A canvasser ANI outranks the tier reasons, and is NOT gated on
+  // A canvasser hit outranks the tier reasons, and is NOT gated on
   // call.eligible the way a plain 'none' is. A plain miss on an ineligible
-  // call is expected and not queue-worthy; a canvasser ANI is a call we
+  // call is expected and not queue-worthy; a canvasser hit is a call we
   // deliberately refused to match, and a reviewer needs to see it either way.
+  //
+  // The STRING stays 'canvasser_ani' even though the guard now checks the
+  // customer's number rather than the ANI. It is a stored value: ci_calls rows
+  // already carry it, and scripts/requeue-ci-review.js selects on it by name.
+  // Renaming it would strand those rows and silently break that selector — a
+  // cosmetic gain for a real loss.
   if (lp?.canvassers?.length) return 'canvasser_ani';
   if (lp.tier === 'ambiguous') return 'match_ambiguous';
   if (lp.tier === 'none' && call?.eligible) return 'match_none';

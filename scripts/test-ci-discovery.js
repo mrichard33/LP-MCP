@@ -202,7 +202,14 @@ test('an eligible call shapes to status discovered with UTC call_start', () => {
   assert.equal(out.duration_seconds, 135);
   assert.equal(out.eligible, true);
   assert.equal(out.status, 'discovered');
-  assert.equal(out.customer_phone_e164, '+19419203087');
+  // The fixture is CALL TYPE 'Outbound', so the customer is the DNIS
+  // (7275551234), NOT the ANI (9419203087) — the ANI on an outbound call is a
+  // Reece local-presence caller ID. This assertion expected the ANI until
+  // 2026-08-24 and was encoding the bug: see scripts/test-ci-customer-phone.js.
+  assert.equal(out.customer_phone, '7275551234');
+  assert.equal(out.customer_phone_e164, '+17275551234');
+  assert.equal(out.ani, '9419203087', 'the ANI is still stored raw, as the audit trail');
+  assert.equal(out.dnis, '7275551234');
 });
 
 test('an ineligible call shapes to status skipped and keeps its reason', () => {

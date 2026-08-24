@@ -125,7 +125,7 @@ export async function reconcileDay({ db = supabase, cfg = getConfig(), date, lim
 
   const { data: calls, error } = await db
     .from('ci_calls')
-    .select('id, five9_call_id, call_start, campaign, ani, was_transferred, raw_metadata, status')
+    .select('id, five9_call_id, call_start, campaign, ani, customer_phone, was_transferred, raw_metadata, status')
     .gte('call_start', from)
     .lte('call_start', to)
     .limit(limit);
@@ -164,7 +164,7 @@ export async function reconcileDay({ db = supabase, cfg = getConfig(), date, lim
         expected_segments: expectedSegments(call),
         campaign: call.campaign,
         // §10: last-4 only, never the full number.
-        phone: last4(call.ani),
+        phone: last4(call.customer_phone || call.ani),
         five9_call_id: call.five9_call_id,
         status_at_reconcile: call.status,
       },
