@@ -1119,6 +1119,29 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] call intelligence reconciliation support FAILED (review queue may list a call twice — apply sql/066 manually):', err.message);
   }
+
+  // CI canvasser roster (sql/067 — the file is the source of truth).
+  // The ANI on canvass work is the canvasser at the door, not the customer;
+  // without this table the global guard has nothing to check and those calls
+  // phone-match to an employee. The PK is composite because 11 numbers in the
+  // roster are carried by more than one Pro ID.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE TABLE IF NOT EXISTS ci_canvassers (
+              pro_id       integer     NOT NULL,
+              name         text,
+              market       text,
+              phone_last10 text        NOT NULL,
+              phone_source text,
+              active       boolean     NOT NULL DEFAULT true,
+              updated_at   timestamptz NOT NULL DEFAULT now(),
+              PRIMARY KEY (pro_id, phone_last10)
+            );
+            CREATE INDEX IF NOT EXISTS ci_canvassers_phone_idx ON ci_canvassers (phone_last10);`);
+    console.log('[Migration] call intelligence canvasser roster (sql/067) ready');
+  } catch (err) {
+    console.error('[Migration] call intelligence canvasser roster FAILED (canvasser ANIs will phone-match as customers — apply sql/067 manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
