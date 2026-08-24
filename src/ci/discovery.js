@@ -17,6 +17,13 @@
  * UTC timestamptz. All conversion goes through src/ci/time.js — see the
  * three-zone note there. A row whose timestamp will not parse is recorded
  * ineligible with a reason, never given a guessed call_start.
+ *
+ * TEAM RESOLUTION, in this order: the AGENT NAME suffix (teams.js), then
+ * ci_agent_map by login, then 'unknown'. The suffix is first because it is
+ * what the dialer recorded against the call and it is how partner agents are
+ * identified; the map is the fallback for Reece's in-house agents, whose names
+ * carry no suffix at all. Both maps are read ONCE per run and threaded down —
+ * a per-call lookup would be one round trip per row, 5000 on a capped window.
  */
 
 import supabase from '../supabase.js';
@@ -199,12 +206,45 @@ export function evaluateEligibility(call, campaignRow, cfg) {
 }
 
 /**
+ * The ci_agent_map fallback: login → team.
+ *
+ * Pure, and deliberately NOT in teams.js — that module owns the STRING rules
+ * (a name's suffix, an email's domain) and has no opinion about how a map is
+ * shaped or loaded. This one is about the loaded map, so it lives next to
+ * loadAgentMap() where the two can only ever be changed together.
+ *
+ * BOTH SIDES ARE LOWERCASED. The live map holds mixed case as seeded from the
+ * Five9 user records — 'Bleadbeater2254', 'Mcole2321',
+ * 'C.garner@reecewindows.com' — while the call log's AGENT column is the login
+ * as typed. Case-sensitive lookup would silently miss those agents and send
+ * every one of their calls to review, which is exactly the failure this
+ * fallback exists to end.
+ *
+ * A row whose team is null/empty resolves to null, so the caller falls through
+ * to 'unknown' rather than writing an empty team.
+ */
+export function teamFromAgentMap(agentMap, agentUsername) {
+  const key = String(agentUsername ?? '').trim().toLowerCase();
+  if (!key || typeof agentMap?.get !== 'function') return null;
+  const team = String(agentMap.get(key)?.team ?? '').trim();
+  return team || null;
+}
+
+/**
  * Build a ci_calls row from a grouped set of report legs. Pure — exported so
  * the whole shaping path is testable without Five9 or Supabase.
  *
+ * The agent map is an ARGUMENT, never a read from here: this function shapes
+ * up to 5000 rows per window, and a Supabase call inside it would be one round
+ * trip per call. It is also what keeps the whole shaping path testable.
+ *
+ * @param {Array}  legs         report rows sharing one Call ID
+ * @param {object} campaignRow  ci_campaign_map row, or null
+ * @param {object} cfg          resolved CI config
+ * @param {Map}    agentMap     login (LOWERCASED) → ci_agent_map row
  * @returns {{row: object|null, reject: string|null}}
  */
-export function buildCallRow(legs, campaignRow, cfg) {
+export function buildCallRow(legs, campaignRow, cfg, agentMap = null) {
   const primary = legs.find((l) => !/3rd party transfer|third party transfer/i.test(String(l.direction ?? ''))) || legs[0];
 
   const startedAt = parsePacificReportTimestamp(primary.timestamp);
@@ -234,11 +274,25 @@ export function buildCallRow(legs, campaignRow, cfg) {
   const agentUsername = normalizeAgentField(primary.agentUsername);
   const agentDisplay = normalizeAgentField(primary.agentName);
 
+  // ── TEAM: suffix, then the agent map, then 'unknown' ─────────────────────
+  //
   // The display name carries the team suffix on partner agents ('Shari
   // Walker - LF'), which is handoff decision #5's rule and the most direct
   // signal available at discovery. Store the person's name without the
   // suffix so it matches the seeded ci_agent_map row.
   const suffixTeam = teamFromName(agentDisplay);
+
+  // The suffix STAYS FIRST. It is what the dialer records against this
+  // specific call, and it is how partner agents are identified; the map is a
+  // fallback for agents the dialer gives no suffix, not an override of what
+  // the dialer said.
+  //
+  // Without this fallback every Reece in-house agent — who has no suffix at
+  // all — landed at 'unknown' and was flagged unknown_team into review.
+  // Measured live 2026-08-24 before the change: of 31 eligible calls, 15 sat
+  // at 'unknown', 10 of them belonging to five named Reece agents whose
+  // ci_agent_map rows said 'reece' the whole time.
+  const mappedTeam = teamFromAgentMap(agentMap, agentUsername);
 
   const row = {
     five9_call_id: primary.callId,
@@ -256,7 +310,7 @@ export function buildCallRow(legs, campaignRow, cfg) {
     agent_five9_id: normalizeAgentField(primary.agentId),
     agent_username: agentUsername,
     agent_name: agentDisplay ? stripTeamSuffix(agentDisplay) : null,
-    team: suffixTeam || 'unknown',
+    team: suffixTeam || mappedTeam || 'unknown',
     was_transferred: wasTransferred,
     raw_metadata: {
       legs,
@@ -281,7 +335,7 @@ export function buildCallRow(legs, campaignRow, cfg) {
  *
  * @returns {Promise<{rows: object[], windows: number, capHits: number}>}
  */
-export async function pullWindow(from, to, { cfg, campaignMap, deps = {}, depth = 0 } = {}) {
+export async function pullWindow(from, to, { cfg, campaignMap, agentMap = null, deps = {}, depth = 0 } = {}) {
   const runReport = deps.runReportAndWait || runReportAndWait;
   const result = await runReport({
     folder: REPORT_FOLDER,
@@ -317,8 +371,8 @@ export async function pullWindow(from, to, { cfg, campaignMap, deps = {}, depth 
     }
     const mid = new Date(from.getTime() + Math.floor(spanMs / 2));
     console.warn(`${LOG} window ${from.toISOString()}..${to.toISOString()} hit the ${REPORT_ROW_CAP}-row cap — splitting`);
-    const left = await pullWindow(from, mid, { cfg, campaignMap, deps, depth: depth + 1 });
-    const right = await pullWindow(mid, to, { cfg, campaignMap, deps, depth: depth + 1 });
+    const left = await pullWindow(from, mid, { cfg, campaignMap, agentMap, deps, depth: depth + 1 });
+    const right = await pullWindow(mid, to, { cfg, campaignMap, agentMap, deps, depth: depth + 1 });
     return {
       rows: [...left.rows, ...right.rows],
       windows: left.windows + right.windows,
@@ -329,7 +383,7 @@ export async function pullWindow(from, to, { cfg, campaignMap, deps = {}, depth 
   const rows = [];
   for (const [callId, legs] of groupByCallId(raw)) {
     const campaignRow = campaignMap?.get(legs[0].campaign) || null;
-    const { row, reject } = buildCallRow(legs, campaignRow, cfg);
+    const { row, reject } = buildCallRow(legs, campaignRow, cfg, agentMap);
     if (reject) {
       console.warn(`${LOG} call ${callId} rejected at shaping: ${reject}`);
       continue;
@@ -345,6 +399,31 @@ export async function loadCampaignMap(db = supabase) {
   const { data, error } = await db.from('ci_campaign_map').select('*');
   if (error) throw new Error(`ci_campaign_map read failed: ${error.message}`);
   return new Map((data || []).map((r) => [r.campaign, r]));
+}
+
+/**
+ * Load ci_agent_map into a Map keyed by LOWERCASED agent_username.
+ *
+ * Read ONCE per discovery run and threaded down, exactly as the campaign map
+ * is — the alternative is a query per call, and a 5000-row window would make
+ * 5000 of them.
+ *
+ * The key is folded to lowercase because the map holds the login as Five9's
+ * user record spells it (mixed case: 'Bleadbeater2254', 'Mcole2321') while the
+ * call log carries the login as typed. teamFromAgentMap() folds the lookup
+ * side to match. Rows with no username are skipped rather than keyed on '' —
+ * one such row would otherwise become the answer for every agentless leg.
+ */
+export async function loadAgentMap(db = supabase) {
+  const { data, error } = await db.from('ci_agent_map').select('*');
+  if (error) throw new Error(`ci_agent_map read failed: ${error.message}`);
+  const map = new Map();
+  for (const r of data || []) {
+    const key = String(r?.agent_username ?? '').trim().toLowerCase();
+    if (!key) continue;
+    map.set(key, r);
+  }
+  return map;
 }
 
 /**
@@ -366,13 +445,14 @@ export async function discoverCalls({ from, to, windowHours = 6, deps = {} } = {
   }
 
   const campaignMap = deps.campaignMap || await loadCampaignMap(db);
+  const agentMap = deps.agentMap || await loadAgentMap(db);
   const windows = splitWindows(start, end, windowHours);
 
   let shaped = [];
   let windowsPulled = 0;
   let capHits = 0;
   for (const w of windows) {
-    const out = await pullWindow(w.from, w.to, { cfg, campaignMap, deps });
+    const out = await pullWindow(w.from, w.to, { cfg, campaignMap, agentMap, deps });
     shaped = shaped.concat(out.rows);
     windowsPulled += out.windows;
     capHits += out.capHits;
@@ -417,4 +497,4 @@ export async function discoverCalls({ from, to, windowHours = 6, deps = {} } = {
 }
 
 export const _internal = { last4 };
-export default { discoverCalls, pullWindow, loadCampaignMap };
+export default { discoverCalls, pullWindow, loadCampaignMap, loadAgentMap };
