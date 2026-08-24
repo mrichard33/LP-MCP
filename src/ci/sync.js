@@ -32,6 +32,8 @@
  */
 
 import supabase from '../supabase.js';
+import { addNote as lpAddNote } from '../lp-client.js';
+import { addGHLNote } from '../ghl.js';
 import { getConfig, liveWrites, allowProbableLp, ghlCreateEnabled, nextRetryAt } from './config.js';
 import { composeNote, idempotencyKey } from './notes.js';
 import { WRITABLE_TIERS } from './match.js';
@@ -40,6 +42,31 @@ const LOG = '[CISync]';
 
 /** Postgres unique-violation. A duplicate write attempt, not an outage. */
 const UNIQUE_VIOLATION = '23505';
+
+/**
+ * ── THE PRODUCTION CLIENTS ─────────────────────────────────────────────────
+ * 2026-08-24 — the first live tick threw `Cannot read properties of undefined
+ * (reading 'addNote')` on six calls and reached no HTTP. syncToLp/syncToGhl
+ * took `lpClient`/`ghlClient` with NO default, and nothing upstream supplied
+ * one: worker.runTick() defaults adapter, transcriber and loadAudio but passes
+ * these two straight through. Every test injected a client, so the production
+ * path had never once executed.
+ *
+ * The default lives HERE, in the destructure at the write site, and nowhere
+ * else. Two reasons:
+ *   - The gate stays at the single write site. A default constructed in
+ *     runTick() would put a second source of the client above liveWrites(),
+ *     which is exactly the "second path to the API" the header warns about.
+ *   - The write site is not only reached from the worker. The review resolve
+ *     path and scripts/requeue-ci-review.js put a call back to 'matched' and a
+ *     later tick syncs it; anything that calls syncToLp/syncToGhl directly
+ *     would still have had `undefined` if the default sat in the worker.
+ *
+ * Exported so a test can assert these ARE the real client functions — an
+ * injected stub proves nothing about what production does.
+ */
+export const defaultLpClient = { addNote: lpAddNote };
+export const defaultGhlClient = { addGHLNote };
 
 /**
  * May this match tier be written to this target?
@@ -125,9 +152,9 @@ export async function markSyncFailed(db, row, err, cfg = getConfig()) {
 /**
  * Push the note to Lead Perfection.
  *
- * @param {object} opts.lpClient  injected { addNote } — real client in prod
+ * @param {object} [opts.lpClient]  { addNote }; defaults to the REAL LP client
  */
-export async function syncToLp(call, summary, match, { db = supabase, cfg = getConfig(), lpClient, link = null, agentLabel = null } = {}) {
+export async function syncToLp(call, summary, match, { db = supabase, cfg = getConfig(), lpClient = defaultLpClient, link = null, agentLabel = null } = {}) {
   const target = 'lp';
   const rectype = match?.evidence?.note_target?.rectype ?? null;
   const recid = match?.evidence?.note_target?.recid ?? null;
@@ -177,8 +204,10 @@ export async function syncToLp(call, summary, match, { db = supabase, cfg = getC
  * a contact from a call that matched nothing is the duplicate-contact risk
  * §14.4 calls the top danger. Without it, a missed match quietly becomes a new
  * contact record rather than a review item.
+ *
+ * @param {object} [opts.ghlClient]  { addGHLNote }; defaults to the REAL client
  */
-export async function syncToGhl(call, summary, match, { db = supabase, cfg = getConfig(), ghlClient, link = null, agentLabel = null } = {}) {
+export async function syncToGhl(call, summary, match, { db = supabase, cfg = getConfig(), ghlClient = defaultGhlClient, link = null, agentLabel = null } = {}) {
   const target = 'ghl';
   const contactId = match?.ghl_contact_id ?? null;
 
@@ -260,4 +289,7 @@ export function shapeOf(resp) {
   return { shape: 'object', keys: Object.keys(resp).slice(0, 10) };
 }
 
-export default { syncCall, syncToLp, syncToGhl, tierWritable, claimSync, markSynced, markSyncFailed };
+export default {
+  syncCall, syncToLp, syncToGhl, tierWritable, claimSync, markSynced, markSyncFailed,
+  defaultLpClient, defaultGhlClient,
+};
