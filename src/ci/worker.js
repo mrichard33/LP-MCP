@@ -21,7 +21,7 @@
 import supabase from '../supabase.js';
 import { runSQL } from '../admin/supabase-admin.js';
 import { getConfig, nextRetryAt } from './config.js';
-import { createSftpAdapter, createManualAdapter, describeRecording, matchRecordingToCall, storeAudio, sha256Hex, ensureLinkToken, linkableRecording } from './recordings.js';
+import { createSftpAdapter, createManualAdapter, describeRecording, matchRecordingToCall, storeAudio, sha256Hex, ensureLinkToken, linkableRecording, transcodeAndStoreMp3 } from './recordings.js';
 import { dateDirFor, last4, last10 } from './time.js';
 import { transcribeCall, createOpenAITranscriber, createStorageAudioLoader } from './transcribe.js';
 import { analyzeTranscript } from './analyze.js';
@@ -213,6 +213,18 @@ export async function stageFetchRecording(call, { db = supabase, cfg = getConfig
   const buffer = await sftp.fetch({ sourcePath: best.recording.sourcePath });
   const stored = await storeAudio({ callId: call.id, buffer, filename: best.recording.sourceFilename, db });
 
+  // The browser-playable derivative, stored beside the original. NEVER throws:
+  // a call whose audio will not convert still needs its transcript, so a failed
+  // transcode leaves mp3_storage_path null and the route serves the WAV.
+  // The WAV is untouched — it stays the archival copy and the Whisper input.
+  const mp3 = await transcodeAndStoreMp3({
+    callId: call.id,
+    buffer,
+    sha: stored.sha256,
+    filename: best.recording.sourceFilename,
+    db,
+  });
+
   const { error } = await db.from('ci_recordings').upsert({
     call_id: call.id,
     source: 'sftp',
@@ -231,6 +243,8 @@ export async function stageFetchRecording(call, { db = supabase, cfg = getConfig
     file_bytes: stored.bytes,
     mime: 'audio/wav',
     storage_path: stored.storagePath,
+    mp3_storage_path: mp3.mp3StoragePath,
+    mp3_bytes: mp3.mp3Bytes,
     excluded: false,
   }, { onConflict: 'source_path' });
   if (error) throw new Error(`ci_recordings upsert failed: ${error.message}`);
@@ -245,6 +259,10 @@ export async function stageFetchRecording(call, { db = supabase, cfg = getConfig
     match_method: best.method,
     confidence: best.confidence,
     phone: last4(call.customer_phone || call.ani),
+    // Recorded either way. A run of nulls here is how "ffmpeg is missing in
+    // production" becomes visible instead of just quietly unplayable links.
+    mp3_bytes: mp3.mp3Bytes,
+    ...(mp3.error ? { mp3_error: mp3.error.slice(0, 200) } : {}),
   });
   return { outcome: 'advanced', to: 'fetched' };
 }
