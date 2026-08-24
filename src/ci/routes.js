@@ -261,26 +261,62 @@ export function createRecordingHandler({
       const client = db || supabase;
       if (!client) throw new Error('Supabase not configured');
 
-      const { data: rec, error } = await client
+      // DEPLOY-BEFORE-DDL GRACE, the same pattern claimBatch() uses for
+      // sql/063. This is the ONE public route in the subsystem, and it fails
+      // closed: an unknown column would surface as a caught error and turn
+      // EVERY recording link into a 404 — a worse regression than the
+      // unplayable audio this PR exists to fix. So a missing mp3 column
+      // degrades to the pre-070 read instead of breaking the route, and says
+      // so once per request rather than silently.
+      let rec;
+      let { data, error } = await client
         .from('ci_recordings')
-        .select('id, call_id, storage_path, link_expires_at, purged_at')
+        .select('id, call_id, storage_path, mp3_storage_path, link_expires_at, purged_at')
         .eq('link_token', token)
         .maybeSingle();
+      if (error && /mp3_storage_path|column .* does not exist|42703|schema cache/i.test(error.message || '')) {
+        console.warn(`${LOG} ci_recordings.mp3_storage_path is missing — serving WAVs until sql/070 is applied`);
+        ({ data, error } = await client
+          .from('ci_recordings')
+          .select('id, call_id, storage_path, link_expires_at, purged_at')
+          .eq('link_token', token)
+          .maybeSingle());
+      }
       if (error) throw new Error(`ci_recordings lookup failed: ${error.message}`);
+      rec = data;
 
       if (!rec) return notFound();
       if (rec.purged_at) return notFound();
+      // Gated on the WAV, deliberately, NOT on whichever object is about to be
+      // served. storage_path is the original and is what "this recording still
+      // exists" means; a row with no WAV has been purged or never landed, and
+      // must 404 whatever the derivative column says.
       if (!rec.storage_path) return notFound();
       if (rec.link_expires_at && new Date(rec.link_expires_at).getTime() <= now()) return notFound();
 
+      // ══ PREFER THE MP3, FALL BACK TO THE WAV ══
+      // Five9's WAVs are GSM 6.10 (format tag 0x0031), which no browser will
+      // decode — the link opened and nothing played. The MP3 derivative is
+      // uploaded with contentType 'audio/mpeg', so the redirect carries the
+      // right type from Storage. A null here is a NORMAL state (ingested
+      // before sql/070, or a transcode that failed) and serving the WAV is
+      // exactly the behaviour that shipped before, not a degradation.
+      //
+      // ONE ROUTE, ONE TOKEN. There is deliberately no ?format= — a second
+      // way to name the object is a second way in that is not the token.
+      const objectPath = rec.mp3_storage_path || rec.storage_path;
+
       const { data: signed, error: signErr } = await client.storage
         .from(CI_AUDIO_BUCKET)
-        .createSignedUrl(rec.storage_path, signedTtlS);
+        .createSignedUrl(objectPath, signedTtlS);
       if (signErr || !signed?.signedUrl) {
         throw new Error(`signed URL failed: ${signErr?.message || 'no url returned'}`);
       }
 
-      console.log(`${LOG} rec token=${prefix}… → call ${rec.call_id} (signed ${signedTtlS}s)`);
+      console.log(
+        `${LOG} rec token=${prefix}… → call ${rec.call_id} ` +
+        `(${rec.mp3_storage_path ? 'mp3' : 'wav — not transcoded, may not play'}, signed ${signedTtlS}s)`,
+      );
       return res.redirect(302, signed.signedUrl);
     } catch (err) {
       // Even an internal failure must not describe itself: an error string

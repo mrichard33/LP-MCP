@@ -264,6 +264,7 @@ import { registerScorecardValidateRoutes, startScorecardValidateScheduler } from
 import { registerFive9SnapshotRoutes, startFive9ConfigSnapshotScheduler } from './jobs/five9-config-snapshot.js';
 import { registerCiRoutes } from './ci/routes.js';
 import { startCiWorkerScheduler } from './ci/worker.js';
+import { logFfmpegStatus } from './ci/recordings.js';
 // ─── Agentic Hold-Complete (return-from-hold re-entry) ───────────
 import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
 // ─── FB Publish Watchdog (alert on missed WF4 publish window) ────
@@ -1170,6 +1171,22 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] call intelligence agent display name FAILED (CRM notes may show administrative agent labels — apply sql/069 manually):', err.message);
   }
+
+  // CI recording MP3 derivative (sql/070 — the file is the source of truth).
+  // Five9 writes GSM 6.10 (WAVE format tag 0x0031), which no browser decodes,
+  // so the shareable link opened and nothing played. These two columns locate
+  // the MP3 copy. Both nullable and NULL is a normal state — pre-070 rows, a
+  // purged recording, or a transcode that failed — and the route falls back to
+  // the WAV, which is exactly the behaviour that shipped before. storage_path
+  // is NOT touched: the WAV stays the archival copy and the Whisper input.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS mp3_storage_path text;
+            ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS mp3_bytes        bigint;`);
+    console.log('[Migration] call intelligence recording mp3 (sql/070) ready');
+  } catch (err) {
+    console.error('[Migration] call intelligence recording mp3 FAILED (recording links will serve unplayable GSM WAVs — apply sql/070 manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
@@ -1566,6 +1583,11 @@ app.listen(PORT, async () => {
   startGoalScorecardScheduler();
   startScorecardValidateScheduler();
   startFive9ConfigSnapshotScheduler();
+  // Probe ffmpeg, which transcodes Five9's GSM 6.10 recordings to a format a
+  // browser can actually play. A CLEAR LOG LINE, NOT A CRASH: without it the
+  // whole pipeline still runs and links still resolve, they just serve the
+  // unplayable original. Deliberately not awaited — a boot must not wait on it.
+  logFfmpegStatus().catch(() => {});
   startCiWorkerScheduler();
   startLpReportReconScheduler();
   startLpReportWatchdog();

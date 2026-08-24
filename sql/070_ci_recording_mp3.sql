@@ -1,0 +1,96 @@
+-- ============================================================================
+-- 070 — Call Intelligence: browser-playable MP3 derivative of each recording
+--
+-- WHY: the shareable link added in sql/068 works — the route returns HTTP 200,
+-- content-type audio/wav, a valid RIFF file, and the token resolves correctly.
+-- The rep still gets nothing, because of what is INSIDE the RIFF container.
+--
+-- Five9 writes WAVE format tag 0x0031: GSM 6.10, 8 kHz, 1 channel, with a fact
+-- chunk. Verified by fetching a real file through GET /ci/rec/:token — 456,036
+-- bytes, valid RIFF, format tag 0x0031. Chrome, Safari, Firefox and QuickTime
+-- all refuse to decode GSM 6.10. The link opens and nothing plays.
+--
+-- So we store a second object per recording: the same audio transcoded to MP3,
+-- which every one of those decodes. These two columns locate it.
+--
+-- (This also settles the stereo question that has been open since sql/061:
+-- channels = 1 in the header. There is no second channel to diarize —
+-- dual-channel audio has to come from Five9 or not at all.)
+--
+-- ── THE WAV IS NOT REPLACED ────────────────────────────────────────────────
+-- storage_path keeps pointing at the ORIGINAL Five9 WAV and nothing here
+-- changes it. That file is the archival copy and it is the TRANSCRIPTION
+-- INPUT: Whisper already accepts the GSM WAV, so src/ci/transcribe.js keeps
+-- reading storage_path and must not be pointed at the derivative. The MP3 is
+-- for humans only — a rep clicking a link — and carries no pipeline meaning.
+--
+-- Storing the derivative rather than transcoding on request is deliberate: the
+-- public route mints a signed URL and redirects, so there is no place to
+-- transcode in-band without holding the request open for the length of a call.
+--
+-- ── BOTH COLUMNS ARE NULLABLE, AND NULL IS A NORMAL STATE ──────────────────
+-- Three ways a row legitimately has no MP3:
+--   - it was ingested before this migration (10 such rows today)
+--   - its audio has been purged
+--   - the transcode FAILED, which must never fail the fetch stage — a call
+--     whose audio will not convert still needs its transcript
+-- The route falls back to serving the WAV whenever mp3_storage_path is null,
+-- so every one of those degrades to exactly today's behaviour rather than to
+-- a broken link.
+--
+-- No index. The column is never a lookup key: the route finds a row by
+-- link_token (sql/068) and then reads this column off the row it already has.
+--
+-- Mirrored in runMigrations() (src/index.js). Purely additive: two nullable
+-- columns. No existing column changes type or nullability and no row is
+-- rewritten — existing recordings get an MP3 from
+-- scripts/backfill-ci-mp3.js --execute, not from this file.
+--
+-- ROLLBACK:
+--   ALTER TABLE ci_recordings DROP COLUMN IF EXISTS mp3_bytes;
+--   ALTER TABLE ci_recordings DROP COLUMN IF EXISTS mp3_storage_path;
+--   -- NOTE: this strands the .mp3 objects in the ci-audio bucket. They are
+--   -- derivatives and losing them costs nothing but the CPU to remake them;
+--   -- the WAVs they came from are untouched by this migration either way.
+-- ============================================================================
+
+ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS mp3_storage_path text;
+ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS mp3_bytes        bigint;
+
+-- ─── Verification ────────────────────────────────────────────────────────────
+-- Both columns present and nullable:
+--   SELECT column_name, data_type, is_nullable FROM information_schema.columns
+--    WHERE table_name = 'ci_recordings'
+--      AND column_name IN ('mp3_storage_path','mp3_bytes');
+--   -- expect 2 rows: text/YES and bigint/YES
+--
+-- The WAV is still the transcription input — storage_path is untouched and no
+-- live recording lost its original (0 rows, always):
+--   SELECT count(*) FROM ci_recordings
+--    WHERE purged_at IS NULL AND mp3_storage_path IS NOT NULL
+--      AND storage_path IS NULL;
+--   -- expect 0
+--
+-- The two objects are never the same object (0 rows, always):
+--   SELECT count(*) FROM ci_recordings WHERE mp3_storage_path = storage_path;
+--   -- expect 0
+--
+-- A derivative always names a .mp3 and an original always names a .wav:
+--   SELECT count(*) FROM ci_recordings
+--    WHERE (mp3_storage_path IS NOT NULL AND mp3_storage_path NOT LIKE '%.mp3')
+--       OR (storage_path     IS NOT NULL AND storage_path     NOT LIKE '%.wav');
+--   -- expect 0
+--
+-- Coverage — how much of the live audio a rep can actually play. Rows with no
+-- MP3 are NOT a fault (see the nullable note above); this is the number
+-- scripts/backfill-ci-mp3.js drives toward:
+--   SELECT count(*) FILTER (WHERE mp3_storage_path IS NOT NULL) AS playable,
+--          count(*)                                             AS live
+--     FROM ci_recordings WHERE purged_at IS NULL AND storage_path IS NOT NULL;
+--
+-- A purge must clear BOTH objects, never one (0 rows, always):
+--   SELECT count(*) FROM ci_recordings
+--    WHERE purged_at IS NOT NULL
+--      AND (storage_path IS NOT NULL OR mp3_storage_path IS NOT NULL
+--           OR link_token IS NOT NULL);
+--   -- expect 0

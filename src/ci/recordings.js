@@ -30,6 +30,7 @@
  */
 
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
 
 import supabase from '../supabase.js';
 import { getConfig } from './config.js';
@@ -509,16 +510,235 @@ export async function storeAudio({ callId, buffer, filename, db = supabase }) {
   return { storagePath, sha256: sha, bytes: buffer.length };
 }
 
+/* ─── MP3 derivative ────────────────────────────────────────────────────── */
+
+/**
+ * ══ WHY THIS EXISTS ══
+ * Five9 writes WAVE format tag 0x0031 — GSM 6.10, 8 kHz, 1 channel, with a
+ * fact chunk. Verified by fetching a real file through GET /ci/rec/:token:
+ * HTTP 200, content-type audio/wav, 456,036 bytes, valid RIFF. The route and
+ * the token work correctly. Chrome, Safari, Firefox and QuickTime all refuse
+ * to decode GSM 6.10, so the rep clicks the link and gets nothing.
+ *
+ * So every fetched recording also gets an MP3 derivative, stored alongside the
+ * original in the SAME private bucket. THE WAV IS NOT REPLACED: it is the
+ * archival copy and the transcription input (Whisper accepts the GSM WAV, and
+ * transcribe.js keeps reading storage_path). The MP3 is for humans only.
+ */
+
+/** Overridable so a container with ffmpeg somewhere unusual still works. */
+export const FFMPEG_BIN = process.env.CI_FFMPEG_PATH || 'ffmpeg';
+
+/** Mono, 64 kbps — speech from an 8 kHz telephony source. */
+export const MP3_BITRATE = '64k';
+
+/**
+ * 44.1 kHz OUTPUT, from an 8 kHz source, and the upsample is the point.
+ *
+ * MP3 sample rates fall in three families: MPEG-1 (32/44.1/48 kHz), MPEG-2 LSF
+ * (16/22.05/24) and MPEG-2.5 (8/11.025/12). Encoding at the source's native
+ * 8 kHz would produce MPEG-2.5, whose decoder support is exactly the thing that
+ * is spotty in Safari and QuickTime — both named targets here. Re-encoding at
+ * 44.1 kHz yields plain MPEG-1 Layer III, which every browser and player
+ * decodes, and costs nothing in file size because BITRATE governs size, not
+ * sample rate. It adds no information to the audio and is not meant to: this
+ * whole derivative exists so the file PLAYS, and the container is what was
+ * stopping it.
+ */
+export const MP3_SAMPLE_RATE = 44100;
+
+/** A call that will not convert in this long is not going to. */
+export const MP3_TIMEOUT_MS = 120_000;
+
+/**
+ * Transcode a WAV buffer to MP3 bytes via ffmpeg, over pipes — no temp files.
+ *
+ * THROWS on failure. The caller (transcodeAndStoreMp3) is what swallows it;
+ * this stays honest so the backfill can report why a file would not convert.
+ *
+ * @returns {Promise<Buffer>}
+ */
+export function transcodeToMp3(buffer, {
+  bin = FFMPEG_BIN,
+  bitrate = MP3_BITRATE,
+  sampleRate = MP3_SAMPLE_RATE,
+  timeoutMs = MP3_TIMEOUT_MS,
+  spawnImpl = spawn,
+} = {}) {
+  return new Promise((resolve, reject) => {
+    if (!Buffer.isBuffer(buffer) || !buffer.length) {
+      reject(new Error('transcodeToMp3 requires a non-empty buffer'));
+      return;
+    }
+
+    // -f wav on the INPUT is deliberate: ffmpeg cannot seek a pipe, so letting
+    // it probe would make it buffer looking for a format it has already been
+    // told. -ac 1 because these files are mono and an upmix would only double
+    // the bytes.
+    const args = [
+      '-hide_banner', '-loglevel', 'error',
+      '-f', 'wav', '-i', 'pipe:0',
+      '-vn', '-ac', '1', '-ar', String(sampleRate), '-b:a', bitrate,
+      '-f', 'mp3', 'pipe:1',
+    ];
+
+    let child;
+    try {
+      child = spawnImpl(bin, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (err) {
+      reject(new Error(`ffmpeg could not be started (${bin}): ${err.message}`));
+      return;
+    }
+
+    const out = [];
+    const errText = [];
+    let settled = false;
+    const finish = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(arg);
+    };
+
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      finish(reject, new Error(`ffmpeg timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    child.stdout.on('data', (d) => out.push(d));
+    // Bounded: a pathological file must not accumulate megabytes of log lines
+    // in memory just to be quoted in an error message.
+    child.stderr.on('data', (d) => { if (errText.length < 40) errText.push(String(d)); });
+
+    child.on('error', (err) => finish(reject, new Error(`ffmpeg failed to run (${bin}): ${err.message}`)));
+
+    child.on('close', (code) => {
+      if (code !== 0) {
+        finish(reject, new Error(`ffmpeg exited ${code}: ${errText.join('').trim().slice(0, 500) || 'no stderr'}`));
+        return;
+      }
+      const mp3 = Buffer.concat(out);
+      if (!mp3.length) {
+        finish(reject, new Error('ffmpeg produced no output'));
+        return;
+      }
+      finish(resolve, mp3);
+    });
+
+    // EPIPE here is normal when ffmpeg rejects the input and exits before
+    // reading it all; the non-zero exit above is the real error, and letting
+    // this one through unhandled would crash the process instead.
+    child.stdin.on('error', () => {});
+    child.stdin.end(buffer);
+  });
+}
+
+/**
+ * Is ffmpeg present? Resolves a verdict, NEVER throws and never rejects.
+ *
+ * @returns {Promise<{ok: boolean, version: string|null, error: string|null}>}
+ */
+export function ffmpegAvailable({ bin = FFMPEG_BIN, spawnImpl = spawn, timeoutMs = 10_000 } = {}) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawnImpl(bin, ['-hide_banner', '-version'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (err) {
+      resolve({ ok: false, version: null, error: err.message });
+      return;
+    }
+    const out = [];
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; clearTimeout(timer); resolve(v); } };
+    const timer = setTimeout(() => { child.kill('SIGKILL'); done({ ok: false, version: null, error: 'timed out' }); }, timeoutMs);
+    child.stdout.on('data', (d) => out.push(d));
+    child.on('error', (err) => done({ ok: false, version: null, error: err.message }));
+    child.on('close', (code) => {
+      if (code !== 0) return done({ ok: false, version: null, error: `exited ${code}` });
+      done({ ok: true, version: Buffer.concat(out).toString().split('\n')[0].trim() || null, error: null });
+    });
+  });
+}
+
+/**
+ * Startup probe. A CLEAR LOG LINE, NOT A CRASH.
+ *
+ * A missing ffmpeg costs playable links and nothing else: the WAV is still
+ * fetched, still transcribed, still analyzed, still matched, still synced, and
+ * the route falls back to serving it. Refusing to boot over that would trade a
+ * working pipeline for a convenience — the exact trade ensureLinkToken()
+ * already refuses to make. So this says so loudly and returns.
+ */
+export async function logFfmpegStatus(opts = {}) {
+  const status = await ffmpegAvailable(opts);
+  if (status.ok) {
+    console.log(`${LOG} ffmpeg present — recordings will get a browser-playable MP3 (${status.version})`);
+  } else {
+    console.warn(
+      `${LOG} ffmpeg NOT FOUND (${status.error}). The pipeline runs normally and links still resolve, ` +
+      'but they serve the original Five9 GSM 6.10 WAV, which no browser can decode — a rep clicking a ' +
+      'link will get nothing. Install ffmpeg in the runtime image (Dockerfile: apk add ffmpeg).',
+    );
+  }
+  return status;
+}
+
+/**
+ * Store the MP3 derivative beside its original.
+ *
+ * Keyed on the SOURCE WAV's sha, not the MP3's own, so the derivative is
+ * addressed by the identity of the audio it came from: re-running the
+ * transcode overwrites one object instead of littering the bucket with a new
+ * one per encoder run, and the pairing with the .wav is readable from the path.
+ */
+export async function storeMp3({ callId, buffer, sha, db = supabase }) {
+  const storagePath = `${callId || 'unlinked'}/${sha}.mp3`;
+  const { error } = await db.storage
+    .from(CI_AUDIO_BUCKET)
+    .upload(storagePath, buffer, { contentType: 'audio/mpeg', upsert: true });
+  if (error) throw new Error(`ci-audio mp3 upload failed for ${storagePath}: ${error.message}`);
+  return { storagePath, bytes: buffer.length };
+}
+
+/**
+ * Transcode + store + report, and NEVER THROW.
+ *
+ * ══ A FAILED TRANSCODE MUST NOT FAIL THE FETCH STAGE ══
+ * This is the whole contract. A call whose audio will not convert still needs
+ * its transcript, its analysis, its match and its note — everything that
+ * actually reaches a customer record. Losing the convenience of a playable
+ * link is a bad afternoon; losing the note is the pipeline not working. So
+ * every failure path here logs and returns nulls, the row keeps
+ * mp3_storage_path null, and the route serves the WAV exactly as it does today.
+ *
+ * @returns {Promise<{mp3StoragePath: string|null, mp3Bytes: number|null, error: string|null}>}
+ */
+export async function transcodeAndStoreMp3({ callId, buffer, sha, filename = null, db = supabase, opts = {} } = {}) {
+  try {
+    const mp3 = await transcodeToMp3(buffer, opts);
+    const stored = await storeMp3({ callId, buffer: mp3, sha, db });
+    return { mp3StoragePath: stored.storagePath, mp3Bytes: stored.bytes, error: null };
+  } catch (err) {
+    console.warn(`${LOG} mp3 transcode skipped for ${filename || sha}: ${err.message} (the WAV is stored and will still be transcribed)`);
+    return { mp3StoragePath: null, mp3Bytes: null, error: err.message };
+  }
+}
+
 /**
  * Purge audio past the retention window. Five9/ETG remain the system of
  * record, so deleting OUR copy loses nothing; the row is kept and stamped
  * purged_at so the audit trail still shows the file existed.
+ *
+ * BOTH OBJECTS GO. The MP3 derivative is audio of the same conversation and is
+ * subject to the same retention — purging the WAV and leaving the MP3 would
+ * keep the recording we promised to delete, in the more playable of the two
+ * formats, addressable by a token that is about to be nulled anyway.
  */
 export async function purgeExpiredAudio({ db = supabase, cfg = getConfig(), now = new Date() } = {}) {
   const cutoff = new Date(now.getTime() - cfg.audioRetentionDays * 24 * 60 * 60 * 1000).toISOString();
   const { data, error } = await db
     .from('ci_recordings')
-    .select('id, storage_path')
+    .select('id, storage_path, mp3_storage_path')
     .not('storage_path', 'is', null)
     .is('purged_at', null)
     .lt('fetched_at', cutoff)
@@ -528,7 +748,11 @@ export async function purgeExpiredAudio({ db = supabase, cfg = getConfig(), now 
   const rows = data || [];
   if (!rows.length) return { purged: 0 };
 
-  const { error: rmErr } = await db.storage.from(CI_AUDIO_BUCKET).remove(rows.map((r) => r.storage_path));
+  // One remove() call carrying both objects per row. Nulls filtered out — a
+  // row with no MP3 (pre-070, or a failed transcode) is normal, and passing a
+  // null path would fail the whole batch over a file that never existed.
+  const objects = rows.flatMap((r) => [r.storage_path, r.mp3_storage_path]).filter(Boolean);
+  const { error: rmErr } = await db.storage.from(CI_AUDIO_BUCKET).remove(objects);
   if (rmErr) throw new Error(`ci-audio remove failed: ${rmErr.message}`);
 
   const { error: updErr } = await db
@@ -536,6 +760,11 @@ export async function purgeExpiredAudio({ db = supabase, cfg = getConfig(), now 
     .update({
       purged_at: new Date().toISOString(),
       storage_path: null,
+      // The derivative is gone from the bucket, so the column that points at
+      // it must go too — otherwise the route prefers an object that no longer
+      // exists and the fallback to the WAV never runs.
+      mp3_storage_path: null,
+      mp3_bytes: null,
       // NULL THE TOKEN AT PURGE, not at link_expires_at. The two are normally
       // the same instant, but a purge can run early (a retention change, a
       // manual cleanup) and a token that outlived its object would resolve to
@@ -547,8 +776,11 @@ export async function purgeExpiredAudio({ db = supabase, cfg = getConfig(), now 
     .in('id', rows.map((r) => r.id));
   if (updErr) throw new Error(`purge stamp failed: ${updErr.message}`);
 
-  console.log(`${LOG} purged ${rows.length} audio object(s) older than ${cfg.audioRetentionDays}d`);
-  return { purged: rows.length };
+  console.log(
+    `${LOG} purged ${rows.length} recording(s) — ${objects.length} object(s), WAV + MP3 — ` +
+    `older than ${cfg.audioRetentionDays}d`,
+  );
+  return { purged: rows.length, objects: objects.length };
 }
 
 export const _internal = { confidenceFor, last4 };
@@ -569,4 +801,9 @@ export default {
   RECORDING_MATCH_CAMPAIGN_TIME,
   RECORDING_MATCH_CAMPAIGN_TIME_LEGACY,
   RECORDING_MATCH_METHODS,
+  transcodeToMp3,
+  transcodeAndStoreMp3,
+  storeMp3,
+  ffmpegAvailable,
+  logFfmpegStatus,
 };
