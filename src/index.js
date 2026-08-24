@@ -1142,6 +1142,20 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] call intelligence canvasser roster FAILED (canvasser ANIs will phone-match as customers — apply sql/067 manually):', err.message);
   }
+
+  // CI recording links (sql/068 — the file is the source of truth).
+  // link_token is the ENTIRE access control on the public GET /ci/rec/:token
+  // route, so the index must be UNIQUE: the route looks a token up as its only
+  // key and a duplicate would make that lookup ambiguous.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS link_token      text;
+            ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS link_expires_at timestamptz;
+            CREATE UNIQUE INDEX IF NOT EXISTS ci_recordings_link_token_uq ON ci_recordings (link_token);`);
+    console.log('[Migration] call intelligence recording links (sql/068) ready');
+  } catch (err) {
+    console.error('[Migration] call intelligence recording links FAILED (notes will carry no Recording: line — apply sql/068 manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {

@@ -70,6 +70,128 @@ export function sha256Hex(buffer) {
   return crypto.createHash('sha256').update(buffer).digest('hex');
 }
 
+/* ─── shareable links ───────────────────────────────────────────────────── */
+
+/**
+ * Mint a recording link token.
+ *
+ * ══ THIS VALUE IS THE ENTIRE ACCESS CONTROL ══
+ * Decision record (Mark, 2026-08-24): recording links work for anyone holding
+ * them, with no login, because a rep has to be able to forward the note. So
+ * there is no second factor behind this — guessing the token IS the attack,
+ * and 256 bits of CSPRNG output is the only thing standing in the way.
+ *
+ * It is therefore NOT, and must never become:
+ *   - a uuid           — v4 spends 6 bits on version/variant and leaves 122,
+ *                        and some uuid paths in this repo are v1/time-based
+ *   - derived from call_id, five9_call_id, source_path, or file_sha256 — all
+ *     of those are knowable or enumerable elsewhere, so deriving from them
+ *     would let anyone holding ONE token compute others
+ *   - a hash of anything at all — same reason
+ *
+ * base64url so it is safe in a path segment with no escaping: 32 bytes → 43
+ * chars, no padding, alphabet [A-Za-z0-9_-]. sql/068's verification query
+ * asserts that shape precisely so a regression to something guessable is
+ * visible in one SELECT.
+ */
+export function mintLinkToken() {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+/**
+ * When a link dies: fetched_at + CI_AUDIO_RETENTION_DAYS.
+ *
+ * Deliberately the SAME horizon as the audio purge rather than a policy of its
+ * own. The link cannot outlive the object it points at, and tying the two
+ * together means there is one number to change, not two that can drift into
+ * disagreeing.
+ */
+export function linkExpiresAt(fetchedAt, cfg = getConfig()) {
+  const base = fetchedAt ? new Date(fetchedAt) : new Date();
+  if (Number.isNaN(base.getTime())) return null;
+  return new Date(base.getTime() + cfg.audioRetentionDays * 24 * 60 * 60 * 1000);
+}
+
+/**
+ * Give a stored recording a link token IF IT DOES NOT ALREADY HAVE ONE.
+ *
+ * WHY THIS IS A SEPARATE CONDITIONAL UPDATE rather than columns on the upsert.
+ * The ci_recordings write is an upsert on source_path, so re-fetching a
+ * recording (a review retry, a re-run of the fetch stage) runs it again. If
+ * the token were part of that payload, the re-fetch would ROTATE it — and
+ * every link already pasted into an LP or GHL note for that call would break,
+ * silently, with no error anywhere. `.is('link_token', null)` makes the write
+ * happen exactly once per recording and turns a re-fetch into a no-op.
+ *
+ * Never throws. A recording that fails to get a token still has its audio and
+ * its row; the note simply omits the link line. Failing the whole fetch stage
+ * over a link would trade a working pipeline for a convenience.
+ *
+ * @returns {Promise<{token: string|null, expiresAt: string|null}>}
+ */
+export async function ensureLinkToken({ sourcePath, fetchedAt = null, db = supabase, cfg = getConfig() }) {
+  if (!sourcePath || !db) return { token: null, expiresAt: null };
+  const token = mintLinkToken();
+  const expires = linkExpiresAt(fetchedAt, cfg);
+  const expiresAt = expires ? expires.toISOString() : null;
+
+  try {
+    const { data, error } = await db
+      .from('ci_recordings')
+      .update({ link_token: token, link_expires_at: expiresAt })
+      .eq('source_path', sourcePath)
+      .is('link_token', null)
+      .select('link_token, link_expires_at');
+    if (error) throw new Error(error.message);
+
+    // No row updated means one already had a token — read it back rather than
+    // reporting null, so the caller can still compose a link.
+    if (!data || data.length === 0) {
+      const { data: existing, error: readErr } = await db
+        .from('ci_recordings')
+        .select('link_token, link_expires_at')
+        .eq('source_path', sourcePath)
+        .maybeSingle();
+      if (readErr) throw new Error(readErr.message);
+      return {
+        token: existing?.link_token ?? null,
+        expiresAt: existing?.link_expires_at ?? null,
+      };
+    }
+    return { token, expiresAt };
+  } catch (err) {
+    console.warn(`${LOG} link token not issued for ${sourcePath}: ${err.message}`);
+    return { token: null, expiresAt: null };
+  }
+}
+
+/**
+ * Choose the recording a note should link to: the FIRST by recorded_at.
+ *
+ * A held call produces several segments — one live call carried seven. Pasting
+ * seven URLs into a CRM note would make the note unreadable, so the note links
+ * the first and says how many more there are. Pure.
+ *
+ * Rows with no usable token are skipped entirely; ordering falls back to
+ * fetched_at, then to the original array order, so a null recorded_at cannot
+ * make the choice non-deterministic between runs.
+ *
+ * @returns {{recording: object|null, extra: number}}
+ */
+export function linkableRecording(recordings) {
+  const usable = (recordings || []).filter((r) => r && r.link_token && !r.purged_at);
+  if (!usable.length) return { recording: null, extra: 0 };
+  const key = (r) => {
+    const t = new Date(r.recorded_at ?? r.fetched_at ?? 0).getTime();
+    return Number.isFinite(t) ? t : 0;
+  };
+  const ordered = usable
+    .map((r, i) => ({ r, i }))
+    .sort((a, b) => (key(a.r) - key(b.r)) || (a.i - b.i))
+    .map((x) => x.r);
+  return { recording: ordered[0], extra: ordered.length - 1 };
+}
+
 /**
  * Score one candidate call against one parsed recording.
  *
@@ -364,7 +486,17 @@ export async function purgeExpiredAudio({ db = supabase, cfg = getConfig(), now 
 
   const { error: updErr } = await db
     .from('ci_recordings')
-    .update({ purged_at: new Date().toISOString(), storage_path: null })
+    .update({
+      purged_at: new Date().toISOString(),
+      storage_path: null,
+      // NULL THE TOKEN AT PURGE, not at link_expires_at. The two are normally
+      // the same instant, but a purge can run early (a retention change, a
+      // manual cleanup) and a token that outlived its object would resolve to
+      // a row whose storage_path is null — a 500, or worse a signed URL for
+      // nothing. Killing the token here makes the link dead the moment the
+      // audio is, and the route's 404 then reads as "expired", which it is.
+      link_token: null,
+    })
     .in('id', rows.map((r) => r.id));
   if (updErr) throw new Error(`purge stamp failed: ${updErr.message}`);
 
@@ -382,4 +514,8 @@ export default {
   storeAudio,
   purgeExpiredAudio,
   assertReadOnly,
+  mintLinkToken,
+  linkExpiresAt,
+  ensureLinkToken,
+  linkableRecording,
 };

@@ -17,7 +17,8 @@ import supabase from '../supabase.js';
 import { getConfig } from './config.js';
 import { discoverCalls } from './discovery.js';
 import { runTick } from './worker.js';
-import { createManualAdapter, storeAudio, sha256Hex, describeRecording } from './recordings.js';
+import { createManualAdapter, storeAudio, sha256Hex, describeRecording, ensureLinkToken } from './recordings.js';
+import { CI_AUDIO_BUCKET } from '../../scripts/setup-ci-audio-bucket.js';
 import { reconcileDay, pipelineHealth } from './reconcile.js';
 
 const LOG = '[CIRoutes]';
@@ -71,6 +72,137 @@ export async function resumeStatusFor(db, callId) {
   if (await has('ci_transcripts')) return 'transcribed';
   if (await has('ci_recordings')) return 'fetched';
   return 'discovered';
+}
+
+/**
+ * Fixed-window per-IP limiter for the public recording route.
+ *
+ * In-memory and deliberately dependency-free — the repo has no rate-limit
+ * package and this needs no shared state to do its job. It is NOT a general
+ * limiter and is not offered as one: its single purpose is to blunt online
+ * token guessing on /ci/rec/:token.
+ *
+ * Note what it is worth and what it is not. A 256-bit token is not going to
+ * fall to brute force at any rate, so this is defence in depth, not the
+ * defence — it caps the noise, keeps a scan out of the logs, and stops one
+ * host burning the signed-URL path. Per-process, so N replicas allow N × the
+ * limit; that is acceptable for the same reason.
+ */
+export const REC_RATE_LIMIT = 30;          // requests
+export const REC_RATE_WINDOW_MS = 60_000;  // per IP, per minute
+
+export function createRateLimiter({ limit = REC_RATE_LIMIT, windowMs = REC_RATE_WINDOW_MS } = {}) {
+  const hits = new Map();   // ip -> { count, resetAt }
+  return function allow(ip, now = Date.now()) {
+    const key = String(ip || 'unknown');
+    const entry = hits.get(key);
+    if (!entry || now >= entry.resetAt) {
+      hits.set(key, { count: 1, resetAt: now + windowMs });
+      // Opportunistic sweep so a scan from many source addresses cannot grow
+      // this map without bound.
+      if (hits.size > 5000) {
+        for (const [k, v] of hits) if (now >= v.resetAt) hits.delete(k);
+      }
+      return true;
+    }
+    entry.count += 1;
+    return entry.count <= limit;
+  };
+}
+
+/** How long a minted Storage signed URL stays valid. */
+export const REC_SIGNED_URL_TTL_S = 300;
+
+/** First 8 chars only — enough to correlate a log line, useless as a key. */
+export function tokenPrefix(token) {
+  return String(token || '').slice(0, 8);
+}
+
+/** The exact shape mintLinkToken() produces: 32 bytes of base64url. */
+export const REC_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
+
+/**
+ * GET /ci/rec/:token — the ONE public surface in this subsystem.
+ *
+ * ══ THIS HANDLER IS DELIBERATELY OUTSIDE THE AUTH GUARDS ══
+ * Decision record (Mark, 2026-08-24): recording links work for anyone holding
+ * them, no login, because a rep has to be able to forward a note and have the
+ * link still open. Security therefore rests ENTIRELY on the token being
+ * unguessable — 32 random bytes, minted in recordings.js, derived from
+ * nothing. Everything below follows from that being the only defence:
+ *
+ *  - THE TOKEN IS THE ONLY LOOKUP KEY. No call_id, no five9_call_id, no
+ *    storage path, no date. Accepting a second key would create a way in that
+ *    is not the unguessable one.
+ *  - UNKNOWN, EXPIRED AND PURGED ALL RETURN THE SAME BARE 404. A
+ *    distinguishable "expired" or "purged" confirms the token was real, which
+ *    turns a blind guess into an oracle. Same status, same body, every time —
+ *    including when something fails internally.
+ *  - NO LISTING, NO ENUMERATION, NO RANGES. One token, one object. There is no
+ *    index route and there must never be one.
+ *  - THE BUCKET STAYS PRIVATE. This mints a short-lived signed URL and
+ *    redirects; ci-audio is never made public and gets no public policy.
+ *    setup-ci-audio-bucket.js exits 1 on a public bucket — keep that true.
+ *  - ONLY THE TOKEN PREFIX IS LOGGED. A whole token in a log line is a
+ *    credential in a log line.
+ *
+ * A factory rather than an inline handler so the db, the limiter and the clock
+ * are injectable: the guarantees above are exactly the kind that rot silently,
+ * and they are only testable if this is reachable without a live Supabase.
+ */
+export function createRecordingHandler({
+  db = null,
+  allow = createRateLimiter(),
+  signedTtlS = REC_SIGNED_URL_TTL_S,
+  now = () => Date.now(),
+} = {}) {
+  return async function handleRecording(req, res) {
+    // ONE bare 404 for every miss — see the oracle note above.
+    const notFound = () => res.status(404).type('text/plain').send('Not found');
+
+    const token = String(req.params?.token || '');
+    const prefix = tokenPrefix(token);
+    try {
+      if (!allow(req.ip)) {
+        console.warn(`${LOG} GET /ci/rec rate-limited ip=${req.ip} token=${prefix}…`);
+        return res.status(429).type('text/plain').send('Too many requests');
+      }
+
+      // Shape check before touching the database. This tells a scanner nothing
+      // it could not read in this file, and saves a query per junk request.
+      if (!REC_TOKEN_RE.test(token)) return notFound();
+
+      const client = db || supabase;
+      if (!client) throw new Error('Supabase not configured');
+
+      const { data: rec, error } = await client
+        .from('ci_recordings')
+        .select('id, call_id, storage_path, link_expires_at, purged_at')
+        .eq('link_token', token)
+        .maybeSingle();
+      if (error) throw new Error(`ci_recordings lookup failed: ${error.message}`);
+
+      if (!rec) return notFound();
+      if (rec.purged_at) return notFound();
+      if (!rec.storage_path) return notFound();
+      if (rec.link_expires_at && new Date(rec.link_expires_at).getTime() <= now()) return notFound();
+
+      const { data: signed, error: signErr } = await client.storage
+        .from(CI_AUDIO_BUCKET)
+        .createSignedUrl(rec.storage_path, signedTtlS);
+      if (signErr || !signed?.signedUrl) {
+        throw new Error(`signed URL failed: ${signErr?.message || 'no url returned'}`);
+      }
+
+      console.log(`${LOG} rec token=${prefix}… → call ${rec.call_id} (signed ${signedTtlS}s)`);
+      return res.redirect(302, signed.signedUrl);
+    } catch (err) {
+      // Even an internal failure must not describe itself: an error string
+      // that differs between a real and a fake token is an oracle too.
+      console.error(`${LOG} GET /ci/rec/${prefix}… failed: ${err.message}`);
+      return res.status(404).type('text/plain').send('Not found');
+    }
+  };
 }
 
 export function registerCiRoutes(app, authenticate) {
@@ -160,6 +292,9 @@ export function registerCiRoutes(app, authenticate) {
         excluded: false,
       }, { onConflict: 'source_path' });
       if (error) throw new Error(`ci_recordings upsert failed: ${error.message}`);
+
+      // A manual backfill is audio like any other and gets a link too.
+      await ensureLinkToken({ sourcePath, db });
 
       // Only advance a call that is still waiting for audio. A later-stage
       // call must not be dragged backwards by a backfill.
@@ -347,11 +482,39 @@ export function registerCiRoutes(app, authenticate) {
     }
   });
 
+  /**
+   * GET /ci/rec/:token — the ONE public surface in this subsystem.
+   *
+   * ══ THIS ROUTE IS DELIBERATELY OUTSIDE THE AUTH GUARDS ══
+   * Decision record (Mark, 2026-08-24): recording links work for anyone
+   * holding them, no login, because a rep has to be able to forward a note.
+   * Security therefore rests ENTIRELY on the token being unguessable — 32
+   * random bytes, minted in recordings.js, derived from nothing. Everything
+   * below follows from that being the only defence:
+   *
+   *  - THE TOKEN IS THE ONLY LOOKUP KEY. No call_id, no five9_call_id, no
+   *    storage path, no date. Accepting a second key would create a way in
+   *    that is not the unguessable one.
+   *  - UNKNOWN, EXPIRED AND PURGED ALL RETURN THE SAME BARE 404. A
+   *    distinguishable "expired" or "purged" confirms the token was real,
+   *    which turns a blind guess into an oracle. Same status, same body,
+   *    every time.
+   *  - NO LISTING, NO ENUMERATION, NO RANGES. One token, one object. There is
+   *    no index route and must never be one.
+   *  - THE BUCKET STAYS PRIVATE. We mint a short-lived signed URL and
+   *    redirect; ci-audio itself is never made public and gets no public
+   *    policy. setup-ci-audio-bucket.js exits 1 on a public bucket — keep
+   *    that true.
+   *  - ONLY THE TOKEN PREFIX IS LOGGED. A full token in a log line is a
+   *    credential in a log line.
+   */
+  app.get('/ci/rec/:token', createRecordingHandler());
+
   const cfg = getConfig();
   console.log(
     `${LOG} Routes: POST /ci/discover, POST /ci/tick, POST /ci/backfill,` +
     ` GET /ci/review, POST /ci/review/:call_id/resolve,` +
-    ` POST /ci/reconcile, GET /ci/health` +
+    ` POST /ci/reconcile, GET /ci/health, GET /ci/rec/:token (PUBLIC by design)` +
     `${guards.length ? ' (authenticated)' : ' (UNAUTHENTICATED — no middleware passed)'}` +
     ` [mode=${cfg.mode}, sftp=${cfg.sftp.readOnly ? 'read-only' : 'WRITABLE — MISCONFIGURED'}]`,
   );
