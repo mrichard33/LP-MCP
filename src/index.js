@@ -1156,6 +1156,20 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] call intelligence recording links FAILED (notes will carry no Recording: line — apply sql/068 manually):', err.message);
   }
+
+  // CI agent display name (sql/069 — the file is the source of truth).
+  // ci_agent_map.agent_name comes from the Five9 user record and can be an
+  // administrative label ('Mark R (Keep Old Edwin Account)') that must never
+  // reach a customer record. display_name overrides it; NULL means "use
+  // agent_name" and is deliberately NOT backfilled — a copy would go stale the
+  // next time Five9 renames someone.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL('ALTER TABLE ci_agent_map ADD COLUMN IF NOT EXISTS display_name text;');
+    console.log('[Migration] call intelligence agent display name (sql/069) ready');
+  } catch (err) {
+    console.error('[Migration] call intelligence agent display name FAILED (CRM notes may show administrative agent labels — apply sql/069 manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {

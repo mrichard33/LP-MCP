@@ -1,0 +1,81 @@
+-- ============================================================================
+-- 069 — Call Intelligence: a customer-safe display name for agents
+--
+-- WHY: ci_agent_map.agent_name is seeded from the Five9 user record, and those
+-- records carry ADMINISTRATIVE labels — notes to whoever maintains the domain,
+-- not names anyone should read. Confirmed live 2026-08-24:
+--
+--     agent_username  e.ramirez@reecewindows.com
+--     agent_name      'Mark R (Keep Old Edwin Account)'
+--
+-- which the note composer renders into a CRM note header as:
+--
+--     Agent: Mark R (Keep Old Edwin Account) (reece)
+--
+-- on a real customer's record, in both CRMs.
+--
+-- ── THE FIX IS A LAYER, NOT A ROW ──────────────────────────────────────────
+-- Correcting that one agent_name would work exactly once and would also fight
+-- the seed: scripts/seed-ci-maps.js re-reads agent_name from the live Five9
+-- domain and would put the administrative label straight back on the next run.
+-- display_name is a separate column the seed does not write, so a correction
+-- survives re-seeding — and Mark can fix any future label from data rather
+-- than from a deploy.
+--
+-- ── NULL MEANS "USE agent_name" — DO NOT BACKFILL ──────────────────────────
+-- The column is nullable and stays NULL for the overwhelming majority of
+-- agents, whose Five9 name is already the name they go by. It is deliberately
+-- NOT seeded with a copy of agent_name: a copy goes stale the next time Five9
+-- renames someone, and then two columns disagree with nothing to say which was
+-- intended. NULL is not missing data here, it is the answer.
+--
+-- Resolution order, implemented once in src/ci/teams.js resolveAgentLabel()
+-- and used by BOTH the note header and the analyzer's agent-identity line:
+--
+--     display_name -> agent_name -> agent_username -> 'unknown agent'
+--
+-- Mirrored in runMigrations() (src/index.js). Purely additive: one nullable
+-- column. No existing column changes and no row is rewritten.
+--
+-- AFTER RUNNING: review the roster before trusting any label —
+--   node scripts/review-ci-agent-names.js
+-- It is READ ONLY and flags any agent_name that would reach a customer record
+-- looking like an internal note. Then set display_name only where Mark has
+-- confirmed the correct name.
+--
+-- ROLLBACK:
+--   ALTER TABLE ci_agent_map DROP COLUMN IF EXISTS display_name;
+-- ============================================================================
+
+ALTER TABLE ci_agent_map ADD COLUMN IF NOT EXISTS display_name text;
+
+-- ─── Verification ────────────────────────────────────────────────────────────
+-- Column present and nullable:
+--   SELECT column_name, data_type, is_nullable FROM information_schema.columns
+--    WHERE table_name = 'ci_agent_map' AND column_name = 'display_name';
+--   -- expect one row, is_nullable = YES
+--
+-- It must NOT have been mass-populated — see the no-backfill note above. If
+-- this returns a number close to the agent count, someone copied agent_name in:
+--   SELECT count(*) FILTER (WHERE display_name IS NOT NULL) AS overridden,
+--          count(*) AS total
+--     FROM ci_agent_map;
+--   -- expect overridden to be small and deliberate (1 as of 2026-08-24)
+--
+-- No override is a pointless copy of the name it overrides:
+--   SELECT agent_username FROM ci_agent_map
+--    WHERE display_name IS NOT NULL AND btrim(display_name) = btrim(agent_name);
+--   -- expect 0 rows
+--
+-- The labels that would reach a customer record, worst first. Anything here
+-- with a parenthesis or an internal word wants a display_name:
+--   SELECT agent_username, agent_name, display_name, team
+--     FROM ci_agent_map
+--    WHERE display_name IS NULL
+--      AND (agent_name ~ '[()]' OR agent_name ~* '(keep|old|test|do not use|inactive)')
+--    ORDER BY agent_name;
+--
+-- The one confirmed correction (applied post-deploy, NOT by this migration —
+-- a data UPDATE in a migration re-runs on every boot forever):
+--   UPDATE ci_agent_map SET display_name = 'Mark Richard'
+--    WHERE agent_username = 'e.ramirez@reecewindows.com';

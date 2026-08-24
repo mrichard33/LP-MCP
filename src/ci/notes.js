@@ -141,12 +141,21 @@ export function formatRecordingLine({ token, expiresAt, extraSegments = 0, linkB
  *                          recording link. The base is PASSED IN, never read
  *                          from env here: this module is pure by contract, and
  *                          reading config would make every note test need env.
+ * @param {string} [agentLabel] The name to print for the agent, ALREADY
+ *                          RESOLVED against ci_agent_map.display_name by the
+ *                          caller (teams.js resolveAgentLabel). Passed in
+ *                          rather than looked up because this module takes no
+ *                          database dependency — and because the analyzer must
+ *                          print the identical label, which only holds if one
+ *                          resolution is shared rather than repeated.
+ *                          Omitted, it falls back to the call row's own fields.
  * @returns {string}
  */
-export function composeNote(call, summary, link = null) {
+export function composeNote(call, summary, link = null, agentLabel = null) {
   const analysis = summary?.output ?? {};
   const direction = String(call?.direction || '').toLowerCase().includes('inbound') ? 'inbound' : 'outbound';
-  const agent = call?.agent_name || call?.agent_username || 'unknown agent';
+  const agent = String(agentLabel ?? '').trim()
+    || call?.agent_name || call?.agent_username || 'unknown agent';
   const team = call?.team && call.team !== 'unknown' ? call.team : 'unassigned';
 
   const header = `[AI CALL NOTE | ${formatEt(call?.call_start)} | ${direction} | Agent: ${agent} (${team}) | Outcome: ${outcomeLabel(analysis.outcome)}]`;

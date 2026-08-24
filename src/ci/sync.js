@@ -127,7 +127,7 @@ export async function markSyncFailed(db, row, err, cfg = getConfig()) {
  *
  * @param {object} opts.lpClient  injected { addNote } — real client in prod
  */
-export async function syncToLp(call, summary, match, { db = supabase, cfg = getConfig(), lpClient, link = null } = {}) {
+export async function syncToLp(call, summary, match, { db = supabase, cfg = getConfig(), lpClient, link = null, agentLabel = null } = {}) {
   const target = 'lp';
   const rectype = match?.evidence?.note_target?.rectype ?? null;
   const recid = match?.evidence?.note_target?.recid ?? null;
@@ -139,7 +139,7 @@ export async function syncToLp(call, summary, match, { db = supabase, cfg = getC
     return { target, skipped: true, reason: `tier_${match.tier}_not_writable` };
   }
 
-  const noteBody = composeNote(call, summary, link);
+  const noteBody = composeNote(call, summary, link, agentLabel);
   const live = liveWrites(target, cfg);
   const request = { rectype, recid, nct_id: cfg.lpNoteCategoryId };
 
@@ -178,7 +178,7 @@ export async function syncToLp(call, summary, match, { db = supabase, cfg = getC
  * §14.4 calls the top danger. Without it, a missed match quietly becomes a new
  * contact record rather than a review item.
  */
-export async function syncToGhl(call, summary, match, { db = supabase, cfg = getConfig(), ghlClient, link = null } = {}) {
+export async function syncToGhl(call, summary, match, { db = supabase, cfg = getConfig(), ghlClient, link = null, agentLabel = null } = {}) {
   const target = 'ghl';
   const contactId = match?.ghl_contact_id ?? null;
 
@@ -192,7 +192,7 @@ export async function syncToGhl(call, summary, match, { db = supabase, cfg = get
     return { target, skipped: true, reason: `tier_${match.tier}_not_writable` };
   }
 
-  const noteBody = composeNote(call, summary, link);
+  const noteBody = composeNote(call, summary, link, agentLabel);
   const live = liveWrites(target, cfg);
 
   const claim = await claimSync(db, {

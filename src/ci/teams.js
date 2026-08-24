@@ -96,3 +96,39 @@ export function normalizeAgentField(value) {
   if (!s || NO_AGENT_SENTINELS.has(s.toLowerCase())) return null;
   return s;
 }
+
+/**
+ * The name a CUSTOMER-FACING artifact may call this agent.
+ *
+ * ── WHY THIS EXISTS ────────────────────────────────────────────────────────
+ * ci_agent_map.agent_name is seeded from the Five9 user record, and Five9 user
+ * records carry ADMINISTRATIVE labels — notes to whoever maintains the domain,
+ * not names anybody should read. Confirmed live 2026-08-24:
+ *
+ *     e.ramirez@reecewindows.com  ->  'Mark R (Keep Old Edwin Account)'
+ *
+ * which rendered in a CRM note header as:
+ *
+ *     Agent: Mark R (Keep Old Edwin Account) (reece)
+ *
+ * on a real customer's record. The fix is a LAYER, not that one row:
+ * ci_agent_map.display_name (sql/069) overrides agent_name wherever an agent is
+ * named to a human, so Mark can correct any label from data without a deploy.
+ *
+ * display_name is NULL by default and NULL means "use agent_name". It is
+ * deliberately NOT backfilled with a copy of agent_name — a copy would go
+ * stale the next time Five9 renames someone, and the two would silently
+ * disagree with no way to tell which was intended.
+ *
+ * Pure, and it lives here rather than in notes.js because BOTH the note header
+ * and the analyzer's agent-identity line must resolve the label identically. A
+ * note header and a summary naming the same agent differently is worse than
+ * either being wrong alone — it reads as two different people on one call.
+ */
+export function resolveAgentLabel({ displayName, agentName, agentUsername } = {}) {
+  const pick = (v) => {
+    const s = String(v ?? '').trim();
+    return s || null;
+  };
+  return pick(displayName) || pick(agentName) || pick(agentUsername) || 'unknown agent';
+}
