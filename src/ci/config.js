@@ -82,6 +82,15 @@ export function parseConfig(env = process.env) {
     transcribeModel: env.CI_TRANSCRIBE_MODEL || 'gpt-4o-mini-transcribe',
     promptVersion: env.CI_PROMPT_VERSION || 'v1',
 
+    // Origin for the recording link in a CRM note, e.g.
+    // 'https://lp-mcp-production.up.railway.app'. DELIBERATELY NO DEFAULT:
+    // unset means the note omits the link line entirely and everything else
+    // behaves exactly as before. A guessed default would paste a URL nobody
+    // can open into two CRMs, which is worse than no link at all. Trailing
+    // slashes are trimmed so base + '/ci/rec/...' cannot produce a double
+    // slash that some CRMs render as a broken link.
+    recordingLinkBase: String(env.CI_RECORDING_LINK_BASE || '').trim().replace(/\/+$/, '') || null,
+
     // Which channel of a 2-channel recording is the agent. UNVERIFIED against
     // a real Five9 stereo file — see the warning on agentChannel() in
     // transcribe.js. Wrong, it swaps the speaker label on every labelled line

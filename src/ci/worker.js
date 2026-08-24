@@ -21,7 +21,7 @@
 import supabase from '../supabase.js';
 import { runSQL } from '../admin/supabase-admin.js';
 import { getConfig, nextRetryAt } from './config.js';
-import { createSftpAdapter, createManualAdapter, describeRecording, matchRecordingToCall, storeAudio, sha256Hex } from './recordings.js';
+import { createSftpAdapter, createManualAdapter, describeRecording, matchRecordingToCall, storeAudio, sha256Hex, ensureLinkToken, linkableRecording } from './recordings.js';
 import { dateDirFor, last4, last10 } from './time.js';
 import { transcribeCall, createOpenAITranscriber, createStorageAudioLoader } from './transcribe.js';
 import { analyzeTranscript } from './analyze.js';
@@ -218,6 +218,11 @@ export async function stageFetchRecording(call, { db = supabase, cfg = getConfig
     excluded: false,
   }, { onConflict: 'source_path' });
   if (error) throw new Error(`ci_recordings upsert failed: ${error.message}`);
+
+  // Issue the shareable link token. Conditional on link_token being null, so a
+  // re-fetch of this recording does NOT rotate a token already pasted into a
+  // CRM note. Never throws — a missing link costs the note one line.
+  await ensureLinkToken({ sourcePath: best.recording.sourcePath, db, cfg });
 
   await advance(db, call, 'fetch', 'fetched', {
     source_path: best.recording.sourcePath,
@@ -497,7 +502,31 @@ export async function stageSync(call, { db = supabase, cfg = getConfig(), lpClie
     return { outcome: 'review', reason: 'no_summary' };
   }
 
-  const result = await syncCall(call, summary, match, { db, cfg, lpClient, ghlClient });
+  // The recording link, composed once and given to BOTH targets so the two
+  // CRMs cannot end up quoting different URLs for the same call. A failure
+  // here is not a sync failure: the note still goes, minus the link line.
+  let link = null;
+  try {
+    const { data: recs, error: recErr } = await db
+      .from('ci_recordings')
+      .select('link_token, link_expires_at, recorded_at, fetched_at, purged_at')
+      .eq('call_id', call.id)
+      .eq('excluded', false);
+    if (recErr) throw new Error(recErr.message);
+    const { recording, extra } = linkableRecording(recs || []);
+    if (recording) {
+      link = {
+        token: recording.link_token,
+        expiresAt: recording.link_expires_at,
+        extraSegments: extra,
+        linkBase: cfg.recordingLinkBase,
+      };
+    }
+  } catch (err) {
+    console.warn(`${LOG} call=${call.id} recording link unavailable: ${err.message}`);
+  }
+
+  const result = await syncCall(call, summary, match, { db, cfg, lpClient, ghlClient, link });
 
   // A target that failed and has NOT exhausted its attempts gets another go.
   const retryable = ['lp', 'ghl'].filter((t) => result[t]?.failed && !result[t]?.terminal);

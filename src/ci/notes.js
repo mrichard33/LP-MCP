@@ -88,15 +88,62 @@ export function formatFollowUp(followUp) {
   return bits.length ? bits.join(' — ') : 'Follow-up required';
 }
 
+/** Expiry date for the recording line: MM/DD/YYYY in Eastern wall-clock. */
+export function formatExpiryDate(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    month: '2-digit', day: '2-digit', year: 'numeric',
+  }).formatToParts(d);
+  const get = (t) => parts.find((p) => p.type === t)?.value ?? '';
+  return `${get('month')}/${get('day')}/${get('year')}`;
+}
+
+/**
+ * The recording line, or null when there is nothing linkable.
+ *
+ * ── WHY THE EXPIRY IS IN THE NOTE ──────────────────────────────────────────
+ * The audio is purged at CI_AUDIO_RETENTION_DAYS and the link dies with it, by
+ * design. A rep who clicks a six-week-old note and gets nothing has no way to
+ * tell an expected expiry from a broken system — and will report it as a bug,
+ * repeatedly. Stating the date turns a dead link into an understood one.
+ *
+ * ── WHY ONE LINK AND A COUNT ───────────────────────────────────────────────
+ * A held call produces one file per segment; a real call in this domain
+ * carried seven. Seven URLs in a CRM note is not a note anyone reads. The
+ * first segment is linked and the rest are counted.
+ *
+ * Returns null — so the line is omitted entirely rather than rendered empty —
+ * when there is no token, or no link base configured. Both are normal states:
+ * recordings ingested before sql/068 have no token, and CI_RECORDING_LINK_BASE
+ * has no default.
+ */
+export function formatRecordingLine({ token, expiresAt, extraSegments = 0, linkBase } = {}) {
+  const base = String(linkBase || '').trim().replace(/\/+$/, '');
+  const tok = String(token || '').trim();
+  if (!base || !tok) return null;
+
+  const expiry = expiresAt ? formatExpiryDate(expiresAt) : null;
+  const extra = Number.isFinite(extraSegments) && extraSegments > 0
+    ? ` (+${extraSegments} more segment${extraSegments === 1 ? '' : 's'})`
+    : '';
+  return `Recording: ${base}/ci/rec/${tok}${expiry ? `  (expires ${expiry})` : ''}${extra}`;
+}
+
 /**
  * Compose the note body. Identical text for LP and GHL — one composer, so the
  * two CRMs can never drift into telling different stories about a call.
  *
  * @param {object} call     ci_calls row
  * @param {object} summary  ci_summaries row (with .output = the §7 analysis)
+ * @param {object} [link]   { token, expiresAt, extraSegments, linkBase } — the
+ *                          recording link. The base is PASSED IN, never read
+ *                          from env here: this module is pure by contract, and
+ *                          reading config would make every note test need env.
  * @returns {string}
  */
-export function composeNote(call, summary) {
+export function composeNote(call, summary, link = null) {
   const analysis = summary?.output ?? {};
   const direction = String(call?.direction || '').toLowerCase().includes('inbound') ? 'inbound' : 'outbound';
   const agent = call?.agent_name || call?.agent_username || 'unknown agent';
@@ -112,6 +159,12 @@ export function composeNote(call, summary) {
 
   const follow = formatFollowUp(analysis.follow_up);
   if (follow) lines.push(`Follow-up: ${follow}`);
+
+  // Immediately ABOVE the provenance footer: the footer says the note was
+  // machine-written and that commitments need verifying, and this is the line
+  // that makes verifying possible.
+  const recording = formatRecordingLine(link || {});
+  if (recording) lines.push(recording);
 
   lines.push(
     `[AI-CI:${shortId(call?.id)} | Five9 ${call?.five9_call_id ?? 'unknown'} | `
@@ -140,7 +193,9 @@ export default {
   idempotencyKey,
   outcomeLabel,
   formatEt,
+  formatExpiryDate,
   formatKeyDetails,
   formatFollowUp,
+  formatRecordingLine,
   shortId,
 };

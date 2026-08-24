@@ -1,0 +1,82 @@
+-- ============================================================================
+-- 068 — Call Intelligence: shareable recording links
+--
+-- WHY: an AI call note asserts what was said. A rep who doubts a digit — a
+-- phone number, a house number, an appointment time — currently has no way to
+-- check it. Five9 exposes no stable per-call URL and nas1.etgts.com is a third
+-- party's SFTP archive we are read-only against, so neither can be linked.
+-- The only linkable copy is OUR object in the private ci-audio bucket.
+--
+-- This adds the two columns that make one such object reachable by URL.
+--
+-- ── THE TOKEN IS THE ENTIRE SECURITY BOUNDARY ──────────────────────────────
+-- Decision record (Mark, 2026-08-24): links work for anyone holding them, with
+-- no login. That is a deliberate trade — a rep forwards the note, the link has
+-- to survive the forward — and it means the token is not a convenience, it is
+-- the whole access control.
+--
+-- So link_token is 32 bytes from crypto.randomBytes, base64url. It is NOT a
+-- uuid (v4 leaks version/variant bits and is only 122 bits), NOT derived from
+-- call_id, the file sha256, or any other pipeline identifier. Anyone holding
+-- one token must be unable to learn anything about any other. Generation lives
+-- in src/ci/recordings.js; the rule is restated there.
+--
+-- ── EXPIRY IS NOT A SEPARATE POLICY ────────────────────────────────────────
+-- link_expires_at = fetched_at + CI_AUDIO_RETENTION_DAYS, i.e. the link dies
+-- exactly when the audio it points at is purged. A token that outlived its
+-- object would 404 anyway; storing the expiry means the NOTE can say when the
+-- link stops working, which is the difference between a dead link reading as
+-- an expected expiry and reading as a bug.
+--
+-- ── WHY A PLAIN UNIQUE INDEX, NOT A PARTIAL ONE ────────────────────────────
+-- Most rows carry no token: recordings ingested before this migration, and
+-- excluded/unlinked ones. In Postgres NULLs are never equal to each other, so
+-- a plain UNIQUE index permits unlimited NULLs and still guarantees that a
+-- non-null token identifies exactly one row. That uniqueness is what lets the
+-- public route look a token up as its ONLY key.
+--
+-- Mirrored in runMigrations() (src/index.js). Purely additive: two nullable
+-- columns and one index. No existing column changes type or nullability and no
+-- row is rewritten — recordings already stored simply have no link until they
+-- are re-fetched, which is correct, since their audio may already be purged.
+--
+-- ROLLBACK:
+--   DROP INDEX IF EXISTS ci_recordings_link_token_uq;
+--   ALTER TABLE ci_recordings DROP COLUMN IF EXISTS link_expires_at;
+--   ALTER TABLE ci_recordings DROP COLUMN IF EXISTS link_token;
+-- ============================================================================
+
+ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS link_token      text;
+ALTER TABLE ci_recordings ADD COLUMN IF NOT EXISTS link_expires_at timestamptz;
+
+-- The public route's ONLY lookup key, so it must be unique and indexed.
+CREATE UNIQUE INDEX IF NOT EXISTS ci_recordings_link_token_uq
+  ON ci_recordings (link_token);
+
+-- ─── Verification ────────────────────────────────────────────────────────────
+-- Both columns present and nullable:
+--   SELECT column_name, data_type, is_nullable FROM information_schema.columns
+--    WHERE table_name = 'ci_recordings'
+--      AND column_name IN ('link_token','link_expires_at');
+--   -- expect 2 rows, both is_nullable = YES
+--
+-- Index present and UNIQUE:
+--   SELECT indexname, indexdef FROM pg_indexes
+--    WHERE tablename = 'ci_recordings' AND indexname = 'ci_recordings_link_token_uq';
+--   -- indexdef must contain 'CREATE UNIQUE INDEX'
+--
+-- No token is ever reused (0 rows, always):
+--   SELECT link_token, count(*) FROM ci_recordings
+--    WHERE link_token IS NOT NULL GROUP BY link_token HAVING count(*) > 1;
+--
+-- Tokens look like 32 random bytes in base64url — 43 chars, no +/= padding.
+-- A short or patterned token here means generation regressed to something
+-- guessable, which is the one failure that silently exposes audio:
+--   SELECT count(*) FROM ci_recordings
+--    WHERE link_token IS NOT NULL AND link_token !~ '^[A-Za-z0-9_-]{43}$';
+--   -- expect 0
+--
+-- Every live token expires with its audio, never after it:
+--   SELECT count(*) FROM ci_recordings
+--    WHERE link_token IS NOT NULL AND purged_at IS NULL AND link_expires_at IS NULL;
+--   -- expect 0
