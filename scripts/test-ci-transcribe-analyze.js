@@ -40,7 +40,10 @@ import {
   OUTCOMES,
   FLAG_KEYS,
 } from '../src/ci/analysis-schema.js';
-import { analyzeTranscript, extractJson, buildUserMessage, MAX_ANALYSIS_ATTEMPTS } from '../src/ci/analyze.js';
+import {
+  analyzeTranscript, extractJson, buildUserMessage, buildSystemPrompt,
+  agentContextLine, MAX_ANALYSIS_ATTEMPTS,
+} from '../src/ci/analyze.js';
 import { insertCurrentSummary, stageAnalyze } from '../src/ci/worker.js';
 import { parseConfig } from '../src/ci/config.js';
 
@@ -292,6 +295,86 @@ test('the prompt tells the model whether speaker labels can be trusted', () => {
   // The customer's phone number must not be handed to the model — §7 asks it
   // whether a number was SPOKEN, and priming it invites a false 'stated'.
   assert.equal(stereo.includes(CALL.ani), false);
+});
+
+// ─── the agent is TOLD, not inferred ────────────────────────────────────────
+//
+// THE TRAP THIS GUARDS. The audio is mono with no speaker labels, so the model
+// works out roles from context and gets them wrong. Live example, call
+// 300000010270792: Jamal Flanders is a Reece CALL-CENTER agent, and the
+// summary called him "a field representative (Jamal)". In shadow that text sat
+// in ci_summaries; with the write flags on it would have posted to both CRMs.
+
+const AGENT_CALL = { ...CALL, agent_name: 'Jamal Flanders', team: 'reece' };
+const TRANSCRIPT = { transcript_text: 't', diarization_method: 'none' };
+
+test('the prompt names the known agent and anchors their role', () => {
+  const msg = buildUserMessage(TRANSCRIPT, AGENT_CALL);
+  assert.match(msg, /The agent on this call is Jamal Flanders, an internal Reece call-center agent\./);
+  assert.match(msg, /Any other speaker is the customer or a third party\./);
+  assert.match(msg, /Do not describe the agent as a\s+field representative, canvasser, or installer unless the transcript says so explicitly\./);
+});
+
+test('the agent line sits ABOVE direction and campaign', () => {
+  // It is the one fact here we actually know. Buried among the hints it reads
+  // as another thing to weigh rather than a premise to anchor on.
+  const msg = buildUserMessage(TRANSCRIPT, AGENT_CALL);
+  assert.ok(
+    msg.indexOf('The agent on this call is') < msg.indexOf('Call direction:'),
+    'identity must precede direction',
+  );
+  assert.ok(
+    msg.indexOf('The agent on this call is') < msg.indexOf('Campaign:'),
+    'identity must precede campaign',
+  );
+});
+
+test('the descriptor follows the resolved team', () => {
+  const line = (team) => agentContextLine({ agent_name: 'Jamal Flanders', team });
+  assert.equal(line('reece'), 'The agent on this call is Jamal Flanders, an internal Reece call-center agent.');
+  assert.equal(line('lightfire'), 'The agent on this call is Jamal Flanders, a LightFire Partners call-center agent.');
+  assert.equal(line('north_carolina'), 'The agent on this call is Jamal Flanders, a North Carolina call-center agent.');
+});
+
+test('an unresolved team names the agent and claims NOTHING about their employer', () => {
+  // Inventing a plausible employer for an agent we could not place is the same
+  // class of error this change exists to stop.
+  for (const team of ['unknown', 'ftm', '', null, undefined]) {
+    const line = agentContextLine({ agent_name: 'Jamal Flanders', team });
+    assert.equal(line, 'The agent on this call is Jamal Flanders.', `team ${JSON.stringify(team)}`);
+    assert.equal(/call-center|Reece|LightFire|North Carolina/.test(line), false);
+  }
+});
+
+test('no agent name means NO agent line — never the word undefined', () => {
+  for (const agentName of [null, undefined, '', '   ']) {
+    const msg = buildUserMessage(TRANSCRIPT, { ...CALL, agent_name: agentName });
+    assert.equal(agentContextLine({ ...CALL, agent_name: agentName }), null);
+    assert.equal(msg.includes('The agent on this call is'), false, `agent_name ${JSON.stringify(agentName)}`);
+    // 'null' appears legitimately inside the schema skeleton JSON; 'undefined'
+    // is the one that could only come from a stringified empty agent.
+    assert.equal(msg.includes('undefined'), false, 'a stringified empty must never reach the prompt');
+  }
+  // A null call object at all is still fine.
+  assert.equal(buildUserMessage(TRANSCRIPT, null).includes('The agent on this call is'), false);
+  assert.equal(agentContextLine(null), null);
+});
+
+test('the customer phone number is STILL never handed to the model', () => {
+  // Pre-existing guarantee — asserted here because this change adds the first
+  // new identity context the prompt has carried. §7 asks whether a number was
+  // SPOKEN, and priming the model invites a false 'stated'.
+  for (const call of [AGENT_CALL, { ...AGENT_CALL, team: 'unknown' }, CALL]) {
+    const msg = buildUserMessage(TRANSCRIPT, call);
+    assert.equal(msg.includes(CALL.ani), false, 'ANI must not reach the prompt');
+    assert.equal(msg.includes('7273302574'), false);
+  }
+});
+
+test('system prompt rule 6 forbids inventing a role, not just naming a team', () => {
+  const sys = buildSystemPrompt();
+  assert.match(sys, /you are told who the agent is/);
+  assert.match(sys, /Do not invent a role for any speaker\./);
 });
 
 // ─── review triggers ────────────────────────────────────────────────────────

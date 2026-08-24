@@ -14,6 +14,24 @@
  * it says. §7 is explicit — two failed attempts, then review with
  * `ai_output_invalid`. We retry ONCE, unrepaired, and then stop.
  *
+ * ── THE AGENT IS TOLD, NOT INFERRED ────────────────────────────────────────
+ * The audio is mono and carries no speaker labels, so left to itself the model
+ * works out who is who from context and gets it wrong. Live example, call
+ * 300000010270792: Jamal Flanders is a Reece CALL-CENTER agent, and the
+ * summary described him as "a field representative (Jamal)" — a role he does
+ * not hold, in text that would have posted to both CRMs once the write flags
+ * are on.
+ *
+ * So discovery's resolved identity is handed to the model as a premise rather
+ * than left to inference: who the agent is, which team they are on, and an
+ * explicit instruction not to invent a role for anyone else. This is the ONLY
+ * identity context in the prompt — the customer's phone number is still
+ * deliberately withheld, for the reason in buildUserMessage().
+ *
+ * Changing any of this is a PROMPT CHANGE. CI_PROMPT_VERSION is read from env
+ * (config.js), never set in code, so old and new summaries stay
+ * distinguishable in ci_summaries.prompt_version — set it at deploy.
+ *
  * ── MODEL SELECTION ────────────────────────────────────────────────────────
  * Goes through the house llm-client (fn key `ci_analysis`, decision_engine
  * group), so this call site is steered by the same env vars as every other
@@ -50,7 +68,8 @@ export function buildSystemPrompt() {
     '4. If something was not mentioned at all, return value null with source "unknown".',
     '5. NEVER guess a name, date, address, phone number, or email. A wrong name on a',
     '   customer record is worse than an absent one. If you did not hear it, it is null.',
-    '6. Do not identify the agent or assign a team — that is known already and is not your job.',
+    '6. Do not identify the agent or assign a team — you are told who the agent is.',
+    '   Do not invent a role for any speaker.',
     '7. Confidence is a number from 0.0 to 1.0. Be honest and use the low end; a confident',
     '   wrong answer is the most expensive thing you can produce here.',
     '8. The summary is factual, past tense, and at most 120 words.',
@@ -81,8 +100,60 @@ export function schemaSkeleton() {
   };
 }
 
+/**
+ * How to describe a known agent's employer to the model, by resolved team.
+ *
+ * A team with no entry here yields the agent's NAME AND NOTHING ELSE. That is
+ * deliberate: 'unknown' means we did not resolve the team, and inventing a
+ * plausible employer for an agent we cannot place is the same class of error
+ * this whole change exists to stop. 'ftm' is likewise absent — the suffix
+ * exists in teams.js but the descriptor for it has never been confirmed, and a
+ * guessed one would be asserted to the model as fact.
+ */
+const TEAM_DESCRIPTORS = {
+  reece: 'an internal Reece call-center agent',
+  lightfire: 'a LightFire Partners call-center agent',
+  north_carolina: 'a North Carolina call-center agent',
+};
+
+/** The agent-identity line, or null when there is no agent name to anchor on. */
+export function agentContextLine(call) {
+  const name = String(call?.agent_name ?? '').trim();
+  if (!name) return null;
+  const descriptor = TEAM_DESCRIPTORS[String(call?.team ?? '').trim()];
+  return descriptor
+    ? `The agent on this call is ${name}, ${descriptor}.`
+    : `The agent on this call is ${name}.`;
+}
+
+/**
+ * The role-anchoring instruction that follows the identity line.
+ *
+ * WHY THIS IS NEEDED AT ALL. The audio is mono with no speaker labels, so the
+ * model infers who is who from context — and it gets it wrong. Live example,
+ * call 300000010270792: Jamal Flanders is a Reece call-center agent, and the
+ * summary called him "a field representative (Jamal)". In shadow mode that
+ * text sat in ci_summaries; with the write flags on it would have posted to
+ * both CRMs, telling every rep who read the record that a phone agent had been
+ * to the customer's house.
+ */
+const ROLE_ANCHOR = [
+  'Any other speaker is the customer or a third party. Do not describe the agent as a',
+  'field representative, canvasser, or installer unless the transcript says so explicitly.',
+].join('\n');
+
 export function buildUserMessage(transcript, call = null) {
   const head = [];
+  // The agent's identity goes FIRST, above direction and campaign: it is the
+  // one fact here we actually know, and the model should anchor on it rather
+  // than read it as another hint to weigh. Omitted entirely when there is no
+  // agent name — a line reading "The agent on this call is undefined." is
+  // worse than no line at all.
+  const agentLine = agentContextLine(call);
+  if (agentLine) {
+    head.push(agentLine);
+    head.push(ROLE_ANCHOR);
+  }
   // Context the model may use for disambiguation but must not restate as
   // fact: direction and campaign shape how a transcript reads. The customer's
   // phone number is deliberately NOT included — §7 asks whether a number was
@@ -221,6 +292,7 @@ export default {
   buildSummaryRow,
   buildSystemPrompt,
   buildUserMessage,
+  agentContextLine,
   schemaSkeleton,
   extractJson,
   assertModelEnv,
