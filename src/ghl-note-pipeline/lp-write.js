@@ -22,17 +22,36 @@ const IMPORTANT_CATEGORY = process.env.GHL_NOTE_IMPORTANT_CATEGORY_ID
   : null;
 
 /**
+ * Pull an id out of a legacy LP acknowledgment. Anchored: a bare trailing
+ * number would take the RECID out of prose like "added for recid 452742" and
+ * store it as a note id. See the twin in src/ci/sync.js — the two are pinned
+ * to identical behaviour by scripts/test-ci-lp-note-id.js.
+ */
+function idFromAck(text) {
+  const s = String(text ?? '').trim();
+  if (!s) return null;
+  const m = s.match(/^(\d+)$/) || s.match(/[:#=]\s*(\d+)$/);
+  return m ? m[1] : null;
+}
+
+/**
  * Best-effort extraction of the new note id from the AddNotes response, which
  * (like AddLead) may be a structured object or a legacy "...: <id>" message.
+ *
+ * 2026-08-24 — THIS IS WHY 0 OF 131 ROWS CARRIED AN lp_note_id. lpPost returns
+ * `await res.json()` and AddNotes answers with a bare JSON string, so `resp` is
+ * a STRING. None of the object lookups can match on a string, and the message
+ * fallback read `resp.message`, which a string does not have — so the only
+ * branch that could have found an id never saw the payload. describeRespShape
+ * recorded `string` faithfully for a month; nothing joined that to the cause.
  */
-function extractNoteId(resp) {
+export function extractNoteId(resp) {
   if (!resp) return null;
+  if (typeof resp === 'string') return idFromAck(resp);
   if (resp.note_id) return String(resp.note_id);
   if (resp.noteId) return String(resp.noteId);
   if (resp.id) return String(resp.id);
-  const msg = String(resp.message || '');
-  const match = msg.match(/(\d+)\s*$/);
-  return match ? match[1] : null;
+  return idFromAck(resp.message);
 }
 
 /**
