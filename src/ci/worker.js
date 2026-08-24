@@ -30,6 +30,20 @@ import { syncCall } from './sync.js';
 
 const LOG = '[CIWorker]';
 
+/**
+ * ci_matches.decided_by for a machine-made decision.
+ *
+ * The column is `NOT NULL DEFAULT 'auto' CHECK (decided_by IN ('auto','human'))`
+ * — sql/061, mirrored in runMigrations(). Only these two values exist, and
+ * 'auto' is already the default, so a system decision writing anything else is
+ * a constraint violation rather than a new category.
+ *
+ * Named rather than inlined so the value has ONE home and a test can assert it
+ * against the constraint parsed out of the schema, instead of against a second
+ * hardcoded literal that would drift with the first.
+ */
+export const DECIDED_BY_AUTO = 'auto';
+
 /** Statuses a worker may claim. Terminal/parking states are never claimed. */
 export const CLAIMABLE = ['discovered', 'fetched', 'transcribed', 'analyzed', 'matched', 'syncing'];
 
@@ -371,9 +385,18 @@ export async function stageAnalyze(call, { db = supabase, cfg = getConfig(), cal
  * matcher never reached; a row with tier 'none' says "we looked, and this is
  * what we found", which is what reconciliation and the review queue need.
  *
- * `decided_by` is 'system' here. The review endpoint writes 'human' rows for
- * the same call, and the newest row wins — that is how a human correction
- * survives a re-run of this stage.
+ * `decided_by` is 'auto' here — the value the COLUMN ALREADY DEFAULTS TO, and
+ * one of exactly two the CHECK constraint admits (sql/061: `CHECK (decided_by
+ * IN ('auto','human'))`). The review endpoint writes 'human' rows for the same
+ * call, and the newest row wins — that is how a human correction survives a
+ * re-run of this stage.
+ *
+ * This said 'system' until 2026-08-24, and so did the insert. Every
+ * system-decided match therefore failed the constraint, so no call could reach
+ * 'matched', so stageSync never ran and ci_syncs stayed empty — no note body
+ * had ever been composed. It was latent from the day matching shipped: it
+ * could only surface once a call actually reached this stage, which first
+ * happened on call 300000010270798 (attempts 3, stuck at 'analyzed').
  */
 export async function stageMatch(call, { db = supabase, cfg = getConfig(), now = new Date(), canvasserPhones } = {}) {
   const { data: summary, error: sumErr } = await db
@@ -437,7 +460,9 @@ export async function stageMatch(call, { db = supabase, cfg = getConfig(), now =
         }
         : {}),
     },
-    decided_by: 'system',
+    // 'auto', never 'system' — see the block comment on this function. The
+    // CHECK admits exactly 'auto' and 'human'; anything else fails the insert.
+    decided_by: DECIDED_BY_AUTO,
   });
   if (insErr) throw new Error(`ci_matches insert failed: ${insErr.message}`);
 
