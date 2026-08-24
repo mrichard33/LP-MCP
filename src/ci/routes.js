@@ -74,6 +74,92 @@ export async function resumeStatusFor(db, callId) {
   return 'discovered';
 }
 
+/** The four things a human can decide about a reviewed call. */
+export const RESOLVE_ACTIONS = new Set(['set_match', 'skip', 'retry', 'fail']);
+
+/**
+ * Apply one review resolution to one call.
+ *
+ * ══ THIS IS THE ONLY IMPLEMENTATION ══
+ * Extracted out of the POST /ci/review/:call_id/resolve handler so the
+ * endpoint and scripts/requeue-ci-review.js run the SAME code, not two
+ * implementations that agree today. A bulk requeue written as its own UPDATE
+ * is how `attempts = 0` gets forgotten, or a call gets sent back to the wrong
+ * stage — and neither failure announces itself; the calls just quietly
+ * re-fail or re-buy a transcript that already exists.
+ *
+ * `retry` resumes from the furthest stage the call actually reached, derived
+ * from the artifacts on disk by resumeStatusFor() — not from a remembered
+ * status (ci_calls has no such column) and not from review_reason, which would
+ * break the moment a reason string is renamed.
+ *
+ * Writes ci_calls and ci_events, and ci_matches on set_match. Throws
+ * BadRequest on a set_match that names no record.
+ *
+ * @returns {Promise<{status: string, patch: object}>}
+ */
+export async function applyResolve(db, call, action, { note = null, cstId = null, ldsId = null, ghlId = null } = {}) {
+  if (!RESOLVE_ACTIONS.has(action)) {
+    throw new BadRequest(`action must be one of ${[...RESOLVE_ACTIONS].join('|')}`);
+  }
+  const callId = call.id;
+
+  let nextStatus;
+  if (action === 'set_match') {
+    if (cstId == null && ldsId == null && !ghlId) {
+      // A "correction" that names no record is not a correction. Refusing is
+      // better than writing an empty human match that later reads as an
+      // authoritative decision.
+      throw new BadRequest('set_match needs at least one of lp_cst_id, lp_lds_id, ghl_contact_id');
+    }
+    const { error: mErr } = await db.from('ci_matches').insert({
+      call_id: callId,
+      lp_cst_id: cstId ?? null,
+      lp_lds_id: ldsId ?? null,
+      ghl_contact_id: ghlId ?? null,
+      method: 'human_review',
+      tier: 'exact',
+      confidence: 1.0,
+      candidates: [],
+      evidence: { note: note ?? null, resolved_via: 'POST /ci/review/:call_id/resolve' },
+      decided_by: 'human',
+    });
+    if (mErr) throw new Error(`ci_matches insert failed: ${mErr.message}`);
+    nextStatus = 'matched';
+  } else if (action === 'skip') {
+    nextStatus = 'skipped';
+  } else if (action === 'retry') {
+    nextStatus = await resumeStatusFor(db, callId);
+  } else {
+    nextStatus = 'failed';
+  }
+
+  const patch = {
+    status: nextStatus,
+    review_reason: action === 'fail' ? (note || call.review_reason) : null,
+    status_detail: note ? String(note).slice(0, 500) : null,
+    locked_until: null,
+    locked_by: null,
+    next_retry_at: null,
+  };
+  // A retried call starts its attempt budget over. Without this a call that
+  // already burned its attempts comes straight back to 'failed' on the first
+  // hiccup, and the requeue looks like it did nothing.
+  if (action === 'retry') patch.attempts = 0;
+
+  const { error: upErr } = await db.from('ci_calls').update(patch).eq('id', callId);
+  if (upErr) throw new Error(`ci_calls update failed: ${upErr.message}`);
+
+  await db.from('ci_events').insert({
+    call_id: callId,
+    stage: 'review',
+    event: 'resolved',
+    detail: { action, to: nextStatus, by: 'human', has_note: Boolean(note) },
+  });
+
+  return { status: nextStatus, patch };
+}
+
 /**
  * Fixed-window per-IP limiter for the public recording route.
  *
@@ -374,9 +460,8 @@ export function registerCiRoutes(app, authenticate) {
       if (!callId) throw new BadRequest('call_id is required');
 
       const { action, lp_cst_id: cstId, lp_lds_id: ldsId, ghl_contact_id: ghlId, note } = req.body || {};
-      const ACTIONS = new Set(['set_match', 'skip', 'retry', 'fail']);
-      if (!ACTIONS.has(action)) {
-        throw new BadRequest(`action must be one of ${[...ACTIONS].join('|')}`);
+      if (!RESOLVE_ACTIONS.has(action)) {
+        throw new BadRequest(`action must be one of ${[...RESOLVE_ACTIONS].join('|')}`);
       }
 
       const { data: call, error: callErr } = await supabase
@@ -384,59 +469,7 @@ export function registerCiRoutes(app, authenticate) {
       if (callErr) throw new Error(callErr.message);
       if (!call) throw new BadRequest(`no ci_calls row for id ${callId}`);
 
-      let nextStatus;
-      if (action === 'set_match') {
-        if (cstId == null && ldsId == null && !ghlId) {
-          // A "correction" that names no record is not a correction. Refusing
-          // is better than writing an empty human match that later reads as
-          // an authoritative decision.
-          throw new BadRequest('set_match needs at least one of lp_cst_id, lp_lds_id, ghl_contact_id');
-        }
-        const { error: mErr } = await supabase.from('ci_matches').insert({
-          call_id: callId,
-          lp_cst_id: cstId ?? null,
-          lp_lds_id: ldsId ?? null,
-          ghl_contact_id: ghlId ?? null,
-          method: 'human_review',
-          tier: 'exact',
-          confidence: 1.0,
-          candidates: [],
-          evidence: { note: note ?? null, resolved_via: 'POST /ci/review/:call_id/resolve' },
-          decided_by: 'human',
-        });
-        if (mErr) throw new Error(`ci_matches insert failed: ${mErr.message}`);
-        nextStatus = 'matched';
-      } else if (action === 'skip') {
-        nextStatus = 'skipped';
-      } else if (action === 'retry') {
-        // Resume from the furthest stage this call actually reached, derived
-        // from the artifacts on disk rather than from a remembered status.
-        // ci_calls has no "stage before review" column, and inferring it from
-        // review_reason would break the moment a reason string is renamed.
-        nextStatus = await resumeStatusFor(supabase, callId);
-      } else {
-        nextStatus = 'failed';
-      }
-
-      const patch = {
-        status: nextStatus,
-        review_reason: action === 'fail' ? (note || call.review_reason) : null,
-        status_detail: note ? String(note).slice(0, 500) : null,
-        locked_until: null,
-        locked_by: null,
-        next_retry_at: null,
-      };
-      if (action === 'retry') patch.attempts = 0;
-
-      const { error: upErr } = await supabase.from('ci_calls').update(patch).eq('id', callId);
-      if (upErr) throw new Error(`ci_calls update failed: ${upErr.message}`);
-
-      await supabase.from('ci_events').insert({
-        call_id: callId,
-        stage: 'review',
-        event: 'resolved',
-        detail: { action, to: nextStatus, by: 'human', has_note: Boolean(note) },
-      });
+      const { status: nextStatus } = await applyResolve(supabase, call, action, { note, cstId, ldsId, ghlId });
 
       console.log(`${LOG} review resolve: call ${callId} ${action} → ${nextStatus}`);
       res.json({ ok: true, call_id: callId, action, status: nextStatus });
