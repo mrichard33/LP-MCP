@@ -34,6 +34,23 @@
  * The data backs this up: of the canvasser roster, every live Canvass
  * Confirmation ANI checked resolved to a real canvasser, not a customer.
  *
+ * ── THE GLOBAL CANVASSER-ANI GUARD, WHICH THE CAMPAIGN RULE DOES NOT COVER ─
+ * That campaign rule guards ONE campaign. The other 97 all match on phone, so
+ * the same canvasser dialling in under any of them was matched as a customer.
+ * Proven live: recording ANI 3213050187 belongs to Pro ID 5296, GIAN CROSS,
+ * ORL market — a canvasser, matched as a customer.
+ *
+ * So before ANY phone-tier match, the ANI is checked against the ci_canvassers
+ * roster (sql/067). A hit does NOT produce a match: it routes the call to
+ * review with `canvasser_ani` and records which canvasser it hit. It
+ * deliberately does NOT try to work out who the customer really was —
+ * correlating a canvass call to its customer is the canvass_correlation
+ * strategy's job, and widening it here would be a second guess layered on a
+ * first.
+ *
+ * The guard can only ever WITHHOLD a match, never invent one, so an unseeded
+ * or empty roster degrades to exactly today's behaviour.
+ *
  * ── PHONE COMPARISON ───────────────────────────────────────────────────────
  * LP stores bare 10-digit (measured: 139,693 of 140,600 prospect phones; zero
  * E.164). Comparison is equality against the 10-digit and '1'-prefixed forms
@@ -79,6 +96,55 @@ export function phoneVariants(phone) {
  */
 export function isCanvassCorrelation(campaignRow) {
   return campaignRow?.match_strategy === 'canvass_correlation';
+}
+
+/**
+ * Load the canvasser roster into a Map keyed on the 10-digit phone.
+ *
+ * ONE read per worker tick, threaded down — not one per call. The roster is
+ * ~850 rows and every call in the batch checks the same set.
+ *
+ * The value is an ARRAY, not a row. 11 numbers in the roster belong to more
+ * than one Pro ID (shared household and company lines), which is why
+ * ci_canvassers is keyed on (pro_id, phone_last10). Collapsing them to one row
+ * here would throw away exactly the information the composite key preserves.
+ * Sorted by pro_id so the evidence written to ci_matches is deterministic.
+ */
+export async function loadCanvasserPhones(db = supabase) {
+  const { data, error } = await db
+    .from('ci_canvassers')
+    .select('pro_id, name, market, phone_last10, active');
+  if (error) throw new Error(`ci_canvassers read failed: ${error.message}`);
+
+  const map = new Map();
+  for (const r of data || []) {
+    // An explicitly deactivated canvasser is no longer on the doors; their
+    // number is theirs again and should match normally.
+    if (r?.active === false) continue;
+    const key = last10(r?.phone_last10);
+    if (!key) continue;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push({ pro_id: r.pro_id ?? null, name: r.name ?? null, market: r.market ?? null });
+  }
+  for (const list of map.values()) {
+    list.sort((a, b) => Number(a.pro_id ?? 0) - Number(b.pro_id ?? 0));
+  }
+  return map;
+}
+
+/**
+ * Which canvassers, if any, own this number? Pure — the roster is an argument.
+ *
+ * Both sides go through last10(), so '321-305-0187', '13213050187' and
+ * '3213050187' all resolve to the same roster row. A missing roster returns []
+ * — the guard is then a no-op, which is the safe direction.
+ *
+ * @returns {Array<{pro_id: number|null, name: string|null, market: string|null}>}
+ */
+export function canvasserMatches(canvasserPhones, phone) {
+  const key = last10(phone);
+  if (!key || typeof canvasserPhones?.get !== 'function') return [];
+  return canvasserPhones.get(key) || [];
 }
 
 function daysBetween(a, b) {
@@ -312,7 +378,7 @@ export function decideGhlTier({ lpProspect = null, lpLeads = [], phoneCandidates
  *
  * @returns {Promise<{lp: object, ghl: object, target: object, review: string|null}>}
  */
-export async function matchCall(call, { db = supabase, analysis = null, campaignRow = null, cfg = getConfig() } = {}) {
+export async function matchCall(call, { db = supabase, analysis = null, campaignRow = null, cfg = getConfig(), canvasserPhones = null } = {}) {
   const canvass = isCanvassCorrelation(campaignRow);
 
   let lp;
@@ -338,20 +404,44 @@ export async function matchCall(call, { db = supabase, analysis = null, campaign
       };
     }
   } else {
-    const phoneCandidates = await findLpByPhone(db, call.customer_phone || call.ani);
-    // The name+address fallback needs its own lookup, and only earns one when
-    // the AI evidence is strong enough to justify it.
-    let nameCandidates = [];
-    if (phoneCandidates.length === 0 && nameAddressUsable(analysis)) {
-      nameCandidates = await findLpByNameAddress(db, analysis);
+    const listIds = call.raw_metadata?.list_ids ?? null;
+    const hasListIds = Boolean(listIds && (listIds.cst_id || listIds.lds_id));
+
+    // THE GUARD, and note what it does NOT cover: list-carried ids. Those are
+    // real LP ids the dialing record supplied, tier 'exact', nothing inferred
+    // from the ANI at all — a canvasser's phone in the ANI does not make them
+    // wrong. The guard is specifically about the PHONE tier, which is the one
+    // that reads the ANI as the customer's number.
+    const canvassers = hasListIds ? [] : canvasserMatches(canvasserPhones, call.customer_phone || call.ani);
+
+    if (canvassers.length) {
+      // Withhold the match; do NOT try to work out who the customer was.
+      // Tier 'none' keeps this out of WRITABLE_TIERS, so no CRM write can
+      // consider it even if every write flag were on.
+      lp = {
+        tier: 'none',
+        method: 'canvasser_ani',
+        prospectId: null,
+        candidates: [],
+        reason: 'ani_belongs_to_canvasser',
+        canvassers,
+      };
+    } else {
+      const phoneCandidates = await findLpByPhone(db, call.customer_phone || call.ani);
+      // The name+address fallback needs its own lookup, and only earns one when
+      // the AI evidence is strong enough to justify it.
+      let nameCandidates = [];
+      if (phoneCandidates.length === 0 && nameAddressUsable(analysis)) {
+        nameCandidates = await findLpByNameAddress(db, analysis);
+      }
+      lp = decideLpTier({
+        listIds,
+        phoneCandidates,
+        nameCandidates,
+        analysis,
+        callStart: call.call_start,
+      });
     }
-    lp = decideLpTier({
-      listIds: call.raw_metadata?.list_ids ?? null,
-      phoneCandidates,
-      nameCandidates,
-      analysis,
-      callStart: call.call_start,
-    });
   }
 
   // Note target + GHL both need the person's inquiries.
@@ -381,6 +471,11 @@ export async function matchCall(call, { db = supabase, analysis = null, campaign
  * call is expected and is not queue-worthy.
  */
 export function reviewReasonFor(lp, call) {
+  // A canvasser ANI outranks the tier reasons, and is NOT gated on
+  // call.eligible the way a plain 'none' is. A plain miss on an ineligible
+  // call is expected and not queue-worthy; a canvasser ANI is a call we
+  // deliberately refused to match, and a reviewer needs to see it either way.
+  if (lp?.canvassers?.length) return 'canvasser_ani';
   if (lp.tier === 'ambiguous') return 'match_ambiguous';
   if (lp.tier === 'none' && call?.eligible) return 'match_none';
   return null;
@@ -421,6 +516,8 @@ export default {
   narrowByRecency,
   nameAddressUsable,
   isCanvassCorrelation,
+  loadCanvasserPhones,
+  canvasserMatches,
   phoneVariants,
   reviewReasonFor,
   TIERS,

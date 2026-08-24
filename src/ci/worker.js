@@ -22,10 +22,10 @@ import supabase from '../supabase.js';
 import { runSQL } from '../admin/supabase-admin.js';
 import { getConfig, nextRetryAt } from './config.js';
 import { createSftpAdapter, createManualAdapter, describeRecording, matchRecordingToCall, storeAudio, sha256Hex } from './recordings.js';
-import { dateDirFor, last4 } from './time.js';
+import { dateDirFor, last4, last10 } from './time.js';
 import { transcribeCall, createOpenAITranscriber, createStorageAudioLoader } from './transcribe.js';
 import { analyzeTranscript } from './analyze.js';
-import { matchCall } from './match.js';
+import { matchCall, loadCanvasserPhones } from './match.js';
 import { syncCall } from './sync.js';
 
 const LOG = '[CIWorker]';
@@ -370,7 +370,7 @@ export async function stageAnalyze(call, { db = supabase, cfg = getConfig(), cal
  * the same call, and the newest row wins — that is how a human correction
  * survives a re-run of this stage.
  */
-export async function stageMatch(call, { db = supabase, cfg = getConfig(), now = new Date() } = {}) {
+export async function stageMatch(call, { db = supabase, cfg = getConfig(), now = new Date(), canvasserPhones } = {}) {
   const { data: summary, error: sumErr } = await db
     .from('ci_summaries')
     .select('*')
@@ -386,7 +386,15 @@ export async function stageMatch(call, { db = supabase, cfg = getConfig(), now =
     .maybeSingle();
   if (campErr) throw new Error(`ci_campaign_map read failed: ${campErr.message}`);
 
-  const result = await matchCall(call, { db, analysis: summary?.output ?? null, campaignRow, cfg });
+  // The roster is normally loaded ONCE per tick and threaded in. A direct
+  // call to this stage (the review endpoint, a test) loads it here instead —
+  // it must never be skipped, because an absent roster silently disarms the
+  // guard and the call phone-matches to the canvasser.
+  const roster = canvasserPhones ?? await loadCanvasserPhones(db);
+
+  const result = await matchCall(call, {
+    db, analysis: summary?.output ?? null, campaignRow, cfg, canvasserPhones: roster,
+  });
 
   const { error: insErr } = await db.from('ci_matches').insert({
     call_id: call.id,
@@ -409,6 +417,20 @@ export async function stageMatch(call, { db = supabase, cfg = getConfig(), now =
       note_target: result.target,
       ghl: { tier: result.ghl.tier, method: result.ghl.method, reason: result.ghl.reason },
       canvass_strategy: campaignRow?.match_strategy ?? null,
+      // WHICH canvasser the ANI hit. Without this a reviewer sees only that
+      // the call was withheld, with no way to confirm the roster was right.
+      // All matches are listed — 11 numbers belong to two Pro IDs.
+      ...(result.lp.canvassers?.length
+        ? {
+          canvasser_ani: {
+            phone_last10: last10(call.customer_phone || call.ani),
+            pro_id: result.lp.canvassers[0].pro_id,
+            name: result.lp.canvassers[0].name,
+            market: result.lp.canvassers[0].market,
+            matched: result.lp.canvassers,
+          },
+        }
+        : {}),
     },
     decided_by: 'system',
   });
@@ -542,7 +564,7 @@ export function bestRecordingForCall(call, recordings, windowSeconds = 180) {
 const NOT_YET_IMPLEMENTED = {};
 
 /** Dispatch one claimed call to its stage handler. */
-export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapter, transcriber, loadAudio, callJson, lpClient, ghlClient, now = new Date() } = {}) {
+export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapter, transcriber, loadAudio, callJson, lpClient, ghlClient, now = new Date(), canvasserPhones } = {}) {
   try {
     if (call.status === 'discovered') {
       return await stageFetchRecording(call, { db, cfg, adapter, now });
@@ -554,7 +576,7 @@ export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapt
       return await stageAnalyze(call, { db, cfg, callJson, now });
     }
     if (call.status === 'analyzed') {
-      return await stageMatch(call, { db, cfg, now });
+      return await stageMatch(call, { db, cfg, now, canvasserPhones });
     }
     if (call.status === 'matched') {
       return await stageSync(call, { db, cfg, lpClient, ghlClient, now });
@@ -580,7 +602,7 @@ export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapt
  */
 let ticking = false;
 
-export async function runTick({ db = supabase, cfg = getConfig(), adapter, transcriber, loadAudio, callJson, lpClient, ghlClient, limit, now = new Date() } = {}) {
+export async function runTick({ db = supabase, cfg = getConfig(), adapter, transcriber, loadAudio, callJson, lpClient, ghlClient, limit, now = new Date(), canvasserPhones } = {}) {
   if (ticking) return { ok: true, skipped: 'already_running' };
   ticking = true;
   const startedAt = Date.now();
@@ -588,9 +610,16 @@ export async function runTick({ db = supabase, cfg = getConfig(), adapter, trans
     const batch = await claimBatch({ db, limit: limit ?? cfg.batchSize });
     if (!batch.rows.length) return { ok: true, claimed: 0 };
 
+    // ONE roster read per tick, not one per call — every call in the batch
+    // checks the same ~850 rows. Loaded here rather than lazily inside the
+    // match stage so a batch of ten matching calls costs one query, not ten.
+    // A read failure fails the tick loudly: silently continuing with no
+    // roster would disarm the guard and phone-match canvassers as customers.
+    const roster = canvasserPhones ?? await loadCanvasserPhones(db);
+
     const outcomes = {};
     for (const call of batch.rows) {
-      const r = await advanceOne(call, { db, cfg, adapter, transcriber, loadAudio, callJson, lpClient, ghlClient, now });
+      const r = await advanceOne(call, { db, cfg, adapter, transcriber, loadAudio, callJson, lpClient, ghlClient, now, canvasserPhones: roster });
       outcomes[r.outcome] = (outcomes[r.outcome] || 0) + 1;
     }
     console.log(`${LOG} tick: claimed ${batch.rows.length}${batch.claimed ? '' : ' (UNLEASED fallback)'} → ${JSON.stringify(outcomes)} in ${Date.now() - startedAt}ms`);
