@@ -5,10 +5,16 @@
  * THE TRAPS THESE GUARD:
  *
  * 1. THE JOIN CAN BE AMBIGUOUS AND MUST SAY SO. The Call ID is not in the
- *    filename, so recordings match on campaign + ANI + time. Repeat dials to
- *    one number minutes apart are routine — one number showed five files in
- *    sixteen minutes — so two candidates inside the window is a NORMAL case.
- *    Picking one anyway files a customer's conversation under a stranger.
+ *    filename, so recordings match on campaign + the customer's number + time.
+ *    Repeat dials to one number minutes apart are routine — one number showed
+ *    five files in sixteen minutes — so two candidates inside the window is a
+ *    NORMAL case. Picking one anyway files a customer's conversation under a
+ *    stranger.
+ * 1b. THE CALL SIDE OF THAT COMPARISON IS customer_phone, NOT ani. Five9 names
+ *    a recording file after the number DIALLED, and on an outbound call the ANI
+ *    is a Reece local-presence caller ID. Searching the ANI is why 44 calls sat
+ *    at review_reason='recording_missing' while Five9's own RECORDINGS column
+ *    said the audio existed.
  * 2. CAMPAIGN MUST MATCH EXACTLY. Near-duplicate campaign directories differ
  *    only by case ('Magazine - CLiPP' vs 'Magazine - Clipp'). Folding merges
  *    two campaigns.
@@ -45,17 +51,51 @@ function rec({ ani = '9419203087', campaignDir = 'Main Number', at = '2026-08-05
   return { ani, campaignDir, recordedAt: new Date(at), durationSeconds: duration, sourcePath: path, sourceFilename: 'f.wav' };
 }
 
-/** A ci_calls row. */
-function call({ id = 'call-1', ani = '9419203087', campaign = 'Main Number', start = '2026-08-05T21:30:00Z', duration = 135 } = {}) {
-  return { id, ani, campaign, call_start: start, duration_seconds: duration };
+/**
+ * A ci_calls row.
+ *
+ * customer_phone defaults to the same value as ani — that is an INBOUND call,
+ * where the two genuinely are the same number, and it keeps every pre-existing
+ * case in this file meaning what it meant. Outbound is the case where they
+ * diverge, and it is exercised explicitly below.
+ */
+function call({ id = 'call-1', ani = '9419203087', customerPhone = undefined, campaign = 'Main Number', start = '2026-08-05T21:30:00Z', duration = 135 } = {}) {
+  return {
+    id,
+    ani,
+    customer_phone: customerPhone === undefined ? ani : customerPhone,
+    campaign,
+    call_start: start,
+    duration_seconds: duration,
+  };
 }
 
 // ─── candidate scoring ──────────────────────────────────────────────────────
 
-test('a candidate is disqualified unless campaign AND ANI both match', () => {
+test('a candidate is disqualified unless campaign AND the customer number both match', () => {
   assert.equal(typeof candidateDistanceSeconds(rec(), call()), 'number');
   assert.equal(candidateDistanceSeconds(rec({ campaignDir: 'Other' }), call()), null);
   assert.equal(candidateDistanceSeconds(rec({ ani: '7275550000' }), call()), null);
+});
+
+/* ── THE OUTBOUND CASE THIS JOIN USED TO FAIL ──────────────────────────────
+ *
+ * Live path, fetched 2026-08-24:
+ *   '/Five9/Recordings/Main Number/8_19_2026/4436170733 by cdeer @ 7_16_55 AM.wav'
+ * 4436170733 is the DNIS of outbound call 300000010259676 — its ANI is
+ * 3213429858, a Reece caller ID. Searching the ANI finds nothing, forever.
+ */
+test('an outbound recording is found by the DIALLED number, not the Reece caller ID', () => {
+  const outbound = call({ ani: '3213429858', customerPhone: '4436170733' });
+  assert.equal(typeof candidateDistanceSeconds(rec({ ani: '4436170733' }), outbound), 'number');
+  // The old behaviour, now explicitly rejected: the recording named after the
+  // Reece caller ID does not exist, and must not match if something invents it.
+  assert.equal(candidateDistanceSeconds(rec({ ani: '3213429858' }), outbound), null);
+});
+
+test('a row whose customer_phone was never repaired still falls back to the ANI', () => {
+  const legacy = { id: 'legacy', ani: '9419203087', campaign: 'Main Number', call_start: '2026-08-05T21:30:00Z', duration_seconds: 135 };
+  assert.equal(typeof candidateDistanceSeconds(rec(), legacy), 'number');
 });
 
 test('campaign comparison is EXACT — case-differing near-duplicates never match', () => {
@@ -63,7 +103,7 @@ test('campaign comparison is EXACT — case-differing near-duplicates never matc
   assert.equal(typeof candidateDistanceSeconds(rec({ campaignDir: 'Magazine - CLiPP' }), call({ campaign: 'Magazine - CLiPP' })), 'number');
 });
 
-test('ANI compares on the last 10 digits, so formatting differences still match', () => {
+test('the phone compares on the last 10 digits, so formatting differences still match', () => {
   assert.equal(candidateDistanceSeconds(rec({ ani: '9419203087' }), call({ ani: '+1 (941) 920-3087' })), 12);
 });
 
@@ -72,7 +112,7 @@ test('ANI compares on the last 10 digits, so formatting differences still match'
 test('exactly one candidate inside the window links with a method and confidence', () => {
   const m = matchRecordingToCall(rec(), [call()], { windowSeconds: 180 });
   assert.equal(m.call.id, 'call-1');
-  assert.equal(m.method, 'campaign_ani_time');
+  assert.equal(m.method, 'campaign_customer_time');
   assert.ok(m.confidence > 0.5 && m.confidence <= 1);
   assert.equal(m.reason, 'single_candidate');
 });

@@ -19,7 +19,10 @@
  *
  * ══ THE JOIN ══
  * The Call ID is NOT in the filename (see src/ci/filenames.js). Recordings are
- * matched on campaign + ANI + time, and when that is ambiguous the recording
+ * matched on campaign + THE CUSTOMER'S NUMBER + time — the customer's, not the
+ * ANI, because Five9 names the file after the number DIALLED and on an outbound
+ * call the ANI is a Reece caller ID. See candidateDistanceSeconds(). When that
+ * is ambiguous the recording
  * stays UNLINKED and flagged. Repeat dials to one number minutes apart are
  * routine — one number showed five files inside sixteen minutes — so the
  * ambiguous path is a normal outcome, not an edge case. Guessing here attaches
@@ -193,12 +196,56 @@ export function linkableRecording(recordings) {
 }
 
 /**
+ * Recording→call match methods.
+ *
+ * 'campaign_ani_time' is the LEGACY name for what 'campaign_customer_time' now
+ * does. The rename is not cosmetic: the join used to compare the recording's
+ * number against ci_calls.ani, which is the CUSTOMER only on inbound calls —
+ * on everything else the ANI is a Reece local-presence caller ID, so the search
+ * looked for a Reece number in filenames Five9 names after the number DIALLED
+ * and never found one. 44 calls sat at review_reason='recording_missing' with
+ * recording segments in raw_metadata, i.e. Five9 said the audio existed.
+ *
+ * THE LEGACY STRING STAYS READABLE FOREVER. ci_recordings rows written before
+ * this change carry it, the column has no CHECK constraint, and nothing may
+ * treat those rows as unmatched. Any code that asks "was this matched by the
+ * campaign+time join?" asks isCampaignTimeMatch(), never an equality test
+ * against one string.
+ */
+export const RECORDING_MATCH_CAMPAIGN_TIME = 'campaign_customer_time';
+export const RECORDING_MATCH_CAMPAIGN_TIME_LEGACY = 'campaign_ani_time';
+export const RECORDING_MATCH_METHODS = Object.freeze([
+  RECORDING_MATCH_CAMPAIGN_TIME,
+  RECORDING_MATCH_CAMPAIGN_TIME_LEGACY,
+  'manual',
+]);
+
+/** True for both the current and the legacy campaign+time method names. */
+export function isCampaignTimeMatch(method) {
+  return method === RECORDING_MATCH_CAMPAIGN_TIME
+    || method === RECORDING_MATCH_CAMPAIGN_TIME_LEGACY;
+}
+
+/**
  * Score one candidate call against one parsed recording.
  *
  * Order (handoff §6): campaign dir must match ci_calls.campaign EXACTLY (never
- * case-folded — near-duplicate campaign dirs differ only by case); ANI compares
- * on last-10; time must fall inside the window. Among survivors the NEAREST in
- * time wins, and duration breaks a remaining tie.
+ * case-folded — near-duplicate campaign dirs differ only by case); the phone
+ * compares on last-10; time must fall inside the window. Among survivors the
+ * NEAREST in time wins, and duration breaks a remaining tie.
+ *
+ * ══ IT IS THE CUSTOMER'S NUMBER ON BOTH SIDES, NOT THE ANI ══
+ * Five9 names a recording file after the number DIALLED. Confirmed in a fetched
+ * path: '/Five9/Recordings/Main Number/8_19_2026/4436170733 by cdeer @ 7_16_55
+ * AM.wav' — 4436170733 is the DNIS of an OUTBOUND call, not its ANI. So the
+ * call side of this comparison must be ci_calls.customer_phone, which
+ * discovery.js's customerNumberFor() sets to the ANI on inbound and the DNIS on
+ * everything else. On an inbound call the two are the same value, so inbound
+ * behaviour is unchanged.
+ *
+ * The `|| call.ani` fallback covers rows discovered before that fix whose
+ * customer_phone was never repaired; it can only ever restore today's
+ * behaviour, never worsen it.
  *
  * @returns {number|null} seconds of separation, or null when disqualified
  */
@@ -206,7 +253,7 @@ export function candidateDistanceSeconds(recording, call) {
   if (!recording.recordedAt || !call.call_start) return null;
   if (recording.campaignDir !== call.campaign) return null;
   const a = last10(recording.ani);
-  const b = last10(call.ani);
+  const b = last10(call.customer_phone || call.ani);
   if (!a || !b || a !== b) return null;
   return Math.abs(new Date(call.call_start).getTime() - recording.recordedAt.getTime()) / 1000;
 }
@@ -236,7 +283,7 @@ export function matchRecordingToCall(recording, calls, { windowSeconds = 180 } =
   if (scored.length === 1) {
     return {
       call: scored[0].call,
-      method: 'campaign_ani_time',
+      method: RECORDING_MATCH_CAMPAIGN_TIME,
       confidence: confidenceFor(scored[0].distance, windowSeconds),
       reason: 'single_candidate',
     };
@@ -249,7 +296,7 @@ export function matchRecordingToCall(recording, calls, { windowSeconds = 180 } =
   if (separation >= 30) {
     return {
       call: best.call,
-      method: 'campaign_ani_time',
+      method: RECORDING_MATCH_CAMPAIGN_TIME,
       confidence: confidenceFor(best.distance, windowSeconds),
       reason: 'nearest_by_time',
     };
@@ -262,7 +309,7 @@ export function matchRecordingToCall(recording, calls, { windowSeconds = 180 } =
     if (Number.isFinite(byDuration[0].delta) && byDuration[1].delta - byDuration[0].delta >= 5) {
       return {
         call: byDuration[0].call,
-        method: 'campaign_ani_time',
+        method: RECORDING_MATCH_CAMPAIGN_TIME,
         confidence: 0.6,
         reason: 'nearest_by_duration',
       };
@@ -518,4 +565,8 @@ export default {
   linkExpiresAt,
   ensureLinkToken,
   linkableRecording,
+  isCampaignTimeMatch,
+  RECORDING_MATCH_CAMPAIGN_TIME,
+  RECORDING_MATCH_CAMPAIGN_TIME_LEGACY,
+  RECORDING_MATCH_METHODS,
 };

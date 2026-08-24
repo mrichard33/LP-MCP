@@ -231,6 +231,68 @@ export function teamFromAgentMap(agentMap, agentUsername) {
 }
 
 /**
+ * WHICH NUMBER ON THIS CALL BELONGS TO THE CUSTOMER.
+ *
+ * ══ INBOUND IS THE SPECIAL CASE, NOT THE DEFAULT ══
+ * On an INBOUND call the customer dialled us, so the ANI is theirs. On
+ * everything else — Outbound, Manual, Preview — the dialer placed the call, so
+ * the ANI is a REECE local-presence caller ID and the DNIS is the customer.
+ * Verified live 2026-08-24:
+ *   300000010259677  Manual   ani 8555768943 (Reece toll-free)  dnis 9125520152
+ *   300000010259676  Preview  ani 3213429858                    dnis 4436170733
+ *   300000010259655  Preview  ani 3527223289                    dnis 3212765070
+ *
+ * This function previously did not exist and buildCallRow took the ANI
+ * unconditionally. That was wrong on 13,944 of 15,114 live rows (92%), and it
+ * was wrong in two directions at once: the recording join searched a Reece
+ * number and found nothing (Five9 names recording files after the number
+ * DIALLED), and — the dangerous one — customer_phone_e164 fed the phone-tier
+ * LP/GHL match, so an outbound note either failed to match or attached to
+ * whatever record happens to hold that Reece caller ID. Silently.
+ *
+ * ══ AN UNRECOGNISED DIRECTION TAKES THE OUTBOUND BRANCH ══
+ * Treating an unknown direction as inbound is precisely what produced the bug,
+ * so the test is `contains 'inbound'` and EVERYTHING else falls through to
+ * DNIS. That is deliberate on the live values this does not name: '3rd party
+ * conference' and 'Internal' both take the DNIS, as does any value Five9 adds
+ * later. 'Inbound Voicemail' contains 'inbound' and correctly takes the ANI.
+ *
+ * ══ THE FALLBACK IS ONE-WAY ══
+ * A non-inbound call with no DNIS falls back to the ANI — a poor answer, but
+ * the only number the call has. Inbound does NOT fall back to the DNIS: a
+ * withheld caller ID leaves the ANI empty, and the DNIS on an inbound call is
+ * REECE'S OWN inbound number. Falling back there would write a Reece number
+ * into customer_phone and hand the matcher a company line to resolve, which is
+ * the same class of failure this function exists to end. Null is the honest
+ * answer.
+ *
+ * Pure, and takes anything carrying {direction, ani, dnis} — a zipped report
+ * leg here, a ci_calls row in scripts/repair-ci-customer-phone.js. Both callers
+ * MUST use this function: two implementations of "which number is the
+ * customer" would be two chances to disagree, and the disagreement would be
+ * invisible until a note landed on a stranger's record.
+ *
+ * @param {{direction?: string, ani?: string, dnis?: string}} row
+ * @returns {string|null} the customer's number as stored, raw
+ */
+export function customerNumberFor(row) {
+  const clean = (v) => {
+    const s = String(v ?? '').trim();
+    return s || null;
+  };
+  const ani = clean(row?.ani);
+  const dnis = clean(row?.dnis);
+  if (String(row?.direction ?? '').toLowerCase().includes('inbound')) return ani;
+  return dnis || ani;
+}
+
+/** The '+1' form of whatever customerNumberFor() chose — never of a different field. */
+export function customerE164For(row) {
+  const ten = last10(customerNumberFor(row));
+  return ten ? `+1${ten}` : null;
+}
+
+/**
  * Build a ci_calls row from a grouped set of report legs. Pure — exported so
  * the whole shaping path is testable without Five9 or Supabase.
  *
@@ -300,10 +362,14 @@ export function buildCallRow(legs, campaignRow, cfg, agentMap = null) {
     call_start: startedAt.toISOString(),
     duration_seconds: durationSeconds,
     direction: primary.direction || null,
+    // ani and dnis stay RAW and unchanged — they are the audit trail, and the
+    // repair script recomputes the two derived columns from them.
     ani: primary.ani || null,
     dnis: primary.dnis || null,
-    customer_phone: primary.ani || null,
-    customer_phone_e164: last10(primary.ani) ? `+1${last10(primary.ani)}` : null,
+    // Both derived columns come from the SAME helper, so they can never name
+    // different fields of the same call.
+    customer_phone: customerNumberFor(primary),
+    customer_phone_e164: customerE164For(primary),
     campaign: primary.campaign || null,
     skill: primary.skill || null,
     disposition: primary.disposition || null,
@@ -497,4 +563,7 @@ export async function discoverCalls({ from, to, windowHours = 6, deps = {} } = {
 }
 
 export const _internal = { last4 };
-export default { discoverCalls, pullWindow, loadCampaignMap, loadAgentMap };
+export default {
+  discoverCalls, pullWindow, loadCampaignMap, loadAgentMap,
+  customerNumberFor, customerE164For,
+};

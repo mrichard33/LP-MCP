@@ -244,7 +244,7 @@ export async function stageFetchRecording(call, { db = supabase, cfg = getConfig
     source_path: best.recording.sourcePath,
     match_method: best.method,
     confidence: best.confidence,
-    phone: last4(call.ani),
+    phone: last4(call.customer_phone || call.ani),
   });
   return { outcome: 'advanced', to: 'fetched' };
 }
@@ -318,7 +318,7 @@ export async function stageTranscribe(call, { db = supabase, cfg = getConfig(), 
     audio_seconds: row.audio_seconds,
     low_confidence: row.low_confidence,
     segments: Array.isArray(row.segments) ? row.segments.length : 0,
-    phone: last4(call.ani),
+    phone: last4(call.customer_phone || call.ani),
   });
   return { outcome: 'advanced', to: 'transcribed', low_confidence: row.low_confidence };
 }
@@ -401,7 +401,7 @@ export async function stageAnalyze(call, { db = supabase, cfg = getConfig(), cal
     outcome: result.row.outcome,
     confidence: result.row.outcome_confidence,
     attempts: result.attempts,
-    phone: last4(call.ani),
+    phone: last4(call.customer_phone || call.ani),
   });
   return { outcome: 'advanced', to: 'analyzed' };
 }
@@ -499,7 +499,7 @@ export async function stageMatch(call, { db = supabase, cfg = getConfig(), now =
     await sendToReview(db, call, 'match', result.review, {
       lp_tier: result.lp.tier,
       candidates: (result.lp.candidates || []).length,
-      phone: last4(call.ani),
+      phone: last4(call.customer_phone || call.ani),
     });
     return { outcome: 'review', reason: result.review, tier: result.lp.tier };
   }
@@ -508,7 +508,7 @@ export async function stageMatch(call, { db = supabase, cfg = getConfig(), now =
     lp_tier: result.lp.tier,
     ghl_tier: result.ghl.tier,
     rectype: result.target.rectype,
-    phone: last4(call.ani),
+    phone: last4(call.customer_phone || call.ani),
   });
   return { outcome: 'advanced', to: 'matched', tier: result.lp.tier };
 }
@@ -595,7 +595,7 @@ export async function stageSync(call, { db = supabase, cfg = getConfig(), lpClie
   if (terminal.length > 0) {
     await sendToReview(db, call, 'sync', 'sync_failed', {
       targets: terminal,
-      phone: last4(call.ani),
+      phone: last4(call.customer_phone || call.ani),
     });
     return { outcome: 'review', reason: 'sync_failed', result };
   }
@@ -603,7 +603,7 @@ export async function stageSync(call, { db = supabase, cfg = getConfig(), lpClie
   await advance(db, call, 'sync', 'completed', {
     lp: describeSync(result.lp),
     ghl: describeSync(result.ghl),
-    phone: last4(call.ani),
+    phone: last4(call.customer_phone || call.ani),
   });
   return { outcome: 'advanced', to: 'completed', result };
 }
