@@ -26,6 +26,8 @@ import { dateDirFor, last4, last10 } from './time.js';
 import { transcribeCall, createOpenAITranscriber, createStorageAudioLoader } from './transcribe.js';
 import { analyzeTranscript } from './analyze.js';
 import { matchCall, loadCanvasserPhones } from './match.js';
+import { loadAgentMap } from './discovery.js';
+import { resolveAgentLabel } from './teams.js';
 import { syncCall } from './sync.js';
 
 const LOG = '[CIWorker]';
@@ -333,7 +335,32 @@ export async function stageTranscribe(call, { db = supabase, cfg = getConfig(), 
  * advances — the summary is real and a reviewer needs to read it. The call
  * then goes to review carrying its flags, rather than being discarded.
  */
-export async function stageAnalyze(call, { db = supabase, cfg = getConfig(), callJson, now = new Date() } = {}) {
+/**
+ * The name to print for this call's agent, resolved against the agent map.
+ *
+ * ci_agent_map.agent_name is seeded from the Five9 user record and can be an
+ * ADMINISTRATIVE label — live example, 'Mark R (Keep Old Edwin Account)' —
+ * which has no business on a customer record. display_name (sql/069) overrides
+ * it; NULL means "use agent_name".
+ *
+ * Used at BOTH stageAnalyze and stageSync so the summary and the note header
+ * name the agent identically. A header and a summary naming the same agent
+ * differently reads as two people on one call.
+ *
+ * Falls back to the call row alone when no map was threaded in, which is the
+ * pre-sql/069 behaviour. Pure: the map is an argument, never a read.
+ */
+export function agentLabelFor(call, agentMap) {
+  const key = String(call?.agent_username ?? '').trim().toLowerCase();
+  const row = (key && typeof agentMap?.get === 'function') ? agentMap.get(key) : null;
+  return resolveAgentLabel({
+    displayName: row?.display_name,
+    agentName: call?.agent_name ?? row?.agent_name,
+    agentUsername: call?.agent_username,
+  });
+}
+
+export async function stageAnalyze(call, { db = supabase, cfg = getConfig(), callJson, now = new Date(), agentMap = null } = {}) {
   const { data: transcript, error } = await db
     .from('ci_transcripts')
     .select('*')
@@ -347,6 +374,8 @@ export async function stageAnalyze(call, { db = supabase, cfg = getConfig(), cal
 
   const result = await analyzeTranscript(call, transcript, {
     cfg,
+    // The SAME label the note header will print — see agentLabelFor().
+    agentLabel: agentLabelFor(call, agentMap),
     ...(callJson ? { callJson } : {}),
   });
 
@@ -501,7 +530,7 @@ const TIER_CONFIDENCE = { exact: 1.0, high: 0.9, probable: 0.6, ambiguous: 0.3, 
  * out. Treating "shadow skipped" as incomplete would park every call in the
  * subsystem for as long as the flags stay off, which is the normal state.
  */
-export async function stageSync(call, { db = supabase, cfg = getConfig(), lpClient, ghlClient, now = new Date() } = {}) {
+export async function stageSync(call, { db = supabase, cfg = getConfig(), lpClient, ghlClient, now = new Date(), agentMap = null } = {}) {
   const { data: match, error: mErr } = await db
     .from('ci_matches')
     .select('*')
@@ -551,7 +580,9 @@ export async function stageSync(call, { db = supabase, cfg = getConfig(), lpClie
     console.warn(`${LOG} call=${call.id} recording link unavailable: ${err.message}`);
   }
 
-  const result = await syncCall(call, summary, match, { db, cfg, lpClient, ghlClient, link });
+  const result = await syncCall(call, summary, match, {
+    db, cfg, lpClient, ghlClient, link, agentLabel: agentLabelFor(call, agentMap),
+  });
 
   // A target that failed and has NOT exhausted its attempts gets another go.
   const retryable = ['lp', 'ghl'].filter((t) => result[t]?.failed && !result[t]?.terminal);
@@ -618,7 +649,7 @@ export function bestRecordingForCall(call, recordings, windowSeconds = 180) {
 const NOT_YET_IMPLEMENTED = {};
 
 /** Dispatch one claimed call to its stage handler. */
-export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapter, transcriber, loadAudio, callJson, lpClient, ghlClient, now = new Date(), canvasserPhones } = {}) {
+export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapter, transcriber, loadAudio, callJson, lpClient, ghlClient, now = new Date(), canvasserPhones, agentMap } = {}) {
   try {
     if (call.status === 'discovered') {
       return await stageFetchRecording(call, { db, cfg, adapter, now });
@@ -627,13 +658,13 @@ export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapt
       return await stageTranscribe(call, { db, cfg, transcriber, loadAudio, now });
     }
     if (call.status === 'transcribed') {
-      return await stageAnalyze(call, { db, cfg, callJson, now });
+      return await stageAnalyze(call, { db, cfg, callJson, now, agentMap });
     }
     if (call.status === 'analyzed') {
       return await stageMatch(call, { db, cfg, now, canvasserPhones });
     }
     if (call.status === 'matched') {
-      return await stageSync(call, { db, cfg, lpClient, ghlClient, now });
+      return await stageSync(call, { db, cfg, lpClient, ghlClient, now, agentMap });
     }
     const pending = NOT_YET_IMPLEMENTED[call.status];
     if (pending) {
@@ -656,7 +687,7 @@ export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapt
  */
 let ticking = false;
 
-export async function runTick({ db = supabase, cfg = getConfig(), adapter, transcriber, loadAudio, callJson, lpClient, ghlClient, limit, now = new Date(), canvasserPhones } = {}) {
+export async function runTick({ db = supabase, cfg = getConfig(), adapter, transcriber, loadAudio, callJson, lpClient, ghlClient, limit, now = new Date(), canvasserPhones, agentMap } = {}) {
   if (ticking) return { ok: true, skipped: 'already_running' };
   ticking = true;
   const startedAt = Date.now();
@@ -670,10 +701,14 @@ export async function runTick({ db = supabase, cfg = getConfig(), adapter, trans
     // A read failure fails the tick loudly: silently continuing with no
     // roster would disarm the guard and phone-match canvassers as customers.
     const roster = canvasserPhones ?? await loadCanvasserPhones(db);
+    // ONE agent-map read per tick, like the roster. It supplies the
+    // display_name override (sql/069) for the note header AND the analyzer's
+    // identity line — both must print the SAME label.
+    const agents = agentMap ?? await loadAgentMap(db);
 
     const outcomes = {};
     for (const call of batch.rows) {
-      const r = await advanceOne(call, { db, cfg, adapter, transcriber, loadAudio, callJson, lpClient, ghlClient, now, canvasserPhones: roster });
+      const r = await advanceOne(call, { db, cfg, adapter, transcriber, loadAudio, callJson, lpClient, ghlClient, now, canvasserPhones: roster, agentMap: agents });
       outcomes[r.outcome] = (outcomes[r.outcome] || 0) + 1;
     }
     console.log(`${LOG} tick: claimed ${batch.rows.length}${batch.claimed ? '' : ' (UNLEASED fallback)'} → ${JSON.stringify(outcomes)} in ${Date.now() - startedAt}ms`);

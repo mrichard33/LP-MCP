@@ -116,9 +116,25 @@ const TEAM_DESCRIPTORS = {
   north_carolina: 'a North Carolina call-center agent',
 };
 
-/** The agent-identity line, or null when there is no agent name to anchor on. */
-export function agentContextLine(call) {
-  const name = String(call?.agent_name ?? '').trim();
+/**
+ * The agent-identity line, or null when there is no agent name to anchor on.
+ *
+ * `agentLabel` is the name ALREADY RESOLVED against ci_agent_map.display_name
+ * (teams.js resolveAgentLabel), supplied by the worker. It must be the SAME
+ * label the note header prints: a summary and a header naming the agent
+ * differently reads as two people on one call, which is worse than either
+ * being wrong on its own. Absent, this falls back to the call row's own
+ * agent_name, which is the pre-sql/069 behaviour.
+ *
+ * 'unknown agent' is treated as no name at all — it is resolveAgentLabel's
+ * last-resort filler, and asserting "The agent on this call is unknown agent."
+ * to the model is worse than saying nothing.
+ */
+export function agentContextLine(call, agentLabel = null) {
+  const resolved = String(agentLabel ?? '').trim();
+  const name = (resolved && resolved !== 'unknown agent')
+    ? resolved
+    : String(call?.agent_name ?? '').trim();
   if (!name) return null;
   const descriptor = TEAM_DESCRIPTORS[String(call?.team ?? '').trim()];
   return descriptor
@@ -142,14 +158,14 @@ const ROLE_ANCHOR = [
   'field representative, canvasser, or installer unless the transcript says so explicitly.',
 ].join('\n');
 
-export function buildUserMessage(transcript, call = null) {
+export function buildUserMessage(transcript, call = null, agentLabel = null) {
   const head = [];
   // The agent's identity goes FIRST, above direction and campaign: it is the
   // one fact here we actually know, and the model should anchor on it rather
   // than read it as another hint to weigh. Omitted entirely when there is no
   // agent name — a line reading "The agent on this call is undefined." is
   // worse than no line at all.
-  const agentLine = agentContextLine(call);
+  const agentLine = agentContextLine(call, agentLabel);
   if (agentLine) {
     head.push(agentLine);
     head.push(ROLE_ANCHOR);
@@ -228,9 +244,9 @@ export const MAX_ANALYSIS_ATTEMPTS = 2;
  *
  * @returns {Promise<{ok: boolean, row?: object, reason?: string, errors?: string[], attempts: number}>}
  */
-export async function analyzeTranscript(call, transcript, { cfg = getConfig(), callJson = callLLMJson } = {}) {
+export async function analyzeTranscript(call, transcript, { cfg = getConfig(), callJson = callLLMJson, agentLabel = null } = {}) {
   const system = buildSystemPrompt();
-  const user = buildUserMessage(transcript, call);
+  const user = buildUserMessage(transcript, call, agentLabel);
 
   const failures = [];
   for (let attempt = 1; attempt <= MAX_ANALYSIS_ATTEMPTS; attempt++) {
