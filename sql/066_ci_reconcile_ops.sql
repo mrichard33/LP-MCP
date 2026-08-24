@@ -7,9 +7,10 @@
 --
 --    sql/061 wrote that view when ci_matches held at most one row per call.
 --    PR 4 and PR 5 made the table append-only on purpose: stageMatch inserts
---    decided_by='system', and the review endpoint appends decided_by='human'
---    beside it rather than overwriting, so the trail shows both what the
---    matcher concluded and what a person decided.
+--    decided_by='auto' (the column default, and one of the only two values its
+--    CHECK admits), and the review endpoint appends decided_by='human' beside
+--    it rather than overwriting, so the trail shows both what the matcher
+--    concluded and what a person decided.
 --
 --    With a plain LEFT JOIN, a call with two match rows appears TWICE in the
 --    review queue — and the two copies disagree, because one carries the

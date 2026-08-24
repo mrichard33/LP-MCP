@@ -363,8 +363,10 @@ export function registerCiRoutes(app, authenticate) {
    *   fail       give up on it, with the reason on the record
    *
    * set_match writes a ci_matches row with decided_by='human'. That row does
-   * not overwrite the system's — both are kept, and the human one is newer, so
-   * the audit trail shows what the matcher thought AND what a person decided.
+   * not overwrite the matcher's ('auto') — both are kept, and the human one is
+   * newer, so the audit trail shows what the matcher thought AND what a person
+   * decided. 'auto' and 'human' are the only two values the column's CHECK
+   * admits (sql/061).
    */
   app.post('/ci/review/:call_id/resolve', ...guards, async (req, res) => {
     try {
