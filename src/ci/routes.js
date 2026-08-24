@@ -17,7 +17,7 @@ import supabase from '../supabase.js';
 import { getConfig } from './config.js';
 import { discoverCalls } from './discovery.js';
 import { runTick } from './worker.js';
-import { createManualAdapter, storeAudio, sha256Hex, describeRecording, ensureLinkToken } from './recordings.js';
+import { createManualAdapter, storeAudio, sha256Hex, describeRecording, ensureLinkToken, transcodeAndStoreMp3 } from './recordings.js';
 import { CI_AUDIO_BUCKET } from '../../scripts/setup-ci-audio-bucket.js';
 import { reconcileDay, pipelineHealth } from './reconcile.js';
 
@@ -72,6 +72,96 @@ export async function resumeStatusFor(db, callId) {
   if (await has('ci_transcripts')) return 'transcribed';
   if (await has('ci_recordings')) return 'fetched';
   return 'discovered';
+}
+
+/**
+ * Store one manually-uploaded recording against a known call.
+ *
+ * ══ EXTRACTED SO IT CAN BE TESTED ══
+ * Same reasoning as applyResolve() below: this was inline in the POST
+ * /ci/backfill handler, which reads the module-level supabase client and so
+ * could not be driven from a test at all. That is exactly how it came to be
+ * the ONE audio path that stored a WAV and never produced the MP3 derivative —
+ * a manual upload got a link that opens and plays nothing, which is the very
+ * failure sql/070 exists to fix. An untested storage path is what let that sit.
+ *
+ * Everything is injected, so the whole shape of what gets written is
+ * assertable without a live Supabase.
+ *
+ * @returns {Promise<{sourcePath, sha256, bytes, mp3Bytes, mp3Error, advanced}>}
+ */
+export async function storeManualRecording({ db, call, buffer, five9CallId, filename = null }) {
+  const manual = createManualAdapter();
+  const bytes = await manual.fetch({ buffer });
+  const wavName = `manual-${five9CallId}.wav`;
+  const stored = await storeAudio({ callId: call.id, buffer: bytes, filename: wavName, db });
+
+  // A manual upload is audio like any other and gets an MP3 like any other.
+  // The bytes a human uploads are usually a Five9 export, i.e. the same GSM
+  // 6.10 no browser decodes. Never throws — a failed transcode leaves
+  // mp3_storage_path null and the route falls back to serving the WAV.
+  const mp3 = await transcodeAndStoreMp3({
+    callId: call.id, buffer: bytes, sha: stored.sha256, filename: wavName, db,
+  });
+
+  // source_path is the table's unique key and a manual upload has no remote
+  // path, so synthesize a stable one from the content hash. Two uploads of the
+  // same bytes collapse to one row; different bytes for the same call are two
+  // rows, which is the honest representation.
+  const sourcePath = `manual://${five9CallId}/${stored.sha256}`;
+  const { error } = await db.from('ci_recordings').upsert({
+    call_id: call.id,
+    source: 'manual',
+    source_path: sourcePath,
+    source_filename: String(filename || wavName),
+    file_sha256: stored.sha256,
+    file_bytes: stored.bytes,
+    // mime still describes the ORIGINAL. The derivative is additive and the
+    // WAV remains the archival copy and the transcription input.
+    mime: 'audio/wav',
+    storage_path: stored.storagePath,
+    mp3_storage_path: mp3.mp3StoragePath,
+    mp3_bytes: mp3.mp3Bytes,
+    match_method: 'manual',
+    match_confidence: 1,
+    excluded: false,
+  }, { onConflict: 'source_path' });
+  if (error) throw new Error(`ci_recordings upsert failed: ${error.message}`);
+
+  // A manual backfill is audio like any other and gets a link too.
+  await ensureLinkToken({ sourcePath, db });
+
+  // Only advance a call that is still waiting for audio. A later-stage call
+  // must not be dragged backwards by a backfill.
+  let advanced = false;
+  if (call.status === 'discovered' || call.status === 'review') {
+    const { error: updErr } = await db.from('ci_calls').update({
+      status: 'fetched',
+      review_reason: null,
+      next_retry_at: null,
+      locked_until: null,
+      locked_by: null,
+      updated_at: new Date().toISOString(),
+    }).eq('id', call.id);
+    if (updErr) throw new Error(`ci_calls advance failed: ${updErr.message}`);
+    advanced = true;
+  }
+
+  await db.from('ci_events').insert({
+    call_id: call.id,
+    stage: 'fetch',
+    event: 'transition',
+    detail: { source: 'manual', sha256: stored.sha256, bytes: stored.bytes, advanced, mp3_bytes: mp3.mp3Bytes },
+  });
+
+  return {
+    sourcePath,
+    sha256: stored.sha256,
+    bytes: stored.bytes,
+    mp3Bytes: mp3.mp3Bytes,
+    mp3Error: mp3.error,
+    advanced,
+  };
 }
 
 /** The four things a human can decide about a reviewed call. */
@@ -391,58 +481,20 @@ export function registerCiRoutes(app, authenticate) {
       if (callErr) throw new Error(`ci_calls lookup failed: ${callErr.message}`);
       if (!call) throw new BadRequest(`no ci_calls row for five9_call_id ${five9CallId} — discover it first`);
 
-      const manual = createManualAdapter();
-      const buffer = await manual.fetch({ buffer: req.body });
-      const stored = await storeAudio({ callId: call.id, buffer, filename: `manual-${five9CallId}.wav`, db });
-
-      // source_path is the table's unique key and a manual upload has no
-      // remote path, so synthesize a stable one from the content hash. Two
-      // uploads of the same bytes collapse to one row; different bytes for the
-      // same call are two rows, which is the honest representation.
-      const sourcePath = `manual://${five9CallId}/${stored.sha256}`;
-      const { error } = await db.from('ci_recordings').upsert({
-        call_id: call.id,
-        source: 'manual',
-        source_path: sourcePath,
-        source_filename: String(req.query.filename || `manual-${five9CallId}.wav`),
-        file_sha256: stored.sha256,
-        file_bytes: stored.bytes,
-        mime: 'audio/wav',
-        storage_path: stored.storagePath,
-        match_method: 'manual',
-        match_confidence: 1,
-        excluded: false,
-      }, { onConflict: 'source_path' });
-      if (error) throw new Error(`ci_recordings upsert failed: ${error.message}`);
-
-      // A manual backfill is audio like any other and gets a link too.
-      await ensureLinkToken({ sourcePath, db });
-
-      // Only advance a call that is still waiting for audio. A later-stage
-      // call must not be dragged backwards by a backfill.
-      let advanced = false;
-      if (call.status === 'discovered' || call.status === 'review') {
-        const { error: updErr } = await db.from('ci_calls').update({
-          status: 'fetched',
-          review_reason: null,
-          next_retry_at: null,
-          locked_until: null,
-          locked_by: null,
-          updated_at: new Date().toISOString(),
-        }).eq('id', call.id);
-        if (updErr) throw new Error(`ci_calls advance failed: ${updErr.message}`);
-        advanced = true;
-      }
-
-      await db.from('ci_events').insert({
-        call_id: call.id,
-        stage: 'fetch',
-        event: 'transition',
-        detail: { source: 'manual', sha256: stored.sha256, bytes: stored.bytes, advanced },
+      const out = await storeManualRecording({
+        db, call, buffer: req.body, five9CallId, filename: req.query.filename,
       });
 
-      console.log(`${LOG} backfill: call ${call.id} ← ${stored.bytes}B (sha ${stored.sha256.slice(0, 12)})${advanced ? ' → fetched' : ' (status unchanged)'}`);
-      res.json({ ok: true, call_id: call.id, sha256: stored.sha256, bytes: stored.bytes, advanced });
+      console.log(`${LOG} backfill: call ${call.id} ← ${out.bytes}B (sha ${out.sha256.slice(0, 12)})`
+        + `${out.mp3Bytes ? `, mp3 ${out.mp3Bytes}B` : ', NO mp3 (link will serve the original)'}`
+        + `${out.advanced ? ' → fetched' : ' (status unchanged)'}`);
+      // mp3_bytes null tells the uploader their link will serve the original
+      // and may not play, instead of leaving them to discover it by clicking.
+      res.json({
+        ok: true, call_id: call.id, sha256: out.sha256, bytes: out.bytes, advanced: out.advanced,
+        mp3_bytes: out.mp3Bytes,
+        ...(out.mp3Error ? { mp3_error: out.mp3Error.slice(0, 200) } : {}),
+      });
     } catch (err) {
       if (err instanceof BadRequest) return res.status(400).json({ ok: false, error: err.message });
       console.error(`${LOG} POST /ci/backfill failed: ${err.message}`);

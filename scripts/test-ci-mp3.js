@@ -596,3 +596,122 @@ test('a recording row with an MP3 still carries its untouched WAV path', () => {
   assert.equal(row.mime, 'audio/wav', 'mime still describes the original');
   assert.notEqual(row.storage_path, row.mp3_storage_path);
 });
+
+// ─── the manual upload path gets an MP3 too ─────────────────────────────────
+
+/**
+ * Supabase double for storeManualRecording: captures the ci_recordings upsert,
+ * the storage uploads, the ci_calls patch and the ci_events row.
+ */
+function manualDb() {
+  const state = { uploads: [], upsert: null, callPatch: null, event: null, tokenUpdate: null };
+  return {
+    state,
+    from(table) {
+      const chain = {
+        upsert: async (row) => { if (table === 'ci_recordings') state.upsert = row; return { error: null }; },
+        update(p) { if (table === 'ci_calls') state.callPatch = p; else state.tokenUpdate = p; return chain; },
+        insert: async (row) => { if (table === 'ci_events') state.event = row; return { error: null }; },
+        eq() { return chain; },
+        is() { return chain; },
+        select: async () => ({ data: [{ link_token: 't' }], error: null }),
+        maybeSingle: async () => ({ data: null, error: null }),
+      };
+      return chain;
+    },
+    storage: {
+      from(bucket) {
+        return {
+          upload: async (p, buf, opts) => {
+            state.uploads.push({ bucket, path: p, bytes: buf.length, contentType: opts?.contentType });
+            return { error: null };
+          },
+        };
+      },
+    },
+  };
+}
+
+/*
+ * THE GAP THIS CLOSES. POST /ci/backfill is the one path a HUMAN uses to fix a
+ * recording the crawl could not find. It stored the WAV and produced no MP3, so
+ * the link it handed back opened and played nothing — the exact failure sql/070
+ * exists to fix, on the exact path someone reaches for when something is
+ * already wrong. It went unnoticed because the handler read the module-level
+ * supabase client and so could not be tested at all.
+ */
+test('a MANUAL upload gets an MP3 derivative, not just a WAV', { skip: FFMPEG.ok ? false : 'ffmpeg not available' }, async () => {
+  const { storeManualRecording } = await import('../src/ci/routes.js');
+  const db = manualDb();
+  const out = await storeManualRecording({
+    db,
+    call: { id: 'call-m1', status: 'review' },
+    buffer: GSM_FIXTURE,
+    five9CallId: '300000010259677',
+  });
+
+  assert.ok(out.mp3Bytes > 0, 'an MP3 was produced');
+  assert.equal(out.mp3Error, null);
+
+  // Both objects stored, in the same private bucket, with the right types.
+  const wav = db.state.uploads.find((u) => u.path.endsWith('.wav'));
+  const mp3 = db.state.uploads.find((u) => u.path.endsWith('.mp3'));
+  assert.ok(wav, 'the original is still stored');
+  assert.ok(mp3, 'and so is the derivative');
+  assert.equal(wav.contentType, 'audio/wav');
+  assert.equal(mp3.contentType, 'audio/mpeg');
+  assert.equal(wav.bucket, 'ci-audio');
+  assert.equal(mp3.bucket, 'ci-audio');
+
+  // And the row points at both.
+  assert.equal(db.state.upsert.storage_path, wav.path);
+  assert.equal(db.state.upsert.mp3_storage_path, mp3.path);
+  assert.equal(db.state.upsert.mp3_bytes, out.mp3Bytes);
+  assert.equal(db.state.upsert.mime, 'audio/wav', 'mime still describes the original');
+  assert.equal(db.state.upsert.source, 'manual');
+});
+
+test('a manual upload whose audio will not convert still stores and still advances', async () => {
+  const { storeManualRecording } = await import('../src/ci/routes.js');
+  const db = manualDb();
+  const realWarn = console.warn;
+  console.warn = () => {};
+  let out;
+  try {
+    out = await storeManualRecording({
+      db,
+      call: { id: 'call-m2', status: 'review' },
+      buffer: Buffer.from('not audio at all'),
+      five9CallId: '300000010259678',
+    });
+  } finally {
+    console.warn = realWarn;
+  }
+
+  // The WAV is stored and the call still advances — losing the playable copy
+  // must never cost the call its transcript.
+  assert.equal(db.state.upsert.mp3_storage_path, null);
+  assert.equal(db.state.upsert.mp3_bytes, null);
+  assert.ok(db.state.upsert.storage_path, 'the original is still stored');
+  assert.equal(out.advanced, true, 'the call still moves to fetched');
+  assert.equal(db.state.callPatch.status, 'fetched');
+});
+
+test('a manual upload never drags a later-stage call backwards', async () => {
+  const { storeManualRecording } = await import('../src/ci/routes.js');
+  const db = manualDb();
+  const realWarn = console.warn;
+  console.warn = () => {};
+  try {
+    const out = await storeManualRecording({
+      db,
+      call: { id: 'call-m3', status: 'completed' },
+      buffer: Buffer.from('not audio at all'),
+      five9CallId: '300000010259679',
+    });
+    assert.equal(out.advanced, false);
+  } finally {
+    console.warn = realWarn;
+  }
+  assert.equal(db.state.callPatch, null, 'ci_calls was not touched');
+});
