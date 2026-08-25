@@ -29,6 +29,7 @@ import { matchCall, loadCanvasserPhones } from './match.js';
 import { loadAgentMap } from './discovery.js';
 import { resolveAgentLabel } from './teams.js';
 import { syncCall } from './sync.js';
+import { verifyPendingLpNotes } from './verify.js';
 
 const LOG = '[CIWorker]';
 
@@ -478,7 +479,10 @@ export async function stageMatch(call, { db = supabase, cfg = getConfig(), now =
   const { error: insErr } = await db.from('ci_matches').insert({
     call_id: call.id,
     lp_cst_id: result.lp.prospectId ?? null,
-    lp_lds_id: result.target.rectype === 'ils' ? result.target.recid : (result.lp.leadId ?? null),
+    // The inquiry the note is ABOUT. It stopped being the note's attachment
+    // point (see pickNoteTarget — notes anchor to the prospect now), but it is
+    // still resolved and still recorded here, which is the join an audit uses.
+    lp_lds_id: result.target.lead_id ?? result.lp.leadId ?? null,
     ghl_contact_id: result.ghl.ghlContactId ?? null,
     method: result.lp.method,
     tier: result.lp.tier,
@@ -634,6 +638,10 @@ export async function stageSync(call, { db = supabase, cfg = getConfig(), lpClie
 function describeSync(r) {
   if (!r) return 'none';
   if (r.synced) return 'synced';
+  // LP: the write went out and delivery is not yet proven. The CALL is still
+  // finished — it has nothing left to do — so this is an outcome, not a defer.
+  // Proving it is src/ci/verify.js's job and belongs to the sync ROW.
+  if (r.sent) return 'sent_unconfirmed';
   if (r.shadow) return 'shadow';
   if (r.skipped) return `skipped:${r.reason}`;
   if (r.failed) return 'failed';
@@ -709,13 +717,30 @@ export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapt
  */
 let ticking = false;
 
-export async function runTick({ db = supabase, cfg = getConfig(), adapter, transcriber, loadAudio, callJson, lpClient, ghlClient, limit, now = new Date(), canvasserPhones, agentMap } = {}) {
+export async function runTick({ db = supabase, cfg = getConfig(), adapter, transcriber, loadAudio, callJson, lpClient, ghlClient, lpReader, limit, now = new Date(), canvasserPhones, agentMap } = {}) {
   if (ticking) return { ok: true, skipped: 'already_running' };
   ticking = true;
   const startedAt = Date.now();
   try {
+    // Prove the PREVIOUS tick's notes before writing any more.
+    //
+    // Deliberately ahead of claimBatch and ahead of the empty-batch return: an
+    // idle queue is exactly when unconfirmed notes are waiting to be read back,
+    // and hanging this off the claim would leave them unverified for as long as
+    // there were no calls. It is also why this needs no scheduler of its own.
+    //
+    // A verification failure must never stop the pipeline. The sweep already
+    // treats an unreadable prospect as "unknown, change nothing"; this catch is
+    // for the read of ci_syncs itself.
+    let verified = null;
+    try {
+      verified = await verifyPendingLpNotes({ db, cfg, lpReader, now: () => now });
+    } catch (err) {
+      console.warn(`${LOG} tick: LP note verification failed (notes stay unconfirmed, nothing lost): ${err.message}`);
+    }
+
     const batch = await claimBatch({ db, limit: limit ?? cfg.batchSize });
-    if (!batch.rows.length) return { ok: true, claimed: 0 };
+    if (!batch.rows.length) return { ok: true, claimed: 0, verified };
 
     // ONE roster read per tick, not one per call — every call in the batch
     // checks the same ~850 rows. Loaded here rather than lazily inside the
@@ -734,7 +759,7 @@ export async function runTick({ db = supabase, cfg = getConfig(), adapter, trans
       outcomes[r.outcome] = (outcomes[r.outcome] || 0) + 1;
     }
     console.log(`${LOG} tick: claimed ${batch.rows.length}${batch.claimed ? '' : ' (UNLEASED fallback)'} → ${JSON.stringify(outcomes)} in ${Date.now() - startedAt}ms`);
-    return { ok: true, claimed: batch.rows.length, leased: batch.claimed, outcomes, elapsed_ms: Date.now() - startedAt };
+    return { ok: true, claimed: batch.rows.length, leased: batch.claimed, outcomes, verified, elapsed_ms: Date.now() - startedAt };
   } finally {
     ticking = false;
   }

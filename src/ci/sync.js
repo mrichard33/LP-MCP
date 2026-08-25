@@ -117,6 +117,29 @@ export async function claimSync(db, { callId, target, noteBody, request, status 
   return { ok: true, row: data };
 }
 
+/**
+ * Mark a claimed sync row as SENT but not yet proven — the honest state of an
+ * LP note between the write and the read-back.
+ *
+ * Only LP uses this. GHL's addGHLNote returns something that varies with what
+ * happened (see classifyGhlNoteResult), so a GHL write can be classified on the
+ * spot and goes straight to 'synced'. LP's constant acknowledgment cannot be,
+ * which is the whole reason this state exists.
+ *
+ * `synced_at` IS stamped here: it records when the write went out, and
+ * src/ci/verify.js uses it to decide which rows have had time to settle.
+ * `verified_at` — set only by the read-back — is the one that means proven.
+ */
+export async function markSentUnconfirmed(db, id, { response = null } = {}) {
+  const { error } = await db.from('ci_syncs').update({
+    status: 'sent_unconfirmed',
+    response: response ?? null,
+    error: null,
+    synced_at: new Date().toISOString(),
+  }).eq('id', id);
+  if (error) throw new Error(`ci_syncs update failed: ${error.message}`);
+}
+
 /** Mark a claimed sync row as delivered. */
 export async function markSynced(db, id, { externalRef = null, response = null } = {}) {
   const { error } = await db.from('ci_syncs').update({
@@ -190,25 +213,31 @@ export async function syncToLp(call, summary, match, { db = supabase, cfg = getC
 
   try {
     const resp = await lpClient.addNote({ rectype, recid, notes: noteBody, categoryId: cfg.lpNoteCategoryId });
-    // external_ref stays NULL for LP, deliberately.
+
+    // SENT — NOT YET PROVEN. This is not hedging; it is the whole lesson of
+    // 2026-08-24.
     //
     // /api/SalesApi/AddNotes answers with the bare string "UPDATED
-    // SUCCESSFULLY!" and nothing else — no id, no digits, measured across
-    // every live note written since 2026-08-24 (one distinct response
-    // template, recorded by shapeOf). There is no id to extract, so the code
-    // no longer pretends there might be: an extractor here would be a
-    // permanent no-op that reads like a capability.
+    // SUCCESSFULLY!" and nothing else — no id, no digits, one distinct response
+    // template across every live note (recorded by shapeOf, pinned by
+    // scripts/test-ci-lp-note-id.js). It is a CONSTANT: byte-identical whether
+    // the note landed on the record or vanished. So "addNote did not throw"
+    // proves LP returned 2xx, and that is all it proves.
     //
-    // The receipt is `addNote` NOT THROWING — lpPost raises on any non-2xx, so
-    // reaching this line means LP accepted the write. A null external_ref is
-    // therefore an absent id, never an unconfirmed delivery.
+    // This line used to call markSynced on exactly that. 286 rows recorded
+    // `synced` over four hours and nothing in the database could say which of
+    // them a rep could actually read.
     //
-    // The note's real LP id does exist, just not here: it arrives later on the
-    // notes mirror (lp_notes.lp_note_id — e.g. 2238213 for the 08-24 notes),
-    // which is where to join if an audit ever needs one.
-    await markSynced(db, claim.row.id, { externalRef: null, response: shapeOf(resp) });
-    console.log(`${LOG} call=${call.id} target=lp synced (${rectype}/${recid})`);
-    return { target, synced: true };
+    // So the row now says what is true — LP accepted the write, we have not
+    // looked — and src/ci/verify.js promotes it to 'synced' once it has SEEN
+    // the note in LP, filling external_ref with the real lp_note_id on the way
+    // past. That id exists; AddNotes just will not hand it over.
+    //
+    // The idempotency key is already held, so nothing re-sends this in the
+    // meantime, which is the correct posture for a write that probably landed.
+    await markSentUnconfirmed(db, claim.row.id, { response: shapeOf(resp) });
+    console.log(`${LOG} call=${call.id} target=lp sent, awaiting read-back (${rectype}/${recid})`);
+    return { target, sent: true, confirmed: false };
   } catch (err) {
     const f = await markSyncFailed(db, claim.row, err, cfg);
     console.error(`${LOG} call=${call.id} target=lp FAILED (attempt ${f.attempts}): ${err.message}`);

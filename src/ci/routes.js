@@ -20,6 +20,7 @@ import { runTick } from './worker.js';
 import { createManualAdapter, storeAudio, sha256Hex, describeRecording, ensureLinkToken, transcodeAndStoreMp3 } from './recordings.js';
 import { CI_AUDIO_BUCKET } from '../../scripts/setup-ci-audio-bucket.js';
 import { reconcileDay, pipelineHealth } from './reconcile.js';
+import { auditLpNotes } from './verify.js';
 
 const LOG = '[CIRoutes]';
 
@@ -438,6 +439,39 @@ export function registerCiRoutes(app, authenticate) {
     } catch (err) {
       if (err instanceof BadRequest) return res.status(400).json({ ok: false, error: err.message });
       console.error(`${LOG} POST /ci/discover failed: ${err.message}`);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  /**
+   * GET /ci/verify-notes?status=&limit=&marker= — ask LP what it actually has.
+   *
+   * READ ONLY, on both sides: it reads ci_syncs and it reads Lead Perfection.
+   * There is no write path through this route.
+   *
+   * It exists as an endpoint and not only as a CLI because answering "did the
+   * notes land" should never require anyone to copy LP credentials onto a
+   * laptop. The deployed service already holds them; this asks it to look.
+   *
+   * `limit` caps PROSPECTS read, not rows returned — one GetLead covers every
+   * note on a person. Default 25; `limit=0` sweeps every prospect and can take
+   * minutes on a large backlog.
+   */
+  app.get('/ci/verify-notes', ...guards, async (req, res) => {
+    try {
+      const raw = req.query?.limit;
+      const parsed = raw === undefined ? 25 : parseInt(raw, 10);
+      // 0 (or a nonsense value paired with an explicit ?limit=) means "all" —
+      // auditLpNotes reads a falsy limit as no cap.
+      const limit = Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 500) : null;
+      res.json(await auditLpNotes({
+        db: supabase,
+        status: String(req.query?.status || 'synced'),
+        marker: req.query?.marker ? String(req.query.marker) : null,
+        limit,
+      }));
+    } catch (err) {
+      console.error(`${LOG} GET /ci/verify-notes failed: ${err.message}`);
       res.status(500).json({ ok: false, error: err.message });
     }
   });

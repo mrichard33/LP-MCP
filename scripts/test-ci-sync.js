@@ -233,7 +233,12 @@ test('IDEMPOTENCY: a second sync of the same call does not reach the API', async
   const lpClient = { addNote: async () => { sends++; return { note_id: 1 }; } };
 
   const first = await syncToLp(CALL, SUMMARY, MATCH(), { db, cfg: LIVE_BOTH, lpClient });
-  assert.equal(first.synced, true);
+  // `sent`, not `synced` — LP's acknowledgment is a constant, so delivery is
+  // proven by the read-back (src/ci/verify.js), never by the write returning.
+  // The idempotency key is held from the moment the row is CLAIMED, which is
+  // before the API call and therefore unaffected by that distinction.
+  assert.equal(first.sent, true);
+  assert.equal(first.confirmed, false);
   assert.equal(sends, 1);
 
   const second = await syncToLp(CALL, SUMMARY, MATCH(), { db, cfg: LIVE_BOTH, lpClient });

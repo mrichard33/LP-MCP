@@ -174,11 +174,37 @@ test('a bare has_appointment boolean does NOT qualify a stale candidate', () => 
 
 // ─── cst vs lds note-target selection ───────────────────────────────────────
 
-test('NOTE TARGET — one relevant inquiry attaches to that lead (ils)', () => {
+test('NOTE TARGET — even ONE relevant inquiry anchors to the PERSON, not the lead', () => {
+  // 2026-08-24: this used to return ils/9001. LP surfaces prospect-attached
+  // notes on the record a rep reads; lead-attached ones are not what they see,
+  // which sent 195 of 286 AI call notes somewhere nobody looks. The inquiry is
+  // still resolved — it just stopped deciding where the note is filed.
   const t = pickNoteTarget(500, [{ lp_lead_id: 9001, appointment_date: daysAfter(3) }], CALL_START);
-  assert.equal(t.rectype, 'ils');
-  assert.equal(t.recid, 9001);
+  assert.equal(t.rectype, 'cst');
+  assert.equal(t.recid, 500);
+  assert.equal(t.lead_id, 9001, 'which inquiry it is about is recorded, not lost');
   assert.equal(t.reason, 'single_relevant_lead');
+});
+
+test('a lead id supplied outright is RECORDED, and still does not anchor the note', () => {
+  // The dialing record or the canvass correlation naming the inquiry removes
+  // the guesswork; it is not a licence to file the note off the prospect.
+  const t = pickNoteTarget(500, [{ lp_lead_id: 9001, appointment_date: daysAfter(3) }], CALL_START, 7777);
+  assert.equal(t.rectype, 'cst');
+  assert.equal(t.recid, 500);
+  assert.equal(t.lead_id, 7777, 'the supplied id beats inference');
+  assert.equal(t.reason, 'id_supplied');
+});
+
+test('NO note target may ever be ils again — that is the whole fix', () => {
+  const cases = [
+    pickNoteTarget(500, [{ lp_lead_id: 9001, appointment_date: daysAfter(3) }], CALL_START),
+    pickNoteTarget(500, [{ lp_lead_id: 9001, appointment_date: daysAfter(2) },
+      { lp_lead_id: 9002, appointment_date: daysAfter(6) }], CALL_START),
+    pickNoteTarget(500, [], CALL_START),
+    pickNoteTarget(500, [{ lp_lead_id: 9001, appointment_date: daysBefore(400) }], CALL_START, 4242),
+  ];
+  for (const t of cases) assert.equal(t.rectype, 'cst', `regressed to ${t.rectype}`);
 });
 
 test('MULTIPLE APPOINTMENTS go to the PERSON (cst), never to a chosen one', () => {
@@ -197,6 +223,7 @@ test('no relevant inquiry also goes to the person, not to a stale lead', () => {
   const t = pickNoteTarget(500, [{ lp_lead_id: 9001, appointment_date: daysBefore(400) }], CALL_START);
   assert.equal(t.rectype, 'cst');
   assert.equal(t.recid, 500);
+  assert.equal(t.lead_id, null, 'a stale inquiry is not what this call was about');
   assert.equal(t.reason, 'no_relevant_lead');
 });
 

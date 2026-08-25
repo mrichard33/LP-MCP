@@ -121,7 +121,7 @@ test('LP\'s acknowledgment carries no digits at all — there is no id to extrac
   assert.equal(extractNoteId(LP_ACK), null);
 });
 
-test('a successful LP note records external_ref NULL, by design', async () => {
+test('a successful LP write records NO id, because there was none to record', async () => {
   const db = fakeDb();
   const r = await syncToLp(CALL, SUMMARY, MATCH, {
     db,
@@ -129,33 +129,51 @@ test('a successful LP note records external_ref NULL, by design', async () => {
     lpClient: { addNote: async () => LP_ACK },
   });
 
-  assert.equal(r.synced, true);
-  assert.equal(db.row().status, 'synced');
-  assert.equal(db.row().external_ref, null, 'LP returns no id — null is the honest record');
+  assert.equal(r.sent, true);
+  assert.equal(db.row().external_ref, undefined, 'LP returns no id, so the write site sets none');
   assert.equal(db.row().error, null);
 });
 
-test('a NULL external_ref is an absent id, NOT an unconfirmed delivery', async () => {
-  // The distinction that matters: addNote throws on any non-2xx, so reaching
-  // markSynced means LP accepted the write. Reading null as "not delivered"
-  // is what would retry a landed note and double-post it.
+test('2026-08-25 — "no id" is now ALSO "not yet proven", and the row says so', async () => {
+  // This test used to assert status 'synced' here, on the reasoning that
+  // addNote throws on any non-2xx so reaching the end meant LP accepted the
+  // write. The first half of that is still true; the conclusion was not.
+  //
+  // "LP accepted the write" is not "the note is on the record a rep reads".
+  // AddNotes answers with a CONSTANT, byte-identical either way, so the write
+  // site cannot tell them apart — and on 08-24, 286 rows recorded `synced`
+  // over four hours while 195 of them sat on the wrong record.
+  //
+  // So the row now separates the two facts it always conflated: it went out
+  // (synced_at), and it has been seen (verified_at, set only by the read-back
+  // in src/ci/verify.js).
   const db = fakeDb();
   const r = await syncToLp(CALL, SUMMARY, MATCH, {
     db, cfg: LIVE_LP, lpClient: { addNote: async () => LP_ACK },
   });
   assert.equal(r.failed, undefined);
-  assert.equal(db.row().status, 'synced');
-  assert.ok(db.row().synced_at, 'the delivery timestamp is the receipt, not the id');
+  assert.equal(db.row().status, 'sent_unconfirmed');
+  assert.ok(db.row().synced_at, 'when it went out is still recorded');
+  assert.equal(db.row().verified_at, undefined, 'nothing has looked at LP yet');
 });
 
 test('the write site runs no extractor over the LP response any more', () => {
   // A permanent no-op that reads like a capability is worse than an honest
-  // null — the next reader would assume external_ref is sometimes populated
-  // for LP and build on it.
+  // absence — the next reader would assume external_ref is sometimes populated
+  // at the write site and build on it.
   const src = syncToLp.toString();
   assert.equal(/extractLpNoteId|idFromAck/.test(src), false,
     'LP note-id extraction was removed once LP was proven to return no id');
-  assert.match(src, /externalRef:\s*null/, 'the null must be explicit at the write site');
+});
+
+test('the id DOES exist, and the read-back is the only thing allowed to record it', () => {
+  // The other half of the 08-24 fix. AddNotes will not hand over an id, but
+  // GetLead carries it, so external_ref is finally populated with something
+  // true — by verify.js, after it has SEEN the note. The write site must never
+  // set it, because at that point it has no id and no proof.
+  const src = syncToLp.toString();
+  assert.match(src, /markSentUnconfirmed/, 'the write records sent, not delivered');
+  assert.equal(/markSynced\(/.test(src), false, 'only the read-back may mark an LP note synced');
 });
 
 // ─── the instrumentation that proved it, and still guards it ────────────────

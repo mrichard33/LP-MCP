@@ -920,7 +920,7 @@ async function runMigrations() {
               call_id         uuid NOT NULL REFERENCES ci_calls(id),
               target          text NOT NULL CHECK (target IN ('lp','ghl')),
               status          text NOT NULL DEFAULT 'pending'
-                              CHECK (status IN ('pending','shadow','synced','failed','skipped')),
+                              CHECK (status IN ('pending','shadow','synced','sent_unconfirmed','failed','skipped')),
               idempotency_key text NOT NULL UNIQUE,
               note_body       text,
               request         jsonb,
@@ -1186,6 +1186,31 @@ async function runMigrations() {
     console.log('[Migration] call intelligence recording mp3 (sql/070) ready');
   } catch (err) {
     console.error('[Migration] call intelligence recording mp3 FAILED (recording links will serve unplayable GSM WAVs — apply sql/070 manually):', err.message);
+  }
+
+  // CI sync verification (sql/071 — the file is the source of truth). AddNotes
+  // answers every write with the constant "UPDATED SUCCESSFULLY!", so 'synced'
+  // used to rest on a non-throw and could not distinguish a delivered note from
+  // one LP accepted and dropped. 'sent_unconfirmed' is the honest intermediate
+  // state; src/ci/verify.js promotes it only after reading the note back.
+  //
+  // Widening a CHECK admits a new value and rejects nothing previously allowed,
+  // so no existing row can violate it. If this FAILS, the constraint still has
+  // its old five values and every LP note write will be rejected outright —
+  // which is loud and safe (nothing is delivered unrecorded), but it does stop
+  // note delivery until sql/071 is applied by hand.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`ALTER TABLE ci_syncs ADD COLUMN IF NOT EXISTS verified_at     timestamptz;
+            ALTER TABLE ci_syncs ADD COLUMN IF NOT EXISTS verify_attempts integer NOT NULL DEFAULT 0;
+            ALTER TABLE ci_syncs DROP CONSTRAINT IF EXISTS ci_syncs_status_check;
+            ALTER TABLE ci_syncs ADD CONSTRAINT ci_syncs_status_check
+              CHECK (status = ANY (ARRAY['pending','shadow','synced','sent_unconfirmed','failed','skipped']));
+            CREATE INDEX IF NOT EXISTS ci_syncs_unconfirmed_idx
+              ON ci_syncs (synced_at) WHERE status = 'sent_unconfirmed';`);
+    console.log('[Migration] call intelligence sync verification (sql/071) ready');
+  } catch (err) {
+    console.error('[Migration] call intelligence sync verification FAILED (LP note writes will be REJECTED by the old status check — apply sql/071 manually):', err.message);
   }
 }
 
