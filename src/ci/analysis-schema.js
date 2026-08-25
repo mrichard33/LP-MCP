@@ -244,6 +244,36 @@ function countWords(s) {
 export const OUTCOME_CONFIDENCE_FLOOR = 0.7;
 
 /**
+ * Flags that are RECORDED but do not stop a call.
+ *
+ * ── WHY unknown_team IS HERE ───────────────────────────────────────────────
+ * 84 calls were parked on 'unknown_team', and measurement showed they are not
+ * unmapped agents at all: every one has agent_username AND agent_name NULL.
+ * 83 arrived on DNIS 2394930774 ('Canvass Confirmation - Inbound'), all
+ * was_transferred, averaging 213 seconds; the 84th is the same shape on Main
+ * Number. No Reece agent was on those calls — the caller reached a LINE and
+ * was transferred to a third party. There is no team to resolve, so parking
+ * them waits for an answer that will never come, and a real multi-minute
+ * conversation with a customer produces no note at all.
+ *
+ * The flag STAYS. It is still written to ci_summaries.review_flags and still
+ * carried in the ci_events detail, so "no team was resolved" remains visible
+ * and queryable. Only the BLOCK is lifted.
+ *
+ * ── WHY A NAMED SET AND NOT A BOOLEAN ──────────────────────────────────────
+ * A `blocking: false` property hung off a flag is a property the next flag
+ * inherits by whichever default someone picks. Membership here is a decision
+ * somebody has to write down, one reason at a time. Nothing joins this set
+ * because it resembles something already in it.
+ */
+export const NON_BLOCKING_REVIEW_FLAGS = new Set(['unknown_team']);
+
+/** The flags in `flags` that actually stop a call. Order is preserved. */
+export function blockingReviewFlags(flags) {
+  return (flags || []).filter((f) => !NON_BLOCKING_REVIEW_FLAGS.has(f));
+}
+
+/**
  * The §7 review triggers that are readable from the transcript + analysis
  * alone. Match-tier and sync-failure triggers belong to PRs 4 and 5 and are
  * deliberately absent here rather than stubbed.

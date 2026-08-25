@@ -143,7 +143,27 @@ test('composeNote takes NO database dependency', () => {
     .replace(/^\s*\/\/.*$/gm, '');
   assert.equal(/supabase|\.from\(|createClient/.test(code), false, 'notes.js must stay free of any client');
   assert.equal(/ci_agent_map/.test(code), false, 'notes.js must not read the map');
-  assert.equal(/^import /m.test(code), false, 'notes.js imports nothing at all — it is pure by contract');
+
+  // This used to assert notes.js imported NOTHING. That was a proxy for the
+  // real contract — no client, no env, no I/O — and it held only while the
+  // file happened to have zero imports. It stopped holding when the header
+  // started naming the LINE on agentless calls, which needs the phone
+  // normalizer (time.js) and Five9's '[None]' sentinel set (teams.js).
+  // Re-inlining either would be worse: the sentinel set lives in teams.js
+  // precisely so a load-bearing rule has ONE home.
+  //
+  // So the assertion follows the imports instead of forbidding them: every
+  // import must be a sibling in src/ci/, and every one of those must itself
+  // be free of clients and env. That is a stronger check than "none" — it
+  // proves purity rather than assuming it.
+  const imports = [...code.matchAll(/^import\s+.*?from\s+'([^']+)';/gm)].map((m) => m[1]);
+  assert.ok(imports.length > 0, 'if notes.js has no imports this check is vacuous — simplify it');
+  for (const spec of imports) {
+    assert.match(spec, /^\.\/[a-z0-9-]+\.js$/, `notes.js may only import pure src/ci siblings, not '${spec}'`);
+    const dep = fs.readFileSync(path.join(ROOT, 'src/ci', spec.slice(2)), 'utf8');
+    assert.equal(/process\.env/.test(dep), false, `${spec} reads env — notes.js may not depend on it`);
+    assert.equal(/supabase|createClient/.test(dep), false, `${spec} carries a client — notes.js may not depend on it`);
+  }
 });
 
 test('with no label supplied the header is byte-for-byte what it was', () => {
