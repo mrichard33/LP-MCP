@@ -31,6 +31,7 @@ import { loadAgentMap } from './discovery.js';
 import { resolveAgentLabel } from './teams.js';
 import { syncCall } from './sync.js';
 import { verifyPendingLpNotes } from './verify.js';
+import { alertUnreadableFolder } from './alerts.js';
 
 const LOG = '[CIWorker]';
 
@@ -199,6 +200,63 @@ export async function advance(db, call, fromStage, toStatus, detail = null, patc
  *                             something anyone looks at again
  *   - recording is excluded → skipped with the exclusion reason
  */
+/**
+ * A folder held .wav files and NOT ONE of their names parsed — say so, loudly.
+ *
+ * ── WHY THIS IS ITS OWN STEP AND NOT A LOG LINE ────────────────────────────
+ * Because a log line is what we already effectively had: nothing. adapter.list()
+ * drops a file it cannot parse and returns `[]`, indistinguishable at every
+ * call site from an empty folder. On 2026-08-22 the Five9 export began
+ * appending a session id to every filename, and the whole archive read as empty
+ * for three days while 332 calls parked on 'recording_missing'. Nothing threw.
+ *
+ * So the condition gets three outputs, each for a different reader:
+ *   console   — greppable, for whoever is already tailing the worker
+ *   ci_events — countable AFTER the fact, when the logs have rolled
+ *   GroupMe   — a human, today, which is the only one that shortens the outage
+ *
+ * ── NEVER THROWS ───────────────────────────────────────────────────────────
+ * This is a diagnostic on the path of the only code that pulls audio off the
+ * archive. If the ci_events insert fails or GroupMe is down, the recording
+ * still gets fetched. A reporting failure that costs a recording would be a
+ * worse bug than the one it reports.
+ */
+export async function reportUnreadableFolder(db, call, listing, { dateDir, cfg = getConfig() } = {}) {
+  // Fires only on ZERO of N. A folder where some names parse is a curiosity;
+  // a folder where none do cannot be anything but a format change.
+  if (!listing || listing.described !== 0 || !(listing.wav > 0)) return { reported: false };
+
+  console.error(
+    `${LOG} UNREADABLE FOLDER ${listing.dir} — parsed 0 of ${listing.wav} .wav file(s). `
+    + 'The archive has the audio and parseRecordingFilename() cannot read the names. '
+    + 'Every call for this campaign/date will park on recording_missing until the parser is fixed.',
+  );
+
+  try {
+    // PostgREST resolves with { error } rather than throwing, so the error is
+    // read from the result — a bare await here would swallow a failed insert.
+    const { error } = await db.from('ci_events').insert({
+      call_id: call.id,
+      stage: 'fetch',
+      event: 'unreadable_folder',
+      // Counts and the folder only. §10: no filenames here — a recording
+      // filename begins with the customer's full phone number.
+      detail: { dir: listing.dir, wav: listing.wav, described: 0, unparseable: listing.unparseable },
+    });
+    if (error) throw new Error(error.message);
+  } catch (err) {
+    console.warn(`${LOG} could not record unreadable_folder event: ${err.message}`);
+  }
+
+  try {
+    await alertUnreadableFolder({ campaign: call.campaign, dateDir, wav: listing.wav, cfg });
+  } catch (err) {
+    console.warn(`${LOG} unreadable-folder alert failed to send: ${err.message}`);
+  }
+
+  return { reported: true, wav: listing.wav };
+}
+
 export async function stageFetchRecording(call, { db = supabase, cfg = getConfig(), adapter, listings, now = new Date() } = {}) {
   const sftp = adapter || createSftpAdapter({ cfg });
   // The tick's shared listing memo. runTick builds one and threads it through
@@ -214,7 +272,23 @@ export async function stageFetchRecording(call, { db = supabase, cfg = getConfig
   }
 
   const dateDir = dateDirFor(new Date(call.call_start), cfg.recordingTzOffsetMin);
-  const candidates = await archive.list({ campaign: call.campaign, date: dateDir });
+
+  // The listing reports what it DISCARDED. Without this, a folder holding
+  // three hundred files whose names we cannot read returns the same empty
+  // array an empty folder returns, and the call is parked 'recording_missing'
+  // with nothing anywhere saying why. That is exactly how the 2026-08-22
+  // filename change cost three days of recordings.
+  //
+  // Threaded through the tick's memo, so it reports once per folder per tick
+  // rather than once per call — a cache hit did no listing and has nothing new
+  // to say.
+  let listing = null;
+  const candidates = await archive.list({
+    campaign: call.campaign,
+    date: dateDir,
+    onStats: (st) => { listing = st; },
+  });
+  await reportUnreadableFolder(db, call, listing, { dateDir, cfg });
 
   // Excluded files (test modules, sub-floor sizes) are never candidates — but
   // they were still recorded as rows by the crawl, so the exclusion is auditable.
@@ -264,6 +338,11 @@ export async function stageFetchRecording(call, { db = supabase, cfg = getConfig
     agent_username: best.recording.agentUsername,
     ivr_module: best.recording.ivrModule,
     filename_clock_text: best.recording.clockText,
+    // sql/061 declared this column and nothing ever wrote it; sql/074 documents
+    // what now does. NULL for every pre-2026-08-22 recording, and NEVER a call
+    // key — the trailing digits resemble a five9_call_id and verifiably are not
+    // one (disjoint ranges, ~7.4M apart).
+    five9_recording_id: best.recording.sessionId ?? null,
     recorded_at: best.recording.recordedAt ? best.recording.recordedAt.toISOString() : null,
     match_method: best.method,
     match_confidence: best.confidence,

@@ -1,0 +1,80 @@
+-- ============================================================================
+-- 074 — Call Intelligence: put the Five9 recording id where it always belonged
+--
+-- NO DDL. ci_recordings.five9_recording_id has existed since sql/061, declared
+-- for exactly this and never written by any code path — 0 of 1,754 rows
+-- populated as of 2026-08-25. This migration documents what now fills it and,
+-- more importantly, what it must never be used for.
+--
+-- WHY IT IS FINALLY BEING WRITTEN: on 2026-08-22 the Five9 recording export
+-- began appending an identifier to every filename — 32 hex characters followed
+-- by 15 digits, abutting whatever precedes it with no separator:
+--
+--   old  9419203087 by  @ 4_30_12 PM_Transfer to Lightfire.wav
+--   new  9419203087 by  @ 1_49_32 PM_Transfer to LightfireCB3E712B…866719.wav
+--
+-- The parser could not read the new shape, so adapter.list() dropped every such
+-- file and each folder returned the same empty array an empty folder returns.
+-- 332 calls parked 'recording_missing' against folders holding hundreds of
+-- files. src/ci/filenames.js now extracts the id and this column stores it.
+--
+-- ══ THIS IS NOT ci_calls.five9_call_id. DO NOT JOIN ON IT. ══
+-- The trailing digits look exactly like a Five9 Call ID and are not one.
+-- Verified 2026-08-25 against all 20 rows that carried it:
+--
+--   filename tail   300000002864763   300000002864750   300000002866719
+--   five9_call_id   300000010289685   300000010289658   300000010296218
+--
+-- 300000002867064 appears NOWHERE in ci_calls — not as five9_call_id, not
+-- anywhere in raw_metadata. Every five9_call_id since 2026-08-24 (n=15,590)
+-- falls in 300000010282668 … 300000010298341, while the filename tails sit
+-- around 3000000028…, roughly 7.4 million below. Disjoint ranges. And
+-- raw_metadata.recordings_raw carries only a timestamp and a duration
+-- ('14:40:53(6:32)'), so nothing we store maps one id space to the other.
+--
+-- The recording→call join therefore stays campaign + customer number + time.
+-- Treating this as a call key would take the pipeline from "finds no files" to
+-- "finds files and links none" — every recording scoring no_candidate and
+-- re-parking the whole backlog. src/ci/filenames.js already carries the same
+-- warning about the LEADING number being the ANI; an earlier handoff assumed a
+-- call id was recoverable from a filename and the entire join had to be
+-- redesigned around the retraction.
+--
+-- ── A POSSIBLE ROUTE TO A REAL EXACT KEY (untested) ────────────────────────
+-- ci_calls.five9_session_id has existed since sql/061 and src/ci/discovery.js
+-- already writes it. It is populated on 0 of 15,848 rows because the saved
+-- Five9 Call Log report does not emit a Session ID column — the code is there,
+-- the data is not. Adding that column to the report is a configuration change,
+-- after which this query decides whether the filename tail is that session id:
+--
+--   SELECT count(*) FILTER (WHERE right(r.five9_recording_id, 15) = c.five9_session_id) AS matched,
+--          count(*) AS comparable
+--   FROM ci_recordings r JOIN ci_calls c ON c.id = r.call_id
+--   WHERE r.five9_recording_id IS NOT NULL AND c.five9_session_id IS NOT NULL;
+--
+-- A HYPOTHESIS, not a finding. Until it returns a convincing number on real
+-- rows, the join stays campaign + customer number + time.
+--
+-- ── STAYS NULLABLE, NO BACKFILL, NO UNIQUE ─────────────────────────────────
+-- Every recording written before 2026-08-22 legitimately has no id, and the
+-- archive holds those back to ~Aug 2023. NULL is the honest value for them.
+-- No UNIQUE either: nothing has established that the id is unique per file,
+-- and a constraint asserting something unverified would fail an ingest at 3am
+-- over a claim nobody checked.
+-- ============================================================================
+
+COMMENT ON COLUMN ci_recordings.five9_recording_id IS
+  'Recording identifier parsed from the Five9 filename (32 hex + 15 digits), appended '
+  'by the export from 2026-08-22. NULL for every earlier recording. NOT a Five9 Call ID '
+  'and never a join key — see sql/074 and src/ci/filenames.js.';
+
+-- Verification:
+--   SELECT count(*) FILTER (WHERE five9_recording_id IS NOT NULL) AS with_id,
+--          count(*) FILTER (WHERE five9_recording_id IS NULL)     AS without_id
+--   FROM ci_recordings;
+--
+-- Proves the id is NOT the call id — this must return 0 rows:
+--   SELECT r.five9_recording_id, c.five9_call_id
+--   FROM ci_recordings r JOIN ci_calls c ON c.id = r.call_id
+--   WHERE r.five9_recording_id IS NOT NULL
+--     AND right(r.five9_recording_id, 15) = c.five9_call_id;

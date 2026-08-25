@@ -540,13 +540,26 @@ export function createSftpAdapter({ cfg = getConfig(), clientFactory, onStats } 
         else if (unparseableNames.length < STATS_SAMPLE) unparseableNames.push(e.name);
       }
       const wav = entries.length - dirs - nonWav;
+      const unparseable = wav - out.length;
+      // Greppable, at the source. The count alone is not enough for whoever is
+      // tailing the worker: 'parsed 0 of 312' has to appear in the log of the
+      // process that read the directory, not only in the caller that asked for
+      // stats. A partial figure is worth saying too — a format change can roll
+      // out gradually, and 12 of 300 today is 300 of 300 tomorrow.
+      if (unparseable > 0) {
+        console.warn(
+          `${LOG} ${dir}: parsed ${out.length} of ${wav} .wav file(s) — `
+          + `${unparseable} filename(s) could not be read`
+          + (out.length === 0 ? '. THE FOLDER READS AS EMPTY AND IS NOT.' : '.'),
+        );
+      }
       report({
         dir,
         entries: entries.length,
         dirs,
         nonWav,
         wav,
-        unparseable: wav - out.length,
+        unparseable,
         unparseableNames,
         wavNames,
         described: out.length,
