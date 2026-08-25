@@ -382,6 +382,14 @@ export function buildCallRow(legs, campaignRow, cfg, agentMap = null) {
       legs,
       recording_segments: segments,
       expected_recording_count: segments.length,
+      // THE RAW CELL, kept deliberately. parseRecordingSegments reads the
+      // 'HH:MM:SS(M:SS)' timing form and discards everything else, so if Five9
+      // ever changes what this column carries — a recording id or URL once the
+      // API user has recording permission, for instance — the parse would
+      // silently yield [] and we would be guessing about why. Keeping the
+      // string turns that into a query. It is short (a few dozen bytes) and
+      // holds no customer data: times and durations only.
+      recordings_raw: legs.map((l) => l.recordings).filter(Boolean).join(' | ') || null,
     },
   };
 

@@ -264,6 +264,7 @@ import { registerScorecardValidateRoutes, startScorecardValidateScheduler } from
 import { registerFive9SnapshotRoutes, startFive9ConfigSnapshotScheduler } from './jobs/five9-config-snapshot.js';
 import { registerCiRoutes } from './ci/routes.js';
 import { startCiWorkerScheduler } from './ci/worker.js';
+import { startCiDiscoveryScheduler } from './jobs/ci-discovery-scheduler.js';
 import { logFfmpegStatus } from './ci/recordings.js';
 // ─── Agentic Hold-Complete (return-from-hold re-entry) ───────────
 import { registerHoldCompleteRoutes } from './agentic/hold-complete.js';
@@ -1212,6 +1213,19 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] call intelligence sync verification FAILED (LP note writes will be REJECTED by the old status check — apply sql/071 manually):', err.message);
   }
+
+  // CI discovery cursor index (sql/072 — the file is the source of truth). The
+  // discovery scheduler reads max(call_start) on every boot, and the existing
+  // composite (status, eligible, call_start) cannot serve an unfiltered ORDER
+  // BY on its trailing column. Additive; a failure costs a scan, not
+  // correctness.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL('CREATE INDEX IF NOT EXISTS ci_calls_call_start_idx ON ci_calls (call_start);');
+    console.log('[Migration] call intelligence discovery cursor index (sql/072) ready');
+  } catch (err) {
+    console.error('[Migration] call intelligence discovery cursor index FAILED (cold-start cursor will seq-scan ci_calls — apply sql/072 manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
@@ -1614,6 +1628,9 @@ app.listen(PORT, async () => {
   // unplayable original. Deliberately not awaited — a boot must not wait on it.
   logFfmpegStatus().catch(() => {});
   startCiWorkerScheduler();
+  // Opens the front door: until this existed, calls entered Call Intelligence
+  // only when a human called POST /ci/discover. Ships DISARMED.
+  startCiDiscoveryScheduler();
   startLpReportReconScheduler();
   startLpReportWatchdog();
   startLpCsvOrphanReaper();

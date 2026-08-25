@@ -1,0 +1,49 @@
+-- ============================================================================
+-- 072 — Call Intelligence: index call_start for the discovery cursor
+--
+-- WHY: the discovery scheduler (src/jobs/ci-discovery-scheduler.js) resolves its
+-- cold-start cursor with
+--
+--     SELECT call_start FROM ci_calls ORDER BY call_start DESC LIMIT 1
+--
+-- on every process boot. ci_calls is already ~15k rows and grows by roughly 5k
+-- a day once the poller is armed, so without an index that is a full scan plus
+-- a sort on every restart — and a redeploy during business hours is exactly
+-- when it must be fast.
+--
+-- ── WHY THE EXISTING COMPOSITE DOES NOT SERVE THIS ─────────────────────────
+-- sql/061:242 creates (status, eligible, call_start). Postgres can only use a
+-- btree's trailing column for ordering once the leading columns are pinned to
+-- constants, and this query filters on NOTHING — it wants the newest call in
+-- the table, whatever its status. So the composite is unusable here and a
+-- dedicated single-column index is the smallest thing that works.
+--
+-- It also serves the worker's newest-first claim ordering when claim_ci_calls
+-- is absent and src/ci/worker.js falls back to a plain SELECT ... ORDER BY
+-- call_start DESC.
+--
+-- Plain (not CONCURRENT) because runMigrations cannot run CONCURRENTLY inside a
+-- transaction; IF NOT EXISTS makes it a no-op once built. Additive: no column,
+-- constraint or row changes, and no query plan gets worse.
+--
+-- Mirrored in runMigrations() (src/index.js).
+--
+-- ROLLBACK:
+--   DROP INDEX IF EXISTS ci_calls_call_start_idx;
+--   -- Costs only the scan this avoids; nothing depends on it for correctness.
+-- ============================================================================
+
+CREATE INDEX IF NOT EXISTS ci_calls_call_start_idx ON ci_calls (call_start);
+
+-- ─── Verification ────────────────────────────────────────────────────────────
+-- The index exists and is on the column the cursor reads:
+--   SELECT indexdef FROM pg_indexes WHERE indexname = 'ci_calls_call_start_idx';
+--
+-- The cold-start cursor uses it — expect an index scan, NOT a seq scan + sort:
+--   EXPLAIN SELECT call_start FROM ci_calls ORDER BY call_start DESC LIMIT 1;
+--
+-- The cursor must never be derived from created_at (insert time, always later
+-- than the calls it covers, so it would under-cover permanently). These two
+-- should differ by days after a backfill, which is the whole point:
+--   SELECT max(call_start) AS newest_call, max(created_at) AS newest_insert
+--     FROM ci_calls;
