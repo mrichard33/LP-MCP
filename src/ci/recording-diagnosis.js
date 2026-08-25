@@ -50,6 +50,8 @@
 import supabaseDefault from '../supabase.js';
 import { getConfig } from './config.js';
 import { candidateDistanceSeconds, matchRecordingToCall } from './recordings.js';
+import { isTransferLeg } from './discovery.js';
+import { formatPhoneLine } from './notes.js';
 import { dateDirFor, last10 } from './time.js';
 
 const LOG = '[CIRecDiag]';
@@ -69,9 +71,79 @@ export const VERDICTS = Object.freeze({
   CAMPAIGN_DIR_EMPTY: 'campaign_dir_empty',
   /** It is right there and should have matched — the matcher, not retrieval. */
   PRESENT_SHOULD_HAVE_MATCHED: 'present_should_have_matched',
+  /**
+   * VENDOR-SIDE AUDIO. The conversation continued on someone else's platform
+   * after a transfer, and Five9 holds only its own leg. NEVER a retrieval
+   * failure — no SFTP search will ever find these, so counting them as
+   * `recording_missing` is what made the gap look unexplainable.
+   */
+  TRANSFERRED: 'transferred',
   /** We could not look. NEVER a conclusion about the archive. */
   UNKNOWN: 'unknown',
 });
+
+/** Five9's own words for it, on the call row rather than on a leg. */
+const TRANSFER_DISPOSITION = /transferred to 3rd party|transferred to third party/i;
+
+/**
+ * Did this call continue on a vendor platform after a transfer? Pure.
+ *
+ * ── WHAT THIS IS ABOUT ─────────────────────────────────────────────────────
+ * Measured 2026-08-25: of 199 calls parked on `recording_missing`, 75 carry
+ * disposition 'Transferred To 3rd Party' — all on 'Main Number', averaging
+ * 225 seconds, to two destinations. Add the 83 canvass-line calls and it is
+ * ONE cause: real multi-minute conversations that carried on somewhere Five9
+ * does not record. The audio is not missing; it was never ours.
+ *
+ * ── WHY THE TRANSFER LEG AND NOT "WHO OWNS THE NUMBER" ─────────────────────
+ * The obvious rule — "a transfer DNIS Reece does not own" — cannot be
+ * evaluated here, and pretending otherwise would bake in a wrong answer.
+ * 9548008906 IS a Reece number: it is GENERAL_SERVICE_PHONE
+ * (src/services/market-phone.js) and the GENERAL/JAX fallback in sql/017. Yet
+ * scripts/seed-ci-maps.js deliberately leaves it out of ci_transfer_target_map
+ * because "identify that destination" is still an open item. So ownership is
+ * the QUESTION this report exists to answer, not an input to it.
+ *
+ * What is knowable from the row is whether a transfer happened, and where to.
+ * Both come from Five9's own labelling: the disposition, or a leg whose
+ * DIRECTION says '3rd party transfer' (isTransferLeg, discovery.js — imported
+ * rather than re-written, so the two cannot drift).
+ *
+ * `was_transferred` alone is NOT a trigger. isTransferGroup sets it true for
+ * any multi-leg group, which includes ordinary re-dials; using it here would
+ * classify unrelated calls as vendor-side and hide real retrieval failures.
+ * It is reported as corroboration, never as the reason.
+ *
+ * @returns {{transferred: boolean, reason: string|null, dnis: string|null}}
+ */
+/**
+ * The one sentence that explains a transferred call. ONE copy: diagnoseCall
+ * reaches this verdict from a listing search, diagnoseRecordingGap reaches it
+ * before searching at all, and two hand-written copies of the same explanation
+ * would drift the moment either was edited.
+ */
+export function transferDetail(dnis) {
+  const shown = dnis ? ` (${formatPhoneLine(dnis) ?? dnis})` : '';
+  return `call was transferred to a 3rd party${shown} — the conversation continued off Five9, `
+    + 'which records only its own leg. No archive search will find this; it is not a retrieval failure.';
+}
+
+export function classifyTransfer(call) {
+  const legs = Array.isArray(call?.raw_metadata?.legs) ? call.raw_metadata.legs : [];
+  const transferLeg = legs.find(isTransferLeg) ?? null;
+  // The destination is the TRANSFER leg's own dnis. ci_calls.dnis is the
+  // PRIMARY leg's (discovery.js buildCallRow) — the number the customer
+  // reached, not the one they were handed to.
+  const dnis = last10(transferLeg?.dnis) ?? null;
+
+  if (TRANSFER_DISPOSITION.test(String(call?.disposition ?? ''))) {
+    return { transferred: true, reason: 'disposition', dnis };
+  }
+  if (transferLeg) {
+    return { transferred: true, reason: 'transfer_leg', dnis };
+  }
+  return { transferred: false, reason: null, dnis: null };
+}
 
 /**
  * The three date folders a call could plausibly be filed under. Pure.
@@ -162,7 +234,28 @@ export function diagnoseCall(call, listings, windowSeconds = 180) {
     };
   }
 
-  // 4. The folder is empty — the campaign dir is wrong, or Five9 filed the
+  // 4. Nothing found for this number anywhere we looked. BEFORE concluding
+  //    retrieval failed, ask whether there was ever anything of ours to
+  //    retrieve: a transferred call's conversation continued on a vendor
+  //    platform and Five9 holds only its own leg.
+  //
+  //    This is checked HERE and not earlier on purpose. Every verdict above
+  //    means "we found a file for this number" — present, a day away, or just
+  //    outside the window — and each of those is recoverable. A transferred
+  //    call whose Five9 leg WAS recorded is still a real finding, and letting
+  //    'transferred' outrank them would hide it.
+  const transfer = classifyTransfer(call);
+  if (transfer.transferred) {
+    return {
+      verdict: VERDICTS.TRANSFERRED,
+      detail: transferDetail(transfer.dnis),
+      wanted,
+      transfer_dnis: transfer.dnis,
+      transfer_basis: transfer.reason,
+    };
+  }
+
+  // 5. The folder is empty — the campaign dir is wrong, or Five9 filed the
   //    audio somewhere else entirely.
   if (!same.length) {
     return {
@@ -218,12 +311,67 @@ export function recommendation(summary) {
     return `The audio is where ingest looked and matches on re-run (${d.count} of ${summary.diagnosed}). `
       + `This is NOT a retrieval gap — investigate the fetch stage's listing or its wait/backoff, not the archive.`;
   }
+  if (d.verdict === VERDICTS.TRANSFERRED && share >= 0.5) {
+    return `${d.count} of ${summary.diagnosed} were TRANSFERRED to a 3rd party — the conversation continued off `
+      + `Five9, which records only its own leg. There is NO code fix and no archive search that will find these. `
+      + `Read the per-DNIS rollup below, identify each destination, and agree a feed with that vendor IN WRITING `
+      + `(filename convention, timezone, audio format) before any ingest path is built.`;
+  }
   if (d.verdict === VERDICTS.CAMPAIGN_DIR_EMPTY && share >= 0.5) {
     return `${d.count} of ${summary.diagnosed} have no audio under their campaign folder at all. `
       + `Either the campaign was renamed in Five9 after these calls, or recording is off for it — check Five9 config before changing any code.`;
   }
   return `MIXED — no single cause covers half the sample (largest: ${d.verdict}, ${d.count} of ${summary.diagnosed}). `
     + `Read the per-call table; these need more than one fix.`;
+}
+
+/**
+ * Roll transferred calls up per destination. Pure.
+ *
+ * This is the deliverable, not a footnote: the destinations are unidentified
+ * (scripts/seed-ci-maps.js leaves 954-800-8906 out of ci_transfer_target_map
+ * precisely because "identify that destination" is still open), and volume per
+ * number is what makes them worth identifying — or not.
+ *
+ * Minutes rather than seconds because the decision this feeds is "is there
+ * enough conversation here to be worth a vendor integration".
+ *
+ * A transferred call whose destination could not be read is counted under
+ * `unknown_destination` rather than dropped. Dropping it would understate the
+ * volume, which is the one number this rollup exists to get right.
+ */
+export function summariseTransfers(rows) {
+  const byDnis = new Map();
+  for (const r of rows || []) {
+    if (r?.verdict !== VERDICTS.TRANSFERRED) continue;
+    const key = r.transfer_dnis || 'unknown_destination';
+    if (!byDnis.has(key)) {
+      byDnis.set(key, { dnis: r.transfer_dnis ?? null, calls: 0, seconds: 0, campaigns: new Set(), first: null, last: null });
+    }
+    const e = byDnis.get(key);
+    e.calls += 1;
+    if (Number.isFinite(r.duration_seconds)) e.seconds += r.duration_seconds;
+    if (r.campaign) e.campaigns.add(r.campaign);
+    const t = r.call_start ? new Date(r.call_start) : null;
+    if (t && Number.isFinite(t.getTime())) {
+      if (!e.first || t < e.first) e.first = t;
+      if (!e.last || t > e.last) e.last = t;
+    }
+  }
+
+  return [...byDnis.entries()]
+    .map(([key, e]) => ({
+      destination: e.dnis ? (formatPhoneLine(e.dnis) ?? e.dnis) : 'unknown',
+      dnis: e.dnis,
+      calls: e.calls,
+      total_minutes: Math.round(e.seconds / 60),
+      avg_seconds: e.calls ? Math.round(e.seconds / e.calls) : 0,
+      campaigns: [...e.campaigns].sort(),
+      first_call: e.first ? e.first.toISOString() : null,
+      last_call: e.last ? e.last.toISOString() : null,
+      ...(key === 'unknown_destination' ? { note: 'no transfer-leg DNIS on these rows' } : {}),
+    }))
+    .sort((a, b) => b.calls - a.calls);
 }
 
 /**
@@ -243,19 +391,55 @@ export async function diagnoseRecordingGap({
 
   const { data: calls, error } = await db
     .from('ci_calls')
-    .select('id, five9_call_id, campaign, customer_phone, ani, call_start, review_reason, raw_metadata')
+    .select('id, five9_call_id, campaign, customer_phone, ani, dnis, call_start, duration_seconds, disposition, was_transferred, review_reason, raw_metadata')
     .in('review_reason', ['recording_missing', 'recording_ambiguous'])
     .order('call_start', { ascending: false })
     .limit(Math.max(1, Math.min(limit, 200)));
   if (error) throw new Error(`ci_calls read failed: ${error.message}`);
 
-  // The report saying "audio exists" is what makes a call recoverable. Without
-  // it there is nothing to find and the review is correct.
-  const withAudio = (calls || []).filter(
+  // TRANSFERS FIRST, over the whole selection — before the expected-recordings
+  // filter, not after it.
+  //
+  // A transferred call whose Five9 leg produced no recording row has
+  // expected_recording_count 0, so it used to fall into
+  // `no_audio_correctly_parked` and never be examined at all. That phrase
+  // means "nothing to recover", which is the opposite of true here: the
+  // conversation happened and the audio exists, on someone else's platform.
+  // Reporting it as correctly parked is how 75 real conversations stayed
+  // invisible.
+  //
+  // classifyTransfer is pure and needs no listing, so this costs no extra SFTP
+  // round trip and no extra query.
+  const results = [];
+  const rest = [];
+  for (const call of calls || []) {
+    const transfer = classifyTransfer(call);
+    if (!transfer.transferred) { rest.push(call); continue; }
+    results.push({
+      five9_call_id: call.five9_call_id,
+      call_start: call.call_start,
+      campaign: call.campaign,
+      duration_seconds: call.duration_seconds ?? null,
+      review_reason: call.review_reason,
+      expected_recordings: Number(call.raw_metadata?.expected_recording_count ?? 0),
+      recordings_raw: call.raw_metadata?.recordings_raw ?? null,
+      verdict: VERDICTS.TRANSFERRED,
+      detail: transferDetail(transfer.dnis),
+      wanted: last10(call.customer_phone || call.ani),
+      transfer_dnis: transfer.dnis,
+      transfer_basis: transfer.reason,
+      // Corroboration only — never the reason. isTransferGroup sets this true
+      // for ANY multi-leg group, re-dials included.
+      was_transferred: call.was_transferred ?? null,
+    });
+  }
+
+  // The report saying "audio exists" is what makes a NON-transferred call
+  // recoverable. Without it there is nothing to find and the review is correct.
+  const withAudio = rest.filter(
     (c) => Number(c.raw_metadata?.expected_recording_count ?? 0) > 0,
   );
 
-  const results = [];
   // ONE connection for the whole run. The adapter opens one per list() call
   // otherwise, and this lists up to three directories per call.
   for (const call of withAudio) {
@@ -275,6 +459,7 @@ export async function diagnoseRecordingGap({
       five9_call_id: call.five9_call_id,
       call_start: call.call_start,
       campaign: call.campaign,
+      duration_seconds: call.duration_seconds ?? null,
       review_reason: call.review_reason,
       expected_recordings: Number(call.raw_metadata?.expected_recording_count ?? 0),
       recordings_raw: call.raw_metadata?.recordings_raw ?? null,
@@ -283,12 +468,18 @@ export async function diagnoseRecordingGap({
   }
 
   const summary = summariseVerdicts(results);
+  const transfers = summariseTransfers(results);
+  const transferred = results.filter((r) => r.verdict === VERDICTS.TRANSFERRED).length;
   return {
     examined: (calls || []).length,
+    transferred,
     recoverable: withAudio.length,
-    no_audio_correctly_parked: (calls || []).length - withAudio.length,
+    // Now means what it says: no audio, AND not a transfer. The transferred
+    // calls used to be counted here, which read as "nothing to recover".
+    no_audio_correctly_parked: rest.length - withAudio.length,
     results,
     summary,
+    transfers,
     recommendation: recommendation(summary),
     note: 'READ ONLY — nothing was re-ingested, re-queued or changed.',
   };
@@ -296,5 +487,6 @@ export async function diagnoseRecordingGap({
 
 export default {
   VERDICTS, candidateDateDirs, diagnoseCall, summariseVerdicts,
+  classifyTransfer, summariseTransfers, transferDetail,
   recommendation, diagnoseRecordingGap,
 };

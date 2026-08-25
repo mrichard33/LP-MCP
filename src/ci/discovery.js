@@ -163,10 +163,23 @@ export function groupByCallId(rows) {
   return groups;
 }
 
+/**
+ * Is THIS leg the third-party transfer leg?
+ *
+ * The regex lives here and nowhere else. Five9 writes the transfer marker into
+ * the leg's DIRECTION cell ('3rd party transfer', verified live 2026-08-18),
+ * and both discovery and the recording diagnostic have to agree on what a
+ * transfer looks like — a diagnostic that recognises a different set of legs
+ * from the code it is diagnosing describes a different system, convincingly.
+ */
+export function isTransferLeg(leg) {
+  return /3rd party transfer|third party transfer/i.test(String(leg?.direction ?? ''));
+}
+
 /** Does any leg in the group look like a transfer leg? */
 export function isTransferGroup(legs) {
   if (legs.length > 1) return true;
-  return legs.some((l) => /3rd party transfer|third party transfer/i.test(String(l.direction ?? '')));
+  return legs.some(isTransferLeg);
 }
 
 /**
@@ -307,7 +320,7 @@ export function customerE164For(row) {
  * @returns {{row: object|null, reject: string|null}}
  */
 export function buildCallRow(legs, campaignRow, cfg, agentMap = null) {
-  const primary = legs.find((l) => !/3rd party transfer|third party transfer/i.test(String(l.direction ?? ''))) || legs[0];
+  const primary = legs.find((l) => !isTransferLeg(l)) || legs[0];
 
   const startedAt = parsePacificReportTimestamp(primary.timestamp);
   if (!startedAt) {
