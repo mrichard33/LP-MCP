@@ -178,23 +178,56 @@ export function narrowByRecency(candidates, callStart) {
 }
 
 /**
- * §8 note target: 'ils' + lds_id when the person has exactly ONE inquiry
- * relevant to this call, otherwise 'cst' + cst_id.
+ * §8 note target: ALWAYS the prospect — 'cst' + cst_id.
  *
- * "Never guess between multiple appointments" is the rule that matters here.
- * A person with two open jobs gets the note on the PERSON, where whoever reads
- * it can see both, rather than on one arbitrarily chosen job where it silently
- * implies the wrong context.
+ * ── WHY THIS IS NOT A CHOICE ANY MORE ──────────────────────────────────────
+ * This used to return 'ils' + lds_id when the person had exactly one relevant
+ * inquiry, on the reasoning that a note about a specific job belongs on that
+ * job. The reasoning was fine; the destination was not.
+ *
+ * LP surfaces PROSPECT-attached notes on the record a rep reads. Lead-attached
+ * notes are not what they see. On 2026-08-24 that sent 195 of 286 AI call notes
+ * somewhere nobody looks — and because AddNotes answers every write with the
+ * constant "UPDATED SUCCESSFULLY!", all 195 recorded as delivered. Mark checked
+ * prospect 453031, whose three notes went out as ils/568072, and found nothing.
+ *
+ * The sibling pipeline had already settled this: src/ghl-note-pipeline/lp-write.js
+ * writes rectype 'cst' onto the prospect, and its notes ARE visible, through the
+ * same addNote() wrapper and the same nct_id. Two note writers in one repo
+ * disagreeing about where notes go was itself the defect.
+ *
+ * ── THE INQUIRY IS NOT LOST, IT IS JUST NOT THE ANCHOR ─────────────────────
+ * Which lead the note is ABOUT is still resolved and still recorded — in
+ * `lead_id` here, on ci_matches.lp_lds_id, and in the note text itself. It has
+ * simply stopped deciding where the note is filed. Same reasoning as lp-write.js,
+ * which encodes identity in the note body rather than the attachment point.
+ *
+ * The old rule that mattered survives intact and now costs nothing: a person
+ * with two open jobs never gets the note pinned to one arbitrarily chosen job.
+ * Nobody does.
+ *
+ * @param {number|string|null} suppliedLeadId  an inquiry named outright by the
+ *   dialing record or the canvass correlation — recorded, never used to anchor
  */
-export function pickNoteTarget(prospectId, leads, callStart) {
+export function pickNoteTarget(prospectId, leads, callStart, suppliedLeadId = null) {
   const relevant = narrowByRecency(leads || [], callStart);
-  if (relevant.length === 1 && relevant[0].lp_lead_id != null) {
-    return { rectype: 'ils', recid: Number(relevant[0].lp_lead_id), reason: 'single_relevant_lead' };
-  }
+
+  // Resolve the inquiry for the record. An id we were handed outright beats
+  // inference; otherwise a single relevant lead identifies itself.
+  const leadId = suppliedLeadId != null
+    ? Number(suppliedLeadId)
+    : (relevant.length === 1 && relevant[0].lp_lead_id != null ? Number(relevant[0].lp_lead_id) : null);
+
+  const reason = suppliedLeadId != null ? 'id_supplied'
+    : relevant.length === 0 ? 'no_relevant_lead'
+      : relevant.length === 1 ? 'single_relevant_lead'
+        : 'multiple_relevant_leads';
+
   return {
     rectype: 'cst',
     recid: prospectId != null ? Number(prospectId) : null,
-    reason: relevant.length === 0 ? 'no_relevant_lead' : 'multiple_relevant_leads',
+    lead_id: Number.isFinite(leadId) ? leadId : null,
+    reason,
   };
 }
 
@@ -461,13 +494,13 @@ export async function matchCall(call, { db = supabase, analysis = null, campaign
   if (lp.prospectId != null) leads = await findLpLeads(db, lp.prospectId);
 
   const prospect = (lp.candidates || []).find((c) => Number(c.lp_prospect_id) === lp.prospectId) || null;
+  // An id carried by the dialing record or the canvass correlation names the
+  // inquiry outright — so there is no selection to make, but that is a fact to
+  // RECORD, not a reason to file the note off the prospect where no rep reads
+  // it. See pickNoteTarget: the anchor is the person, always.
   const target = lp.prospectId != null
-    ? (lp.leadId != null
-      // An id carried by the dialing record or the canvass correlation names
-      // the inquiry outright — no selection to make.
-      ? { rectype: 'ils', recid: Number(lp.leadId), reason: 'id_supplied' }
-      : pickNoteTarget(lp.prospectId, leads, call.call_start))
-    : { rectype: null, recid: null, reason: 'no_lp_match' };
+    ? pickNoteTarget(lp.prospectId, leads, call.call_start, lp.leadId ?? null)
+    : { rectype: null, recid: null, lead_id: null, reason: 'no_lp_match' };
 
   const ghl = decideGhlTier({ lpProspect: prospect, lpLeads: leads });
 
