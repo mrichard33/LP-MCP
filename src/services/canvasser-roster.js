@@ -18,6 +18,26 @@
  *
  * So the id is checked against the roster BEFORE it is sent.
  *
+ * ── THIS IS INSURANCE, NOT A REPAIR ────────────────────────────────────────
+ * Traced end to end on live leads (2026-08-25) BEFORE writing this, and the
+ * path is currently CORRECT — no misattribution was found:
+ *
+ *   GHL contact dNdfHFYEb0PTeHYYJQlo  pro_id=4428  ->  LP "Clemons, Joshua - FTM"
+ *   roster 4428 = "Joshua Clemons", FTMYR                        ✓ same person
+ *   GHL contact pPDw6VflphQGtOCIyZbM  pro_id=5607  ->  LP "Jackson, Terrance - FTM"
+ *   roster 5607 = "Terrance Jackson", FTMYR                      ✓ same person
+ *
+ * The canvass landing page sends `pro_id` and `sales_rabbit_lead_id` as
+ * SEPARATE parameters (4428 vs 5768592), so the two id spaces are not being
+ * confused today. Across the previous 7 days, 302 of 371 canvass leads
+ * resolved to promoters that are on the roster.
+ *
+ * The guard exists because the failure it prevents is undetectable after the
+ * fact: nothing downstream can tell a lead credited to the wrong canvasser
+ * from one credited correctly. It is deliberately cheap — one indexed lookup
+ * per canvassing lead — and it ships observing (below), so it changes nothing
+ * until someone reads the verdicts and decides.
+ *
  * ── UNATTRIBUTED BEATS MISATTRIBUTED ───────────────────────────────────────
  * Once enforcing, a miss means the id is WITHHELD rather than forwarded. A
  * lead with no promoter is visibly incomplete and someone fixes it; a lead
