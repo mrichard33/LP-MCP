@@ -21,6 +21,10 @@ import { createManualAdapter, storeAudio, sha256Hex, describeRecording, ensureLi
 import { CI_AUDIO_BUCKET } from '../../scripts/setup-ci-audio-bucket.js';
 import { reconcileDay, pipelineHealth } from './reconcile.js';
 import { auditLpNotes } from './verify.js';
+import { releaseShadowSyncs } from './shadow-release.js';
+import {
+  runDiscoveryTick, discoverySchedulerStatus,
+} from '../jobs/ci-discovery-scheduler.js';
 
 const LOG = '[CIRoutes]';
 
@@ -472,6 +476,67 @@ export function registerCiRoutes(app, authenticate) {
       }));
     } catch (err) {
       console.error(`${LOG} GET /ci/verify-notes failed: ${err.message}`);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  /**
+   * GET /ci/discovery/status — is the poller armed, and where is its cursor?
+   *
+   * The first thing to look at when calls stop arriving. Reports the cursor,
+   * the quiet window, consecutive failures and the Five9 auth breaker, which is
+   * the most likely reason a poller has gone quiet without erroring.
+   */
+  app.get('/ci/discovery/status', ...guards, (req, res) => {
+    try {
+      res.json(discoverySchedulerStatus());
+    } catch (err) {
+      console.error(`${LOG} GET /ci/discovery/status failed: ${err.message}`);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  /**
+   * POST /ci/discovery/run — pull once, now.
+   *
+   * Bypasses CI_DISCOVERY_ENABLED and quiet hours so the scheduler can be
+   * proven working before it is armed. It deliberately does NOT bypass the
+   * Five9 auth breaker: a human asking for a pull is not evidence that the
+   * credential is right, and an unattended retry loop against a bad password
+   * locks the account the whole floor dials on.
+   */
+  app.post('/ci/discovery/run', ...guards, async (req, res) => {
+    try {
+      res.json(await runDiscoveryTick({ force: true }));
+    } catch (err) {
+      console.error(`${LOG} POST /ci/discovery/run failed: ${err.message}`);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  /**
+   * POST /ci/release-shadow-syncs?execute=true&target=lp
+   *
+   * Gives back the write that shadow mode consumed. claimSync inserts the
+   * ci_syncs row — with its idempotency key — before it knows whether the write
+   * will go out, so every call processed while CALL_INTEL_LP_WRITES was false
+   * permanently spent its one chance. Turning the flag on delivers nothing for
+   * those calls without this.
+   *
+   * DRY-RUN unless ?execute=true. Read the dry run first: it lists what would be
+   * released and, more importantly, what is REFUSED and why.
+   *
+   * See src/ci/shadow-release.js for why releasing these cannot double-post —
+   * the proof is that the row was written on the branch that returns before the
+   * request exists.
+   */
+  app.post('/ci/release-shadow-syncs', ...guards, async (req, res) => {
+    try {
+      const execute = String(req.query?.execute ?? '').toLowerCase() === 'true';
+      const target = String(req.query?.target || 'lp');
+      res.json(await releaseShadowSyncs({ db: supabase, target, execute }));
+    } catch (err) {
+      console.error(`${LOG} POST /ci/release-shadow-syncs failed: ${err.message}`);
       res.status(500).json({ ok: false, error: err.message });
     }
   });

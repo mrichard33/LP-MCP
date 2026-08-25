@@ -208,22 +208,29 @@ const NOW = new Date('2026-08-25T01:00:00.000Z');
  * A ci_syncs double for the sweep: serves loadSyncRows' two reads and records
  * every update, so a test can assert what did NOT change as easily as what did.
  */
-function sweepDb(syncRows, matchRows) {
+function sweepDb(syncRows, matchRows, legacyRows = []) {
   const updates = [];
   return {
     updates,
     from(table) {
       if (table === 'ci_syncs') {
+        // `.is()` is only ever called by the LEGACY slice (external_ref IS NULL
+        // AND verified_at IS NULL), so it is the discriminator between the two
+        // passes — which lets one double serve both and keeps a test that seeds
+        // no legacy rows from accidentally exercising that path.
         const chain = {
-          _rows: syncRows,
+          _legacy: false,
           select() { return chain; },
           eq() { return chain; },
           lt() { return chain; },
+          is() { chain._legacy = true; return chain; },
           order() { return chain; },
           update(patch) {
             return { eq(_c, id) { return { eq() { updates.push({ id, patch }); return Promise.resolve({ error: null }); } }; } };
           },
-          then: (res, rej) => Promise.resolve({ data: chain._rows, error: null }).then(res, rej),
+          then: (res, rej) => Promise.resolve({
+            data: chain._legacy ? legacyRows : syncRows, error: null,
+          }).then(res, rej),
         };
         return chain;
       }
@@ -379,11 +386,99 @@ test('the sweep is a no-op when disabled, and never guesses without a reader', a
   assert.equal(db.updates.length, 0);
 });
 
+// ─── the legacy backfill: the 286 settle themselves ─────────────────────────
+
+const legacyRow = (over = {}) => ({
+  id: 'legacy-1', call_id: CALL_ID, status: 'synced', synced_at: '2026-08-24T22:29:23.018Z',
+  created_at: '2026-08-24T22:29:23.018Z', external_ref: null, verified_at: null, verify_attempts: 0,
+  ci_calls: { lp_cst_id: '244594', five9_call_id: '300000010259899' },
+  ...over,
+});
+
+test('LEGACY: a pre-fix synced row is read back and gets its real note id', async () => {
+  // The 286 rows written on 08-24 recorded `synced` on a non-throw alone, so
+  // they cannot verify through the live path — they are already 'synced'. The
+  // backfill settles them with exactly the same rule.
+  const db = sweepDb([], [matchRow()], [legacyRow()]);
+  const stats = await verifyPendingLpNotes({
+    db, now: () => NOW,
+    lpReader: async () => [prospectWith({ prospectNotes: [{ id: '2238213', note: noteFor(CALL_ID) }] })],
+  });
+  assert.equal(stats.verified, 1);
+  assert.equal(stats.legacy.verified, 1, 'counted as legacy, so the two passes stay legible');
+  assert.equal(db.updates[0].patch.status, 'synced');
+  assert.equal(db.updates[0].patch.external_ref, '2238213');
+  assert.ok(db.updates[0].patch.verified_at);
+});
+
+test('LEGACY: the update is guarded on the row still being synced', async () => {
+  // The guard must follow the pass. Guarding a legacy update on
+  // 'sent_unconfirmed' would match nothing and silently verify none of the 286.
+  const db = sweepDb([], [matchRow()], [legacyRow()]);
+  await verifyPendingLpNotes({
+    db, now: () => NOW,
+    lpReader: async () => [prospectWith({ prospectNotes: [{ id: 'X', note: noteFor(CALL_ID) }] })],
+  });
+  assert.equal(db.updates.length, 1, 'the guarded update must have matched');
+});
+
+test('LEGACY: THE RULE still holds — a failed read changes nothing', async () => {
+  const db = sweepDb([], [matchRow()], [legacyRow()]);
+  const stats = await verifyPendingLpNotes({
+    db, now: () => NOW, lpReader: async () => { throw new Error('ETIMEDOUT'); },
+  });
+  assert.equal(stats.unread, 1);
+  assert.equal(db.updates.length, 0, 'a pre-fix row is not evidence of anything on a read we could not make');
+});
+
+test('LEGACY: a row LP does not have is failed, not silently left synced', async () => {
+  const db = sweepDb([], [matchRow('ils', 568072)], [legacyRow({ verify_attempts: 2 })]);
+  const alerts = [];
+  const stats = await verifyPendingLpNotes({
+    db, now: () => NOW,
+    lpReader: async () => [prospectWith()],
+    alert: async (kind, text) => { alerts.push({ kind, text }); },
+  });
+  assert.equal(stats.failed, 1);
+  assert.equal(db.updates[0].patch.status, 'failed');
+  assert.match(db.updates[0].patch.error, /not_present_in_lp/);
+  assert.equal(alerts.length, 1, 'this is the 08-24 failure mode confirmed — it must be loud');
+});
+
+test('LEGACY: an already-settled row is never re-read', async () => {
+  // loadSyncRows filters on external_ref IS NULL AND verified_at IS NULL. Without
+  // that, every verified row would be re-read on every tick forever — LP calls
+  // burned on closed cases.
+  const src = (await import('../src/ci/verify.js')).loadSyncRows.toString();
+  assert.match(src, /unverifiedOnly/);
+  assert.match(src, /is\('external_ref', null\)\.is\('verified_at', null\)/);
+});
+
+test('LEGACY: the pass is bounded, and can be turned off', async () => {
+  const many = Array.from({ length: 50 }, (_, i) => legacyRow({ id: `legacy-${i}` }));
+  const db = sweepDb([], [matchRow()], many);
+  const stats = await verifyPendingLpNotes({
+    db, now: () => NOW, env: { CI_VERIFY_LEGACY_BATCH: '3' },
+    lpReader: async () => [prospectWith()],
+  });
+  assert.equal(stats.checked, 3, 'a backfill riding a live tick must never take the whole table');
+
+  const off = sweepDb([], [matchRow()], many);
+  const none = await verifyPendingLpNotes({
+    db: off, now: () => NOW, env: { CI_VERIFY_LEGACY_ENABLED: 'false' },
+    lpReader: async () => [prospectWith()],
+  });
+  assert.equal(none.checked, 0);
+  assert.equal(off.updates.length, 0);
+});
+
 // ─── the knobs ──────────────────────────────────────────────────────────────
 
 test('verification defaults ON — it is the safety net, not an opt-in', () => {
   const d = readVerifyEnv({});
   assert.equal(d.enabled, true, 'an unset variable must not remove the check that would have caught 08-24');
+  assert.equal(d.legacyEnabled, true, 'and the 286 settle themselves without anyone remembering to ask');
+  assert.equal(d.legacyBatch, 10);
   assert.equal(d.delayMs, 120000);
   assert.equal(d.maxAttempts, 3);
   assert.equal(readVerifyEnv({ CI_VERIFY_ENABLED: 'false' }).enabled, false);

@@ -80,6 +80,17 @@ export function readVerifyEnv(env = process.env) {
     delayMs: num(env.CI_VERIFY_DELAY_MS, 120000, 1000),
     maxAttempts: num(env.CI_VERIFY_MAX_ATTEMPTS, 3, 1),
     batch: num(env.CI_VERIFY_BATCH, 50, 1),
+    // The LEGACY PASS. 286 rows recorded `synced` on 2026-08-24 before
+    // sent_unconfirmed existed, on nothing but a non-throw, and 195 of them
+    // were filed on the lead where no rep reads. They cannot verify themselves
+    // through the normal path — they are already 'synced' — so the sweep also
+    // takes a small slice of them each tick and settles them the same way.
+    //
+    // Deliberately SMALL and default-on: it is a backfill riding on a
+    // five-minute worker tick, so at 10 per tick the whole backlog resolves in
+    // about two hours without ever competing with live verification.
+    legacyEnabled: String(env.CI_VERIFY_LEGACY_ENABLED ?? 'true').toLowerCase() !== 'false',
+    legacyBatch: num(env.CI_VERIFY_LEGACY_BATCH, 10, 1),
   };
 }
 
@@ -162,14 +173,18 @@ export function verdictOf(acc) {
  * separately and joined here — one predictable query beats a nested embed whose
  * shape depends on how PostgREST resolves UNIQUE(call_id).
  */
-export async function loadSyncRows({ db = supabaseDefault, status = 'synced', olderThan = null } = {}) {
+export async function loadSyncRows({ db = supabaseDefault, status = 'synced', olderThan = null, unverifiedOnly = false } = {}) {
   let q = db
     .from('ci_syncs')
-    .select('id, call_id, status, synced_at, created_at, external_ref, verify_attempts, ci_calls(lp_cst_id, five9_call_id)')
+    .select('id, call_id, status, synced_at, created_at, external_ref, verified_at, verify_attempts, ci_calls(lp_cst_id, five9_call_id)')
     .eq('target', 'lp')
     .eq('status', status)
     .order('synced_at', { ascending: true });
   if (olderThan) q = q.lt('synced_at', olderThan);
+  // The legacy slice: 'synced' rows that no read-back ever confirmed. A row
+  // carrying external_ref or verified_at has already been settled and must not
+  // be re-read — re-reading it would burn LP calls forever on a closed case.
+  if (unverifiedOnly) q = q.is('external_ref', null).is('verified_at', null);
 
   const { data: syncs, error } = await q;
   if (error) throw new Error(`ci_syncs read failed: ${error.message}`);
@@ -191,6 +206,7 @@ export async function loadSyncRows({ db = supabaseDefault, status = 'synced', ol
       status: s.status,
       synced_at: s.synced_at,
       external_ref: s.external_ref,
+      verified_at: s.verified_at ?? null,
       verify_attempts: s.verify_attempts ?? 0,
       five9_call_id: s.ci_calls?.five9_call_id ?? null,
       lp_cst_id: s.ci_calls?.lp_cst_id ?? null,
@@ -245,34 +261,28 @@ export async function auditLpNotes({ db = supabaseDefault, lpReader = defaultLpR
 }
 
 /**
- * Promote the notes we can now see; leave alone the ones we cannot.
- *
- * Called once per worker tick. Claims `sent_unconfirmed` rows older than the
- * settle delay, reads one prospect at a time, and:
+ * THE SETTLE RULE. One prospect read at a time, and for each of its rows:
  *
  *   found        → 'synced', verified_at set, external_ref = the real note id
  *   read OK,
  *   not found    → verify_attempts+1; at maxAttempts, 'failed' + an alert
  *   read FAILED  → NOTHING CHANGES. Unknown is not absent.
  *
+ * Extracted so the live pass and the legacy backfill share it EXACTLY. Two
+ * copies of this would drift, and the branch that would drift first is the last
+ * one — the one that must never turn "we could not ask LP" into "LP does not
+ * have it", because that releases the idempotency key on a delivered note and
+ * the retry double-posts onto a customer's record.
+ *
+ * `fromStatus` is the status the row is expected to still be in, and it is
+ * re-asserted in every UPDATE. It differs between the passes
+ * ('sent_unconfirmed' live, 'synced' legacy), so hardcoding it would make one
+ * pass silently match nothing.
+ *
  * @returns {{checked:number, verified:number, missing:number, failed:number, unread:number}}
  */
-export async function verifyPendingLpNotes({
-  db = supabaseDefault,
-  cfg = getConfig(),
-  env = process.env,
-  lpReader = defaultLpReader,
-  now = () => new Date(),
-  alert = sendAlert,
-} = {}) {
-  const opts = readVerifyEnv(env);
+async function settleRows({ db, rows, fromStatus, opts, lpReader, now, alert, label }) {
   const stats = { checked: 0, verified: 0, missing: 0, failed: 0, unread: 0, skipped: false };
-
-  if (!opts.enabled) return { ...stats, skipped: 'disabled' };
-  if (typeof lpReader !== 'function') return { ...stats, skipped: 'no_lp_reader' };
-
-  const cutoff = new Date(now().getTime() - opts.delayMs).toISOString();
-  const rows = (await loadSyncRows({ db, status: UNCONFIRMED, olderThan: cutoff })).slice(0, opts.batch);
   if (!rows.length) return stats;
 
   const { byProspect, unresolved } = groupByProspect(rows);
@@ -301,7 +311,7 @@ export async function verifyPendingLpNotes({
           external_ref: hit.lpNoteId,
           verified_at: now().toISOString(),
           error: null,
-        }).eq('id', r.sync_id).eq('status', UNCONFIRMED);
+        }).eq('id', r.sync_id).eq('status', fromStatus);
         if (uErr) { console.warn(`${LOG} verify: could not mark ${r.sync_id} synced: ${uErr.message}`); continue; }
         stats.verified += 1;
         if (hit.side === 'lead') {
@@ -318,10 +328,10 @@ export async function verifyPendingLpNotes({
       const attempts = (r.verify_attempts || 0) + 1;
       const terminal = attempts >= opts.maxAttempts;
       const { error: uErr } = await db.from('ci_syncs').update({
-        status: terminal ? 'failed' : UNCONFIRMED,
+        status: terminal ? 'failed' : fromStatus,
         verify_attempts: attempts,
         error: terminal ? 'not_present_in_lp — LP accepted the write but the note is not on the record' : null,
-      }).eq('id', r.sync_id).eq('status', UNCONFIRMED);
+      }).eq('id', r.sync_id).eq('status', fromStatus);
       if (uErr) { console.warn(`${LOG} verify: could not record miss for ${r.sync_id}: ${uErr.message}`); continue; }
 
       stats.missing += 1;
@@ -342,13 +352,73 @@ export async function verifyPendingLpNotes({
 
   for (const _ of unresolved) { stats.checked += 1; stats.unread += 1; }
   if (unresolved.length) {
-    console.warn(`${LOG} verify: ${unresolved.length} unconfirmed note(s) have no prospect id and cannot be read back`);
+    console.warn(`${LOG} verify${label}: ${unresolved.length} note(s) have no prospect id and cannot be read back`);
   }
 
   if (stats.checked) {
-    console.log(`${LOG} verify: checked=${stats.checked} verified=${stats.verified} missing=${stats.missing} failed=${stats.failed} unread=${stats.unread}`);
+    console.log(`${LOG} verify${label}: checked=${stats.checked} verified=${stats.verified} missing=${stats.missing} failed=${stats.failed} unread=${stats.unread}`);
   }
   return stats;
+}
+
+/**
+ * Promote the notes we can now see; leave alone the ones we cannot.
+ *
+ * TWO PASSES, one settle rule.
+ *
+ *   live    'sent_unconfirmed' rows past the settle delay — the normal path
+ *           every LP note now takes.
+ *   legacy  'synced' rows that no read-back ever confirmed (external_ref and
+ *           verified_at both NULL). These are the 286 written on 2026-08-24
+ *           before this state existed, whose `synced` rests on a non-throw and
+ *           nothing else. They cannot verify themselves through the live path
+ *           because they are already 'synced', so a small slice is taken each
+ *           tick until the backlog is settled.
+ *
+ * Both go through settleRows, so the rule that matters — a failed read changes
+ * NOTHING — cannot drift between them.
+ */
+export async function verifyPendingLpNotes({
+  db = supabaseDefault,
+  cfg = getConfig(),
+  env = process.env,
+  lpReader = defaultLpReader,
+  now = () => new Date(),
+  alert = sendAlert,
+} = {}) {
+  const opts = readVerifyEnv(env);
+  const empty = { checked: 0, verified: 0, missing: 0, failed: 0, unread: 0, skipped: false };
+
+  if (!opts.enabled) return { ...empty, skipped: 'disabled' };
+  if (typeof lpReader !== 'function') return { ...empty, skipped: 'no_lp_reader' };
+
+  const cutoff = new Date(now().getTime() - opts.delayMs).toISOString();
+  const live = (await loadSyncRows({ db, status: UNCONFIRMED, olderThan: cutoff })).slice(0, opts.batch);
+  const stats = await settleRows({
+    db, rows: live, fromStatus: UNCONFIRMED, opts, lpReader, now, alert, label: '',
+  });
+
+  if (!opts.legacyEnabled) return stats;
+
+  // The legacy backfill rides the same tick. Oldest first, so the incident's
+  // earliest writes — the ones a rep is most likely to have gone looking for —
+  // are settled first.
+  const legacyRows = (await loadSyncRows({ db, status: 'synced', unverifiedOnly: true })).slice(0, opts.legacyBatch);
+  if (!legacyRows.length) return stats;
+
+  const legacy = await settleRows({
+    db, rows: legacyRows, fromStatus: 'synced', opts, lpReader, now, alert, label: '(legacy)',
+  });
+
+  return {
+    checked: stats.checked + legacy.checked,
+    verified: stats.verified + legacy.verified,
+    missing: stats.missing + legacy.missing,
+    failed: stats.failed + legacy.failed,
+    unread: stats.unread + legacy.unread,
+    skipped: false,
+    legacy,
+  };
 }
 
 export default {
