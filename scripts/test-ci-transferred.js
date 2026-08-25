@@ -163,6 +163,25 @@ test('a genuinely absent recording is still reported as absent', () => {
   );
 });
 
+test('a folder we cannot READ is not a transfer verdict either', () => {
+  // Same principle as the UNKNOWN case below, one step further in. The listing
+  // succeeded and held 312 .wav files; not one of their names parsed, so
+  // list() dropped them all and handed back the same [] an empty folder gives.
+  // The transfer marker on this row is true, but reporting 'transferred' would
+  // file a folder-wide failure under a per-call cause and hide it — and the
+  // folder is unreadable for every OTHER call in it too, transferred or not.
+  const stats = { same: { wav: 312, described: 0, unparseable: 312, unparseableNames: [] } };
+  const d = diagnoseCall(TRANSFERRED_CALL, { same: [], prev: [], next: [] }, 180, stats);
+  assert.equal(d.verdict, VERDICTS.FILENAME_UNPARSEABLE);
+});
+
+test('without listing stats, a transferred call in an empty folder is TRANSFERRED', () => {
+  // The precedence above costs nothing when the counts are absent: a caller
+  // that cannot see inside list() falls through to the established verdict.
+  const d = diagnoseCall(TRANSFERRED_CALL, { same: [], prev: [], next: [] }, 180, null);
+  assert.equal(d.verdict, VERDICTS.TRANSFERRED);
+});
+
 test('an unreadable archive is still UNKNOWN, never a transfer', () => {
   // We could not look. That must never become a conclusion about the archive,
   // and a transfer marker on the row does not change that we could not look.

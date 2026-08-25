@@ -51,10 +51,18 @@ const LATE_CALL = {
   call_start: '2026-08-22T00:30:00.000Z',
 };
 
-/** A recording as describeRecording returns it. */
+/**
+ * A recording as describeRecording ACTUALLY returns it.
+ *
+ * The fields are `sourcePath` and `sourceFilename` — see parseRecordingPath in
+ * src/ci/filenames.js. This fixture previously said `fullPath`/`fileName`,
+ * mirroring the diagnostic's own mistake rather than the real shape, which is
+ * why every `path` in a live /ci/diagnose-recordings report came back null and
+ * no test noticed.
+ */
 const rec = (over = {}) => ({
-  fullPath: '/Five9/Recordings/DIAL ASAP/8_21_2026/4436170733 by cdeer @ 7_30_00 PM.wav',
-  fileName: '4436170733 by cdeer @ 7_30_00 PM.wav',
+  sourcePath: '/Five9/Recordings/DIAL ASAP/8_21_2026/4436170733 by cdeer @ 7_30_00 PM.wav',
+  sourceFilename: '4436170733 by cdeer @ 7_30_00 PM.wav',
   campaignDir: 'DIAL ASAP',
   ani: '4436170733',
   recordedAt: new Date('2026-08-22T00:30:00.000Z'),
@@ -113,6 +121,31 @@ test('the right folder with the right number but the wrong time is outside_windo
   assert.match(d.detail, /window is 180s/);
 });
 
+test('a FULL folder whose filenames will not parse is NOT reported as empty', () => {
+  // The whole reason this verdict exists. list() drops a file it cannot parse
+  // and returns [], exactly as it does for a folder holding nothing — so
+  // without the listing's own counts these two are the same value, and the
+  // report tells Mark that Five9 stopped recording when it did no such thing.
+  const stats = {
+    same: {
+      wav: 312,
+      described: 0,
+      unparseable: 312,
+      unparseableNames: ['4436170733 by cdeer @ 7_30_00 PMB6A58CED4F52462300000002867137.wav'],
+    },
+  };
+  const d = diagnoseCall(LATE_CALL, { same: [], prev: [], next: [] }, 180, stats);
+  assert.equal(d.verdict, VERDICTS.FILENAME_UNPARSEABLE);
+  assert.match(d.detail, /312 \.wav file\(s\)/);
+  assert.match(d.detail, /NOT ONE parsed/);
+});
+
+test('without listing stats the empty-folder verdict is unchanged', () => {
+  // A caller that cannot see inside list() must not pretend it can.
+  const d = diagnoseCall(LATE_CALL, { same: [], prev: [], next: [] }, 180, null);
+  assert.equal(d.verdict, VERDICTS.CAMPAIGN_DIR_EMPTY);
+});
+
 test('an empty campaign folder is a Five9 config question, not a code one', () => {
   const d = diagnoseCall(LATE_CALL, { same: [], prev: [], next: [] });
   assert.equal(d.verdict, VERDICTS.CAMPAIGN_DIR_EMPTY);
@@ -120,7 +153,7 @@ test('an empty campaign folder is a Five9 config question, not a code one', () =
 });
 
 test('a populated folder with no file for this number is its own verdict', () => {
-  const other = rec({ ani: '7273302574', fullPath: '/x/other.wav' });
+  const other = rec({ ani: '7273302574', sourcePath: '/x/other.wav' });
   const d = diagnoseCall(LATE_CALL, { same: [other], prev: [], next: [] });
   assert.equal(d.verdict, VERDICTS.NO_FILE_FOR_NUMBER);
   assert.match(d.detail, /none for 4436170733/);

@@ -69,6 +69,16 @@ export const VERDICTS = Object.freeze({
   OUTSIDE_WINDOW: 'outside_window',
   /** The campaign folder itself is absent or empty for that date. */
   CAMPAIGN_DIR_EMPTY: 'campaign_dir_empty',
+  /**
+   * The folder is FULL and we could not read a single filename in it.
+   *
+   * Deliberately NOT folded into CAMPAIGN_DIR_EMPTY, because the two are the
+   * same value at every call site — adapter.list() drops a file it cannot
+   * parse and returns `[]`, exactly as it does for a folder holding nothing.
+   * Collapsing them is what let a filename-format change read as "Five9 stopped
+   * recording" and sent an investigation at four causes that were all innocent.
+   */
+  FILENAME_UNPARSEABLE: 'filename_unparseable',
   /** It is right there and should have matched — the matcher, not retrieval. */
   PRESENT_SHOULD_HAVE_MATCHED: 'present_should_have_matched',
   /**
@@ -171,8 +181,14 @@ export function candidateDateDirs(callStart, offsetMin) {
  *                                 MISSING key means that listing failed, which
  *                                 is different from an empty array
  * @param {number} windowSeconds   the ingest match window
+ * @param {object} [stats]         { same, prev, next } listing reports from the
+ *                                 adapter's onStats hook. OPTIONAL: without it
+ *                                 this behaves exactly as before, because a
+ *                                 caller that cannot see inside list() has no
+ *                                 way to tell an empty folder from an unreadable
+ *                                 one and must not pretend otherwise.
  */
-export function diagnoseCall(call, listings, windowSeconds = 180) {
+export function diagnoseCall(call, listings, windowSeconds = 180, stats = null) {
   const wanted = last10(call?.customer_phone || call?.ani);
   const same = listings?.same;
   const prev = listings?.prev;
@@ -192,9 +208,9 @@ export function diagnoseCall(call, listings, windowSeconds = 180) {
     if (m.call) {
       return {
         verdict: VERDICTS.PRESENT_SHOULD_HAVE_MATCHED,
-        detail: `${rec.fileName ?? rec.fullPath} matched on re-run (${m.reason})`,
+        detail: `${rec.sourceFilename ?? rec.sourcePath} matched on re-run (${m.reason})`,
         wanted,
-        path: rec.fullPath ?? null,
+        path: rec.sourcePath ?? null,
       };
     }
   }
@@ -212,7 +228,7 @@ export function diagnoseCall(call, listings, windowSeconds = 180) {
           + `${seconds == null ? '' : `, ${Math.round(seconds)}s from call_start`}`
           + ' — ingest lists only one directory, so it never saw this',
         wanted,
-        path: rec.fullPath ?? null,
+        path: rec.sourcePath ?? null,
       };
     }
   }
@@ -230,11 +246,40 @@ export function diagnoseCall(call, listings, windowSeconds = 180) {
         ? `nearest file for this number is ${Math.round(nearest.s)}s away, window is ${windowSeconds}s`
         : 'files exist for this number but none could be timed',
       wanted,
-      path: nearest?.r?.fullPath ?? null,
+      path: nearest?.r?.sourcePath ?? null,
     };
   }
 
-  // 4. Nothing found for this number anywhere we looked. BEFORE concluding
+  // 4. WE COULD NOT READ THE FOLDER. The listing succeeded, it held .wav
+  //    files, and not one of their names parsed — so list() dropped every one
+  //    and returned the same `[]` an empty folder returns.
+  //
+  //    This is checked ahead of every remaining verdict, INCLUDING transferred,
+  //    for the same reason UNKNOWN is checked first: it is a "we could not
+  //    look" answer, not a finding about this call. The verdicts below all
+  //    assert something about one call's audio; this one says the folder is
+  //    unreadable for every call in it, and a systemic signal that gets filed
+  //    under a per-call cause is a signal nobody sees. A transferred call in an
+  //    unreadable folder is still transferred — but reporting that first would
+  //    hide the fact that we cannot read the folder at all, which is the
+  //    larger and more urgent finding.
+  //
+  //    Only reachable when the listing reports its own counts. Without stats
+  //    this is invisible and the old empty-folder verdict stands, because a
+  //    caller that cannot see inside list() must not pretend it can.
+  const wavCount = Number(stats?.same?.wav ?? 0);
+  if (!same.length && wavCount > 0) {
+    const sample = (stats.same.unparseableNames || []).slice(0, 3);
+    return {
+      verdict: VERDICTS.FILENAME_UNPARSEABLE,
+      detail: `${wavCount} .wav file(s) under campaign '${call.campaign}' for that date and NOT ONE parsed`
+        + ' — the archive has the audio; parseRecordingFilename() no longer recognises the name'
+        + (sample.length ? `. e.g. ${sample.join(' | ')}` : ''),
+      wanted,
+    };
+  }
+
+  // 5. Nothing found for this number anywhere we looked. BEFORE concluding
   //    retrieval failed, ask whether there was ever anything of ours to
   //    retrieve: a transferred call's conversation continued on a vendor
   //    platform and Five9 holds only its own leg.
@@ -255,7 +300,7 @@ export function diagnoseCall(call, listings, windowSeconds = 180) {
     };
   }
 
-  // 5. The folder is empty — the campaign dir is wrong, or Five9 filed the
+  // 6. The folder is empty — the campaign dir is wrong, or Five9 filed the
   //    audio somewhere else entirely.
   if (!same.length) {
     return {
@@ -310,6 +355,13 @@ export function recommendation(summary) {
   if (d.verdict === VERDICTS.PRESENT_SHOULD_HAVE_MATCHED && share >= 0.5) {
     return `The audio is where ingest looked and matches on re-run (${d.count} of ${summary.diagnosed}). `
       + `This is NOT a retrieval gap — investigate the fetch stage's listing or its wait/backoff, not the archive.`;
+  }
+  if (d.verdict === VERDICTS.FILENAME_UNPARSEABLE && share >= 0.5) {
+    return `CONFIRMED: the archive HAS the audio and we cannot read the filenames. `
+      + `${d.count} of ${summary.diagnosed} sit in folders holding .wav files of which none parse. `
+      + `This is a filename-format change, not a missing recording — do NOT open a vendor ticket and do not `
+      + `touch the timestamp arithmetic or the listing cache. Fix parseRecordingFilename() in `
+      + `src/ci/filenames.js, then requeue; the audio has been there all along.`;
   }
   if (d.verdict === VERDICTS.TRANSFERRED && share >= 0.5) {
     return `${d.count} of ${summary.diagnosed} were TRANSFERRED to a 3rd party — the conversation continued off `
@@ -444,9 +496,17 @@ export async function diagnoseRecordingGap({
   // otherwise, and this lists up to three directories per call.
   for (const call of withAudio) {
     const listings = {};
+    // What each listing DISCARDED, keyed the same way. Without this, a folder
+    // of unreadable filenames and an empty folder are the same `[]` and the
+    // verdict below cannot separate them.
+    const stats = {};
     for (const { label, dir } of candidateDateDirs(call.call_start, cfg.recordingTzOffsetMin)) {
       try {
-        listings[label] = await adapter.list({ campaign: call.campaign, date: dir });
+        listings[label] = await adapter.list({
+          campaign: call.campaign,
+          date: dir,
+          onStats: (s) => { stats[label] = s; },
+        });
       } catch (err) {
         // Leave the key ABSENT rather than setting []. An empty array means
         // "the folder is empty"; a missing key means "we could not look", and
@@ -454,7 +514,7 @@ export async function diagnoseRecordingGap({
         console.warn(`${LOG} list failed for ${call.campaign}/${dir}: ${err.message}`);
       }
     }
-    const d = diagnoseCall(call, listings, cfg.recordingMatchWindowS ?? 180);
+    const d = diagnoseCall(call, listings, cfg.recordingMatchWindowS ?? 180, stats);
     results.push({
       five9_call_id: call.five9_call_id,
       call_start: call.call_start,

@@ -23,6 +23,7 @@ import { reconcileDay, pipelineHealth } from './reconcile.js';
 import { auditLpNotes } from './verify.js';
 import { releaseShadowSyncs } from './shadow-release.js';
 import { diagnoseRecordingGap } from './recording-diagnosis.js';
+import { traceFetch } from './fetch-trace.js';
 import {
   runDiscoveryTick, discoverySchedulerStatus,
 } from '../jobs/ci-discovery-scheduler.js';
@@ -578,6 +579,41 @@ export function registerCiRoutes(app, authenticate) {
   });
 
   /**
+   * GET /ci/trace-fetch?call_id=... — trace ONE call through the fetch stage.
+   *
+   * READ ONLY on both sides, and narrower than /ci/diagnose-recordings on
+   * purpose. That endpoint reports a verdict per call derived from what
+   * adapter.list() RETURNS; this one reports the counts from INSIDE the
+   * listing — how many entries the server sent, how many were .wav, and how
+   * many .wav files were dropped because their filenames would not parse.
+   *
+   * That last number is the one no existing surface can produce. A folder of
+   * three hundred unreadable filenames and an empty folder are the same value
+   * at every call site, `[]`, which is why a full archive can report as empty
+   * and stay that way for days.
+   *
+   * Accepts call_id (ci_calls.id) or five9_call_id.
+   */
+  app.get('/ci/trace-fetch', ...guards, async (req, res) => {
+    try {
+      const callId = String(req.query?.call_id || '').trim() || null;
+      const five9CallId = String(req.query?.five9_call_id || '').trim() || null;
+      if (!callId && !five9CallId) {
+        throw new BadRequest('call_id or five9_call_id query parameter is required');
+      }
+      const adapter = createSftpAdapter({ cfg: getConfig() });
+      res.json(await traceFetch({ db: supabase, adapter, callId, five9CallId }));
+    } catch (err) {
+      if (err instanceof BadRequest) {
+        res.status(400).json({ ok: false, error: err.message });
+        return;
+      }
+      console.error(`${LOG} GET /ci/trace-fetch failed: ${err.message}`);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  /**
    * POST /ci/tick — claim a batch and advance each call one stage.
    * Also driven by the internal interval; the endpoint is the n8n
    * belt-and-suspenders trigger.
@@ -772,7 +808,8 @@ export function registerCiRoutes(app, authenticate) {
   console.log(
     `${LOG} Routes: POST /ci/discover, POST /ci/tick, POST /ci/backfill,` +
     ` GET /ci/review, POST /ci/review/:call_id/resolve,` +
-    ` POST /ci/reconcile, GET /ci/health, GET /ci/rec/:token (PUBLIC by design)` +
+    ` POST /ci/reconcile, GET /ci/health, GET /ci/trace-fetch,` +
+    ` GET /ci/rec/:token (PUBLIC by design)` +
     `${guards.length ? ' (authenticated)' : ' (UNAUTHENTICATED — no middleware passed)'}` +
     ` [mode=${cfg.mode}, sftp=${cfg.sftp.readOnly ? 'read-only' : 'WRITABLE — MISCONFIGURED'}]`,
   );
