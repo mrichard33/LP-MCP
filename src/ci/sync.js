@@ -137,9 +137,12 @@ export async function markSynced(db, id, { externalRef = null, response = null }
  * would release the idempotency key, and a retry after a request that actually
  * landed would double-post.
  */
-export async function markSyncFailed(db, row, err, cfg = getConfig()) {
+export async function markSyncFailed(db, row, err, cfg = getConfig(), { permanent = false } = {}) {
   const attempts = (row.attempts || 0) + 1;
-  const terminal = attempts >= cfg.maxAttempts;
+  // `permanent` is for a failure that retrying cannot fix — a CRM telling us
+  // the contact does not exist. Burning five attempts and a backoff curve on
+  // that only delays the review a human has to do anyway.
+  const terminal = permanent || attempts >= cfg.maxAttempts;
   const { error } = await db.from('ci_syncs').update({
     status: terminal ? 'failed' : 'pending',
     error: String(err?.message || err).slice(0, 500),
@@ -198,6 +201,61 @@ export async function syncToLp(call, summary, match, { db = supabase, cfg = getC
 }
 
 /**
+ * What did addGHLNote actually do?
+ *
+ * ── WHY THIS EXISTS ────────────────────────────────────────────────────────
+ * addGHLNote does NOT signal failure by throwing. It returns four different
+ * things (src/ghl.js), and the write site used to treat all four as success:
+ *
+ *   data object          the note was written
+ *   {skipped:true,...}   an identical note is already on the contact
+ *   'not_found'          the contact is unreachable — PERMANENT, never retry
+ *   null                 GHL disabled, empty body, or a transient failure
+ *
+ * `markSynced` was called unconditionally, so a contact that no longer exists
+ * and a GHL outage both recorded status='synced' with a null external_ref —
+ * indistinguishable from a delivered note. Nothing retried, nothing alerted,
+ * and the review queue stayed empty while notes silently went nowhere. This is
+ * the same class of defect as the missing client default: a non-exception
+ * result that means "no write happened" being read as "write happened".
+ *
+ * 'not_found' is a TRUTHY STRING, so it must be tested before any truthiness
+ * check — the ordering ghl.js's own header warns about.
+ *
+ * A duplicate IS delivery. The note is on the contact; the dedupe guard only
+ * stopped us adding a second copy. Recording that as a failure would retry
+ * forever against a guard designed to keep winning.
+ *
+ * @returns {{delivered: boolean, permanent?: boolean, reason?: string,
+ *            message?: string, externalRef?: string|null}}
+ */
+export function classifyGhlNoteResult(resp) {
+  // Sentinel FIRST — truthy string.
+  if (resp === 'not_found') {
+    return {
+      delivered: false,
+      permanent: true,
+      reason: 'contact_not_found',
+      message: 'GHL contact not found — the note has nowhere to go (permanent)',
+    };
+  }
+  if (resp == null) {
+    return {
+      delivered: false,
+      permanent: false,
+      reason: 'ghl_unavailable',
+      message: 'GHL returned no result — disabled, rate-limited, or a transient failure',
+    };
+  }
+  if (resp.skipped === true) {
+    // Already on the record. Delivered, and worth naming so the row does not
+    // read as though this pipeline wrote it.
+    return { delivered: true, reason: 'duplicate_note', externalRef: resp.matched_note_id ?? null };
+  }
+  return { delivered: true, externalRef: resp.id ?? resp.note?.id ?? null };
+}
+
+/**
  * Push the note to GoHighLevel.
  *
  * Contact creation is a THIRD gate on top of live+ghlWrites, because creating
@@ -240,9 +298,23 @@ export async function syncToGhl(call, summary, match, { db = supabase, cfg = get
 
   try {
     const resp = await ghlClient.addGHLNote(contactId, noteBody);
-    await markSynced(db, claim.row.id, { externalRef: resp?.id ?? resp?.note?.id ?? null, response: shapeOf(resp) });
-    console.log(`${LOG} call=${call.id} target=ghl synced`);
-    return { target, synced: true };
+    const verdict = classifyGhlNoteResult(resp);
+
+    if (verdict.delivered) {
+      await markSynced(db, claim.row.id, { externalRef: verdict.externalRef, response: shapeOf(resp) });
+      console.log(`${LOG} call=${call.id} target=ghl synced${verdict.reason ? ` (${verdict.reason})` : ''}`);
+      return { target, synced: true, ...(verdict.reason ? { reason: verdict.reason } : {}) };
+    }
+
+    // NOT delivered, and addGHLNote did not throw to say so — see
+    // classifyGhlNoteResult. Route it through the same failure bookkeeping a
+    // thrown error gets, so the row carries the reason and the retry policy.
+    const f = await markSyncFailed(db, claim.row, new Error(verdict.message), cfg, {
+      permanent: verdict.permanent,
+    });
+    console.error(`${LOG} call=${call.id} target=ghl NOT DELIVERED (${verdict.reason}`
+      + `${verdict.permanent ? ', permanent' : `, attempt ${f.attempts}`}): ${verdict.message}`);
+    return { target, failed: true, terminal: f.terminal, reason: verdict.reason, error: verdict.message };
   } catch (err) {
     const f = await markSyncFailed(db, claim.row, err, cfg);
     console.error(`${LOG} call=${call.id} target=ghl FAILED (attempt ${f.attempts}): ${err.message}`);
@@ -351,5 +423,5 @@ export function shapeOf(resp) {
 
 export default {
   syncCall, syncToLp, syncToGhl, tierWritable, claimSync, markSynced, markSyncFailed,
-  defaultLpClient, defaultGhlClient,
+  defaultLpClient, defaultGhlClient, classifyGhlNoteResult,
 };
