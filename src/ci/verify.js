@@ -176,7 +176,12 @@ export function verdictOf(acc) {
 export async function loadSyncRows({ db = supabaseDefault, status = 'synced', olderThan = null, unverifiedOnly = false } = {}) {
   let q = db
     .from('ci_syncs')
-    .select('id, call_id, status, synced_at, created_at, external_ref, verified_at, verify_attempts, ci_calls(lp_cst_id, five9_call_id)')
+    // ci_calls carries five9_call_id and NOT lp_cst_id — the prospect id lives
+    // on ci_matches (worker.js writes it there at match time). Asking ci_calls
+    // for it made PostgREST reject the whole select, which made loadSyncRows
+    // throw on EVERY call and silently disabled the entire verify sweep from
+    // the day it shipped. See the schema assertion in the tests.
+    .select('id, call_id, status, synced_at, created_at, external_ref, verified_at, verify_attempts, ci_calls(five9_call_id)')
     .eq('target', 'lp')
     .eq('status', status)
     .order('synced_at', { ascending: true });
@@ -189,17 +194,20 @@ export async function loadSyncRows({ db = supabaseDefault, status = 'synced', ol
   const { data: syncs, error } = await q;
   if (error) throw new Error(`ci_syncs read failed: ${error.message}`);
 
+  // ci_matches carries BOTH the note target we aimed at and the prospect id we
+  // have to read back, so one query serves both.
   const callIds = [...new Set((syncs || []).map((s) => s.call_id))];
-  const targetByCall = new Map();
+  const matchByCall = new Map();
   for (let i = 0; i < callIds.length; i += 200) {
     const { data: matches, error: mErr } = await db
-      .from('ci_matches').select('call_id, evidence').in('call_id', callIds.slice(i, i + 200));
+      .from('ci_matches').select('call_id, lp_cst_id, evidence').in('call_id', callIds.slice(i, i + 200));
     if (mErr) throw new Error(`ci_matches read failed: ${mErr.message}`);
-    for (const m of matches || []) targetByCall.set(m.call_id, m.evidence?.note_target ?? {});
+    for (const m of matches || []) matchByCall.set(m.call_id, m);
   }
 
   return (syncs || []).map((s) => {
-    const t = targetByCall.get(s.call_id) ?? {};
+    const m = matchByCall.get(s.call_id) ?? {};
+    const t = m.evidence?.note_target ?? {};
     return {
       sync_id: s.id,
       call_id: s.call_id,
@@ -209,7 +217,7 @@ export async function loadSyncRows({ db = supabaseDefault, status = 'synced', ol
       verified_at: s.verified_at ?? null,
       verify_attempts: s.verify_attempts ?? 0,
       five9_call_id: s.ci_calls?.five9_call_id ?? null,
-      lp_cst_id: s.ci_calls?.lp_cst_id ?? null,
+      lp_cst_id: m.lp_cst_id ?? null,
       rectype: t.rectype ?? 'unknown',
       recid: t.recid ?? null,
       marker: markerFor(s.call_id),

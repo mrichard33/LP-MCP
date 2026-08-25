@@ -17,11 +17,12 @@ import supabase from '../supabase.js';
 import { getConfig } from './config.js';
 import { discoverCalls } from './discovery.js';
 import { runTick } from './worker.js';
-import { createManualAdapter, storeAudio, sha256Hex, describeRecording, ensureLinkToken, transcodeAndStoreMp3 } from './recordings.js';
+import { createSftpAdapter, createManualAdapter, storeAudio, sha256Hex, describeRecording, ensureLinkToken, transcodeAndStoreMp3 } from './recordings.js';
 import { CI_AUDIO_BUCKET } from '../../scripts/setup-ci-audio-bucket.js';
 import { reconcileDay, pipelineHealth } from './reconcile.js';
 import { auditLpNotes } from './verify.js';
 import { releaseShadowSyncs } from './shadow-release.js';
+import { diagnoseRecordingGap } from './recording-diagnosis.js';
 import {
   runDiscoveryTick, discoverySchedulerStatus,
 } from '../jobs/ci-discovery-scheduler.js';
@@ -537,6 +538,33 @@ export function registerCiRoutes(app, authenticate) {
       res.json(await releaseShadowSyncs({ db: supabase, target, execute }));
     } catch (err) {
       console.error(`${LOG} POST /ci/release-shadow-syncs failed: ${err.message}`);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  /**
+   * GET /ci/diagnose-recordings?limit=25 — why calls with audio got no summary.
+   *
+   * READ ONLY on both sides: it reads ci_calls and it LISTS the recording
+   * archive. Nothing is fetched, re-ingested, re-queued or changed.
+   *
+   * `recording_missing` is the largest review reason, and 93 of those have a
+   * Call Log row saying audio EXISTS — plus 20 ambiguous, so 113 recoverable
+   * summaries. Every recording that WAS ingested linked correctly (0 unlinked
+   * across every campaign), so this is a retrieval gap, not a matching one.
+   *
+   * The verdicts name four different fixes and are deliberately not collapsed
+   * into "missing". `unknown` means the archive could not be read and is never
+   * counted as a cause.
+   */
+  app.get('/ci/diagnose-recordings', ...guards, async (req, res) => {
+    try {
+      const parsed = parseInt(req.query?.limit, 10);
+      const limit = Number.isFinite(parsed) && parsed > 0 ? parsed : 25;
+      const adapter = createSftpAdapter({ cfg: getConfig() });
+      res.json(await diagnoseRecordingGap({ db: supabase, adapter, limit }));
+    } catch (err) {
+      console.error(`${LOG} GET /ci/diagnose-recordings failed: ${err.message}`);
       res.status(500).json({ ok: false, error: err.message });
     }
   });
