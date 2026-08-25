@@ -246,10 +246,13 @@ function sweepDb(syncRows, matchRows, legacyRows = []) {
 const syncRow = (over = {}) => ({
   id: 'sync-1', call_id: CALL_ID, status: UNCONFIRMED, synced_at: SETTLED,
   created_at: SETTLED, external_ref: null, verify_attempts: 0,
-  ci_calls: { lp_cst_id: '244594', five9_call_id: '300000010262436' },
+  ci_calls: { five9_call_id: '300000010262436' },
   ...over,
 });
-const matchRow = (rectype = 'cst', recid = 244594) => ({ call_id: CALL_ID, evidence: { note_target: { rectype, recid } } });
+// lp_cst_id lives HERE, on ci_matches — not on ci_calls. Getting that wrong is
+// what silently disabled the sweep through two merged PRs.
+const matchRow = (rectype = 'cst', recid = 244594, cst = '244594') =>
+  ({ call_id: CALL_ID, lp_cst_id: cst, evidence: { note_target: { rectype, recid } } });
 
 test('a note FOUND in LP is promoted, and captures the id AddNotes never returns', async () => {
   const db = sweepDb([syncRow()], [matchRow()]);
@@ -339,7 +342,7 @@ test('several notes on ONE prospect cost ONE LP read', async () => {
   const second = '77777777-0000-4000-8000-000000000000';
   const db = sweepDb(
     [syncRow(), syncRow({ id: 'sync-2', call_id: second })],
-    [matchRow(), { call_id: second, evidence: { note_target: { rectype: 'cst', recid: 244594 } } }],
+    [matchRow(), { call_id: second, lp_cst_id: '244594', evidence: { note_target: { rectype: 'cst', recid: 244594 } } }],
   );
   let reads = 0;
   const stats = await verifyPendingLpNotes({
@@ -354,7 +357,7 @@ test('several notes on ONE prospect cost ONE LP read', async () => {
 });
 
 test('a row with no prospect id is UNREAD, never missing', async () => {
-  const db = sweepDb([syncRow({ ci_calls: { lp_cst_id: null, five9_call_id: '1' } })], [matchRow('ils', 568072)]);
+  const db = sweepDb([syncRow()], [matchRow('ils', 568072, null)]);
   const stats = await verifyPendingLpNotes({ db, now: () => NOW, lpReader: async () => [prospectWith()] });
   assert.equal(stats.unread, 1);
   assert.equal(stats.missing, 0);
@@ -386,12 +389,75 @@ test('the sweep is a no-op when disabled, and never guesses without a reader', a
   assert.equal(db.updates.length, 0);
 });
 
+// ─── the columns actually exist ─────────────────────────────────────────────
+
+/**
+ * The REAL schema, as of sql/061-072. Asserted against a live database on
+ * 2026-08-25 (information_schema.columns), not copied from memory.
+ *
+ * This exists because the doubles above accept any select string, and that blind
+ * spot shipped a bug: loadSyncRows asked ci_calls for `lp_cst_id`, which lives on
+ * ci_matches. PostgREST rejects the whole select, so loadSyncRows threw on EVERY
+ * call and the verify sweep silently never ran — through two merged PRs, with a
+ * green suite the whole way.
+ */
+const SCHEMA = {
+  ci_syncs: ['id', 'call_id', 'target', 'status', 'idempotency_key', 'note_body', 'request',
+    'response', 'error', 'attempts', 'external_ref', 'synced_at', 'created_at',
+    'verified_at', 'verify_attempts'],
+  ci_calls: ['id', 'five9_call_id', 'call_start', 'campaign', 'customer_phone', 'ani', 'dnis',
+    'direction', 'agent_name', 'agent_username', 'team', 'status', 'eligible',
+    'review_reason', 'raw_metadata', 'created_at'],
+  ci_matches: ['id', 'call_id', 'lp_cst_id', 'lp_lds_id', 'ghl_contact_id', 'method', 'tier',
+    'confidence', 'candidates', 'evidence', 'decided_by'],
+};
+
+/** Parse a PostgREST select string into { table: [cols] }, embeds included. */
+function columnsOf(select, table) {
+  const out = {};
+  const push = (t, c) => { (out[t] ||= []).push(c); };
+  let rest = String(select);
+  // Pull out embedded relations: name(col, col)
+  for (const m of rest.matchAll(/(\w+)\(([^)]*)\)/g)) {
+    for (const c of m[2].split(',')) if (c.trim()) push(m[1], c.trim());
+  }
+  rest = rest.replace(/\w+\([^)]*\)/g, '');
+  for (const c of rest.split(',')) if (c.trim()) push(table, c.trim());
+  return out;
+}
+
+test('THE BUG THAT SHIPPED: every column loadSyncRows selects must exist', async () => {
+  // A double that ignores the select string cannot catch a column that is not
+  // there. This reads the source and checks it against the real schema, which is
+  // the only thing in the suite that would have failed on the broken version.
+  const src = (await import('../src/ci/verify.js')).loadSyncRows.toString();
+  const selects = [...src.matchAll(/\.from\('(\w+)'\)[\s\S]{0,400}?\.select\('([^']+)'\)/g)];
+  assert.ok(selects.length >= 2, 'expected the ci_syncs and ci_matches selects');
+
+  for (const [, table, select] of selects) {
+    for (const [t, cols] of Object.entries(columnsOf(select, table))) {
+      assert.ok(SCHEMA[t], `select names unknown table '${t}'`);
+      for (const c of cols) {
+        assert.ok(SCHEMA[t].includes(c),
+          `${t}.${c} does not exist — PostgREST rejects the WHOLE select, so this silently disables the sweep`);
+      }
+    }
+  }
+});
+
+test('lp_cst_id comes from ci_matches, which is the table that has it', async () => {
+  const src = (await import('../src/ci/verify.js')).loadSyncRows.toString();
+  assert.match(src, /ci_matches'\)\.select\('call_id, lp_cst_id, evidence'\)/);
+  assert.equal(/ci_calls\([^)]*lp_cst_id/.test(src), false,
+    'ci_calls has no lp_cst_id — asking for it breaks the entire select');
+});
+
 // ─── the legacy backfill: the 286 settle themselves ─────────────────────────
 
 const legacyRow = (over = {}) => ({
   id: 'legacy-1', call_id: CALL_ID, status: 'synced', synced_at: '2026-08-24T22:29:23.018Z',
   created_at: '2026-08-24T22:29:23.018Z', external_ref: null, verified_at: null, verify_attempts: 0,
-  ci_calls: { lp_cst_id: '244594', five9_call_id: '300000010259899' },
+  ci_calls: { five9_call_id: '300000010259899' },
   ...over,
 });
 
