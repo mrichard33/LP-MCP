@@ -21,6 +21,9 @@
  * text across two systems with no way to redact it later.
  */
 
+import { last10 } from './time.js';
+import { normalizeAgentField } from './teams.js';
+
 /** §7 outcome → the label a human reads. */
 const OUTCOME_LABELS = {
   appointment_set: 'Appointment set',
@@ -132,6 +135,69 @@ export function formatRecordingLine({ token, expiresAt, extraSegments = 0, linkB
 }
 
 /**
+ * A phone number as a human reads it: '2394930774' -> '(239) 493-0774'.
+ *
+ * Returns null — so the caller omits its line entirely — for anything that is
+ * not a full 10-digit number. A partial number in a CRM note is worse than no
+ * number: a rep will dial it.
+ */
+export function formatPhoneLine(phone) {
+  const digits = last10(phone);
+  if (!digits) return null;
+  return `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}`;
+}
+
+/**
+ * The header's agent segment.
+ *
+ * ── THE CASE THIS EXISTS FOR ───────────────────────────────────────────────
+ * 84 calls carried NO agent identity at all — agent_username and agent_name
+ * both null. They were not agents we failed to map. 83 arrived on DNIS
+ * 2394930774 ('Canvass Confirmation - Inbound'), every one transferred, and
+ * averaged 213 seconds; the 84th is the same shape on Main Number. A caller
+ * reached a LINE and was handed to a third party. No Reece agent was ever on
+ * the call.
+ *
+ * Rendering those as `Agent: unknown agent (unassigned)` — what this used to
+ * do — puts a phantom colleague on a customer's record. A rep reading it asks
+ * who took the call and starts looking for a person who does not exist. So
+ * the segment says plainly that no Reece agent was on it, and names the line
+ * instead: the DNIS on an inbound call (the number it came in ON) and the ANI
+ * on an outbound one (the number presented OUT).
+ *
+ * ── AND THE MILDER CASE ────────────────────────────────────────────────────
+ * An agent we DO know, on a team we do not, prints the name with no
+ * parenthetical. It used to print '(unassigned)', which is a placeholder
+ * masquerading as a team name. Saying nothing about the team is the honest
+ * rendering of knowing nothing about it.
+ */
+export function formatAgentSegment(call, agentLabel = null) {
+  const identified = Boolean(
+    normalizeAgentField(call?.agent_username) || normalizeAgentField(call?.agent_name),
+  );
+
+  if (!identified) {
+    // The direction must be KNOWN, not assumed. On an inbound call the ANI is
+    // the customer's own number; on an outbound one it is a Reece
+    // local-presence caller ID. Defaulting an absent direction to 'outbound' —
+    // which the header's own direction word does, for display — would print
+    // the CUSTOMER's number in the header of their own note on every inbound
+    // call whose direction Five9 left blank. §9 excludes customer PII from
+    // note text deliberately; this is the one place a header could leak it.
+    const direction = String(call?.direction || '').toLowerCase();
+    const line = direction.includes('inbound') ? formatPhoneLine(call?.dnis)
+      : direction.includes('outbound') ? formatPhoneLine(call?.ani)
+        : null;
+    return line ? `Agent: No Reece agent | Line: ${line}` : 'Agent: No Reece agent';
+  }
+
+  const agent = String(agentLabel ?? '').trim()
+    || call?.agent_name || call?.agent_username || 'unknown agent';
+  const team = call?.team && call.team !== 'unknown' ? call.team : null;
+  return team ? `Agent: ${agent} (${team})` : `Agent: ${agent}`;
+}
+
+/**
  * Compose the note body. Identical text for LP and GHL — one composer, so the
  * two CRMs can never drift into telling different stories about a call.
  *
@@ -154,11 +220,8 @@ export function formatRecordingLine({ token, expiresAt, extraSegments = 0, linkB
 export function composeNote(call, summary, link = null, agentLabel = null) {
   const analysis = summary?.output ?? {};
   const direction = String(call?.direction || '').toLowerCase().includes('inbound') ? 'inbound' : 'outbound';
-  const agent = String(agentLabel ?? '').trim()
-    || call?.agent_name || call?.agent_username || 'unknown agent';
-  const team = call?.team && call.team !== 'unknown' ? call.team : 'unassigned';
 
-  const header = `[AI CALL NOTE | ${formatEt(call?.call_start)} | ${direction} | Agent: ${agent} (${team}) | Outcome: ${outcomeLabel(analysis.outcome)}]`;
+  const header = `[AI CALL NOTE | ${formatEt(call?.call_start)} | ${direction} | ${formatAgentSegment(call, agentLabel)} | Outcome: ${outcomeLabel(analysis.outcome)}]`;
 
   const lines = [header];
   if (analysis.summary) lines.push(String(analysis.summary).trim());
@@ -200,6 +263,8 @@ export function idempotencyKey(callId, target) {
 export default {
   composeNote,
   idempotencyKey,
+  formatAgentSegment,
+  formatPhoneLine,
   outcomeLabel,
   formatEt,
   formatExpiryDate,

@@ -170,8 +170,17 @@ test('a DNC outcome is shouted, not softened', () => {
 });
 
 test('an unmapped agent or team degrades to a label, never to blank or "null"', () => {
+  // NO agent identity is not an unidentified agent: it means no Reece agent
+  // was on the call. This used to render 'Agent: unknown agent (unassigned)',
+  // which put a phantom colleague on a customer's record. It names the LINE
+  // now — the ANI here, because CALL is outbound.
   const note = composeNote({ ...CALL, agent_name: null, agent_username: null, team: 'unknown' }, SUMMARY);
-  assert.match(note, /Agent: unknown agent \(unassigned\)/);
+  assert.match(note, /Agent: No Reece agent \| Line: \(727\) 330-2574/);
+  assert.equal(/unassigned|unknown agent/.test(note), false);
+
+  // An agent we DO know, on a team we do not: the name, and no placeholder.
+  const knownAgent = composeNote({ ...CALL, team: 'unknown' }, SUMMARY);
+  assert.match(knownAgent, /Agent: John Manieri \| Outcome:/);
 });
 
 // ─── 1. SHADOW MAKES NO HTTP CALL ───────────────────────────────────────────

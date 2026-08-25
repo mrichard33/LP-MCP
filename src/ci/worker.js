@@ -25,6 +25,7 @@ import { createSftpAdapter, createManualAdapter, createListingCache, describeRec
 import { dateDirFor, last4, last10 } from './time.js';
 import { transcribeCall, createOpenAITranscriber, createStorageAudioLoader } from './transcribe.js';
 import { analyzeTranscript } from './analyze.js';
+import { blockingReviewFlags } from './analysis-schema.js';
 import { matchCall, loadCanvasserPhones } from './match.js';
 import { loadAgentMap } from './discovery.js';
 import { resolveAgentLabel } from './teams.js';
@@ -421,9 +422,16 @@ export async function stageAnalyze(call, { db = supabase, cfg = getConfig(), cal
   await insertCurrentSummary(db, call.id, result.row);
 
   const flags = result.row.review_flags || [];
-  if (flags.length > 0) {
-    await sendToReview(db, call, 'analyze', flags[0], { review_flags: flags, outcome: result.row.outcome });
-    return { outcome: 'review', reason: flags[0], review_flags: flags };
+  // Only the BLOCKING flags stop the call. An unresolved team does not: those
+  // calls had no Reece agent on them at all (see NON_BLOCKING_REVIEW_FLAGS),
+  // so waiting for a human to name the team waits for an answer that does not
+  // exist, and the customer's record gets nothing. The full flag list still
+  // goes into the detail either way — a reviewer must see everything that was
+  // raised, not just the one that happened to stop the call.
+  const blocking = blockingReviewFlags(flags);
+  if (blocking.length > 0) {
+    await sendToReview(db, call, 'analyze', blocking[0], { review_flags: flags, outcome: result.row.outcome });
+    return { outcome: 'review', reason: blocking[0], review_flags: flags };
   }
 
   await advance(db, call, 'analyze', 'analyzed', {
@@ -431,8 +439,13 @@ export async function stageAnalyze(call, { db = supabase, cfg = getConfig(), cal
     confidence: result.row.outcome_confidence,
     attempts: result.attempts,
     phone: last4(call.customer_phone || call.ani),
+    // The signal survives the unblocking. Without this the ci_events trail for
+    // a non-blocking flag would be indistinguishable from a call that raised
+    // nothing at all — the flag would live only in ci_summaries, and the
+    // moment it stopped parking it would stop being visible in the timeline.
+    ...(flags.length ? { review_flags: flags, blocked: false } : {}),
   });
-  return { outcome: 'advanced', to: 'analyzed' };
+  return { outcome: 'advanced', to: 'analyzed', ...(flags.length ? { review_flags: flags } : {}) };
 }
 
 /**
