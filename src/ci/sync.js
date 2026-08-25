@@ -18,6 +18,15 @@
  * that would have gone live, and flipping the flag changes one thing only —
  * whether the POST happens.
  *
+ * ── AND ONE GATE THAT IS NOT ABOUT PERMISSION ──────────────────────────────
+ * noteAgeVerdict() is checked alongside the write gate but answers a different
+ * question: not "are we allowed to write" but "is this note still worth
+ * writing". LP stamps a note with the date it was WRITTEN and cannot backdate
+ * it, so a three-day-old call posts as though the conversation happened today.
+ * See config.js maxNoteAgeHours. It is checked BEFORE claimSync so a skipped
+ * call does not burn its idempotency key — lower the gate later and the note
+ * can still post.
+ *
  * ── IDEMPOTENCY IS A DATABASE CONSTRAINT, NOT A CHECK ──────────────────────
  * The ci_syncs row is inserted BEFORE the API call, carrying a UNIQUE
  * idempotency_key. A duplicate attempt therefore fails on the constraint at
@@ -34,7 +43,7 @@
 import supabase from '../supabase.js';
 import { addNote as lpAddNote } from '../lp-client.js';
 import { addGHLNote } from '../ghl.js';
-import { getConfig, liveWrites, allowProbableLp, ghlCreateEnabled, nextRetryAt } from './config.js';
+import { getConfig, liveWrites, allowProbableLp, ghlCreateEnabled, nextRetryAt, noteAgeVerdict } from './config.js';
 import { composeNote, idempotencyKey } from './notes.js';
 import { WRITABLE_TIERS } from './match.js';
 
@@ -180,7 +189,7 @@ export async function markSyncFailed(db, row, err, cfg = getConfig(), { permanen
  *
  * @param {object} [opts.lpClient]  { addNote }; defaults to the REAL LP client
  */
-export async function syncToLp(call, summary, match, { db = supabase, cfg = getConfig(), lpClient = defaultLpClient, link = null, agentLabel = null } = {}) {
+export async function syncToLp(call, summary, match, { db = supabase, cfg = getConfig(), lpClient = defaultLpClient, link = null, agentLabel = null, now = new Date() } = {}) {
   const target = 'lp';
   const rectype = match?.evidence?.note_target?.rectype ?? null;
   const recid = match?.evidence?.note_target?.recid ?? null;
@@ -190,6 +199,15 @@ export async function syncToLp(call, summary, match, { db = supabase, cfg = getC
   }
   if (!tierWritable(match.tier, target, cfg)) {
     return { target, skipped: true, reason: `tier_${match.tier}_not_writable` };
+  }
+
+  // Age gate — BEFORE claimSync, deliberately. A skipped call must not burn
+  // its idempotency key: lower CALL_INTEL_MAX_NOTE_AGE_HOURS (or set it to 0)
+  // and the note can still post, because no row is holding the key.
+  const age = noteAgeVerdict(call, cfg, now);
+  if (age.tooOld) {
+    console.log(`${LOG} call=${call.id} target=lp SKIPPED too_old (${Math.round(age.ageHours)}h > ${age.limitHours}h) — LP cannot backdate a note`);
+    return { target, skipped: true, reason: 'call_too_old', age_hours: Math.round(age.ageHours) };
   }
 
   const noteBody = composeNote(call, summary, link, agentLabel);
@@ -310,7 +328,7 @@ export function classifyGhlNoteResult(resp) {
  *
  * @param {object} [opts.ghlClient]  { addGHLNote }; defaults to the REAL client
  */
-export async function syncToGhl(call, summary, match, { db = supabase, cfg = getConfig(), ghlClient = defaultGhlClient, link = null, agentLabel = null } = {}) {
+export async function syncToGhl(call, summary, match, { db = supabase, cfg = getConfig(), ghlClient = defaultGhlClient, link = null, agentLabel = null, now = new Date() } = {}) {
   const target = 'ghl';
   const contactId = match?.ghl_contact_id ?? null;
 
@@ -322,6 +340,16 @@ export async function syncToGhl(call, summary, match, { db = supabase, cfg = get
   }
   if (!tierWritable(match.tier, target, cfg)) {
     return { target, skipped: true, reason: `tier_${match.tier}_not_writable` };
+  }
+
+  // Age gate — same rule, same reason, BEFORE claimSync. GHL timestamps its
+  // own notes too, so a backfilled note misdates the contact timeline exactly
+  // as it does in LP. Applying it to one target and not the other would put
+  // the two CRMs out of step on the same call.
+  const age = noteAgeVerdict(call, cfg, now);
+  if (age.tooOld) {
+    console.log(`${LOG} call=${call.id} target=ghl SKIPPED too_old (${Math.round(age.ageHours)}h > ${age.limitHours}h)`);
+    return { target, skipped: true, reason: 'call_too_old', age_hours: Math.round(age.ageHours) };
   }
 
   const noteBody = composeNote(call, summary, link, agentLabel);
