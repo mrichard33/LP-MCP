@@ -169,11 +169,15 @@ test('unknown_team is named as non-blocking in ONE place', () => {
   // Everything else still stops the call. A future reason joins this set by
   // somebody deciding it does, never by resembling one already in it.
   assert.deepEqual(
-    blockingReviewFlags(['unknown_team', 'low_confidence_transcript', 'dnc_request']),
-    ['low_confidence_transcript', 'dnc_request'],
+    blockingReviewFlags(['unknown_team', 'low_confidence_transcript', 'low_outcome_confidence']),
+    ['low_confidence_transcript', 'low_outcome_confidence'],
   );
+  // 'unknown_team' belongs to THIS set alone. dnc_request and
+  // cancellation_request also skip the park at analysis, but they go to
+  // DEFER_REVIEW_UNTIL_SYNCED — delivered, then queued for a human — which is
+  // a different behaviour and a different set. See test-ci-deferred-review.js.
   for (const reason of ['dnc_request', 'cancellation_request', 'low_outcome_confidence', 'transcript_unintelligible']) {
-    assert.equal(NON_BLOCKING_REVIEW_FLAGS.has(reason), false, `${reason} must still block`);
+    assert.equal(NON_BLOCKING_REVIEW_FLAGS.has(reason), false, `${reason} is not deliver-and-complete`);
   }
 });
 

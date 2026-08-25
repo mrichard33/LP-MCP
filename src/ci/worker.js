@@ -25,7 +25,7 @@ import { createSftpAdapter, createManualAdapter, createListingCache, describeRec
 import { dateDirFor, last4, last10 } from './time.js';
 import { transcribeCall, createOpenAITranscriber, createStorageAudioLoader } from './transcribe.js';
 import { analyzeTranscript } from './analyze.js';
-import { blockingReviewFlags } from './analysis-schema.js';
+import { blockingReviewFlags, deferredReviewReason } from './analysis-schema.js';
 import { matchCall, loadCanvasserPhones } from './match.js';
 import { loadAgentMap } from './discovery.js';
 import { resolveAgentLabel } from './teams.js';
@@ -145,21 +145,36 @@ export async function recordFailure(db, call, stage, err, cfg = getConfig()) {
   });
 }
 
-/** Park a call for human review with a reason. Terminal until resolved. */
-export async function sendToReview(db, call, stage, reason, detail = null) {
+/**
+ * Park a call for human review with a reason. Terminal until resolved.
+ *
+ * `patch` merges into the SAME update rather than being a second write. The
+ * only caller that uses it clears pending_review_reason as it parks, and those
+ * two facts must land together: a call parked with its pending reason still
+ * set would park again on every retry.
+ */
+export async function sendToReview(db, call, stage, reason, detail = null, patch = {}) {
   const { error } = await db.from('ci_calls').update({
     status: 'review',
     review_reason: reason,
     locked_until: null,
     locked_by: null,
     updated_at: new Date().toISOString(),
+    ...patch,
   }).eq('id', call.id);
   if (error) console.warn(`${LOG} review update failed for ${call.id}: ${error.message}`);
   await logEvent(db, { callId: call.id, stage, event: 'review', detail: detail ?? { reason } });
 }
 
-/** Advance a call to the next status and clear its lease. */
-export async function advance(db, call, fromStage, toStatus, detail = null) {
+/**
+ * Advance a call to the next status and clear its lease.
+ *
+ * `patch` merges into the SAME update. stageAnalyze uses it to record
+ * pending_review_reason as it advances: a second write would leave a window in
+ * which the call is 'analyzed' with no pending reason, and a worker that died
+ * inside that window would lose a customer's DNC request entirely.
+ */
+export async function advance(db, call, fromStage, toStatus, detail = null, patch = {}) {
   const { error } = await db.from('ci_calls').update({
     status: toStatus,
     status_detail: null,
@@ -167,6 +182,7 @@ export async function advance(db, call, fromStage, toStatus, detail = null) {
     locked_until: null,
     locked_by: null,
     updated_at: new Date().toISOString(),
+    ...patch,
   }).eq('id', call.id);
   if (error) throw new Error(`advance to ${toStatus} failed: ${error.message}`);
   await logEvent(db, { callId: call.id, stage: fromStage, event: 'transition', detail: detail ?? { to: toStatus } });
@@ -434,6 +450,16 @@ export async function stageAnalyze(call, { db = supabase, cfg = getConfig(), cal
     return { outcome: 'review', reason: blocking[0], review_flags: flags };
   }
 
+  // A DNC or cancellation request rides along to sync and is queued for a
+  // human AFTER the note lands (DEFER_REVIEW_UNTIL_SYNCED). Parking here is
+  // what left the two reasons that most need a rep's eyes as the only two that
+  // never produced a note.
+  //
+  // Written on EVERY advance, null included. A re-analysis that no longer
+  // finds the flag must clear the column, or a stale value parks a call for a
+  // request the customer never made.
+  const deferred = deferredReviewReason(flags);
+
   await advance(db, call, 'analyze', 'analyzed', {
     outcome: result.row.outcome,
     confidence: result.row.outcome_confidence,
@@ -444,8 +470,14 @@ export async function stageAnalyze(call, { db = supabase, cfg = getConfig(), cal
     // nothing at all — the flag would live only in ci_summaries, and the
     // moment it stopped parking it would stop being visible in the timeline.
     ...(flags.length ? { review_flags: flags, blocked: false } : {}),
-  });
-  return { outcome: 'advanced', to: 'analyzed', ...(flags.length ? { review_flags: flags } : {}) };
+    ...(deferred ? { deferred_review: deferred } : {}),
+  }, { pending_review_reason: deferred });
+  return {
+    outcome: 'advanced',
+    to: 'analyzed',
+    ...(flags.length ? { review_flags: flags } : {}),
+    ...(deferred ? { deferred_review: deferred } : {}),
+  };
 }
 
 /**
@@ -638,11 +670,35 @@ export async function stageSync(call, { db = supabase, cfg = getConfig(), lpClie
 
   const terminal = ['lp', 'ghl'].filter((t) => result[t]?.terminal);
   if (terminal.length > 0) {
+    // pending_review_reason is deliberately NOT cleared here. The write did
+    // not land, so the call has not earned its way to the review queue on its
+    // own reason yet — and a sync failure must be recorded AS a sync failure,
+    // not swallowed because the call was heading to review anyway. The column
+    // keeps the customer's request attached for whoever picks this up.
     await sendToReview(db, call, 'sync', 'sync_failed', {
       targets: terminal,
       phone: last4(call.customer_phone || call.ani),
+      ...(call.pending_review_reason ? { pending_review_reason: call.pending_review_reason } : {}),
     });
     return { outcome: 'review', reason: 'sync_failed', result };
+  }
+
+  // The write is done. A call carrying a deferred reason now goes to a HUMAN
+  // rather than to 'completed' — the note is delivered AND the request is
+  // queued. Both, not either.
+  //
+  // This runs whatever the write's disposition was: synced, sent-unconfirmed,
+  // shadow, or skipped below the tier threshold. Queueing only on a confirmed
+  // delivery would mean that with the write flags off — the normal state — a
+  // customer's DNC request completed silently with nobody ever seeing it.
+  if (call.pending_review_reason) {
+    await sendToReview(db, call, 'sync', call.pending_review_reason, {
+      note: 'note delivered; queued for a human because the customer asked for something a machine must not action',
+      lp: describeSync(result.lp),
+      ghl: describeSync(result.ghl),
+      phone: last4(call.customer_phone || call.ani),
+    }, { pending_review_reason: null });
+    return { outcome: 'review', reason: call.pending_review_reason, delivered: true, result };
   }
 
   await advance(db, call, 'sync', 'completed', {
