@@ -11,14 +11,13 @@
  *
  * THE LEADING NUMBER IS THE ANI, NOT THE FIVE9 CALL ID. An earlier revision of
  * the handoff assumed a Call ID was recoverable here; it is not, and the whole
- * recording→call join was redesigned around that retraction. Nothing in this
+ * recording->call join was redesigned around that retraction. Nothing in this
  * module may present the ANI as an identifier for a call.
  *
  * Two shapes that break naive parsing, both real:
  *   - agent_username is EMPTY on transfer legs: 'by  @' — two spaces, no name.
  *   - ivr_module contains spaces ('Transfer to Lightfire', 'Third Party
- *     Transfer'), and the separator is the LAST '_' before '.wav'. Splitting on
- *     the first '_' shreds the clock; splitting on every '_' shreds the module.
+ *     Transfer'), and the separator is the LAST '_' before '.wav'.
  *
  * Pure module: no env, no clients, no import-time work.
  */
@@ -28,10 +27,6 @@
  *
  * @returns {object|null} null when the name does not match the format at all —
  *   the caller records the file as unparseable rather than inventing fields.
- *   A null `ivrModule` is normal (plain agent call); an empty-string
- *   `agentUsername` is normal (transfer leg) and is deliberately distinct from
- *   null so "no agent on this leg" stays legible downstream. `sessionId` is
- *   null for every pre-2026-08-22 name and is NEVER a call key — see below.
  */
 export function parseRecordingFilename(filename) {
   const raw = String(filename ?? '').trim();
@@ -48,20 +43,16 @@ export function parseRecordingFilename(filename) {
   const agentUsername = m[2].trim();   // '' on transfer legs
   const tail = m[3];
 
-  // ── the clock comes off the HEAD, not the whole tail ────────────────────
-  // Until 2026-08-22 the clock WAS the whole tail (after an optional module
-  // split) and the clock had to match the remainder exactly. It now appends a
-  // session id, so anything that insists the clock is the entire remainder
-  // rejects every new name. Anchoring at the head reads both eras.
   const head = CLOCK_HEAD_RE.exec(tail);
   if (!head) return null;
   const clockText = head[1].trim();
-  let rest = head[2];
+  const rest = head[2];
 
   // Old format: nothing follows the clock. Byte-identical behaviour.
   if (!rest) return { ani, agentUsername, clockText, ivrModule: null, sessionId: null };
 
-  const split = splitModuleAndSession(rest);
+  // agentUsername is threaded in DELIBERATELY — see splitModuleAndSession.
+  const split = splitModuleAndSession(rest, agentUsername);
   if (!split) return null;
 
   return { ani, agentUsername, clockText, ivrModule: split.ivrModule, sessionId: split.sessionId };
@@ -69,119 +60,134 @@ export function parseRecordingFilename(filename) {
 
 /**
  * 'H_MM_SS AM/PM' at the START of the string, with the remainder captured.
- *
- * Anchored at the head rather than over the whole string, which is the single
- * change that reads both filename eras: before 2026-08-22 the remainder is
- * empty or '_{module}', and after it the remainder also carries a session id.
  */
 const CLOCK_HEAD_RE = /^(\d{1,2}_\d{2}_\d{2}\s*[AaPp][Mm])(.*)$/;
 
 /**
- * The session id Five9 began appending on 2026-08-22: 32 hex characters
- * followed by digits.
+ * The session id Five9 began appending on 2026-08-22.
  *
- * ══ THIS IS NOT THE FIVE9 CALL ID. DO NOT JOIN ON IT. ══
- * The trailing digits look exactly like a call id and are not one. Verified
- * 2026-08-25 against all 20 rows that carried it, plus a direct lookup:
+ * == THE ACTUAL SHAPE, from verbatim filenames read off the archive ==
+ * Confirmed 2026-08-25 via GET /ci/trace-fetch on a full Main Number folder
+ * (335 .wav files). The id is NOT '32 hex + 15 digits'. On a plain agent call
+ * the AGENT USERNAME sits BETWEEN the hex run and the digits:
+ *
+ *   ...2_47_37 PMA7DD782645174F9285831B51AD12EB90ljulien300000002867064.wav
+ *                |--------- 32 hex -----------||agent||-- 15 digits --|
+ *
+ * On a transfer leg there is no agent, so the two are contiguous:
+ *
+ *   ..._Transfer to LightfireB6A58CED4F5246238AAB0FCA8EFAF2D0300000002867137
+ *       |---- module ------||-------- 32 hex ------------||- 15 digits -|
+ *
+ * A single regex of /[0-9A-Fa-f]{32}\d{15}$/ therefore matches transfer legs
+ * and NEVER matches a plain agent call — which is precisely why, between
+ * 2026-08-22 and 2026-08-25, Canvass Confirmation and Dispatch were the only
+ * campaigns still fetching while 335-file folders reported as empty.
+ *
+ * == THIS IS NOT THE FIVE9 CALL ID. DO NOT JOIN ON IT. ==
+ * Verified 2026-08-25 against all 20 rows that carried it, plus a direct
+ * lookup:
  *
  *   filename tail   300000002864763   300000002864750   300000002866719
  *   five9_call_id   300000010289685   300000010289658   300000010296218
  *
- * Every ci_calls.five9_call_id since 2026-08-24 (n=15,590) falls in
- * 300000010282668 … 300000010298341; the filename tails sit around
- * 3000000028…, roughly 7.4 million below. Disjoint ranges, and
- * raw_metadata.recordings_raw carries only a timestamp and a duration, so
- * nothing we store maps one space to the other.
+ * Disjoint ranges, roughly 7.4 million apart, and raw_metadata.recordings_raw
+ * carries only a timestamp and a duration, so nothing we store maps one space
+ * to the other. The id is stored for provenance and for the day a mapping
+ * exists; the join stays campaign + customer number + time.
  *
- * This module already records that the LEADING number is the ANI and not a
- * call id — an earlier handoff assumed otherwise and the whole join had to be
- * redesigned around the retraction. The same rule applies here. The id is
- * stored for provenance and for the day a mapping exists; the join stays
- * campaign + customer number + time.
- *
- * ── THE DAY A MAPPING MIGHT EXIST, AND HOW TO TEST IT ──────────────────────
- * ci_calls.five9_session_id has been declared since sql/061 and discovery.js
- * already writes it (`five9_session_id: primary.sessionId || null`). It is
- * populated on 0 of 15,848 rows because the saved Call Log report does not
- * currently emit a Session ID column — not because the code is missing.
- *
- * So there is a plausible, cheap route to the exact key this heuristic join
- * would love to have, and it is a REPORT CONFIGURATION change rather than a
- * code change: add the Session ID column to the Five9 saved report, let
- * discovery populate five9_session_id, then check whether the filename tail
- * matches it:
+ * ci_calls.five9_session_id is declared and discovery.js already writes it; it
+ * is populated on 0 rows because the saved Call Log report does not emit a
+ * Session ID column. Adding that column is a REPORT CONFIG change, after which
+ * this becomes testable:
  *
  *   SELECT count(*) FILTER (WHERE right(r.five9_recording_id, 15) = c.five9_session_id)
  *   FROM ci_recordings r JOIN ci_calls c ON c.id = r.call_id
  *   WHERE r.five9_recording_id IS NOT NULL AND c.five9_session_id IS NOT NULL;
  *
- * That is a HYPOTHESIS, not a finding. Until that query returns a convincing
- * number on real rows, nothing here joins on this id.
- *
- * ══ WHY THE SHAPE IS EXACT AND ANCHORED TO THE END ══
- * Because "find a 32-hex run" does not have one answer. The id abuts the
- * module with no separator, and the module can END in a hex character:
- *
- *   Transfer to LightfireCB3E712B7E084D8A9BD23381B216E482300000002866719
- *                      ^
- *                      'e' is a hex digit, so a leftmost scan starts HERE
- *                      and returns the module as 'Transfer to Lightfir'
- *
- * A rightmost scan is no better — it eats into the id — because the trailing
- * digits are themselves hex characters, so runs of ≥32 hex start at many
- * positions. Only the id's exact structure pins the boundary: 32 hex followed
- * by exactly 15 digits, ending the string. That is 47 characters, uniform
- * across all 20 rows carrying it as of 2026-08-25.
- *
- * A truncated module is not a loud failure. It would silently miss
- * ci_transfer_target_map's exact-equality lookup and re-break classifyTeam —
- * the very defect this parser exists to repair. If Five9 changes the id's
- * length the name stops parsing and is COUNTED as unparseable, which is the
- * correct failure: visible, not silently wrong.
+ * That is a HYPOTHESIS, not a finding.
  */
-const SESSION_ID_RE = /[0-9A-Fa-f]{32}\d{15}$/;
+
+/** Exactly 15 digits ending the string — the id's tail in both shapes. */
+const TAIL_DIGITS_RE = /(\d{15})$/;
+
+/** Exactly 32 hex characters ending the string, after the tail is peeled. */
+const HEX32_END_RE = /[0-9A-Fa-f]{32}$/;
 
 /**
  * Split what follows the clock into an optional module and the session id.
  *
- * ── WHY IT ANCHORS ON THE HEX RUN ──────────────────────────────────────────
- * The id abuts whatever precedes it with NO separator:
+ * -- WHY IT PEELS FROM THE RIGHT INSTEAD OF SEARCHING FOR THE HEX RUN --
+ * 'Find a 32-hex run' does not have one answer, and getting it wrong is
+ * SILENT. The module can end in a hex character:
  *
- *   _Transfer to LightfireCB3E712B7E084D8A9BD23381B216E482300000002866719
- *    └──── module ───────┘└─────────── session id ───────────────────────┘
+ *   Transfer to LightfireB6A58CED4F5246238AAB0FCA8EFAF2D0300000002867137
+ *                      ^ 'e' is a hex digit, so a lazy or leftmost scan
+ *                        starts HERE and yields module 'Transfer to Lightfir'
  *
- * so there is no delimiter to split on and the 32-hex run is the only reliable
- * boundary. Taking the module as everything BEFORE the run and the id as
- * everything FROM it onward is also robust to what sits inside the id: whether
- * the trailing blob is hex+digits or carries another token between them, the
- * module still ends where the hex begins. That matters because the plain-agent
- * shape has not been observed directly — only the transfer shape has.
+ * A truncated module is not a loud failure — it would silently miss
+ * ci_transfer_target_map's exact-equality lookup and re-break classifyTeam.
+ * Verified: a lazy /[0-9A-Fa-f]{32}[A-Za-z0-9._@-]*?\d{15}$/ does exactly this.
  *
- * ── AND WHY IT REFUSES ANYTHING ELSE ───────────────────────────────────────
- * A trailing blob with no 32-hex run returns null, exactly as today. That
- * refusal is the feature: a filename this code cannot confidently read must
- * stay unreadable and be COUNTED (see createSftpAdapter's onStats), because a
- * parser that guesses at an unknown shape is a parser that hides the next
- * vendor change instead of surfacing it. That is precisely how the 2026-08-22
+ * So the boundary is not searched for. It is PEELED off the right in a fixed
+ * order, using information we already hold:
+ *
+ *   1. take the trailing 15 digits
+ *   2. take the agentUsername — which the caller parsed out of 'by {agent} @'
+ *      and therefore KNOWS, so the token between hex and digits needs no
+ *      guessing at all
+ *   3. what remains must END in exactly 32 hex, or the name is unparseable
+ *   4. anything before that is the module, introduced by its '_'
+ *
+ * Step 2 is why this is deterministic where a regex cannot be: the ambiguous
+ * middle token is not inferred from shape, it is read from another field of
+ * the same filename. An agent username containing digits ('mcole2321') or
+ * punctuation ('c.garner@reecewindows.com') needs no special case.
+ *
+ * -- AND WHY IT STILL REFUSES --
+ * If the remainder does not end in 32 hex, this returns null and the file is
+ * COUNTED as unparseable (see createSftpAdapter's onStats) rather than guessed
+ * at. That refusal is the feature: a parser that invents a shape hides the
+ * next vendor change instead of surfacing it, which is how the 2026-08-22
  * break went unnoticed for three days.
  *
- * @returns {{ivrModule: string|null, sessionId: string}|null}
+ * @param {string} rest what follows the clock
+ * @param {string} agentUsername from 'by {agent} @' — '' on transfer legs
+ * @returns {{ivrModule: string|null, sessionId: string|null}|null}
  */
-function splitModuleAndSession(rest) {
-  // End-anchored, so there is exactly one match and no boundary to choose.
-  const at = rest.search(SESSION_ID_RE);
+function splitModuleAndSession(rest, agentUsername = '') {
+  const tail = TAIL_DIGITS_RE.exec(rest);
 
-  // No session id. This is the OLD format's transfer leg — '_{module}' and
-  // nothing else — and it must keep parsing exactly as it always has. The
+  // No trailing digits: the OLD format's transfer leg — '_{module}' and
+  // nothing else — which must keep parsing exactly as it always has. The
   // archive holds these back to ~Aug 2023 and the backfill reads them.
-  if (at === -1) {
+  if (!tail) {
     if (rest[0] !== '_') return null;
     const legacyModule = rest.slice(1).trim();
     return legacyModule ? { ivrModule: legacyModule, sessionId: null } : null;
   }
 
-  const before = rest.slice(0, at);
-  const sessionId = rest.slice(at);
+  const digits = tail[1];
+  const withoutDigits = rest.slice(0, rest.length - digits.length);
+
+  // Peel the agent token when the caller knows one AND it is actually there.
+  // Both conditions matter: transfer legs have no agent, and a plain-agent
+  // name has it immediately before the digits.
+  const agent = String(agentUsername ?? '').trim();
+  const hasAgentToken = agent.length > 0 && withoutDigits.endsWith(agent);
+  const head = hasAgentToken
+    ? withoutDigits.slice(0, withoutDigits.length - agent.length)
+    : withoutDigits;
+
+  // What is left MUST end in the 32-hex run, or we cannot read this name.
+  if (!HEX32_END_RE.test(head)) return null;
+
+  const before = head.slice(0, head.length - 32);
+
+  // The id is stored verbatim as it appears in the filename — hex, the agent
+  // token when present, and the digits — so provenance is exact and a future
+  // mapping can be tested against the real string rather than a normalised one.
+  const sessionId = rest.slice(before.length);
 
   // What precedes the id is the module, introduced by the '_' that has always
   // separated it from the clock. No '_' and no text means a plain agent call.
@@ -197,8 +203,7 @@ function splitModuleAndSession(rest) {
  *
  * Campaign is taken from the DIRECTORY and is matched EXACTLY downstream —
  * never case-folded. Near-duplicate directories differing only in case exist
- * on the server ('Magazine - CLiPP' vs 'Magazine - Clipp'), so folding would
- * merge two distinct campaigns into one.
+ * on the server ('Magazine - CLiPP' vs 'Magazine - Clipp').
  */
 export function parseRecordingPath(fullPath, root = '/Five9/Recordings') {
   const path = String(fullPath ?? '').trim();
@@ -221,8 +226,8 @@ export function parseRecordingPath(fullPath, root = '/Five9/Recordings') {
 }
 
 /**
- * The ETG-owned directory, untouched since Jan 2026. §6 says skip it — it is
- * not ours and nothing in it is Five9 call audio.
+ * The ETG-owned directory, untouched since Jan 2026. Skip it — it is not ours
+ * and nothing in it is Five9 call audio.
  */
 export const SKIP_DIRS = new Set(['Owner']);
 
@@ -233,16 +238,8 @@ export function isSkippedDir(dirName) {
 /**
  * Should this file be ingested, or recorded as deliberately excluded?
  *
- * Two exclusions, both from §6:
- *   test_module     — Mark's transfer-module build tests. They appear only on
- *                     8/14 and 8/17/2026 and are ~1 second long. Matched BY
- *                     NAME as well as by size, because a longer test recording
- *                     would slip straight past a byte floor.
- *   below_min_bytes — ~1s files (1.7–4.9 KB observed) that carry no
- *                     conversation. Default floor 8000 bytes.
- *
  * Excluded files are still ROWS — recorded with a reason, never silently
- * dropped, so reconciliation can tell "we chose not to" from "we missed it".
+ * dropped, so reconciliation can tell 'we chose not to' from 'we missed it'.
  *
  * @returns {{excluded: boolean, reason: string|null}}
  */
