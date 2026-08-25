@@ -51,6 +51,7 @@ import {
 } from './canvassing-time.js';
 import { flattenWebhookBody, webhookShapeFingerprint } from './webhook-body.js';
 import { buildLeadNoteLines } from './services/lead-note-lines.js';
+import { resolveCanvasserProId } from './services/canvasser-roster.js';
 
 // GHL custom field: "LP Inbound Lead ID". Reminder: in1_id is the LP
 // inbound-QUEUE id, not lds_id — SetAppointment can never target it.
@@ -226,12 +227,25 @@ export function validateCanvassingPayload(rawBody) {
  * field set (REST naming — lp-client translates to legacy adate/atime/
  * phone1). Pure; returns the exact object handed to addLead().
  */
-export function buildLpLeadFields(p, appt) {
+export function buildLpLeadFields(p, appt, { proId: verifiedProId } = {}) {
   const nationalPhone = (normalizePhone(p.phone_raw) || '').slice(-10);
 
   // promoter is a NAME in the v2 form; LP pro_id must be numeric. Accept
   // an explicit pro_id payload key, or a promoter that is itself numeric.
-  const proId = p.pro_id || (/^\d+$/.test(p.promoter) ? p.promoter : '');
+  //
+  // `verifiedProId` is the id AFTER the roster check (services/
+  // canvasser-roster.js), and processCanvassingLead always passes it. LP
+  // resolves a pro_id to a promoter NAME — the person who gets the commission
+  // — and it cannot tell an LP Pro ID from a SalesRabbit or GHL id that
+  // happens to be digits, so an unverified number is not a missing attribution
+  // but a WRONG one: a different real canvasser, silently credited.
+  //
+  // The parameter is optional ONLY so the pure builder stays callable on its
+  // own in tests; the empty string it then falls back to means "no promoter",
+  // never "send it unchecked".
+  const proId = verifiedProId !== undefined
+    ? (verifiedProId || '')
+    : (p.pro_id || (/^\d+$/.test(p.promoter) ? p.promoter : ''));
 
   const utm = p.utm || {};
 
@@ -346,6 +360,7 @@ const DEFAULT_DEPS = {
   sendGroupMeMessage,
   updateSalesRabbitLead,
   emitEvent,
+  resolveCanvasserProId,
   now: () => new Date(),
 };
 
@@ -431,7 +446,46 @@ export async function processCanvassingLead(payload, deps = {}) {
     }
 
     // 4. LP addLead (legacy path, 3 attempts exponential backoff inside).
-    const fields = buildLpLeadFields(p, appt);
+    //
+    // The Pro ID is checked against the roster FIRST. LP turns a pro_id into a
+    // promoter name — the canvasser who gets the commission — and it cannot
+    // tell an LP Pro ID from a SalesRabbit or GHL id that is also just digits.
+    // An unverified number therefore does not fail; it credits a DIFFERENT
+    // REAL PERSON, and nothing downstream can spot that afterwards.
+    const canvasser = await d.resolveCanvasserProId(
+      p.pro_id || (/^\d+$/.test(p.promoter || '') ? p.promoter : ''),
+      clientOpt.client !== undefined ? { db: clientOpt.client } : {},
+    );
+    const proIdSuspect = canvasser.reason !== 'ok'
+      && canvasser.reason !== 'inactive_canvasser'
+      && canvasser.reason !== 'absent';
+    if (proIdSuspect) {
+      // Loud either way, because this is the only thing that says why the
+      // promoter is wrong or missing. What differs is the consequence:
+      // withheld (enforcing) or sent anyway and recorded (observing).
+      const outcome = canvasser.withheld
+        ? 'it was NOT sent, so the lead lands with no promoter'
+        : 'it was still sent (observe mode) and the verdict recorded on the event';
+      console.error(
+        `[Canvassing] pro_id SUSPECT for ${p.ghl_contact_id} (${canvasser.reason}) — ${outcome}.`
+        + ` If this canvasser is new, re-run scripts/seed-ci-canvassers.js;`
+        + ` otherwise GHL is sending an id from another system.`,
+      );
+      await d.sendGroupMeMessage(
+        canvassCard({
+          notification_class: 'priority',
+          action_verb: 'CANVASSER NOT RECOGNISED',
+          payload: p,
+          narrative: `The Pro ID from GHL is not on the LP roster (${canvasser.reason}) — ${outcome}.`
+            + ` Crediting the wrong canvasser is worse than crediting none. The lead itself is`
+            + ` unaffected. Re-seed the roster if this canvasser is new; otherwise check what`
+            + ` GHL is putting in that field.`,
+        }),
+        { channel: 'canvass', flushNow: true },
+      );
+    }
+
+    const fields = buildLpLeadFields(p, appt, { proId: canvasser.proId });
     let lpResponse;
     try {
       lpResponse = await d.addLead(fields);
@@ -529,7 +583,16 @@ export async function processCanvassingLead(payload, deps = {}) {
         in1_id: in1Id ? String(in1Id) : null,
         adate: appt.adate,
         atime: appt.atime,
-        promoter: p.promoter || null,
+        // The canvasser as RESOLVED against the roster, not as received.
+        //
+        // This field used to be `p.promoter`, which was null on 187 of 187
+        // events over the week to 2026-08-25 — GHL sends the numeric id, not
+        // a name, so anything reading this saw zero canvasser attribution
+        // while LP itself had it at ~97%. Recording the resolved identity
+        // makes our own event agree with the lead LP stored.
+        promoter: canvasser.name || p.promoter || null,
+        pro_id: canvasser.proId,
+        pro_id_verdict: canvasser.reason,
       },
       idempotency_key: `canvassing_lead_${p.ghl_contact_id}_${new Date(d.now()).toISOString().slice(0, 10)}`,
     });

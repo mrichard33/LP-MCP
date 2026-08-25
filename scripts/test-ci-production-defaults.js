@@ -211,14 +211,18 @@ test('syncToGhl with NO ghlClient reaches the real client rather than undefined'
   assert.doesNotMatch(String(r.error || ''), MISSING_DEPENDENCY,
     'the production default is missing again for GHL');
   // With no GHL_API_KEY the real addGHLNote returns null WITHOUT any HTTP —
-  // reaching that null is itself the proof the real function ran.
+  // reaching that null is itself the proof the real function ran, because an
+  // absent default would have thrown a TypeError before ever calling it.
   //
-  // NOTE for whoever enables CALL_INTEL_GHL_WRITES: that null is currently
-  // recorded as status='synced' with a null external_ref. Nothing is lost while
-  // the flag is off, but an unconfigured or circuit-broken GHL would look
-  // delivered. Worth fixing BEFORE the flag is flipped, not as part of this PR.
-  assert.equal(r.synced, true);
-  assert.equal(db.syncs.find((s) => s.target === 'ghl').external_ref, null);
+  // That null is now classified as a transient failure rather than recorded as
+  // a delivered note (classifyGhlNoteResult — see test-ci-ghl-note-result.js).
+  // An unconfigured or circuit-broken GHL used to read as 'synced' here, which
+  // is what this assertion asserted before the semantics were fixed.
+  assert.equal(r.synced, undefined, 'an unconfigured GHL is not a delivered note');
+  assert.equal(r.failed, true);
+  assert.equal(r.reason, 'ghl_unavailable');
+  assert.equal(r.terminal, false, 'unconfigured/down is transient — it must retry');
+  assert.equal(db.syncs.find((s) => s.target === 'ghl').status, 'pending');
 });
 
 test('syncCall with NO clients at all attempts BOTH writes', async () => {

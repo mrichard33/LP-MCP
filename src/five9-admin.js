@@ -97,6 +97,71 @@ export function assertResponseSize(method, size, maxBytes) {
 }
 
 /**
+ * ── THE AUTH BREAKER ────────────────────────────────────────────────────────
+ *
+ * Five9 LOCKS the API account after repeated failed logins, and every call
+ * here carries HTTP Basic credentials — so one wrong password does not fail
+ * once, it fails once PER CALL.
+ *
+ * 2026-08-25: the account was locked. The amplifier was
+ * jobs/five9-config-snapshot.js, which makes one SOAP read per campaign plus
+ * profiles, lists, skills, dispositions, users and VCC — ~37 sequential calls,
+ * each wrapped in an attempt() that records the error and CONTINUES. A single
+ * stale credential therefore became ~37 failed logins within seconds, which is
+ * precisely how an account gets locked. (scripts/test-five9-admin-reads.js was
+ * spending live attempts too; fixed separately.)
+ *
+ * So the breaker: the FIRST auth-shaped rejection trips it, and every
+ * subsequent call fails immediately WITHOUT touching the network. One bad
+ * password now costs exactly one failed login, not thirty-seven.
+ *
+ * It does NOT auto-reset on a timer. A timer would re-arm the very loop this
+ * exists to stop — the snapshot would retry tomorrow and spend another burst.
+ * The credential has to actually change, and changing it in Railway restarts
+ * the service, which clears this by construction. resetFive9AuthBreaker() is
+ * exported for an operator who has just fixed the password and wants the
+ * current process to pick it up without a redeploy.
+ *
+ * Only AUTH failures trip it. A timeout, a 500 or an oversize refusal are not
+ * credential problems and must not disable the integration.
+ */
+let authBreaker = null;
+
+/** Does this rejection mean "your credentials are wrong or locked out"? */
+export function isFive9AuthFailure(message) {
+  return /user name or password|account is locked|invalid (?:login|credentials)|not authorized to (?:log ?in|use)|authentication fail/i
+    .test(String(message || ''));
+}
+
+/** Current breaker state, for the health view and the admin tools. */
+export function five9AuthBreakerStatus() {
+  return authBreaker
+    ? { open: true, since: authBreaker.at, reason: authBreaker.message }
+    : { open: false };
+}
+
+/**
+ * Re-arm Five9 calls after the credential has been corrected. Deliberately
+ * manual — see above.
+ */
+export function resetFive9AuthBreaker() {
+  const was = authBreaker;
+  authBreaker = null;
+  if (was) console.warn(`[Five9] auth breaker RESET (was open since ${was.at})`);
+  return { reset: Boolean(was), was };
+}
+
+function tripAuthBreaker(message) {
+  if (authBreaker) return;
+  authBreaker = { at: new Date().toISOString(), message: String(message).slice(0, 300) };
+  console.error(
+    `[Five9] AUTH BREAKER OPEN — refusing all further Five9 admin calls to protect the account`
+    + ` from lockout. Fix FIVE9_USERNAME / FIVE9_PASSWORD, then redeploy (or call`
+    + ` resetFive9AuthBreaker). Cause: ${authBreaker.message}`,
+  );
+}
+
+/**
  * Low-level SOAP call. Returns the raw XML response body on success.
  * Throws with a readable message on HTTP errors, SOAP Faults, or timeout.
  *
@@ -106,6 +171,15 @@ export function assertResponseSize(method, size, maxBytes) {
 export async function five9SoapCall(method, innerXml = '', { maxBytes } = {}) {
   if (!credsConfigured()) {
     throw new Error('Five9 admin credentials not configured (FIVE9_USERNAME / FIVE9_PASSWORD Railway env vars)');
+  }
+  if (authBreaker) {
+    // No fetch. This is the whole point: the 2nd..37th call of a snapshot run
+    // must not reach Five9 once the 1st has already been told the credential
+    // is bad.
+    throw new Error(
+      `Five9 ${method}: auth breaker OPEN since ${authBreaker.at} — not retrying to avoid locking the account.`
+      + ` Fix FIVE9_USERNAME / FIVE9_PASSWORD and redeploy. Original cause: ${authBreaker.message}`,
+    );
   }
 
   const envelope =
@@ -155,10 +229,14 @@ export async function five9SoapCall(method, innerXml = '', { maxBytes } = {}) {
     if (/permission/i.test(msg)) {
       throw new Error(`Five9 ${method}: ${msg} — the API user needs the "User can use Administrator Services" role permission`);
     }
+    // A credential rejection arrives as a SOAP Fault with 200, not a 401 —
+    // which is why the 401 branch below never caught the 2026-08-25 lockout.
+    if (isFive9AuthFailure(msg)) tripAuthBreaker(`${method}: ${msg}`);
     throw new Error(`Five9 ${method} fault: ${msg}`);
   }
   if (!res.ok) {
     if (res.status === 401) {
+      tripAuthBreaker(`${method}: HTTP 401`);
       throw new Error(`Five9 ${method}: HTTP 401 — bad FIVE9_USERNAME/FIVE9_PASSWORD`);
     }
     throw new Error(`Five9 ${method}: HTTP ${res.status}`);

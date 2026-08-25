@@ -287,9 +287,39 @@ test('assertResponseSize: opt-in ceiling, and the marker survives for the caller
   assert.ok(MAX_IVR_RESPONSE_BYTES > 0);
 });
 
+/**
+ * Run `fn` with the Five9 admin credentials removed, then put them back.
+ *
+ * 2026-08-25 — this test used to ASSUME "no credentials are configured in this
+ * process". That is true on a bare checkout and false everywhere the env is
+ * loaded: a container, a dev box, CI with secrets. Where they ARE set, the
+ * "must fail for want of credentials" assertions below stopped short-circuiting
+ * and issued REAL authenticated SOAP calls to the production dialer — so every
+ * `npm test` run spent a live Five9 auth attempt, and the test failed with
+ * "user name or password ... incorrect, or the account is locked" instead of
+ * the expected error.
+ *
+ * Repeated failed auth is how an account gets locked, so an offline unit test
+ * must not be able to reach Five9 at all. Stripping the env makes the file's
+ * own "No network" header true by construction rather than by assumption.
+ */
+const FIVE9_ENV = ['FIVE9_USERNAME', 'FIVE9_PASSWORD'];
+async function withoutFive9Credentials(fn) {
+  const saved = Object.fromEntries(FIVE9_ENV.map((k) => [k, process.env[k]]));
+  for (const k of FIVE9_ENV) delete process.env[k];
+  try {
+    return await fn();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
 test('getDnisMap: cache is served without network and carries fetched_at', async () => {
-  // No credentials are configured in this process, so any real SOAP call
-  // throws. A resolved value therefore proves the cache short-circuited.
+  // Credentials are stripped for the duration, so any real SOAP call throws
+  // before the wire. A resolved value therefore proves the cache short-circuited.
   const seeded = {
     fetched_at: '2026-08-13T00:00:00.000Z',
     inbound_campaigns: 2,
@@ -299,23 +329,25 @@ test('getDnisMap: cache is served without network and carries fetched_at', async
     unassigned_count: 1,
     unassigned: ['9045550000'],
   };
-  try {
-    __setDnisMapCacheForTest(seeded);
-    const hit = await getDnisMap();
-    assert.equal(hit, seeded);
-    assert.equal(hit.fetched_at, '2026-08-13T00:00:00.000Z');
-    assert.equal(hit.assignments['9045559999'], 'Canvass Confirmation - Inbound');
-    assert.deepEqual(hit.unassigned, ['9045550000']);
+  await withoutFive9Credentials(async () => {
+    try {
+      __setDnisMapCacheForTest(seeded);
+      const hit = await getDnisMap();
+      assert.equal(hit, seeded);
+      assert.equal(hit.fetched_at, '2026-08-13T00:00:00.000Z');
+      assert.equal(hit.assignments['9045559999'], 'Canvass Confirmation - Inbound');
+      assert.deepEqual(hit.unassigned, ['9045550000']);
 
-    // refresh must NOT be served from cache — it has to attempt a real read,
-    // which fails here for want of credentials. That failure is the proof.
-    await assert.rejects(() => getDnisMap({ refresh: true }), /credentials not configured/);
+      // refresh must NOT be served from cache — it has to attempt a real read,
+      // which fails here for want of credentials. That failure is the proof.
+      await assert.rejects(() => getDnisMap({ refresh: true }), /credentials not configured/);
 
-    invalidateDnisMap();
-    await assert.rejects(() => getDnisMap(), /credentials not configured/);
-  } finally {
-    invalidateDnisMap();
-  }
+      invalidateDnisMap();
+      await assert.rejects(() => getDnisMap(), /credentials not configured/);
+    } finally {
+      invalidateDnisMap();
+    }
+  });
 });
 
 /* ── Part A: user-profile reads (2026-08-21 Phase H) ──────────────────────

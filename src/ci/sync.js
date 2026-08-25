@@ -137,9 +137,12 @@ export async function markSynced(db, id, { externalRef = null, response = null }
  * would release the idempotency key, and a retry after a request that actually
  * landed would double-post.
  */
-export async function markSyncFailed(db, row, err, cfg = getConfig()) {
+export async function markSyncFailed(db, row, err, cfg = getConfig(), { permanent = false } = {}) {
   const attempts = (row.attempts || 0) + 1;
-  const terminal = attempts >= cfg.maxAttempts;
+  // `permanent` is for a failure that retrying cannot fix — a CRM telling us
+  // the contact does not exist. Burning five attempts and a backoff curve on
+  // that only delays the review a human has to do anyway.
+  const terminal = permanent || attempts >= cfg.maxAttempts;
   const { error } = await db.from('ci_syncs').update({
     status: terminal ? 'failed' : 'pending',
     error: String(err?.message || err).slice(0, 500),
@@ -187,7 +190,23 @@ export async function syncToLp(call, summary, match, { db = supabase, cfg = getC
 
   try {
     const resp = await lpClient.addNote({ rectype, recid, notes: noteBody, categoryId: cfg.lpNoteCategoryId });
-    await markSynced(db, claim.row.id, { externalRef: extractLpNoteId(resp), response: shapeOf(resp) });
+    // external_ref stays NULL for LP, deliberately.
+    //
+    // /api/SalesApi/AddNotes answers with the bare string "UPDATED
+    // SUCCESSFULLY!" and nothing else — no id, no digits, measured across
+    // every live note written since 2026-08-24 (one distinct response
+    // template, recorded by shapeOf). There is no id to extract, so the code
+    // no longer pretends there might be: an extractor here would be a
+    // permanent no-op that reads like a capability.
+    //
+    // The receipt is `addNote` NOT THROWING — lpPost raises on any non-2xx, so
+    // reaching this line means LP accepted the write. A null external_ref is
+    // therefore an absent id, never an unconfirmed delivery.
+    //
+    // The note's real LP id does exist, just not here: it arrives later on the
+    // notes mirror (lp_notes.lp_note_id — e.g. 2238213 for the 08-24 notes),
+    // which is where to join if an audit ever needs one.
+    await markSynced(db, claim.row.id, { externalRef: null, response: shapeOf(resp) });
     console.log(`${LOG} call=${call.id} target=lp synced (${rectype}/${recid})`);
     return { target, synced: true };
   } catch (err) {
@@ -195,6 +214,61 @@ export async function syncToLp(call, summary, match, { db = supabase, cfg = getC
     console.error(`${LOG} call=${call.id} target=lp FAILED (attempt ${f.attempts}): ${err.message}`);
     return { target, failed: true, terminal: f.terminal, error: err.message };
   }
+}
+
+/**
+ * What did addGHLNote actually do?
+ *
+ * ── WHY THIS EXISTS ────────────────────────────────────────────────────────
+ * addGHLNote does NOT signal failure by throwing. It returns four different
+ * things (src/ghl.js), and the write site used to treat all four as success:
+ *
+ *   data object          the note was written
+ *   {skipped:true,...}   an identical note is already on the contact
+ *   'not_found'          the contact is unreachable — PERMANENT, never retry
+ *   null                 GHL disabled, empty body, or a transient failure
+ *
+ * `markSynced` was called unconditionally, so a contact that no longer exists
+ * and a GHL outage both recorded status='synced' with a null external_ref —
+ * indistinguishable from a delivered note. Nothing retried, nothing alerted,
+ * and the review queue stayed empty while notes silently went nowhere. This is
+ * the same class of defect as the missing client default: a non-exception
+ * result that means "no write happened" being read as "write happened".
+ *
+ * 'not_found' is a TRUTHY STRING, so it must be tested before any truthiness
+ * check — the ordering ghl.js's own header warns about.
+ *
+ * A duplicate IS delivery. The note is on the contact; the dedupe guard only
+ * stopped us adding a second copy. Recording that as a failure would retry
+ * forever against a guard designed to keep winning.
+ *
+ * @returns {{delivered: boolean, permanent?: boolean, reason?: string,
+ *            message?: string, externalRef?: string|null}}
+ */
+export function classifyGhlNoteResult(resp) {
+  // Sentinel FIRST — truthy string.
+  if (resp === 'not_found') {
+    return {
+      delivered: false,
+      permanent: true,
+      reason: 'contact_not_found',
+      message: 'GHL contact not found — the note has nowhere to go (permanent)',
+    };
+  }
+  if (resp == null) {
+    return {
+      delivered: false,
+      permanent: false,
+      reason: 'ghl_unavailable',
+      message: 'GHL returned no result — disabled, rate-limited, or a transient failure',
+    };
+  }
+  if (resp.skipped === true) {
+    // Already on the record. Delivered, and worth naming so the row does not
+    // read as though this pipeline wrote it.
+    return { delivered: true, reason: 'duplicate_note', externalRef: resp.matched_note_id ?? null };
+  }
+  return { delivered: true, externalRef: resp.id ?? resp.note?.id ?? null };
 }
 
 /**
@@ -240,9 +314,23 @@ export async function syncToGhl(call, summary, match, { db = supabase, cfg = get
 
   try {
     const resp = await ghlClient.addGHLNote(contactId, noteBody);
-    await markSynced(db, claim.row.id, { externalRef: resp?.id ?? resp?.note?.id ?? null, response: shapeOf(resp) });
-    console.log(`${LOG} call=${call.id} target=ghl synced`);
-    return { target, synced: true };
+    const verdict = classifyGhlNoteResult(resp);
+
+    if (verdict.delivered) {
+      await markSynced(db, claim.row.id, { externalRef: verdict.externalRef, response: shapeOf(resp) });
+      console.log(`${LOG} call=${call.id} target=ghl synced${verdict.reason ? ` (${verdict.reason})` : ''}`);
+      return { target, synced: true, ...(verdict.reason ? { reason: verdict.reason } : {}) };
+    }
+
+    // NOT delivered, and addGHLNote did not throw to say so — see
+    // classifyGhlNoteResult. Route it through the same failure bookkeeping a
+    // thrown error gets, so the row carries the reason and the retry policy.
+    const f = await markSyncFailed(db, claim.row, new Error(verdict.message), cfg, {
+      permanent: verdict.permanent,
+    });
+    console.error(`${LOG} call=${call.id} target=ghl NOT DELIVERED (${verdict.reason}`
+      + `${verdict.permanent ? ', permanent' : `, attempt ${f.attempts}`}): ${verdict.message}`);
+    return { target, failed: true, terminal: f.terminal, reason: verdict.reason, error: verdict.message };
   } catch (err) {
     const f = await markSyncFailed(db, claim.row, err, cfg);
     console.error(`${LOG} call=${call.id} target=ghl FAILED (attempt ${f.attempts}): ${err.message}`);
@@ -266,57 +354,6 @@ export async function syncCall(call, summary, match, opts = {}) {
     ? r.value
     : { target, failed: true, error: String(r.reason?.message || r.reason) });
   return { lp: unwrap(lp, 'lp'), ghl: unwrap(ghl, 'ghl') };
-}
-
-/**
- * Pull an id out of a legacy LP acknowledgment.
- *
- * ANCHORED DELIBERATELY. The obvious rule — "the trailing number" — is wrong
- * against prose: an acknowledgment like `Notes added for recid 452742` would
- * yield the RECID, and external_ref would then hold a customer record id
- * labelled as a note id. A null external_ref is honest; a plausible wrong one
- * is not, and nothing downstream would ever flag it.
- *
- * So a number is taken only where it cannot be anything else: the whole string
- * is the id, or it follows a separator in the documented `...: <id>` shape.
- * Anything else returns null, which is exactly what happens today.
- */
-function idFromAck(text) {
-  const s = String(text ?? '').trim();
-  if (!s) return null;
-  const m = s.match(/^(\d+)$/) || s.match(/[:#=]\s*(\d+)$/);
-  return m ? m[1] : null;
-}
-
-/**
- * Response id extraction, mirroring src/ghl-note-pipeline/lp-write.js.
- *
- * 2026-08-24 — the FIRST live AI call notes posted, and every one recorded
- * external_ref NULL. lpPost returns `await res.json()`, and AddNotes answers
- * with a bare JSON string, so `resp` is a STRING: `resp.note_id`/`noteId`/`id`
- * are all undefined on it, and the fallback then read `resp.message`, which is
- * undefined too. The one branch that could have matched an id never saw the
- * payload — the string fell straight through to null.
- *
- * The sibling extractor in lp-write.js carries the identical defect, and the
- * evidence was already sitting there: 0 of 131 rows written since that pipeline
- * went live ever carried an lp_note_id (recorded 2026-07-29). Both are fixed
- * together; test-ci-lp-note-id.js pins them to the same behaviour so the two
- * mirrors cannot drift.
- *
- * NOTE: no sample of LP's actual acknowledgment string exists — not in the
- * repo, not in the docs, not in retained logs — because every logger records
- * the SHAPE and discards the content (§10). idFromAck is therefore conservative
- * on purpose, and shapeOf now records a digit-masked template of a short string
- * response so the next live write answers the question for good.
- */
-export function extractLpNoteId(resp) {
-  if (!resp) return null;
-  if (typeof resp === 'string') return idFromAck(resp);
-  if (resp.note_id) return String(resp.note_id);
-  if (resp.noteId) return String(resp.noteId);
-  if (resp.id) return String(resp.id);
-  return idFromAck(resp.message);
 }
 
 /**
@@ -351,5 +388,5 @@ export function shapeOf(resp) {
 
 export default {
   syncCall, syncToLp, syncToGhl, tierWritable, claimSync, markSynced, markSyncFailed,
-  defaultLpClient, defaultGhlClient,
+  defaultLpClient, defaultGhlClient, classifyGhlNoteResult,
 };
