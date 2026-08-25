@@ -25,6 +25,17 @@ export const SYNC_FAILURE_THRESHOLD = 5;
 /** Minimum gap between two alerts OF THE SAME KIND. */
 export const ALERT_DEBOUNCE_MS = 60 * 60 * 1000;
 
+/**
+ * The kind for "a recording folder held .wav files and we could not read a
+ * single filename".
+ *
+ * ONE kind for the whole condition, not one per folder. A vendor format change
+ * hits every campaign at once — 25 folders in a morning — and 25 messages is
+ * how a channel gets muted. Debounced like every other kind, so the condition
+ * says so once an hour with the first folder that hit it named as the example.
+ */
+export const UNREADABLE_FOLDER_KIND = 'filename_unparseable';
+
 /** kind → last sent epoch ms. Process-local; a restart re-alerts, which is fine. */
 const lastSent = new Map();
 
@@ -107,4 +118,44 @@ export async function checkAndAlert({ db, cfg = getConfig(), send, now = Date.no
   return { findings, alerts };
 }
 
-export default { checkAndAlert, sendAlert, shouldSend, REVIEW_BACKLOG_THRESHOLD, SYNC_FAILURE_THRESHOLD };
+/**
+ * Alert that a folder full of recordings could not be read at all.
+ *
+ * ══ WHY THIS ALERT EXISTS ══
+ * On 2026-08-22 Five9 began appending a session id to every recording
+ * filename. The parser could not read the new shape, so adapter.list() dropped
+ * every file and each folder returned the same empty array an empty folder
+ * returns. Nothing threw, nothing logged, and 332 calls were parked
+ * 'recording_missing' against folders holding hundreds of files. It ran for
+ * three days because the only thing watching the archive was the code with the
+ * bug in it.
+ *
+ * ══ WHY IT FIRES ONLY ON ZERO OF N ══
+ * A folder where SOME names parse is a curiosity — one odd file, a partial
+ * rollout — and paging on it would make this alert noise, which §10 says is
+ * the same as no alert at all. A folder holding .wav files where NOT ONE name
+ * parses cannot be anything but a format change. That condition is unambiguous
+ * and it is the one that costs a day of recordings per day it goes unnoticed.
+ *
+ * ══ NO FILENAMES IN THE MESSAGE ══
+ * §10: alerts carry counts and ci_calls ids, never customer names or full
+ * phone numbers. A recording filename BEGINS with the customer's full number,
+ * so the sample names stay behind auth — the message points at
+ * GET /ci/trace-fetch, which returns them to someone who has a token.
+ */
+export async function alertUnreadableFolder({
+  campaign, dateDir, wav, cfg = getConfig(), send, now = Date.now(),
+} = {}) {
+  const text =
+    `🚨 Call Intelligence: recording filenames are UNREADABLE. `
+    + `'${campaign}' / ${dateDir} holds ${wav} .wav file(s) and not one parsed, `
+    + `so the fetch stage sees an empty folder and will park every call for that day. `
+    + `This is what a Five9 export format change looks like. `
+    + `Run GET /ci/trace-fetch?call_id=<id> for the verbatim filenames.`;
+  return sendAlert(UNREADABLE_FOLDER_KIND, text, { cfg, send, now });
+}
+
+export default {
+  checkAndAlert, sendAlert, shouldSend, alertUnreadableFolder,
+  REVIEW_BACKLOG_THRESHOLD, SYNC_FAILURE_THRESHOLD, UNREADABLE_FOLDER_KIND,
+};

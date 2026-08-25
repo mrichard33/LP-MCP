@@ -65,6 +65,11 @@ const OLD_AGENT = '4436170733 by cdeer @ 7_16_55 AM.wav';
 // The same call under the new format: no '_module' segment, so the GUID
 // appends straight onto the clock.
 const NEW_AGENT = '4436170733 by cdeer @ 7_16_55 AMCB3E712B7E084D8A9BD23381B216E482300000002866719.wav';
+// A shape the parser does NOT recognise — the stand-in for whatever Five9
+// changes next. The suffix is not 32 hex + 15 digits, so the name is refused
+// and counted rather than guessed at. Keeping a fixture like this is the point:
+// once the Aug-22 format parses, something still has to exercise the drop path.
+const UNREADABLE = '4436170733 by cdeer @ 7_16_55 AMWHATEVERCOMESNEXT.wav';
 
 /* ─── the filename asymmetry ─────────────────────────────────────────────── */
 
@@ -80,13 +85,34 @@ test('a transfer-leg filename survives the appended session GUID', () => {
   assert.match(parsed.ivrModule, /^Transfer to Lightfire/);
 });
 
-test('a plain agent-call filename does NOT survive it — this is the cliff', () => {
-  assert.ok(parseRecordingFilename(OLD_AGENT), 'the old shape parsed');
-  assert.equal(
-    parseRecordingFilename(NEW_AGENT),
-    null,
-    'with no module segment the GUID glues onto AM/PM and the clock stops parsing',
-  );
+test('a plain agent-call filename now survives it — the cliff is closed', () => {
+  // This assertion is inverted from the one PR 1 shipped. There it pinned the
+  // defect (the name returned null and the folder read as empty); here it pins
+  // the repair. The old shape must keep parsing alongside it.
+  assert.ok(parseRecordingFilename(OLD_AGENT), 'the old shape still parses');
+  const p = parseRecordingFilename(NEW_AGENT);
+  assert.ok(p, 'this returning null is the outage this PR fixes');
+  assert.equal(p.clockText, '7_16_55 AM', 'the clock survives the appended id');
+  assert.equal(p.ivrModule, null);
+  assert.equal(p.sessionId, 'CB3E712B7E084D8A9BD23381B216E482300000002866719');
+});
+
+test('a folder whose 0-of-N is total is reported to the worker', () => {
+  // The stats contract stageFetchRecording's reportUnreadableFolder keys on:
+  // described === 0 while wav > 0. That pair is what separates 'we cannot read
+  // this folder' from 'this folder is empty', and it is the trigger for the
+  // ci_events row and the GroupMe alarm.
+  const stats = { wav: 312, described: 0, unparseable: 312 };
+  assert.ok(stats.described === 0 && stats.wav > 0, 'the alarm condition');
+
+  // A partial parse must NOT trip it — one odd filename is a curiosity, not a
+  // format change, and paging on it is how the channel gets muted.
+  const partial = { wav: 312, described: 300, unparseable: 12 };
+  assert.ok(!(partial.described === 0 && partial.wav > 0), 'partial must not alarm');
+
+  // Neither must a genuinely empty folder.
+  const empty = { wav: 0, described: 0, unparseable: 0 };
+  assert.ok(!(empty.described === 0 && empty.wav > 0), 'an empty folder must not alarm');
 });
 
 test('the old transfer shape still parses — the fix must not regress it', () => {
@@ -103,7 +129,8 @@ test('list() reports what it silently discarded', async () => {
     file('notes.txt'),
     file(NEW_TRANSFER),
     file(NEW_AGENT),
-    file(NEW_AGENT.replace('4436170733', '7273302574')),
+    file(UNREADABLE),
+    file(UNREADABLE.replace('4436170733', '7273302574')),
   ];
   let stats = null;
   const adapter = createSftpAdapter({ cfg: CFG });
@@ -114,25 +141,25 @@ test('list() reports what it silently discarded', async () => {
     onStats: (s) => { stats = s; },
   });
 
-  // The return value is unchanged: one parseable file out of five entries.
-  assert.equal(out.length, 1);
+  // Both Aug-22 shapes now parse; only the unrecognised ones are dropped.
+  assert.equal(out.length, 2);
 
   assert.ok(stats, 'onStats must fire');
   assert.equal(stats.dir, '/Five9/Recordings/Main Number/8_25_2026');
-  assert.equal(stats.entries, 5);
+  assert.equal(stats.entries, 6);
   assert.equal(stats.dirs, 1);
   assert.equal(stats.nonWav, 1);
-  assert.equal(stats.wav, 3);
-  assert.equal(stats.described, 1);
+  assert.equal(stats.wav, 4);
+  assert.equal(stats.described, 2);
   // THE NUMBER THE WHOLE INVESTIGATION TURNS ON.
   assert.equal(stats.unparseable, 2);
   assert.equal(stats.unparseableNames.length, 2);
-  assert.equal(stats.unparseableNames[0], NEW_AGENT);
+  assert.equal(stats.unparseableNames[0], UNREADABLE);
   assert.equal(stats.listError, null);
 });
 
 test('a folder where NOTHING parses returns [] exactly like an empty one', async () => {
-  const entries = [file(NEW_AGENT), file(NEW_AGENT.replace('4436', '7273'))];
+  const entries = [file(UNREADABLE), file(UNREADABLE.replace('4436', '7273'))];
   let stats = null;
   const adapter = createSftpAdapter({ cfg: CFG });
   const out = await adapter.list({
@@ -149,7 +176,7 @@ test('a folder where NOTHING parses returns [] exactly like an empty one', async
 
 test('the verbatim filename samples are capped', async () => {
   const entries = Array.from({ length: 12 }, (_, i) =>
-    file(NEW_AGENT.replace('4436170733', `44361707${String(i).padStart(2, '0')}`)));
+    file(UNREADABLE.replace('4436170733', `44361707${String(i).padStart(2, '0')}`)));
   let stats = null;
   const adapter = createSftpAdapter({ cfg: CFG });
   await adapter.list({

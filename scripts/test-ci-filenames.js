@@ -45,7 +45,13 @@ import {
 
 test('plain agent call: ANI, agent, clock, no module', () => {
   const p = parseRecordingFilename('9419203087 by mgiraldo @ 4_30_12 PM.wav');
-  assert.deepEqual(p, { ani: '9419203087', agentUsername: 'mgiraldo', clockText: '4_30_12 PM', ivrModule: null });
+  assert.deepEqual(p, {
+    ani: '9419203087', agentUsername: 'mgiraldo', clockText: '4_30_12 PM',
+    ivrModule: null,
+    // Null for every pre-2026-08-22 name. The field exists on both eras so a
+    // caller never has to ask which era a row came from.
+    sessionId: null,
+  });
 });
 
 test('transfer leg: agent is EMPTY (by  @) and the module carries spaces', () => {
@@ -86,6 +92,116 @@ test('malformed names return null rather than a partial guess', () => {
     '9419203087 by mgiraldo 4_30_12 PM.wav',        // missing '@'
     '9419203087 by mgiraldo @ not-a-clock.wav',      // clock unparseable
     'abc by mgiraldo @ 4_30_12 PM.wav',              // ANI not numeric
+  ]) {
+    assert.equal(parseRecordingFilename(bad), null, `${JSON.stringify(bad)} must not parse`);
+  }
+});
+
+// ─── the 2026-08-22 format change ───────────────────────────────────────────
+//
+// Five9 began appending a session id: 32 hex characters followed by digits,
+// abutting whatever precedes it with NO separator. On a transfer leg it lands
+// after the module and the clock in front survives, so those files kept
+// parsing. On a plain agent call there is no module segment, so it glues onto
+// AM/PM and the whole name stopped parsing — 93% of volume, silently dropped
+// for three days. These are the real strings, verbatim from the archive.
+
+const NEW_TRANSFER = '9419203087 by  @ 1_49_32 PM_Transfer to LightfireCB3E712B7E084D8A9BD23381B216E482300000002866719.wav';
+const NEW_AGENT = '4436170733 by cdeer @ 7_16_55 AMCB3E712B7E084D8A9BD23381B216E482300000002866719.wav';
+
+test('the new plain-agent shape parses — the cliff', () => {
+  const p = parseRecordingFilename(NEW_AGENT);
+  assert.ok(p, 'this returning null IS the outage');
+  assert.equal(p.ani, '4436170733');
+  assert.equal(p.agentUsername, 'cdeer');
+  assert.equal(p.clockText, '7_16_55 AM', 'the clock must survive the appended id');
+  assert.equal(p.ivrModule, null, 'a plain agent call has no module');
+  assert.equal(p.sessionId, 'CB3E712B7E084D8A9BD23381B216E482300000002866719');
+});
+
+test('the new transfer shape yields a CLEAN module, not a GUID-suffixed one', () => {
+  // This is the assertion that repairs classifyTeam. ci_transfer_target_map
+  // holds exactly one label, 'Transfer to Lightfire', and classifyTeam matches
+  // it by EXACT equality — so while the id stayed glued to the module, not one
+  // transfer leg matched the map. Before the boundary: 101 rows, 2 distinct
+  // modules. After: 20 rows, 20 distinct modules.
+  const p = parseRecordingFilename(NEW_TRANSFER);
+  assert.ok(p);
+  assert.equal(p.clockText, '1_49_32 PM');
+  assert.equal(p.ivrModule, 'Transfer to Lightfire', 'exact — a prefix match would pass on the broken value');
+  assert.equal(p.sessionId, 'CB3E712B7E084D8A9BD23381B216E482300000002866719');
+});
+
+test('the session id is NEVER presented as a call id', () => {
+  // Verified 2026-08-25: the trailing digits are not ci_calls.five9_call_id.
+  // The ranges are disjoint by ~7.4 million and nothing maps between them.
+  // The module already carries this warning about the LEADING number; an
+  // earlier handoff assumed a call id was recoverable and the entire join had
+  // to be redesigned around the retraction.
+  const p = parseRecordingFilename(NEW_TRANSFER);
+  assert.equal('callId' in p, false);
+  assert.equal('five9CallId' in p, false);
+  assert.notEqual(p.sessionId, '300000010296218', 'must not be mistaken for the call id');
+});
+
+test('a module ENDING IN A HEX CHARACTER is not truncated', () => {
+  // 'Transfer to Lightfire' ends in 'e', which is a hex digit — so a leftmost
+  // scan for a 32-hex run starts one character early and returns the module as
+  // 'Transfer to Lightfir'. A rightmost scan eats into the id instead, because
+  // the trailing digits are hex characters too. Only the id's exact shape (32
+  // hex + exactly 15 digits, ending the string) pins the boundary.
+  //
+  // This is the failure mode worth a test of its own: a truncated module is
+  // silent. It misses ci_transfer_target_map's exact-equality lookup and
+  // re-breaks classifyTeam, which is the defect this parser exists to repair.
+  const p = parseRecordingFilename(NEW_TRANSFER);
+  assert.equal(p.ivrModule, 'Transfer to Lightfire');
+  assert.equal(p.ivrModule.length, 21, 'not 20 — the trailing e belongs to the module');
+  assert.ok(/^[0-9A-F]{32}\d{15}$/.test(p.sessionId), 'and the id keeps its leading C');
+});
+
+test('a module ending in several hex characters is also intact', () => {
+  const facade = '9419203087 by  @ 1_49_32 PM_Transfer to FacadeCB3E712B7E084D8A9BD23381B216E482300000002866719.wav';
+  assert.equal(parseRecordingFilename(facade).ivrModule, 'Transfer to Facade');
+});
+
+test('excluded modules are matched again once the id is stripped', () => {
+  // classifyExclusion compares by exact equality too, so the glued id disarmed
+  // the test-module and third-party guards along with team classification.
+  const suffixed = '7275551234 by  @ 11_05_09 AM_Third Party TransferCB3E712B7E084D8A9BD23381B216E482300000002866719.wav';
+  const p = parseRecordingFilename(suffixed);
+  assert.equal(p.ivrModule, 'Third Party Transfer');
+  assert.deepEqual(
+    classifyExclusion({ ivrModule: p.ivrModule, fileBytes: 350000, excludedModules: DEFAULT_EXCLUDED_IVR_MODULES }),
+    { excluded: true, reason: 'test_module' },
+  );
+});
+
+test('BOTH old shapes still parse byte-identically', () => {
+  // The archive holds these back to ~Aug 2023 and the backfill reads them, so
+  // a fix that only understands the new era would trade one outage for another.
+  const oldAgent = parseRecordingFilename('4436170733 by cdeer @ 7_16_55 AM.wav');
+  assert.equal(oldAgent.clockText, '7_16_55 AM');
+  assert.equal(oldAgent.ivrModule, null);
+  assert.equal(oldAgent.sessionId, null);
+
+  const oldTransfer = parseRecordingFilename('9419203087 by  @ 4_30_12 PM_Transfer to Lightfire.wav');
+  assert.equal(oldTransfer.clockText, '4_30_12 PM');
+  assert.equal(oldTransfer.ivrModule, 'Transfer to Lightfire');
+  assert.equal(oldTransfer.sessionId, null);
+});
+
+test('an UNRECOGNISED trailing blob still returns null — the refusal is the feature', () => {
+  // A parser that guesses at a shape it does not know is a parser that hides
+  // the next vendor change instead of surfacing it. Returning null keeps the
+  // file counted as unparseable by createSftpAdapter's onStats, which is the
+  // signal that made this break findable at all.
+  for (const bad of [
+    '4436170733 by cdeer @ 7_16_55 AMWHATEVERCAMENEXT.wav',       // no 32-hex run
+    '4436170733 by cdeer @ 7_16_55 AM-CB3E712B7E084D8A.wav',      // hex run too short
+    '4436170733 by cdeer @ 7_16_55 AM Transfer to X.wav',         // module without the '_'
+    '4436170733 by cdeer @ 7_16_55 AMCB3E712B7E084D8A9BD23381B216E48230000000286671.wav',   // 14 digits, not 15
+    '4436170733 by cdeer @ 7_16_55 AMCB3E712B7E084D8A9BD23381B216E4823000000028667199.wav', // 16 digits
   ]) {
     assert.equal(parseRecordingFilename(bad), null, `${JSON.stringify(bad)} must not parse`);
   }
