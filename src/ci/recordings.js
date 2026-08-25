@@ -398,14 +398,64 @@ export function classifyTeam({ ivrModule, agentUsername, agentFive9Id, campaign 
  */
 
 /**
+ * How many filenames a listing report quotes verbatim. Five is the handoff's
+ * number and it is deliberately small: these are customer phone numbers in a
+ * path, so the report samples the SHAPE of the names rather than dumping the
+ * folder. §10's logging posture — enough to identify the format, never a full
+ * inventory.
+ */
+export const STATS_SAMPLE = 5;
+
+/** The listing report for a folder that yielded nothing. */
+function emptyStats(dir) {
+  return {
+    dir,
+    entries: 0,
+    dirs: 0,
+    nonWav: 0,
+    wav: 0,
+    unparseable: 0,
+    unparseableNames: [],
+    wavNames: [],
+    described: 0,
+    excluded: 0,
+    usable: 0,
+    listError: null,
+    skippedDir: false,
+  };
+}
+
+/**
+ * Wrap an onStats callback so it CANNOT fail the listing that produced it.
+ *
+ * This is diagnostic output on the critical path of the only code that pulls
+ * audio off the archive. A reporter that throws — a bad console, a full disk,
+ * a caller's own bug — must cost the report, never the recording. Absent
+ * callback returns a no-op so `list()` needs no conditional at each call site.
+ */
+function makeStatsReporter(fn) {
+  if (typeof fn !== 'function') return () => {};
+  return (stats) => {
+    try {
+      fn(stats);
+    } catch (err) {
+      console.warn(`${LOG} listing stats callback threw (the listing itself is unaffected): ${err.message}`);
+    }
+  };
+}
+
+/**
  * sftp_pull — read-only crawl of ETG's archive.
  *
  * The ssh2-sftp-client dependency is loaded LAZILY so that importing this
  * module (which the worker and routes do at boot) never requires the package
  * to be installed or the credentials to exist. Discovery, the join, and every
  * pure helper stay usable — and testable — without it.
+ *
+ * `onStats` is an optional per-adapter listing reporter; `list()` accepts one
+ * per call that takes precedence. See list() for what it is for.
  */
-export function createSftpAdapter({ cfg = getConfig(), clientFactory } = {}) {
+export function createSftpAdapter({ cfg = getConfig(), clientFactory, onStats } = {}) {
   const name = 'sftp';
 
   async function connect() {
@@ -430,32 +480,90 @@ export function createSftpAdapter({ cfg = getConfig(), clientFactory } = {}) {
    * List recordings for one campaign/date pair. Both are REQUIRED — the
    * archive holds ~1,025 date folders under a single campaign, so an
    * unqualified crawl is a very expensive mistake.
+   *
+   * ══ WHY THIS TAKES AN onStats CALLBACK ══
+   * This function narrows a directory THREE times before it returns, and every
+   * one of those narrowings is silent:
+   *
+   *   1. directory entries are skipped
+   *   2. anything not matching /\.wav$/i is skipped
+   *   3. anything describeRecording() cannot parse is DROPPED
+   *
+   * Step 3 is the dangerous one. A folder holding three hundred files whose
+   * names the parser no longer recognises returns exactly the same value as a
+   * folder holding nothing — `[]` — and every caller downstream, the fetch
+   * stage and the diagnostic alike, reads that as "there is no audio here" and
+   * parks the call on `recording_missing`. There is no error, no log line and
+   * no count, so the failure is indistinguishable from the normal case.
+   *
+   * The swallowed-ENOENT catch below has the same shape: a listing that threw
+   * becomes `[]` and reads as an empty folder.
+   *
+   * onStats reports what those narrowings discarded. It is OPTIONAL and
+   * defaults to a no-op, so the worker, the listing cache and every existing
+   * caller keep today's exact return value; only a caller that asks gets the
+   * counts. Nothing here writes, and a throwing onStats must never be able to
+   * fail a listing — see makeStatsReporter().
    */
-  async function list({ campaign, date, client: injected } = {}) {
+  async function list({ campaign, date, client: injected, onStats: onStatsArg } = {}) {
     assertReadOnly(cfg);
     if (!campaign) throw new Error('list requires a campaign');
-    if (isSkippedDir(campaign)) return [];
+    const report = makeStatsReporter(onStatsArg ?? onStats);
     const dateDir = typeof date === 'string' ? date : dateDirFor(date ?? new Date(), cfg.recordingTzOffsetMin);
     const dir = `${cfg.sftp.root}/${campaign}/${dateDir}`;
+
+    if (isSkippedDir(campaign)) {
+      report({ ...emptyStats(dir), skippedDir: true });
+      return [];
+    }
 
     const client = injected || await connect();
     try {
       const entries = await client.list(dir);
       const out = [];
+      let dirs = 0;
+      let nonWav = 0;
+      const unparseableNames = [];
+      const wavNames = [];
       for (const e of entries) {
-        if (e.type === 'd') continue;
-        if (!/\.wav$/i.test(e.name)) continue;
+        if (e.type === 'd') { dirs += 1; continue; }
+        if (!/\.wav$/i.test(e.name)) { nonWav += 1; continue; }
+        if (wavNames.length < STATS_SAMPLE) wavNames.push(e.name);
         const described = describeRecording({
           fullPath: `${dir}/${e.name}`,
           fileBytes: e.size,
           cfg,
         });
         if (described) out.push(described);
+        // Not a soft skip: the file IS on the archive and we cannot read its
+        // name. Sampled verbatim so the report says what the new shape is.
+        else if (unparseableNames.length < STATS_SAMPLE) unparseableNames.push(e.name);
       }
+      const wav = entries.length - dirs - nonWav;
+      report({
+        dir,
+        entries: entries.length,
+        dirs,
+        nonWav,
+        wav,
+        unparseable: wav - out.length,
+        unparseableNames,
+        wavNames,
+        described: out.length,
+        excluded: out.filter((r) => r.excluded).length,
+        usable: out.filter((r) => !r.excluded).length,
+        listError: null,
+        skippedDir: false,
+      });
       return out;
     } catch (err) {
       // A missing date folder is normal — no calls on that campaign that day.
-      if (/no such file|not found|ENOENT/i.test(err.message || '')) return [];
+      // Reported all the same: "the folder is not there" and "the folder is
+      // empty" are the same return value and must not be the same finding.
+      if (/no such file|not found|ENOENT/i.test(err.message || '')) {
+        report({ ...emptyStats(dir), listError: err.message || 'no such file' });
+        return [];
+      }
       throw err;
     } finally {
       if (!injected && client?.end) await client.end().catch(() => {});
@@ -909,6 +1017,7 @@ export default {
   createManualAdapter,
   createListingCache,
   listingCacheKey,
+  STATS_SAMPLE,
   matchRecordingToCall,
   describeRecording,
   classifyTeam,
