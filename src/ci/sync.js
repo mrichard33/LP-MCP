@@ -190,7 +190,23 @@ export async function syncToLp(call, summary, match, { db = supabase, cfg = getC
 
   try {
     const resp = await lpClient.addNote({ rectype, recid, notes: noteBody, categoryId: cfg.lpNoteCategoryId });
-    await markSynced(db, claim.row.id, { externalRef: extractLpNoteId(resp), response: shapeOf(resp) });
+    // external_ref stays NULL for LP, deliberately.
+    //
+    // /api/SalesApi/AddNotes answers with the bare string "UPDATED
+    // SUCCESSFULLY!" and nothing else — no id, no digits, measured across
+    // every live note written since 2026-08-24 (one distinct response
+    // template, recorded by shapeOf). There is no id to extract, so the code
+    // no longer pretends there might be: an extractor here would be a
+    // permanent no-op that reads like a capability.
+    //
+    // The receipt is `addNote` NOT THROWING — lpPost raises on any non-2xx, so
+    // reaching this line means LP accepted the write. A null external_ref is
+    // therefore an absent id, never an unconfirmed delivery.
+    //
+    // The note's real LP id does exist, just not here: it arrives later on the
+    // notes mirror (lp_notes.lp_note_id — e.g. 2238213 for the 08-24 notes),
+    // which is where to join if an audit ever needs one.
+    await markSynced(db, claim.row.id, { externalRef: null, response: shapeOf(resp) });
     console.log(`${LOG} call=${call.id} target=lp synced (${rectype}/${recid})`);
     return { target, synced: true };
   } catch (err) {
@@ -338,57 +354,6 @@ export async function syncCall(call, summary, match, opts = {}) {
     ? r.value
     : { target, failed: true, error: String(r.reason?.message || r.reason) });
   return { lp: unwrap(lp, 'lp'), ghl: unwrap(ghl, 'ghl') };
-}
-
-/**
- * Pull an id out of a legacy LP acknowledgment.
- *
- * ANCHORED DELIBERATELY. The obvious rule — "the trailing number" — is wrong
- * against prose: an acknowledgment like `Notes added for recid 452742` would
- * yield the RECID, and external_ref would then hold a customer record id
- * labelled as a note id. A null external_ref is honest; a plausible wrong one
- * is not, and nothing downstream would ever flag it.
- *
- * So a number is taken only where it cannot be anything else: the whole string
- * is the id, or it follows a separator in the documented `...: <id>` shape.
- * Anything else returns null, which is exactly what happens today.
- */
-function idFromAck(text) {
-  const s = String(text ?? '').trim();
-  if (!s) return null;
-  const m = s.match(/^(\d+)$/) || s.match(/[:#=]\s*(\d+)$/);
-  return m ? m[1] : null;
-}
-
-/**
- * Response id extraction, mirroring src/ghl-note-pipeline/lp-write.js.
- *
- * 2026-08-24 — the FIRST live AI call notes posted, and every one recorded
- * external_ref NULL. lpPost returns `await res.json()`, and AddNotes answers
- * with a bare JSON string, so `resp` is a STRING: `resp.note_id`/`noteId`/`id`
- * are all undefined on it, and the fallback then read `resp.message`, which is
- * undefined too. The one branch that could have matched an id never saw the
- * payload — the string fell straight through to null.
- *
- * The sibling extractor in lp-write.js carries the identical defect, and the
- * evidence was already sitting there: 0 of 131 rows written since that pipeline
- * went live ever carried an lp_note_id (recorded 2026-07-29). Both are fixed
- * together; test-ci-lp-note-id.js pins them to the same behaviour so the two
- * mirrors cannot drift.
- *
- * NOTE: no sample of LP's actual acknowledgment string exists — not in the
- * repo, not in the docs, not in retained logs — because every logger records
- * the SHAPE and discards the content (§10). idFromAck is therefore conservative
- * on purpose, and shapeOf now records a digit-masked template of a short string
- * response so the next live write answers the question for good.
- */
-export function extractLpNoteId(resp) {
-  if (!resp) return null;
-  if (typeof resp === 'string') return idFromAck(resp);
-  if (resp.note_id) return String(resp.note_id);
-  if (resp.noteId) return String(resp.noteId);
-  if (resp.id) return String(resp.id);
-  return idFromAck(resp.message);
 }
 
 /**
