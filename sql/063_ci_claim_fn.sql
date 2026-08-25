@@ -19,7 +19,27 @@
 --
 -- ORDERING matches ci_calls_status_retry_idx (status, next_retry_at,
 -- call_start) from sql/061 so the claim uses the index rather than sorting the
--- table. Oldest call first: a backlog drains in the order calls happened.
+-- table.
+--
+-- NEWEST CALL FIRST (2026-08-25, reversed from oldest-first).
+-- A CRM note is worth most while the call is still live for the rep working
+-- the record — a note on this morning's conversation changes the next call;
+-- one on a five-day-old conversation is history. Oldest-first put every fresh
+-- call behind the entire backlog: with 1,509 calls queued from 08-19..08-21,
+-- a call taken now would have been the 1,510th processed.
+--
+-- WHY THIS DOES NOT STARVE THE BACKLOG. Throughput is batch 25 every 30s
+-- (~72k calls/day of capacity) against ~650 eligible calls/day of real volume,
+-- so the queue empties to zero many times over in a day and old calls are
+-- reached in the gaps. If that ratio ever inverts — a much larger batch of
+-- history, or a much slower per-stage cost — revisit this: strict LIFO starves
+-- the tail, and the fix then is a reserved share of each batch for the oldest
+-- rows rather than flipping back to oldest-first.
+--
+-- A call too fresh to have audio yet is NOT a problem here: stageFetchRecording
+-- defers it (recording_not_yet_available) until CI_RECORDING_WAIT_HOURS, and
+-- next_retry_at then excludes it from this claim, so it costs one SFTP listing
+-- and steps aside rather than blocking the batch.
 --
 -- Mirrored in runMigrations() (src/index.js). Additive; creates one function
 -- and no tables. Safe to re-run — CREATE OR REPLACE.
@@ -42,7 +62,7 @@ AS $fn$
       AND eligible
       AND (next_retry_at IS NULL OR next_retry_at <= now())
       AND (locked_until  IS NULL OR locked_until  <  now())
-    ORDER BY call_start
+    ORDER BY call_start DESC
     LIMIT GREATEST(1, p_limit)
     FOR UPDATE SKIP LOCKED
   )

@@ -93,7 +93,11 @@ export async function claimBatch({ db = supabase, statuses = CLAIMABLE, limit = 
       .select('*')
       .in('status', statuses)
       .eq('eligible', true)
-      .order('call_start', { ascending: true })
+      // NEWEST FIRST, matching claim_ci_calls (sql/063). If the two ever
+      // disagree, the pipeline's processing order would depend on whether the
+      // SQL function happened to be deployed — the worst kind of difference,
+      // because both paths "work".
+      .order('call_start', { ascending: false })
       .limit(limit);
     if (error) throw new Error(`fallback claim failed: ${error.message}`);
     return { rows: data || [], claimed: false };

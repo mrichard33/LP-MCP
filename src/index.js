@@ -1044,7 +1044,7 @@ async function runMigrations() {
                   AND eligible
                   AND (next_retry_at IS NULL OR next_retry_at <= now())
                   AND (locked_until  IS NULL OR locked_until  <  now())
-                ORDER BY call_start
+                ORDER BY call_start DESC
                 LIMIT GREATEST(1, p_limit)
                 FOR UPDATE SKIP LOCKED
               )
