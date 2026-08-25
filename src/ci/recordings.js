@@ -493,6 +493,126 @@ export function createManualAdapter() {
   };
 }
 
+
+/* ─── the per-tick listing memo ─────────────────────────────────────────── */
+
+/**
+ * The memo key for one (campaign, dateDir) pair.
+ *
+ * The separator is NUL, and that is not a style choice. Campaign directory
+ * names carry spaces and hyphens — 'Data - Hot Leads less than 7', 'Magazine -
+ * CLiPP' — so a separator that can occur INSIDE a key is a separator that folds
+ * two different folders onto one cache entry. ':' and '|' are both plausible
+ * inside a Five9 campaign name; NUL cannot appear in either a campaign name or
+ * a date directory, so the mapping stays injective.
+ *
+ * A collision here would not fail loudly: the second campaign would be served
+ * the FIRST campaign's file list, find no candidate, and park the call on
+ * `recording_missing` — the exact symptom this cache exists to reduce.
+ */
+export function listingCacheKey(campaign, dateDir) {
+  return `${String(campaign ?? '')}\u0000${String(dateDir ?? '')}`;
+}
+
+/**
+ * Memoize `adapter.list` for the life of ONE worker tick.
+ *
+ * ── WHY ────────────────────────────────────────────────────────────────────
+ * stageFetchRecording lists a directory per CALL. A batch of 50 shares a
+ * handful of campaign/date pairs, and each list() opens its own SFTP
+ * connection, reads a folder holding up to 758 files, and disconnects. Fifty
+ * listings for three folders is why a tick of 50 outlived its 300s lease.
+ *
+ * ── LIFETIME IS THE TICK, DELIBERATELY ─────────────────────────────────────
+ * Created in runTick and thrown away with it. NOT module-level, and NOT
+ * TTL'd — a listing that outlives the tick means audio that HAS since landed
+ * on the archive reads as absent, and the call is parked `recording_missing`.
+ * That turns a throughput fix into data loss, a strictly worse trade than the
+ * listing it saves.
+ *
+ * ── WHAT IS AND IS NOT CACHED ──────────────────────────────────────────────
+ * The LISTING only. Fetched bytes are never held here — this wraps list() and
+ * nothing else, so the adapter's fetch() stays the single path for audio.
+ *
+ * An empty result IS cached: an empty folder is a valid answer for the tick.
+ *
+ * A THROWN listing is NEVER cached. The entry is removed on rejection so the
+ * next call re-lists. Caching the error would let one transient SFTP failure
+ * park every remaining call in the batch on `recording_missing` — fifty calls
+ * lost to one blip.
+ *
+ * @param {object} opts.adapter  anything with `list({ campaign, date })`
+ * @param {object} [opts.cfg]    for the date normalization only
+ * @returns {{ list: Function, stats: Function }}
+ */
+export function createListingCache({ adapter, cfg = getConfig() } = {}) {
+  if (typeof adapter?.list !== 'function') {
+    throw new Error('createListingCache requires an adapter with a list()');
+  }
+
+  /** key → in-flight or settled Promise<recording[]>. */
+  const entries = new Map();
+  const counts = { pairs: 0, calls: 0, hits: 0, errors: 0 };
+
+  /**
+   * Normalize `date` exactly as createSftpAdapter().list does, so the key is
+   * derived from the directory that will actually be listed. Without this, two
+   * Date objects for the same day key differently and both miss.
+   */
+  function dirFor(date) {
+    return typeof date === 'string'
+      ? date
+      : dateDirFor(date ?? new Date(), cfg.recordingTzOffsetMin);
+  }
+
+  /**
+   * The key is the FOLDER, never the connection: any extra argument (an
+   * injected `client`) is forwarded to the adapter but deliberately kept out
+   * of the key, because two connections to the same archive see the same
+   * directory. Keying on it would just re-list the folder per connection.
+   */
+  async function list({ campaign, date, ...rest } = {}) {
+    const dateDir = dirFor(date);
+    const key = listingCacheKey(campaign, dateDir);
+    counts.calls += 1;
+
+    let pending = entries.get(key);
+    if (pending) {
+      counts.hits += 1;
+    } else {
+      counts.pairs += 1;
+      pending = adapter.list({ campaign, date: dateDir, ...rest }).catch((err) => {
+        // Evict BEFORE rethrowing: a failed listing must not become this
+        // tick's answer for the pair.
+        entries.delete(key);
+        counts.errors += 1;
+        throw err;
+      });
+      entries.set(key, pending);
+    }
+
+    const out = await pending;
+    // A copy per caller. The elements themselves are shared — nothing in the
+    // pipeline mutates a described recording — but handing out the same ARRAY
+    // instance fifty times invites one caller's sort or splice to rewrite what
+    // the other forty-nine see.
+    return Array.isArray(out) ? out.slice() : out;
+  }
+
+  /** What the tick log reports: how much listing this actually saved. */
+  function stats() {
+    return {
+      pairs: counts.pairs,
+      calls: counts.calls,
+      hits: counts.hits,
+      errors: counts.errors,
+      hit_rate: counts.calls ? Math.round((counts.hits / counts.calls) * 100) / 100 : 0,
+    };
+  }
+
+  return { list, stats };
+}
+
 /* ─── storage ───────────────────────────────────────────────────────────── */
 
 /**
@@ -787,6 +907,8 @@ export const _internal = { confidenceFor, last4 };
 export default {
   createSftpAdapter,
   createManualAdapter,
+  createListingCache,
+  listingCacheKey,
   matchRecordingToCall,
   describeRecording,
   classifyTeam,
