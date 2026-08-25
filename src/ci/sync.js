@@ -268,23 +268,83 @@ export async function syncCall(call, summary, match, opts = {}) {
   return { lp: unwrap(lp, 'lp'), ghl: unwrap(ghl, 'ghl') };
 }
 
-/** Response id extraction, mirroring src/ghl-note-pipeline/lp-write.js. */
+/**
+ * Pull an id out of a legacy LP acknowledgment.
+ *
+ * ANCHORED DELIBERATELY. The obvious rule — "the trailing number" — is wrong
+ * against prose: an acknowledgment like `Notes added for recid 452742` would
+ * yield the RECID, and external_ref would then hold a customer record id
+ * labelled as a note id. A null external_ref is honest; a plausible wrong one
+ * is not, and nothing downstream would ever flag it.
+ *
+ * So a number is taken only where it cannot be anything else: the whole string
+ * is the id, or it follows a separator in the documented `...: <id>` shape.
+ * Anything else returns null, which is exactly what happens today.
+ */
+function idFromAck(text) {
+  const s = String(text ?? '').trim();
+  if (!s) return null;
+  const m = s.match(/^(\d+)$/) || s.match(/[:#=]\s*(\d+)$/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Response id extraction, mirroring src/ghl-note-pipeline/lp-write.js.
+ *
+ * 2026-08-24 — the FIRST live AI call notes posted, and every one recorded
+ * external_ref NULL. lpPost returns `await res.json()`, and AddNotes answers
+ * with a bare JSON string, so `resp` is a STRING: `resp.note_id`/`noteId`/`id`
+ * are all undefined on it, and the fallback then read `resp.message`, which is
+ * undefined too. The one branch that could have matched an id never saw the
+ * payload — the string fell straight through to null.
+ *
+ * The sibling extractor in lp-write.js carries the identical defect, and the
+ * evidence was already sitting there: 0 of 131 rows written since that pipeline
+ * went live ever carried an lp_note_id (recorded 2026-07-29). Both are fixed
+ * together; test-ci-lp-note-id.js pins them to the same behaviour so the two
+ * mirrors cannot drift.
+ *
+ * NOTE: no sample of LP's actual acknowledgment string exists — not in the
+ * repo, not in the docs, not in retained logs — because every logger records
+ * the SHAPE and discards the content (§10). idFromAck is therefore conservative
+ * on purpose, and shapeOf now records a digit-masked template of a short string
+ * response so the next live write answers the question for good.
+ */
 export function extractLpNoteId(resp) {
   if (!resp) return null;
+  if (typeof resp === 'string') return idFromAck(resp);
   if (resp.note_id) return String(resp.note_id);
   if (resp.noteId) return String(resp.noteId);
   if (resp.id) return String(resp.id);
-  const m = String(resp.message || '').match(/(\d+)\s*$/);
-  return m ? m[1] : null;
+  return idFromAck(resp.message);
 }
+
+/**
+ * Longest string response templated into `response`. A composed note runs
+ * ~1,000–1,600 bytes (measured on the first five live notes), so a cap this
+ * far below that cannot capture a note body even if LP ever echoed one back.
+ */
+export const ACK_TEMPLATE_MAX = 80;
 
 /**
  * Shape-only description of a CRM response. §10 keeps note bodies and customer
  * data out of stored logs — the key names are enough to tell a changed API
  * from a failed extraction, which is what this is for.
+ *
+ * A STRING response gets one thing more: a digit-masked template, e.g.
+ * `Notes added: #####`. Without it, `{shape: 'string'}` is all we ever learn,
+ * and "LP hands back no id" stays indistinguishable from "our extractor is
+ * wrong" — the exact ambiguity that left lp_note_id null on 131 rows for a
+ * month. Every digit is masked, so an id cannot leak through it, and only a
+ * short string is templated at all.
  */
 export function shapeOf(resp) {
   if (resp == null) return { shape: 'null' };
+  if (typeof resp === 'string') {
+    const out = { shape: 'string', length: resp.length };
+    if (resp.length <= ACK_TEMPLATE_MAX) out.template = resp.replace(/\d/g, '#');
+    return out;
+  }
   if (typeof resp !== 'object') return { shape: typeof resp };
   return { shape: 'object', keys: Object.keys(resp).slice(0, 10) };
 }
