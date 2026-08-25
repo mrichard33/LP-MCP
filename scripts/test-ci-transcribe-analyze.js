@@ -462,21 +462,38 @@ test('the superseded analysis is demoted, never deleted — it is the audit trai
 });
 
 test('stageAnalyze stores a flagged summary AND sends the call to review', async () => {
-  const dnc = validAnalysis();
-  dnc.flags.dnc_request = true;
-  const db = fakeDb({ transcript: { call_id: CALL.id, transcript_text: 'take me off your list' } });
+  // A BLOCKING flag. dnc_request used to park here too, and that was the bug:
+  // it meant the reasons that most need a rep's eyes were the only ones that
+  // never produced a note. Those now advance and are queued after the write —
+  // see scripts/test-ci-deferred-review.js. An unintelligible transcript is
+  // still a hard stop, because there is nothing worth delivering.
+  const unreadable = validAnalysis();
+  unreadable.quality.transcript_intelligible = false;
+  const db = fakeDb({ transcript: { call_id: CALL.id, transcript_text: '...' } });
 
   const r = await stageAnalyze(CALL, {
     db,
     cfg: CFG,
-    callJson: async () => ({ json: dnc }),
+    callJson: async () => ({ json: unreadable }),
   });
 
   assert.equal(r.outcome, 'review');
-  assert.equal(r.reason, 'dnc_request');
+  assert.equal(r.reason, 'transcript_unintelligible');
   // The summary must still be on disk — a reviewer has to read what was said.
   assert.ok(db.log.some((l) => l.table === 'ci_summaries' && l.op === 'insert'),
     'a flagged analysis is stored, not discarded');
+});
+
+test('a DNC request no longer parks at analysis — it advances to be delivered', async () => {
+  const dnc = validAnalysis();
+  dnc.flags.dnc_request = true;
+  const db = fakeDb({ transcript: { call_id: CALL.id, transcript_text: 'take me off your list' } });
+
+  const r = await stageAnalyze(CALL, { db, cfg: CFG, callJson: async () => ({ json: dnc }) });
+
+  assert.equal(r.outcome, 'advanced');
+  assert.equal(r.deferred_review, 'dnc_request', 'the reason rides along to sync');
+  assert.ok(db.log.some((l) => l.table === 'ci_summaries' && l.op === 'insert'));
 });
 
 // ─── WAV handling, which is what makes stereo splitting possible ────────────

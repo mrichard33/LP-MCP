@@ -135,6 +135,36 @@ export function formatRecordingLine({ token, expiresAt, extraSegments = 0, linkB
 }
 
 /**
+ * The header's outcome segment.
+ *
+ * ── WHY A FLAG OUTRANKS THE OUTCOME HERE ───────────────────────────────────
+ * §7's `outcome` is what the call was ABOUT; `flags.dnc_request` and
+ * `flags.cancellation_request` are what the customer ASKED FOR, and the two
+ * are independent. A call can end 'appointment_confirmed' and still contain
+ * "and take me off your list" — in which case a header reading only
+ * `Outcome: Appointment confirmed` is true and useless, and the rep who acts
+ * on it calls a customer who asked not to be called.
+ *
+ * So the flag leads the segment and the real outcome follows it. It is in the
+ * HEADER rather than in Key details deliberately: Key details is the line a
+ * rep skims past.
+ *
+ * DNC beats cancellation when a call carries both — it is the one with legal
+ * weight. And when the outcome IS the flag ('dnc_request'), the segment does
+ * not say it twice.
+ */
+export function formatOutcomeSegment(analysis) {
+  const label = outcomeLabel(analysis?.outcome);
+  const flag = analysis?.flags?.dnc_request ? { text: 'DNC REQUESTED', outcome: 'dnc_request' }
+    : analysis?.flags?.cancellation_request ? { text: 'Cancellation requested', outcome: 'cancellation_request' }
+      : null;
+
+  if (!flag) return `Outcome: ${label}`;
+  if (analysis?.outcome === flag.outcome) return `Outcome: ${flag.text}`;
+  return `Outcome: ${flag.text} — ${label}`;
+}
+
+/**
  * A phone number as a human reads it: '2394930774' -> '(239) 493-0774'.
  *
  * Returns null — so the caller omits its line entirely — for anything that is
@@ -221,7 +251,7 @@ export function composeNote(call, summary, link = null, agentLabel = null) {
   const analysis = summary?.output ?? {};
   const direction = String(call?.direction || '').toLowerCase().includes('inbound') ? 'inbound' : 'outbound';
 
-  const header = `[AI CALL NOTE | ${formatEt(call?.call_start)} | ${direction} | ${formatAgentSegment(call, agentLabel)} | Outcome: ${outcomeLabel(analysis.outcome)}]`;
+  const header = `[AI CALL NOTE | ${formatEt(call?.call_start)} | ${direction} | ${formatAgentSegment(call, agentLabel)} | ${formatOutcomeSegment(analysis)}]`;
 
   const lines = [header];
   if (analysis.summary) lines.push(String(analysis.summary).trim());
@@ -264,6 +294,7 @@ export default {
   composeNote,
   idempotencyKey,
   formatAgentSegment,
+  formatOutcomeSegment,
   formatPhoneLine,
   outcomeLabel,
   formatEt,

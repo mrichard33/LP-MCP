@@ -268,9 +268,58 @@ export const OUTCOME_CONFIDENCE_FLOOR = 0.7;
  */
 export const NON_BLOCKING_REVIEW_FLAGS = new Set(['unknown_team']);
 
-/** The flags in `flags` that actually stop a call. Order is preserved. */
+/**
+ * Flags whose call is DELIVERED FIRST and queued for a human afterwards.
+ *
+ * ── THE PROBLEM THIS FIXES ─────────────────────────────────────────────────
+ * These two are flagged during analysis, which used to park the call BEFORE
+ * matching and sync ever ran. So the two review reasons that most need to
+ * reach a rep's eyes — 85 calls — were exactly the ones that never produced a
+ * note. A cancellation or a DNC request sitting only in an internal queue is
+ * worse than useless: the customer's record shows nothing at all, and the next
+ * rep to open it has no idea the customer asked to be left alone.
+ *
+ * So: the note goes out AND the call stays queued for a human. Both, not
+ * either. stageAnalyze advances instead of parking, and stageSync parks the
+ * call after the write lands, with this reason.
+ *
+ * ── HOW THIS DIFFERS FROM NON_BLOCKING_REVIEW_FLAGS ────────────────────────
+ * Two sets because they are two behaviours, not one with a switch:
+ *
+ *   NON_BLOCKING_REVIEW_FLAGS   deliver, then COMPLETE. Nothing for a human
+ *                               to do — an unresolved team has no answer to
+ *                               find, so queueing it queues work nobody can
+ *                               clear.
+ *   DEFER_REVIEW_UNTIL_SYNCED   deliver, then QUEUE. A human must act on it.
+ *
+ * ── NOTHING IS AUTO-ACTIONED ───────────────────────────────────────────────
+ * Being in this set makes a call VISIBLE. It does not tag, write a DNC, or
+ * cancel an appointment. Acting on "take me off your list" stays human.
+ */
+export const DEFER_REVIEW_UNTIL_SYNCED = new Set(['dnc_request', 'cancellation_request']);
+
+/**
+ * The flags in `flags` that actually stop a call at analysis. Order preserved.
+ *
+ * A call carrying BOTH a deferred flag and a blocking one PARKS: the quality
+ * gate wins over the delivery wish. A note composed from a transcript nobody
+ * could make out is not worth delivering just because it also mentioned a DNC.
+ */
 export function blockingReviewFlags(flags) {
-  return (flags || []).filter((f) => !NON_BLOCKING_REVIEW_FLAGS.has(f));
+  return (flags || []).filter(
+    (f) => !NON_BLOCKING_REVIEW_FLAGS.has(f) && !DEFER_REVIEW_UNTIL_SYNCED.has(f),
+  );
+}
+
+/**
+ * The ONE reason a delivered call is queued on, or null.
+ *
+ * First match wins, and analysisReviewFlags pushes dnc_request ahead of
+ * cancellation_request — so a call that asked for both is queued as the DNC.
+ * That ordering is deliberate: DNC carries the legal weight.
+ */
+export function deferredReviewReason(flags) {
+  return (flags || []).find((f) => DEFER_REVIEW_UNTIL_SYNCED.has(f)) ?? null;
 }
 
 /**

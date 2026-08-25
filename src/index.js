@@ -1226,6 +1226,28 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] call intelligence discovery cursor index FAILED (cold-start cursor will seq-scan ci_calls — apply sql/072 manually):', err.message);
   }
+
+  // CI deferred review reason (sql/073 — the file is the source of truth). A
+  // DNC or cancellation request is raised at ANALYSIS, which parked the call
+  // before sync ever ran — so the two review reasons that most need a rep's
+  // eyes were the only two that never produced a note. This column carries the
+  // reason across the two stages: stageAnalyze records it and advances,
+  // stageSync writes the note and then parks the call on it. Additive, one
+  // nullable column, no backfill.
+  //
+  // This one is load-bearing, not best-effort: without the column EVERY
+  // stageAnalyze advance rejects on the unknown column, so calls burn their
+  // attempts and land in 'failed' rather than parking in review. This runs
+  // before startCiWorkerScheduler() (see app.listen below), so the column is
+  // in place before a tick can happen — but if this line ever logs FAILED,
+  // apply sql/073 by hand before the worker is armed.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL('ALTER TABLE ci_calls ADD COLUMN IF NOT EXISTS pending_review_reason text;');
+    console.log('[Migration] call intelligence deferred review reason (sql/073) ready');
+  } catch (err) {
+    console.error('[Migration] call intelligence deferred review reason FAILED — apply sql/073 MANUALLY before arming the worker; until then every analyze advance rejects and calls exhaust their attempts into "failed":', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
