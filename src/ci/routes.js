@@ -554,9 +554,17 @@ export function registerCiRoutes(app, authenticate) {
    * summaries. Every recording that WAS ingested linked correctly (0 unlinked
    * across every campaign), so this is a retrieval gap, not a matching one.
    *
-   * The verdicts name four different fixes and are deliberately not collapsed
-   * into "missing". `unknown` means the archive could not be read and is never
+   * The verdicts name different fixes and are deliberately not collapsed into
+   * "missing". `unknown` means the archive could not be read and is never
    * counted as a cause.
+   *
+   * `transferred` is the one verdict with NO fix: the conversation continued
+   * off Five9 after a transfer and Five9 records only its own leg, so no
+   * archive search will ever find it. Those calls are classified before the
+   * expected-recordings filter — a transferred call whose Five9 leg was never
+   * recorded used to be counted as "correctly parked", i.e. nothing to
+   * recover, which is the opposite of true. The `transfers` block rolls them
+   * up per destination DNIS so the destinations can be identified.
    */
   app.get('/ci/diagnose-recordings', ...guards, async (req, res) => {
     try {
