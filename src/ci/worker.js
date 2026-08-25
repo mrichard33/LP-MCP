@@ -21,7 +21,7 @@
 import supabase from '../supabase.js';
 import { runSQL } from '../admin/supabase-admin.js';
 import { getConfig, nextRetryAt } from './config.js';
-import { createSftpAdapter, createManualAdapter, describeRecording, matchRecordingToCall, storeAudio, sha256Hex, ensureLinkToken, linkableRecording, transcodeAndStoreMp3 } from './recordings.js';
+import { createSftpAdapter, createManualAdapter, createListingCache, describeRecording, matchRecordingToCall, storeAudio, sha256Hex, ensureLinkToken, linkableRecording, transcodeAndStoreMp3 } from './recordings.js';
 import { dateDirFor, last4, last10 } from './time.js';
 import { transcribeCall, createOpenAITranscriber, createStorageAudioLoader } from './transcribe.js';
 import { analyzeTranscript } from './analyze.js';
@@ -182,8 +182,14 @@ export async function advance(db, call, fromStage, toStatus, detail = null) {
  *                             something anyone looks at again
  *   - recording is excluded → skipped with the exclusion reason
  */
-export async function stageFetchRecording(call, { db = supabase, cfg = getConfig(), adapter, now = new Date() } = {}) {
+export async function stageFetchRecording(call, { db = supabase, cfg = getConfig(), adapter, listings, now = new Date() } = {}) {
   const sftp = adapter || createSftpAdapter({ cfg });
+  // The tick's shared listing memo. runTick builds one and threads it through
+  // every call in the batch — that is the whole point, since a batch of 50
+  // shares a handful of campaign/date folders. A DIRECT caller (the review
+  // endpoint, a backfill, a test) passes none and gets a cache of one, so this
+  // stage behaves identically either way.
+  const archive = listings || createListingCache({ adapter: sftp, cfg });
 
   if (!call.campaign) {
     await sendToReview(db, call, 'fetch', 'no_campaign', { note: 'recording lookup needs the campaign directory' });
@@ -191,7 +197,7 @@ export async function stageFetchRecording(call, { db = supabase, cfg = getConfig
   }
 
   const dateDir = dateDirFor(new Date(call.call_start), cfg.recordingTzOffsetMin);
-  const candidates = await sftp.list({ campaign: call.campaign, date: dateDir });
+  const candidates = await archive.list({ campaign: call.campaign, date: dateDir });
 
   // Excluded files (test modules, sub-floor sizes) are never candidates — but
   // they were still recorded as rows by the crawl, so the exclusion is auditable.
@@ -679,10 +685,10 @@ export function bestRecordingForCall(call, recordings, windowSeconds = 180) {
 const NOT_YET_IMPLEMENTED = {};
 
 /** Dispatch one claimed call to its stage handler. */
-export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapter, transcriber, loadAudio, callJson, lpClient, ghlClient, now = new Date(), canvasserPhones, agentMap } = {}) {
+export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapter, listings, transcriber, loadAudio, callJson, lpClient, ghlClient, now = new Date(), canvasserPhones, agentMap } = {}) {
   try {
     if (call.status === 'discovered') {
-      return await stageFetchRecording(call, { db, cfg, adapter, now });
+      return await stageFetchRecording(call, { db, cfg, adapter, listings, now });
     }
     if (call.status === 'fetched') {
       return await stageTranscribe(call, { db, cfg, transcriber, loadAudio, now });
@@ -753,13 +759,37 @@ export async function runTick({ db = supabase, cfg = getConfig(), adapter, trans
     // identity line — both must print the SAME label.
     const agents = agentMap ?? await loadAgentMap(db);
 
+    // ONE archive listing per (campaign, date) FOLDER per tick, not one per
+    // call. The fetch stage lists a directory for every call it advances, and
+    // every list() is its own SFTP connect over a folder holding up to 758
+    // files — a batch of 50 sharing three folders paid for fifty of them, which
+    // is how a tick outlived its own 300s lease and handed the same rows back.
+    //
+    // Built HERE, inside the tick, and discarded with it. Deliberately not
+    // module-level and deliberately not TTL'd: a listing that outlives the tick
+    // would report audio that has since landed as absent, parking the call on
+    // `recording_missing`. That trades a throughput win for lost recordings.
+    //
+    // The adapter is built once too. Construction opens no connection, so this
+    // costs nothing beyond the object — but it means the memo and the fetches
+    // it feeds are the same adapter rather than fifty of them.
+    const sftp = adapter || createSftpAdapter({ cfg });
+    const listings = createListingCache({ adapter: sftp, cfg });
+
     const outcomes = {};
     for (const call of batch.rows) {
-      const r = await advanceOne(call, { db, cfg, adapter, transcriber, loadAudio, callJson, lpClient, ghlClient, now, canvasserPhones: roster, agentMap: agents });
+      const r = await advanceOne(call, { db, cfg, adapter: sftp, listings, transcriber, loadAudio, callJson, lpClient, ghlClient, now, canvasserPhones: roster, agentMap: agents });
       outcomes[r.outcome] = (outcomes[r.outcome] || 0) + 1;
     }
-    console.log(`${LOG} tick: claimed ${batch.rows.length}${batch.claimed ? '' : ' (UNLEASED fallback)'} → ${JSON.stringify(outcomes)} in ${Date.now() - startedAt}ms`);
-    return { ok: true, claimed: batch.rows.length, leased: batch.claimed, outcomes, verified, elapsed_ms: Date.now() - startedAt };
+    // The listing line is the measurement, not decoration: pairs well below
+    // calls is this cache working, and pairs == calls is it silently bypassed.
+    const listed = listings.stats();
+    console.log(
+      `${LOG} tick: claimed ${batch.rows.length}${batch.claimed ? '' : ' (UNLEASED fallback)'} → ${JSON.stringify(outcomes)} in ${Date.now() - startedAt}ms`
+      + ` | listings: ${listed.pairs} folder(s) for ${listed.calls} lookup(s), ${Math.round(listed.hit_rate * 100)}% hit`
+      + `${listed.errors ? `, ${listed.errors} failed` : ''}`,
+    );
+    return { ok: true, claimed: batch.rows.length, leased: batch.claimed, outcomes, verified, listings: listed, elapsed_ms: Date.now() - startedAt };
   } finally {
     ticking = false;
   }
