@@ -44,6 +44,12 @@
 
 import supabase from './supabase.js';
 import { emitEvent } from './event-emitter.js';
+// Co-registered from here rather than from index.js: the suppress-automation
+// backfill is the same primitive as this sweep — release an orphaned
+// suppression tag that no other path will ever clear — and keeping the two
+// wired through one call site avoids a second edit to the 2,000-line
+// index.js route block. See src/jobs/suppress-automation-backfill.js.
+import { registerSuppressAutomationBackfillRoutes } from './jobs/suppress-automation-backfill.js';
 
 const FIZZLE_DAYS = 7;
 const FIZZLE_MS = FIZZLE_DAYS * 86400000;
@@ -317,4 +323,9 @@ export function registerPauseWorkflowSweepRoutes(app) {
       res.status(500).json({ success: false, error: err.message });
     }
   });
+
+  // POST /n8n/suppress-automation/backfill — drains the orphaned
+  // suppress-automation backlog left by AUTOMATION_SUPPRESS_ON_BOOKING
+  // (disabled 2026-08-25). Dry-run by default; see the module header.
+  registerSuppressAutomationBackfillRoutes(app);
 }
