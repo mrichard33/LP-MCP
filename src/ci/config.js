@@ -51,7 +51,7 @@ export function parseConfig(env = process.env) {
     lpWrites: TRUE(env.CALL_INTEL_LP_WRITES),
     ghlWrites: TRUE(env.CALL_INTEL_GHL_WRITES),
     // GHL contact creation — duplicate-contact risk is the top danger; stays
-    // false until matching has ≥2 weeks of shadow QA (handoff §14.4).
+    // false until matching has >=2 weeks of shadow QA (handoff §14.4).
     ghlCreate: TRUE(env.CALL_INTEL_GHL_CREATE),
     // LP probable-tier write gate (write threshold is otherwise exact|high).
     allowProbable: TRUE(env.CALL_INTEL_ALLOW_PROBABLE),
@@ -62,11 +62,38 @@ export function parseConfig(env = process.env) {
     recordingWaitHours: intFloor(env.CI_RECORDING_WAIT_HOURS, 6, 0),
     audioRetentionDays: intFloor(env.CI_AUDIO_RETENTION_DAYS, 7, 0),
 
-    // Tolerance for the campaign+ANI+time recording→call join. Repeat dials
+    /**
+     * How old a call may be and still have a note posted to a CRM.
+     *
+     * WHY THIS EXISTS. Lead Perfection stamps a note with the date it was
+     * WRITTEN and offers no way to backdate it. So a call from three days ago
+     * lands on the record dated today, next to notes a rep typed today, with
+     * nothing on the record to say the conversation was not today's. That
+     * misleads whoever reads it next, and it cannot be corrected after the
+     * fact — LP has no edit for the note date.
+     *
+     * A stale note is therefore not a smaller version of a fresh note; it is a
+     * different and worse artifact. Backfills stay valuable in the DATABASE
+     * (transcript, summary, recording link, match) and stop at the CRM door.
+     *
+     * 0 DISABLES the gate — every matched call posts regardless of age, which
+     * is the pre-2026-08-25 behaviour and what a deliberate historical backfill
+     * would want. Default 24 hours: yesterday evening's calls still post the
+     * next morning, which is the normal working pattern, while a multi-day
+     * backfill does not.
+     *
+     * Skipped calls still COMPLETE. They are not failures and not review
+     * items — the pipeline did everything asked of it and deliberately
+     * withheld one write. ci_syncs records the skip and its reason, so
+     * "we chose not to post this" stays distinguishable from "we missed it".
+     */
+    maxNoteAgeHours: intFloor(env.CALL_INTEL_MAX_NOTE_AGE_HOURS, 24, 0),
+
+    // Tolerance for the campaign+ANI+time recording->call join. Repeat dials
     // to one number minutes apart are common, so this window is what decides
     // whether a recording links, or stays unlinked as ambiguous.
     recordingMatchWindowS: intFloor(env.CI_RECORDING_MATCH_WINDOW_S, 180, 1),
-    // Files below this are transfer-module test calls (~1s, 1.7–4.9 KB), not
+    // Files below this are transfer-module test calls (~1s, 1.7-4.9 KB), not
     // production traffic — marked excluded rather than ingested.
     minRecordingBytes: intFloor(env.CI_MIN_RECORDING_BYTES, 8000, 0),
     // FIXED offset for recording-filename clocks. The Recordings export runs
@@ -134,6 +161,31 @@ export function liveWrites(target, cfg = getConfig()) {
   if (target === 'lp') return cfg.lpWrites;
   if (target === 'ghl') return cfg.ghlWrites;
   return false;
+}
+
+/**
+ * Is this call too old to post a note for?
+ *
+ * Pure, and takes `now` so tests pin time. Returns false when the gate is
+ * disabled (maxNoteAgeHours === 0) or when call_start is unparseable — an
+ * unreadable timestamp must not silently suppress a write, because that would
+ * turn a data defect into missing notes nobody looks for. The age gate is a
+ * deliberate policy, not a fallback.
+ *
+ * @param {object} call     ci_calls row (needs call_start)
+ * @param {object} [cfg]
+ * @param {Date}   [now]
+ * @returns {{tooOld: boolean, ageHours: number|null, limitHours: number}}
+ */
+export function noteAgeVerdict(call, cfg = getConfig(), now = new Date()) {
+  const limitHours = cfg.maxNoteAgeHours ?? 0;
+  if (!limitHours) return { tooOld: false, ageHours: null, limitHours: 0 };
+
+  const started = new Date(call?.call_start ?? NaN);
+  if (Number.isNaN(started.getTime())) return { tooOld: false, ageHours: null, limitHours };
+
+  const ageHours = (now.getTime() - started.getTime()) / 3600000;
+  return { tooOld: ageHours > limitHours, ageHours, limitHours };
 }
 
 /** GHL contact creation: needs live + GHL writes + its own flag, all three. */
