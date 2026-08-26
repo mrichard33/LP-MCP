@@ -41,7 +41,10 @@
 // rows for windows that DID contain changes. This client now bypasses
 // it entirely and uses /api/Customers/GetLead with options=261120.
 
-import { getToken, refreshToken, invalidateToken, getTokenStatus } from './token-manager.js';
+import {
+  getToken, refreshToken, invalidateToken, getTokenStatus,
+  getNoteToken, refreshNoteToken, invalidateNoteToken, hasNoteIdentity,
+} from './token-manager.js';
 import { LP_EMP } from './lp-source-ids.js';
 
 const LP_BASE = () => (process.env.LP_API_BASE_URL || '').replace(/\/+$/, '');
@@ -84,8 +87,19 @@ const RESOLVE_FAST_TIMEOUT_MS = parseInt(process.env.LP_RESOLVE_FAST_TIMEOUT_MS 
 // `opts.fast` → single attempt, short timeout, no retry/backoff. For
 // interactive/tool callers that must fail fast instead of riding the
 // 120s × 3-retry sync budget (which can run ~360s+ before throwing).
+//
+// `opts.useNoteIdentity` → authenticate as the note-writing user instead of
+// the primary one. LP attributes every write to the user behind the
+// credential and AddNotes has no author field, so this is the only way to
+// change who a note appears to come from. ONLY /api/SalesApi/AddNotes sets
+// it — appointment sync, lead creation, the mirror and every read stay on
+// the primary credential, which is the entire point of the separation.
 export const lpPost = async (endpoint, fields = {}, retries = 3, opts = {}) => {
-  const token = await getToken();
+  // Gate on hasNoteIdentity(), not on the option alone. Unset, getNoteToken()
+  // hands back the primary token, so the 401 path below must fall back with
+  // it — refreshNoteToken() would throw on the missing credentials.
+  const useNote = opts.useNoteIdentity === true && hasNoteIdentity();
+  const token = useNote ? await getNoteToken() : await getToken();
   const body  = new URLSearchParams(fields);
   const base  = LP_BASE();
 
@@ -116,11 +130,24 @@ export const lpPost = async (endpoint, fields = {}, retries = 3, opts = {}) => {
 
       clearTimeout(timeout);
 
-      // Token expired mid-sync — force refresh and retry
+      // Token expired mid-sync — force refresh and retry.
+      // Refresh the SAME identity that made the call. Refreshing the primary
+      // after a note write 401s would retry that note with a primary bearer,
+      // posting it under the wrong author and returning success — undetectable
+      // downstream, because AddNotes answers every write with the same constant
+      // string. refreshNoteToken() throws rather than falling back; that is
+      // deliberate, and a recorded sync failure is the correct outcome.
       if (res.status === 401 || res.status === 403) {
-        console.warn(`[LP] Got ${res.status} — refreshing token...`);
-        invalidateToken();
-        const newToken = await refreshToken();
+        const identity = useNote ? 'note-identity' : 'primary';
+        console.warn(`[LP] Got ${res.status} on ${endpoint} (${identity}) — refreshing token...`);
+        let newToken;
+        if (useNote) {
+          invalidateNoteToken();
+          newToken = await refreshNoteToken();
+        } else {
+          invalidateToken();
+          newToken = await refreshToken();
+        }
         // Retry immediately with new token
         const retryCtrl = new AbortController();
         const retryTimeout = setTimeout(() => retryCtrl.abort(), 120000);
@@ -1098,12 +1125,16 @@ export async function addNote({ rectype, recid, notes, categoryId = 1 }) {
   if (!recid) throw new Error('addNote: recid is required');
   if (!notes) throw new Error('addNote: notes is required');
 
+  // useNoteIdentity: the ONLY call site that sets it. LP has no author field
+  // on AddNotes, so authenticating as LP_NOTE_USERNAME is the only way the
+  // note reads as that user instead of the integration user. `retries` has to
+  // be passed explicitly — opts is the 4th positional argument.
   return withCircuit(() => lpPost('/api/SalesApi/AddNotes', {
     rectype,
     recid:  String(recid),
     notes,
     nct_id: String(categoryId),
-  }));
+  }, 3, { useNoteIdentity: true }));
 }
 
 // ─── Diagnostic — Connection Test ────────────────────────────────

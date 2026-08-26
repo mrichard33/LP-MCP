@@ -1267,6 +1267,10 @@ app.get('/health', (req, res) => {
       username:     process.env.LP_USERNAME      ? 'set' : 'MISSING',
       password:     process.env.LP_PASSWORD      ? 'set' : 'MISSING',
       app_key:      process.env.LP_APP_KEY       ? 'set' : 'MISSING',
+      // Optional, unlike the five above — unset just means notes are written
+      // by the primary credential, so 'not set' is not a fault condition.
+      note_username: process.env.LP_NOTE_USERNAME ? 'set' : 'not set (notes use primary)',
+      note_password: process.env.LP_NOTE_PASSWORD ? 'set' : 'not set (notes use primary)',
     },
     lp_token: getTokenStatus(),
     supabase: process.env.SUPABASE_URL ? 'configured' : 'MISSING',
