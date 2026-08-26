@@ -50,13 +50,25 @@
  *     with a 24h suppress_until, and `buying-signal-detected` / `intent-spike`
  *     are already in GUARD_TAGS — so the age window is the SECOND line of
  *     defence, not the only one. Callers working the time-critical
- *     upcoming-appointment cohort may lower it (0 is honoured; see the
- *     numeric coercion note below) because a contact whose appointment is
- *     three days out cannot afford to wait a day for their reminders.
+ *     upcoming-appointment cohort may lower it (0 is honoured) because a
+ *     contact whose appointment is three days out cannot afford to wait a
+ *     day for their reminders.
  *   - Live GHL re-read before every removal — other release paths may have
  *     already cleared the tag, and the mirror can be stale.
- *   - Bounded by `limit`; rate limited between writes.
+ *   - Bounded by `limit`; rate limited on BOTH reads and writes (see the
+ *     rate-limit note below — an unpaced read loop silently lost 29 of 191
+ *     contacts on the first live dry run).
  *   - Every removal emits a system event for audit.
+ *
+ * ─── GHL RATE LIMITING ───────────────────────────────────────────
+ *
+ * GHL allows roughly 100 requests / 10s burst per location. The verify-read
+ * loop originally ran unpaced at ~13 req/s and GHL answered 29 of 191 reads
+ * with a 429; those contacts counted as `skipped_lookup_failed` and were
+ * silently left suppressed while the run still reported success. Reads are
+ * now paced and a 429 / 5xx is retried with backoff rather than discarded,
+ * because a dropped read here is a contact who keeps missing their
+ * appointment reminders.
  *
  * ─── ROUTE ───────────────────────────────────────────────────────
  *
@@ -98,7 +110,12 @@ const GUARD_TAGS = [
 const DEFAULT_LIMIT = 200;
 const DEFAULT_MIN_AGE_HOURS = 24;
 const DEFAULT_APPT_HORIZON_DAYS = 60;
+
+// ~8 req/s combined, comfortably under GHL's ~10/s sustained ceiling.
+const READ_PAUSE_MS = 130;
 const WRITE_PAUSE_MS = 250;
+const RETRY_STATUSES = new Set([429, 500, 502, 503, 504]);
+const MAX_ATTEMPTS = 3;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -175,26 +192,64 @@ function buildCohortSql({ cohort, limit, minAgeHours, appointmentHorizonDays }) 
   `;
 }
 
+/**
+ * GHL fetch with retry on the transient statuses.
+ *
+ * Returns the Response on success, or null once retries are exhausted. A 4xx
+ * that is NOT in RETRY_STATUSES (404 on a deleted contact, 401 on a bad key)
+ * is returned as-is for the caller to classify — retrying those just burns
+ * quota.
+ */
+async function ghlFetch(url, init, label) {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(url, { ...init, signal: AbortSignal.timeout(10000) });
+      if (res.ok || !RETRY_STATUSES.has(res.status)) return res;
+      if (attempt === MAX_ATTEMPTS) {
+        console.warn(`[SuppressBackfill] ${label} gave up after ${MAX_ATTEMPTS} attempts: ${res.status}`);
+        return res;
+      }
+      // Honour Retry-After when GHL sends it; otherwise exponential backoff.
+      const retryAfter = Number(res.headers.get('retry-after'));
+      const backoff = Number.isFinite(retryAfter) && retryAfter > 0
+        ? retryAfter * 1000
+        : 500 * Math.pow(2, attempt);
+      console.warn(`[SuppressBackfill] ${label} got ${res.status}, retrying in ${backoff}ms`);
+      await sleep(backoff);
+    } catch (err) {
+      if (attempt === MAX_ATTEMPTS) {
+        console.warn(`[SuppressBackfill] ${label} errored after ${MAX_ATTEMPTS} attempts: ${err.message}`);
+        return null;
+      }
+      await sleep(500 * Math.pow(2, attempt));
+    }
+  }
+  return null;
+}
+
 /** Live GHL tag read. Returns null on failure — caller treats null as "skip". */
 async function fetchContactTags(contactId) {
   if (!GHL_API_KEY || !contactId) return null;
-  try {
-    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}`, {
+  const res = await ghlFetch(
+    `https://services.leadconnectorhq.com/contacts/${contactId}`,
+    {
       headers: {
         Authorization: `Bearer ${GHL_API_KEY}`,
         Version: '2021-07-28',
         Accept: 'application/json',
       },
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!res.ok) {
-      console.warn(`[SuppressBackfill] GHL lookup failed for ${contactId}: ${res.status}`);
-      return null;
-    }
+    },
+    `GHL lookup ${contactId}`
+  );
+  if (!res || !res.ok) {
+    if (res) console.warn(`[SuppressBackfill] GHL lookup failed for ${contactId}: ${res.status}`);
+    return null;
+  }
+  try {
     const data = await res.json();
     return data?.contact?.tags || [];
   } catch (err) {
-    console.warn(`[SuppressBackfill] GHL lookup error for ${contactId}: ${err.message}`);
+    console.warn(`[SuppressBackfill] GHL lookup parse error for ${contactId}: ${err.message}`);
     return null;
   }
 }
@@ -202,8 +257,9 @@ async function fetchContactTags(contactId) {
 /** Subtractive tag removal — leaves every other tag intact. */
 async function removeContactTag(contactId, tag) {
   if (!GHL_API_KEY || !contactId) return false;
-  try {
-    const res = await fetch(`https://services.leadconnectorhq.com/contacts/${contactId}/tags`, {
+  const res = await ghlFetch(
+    `https://services.leadconnectorhq.com/contacts/${contactId}/tags`,
+    {
       method: 'DELETE',
       headers: {
         Authorization: `Bearer ${GHL_API_KEY}`,
@@ -212,18 +268,17 @@ async function removeContactTag(contactId, tag) {
         Accept: 'application/json',
       },
       body: JSON.stringify({ tags: [tag] }),
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!res.ok) {
-      const body = await res.text();
+    },
+    `GHL tag removal ${contactId}`
+  );
+  if (!res || !res.ok) {
+    if (res) {
+      const body = await res.text().catch(() => '');
       console.warn(`[SuppressBackfill] Tag removal failed for ${contactId}: ${res.status} ${body}`);
-      return false;
     }
-    return true;
-  } catch (err) {
-    console.warn(`[SuppressBackfill] Tag removal error for ${contactId}: ${err.message}`);
     return false;
   }
+  return true;
 }
 
 export async function runSuppressAutomationBackfill({
@@ -279,12 +334,19 @@ export async function runSuppressAutomationBackfill({
     skipped_lookup_failed: 0,
     errors: 0,
     upcoming_appt_cleared: 0,
+    lookup_failed_ids: [],
     samples: [],
   };
 
+  let first = true;
   for (const row of rows) {
     const contactId = row.ghl_contact_id;
     if (!contactId) continue;
+
+    // Pace the verify-read loop. Without this GHL 429s a chunk of the batch
+    // and those contacts stay suppressed while the run reports success.
+    if (!first) await sleep(READ_PAUSE_MS);
+    first = false;
 
     try {
       // Second guard pass against LIVE tags. The mirror lags GHL, and lifting
@@ -293,6 +355,9 @@ export async function runSuppressAutomationBackfill({
       const liveTags = await fetchContactTags(contactId);
       if (liveTags === null) {
         results.skipped_lookup_failed++;
+        // Surfaced so a caller can re-run the exact stragglers rather than
+        // re-sweeping the whole cohort to find them.
+        if (results.lookup_failed_ids.length < 100) results.lookup_failed_ids.push(contactId);
         continue;
       }
       if (!liveTags.includes(TARGET_TAG)) {
@@ -353,8 +418,11 @@ export async function runSuppressAutomationBackfill({
 
   results.elapsed_ms = Date.now() - startTime;
   // `remaining_hint` lets the n8n driver decide whether to loop again without
-  // running a second count query: a full page means there is probably more.
-  results.remaining_hint = rows.length >= boundedLimit ? 'more_likely' : 'drained';
+  // running a second count query. A full page means there is probably more —
+  // and so does ANY lookup failure, since those contacts were not fixed and
+  // must be picked up on a later pass.
+  results.remaining_hint =
+    rows.length >= boundedLimit || results.skipped_lookup_failed > 0 ? 'more_likely' : 'drained';
 
   console.log(
     `[SuppressBackfill] ${dryRun ? 'DRY RUN ' : ''}cohort=${cohort} minAge=${effMinAgeHours}h: ` +
