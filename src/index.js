@@ -107,6 +107,8 @@ import { registerEntryEventRoutes } from './entry-event-handler.js';
 import { registerGhlTagRoutes } from './ghl-tag-handler.js';
 // ─── Canvassing Pilot v2 intake (I.CV → LP) ──────────────────────
 import { registerCanvassingLeadRoutes } from './canvassing-lead-handler.js';
+// ─── Canvass confirmation intake (U.LCF, existing LP prospect) ───
+import { registerCanvassConfirmationRoutes } from './canvass-confirmation-handler.js';
 // ─── Affiliate lead intake (per-affiliate GHL form → LP) ─────────
 import { registerAffiliateLeadRoutes } from './affiliate-lead-handler.js';
 // ─── IME MIC Integration ─────────────────────────────────────────
@@ -579,6 +581,32 @@ async function runMigrations() {
     console.log('[Migration] canvassing intake marks (sql/052) ready');
   } catch (err) {
     console.error('[Migration] canvassing intake marks FAILED (canvassing-lead idempotency reads it — apply sql/052 manually):', err.message);
+  }
+
+  // Canvass confirmation marks (sql/migrations/2026-08-26_canvass_confirmation_marks.sql
+  // is the source of truth; this mirror guarantees the table exists before the
+  // first POST /webhooks/canvass-confirmation, whose duplicate pre-check reads
+  // it). The block above exists because canvassing_intake_marks was referenced
+  // from the day its endpoint shipped but never created — and because every
+  // access is fail-open, its absence silently disabled 24h idempotency instead
+  // of erroring. Identical table, identical failure mode, so it gets the same
+  // self-heal on the way in rather than after the first double-record.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE TABLE IF NOT EXISTS canvass_confirmation_marks (
+              dedup_key       text PRIMARY KEY,
+              ghl_contact_id  text,
+              lp_prospect_id  text,
+              phone           text,
+              status          text NOT NULL DEFAULT 'processing',
+              created_at      timestamptz NOT NULL DEFAULT now());
+            CREATE INDEX IF NOT EXISTS idx_canvass_confirmation_marks_created
+              ON canvass_confirmation_marks (created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_canvass_confirmation_marks_prospect
+              ON canvass_confirmation_marks (lp_prospect_id, created_at DESC);`);
+    console.log('[Migration] canvass confirmation marks (2026-08-26) ready');
+  } catch (err) {
+    console.error('[Migration] canvass confirmation marks FAILED (canvass-confirmation idempotency reads it — apply sql/migrations/2026-08-26_canvass_confirmation_marks.sql manually):', err.message);
   }
 
   // Rep + setter reporting RPCs (sql/functions.sql and sql/053 are the source
@@ -1506,6 +1534,14 @@ registerGhlTagRoutes(app);
 
 // ─── Canvassing Pilot v2 intake (I.CV → LP) ──────────────────────
 registerCanvassingLeadRoutes(app);
+
+// ─── Canvass confirmation intake (U.LCF → record only) ───────────
+// The Lightfire confirmation form's EXISTING-PROSPECT branch. Deliberately
+// not the canvassing route: that one calls LP addLead, which on a prospect LP
+// already holds would create a duplicate lead. This endpoint emits
+// canvass.confirmation_submitted and writes a GHL note, and never touches LP.
+//   POST /webhooks/canvass-confirmation
+registerCanvassConfirmationRoutes(app);
 
 // ─── Affiliate lead intake (per-affiliate GHL form → LP) ─────────
 // Deliberately separate from the canvassing route: different dedup table,
