@@ -94,7 +94,11 @@ const MATCH = {
  * Deliberately unconditional: the point is that this test can never reach the
  * LP API, whatever the developer's shell holds.
  */
-const LP_ENV = ['LP_API_BASE_URL', 'LP_USERNAME', 'LP_PASSWORD', 'LP_CLIENT_ID', 'LP_APP_KEY'];
+// Both identities. addNote now authenticates as LP_NOTE_USERNAME when one is
+// configured, so stripping only the primary credentials would leave the
+// "no HTTP can escape" guarantee resting on LP_API_BASE_URL alone.
+const LP_ENV = ['LP_API_BASE_URL', 'LP_USERNAME', 'LP_PASSWORD', 'LP_CLIENT_ID', 'LP_APP_KEY',
+                'LP_NOTE_USERNAME', 'LP_NOTE_PASSWORD'];
 async function withoutLpCredentials(fn) {
   const saved = Object.fromEntries(LP_ENV.map((k) => [k, process.env[k]]));
   for (const k of LP_ENV) delete process.env[k];
