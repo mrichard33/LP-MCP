@@ -591,6 +591,12 @@ async function runMigrations() {
   // access is fail-open, its absence silently disabled 24h idempotency instead
   // of erroring. Identical table, identical failure mode, so it gets the same
   // self-heal on the way in rather than after the first double-record.
+  //
+  // The ALTER is not redundant with the CREATE. PR #768 shipped this table
+  // WITHOUT lead_in_lp; wherever that version already ran, CREATE IF NOT EXISTS
+  // is a no-op and would leave the column missing — and the pre-check selects
+  // it, so the select would error and fail open, silently disabling the 24h
+  // idempotency this block exists to guarantee.
   try {
     const { runSQL } = await import('./admin/supabase-admin.js');
     await runSQL(`CREATE TABLE IF NOT EXISTS canvass_confirmation_marks (
@@ -601,6 +607,8 @@ async function runMigrations() {
               phone           text,
               status          text NOT NULL DEFAULT 'processing',
               created_at      timestamptz NOT NULL DEFAULT now());
+            ALTER TABLE canvass_confirmation_marks
+              ADD COLUMN IF NOT EXISTS lead_in_lp boolean;
             CREATE INDEX IF NOT EXISTS idx_canvass_confirmation_marks_created
               ON canvass_confirmation_marks (created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_canvass_confirmation_marks_prospect

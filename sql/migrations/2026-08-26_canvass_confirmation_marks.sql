@@ -43,6 +43,15 @@
 -- never to a dropped submission. Do not rely on that — APPLY THIS BEFORE the
 -- Railway deploy that ships the handler.
 --
+-- SAFE TO RUN TWICE, AND IT MAY NEED TO BE. An earlier revision of this file
+-- shipped in PR #768 WITHOUT lead_in_lp. If that version was already applied,
+-- the CREATE below is a no-op and would leave the column missing — the handler
+-- selects lead_in_lp on its duplicate pre-check, and a select naming a column
+-- that does not exist errors, which every marks path treats as fail-open. The
+-- result would be 24h idempotency silently disabled: exactly the failure mode
+-- canvassing_intake_marks had. Hence the explicit ADD COLUMN IF NOT EXISTS,
+-- which is a no-op on a fresh table and the whole point on an existing one.
+--
 -- DDL runs in the Supabase dashboard SQL editor, not through MCP.
 -- ═══════════════════════════════════════════════════════════════════
 
@@ -55,6 +64,10 @@ CREATE TABLE IF NOT EXISTS canvass_confirmation_marks (
   status          text        NOT NULL DEFAULT 'processing',
   created_at      timestamptz NOT NULL DEFAULT now()
 );
+
+-- Brings a table created by the PR #768 revision of this file up to date.
+ALTER TABLE canvass_confirmation_marks
+  ADD COLUMN IF NOT EXISTS lead_in_lp boolean;
 
 CREATE INDEX IF NOT EXISTS idx_canvass_confirmation_marks_created
   ON canvass_confirmation_marks (created_at DESC);
