@@ -171,9 +171,21 @@ export function validateRequest(body, statuses = ENABLED_NOTIFICATION_STATUSES) 
   // and the notification never generated. Proven live 2026-08-17: omitting the
   // two keys 422s, sending them as empty strings passes.
   //
+  // contact_last_name joined the set 2026-08-26. First-name-only contacts are
+  // routine (canvass entries, inbound calls captured with a single name), and
+  // GHL drops the key when {{contact.last_name}} resolves empty — so every one
+  // of them 422'd with "'contact_last_name' is required" and never generated a
+  // cancellation or reschedule alert. Six occurrences in the seven days to
+  // 2026-08-26 (contacts uQErm6ihUpuFSSonANeG, HxztTDVGTDTecGf1uUKj,
+  // Tuz8VEPi7naclkuZTltx, C5DqkOUqoRvHT86dia4H, ObhO7Oa5E18X7bP1EhuK). The
+  // field is not load-bearing: contact_name already carries the full name, and
+  // both body generators read contact_last_name defensively
+  // (appointment-body-generator.js:280, cancellation-body-generator.js:261),
+  // rendering the name without it.
+  //
   // Every other field keeps the old strict behaviour — undefined, null, and
   // whitespace-only all still fail.
-  const ALLOW_EMPTY = new Set(['lp_source', 'lp_subsource']);
+  const ALLOW_EMPTY = new Set(['lp_source', 'lp_subsource', 'contact_last_name']);
   for (const key of REQUIRED_FIELDS) {
     if (key === 'status') continue;
     if (ALLOW_EMPTY.has(key)) continue;
