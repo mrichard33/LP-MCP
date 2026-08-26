@@ -15,7 +15,8 @@
  *     safety net but queried a table named `ghl_contacts`, which does not
  *     exist in the HL warehouse (the table is `contacts`), and posted to
  *     an HL MCP `/tools/*` REST surface that does not exist either. It has
- *     been a silent no-op since 2026-04-10.
+ *     been a silent no-op since 2026-04-10. Repointed at this endpoint
+ *     2026-08-25.
  *   - The CANCELLATION rules (GHL_APPT_CANCELLED_REBOOK_COLD,
  *     LP_DISP_CANCEL_COLD_TO_S5_2) removed the tag before routing to S5.2.
  *     The NO-SHOW rules did not — patched 2026-08-25, but only forward.
@@ -44,9 +45,14 @@
  *     signal. Lifting suppression off a DNC contact is a compliance event,
  *     so the guard is checked twice — once in SQL, once against live GHL
  *     tags immediately before the write.
- *   - minAgeHours (default 24): never lifts suppression applied recently.
- *     REPLY_INTENT_BUYING_SIGNAL legitimately sets `suppress-automation`
- *     with a 24h suppress_until; this window keeps the sweep off those.
+ *   - minAgeHours (default 24): a belt-and-braces recency window on top of
+ *     the tag guards. REPLY_INTENT_BUYING_SIGNAL sets `suppress-automation`
+ *     with a 24h suppress_until, and `buying-signal-detected` / `intent-spike`
+ *     are already in GUARD_TAGS — so the age window is the SECOND line of
+ *     defence, not the only one. Callers working the time-critical
+ *     upcoming-appointment cohort may lower it (0 is honoured; see the
+ *     numeric coercion note below) because a contact whose appointment is
+ *     three days out cannot afford to wait a day for their reminders.
  *   - Live GHL re-read before every removal — other release paths may have
  *     already cleared the tag, and the mirror can be stale.
  *   - Bounded by `limit`; rate limited between writes.
@@ -58,8 +64,8 @@
  *     { dryRun: true, cohort: 'upcoming_appt'|'no_show'|'all', limit: 200,
  *       minAgeHours: 24, appointmentHorizonDays: 60 }
  *
- * No scheduler. This is a drain, not a standing job — once the backlog is
- * clear the disabled rule means nothing refills it.
+ * No scheduler of its own. The hourly * Suppression TTL Manager drives the
+ * standing safety-net pass; the OPS backfill n8n workflow drives the drain.
  */
 
 import { hlRunSQL, esc } from '../admin/hl-client.js';
@@ -96,6 +102,21 @@ const WRITE_PAUSE_MS = 250;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Coerce a caller-supplied number, treating 0 as a real value.
+ *
+ * `Number(x) || fallback` is wrong here and was a live bug: minAgeHours: 0
+ * is a legitimate "no recency window" request, but 0 is falsy, so it fell
+ * through to the 24h default and silently ignored the caller. That kept 106
+ * contacts with appointments inside four days out of the upcoming_appt
+ * cohort while reporting success.
+ */
+function num(value, fallback, { min = 0 } = {}) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < min) return fallback;
+  return n;
+}
+
 function sqlTagArray(tags) {
   return `ARRAY[${tags.map((t) => `'${esc(t)}'`).join(',')}]`;
 }
@@ -121,7 +142,7 @@ function buildCohortSql({ cohort, limit, minAgeHours, appointmentHorizonDays }) 
          WHERE a.ghl_contact_id = c.ghl_contact_id
            AND a.deleted_at IS NULL
            AND a.start_time > now()
-           AND a.start_time < now() + interval '${Number(appointmentHorizonDays)} days'
+           AND a.start_time < now() + interval '${appointmentHorizonDays} days'
       )`;
 
   let cohortPredicate;
@@ -133,6 +154,13 @@ function buildCohortSql({ cohort, limit, minAgeHours, appointmentHorizonDays }) 
     cohortPredicate = 'TRUE';
   }
 
+  // minAgeHours of 0 makes the interval clause a no-op tautology rather than
+  // an always-false comparison against now(), so it is dropped outright.
+  const ageClause =
+    minAgeHours > 0
+      ? `AND c.date_updated < now() - interval '${minAgeHours} hours'`
+      : '';
+
   return `
     SELECT c.ghl_contact_id,
            c.tags,
@@ -140,10 +168,10 @@ function buildCohortSql({ cohort, limit, minAgeHours, appointmentHorizonDays }) 
       FROM contacts c
      WHERE c.tags @> ARRAY['${esc(TARGET_TAG)}']
        AND NOT (c.tags && ${guard})
-       AND c.date_updated < now() - interval '${Number(minAgeHours)} hours'
+       ${ageClause}
        AND ${cohortPredicate}
      ORDER BY ${cohort === 'all' ? `(${upcomingApptExists}) DESC,` : ''} c.date_updated ASC
-     LIMIT ${Number(limit)}
+     LIMIT ${limit}
   `;
 }
 
@@ -214,7 +242,9 @@ export async function runSuppressAutomationBackfill({
     return { success: false, error: 'GHL_API_KEY not set — cannot verify or write tags.' };
   }
 
-  const boundedLimit = Math.min(Math.max(1, Number(limit) || DEFAULT_LIMIT), 500);
+  const boundedLimit = Math.min(Math.max(1, num(limit, DEFAULT_LIMIT, { min: 1 })), 500);
+  const effMinAgeHours = num(minAgeHours, DEFAULT_MIN_AGE_HOURS);
+  const effHorizonDays = num(appointmentHorizonDays, DEFAULT_APPT_HORIZON_DAYS, { min: 1 });
 
   let rows;
   try {
@@ -223,8 +253,8 @@ export async function runSuppressAutomationBackfill({
       buildCohortSql({
         cohort,
         limit: boundedLimit,
-        minAgeHours: Number(minAgeHours) || DEFAULT_MIN_AGE_HOURS,
-        appointmentHorizonDays: Number(appointmentHorizonDays) || DEFAULT_APPT_HORIZON_DAYS,
+        minAgeHours: effMinAgeHours,
+        appointmentHorizonDays: effHorizonDays,
       })
     )) || [];
   } catch (err) {
@@ -238,6 +268,10 @@ export async function runSuppressAutomationBackfill({
     dry_run: !!dryRun,
     cohort,
     limit: boundedLimit,
+    // Echoed back so a caller can confirm the knobs were actually applied
+    // rather than silently defaulted — see the num() note above.
+    min_age_hours: effMinAgeHours,
+    appointment_horizon_days: effHorizonDays,
     candidates: rows.length,
     cleared: 0,
     skipped_guard_tag: 0,
@@ -323,8 +357,9 @@ export async function runSuppressAutomationBackfill({
   results.remaining_hint = rows.length >= boundedLimit ? 'more_likely' : 'drained';
 
   console.log(
-    `[SuppressBackfill] ${dryRun ? 'DRY RUN ' : ''}cohort=${cohort}: ${rows.length} candidates -> ` +
-      `${results.cleared} cleared (${results.upcoming_appt_cleared} w/ upcoming appt), ` +
+    `[SuppressBackfill] ${dryRun ? 'DRY RUN ' : ''}cohort=${cohort} minAge=${effMinAgeHours}h: ` +
+      `${rows.length} candidates -> ${results.cleared} cleared ` +
+      `(${results.upcoming_appt_cleared} w/ upcoming appt), ` +
       `${results.skipped_guard_tag} guard-tag, ${results.skipped_already_clear} already-clear, ` +
       `${results.skipped_lookup_failed} lookup-failed, ${results.errors} errors (${results.elapsed_ms}ms)`
   );
@@ -345,8 +380,8 @@ export function registerSuppressAutomationBackfillRoutes(app) {
       const result = await runSuppressAutomationBackfill({
         dryRun,
         cohort: b.cohort || req.query.cohort || 'upcoming_appt',
-        limit: b.limit || req.query.limit || DEFAULT_LIMIT,
-        minAgeHours: b.minAgeHours ?? b.min_age_hours ?? DEFAULT_MIN_AGE_HOURS,
+        limit: b.limit ?? req.query.limit ?? DEFAULT_LIMIT,
+        minAgeHours: b.minAgeHours ?? b.min_age_hours ?? req.query.minAgeHours ?? DEFAULT_MIN_AGE_HOURS,
         appointmentHorizonDays:
           b.appointmentHorizonDays ?? b.appointment_horizon_days ?? DEFAULT_APPT_HORIZON_DAYS,
       });
