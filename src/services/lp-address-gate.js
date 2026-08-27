@@ -47,6 +47,7 @@
 import supabase from '../supabase.js';
 import { getGHLContact } from '../ghl.js';
 import { LP_SRS } from '../lp-source-ids.js';
+import { normalizeState } from '../sync-utils.js';
 
 export const ADDRESS_FIELDS = ['address1', 'city', 'state', 'zip'];
 export const INCOMPLETE_NOTES_STAMP = 'INCOMPLETE ADDRESS ON FILE';
@@ -144,7 +145,15 @@ export async function enrichBodyFromGhl(body, deps = {}) {
   const sourceByField = {
     address1: contact.address1,
     city: contact.city,
-    state: contact.state,
+    // GHL stores the state spelled out ("Florida") and LP TRUNCATES the column
+    // to two characters, so backfilling it raw writes "Fl" — wrong, still
+    // shaped like a state code, and never an error (39 such prospects, plus
+    // 829 reading "nu" from the literal string "null"; see normalizeState).
+    // Normalizing is within this function's existing remit: its whole job is
+    // deciding what GHL value to write into the body. A nullish literal
+    // normalizes to blank, which isBlank() below then rejects — so the field
+    // stays missing and the gate holds the lead, which is the right outcome.
+    state: normalizeState(contact.state),
     zip: contact.postalCode,
   };
   const out = { ...body };

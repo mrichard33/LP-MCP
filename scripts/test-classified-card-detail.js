@@ -216,3 +216,40 @@ test('a card with nothing optional to show renders no empty detail lines', async
   assert.ok(!card.includes('🚪'));
   assert.ok(!card.includes('Job size'));
 });
+
+// ─── State normalization on the address line (2026-08-27) ───────
+//
+// The LP appointment card reads state straight off the GHL contact, where it
+// is spelled out. A live canvass card rendered "Delray Beach Florida 33484".
+// LP truncates its own state column to two characters, so the card and the
+// record it describes must not disagree.
+
+test('formatAddressLine renders a two-letter state whatever GHL stored', () => {
+  assert.equal(
+    formatAddressLine({ address1: '5476 Enclave Crossing Way', city: 'Delray Beach', state: 'Florida', zip: '33484' }),
+    '5476 Enclave Crossing Way, Delray Beach FL 33484',
+  );
+  assert.equal(
+    formatAddressLine({ address1: '1 A St', city: 'Tampa', state: 'fl', zip: '33601' }),
+    '1 A St, Tampa FL 33601',
+  );
+  // A nullish literal is dropped rather than printed as "null" or "nu".
+  assert.equal(
+    formatAddressLine({ address1: '1 A St', city: 'Tampa', state: 'null', zip: '33601' }),
+    '1 A St, Tampa 33601',
+  );
+  // An unrecognized value still renders — the card should show what is on file.
+  assert.equal(
+    formatAddressLine({ address1: '1 A St', city: 'Toronto', state: 'Ontario', zip: 'M5V' }),
+    '1 A St, Toronto Ontario M5V',
+  );
+});
+
+test('the LP appointment card carries the normalized state', async () => {
+  const card = await buildLpAppointmentCard({
+    contactId: 'C1', lpLeadId: '570351', apptDate: '08/28/2026', apptTime: '18:00',
+    address1: '5476 Enclave Crossing Way', city: 'Delray Beach', state: 'Florida', zip: '33484',
+  });
+  assert.match(card, /📍 5476 Enclave Crossing Way, Delray Beach FL 33484/);
+  assert.doesNotMatch(card, /Florida/);
+});
