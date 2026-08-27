@@ -277,3 +277,45 @@ test('an already-correct state code is backfilled unchanged', async () => {
   });
   assert.equal(body.state, 'FL');
 });
+
+// ─── the "null" literal is not a value (2026-08-27) ────────────────
+//
+// isBlank used to be `String(v).trim() !== ''`, so the four-character string
+// "null" counted as a real address field: missingAddressFields never flagged
+// it, the gate neither enriched nor held, and it forwarded to LP — which
+// truncates the column to two characters. That is why 604 prospects read a
+// state of "nu". A wrong-but-plausible value beat a blank one purely because
+// it was long enough.
+
+test('a "null" literal counts as MISSING, not as a value', () => {
+  for (const junk of ['null', 'NULL', 'undefined', 'NaN', 'none', 'N/A', 'na']) {
+    assert.deepEqual(
+      missingAddressFields({ ...COMPLETE, state: junk }),
+      ['state'],
+      `"${junk}" was treated as a real state`,
+    );
+  }
+});
+
+test('a "null" literal in any address field is caught', () => {
+  assert.deepEqual(
+    missingAddressFields({ ...COMPLETE, address1: 'null', city: 'undefined' }).sort(),
+    ['address1', 'city'],
+  );
+});
+
+test('real values are still values — 0 and false are not nullish', () => {
+  assert.deepEqual(missingAddressFields(COMPLETE), []);
+  // A zip of "0" is wrong data but it is not "nothing was here"; the gate must
+  // not silently reinterpret it.
+  assert.deepEqual(missingAddressFields({ ...COMPLETE, zip: '0' }), []);
+});
+
+test('a body carrying state "null" is now enriched from GHL instead of forwarded', async () => {
+  const { body, filled } = await enrichBodyFromGhl({ ...COMPLETE, state: 'null' }, {
+    getGHLContact: async () => ({ address1: '4360 Washington Place', city: 'Ave Maria', state: 'Florida', postalCode: '34142' }),
+  });
+  assert.deepEqual(filled, ['state']);
+  assert.equal(body.state, 'FL');
+  assert.deepEqual(missingAddressFields(body), []);
+});

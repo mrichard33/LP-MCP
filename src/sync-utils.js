@@ -54,6 +54,23 @@ const STATE_NAMES = {
 const STATE_NULLISH = new Set(['null', 'undefined', 'nan', 'none', 'n/a', 'na']);
 
 /**
+ * Does this value READ as absent even though it is a non-empty string?
+ *
+ * These are what a JS or template pipeline emits when a variable is missing —
+ * `String(null)`, `${undefined}`, an unresolved merge tag. They are the reason
+ * 604 LP prospects carry a state of "nu": the literal "null" arrived, passed
+ * every `!== ''` blank check on the way in, and LP truncated it to two
+ * characters that still look like a state code.
+ *
+ * Deliberately does NOT include '0' or 'false' — those are real values in
+ * other fields. Only strings whose sole meaning is "nothing was here".
+ */
+export function isNullishText(v) {
+  if (v === null || v === undefined) return true;
+  return STATE_NULLISH.has(String(v).trim().toLowerCase());
+}
+
+/**
  * Normalize a US state to its two-letter code.
  *
  * Two-letter passthrough (uppercased); full names mapped; the nullish literals
@@ -64,7 +81,7 @@ const STATE_NULLISH = new Set(['null', 'undefined', 'nan', 'none', 'n/a', 'na'])
 export function normalizeState(raw) {
   const s = (raw === null || raw === undefined ? '' : String(raw)).trim();
   if (!s) return '';
-  if (STATE_NULLISH.has(s.toLowerCase())) return '';
+  if (isNullishText(s)) return '';
   if (/^[A-Za-z]{2}$/.test(s)) return s.toUpperCase();
   const mapped = STATE_NAMES[s.toLowerCase().replace(/[.\s]+/g, ' ').trim()];
   return mapped || s;
