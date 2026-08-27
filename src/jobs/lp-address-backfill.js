@@ -8,7 +8,7 @@
  * live on prospect 452653, which kept a blank address through an estimator
  * push carrying "4360 Washington Place").
  *
- * Sweep:   lp_leads WHERE address IS NULL AND ghl_contact_id IS NOT NULL,
+ * Sweep:   lp_leads WHERE address is blank-ish AND ghl_contact_id IS NOT NULL,
  *          GHL contact has address1 → UpdateProspectInfo → read back via
  *          GetCustomersByProspectID and CONFIRM the address took. Log
  *          before/after. Never silently no-op — a failed update throws and
@@ -25,11 +25,27 @@
  *          with real values are ever transmitted (buildProspectUpdateFields,
  *          unit-tested) — an empty string is NEVER sent over a populated LP
  *          field.
+ *
+ * ─── 2026-08-27: the "undefined" blindness fix ──────────────────────────
+ * This job shipped testing blankness as `String(x||'').trim() !== ''`, and
+ * the sweep queried `.is('address', null)`. Both miss the single most common
+ * poisoned value in production: the literal string "undefined", left by a JS
+ * serialisation leak in the chatbot intake path.
+ *
+ * Live proof (contact q5GehRye7DNkN6jlmjl3, Myron Thorner): the per-contact
+ * route returned `lp_address_already_present` and skipped a prospect whose LP
+ * Address1 was literally "undefined" and whose CSZ was ",   ". The job built
+ * to repair exactly this could not see it. Nulling the value by hand and
+ * re-running the same route repaired it immediately.
+ *
+ * Blankness is now decided in ONE place — src/lp-address-validity.js — for
+ * this job, the appointment pre-flight and the LP write gate alike.
  */
 
 import supabase from '../supabase.js';
 import { getGHLContact } from '../ghl.js';
 import { repairProspectAddress } from '../services/lp-callback-requeue.js';
+import { isBlankAddress, hasRealValue, BLANKISH_SQL_OR } from '../lp-address-validity.js';
 
 const BACKFILL_ENABLED = () =>
   String(process.env.LP_ADDRESS_BACKFILL_ENABLED || '').toLowerCase() === 'true';
@@ -55,13 +71,20 @@ export async function backfillProspectAddressForContact(contactId, deps = {}) {
   if (error) throw new Error(`lp_leads lookup failed for ${contactId}: ${error.message}`);
   const row = rows?.[0];
   if (!row?.lp_prospect_id) return { repaired: false, reason: 'no_lp_prospect', prospect_id: null };
-  if (String(row.address || '').trim() !== '') {
+
+  // 2026-08-27 — was: String(row.address || '').trim() !== ''. That test read
+  // the literal string "undefined" as a populated address and skipped the
+  // repair. isBlankAddress() treats undefined/null/none/n-a placeholders as
+  // blank, which is what they are.
+  if (hasRealValue(row.address)) {
     return { repaired: false, reason: 'lp_address_already_present', prospect_id: row.lp_prospect_id };
   }
 
   const fetchContact = deps.getGHLContact || getGHLContact;
   const contact = await fetchContact(contactId);
-  if (!contact || String(contact.address1 || '').trim() === '') {
+  // Same normaliser on the GHL side — a GHL contact carrying "undefined" is
+  // not a repair source, it is a second copy of the same bug.
+  if (!contact || isBlankAddress(contact.address1)) {
     return { repaired: false, reason: 'ghl_has_no_address', prospect_id: row.lp_prospect_id };
   }
 
@@ -70,11 +93,20 @@ export async function backfillProspectAddressForContact(contactId, deps = {}) {
     ghlContact: contact,
   }, deps);
 
-  return { repaired: true, reason: 'repaired', prospect_id: row.lp_prospect_id, before: result.before, after: result.after };
+  return {
+    repaired: true,
+    reason: 'repaired',
+    prospect_id: row.lp_prospect_id,
+    // Surfacing the poisoned value makes the "undefined" class of failure
+    // visible in logs instead of looking like an ordinary blank.
+    repaired_from: row.address === null ? '(null)' : String(row.address),
+    before: result.before,
+    after: result.after,
+  };
 }
 
 /**
- * The sweep: page over lp_leads rows with a blank LP address and a GHL
+ * The sweep: page over lp_leads rows with a blank-ish LP address and a GHL
  * link, repair the ones whose GHL contact holds an address. Distinct
  * prospects only — two lds rows on one prospect need one repair.
  */
@@ -82,8 +114,10 @@ export async function runAddressBackfillSweep(deps = {}) {
   const db = deps.supabase || supabase;
   const { data, error } = await db
     .from('lp_leads')
-    .select('ghl_contact_id, lp_prospect_id, address')
-    .is('address', null)
+    // 2026-08-27 — was .is('address', null), which made every "undefined"
+    // row invisible to this sweep. BLANKISH_SQL_OR also matches the empty
+    // string and the placeholder tokens.
+    .or(BLANKISH_SQL_OR)
     .not('ghl_contact_id', 'is', null)
     .not('lp_prospect_id', 'is', null)
     .order('created_at_lp', { ascending: false })
@@ -93,10 +127,12 @@ export async function runAddressBackfillSweep(deps = {}) {
     return { candidates: 0, error: error.message };
   }
 
-  // Distinct prospects, newest first.
+  // Distinct prospects, newest first. The .or() above is a cheap server-side
+  // narrowing; isBlankAddress() is the authority.
   const seen = new Set();
   const candidates = [];
   for (const r of (data || [])) {
+    if (!isBlankAddress(r.address)) continue;
     if (seen.has(r.lp_prospect_id)) continue;
     seen.add(r.lp_prospect_id);
     candidates.push(r);
@@ -109,7 +145,7 @@ export async function runAddressBackfillSweep(deps = {}) {
       const res = await backfillProspectAddressForContact(row.ghl_contact_id, deps);
       if (res.repaired) {
         repaired++;
-        console.log(`[AddrBackfill] ✅ prospect ${res.prospect_id} (contact ${row.ghl_contact_id}) address repaired`);
+        console.log(`[AddrBackfill] ✅ prospect ${res.prospect_id} (contact ${row.ghl_contact_id}) address repaired — was ${res.repaired_from}`);
       } else {
         skipped++;
       }
@@ -124,14 +160,18 @@ export async function runAddressBackfillSweep(deps = {}) {
   return { candidates: candidates.length, batch: batch.length, repaired, skipped, failed };
 }
 
-/** Dry-run count for the PR4 post-deploy report: how many lp_leads rows
- *  have a blank LP address while the linked GHL contact has one. */
+/** Dry-run count for the post-deploy report: how many lp_leads rows have a
+ *  blank-ish LP address while the linked GHL contact has one.
+ *
+ *  NOTE: this count is EXPECTED TO RISE after the 2026-08-27 fix. The extra
+ *  rows are the "undefined"-poisoned prospects that were previously invisible,
+ *  not new breakage. */
 export async function countBackfillCandidates(deps = {}) {
   const db = deps.supabase || supabase;
   const { count, error } = await db
     .from('lp_leads')
     .select('id', { count: 'exact', head: true })
-    .is('address', null)
+    .or(BLANKISH_SQL_OR)
     .not('ghl_contact_id', 'is', null)
     .not('lp_prospect_id', 'is', null);
   if (error) return { error: error.message };
