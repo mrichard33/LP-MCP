@@ -165,6 +165,10 @@ import { buildRichNotification } from '../enrichment.js';
 import { isGhlOnlyCalendarId } from '../../knowledge/booking-calendar-router.js';
 import { appointmentDelta, lpWallClockToGhlStartTime } from '../../appointment-dates.js';
 import { LP_EMP } from '../../lp-source-ids.js';
+// 2026-05-27 v2's hasMeaningfulCalendar now lives beside the card builder that
+// is its other consumer, so the GHL note and the GroupMe card cannot disagree
+// about whether a calendar is worth rendering.
+import { buildLpAppointmentCard, hasMeaningfulCalendar } from '../../services/appointment-card.js';
 import { claimAppointmentAuthority, isAuthorityEnforced }
   from '../../services/contact-appointment-authority.js';
 
@@ -391,17 +395,6 @@ function findLeadInLpResponse(resp, ldsId) {
     if (match) return match;
   }
   return null;
-}
-
-// 2026-05-27 v2: helper used by the conditional calendar render below.
-// "N/A" is treated as absent so legacy callers passing the literal
-// string don't accidentally render "Calendar: N/A".
-function hasMeaningfulCalendar(name) {
-  if (!name) return false;
-  const s = String(name).trim();
-  if (!s) return false;
-  if (s.toUpperCase() === 'N/A') return false;
-  return true;
 }
 
 export async function executeSetLPAppointment(action, context = {}) {
@@ -887,7 +880,6 @@ export async function executeSetLPAppointment(action, context = {}) {
   // line form.
   const showCalendar = hasMeaningfulCalendar(calendarName);
   const calendarLineGhlNote    = showCalendar ? `\nCalendar: ${calendarName}` : '';
-  const calendarSegmentGroupMe = showCalendar ? ` | ${calendarName}` : '';
 
   // v1.1 (Victor Lopez incident 2026-07-04): carry the GHL appointment
   // status through so LP-side reps see the same confirmation state GHL
@@ -899,7 +891,9 @@ export async function executeSetLPAppointment(action, context = {}) {
   const statusLineGhlNote = ghlStatus
     ? `\nGHL Status: ${ghlStatus}${ghlStatus === 'new' ? ' (decision-maker confirmation pending)' : ''}`
     : '';
-  const statusSegmentGroupMe = ghlStatus === 'new' ? ' | ⏳ DM confirm pending' : (ghlStatus === 'confirmed' ? ' | ✅ confirmed' : '');
+  // The GroupMe equivalents of these two segments now live in
+  // services/appointment-card.js buildAppointmentDisplay, shared with the sync
+  // path. Only the GHL-note forms are built here.
 
   if (!isLPLeadId(contactId)) {
     await addGHLNote(contactId,
@@ -919,23 +913,41 @@ export async function executeSetLPAppointment(action, context = {}) {
     });
   }
   const { name } = await resolveContactInfo(contactId, eventPayload);
-  // Success notification uses inline formatting (not buildRichNotification)
-  // because the LP Lead/Prospect IDs are the authoritative known-good values
-  // we want surfaced prominently — not the GHL-derived enrichment fallback.
-  // v2: source now from resolution.lpSource (Supabase fallback);
-  // Calendar line omitted entirely when not resolved.
-  // 2026-06-02: card cleaned up to match the webhook sync path — dropped
-  // the internal resolution source "(${resolutionSource})" and the raw
-  // GHL contact UUID line (both backend noise), and the time now renders
-  // 12-hour Eastern ("6:00 PM EST") via formatApptTime12h. The value
-  // written to LP above is unchanged (LP still receives 24h). Full
-  // diagnostics stay in the GHL note.
+  // 2026-08-27: the card is now built by services/appointment-card.js, the ONE
+  // builder shared with the webhook sync path in lp-appointment-sync.js. Both
+  // paths hand-rolled the same four lines and had drifted apart twice (see that
+  // module's header). It renders the required Market and Src lines plus the
+  // address, email and LP reference that make the card actionable without
+  // opening GHL. The value written to LP above is unchanged, and the full
+  // diagnostics still live in the GHL note.
+  // Cached — the same contact was already fetched earlier in this run on the
+  // normal path, so this costs nothing there. Skipped entirely when target_id
+  // is an LP lead id rather than a GHL contact (no GHL record to fetch), and
+  // fail-soft either way: the card still sends with whatever is known.
+  const cardContact = isLPLeadId(contactId)
+    ? null
+    : await getContactCached(contactId, cache).catch(() => null);
   await sendGroupMeMessage(
-    `📅 LP Appointment Set\n` +
-    `👤 ${name || contactId}\n` +
-    `📋 LP Lead: ${lpLeadId} | Prospect: ${resolvedProspectId || 'NONE'}\n` +
-    (lpSourceLine ? `📋 Src: ${lpSourceLine}\n` : '') +
-    `📅 ${apptDate} ${formatApptTime12h(apptTime)}${calendarSegmentGroupMe}${statusSegmentGroupMe}`
+    await buildLpAppointmentCard({
+      contactId,
+      name: name || undefined,
+      phone: cardContact?.phone,
+      email: cardContact?.email,
+      lpLeadId,
+      prospectId: resolvedProspectId,
+      lpSource: resolutionLpSource,
+      lpSourceDetail: resolutionLpSourceDetail,
+      address1: cardContact?.address1,
+      city: cardContact?.city,
+      state: cardContact?.state,
+      zip: cardContact?.postalCode,
+      apptDate,
+      apptTime,
+      calendarName,
+      ghlStatus,
+      ghlContact: cardContact,
+      narrative: `Appointment written to Lead Perfection for LP lead ${lpLeadId}. The LP-side team works it from here.`,
+    })
   ).catch(() => {});
 
   console.log(`[LP-APPT] ✅ LP appointment set: lds_id=${lpLeadId}, ${apptDate} ${apptTime}, resolved_via=${resolutionSource}${lpSourceLine ? `, source="${lpSourceLine}"` : ''}`);

@@ -13,6 +13,30 @@
  *       "No 1234"           → reject
  *       "Edit 1234 <desc>"  → AI rewrites with the description as guidance
  *
+ * v1.8 — CONTENT DEDUP BACKSTOP (2026-08-27).
+ *   PROBLEM: the v1.7 debounce below only consolidates messages that carry a
+ *   contactId and are not flushNow. Everything else — every operator card,
+ *   every system event, and BOTH "LP Appointment Set" emitters
+ *   (actions/handlers/lp-appointment.js and lp-appointment-sync.js, which call
+ *   sendGroupMeMessage(text) with no opts) — takes the immediate path, which
+ *   had no dedup at all. Byte-identical cards therefore always sent. On
+ *   2026-08-26 one GHL appointment produced two system_events, two LP writes
+ *   and two identical cards.
+ *
+ *   FIX: a sha256 of `${channel}|${text.trim()}` is claimed in
+ *   groupme_notification_marks immediately before every POST. An in-window
+ *   collision suppresses the send and returns
+ *   { sent: false, reason: 'duplicate_suppressed' }. The channel is in the
+ *   hash, so the same text still reaches a different audience. Suppression is
+ *   windowed (GROUPME_DEDUP_WINDOW_MIN, default 60), never permanent.
+ *
+ *   FAIL-OPEN everywhere: a missing table, a DB error or a throw sends the
+ *   card. Approval cards opt out entirely via opts.noDedup. Kill without a
+ *   redeploy with GROUPME_DEDUP_ENABLED=false.
+ *
+ *   This is a BACKSTOP, not the fix — it catches the third identical card and
+ *   every future emitter. The duplicate producers are removed at source.
+ *
  * v1.7 — DEBOUNCED CONSOLIDATION (2026-05-14).
  *   PROBLEM: When the action executor fires multiple actions for the same
  *   contact within seconds (e.g. one inbound message triggering
@@ -107,6 +131,7 @@
  *   GET  /groupme/queue-state — View in-flight debounce buffers (v1.7)
  */
 
+import { createHash } from 'node:crypto';
 import supabase from './supabase.js';
 import { generateResponse } from './response-generator.js';
 
@@ -183,6 +208,152 @@ const pendingNotifications = new Map();
 console.log(`[GroupMe] v1.7 debounce config: window=${NOTIFICATION_DEBOUNCE_MS}ms max_lines=${MAX_CONSOLIDATED_LINES} max_chars=${MAX_CARD_CHARS}`);
 
 // ═══════════════════════════════════════════════════════════════════
+// v1.8: CONTENT DEDUP BACKSTOP (2026-08-27)
+// ═══════════════════════════════════════════════════════════════════
+//
+// The debounce layer above only consolidates messages that carry a contactId
+// and are not flushNow. Every operator card, every system event and both "LP
+// Appointment Set" emitters take the IMMEDIATE path, so byte-identical cards
+// always sent. This is the last line of defence: a content hash claimed in
+// groupme_notification_marks, so the SECOND identical card inside the window
+// never reaches GroupMe — whichever emitter produced it, including ones that
+// do not exist yet.
+//
+// It is a backstop, not the fix. The duplicate PRODUCERS are removed in the
+// same branch (canvassing intake claim; one system_event per appointment).
+//
+// Safe default ON: only the literal 'false' disables it, so an unset or
+// mistyped var still dedups. Killable without a redeploy.
+const GROUPME_DEDUP_ENABLED = String(process.env.GROUPME_DEDUP_ENABLED ?? 'true') !== 'false';
+const GROUPME_DEDUP_WINDOW_MIN = Math.max(
+  1,
+  parseInt(process.env.GROUPME_DEDUP_WINDOW_MIN || '60', 10) || 60,
+);
+const DEDUP_SAMPLE_CHARS = 200;
+const DEDUP_PRUNE_INTERVAL_MS = 60 * 60 * 1000; // once per process-hour
+const DEDUP_PRUNE_AFTER_DAYS = 7;
+
+let lastDedupPruneAt = 0;
+
+// Test seam. sendGroupMeMessage is called from ~40 sites with no dependency
+// injection of any kind, and adding a client parameter to all of them to make
+// one backstop testable would be worse than this. null = use the imported
+// supabase singleton, which is what production always does.
+let _dedupClientOverride = null;
+
+/**
+ * TESTS ONLY — point the dedup layer at a stub client. Production never calls
+ * this; the module-level supabase import is the real client.
+ */
+export function __setDedupClientForTests(client) {
+  _dedupClientOverride = client;
+  lastDedupPruneAt = 0;
+}
+
+console.log(`[GroupMe] v1.8 dedup config: enabled=${GROUPME_DEDUP_ENABLED} window_min=${GROUPME_DEDUP_WINDOW_MIN}`);
+
+/**
+ * Opportunistic prune of dedup rows older than 7 days. Fire-and-forget and at
+ * most once per process-hour — this must NEVER block or fail a send.
+ */
+function _maybePruneDedupMarks(client) {
+  const now = Date.now();
+  if (now - lastDedupPruneAt < DEDUP_PRUNE_INTERVAL_MS) return;
+  lastDedupPruneAt = now;
+  const cutoff = new Date(now - DEDUP_PRUNE_AFTER_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  Promise.resolve(
+    client.from('groupme_notification_marks').delete().lt('first_sent_at', cutoff),
+  ).then(
+    ({ error } = {}) => {
+      if (error) console.warn(`[GroupMe] dedup prune failed (ignored): ${error.message}`);
+    },
+    (err) => console.warn(`[GroupMe] dedup prune threw (ignored): ${err.message}`),
+  );
+}
+
+/**
+ * Is this exact card, on this exact channel, a duplicate of one sent inside the
+ * window? Claims the hash by INSERT — the unique PK is what serializes two
+ * concurrent emitters, the same doctrine as the v1.5 approval claim.
+ *
+ * The channel is part of the hash on purpose: the same text to a DIFFERENT
+ * channel is two audiences and two legitimate cards.
+ *
+ * FAIL-OPEN on every error path — a card is never dropped because the dedup
+ * table is missing, slow or unhappy. Returns true ONLY on a proven, in-window
+ * duplicate.
+ *
+ * @returns {Promise<boolean>} true = suppress this send.
+ */
+async function _isDuplicateCard(text, channel, opts = {}) {
+  const client = opts.client ?? _dedupClientOverride ?? supabase;
+  if (!GROUPME_DEDUP_ENABLED) return false;
+  if (!client || !text) return false;
+
+  const chan = channel || 'main';
+  const hash = createHash('sha256').update(`${chan}|${String(text).trim()}`).digest('hex');
+
+  try {
+    const { error: insErr } = await client.from('groupme_notification_marks').insert({
+      dedup_hash: hash,
+      channel: chan,
+      sample: String(text).trim().slice(0, DEDUP_SAMPLE_CHARS),
+      first_sent_at: new Date().toISOString(),
+      hit_count: 1,
+    });
+
+    // No row existed — this card is new. Send it.
+    if (!insErr) {
+      _maybePruneDedupMarks(client);
+      return false;
+    }
+    // Anything other than a PK collision is an infra problem, not a duplicate.
+    if (insErr.code !== '23505') {
+      console.warn(`[GroupMe] dedup insert failed (fail-open, sending): ${insErr.message}`);
+      return false;
+    }
+
+    // Collision — decide by age, not by existence, so a card that recurs
+    // tomorrow is news again.
+    const { data: existing, error: selErr } = await client
+      .from('groupme_notification_marks')
+      .select('first_sent_at, hit_count')
+      .eq('dedup_hash', hash)
+      .maybeSingle();
+
+    if (selErr || !existing) {
+      console.warn(`[GroupMe] dedup lookup after collision failed (fail-open, sending): ${selErr?.message || 'row vanished'}`);
+      return false;
+    }
+
+    const ageMs = Date.now() - new Date(existing.first_sent_at).getTime();
+    if (Number.isNaN(ageMs)) return false;
+
+    if (ageMs < GROUPME_DEDUP_WINDOW_MIN * 60000) {
+      const { error: updErr } = await client
+        .from('groupme_notification_marks')
+        .update({ hit_count: (existing.hit_count || 1) + 1 })
+        .eq('dedup_hash', hash);
+      if (updErr) console.warn(`[GroupMe] dedup hit_count bump failed (ignored): ${updErr.message}`);
+      console.log(`[GroupMe] duplicate suppressed hash=${hash.slice(0, 12)} channel=${chan} age_s=${Math.round(ageMs / 1000)}`);
+      return true;
+    }
+
+    // Older than the window — reopen it and let this one through.
+    const { error: reopenErr } = await client
+      .from('groupme_notification_marks')
+      .update({ first_sent_at: new Date().toISOString(), hit_count: 1 })
+      .eq('dedup_hash', hash);
+    if (reopenErr) console.warn(`[GroupMe] dedup window reopen failed (ignored, sending): ${reopenErr.message}`);
+    _maybePruneDedupMarks(client);
+    return false;
+  } catch (err) {
+    console.warn(`[GroupMe] dedup threw (fail-open, sending): ${err.message}`);
+    return false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // OUTBOUND: Send messages to GroupMe
 // ═══════════════════════════════════════════════════════════════════
 
@@ -202,12 +373,17 @@ console.log(`[GroupMe] v1.7 debounce config: window=${NOTIFICATION_DEBOUNCE_MS}m
  * @param {string} [opts.channel]     — Logical destination channel.
  *   'canvass' → GROUPME_CANVASS_BOT_ID (falls back to the main bot with a
  *   one-time warning when unset). Omitted/unknown → main bot.
+ * @param {boolean} [opts.noDedup]    — v1.8: skip the content-dedup backstop.
+ *   For cards that must send even when byte-identical to a recent one
+ *   (approval cards — time-sensitive operator decisions).
  * @returns {Promise<{sent: boolean, reason?: string, queue_size?: number}>}
  *   sent=true: fired immediately. sent=false with reason='queued': buffered.
- *   sent=false with other reason: send failed.
+ *   sent=false with reason='duplicate_suppressed': identical card already sent
+ *   to this channel inside the dedup window. sent=false with other reason:
+ *   send failed.
  */
 export async function sendGroupMeMessage(text, opts = {}) {
-  const { contactId, contactName, flushNow, channel } = opts || {};
+  const { contactId, contactName, flushNow, channel, noDedup } = opts || {};
   const botId = _resolveBotId(channel);
 
   if (!botId) {
@@ -218,6 +394,11 @@ export async function sendGroupMeMessage(text, opts = {}) {
   // Immediate path: no contactId (system event) OR explicit flushNow
   // (approval/error/operator card). This is the v1.6-and-earlier behavior.
   if (!contactId || flushNow) {
+    // v1.8: content dedup immediately before the POST. This is the path both
+    // "LP Appointment Set" emitters take, and the one with no other guard.
+    if (!noDedup && await _isDuplicateCard(text, channel)) {
+      return { sent: false, reason: 'duplicate_suppressed' };
+    }
     return await _sendRawGroupMeMessage(text, botId);
   }
 
@@ -324,11 +505,24 @@ async function _flushBuffer(buf) {
     // Single message — send as-is, no consolidation header. Caller still
     // gets the 5s delay (cost of opt-in), but the message format is
     // identical to what they passed in.
+    // v1.8: dedup on the exact text that is about to be POSTed.
+    if (await _isDuplicateCard(buf.lines[0], buf.channel)) {
+      console.log(`[GroupMe] flushed contact=${buf.contactId} lines=1 elapsed_ms=${elapsed} — duplicate suppressed`);
+      return { sent: false, reason: 'duplicate_suppressed' };
+    }
     console.log(`[GroupMe] flushed contact=${buf.contactId} lines=1 elapsed_ms=${elapsed} (single, no header)`);
     return await _sendRawGroupMeMessage(buf.lines[0], botId);
   }
 
   const consolidated = _buildConsolidatedCard(buf);
+  // v1.8: the consolidated card carries a live "Ns window" header, so two
+  // consolidations are byte-identical only when their timing matches too —
+  // narrower than the single-line case by nature, but the guard belongs on
+  // every path that POSTs.
+  if (await _isDuplicateCard(consolidated, buf.channel)) {
+    console.log(`[GroupMe] flushed contact=${buf.contactId} lines=${buf.lines.length} elapsed_ms=${elapsed} — duplicate suppressed`);
+    return { sent: false, reason: 'duplicate_suppressed' };
+  }
   console.log(`[GroupMe] flushed contact=${buf.contactId} lines=${buf.lines.length} elapsed_ms=${elapsed} consolidated_chars=${consolidated.length}`);
   return await _sendRawGroupMeMessage(consolidated, botId);
 }
@@ -532,8 +726,12 @@ export async function sendApprovalRequest(batchActions, contactName, contactPhon
     throw new Error(`Failed to claim approval batch ${batchId}: ${claimErr.message}`);
   }
 
-  // v1.7: approval cards bypass debounce (no opts → immediate send).
-  const sendResult = await sendGroupMeMessage(msg);
+  // v1.7: approval cards bypass debounce (immediate send).
+  // v1.8: and bypass content dedup. The body carries a unique short_ref so two
+  // approval cards would never collide anyway — but an approval is a
+  // time-sensitive operator decision, and it must not depend on that staying
+  // true. The v1.5 insert-first claim above is already this path's dedup.
+  const sendResult = await sendGroupMeMessage(msg, { noDedup: true });
   if (!sendResult?.sent) {
     await supabase
       .from('groupme_approval_requests')
@@ -668,7 +866,9 @@ async function sendRegeneratedApprovalCard({
     throw new Error(`Failed to claim regenerated approval ${shortRef}: ${claimErr.message}`);
   }
 
-  const sendResult = await sendGroupMeMessage(msg);
+  // v1.8: noDedup for the same reason as sendApprovalRequest — an operator
+  // decision card must never be suppressed by a content match.
+  const sendResult = await sendGroupMeMessage(msg, { noDedup: true });
   if (!sendResult?.sent) {
     await supabase.from('groupme_approval_requests').delete().eq('short_ref', shortRef).catch(() => {});
     throw new Error(`Edit GroupMe send failed: ${sendResult?.reason || 'unknown'}`);
@@ -1052,6 +1252,11 @@ export function registerGroupMeRoutes(app) {
       max_card_chars: MAX_CARD_CHARS,
       buffer_count: snapshot.length,
       buffers: snapshot,
+      // v1.8 — is the content-dedup backstop live, and how wide is its window?
+      dedup: {
+        enabled: GROUPME_DEDUP_ENABLED,
+        window_min: GROUPME_DEDUP_WINDOW_MIN,
+      },
     });
   });
 

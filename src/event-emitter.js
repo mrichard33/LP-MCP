@@ -235,6 +235,17 @@ export async function emitEvent(opts) {
     );
 
     if (error) {
+      // A unique-key collision is the idempotency contract working, not a
+      // failure: another producer (or another worker) already emitted this
+      // exact event between our SELECT above and this INSERT. Deliberate as of
+      // 2026-08-27 — the two producers of ghl.appointment_booked now share one
+      // idempotency key precisely so the second insert loses here. Log it as
+      // the no-op it is; reserve console.error for real write failures, or
+      // every appointment booked would raise a false alarm.
+      if (error.code === '23505') {
+        console.log(`[EventEmitter] ${event_type} already emitted (idempotency_key=${idempotency_key}) — no-op`);
+        return null;
+      }
       console.error(`[EventEmitter] Failed to emit ${event_type}:`, error.message);
       return null;
     }

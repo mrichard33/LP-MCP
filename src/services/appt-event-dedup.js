@@ -53,15 +53,67 @@ function withTimeout(promise, label, ms = DEDUP_TIMEOUT_MS) {
 }
 
 /**
+ * Namespace for the appointment-id key family. Shared verbatim with the
+ * lp_mcp producer in actions/handlers/appointments.js — see
+ * buildApptEventIdempotencyKey. The literal reads "booked" for historical
+ * reasons (it is the key that producer has written since 2026-08-13); the
+ * real status lives in its own segment, so cancels never collide with books.
+ */
+const APPT_ID_KEY_PREFIX = 'ghl_appt_booked';
+
+/**
  * Stable logical key for an appointment slot — NO status segment.
  * Prefers the real appointment id; until GHL sends it, falls back to the
  * appointment's identity: calendar + date + start time.
+ *
+ * 2026-08-27: the appointment-id branch is namespaced under
+ * APPT_ID_KEY_PREFIX so the two producers of ghl.appointment_booked write the
+ * SAME stored key and collide on the unique index (see
+ * buildApptEventIdempotencyKey). checkApptEventDedup's LIKE lookup below is
+ * still prefixed with this slot key, so its own sequence-aware dedup is
+ * unchanged. The contact id leaves this branch — a GHL appointment id is
+ * globally unique, and the lookup is still scoped by .eq('entity_id', ...).
+ * The no-appointment-id fallback is untouched.
  */
 export function buildApptSlotKey({ contactId, calendarId, appointmentId, startDate, startTime }) {
-  const apptKey = appointmentId
-    ? `id:${appointmentId}`
-    : `slot:${calendarId || 'nocal'}:${startDate || 'nodate'}:${startTime || 'notime'}`;
-  return `ghl_appt_${contactId}_${apptKey}`;
+  if (appointmentId) return `${APPT_ID_KEY_PREFIX}:${appointmentId}`;
+  return `ghl_appt_${contactId}_slot:${calendarId || 'nocal'}:${startDate || 'nodate'}:${startTime || 'notime'}`;
+}
+
+/**
+ * The STORED idempotency key for an appointment event, shared by both
+ * producers of ghl.appointment_booked so one appointment yields one event.
+ *
+ * Verified 2026-08-27: system_events 3173274 (source lp_mcp, key
+ * `ghl_appt_booked:08ZumfzoGu2Opn8VHIlp`) and 3173275 (source ghl_webhook, key
+ * `ghl_appt_q5GehRye7DNkN6jlmjl3_id:08ZumfzoGu2Opn8VHIlp_booked_1787793611613`)
+ * describe the SAME appointment at the same start time. Different keys → both
+ * inserted → rule 112 GHL_APPT_LP_SYNC fired twice → agent_actions 367235 and
+ * 367236 both wrote to LP and both carded. All four lp_mcp events in the
+ * trailing fortnight were duplicates of a ghl_webhook twin.
+ *
+ * The three segments are exactly the fact "this appointment, in this state, at
+ * this time":
+ *   - appointmentId — the appointment's identity.
+ *   - status — the booked/cancelled fact as carried on the event PAYLOAD, which
+ *     both producers already set identically (lp_mcp hardcodes 'booked' and
+ *     puts GHL's own appointmentStatus in a separate ghl_status field; the
+ *     webhook producer's value tracks its event type). NEVER pass ghl_status
+ *     here: on the reference pair above it read "new" on one side and would
+ *     have made the two keys differ forever.
+ *   - startDate + startTime — so a genuine RESCHEDULE emits a new event rather
+ *     than being swallowed. Do not key on appointment id alone. Both producers
+ *     were verified to render these identically ("2026-08-28", "6:00 PM") on
+ *     every duplicate pair on record.
+ *
+ * Returns null when there is no appointment id — the caller keeps its own
+ * existing fallback key, which is deliberately collision-free because the
+ * slot-lookup path in checkApptEventDedup does that dedup instead.
+ */
+export function buildApptEventIdempotencyKey({ appointmentId, status, startDate, startTime }) {
+  if (!appointmentId) return null;
+  const start = [startDate, startTime].filter(Boolean).join(' ');
+  return `${APPT_ID_KEY_PREFIX}:${appointmentId}:${status || 'booked'}:${start}`;
 }
 
 /**
@@ -81,8 +133,16 @@ export async function checkApptEventDedup(
   const supabase = client ?? defaultSupabase;
   const slotKey = buildApptSlotKey({ contactId, calendarId, appointmentId, startDate, startTime });
   // status stays in the STORED key for forensics; it is NOT part of the lookup
-  // prefix. Date.now() keeps emitEvent's unique-key insert from colliding.
-  const idempotencyKey = `${slotKey}_${status}_${Date.now()}`;
+  // prefix (LIKE `${slotKey}_%` matches both shapes below — `_` is a
+  // single-character wildcard, so the `:` separator matches it).
+  //
+  // With an appointment id the stored key is the SHARED, deterministic one so
+  // the other producer of this event collides with us on the unique index
+  // rather than inserting a twin. Without one there is nothing stable to agree
+  // on, so Date.now() keeps emitEvent's unique-key insert from colliding and
+  // the slot lookup above is what dedups.
+  const idempotencyKey = buildApptEventIdempotencyKey({ appointmentId, status, startDate, startTime })
+    || `${slotKey}_${status}_${Date.now()}`;
   const open = (reason) => ({ deduped: false, slotKey, idempotencyKey, matchedAgeMs: null, reason });
 
   if (!supabase) return open('no_supabase_open');
@@ -125,4 +185,4 @@ export async function checkApptEventDedup(
   }
 }
 
-export default { buildApptSlotKey, checkApptEventDedup };
+export default { buildApptSlotKey, buildApptEventIdempotencyKey, checkApptEventDedup };

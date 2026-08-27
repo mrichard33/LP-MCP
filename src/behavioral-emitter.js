@@ -1072,6 +1072,13 @@ async function handleAppointment(req, res) {
     // effect below. Return 200 (not an error) — GHL retries on non-2xx.
     return res.json({ status: 'deduped', event_type: eventType });
   }
+  // 2026-08-27: when GHL sends an appointment id this is the SHARED key that
+  // the lp_mcp producer (actions/handlers/appointments.js) also writes, so one
+  // appointment yields one event whichever side gets there first — the loser's
+  // insert hits the unique index and emitEvent no-ops. `status` here is the
+  // lowercased booked/cancelled fact that also lands on the payload, which is
+  // exactly what that producer agrees with. Without an appointment id the key
+  // stays unique-per-emit and the slot lookup above does the dedup.
   const idempotencyKey = dedup.idempotencyKey;
 
   await emitEvent({

@@ -20,6 +20,8 @@ const {
   buildLpLeadFields,
   processCanvassingLead,
   findRecentCanvassMark,
+  claimCanvassMark,
+  buildJobSize,
   FIELD_LP_INBOUND_LEAD_ID,
 } = await import('../src/canvassing-lead-handler.js');
 const { convertCanvassAppointment } = await import('../src/canvassing-time.js');
@@ -61,11 +63,25 @@ function validPayload(overrides = {}) {
 }
 
 // Stateful mock of canvassing_intake_marks keyed by dedup_key.
-function mockMarksClient(rows = new Map()) {
+//
+// insert() models the real PRIMARY KEY on dedup_key: a second insert for the
+// same key returns 23505 rather than overwriting. That collision is the entire
+// mechanism behind claimCanvassMark — an upsert cannot lose that race because
+// it never fails. `insertError` forces a non-23505 DB failure to exercise the
+// fail-open branch.
+function mockMarksClient(rows = new Map(), { insertError = null } = {}) {
   return {
     _rows: rows,
     from() {
       return {
+        insert(row) {
+          if (insertError) return Promise.resolve({ error: insertError });
+          if (rows.has(row.dedup_key)) {
+            return Promise.resolve({ error: { code: '23505', message: 'duplicate key value violates unique constraint "canvassing_intake_marks_pkey"' } });
+          }
+          rows.set(row.dedup_key, { ...row });
+          return Promise.resolve({ error: null });
+        },
         upsert(row) {
           rows.set(row.dedup_key, { ...(rows.get(row.dedup_key) || {}), ...row });
           return Promise.resolve({ error: null });
@@ -94,11 +110,12 @@ function mockMarksClient(rows = new Map()) {
   };
 }
 
-function mockDeps({ addLeadImpl, salesRabbitImpl, client } = {}) {
+function mockDeps({ addLeadImpl, salesRabbitImpl, client, resolveCanvasserProId } = {}) {
   const calls = { addLead: [], groupme: [], ghlFields: [], salesrabbit: [], events: [] };
   const deps = {
     client: client ?? mockMarksClient(),
     now: () => NOW,
+    ...(resolveCanvasserProId ? { resolveCanvasserProId } : {}),
     addLead: async (fields) => {
       calls.addLead.push(fields);
       if (addLeadImpl) return addLeadImpl(fields);
@@ -443,4 +460,152 @@ test('pipeline: no salesrabbit_id → SalesRabbit never called', async () => {
   const { deps, calls } = mockDeps();
   await processCanvassingLead(validPayload({ salesrabbit_id: '' }), deps);
   assert.equal(calls.salesrabbit.length, 0);
+});
+
+// ─── Concurrent-duplicate claim (2026-08-27) ────────────────────
+//
+// Verified defect: contact hclMXNalJA8H2bGVW0kS produced LP inbound leads
+// 418571 AND 418575, both at 2026-08-26T23:33Z, while canvassing_intake_marks
+// held exactly ONE row. Both POSTs passed the route's findRecentCanvassMark
+// pre-check, both called addLead, and the upsert overwrote instead of
+// colliding. The claim is an INSERT precisely so one of them loses.
+
+test('claim: two concurrent runs for one contact → addLead called EXACTLY once', async () => {
+  const rows = new Map();
+  const client = mockMarksClient(rows);
+  const a = mockDeps({ client });
+  const b = mockDeps({ client });
+
+  const [ra, rb] = await Promise.all([
+    processCanvassingLead(validPayload(), a.deps),
+    processCanvassingLead(validPayload(), b.deps),
+  ]);
+
+  const outcomes = [ra.outcome, rb.outcome].sort();
+  assert.deepEqual(outcomes, ['duplicate_suppressed', 'ok']);
+
+  // Exactly one LP write across BOTH runs — the whole point.
+  assert.equal(a.calls.addLead.length + b.calls.addLead.length, 1);
+
+  // The loser is silent: a suppressed duplicate is not news.
+  const loser = ra.outcome === 'duplicate_suppressed' ? a.calls : b.calls;
+  assert.equal(loser.groupme.length, 0);
+  assert.equal(loser.events.length, 0);
+  assert.equal(loser.ghlFields.length, 0);
+  assert.equal(loser.salesrabbit.length, 0);
+});
+
+test('claim: the loser returns BEFORE addLead, not after', async () => {
+  const rows = new Map();
+  const client = mockMarksClient(rows);
+  // Winner goes first and completes, so the second run collides on a row that
+  // already exists — the sequential form of the same race.
+  const first = mockDeps({ client });
+  await processCanvassingLead(validPayload(), first.deps);
+
+  const second = mockDeps({ client });
+  const result = await processCanvassingLead(validPayload(), second.deps);
+  assert.equal(result.outcome, 'duplicate_suppressed');
+  assert.equal(second.calls.addLead.length, 0);
+  assert.equal(second.calls.groupme.length, 0);
+});
+
+test('claim: a non-23505 DB error fails OPEN — the lead still processes', async () => {
+  const client = mockMarksClient(new Map(), {
+    insertError: { code: '42P01', message: 'relation "canvassing_intake_marks" does not exist' },
+  });
+  const { deps, calls } = mockDeps({ client });
+  const result = await processCanvassingLead(validPayload(), deps);
+  // Double-processing during an infra failure beats dropping a lead.
+  assert.equal(result.outcome, 'ok');
+  assert.equal(calls.addLead.length, 1);
+  assert.ok(calls.groupme.some((g) => g.text.includes('CANVASSING LEAD CREATED')));
+});
+
+test('claim: no client at all (fail-open) still processes', async () => {
+  const { deps, calls } = mockDeps({ client: null });
+  const result = await processCanvassingLead(validPayload(), deps);
+  assert.equal(result.outcome, 'ok');
+  assert.equal(calls.addLead.length, 1);
+});
+
+test('claim: later status updates still overwrite the row the claim created', async () => {
+  const rows = new Map();
+  const { deps } = mockDeps({ client: mockMarksClient(rows) });
+  await processCanvassingLead(validPayload(), deps);
+  // writeCanvassMark (upsert) must still work on top of the claimed row.
+  assert.equal(rows.get('CONTACT123').status, 'lp_created');
+  assert.equal(rows.get('CONTACT123').in1_id, '384191');
+});
+
+// ─── Card detail (2026-08-27) ───────────────────────────────────
+
+test('card: the canvasser NAME renders, and a numeric Pro ID never reaches the card', async () => {
+  const { deps, calls } = mockDeps({
+    resolveCanvasserProId: async () => ({ proId: '4471', name: 'Jordan Pérez', reason: 'ok', withheld: false }),
+  });
+  // promoter is the numeric Pro ID GHL actually sends — it must not be printed.
+  await processCanvassingLead(validPayload({ promoter: '4471', pro_id: '4471' }), deps);
+  const card = calls.groupme.find((g) => g.text.includes('CANVASSING LEAD CREATED')).text;
+  assert.match(card, /🚪 Canvasser: Jordan Pérez/);
+  assert.match(card, /📋 Src: .*Jordan Pérez/);
+  assert.doesNotMatch(card, /4471/);
+});
+
+test('card: an unresolved canvasser omits the line entirely rather than printing an id', async () => {
+  const { deps, calls } = mockDeps({
+    resolveCanvasserProId: async () => ({ proId: '', name: null, reason: 'absent', withheld: false }),
+  });
+  const card = await processCanvassingLead(validPayload({ promoter: '9999', pro_id: '9999' }), deps)
+    .then(() => calls.groupme.find((g) => g.text.includes('CANVASSING LEAD CREATED')).text);
+  assert.doesNotMatch(card, /🚪 Canvasser:/);
+  assert.doesNotMatch(card, /9999/);
+});
+
+test('card: address, email, job size and LP ref all render', async () => {
+  const { deps, calls } = mockDeps();
+  await processCanvassingLead(validPayload(), deps);
+  const card = calls.groupme.find((g) => g.text.includes('CANVASSING LEAD CREATED')).text;
+  assert.match(card, /📍 123 Main St, Delray Beach FL 33446/);
+  assert.match(card, /✉️ test@example\.com/);
+  assert.match(card, /📐 Job size: 15 windows · 1 door · 2 sliders/);
+  assert.match(card, /📋 LP: inbound #384191/);
+});
+
+test('card: blank and zero counts are omitted; all-absent renders no job size', async () => {
+  const { deps, calls } = mockDeps();
+  await processCanvassingLead(validPayload({ window_count: '8', door_count: '0', slider_count: '' }), deps);
+  const card = calls.groupme.find((g) => g.text.includes('CANVASSING LEAD CREATED')).text;
+  assert.match(card, /📐 Job size: 8 windows$/m);
+
+  const bare = mockDeps();
+  await processCanvassingLead(
+    validPayload({ window_count: '', door_count: '', slider_count: '' }),
+    bare.deps,
+  );
+  const bareCard = bare.calls.groupme.find((g) => g.text.includes('CANVASSING LEAD CREATED')).text;
+  assert.doesNotMatch(bareCard, /Job size/);
+});
+
+test('card: a blank address omits the line rather than rendering ", FL 33446"', async () => {
+  const { deps, calls } = mockDeps();
+  await processCanvassingLead(validPayload({ address1: '' }), deps);
+  // No address1 → the lead is blocked before LP, and that card must still be clean.
+  const card = calls.groupme.find((g) => g.text.includes('CANVASSING LEAD BLOCKED')).text;
+  assert.doesNotMatch(card, /📍/);
+});
+
+test('card: an event booth reads as Events, not Canvassing', async () => {
+  const { deps, calls } = mockDeps();
+  await processCanvassingLead(validPayload({ srs_id: '869' }), deps);
+  const card = calls.groupme.find((g) => g.text.includes('CANVASSING LEAD CREATED')).text;
+  assert.match(card, /📋 Src: Events/);
+});
+
+test('buildJobSize: singular/plural, zeros, blanks, all-absent', () => {
+  assert.equal(buildJobSize({ window_count: '1', door_count: '1', slider_count: '1' }), '1 window · 1 door · 1 slider');
+  assert.equal(buildJobSize({ window_count: '2', door_count: '0', slider_count: '' }), '2 windows');
+  assert.equal(buildJobSize({ window_count: 'abc' }), undefined);
+  assert.equal(buildJobSize({}), undefined);
+  assert.equal(buildJobSize(), undefined);
 });

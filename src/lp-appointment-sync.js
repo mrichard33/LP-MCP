@@ -206,6 +206,7 @@ import { five9DispatchConfigured, dispatchConfirmationCallback } from './five9/l
 import { ghlFetch as sharedGhlFetch } from './actions/helpers.js';
 import { emitEvent } from './event-emitter.js';
 import { LP_EMP } from './lp-source-ids.js';
+import { buildLpAppointmentCard } from './services/appointment-card.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 // GHL_LOCATION_ID removed 2026-07-28: its only consumer was the locationId
@@ -1735,7 +1736,6 @@ async function syncAppointmentToLP({
   await writeApptSyncMark({ dedupKey, contactId, ldsId, apptDate, apptTime });
   await applyApptSyncedTag(contactId);
 
-  const calendarSegmentGroupMe = calendarName ? ` | ${calendarName}` : '';
   const calendarLineGhlNote    = calendarName ? `\nCalendar: ${calendarName}` : '';
 
   await addGHLNote(contactId,
@@ -1745,12 +1745,29 @@ async function syncAppointmentToLP({
     calendarLineGhlNote
   ).catch(() => {});
 
+  // 2026-08-27: ONE shared builder with the agentic path in
+  // actions/handlers/lp-appointment.js (services/appointment-card.js). The two
+  // hand-rolled copies had drifted: this one rendered no ghl_status segment,
+  // treated a literal "N/A" calendar as real, and printed "N/A" where the other
+  // printed "NONE" for a missing prospect. It also now carries Market, the
+  // address and the email — all of which this function already had in hand and
+  // none of which reached the card.
   await sendGroupMeMessage(
-    `📅 LP Appointment Set\n` +
-    `👤 ${contactName || contactId}\n` +
-    `📋 LP Lead: ${ldsId} | Prospect: ${prospectId || 'N/A'}\n` +
-    (lpSourceLine ? `📋 Src: ${lpSourceLine}\n` : '') +
-    `📅 ${apptDate} ${formatApptTime12h(apptTime)}${calendarSegmentGroupMe}`
+    await buildLpAppointmentCard({
+      contactId,
+      name: contactName || undefined,
+      phone: contactPhone,
+      email: contactEmail,
+      lpLeadId: ldsId,
+      prospectId,
+      lpSource,
+      lpSourceDetail,
+      address1, city, state, zip: postalCode,
+      apptDate,
+      apptTime,
+      calendarName,
+      narrative: `Appointment written to Lead Perfection for LP lead ${ldsId}. The LP-side team works it from here.`,
+    })
   ).catch(() => {});
 
   console.log(`[LP-APPT] ✅ Done: lds_id=${ldsId}, ${apptDate} ${apptTime}`);
