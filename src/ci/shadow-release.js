@@ -116,7 +116,7 @@ export function planShadowRelease(rows, target = 'lp') {
  * released row nothing would ever act on.
  *
  * 'review' is included because a call can be parked for one target while the
- * other shadowed; resuming it at 'matched' re-runs the sync stage, which is
+ * other shadowed; resuming it at 'syncing' re-runs the sync stage, which is
  * where the work actually is. Anything mid-pipeline is left alone — it is
  * already moving, and shoving it backwards would re-do finished stages.
  */
@@ -127,7 +127,10 @@ export function planParentResume(calls, callIds) {
 
 /** Puts a call back at the sync stage with a clean lease and no retry timer. */
 export const PARENT_RESUME_PATCH = {
-  status: 'matched',
+  // 'syncing', not 'matched': stageSync claims 'syncing'. 'matched' has meant
+  // "ready to transcribe" since matching moved ahead of transcription, and
+  // would put this call through analysis again to re-send one note.
+  status: 'syncing',
   review_reason: null,
   status_detail: null,
   attempts: 0,

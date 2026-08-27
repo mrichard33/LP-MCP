@@ -141,7 +141,7 @@ export function planRepair(results, window) {
   return { release, refuse };
 }
 
-/** Which parent calls this run should move back to 'matched'. Pure. */
+/** Which parent calls this run should move back to the sync stage. Pure. */
 export function planParentReset(calls, callIds) {
   const ids = new Set(callIds || []);
   return (calls || []).filter((c) => (
@@ -152,7 +152,10 @@ export function planParentReset(calls, callIds) {
 
 /** The patch that puts a call back in the queue at the sync stage. */
 export const PARENT_RESET_PATCH = {
-  status: 'matched',
+  // 'syncing', not 'matched': stageSync claims 'syncing'. Since matching moved
+  // ahead of transcription, 'matched' means "ready to transcribe" and would
+  // re-run analysis on a call that only needs its note re-sent.
+  status: 'syncing',
   review_reason: null,
   status_detail: null,
   attempts: 0,
@@ -271,7 +274,7 @@ async function main() {
   if (cErr) throw new Error(`ci_calls read failed: ${cErr.message}`);
 
   const toReset = planParentReset(calls || [], callIds);
-  console.log(`\n  parent calls: ${(calls || []).length} read, ${toReset.length} to reset to 'matched'`);
+  console.log(`\n  parent calls: ${(calls || []).length} read, ${toReset.length} to reset to 'syncing'`);
 
   if (!args.execute) {
     console.log('\nDRY-RUN complete. No writes performed.');

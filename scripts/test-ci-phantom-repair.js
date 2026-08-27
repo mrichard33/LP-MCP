@@ -155,9 +155,13 @@ test('only calls whose key this run released are reset', () => {
 });
 
 test('the reset clears the lease and the retry timer, not just the status', () => {
-  // A call put back to 'matched' while still holding a lease is invisible to
+  // A call put back in the queue while still holding a lease is invisible to
   // the claimer until the lease expires — it would look repaired and do nothing.
-  assert.equal(PARENT_RESET_PATCH.status, 'matched');
+  // 'syncing', not 'matched': stageSync claims 'syncing'. Since the early
+  // match gate moved matching ahead of transcription, 'matched' is the
+  // TRANSCRIBE rung — resetting there would put a call whose note merely
+  // needs re-sending back through analysis.
+  assert.equal(PARENT_RESET_PATCH.status, 'syncing');
   assert.equal(PARENT_RESET_PATCH.locked_until, null);
   assert.equal(PARENT_RESET_PATCH.locked_by, null);
   assert.equal(PARENT_RESET_PATCH.next_retry_at, null);

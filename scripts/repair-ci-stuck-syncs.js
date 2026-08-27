@@ -46,16 +46,21 @@
  * ── THE PARENT CALL ────────────────────────────────────────────────────────
  * A sync that failed terminally parks its call in 'review' with
  * review_reason='sync_failed'. Releasing the key without moving that call back
- * to 'matched' would leave it parked with nothing to park it. Only calls whose
- * key this run actually released are touched, only from 'review'/'completed',
- * and only when review_reason='sync_failed'.
+ * to the sync stage would leave it parked with nothing to park it. Only calls
+ * whose key this run actually released are touched, only from
+ * 'review'/'completed', and only when review_reason='sync_failed'.
  *
  * The reset also clears the lease and the retry timer and zeroes attempts —
  * the same field set POST /ci/review/:call_id/resolve applies on a retry. It
  * deliberately does NOT go through applyResolve(): that derives the resume
  * stage from the artifacts and would send a call with a current summary back to
  * 'analyzed', re-running matching. The match is not what failed here; only the
- * delivery was, so the call resumes at 'matched'.
+ * delivery was, so the call resumes at 'syncing' — the status stageSync claims.
+ *
+ * ⚠ 'syncing', NOT 'matched'. Matching moved ahead of transcription, so
+ * 'matched' now means "ready to TRANSCRIBE" and would send these calls back
+ * through analysis, paying model tokens to reproduce a summary they already
+ * hold. 'syncing' is the rung stageSync claims.
  *
  * Usage:
  *   node scripts/repair-ci-stuck-syncs.js                # dry-run (default)
@@ -146,7 +151,7 @@ export function planRepair(rows) {
 }
 
 /**
- * Which parent calls this run should move back to 'matched'. Pure.
+ * Which parent calls this run should move back to the sync stage. Pure.
  *
  * `callIds` is the set whose keys were released — a call whose key we did NOT
  * touch is none of this script's business, however it looks.
@@ -162,7 +167,9 @@ export function planParentReset(calls, callIds) {
 
 /** The patch that puts a parked call back in the queue at the sync stage. */
 export const PARENT_RESET_PATCH = {
-  status: 'matched',
+  // 'syncing', not 'matched' — see the header. stageSync claims 'syncing';
+  // 'matched' is the transcribe rung since the early match gate shipped.
+  status: 'syncing',
   review_reason: null,
   status_detail: null,
   attempts: 0,
@@ -287,7 +294,7 @@ async function main() {
   if (cErr) throw new Error(`ci_calls read failed: ${cErr.message}`);
 
   const toReset = planParentReset(calls || [], callIds);
-  console.log(`\n  parent calls: ${(calls || []).length} read, ${toReset.length} to reset to 'matched'`);
+  console.log(`\n  parent calls: ${(calls || []).length} read, ${toReset.length} to reset to 'syncing'`);
   for (const c of calls || []) {
     const mark = toReset.includes(c) ? '-> matched' : '(left alone)';
     console.log(`    ${String(c.five9_call_id ?? c.id).padEnd(20)} ${String(c.status).padEnd(10)}`

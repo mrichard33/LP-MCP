@@ -118,7 +118,7 @@ test('an empty read releases nothing rather than everything', () => {
 
 // ─── the parent calls ───────────────────────────────────────────────────────
 
-test('only calls whose key was released come back to matched', () => {
+test('only calls whose key was released come back to the sync stage', () => {
   const calls = [
     { id: 'c1', status: 'completed' },
     { id: 'c2', status: 'completed' },  // key not touched — none of our business
@@ -130,9 +130,13 @@ test('only calls whose key was released come back to matched', () => {
 });
 
 test('the resume clears the lease and the retry timer, not just the status', () => {
-  // A call put back to 'matched' while still holding a lease is invisible to
+  // A call put back in the queue while still holding a lease is invisible to
   // the claimer until the lease expires — it would look repaired and do nothing.
-  assert.equal(PARENT_RESUME_PATCH.status, 'matched');
+  // 'syncing', not 'matched': stageSync claims 'syncing'. Since the early
+  // match gate moved matching ahead of transcription, 'matched' is the
+  // TRANSCRIBE rung — resetting there would put a call whose note merely
+  // needs re-sending back through analysis.
+  assert.equal(PARENT_RESUME_PATCH.status, 'syncing');
   assert.equal(PARENT_RESUME_PATCH.locked_until, null);
   assert.equal(PARENT_RESUME_PATCH.locked_by, null);
   assert.equal(PARENT_RESUME_PATCH.next_retry_at, null);
@@ -195,14 +199,14 @@ test('DRY-RUN is the default and writes nothing', async () => {
   assert.equal(db.updates.length, 0);
 });
 
-test('executing releases the key, audits it, and puts the call back to matched', async () => {
+test('executing releases the key, audits it, and puts the call back at sync', async () => {
   const r0 = row();
   const db = fakeDb([r0], [{ id: r0.call_id, status: 'completed' }]);
   const r = await releaseShadowSyncs({ db, execute: true });
   assert.equal(r.released, 1);
   assert.equal(r.resumed, 1);
   assert.deepEqual(db.deletes, ['sync-1']);
-  assert.equal(db.updates[0].patch.status, 'matched');
+  assert.equal(db.updates[0].patch.status, 'syncing');
 
   // The row is gone; the fact is not.
   assert.equal(db.events.length, 1);
