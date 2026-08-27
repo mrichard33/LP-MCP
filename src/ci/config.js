@@ -109,6 +109,46 @@ export function parseConfig(env = process.env) {
     transcribeModel: env.CI_TRANSCRIBE_MODEL || 'gpt-4o-mini-transcribe',
     promptVersion: env.CI_PROMPT_VERSION || 'v1',
 
+    /**
+     * Transcribe a call the early gate resolved to NO writable target?
+     *
+     * ── WHAT THE GATE IS FOR ───────────────────────────────────────────────
+     * Matching keys on campaign + customer phone against LP and reads nothing
+     * from the transcript (measured: every `evidence` row across 2,989 matches
+     * carries only ghl / note_target / canvass_strategy / reason /
+     * canvasser_ani — no transcript-derived field). It was nonetheless paid
+     * for AFTER transcription. Over 4,154 transcripts / 113.5 audio-hours,
+     * 2,120 calls — 51% of the ~$40.86 Whisper spend — produced no writable
+     * match and therefore no note. Resolving the customer BEFORE the Whisper
+     * call is what stops paying for those.
+     *
+     * ── WHY IT DEFAULTS TO true, i.e. TO TODAY'S BEHAVIOUR ─────────────────
+     * Not every `none` is worthless. Some are genuinely NEW callers who ought
+     * to become leads, and for those the transcript is the ONLY record of who
+     * rang and what they wanted. Killing it saves fractions of a cent and
+     * loses the lead.
+     *
+     * So this ships as an OPT-OUT and the gate ships INERT: with the default,
+     * a tier-'none' call transcribes exactly as it does today and the only
+     * new artifact is the ci_events gate row saying what WOULD have been
+     * saved. Mark turns it off once he has read what those calls contain.
+     * Shipping it default-off would be a silent behaviour change wearing an
+     * optimisation's clothes.
+     *
+     * ── AND WHAT TURNING IT OFF ALSO TURNS OFF ─────────────────────────────
+     * decideLpTier()'s name+address fallback (match.js step 4) runs only when
+     * the phone found nothing, and needs the AI's `customer.name`/`.address`.
+     * The early gate has no analysis yet, so with this false a call that today
+     * matches on name+address is gated out before the analysis that would have
+     * matched it exists. That is a real, small loss and it is the reason the
+     * flag exists rather than the gate being unconditional.
+     *
+     * OPT-OUT parsing, not the repo's usual `=== 'true'`: an unset or
+     * misspelled variable must land on "keep transcribing", never on "stop".
+     * Only the literal string 'false' disarms it.
+     */
+    transcribeUnmatched: String(env.CI_TRANSCRIBE_UNMATCHED ?? 'true').trim().toLowerCase() !== 'false',
+
     // Origin for the recording link in a CRM note, e.g.
     // 'https://lp-mcp-production.up.railway.app'. DELIBERATELY NO DEFAULT:
     // unset means the note omits the link line entirely and everything else

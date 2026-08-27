@@ -37,6 +37,7 @@
 import supabase from '../supabase.js';
 import { getConfig } from './config.js';
 import { last4 } from './time.js';
+import { GATE_STAGE, GATE_EVENT } from './match-gate.js';
 
 const LOG = '[CIReconcile]';
 
@@ -223,6 +224,8 @@ export async function pipelineHealth({ db = supabase, cfg = getConfig(), sinceHo
     .eq('event', GAP_EVENT)
     .gte('created_at', since);
 
+  const gate = await matchGateHealth({ db, since });
+
   return {
     mode: cfg.mode,
     writes: { lp: cfg.lpWrites, ghl: cfg.ghlWrites, ghl_create: cfg.ghlCreate, allow_probable: cfg.allowProbable },
@@ -233,7 +236,57 @@ export async function pipelineHealth({ db = supabase, cfg = getConfig(), sinceHo
     tokens,
     // Named 'estimated_' so nobody reads it as billing truth.
     estimated_analysis_tokens_per_day: sinceHours > 0 ? Math.round(((tokens.input + tokens.output) / sinceHours) * 24) : 0,
+    match_gate: { transcribe_unmatched: cfg.transcribeUnmatched, ...gate },
   };
 }
 
-export default { reconcileDay, pipelineHealth, classifyCall, expectedSegments, beforeTransferRecording };
+/**
+ * What the early match gate did in the window.
+ *
+ * ══ THIS IS THE PR'S ONLY EVIDENCE, SO IT IS NOT OPTIONAL ══
+ * The change is justified entirely by "calls we stopped paying to transcribe".
+ * That number has to be readable AFTER deploy from the live system, not
+ * asserted in a description — and its counterpart (`transcribed`) has to be
+ * readable beside it, because a gate that is too aggressive and a pipeline
+ * that is simply quiet produce the same silence otherwise.
+ *
+ * Seconds are what ci_calls.duration_seconds said at gate time, summed off the
+ * event rows. A call with no duration contributes 0 rather than a guess, so
+ * this UNDER-reports and never over-claims a saving.
+ *
+ * NEVER THROWS. /ci/health is what a human opens when something looks wrong;
+ * a new counter must not be the reason the whole endpoint 500s. A failure
+ * reports itself in the payload and everything else still renders.
+ */
+export async function matchGateHealth({ db = supabase, since } = {}) {
+  const empty = { gated_out: 0, transcribed: 0, audio_seconds_not_transcribed: 0, reasons: {} };
+  try {
+    const { data, error } = await db
+      .from('ci_events')
+      .select('detail')
+      .eq('stage', GATE_STAGE)
+      .eq('event', GATE_EVENT)
+      .gte('created_at', since);
+    if (error) throw new Error(error.message);
+
+    const out = { ...empty, reasons: {} };
+    for (const row of data || []) {
+      const d = row?.detail || {};
+      const reason = String(d.reason ?? 'unknown');
+      out.reasons[reason] = (out.reasons[reason] || 0) + 1;
+      if (d.transcribed === false) {
+        out.gated_out++;
+        const s = Number(d.audio_seconds ?? 0);
+        if (Number.isFinite(s) && s > 0) out.audio_seconds_not_transcribed += Math.round(s);
+      } else {
+        out.transcribed++;
+      }
+    }
+    return out;
+  } catch (err) {
+    console.warn(`${LOG} match-gate health unavailable: ${err.message}`);
+    return { ...empty, error: err.message };
+  }
+}
+
+export default { reconcileDay, pipelineHealth, matchGateHealth, classifyCall, expectedSegments, beforeTransferRecording };

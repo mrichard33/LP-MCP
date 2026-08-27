@@ -6,10 +6,36 @@
  * mid-batch loses nothing: leases expire and the calls come back.
  *
  * ONE STAGE PER CLAIM is deliberate. A call moves discovered → fetched →
- * transcribed → … one step at a time, and each step commits before the next is
+ * matched → … one step at a time, and each step commits before the next is
  * attempted. A crash costs one stage, not a whole pipeline run, and a stage
  * that fails repeatedly is visible in ci_calls.attempts rather than hidden
  * inside a long transaction.
+ *
+ * ── THE STAGE ORDER, AND WHY MATCHING MOVED IN FRONT OF WHISPER ────────────
+ * The common path is:
+ *
+ *   discovered → fetched → matched → transcribed → analyzed → syncing → completed
+ *
+ * Matching used to run AFTER transcription and analysis, which meant every
+ * call bought a transcript before anyone asked whether its note had anywhere
+ * to go. Matching does not read the transcript — it keys on campaign +
+ * customer phone against LP — so half the Whisper spend (2,120 of 4,154 calls,
+ * ~$21 of ~$41) bought transcripts for calls that produced no writable match
+ * and therefore no note.
+ *
+ * So `fetched` now dispatches to stageEarlyMatch, which resolves the customer
+ * and consults src/ci/match-gate.js before any audio is sent anywhere.
+ *
+ * THE LATE STAGE IS STILL HERE AND STILL RUNS. stageMatch was NOT moved or
+ * deleted; `analyzed` still dispatches to it, and it NO-OPS when a ci_matches
+ * row already exists. Two reasons it has to stay:
+ *   - the review-resolve path and the requeue scripts put calls back at
+ *     assorted stages, and every one of those routes must keep working;
+ *   - a call whose LP record was created AFTER the call (a lead entered later
+ *     the same day) still needs a path to match on a requeue.
+ *
+ * `syncing` — declared in sql/061 and never used until now — is what the late
+ * match stage advances to, since `matched` is taken by the earlier rung.
  *
  * PR 2 SCOPE: the loop, the lease, backoff, event logging, and the `fetched`
  * stage (recording ingest). Transcription, analysis, matching and CRM sync are
@@ -26,7 +52,8 @@ import { dateDirFor, last4, last10 } from './time.js';
 import { transcribeCall, createOpenAITranscriber, createStorageAudioLoader } from './transcribe.js';
 import { analyzeTranscript } from './analyze.js';
 import { blockingReviewFlags, deferredReviewReason } from './analysis-schema.js';
-import { matchCall, loadCanvasserPhones } from './match.js';
+import { matchCall, loadCanvasserPhones, reviewReasonFor } from './match.js';
+import { transcribeGate, gateEventDetail, GATE_STAGE, GATE_EVENT } from './match-gate.js';
 import { loadAgentMap } from './discovery.js';
 import { resolveAgentLabel } from './teams.js';
 import { syncCall } from './sync.js';
@@ -403,7 +430,7 @@ export async function insertCurrentSummary(db, callId, row) {
 }
 
 /**
- * Stage: fetched → transcribed.
+ * Stage: matched → transcribed.
  *
  * A call can own several recording files (holds split one conversation into
  * segments); transcribeCall orders and concatenates them. The audio object is
@@ -411,8 +438,37 @@ export async function insertCurrentSummary(db, callId, row) {
  * retention window has passed, which is purgeExpiredAudio's job, not this
  * stage's. Deleting it here would destroy the only copy we control the moment
  * a transcript we might still reject is written.
+ *
+ * ── AN EXISTING TRANSCRIPT IS NEVER RE-BOUGHT ──────────────────────────────
+ * The upsert on call_id made re-running this stage harmless to the DATA and
+ * silently expensive: it re-sent the audio to Whisper and overwrote a
+ * transcript with a fresh copy of itself. Nothing about that was visible —
+ * same row, same call, a second charge. Every requeue path that lands a call
+ * back on this stage paid twice.
+ *
+ * So the row's existence short-circuits the stage. It is checked FIRST,
+ * before the recordings read, because the answer makes that read pointless.
+ * The event is logged rather than skipped quietly: an unexplained jump from
+ * `matched` to `transcribed` with no Whisper call is exactly the kind of
+ * silence this subsystem has been bitten by.
  */
 export async function stageTranscribe(call, { db = supabase, cfg = getConfig(), transcriber, loadAudio, now = new Date() } = {}) {
+  const { data: existing, error: exErr } = await db
+    .from('ci_transcripts')
+    .select('call_id, audio_seconds')
+    .eq('call_id', call.id)
+    .maybeSingle();
+  if (exErr) throw new Error(`ci_transcripts probe failed: ${exErr.message}`);
+  if (existing) {
+    await advance(db, call, 'transcribe', 'transcribed', {
+      reused: true,
+      note: 'transcript already exists — not re-transcribed',
+      audio_seconds: existing.audio_seconds ?? null,
+      phone: last4(call.customer_phone || call.ani),
+    });
+    return { outcome: 'advanced', to: 'transcribed', reused: true };
+  }
+
   const { data: recordings, error } = await db
     .from('ci_recordings')
     .select('*')
@@ -560,18 +616,81 @@ export async function stageAnalyze(call, { db = supabase, cfg = getConfig(), cal
 }
 
 /**
- * Stage: analyzed → matched.
+ * The newest — and, by the schema, the ONLY — ci_matches row for a call.
  *
- * Records the decision in ci_matches EVEN WHEN it resolves to nothing. An
- * unmatched call with no ci_matches row is indistinguishable from a call the
- * matcher never reached; a row with tier 'none' says "we looked, and this is
- * what we found", which is what reconciliation and the review queue need.
+ * `ci_matches.call_id` is `uuid NOT NULL UNIQUE` (sql/061), so there is at
+ * most one row and no ordering to do. Deliberately NOT an `.order()` query:
+ * writing one would imply a history this table cannot hold, and it is exactly
+ * that mistaken belief that produced the 2026-08-26 incident, when a bulk
+ * requeue set ci_calls.status directly on calls that already had a match row
+ * and sent 88 of them to 'failed' on ci_matches_call_id_key.
+ *
+ * @returns {Promise<object|null>}
+ */
+export async function existingMatch(db, callId) {
+  const { data, error } = await db
+    .from('ci_matches')
+    .select('*')
+    .eq('call_id', callId)
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new Error(`ci_matches read failed: ${error.message}`);
+  return data ?? null;
+}
+
+/**
+ * Rebuild the matcher's `lp` verdict from a stored ci_matches row.
+ *
+ * Needed because the review decision now happens at a DIFFERENT stage from the
+ * resolution: the early stage records the match, and the late stage — which
+ * no-ops rather than re-resolving — still owes the review queue its verdict.
+ * Reading it back off the row keeps one source of truth (the row that was
+ * actually written) instead of recomputing a second opinion that could differ.
+ *
+ * `canvassers` comes out of evidence.canvasser_ani.matched, which stageMatch
+ * has written since the guard shipped. A row without it yields [], i.e. "no
+ * canvasser hit" — the same safe direction an unseeded roster degrades to.
+ */
+export function lpDecisionFromMatchRow(row) {
+  return {
+    tier: row?.tier ?? 'none',
+    method: row?.method ?? 'none',
+    prospectId: row?.lp_cst_id ?? null,
+    candidates: Array.isArray(row?.candidates) ? row.candidates : [],
+    reason: row?.evidence?.reason ?? null,
+    canvassers: Array.isArray(row?.evidence?.canvasser_ani?.matched)
+      ? row.evidence.canvasser_ani.matched
+      : [],
+  };
+}
+
+/**
+ * Resolve one call to its customer and RECORD the decision in ci_matches.
+ *
+ * ══ THE ONE IMPLEMENTATION, CALLED FROM TWO STAGES ══
+ * Extracted out of stageMatch so the early gate and the late stage run the
+ * same resolution rather than two that agree today. It writes at most one row,
+ * and returns `{ existing: true }` untouched when one is already there —
+ * ci_matches.call_id is UNIQUE, so a second insert is not a duplicate, it is a
+ * stage failure.
+ *
+ * THE ANALYSIS IS READ WHEN IT EXISTS AND NOT REQUIRED WHEN IT DOES NOT. At
+ * the early stage there is no summary yet and matchCall gets `null`, which
+ * disables only decideLpTier()'s name+address fallback — the phone, list-id
+ * and canvass-correlation tiers are all transcript-independent. On a requeue
+ * the summary may already be there, and then it is used. One code path, and
+ * the better answer whenever the data for it exists.
+ *
+ * Records the decision EVEN WHEN it resolves to nothing. An unmatched call
+ * with no ci_matches row is indistinguishable from a call the matcher never
+ * reached; a row with tier 'none' says "we looked, and this is what we found",
+ * which is what reconciliation and the review queue need.
  *
  * `decided_by` is 'auto' here — the value the COLUMN ALREADY DEFAULTS TO, and
  * one of exactly two the CHECK constraint admits (sql/061: `CHECK (decided_by
  * IN ('auto','human'))`). The review endpoint writes 'human' rows for the same
- * call, and the newest row wins — that is how a human correction survives a
- * re-run of this stage.
+ * call; because call_id is UNIQUE that write REPLACES this one rather than
+ * appending beside it, which is how a human correction survives a re-run.
  *
  * This said 'system' until 2026-08-24, and so did the insert. Every
  * system-decided match therefore failed the constraint, so no call could reach
@@ -579,8 +698,13 @@ export async function stageAnalyze(call, { db = supabase, cfg = getConfig(), cal
  * had ever been composed. It was latent from the day matching shipped: it
  * could only surface once a call actually reached this stage, which first
  * happened on call 300000010270798 (attempts 3, stuck at 'analyzed').
+ *
+ * @returns {Promise<{result: object|null, row: object, existing: boolean}>}
  */
-export async function stageMatch(call, { db = supabase, cfg = getConfig(), now = new Date(), canvasserPhones } = {}) {
+export async function resolveAndRecordMatch(call, { db = supabase, cfg = getConfig(), canvasserPhones } = {}) {
+  const already = await existingMatch(db, call.id);
+  if (already) return { result: null, row: already, existing: true };
+
   const { data: summary, error: sumErr } = await db
     .from('ci_summaries')
     .select('*')
@@ -606,7 +730,7 @@ export async function stageMatch(call, { db = supabase, cfg = getConfig(), now =
     db, analysis: summary?.output ?? null, campaignRow, cfg, canvasserPhones: roster,
   });
 
-  const { error: insErr } = await db.from('ci_matches').insert({
+  const row = {
     call_id: call.id,
     lp_cst_id: result.lp.prospectId ?? null,
     // The inquiry the note is ABOUT. It stopped being the note's attachment
@@ -648,36 +772,167 @@ export async function stageMatch(call, { db = supabase, cfg = getConfig(), now =
     // 'auto', never 'system' — see the block comment on this function. The
     // CHECK admits exactly 'auto' and 'human'; anything else fails the insert.
     decided_by: DECIDED_BY_AUTO,
-  });
+  };
+
+  const { error: insErr } = await db.from('ci_matches').insert(row);
   if (insErr) throw new Error(`ci_matches insert failed: ${insErr.message}`);
 
-  if (result.review) {
-    await sendToReview(db, call, 'match', result.review, {
-      lp_tier: result.lp.tier,
-      candidates: (result.lp.candidates || []).length,
-      phone: last4(call.customer_phone || call.ani),
-    });
-    return { outcome: 'review', reason: result.review, tier: result.lp.tier };
-  }
-
-  await advance(db, call, 'match', 'matched', {
-    lp_tier: result.lp.tier,
-    ghl_tier: result.ghl.tier,
-    rectype: result.target.rectype,
-    phone: last4(call.customer_phone || call.ani),
-  });
-  return { outcome: 'advanced', to: 'matched', tier: result.lp.tier };
+  return { result, row, existing: false };
 }
 
 /** Confidence stamped on a ci_matches row, by tier. Ordinal, not probability. */
 const TIER_CONFIDENCE = { exact: 1.0, high: 0.9, probable: 0.6, ambiguous: 0.3, none: 0 };
 
 /**
- * Stage: matched → completed.
+ * Stage: fetched → matched. THE EARLY MATCH GATE.
  *
- * Reads the NEWEST ci_matches row for the call, which is how a human
- * correction outranks the matcher: the review endpoint appends a
- * decided_by='human' row, and this picks that one up on the retry.
+ * Resolves the customer and decides, BEFORE any audio is sent to Whisper,
+ * whether this call is worth transcribing. See src/ci/match-gate.js for the
+ * rules and the measurement that motivated them.
+ *
+ * ── WHAT THIS STAGE DELIBERATELY DOES NOT DO ───────────────────────────────
+ * It does NOT route to review on an ambiguous or canvasser match, even though
+ * it now holds the verdict that would justify it. Those calls advance and the
+ * LATE stage parks them, exactly as before this change — which keeps the review
+ * queue's arrival order and its contents identical to today's for every call
+ * that still transcribes. The only calls this stage parks are the ones it
+ * personally stopped, because for those there is no later stage to do it.
+ *
+ * ── THE FETCH IS NEVER SKIPPED ─────────────────────────────────────────────
+ * Gating happens after `fetched`, not instead of it. The recording and its
+ * shareable link have value on their own, the audio is already sitting on nas1,
+ * and fetching it is free. Transcribing it is not. That is the whole boundary.
+ */
+export async function stageEarlyMatch(call, { db = supabase, cfg = getConfig(), now = new Date(), canvasserPhones } = {}) {
+  const { row, existing } = await resolveAndRecordMatch(call, { db, cfg, canvasserPhones });
+
+  // A transcript already bought is the one input the gate cannot get from the
+  // match row, and the one that makes the whole question moot.
+  const { data: transcript, error: tErr } = await db
+    .from('ci_transcripts')
+    .select('call_id')
+    .eq('call_id', call.id)
+    .limit(1)
+    .maybeSingle();
+  if (tErr) throw new Error(`ci_transcripts probe failed: ${tErr.message}`);
+
+  const lp = lpDecisionFromMatchRow(row);
+  const gate = transcribeGate({
+    tier: lp.tier,
+    canvassers: lp.canvassers,
+    hasTranscript: Boolean(transcript),
+    cfg,
+  });
+
+  // EVERY decision is recorded, in both directions. A gate that is too
+  // aggressive looks exactly like a pipeline that is working fine but quiet,
+  // and quiet is how the 2026-08-22 filename break stayed invisible for three
+  // days. This row is also the only source for the /ci/health savings figure,
+  // which is the entire justification for the change and must be checkable
+  // after deploy rather than asserted in a PR description.
+  await logEvent(db, {
+    callId: call.id,
+    stage: GATE_STAGE,
+    event: GATE_EVENT,
+    detail: gateEventDetail(call, gate, {
+      method: lp.method,
+      match_reused: existing,
+      phone: last4(call.customer_phone || call.ani),
+    }),
+  });
+
+  if (gate.transcribe) {
+    await advance(db, call, GATE_STAGE, 'matched', {
+      lp_tier: lp.tier,
+      gate: gate.reason,
+      match_reused: existing,
+      phone: last4(call.customer_phone || call.ani),
+    });
+    return { outcome: 'advanced', to: 'matched', tier: lp.tier, gate: gate.reason };
+  }
+
+  // Stopped here. The call will never reach the late match stage, so this
+  // stage owes the review queue the verdict that stage would have filed —
+  // same reason strings, so scripts/requeue-ci-review.js keeps selecting them.
+  const review = reviewReasonFor(lp, call);
+  if (review) {
+    await sendToReview(db, call, GATE_STAGE, review, {
+      lp_tier: lp.tier,
+      gate: gate.reason,
+      note: 'no writable target — not transcribed',
+      phone: last4(call.customer_phone || call.ani),
+    });
+    return { outcome: 'review', reason: review, tier: lp.tier, gate: gate.reason };
+  }
+
+  // Nothing matched and nothing to review — an ineligible call that got this
+  // far. 'skipped' is terminal and honest: the pipeline looked and stopped.
+  await advance(db, call, GATE_STAGE, 'skipped', {
+    lp_tier: lp.tier,
+    gate: gate.reason,
+    phone: last4(call.customer_phone || call.ani),
+  });
+  return { outcome: 'advanced', to: 'skipped', tier: lp.tier, gate: gate.reason };
+}
+
+/**
+ * Stage: analyzed → syncing. The LATE match stage.
+ *
+ * ══ STILL HERE ON PURPOSE, AND USUALLY A NO-OP ══
+ * stageEarlyMatch has normally already resolved and recorded the match, so
+ * this stage finds the row and simply advances. It is NOT deleted, because:
+ *
+ *   - the review-resolve path and the requeue scripts put calls back at
+ *     assorted stages, and a call re-entering at `analyzed` must still find a
+ *     matcher here;
+ *   - a call whose LP record was created AFTER the call — a lead entered later
+ *     the same day — has no match at fetch time and gets one here on a requeue.
+ *
+ * ══ IT MUST NOT INSERT TWICE ══
+ * ci_matches.call_id is UNIQUE. A second insert does not append a row, it
+ * throws, and recordFailure() then walks the call to 'failed'. That is exactly
+ * what happened on 2026-08-26 when a bulk requeue set ci_calls.status directly
+ * on calls that already carried a match row: 88 of them failed on
+ * ci_matches_call_id_key. resolveAndRecordMatch() returns the existing row
+ * rather than writing, so the no-op is structural, not a convention.
+ *
+ * The review verdict is still filed HERE for every call that transcribed, off
+ * the stored row — see lpDecisionFromMatchRow. So `match_ambiguous`,
+ * `canvasser_ani` and `match_none` reach the queue after analysis, with the
+ * same reasons and the same contents as before matching moved.
+ */
+export async function stageMatch(call, { db = supabase, cfg = getConfig(), now = new Date(), canvasserPhones } = {}) {
+  const { row, existing } = await resolveAndRecordMatch(call, { db, cfg, canvasserPhones });
+  const lp = lpDecisionFromMatchRow(row);
+
+  const review = reviewReasonFor(lp, call);
+  if (review) {
+    await sendToReview(db, call, 'match', review, {
+      lp_tier: lp.tier,
+      candidates: (lp.candidates || []).length,
+      match_reused: existing,
+      phone: last4(call.customer_phone || call.ani),
+    });
+    return { outcome: 'review', reason: review, tier: lp.tier };
+  }
+
+  await advance(db, call, 'match', 'syncing', {
+    lp_tier: lp.tier,
+    ghl_tier: row?.evidence?.ghl?.tier ?? null,
+    rectype: row?.evidence?.note_target?.rectype ?? null,
+    match_reused: existing,
+    phone: last4(call.customer_phone || call.ani),
+  });
+  return { outcome: 'advanced', to: 'syncing', tier: lp.tier };
+}
+
+/**
+ * Stage: syncing → completed.
+ *
+ * Reads the call's ci_matches row, which is how a human correction outranks
+ * the matcher: the review endpoint REPLACES the matcher's row (call_id is
+ * UNIQUE), so the decided_by='human' decision is simply what is there on the
+ * retry.
  *
  * Completion is not conditional on a CRM accepting the note. A call whose
  * writes were skipped (shadow, or a tier below the threshold) is still
@@ -696,7 +951,7 @@ export async function stageSync(call, { db = supabase, cfg = getConfig(), lpClie
     .maybeSingle();
   if (mErr) throw new Error(`ci_matches read failed: ${mErr.message}`);
   if (!match) {
-    await sendToReview(db, call, 'sync', 'no_match_row', { note: 'call is matched but has no ci_matches row' });
+    await sendToReview(db, call, 'sync', 'no_match_row', { note: 'call reached sync but has no ci_matches row' });
     return { outcome: 'review', reason: 'no_match_row' };
   }
 
@@ -838,7 +1093,12 @@ export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapt
     if (call.status === 'discovered') {
       return await stageFetchRecording(call, { db, cfg, adapter, listings, now });
     }
+    // THE GATE. `fetched` resolves the customer BEFORE Whisper is asked for
+    // anything — see stageEarlyMatch and src/ci/match-gate.js.
     if (call.status === 'fetched') {
+      return await stageEarlyMatch(call, { db, cfg, now, canvasserPhones });
+    }
+    if (call.status === 'matched') {
       return await stageTranscribe(call, { db, cfg, transcriber, loadAudio, now });
     }
     if (call.status === 'transcribed') {
@@ -847,7 +1107,7 @@ export async function advanceOne(call, { db = supabase, cfg = getConfig(), adapt
     if (call.status === 'analyzed') {
       return await stageMatch(call, { db, cfg, now, canvasserPhones });
     }
-    if (call.status === 'matched') {
+    if (call.status === 'syncing') {
       return await stageSync(call, { db, cfg, lpClient, ghlClient, now, agentMap });
     }
     const pending = NOT_YET_IMPLEMENTED[call.status];

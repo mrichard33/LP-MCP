@@ -178,7 +178,11 @@ test('a call still mid-pipeline is left exactly where it is', () => {
 test('the reset clears the lease and the retry timer, or the call never runs', () => {
   // A call left holding next_retry_at or a lease sits there after the repair,
   // which looks exactly like the repair not working.
-  assert.equal(PARENT_RESET_PATCH.status, 'matched');
+  // 'syncing', not 'matched': stageSync claims 'syncing'. Since the early
+  // match gate moved matching ahead of transcription, 'matched' is the
+  // TRANSCRIBE rung — resetting there would put a call whose note merely
+  // needs re-sending back through analysis.
+  assert.equal(PARENT_RESET_PATCH.status, 'syncing');
   assert.equal(PARENT_RESET_PATCH.attempts, 0);
   assert.equal(PARENT_RESET_PATCH.next_retry_at, null);
   assert.equal(PARENT_RESET_PATCH.locked_until, null);

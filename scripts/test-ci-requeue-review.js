@@ -90,9 +90,14 @@ test('--all and --reason together are refused rather than silently ranked', () =
 // ─── the resume stage comes from the artifacts ──────────────────────────────
 
 /** Double whose artifact tables can be turned on and off per call. */
-function artifactDb({ summary = false, transcript = false, recording = false } = {}) {
+function artifactDb({ summary = false, transcript = false, recording = false, match = false } = {}) {
   const log = [];
-  const present = { ci_summaries: summary, ci_transcripts: transcript, ci_recordings: recording };
+  const present = {
+    ci_summaries: summary,
+    ci_transcripts: transcript,
+    ci_recordings: recording,
+    ci_matches: match,
+  };
   return {
     log,
     from(table) {
@@ -100,7 +105,12 @@ function artifactDb({ summary = false, transcript = false, recording = false } =
         select() { return chain; },
         eq() { return chain; },
         limit: async () => ({ data: present[table] ? [{ call_id: 'c1' }] : [], error: null }),
-        insert: async (row) => { log.push({ table, op: 'insert', row }); return { error: null }; },
+        // A write MAKES the artifact present. Without this the double would
+        // answer a probe with the state from before its own insert, and an
+        // ordering bug in applyResolve (deriving the resume stage before
+        // recording the match) would pass unnoticed.
+        insert: async (row) => { log.push({ table, op: 'insert', row }); present[table] = true; return { error: null }; },
+        upsert: async (row, opts) => { log.push({ table, op: 'upsert', row, opts }); present[table] = true; return { error: null }; },
         update(patch) {
           const thenable = {
             eq() { return thenable; },
@@ -118,8 +128,12 @@ test('THE RESUME STAGE IS DERIVED FROM ARTIFACTS, at every level', () => {
   // Never from review_reason — that would break the moment a reason string is
   // renamed, and would re-buy a transcript that already exists.
   const cases = [
-    [{ summary: true, transcript: true, recording: true }, 'analyzed'],
-    [{ transcript: true, recording: true }, 'transcribed'],
+    [{ summary: true, transcript: true, match: true, recording: true }, 'analyzed'],
+    [{ transcript: true, match: true, recording: true }, 'transcribed'],
+    // A match row and no transcript belongs at 'matched' (→ transcribe), NOT
+    // back at 'fetched'. Matching runs at the fetch stage now, so sending it
+    // to 'fetched' would re-enter a stage that has nothing left to do.
+    [{ match: true, recording: true }, 'matched'],
     [{ recording: true }, 'fetched'],
     [{}, 'discovered'],
   ];
@@ -214,10 +228,35 @@ test('the other three actions are untouched by the extraction', async () => {
 });
 
 test('a set_match still records a human decision', async () => {
-  const db = artifactDb();
+  const db = artifactDb({ recording: true });
   const { status } = await applyResolve(db, { id: 'c1' }, 'set_match', { cstId: 453297 });
-  assert.equal(status, 'matched');
   const m = db.log.find((l) => l.table === 'ci_matches');
   assert.equal(m.row.decided_by, 'human');
   assert.equal(m.row.lp_cst_id, 453297);
+  // A human correction on a call that never got past the fetch stage still
+  // owes that call a transcript and an analysis before it can sync.
+  assert.equal(status, 'matched');
+});
+
+test('SET_MATCH UPSERTS — ci_matches.call_id is UNIQUE, so an insert would throw', async () => {
+  // Since matching moved to the fetch stage, essentially every reviewed call
+  // already carries the matcher's 'auto' row. A plain insert against a UNIQUE
+  // call_id is not an append, it is the 2026-08-26 failure that sent 88 calls
+  // to 'failed' on ci_matches_call_id_key.
+  const db = artifactDb({ match: true, recording: true });
+  await applyResolve(db, { id: 'c1' }, 'set_match', { cstId: 453297 });
+
+  const writes = db.log.filter((l) => l.table === 'ci_matches');
+  assert.equal(writes.length, 1, 'exactly one write to ci_matches');
+  assert.equal(writes[0].op, 'upsert', 'insert would violate the unique constraint');
+  assert.equal(writes[0].opts?.onConflict, 'call_id', 'the conflict target must be the unique column');
+});
+
+test('a set_match on a fully-processed call rejoins just before sync', async () => {
+  // Not at 'matched'. That status now means "ready to transcribe", and a call
+  // that already has a transcript and a current summary would be re-analyzed —
+  // paying model tokens to reproduce a summary it is already holding.
+  const db = artifactDb({ summary: true, transcript: true, match: true, recording: true });
+  const { status } = await applyResolve(db, { id: 'c1' }, 'set_match', { cstId: 453297 });
+  assert.equal(status, 'analyzed', 'one no-op match stage, then sync');
 });

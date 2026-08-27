@@ -61,13 +61,23 @@ export function assertSpan(from, to) {
  * Where a reviewed call should resume, based on what it actually produced.
  *
  * Walks backwards from the last artifact: a current summary means analysis
- * succeeded, so re-run matching; a transcript means re-run analysis; a
- * recording means re-run transcription; nothing means start at the fetch.
+ * succeeded, so re-run matching; a transcript means re-run analysis; a match
+ * row means re-run transcription; a recording means re-run the match gate;
+ * nothing means start at the fetch.
  *
  * Deriving from artifacts rather than from review_reason means a renamed
  * reason string cannot silently send a call back to the wrong stage — and a
  * call that was reviewed for a reason unrelated to its stage (a DNC flag, say)
  * still resumes where it left off instead of re-transcribing from scratch.
+ *
+ * ── THE ci_matches RUNG IS LOAD-BEARING ────────────────────────────────────
+ * Matching now runs at `fetched`, so a call that has a match row and no
+ * transcript belongs at `matched` (→ transcribe), NOT back at `fetched`.
+ * Sending it to `fetched` would re-enter stageEarlyMatch, which would find the
+ * existing row and no-op — harmless but pointless — and, before
+ * resolveAndRecordMatch() short-circuited on the existing row, would have been
+ * a second insert against a UNIQUE call_id. That is the 2026-08-26 failure
+ * mode, and this rung is what keeps requeues away from it entirely.
  */
 export async function resumeStatusFor(db, callId) {
   const has = async (table, extra = (q) => q) => {
@@ -77,6 +87,7 @@ export async function resumeStatusFor(db, callId) {
   };
   if (await has('ci_summaries', (q) => q.eq('is_current', true))) return 'analyzed';
   if (await has('ci_transcripts')) return 'transcribed';
+  if (await has('ci_matches')) return 'matched';
   if (await has('ci_recordings')) return 'fetched';
   return 'discovered';
 }
@@ -209,7 +220,13 @@ export async function applyResolve(db, call, action, { note = null, cstId = null
       // authoritative decision.
       throw new BadRequest('set_match needs at least one of lp_cst_id, lp_lds_id, ghl_contact_id');
     }
-    const { error: mErr } = await db.from('ci_matches').insert({
+    // UPSERT, not insert. ci_matches.call_id is UNIQUE (sql/061), so a plain
+    // insert throws the moment the call already carries a matcher's row — and
+    // since matching moved to the `fetched` stage, essentially every reviewed
+    // call carries one. A human correction must overwrite the machine's
+    // verdict, which is what the constraint has always made it do; the insert
+    // just failed loudly instead of saying so.
+    const { error: mErr } = await db.from('ci_matches').upsert({
       call_id: callId,
       lp_cst_id: cstId ?? null,
       lp_lds_id: ldsId ?? null,
@@ -220,9 +237,15 @@ export async function applyResolve(db, call, action, { note = null, cstId = null
       candidates: [],
       evidence: { note: note ?? null, resolved_via: 'POST /ci/review/:call_id/resolve' },
       decided_by: 'human',
-    });
-    if (mErr) throw new Error(`ci_matches insert failed: ${mErr.message}`);
-    nextStatus = 'matched';
+    }, { onConflict: 'call_id' });
+    if (mErr) throw new Error(`ci_matches upsert failed: ${mErr.message}`);
+    // Resume from the artifacts, exactly like `retry`, rather than jumping to
+    // a fixed stage. A corrected call that already has a transcript and a
+    // summary rejoins just before sync; one corrected at the fetch stage still
+    // gets transcribed and analyzed on the way. Hardcoding 'matched' did the
+    // right thing only while 'matched' meant "ready to sync" — it now means
+    // "ready to transcribe", and a call with a summary would be re-analyzed.
+    nextStatus = await resumeStatusFor(db, callId);
   } else if (action === 'skip') {
     nextStatus = 'skipped';
   } else if (action === 'retry') {
@@ -707,11 +730,12 @@ export function registerCiRoutes(app, authenticate) {
    *   retry      put it back at its current stage and let the worker re-run
    *   fail       give up on it, with the reason on the record
    *
-   * set_match writes a ci_matches row with decided_by='human'. That row does
-   * not overwrite the matcher's ('auto') — both are kept, and the human one is
-   * newer, so the audit trail shows what the matcher thought AND what a person
-   * decided. 'auto' and 'human' are the only two values the column's CHECK
-   * admits (sql/061).
+   * set_match writes a ci_matches row with decided_by='human', REPLACING the
+   * matcher's 'auto' row for that call. It reads as an append-only audit trail
+   * and is not one: call_id is UNIQUE (sql/061), so the table holds exactly one
+   * verdict per call and the human's is it. The matcher's reasoning survives in
+   * the ci_events transition it logged, not here. 'auto' and 'human' are the
+   * only two values the column's CHECK admits.
    */
   app.post('/ci/review/:call_id/resolve', ...guards, async (req, res) => {
     try {
