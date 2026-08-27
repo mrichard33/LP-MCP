@@ -163,6 +163,11 @@ export function inferClassification(ruleKey = '', message = '') {
  * @param {string} [args.lossReason]  — v1.1: humanized loss reason; renders 🚫 line when present
  * @param {string} [args.appointmentDisplay] — v1.1: pre-formatted "MM/DD/YYYY at h:mm AM" string; renders 📅 line when present
  * @param {string} [args.calcSummary] — v1.1: e.g. "7 windows · est. $18,585"; renders 📐 line when present
+ * @param {string} [args.address]     — v1.2: single line "street, city ST zip"; renders 📍 when present
+ * @param {string} [args.email]       — v1.2: renders ✉️ when present
+ * @param {string} [args.jobSize]     — v1.2: e.g. "8 windows · 2 doors"; renders 📐 Job size when present
+ * @param {string} [args.canvasser]   — v1.2: resolved canvasser NAME; renders 🚪 when present
+ * @param {string} [args.lpRef]       — v1.2: e.g. "inbound #418575" or "Lead 570351 | Prospect 454810"; renders 📋 LP when present
  * @param {'Cold'|'Warm'|'Hot'|'Imminent'} [args.tier]
  * @param {string} [args.status]      — short status descriptor
  * @param {string} args.narrative     — 1-2 sentence doctrinal explanation
@@ -185,6 +190,11 @@ export function buildClassifiedNotification(args = {}) {
     lossReason,
     appointmentDisplay,
     calcSummary,
+    address,
+    email,
+    jobSize,
+    canvasser,
+    lpRef,
     tier,
     status,
     narrative,
@@ -224,6 +234,19 @@ export function buildClassifiedNotification(args = {}) {
   // when unresolvable — absence is signal, same doctrine as Prospect.
   lines.push(`🌍 Market: ${market || 'Unknown'}`);
   lines.push(`📋 Src: ${formatLpSource(lpSource, lpSourceDetail) || 'Unknown'}`);
+
+  // v1.2 (2026-08-27) — the facts that make a card worth acting on rather than
+  // just reading. Each renders ONLY when the caller passes it, so every
+  // existing caller produces byte-identical output. Deliberately NOT
+  // always-on with an "Unknown" fallback like Market and Src above: an empty
+  // 📍 line is noise on the many cards that have no address to show, whereas
+  // an unresolved Market is itself the signal.
+  if (address)   lines.push(`📍 ${address}`);
+  if (email)     lines.push(`✉️ ${email}`);
+  if (jobSize)   lines.push(`📐 Job size: ${jobSize}`);
+  if (canvasser) lines.push(`🚪 Canvasser: ${canvasser}`);
+  if (lpRef)     lines.push(`📋 LP: ${lpRef}`);
+
   lines.push('');
 
   lines.push(`📊 Tier: ${cleanTier}`);

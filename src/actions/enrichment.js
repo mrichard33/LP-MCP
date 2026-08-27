@@ -109,7 +109,7 @@ async function getMarketMap() {
  *   3. city as a last-resort label
  * Returns null when nothing resolves (renderers show "Unknown").
  */
-async function resolveMarket({ ghlContact = null, lpLead = null } = {}) {
+export async function resolveMarket({ ghlContact = null, lpLead = null, zip: zipArg = null } = {}) {
   const markets = await getMarketMap();
 
   // 1. LP branch/market code on the GHL contact
@@ -121,8 +121,15 @@ async function resolveMarket({ ghlContact = null, lpLead = null } = {}) {
     return String(code).toUpperCase();
   }
 
-  // 2. zip → service_area_zips
-  const zip = (ghlContact?.postalCode || lpLead?.zip || '').toString().trim().slice(0, 5);
+  // 2. zip → service_area_zips.
+  //
+  // An explicit zip wins over both record lookups: callers that have the zip in
+  // hand and no fetched contact (the canvassing intake, whose payload carries
+  // the address the homeowner just gave at the door) would otherwise resolve
+  // nothing and card a hardcoded market. Order is deliberate — a caller passing
+  // a zip is asserting it, and the two record fields stay as the fallbacks they
+  // have always been for every existing caller.
+  const zip = (zipArg || ghlContact?.postalCode || lpLead?.zip || '').toString().trim().slice(0, 5);
   if (/^\d{5}$/.test(zip)) {
     try {
       const { data } = await supabase.from('service_area_zips')

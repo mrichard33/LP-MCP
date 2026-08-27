@@ -52,6 +52,8 @@ import {
 import { flattenWebhookBody, webhookShapeFingerprint } from './webhook-body.js';
 import { buildLeadNoteLines } from './services/lead-note-lines.js';
 import { resolveCanvasserProId } from './services/canvasser-roster.js';
+import { resolveMarket } from './actions/enrichment.js';
+import { formatAddressLine } from './services/appointment-card.js';
 
 // GHL custom field: "LP Inbound Lead ID". Reminder: in1_id is the LP
 // inbound-QUEUE id, not lds_id — SetAppointment can never target it.
@@ -102,6 +104,38 @@ export async function findRecentCanvassMark(ghlContactId, { client = supabase, w
   } catch (err) {
     console.warn(`[Canvassing] mark lookup failed (fail-open): ${err.message}`);
     return null;
+  }
+}
+
+/**
+ * Atomically claim this contact for processing. INSERT, not upsert: the unique
+ * PK on dedup_key is what serializes two concurrent POSTs, and an upsert cannot
+ * lose that race because it never fails. A 23505 means another worker owns this
+ * contact and this one must stop BEFORE addLead.
+ *
+ * Verified 2026-08-27: contact hclMXNalJA8H2bGVW0kS produced LP inbound leads
+ * 418571 AND 418575, both at 23:33Z, while canvassing_intake_marks held exactly
+ * ONE row. Both POSTs passed the route's findRecentCanvassMark pre-check, both
+ * called addLead, and the upsert below silently overwrote instead of colliding.
+ * The pre-check is the cheap path for a re-fire minutes later; this claim is
+ * what closes the millisecond race.
+ *
+ * Fail-open on any other DB error (missing table, outage) — same doctrine as the
+ * rest of the marks layer: double-processing during an infra failure beats
+ * dropping a lead.
+ */
+export async function claimCanvassMark(row, { client = supabase } = {}) {
+  if (!client) return { claimed: true, degraded: true };
+  try {
+    const { error } = await client.from(MARKS_TABLE)
+      .insert({ created_at: new Date().toISOString(), ...row });
+    if (!error) return { claimed: true };
+    if (error.code === '23505') return { claimed: false, conflict: true };
+    console.warn(`[Canvassing] claim failed (fail-open): ${error.message}`);
+    return { claimed: true, degraded: true };
+  } catch (err) {
+    console.warn(`[Canvassing] claim threw (fail-open): ${err.message}`);
+    return { claimed: true, degraded: true };
   }
 }
 
@@ -330,16 +364,64 @@ export function buildLpLeadFields(p, appt, { proId: verifiedProId } = {}) {
 // Notifications (canvass channel, flushNow — operator cards)
 // ═══════════════════════════════════════════════════════════════════
 
-function canvassCard({ notification_class, action_verb, payload, narrative, appointmentDisplay, actWithin }) {
+/**
+ * "8 windows · 2 doors · 1 slider" from the counts the homeowner gave at the
+ * door. Zero and blank counts are omitted rather than printed — "0 doors" is
+ * not a fact anyone needs on a card. Returns undefined when all three are
+ * absent, so the line does not render at all.
+ *
+ * These counts have been on the form and in the normalized payload since v2 but
+ * reached no card until now: the single most useful fact for the setter working
+ * the lead and the rep dispatched to the home.
+ */
+export function buildJobSize({ window_count, door_count, slider_count } = {}) {
+  const parts = [];
+  for (const [raw, singular] of [[window_count, 'window'], [door_count, 'door'], [slider_count, 'slider']]) {
+    const n = parseInt(String(raw ?? '').trim(), 10);
+    if (!Number.isFinite(n) || n <= 0) continue;
+    parts.push(`${n} ${singular}${n === 1 ? '' : 's'}`);
+  }
+  return parts.length ? parts.join(' · ') : undefined;
+}
+
+/**
+ * The canvass-channel card.
+ *
+ * `market` and `canvasserName` are resolved ONCE per processCanvassingLead run
+ * and threaded through every card in that run — the market from the homeowner's
+ * zip rather than the hardcoded literal 'Canvassing' this used to print, and the
+ * canvasser from the LP roster.
+ *
+ * lpSourceDetail is the RESOLVED canvasser NAME and never p.promoter: GHL sends
+ * the numeric Pro ID in that field, so the Src line rendered blank on every card
+ * (the same defect that left `promoter` null on 187 of 187 canvassing events to
+ * 2026-08-25). When the roster returns no name the field is omitted entirely —
+ * an id on the card is worse than no line, because it reads as an identity.
+ */
+function canvassCard({
+  notification_class, action_verb, payload, narrative, appointmentDisplay, actWithin,
+  market, canvasserName, lpRef,
+}) {
+  const p = payload;
+  // Sender follows srs_id, exactly as buildLpLeadFields does — a booth lead
+  // posts to LP as Events, and the card must not claim it was a door knock.
+  const isEvent = Boolean(p.srs_id) && p.srs_id !== CANVASSING_SRS_ID;
   return buildClassifiedNotification({
     notification_class,
     action_verb,
-    name: [payload.first_name, payload.last_name].filter(Boolean).join(' ') || 'Unknown',
-    phone: payload.phone_raw,
-    contactId: payload.ghl_contact_id,
-    market: 'Canvassing',
-    lpSource: 'Canvassing',
-    lpSourceDetail: payload.promoter || undefined,
+    name: [p.first_name, p.last_name].filter(Boolean).join(' ') || 'Unknown',
+    phone: p.phone_raw,
+    contactId: p.ghl_contact_id,
+    market: market || 'Canvassing',
+    lpSource: isEvent ? 'Events' : 'Canvassing',
+    lpSourceDetail: canvasserName || undefined,
+    // Shared with the LP appointment card so the two render an address the same
+    // way — and so a street with no city/state/zip does not trail a comma.
+    address: formatAddressLine({ address1: p.address1, city: p.city, state: p.state, zip: p.zip }),
+    email: p.email || undefined,
+    jobSize: buildJobSize(p),
+    canvasser: canvasserName || undefined,
+    lpRef,
     appointmentDisplay,
     tier: 'Hot',
     status: 'Canvass Intake',
@@ -380,24 +462,49 @@ export async function processCanvassingLead(payload, deps = {}) {
   const link = ghlContactLink(p.ghl_contact_id);
 
   try {
-    // 1. Write the processing mark immediately — closes the window where a
-    // GHL re-fire seconds later would double-post (the route's pre-check
-    // only catches marks that already exist).
-    await writeCanvassMark(
+    // 1. Claim the contact atomically — closes the window where a GHL re-fire
+    // seconds later, or a genuinely concurrent POST, would double-post (the
+    // route's pre-check only catches marks that already exist).
+    //
+    // The loser returns HERE, before any addLead call, and sends NO GroupMe
+    // card: a suppressed duplicate is not news. Every later status update below
+    // still uses writeCanvassMark (upsert) so it overwrites the row this claim
+    // created.
+    const claim = await claimCanvassMark(
       { dedup_key: p.ghl_contact_id, ghl_contact_id: p.ghl_contact_id, phone: p.phone_raw, status: 'processing' },
       clientOpt
     );
+    if (!claim.claimed) {
+      console.log(`[Canvassing] concurrent duplicate for ${p.ghl_contact_id} — suppressed before LP`);
+      return { outcome: 'duplicate_suppressed' };
+    }
+
+    // 1b. Resolve the market ONCE for every card this run will send. The zip is
+    // the homeowner's, straight off the form — this handler has no fetched GHL
+    // contact to read a market code from, which is why the cards hardcoded the
+    // literal 'Canvassing' as a "market" until now. Fail-soft: a lookup that
+    // errors leaves the old literal in place rather than losing the card.
+    let market = null;
+    try {
+      market = await resolveMarket({ zip: p.zip });
+    } catch (err) {
+      console.warn(`[Canvassing] market resolution failed for ${p.ghl_contact_id} (cards fall back): ${err.message}`);
+    }
 
     // 2. Required-field gate (skip cleanly; operator fixes in GHL).
     const missing = LP_REQUIRED_FIELDS.filter((k) => !p[k]);
     if (!(normalizePhone(p.phone_raw) || '').slice(-10) && !missing.includes('phone_raw')) missing.push('phone_raw');
     if (missing.length) {
       console.warn(`[Canvassing] skip ${p.ghl_contact_id}: missing required field(s) ${missing.join(', ')}`);
+      // This card fires BEFORE the roster resolution below, so it carries no
+      // canvasser name. The omit-blanks rule in canvassCard handles that: the
+      // line is absent rather than empty.
       await d.sendGroupMeMessage(
         canvassCard({
           notification_class: 'priority',
           action_verb: 'CANVASSING LEAD BLOCKED',
           payload: p,
+          market,
           narrative: `Lead cannot post to LP — missing ${missing.join(', ')}. Fix the contact in GHL and resubmit. ${link}`,
           actWithin: '1 hour',
         }),
@@ -428,6 +535,7 @@ export async function processCanvassingLead(payload, deps = {}) {
           notification_class: 'system',
           action_verb: 'CANVASS APPT TIME REJECTED',
           payload: p,
+          market,
           narrative: `${detail} Lead posts to LP without an appointment — set the time manually in LP. ${link}`,
         }),
         { channel: 'canvass', flushNow: true }
@@ -438,6 +546,7 @@ export async function processCanvassingLead(payload, deps = {}) {
           notification_class: 'system',
           action_verb: 'CANVASS APPT BEYOND 48H',
           payload: p,
+          market,
           appointmentDisplay: apptDisplay,
           narrative: `Appointment is ${Math.round(appt.hoursOut)}h out — beyond the ${APPT_WINDOW_HOURS}h canvassing window (Friday→Monday excepted). Posted as Set anyway; verify the supervisor exception. ${link}`,
         }),
@@ -476,6 +585,7 @@ export async function processCanvassingLead(payload, deps = {}) {
           notification_class: 'priority',
           action_verb: 'CANVASSER NOT RECOGNISED',
           payload: p,
+          market,
           narrative: `The Pro ID from GHL is not on the LP roster (${canvasser.reason}) — ${outcome}.`
             + ` Crediting the wrong canvasser is worse than crediting none. The lead itself is`
             + ` unaffected. Re-seed the roster if this canvasser is new; otherwise check what`
@@ -484,6 +594,10 @@ export async function processCanvassingLead(payload, deps = {}) {
         { channel: 'canvass', flushNow: true },
       );
     }
+
+    // The roster NAME, for every card from here on. p.promoter is the numeric
+    // Pro ID GHL sends, which is why the Src line has been rendering blank.
+    const canvasserName = canvasser.name || null;
 
     const fields = buildLpLeadFields(p, appt, { proId: canvasser.proId });
     let lpResponse;
@@ -497,6 +611,8 @@ export async function processCanvassingLead(payload, deps = {}) {
           notification_class: 'priority',
           action_verb: 'LP SUBMIT FAILED',
           payload: p,
+          market,
+          canvasserName,
           appointmentDisplay: apptDisplay,
           narrative: `Canvassing lead did NOT reach LP after retries. Enter manually or re-fire the intake. ${link}`,
           actWithin: '30 minutes',
@@ -515,6 +631,8 @@ export async function processCanvassingLead(payload, deps = {}) {
           notification_class: 'system',
           action_verb: 'LP INBOUND ID UNPARSEABLE',
           payload: p,
+          market,
+          canvasserName,
           narrative: `LP accepted the canvassing lead but the inbound ID could not be read from the response — LP Inbound Lead ID not written back to GHL. ${link}`,
         }),
         { channel: 'canvass', flushNow: true }
@@ -546,6 +664,9 @@ export async function processCanvassingLead(payload, deps = {}) {
             notification_class: 'system',
             action_verb: 'SALESRABBIT SYNC FAILED',
             payload: p,
+            market,
+            canvasserName,
+            lpRef: in1Id ? `inbound #${in1Id}` : undefined,
             narrative: `SalesRabbit lead ${p.salesrabbit_id} was not updated (${sr.reason || 'unknown'}). LP intake completed normally. ${link}`,
           }),
           { channel: 'canvass', flushNow: true }
@@ -602,6 +723,9 @@ export async function processCanvassingLead(payload, deps = {}) {
         notification_class: 'system',
         action_verb: 'CANVASSING LEAD CREATED',
         payload: p,
+        market,
+        canvasserName,
+        lpRef: in1Id ? `inbound #${in1Id}` : undefined,
         appointmentDisplay: apptDisplay,
         narrative: `Canvassing lead posted to LP${in1Id ? ` (inbound #${in1Id})` : ''}${apptDisplay ? ' as Set' : ' without an appointment'}. SMS confirmation flow takes it from here.`,
       }),

@@ -105,6 +105,7 @@ import { syncCancelledAppointmentState, reconcileGhlOnlyApptTag } from './appoin
 import { findExistingAppointment, emitSlotCheckEvent, isSlotCheckEnabled } from '../../appointments/slot-check.js';
 import { applyAppointmentFormatForContact } from '../../appointments/format-contact.js';
 import { claimAppointmentCreate, releaseAppointmentCreate } from '../../services/appointment-sync-claim.js';
+import { buildApptEventIdempotencyKey } from '../../services/appt-event-dedup.js';
 
 // Tags cleared once a booking lands (or the flow otherwise terminates) so the
 // post-qualification affirmative-gate bypass (intent-classifier.js) doesn't
@@ -1014,7 +1015,21 @@ export async function executeBookAppointment(action, context) {
       // book_appointment (reaper requeue, duplicate companion), and the
       // idempotent-skip branch above returns before reaching here, but a
       // genuine double-create would otherwise queue LP sync twice.
-      idempotency_key: appointmentId ? `ghl_appt_booked:${appointmentId}` : null,
+      //
+      // 2026-08-27: built by the SHARED builder so this producer and the
+      // ghl_webhook one write the same key for one appointment. The key was
+      // previously `ghl_appt_booked:${appointmentId}` — same appointment,
+      // different key from the webhook side, so both inserted and LP was
+      // written twice (system_events 3173274/3173275, agent_actions
+      // 367235/367236). The status segment must come from the event PAYLOAD's
+      // booked/cancelled fact, NOT from `status` (GHL's appointmentStatus,
+      // which we emit as ghl_status and which read "new" on that pair).
+      idempotency_key: buildApptEventIdempotencyKey({
+        appointmentId,
+        status: 'booked',
+        startDate: etParts?.startDate || null,
+        startTime: etParts?.startTime12h || null,
+      }),
     });
     console.log(`[ActionExecutor] 📤 ghl.appointment_booked emitted for ${contactId} (appt ${appointmentId}, ${cleanCalendarName} ${etParts?.startDate} ${etParts?.startTime12h}, ghl_status=${status}) → rule 112 GHL_APPT_LP_SYNC`);
   } catch (err) {

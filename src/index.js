@@ -618,6 +618,28 @@ async function runMigrations() {
     console.error('[Migration] canvass confirmation marks FAILED (canvass-confirmation idempotency reads it — apply sql/migrations/2026-08-26_canvass_confirmation_marks.sql manually):', err.message);
   }
 
+  // GroupMe notification content dedup
+  // (sql/migrations/2026-08-27_groupme_notification_marks.sql is the source of
+  // truth; this mirror guarantees the table exists before the first outbound
+  // card). Same self-heal reasoning as the two marks blocks above, and the same
+  // failure mode: every access in src/groupme.js is fail-open, so a missing
+  // table silently degrades to no dedup at all rather than erroring — which is
+  // exactly the defect this table exists to close.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE TABLE IF NOT EXISTS groupme_notification_marks (
+              dedup_hash    text PRIMARY KEY,
+              channel       text,
+              sample        text,
+              first_sent_at timestamptz NOT NULL DEFAULT now(),
+              hit_count     integer NOT NULL DEFAULT 1);
+            CREATE INDEX IF NOT EXISTS idx_gnm_first_sent_at
+              ON groupme_notification_marks (first_sent_at DESC);`);
+    console.log('[Migration] groupme notification marks (2026-08-27) ready');
+  } catch (err) {
+    console.error('[Migration] groupme notification marks FAILED (GroupMe content dedup reads it — apply sql/migrations/2026-08-27_groupme_notification_marks.sql manually; sends continue undeduped):', err.message);
+  }
+
   // Rep + setter reporting RPCs (sql/functions.sql and sql/053 are the source
   // of truth; this mirror lets a fresh deploy self-heal them). Unlike every
   // other block here this one defines FUNCTIONS, not DDL — the reporting layer
