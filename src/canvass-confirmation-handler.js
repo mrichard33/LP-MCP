@@ -2,37 +2,44 @@
  * Canvass Confirmation Handler — src/canvass-confirmation-handler.js
  *
  * POST /webhooks/canvass-confirmation — called by the GHL workflow
- * "U.LCF Lightfire Confirmation Form" (20eeb054-f9a5-44fc-b74f-7c41141e5c9c)
- * on the branch where the canvassed homeowner is ALREADY IN LEAD PERFECTION
- * and Lightfire supplied the Prospect ID.
+ * "U.LCF Lightfire Confirmation Form" (20eeb054-f9a5-44fc-b74f-7c41141e5c9c),
+ * which Lightfire's call center submits for every canvass appointment called
+ * in by a canvasser.
  *
- * ── WHY THIS IS A SECOND ENDPOINT ──────────────────────────────────────────
- * The confirmation form has two branches. The new-lead branch already has a
- * destination: /webhooks/canvassing-lead, which calls LP addLead. The
- * existing-prospect branch had none, and routing it through the canvassing
- * route would have called addLead on a prospect LP already holds — a duplicate
- * lead, created by the very step meant to confirm the appointment.
+ * ── WHAT A SUBMISSION IS, AND IS NOT ───────────────────────────────────────
+ * It is an unverified INTAKE RECORD, not a lead. A Reece confirmation agent
+ * reviews each submission in pipeline P4, verifies it, and only then decides
+ * whether it becomes a confirmed appointment. Lead Perfection creation happens
+ * at that later step, in a separate workflow triggered on the pipeline stage
+ * change — not here, and not on either branch of this form.
  *
- * So this endpoint RECORDS and never writes to LP. It emits
- * canvass.confirmation_submitted for the Decision Engine, writes one note on
- * the GHL contact for the confirmation team, and cards the canvass channel.
- * That is the whole surface.
+ * So this endpoint does exactly three things: record the submission, write a
+ * note on the GHL contact, and emit an event the Decision Engine can react to.
+ *
+ * ONE ENDPOINT SERVES BOTH BRANCHES. Whether the homeowner is already in LP
+ * (Lightfire supplies a Prospect ID) or is new (address and product counts
+ * arrive instead) changes only which fields are populated — never where the
+ * submission goes. Blanks are expected and are never an error; which fields
+ * arrive is itself the signal for which path a submission came from.
  *
  * ── WHAT THIS FILE MUST NEVER GROW ─────────────────────────────────────────
  * No addLead. No buildLpLeadFields. No import of lp-client's write surface, in
- * any form. The duplicate-lead defect this endpoint exists to avoid is one
- * import away at all times, and scripts/test-canvass-confirmation-handler.js
- * asserts against the source text of this file precisely because a runtime
- * spy cannot catch a call that a future edit adds on a path no test walks.
- * If a future change genuinely needs an LP write here, that is a separate
- * decision with a separate PR — not a line added to this module.
+ * any form, on any path. Writing to LP at submission time would create a lead
+ * out of a record no human has verified yet — which is the entire reason this
+ * is its own endpoint rather than a second caller of /webhooks/canvassing-lead.
+ *
+ * scripts/test-canvass-confirmation-handler.js asserts against the SOURCE TEXT
+ * of this file, not only its runtime behaviour: a runtime spy can only catch a
+ * call on a path a test happens to walk, and the defect arrives as an innocent
+ * import in a future edit. If an LP write is genuinely needed here one day,
+ * that is a separate decision with a separate PR — not a line added to this
+ * module.
  *
  * Also deliberately absent, and each for its own reason:
- *   - active-entry:* tag hygiene. These prospects may be mid-sequence; the GHL
- *     workflow owns tags on this path and deliberately does nothing.
- *   - P4 opportunity creation. The GHL workflow owns it on both branches, same
- *     division of labour as the canvassing intake (opportunity creation is the
- *     agentic Stage-6 path's job, never an intake webhook's).
+ *   - active-entry:* tag hygiene. Existing prospects may be mid-sequence; the
+ *     GHL workflow owns tags on this path.
+ *   - P4 opportunity creation. The workflow owns it on both branches, same
+ *     division of labour as the canvassing intake.
  *
  * Contract:
  *   - Respond fast (202) after validation + idempotency pre-check; all real
@@ -81,24 +88,25 @@ function ghlContactLink(contactId) {
 /**
  * Return the existing mark row when this contact was processed within the
  * dedup window; null otherwise. Fail-open: any DB error → null (better to
- * double-process than to silently drop a confirmation).
+ * double-process than to silently drop a submission).
  *
- * A mark whose status is 'failed' does NOT block. The pipeline only lands
- * there when it threw before recording anything, so the contact has no event
- * and no note — treating that row as a duplicate would turn one bad minute
- * into a 24-hour hole with nothing to re-fire into. The row is still written
- * (and kept) so the failure is queryable.
+ * A mark whose status is 'blocked' does NOT block. That status means the
+ * submission was accepted but skipped for a fixable reason (see the
+ * missing-prospect-id gate below), and the operator's instruction is to fix
+ * the contact in GHL and re-fire. If the mark it left behind counted as a
+ * duplicate, that re-fire would be swallowed for 24 hours and the fix would
+ * appear to do nothing. The row is still written so the block stays queryable.
  */
 export async function findRecentConfirmationMark(ghlContactId, { client = supabase, windowMin = DEDUP_WINDOW_MIN } = {}) {
   if (!client) return null;
   try {
     const { data, error } = await client
       .from(MARKS_TABLE)
-      .select('dedup_key, ghl_contact_id, lp_prospect_id, status, created_at')
+      .select('dedup_key, ghl_contact_id, lp_prospect_id, lead_in_lp, status, created_at')
       .eq('dedup_key', String(ghlContactId))
       .maybeSingle();
     if (error || !data) return null;
-    if (data.status === 'failed') return null;
+    if (data.status === 'blocked') return null;
     const ageMs = Date.now() - new Date(data.created_at).getTime();
     if (Number.isNaN(ageMs) || ageMs > windowMin * 60000) return null;
     return data;
@@ -126,8 +134,18 @@ export async function writeConfirmationMark(row, { client = supabase } = {}) {
   }
 }
 
+/** Best-effort delete so a manual re-fire works after a hard pipeline failure. */
+export async function deleteConfirmationMark(ghlContactId, { client = supabase } = {}) {
+  if (!client) return;
+  try {
+    await client.from(MARKS_TABLE).delete().eq('dedup_key', String(ghlContactId));
+  } catch (err) {
+    console.warn(`[CanvassConfirm] mark delete failed: ${err.message}`);
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════
-// Validation (pure)
+// Validation + normalisation (pure)
 // ═══════════════════════════════════════════════════════════════════
 
 const trim = (v) => (v === null || v === undefined ? '' : String(v).trim());
@@ -138,9 +156,36 @@ export function isNo(value) {
 }
 
 /**
+ * Normalise the form's "is this lead already in Lead Perfection?" answer.
+ *
+ * The form sends the literal option TEXT — currently "Yes — I have a Prospect
+ * ID" and "No — new lead". Matching the full string would break the first time
+ * someone rewords a dropdown label in the GHL editor, silently and with no
+ * error anywhere, so only the leading yes/no is read.
+ *
+ * Anything else is ambiguous rather than wrong: a reworded option that no
+ * longer starts with yes/no, an unresolved merge tag, an empty value. Rather
+ * than guess or 400, fall back to the fact that IS unambiguous — whether a
+ * Prospect ID actually arrived — and mark the answer `inferred` so the guess
+ * travels with the event and raises a card. A wrong inference then shows up as
+ * a mismatch someone can find, instead of a branch nobody knew was taken.
+ *
+ * @param {*} raw — the form value
+ * @param {*} lpProspectId — used only for the inferred fallback
+ * @returns {{value: boolean, source: 'stated'|'inferred'}}
+ */
+export function normalizeLeadInLp(raw, lpProspectId) {
+  const s = trim(raw).toLowerCase();
+  if (s.startsWith('yes')) return { value: true, source: 'stated' };
+  if (s.startsWith('no')) return { value: false, source: 'stated' };
+  return { value: Boolean(trim(lpProspectId)), source: 'inferred' };
+}
+
+/**
  * Structural validation only — an error here means the GHL workflow step is
  * misconfigured and should see a 4xx. Everything else about the submission is
- * optional: a confirmation with nothing but the two ids still records.
+ * optional: which fields arrive is what distinguishes the two branches, so a
+ * blank is information, not a failure.
  *
  * Flattens customData FIRST. GHL's standard Webhook action nests the step's
  * declared keys under `customData` rather than posting them flat, so reading
@@ -148,11 +193,13 @@ export function isNo(value) {
  * static literal like confirmation_version. That defect 400'd every event-form
  * submission on the canvassing route (2026-07-30); same fix, applied up front.
  *
- * lp_prospect_id is structural HERE and nowhere else in the intake family: it
- * is the entire reason this branch has its own endpoint. A confirmation that
- * arrives without one is a new-lead submission that reached the wrong route,
- * and the 400 sends it back to be fixed rather than recording a prospect
- * reference that does not exist.
+ * DELIBERATELY NOT structural: lead_in_lp and lp_prospect_id.
+ *   - lead_in_lp is a required KEY on the workflow step, but an unrecognised
+ *     or missing VALUE is handled by normalizeLeadInLp rather than rejected —
+ *     a reworded dropdown label must not start 400ing live submissions.
+ *   - lp_prospect_id is conditional (existing-prospect branch only), so it is
+ *     gated in the pipeline, where the answer can be a fixable card instead of
+ *     a rejection GHL will never show anyone.
  */
 export function validateConfirmationPayload(rawBody) {
   const errors = [];
@@ -167,8 +214,6 @@ export function validateConfirmationPayload(rawBody) {
   }
   const ghlContactId = trim(body.ghl_contact_id);
   if (!ghlContactId) errors.push('ghl_contact_id is required');
-  const lpProspectId = trim(body.lp_prospect_id);
-  if (!lpProspectId) errors.push('lp_prospect_id is required');
   if (errors.length) return { ok: false, errors, normalized: null };
 
   return {
@@ -176,20 +221,34 @@ export function validateConfirmationPayload(rawBody) {
     errors: [],
     normalized: {
       ghl_contact_id: ghlContactId,
-      lp_prospect_id: lpProspectId,
       confirmation_version: version,
+      // Raw as sent; normalizeLeadInLp turns it into a boolean + provenance.
+      lead_in_lp_raw: trim(body.lead_in_lp),
+      lp_prospect_id: trim(body.lp_prospect_id),
       lightfire_agent: trim(body.lightfire_agent),
       first_name: trim(body.first_name),
       last_name: trim(body.last_name),
       phone_raw: trim(body.phone_raw),
+      email: trim(body.email),
+      // New-lead branch only — blank on an existing prospect, which already
+      // has all of this in LP.
+      address1: trim(body.address1),
+      city: trim(body.city),
+      state: trim(body.state),
+      zip: trim(body.zip),
+      window_count: trim(body.window_count),
+      door_count: trim(body.door_count),
+      slider_count: trim(body.slider_count),
+      spouse_name: trim(body.spouse_name),
       appt_date: trim(body.appt_date),
       appt_slot: trim(body.appt_slot),
+      // Existing-prospect branch only: did what the homeowner said match what
+      // LP already holds?
       phone_match: trim(body.phone_match),
       address_match: trim(body.address_match),
       phone_correction: trim(body.phone_correction),
       address_correction: trim(body.address_correction),
-      submission_reason: trim(body.submission_reason),
-      canvassing_notes: trim(body.canvassing_notes),
+      notes: trim(body.notes),
       promoter: trim(body.promoter),
       pro_id: trim(body.pro_id),
     },
@@ -201,38 +260,57 @@ export function validateConfirmationPayload(rawBody) {
 // ═══════════════════════════════════════════════════════════════════
 
 /**
- * The note the confirmation team reads on the contact. Built through
- * services/lead-note-lines.js so the counts-lead-the-block and omit-blanks
- * rules stay shared with the canvassing and affiliate intakes rather than
- * being re-implemented (and re-broken) here — blank values are omitted, never
- * printed as an empty label, which reads to a human as "not captured" instead
- * of "asked, answered nothing".
+ * The note the confirmation team reads on the contact.
+ *
+ * Built through services/lead-note-lines.js so the counts-lead-the-block and
+ * omit-blanks rules stay shared with the canvassing and affiliate intakes
+ * rather than being re-implemented (and re-broken) here. Job size is the most
+ * useful fact for whoever works the appointment, so it leads; blanks are
+ * omitted rather than printed as empty labels, which reads to a human as "not
+ * captured" instead of "asked, answered nothing".
+ *
+ * That omit-blanks behaviour is also why ONE call covers both branches with no
+ * path branching: the existing-prospect payload simply has no counts and no
+ * address, so those lines do not render.
  *
  * @param {object} p — normalized payload
  * @param {object} appt — convertCanvassAppointment result (may be null)
- * @param {object} [canvasser] — roster verdict, when resolved
+ * @param {object} [opts]
+ * @param {{value: boolean, source: string}} [opts.leadInLp]
+ * @param {object} [opts.canvasser] — roster verdict, when resolved
  */
-export function buildConfirmationNote(p, appt, canvasser = null) {
+export function buildConfirmationNote(p, appt, { leadInLp, canvasser } = {}) {
   const apptLine = appt && appt.adate && appt.atime
     ? `Appointment: ${appt.adate} at ${appt.atime}`
     : ((p.appt_date || p.appt_slot)
       ? `Appointment as submitted: ${[p.appt_date, p.appt_slot].filter(Boolean).join(' ')} (not recognised — verify manually)`
       : '');
 
+  const cityStateZip = [p.city, [p.state, p.zip].filter(Boolean).join(' ').trim()]
+    .filter(Boolean).join(', ');
+  const address = [p.address1, cityStateZip].filter(Boolean).join(', ');
+
   const canvasserName = (canvasser && canvasser.name) || p.promoter;
   const canvasserId = (canvasser && canvasser.proId) || p.pro_id;
 
+  const lpLine = leadInLp
+    ? `In Lead Perfection: ${leadInLp.value ? 'Yes' : 'No'}`
+      + (leadInLp.source === 'inferred' ? ' (inferred — the form answer was not recognised)' : '')
+    : '';
+
   const body = buildLeadNoteLines(p, [
-    `LP Prospect ID: ${p.lp_prospect_id}`,
+    lpLine,
+    p.lp_prospect_id && `LP Prospect ID: ${p.lp_prospect_id}`,
     p.lightfire_agent && `Lightfire agent: ${p.lightfire_agent}`,
     apptLine,
+    address && `Address: ${address}`,
+    p.spouse_name && `Spouse/co-owner: ${p.spouse_name}`,
     isNo(p.phone_match) && 'Phone on file did NOT match at confirmation.',
     p.phone_correction && `Corrected phone: ${p.phone_correction}`,
     isNo(p.address_match) && 'Address on file did NOT match at confirmation.',
     p.address_correction && `Corrected address: ${p.address_correction}`,
-    p.submission_reason && `Submission reason: ${p.submission_reason}`,
     canvasserName && `Canvasser: ${canvasserName}${canvasserId ? ` (Pro ID ${canvasserId})` : ''}`,
-    p.canvassing_notes && `Canvasser notes: ${p.canvassing_notes}`,
+    p.notes && `Notes: ${p.notes}`,
   ]);
 
   return ['Canvass confirmation submitted (Lightfire call center)', body]
@@ -251,8 +329,8 @@ function confirmationCard({ notification_class, action_verb, payload, narrative,
     name: [payload.first_name, payload.last_name].filter(Boolean).join(' ') || 'Unknown',
     phone: payload.phone_raw,
     contactId: payload.ghl_contact_id,
-    // Unlike the canvassing intake, this path ALWAYS has a prospect — that is
-    // its defining condition — so the card can name it instead of "NONE".
+    // Renders "NONE" when absent, which is correct and meaningful here: on the
+    // new-lead branch there genuinely is no prospect yet.
     prospectId: payload.lp_prospect_id,
     market: 'Canvassing',
     lpSource: 'Canvassing',
@@ -282,12 +360,13 @@ const DEFAULT_DEPS = {
  * Full async pipeline. Called fire-and-forget after the 202. Never throws.
  *
  * Nothing in here can fail in a way that loses the submission: the note is
- * non-fatal, the card is non-fatal, and the event is the durable record. The
- * one thing that must always happen is the emit.
+ * non-fatal and the card is non-fatal. The event is the durable record, and it
+ * is the one thing that must always happen.
  *
  * @param {object} payload — normalized payload from validateConfirmationPayload
  * @param {object} [deps] — injectable collaborators (tests)
- * @returns {Promise<{outcome: string, appt_status?: string, note?: string, pro_id_verdict?: string}>}
+ * @returns {Promise<{outcome: string, lead_in_lp?: boolean, appt_status?: string,
+ *   note?: string, pro_id_verdict?: string}>}
  */
 export async function processCanvassConfirmation(payload, deps = {}) {
   const d = { ...DEFAULT_DEPS, ...deps };
@@ -296,35 +375,61 @@ export async function processCanvassConfirmation(payload, deps = {}) {
   const link = ghlContactLink(p.ghl_contact_id);
 
   try {
-    // 1. Write the processing mark immediately — closes the window where a
-    // GHL re-fire seconds later would double-record (the route's pre-check
-    // only catches marks that already exist).
-    await writeConfirmationMark(
-      {
-        dedup_key: p.ghl_contact_id,
-        ghl_contact_id: p.ghl_contact_id,
-        lp_prospect_id: p.lp_prospect_id,
-        phone: p.phone_raw,
-        status: 'processing',
-      },
-      clientOpt
-    );
+    // 1. Normalise, then write the processing mark immediately — the mark
+    // closes the window where a GHL re-fire seconds later would double-record
+    // (the route's pre-check only catches marks that already exist), and
+    // normalizing first costs nothing against that window because it is pure.
+    const leadInLp = normalizeLeadInLp(p.lead_in_lp_raw, p.lp_prospect_id);
 
-    // 2. Resolve the canvasser against the roster.
+    const markBase = {
+      dedup_key: p.ghl_contact_id,
+      ghl_contact_id: p.ghl_contact_id,
+      lp_prospect_id: p.lp_prospect_id || null,
+      lead_in_lp: leadInLp.value,
+      phone: p.phone_raw,
+    };
+    await writeConfirmationMark({ ...markBase, status: 'processing' }, clientOpt);
+
+    // 2. The one gate on this endpoint: the submission says the homeowner is
+    // already in LP but carries no Prospect ID, so the fact that defines the
+    // existing-prospect branch is missing. Skip cleanly and card — the
+    // operator fixes the contact in GHL and re-fires (which the 'blocked'
+    // mark deliberately does not obstruct; see findRecentConfirmationMark).
+    // Same doctrine as the canvassing handler's required-field gate: accepted
+    // at the door, skipped with a human told exactly what to do.
+    if (leadInLp.value && !p.lp_prospect_id) {
+      console.warn(`[CanvassConfirm] skip ${p.ghl_contact_id}: lead_in_lp is true but lp_prospect_id is blank`);
+      await d.sendGroupMeMessage(
+        confirmationCard({
+          notification_class: 'priority',
+          action_verb: 'CONFIRMATION MISSING PROSPECT ID',
+          payload: p,
+          narrative: 'The confirmation form says this homeowner is already in Lead Perfection but no'
+            + ' Prospect ID came through, so there is nothing to tie the submission to. Add the'
+            + ` Prospect ID to the contact in GHL and re-fire the form. ${link}`,
+          actWithin: '1 hour',
+        }),
+        { channel: 'canvass', flushNow: true },
+      );
+      await writeConfirmationMark({ ...markBase, status: 'blocked' }, clientOpt);
+      return { outcome: 'blocked_missing_prospect_id', lead_in_lp: true };
+    }
+
+    // 3. Resolve the canvasser against the roster.
     //
     // The verdict is recorded, never enforced. On the canvassing intake an
     // unverified Pro ID is a live commission error — LP resolves it to a
-    // promoter NAME and pays whoever occupies that id. Here nothing reaches
-    // LP at all, so the same wrong number is an attribution note on an event.
-    // Blocking on it would cost a confirmation to fix a field nobody is paid
+    // promoter NAME and pays whoever occupies that id. Nothing reaches LP from
+    // here, so the same wrong number is an attribution note on an event.
+    // Blocking on it would cost a submission to fix a field nobody is paid
     // from.
     const canvasser = await d.resolveCanvasserProId(
       p.pro_id || (/^\d+$/.test(p.promoter || '') ? p.promoter : ''),
       clientOpt.client !== undefined ? { db: clientOpt.client } : {},
     );
     // 'absent' and 'inactive_canvasser' are not worth a card: the first is the
-    // ordinary case (the confirmation form does not ask for a Pro ID), the
-    // second is a real identity that simply left the doors.
+    // ordinary case (a submission with no Pro ID on it), the second is a real
+    // identity that simply left the doors.
     const proIdSuspect = canvasser.reason !== 'ok'
       && canvasser.reason !== 'inactive_canvasser'
       && canvasser.reason !== 'absent';
@@ -339,17 +444,17 @@ export async function processCanvassConfirmation(payload, deps = {}) {
           action_verb: 'CONFIRMATION CANVASSER UNRESOLVED',
           payload: p,
           narrative: `The Pro ID on this confirmation is not on the LP roster (${canvasser.reason}).`
-            + ' The confirmation itself is recorded normally and nothing is credited from this path,'
+            + ' The submission itself is recorded normally and nothing is credited from this path,'
             + ' so this is an attribution note only. Re-seed the roster if the canvasser is new.',
         }),
         { channel: 'canvass', flushNow: true },
       );
     }
 
-    // 3. Convert the appointment. Status is carried onto the event and into
+    // 4. Convert the appointment. Status is carried onto the event and into
     // the note; it is NOT a gate. This endpoint records what the call center
     // submitted — a beyond-window or unparseable time is information for the
-    // human reading the card, not grounds to drop the submission.
+    // human reviewing it in P4, not grounds to drop the submission.
     const appt = convertCanvassAppointment(
       { appt_date: p.appt_date, appt_slot: p.appt_slot },
       d.now(),
@@ -357,10 +462,10 @@ export async function processCanvassConfirmation(payload, deps = {}) {
     );
     const apptDisplay = appt.adate && appt.atime ? `${appt.adate} at ${appt.atime}` : undefined;
 
-    // 4. Note on the GHL contact (non-fatal — the event is the durable record).
+    // 5. Note on the GHL contact (non-fatal — the event is the durable record).
     let noteStatus = 'skipped';
     try {
-      const noteBody = buildConfirmationNote(p, appt, canvasser);
+      const noteBody = buildConfirmationNote(p, appt, { leadInLp, canvasser });
       const note = await d.addGHLNote(p.ghl_contact_id, noteBody);
       if (note === 'not_found') {
         noteStatus = 'contact_not_found';
@@ -378,17 +483,22 @@ export async function processCanvassConfirmation(payload, deps = {}) {
       console.warn(`[CanvassConfirm] note write failed for ${p.ghl_contact_id} (continuing): ${err.message}`);
     }
 
-    // 5. Emit the event — the durable record and the Decision Engine's input.
+    // 6. Emit the event — the durable record and the Decision Engine's input.
     await d.emitEvent({
       event_type: 'canvass.confirmation_submitted',
       source: 'canvass_confirmation_webhook',
       entity_type: 'contact',
       entity_id: p.ghl_contact_id,
       ghl_contact_id: p.ghl_contact_id,
-      lp_prospect_id: p.lp_prospect_id,
+      ...(p.lp_prospect_id ? { lp_prospect_id: p.lp_prospect_id } : {}),
       payload: {
         ghl_contact_id: p.ghl_contact_id,
-        lp_prospect_id: p.lp_prospect_id,
+        lead_in_lp: leadInLp.value,
+        // 'stated' = read off the form answer; 'inferred' = the answer was not
+        // recognised and this was deduced from whether a Prospect ID arrived.
+        // Anything reading lead_in_lp should know which it is looking at.
+        lead_in_lp_source: leadInLp.source,
+        lp_prospect_id: p.lp_prospect_id || null,
         lightfire_agent: p.lightfire_agent || null,
         // DERIVED server-side, matching the canvassing handler's 2026-07-15
         // contract revision: did a usable appointment actually come through?
@@ -397,11 +507,19 @@ export async function processCanvassConfirmation(payload, deps = {}) {
         adate: appt.adate,
         atime: appt.atime,
         appt_status: appt.status,
+        address1: p.address1 || null,
+        city: p.city || null,
+        state: p.state || null,
+        zip: p.zip || null,
+        window_count: p.window_count || null,
+        door_count: p.door_count || null,
+        slider_count: p.slider_count || null,
+        spouse_name: p.spouse_name || null,
         phone_match: p.phone_match || null,
         address_match: p.address_match || null,
         phone_correction: p.phone_correction || null,
         address_correction: p.address_correction || null,
-        submission_reason: p.submission_reason || null,
+        notes: p.notes || null,
         // The canvasser as RESOLVED against the roster, not as received — same
         // reason as canvassing.lead_created: GHL sends the numeric id, so
         // recording the raw value alone reads as zero attribution downstream.
@@ -412,39 +530,41 @@ export async function processCanvassConfirmation(payload, deps = {}) {
       idempotency_key: `canvass_confirmation_${p.ghl_contact_id}_${new Date(d.now()).toISOString().slice(0, 10)}`,
     });
 
-    // 6. Final mark.
-    await writeConfirmationMark(
-      {
-        dedup_key: p.ghl_contact_id,
-        ghl_contact_id: p.ghl_contact_id,
-        lp_prospect_id: p.lp_prospect_id,
-        phone: p.phone_raw,
-        status: 'recorded',
-      },
-      clientOpt
-    );
+    // 7. Final mark.
+    await writeConfirmationMark({ ...markBase, status: 'recorded' }, clientOpt);
 
-    // 7. Card the canvass channel. Priority ONLY on a flagged mismatch — that
-    // is the one case where a human has to go and change something, because
-    // nothing on this path can correct LP itself.
+    // 8. Card the canvass channel. Priority on the two cases a human needs to
+    // look at: a flagged mismatch (nothing on this path can correct LP itself)
+    // and an inferred branch (the form answer was not recognised, so which
+    // branch this submission is on was deduced rather than read).
     const mismatched = [
       isNo(p.phone_match) && 'phone',
       isNo(p.address_match) && 'address',
     ].filter(Boolean);
+    const inferred = leadInLp.source === 'inferred';
 
-    if (mismatched.length) {
+    if (mismatched.length || inferred) {
+      const mismatchNarrative = mismatched.length
+        ? `Confirmation agent flagged the ${mismatched.join(' and ')} on file as wrong`
+          + `${p.lp_prospect_id ? ` for LP prospect #${p.lp_prospect_id}` : ''}.`
+          + `${p.phone_correction ? ` Corrected phone: ${p.phone_correction}.` : ''}`
+          + `${p.address_correction ? ` Corrected address: ${p.address_correction}.` : ''}`
+          + ' Correct it in Lead Perfection at confirmation — this path records only'
+          + ' and cannot write to LP.'
+        : '';
+      const inferredNarrative = inferred
+        ? `The form's "already in Lead Perfection" answer was not recognised, so it was read as`
+          + ` ${leadInLp.value ? 'YES' : 'NO'} from ${leadInLp.value ? 'the Prospect ID that arrived' : 'the absence of a Prospect ID'}.`
+          + ' Check the submission is on the right branch, and check whether a dropdown option'
+          + ' was reworded.'
+        : '';
       await d.sendGroupMeMessage(
         confirmationCard({
           notification_class: 'priority',
-          action_verb: 'CANVASS CONFIRMATION MISMATCH',
+          action_verb: mismatched.length ? 'CANVASS CONFIRMATION MISMATCH' : 'CONFIRMATION PATH UNCLEAR',
           payload: p,
           appointmentDisplay: apptDisplay,
-          narrative: `Confirmation agent flagged the ${mismatched.join(' and ')} on file as wrong for LP prospect`
-            + ` #${p.lp_prospect_id}.`
-            + `${p.phone_correction ? ` Corrected phone: ${p.phone_correction}.` : ''}`
-            + `${p.address_correction ? ` Corrected address: ${p.address_correction}.` : ''}`
-            + ' Update the prospect in Lead Perfection before the appointment — this path records only'
-            + ` and cannot write to LP. ${link}`,
+          narrative: [mismatchNarrative, inferredNarrative].filter(Boolean).join(' ') + ` ${link}`,
           actWithin: '2 hours',
         }),
         { channel: 'canvass', flushNow: true },
@@ -456,40 +576,35 @@ export async function processCanvassConfirmation(payload, deps = {}) {
           action_verb: 'CANVASS CONFIRMATION RECORDED',
           payload: p,
           appointmentDisplay: apptDisplay,
-          narrative: `Confirmation submitted for existing LP prospect #${p.lp_prospect_id}`
-            + `${p.lightfire_agent ? ` by ${p.lightfire_agent}` : ''}. Recorded on the contact —`
-            + ' no lead was created in Lead Perfection, by design.',
+          narrative: `Confirmation submitted${p.lightfire_agent ? ` by ${p.lightfire_agent}` : ''} for`
+            + `${leadInLp.value ? ` existing LP prospect #${p.lp_prospect_id}` : ' a homeowner not yet in Lead Perfection'}.`
+            + ' Recorded on the contact and waiting on review in P4 — no Lead Perfection record is'
+            + ' created at submission, by design.',
         }),
         { channel: 'canvass', flushNow: true },
       );
     }
 
     console.log(
-      `[CanvassConfirm] ${p.ghl_contact_id} → recorded prospect=${p.lp_prospect_id}`
-      + ` appt=${appt.status} note=${noteStatus}`,
+      `[CanvassConfirm] ${p.ghl_contact_id} → recorded in_lp=${leadInLp.value}(${leadInLp.source})`
+      + ` prospect=${p.lp_prospect_id || '(none)'} appt=${appt.status} note=${noteStatus}`,
     );
     return {
       outcome: 'recorded',
+      lead_in_lp: leadInLp.value,
+      lead_in_lp_source: leadInLp.source,
       appt_status: appt.status,
       note: noteStatus,
       pro_id_verdict: canvasser.reason,
     };
   } catch (err) {
     // Belt-and-suspenders: nothing above should throw, but a webhook pipeline
-    // must never take the process down. The 'failed' mark is deliberately not
-    // a duplicate for the pre-check (see findRecentConfirmationMark) — landing
-    // here means nothing was recorded, so a re-fire must be able to get in.
+    // must never take the process down. Landing here means nothing was
+    // recorded, so the mark is removed rather than left as 'processing' — a
+    // mark that blocks for 24 hours with no event and no note behind it would
+    // turn one bad minute into a silently dropped submission.
     console.error(`[CanvassConfirm] pipeline error for ${p?.ghl_contact_id}: ${err.message}`);
-    await writeConfirmationMark(
-      {
-        dedup_key: p?.ghl_contact_id,
-        ghl_contact_id: p?.ghl_contact_id,
-        lp_prospect_id: p?.lp_prospect_id,
-        phone: p?.phone_raw,
-        status: 'failed',
-      },
-      clientOpt
-    ).catch(() => {});
+    if (p?.ghl_contact_id) await deleteConfirmationMark(p.ghl_contact_id, clientOpt);
     return { outcome: 'error', error: err.message };
   }
 }

@@ -591,15 +591,24 @@ async function runMigrations() {
   // access is fail-open, its absence silently disabled 24h idempotency instead
   // of erroring. Identical table, identical failure mode, so it gets the same
   // self-heal on the way in rather than after the first double-record.
+  //
+  // The ALTER is not redundant with the CREATE. PR #768 shipped this table
+  // WITHOUT lead_in_lp; wherever that version already ran, CREATE IF NOT EXISTS
+  // is a no-op and would leave the column missing — and the pre-check selects
+  // it, so the select would error and fail open, silently disabling the 24h
+  // idempotency this block exists to guarantee.
   try {
     const { runSQL } = await import('./admin/supabase-admin.js');
     await runSQL(`CREATE TABLE IF NOT EXISTS canvass_confirmation_marks (
               dedup_key       text PRIMARY KEY,
               ghl_contact_id  text,
               lp_prospect_id  text,
+              lead_in_lp      boolean,
               phone           text,
               status          text NOT NULL DEFAULT 'processing',
               created_at      timestamptz NOT NULL DEFAULT now());
+            ALTER TABLE canvass_confirmation_marks
+              ADD COLUMN IF NOT EXISTS lead_in_lp boolean;
             CREATE INDEX IF NOT EXISTS idx_canvass_confirmation_marks_created
               ON canvass_confirmation_marks (created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_canvass_confirmation_marks_prospect
@@ -1536,10 +1545,11 @@ registerGhlTagRoutes(app);
 registerCanvassingLeadRoutes(app);
 
 // ─── Canvass confirmation intake (U.LCF → record only) ───────────
-// The Lightfire confirmation form's EXISTING-PROSPECT branch. Deliberately
-// not the canvassing route: that one calls LP addLead, which on a prospect LP
-// already holds would create a duplicate lead. This endpoint emits
-// canvass.confirmation_submitted and writes a GHL note, and never touches LP.
+// The Lightfire confirmation form, BOTH branches. A submission is an
+// unverified intake record, not a lead: a confirmation agent reviews it in P4
+// and LP creation happens later, in a separate workflow. So this endpoint
+// emits canvass.confirmation_submitted and writes a GHL note, and never
+// touches LP on either path.
 //   POST /webhooks/canvass-confirmation
 registerCanvassConfirmationRoutes(app);
 
