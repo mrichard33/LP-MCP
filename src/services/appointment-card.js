@@ -28,6 +28,7 @@
 import { buildClassifiedNotification } from '../actions/notification-classifier.js';
 import { resolveMarket } from '../actions/enrichment.js';
 import { formatApptTime12h } from '../format-helpers.js';
+import { normalizeState } from '../sync-utils.js';
 
 /**
  * "N/A" is treated as absent so legacy callers passing the literal string don't
@@ -51,7 +52,12 @@ export function hasMeaningfulCalendar(name) {
 export function formatAddressLine({ address1, city, state, zip } = {}) {
   const street = String(address1 || '').trim();
   if (!street) return undefined;
-  const tail = [String(city || '').trim(), [String(state || '').trim(), String(zip || '').trim()].filter(Boolean).join(' ')]
+  // Normalized for display too, not just on the way to LP. The LP appointment
+  // card reads state straight off the GHL contact, where it is spelled out
+  // ("Delray Beach Florida 33484"), and a card that disagrees with the record
+  // it describes invites someone to "correct" the right one.
+  const st = normalizeState(state);
+  const tail = [String(city || '').trim(), [st, String(zip || '').trim()].filter(Boolean).join(' ')]
     .filter(Boolean)
     .join(' ');
   return tail ? `${street}, ${tail}` : street;

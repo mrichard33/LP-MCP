@@ -609,3 +609,54 @@ test('buildJobSize: singular/plural, zeros, blanks, all-absent', () => {
   assert.equal(buildJobSize({}), undefined);
   assert.equal(buildJobSize(), undefined);
 });
+
+// ─── State normalization (2026-08-27) ───────────────────────────
+//
+// LP's state column TRUNCATES TO TWO CHARACTERS silently. Verified against
+// lp_prospects: no stored value exceeds 2 chars, and the residue is exactly
+// what truncation produces — 39 rows read "Fl" (from GHL's spelled-out
+// "Florida"), 18 read "fl", 829 read "nu" (from the literal string "null"),
+// with Canvass among the sources on all three. So an un-normalized state is
+// not cosmetic: it lands in LP as a wrong value that still looks like a state
+// code, and nothing ever errors.
+
+test('state: GHL\'s spelled-out "Florida" reaches LP as FL, not "Fl"', () => {
+  const p = validPayload({ state: 'Florida' });
+  assert.equal(p.state, 'FL');
+  const appt = convertCanvassAppointment({ appt_date: p.appt_date, appt_slot: p.appt_slot }, NOW);
+  assert.equal(buildLpLeadFields(p, appt).state, 'FL');
+});
+
+test('state: the SAME normalized value reaches the card, so LP and GroupMe agree', async () => {
+  const { deps, calls } = mockDeps();
+  await processCanvassingLead(validPayload({ state: 'Florida' }), deps);
+  const card = calls.groupme.find((g) => g.text.includes('CANVASSING LEAD CREATED')).text;
+  assert.match(card, /📍 123 Main St, Delray Beach FL 33446/);
+  assert.doesNotMatch(card, /Florida/);
+});
+
+test('state: the "null" literal is BLANKED, not forwarded as "nu"', () => {
+  // 829 prospects carry "nu" because the string "null" was sent and truncated.
+  // Blanking trips the required-field gate instead, which cards the operator.
+  for (const junk of ['null', 'NULL', 'undefined', 'NaN', 'none', 'N/A']) {
+    assert.equal(validPayload({ state: junk }).state, '', `"${junk}" leaked through`);
+  }
+});
+
+test('state: a blanked junk state is caught by the required-field gate', async () => {
+  const { deps, calls } = mockDeps();
+  const result = await processCanvassingLead(validPayload({ state: 'null' }), deps);
+  assert.equal(result.outcome, 'skipped_missing_fields');
+  assert.equal(calls.addLead.length, 0);
+  const card = calls.groupme.find((g) => g.text.includes('CANVASSING LEAD BLOCKED')).text;
+  assert.match(card, /missing state/);
+});
+
+test('state: already-good values pass through untouched', () => {
+  assert.equal(validPayload({ state: 'FL' }).state, 'FL');
+  assert.equal(validPayload({ state: 'fl' }).state, 'FL');
+  assert.equal(validPayload({ state: 'ga' }).state, 'GA');
+  // An unrecognized value is preserved so the operator card names the real
+  // problem rather than a silently blanked field.
+  assert.equal(validPayload({ state: 'Ontario' }).state, 'Ontario');
+});

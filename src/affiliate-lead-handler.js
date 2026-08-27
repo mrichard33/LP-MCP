@@ -54,7 +54,7 @@ import { updateGHLContactFields } from './ghl.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { buildClassifiedNotification } from './actions/notification-classifier.js';
 import { emitEvent } from './event-emitter.js';
-import { normalizePhone } from './sync-utils.js';
+import { normalizePhone, normalizeState } from './sync-utils.js';
 import {
   convertCanvassAppointment,
   SEND_APPT_WHEN_BEYOND_WINDOW,
@@ -196,40 +196,12 @@ export async function deleteAffiliateMark(ghlContactId, { client = supabase } = 
 
 const trim = (v) => (v === null || v === undefined ? '' : String(v).trim());
 
-const STATE_NAMES = {
-  alabama: 'AL', alaska: 'AK', arizona: 'AZ', arkansas: 'AR', california: 'CA',
-  colorado: 'CO', connecticut: 'CT', delaware: 'DE', 'district of columbia': 'DC',
-  florida: 'FL', georgia: 'GA', hawaii: 'HI', idaho: 'ID', illinois: 'IL',
-  indiana: 'IN', iowa: 'IA', kansas: 'KS', kentucky: 'KY', louisiana: 'LA',
-  maine: 'ME', maryland: 'MD', massachusetts: 'MA', michigan: 'MI',
-  minnesota: 'MN', mississippi: 'MS', missouri: 'MO', montana: 'MT',
-  nebraska: 'NE', nevada: 'NV', 'new hampshire': 'NH', 'new jersey': 'NJ',
-  'new mexico': 'NM', 'new york': 'NY', 'north carolina': 'NC',
-  'north dakota': 'ND', ohio: 'OH', oklahoma: 'OK', oregon: 'OR',
-  pennsylvania: 'PA', 'rhode island': 'RI', 'south carolina': 'SC',
-  'south dakota': 'SD', tennessee: 'TN', texas: 'TX', utah: 'UT',
-  vermont: 'VT', virginia: 'VA', washington: 'WA', 'west virginia': 'WV',
-  wisconsin: 'WI', wyoming: 'WY',
-};
-
-/**
- * Normalize a US state to its two-letter code.
- *
- * The Lead Pilot form's State field is free text and an affiliate will
- * eventually type "Florida"; `state` sits in the required-field gate, so
- * without this it passes straight through to LP unvalidated.
- *
- * Two-letter passthrough (uppercased); full names mapped; anything else
- * returned as-is so the required-field gate still sees a value and the
- * operator card names the real problem rather than a blanked field.
- */
-export function normalizeState(raw) {
-  const s = trim(raw);
-  if (!s) return '';
-  if (/^[A-Za-z]{2}$/.test(s)) return s.toUpperCase();
-  const mapped = STATE_NAMES[s.toLowerCase().replace(/[.\s]+/g, ' ').trim()];
-  return mapped || s;
-}
+// normalizeState moved to sync-utils.js on 2026-08-27 and is re-exported here
+// so existing importers of this module keep working. It had drifted: this
+// handler normalized, the canvassing intake did not, and LP silently
+// TRUNCATES state to two characters — so canvassing's spelled-out "Florida"
+// was landing as "Fl". One definition now serves both.
+export { normalizeState };
 
 // A GHL checkbox posts STRINGS, and the string "false" is JS-truthy — so
 // consent can never be evaluated with a bare truthiness test.

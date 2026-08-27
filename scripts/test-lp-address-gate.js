@@ -242,3 +242,38 @@ test('in1_id parses from LP raw addlead responses', () => {
   assert.equal(parseInboundIdFromRaw('ERROR: something'), null);
   assert.equal(parseInboundIdFromRaw(''), null);
 });
+
+// ─── state normalization on backfill (2026-08-27) ──────────────────
+//
+// LP TRUNCATES its state column to two characters, silently. GHL stores the
+// state spelled out, so backfilling it raw wrote "Fl" — wrong, still shaped
+// like a state code, never an error. Verified in lp_prospects: 39 rows "Fl",
+// 18 "fl", 829 "nu" (the literal string "null" truncated).
+
+test('a spelled-out GHL state is backfilled as its two-letter code', async () => {
+  const { body, filled } = await enrichBodyFromGhl(zipOnly(), {
+    getGHLContact: async () => ({ address1: '5476 Enclave Crossing Way', city: 'Delray Beach', state: 'Florida', postalCode: '33484' }),
+  });
+  assert.ok(filled.includes('state'));
+  assert.equal(body.state, 'FL');
+  assert.deepEqual(missingAddressFields(body), []);
+});
+
+test('a nullish GHL state is NOT backfilled — the gate holds instead of writing "nu"', async () => {
+  const { body, filled } = await enrichBodyFromGhl(zipOnly(), {
+    getGHLContact: async () => ({ address1: '5476 Enclave Crossing Way', city: 'Delray Beach', state: 'null', postalCode: '33484' }),
+  });
+  // normalizeState blanks it, isBlank() then rejects it: state stays missing.
+  assert.ok(!filled.includes('state'));
+  assert.ok(missingAddressFields(body).includes('state'));
+  // The other fields still fill — one bad value must not block the rest.
+  assert.ok(filled.includes('address1'));
+  assert.ok(filled.includes('city'));
+});
+
+test('an already-correct state code is backfilled unchanged', async () => {
+  const { body } = await enrichBodyFromGhl(zipOnly(), {
+    getGHLContact: async () => ({ address1: '4360 Washington Place', city: 'Ave Maria', state: 'FL', postalCode: '34142' }),
+  });
+  assert.equal(body.state, 'FL');
+});

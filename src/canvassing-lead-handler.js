@@ -40,7 +40,7 @@ import { updateGHLContactFields } from './ghl.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { buildClassifiedNotification } from './actions/notification-classifier.js';
 import { emitEvent } from './event-emitter.js';
-import { normalizePhone } from './sync-utils.js';
+import { normalizePhone, normalizeState } from './sync-utils.js';
 import { updateSalesRabbitLead } from './salesrabbit.js';
 import {
   convertCanvassAppointment,
@@ -209,7 +209,13 @@ export function validateCanvassingPayload(rawBody) {
       email: trim(body.email),
       address1: trim(body.address1),
       city: trim(body.city),
-      state: trim(body.state),
+      // Normalized HERE rather than in buildLpLeadFields so the one call fixes
+      // every consumer at once — the LP payload, the GroupMe card's address
+      // line, and the required-field gate below. GHL's canvassing form posts
+      // the state spelled out ("Florida"), and LP TRUNCATES the column to two
+      // characters, so that was landing in LP as "Fl" — wrong, plausible-
+      // looking, and never an error. See normalizeState in sync-utils.js.
+      state: normalizeState(body.state),
       zip: trim(body.zip),
       window_count: trim(body.window_count),
       door_count: trim(body.door_count),
