@@ -108,7 +108,8 @@ export async function findRecentCanvassMark(ghlContactId, { client = supabase, w
 }
 
 /**
- * Atomically claim this contact for processing. INSERT, not upsert: the unique
+ * Atomically claim this contact for processing, WITHIN THE DEDUP WINDOW.
+ * INSERT, not upsert: the unique
  * PK on dedup_key is what serializes two concurrent POSTs, and an upsert cannot
  * lose that race because it never fails. A 23505 means another worker owns this
  * contact and this one must stop BEFORE addLead.
@@ -124,14 +125,53 @@ export async function findRecentCanvassMark(ghlContactId, { client = supabase, w
  * rest of the marks layer: double-processing during an infra failure beats
  * dropping a lead.
  */
-export async function claimCanvassMark(row, { client = supabase } = {}) {
+export async function claimCanvassMark(row, { client = supabase, windowMin = DEDUP_WINDOW_MIN } = {}) {
   if (!client) return { claimed: true, degraded: true };
+  const key = String(row.dedup_key);
   try {
     const { error } = await client.from(MARKS_TABLE)
       .insert({ created_at: new Date().toISOString(), ...row });
     if (!error) return { claimed: true };
-    if (error.code === '23505') return { claimed: false, conflict: true };
-    console.warn(`[Canvassing] claim failed (fail-open): ${error.message}`);
+    if (error.code !== '23505') {
+      console.warn(`[Canvassing] claim failed (fail-open): ${error.message}`);
+      return { claimed: true, degraded: true };
+    }
+
+    // A PK collision is only a RACE if the row that beat us is RECENT.
+    //
+    // dedup_key is the ghl_contact_id and marks never expire, so a mark from
+    // ANY prior canvass — days or months back — collided here too and returned
+    // {claimed:false}. That returns before addLead and sends no card, which
+    // silently and permanently blocked every previously-canvassed contact from
+    // ever reaching LP again. Verified 2026-08-28: contact WEtFEYariWqZRmBks7tc
+    // logged "concurrent duplicate ... suppressed before LP" against a mark that
+    // was 14 DAYS old, and 506 of 558 marks were past the window.
+    //
+    // The route's findRecentCanvassMark pre-check was already windowed; this
+    // claim was not, so the two disagreed and the un-windowed one won. Age the
+    // stale row out and retry once. A genuinely concurrent POST still loses,
+    // because its rival's row is seconds old, not days.
+    const { data: existing, error: readErr } = await client
+      .from(MARKS_TABLE)
+      .select('created_at')
+      .eq('dedup_key', key)
+      .maybeSingle();
+    if (readErr || !existing) return { claimed: true, degraded: true };
+
+    const ageMs = Date.now() - new Date(existing.created_at).getTime();
+    if (!Number.isNaN(ageMs) && ageMs <= windowMin * 60000) {
+      return { claimed: false, conflict: true };
+    }
+
+    await client.from(MARKS_TABLE).delete().eq('dedup_key', key);
+    const { error: retryErr } = await client.from(MARKS_TABLE)
+      .insert({ created_at: new Date().toISOString(), ...row });
+    if (!retryErr) {
+      console.log(`[Canvassing] stale mark expired for ${key} (age ${Math.round(ageMs / 60000)}m) — reclaimed`);
+      return { claimed: true, expired: true };
+    }
+    if (retryErr.code === '23505') return { claimed: false, conflict: true };
+    console.warn(`[Canvassing] claim retry failed (fail-open): ${retryErr.message}`);
     return { claimed: true, degraded: true };
   } catch (err) {
     console.warn(`[Canvassing] claim threw (fail-open): ${err.message}`);

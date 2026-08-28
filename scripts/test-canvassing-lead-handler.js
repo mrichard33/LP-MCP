@@ -510,6 +510,62 @@ test('claim: the loser returns BEFORE addLead, not after', async () => {
   assert.equal(second.calls.groupme.length, 0);
 });
 
+// ─── Stale-mark block (2026-08-28) ──────────────────────────────
+//
+// Verified defect: dedup_key is the ghl_contact_id and marks never expire, so a
+// PK collision against a mark from ANY earlier canvass returned {claimed:false}
+// — before addLead and before any card. Contact WEtFEYariWqZRmBks7tc was
+// suppressed against a 14-DAY-old mark, and 506 of 558 marks were past the
+// window. The route's findRecentCanvassMark pre-check was already windowed;
+// the claim was not, so the two disagreed and the un-windowed one won.
+//
+// claimCanvassMark ages the row off the wall clock, not the `now` dep, so these
+// marks are seeded relative to real Date.now().
+
+test('claim: a mark older than the dedup window is expired and reclaimed', async () => {
+  const rows = new Map();
+  const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+  rows.set('CONTACT123', {
+    dedup_key: 'CONTACT123',
+    ghl_contact_id: 'CONTACT123',
+    phone: '+19545551234',
+    status: 'ok',
+    created_at: fourteenDaysAgo,
+  });
+
+  const { deps, calls } = mockDeps({ client: mockMarksClient(rows) });
+  const result = await processCanvassingLead(validPayload(), deps);
+
+  // The whole point: a previously-canvassed homeowner reaches LP again.
+  assert.equal(result.outcome, 'ok');
+  assert.equal(calls.addLead.length, 1);
+  assert.ok(calls.groupme.some((g) => g.text.includes('CANVASSING LEAD CREATED')));
+
+  // The stale row was replaced, not left behind to block the next run too.
+  const mark = rows.get('CONTACT123');
+  assert.ok(mark);
+  assert.ok(new Date(mark.created_at).getTime() > new Date(fourteenDaysAgo).getTime());
+});
+
+test('claim: a mark INSIDE the dedup window still suppresses before LP', async () => {
+  const rows = new Map();
+  rows.set('CONTACT123', {
+    dedup_key: 'CONTACT123',
+    ghl_contact_id: 'CONTACT123',
+    phone: '+19545551234',
+    status: 'processing',
+    created_at: new Date(Date.now() - 30 * 1000).toISOString(),
+  });
+
+  const { deps, calls } = mockDeps({ client: mockMarksClient(rows) });
+  const result = await processCanvassingLead(validPayload(), deps);
+
+  // Concurrency protection is unchanged: a rival's mark is seconds old.
+  assert.equal(result.outcome, 'duplicate_suppressed');
+  assert.equal(calls.addLead.length, 0);
+  assert.equal(calls.groupme.length, 0);
+});
+
 test('claim: a non-23505 DB error fails OPEN — the lead still processes', async () => {
   const client = mockMarksClient(new Map(), {
     insertError: { code: '42P01', message: 'relation "canvassing_intake_marks" does not exist' },
