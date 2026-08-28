@@ -47,7 +47,7 @@
 import supabase from '../supabase.js';
 import { getGHLContact } from '../ghl.js';
 import { LP_SRS } from '../lp-source-ids.js';
-import { normalizeState } from '../sync-utils.js';
+import { normalizeState, isNullishText } from '../sync-utils.js';
 
 export const ADDRESS_FIELDS = ['address1', 'city', 'state', 'zip'];
 export const INCOMPLETE_NOTES_STAMP = 'INCOMPLETE ADDRESS ON FILE';
@@ -70,8 +70,19 @@ export function holdMaxRetries() {
   return Math.max(1, Number(process.env.LP_ADDRESS_HOLD_MAX_RETRIES) || 5);
 }
 
+// A field is blank if it is empty OR if it carries a string that only MEANS
+// empty — "null", "undefined" and friends.
+//
+// The literal-string case is why 604 LP prospects read state "nu" (2026-08-27:
+// 572 of them arrived with no GHL contact at all, so most are vendor and
+// web-form posts we do not originate — but the ones that ARE ours came through
+// here). `String(v).trim() !== ''` counted "null" as a real value, so
+// missingAddressFields never flagged it, the gate neither enriched nor held,
+// and it forwarded to LP, which truncates the column to two characters. A
+// wrong-but-plausible value beat a blank one purely because it was four
+// characters long.
 function isBlank(v) {
-  return v == null || String(v).trim() === '';
+  return v == null || String(v).trim() === '' || isNullishText(v);
 }
 
 /** Pure: which of the four address fields are missing on an addlead body (legacy field names). */
