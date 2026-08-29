@@ -56,7 +56,7 @@ let running = false;
 /**
  * Process one batch of pending inbox rows.
  *
- * @returns {Promise<{processed: number, failed: number, parked: number, errors: string[]}>}
+ * @returns {Promise<{processed: number, failed: number, parked: number, deferred: number, errors: string[]}>}
  */
 export async function processTagInbox({ limit = BATCH_SIZE } = {}) {
   const { data: rows, error } = await supabase
@@ -69,20 +69,42 @@ export async function processTagInbox({ limit = BATCH_SIZE } = {}) {
 
   if (error) {
     console.error(`[GhlTagProcessor] fetch error: ${error.message}`);
-    return { processed: 0, failed: 0, parked: 0, errors: [error.message] };
+    return { processed: 0, failed: 0, parked: 0, deferred: 0, errors: [error.message] };
   }
 
   if (!rows?.length) {
-    return { processed: 0, failed: 0, parked: 0, errors: [] };
+    return { processed: 0, failed: 0, parked: 0, deferred: 0, errors: [] };
   }
 
   let processed = 0;
   let failed = 0;
   let parked = 0;
+  let deferred = 0;
   const errors = [];
+
+  /**
+   * Contacts whose oldest pending update failed this pass.
+   *
+   * Ordering is per-contact, so a failure has to hold the line for that
+   * contact only. Without this, a row that failed would be retried on the
+   * next tick AFTER its successor had already advanced the snapshot — and
+   * the retry would then diff a stale tag set against a newer one and emit
+   * the difference as removals. That is the same backwards-diff that makes
+   * naive replay destructive; it must not be reachable from a transient
+   * Supabase error either.
+   *
+   * Deferred rows are left untouched — no attempts increment — so a slow
+   * upstream cannot burn a healthy row's retry budget.
+   */
+  const blocked = new Set();
 
   // Sequential by design — see ORDERING above.
   for (const row of rows) {
+    if (blocked.has(row.ghl_contact_id)) {
+      deferred++;
+      continue;
+    }
+
     try {
       const result = await processTagUpdate({
         contact_id:  row.ghl_contact_id,
@@ -128,8 +150,12 @@ export async function processTagInbox({ limit = BATCH_SIZE } = {}) {
           `[GhlTagProcessor] contact ${row.ghl_contact_id}: parked after ` +
           `${attempts} attempts — ${msg}`
         );
+        // Parked, so the next update for this contact may proceed. It will
+        // diff forward from a snapshot that skipped one transition, which
+        // costs an intermediate event but cannot invert the diff.
       } else {
         failed++;
+        blocked.add(row.ghl_contact_id);
         console.warn(
           `[GhlTagProcessor] contact ${row.ghl_contact_id}: attempt ${attempts}/${MAX_ATTEMPTS} ` +
           `failed, will retry — ${msg}`
@@ -139,7 +165,7 @@ export async function processTagInbox({ limit = BATCH_SIZE } = {}) {
     }
   }
 
-  return { processed, failed, parked, errors };
+  return { processed, failed, parked, deferred, errors };
 }
 
 async function tick(reason) {
@@ -151,10 +177,10 @@ async function tick(reason) {
   running = true;
   try {
     const result = await processTagInbox();
-    if (result.processed || result.failed || result.parked) {
+    if (result.processed || result.failed || result.parked || result.deferred) {
       console.log(
         `[GhlTagProcessor] ${reason}: processed=${result.processed} ` +
-        `retrying=${result.failed} parked=${result.parked}`
+        `retrying=${result.failed} parked=${result.parked} deferred=${result.deferred}`
       );
     }
   } catch (err) {

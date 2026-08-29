@@ -272,3 +272,54 @@ test('bucketOf falls back to now for an unparseable timestamp', () => {
   const b = bucketOf('not-a-date');
   assert.ok(Math.abs(b - Math.floor(Date.now() / 60000)) <= 1);
 });
+
+// ════════════════════════════════════════════════════════════════════
+// 4. Worker ordering
+// ════════════════════════════════════════════════════════════════════
+
+test('a failed row blocks later rows for the SAME contact, not for others', async () => {
+  reset();
+
+  // Three pending rows: two for c1 (ordered), one for c2.
+  selectResults['ghl_tag_inbox'] = [
+    { id: 1, ghl_contact_id: 'c1', tags: ['a'], occurred_at: '2026-08-29T14:00:00.000Z', attempts: 0 },
+    { id: 2, ghl_contact_id: 'c1', tags: ['a', 'b'], occurred_at: '2026-08-29T14:00:30.000Z', attempts: 0 },
+    { id: 3, ghl_contact_id: 'c2', tags: ['z'], occurred_at: '2026-08-29T14:00:40.000Z', attempts: 0 },
+  ];
+  // Make every snapshot read fail so row 1 errors out.
+  failTable['contact_tag_snapshot'] = 'timeout';
+
+  const { processTagInbox } = await import('../src/jobs/ghl-tag-processor.js');
+  const result = await processTagInbox();
+
+  // Row 1 failed. Row 2 is the same contact and must NOT have been attempted:
+  // processing it would advance the snapshot past row 1, and row 1's retry
+  // would then diff backwards and emit phantom removals.
+  assert.equal(result.deferred, 1, 'the later row for c1 must be deferred, not processed');
+
+  // c2 is independent, so its failure is its own — it is attempted, not deferred.
+  assert.equal(result.failed, 2, 'c1 row 1 and c2 row 3 both attempted and failed');
+
+  // A deferred row must not burn its retry budget.
+  const inboxUpdates = writesTo('ghl_tag_inbox');
+  const touchedIds = inboxUpdates.map((c) => c.body).filter(Boolean);
+  assert.ok(!JSON.stringify(touchedIds).includes('"id":2'),
+    'the deferred row must be left completely untouched');
+});
+
+test('a parked row releases the block so its successor can proceed', async () => {
+  reset();
+  selectResults['ghl_tag_inbox'] = [
+    // Already at the attempt ceiling, so this failure parks rather than blocks.
+    { id: 1, ghl_contact_id: 'c1', tags: ['a'], occurred_at: '2026-08-29T14:00:00.000Z', attempts: 4 },
+    { id: 2, ghl_contact_id: 'c1', tags: ['a', 'b'], occurred_at: '2026-08-29T14:00:30.000Z', attempts: 0 },
+  ];
+  failTable['contact_tag_snapshot'] = 'timeout';
+
+  const { processTagInbox } = await import('../src/jobs/ghl-tag-processor.js');
+  const result = await processTagInbox();
+
+  assert.equal(result.parked, 1, 'row 1 hit MAX_ATTEMPTS and should park');
+  assert.equal(result.deferred, 0,
+    'a parked row must not hold the contact hostage forever');
+});
