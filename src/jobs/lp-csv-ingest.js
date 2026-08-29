@@ -46,7 +46,7 @@ import {
 import { logIngest, quarantineRows, alertGroupMe, duplicateResponse, releaseIfEmpty, extractPdfText, extractPdfBboxXml, NoTextLayerError } from './lp-report-ingest.js';
 import {
   parseJobStatusCsv, validateJobStatusCsv,
-  JOB_STATUS_PARSER_VERSION,
+  JOB_STATUS_PARSER_VERSION, JOB_STATUS_BUCKET_MAP, judgeUnmappedStatus,
 } from './lp-report-parse-job-status.js';
 import {
   parseLeadDispositionCsv, validateLeadDispositionCsv, resolveLeadMarkets,
@@ -407,7 +407,45 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
     if (reportType === 'job_status_ytd') {
       parsed = parseJobStatusCsv(text);
       const v = validateJobStatusCsv(parsed);
-      if (!v.ok) {
+      // UNMAPPED STATUS: QUARANTINE THE ROWS, NOT THE FILE — up to a volume
+      // the numbers can absorb. This is the 137 doctrine (§F, just below)
+      // extended to status, and it supersedes the 2026-08-21 ruling that a
+      // single unannounced status must stop the pipeline. That ruling cost
+      // four days of 133 (08-18 → 08-21) over one or two rows a day.
+      //
+      // The ruling and the guard both live in judgeUnmappedStatus(), next to
+      // the map they protect; read the note there for why the guard is not
+      // optional. This block owns only the side effects.
+      const judged = judgeUnmappedStatus(parsed, v.violations, {
+        maxRows: process.env.LP_JOB_STATUS_UNMAPPED_MAX_ROWS,
+        maxPct: process.env.LP_JOB_STATUS_UNMAPPED_MAX_PCT,
+      });
+      if (!v.ok && judged.action === 'quarantine') {
+        await quarantineRows(reportType, sha,
+          judged.bad.map((row) => ({ reason: 'unmapped_status', row })));
+        parsed.rows = parsed.rows.filter((r) => r.bucket != null);
+        // The gross MUST travel with the warning. Dropping rows makes the
+        // snapshot gross diverge from LP's own header total, and without the
+        // number attached that delta reads as a data defect rather than as the
+        // known, bounded cost of this quarantine.
+        extraDetail.warnings = [...(extraDetail.warnings ?? []), {
+          rule: 'unmapped_status_quarantined',
+          detail: {
+            count: judged.bad.length,
+            statuses: judged.statuses,
+            quarantined_gross_cents: judged.grossCents,
+            pct_of_file: judged.pct,
+          },
+        }];
+        console.warn(`[LPCsv] ${reportType}: quarantined ${judged.bad.length} row(s) with unmapped status ${judged.statuses.join(', ')} (${centsToDollars(judged.grossCents)} gross); ingesting the remaining ${parsed.rows.length}.`);
+        await alertGroupMe(`⚠️ LP CSV ingest WARNING (${reportType}): ${judged.bad.length} row(s) carry unmapped status ${judged.statuses.join(', ')} — quarantined, ${centsToDollars(judged.grossCents)} gross withheld from Open Backlog. The other ${parsed.rows.length} rows ingested. Add the status to JOB_STATUS_BUCKET_MAP and re-send to recover the rows.`);
+      } else if (!v.ok && judged.action === 'reject') {
+        await quarantineRows(reportType, sha,
+          judged.bad.map((row) => ({ reason: 'unmapped_status', row })));
+        return await fail('unmapped_status',
+          { violations: v.violations, guard: { rows: judged.bad.length, pct: judged.pct, max_rows: judged.maxRows, max_pct: judged.maxPct } },
+          `${judged.bad.length} row(s) (${judged.pct}%) carry unmapped status ${judged.statuses.join(', ')} — past the quarantine guard (max ${judged.maxRows} rows / ${judged.maxPct}%), so the file is rejected rather than landing an understated snapshot.`);
+      } else if (!v.ok) {
         await quarantineRows(reportType, sha,
           parsed.rows.filter((r) => r.bucket == null).map((row) => ({ reason: 'unmapped_status', row })));
         return await fail(v.violations[0].rule, { violations: v.violations },
@@ -808,8 +846,10 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
  * The count gate is the ONLY fail-closed check: per-band `Totals:` and the
  * `Grand Totals:` line must both tie to the parsed rows. An unmapped
  * disposition or last-result value writes a reconciliation warning and the
- * snapshot still lands — the opposite of report 133, which has been failing
- * 25× a day on `unmapped_status`.
+ * snapshot still lands. Report 133 used to be the opposite — it rejected the
+ * whole file on `unmapped_status` — and has since been brought into line with
+ * this behaviour, with a volume guard so a bulk LP status rename still stops
+ * rather than quietly understating Open Backlog.
  *
  * Nothing is deduped: LP counts ROWS, prosp # repeats, and row identity is
  * (snapshot_id, row_ordinal).
@@ -1303,5 +1343,85 @@ export function registerLpCsvRoutes(app) {
     });
   }
 
-  console.log('[LPCsv] Routes registered: POST /n8n/admin/lp-csv-ingest/{job-status|lead-disposition|source-cost|sales-efficiency} | POST /n8n/admin/lp-report-ingest/{sales-efficiency|lead-disposition|source-cost} (137/135/136, live parsers)');
+  // RE-INGEST AN ARCHIVED FILE. Every CSV is archived to Storage BEFORE it is
+  // parsed, precisely so a rejection is recoverable — but until now nothing
+  // could actually reach back for one. Recovering a rejected day meant finding
+  // the original LP email and re-sending it by hand, which is why 133 still has
+  // a hole at 2026-08-18 → 08-20: the files were sitting in the bucket the
+  // whole time with no way to replay them.
+  //
+  // Safe to call twice. The ingest's own sha256 duplicate check runs first, so
+  // a second call against a file that already landed is a clean no-op rather
+  // than a second snapshot.
+  app.post('/n8n/admin/lp-csv-ingest/reingest-archived', express.json({ limit: '64kb' }), async (req, res) => {
+    try {
+      if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
+      if (!supabase) return res.status(500).json({ success: false, error: 'Supabase not configured' });
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      // Either address a file directly by its archive path, or name the
+      // report_type + sha256 and let the conventional path be rebuilt. The
+      // second is what a scorecard_ingest_log row gives you.
+      let path = typeof body.storage_path === 'string' ? body.storage_path.trim() : '';
+      if (!path) {
+        const reportType = String(body.report_type || '').trim();
+        const sha = String(body.sha256 || '').trim().toLowerCase();
+        if (!reportType || !/^[0-9a-f]{64}$/.test(sha)) {
+          return res.status(400).json({ success: false, error: 'pass storage_path, or report_type + a 64-char hex sha256' });
+        }
+        // The archive path is `<report_type>/<date received>/<sha>.csv`, and
+        // the date is not derivable from the sha — so walk the day folders
+        // rather than guess. Listing `<report_type>/` returns those folders,
+        // NOT files, which is why this cannot be a single search call.
+        // Newest first: a re-send is far likelier to be recent.
+        const { data: days, error: listErr } = await supabase.storage
+          .from(STORAGE_BUCKET).list(reportType, { limit: 1000, sortBy: { column: 'name', order: 'desc' } });
+        if (listErr) throw new Error(`archive list failed: ${listErr.message}`);
+        for (const day of (days || [])) {
+          if (!day?.name) continue;
+          const { data: hit } = await supabase.storage
+            .from(STORAGE_BUCKET).list(`${reportType}/${day.name}`, { search: `${sha}.csv`, limit: 10 });
+          if ((hit || []).some((f) => f.name === `${sha}.csv`)) {
+            path = `${reportType}/${day.name}/${sha}.csv`;
+            break;
+          }
+        }
+        if (!path) return res.status(404).json({ success: false, error: `no archived file for ${reportType} ${sha}` });
+      }
+
+      const { data: blob, error: dlErr } = await supabase.storage.from(STORAGE_BUCKET).download(path);
+      if (dlErr) throw new Error(`archive download failed: ${dlErr.message}`);
+      const text = await blob.text();
+      if (!text.length) return res.status(422).json({ success: false, error: `archived file is empty: ${path}` });
+
+      // Route on the file's own header, exactly as the live path does (§C) —
+      // an archived file gets no shortcut the live one does not have.
+      const grid = parseCsv(text);
+      const resolved = detectReportFromHeader(grid[0] ?? []);
+      const variant = resolveVariant(resolved.reportType, grid[0] ?? [], grid[1] ?? []);
+      const effectiveType = variant.reportType;
+      const source = String(req.query.source || body.source || 'backfill');
+      console.log(`[LPCsv] re-ingesting archived ${path} as ${effectiveType} (source=${source})`);
+      const result = await ingestCsv({ reportType: effectiveType, text, source });
+      res.json({ ...result, report_type: effectiveType, storage_path: path, reingested: true });
+    } catch (err) {
+      console.error('[LPCsv] reingest-archived error:', err.message);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  console.log('[LPCsv] Routes registered: POST /n8n/admin/lp-csv-ingest/{job-status|lead-disposition|source-cost|sales-efficiency} | POST /n8n/admin/lp-csv-ingest/reingest-archived | POST /n8n/admin/lp-report-ingest/{sales-efficiency|lead-disposition|source-cost} (137/135/136, live parsers)');
+
+  // The 133 status vocabulary, printed at boot. LP adds statuses without
+  // notice — 'Await Customer' cost four days in August 2026 — and until now
+  // the only way to answer "what does LP-MCP currently think the vocabulary
+  // is" was to read the source at the deployed SHA. Now it is one grep of the
+  // Railway log, which is also how you confirm a mapping fix actually shipped.
+  const byBucket = {};
+  for (const [status, bucket] of Object.entries(JOB_STATUS_BUCKET_MAP)) {
+    (byBucket[bucket] ??= []).push(status);
+  }
+  console.log(`[LPCsv] job-status mapping (${JOB_STATUS_PARSER_VERSION}), ${Object.keys(JOB_STATUS_BUCKET_MAP).length} statuses:`);
+  for (const bucket of Object.keys(byBucket).sort()) {
+    console.log(`[LPCsv]   ${bucket}: ${byBucket[bucket].sort().join(' | ')}`);
+  }
 }

@@ -132,6 +132,64 @@ export function classifyJobStatus(statusRaw) {
   return JOB_STATUS_BUCKET_MAP[String(statusRaw ?? '').trim()] ?? null;
 }
 
+/** Defaults for the unmapped-status quarantine guard; env can override both. */
+export const UNMAPPED_STATUS_MAX_ROWS = 10;
+export const UNMAPPED_STATUS_MAX_PCT = 2;
+
+/**
+ * Decide what an `unmapped_status` violation costs: quarantine the rows and
+ * keep the file, or reject the file outright.
+ *
+ * Pure and separate from the ingest so the ruling is testable without a
+ * database, and so the threshold lives next to the map it protects rather than
+ * buried in the orchestrator.
+ *
+ * THE RULING. LP adds statuses without notice; 'Await Customer' appeared on
+ * 2026-08-18 and fail-closed report 133 for four days over one or two rows a
+ * day. Rejecting 328 rows to avoid mis-filing 2 is the wrong trade, and the
+ * quarantined rows are not lost — scorecard_ingest_quarantine keeps the whole
+ * parsed object, so re-sending after the map is widened recovers them.
+ *
+ * THE GUARD, and why it is not optional. Buckets are money: an unmapped row is
+ * dropped from a snapshot that feeds Open Backlog, so quarantining always
+ * understates revenue by exactly the gross withheld. That is affordable at two
+ * rows and indefensible at two hundred. A bulk LP status rename must still
+ * stop the pipeline instead of landing a snapshot that looks fine and is not.
+ *
+ * Returns 'none' when the violation is absent, 'quarantine' when within both
+ * limits, 'reject' when past either. The caller owns the side effects.
+ */
+export function judgeUnmappedStatus(parsed, violations, opts = {}) {
+  // `?? undefined` is deliberate: an unset env var arrives as undefined and
+  // must fall back, but a deliberate 0 must be honoured as "never quarantine".
+  const num = (v, dflt) => (v === undefined || v === null || v === '' || Number.isNaN(Number(v)) ? dflt : Number(v));
+  const maxRows = num(opts.maxRows, UNMAPPED_STATUS_MAX_ROWS);
+  const maxPct = num(opts.maxPct, UNMAPPED_STATUS_MAX_PCT);
+  const list = violations ?? [];
+
+  // Narrow on purpose: only when `unmapped_status` is the ONLY thing wrong.
+  // A file that also fails money parsing or is missing job ids is a broken
+  // file, and softening one of its several violations helps nobody.
+  const only = list.length > 0 && list.every((x) => x.rule === 'unmapped_status');
+  if (!only) return { action: 'none' };
+
+  const rows = parsed?.rows ?? [];
+  const bad = rows.filter((r) => r.bucket == null);
+  if (!bad.length) return { action: 'none' };
+
+  const statuses = [...new Set(bad.map((r) => r.status_raw))];
+  const grossCents = bad.reduce((a, r) => a + (r.gross_cents ?? 0), 0);
+  // An empty file cannot be a small fraction of itself — treat it as 100% so a
+  // degenerate parse can never slip through the percentage half of the guard.
+  const pct = rows.length ? Number(((bad.length / rows.length) * 100).toFixed(2)) : 100;
+  const within = bad.length <= maxRows && pct <= maxPct;
+
+  return {
+    action: within ? 'quarantine' : 'reject',
+    bad, statuses, grossCents, pct, maxRows, maxPct,
+  };
+}
+
 /**
  * Only what the parser actually consumes and cannot proceed without.
  *
