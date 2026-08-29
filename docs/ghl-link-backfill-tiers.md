@@ -4,8 +4,9 @@ Back-filling `ghl_contact_id` on stranded `lp_leads`, `lp_jobs` and
 `lp_job_milestones`. Three tiers, ascending in risk, with a sign-off gate
 between each. This document carries the measurements each gate needs.
 
-**Status: Tier A built and ready to run. Tiers B and C NOT built — both need
-decisions from Mark that the measurements below change.**
+**Status (2026-08-29): Tier A BUILT, MERGED AND RUN — see results below.
+Tier B probed and recommended for CLOSURE, not construction: the premise it
+rests on is false. Tier C not built; blocked on Mark's GHL UI changes.**
 
 All figures measured against production LP Supabase on 2026-08-29. The live
 15-minute sync moves them by tens of rows per hour; re-measure with
@@ -21,8 +22,9 @@ All figures measured against production LP Supabase on 2026-08-29. The live
 | `claude/early-match-gate-1xaf6l` | **Merged** (PR #770, 2026-08-27) | Already in `main`. Despite the name it is Call-Intelligence matching — resolving a *call recording* to an LP record before transcription. Different problem, different tables (`ci_*`). Not identity matching for GHL links. |
 | `claude/canvassing-leads-lp-block-2fr7pg` | **Merged** (PR #775, 2026-08-28) | Already in `main`. Stale idempotency marks blocking canvassing leads into LP. Unrelated. |
 
-**Building on: `main` (d49d3ce).** Not on any of the three. No rebase or
-coordination needed.
+**Built on `main`** — d49d3ce for the Tier A PR, re-cut from 0ba6168 (which
+carries both that merge and PR #778) for this one. Not on any of the three
+flagged branches. No rebase or coordination needed.
 
 The matching logic this project needs already exists and is **not** on any of
 those branches — it is in `main`, in `src/services/link-corroboration.js`
@@ -62,13 +64,13 @@ best) leaves **~51,700**, not under 5,000. The gap is not a matching-quality
 problem; it is a scope problem. The milestone backlog is carried by **old jobs**,
 and Tier B is scoped to **new leads**. The two barely intersect.
 
-**Decision needed (gate B):** to reach the stated criterion, Tier B's lead scope
-must be widened from "created in the last 90 days" to also include **leads of
-any age that have a job** — 3,238 leads. That is a *smaller* cohort than the
-11,771 already approved, and a higher-quality one: every row is a real customer
-with work in production, so phone/email match rates should be well above the
-cold-lead average. It is a scope change, not a risk increase, on the matching
-side. The risk it *does* carry is in the next section.
+**CORRECTED 2026-08-29 — this section's original recommendation was wrong.**
+It proposed widening Tier B to the 3,238 job-bearing leads on the reasoning that
+"every row is a real customer with work in production, so phone/email match
+rates should be well above the cold-lead average." That was an assumption, and
+measuring it falsified it: those leads match at **3.3%**, not above average.
+Widening the scope would not have helped. See "Tier B" below for the measurement
+that replaced this guess.
 
 I did check the cheaper alternative — propagating from a linked **sibling lead
 under the same `lp_prospect_id`** (repeat inquiries from one household). It
@@ -79,7 +81,31 @@ identity assumption. Rejected.
 
 ## Tier A — propagate links that already exist
 
-**Built. Ready to run. Zero external calls.**
+**BUILT, MERGED (PR #777) AND RUN on 2026-08-29. Zero external calls.**
+
+### Run record
+
+Executed through the same `run_sql` RPC the runner calls
+(`src/admin/supabase-admin.js` → `runSQL`), using the statements verbatim from
+`sql/075_ghl_link_propagate.sql`. Undo snapshots
+`lp_link_propagate_undo_jobs_20260829` (830 rows) and
+`lp_link_propagate_undo_ms_20260829` (13,489 rows) were captured first.
+
+| | before | after |
+|---|---:|---:|
+| `lp_job_milestones` null link | 65,465 | **51,944** |
+| `lp_jobs` null link | 4,068 | **3,236** |
+| targeted cohort (milestones) | 13,521 | **0** |
+| targeted cohort (jobs) | 832 | **0** |
+| **`armed` milestone fires** | **12,321** | **12,321** |
+| `lp_leads` rows / linked | 235,955 / 18,897 | 235,955 / 18,897 |
+| `lp_link_conflicts` | 129 | 129 |
+
+Every invariant held. `armed` came back **exactly** unchanged — the safety case
+was not merely argued, it was measured: propagating 13,521 links altered the
+fire set by zero rows. `lp_leads` and `lp_link_conflicts` untouched, as intended.
+The one job whose link disagrees with its parent lead is still there, still
+untouched.
 
 - `sql/075_ghl_link_propagate.sql` — the two `UPDATE`s, source of truth
 - `scripts/backfill-ghl-link-propagate.js` — runner: measurement, undo
@@ -145,12 +171,53 @@ decision, not a backfill's call. The runner reports the count.
 
 ## Tier B — match stranded leads to existing GHL contacts
 
-**Not built. Two decisions needed first.**
+**Probed, not built. Recommendation: close it out. The premise is false.**
 
-### Decision 1: scope (see "the finding" above)
+Tier B assumes stranded LP leads have GHL contacts we failed to link. Measured
+against the HL contacts mirror, normalising both sides to the last 10 phone
+digits, with a control group:
 
-Widen from "90 days" to "90 days **OR** has a job" — adds 3,238 leads and is
-what makes the milestone criterion reachable.
+| Cohort | Probed | Found in GHL | Rate |
+|---|---:|---:|---:|
+| **Control** — leads that ARE linked | 240 | 230 | **95.8%** |
+| Stranded, job-bearing — full-cohort pass | 1,597 | 53 | **3.3%** |
+| Stranded, job-bearing — earlier sample | 273 | 8 | 2.9% |
+| Stranded, created in last 90 days | 260 | 3 | **1.2%** |
+
+The control proves the method and the mirror are sound; the stranded cohorts
+genuinely have no GHL counterpart. **Zero ambiguous matches across all 2,130
+leads probed** — so Tier B would add no `lp_link_conflicts` rows at all.
+
+### Why: LP and GHL were never the same population
+
+- GHL holds **18,229** contacts.
+- LP holds **235,955** leads; 18,897 rows carry a link, resolving to **12,246
+  distinct** contacts.
+- So the mirror holds ~6,000 contacts *not* linked to any LP lead — it is a real
+  mirror of GHL, not a mirror of the linked set, and the probe is not circular.
+  Tier B had ~6,000 genuine candidates to match into and hit 11.
+
+LP is the full historical lead universe; GHL is the actively-marketed subset.
+The 217,000 LP leads with no `ghl_contact_id` are overwhelmingly **not** a
+linking defect — there is nothing on the GHL side to link them to.
+
+At 3.3%, Tier B would recover ~107 of the 3,247 job-bearing leads, worth roughly
+1,700 of the 51,944 remaining milestone nulls. The completion criteria
+(<5,000 milestones, <500 recent orphans) are therefore unreachable by matching
+at any scope — only mass contact **creation** moves them, which is Tier C at
+3× to 10× its briefed volume.
+
+### What was built instead
+
+`scripts/probe-ghl-link-candidates.js` — a read-only reconciliation report
+(writing is opt-in via `--write`, following `audit-orphan-ghl-links.js` rather
+than the `backfill-*` convention, because it informs a go/no-go). It reuses
+`corroborateIdentity` / `normalizeEmail` from
+`src/services/link-corroboration.js` rather than adding a second matcher, and
+batches indexed `.in()` lookups against the mirror. It never writes `lp_leads`.
+
+`scripts/test-ghl-link-probe.js` pins the matching rules, including that
+many-LP-leads-to-one-GHL-contact is normal and not a conflict.
 
 ### Decision 2: the promotion step is NOT low-risk, and the brief has this backwards
 
@@ -183,20 +250,20 @@ particular order. That is a pre-existing defect, not one this project
 introduces, but it means "it will fire eventually, in unpredictable order"
 rather than "it fires all at once".
 
-### What to build (when approved)
+### To close Tier B out
 
-- Extend `src/services/link-corroboration.js` rather than adding a matcher.
-  `corroborateIdentity` / `phonesMatch` / `normalizeEmail` already handle the
-  LP-bare-10-digit vs GHL-E.164 mismatch and the `"NA"` email sentinel.
-- Write every match to `lp_link_verifications` first; promote only after Mark
-  reviews 50.
-- Many-LP-leads-to-one-GHL-contact is **normal** (3,872 contacts already map to
-  more than one lead; 3,785 share a phone). The existing resolver already
-  treats this correctly — it keys verdicts on `(lp_lead_id, ghl_contact_id)`,
-  so one contact serving many leads is not a conflict. Only *one lead with two
-  candidate contacts* is. Do not "fix" this.
-- Ambiguity goes to `lp_link_conflicts` via the existing `recordConflict`,
-  which counts recurrence instead of inserting duplicates.
+1. Run the full credentialed pass (needs `SUPABASE_URL` + `HL_SUPABASE_URL`):
+   `node scripts/probe-ghl-link-candidates.js --cohort=both`, then `--write` to
+   record verdicts once the rate is confirmed.
+2. Review the handful of `pass` verdicts in `lp_link_verifications` — far fewer
+   than the 50 the brief anticipated, because there are not 50 to review.
+3. Promote only those, and only with the suppression decision below applied.
+
+Many-LP-leads-to-one-GHL-contact stays **normal** (3,872 contacts already map to
+more than one lead; 3,785 share a phone). The resolver keys verdicts on
+`(lp_lead_id, ghl_contact_id)`, so one contact serving many leads is not a
+conflict — only *one lead with several candidate contacts* is. A test pins this.
+Do not "fix" it.
 
 ---
 
@@ -267,13 +334,16 @@ choosing the final tag name.
 
 ## Dependency: Project 2
 
-Not verified as merged. There are **no open PRs** in LP-MCP or HL-MCP, and no
-PR title matching the dropped-webhook defect, so Project 2 is either already in
-`main` under a name I could not identify, or not yet started. **Mark should
-confirm before Tier B or C.**
+**Appears to have landed** while this work was in flight: PR #778
+(`claude/ghl-tag-webhook-durability-0st9dn`, merged into `main` as `0ba6168`)
+fixes per-contact ordering in the GHL tag inbox worker — a failed row no longer
+lets a later row for the same contact advance the snapshot past it and emit the
+difference as tag *removals*. That is the tag-event durability defect Project 3
+was told to wait for. **Mark should confirm it is the whole of Project 2** before
+Tier C runs.
 
-It is **not** a gate on Tier A: Tier A changes no firing behavior at all, so
-there are no tag events for a dropped-webhook defect to lose.
+It was never a gate on Tier A: Tier A changed no firing behavior at all, so
+there were no tag events for the defect to lose.
 
 ---
 
@@ -286,6 +356,11 @@ SELECT count(*) FROM lp_leads
 SELECT count(*) FROM lp_link_conflicts WHERE detected_at > now() - interval '48 hours';
 ```
 
-Expected after Tier A: milestones ≈ 52,000 (from ~66,900); leads and conflicts
-**unchanged** — Tier A touches neither table. A change in either means
-something other than Tier A ran.
+Tier A actual (2026-08-29): milestones **51,944** (from 65,465), jobs **3,236**
+(from 4,068), leads and conflicts **unchanged**, `armed` unchanged at 12,321.
+A later change in `lp_leads` or `lp_link_conflicts` means something other than
+Tier A ran.
+
+The milestone figure keeps falling on its own between runs — that is the
+sweeper stamping ids down as it fires, not measurement drift. Compare against
+the number the runner prints, not against this document.
