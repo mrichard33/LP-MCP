@@ -336,23 +336,32 @@ function bumpDropCounter(key) {
   }
 }
 
+/** Shape one filtered event into a system_events_filtered row. */
+function filteredRow(evt, decision) {
+  return {
+    event_type: evt.event_type || null,
+    event_subtype: evt.event_subtype || null,
+    source: evt.source || null,
+    ghl_contact_id: evt.ghl_contact_id || null,
+    entity_id: evt.entity_id ? String(evt.entity_id) : null,
+    payload: evt.payload || null,
+    filter_reason: decision.reason,
+    filter_rule: 'intake_filter_v1',
+  };
+}
+
 /**
- * Record a filtered event in system_events_filtered for observability.
+ * Record filtered events in system_events_filtered for observability.
  * Fail-open: telemetry write errors do not block the filter decision.
+ *
+ * Takes an array and writes it as ONE multi-row insert. The single-row
+ * caller passes a one-element array. See recordFilteredBatch's note on why
+ * the batch shape matters.
  */
-async function recordFiltered(evt, decision) {
-  if (!supabase) return;
+async function recordFiltered(rows) {
+  if (!supabase || rows.length === 0) return;
   try {
-    await supabase.from('system_events_filtered').insert({
-      event_type: evt.event_type || null,
-      event_subtype: evt.event_subtype || null,
-      source: evt.source || null,
-      ghl_contact_id: evt.ghl_contact_id || null,
-      entity_id: evt.entity_id ? String(evt.entity_id) : null,
-      payload: evt.payload || null,
-      filter_reason: decision.reason,
-      filter_rule: 'intake_filter_v1',
-    });
+    await supabase.from('system_events_filtered').insert(rows);
   } catch (err) {
     console.warn(`[event-intake-filter] telemetry write failed: ${err.message}`);
   }
@@ -393,9 +402,65 @@ export async function applyIntakeFilter(evt, opts = {}) {
 
   // Record + count
   bumpDropCounter(evt.event_type || 'unknown');
-  await recordFiltered(evt, decision);
+  await recordFiltered([filteredRow(evt, decision)]);
 
   return decision;
+}
+
+/**
+ * Batch form of applyIntakeFilter.
+ *
+ * Added 2026-08-29 (Project 2 — GHL tag webhook durability). The tag handler
+ * used to call applyIntakeFilter in a serial per-tag loop, so a contact with
+ * 30 tags cost 30 sequential awaited INSERTs into system_events_filtered. Tag
+ * traffic drops ~99.5% of what it sees (~8,000 filtered writes/day against
+ * ~15 kept events), so that loop was almost entirely telemetry — and it was
+ * the dominant cost inside HL MCP's 5s webhook budget.
+ *
+ * Here the allow/deny decisions are made against the same pure
+ * shouldAllowEvent, then every dropped row is written in ONE insert.
+ *
+ * Fail-open, matching applyIntakeFilter: a decision that throws allows the
+ * event through, and a telemetry write failure never blocks the batch.
+ *
+ * @param {object[]} events
+ * @param {object} [opts]
+ * @param {boolean} [opts.bypass=false]
+ * @returns {Promise<{ allowed: object[], filtered: object[] }>}
+ */
+export async function applyIntakeFilterBatch(events, opts = {}) {
+  const list = Array.isArray(events) ? events : [];
+  if (opts.bypass === true) {
+    return { allowed: [...list], filtered: [] };
+  }
+
+  const allowed = [];
+  const filtered = [];
+  const telemetry = [];
+
+  for (const evt of list) {
+    let decision;
+    try {
+      decision = shouldAllowEvent(evt);
+    } catch (err) {
+      console.error(`[event-intake-filter] decision error, failing open: ${err.message}`);
+      allowed.push(evt);
+      continue;
+    }
+
+    if (decision.allow) {
+      allowed.push(evt);
+      continue;
+    }
+
+    bumpDropCounter(evt.event_type || 'unknown');
+    filtered.push({ event: evt, reason: decision.reason });
+    telemetry.push(filteredRow(evt, decision));
+  }
+
+  await recordFiltered(telemetry);
+
+  return { allowed, filtered };
 }
 
 // Exported for unit tests + introspection
