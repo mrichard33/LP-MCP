@@ -1343,7 +1343,73 @@ export function registerLpCsvRoutes(app) {
     });
   }
 
-  console.log('[LPCsv] Routes registered: POST /n8n/admin/lp-csv-ingest/{job-status|lead-disposition|source-cost|sales-efficiency} | POST /n8n/admin/lp-report-ingest/{sales-efficiency|lead-disposition|source-cost} (137/135/136, live parsers)');
+  // RE-INGEST AN ARCHIVED FILE. Every CSV is archived to Storage BEFORE it is
+  // parsed, precisely so a rejection is recoverable — but until now nothing
+  // could actually reach back for one. Recovering a rejected day meant finding
+  // the original LP email and re-sending it by hand, which is why 133 still has
+  // a hole at 2026-08-18 → 08-20: the files were sitting in the bucket the
+  // whole time with no way to replay them.
+  //
+  // Safe to call twice. The ingest's own sha256 duplicate check runs first, so
+  // a second call against a file that already landed is a clean no-op rather
+  // than a second snapshot.
+  app.post('/n8n/admin/lp-csv-ingest/reingest-archived', express.json({ limit: '64kb' }), async (req, res) => {
+    try {
+      if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
+      if (!supabase) return res.status(500).json({ success: false, error: 'Supabase not configured' });
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      // Either address a file directly by its archive path, or name the
+      // report_type + sha256 and let the conventional path be rebuilt. The
+      // second is what a scorecard_ingest_log row gives you.
+      let path = typeof body.storage_path === 'string' ? body.storage_path.trim() : '';
+      if (!path) {
+        const reportType = String(body.report_type || '').trim();
+        const sha = String(body.sha256 || '').trim().toLowerCase();
+        if (!reportType || !/^[0-9a-f]{64}$/.test(sha)) {
+          return res.status(400).json({ success: false, error: 'pass storage_path, or report_type + a 64-char hex sha256' });
+        }
+        // The archive path is `<report_type>/<date received>/<sha>.csv`, and
+        // the date is not derivable from the sha — so walk the day folders
+        // rather than guess. Listing `<report_type>/` returns those folders,
+        // NOT files, which is why this cannot be a single search call.
+        // Newest first: a re-send is far likelier to be recent.
+        const { data: days, error: listErr } = await supabase.storage
+          .from(STORAGE_BUCKET).list(reportType, { limit: 1000, sortBy: { column: 'name', order: 'desc' } });
+        if (listErr) throw new Error(`archive list failed: ${listErr.message}`);
+        for (const day of (days || [])) {
+          if (!day?.name) continue;
+          const { data: hit } = await supabase.storage
+            .from(STORAGE_BUCKET).list(`${reportType}/${day.name}`, { search: `${sha}.csv`, limit: 10 });
+          if ((hit || []).some((f) => f.name === `${sha}.csv`)) {
+            path = `${reportType}/${day.name}/${sha}.csv`;
+            break;
+          }
+        }
+        if (!path) return res.status(404).json({ success: false, error: `no archived file for ${reportType} ${sha}` });
+      }
+
+      const { data: blob, error: dlErr } = await supabase.storage.from(STORAGE_BUCKET).download(path);
+      if (dlErr) throw new Error(`archive download failed: ${dlErr.message}`);
+      const text = await blob.text();
+      if (!text.length) return res.status(422).json({ success: false, error: `archived file is empty: ${path}` });
+
+      // Route on the file's own header, exactly as the live path does (§C) —
+      // an archived file gets no shortcut the live one does not have.
+      const grid = parseCsv(text);
+      const resolved = detectReportFromHeader(grid[0] ?? []);
+      const variant = resolveVariant(resolved.reportType, grid[0] ?? [], grid[1] ?? []);
+      const effectiveType = variant.reportType;
+      const source = String(req.query.source || body.source || 'backfill');
+      console.log(`[LPCsv] re-ingesting archived ${path} as ${effectiveType} (source=${source})`);
+      const result = await ingestCsv({ reportType: effectiveType, text, source });
+      res.json({ ...result, report_type: effectiveType, storage_path: path, reingested: true });
+    } catch (err) {
+      console.error('[LPCsv] reingest-archived error:', err.message);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  console.log('[LPCsv] Routes registered: POST /n8n/admin/lp-csv-ingest/{job-status|lead-disposition|source-cost|sales-efficiency} | POST /n8n/admin/lp-csv-ingest/reingest-archived | POST /n8n/admin/lp-report-ingest/{sales-efficiency|lead-disposition|source-cost} (137/135/136, live parsers)');
 
   // The 133 status vocabulary, printed at boot. LP adds statuses without
   // notice — 'Await Customer' cost four days in August 2026 — and until now
