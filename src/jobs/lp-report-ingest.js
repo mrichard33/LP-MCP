@@ -17,6 +17,13 @@
 // scorecard_ingest_quarantine rows) are the failure record and always
 // write. GroupMe gets failures only — a healthy morning is silent.
 //
+// ONE EXCEPTION, and it lives in the CSV path, not here: 133's
+// `unmapped_status` now quarantines the offending rows and lands the rest as
+// `succeeded_with_warnings`, provided they stay under a volume guard. See the
+// long note at the job_status_ytd branch in lp-csv-ingest.js. This module —
+// the legacy PDF orchestrator — is unchanged and still fail-closed on every
+// violation; report 133 does not route through it.
+//
 // HTTP CONTRACT: deterministic content failures return 200 with
 // { success:false, failure_reason } (the goal-scorecard-run precedent) so
 // n8n's retry loop doesn't hammer an identically-failing PDF; transport /
@@ -567,7 +574,7 @@ export async function ingestReportPdf({ reportType, buffer, source = 'n8n', expe
 }
 
 /**
- * Guards the PDF ingest routes AND /events/lp_report_ingest_failed.
+ * Guards the PDF ingest routes AND /events/lp_report_ingest_{failed,succeeded}.
  * See ingestAuthorized in lp-report-common.js — including why it fails OPEN.
  */
 const authorized = (req) => ingestAuthorized(req, 'lp-report-ingest');
@@ -667,6 +674,41 @@ export function registerLpReportRoutes(app) {
     }
   });
 
+  // n8n SUCCESS telemetry — the other half of the pair above, and the reason
+  // it exists at all. I.LPRB only ever POSTed on failure, so report_type
+  // 'jobs_by_status' in scorecard_ingest_log held failure rows and nothing
+  // else. Reading that table therefore showed 133 as permanently broken long
+  // after it was fixed: the last row was the 2026-08-21 rejection, while the
+  // parser had been ingesting cleanly every morning since. A monitoring signal
+  // that can only ever go red is not a monitoring signal.
+  //
+  // This row is TELEMETRY, not the ingest record. The authoritative row is the
+  // one lp-csv-ingest.js writes under report_type 'job_status_ytd'; this one
+  // says "n8n got a green answer from LP-MCP", which is the only fact n8n can
+  // actually attest to. Same 200-always contract as the failure route.
+  app.post('/events/lp_report_ingest_succeeded', express.json({ limit: '256kb' }), async (req, res) => {
+    try {
+      if (!authorized(req)) return res.status(401).json({ success: false, error: 'bad signature' });
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const reportType = canonicalReportType(String(body.report || '').trim());
+      // A duplicate is a legitimate green outcome (LP re-sends, n8n retries),
+      // but it is not a fresh ingest and must not read as one.
+      const status = body.duplicate === true ? 'duplicate' : 'success';
+      await logIngest({
+        report_type: reportType || 'unknown',
+        file_sha256: typeof body.sha256 === 'string' && body.sha256 ? body.sha256 : null,
+        status,
+        failure_reason: null,
+        detail: { ...body, source: 'n8n_telemetry' },
+        source: 'n8n_telemetry',
+      });
+      res.json({ success: true });
+    } catch (err) {
+      console.error('[LPReport] success telemetry event error:', err.message);
+      res.json({ success: true, logged: false, error: err.message });
+    }
+  });
+
   app.get('/n8n/admin/lp-report-ingest/status', async (req, res) => {
     try {
       if (!supabase) return res.status(500).json({ success: false, error: 'Supabase not configured' });
@@ -728,5 +770,5 @@ export function registerLpReportRoutes(app) {
     }
   });
 
-  console.log('[LPReport] Routes registered: POST /n8n/admin/lp-report-ingest/{jobs-by-milestone|jobs-by-status} | POST /n8n/admin/lp-report-ingest/backfill/{…} | POST /events/lp_report_ingest_failed | GET /n8n/admin/lp-report-ingest/status | POST /n8n/admin/lp-report-facts-rebuild');
+  console.log('[LPReport] Routes registered: POST /n8n/admin/lp-report-ingest/{jobs-by-milestone|jobs-by-status} | POST /n8n/admin/lp-report-ingest/backfill/{…} | POST /events/lp_report_ingest_{failed|succeeded} | GET /n8n/admin/lp-report-ingest/status | POST /n8n/admin/lp-report-facts-rebuild');
 }

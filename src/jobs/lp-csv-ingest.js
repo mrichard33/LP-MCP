@@ -46,7 +46,7 @@ import {
 import { logIngest, quarantineRows, alertGroupMe, duplicateResponse, releaseIfEmpty, extractPdfText, extractPdfBboxXml, NoTextLayerError } from './lp-report-ingest.js';
 import {
   parseJobStatusCsv, validateJobStatusCsv,
-  JOB_STATUS_PARSER_VERSION,
+  JOB_STATUS_PARSER_VERSION, JOB_STATUS_BUCKET_MAP, judgeUnmappedStatus,
 } from './lp-report-parse-job-status.js';
 import {
   parseLeadDispositionCsv, validateLeadDispositionCsv, resolveLeadMarkets,
@@ -407,7 +407,45 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
     if (reportType === 'job_status_ytd') {
       parsed = parseJobStatusCsv(text);
       const v = validateJobStatusCsv(parsed);
-      if (!v.ok) {
+      // UNMAPPED STATUS: QUARANTINE THE ROWS, NOT THE FILE — up to a volume
+      // the numbers can absorb. This is the 137 doctrine (§F, just below)
+      // extended to status, and it supersedes the 2026-08-21 ruling that a
+      // single unannounced status must stop the pipeline. That ruling cost
+      // four days of 133 (08-18 → 08-21) over one or two rows a day.
+      //
+      // The ruling and the guard both live in judgeUnmappedStatus(), next to
+      // the map they protect; read the note there for why the guard is not
+      // optional. This block owns only the side effects.
+      const judged = judgeUnmappedStatus(parsed, v.violations, {
+        maxRows: process.env.LP_JOB_STATUS_UNMAPPED_MAX_ROWS,
+        maxPct: process.env.LP_JOB_STATUS_UNMAPPED_MAX_PCT,
+      });
+      if (!v.ok && judged.action === 'quarantine') {
+        await quarantineRows(reportType, sha,
+          judged.bad.map((row) => ({ reason: 'unmapped_status', row })));
+        parsed.rows = parsed.rows.filter((r) => r.bucket != null);
+        // The gross MUST travel with the warning. Dropping rows makes the
+        // snapshot gross diverge from LP's own header total, and without the
+        // number attached that delta reads as a data defect rather than as the
+        // known, bounded cost of this quarantine.
+        extraDetail.warnings = [...(extraDetail.warnings ?? []), {
+          rule: 'unmapped_status_quarantined',
+          detail: {
+            count: judged.bad.length,
+            statuses: judged.statuses,
+            quarantined_gross_cents: judged.grossCents,
+            pct_of_file: judged.pct,
+          },
+        }];
+        console.warn(`[LPCsv] ${reportType}: quarantined ${judged.bad.length} row(s) with unmapped status ${judged.statuses.join(', ')} (${centsToDollars(judged.grossCents)} gross); ingesting the remaining ${parsed.rows.length}.`);
+        await alertGroupMe(`⚠️ LP CSV ingest WARNING (${reportType}): ${judged.bad.length} row(s) carry unmapped status ${judged.statuses.join(', ')} — quarantined, ${centsToDollars(judged.grossCents)} gross withheld from Open Backlog. The other ${parsed.rows.length} rows ingested. Add the status to JOB_STATUS_BUCKET_MAP and re-send to recover the rows.`);
+      } else if (!v.ok && judged.action === 'reject') {
+        await quarantineRows(reportType, sha,
+          judged.bad.map((row) => ({ reason: 'unmapped_status', row })));
+        return await fail('unmapped_status',
+          { violations: v.violations, guard: { rows: judged.bad.length, pct: judged.pct, max_rows: judged.maxRows, max_pct: judged.maxPct } },
+          `${judged.bad.length} row(s) (${judged.pct}%) carry unmapped status ${judged.statuses.join(', ')} — past the quarantine guard (max ${judged.maxRows} rows / ${judged.maxPct}%), so the file is rejected rather than landing an understated snapshot.`);
+      } else if (!v.ok) {
         await quarantineRows(reportType, sha,
           parsed.rows.filter((r) => r.bucket == null).map((row) => ({ reason: 'unmapped_status', row })));
         return await fail(v.violations[0].rule, { violations: v.violations },
@@ -808,8 +846,10 @@ export async function ingestCsv({ reportType, text, source = 'manual', expectedT
  * The count gate is the ONLY fail-closed check: per-band `Totals:` and the
  * `Grand Totals:` line must both tie to the parsed rows. An unmapped
  * disposition or last-result value writes a reconciliation warning and the
- * snapshot still lands — the opposite of report 133, which has been failing
- * 25× a day on `unmapped_status`.
+ * snapshot still lands. Report 133 used to be the opposite — it rejected the
+ * whole file on `unmapped_status` — and has since been brought into line with
+ * this behaviour, with a volume guard so a bulk LP status rename still stops
+ * rather than quietly understating Open Backlog.
  *
  * Nothing is deduped: LP counts ROWS, prosp # repeats, and row identity is
  * (snapshot_id, row_ordinal).
@@ -1304,4 +1344,18 @@ export function registerLpCsvRoutes(app) {
   }
 
   console.log('[LPCsv] Routes registered: POST /n8n/admin/lp-csv-ingest/{job-status|lead-disposition|source-cost|sales-efficiency} | POST /n8n/admin/lp-report-ingest/{sales-efficiency|lead-disposition|source-cost} (137/135/136, live parsers)');
+
+  // The 133 status vocabulary, printed at boot. LP adds statuses without
+  // notice — 'Await Customer' cost four days in August 2026 — and until now
+  // the only way to answer "what does LP-MCP currently think the vocabulary
+  // is" was to read the source at the deployed SHA. Now it is one grep of the
+  // Railway log, which is also how you confirm a mapping fix actually shipped.
+  const byBucket = {};
+  for (const [status, bucket] of Object.entries(JOB_STATUS_BUCKET_MAP)) {
+    (byBucket[bucket] ??= []).push(status);
+  }
+  console.log(`[LPCsv] job-status mapping (${JOB_STATUS_PARSER_VERSION}), ${Object.keys(JOB_STATUS_BUCKET_MAP).length} statuses:`);
+  for (const bucket of Object.keys(byBucket).sort()) {
+    console.log(`[LPCsv]   ${bucket}: ${byBucket[bucket].sort().join(' | ')}`);
+  }
 }
