@@ -105,6 +105,8 @@ import { registerCoolingCallbackRoutes } from './cooling-callback-handler.js';
 import { registerEntryEventRoutes } from './entry-event-handler.js';
 // ─── GHL Tag Webhook Bridge (Wave 1.2) ──────────────────────────
 import { registerGhlTagRoutes } from './ghl-tag-handler.js';
+// ─── GHL tag inbox worker (Project 2 — fast-ack durability) ──────
+import { startGhlTagProcessor } from './jobs/ghl-tag-processor.js';
 // ─── Canvassing Pilot v2 intake (I.CV → LP) ──────────────────────
 import { registerCanvassingLeadRoutes } from './canvassing-lead-handler.js';
 // ─── Canvass confirmation intake (U.LCF, existing LP prospect) ───
@@ -1706,6 +1708,9 @@ app.listen(PORT, async () => {
   startCohortReconcileScheduler();
   startExecutorHeartbeatScheduler();
   startDecisionEngineHeartbeatScheduler();
+  // Drains ghl_tag_inbox. /webhooks/ghl-tag only enqueues now, so without
+  // this running no tag event ever reaches the Decision Engine.
+  startGhlTagProcessor();
   startDriftDetectorScheduler();
   startLeadStateSweepScheduler();
   startNoteChangeAnalyzerScheduler();
