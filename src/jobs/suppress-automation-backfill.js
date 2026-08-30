@@ -303,7 +303,8 @@ export async function runSuppressAutomationBackfill({
 
   let rows;
   try {
-    // hlRunSQL wraps in json_agg, so a zero-row result comes back as null.
+    // hlRunSQL returns a row array; zero rows is []. The `|| []` and the
+    // Array.isArray guard below are kept as belt-and-braces.
     rows = (await hlRunSQL(
       buildCohortSql({
         cohort,

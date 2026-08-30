@@ -109,7 +109,7 @@ async function findOffenderGroups() {
     HAVING count(*) > 1
     ORDER BY n DESC
   `);
-  // hlRunSQL's json_agg wrap returns null, not [], for zero rows.
+  // hlRunSQL returns a row array; zero rows is []. `|| []` kept as a backstop.
   return rows || [];
 }
 
