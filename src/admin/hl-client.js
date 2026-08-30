@@ -46,35 +46,59 @@ export function assertReadOnly(q) {
   return t;
 }
 
-// HL's run_sql RPC returns a json-typed variable, so every SELECT is wrapped in
-// json_agg before execution.
-function wrapSelectForJsonAgg(queryText) {
-  const trimmed = queryText.trim();
-  const upper = trimmed.toUpperCase();
-  if (!upper.startsWith('SELECT') && !upper.startsWith('WITH')) return trimmed;
-  if (upper.includes('JSON_AGG')) return trimmed;
-  return `SELECT json_agg(t) FROM (${trimmed}) t`;
-}
-
-function unwrapSingleValue(data) {
-  if (Array.isArray(data) && data.length === 1 && typeof data[0] === 'object' && data[0] !== null) {
-    const keys = Object.keys(data[0]);
-    if (keys.length === 1) return data[0][keys[0]];
-  }
-  return data;
+export function isSelectish(queryText) {
+  const upper = (queryText || '').trim().toUpperCase();
+  return upper.startsWith('SELECT') || upper.startsWith('WITH');
 }
 
 /**
- * CALLER BEWARE: the json_agg wrap plus unwrapSingleValue mean a zero-row
- * SELECT returns null rather than [], and a single-row single-column result
- * collapses to a bare scalar. Normalize before treating the result as an array.
+ * Throw unless a SELECT came back as a row array.
+ *
+ * Pure so it can be tested without a Supabase client. See the note on
+ * hlRunSQL: a non-array here means HL's run_sql is still the original 009 body,
+ * which answers a multi-column SELECT with its first column and drops the
+ * rest. There is no safe way to use that value, so this refuses it.
+ */
+export function assertRowArray(queryText, data) {
+  if (!isSelectish(queryText) || Array.isArray(data)) return data;
+  throw new Error(
+    'HL run_sql returned a non-array for a SELECT, which means migration '
+    + '014_run_sql_full_resultset.sql is NOT applied on this HL Supabase. '
+    + 'Refusing the result: the old function body returns only the first column '
+    + 'of the first row, so this value is silently truncated. Apply '
+    + 'HL-MCP/supabase/migrations/014_run_sql_full_resultset.sql (the Supabase '
+    + 'branching workflow does this on merge; by hand, use the SQL editor — it '
+    + 'cannot be applied through the MCP admin tool).',
+  );
+}
+
+/**
+ * Run SQL against the HL Supabase and return ROWS.
+ *
+ * A SELECT always returns an array of row objects — `[]` for zero rows, and a
+ * single-row single-column result stays `[{col: value}]` rather than collapsing
+ * to a bare scalar.
+ *
+ * ─── History (2026-08-30) ─────────────────────────────────────────────────
+ * This used to wrap every SELECT in json_agg client-side and then un-nest the
+ * reply, because HL's run_sql carried the original
+ * `EXECUTE query_text INTO result` body — which captures only the FIRST COLUMN
+ * of the FIRST ROW and silently discards everything else. HL-MCP migration
+ * 014_run_sql_full_resultset.sql fixes that server-side (the function is now
+ * byte-identical to LP's own sql/run_sql.sql), so the workaround is gone and
+ * both Supabase clients in this repo behave the same way.
+ *
+ * The guard below exists because that migration is applied BY HAND. Against an
+ * un-migrated instance the old body would answer a multi-column SELECT with one
+ * plausible-looking scalar, and every caller here would quietly act on
+ * truncated data. Failing loudly is the only safe response — a wrong number
+ * that looks right is worse than an outage.
  */
 export async function hlRunSQL(queryText) {
   const supabase = getHlSupabase();
-  const wrapped = wrapSelectForJsonAgg(queryText);
-  const { data, error } = await supabase.rpc('run_sql', { query_text: wrapped });
+  const { data, error } = await supabase.rpc('run_sql', { query_text: queryText });
   if (error) throw new Error(`HL SQL error: ${error.message}`);
-  return unwrapSingleValue(data);
+  return assertRowArray(queryText, data);
 }
 
 /** This path has NO bind parameters — every interpolated value needs this. */

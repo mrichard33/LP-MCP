@@ -201,9 +201,9 @@ function resolveWindow(startDate, endDate) {
 }
 
 /**
- * hlRunSQL wraps SELECTs in json_agg and pipes the result through
- * unwrapSingleValue(): a zero-row SELECT returns NULL rather than [], and a
- * single-row single-column result collapses to a bare scalar. Normalize.
+ * hlRunSQL now returns a row array for every SELECT ([] for zero rows), so this
+ * is a backstop rather than the load-bearing normalizer it used to be. Kept
+ * because it costs nothing and this job also feeds on non-hlRunSQL shapes.
  */
 function asRows(value) {
   if (Array.isArray(value)) return value;
