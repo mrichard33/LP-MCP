@@ -4,7 +4,7 @@
  * src/admin/hl-client.js used to wrap every SELECT in json_agg client-side,
  * because HL's run_sql carried the original `EXECUTE query_text INTO result`
  * body — which returns only the FIRST COLUMN of the FIRST ROW. HL-MCP migration
- * 013_run_sql_full_resultset.sql fixes that server-side, so the wrap is gone.
+ * 014_run_sql_full_resultset.sql fixes that server-side, so the wrap is gone.
  *
  * That migration is applied by the Supabase branching workflow, i.e. on a
  * different schedule from this code. Against an un-migrated instance the old
@@ -12,7 +12,7 @@
  * every caller here would quietly act on truncated data. assertRowArray refuses
  * that instead, and this pins the refusal.
  *
- * Verified against a real Postgres 16 (2026-08-30) — with the pre-013 body:
+ * Verified against a real Postgres 16 (2026-08-30) — with the original 009 body:
  *   SELECT count(*) AS probed, 8 AS exactly_one, 265 AS no_contact  ->  273
  *   SELECT json_build_object('probed',273,'exactly_one',8)  ->  {..} (survives)
  * Both are non-arrays, so both are caught here.
@@ -49,7 +49,7 @@ for (const truncated of [
 ]) {
   assert.throws(
     () => assertRowArray('SELECT count(*) AS probed, 8 AS exactly_one FROM t', truncated),
-    /013_run_sql_full_resultset\.sql is NOT applied/,
+    /014_run_sql_full_resultset\.sql is NOT applied/,
     `a ${JSON.stringify(truncated)} reply to a SELECT must be refused, not used`,
   );
 }

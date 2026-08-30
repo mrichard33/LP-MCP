@@ -63,10 +63,10 @@ export function assertRowArray(queryText, data) {
   if (!isSelectish(queryText) || Array.isArray(data)) return data;
   throw new Error(
     'HL run_sql returned a non-array for a SELECT, which means migration '
-    + '013_run_sql_full_resultset.sql is NOT applied on this HL Supabase. '
+    + '014_run_sql_full_resultset.sql is NOT applied on this HL Supabase. '
     + 'Refusing the result: the old function body returns only the first column '
     + 'of the first row, so this value is silently truncated. Apply '
-    + 'HL-MCP/supabase/migrations/013_run_sql_full_resultset.sql (the Supabase '
+    + 'HL-MCP/supabase/migrations/014_run_sql_full_resultset.sql (the Supabase '
     + 'branching workflow does this on merge; by hand, use the SQL editor — it '
     + 'cannot be applied through the MCP admin tool).',
   );
@@ -84,7 +84,7 @@ export function assertRowArray(queryText, data) {
  * reply, because HL's run_sql carried the original
  * `EXECUTE query_text INTO result` body — which captures only the FIRST COLUMN
  * of the FIRST ROW and silently discards everything else. HL-MCP migration
- * 013_run_sql_full_resultset.sql fixes that server-side (the function is now
+ * 014_run_sql_full_resultset.sql fixes that server-side (the function is now
  * byte-identical to LP's own sql/run_sql.sql), so the workaround is gone and
  * both Supabase clients in this repo behave the same way.
  *
