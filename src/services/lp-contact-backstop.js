@@ -271,6 +271,38 @@ export function makeIsWithinIntakeWindow(lookbackHours, nowMs = Date.now()) {
   };
 }
 
+/**
+ * Intake window with an explicit UPPER bound as well as the lookback.
+ *
+ * makeIsWithinIntakeWindow is lower-bound only ("entered LP within N hours"),
+ * which is right for the forward-only sweep: it should always run up to now.
+ * A bounded BACKFILL is the opposite shape — it targets a closed historical
+ * window and must not spill past it.
+ *
+ * Measured 2026-08-29: reaching back to 2026-08-13 needs a ~408h lookback, and
+ * an unbounded run at that depth also sweeps 21 unlinked "Data" leads created
+ * AFTER 2026-08-19. Some of those are fresh enough that shouldSuppressOutbound
+ * would let them through un-suppressed — i.e. a backfill would send a
+ * speed-to-lead text it was never scoped to send. Hence the upper bound.
+ *
+ * Fails CLOSED: an unparseable created_at_lp is outside the window, matching
+ * makeIsWithinIntakeWindow and shouldSuppressOutbound ("fail toward silence").
+ *
+ * @param {number} lookbackHours
+ * @param {string|null} untilIso  exclusive upper bound; null = no upper bound
+ */
+export function makeIntakeWindowGate(lookbackHours, untilIso = null, nowMs = Date.now()) {
+  const lower = makeIsWithinIntakeWindow(lookbackHours, nowMs);
+  if (!untilIso) return lower;
+  const untilMs = Date.parse(untilIso);
+  if (!Number.isFinite(untilMs)) throw new Error(`untilIso is not a valid date: ${untilIso}`);
+  return (lead) => {
+    if (!lower(lead)) return false;
+    const t = Date.parse(lead?.created_at_lp);
+    return Number.isFinite(t) && t < untilMs;
+  };
+}
+
 // ─── Selection ───────────────────────────────────────────────────────
 /**
  * Scan lp_leads for APPOINTMENT-mode backstop candidates: unlinked leads with
@@ -331,6 +363,7 @@ export async function scanIntakeBackstopCandidates({
   lookbackHours = DEFAULT_INTAKE_LOOKBACK_HOURS,
   maxPerRun = DEFAULT_INTAKE_MAX_PER_RUN,
   limit = 0,
+  untilIso = null,
 } = {}) {
   if (!supabase) throw new Error('Supabase not configured');
 
@@ -341,12 +374,16 @@ export async function scanIntakeBackstopCandidates({
   const rows = [];
   let from = 0;
   while (true) {
-    const { data, error } = await supabase
+    let q = supabase
       .from('lp_leads')
       .select('lp_lead_id, ghl_contact_id, disposition_code, appointment_date, created_at_lp, first_name, last_name, phone, lead_source, lead_source_detail, lp_prospect_id')
       .is('ghl_contact_id', null)
       .in('disposition_code', INTAKE_DISPOSITIONS)
-      .gte('created_at_lp', fromIso)
+      .gte('created_at_lp', fromIso);
+    // Pushed into SQL as well as the JS gate so a bounded backfill does not
+    // page through tens of thousands of rows it will only discard.
+    if (untilIso) q = q.lt('created_at_lp', untilIso);
+    const { data, error } = await q
       .order('created_at_lp', { ascending: false })
       .range(from, from + PAGE - 1);
     if (error) throw new Error(`lp_leads intake scan failed at offset ${from}: ${error.message}`);
@@ -359,9 +396,9 @@ export async function scanIntakeBackstopCandidates({
   const selected = selectBackstopTargets(rows, {
     maxPerRun,
     limit,
-    withinWindow: makeIsWithinIntakeWindow(effLookback),
+    withinWindow: makeIntakeWindowGate(effLookback, untilIso),
   });
-  return { ...selected, totalRows: rows.length, lookback_hours: effLookback };
+  return { ...selected, totalRows: rows.length, lookback_hours: effLookback, until_iso: untilIso };
 }
 
 /**
@@ -858,9 +895,10 @@ export async function runLpIntakeBackstop({
   freshHours = DEFAULT_INTAKE_FRESH_HOURS,
   suppressOutbound = false,
   limit = 0,
+  untilIso = null,
   job = null,
 } = {}) {
-  const scan = await scanIntakeBackstopCandidates({ lookbackHours, maxPerRun, limit });
+  const scan = await scanIntakeBackstopCandidates({ lookbackHours, maxPerRun, limit, untilIso });
   if (job) job.total = scan.targets.length;
 
   const { counts, lines, results, errors, suppressedCount } = await executeOverScan(scan, {
@@ -874,6 +912,7 @@ export async function runLpIntakeBackstop({
     mode: 'intake',
     dry_run: dryRun,
     lookback_hours: scan.lookback_hours,
+    until_iso: scan.until_iso ?? null,
     fresh_hours: freshHours,
     suppress_outbound_run: suppressOutbound,
     max_per_run: maxPerRun,

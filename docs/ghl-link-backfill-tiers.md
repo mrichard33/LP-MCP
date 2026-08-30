@@ -4,9 +4,9 @@ Back-filling `ghl_contact_id` on stranded `lp_leads`, `lp_jobs` and
 `lp_job_milestones`. Three tiers, ascending in risk, with a sign-off gate
 between each. This document carries the measurements each gate needs.
 
-**Status (2026-08-29): Tier A BUILT, MERGED AND RUN — see results below.
-Tier B probed and recommended for CLOSURE, not construction: the premise it
-rests on is false. Tier C not built; blocked on Mark's GHL UI changes.**
+**Status (2026-08-29): Tier A BUILT, MERGED AND RUN. Tier B probed and closed
+out — its premise is false. Tier C BUILT and dry-runnable; the live run is
+blocked on Mark suppressing two GHL workflows in the UI.**
 
 All figures measured against production LP Supabase on 2026-08-29. The live
 15-minute sync moves them by tens of rows per hour; re-measure with
