@@ -39,7 +39,7 @@ assert.equal(isSelectish(null), false);
 }
 
 // ─── the truncated shapes the old server produces are REFUSED ────
-// These are the exact values a pre-013 instance returns; each one would
+// These are the exact values an un-migrated (009-body) instance returns; each would
 // otherwise be used as if it were a complete result.
 for (const truncated of [
   273,                                   // multi-column count aggregate

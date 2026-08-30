@@ -55,7 +55,7 @@ export function isSelectish(queryText) {
  * Throw unless a SELECT came back as a row array.
  *
  * Pure so it can be tested without a Supabase client. See the note on
- * hlRunSQL: a non-array here means HL's run_sql is still the pre-013 body,
+ * hlRunSQL: a non-array here means HL's run_sql is still the original 009 body,
  * which answers a multi-column SELECT with its first column and drops the
  * rest. There is no safe way to use that value, so this refuses it.
  */
