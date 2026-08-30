@@ -85,10 +85,14 @@ export function startLpContactBackstopScheduler() {
 /**
  * Intake sweep. FORWARD-ONLY by construction: suppressOutbound is false and
  * the lookback is the env window, so this never reaches into the historical
- * backlog. Draining the 8,331-lead backlog is a deliberate, separately
- * approved act via POST /admin/lp-intake-backstop with an explicit
- * lookback_hours + suppress_outbound:true — never something a scheduler does
- * on its own.
+ * backlog. Draining the backlog is a deliberate, separately approved act via
+ * POST /admin/lp-intake-backstop with an explicit lookback_hours +
+ * suppress_outbound:true — never something a scheduler does on its own.
+ *
+ * A backfill targeting a CLOSED window must also pass until_iso. lookback_hours
+ * is a lower bound only; without an upper bound a deep lookback also sweeps
+ * everything since, and any of those leads inside fresh_hours would be created
+ * UN-suppressed. See makeIntakeWindowGate in the service module.
  *
  * Offset 8 min from the appointment sweep so the two never contend for the
  * GHL token bucket on the same tick.
@@ -175,6 +179,29 @@ export function registerLpContactBackstopRoutes(app) {
     const freshHours = Number.isFinite(parseInt(body.fresh_hours, 10)) ? parseInt(body.fresh_hours, 10) : INTAKE_FRESH_HOURS;
     const suppressOutbound = body.suppress_outbound === true;
     const limit = parseInt(body.limit, 10) || 0;
+    const maxPerRun = Math.max(1, parseInt(body.max_per_run, 10) || INTAKE_MAX_PER_RUN);
+
+    // Upper bound on created_at_lp. lookback_hours is a LOWER bound only, which
+    // is right for the forward-only sweep but wrong for a bounded backfill: a
+    // lookback deep enough to reach an old window also sweeps everything since,
+    // and anything inside fresh_hours would be created UN-suppressed — a
+    // speed-to-lead text the run was never scoped to send.
+    //
+    // An unparseable value is a 400, never a silent fall-through to unbounded:
+    // degrading quietly here widens the run, which is the exact failure this
+    // parameter exists to prevent.
+    let untilIso = null;
+    if (body.until_iso != null && body.until_iso !== '') {
+      const t = Date.parse(body.until_iso);
+      if (!Number.isFinite(t)) {
+        return res.status(400).json({
+          ok: false,
+          error: 'invalid_until_iso',
+          detail: `until_iso is not a parseable date: ${String(body.until_iso).slice(0, 64)}`,
+        });
+      }
+      untilIso = new Date(t).toISOString();
+    }
 
     if (!supabase) return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
 
@@ -189,7 +216,7 @@ export function registerLpContactBackstopRoutes(app) {
     setImmediate(async () => {
       try {
         await runLpIntakeBackstop({
-          dryRun, lookbackHours, maxPerRun: INTAKE_MAX_PER_RUN, freshHours, suppressOutbound, limit, job,
+          dryRun, lookbackHours, maxPerRun, freshHours, suppressOutbound, limit, untilIso, job,
         });
       } catch (err) {
         job.status = 'failed';
@@ -204,9 +231,10 @@ export function registerLpContactBackstopRoutes(app) {
       job_id: jobId,
       dry_run: dryRun,
       lookback_hours: lookbackHours,
+      until_iso: untilIso,
       fresh_hours: freshHours,
       suppress_outbound: suppressOutbound,
-      max_per_run: INTAKE_MAX_PER_RUN,
+      max_per_run: maxPerRun,
       status_url: `/admin/lp-contact-backstop/${jobId}`,
       message: dryRun
         ? 'Dry-run in progress (GHL reads only, zero mutations). summary.lines shows would_tag per lead — check suppression + vendor attribution there before going live.'
