@@ -411,6 +411,24 @@ Required JSON structure:
   "reasoning": "<1-2 sentence explanation>"
 }
 
+APPOINTMENT-DAY OVERRIDE (highest precedence when it applies):
+Read appointment_phase from the context. When appointment_phase is
+"in_window" or "past" and the contact has just sent an inbound message,
+recommended_action MUST be "callback_request" — never "fast_track_booking"
+and never "continue_current". A booked homeowner who is texting during or
+after their own appointment window is not asking to be reassured and is not
+asking to be re-booked. They need a human on the phone, now. Set
+requested_fulfillment to "phone_call".
+
+When appointment_phase is "imminent" (the visit is within four hours),
+treat logistics questions — ETA, directions, gate codes, who is coming,
+"is this time firm" — as callback_request when the homeowner has asked the
+same thing more than once, and as continue_current on the first ask.
+
+NEVER state or imply a clock time without checking it against
+now.time_human. now.time_human is the current wall clock in Eastern Time.
+Any time you reference must be LATER than now.time_human.
+
 ═══════════════════════════════════════════════════════════════════
 CONVERSATION ACTIONS (Bot 2/3/4 consolidation) — WHEN TO USE EACH
 ═══════════════════════════════════════════════════════════════════
@@ -668,6 +686,15 @@ async function callClaude(messageText, context) {
 function buildContextSummary(context) {
   const parts = [];
 
+  // 2026-08-29 (Myron Thorner): the APPOINTMENT-DAY OVERRIDE in the system
+  // prompt reads now.time_human and appointment_phase. Neither was ever
+  // rendered here, so the analyzer had the date at best and never the hour.
+  // Stated first, before any lead data, because it frames everything below.
+  if (context.now?.time_human || context.now?.date_human) {
+    parts.push(`NOW: ${context.now.time_human || '(time unknown)'} on ${context.now.date_human || '(date unknown)'} (${context.now.tz || 'America/New_York'}).`);
+    parts.push(`Every clock time you reference must be LATER than ${context.now.time_human || 'the current time'}.`);
+  }
+
   if (context.lead) {
     parts.push(`Name: ${context.lead.name}`);
     parts.push(`Entry Source: ${context.lead.entry_source || 'unknown'}`);
@@ -692,6 +719,15 @@ function buildContextSummary(context) {
     if (context.lp.source) parts.push(`Lead Source: ${context.lp.source}${context.lp.source_detail ? ' / ' + context.lp.source_detail : ''}`);
     parts.push(`Demo Completed: ${context.lp.demo_completed ? 'YES' : 'no'}`);
     parts.push(`Appointment Set: ${context.lp.appointment_set ? 'YES' : 'no'}${context.lp.appointment_date ? ' — ' + context.lp.appointment_date : ''}`);
+    // Minute-grain phase — the signal the APPOINTMENT-DAY OVERRIDE routes on.
+    if (context.lp.appointment_phase) {
+      const mins = context.lp.appointment_minutes_delta;
+      const at = context.lp.appointment_time_human;
+      const rel = typeof mins === 'number'
+        ? (mins >= 0 ? `${mins} minutes from now` : `${Math.abs(mins)} minutes ago`)
+        : 'time of day not known';
+      parts.push(`appointment_phase: ${context.lp.appointment_phase}${at ? ` (starts ${at}, ${rel})` : ` (${rel})`}`);
+    }
     if (context.lp.closed_won) parts.push(`CLOSED WON — Job Value: $${context.lp.job_value || 0}`);
     if (context.lp.call_count) parts.push(`Call Count: ${context.lp.call_count}`);
 
@@ -1128,6 +1164,11 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
         // + 90d cooling, re-opened two minutes later by the cancel doctrine).
         // Emitted as a string for payload_field_eq's string comparison.
         appointment_active: context.lp?.appointment_set === true ? 'true' : 'false',
+        // 2026-08-29 (Myron Thorner): minute-grain phase so downstream rules and
+        // the audit log can tell "booked for next Tuesday" from "the rep is 40
+        // minutes late right now." Both were previously appointment_active=true.
+        appointment_phase: context.lp?.appointment_phase || null,
+        appointment_minutes_delta: context.lp?.appointment_minutes_delta ?? null,
       },
       priority: analysis.fast_track_eligible ? 'critical' :
                 analysis.engagement_quality === 'dnc' ? 'critical' :

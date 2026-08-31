@@ -71,7 +71,7 @@
  */
 
 import supabase from './supabase.js';
-import { appointmentDelta, formatDateHuman, APPOINTMENT_TZ } from './appointment-dates.js';
+import { appointmentDelta, appointmentPhase, formatDateHuman, formatTimeHuman, APPOINTMENT_TZ } from './appointment-dates.js';
 import { stripQuotedEmail } from './email-thread.js';
 import { channelOfMessage } from './agentic/reply-sender.js';
 
@@ -793,6 +793,9 @@ export async function buildLeadContext(ghlContactId, options = {}) {
   // appointment so the prompt never calls a past appointment "upcoming".
   const nowInstant = new Date();
   const apptDelta = appointmentDelta(lpLead?.appointment_date, nowInstant);
+  // 2026-08-29 (Myron Thorner): minute-grain phase. appointmentDelta is day
+  // grain and reported "not past" 37 minutes after the appointment started.
+  const apptPhase = appointmentPhase(lpLead?.appointment_date, nowInstant);
 
   // 2026-07-06: effective appointment state. The snapshot flag is stale
   // after a cancellation (never reset by any cancel path), so treat the
@@ -808,6 +811,10 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     now: {
       iso: nowInstant.toISOString(),
       date_human: formatDateHuman(nowInstant),
+      // 2026-08-29: the current WALL CLOCK, not just the date. Without this
+      // the prompt could reason about days but never about hours, and the
+      // responder offered callback windows that had already passed.
+      time_human: formatTimeHuman(nowInstant),
       tz: APPOINTMENT_TZ,
     },
     lead: {
@@ -902,6 +909,12 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       // Signed whole-day delta from today (ET); negative = past. null when no appt.
       appointment_is_past: apptCancelled ? null : (apptDelta ? apptDelta.is_past : null),
       appointment_days_delta: apptCancelled ? null : (apptDelta ? apptDelta.days_delta : null),
+      // Minute-grain phase: scheduled | imminent | in_window | past |
+      // today_time_unknown. Null when cancelled or no appointment.
+      appointment_phase: apptCancelled ? null : (apptPhase ? apptPhase.phase : null),
+      appointment_minutes_delta: apptCancelled ? null : (apptPhase ? apptPhase.minutes_delta : null),
+      appointment_time_human: apptCancelled ? null : (apptPhase ? apptPhase.appointment_time_human : null),
+      appointment_time_known: apptCancelled ? null : (apptPhase ? apptPhase.time_known : null),
       demo_completed: lpLead?.demo_completed || false,
       demo_date: lpLead?.demo_date || null,
       days_to_demo: lpLead?.days_to_demo || null,
