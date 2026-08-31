@@ -44,6 +44,7 @@ import { emitEvent } from './event-emitter.js';
 import { combineNotes } from './safe-notes.js';
 import { getLead } from './lp-client.js';
 import { isMilestoneAchieved } from './milestone-gate.js';
+import { mapJobFields, mapMilestoneChangeFields } from './lp-job-fields.js';
 import { selectFurthestMilestone } from './milestone-order.js';
 
 // ─── Skip counter for observability ──────────────────────────────
@@ -421,16 +422,35 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
   // Destructure the error, name the violated constraint, and stop: milestone
   // work against a missing parent cannot succeed, so continuing only produces
   // noise that masks this line.
+  // mapJobFields (src/lp-job-fields.js) supplies the ten columns that used to sit
+  // at 100% null, and replaces the old updated_at_lp line, which read
+  // 'lastchangedon' — a key that appears on ZERO job payloads. It returns a SPARSE
+  // object: shape-scoped keys (updated_at_lp, financing_company) are omitted when
+  // this payload cannot speak to them, so a Shape B sweep cannot blank a value only
+  // Shape A carries. Spread it; do not read fixed keys off it.
+  //
+  // It needs the current row because financing_company is Shape-B-only: without it
+  // a Shape A sweep of a known-financed job would find no finance evidence in hand
+  // and downgrade the row to whatever its status implied.
+  const { data: existingJob } = await supabase.from('lp_jobs')
+    .select('financing_company').eq('lp_job_id', jobId).maybeSingle();
+
   const { error: jobErr } = await supabase.from('lp_jobs').upsert({
     lp_job_id:       jobId,
     lp_lead_id:      lpLeadId,
-    ghl_contact_id:  ghlContactId || null,
+    // ghl_contact_id is OMITTED, not nulled, when the caller has none. The
+    // job-changes sweep calls this with ghlContactId=null for every record
+    // (src/sync-engine.js), so writing the null erased the link that the Tier A
+    // backfill copies down from lp_leads — measured 2026-08-31: 93 jobs sitting
+    // NULL against a linked parent lead, all of them Shape A, zero Shape B. That
+    // asymmetry is this code path. Same shape-scoped treatment as updated_at_lp.
+    ...(ghlContactId ? { ghl_contact_id: ghlContactId } : {}),
     job_status:      getField(job, 'jobstatus', 'JobStatus', 'job_status'),
     job_value:       jobValue,
     branch_code:     branchCode,
     rep_name:        getField(job, 'salesrepname', 'SalesRepName', 'rep_name'),
     created_at_lp:   lpDateToEastern(getField(job, 'entrydate', 'EntryDate')),
-    updated_at_lp:   lpDateToEastern(getField(job, 'lastchangedon', 'LastChangedOn')),
+    ...mapJobFields(job, existingJob || {}),
     synced_at:       new Date().toISOString(),
     raw_lp_data:     job,
   }, { onConflict: 'lp_job_id' });
@@ -517,6 +537,12 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
       act_date:    actDateEt,
       entered_by:  getField(ms, 'enteredby', 'EnteredBy', 'entered_by'),
       entered_on:  lpDateToEastern(getField(ms, 'enteredon', 'EnteredOn', 'entered_on')),
+      // This literal read 8 of the 10 keys LP sends per milestone, taking
+      // enteredby/enteredon and dropping lastchangedby/lastchangedon — which is why
+      // both columns were null across all 94,870 rows. Always emits both keys, null
+      // included: msRows is bulk-upserted as an ARRAY and PostgREST rejects a batch
+      // whose objects do not all carry the same keys.
+      ...mapMilestoneChangeFields(ms),
       synced_at:   new Date().toISOString(),
     };
     if (suppressThisFire) {
