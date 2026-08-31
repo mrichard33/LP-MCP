@@ -34,6 +34,31 @@
  *                  while a last name exists. Anything else is left as-is,
  *                  because a human may have renamed an opportunity deliberately.
  *
+ * ONE JOB'S VALUE IS NEVER WRITTEN TO TWO OPEN OPPORTUNITIES
+ * ----------------------------------------------------------
+ * A contact must hold at most one OPEN opportunity per pipeline — the invariant
+ * in src/actions/handlers/opportunities.js v5.0. The create path broke it: the
+ * 2026-08-31 dry run found 21 contacts holding 54 open P2 opportunities where 21
+ * should exist, all of them create-branch artifacts with identical names and
+ * null values ("Ron/georgia" five times, "Maryrita" five times, "Sue-ann" four).
+ *
+ * Writing the contact's job value to each of them would have inflated P2
+ * pipeline by $651,556 — 13.9% of everything this script was about to write. It
+ * is the same error the sum-of-jobs rule made, arriving from the other
+ * direction: not one opportunity counting many jobs, but one job counted by many
+ * opportunities.
+ *
+ * So the VALUE write is skipped for any contact holding more than one open
+ * opportunity in the pipeline, and those contacts are reported. Run
+ * scripts/dedupe-opportunities.js first; it abandons the losing duplicates and
+ * keeps the furthest-along, after which this script writes each value once.
+ *
+ * Name and source repairs are NOT skipped for them — those are harmless on a
+ * duplicate that is about to be abandoned, and leaving them broken helps nobody.
+ *
+ * This is a guard, not a running order. A script that inflates the pipeline when
+ * someone runs it before the dedupe is not correct, it is lucky.
+ *
  * CLOSED OPPORTUNITIES ARE OUT OF SCOPE, BY QUERY
  * -----------------------------------------------
  * Only status='open' rows are candidates. A won/lost/abandoned opportunity's
@@ -66,6 +91,7 @@ import { PIPELINE_IDS } from '../src/actions/constants.js';
 import { hlRunSQL } from '../src/admin/hl-client.js';
 import { latestJobValue } from '../src/lp-job-value.js';
 import supabase from '../src/supabase.js';
+import { pathToFileURL } from 'node:url';
 
 const args = process.argv.slice(2);
 const numericArg = (name, fallback) => {
@@ -118,7 +144,16 @@ async function fetchCandidates() {
     : 'AND (o.monetary_value IS NULL OR o.monetary_value = 0)';
   const rows = await hlRunSQL(`
     SELECT o.ghl_opportunity_id, o.ghl_contact_id, o.monetary_value, o.name, o.source,
-           c.first_name, c.last_name, c.source AS contact_source
+           c.first_name, c.last_name, c.source AS contact_source,
+           -- Counted over ALL open opportunities in the pipeline, not over the
+           -- candidate set: --fields=value narrows the rows below, and a contact
+           -- holding one valued opp plus one empty one is exactly the case the
+           -- duplicate guard exists to catch.
+           (SELECT count(*) FROM opportunities o2
+             WHERE o2.ghl_pipeline_id = o.ghl_pipeline_id
+               AND o2.ghl_contact_id = o.ghl_contact_id
+               AND o2.status = 'open'
+               AND o2.deleted_at IS NULL) AS open_opps_for_contact
       FROM opportunities o
       LEFT JOIN contacts c ON c.ghl_contact_id = o.ghl_contact_id
      WHERE o.ghl_pipeline_id = '${pipelineId}'
@@ -150,6 +185,28 @@ async function jobValuesByContact(contactIds) {
   return out;
 }
 
+/**
+ * Whether this opportunity's monetaryValue may be written, and if not, why.
+ *
+ * Pure and exported so the guards have unit coverage — the loop below reads as
+ * a dispatch on the answer rather than a nest of conditions, and a regression
+ * in the duplicate guard fails a test instead of quietly inflating pipeline.
+ *
+ * ORDER MATTERS. "no usable job" is decided before "duplicate", so a contact
+ * with neither is reported as the more basic problem rather than as a duplicate
+ * we would have written to if only it had a value.
+ *
+ * @returns {'write'|'skip_no_job'|'skip_duplicate'|'skip_ineligible'|'skip_unchanged'}
+ */
+export function valueWriteDecision({ value, currentValue, openOppsForContact, includeValued = false }) {
+  if (value === null || value === undefined) return 'skip_no_job';
+  if ((Number(openOppsForContact) || 1) > 1) return 'skip_duplicate';
+  const current = currentValue === null || currentValue === undefined ? null : Number(currentValue);
+  if (!includeValued && current !== null && current !== 0) return 'skip_ineligible';
+  if (current === value) return 'skip_unchanged';
+  return 'write';
+}
+
 const norm = (s) => (typeof s === 'string' ? s.trim() : '');
 
 /**
@@ -162,7 +219,7 @@ const norm = (s) => (typeof s === 'string' ? s.trim() : '');
  * "McDonald", "O'Brien" and "van Dyke" survive untouched. Hyphen and apostrophe
  * segments are capitalised individually: "o'brien" → "O'Brien".
  */
-function titleCasePart(part) {
+export function titleCasePart(part) {
   if (/[A-Z]/.test(part)) return part;
   return part.replace(/[^\s'-]+/g, (w) => w.charAt(0).toUpperCase() + w.slice(1));
 }
@@ -174,7 +231,7 @@ function titleCasePart(part) {
  * name, while a last name exists. "Wendel & Kathleen Kauffman" does not match
  * its contact's first name, so it is untouched — as is anything a human renamed.
  */
-function repairedName(opp) {
+export function repairedName(opp) {
   const first = norm(opp.first_name);
   const last  = norm(opp.last_name);
   const current = norm(opp.name);
@@ -187,7 +244,7 @@ function repairedName(opp) {
 }
 
 /** The source to fill in, or null when there is nothing to fill or it is already set. */
-function repairedSource(opp) {
+export function repairedSource(opp) {
   if (norm(opp.source)) return null;          // never overwrite
   const contactSource = norm(opp.contact_source);
   return contactSource || null;
@@ -208,8 +265,9 @@ async function main() {
 
   const stats = {
     written: 0, unchanged: 0, failed: 0,
-    value: 0, source: 0, name: 0, skipped_no_job: 0,
+    value: 0, source: 0, name: 0, skipped_no_job: 0, skipped_duplicate_opps: 0,
   };
+  const duplicateContacts = new Set();
   let plannedTotal = 0;
   let shown = 0;
 
@@ -219,17 +277,25 @@ async function main() {
 
     if (opt.doValue) {
       const value = values.get(opp.ghl_contact_id) ?? null;
-      if (value === null) {
+      const decision = valueWriteDecision({
+        value,
+        currentValue: opp.monetary_value,
+        openOppsForContact: opp.open_opps_for_contact,
+        includeValued: opt.includeValued,
+      });
+      if (decision === 'skip_no_job') {
         stats.skipped_no_job++;
-      } else {
+      } else if (decision === 'skip_duplicate') {
+        // One job's value onto several open opportunities would inflate the
+        // pipeline by exactly the duplicate. Dedupe first.
+        stats.skipped_duplicate_opps++;
+        duplicateContacts.add(opp.ghl_contact_id);
+      } else if (decision === 'write') {
         const current = opp.monetary_value === null ? null : Number(opp.monetary_value);
-        const eligible = opt.includeValued || current === null || current === 0;
-        if (eligible && current !== value) {
-          body.monetaryValue = value;
-          changes.push(`value ${current ?? 'null'} → ${value}`);
-          plannedTotal += value;
-          stats.value++;
-        }
+        body.monetaryValue = value;
+        changes.push(`value ${current ?? 'null'} → ${value}`);
+        plannedTotal += value;
+        stats.value++;
       }
     }
 
@@ -269,8 +335,18 @@ async function main() {
   console.log(`nothing to change   ${stats.unchanged}`);
   console.log(`no usable job       ${stats.skipped_no_job}`);
   console.log(`failed              ${stats.failed}`);
+  if (stats.skipped_duplicate_opps > 0) {
+    console.log(`\nvalue SKIPPED on ${stats.skipped_duplicate_opps} opportunities across ${duplicateContacts.size} contacts`);
+    console.log(`holding more than one OPEN ${opt.pipeline} opportunity. Writing one job's`);
+    console.log(`value to each would inflate pipeline by exactly the duplicate.`);
+    console.log(`Run scripts/dedupe-opportunities.js --pipeline=${opt.pipeline} first, then re-run this.`);
+  }
   console.log(`total value ${opt.apply ? 'added' : 'to add'}: $${plannedTotal.toLocaleString()}`);
   console.log(`\n[OppRepair] done${opt.apply ? '' : ' — DRY RUN, nothing written. Re-run with --apply to write.'}`);
 }
 
-main().catch(err => { console.error('[OppRepair] FAILED:', err.message); process.exit(1); });
+// Run only when invoked directly — importing this module for its pure helpers
+// (scripts/test-backfill-opportunity-values.js) must not start a GHL run.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(err => { console.error('[OppRepair] FAILED:', err.message); process.exit(1); });
+}
