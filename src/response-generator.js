@@ -244,6 +244,7 @@ import {
   persistPreferredTime,
 } from './services/preferred-time.js';
 import { hasActiveBooking, isPostDemoDecline } from './agentic/lead-state/signals/context-reader.js';
+import { buildNepqBlock } from './agentic/nepq-layer.js';
 import { fetchUpcomingAppointments, formatAppointmentsForPrompt } from './knowledge/contact-appointments.js';
 import {
   resolveBookingCalendar,
@@ -1723,6 +1724,14 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   if (classification.reasoning) parts.push(`Classifier reasoning: ${classification.reasoning}`);
 
   parts.push(`\nTRAFFIC TEMPERATURE: ${trafficTemp.toUpperCase()} — calibrate hook intensity per Traffic Secrets section.`);
+
+  // 2026-08-29 — NEPQ conversation discipline. Refines the Chatbot channel
+  // inside the Antifragile framework; the commitment gate inside turns
+  // discovery OFF for booked contacts. Kill switch: NEPQ_LAYER_MODE=off.
+  // Placed after the date/time frame and the stage signals above, so the
+  // questioning discipline is chosen against a context the model already has.
+  const nepqBlock = buildNepqBlock(context);
+  if (nepqBlock) parts.push(nepqBlock);
 
   // Acknowledgment-only conduct is decided BEFORE the email opener, because it
   // suppresses the handoff bridge outright: a two-sentence escalation
