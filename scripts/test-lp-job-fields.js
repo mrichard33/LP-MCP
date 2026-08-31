@@ -127,6 +127,69 @@ test('job_stage derives the schema vocabulary from milestone codes', () => {
   assert.equal(stageOf([]),              null);
 });
 
+test('a Scheduled job with a FUTURE Install End is not "complete"', () => {
+  // LP records scheduled actuals, so a job booked for next week carries a real
+  // future F actdate. install_completed_date must keep it; job_stage must not
+  // claim the stage was reached. "Scheduled / complete" is wrong in English, and
+  // job_stage is read by people who do not check the dates underneath it.
+  const f = mapJobFields(shapeA({
+    jobstatus: 'Scheduled',
+    milestones: [
+      milestone('K', 'Ordered',     { actdate: '2026-07-01T00:00:00' }),
+      milestone('S', 'Start',       { actdate: '2026-09-07T00:00:00' }),
+      milestone('F', 'Install End', { actdate: '2026-09-07T00:00:00' }),
+    ],
+  }), {}, NOW);
+  assert.notEqual(f.job_stage, 'complete');
+  assert.equal(f.job_stage, 'production');            // falls through to what HAS passed
+  assert.equal(f.install_date,           '2026-09-07T00:00:00+00:00');
+  assert.equal(f.install_completed_date, '2026-09-07T00:00:00+00:00');
+});
+
+test('a future Start falls through to production rather than reading install', () => {
+  const f = mapJobFields(shapeA({
+    milestones: [
+      milestone('G', 'Received All Product', { actdate: '2026-08-01T00:00:00' }),
+      milestone('S', 'Start',                { actdate: '2026-10-13T00:00:00' }),
+    ],
+  }), {}, NOW);
+  assert.equal(f.job_stage, 'production');
+  assert.equal(f.install_date, '2026-10-13T00:00:00+00:00');
+});
+
+test('a job whose only milestones are all in the future has no stage at all', () => {
+  const f = mapJobFields(shapeA({
+    milestones: [milestone('S', 'Start', { actdate: '2026-09-20T00:00:00' })],
+  }), {}, NOW);
+  assert.equal(f.job_stage, null);
+  assert.equal(f.install_date, '2026-09-20T00:00:00+00:00');
+});
+
+test('a PASSED Install End still reads complete', () => {
+  // The gate must not swallow genuinely finished work — 0 Paid In Full jobs moved.
+  const f = mapJobFields(shapeA({
+    jobstatus: 'Paid In Full',
+    milestones: [
+      milestone('S', 'Start',       { actdate: '2026-08-20T00:00:00' }),
+      milestone('F', 'Install End', { actdate: '2026-08-21T00:00:00' }),
+    ],
+  }), {}, NOW);
+  assert.equal(f.job_stage, 'complete');
+});
+
+test('a passed Completion outranks a future Install End', () => {
+  // The real Paid In Full shape: C landed, F is stamped out to 2026-12-29.
+  const f = mapJobFields(shapeA({
+    jobstatus: 'Paid In Full',
+    milestones: [
+      milestone('C', 'Completion',  { actdate: '2026-08-22T00:00:00' }),
+      milestone('F', 'Install End', { actdate: '2026-12-29T00:00:00' }),
+    ],
+  }), {}, NOW);
+  assert.equal(f.job_stage, 'complete');
+  assert.equal(f.install_completed_date, '2026-12-29T00:00:00+00:00');
+});
+
 test('job_stage ignores stg_id entirely', () => {
   // stg_id is "0" on 3,534 of 3,583 Shape A rows — no stage information at all.
   const f = mapJobFields(shapeA({ stg_id: '7', milestones: [] }), {}, NOW);

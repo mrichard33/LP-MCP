@@ -27,17 +27,29 @@
  *   --milestones-only  Skip the lp_jobs pass
  *   --batch=N          Rows per milestone UPDATE statement (default 1000)
  *
- * EXPECTED DRY-RUN OUTPUT (measured 2026-08-31, ±10 as the sync writes):
- *   rep_id 5,559 | updated_at_lp 3,583 | financing_company 918
- *   financing_status 1,310 | hoa_required 3,717 | permit_required 5,368
- *   permit_status 4,236 | job_stage 4,592 | install_date 3,907
- *   install_completed_date 2,283 | milestones last_changed 57,654
- * A material divergence means the mapper disagrees with the validated projection.
- * Stop and diff rather than proceeding.
+ * EXPECTED OUTPUT (measured 2026-08-31, ±10 as the live sync keeps writing):
  *
- * Idempotency: the mapper is deterministic and the script writes only rows whose
- * computed values differ from what is stored. Safe to re-run; a second run reports
- * zero changes.
+ *   --jobs-only        rep_id 5,562 | updated_at_lp 3,604 | financing_company 916
+ *                      financing_status 1,314 | hoa_required 3,719
+ *                      permit_required 5,375 | permit_status 4,242
+ *                      job_stage 4,594 | install_date 3,909
+ *                      install_completed_date 2,284
+ *   --milestones-only  entries scanned 94,918 | with last_changed 57,770
+ *
+ * The jobs pass has already run once, so a re-run should report few or no changes;
+ * `job_stage` is the exception until the passed-date gate is deployed, which moves
+ * 47 rows (46 of them job_status 'Scheduled') off a stage they had not reached.
+ *
+ * Two numbers are load-bearing. If `install_date` comes back anywhere near the row
+ * count the mapper is reading `estdate` — stop there. If the milestone pass reports
+ * materially fewer than 57,770 mappable, the payload is not what it was measured to
+ * be. Either way, diff rather than proceeding.
+ *
+ * Idempotency: the mapper is deterministic and both passes write only rows whose
+ * computed values differ from what is stored. Safe to re-run. Note the milestone
+ * pass reports rows SENT, not rows changed — a re-run will report the full 57,770
+ * while changing nothing, which is why it reads the real post-state back from the
+ * table and prints that too.
  *
  * Pre-conditions: none. No migration, no new column, no env var. The columns exist
  * (sql/schema.sql) and are nullable with no default.
@@ -160,7 +172,12 @@ async function backfillJobs() {
  * supabase.rpc() directly — see sql/README.md.
  */
 async function backfillMilestones() {
-  let scanned = 0, pending = 0, written = 0;
+  // `sent` is rows PUT ON THE WIRE, not rows changed. The statement's WHERE clause
+  // only touches rows that actually differ, so on a second run this reports the full
+  // 57,770 while changing nothing. Reporting it as "written" would quietly contradict
+  // the idempotency guarantee exactly when someone is leaning on it — so the real
+  // post-state is read back from the table at the end instead.
+  let scanned = 0, pending = 0, sent = 0;
   let from = 0;
   let buffer = [];
 
@@ -182,7 +199,7 @@ async function backfillMilestones() {
            AND (m.last_changed_by IS DISTINCT FROM COALESCE(v.last_changed_by, m.last_changed_by)
              OR m.last_changed_on IS DISTINCT FROM COALESCE(v.last_changed_on, m.last_changed_on));
       `);
-      written += buffer.length;
+      sent += buffer.length;
     }
     buffer = [];
   };
@@ -220,14 +237,27 @@ async function backfillMilestones() {
       }
     }
 
-    console.log(`[Backfill:milestones] entries scanned ${scanned}, mappable ${pending}${opt.dryRun ? ' (dry-run)' : `, written ${written}`}`);
+    console.log(`[Backfill:milestones] entries scanned ${scanned}, mappable ${pending}${opt.dryRun ? ' (dry-run)' : `, sent ${sent}`}`);
     if (opt.jobId) break;
     if (rows.length < PAGE_SIZE) break;
     from += PAGE_SIZE;
   }
 
   await flush();
-  return { scanned, pending, written };
+
+  // Read the real post-state back rather than inferring it from what we sent.
+  let populated = null;
+  if (!opt.dryRun) {
+    try {
+      const rows = await runSQL(
+        'SELECT count(*)::int AS n FROM lp_job_milestones WHERE last_changed_on IS NOT NULL;'
+      );
+      populated = Array.isArray(rows) ? (rows[0]?.n ?? null) : (rows?.n ?? null);
+    } catch (err) {
+      console.warn(`[Backfill:milestones] post-state count failed: ${err.message}`);
+    }
+  }
+  return { scanned, pending, sent, populated };
 }
 
 async function main() {
@@ -246,7 +276,10 @@ async function main() {
   if (!opt.jobsOnly) {
     const ms = await backfillMilestones();
     console.log('\n─── lp_job_milestones ─────────────────────────');
-    console.log(`entries scanned ${ms.scanned} | with last_changed ${ms.pending} | written ${ms.written}`);
+    console.log(`entries scanned ${ms.scanned} | with last_changed ${ms.pending} | rows sent ${ms.sent}`);
+    if (ms.populated !== null && ms.populated !== undefined) {
+      console.log(`last_changed_on populated in table: ${ms.populated}`);
+    }
   }
 
   console.log(`\n[Backfill] done${opt.dryRun ? ' — DRY RUN, nothing written' : ''}`);

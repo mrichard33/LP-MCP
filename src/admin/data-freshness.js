@@ -43,6 +43,7 @@ import supabase from '../supabase.js';
 import { getJobStatusChanges, probeLeadEndpoints, getLeadByLdsId, getCircuitStatus } from '../lp-client.js';
 import { sendGroupMeMessage } from '../groupme.js';
 import { extractArray, getField } from '../sync-utils.js';
+import { runSQL } from './supabase-admin.js';
 
 // ─── Configuration ──────────────────────────────────────────────────
 // Per-table freshness thresholds. Tuned to typical update cadence:
@@ -83,6 +84,23 @@ const GROUPME_ALERTS_DISABLED = (process.env.FRESHNESS_GROUPME_ALERTS_DISABLED |
 // the count of drifted rows exceeds FRESHNESS_FIELD_DRIFT_LIMIT.
 const FIELD_DRIFT_SAMPLE = parseInt(process.env.FRESHNESS_FIELD_DRIFT_SAMPLE || '25', 10);
 const FIELD_DRIFT_LIMIT  = parseInt(process.env.FRESHNESS_FIELD_DRIFT_LIMIT  || '3', 10);
+
+// Date-inversion probe: jobs whose install_completed_date precedes install_date —
+// an install that finished before it started. Measured 2026-08-31 immediately after
+// the lp_jobs field backfill: 19 rows, 18 of them Paid In Full (work done and paid,
+// dates keyed wrong in LP) plus one one-day inversion that reads as a typo.
+//
+// This is LP SOURCE data. The mapper reads both values from milestone actdates and
+// correcting them would mean inventing data, so this check exists to keep the number
+// VISIBLE, not to fix it. Alert only when it grows past the accepted baseline —
+// following the named-residual precedent in src/jobs/lp-report-recon.js:66.
+export const JOB_DATE_INVERSION_BASELINE =
+  parseInt(process.env.FRESHNESS_JOB_DATE_INVERSION_BASELINE || '19', 10);
+// Freshness runs every 30 min; this is a slow-moving warehouse invariant and a full
+// lp_jobs scan. Once an hour is plenty — 48 scans/day buys nothing.
+const JOB_DATE_INVERSION_MIN_INTERVAL_MS = 60 * 60 * 1000;
+let _lastInversionCheck = 0;
+let _lastInversionResult = null;
 
 // ─── Per-table check ────────────────────────────────────────────────
 
@@ -241,6 +259,38 @@ export async function checkFieldDrift({ sample = FIELD_DRIFT_SAMPLE } = {}) {
   }
 }
 
+// ─── Job date inversion ─────────────────────────────────────────────
+// Counts lp_jobs rows where the install finished before it started, and compares
+// against an accepted baseline. Same count-vs-threshold shape as checkFieldDrift.
+//
+// runSQL, not a supabase-js filter: PostgREST cannot compare one column to another,
+// so `install_completed_date < install_date` is not expressible through .lt(). runSQL
+// throws on failure (supabase.rpc reports errors in its return value without
+// throwing) — see sql/README.md.
+export async function checkJobDateInversion({ force = false } = {}) {
+  const now = Date.now();
+  if (!force && _lastInversionResult && now - _lastInversionCheck < JOB_DATE_INVERSION_MIN_INTERVAL_MS) {
+    return { ..._lastInversionResult, cached: true };
+  }
+  try {
+    const rows = await runSQL(
+      'SELECT count(*)::int AS inverted FROM lp_jobs WHERE install_completed_date < install_date;'
+    );
+    const count = Array.isArray(rows) ? (rows[0]?.inverted ?? 0) : (rows?.inverted ?? 0);
+    const result = {
+      status:   count > JOB_DATE_INVERSION_BASELINE ? 'inverted' : 'ok',
+      count,
+      baseline: JOB_DATE_INVERSION_BASELINE,
+      delta:    count - JOB_DATE_INVERSION_BASELINE,
+    };
+    _lastInversionCheck = now;
+    _lastInversionResult = result;
+    return result;
+  } catch (err) {
+    return { status: 'error', error_message: err.message };
+  }
+}
+
 // ─── Alert dedup ────────────────────────────────────────────────────
 
 async function shouldAlert(tableName) {
@@ -263,6 +313,7 @@ export async function runFreshnessCheck({ alert = true } = {}) {
   const results = await checkFreshness();
   const watermark = await checkSyncWatermarkHealth();
   const fieldDrift = await checkFieldDrift();
+  const dateInversion = await checkJobDateInversion();
   const stale = results.filter(r => r.status === 'stale' || r.status === 'empty' || r.status === 'error');
   const alerted = [];
 
@@ -369,6 +420,29 @@ export async function runFreshnessCheck({ alert = true } = {}) {
         console.warn(`[Freshness] field-drift alert failed: ${err.message}`);
       }
     }
+
+    // Job date-inversion alert (install finished before it started — LP source data,
+    // tracked not repaired). Fires only above the accepted baseline.
+    if (dateInversion.status === 'inverted') {
+      try {
+        if (await shouldAlert('__job_date_inversion__')) {
+          const human = `lp_jobs date inversion: ${dateInversion.count} jobs have install_completed_date before install_date, up ${dateInversion.delta} on the accepted baseline of ${dateInversion.baseline}. LP source data — check what is keying these dates, do not repair in the mapper.`;
+          const sendResult = GROUPME_ALERTS_DISABLED
+            ? { sent: false, suppressed: true }
+            : await sendGroupMeMessage(`\u26a0\ufe0f LP JOB DATE INVERSION\n${human}`);
+          await supabase.from('data_freshness_log').insert({
+            table_name:    '__job_date_inversion__',
+            status:        'stale',
+            severity:      'warning',
+            error_message: sendResult?.sent ? human : `${human} [GroupMe alert suppressed by FRESHNESS_GROUPME_ALERTS_DISABLED]`,
+            alerted_at:    sendResult?.sent ? new Date().toISOString() : null,
+          });
+          if (sendResult?.sent) alerted.push('__job_date_inversion__');
+        }
+      } catch (err) {
+        console.warn(`[Freshness] date-inversion alert failed: ${err.message}`);
+      }
+    }
   }
 
   return {
@@ -376,6 +450,7 @@ export async function runFreshnessCheck({ alert = true } = {}) {
     table_results: results,
     sync_watermark: watermark,
     field_drift: fieldDrift,
+    job_date_inversion: dateInversion,
     stale_count: stale.length,
     alerted,
     groupme_alerts_disabled: GROUPME_ALERTS_DISABLED,
@@ -464,13 +539,19 @@ export function registerDataFreshnessRoutes(app) {
       // (?drift=1). The scheduled freshness-check always runs it.
       const wantDrift = req.query?.drift === '1' || req.query?.drift === 'true';
       const fieldDrift = wantDrift ? await checkFieldDrift() : null;
+      // Date-inversion is a plain DB count with no LP call, so unlike field-drift it
+      // runs unconditionally here. Its own hourly guard keeps the scan cheap.
+      const dateInversion = await checkJobDateInversion();
       const stale = results.filter(r => r.status === 'stale' || r.status === 'empty' || r.status === 'error');
       res.json({
         checked_at: new Date().toISOString(),
-        all_fresh: stale.length === 0 && watermark.status !== 'stuck' && (!fieldDrift || fieldDrift.status !== 'drift'),
+        all_fresh: stale.length === 0 && watermark.status !== 'stuck'
+                   && (!fieldDrift || fieldDrift.status !== 'drift')
+                   && dateInversion.status !== 'inverted',
         stale_count: stale.length,
         sync_watermark: watermark,
         field_drift: fieldDrift,
+        job_date_inversion: dateInversion,
         groupme_alerts_disabled: GROUPME_ALERTS_DISABLED,
         results,
       });
