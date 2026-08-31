@@ -111,11 +111,49 @@ function jobIdRank(lpJobId) {
 }
 
 /**
- * The value of the contact's most recent non-cancelled job. Pure — no I/O, no clock.
+ * The contact's most recent non-cancelled job ROW, or null. Pure — no I/O, no clock.
  *
  * Cancelled jobs are filtered BEFORE the most-recent pick, so a contact whose
  * newest job was cancelled falls through to their most recent live one rather
- * than reporting zero.
+ * than reporting nothing.
+ *
+ * ONE DEFINITION OF "MOST RECENT NON-CANCELLED", USED BY EVERYONE
+ * ---------------------------------------------------------------
+ * Extracted from latestJobValue 2026-08-31 so
+ * scripts/reconcile-p2-stages.js decides which job an opportunity tracks by
+ * the SAME rule this module already uses for value, rather than growing a
+ * second copy of it that can drift. The reconciler needs the row (its status
+ * and its milestones), not the number.
+ *
+ * `requireValue` is what keeps that extraction behaviour-preserving. Value
+ * callers must skip a job with no parseable job_value and fall through to an
+ * older one that has a number; the reconciler must NOT, because a job with no
+ * value is still the job the opportunity is tracking. Passing the flag rather
+ * than filtering in the caller keeps the fall-through inside the ranking loop,
+ * which is the only place it can be done correctly.
+ *
+ * @param {Array<{lp_job_id?: string|number|null, job_status?: string, job_value?: number|string|null}>} jobs
+ * @param {{requireValue?: boolean}} [opts]
+ * @returns {object|null}
+ */
+export function latestJob(jobs = [], { requireValue = false } = {}) {
+  let best = null;
+  for (const job of jobs) {
+    if (!job) continue;
+    const status = typeof job.job_status === 'string' ? job.job_status.trim() : '';
+    if (CANCELLED_JOB_STATUSES.has(status)) continue;
+    if (requireValue && !Number.isFinite(parseFloat(job.job_value))) continue;
+    const rank = jobIdRank(job.lp_job_id);
+    const tie = job.lp_job_id == null ? '' : String(job.lp_job_id);
+    if (best === null || rank > best.rank || (rank === best.rank && tie > best.tie)) {
+      best = { rank, tie, job };
+    }
+  }
+  return best === null ? null : best.job;
+}
+
+/**
+ * The value of the contact's most recent non-cancelled job. Pure — no I/O, no clock.
  *
  * Returns null, NOT 0, when nothing qualifies: the caller must be able to tell
  * "this contact has no live work" from "this contact's work is worth zero", so
@@ -126,22 +164,10 @@ function jobIdRank(lpJobId) {
  * @returns {number|null}
  */
 export function latestJobValue(jobs = []) {
-  let best = null;
-  for (const job of jobs) {
-    if (!job) continue;
-    const status = typeof job.job_status === 'string' ? job.job_status.trim() : '';
-    if (CANCELLED_JOB_STATUSES.has(status)) continue;
-    const value = parseFloat(job.job_value);
-    if (!Number.isFinite(value)) continue;
-    const rank = jobIdRank(job.lp_job_id);
-    const tie = job.lp_job_id == null ? '' : String(job.lp_job_id);
-    if (best === null || rank > best.rank || (rank === best.rank && tie > best.tie)) {
-      best = { rank, tie, value };
-    }
-  }
-  if (best === null) return null;
+  const job = latestJob(jobs, { requireValue: true });
+  if (job === null) return null;
   // LP money is 2dp; job_value arrives as a string often enough to be worth it.
-  return Math.round(best.value * 100) / 100;
+  return Math.round(parseFloat(job.job_value) * 100) / 100;
 }
 
 /**
