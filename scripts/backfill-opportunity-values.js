@@ -209,6 +209,9 @@ export function valueWriteDecision({ value, currentValue, openOppsForContact, in
 
 const norm = (s) => (typeof s === 'string' ? s.trim() : '');
 
+/** Collapse runs of internal whitespace so "Alex  Ivelic" and "Alex Ivelic" compare equal. */
+const squash = (s) => norm(s).replace(/\s+/g, ' ');
+
 /**
  * Title-case a name part that LP stored lowercase, and ONLY such a part.
  *
@@ -218,29 +221,66 @@ const norm = (s) => (typeof s === 'string' ? s.trim() : '');
  * that already contains an uppercase letter is left exactly as it is, so
  * "McDonald", "O'Brien" and "van Dyke" survive untouched. Hyphen and apostrophe
  * segments are capitalised individually: "o'brien" → "O'Brien".
+ *
+ * SLASH AND COMMA COUNT AS SEPARATORS. LP stores a couple in one field as
+ * "kent/earlene" or "brian,stephanie". Treating that as a single token
+ * capitalises only the first letter and lowercases the second person —
+ * "Kent/earlene", "Brian,stephanie" — which is how 27 of the planned rewrites
+ * came out damaged on the 2026-08-31 dry run.
  */
 export function titleCasePart(part) {
   if (/[A-Z]/.test(part)) return part;
-  return part.replace(/[^\s'-]+/g, (w) => w.charAt(0).toUpperCase() + w.slice(1));
+  return part.replace(/[^\s'\-,/]+/g, (w) => w.charAt(0).toUpperCase() + w.slice(1));
 }
+
+/** True when a name carries letters and not one of them is lowercase. */
+const isAllCaps = (s) => /[A-Z]/.test(s) && !/[a-z]/.test(s);
 
 /**
  * The full name this opportunity should carry, or null to leave it alone.
  *
- * Rewrites ONLY the degraded shape the create path produced: the bare first
- * name, while a last name exists. "Wendel & Kathleen Kauffman" does not match
- * its contact's first name, so it is untouched — as is anything a human renamed.
+ * Rewrites only two unambiguously degraded shapes:
+ *   (a) the bare first name, while a last name exists — the create-path artifact;
+ *   (b) already the contact's full name, but differing only in spacing or case.
+ *
+ * Anything else is left exactly as it is. In particular an opportunity naming
+ * two people ("Brenda & Michael Patton") is RICHER than the contact record,
+ * which holds only "brenda"/"patton" — rewriting it would delete the spouse
+ * from 535 records. That is a decision, not an oversight. Do not "improve" it
+ * by matching on the first name appearing anywhere in the current name.
  */
 export function repairedName(opp) {
-  const first = norm(opp.first_name);
-  const last  = norm(opp.last_name);
-  const current = norm(opp.name);
+  const first   = squash(opp.first_name);
+  const last    = squash(opp.last_name);
+  const current = squash(opp.name);
   if (!first || !last || !current) return null;
-  // GHL title-cases the display name while LP often stores it lowercase, so the
-  // comparison has to be case-insensitive or nothing matches.
-  if (current.toLowerCase() !== first.toLowerCase()) return null;
+
   const full = `${titleCasePart(first)} ${titleCasePart(last)}`;
-  return full === current ? null : full;
+  const cur  = current.toLowerCase();
+
+  const isBareFirst = cur === first.toLowerCase();
+
+  // Shape (b), and the line that decides what it may touch.
+  //
+  // Spacing-only is always safe: the letters are identical, only the gaps move.
+  //
+  // A CASE difference is only safe when the current name is ALL CAPS, where the
+  // contact record is strictly more informative. On a mixed-case name the
+  // opportunity is usually the BETTER record — LP stores "mcleod" flat while
+  // the opportunity carries "McLeod" — so rewriting flattens it. The
+  // titleCasePart guard cannot catch this: it inspects the contact's part,
+  // which is lowercase, not the name being replaced. Measured 2026-08-31: 32
+  // mixed-case rewrites, most of them losses (McLeod→Mcleod,
+  // DiChristopher→Dichristopher, LaVita→Lavita). Never re-case mixed case.
+  let isSameNameDifferentForm = false;
+  if (!isBareFirst && cur === full.toLowerCase()) {
+    isSameNameDifferentForm = current === full || isAllCaps(current);
+  }
+  if (!isBareFirst && !isSameNameDifferentForm) return null;
+
+  // Compare against the ORIGINAL trimmed name, not the squashed one, so a
+  // spacing-only difference still counts as a change worth writing.
+  return full === norm(opp.name) ? null : full;
 }
 
 /** The source to fill in, or null when there is nothing to fill or it is already set. */
@@ -270,6 +310,12 @@ async function main() {
   const duplicateContacts = new Set();
   let plannedTotal = 0;
   let shown = 0;
+  // The sample cap exists so an --apply run's log stays readable. On a
+  // name-only DRY run it defeats the point: the documented safety check greps
+  // this output for a rewrite touching an "&" or "/" name, and a 15-line
+  // sample silently passes however bad the other 372 are. Print all of them.
+  const sampleCap = (!opt.apply && opt.doName && !opt.doValue && !opt.doSource)
+    ? Infinity : 15;
 
   for (const opp of candidates) {
     const body = {};
@@ -313,7 +359,7 @@ async function main() {
 
     if (!opt.apply) {
       stats.written++;
-      if (shown++ < 15) console.log(`  would update ${opp.ghl_opportunity_id}: ${changes.join('; ')}`);
+      if (shown++ < sampleCap) console.log(`  would update ${opp.ghl_opportunity_id}: ${changes.join('; ')}`);
       continue;
     }
 

@@ -120,6 +120,54 @@ test('matching is case-insensitive because GHL title-cases what LP stores lower'
   assert.equal(repairedName(nameRow('Kelly', 'kelly', 'stahley')), 'Kelly Stahley');
 });
 
+test('a spacing-only difference is normalised', () => {
+  assert.equal(repairedName(nameRow('Alex  Ivelic', 'alex', 'ivelic')), 'Alex Ivelic');
+  assert.equal(repairedName(nameRow('Mary\tJane Okonkwo', 'mary jane', 'okonkwo')), 'Mary Jane Okonkwo');
+});
+
+test('an all-caps name that matches the contact is normalised', () => {
+  assert.equal(repairedName(nameRow('JOHN SMITH', 'john', 'smith')), 'John Smith');
+});
+
+test('an opportunity naming TWO people is never collapsed to one', () => {
+  // 535 records. The opportunity carries the household; the contact carries
+  // one person. Rewriting these would delete the co-signer.
+  assert.equal(repairedName(nameRow('Brenda & Michael Patton', 'brenda', 'patton')), null);
+  assert.equal(repairedName(nameRow('Cheryl/Mark Miller', 'cheryl', 'miller')), null);
+  assert.equal(repairedName(nameRow('Paula & Kimano Griffith', 'paula', 'griffith')), null);
+});
+
+test('a spelling conflict is left for a human, not guessed at', () => {
+  assert.equal(repairedName(nameRow('MARY PERRY', 'merry', 'perry')), null);
+  assert.equal(repairedName(nameRow('Richard Dittman', 'richard', 'dittmon')), null);
+});
+
+test('a mixed-case name is never re-cased — the opportunity is the better record', () => {
+  // LP stores "mcleod" flat; the opportunity carries "McLeod". Rewriting
+  // flattens it. titleCasePart cannot catch this: it inspects the contact's
+  // part, which is lowercase, not the name being replaced. 32 such records.
+  assert.equal(repairedName(nameRow('Lawrence McLeod', 'lawrence', 'mcleod')), null);
+  assert.equal(repairedName(nameRow('Cassandra DiChristopher', 'cassandra', 'dichristopher')), null);
+  assert.equal(repairedName(nameRow('Nevanita LaVita', 'nevanita', 'lavita')), null);
+});
+
+test('spacing is still repaired on a mixed-case name — only CASE is off limits', () => {
+  assert.equal(repairedName(nameRow('Lawrence  McLeod', 'lawrence', 'McLeod')), 'Lawrence McLeod');
+});
+
+test('slash- and comma-joined couples capitalise both people', () => {
+  // "kent/earlene" as one token yields "Kent/earlene" — the second person
+  // lowercased. 27 planned rewrites came out damaged this way.
+  assert.equal(titleCasePart('kent/earlene'), 'Kent/Earlene');
+  assert.equal(titleCasePart('brian,stephanie'), 'Brian,Stephanie');
+  assert.equal(repairedName(nameRow('KENT/EARLENE BIGGERSTAFF', 'kent/earlene', 'biggerstaff')),
+               'Kent/Earlene Biggerstaff');
+});
+
+test('a mixed-case couple already spelled correctly is left alone', () => {
+  assert.equal(repairedName(nameRow('Renata/Zbigniew Kang/Folga', 'renata/zbigniew', 'kang/folga')), null);
+});
+
 test('leading and trailing whitespace does not defeat the match', () => {
   assert.equal(repairedName(nameRow(' Mary ', 'mary', 'okonkwo')), 'Mary Okonkwo');
 });
