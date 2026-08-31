@@ -115,6 +115,15 @@ export const JOB_STATUS_BUCKET_MAP = {
   'Paid In Full': 'completed',
   'PIF Survey Ready': 'completed',
   // terminal — no revenue
+  //
+  // NOTE — this bucket is deliberately WIDER than CANCELLED_JOB_STATUSES in
+  // src/lp-job-value.js, which excludes work from an opportunity's monetary
+  // value. That set omits 'Credit Decline' on the grounds that a decline can
+  // still convert; this one counts it lost. Both choices are intentional and
+  // they do NOT reconcile: a Credit Decline job carries pipeline value while
+  // reporting counts it lost. If you are chasing a gap between pipeline revenue
+  // and this report, that is the gap. Changing either side is a business
+  // decision, not a bug fix — change both together or neither.
   'Cancelled': 'lost',
   'Cancelled By Mgt': 'lost',
   'Credit Decline': 'lost',

@@ -89,6 +89,7 @@
 
 import { getToken } from './token-manager.js';
 import { normalizePhone, getField, extractArray } from './sync-utils.js';
+import { latestJobValue } from './lp-job-value.js';
 
 const LP_API_BASE = process.env.LP_API_BASE_URL || 'https://api.leadperfection.com';
 const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -457,7 +458,42 @@ function enrichFromLP(enrichedRecord, rawLead) {
   else if (pf.set) highestStage = 'Set';
 
   const markets = [...new Set(allLeads.map(l => l.brn_id).filter(Boolean))].join(', ');
-  const totalGrossSale = allLeads.reduce((sum, l) => sum + parseFloat(l.GrossSaleAmount || '0'), 0).toFixed(2);
+
+  // ── lp_gross_sale_amount is ONE job's value (2026-08-31) ──────────
+  // This used to SUM GrossSaleAmount across every lead, while
+  // src/ghl-field-sync.js wrote a MAX to the SAME GHL field
+  // (lp_gross_sale_amount / YWhoVixgPtvEDzSXcMpJ) — so the number a contact
+  // displayed depended on which writer ran last. The GHL workflow "C.0-IN Sale
+  // Made Entry" reads this field as the stage-1 Client Lifecycle opportunity's
+  // monetary value, so on a repeat customer the sum inflated their pipeline by
+  // work that was already closed and paid, and the max reported whichever job
+  // happened to be biggest.
+  //
+  // Both writers now mean the same thing, via the same function: the value of
+  // the contact's most recent non-cancelled job. Key aliases match the ones
+  // src/sync-children.js reads when it writes lp_jobs, so the number derived
+  // from a live LP payload here and the number derived from the mirror there
+  // agree. Single-job contacts are unaffected.
+  const allJobs = allLeads
+    .flatMap(l => (Array.isArray(l.jobs) ? l.jobs : []))
+    .map(j => ({
+      lp_job_id:  j.id ?? j.job_id ?? j.JobID ?? null,
+      job_status: j.jobstatus ?? j.JobStatus ?? j.job_status ?? '',
+      job_value:  j.grossamount ?? j.GrossAmount ?? j.gsa ?? j.GSA ?? null,
+    }));
+  const jobGrossSale = latestJobValue(allJobs);
+  // Lead-grain fallback for a prospect whose payload carries no job objects:
+  // the most recently entered lead that actually has a sale amount, mirroring
+  // the same rule one level up rather than reverting to a sum. '0.00' when
+  // there is no sale anywhere — unchanged from before, so a prospect with no
+  // sale still clears the field rather than leaving a stale number.
+  const newestLeadGross = [...allLeads]
+    .sort((a, b) => new Date(b.dateentered || b.DateEntered || b.entrydate || 0)
+                  - new Date(a.dateentered || a.DateEntered || a.entrydate || 0))
+    .map(l => parseFloat(l.GrossSaleAmount || '0'))
+    .find(v => Number.isFinite(v) && v > 0);
+  const totalGrossSale = (jobGrossSale !== null ? jobGrossSale : (newestLeadGross ?? 0)).toFixed(2);
+
   const salesRep = bestLead ? (bestLead.salesrepname || '') : '';
 
   const latestAppt = allAppointments.length > 0

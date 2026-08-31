@@ -19,16 +19,39 @@
 //   - Status fields (disposition, rep, promoter, source) → from NEWEST lead
 //   - Appointment fields → from the lead with the most recent appointment
 //   - "Ever" fields (demo completed, closed won) → true if ANY lead has flag
-//   - Value fields (job value) → MAX across all leads
+//   - Value fields (job value) → the CURRENT job's value (see below)
 //   - Count fields (total appointments) → COUNT across all leads
 //   - Engagement (call count, last contact) → shared at prospect level
 //
 // When the newest lead has null for a field (e.g., rep_name), we send an
 // empty string to GHL to CLEAR the old stale value — not skip it.
+//
+// v5.1 — 2026-08-31 — "LP Gross Sale Amount" is ONE job's value
+// ------------------------------------------------------------
+// job_value used to be MAX across the contact's leads here, while
+// src/n8n-enrichment.js wrote a SUM to the SAME GHL field
+// (lp_gross_sale_amount / YWhoVixgPtvEDzSXcMpJ) — so the number a contact showed
+// depended on which writer ran last. Both were wrong for the same reason the
+// opportunity sum was: an opportunity tracks ONE job, and the GHL workflow
+// "C.0-IN Sale Made Entry" reads this field as the stage-1 Client Lifecycle
+// opportunity's monetary value. A repeat customer's field therefore inflated
+// their pipeline by work that was already closed and paid.
+//
+// Both writers now mean the same thing: the value of the contact's most recent
+// non-cancelled lp_jobs row, via latestJobValue() in src/lp-job-value.js — the
+// same derivation the opportunity itself uses. Single-job contacts are
+// unaffected (max, sum and latest agree on one job); the change is confined to
+// the ~293 multi-job contacts.
+//
+// EXPECT A ONE-TIME PUSH WAVE. This changes the field payload for multi-job
+// contacts, so their ghl_fields_hash no longer matches and they queue for a
+// push in the first cycle after deploy. That is the correction landing, not a
+// fault.
 
 import supabase from './supabase.js';
 import { updateGHLContactFields } from './ghl.js';
 import { buildGHLFieldPayload, computeFieldHash, getConfiguredFieldCount } from './ghl-field-map.js';
+import { latestJobValue } from './lp-job-value.js';
 import { emitEvent, dispositionPriority } from './event-emitter.js';
 import { sendGroupMeMessage } from './groupme.js';
 
@@ -46,9 +69,10 @@ let fieldSyncStats = { checked: 0, pushed: 0, skipped: 0, failed: 0, cleared: 0 
  * "ever" fields across all leads.
  *
  * @param {Array} leads - All lp_leads rows for one GHL contact
+ * @param {Array} [jobs] - All lp_jobs rows for the same contact, when available
  * @returns {Object} Merged lead object compatible with field map transforms
  */
-export function buildMergedLead(leads) {
+export function buildMergedLead(leads, jobs = null) {
   if (!leads || leads.length === 0) return null;
 
   // Sort by updated_at_lp DESC — newest first
@@ -67,9 +91,17 @@ export function buildMergedLead(leads) {
   const everDemoCompleted = sorted.some(l => l.demo_completed === true);
   const everClosedWon = sorted.some(l => l.closed_won === true);
 
-  // MAX job value across all leads
-  const jobValues = sorted.map(l => parseFloat(l.job_value) || 0).filter(v => v > 0);
-  const maxJobValue = jobValues.length > 0 ? Math.max(...jobValues) : null;
+  // The CURRENT job's value — not a max, not a sum. See the v5.1 note above.
+  //
+  // lp_jobs is the right grain and is preferred whenever we have it. The lead
+  // fallback exists for contacts with no linked job row at all, and mirrors the
+  // same rule at lead grain: the most recent lead that actually carries a value,
+  // rather than the largest one the contact ever had.
+  const jobValueFromJobs = Array.isArray(jobs) && jobs.length > 0 ? latestJobValue(jobs) : null;
+  const newestValuedLead = sorted.find(l => (parseFloat(l.job_value) || 0) > 0) || null;
+  const currentJobValue = jobValueFromJobs !== null
+    ? jobValueFromJobs
+    : (newestValuedLead ? parseFloat(newestValuedLead.job_value) : null);
 
   // COUNT of leads with appointments set
   const totalAppointments = sorted.filter(l => l.appointment_set).length;
@@ -98,7 +130,7 @@ export function buildMergedLead(leads) {
     closed_won: everClosedWon,
 
     // Value — MAX across all leads
-    job_value: maxJobValue,
+    job_value: currentJobValue,
 
     // Count of appointments
     _total_appointments: totalAppointments,
@@ -397,6 +429,35 @@ export async function bulkFieldSync(batchSize = 100, delayMs = 200, maxPushesPer
       byContact.get(lead.ghl_contact_id).push(lead);
     }
 
+    // Jobs for the same contacts, paginated the same way. Loaded in bulk rather
+    // than per contact: this loop already runs over every GHL-matched contact,
+    // and a per-contact lookup would turn one query into thousands. A read
+    // failure here is NOT fatal — buildMergedLead falls back to lead-grain
+    // values, so a sync cycle still completes with a slightly coarser number.
+    const jobsByContact = new Map();
+    let jobOffset = 0;
+    while (true) {
+      const { data, error } = await supabase
+        .from('lp_jobs')
+        .select('ghl_contact_id, lp_job_id, job_status, job_value')
+        .not('ghl_contact_id', 'is', null)
+        .order('lp_job_id', { ascending: false })
+        .range(jobOffset, jobOffset + LEAD_PAGE_SIZE - 1);
+
+      if (error) {
+        console.warn(`[FieldSync] lp_jobs read failed (${error.message}) — falling back to lead-grain job values this cycle`);
+        jobsByContact.clear();
+        break;
+      }
+      if (!data || data.length === 0) break;
+      for (const job of data) {
+        if (!jobsByContact.has(job.ghl_contact_id)) jobsByContact.set(job.ghl_contact_id, []);
+        jobsByContact.get(job.ghl_contact_id).push(job);
+      }
+      if (data.length < LEAD_PAGE_SIZE) break;
+      jobOffset += LEAD_PAGE_SIZE;
+    }
+
     console.log(`[FieldSync] ${allLeads.length} GHL-matched leads → ${byContact.size} unique contacts (max ${maxPushesPerCycle} pushes/cycle)`);
 
     // ── Phase 1: find the contacts that ACTUALLY need a push (no GHL calls) ──
@@ -409,7 +470,7 @@ export async function bulkFieldSync(batchSize = 100, delayMs = 200, maxPushesPer
     const pending = [];
     for (const [ghlContactId, leads] of byContact) {
       stats.total++;
-      const merged = buildMergedLead(leads);
+      const merged = buildMergedLead(leads, jobsByContact.get(ghlContactId) || null);
       if (!merged) continue;
 
       const fields = buildGHLFieldPayload(merged);

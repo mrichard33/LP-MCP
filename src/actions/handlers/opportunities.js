@@ -8,9 +8,14 @@
  *   v4.3 (2026-05-06): allow_backward payload flag bypasses the guard for
  *   intentional backward moves (remediation, cold-cancellation rerouting).
  *
- *   v5.1 (2026-08-31): every write path now carries monetaryValue — the sum of
- *   the contact's non-cancelled lp_jobs.job_value, recomputed per write. See
- *   src/lp-job-value.js for why sum-not-max and why not a custom field.
+ *   v5.1 (2026-08-31): every write path now carries monetaryValue — the value of
+ *   the contact's MOST RECENT non-cancelled lp_jobs row, recomputed per write.
+ *   An opportunity tracks ONE job, so a sum double-counts a repeat customer
+ *   whose earlier job is already closed Won. See src/lp-job-value.js.
+ *
+ *   v5.2 (2026-08-31): the value freeze is stated rather than emergent — see
+ *   isValueWritable() below — and the create path stops producing records with
+ *   no source and a first-name-only name.
  *
  *   v4.4 (2026-06-16): duplicate-opportunity recovery (N1). When the create
  *   path's POST is rejected by GHL with 400 "Can not create duplicate
@@ -82,6 +87,27 @@ async function withOpportunityLock(key, fn) {
   }
 }
 
+// ─── The value invariant, stated once ───────────────────────────────
+// A won/lost/abandoned opportunity's monetaryValue is historical record and is
+// never rewritten. If a Won opp kept recomputing against the contact's newest
+// job, historical won revenue would silently rewrite itself downward every time
+// a later job was cancelled, with nothing to detect it.
+//
+// Until 2026-08-31 this held only as a SIDE EFFECT of the v5.0 openOpps filter
+// below — a closed opp was never a move target, so it was never revalued. An
+// invariant held by accident breaks the first time someone refactors the guard
+// that happens to be holding it, and nobody connects the two. Hence this
+// function, and hence the status predicate in
+// scripts/backfill-opportunity-values.js which had no such accident protecting
+// it and would have rewritten every closed-won opportunity in the pipeline.
+//
+// The freeze point is the win itself: executeMoveOpportunity recomputes on
+// every call, so the write that carries status:'won' stamps the value as of the
+// win. executeUpdateOpportunity does the same explicitly.
+function isValueWritable(opp) {
+  return (opp?.status || 'open') === 'open';
+}
+
 // Rank duplicates furthest-along-first and report them. Unknown stage
 // positions sort last. Creation order breaks ties.
 function pickPrimaryOpp(openOpps, contactId, pipeline) {
@@ -126,10 +152,16 @@ export async function executeMoveOpportunity(action) {
   // ── Job value on every move (2026-08-31) ────────────────────────
   // All three write paths below used to send only pipelineStageId/status, so
   // every opportunity this handler created or moved landed with NO value —
-  // 260 of 2,518 Client Lifecycle opps sitting at zero. monetaryValue is
+  // 260 of 2,483 Client Lifecycle opps sitting at zero. monetaryValue is
   // GHL's own field and what its pipeline revenue reporting reads; the
   // "LP Gross Sale Amount" custom field is CONTACT-scoped and cannot be
   // written onto an opportunity.
+  //
+  // The value is ONE job's — the contact's most recent non-cancelled lp_jobs
+  // row — not a sum across their jobs. An opportunity tracks a single job's
+  // lifecycle and is closed Won when that job closes, so summing counts a job
+  // whose opportunity is already Won a second time and inflates pipeline for
+  // precisely the repeat customers this exists to get right.
   //
   // Recomputed from the contact's FULL job set on every write, never
   // incremented — a delta write drifts permanently the first time a job is
@@ -210,19 +242,36 @@ export async function executeMoveOpportunity(action) {
     if (!guard.allowed && allowBackward) {
       console.log(`[ActionExecutor] ⚠️ Backward move ALLOWED via allow_backward: ${pipeline} opp at pos ${guard.currentPos}, target pos ${guard.targetPos} — ${guard.reason}`);
     }
-    await ghlFetch('PUT', `/opportunities/${opps[0].id}`, { pipelineStageId: stageId, status: status || 'open', ...valueField });
+    // opps[0] is open by construction (the openOpps filter above), but the
+    // invariant is enforced at the WRITE rather than inherited from that filter
+    // — that inheritance is exactly what made the freeze accidental.
+    const moveValueField = isValueWritable(opps[0]) ? valueField : {};
+    await ghlFetch('PUT', `/opportunities/${opps[0].id}`, { pipelineStageId: stageId, status: status || 'open', ...moveValueField });
     return {
       action: 'updated',
       opportunity_id: opps[0].id,
       pipeline,
       stage,
       status,
-      monetary_value: jobValue,
+      monetary_value: Object.keys(moveValueField).length ? jobValue : null,
       backward_override: !guard.allowed && allowBackward,
     };
   } else {
     const contactRes = await ghlFetch('GET', `/contacts/${contactId}`);
-    const name = contactRes?.contact?.name || contactRes?.contact?.firstName || 'Unknown';
+    const c = contactRes?.contact || {};
+    // v5.2 (2026-08-31): this used to read `c.name || c.firstName`. ghlFetch
+    // talks to GHL API v2 (services.leadconnectorhq.com, Version 2021-07-28),
+    // whose contact payload carries firstName/lastName/contactName — `name` is
+    // not reliably present, so the expression silently degraded to the FIRST
+    // NAME ALONE. 212 of the 260 empty Client Lifecycle opportunities are
+    // one-word names ("Kelly", "Charles") against 26 of 2,223 populated ones.
+    // Matches the builder used in handlers/appointments.js and handlers/notes.js.
+    const name = [c.firstName, c.lastName].filter(Boolean).join(' ')
+      || c.contactName || c.name || 'Unknown';
+    // v5.2: and it never sent source at all, which is why no_value and no_source
+    // track each other stage for stage. Create only — the PUT paths must not
+    // clobber a source another path already set.
+    const sourceField = c.source ? { source: c.source } : {};
     try {
       const newOpp = await ghlFetch('POST', '/opportunities/', {
         pipelineId,
@@ -232,6 +281,7 @@ export async function executeMoveOpportunity(action) {
         name,
         status: status || 'open',
         ...valueField,
+        ...sourceField,
       });
       return { action: 'created', opportunity_id: newOpp?.opportunity?.id, pipeline, stage, status, monetary_value: jobValue };
     } catch (err) {
@@ -246,7 +296,19 @@ export async function executeMoveOpportunity(action) {
       const m = /"existingId"\s*:\s*"([^"]+)"/.exec(err?.message || '');
       if (m) {
         const existingId = m[1];
-        await ghlFetch('PUT', `/opportunities/${existingId}`, { pipelineStageId: stageId, status: status || 'open', ...valueField });
+        // v5.2: the opp GHL collided with was never searched for, so unlike the
+        // opps[0] path above it is NOT known to be open — it may be a won opp in
+        // another pipeline. Read it before deciding whether the value may be
+        // written; if we cannot read it, omit the value rather than guess.
+        let existingOpp = null;
+        try {
+          const res = await ghlFetch('GET', `/opportunities/${existingId}`);
+          existingOpp = res?.opportunity || null;
+        } catch (readErr) {
+          console.warn(`[ActionExecutor] duplicate-recovery: could not read opp ${existingId} (${readErr.message}) — omitting monetaryValue`);
+        }
+        const recoveryValueField = (existingOpp && isValueWritable(existingOpp)) ? valueField : {};
+        await ghlFetch('PUT', `/opportunities/${existingId}`, { pipelineStageId: stageId, status: status || 'open', ...recoveryValueField });
         console.log(`[ActionExecutor] ♻️ move_opportunity recovered from duplicate-opp 400 — updated existing opp ${existingId} → ${pipeline}/${stage}`);
         return {
           action: 'updated_existing_on_duplicate',
@@ -254,6 +316,7 @@ export async function executeMoveOpportunity(action) {
           pipeline,
           stage,
           status,
+          monetary_value: Object.keys(recoveryValueField).length ? jobValue : null,
           recovered_from: 'duplicate_opportunity_400',
         };
       }
@@ -305,6 +368,19 @@ export async function executeUpdateOpportunity(action) {
   if (payload.lostReasonId) updateBody.lostReasonId = payload.lostReasonId;
   if (payload.status) updateBody.status = payload.status;
   if (payload.name) updateBody.name = payload.name;
+
+  // Freeze at the win, not before it (v5.2, 2026-08-31). This action type
+  // passes payload.monetaryValue through verbatim and the loss/win rules do not
+  // supply one, so a rule that only sets status:'won' would leave the value
+  // frozen as of the last stage MOVE. A job revalued between that move and its
+  // close would then be recorded won at the stale number — a silent
+  // understatement of won revenue with nothing to detect it later. Recompute in
+  // the same write that closes it.
+  if (updateBody.status === 'won' && updateBody.monetaryValue === undefined
+      && contactId && !isLPLeadId(contactId)) {
+    const wonValue = await openJobValueForContact(contactId);
+    if (wonValue !== null) updateBody.monetaryValue = wonValue;
+  }
 
   if (Object.keys(updateBody).length === 0 && !payload.contact_source && !payload.contact_custom_fields) {
     return { action: 'skipped_no_fields', opportunity_id: oppId, contact_id: contactId };
