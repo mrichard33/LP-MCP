@@ -593,7 +593,18 @@ export async function processOneLead({
       firstName: cleanName(lead.first_name),
       lastName: cleanName(lead.last_name),
       phone: lead.phone,
-      source: 'lp-backstop',
+      // The lead's real origin, not the pipe that carried it. lead_source is
+      // already in scope (both scans select it) and already drives the
+      // source:* tags below — the source FIELD was the only place it was
+      // being discarded. Provenance is unaffected: LP_BACKSTOP_ALWAYS_TAGS
+      // still applies `lp-backstop-created`, which is what makes a
+      // backstop-created contact auditable.
+      //
+      // 'lp-backstop' remains the fallback ONLY where LP itself has no
+      // lead_source (1,574 such unlinked "Data" leads as of 2026-07-26).
+      // An honest "we don't know, this came in via the backstop" is better
+      // than an invented source.
+      source: lead.lead_source || 'lp-backstop',
       tags: backstopTagsFor(lead.lead_source, lead.lead_source_detail, { suppressOutbound: suppression.suppress }),
       customFields: [
         { id: LP_LEAD_ID_FIELD, field_value: String(lead.lp_lead_id) },

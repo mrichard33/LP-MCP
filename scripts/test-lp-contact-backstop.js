@@ -258,7 +258,7 @@ test('(2) no match → one POST /contacts with correct tags/source/customFields,
     assert.equal(contactCreates().length, 1, `src ${src}`);
     const b = contactCreates()[0].body;
     assert.equal(b.locationId, GHL_LOCATION_ID);
-    assert.equal(b.source, 'lp-backstop');
+    assert.equal(b.source, src, `src ${src}`); // the LP lead source, not the mechanism
     assert.deepEqual(b.tags, expectTags, `src ${src}`);
     assert.deepEqual(b.customFields, [
       { id: LP_LEAD_ID_FIELD, field_value: '555360' },
@@ -266,6 +266,42 @@ test('(2) no match → one POST /contacts with correct tags/source/customFields,
     ]);
     assert.equal(posts('/calendars/events/appointments').length, 1, `reconcile for ${src}`);
   }
+});
+
+// ─── source attribution on the create body ───────────────────────────
+// Same stub, same path as (2) above — just narrowed to the create body so the
+// source-field cases read as one thing each.
+async function captureCreateBody(over) {
+  reset({ search: [] }); // no phone match → the create branch
+  await processOneLead({ lead: lead(over), contactCache: new Map() });
+  assert.equal(contactCreates().length, 1);
+  return contactCreates()[0].body;
+}
+
+test('a created contact carries the LP lead source, not the mechanism', async () => {
+  // The whole point: 'lp-backstop' is how the lead arrived, not where from.
+  const body = await captureCreateBody({ lead_source: 'Canvass' });
+  assert.equal(body.source, 'Canvass');
+});
+
+test('the vendor detail stays on its tag and out of the source field', async () => {
+  const body = await captureCreateBody({
+    lead_source: 'Internet', lead_source_detail: 'Modernize',
+  });
+  assert.equal(body.source, 'Internet');
+  assert.ok(body.tags.includes('source:internet-modernize'));
+});
+
+test('a lead with no LP source still falls back to the mechanism', async () => {
+  for (const missing of [null, undefined, '']) {
+    const body = await captureCreateBody({ lead_source: missing });
+    assert.equal(body.source, 'lp-backstop');
+  }
+});
+
+test('provenance survives the change', async () => {
+  const body = await captureCreateBody({ lead_source: 'Canvass' });
+  assert.ok(body.tags.includes('lp-backstop-created'));
 });
 
 test('(3) junk name → created with empty firstName/lastName, not "N/A"', async () => {
