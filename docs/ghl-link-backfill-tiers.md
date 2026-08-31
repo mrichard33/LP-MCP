@@ -364,3 +364,83 @@ Tier A ran.
 The milestone figure keeps falling on its own between runs — that is the
 sweeper stamping ids down as it fires, not measurement drift. Compare against
 the number the runner prints, not against this document.
+
+---
+
+## Tier C actual (2026-08-31) — executed
+
+Ran against the briefed window only: `created_at_lp >= 2026-08-13`,
+`< 2026-08-20`, via `POST /admin/lp-intake-backstop` with
+`until_iso=2026-08-20T00:00:00.000Z`, `suppress_outbound=true`,
+`fresh_hours=24`. Owner confirmed the two unconditional `contact_created`
+workflows were suppressed in the GHL UI before the live pass; re-verified
+against the HL mirror immediately before each batch — **I.AC All Contacts
+Created** and **I.C-NN Contact Normalizer** both `draft`, the three remaining
+published `contact_created` workflows all conditional on a SalesRabbit ID, a
+`chatbot` tag, or risk-report tags, none of which this run sets.
+
+### Dry run
+`scanned_rows 1103 · eligible 1087 · created 1081 · linked 6 ·
+skipped_no_phone 1 · suppressed 1081 · errors 0`
+
+Every projected create carried `SUPPRESSED(run_mode_backlog)`; none without.
+
+### Live pass — three batches
+The run was interrupted twice, both times by an unrelated merge to `main`
+auto-deploying and restarting the service (PR #783 at 15:23, PR #787 at 16:52).
+The job registry is in-memory, so each restart lost the job record rather than
+failing it. **Nothing was lost or duplicated:** the scan selects only
+`ghl_contact_id IS NULL`, and the phone-search-first path relinks any lead whose
+contact was created before its LP write landed. Batch 3 reported 7 links against
+the dry run's 6 — that extra link is exactly this recovery working.
+
+| Batch | Processed | Created | Linked | Errors |
+|---|---|---|---|---|
+| 1 (killed 15:24) | ~553 | ~553 | 6 | 0 |
+| 2 (killed 16:53) | ~342 | ~342 | — | 0 |
+| 3 (completed) | 205 | 198 | 7 | 0 |
+
+### Outcome
+- **1,207 of 1,210** in-window leads linked; 1,081 contacts created by this run.
+- **0 of 1,081 missing `suppress-outbound`.**
+- **0 messages** — inbound or outbound — to any contact this run created,
+  measured against a mirror fresh to under a minute.
+- 3 leads deliberately unlinked: one 9-digit phone (invalid, needs a data fix)
+  and two duplicate-phone siblings whose person already holds a contact. The
+  latter is the briefed many-LP-leads-to-one-GHL-contact case, not a miss.
+
+### Propagation re-run
+Undo snapshot captured first (`lp_link_propagate_undo_20260831_milestones`,
+1,757 rows; `..._jobs`, 96 rows), then `sql/075` re-applied:
+
+- milestone nulls **53,716 → 51,959**, jobs **3,333 → 3,237**
+- both propagatable cohorts drained to **0**
+- `armed` 27,809 → 27,813 (**+4**)
+
+The +4 is concurrent sync, not the propagation: 1,839 milestone rows synced in
+the surrounding 30 minutes, 665 of them armed. `armed` is defined as
+`ghl_tag_fired = false AND act_date IS NOT NULL` and references neither
+`ghl_contact_id` nor any column the UPDATE writes, so a statement setting only
+that column cannot move it. Tier A's exactly-constant reading came from a
+quieter moment, not a stronger guarantee — do not treat an exact match as the
+pass condition; treat *no propagation-attributable change* as the pass
+condition.
+
+### Measurement trap worth knowing
+`contacts.source = 'lp-backstop'` is written by BOTH this backfill and the
+scheduled 15-minute intake sweep. Attributing contacts to a backfill by
+`source` + `date_added` therefore silently includes the day's live intake —
+which is correctly created UNSUPPRESSED, because fresh leads should get
+speed-to-lead. Doing this produced a false "52 contacts missing
+`suppress-outbound`" alarm during verification. Attribute by the LP lead id in
+custom field `GmAVmW6V9sekD7pVONKr` instead, and check it falls in the target
+window.
+
+### Still open — owner decisions
+- **DNC.** `lp_leads` carries no consent column and every lead in this window
+  had a NULL disposition, so `suppress-outbound` is the only thing between
+  these 1,081 contacts and outbound. The run proceeded on
+  create-everything-suppressed.
+- **The completion criteria cannot be met as written** (<5,000 milestone nulls,
+  <500 recent orphans). Tier B established LP and GHL were never the same
+  population. They need rewriting against what the data can support.
