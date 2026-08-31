@@ -530,7 +530,15 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
     const suppressThisFire = isFirstCompletion && suppressSideEffects; // suppress linked OR unlinked
 
     const msRow = {
-      lp_job_id: jobId, lp_lead_id: lpLeadId, ghl_contact_id: ghlContactId || null,
+      lp_job_id: jobId, lp_lead_id: lpLeadId,
+      // OMITTED, not nulled, when the caller has none — the same treatment the
+      // parent lp_jobs row got in #784. That fix covered the parent and left
+      // the child: the job-changes sweep calls this with ghlContactId=null for
+      // every record, so this literal kept writing null over the link Tier A
+      // copies down from lp_leads. Measured 2026-08-31, after #784 deployed:
+      // lp_jobs orphaned 96 (frozen), lp_job_milestones orphaned 1,773 (still
+      // climbing) — 18x the number that justified the original fix.
+      ...(ghlContactId ? { ghl_contact_id: ghlContactId } : {}),
       mdt_id: mdtId,
       datetype:    dateType,
       est_date:    lpDateToEastern(getField(ms, 'estdate', 'EstDate', 'est_date')),

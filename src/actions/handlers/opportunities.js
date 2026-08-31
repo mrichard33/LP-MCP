@@ -8,6 +8,10 @@
  *   v4.3 (2026-05-06): allow_backward payload flag bypasses the guard for
  *   intentional backward moves (remediation, cold-cancellation rerouting).
  *
+ *   v5.1 (2026-08-31): every write path now carries monetaryValue — the sum of
+ *   the contact's non-cancelled lp_jobs.job_value, recomputed per write. See
+ *   src/lp-job-value.js for why sum-not-max and why not a custom field.
+ *
  *   v4.4 (2026-06-16): duplicate-opportunity recovery (N1). When the create
  *   path's POST is rejected by GHL with 400 "Can not create duplicate
  *   opportunity for the contact" (meta.existingId), update that existing opp
@@ -39,6 +43,7 @@ import { updateGHLContactFields } from '../../ghl.js';
 // 2026-07-03 (pipeline-integrity breach) — evidence-gated milestone moves.
 import { checkStageMoveEvidence } from '../stage-evidence.js';
 import { emitEvent } from '../../event-emitter.js';
+import { openJobValueForContact } from '../../lp-job-value.js';
 
 // ─── v5.0 (2026-08-16): one-open-opportunity-per-pipeline invariant ──
 // Standing rule (Mark): a contact must never hold more than one OPEN
@@ -118,6 +123,22 @@ export async function executeMoveOpportunity(action) {
   const stageId = STAGE_MAP[stage];
   if (!stageId) throw new Error(`Unknown stage: "${stage}" — fix the agent_rule`);
 
+  // ── Job value on every move (2026-08-31) ────────────────────────
+  // All three write paths below used to send only pipelineStageId/status, so
+  // every opportunity this handler created or moved landed with NO value —
+  // 260 of 2,518 Client Lifecycle opps sitting at zero. monetaryValue is
+  // GHL's own field and what its pipeline revenue reporting reads; the
+  // "LP Gross Sale Amount" custom field is CONTACT-scoped and cannot be
+  // written onto an opportunity.
+  //
+  // Recomputed from the contact's FULL job set on every write, never
+  // incremented — a delta write drifts permanently the first time a job is
+  // cancelled or revalued. null means "no live work", and the key is then
+  // OMITTED rather than sent as 0, so a contact with no linked LP job never
+  // has an existing value clobbered by a stage move.
+  const jobValue = await openJobValueForContact(contactId);
+  const valueField = jobValue === null ? {} : { monetaryValue: jobValue };
+
   // ── Stage-transition evidence validator (2026-07-03) ────────────
   // Milestone stages require real-world evidence BEFORE any move, no matter
   // which rule requested it (BEHAVIORAL_FAST_TRACK fabricated "Appointment
@@ -189,13 +210,14 @@ export async function executeMoveOpportunity(action) {
     if (!guard.allowed && allowBackward) {
       console.log(`[ActionExecutor] ⚠️ Backward move ALLOWED via allow_backward: ${pipeline} opp at pos ${guard.currentPos}, target pos ${guard.targetPos} — ${guard.reason}`);
     }
-    await ghlFetch('PUT', `/opportunities/${opps[0].id}`, { pipelineStageId: stageId, status: status || 'open' });
+    await ghlFetch('PUT', `/opportunities/${opps[0].id}`, { pipelineStageId: stageId, status: status || 'open', ...valueField });
     return {
       action: 'updated',
       opportunity_id: opps[0].id,
       pipeline,
       stage,
       status,
+      monetary_value: jobValue,
       backward_override: !guard.allowed && allowBackward,
     };
   } else {
@@ -209,8 +231,9 @@ export async function executeMoveOpportunity(action) {
         contactId,
         name,
         status: status || 'open',
+        ...valueField,
       });
-      return { action: 'created', opportunity_id: newOpp?.opportunity?.id, pipeline, stage, status };
+      return { action: 'created', opportunity_id: newOpp?.opportunity?.id, pipeline, stage, status, monetary_value: jobValue };
     } catch (err) {
       // v4.4 (2026-06-16) — Duplicate-opportunity recovery (N1).
       // GHL permits only one open opportunity per contact and rejects the
@@ -223,7 +246,7 @@ export async function executeMoveOpportunity(action) {
       const m = /"existingId"\s*:\s*"([^"]+)"/.exec(err?.message || '');
       if (m) {
         const existingId = m[1];
-        await ghlFetch('PUT', `/opportunities/${existingId}`, { pipelineStageId: stageId, status: status || 'open' });
+        await ghlFetch('PUT', `/opportunities/${existingId}`, { pipelineStageId: stageId, status: status || 'open', ...valueField });
         console.log(`[ActionExecutor] ♻️ move_opportunity recovered from duplicate-opp 400 — updated existing opp ${existingId} → ${pipeline}/${stage}`);
         return {
           action: 'updated_existing_on_duplicate',
