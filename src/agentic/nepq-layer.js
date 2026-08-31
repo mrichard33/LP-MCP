@@ -171,15 +171,21 @@ export function buildNepqBlock(ctx) {
     CONSEQUENCE_GUARDRAILS,
     `
 POST-BOOKING DISCLOSURE (say this once, in the message that confirms a
-booking, and never again): tell them a team member may call or text before
-the visit to confirm details, and that it will come from a 954 number.
-Homeowners block unknown business numbers. Contact q5GehRye7DNkN6jlmjl3
-blocked our rep's number and unblocked it himself 24 minutes past his own
-appointment time. One sentence at booking would have prevented it.
-Example shape: "You're set for [day] at [time]. Someone may call or text
-before then to confirm details — it comes from a 954 number, so you know
-it's us."`,
+booking, and never again): tell them someone from our team WILL call before
+the visit to go over the details and finalize it.
+
+State it as CERTAIN. Never "may", never "might", never "if we need anything
+else". A booked slot is scheduled, not dispatched — nobody is sent to the
+home until that call happens, so the call is a fact, not a possibility. Say
+it as diligence, not as doubt about whether they have an appointment.
+
+NEVER name a phone number, an area code, or say which line the call will
+come from. We do not control which number places it, so any number we name
+is a promise we cannot keep.
+
+Example shape: "You're set for [day] at [time]. Someone from our team will
+call before then to go over the details and finalize the visit."`,
   ].join('\n');
 }
 
-export const NEPQ_LAYER_VERSION = '1.0';
+export const NEPQ_LAYER_VERSION = '1.1';
