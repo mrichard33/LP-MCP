@@ -165,14 +165,40 @@ function toPositiveNumber(raw) {
 /**
  * The lifecycle bucket the schema declares at sql/schema.sql:68
  * (`permit | production | install | complete`), derived from which milestones have
- * actually been stamped. NOT from stg_id: that field exists only on Shape A and is
- * "0" on 3,534 of 3,583 rows, so it carries no stage information at all.
+ * actually been stamped AND ALREADY HAPPENED. NOT from stg_id: that field exists only
+ * on Shape A and is "0" on 3,534 of 3,583 rows, so it carries no stage information.
+ *
+ * WHY THE DATE MUST HAVE PASSED
+ * -----------------------------
+ * LP is routinely used to record SCHEDULED actuals, so a job booked for next month
+ * carries a real, future `Install End` actdate. install_completed_date must keep that
+ * date — see milestone-gate.js, and it is deliberately unchanged below. But "the date
+ * is real" and "the stage has been reached" are different claims. Ungated, 47 jobs
+ * read a stage they had not reached (measured 2026-08-31), 46 of them job_status
+ * 'Scheduled' — and one of them showed `complete` for an install still a week away.
+ * job_stage is a reporting column; someone reads it without checking the dates under
+ * it, and "Scheduled / complete" is simply wrong in English.
+ *
+ * All four tiers are gated, not just the two that had offenders. The rule "fall
+ * through to the next-lowest stage the passed dates support" only reads consistently
+ * if every tier answers the same question, and gating all four was measured to produce
+ * IDENTICAL output to gating only complete/install across all 5,892 rows — no K, G, U,
+ * P or H milestone currently carries a future actdate. Uniform is the simpler rule with
+ * the same behaviour today, and it stays right if LP starts stamping scheduled actuals
+ * on the earlier milestones too.
  */
-function jobStage(act) {
-  if (act.has(MS_COMPLETION) || act.has(MS_INSTALL_END)) return 'complete';
-  if (act.has(MS_INSTALL_START)) return 'install';
-  if (act.has(MS_ORDERED) || act.has(MS_RECEIVED_ALL)) return 'production';
-  if (act.has(MS_PERMIT_SUBMIT) || act.has(MS_PERMIT_ISSUED) || act.has(MS_HOA_APPROVED)) {
+function jobStage(act, now) {
+  const cutoff = now.getTime();
+  const passed = (code) => {
+    const date = act.get(code);
+    if (!date) return false;
+    const t = Date.parse(date);
+    return !Number.isNaN(t) && t <= cutoff;
+  };
+  if (passed(MS_COMPLETION) || passed(MS_INSTALL_END)) return 'complete';
+  if (passed(MS_INSTALL_START)) return 'install';
+  if (passed(MS_ORDERED) || passed(MS_RECEIVED_ALL)) return 'production';
+  if (passed(MS_PERMIT_SUBMIT) || passed(MS_PERMIT_ISSUED) || passed(MS_HOA_APPROVED)) {
     return 'permit';
   }
   return null;
@@ -216,7 +242,7 @@ export function mapJobFields(job, existing = {}, now = new Date()) {
   const fields = {
     // ─── Always written: sources present in BOTH shapes ───────────────
     rep_id:                 repId === null ? null : String(repId),
-    job_stage:              jobStage(act),
+    job_stage:              jobStage(act, now),
     install_date:           act.get(MS_INSTALL_START) ?? null,
     // 'Install End', not 'Completion'. C has an actual date on 3,204 of 3,230 Paid
     // In Full jobs versus F's 2,127, but C is job completion — sign-off and final
