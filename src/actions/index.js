@@ -161,6 +161,10 @@ import { registerRateLimiterRoutes } from '../ghl-rate-limiter.js';
 import { getEventContext } from './resolvers.js';
 import { processApprovalQueue } from './approval-path.js';
 import { reapStuckActions } from './reaper.js';
+// 2026-08-31 — post-send reconciler. GHL 2xx + message id was being treated as
+// proof of delivery; nothing ever re-read the message status, so a carrier
+// rejection recorded as `completed` with a null error. Never gates a send.
+import { verifyRecentSends } from '../services/send-delivery-verify.js';
 import { runPool, groupByBatch } from './concurrency.js';
 import { classifyHandlerResult } from './result-status.js';
 
@@ -1089,6 +1093,11 @@ export async function executeActions({ limit } = {}) {
     // Phase 0: reap stuck 'executing' (killed-process zombies) + orphaned
     // 'approved' rows. Phase 1: send pending_approval GroupMe cards.
     const reaperResult = await reapStuckActions();
+    // Reconcile recently-completed sends against GHL delivery status. Runs on
+    // the executor cadence, lagged by SEND_VERIFY_MIN_AGE_SEC because GHL's
+    // message list propagates behind the send. Fail-soft — never blocks a run.
+    const sendVerifyResult = await verifyRecentSends()
+      .catch((err) => { console.warn(`[ActionExecutor] send verify threw (ignored): ${err.message}`); return null; });
     const approvalRequestsSent = await processApprovalQueue();
 
     // Phase 2: claim → group → bounded-concurrent execute, chunked, until the
@@ -1145,6 +1154,7 @@ export async function executeActions({ limit } = {}) {
       retrying: results.filter(r => r.status === 'pending').length,
       approval_requests_sent: approvalRequestsSent,
       stuck_actions_reaped: reaperResult.reaped || 0,
+      send_delivery_flagged: sendVerifyResult?.flagged || 0,
       reaper_detail: reaperResult.reaped > 0 ? reaperResult : undefined,
       claimed_total: claimedTotal,
       chunks,
