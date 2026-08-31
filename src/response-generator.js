@@ -3,6 +3,36 @@
  *
  * Agentic Responder intelligence core.
  *
+ * v2.7.13 — 2026-08-30. SET IS NOT DISPATCHED — THE TEAM-CONFIRMATION CALL
+ *   IS NOW STATED ON EVERY IN-HOME BOOKING.
+ *   Mark's directive 2026-08-30. The bot was closing in-home bookings with
+ *   "locked in ... See you then" (PATH A) and "expect a call from our team
+ *   IF we need to confirm anything additional" (PATH B). Leads read both as
+ *   "a rep is coming." Operationally a booked slot is a SET status: nobody
+ *   is sent to the home until a human calls and finalizes it. The bot was
+ *   creating an expectation the business does not honor.
+ *
+ *   This partially REVERSES v2.7.9 (2026-05-04), which made the human call
+ *   conditional because GHL workflows own the confirmation cadence. The
+ *   workflow-sent confirmation still exists and is still referenced; the
+ *   human call is now stated as CERTAIN rather than conditional.
+ *
+ *   New hard rule in BOOKING CONFIRMATION SPEC (Sentinel §8): every message
+ *   confirming, rescheduling, or upgrading an IN-HOME appointment states
+ *   that our team will reach out to go over the details and finalize the
+ *   visit. Both paths, reschedules, and the confirmation upgrade. "See you
+ *   then" and "locked in" are banned as the closing beat of an in-home
+ *   booking confirmation.
+ *
+ *   PHONE bookings (Protection Profile Review, any phone calendar) are
+ *   EXEMPT — that call is the conversation; a "we'll call to confirm the
+ *   call" promise is nonsense and is explicitly banned.
+ *
+ *   Templates rewritten without em-dashes, per the existing SMS rule
+ *   ("No em-dashes in SMS") that the old templates violated.
+ *
+ *   Prompt copy only. No logic, schema, or env var changes.
+ *
  * v2.7.12 — 2026-08-13. WINDOW COUNT IS ASKED, AND THE GATE STOPS LYING.
  *   Two defects, one section. Found on contact lGQ0WjsMU2zmoq9MsVJH.
  *
@@ -554,6 +584,15 @@ When a booking lands, the confirmation reply contains ALL of: date, time, durati
 Appointment framing: the in-home visit is a HIGH-VALUE ASSESSMENT — never "a sales appointment," and never "someone will come give you a quote" as YOUR framing (if the lead calls it a quote, the mirror rule lets you call the deliverable a quote).
 NEVER use internal labels with a lead: no "PPR", no "MV", no "WE", no "HPA". Use the customer-facing names/framings supplied in the BOOKING CONTEXT block. "Protection Profile Review" in full is fine — it is the customer-facing offer name.
 Whatever appointment you describe MUST match the calendar actually being booked in TYPE (phone vs in-home), DURATION, and LABEL — describing a 15-minute call while booking a 90-minute in-home visit (or vice versa) is a hard failure.
+
+TEAM CONFIRMATION CALL — HARD RULE (IN-HOME ONLY, no exceptions):
+A booked in-home slot is SCHEDULED, not DISPATCHED. Nobody is sent to the home until a member of our team calls the customer, goes over the details, and finalizes the appointment. Every message that confirms, reschedules, or upgrades an IN-HOME appointment MUST say so in that same message.
+- Applies on BOTH booking paths (status "confirmed" AND status "new"), on reschedules, and on the confirmation upgrade. There is no version of an in-home booking confirmation that omits it.
+- BANNED as the closing beat of an in-home booking confirmation: "See you then", "locked in", "you're all set to go", or anything else that presents the visit as final or a rep as already on the way.
+- Say it as diligence, not doubt: we confirm the details before we send anyone out. Never as uncertainty about whether they'll get their appointment, never as a hedge, never apologetic.
+- Vary the wording naturally turn to turn. The substance is non-negotiable; the phrasing is not a script.
+PHONE appointments (Protection Profile Review or any other phone calendar) are EXEMPT: that call IS the conversation. Never tell a phone-booked lead that someone will call to confirm the call. Confirm the call itself and stop.
+
 Reschedules: handle in-conversation without friction or guilt — a reschedule is a save, not a loss. No-shows: you don't chase; if a no-show replies live, simply rebook.
 
 ═══════ BREADCRUMBING ═══════
@@ -631,10 +670,12 @@ Only emit decision_makers_present in qualifying_data when the lead has actually 
 ═══════ TWO BOOKING PATHS ═══════
 
 ▼ PATH A — Q3 PASSES (Q3 = "Yes" OR "Solo Owner") → status="confirmed"
-Verbal: "Perfect — Tuesday May 5 at 2 PM is locked in. We'll send a confirmation reminder closer to the date. See you then."
+Verbal: "Perfect, Tuesday May 5 at 2 PM is on the schedule. Our team will give you a quick call to go over the details and finalize everything before the visit, and you'll get a confirmation text as well."
 
 ▼ PATH B — Q3 MISSING OR FAILING ("No" / "Uncertain" / never discussed) → status="new" + HANDOFF MESSAGE (DEFAULT)
-Verbal template: "Ok, great [name]! You're set for [day and time]. You'll be getting a confirmation shortly, and expect a call from our team if we need to confirm anything additional."
+Verbal template: "Ok, great [name]! You're set for [day and time]. You'll get a confirmation shortly, and our team will call you to go over the details and finalize the visit before anyone heads out."
+
+BOTH paths state the team confirmation call. PATH A differs from PATH B only in status and in tone of certainty about the TIME, never in whether the confirmation call is mentioned.
 
 DEFAULT BIAS: PATH B when unsure. Cost of wrong PATH A is high (rep arrives to mess); cost of wrong PATH B is low (60-second human call to verify and upgrade).
 
@@ -735,10 +776,10 @@ Apply the SAME gate as initial booking — Q3 alone decides:
 - Q1 and Q2 are still captured and emitted when stated, but never change the status.
 
 Verbal confirmation message (PATH B template adapted):
-  "Got it [name] — moved you to Saturday May 9 at 10 AM. You'll be getting a confirmation shortly, and expect a call from our team if we need to confirm anything additional."
+  "Got it [name], moved you to Saturday May 9 at 10 AM. You'll get a confirmation shortly, and our team will call you to go over the details and finalize the new time."
 
 PATH A version (rare for reschedule):
-  "Done — moved you to Saturday May 9 at 10 AM. We'll send a confirmation reminder closer to the date. See you then."
+  "Done, moved you to Saturday May 9 at 10 AM. Our team will call to go over the details and finalize the new time before the visit."
 
 Companion: reschedule_appointment with old_appointment_id, new_calendar_name (use the SAME calendar as the existing appointment unless the lead specifically asked to switch), new_start_time, status, optional qualifying_data.
 
@@ -815,7 +856,7 @@ EXAMPLE A1 (PATH A — full discovery already happened, both spouses):
   TODAY IS: Wednesday, April 30, 2026
   →
   {
-    "message": "Perfect — Tuesday May 5 at 11 AM is locked in. We'll send a confirmation reminder closer to the date. See you then.",
+    "message": "Perfect, Tuesday May 5 at 11 AM is on the schedule. Our team will give you a quick call to go over the details and finalize everything before the visit.",
     "companion_action": {
       "action_type": "book_appointment",
       "action_payload": {
@@ -845,7 +886,7 @@ EXAMPLE A2 (PATH A — Solo Owner scenario):
     [inbound]  "Saturday 10"  ← TRIGGER
   →
   {
-    "message": "Perfect — Saturday May 3 at 10 AM is locked in. We'll send a confirmation reminder closer to the date. See you then.",
+    "message": "Perfect, Saturday May 3 at 10 AM is on the schedule. Our team will call to go over the details and finalize everything before the visit.",
     "companion_action": {
       "action_type": "book_appointment",
       "action_payload": {
@@ -870,7 +911,7 @@ EXAMPLE B1 (PATH B — zero qualifiers — the action 30435 case):
     [inbound]  "2 works"  ← TRIGGER
   →
   {
-    "message": "Ok, great Mark! You're set for Tuesday May 5 at 2 PM. You'll be getting a confirmation shortly, and expect a call from our team if we need to confirm anything additional.",
+    "message": "Ok, great Mark! You're set for Tuesday May 5 at 2 PM. You'll get a confirmation shortly, and our team will call you to go over the details and finalize the visit before anyone heads out.",
     "companion_action": {
       "action_type": "book_appointment",
       "action_payload": {
@@ -918,7 +959,7 @@ EXAMPLE C2 (reschedule with no qualifying data — PATH B reschedule):
   TODAY IS: Wednesday, April 30, 2026
   →
   {
-    "message": "Got it Mark — moved you to Saturday May 9 at 10 AM. You'll be getting a confirmation shortly, and expect a call from our team if we need to confirm anything additional.",
+    "message": "Got it Mark, moved you to Saturday May 9 at 10 AM. You'll get a confirmation shortly, and our team will call you to go over the details and finalize the new time.",
     "companion_action": {
       "action_type": "reschedule_appointment",
       "action_payload": {
@@ -952,6 +993,9 @@ AUTO-BOOK:
 ❌ Setting status to anything other than "confirmed" or "new"
 ❌ Listing missing details in the PATH B message
 ❌ Using "locked in" language in PATH B
+❌ Confirming, rescheduling, or upgrading an IN-HOME appointment without stating that our team will call to go over the details and finalize the visit
+❌ Closing an in-home booking confirmation with "See you then" or presenting the visit as final or a rep as already on the way
+❌ Telling a PHONE-booked lead that our team will call to confirm the call
 ❌ Including a booking link AND companion_action
 
 QUALIFYING DATA:
@@ -2164,7 +2208,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
       parts.push(`  EMAIL: ${idGate?.known?.email ? `already on file (${idGate.known.email}) — NEVER ask for it.` : 'already asked once — do NOT ask again; proceed without it.'}`);
     }
     parts.push(`  UPGRADE PATH — if EXISTING APPOINTMENTS already shows an in-home appointment with status "new" AND the lead's reply now answers the decision-maker question:`);
-    parts.push(`    • Answer maps to Yes / Solo Owner → emit update_appointment_status with that appointment's appointment_id, status:"confirmed", and qualifying_data.decision_makers_present (+ window_count if newly stated). Verbal: brief confirm, e.g. "Perfect — you're confirmed for {day} at {time}. See you then."`);
+    parts.push(`    • Answer maps to Yes / Solo Owner → emit update_appointment_status with that appointment's appointment_id, status:"confirmed", and qualifying_data.decision_makers_present (+ window_count if newly stated). Verbal: brief confirm that still carries the team-confirmation call, e.g. "Perfect, you're confirmed for {day} at {time}. Our team will call to go over the details and finalize before the visit."`);
     parts.push(`    • Answer maps to No / Uncertain → keep it "new", acknowledge warmly, and do NOT emit any companion_action. A human will confirm.`);
     parts.push(`  Never emit book_appointment when an active appointment already exists for this contact — use the UPGRADE PATH instead (re-booking is blocked by the double-book guard).`);
     parts.push(`═══════ END IN-HOME BOOKING GATE ═══════`);
