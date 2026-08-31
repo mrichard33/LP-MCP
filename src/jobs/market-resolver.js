@@ -20,6 +20,7 @@
 // comparison/lookup here TRIMs. Getting that wrong makes ~40% look like misses.
 
 import supabase from '../supabase.js';
+import { selectAllIn } from '../supabase-page.js';
 
 const CACHE_TTL_MS = Number(process.env.MARKET_MAP_TTL_MS || 3_600_000); // 1h
 
@@ -177,29 +178,61 @@ export async function buildLeadBranchMarketMap(leadIds) {
  * the prospect's ZIP resolves the market for all its leads). Prospects absent from
  * the cache resolve to UNASSIGNED. Used by C2 to partition the scorecard cohort.
  */
+/**
+ * prospect_id → its latest valid ZIP, from a COMPLETE set of lp_leads rows.
+ *
+ * Pure and exported so the rule has unit coverage without a database. It used
+ * to live inside the query as `.order('updated_at_lp', {ascending:false})`,
+ * which range pagination cannot preserve: paging must be ordered by a unique
+ * stable key (see src/supabase-page.js), so recency is decided here instead.
+ *
+ * Sorting the whole set in JS is also strictly MORE correct than the old query
+ * order was — that only ever ordered within one 300-key chunk, so a prospect
+ * split across two chunks already got an arbitrary winner.
+ *
+ * The caller must pass every matching row. Given a truncated set this returns a
+ * confident wrong answer, which is precisely the bug the pagination fixes.
+ */
+export function latestZipByProspect(rows) {
+  const sorted = [...(rows || [])].sort(
+    (a, b) => String(b.updated_at_lp ?? '').localeCompare(String(a.updated_at_lp ?? '')),
+  );
+  const out = new Map();
+  for (const r of sorted) {
+    const pid = String(r.lp_prospect_id ?? '');
+    if (!pid) continue;
+    const z = normalizeZip5(r.zip);
+    if (!out.has(pid)) out.set(pid, z);           // latest wins
+    else if (!out.get(pid) && z) out.set(pid, z); // backfill if the latest had none
+  }
+  return out;
+}
+
 export async function buildProspectMarketMap(prospectIds) {
   const { zipMap, branchMap } = await getMarketMaps();
   const ids = [...new Set(prospectIds.map((p) => String(p ?? '')).filter(Boolean))];
 
   const zipByProspect = new Map(); // latest valid ZIP per prospect
-  // Keep chunks small: a prospect has ~1.7 cached leads, and PostgREST caps a
-  // response at ~1000 rows, so 300 prospect ids (~500 rows) stays safely under it.
-  const CHUNK = 300;
-  for (let i = 0; i < ids.length; i += CHUNK) {
-    const slice = ids.slice(i, i + CHUNK);
-    const { data, error } = await supabase
-      .from('lp_leads')
-      .select('lp_prospect_id, zip, updated_at_lp')
-      .in('lp_prospect_id', slice)
-      .order('updated_at_lp', { ascending: false });
-    if (error) throw new Error(`lp_leads zip lookup failed: ${error.message}`);
-    for (const r of data || []) {
-      const pid = String(r.lp_prospect_id);
-      const z = normalizeZip5(r.zip);
-      if (!zipByProspect.has(pid)) zipByProspect.set(pid, z);        // latest wins
-      else if (!zipByProspect.get(pid) && z) zipByProspect.set(pid, z); // backfill if latest had none
-    }
-  }
+
+  // PAGINATED — the "300 prospect ids (~500 rows) stays safely under it"
+  // reasoning this replaced was true of the AVERAGE and wrong about the worst
+  // case. A prospect holds 1.66 cached leads on average but up to 41, and the
+  // 300 prospects with the most leads sum to 3,306 rows — 3.3x PostgREST's
+  // silent 1,000-row cap. A truncated page does not error; it drops leads, and
+  // because the rule below is LATEST-WINS the dropped rows are exactly the ones
+  // that decide the answer. The prospect still resolves — to the wrong market,
+  // quietly, in a scorecard nobody re-checks.
+  //
+  // Chunking alone cannot fix this: no chunk size is safe when a single key can
+  // carry 41 rows. selectAllIn pages WITHIN each chunk and asserts the count.
+  const rows = await selectAllIn(supabase, 'lp_leads', {
+    columns: 'id, lp_prospect_id, zip, updated_at_lp',
+    orderBy: 'id',
+    column: 'lp_prospect_id',
+    values: ids,
+  });
+
+  for (const [pid, z] of latestZipByProspect(rows)) zipByProspect.set(pid, z);
 
   const marketByProspect = new Map();
   for (const pid of ids) {
@@ -222,28 +255,51 @@ export async function buildProspectMarketMap(prospectIds) {
  * inline prospect ZIP path. Used by the scorecard cohort partition (C2) so
  * funnel attribution matches revenue attribution.
  */
+/**
+ * prospect_id → { market_code, method }, branch-first, from a COMPLETE set of
+ * lp_lead_market_assignments rows.
+ *
+ * Pure and exported so branch-first-wins has unit coverage without a database.
+ * The rule is order-independent by construction — a brn_map row beats a zip one
+ * no matter which arrives first — which is exactly why a TRUNCATED input is so
+ * quiet here: drop the single brn_map row among a prospect's leads and the
+ * function returns the ZIP answer with no sign anything is missing.
+ */
+export function branchFirstByProspect(rows) {
+  const out = new Map();
+  for (const r of rows || []) {
+    const pid = String(r.prospect_id ?? '');
+    if (!pid || r.resolved_market_code == null) continue;
+    const isBranch = r.method === 'brn_map';
+    const prev = out.get(pid);
+    // Branch-first-wins: a brn_map assignment overrides an existing zip one;
+    // otherwise the first assignment seen for the prospect stands.
+    if (!prev || (isBranch && prev.method !== 'brn_map')) {
+      out.set(pid, { market_code: r.resolved_market_code, method: r.method });
+    }
+  }
+  return out;
+}
+
 export async function buildProspectMarketMapFromAssignments(prospectIds) {
   const ids = [...new Set((prospectIds || []).map((p) => String(p ?? '')).filter(Boolean))];
   const byProspect = new Map(); // prospect_id → { market_code, method }
-  const CHUNK = 300;
-  for (let i = 0; i < ids.length; i += CHUNK) {
-    const slice = ids.slice(i, i + CHUNK);
-    const { data, error } = await supabase
-      .from('lp_lead_market_assignments')
-      .select('prospect_id, resolved_market_code, method')
-      .in('prospect_id', slice);
-    if (error) throw new Error(`lp_lead_market_assignments lookup failed: ${error.message}`);
-    for (const r of data || []) {
-      const pid = String(r.prospect_id);
-      if (!pid || r.resolved_market_code == null) continue;
-      const isBranch = r.method === 'brn_map';
-      const prev = byProspect.get(pid);
-      // Branch-first-wins: a brn_map assignment overrides an existing zip one;
-      // otherwise the first assignment seen for the prospect stands.
-      if (!prev || (isBranch && prev.method !== 'brn_map')) {
-        byProspect.set(pid, { market_code: r.resolved_market_code, method: r.method });
-      }
-    }
-  }
+
+  // PAGINATED, for the same reason as buildProspectMarketMap above: this table
+  // is one row per LEAD keyed here by PROSPECT, so a 300-prospect chunk spans
+  // 3,306 rows in the worst case against a silent 1,000-row cap. Truncation
+  // here is quieter still — BRANCH-FIRST-WINS means losing the one brn_map row
+  // among a prospect's leads silently downgrades it to the ZIP answer, which is
+  // a plausible market rather than a visible failure.
+  //
+  // Ordered by lead_id: this table has no `id` column, and lead_id is unique
+  // across all 236,322 rows.
+  const rows = await selectAllIn(supabase, 'lp_lead_market_assignments', {
+    columns: 'lead_id, prospect_id, resolved_market_code, method',
+    orderBy: 'lead_id',
+    column: 'prospect_id',
+    values: ids,
+  });
+  for (const [pid, v] of branchFirstByProspect(rows)) byProspect.set(pid, v);
   return byProspect;
 }

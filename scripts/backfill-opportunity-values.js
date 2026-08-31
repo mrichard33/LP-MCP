@@ -170,25 +170,36 @@ async function fetchCandidates() {
 /**
  * contact id -> most recent non-cancelled job value, in one pass rather than N.
  *
- * PAGINATED SINCE 2026-08-31, AND THE REASON MATTERS
- * --------------------------------------------------
+ * PAGINATED SINCE 2026-08-31 — AND NO PAST RUN WAS AFFECTED
+ * ---------------------------------------------------------
  * This used to read 500 contact ids per chunk with no pagination. PostgREST
  * caps every response at 1,000 rows silently — no error, no flag, and .limit()
- * does not raise it — and a 500-contact chunk routinely spans more than that,
- * so most of each chunk was dropped on the floor.
+ * does not raise it — so a chunk spanning more than 1,000 job rows would have
+ * been truncated on the floor.
  *
- * The effect here was UNDER-WRITING, not wrong values: a contact whose job rows
- * fell past the cap simply had no entry in this map, so valueWriteDecision()
- * saw a null value and answered 'skip_no_job'. Those opportunities were
- * reported as "no usable job" and never got the monetaryValue they had. The
- * `no usable job` line in every run before this fix is inflated by an unknown
- * amount, and the write count short by the same.
+ * IT NEVER WAS. Say so plainly, because the first version of this comment
+ * claimed the opposite and was wrong. Measured against live data:
  *
- * Nothing was written incorrectly, so this is a hardening fix and not an
- * incident — but it is worth stating plainly what the failure mode is: a number
- * that is smaller than the truth and looks exactly like an answer. The same bug
- * in scripts/reconcile-p2-stages.js read one milestone row in six and planned 2
- * stage moves instead of 597, with a completely plausible summary.
+ *   contacts queried              2453
+ *   chunk row counts              517, 497, 513, 491, 476   (cap 1000)
+ *   rows the old read dropped        0
+ *   contacts with a value OLD/NEW 1830 / 1830
+ *
+ * Nor was that luck in the ordering. lp_jobs carries 2,662 contact-linked rows
+ * over 2,265 distinct contacts — 1.18 per contact, max 9 — so the 500 contacts
+ * with the MOST jobs still sum to only 897 rows. At chunk size 500 the cap was
+ * unreachable by construction; it would take ~850 contacts in one chunk to
+ * touch it. The bug was real but LATENT, and no historical `no usable job`
+ * count or write count is short because of it. Do not go re-running past
+ * backfills on the strength of this fix.
+ *
+ * It is still worth paginating, because the margin is a property of today's
+ * data and nothing enforces it. And it is worth naming the failure mode: a
+ * number smaller than the truth that looks exactly like an answer. The same
+ * bug in scripts/reconcile-p2-stages.js was NOT latent — one 500-job chunk
+ * selects 4,425 completed milestones, 4.4x over the cap, and it read one
+ * milestone row in six and planned 2 stage moves instead of 597, with a
+ * completely plausible summary.
  *
  * src/supabase-page.js owns the paging and asserts the row count, so this is
  * one shared implementation rather than the third hand-rolled copy — the copies
