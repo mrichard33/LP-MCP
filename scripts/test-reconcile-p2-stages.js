@@ -212,10 +212,31 @@ test('every job cancelled is a loss, NOT reported as a missing job', () => {
   assert.equal(d.jobStatus, 'Dead Deal'); // the newest of them, for the reason
 });
 
-test('the non-cancelled lost statuses are lost too', () => {
-  for (const status of ['Credit Decline', 'Sent To Attorney']) {
-    assert.equal(decide(STAGE.CONTRACT_SIGNED, [job(93400, status, ['M', 'R'])]).verdict, 'lose');
-  }
+test('Sent To Attorney is lost — a deal in collections is not in progress', () => {
+  assert.equal(decide(STAGE.CONTRACT_SIGNED, [job(93400, 'Sent To Attorney', ['M', 'R'])]).verdict, 'lose');
+});
+
+test('Credit Decline is NOT lost — it stays open and derives a stage', () => {
+  // Decided 2026-08-31. 149 of the 375 planned Contract Signed losses hung on
+  // this one status. Marking an opportunity lost is irreversible in reporting,
+  // and nobody has measured how often a decline is reworked and recovers. Until
+  // that is known it is in-progress work, which also aligns the reconciler with
+  // CANCELLED_JOB_STATUSES in src/lp-job-value.js.
+  assert.equal(LOST_JOB_STATUSES.has('Credit Decline'), false);
+  assert.equal(WON_JOB_STATUSES.has('Credit Decline'), false);
+  const d = decide(STAGE.CONTRACT_SIGNED, [job(93400, 'Credit Decline', ['M', 'R', 'H'])]);
+  assert.equal(d.verdict, 'move');
+  assert.equal(d.targetStageId, STAGE.PERMITTING);
+});
+
+test('a Credit Decline job can still be the job that decides an opportunity', () => {
+  // It is not in CANCELLED_JOB_STATUSES either, so latestJob() may select it
+  // rather than falling through to an older job. Both halves have to agree or
+  // a decline would be selected and then have no verdict.
+  const jobs = [job(80100, 'Awaiting Product', ['M']), job(93400, 'Credit Decline', ['M', 'R'])];
+  const d = decide(STAGE.CONTRACT_SIGNED, jobs);
+  assert.equal(d.job.lp_job_id, '93400');
+  assert.equal(d.verdict, 'move');
 });
 
 test('Installed & Unpaid is NOT won — the work is done, the money is not', () => {
