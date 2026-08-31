@@ -87,17 +87,20 @@
  * for the live emit path. This script deliberately does NOT import it — a
  * repair pass reading a copy would repair the data to match the copy.
  *
- * ─── TERMINAL STATUS — NEEDS SIGN-OFF BEFORE --fields=status --apply ──────
+ * ─── TERMINAL STATUS ──────────────────────────────────────────────────────
  * WON  : Paid In Full · PIF Survey Ready · PIF NO Survey · Assumed Complete
- * LOST : Cancelled · Cancelled By Mgt · Dead Deal · Credit Decline ·
- *        Sent To Attorney
+ * LOST : Cancelled · Cancelled By Mgt · Dead Deal · Sent To Attorney
  *
- * Everything else — Awaiting Product, Scheduled, HOLD - HOA, Quoted, New, and
- * the other holds and awaits — is in progress: derive a stage, leave the status
- * open. 'Installed & Unpaid' (78 jobs / 61 contacts) is deliberately in that
- * in-progress set: the work is done but the money is not collected, so its
- * milestones carry it to Install Completed and it stays OPEN. Marking unpaid
- * work won overstates revenue. See the three open questions in the PR.
+ * Everything else is in progress: derive a stage, leave the status open. Two
+ * of those are decisions rather than omissions, both made 2026-08-31:
+ *
+ *   'Installed & Unpaid' (78 jobs / 61 contacts) — the work is done, the money
+ *   is not collected. Its milestones carry it to Install Completed and it stays
+ *   OPEN. It becomes won when a collected status is reached, not before;
+ *   counting unpaid work as won overstates revenue.
+ *
+ *   'Credit Decline' (329 jobs / 179 contacts) — see LOST_JOB_STATUSES below.
+ *   Left open pending a measurement of how often declines recover.
  *
  * A LOST REASON IS NEVER INVENTED. GHL's built-in Lost Reason picker is a
  * configured list; an unrecognised string either fails the write or pollutes
@@ -153,6 +156,7 @@ import { PIPELINE_IDS, STAGE_MAP, GHL_LOCATION_ID } from '../src/actions/constan
 import { checkForwardOnly, getStagePosition } from '../src/pipeline-guard.js';
 import { hlRunSQL } from '../src/admin/hl-client.js';
 import { latestJob } from '../src/lp-job-value.js';
+import { selectAllIn, assertComplete } from '../src/supabase-page.js';
 import supabase from '../src/supabase.js';
 
 // ═══════════════════════════════════════════════════════════════════
@@ -178,18 +182,34 @@ export const WON_JOB_STATUSES = new Set([
  * NOTE the overlap with CANCELLED_JOB_STATUSES in src/lp-job-value.js: the
  * first three are in both. That is not redundancy. There, they exclude a job
  * from being SELECTED (a cancelled job never decides a live opportunity);
- * here, they decide the verdict for a contact who has nothing else. The two
- * remaining statuses — 'Credit Decline' and 'Sent To Attorney' — are lost here
- * but are NOT cancelled there, which is deliberate and documented in that file:
- * a Credit Decline can still convert, so it keeps its pipeline value and can
- * still be the job an opportunity is tracking. Whether it should therefore be
- * marked lost at all is one of the open questions for sign-off.
+ * here, they decide the verdict for a contact who has nothing else.
+ *
+ * 'CREDIT DECLINE' IS DELIBERATELY NOT HERE (decided 2026-08-31).
+ * -------------------------------------------------------------
+ * It was in the proposed list, and it is the single biggest lever in the plan:
+ * 149 of the 375 losses the first dry run planned for the Contract Signed
+ * cohort. Marking an opportunity lost is an irreversible reporting act — it
+ * lands in close-rate and loss-reason reporting and nothing walks it back — and
+ * nobody has yet measured how often a declined deal is reworked and recovered
+ * versus how often it terminates. Until that is known, a decline is treated as
+ * IN PROGRESS: it derives a stage from its milestones and its status stays
+ * open.
+ *
+ * This also puts the reconciler on the same side as src/lp-job-value.js, which
+ * keeps Credit Decline OUT of CANCELLED_JOB_STATUSES so the job retains its
+ * pipeline value and can still be the job an opportunity tracks. The reporting
+ * path (src/jobs/lp-report-parse-job-status.js) does count it lost; that
+ * disagreement is pre-existing, documented in both files, and is exactly the
+ * question a recovery-rate measurement would settle. Do not "fix" it by adding
+ * the status here.
+ *
+ * 'Sent To Attorney' stays: 40 jobs across 5 contacts, and a deal in
+ * collections is not a deal in progress.
  */
 export const LOST_JOB_STATUSES = new Set([
   'Cancelled',
   'Cancelled By Mgt',
   'Dead Deal',
-  'Credit Decline',
   'Sent To Attorney',
 ]);
 
@@ -552,12 +572,16 @@ const STAGE_LABELS = Object.entries(STAGE_MAP).reduce((acc, [name, id]) => {
 const label = (stageId) => STAGE_LABELS[stageId] || stageId || '(none)';
 
 async function loadMilestoneMapping() {
-  const { data, error } = await supabase
+  const { data, error, count } = await supabase
     .from('agent_rules')
-    .select('rule_key, rule_name, enabled, event_pattern, action_template')
+    .select('rule_key, rule_name, enabled, event_pattern, action_template', { count: 'exact' })
     .like('rule_key', 'P2_MILESTONE%')
     .eq('enabled', true);
   if (error) throw new Error(`agent_rules read failed: ${error.message}`);
+  // A dozen rows today, so paging is overkill — but a partial mapping
+  // under-reconciles in total silence, which is the one outcome worth a cheap
+  // assertion. If this family ever outgrows the cap, this throws.
+  assertComplete('agent_rules', data || [], count);
   return buildMilestoneStageMap(data || []);
 }
 
@@ -572,41 +596,29 @@ async function fetchCandidates() {
        AND o.status = 'open'
      ORDER BY o.ghl_opportunity_id
   `);
-  return rows || [];
-}
 
-/**
- * SELECT ... WHERE <column> IN (...) with EVERY row, not the first thousand.
- *
- * PostgREST caps a response at 1,000 rows and says nothing about it: no error,
- * no flag, and .limit() does not raise the cap. Measured 2026-08-31 —
- * `select('lp_job_id').limit(100000)` on lp_jobs (5,892 rows) returns exactly
- * 1000. So an unpaginated chunk read of lp_job_milestones, where 500 jobs carry
- * roughly 6,000 completed milestones between them, silently drops five rows in
- * six. The first version of this script did exactly that: it planned 2 stage
- * moves instead of ~490 and reported 770 jobs as having no completed milestone
- * at all, and every number in the summary looked plausible.
- *
- * That is the failure src/admin/hl-client.js refuses loudly for the HL side —
- * a wrong number that looks right is worse than an outage. Here it is
- * paginated with .range(), ordered by the primary key so page boundaries are
- * stable, and the chunk is kept small enough that the IN list stays a sane URL.
- */
-const PAGE_ROWS = 1000;
-async function selectAllIn(table, columns, column, values, refine = (q) => q) {
-  const out = [];
-  for (let i = 0; i < values.length; i += 200) {
-    const chunk = values.slice(i, i + 200);
-    for (let from = 0; ; from += PAGE_ROWS) {
-      const { data, error } = await refine(
-        supabase.from(table).select(columns).in(column, chunk),
-      ).order('id', { ascending: true }).range(from, from + PAGE_ROWS - 1);
-      if (error) throw new Error(`${table} read failed: ${error.message}`);
-      out.push(...(data || []));
-      if (!data || data.length < PAGE_ROWS) break;
-    }
+  // hlRunSQL goes through the run_sql RPC, which returns one json value and is
+  // NOT subject to the PostgREST row cap that src/supabase-page.js exists to
+  // defeat — demonstrated by this very query returning 2,453 rows. That is a
+  // property of the transport, though, not a guarantee anyone wrote down, so it
+  // is checked rather than assumed: an independent COUNT(*) over the same
+  // predicate must agree with what arrived.
+  const [{ n } = {}] = await hlRunSQL(`
+    SELECT count(*) AS n
+      FROM opportunities o
+     WHERE o.ghl_pipeline_id = '${pipelineId}'
+       AND o.ghl_contact_id IS NOT NULL
+       AND o.deleted_at IS NULL
+       AND o.status = 'open'
+  `);
+  const expected = Number(n);
+  if (Number.isFinite(expected) && (rows || []).length !== expected) {
+    throw new Error(
+      `HL opportunities read incomplete: got ${(rows || []).length} of ${expected}. `
+      + 'Refusing to reconcile from a partial candidate set.',
+    );
   }
-  return out;
+  return rows || [];
 }
 
 /** contact id → their lp_jobs rows, each with its completed milestones attached. */
@@ -614,12 +626,12 @@ async function fetchJobsWithMilestones(contactIds) {
   const byContact = new Map();
   const byJobId = new Map();
 
-  const jobRows = await selectAllIn(
-    'lp_jobs',
-    'id, ghl_contact_id, lp_job_id, job_status, job_value',
-    'ghl_contact_id',
-    contactIds,
-  );
+  const jobRows = await selectAllIn(supabase, 'lp_jobs', {
+    columns: 'id, ghl_contact_id, lp_job_id, job_status, job_value',
+    orderBy: 'id',
+    column: 'ghl_contact_id',
+    values: contactIds,
+  });
   for (const row of jobRows) {
     const job = { ...row, milestones: [] };
     if (!byContact.has(row.ghl_contact_id)) byContact.set(row.ghl_contact_id, []);
@@ -631,13 +643,13 @@ async function fetchJobsWithMilestones(contactIds) {
   // milestone type per job whether or not it happened (5,898 rows per type), so
   // act_date is the whole signal. Filtered server-side so the pages carry only
   // rows that can decide something.
-  const milestoneRows = await selectAllIn(
-    'lp_job_milestones',
-    'id, lp_job_id, mdt_id, act_date',
-    'lp_job_id',
-    [...byJobId.keys()],
-    (q) => q.not('act_date', 'is', null),
-  );
+  const milestoneRows = await selectAllIn(supabase, 'lp_job_milestones', {
+    columns: 'id, lp_job_id, mdt_id, act_date',
+    orderBy: 'id',
+    column: 'lp_job_id',
+    values: [...byJobId.keys()],
+    refine: (q) => q.not('act_date', 'is', null),
+  });
   for (const row of milestoneRows) byJobId.get(String(row.lp_job_id))?.milestones.push(row);
 
   return { byContact, jobCount: jobRows.length, milestoneCount: milestoneRows.length };

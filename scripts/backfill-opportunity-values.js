@@ -91,6 +91,7 @@ import { PIPELINE_IDS } from '../src/actions/constants.js';
 import { hlRunSQL } from '../src/admin/hl-client.js';
 import { latestJobValue } from '../src/lp-job-value.js';
 import supabase from '../src/supabase.js';
+import { selectAllIn } from '../src/supabase-page.js';
 import { pathToFileURL } from 'node:url';
 
 const args = process.argv.slice(2);
@@ -166,19 +167,44 @@ async function fetchCandidates() {
   return rows || [];
 }
 
-/** contact id -> most recent non-cancelled job value, in one round trip rather than N. */
+/**
+ * contact id -> most recent non-cancelled job value, in one pass rather than N.
+ *
+ * PAGINATED SINCE 2026-08-31, AND THE REASON MATTERS
+ * --------------------------------------------------
+ * This used to read 500 contact ids per chunk with no pagination. PostgREST
+ * caps every response at 1,000 rows silently — no error, no flag, and .limit()
+ * does not raise it — and a 500-contact chunk routinely spans more than that,
+ * so most of each chunk was dropped on the floor.
+ *
+ * The effect here was UNDER-WRITING, not wrong values: a contact whose job rows
+ * fell past the cap simply had no entry in this map, so valueWriteDecision()
+ * saw a null value and answered 'skip_no_job'. Those opportunities were
+ * reported as "no usable job" and never got the monetaryValue they had. The
+ * `no usable job` line in every run before this fix is inflated by an unknown
+ * amount, and the write count short by the same.
+ *
+ * Nothing was written incorrectly, so this is a hardening fix and not an
+ * incident — but it is worth stating plainly what the failure mode is: a number
+ * that is smaller than the truth and looks exactly like an answer. The same bug
+ * in scripts/reconcile-p2-stages.js read one milestone row in six and planned 2
+ * stage moves instead of 597, with a completely plausible summary.
+ *
+ * src/supabase-page.js owns the paging and asserts the row count, so this is
+ * one shared implementation rather than the third hand-rolled copy — the copies
+ * are how the bug spread.
+ */
 async function jobValuesByContact(contactIds) {
+  const rows = await selectAllIn(supabase, 'lp_jobs', {
+    columns: 'id, ghl_contact_id, lp_job_id, job_status, job_value',
+    orderBy: 'id',
+    column: 'ghl_contact_id',
+    values: contactIds,
+  });
   const byContact = new Map();
-  for (let i = 0; i < contactIds.length; i += 500) {
-    const chunk = contactIds.slice(i, i + 500);
-    const { data, error } = await supabase.from('lp_jobs')
-      .select('ghl_contact_id, lp_job_id, job_status, job_value')
-      .in('ghl_contact_id', chunk);
-    if (error) throw new Error(`lp_jobs read failed: ${error.message}`);
-    for (const row of data || []) {
-      if (!byContact.has(row.ghl_contact_id)) byContact.set(row.ghl_contact_id, []);
-      byContact.get(row.ghl_contact_id).push(row);
-    }
+  for (const row of rows) {
+    if (!byContact.has(row.ghl_contact_id)) byContact.set(row.ghl_contact_id, []);
+    byContact.get(row.ghl_contact_id).push(row);
   }
   const out = new Map();
   for (const [contactId, jobs] of byContact) out.set(contactId, latestJobValue(jobs));
