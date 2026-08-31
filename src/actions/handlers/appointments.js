@@ -314,7 +314,15 @@ async function enqueuePostBookingEmailAsk(contactId, action, context) {
       target_system: 'ghl',
       target_entity: 'contact',
       target_id: contactId,
-      action_payload: { message: POST_BOOKING_EMAIL_ASK_MESSAGE, channel: 'sms' },
+      // 2026-08-31 — same trigger_id collision as the deferred confirmation
+      // below (see the note in enqueueDeferredConfirmation). This row
+      // inherited the reply's message_id and was killed by the
+      // one-reply-per-inbound outbound lock every time.
+      action_payload: {
+        message: POST_BOOKING_EMAIL_ASK_MESSAGE,
+        channel: 'sms',
+        trigger_id: `post-booking-email-ask:a${action?.id ?? contactId}`,
+      },
       reasoning: 'Post-booking email ask — its own message on the turn after the confirmation, once (2026-07-24 Engelke incident, Defect 4).',
       rule_applied: 'POST_BOOKING_EMAIL_ASK',
       confidence: 1.0,
@@ -383,7 +391,22 @@ async function enqueueDeferredConfirmation(contactId, action, context) {
       target_system: 'ghl',
       target_entity: 'contact',
       target_id: contactId,
-      action_payload: { message, channel: deferred.channel || 'sms' },
+      // 2026-08-31 — EXPLICIT trigger_id. Without it resolveTriggerId falls
+      // through to the source event and this row inherits the SAME message_id
+      // as the reply that already sent the hold copy. The outbound lock is
+      // keyed on (contact_id, trigger_id) and enforces one reply per inbound,
+      // so the confirmation deferred until the reply's lock hit TTL and was
+      // then terminally skipped as holder_expired_unreleased_presumed_sent.
+      // Verified live on 61LmNFIppYRWUzNyIJbq (action 383067): the lead was
+      // told "text you right back" and never heard back. This is a DELIBERATE
+      // second message for the same inbound, so it needs its own lock key.
+      // Keyed on the booking action id: stable across retries (so a re-run
+      // still dedupes correctly) and unique per booking.
+      action_payload: {
+        message,
+        channel: deferred.channel || 'sms',
+        trigger_id: `deferred-confirm:a${action.id}`,
+      },
       reasoning: `Deferred booking confirmation — the inline booking did not land in time, the lead was sent hold copy, and this keeps that promise (companion action ${action.id}).`,
       rule_applied: 'DEFERRED_BOOKING_CONFIRMATION',
       confidence: 1.0,
