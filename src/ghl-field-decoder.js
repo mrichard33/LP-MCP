@@ -117,7 +117,7 @@ const GHL_FIELD_DECODER = {
   // ─── PROJECT SCOPE ──────────────────────────────────────────────
   'h9FJTUbmUHIuD6JKmpXv': { name: 'Window Count',            category: 'project' },
   'j7l1KWmDgoJqy7SINjQs': { name: 'Door Count',              category: 'project' },
-  'YWhoVixgPtvEDzSXcMpJ': { name: 'Window Count (alt) / Gross Sale Amount', category: 'project', notes: 'CONFLICT: skill says Window Count alt; ghl-field-map.js says Gross Sale Amount. Verify.' },
+  'YWhoVixgPtvEDzSXcMpJ': { name: 'LP Gross Sale Amount',    category: 'project', notes: 'Verified 2026-08-31 against the live GHL custom_fields table: key contact.lp_gross_sale_amount, type MONETORY. The "Window Count (alt)" reading was wrong. Written by ghl-field-sync.js and n8n-enrichment.js, and read by the C.0-IN Sale Made Entry workflow as the stage-1 Client Lifecycle opportunity value.' },
   'L0mb4tIiSBYYLn5fyprZ': { name: 'Spouse/Partner Name',     category: 'project' },
   '3vQsf4lNxL0LrDpgHY9Q': { name: 'Language',                category: 'project' },
 
