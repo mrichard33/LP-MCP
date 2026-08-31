@@ -149,4 +149,68 @@ export function etAppointmentParts(startTime) {
   return { startDate, startTime12h };
 }
 
+/** Human wall-clock time in ET, e.g. "6:37 PM". */
+export function formatTimeHuman(date = new Date()) {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: TZ, hour: 'numeric', minute: '2-digit', hour12: true,
+  }).format(date).replace(/\s+/g, ' ').trim().toUpperCase();
+}
+
+/**
+ * Minute-grain appointment phase.
+ *
+ * WHY THIS EXISTS (Myron Thorner, q5GehRye7DNkN6jlmjl3, 2026-08-28):
+ * appointmentDelta() is whole-DAY grain. At 6:37 PM ET, 37 minutes AFTER a
+ * 6:00 PM appointment, it returned { is_past: false, days_delta: 0 } — which
+ * is true at day grain and catastrophically wrong at conversation grain. The
+ * bot told the homeowner "the rep will be reaching out ahead of 6 PM."
+ *
+ * Phases (minutes_delta = appointment instant minus now, so positive = future):
+ *   scheduled          more than 4 hours out
+ *   imminent           0 to 4 hours out — rep is en route or about to be
+ *   in_window          0 to 120 minutes PAST start — visit is happening now
+ *   past               more than 120 minutes past start
+ *   today_time_unknown LP has the day but no usable time-of-day
+ *
+ * Returns null when there is no parseable appointment date at all.
+ */
+export function appointmentPhase(apptDate, now = new Date()) {
+  if (!apptDate) return null;
+
+  const iso = lpWallClockToGhlStartTime(apptDate);
+
+  // No usable time-of-day (LP date-only rows, or exact midnight). Degrade to
+  // day grain rather than guessing a clock time we do not have.
+  if (!iso) {
+    const delta = appointmentDelta(apptDate, now);
+    if (!delta) return null;
+    let phase;
+    if (delta.days_delta > 0) phase = 'scheduled';
+    else if (delta.days_delta === 0) phase = 'today_time_unknown';
+    else phase = 'past';
+    return {
+      phase,
+      minutes_delta: null,
+      time_known: false,
+      appointment_time_human: null,
+      days_delta: delta.days_delta,
+    };
+  }
+
+  const minutes_delta = Math.round((new Date(iso).getTime() - now.getTime()) / 60000);
+  let phase;
+  if (minutes_delta > 240) phase = 'scheduled';
+  else if (minutes_delta > 0) phase = 'imminent';
+  else if (minutes_delta > -120) phase = 'in_window';
+  else phase = 'past';
+
+  return {
+    phase,
+    minutes_delta,
+    time_known: true,
+    appointment_time_human: formatTimeHuman(new Date(iso)),
+    days_delta: appointmentDelta(apptDate, now)?.days_delta ?? null,
+  };
+}
+
 export const APPOINTMENT_TZ = TZ;

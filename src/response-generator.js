@@ -1680,6 +1680,45 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   parts.push(`\n═══════ CURRENT DATE — Florida / ${PROMPT_TIMEZONE} ═══════`);
   parts.push(`TODAY IS: ${formatTodayForPrompt()}. NEVER propose or confirm a date that has already passed. Compare every appointment and proposed slot against TODAY before calling it upcoming.`);
 
+  // ── TIME NOW (2026-08-29, Myron Thorner q5GehRye7DNkN6jlmjl3) ──────────
+  // The model previously received only the current DATE — the block directly
+  // above. It emitted three consecutive replies citing clock times already in
+  // the past, including "the rep will be reaching out ahead of 6 PM" sent at
+  // 6:37 PM. The clock and the phase are stated here, alongside the date and
+  // ahead of every appointment-specific block in this prompt, and framed as
+  // binding.
+  if (context.now?.time_human) {
+    parts.push(
+      `TIME NOW: It is ${context.now.time_human} on ${context.now.date_human} (Eastern).\n` +
+      `HARD RULE: every clock time you write must be LATER than ${context.now.time_human}. ` +
+      `Before writing any time, compare it to the current time. Never offer a callback ` +
+      `window, a deadline, or a "if you haven't heard by X" that has already passed. ` +
+      `If there is no useful future time to offer, offer a phone call instead.`
+    );
+  }
+  if (context.lp?.appointment_phase) {
+    const ph = context.lp.appointment_phase;
+    const mins = context.lp.appointment_minutes_delta;
+    const at = context.lp.appointment_time_human;
+    // LP appointment rows with no usable time-of-day (date-only values, which
+    // normalize to UTC midnight) degrade to day grain: the phase is real but
+    // the clock and the delta are both null. Never interpolate those — "booked
+    // for null" and "that was 0 minutes ago" would be worse than the defect
+    // this block exists to fix. Say the time is unverified instead.
+    const timeKnown = at !== null && typeof mins === 'number';
+    const phaseLine = timeKnown ? {
+      scheduled: `APPOINTMENT: booked for ${at}, still comfortably ahead. Normal pre-visit tone.`,
+      imminent: `APPOINTMENT: ${at}, about ${mins} minutes from now. The rep is en route or about to be. Do not re-pitch, do not re-book, do not re-qualify. Logistics and reassurance only.`,
+      in_window: `APPOINTMENT: ${at} — that time has PASSED and the visit window is open RIGHT NOW (${Math.abs(mins)} minutes in). Do NOT say the appointment is "coming up," "on track," or "ahead of ${at}." The correct move is to offer to get a person on the phone immediately.`,
+      past: `APPOINTMENT: ${at} — that was ${Math.abs(mins)} minutes ago and the window has closed. Do NOT speak about it in the future tense. Acknowledge plainly that the time has passed, do not invent a reason for it, and offer to get a person on the phone immediately.`,
+    }[ph] : {
+      scheduled: `APPOINTMENT: on record for ${context.lp.appointment_date || 'an upcoming date'}, exact time not confirmed in our records. Do not state a specific time you cannot verify. Offer to have someone confirm it by phone.`,
+      past: `APPOINTMENT: on record for ${context.lp.appointment_date || 'an earlier date'}, which has already passed; the exact time is not confirmed in our records. Do NOT speak about it in the future tense and do NOT state a time you cannot verify. Offer to get a person on the phone immediately.`,
+      today_time_unknown: `APPOINTMENT: today, exact time not confirmed in our records. Do not state a specific time you cannot verify. Offer to have someone confirm it by phone.`,
+    }[ph];
+    if (phaseLine) parts.push(phaseLine);
+  }
+
   parts.push(`\nCLASSIFICATION: ${classification.intent_class} (${classification.confidence?.toFixed(2) || 'n/a'} confidence, ${classification.classification_method})`);
   if (classification.reasoning) parts.push(`Classifier reasoning: ${classification.reasoning}`);
 
@@ -2921,7 +2960,13 @@ export async function buildConfFlowContext(contactId, context, { now = new Date(
   let apptInstant = null;
 
   const lpApptRaw = context?.lp?.appointment_date;
-  if (lpApptRaw && context?.lp?.appointment_is_past !== true) {
+  // 2026-08-29: appointment_is_past is day grain, so on the day of the visit
+  // it stays false even hours after the start — the conf-flow then offered
+  // reschedule options against an appointment already underway. The
+  // minute-grain phase excludes the live and closed windows too.
+  if (lpApptRaw
+      && context?.lp?.appointment_is_past !== true
+      && !['in_window', 'past'].includes(context?.lp?.appointment_phase)) {
     const iso = lpWallClockToGhlStartTime(lpApptRaw);
     if (iso) apptInstant = new Date(iso);
   }
