@@ -49,6 +49,7 @@ import { updateGHLContactFields } from '../../ghl.js';
 import { checkStageMoveEvidence } from '../stage-evidence.js';
 import { emitEvent } from '../../event-emitter.js';
 import { openJobValueForContact } from '../../lp-job-value.js';
+import { opportunitySourceField } from '../../lp-source-attribution.js';
 
 // ─── v5.0 (2026-08-16): one-open-opportunity-per-pipeline invariant ──
 // Standing rule (Mark): a contact must never hold more than one OPEN
@@ -271,7 +272,15 @@ export async function executeMoveOpportunity(action) {
     // v5.2: and it never sent source at all, which is why no_value and no_source
     // track each other stage for stage. Create only — the PUT paths must not
     // clobber a source another path already set.
-    const sourceField = c.source ? { source: c.source } : {};
+    //
+    // v5.3 (2026-08-31): the source now carries the LP VENDOR too, where the
+    // contact's source and LP's already agree on the channel — "Internet"
+    // becomes "Internet, Modernize". The parent alone is near-useless for
+    // attribution ("Internet" is 60%+ of volume). Contacts whose vocabulary
+    // differs from LP's ("Canvassing", "Window Estimator") are returned
+    // unchanged, so this only ever adds detail and never rewrites a value
+    // another path set. See src/lp-source-attribution.js.
+    const sourceField = opportunitySourceField(c);
     try {
       const newOpp = await ghlFetch('POST', '/opportunities/', {
         pipelineId,

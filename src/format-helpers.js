@@ -192,6 +192,45 @@ export function formatLpSource(source, detail) {
 }
 
 /**
+ * 2026-08-31 — The DATA sibling of formatLpSource.
+ *
+ * formatLpSource above renders "Parent > Detail" for humans reading a
+ * notification. This one produces "Parent, Detail" for a stored attribution
+ * field, where the comma form is a native LP idiom rather than an invention:
+ * LP's own `promotername` arrives as "Internet, Socius Marketing", and
+ * deriveSourceFromPromoter (src/sync-leads.js) already parses exactly that
+ * shape. Prefix matching therefore keeps a combined value groupable against
+ * the plain parent it extends.
+ *
+ * Same absence rules as formatLpSource — null/undefined/whitespace-only all
+ * count as absent — plus ONE rule it does not have: a detail that merely
+ * restates its parent is not doubled. LP carries thousands of such rows
+ * (Canvass/Canvass, Canvass Sticky/Canvass Sticky), and "Canvass, Canvass"
+ * would be a value no reader could interpret. The comparison is trimmed and
+ * case-insensitive so "Canvass"/" canvass " collapses too.
+ *
+ * Deliberately NOT built on vendorSlug() from services/lp-contact-backstop.js:
+ * that is the TAG axis and collapses punctuation to hyphens, which would merge
+ * genuinely distinct vendors ("Home4Quotes" vs "Home 4 Quotes") into one label.
+ *
+ * Examples:
+ *   combinedSourceLabel("Internet", "Modernize")  → "Internet, Modernize"
+ *   combinedSourceLabel("Canvass", "Canvass")     → "Canvass"
+ *   combinedSourceLabel("Canvass", " canvass ")   → "Canvass"
+ *   combinedSourceLabel("Internet", null)         → "Internet"
+ *   combinedSourceLabel(null, "Modernize")        → "Modernize"
+ *   combinedSourceLabel(null, null)               → null
+ */
+export function combinedSourceLabel(source, detail) {
+  const s = source != null && String(source).trim() !== '' ? String(source).trim() : null;
+  const d = detail != null && String(detail).trim() !== '' ? String(detail).trim() : null;
+  if (s && d) return s.toLowerCase() === d.toLowerCase() ? s : `${s}, ${d}`;
+  if (s) return s;
+  if (d) return d;
+  return null;
+}
+
+/**
  * 2026-06-02 — Format an appointment time for team-facing display.
  *
  * The appointment time the system stores and sends to LP is 24-hour

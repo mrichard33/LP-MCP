@@ -30,8 +30,14 @@ const SOURCE_MAP_TTL_MS = parseInt(process.env.ENTRY_SOURCE_MAP_TTL_MS || '30000
 let _cache = null;   // Array<row> snapshot of lp_source_mapping
 let _cacheAt = 0;
 
-/** Read a custom field value off a GHL contact snapshot. Mirrors enrichment.readCF. */
-function readCF(contact, fieldId) {
+/**
+ * Read a custom field value off a GHL contact snapshot. Mirrors enrichment.readCF.
+ *
+ * 2026-08-31: promoted to a real export. It was private here and duplicated
+ * privately in actions/enrichment.js; the opportunity create path now needs it
+ * too, and reaching through `_internal` from production code is not that.
+ */
+export function readCF(contact, fieldId) {
   const arr = contact?.customFields || [];
   const f = arr.find((x) => x.id === fieldId);
   if (!f) return null;
