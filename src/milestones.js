@@ -2,6 +2,38 @@ import supabase from './supabase.js';
 import { applyGHLTag } from './ghl.js';
 import { emitEvent } from './event-emitter.js';
 import { classifyMilestoneDate, MIN_PLAUSIBLE_ACT_DATE } from './milestone-gate.js';
+import { selectAllIn } from './supabase-page.js';
+
+// Rows per candidate page. PostgREST caps a response at 1,000 on this project
+// and says nothing when it truncates, so this is the cap made explicit rather
+// than a limit being imposed — see src/supabase-page.js.
+const CANDIDATE_PAGE_ROWS = 1000;
+
+// The lowest possible uuid, as the opening keyset cursor. lp_job_milestones.id
+// is a uuid, so this is `>= every row` rather than an integer 0.
+const UUID_MIN = '00000000-0000-0000-0000-000000000000';
+
+/**
+ * Ceiling on GHL tags this sweep will apply in one pass.
+ *
+ * NOT a performance knob — a blast-radius one. When the clog described above
+ * was fixed there were 12,618 achieved-but-unfired milestones waiting, each of
+ * which applies a customer-visible tag and emits an event that can move a P2
+ * opportunity. Draining that in a single pass would fire twelve thousand tags
+ * at real homeowners inside one sync. At 100 per pass and a 15-minute sync the
+ * backlog clears in about a day and a half, and a mistake costs 100 records
+ * rather than all of them.
+ *
+ * Rows skipped for want of a contact do NOT consume budget — only real fires
+ * do — so a queue that is mostly unfireable still makes full progress.
+ *
+ * Set MILESTONE_SWEEP_MAX_FIRES=0 for SCAN-ONLY: the sweep still walks the
+ * whole queue and reports exactly what it would have fired, but applies no tag
+ * and emits no event. That is the safe way to confirm the walk on live data
+ * before letting it write — the same dry-run-first posture the repair scripts
+ * in scripts/ take.
+ */
+const MAX_FIRES_PER_PASS = Number(process.env.MILESTONE_SWEEP_MAX_FIRES ?? 100);
 
 // mdt_id → GHL tag lookup (16 milestones for the C.x Customer Journey)
 export const MDT_TAG_MAP = {
@@ -78,67 +110,240 @@ export const MDT_LABELS = {
  *    Client Lifecycle stage with the right tag on them. Now emitted with
  *    the same idempotency_key as the inline path, so a milestone that fires
  *    here after a partial inline failure cannot double-emit.
+ *
+ * ─── 2026-08-31: THIRD DEFECT — THE SWEEP WAS FIRING NOTHING AT ALL ───
+ *
+ * Measured on live data before this fix:
+ *
+ *   candidate queue (exact count)  27668
+ *   rows the sweep actually read    1000   ← 3.6%
+ *   overlap between two reads       1000 / 1000  (100% identical)
+ *   of that window, fireable           0
+ *
+ * Three things compounded, and only together do they explain a job that
+ * looks healthy in the logs and does nothing:
+ *
+ *   1. The candidate SELECT had no .range() and no .limit(). PostgREST caps a
+ *      response at 1,000 rows SILENTLY, so 27,668 candidates arrived as 1,000
+ *      with no error and no truncation marker.
+ *   2. It had no ORDER BY either. An unordered PostgREST read comes back in
+ *      heap order, which is stable between calls — hence the 100% overlap. The
+ *      sweep saw the same arbitrary 1,000 rows on every pass, forever.
+ *   3. A row is only marked ghl_tag_fired once a tag has ACTUALLY been applied.
+ *      A row whose contact cannot be resolved hits `continue` and is never
+ *      marked, so it stays a candidate permanently. 15,050 rows are in that
+ *      state — 15x the page size — and heap order had clustered them into
+ *      exactly the window the sweep kept re-reading.
+ *
+ * So the window was 100% unfireable, nothing in it could ever be marked, the
+ * window therefore never changed, and 12,618 fireable milestones sat
+ * unreachable behind it. Each is a missed GHL tag AND a missed
+ * lp.milestone_completed — which is to say a missed P2 stage move, the very
+ * defect (2) above claims to have fixed.
+ *
+ * THE FIX IS ORDERING, NOT FILTERING, AND THAT DISTINCTION IS LOAD-BEARING.
+ *
+ * The tempting fix — only consider rows that have a contact — is FORBIDDEN
+ * here. scripts/test-ghl-link-propagate.js pins the invariant that this
+ * SELECT filters on act_date and ghl_tag_fired and nothing else, because
+ * sql/075_ghl_link_propagate.sql's "this cannot fire a tag at a real
+ * homeowner" claim rests on the fire set being independent of ghl_contact_id.
+ * Add that filter and the propagation silently arms thousands of historical
+ * fires. Do not add it. That test is not in the way; it is the reason this
+ * fix takes the shape it does.
+ *
+ * Ordering alone is enough, because the dead rows are not concentrated: walked
+ * in id order every 1,000-row page is ~45% fireable (454, 452, 438, 447, ...).
+ * It was only heap order that made them look like a wall. So this now walks
+ * the queue by keyset on id, and pages PAST unfireable rows instead of
+ * stopping at them.
+ *
+ * The 15,050 unfireable rows are still read each pass — about 16 pages once
+ * the backlog drains. They no longer block anything; they cost reads. Retiring
+ * them for good needs a decision this code should not make on its own: their
+ * leads have no GHL contact TODAY, but a later link would make them legitimate
+ * fires, so marking them fired would silently destroy that.
  */
-export async function processMilestoneTriggers(now = new Date()) {
-  const { data: newMilestones, error } = await supabase
+/**
+ * One page of sweep candidates, in keyset order after `cursor`.
+ *
+ * Takes the client as an argument for one reason: it is the only seam in this
+ * module. Everything else here reaches Supabase and GHL through import-time
+ * singletons, which is why scripts/test-ghl-link-propagate.js has to assert
+ * its invariant against source TEXT. The paging rules below — ordered, keyset,
+ * and free of any ghl_contact_id predicate — are the ones that were wrong for
+ * long enough to stall the sweep completely, so they get a real test with a
+ * fake PostgREST instead (scripts/test-milestone-sweep.js).
+ *
+ * THE PREDICATE AND THE WALK ARE DIFFERENT THINGS, and the order below says
+ * which is which: everything up to ghl_tag_fired decides ELIGIBILITY and is
+ * pinned by the propagation safety test; everything after it decides only
+ * WHERE WE ARE in the queue and must never narrow the set.
+ */
+export async function readCandidatePage(client, { now, cursor, pageRows = CANDIDATE_PAGE_ROWS }) {
+  return client
     .from('lp_job_milestones')
-    .select('lp_job_id, lp_lead_id, ghl_contact_id, mdt_id, datetype, act_date')
+    .select('id, lp_job_id, lp_lead_id, ghl_contact_id, mdt_id, datetype, act_date')
     .not('act_date', 'is', null)
     // Achievement gate, pushed into Postgres. Upper bound excludes both
     // scheduled-future and the corrupt 2206/2046 rows in one comparison.
     .gte('act_date', MIN_PLAUSIBLE_ACT_DATE)
     .lte('act_date', now.toISOString())
-    .eq('ghl_tag_fired', false);
+    .eq('ghl_tag_fired', false)
+    // ── walk, not predicate ──
+    .gt('id', cursor)
+    .order('id', { ascending: true })
+    .limit(pageRows);
+}
 
-  if (error) {
-    console.error('[Milestones] Query failed:', error.message);
-    return { processed: 0, fired: 0, errors: 0, gated: 0 };
-  }
-
+export async function processMilestoneTriggers(now = new Date()) {
   let fired = 0;
   let errors = 0;
   let gated = 0;
+  let processed = 0;
+  let scanned = 0;
+  let pagesRead = 0;
+  let skippedNoContact = 0;
+  let skippedNoTag = 0;
+  let wouldFire = 0;
+  // Outward-facing ATTEMPTS this pass — successful fires plus failed tag
+  // applications. The budget is charged against this, not against `fired`,
+  // because a failure still reached a live contact and still wrote a log row.
+  let attempted = 0;
+  let stoppedOnBudget = false;
 
-  // Bug 10: Build a map of lead_id → {ghl_contact_id, lp_prospect_id} from
-  // lp_leads so we can resolve contacts and always log prospect IDs.
-  const leadIds = [...new Set((newMilestones || []).map(m => m.lp_lead_id).filter(Boolean))];
-  const leadDataMap = {};
-  if (leadIds.length > 0) {
-    const { data: leads } = await supabase
-      .from('lp_leads')
-      .select('lp_lead_id, ghl_contact_id, lp_prospect_id')
-      .in('lp_lead_id', leadIds);
-    for (const lead of (leads || [])) {
-      leadDataMap[lead.lp_lead_id] = {
-        ghl_contact_id: lead.ghl_contact_id,
-        lp_prospect_id: lead.lp_prospect_id,
-      };
+  // Budget 0 means "walk everything, write nothing" rather than "do nothing":
+  // an off switch that still reports is worth far more than a silent one.
+  const scanOnly = MAX_FIRES_PER_PASS <= 0;
+
+  // Keyset, not offset. Firing a row sets ghl_tag_fired = true, which removes
+  // it from this very filter mid-walk; an offset cursor would then slide over
+  // exactly as many unread rows as were fired. A cursor on id cannot skip.
+  let cursor = UUID_MIN;
+
+  for (;;) {
+    if (!scanOnly && attempted >= MAX_FIRES_PER_PASS) { stoppedOnBudget = true; break; }
+
+    const { data: page, error } = await readCandidatePage(supabase, { now, cursor });
+
+    if (error) {
+      console.error('[Milestones] Query failed:', error.message);
+      if (scanned === 0) return { processed: 0, fired: 0, errors: 0, gated: 0 };
+      break; // partial pass: report what was actually done, do not claim zero
     }
+    if (!page.length) break;
+
+    pagesRead++;
+    scanned += page.length;
+    cursor = page[page.length - 1].id;
+
+    // Bug 10: Build a map of lead_id → {ghl_contact_id, lp_prospect_id} from
+    // lp_leads so we can resolve contacts and always log prospect IDs.
+    // Per page, and via the shared count-asserting reader: a page carries up to
+    // 1,000 keys, and an unchunked .in() of 1,000 sits exactly ON the response
+    // cap — a partial lead map would make fireable rows look contact-less and
+    // skip them silently, which is the same class of bug as the one above.
+    const leadIds = [...new Set(page.map(m => m.lp_lead_id).filter(Boolean))];
+    const leadDataMap = {};
+    if (leadIds.length > 0) {
+      const leads = await selectAllIn(supabase, 'lp_leads', {
+        columns: 'id, lp_lead_id, ghl_contact_id, lp_prospect_id',
+        orderBy: 'id',
+        column: 'lp_lead_id',
+        values: leadIds,
+      });
+      for (const lead of leads) {
+        leadDataMap[lead.lp_lead_id] = {
+          ghl_contact_id: lead.ghl_contact_id,
+          lp_prospect_id: lead.lp_prospect_id,
+        };
+      }
+    }
+
+    // Job context for the emitted event payload (job_value drives the P2
+    // opportunity's monetary value; branch_code drives market attribution).
+    // ONE batched read per page, not one per milestone.
+    const jobIds = [...new Set(page.map(m => m.lp_job_id).filter(Boolean))];
+    const jobDataMap = {};
+    if (jobIds.length > 0) {
+      const jobs = await selectAllIn(supabase, 'lp_jobs', {
+        columns: 'id, lp_job_id, job_value, branch_code',
+        orderBy: 'id',
+        column: 'lp_job_id',
+        values: jobIds,
+      });
+      for (const job of jobs) {
+        jobDataMap[job.lp_job_id] = { job_value: job.job_value, branch_code: job.branch_code };
+      }
+    }
+
+    const spent = await processPage(page, {
+      now, leadDataMap, jobDataMap, scanOnly,
+      // Charged against attempts ACROSS pages, not fires within one. An earlier
+      // draft passed `MAX_FIRES_PER_PASS - fired`: because a failed tag
+      // increments errors and not fired, a GHL outage left the remaining budget
+      // at full on every page and the ceiling became 28x itself. Track the spend.
+      remainingBudget: MAX_FIRES_PER_PASS - attempted,
+      onWouldFire: () => { wouldFire++; },
+      onFired: () => { fired++; },
+      onError: () => { errors++; },
+      onGated: () => { gated++; },
+      onNoContact: () => { skippedNoContact++; },
+      onNoTag: () => { skippedNoTag++; },
+      onProcessed: () => { processed++; },
+    });
+    attempted += spent;
+    if (!scanOnly && attempted >= MAX_FIRES_PER_PASS) { stoppedOnBudget = true; break; }
+
+    if (page.length < CANDIDATE_PAGE_ROWS) break;
   }
 
-  // Job context for the emitted event payload (job_value drives the P2
-  // opportunity's monetary value; branch_code drives market attribution).
-  // ONE batched read for the whole sweep, not one per milestone.
-  const jobIds = [...new Set((newMilestones || []).map(m => m.lp_job_id).filter(Boolean))];
-  const jobDataMap = {};
-  if (jobIds.length > 0) {
-    const { data: jobs } = await supabase
-      .from('lp_jobs')
-      .select('lp_job_id, job_value, branch_code')
-      .in('lp_job_id', jobIds);
-    for (const job of (jobs || [])) {
-      jobDataMap[job.lp_job_id] = { job_value: job.job_value, branch_code: job.branch_code };
-    }
+  if (gated > 0) {
+    console.log(`[Milestones] ${gated} row(s) held by the achievement gate — act_date not yet reached`);
   }
+  if (skippedNoContact > 0) {
+    console.log(
+      `[Milestones] ${skippedNoContact} row(s) skipped — no GHL contact on the milestone or its lead. `
+      + 'These are never marked fired, so they stay candidates; the walk pages past them.',
+    );
+  }
+  console.log(
+    `[Milestones] swept ${scanned} candidate(s) over ${pagesRead} page(s): `
+    + (scanOnly ? `SCAN ONLY — ${wouldFire} would fire (nothing written)` : `${fired} fired`)
+    + `, ${errors} failed, ${skippedNoContact} no-contact, ${skippedNoTag} no-tag`
+    + (stoppedOnBudget ? ` — STOPPED at the ${MAX_FIRES_PER_PASS}-fire budget, more remain` : ''),
+  );
 
-  for (const milestone of (newMilestones || [])) {
+  return {
+    processed, fired, errors, gated,
+    scanned, pagesRead, skippedNoContact, skippedNoTag, wouldFire, scanOnly, stoppedOnBudget,
+  };
+}
+
+/**
+ * Fire one page of candidates. Returns the number of outward-facing ATTEMPTS
+ * made — fires plus failed tag applications — so the caller can charge them
+ * against a budget that spans the whole pass rather than resetting per page.
+ *
+ * Split out of processMilestoneTriggers only so the paging above stays legible;
+ * the per-row rules are unchanged.
+ */
+async function processPage(page, {
+  now, leadDataMap, jobDataMap, remainingBudget, scanOnly,
+  onFired, onError, onGated, onNoContact, onNoTag, onProcessed, onWouldFire,
+}) {
+  let spent = 0;
+
+  for (const milestone of page) {
+    if (!scanOnly && spent >= remainingBudget) return spent;
+    onProcessed();
     // Belt-and-braces: the range filter above already excluded these, but
     // running the shared predicate here keeps the two fire paths provably
     // in agreement and catches anything the range filter's timezone
     // handling might let through.
     const verdict = classifyMilestoneDate(milestone.act_date, now);
     if (!verdict.achieved) {
-      gated++;
+      onGated();
       continue;
     }
 
@@ -146,10 +351,19 @@ export async function processMilestoneTriggers(now = new Date()) {
     // Bug 10: Use lead's ghl_contact_id as fallback if milestone row has null
     const ghlContactId = milestone.ghl_contact_id || leadData.ghl_contact_id;
     const lpProspectId = leadData.lp_prospect_id || null;
-    if (!ghlContactId) continue;
+    // Unfireable, and deliberately NOT marked: the lead may gain a GHL contact
+    // later, and this row is then a legitimate fire. It costs a read on every
+    // pass and blocks nothing — the walk continues past it. Counting it is the
+    // point: 15,050 of these silently wedged the sweep before it was ordered.
+    if (!ghlContactId) { onNoContact(); continue; }
 
     const tag = MDT_TAG_MAP[milestone.mdt_id];
-    if (!tag) continue;
+    if (!tag) { onNoTag(); continue; }
+
+    // Everything above is classification and touches nothing. The line below
+    // is the first outward-facing act in this function, so scan-only stops
+    // exactly here — after the row has been counted, before anything is sent.
+    if (scanOnly) { onWouldFire(); continue; }
 
     const success = await applyGHLTag(ghlContactId, tag);
 
@@ -203,7 +417,8 @@ export async function processMilestoneTriggers(now = new Date()) {
         tag_fired: tag,
         status: 'success',
       });
-      fired++;
+      onFired();
+      spent++;
     } else {
       await logTrigger({
         lp_lead_id: milestone.lp_lead_id,
@@ -214,15 +429,14 @@ export async function processMilestoneTriggers(now = new Date()) {
         status: 'failed',
         error_detail: 'GHL tag application failed',
       });
-      errors++;
+      onError();
+      // A failed tag still consumed an attempt against a live contact. Charge
+      // it to the budget, or a GHL outage turns the ceiling into no ceiling.
+      spent++;
     }
   }
 
-  if (gated > 0) {
-    console.log(`[Milestones] ${gated} row(s) held by the achievement gate — act_date not yet reached`);
-  }
-
-  return { processed: newMilestones?.length || 0, fired, errors, gated };
+  return spent;
 }
 
 async function logTrigger({ lp_lead_id, lp_prospect_id, ghl_contact_id, event, tag_fired, status, error_detail }) {

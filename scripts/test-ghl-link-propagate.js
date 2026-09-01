@@ -38,13 +38,28 @@ import { readFile } from 'node:fs/promises';
 const milestonesSrc = await readFile(new URL('../src/milestones.js', import.meta.url), 'utf8');
 const sqlSrc = await readFile(new URL('../sql/075_ghl_link_propagate.sql', import.meta.url), 'utf8');
 
-// The chained PostgREST query inside processMilestoneTriggers, from the
-// table selection to the terminating ghl_tag_fired filter.
+// The chained PostgREST query that selects sweep candidates, from the table
+// selection to the end of the statement.
+//
+// 2026-08-31 — THIS SLICE WAS WIDENED, AND THE REASON IS A NEAR MISS.
+// It used to end at the ghl_tag_fired filter, which was fine only because that
+// filter was the last call in the chain. When the sweep gained its keyset walk
+// (.gt/.order/.limit, which must follow the predicate), everything after
+// ghl_tag_fired became invisible to this test — and a ghl_contact_id filter
+// added there would have passed. Verified by mutation: the check below went
+// green on exactly the edit it exists to stop.
+//
+// This is a WIDENING, not a loosening. The note at the top of this file still
+// stands: if it fails, do not narrow it again to make it pass.
 function sweeperQuery() {
   const start = milestonesSrc.indexOf("from('lp_job_milestones')");
-  assert.notEqual(start, -1, 'processMilestoneTriggers no longer queries lp_job_milestones');
-  const end = milestonesSrc.indexOf("eq('ghl_tag_fired', false)", start);
-  assert.notEqual(end, -1, 'the sweeper no longer filters on ghl_tag_fired = false');
+  assert.notEqual(start, -1, 'the sweeper no longer queries lp_job_milestones');
+  assert.notEqual(
+    milestonesSrc.indexOf("eq('ghl_tag_fired', false)", start), -1,
+    'the sweeper no longer filters on ghl_tag_fired = false',
+  );
+  const end = milestonesSrc.indexOf(';', start);
+  assert.notEqual(end, -1, 'could not find the end of the candidate query');
   return milestonesSrc.slice(start, end);
 }
 
