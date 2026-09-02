@@ -293,6 +293,76 @@ const WEBHOOK_FOR_SMS = (process.env.GHL_SEND_SMS_VIA_WEBHOOK || 'true').toLower
 const WEBHOOK_FOR_EMAIL = (process.env.GHL_SEND_EMAIL_VIA_WEBHOOK || 'false').toLowerCase() === 'true';
 
 // ═══════════════════════════════════════════════════════════════════
+// 2026-09-02 — REPLY SENDER: never Randy's mailbox.
+//
+// v3.11/v3.14 sender continuity sets emailFrom to the address the lead wrote
+// TO (the inbound's to[0]) and userId to the user who sent the last outbound.
+// On a lead replying to a Randy-signed broadcast, both of those are Randy —
+// so a reply the generator correctly wrote in Mark's voice ("Mark here —
+// Randy asked me to reach out…") went out FROM Randy's address. Confirmed on
+// lGQ0WjsMU2zmoq9MsVJH, action 406588, 2026-09-02 22:31Z.
+//
+// Brand law (locked): Randy is the broadcast email/video voice only. A
+// conversational reply is never Randy's — in voice OR in sender. When the
+// thread is Randy's, the reply goes out from the configured rep mailbox.
+// Every other thread keeps continuity exactly as before.
+//
+// Detection is belt-and-suspenders, either alone reroutes:
+//   - the inbound's `to` is a Randy mailbox (local part starts with "randy",
+//     or the address is listed in AGENTIC_NEVER_REPLY_FROM), or
+//   - the thread-sender classifier (v3.15, classifyThreadSenderText) says
+//     the last outbound was Randy-signed.
+//
+// AGENTIC_REPLY_FROM_EMAIL must be a sender the GHL email provider has
+// verified, or GHL substitutes its default. AGENTIC_REPLY_FROM_USER_ID is the
+// rep's GHL user id (LC-Email keys From on userId). Both are Railway env vars.
+// ═══════════════════════════════════════════════════════════════════
+const AGENTIC_REPLY_FROM_EMAIL = String(process.env.AGENTIC_REPLY_FROM_EMAIL || 'mark@getreecewindows.com').trim().toLowerCase();
+const AGENTIC_REPLY_FROM_USER_ID = String(process.env.AGENTIC_REPLY_FROM_USER_ID || '').trim() || null;
+const AGENTIC_NEVER_REPLY_FROM = new Set(
+  String(process.env.AGENTIC_NEVER_REPLY_FROM || '')
+    .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
+);
+
+/** True for any mailbox that belongs to Randy. Pure. */
+export function isRandyMailbox(addr) {
+  const a = String(addr || '').trim().toLowerCase();
+  if (!a) return false;
+  if (AGENTIC_NEVER_REPLY_FROM.has(a)) return true;
+  const local = a.split('@')[0] || '';
+  return /^randy(?:[._-]|$)/.test(local);
+}
+
+/**
+ * Decide the outbound email sender. Pure — all I/O happens in the callers.
+ *
+ *   inboundTo         the address the lead wrote to (our receiving mailbox)
+ *   originatorUserId  GHL user who sent the last outbound in the thread
+ *   threadSenderType  classifyThreadSenderText verdict ({ type }) or null
+ *
+ * Returns { emailFrom, userId, reason }:
+ *   randy_thread_rerouted        Randy thread → rep mailbox, rep user
+ *   inbound_mailbox_continuity   today's v3.11/v3.14 behavior, unchanged
+ *   ghl_default                  nothing known → GHL picks (unchanged)
+ *
+ * On a Randy thread the originator userId is DROPPED on purpose — it is
+ * Randy's user. If no rep user id is configured, userId is null and GHL
+ * falls back to the contact's assignedTo user (never Randy in practice, but
+ * set AGENTIC_REPLY_FROM_USER_ID to make it Mark by contract).
+ */
+export function resolveEmailSender({ inboundTo = null, originatorUserId = null, threadSenderType = null } = {}) {
+  const to = inboundTo ? String(inboundTo).trim().toLowerCase() : null;
+  const randyThread = isRandyMailbox(to) || threadSenderType?.type === 'randy';
+  if (randyThread) {
+    return { emailFrom: AGENTIC_REPLY_FROM_EMAIL, userId: AGENTIC_REPLY_FROM_USER_ID, reason: 'randy_thread_rerouted' };
+  }
+  if (to || originatorUserId) {
+    return { emailFrom: to, userId: originatorUserId || null, reason: 'inbound_mailbox_continuity' };
+  }
+  return { emailFrom: null, userId: null, reason: 'ghl_default' };
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // TAG HELPERS
 // ═══════════════════════════════════════════════════════════════════
 
@@ -1156,10 +1226,22 @@ async function sendViaWebhook(contactId, message, channel, subject, action) {
   // v3.14: email uses the email-detail endpoint (conversation-level
   // message objects carry no `.to` for email); SMS keeps the original
   // top-level `.to` lookup, which works for that channel.
-  const [replyFromAddress, threadOriginatorUserId] = await Promise.all([
+  const [rawReplyFromAddress, rawThreadOriginatorUserId] = await Promise.all([
     channel === 'email' ? getInboundEmailToAddress(contactId) : getReplyFromAddress(contactId, channel),
     channel === 'email' ? getThreadOriginatorUserId(contactId) : Promise.resolve(null),
   ]);
+  // 2026-09-02 — never send as Randy, on this degraded path too. SMS is
+  // untouched (resolver is email-only; the raw values pass straight through).
+  let replyFromAddress = rawReplyFromAddress;
+  let threadOriginatorUserId = rawThreadOriginatorUserId;
+  if (channel === 'email') {
+    const sender = resolveEmailSender({ inboundTo: rawReplyFromAddress, originatorUserId: rawThreadOriginatorUserId });
+    replyFromAddress = sender.emailFrom;
+    threadOriginatorUserId = sender.userId;
+    if (sender.reason === 'randy_thread_rerouted') {
+      console.log(`[SendMessage] 2026-09-02: Randy thread for ${contactId} (webhook path) — reply sender rerouted ${rawReplyFromAddress || 'unknown'} → ${sender.emailFrom}`);
+    }
+  }
 
   // v3.8 — channelType in proper case (matches GHL's native TYPE_SMS /
   // TYPE_EMAIL convention). The existing `channel` field is preserved
@@ -1313,15 +1395,28 @@ async function sendViaConversationsAPI(contactId, message, channel, subject, opt
     //   - emailFrom → Custom provider (paired with conversationProviderId)
     // GHL ignores whichever doesn't apply for the active provider, so
     // setting both is safe and provider-agnostic.
-    if (originatorUserId) {
-      msgBody.userId = originatorUserId;
-      console.log(`[SendMessage] v3.11: setting userId=${originatorUserId} as thread originator (overrides current assignedTo)`);
+    // 2026-09-02 — never send as Randy. See resolveEmailSender (module top).
+    // opts.threadSenderType is the v3.15 classifier verdict when the caller
+    // already fetched it; the address check alone is sufficient without it.
+    const sender = resolveEmailSender({
+      inboundTo: replyFromAddr,
+      originatorUserId,
+      threadSenderType: opts.threadSenderType || null,
+    });
+    if (sender.userId) {
+      msgBody.userId = sender.userId;
     }
-    if (replyFromAddr) {
-      msgBody.emailFrom = replyFromAddr;
-      console.log(`[SendMessage] v3.11: setting emailFrom=${replyFromAddr} (most recent inbound's TO address)`);
+    if (sender.emailFrom) {
+      msgBody.emailFrom = sender.emailFrom;
     }
-    if (!originatorUserId && !replyFromAddr) {
+    if (sender.reason === 'randy_thread_rerouted') {
+      console.log(
+        `[SendMessage] 2026-09-02: Randy thread for ${contactId} — reply sender rerouted ` +
+        `${replyFromAddr || 'unknown'} → ${sender.emailFrom} (userId ${originatorUserId || 'none'} → ${sender.userId || 'GHL default'})`
+      );
+    } else if (sender.reason === 'inbound_mailbox_continuity') {
+      console.log(`[SendMessage] v3.11: sender continuity for ${contactId} — emailFrom=${sender.emailFrom || 'unset'} userId=${sender.userId || 'unset'}`);
+    } else {
       console.warn(`[SendMessage] v3.11: no prior outbound + no inbound email found for ${contactId} — sender will default to current assignedTo user (first agentic send in thread)`);
     }
 
@@ -1374,6 +1469,10 @@ async function sendViaConversationsAPI(contactId, message, channel, subject, opt
     // with nobody else on the thread.
     ...(msgBody.emailCc?.length ? { emailCc: msgBody.emailCc } : {}),
     ...(msgBody.emailMessageId ? { emailMessageId: msgBody.emailMessageId } : {}),
+    // 2026-09-02 — durable record of WHO the reply went out as. Railway logs
+    // roll off; execution_result does not. Absent for non-email.
+    ...(msgBody.emailFrom ? { emailFrom: msgBody.emailFrom } : {}),
+    ...(msgBody.userId ? { emailUserId: msgBody.userId } : {}),
   };
 }
 
@@ -2413,6 +2512,9 @@ export async function executeSendMessage(action, context) {
   // requires_ai_generation block) can surface it to the action executor.
   let fallbackUsed = false;
   let fallbackError = null;
+  // 2026-09-02 — hoisted from the generation block so the send can pass the
+  // v3.15 thread-sender verdict to resolveEmailSender (never send as Randy).
+  let threadSenderType = null;
 
   if (message) {
     console.log(`[SendMessage] Using ${payload.pre_generated ? 'pre-generated' : 'provided'} message for ${contactId} (${message.length} chars)`);
@@ -2448,7 +2550,7 @@ export async function executeSendMessage(action, context) {
     // pick the correct opener. Email-only; never fetched for SMS. Fail-open to
     // 'rep' (the safe, non-aggressive opener) if the lookup is unavailable.
     // Fetched once, before the retry loop, so a retry never re-fetches it.
-    let threadSenderType = null;
+    threadSenderType = null;
     if (channel === 'email') {
       try {
         threadSenderType = await getThreadSenderType(contactId);
@@ -2942,6 +3044,9 @@ export async function executeSendMessage(action, context) {
     contactId, message, channel, subject, action,
     {
       fromNumber: replyContext?.fromNumber || null,
+      // 2026-09-02 — never send as Randy (see resolveEmailSender). Null on
+      // SMS and when the pre-fetch failed; the address check still applies.
+      threadSenderType,
       // 2026-08-18 phone guard: the only numbers this body may contain — the
       // market service phone this generation resolved and the contact's own
       // known number. The sending line is added inside sendWithFallback.
@@ -3185,6 +3290,10 @@ export async function executeSendMessage(action, context) {
     // and for plain replies with nobody else on the thread.
     email_message_id: sendResult?.emailMessageId || null,
     email_cc: sendResult?.emailCc || null,
+    // 2026-09-02 — who the reply went out as. Verify with:
+    //   SELECT execution_result->>'email_from' FROM agent_actions WHERE ...
+    email_from: sendResult?.emailFrom || null,
+    email_user_id: sendResult?.emailUserId || null,
     ai_generated: !!generated,
     intent_class: generated?.intent_class || null,
     classifier_method: generated?.classification_method || null,
@@ -3217,4 +3326,7 @@ export const _internal = {
   // 2026-08-14 — exported so the missing-.from() regression is coverable. Takes
   // an injectable client so a test can assert WHICH table is queried.
   fetchSourceEventMeta,
+  // 2026-09-02 — never send as Randy.
+  resolveEmailSender,
+  isRandyMailbox,
 };
