@@ -3,6 +3,24 @@
  *
  * The brain of the agentic system.
  *
+ * v2.19 — 2026-09-02. not_duplicate_lead_live_appointment context operator —
+ *   blocks a cancellation / no-show routing rule when the SAME GHL contact
+ *   holds a live future Set/Cnf appointment, or a Sale in the last 30 days, on
+ *   ANOTHER LP lead. Call-center duplicate-lead cleanup CXLs one lead while the
+ *   real appointment stays Set on the other; without this gate the whole action
+ *   batch fires — stage:reactivation, move_opportunity → Reactivation,
+ *   add_tag appt-cancelled, create_task, end_agentic_handoff, and the S5.2 v2
+ *   "you cancelled" enrollment — against a contact who never cancelled.
+ *   objection-state.js v2.0 already guarded the state write and the enrollment;
+ *   this operator lifts the same predicate (shared: src/duplicate-lead-guard.js)
+ *   to the rule gate so the SIBLING actions are suppressed too.
+ *   Emits rule.suppressed_duplicate_lead on a block, for observability.
+ *   FAILS OPEN by design — a documented exception to the 2026-07-03 fail-closed
+ *   doctrine; see the case body and duplicate-lead-guard.js for the rationale.
+ *   MUST be deployed live BEFORE the SQL that adds it to agent_rules — the
+ *   switch fails closed on an unknown operator, so an early SQL land would
+ *   silence every cancellation and no-show routing rule (~700 contacts/30d).
+ *
  * v2.18 — 2026-07-13. payload_field_in {field, values: [...]} context operator —
  *   the set form of payload_field_eq. Added so the responder rules' channel gate
  *   (agent_rules 106/228/310/330/333) can admit BOTH sms and email in one
@@ -196,6 +214,7 @@ import { emitEvent } from './event-emitter.js';
 // escalation/objection/callback rules can opt out while a booking is in flight.
 import { isInHomeCalendarId } from './knowledge/booking-calendar-router.js';
 import { isRescheduleInflight } from './services/reschedule-inflight.js';
+import { findBlockingLiveLead, blockingReason } from './duplicate-lead-guard.js';
 // 2026-08-03 — one rank scale, shared with the contact-scoped appointment
 // claim. See the BOOKING_AUTHORITY_RANK note below.
 import { BOOKING_AUTHORITY_RANK as SERVICE_BOOKING_AUTHORITY_RANK }
@@ -1188,6 +1207,62 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
         if (!expected) break; // only gate when set truthy
         if (await isRescheduleInflight(event.ghl_contact_id)) {
           console.log(`[Context] BLOCKED: not_reschedule_inflight — contact ${event.ghl_contact_id} has an agent reschedule in flight`);
+          return false;
+        }
+        break;
+      }
+
+      // 2026-09-02 — duplicate-lead guard (v2.19). Blocks cancellation and
+      // no-show routing rules when the same contact holds a live future
+      // appointment (Set/Cnf) or a Sale in the last 30 days on ANOTHER LP lead.
+      // Call-center duplicate-lead cleanup CXLs one lead while the real
+      // appointment stays Set on the other; the disposition sync then routes the
+      // contact to Reactivation and texts them "you cancelled" while their
+      // appointment is still on the books.
+      //
+      // FAIL-OPEN, deliberately — a documented exception to the 2026-07-03
+      // fail-closed doctrine. findBlockingLiveLead() maps every query error to
+      // null (no block), so a Supabase hiccup lets the rule fire as it does
+      // today. Failing closed here would suppress EVERY cancellation's rescue
+      // path (~700 contacts/30d) to spare the ~8% false-positive cohort — a
+      // strictly worse trade. The helper logs each failure so outages stay
+      // visible in Railway.
+      case 'not_duplicate_lead_live_appointment': {
+        if (!expected) break; // only gate when set truthy
+        const dupContactId = event.ghl_contact_id;
+        if (!dupContactId) break; // no contact to check — nothing to block on
+        const blockingLead = await findBlockingLiveLead(dupContactId, 'DecisionEngine');
+        if (blockingLead) {
+          const why = blockingReason(blockingLead);
+          console.log(
+            `[Context] BLOCKED: not_duplicate_lead_live_appointment — contact ${dupContactId} ` +
+            `has ${why} on lp_lead ${blockingLead.lp_lead_id} ` +
+            `(${blockingLead.disposition_code}, appt ${blockingLead.appointment_date || 'n/a'}, ` +
+            `source ${blockingLead.lead_source_detail || 'unknown'}) — rule ${ruleKey || '?'} suppressed`
+          );
+          emitEvent({
+            event_type: 'rule.suppressed_duplicate_lead',
+            source: 'decision_engine',
+            entity_type: 'contact',
+            entity_id: String(dupContactId),
+            ghl_contact_id: dupContactId,
+            payload: {
+              rule_key: ruleKey,
+              source_event_id: event?.id || null,
+              source_event_type: event?.event_type || null,
+              blocking_lp_lead_id: blockingLead.lp_lead_id,
+              blocking_source: blockingLead.lead_source_detail,
+              blocking_disposition: blockingLead.disposition_code,
+              blocking_appointment_date: blockingLead.appointment_date,
+              blocking_reason: why,
+              reason: 'live_appointment_or_sale_on_other_lead',
+            },
+            priority: 'low',
+            bypass_filter: true,
+            idempotency_key: `rule_dupguard_${event?.id || 'noevt'}_${ruleKey || 'norule'}`,
+          }).catch((err) =>
+            console.warn(`[DecisionEngine] duplicate-lead suppression event emit failed: ${err.message}`)
+          );
           return false;
         }
         break;
