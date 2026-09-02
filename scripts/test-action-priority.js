@@ -80,3 +80,10 @@ test('null/undefined explicit priority falls through to the type default', () =>
   assert.equal(resolveActionPriority({ action_type: 'send_message', priority: null }), TIME_SENSITIVE_PRIORITY);
   assert.equal(resolveActionPriority({ action_type: 'send_message', priority: undefined }), TIME_SENSITIVE_PRIORITY);
 });
+
+test('2026-09-02 — layer3_dispatch runs in its own lane (15), ahead of bulk work', () => {
+  const p = resolveActionPriority({ action_type: 'layer3_dispatch' });
+  assert.equal(p, 15);
+  assert.ok(p < TIME_SENSITIVE_PRIORITY, 'the fan-out must precede the replies it creates');
+  assert.equal(resolveActionPriority({ action_type: 'layer3_dispatch', priority: 3 }), 3, 'explicit template priority still wins');
+});

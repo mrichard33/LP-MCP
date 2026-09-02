@@ -258,7 +258,18 @@ const DEDUP_WINDOW_MINUTES = 30;
 //   tag/stage ops are unchanged.
 const TIME_SENSITIVE_PRIORITY = 20;
 const DEFAULT_ACTION_PRIORITY = 100;
+// 2026-09-02 (Jacqueline Branham, gpPQYhCsqdGy10wU14Rp) — layer3_dispatch is
+// the FAN-OUT that creates every Layer-3-owned reply (busy_callback,
+// objection_price, wrong_person, callback_request, guide_send,
+// follow_up_scheduled, frustrated_fast_track). sql/020 assigned it lane 15,
+// but this map omitted it, so resolveActionPriority stamped 100 explicitly and
+// the BEFORE INSERT trigger (which only fills NULL) never got a say: 126/126
+// layer3_dispatch rows in the 7 days to 2026-09-02 sat at priority 100 behind
+// bulk P2-milestone and disposition tag work. The contact replied 14:31:02Z;
+// the dispatch executed 14:53:49Z. Lane 15 restores the sql/020 design.
+const LAYER3_DISPATCH_PRIORITY = 15;
 const DEFAULT_PRIORITY_BY_TYPE = {
+  layer3_dispatch: LAYER3_DISPATCH_PRIORITY,
   set_lp_appointment: TIME_SENSITIVE_PRIORITY,
   send_message: TIME_SENSITIVE_PRIORITY,
   book_appointment: TIME_SENSITIVE_PRIORITY,
@@ -1805,14 +1816,20 @@ async function createActionsFromRule(event, rule) {
       // The rule-key clause is what actually matches the reply (send_message
       // takes the default priority 20); priority<=15 is an OR fallback for any
       // future rule that sets an explicit high-priority lane.
-      if (
-        !requiresApproval &&
-        data.status === 'pending' &&
-        tmpl.action_type === 'send_message' &&
-        (rule.rule_key === 'AGENTIC_RESPOND_POST_CHATBOT' || priority <= 15)
-      ) {
-        executeActionById(data.id).catch(err =>
-          console.warn(`[DecisionEngine] reply fast-path failed for action ${data.id}: ${err.message}`));
+      // 2026-09-02 — layer3_dispatch joins the fast path. It is the fan-out
+      // that CREATES the Layer-3 reply; leaving it to the sweep meant the reply
+      // could not even be queued until the bulk backlog cleared (22 min on
+      // 2026-09-02). The pipeline's own /execute call cannot cover this — it is
+      // skipped whenever the scheduler sweep holds executorRunning.
+      // allowExecuting:false — if the sweep already claimed the row, let the
+      // sweep own it; a double fan-out would queue the reply twice (the
+      // outbound lock would dedup the send, but not the tag/hold siblings).
+      const isLayer3FanOut = tmpl.action_type === 'layer3_dispatch';
+      const isReplySend = tmpl.action_type === 'send_message' &&
+        (rule.rule_key === 'AGENTIC_RESPOND_POST_CHATBOT' || priority <= 15);
+      if (!requiresApproval && data.status === 'pending' && (isReplySend || isLayer3FanOut)) {
+        executeActionById(data.id, isLayer3FanOut ? { allowExecuting: false } : {}).catch(err =>
+          console.warn(`[DecisionEngine] ${tmpl.action_type} fast-path failed for action ${data.id}: ${err.message}`));
       }
     }
   }
