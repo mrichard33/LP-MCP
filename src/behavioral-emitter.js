@@ -14,6 +14,25 @@
  * 
  * Security: All endpoints validate GHL_WEBHOOK_SECRET.
  *
+ * v2.17 (2026-09-02) — Chat Widget is SMS, not live chat.
+ *   normalizeInboundChannel lumped 'chatwidget' in with 'livechat', so every
+ *   chat-widget reply was excluded from the agentic pipeline. GHL does not
+ *   treat the two surfaces the same: its "Live Chat" trigger (message.type 29)
+ *   feeds B.1A, which tags `pause-bot`; its "Chat Widget" trigger
+ *   (message.type 5) feeds B.1B "SMS Widget First-Touch", which tags
+ *   `agentic-active` + `chat-widget`. GHL was therefore stamping chat-widget
+ *   contacts as agentic-owned while this emitter refused to route their
+ *   replies — stamped for a bot that never answered.
+ *   'Chat Widget' now normalizes to 'sms': ownership stamp, analyzer, and
+ *   reply pipeline all engage, and the outbound side already lands on SMS
+ *   (reply-sender.channelOfMessage does not match chatwidget, so
+ *   decideReplyChannel falls through to 'no_inbound_found' → SMS).
+ *   True live chat ("Live Chat", "WebChat") is UNCHANGED — still excluded,
+ *   still no stamp, no analyzer, no reply. Existing-customer coverage now
+ *   spans both surfaces: chat widget via ESC_EXISTING_CUSTOMER
+ *   (ai.analysis_completed), live chat via ESC_LIVECHAT_EXISTING_CUSTOMER
+ *   (ghl.reply_channel_excluded / livechat, v2.16).
+ *
  * v2.16 (2026-09-02) — live chat emits its bookkeeping event.
  *   The v2.14 live-chat early return skipped `ghl.reply_channel_excluded` as
  *   well as the pipeline, so live chat produced ZERO system_events and no rule
@@ -690,7 +709,15 @@ function cleanGHLValue(val) {
 // live-chat early return. Strip non-alphanumerics first, then match.
 function normalizeInboundChannel(messageType) {
   const lt = String(messageType || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  if (lt.includes('livechat') || lt.includes('webchat') || lt.includes('chatwidget')) return 'livechat';
+  // v2.17 — Chat Widget is an SMS surface, NOT live chat. Checked FIRST because
+  // it is the narrower match. GHL routes its two widget surfaces to different
+  // owners: "Live Chat" (message.type 29) → B.1A, which tags `pause-bot`; "Chat
+  // Widget" (message.type 5) → B.1B "SMS Widget First-Touch", which tags
+  // `agentic-active` + `chat-widget`. Lumping chatwidget into 'livechat' meant
+  // GHL stamped those contacts as agentic-owned while this emitter excluded
+  // their replies from the pipeline — stamped for a bot that never answered.
+  if (lt.includes('chatwidget')) return 'sms';
+  if (lt.includes('livechat') || lt.includes('webchat')) return 'livechat';
   if (lt.includes('email')) return 'email';
   if (lt.includes('facebook') || lt.includes('instagram') || lt.includes('gmb') || lt.includes('whatsapp') || lt === 'fb' || lt === 'ig') return 'social';
   if (lt.includes('sms')) return 'sms';
