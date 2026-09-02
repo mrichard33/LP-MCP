@@ -159,6 +159,13 @@ const ALLOWED_EVENT_TYPES = new Set([
                                    // precisely how the 2026-08-03 outage stayed
                                    // invisible for seven hours (ai.analysis_failed
                                    // emitted without it, 39 dropped in 14 days).
+  'ghl.reply_channel_excluded',    // 2026-09-02 — rule ESC_LIVECHAT_EXISTING_CUSTOMER
+                                   // routes live-chat service requests from
+                                   // closed-won customers to a human. The producer
+                                   // (behavioral-emitter handleReply) already emits
+                                   // with bypass_filter, so this is defense in depth:
+                                   // if that flag is ever dropped the escalation
+                                   // would die at intake with no trace.
 
   // Quiet but rule-watched (must not drop)
   'ghl.lead_score_changed',        // 4 rules (W11_1_*)

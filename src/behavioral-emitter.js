@@ -14,6 +14,18 @@
  * 
  * Security: All endpoints validate GHL_WEBHOOK_SECRET.
  *
+ * v2.16 (2026-09-02) — live chat emits its bookkeeping event.
+ *   The v2.14 live-chat early return skipped `ghl.reply_channel_excluded` as
+ *   well as the pipeline, so live chat produced ZERO system_events and no rule
+ *   could ever see it. Confirmed on contact `m4Yx7n8XVDb8QnxfUsio` (Brian
+ *   Stanley, closed-won $6,860): a service request through the chat widget on
+ *   2026-09-02 produced no event, no task, and no notification, and sat
+ *   unhandled. The agentic bot remains permanently excluded from live chat —
+ *   no stamp, no analyzer, no reply. Only the forensic event now emits, so
+ *   `ESC_LIVECHAT_EXISTING_CUSTOMER` can route existing-customer service
+ *   requests to a human. Live-chat events emit at `normal` priority;
+ *   social/unknown stay `low`.
+ *
  * v2.15 (2026-07-13) — restore agentic email replies + fix live-chat detection.
  *   NORMALIZER: normalizeInboundChannel now strips non-alphanumerics BEFORE
  *   matching. GHL's inbound REPLY webhook sends human-readable message types
@@ -841,13 +853,6 @@ async function handleReply(req, res) {
     return res.json({ status: 'accepted', classification: 'dnc', channel });
   }
 
-  // Live chat: PERMANENT hard exclusion — its existing handler owns the surface.
-  // No stamp, no event, no pipeline. (Sentinel §14.)
-  if (channel === 'livechat') {
-    console.log(`[BehavioralEmitter] live-chat inbound from ${contactId} — agentic bot permanently excluded from this channel, skipping entirely`);
-    return res.json({ status: 'skipped', reason: 'live_chat_channel_excluded' });
-  }
-
   // v2.15 — CHANNEL GATE. SMS + Email are answered. Social and unidentifiable
   // types are not (fail closed — an unknown channel never gets an agentic reply).
   // Excluded inbounds still get the bookkeeping event + engagement timestamp so
@@ -858,7 +863,7 @@ async function handleReply(req, res) {
       event_type: 'ghl.reply_channel_excluded', event_subtype: channel, source: 'ghl_webhook',
       entity_type: 'contact', entity_id: contactId, ghl_contact_id: contactId,
       payload: { message_text: trimmed, message_type: messageType, channel, message_id: messageId, word_count: trimmed.split(/\s+/).length },
-      priority: 'low', bypass_filter: true,
+      priority: channel === 'livechat' ? 'normal' : 'low', bypass_filter: true,
       idempotency_key: `ghl_reply_excluded_${contactId}_${messageId}`,
     }).catch((err) => console.warn(`[BehavioralEmitter] channel-excluded event emit failed for ${contactId}: ${err.message}`));
     console.log(`[BehavioralEmitter] ${channel} inbound from ${contactId} — not an agentic reply channel, no stamp, no reply pipeline`);
