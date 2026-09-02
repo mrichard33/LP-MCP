@@ -119,11 +119,21 @@
  *              receive S5.2 appointment-rescue SMS/email; legitimate booked
  *              leads with pre-appointment friction are unaffected. Stops the
  *              regrowth that the 2026-06-05 one-time lane cleanup cleared.
+ *
+ * 2026-09-02 — v2.0: APPOINTMENT_DISRUPTION proposals are rejected (before the
+ *              state row is written) when lp_leads shows ANOTHER lead on the
+ *              same GHL contact with a live future Set/Cnf appointment or a
+ *              Sale in the last 30 days. Root cause: call-center duplicate-lead
+ *              cleanup CXLs one lead while the real appointment stays Set on
+ *              the other; the sync emits cancelled → S5.2 "you cancelled" text
+ *              to a contact who never cancelled. Emits
+ *              state_transition_suppressed_duplicate_lead. Fails open.
  */
 
 import supabase from '../../supabase.js';
 import { updateGHLContactFields, getGHLContact } from '../../ghl.js';
 import { emitEvent } from '../../event-emitter.js';
+import { findBlockingLiveLead, blockingReason } from '../../duplicate-lead-guard.js';
 
 const GHL_FIELD_OBJECTION_STATE_CODE =
   process.env.GHL_FIELD_OBJECTION_STATE_CODE || null;
@@ -304,6 +314,40 @@ export async function executeTransitionObjectionState(action) {
         reason: 'awaiting_approval',
         threshold,
         classifier_confidence: conf,
+      };
+    }
+  }
+
+  // v2.0 — Duplicate-lead guard. A disposition-driven disruption (CXL/NS/BO/
+  // 1Leg) on ONE lead must not fire rescue when the same contact holds a live
+  // future appointment (or a recent Sale) on ANOTHER LP lead. Duplicate-lead
+  // cleanup by the call center produces exactly this shape. We reject BEFORE
+  // writing the state row so the contact's current objection state, GHL mirror
+  // field, and rebook link are all left untouched.
+  if (proposedPolicy.parent_state === 'APPOINTMENT_DISRUPTION') {
+    const blocking = await findBlockingLiveLead(contact_id, 'ObjectionState');
+    if (blocking) {
+      await emitTransitionEvent('state_transition_suppressed_duplicate_lead', {
+        contact_id,
+        currentState,
+        proposed_state,
+        blocking_lp_lead_id: blocking.lp_lead_id,
+        blocking_source: blocking.lead_source_detail,
+        blocking_disposition: blocking.disposition_code,
+        blocking_appointment_date: blocking.appointment_date,
+        blocking_reason: blockingReason(blocking),
+        trigger_source,
+        triggering_event_id,
+        source_action_id: action.id,
+        reason: 'live_appointment_or_sale_on_other_lead',
+      });
+      return {
+        success: false,
+        reason: 'duplicate_lead_live_appointment',
+        from: fromState,
+        to: proposed_state,
+        blocking_lp_lead_id: blocking.lp_lead_id,
+        blocking_disposition: blocking.disposition_code,
       };
     }
   }
