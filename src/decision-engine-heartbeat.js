@@ -83,6 +83,8 @@ import {
   shouldAlertAgenticSilence,
   formatAgenticSilenceAlert,
 } from './agentic-silence-alerts.js';
+// 2026-09-02 — per-contact reply SLA (Jacqueline Branham). Shadow by default.
+import { runReplySlaWatchdog } from './jobs/reply-sla-watchdog.js';
 
 // 2026-06-05: promoted from 6-min-late FAILOVER to PRIMARY driver. The n8n
 // cron (ERnvX5hp6i90VVWc) silently went dormant on 2026-05-22 while still
@@ -147,6 +149,8 @@ let isRunning = false; // reentrancy guard — prevents overlapping drain cycles
 // inspected without waiting for it to fire.
 let lastSilenceAlertAt = 0;
 let lastSilenceCheck = null;
+// 2026-09-02 — most recent reply-SLA pass, surfaced on the status route.
+let lastReplySlaCheck = null;
 
 /**
  * Find the most recent processed_at timestamp across all system_events.
@@ -314,6 +318,12 @@ export async function runDecisionEngineHeartbeat({ force = false } = {}) {
   // watchdog exists to catch. Gating the check on a firing heartbeat would
   // blind it precisely during the outage it is meant to page on.
   await maybeAlertAgenticSilence();
+
+  // 2026-09-02 — per-contact reply SLA. Same placement reasoning as the
+  // silence watchdog above: a stalled reply leaves NO pending event, so this
+  // must run before the skip branch. Never throws into the heartbeat.
+  lastReplySlaCheck = await runReplySlaWatchdog()
+    .catch((err) => { console.warn(`[DecisionEngineHeartbeat] reply SLA watchdog threw (ignored): ${err.message}`); return { error: err.message }; });
 
   const health = await checkEngineHealth();
 
@@ -488,6 +498,8 @@ export function registerDecisionEngineHeartbeatRoutes(app) {
           last_alert_at: lastSilenceAlertAt || null,
           last_check: req.query?.refresh ? await getAgenticSilenceCounts() : lastSilenceCheck,
         },
+        // 2026-09-02 — per-contact reply SLA. ?refresh=1 runs a pass on demand.
+        reply_sla: req.query?.refresh ? await runReplySlaWatchdog() : lastReplySlaCheck,
       });
     } catch (err) {
       res.status(500).json({ success: false, error: err.message });

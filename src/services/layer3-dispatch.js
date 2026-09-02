@@ -21,6 +21,75 @@ import supabase from '../supabase.js';
 import { fetchUpcomingAppointments } from '../knowledge/contact-appointments.js';
 import { isInHomeCalendarId } from '../knowledge/booking-calendar-router.js';
 
+// ═══════════════════════════════════════════════════════════════════
+// 2026-09-02 — follow-up promise vs soft decline (Jacqueline Branham,
+// gpPQYhCsqdGy10wU14Rp).
+//
+// The follow_up_scheduled dispatch row is built for a lead who ASKED for a
+// time ("call me next month"): confirm warmly, no ask, hold until then. The
+// analyzer also routes soft declines here — "I'm not going to bother for now"
+// — with engagement_quality=disengagement and the vague-deferral bucket
+// (seasonal = 2160h). On a lead whose appointment was disrupted in the last
+// 7 days that is the wrong play twice over: the bot capitulates instead of
+// reframing once, and a booked-yesterday lead is frozen for a quarter.
+//
+// Antifragile objection rule: acknowledge, reframe ONCE, re-ask at the
+// current trust level. Timing after a no-show is a step-DOWN ask (15-minute
+// phone Protection Profile Review), never a re-pitch of the in-home visit,
+// and never a park. The dispatch row itself is untouched; this guard returns
+// a copy with the reply prompt swapped and the bucket forced to 1week via
+// payload_overrides (consumed by executeLayer3Dispatch).
+//
+// Explicit timing requests (tomorrow / few-days / 1week / 2weeks) are never
+// touched — the customer named a time, honor it. Pure predicate; unit-tested.
+// ═══════════════════════════════════════════════════════════════════
+const SOFT_DECLINE_BUCKETS = new Set(['seasonal', '1month', '2months', 'after-holidays']);
+const RECENT_DISRUPTION_WINDOW_MINUTES = 7 * 24 * 60;
+export const SOFT_DECLINE_BUCKET = '1week';
+export const SOFT_DECLINE_REFRAME_HINT =
+  'SOFT DECLINE after a missed or cancelled appointment in the last 7 days. This is a timing objection, not a rejection. ' +
+  'Acknowledge it in their own words, reframe ONCE, then make one low-friction ask. Do NOT re-pitch the in-home visit, do NOT offer times, do NOT apologize twice. ' +
+  'The reframe: nobody needs to come to the house — a 15-minute Protection Profile Review by phone puts their numbers on file for whenever they are ready, and it costs nothing. ' +
+  'One question, one question mark, under 300 characters, rep or company voice, no exclamation points. Read the last few turns so the reply answers what they actually said. ' +
+  'If they also raised price, spouse, or trust, name it in one clause before the ask. ' +
+  'Never push past this turn: if the next reply is still no, confirm the check-back and stop.';
+
+/**
+ * True when a follow_up_scheduled classification is really a soft decline on
+ * a lead whose appointment was disrupted within the last 7 days. Reads only
+ * the ai.analysis_completed payload. Fail-CLOSED toward the existing behavior:
+ * any missing field means "not a soft decline" and the row runs as written.
+ */
+export function isSoftDeclineAfterAppointmentDisruption(payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  const bucket = typeof payload.follow_up_bucket === 'string' ? payload.follow_up_bucket.toLowerCase() : null;
+  const engagement = typeof payload.engagement_quality === 'string' ? payload.engagement_quality.toLowerCase() : null;
+  const softDecline = engagement === 'disengagement' || (bucket !== null && SOFT_DECLINE_BUCKETS.has(bucket));
+  if (!softDecline) return false;
+  if (String(payload.appointment_phase || '').toLowerCase() !== 'past') return false;
+  const delta = Number(payload.appointment_minutes_delta);
+  if (!Number.isFinite(delta)) return false;
+  return delta <= 0 && delta >= -RECENT_DISRUPTION_WINDOW_MINUTES;
+}
+
+/**
+ * Returns a copy of the dispatch row with the send_message prompt replaced by
+ * the reframe hint. Every other sub-action (follow-up tag, hold) is kept; the
+ * bucket override happens through payload_overrides at interpolation time.
+ */
+export function applySoftDeclineReframe(row) {
+  const actions = Array.isArray(row?.actions) ? row.actions : [];
+  return {
+    ...row,
+    notes: `soft-decline reframe (2026-09-02 guard) — ${row?.notes || ''}`,
+    actions: actions.map((a) => (
+      a?.action_type === 'send_message'
+        ? { ...a, params: { ...(a.params || {}), prompt_hint: SOFT_DECLINE_REFRAME_HINT } }
+        : a
+    )),
+  };
+}
+
 // 2026-06-16 — suppress disambiguation. `recommended_action: "suppress"` is
 // overloaded: the analyzer returns it for BOTH "the customer declined" and
 // "hold outreach, the lead is booked/satisfied". The suppress dispatch row runs
@@ -140,6 +209,22 @@ export async function getDispatchForClassification(payload, opts = {}) {
       dispatch: null,
       reason: 'below_confidence_threshold',
       confidence, threshold, recommended_action: recommended,
+    };
+  }
+
+  // 2026-09-02 — soft-decline reframe (see module header). Applied AFTER the
+  // confidence gate so a low-confidence analysis still stands down as today.
+  if (recommended === 'follow_up_scheduled' && isSoftDeclineAfterAppointmentDisruption(payload)) {
+    console.log(
+      `[layer3-dispatch] follow_up_scheduled reclassified as soft decline for ${opts.contactId}: ` +
+      `bucket=${payload.follow_up_bucket || 'unset'} engagement=${payload.engagement_quality || 'unset'} ` +
+      `appt_delta_min=${payload.appointment_minutes_delta} → reframe + ${SOFT_DECLINE_BUCKET}`
+    );
+    return {
+      dispatch: applySoftDeclineReframe(data),
+      confidence, threshold,
+      soft_decline_reframe: true,
+      payload_overrides: { follow_up_bucket: SOFT_DECLINE_BUCKET },
     };
   }
 

@@ -419,7 +419,11 @@ async function executeLayer3Dispatch(action /*, context */) {
     // {{trigger_link.xyz}}) contain dots and pass through UNTOUCHED. An
     // absent token blanks to '' — executeAddTag's trailing-':' hygiene guard
     // rejects the malformed tag rather than writing it.
-    let actionPayload = interpolatePayload(tmpl.params || tmpl.payload || {}, event.payload || {});
+    // 2026-09-02 — a dispatch guard may override interpolation inputs (the
+    // soft-decline guard in layer3-dispatch.js forces follow_up_bucket to
+    // '1week'). Spread so the fetched event row is never mutated.
+    const interpContext = { ...(event.payload || {}), ...(result.payload_overrides || {}) };
+    let actionPayload = interpolatePayload(tmpl.params || tmpl.payload || {}, interpContext);
 
     // 2026-08-13 — stamp the REAL channel from the triggering event, mirroring
     // what decision-engine.createActionsFromRule already does for rule
@@ -471,6 +475,24 @@ async function executeLayer3Dispatch(action /*, context */) {
       continue;
     }
     queued.push({ id: data.id, action_type: data.action_type });
+
+    // 2026-09-02 — the reply this fan-out just queued must not wait for the
+    // next sweep chunk either (3–4 min on 2026-09-02 even at lane 10, because
+    // the running sweep had already claimed its chunk). Same fast path
+    // createActionsFromRule uses for rule-template replies. The outbound lock
+    // + sent marker dedup a later sweep claim. allowExecuting:false — if the
+    // sweep got there first, it owns the row.
+    if (tmpl.action_type === 'send_message' && data.status === 'pending') {
+      executeActionById(data.id, { allowExecuting: false }).catch((err) =>
+        console.warn(`[ActionExecutor] layer3 reply fast-path failed for action ${data.id}: ${err.message}`));
+    }
+  }
+
+  if (result.soft_decline_reframe) {
+    console.log(
+      `[ActionExecutor] layer3_dispatch(${dispatch.recommended_action}): soft-decline reframe applied for ${targetId} — ` +
+      `bucket ${event.payload?.follow_up_bucket || 'unset'} → ${result.payload_overrides?.follow_up_bucket} (event ${event.id})`
+    );
   }
 
   console.log(
@@ -994,6 +1016,16 @@ const HANDLER_TIMEOUT_OVERRIDES_MS = {
   set_lp_appointment: Math.max(
     HANDLER_TIMEOUT_MS,
     parseInt(process.env.EXECUTOR_LP_APPOINTMENT_TIMEOUT_MS || '120000', 10),
+  ),
+  // 2026-09-02 — send_message = reply-context build + Claude generation + GHL
+  // send, each behind the rate limiter. Action 401270 (gpPQYhCsqdGy10wU14Rp)
+  // hit the 60s watchdog at 14:56:49Z, the zombie delivered the SMS 39s later,
+  // and the row stayed `pending` — a customer reply recorded as unsent. Same
+  // scoped-override reasoning as set_lp_appointment above; still well under
+  // the 10-min reaper. The sent marker keeps a late retry from double-texting.
+  send_message: Math.max(
+    HANDLER_TIMEOUT_MS,
+    parseInt(process.env.EXECUTOR_SEND_MESSAGE_TIMEOUT_MS || '120000', 10),
   ),
 };
 
