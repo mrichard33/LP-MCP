@@ -304,33 +304,44 @@ const WEBHOOK_FOR_EMAIL = (process.env.GHL_SEND_EMAIL_VIA_WEBHOOK || 'false').to
 //
 // Brand law (locked): Randy is the broadcast email/video voice only. A
 // conversational reply is never Randy's — in voice OR in sender. When the
-// thread is Randy's, the reply goes out from the configured rep mailbox.
-// Every other thread keeps continuity exactly as before.
+// lead wrote to Randy's mailbox, the reply goes out from the configured rep
+// mailbox. Every other thread keeps continuity exactly as before.
 //
-// Detection is belt-and-suspenders, either alone reroutes:
-//   - the inbound's `to` is a Randy mailbox (local part starts with "randy",
-//     or the address is listed in AGENTIC_NEVER_REPLY_FROM), or
-//   - the thread-sender classifier (v3.15, classifyThreadSenderText) says
-//     the last outbound was Randy-signed.
+// SCOPE (narrowed 2026-09-02, Mark): the reroute fires on EXACTLY ONE
+// SIGNAL — the lead wrote TO Randy's broadcast mailbox. Nothing else.
+//
+// The first cut also rerouted whenever the v3.15 thread-sender classifier
+// read the last outbound as Randy-signed, regardless of which mailbox the
+// lead had written to. That was too wide: a lead replying to a rep or to a
+// team mailbox (contact@, info@, careers@, agreements@, a rep's own
+// address) would have had their reply rerouted to AGENTIC_REPLY_FROM_EMAIL
+// on the strength of a signature match alone. Those threads must keep
+// v3.11/v3.14 continuity — the reply comes back from the mailbox the lead
+// actually wrote to. The classifier still drives the VOICE (unchanged); it
+// no longer has any say over the SENDER.
+//
+// Match is exact and case-insensitive on the whole address — not a prefix.
+// A prefix rule would also have caught unrelated mailboxes that merely
+// start with "randy" (a real lead in the message history is
+// randycundiff@gmail.com).
 //
 // AGENTIC_REPLY_FROM_EMAIL must be a sender the GHL email provider has
 // verified, or GHL substitutes its default. AGENTIC_REPLY_FROM_USER_ID is the
 // rep's GHL user id (LC-Email keys From on userId). Both are Railway env vars.
+// AGENTIC_RANDY_EMAIL only needs setting if Randy's mailbox ever changes.
 // ═══════════════════════════════════════════════════════════════════
 const AGENTIC_REPLY_FROM_EMAIL = String(process.env.AGENTIC_REPLY_FROM_EMAIL || 'mark@getreecewindows.com').trim().toLowerCase();
 const AGENTIC_REPLY_FROM_USER_ID = String(process.env.AGENTIC_REPLY_FROM_USER_ID || '').trim() || null;
-const AGENTIC_NEVER_REPLY_FROM = new Set(
-  String(process.env.AGENTIC_NEVER_REPLY_FROM || '')
-    .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
-);
+const AGENTIC_RANDY_EMAIL = String(process.env.AGENTIC_RANDY_EMAIL || 'randy@getreecewindows.com').trim().toLowerCase();
 
-/** True for any mailbox that belongs to Randy. Pure. */
+/**
+ * True only for Randy's broadcast mailbox — exact match, case-insensitive.
+ * Deliberately NOT a prefix or domain match: every other Reece mailbox,
+ * including a lead who happens to be called Randy, is not Randy. Pure.
+ */
 export function isRandyMailbox(addr) {
   const a = String(addr || '').trim().toLowerCase();
-  if (!a) return false;
-  if (AGENTIC_NEVER_REPLY_FROM.has(a)) return true;
-  const local = a.split('@')[0] || '';
-  return /^randy(?:[._-]|$)/.test(local);
+  return !!a && a === AGENTIC_RANDY_EMAIL;
 }
 
 /**
@@ -338,10 +349,9 @@ export function isRandyMailbox(addr) {
  *
  *   inboundTo         the address the lead wrote to (our receiving mailbox)
  *   originatorUserId  GHL user who sent the last outbound in the thread
- *   threadSenderType  classifyThreadSenderText verdict ({ type }) or null
  *
  * Returns { emailFrom, userId, reason }:
- *   randy_thread_rerouted        Randy thread → rep mailbox, rep user
+ *   randy_thread_rerouted        lead wrote to Randy → rep mailbox, rep user
  *   inbound_mailbox_continuity   today's v3.11/v3.14 behavior, unchanged
  *   ghl_default                  nothing known → GHL picks (unchanged)
  *
@@ -350,10 +360,9 @@ export function isRandyMailbox(addr) {
  * falls back to the contact's assignedTo user (never Randy in practice, but
  * set AGENTIC_REPLY_FROM_USER_ID to make it Mark by contract).
  */
-export function resolveEmailSender({ inboundTo = null, originatorUserId = null, threadSenderType = null } = {}) {
+export function resolveEmailSender({ inboundTo = null, originatorUserId = null } = {}) {
   const to = inboundTo ? String(inboundTo).trim().toLowerCase() : null;
-  const randyThread = isRandyMailbox(to) || threadSenderType?.type === 'randy';
-  if (randyThread) {
+  if (isRandyMailbox(to)) {
     return { emailFrom: AGENTIC_REPLY_FROM_EMAIL, userId: AGENTIC_REPLY_FROM_USER_ID, reason: 'randy_thread_rerouted' };
   }
   if (to || originatorUserId) {
@@ -1396,13 +1405,9 @@ async function sendViaConversationsAPI(contactId, message, channel, subject, opt
     // GHL ignores whichever doesn't apply for the active provider, so
     // setting both is safe and provider-agnostic.
     // 2026-09-02 — never send as Randy. See resolveEmailSender (module top).
-    // opts.threadSenderType is the v3.15 classifier verdict when the caller
-    // already fetched it; the address check alone is sufficient without it.
-    const sender = resolveEmailSender({
-      inboundTo: replyFromAddr,
-      originatorUserId,
-      threadSenderType: opts.threadSenderType || null,
-    });
+    // Keyed solely on the mailbox the lead wrote to; the thread-sender
+    // classifier deliberately has no say over the sender.
+    const sender = resolveEmailSender({ inboundTo: replyFromAddr, originatorUserId });
     if (sender.userId) {
       msgBody.userId = sender.userId;
     }
@@ -2512,9 +2517,6 @@ export async function executeSendMessage(action, context) {
   // requires_ai_generation block) can surface it to the action executor.
   let fallbackUsed = false;
   let fallbackError = null;
-  // 2026-09-02 — hoisted from the generation block so the send can pass the
-  // v3.15 thread-sender verdict to resolveEmailSender (never send as Randy).
-  let threadSenderType = null;
 
   if (message) {
     console.log(`[SendMessage] Using ${payload.pre_generated ? 'pre-generated' : 'provided'} message for ${contactId} (${message.length} chars)`);
@@ -2550,7 +2552,7 @@ export async function executeSendMessage(action, context) {
     // pick the correct opener. Email-only; never fetched for SMS. Fail-open to
     // 'rep' (the safe, non-aggressive opener) if the lookup is unavailable.
     // Fetched once, before the retry loop, so a retry never re-fetches it.
-    threadSenderType = null;
+    let threadSenderType = null;
     if (channel === 'email') {
       try {
         threadSenderType = await getThreadSenderType(contactId);
@@ -3044,9 +3046,6 @@ export async function executeSendMessage(action, context) {
     contactId, message, channel, subject, action,
     {
       fromNumber: replyContext?.fromNumber || null,
-      // 2026-09-02 — never send as Randy (see resolveEmailSender). Null on
-      // SMS and when the pre-fetch failed; the address check still applies.
-      threadSenderType,
       // 2026-08-18 phone guard: the only numbers this body may contain — the
       // market service phone this generation resolved and the contact's own
       // known number. The sending line is added inside sendWithFallback.
