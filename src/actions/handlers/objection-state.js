@@ -119,6 +119,15 @@
  *              receive S5.2 appointment-rescue SMS/email; legitimate booked
  *              leads with pre-appointment friction are unaffected. Stops the
  *              regrowth that the 2026-06-05 one-time lane cleanup cleared.
+ *
+ * 2026-09-02 — v2.0: APPOINTMENT_DISRUPTION proposals are rejected (before the
+ *              state row is written) when lp_leads shows ANOTHER lead on the
+ *              same GHL contact with a live future Set/Cnf appointment or a
+ *              Sale in the last 30 days. Root cause: call-center duplicate-lead
+ *              cleanup CXLs one lead while the real appointment stays Set on
+ *              the other; the sync emits cancelled → S5.2 "you cancelled" text
+ *              to a contact who never cancelled. Emits
+ *              state_transition_suppressed_duplicate_lead. Fails open.
  */
 
 import supabase from '../../supabase.js';
@@ -304,6 +313,39 @@ export async function executeTransitionObjectionState(action) {
         reason: 'awaiting_approval',
         threshold,
         classifier_confidence: conf,
+      };
+    }
+  }
+
+  // v2.0 — Duplicate-lead guard. A disposition-driven disruption (CXL/NS/BO/
+  // 1Leg) on ONE lead must not fire rescue when the same contact holds a live
+  // future appointment (or a recent Sale) on ANOTHER LP lead. Duplicate-lead
+  // cleanup by the call center produces exactly this shape. We reject BEFORE
+  // writing the state row so the contact's current objection state, GHL mirror
+  // field, and rebook link are all left untouched.
+  if (proposedPolicy.parent_state === 'APPOINTMENT_DISRUPTION') {
+    const blocking = await findBlockingLiveLead(contact_id);
+    if (blocking) {
+      await emitTransitionEvent('state_transition_suppressed_duplicate_lead', {
+        contact_id,
+        currentState,
+        proposed_state,
+        blocking_lp_lead_id: blocking.lp_lead_id,
+        blocking_source: blocking.lead_source_detail,
+        blocking_disposition: blocking.disposition_code,
+        blocking_appointment_date: blocking.appointment_date,
+        trigger_source,
+        triggering_event_id,
+        source_action_id: action.id,
+        reason: 'live_appointment_or_sale_on_other_lead',
+      });
+      return {
+        success: false,
+        reason: 'duplicate_lead_live_appointment',
+        from: fromState,
+        to: proposed_state,
+        blocking_lp_lead_id: blocking.lp_lead_id,
+        blocking_disposition: blocking.disposition_code,
       };
     }
   }
@@ -786,6 +828,57 @@ async function contactHasAppointmentEvidence(contact_id) {
   }
 
   return false; // both LP and GHL show no appointment evidence → suppress enroll
+}
+
+/**
+ * v2.0 — Duplicate-lead live-appointment check for APPOINTMENT_DISRUPTION.
+ *
+ * Returns the lp_leads row that should block a disruption transition, or null.
+ * A block is any OTHER lead on the same GHL contact that is either:
+ *   (a) appointment_set = true AND appointment_date >= now() AND
+ *       disposition_code IN ('Set','Cnf')   — a live future appointment, or
+ *   (b) disposition_code IN ('Sale','Sold') AND updated_at_lp >= now() - 30d
+ *       — the contact already bought on another lead.
+ *
+ * The triggering (cancelled/no-show) lead cannot match (a): its own
+ * disposition is CXL/CCC/BO/NoHome/1Leg. So no need to know which lead fired.
+ *
+ * Fails OPEN (returns null) on any query error — never suppress on an outage.
+ * lp_leads lives in this Supabase instance; no cross-join.
+ *
+ * NOTE: updated_at_lp is null on some rows (known cache limitation). The .gte
+ * filter treats null as non-matching, which is the safe direction for clause
+ * (b). Clause (a) does not depend on it.
+ *
+ * @param {string} contact_id  GHL contact id
+ * @returns {Promise<object|null>} blocking lp_leads row, or null to allow
+ */
+async function findBlockingLiveLead(contact_id) {
+  try {
+    const nowIso = new Date().toISOString();
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString();
+
+    const { data, error } = await supabase
+      .from('lp_leads')
+      .select('lp_lead_id, lead_source_detail, disposition_code, appointment_set, appointment_date, updated_at_lp')
+      .eq('ghl_contact_id', String(contact_id))
+      .or(
+        `and(appointment_set.eq.true,appointment_date.gte.${nowIso},disposition_code.in.(Set,Cnf)),` +
+        `and(disposition_code.in.(Sale,Sold),updated_at_lp.gte.${thirtyDaysAgo})`
+      )
+      .order('appointment_date', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      console.warn(`[ObjectionState] duplicate-lead guard query failed for ${contact_id}: ${error.message} — failing open`);
+      return null;
+    }
+    return data || null;
+  } catch (err) {
+    console.warn(`[ObjectionState] duplicate-lead guard threw for ${contact_id}: ${err.message} — failing open`);
+    return null;
+  }
 }
 
 /**
