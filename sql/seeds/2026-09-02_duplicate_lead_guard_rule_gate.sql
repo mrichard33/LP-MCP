@@ -1,8 +1,25 @@
 -- =====================================================================
 -- 2026-09-02 — DUPLICATE-LEAD GUARD, RULE GATE (objection-state v2.0 part 2)
 -- =====================================================================
--- NOT YET APPLIED. See DEPLOY ORDER below — this file MUST NOT be run until
--- decision-engine.js v2.19 is live on Railway.
+-- APPLIED LIVE 2026-09-02 ~02:25Z via LP MCP supabase_run_query, AFTER the
+-- decision-engine.js v2.19 deploy landed (Railway deployment
+-- e6c7d693-e313-4ccc-9525-b0828eced1c3, SUCCESS, built from merge commit
+-- e036264 / PR #802). Deploy order was respected — code first, then this SQL.
+--
+--   Pre-change enabled rules: 277 (304 total, 0 already gated)
+--   Rules gated:              12 (all enabled)
+--   Reload asserted:          POST /n8n/decision-engine/reload-rules
+--                             -> {"success":true,"rules_loaded":277}
+--                             UNCHANGED, as required for a condition edit.
+--   Fail-closed on the new operator at apply time: 0
+--
+-- NOTE the wrapper limitation: LP MCP supabase_run_query rejects a top-level
+-- data-modifying CTE ("WITH clause containing a data-modifying statement must
+-- be at the top level") and does not report rows_affected. The APPLY below is
+-- therefore written as a plain UPDATE ... RETURNING, and the count is asserted
+-- by the read-back query that follows it. Do not "restore" the CTE form.
+--
+-- This file remains the durable record and the rollback vehicle.
 --
 -- WHAT
 --   Adds the context condition `not_duplicate_lead_live_appointment: true` to
@@ -76,34 +93,42 @@
 -- disposition checks have already short-circuited most events. The lp_leads
 -- lookup only runs for events that pass everything else.
 
-WITH u AS (
-  UPDATE agent_rules
-     SET context_conditions =
-           coalesce(context_conditions, '{}'::jsonb)
-           || '{"not_duplicate_lead_live_appointment": true}'::jsonb,
-         version = version + 1,
-         notes = coalesce(notes, '') ||
-           E'\n[2026-09-02 Claude] Added not_duplicate_lead_live_appointment. '
-           'Call-center duplicate-lead cleanup CXLs one LP lead while the real '
-           'appointment stays Set/Cnf on another lead for the same contact; '
-           'this rule was firing its full action batch (stage:reactivation, '
-           'move_opportunity, appt-cancelled, task, end_agentic_handoff, S5.2 '
-           'enrollment) against contacts who never cancelled. objection-state '
-           'v2.0 guarded only the state write and enrollment; this gates the '
-           'siblings. Requires decision-engine.js v2.19. Fails OPEN on lp_leads '
-           'query error. Evidence: cySIThxV1wJsV5E11Umu, actions 389380-389397.'
-   WHERE rule_key IN (
-     'LP_DISP_CXL_TO_CANCELLED','LP_DISP_CANCEL_COLD_TO_S5_2',
-     'LP_DISP_NS_NOHOME_CUSTOMER_TO_NOSHOW','LP_DISP_NOSHOW_COLD_TO_TOFU',
-     'LP_DISP_1LEG_TO_ONELEG','LP_DISP_BO_TO_BEBACK',
-     'GHL_APPT_CANCELLED_REBOOK','GHL_APPT_CANCELLED_REBOOK_COLD',
-     'BEHAVIORAL_APPT_NO_SHOW','BEHAVIORAL_APPT_NO_SHOW_COLD',
-     'ENROLL_S5_2_v2_NO_SHOW_ON_US','ENROLL_S5_2_v2_NO_SHOW_REP_TRAVELED')
-     AND NOT (coalesce(context_conditions, '{}'::jsonb)
-              ? 'not_duplicate_lead_live_appointment')
-  RETURNING 1
-)
-SELECT count(*) AS rules_gated FROM u;
+UPDATE agent_rules
+   SET context_conditions =
+         coalesce(context_conditions, '{}'::jsonb)
+         || '{"not_duplicate_lead_live_appointment": true}'::jsonb,
+       version = version + 1,
+       notes = coalesce(notes, '') ||
+         E'\n[2026-09-02 Claude] Added not_duplicate_lead_live_appointment. '
+         'Call-center duplicate-lead cleanup CXLs one LP lead while the real '
+         'appointment stays Set/Cnf on another lead for the same contact; '
+         'this rule was firing its full action batch (stage:reactivation, '
+         'move_opportunity, appt-cancelled, task, end_agentic_handoff, S5.2 '
+         'enrollment) against contacts who never cancelled. objection-state '
+         'v2.0 guarded only the state write and enrollment; this gates the '
+         'siblings. Requires decision-engine.js v2.19. Fails OPEN on lp_leads '
+         'query error. Evidence: cySIThxV1wJsV5E11Umu, actions 389380-389397.'
+ WHERE rule_key IN (
+   'LP_DISP_CXL_TO_CANCELLED','LP_DISP_CANCEL_COLD_TO_S5_2',
+   'LP_DISP_NS_NOHOME_CUSTOMER_TO_NOSHOW','LP_DISP_NOSHOW_COLD_TO_TOFU',
+   'LP_DISP_1LEG_TO_ONELEG','LP_DISP_BO_TO_BEBACK',
+   'GHL_APPT_CANCELLED_REBOOK','GHL_APPT_CANCELLED_REBOOK_COLD',
+   'BEHAVIORAL_APPT_NO_SHOW','BEHAVIORAL_APPT_NO_SHOW_COLD',
+   'ENROLL_S5_2_v2_NO_SHOW_ON_US','ENROLL_S5_2_v2_NO_SHOW_REP_TRAVELED')
+   AND NOT (coalesce(context_conditions, '{}'::jsonb)
+            ? 'not_duplicate_lead_live_appointment')
+RETURNING id, rule_key;
+
+-- Assert the count (the wrapper does not report rows_affected). Expect
+-- gated_total = 12, gated_enabled = 12, enabled_rules unchanged at 277.
+-- SELECT json_agg(row_to_json(s)) FROM (
+--   SELECT
+--     (SELECT count(*) FROM agent_rules
+--       WHERE coalesce(context_conditions,'{}'::jsonb) ? 'not_duplicate_lead_live_appointment') AS gated_total,
+--     (SELECT count(*) FROM agent_rules
+--       WHERE coalesce(context_conditions,'{}'::jsonb) ? 'not_duplicate_lead_live_appointment'
+--         AND enabled) AS gated_enabled,
+--     (SELECT count(*) FROM agent_rules WHERE enabled) AS enabled_rules) s;
 
 -- ---------------------------------------------------------------------
 -- RELOAD — required. Assert rules_loaded against the pre-change enabled count.
@@ -148,6 +173,12 @@ SELECT count(*) AS rules_gated FROM u;
 --   GROUP BY 1) s;
 --   Baseline (30d to 2026-09-02): LP_DISP_CANCEL_COLD_TO_S5_2 714 contacts,
 --   GHL_APPT_CANCELLED_REBOOK_COLD 687 contacts.
+--   Baseline at apply time (2026-09-02 02:25Z), for the first post-apply check:
+--     GHL_APPT_CANCELLED_REBOOK_COLD  28 contacts/24h, 154/7d
+--     LP_DISP_CANCEL_COLD_TO_S5_2     27 contacts/24h, 154/7d
+--     LP_DISP_NOSHOW_COLD_TO_TOFU      8 contacts/24h,  36/7d
+--   A 24h figure near zero on either of the top two = the gate is over-firing
+--   or the operator is not live. Roll back and investigate.
 --
 -- (4) Engine-side fail-closed events must NOT name these rules. If they do,
 --     the operator is unknown to the running deploy — roll back now:
