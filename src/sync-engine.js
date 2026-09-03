@@ -137,7 +137,7 @@
 import { createHash } from 'node:crypto';
 import supabase from './supabase.js';
 import { getToken, startTokenRefreshSchedule } from './token-manager.js';
-import { getLeadData, getJobStatusChanges, getLead, testConnection } from './lp-client.js';
+import { getLeadData, getJobStatusChanges, getLead, getLeadByLdsId, testConnection } from './lp-client.js';
 import { resetGHLState, matchToGHL, applyGHLTag } from './ghl.js';
 import { resetLinkVerifyBudget, logLinkCorroborationConfig } from './services/link-corroboration.js';
 import { processMilestoneTriggers } from './milestones.js';
@@ -155,7 +155,12 @@ import { populateSourceMapping, backfillSourceMappingsFromLeads } from './sync-s
 import { syncDispositions, backfillDispositionsFromLeads } from './sync-dispositions.js';
 import { upsertLeadOnly, processProspect } from './sync-leads.js';
 import { syncAllChildRecords, syncJobAndMilestones } from './sync-children.js';
-import { describeJobUpsertError } from './job-upsert-error.js';
+import {
+  describeJobUpsertError,
+  getJobParentHealMode,
+  getJobParentHealBudget,
+  shouldHealParent,
+} from './job-upsert-error.js';
 import { checkDay15Handoffs, checkLeadTriggers } from './sync-triggers.js';
 
 // v6.10: Prospect deny-list for chronically-timing-out cstIds. The
@@ -975,9 +980,72 @@ async function runLeadsSweep(since, windowEnd, logIds, maxLeads) {
   return { counts, failed, hitCap, denylistSkipped, newlyDenylisted, unchangedSkipped, scanned, truncatedAt };
 }
 
+/**
+ * v6.14 — Parent-lead self-heal for the job-changes sweep.
+ *
+ * runJobChangesSweep pulls jobs whose STATUS changed and writes them straight
+ * to lp_jobs. The leads sweep is independent and only picks up leads that
+ * themselves changed, so a job whose lead never synced fails
+ * lp_jobs_lp_lead_id_fkey on every sweep, forever — and its milestones are
+ * skipped with it. Measured 2026-09-03: job 57771 (a $19,595 sale, product
+ * received 9/1, install started 9/2) absent from lp_jobs entirely, its revenue
+ * missing from every lp_jobs-derived report and its post-sale milestone tags
+ * never fired.
+ *
+ * This fetches the prospect from LP by lds_id and runs it through the CANONICAL
+ * upsertLeadOnly() rather than synthesising a lead row from the job payload.
+ * The job payload does carry lead-ish fields, but a hand-built row would be a
+ * new row shape that skips source-bucket resolution and link handling — exactly
+ * how cohort and source reporting gets quietly contaminated. One extra LP call
+ * per missing parent is the right trade.
+ *
+ * SAFETY: upsertLeadOnly + upsertProspect are DB-only — no matchToGHL, no tag
+ * writes, no event emission (verified 2026-09-03). Healing a parent cannot
+ * create a GHL contact or send anything to a customer.
+ *
+ * Returns { healed: boolean, reason?: string } and never throws.
+ */
+async function healMissingParentLead(lpLeadId, jobId) {
+  try {
+    const resp = await getLeadByLdsId(lpLeadId);
+    // GetLead returns prospect records; take the one that actually carries this
+    // lds_id rather than assuming the first. A prospect can hold several leads.
+    const prospect = extractArray(resp).find((p) =>
+      (getField(p, 'leads', 'Leads') || []).some(
+        (l) => String(getField(l, 'id', 'lds_id', 'LeadID')) === String(lpLeadId),
+      ),
+    );
+    if (!prospect) {
+      // LP itself has no such lead — the job references an id that does not
+      // resolve. Not healable; leave it to the error row.
+      return { healed: false, reason: 'lead not present in LP GetLead response' };
+    }
+
+    await upsertLeadOnly(prospect);
+
+    // Verify rather than assume: upsertLeadOnly can skip rows on its own
+    // freshness rules, and a heal that did not actually land must not be
+    // reported as one.
+    const { data: row } = await supabase.from('lp_leads')
+      .select('lp_lead_id').eq('lp_lead_id', String(lpLeadId)).maybeSingle();
+    if (!row) return { healed: false, reason: 'lp_leads row still absent after upsertLeadOnly' };
+
+    console.log(`[Sync:JobChanges] HEAL: created parent lead ${lpLeadId} for job ${jobId}`);
+    return { healed: true };
+  } catch (err) {
+    return { healed: false, reason: `heal threw: ${err.message}` };
+  }
+}
+
 async function runJobChangesSweep(since, windowEnd, logIds) {
   const counts = { jobs: 0, milestones: 0 };
   let failed = 0;
+  // v6.14 — parent-lead self-heal, read once per sweep so a mid-sweep env
+  // change cannot split behavior across the same window.
+  const healMode = getJobParentHealMode();
+  const healBudget = getJobParentHealBudget();
+  let healsUsed = 0;
+  let healed = 0;
   let startIndex = 1;
   // v6.13: deep-offset mode, ported from runLeadsSweep (#709). This sweep was
   // left on the pre-fix path deliberately as the control arm; it has served
@@ -1049,8 +1117,44 @@ async function runJobChangesSweep(since, windowEnd, logIds) {
         // 57771 ($19,595, install in progress) and 58260 were absent from
         // lp_jobs entirely. Count it, and write it where a query can find it.
         if (res?.jobUpsertError) {
-          failed++;
           const e = res.jobUpsertError;
+
+          // v6.14 — self-heal the one failure that IS fixable: a missing parent
+          // lead. Gated, budgeted, and retried at most once. Anything the gate
+          // rejects (non-23503, unusable id, budget spent, mode off) falls
+          // straight through to the error row below, exactly as before.
+          if (shouldHealParent(e, healMode, healsUsed, healBudget)) {
+            healsUsed++;
+            if (healMode === 'shadow') {
+              console.log(
+                `[Sync:JobChanges] HEAL shadow: would create parent lead ${e.lpLeadId} ` +
+                `for job ${e.jobId} (no write performed)`,
+              );
+            } else {
+              const heal = await healMissingParentLead(e.lpLeadId, e.jobId);
+              if (heal.healed) {
+                // Retry ONCE. If the parent now exists the FK is satisfied and
+                // the job plus its milestones land on this pass. No loop: a
+                // second failure is a different problem and gets logged.
+                const retry = await syncJobAndMilestones(job, job.lds_id || job.lp_lead_id, null);
+                if (!retry?.jobUpsertError) {
+                  healed++;
+                  counts.jobs++;
+                  counts.milestones += (getField(job, 'milestones', 'Milestones') || []).length;
+                  console.log(`[Sync:JobChanges] HEAL: job ${e.jobId} synced after parent lead ${e.lpLeadId} created`);
+                  return;
+                }
+                console.error(
+                  `[Sync:JobChanges] HEAL: parent lead ${e.lpLeadId} created but job ${e.jobId} ` +
+                  `still failed — ${describeJobUpsertError(retry.jobUpsertError)}`,
+                );
+              } else {
+                console.warn(`[Sync:JobChanges] HEAL failed for lead ${e.lpLeadId} (job ${e.jobId}): ${heal.reason}`);
+              }
+            }
+          }
+
+          failed++;
           // entityId lands in lp_sync_errors.lp_lead_id, so pass the LEAD id —
           // the job id travels in the message. (The generic catch below still
           // passes a job id into that column; left as-is, out of scope here.)
@@ -1077,6 +1181,16 @@ async function runJobChangesSweep(since, windowEnd, logIds) {
     console.log(
       `[Sync:JobChanges] Deep-offset mode engaged at StartIndex=${deepOffsetSince} — ` +
       `${scanned} rows scanned at 1 LP call/row, ${(scanned / Math.max(0.1, mins)).toFixed(1)} rows/min`
+    );
+  }
+  // v6.14 — one line per sweep whenever the heal path engaged, so shadow runs
+  // are readable without grepping per-job lines, and a spent budget (the signal
+  // that the gap is bigger than one sweep can close) is impossible to miss.
+  if (healMode !== 'off' && healsUsed > 0) {
+    console.log(
+      `[Sync:JobChanges] Parent-lead heal (${healMode}): ${healsUsed} attempted, ` +
+      `${healed} job(s) recovered, budget ${healsUsed}/${healBudget}` +
+      (healsUsed >= healBudget ? ' — BUDGET SPENT, remainder deferred to next sweep' : '')
     );
   }
   return { counts, failed };
