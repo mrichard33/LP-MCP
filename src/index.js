@@ -242,6 +242,9 @@ import { registerMarketAssignmentRoutes, startMarketAssignmentScheduler } from '
 // nightly 23:50 ET fill snapshot, unauthenticated GET /board/capacity for the
 // dashboard TV board (sql/043).
 import { registerCapacityBoardRoutes, startCapacitySweepScheduler } from './jobs/capacity-sweep.js';
+// 2026-09-03 — capacity-driven Five9 list priority ranker. Ships in shadow
+// (CAPACITY_RANKER_MODE=shadow default): computes, logs, never writes.
+import { registerCapacityRankerRoutes } from './routes/capacityRanker.js';
 // Band-level (slot_id) capacity vs GHL bookings — the dimension v_appt_board
 // aggregates away. Read-only diagnostic, authenticated, no scheduler (sql/048).
 import { registerCapacityBandRoutes } from './jobs/capacity-bands.js';
@@ -1547,6 +1550,30 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] call intelligence deferred review reason FAILED — apply sql/073 MANUALLY before arming the worker; until then every analyze advance rejects and calls exhaust their attempts into "failed":', err.message);
   }
+
+  // Capacity ranker log (sql/080 — the file is the source of truth). One row
+  // per POST /n8n/capacity-ranker/run; the ranker compares each run to the
+  // last row where applied = true. Plain CREATE INDEX here (the .sql file
+  // carries the CONCURRENTLY form under its own execution). Additive.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE TABLE IF NOT EXISTS dial_priority_log (
+              id              bigserial PRIMARY KEY,
+              ran_at          timestamptz NOT NULL DEFAULT now(),
+              slot_date       date        NOT NULL,
+              ranking         jsonb       NOT NULL,
+              unknown_markets jsonb       NOT NULL DEFAULT '[]'::jsonb,
+              changed         boolean     NOT NULL DEFAULT false,
+              applied         boolean     NOT NULL DEFAULT false,
+              mode            text        NOT NULL,
+              error_message   text
+            );
+            CREATE INDEX IF NOT EXISTS idx_dial_priority_log_slot_ran
+              ON dial_priority_log (slot_date, ran_at DESC);`);
+    console.log('[Migration] capacity ranker dial_priority_log (sql/080) ready');
+  } catch (err) {
+    console.error('[Migration] capacity ranker dial_priority_log FAILED (POST /n8n/capacity-ranker/run will answer 500 until sql/080 is applied manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
@@ -1908,6 +1935,7 @@ registerWorkflowProjectionRoutes(app);
 registerGoalScorecardRoutes(app);
 registerMarketAssignmentRoutes(app);
 registerCapacityBoardRoutes(app); // 2026-07-22 — TV capacity board aggregate (GET /board/capacity, unauthenticated by design)
+registerCapacityRankerRoutes(app); // 2026-09-03 — POST /n8n/capacity-ranker/run: next-day capacity → Five9 list priority (shadow by default)
 // 2026-07-25 — GET /admin/capacity-bands: per-band LP capacity vs GHL bookings.
 // Read-only. Takes `authenticate` (an admin diagnostic, not a kiosk feed);
 // registered separately from the board so the two stay independently removable.
