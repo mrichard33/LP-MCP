@@ -3,6 +3,9 @@
 -- Date: 2026-09-03
 -- Applied live: 2026-09-03 12:22 UTC via LP MCP:supabase_run_query
 -- Reload: POST /n8n/decision-engine/reload-rules -> rules_loaded 278 -> 279
+-- Revised 2026-09-03 13:53 UTC: removed agentic-active from not_has_any_tag
+--   (Mark). agentic-active only means the reply bot is on; it is not a
+--   suppression tag and must not block enrollment. Reloaded, 279 held.
 -- First verified firing: contact kfNhTvHaKFhptkatBpGv (LP 572604), backstop
 --   sweep at 12:30 UTC; agent_actions completed 12:31 UTC; contact carried
 --   stage:entry-bridge + active-e.5 + agentic-active by 12:33 UTC.
@@ -31,7 +34,8 @@
 -- SCOPE: active-entry:other ONLY. Canvass / referral / high-intent backstop
 --   leads route via I.CC and the ghl.contact_created hygiene family.
 --   suppress-outbound (stale/backlog) leads are excluded by design.
---   DNC family, stop-bot, active-e.5, agentic-active re-read at fire time.
+--   DNC family, stop-bot, active-e.5 re-read at fire time. agentic-active is
+--   deliberately NOT a guard here (bot-on flag, not suppression).
 -- ============================================================================
 
 INSERT INTO agent_rules
@@ -48,7 +52,7 @@ VALUES
     "has_any_tag": ["active-entry:other"],
     "not_has_any_tag": ["suppress-outbound","stop-bot","dnc","dnc-sms",
                         "do-not-contact","stage:dnc","unsubscribed",
-                        "active-e.5","agentic-active"]}'::jsonb,
+                        "active-e.5"]}'::jsonb,
   '[{"action_type":"add_to_workflow","target_system":"ghl","target_entity":"contact",
      "params":{"format":"form",
                "webhook_url":"https://services.leadconnectorhq.com/hooks/SsBG7j5KQAIP1SFP2Sca/webhook-trigger/b438b1a2-04c0-4b25-98a6-e16832f80cee",
