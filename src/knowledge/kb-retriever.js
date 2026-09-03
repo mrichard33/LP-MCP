@@ -4,6 +4,28 @@
  * Orchestrates structured KB lookups (Tier 1) for the response generator,
  * plus the Tier 2 vector search over kb_embeddings (v1.9, gated).
  *
+ * v1.10 — 2026-09-03. SEMANTIC TIER 1 (KB_FAQ_SEMANTIC_MODE).
+ *   PROBLEM: searchFaqs() is Postgres full-text on kb_faqs.question_pattern —
+ *   it hits only when the lead's words overlap the pattern's words. "Will
+ *   these hold up in a Cat 4?" does not match "hurricane rated"; the pack is
+ *   empty and the model is free to invent product claims. detectObjection()
+ *   is a fixed keyword list with the same blind spot.
+ *
+ *   FIX (three parts, one flag):
+ *     1. searchFaqs() is semantic-first. kb_faqs gets an embedding column
+ *        (sql/077) kept fresh by tier1-semantic.js embedFaqsSweep(); the
+ *        match_kb_faqs RPC returns rows by cosine similarity. Keyword path is
+ *        retained byte-for-byte as searchFaqsKeyword() and is the fallback.
+ *     2. On OBJECTION turns where keywords + tags found no type, six embedded
+ *        type descriptions are compared in memory to pick objection_type.
+ *     3. One query embedding per turn (makeQueryEmbedder, memoised) is shared
+ *        by Tier 1 semantic, objection typing, and Tier 2 — never two OpenAI
+ *        calls for the same message.
+ *   Gated by KB_FAQ_SEMANTIC_MODE: off (default) = pre-v1.10 behaviour;
+ *   shadow = keyword answers, semantic runs and is logged to kb_vector_queries
+ *   (tier='kb_faqs' / 'objection_type', keyword_match_count alongside);
+ *   live = semantic first.
+ *
  * v1.9 — 2026-09-02. TIER 2 VECTOR SEARCH WIRED (KB_VECTOR_MODE).
  *   PROBLEM: src/knowledge/vector-search.js existed since 2026-04 but was
  *   imported by nothing. idx_kb_embeddings_vec had 0 lifetime scans on
@@ -110,6 +132,13 @@ import {
   shouldRunVectorSearch,
   dedupeVectorMatches,
 } from './vector-gate.js';
+import { getKbFaqSemanticMode } from './tier1-semantic-core.js';
+import {
+  makeQueryEmbedder,
+  matchFaqsSemantic,
+  classifyObjectionSemantic,
+  logKbQuery,
+} from './tier1-semantic.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // v1.9 — TIER 2 VECTOR SEARCH RUNNER
@@ -132,13 +161,18 @@ function withTimeout(promise, ms, label) {
  * KB_VECTOR_TIMEOUT_MS. Writes one audit row to kb_vector_queries (fire and
  * forget) — that table is the evidence for the shadow → live decision.
  */
-async function runVectorTier(messageText, pack, mode) {
+async function runVectorTier(messageText, pack, mode, getQueryEmbedding = null) {
   const started = Date.now();
   let matches = [];
   let error = null;
   try {
+    // v1.10: reuse the per-turn query embedding when the caller has one, so a
+    // QUESTION turn that already embedded for Tier 1 does not embed again.
     const res = await withTimeout(
-      searchKnowledge(messageText, { limit: KB_VECTOR_LIMIT }),
+      (async () => {
+        const queryEmbedding = getQueryEmbedding ? await getQueryEmbedding() : null;
+        return searchKnowledge(messageText, { limit: KB_VECTOR_LIMIT, queryEmbedding });
+      })(),
       KB_VECTOR_TIMEOUT_MS,
       'kb vector search',
     );
@@ -607,7 +641,9 @@ export async function getProofPoints(category, arcId, limit = 3) {
   return safeFetch(q, 'getProofPoints');
 }
 
-export async function searchFaqs(messageText, channel = 'sms', limit = 3) {
+// v1.10 — the pre-v1.10 keyword path, unchanged. Fallback for the semantic
+// path and the whole answer when KB_FAQ_SEMANTIC_MODE=off.
+async function searchFaqsKeyword(messageText, channel = 'sms', limit = 3) {
   if (!messageText) return [];
   const terms = String(messageText)
     .replace(/[^a-zA-Z0-9 ]/g, ' ')
@@ -655,6 +691,65 @@ export async function searchFaqs(messageText, channel = 'sms', limit = 3) {
     console.warn('[KBRetriever] searchFaqs threw:', err.message);
     return [];
   }
+}
+
+/**
+ * v1.10 — Tier 1 FAQ lookup.
+ *   off    → keyword path only (identical to pre-v1.10)
+ *   shadow → keyword path is the answer; semantic runs alongside, both logged
+ *   live   → semantic first; keyword path only when semantic returns nothing
+ * opts.getQueryEmbedding: memoised per-turn embedder from buildKbPack.
+ */
+export async function searchFaqs(messageText, channel = 'sms', limit = 3, opts = {}) {
+  const mode = getKbFaqSemanticMode();
+  if (mode === 'off' || !messageText) {
+    return searchFaqsKeyword(messageText, channel, limit);
+  }
+
+  const started = Date.now();
+  const getQueryEmbedding = opts.getQueryEmbedding || makeQueryEmbedder(messageText);
+  let semantic = [];
+  let error = null;
+  try {
+    semantic = await withTimeout(
+      (async () => matchFaqsSemantic(await getQueryEmbedding(), channel, limit))(),
+      KB_VECTOR_TIMEOUT_MS,
+      'kb faq semantic',
+    );
+  } catch (err) {
+    error = err.message;
+  }
+
+  let keyword = null;
+  if (mode === 'shadow' || semantic.length === 0) {
+    keyword = await searchFaqsKeyword(messageText, channel, limit);
+  }
+
+  const top = typeof semantic[0]?.similarity === 'number' ? semantic[0].similarity : null;
+  console.log(
+    `[KBRetriever] faq ${mode}: semantic=${semantic.length} keyword=${keyword === null ? 'skipped' : keyword.length}` +
+    ` top_sim=${top === null ? 'n/a' : top.toFixed(3)} latency=${Date.now() - started}ms` +
+    (error ? ` error=${error}` : ''),
+  );
+  logKbQuery({
+    tier: 'kb_faqs',
+    intent_class: opts.intentClass || 'QUESTION',
+    mode,
+    query_text: String(messageText).slice(0, 500),
+    match_count: semantic.length,
+    keyword_match_count: keyword === null ? null : keyword.length,
+    top_similarity: top,
+    sources: semantic.map((f) => ({
+      faq_id: f.id,
+      question_pattern: String(f.question_pattern || '').slice(0, 120),
+      similarity: f.similarity,
+    })),
+    latency_ms: Date.now() - started,
+    error,
+  });
+
+  if (mode === 'live' && semantic.length > 0) return semantic;
+  return keyword || [];
 }
 
 export async function getTechniquesForStage(buyerStage, limit = 3) {
@@ -776,9 +871,55 @@ export async function buildKbPack(params) {
     contactTags = [],
   } = params;
 
+  // v1.10 — one query embedding per turn, computed lazily on first use and
+  // shared by Tier 1 semantic FAQ, objection typing, and Tier 2.
+  const getQueryEmbedding = makeQueryEmbedder(messageText);
+  const faqSemanticMode = getKbFaqSemanticMode();
+
   const detectedCompetitor = detectCompetitorMention(messageText);
-  const detectedObjection = detectObjection(messageText)
+  let detectedObjection = detectObjection(messageText)
     || (objectionTags.length > 0 ? objectionTags[0] : null);
+  let objectionDetectedBy = detectedObjection ? 'keyword' : null;
+
+  // v1.10 — semantic objection typing. Only on an OBJECTION turn where the
+  // keyword list and objection tags both found nothing. shadow logs the pick;
+  // live uses it. Never blocks the reply.
+  if (!detectedObjection && intentClass === 'OBJECTION' && messageText && faqSemanticMode !== 'off') {
+    const started = Date.now();
+    let pick = null;
+    let scores = {};
+    let error = null;
+    try {
+      ({ pick, scores } = await withTimeout(
+        (async () => classifyObjectionSemantic(await getQueryEmbedding()))(),
+        KB_VECTOR_TIMEOUT_MS,
+        'objection semantic',
+      ));
+    } catch (err) {
+      error = err.message;
+    }
+    console.log(
+      `[KBRetriever] objection ${faqSemanticMode}: pick=${pick ? `${pick.type}@${pick.similarity.toFixed(3)}` : 'none'}` +
+      ` latency=${Date.now() - started}ms` + (error ? ` error=${error}` : ''),
+    );
+    logKbQuery({
+      tier: 'objection_type',
+      intent_class: intentClass,
+      mode: faqSemanticMode,
+      query_text: String(messageText).slice(0, 500),
+      match_count: pick ? 1 : 0,
+      keyword_match_count: 0,
+      top_similarity: pick ? pick.similarity : null,
+      sources: Object.entries(scores).map(([type, similarity]) => ({ type, similarity })),
+      latency_ms: Date.now() - started,
+      error,
+    });
+    if (pick && faqSemanticMode === 'live') {
+      detectedObjection = pick.type;
+      objectionDetectedBy = 'semantic';
+    }
+  }
+
   const userBookingPreference = detectUserBookingPreference(messageText);
   // v1.7: scheduling-signal detection for defensive booking_context attachment
   const schedulingSignal = detectSchedulingSignal(messageText);
@@ -800,6 +941,7 @@ export async function buildKbPack(params) {
     detected_signals: {
       competitor: detectedCompetitor,
       objection: detectedObjection,
+      objection_detected_by: objectionDetectedBy,  // v1.10 — 'keyword' | 'semantic' | null
       active_entry: activeEntryTag,
       user_booking_preference: userBookingPreference,
       scheduling_signal: schedulingSignal,  // v1.7
@@ -855,7 +997,7 @@ export async function buildKbPack(params) {
       break;
 
     case 'QUESTION':
-      result.faqs = await searchFaqs(messageText, channel, 3);
+      result.faqs = await searchFaqs(messageText, channel, 3, { getQueryEmbedding, intentClass });
       // v1.7: attach booking_context if user preference OR scheduling signal
       // detected — this catches misclassified continuations like "Saturday
       // doesn't work, anything Sunday?" that Layer 1 keyword scan routes to
@@ -921,7 +1063,7 @@ export async function buildKbPack(params) {
   const vectorMode = getKbVectorMode();
   result.vector_mode = vectorMode;
   if (vectorMode !== 'off' && messageText && shouldRunVectorSearch(intentClass, result)) {
-    result.vector_context = await runVectorTier(messageText, result, vectorMode);
+    result.vector_context = await runVectorTier(messageText, result, vectorMode, getQueryEmbedding);
   }
 
   if (detectedCompetitor) {

@@ -36,6 +36,7 @@ import { registerLlmGatewayRoutes } from './llm-gateway.js';
 import { registerIntentScorerRoutes } from './intent-scorer.js';
 // ─── Phase 4: KB Vector Ingestion (agentic bot knowledge layer) ──
 import { registerKbIngestionRoutes } from './knowledge/ingest-embeddings.js';
+import { startTier1EmbedSweep } from './knowledge/tier1-semantic.js';
 // ─── Pause-Workflow Fizzle Sweep ─────────────────────────────────
 import {
   registerPauseWorkflowSweepRoutes,
@@ -670,6 +671,50 @@ async function runMigrations() {
     console.log('[Migration] kb vector tier (sql/076) ready');
   } catch (err) {
     console.error('[Migration] kb vector tier FAILED (Tier 2 search still answers without the index; kb_vector_queries inserts will warn until sql/076 is applied manually):', err);
+  }
+
+  // ── sql/077_kb_faq_semantic.sql (Tier 1 semantic FAQ) ────────────────────
+  // Additive: three nullable columns on kb_faqs, two on kb_vector_queries, one
+  // RPC. tier1-semantic.js embedFaqsSweep() fills kb_faqs.embedding on boot when
+  // KB_FAQ_SEMANTIC_MODE != off. No index: kb_faqs is <100 rows (56 active on
+  // 2026-09-02); a sequential scan over 1536-dim vectors at that size is sub-ms.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`ALTER TABLE kb_faqs
+      ADD COLUMN IF NOT EXISTS embedding vector(1536),
+      ADD COLUMN IF NOT EXISTS embedding_hash TEXT,
+      ADD COLUMN IF NOT EXISTS embedded_at TIMESTAMPTZ;`);
+    await runSQL(`ALTER TABLE kb_vector_queries
+      ADD COLUMN IF NOT EXISTS tier TEXT NOT NULL DEFAULT 'kb_embeddings',
+      ADD COLUMN IF NOT EXISTS keyword_match_count INTEGER;`);
+    await runSQL(`CREATE OR REPLACE FUNCTION match_kb_faqs (
+      query_embedding vector(1536),
+      p_channel       TEXT    DEFAULT 'sms',
+      match_threshold FLOAT8  DEFAULT 0.40,
+      match_count     INTEGER DEFAULT 3
+    )
+    RETURNS TABLE (
+      id BIGINT, question_pattern TEXT, canonical_answer TEXT, answer_short TEXT,
+      story_arc TEXT, channel TEXT, tier TEXT, similarity FLOAT8
+    )
+    LANGUAGE plpgsql STABLE AS $$
+    BEGIN
+      RETURN QUERY
+      SELECT f.id, f.question_pattern, f.canonical_answer, f.answer_short,
+             f.story_arc, f.channel, f.tier,
+             1 - (f.embedding <=> query_embedding) AS similarity
+      FROM kb_faqs f
+      WHERE f.active = true
+        AND f.embedding IS NOT NULL
+        AND f.channel IN (p_channel, 'both')
+        AND (1 - (f.embedding <=> query_embedding)) >= match_threshold
+      ORDER BY f.embedding <=> query_embedding
+      LIMIT match_count;
+    END;
+    $$;`);
+    console.log('[Migration] kb faq semantic (sql/077) ready');
+  } catch (err) {
+    console.error('[Migration] kb faq semantic FAILED (searchFaqs falls back to keyword; apply sql/077 manually):', err);
   }
 
   // Rep + setter reporting RPCs (sql/functions.sql and sql/053 are the source
@@ -1735,6 +1780,7 @@ app.listen(PORT, async () => {
   console.log(`MCP:          http://localhost:${PORT}/mcp`);
   console.log(`Health:       http://localhost:${PORT}/health`);
   await runMigrations();
+  startTier1EmbedSweep(); // v1.10 — no-op while KB_FAQ_SEMANTIC_MODE=off
   initFieldSync();
   startSyncScheduler();
   startImeWorkers();
