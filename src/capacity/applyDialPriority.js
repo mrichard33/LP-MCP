@@ -18,9 +18,20 @@
  *     complete attached set, read moments earlier, with only dialingPriority
  *     changed — that is what makes it reorder-only.
  *   - It REFUSES while the campaign is RUNNING (refuseIfCampaignRunning).
- *     Both Data campaigns run all day. In live mode the write will therefore
- *     be refused during dialing hours until Mark rules on that guard; the
- *     refusal surfaces as applied=false + error_message, never as a retry.
+ *     Both Data campaigns run all day. Without cycleCampaigns the write is
+ *     therefore refused during dialing hours; the refusal surfaces as
+ *     applied=false + error_message, never as a retry.
+ *
+ * CYCLING (deps.cycleCampaigns, wired from CAPACITY_RANKER_CYCLE_CAMPAIGNS):
+ * each campaign that reads RUNNING is gracefully stopped, written, and then
+ * restarted in a finally block — the restart runs whether the write
+ * succeeded, threw, or the read-back mismatched, is retried up to
+ * restartAttempts with restartBackoffMs between, and is verified by reading
+ * state. A campaign that does not come back is named in result.restart_failures
+ * and forces applied=false. Campaigns cycle one at a time (the TIERS loop is
+ * sequential — never parallelise it) and a campaign is never stopped while one
+ * cycled earlier in the run is still dark. Prior state is restored, not
+ * assumed: a campaign already NOT_RUNNING is written and left stopped.
  * FIVE9_WRITES_ENABLED still gates the SOAP call inside that op: with it
  * unset the op dry-runs, and this module reports dry_run:true and applied:false
  * rather than pretending the read-back matched.
@@ -156,12 +167,39 @@ export function verifyListOrder(intended, afterLists) {
  * @param {(action:object)=>Promise<object>} deps.modifyCampaignLists
  *        executeModifyCampaignLists from src/five9/admin-writes.js.
  * @param {()=>boolean} deps.five9WritesEnabled
+ * @param {(action:object)=>Promise<object>} [deps.stopCampaign]
+ *        executeStopCampaign — required when cycleCampaigns is true. Always
+ *        called WITHOUT force (forceStopCampaign drops calls in progress).
+ * @param {(action:object)=>Promise<object>} [deps.startCampaign]
+ *        executeStartCampaign — required when cycleCampaigns is true.
+ *        decideLifecycleNoop makes start on a RUNNING campaign a skip, so the
+ *        restart is idempotent.
+ * @param {(name:string)=>Promise<{state:string}>} [deps.getCampaignState]
+ *        Optional cheaper state read for restart verification; falls back to
+ *        getOutboundCampaign.
+ * @param {boolean} [deps.cycleCampaigns=false]
+ *        Stop → reorder → restart each campaign that reads RUNNING. A campaign
+ *        already NOT_RUNNING is reordered and left stopped (prior state is
+ *        restored, never assumed). Never both campaigns at once — the TIERS
+ *        loop is sequential and must stay that way.
+ * @param {number} [deps.restartAttempts=3]
+ * @param {number} [deps.restartBackoffMs=2000]
+ * @param {(ms:number)=>Promise<void>} [deps.sleep]
  * @param {(msg:string)=>void} [deps.log]
  */
 export async function applyDialPriority(rankResult, deps) {
-  const { getOutboundCampaign, modifyCampaignLists, five9WritesEnabled, log = console.log } = deps || {};
+  const {
+    getOutboundCampaign, modifyCampaignLists, five9WritesEnabled,
+    stopCampaign = null, startCampaign = null, getCampaignState = null,
+    cycleCampaigns = false, restartAttempts = 3, restartBackoffMs = 2000,
+    sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+    log = console.log,
+  } = deps || {};
   if (typeof getOutboundCampaign !== 'function' || typeof modifyCampaignLists !== 'function') {
     throw new Error('applyDialPriority: getOutboundCampaign and modifyCampaignLists are required');
+  }
+  if (cycleCampaigns && (typeof stopCampaign !== 'function' || typeof startCampaign !== 'function')) {
+    throw new Error('applyDialPriority: cycleCampaigns requires stopCampaign and startCampaign');
   }
   const dryRun = typeof five9WritesEnabled === 'function' ? !five9WritesEnabled() : true;
   const result = { applied: false, dry_run: dryRun, campaigns: {} };
@@ -185,6 +223,8 @@ export async function applyDialPriority(rankResult, deps) {
       changed: block.changed,
       written: false,
       verified: null,
+      cycled: false,
+      was_running: String(before.state || '').toUpperCase() === 'RUNNING',
     };
     result.campaigns[tier] = entry;
     if (!block.changed) {
@@ -192,19 +232,90 @@ export async function applyDialPriority(rankResult, deps) {
       continue;
     }
 
-    // Same op the approve_action path runs; the gate inside it (flag → lock →
-    // audit event) is unchanged. confirm_token restates the campaign name as
-    // that op requires.
-    const write = await modifyCampaignLists({
-      id: null,
-      action_type: 'five9_modify_campaign_lists',
-      requires_approval: true,
-      action_payload: {
-        campaign_name: campaignName,
-        confirm_token: campaignName,
-        lists: block.lists,
-      },
-    });
+    // modifyCampaignLists refuses a RUNNING campaign (refuseIfCampaignRunning).
+    // When cycling is enabled we stop it first and ALWAYS restart it in the
+    // finally below — a stop that is not followed by a restart leaves the
+    // floor dark, which is worse than never reordering at all.
+    const wasRunning = String(before.state || '').toUpperCase() === 'RUNNING';
+    const mustCycle = cycleCampaigns && wasRunning && !dryRun;
+    entry.cycled = mustCycle;
+    entry.was_running = wasRunning;
+    let stoppedAt = null;
+
+    // Never both campaigns stopped at once. If a campaign cycled earlier in
+    // this run did NOT come back, stopping this one would leave the floor with
+    // no Data campaign dialing at all — so this one is not stopped and not
+    // written (a RUNNING campaign refuses the write anyway). The run already
+    // reports applied=false and names the dark campaign in restart_failures.
+    const darkFromThisRun = TIERS
+      .filter((t) => result.campaigns[t]?.cycled && result.campaigns[t]?.restarted === false)
+      .map((t) => CAMPAIGNS[t]);
+    if (mustCycle && darkFromThisRun.length) {
+      entry.cycled = false;
+      entry.skipped_reason = `not cycled: ${darkFromThisRun.join(', ')} did not restart earlier in this run — never both campaigns stopped at once`;
+      log(`[CapacityRanker] ${campaignName}: ${entry.skipped_reason}`);
+      continue;
+    }
+
+    if (mustCycle) {
+      // Graceful stop only. force:true drops calls in progress.
+      await stopCampaign({
+        id: null,
+        action_type: 'five9_stop_campaign',
+        requires_approval: true,
+        action_payload: { campaign_name: campaignName },
+      });
+      stoppedAt = Date.now();
+      log(`[CapacityRanker] ${campaignName}: stopped for reorder`);
+    }
+
+    let write;
+    try {
+      // Same op the approve_action path runs; the gate inside it (flag → lock →
+      // audit event) is unchanged. confirm_token restates the campaign name as
+      // that op requires.
+      write = await modifyCampaignLists({
+        id: null,
+        action_type: 'five9_modify_campaign_lists',
+        requires_approval: true,
+        action_payload: {
+          campaign_name: campaignName,
+          confirm_token: campaignName,
+          lists: block.lists,
+        },
+      });
+    } finally {
+      if (mustCycle) {
+        let restarted = false;
+        let lastErr = null;
+        for (let attempt = 1; attempt <= restartAttempts && !restarted; attempt += 1) {
+          try {
+            await startCampaign({
+              id: null,
+              action_type: 'five9_start_campaign',
+              requires_approval: true,
+              action_payload: { campaign_name: campaignName },
+            });
+            const state = getCampaignState
+              ? String((await getCampaignState(campaignName))?.state || '').toUpperCase()
+              : String((await getOutboundCampaign(campaignName))?.state || '').toUpperCase();
+            restarted = state === 'RUNNING';
+            if (!restarted) lastErr = new Error(`state reads ${state || 'unknown'} after start`);
+          } catch (err) {
+            lastErr = err;
+          }
+          if (!restarted && attempt < restartAttempts) await sleep(restartBackoffMs);
+        }
+        entry.downtime_ms = stoppedAt ? Date.now() - stoppedAt : null;
+        entry.restarted = restarted;
+        if (!restarted) {
+          entry.restart_error = lastErr?.message || 'unknown';
+          log(`[CapacityRanker] CRITICAL ${campaignName} DID NOT RESTART after ${restartAttempts} attempts (${entry.restart_error}) — campaign is STOPPED and the floor is not dialing it`);
+        } else {
+          log(`[CapacityRanker] ${campaignName}: restarted after ${entry.downtime_ms}ms`);
+        }
+      }
+    }
     entry.write = write;
     if (write?.deferred || write?.skipped) {
       throw new Error(`${campaignName}: write did not run (${write.reason || 'deferred'}) — not retrying`);
@@ -225,7 +336,10 @@ export async function applyDialPriority(rankResult, deps) {
     }
   }
 
-  result.applied = !dryRun && TIERS.every((t) => {
+  result.restart_failures = TIERS
+    .filter((t) => result.campaigns[t]?.cycled && result.campaigns[t]?.restarted === false)
+    .map((t) => CAMPAIGNS[t]);
+  result.applied = !dryRun && result.restart_failures.length === 0 && TIERS.every((t) => {
     const e = result.campaigns[t];
     return e && (e.written ? e.verified === true : !e.changed);
   });

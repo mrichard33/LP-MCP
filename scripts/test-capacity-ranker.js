@@ -30,6 +30,8 @@ import {
   runCapacityRanker,
   resolveMode,
   resolveSwapMargin,
+  cycleEnabled,
+  withinCycleWindow,
   addDays,
   MissingTableError,
 } from '../src/routes/capacityRanker.js';
@@ -304,31 +306,238 @@ test('verifyListOrder: reports mismatches, empty when read-back matches', () => 
 
 // ─── applyDialPriority (fake Five9) ──────────────────────────────────────────
 
-function fakeFive9({ writesEnabled = true, applyWrites = true, refuse = null } = {}) {
+/**
+ * Fake Five9 with campaign lifecycle.
+ *   states            — initial campaign state per campaign (default RUNNING).
+ *   refuseWhileRunning — mimic refuseIfCampaignRunning: the list write throws
+ *                        unless the campaign is NOT_RUNNING at write time.
+ *   startsBeforeRunning — how many startCampaign calls read back non-RUNNING
+ *                        before the campaign actually comes up (retry cases).
+ *   startAlwaysFails  — startCampaign never brings the campaign back.
+ *   startThrows       — startCampaign throws instead of returning.
+ *   calls             — ordered [op, campaign] log across stop/modify/start.
+ */
+function fakeFive9({
+  writesEnabled = true, applyWrites = true, refuse = null,
+  states = null, refuseWhileRunning = false,
+  startsBeforeRunning = 0, startAlwaysFails = false, startThrows = false,
+} = {}) {
   const state = {
     [CAMPAIGNS.hot]: LIVE_HOT_LISTS.map((l) => ({ ...l })),
     [CAMPAIGNS.warm]: LIVE_WARM_LISTS.map((l) => ({ ...l })),
   };
+  const campaignState = { [CAMPAIGNS.hot]: 'RUNNING', [CAMPAIGNS.warm]: 'RUNNING', ...(states || {}) };
   const writes = [];
+  const calls = [];
+  const startAttempts = {};
+  const stoppedByUs = new Set(); // campaigns THIS run stopped and has not brought back
   return {
     state,
+    campaignState,
     writes,
+    calls,
     deps: {
       five9WritesEnabled: () => writesEnabled,
-      getOutboundCampaign: async (name) => (state[name] ? { name, state: 'RUNNING', lists: state[name].map((l) => ({ ...l })) } : { name, error: 'campaign_not_found' }),
+      getOutboundCampaign: async (name) => (state[name]
+        ? { name, state: campaignState[name], lists: state[name].map((l) => ({ ...l })) }
+        : { name, error: 'campaign_not_found' }),
       modifyCampaignLists: async (action) => {
         const p = action.action_payload;
         writes.push(action);
+        calls.push(['modify', p.campaign_name]);
         assert.equal(action.requires_approval, true);
         assert.equal(p.confirm_token, p.campaign_name, 'confirm_token restates the campaign');
         if (refuse) throw new Error(refuse);
+        if (refuseWhileRunning && campaignState[p.campaign_name] === 'RUNNING') {
+          throw new Error(`REFUSED: modify_campaign_lists on a RUNNING campaign — ${p.campaign_name}`);
+        }
         if (!writesEnabled) return { campaign: p.campaign_name, method: 'modifyCampaignLists', previewed: true, dry_run: true };
         if (applyWrites) state[p.campaign_name] = p.lists.map((l) => ({ ...l }));
         return { campaign: p.campaign_name, method: 'modifyCampaignLists' };
       },
+      stopCampaign: async (action) => {
+        const name = action.action_payload.campaign_name;
+        assert.equal(action.action_type, 'five9_stop_campaign');
+        assert.notEqual(action.action_payload.force, true, 'NEVER force-stop — it drops calls in progress');
+        assert.equal(stoppedByUs.size, 0, `stop ${name}: a campaign this run stopped (${[...stoppedByUs].join(', ')}) is still dark — never both at once`);
+        calls.push(['stop', name]);
+        campaignState[name] = 'NOT_RUNNING';
+        stoppedByUs.add(name);
+        return { campaign: name, method: 'stopCampaign', state: 'NOT_RUNNING' };
+      },
+      startCampaign: async (action) => {
+        const name = action.action_payload.campaign_name;
+        assert.equal(action.action_type, 'five9_start_campaign');
+        calls.push(['start', name]);
+        startAttempts[name] = (startAttempts[name] || 0) + 1;
+        if (startThrows) throw new Error('Five9 startCampaign fault');
+        if (startAlwaysFails) return { campaign: name, method: 'startCampaign', state: 'NOT_RUNNING' };
+        if (startAttempts[name] > startsBeforeRunning) {
+          campaignState[name] = 'RUNNING';
+          stoppedByUs.delete(name);
+        }
+        return { campaign: name, method: 'startCampaign', state: campaignState[name] };
+      },
+      sleep: async () => {},
     },
   };
 }
+
+// ─── applyDialPriority: stop → reorder → restart cycle ───────────────────────
+//
+// THE test this whole design exists for. A successful stop followed by a
+// reorder that throws must STILL restart the campaign — a stop with no restart
+// leaves the floor dark, which is worse than the reorder never happening.
+
+test('CYCLE: modifyCampaignLists THROWS → startCampaign is still called (finally guarantee), campaign reads RUNNING', async () => {
+  const f = fakeFive9({ refuse: 'SOAP fault: modifyCampaignLists exploded' });
+  await assert.rejects(
+    applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: () => {} }),
+    /modifyCampaignLists exploded/,
+    'the reorder failure still surfaces (logged, abandoned, not retried)',
+  );
+  assert.deepEqual(
+    f.calls,
+    [['stop', CAMPAIGNS.hot], ['modify', CAMPAIGNS.hot], ['start', CAMPAIGNS.hot]],
+    'stop → (failed) modify → START. Warm is never touched because hot aborted the run.',
+  );
+  assert.equal(f.campaignState[CAMPAIGNS.hot], 'RUNNING', 'hot is dialing again');
+  assert.equal(f.campaignState[CAMPAIGNS.warm], 'RUNNING', 'warm was never stopped');
+});
+
+test('CYCLE: read-back MISMATCH after a landed write → campaign is still restarted', async () => {
+  const f = fakeFive9({ applyWrites: false, refuseWhileRunning: true });
+  await assert.rejects(
+    applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: () => {} }),
+    /read-back order does not match intent/,
+  );
+  assert.deepEqual(f.calls.map((c) => c[0]), ['stop', 'modify', 'start']);
+  assert.equal(f.campaignState[CAMPAIGNS.hot], 'RUNNING');
+});
+
+test('CYCLE: stop before modify, start after, one campaign at a time — the write lands only because the campaign was stopped', async () => {
+  const f = fakeFive9({ refuseWhileRunning: true });
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: () => {} });
+  assert.deepEqual(f.calls, [
+    ['stop', CAMPAIGNS.hot], ['modify', CAMPAIGNS.hot], ['start', CAMPAIGNS.hot],
+    ['stop', CAMPAIGNS.warm], ['modify', CAMPAIGNS.warm], ['start', CAMPAIGNS.warm],
+  ], 'hot cycles and restarts fully before warm begins');
+  assert.equal(out.applied, true);
+  assert.deepEqual(out.restart_failures, []);
+  for (const t of ['hot', 'warm']) {
+    assert.equal(out.campaigns[t].cycled, true);
+    assert.equal(out.campaigns[t].was_running, true);
+    assert.equal(out.campaigns[t].restarted, true);
+    assert.equal(out.campaigns[t].verified, true);
+    assert.equal(typeof out.campaigns[t].downtime_ms, 'number');
+  }
+  assert.equal(f.campaignState[CAMPAIGNS.hot], 'RUNNING');
+  assert.equal(f.campaignState[CAMPAIGNS.warm], 'RUNNING');
+  assert.equal(f.state[CAMPAIGNS.hot].find((l) => l.name === 'Data - Hot - LKE less than 7').dialingPriority, 7, 'reorder landed');
+});
+
+test('CYCLE: restart reads non-RUNNING twice then RUNNING → retried with backoff, restarted:true', async () => {
+  const sleeps = [];
+  const f = fakeFive9({ startsBeforeRunning: 2 });
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true, restartAttempts: 3, restartBackoffMs: 2000,
+    sleep: async (ms) => { sleeps.push(ms); }, log: () => {},
+  });
+  assert.equal(f.calls.filter((c) => c[0] === 'start' && c[1] === CAMPAIGNS.hot).length, 3, 'three start attempts on hot');
+  assert.deepEqual(sleeps.slice(0, 2), [2000, 2000], '2s backoff between attempts');
+  assert.equal(out.campaigns.hot.restarted, true);
+  assert.equal(out.applied, true);
+  assert.deepEqual(out.restart_failures, []);
+});
+
+test('CYCLE: restart NEVER succeeds → applied:false, restart_failures populated, restart_error recorded', async () => {
+  const log = [];
+  const f = fakeFive9({ startAlwaysFails: true });
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: (m) => log.push(m) });
+  assert.equal(out.applied, false, 'a landed reorder never counts as applied when the campaign is dark');
+  assert.deepEqual(out.restart_failures, [CAMPAIGNS.hot], 'hot is named');
+  assert.equal(out.campaigns.hot.restarted, false);
+  assert.equal(out.campaigns.hot.verified, true, 'the reorder itself DID land — the failure is the restart');
+  assert.match(out.campaigns.hot.restart_error, /state reads NOT_RUNNING after start/);
+  assert.equal(f.calls.filter((c) => c[0] === 'start' && c[1] === CAMPAIGNS.hot).length, 3, 'bounded at restartAttempts');
+  assert.ok(log.some((m) => /CRITICAL.*DID NOT RESTART/.test(m)), 'shouts in the log');
+  // Hot is dark, so Warm must NOT be stopped too — the floor keeps its one live campaign.
+  assert.deepEqual(f.calls.filter((c) => c[1] === CAMPAIGNS.warm), [], 'warm: not stopped, not written, not started');
+  assert.equal(f.campaignState[CAMPAIGNS.warm], 'RUNNING');
+  assert.equal(out.campaigns.warm.cycled, false);
+  assert.equal(out.campaigns.warm.written, false);
+  assert.match(out.campaigns.warm.skipped_reason, /did not restart earlier in this run/);
+});
+
+test('CYCLE: startCampaign THROWS every time → still bounded, restart_failures populated, the throw does not escape', async () => {
+  const f = fakeFive9({ startThrows: true });
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: () => {} });
+  assert.equal(out.applied, false);
+  assert.match(out.campaigns.hot.restart_error, /startCampaign fault/);
+  assert.deepEqual(out.restart_failures, [CAMPAIGNS.hot]);
+  assert.equal(f.campaignState[CAMPAIGNS.warm], 'RUNNING', 'warm left running — never both dark');
+});
+
+test('CYCLE: a campaign already NOT_RUNNING is reordered and LEFT STOPPED — never stopped, never started, cycled:false', async () => {
+  const f = fakeFive9({ states: { [CAMPAIGNS.hot]: 'NOT_RUNNING' }, refuseWhileRunning: true });
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: () => {} });
+  assert.deepEqual(f.calls.filter((c) => c[1] === CAMPAIGNS.hot), [['modify', CAMPAIGNS.hot]], 'hot: write only');
+  assert.equal(out.campaigns.hot.cycled, false);
+  assert.equal(out.campaigns.hot.was_running, false);
+  assert.equal(out.campaigns.hot.restarted, undefined);
+  assert.equal(f.campaignState[CAMPAIGNS.hot], 'NOT_RUNNING', 'prior state restored, not assumed');
+  assert.equal(out.campaigns.warm.cycled, true, 'warm (RUNNING) still cycles');
+  assert.equal(out.applied, true);
+});
+
+test('CYCLE: flag OFF (default) → no stop, no start, a RUNNING campaign still refuses the write (today\'s behavior)', async () => {
+  const f = fakeFive9({ refuseWhileRunning: true });
+  await assert.rejects(
+    applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, log: () => {} }),
+    /REFUSED.*RUNNING/,
+  );
+  assert.deepEqual(f.calls, [['modify', CAMPAIGNS.hot]], 'no lifecycle calls at all');
+});
+
+test('CYCLE: dry-run (FIVE9_WRITES_ENABLED off) never stops a campaign even with the flag on', async () => {
+  const f = fakeFive9({ writesEnabled: false });
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...f.deps, cycleCampaigns: true, log: () => {} });
+  assert.equal(out.dry_run, true);
+  assert.ok(!f.calls.some((c) => c[0] === 'stop' || c[0] === 'start'));
+  assert.equal(out.campaigns.hot.cycled, false);
+});
+
+test('CYCLE: no write needed → no cycle (order already matches)', async () => {
+  const f = fakeFive9();
+  const rank = rankMarkets(FIXTURE_2026_09_04);
+  await applyDialPriority(rank, { ...f.deps, cycleCampaigns: true, log: () => {} });
+  f.calls.length = 0;
+  const out = await applyDialPriority(rank, { ...f.deps, cycleCampaigns: true, log: () => {} });
+  assert.deepEqual(f.calls, [], 'nothing stopped for a no-op');
+  assert.equal(out.campaigns.hot.cycled, false);
+  assert.equal(out.applied, true);
+});
+
+test('CYCLE: cycleCampaigns without stopCampaign/startCampaign deps is refused up front', async () => {
+  const f = fakeFive9();
+  const { stopCampaign, startCampaign, ...rest } = f.deps;
+  await assert.rejects(
+    applyDialPriority(rankMarkets(FIXTURE_2026_09_04), { ...rest, cycleCampaigns: true, log: () => {} }),
+    /cycleCampaigns requires stopCampaign and startCampaign/,
+  );
+  assert.deepEqual(f.calls, [], 'nothing was touched');
+});
+
+test('CYCLE: getCampaignState, when injected, is used for restart verification', async () => {
+  const f = fakeFive9();
+  const reads = [];
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true, log: () => {},
+    getCampaignState: async (name) => { reads.push(name); return { name, state: f.campaignState[name] }; },
+  });
+  assert.deepEqual(reads, [CAMPAIGNS.hot, CAMPAIGNS.warm]);
+  assert.equal(out.applied, true);
+});
 
 test('applyDialPriority: writes both campaigns, reads back, applied=true when the order matches', async () => {
   const f = fakeFive9();
@@ -386,19 +595,35 @@ test('applyDialPriority: no write when the order already matches', async () => {
 
 // ─── runCapacityRanker (route orchestration, fake I/O) ───────────────────────
 
-function fakeRun({ prev = null, mode = 'shadow', rows = FIXTURE_2026_09_04, applyImpl = null, insertImpl = null, stale = false } = {}) {
-  const calls = { apply: 0, inserted: [] };
+function fakeRun({ prev = null, mode = 'shadow', rows = FIXTURE_2026_09_04, applyImpl = null, insertImpl = null, stale = false, now = null } = {}) {
+  const calls = { apply: 0, applyOpts: [], inserted: [] };
   const deps = {
     mode,
     swapMargin: 5,
     log: () => {},
-    now: new Date('2026-09-03T16:48:00Z'), // 12:48 ET
+    now: now || new Date('2026-09-03T16:48:00Z'), // 12:48 ET
     fetchCapacity: async () => ({ rows, stale, last_sweep_at: '2026-09-03T16:45:00Z' }),
     readLastApplied: async () => prev,
     insertLog: insertImpl || (async (row) => { calls.inserted.push(row); return 42; }),
-    apply: applyImpl || (async () => { calls.apply += 1; return { applied: true, dry_run: false, campaigns: {} }; }),
+    apply: async (rankResult, opts) => {
+      calls.apply += 1;
+      calls.applyOpts.push(opts);
+      if (applyImpl) return applyImpl(rankResult, opts);
+      return { applied: true, dry_run: false, campaigns: {} };
+    },
   };
   return { deps, calls };
+}
+
+/** Run fn with CAPACITY_RANKER_CYCLE_CAMPAIGNS set, then restore the env. */
+async function withCycleEnv(value, fn) {
+  const prev = process.env.CAPACITY_RANKER_CYCLE_CAMPAIGNS;
+  if (value === undefined) delete process.env.CAPACITY_RANKER_CYCLE_CAMPAIGNS;
+  else process.env.CAPACITY_RANKER_CYCLE_CAMPAIGNS = value;
+  try { return await fn(); } finally {
+    if (prev === undefined) delete process.env.CAPACITY_RANKER_CYCLE_CAMPAIGNS;
+    else process.env.CAPACITY_RANKER_CYCLE_CAMPAIGNS = prev;
+  }
 }
 
 test('route: defaults slot_date to tomorrow in America/New_York', async () => {
@@ -472,6 +697,93 @@ test('route: LIVE apply failure → applied=false, error logged, 500, row still 
   assert.match(calls.inserted[0].error_message, /read-back/);
 });
 
+test('route: LIVE apply that reports restart_failures → applied=false, 500, CRITICAL error, row carries cycled/downtime/restart_failures', async () => {
+  const { deps, calls } = fakeRun({
+    mode: 'live',
+    applyImpl: async () => ({
+      applied: false,
+      dry_run: false,
+      restart_failures: [CAMPAIGNS.hot],
+      campaigns: {
+        hot: { cycled: true, restarted: false, downtime_ms: 8000, verified: true, written: true, changed: true },
+        warm: { cycled: true, restarted: true, downtime_ms: 1500, verified: true, written: true, changed: true },
+      },
+    }),
+  });
+  const { status, body } = await runCapacityRanker({ slot_date: '2026-09-04' }, deps);
+  assert.equal(status, 500);
+  assert.equal(body.applied, false);
+  assert.match(body.error, /CRITICAL: campaign\(s\) did not restart after reorder: Data - Hot Leads less than 7/);
+  assert.equal(calls.inserted.length, 1, 'row still inserted');
+  assert.equal(calls.inserted[0].applied, false);
+  assert.equal(calls.inserted[0].cycled, true);
+  assert.equal(calls.inserted[0].downtime_ms, 9500);
+  assert.deepEqual(calls.inserted[0].restart_failures, [CAMPAIGNS.hot]);
+  assert.match(calls.inserted[0].error_message, /CRITICAL/);
+});
+
+test('route: a successful cycle logs cycled=true, summed downtime_ms, restart_failures=null', async () => {
+  const { deps, calls } = fakeRun({
+    mode: 'live',
+    applyImpl: async () => ({
+      applied: true, dry_run: false, restart_failures: [],
+      campaigns: {
+        hot: { cycled: true, restarted: true, downtime_ms: 900 },
+        warm: { cycled: true, restarted: true, downtime_ms: 1100 },
+      },
+    }),
+  });
+  const { status, body } = await runCapacityRanker({ slot_date: '2026-09-04' }, deps);
+  assert.equal(status, 200);
+  assert.equal(body.applied, true);
+  assert.equal(calls.inserted[0].cycled, true);
+  assert.equal(calls.inserted[0].downtime_ms, 2000);
+  assert.equal(calls.inserted[0].restart_failures, null);
+});
+
+test('route: no apply (shadow / unchanged) logs cycled=false, downtime_ms=null, restart_failures=null', async () => {
+  const { deps, calls } = fakeRun({ mode: 'shadow' });
+  await runCapacityRanker({ slot_date: '2026-09-04' }, deps);
+  assert.equal(calls.inserted[0].cycled, false);
+  assert.equal(calls.inserted[0].downtime_ms, null);
+  assert.equal(calls.inserted[0].restart_failures, null);
+});
+
+test('route: cycle flag OFF (default) → apply receives cycleCampaigns:false, no window warning', async () => {
+  await withCycleEnv(undefined, async () => {
+    const { deps, calls } = fakeRun({ mode: 'live' });
+    const { body } = await runCapacityRanker({ slot_date: '2026-09-04' }, deps);
+    assert.deepEqual(calls.applyOpts, [{ cycleCampaigns: false }]);
+    assert.ok(!body.warnings.some((w) => /cycle window/.test(w)));
+  });
+});
+
+test('route: cycle flag ON inside the window (12:48 ET) → apply receives cycleCampaigns:true', async () => {
+  await withCycleEnv('true', async () => {
+    const { deps, calls } = fakeRun({ mode: 'live' });
+    const { body } = await runCapacityRanker({ slot_date: '2026-09-04' }, deps);
+    assert.deepEqual(calls.applyOpts, [{ cycleCampaigns: true }]);
+    assert.ok(!body.warnings.some((w) => /cycle window/.test(w)));
+  });
+});
+
+test('route: cycle flag ON outside the window (20:45 ET) → cycleCampaigns:false and a warning', async () => {
+  await withCycleEnv('true', async () => {
+    const { deps, calls } = fakeRun({ mode: 'live', now: new Date('2026-09-04T00:45:00Z') }); // 20:45 EDT
+    const { body } = await runCapacityRanker({ slot_date: '2026-09-04' }, deps);
+    assert.deepEqual(calls.applyOpts, [{ cycleCampaigns: false }]);
+    assert.ok(body.warnings.some((w) => /outside the 08:00–20:30 ET cycle window/.test(w)), body.warnings.join('; '));
+  });
+});
+
+test('route: cycle flag ON in SHADOW mode never calls apply', async () => {
+  await withCycleEnv('true', async () => {
+    const { deps, calls } = fakeRun({ mode: 'shadow' });
+    await runCapacityRanker({ slot_date: '2026-09-04' }, deps);
+    assert.equal(calls.apply, 0);
+  });
+});
+
 test('route: missing dial_priority_log table fails gracefully with a clear message', async () => {
   const { deps } = fakeRun({ insertImpl: async () => { throw new MissingTableError({ message: 'relation "dial_priority_log" does not exist' }); } });
   await assert.rejects(runCapacityRanker({ slot_date: '2026-09-04' }, deps), (err) => {
@@ -513,6 +825,35 @@ test('CAPACITY_RANKER_SWAP_MARGIN: default 5, unparseable falls back', () => {
   assert.equal(resolveSwapMargin('3'), 3);
   assert.equal(resolveSwapMargin('abc'), 5);
   assert.equal(resolveSwapMargin('-1'), 5);
+});
+
+test('CAPACITY_RANKER_CYCLE_CAMPAIGNS: default false; only the literal "true" arms cycling', () => {
+  assert.equal(cycleEnabled(undefined), false);
+  assert.equal(cycleEnabled(''), false);
+  assert.equal(cycleEnabled('false'), false);
+  assert.equal(cycleEnabled('1'), false);
+  assert.equal(cycleEnabled('on'), false);
+  assert.equal(cycleEnabled('true'), true);
+  assert.equal(cycleEnabled(' TRUE '), true);
+});
+
+test('withinCycleWindow: false at 07:30 and 20:45 ET, true at 12:00 ET (EDT, UTC-4)', () => {
+  assert.equal(withinCycleWindow(new Date('2026-09-03T11:30:00Z')), false, '07:30 ET');
+  assert.equal(withinCycleWindow(new Date('2026-09-04T00:45:00Z')), false, '20:45 ET');
+  assert.equal(withinCycleWindow(new Date('2026-09-03T16:00:00Z')), true, '12:00 ET');
+});
+
+test('withinCycleWindow: edges — 08:00 and 20:30 ET are inside, 07:59 and 20:31 are outside', () => {
+  assert.equal(withinCycleWindow(new Date('2026-09-03T12:00:00Z')), true, '08:00 ET');
+  assert.equal(withinCycleWindow(new Date('2026-09-03T11:59:00Z')), false, '07:59 ET');
+  assert.equal(withinCycleWindow(new Date('2026-09-04T00:30:00Z')), true, '20:30 ET');
+  assert.equal(withinCycleWindow(new Date('2026-09-04T00:31:00Z')), false, '20:31 ET');
+});
+
+test('withinCycleWindow: honours America/New_York in winter too (EST, UTC-5)', () => {
+  assert.equal(withinCycleWindow(new Date('2026-01-15T13:00:00Z')), true, '08:00 EST');
+  assert.equal(withinCycleWindow(new Date('2026-01-15T12:59:00Z')), false, '07:59 EST');
+  assert.equal(withinCycleWindow(new Date('2026-01-16T01:31:00Z')), false, '20:31 EST');
 });
 
 test('addDays: pure calendar arithmetic across a month boundary', () => {

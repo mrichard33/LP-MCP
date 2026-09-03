@@ -15,6 +15,18 @@
  *            FIVE9_WRITES_ENABLED must ALSO be 'true' for the SOAP call to go
  *            out; otherwise the write path dry-runs and applied stays false.
  *
+ * CYCLING (CAPACITY_RANKER_CYCLE_CAMPAIGNS, default false): the list write
+ * refuses a RUNNING campaign, and both Data campaigns run all day. With this
+ * flag 'true' AND mode live AND the clock inside 08:00–20:30 ET, each campaign
+ * is gracefully stopped → reordered → restarted, one at a time, with the
+ * restart in a finally block (src/capacity/applyDialPriority.js). Outside the
+ * window the cycle is skipped and a warning is logged. A campaign that fails
+ * to restart forces applied=false and a 500 (restart_failures in the log row).
+ *
+ * GET /n8n/capacity-ranker/campaign-state — read-only, polled by the n8n
+ * watchdog (OPS - Capacity Ranker Campaign Watchdog): 200 when both Data
+ * campaigns read RUNNING, 503 otherwise.
+ *
  * Body: { slot_date?: "YYYY-MM-DD" } — defaults to tomorrow, America/New_York.
  * No auth, matching the /n8n/* convention (n8n hourly cron is the caller).
  *
@@ -28,9 +40,11 @@
 import supabase from '../supabase.js';
 import { buildBoardResponse } from '../jobs/capacity-sweep.js';
 import { getOutboundCampaign } from '../five9-admin.js';
-import { executeModifyCampaignLists, five9WritesEnabled } from '../five9/admin-writes.js';
+import {
+  executeModifyCampaignLists, executeStartCampaign, executeStopCampaign, five9WritesEnabled,
+} from '../five9/admin-writes.js';
 import { rankMarkets, isMaterialChange, DEFAULT_SWAP_MARGIN, MARKET_CODES } from '../capacity/rankMarkets.js';
-import { applyDialPriority } from '../capacity/applyDialPriority.js';
+import { applyDialPriority, CAMPAIGNS } from '../capacity/applyDialPriority.js';
 
 const TIMEZONE = 'America/New_York';
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -108,11 +122,26 @@ async function insertLogLive(row) {
   return data?.id ?? null;
 }
 
-function applyLive(rankResult) {
+export function cycleEnabled(raw = process.env.CAPACITY_RANKER_CYCLE_CAMPAIGNS) {
+  return String(raw || 'false').trim().toLowerCase() === 'true';
+}
+
+/** Cycling is only safe inside dial hours — never near the 21:00 ET legal edge. */
+export function withinCycleWindow(now = new Date()) {
+  const hhmm = new Intl.DateTimeFormat('en-GB', {
+    timeZone: TIMEZONE, hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(now);
+  return hhmm >= '08:00' && hhmm <= '20:30';
+}
+
+function applyLive(rankResult, { cycleCampaigns = false } = {}) {
   return applyDialPriority(rankResult, {
     getOutboundCampaign,
     modifyCampaignLists: executeModifyCampaignLists,
+    stopCampaign: executeStopCampaign,
+    startCampaign: executeStartCampaign,
     five9WritesEnabled,
+    cycleCampaigns,
   });
 }
 
@@ -162,10 +191,19 @@ export async function runCapacityRanker(input = {}, deps = {}) {
   let errorMessage = null;
   let status = 200;
 
+  const cycle = cycleEnabled() && withinCycleWindow(now);
+  if (cycleEnabled() && !cycle) {
+    warnings.push('outside the 08:00–20:30 ET cycle window — campaigns will not be stopped, so a RUNNING campaign will refuse the reorder');
+  }
   if (changed && mode === 'live') {
     try {
-      applyResult = await apply(rankResult);
+      applyResult = await apply(rankResult, { cycleCampaigns: cycle });
       applied = applyResult?.applied === true;
+      if (applyResult?.restart_failures?.length) {
+        errorMessage = `CRITICAL: campaign(s) did not restart after reorder: ${applyResult.restart_failures.join(', ')}`;
+        status = 500;
+        log(`[CapacityRanker] ${errorMessage}`);
+      }
     } catch (err) {
       errorMessage = err.message;
       status = 500;
@@ -184,6 +222,11 @@ export async function runCapacityRanker(input = {}, deps = {}) {
     applied,
     mode,
     error_message: errorMessage,
+    cycled: applyResult ? Object.values(applyResult.campaigns || {}).some((c) => c.cycled) : false,
+    downtime_ms: applyResult
+      ? Object.values(applyResult.campaigns || {}).reduce((a, c) => a + (c.downtime_ms || 0), 0) || null
+      : null,
+    restart_failures: applyResult?.restart_failures?.length ? applyResult.restart_failures : null,
   });
 
   return {
@@ -227,5 +270,20 @@ export function registerCapacityRankerRoutes(app) {
       res.status(err.status || 500).json({ error: err.message });
     }
   });
-  console.log('[REST API] Registered: POST /n8n/capacity-ranker/run (CAPACITY_RANKER_MODE=' + resolveMode() + ')');
+  // Read-only. The n8n watchdog polls this every 5 minutes during dial hours
+  // and alerts if either Data campaign is not RUNNING. No auth (/n8n/*).
+  app.get('/n8n/capacity-ranker/campaign-state', async (req, res) => {
+    try {
+      const names = [CAMPAIGNS.hot, CAMPAIGNS.warm];
+      const states = await Promise.all(names.map(async (name) => {
+        const c = await getOutboundCampaign(name).catch(() => null);
+        return { campaign: name, state: c?.state ?? null, ok: String(c?.state || '').toUpperCase() === 'RUNNING' };
+      }));
+      const allRunning = states.every((s) => s.ok);
+      res.status(allRunning ? 200 : 503).json({ all_running: allRunning, checked_at: new Date().toISOString(), campaigns: states });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+  console.log('[REST API] Registered: POST /n8n/capacity-ranker/run (CAPACITY_RANKER_MODE=' + resolveMode() + ', CAPACITY_RANKER_CYCLE_CAMPAIGNS=' + cycleEnabled() + '), GET /n8n/capacity-ranker/campaign-state');
 }
