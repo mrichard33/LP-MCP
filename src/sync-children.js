@@ -36,6 +36,7 @@
 //   attribution) and to disambiguate the mdt_id 'X' collision downstream.
 
 import supabase from './supabase.js';
+import { buildJobUpsertError } from './job-upsert-error.js';
 import { getField, normalizePhone, extractArray, loggedFirstKeys, sleep } from './sync-utils.js';
 import { syncLogProgress, logSyncError } from './sync-log.js';
 import { lpDateToEastern } from './lp-dates.js';
@@ -461,7 +462,19 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
       `details="${jobErr.details || ''}" hint="${jobErr.hint || ''}" ` +
       `— skipping milestones for this job (parent row absent)`
     );
-    return { suppressedFires, suppressedUnlinked };
+    // Return the failure instead of only logging it. This function cannot
+    // throw on a failed upsert — supabase-js RESOLVES with { error } — so every
+    // caller's try/catch is blind to this path. runJobChangesSweep counted each
+    // rejected job as synced and never wrote lp_sync_errors, which is why
+    // get_sync_health reported clean sweeps while jobs silently vanished
+    // (verified 2026-09-03: jobs 57771 and 58260 absent from lp_jobs, both
+    // parents absent from lp_leads, zero rows in lp_sync_errors). Callers that
+    // ignore the extra field are unaffected.
+    return {
+      suppressedFires,
+      suppressedUnlinked,
+      jobUpsertError: buildJobUpsertError(jobId, lpLeadId, jobErr),
+    };
   }
 
   const milestones = getField(job, 'milestones', 'Milestones') || [];
@@ -663,7 +676,7 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
       }
     }
   }
-  return { suppressedFires, suppressedUnlinked };
+  return { suppressedFires, suppressedUnlinked, jobUpsertError: null };
 }
 
 // ─── Pass 2 — syncAllChildRecords() ──────────────────────────────
