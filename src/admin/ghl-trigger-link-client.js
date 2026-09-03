@@ -4,7 +4,7 @@
  * Used by:
  *   - src/admin/ghl-trigger-links.js (HTTP admin routes)
  *   - src/tools/admin/ghl-trigger-link-tools.js (MCP tools)
- *   - seedS45Links() for one-shot bulk creation of S4.5 nurture links
+ *   - seedS45Links() for idempotent reconciliation of S4.5 nurture links
  *
  * GHL API reference: GET/POST/PUT/DELETE /links with locationId in body/query.
  * Auth: same Bearer GHL_API_KEY + Version 2021-07-28 as src/ghl.js.
@@ -130,27 +130,31 @@ export async function deleteLink(id) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// S4.5 SEED — idempotent bulk creation of nurture booking links
+// S4.5 SEED — idempotent reconciliation of nurture trigger links
 // ═══════════════════════════════════════════════════════════════════
 
 /**
- * Canonical destination URLs by CTA type.
- * Resource destination is a placeholder — Mark can PUT a real URL later
- * via updateLink() once the calculator funnel landing page is final.
+ * Canonical destinations.
+ *
+ * v1.1 (2026-09-03): the S4.5 Offer is the Tier-1 Protection Profile
+ * Review (15-min call), never the in-home Window Estimate page. The
+ * booking base is the GHL custom value so a calendar change is a
+ * one-place edit. Resource destinations are explicit per spec below.
+ *
+ * History: the June spec pointed `booking` at
+ * landing.reecewindows.com/window-estimate and `resource` at a
+ * /calculator placeholder, and named the resource links differently
+ * from what was later created by hand. Running that spec against the
+ * live location would have re-pointed six PPR links back to the
+ * estimate page and created two duplicate resource links.
  */
-const DESTINATIONS = {
-  booking: 'https://landing.reecewindows.com/window-estimate',
-  resource: 'https://landing.reecewindows.com/calculator',
-};
+const BOOKING_BASE = '{{custom_values.protection_profile_review}}';
 
 /**
- * Build the redirect URL for a given S4.5 trigger link.
- * Preserves the existing utm_medium=email & utm_campaign=s4-5-seinfeld
- * standards from the direct-URL approach in nurture-booking-link.js.
- * GHL substitutes {{contact.*}} merge tags at click-time.
+ * Build the standard S4.5 redirect: contact merge tags + fixed UTMs.
+ * GHL substitutes {{contact.*}} and {{custom_values.*}} at click-time.
  */
-function buildRedirect(destinationKey, utmContent) {
-  const base = DESTINATIONS[destinationKey];
+function buildRedirect(base, utmContent) {
   const params = [
     'first_name={{contact.first_name}}',
     'last_name={{contact.last_name}}',
@@ -165,37 +169,60 @@ function buildRedirect(destinationKey, utmContent) {
 }
 
 /**
- * The 9 S4.5 trigger links to seed.
- * Skips the 4 no-URL prompts (reflection / reply / self-id CTAs don't
- * reference a URL — no trigger link needed).
+ * The 9 S4.5 trigger links. Names match the live GHL location exactly
+ * (verified 2026-09-03 via ghl_links_list) so the seed reconciles rather
+ * than duplicates.
  *
- * Updated 2026-05-12 when CTA rotation locked.
+ *   prompt_codes  — every agentic_messaging_prompts row bound to the link
+ *   redirectTo    — explicit when the destination is not the PPR pattern
  */
 const S45_LINK_SPECS = [
-  // Booking destination — soft_booking_offer prompts
-  { prompt_code: 'S4.5-WK2-EPIPHANY-SA3-V1',     name: 'S4.5 Booking — WK2 Epiphany SA3',     destinationKey: 'booking',  utmContent: 'wk2-epiphany-sa3' },
-  { prompt_code: 'S4.5-WK5-EPIPHANY-SA4-V1',     name: 'S4.5 Booking — WK5 Epiphany SA4',     destinationKey: 'booking',  utmContent: 'wk5-epiphany-sa4' },
-  { prompt_code: 'S4.5-WK8-EPIPHANY-SA2-V1',     name: 'S4.5 Booking — WK8 Epiphany SA2',     destinationKey: 'booking',  utmContent: 'wk8-epiphany-sa2' },
-  { prompt_code: 'S4.5-WK11-EPIPHANY-SA1-V1',    name: 'S4.5 Booking — WK11 Epiphany SA1',    destinationKey: 'booking',  utmContent: 'wk11-epiphany-sa1' },
-  // Booking destination — direct_assessment_ask
-  { prompt_code: 'S4.5-WK12-EDUCATIONAL-SA3-V1', name: 'S4.5 Booking — WK12 Direct',           destinationKey: 'booking',  utmContent: 'wk12-direct-sa3' },
-  // Booking destination — fallback
-  { prompt_code: 'S4.5-FALLBACK-V1',             name: 'S4.5 Booking — Fallback',              destinationKey: 'booking',  utmContent: 'fallback' },
-  // Resource destination — resource_offer prompts (destination placeholder; Mark can update)
-  { prompt_code: 'S4.5-WK3-EDUCATIONAL-SA2-V1',  name: 'S4.5 Resource — WK3 Educational SA2',  destinationKey: 'resource', utmContent: 'wk3-resource-sa2' },
-  { prompt_code: 'S4.5-WK9-EDUCATIONAL-SA5-V1',  name: 'S4.5 Resource — WK9 Educational SA5',  destinationKey: 'resource', utmContent: 'wk9-resource-sa5' },
+  // Weekly PPR booking links — soft_booking_offer / direct_assessment_ask
+  { prompt_codes: ['S4.5-WK2-EPIPHANY-SA3-V1'],     name: 'S4.5 Booking — WK2 Epiphany SA3',  redirectTo: buildRedirect(BOOKING_BASE, 'wk2-epiphany-sa3') },
+  { prompt_codes: ['S4.5-WK5-EPIPHANY-SA4-V1'],     name: 'S4.5 Booking — WK5 Epiphany SA4',  redirectTo: buildRedirect(BOOKING_BASE, 'wk5-epiphany-sa4') },
+  { prompt_codes: ['S4.5-WK8-EPIPHANY-SA2-V1'],     name: 'S4.5 Booking — WK8 Epiphany SA2',  redirectTo: buildRedirect(BOOKING_BASE, 'wk8-epiphany-sa2') },
+  { prompt_codes: ['S4.5-WK11-EPIPHANY-SA1-V1'],    name: 'S4.5 Booking — WK11 Epiphany SA1', redirectTo: buildRedirect(BOOKING_BASE, 'wk11-epiphany-sa1') },
+  { prompt_codes: ['S4.5-WK12-EDUCATIONAL-SA3-V1'], name: 'S4.5 Booking — WK12 Direct',        redirectTo: buildRedirect(BOOKING_BASE, 'wk12-direct-sa3') },
+  { prompt_codes: ['S4.5-FALLBACK-V1'],             name: 'S4.5 Booking — Fallback',           redirectTo: buildRedirect(BOOKING_BASE, 'fallback') },
+
+  // Escape hatch — one PPR link shared by every week whose body close is a
+  // reply / reflection / self-id cue. The P.S. always carries it (S4.5 v1.1).
+  {
+    prompt_codes: [
+      'S4.5-WK1-EPISODE-SA1-V1',
+      'S4.5-WK4-EPISODE-SA5-V1',
+      'S4.5-WK6-EDUCATIONAL-SA1-V1',
+      'S4.5-WK7-EPISODE-SA3-V1',
+      'S4.5-WK10-EPISODE-SA4-V1',
+    ],
+    name: 'S4.5 Escape Hatch — PPR',
+    redirectTo: buildRedirect(BOOKING_BASE, 'escape-hatch-ppr'),
+  },
+
+  // Resource links — resource_offer weeks. Destinations are the live assets.
+  {
+    prompt_codes: ['S4.5-WK3-EDUCATIONAL-SA2-V1'],
+    name: 'S4.5 Resource — WK3 Home Risk Report',
+    redirectTo: buildRedirect('https://landing.reecewindows.com/risk-report-step1', 'wk3-risk-report-sa2'),
+  },
+  {
+    prompt_codes: ['S4.5-WK9-EDUCATIONAL-SA5-V1'],
+    name: 'S4.5 Resource — WK9 Hurricane Preparedness Guide',
+    // Static PDF — no merge tags or UTMs (GHL storage ignores the query string).
+    redirectTo: 'https://storage.googleapis.com/msgsndr/SsBG7j5KQAIP1SFP2Sca/media/69335bfd81eaa1bd84c19ea7.pdf',
+  },
 ];
 
 /**
  * Idempotent seed. For each spec:
- *   1. Look up existing link by name
+ *   1. Look up existing link by exact name
  *   2. If exists with matching redirectTo → no-op
  *   3. If exists with different redirectTo → UPDATE
  *   4. If not exists → CREATE
- *   5. After all 9 are reconciled, write { trigger_link_id, trigger_link_field_key }
- *      back to agentic_messaging_prompts by prompt_code
+ *   5. Write { trigger_link_id, trigger_link_field_key } back to every
+ *      agentic_messaging_prompts row in spec.prompt_codes
  *
- * Returns a per-spec status report plus the DB writeback count.
+ * Returns a per-spec status report plus DB writeback status.
  */
 export async function seedS45Links() {
   if (!isReady()) {
@@ -211,7 +238,7 @@ export async function seedS45Links() {
   const report = [];
 
   for (const spec of S45_LINK_SPECS) {
-    const wantRedirect = buildRedirect(spec.destinationKey, spec.utmContent);
+    const wantRedirect = spec.redirectTo;
     const found = byName.get(spec.name);
 
     let link;
@@ -234,36 +261,26 @@ export async function seedS45Links() {
       action = 'unchanged';
     }
 
-    // Write the trigger link mapping back to the prompts table.
-    const { error: dbErr } = await supabase
+    // Write the trigger link mapping back to every bound prompt row.
+    const { error: dbErr, count } = await supabase
       .from('agentic_messaging_prompts')
       .update({
         trigger_link_id: link.id,
         trigger_link_field_key: link.fieldKey,
         updated_at: new Date().toISOString(),
-      })
-      .eq('prompt_code', spec.prompt_code);
+      }, { count: 'exact' })
+      .in('prompt_code', spec.prompt_codes);
 
-    if (dbErr) {
-      report.push({
-        prompt_code: spec.prompt_code,
-        name: spec.name,
-        action,
-        link_id: link.id,
-        field_key: link.fieldKey,
-        db_write: 'failed',
-        db_error: dbErr.message,
-      });
-    } else {
-      report.push({
-        prompt_code: spec.prompt_code,
-        name: spec.name,
-        action,
-        link_id: link.id,
-        field_key: link.fieldKey,
-        db_write: 'ok',
-      });
-    }
+    report.push({
+      prompt_codes: spec.prompt_codes,
+      name: spec.name,
+      action,
+      link_id: link.id,
+      field_key: link.fieldKey,
+      db_write: dbErr ? 'failed' : 'ok',
+      db_rows: dbErr ? 0 : count,
+      ...(dbErr ? { db_error: dbErr.message } : {}),
+    });
   }
 
   const summary = report.reduce((acc, r) => {
