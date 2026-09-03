@@ -1,7 +1,24 @@
 /**
  * KB Retriever — src/knowledge/kb-retriever.js
  *
- * Orchestrates structured KB lookups (Tier 1) for the response generator.
+ * Orchestrates structured KB lookups (Tier 1) for the response generator,
+ * plus the Tier 2 vector search over kb_embeddings (v1.9, gated).
+ *
+ * v1.9 — 2026-09-02. TIER 2 VECTOR SEARCH WIRED (KB_VECTOR_MODE).
+ *   PROBLEM: src/knowledge/vector-search.js existed since 2026-04 but was
+ *   imported by nothing. idx_kb_embeddings_vec had 0 lifetime scans on
+ *   2026-09-02 with 3,289 chunks / 18 source docs loaded. The only reader of
+ *   kb_embeddings was getConciergeBeliefDocs() — a whole-doc fetch by name.
+ *   The KB was embedded; the bot never searched it by meaning.
+ *
+ *   FIX: after Tier 1 resolves, buildKbPack() runs searchKnowledge() on the
+ *   inbound text for QUESTION/OBJECTION (only when Tier 1 missed) and
+ *   PRICING/SEND_INFO/UNCLEAR (always). Gated by KB_VECTOR_MODE:
+ *     off    (default) — never runs
+ *     shadow — runs, logs to console + kb_vector_queries, NOT in the prompt
+ *     live   — also injected by formatKbPackForPrompt() as background context
+ *   Time-boxed (KB_VECTOR_TIMEOUT_MS) so an OpenAI stall can never hold a
+ *   reply. Gating logic lives in vector-gate.js (pure, unit-tested).
  *
  * v1.8 — 2026-04-30. ALIGN MV calendar_name with action-handler CALENDAR_MAP.
  *   PROBLEM: mvCalendar() returned calendar_name: "Window Measurement
@@ -87,6 +104,85 @@
  */
 
 import supabase from '../supabase.js';
+import { searchKnowledge, formatMatchesForPrompt } from './vector-search.js';
+import {
+  getKbVectorMode,
+  shouldRunVectorSearch,
+  dedupeVectorMatches,
+} from './vector-gate.js';
+
+// ═══════════════════════════════════════════════════════════════════
+// v1.9 — TIER 2 VECTOR SEARCH RUNNER
+// ═══════════════════════════════════════════════════════════════════
+
+const KB_VECTOR_TIMEOUT_MS = parseInt(process.env.KB_VECTOR_TIMEOUT_MS || '1500', 10);
+const KB_VECTOR_MAX_CHARS  = parseInt(process.env.KB_VECTOR_MAX_CHARS  || '1500', 10);
+const KB_VECTOR_LIMIT      = parseInt(process.env.KB_VECTOR_MATCH_COUNT || '4', 10);
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Run the vector tier for one turn. Never throws; never blocks a reply past
+ * KB_VECTOR_TIMEOUT_MS. Writes one audit row to kb_vector_queries (fire and
+ * forget) — that table is the evidence for the shadow → live decision.
+ */
+async function runVectorTier(messageText, pack, mode) {
+  const started = Date.now();
+  let matches = [];
+  let error = null;
+  try {
+    const res = await withTimeout(
+      searchKnowledge(messageText, { limit: KB_VECTOR_LIMIT }),
+      KB_VECTOR_TIMEOUT_MS,
+      'kb vector search',
+    );
+    matches = dedupeVectorMatches(res.matches, pack);
+    if (res.error) error = res.error;
+  } catch (err) {
+    error = err.message;
+  }
+  const latency = Date.now() - started;
+  const top = typeof matches[0]?.similarity === 'number' ? matches[0].similarity : null;
+
+  console.log(
+    `[KBRetriever] vector ${mode}: intent=${pack.intent_class} matches=${matches.length}` +
+    ` top_sim=${top === null ? 'n/a' : top.toFixed(3)} latency=${latency}ms` +
+    (error ? ` error=${error}` : ''),
+  );
+
+  try {
+    supabase
+      .from('kb_vector_queries')
+      .insert({
+        intent_class: pack.intent_class,
+        mode,
+        query_text: String(messageText).slice(0, 500),
+        match_count: matches.length,
+        top_similarity: top,
+        sources: matches.map((m) => ({
+          source_doc: m.source_doc,
+          section: m.source_section || null,
+          similarity: m.similarity,
+        })),
+        latency_ms: latency,
+        error,
+      })
+      .then(({ error: insErr }) => {
+        if (insErr) console.warn('[KBRetriever] kb_vector_queries insert failed:', insErr.message);
+      })
+      .catch(() => {});
+  } catch {
+    // audit row is best-effort; never affects the reply
+  }
+
+  return matches;
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // CALENDAR + TRIGGER LINK CONSTANTS
@@ -699,6 +795,8 @@ export async function buildKbPack(params) {
     proof_points: [],
     techniques: [],
     competitor_intel: null,
+    vector_context: [],   // v1.9 — Tier 2 matches; injected only when vector_mode === 'live'
+    vector_mode: 'off',   // v1.9 — resolved KB_VECTOR_MODE for this turn
     detected_signals: {
       competitor: detectedCompetitor,
       objection: detectedObjection,
@@ -814,6 +912,16 @@ export async function buildKbPack(params) {
   // the Protection Profile Review. Additive context; never blocks a reply.
   if (intentClass === 'OBJECTION' || intentClass === 'PRICING') {
     result.belief_stack = await getConciergeBeliefDocs(intentClass);
+  }
+
+  // v1.9 — Tier 2 vector search over kb_embeddings. Runs AFTER Tier 1 so the
+  // 'miss' policy can see whether faqs / objection_script came back empty, and
+  // after belief_stack so dedupeVectorMatches() can drop what is already
+  // attached verbatim. Additive context; a failure or timeout never blocks.
+  const vectorMode = getKbVectorMode();
+  result.vector_mode = vectorMode;
+  if (vectorMode !== 'off' && messageText && shouldRunVectorSearch(intentClass, result)) {
+    result.vector_context = await runVectorTier(messageText, result, vectorMode);
   }
 
   if (detectedCompetitor) {
@@ -966,6 +1074,17 @@ export function formatKbPackForPrompt(pack) {
       lines.push(`  • ${p.claim}${p.evidence ? ` — ${p.evidence}` : ''} [${p.tier}]`);
     }
     lines.push('');
+  }
+
+  // v1.9 — Tier 2 excerpts, live mode only. Background context, never a source
+  // of new claims: PROOF POINTS and FAQ MATCHES remain the only citable facts.
+  if (pack.vector_mode === 'live' && Array.isArray(pack.vector_context) && pack.vector_context.length > 0) {
+    const block = formatMatchesForPrompt(pack.vector_context, { maxChars: KB_VECTOR_MAX_CHARS });
+    if (block) {
+      lines.push(block);
+      lines.push('  (Use these excerpts only to inform framing and tone. Do NOT quote them, do NOT mention any book, author, or document name to the lead, and do NOT introduce stats, prices, or product claims that are not in PROOF POINTS or FAQ MATCHES.)');
+      lines.push('');
+    }
   }
 
   if (pack.techniques && pack.techniques.length > 0) {

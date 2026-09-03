@@ -3,8 +3,10 @@
  *
  * Thin wrapper around the match_kb_embeddings(...) Supabase RPC.
  * Used by:
- *   - src/knowledge/kb-retriever.js (when structured KB returns no match)
- *   - src/response-generator.js (as a tool the LLM can call)
+ *   - src/knowledge/kb-retriever.js v1.9 — Tier 2, gated by KB_VECTOR_MODE
+ *     (first real caller; from 2026-04 to 2026-09 nothing imported this file)
+ *   - NOT used as an LLM tool call from response-generator.js — that was
+ *     planned in v1.0 and never built.
  *
  * Flow:
  *   1. Caller passes a query string + optional filters
@@ -12,13 +14,18 @@
  *   3. We invoke match_kb_embeddings RPC with the embedding
  *   4. Return ranked chunks with similarity scores
  *
+ * v1.1 — 2026-09-02. Default threshold 0.7 → 0.35. text-embedding-3-small
+ *   cosine similarities run low: a relevant ~500-token chunk against a short
+ *   SMS question typically lands 0.35–0.60, unrelated text 0.10–0.30. At 0.7
+ *   the tier would return nothing on real traffic. Calibrate from
+ *   kb_vector_queries.top_similarity after a shadow run.
  * v1.0 — Initial implementation.
  */
 
 import supabase from '../supabase.js';
 import { embed } from './openai-embeddings.js';
 
-const DEFAULT_THRESHOLD = parseFloat(process.env.KB_VECTOR_MIN_SIMILARITY || '0.7');
+const DEFAULT_THRESHOLD = parseFloat(process.env.KB_VECTOR_MIN_SIMILARITY || '0.35');
 const DEFAULT_MATCH_COUNT = parseInt(process.env.KB_VECTOR_MATCH_COUNT || '5', 10);
 
 /**
@@ -90,7 +97,7 @@ export function formatMatchesForPrompt(matches, opts = {}) {
   if (!Array.isArray(matches) || matches.length === 0) return '';
   const maxChars = opts.maxChars || 2000;
 
-  const lines = ['KNOWLEDGE BASE EXCERPTS (cite when relevant):'];
+  const lines = ['KNOWLEDGE BASE EXCERPTS (background context only — see note below):'];
   let used = lines[0].length;
 
   for (const m of matches) {
