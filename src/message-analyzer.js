@@ -506,6 +506,10 @@ When recommended_action is "escalate_to_rep" (or wrong_person for identity cases
 • "existing_customer_service" — existing customer with install problems, warranty claims, or scheduling complaints. No selling.
 • "legal_media" — legal threats, injury, damage claims, or press/media inquiries. Acknowledge only.
 • "identity_ambiguous" — wrong number, deceased contact, or a minor.
+  NEGATIVE EXAMPLE: a signature whose name or email differs from the record
+  ("Mark Follen" signing for a lead named "Mark Test", a personal vs work
+  email) is data hygiene, NOT identity_ambiguous. Leave escalation_category
+  null and keep the conversation going.
 • "commercial_hoa" — commercial, multi-property, HOA, or condo-association projects.
 • "contract_change" — requests to change or CANCEL A SIGNED CONTRACT (a purchase agreement they already signed). Humans only — rescission-sensitive.
   NEGATIVE EXAMPLE: cancelling or rescheduling an APPOINTMENT ("cancel my appointment", "cancel that", "I can't make Wednesday") is NOT contract_change — appointment changes are handled conversationally by the cancellation flow; leave escalation_category null for them. contract_change requires an actual signed contract/purchase being referenced (deposit, contract, paperwork, "cancel my order").
@@ -547,6 +551,14 @@ AFFIRMATIVE INBOUND MARKERS — the lead's reply is one of:
   • "go ahead" / "absolutely" / "definitely"
   • "sounds good" / "let's do it" / "sure thing" / "of course"
   • Any short positive response (1–4 words) that signals agreement
+
+  NOT AFFIRMATIVES (appreciation is not acceptance): reactions to content such as
+  "This is great", "Good stuff", "Thanks for this", "Interesting", "Love it",
+  "Well said". For these: engagement_quality "meaningful", buyer_stage unchanged
+  (never raised on a compliment), recommended_action "continue_current",
+  fast_track_eligible false, requested_fulfillment "unspecified". An email
+  signature block (name, phone, email under the reply) is NOT a buying signal
+  and NOT "voluntarily provided contact details" — it is the mail client.
 
 WHEN BOTH MATCH, YOU MUST RETURN:
   • recommended_action: "fast_track_booking"
@@ -843,6 +855,118 @@ export const MOVED_REGEX = new RegExp(
 // those are price objections (negotiation still possible → SA3 is correct).
 export const CANNOT_AFFORD_REGEX = /can'?t\s+afford|cannot\s+afford|don'?t\s+have\s+(home\s*owners?|home)\s+insurance|no\s+home\s*owners?\s+insurance|apply\s+for\s+(help|assistance|a\s+grant)|my\s+safe\s+florida\s+home/i;
 
+// ═══════════════════════════════════════════════════════════════════
+// FAST-TRACK EVIDENCE GATE (2026-09-03, S4.5 test-contact incident)
+// ═══════════════════════════════════════════════════════════════════
+// The LLM returned fast_track_eligible=true / fast_track_booking / stage 4 /
+// escalation_category=identity_ambiguous on the inbound "This is great."
+// followed by an email signature (event 3361024). Its own reasoning said
+// "not a CTA affirmative — escalate to a rep." Downstream, fast_track routed
+// a chatbot-entry contact to the in-home Window Estimate and the generator
+// pitched a 90-minute visit with slot offers.
+//
+// Fast-track is a strong claim about the lead. It must be backed by the
+// lead's words: either explicit booking/pricing/scheduling language, or a
+// genuine CTA-affirmative (a short yes to an outbound that actually asked).
+// Same pattern as MOVED_REGEX / CANNOT_AFFORD_REGEX: deterministic,
+// post-LLM, keeps every other field intact. Exported for unit tests.
+
+// Explicit intent in the lead's own words. Word-bounded on every alternative.
+export const BOOKING_INTENT_REGEX = new RegExp(
+  '\\b(?:schedul\\w*|book\\w*|appointment|come\\s+(?:out|by|over)|send\\s+someone' +
+  '|how\\s+soon|when\\s+can|what\'?s\\s+next|next\\s+steps?|call\\s+me|give\\s+me\\s+a\\s+call' +
+  '|quote|estimate|pric(?:e|es|ing)|cost|how\\s+much|financ\\w*|ready\\s+to' +
+  '|let\'?s\\s+do\\s+it|sign\\s+me\\s+up|get\\s+started|slot|time\\s+works)\\b',
+  'i'
+);
+
+// A bare yes. Anchored to the whole first line so "Yes I have a question" is
+// not a bare yes but "Yes please" is.
+export const AFFIRMATIVE_REGEX =
+  /^(?:yes|yeah|yep|yup|ya|sure|ok|okay|absolutely|definitely|of\s+course|sounds\s+good|let'?s\s+do\s+it|go\s+ahead|send\s+it|yes\s+please|sure\s+thing|please\s+do|do\s+it)[\s!.]*$/i;
+
+// CTA shape in the outbound the lead is answering: ends in a question, or
+// carries one of the CTA phrasings the CTA-AFFIRMATIVE OVERRIDE lists.
+export const OUTBOUND_CTA_REGEX =
+  /\b(?:want\s+(?:me\s+to|the|it|to)|should\s+i\s+send|can\s+i\s+send|ready\s+to\s+schedule|want\s+to\s+(?:grab|see)|should\s+we\s+get\s+started|want\s+pricing|which\s+(?:works|of\s+those))\b/i;
+
+// The lead is telling us we have the wrong person (deceased/minor included).
+export const WRONG_PERSON_REGEX =
+  /\b(?:wrong\s+(?:number|person)|who\s+is\s+this|no\s+one\s+(?:here|by\s+that\s+name)|doesn'?t\s+live\s+here|passed\s+away|deceased|died|is\s+a\s+minor|under\s+18)\b/i;
+
+function firstMeaningfulLine(text) {
+  return String(text || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .find((l) => l.length > 0) || '';
+}
+
+function lastOutboundLooksLikeCta(context) {
+  const recent = Array.isArray(context?.conversation_recent) ? context.conversation_recent : [];
+  const out = [...recent].reverse().find((m) => m?.direction === 'outbound');
+  if (!out) return false;
+  const text = String(out.text || '')
+    .replace(/https?:\/\/[^\s<>"')\]]+/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) return false;
+  // Look at the closing ~200 chars: that's where CTAs live.
+  const tail = text.slice(-200);
+  return /\?\s*$/.test(tail) || OUTBOUND_CTA_REGEX.test(tail);
+}
+
+/**
+ * Apply the fast-track evidence gate and the escalation-coherence rules to a
+ * validated analysis. Mutates and returns `analysis`. Pure apart from logs.
+ *
+ * @param {object} analysis   output of validateAnalysis()
+ * @param {string} messageText  the inbound (already quote-stripped upstream)
+ * @param {object} context    buildLeadContext() output (conversation_recent used)
+ * @param {string} [contactId]  for the log line only
+ */
+export function applyFastTrackEvidenceGate(analysis, messageText, context, contactId = '?') {
+  if (!analysis) return analysis;
+  const text = String(messageText || '');
+  const first = firstMeaningfulLine(text);
+  const firstWords = first.split(/\s+/).filter(Boolean).length;
+
+  const explicitIntent = BOOKING_INTENT_REGEX.test(text);
+  const ctaAffirmative = firstWords <= 6 && AFFIRMATIVE_REGEX.test(first) && lastOutboundLooksLikeCta(context);
+  const evidence = explicitIntent || ctaAffirmative;
+
+  const claimsFastTrack = analysis.fast_track_eligible === true || analysis.recommended_action === 'fast_track_booking';
+  if (claimsFastTrack && !evidence) {
+    console.log(
+      `[MessageAnalyzer] Fast-track evidence gate for ${contactId}: ` +
+      `no booking intent and no CTA-affirmative in "${first.slice(0, 60)}" → ` +
+      `fast_track_eligible=false, ${analysis.recommended_action}→continue_current, stage ${analysis.buyer_stage}→${Math.min(analysis.buyer_stage, 3)}`
+    );
+    analysis.fast_track_eligible = false;
+    if (analysis.recommended_action === 'fast_track_booking') analysis.recommended_action = 'continue_current';
+    if (analysis.buyer_stage > 3) analysis.buyer_stage = 3;
+    analysis.recommended_story_arc = analysis.recommended_story_arc || null;
+  }
+
+  // identity_ambiguous means wrong number / deceased / minor. A signature that
+  // disagrees with the record is not that.
+  if (analysis.escalation_category === 'identity_ambiguous'
+      && analysis.recommended_action !== 'wrong_person'
+      && !WRONG_PERSON_REGEX.test(text)) {
+    console.log(`[MessageAnalyzer] Escalation coherence for ${contactId}: identity_ambiguous cleared (no wrong-person language, action=${analysis.recommended_action})`);
+    analysis.escalation_category = null;
+  }
+
+  // A flagged escalation and a booking push cannot both be true.
+  if (analysis.escalation_category && ['fast_track_booking', 'advance_stage'].includes(analysis.recommended_action)) {
+    console.log(`[MessageAnalyzer] Escalation coherence for ${contactId}: ${analysis.recommended_action}→escalate_to_rep (escalation_category=${analysis.escalation_category})`);
+    analysis.recommended_action = 'escalate_to_rep';
+    analysis.fast_track_eligible = false;
+    analysis.recommended_story_arc = null;
+  }
+
+  return analysis;
+}
+
 // Explicit decline (S13_LANE4) + hard DNC (rule 172) — the only messages on
 // which the S1.3 suppress-gate below lets an LLM `suppress` stand.
 export const S13_EXPLICIT_DECLINE_REGEX = new RegExp(
@@ -1048,6 +1172,11 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
         analysis.recommended_story_arc = null;
       }
     }
+
+    // 2026-09-03 — fast-track evidence gate + escalation coherence. Runs after
+    // the moved/affordability overrides (which can only lower readiness) and
+    // before the booking-flow override (which reads fast_track_eligible).
+    applyFastTrackEvidenceGate(analysis, messageText, context, ghlContactId);
 
     // 2026-06-10 — S1.3 suppress-gate. In the S1.3 revival cohort, suppression
     // decisions belong to the reply-lane rules, not the LLM: dispatch row 1 now
