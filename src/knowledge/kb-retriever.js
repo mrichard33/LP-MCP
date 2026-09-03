@@ -4,6 +4,18 @@
  * Orchestrates structured KB lookups (Tier 1) for the response generator,
  * plus the Tier 2 vector search over kb_embeddings (v1.9, gated).
  *
+ * v1.11 — 2026-09-03. PAST-WIN EXEMPLARS (KB_EXEMPLAR_MODE).
+ *   PROBLEM: Tiers 1 and 2 tell the model what is true; nothing tells it what
+ *   has worked. Every lead message and reply since 2025-09 sits in the HL
+ *   warehouse and appointments.raw_json->>'dateAdded' says whether a booking
+ *   followed (177 of 1,603 answered inbounds since 2026-06-01).
+ *   FIX: exemplars.js builds kb_exemplars (lead said → we replied → outcome,
+ *   PII-scrubbed, lead side embedded). buildKbPack() retrieves the closest
+ *   exchanges that led to a booking, AFTER Tier 1 and BEFORE Tier 2, on every
+ *   conversational intent (EXEMPLAR_SKIP_INTENTS excluded), reusing the
+ *   per-turn query embedding. Gated by KB_EXEMPLAR_MODE: off (default) /
+ *   shadow (log only, tier='kb_exemplars') / live (PAST WINS block injected).
+ *
  * v1.10 — 2026-09-03. SEMANTIC TIER 1 (KB_FAQ_SEMANTIC_MODE).
  *   PROBLEM: searchFaqs() is Postgres full-text on kb_faqs.question_pattern —
  *   it hits only when the lead's words overlap the pattern's words. "Will
@@ -139,6 +151,10 @@ import {
   classifyObjectionSemantic,
   logKbQuery,
 } from './tier1-semantic.js';
+import { getKbExemplarMode, shouldRunExemplars, formatExemplarsForPrompt } from './exemplars-core.js';
+import { runExemplarTier } from './exemplars.js';
+
+const KB_EXEMPLAR_MAX_CHARS = parseInt(process.env.KB_EXEMPLAR_MAX_CHARS || '1200', 10);
 
 // ═══════════════════════════════════════════════════════════════════
 // v1.9 — TIER 2 VECTOR SEARCH RUNNER
@@ -938,6 +954,8 @@ export async function buildKbPack(params) {
     competitor_intel: null,
     vector_context: [],   // v1.9 — Tier 2 matches; injected only when vector_mode === 'live'
     vector_mode: 'off',   // v1.9 — resolved KB_VECTOR_MODE for this turn
+    exemplars: [],        // v1.11 — past-win exchanges; injected only when exemplar_mode === 'live'
+    exemplar_mode: 'off', // v1.11 — resolved KB_EXEMPLAR_MODE for this turn
     detected_signals: {
       competitor: detectedCompetitor,
       objection: detectedObjection,
@@ -1054,6 +1072,15 @@ export async function buildKbPack(params) {
   // the Protection Profile Review. Additive context; never blocks a reply.
   if (intentClass === 'OBJECTION' || intentClass === 'PRICING') {
     result.belief_stack = await getConciergeBeliefDocs(intentClass);
+  }
+
+  // v1.11 — Past-win exemplars. AFTER Tier 1 (so a canonical FAQ/script is
+  // already in the pack and wins on facts), BEFORE Tier 2 (approach beats
+  // background). Shares the per-turn query embedding. Never blocks a reply.
+  const exemplarMode = getKbExemplarMode();
+  result.exemplar_mode = exemplarMode;
+  if (exemplarMode !== 'off' && shouldRunExemplars(intentClass, messageText)) {
+    result.exemplars = await runExemplarTier(messageText, result, exemplarMode, getQueryEmbedding);
   }
 
   // v1.9 — Tier 2 vector search over kb_embeddings. Runs AFTER Tier 1 so the
@@ -1216,6 +1243,16 @@ export function formatKbPackForPrompt(pack) {
       lines.push(`  • ${p.claim}${p.evidence ? ` — ${p.evidence}` : ''} [${p.tier}]`);
     }
     lines.push('');
+  }
+
+  // v1.11 — Past wins, live mode only. Placed after PROOF POINTS (facts win)
+  // and before Tier 2 excerpts (approach beats background).
+  if (pack.exemplar_mode === 'live' && Array.isArray(pack.exemplars) && pack.exemplars.length > 0) {
+    const block = formatExemplarsForPrompt(pack.exemplars, { maxChars: KB_EXEMPLAR_MAX_CHARS });
+    if (block) {
+      lines.push(block);
+      lines.push('');
+    }
   }
 
   // v1.9 — Tier 2 excerpts, live mode only. Background context, never a source

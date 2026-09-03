@@ -37,6 +37,7 @@ import { registerIntentScorerRoutes } from './intent-scorer.js';
 // ─── Phase 4: KB Vector Ingestion (agentic bot knowledge layer) ──
 import { registerKbIngestionRoutes } from './knowledge/ingest-embeddings.js';
 import { startTier1EmbedSweep } from './knowledge/tier1-semantic.js';
+import { startExemplarSweep } from './knowledge/exemplars.js';
 // ─── Pause-Workflow Fizzle Sweep ─────────────────────────────────
 import {
   registerPauseWorkflowSweepRoutes,
@@ -715,6 +716,70 @@ async function runMigrations() {
     console.log('[Migration] kb faq semantic (sql/077) ready');
   } catch (err) {
     console.error('[Migration] kb faq semantic FAILED (searchFaqs falls back to keyword; apply sql/077 manually):', err);
+  }
+
+  // ── sql/078_kb_exemplars.sql (past-win exemplars) ───────────────────────
+  // New table + plain HNSW index (table is created empty; exemplars.js fills
+  // it) + RPC. All additive.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE TABLE IF NOT EXISTS kb_exemplars (
+      id                 BIGSERIAL PRIMARY KEY,
+      inbound_message_id TEXT NOT NULL UNIQUE,
+      ghl_contact_id     TEXT NOT NULL,
+      channel            TEXT NOT NULL,
+      prior_outbound     TEXT,
+      inbound_text       TEXT NOT NULL,
+      reply_text         TEXT NOT NULL,
+      reply_source       TEXT NOT NULL DEFAULT 'other',
+      inbound_sent_at    TIMESTAMPTZ NOT NULL,
+      reply_sent_at      TIMESTAMPTZ,
+      outcome            TEXT NOT NULL DEFAULT 'pending',
+      outcome_at         TIMESTAMPTZ,
+      embedding          vector(1536),
+      embedding_hash     TEXT,
+      active             BOOLEAN NOT NULL DEFAULT true,
+      built_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+    );`);
+    await runSQL(`CREATE INDEX IF NOT EXISTS idx_kb_exemplars_outcome
+      ON kb_exemplars (outcome, inbound_sent_at DESC);`);
+    await runSQL(`CREATE INDEX IF NOT EXISTS idx_kb_exemplars_contact
+      ON kb_exemplars (ghl_contact_id);`);
+    await runSQL(`CREATE INDEX IF NOT EXISTS idx_kb_exemplars_hnsw
+      ON kb_exemplars USING hnsw (embedding vector_cosine_ops)
+      WITH (m = 16, ef_construction = 64)
+      WHERE active = true;`);
+    await runSQL(`CREATE OR REPLACE FUNCTION match_kb_exemplars (
+      query_embedding vector(1536),
+      p_channel       TEXT    DEFAULT NULL,
+      p_won_only      BOOLEAN DEFAULT true,
+      match_threshold FLOAT8  DEFAULT 0.45,
+      match_count     INTEGER DEFAULT 2
+    )
+    RETURNS TABLE (
+      id BIGINT, channel TEXT, prior_outbound TEXT, inbound_text TEXT, reply_text TEXT,
+      reply_source TEXT, outcome TEXT, similarity FLOAT8
+    )
+    LANGUAGE plpgsql STABLE AS $$
+    BEGIN
+      RETURN QUERY
+      SELECT e.id, e.channel, e.prior_outbound, e.inbound_text, e.reply_text,
+             e.reply_source, e.outcome,
+             1 - (e.embedding <=> query_embedding) AS similarity
+      FROM kb_exemplars e
+      WHERE e.active = true
+        AND e.embedding IS NOT NULL
+        AND (p_channel IS NULL OR e.channel = p_channel)
+        AND (NOT p_won_only OR e.outcome IN ('booked', 'confirmed', 'showed'))
+        AND (1 - (e.embedding <=> query_embedding)) >= match_threshold
+      ORDER BY e.embedding <=> query_embedding
+      LIMIT match_count;
+    END;
+    $$;`);
+    console.log('[Migration] kb exemplars (sql/078) ready');
+  } catch (err) {
+    console.error('[Migration] kb exemplars FAILED (exemplar tier logs errors and injects nothing; apply sql/078 manually):', err);
   }
 
   // Rep + setter reporting RPCs (sql/functions.sql and sql/053 are the source
@@ -1781,6 +1846,7 @@ app.listen(PORT, async () => {
   console.log(`Health:       http://localhost:${PORT}/health`);
   await runMigrations();
   startTier1EmbedSweep(); // v1.10 — no-op while KB_FAQ_SEMANTIC_MODE=off
+  startExemplarSweep();   // v1.11 — no-op while KB_EXEMPLAR_MODE=off
   initFieldSync();
   startSyncScheduler();
   startImeWorkers();
