@@ -12,8 +12,9 @@
 --
 -- WHAT THIS IS NOT
 --   - No change to kb_embeddings rows, match_kb_embeddings(), or ingestion.
---   - Does NOT drop idx_kb_embeddings_vec (the 2026-04 IVFFlat index). That is
---     §C, a separate human-run step, only after §B is verified in use.
+--   - The drop of idx_kb_embeddings_vec (the 2026-04 IVFFlat index) is §C, a
+--     separate destructive step. APPLIED 2026-09-03 on Mark's instruction —
+--     see §C for why it had to run before, not after, Verification 2.
 --
 -- WHY
 --   kb_embeddings: 3,289 rows (1,665 active), 18 source docs, and
@@ -67,11 +68,31 @@ COMMENT ON TABLE kb_vector_queries IS
 --   WITH (m = 16, ef_construction = 64)
 --   WHERE active = true;
 
--- §C — RUN SEPARATELY, HUMAN-RUN, ONLY AFTER Verification 2 shows the planner
--- choosing idx_kb_embeddings_hnsw. Destructive class per sql/README.md.
--- Nothing reads this index (0 scans since creation).
+-- §C — APPLIED 2026-09-03, on Mark's explicit instruction. Destructive class
+-- per sql/README.md. Recorded here; do not re-run.
 --
 -- DROP INDEX CONCURRENTLY IF EXISTS idx_kb_embeddings_vec;
+--
+-- The original gate ("only after Verification 2 shows the planner choosing
+-- idx_kb_embeddings_hnsw") could not be satisfied as written: with both
+-- indexes present the planner priced IVFFlat lower every time and HNSW stayed
+-- at 0 scans, so the gate could never open itself. §C had to run FIRST, and
+-- Verification 2 was then confirmed on the far side of the drop.
+--
+-- Measured on the same query (match_kb_embeddings against a reece_faq_core
+-- chunk, threshold 0.35, 4 rows) — the IVFFlat index was silently costing
+-- recall, not just speed:
+--
+--   BEFORE (IVFFlat, lists=100, probes=1)   AFTER (HNSW)
+--   1.000 reece_faq_core                    1.000 reece_faq_core
+--   0.681 reece_compliance_guardrails       0.814 reece_canonical_kb
+--   0.522 reece_content_playbook            0.776 reece_canonical_kb
+--   0.498 reece_content_playbook            0.769 reece_canonical_kb
+--
+-- IVFFlat was missing the true nearest neighbours outright — the whole
+-- reece_canonical_kb cluster never surfaced. Calibrate KB_VECTOR_MIN_SIMILARITY
+-- from shadow-mode numbers collected AFTER this drop; anything measured with
+-- the IVFFlat index in place understates what the KB can return.
 
 -- Verification
 -- SELECT indexrelname, idx_scan
