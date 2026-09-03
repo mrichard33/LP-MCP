@@ -1574,6 +1574,19 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] capacity ranker dial_priority_log FAILED (POST /n8n/capacity-ranker/run will answer 500 until sql/080 is applied manually):', err.message);
   }
+
+  // Capacity ranker campaign cycle columns (sql/081 — the file is the source
+  // of truth). cycled / downtime_ms / restart_failures per run. Additive.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`ALTER TABLE dial_priority_log
+              ADD COLUMN IF NOT EXISTS cycled           boolean,
+              ADD COLUMN IF NOT EXISTS downtime_ms      integer,
+              ADD COLUMN IF NOT EXISTS restart_failures jsonb;`);
+    console.log('[Migration] capacity ranker dial_priority_log cycle columns (sql/081) ready');
+  } catch (err) {
+    console.error('[Migration] capacity ranker dial_priority_log cycle columns FAILED (the ranker log insert will fail until sql/081 is applied manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
