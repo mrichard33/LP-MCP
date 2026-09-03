@@ -14,6 +14,7 @@
  *   3. We invoke match_kb_embeddings RPC with the embedding
  *   4. Return ranked chunks with similarity scores
  *
+ * v1.2 — 2026-09-03. opts.queryEmbedding: reuse a precomputed query embedding.
  * v1.1 — 2026-09-02. Default threshold 0.7 → 0.35. text-embedding-3-small
  *   cosine similarities run low: a relevant ~500-token chunk against a short
  *   SMS question typically lands 0.35–0.60, unrelated text 0.10–0.30. At 0.7
@@ -49,10 +50,13 @@ export async function searchKnowledge(query, opts = {}) {
   const sourceDoc = opts.sourceDoc || null;
   const metadata = opts.metadata || null;
 
-  // 1. Embed the query
+  // 1. Embed the query — or reuse one the caller already computed (v1.2:
+  //    kb-retriever shares a single per-turn embedding across Tier 1 + Tier 2)
   let queryResult;
   try {
-    queryResult = await embed(query);
+    queryResult = (opts.queryEmbedding && Array.isArray(opts.queryEmbedding.embedding))
+      ? opts.queryEmbedding
+      : await embed(query);
   } catch (err) {
     console.error('[VectorSearch] Embed failed:', err.message);
     return { matches: [], query_tokens: 0, query_cost_usd: 0, error: err.message };
