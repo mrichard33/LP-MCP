@@ -24,6 +24,23 @@
  * The same quoted block carried the "Mark / Reece Windows & Doors" sign-off
  * that seeds the handoff-bridge template.
  *
+ * Self-broadcast marker (2026-09-03, S4.5 test-contact incident)
+ * ──────────────────────────────────────────────────────────────
+ * Mark replied "This is great." to an S4.5 Randy email from Apple Mail. The
+ * webhook body was stripped correctly, but the body GHL STORED for that
+ * inbound message was only the quoted Randy email — no "On … wrote:" line,
+ * no customer text, and the unsubscribe URL only at the very end. So when
+ * context-builder read the turn back, nothing above cut it, and identity
+ * extraction reported the customer's name as "Randy Reece" and address as
+ * "7181 30th Avenue" (event ids 3361019–3361023). The quoted email is our
+ * own GHL template, and every GHL email template starts with a preheader
+ * line padded by a run of zero-width / no-break characters. That run never
+ * appears in text a human types, so it is a reliable "our broadcast starts
+ * here" marker. We cut at the start of the preheader line (and one line
+ * earlier when GHL has already echoed the subject on the line above).
+ * A "Randy Reece / Reece Windows & Doors" sign-off is a secondary marker
+ * for older template variants without the padding.
+ *
  * COMPLIANCE NOTE — why the footer cut is URL-anchored, not word-anchored
  * ──────────────────────────────────────────────────────────────────────
  * behavioral-emitter.handleReply() runs isDNCSignal() on the STRIPPED text, and
@@ -47,7 +64,15 @@ const QUOTED_THREAD_MARKERS = [
   /\n\s*-{2,}\s*Original Message\s*-{2,}/i,
   /\n\s*_{5,}\s*\n/,                          // Outlook divider
   /\n\s*From:\s.+\n\s*Sent:\s/i,
+  // Our own broadcast sign-off block (Randy = email-only Attractive Character).
+  // Fires only on the two-line signature, never on the bare name.
+  /\n\s*Randy Reece\s*\n+\s*Reece Windows\s*&\s*Doors\s*\n/i,
 ];
+
+// GHL email-template preheader padding: a run of zero-width non-joiners,
+// zero-width spaces, soft hyphens, figure spaces, or NBSPs (with optional
+// plain spaces between). Five or more in a row never occurs in human text.
+const PREHEADER_PAD_RX = /(?:[\u200B\u200C\u200D\u2007\u00A0\u00AD\uFEFF] ?){5,}/;
 
 /**
  * Collapse an HTML email body to plain text, preserving line structure so the
@@ -73,11 +98,35 @@ export function htmlEmailToText(text) {
 }
 
 /**
+ * Locate the start of our own broadcast template inside a stored body, using
+ * the preheader padding run. Returns the cut index, or -1 when absent.
+ *
+ * Walks back to the start of the padded line. If the line immediately above
+ * is the same text as the padded line (GHL echoes the subject once above the
+ * preheader), the cut moves up to include that line too.
+ */
+function selfBroadcastStart(t) {
+  const m = t.match(PREHEADER_PAD_RX);
+  if (!m || m.index === undefined) return -1;
+
+  const lineStart = t.lastIndexOf('\n', m.index - 1) + 1;
+  const padLine = t.slice(lineStart, m.index).trim();
+
+  if (lineStart === 0) return 0;
+  const prevStart = t.lastIndexOf('\n', lineStart - 2) + 1;
+  const prevLine = t.slice(prevStart, lineStart).trim();
+  if (padLine && prevLine === padLine) return prevStart;
+  return lineStart;
+}
+
+/**
  * Reduce an inbound email to the customer's own words: cut at the first quoted-
- * thread marker or broadcast-footer link, drop `>` quote prefixes, trim.
+ * thread marker, our own broadcast template, or broadcast-footer link; drop `>`
+ * quote prefixes; trim.
  *
  * Behavior on plain-text bodies is identical to the original
- * behavioral-emitter implementation, plus the URL-anchored footer cut.
+ * behavioral-emitter implementation, plus the URL-anchored footer cut and the
+ * self-broadcast cut.
  */
 export function stripQuotedEmail(text) {
   const t = htmlEmailToText(text);
@@ -86,6 +135,8 @@ export function stripQuotedEmail(text) {
     const m = t.match(re);
     if (m && m.index !== undefined && m.index < cut) cut = m.index;
   }
+  const self = selfBroadcastStart(t);
+  if (self >= 0 && self < cut) cut = self;
   return t.slice(0, cut).replace(/^>.*$/gm, '').trim();
 }
 
