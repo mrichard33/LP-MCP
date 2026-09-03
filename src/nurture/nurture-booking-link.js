@@ -32,7 +32,9 @@
  *
  * MODE 2 — DIRECT URL (fallback when no trigger link is mapped)
  *   Builds a per-message URL with dynamic UTMs from prompt + request
- *   context. This is the historical behavior, preserved as a guardrail
+ *   context. Base URL is the Protection Profile Review calendar (Tier-1
+ *   offer), not the Window Estimate page (S4.5 v1.1, 2026-09-03).
+ *   This is the historical behavior, preserved as a guardrail
  *   so a missing trigger-link mapping never breaks a send. Falls back
  *   silently — the email still goes out with a working URL, just
  *   without the named trigger-link binding.
@@ -47,7 +49,9 @@
  * old non-S4.5 prompts).
  */
 
-const BOOKING_BASE_URL = 'https://landing.reecewindows.com/window-estimate';
+// Tier-1 offer (Protection Profile Review, 15-min call). S4.5 v1.1:
+// every nurture CTA lands here, never on the in-home estimate page.
+const BOOKING_BASE_URL = 'https://link.reecewindows.com/widget/booking/DQYMaJ22N6zL4SXjHukw';
 
 /**
  * Contact fields included in the direct-URL fallback when the lead has
