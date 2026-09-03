@@ -146,6 +146,16 @@ const WE_DEFAULT_ENTRY_TAGS = new Set([
   'active-entry:high-intent-digital',
 ]);
 
+// 2026-09-03 (S4.5 test-contact incident) — nurture cohort holds at PPR.
+// A contact in the Seinfeld nurture is, by definition, an engaged non-booker
+// at trust L2–L3. The readiness override below exists for chatbot/web leads
+// who show up hot; it must not turn a warm "This is great." email reply
+// into a 90-minute in-home ask. Explicit in-home requests still win (step 1).
+const NURTURE_COHORT_TAGS = new Set([
+  'active-s4.5',
+  'nurture-active',
+]);
+
 /**
  * Resolve which calendar a bot-driven booking targets.
  *
@@ -238,6 +248,10 @@ export async function resolveBookingCalendar(contact, opts = {}) {
   // Readiness override for the unknown/low-signal default: a hyperactive
   // buyer or a stage-4 negotiator earns the direct in-home estimate.
   if (opts.fastTrack === true || Number(opts.buyerStage) >= 4) {
+    if (tags.some((t) => NURTURE_COHORT_TAGS.has(t))) {
+      return { calendar_id: BOOKING_CALENDARS.PROTECTION_PROFILE_REVIEW,
+               calendar_key: 'PROTECTION_PROFILE_REVIEW', reason: 'nurture_cohort_holds_ppr' };
+    }
     return { calendar_id: BOOKING_CALENDARS.WINDOW_ESTIMATE,
              calendar_key: 'WINDOW_ESTIMATE', reason: 'readiness_signal_direct_in_home' };
   }
