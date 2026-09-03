@@ -642,6 +642,36 @@ async function runMigrations() {
     console.error('[Migration] groupme notification marks FAILED (GroupMe content dedup reads it — apply sql/migrations/2026-08-27_groupme_notification_marks.sql manually; sends continue undeduped):', err.message);
   }
 
+  // ── sql/076_kb_vector_hnsw_and_query_log.sql (Tier 2 vector search) ──────
+  // kb_vector_queries is the audit row written on every Tier 2 search
+  // (src/knowledge/kb-retriever.js v1.9). Plain CREATE INDEX here per
+  // sql/README.md; the CONCURRENTLY form for the populated table is in the
+  // .sql file under RUN SEPARATELY and is applied in the dashboard BEFORE merge.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE TABLE IF NOT EXISTS kb_vector_queries (
+      id             BIGSERIAL PRIMARY KEY,
+      intent_class   TEXT,
+      mode           TEXT NOT NULL,
+      query_text     TEXT,
+      match_count    INTEGER NOT NULL DEFAULT 0,
+      top_similarity FLOAT8,
+      sources        JSONB NOT NULL DEFAULT '[]'::jsonb,
+      latency_ms     INTEGER,
+      error          TEXT,
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    );`);
+    await runSQL(`CREATE INDEX IF NOT EXISTS idx_kb_vector_queries_created
+      ON kb_vector_queries (created_at DESC);`);
+    await runSQL(`CREATE INDEX IF NOT EXISTS idx_kb_embeddings_hnsw
+      ON kb_embeddings USING hnsw (embedding vector_cosine_ops)
+      WITH (m = 16, ef_construction = 64)
+      WHERE active = true;`);
+    console.log('[Migration] kb vector tier (sql/076) ready');
+  } catch (err) {
+    console.error('[Migration] kb vector tier FAILED (Tier 2 search still answers without the index; kb_vector_queries inserts will warn until sql/076 is applied manually):', err);
+  }
+
   // Rep + setter reporting RPCs (sql/functions.sql and sql/053 are the source
   // of truth; this mirror lets a fresh deploy self-heal them). Unlike every
   // other block here this one defines FUNCTIONS, not DDL — the reporting layer
