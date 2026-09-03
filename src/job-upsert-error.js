@@ -50,3 +50,42 @@ export function describeJobUpsertError(e) {
     (e.missingParent ? ' — parent lead absent from lp_leads' : '')
   );
 }
+
+// ─── Parent-lead self-heal gate (v1.1) ───────────────────────────
+//
+// The heal path fetches the prospect from LP and runs it through the canonical
+// upsertLeadOnly(), then retries the job once. Gated because it is a WRITE path
+// on the recurring sweep: ships off, gets proven in shadow, then live.
+
+export const JOB_PARENT_HEAL_MODES = new Set(['off', 'shadow', 'live']);
+
+/** off (default) | shadow (log the intent, write nothing) | live (heal + retry). */
+export function getJobParentHealMode(env = process.env) {
+  const m = String(env.LP_JOB_PARENT_HEAL_MODE || 'off').toLowerCase().trim();
+  return JOB_PARENT_HEAL_MODES.has(m) ? m : 'off';
+}
+
+/**
+ * Per-sweep cap on heal attempts. Each heal costs one LP GetLead call, so an
+ * unbounded gap (a full-sync outage leaving thousands of parents missing) would
+ * turn one sweep into thousands of LP calls. Bound it; the remainder simply
+ * logs as before and gets picked up on later sweeps.
+ */
+export function getJobParentHealBudget(env = process.env) {
+  const n = parseInt(env.LP_JOB_PARENT_HEAL_MAX_PER_SWEEP || '25', 10);
+  return Number.isFinite(n) && n > 0 ? n : 25;
+}
+
+/**
+ * Heal ONLY a missing parent, and only with a usable lead id.
+ *
+ * missingParent is true only for Postgres 23503 (see PG_FK_VIOLATION). A
+ * permission or constraint error must never reach the heal path — creating a
+ * lead would not fix it and would write a row nobody asked for.
+ */
+export function shouldHealParent(jobUpsertError, mode, healsUsed = 0, budget = 25) {
+  if (mode !== 'shadow' && mode !== 'live') return false;
+  if (!jobUpsertError || !jobUpsertError.missingParent) return false;
+  if (!/^\d+$/.test(String(jobUpsertError.lpLeadId || ''))) return false;
+  return healsUsed < budget;
+}
