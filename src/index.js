@@ -688,6 +688,18 @@ async function runMigrations() {
   //
   // Nothing at boot reads these RPCs — only the MCP tool layer — so a failure
   // logs and continues rather than blocking startup.
+  //
+  // runSQL's second argument (confirmDestructive) is REQUIRED here and is the
+  // only call site in this file that needs it: runSQL guards on
+  // /^\s*(DROP|TRUNCATE)\b/i, and this is the one migration whose statement
+  // list STARTS with DROP. Without it every boot threw
+  // "Destructive statement detected (DROP/TRUNCATE)" and this block never ran
+  // — silently, because the catch only logs. The other DROPs in runMigrations()
+  // are ALTER ... DROP NOT NULL / DROP CONSTRAINT, which the anchored regex
+  // does not match, so they were never affected.
+  //
+  // Scope of the DROP is deliberately narrow: DROP FUNCTION IF EXISTS on one
+  // explicit signature, 0 dependents, no CASCADE. It cannot reach a table.
   try {
     const { runSQL } = await import('./admin/supabase-admin.js');
     await runSQL(`
@@ -778,7 +790,7 @@ async function runMigrations() {
               GROUP BY l.set_by_name, l.lead_source_detail
               HAVING COUNT(*) >= p_min_appts
               ORDER BY appts_scheduled DESC;
-            $fn$ LANGUAGE sql;`);
+            $fn$ LANGUAGE sql;`, true);
     console.log('[Migration] rep + setter reporting RPCs (sql/functions.sql + sql/053) ready');
   } catch (err) {
     console.error('[Migration] reporting RPCs FAILED (get_rep_performance / get_setter_performance — apply sql/functions.sql + sql/053 manually):', err.message);
