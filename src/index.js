@@ -38,6 +38,7 @@ import { registerIntentScorerRoutes } from './intent-scorer.js';
 import { registerKbIngestionRoutes } from './knowledge/ingest-embeddings.js';
 import { startTier1EmbedSweep } from './knowledge/tier1-semantic.js';
 import { startExemplarSweep } from './knowledge/exemplars.js';
+import { startCiMomentsSweep } from './knowledge/ci-moments.js';
 // ─── Pause-Workflow Fizzle Sweep ─────────────────────────────────
 import {
   registerPauseWorkflowSweepRoutes,
@@ -780,6 +781,91 @@ async function runMigrations() {
     console.log('[Migration] kb exemplars (sql/078) ready');
   } catch (err) {
     console.error('[Migration] kb exemplars FAILED (exemplar tier logs errors and injects nothing; apply sql/078 manually):', err);
+  }
+
+  // ── sql/079_ci_moments.sql (call moments) ────────────────────────────────
+  // Two new tables + plain HNSW index (tables are created empty; ci-moments.js
+  // fills them) + RPC + view. All additive.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE TABLE IF NOT EXISTS ci_moment_extractions (
+      call_id        UUID PRIMARY KEY,
+      status         TEXT NOT NULL,
+      attempts       INTEGER NOT NULL DEFAULT 0,
+      moments        INTEGER NOT NULL DEFAULT 0,
+      error          TEXT,
+      model          TEXT,
+      prompt_version TEXT,
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    );`);
+    await runSQL(`CREATE TABLE IF NOT EXISTS ci_moments (
+      id              BIGSERIAL PRIMARY KEY,
+      call_id         UUID NOT NULL,
+      transcript_id   UUID,
+      moment_index    INTEGER NOT NULL,
+      kind            TEXT NOT NULL,
+      objection_type  TEXT,
+      customer_said   TEXT NOT NULL,
+      agent_said      TEXT,
+      resolved        BOOLEAN,
+      confidence      NUMERIC(3,2),
+      call_outcome    TEXT,
+      call_won        BOOLEAN NOT NULL DEFAULT false,
+      agent_username  TEXT,
+      team            TEXT,
+      campaign        TEXT,
+      call_start      TIMESTAMPTZ,
+      extractor_model TEXT,
+      prompt_version  TEXT,
+      embedding       vector(1536),
+      embedding_hash  TEXT,
+      active          BOOLEAN NOT NULL DEFAULT true,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (call_id, moment_index)
+    );`);
+    await runSQL(`CREATE INDEX IF NOT EXISTS idx_ci_moments_kind_type ON ci_moments (kind, objection_type) WHERE active = true;`);
+    await runSQL(`CREATE INDEX IF NOT EXISTS idx_ci_moments_call ON ci_moments (call_id);`);
+    await runSQL(`CREATE INDEX IF NOT EXISTS idx_ci_moments_hnsw
+      ON ci_moments USING hnsw (embedding vector_cosine_ops)
+      WITH (m = 16, ef_construction = 64)
+      WHERE active = true;`);
+    await runSQL(`CREATE OR REPLACE FUNCTION match_ci_moments (
+      query_embedding vector(1536),
+      p_kind          TEXT    DEFAULT NULL,
+      p_won_only      BOOLEAN DEFAULT true,
+      match_threshold FLOAT8  DEFAULT 0.45,
+      match_count     INTEGER DEFAULT 2
+    )
+    RETURNS TABLE (
+      id BIGINT, kind TEXT, objection_type TEXT, customer_said TEXT, agent_said TEXT,
+      resolved BOOLEAN, call_won BOOLEAN, call_outcome TEXT, similarity FLOAT8
+    )
+    LANGUAGE plpgsql STABLE AS $$
+    BEGIN
+      RETURN QUERY
+      SELECT m.id, m.kind, m.objection_type, m.customer_said, m.agent_said,
+             m.resolved, m.call_won, m.call_outcome,
+             1 - (m.embedding <=> query_embedding) AS similarity
+      FROM ci_moments m
+      WHERE m.active = true
+        AND m.embedding IS NOT NULL
+        AND (p_kind IS NULL OR m.kind = p_kind)
+        AND (NOT p_won_only OR m.resolved = true OR m.call_won = true)
+        AND (1 - (m.embedding <=> query_embedding)) >= match_threshold
+      ORDER BY m.embedding <=> query_embedding
+      LIMIT match_count;
+    END;
+    $$;`);
+    await runSQL(`CREATE OR REPLACE VIEW v_ci_faq_gaps AS
+      SELECT m.id, m.call_start, m.campaign, m.call_outcome, m.customer_said, m.agent_said, m.confidence,
+             (SELECT MAX(1 - (f.embedding <=> m.embedding))
+                FROM kb_faqs f WHERE f.active = true AND f.embedding IS NOT NULL) AS best_faq_similarity
+      FROM ci_moments m
+      WHERE m.kind = 'question' AND m.active = true AND m.embedding IS NOT NULL;`);
+    console.log('[Migration] ci moments (sql/079) ready');
+  } catch (err) {
+    console.error('[Migration] ci moments FAILED (call-moments tier logs errors and injects nothing; apply sql/079 manually):', err);
   }
 
   // Rep + setter reporting RPCs (sql/functions.sql and sql/053 are the source
@@ -1847,6 +1933,7 @@ app.listen(PORT, async () => {
   await runMigrations();
   startTier1EmbedSweep(); // v1.10 — no-op while KB_FAQ_SEMANTIC_MODE=off
   startExemplarSweep();   // v1.11 — no-op while KB_EXEMPLAR_MODE=off
+  startCiMomentsSweep();  // v1.12 — no-op while KB_CALL_MOMENTS_MODE=off
   initFieldSync();
   startSyncScheduler();
   startImeWorkers();

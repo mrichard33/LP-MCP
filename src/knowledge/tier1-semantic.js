@@ -25,6 +25,10 @@ import {
   pickObjectionType,
   getKbFaqSemanticMode,
 } from './tier1-semantic-core.js';
+import { matchCiMoments } from './ci-moments.js';
+import { getKbCallMomentsMode, scoresFromMoments } from './ci-moments-core.js';
+
+const KB_OBJECTION_FROM_CALLS = String(process.env.KB_OBJECTION_FROM_CALLS || 'true').toLowerCase() !== 'false';
 
 const KB_FAQ_MIN_SIMILARITY       = parseFloat(process.env.KB_FAQ_MIN_SIMILARITY || '0.40');
 const KB_OBJECTION_MIN_SIMILARITY = parseFloat(process.env.KB_OBJECTION_MIN_SIMILARITY || '0.30');
@@ -72,6 +76,20 @@ async function getObjectionTypeVectors() {
  */
 export async function classifyObjectionSemantic(queryEmbedding, threshold = KB_OBJECTION_MIN_SIMILARITY) {
   if (!queryEmbedding || !Array.isArray(queryEmbedding.embedding)) return { pick: null, scores: {} };
+
+  // v1.12 — prefer nearest REAL objections from ci_moments over the six
+  // hand-written descriptions, once the corpus can answer (≥3 neighbours at
+  // 0.30). Only in live call-moments mode; any failure falls through.
+  if (KB_OBJECTION_FROM_CALLS && getKbCallMomentsMode() === 'live') {
+    try {
+      const rows = await matchCiMoments(queryEmbedding, { kind: 'objection', wonOnly: false, limit: 8, threshold: 0.30 });
+      const scores = scoresFromMoments(rows, 3);
+      if (scores) return { pick: pickObjectionType(scores, threshold), scores, basis: 'ci_moments' };
+    } catch (err) {
+      console.warn('[Tier1Semantic] ci_moments objection lookup failed, using descriptions:', err.message);
+    }
+  }
+
   const vectors = await getObjectionTypeVectors();
   const scores = {};
   for (const v of vectors) scores[v.type] = cosineSimilarity(queryEmbedding.embedding, v.embedding);

@@ -100,6 +100,9 @@ const FUNCTION_GROUPS = {
   // OpenAI with CI_ANALYSIS_PROVIDER + CI_ANALYSIS_MODEL_OPENAI, or leave it
   // on the decision_engine group. See src/ci/analyze.js.
   ci_analysis: 'decision_engine',        // src/ci/analyze.js
+  // Call moments — objection/question extraction from a transcript (JSON).
+  // Override cheaply with CI_MOMENTS_MODEL_ANTHROPIC (Haiku is plenty).
+  ci_moments: 'decision_engine',         // src/knowledge/ci-moments.js
   // Operational read on a backstop sweep — team GroupMe only, never a
   // customer. There is no internal/operational tier, so it rides the
   // decision-engine group (already pointed at a model on Railway via

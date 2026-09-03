@@ -4,6 +4,19 @@
  * Orchestrates structured KB lookups (Tier 1) for the response generator,
  * plus the Tier 2 vector search over kb_embeddings (v1.9, gated).
  *
+ * v1.12 — 2026-09-03. CALL MOMENTS (KB_CALL_MOMENTS_MODE).
+ *   4,462 CI transcripts since 2026-08-24 hold homeowner objections and
+ *   questions in their own words, plus the agent's answer — and no speaker
+ *   labels. ci-moments.js runs one JSON extraction per eligible call and
+ *   stores the moments (homeowner side embedded). buildKbPack() retrieves
+ *   the closest moments where the point was resolved or the call booked,
+ *   AFTER Tier 1 and BEFORE Tier 2, on every conversational intent, reusing
+ *   the per-turn query embedding. off (default) / shadow (log only,
+ *   tier='ci_moments') / live (FROM REAL CALLS block injected). Also feeds
+ *   the v1.10 objection classifier (tier1-semantic.js) with real objections
+ *   once ≥3 neighbours exist. Independent of v1.11 (text-side exemplars);
+ *   both may be present.
+ *
  * v1.11 — 2026-09-03. PAST-WIN EXEMPLARS (KB_EXEMPLAR_MODE).
  *   PROBLEM: Tiers 1 and 2 tell the model what is true; nothing tells it what
  *   has worked. Every lead message and reply since 2025-09 sits in the HL
@@ -151,6 +164,10 @@ import {
   classifyObjectionSemantic,
   logKbQuery,
 } from './tier1-semantic.js';
+import { getKbCallMomentsMode, shouldRunCallMoments, formatCallMomentsForPrompt } from './ci-moments-core.js';
+import { runCallMomentsTier } from './ci-moments.js';
+
+const KB_CALL_MOMENTS_MAX_CHARS = parseInt(process.env.KB_CALL_MOMENTS_MAX_CHARS || '1200', 10);
 import { getKbExemplarMode, shouldRunExemplars, formatExemplarsForPrompt } from './exemplars-core.js';
 import { runExemplarTier } from './exemplars.js';
 
@@ -954,6 +971,8 @@ export async function buildKbPack(params) {
     competitor_intel: null,
     vector_context: [],   // v1.9 — Tier 2 matches; injected only when vector_mode === 'live'
     vector_mode: 'off',   // v1.9 — resolved KB_VECTOR_MODE for this turn
+    call_moments: [],         // v1.12 — real-call moments; injected only when call_moments_mode === 'live'
+    call_moments_mode: 'off', // v1.12 — resolved KB_CALL_MOMENTS_MODE for this turn
     exemplars: [],        // v1.11 — past-win exchanges; injected only when exemplar_mode === 'live'
     exemplar_mode: 'off', // v1.11 — resolved KB_EXEMPLAR_MODE for this turn
     detected_signals: {
@@ -1081,6 +1100,14 @@ export async function buildKbPack(params) {
   result.exemplar_mode = exemplarMode;
   if (exemplarMode !== 'off' && shouldRunExemplars(intentClass, messageText)) {
     result.exemplars = await runExemplarTier(messageText, result, exemplarMode, getQueryEmbedding);
+  }
+
+  // v1.12 — Call moments. AFTER Tier 1 (facts win), BEFORE Tier 2 (approach
+  // beats background). Shares the per-turn query embedding. Never blocks.
+  const callMomentsMode = getKbCallMomentsMode();
+  result.call_moments_mode = callMomentsMode;
+  if (callMomentsMode !== 'off' && shouldRunCallMoments(intentClass, messageText)) {
+    result.call_moments = await runCallMomentsTier(messageText, result, callMomentsMode, getQueryEmbedding);
   }
 
   // v1.9 — Tier 2 vector search over kb_embeddings. Runs AFTER Tier 1 so the
@@ -1249,6 +1276,16 @@ export function formatKbPackForPrompt(pack) {
   // and before Tier 2 excerpts (approach beats background).
   if (pack.exemplar_mode === 'live' && Array.isArray(pack.exemplars) && pack.exemplars.length > 0) {
     const block = formatExemplarsForPrompt(pack.exemplars, { maxChars: KB_EXEMPLAR_MAX_CHARS });
+    if (block) {
+      lines.push(block);
+      lines.push('');
+    }
+  }
+
+  // v1.12 — Real-call moments, live mode only. After PROOF POINTS (and after
+  // PAST WINS if v1.11 is present), before Tier 2 excerpts.
+  if (pack.call_moments_mode === 'live' && Array.isArray(pack.call_moments) && pack.call_moments.length > 0) {
+    const block = formatCallMomentsForPrompt(pack.call_moments, { maxChars: KB_CALL_MOMENTS_MAX_CHARS });
     if (block) {
       lines.push(block);
       lines.push('');
