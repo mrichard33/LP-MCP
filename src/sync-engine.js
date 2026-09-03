@@ -155,6 +155,7 @@ import { populateSourceMapping, backfillSourceMappingsFromLeads } from './sync-s
 import { syncDispositions, backfillDispositionsFromLeads } from './sync-dispositions.js';
 import { upsertLeadOnly, processProspect } from './sync-leads.js';
 import { syncAllChildRecords, syncJobAndMilestones } from './sync-children.js';
+import { describeJobUpsertError } from './job-upsert-error.js';
 import { checkDay15Handoffs, checkLeadTriggers } from './sync-triggers.js';
 
 // v6.10: Prospect deny-list for chronically-timing-out cstIds. The
@@ -1038,7 +1039,24 @@ async function runJobChangesSweep(since, windowEnd, logIds) {
 
     await processInBatches(items, SYNC_PROSPECT_CONCURRENCY, async (job) => {
       try {
-        await syncJobAndMilestones(job, job.lds_id || job.lp_lead_id, null);
+        const res = await syncJobAndMilestones(job, job.lds_id || job.lp_lead_id, null);
+        // A rejected lp_jobs upsert does NOT throw — supabase-js resolves with
+        // { error } — so the catch below never saw it. counts.jobs++ ran anyway,
+        // `failed` stayed 0, and logSyncError was never called: every
+        // FK-rejected job was reported as synced and left no trace outside the
+        // deploy log, which Railway prunes with the deployment. That is how
+        // get_sync_health showed 104 jobs / 0 failures on 2026-09-03 while jobs
+        // 57771 ($19,595, install in progress) and 58260 were absent from
+        // lp_jobs entirely. Count it, and write it where a query can find it.
+        if (res?.jobUpsertError) {
+          failed++;
+          const e = res.jobUpsertError;
+          // entityId lands in lp_sync_errors.lp_lead_id, so pass the LEAD id —
+          // the job id travels in the message. (The generic catch below still
+          // passes a job id into that column; left as-is, out of scope here.)
+          await logSyncError(e.lpLeadId, new Error(describeJobUpsertError(e)), 'jobChangesSweep');
+          return;
+        }
         counts.jobs++;
         counts.milestones += (getField(job, 'milestones', 'Milestones') || []).length;
       } catch (err) {
