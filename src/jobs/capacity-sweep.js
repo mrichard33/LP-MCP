@@ -758,7 +758,10 @@ export async function runFillSnapshot(snapshotDate = todayET()) {
  * fill_pct is null when requested=0 and UNCAPPED above 1.0 (business rule 4 —
  * overbooking is real; only the UI's arc render caps at 100%).
  */
-async function buildBoardResponse(date) {
+// Exported (2026-09-03) so the capacity ranker (src/routes/capacityRanker.js)
+// reads the SAME aggregate the TV board polls — never a parallel query that
+// can drift from it.
+export async function buildBoardResponse(date) {
   const [marketRows, denomRows, numerRows, sweepRows] = await Promise.all([
     runSQL(`SELECT DISTINCT market_code, market_label FROM lp_branch_market_map ORDER BY market_code`),
     runSQL(`SELECT market, requested, booked FROM v_appt_board WHERE slot_date = '${date}'::date`),
