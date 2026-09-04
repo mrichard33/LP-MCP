@@ -23,6 +23,7 @@ import {
   OUTBOUND_CAMPAIGN_FIELD_ORDER,
   INBOUND_CAMPAIGN_FIELD_ORDER,
   LIST_DELETE_SETTINGS_FIELD_ORDER,
+  LIST_UPDATE_SETTINGS_FIELD_ORDER,
   ASYNC_DELETE_FIELD_ORDER,
   ASYNC_ADD_FIELD_ORDER,
   IVR_SCRIPT_DEF_FIELD_ORDER,
@@ -75,7 +76,7 @@ test('artifact is populated and self-describing', () => {
 test('artifact carries the types the write surface builds', () => {
   for (const t of [
     'campaignProfileInfo', 'userSkill', 'inboundCampaign', 'outboundCampaign',
-    'listDeleteSettings', 'vccConfiguration', 'campaignCallWrapup', 'ivrScriptDef',
+    'listDeleteSettings', 'listUpdateSettings', 'vccConfiguration', 'campaignCallWrapup', 'ivrScriptDef',
   ]) {
     assert.ok(schema.complexTypes[t], `missing complexType ${t}`);
   }
@@ -87,6 +88,7 @@ const COMPLEX_TYPE_CASES = [
   ['OUTBOUND_CAMPAIGN_FIELD_ORDER', OUTBOUND_CAMPAIGN_FIELD_ORDER, 'outboundCampaign'],
   ['INBOUND_CAMPAIGN_FIELD_ORDER', INBOUND_CAMPAIGN_FIELD_ORDER, 'inboundCampaign'],
   ['LIST_DELETE_SETTINGS_FIELD_ORDER', LIST_DELETE_SETTINGS_FIELD_ORDER, 'listDeleteSettings'],
+  ['LIST_UPDATE_SETTINGS_FIELD_ORDER', LIST_UPDATE_SETTINGS_FIELD_ORDER, 'listUpdateSettings'],
   ['IVR_SCRIPT_DEF_FIELD_ORDER', IVR_SCRIPT_DEF_FIELD_ORDER, 'ivrScriptDef'],
   ['CAMPAIGN_CALL_WRAPUP_FIELD_ORDER', CAMPAIGN_CALL_WRAPUP_FIELD_ORDER, 'campaignCallWrapup'],
   ['IVR_SCRIPT_SCHEDULE_FIELD_ORDER', IVR_SCRIPT_SCHEDULE_FIELD_ORDER, 'ivrScriptSchedule'],

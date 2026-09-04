@@ -79,8 +79,14 @@ const FIVE9_WRITE_TYPES = [
   'five9_reset_list_position',
 ];
 
+// The ONE carved-out op (Mark, 2026-09-04). Excluded from the blanket loop
+// below and asserted on its own terms in scripts/test-five9-approval-carveout.js.
+// Kept as a single named constant here, rather than a set, so that widening the
+// carve-out means editing two files that both say "one".
+const CARVED_OUT = 'five9_add_records_to_list';
+
 test('every five9_* write is coerced to requires_approval:true, however it was queued', () => {
-  for (const actionType of FIVE9_WRITE_TYPES) {
+  for (const actionType of FIVE9_WRITE_TYPES.filter((t) => t !== CARVED_OUT)) {
     // The bypass attempt this exists to stop.
     for (const requested of [false, undefined, null, 0, '']) {
       const out = resolveRequiresApproval(actionType, requested);
@@ -123,9 +129,30 @@ test('the Phase H user-profile surface is covered — all four, by name', () => 
 
 test('a five9_* op that does not exist yet is covered the day it is added', () => {
   // Prefix-matched on purpose: the alternative is a second list that goes
-  // stale the first time someone adds an op and forgets it.
+  // stale the first time someone adds an op and forgets it. The 2026-09-04
+  // carve-out is a single EXACT-MATCH exception and does not weaken this —
+  // a new op is still armed on the day it is added.
   assert.equal(resolveRequiresApproval('five9_some_future_op', false).requiresApproval, true);
   assert.equal(resolveRequiresApproval('five9_', false).requiresApproval, true);
+  // Near-misses on the carved-out name must NOT inherit the exemption.
+  for (const near of [
+    'five9_add_records_to_list_bulk',
+    'five9_add_records_to_lists',
+    'five9_add_records_to_lis',
+  ]) {
+    assert.equal(resolveRequiresApproval(near, false).requiresApproval, true, `${near} must stay gated`);
+  }
+
+  // Case and prefix variants are not five9 writes to this function AT ALL —
+  // the startsWith check is case-sensitive, and always has been. They are not
+  // exempted by the carve-out; they simply never reach the prefix rule, and
+  // they fail safe one layer down because executeFive9Write resolves
+  // action_type against FIVE9_WRITE_OPS and throws "unknown op" on a miss
+  // (asserted in scripts/test-five9-approval-carveout.js). Recorded here so
+  // the false negative is documented rather than rediscovered as a surprise.
+  for (const variant of ['Five9_Add_Records_To_List', 'FIVE9_ADD_RECORDS_TO_LIST', 'xfive9_add_records_to_list']) {
+    assert.equal(resolveRequiresApproval(variant, false).isFive9Write, false, `${variant} is not prefix-matched`);
+  }
 });
 
 /**

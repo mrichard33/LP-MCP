@@ -2,8 +2,17 @@
  * LP Re-queue Verification Sweep — src/jobs/lp-requeue-verify.js
  *
  * Handoff C4 (2026-08-18): the outbound SMS says someone will ring within
- * minutes, so verify rather than assume. After a callback re-queue LeadAdd,
- * confirm the lead actually became dialable:
+ * minutes, so verify rather than assume. After a callback re-queue, confirm
+ * the call actually reached a dialer.
+ *
+ * TWO MODES since 2026-09-04, because the re-queue has two destinations
+ * (LP_REQUEUE_MODE). A five9-mode row is verified by verifyFive9Push: it
+ * creates no LP lead, so there is no lds_id to wait for and the LP checks
+ * below would escalate every single callback once its window expired. The
+ * question asked is the same — did this reach a dialer — of whichever system
+ * received it.
+ *
+ * LP mode (LP_REQUEUE_MODE=lp_leadadd), unchanged:
  *
  *   1. LP's ~60s inbound callback writes the newly issued lds_id back to
  *      the GHL contact (field GmAVmW6V9sekD7pVONKr). A value different from
@@ -40,9 +49,13 @@ function readCF(contact, fieldId) {
   return (f?.value !== undefined && f?.value !== null) ? String(f.value) : '';
 }
 
-async function stampResult(actionId, executionResult, patch) {
+// db is a TEST SEAM. It defaults to the module client, so every production
+// call site is unchanged; without it this whole file is untestable, which is
+// why it had no tests until 2026-09-04 and why the five9 branch could have
+// shipped escalating every callback.
+async function stampResult(actionId, executionResult, patch, db = supabase) {
   const merged = { ...(executionResult || {}), ...patch };
-  const { error } = await supabase
+  const { error } = await db
     .from('agent_actions')
     .update({ execution_result: merged, updated_at: new Date().toISOString() })
     .eq('id', actionId);
@@ -60,6 +73,13 @@ async function verifyOne(row, deps = {}) {
   const preLds = new Set((res.pre_lds_ids || []).map(String));
   const inboundId = String(res.lp_inbound_lead_id || '');
   const deadline = res.verify_deadline ? Date.parse(res.verify_deadline) : (Date.parse(row.created_at) + 12 * 60 * 1000);
+
+  // A five9-mode re-queue creates no LP lead, so there is no lds_id to wait
+  // for and steps 1-3 below would escalate EVERY push once its window expired
+  // — a priority GroupMe per callback. The promise still has to be verified
+  // though; skipping would drop the one guarantee this sweep exists to make.
+  // So the same question is asked of the system that actually received it.
+  if (res.mode === 'five9') return verifyFive9Push(row, res, deps);
 
   // 1. Has LP issued a NEW lds_id? (the ~60s callback writes it to GHL)
   let newLds = null;
@@ -80,7 +100,7 @@ async function verifyOne(row, deps = {}) {
       verified_at: new Date().toISOString(),
       new_lds_id: newLds,
       lead_to_lds_seconds: elapsedS,
-    });
+    }, deps.supabase || supabase);
     return 'lds_issued';
   }
 
@@ -92,7 +112,7 @@ async function verifyOne(row, deps = {}) {
         const info = await infoFn({ lognumber: contactId });
         const rows = Array.isArray(info) ? info : (info?.data || info?.leads || info?.results || info?.items || []);
         const seen = JSON.stringify(rows || []).includes(inboundId);
-        if (seen) await stampResult(row.id, res, { inbound_row_seen: true });
+        if (seen) await stampResult(row.id, res, { inbound_row_seen: true }, deps.supabase || supabase);
         else console.log(`[RequeueVerify] ${contactId}: in1 ${inboundId} not visible in inbound queue yet`);
       } catch (err) {
         console.warn(`[RequeueVerify] inbound check failed for ${contactId}: ${err.message}`);
@@ -111,7 +131,8 @@ async function verifyOne(row, deps = {}) {
     name = `${c.firstName || ''} ${c.lastName || ''}`.trim() || contactId;
     phone = c.phone || 'unknown';
   } catch {}
-  await sendGroupMeMessage(
+  const notify = deps.sendGroupMeMessage || sendGroupMeMessage;
+  await notify(
     `🚨 PROMISED CALLBACK DID NOT REACH THE DIALER\n` +
     `Contact: ${name} (${contactId})\n` +
     `Phone: ${phone}\n` +
@@ -123,7 +144,89 @@ async function verifyOne(row, deps = {}) {
   await stampResult(row.id, res, {
     verify_status: 'escalated',
     verified_at: new Date().toISOString(),
-  });
+  }, deps.supabase || supabase);
+  return 'escalated';
+}
+
+/**
+ * Verify a five9-mode re-queue: did the Five9 push actually execute?
+ *
+ * The LP path waits on LP issuing an lds_id. Here the equivalent proof is the
+ * five9_add_records_to_list row this re-queue queued reaching status
+ * 'completed' — that row only completes after withFive9WriteGate has run the
+ * SOAP call and assertNoRecordFailures has passed, so a completed row means
+ * Five9 accepted the record.
+ *
+ * Same escalation as the LP path when the window expires, because the customer
+ * heard the same promise either way.
+ */
+async function verifyFive9Push(row, res, deps = {}) {
+  const db = deps.supabase || supabase;
+  const contactId = row.target_id;
+  const five9ActionId = res.five9_action_id;
+  const deadline = res.verify_deadline ? Date.parse(res.verify_deadline) : (Date.parse(row.created_at) + 12 * 60 * 1000);
+
+  // No id recorded means the queue insert itself is unaccounted for. Treat it
+  // as unverifiable rather than assume success — the whole point is that a
+  // promised call is never silently dropped.
+  let status = null;
+  let errorMessage = null;
+  if (five9ActionId) {
+    try {
+      const { data } = await db
+        .from('agent_actions')
+        .select('status, error_message')
+        .eq('id', five9ActionId)
+        .limit(1);
+      status = data?.[0]?.status ?? null;
+      errorMessage = data?.[0]?.error_message ?? null;
+    } catch (err) {
+      console.warn(`[RequeueVerify] five9 action read failed for ${contactId}: ${err.message}`);
+      return null; // unreadable is not a verdict; try again next sweep
+    }
+  }
+
+  if (status === 'completed') {
+    const elapsedS = Math.round((Date.now() - Date.parse(row.created_at)) / 1000);
+    console.log(`[RequeueVerify] ✅ ${contactId}: five9 push (action ${five9ActionId}) completed ${elapsedS}s after re-queue`);
+    await stampResult(row.id, res, {
+      verify_status: 'five9_pushed',
+      verified_at: new Date().toISOString(),
+      five9_action_status: status,
+      push_to_five9_seconds: elapsedS,
+    }, db);
+    return 'lds_issued'; // counted as a success by the sweep's tally
+  }
+
+  // Still inside the window and not yet failed → keep waiting.
+  if (Date.now() < deadline && status !== 'failed') return null;
+
+  console.error(`[RequeueVerify] ⛔ ${contactId}: five9 push (action ${five9ActionId || 'unknown'}) did not complete inside the window (status=${status || 'unknown'}) — escalating`);
+  let name = contactId, phone = 'unknown';
+  try {
+    const fetcher = deps.ghlFetch || ghlFetch;
+    const ghlRes = await fetcher('GET', `/contacts/${contactId}`);
+    const c = ghlRes?.contact || {};
+    name = `${c.firstName || ''} ${c.lastName || ''}`.trim() || contactId;
+    phone = c.phone || 'unknown';
+  } catch {}
+  const notify = deps.sendGroupMeMessage || sendGroupMeMessage;
+  await notify(
+    `🚨 PROMISED CALLBACK DID NOT REACH THE DIALER\n` +
+    `Contact: ${name} (${contactId})\n` +
+    `Phone: ${phone}\n` +
+    `Five9 list: ${res.list || 'Callback Request'} | CustID: ${res.cust_id || 'unknown'}\n` +
+    `five9_add_records_to_list action ${five9ActionId || 'unknown'} is "${status || 'unknown'}"` +
+    `${errorMessage ? ` — ${String(errorMessage).slice(0, 160)}` : ''}\n` +
+    `The customer was told someone will ring within minutes and the push was queued ` +
+    `${Math.round((Date.now() - Date.parse(row.created_at)) / 60000)}min ago.\n` +
+    `→ CALL THEM MANUALLY NOW, then check the Five9 write gate and the action executor.`
+  ).catch((err) => console.warn(`[RequeueVerify] escalation GroupMe failed: ${err.message}`));
+  await stampResult(row.id, res, {
+    verify_status: 'escalated',
+    verified_at: new Date().toISOString(),
+    five9_action_status: status,
+  }, db);
   return 'escalated';
 }
 

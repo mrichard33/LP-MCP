@@ -51,8 +51,12 @@
  *   State machines (5):
  *     compute_rescission_dispatch, transition_objection_state,
  *     resolve_objection_state, classify_lead_state, end_agentic_handoff
- *   Five9 gated writes (37 — every one behind FIVE9_WRITES_ENABLED +
- *   approve_action; see src/five9/admin-writes.js):
+ *   Five9 gated writes (37 — every one behind FIVE9_WRITES_ENABLED, and all
+ *   but one behind approve_action too; see src/five9/admin-writes.js).
+ *   THE ONE EXCEPTION is five9_add_records_to_list, carved out on 2026-09-04
+ *   so a promised callback does not wait on an approval click — the ruling
+ *   and the reasoning are on AUTO_APPROVED_FIVE9_OP in src/tools/agent-tools.js.
+ *   It is still behind FIVE9_WRITES_ENABLED:
  *     2026-07-21 Phase C — five9_start_campaign, five9_stop_campaign,
  *       five9_reset_campaign, five9_set_outbound_campaign,
  *       five9_add_records_to_list, five9_delete_record_from_list,
