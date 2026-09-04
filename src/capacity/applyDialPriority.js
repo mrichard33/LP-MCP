@@ -23,16 +23,20 @@
  *     applied=false + error_message, never as a retry.
  *
  * CYCLING (deps.cycleCampaigns, wired from CAPACITY_RANKER_CYCLE_CAMPAIGNS):
- * each campaign that reads RUNNING is gracefully stopped, written, and then
- * restarted in a finally block — the restart runs whether the write
- * succeeded, threw, or the read-back mismatched, is retried up to
- * restartAttempts with restartBackoffMs between, and is verified by reading
- * state after restartSettleMs (Five9 reports state on a lag, so an immediate
- * read is not evidence of anything) plus one final read restartFinalWaitMs
- * later. A campaign that does not come back is named in result.restart_failures
- * and forces applied=false. Campaigns cycle one at a time (the TIERS loop is
- * sequential — never parallelise it). Prior state is restored, not assumed: a
- * campaign already NOT_RUNNING is written and left stopped.
+ * each campaign that reads RUNNING is gracefully stopped, WAITED OUT until the
+ * stop settles (waitForStopSettle — a write into a draining campaign is a
+ * guaranteed refusal), written, and then restarted in a finally block. The
+ * restart runs whether the write succeeded, threw, or the read-back
+ * mismatched; it is up to restartAttempts (10) over restartCeilingMs (10
+ * minutes) with exponential backoff capped at 60s, and each attempt is verified
+ * by POLLING state for restartVerifyMs (15s) — Five9 reports state on a lag, so
+ * one immediate read is not evidence of anything. A campaign that does not come
+ * back is named in result.restart_failures and forces applied=false. Campaigns
+ * cycle one at a time (the TIERS loop is sequential — never parallelise it).
+ * Prior state is restored, not assumed: a campaign already NOT_RUNNING is
+ * written and left stopped. If the stop never settles the reorder is SKIPPED
+ * and the campaign restarted — the run aborts cleanly rather than making the
+ * dark window longer for a write that cannot land.
  *
  * TWO THINGS THE 2026-09-04 OUTAGE TAUGHT US, both fixed here:
  *
@@ -95,6 +99,216 @@ export const TIERS = Object.freeze(['hot', 'warm']);
 export const TRANSITIONAL_STATES = Object.freeze(new Set(['STOPPING', 'STARTING', 'RESETTING']));
 
 const norm = (s) => String(s ?? '').trim().toLowerCase();
+
+/* ─── Restart budget ─────────────────────────────────────────────────────── *
+ *
+ * WHY THESE NUMBERS. On 2026-09-04 the ranker failed to restart a campaign
+ * three times in one afternoon (dial_priority_log 18, 19, 24) with an
+ * ESCALATING dark window: 16s, 22s, 200s. The last one never came back at all
+ * and "Data - Warm Leads less than 30" sat NOT_RUNNING for roughly two hours,
+ * ~2,600 warm leads undialed, until Mark started it by hand.
+ *
+ * The old budget was 3 attempts at a flat 2s — about six seconds of trying
+ * before giving up PERMANENTLY. A run that gives up on a restart is worse than
+ * a run that never cycled, so the budget is now long, backed off, and it never
+ * exits early on an exception: every failure mode (a refusal, a throw, a state
+ * that reads wrong) is caught, backed off and retried until the attempts or
+ * the ceiling are spent.
+ */
+export const DEFAULT_RESTART = Object.freeze({
+  /** RANKER_RESTART_MAX_ATTEMPTS */
+  maxAttempts: 10,
+  /** RANKER_RESTART_CEILING_MS — wall ceiling across all attempts. */
+  ceilingMs: 600000,
+  /** How long to keep polling state after a start before calling it failed.
+   *  A start that is still transitioning is NOT a failed start — Five9 reports
+   *  state 5–8s late (observed 2026-09-03). */
+  verifyMs: 15000,
+  /** Poll interval for both the verify window and the transitional-state wait. */
+  pollMs: 3000,
+  backoffBaseMs: 2000,
+  backoffCapMs: 60000,
+  /** Hard ceiling on waiting out a transitional state before firing a start. */
+  maxWaitMs: 180000,
+  /** RANKER_STOP_SETTLE_TIMEOUT_MS — how long to wait for a graceful stop to
+   *  actually land before touching the campaign's lists. */
+  stopSettleTimeoutMs: 30000,
+  /** Poll interval for the stop-settle wait. */
+  stopSettlePollMs: 2000,
+});
+
+/** Exponential backoff, capped: 2s, 4s, 8s, 16s, 32s, 60s, 60s, … Pure. */
+export function restartBackoffMs(attempt, { baseMs = DEFAULT_RESTART.backoffBaseMs, capMs = DEFAULT_RESTART.backoffCapMs } = {}) {
+  if (!(attempt >= 1)) return baseMs;
+  return Math.min(capMs, baseMs * (2 ** (attempt - 1)));
+}
+
+/**
+ * Wait for a graceful stop to SETTLE before doing anything else.
+ *
+ * THE MECHANISM BEHIND THE 2026-09-04 FAILURES. `stopCampaign` returns as soon
+ * as Five9 accepts it, but the campaign then sits in STOPPING while it drains
+ * calls in progress — and in that window Five9 refuses both the list write and
+ * a start ("Illegal campaign state STOPPING"). Firing either into it is not a
+ * retry, it is a guaranteed refusal. Warm is the bigger campaign (2,640
+ * records, 8 lists) and drains longest, which is why it failed twice.
+ *
+ * Bounded by a POLL COUNT, not wall clock, so it is deterministic under the
+ * tests' injected sleep.
+ *
+ * @returns {{settled:boolean, state:string|null, settle_ms:number, polls:number}}
+ *          settle_ms is the observed settle time — the number we need in
+ *          dial_priority_log to tune every other timeout here.
+ */
+export async function waitForStopSettle(campaignName, {
+  readState, sleep, log = () => {},
+  timeoutMs = DEFAULT_RESTART.stopSettleTimeoutMs,
+  pollMs = DEFAULT_RESTART.stopSettlePollMs,
+} = {}) {
+  const maxPolls = Math.max(0, Math.ceil(timeoutMs / Math.max(1, pollMs)));
+  let waited = 0;
+  let polls = 0;
+  let state = null;
+  try {
+    state = await readState();
+  } catch (err) {
+    // Unreadable is not settled, but it is also not a reason to hang: fall
+    // through and let the caller decide (it skips the write and restarts).
+    return { settled: false, state: null, settle_ms: waited, polls, error: err.message };
+  }
+  while (polls < maxPolls && state !== 'NOT_RUNNING') {
+    log(`[CapacityRanker] ${campaignName}: reads ${state || 'UNREADABLE'} — waiting for the stop to settle`);
+    await sleep(pollMs);
+    waited += pollMs;
+    polls += 1;
+    try {
+      state = await readState();
+    } catch (err) {
+      state = null;
+    }
+  }
+  return { settled: state === 'NOT_RUNNING', state, settle_ms: waited, polls };
+}
+
+/**
+ * Start a campaign and keep trying until it is verifiably RUNNING.
+ *
+ * Shared by the cycle's restart (src/capacity/applyDialPriority.js) and the
+ * self-healing sweeper (POST /n8n/capacity-ranker/heal) so both are bounded and
+ * verified the same way — one restart algorithm, one place to fix it.
+ *
+ * Per attempt: wait out any transitional state → fire ONE start → poll state
+ * for up to verifyMs → back off exponentially. Nothing throws out of here; an
+ * exception is a failed attempt, never the end of the loop.
+ *
+ * The budget is enforced on SUMMED SLEEP, not Date.now(), so it behaves
+ * identically under an injected clock.
+ *
+ * @returns {{restarted:boolean, attempts:number, error:string|null,
+ *            waited_ms:number, ack_at:number|null}}
+ */
+export async function restartCampaignVerified(campaignName, deps = {}) {
+  const {
+    startCampaign, readState, sleep, log = () => {},
+    maxAttempts = DEFAULT_RESTART.maxAttempts,
+    ceilingMs = DEFAULT_RESTART.ceilingMs,
+    verifyMs = DEFAULT_RESTART.verifyMs,
+    pollMs = DEFAULT_RESTART.pollMs,
+    backoffBaseMs = DEFAULT_RESTART.backoffBaseMs,
+    backoffCapMs = DEFAULT_RESTART.backoffCapMs,
+    maxWaitMs = DEFAULT_RESTART.maxWaitMs,
+  } = deps;
+
+  let waited = 0;
+  const wait = async (ms) => { waited += ms; await sleep(ms); };
+  let attempts = 0;
+  let restarted = false;
+  let lastErr = null;
+  let ackAt = null;
+
+  // ── Wait out a transitional state before firing a single start ──────────
+  // A start fired into STOPPING is refused outright and burns an attempt.
+  const maxDrainPolls = Math.max(0, Math.ceil(maxWaitMs / Math.max(1, pollMs)));
+  let state = null;
+  let startable = false;
+  try {
+    state = await readState();
+    for (let poll = 0; poll < maxDrainPolls && TRANSITIONAL_STATES.has(state); poll += 1) {
+      log(`[CapacityRanker] ${campaignName}: reads ${state} — waiting for it to become startable`);
+      await wait(pollMs);
+      state = await readState();
+    }
+    startable = !TRANSITIONAL_STATES.has(state);
+  } catch (err) {
+    // An unreadable state is not fatal — try the start anyway.
+    lastErr = err;
+    startable = true;
+  }
+  if (state === 'RUNNING') {
+    // Nothing to do: something already brought it back (a peer heal, a human).
+    return { restarted: true, attempts: 0, error: null, waited_ms: waited, ack_at: null };
+  }
+  if (!startable) {
+    return {
+      restarted: false,
+      attempts: 0,
+      error: `still ${state} after ${maxWaitMs}ms — never became startable`,
+      waited_ms: waited,
+      ack_at: null,
+    };
+  }
+
+  while (!restarted && attempts < maxAttempts && waited < ceilingMs) {
+    attempts += 1;
+    // A start that Five9 REFUSED explains the campaign's state better than the
+    // state read that follows it, so it wins the reported error.
+    let startErr = null;
+    let stateErr = null;
+    try {
+      await startCampaign({
+        id: null,
+        action_type: 'five9_start_campaign',
+        requires_approval: true,
+        action_payload: { campaign_name: campaignName },
+      });
+      if (ackAt === null) ackAt = Date.now();
+    } catch (err) {
+      // A refusal is a failed ATTEMPT, never the end of the loop. This is the
+      // line that would have kept the floor dialing on 2026-09-04.
+      startErr = err;
+    }
+
+    // Verify by POLLING, not by one read. Five9 reports state on a lag, so a
+    // single immediate read calls a healthy restart a failure — which is how a
+    // campaign that was actually coming back got declared dark.
+    const verifyPolls = Math.max(1, Math.ceil(verifyMs / Math.max(1, pollMs)));
+    for (let poll = 0; poll < verifyPolls && !restarted; poll += 1) {
+      await wait(pollMs);
+      try {
+        const s = await readState();
+        if (s === 'RUNNING') { restarted = true; lastErr = null; break; }
+        if (!TRANSITIONAL_STATES.has(s)) stateErr = new Error(`state reads ${s || 'unknown'} after start`);
+      } catch (err) {
+        stateErr = err;
+      }
+    }
+    if (!restarted) lastErr = startErr || stateErr || lastErr;
+
+    if (!restarted && attempts < maxAttempts && waited < ceilingMs) {
+      const backoff = restartBackoffMs(attempts, { baseMs: backoffBaseMs, capMs: backoffCapMs });
+      log(`[CapacityRanker] ${campaignName}: restart attempt ${attempts}/${maxAttempts} did not take (${lastErr?.message || 'state not RUNNING'}) — retrying in ${backoff}ms`);
+      await wait(backoff);
+    }
+  }
+
+  return {
+    restarted,
+    attempts,
+    error: restarted ? null : (lastErr?.message || 'campaign never read RUNNING'),
+    waited_ms: waited,
+    ack_at: ackAt,
+  };
+}
 
 /* ─── In-flight cycle registry ───────────────────────────────────────────── *
  *
@@ -255,15 +469,18 @@ export function verifyListOrder(intended, afterLists) {
  *        already NOT_RUNNING is reordered and left stopped (prior state is
  *        restored, never assumed). Never both campaigns at once — the TIERS
  *        loop is sequential and must stay that way.
- * @param {number} [deps.restartAttempts=3]
- * @param {number} [deps.restartBackoffMs=2000]  Wait between restart attempts.
- * @param {number} [deps.restartSettleMs=5000]
- *        Wait after Five9 accepts a start before reading state back. Five9
- *        reports state asynchronously (5-8s lag observed 2026-09-03), so an
- *        immediate read reports a healthy restart as a failure.
- * @param {number} [deps.restartFinalWaitMs=10000]
- *        One last confirmation read after every attempt has failed, before
- *        declaring the campaign dark.
+ * @param {number} [deps.restartAttempts=10]     RANKER_RESTART_MAX_ATTEMPTS
+ * @param {number} [deps.restartCeilingMs=600000] RANKER_RESTART_CEILING_MS
+ * @param {number} [deps.restartVerifyMs=15000]
+ *        How long to poll state after each start before judging the attempt
+ *        failed. Five9 reports state asynchronously (5-8s lag observed
+ *        2026-09-03), so one immediate read calls a healthy restart a failure.
+ * @param {number} [deps.stopSettleTimeoutMs=30000] RANKER_STOP_SETTLE_TIMEOUT_MS
+ *        How long to wait for the graceful stop to actually land (state reads
+ *        NOT_RUNNING) before writing lists. On a timeout the reorder is
+ *        SKIPPED and the campaign is restarted — the run aborts cleanly rather
+ *        than writing into a draining campaign.
+ * @param {number} [deps.stopSettlePollMs=2000]
  * @param {number} [deps.restartPollMs=3000]
  *        How often to re-read state while the campaign is still STOPPING.
  * @param {number} [deps.restartMaxWaitMs=180000]
@@ -279,9 +496,16 @@ export async function applyDialPriority(rankResult, deps) {
   const {
     getOutboundCampaign, modifyCampaignLists, five9WritesEnabled,
     stopCampaign = null, startCampaign = null, getCampaignState = null,
-    cycleCampaigns = false, restartAttempts = 3, restartBackoffMs = 2000,
-    restartSettleMs = 5000, restartFinalWaitMs = 10000,
-    restartPollMs = 3000, restartMaxWaitMs = 180000,
+    cycleCampaigns = false,
+    restartAttempts = DEFAULT_RESTART.maxAttempts,
+    restartCeilingMs = DEFAULT_RESTART.ceilingMs,
+    restartVerifyMs = DEFAULT_RESTART.verifyMs,
+    restartBackoffMs = DEFAULT_RESTART.backoffBaseMs,
+    restartBackoffCapMs = DEFAULT_RESTART.backoffCapMs,
+    stopSettleTimeoutMs = DEFAULT_RESTART.stopSettleTimeoutMs,
+    stopSettlePollMs = DEFAULT_RESTART.stopSettlePollMs,
+    restartPollMs = DEFAULT_RESTART.pollMs,
+    restartMaxWaitMs = DEFAULT_RESTART.maxWaitMs,
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
     log = console.log,
   } = deps || {};
@@ -331,6 +555,7 @@ export async function applyDialPriority(rankResult, deps) {
     entry.cycled = mustCycle;
     entry.was_running = wasRunning;
     let stoppedAt = null;
+    let skipWrite = false;
 
     // Never both campaigns dark at once. Stopping this one while another Data
     // campaign is already down leaves the floor with NO Data campaign dialing
@@ -372,6 +597,10 @@ export async function applyDialPriority(rankResult, deps) {
       continue;
     }
 
+    const readState = async () => (getCampaignState
+      ? String((await getCampaignState(campaignName))?.state || '').toUpperCase()
+      : String((await getOutboundCampaign(campaignName))?.state || '').toUpperCase());
+
     if (mustCycle) {
       // Marked BEFORE the stop, so the watchdog does not page about the brief
       // NOT_RUNNING this is about to cause. Cleared in the finally below no
@@ -393,6 +622,30 @@ export async function applyDialPriority(rankResult, deps) {
       }
       stoppedAt = Date.now();
       log(`[CapacityRanker] ${campaignName}: stopped for reorder`);
+
+      // ── WAIT FOR THE STOP TO SETTLE BEFORE TOUCHING ANYTHING ────────────
+      //
+      // stopCampaign returns the moment Five9 accepts it; the campaign then
+      // sits in STOPPING while it drains. Both the list write and the restart
+      // are refused in that window. So poll until state actually reads
+      // NOT_RUNNING, and record how long it took — settle_ms is the number
+      // that tells us whether every other timeout here is set right.
+      const settle = await waitForStopSettle(campaignName, {
+        readState, sleep, log, timeoutMs: stopSettleTimeoutMs, pollMs: stopSettlePollMs,
+      });
+      entry.settle_ms = settle.settle_ms;
+      entry.settled = settle.settled;
+      if (settle.settled) {
+        log(`[CapacityRanker] ${campaignName}: stop settled in ${settle.settle_ms}ms`);
+      } else {
+        // ABORT CLEANLY. Writing lists into a campaign that has not drained is
+        // a guaranteed refusal, and a refusal here costs the campaign a longer
+        // dark window for nothing. Skip the reorder; the finally still brings
+        // the campaign back.
+        skipWrite = true;
+        entry.skipped_reason = `not reordered: the graceful stop did not settle within ${stopSettleTimeoutMs}ms (state reads ${settle.state || 'UNREADABLE'}) — restarting without reordering`;
+        log(`[CapacityRanker] ${campaignName}: ${entry.skipped_reason}`);
+      }
     }
 
     let write;
@@ -400,115 +653,58 @@ export async function applyDialPriority(rankResult, deps) {
       // Same op the approve_action path runs; the gate inside it (flag → lock →
       // audit event) is unchanged. confirm_token restates the campaign name as
       // that op requires.
-      write = await modifyCampaignLists({
-        id: null,
-        action_type: 'five9_modify_campaign_lists',
-        requires_approval: true,
-        action_payload: {
-          campaign_name: campaignName,
-          confirm_token: campaignName,
-          lists: block.lists,
-        },
-      });
+      if (!skipWrite) {
+        write = await modifyCampaignLists({
+          id: null,
+          action_type: 'five9_modify_campaign_lists',
+          requires_approval: true,
+          action_payload: {
+            campaign_name: campaignName,
+            confirm_token: campaignName,
+            lists: block.lists,
+          },
+        });
+      }
     } finally {
       if (mustCycle) {
-        let restarted = false;
-        let lastErr = null;
-        // The campaign is dialing again the moment Five9 accepts the start.
-        // Downtime is measured to THAT ack, not to the confirmation read
-        // below, which deliberately waits out the reporting lag.
-        let ackAt = null;
-        const readState = async () => (getCampaignState
-          ? String((await getCampaignState(campaignName))?.state || '').toUpperCase()
-          : String((await getOutboundCampaign(campaignName))?.state || '').toUpperCase());
-
-        // ── Wait out STOPPING before firing a single start ────────────────
-        //
-        // A graceful stop does not land instantly: Five9 reports STOPPING
-        // while it drains calls in progress, and REFUSES startCampaign for
-        // that whole window ("Illegal campaign state STOPPING"). A start
-        // fired into it is not a retry — it is a guaranteed refusal that
-        // burns an attempt. Because a throwing start skips the settle wait,
-        // the old loop spent its entire budget (2s + 2s + a 10s final read)
-        // inside a 25s drain and declared a healthy campaign dark. That took
-        // the floor down twice on 2026-09-04.
-        //
-        // So: poll until the campaign is actually startable, bounded by
-        // restartMaxWaitMs so a campaign genuinely stuck in STOPPING is still
-        // reported rather than looped on forever. The bound is a POLL COUNT,
-        // not a wall-clock deadline, so it behaves identically under the
-        // tests' injected clock as it does in production.
-        const maxDrainPolls = Math.max(0, Math.ceil(restartMaxWaitMs / Math.max(1, restartPollMs)));
-        let drainState = null;
-        let drained = false;
-        try {
-          drainState = await readState();
-          for (let poll = 0; poll < maxDrainPolls && TRANSITIONAL_STATES.has(drainState); poll += 1) {
-            log(`[CapacityRanker] ${campaignName}: reads ${drainState} — waiting for it to become startable`);
-            await sleep(restartPollMs);
-            drainState = await readState();
-          }
-          drained = !TRANSITIONAL_STATES.has(drainState);
-        } catch (err) {
-          // An unreadable state is not fatal — fall through and try the start.
-          lastErr = err;
-          drained = true;
-        }
-        if (!drained) {
-          lastErr = new Error(`still ${drainState} after ${restartMaxWaitMs}ms — never became startable`);
-        }
-
-        for (let attempt = 1; attempt <= restartAttempts && !restarted && drained; attempt += 1) {
-          try {
-            await startCampaign({
-              id: null,
-              action_type: 'five9_start_campaign',
-              requires_approval: true,
-              action_payload: { campaign_name: campaignName },
-            });
-            if (ackAt === null) ackAt = Date.now();
-            // Five9 reports campaign state asynchronously: getCampaignState
-            // still read NOT_RUNNING ~5s after a start that had already been
-            // accepted (STEP 0, 2026-09-03 — stop and start both lagged 5-8s).
-            // Reading immediately would call a healthy restart a failure and
-            // fire the CRITICAL alarm, so settle first.
-            await sleep(restartSettleMs);
-            const state = await readState();
-            restarted = state === 'RUNNING';
-            if (!restarted) lastErr = new Error(`state reads ${state || 'unknown'} after start`);
-          } catch (err) {
-            lastErr = err;
-          }
-          if (!restarted && attempt < restartAttempts) await sleep(restartBackoffMs);
-        }
-
-        // Last word before declaring the floor dark: one more read after a
-        // longer wait. A stale read must never be the reason we page someone.
-        if (!restarted) {
-          try {
-            await sleep(restartFinalWaitMs);
-            const state = await readState();
-            restarted = state === 'RUNNING';
-            if (restarted) lastErr = null;
-            else if (!lastErr) lastErr = new Error(`state reads ${state || 'unknown'} after start`);
-          } catch (err) {
-            if (!lastErr) lastErr = err;
-          }
-        }
+        // ONE restart algorithm, shared with the self-healing sweeper: wait out
+        // any transitional state, then start and verify by polling, up to
+        // restartAttempts over restartCeilingMs with exponential backoff.
+        // Nothing throws out of it — an exception is a failed attempt, not the
+        // end of the loop. That is the difference between a campaign that comes
+        // back and the two hours "Data - Warm Leads less than 30" spent dark on
+        // 2026-09-04.
+        const r = await restartCampaignVerified(campaignName, {
+          startCampaign, readState, sleep, log,
+          maxAttempts: restartAttempts,
+          ceilingMs: restartCeilingMs,
+          verifyMs: restartVerifyMs,
+          pollMs: restartPollMs,
+          backoffBaseMs: restartBackoffMs,
+          backoffCapMs: restartBackoffCapMs,
+          maxWaitMs: restartMaxWaitMs,
+        });
 
         // Unconditional. A campaign that did NOT come back is dark, not
         // cycling, and the very next watchdog poll must page about it.
         clearCycling(campaignName);
-        entry.downtime_ms = stoppedAt ? (restarted && ackAt ? ackAt : Date.now()) - stoppedAt : null;
-        entry.restarted = restarted;
-        if (!restarted) {
-          entry.restart_error = lastErr?.message || 'unknown';
-          log(`[CapacityRanker] CRITICAL ${campaignName} DID NOT RESTART after ${restartAttempts} attempts (${entry.restart_error}) — campaign is STOPPED and the floor is not dialing it`);
+        // The campaign is dialing again the moment Five9 accepts the start, so
+        // downtime is measured to THAT ack — not to the verification polling
+        // that deliberately waits out Five9's reporting lag.
+        entry.downtime_ms = stoppedAt ? (r.restarted && r.ack_at ? r.ack_at : Date.now()) - stoppedAt : null;
+        entry.restarted = r.restarted;
+        entry.restart_attempts = r.attempts;
+        if (!r.restarted) {
+          entry.restart_error = r.error || 'unknown';
+          log(`[CapacityRanker] CRITICAL ${campaignName} DID NOT RESTART after ${r.attempts} attempts over ${r.waited_ms}ms (${entry.restart_error}) — campaign is STOPPED and the floor is not dialing it`);
         } else {
-          log(`[CapacityRanker] ${campaignName}: restarted after ${entry.downtime_ms}ms`);
+          log(`[CapacityRanker] ${campaignName}: restarted after ${entry.downtime_ms}ms (${r.attempts} attempt${r.attempts === 1 ? '' : 's'})`);
         }
       }
     }
+    // The stop never settled, so the reorder was deliberately not attempted.
+    // The campaign has been restarted above; this run simply did not apply.
+    if (skipWrite) continue;
     entry.write = write;
     if (write?.deferred || write?.skipped) {
       throw new Error(`${campaignName}: write did not run (${write.reason || 'deferred'}) — not retrying`);
@@ -532,6 +728,12 @@ export async function applyDialPriority(rankResult, deps) {
   result.restart_failures = TIERS
     .filter((t) => result.campaigns[t]?.cycled && result.campaigns[t]?.restarted === false)
     .map((t) => CAMPAIGNS[t]);
+  // Observability for dial_priority_log: how long the graceful stops took to
+  // settle, and how many start attempts the restarts needed. These are the two
+  // numbers that say whether the budgets above are set right.
+  const cycled = TIERS.map((t) => result.campaigns[t]).filter((e) => e?.cycled);
+  result.settle_ms = cycled.reduce((a, e) => a + (e.settle_ms || 0), 0) || null;
+  result.restart_attempts = cycled.reduce((a, e) => a + (e.restart_attempts || 0), 0) || null;
   result.applied = !dryRun && result.restart_failures.length === 0 && TIERS.every((t) => {
     const e = result.campaigns[t];
     return e && (e.written ? e.verified === true : !e.changed);

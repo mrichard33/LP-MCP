@@ -18,15 +18,25 @@
  * CYCLING (CAPACITY_RANKER_CYCLE_CAMPAIGNS, default false): the list write
  * refuses a RUNNING campaign, and both Data campaigns run all day. With this
  * flag 'true' AND mode live AND the clock inside 07:00–20:30 ET, each campaign
- * is gracefully stopped → reordered → restarted, one at a time, with the
- * restart in a finally block (src/capacity/applyDialPriority.js). Outside the
- * window the cycle is skipped and a warning is logged. A campaign that fails
- * to restart forces applied=false and a 500 (restart_failures in the log row).
+ * is gracefully stopped → waited out until the stop settles → reordered →
+ * restarted, one at a time, with the restart in a finally block
+ * (src/capacity/applyDialPriority.js). Outside the window the cycle is skipped
+ * and a warning is logged. A campaign that fails to restart forces
+ * applied=false, a 500 (restart_failures in the log row), a durable alert, and
+ * cycle_disabled_until — no further cycling today, whatever the flag says.
  *
  * GET /n8n/capacity-ranker/campaign-state — polled by the n8n watchdog
  * (OPS - Capacity Ranker Campaign Watchdog): 200 when both Data campaigns read
  * RUNNING, 503 otherwise. It also SENDS the GroupMe alert when one is not,
  * because the bot id lives here and not in n8n — see checkCampaignState.
+ *
+ * POST /n8n/capacity-ranker/heal — the same watchdog calls this when
+ * campaign-state reports all_running:false. It restarts any campaign the last
+ * failed cycle left NOT_RUNNING, verified, and records the outcome. Idempotent:
+ * it only ever starts, never stops, and no-ops when everything is up. This is
+ * the cover for the two failure modes the run cannot cover itself — a process
+ * death between stop and start, and retries that genuinely exhaust. See
+ * healCampaigns.
  *
  * Body: { slot_date?: "YYYY-MM-DD" } — defaults to tomorrow, America/New_York.
  * No auth, matching the /n8n/* convention (n8n hourly cron is the caller).
@@ -65,7 +75,9 @@ import { sendGroupMeMessage } from '../groupme.js';
 import { tryAcquireLock, releaseLock } from '../services/outbound-locks.js';
 import { reportAlertCondition } from '../alert-state.js';
 import { rankMarkets, isMaterialChange, DEFAULT_SWAP_MARGIN, MARKET_CODES } from '../capacity/rankMarkets.js';
-import { applyDialPriority, CAMPAIGNS, isCycling } from '../capacity/applyDialPriority.js';
+import {
+  applyDialPriority, CAMPAIGNS, isCycling, restartCampaignVerified, DEFAULT_RESTART,
+} from '../capacity/applyDialPriority.js';
 import {
   getMarketPerformance, countBottomHalfStreaks, resolvePerfWeight,
 } from '../capacity/marketPerformance.js';
@@ -172,6 +184,67 @@ export function cycleEnabled(raw = process.env.CAPACITY_RANKER_CYCLE_CAMPAIGNS) 
   return String(raw || 'false').trim().toLowerCase() === 'true';
 }
 
+/** Positive integer env, or the default. */
+export function intEnv(raw, fallback) {
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * Restart / settle budgets, from env. Documented in .env.example.
+ * These are the knobs the 2026-09-04 outage was about: the old fixed 3 × 2s
+ * could not absorb a graceful stop that took 25s to drain.
+ */
+export function restartTuning(env = process.env) {
+  return {
+    restartAttempts: intEnv(env.RANKER_RESTART_MAX_ATTEMPTS, DEFAULT_RESTART.maxAttempts),
+    restartCeilingMs: intEnv(env.RANKER_RESTART_CEILING_MS, DEFAULT_RESTART.ceilingMs),
+    stopSettleTimeoutMs: intEnv(env.RANKER_STOP_SETTLE_TIMEOUT_MS, DEFAULT_RESTART.stopSettleTimeoutMs),
+  };
+}
+
+/**
+ * The instant of the next ET midnight — how long a failed restart disables
+ * cycling for. "The rest of the day", literally.
+ *
+ * Derived by probing the two possible US Eastern offsets rather than hardcoding
+ * one, so it is right in both EDT and EST.
+ */
+export function endOfDayET(now = new Date()) {
+  const next = addDays(todayET(now), 1);
+  for (const offset of ['04', '05']) { // EDT = UTC-4, EST = UTC-5
+    const candidate = new Date(`${next}T${offset}:00:00Z`);
+    if (todayET(candidate) === next) return candidate;
+  }
+  return new Date(`${next}T05:00:00Z`);
+}
+
+/**
+ * CAP THE BLAST RADIUS. Any run that ends with a restart failure stamps
+ * cycle_disabled_until on its log row; every later run reads the most recent
+ * stamp and refuses to cycle until it passes. Three failures in one afternoon
+ * (dial_priority_log 18, 19, 24) should have stopped the cycling automatically
+ * after the FIRST one. The ranking is still computed and still logged — only
+ * the stop/restart is withheld.
+ *
+ * Best effort: a read failure never blocks a run. Mark clears it early by
+ * NULLing cycle_disabled_until on the row that set it.
+ */
+async function readCycleDisabledUntilLive() {
+  if (!supabase) return null;
+  const { data, error } = await supabase
+    .from(TABLE)
+    .select('cycle_disabled_until')
+    .not('cycle_disabled_until', 'is', null)
+    .order('ran_at', { ascending: false })
+    .limit(1);
+  if (error) {
+    if (isMissingTable(error)) throw new MissingTableError(error);
+    throw new Error(`${TABLE} cycle_disabled_until read failed: ${error.message}`);
+  }
+  return data?.[0]?.cycle_disabled_until ?? null;
+}
+
 /* ─── Run lock: one ranker run at a time, fleet-wide ─────────────────────── *
  *
  * The Five9 write gate (src/five9/admin-writes.js) already serializes each
@@ -212,7 +285,17 @@ const RUN_LOCK_TRIGGER = 'run';
  * run leaks the lock for at most this long, which costs nothing — the cron is
  * hourly, so the next run is 60 minutes away regardless.
  */
-const RUN_LOCK_TTL_SEC = parseInt(process.env.CAPACITY_RANKER_LOCK_TTL_SEC || '600', 10);
+export function runLockTtlSec(env = process.env) {
+  // RANKER_LOCK_TTL_MS is the documented knob (default 900000 = 15 minutes,
+  // longer than the worst observed run now that a restart may spend up to ten
+  // minutes coming back). It WINS over the older CAPACITY_RANKER_LOCK_TTL_SEC,
+  // which stays honoured so an existing Railway value still means something.
+  const ms = parseInt(env.RANKER_LOCK_TTL_MS, 10);
+  if (Number.isFinite(ms) && ms > 0) return Math.ceil(ms / 1000);
+  const sec = parseInt(env.CAPACITY_RANKER_LOCK_TTL_SEC, 10);
+  if (Number.isFinite(sec) && sec > 0) return sec;
+  return 900;
+}
 
 async function acquireRunLockLive() {
   return tryAcquireLock({
@@ -220,7 +303,7 @@ async function acquireRunLockLive() {
     trigger_id: RUN_LOCK_TRIGGER,
     sender: 'capacity_ranker',
     message_preview: 'capacity-ranker/run',
-    ttl_seconds: RUN_LOCK_TTL_SEC,
+    ttl_seconds: runLockTtlSec(),
   });
 }
 
@@ -256,6 +339,7 @@ function applyLive(rankResult, { cycleCampaigns = false } = {}) {
     startCampaign: executeStartCampaign,
     five9WritesEnabled,
     cycleCampaigns,
+    ...restartTuning(),
   });
 }
 
@@ -290,7 +374,9 @@ export async function runCapacityRanker(input = {}, deps = {}) {
     return {
       status: 409,
       body: {
-        error: 'capacity ranker is already running — this run was skipped to avoid two concurrent runs stopping both Data campaigns at once',
+        error: 'ranker_already_running',
+        message: 'capacity ranker is already running — this run was skipped to avoid two concurrent runs stopping both Data campaigns at once',
+        lock_acquired_at: lock?.acquired_at ?? null,
         lock_held_by: heldBy,
         lock_expires_at: lock?.expires_at ?? null,
         slot_date: slotDate,
@@ -320,6 +406,8 @@ async function runRankerLocked(slotDate, deps = {}) {
     readAppliedHistory = readAppliedHistoryLive,
     getPerformance = getMarketPerformance,
     insertLog = insertLogLive,
+    readCycleDisabledUntil = readCycleDisabledUntilLive,
+    raiseAlert = raiseRestartAlert,
     apply = applyLive,
     mode = resolveMode(),
     swapMargin = resolveSwapMargin(),
@@ -374,9 +462,28 @@ async function runRankerLocked(slotDate, deps = {}) {
   let applyResult = null;
   let errorMessage = null;
   let status = 200;
+  let disableCyclingUntil = null;
 
-  const cycle = cycleEnabled() && withinCycleWindow(now);
-  if (cycleEnabled() && !cycle) {
+  // A restart failure earlier today disables cycling for the rest of the day.
+  // Best effort in BOTH directions: an unreadable marker must not silently
+  // re-arm cycling, so a failed read is treated as "do not cycle" and warned.
+  let cycleDisabledUntil = null;
+  let cycleBlocked = false;
+  if (cycleEnabled()) {
+    try {
+      cycleDisabledUntil = await readCycleDisabledUntil();
+      cycleBlocked = !!cycleDisabledUntil && new Date(cycleDisabledUntil) > now;
+    } catch (err) {
+      if (err instanceof MissingTableError) throw err;
+      cycleBlocked = true;
+      warnings.push(`could not read cycle_disabled_until (${err.message}) — not cycling this run; the ranking is still computed and logged`);
+    }
+  }
+
+  const cycle = cycleEnabled() && withinCycleWindow(now) && !cycleBlocked;
+  if (cycleBlocked && cycleDisabledUntil) {
+    warnings.push(`cycling is DISABLED until ${cycleDisabledUntil} — an earlier run failed to restart a campaign. The ranking is computed and logged, but no campaign is stopped. Clear cycle_disabled_until in dial_priority_log to re-arm.`);
+  } else if (cycleEnabled() && !cycle && !cycleBlocked) {
     warnings.push('outside the 07:00–20:30 ET cycle window — campaigns will not be stopped, so a RUNNING campaign will refuse the reorder');
   }
   if (changed && mode === 'live') {
@@ -387,6 +494,22 @@ async function runRankerLocked(slotDate, deps = {}) {
         errorMessage = `CRITICAL: campaign(s) did not restart after reorder: ${applyResult.restart_failures.join(', ')}`;
         status = 500;
         log(`[CapacityRanker] ${errorMessage}`);
+        // CAP THE BLAST RADIUS: no more cycling today.
+        disableCyclingUntil = endOfDayET(now).toISOString();
+        warnings.push(`cycling disabled until ${disableCyclingUntil} after this restart failure — clear cycle_disabled_until in dial_priority_log to re-arm`);
+        // DURABLE beyond the log line: the alert queue outlives this process,
+        // which a console.log does not. Wrapped on its own so a failure to
+        // ALERT can never replace the CRITICAL message with an alerting error.
+        try {
+          await raiseAlert({
+            campaigns: applyResult.restart_failures,
+            message: errorMessage,
+            disabledUntil: disableCyclingUntil,
+            log,
+          });
+        } catch (alertErr) {
+          log(`[CapacityRanker] WARN restart-failure alert failed: ${alertErr.message}`);
+        }
       }
     } catch (err) {
       errorMessage = err.message;
@@ -413,6 +536,9 @@ async function runRankerLocked(slotDate, deps = {}) {
       ? Object.values(applyResult.campaigns || {}).reduce((a, c) => a + (c.downtime_ms || 0), 0) || null
       : null,
     restart_failures: applyResult?.restart_failures?.length ? applyResult.restart_failures : null,
+    settle_ms: applyResult?.settle_ms ?? null,
+    restart_attempts: applyResult?.restart_attempts ?? null,
+    cycle_disabled_until: disableCyclingUntil,
   });
 
   return {
@@ -447,9 +573,242 @@ async function runRankerLocked(slotDate, deps = {}) {
       compared_to: prev ? { log_id: prev.id, ran_at: prev.ran_at, slot_date: prev.slot_date } : null,
       source: { last_sweep_at: capacity.last_sweep_at, stale: capacity.stale === true },
       warnings,
+      cycled: applyResult ? Object.values(applyResult.campaigns || {}).some((c) => c.cycled) : false,
+      cycle_disabled_until: disableCyclingUntil || (cycleBlocked ? cycleDisabledUntil : null),
       log_id: logId,
       ...(applyResult ? { apply: applyResult } : {}),
       ...(errorMessage ? { error: errorMessage } : {}),
+    },
+  };
+}
+
+/**
+ * A restart failure must outlive the process that saw it.
+ *
+ * The console line and the dial_priority_log row are both good, but neither
+ * puts the failure in front of a human. This queues an agent_actions
+ * notification (the existing durable alert path) so the failure survives the
+ * request, the deploy, and the log retention window. Best effort by design: an
+ * alert that cannot be queued must never turn a 500 into an exception.
+ */
+export async function raiseRestartAlert({ campaigns, message, disabledUntil, log = console.log }) {
+  const text = `🚨 CAPACITY RANKER: ${campaigns.join(', ')} did NOT restart after a list reorder. The floor is not dialing ${campaigns.length > 1 ? 'them' : 'it'}. Cycling is disabled until ${disabledUntil}. POST /n8n/capacity-ranker/heal or start the campaign in Five9 now.`;
+  try {
+    if (supabase) {
+      await supabase.from('agent_actions').insert({
+        action_type: 'send_notification',
+        target_system: 'groupme',
+        target_entity: 'campaign',
+        target_id: campaigns.join(','),
+        action_payload: {
+          tier: 'OPS',
+          status: 'CRITICAL',
+          message: text,
+          narrative: message,
+          next_step: 'POST /n8n/capacity-ranker/heal (the watchdog does this automatically within 5 minutes) or start the campaign in the Five9 admin UI.',
+          action_verb: 'RESTART CAMPAIGN',
+          notification_class: 'incident',
+          capacity_ranker: { campaigns, cycle_disabled_until: disabledUntil },
+        },
+        reasoning: message,
+        confidence: 1.0,
+        rule_applied: 'CAPACITY_RANKER_RESTART_FAILURE',
+        status: 'pending',
+        requires_approval: false,
+        priority: 10,
+      });
+    }
+  } catch (err) {
+    log(`[CapacityRanker] WARN could not queue the restart-failure alert: ${err.message}`);
+  }
+  try {
+    await sendGroupMeMessage(text, { noDedup: true });
+  } catch (err) {
+    log(`[CapacityRanker] WARN could not send the restart-failure GroupMe alert: ${err.message}`);
+  }
+}
+
+/* ─── Self-healing sweeper: POST /n8n/capacity-ranker/heal ───────────────── *
+ *
+ * THE PART THAT WOULD HAVE PREVENTED 2026-09-04. Two things the run itself
+ * cannot cover:
+ *   - the finally block cannot survive a process death between stop and start;
+ *   - retries can genuinely exhaust, however long the budget.
+ * Either way a campaign is left NOT_RUNNING and nothing in the run will ever
+ * come back for it. On 2026-09-04 that was two hours of silence on
+ * "Data - Warm Leads less than 30".
+ *
+ * So the watchdog that already DETECTS now also REPAIRS: it reads the most
+ * recent dial_priority_log row carrying restart_failures, checks each named
+ * campaign's LIVE state, and starts anything that is NOT_RUNNING — verified,
+ * with the same bounded restart the cycle uses.
+ *
+ * IDEMPOTENT AND SAFE TO CALL REPEATEDLY. It never stops anything, it only
+ * starts; a campaign that already reads RUNNING is a no-op. Calling it when
+ * everything is healthy does nothing and says so.
+ *
+ * The heal budget is deliberately shorter than the cycle's: the n8n watchdog
+ * calls this every five minutes, so ten minutes of retrying inside one HTTP
+ * request buys nothing that the next poll would not.
+ */
+
+export const HEAL_BUDGET = Object.freeze({
+  maxAttempts: 2,
+  ceilingMs: 45000,
+  verifyMs: 12000,
+  pollMs: 3000,
+});
+
+async function readLastRestartFailureLive() {
+  if (!supabase) throw new Error('Supabase not configured');
+  const { data, error } = await supabase
+    .from(TABLE)
+    .select('id, ran_at, restart_failures, healed_at, cycle_disabled_until')
+    .not('restart_failures', 'is', null)
+    .order('ran_at', { ascending: false })
+    .limit(1);
+  if (error) {
+    if (isMissingTable(error)) throw new MissingTableError(error);
+    throw new Error(`${TABLE} restart_failures read failed: ${error.message}`);
+  }
+  return data?.[0] ?? null;
+}
+
+async function markHealedLive(id, healedAt) {
+  if (!supabase || !id) return;
+  const { error } = await supabase.from(TABLE).update({ healed_at: healedAt }).eq('id', id);
+  if (error) throw new Error(`${TABLE} healed_at update failed: ${error.message}`);
+}
+
+/**
+ * @returns {{status:number, body:object}} 200 when nothing is left dark
+ *          (healed, or already RUNNING, or nothing to do); 503 when a campaign
+ *          is still NOT_RUNNING after the attempt, so the n8n execution goes
+ *          red and somebody looks.
+ */
+export async function healCampaigns(deps = {}) {
+  const {
+    readLastRestartFailure = readLastRestartFailureLive,
+    getOutbound = getOutboundCampaign,
+    startCampaign = executeStartCampaign,
+    insertLog = insertLogLive,
+    markHealed = markHealedLive,
+    sendAlert = (text) => sendGroupMeMessage(text, { noDedup: true }),
+    sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+    now = new Date(),
+    log = console.log,
+  } = deps;
+
+  const source = await readLastRestartFailure();
+  const names = Array.isArray(source?.restart_failures)
+    ? source.restart_failures.filter(Boolean)
+    : [];
+  if (!names.length) {
+    log('[CapacityRanker] HEAL: no dial_priority_log row carries restart_failures — nothing to heal');
+    return {
+      status: 200,
+      body: { healed: [], already_running: [], failed: [], source_log_id: source?.id ?? null, no_op: true, checked_at: now.toISOString() },
+    };
+  }
+
+  const healed = [];
+  const alreadyRunning = [];
+  const failed = [];
+
+  for (const campaign of names) {
+    const readState = async () => String((await getOutbound(campaign))?.state || '').toUpperCase();
+    let state = null;
+    try {
+      state = await readState();
+    } catch (err) {
+      state = null;
+    }
+    if (state === 'RUNNING') {
+      alreadyRunning.push(campaign);
+      continue;
+    }
+    if (!state) {
+      failed.push({ campaign, error: 'state is UNREADABLE — refusing to guess; Five9 may be unreachable' });
+      continue;
+    }
+    log(`[CapacityRanker] HEAL: ${campaign} reads ${state} — starting it`);
+    // restartCampaignVerified waits out STOPPING/STARTING before firing, so a
+    // heal that lands mid-cycle does not fight the run that is already there.
+    const r = await restartCampaignVerified(campaign, {
+      startCampaign, readState, sleep, log,
+      maxAttempts: HEAL_BUDGET.maxAttempts,
+      ceilingMs: HEAL_BUDGET.ceilingMs,
+      verifyMs: HEAL_BUDGET.verifyMs,
+      pollMs: HEAL_BUDGET.pollMs,
+      maxWaitMs: HEAL_BUDGET.ceilingMs,
+    });
+    if (r.restarted) healed.push(campaign);
+    else failed.push({ campaign, error: r.error, attempts: r.attempts });
+  }
+
+  const healedAt = now.toISOString();
+  const outcome = failed.length ? 'heal_failed' : 'healed';
+  const summary = `heal: ${outcome} — healed=[${healed.join(', ')}] already_running=[${alreadyRunning.join(', ')}] failed=[${failed.map((f) => f.campaign).join(', ')}] (source dial_priority_log id ${source?.id ?? '?'})`;
+  log(`[CapacityRanker] ${summary}`);
+
+  // The outcome row: a durable record that a heal ran and what it did. mode is
+  // 'heal' so these never mix with ranking runs, and ranking is [] because a
+  // heal computes no ranking — it only restarts what a ranking run left dark.
+  let logId = null;
+  try {
+    logId = await insertLog({
+      slot_date: todayET(now),
+      ranking: [],
+      unknown_markets: [],
+      changed: false,
+      applied: false,
+      mode: 'heal',
+      error_message: summary,
+      scoring_basis: 'heal',
+      cycled: false,
+      restart_failures: failed.length ? failed.map((f) => f.campaign) : null,
+      restart_attempts: null,
+      healed_at: healed.length ? healedAt : null,
+    });
+  } catch (err) {
+    log(`[CapacityRanker] WARN heal outcome row could not be written: ${err.message}`);
+  }
+
+  // Stamp the row that recorded the failure, so a later heal (and a human
+  // reading the log) can see the incident was closed and when.
+  if (healed.length && source?.id) {
+    try {
+      await markHealed(source.id, healedAt);
+    } catch (err) {
+      log(`[CapacityRanker] WARN could not stamp healed_at on dial_priority_log ${source.id}: ${err.message}`);
+    }
+  }
+
+  // Speak only when something actually happened. A no-op heal every five
+  // minutes must not turn into a five-minute alarm.
+  if (healed.length || failed.length) {
+    const text = failed.length
+      ? `🚨 CAPACITY RANKER HEAL FAILED: ${failed.map((f) => f.campaign).join(', ')} is STILL not RUNNING (${failed[0].error}). Start it in Five9 now.`
+      : `✅ CAPACITY RANKER HEAL: restarted ${healed.join(', ')} — the floor is dialing ${healed.length > 1 ? 'them' : 'it'} again. Cycling stays disabled until Mark clears cycle_disabled_until.`;
+    try {
+      await sendAlert(text);
+    } catch (err) {
+      log(`[CapacityRanker] WARN heal alert could not be sent: ${err.message}`);
+    }
+  }
+
+  return {
+    status: failed.length ? 503 : 200,
+    body: {
+      outcome,
+      healed,
+      already_running: alreadyRunning,
+      failed,
+      no_op: healed.length === 0 && failed.length === 0,
+      source_log_id: source?.id ?? null,
+      healed_at: healed.length ? healedAt : null,
+      log_id: logId,
+      checked_at: healedAt,
     },
   };
 }
@@ -620,5 +979,17 @@ export function registerCapacityRankerRoutes(app) {
       res.status(500).json({ error: err.message });
     }
   });
-  console.log('[REST API] Registered: POST /n8n/capacity-ranker/run (CAPACITY_RANKER_MODE=' + resolveMode() + ', CAPACITY_RANKER_CYCLE_CAMPAIGNS=' + cycleEnabled() + '), GET /n8n/capacity-ranker/campaign-state');
+  // Self-healing sweeper. The same watchdog workflow calls this when
+  // campaign-state reports all_running:false. Idempotent — it only ever
+  // STARTS a campaign, never stops one, and no-ops when everything is up.
+  app.post('/n8n/capacity-ranker/heal', async (req, res) => {
+    try {
+      const { status, body } = await healCampaigns();
+      res.status(status).json(body);
+    } catch (err) {
+      console.error('[CapacityRanker] heal failed:', err.message);
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  });
+  console.log('[REST API] Registered: POST /n8n/capacity-ranker/run (CAPACITY_RANKER_MODE=' + resolveMode() + ', CAPACITY_RANKER_CYCLE_CAMPAIGNS=' + cycleEnabled() + '), GET /n8n/capacity-ranker/campaign-state, POST /n8n/capacity-ranker/heal');
 }
