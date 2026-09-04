@@ -144,37 +144,95 @@ export async function findLeadInDataQueues(ldsIds, deps = {}) {
 // ─── Dedup window ──────────────────────────────────────────────────
 
 /**
- * True when a re-queue LeadAdd already went out for this contact inside the
- * dedup window. Reads agent_actions (the durable local record of every
- * re-queue — execution_result.requeued is stamped by the handler).
+ * True when a re-queue LeadAdd already went out — or may already have gone out —
+ * for this contact inside the dedup window.
+ *
+ * 2026-09-03 (Tom Messick, eqjK58AwEZ1juYJH6szE, action 418351): the old query
+ * filtered `.eq('status','completed')`, so an action's OWN prior attempt was
+ * invisible to it. That action timed out twice at the executor's 60s handler
+ * limit, was retried twice, and each retry re-entered the handler and posted a
+ * fresh LeadAdd — LP issued 572927, 572928 and 572929 inside 70 seconds. The
+ * status filter is why the second and third attempts sailed past the guard: a
+ * row mid-retry is 'executing' or 'failed', never 'completed'.
+ *
+ * Three duplicate signals now, in order of certainty:
+ *
+ *   1. ANOTHER completed re-queue in the window with execution_result.requeued
+ *      — a LeadAdd definitely went out. (Original behaviour.)
+ *   2. ANOTHER re-queue row in the window still in flight ('pending',
+ *      'executing') or 'failed' — a LeadAdd MAY have gone out from a zombie
+ *      handler. Treated as duplicate: a promised call that the verify sweep
+ *      escalates costs one manual dial; a duplicate LeadAdd costs a junk LP
+ *      lead and a second dial to an already-annoyed customer.
+ *   3. THIS action's own row when retryCount > 0 — the reason this function
+ *      exists. Excluded on attempt 0 (retryCount 0) so the first, legitimate
+ *      re-queue is never self-deduplicated.
+ *
+ * Still fails CLOSED on a query error: duplication is the worse failure.
+ *
+ * @param {string} contactId
+ * @param {object} [opts]
+ * @param {number|string} [opts.currentActionId] this action's agent_actions.id
+ * @param {number} [opts.retryCount] this action's retry_count (0 on first try)
+ * @param {object} [opts.supabase] client injection for tests
  */
-export async function recentRequeueExists(contactId, deps = {}) {
-  const db = deps.supabase || supabase;
+export async function recentRequeueExists(contactId, opts = {}) {
+  const db = opts.supabase || supabase;
   const windowMin = REQUEUE_DEDUP_MINUTES();
   const since = new Date(Date.now() - windowMin * 60 * 1000).toISOString();
+  const currentId = opts.currentActionId != null ? String(opts.currentActionId) : null;
+  const retryCount = Number(opts.retryCount) || 0;
+
+  // A retry of THIS row is duplicate by definition — the prior attempt may have
+  // posted a LeadAdd from a handler that timed out but kept running.
+  if (currentId && retryCount > 0) {
+    return {
+      duplicate: true,
+      reason: 'same_action_retry',
+      prior_action_id: currentId,
+      retry_count: retryCount,
+      window_minutes: windowMin,
+    };
+  }
+
   const { data, error } = await db
     .from('agent_actions')
-    .select('id, created_at, execution_result')
+    .select('id, created_at, status, execution_result')
     .eq('action_type', 'lp_callback_requeue')
     .eq('target_id', contactId)
-    .eq('status', 'completed')
     .gte('created_at', since)
     .order('created_at', { ascending: false })
-    .limit(5);
+    .limit(10);
   if (error) {
-    // Fail CLOSED for a dedup check: a missed dedup means a duplicate LP
-    // row; a false positive means a skipped re-queue that the verification
-    // sweep would surface. Duplication is the worse failure.
     console.warn(`[LP-REQUEUE] dedup lookup failed for ${contactId}: ${error.message} — treating as duplicate (fail-closed)`);
     return { duplicate: true, reason: 'dedup_lookup_error', window_minutes: windowMin };
   }
-  const prior = (data || []).find((r) => r?.execution_result?.requeued === true);
-  return {
-    duplicate: !!prior,
-    prior_action_id: prior?.id || null,
-    prior_at: prior?.created_at || null,
-    window_minutes: windowMin,
-  };
+
+  const others = (data || []).filter((r) => !currentId || String(r.id) !== currentId);
+  const completed = others.find((r) => r?.execution_result?.requeued === true);
+  if (completed) {
+    return {
+      duplicate: true,
+      reason: 'prior_requeue_completed',
+      prior_action_id: completed.id,
+      prior_at: completed.created_at,
+      window_minutes: windowMin,
+    };
+  }
+  const inFlight = others.find((r) =>
+    ['pending', 'executing', 'approved', 'failed'].includes(String(r.status || '')));
+  if (inFlight) {
+    return {
+      duplicate: true,
+      reason: 'prior_requeue_in_flight',
+      prior_action_id: inFlight.id,
+      prior_status: inFlight.status,
+      prior_at: inFlight.created_at,
+      window_minutes: windowMin,
+    };
+  }
+
+  return { duplicate: false, prior_action_id: null, prior_at: null, window_minutes: windowMin };
 }
 
 // ─── Prospect address repair (F4) ──────────────────────────────────
