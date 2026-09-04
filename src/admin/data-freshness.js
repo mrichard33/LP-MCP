@@ -109,6 +109,36 @@ const JOB_DATE_INVERSION_MIN_INTERVAL_MS = 60 * 60 * 1000;
 let _lastInversionCheck = 0;
 let _lastInversionResult = null;
 
+// Prospect-split probe: one ghl_contact_id whose lp_leads point at more than one
+// lp_prospect_id. PR #823 stopped the duplicate LeadAdd at source, so no new bursts
+// should occur — but the 2026-09-03 audit found the lead-level view was missing this:
+// for contact lGQ0WjsMU2zmoq9MsVJH the three retry leads landed on THREE separate LP
+// prospects (456535, 456538, 456540), while Messick and Totolis each stayed on one.
+// Splitting is conditional on something not yet identified, most likely whether the
+// LeadAdd carried a matchable phone or address at that moment.
+//
+// Prospect-level duplication is worse than lead-level: lp_prospect_id is the stable
+// person-level key used for cross-system lookups, so a split silently gives one human
+// two identities, and deleting the duplicate LEADS does not clean it up.
+//
+// DETECT, DO NOT AUTO-MERGE. Merging LP prospects is destructive and LP-side; this
+// keeps the number VISIBLE and a human merges. Same accepted-baseline shape as
+// JOB_DATE_INVERSION_BASELINE above — alert only on growth.
+//
+// Measured 2026-09-04 over the 90-day window: 161. Worst offender at the time was
+// LSo4GLGF0PtdlN161XWq with 9 distinct prospects. A RISE means the LeadAdd path is
+// splitting prospects again — check what changed in the phone/address match at intake.
+export const PROSPECT_SPLIT_BASELINE =
+  parseInt(process.env.FRESHNESS_PROSPECT_SPLIT_BASELINE || '161', 10);
+// Same reasoning as the inversion guard: a slow-moving warehouse invariant and a full
+// lp_leads group-by. Once an hour is plenty.
+const PROSPECT_SPLIT_MIN_INTERVAL_MS = 60 * 60 * 1000;
+// Name the affected contacts in the alert so it is actionable rather than a bare
+// count. Capped — a GroupMe message is not a report.
+const PROSPECT_SPLIT_SAMPLE_CAP = 10;
+let _lastProspectSplitCheck = 0;
+let _lastProspectSplitResult = null;
+
 // ─── Per-table check ────────────────────────────────────────────────
 
 async function checkOneTable(t) {
@@ -310,6 +340,71 @@ export async function checkJobDateInversion({ force = false } = {}) {
   }
 }
 
+// ─── Prospect-split check (warehouse invariant, detect only) ────────
+//
+// Counts contacts whose lp_leads span more than one lp_prospect_id, and compares
+// against an accepted baseline. Same count-vs-threshold shape as
+// checkJobDateInversion, and the same hourly guard.
+//
+// runSQL, not a supabase-js filter: PostgREST cannot express GROUP BY … HAVING
+// count(DISTINCT …) > 1. runSQL throws on failure — see sql/README.md.
+const PROSPECT_SPLIT_SQL =
+  `SELECT ghl_contact_id, count(DISTINCT lp_prospect_id)::int AS prospects
+     FROM lp_leads
+    WHERE ghl_contact_id IS NOT NULL
+      AND lp_prospect_id IS NOT NULL
+      AND created_at_lp > now() - interval '90 days'
+    GROUP BY ghl_contact_id
+   HAVING count(DISTINCT lp_prospect_id) > 1
+    ORDER BY 2 DESC;`;
+
+/**
+ * Pure: rows → the check result. Split out from the DB wrapper so the baseline
+ * comparison is unit-testable without a database; unit-tested in
+ * scripts/test-prospect-split-detector.js.
+ */
+export function classifyProspectSplit(rows, baseline = PROSPECT_SPLIT_BASELINE) {
+  const list = Array.isArray(rows) ? rows : (rows ? [rows] : []);
+  const count = list.length;
+  return {
+    status:   count > baseline ? 'split' : 'ok',
+    count,
+    baseline,
+    delta:    count - baseline,
+    // Worst-first, capped: the alert names who to look at, not everyone.
+    sample:   list.slice(0, PROSPECT_SPLIT_SAMPLE_CAP)
+                  .map(r => ({ ghl_contact_id: r.ghl_contact_id, prospects: Number(r.prospects) })),
+    sample_capped: count > PROSPECT_SPLIT_SAMPLE_CAP,
+  };
+}
+
+/**
+ * Pure: should the hourly guard serve the cached result instead of re-scanning?
+ * Split out for the same reason as classifyProspectSplit.
+ */
+export function isProspectSplitCacheFresh({ force = false, lastResult = null, lastCheckMs = 0, nowMs = Date.now() } = {}) {
+  if (force) return false;
+  if (!lastResult) return false;
+  return nowMs - lastCheckMs < PROSPECT_SPLIT_MIN_INTERVAL_MS;
+}
+
+export async function checkProspectSplit({ force = false } = {}) {
+  const now = Date.now();
+  if (isProspectSplitCacheFresh({
+    force, lastResult: _lastProspectSplitResult, lastCheckMs: _lastProspectSplitCheck, nowMs: now,
+  })) {
+    return { ..._lastProspectSplitResult, cached: true };
+  }
+  try {
+    const result = classifyProspectSplit(await runSQL(PROSPECT_SPLIT_SQL));
+    _lastProspectSplitCheck = now;
+    _lastProspectSplitResult = result;
+    return result;
+  } catch (err) {
+    return { status: 'error', error_message: err.message };
+  }
+}
+
 // ─── Alert dedup ────────────────────────────────────────────────────
 
 async function shouldAlert(tableName) {
@@ -333,6 +428,7 @@ export async function runFreshnessCheck({ alert = true } = {}) {
   const watermark = await checkSyncWatermarkHealth();
   const fieldDrift = await checkFieldDrift();
   const dateInversion = await checkJobDateInversion();
+  const prospectSplit = await checkProspectSplit();
   const stale = results.filter(r => r.status === 'stale' || r.status === 'empty' || r.status === 'error');
   const alerted = [];
 
@@ -462,6 +558,35 @@ export async function runFreshnessCheck({ alert = true } = {}) {
         console.warn(`[Freshness] date-inversion alert failed: ${err.message}`);
       }
     }
+
+    // Prospect-split alert (one contact spanning several LP prospects — a person-level
+    // identity split). Detect only; a human merges in LP. Fires only above baseline.
+    if (prospectSplit.status === 'split') {
+      try {
+        if (await shouldAlert('__prospect_split__')) {
+          const names = prospectSplit.sample
+            .map(s => `${s.ghl_contact_id} (${s.prospects})`)
+            .join(', ');
+          const more = prospectSplit.sample_capped
+            ? ` +${prospectSplit.count - prospectSplit.sample.length} more`
+            : '';
+          const human = `LP prospect split: ${prospectSplit.count} contacts have lp_leads across more than one lp_prospect_id, up ${prospectSplit.delta} on the accepted baseline of ${prospectSplit.baseline}. Affected: ${names}${more}. lp_prospect_id is the person-level key, so a split gives one human two identities — deleting duplicate LEADS does not fix it. Merge or delete the extra prospects in LP; do NOT auto-merge.`;
+          const sendResult = GROUPME_ALERTS_DISABLED
+            ? { sent: false, suppressed: true }
+            : await sendGroupMeMessage(`⚠️ LP PROSPECT SPLIT\n${human}`);
+          await supabase.from('data_freshness_log').insert({
+            table_name:    '__prospect_split__',
+            status:        'stale',
+            severity:      'warning',
+            error_message: sendResult?.sent ? human : `${human} [GroupMe alert suppressed by FRESHNESS_GROUPME_ALERTS_DISABLED]`,
+            alerted_at:    sendResult?.sent ? new Date().toISOString() : null,
+          });
+          if (sendResult?.sent) alerted.push('__prospect_split__');
+        }
+      } catch (err) {
+        console.warn(`[Freshness] prospect-split alert failed: ${err.message}`);
+      }
+    }
   }
 
   return {
@@ -470,6 +595,7 @@ export async function runFreshnessCheck({ alert = true } = {}) {
     sync_watermark: watermark,
     field_drift: fieldDrift,
     job_date_inversion: dateInversion,
+    prospect_split: prospectSplit,
     stale_count: stale.length,
     alerted,
     groupme_alerts_disabled: GROUPME_ALERTS_DISABLED,
@@ -561,16 +687,20 @@ export function registerDataFreshnessRoutes(app) {
       // Date-inversion is a plain DB count with no LP call, so unlike field-drift it
       // runs unconditionally here. Its own hourly guard keeps the scan cheap.
       const dateInversion = await checkJobDateInversion();
+      // Prospect-split is likewise a plain DB count with no LP call, guarded hourly.
+      const prospectSplit = await checkProspectSplit();
       const stale = results.filter(r => r.status === 'stale' || r.status === 'empty' || r.status === 'error');
       res.json({
         checked_at: new Date().toISOString(),
         all_fresh: stale.length === 0 && watermark.status !== 'stuck'
                    && (!fieldDrift || fieldDrift.status !== 'drift')
-                   && dateInversion.status !== 'inverted',
+                   && dateInversion.status !== 'inverted'
+                   && prospectSplit.status !== 'split',
         stale_count: stale.length,
         sync_watermark: watermark,
         field_drift: fieldDrift,
         job_date_inversion: dateInversion,
+        prospect_split: prospectSplit,
         groupme_alerts_disabled: GROUPME_ALERTS_DISABLED,
         results,
       });
