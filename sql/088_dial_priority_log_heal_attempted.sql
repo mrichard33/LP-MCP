@@ -1,0 +1,43 @@
+-- ============================================================================
+-- 088_dial_priority_log_heal_attempted.sql — Capacity ranker: heal flap guard
+-- ============================================================================
+-- Doctrine: sql/README.md. Additive. Safe to re-run.
+--
+-- WHY
+--   2026-09-04, ~22:05 and ~22:15 UTC: "Data - Warm Leads less than 30" went
+--   NOT_RUNNING twice in ten minutes and POST /n8n/capacity-ranker/heal
+--   restarted it both times (dial_priority_log 27 and 29). Cycling was OFF, so
+--   neither outage could have been caused by a failed cycle — the ranker never
+--   stopped anything. Five9 stopped the campaign for its own reasons (most
+--   likely nothing dialable: 8 attempts with a 3-hour redial timeout empties
+--   the dialable set long before the lists are empty).
+--
+--   Heal cannot tell "dark because our cycle failed" from "stopped by Five9",
+--   so it restarted a campaign that was not ours to restart, and each round
+--   cost three GroupMe cards — outage, healed, recovered.
+--
+-- WHAT THIS COLUMN IS FOR
+--   heal_attempted — jsonb array of the campaign names a heal run tried to
+--                    START, whether or not the start succeeded. NULL on
+--                    ranking runs and on heal runs that started nothing.
+--
+--   It is the flap guard's memory: heal counts today's attempts per campaign
+--   and stands down after RANKER_HEAL_MAX_PER_DAY (default 2), alerting once
+--   instead of looping. It has to be durable rather than process-local,
+--   because a Railway restart must not hand a flapping campaign a fresh
+--   budget — that is the whole failure mode.
+--
+--   Deliberately NOT the same thing as healed_at (sql/087), which records that
+--   an incident was closed. A heal that ATTEMPTED and failed still spends
+--   budget, and still belongs in this column.
+--
+-- Mirrored in runMigrations() (src/index.js) so a fresh deploy self-heals.
+--
+-- EXECUTION: Supabase dashboard SQL editor, LP MCP instance. One execution.
+--
+-- ROLLBACK:
+--   ALTER TABLE dial_priority_log DROP COLUMN IF EXISTS heal_attempted;
+-- ============================================================================
+
+ALTER TABLE dial_priority_log
+  ADD COLUMN IF NOT EXISTS heal_attempted jsonb;

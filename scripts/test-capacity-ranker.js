@@ -46,7 +46,11 @@ import {
   watchdogAlertText,
   checkCampaignState,
   healCampaigns,
+  todayET,
   endOfDayET,
+  startOfDayET,
+  healMaxPerDay,
+  healStandDownKey,
   restartTuning,
   runLockTtlSec,
   addDays,
@@ -1974,13 +1978,23 @@ test('INCIDENT 2026-09-04: a campaign that never comes back → 500, named, aler
 function fakeHeal({
   restartFailures = [CAMPAIGNS.warm], states = { [CAMPAIGNS.warm]: 'NOT_RUNNING' },
   sourceId = 24, startWorks = true, sourceRow = undefined,
+  // Cycling ARMED by default: these cases exercise the repair path. The
+  // observe-only path is gated on this and has its own tests below.
+  cycleOn = true, attemptsToday = [], maxPerDay = 2, attemptsThrow = false,
 } = {}) {
   const campaignState = { [CAMPAIGNS.hot]: 'RUNNING', ...states };
-  const calls = { starts: [], inserted: [], healed: [], alerts: [] };
+  const calls = { starts: [], inserted: [], healed: [], alerts: [], conditions: [] };
   const deps = {
     log: () => {},
     now: new Date('2026-09-04T20:25:00Z'),
     sleep: async () => {},
+    actionEnabled: () => cycleOn,
+    maxPerDay,
+    readHealAttemptsToday: async () => {
+      if (attemptsThrow) throw new Error('supabase unavailable');
+      return attemptsToday;
+    },
+    report: async (c) => { calls.conditions.push(c); return { sent: c.active === true }; },
     readLastRestartFailure: async () => (sourceRow !== undefined
       ? sourceRow
       : { id: sourceId, ran_at: '2026-09-04T20:18:27Z', restart_failures: restartFailures, healed_at: null }),
@@ -2134,6 +2148,156 @@ test('HEAL: both campaigns named → both handled, and one outcome row covers th
   assert.deepEqual(body.healed, [CAMPAIGNS.hot, CAMPAIGNS.warm]);
   assert.deepEqual(calls.starts, [CAMPAIGNS.hot, CAMPAIGNS.warm]);
   assert.equal(calls.inserted.length, 1);
+});
+
+// ─── The heal action gate and the flap guard ────────────────────────────────
+//
+// 2026-09-04, ~22:05 and ~22:15 UTC: Warm went NOT_RUNNING twice in ten minutes
+// with cycling OFF — so no failed cycle could have caused either — and heal
+// restarted it both times, at three GroupMe cards a round. Heal cannot tell
+// "dark because our cycle failed" from "Five9 stopped it for its own reasons".
+//
+// The fix gates the ACTION, never the OBSERVATION: going quiet would trade a
+// restart loop for the failure PR #844 exists to prevent.
+
+test('GATE: cycling OFF → heal does not restart, but STILL reports the dark campaign', async () => {
+  const { deps, calls, campaignState } = fakeHeal({ cycleOn: false });
+  const { status, body } = await healCampaigns(deps);
+
+  assert.deepEqual(calls.starts, [], 'no restart: the ranker never stopped it, so this outage is not heal\'s to fix');
+  assert.equal(campaignState[CAMPAIGNS.warm], 'NOT_RUNNING', 'left exactly as Five9 had it');
+
+  // ...and the observation is LOUD, which is the whole amendment.
+  assert.equal(status, 503, 'a campaign is still dark — the n8n execution must go red');
+  assert.equal(body.may_act, false);
+  assert.equal(body.stood_down[0].campaign, CAMPAIGNS.warm);
+  assert.equal(body.stood_down[0].state, 'NOT_RUNNING');
+  assert.match(body.stood_down[0].reason, /CAPACITY_RANKER_CYCLE_CAMPAIGNS is false/);
+  const fired = calls.conditions.filter((c) => c.active === true);
+  assert.equal(fired.length, 1, 'exactly one condition opened');
+  assert.match(fired[0].text, /is NOT_RUNNING during dial hours and heal will NOT restart it/);
+  assert.match(fired[0].text, /out of dialable records/, 'the card names the likeliest cause, so it is actionable at 6pm');
+  assert.equal(fired[0].key, `capacity_ranker:heal_not_acting:${CAMPAIGNS.warm}`);
+  assert.ok(fired[0].remindMs > 0, 'and it re-reminds while the campaign stays dark');
+});
+
+test('GATE: force:true overrides it for a deliberate manual repair', async () => {
+  const { deps, calls, campaignState } = fakeHeal({ cycleOn: false });
+  deps.force = true;
+  const { status, body } = await healCampaigns(deps);
+  assert.equal(status, 200);
+  assert.deepEqual(body.healed, [CAMPAIGNS.warm]);
+  assert.deepEqual(calls.starts, [CAMPAIGNS.warm]);
+  assert.equal(campaignState[CAMPAIGNS.warm], 'RUNNING');
+});
+
+test('GATE: cycling off and everything RUNNING is still a clean no-op', async () => {
+  const { deps, calls } = fakeHeal({
+    cycleOn: false,
+    states: { [CAMPAIGNS.hot]: 'RUNNING', [CAMPAIGNS.warm]: 'RUNNING' },
+  });
+  const { status, body } = await healCampaigns(deps);
+  assert.equal(status, 200);
+  assert.equal(body.no_op, true);
+  assert.deepEqual(body.stood_down, []);
+  assert.deepEqual(calls.inserted, [], 'nothing happened, so nothing is logged');
+});
+
+test('FLAP CAP: at the cap heal stands down — ONE alert, no further restarts', async () => {
+  // Warm already restarted twice today. This is the third time it has gone down.
+  const { deps, calls, campaignState } = fakeHeal({
+    attemptsToday: [CAMPAIGNS.warm, CAMPAIGNS.warm], maxPerDay: 2,
+  });
+  const { status, body } = await healCampaigns(deps);
+
+  assert.deepEqual(calls.starts, [], 'a third restart is fighting whatever keeps stopping it');
+  assert.equal(campaignState[CAMPAIGNS.warm], 'NOT_RUNNING');
+  assert.equal(status, 503);
+  assert.equal(body.outcome, 'stood_down');
+  assert.equal(body.stood_down[0].attempts_today, 2);
+  assert.match(body.stood_down[0].reason, /already restarted this campaign 2x today/);
+
+  const fired = calls.conditions.filter((c) => c.active === true);
+  assert.equal(fired.length, 1, 'exactly one alert, not one per poll');
+  assert.match(fired[0].detail, /attempts_today=2 cap=2/);
+  // Edge-triggered: a second identical sweep opens the same condition, and
+  // alert-state — not this code — decides it has already been said.
+  assert.equal(fired[0].key, healStandDownKey(CAMPAIGNS.warm));
+});
+
+test('FLAP CAP: BELOW the cap it still heals, and records the attempt durably', async () => {
+  const { deps, calls, campaignState } = fakeHeal({ attemptsToday: [CAMPAIGNS.warm], maxPerDay: 2 });
+  const { status, body } = await healCampaigns(deps);
+  assert.equal(status, 200);
+  assert.deepEqual(body.healed, [CAMPAIGNS.warm], 'second restart of the day is still allowed');
+  assert.equal(campaignState[CAMPAIGNS.warm], 'RUNNING');
+  assert.deepEqual(calls.inserted[0].heal_attempted, [CAMPAIGNS.warm],
+    'the attempt is written to dial_priority_log — that row IS tomorrow\'s budget memory');
+});
+
+test('FLAP CAP: a FAILED attempt spends budget too', async () => {
+  const { deps, calls } = fakeHeal({ startWorks: false, attemptsToday: [], maxPerDay: 2 });
+  await healCampaigns(deps);
+  assert.deepEqual(calls.inserted[0].heal_attempted, [CAMPAIGNS.warm],
+    'a heal that tried and failed must not get a free retry every 5 minutes');
+});
+
+test('FLAP CAP: the cap RESETS the next day — yesterday\'s attempts are not counted', async () => {
+  // The counter query is bounded by startOfDayET, so a new ET day reads zero
+  // attempts. Proven here through the boundary itself.
+  const lateYesterday = new Date('2026-09-04T23:30:00Z');   // 19:30 ET Sep 4
+  const earlyToday = new Date('2026-09-05T12:00:00Z');      // 08:00 ET Sep 5
+  assert.equal(todayET(lateYesterday), '2026-09-04');
+  assert.equal(todayET(earlyToday), '2026-09-05');
+  assert.ok(startOfDayET(earlyToday) > lateYesterday,
+    'the new day\'s window opens AFTER yesterday\'s attempts, so they fall out of the count');
+
+  // And with an empty count the campaign heals again, cap or no cap yesterday.
+  const { deps, calls } = fakeHeal({ attemptsToday: [], maxPerDay: 2 });
+  deps.now = earlyToday;
+  const { body } = await healCampaigns(deps);
+  assert.deepEqual(body.healed, [CAMPAIGNS.warm]);
+  assert.deepEqual(calls.starts, [CAMPAIGNS.warm]);
+});
+
+test('FLAP CAP: an unreadable counter FAILS OPEN — a dark campaign beats a duplicate restart', async () => {
+  const { deps, calls, campaignState } = fakeHeal({ attemptsThrow: true });
+  const { status, body } = await healCampaigns(deps);
+  assert.equal(status, 200);
+  assert.deepEqual(calls.starts, [CAMPAIGNS.warm], 'still repaired');
+  assert.equal(campaignState[CAMPAIGNS.warm], 'RUNNING');
+  assert.match(body.heal_budget.counter_unreadable, /supabase unavailable/, 'and it says the budget was unknown');
+});
+
+test('STAND-DOWN: the condition CLEARS when the campaign comes back', async () => {
+  const { deps, calls } = fakeHeal({
+    states: { [CAMPAIGNS.hot]: 'RUNNING', [CAMPAIGNS.warm]: 'RUNNING' },
+  });
+  await healCampaigns(deps);
+  const cleared = calls.conditions.filter((c) => c.active === false).map((c) => c.key);
+  assert.ok(cleared.includes(healStandDownKey(CAMPAIGNS.warm)), 'so tomorrow\'s first stand-down pages again');
+  assert.ok(cleared.includes(healStandDownKey(CAMPAIGNS.hot)));
+});
+
+test('STAND-DOWN: a successful heal also clears the condition', async () => {
+  const { deps, calls } = fakeHeal();
+  await healCampaigns(deps);
+  const cleared = calls.conditions.filter((c) => c.active === false).map((c) => c.key);
+  assert.ok(cleared.includes(healStandDownKey(CAMPAIGNS.warm)));
+});
+
+test('healMaxPerDay: default 2, env-tunable, garbage falls back', () => {
+  assert.equal(healMaxPerDay(undefined), 2);
+  assert.equal(healMaxPerDay('4'), 4);
+  assert.equal(healMaxPerDay('nope'), 2);
+  assert.equal(healMaxPerDay('0'), 2, 'zero would disable heal entirely — that is what the cycling gate is for');
+});
+
+test('startOfDayET: ET midnight in both EDT and EST', () => {
+  assert.equal(startOfDayET(new Date('2026-09-04T20:18:00Z')).toISOString(), '2026-09-04T04:00:00.000Z');
+  assert.equal(startOfDayET(new Date('2026-01-15T18:00:00Z')).toISOString(), '2026-01-15T05:00:00.000Z');
+  assert.equal(startOfDayET(new Date('2026-09-04T03:00:00Z')).toISOString(), '2026-09-03T04:00:00.000Z',
+    '23:00 ET is still the PREVIOUS ET day');
 });
 
 // ─── env resolution ──────────────────────────────────────────────────────────

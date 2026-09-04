@@ -1648,6 +1648,18 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] capacity ranker dial_priority_log restart hardening columns FAILED (the ranker log insert and POST /n8n/capacity-ranker/heal will fail until sql/087 is applied manually):', err.message);
   }
+
+  // Capacity ranker heal flap guard (sql/088 — the file is the source of
+  // truth). heal_attempted is the durable per-day memory the cap counts, so a
+  // Railway restart cannot hand a flapping campaign a fresh budget. Additive.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`ALTER TABLE dial_priority_log
+              ADD COLUMN IF NOT EXISTS heal_attempted jsonb;`);
+    console.log('[Migration] capacity ranker dial_priority_log heal_attempted (sql/088) ready');
+  } catch (err) {
+    console.error('[Migration] capacity ranker dial_priority_log heal_attempted FAILED (the heal flap guard will fail open and POST /n8n/capacity-ranker/heal cannot record its budget until sql/088 is applied manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
