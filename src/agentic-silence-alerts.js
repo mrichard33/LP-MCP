@@ -48,7 +48,14 @@
  *   The literal spec ("any non-zero reply count") would page on a single
  *   off-hours message; 2 keeps that quiet while still catching the real outage,
  *   which had 8 replies inside its first 6 hours.
- * @returns {{alert:boolean, reasons:string[], critical:boolean}}
+ * @returns {{alert:boolean, reasons:string[], critical:boolean, verdict:string}}
+ *   verdict distinguishes the TWO reasons this returns alert:false —
+ *   'healthy' (analyses ran) and 'insufficient_evidence' (too quiet to
+ *   conclude). The boolean cannot tell them apart, and the 2026-09-04
+ *   edge-triggered alerting in src/alert-state.js must: treating a quiet night
+ *   as "healthy" would emit a false "RECOVERED" card every time traffic dipped
+ *   below minReplies. 'insufficient_evidence' maps to active:null there —
+ *   touch nothing. The alert boolean itself is unchanged.
  */
 export function shouldAlertAgenticSilence(counts, thresholds) {
   const analyses = counts?.analyses ?? 0;
@@ -59,17 +66,19 @@ export function shouldAlertAgenticSilence(counts, thresholds) {
   const reasons = [];
 
   // The pipeline produced output — it is alive, whatever else may be wrong.
-  if (analyses > 0) return { alert: false, reasons, critical: false };
+  if (analyses > 0) return { alert: false, reasons, critical: false, verdict: 'healthy' };
 
   // Too quiet to conclude anything. Absence of traffic is not absence of health.
-  if (eligibleReplies < minReplies) return { alert: false, reasons, critical: false };
+  if (eligibleReplies < minReplies) {
+    return { alert: false, reasons, critical: false, verdict: 'insufficient_evidence' };
+  }
 
   reasons.push(
     `0 ai.analysis_completed in ${windowHours}h while ${eligibleReplies} answerable ` +
     `repl${eligibleReplies === 1 ? 'y' : 'ies'} arrived`
   );
   // Always critical. This state means leads are being ghosted right now.
-  return { alert: true, reasons, critical: true };
+  return { alert: true, reasons, critical: true, verdict: 'alert' };
 }
 
 /**

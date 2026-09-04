@@ -55,6 +55,7 @@ import {
   executeModifyCampaignLists, executeStartCampaign, executeStopCampaign, five9WritesEnabled,
 } from '../five9/admin-writes.js';
 import { sendGroupMeMessage } from '../groupme.js';
+import { reportAlertCondition } from '../alert-state.js';
 import { rankMarkets, isMaterialChange, DEFAULT_SWAP_MARGIN, MARKET_CODES } from '../capacity/rankMarkets.js';
 import { applyDialPriority, CAMPAIGNS, isCycling } from '../capacity/applyDialPriority.js';
 import {
@@ -364,10 +365,11 @@ export async function runCapacityRanker(input = {}, deps = {}) {
  * bot id in n8n after all, which is the thing that did not work.
  */
 
+/** 2026-09-04 — no longer the alert interval. Suppression moved to the durable
+ *  edge-triggered layer (src/alert-state.js), so a campaign that stays down is
+ *  ONE incident rather than a fresh page every 30 minutes. This survives only
+ *  as the degraded cooldown for when that state table is unusable. */
 const WATCHDOG_SUPPRESS_MS = 30 * 60 * 1000;
-
-/** Process-local. A restart re-arms every alert, which is the safe direction. */
-const watchdogLastAlert = new Map();
 
 /** Dial hours for the watchdog: 08:00–21:00 ET, Mon–Sat. A stopped campaign at
  *  02:00 on a Sunday is not an emergency and must not page anyone. */
@@ -380,30 +382,24 @@ export function withinWatchdogWindow(now = new Date()) {
   return hhmm >= '08:00' && hhmm <= '21:00';
 }
 
+/** The card for a campaign that is down during dial hours. The live state goes
+ *  in the BODY, never in the alert key — see watchdogAlertKey. */
+export function watchdogAlertText(campaign, state) {
+  const shown = state ? String(state).toUpperCase() : 'UNREADABLE';
+  return `⚠ CAPACITY RANKER: ${campaign} is ${shown} during dial hours — floor is not dialing it. Check Five9 now.`;
+}
+
 /**
- * Which campaigns to alert about right now. Pure; mutates only the map handed
- * to it, so the suppression clock is testable without waiting 30 minutes.
- * A campaign reading RUNNING clears its own suppression, so the next outage
- * alerts immediately rather than inheriting the previous one's silence.
+ * Condition identity for one campaign's outage.
+ *
+ * The state string is deliberately NOT part of this. Five9 reports a single
+ * continuous outage as UNREADABLE, then NOT_RUNNING, then STOPPING, and the
+ * pre-2026-09-04 alert keyed on that string — so one campaign that was down
+ * all morning read as three separate problems and paged three times. One
+ * campaign down is one condition, whatever Five9 calls it this minute.
  */
-export function decideWatchdogAlerts(campaigns, { now = Date.now(), lastAlert = new Map(), suppressMs = WATCHDOG_SUPPRESS_MS } = {}) {
-  const alerts = [];
-  for (const c of campaigns || []) {
-    if (c.ok) { lastAlert.delete(c.campaign); continue; }
-    // Stopped on purpose, by a cycle this process is running right now. Not an
-    // alert, and not a healthy read either — leave the suppression clock alone.
-    if (c.cycling) continue;
-    const prev = lastAlert.get(c.campaign);
-    if (prev !== undefined && now - prev < suppressMs) continue;
-    lastAlert.set(c.campaign, now);
-    const state = c.state ? String(c.state).toUpperCase() : 'UNREADABLE';
-    alerts.push({
-      campaign: c.campaign,
-      state,
-      text: `⚠ CAPACITY RANKER: ${c.campaign} is ${state} during dial hours — floor is not dialing it. Check Five9 now.`,
-    });
-  }
-  return alerts;
+export function watchdogAlertKey(campaign) {
+  return `capacity_ranker:campaign_not_running:${campaign}`;
 }
 
 /**
@@ -415,10 +411,17 @@ export function decideWatchdogAlerts(campaigns, { now = Date.now(), lastAlert = 
  * cycling flag, so a 200 mid-cycle hides nothing — it only says "no action
  * required", which is what both the pager and the n8n execution log are for.
  *
- * noDedup on the send is deliberate: groupme.js content-dedups identical text
- * for 60 minutes by default, which would silently override the 30-minute
- * re-alert this watchdog promises. Suppression is owned here so the interval
- * is exactly what is documented.
+ * 2026-09-04 — alerting is edge-triggered via src/alert-state.js: one card when
+ * a campaign goes down, one when it comes back, nothing in between, and that
+ * holds across restarts and replicas. It replaces a 30-minute re-alert that
+ * paged 4x in 90 minutes on 2026-09-04 for two campaigns that never recovered
+ * in between.
+ *
+ * Outside dial hours the watchdog does not speak AT ALL — it neither opens nor
+ * clears. A campaign that dies at 22:00 and is still dead at 08:00 must page
+ * once at 08:00; it must not "recover" at 22:01 simply because nobody is
+ * listening. Likewise a campaign this process is cycling right now is neither
+ * an alert nor a healthy read, so it leaves the condition untouched.
  */
 export async function checkCampaignState(deps = {}) {
   const {
@@ -426,7 +429,7 @@ export async function checkCampaignState(deps = {}) {
     sendAlert = (text) => sendGroupMeMessage(text, { noDedup: true }),
     inWindow = withinWatchdogWindow,
     cycling = isCycling,
-    lastAlert = watchdogLastAlert,
+    report = reportAlertCondition,
     now = new Date(),
     log = console.log,
   } = deps;
@@ -445,20 +448,27 @@ export async function checkCampaignState(deps = {}) {
   const windowOpen = inWindow(now);
   const alerted = [];
 
-  // A healthy read clears that campaign's suppression, so the next outage is
-  // never silenced by the previous one. This runs on EVERY check, including the
-  // all-clear ones that never reach the alert path below.
-  for (const c of campaigns) if (c.ok) lastAlert.delete(c.campaign);
-
-  if (needsAttention && windowOpen) {
-    for (const a of decideWatchdogAlerts(campaigns, { now: now.getTime(), lastAlert })) {
-      log(`[CapacityRanker] WATCHDOG ${a.text}`);
+  if (windowOpen) {
+    for (const c of campaigns) {
+      // Tri-state. Healthy clears; down-and-unexplained fires; down-because-
+      // we-are-cycling-it is neither, so it must not clear the condition.
+      const active = c.ok ? false : (c.cycling ? null : true);
+      const text = watchdogAlertText(c.campaign, c.state);
+      if (active === true) log(`[CapacityRanker] WATCHDOG ${text}`);
       try {
-        await sendAlert(a.text);
-        alerted.push(a.campaign);
+        const r = await report({
+          key: watchdogAlertKey(c.campaign),
+          active,
+          label: `${c.campaign} is RUNNING again`,
+          text,
+          detail: `state=${c.state ?? 'UNREADABLE'} cycling=${c.cycling}`,
+          send: sendAlert,
+          fallbackCooldownMs: WATCHDOG_SUPPRESS_MS,
+        });
+        if (r?.sent && active === true) alerted.push(c.campaign);
       } catch (err) {
         // The alert is the whole point, so a failure to send is itself loud.
-        log(`[CapacityRanker] WATCHDOG could not send the GroupMe alert for ${a.campaign}: ${err.message}`);
+        log(`[CapacityRanker] WATCHDOG could not send the GroupMe alert for ${c.campaign}: ${err.message}`);
       }
     }
   } else if (needsAttention) {

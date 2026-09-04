@@ -651,6 +651,33 @@ async function runMigrations() {
     console.error('[Migration] groupme notification marks FAILED (GroupMe content dedup reads it — apply sql/migrations/2026-08-27_groupme_notification_marks.sql manually; sends continue undeduped):', err.message);
   }
 
+  // Durable alert state — edge-triggered operational alerts
+  // (sql/migrations/2026-09-04_alert_conditions.sql is the source of truth;
+  // this mirror guarantees the table exists before the first heartbeat sweep).
+  // state='firing' means a condition is already announced, so an ongoing
+  // problem alerts once instead of once per sweep. A missing table is NOT
+  // silence: src/alert-state.js degrades the firing edge to the in-process
+  // cooldown each emitter already had, i.e. exactly the pre-2026-09-04
+  // behavior.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`CREATE TABLE IF NOT EXISTS alert_conditions (
+              alert_key        text PRIMARY KEY,
+              state            text NOT NULL DEFAULT 'firing',
+              label            text,
+              first_seen_at    timestamptz NOT NULL DEFAULT now(),
+              last_seen_at     timestamptz NOT NULL DEFAULT now(),
+              last_notified_at timestamptz,
+              cleared_at       timestamptz,
+              notify_count     integer NOT NULL DEFAULT 0,
+              detail           text);
+            CREATE INDEX IF NOT EXISTS idx_alert_conditions_state
+              ON alert_conditions (state, last_seen_at DESC);`);
+    console.log('[Migration] alert conditions (2026-09-04) ready');
+  } catch (err) {
+    console.error('[Migration] alert conditions FAILED (edge-triggered alerting reads it — apply sql/migrations/2026-09-04_alert_conditions.sql manually; alerts fall back to in-process cooldowns):', err.message);
+  }
+
   // ── sql/076_kb_vector_hnsw_and_query_log.sql (Tier 2 vector search) ──────
   // kb_vector_queries is the audit row written on every Tier 2 search
   // (src/knowledge/kb-retriever.js v1.9). Plain CREATE INDEX here per

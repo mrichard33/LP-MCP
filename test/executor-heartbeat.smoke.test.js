@@ -84,6 +84,12 @@ export function formatLimiterAlert() { return 'stub'; }
 export function shouldAlertFailedActions() { return { alert: false, reasons: [] }; }
 export function formatFailedActionsAlert() { return 'stub'; }
 `,
+  // 2026-09-04 — the durable edge-trigger layer. Every alert path now goes
+  // through it, so the smoke test has to satisfy the import or the module it
+  // is guarding cannot even load.
+  'alert-state.js': `
+export async function reportAlertCondition() { return { action: 'noop', sent: false }; }
+`,
 };
 
 const checks = [];

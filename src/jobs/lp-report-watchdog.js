@@ -1,6 +1,7 @@
 // ─── LP report freshness watchdog — src/jobs/lp-report-watchdog.js ───
 //
-// From 07:30 ET onward, alert (GroupMe, once per report type per ET day) if
+// From 07:30 ET onward, alert (GroupMe, once per report type per outage, then
+// once a day while it is still missing — see REPORT_REMIND_MS) if
 // a report type has NO successful snapshot ingested today. The LP emails are
 // scheduled 6:00 / 6:15 ET, so by 07:30 both should have landed and ingested.
 //
@@ -15,6 +16,7 @@
 
 import supabase from '../supabase.js';
 import { todayET, hourET } from './lp-report-common.js';
+import { reportAlertCondition } from '../alert-state.js';
 
 const DISABLED = !!(process.env.LP_REPORT_WATCHDOG_DISABLED || '').trim();
 
@@ -91,7 +93,14 @@ const UNARMED_SENTINEL = '__unarmed__';
 const RECENTLY_ACTIVE_DAYS = 7;
 
 let watchdogTimer = null;
-const lastAlertDate = new Map(); // report_type → ET date already alerted
+
+// 2026-09-04 — a missing report cannot fix itself; somebody has to go look at
+// LP's scheduler, Gmail, or n8n. So unlike the live-ops watchdogs this one
+// keeps a re-reminder — but a DAILY one. Report 134 was missing from 09-01 and
+// re-announced 6 times over two days under the old per-sweep alerting.
+const REPORT_REMIND_MS = parseInt(
+  process.env.LP_REPORT_ALERT_REMIND_MS || `${24 * 60 * 60 * 1000}`, 10
+);
 
 /** Minute-of-hour in ET (0-59). */
 function minuteET(d = new Date()) {
@@ -134,6 +143,9 @@ export async function checkLpReportFreshness({ alert = true } = {}) {
   const activeSince = etDaysAgo(RECENTLY_ACTIVE_DAYS);
   const missing = [];
   const unarmed = [];
+  // Any read that failed this sweep. Guards the blind-spot key from clearing
+  // on an `unarmed` list we could not actually verify.
+  let readFailed = false;
 
   for (const { type, label, schedule } of WATCHED) {
     // Armed only after the first scheduled (n8n-sourced) success — see header.
@@ -153,6 +165,7 @@ export async function checkLpReportFreshness({ alert = true } = {}) {
       .limit(1).maybeSingle();
     if (armErr) {
       console.error('[LPReportWatchdog] arm check failed:', armErr.message);
+      readFailed = true;
       continue;
     }
 
@@ -161,6 +174,7 @@ export async function checkLpReportFreshness({ alert = true } = {}) {
       lastEtDay = await lastIngestEtDay(type);
     } catch (err) {
       console.error('[LPReportWatchdog]', err.message);
+      readFailed = true;
       continue;
     }
 
@@ -173,17 +187,27 @@ export async function checkLpReportFreshness({ alert = true } = {}) {
       continue;
     }
 
-    if (lastEtDay === today) continue;
+    const ingestedToday = lastEtDay === today;
+    if (!ingestedToday) missing.push({ type, label, last_ingested_et: lastEtDay });
 
-    missing.push({ type, label, last_ingested_et: lastEtDay });
-    if (!alert || lastAlertDate.get(type) === today) continue;
-    lastAlertDate.set(type, today);
-    await notify(
-      `⏰ LP report MISSING: ${label} has not ingested today (${today} ET). ` +
-      `Expected via scheduled email ~${schedule}. Last ingest: ${lastEtDay ?? 'never'}. ` +
-      `Check, in order: LP's scheduled email fired → Gmail received it → n8n workflow active (I.LPRA–F) → ` +
-      `GET /n8n/admin/lp-report-ingest/status for a rejection.`,
-    );
+    // Every read failure above `continue`s before this point, so reaching here
+    // is always a real observation — safe to open the condition or to clear it.
+    // Clearing is why a report that finally lands says so exactly once.
+    if (alert) {
+      await reportAlertCondition({
+        key: `lp_report:missing:${type}`,
+        active: !ingestedToday,
+        label: `${label} ingested`,
+        text: () =>
+          `⏰ LP report MISSING: ${label} has not ingested today (${today} ET). ` +
+          `Expected via scheduled email ~${schedule}. Last ingest: ${lastEtDay ?? 'never'}. ` +
+          `Check, in order: LP's scheduled email fired → Gmail received it → n8n workflow active (I.LPRA–F) → ` +
+          `GET /n8n/admin/lp-report-ingest/status for a rejection.`,
+        detail: `last_ingested_et=${lastEtDay ?? 'never'}`,
+        remindMs: REPORT_REMIND_MS,
+        send: notify,
+      });
+    }
   }
 
   if (unarmed.length) {
@@ -192,15 +216,26 @@ export async function checkLpReportFreshness({ alert = true } = {}) {
       `ingesting but never logged a success with source='n8n', so no missing-report alert can fire for them. ` +
       `Check that the I.LPRA–F workflows still POST with ?source=n8n.`,
     );
-    if (alert && lastAlertDate.get(UNARMED_SENTINEL) !== today) {
-      lastAlertDate.set(UNARMED_SENTINEL, today);
-      await notify(
+  }
+
+  // Outside the `if` so the blind spot can CLEAR once every feed is armed.
+  // A sweep in which any read failed passes null instead of false: an empty
+  // `unarmed` list that we could not actually verify is not evidence of
+  // health, and clearing on it would announce an all-clear nobody earned.
+  if (alert) {
+    await reportAlertCondition({
+      key: `lp_report:${UNARMED_SENTINEL}`,
+      active: readFailed && unarmed.length === 0 ? null : unarmed.length > 0,
+      label: 'LP report watchdog blind spot closed — every feed is guarded',
+      text: () =>
         `⚠️ LP report watchdog BLIND SPOT (${today} ET): ${unarmed.length} feed(s) are ingesting but NOT guarded — ` +
         `${unarmed.map((u) => u.label).join('; ')}. ` +
         `They have never logged an ingest with source='n8n', so if they stop, nothing will alert. ` +
         `Fix: confirm the I.LPRA–F workflows POST to /n8n/admin/lp-csv-ingest/… with ?source=n8n.`,
-      );
-    }
+      detail: unarmed.map((u) => u.type).join(', '),
+      remindMs: REPORT_REMIND_MS,
+      send: notify,
+    });
   }
 
   return { checked: true, today, missing, unarmed };
@@ -218,9 +253,14 @@ export async function checkLpReportFreshness({ alert = true } = {}) {
 async function notify(text) {
   try {
     const { sendGroupMeMessage } = await import('../groupme.js');
-    await sendGroupMeMessage(text, { channel: 'ops' });
+    // 2026-09-04 — the result is RETURNED, not swallowed. alert-state.js marks
+    // an incident announced only on a send it can confirm; reporting a failed
+    // send as success would suppress the retry and, later, announce a recovery
+    // for an alert nobody ever saw.
+    return await sendGroupMeMessage(text, { channel: 'ops' });
   } catch (err) {
     console.error('[LPReportWatchdog] GroupMe alert failed:', err.message);
+    return { sent: false, reason: err.message };
   }
 }
 

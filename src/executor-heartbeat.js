@@ -192,9 +192,9 @@
 import supabase from './supabase.js';
 import { executeActions } from './action-executor.js';
 import { reapStaleLocks } from './actions/reaper.js';
-import { sendGroupMeMessage } from './groupme.js';
 import { shouldAlertQueueDepth, formatQueueAlert } from './executor-queue-alerts.js';
 import { getRateLimiterStats } from './ghl-rate-limiter.js';
+import { reportAlertCondition } from './alert-state.js';
 import {
   shouldAlertLimiter,
   formatLimiterAlert,
@@ -205,7 +205,9 @@ import {
 // Phase 4 (2026-06-02) — queue-depth observability + alerting. A silent
 // multi-hour backlog used to be invisible; the heartbeat now surfaces
 // pending depth + oldest-pending age on /heartbeat-status and raises a
-// throttled GroupMe alert when the queue is unhealthy.
+// GroupMe alert when the queue is unhealthy. 2026-09-04: the cooldown below
+// no longer paces the alert — src/alert-state.js is edge-triggered — it
+// survives only as the degraded path for when that state table is unusable.
 const PENDING_ALERT_THRESHOLD = parseInt(
   process.env.EXECUTOR_PENDING_ALERT_THRESHOLD || '500', 10
 );
@@ -216,7 +218,6 @@ const ALERT_COOLDOWN_MS = parseInt(
   process.env.EXECUTOR_ALERT_COOLDOWN_MS || `${30 * 60 * 1000}`, 10
 );
 
-let lastQueueAlertAt = 0;
 
 // 2026-06-05 — limiter-health + failure-rate alerting. The Jun 4/5 GHL
 // token-starvation storm ran silently for hours: the limiter failed open
@@ -245,9 +246,7 @@ const FAILED_ACTION_ALERT_COOLDOWN_MS = parseInt(
   process.env.FAILED_ACTION_ALERT_COOLDOWN_MS || `${15 * 60 * 1000}`, 10
 );
 
-let lastLimiterAlertAt = 0;
 let lastLimiterSnapshot = null; // { timedOut, total429s } — for delta math
-let lastFailedActionAlertAt = 0;
 
 const STALE_THRESHOLD_MS = parseInt(
   process.env.EXECUTOR_STALE_THRESHOLD_MS || `${6 * 60 * 1000}`, 10
@@ -442,10 +441,11 @@ async function getRecentFailedCount(windowMin, { force = false } = {}) {
 }
 
 /**
- * Phase 4 — raise a throttled GroupMe alert when the queue is unhealthy
- * (pending over threshold OR oldest pending too old). Cooldown prevents
- * spamming every 60s heartbeat while a backlog persists. Best-effort: a
- * send failure is logged, never thrown.
+ * Phase 4 — raise a GroupMe alert when the queue is unhealthy (pending over
+ * threshold OR oldest pending too old). Edge-triggered since 2026-09-04: one
+ * card when the backlog opens, one when it drains, nothing in between, and
+ * that holds across restarts. Best-effort: a send failure is logged, never
+ * thrown.
  */
 async function maybeAlertQueueDepth(stats) {
   if (!stats) return { alerted: false };
@@ -453,25 +453,30 @@ async function maybeAlertQueueDepth(stats) {
     pendingThreshold: PENDING_ALERT_THRESHOLD,
     oldestAgeThresholdMs: OLDEST_AGE_ALERT_MS,
   });
-  if (!alert) return { alerted: false };
-  if (Date.now() - lastQueueAlertAt < ALERT_COOLDOWN_MS) {
-    return { alerted: false, suppressed: 'cooldown', reasons };
-  }
-  lastQueueAlertAt = Date.now();
-  try {
-    await sendGroupMeMessage(formatQueueAlert(stats, reasons));
+  // 2026-09-04 — edge-triggered (src/alert-state.js). A backlog that persists
+  // is ONE incident: one card when it opens, one when it drains. ALERT_COOLDOWN_MS
+  // survives only as the degraded path for when the state table is unusable.
+  // A stale reading never reaches here — the caller skips on queueStats.stale
+  // — so every call is a real observation, safe to open or clear on.
+  const res = await reportAlertCondition({
+    key: 'executor:queue_depth',
+    active: alert,
+    label: 'executor queue back within limits',
+    text: () => formatQueueAlert(stats, reasons),
+    detail: reasons.join('; '),
+    fallbackCooldownMs: ALERT_COOLDOWN_MS,
+  });
+  if (res.sent && alert) {
     console.warn(`[ExecutorHeartbeat] queue-depth alert sent — ${reasons.join('; ')}`);
-  } catch (err) {
-    console.error(`[ExecutorHeartbeat] queue-depth alert send failed: ${err.message}`);
   }
-  return { alerted: true, reasons };
+  return { alerted: !!(res.sent && alert), action: res.action, reasons };
 }
 
 /**
- * 2026-06-05 — throttled GroupMe alert when the GHL rate limiter is
- * starved (deep wait queue, a fresh 429, or a standing pause). The
- * snapshot is updated every cycle (even under cooldown) so the
- * cumulative-counter deltas (timedOut, total429s) stay accurate.
+ * 2026-06-05 — GroupMe alert when the GHL rate limiter is starved (deep wait
+ * queue, a fresh 429, or a standing pause). The snapshot is updated every
+ * cycle (even while silent) so the cumulative-counter deltas (timedOut,
+ * total429s) stay accurate.
  * Best-effort: a send failure is logged, never thrown. Returns the live
  * stats for the status route.
  *
@@ -494,24 +499,32 @@ async function maybeAlertLimiter() {
   // Update snapshot regardless of alert/cooldown so deltas stay correct.
   lastLimiterSnapshot = { timedOut: curr?.timedOut ?? 0, total429s: curr?.total429s ?? 0 };
 
-  if (!alert) return { alerted: false, stats: curr };
-  if (Date.now() - lastLimiterAlertAt < LIMITER_ALERT_COOLDOWN_MS) {
-    return { alerted: false, suppressed: 'cooldown', reasons, stats: curr };
-  }
-  lastLimiterAlertAt = Date.now();
-  try {
-    await sendGroupMeMessage(formatLimiterAlert(curr, reasons, critical));
+  // 2026-09-04 — edge-triggered. This is the alert that fired 11x in 18h on
+  // 2026-09-03/04; a starved limiter clears on its own, so the key carries NO
+  // re-reminder. One card when it goes bad, one when it recovers.
+  //
+  // Note this is the one watchdog whose input does NOT come from Supabase
+  // (getRateLimiterStats reads in-process memory), so it is the one that can
+  // still evaluate during a DB outage — which is exactly why it keeps a
+  // fallback cooldown rather than firing every cycle if the state table dies.
+  const res = await reportAlertCondition({
+    key: 'executor:limiter_unhealthy',
+    active: alert,
+    label: 'GHL rate limiter healthy again',
+    text: () => formatLimiterAlert(curr, reasons, critical),
+    detail: reasons.join('; '),
+    fallbackCooldownMs: LIMITER_ALERT_COOLDOWN_MS,
+  });
+  if (res.sent && alert) {
     console.warn(`[ExecutorHeartbeat] limiter alert sent — ${reasons.join('; ')}`);
-  } catch (err) {
-    console.error(`[ExecutorHeartbeat] limiter alert send failed: ${err.message}`);
   }
-  return { alerted: true, reasons, stats: curr };
+  return { alerted: !!(res.sent && alert), action: res.action, reasons, stats: curr };
 }
 
 /**
- * 2026-06-05 — throttled GroupMe alert when the executor's failure rate
- * spikes over a short rolling window, independent of cause (limiter, GHL
- * 5xx, handler bug). Best-effort.
+ * 2026-06-05 — GroupMe alert when the executor's failure rate spikes over a
+ * short rolling window, independent of cause (limiter, GHL 5xx, handler bug).
+ * Best-effort.
  *
  * 2026-08-07 — only evaluates on a fresh sample. A cached count is not
  * re-tested, so the alert cannot double-fire off one reading.
@@ -525,18 +538,22 @@ async function maybeAlertFailedActions() {
   const { alert, reasons } = shouldAlertFailedActions(
     failedCount, FAILED_ACTION_WINDOW_MIN, FAILED_ACTION_ALERT_THRESHOLD
   );
-  if (!alert) return { alerted: false, failedCount };
-  if (Date.now() - lastFailedActionAlertAt < FAILED_ACTION_ALERT_COOLDOWN_MS) {
-    return { alerted: false, suppressed: 'cooldown', failedCount, reasons };
-  }
-  lastFailedActionAlertAt = Date.now();
-  try {
-    await sendGroupMeMessage(formatFailedActionsAlert(failedCount, FAILED_ACTION_WINDOW_MIN, reasons));
+  // 2026-09-04 — edge-triggered. Only reached on a FRESH sample: the cached
+  // (!sampledNow) and unreadable (failedCount == null) paths above return
+  // first, so a stale or failed reading can neither open the condition nor
+  // falsely clear it.
+  const res = await reportAlertCondition({
+    key: 'executor:failed_action_rate',
+    active: alert,
+    label: 'action failure rate back to normal',
+    text: () => formatFailedActionsAlert(failedCount, FAILED_ACTION_WINDOW_MIN, reasons),
+    detail: reasons.join('; '),
+    fallbackCooldownMs: FAILED_ACTION_ALERT_COOLDOWN_MS,
+  });
+  if (res.sent && alert) {
     console.warn(`[ExecutorHeartbeat] failed-action alert sent — ${reasons.join('; ')}`);
-  } catch (err) {
-    console.error(`[ExecutorHeartbeat] failed-action alert send failed: ${err.message}`);
   }
-  return { alerted: true, failedCount, reasons };
+  return { alerted: !!(res.sent && alert), action: res.action, failedCount, reasons };
 }
 
 /**
@@ -591,7 +608,7 @@ export async function runHeartbeat({ force = false } = {}) {
     return { skipped: true, reason: 'EXECUTOR_HEARTBEAT_DISABLED=true' };
   }
 
-  // Phase 4 — queue observability + throttled backlog alert. Best-effort.
+  // Phase 4 — queue observability + backlog alert. Best-effort.
   // 2026-08-07: sampled on OBSERVABILITY_INTERVAL_MS rather than every
   // cycle. A forced heartbeat always takes a live sample.
   let queueStats = null;
