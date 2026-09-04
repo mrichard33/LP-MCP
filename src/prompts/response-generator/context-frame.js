@@ -466,6 +466,25 @@ export const timeNowHardRule = (timeHuman, dateHuman) => [
   `If there is no useful future time to offer, offer a phone call instead.`,
 ];
 
+// 2026-09-04, Robert Pederson (zLDD7V1eosF8vldF5U7i). The callback_request
+// prompt said "if it is business hours" and nothing ever computed them, so the
+// model inferred the phone room's hours from whatever else was in context —
+// including a knowledge-base row that states different hours than the dialer
+// actually runs. It promised a call "within the next few minutes" to a customer
+// the dialer was never going to reach. The window is now computed in
+// src/dial-window.js from the live Five9 dialing schedule and stated here as
+// fact, next to TIME NOW, so the model reads a verdict instead of guessing one.
+//
+// This governs whether a CALL can be promised. It says nothing about whether a
+// TEXT may be sent — that is quiet hours, and it stays in
+// src/services/quiet-hours.js.
+export const dialWindowHardRule = (line) => [
+  `${line}\n` +
+  `HARD RULE: only promise an immediate or "next few minutes" callback when the ` +
+  `phone room is OPEN above. When it is CLOSED, say the call goes out when we ` +
+  `open and do not offer a calendar slot instead.`,
+];
+
 // Per-channel shape of the reply. SMS is hard-capped and single-question; email
 // is a short structured message with a subject line.
 // Was response-generator.js:924-925.
