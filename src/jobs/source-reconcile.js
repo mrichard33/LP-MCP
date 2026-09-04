@@ -61,6 +61,39 @@ const TIMEZONE = 'America/New_York';
 export const ENABLED = () => (process.env.SOURCE_RECONCILE_ENABLED || 'true') === 'true';
 export const MIN_LEADS_30D = () => parseInt(process.env.SOURCE_GAP_MIN_LEADS_30D || '25', 10);
 
+// WO-7 (B3): a second, lower floor for event-class sources.
+//
+// The 25-lead floor makes event sources structurally invisible, not quiet.
+// Home shows, fairs and seasonal promos are short-lived and low-volume by
+// nature — they run for a weekend and produce a dozen leads total, so they
+// can never clear a floor tuned for always-on channels. Measured 2026-09-04,
+// every one of these is genuinely unmapped and none would ever alert:
+//
+//   Great American Home Show        16 / 30d    16 / 90d
+//   Angie                           13 / 30d    44 / 90d
+//   Point2Web                        0 / 30d    25 / 90d
+//   Fort Myers Arts & Crafts Show    3 / 30d    12 / 90d
+//   Fort Myers Beat the Heat         3 / 30d     7 / 90d
+//
+// A floor that a whole class of source cannot reach is not a threshold, it
+// is an exclusion.
+export const MIN_LEADS_30D_EVENTS = () =>
+  parseInt(process.env.SOURCE_GAP_MIN_LEADS_30D_EVENTS || '5', 10);
+
+/**
+ * Is this an event-class source?
+ *
+ * Matched on `lp_source_raw` against the two shapes LP actually uses: the
+ * "Events " prefix its catalog applies, and a name containing "Show".
+ * Deliberately narrow — a broad pattern would drag always-on sources under
+ * the lower floor and turn the event exception into a global threshold cut,
+ * which is not what was asked for and would make the job noisy.
+ */
+export function isEventSource(source = {}) {
+  const raw = String(source.lp_source_raw || '');
+  return /^events\s/i.test(raw) || /\bshow\b/i.test(raw);
+}
+
 // ─── Pure helpers ────────────────────────────────────────────────────────────
 
 /** Comparison key for a source. Mapping lookups are case/whitespace-tolerant. */
@@ -201,21 +234,61 @@ export function computeDiffs({ catalog = [], mappings = [], volume = [] } = {}) 
         lp_source_raw: m.lp_source_raw,
         ghl_intent_bucket: m.ghl_intent_bucket,
         ghl_entry_tag: m.ghl_entry_tag,
+        // WO-7 (B2): null until 083 flags the row. Reported, never acted on.
+        mapping_status: m.mapping_status ?? null,
         ...vol(sub),
       };
     });
+
+  // WO-7 (B2): rows flagged as not-a-source at all. These are a subset of
+  // `orphaned` — every one of them is orphaned too — pulled out separately
+  // because "LP retired this source" and "this was never a source" are
+  // different problems with different fixes, and lumping them together is
+  // what let eight market codes sit in the mapping table looking mapped.
+  const suspectedNonSource = live
+    .filter((m) => m.mapping_status === 'suspected_non_source')
+    .map((m) => ({
+      lp_source_subdetail: m.lp_source_subdetail,
+      lp_source_raw: m.lp_source_raw,
+      ghl_intent_bucket: m.ghl_intent_bucket,
+      ghl_entry_tag: m.ghl_entry_tag,
+      mapping_status: m.mapping_status,
+      ...vol(normKey(m.lp_source_subdetail)),
+    }));
 
   const byVolume = (a, b) => (b.leads_90d - a.leads_90d) || (b.leads_30d - a.leads_30d);
   unmapped.sort(byVolume);
   orphaned.sort(byVolume);
   dormant.sort((a, b) => String(a.lp_source_subdetail || '').localeCompare(String(b.lp_source_subdetail || '')));
 
-  return { unmapped, orphaned, dormant };
+  suspectedNonSource.sort(byVolume);
+
+  return { unmapped, orphaned, dormant, suspectedNonSource };
 }
 
-/** Which unmapped sources clear the volume floor and therefore deserve an alert. */
-export function selectGapAlerts(unmapped = [], minLeads30d = 25) {
-  return unmapped.filter((u) => Number(u.leads_30d || 0) >= minLeads30d);
+/**
+ * Which unmapped sources clear their volume floor and therefore deserve an alert.
+ *
+ * WO-7 (B3): two floors. Event-class sources are held to `minLeads30dEvents`
+ * (default 5), everything else to `minLeads30d` (default 25). The event floor
+ * only ever LOWERS the bar — an event source above the standard floor still
+ * alerts, so adding this can never silence something that used to fire.
+ *
+ * Idempotency is untouched: the caller still keys one event per source per
+ * ISO week, exactly as before.
+ *
+ * `minLeads30dEvents` defaults to `minLeads30d` — i.e. NO event exception
+ * unless a caller asks for one. A two-argument call therefore behaves
+ * exactly as it did before this change, which keeps the single-floor
+ * contract the existing suite pins. The scheduled job passes both floors
+ * explicitly from env.
+ */
+export function selectGapAlerts(unmapped = [], minLeads30d = 25, minLeads30dEvents = minLeads30d) {
+  return unmapped.filter((u) => {
+    const leads = Number(u.leads_30d || 0);
+    const floor = isEventSource(u) ? Math.min(minLeads30dEvents, minLeads30d) : minLeads30d;
+    return leads >= floor;
+  });
 }
 
 // ─── Default deps (the seam the tests replace) ───────────────────────────────
@@ -226,7 +299,10 @@ const defaultDeps = {
   readMappings: async () => {
     const { data, error } = await supabase
       .from('lp_source_mapping')
-      .select('lp_source_subdetail, lp_source_raw, ghl_intent_bucket, ghl_entry_tag');
+      // WO-7 (B2): mapping_status rides along so the diff can separate rows
+      // that are orphaned because LP retired the source from rows that were
+      // never a source in the first place.
+      .select('lp_source_subdetail, lp_source_raw, ghl_intent_bucket, ghl_entry_tag, mapping_status');
     if (error) throw new Error(`lp_source_mapping read failed: ${error.message}`);
     return data || [];
   },
@@ -310,14 +386,15 @@ export async function runSourceReconcile(deps = {}, { alert = true } = {}) {
     };
   }
 
-  const { unmapped, orphaned, dormant } = computeDiffs({ catalog, mappings, volume });
+  const { unmapped, orphaned, dormant, suspectedNonSource } = computeDiffs({ catalog, mappings, volume });
 
   await d.writeCatalog(catalog);
 
   // ── Alerting ──────────────────────────────────────────────────────────────
   const floor = MIN_LEADS_30D();
+  const eventFloor = MIN_LEADS_30D_EVENTS();
   const week = isoWeek(startedAt);
-  const candidates = alert ? selectGapAlerts(unmapped, floor) : [];
+  const candidates = alert ? selectGapAlerts(unmapped, floor, eventFloor) : [];
   let emitted = 0;
 
   for (const gap of candidates) {
@@ -340,7 +417,11 @@ export async function runSourceReconcile(deps = {}, { alert = true } = {}) {
         leads_30d: gap.leads_30d,
         leads_90d: gap.leads_90d,
         sample_lp_lead_id: sampleLeadId,
-        threshold_30d: floor,
+        // Report the floor this source was actually judged against, not the
+        // global one — an event alert at 6 leads against a stated threshold
+        // of 25 would read as a bug.
+        threshold_30d: isEventSource(gap) ? Math.min(eventFloor, floor) : floor,
+        source_class: isEventSource(gap) ? 'event' : 'standard',
         iso_week: week,
         action: 'Classify in lp_source_mapping — bucket and entry tag are a human decision.',
       },
@@ -354,10 +435,14 @@ export async function runSourceReconcile(deps = {}, { alert = true } = {}) {
     catalog_count: catalog.length,
     mapping_count: mappings.length,
     threshold_30d: floor,
+    threshold_30d_events: eventFloor,
     iso_week: week,
     unmapped,
     orphaned,
     dormant,
+    // WO-7 (B2): flagged as not-a-source. Subset of `orphaned`, reported so
+    // it is visible; nothing routes on it and nothing is removed.
+    suspected_non_source: suspectedNonSource,
     events_emitted: emitted,
   };
 
@@ -367,13 +452,15 @@ export async function runSourceReconcile(deps = {}, { alert = true } = {}) {
     unmapped_count: unmapped.length,
     orphaned_count: orphaned.length,
     dormant_count: dormant.length,
+    suspected_non_source_count: suspectedNonSource.length,
     events_emitted: emitted,
-    detail: { unmapped, orphaned, dormant: dormant.slice(0, 100), threshold_30d: floor },
+    detail: { unmapped, orphaned, dormant: dormant.slice(0, 100), suspected_non_source: suspectedNonSource, threshold_30d: floor, threshold_30d_events: eventFloor },
   });
 
   console.log(
     `[SourceReconcile] catalog=${catalog.length} unmapped=${unmapped.length} ` +
-    `orphaned=${orphaned.length} dormant=${dormant.length} events=${emitted}`
+    `orphaned=${orphaned.length} (${suspectedNonSource.length} suspected non-source) ` +
+    `dormant=${dormant.length} events=${emitted}`
   );
   return report;
 }
