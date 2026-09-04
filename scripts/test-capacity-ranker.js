@@ -2020,7 +2020,8 @@ test('HEAL: IDEMPOTENT — a second call against an already RUNNING campaign is 
   const { status, body } = await healCampaigns(deps);
   assert.equal(status, 200);
   assert.deepEqual(calls.starts, [], 'never starts what is already up');
-  assert.deepEqual(body.already_running, [CAMPAIGNS.warm]);
+  assert.deepEqual(body.already_running, [CAMPAIGNS.hot, CAMPAIGNS.warm], 'BOTH campaigns are checked, not just the one the failure row named');
+  assert.deepEqual(body.swept, [CAMPAIGNS.hot, CAMPAIGNS.warm]);
   assert.equal(body.no_op, true);
   assert.equal(body.outcome, 'noop', 'a sweep that started nothing did not HEAL anything');
   assert.equal(body.log_id, null);
@@ -2029,13 +2030,80 @@ test('HEAL: IDEMPOTENT — a second call against an already RUNNING campaign is 
   assert.deepEqual(calls.healed, [], 'nothing to close out');
 });
 
-test('HEAL: nothing has ever failed to restart → no-op, 200, no Five9 call at all', async () => {
-  const { deps, calls } = fakeHeal({ sourceRow: null });
+test('HEAL: no failure row and everything RUNNING → no-op, 200, no Five9 write', async () => {
+  const { deps, calls } = fakeHeal({
+    sourceRow: null,
+    states: { [CAMPAIGNS.hot]: 'RUNNING', [CAMPAIGNS.warm]: 'RUNNING' },
+  });
   const { status, body } = await healCampaigns(deps);
   assert.equal(status, 200);
   assert.equal(body.no_op, true);
+  assert.equal(body.source_log_id, null);
   assert.deepEqual(calls.starts, []);
-  assert.deepEqual(calls.inserted, [], 'no outcome row for a sweep that had nothing to sweep');
+  assert.deepEqual(calls.inserted, [], 'no outcome row for a sweep that had nothing to do');
+});
+
+// ─── THE SCOPING GAP: the failure row says WHY, not WHAT ────────────────────
+//
+// The sweep used to be limited to the campaigns named in the newest
+// restart_failures row. Two holes, both of them the exact shape of the incident
+// this sweeper exists for.
+
+test('HEAL GAP: a peer left dark by a PROCESS DEATH is healed, even though the failure row names the other campaign', async () => {
+  // dial_priority_log 24 names Warm. Warm recovered; HOT then died between stop
+  // and start, which writes no row at all. The old sweep looked only at Warm
+  // and walked past a dark Hot campaign.
+  const { deps, calls, campaignState } = fakeHeal({
+    restartFailures: [CAMPAIGNS.warm],
+    states: { [CAMPAIGNS.hot]: 'NOT_RUNNING', [CAMPAIGNS.warm]: 'RUNNING' },
+  });
+  const { status, body } = await healCampaigns(deps);
+  assert.equal(status, 200);
+  assert.deepEqual(body.healed, [CAMPAIGNS.hot], 'the campaign NOBODY logged is the one that needed healing');
+  assert.deepEqual(body.already_running, [CAMPAIGNS.warm]);
+  assert.equal(campaignState[CAMPAIGNS.hot], 'RUNNING');
+  assert.deepEqual(calls.healed, [], 'healed_at is NOT stamped on row 24 — it named Warm, and Warm was never the problem');
+});
+
+test('HEAL GAP: NO failure row at all and both campaigns dark → both are healed', async () => {
+  // A process death mid-cycle writes nothing. Live state is the only witness.
+  const { deps, campaignState } = fakeHeal({
+    sourceRow: null,
+    states: { [CAMPAIGNS.hot]: 'NOT_RUNNING', [CAMPAIGNS.warm]: 'NOT_RUNNING' },
+  });
+  const { status, body } = await healCampaigns(deps);
+  assert.equal(status, 200);
+  assert.deepEqual(body.healed, [CAMPAIGNS.hot, CAMPAIGNS.warm]);
+  assert.equal(body.source_log_id, null, 'no row to point at, and it heals anyway');
+  assert.equal(campaignState[CAMPAIGNS.hot], 'RUNNING');
+  assert.equal(campaignState[CAMPAIGNS.warm], 'RUNNING');
+});
+
+test('HEAL GAP: healed_at IS stamped when the healed campaign is one the row named', async () => {
+  const { deps, calls } = fakeHeal({
+    restartFailures: [CAMPAIGNS.warm],
+    states: { [CAMPAIGNS.hot]: 'RUNNING', [CAMPAIGNS.warm]: 'NOT_RUNNING' },
+  });
+  const { body } = await healCampaigns(deps);
+  assert.deepEqual(body.healed, [CAMPAIGNS.warm]);
+  assert.deepEqual(calls.healed, [[24, '2026-09-04T20:25:00.000Z']], 'that incident really is closed out');
+});
+
+test('HEAL GAP: a campaign the ranker is CYCLING right now is left alone', async () => {
+  // NOT_RUNNING on purpose, for a few seconds, with the list write still to
+  // land. Starting it here would break the reorder mid-flight — the run's own
+  // finally block owns that restart.
+  const { deps, calls, campaignState } = fakeHeal({
+    states: { [CAMPAIGNS.hot]: 'NOT_RUNNING', [CAMPAIGNS.warm]: 'RUNNING' },
+  });
+  deps.cycling = (name) => name === CAMPAIGNS.hot;
+  const { status, body } = await healCampaigns(deps);
+  assert.equal(status, 200);
+  assert.deepEqual(calls.starts, [], 'never fired a start into a live cycle');
+  assert.deepEqual(body.cycling, [CAMPAIGNS.hot]);
+  assert.deepEqual(body.healed, []);
+  assert.equal(body.no_op, true, 'and it is not an incident');
+  assert.equal(campaignState[CAMPAIGNS.hot], 'NOT_RUNNING', 'left exactly as the run left it');
 });
 
 test('HEAL: a campaign that still will not start → 503, heal_failed, and a loud alert', async () => {
