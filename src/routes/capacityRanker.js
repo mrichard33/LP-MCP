@@ -38,8 +38,16 @@
  * at all, and a row naming one campaign says nothing about the other. That row
  * is provenance only. A campaign the ranker is cycling RIGHT NOW is left
  * alone — the run's own finally block owns that restart. Idempotent: it only
- * ever starts, never stops, and no-ops when everything is up. See
- * healCampaigns.
+ * ever starts, never stops, and no-ops when everything is up.
+ *
+ * IT OBSERVES ALWAYS, BUT ACTS ONLY WHEN CYCLING IS ARMED. With
+ * CAPACITY_RANKER_CYCLE_CAMPAIGNS false the ranker never stops a campaign, so
+ * an outage cannot be one heal caused — restarting then fights Five9 or a human
+ * over a campaign that is down for its own reasons. Heal still sweeps and still
+ * opens an alert condition for a dark campaign; it just does not restart it.
+ * POST {"force":true} overrides that for a deliberate manual repair. A FLAP CAP
+ * (RANKER_HEAL_MAX_PER_DAY, default 2) bounds it further: past the cap heal
+ * stands down and pages once instead of looping. See healCampaigns.
  *
  * Body: { slot_date?: "YYYY-MM-DD" } — defaults to tomorrow, America/New_York.
  * No auth, matching the /n8n/* convention (n8n hourly cron is the caller).
@@ -207,20 +215,54 @@ export function restartTuning(env = process.env) {
 }
 
 /**
- * The instant of the next ET midnight — how long a failed restart disables
- * cycling for. "The rest of the day", literally.
+ * The instant of ET midnight opening the given YYYY-MM-DD.
  *
  * Derived by probing the two possible US Eastern offsets rather than hardcoding
  * one, so it is right in both EDT and EST.
  */
-export function endOfDayET(now = new Date()) {
-  const next = addDays(todayET(now), 1);
+function etMidnight(dateStr) {
   for (const offset of ['04', '05']) { // EDT = UTC-4, EST = UTC-5
-    const candidate = new Date(`${next}T${offset}:00:00Z`);
-    if (todayET(candidate) === next) return candidate;
+    const candidate = new Date(`${dateStr}T${offset}:00:00Z`);
+    if (todayET(candidate) === dateStr) return candidate;
   }
-  return new Date(`${next}T05:00:00Z`);
+  return new Date(`${dateStr}T05:00:00Z`);
 }
+
+/** Start of the current ET day — the flap guard's daily reset boundary. */
+export function startOfDayET(now = new Date()) {
+  return etMidnight(todayET(now));
+}
+
+/**
+ * The instant of the next ET midnight — how long a failed restart disables
+ * cycling for. "The rest of the day", literally.
+ */
+export function endOfDayET(now = new Date()) {
+  return etMidnight(addDays(todayET(now), 1));
+}
+
+/**
+ * How many times heal may restart ONE campaign in ONE ET day before it stands
+ * down and pages instead. Env-tunable so it can be changed without a deploy.
+ *
+ * WHY A CAP AT ALL. 2026-09-04: Warm went NOT_RUNNING at ~22:05 and again at
+ * ~22:15 with cycling OFF — so no failed cycle could have caused either. Heal
+ * restarted it both times, and each round cost three GroupMe cards. Heal cannot
+ * tell "dark because our cycle failed" from "Five9 stopped it for its own
+ * reasons", so past a small number of repeats the right move is to stop
+ * restarting and tell a human, not to keep pulling against the dialer.
+ */
+export function healMaxPerDay(raw = process.env.RANKER_HEAL_MAX_PER_DAY) {
+  return intEnv(raw, 2);
+}
+
+/** One condition per campaign: "heal saw this dark and will not restart it." */
+export function healStandDownKey(campaign) {
+  return `capacity_ranker:heal_not_acting:${campaign}`;
+}
+
+/** Re-remind daily while a campaign stays dark and heal stays hands-off. */
+const HEAL_STAND_DOWN_REMIND_MS = 24 * 60 * 60 * 1000;
 
 /**
  * CAP THE BLAST RADIUS. Any run that ends with a restart failure stamps
@@ -677,10 +719,65 @@ async function readLastRestartFailureLive() {
   return data?.[0] ?? null;
 }
 
+/**
+ * How many restarts heal has already spent on each campaign today.
+ *
+ * DURABLE, not process-local: a Railway restart must not hand a flapping
+ * campaign a fresh budget, since a restart loop is exactly the failure this
+ * budget exists to stop.
+ *
+ * FAILS OPEN, deliberately. If the counter cannot be read we do not know the
+ * budget, and the house rule holds — a dark campaign is an emergency, a noisy
+ * one is not. A heal we should have withheld costs a GroupMe card; a heal we
+ * wrongly withheld costs dial hours. The stand-down alert still fires either
+ * way, so a human sees it.
+ */
+async function readHealAttemptsTodayLive(now = new Date()) {
+  if (!supabase) return [];
+  const { data, error } = await supabase
+    .from(TABLE)
+    .select('heal_attempted')
+    .eq('mode', 'heal')
+    .gte('ran_at', startOfDayET(now).toISOString());
+  if (error) {
+    if (isMissingTable(error)) throw new MissingTableError(error);
+    throw new Error(`${TABLE} heal_attempted read failed: ${error.message}`);
+  }
+  return (data || []).flatMap((r) => (Array.isArray(r.heal_attempted) ? r.heal_attempted : []));
+}
+
 async function markHealedLive(id, healedAt) {
   if (!supabase || !id) return;
   const { error } = await supabase.from(TABLE).update({ healed_at: healedAt }).eq('id', id);
   if (error) throw new Error(`${TABLE} healed_at update failed: ${error.message}`);
+}
+
+/**
+ * One edge-triggered condition per campaign: "heal saw this dark and will not
+ * restart it."
+ *
+ * Routed through src/alert-state.js rather than a fresh cooldown, for the
+ * reason that file was written: a channel that repeats itself gets muted, and
+ * a muted channel is how the 2026-07-31 outage ran 47 hours unnoticed. So this
+ * is ONE card when heal stands down, a daily nudge while the campaign stays
+ * dark, and one recovery card when it comes back.
+ *
+ * Never fatal: an alerting failure must not take the sweep down.
+ */
+async function reportStandDown({ report, campaign, active, text, detail, sendAlert, log }) {
+  try {
+    await report({
+      key: healStandDownKey(campaign),
+      active,
+      label: `${campaign} is RUNNING again`,
+      text,
+      detail,
+      send: sendAlert,
+      remindMs: HEAL_STAND_DOWN_REMIND_MS,
+    });
+  } catch (err) {
+    log(`[CapacityRanker] HEAL WARN stand-down alert for ${campaign} failed: ${err.message}`);
+  }
 }
 
 /**
@@ -698,10 +795,41 @@ export async function healCampaigns(deps = {}) {
     markHealed = markHealedLive,
     sendAlert = (text) => sendGroupMeMessage(text, { noDedup: true }),
     cycling = isCycling,
+    report = reportAlertCondition,
+    readHealAttemptsToday = readHealAttemptsTodayLive,
+    actionEnabled = cycleEnabled,
+    maxPerDay = healMaxPerDay(),
+    force = false,
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
     now = new Date(),
     log = console.log,
   } = deps;
+
+  // GATE THE ACTION, NOT THE OBSERVATION.
+  //
+  // With CAPACITY_RANKER_CYCLE_CAMPAIGNS false the ranker never stops a
+  // campaign, so no outage can be one heal caused — every restart it makes
+  // then is fighting Five9 or a human over a campaign that is down for its own
+  // reasons. That is what happened on 2026-09-04 (Warm, twice in ten minutes).
+  //
+  // But going SILENT would trade a restart loop for the failure PR #844
+  // exists to prevent: both Data campaigns dark, ~85s and ~95s, recovered by
+  // hand. So heal still sweeps, still reads live state, and still opens an
+  // alert condition for a dark campaign — it just does not restart it.
+  // `force: true` on the request body is the manual override.
+  const mayAct = force || actionEnabled();
+
+  // Today's spent budget, per campaign. Read once per sweep.
+  let attemptsToday = [];
+  let counterUnreadable = null;
+  try {
+    attemptsToday = await readHealAttemptsToday(now);
+  } catch (err) {
+    if (err instanceof MissingTableError) throw err;
+    counterUnreadable = err.message;
+    log(`[CapacityRanker] HEAL WARN could not read today's heal budget (${err.message}) — proceeding; a dark campaign matters more than a duplicate restart`);
+  }
+  const spent = (campaign) => attemptsToday.filter((c) => c === campaign).length;
 
   // THE FAILURE ROW SAYS WHY A CAMPAIGN IS DOWN. IT DOES NOT BOUND WHAT CAN BE.
   //
@@ -730,6 +858,8 @@ export async function healCampaigns(deps = {}) {
   const alreadyRunning = [];
   const failed = [];
   const skippedCycling = [];
+  const attempted = [];   // what this sweep SPENT budget on, durable in heal_attempted
+  const standDown = [];   // dark, observed, deliberately not restarted
 
   for (const campaign of sweep) {
     // NEVER FIGHT A CYCLE IN FLIGHT. A campaign the ranker stopped seconds ago
@@ -752,13 +882,38 @@ export async function healCampaigns(deps = {}) {
     }
     if (state === 'RUNNING') {
       alreadyRunning.push(campaign);
+      // The campaign is back, so any stand-down condition it was carrying is
+      // over. Clearing here is what makes tomorrow's first stand-down page.
+      await reportStandDown({ report, campaign, active: false, sendAlert, log });
       continue;
     }
     if (!state) {
       failed.push({ campaign, error: 'state is UNREADABLE — refusing to guess; Five9 may be unreachable' });
       continue;
     }
-    log(`[CapacityRanker] HEAL: ${campaign} reads ${state} — starting it`);
+
+    // ── Dark. Decide whether heal may act, and say so either way. ──────────
+    const used = spent(campaign);
+    let refusal = null;
+    if (!mayAct) {
+      refusal = `heal is observing only: CAPACITY_RANKER_CYCLE_CAMPAIGNS is false, so the ranker never stopped this campaign and this outage is not one heal caused. Five9 or a human stopped it. POST /n8n/capacity-ranker/heal {"force":true} to restart it anyway`;
+    } else if (used >= maxPerDay) {
+      refusal = `heal already restarted this campaign ${used}x today (cap ${maxPerDay}, RANKER_HEAL_MAX_PER_DAY) and it went down again — restarting a ${maxPerDay + 1}th time is fighting whatever keeps stopping it, not fixing it`;
+    }
+
+    if (refusal) {
+      standDown.push({ campaign, state, attempts_today: used, reason: refusal });
+      log(`[CapacityRanker] HEAL STAND DOWN ${campaign} reads ${state} — ${refusal}`);
+      await reportStandDown({
+        report, campaign, active: true, sendAlert, log,
+        text: `⚠ CAPACITY RANKER: ${campaign} is ${state} during dial hours and heal will NOT restart it.\nWhy: ${refusal}.\nThe floor is not dialing it — check Five9 (is the list out of dialable records?) and start it by hand if it should be up.`,
+        detail: `state=${state} attempts_today=${used} cap=${maxPerDay} may_act=${mayAct}`,
+      });
+      continue;
+    }
+
+    attempted.push(campaign);
+    log(`[CapacityRanker] HEAL: ${campaign} reads ${state} — starting it (${used + 1}/${maxPerDay} today)`);
     // The cycling guard above covers a cycle THIS process is running.
     // restartCampaignVerified additionally waits out STOPPING/STARTING, which
     // covers a stop that another process or a human started.
@@ -770,8 +925,12 @@ export async function healCampaigns(deps = {}) {
       pollMs: HEAL_BUDGET.pollMs,
       maxWaitMs: HEAL_BUDGET.ceilingMs,
     });
-    if (r.restarted) healed.push(campaign);
-    else failed.push({ campaign, error: r.error, attempts: r.attempts });
+    if (r.restarted) {
+      healed.push(campaign);
+      await reportStandDown({ report, campaign, active: false, sendAlert, log });
+    } else {
+      failed.push({ campaign, error: r.error, attempts: r.attempts });
+    }
   }
 
   const healedAt = now.toISOString();
@@ -779,9 +938,13 @@ export async function healCampaigns(deps = {}) {
   // the watchdog calls this every 5 minutes for as long as ANY campaign reads
   // down, so a heal whose named campaign is already back reports noop on every
   // one of those polls.
-  const acted = healed.length > 0 || failed.length > 0;
-  const outcome = failed.length ? 'heal_failed' : (healed.length ? 'healed' : 'noop');
-  const summary = `heal: ${outcome} — healed=[${healed.join(', ')}] already_running=[${alreadyRunning.join(', ')}] failed=[${failed.map((f) => f.campaign).join(', ')}] cycling=[${skippedCycling.join(', ')}] (source dial_priority_log id ${source?.id ?? 'none'})`;
+  // A stand-down is an EVENT, even though nothing was restarted: it is the
+  // sweep declining to act on a dark campaign, and that belongs in the log.
+  const acted = healed.length > 0 || failed.length > 0 || standDown.length > 0;
+  const outcome = failed.length
+    ? 'heal_failed'
+    : (healed.length ? 'healed' : (standDown.length ? 'stood_down' : 'noop'));
+  const summary = `heal: ${outcome} — healed=[${healed.join(', ')}] already_running=[${alreadyRunning.join(', ')}] failed=[${failed.map((f) => f.campaign).join(', ')}] stood_down=[${standDown.map((s2) => `${s2.campaign} (${s2.state}, ${s2.attempts_today} today)`).join('; ')}] cycling=[${skippedCycling.join(', ')}] may_act=${mayAct} (source dial_priority_log id ${source?.id ?? 'none'})`;
   log(`[CapacityRanker] ${summary}`);
 
   // The outcome row: a durable record that a heal DID something. mode is
@@ -807,6 +970,9 @@ export async function healCampaigns(deps = {}) {
         restart_failures: failed.length ? failed.map((f) => f.campaign) : null,
         restart_attempts: null,
         healed_at: healed.length ? healedAt : null,
+        // The flap guard's durable memory. Every campaign this sweep TRIED to
+        // start, successful or not — a failed attempt spends budget too.
+        heal_attempted: attempted.length ? attempted : null,
       });
     } catch (err) {
       log(`[CapacityRanker] WARN heal outcome row could not be written: ${err.message}`);
@@ -830,7 +996,10 @@ export async function healCampaigns(deps = {}) {
 
   // Speak only when something actually happened. A no-op heal every five
   // minutes must not turn into a five-minute alarm.
-  if (acted) {
+  // A stand-down speaks through its own edge-triggered condition above, which
+  // is the whole point of routing it there — this free-text card would repeat
+  // every five minutes and get the channel muted.
+  if (healed.length || failed.length) {
     const text = failed.length
       ? `🚨 CAPACITY RANKER HEAL FAILED: ${failed.map((f) => f.campaign).join(', ')} is STILL not RUNNING (${failed[0].error}). Start it in Five9 now.`
       : `✅ CAPACITY RANKER HEAL: restarted ${healed.join(', ')} — the floor is dialing ${healed.length > 1 ? 'them' : 'it'} again. Cycling stays disabled until Mark clears cycle_disabled_until.`;
@@ -841,8 +1010,11 @@ export async function healCampaigns(deps = {}) {
     }
   }
 
+  // 503 whenever a campaign is left NOT_RUNNING — whether heal failed to
+  // restart it or deliberately declined to. Either way the floor is not
+  // dialing it and the n8n execution should go red.
   return {
-    status: failed.length ? 503 : 200,
+    status: (failed.length || standDown.length) ? 503 : 200,
     body: {
       outcome,
       healed,
@@ -853,6 +1025,10 @@ export async function healCampaigns(deps = {}) {
       // incident being closed, not the scope of the sweep.
       swept: sweep,
       cycling: skippedCycling,
+      // Dark, seen, and deliberately not restarted — each with the reason.
+      stood_down: standDown,
+      may_act: mayAct,
+      heal_budget: { max_per_day: maxPerDay, counter_unreadable: counterUnreadable },
       no_op: !acted,
       source_log_id: source?.id ?? null,
       healed_at: healed.length ? healedAt : null,
@@ -1033,7 +1209,10 @@ export function registerCapacityRankerRoutes(app) {
   // STARTS a campaign, never stops one, and no-ops when everything is up.
   app.post('/n8n/capacity-ranker/heal', async (req, res) => {
     try {
-      const { status, body } = await healCampaigns();
+      // force:true overrides the cycling gate for a deliberate manual repair.
+      // The watchdog never sends it, so the automatic path stays observe-only
+      // while CAPACITY_RANKER_CYCLE_CAMPAIGNS is false.
+      const { status, body } = await healCampaigns({ force: req.body?.force === true });
       res.status(status).json(body);
     } catch (err) {
       console.error('[CapacityRanker] heal failed:', err.message);
