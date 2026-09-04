@@ -29,3 +29,4 @@
  */
 export * from './system-core.js';
 export * from './banned.js';
+export * from './examples.js';
