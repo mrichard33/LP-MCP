@@ -31,9 +31,27 @@
  * read is not evidence of anything) plus one final read restartFinalWaitMs
  * later. A campaign that does not come back is named in result.restart_failures
  * and forces applied=false. Campaigns cycle one at a time (the TIERS loop is
- * sequential — never parallelise it) and a campaign is never stopped while one
- * cycled earlier in the run is still dark. Prior state is restored, not
- * assumed: a campaign already NOT_RUNNING is written and left stopped.
+ * sequential — never parallelise it). Prior state is restored, not assumed: a
+ * campaign already NOT_RUNNING is written and left stopped.
+ *
+ * TWO THINGS THE 2026-09-04 OUTAGE TAUGHT US, both fixed here:
+ *
+ *   1. A GRACEFUL STOP DOES NOT LAND INSTANTLY. Five9 reports STOPPING while
+ *      it drains calls in progress and REFUSES startCampaign for that whole
+ *      window ("Illegal campaign state STOPPING"). A start fired into it is
+ *      not a retry, it is a guaranteed refusal — and because a throwing start
+ *      skips the settle wait, the old loop burned its entire budget (~16s)
+ *      inside a 25s drain and declared a healthy campaign dark. The restart
+ *      now WAITS OUT any transitional state (TRANSITIONAL_STATES) before
+ *      firing a single start, bounded by restartMaxWaitMs.
+ *
+ *   2. THE NEVER-BOTH-DARK GUARD MUST READ LIVE STATE. It used to consider
+ *      only campaigns cycled in the CURRENT run, so it was blind to a peer
+ *      already dark from an earlier run, a human stop in the admin UI, or a
+ *      crash between stop and start. On 2026-09-04 Hot was left NOT_RUNNING
+ *      at 17:07 and the 17:15 run cycled Warm anyway. The guard now reads each
+ *      peer's live state before stopping anything, and treats an UNREADABLE
+ *      peer as dark — refusing to stop is always the recoverable direction.
  * FIVE9_WRITES_ENABLED still gates the SOAP call inside that op: with it
  * unset the op dry-runs, and this module reports dry_run:true and applied:false
  * rather than pretending the read-back matched.
@@ -67,6 +85,14 @@ export const CAMPAIGNS = Object.freeze({
 });
 
 export const TIERS = Object.freeze(['hot', 'warm']);
+
+/**
+ * States Five9 will REFUSE a startCampaign against. These are transitional —
+ * the campaign is between states and the right response is to wait, never to
+ * fire another start. Observed live 2026-09-04: startCampaign against a
+ * STOPPING campaign returns "Illegal campaign state STOPPING".
+ */
+export const TRANSITIONAL_STATES = Object.freeze(new Set(['STOPPING', 'STARTING', 'RESETTING']));
 
 const norm = (s) => String(s ?? '').trim().toLowerCase();
 
@@ -238,6 +264,14 @@ export function verifyListOrder(intended, afterLists) {
  * @param {number} [deps.restartFinalWaitMs=10000]
  *        One last confirmation read after every attempt has failed, before
  *        declaring the campaign dark.
+ * @param {number} [deps.restartPollMs=3000]
+ *        How often to re-read state while the campaign is still STOPPING.
+ * @param {number} [deps.restartMaxWaitMs=180000]
+ *        Hard ceiling on waiting out a transitional state. A graceful stop
+ *        drains calls in progress and took ~25s live; three minutes covers a
+ *        long call without hanging the run on a campaign that is genuinely
+ *        stuck. Enforced as a poll count, so it is deterministic under an
+ *        injected clock.
  * @param {(ms:number)=>Promise<void>} [deps.sleep]
  * @param {(msg:string)=>void} [deps.log]
  */
@@ -247,6 +281,7 @@ export async function applyDialPriority(rankResult, deps) {
     stopCampaign = null, startCampaign = null, getCampaignState = null,
     cycleCampaigns = false, restartAttempts = 3, restartBackoffMs = 2000,
     restartSettleMs = 5000, restartFinalWaitMs = 10000,
+    restartPollMs = 3000, restartMaxWaitMs = 180000,
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
     log = console.log,
   } = deps || {};
@@ -297,17 +332,42 @@ export async function applyDialPriority(rankResult, deps) {
     entry.was_running = wasRunning;
     let stoppedAt = null;
 
-    // Never both campaigns stopped at once. If a campaign cycled earlier in
-    // this run did NOT come back, stopping this one would leave the floor with
-    // no Data campaign dialing at all — so this one is not stopped and not
-    // written (a RUNNING campaign refuses the write anyway). The run already
-    // reports applied=false and names the dark campaign in restart_failures.
-    const darkFromThisRun = TIERS
-      .filter((t) => result.campaigns[t]?.cycled && result.campaigns[t]?.restarted === false)
-      .map((t) => CAMPAIGNS[t]);
-    if (mustCycle && darkFromThisRun.length) {
+    // Never both campaigns dark at once. Stopping this one while another Data
+    // campaign is already down leaves the floor with NO Data campaign dialing
+    // at all — so this one is not stopped and not written (a RUNNING campaign
+    // refuses the write anyway). The run reports applied=false and names why.
+    //
+    // THIS CHECKS LIVE STATE, not just this run's history. It used to look
+    // only at campaigns cycled in the CURRENT run, which misses every way a
+    // peer can already be dark before the run starts: a failed restart in an
+    // earlier run, a human stopping it in the Five9 admin UI, a crash between
+    // stop and start. On 2026-09-04 the Hot campaign was left NOT_RUNNING by a
+    // failed restart at 17:07 and the 17:15 run cycled Warm anyway, blind to
+    // it — had Warm also failed to come back, the floor would have gone
+    // completely dark.
+    //
+    // A state that cannot be READ counts as dark: refusing to stop is always
+    // the recoverable direction, and a peer we cannot see is not a peer we can
+    // vouch for.
+    let darkPeers = [];
+    if (mustCycle) {
+      for (const other of TIERS) {
+        if (other === tier) continue;
+        const otherName = CAMPAIGNS[other];
+        let otherState;
+        try {
+          otherState = String((getCampaignState
+            ? (await getCampaignState(otherName))?.state
+            : (await getOutboundCampaign(otherName))?.state) || '').toUpperCase();
+        } catch (err) {
+          otherState = '';
+        }
+        if (otherState !== 'RUNNING') darkPeers.push(`${otherName} is ${otherState || 'unreadable'}`);
+      }
+    }
+    if (mustCycle && darkPeers.length) {
       entry.cycled = false;
-      entry.skipped_reason = `not cycled: ${darkFromThisRun.join(', ')} did not restart earlier in this run — never both campaigns stopped at once`;
+      entry.skipped_reason = `not cycled: ${darkPeers.join('; ')} — never both campaigns stopped at once`;
       log(`[CapacityRanker] ${campaignName}: ${entry.skipped_reason}`);
       continue;
     }
@@ -362,7 +422,43 @@ export async function applyDialPriority(rankResult, deps) {
           ? String((await getCampaignState(campaignName))?.state || '').toUpperCase()
           : String((await getOutboundCampaign(campaignName))?.state || '').toUpperCase());
 
-        for (let attempt = 1; attempt <= restartAttempts && !restarted; attempt += 1) {
+        // ── Wait out STOPPING before firing a single start ────────────────
+        //
+        // A graceful stop does not land instantly: Five9 reports STOPPING
+        // while it drains calls in progress, and REFUSES startCampaign for
+        // that whole window ("Illegal campaign state STOPPING"). A start
+        // fired into it is not a retry — it is a guaranteed refusal that
+        // burns an attempt. Because a throwing start skips the settle wait,
+        // the old loop spent its entire budget (2s + 2s + a 10s final read)
+        // inside a 25s drain and declared a healthy campaign dark. That took
+        // the floor down twice on 2026-09-04.
+        //
+        // So: poll until the campaign is actually startable, bounded by
+        // restartMaxWaitMs so a campaign genuinely stuck in STOPPING is still
+        // reported rather than looped on forever. The bound is a POLL COUNT,
+        // not a wall-clock deadline, so it behaves identically under the
+        // tests' injected clock as it does in production.
+        const maxDrainPolls = Math.max(0, Math.ceil(restartMaxWaitMs / Math.max(1, restartPollMs)));
+        let drainState = null;
+        let drained = false;
+        try {
+          drainState = await readState();
+          for (let poll = 0; poll < maxDrainPolls && TRANSITIONAL_STATES.has(drainState); poll += 1) {
+            log(`[CapacityRanker] ${campaignName}: reads ${drainState} — waiting for it to become startable`);
+            await sleep(restartPollMs);
+            drainState = await readState();
+          }
+          drained = !TRANSITIONAL_STATES.has(drainState);
+        } catch (err) {
+          // An unreadable state is not fatal — fall through and try the start.
+          lastErr = err;
+          drained = true;
+        }
+        if (!drained) {
+          lastErr = new Error(`still ${drainState} after ${restartMaxWaitMs}ms — never became startable`);
+        }
+
+        for (let attempt = 1; attempt <= restartAttempts && !restarted && drained; attempt += 1) {
           try {
             await startCampaign({
               id: null,
