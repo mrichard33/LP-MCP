@@ -31,6 +31,13 @@
  * Body: { slot_date?: "YYYY-MM-DD" } — defaults to tomorrow, America/New_York.
  * No auth, matching the /n8n/* convention (n8n hourly cron is the caller).
  *
+ * ONE RUN AT A TIME. The whole run holds a fleet-wide lock
+ * (outbound_locks key capacity_ranker:run); a second concurrent call answers
+ * 409 and does nothing at all — no capacity read, no log row, no Five9 write.
+ * Without it two overlapping runs can each stop a different campaign and take
+ * the floor dark; see the run-lock block below for why the per-write lock and
+ * the peer check are both insufficient on their own.
+ *
  * Always inserts one dial_priority_log row. If the table is missing (sql/080
  * not applied) the route answers 500 with a message that says so.
  *
@@ -55,6 +62,7 @@ import {
   executeModifyCampaignLists, executeStartCampaign, executeStopCampaign, five9WritesEnabled,
 } from '../five9/admin-writes.js';
 import { sendGroupMeMessage } from '../groupme.js';
+import { tryAcquireLock, releaseLock } from '../services/outbound-locks.js';
 import { reportAlertCondition } from '../alert-state.js';
 import { rankMarkets, isMaterialChange, DEFAULT_SWAP_MARGIN, MARKET_CODES } from '../capacity/rankMarkets.js';
 import { applyDialPriority, CAMPAIGNS, isCycling } from '../capacity/applyDialPriority.js';
@@ -164,6 +172,62 @@ export function cycleEnabled(raw = process.env.CAPACITY_RANKER_CYCLE_CAMPAIGNS) 
   return String(raw || 'false').trim().toLowerCase() === 'true';
 }
 
+/* ─── Run lock: one ranker run at a time, fleet-wide ─────────────────────── *
+ *
+ * The Five9 write gate (src/five9/admin-writes.js) already serializes each
+ * INDIVIDUAL admin write on five9_admin:write. That is not enough here: a
+ * ranker run is a SEQUENCE of writes — stop, reorder, start, per campaign —
+ * and the gate releases between each one. Two overlapping runs interleave
+ * perfectly legally:
+ *
+ *     run A: stop Hot   (takes the write lock, releases it)
+ *     run B: stop Warm  (takes the write lock, releases it)
+ *     → BOTH Data campaigns stopped, and the floor is dark.
+ *
+ * The live peer check in applyDialPriority narrows this but cannot close it —
+ * it reads each peer's state and refuses to stop while another is down, which
+ * is check-then-act. If both runs read before either stop lands, both see
+ * RUNNING and both proceed. No amount of re-reading fixes a TOCTOU race; only
+ * mutual exclusion does.
+ *
+ * REAL OCCURRENCE, 2026-09-04: two runs landed 42 seconds apart — n8n
+ * execution 286949 at 18:15:00 (mode=trigger, the cron) and 286951 at
+ * 18:15:42 (mode=manual, someone hitting Execute in the n8n UI). Neither
+ * cycled, because the order already matched, so nothing broke. The same
+ * overlap during a real cycle is how both campaigns go dark at once.
+ *
+ * IN SUPABASE, NOT PROCESS MEMORY. outbound_locks already gives TTL expiry,
+ * compare-and-set release and fail-open semantics, and it survives a Railway
+ * restart — which a process-local flag would not, and a restart mid-cycle is
+ * exactly when the lock matters most. It also holds if the service is ever
+ * scaled past one instance.
+ */
+
+const RUN_LOCK_CONTACT = 'capacity_ranker';
+const RUN_LOCK_TRIGGER = 'run';
+
+/**
+ * Long enough for the slowest legitimate run: two campaigns, each waiting out
+ * a STOPPING drain (restartMaxWaitMs, 180s) plus restart attempts. A crashed
+ * run leaks the lock for at most this long, which costs nothing — the cron is
+ * hourly, so the next run is 60 minutes away regardless.
+ */
+const RUN_LOCK_TTL_SEC = parseInt(process.env.CAPACITY_RANKER_LOCK_TTL_SEC || '600', 10);
+
+async function acquireRunLockLive() {
+  return tryAcquireLock({
+    contact_id: RUN_LOCK_CONTACT,
+    trigger_id: RUN_LOCK_TRIGGER,
+    sender: 'capacity_ranker',
+    message_preview: 'capacity-ranker/run',
+    ttl_seconds: RUN_LOCK_TTL_SEC,
+  });
+}
+
+async function releaseRunLockLive(lock) {
+  return releaseLock(RUN_LOCK_CONTACT, RUN_LOCK_TRIGGER, { expected_expires_at: lock?.expires_at });
+}
+
 /**
  * Cycling is only safe inside dial hours — never near the 21:00 ET legal edge.
  *
@@ -202,6 +266,55 @@ function applyLive(rankResult, { cycleCampaigns = false } = {}) {
  */
 export async function runCapacityRanker(input = {}, deps = {}) {
   const {
+    acquireRunLock = acquireRunLockLive,
+    releaseRunLock = releaseRunLockLive,
+    now = new Date(),
+    log = console.log,
+  } = deps;
+
+  // Validated BEFORE the lock: a request that can never run must not take a
+  // slot the real hourly run needs.
+  const slotDate = String(input.slot_date || '').trim() || addDays(todayET(now), 1);
+  if (!DATE_RE.test(slotDate)) {
+    return { status: 400, body: { error: 'slot_date must be YYYY-MM-DD' } };
+  }
+
+  // Taken BEFORE any capacity read, so a refused run does no work at all.
+  // FAILS OPEN: tryAcquireLock returns acquired:true with reason
+  // acquire_error_open when Supabase errors, and that is the right default —
+  // a dial order an hour stale is worse than a small race window.
+  const lock = await acquireRunLock();
+  if (!lock?.acquired) {
+    const heldBy = lock?.held_by || 'another run';
+    log(`[CapacityRanker] REFUSED: a ranker run is already in flight (held by ${heldBy}, expires ${lock?.expires_at || 'unknown'}) — skipping this one rather than racing it`);
+    return {
+      status: 409,
+      body: {
+        error: 'capacity ranker is already running — this run was skipped to avoid two concurrent runs stopping both Data campaigns at once',
+        lock_held_by: heldBy,
+        lock_expires_at: lock?.expires_at ?? null,
+        slot_date: slotDate,
+      },
+    };
+  }
+
+  try {
+    return await runRankerLocked(slotDate, deps);
+  } finally {
+    // Compare-and-set on the expires_at we acquired: if this run overran its
+    // TTL and a later run re-took the key, releasing here must NOT free the
+    // successor's live lock.
+    try {
+      await releaseRunLock(lock);
+    } catch (err) {
+      log(`[CapacityRanker] WARN could not release the run lock (it will expire on its own): ${err.message}`);
+    }
+  }
+}
+
+/** The run itself. The caller holds the run lock for its whole lifetime. */
+async function runRankerLocked(slotDate, deps = {}) {
+  const {
     fetchCapacity = fetchCapacityLive,
     readLastApplied = readLastAppliedLive,
     readAppliedHistory = readAppliedHistoryLive,
@@ -214,11 +327,6 @@ export async function runCapacityRanker(input = {}, deps = {}) {
     now = new Date(),
     log = console.log,
   } = deps;
-
-  const slotDate = String(input.slot_date || '').trim() || addDays(todayET(now), 1);
-  if (!DATE_RE.test(slotDate)) {
-    return { status: 400, body: { error: 'slot_date must be YYYY-MM-DD' } };
-  }
 
   const warnings = [];
 
