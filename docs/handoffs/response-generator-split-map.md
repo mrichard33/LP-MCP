@@ -267,3 +267,206 @@ node --test scripts/test-response-prompt-snapshot.js                      # must
 
 The diff of `scripts/fixtures/response-prompt/__snapshots__/*.txt` **is** the copy change
 and is what gets reviewed.
+
+---
+
+# FINAL LAYOUT (Step 4, post-split)
+
+Everything above is the PRE-split map and its line numbers are historical — kept
+as the review artifact it was written to be. Below is where the text actually
+landed. `src/response-generator.js` now contains ZERO inline prompt literals.
+
+| File | Bytes | Exports |
+| --- | --- | --- |
+| `src/prompts/response-generator/system-core.js` | 27,260 | 5 |
+| `src/prompts/response-generator/banned.js` | 7,502 | 5 |
+| `src/prompts/response-generator/examples.js` | 7,408 | 1 |
+| `src/prompts/response-generator/framing.js` | 16,921 | 24 |
+| `src/prompts/response-generator/playbooks.js` | 50,073 | 28 |
+| `src/prompts/response-generator/context-frame.js` | 26,157 | 89 |
+| `src/prompts/response-generator/index.js` | 1,654 | barrel |
+| **`src/response-generator.js`** | **136,675** | orchestration only |
+
+`src/response-generator.js`: **231,414 → 136,675 bytes** (94,739 moved out, 41% smaller).
+
+### `system-core.js` — 5 exports
+
+| Export | Line | Was (pre-split) |
+| --- | --- | --- |
+| `SYSTEM_IDENTITY_AND_VOICE` | 15 | 326-395 |
+| `SYSTEM_QUALIFICATION_AND_COMPLIANCE` | 89 | 399-452 |
+| `SYSTEM_TRUST_AND_BOOKING_MODEL` | 147 | 474-553 |
+| `SYSTEM_BREADCRUMBING` | 231 | 600-606 |
+| `SYSTEM_CHANNEL_AND_RESPONSE_FORMAT` | 242 | 1074-1100 |
+
+### `banned.js` — 5 exports
+
+| Export | Line | Was (pre-split) |
+| --- | --- | --- |
+| `BRAND_LANGUAGE_RULE` | 15 | 607-610 |
+| `ANTI_PATTERNS` | 23 | 989-1018 |
+| `HARD_PROHIBITIONS` | 57 | 1043-1073 |
+| `CONVERSATION_HARD_RULES` | 92 | 1852-1853 |
+| `dispatchPhoneRule` | 99 | 1668-1669 |
+
+### `examples.js` — 1 exports
+
+| Export | Line | Was (pre-split) |
+| --- | --- | --- |
+| `EXAMPLES_AUTOBOOK_AND_CANCELLATION` | 15 | 846-988 |
+
+### `framing.js` — 24 exports
+
+| Export | Line | Was (pre-split) |
+| --- | --- | --- |
+| `RANDY_ATTRACTIVE_CHARACTER` | 15 | 396-398 |
+| `EMAIL_OPENER_THREAD_AWARENESS` | 22 | 453-473 |
+| `signOffFooter` | 47 | 1234-1236 |
+| `signOffNotYetSigned` | 55 | 1231-1232 |
+| `signOffAlreadySigned` | 62 | 1229 |
+| `signOffRuleHeader` | 68 | 1227 |
+| `directLineIdentity` | 74 | 1219-1220 |
+| `LINE_IDENTITY_HEADER` | 81 | 1213 |
+| `authorship` | 87 | 1199-1203 |
+| `sharedLineIdentity` | 97 | 1211-1213 |
+| `APPOINTMENT_LANGUAGE_FOOTER` | 105 | 1776-1777 |
+| `callPurposeLines` | 112 | 1773-1774 |
+| `appointmentLanguage` | 119 | 1760-1762 |
+| `CALL_PURPOSE_COPY` | 129 | 1766-1769 |
+| `serviceAreaCityTentative` | 138 | 1479 |
+| `serviceAreaOutside` | 144 | 1473 |
+| `serviceAreaVerified` | 150 | 1471 |
+| `EMAIL_OPENER_REP_WRITTEN` | 156 | 1330 |
+| `emailOpenerInherited` | 162 | 1328 |
+| `EMAIL_OPENER_COMPANY_VOICE` | 168 | 1322 |
+| `emailBridgeCompanyVoice` | 174 | 1317 |
+| `emailBridgeFromBroadcast` | 180 | 1313 |
+| `emailBridgeSuppressedByEscalation` | 186 | 1308 |
+| `EMAIL_THREAD_CONTEXT_HEADER` | 192 | 1306 |
+
+### `playbooks.js` — 28 exports
+
+| Export | Line | Was (pre-split) |
+| --- | --- | --- |
+| `OBJECTION_PPR_AND_CONFIRMATION_SPEC` | 15 | 554-599 |
+| `CLOSING_AUTOBOOK_AND_CANCELLATION` | 65 | 611-845 |
+| `GUIDE_OFFER_BOOKING_FAILURE_EXIT` | 304 | 1019-1042 |
+| `scriptDirective` | 332 | 1127-1131 |
+| `humanCorrection` | 342 | 1112-1117 |
+| `canvassConfFlow` | 353 | 1102-1108 |
+| `FAST_TRACK_SUPPRESSED_POST_APPOINTMENT` | 365 | 1095 |
+| `FAST_TRACK_ACTIVE` | 371 | 1093 |
+| `POST_APPOINTMENT_CLOSE` | 377 | 1088-1089 |
+| `POST_APPOINTMENT_FUTURE_APPT_EXCEPTION` | 384 | 1086 |
+| `postAppointmentBan` | 390 | 1077-1084 |
+| `acknowledgmentOnlyConduct` | 403 | 1050-1057 |
+| `GUIDE_OFFER_ELIGIBLE` | 416 | 1214 |
+| `GUIDE_OFFER_OUTSTANDING` | 422 | 1212 |
+| `guideOfferResolved` | 428 | 1210 |
+| `NAMED_STORM_POSTURE` | 434 | 1184 |
+| `objectionState` | 440 | 1178-1181 |
+| `PRIORITY_ORDER_TAIL` | 449 | 1495-1498 |
+| `PRIORITY_PREREQS_NOT_SATISFIED` | 458 | 1493 |
+| `priorityCancelledAppointment` | 464 | 1490 |
+| `priorityPastAppointment` | 470 | 1486 |
+| `priorityOrderHead` | 476 | 1481-1483 |
+| `phoneBooking` | 484 | 1467-1469 |
+| `IN_HOME_GATE_UPGRADE_PATH` | 492 | 1461-1465 |
+| `inHomeGateEmailKnown` | 502 | 1459 |
+| `IN_HOME_GATE_EMAIL_ASK` | 508 | 1457 |
+| `inHomeGateSatisfied` | 514 | 1452-1455 |
+| `inHomePrerequisitesNotSatisfied` | 523 | 1440-1450 |
+
+### `context-frame.js` — 89 exports
+
+| Export | Line | Was (pre-split) |
+| --- | --- | --- |
+| `OUTPUT_CONTRACT` | 21 | 1475 |
+| `EDITORIAL_FEEDBACK_FOOTER` | 27 | 1410 |
+| `editCaseLines` | 33 | 1404 |
+| `recentEditsHeader` | 39 | 1401-1402 |
+| `NO_BOOKING_LINK_AUTHORIZED` | 46 | 1395-1397 |
+| `CANONICAL_BOOKING_LINK_FOOTER` | 54 | 1393 |
+| `BOOKING_LINK_PLAIN_URL` | 60 | 1391 |
+| `BOOKING_LINK_MERGE_TAG_RULES` | 66 | 1385-1389 |
+| `canonicalBookingLinkHeader` | 76 | 1380-1382 |
+| `CALENDAR_AVAILABILITY_FOOTER` | 84 | 1372 |
+| `CALENDAR_AVAILABILITY_HEADER` | 90 | 1365 |
+| `KB_PACK_FOOTER` | 96 | 1358 |
+| `KB_PACK_HEADER` | 102 | 1356 |
+| `EXISTING_APPOINTMENTS_FOOTER` | 108 | 1348-1349 |
+| `EXISTING_APPOINTMENTS_HEADER` | 115 | 1346 |
+| `editCaseInbound` | 122 | 1395 |
+| `editCaseDraft` | 129 | 1396 |
+| `editCaseCorrection` | 136 | 1397 |
+| `editCaseFinal` | 143 | 1398 |
+| `conversationHistoryEntry` | 149 | 1330 |
+| `CONVERSATION_HISTORY_HEADER` | 155 | 1328 |
+| `completedWorkflows` | 161 | 1325 |
+| `activeWorkflows` | 167 | 1324 |
+| `engagement` | 173 | 1319 |
+| `priorReasoning` | 179 | 1316 |
+| `recommendedArc` | 185 | 1315 |
+| `recommendedAction` | 191 | 1314 |
+| `emotionalState` | 197 | 1313 |
+| `priorObjection` | 203 | 1311 |
+| `priorBuyerStage` | 209 | 1309 |
+| `PRIOR_AI_ANALYSIS_HEADER` | 215 | 1308 |
+| `inboundMessage` | 221 | 1444 |
+| `INBOUND_MESSAGE_HEADER` | 227 | 1443 |
+| `lpRecentCalls` | 233 | 1291 |
+| `lpNote` | 239 | 1285 |
+| `LP_NOTES_HEADER` | 245 | 1281 |
+| `lpDataStale` | 251 | 1277 |
+| `lpLostReason` | 257 | 1274 |
+| `lpClosedWon` | 263 | 1273 |
+| `lpDemoAndAppointment` | 269 | 1272 |
+| `lpSalesRep` | 275 | 1258 |
+| `lpDisposition` | 281 | 1252 |
+| `LP_CRM_HEADER` | 287 | 1251 |
+| `ESTIMATE_FOOTER` | 293 | 1247 |
+| `ESTIMATE_PROHIBITION_CARVE_OUT` | 299 | 1246 |
+| `ESTIMATE_RULES` | 305 | 1245 |
+| `estimateWindowCount` | 311 | 1243 |
+| `estimateTotal` | 317 | 1240 |
+| `ESTIMATE_HEADER` | 323 | 1233 |
+| `pipeline` | 329 | 1218 |
+| `trustLevelScore` | 335 | 1173 |
+| `KNOWN_CONTACT_PROFILE_FOOTER` | 341 | 1130 |
+| `KNOWN_CONTACT_PROFILE_RULE` | 347 | 1129 |
+| `knownDecisionMakers` | 353 | 1128 |
+| `knownAddress` | 359 | 1127 |
+| `knownEmail` | 365 | 1126 |
+| `knownPhone` | 371 | 1125 |
+| `knownName` | 377 | 1124 |
+| `KNOWN_CONTACT_PROFILE_HEADER` | 383 | 1123 |
+| `leadEntry` | 389 | 1115 |
+| `leadName` | 395 | 1114 |
+| `trafficTemperature` | 401 | 973 |
+| `classifierReasoning` | 407 | 971 |
+| `classification` | 413 | 970 |
+| `todayIs` | 419 | 929 |
+| `currentDateHeader` | 425 | 928 |
+| `appointmentWhenPast` | 433 | 1266-1268 |
+| `APPOINTMENT_WHEN_TODAY` | 434 | 1266-1268 |
+| `appointmentWhenUpcoming` | 435 | 1266-1268 |
+| `appointmentPhaseLinesWithTime` | 443 | 958-961 and 963-965 |
+| `appointmentPhaseLinesDateOnly` | 449 | — |
+| `timeNowHardRule` | 461 | 940-944 |
+| `SMS_CONSTRAINTS` | 472 | 924-925 |
+| `EMAIL_CONSTRAINTS` | 473 | 924-925 |
+| `canonicalLinkCalendarNote` | 477 | 1364 |
+| `CONTACT_NOTES_GUIDANCE` | 483 | 1288 |
+| `contactNote` | 489 | 1286 |
+| `CONTACT_NOTES_HEADER` | 495 | 1283 |
+| `suppressionTags` | 501 | 1179 |
+| `knownObjections` | 507 | 1176 |
+| `activeEntry` | 513 | 1173 |
+| `buyerJourneyTag` | 519 | 1170 |
+| `buyerTag` | 525 | 1169 |
+| `stageTag` | 531 | 1168 |
+| `funnelStageTag` | 537 | 1153 |
+| `inferredBuyerStage` | 543 | 1144 |
+| `REGENERATION_NOTE_FOOTER` | 549 | 1095 |
+| `REGENERATION_NOTE_HEADER` | 555 | 1093 |
+| `channelHeader` | 561 | 884 |
