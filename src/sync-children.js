@@ -87,19 +87,46 @@ const skipUnchangedEnabled = () => process.env.SYNC_SKIP_UNCHANGED_CHILDREN !== 
 // comparing it would mean pulling every byte of it back over PostgREST on the
 // existence read — which is most of the cost this change exists to remove.
 //
-// The consequence, stated plainly: a row now holds the raw payload from the last
-// sync that changed a MAPPED column, not from the last sync full stop. Nothing
-// on the hot path reads it — mapJobFields derives every lp_jobs column from the
-// live payload, never from the stored blob. Two readers exist and both are fine:
-//   • src/jobs/market-resolver.js falls back to raw_lp_data->>'brp_id' only when
-//     branch_code is NULL, and branch_code is a compared column derived from
-//     that same key — a null one means the payload carried no branch either.
-//   • src/admin/lp-rtp-job-backfill.js reads raw_lp_data->>'contractid', which
-//     is NOT a mapped column, so a contractid that changes with no other change
-//     can go stale here. That is a one-shot admin backfill described in its own
-//     header as best-effort; if it ever needs a guaranteed-fresh blob, set
-//     SYNC_SKIP_UNCHANGED_CHILDREN=false for a cycle first.
+// The consequence: a row would otherwise hold the raw payload from the last sync
+// that changed a MAPPED column rather than from the last sync full stop. Two
+// things close that gap:
+//   • Nothing on the hot path reads the blob — mapJobFields derives every
+//     lp_jobs column from the LIVE payload, never from the stored one.
+//   • The keys inside it that anything downstream DOES read are compared
+//     individually, projected as scalars. See RAW_TRACKED_KEYS below.
 const VOLATILE_COLS = new Set(['synced_at', 'raw_lp_data']);
+
+// Keys that live ONLY inside raw_lp_data and that something downstream reads.
+// The blob is excluded from the row comparison (above), so without these a
+// change confined to one of them would be skipped and the stored blob would go
+// stale. They are projected as SCALARS via PostgREST's JSON-path select, so the
+// read costs a text field rather than the whole payload.
+//
+// contractid — read by src/admin/lp-rtp-job-backfill.js as
+// raw_lp_data->>'contractid'. Not a mapped column, so nothing else would catch
+// a change to it. Measured 2026-09-04: present on 5,986/5,986 lp_jobs rows and
+// populated on 5,985, across BOTH payload shapes (3,592 Shape A / 2,394 Shape
+// B) — so it is safe to compare unconditionally rather than shape-scoped.
+//
+// brp_id / brn_id are deliberately ABSENT: market-resolver.js falls back to them
+// only when branch_code is NULL, and branch_code is a compared column derived
+// from those same two keys, so a change to either already forces a write.
+const RAW_TRACKED_KEYS = [
+  { column: 'raw_contractid', jsonKey: 'contractid', aliases: ['contractid', 'ContractID', 'contract_id'] },
+];
+const RAW_TRACKED_SELECT = RAW_TRACKED_KEYS
+  .map(({ column, jsonKey }) => `${column}:raw_lp_data->>${jsonKey}`).join(', ');
+
+/** True when every tracked raw_lp_data key matches what the payload carries. */
+function rawTrackedUnchanged(job, existingJob) {
+  for (const { column, aliases } of RAW_TRACKED_KEYS) {
+    const incoming = getField(job, ...aliases);
+    const a = (incoming === null || incoming === undefined || incoming === '') ? null : String(incoming);
+    const b = (existingJob?.[column] ?? null) === '' ? null : (existingJob?.[column] ?? null);
+    if (a !== b) return false;
+  }
+  return true;
+}
 
 /**
  * True when `row` would write nothing new over `existing`.
@@ -576,8 +603,39 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
   // upsert can write, so rowIsUnchanged() can gate the write below. The
   // financing_company read is unchanged in purpose — it is still passed into
   // mapJobFields for cross-shape continuity.
-  const { data: existingJob } = await supabase.from('lp_jobs')
-    .select(JOB_COMPARE_COLUMNS).eq('lp_job_id', jobId).maybeSingle();
+  // This read has always failed SILENTLY: `data` comes back null, which is
+  // indistinguishable from "no such job", and mapJobFields then loses the
+  // financing_company continuity it needs — a Shape A sweep of a known-financed
+  // job would quietly downgrade financing_status. Now that the select is wide
+  // enough to matter, the failure is named, and a row we could not read is never
+  // claimed to be unchanged.
+  //
+  // Two-step, because RAW_TRACKED_SELECT uses PostgREST's JSON-path projection
+  // and nothing else in this codebase does — it is unproven against THIS
+  // deployment. If it is rejected, retry with the plain column list: continuity
+  // is preserved, only the job-side skip is given up (the milestone skip, which
+  // is the 2,111-row bulk of the problem, is untouched), and the warning below
+  // says so exactly once per job so it cannot go unnoticed.
+  let { data: existingJob, error: existingJobErr } = await supabase.from('lp_jobs')
+    .select(`${JOB_COMPARE_COLUMNS}, ${RAW_TRACKED_SELECT}`)
+    .eq('lp_job_id', jobId).maybeSingle();
+  let rawTrackedReadable = !existingJobErr;
+  if (existingJobErr) {
+    console.warn(
+      `[Sync] lp_jobs read with JSON-path projection failed for job ${jobId} ` +
+      `(code=${existingJobErr.code || 'none'} message="${existingJobErr.message}") ` +
+      `— retrying without it; job-side skip disabled this pass`,
+    );
+    ({ data: existingJob, error: existingJobErr } = await supabase.from('lp_jobs')
+      .select(JOB_COMPARE_COLUMNS).eq('lp_job_id', jobId).maybeSingle());
+  }
+  if (existingJobErr) {
+    console.warn(
+      `[Sync] lp_jobs existence read FAILED for job ${jobId} (lead ${lpLeadId}) — ` +
+      `code=${existingJobErr.code || 'none'} message="${existingJobErr.message}" ` +
+      `— writing unconditionally this pass`,
+    );
+  }
 
   const jobRow = {
     lp_job_id:       jobId,
@@ -610,7 +668,12 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
   // belt-and-braces against a future edit to the comparison, and it is what
   // makes the intent readable at the call site.)
   const wouldLinkJobNow = 'ghl_contact_id' in jobRow && !existingJob?.ghl_contact_id;
-  const skipJob = skipUnchangedEnabled() && !wouldLinkJobNow && rowIsUnchanged(jobRow, existingJob);
+  const skipJob = skipUnchangedEnabled()
+    && !existingJobErr
+    && rawTrackedReadable
+    && !wouldLinkJobNow
+    && rowIsUnchanged(jobRow, existingJob)
+    && rawTrackedUnchanged(job, existingJob);
 
   let jobErr = null;
   if (skipJob) {
@@ -659,8 +722,24 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
     // v7.5: widened from 'mdt_id, act_date, ghl_tag_fired' to every column the
     // built msRow can write, so rowIsUnchanged() has something to compare. The
     // three original columns still drive the FIRE decision, unchanged.
-    const { data: existingRows } = await supabase.from('lp_job_milestones')
+    const { data: existingRows, error: existingMsErr } = await supabase.from('lp_job_milestones')
       .select(MILESTONE_COMPARE_COLUMNS).eq('lp_job_id', jobId);
+    // A failed read here is NOT "this job has no milestones on file". It has
+    // always been treated as one — data comes back null, the map stays empty,
+    // and every already-completed milestone then reads as a FIRST completion
+    // (isFirstCompletion tests !existing?.act_date), re-firing tags and events
+    // for completions that fired weeks ago. Now that the select is wider there
+    // is more that can fail, so name it and stop: milestone work this pass is
+    // skipped and picked up on the next one, which is strictly safer than a
+    // replayed tag burst on a live contact.
+    if (existingMsErr) {
+      console.error(
+        `[Sync] lp_job_milestones read FAILED for job ${jobId} (lead ${lpLeadId}) — ` +
+        `code=${existingMsErr.code || 'none'} message="${existingMsErr.message}" ` +
+        `— skipping milestone work this pass (an empty map would re-fire settled tags)`,
+      );
+      return { suppressedFires, suppressedUnlinked, jobUpsertError: null };
+    }
     for (const r of existingRows || []) existingByMdt.set(String(r.mdt_id), r);
   }
 

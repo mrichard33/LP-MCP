@@ -101,14 +101,35 @@ function createRecorder() {
   const calls = [];
   const stored = new Map();      // table → rows[]
   const upsertFail = new Map();  // table → (payload) => errorObj | null
+  const selectFail = new Map();  // table → errorObj
 
   const matches = (row, filters) =>
     filters.filter(f => f[0] === 'eq').every(([, col, val]) => String(row[col]) === String(val));
 
+  // Model PostgREST's JSON-path projection: a select token shaped
+  // `alias:jsonbcol->>key` returns the extracted TEXT under `alias`. Without
+  // this the recorder would silently hand back undefined for raw_contractid and
+  // the tracked-key comparison would look like it passes when it never ran.
+  function project(row, selectList) {
+    const out = { ...row };
+    for (const token of String(selectList || '').split(',').map(t => t.trim())) {
+      const m = /^(\w+):(\w+)->>(\w+)$/.exec(token);
+      if (!m) continue;
+      const [, alias, col, key] = m;
+      const raw = row[col]?.[key];
+      out[alias] = raw === undefined || raw === null ? null : String(raw);
+    }
+    return out;
+  }
+
   function settle(s) {
     calls.push({ table: s.table, op: s.op, payload: s.payload, options: s.options, filters: s.filters });
     if (s.op === 'select') {
-      const rows = (stored.get(s.table) ?? []).filter(r => matches(r, s.filters));
+      const failure = selectFail.get(s.table)?.(s.payload);
+      if (failure) return { data: null, error: failure };
+      const rows = (stored.get(s.table) ?? [])
+        .filter(r => matches(r, s.filters))
+        .map(r => project(r, s.payload));
       return s.single ? { data: rows[0] ?? null, error: null } : { data: rows, error: null };
     }
     if (s.op === 'upsert') {
@@ -146,7 +167,9 @@ function createRecorder() {
     selects: (t) => calls.filter(c => c.table === t && c.op === 'select'),
     setStored:  (t, rows) => stored.set(t, rows),
     failUpsert: (t, fn)   => upsertFail.set(t, fn),
-    reset() { calls.length = 0; stored.clear(); upsertFail.clear(); },
+    failSelect:   (t, err) => selectFail.set(t, () => err),
+    failSelectIf: (t, fn)  => selectFail.set(t, fn),
+    reset() { calls.length = 0; stored.clear(); upsertFail.clear(); selectFail.clear(); },
   };
 }
 
@@ -163,6 +186,9 @@ const EST_TZ = '2026-01-10T09:00:00+00:00';
 /** LP job payload, Shape B (the GetLead shape). */
 const mkJob = (o = {}, milestones = [mkMilestone()]) => ({
   id: JOB_ID,
+  // Not a mapped column — it lives only inside raw_lp_data, where
+  // lp-rtp-job-backfill.js reads it. Present on 100% of real job payloads.
+  contractid: 'C-77412',
   jobstatus: 'Scheduled',
   grossamount: '19595.00',
   brp_id: 'ORL  ',
@@ -207,7 +233,9 @@ async function captureFirstSync(job, contact = null) {
 
   const jobRow = { ...rec.upserts('lp_jobs')[0].payload };
   delete jobRow.synced_at;
-  delete jobRow.raw_lp_data;
+  // raw_lp_data is KEPT: the recorder projects raw_contractid out of it the way
+  // PostgREST does, so the tracked-key comparison actually runs against a
+  // realistic stored row instead of silently reading undefined.
 
   const msRows = rec.upserts('lp_job_milestones')[0].payload.map((r) => {
     const row = { ...r };
@@ -526,6 +554,108 @@ test('every column the job upsert writes is in the widened select list', async (
   assert.ok(selected.has('updated_at_lp'), 'Shape A writes updated_at_lp');
   assert.ok(selected.has('financing_company'),
     'Shape B writes financing_company — and mapJobFields also READS it for cross-shape continuity');
+});
+
+// ─── raw_lp_data tracked keys ────────────────────────────────────
+
+test('a change confined to raw_lp_data.contractid still writes', async () => {
+  // contractid is not a mapped column and raw_lp_data is excluded from the row
+  // comparison, so without the tracked-key check this change would be skipped
+  // and the stored blob would keep the old contract id forever.
+  assert.equal(BASE.jobRow.raw_lp_data.contractid, 'C-77412', 'fixture sanity');
+
+  fresh();
+  rec.setStored('lp_jobs', [BASE.jobRow]);
+  rec.setStored('lp_job_milestones', BASE.msRows);
+  await syncJobAndMilestones(mkJob({ contractid: 'C-99999' }), LEAD, null);
+
+  const written = rec.upserts('lp_jobs');
+  assert.equal(written.length, 1, 'the blob must be refreshed when a tracked key moves');
+  assert.equal(written[0].payload.raw_lp_data.contractid, 'C-99999');
+  assert.equal(getChildSkipStats().jobs, 0);
+});
+
+test('the tracked raw keys are projected as scalars, not by pulling the blob', async () => {
+  fresh();
+  await syncJobAndMilestones(mkJob(), LEAD, null);
+  const select = rec.selects('lp_jobs')[0].payload;
+  assert.match(select, /raw_contractid:raw_lp_data->>contractid/,
+    'projected via PostgREST JSON path — a text field, not the whole payload');
+  assert.ok(!/(^|,)\s*raw_lp_data\s*(,|$)/.test(select),
+    'the blob itself must never be selected — that is the cost this change removes');
+});
+
+test('an identical contractid does not by itself force a write', async () => {
+  fresh();
+  rec.setStored('lp_jobs', [BASE.jobRow]);
+  rec.setStored('lp_job_milestones', BASE.msRows);
+  await syncJobAndMilestones(mkJob(), LEAD, null);
+  assert.equal(rec.upserts('lp_jobs').length, 0);
+  assert.equal(getChildSkipStats().jobs, 1);
+});
+
+// ─── Read failures never masquerade as "nothing on file" ─────────
+
+test('a rejected JSON-path projection falls back to the plain select and gives up only the job skip', async () => {
+  // Nothing else in this codebase uses PostgREST's JSON-path select, so it is
+  // unproven against this deployment. If it were rejected, the naive outcome
+  // would be existingJob=null on EVERY job — which silently costs
+  // financing_company continuity and downgrades financing_status. The retry is
+  // what makes that impossible.
+  let seenProjection = 0;
+  fresh();
+  rec.setStored('lp_jobs', [BASE.jobRow]);
+  rec.setStored('lp_job_milestones', BASE.msRows);
+  rec.failSelectIf('lp_jobs', (cols) => {
+    if (!cols.includes('->>')) return null;
+    seenProjection++;
+    return { code: 'PGRST100', message: 'unexpected "-" expecting field name' };
+  });
+
+  await syncJobAndMilestones(mkJob(), LEAD, null);
+
+  assert.equal(seenProjection, 1, 'the projection was attempted');
+  const reads = rec.selects('lp_jobs');
+  assert.equal(reads.length, 2, 'and retried without it');
+  assert.ok(!reads[1].payload.includes('->>'));
+  assert.ok(reads[1].payload.includes('financing_company'), 'continuity input survives the fallback');
+
+  // The job is written (skip given up) but milestones still skip normally —
+  // that is the whole point of bounding the blast radius.
+  assert.equal(rec.upserts('lp_jobs').length, 1);
+  const skips = getChildSkipStats();
+  assert.equal(skips.jobs, 0, 'job skip disabled');
+  assert.equal(skips.milestones, 1, 'milestone skip — the bulk of the win — is untouched');
+});
+
+test('a failed lp_jobs existence read writes unconditionally rather than skipping', async () => {
+  // A row we could not read is a row we cannot claim is unchanged.
+  fresh();
+  rec.setStored('lp_jobs', [BASE.jobRow]);
+  rec.setStored('lp_job_milestones', BASE.msRows);
+  rec.failSelect('lp_jobs', { code: '42703', message: 'column lp_jobs.whatever does not exist' });
+
+  const res = await syncJobAndMilestones(mkJob(), LEAD, null);
+
+  assert.equal(rec.upserts('lp_jobs').length, 1, 'never skip on a read we could not trust');
+  assert.equal(res.jobUpsertError, null);
+  assert.equal(getChildSkipStats().jobs, 0);
+});
+
+test('a failed lp_job_milestones read skips milestone work instead of re-firing settled tags', async () => {
+  // The hazard: data comes back null, the map stays empty, and every
+  // already-completed milestone reads as a FIRST completion — replaying a tag
+  // burst onto a live contact. Skipping the pass is strictly safer.
+  fresh();
+  rec.setStored('lp_jobs', []);
+  rec.failSelect('lp_job_milestones', { code: '42703', message: 'column does not exist' });
+
+  const res = await syncJobAndMilestones(mkJob(), LEAD, CONTACT);
+
+  assert.equal(msUpserts().length, 0, 'no milestone writes against an untrusted read');
+  assert.deepEqual(tagsFired(), [], 'and above all: no replayed tags');
+  assert.equal(res.jobUpsertError, null, 'the job itself still synced — this is not a job failure');
+  assert.equal(rec.upserts('lp_jobs').length, 1);
 });
 
 test('a failed job upsert still returns jobUpsertError and skips milestones', async () => {
