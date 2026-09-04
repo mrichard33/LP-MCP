@@ -731,9 +731,16 @@ export async function applyDialPriority(rankResult, deps) {
   // Observability for dial_priority_log: how long the graceful stops took to
   // settle, and how many start attempts the restarts needed. These are the two
   // numbers that say whether the budgets above are set right.
+  //
+  // NULL MEANS "NOT MEASURED", NEVER "MEASURED ZERO". `sum || null` collapsed
+  // those: on 2026-09-04 23:15 the first armed cycle settled on the very first
+  // read — a settle_ms of 0, the best possible result — and logged it as NULL,
+  // indistinguishable from a run that never cycled. That is the one number the
+  // stop-settle timeout is tuned from, so losing it to a falsy check loses the
+  // evidence. Presence of a cycled campaign decides, not the value.
   const cycled = TIERS.map((t) => result.campaigns[t]).filter((e) => e?.cycled);
-  result.settle_ms = cycled.reduce((a, e) => a + (e.settle_ms || 0), 0) || null;
-  result.restart_attempts = cycled.reduce((a, e) => a + (e.restart_attempts || 0), 0) || null;
+  result.settle_ms = cycled.length ? cycled.reduce((a, e) => a + (e.settle_ms || 0), 0) : null;
+  result.restart_attempts = cycled.length ? cycled.reduce((a, e) => a + (e.restart_attempts || 0), 0) : null;
   result.applied = !dryRun && result.restart_failures.length === 0 && TIERS.every((t) => {
     const e = result.campaigns[t];
     return e && (e.written ? e.verified === true : !e.changed);

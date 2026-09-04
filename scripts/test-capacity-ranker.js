@@ -1200,6 +1200,35 @@ test('RESTART: a campaign someone else already brought back is left alone — no
   assert.equal(r.attempts, 0, 'idempotent — this is what makes /heal safe to call repeatedly');
 });
 
+test('SETTLE: a stop that settles INSTANTLY reports settle_ms 0, not null', async () => {
+  // 2026-09-04 23:15, the first armed cycle in production: the stop settled on
+  // the very first read — the best possible outcome — and `sum || null` logged
+  // it as NULL, which reads identically to "this run never cycled". settle_ms
+  // is the number the stop-settle timeout is tuned from, so a measured zero
+  // must survive.
+  const f = fakeFive9({ refuseWhileRunning: true }); // no drain: settles at once
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true,
+    sleep: async (ms) => { f.advance(ms); }, log: () => {},
+  });
+  assert.equal(out.campaigns.hot.settled, true);
+  assert.equal(out.campaigns.hot.settle_ms, 0, 'settled on the first read');
+  assert.equal(out.settle_ms, 0, 'and ZERO is reported, not null');
+  assert.notEqual(out.settle_ms, null, 'null would mean "never measured"');
+  assert.ok(out.restart_attempts >= 1);
+  assert.equal(out.applied, true);
+});
+
+test('SETTLE: a run that never cycled still reports settle_ms null', async () => {
+  // The other side of the same contract: null keeps meaning "not measured".
+  const f = fakeFive9();
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: false, log: () => {},
+  });
+  assert.equal(out.settle_ms, null);
+  assert.equal(out.restart_attempts, null);
+});
+
 // ─── The never-both-dark guard, on LIVE state ───────────────────────────────
 
 test('GUARD: a campaign already dark from an EARLIER run blocks cycling the other one', async () => {
