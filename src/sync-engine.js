@@ -154,7 +154,7 @@ import {
 import { populateSourceMapping, backfillSourceMappingsFromLeads } from './sync-sources.js';
 import { syncDispositions, backfillDispositionsFromLeads } from './sync-dispositions.js';
 import { upsertLeadOnly, processProspect } from './sync-leads.js';
-import { syncAllChildRecords, syncJobAndMilestones } from './sync-children.js';
+import { syncAllChildRecords, syncJobAndMilestones, getChildSkipStats } from './sync-children.js';
 import {
   describeJobUpsertError,
   getJobParentHealMode,
@@ -630,8 +630,21 @@ export async function fullSync() {
   }
 
   const duration = Date.now() - startedAt.getTime();
+  logChildSkips('Full');
   console.log(`[Sync] Full sync complete — ${counts.leads} leads, ${counts.calls} calls, ${counts.notes} notes, ${counts.jobs} jobs, ${counts.milestones} milestones, ${failed} failed (${Math.round(duration / 1000)}s)`);
   return counts;
+}
+
+// v7.5 — surface the child-write skip counters. getChildSkipStats() DRAINS on
+// read, so this runs exactly once per sync cycle, at the end. jobs + milestones
+// are the perf/skip-unchanged-child-writes win; calls/notes/activities are the
+// v7.0 existence checks and have always been counted but never logged.
+function logChildSkips(label) {
+  const s = getChildSkipStats();
+  console.log(
+    `[Sync] ${label} skipped (unchanged/existing) — jobs=${s.jobs} milestones=${s.milestones} ` +
+    `calls=${s.calls} notes=${s.notes} activities=${s.activities}`,
+  );
 }
 
 // ─── v6.5: Independent Sweeps for Parallel Incremental Sync ──────
@@ -1370,6 +1383,7 @@ export async function incrementalSync() {
     // line. Always shown so a zero-count sweep also makes it visible
     // that the gate ran.
     const denylistSummary = ` | deny-list: ${denylistSkipped} skipped, ${newlyDenylisted} newly denied | hash-gate(${SYNC_HASH_GATE_MODE}): ${unchangedSkipped} unchanged`;
+    logChildSkips('Incremental');
     console.log(`[Sync] Incremental sync complete — ${counts.leads} leads, ${counts.calls} calls, ${counts.notes} notes, ${counts.jobs} jobs, ${failed} failed${hitCap ? ' (CAPPED)' : ''}${denylistSummary} (${Math.round(duration / 1000)}s)`);
     return counts;
 
