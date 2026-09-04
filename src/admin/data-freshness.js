@@ -44,6 +44,7 @@ import { getJobStatusChanges, probeLeadEndpoints, getLeadByLdsId, getCircuitStat
 import { sendGroupMeMessage } from '../groupme.js';
 import { extractArray, getField } from '../sync-utils.js';
 import { runSQL } from './supabase-admin.js';
+import { lpStoredAgeMinutes, lpStoredToUtcIso } from '../lp-dates.js';
 
 // ─── Configuration ──────────────────────────────────────────────────
 // Per-table freshness thresholds. Tuned to typical update cadence:
@@ -56,12 +57,18 @@ import { runSQL } from './supabase-admin.js';
 //   - 'info'     — logs only, no alert (used for low-volume tables that
 //                  legitimately go quiet for hours)
 
+// lp_wall_clock: this column is written through lpDateToEastern(), which tags
+// ET wall-clock with +00:00. Measuring staleness with a raw Date.now() diff
+// therefore adds a constant ~4h (5h in EST) to every reading. On lp_leads that
+// left 2h of real headroom under a 6h threshold, so any ordinary quiet stretch
+// paged GroupMe with a STALE DATA warning that was not true. See
+// lpStoredAgeMinutes in src/lp-dates.js.
 const MONITORED_TABLES = [
   // LP-derived (synced from Lead Perfection every 15min)
-  { name: 'lp_leads',        timestamp_col: 'created_at_lp', threshold_min: 360,  severity: 'warning'  }, // 6h
-  { name: 'lp_notes',        timestamp_col: 'created_at_lp', threshold_min: 720,  severity: 'critical' }, // 12h — was the original symptom
-  { name: 'lp_call_logs',    timestamp_col: 'call_date',     threshold_min: 720,  severity: 'warning'  }, // 12h
-  { name: 'lp_activities',   timestamp_col: 'activity_date', threshold_min: 720,  severity: 'warning'  }, // 12h
+  { name: 'lp_leads',        timestamp_col: 'created_at_lp', threshold_min: 360,  severity: 'warning',  lp_wall_clock: true }, // 6h
+  { name: 'lp_notes',        timestamp_col: 'created_at_lp', threshold_min: 720,  severity: 'critical', lp_wall_clock: true }, // 12h — was the original symptom
+  { name: 'lp_call_logs',    timestamp_col: 'call_date',     threshold_min: 720,  severity: 'warning',  lp_wall_clock: true }, // 12h
+  { name: 'lp_activities',   timestamp_col: 'activity_date', threshold_min: 720,  severity: 'warning',  lp_wall_clock: true }, // 12h
   // Agentic system (continuous when in use)
   { name: 'system_events',   timestamp_col: 'created_at',    threshold_min: 60,   severity: 'critical' }, // 1h
   { name: 'agent_actions',   timestamp_col: 'created_at',    threshold_min: 360,  severity: 'warning'  }, // 6h
@@ -121,12 +128,24 @@ async function checkOneTable(t) {
                threshold_min: t.threshold_min, severity: t.severity };
     }
 
-    const latest = new Date(data[t.timestamp_col]);
-    const staleness_min = Math.round((Date.now() - latest.getTime()) / 60000);
+    // LP-derived columns store ET wall-clock tagged +00:00, so a raw diff
+    // over-reports age by ~4h. lpStoredAgeMinutes converts; everything this
+    // service writes itself is already true UTC and is measured directly.
+    const raw = data[t.timestamp_col];
+    const staleness_min = t.lp_wall_clock
+      ? lpStoredAgeMinutes(raw)
+      : Math.round((Date.now() - new Date(raw).getTime()) / 60000);
+
+    if (staleness_min == null || !Number.isFinite(staleness_min)) {
+      return { table: t.name, status: 'error', error_message: `unparseable ${t.timestamp_col}: ${String(raw)}`,
+               severity: t.severity, threshold_min: t.threshold_min };
+    }
+
     return {
       table: t.name,
       status: staleness_min > t.threshold_min ? 'stale' : 'fresh',
-      latest: latest.toISOString(),
+      latest: t.lp_wall_clock ? lpStoredToUtcIso(raw) : new Date(raw).toISOString(),
+      latest_raw: t.lp_wall_clock ? String(raw) : undefined,
       staleness_min,
       threshold_min: t.threshold_min,
       severity: t.severity,
