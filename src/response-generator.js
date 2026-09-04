@@ -331,33 +331,9 @@ const BARE_MERGE_TAG_RX = /\{\{trigger_link\.[A-Za-z0-9_-]+\}\}/;
 // prompt. Sections still written inline here have not been extracted yet.
 const SYSTEM_PROMPT =
   P.SYSTEM_IDENTITY_AND_VOICE +
-  `═══════ ATTRACTIVE CHARACTER — RANDY REECE (EMAIL-ONLY; NEVER IN CHAT/SMS REPLIES) ═══════
-Per locked canon, the chat/SMS reply bot NEVER speaks in Randy Reece's first person. Randy is the email-only first-person voice. In these replies you are the rep / company voice — always "we / our team", never "I" as Randy, even when the KB pack indicates ac_voice_eligible and even for SA1 or SA3. Randy's founder experience (storms he's seen, cheap-window replacement jobs) may still inform the STORY, but narrate it as "our founder" / "we", not "I".
-
-` +
+  P.RANDY_ATTRACTIVE_CHARACTER +
   P.SYSTEM_QUALIFICATION_AND_COMPLIANCE +
-  `═══════ EMAIL REPLY OPENER — THREAD SENDER AWARENESS ═══════
-When replying to an email thread, the opener depends on who AUTHORED (signed)
-the prior email. This signal is supplied in the EMAIL THREAD CONTEXT block of
-the user prompt — follow it exactly:
-- Prior email = a broadcast/nurture email signed by Mark or Randy:
-  The EMAIL THREAD CONTEXT block decides whether a handoff bridge is used at all
-  and, if so, gives you the EXACT opening line already filled in with real names.
-  Follow that block verbatim. NEVER compose a bridge yourself, and NEVER write a
-  merge tag such as {{custom_values.rep_name}} into the body — every name you
-  send must be a literal name resolved for you. Where a bridge is authorized it
-  explains why a different, personal voice is now replying to a broadcast — use
-  it ONCE per thread, never on every subsequent exchange. Use the EXACT names
-  given; do not substitute Randy for Mark or vice-versa.
-- Prior email = Rep (prior bot reply or manual rep send):
-  Open directly. NO handoff bridge — the rep is the established voice in this
-  thread. Example: "Thanks for getting back to us, [first name]." or respond to
-  the substance directly.
-- Unknown / not the email channel: follow standard voice rules (we / our team).
-The handoff bridge is EMAIL-ONLY and only when the prior outbound was a
-broadcast/nurture email. NEVER use it on SMS or chat.
-
-` +
+  P.EMAIL_OPENER_THREAD_AWARENESS +
   P.SYSTEM_TRUST_AND_BOOKING_MODEL +
   `═══════ OBJECTION HANDLING ═══════
 - Price → SA3 + SA5. Never quote numbers.
@@ -1220,11 +1196,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // customer has met — they own the deal, they do not author this message.
   {
     const authorName = resolveReplySenderName();
-    parts.push(`\n═══════ AUTHORSHIP — WHO THIS REPLY IS FROM ═══════`);
-    parts.push(`You are writing as ${authorName || 'the Reece office team'}, the in-office rep, from the office inbox. ${authorName ? `${authorName} is the ONLY name you may sign or self-identify with.` : 'Write in company voice (we / our team) and do not self-identify by name.'}`);
-    parts.push(`Any OTHER person named anywhere in this prompt — the assigned sales rep, a rep in the notes, a name in the conversation history — is someone the customer deals with, NOT the author of this message. Never open as them ("Beverly here"), never sign as them, never write in their first person. Refer to them in the THIRD person only ("Beverly has your file", "I've flagged this to Beverly").`);
-    parts.push(`Never write a merge tag or template placeholder for a name. Every name in your reply must be a literal name given to you here.`);
-    parts.push(`═══════ END AUTHORSHIP ═══════`);
+    parts.push(...P.authorship(authorName));
   }
 
   // ─── WHICH NUMBER THIS GOES OUT FROM (2026-08-14) ───
@@ -1234,30 +1206,24 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   if (channel === 'sms') {
     const ident = resolveSmsSenderIdentity(opts.fromNumber);
     const alreadySigned = threadCarriesSignOff(context.conversation_recent, ident.signature);
-    parts.push(`\n═══════ WHICH LINE THIS REPLY GOES OUT FROM ═══════`);
+    parts.push(...P.LINE_IDENTITY_HEADER);
     if (ident.shared) {
-      parts.push(`This reply goes out from the SHARED Reece team line${ident.matched ? '' : ' (the sending number could not be confirmed, so treat it as the shared line)'}.`);
-      parts.push(`If the customer asks who they are talking to, asks for your name, or addresses you by a name: give the name ${ident.nameIfAsked}, AND tell them plainly that this is a shared team number so more than one person may answer. Both halves, every time — a name without the shared-line caveat is misleading the moment someone else replies. Answer that in the BODY of the message; it is not a sign-off.`);
-      parts.push(`Do NOT volunteer the shared-line explanation when they have not asked. It is an honest answer to a question, not an opener.`);
+      parts.push(...P.sharedLineIdentity(ident.matched, ident.nameIfAsked));
     } else {
-      parts.push(`This reply goes out from ${ident.signature}'s direct line.`);
-      parts.push(`If the customer asks who they are talking to or asks for your name, the answer is ${ident.signature} — say it in the BODY of the message. Do not describe this as a shared or team number; it is not.`);
+      parts.push(...P.directLineIdentity(ident.signature));
     }
 
     // SIGN-OFF (2026-08-14, owner correction): a signature on EVERY message
     // reads like a form letter, not a person. Real reps sign the first text so
     // the customer knows who is writing, then stop. So: sign once, on the first
     // substantive reply of the thread, and never again.
-    parts.push(`\nSIGN-OFF RULE — this decides whether you end the message with "— ${ident.signature}".`);
+    parts.push(...P.signOffRuleHeader(ident.signature));
     if (alreadySigned) {
-      parts.push(`DO NOT SIGN THIS MESSAGE. This thread already carries "— ${ident.signature}" on an earlier outbound, so the customer already knows who they are talking to. Re-signing every message reads like a form letter instead of a person.`);
+      parts.push(...P.signOffAlreadySigned(ident.signature));
     } else {
-      parts.push(`Nothing in this thread has been signed yet. If this reply is SUBSTANTIVE — it answers a question, moves the conversation, or opens a topic — end it with "— ${ident.signature}", once, at the very end, to establish who is texting.`);
-      parts.push(`If this reply is only a short acknowledgment or a pleasantry ("Got it.", "Sounds good.", "You as well."), DO NOT sign it. A signature would outweigh the message. Leave it unsigned and sign the next substantive reply instead.`);
+      parts.push(...P.signOffNotYetSigned(ident.signature));
     }
-    parts.push(`Never sign with any name other than "${ident.signature}", and never sign more than once in a message.`);
-    parts.push(`Your BODY voice does not change either way: keep writing in "we / our team" voice.`);
-    parts.push(`═══════ END LINE IDENTITY ═══════`);
+    parts.push(...P.signOffFooter(ident.signature));
   }
   parts.push(channel === 'sms'
     ? 'Constraints: under 160 chars ideal, 320 max. 1-3 sentences. ONE question max. Booking link = merge tag, bare (no markdown). At most ONE link.'
@@ -1337,31 +1303,31 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // the bridge, which is correct and on-canon.
   if (channel === 'email') {
     const { senderName, bridgeName, inherited } = resolveEmailSender(opts.threadSenderType);
-    parts.push(`\nEMAIL THREAD CONTEXT:`);
+    parts.push(...P.EMAIL_THREAD_CONTEXT_HEADER);
     if (bridgeName && ackOnly) {
-      parts.push(`The email this lead is replying to was a broadcast/nurture email signed by ${bridgeName}, but this conversation has been ESCALATED TO A HUMAN — see ACKNOWLEDGMENT-ONLY CONDUCT below. Do NOT use a handoff bridge and do NOT explain the change of voice. Acknowledge and stop.`);
+      parts.push(...P.emailBridgeSuppressedByEscalation(bridgeName));
     } else if (bridgeName && senderName) {
       // The canonical Randy flow: a workflow sent the broadcast as Randy, the
       // lead replied, and the in-office rep answers — saying Randy asked them
       // to. Randy is named in THIRD person and never authors.
-      parts.push(`The email this lead is replying to was a broadcast/nurture email signed by ${bridgeName}. Your reply comes from ${senderName}, a different person — open with the handoff bridge EXACTLY as written here: "${senderName} here — ${bridgeName} asked me to reach out personally after seeing your message." Then continue in rep/company (we/our team) voice. Use the bridge ONCE — do not repeat it if the rep is already the established voice in the thread. Write as ${senderName}: ${bridgeName} is being referred to in the third person and is NEVER the author of this reply.`);
+      parts.push(...P.emailBridgeFromBroadcast(senderName, bridgeName));
     } else if (bridgeName) {
       // Signed nurture email and the in-office sender name is unavailable.
       // Bridge in company voice rather than guessing at — or inventing — a name.
-      parts.push(`The email this lead is replying to was a broadcast/nurture email signed by ${bridgeName}. Reply in COMPANY voice (we / our team) — open with "We saw your reply to ${bridgeName} and wanted to get back to you personally." ${bridgeName} is referred to in the third person and is NEVER the author of this reply. Never invent a rep name and never write a merge tag.`);
+      parts.push(...P.emailBridgeCompanyVoice(bridgeName));
     } else if (!senderName) {
       // Team/company-signed broadcast, or a personal signature belonging to
       // someone who does not work this inbox. Answer as the company rather than
       // signing as a person who cannot follow through on the reply.
-      parts.push(`The email this lead is replying to carries no personal signature you can answer as — it was sent in the company's name. Reply in COMPANY voice (we / our team) and do NOT sign it with any personal name. Do NOT invent a rep name and never write a merge tag. Open by responding to what they actually said. Example opener: "Thanks for getting back to us, [first name]."`);
+      parts.push(...P.EMAIL_OPENER_COMPANY_VOICE);
     } else if (inherited) {
       // The thread is already signed by this person and they work this inbox.
       // A bridge here would read "Mark here — Mark asked me to reach out"; the
       // 2026-07-29 collision bug. Structurally impossible now (a bridge is only
       // ever Randy, who can never be the sender) but the instruction stands.
-      parts.push(`The email this lead is replying to was signed by ${senderName}, and this reply also comes from ${senderName} — the same person continuing their own thread. Do NOT use a handoff bridge; a person cannot hand off to themselves. Open directly as ${senderName}, in first person. Example opener: "Thanks for getting back to me, [first name]."`);
+      parts.push(...P.emailOpenerInherited(senderName));
     } else {
-      parts.push(`The email this lead is replying to was written by the rep (prior bot reply or manual rep send), not a broadcast/nurture email. Open directly as the rep — NO handoff bridge. Example opener: "Thanks for getting back to us, [first name]." or simply respond to what they said.`);
+      parts.push(...P.EMAIL_OPENER_REP_WRITTEN);
     }
   }
 
@@ -1502,15 +1468,15 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // ─── v1.1 SERVICE AREA STATUS (zip-verified against service_area_zips) ───
   if (opts.serviceArea?.checked) {
     if (opts.serviceArea.in_service_area === true) {
-      parts.push(`\nSERVICE AREA STATUS: zip ${opts.serviceArea.zip} VERIFIED IN SERVICE AREA${opts.serviceArea.city ? ` (${opts.serviceArea.city})` : ''}. If the customer provided their address or zip in this conversation and you have not yet told them, include a brief natural confirmation that they're in our service area (e.g. "Good news — ${opts.serviceArea.city || 'your area'} is right in our service area."). Say it once; never repeat it on later turns.`);
+      parts.push(...P.serviceAreaVerified(opts.serviceArea.zip, opts.serviceArea.city));
     } else {
-      parts.push(`\nSERVICE AREA STATUS: zip ${opts.serviceArea.zip} is OUTSIDE Reece's mapped service area. Do NOT offer any in-home visit, do NOT propose appointment times, and do NOT include a booking link. Politely let them know their area is outside our current service footprint, thank them for their interest, and do not pitch further. EXCEPTION — if the lead EXPLICITLY asked for something this turn (an estimate, a visit, a call), apply the UNIVERSAL FALLBACK instead of a bare exit: offer to have someone from the team reach out, and ask when's a good time.`);
+      parts.push(...P.serviceAreaOutside(opts.serviceArea.zip));
     }
   } else if (opts.serviceAreaTentative?.checked && opts.serviceAreaTentative.city_served === true) {
     // City-level signal only — Reece serves at least part of this city, but
     // coverage is by ZIP and cities are partially covered. Positive-only:
     // never used to tell someone they're out of area, never infers a zip.
-    parts.push(`\nSERVICE AREA STATUS (TENTATIVE — city match only): ${opts.serviceAreaTentative.city} is a market Reece serves, but coverage is confirmed by zip. You may speak positively about serving ${opts.serviceAreaTentative.city}; when you ask for the zip, frame it as the final confirmation (e.g. "We're all over ${opts.serviceAreaTentative.city} — what's the zip so I can confirm you're in our coverage?"). Do NOT state they are confirmed in the service area until the zip is verified.`);
+    parts.push(...P.serviceAreaCityTentative(opts.serviceAreaTentative.city));
   }
 
   // ─── 2026-08-18 (invented-phone incident): the ONLY phone number the model
@@ -1791,24 +1757,15 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // reference in the reply matches what is actually being booked.
   if (bcg?.customer_framing) {
     const cf = bcg.customer_framing;
-    parts.push(`\n═══════ APPOINTMENT LANGUAGE (must match the booked calendar) ═══════`);
-    parts.push(`Booked appointment type: ${cf.type === 'phone' ? 'PHONE CALL' : 'IN-HOME VISIT'} — ${cf.duration_text}.`);
-    parts.push(`Customer-facing label: "${cf.label}". ${cf.framing}`);
+    parts.push(...P.appointmentLanguage(cf.type, cf.duration_text, cf.label, cf.framing));
     // Quality Pass v1.0 Item 5 — dynamic call purpose. Evidence: a lead who
     // booked a call to get PRICING answers received "…will call you then to
     // confirm a few details" — generic, wrong purpose.
     if (cf.type === 'phone') {
-      const purposeCopy = {
-        pricing_questions: 'this call exists to GO OVER THEIR PRICING QUESTIONS. Confirmation copy names that purpose ("…will call you [day] at [time] ET to go over your pricing questions"). Refer to it as "your pricing call" or "your call".',
-        general_questions: 'this call exists to ANSWER THEIR QUESTIONS. Confirmation copy names that purpose ("…to answer your questions"). Refer to it as "your call".',
-        pre_visit_confirmation: 'this call confirms details BEFORE THEIR VISIT ("…to confirm a few details before your visit"). This is the ONLY case where "confirmation call" is a correct name.',
-        requested_callback: 'the lead ASKED to be called back. Confirmation copy reflects that ("…will call you back [day] at [time] ET"). Refer to it as "your call".',
-      }[opts.callPurpose] || null;
-      parts.push(`CALL PURPOSE: ${purposeCopy || 'unknown — use neutral copy ("…will give you a call [day] at [time] ET") and call it "your call". NEVER say "to confirm a few details" unless the purpose actually is a pre-visit confirmation.'}`);
-      parts.push(`All rendered call times state ET explicitly (e.g. "4 PM ET"). Never call it a "confirmation call" unless the purpose is pre-visit confirmation.`);
+      const purposeCopy = P.CALL_PURPOSE_COPY[opts.callPurpose] || null;
+      parts.push(...P.callPurposeLines(purposeCopy));
     }
-    parts.push(`MIRROR RULE BEATS THIS MAP: if the lead has their own word for it (quote / estimate / call / appointment), use THEIR word. But never describe a phone call as a visit or a visit as a call, and never use internal labels (PPR/MV/WE/HPA).`);
-    parts.push(`═══════ END APPOINTMENT LANGUAGE ═══════`);
+    parts.push(...P.APPOINTMENT_LANGUAGE_FOOTER);
   }
   if (bcg && bcg.requires_in_home_gate === true && idGate && !idGate.ok) {
     // v1.1 (Victor Lopez incident 2026-07-04, R2): an in-home visit may NEVER
