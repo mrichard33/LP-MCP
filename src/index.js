@@ -1631,6 +1631,23 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] capacity ranker dial_priority_log scoring columns FAILED (the ranker log insert will fail until sql/082 is applied manually):', err.message);
   }
+
+  // Capacity ranker restart hardening (sql/087 — the file is the source of
+  // truth). settle_ms / restart_attempts observability, healed_at for the
+  // self-healing sweeper (POST /n8n/capacity-ranker/heal), and
+  // cycle_disabled_until — the kill switch any restart failure trips for the
+  // rest of the day. Additive.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`ALTER TABLE dial_priority_log
+              ADD COLUMN IF NOT EXISTS settle_ms            integer,
+              ADD COLUMN IF NOT EXISTS restart_attempts     integer,
+              ADD COLUMN IF NOT EXISTS healed_at            timestamptz,
+              ADD COLUMN IF NOT EXISTS cycle_disabled_until timestamptz;`);
+    console.log('[Migration] capacity ranker dial_priority_log restart hardening columns (sql/087) ready');
+  } catch (err) {
+    console.error('[Migration] capacity ranker dial_priority_log restart hardening columns FAILED (the ranker log insert and POST /n8n/capacity-ranker/heal will fail until sql/087 is applied manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {

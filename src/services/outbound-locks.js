@@ -92,7 +92,10 @@ export async function tryAcquireLock({ contact_id, trigger_id, sender, message_p
     }
     // A live (non-expired, non-released) holder always blocks the challenger —
     // this is the hard "exactly one outbound per (contact,trigger)" guarantee.
-    return { acquired: false, reason: 'lock_held', held_by: data?.sender || 'unknown', held_priority: data?.holder_priority, expires_at: data?.expires_at };
+    // acquired_at travels with the refusal so a caller can report WHEN the
+    // live holder took the key, not just that it is held (the capacity ranker
+    // answers 409 with lock_acquired_at).
+    return { acquired: false, reason: 'lock_held', held_by: data?.sender || 'unknown', held_priority: data?.holder_priority, expires_at: data?.expires_at, acquired_at: data?.acquired_at };
   }
   if (error) {
     console.error(`[outbound-locks] acquire error for ${lock_key}: ${error.message}`);

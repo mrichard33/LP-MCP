@@ -30,6 +30,10 @@ import {
   clearCycling,
   _resetCycling,
   CYCLE_MARK_TTL_MS,
+  DEFAULT_RESTART,
+  restartBackoffMs,
+  restartCampaignVerified,
+  waitForStopSettle,
 } from '../src/capacity/applyDialPriority.js';
 import {
   runCapacityRanker,
@@ -41,6 +45,10 @@ import {
   watchdogAlertKey,
   watchdogAlertText,
   checkCampaignState,
+  healCampaigns,
+  endOfDayET,
+  restartTuning,
+  runLockTtlSec,
   addDays,
   MissingTableError,
 } from '../src/routes/capacityRanker.js';
@@ -773,7 +781,7 @@ function fakeFive9({
   writesEnabled = true, applyWrites = true, refuse = null,
   states = null, refuseWhileRunning = false,
   startsBeforeRunning = 0, startAlwaysFails = false, startThrows = false,
-  startLagMs = 0, stopDrainMs = 0,
+  startLagMs = 0, stopDrainMs = 0, startRejectsFirst = 0,
 } = {}) {
   const state = {
     [CAMPAIGNS.hot]: LIVE_HOT_LISTS.map((l) => ({ ...l })),
@@ -854,6 +862,12 @@ function fakeFive9({
         if (readCampaignState(name) === 'STOPPING') {
           throw new Error(`Five9 startCampaign fault: Error updating campaign state "${name}": Illegal campaign state STOPPING`);
         }
+        // Five9 REJECTS the first N starts outright — the campaign stays down.
+        // This is the 2026-09-04 shape: a start refused against a campaign that
+        // has not finished settling, which the old 3 x 2s budget ran out on.
+        if (startAttempts[name] <= startRejectsFirst) {
+          throw new Error(`Five9 startCampaign fault: Error updating campaign state "${name}": campaign is not ready`);
+        }
         if (startThrows) throw new Error('Five9 startCampaign fault');
         if (startAlwaysFails) return { campaign: name, method: 'startCampaign', state: 'NOT_RUNNING' };
         if (startAttempts[name] > startsBeforeRunning && campaignState[name] !== 'RUNNING') {
@@ -924,18 +938,27 @@ test('CYCLE: stop before modify, start after, one campaign at a time — the wri
   assert.equal(f.state[CAMPAIGNS.hot].find((l) => l.name === 'Data - Hot - LKE less than 7').dialingPriority, 7, 'reorder landed');
 });
 
-test('CYCLE: restart reads non-RUNNING twice then RUNNING → retried with backoff, restarted:true', async () => {
+test('CYCLE: restart reads non-RUNNING twice then RUNNING → retried with EXPONENTIAL backoff, restarted:true', async () => {
   const sleeps = [];
   const f = fakeFive9({ startsBeforeRunning: 2 });
   const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
-    ...f.deps, cycleCampaigns: true, restartAttempts: 3, restartBackoffMs: 2000, restartSettleMs: 5000,
-    sleep: async (ms) => { sleeps.push(ms); }, log: () => {},
+    ...f.deps, cycleCampaigns: true, log: () => {},
+    sleep: async (ms) => { sleeps.push(ms); },
   });
   assert.equal(f.calls.filter((c) => c[0] === 'start' && c[1] === CAMPAIGNS.hot).length, 3, 'three start attempts on hot');
-  assert.deepEqual(sleeps.slice(0, 5), [5000, 2000, 5000, 2000, 5000], 'settle before each read, 2s backoff between attempts');
+  // The backoff is what the old flat 2s could not do: 2s, then 4s, then 8s…
+  // Everything else in the sleep log is the 3s verify poll.
+  const backoffs = sleeps.filter((ms) => ms !== DEFAULT_RESTART.pollMs);
+  assert.deepEqual(backoffs.slice(0, 2), [2000, 4000], 'exponential, not flat');
   assert.equal(out.campaigns.hot.restarted, true);
+  assert.equal(out.campaigns.hot.restart_attempts, 3);
   assert.equal(out.applied, true);
   assert.deepEqual(out.restart_failures, []);
+});
+
+test('BACKOFF: 2, 4, 8, 16, 32, then capped at 60s — the published ladder', () => {
+  const ladder = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => restartBackoffMs(n));
+  assert.deepEqual(ladder, [2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000, 60000, 60000]);
 });
 
 // Five9 reports campaign state asynchronously. On 2026-09-03 the STEP 0 start
@@ -944,39 +967,39 @@ test('CYCLE: restart reads non-RUNNING twice then RUNNING → retried with backo
 // "campaign is dark" about a campaign that is dialing — a false CRITICAL, a
 // false 500, and a page for nobody.
 
-test('LAG: state still reads NOT_RUNNING right after an accepted start → settles, ONE start call, restarted:true', async () => {
+test('LAG: state still reads NOT_RUNNING right after an accepted start → the verify poll waits it out, ONE start call', async () => {
   const sleeps = [];
-  const f = fakeFive9({ startLagMs: 3000 }); // shorter than the 5s settle
+  const f = fakeFive9({ startLagMs: 3000 }); // Five9 reports state 3s late
   const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
-    ...f.deps, cycleCampaigns: true, restartSettleMs: 5000,
+    ...f.deps, cycleCampaigns: true,
     sleep: async (ms) => { sleeps.push(ms); f.advance(ms); }, log: () => {},
   });
   assert.equal(f.calls.filter((c) => c[0] === 'start' && c[1] === CAMPAIGNS.hot).length, 1, 'the start was accepted once — never re-fired at a live campaign');
-  assert.equal(sleeps[0], 5000, 'settled before believing the read');
+  assert.equal(sleeps[0], DEFAULT_RESTART.pollMs, 'polled rather than believing the first read');
   assert.equal(out.campaigns.hot.restarted, true);
   assert.deepEqual(out.restart_failures, []);
   assert.equal(out.applied, true);
 });
 
-test('LAG: every attempt reads stale, the FINAL confirmation read rescues it — no CRITICAL, applied stays true', async () => {
-  const sleeps = [];
+test('LAG: a 25s reporting lag is absorbed INSIDE the attempt budget — no CRITICAL, applied stays true', async () => {
   const log = [];
-  // 25s lag: every attempt (3 × 5s settle + 2 × 2s backoff = 19s) reads stale.
+  // 25s lag: longer than one 15s verify window, so it takes a second attempt.
+  // Under the OLD budget (3 x 2s + a 10s final read) this campaign was declared
+  // dark while it was in fact dialing.
   const f = fakeFive9({ startLagMs: 25000 });
   const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
-    ...f.deps, cycleCampaigns: true, restartAttempts: 3, restartSettleMs: 5000,
-    restartBackoffMs: 2000, restartFinalWaitMs: 10000,
-    sleep: async (ms) => { sleeps.push(ms); f.advance(ms); }, log: (m) => log.push(m),
+    ...f.deps, cycleCampaigns: true,
+    sleep: async (ms) => { f.advance(ms); }, log: (m) => log.push(m),
   });
-  assert.equal(sleeps.at(-1), 10000, 'the last wait is the final confirmation wait');
   assert.equal(out.campaigns.hot.restarted, true);
   assert.equal(out.campaigns.hot.restart_error, undefined, 'a rescued restart carries no error');
+  assert.ok(out.campaigns.hot.restart_attempts <= 3, 'took a couple of attempts, nowhere near the ceiling');
   assert.ok(!log.some((m) => /CRITICAL/.test(m)), 'never paged anyone');
   assert.deepEqual(out.restart_failures, []);
   assert.equal(out.applied, true);
 });
 
-test('LAG: a genuinely dark campaign still fails after the final read — the alarm is not disarmed', async () => {
+test('LAG: a genuinely dark campaign still fails once the budget is spent — the alarm is not disarmed', async () => {
   const log = [];
   const f = fakeFive9({ startAlwaysFails: true });
   const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
@@ -1060,6 +1083,119 @@ test('DRAIN: the dark window is still REPORTED, never hidden by the new waiting'
   assert.equal(out.campaigns.hot.restarted, true);
 });
 
+// ─── SETTLE: wait for the graceful stop to land before doing anything ───────
+//
+// THE MECHANISM BEHIND 2026-09-04. stopCampaign returns as soon as Five9
+// accepts it, but the campaign then sits in STOPPING while it drains calls in
+// progress — and in that window Five9 refuses BOTH the list write and a start.
+// Warm (2,640 records, 8 lists) drains longest, which is why it failed twice.
+
+test('SETTLE: the list write waits for the stop to actually land, and settle_ms is recorded', async () => {
+  const f = fakeFive9({ stopDrainMs: 12000, refuseWhileRunning: true });
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true,
+    sleep: async (ms) => { f.advance(ms); }, log: () => {},
+  });
+  assert.equal(out.campaigns.hot.settled, true);
+  assert.ok(out.campaigns.hot.settle_ms >= 12000, `settle_ms reports the observed drain (got ${out.campaigns.hot.settle_ms})`);
+  assert.equal(out.campaigns.hot.written, true, 'the write went out only once the campaign had settled');
+  assert.equal(out.campaigns.hot.verified, true);
+  assert.ok(out.settle_ms > 0, 'summed for the dial_priority_log row');
+  assert.equal(out.applied, true);
+});
+
+test('SETTLE: a stop that NEVER settles → no reorder is attempted, the campaign is restarted, the run aborts cleanly', async () => {
+  const log = [];
+  // Drains far past the settle timeout, then finally comes back — so the
+  // restart succeeds and the only casualty is this run's reorder.
+  const f = fakeFive9({ stopDrainMs: 40000, refuseWhileRunning: true });
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true, stopSettleTimeoutMs: 10000,
+    sleep: async (ms) => { f.advance(ms); }, log: (m) => log.push(m),
+  });
+  assert.deepEqual(f.calls.filter((c) => c[0] === 'modify' && c[1] === CAMPAIGNS.hot), [],
+    'the reorder was NEVER fired into a draining campaign');
+  assert.equal(out.campaigns.hot.settled, false);
+  assert.match(out.campaigns.hot.skipped_reason, /did not settle/);
+  assert.equal(out.campaigns.hot.restarted, true, 'but it was still brought back');
+  assert.deepEqual(out.restart_failures, [], 'a skipped reorder is not a dark campaign');
+  assert.equal(out.applied, false, 'nothing was applied, and the run says so');
+  assert.equal(f.campaignState[CAMPAIGNS.hot], 'RUNNING');
+});
+
+test('SETTLE: waitForStopSettle polls every 2s up to the timeout and reports the state it gave up on', async () => {
+  let state = 'STOPPING';
+  const sleeps = [];
+  const out = await waitForStopSettle('Data - Warm Leads less than 30', {
+    readState: async () => state,
+    sleep: async (ms) => { sleeps.push(ms); },
+    timeoutMs: 30000, pollMs: 2000,
+  });
+  assert.equal(out.settled, false);
+  assert.equal(out.state, 'STOPPING');
+  assert.equal(sleeps.length, 15, '30s / 2s — bounded by a poll count, not a wall clock');
+  assert.equal(out.settle_ms, 30000);
+
+  state = 'RUNNING';
+  const quick = await waitForStopSettle('x', { readState: async () => (state = 'NOT_RUNNING'), sleep: async () => {} });
+  assert.equal(quick.settled, true);
+  assert.equal(quick.settle_ms, 0, 'a stop that has already landed costs nothing');
+});
+
+// ─── THE PRODUCTION CASE: a start rejected, then rejected again, then taken ──
+
+test('RESTART: startCampaign is REJECTED twice, then succeeds → campaign ends RUNNING and applied is true', async () => {
+  // This is dial_priority_log id 24, 2026-09-04: the campaign was reachable and
+  // the starts were being refused, not lost. Under the old 3 x 2s budget the
+  // loop gave up and "Data - Warm Leads less than 30" stayed dark for two hours.
+  const log = [];
+  const f = fakeFive9({ startRejectsFirst: 2 });
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true,
+    sleep: async (ms) => { f.advance(ms); }, log: (m) => log.push(m),
+  });
+  for (const tier of ['hot', 'warm']) {
+    assert.equal(out.campaigns[tier].restarted, true, `${tier} came back`);
+    assert.equal(out.campaigns[tier].restart_attempts, 3, `${tier}: two refusals then a start that took`);
+    assert.equal(f.campaignState[CAMPAIGNS[tier]], 'RUNNING');
+  }
+  assert.deepEqual(out.restart_failures, []);
+  assert.equal(out.applied, true, 'the reorder landed AND the floor is dialing');
+  assert.ok(!log.some((m) => /CRITICAL/.test(m)), 'a refusal that is retried past is not an incident');
+});
+
+test('RESTART: an exception NEVER exits the loop early — every attempt is spent before giving up', async () => {
+  const f = fakeFive9({ startThrows: true });
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true, sleep: async () => {}, log: () => {},
+  });
+  assert.equal(f.calls.filter((c) => c[0] === 'start' && c[1] === CAMPAIGNS.hot).length, DEFAULT_RESTART.maxAttempts,
+    'ten attempts, even though every one of them threw');
+  assert.equal(out.campaigns.hot.restart_attempts, DEFAULT_RESTART.maxAttempts);
+  assert.match(out.campaigns.hot.restart_error, /startCampaign fault/, 'the refusal, not a state read, is the reported cause');
+});
+
+test('RESTART: the CEILING ends the loop even when attempts remain', async () => {
+  const f = fakeFive9({ startAlwaysFails: true });
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true, restartCeilingMs: 30000,
+    sleep: async (ms) => { f.advance(ms); }, log: () => {},
+  });
+  assert.ok(out.campaigns.hot.restart_attempts < DEFAULT_RESTART.maxAttempts,
+    `the 30s ceiling stopped it early (attempts=${out.campaigns.hot.restart_attempts})`);
+  assert.deepEqual(out.restart_failures, [CAMPAIGNS.hot]);
+});
+
+test('RESTART: a campaign someone else already brought back is left alone — no start is fired', async () => {
+  const r = await restartCampaignVerified('Data - Hot Leads less than 7', {
+    readState: async () => 'RUNNING',
+    startCampaign: async () => { throw new Error('must never be called'); },
+    sleep: async () => {},
+  });
+  assert.equal(r.restarted, true);
+  assert.equal(r.attempts, 0, 'idempotent — this is what makes /heal safe to call repeatedly');
+});
+
 // ─── The never-both-dark guard, on LIVE state ───────────────────────────────
 
 test('GUARD: a campaign already dark from an EARLIER run blocks cycling the other one', async () => {
@@ -1139,7 +1275,7 @@ test('CYCLE: restart NEVER succeeds → applied:false, restart_failures populate
   assert.equal(out.campaigns.hot.restarted, false);
   assert.equal(out.campaigns.hot.verified, true, 'the reorder itself DID land — the failure is the restart');
   assert.match(out.campaigns.hot.restart_error, /state reads NOT_RUNNING after start/);
-  assert.equal(f.calls.filter((c) => c[0] === 'start' && c[1] === CAMPAIGNS.hot).length, 3, 'bounded at restartAttempts');
+  assert.equal(f.calls.filter((c) => c[0] === 'start' && c[1] === CAMPAIGNS.hot).length, DEFAULT_RESTART.maxAttempts, 'bounded at restartAttempts — TEN, not three');
   assert.ok(log.some((m) => /CRITICAL.*DID NOT RESTART/.test(m)), 'shouts in the log');
   // Hot is dark, so Warm must NOT be stopped too — the floor keeps its one live campaign.
   assert.deepEqual(f.calls.filter((c) => c[1] === CAMPAIGNS.warm), [], 'warm: not stopped, not written, not started');
@@ -1291,8 +1427,9 @@ function fakeRun({
   insertImpl = null, stale = false, now = null, performance = PERF_2026_09_04,
   history = [], historyImpl = null, perfWeight = 0.25,
   lockHeld = false, lockImpl = null, releaseImpl = null,
+  cycleDisabledUntil = null, cycleDisabledImpl = null,
 } = {}) {
-  const calls = { apply: 0, applyOpts: [], inserted: [], acquired: 0, released: [] };
+  const calls = { apply: 0, applyOpts: [], inserted: [], acquired: 0, released: [], alerts: [] };
   const deps = {
     mode,
     swapMargin: 0.5,
@@ -1303,11 +1440,13 @@ function fakeRun({
     getPerformance: async () => performance,
     readAppliedHistory: historyImpl || (async () => history),
     readLastApplied: async () => prev,
+    readCycleDisabledUntil: cycleDisabledImpl || (async () => cycleDisabledUntil),
+    raiseAlert: async (a) => { calls.alerts.push(a); },
     insertLog: insertImpl || (async (row) => { calls.inserted.push(row); return 42; }),
     acquireRunLock: lockImpl || (async () => {
       calls.acquired += 1;
       return lockHeld
-        ? { acquired: false, reason: 'lock_held', held_by: 'capacity_ranker', expires_at: '2026-09-03T16:52:00Z' }
+        ? { acquired: false, reason: 'lock_held', held_by: 'capacity_ranker', acquired_at: '2026-09-03T16:47:00Z', expires_at: '2026-09-03T16:52:00Z' }
         : { acquired: true, expires_at: '2026-09-03T16:53:00Z' };
     }),
     releaseRunLock: releaseImpl || (async (lock) => { calls.released.push(lock?.expires_at ?? null); }),
@@ -1363,7 +1502,9 @@ test('LOCK: a second concurrent run is REFUSED with 409 — no ranking, no log r
   const { deps, calls } = fakeRun({ mode: 'live', lockHeld: true });
   const { status, body } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
   assert.equal(status, 409);
-  assert.match(body.error, /already running/i);
+  assert.equal(body.error, 'ranker_already_running', 'a machine-readable code, not prose — n8n branches on it');
+  assert.match(body.message, /already running/i, 'the prose moved to message');
+  assert.equal(body.lock_acquired_at, '2026-09-03T16:47:00Z', 'the caller is told WHEN the holder took it');
   assert.equal(body.lock_held_by, 'capacity_ranker');
   assert.equal(calls.apply, 0, 'nothing was applied to Five9');
   assert.equal(calls.inserted.length, 0, 'no dial_priority_log row — the run never happened');
@@ -1678,6 +1819,250 @@ test('route: a stale capacity source is flagged, not hidden', async () => {
   const { body } = await runCapacityRanker({ slot_date: '2026-09-04' }, deps);
   assert.equal(body.source.stale, true);
   assert.ok(body.warnings.some((w) => /STALE/.test(w)));
+});
+
+// ─── Blast radius: a restart failure disables cycling for the rest of the day ─
+//
+// Three restart failures in one afternoon (dial_priority_log 18, 19, 24) should
+// have stopped the cycling automatically after the FIRST one. A run still
+// computes and logs its ranking when cycling is disabled — only the stop and
+// restart are withheld.
+
+test('DISABLE: a restart failure sets cycle_disabled_until to the end of the ET day, alerts, and 500s', async () => {
+  await withCycleEnv('true', async () => {
+    const { deps, calls } = fakeRun({
+      mode: 'live',
+      now: new Date('2026-09-04T20:18:00Z'), // 16:18 ET — the id 24 run
+      applyImpl: async () => ({
+        applied: false, dry_run: false, restart_failures: [CAMPAIGNS.warm],
+        settle_ms: 26000, restart_attempts: 10,
+        campaigns: { warm: { cycled: true, restarted: false, downtime_ms: 199717, settle_ms: 26000, restart_attempts: 10 } },
+      }),
+    });
+    const { status, body } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
+    assert.equal(status, 500);
+    assert.equal(calls.inserted[0].cycle_disabled_until, '2026-09-05T04:00:00.000Z', 'midnight ET, not midnight UTC');
+    assert.equal(calls.inserted[0].settle_ms, 26000, 'the observed settle time is recorded');
+    assert.equal(calls.inserted[0].restart_attempts, 10, 'and how many attempts it took to give up');
+    assert.deepEqual(calls.inserted[0].restart_failures, [CAMPAIGNS.warm]);
+    assert.equal(calls.alerts.length, 1, 'the failure is queued durably, not only logged');
+    assert.deepEqual(calls.alerts[0].campaigns, [CAMPAIGNS.warm]);
+    assert.match(body.warnings.join(' '), /cycling disabled until/);
+  });
+});
+
+test('DISABLE: with cycle_disabled_until in the FUTURE the run still ranks and logs, but never cycles', async () => {
+  await withCycleEnv('true', async () => {
+    const { deps, calls } = fakeRun({
+      mode: 'live',
+      cycleDisabledUntil: '2026-09-04T23:59:00Z', // after the 12:48 ET run clock
+    });
+    const { status, body } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
+    assert.equal(status, 200);
+    assert.ok(body.ranking.length > 0, 'the ranking is still computed');
+    assert.equal(calls.inserted.length, 1, 'and still logged');
+    assert.equal(calls.applyOpts[0].cycleCampaigns, false, 'but nothing is stopped');
+    assert.equal(body.cycled, false);
+    assert.match(body.warnings.join(' '), /cycling is DISABLED until/);
+  });
+});
+
+test('DISABLE: a marker that has already PASSED does not block cycling', async () => {
+  await withCycleEnv('true', async () => {
+    const { deps } = fakeRun({ mode: 'live', cycleDisabledUntil: '2026-09-03T10:00:00Z' });
+    const { status } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
+    assert.equal(status, 200);
+  });
+});
+
+test('DISABLE: an unreadable marker refuses to cycle rather than silently re-arming', async () => {
+  await withCycleEnv('true', async () => {
+    const { deps, calls } = fakeRun({
+      mode: 'live',
+      cycleDisabledImpl: async () => { throw new Error('supabase unavailable'); },
+    });
+    const { status, body } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
+    assert.equal(status, 200, 'the ranking still runs');
+    assert.equal(calls.applyOpts[0].cycleCampaigns, false);
+    assert.match(body.warnings.join(' '), /could not read cycle_disabled_until/);
+  });
+});
+
+test('DISABLE: with the cycle flag OFF the marker is never even read', async () => {
+  let reads = 0;
+  const { deps } = fakeRun({ mode: 'live', cycleDisabledImpl: async () => { reads += 1; return null; } });
+  await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
+  assert.equal(reads, 0);
+});
+
+test('endOfDayET: the next ET midnight, in both EDT and EST', () => {
+  assert.equal(endOfDayET(new Date('2026-09-04T20:18:00Z')).toISOString(), '2026-09-05T04:00:00.000Z', 'EDT, UTC-4');
+  assert.equal(endOfDayET(new Date('2026-01-15T18:00:00Z')).toISOString(), '2026-01-16T05:00:00.000Z', 'EST, UTC-5');
+  assert.equal(endOfDayET(new Date('2026-09-05T03:30:00Z')).toISOString(), '2026-09-05T04:00:00.000Z', '23:30 ET — half an hour left, not a whole day');
+});
+
+test('runLockTtlSec: 15 minutes by default, RANKER_LOCK_TTL_MS wins over the legacy seconds knob', () => {
+  assert.equal(runLockTtlSec({}), 900, 'longer than the worst run now a restart can take ten minutes');
+  assert.equal(runLockTtlSec({ RANKER_LOCK_TTL_MS: '600000' }), 600);
+  assert.equal(runLockTtlSec({ CAPACITY_RANKER_LOCK_TTL_SEC: '600' }), 600, 'an existing Railway value still means something');
+  assert.equal(runLockTtlSec({ RANKER_LOCK_TTL_MS: '900000', CAPACITY_RANKER_LOCK_TTL_SEC: '600' }), 900, 'the documented knob wins');
+});
+
+test('restartTuning: env overrides, with the hardened defaults when unset', () => {
+  assert.deepEqual(restartTuning({}), {
+    restartAttempts: 10, restartCeilingMs: 600000, stopSettleTimeoutMs: 30000,
+  });
+  assert.deepEqual(restartTuning({
+    RANKER_RESTART_MAX_ATTEMPTS: '4', RANKER_RESTART_CEILING_MS: '120000', RANKER_STOP_SETTLE_TIMEOUT_MS: '45000',
+  }), { restartAttempts: 4, restartCeilingMs: 120000, stopSettleTimeoutMs: 45000 });
+  assert.deepEqual(restartTuning({ RANKER_RESTART_MAX_ATTEMPTS: 'lots', RANKER_RESTART_CEILING_MS: '0' }), {
+    restartAttempts: 10, restartCeilingMs: 600000, stopSettleTimeoutMs: 30000,
+  }, 'garbage and zero both fall back to the default rather than disabling retries');
+});
+
+// ─── End to end: the production incident, run through the whole route ───────
+
+test('INCIDENT 2026-09-04: two rejected starts, then RUNNING — the run applies, logs settle_ms, and disables nothing', async () => {
+  await withCycleEnv('true', async () => {
+    const f = fakeFive9({ startRejectsFirst: 2, stopDrainMs: 20000, refuseWhileRunning: true });
+    const { deps, calls } = fakeRun({ mode: 'live' });
+    deps.apply = (rankResult, { cycleCampaigns }) => applyDialPriority(rankResult, {
+      ...f.deps, cycleCampaigns, log: () => {},
+      sleep: async (ms) => { f.advance(ms); },
+    });
+    const { status, body } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
+    assert.equal(status, 200, 'no 500 — the campaigns came back');
+    assert.equal(body.applied, true);
+    assert.equal(f.campaignState[CAMPAIGNS.hot], 'RUNNING');
+    assert.equal(f.campaignState[CAMPAIGNS.warm], 'RUNNING');
+    assert.equal(calls.inserted[0].restart_failures, null);
+    assert.equal(calls.inserted[0].cycle_disabled_until, null, 'cycling stays armed when nothing went dark');
+    assert.ok(calls.inserted[0].settle_ms >= 40000, 'both drains are recorded');
+    assert.equal(calls.inserted[0].restart_attempts, 6, 'three attempts per campaign');
+    assert.deepEqual(calls.alerts, [], 'nobody is paged for a restart that took a few tries');
+  });
+});
+
+test('INCIDENT 2026-09-04: a campaign that never comes back → 500, named, alerted, cycling disabled for the day', async () => {
+  await withCycleEnv('true', async () => {
+    const f = fakeFive9({ startAlwaysFails: true });
+    const { deps, calls } = fakeRun({ mode: 'live', now: new Date('2026-09-04T20:18:00Z') });
+    deps.apply = (rankResult, { cycleCampaigns }) => applyDialPriority(rankResult, {
+      ...f.deps, cycleCampaigns, log: () => {},
+      sleep: async (ms) => { f.advance(ms); },
+    });
+    const { status, body } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
+    assert.equal(status, 500);
+    assert.equal(body.applied, false);
+    assert.match(body.error, /CRITICAL/);
+    assert.deepEqual(calls.inserted[0].restart_failures, [CAMPAIGNS.hot]);
+    assert.equal(calls.inserted[0].restart_attempts, DEFAULT_RESTART.maxAttempts, 'ten attempts, not three');
+    assert.equal(calls.inserted[0].cycle_disabled_until, '2026-09-05T04:00:00.000Z');
+    assert.equal(calls.alerts.length, 1);
+    // And the peer guard held: one dark campaign never becomes two.
+    assert.equal(f.campaignState[CAMPAIGNS.warm], 'RUNNING');
+  });
+});
+
+// ─── /heal — the self-healing sweeper ───────────────────────────────────────
+//
+// The finally block cannot survive a process death between stop and start, and
+// retries can genuinely exhaust. Either way a campaign is left NOT_RUNNING and
+// nothing in the run comes back for it — on 2026-09-04 that was two hours.
+// The watchdog that already DETECTS now also REPAIRS.
+
+function fakeHeal({
+  restartFailures = [CAMPAIGNS.warm], states = { [CAMPAIGNS.warm]: 'NOT_RUNNING' },
+  sourceId = 24, startWorks = true, sourceRow = undefined,
+} = {}) {
+  const campaignState = { [CAMPAIGNS.hot]: 'RUNNING', ...states };
+  const calls = { starts: [], inserted: [], healed: [], alerts: [] };
+  const deps = {
+    log: () => {},
+    now: new Date('2026-09-04T20:25:00Z'),
+    sleep: async () => {},
+    readLastRestartFailure: async () => (sourceRow !== undefined
+      ? sourceRow
+      : { id: sourceId, ran_at: '2026-09-04T20:18:27Z', restart_failures: restartFailures, healed_at: null }),
+    getOutbound: async (name) => ({ name, state: campaignState[name] ?? null }),
+    startCampaign: async (action) => {
+      const name = action.action_payload.campaign_name;
+      calls.starts.push(name);
+      assert.equal(action.action_type, 'five9_start_campaign');
+      if (startWorks) campaignState[name] = 'RUNNING';
+      return { campaign: name, method: 'startCampaign' };
+    },
+    insertLog: async (row) => { calls.inserted.push(row); return 99; },
+    markHealed: async (id, at) => { calls.healed.push([id, at]); },
+    sendAlert: async (text) => { calls.alerts.push(text); },
+  };
+  return { deps, calls, campaignState };
+}
+
+test('HEAL: a campaign left NOT_RUNNING is started, verified, and stamped healed_at', async () => {
+  const { deps, calls, campaignState } = fakeHeal();
+  const { status, body } = await healCampaigns(deps);
+  assert.equal(status, 200);
+  assert.equal(body.outcome, 'healed');
+  assert.deepEqual(body.healed, [CAMPAIGNS.warm]);
+  assert.deepEqual(calls.starts, [CAMPAIGNS.warm], 'exactly one start');
+  assert.equal(campaignState[CAMPAIGNS.warm], 'RUNNING', 'the floor is dialing it again');
+  assert.deepEqual(calls.healed, [[24, '2026-09-04T20:25:00.000Z']], 'the row that recorded the failure is closed out');
+  assert.equal(calls.inserted[0].mode, 'heal', 'the outcome row never mixes with ranking runs');
+  assert.equal(calls.inserted[0].healed_at, '2026-09-04T20:25:00.000Z');
+  assert.equal(calls.inserted[0].restart_failures, null);
+  assert.equal(calls.alerts.length, 1, 'and somebody is told');
+  assert.match(calls.alerts[0], /restarted/);
+});
+
+test('HEAL: IDEMPOTENT — a second call against an already RUNNING campaign is a silent no-op', async () => {
+  const { deps, calls } = fakeHeal({ states: { [CAMPAIGNS.warm]: 'RUNNING' } });
+  const { status, body } = await healCampaigns(deps);
+  assert.equal(status, 200);
+  assert.deepEqual(calls.starts, [], 'never starts what is already up');
+  assert.deepEqual(body.already_running, [CAMPAIGNS.warm]);
+  assert.equal(body.no_op, true);
+  assert.deepEqual(calls.alerts, [], 'a healthy sweep every 5 minutes must not become a 5-minute alarm');
+  assert.deepEqual(calls.healed, [], 'nothing to close out');
+});
+
+test('HEAL: nothing has ever failed to restart → no-op, 200, no Five9 call at all', async () => {
+  const { deps, calls } = fakeHeal({ sourceRow: null });
+  const { status, body } = await healCampaigns(deps);
+  assert.equal(status, 200);
+  assert.equal(body.no_op, true);
+  assert.deepEqual(calls.starts, []);
+  assert.deepEqual(calls.inserted, [], 'no outcome row for a sweep that had nothing to sweep');
+});
+
+test('HEAL: a campaign that still will not start → 503, heal_failed, and a loud alert', async () => {
+  const { deps, calls } = fakeHeal({ startWorks: false });
+  const { status, body } = await healCampaigns(deps);
+  assert.equal(status, 503, 'the n8n execution goes red so a human looks');
+  assert.equal(body.outcome, 'heal_failed');
+  assert.equal(body.failed[0].campaign, CAMPAIGNS.warm);
+  assert.deepEqual(calls.healed, [], 'healed_at is NOT stamped on a failure');
+  assert.deepEqual(calls.inserted[0].restart_failures, [CAMPAIGNS.warm]);
+  assert.match(calls.alerts[0], /HEAL FAILED/);
+});
+
+test('HEAL: an UNREADABLE campaign is reported, never guessed at', async () => {
+  const { deps, calls } = fakeHeal({ states: { [CAMPAIGNS.warm]: null } });
+  const { status, body } = await healCampaigns(deps);
+  assert.equal(status, 503);
+  assert.match(body.failed[0].error, /UNREADABLE/);
+  assert.deepEqual(calls.starts, [], 'a campaign we cannot see is not a campaign we start');
+});
+
+test('HEAL: both campaigns named → both handled, and one outcome row covers the sweep', async () => {
+  const { deps, calls } = fakeHeal({
+    restartFailures: [CAMPAIGNS.hot, CAMPAIGNS.warm],
+    states: { [CAMPAIGNS.hot]: 'NOT_RUNNING', [CAMPAIGNS.warm]: 'NOT_RUNNING' },
+  });
+  const { body } = await healCampaigns(deps);
+  assert.deepEqual(body.healed, [CAMPAIGNS.hot, CAMPAIGNS.warm]);
+  assert.deepEqual(calls.starts, [CAMPAIGNS.hot, CAMPAIGNS.warm]);
+  assert.equal(calls.inserted.length, 1);
 });
 
 // ─── env resolution ──────────────────────────────────────────────────────────
