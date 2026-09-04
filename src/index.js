@@ -1590,6 +1590,20 @@ async function runMigrations() {
   } catch (err) {
     console.error('[Migration] capacity ranker dial_priority_log cycle columns FAILED (the ranker log insert will fail until sql/081 is applied manually):', err.message);
   }
+
+  // Capacity ranker scoring provenance (sql/082 — the file is the source of
+  // truth). perf_weight / scoring_basis per run, so a logged ranking can be
+  // reproduced later and pre-2026-09 fill_pct rows stay distinguishable from
+  // open-slot-weighted ones. Additive.
+  try {
+    const { runSQL } = await import('./admin/supabase-admin.js');
+    await runSQL(`ALTER TABLE dial_priority_log
+              ADD COLUMN IF NOT EXISTS perf_weight   numeric,
+              ADD COLUMN IF NOT EXISTS scoring_basis text;`);
+    console.log('[Migration] capacity ranker dial_priority_log scoring columns (sql/082) ready');
+  } catch (err) {
+    console.error('[Migration] capacity ranker dial_priority_log scoring columns FAILED (the ranker log insert will fail until sql/082 is applied manually):', err.message);
+  }
 }
 
 app.get('/', (req, res) => {
