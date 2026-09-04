@@ -82,7 +82,13 @@ export function registerSyncTools(server) {
       const totalSynced = (recentSyncs || []).reduce((s, r) => s + (r.records_synced || 0), 0);
       const totalFailed = (recentSyncs || []).filter(r => r.status === 'failed').length;
 
-      // Unmapped sources count
+      // Unmapped sources count — the raw review queue. Cheap and DB-only, so
+      // it stays here; the authoritative gap (LP's catalog diffed against
+      // lp_source_mapping) needs an LP API call and lives in
+      // get_source_catalog_health instead. After the 2026-09-04 queue repair
+      // this should read in single digits; hundreds means the repair did not
+      // apply. Note it counts rows with no source at all (source_subdetail and
+      // source_raw both NULL), which are not mapping work.
       const { count: unmappedCount } = await supabase
         .from('lp_unmapped_sources')
         .select('*', { count: 'exact', head: true })
@@ -118,6 +124,7 @@ export function registerSyncTools(server) {
               failed_syncs: totalFailed,
             },
             unmapped_sources: unmappedCount || 0,
+            unmapped_sources_note: 'Raw review-queue rows. For the real gap against LP\'s source catalog, run get_source_catalog_health.',
             unfired_milestone_triggers: unfiredMilestones || 0,
             day15_untriggered_leads: day15Untriggered || 0,
             circuit_breaker: circuit,

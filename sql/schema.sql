@@ -234,14 +234,71 @@ CREATE INDEX IF NOT EXISTS idx_trigger_log_event ON lp_trigger_log(event);
 -- =============================================================
 -- Supplemental: lp_unmapped_sources (weekly review queue)
 -- =============================================================
+-- The queue records EXISTENCE of a source and one sample lead. It deliberately
+-- carries no volume counter: lead_count was retired 2026-09-04 because it
+-- counted sync cycles rather than leads (see
+-- sql/migrations/2026-09-04_source_queue_repair.sql). Volume comes from
+-- v_source_volume_90d, computed from lp_leads.
 CREATE TABLE IF NOT EXISTS lp_unmapped_sources (
-  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  source_subdetail    TEXT,
-  source_raw          TEXT,
-  sample_lp_lead_id   TEXT,
-  lead_count          INTEGER DEFAULT 1,
-  first_seen          TIMESTAMPTZ DEFAULT now(),
-  reviewed            BOOLEAN DEFAULT FALSE
+  id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  source_subdetail      TEXT,
+  source_raw            TEXT,
+  sample_lp_lead_id     TEXT,
+  lead_count_deprecated INTEGER,       -- DEPRECATED — do not read. See above.
+  first_seen            TIMESTAMPTZ DEFAULT now(),
+  reviewed              BOOLEAN DEFAULT FALSE,
+  reviewed_by           TEXT
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_unmapped_src ON lp_unmapped_sources(source_subdetail, source_raw);
+-- NULLS NOT DISTINCT (PG15+) is load-bearing: without it a source-less lead
+-- (NULL, NULL) never conflicts with the row already there, so every such lead
+-- inserts a new row. That is what produced 175 duplicate rows by 2026-09-04.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_unmapped_src
+  ON lp_unmapped_sources(source_subdetail, source_raw) NULLS NOT DISTINCT;
+
+-- =============================================================
+-- Supplemental: lp_source_catalog (LP's authoritative source list)
+-- =============================================================
+-- Mirrored daily by src/jobs/source-reconcile.js from
+-- POST /api/Leads/GetLeadsSourceSubPromoter (type=s). Report-only — the
+-- reconciler never writes lp_source_mapping from it.
+CREATE TABLE IF NOT EXISTS lp_source_catalog (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  lp_source_id        TEXT,
+  lp_source_raw       TEXT,
+  lp_source_subdetail TEXT,
+  active              BOOLEAN DEFAULT TRUE,
+  first_seen          TIMESTAMPTZ DEFAULT now(),
+  last_seen           TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_lp_source_catalog_key
+  ON lp_source_catalog(lp_source_raw, lp_source_subdetail) NULLS NOT DISTINCT;
+CREATE INDEX IF NOT EXISTS idx_lp_source_catalog_subdetail
+  ON lp_source_catalog(lower(trim(lp_source_subdetail)));
+
+CREATE TABLE IF NOT EXISTS lp_source_reconcile_runs (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  ran_at          TIMESTAMPTZ DEFAULT now(),
+  catalog_count   INTEGER,
+  unmapped_count  INTEGER,
+  orphaned_count  INTEGER,
+  dormant_count   INTEGER,
+  events_emitted  INTEGER DEFAULT 0,
+  detail          JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_lp_source_reconcile_runs_ran_at
+  ON lp_source_reconcile_runs(ran_at DESC);
+
+-- Real per-source volume. Replaces the retired lead_count everywhere.
+CREATE OR REPLACE VIEW v_source_volume_90d AS
+SELECT
+  lead_source_detail,
+  count(*)                                                            AS leads_90d,
+  count(*) FILTER (WHERE created_at_lp >= now() - interval '30 days')  AS leads_30d,
+  max(created_at_lp)                                                  AS last_lead_at
+FROM lp_leads
+WHERE created_at_lp >= now() - interval '90 days'
+  AND lead_source_detail IS NOT NULL
+GROUP BY 1;
