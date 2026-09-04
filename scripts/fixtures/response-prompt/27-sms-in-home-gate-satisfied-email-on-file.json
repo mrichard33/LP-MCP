@@ -1,0 +1,114 @@
+{
+  "name": "27-sms-in-home-gate-satisfied-email-on-file",
+  "covers": "sms · in-home prerequisites satisfied · email already on file",
+  "env": {},
+  "channel": "sms",
+  "triggerMessage": "Thursday at 10 works for us.",
+  "fastTrack": false,
+  "trafficTemp": "warm",
+  "kbPack": {
+    "primary_arc": {
+      "arc_id": "ARC-3",
+      "arc_name": "The Hurricane Season Clock",
+      "core_belief": "Protection bought early costs less and arrives on time.",
+      "problem_named": "Waiting for a named storm means waiting in line behind everyone else."
+    },
+    "booking_context": {
+      "resolved_calendar_id": "cal_we_0001",
+      "resolved_calendar_name": "Window Estimate",
+      "calendar_name": "Window Estimate",
+      "booking_duration_minutes": 90,
+      "requires_in_home_gate": true,
+      "booking_url": "{{trigger_link.we_booking}}",
+      "dm_present_value": "Yes",
+      "address_on_file": "812 Palm Reach Dr, Coral Springs FL 33071",
+      "customer_framing": {
+        "type": "in_home",
+        "duration_text": "about 90 minutes",
+        "label": "Window Estimate",
+        "framing": "Describe it as someone coming out to measure and price the openings."
+      }
+    }
+  },
+  "availability": {
+    "calendar_id": "cal_we_0001",
+    "timezone": "America/New_York",
+    "slots": [
+      {
+        "day": "Thursday, September 3",
+        "time": "10:00 AM"
+      },
+      {
+        "day": "Thursday, September 3",
+        "time": "2:00 PM"
+      },
+      {
+        "day": "Friday, September 4",
+        "time": "11:00 AM"
+      }
+    ],
+    "slots_total_count": 9
+  },
+  "classification": {
+    "intent_class": "GENERAL_QUESTION",
+    "confidence": 0.82,
+    "classification_method": "llm",
+    "reasoning": "Lead asked an open pricing question with no objection language."
+  },
+  "context": {
+    "now": {
+      "iso": "2026-09-02T15:30:00Z",
+      "date_human": "Wednesday, September 2, 2026",
+      "time_human": "11:30 AM",
+      "tz": "America/New_York"
+    },
+    "lead": {
+      "ghl_contact_id": "FIXTURECONTACT000001",
+      "name": "Dana Whitfield",
+      "first_name": "Dana",
+      "lead_score": 42,
+      "date_added": "2026-08-30T13:00:00Z",
+      "entry_source": "Facebook Lead Form",
+      "current_tags": [],
+      "objection_tags": [],
+      "suppression_tags": [],
+      "contact_notes": [],
+      "rep_display_name": null,
+      "lp_rep_name": null,
+      "trust_level_score": null,
+      "current_buyer_tag": null,
+      "current_bj_tag": null,
+      "current_stage_tag": null
+    },
+    "lp": {
+      "matched": false,
+      "notes": [],
+      "recent_calls": []
+    },
+    "intelligence": {},
+    "engagement": {
+      "emails_opened": 0,
+      "links_clicked": 0,
+      "replies_count": 0,
+      "vsl_watched": false
+    },
+    "objection_state": null,
+    "pipeline": null,
+    "estimate": null,
+    "conversation_recent": []
+  },
+  "opts": {
+    "bookingGate": {
+      "ok": true,
+      "should_ask_email": false,
+      "missing": [],
+      "known": {
+        "name": "Dana Whitfield",
+        "phone": "9545551212",
+        "email": "dana@example.com",
+        "address": "812 Palm Reach Dr, Coral Springs FL 33071"
+      },
+      "decision_maker_confirmed": true
+    }
+  }
+}

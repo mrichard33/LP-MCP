@@ -1,0 +1,898 @@
+[
+  {
+    "id": "system-prompt:326-395",
+    "lines": "326-395",
+    "label": "Identity, framework, voice, AI disclosure",
+    "target": "system-core",
+    "kind": "static",
+    "probe": "You are the Agentic Responder for Reece Windows & Doors, a hurricane impact window and door company founded in"
+  },
+  {
+    "id": "system-prompt:396-398",
+    "lines": "396-398",
+    "label": "Attractive character Randy Reece, email only",
+    "target": "framing",
+    "kind": "static",
+    "probe": "═══════ ATTRACTIVE CHARACTER — RANDY REECE (EMAIL-ONLY; NEVER IN CHAT/SMS REPLIES) ═══════"
+  },
+  {
+    "id": "system-prompt:399-452",
+    "lines": "399-452",
+    "label": "Qualification cap through universal fallback rules",
+    "target": "system-core",
+    "kind": "static",
+    "probe": "═══════ QUALIFICATION DISCIPLINE — 3-QUESTION CAP (Sentinel §5) ═══════"
+  },
+  {
+    "id": "system-prompt:453-473",
+    "lines": "453-473",
+    "label": "Email reply opener, thread sender awareness",
+    "target": "framing",
+    "kind": "static",
+    "probe": "═══════ EMAIL REPLY OPENER — THREAD SENDER AWARENESS ═══════"
+  },
+  {
+    "id": "system-prompt:474-553",
+    "lines": "474-553",
+    "label": "Trust model through booking escape hatch",
+    "target": "system-core",
+    "kind": "static",
+    "probe": "═══════ TRUST MODEL — 4 LEVELS ═══════"
+  },
+  {
+    "id": "system-prompt:554-599",
+    "lines": "554-599",
+    "label": "Objection handling, PPR gate, confirmation spec",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "═══════ OBJECTION HANDLING ═══════"
+  },
+  {
+    "id": "system-prompt:600-606",
+    "lines": "600-606",
+    "label": "Breadcrumbing, one small next step",
+    "target": "system-core",
+    "kind": "static",
+    "probe": "═══════ BREADCRUMBING ═══════"
+  },
+  {
+    "id": "system-prompt:607-610",
+    "lines": "607-610",
+    "label": "Brand-language rule, forbidden product words",
+    "target": "banned",
+    "kind": "static",
+    "probe": "═══════ BRAND-LANGUAGE RULE ═══════"
+  },
+  {
+    "id": "system-prompt:611-845",
+    "lines": "611-845",
+    "label": "Closing acks, auto-book, cancellation state machine",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "═══════ CLOSING ACKNOWLEDGMENTS — KNOW WHEN TO STOP (v2.7.5) ═══════"
+  },
+  {
+    "id": "system-prompt:846-988",
+    "lines": "846-988",
+    "label": "Worked examples, auto-book and cancellation",
+    "target": "examples",
+    "kind": "static",
+    "probe": "═══════ EXAMPLES — AUTO-BOOK ═══════"
+  },
+  {
+    "id": "system-prompt:989-1018",
+    "lines": "989-1018",
+    "label": "Anti-patterns, the never-write list",
+    "target": "banned",
+    "kind": "static",
+    "probe": "═══════ ANTI-PATTERNS ═══════"
+  },
+  {
+    "id": "system-prompt:1019-1042",
+    "lines": "1019-1042",
+    "label": "Guide offer, booking failure exit",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "═══════ GUIDE OFFER — BOOKING FAILURE EXIT (v2.7.11) ═══════"
+  },
+  {
+    "id": "system-prompt:1043-1073",
+    "lines": "1043-1073",
+    "label": "Hard prohibitions, zero exception list",
+    "target": "banned",
+    "kind": "static",
+    "probe": "═══════ HARD PROHIBITIONS ═══════"
+  },
+  {
+    "id": "system-prompt:1074-1100",
+    "lines": "1074-1100",
+    "label": "Channel constraints and response format contract",
+    "target": "system-core",
+    "kind": "static",
+    "probe": "═══════ CHANNEL CONSTRAINTS ═══════"
+  },
+  {
+    "id": "L1649",
+    "lines": "1649",
+    "label": "Author is the in-office rep",
+    "target": "framing",
+    "kind": "interpolated",
+    "probe": ", the in-office rep, from the office inbox."
+  },
+  {
+    "id": "L1650",
+    "lines": "1650",
+    "label": "Other named people stay third person",
+    "target": "framing",
+    "kind": "static",
+    "probe": "Any OTHER person named anywhere in this prompt — the assigned sales rep, a rep in the notes, a name in the con"
+  },
+  {
+    "id": "L1651",
+    "lines": "1651",
+    "label": "Never write a merge-tag name",
+    "target": "framing",
+    "kind": "static",
+    "probe": "Never write a merge tag or template placeholder for a name. Every name in your reply must be a literal name gi"
+  },
+  {
+    "id": "L1664",
+    "lines": "1664",
+    "label": "This reply leaves the shared line",
+    "target": "framing",
+    "kind": "interpolated",
+    "probe": "This reply goes out from the SHARED Reece team line"
+  },
+  {
+    "id": "L1665",
+    "lines": "1665",
+    "label": "Give name plus shared-line caveat both",
+    "target": "framing",
+    "kind": "interpolated",
+    "probe": ", AND tell them plainly that this is a shared team number so more than one person may answer. Both halves, eve"
+  },
+  {
+    "id": "L1666",
+    "lines": "1666",
+    "label": "Never volunteer the shared-line explanation unasked",
+    "target": "framing",
+    "kind": "static",
+    "probe": "Do NOT volunteer the shared-line explanation when they have not asked. It is an honest answer to a question, n"
+  },
+  {
+    "id": "L1669",
+    "lines": "1669",
+    "label": "Direct line answers with that name",
+    "target": "framing",
+    "kind": "interpolated",
+    "probe": "— say it in the BODY of the message. Do not describe this as a shared or team number; it is not."
+  },
+  {
+    "id": "L1678",
+    "lines": "1678",
+    "label": "Thread already signed, do not resign",
+    "target": "framing",
+    "kind": "interpolated",
+    "probe": "\" on an earlier outbound, so the customer already knows who they are talking to. Re-signing every message read"
+  },
+  {
+    "id": "L1680",
+    "lines": "1680",
+    "label": "Unsigned thread signs once when substantive",
+    "target": "framing",
+    "kind": "interpolated",
+    "probe": "Nothing in this thread has been signed yet. If this reply is SUBSTANTIVE — it answers a question, moves the co"
+  },
+  {
+    "id": "L1681",
+    "lines": "1681",
+    "label": "Short acknowledgments stay unsigned entirely",
+    "target": "framing",
+    "kind": "static",
+    "probe": "If this reply is only a short acknowledgment or a pleasantry (\"Got it.\", \"Sounds good.\", \"You as well.\"), DO N"
+  },
+  {
+    "id": "L1688",
+    "lines": "1688",
+    "label": "SMS length, question, and link constraints",
+    "target": "context-frame",
+    "kind": "static",
+    "probe": "Constraints: under 160 chars ideal, 320 max. 1-3 sentences. ONE question max. Booking link = merge tag, bare ("
+  },
+  {
+    "id": "L1693",
+    "lines": "1693",
+    "label": "Today is date, never propose past",
+    "target": "context-frame",
+    "kind": "interpolated",
+    "probe": ". NEVER propose or confirm a date that has already passed. Compare every appointment and proposed slot against"
+  },
+  {
+    "id": "L1723",
+    "lines": "1723",
+    "label": "Appointment imminent, rep is en route",
+    "target": "context-frame",
+    "kind": "interpolated",
+    "probe": "minutes from now. The rep is en route or about to be. Do not re-pitch, do not re-book, do not re-qualify. Logi"
+  },
+  {
+    "id": "L1724",
+    "lines": "1724",
+    "label": "Appointment window open right now",
+    "target": "context-frame",
+    "kind": "interpolated",
+    "probe": "minutes in). Do NOT say the appointment is \"coming up,\" \"on track,\" or \"ahead of"
+  },
+  {
+    "id": "L1725",
+    "lines": "1725",
+    "label": "Appointment passed, window has closed",
+    "target": "context-frame",
+    "kind": "interpolated",
+    "probe": "minutes ago and the window has closed. Do NOT speak about it in the future tense. Acknowledge plainly that the"
+  },
+  {
+    "id": "L1727",
+    "lines": "1727",
+    "label": "Appointment on record, time not confirmed",
+    "target": "context-frame",
+    "kind": "interpolated",
+    "pattern": "\\nAPPOINTMENT: on record for [^\\n]*?, exact time not confirmed"
+  },
+  {
+    "id": "L1728",
+    "lines": "1728",
+    "label": "Past appointment, exact time not confirmed",
+    "target": "context-frame",
+    "kind": "interpolated",
+    "probe": ", which has already passed; the exact time is not confirmed in our records. Do NOT speak about it in the futur"
+  },
+  {
+    "id": "L1729",
+    "lines": "1729",
+    "label": "Appointment today, exact time not confirmed",
+    "target": "context-frame",
+    "kind": "static",
+    "probe": "APPOINTMENT: today, exact time not confirmed in our records. Do not state a specific time you cannot verify. O"
+  },
+  {
+    "id": "L1734",
+    "lines": "1734",
+    "label": "Classification, confidence, and classifier method line",
+    "target": "context-frame",
+    "kind": "interpolated",
+    "pattern": "CLASSIFICATION:[\\s\\S]{0,200}?\\([\\s\\S]{0,200}?confidence,[\\s\\S]{0,200}?\\)"
+  },
+  {
+    "id": "L1767",
+    "lines": "1767",
+    "label": "Broadcast reply escalated, no handoff bridge",
+    "target": "framing",
+    "kind": "interpolated",
+    "probe": ", but this conversation has been ESCALATED TO A HUMAN — see ACKNOWLEDGMENT-ONLY CONDUCT below. Do NOT use a ha"
+  },
+  {
+    "id": "L1772",
+    "lines": "1772",
+    "label": "Randy broadcast bridge, exact opener wording",
+    "target": "framing",
+    "kind": "interpolated",
+    "probe": "asked me to reach out personally after seeing your message.\" Then continue in rep/company (we/our team) voice."
+  },
+  {
+    "id": "L1776",
+    "lines": "1776",
+    "label": "Signed broadcast, bridge in company voice",
+    "target": "framing",
+    "kind": "interpolated",
+    "probe": "is referred to in the third person and is NEVER the author of this reply. Never invent a rep name and never wr"
+  },
+  {
+    "id": "L1781",
+    "lines": "1781",
+    "label": "Company-signed broadcast, no personal name",
+    "target": "framing",
+    "kind": "static",
+    "probe": "The email this lead is replying to carries no personal signature you can answer as — it was sent in the compan"
+  },
+  {
+    "id": "L1787",
+    "lines": "1787",
+    "label": "Same sender continuing their own thread",
+    "target": "framing",
+    "kind": "interpolated",
+    "probe": "— the same person continuing their own thread. Do NOT use a handoff bridge; a person cannot hand off to themse"
+  },
+  {
+    "id": "L1789",
+    "lines": "1789",
+    "label": "Rep-written thread, open without bridge",
+    "target": "framing",
+    "kind": "static",
+    "probe": "The email this lead is replying to was written by the rep (prior bot reply or manual rep send), not a broadcas"
+  },
+  {
+    "id": "L1815",
+    "lines": "1815",
+    "label": "Analyzer routed this to a human",
+    "target": "playbooks",
+    "kind": "interpolated",
+    "probe": "). A person owns the next real move. Your ONLY job is a brief acknowledgment so the lead is not left in silenc"
+  },
+  {
+    "id": "L1816",
+    "lines": "1816",
+    "label": "You may confirm and name owner",
+    "target": "playbooks",
+    "kind": "interpolated",
+    "probe": "YOU MAY: confirm you received and understood what they actually said"
+  },
+  {
+    "id": "L1817",
+    "lines": "1817",
+    "label": "You must not propose or ask",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "YOU MUST NOT: propose, offer, or ask about any appointment or time. Include any link. Ask ANY question. Make a"
+  },
+  {
+    "id": "L1818",
+    "lines": "1818",
+    "label": "Never commit to any response timeline",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "⛔ NEVER COMMIT TO A TIMELINE. Do not say today, this afternoon, tonight, tomorrow, \"within the hour\", \"in the "
+  },
+  {
+    "id": "L1820",
+    "lines": "1820",
+    "label": "Acknowledgment overrides fast-track and stage conduct",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "This overrides FAST_TRACK, the funnel stage conduct, the buyer stage, any SCRIPT DIRECTIVE, and every booking "
+  },
+  {
+    "id": "L1842",
+    "lines": "1842",
+    "label": "Contact is past their appointment, evidence",
+    "target": "playbooks",
+    "kind": "interpolated",
+    "probe": ". Their visit already happened; they are waiting on what comes AFTER it (a proposal, pricing, a callback), not"
+  },
+  {
+    "id": "L1843",
+    "lines": "1843",
+    "label": "Prohibited items override every booking instruction",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "ABSOLUTELY PROHIBITED in this reply — these override FAST_TRACK, the funnel stage tag, the buyer stage, and an"
+  },
+  {
+    "id": "L1845",
+    "lines": "1845",
+    "label": "Banned return-visit words and ideas",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "· The words/ideas \"verification visit\", \"re-measure\", \"specialist comes out\", \"get someone out to you\", \"back "
+  },
+  {
+    "id": "L1846",
+    "lines": "1846",
+    "label": "Never re-ask decision-makers after the visit",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "· Asking whether decision-makers can be present. That question belongs to pre-appointment qualification and is"
+  },
+  {
+    "id": "L1848",
+    "lines": "1848",
+    "label": "Never imply anyone is coming back",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "NEVER state or imply that anyone is coming back out. Do NOT invent a follow-up visit, a second appointment, or"
+  },
+  {
+    "id": "L1850",
+    "lines": "1850",
+    "label": "Exception: a genuine future appointment exists",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "EXCEPTION: a genuine FUTURE appointment exists on record (see EXISTING APPOINTMENTS). You may confirm or discu"
+  },
+  {
+    "id": "L1852",
+    "lines": "1852",
+    "label": "What to do instead, under-promise",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "What TO do: acknowledge what they actually said, be specific about the real next step (their rep sending the e"
+  },
+  {
+    "id": "L1857",
+    "lines": "1857",
+    "label": "Fast track hyperactive buyer, skip education",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "⚡ FAST_TRACK = TRUE — this is a HYPERACTIVE buyer (lead_score >50 in 48h). Skip education. Apply BOOKING — ASK"
+  },
+  {
+    "id": "L1859",
+    "lines": "1859",
+    "label": "Fast track booking push is suppressed",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "⚡ FAST_TRACK is set, but this contact is POST-APPOINTMENT — the fast-track BOOKING push is SUPPRESSED. Keep th"
+  },
+  {
+    "id": "L1870",
+    "lines": "1870",
+    "label": "Pre-computed canvass reschedule options A/B",
+    "target": "playbooks",
+    "kind": "interpolated",
+    "probe": "Pre-computed valid reschedule options (already exclude the declined slot, business hours enforced, phrased rel"
+  },
+  {
+    "id": "L1871",
+    "lines": "1871",
+    "label": "Alternative-of-choice close with exactly two",
+    "target": "playbooks",
+    "kind": "interpolated",
+    "probe": "work better for you both?\" Never invent times, never show a slot menu, never more than two choices, never re-o"
+  },
+  {
+    "id": "L1892",
+    "lines": "1892",
+    "label": "Approved script is the reply backbone",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "The following approved script is the backbone of your reply. Preserve its wording, order, and offer as written"
+  },
+  {
+    "id": "L1893",
+    "lines": "1893",
+    "label": "Re-delivery rule, never resend the script",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "RE-DELIVERY RULE (Quality Pass v1.0): preserve-wording applies to the FIRST delivery of this script only. If t"
+  },
+  {
+    "id": "L1909",
+    "lines": "1909",
+    "label": "Entry source, lead score, date added",
+    "target": "context-frame",
+    "kind": "interpolated",
+    "pattern": "Entry:[\\s\\S]{0,200}?\\| Lead Score:[\\s\\S]{0,200}?\\| Date Added:"
+  },
+  {
+    "id": "L1922",
+    "lines": "1922",
+    "label": "Decision-maker presence state on file",
+    "target": "context-frame",
+    "kind": "interpolated",
+    "pattern": "\\nDecision-maker presence: (CONFIRMED|ANSWERED BUT PENDING|NEVER ASKED)"
+  },
+  {
+    "id": "L1923",
+    "lines": "1923",
+    "label": "Never ask for information already known",
+    "target": "context-frame",
+    "kind": "static",
+    "probe": "NON-NEGOTIABLE RULE: Never ask the customer for information already present in this profile — it is on file. O"
+  },
+  {
+    "id": "L1930",
+    "lines": "1930",
+    "label": "Zip verified inside the service area",
+    "target": "framing",
+    "kind": "interpolated",
+    "probe": ". If the customer provided their address or zip in this conversation and you have not yet told them, include a"
+  },
+  {
+    "id": "L1932",
+    "lines": "1932",
+    "label": "Zip outside service area, polite exit",
+    "target": "framing",
+    "kind": "interpolated",
+    "probe": "is OUTSIDE Reece's mapped service area. Do NOT offer any in-home visit, do NOT propose appointment times, and "
+  },
+  {
+    "id": "L1938",
+    "lines": "1938",
+    "label": "Tentative city match, confirm by zip",
+    "target": "framing",
+    "kind": "interpolated",
+    "probe": "— what's the zip so I can confirm you're in our coverage?\"). Do NOT state they are confirmed in the service ar"
+  },
+  {
+    "id": "L1951",
+    "lines": "1951",
+    "label": "Only the dispatch phone number, ever",
+    "target": "banned",
+    "kind": "static",
+    "probe": "PHONE NUMBER RULE (HARD): if this reply gives the customer any phone number to call, it must be EXACTLY the di"
+  },
+  {
+    "id": "L1968",
+    "lines": "1968",
+    "label": "Trust level score and its band",
+    "target": "context-frame",
+    "kind": "interpolated",
+    "pattern": "TRUST LEVEL SCORE:[\\s\\S]{0,200}?/5 \\([\\s\\S]{0,200}?\\)\\."
+  },
+  {
+    "id": "L1974",
+    "lines": "1974",
+    "label": "Open objection state, entered, attempt count",
+    "target": "playbooks",
+    "kind": "interpolated",
+    "pattern": "Open objection state:[\\s\\S]{0,200}?, entered[\\s\\S]{0,200}?, attempt[\\s\\S]{0,200}?\\."
+  },
+  {
+    "id": "L1975",
+    "lines": "1975",
+    "label": "Objection turn one listens, turn two",
+    "target": "playbooks",
+    "kind": "interpolated",
+    "probe": "of this objection. Turn 1 = listen/categorize only (empathy or ONE categorizing question — no solutions, no fi"
+  },
+  {
+    "id": "L1979",
+    "lines": "1979",
+    "label": "Named-storm posture, empathy over persuasion",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "⛈️ NAMED-STORM POSTURE ACTIVE (global toggle): a named storm is active or recent. Lead with empathy and servic"
+  },
+  {
+    "id": "L2007",
+    "lines": "2007",
+    "label": "Guide offer outstanding, never re-offer it",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "GUIDE OFFER STATUS: OUTSTANDING — already offered, unanswered. Never re-offer. If the lead provides an email n"
+  },
+  {
+    "id": "L2016",
+    "lines": "2016",
+    "label": "Pipeline, stage, status, days in stage",
+    "target": "context-frame",
+    "kind": "interpolated",
+    "pattern": "PIPELINE:[\\s\\S]{0,200}?\\| Stage:[\\s\\S]{0,200}?\\| Status:[\\s\\S]{0,200}?\\| Days in stage:"
+  },
+  {
+    "id": "L2031",
+    "lines": "2031",
+    "label": "Authoritative customer estimate block header",
+    "target": "context-frame",
+    "kind": "static",
+    "probe": "═══════ CUSTOMER'S ACTUAL ESTIMATE (AUTHORITATIVE — overrides any figure in rep notes / conversation history) "
+  },
+  {
+    "id": "L2043",
+    "lines": "2043",
+    "label": "Use only figures from this block",
+    "target": "context-frame",
+    "kind": "static",
+    "probe": "If you reference a dollar figure or window count in your reply, use ONLY the numbers in this block. NEVER quot"
+  },
+  {
+    "id": "L2044",
+    "lines": "2044",
+    "label": "Estimate block is the only source",
+    "target": "context-frame",
+    "kind": "static",
+    "probe": "Per HARD PROHIBITIONS: never quote prices/estimates EXCEPT figures in this block. This block is the ONLY autho"
+  },
+  {
+    "id": "L2050",
+    "lines": "2050",
+    "label": "LP disposition code and its label",
+    "target": "context-frame",
+    "kind": "interpolated",
+    "pattern": "\\nDisposition: "
+  },
+  {
+    "id": "L2102",
+    "lines": "2102",
+    "label": "How to use the contact notes",
+    "target": "context-frame",
+    "kind": "static",
+    "probe": "HOW TO USE THESE NOTES: they exist so your reply lands like it comes from someone who KNOWS this person. Weave"
+  },
+  {
+    "id": "L2117",
+    "lines": "2117",
+    "label": "Engagement opens, clicks, replies, VSL watched",
+    "target": "context-frame",
+    "kind": "interpolated",
+    "pattern": "ENGAGEMENT: opens=[\\s\\S]{0,200}?\\| clicks=[\\s\\S]{0,200}?\\| replies=[\\s\\S]{0,200}?\\| VSL="
+  },
+  {
+    "id": "L2134",
+    "lines": "2134",
+    "label": "Anti-repetition hard rule on outbound history",
+    "target": "banned",
+    "kind": "static",
+    "probe": "ANTI-REPETITION (HARD RULE): NEVER send a message substantially identical (~80%+ similar) to ANY [outbound] ab"
+  },
+  {
+    "id": "L2135",
+    "lines": "2135",
+    "label": "Answered-question hard rule, act on answers",
+    "target": "banned",
+    "kind": "static",
+    "probe": "ANSWERED-QUESTION (HARD RULE): before drafting, check whether the newest [inbound] ANSWERS a question your las"
+  },
+  {
+    "id": "L2185",
+    "lines": "2185",
+    "label": "Ask-first protocol governs including the link",
+    "target": "context-frame",
+    "kind": "static",
+    "probe": "Per ASK-FIRST PROTOCOL: include this link ONLY when (a) the lead asked for the link or said \"I'll pick\", (b) t"
+  },
+  {
+    "id": "L2187",
+    "lines": "2187",
+    "label": "Auto-book confirmations carry no booking link",
+    "target": "context-frame",
+    "kind": "static",
+    "probe": "v2.7.7 EXCEPTION (auto-book): hard confirmations of held times do NOT include the link — emit companion_action"
+  },
+  {
+    "id": "L2188",
+    "lines": "2188",
+    "label": "Cancellation flow carries no booking link",
+    "target": "context-frame",
+    "kind": "static",
+    "probe": "v2.7.8 EXCEPTION (cancellation flow): when the lead is in any state of the CANCELLATION FLOW state machine, do"
+  },
+  {
+    "id": "L2201",
+    "lines": "2201",
+    "label": "Reviewer corrections are lessons, not templates",
+    "target": "context-frame",
+    "kind": "interpolated",
+    "probe": "These are real corrections human reviewers made to past responses for similar inbound types (intent class:"
+  },
+  {
+    "id": "L2229",
+    "lines": "2229",
+    "label": "Call purpose: go over pricing questions",
+    "target": "framing",
+    "kind": "static",
+    "probe": "this call exists to GO OVER THEIR PRICING QUESTIONS. Confirmation copy names that purpose (\"…will call you [da"
+  },
+  {
+    "id": "L2230",
+    "lines": "2230",
+    "label": "Call purpose: answer their general questions",
+    "target": "framing",
+    "kind": "static",
+    "probe": "this call exists to ANSWER THEIR QUESTIONS. Confirmation copy names that purpose (\"…to answer your questions\")"
+  },
+  {
+    "id": "L2231",
+    "lines": "2231",
+    "label": "Call purpose: confirm details before visit",
+    "target": "framing",
+    "kind": "static",
+    "probe": "this call confirms details BEFORE THEIR VISIT (\"…to confirm a few details before your visit\"). This is the ONL"
+  },
+  {
+    "id": "L2232",
+    "lines": "2232",
+    "label": "Call purpose: the lead requested callback",
+    "target": "framing",
+    "kind": "static",
+    "probe": "the lead ASKED to be called back. Confirmation copy reflects that (\"…will call you back [day] at [time] ET\"). "
+  },
+  {
+    "id": "L2234",
+    "lines": "2234",
+    "label": "Call purpose line with neutral fallback",
+    "target": "framing",
+    "kind": "static",
+    "probe": "unknown — use neutral copy (\"…will give you a call [day] at [time] ET\") and call it \"your call\". NEVER say \"to"
+  },
+  {
+    "id": "L2235",
+    "lines": "2235",
+    "label": "Every rendered call time states ET",
+    "target": "framing",
+    "kind": "static",
+    "probe": "All rendered call times state ET explicitly (e.g. \"4 PM ET\"). Never call it a \"confirmation call\" unless the p"
+  },
+  {
+    "id": "L2237",
+    "lines": "2237",
+    "label": "Mirror rule beats the purpose map",
+    "target": "framing",
+    "kind": "static",
+    "probe": "MIRROR RULE BEATS THIS MAP: if the lead has their own word for it (quote / estimate / call / appointment), use"
+  },
+  {
+    "id": "L2249",
+    "lines": "2249",
+    "label": "In-home visit missing required information list",
+    "target": "playbooks",
+    "kind": "interpolated",
+    "probe": "visit, but required information is still missing:"
+  },
+  {
+    "id": "L2254",
+    "lines": "2254",
+    "label": "Ask for one missing item only",
+    "target": "playbooks",
+    "kind": "interpolated",
+    "probe": ". One question only — the rest come on later turns (order: name → address → decision-makers)."
+  },
+  {
+    "id": "L2256",
+    "lines": "2256",
+    "label": "Already-answered check before the decision-maker question",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "• ALREADY-ANSWERED CHECK (decision-makers): before asking the decision-maker question, scan the CONVERSATION H"
+  },
+  {
+    "id": "L2257",
+    "lines": "2257",
+    "label": "If lead pushes, explain then ask",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "• If the lead pushes to lock a time right now, warmly explain you just need this detail to get the visit sched"
+  },
+  {
+    "id": "L2261",
+    "lines": "2261",
+    "label": "Prerequisites satisfied, propose times and book",
+    "target": "playbooks",
+    "kind": "interpolated",
+    "probe": "min). Name, phone, and property address + zip are on file and the decision-maker question has been asked — you"
+  },
+  {
+    "id": "L2262",
+    "lines": "2262",
+    "label": "Decision-makers and address currently on file",
+    "target": "playbooks",
+    "kind": "interpolated",
+    "probe": "On file → decision-makers:"
+  },
+  {
+    "id": "L2263",
+    "lines": "2263",
+    "label": "Hard confirmation status is set server-side",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "ON A HARD CONFIRMATION — emit book_appointment. STATUS is set server-side and NEVER defaults to confirmed: \"co"
+  },
+  {
+    "id": "L2265",
+    "lines": "2265",
+    "label": "Ask for email once, this turn",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "EMAIL (ask ONCE, this turn only, soft): no email is on file. In the same message that confirms or proposes, as"
+  },
+  {
+    "id": "L2267",
+    "lines": "2267",
+    "label": "Email already on file or asked",
+    "target": "playbooks",
+    "kind": "interpolated",
+    "pattern": "\\n  EMAIL: (already on file|already asked once)"
+  },
+  {
+    "id": "L2269",
+    "lines": "2269",
+    "label": "Upgrade path for an existing new appointment",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "UPGRADE PATH — if EXISTING APPOINTMENTS already shows an in-home appointment with status \"new\" AND the lead's "
+  },
+  {
+    "id": "L2270",
+    "lines": "2270",
+    "label": "Yes or Solo Owner upgrades to confirmed",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "• Answer maps to Yes / Solo Owner → emit update_appointment_status with that appointment's appointment_id, sta"
+  },
+  {
+    "id": "L2271",
+    "lines": "2271",
+    "label": "No or Uncertain keeps it new",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "• Answer maps to No / Uncertain → keep it \"new\", acknowledge warmly, and do NOT emit any companion_action. A h"
+  },
+  {
+    "id": "L2272",
+    "lines": "2272",
+    "label": "Never book when an appointment exists",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "Never emit book_appointment when an active appointment already exists for this contact — use the UPGRADE PATH "
+  },
+  {
+    "id": "L2276",
+    "lines": "2276",
+    "label": "Phone booking has no in-home gate",
+    "target": "playbooks",
+    "kind": "interpolated",
+    "probe": "min). There is NO decision-maker or address gate: a phone call needs neither. Acknowledge, propose 2–3 real sl"
+  },
+  {
+    "id": "L2290",
+    "lines": "2290",
+    "label": "Priority one, the cancellation flow machine",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "(1) CANCELLATION FLOW: if the lead expressed cancel intent for an existing appointment OR is mid-state-machine"
+  },
+  {
+    "id": "L2291",
+    "lines": "2291",
+    "label": "Priority 1.5, in-home confirmation upgrade",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "(1.5) IN-HOME CONFIRMATION UPGRADE: if EXISTING APPOINTMENTS shows an in-home appointment with status \"new\" AN"
+  },
+  {
+    "id": "L2294",
+    "lines": "2294",
+    "label": "Priority 1.6, past appointment governs turn",
+    "target": "playbooks",
+    "kind": "interpolated",
+    "probe": "in the PAST. Do NOT confirm it, hold it, or call it upcoming. If the lead asks about their appointment, state "
+  },
+  {
+    "id": "L2298",
+    "lines": "2298",
+    "label": "Priority 1.65, appointment was cancelled",
+    "target": "playbooks",
+    "kind": "interpolated",
+    "probe": "was CANCELLED. Never reference it as upcoming, never anchor anything to it (\"your visit\", \"see you then\"). The"
+  },
+  {
+    "id": "L2301",
+    "lines": "2301",
+    "label": "Priority 1.7, prerequisites are not satisfied",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "(1.7) IN-HOME PREREQUISITES NOT SATISFIED (GOVERNS THIS TURN, overrides (2) and (5)): per the IN-HOME BOOKING "
+  },
+  {
+    "id": "L2303",
+    "lines": "2303",
+    "label": "Priority two, auto-book on hard confirmation",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "(2) AUTO-BOOK on hard confirmation of held time (NOT in a cancel/reschedule conversation): if the lead's reply"
+  },
+  {
+    "id": "L2304",
+    "lines": "2304",
+    "label": "Priority three, closing acknowledgment then stop",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "(3) CLOSING ACKNOWLEDGMENT: soft-confirm with caveat / pure ack / commitment to return → brief acknowledgment "
+  },
+  {
+    "id": "L2306",
+    "lines": "2306",
+    "label": "Priority five, default booking ask-first protocol",
+    "target": "playbooks",
+    "kind": "static",
+    "probe": "(5) DEFAULT: BOOKING — ASK-FIRST PROTOCOL with TWO real specific-time slots from CALENDAR AVAILABILITY, OR fal"
+  },
+  {
+    "id": "L2307",
+    "lines": "2307",
+    "label": "Return only the JSON object, unwrapped",
+    "target": "context-frame",
+    "kind": "static",
+    "probe": "Return ONLY the JSON object — first character must be {, last must be }, no preamble. Include companion_action"
+  }
+]

@@ -1,0 +1,90 @@
+{
+  "name": "23-sms-post-appointment-fast-track-suppressed",
+  "covers": "sms · post-appointment hard ban · fast-track booking push suppressed · a real future appointment exists",
+  "env": {},
+  "channel": "sms",
+  "triggerMessage": "Any word on the pricing from the visit?",
+  "fastTrack": true,
+  "trafficTemp": "hot",
+  "kbPack": null,
+  "availability": null,
+  "classification": {
+    "intent_class": "GENERAL_QUESTION",
+    "confidence": 0.82,
+    "classification_method": "llm",
+    "reasoning": "Lead asked an open pricing question with no objection language."
+  },
+  "context": {
+    "now": {
+      "iso": "2026-09-02T15:30:00Z",
+      "date_human": "Wednesday, September 2, 2026",
+      "time_human": "11:30 AM",
+      "tz": "America/New_York"
+    },
+    "lead": {
+      "ghl_contact_id": "FIXTURECONTACT000001",
+      "name": "Dana Whitfield",
+      "first_name": "Dana",
+      "lead_score": 68,
+      "date_added": "2026-08-30T13:00:00Z",
+      "entry_source": "Facebook Lead Form",
+      "current_tags": [
+        "lp-demo-completed"
+      ],
+      "objection_tags": [],
+      "suppression_tags": [],
+      "contact_notes": [],
+      "rep_display_name": null,
+      "lp_rep_name": null,
+      "trust_level_score": null,
+      "current_buyer_tag": null,
+      "current_bj_tag": null,
+      "current_stage_tag": null
+    },
+    "lp": {
+      "matched": true,
+      "notes": [],
+      "recent_calls": [],
+      "demo_completed": true,
+      "disposition": "OPPFDN",
+      "disposition_label": "Opportunity Found",
+      "rep_name": "Dorsett, Beverly"
+    },
+    "intelligence": {},
+    "engagement": {
+      "emails_opened": 0,
+      "links_clicked": 0,
+      "replies_count": 0,
+      "vsl_watched": false
+    },
+    "objection_state": null,
+    "pipeline": null,
+    "estimate": null,
+    "conversation_recent": [
+      {
+        "direction": "inbound",
+        "text": "Saw the ad about the hurricane windows."
+      },
+      {
+        "direction": "outbound",
+        "text": "Happy to help, Dana. Are you looking at the whole house or a few openings?"
+      },
+      {
+        "direction": "inbound",
+        "text": "Hey, can you tell me more about what this would run us?"
+      }
+    ]
+  },
+  "opts": {
+    "upcomingAppointments": [
+      {
+        "appointment_id": "appt_0001",
+        "calendar_name": "Window Estimate",
+        "start_time_human": "Friday, September 4 at 10:00 AM",
+        "start_time": "2026-09-04T14:00:00Z",
+        "status": "new",
+        "title": "Window Estimate — Dana Whitfield"
+      }
+    ]
+  }
+}
