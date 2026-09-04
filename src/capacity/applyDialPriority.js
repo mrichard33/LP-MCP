@@ -70,6 +70,51 @@ export const TIERS = Object.freeze(['hot', 'warm']);
 
 const norm = (s) => String(s ?? '').trim().toLowerCase();
 
+/* ─── In-flight cycle registry ───────────────────────────────────────────── *
+ *
+ * A cycling campaign is NOT_RUNNING for a few seconds on purpose. The n8n
+ * watchdog polls every 5 minutes, so roughly one run in fifteen catches that
+ * window and pages GroupMe about a campaign that is stopped by design. A
+ * watchdog that cries wolf is a watchdog people learn to ignore, so the route
+ * checks here before alerting.
+ *
+ * Three properties make this safe to suppress on, and all three are tested:
+ *
+ *   1. PROCESS-LOCAL, never persisted. A crash between stop and start takes
+ *      the mark with it, so the next poll sees an unexplained NOT_RUNNING and
+ *      pages — which is the exact failure the watchdog exists for.
+ *   2. CLEARED WHETHER OR NOT THE RESTART WORKED. A campaign that failed to
+ *      come back is dark, not cycling, and must page immediately.
+ *   3. TIME-BOUNDED. If a cycle hangs, the mark expires and the campaign pages
+ *      anyway. Nothing can suppress an alert indefinitely.
+ */
+
+const cycling = new Map(); // campaign name → epoch ms after which the mark is void
+
+/** A healthy cycle is seconds. Past this the campaign is dark, not cycling. */
+export const CYCLE_MARK_TTL_MS = 120000;
+
+export function markCycling(campaignName, { now = Date.now(), ttlMs = CYCLE_MARK_TTL_MS } = {}) {
+  cycling.set(campaignName, now + ttlMs);
+}
+
+export function clearCycling(campaignName) {
+  cycling.delete(campaignName);
+}
+
+/** True only while a cycle this process started is still in flight. */
+export function isCycling(campaignName, { now = Date.now() } = {}) {
+  const until = cycling.get(campaignName);
+  if (until === undefined) return false;
+  if (now >= until) { cycling.delete(campaignName); return false; }
+  return true;
+}
+
+/** Test seam only — never called in production. */
+export function _resetCycling() {
+  cycling.clear();
+}
+
 /**
  * Compute the replacement list block for ONE campaign. Pure.
  *
@@ -268,13 +313,24 @@ export async function applyDialPriority(rankResult, deps) {
     }
 
     if (mustCycle) {
+      // Marked BEFORE the stop, so the watchdog does not page about the brief
+      // NOT_RUNNING this is about to cause. Cleared in the finally below no
+      // matter how the cycle ends.
+      markCycling(campaignName);
       // Graceful stop only. force:true drops calls in progress.
-      await stopCampaign({
-        id: null,
-        action_type: 'five9_stop_campaign',
-        requires_approval: true,
-        action_payload: { campaign_name: campaignName },
-      });
+      try {
+        await stopCampaign({
+          id: null,
+          action_type: 'five9_stop_campaign',
+          requires_approval: true,
+          action_payload: { campaign_name: campaignName },
+        });
+      } catch (err) {
+        // The stop did not land, so nothing is cycling and nothing should be
+        // suppressed. This throws before the try/finally that would clear it.
+        clearCycling(campaignName);
+        throw err;
+      }
       stoppedAt = Date.now();
       log(`[CapacityRanker] ${campaignName}: stopped for reorder`);
     }
@@ -344,6 +400,9 @@ export async function applyDialPriority(rankResult, deps) {
           }
         }
 
+        // Unconditional. A campaign that did NOT come back is dark, not
+        // cycling, and the very next watchdog poll must page about it.
+        clearCycling(campaignName);
         entry.downtime_ms = stoppedAt ? (restarted && ackAt ? ackAt : Date.now()) - stoppedAt : null;
         entry.restarted = restarted;
         if (!restarted) {

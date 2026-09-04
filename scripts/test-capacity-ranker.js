@@ -25,6 +25,11 @@ import {
   applyDialPriority,
   MARKET_LISTS,
   CAMPAIGNS,
+  isCycling,
+  markCycling,
+  clearCycling,
+  _resetCycling,
+  CYCLE_MARK_TTL_MS,
 } from '../src/capacity/applyDialPriority.js';
 import {
   runCapacityRanker,
@@ -949,7 +954,7 @@ test('withinCycleWindow: honours America/New_York in winter too (EST, UTC-5)', (
 // error. A watchdog that reports healthy while the floor is dark is the exact
 // failure it exists to catch, so these tests pin the alert to this side.
 
-function watchdogFake({ states = { hot: 'RUNNING', warm: 'RUNNING' }, throwFor = null, sendThrows = false } = {}) {
+function watchdogFake({ states = { hot: 'RUNNING', warm: 'RUNNING' }, throwFor = null, sendThrows = false, cyclingNames = [] } = {}) {
   const sent = [];
   const lastAlert = new Map();
   return {
@@ -959,6 +964,7 @@ function watchdogFake({ states = { hot: 'RUNNING', warm: 'RUNNING' }, throwFor =
       lastAlert,
       log: () => {},
       inWindow: () => true,
+      cycling: (name) => cyclingNames.includes(name),
       getOutbound: async (name) => {
         if (throwFor && name === throwFor) throw new Error('Five9 getOutboundCampaign fault');
         const tier = name === CAMPAIGNS.hot ? 'hot' : 'warm';
@@ -1045,6 +1051,129 @@ test('WATCHDOG: a GroupMe send failure does not take the route down, and is not 
   const { status, body } = await checkCampaignState(f.deps);
   assert.equal(status, 503);
   assert.deepEqual(body.alerted, [], 'never claim an alert that did not go out');
+});
+
+// ─── Mid-cycle suppression ───────────────────────────────────────────────────
+//
+// A cycling campaign is NOT_RUNNING for a few seconds ON PURPOSE. The watchdog
+// polls every 5 minutes, so roughly one cycling run in fifteen lands inside
+// that window and pages about a campaign the ranker stopped itself. A watchdog
+// that cries wolf gets ignored, and this one is the only cover for a crash
+// between stop and start — so it has to be right in BOTH directions. The tests
+// below pin the suppression AND the three ways it must not hide a real outage.
+
+test('CYCLE-SUPPRESS: a campaign the ranker is cycling right now does not page, and does not fail the poll', async () => {
+  const f = watchdogFake({
+    states: { hot: 'RUNNING', warm: 'NOT_RUNNING' },
+    cyclingNames: [CAMPAIGNS.warm],
+  });
+  const { status, body } = await checkCampaignState(f.deps);
+  assert.deepEqual(f.sent, [], 'nobody is paged about a deliberate stop');
+  assert.equal(status, 200, 'and the n8n execution does not fail either');
+  assert.equal(body.needs_attention, false);
+  assert.equal(body.all_running, false, 'the literal Five9 state is still reported honestly');
+  const warm = body.campaigns.find((c) => c.campaign === CAMPAIGNS.warm);
+  assert.equal(warm.state, 'NOT_RUNNING', 'nothing is hidden');
+  assert.equal(warm.cycling, true, 'it is explained');
+});
+
+test('CYCLE-SUPPRESS: a campaign down while a DIFFERENT one cycles still pages', async () => {
+  const f = watchdogFake({
+    states: { hot: 'NOT_RUNNING', warm: 'NOT_RUNNING' },
+    cyclingNames: [CAMPAIGNS.warm],
+  });
+  const { status, body } = await checkCampaignState(f.deps);
+  assert.equal(status, 503);
+  assert.equal(body.needs_attention, true);
+  assert.equal(f.sent.length, 1);
+  assert.match(f.sent[0], /Data - Hot Leads less than 7 is NOT_RUNNING/);
+  assert.deepEqual(body.alerted, [CAMPAIGNS.hot], 'only the unexplained one');
+});
+
+test('CYCLE-SUPPRESS: a RUNNING campaign is never reported as cycling', async () => {
+  const f = watchdogFake({ cyclingNames: [CAMPAIGNS.hot, CAMPAIGNS.warm] });
+  const { status, body } = await checkCampaignState(f.deps);
+  assert.equal(status, 200);
+  assert.ok(body.campaigns.every((c) => c.cycling === false));
+});
+
+test('CYCLE-SUPPRESS: suppression does not touch the 30-minute clock, so a real outage right after a cycle still pages', async () => {
+  const t0 = new Date('2026-09-03T16:00:00Z');
+  const midCycle = watchdogFake({ states: { hot: 'RUNNING', warm: 'NOT_RUNNING' }, cyclingNames: [CAMPAIGNS.warm] });
+  await checkCampaignState({ ...midCycle.deps, now: t0 });
+  assert.deepEqual(midCycle.sent, []);
+  // The cycle ends badly: the mark is gone, the campaign is still down.
+  const after = watchdogFake({ states: { hot: 'RUNNING', warm: 'NOT_RUNNING' } });
+  const { status } = await checkCampaignState({ ...after.deps, lastAlert: midCycle.lastAlert, now: new Date(t0.getTime() + 30000) });
+  assert.equal(status, 503);
+  assert.equal(after.sent.length, 1, 'pages 30 seconds later — the mid-cycle poll did not start a suppression window');
+});
+
+test('CYCLE MARK: set while the reorder runs, cleared once the campaign is back', async () => {
+  _resetCycling();
+  const seenDuringWrite = [];
+  const f = fakeFive9({ refuseWhileRunning: true });
+  const deps = {
+    ...f.deps,
+    cycleCampaigns: true,
+    sleep: async () => {},
+    log: () => {},
+    modifyCampaignLists: async (action) => {
+      seenDuringWrite.push([action.action_payload.campaign_name, isCycling(action.action_payload.campaign_name)]);
+      return f.deps.modifyCampaignLists(action);
+    },
+  };
+  await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), deps);
+  assert.deepEqual(seenDuringWrite, [[CAMPAIGNS.hot, true], [CAMPAIGNS.warm, true]], 'marked across the whole stopped window');
+  assert.equal(isCycling(CAMPAIGNS.hot), false, 'cleared once it is dialing again');
+  assert.equal(isCycling(CAMPAIGNS.warm), false);
+});
+
+test('CYCLE MARK: a campaign that FAILS to restart is left UNMARKED, so the watchdog pages about it', async () => {
+  _resetCycling();
+  const f = fakeFive9({ startAlwaysFails: true });
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true, sleep: async () => {}, log: () => {},
+  });
+  assert.deepEqual(out.restart_failures, [CAMPAIGNS.hot], 'the campaign really is dark');
+  assert.equal(isCycling(CAMPAIGNS.hot), false, 'dark is NOT cycling — nothing may suppress this page');
+  // Prove it end to end: the watchdog pages about exactly this campaign.
+  const wd = watchdogFake({ states: { hot: 'NOT_RUNNING', warm: 'RUNNING' }, cyclingNames: [] });
+  const { status } = await checkCampaignState({ ...wd.deps, cycling: isCycling });
+  assert.equal(status, 503);
+  assert.match(wd.sent[0], /Data - Hot Leads less than 7 is NOT_RUNNING/);
+});
+
+test('CYCLE MARK: a stop that throws leaves nothing marked', async () => {
+  _resetCycling();
+  const f = fakeFive9();
+  await assert.rejects(applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps,
+    cycleCampaigns: true,
+    log: () => {},
+    stopCampaign: async () => { throw new Error('Five9 stopCampaign fault'); },
+  }), /stopCampaign fault/);
+  assert.equal(isCycling(CAMPAIGNS.hot), false, 'nothing was stopped, so nothing is suppressed');
+});
+
+test('CYCLE MARK: expires, so a HUNG cycle cannot suppress the page forever', () => {
+  _resetCycling();
+  const t0 = 1_000_000;
+  markCycling(CAMPAIGNS.hot, { now: t0 });
+  assert.equal(isCycling(CAMPAIGNS.hot, { now: t0 + 1000 }), true, 'seconds in, still cycling');
+  assert.equal(isCycling(CAMPAIGNS.hot, { now: t0 + CYCLE_MARK_TTL_MS - 1 }), true);
+  assert.equal(isCycling(CAMPAIGNS.hot, { now: t0 + CYCLE_MARK_TTL_MS }), false, 'past the TTL it is an outage, not a cycle');
+  assert.equal(isCycling(CAMPAIGNS.hot), false, 'and the stale mark is gone for good');
+});
+
+test('CYCLE MARK: is per campaign, and clearCycling only clears its own', () => {
+  _resetCycling();
+  markCycling(CAMPAIGNS.hot);
+  markCycling(CAMPAIGNS.warm);
+  clearCycling(CAMPAIGNS.hot);
+  assert.equal(isCycling(CAMPAIGNS.hot), false);
+  assert.equal(isCycling(CAMPAIGNS.warm), true);
+  _resetCycling();
 });
 
 test('decideWatchdogAlerts: pure — suppression is per campaign, not global', () => {

@@ -46,7 +46,7 @@ import {
 } from '../five9/admin-writes.js';
 import { sendGroupMeMessage } from '../groupme.js';
 import { rankMarkets, isMaterialChange, DEFAULT_SWAP_MARGIN, MARKET_CODES } from '../capacity/rankMarkets.js';
-import { applyDialPriority, CAMPAIGNS } from '../capacity/applyDialPriority.js';
+import { applyDialPriority, CAMPAIGNS, isCycling } from '../capacity/applyDialPriority.js';
 
 const TIMEZONE = 'America/New_York';
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -306,6 +306,9 @@ export function decideWatchdogAlerts(campaigns, { now = Date.now(), lastAlert = 
   const alerts = [];
   for (const c of campaigns || []) {
     if (c.ok) { lastAlert.delete(c.campaign); continue; }
+    // Stopped on purpose, by a cycle this process is running right now. Not an
+    // alert, and not a healthy read either — leave the suppression clock alone.
+    if (c.cycling) continue;
     const prev = lastAlert.get(c.campaign);
     if (prev !== undefined && now - prev < suppressMs) continue;
     lastAlert.set(c.campaign, now);
@@ -321,7 +324,12 @@ export function decideWatchdogAlerts(campaigns, { now = Date.now(), lastAlert = 
 
 /**
  * Read both Data campaigns, alert on anything not RUNNING, and report.
- * 200 when both are RUNNING, 503 otherwise.
+ *
+ * 200 when nothing needs a human: both RUNNING, or the only campaign that is
+ * down is one this process is cycling right now. 503 otherwise. all_running
+ * always reports the literal Five9 state, and each campaign carries its own
+ * cycling flag, so a 200 mid-cycle hides nothing — it only says "no action
+ * required", which is what both the pager and the n8n execution log are for.
  *
  * noDedup on the send is deliberate: groupme.js content-dedups identical text
  * for 60 minutes by default, which would silently override the 30-minute
@@ -333,6 +341,7 @@ export async function checkCampaignState(deps = {}) {
     getOutbound = getOutboundCampaign,
     sendAlert = (text) => sendGroupMeMessage(text, { noDedup: true }),
     inWindow = withinWatchdogWindow,
+    cycling = isCycling,
     lastAlert = watchdogLastAlert,
     now = new Date(),
     log = console.log,
@@ -340,9 +349,15 @@ export async function checkCampaignState(deps = {}) {
 
   const campaigns = await Promise.all([CAMPAIGNS.hot, CAMPAIGNS.warm].map(async (name) => {
     const c = await getOutbound(name).catch(() => null);
-    return { campaign: name, state: c?.state ?? null, ok: String(c?.state || '').toUpperCase() === 'RUNNING' };
+    const ok = String(c?.state || '').toUpperCase() === 'RUNNING';
+    // Only ask about a campaign that is actually down; a RUNNING one is never
+    // "cycling" for reporting purposes even mid-reorder.
+    return { campaign: name, state: c?.state ?? null, ok, cycling: ok ? false : cycling(name) };
   }));
   const allRunning = campaigns.every((s) => s.ok);
+  // Down AND unexplained. A campaign the ranker is cycling right now is not a
+  // problem anyone needs to look at, so it neither pages nor fails the poll.
+  const needsAttention = campaigns.some((s) => !s.ok && !s.cycling);
   const windowOpen = inWindow(now);
   const alerted = [];
 
@@ -351,7 +366,7 @@ export async function checkCampaignState(deps = {}) {
   // all-clear ones that never reach the alert path below.
   for (const c of campaigns) if (c.ok) lastAlert.delete(c.campaign);
 
-  if (!allRunning && windowOpen) {
+  if (needsAttention && windowOpen) {
     for (const a of decideWatchdogAlerts(campaigns, { now: now.getTime(), lastAlert })) {
       log(`[CapacityRanker] WATCHDOG ${a.text}`);
       try {
@@ -362,14 +377,17 @@ export async function checkCampaignState(deps = {}) {
         log(`[CapacityRanker] WATCHDOG could not send the GroupMe alert for ${a.campaign}: ${err.message}`);
       }
     }
+  } else if (needsAttention) {
+    log(`[CapacityRanker] WATCHDOG ${campaigns.filter((c) => !c.ok && !c.cycling).map((c) => c.campaign).join(', ')} not RUNNING, but outside 08:00–21:00 ET Mon–Sat — not alerting`);
   } else if (!allRunning) {
-    log(`[CapacityRanker] WATCHDOG ${campaigns.filter((c) => !c.ok).map((c) => c.campaign).join(', ')} not RUNNING, but outside 08:00–21:00 ET Mon–Sat — not alerting`);
+    log(`[CapacityRanker] WATCHDOG ${campaigns.filter((c) => c.cycling).map((c) => c.campaign).join(', ')} is NOT_RUNNING because the ranker is cycling it — not an alert`);
   }
 
   return {
-    status: allRunning ? 200 : 503,
+    status: needsAttention ? 503 : 200,
     body: {
       all_running: allRunning,
+      needs_attention: needsAttention,
       checked_at: now.toISOString(),
       campaigns,
       alert_window_open: windowOpen,
