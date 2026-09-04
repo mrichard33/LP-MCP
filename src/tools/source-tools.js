@@ -84,6 +84,7 @@ export function registerSourceTools(server) {
                 unmapped: report.unmapped.length,
                 orphaned: report.orphaned.length,
                 dormant: report.dormant.length,
+                suspected_non_source: (report.suspected_non_source || []).length,
               },
               // In LP's catalog, no lp_source_mapping row. These leads route to
               // entry:other today. This is the number that replaces the old 552.
@@ -92,7 +93,14 @@ export function registerSourceTools(server) {
               orphaned: report.orphaned.slice(0, limit),
               // Mapped and live in LP, but zero leads in 90 days.
               dormant: include_dormant ? report.dormant.slice(0, limit) : [],
-              alerting: `lp.source_mapping_gap fires at most once per source per ISO week, and only above ${report.threshold_30d} leads in 30 days. Orphaned and dormant never alert.`,
+              // Flagged by migration 083 as not lead sources at all — market
+              // codes and placeholders sitting in lp_source_mapping pointed at
+              // entry:other. A subset of `orphaned`, broken out because the
+              // remedy is different. NOTHING was deleted and no bucket or tag
+              // was changed; deletion is a separate ruling.
+              suspected_non_source: (report.suspected_non_source || []).slice(0, limit),
+              suspected_non_source_note: 'Flagged, not removed. mapping_status=suspected_non_source is a label only — these rows still map exactly as they did before.',
+              alerting: `lp.source_mapping_gap fires at most once per source per ISO week, and only above ${report.threshold_30d} leads in 30 days — or ${report.threshold_30d_events} for event-class sources (lp_source_raw matching "Events …" or containing "Show"), which are too low-volume to ever clear the standard floor. Orphaned and dormant never alert.`,
               action: 'Classify unmapped sources in lp_source_mapping by hand — bucket and entry tag are a human decision.',
             }, null, 2),
           }],
