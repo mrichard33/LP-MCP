@@ -3,6 +3,21 @@
  *
  * Agentic Responder intelligence core.
  *
+ * PROMPT TEXT LIVES IN `src/prompts/response-generator/` (2026-09,
+ * snapshot-verified split). This file owns orchestration: which blocks apply,
+ * in what order, under which conditions, and the single callLLM call. It owns
+ * no copy. Every string the model reads is `P.something` from that directory.
+ *
+ * CHANGING PROMPT COPY: edit the module, never this file, then re-baseline
+ * deliberately and review the snapshot diff as the copy change:
+ *
+ *   UPDATE_SNAPSHOTS=1 node --test scripts/test-response-prompt-snapshot.js
+ *   node --test scripts/test-response-prompt-snapshot.js
+ *
+ * That test is the guard on both prompts for 32 fixtures covering all 112
+ * prompt blocks. An unexplained snapshot diff means the change is wrong, not
+ * the snapshot. Map: docs/handoffs/response-generator-split-map.md.
+ *
  * v2.7.13 — 2026-08-30. SET IS NOT DISPATCHED — THE TEAM-CONFIRMATION CALL
  *   IS NOW STATED ON EVERY IN-HOME BOOKING.
  *   Mark's directive 2026-08-30. The bot was closing in-home bookings with
