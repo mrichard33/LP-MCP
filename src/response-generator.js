@@ -881,7 +881,7 @@ async function getRecentEdits(intentClass, limit = RECENT_EDITS_LIMIT) {
 export function buildResponsePrompt(context, channel, triggerMessage, kbPack, classification, fastTrack, trafficTemp, availability, opts = {}) {
   const parts = [];
 
-  parts.push(`CHANNEL: ${channel.toUpperCase()}`);
+  parts.push(...P.channelHeader(channel.toUpperCase()));
 
   // ─── AUTHORSHIP (2026-07-29 — Kelly Callahan incident) ───
   // Stated FIRST, before any context that names a person, because every
@@ -920,13 +920,10 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     }
     parts.push(...P.signOffFooter(ident.signature));
   }
-  parts.push(channel === 'sms'
-    ? 'Constraints: under 160 chars ideal, 320 max. 1-3 sentences. ONE question max. Booking link = merge tag, bare (no markdown). At most ONE link.'
-    : 'Constraints: 150-400 words. 2-4 short paragraphs. Subject line required. Merge tags as bare text (no markdown).'
-  );
+  parts.push(channel === 'sms' ? P.SMS_CONSTRAINTS : P.EMAIL_CONSTRAINTS);
 
-  parts.push(`\n═══════ CURRENT DATE — Florida / ${PROMPT_TIMEZONE} ═══════`);
-  parts.push(`TODAY IS: ${formatTodayForPrompt()}. NEVER propose or confirm a date that has already passed. Compare every appointment and proposed slot against TODAY before calling it upcoming.`);
+  parts.push(...P.currentDateHeader(PROMPT_TIMEZONE));
+  parts.push(...P.todayIs(formatTodayForPrompt()));
 
   // ── TIME NOW (2026-08-29, Myron Thorner q5GehRye7DNkN6jlmjl3) ──────────
   // The model previously received only the current DATE — the block directly
@@ -936,13 +933,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // ahead of every appointment-specific block in this prompt, and framed as
   // binding.
   if (context.now?.time_human) {
-    parts.push(
-      `TIME NOW: It is ${context.now.time_human} on ${context.now.date_human} (Eastern).\n` +
-      `HARD RULE: every clock time you write must be LATER than ${context.now.time_human}. ` +
-      `Before writing any time, compare it to the current time. Never offer a callback ` +
-      `window, a deadline, or a "if you haven't heard by X" that has already passed. ` +
-      `If there is no useful future time to offer, offer a phone call instead.`
-    );
+    parts.push(...P.timeNowHardRule(context.now.time_human, context.now.date_human));
   }
   if (context.lp?.appointment_phase) {
     const ph = context.lp.appointment_phase;
@@ -954,23 +945,16 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     // for null" and "that was 0 minutes ago" would be worse than the defect
     // this block exists to fix. Say the time is unverified instead.
     const timeKnown = at !== null && typeof mins === 'number';
-    const phaseLine = timeKnown ? {
-      scheduled: `APPOINTMENT: booked for ${at}, still comfortably ahead. Normal pre-visit tone.`,
-      imminent: `APPOINTMENT: ${at}, about ${mins} minutes from now. The rep is en route or about to be. Do not re-pitch, do not re-book, do not re-qualify. Logistics and reassurance only.`,
-      in_window: `APPOINTMENT: ${at} — that time has PASSED and the visit window is open RIGHT NOW (${Math.abs(mins)} minutes in). Do NOT say the appointment is "coming up," "on track," or "ahead of ${at}." The correct move is to offer to get a person on the phone immediately.`,
-      past: `APPOINTMENT: ${at} — that was ${Math.abs(mins)} minutes ago and the window has closed. Do NOT speak about it in the future tense. Acknowledge plainly that the time has passed, do not invent a reason for it, and offer to get a person on the phone immediately.`,
-    }[ph] : {
-      scheduled: `APPOINTMENT: on record for ${context.lp.appointment_date || 'an upcoming date'}, exact time not confirmed in our records. Do not state a specific time you cannot verify. Offer to have someone confirm it by phone.`,
-      past: `APPOINTMENT: on record for ${context.lp.appointment_date || 'an earlier date'}, which has already passed; the exact time is not confirmed in our records. Do NOT speak about it in the future tense and do NOT state a time you cannot verify. Offer to get a person on the phone immediately.`,
-      today_time_unknown: `APPOINTMENT: today, exact time not confirmed in our records. Do not state a specific time you cannot verify. Offer to have someone confirm it by phone.`,
-    }[ph];
+    const phaseLine = timeKnown
+      ? P.appointmentPhaseLinesWithTime(at, mins)[ph]
+      : P.appointmentPhaseLinesDateOnly(context.lp.appointment_date)[ph];
     if (phaseLine) parts.push(phaseLine);
   }
 
-  parts.push(`\nCLASSIFICATION: ${classification.intent_class} (${classification.confidence?.toFixed(2) || 'n/a'} confidence, ${classification.classification_method})`);
-  if (classification.reasoning) parts.push(`Classifier reasoning: ${classification.reasoning}`);
+  parts.push(...P.classification(classification.intent_class, classification.confidence?.toFixed(2) || 'n/a', classification.classification_method));
+  if (classification.reasoning) parts.push(...P.classifierReasoning(classification.reasoning));
 
-  parts.push(`\nTRAFFIC TEMPERATURE: ${trafficTemp.toUpperCase()} — calibrate hook intensity per Traffic Secrets section.`);
+  parts.push(...P.trafficTemperature(trafficTemp.toUpperCase()));
 
   // 2026-08-29 — NEPQ conversation discipline. Refines the Chatbot channel
   // inside the Antifragile framework; the commitment gate inside turns
@@ -1106,13 +1090,13 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // of an earlier outbound, a newer inbound arrived mid-generation, or the
   // trigger went stale). Highest-priority conversational instruction.
   if (opts.regenerationNote) {
-    parts.push(`\n═══════ REGENERATION NOTE (HIGHEST PRIORITY — read before drafting) ═══════`);
+    parts.push(...P.REGENERATION_NOTE_HEADER);
     parts.push(String(opts.regenerationNote).slice(0, 800));
-    parts.push(`═══════ END REGENERATION NOTE ═══════`);
+    parts.push(...P.REGENERATION_NOTE_FOOTER);
   }
 
-  parts.push(`\nLEAD: ${context.lead.name}`);
-  parts.push(`Entry: ${context.lead.entry_source || 'unknown'} | Lead Score: ${context.lead.lead_score} | Date Added: ${context.lead.date_added || 'unknown'}`);
+  parts.push(...P.leadName(context.lead.name));
+  parts.push(...P.leadEntry(context.lead.entry_source || 'unknown', context.lead.lead_score, context.lead.date_added || 'unknown'));
 
   // ─── v1.1 KNOWN CONTACT PROFILE (R5 — never re-ask a known field) ───
   // Hydrated from the GHL record + everything extracted from this
@@ -1120,14 +1104,14 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   if (opts.bookingGate?.known) {
     const known = opts.bookingGate.known;
     const dmState = opts.bookingGate.decision_maker_confirmed;
-    parts.push(`\n═══════ KNOWN CONTACT PROFILE (CRM record + this conversation) ═══════`);
-    parts.push(`Name: ${known.name || 'NOT KNOWN'}`);
-    parts.push(`Phone: ${known.phone || 'NOT KNOWN'}`);
-    parts.push(`Email: ${known.email || 'NOT KNOWN'}`);
-    parts.push(`Property address: ${known.address || 'NOT KNOWN'}`);
-    parts.push(`Decision-maker presence: ${dmState === true ? 'CONFIRMED (all decision-makers attending)' : dmState === false ? 'ANSWERED BUT PENDING/NEGATIVE (do not re-ask this turn unless they volunteer an update)' : 'NEVER ASKED'}`);
-    parts.push(`NON-NEGOTIABLE RULE: Never ask the customer for information already present in this profile — it is on file. Only a field marked NOT KNOWN may ever be asked for, one at a time, and only when the booking-gate rules below call for it.`);
-    parts.push(`═══════ END KNOWN CONTACT PROFILE ═══════`);
+    parts.push(...P.KNOWN_CONTACT_PROFILE_HEADER);
+    parts.push(...P.knownName(known.name));
+    parts.push(...P.knownPhone(known.phone));
+    parts.push(...P.knownEmail(known.email));
+    parts.push(...P.knownAddress(known.address));
+    parts.push(...P.knownDecisionMakers(dmState === true, dmState === false));
+    parts.push(...P.KNOWN_CONTACT_PROFILE_RULE);
+    parts.push(...P.KNOWN_CONTACT_PROFILE_FOOTER);
   }
 
   // ─── v1.1 SERVICE AREA STATUS (zip-verified against service_area_zips) ───
@@ -1157,7 +1141,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   }
 
   const stageNum = inferBuyerStage(context, opts.contextSnapshot);
-  parts.push(`Inferred Buyer Stage: ${stageNum}/5`);
+  parts.push(...P.inferredBuyerStage(stageNum));
 
   // ─── 2026-07-06 (Bot 2/3/4 consolidation): funnel stage, trust, objection
   // state, and the named-storm posture toggle. See FUNNEL STAGE CONDUCT,
@@ -1166,11 +1150,11 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // the same fan-out may have rewritten it since this send was queued.
   const decisionStageTag = resolveStageTag(context, opts.contextSnapshot);
   if (decisionStageTag) {
-    parts.push(`FUNNEL STAGE TAG: ${decisionStageTag} — apply the matching FUNNEL STAGE CONDUCT.`);
+    parts.push(...P.funnelStageTag(decisionStageTag));
   }
   if (context.lead?.trust_level_score != null) {
     const t = context.lead.trust_level_score;
-    parts.push(`TRUST LEVEL SCORE: ${t}/5 (${t <= 2 ? 'LOW — value-first: give (a guide, an answer) before asking; no booking CTA as the primary ask' : t === 3 ? 'NEUTRAL — free estimate framing, soft booking ask allowed' : 'HIGH — direct booking ask appropriate'}).`);
+    parts.push(...P.trustLevelScore(t));
   }
   if (context.objection_state?.state_code) {
     const os = context.objection_state;
@@ -1181,18 +1165,18 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     parts.push(...P.NAMED_STORM_POSTURE);
   }
 
-  if (decisionStageTag) parts.push(`Stage Tag: ${decisionStageTag}`);
-  if (context.lead.current_buyer_tag) parts.push(`Buyer Tag: ${context.lead.current_buyer_tag}`);
-  if (context.lead.current_bj_tag) parts.push(`Buyer Journey: ${context.lead.current_bj_tag}`);
+  if (decisionStageTag) parts.push(...P.stageTag(decisionStageTag));
+  if (context.lead.current_buyer_tag) parts.push(...P.buyerTag(context.lead.current_buyer_tag));
+  if (context.lead.current_bj_tag) parts.push(...P.buyerJourneyTag(context.lead.current_bj_tag));
 
   const activeEntryTag = extractActiveEntryTag(context);
-  if (activeEntryTag) parts.push(`Active Entry: ${activeEntryTag}`);
+  if (activeEntryTag) parts.push(...P.activeEntry(activeEntryTag));
 
   if (context.lead.objection_tags?.length) {
-    parts.push(`Known Objections: ${context.lead.objection_tags.join(', ')}`);
+    parts.push(...P.knownObjections(context.lead.objection_tags.join(', ')));
   }
   if (context.lead.suppression_tags?.length) {
-    parts.push(`Suppression Tags: ${context.lead.suppression_tags.join(', ')}`);
+    parts.push(...P.suppressionTags(context.lead.suppression_tags.join(', ')));
   }
 
   // v2.7.11: guide-offer gate state for the GUIDE OFFER — BOOKING FAILURE
@@ -1215,7 +1199,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   if (context.pipeline?.status) {
     const stageStr = context.pipeline.stage_name || context.pipeline.stage_id || 'unknown';
     const pipeStr = context.pipeline.pipeline_name || 'unknown';
-    parts.push(`\nPIPELINE: ${pipeStr} | Stage: ${stageStr} | Status: ${context.pipeline.status} | Days in stage: ${context.pipeline.days_in_stage}`);
+    parts.push(...P.pipeline(pipeStr, stageStr, context.pipeline.status, context.pipeline.days_in_stage));
   }
 
   // v2.7.10: AUTHORITATIVE customer estimate block. Injected ABOVE the
@@ -1230,32 +1214,32 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // in GHL. When absent, no block is rendered and the system-prompt
   // HARD PROHIBITION on quoting prices/estimates holds absolutely.
   if (context.estimate?.has_data) {
-    parts.push(`\n═══════ CUSTOMER'S ACTUAL ESTIMATE (AUTHORITATIVE — overrides any figure in rep notes / conversation history) ═══════`);
+    parts.push(...P.ESTIMATE_HEADER);
     if (context.estimate.total !== null && context.estimate.total !== undefined) {
       const formattedTotal = new Intl.NumberFormat('en-US', {
         style: 'currency',
         currency: 'USD',
         maximumFractionDigits: 2,
       }).format(context.estimate.total);
-      parts.push(`Estimate Total (from Window Estimate Calculator): ${formattedTotal}`);
+      parts.push(...P.estimateTotal(formattedTotal));
     }
     if (context.estimate.window_count !== null && context.estimate.window_count !== undefined) {
-      parts.push(`Window Count: ${context.estimate.window_count}`);
+      parts.push(...P.estimateWindowCount(context.estimate.window_count));
     }
-    parts.push(`If you reference a dollar figure or window count in your reply, use ONLY the numbers in this block. NEVER quote a number from rep notes, prior conversation history, your own calculations, or training-data priors.`);
-    parts.push(`Per HARD PROHIBITIONS: never quote prices/estimates EXCEPT figures in this block. This block is the ONLY authoritative source. Default behavior remains: do not quote unless directly relevant to the lead's question.`);
-    parts.push(`═══════ END CUSTOMER'S ACTUAL ESTIMATE ═══════`);
+    parts.push(...P.ESTIMATE_RULES);
+    parts.push(...P.ESTIMATE_PROHIBITION_CARVE_OUT);
+    parts.push(...P.ESTIMATE_FOOTER);
   }
 
   if (context.lp?.matched || context.lp?.disposition) {
-    parts.push(`\nLP CRM (Ground Truth):`);
-    parts.push(`Disposition: ${context.lp.disposition || 'none'}${context.lp.disposition_label ? ' (' + context.lp.disposition_label + ')' : ''}`);
+    parts.push(...P.LP_CRM_HEADER);
+    parts.push(...P.lpDisposition(context.lp.disposition || 'none', context.lp.disposition_label));
     if (context.lp.rep_name) {
       // 2026-07-29 — label this explicitly. The field rep is a person the
       // customer has MET; left unlabelled beside "Ground Truth", the model
       // would sign as her or open "Beverly here". She does not write these
       // emails and must never appear to. See AUTHORSHIP at the top of the prompt.
-      parts.push(`Sales Rep (the FIELD rep who owns this deal — NOT the author of your reply): ${context.lp.rep_name}`);
+      parts.push(...P.lpSalesRep(context.lp.rep_name));
     }
     let apptStatus = 'no';
     if (context.lp.appointment_set || context.lp.appointment_date) {
@@ -1263,32 +1247,32 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
       let when = '';
       if (typeof dd === 'number') {
         const n = Math.abs(dd);
-        if (dd < 0) when = ` — ${n} day${n === 1 ? '' : 's'} in the PAST (already passed — do NOT treat as upcoming; offer to reschedule)`;
-        else if (dd === 0) when = ' — TODAY';
-        else when = ` — in ${n} day${n === 1 ? '' : 's'} (upcoming)`;
+        if (dd < 0) when = P.appointmentWhenPast(n);
+        else if (dd === 0) when = P.APPOINTMENT_WHEN_TODAY;
+        else when = P.appointmentWhenUpcoming(n);
       }
       apptStatus = `YES — ${context.lp.appointment_date}${when}`;
     }
-    parts.push(`Demo: ${context.lp.demo_completed ? 'YES' : 'no'} | Appointment: ${apptStatus}`);
-    if (context.lp.closed_won) parts.push(`CLOSED WON — $${context.lp.job_value}`);
-    if (context.lp.lost_reason) parts.push(`LOST REASON: ${context.lp.lost_reason}`);
+    parts.push(...P.lpDemoAndAppointment(context.lp.demo_completed ? 'YES' : 'no', apptStatus));
+    if (context.lp.closed_won) parts.push(...P.lpClosedWon(context.lp.job_value));
+    if (context.lp.lost_reason) parts.push(...P.lpLostReason(context.lp.lost_reason));
 
     if (context.lp.data_stale_active) {
-      parts.push(`⚠️ LP data is ${context.lp.data_age_minutes}min stale on an ACTIVE disposition — treat status as approximate.`);
+      parts.push(...P.lpDataStale(context.lp.data_age_minutes));
     }
 
     if (context.lp.notes?.length) {
-      parts.push(`\nLP Rep Notes (most reliable intelligence):`);
+      parts.push(...P.LP_NOTES_HEADER);
       context.lp.notes.slice(0, 5).forEach(n => {
         const by = n.entered_by || 'System';
         const noteText = typeof n.text === 'string' ? n.text.slice(0, 1500) : '';
-        parts.push(`  [${by}] ${noteText}`);
+        parts.push(...P.lpNote(by, noteText));
       });
     }
     if (context.lp.recent_calls?.length) {
       const calls = context.lp.recent_calls.slice(0, 3).map(c =>
         `${c.type}: ${c.result} (${c.agent})`).join(', ');
-      parts.push(`Recent Calls: ${calls}`);
+      parts.push(...P.lpRecentCalls(calls));
     }
   }
 
@@ -1296,38 +1280,38 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // contact-record notes are read before EVERY generated reply. This is the
   // team's accumulated knowledge of the person — use it.
   if (context.lead?.contact_notes?.length) {
-    parts.push(`\nCONTACT NOTES (internal team notes on this person — most recent first):`);
+    parts.push(...P.CONTACT_NOTES_HEADER);
     context.lead.contact_notes.slice(0, 6).forEach(n => {
       const when = n.date ? String(n.date).slice(0, 10) : '';
-      parts.push(`  [${when}] ${n.text}`);
+      parts.push(...P.contactNote(when, n.text));
     });
-    parts.push(`HOW TO USE THESE NOTES: they exist so your reply lands like it comes from someone who KNOWS this person. Weave in what's relevant — their situation, spouse/family details, pets, stated preferences and constraints, prior commitments — naturally and sparingly (one personal touch beats three). NEVER mention that notes exist, never quote a note verbatim, never surface internal shorthand, rep commentary, scores, or anything that would feel like surveillance rather than attentiveness. If a note conflicts with what the lead just said, what the lead said wins. The goal is trust: show them they don't have to repeat themselves.`);
+    parts.push(...P.CONTACT_NOTES_GUIDANCE);
   }
 
   if (context.intelligence?.buyer_stage) {
-    parts.push(`\nPRIOR AI ANALYSIS:`);
-    parts.push(`Buyer Stage: ${context.intelligence.buyer_stage} (conf: ${context.intelligence.buyer_stage_confidence})`);
+    parts.push(...P.PRIOR_AI_ANALYSIS_HEADER);
+    parts.push(...P.priorBuyerStage(context.intelligence.buyer_stage, context.intelligence.buyer_stage_confidence));
     if (context.intelligence.objection_type) {
-      parts.push(`Objection: ${context.intelligence.objection_type} (conf: ${context.intelligence.objection_confidence})`);
+      parts.push(...P.priorObjection(context.intelligence.objection_type, context.intelligence.objection_confidence));
     }
-    if (context.intelligence.emotional_state) parts.push(`Emotional State: ${context.intelligence.emotional_state}`);
-    if (context.intelligence.recommended_action) parts.push(`Recommended Action: ${context.intelligence.recommended_action}`);
-    if (context.intelligence.recommended_story_arc) parts.push(`Recommended Arc: ${context.intelligence.recommended_story_arc}`);
-    if (context.intelligence.ai_reasoning) parts.push(`Prior reasoning: ${context.intelligence.ai_reasoning}`);
+    if (context.intelligence.emotional_state) parts.push(...P.emotionalState(context.intelligence.emotional_state));
+    if (context.intelligence.recommended_action) parts.push(...P.recommendedAction(context.intelligence.recommended_action));
+    if (context.intelligence.recommended_story_arc) parts.push(...P.recommendedArc(context.intelligence.recommended_story_arc));
+    if (context.intelligence.ai_reasoning) parts.push(...P.priorReasoning(context.intelligence.ai_reasoning));
   }
 
-  parts.push(`\nENGAGEMENT: opens=${context.engagement?.emails_opened || 0} | clicks=${context.engagement?.links_clicked || 0} | replies=${context.engagement?.replies_count || 0} | VSL=${context.engagement?.vsl_watched ? 'watched' : 'not watched'}`);
+  parts.push(...P.engagement(context.engagement?.emails_opened || 0, context.engagement?.links_clicked || 0, context.engagement?.replies_count || 0, context.engagement?.vsl_watched ? 'watched' : 'not watched'));
 
   const activeTags = (context.lead.current_tags || []).filter(t => t.startsWith('active-w'));
   const completedTags = (context.lead.current_tags || []).filter(t =>
     t.includes('-complete') || t.includes('-sent'));
-  if (activeTags.length) parts.push(`Active Workflows: ${activeTags.join(', ')}`);
-  if (completedTags.length) parts.push(`Completed: ${completedTags.slice(0, 8).join(', ')}`);
+  if (activeTags.length) parts.push(...P.activeWorkflows(activeTags.join(', ')));
+  if (completedTags.length) parts.push(...P.completedWorkflows(completedTags.slice(0, 8).join(', ')));
 
   if (context.conversation_recent?.length) {
-    parts.push(`\nCONVERSATION HISTORY (most recent last):`);
+    parts.push(...P.CONVERSATION_HISTORY_HEADER);
     context.conversation_recent.slice(-10).forEach(m => {
-      parts.push(`[${m.direction}] ${m.text?.slice(0, 200) || '(empty)'}`);
+      parts.push(...P.conversationHistoryEntry(m.direction, m.text?.slice(0, 200) || '(empty)'));
     });
     // Quality Pass v1.0 Item 1a — anti-repetition + answered-question (hard rules).
     // Evidence: the same escalation line sent verbatim 3×, and a slot question
@@ -1343,33 +1327,32 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   if (Array.isArray(opts.upcomingAppointments) && opts.upcomingAppointments.length > 0) {
     const formatted = formatAppointmentsForPrompt(opts.upcomingAppointments);
     if (formatted) {
-      parts.push(`\n═══════ EXISTING APPOINTMENTS (active, future) — AUTHORITATIVE for cancel/reschedule ═══════`);
+      parts.push(...P.EXISTING_APPOINTMENTS_HEADER);
       parts.push(formatted);
-      parts.push(`When emitting cancel_appointment or reschedule_appointment companions, use ONLY appointment_id values from this block.`);
-      parts.push(`═══════ END EXISTING APPOINTMENTS ═══════`);
+      parts.push(...P.EXISTING_APPOINTMENTS_FOOTER);
     }
   }
 
   if (kbPack) {
     const formatted = formatKbPackForPrompt(kbPack);
     if (formatted) {
-      parts.push(`\n═══════ KB PACK (PRIMARY SOURCE — adapt tone, do not invent) ═══════`);
+      parts.push(...P.KB_PACK_HEADER);
       parts.push(formatted);
-      parts.push(`═══════ END KB PACK ═══════`);
+      parts.push(...P.KB_PACK_FOOTER);
     }
   }
 
   if (availability) {
     const slotsBlock = formatSlotsForPrompt(availability);
     if (slotsBlock) {
-      parts.push(`\n═══════ CALENDAR AVAILABILITY ═══════`);
+      parts.push(...P.CALENDAR_AVAILABILITY_HEADER);
       // Preferred-time block first (the "you already promised X" walk-back is the
       // most recent instruction inside it), then the 48-hour offer-window frame,
       // then the raw slot list. See preferred-time.js / calendar-availability.js.
       if (opts.preferredTimeBlock) parts.push(opts.preferredTimeBlock);
       if (opts.offerWindowBlock) parts.push(opts.offerWindowBlock);
       parts.push(slotsBlock);
-      parts.push(`═══════ END CALENDAR AVAILABILITY ═══════`);
+      parts.push(...P.CALENDAR_AVAILABILITY_FOOTER);
     }
   }
 
@@ -1377,37 +1360,28 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   const canonicalCalName = kbPack?.booking_context?.calendar_name || null;
   if (canonicalUrl) {
     const looksLikeMergeTag = canonicalUrl.startsWith('{{trigger_link.');
-    parts.push(`\n═══════ CANONICAL BOOKING LINK — COPY VERBATIM IF YOU INCLUDE A LINK ═══════`);
-    parts.push(`The ONLY booking link you may include is this one, exactly as written:`);
-    parts.push(`  ${canonicalUrl}`);
-    if (canonicalCalName) parts.push(`(That ${looksLikeMergeTag ? 'merge tag' : 'URL'} is the ${canonicalCalName} calendar.)`);
+    parts.push(...P.canonicalBookingLinkHeader(canonicalUrl));
+    if (canonicalCalName) parts.push(...P.canonicalLinkCalendarNote(looksLikeMergeTag ? 'merge tag' : 'URL', canonicalCalName));
     if (looksLikeMergeTag) {
-      parts.push(`This is a GHL TRIGGER LINK MERGE TAG. The double-braces are correct GHL syntax — render expected.`);
-      parts.push(`Per ASK-FIRST PROTOCOL: include this link ONLY when (a) the lead asked for the link or said "I'll pick", (b) the lead rejected proposed times and asked for alternatives via self-serve, or (c) CALENDAR AVAILABILITY is empty/missing.`);
-      parts.push(`v2.7.5 EXCEPTION: closing acknowledgments do NOT include the link.`);
-      parts.push(`v2.7.7 EXCEPTION (auto-book): hard confirmations of held times do NOT include the link — emit companion_action of type book_appointment instead. Status: "confirmed" if Q1+Q2+Q3 all pass (Q3 = "Yes" OR "Solo Owner"); "new" otherwise (DEFAULT).`);
-      parts.push(`v2.7.8 EXCEPTION (cancellation flow): when the lead is in any state of the CANCELLATION FLOW state machine, do NOT include the booking link. Use the appropriate state-machine response per the system prompt.`);
+      parts.push(...P.BOOKING_LINK_MERGE_TAG_RULES);
     } else {
-      parts.push(`If you include a booking link: paste this exact string. No markdown. No modifications. No invented domains.`);
+      parts.push(...P.BOOKING_LINK_PLAIN_URL);
     }
-    parts.push(`═══════ END CANONICAL BOOKING LINK ═══════`);
+    parts.push(...P.CANONICAL_BOOKING_LINK_FOOTER);
   } else {
-    parts.push(`\n═══════ NO BOOKING LINK AUTHORIZED ═══════`);
-    parts.push(`No booking link is available for this response. Do NOT include any URL or merge tag in your message.`);
-    parts.push(`═══════ END NO BOOKING LINK AUTHORIZED ═══════`);
+    parts.push(...P.NO_BOOKING_LINK_AUTHORIZED);
   }
 
   if (Array.isArray(opts.recentEdits) && opts.recentEdits.length > 0) {
-    parts.push(`\n═══════ RECENT EDITORIAL FEEDBACK (lessons learned from prior reviews) ═══════`);
-    parts.push(`These are real corrections human reviewers made to past responses for similar inbound types (intent class: ${classification.intent_class}). Apply the LESSONS — don't copy verbatim.`);
+    parts.push(...P.recentEditsHeader(classification.intent_class));
     opts.recentEdits.forEach((e, i) => {
-      parts.push(`\nCASE ${i + 1}:`);
-      if (e.trigger_message) parts.push(`  Inbound was similar to: "${String(e.trigger_message).slice(0, 200)}"`);
-      if (e.original_message) parts.push(`  AI initially drafted: "${String(e.original_message).slice(0, 250)}"`);
-      parts.push(`  Reviewer correction: "${String(e.edit_instruction || '').slice(0, 250)}"`);
-      if (e.final_message) parts.push(`  Final accepted version: "${String(e.final_message).slice(0, 250)}"`);
+      parts.push(...P.editCaseLines(i + 1));
+      if (e.trigger_message) parts.push(...P.editCaseInbound(String(e.trigger_message).slice(0, 200)));
+      if (e.original_message) parts.push(...P.editCaseDraft(String(e.original_message).slice(0, 250)));
+      parts.push(...P.editCaseCorrection(String(e.edit_instruction || '').slice(0, 250)));
+      if (e.final_message) parts.push(...P.editCaseFinal(String(e.final_message).slice(0, 250)));
     });
-    parts.push(`═══════ END EDITORIAL FEEDBACK ═══════`);
+    parts.push(...P.EDITORIAL_FEEDBACK_FOOTER);
   }
 
   // ─── Booking gate (BUILD HANDOFF §4 + v1.1 prerequisite gate) — only when a calendar is resolved ───
@@ -1450,8 +1424,8 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     parts.push(...P.phoneBooking(bcg.resolved_calendar_name, bcg.booking_duration_minutes));
   }
 
-  parts.push(`\nTHE INBOUND MESSAGE TO RESPOND TO:`);
-  parts.push(`"${triggerMessage}"`);
+  parts.push(...P.INBOUND_MESSAGE_HEADER);
+  parts.push(...P.inboundMessage(triggerMessage));
 
   // v2.7.8: priority order updated to include CANCELLATION FLOW recognition
   // ahead of the auto-book branch. The AI must check whether this turn is
@@ -1472,7 +1446,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     parts.push(...P.PRIORITY_PREREQS_NOT_SATISFIED);
   }
   parts.push(...P.PRIORITY_ORDER_TAIL);
-  parts.push(`Return ONLY the JSON object — first character must be {, last must be }, no preamble. Include companion_action only when the appropriate priority criteria match; otherwise omit the field or set it to null.`);
+  parts.push(...P.OUTPUT_CONTRACT);
 
   return parts.join('\n');
 }
