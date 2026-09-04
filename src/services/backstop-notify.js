@@ -15,6 +15,7 @@ import { formatLpSource } from '../format-helpers.js';
 import { buildClassifiedNotification } from '../actions/notification-classifier.js';
 import { sendGroupMeMessage } from '../groupme.js';
 import { generateBackstopInsight } from './backstop-insight.js';
+import { reportAlertCondition, __resetAlertStateFallback } from '../alert-state.js';
 
 /**
  * Source line for the card header, covering BOTH the single-lead and
@@ -97,12 +98,19 @@ const deferThreshold = () => Math.max(1, parseInt(process.env.LP_BACKSTOP_DEFER_
 const cooldownMs = () => Math.max(0, parseInt(process.env.LP_BACKSTOP_ALERT_COOLDOWN_MIN || String(DEFAULT_COOLDOWN_MIN), 10)) * 60000;
 const failureCooldownMs = () => Math.max(0, parseInt(process.env.LP_BACKSTOP_FAILURE_COOLDOWN_MIN || String(DEFAULT_FAILURE_COOLDOWN_MIN), 10)) * 60000;
 
-// key -> last-sent ms. In-memory; resets on redeploy. Same trade-off already
-// accepted for the admin job registry in src/admin/lp-contact-backstop.js.
-const lastAlertAt = new Map();
+// 2026-09-05 (follow-on to PR #845): the cooldown Map moved into
+// alert_conditions. Six conditions live here — contact/intake × errors/backlog/
+// failure — and each is now a durable row, so a chronic backlog or a crash loop
+// posts ONE card until it resolves rather than one per cooldown window, and a
+// redeploy no longer re-announces everything that is still wrong.
+//
+// The old cooldowns survive as fallbackCooldownMs: if alert_conditions is
+// unusable, alert-state.js degrades to exactly this file's previous behavior.
+const ALERT_PREFIX = 'backstop:';
+const alertKey = (sweepMode, kind) => `${ALERT_PREFIX}${sweepMode}:${kind}`;
 
-/** Test hook — clears cooldown state. */
-export function __resetCooldowns() { lastAlertAt.clear(); }
+/** Test hook — clears the degraded-path cooldown state. */
+export function __resetCooldowns() { __resetAlertStateFallback(); }
 
 /**
  * Severity of a completed run. Errors outrank backlog: a run can be both,
@@ -146,34 +154,32 @@ export function classifyRun({
 }
 
 /**
- * Gate. Mutates cooldown state when it returns send:true for a degraded OR a
- * failing run, so callers must call this exactly once per run. Chronic backlog
- * would otherwise alert every 15 minutes — exactly the noise this removes.
+ * Policy only: does this severity warrant a card at all? PURE as of
+ * 2026-09-05 — it used to mutate the cooldown Map as a side effect of being
+ * asked, which meant callers had to invoke it exactly once per run and could
+ * never ask twice. Debouncing now lives in alert_conditions, keyed on the
+ * condition rather than on elapsed time.
  *
- * 2026-08-23 (#292/#291): failing runs are now debounced per sweep mode too,
- * rather than bypassing the cooldown. N failing runs inside the window produce
- * ONE card, not N. Losing the extra cards costs nothing now that every errored
- * lead is written to lp_sync_errors — see the header note above.
+ * 2026-08-23 (#292/#291): failing runs are debounced per sweep mode too, rather
+ * than bypassing the cooldown. N failing runs while the condition persists
+ * produce ONE card, not N. Losing the extra cards costs nothing now that every
+ * errored lead is written to lp_sync_errors — see the header note above.
+ *
+ * `kind` names which condition row the caller should report against.
  */
-export function shouldNotify({ severity, sweepMode, nowMs = Date.now() }) {
+export function shouldNotify({ severity, sweepMode }) {
   const mode = notifyMode();
   if (mode === 'off') return { send: false, reason: 'notify_off' };
-  if (mode === 'all') return { send: true, reason: 'notify_all' };
-  if (severity === 'healthy') return { send: false, reason: 'clean_run' };
-
   if (severity === 'failing') {
-    const errKey = `${sweepMode}:errors`;
-    const lastErr = lastAlertAt.get(errKey) || 0;
-    if (nowMs - lastErr < errorCooldownMs()) return { send: false, reason: 'error_cooldown' };
-    lastAlertAt.set(errKey, nowMs);
-    return { send: true, reason: 'lead_error_rate' };
+    return { send: true, reason: 'lead_error_rate', kind: 'errors', cooldownMs: errorCooldownMs() };
   }
-
-  const key = `${sweepMode}:backlog`;
-  const last = lastAlertAt.get(key) || 0;
-  if (nowMs - last < cooldownMs()) return { send: false, reason: 'backlog_cooldown' };
-  lastAlertAt.set(key, nowMs);
-  return { send: true, reason: 'backlog_pressure' };
+  if (severity === 'degraded') {
+    return { send: true, reason: 'backlog_pressure', kind: 'backlog', cooldownMs: cooldownMs() };
+  }
+  // healthy. 'all' still posts every run, so it keeps bypassing the condition
+  // layer entirely — it is a debugging mode, not an alerting one.
+  if (mode === 'all') return { send: true, reason: 'notify_all', kind: null };
+  return { send: false, reason: 'clean_run', kind: null };
 }
 
 // ─── Card composition ────────────────────────────────────────────────
@@ -305,18 +311,70 @@ export function buildBackstopCard({
  * The model is called only AFTER the gate says send, so healthy runs cost
  * nothing.
  */
-export async function notifyBackstopRun({ sweepMode, scan, counts, errors, results, maxPerRun, intervalMin = 15 }) {
+export async function notifyBackstopRun({
+  sweepMode, scan, counts, errors, results, maxPerRun, intervalMin = 15,
+  // Injectable sender, same seam alert-state.js and capacityRanker already use.
+  // ES module bindings are read-only, so this is the only way a test can watch
+  // what would have been posted without reaching the real GroupMe client.
+  send = (text) => sendGroupMeMessage(text, { flushNow: true }),
+}) {
   try {
     const { severity, errorRate } = classifyRun({ counts, scan });
     const gate = shouldNotify({ severity, sweepMode });
+
+    // notify_off is INHIBITION, not health — alert-state.js's `null` case by
+    // another name. Clearing here would mark every open condition resolved the
+    // moment somebody set LP_BACKSTOP_NOTIFY_MODE=off, and re-announce the lot
+    // when they set it back. Touch nothing.
+    if (gate.reason === 'notify_off') return { sent: false, severity, reason: gate.reason, errorRate };
+
+    // A run that completed is a fresh, first-hand reading of BOTH conditions,
+    // so clear whichever this run did not trip. That is what turns a chronic
+    // backlog followed by a recovery into two events instead of an endless
+    // stream, and it is why the clear happens even on a healthy run.
+    // 'failure' is always in this list: reaching here means the sweep ran to
+    // completion, which is the only evidence that a crash loop has ended.
+    const clears = ['errors', 'backlog', 'failure'].filter((k) => k !== gate.kind);
+    for (const kind of clears) {
+      await reportAlertCondition({
+        key: alertKey(sweepMode, kind), active: false, notifyRecovery: false,
+      });
+    }
+
     if (!gate.send) return { sent: false, severity, reason: gate.reason, errorRate };
 
-    const insight = await generateBackstopInsight({ sweepMode, severity, counts, scan, errors, results, maxPerRun });
-    const card = buildBackstopCard({ sweepMode, severity, scan, counts, errors, results, maxPerRun, intervalMin, insight });
-    if (!card) return { sent: false, severity, reason: 'no_card' };
+    // 'all' mode bypasses the condition layer — post every run, as before.
+    if (!gate.kind) {
+      const insight = await generateBackstopInsight({ sweepMode, severity, counts, scan, errors, results, maxPerRun });
+      const card = buildBackstopCard({ sweepMode, severity, scan, counts, errors, results, maxPerRun, intervalMin, insight });
+      if (!card) return { sent: false, severity, reason: 'no_card' };
+      await send(card);
+      return { sent: true, severity, reason: gate.reason, errorRate, insight_used: Boolean(insight) };
+    }
 
-    await sendGroupMeMessage(card, { flushNow: true });
-    return { sent: true, severity, reason: gate.reason, errorRate, insight_used: Boolean(insight) };
+    // The body is a thunk so the LLM insight call only happens once the firing
+    // edge is won — a silent sweep costs nothing, which is the same reason the
+    // pre-2026-09-05 code called the model after the gate rather than before.
+    let insightUsed = false;
+    const res = await reportAlertCondition({
+      key: alertKey(sweepMode, gate.kind),
+      active: true,
+      label: `${sweepMode} backstop ${gate.kind}`,
+      detail: `${severity} — ${gate.reason}`,
+      fallbackCooldownMs: gate.cooldownMs,
+      notifyRecovery: false,
+      send,
+      text: async () => {
+        const insight = await generateBackstopInsight({ sweepMode, severity, counts, scan, errors, results, maxPerRun });
+        insightUsed = Boolean(insight);
+        return buildBackstopCard({ sweepMode, severity, scan, counts, errors, results, maxPerRun, intervalMin, insight });
+      },
+    });
+
+    if (!res.sent) {
+      return { sent: false, severity, reason: res.reason || res.action, errorRate };
+    }
+    return { sent: true, severity, reason: gate.reason, errorRate, insight_used: insightUsed };
   } catch (e) {
     console.warn(`[BackstopNotify] ${sweepMode} run notification failed: ${e.message}`);
     return { sent: false, reason: 'send_failed' };
@@ -330,29 +388,44 @@ export async function notifyBackstopRun({ sweepMode, scan, counts, errors, resul
  * model is least likely to answer. Cooled down separately so a crash loop
  * cannot post every 15 minutes.
  */
-export async function notifyBackstopFailure({ sweepMode, error, nowMs = Date.now() }) {
+export async function notifyBackstopFailure({
+  sweepMode, error, nowMs = Date.now(),
+  send = (text) => sendGroupMeMessage(text, { flushNow: true }),
+}) {
   try {
     if (notifyMode() === 'off') return { sent: false, reason: 'notify_off' };
-    const key = `${sweepMode}:failure`;
-    const last = lastAlertAt.get(key) || 0;
-    if (nowMs - last < failureCooldownMs()) return { sent: false, reason: 'failure_cooldown' };
-    lastAlertAt.set(key, nowMs);
 
     const label = sweepMode === 'intake' ? 'LP INTAKE BACKSTOP' : 'LP CONTACT BACKSTOP';
     const msg = String(error?.message || error || 'unknown').slice(0, 300);
-    const card = buildClassifiedNotification({
-      notification_class: 'system',
-      action_verb: `${label} — SWEEP FAILED`,
-      name: 'Sweep did not complete',
-      contactId: '—',
-      tier: 'Warm',
-      status: 'Sweep failed',
-      narrative:
-        `The ${sweepMode} sweep failed before processing any leads: ${msg}. ` +
-        `No contacts were created this cycle — unlinked LP leads stay unlinked until a sweep succeeds.`,
-      nextStep: 'Check LP-MCP Railway deploy logs. Repeated failures mean the backstop is not protecting intake at all.',
+
+    // The key deliberately omits the error message. A crash loop that reports a
+    // different message each cycle — a timeout, then a connection reset, then a
+    // 502 — is ONE outage, and keying on the text is what made the capacity
+    // watchdog read one dead campaign as three separate problems (PR #845).
+    const res = await reportAlertCondition({
+      key: alertKey(sweepMode, 'failure'),
+      active: true,
+      label: `${sweepMode} backstop sweep failing`,
+      detail: msg,
+      fallbackCooldownMs: failureCooldownMs(),
+      notifyRecovery: false,
+      nowMs,
+      send,
+      text: () => buildClassifiedNotification({
+        notification_class: 'system',
+        action_verb: `${label} — SWEEP FAILED`,
+        name: 'Sweep did not complete',
+        contactId: '—',
+        tier: 'Warm',
+        status: 'Sweep failed',
+        narrative:
+          `The ${sweepMode} sweep failed before processing any leads: ${msg}. ` +
+          `No contacts were created this cycle — unlinked LP leads stay unlinked until a sweep succeeds.`,
+        nextStep: 'Check LP-MCP Railway deploy logs. Repeated failures mean the backstop is not protecting intake at all.',
+      }),
     });
-    await sendGroupMeMessage(card, { flushNow: true });
+
+    if (!res.sent) return { sent: false, reason: res.reason || res.action };
     return { sent: true };
   } catch (e) {
     console.warn(`[BackstopNotify] ${sweepMode} failure notification failed: ${e.message}`);

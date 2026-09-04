@@ -15,31 +15,47 @@
  *   - Only during business hours (Mon-Sat 09:00-18:00 America/New_York).
  *   - If five9_events_raw is EMPTY (pre-launch) → do nothing.
  *   - Else if the newest received_at is older than SILENCE_THRESHOLD (2h)
- *     → send one GroupMe alert. Suppress repeats to at most 1 per 6h.
+ *     → the feed is silent.
  *
- * Mirrors src/fb-publish-watchdog.js (in-process throttle, GroupMe send
- * with no opts → immediate). Registered in src/index.js alongside
- * startFbPublishWatchdog().
+ * 2026-09-05 — EDGE-TRIGGERED (follow-on to PR #845). The suppression was
+ * `lastAlertMs`, a process-local variable with a 6h ceiling, so a feed that
+ * stayed dead re-announced itself every 6 hours and every redeploy re-announced
+ * it immediately. It is now one durable condition ('five9:ess_silent') in
+ * alert_conditions: one card per outage, a daily reminder while it lasts
+ * because only a human can fix a dead subscription, and a silent clear when
+ * events resume. The 6h value survives as the degraded-path cooldown.
+ *
+ * Registered in src/index.js alongside startFbPublishWatchdog().
  *
  * Env knobs (all optional; reuses existing Supabase + GroupMe creds):
  *   FIVE9_SILENCE_WATCHDOG_ENABLED (default 'true')
  *   FIVE9_SILENCE_INTERVAL_MS      (default 3600000 = hourly) poll cadence
  *   FIVE9_SILENCE_THRESHOLD_MIN    (default 120 = 2h) silence before alert
+ *   FIVE9_SILENCE_REMIND_MS        (default 86400000 = 24h) re-nag interval
  */
 
 import supabase from './supabase.js';
 import { sendGroupMeMessage } from './groupme.js';
+import { reportAlertCondition } from './alert-state.js';
 
 const ENABLED = (process.env.FIVE9_SILENCE_WATCHDOG_ENABLED || 'true') === 'true';
 const INTERVAL_MS = parseInt(process.env.FIVE9_SILENCE_INTERVAL_MS || '3600000', 10);
 const SILENCE_THRESHOLD_MS = parseInt(process.env.FIVE9_SILENCE_THRESHOLD_MIN || '120', 10) * 60 * 1000;
-const REALERT_MS = 6 * 60 * 60 * 1000; // suppress repeat alerts to ≤1 per 6h
 const TIMEZONE = process.env.REECE_TIMEZONE || 'America/New_York';
 
-// In-process throttle. Resets on restart (a restart is exactly when we'd
-// want to re-check), with a 6h re-alert ceiling so a persistently-silent
-// feed can't spam the channel.
-let lastAlertMs = 0;
+// 2026-09-05: the ESS feed is ONE condition, so it gets one durable row.
+const ALERT_KEY = 'five9:ess_silent';
+
+// Was the in-process throttle (`lastAlertMs`, 6h). It now only paces the
+// degraded path in alert-state.js, for when the state table is unusable.
+const REALERT_MS = 6 * 60 * 60 * 1000;
+
+// A dead ESS subscription cannot fix itself — somebody has to open the Five9
+// Admin Console. So unlike the self-clearing live-ops alerts, this one nags,
+// once a day, until the feed comes back.
+const REMIND_MS = parseInt(
+  process.env.FIVE9_SILENCE_REMIND_MS || `${24 * 60 * 60 * 1000}`, 10
+);
 
 // Mon-Sat, 09:00-18:00 ET. Modeled on isWithinBusinessHours in
 // src/agentic-callback-message.js (weekday set includes Sat, 9-18 window).
@@ -59,12 +75,23 @@ function isWithinFive9BusinessHours(now = new Date()) {
 }
 
 /**
- * Check for a silent Five9 ESS feed and alert once (per 6h) if silent.
- * Returns true if an alert was sent, false otherwise.
+ * Read the feed's health as a TRI-STATE, then let alert-state.js decide.
+ *
+ *   true  — silent past the threshold, inside business hours.
+ *   false — delivering. Clears the condition.
+ *   null  — could not tell. Touches nothing.
+ *
+ * Three of the five exits are `null`, and that is the whole point of the shape.
+ * Before 2026-09-05 they all returned a bare `false` that only meant "don't
+ * alert", which was fine when nothing acted on it. Now `false` also means
+ * "announce a recovery" — so an off-hours sweep would report the feed healthy
+ * at 18:01 and again at 08:59, every night, for a feed that has been dead since
+ * yesterday afternoon.
  */
-export async function checkFive9Silence() {
-  // Only alert during business hours — off-hours silence is expected.
-  if (!isWithinFive9BusinessHours()) return false;
+async function readFive9FeedState() {
+  // Off-hours silence is expected, and is not evidence of a working feed. A
+  // feed that dies at 17:59 must page at 09:00, not "recover" at 18:01.
+  if (!isWithinFive9BusinessHours()) return { active: null, reason: 'outside_business_hours' };
 
   const { data: latest, error } = await supabase
     .from('five9_events_raw')
@@ -75,28 +102,41 @@ export async function checkFive9Silence() {
 
   if (error) {
     console.error('[Five9Watchdog] query error:', error.message);
-    return false;
+    return { active: null, reason: 'query_error' };
   }
 
-  // Empty table = pre-launch. Do nothing until the ESS has ever delivered.
-  if (!latest || !latest.received_at) return false;
+  // Empty table = pre-launch. The ESS has never delivered, so there is nothing
+  // to call silent and nothing to call healthy.
+  if (!latest || !latest.received_at) return { active: null, reason: 'no_events_yet' };
 
   const ageMs = Date.now() - new Date(latest.received_at).getTime();
-  if (ageMs < SILENCE_THRESHOLD_MS) return false;
+  if (ageMs < SILENCE_THRESHOLD_MS) return { active: false, reason: 'delivering', latest };
+  return { active: true, reason: 'silent', latest };
+}
 
-  // Silent past threshold — throttle to ≤1 alert per 6h.
-  if (Date.now() - lastAlertMs < REALERT_MS) return false;
-  lastAlertMs = Date.now();
+/**
+ * Check for a silent Five9 ESS feed. Alerts ONCE per outage (re-reminding daily
+ * while it lasts), and clears silently when the feed comes back.
+ * Returns true if a card was sent this sweep.
+ */
+export async function checkFive9Silence() {
+  const { active, latest } = await readFive9FeedState();
 
-  const text =
-    `🚨 SYSTEM — Five9 ESS feed silent since ${latest.received_at} ` +
-    `— check subscription status in Five9 Admin Console.`;
-  try {
-    await sendGroupMeMessage(text);
-  } catch (e) {
-    console.error('[Five9Watchdog] alert send failed:', e.message);
-  }
-  return true;
+  const res = await reportAlertCondition({
+    key: ALERT_KEY,
+    active,
+    label: 'Five9 ESS feed silent',
+    text: () =>
+      `🚨 SYSTEM — Five9 ESS feed silent since ${latest?.received_at} ` +
+      `— check subscription status in Five9 Admin Console.`,
+    detail: latest?.received_at ? `last event ${latest.received_at}` : null,
+    remindMs: REMIND_MS,
+    notifyRecovery: false,
+    fallbackCooldownMs: REALERT_MS,
+    send: sendGroupMeMessage,
+  });
+
+  return res.sent === true;
 }
 
 export function startFive9SilenceWatchdog() {

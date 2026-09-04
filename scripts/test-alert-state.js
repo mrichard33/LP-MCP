@@ -29,61 +29,12 @@ process.env.GROUPME_BOT_ID = 'test-bot';
 const MOD = '../src/alert-state.js';
 const { reportAlertCondition, humanDuration, formatRecovered, __resetAlertStateFallback } =
   await import(MOD);
+const { mockAlertConditions } = await import('./fixtures/alert-conditions-mock.js');
 
-/**
- * Stateful mock of alert_conditions.
- *
- * insert() models the real PRIMARY KEY: a second insert for the same
- * alert_key returns 23505 rather than overwriting. That collision is the whole
- * serialization mechanism — it is what makes two concurrent sweeps safe.
- *
- * update() models a guarded UPDATE ... RETURNING: `.select()` resolves to only
- * the rows that actually matched every filter, which is what makes the
- * clear/re-arm/remind transitions compare-and-swap rather than read-modify-write.
- *
- * `fail` forces an error onto one operation: 'insert', 'update' or 'throw'.
- */
-function mockClient(rows = new Map(), { fail = null } = {}) {
-  const match = (row, filters) => filters.every(([op, col, val]) => {
-    const v = row[col];
-    if (op === 'eq') return v === val;
-    if (op === 'lt') return v != null && String(v) < String(val);
-    return false;
-  });
-
-  const builder = (kind, patch) => {
-    const filters = [];
-    const run = () => {
-      if (fail === 'throw') throw new Error('client exploded');
-      if (fail === 'update') return { data: null, error: { message: 'update boom' } };
-      const hits = [...rows.values()].filter((r) => match(r, filters));
-      if (kind === 'delete') for (const r of hits) rows.delete(r.alert_key);
-      else for (const r of hits) Object.assign(r, patch);
-      return { data: hits.map((r) => ({ ...r })), error: null };
-    };
-    const self = {
-      eq: (c, v) => { filters.push(['eq', c, v]); return self; },
-      lt: (c, v) => { filters.push(['lt', c, v]); return self; },
-      select: () => self,
-      then: (res, rej) => { try { return Promise.resolve(run()).then(res, rej); } catch (e) { return Promise.reject(e).catch(rej); } },
-    };
-    return self;
-  };
-
-  return {
-    from: () => ({
-      insert: (row) => Promise.resolve().then(() => {
-        if (fail === 'throw') throw new Error('client exploded');
-        if (fail === 'insert') return { error: { message: 'insert boom', code: '42P01' } };
-        if (rows.has(row.alert_key)) return { error: { code: '23505', message: 'duplicate key' } };
-        rows.set(row.alert_key, { ...row });
-        return { error: null };
-      }),
-      update: (patch) => builder('update', patch),
-      delete: () => builder('delete'),
-    }),
-  };
-}
+// The alert_conditions mock lives in scripts/fixtures/ — three suites need the
+// same PostgreSQL semantics (PK collision, ON CONFLICT DO NOTHING, guarded
+// UPDATE ... RETURNING), and three drifting copies would test three databases.
+const mockClient = (rows = new Map(), opts = {}) => mockAlertConditions(rows, opts);
 
 /** A condition reporter bound to one shared table + one capture array. */
 function harness({ rows = new Map(), fail = null } = {}) {

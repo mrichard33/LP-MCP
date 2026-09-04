@@ -45,6 +45,7 @@ import { sendGroupMeMessage } from '../groupme.js';
 import { extractArray, getField } from '../sync-utils.js';
 import { runSQL } from './supabase-admin.js';
 import { lpStoredAgeMinutes, lpStoredToUtcIso } from '../lp-dates.js';
+import { reportAlertCondition } from '../alert-state.js';
 
 // ─── Configuration ──────────────────────────────────────────────────
 // Per-table freshness thresholds. Tuned to typical update cadence:
@@ -406,19 +407,59 @@ export async function checkProspectSplit({ force = false } = {}) {
 }
 
 // ─── Alert dedup ────────────────────────────────────────────────────
+//
+// 2026-09-05 (follow-on to PR #845). This file was the only watchdog whose
+// dedup was already DURABLE — `data_freshness_log.alerted_at` survives a
+// restart, unlike the process-local Maps everywhere else. Its predicate was
+// still wrong: "no alert in the last 6h", not "not currently firing". A table
+// stale for a week paged 28 times about the same stale table.
+//
+// So the storage was never the problem, the question was. reportAlertCondition
+// asks the right one. `alerted_at` keeps being written — /n8n/admin/freshness
+// reads it — it just no longer decides anything.
 
-async function shouldAlert(tableName) {
-  const since = new Date(Date.now() - ALERT_DEDUP_HOURS * 3600 * 1000).toISOString();
-  const { data } = await supabase
-    .from('data_freshness_log')
-    .select('id, alerted_at')
-    .eq('table_name', tableName)
-    .not('alerted_at', 'is', null)
-    .gte('alerted_at', since)
-    .order('alerted_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  return !data;  // alert only if no recent alert
+const ALERT_PREFIX = 'freshness:';
+const FALLBACK_COOLDOWN_MS = ALERT_DEDUP_HOURS * 3600 * 1000;
+
+/**
+ * Report one freshness condition. Returns true if a card actually went out.
+ *
+ * The kill switch maps to `active: null`, not `false`. alert-state.js calls
+ * that case out by name — "deliberately inhibited" — and the distinction is
+ * load-bearing: `false` would mark every open condition resolved the moment
+ * somebody set FRESHNESS_GROUPME_ALERTS_DISABLED, and then re-announce the lot
+ * when they unset it.
+ */
+/**
+ * Tri-state verdict for the four probes, which all report `{ status }` and two
+ * of which memoize (JOB_DATE_INVERSION_MIN_INTERVAL_MS, PROSPECT_SPLIT_MIN_
+ * INTERVAL_MS) between the 30-minute freshness sweeps.
+ *
+ *   badStatus  → true
+ *   'error'    → null. The probe could not run; that is not a clean bill.
+ *   cached     → null. A memoized answer is a REPLAY of an earlier observation,
+ *                not a new one, and re-deciding on it would let one stale read
+ *                clear a condition it never actually re-checked.
+ *   anything else → false
+ */
+function probeVerdict(probe, badStatus) {
+  if (!probe || probe.status === 'error') return null;
+  if (probe.cached) return null;
+  return probe.status === badStatus;
+}
+
+async function reportFreshness({ key, active, label, text, detail }) {
+  const res = await reportAlertCondition({
+    key: `${ALERT_PREFIX}${key}`,
+    active: GROUPME_ALERTS_DISABLED ? null : active,
+    label,
+    text,
+    detail,
+    notifyRecovery: false,
+    fallbackCooldownMs: FALLBACK_COOLDOWN_MS,
+    send: sendGroupMeMessage,
+  });
+  return res.sent === true;
 }
 
 // ─── Run check + alert + log ────────────────────────────────────────
@@ -448,28 +489,47 @@ export async function runFreshnessCheck({ alert = true } = {}) {
     console.warn('[Freshness] log insert failed:', err.message);
   }
 
-  // Alert on stale (with dedup, severity gate)
+  // Alert on stale (edge-triggered per table, severity gate)
   if (alert) {
-    for (const r of stale) {
+    // Every table gets a verdict, not just the stale ones — a table dropping
+    // OUT of `stale` is exactly how its condition resolves, and the old
+    // `for (const r of stale)` loop could never see that.
+    for (const r of results) {
       if (r.severity === 'info') continue;  // info-level: log only
+
+      // "The check itself failed" is its own condition, and it is NOT evidence
+      // the table is fresh — so it fires the error key and leaves the stale key
+      // untouched rather than clearing it.
+      const isError = r.status === 'error';
+      const isStale = r.status === 'stale' || r.status === 'empty';
+
       try {
-        if (!(await shouldAlert(r.table))) continue;
-
-        const human = r.status === 'empty'
-          ? `${r.table} has NO ROWS`
-          : r.status === 'error'
-          ? `${r.table} CHECK ERROR: ${r.error_message || 'unknown'}`
-          : `${r.table} last updated ${formatStaleness(r.staleness_min)} ago (threshold ${formatStaleness(r.threshold_min)})`;
-
         const icon = r.severity === 'critical' ? '🚨' : '⚠️';
-        const msg  = `${icon} STALE DATA [${r.severity.toUpperCase()}]\n${human}`;
+        const sent = await reportFreshness({
+          key: `table_stale:${r.table}`,
+          active: isError ? null : isStale,
+          label: `${r.table} stale`,
+          detail: r.status,
+          text: () => {
+            const human = r.status === 'empty'
+              ? `${r.table} has NO ROWS`
+              : `${r.table} last updated ${formatStaleness(r.staleness_min)} ago (threshold ${formatStaleness(r.threshold_min)})`;
+            return `${icon} STALE DATA [${r.severity.toUpperCase()}]\n${human}`;
+          },
+        });
+        const errSent = await reportFreshness({
+          key: `table_error:${r.table}`,
+          active: isError,
+          label: `${r.table} check error`,
+          detail: r.error_message || null,
+          text: () =>
+            `${icon} STALE DATA [${r.severity.toUpperCase()}]\n` +
+            `${r.table} CHECK ERROR: ${r.error_message || 'unknown'}`,
+        });
 
-        // v1.2: respect kill switch. Logs are still written above.
-        const sendResult = GROUPME_ALERTS_DISABLED
-          ? { sent: false, suppressed: true }
-          : await sendGroupMeMessage(msg);
-        if (sendResult?.sent) {
-          // Mark the most recent log row as alerted
+        if (sent || errSent) {
+          // Mark the most recent log row as alerted. Kept for the admin route,
+          // which reads alerted_at; it no longer gates anything.
           await supabase
             .from('data_freshness_log')
             .update({ alerted_at: new Date().toISOString() })
@@ -482,110 +542,132 @@ export async function runFreshnessCheck({ alert = true } = {}) {
       }
     }
 
-    // Also alert on stuck-watermark (separate signal — different message)
-    if (watermark.status === 'stuck') {
-      try {
-        if (await shouldAlert('__sync_watermark__')) {
-          // v1.2: respect kill switch. Suppressed alerts still leave a log row below.
-          const sendResult = GROUPME_ALERTS_DISABLED
-            ? { sent: false, suppressed: true }
-            : await sendGroupMeMessage(`🚨 SYNC WATERMARK STUCK\n${watermark.message}`);
-          if (sendResult?.sent) {
-            await supabase.from('data_freshness_log').insert({
-              table_name:    '__sync_watermark__',
-              status:        'stale',
-              severity:      'critical',
-              error_message: watermark.message,
-              alerted_at:    new Date().toISOString(),
-            });
-            alerted.push('__sync_watermark__');
-          } else if (GROUPME_ALERTS_DISABLED) {
-            // Still leave a non-alerted log row so /n8n/admin/freshness reflects it.
-            await supabase.from('data_freshness_log').insert({
-              table_name:    '__sync_watermark__',
-              status:        'stale',
-              severity:      'critical',
-              error_message: `${watermark.message} [GroupMe alert suppressed by FRESHNESS_GROUPME_ALERTS_DISABLED]`,
-            });
-          }
-        }
-      } catch (err) {
-        console.warn(`[Freshness] watermark alert failed: ${err.message}`);
+    // Also alert on stuck-watermark (separate signal — different message).
+    // 'unknown' (no recent runs) and 'error' are not health: null, not false.
+    try {
+      const sent = await reportFreshness({
+        key: 'sync_watermark_stuck',
+        active: probeVerdict(watermark, 'stuck'),
+        label: 'sync watermark stuck',
+        detail: watermark.message || null,
+        text: () => `🚨 SYNC WATERMARK STUCK\n${watermark.message}`,
+      });
+      // A log row on the firing EDGE, not on every sweep: the old code was gated
+      // by the 6h dedup read, so a firing probe wrote at most one row per window.
+      // Writing one per 30-min sweep instead would quietly grow the table.
+      // Under the kill switch nothing is ever "sent", so the row is written on
+      // each sweep exactly as before — that path is unchanged.
+      if ((watermark.status === 'stuck') && (sent || GROUPME_ALERTS_DISABLED)) {
+        await supabase.from('data_freshness_log').insert({
+          table_name:    '__sync_watermark__',
+          status:        'stale',
+          severity:      'critical',
+          error_message: sent
+            ? watermark.message
+            : `${watermark.message} [alert suppressed — already firing, or FRESHNESS_GROUPME_ALERTS_DISABLED]`,
+          alerted_at:    sent ? new Date().toISOString() : null,
+        });
+        if (sent) alerted.push('__sync_watermark__');
       }
+    } catch (err) {
+      console.warn(`[Freshness] watermark alert failed: ${err.message}`);
     }
 
     // Field-drift alert (funnel flags rotting on existing rows — the 5-vs-21 probe)
-    if (fieldDrift.status === 'drift') {
-      try {
-        if (await shouldAlert('__field_drift__')) {
-          const human = `Funnel-flag drift: ${fieldDrift.drifted}/${fieldDrift.sampled} sampled leads (${fieldDrift.drift_pct}%) have cached demo/appt/sold flags that disagree with LP (threshold ${fieldDrift.threshold}). Run POST /n8n/admin/lp-cohort-reconcile.`;
-          const sendResult = GROUPME_ALERTS_DISABLED
-            ? { sent: false, suppressed: true }
-            : await sendGroupMeMessage(`🚨 LP FIELD DRIFT\n${human}`);
-          await supabase.from('data_freshness_log').insert({
-            table_name:    '__field_drift__',
-            status:        'stale',
-            severity:      'critical',
-            error_message: sendResult?.sent ? human : `${human} [GroupMe alert suppressed by FRESHNESS_GROUPME_ALERTS_DISABLED]`,
-            alerted_at:    sendResult?.sent ? new Date().toISOString() : null,
-          });
-          if (sendResult?.sent) alerted.push('__field_drift__');
-        }
-      } catch (err) {
-        console.warn(`[Freshness] field-drift alert failed: ${err.message}`);
+    try {
+      const human = () => `Funnel-flag drift: ${fieldDrift.drifted}/${fieldDrift.sampled} sampled leads (${fieldDrift.drift_pct}%) have cached demo/appt/sold flags that disagree with LP (threshold ${fieldDrift.threshold}). Run POST /n8n/admin/lp-cohort-reconcile.`;
+      const sent = await reportFreshness({
+        key: 'field_drift',
+        active: probeVerdict(fieldDrift, 'drift'),
+        label: 'LP field drift',
+        detail: fieldDrift.status,
+        text: () => `🚨 LP FIELD DRIFT\n${human()}`,
+      });
+      // A log row on the firing EDGE, not on every sweep: the old code was gated
+      // by the 6h dedup read, so a firing probe wrote at most one row per window.
+      // Writing one per 30-min sweep instead would quietly grow the table.
+      // Under the kill switch nothing is ever "sent", so the row is written on
+      // each sweep exactly as before — that path is unchanged.
+      if ((fieldDrift.status === 'drift') && (sent || GROUPME_ALERTS_DISABLED)) {
+        await supabase.from('data_freshness_log').insert({
+          table_name:    '__field_drift__',
+          status:        'stale',
+          severity:      'critical',
+          error_message: sent ? human() : `${human()} [alert suppressed — already firing, or FRESHNESS_GROUPME_ALERTS_DISABLED]`,
+          alerted_at:    sent ? new Date().toISOString() : null,
+        });
+        if (sent) alerted.push('__field_drift__');
       }
+    } catch (err) {
+      console.warn(`[Freshness] field-drift alert failed: ${err.message}`);
     }
 
     // Job date-inversion alert (install finished before it started — LP source data,
     // tracked not repaired). Fires only above the accepted baseline.
-    if (dateInversion.status === 'inverted') {
-      try {
-        if (await shouldAlert('__job_date_inversion__')) {
-          const human = `lp_jobs date inversion: ${dateInversion.count} jobs have install_completed_date before install_date, up ${dateInversion.delta} on the accepted baseline of ${dateInversion.baseline}. LP source data — check what is keying these dates, do not repair in the mapper.`;
-          const sendResult = GROUPME_ALERTS_DISABLED
-            ? { sent: false, suppressed: true }
-            : await sendGroupMeMessage(`\u26a0\ufe0f LP JOB DATE INVERSION\n${human}`);
-          await supabase.from('data_freshness_log').insert({
-            table_name:    '__job_date_inversion__',
-            status:        'stale',
-            severity:      'warning',
-            error_message: sendResult?.sent ? human : `${human} [GroupMe alert suppressed by FRESHNESS_GROUPME_ALERTS_DISABLED]`,
-            alerted_at:    sendResult?.sent ? new Date().toISOString() : null,
-          });
-          if (sendResult?.sent) alerted.push('__job_date_inversion__');
-        }
-      } catch (err) {
-        console.warn(`[Freshness] date-inversion alert failed: ${err.message}`);
+    try {
+      const human = () => `lp_jobs date inversion: ${dateInversion.count} jobs have install_completed_date before install_date, up ${dateInversion.delta} on the accepted baseline of ${dateInversion.baseline}. LP source data — check what is keying these dates, do not repair in the mapper.`;
+      const sent = await reportFreshness({
+        key: 'job_date_inversion',
+        active: probeVerdict(dateInversion, 'inverted'),
+        label: 'LP job date inversion',
+        detail: dateInversion.status,
+        text: () => `⚠️ LP JOB DATE INVERSION\n${human()}`,
+      });
+      // A log row on the firing EDGE, not on every sweep: the old code was gated
+      // by the 6h dedup read, so a firing probe wrote at most one row per window.
+      // Writing one per 30-min sweep instead would quietly grow the table.
+      // Under the kill switch nothing is ever "sent", so the row is written on
+      // each sweep exactly as before — that path is unchanged.
+      if ((dateInversion.status === 'inverted' && !dateInversion.cached) && (sent || GROUPME_ALERTS_DISABLED)) {
+        await supabase.from('data_freshness_log').insert({
+          table_name:    '__job_date_inversion__',
+          status:        'stale',
+          severity:      'warning',
+          error_message: sent ? human() : `${human()} [alert suppressed — already firing, or FRESHNESS_GROUPME_ALERTS_DISABLED]`,
+          alerted_at:    sent ? new Date().toISOString() : null,
+        });
+        if (sent) alerted.push('__job_date_inversion__');
       }
+    } catch (err) {
+      console.warn(`[Freshness] date-inversion alert failed: ${err.message}`);
     }
 
     // Prospect-split alert (one contact spanning several LP prospects — a person-level
     // identity split). Detect only; a human merges in LP. Fires only above baseline.
-    if (prospectSplit.status === 'split') {
-      try {
-        if (await shouldAlert('__prospect_split__')) {
-          const names = prospectSplit.sample
-            .map(s => `${s.ghl_contact_id} (${s.prospects})`)
-            .join(', ');
-          const more = prospectSplit.sample_capped
-            ? ` +${prospectSplit.count - prospectSplit.sample.length} more`
-            : '';
-          const human = `LP prospect split: ${prospectSplit.count} contacts have lp_leads across more than one lp_prospect_id, up ${prospectSplit.delta} on the accepted baseline of ${prospectSplit.baseline}. Affected: ${names}${more}. lp_prospect_id is the person-level key, so a split gives one human two identities — deleting duplicate LEADS does not fix it. Merge or delete the extra prospects in LP; do NOT auto-merge.`;
-          const sendResult = GROUPME_ALERTS_DISABLED
-            ? { sent: false, suppressed: true }
-            : await sendGroupMeMessage(`⚠️ LP PROSPECT SPLIT\n${human}`);
-          await supabase.from('data_freshness_log').insert({
-            table_name:    '__prospect_split__',
-            status:        'stale',
-            severity:      'warning',
-            error_message: sendResult?.sent ? human : `${human} [GroupMe alert suppressed by FRESHNESS_GROUPME_ALERTS_DISABLED]`,
-            alerted_at:    sendResult?.sent ? new Date().toISOString() : null,
-          });
-          if (sendResult?.sent) alerted.push('__prospect_split__');
-        }
-      } catch (err) {
-        console.warn(`[Freshness] prospect-split alert failed: ${err.message}`);
+    try {
+      const human = () => {
+        const names = prospectSplit.sample
+          .map(s => `${s.ghl_contact_id} (${s.prospects})`)
+          .join(', ');
+        const more = prospectSplit.sample_capped
+          ? ` +${prospectSplit.count - prospectSplit.sample.length} more`
+          : '';
+        return `LP prospect split: ${prospectSplit.count} contacts have lp_leads across more than one lp_prospect_id, up ${prospectSplit.delta} on the accepted baseline of ${prospectSplit.baseline}. Affected: ${names}${more}. lp_prospect_id is the person-level key, so a split gives one human two identities — deleting duplicate LEADS does not fix it. Merge or delete the extra prospects in LP; do NOT auto-merge.`;
+      };
+      const sent = await reportFreshness({
+        key: 'prospect_split',
+        active: probeVerdict(prospectSplit, 'split'),
+        label: 'LP prospect split',
+        detail: prospectSplit.status,
+        text: () => `⚠️ LP PROSPECT SPLIT\n${human()}`,
+      });
+      // A log row on the firing EDGE, not on every sweep: the old code was gated
+      // by the 6h dedup read, so a firing probe wrote at most one row per window.
+      // Writing one per 30-min sweep instead would quietly grow the table.
+      // Under the kill switch nothing is ever "sent", so the row is written on
+      // each sweep exactly as before — that path is unchanged.
+      if ((prospectSplit.status === 'split' && !prospectSplit.cached) && (sent || GROUPME_ALERTS_DISABLED)) {
+        await supabase.from('data_freshness_log').insert({
+          table_name:    '__prospect_split__',
+          status:        'stale',
+          severity:      'warning',
+          error_message: sent ? human() : `${human()} [alert suppressed — already firing, or FRESHNESS_GROUPME_ALERTS_DISABLED]`,
+          alerted_at:    sent ? new Date().toISOString() : null,
+        });
+        if (sent) alerted.push('__prospect_split__');
       }
+    } catch (err) {
+      console.warn(`[Freshness] prospect-split alert failed: ${err.message}`);
     }
   }
 

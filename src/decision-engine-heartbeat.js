@@ -133,6 +133,14 @@ const SILENCE_MIN_REPLIES = Math.max(
   1, parseInt(process.env.AGENTIC_SILENCE_MIN_REPLIES || '2', 10)
 );
 // One page per window, not one per 60s heartbeat.
+//
+// 2026-09-05 — CLOSED, so nobody re-opens it. PR #845 observed this alert
+// firing at ~75-minute intervals against the 6-hour default and guessed
+// AGENTIC_SILENCE_ALERT_COOLDOWN_MS was overridden in Railway. It is not set
+// there (LP-MCP production, single replica; checked 2026-09-05). The cadence
+// was RESTARTS: the service deployed 13 times on 2026-09-04, and every deploy
+// reset lastSilenceAlertAt to 0 — the exact process-local-memory bug #845 was
+// written to fix. There is nothing to clear.
 const SILENCE_ALERT_COOLDOWN_MS = parseInt(
   process.env.AGENTIC_SILENCE_ALERT_COOLDOWN_MS || `${6 * 60 * 60 * 1000}`, 10
 );
