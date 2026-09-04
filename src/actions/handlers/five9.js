@@ -145,12 +145,22 @@ const FIVE9_WRITE_OPS = {
   // registering it would take.
 };
 
+// The single op exempt from the execution-time approval assertion below.
+// Mirrors AUTO_APPROVED_FIVE9_OP in src/tools/agent-tools.js, which is where
+// the ruling and the reasoning live — read that comment before touching this.
+// Duplicated as a literal rather than imported because this is the
+// belt-and-braces half of a deliberately two-layer gate: importing the queue
+// layer's constant would mean one edit silently opens both. The pair is
+// pinned together by scripts/test-five9-approval-carveout.js.
+const EXEC_AUTO_APPROVED_FIVE9_OP = 'five9_add_records_to_list';
+
 export async function executeFive9Write(action) {
   const fn = FIVE9_WRITE_OPS[action.action_type];
   if (!fn) throw new Error(`five9 handler: unknown op ${action.action_type}`);
   // Belt-and-braces: a five9 write row must have entered through the
-  // approve_action gate. requires_approval=false means someone bypassed it.
-  if (action.requires_approval !== true) {
+  // approve_action gate. requires_approval=false means someone bypassed it —
+  // except for the one carved-out op, which is queued unarmed by design.
+  if (action.requires_approval !== true && action.action_type !== EXEC_AUTO_APPROVED_FIVE9_OP) {
     throw new Error(`REFUSED: ${action.action_type} must be queued with requires_approval=true (approve_action gate)`);
   }
   return fn(action);

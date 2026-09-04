@@ -18,12 +18,44 @@ import supabase from '../supabase.js';
  * kind of list that goes stale — the executor's own FIVE9_WRITE_OPS map is
  * the authority on which ops exist, and this does not try to duplicate it.
  */
+
+/**
+ * The ONE five9_ op that does not wait on a human. Mark's ruling, 2026-09-04.
+ *
+ * lp_callback_requeue promises a customer a call "within the next few
+ * minutes". Behind the approval gate that promise cannot be kept: the row sits
+ * in pending_approval until someone clicks, which is the failure this action
+ * exists to prevent (Robert Pederson, zLDD7V1eosF8vldF5U7i, 2026-09-04 — the
+ * customer waited at home and no call came).
+ *
+ * It is carved out because it is the same risk class as add_tag: ONE contact,
+ * appended to ONE list, reversible with five9_delete_record_from_list. It
+ * writes no campaign, profile, strategy, skill or DNC state, and it cannot
+ * remove anything.
+ *
+ * A SET OF ONE, DELIBERATELY, AND IT STAYS THAT WAY. Not a prefix, not an env
+ * list, not a LOW_RISK_OPS array — every one of those shapes lets a future
+ * change widen the hole by adding a string, with no one re-making this
+ * decision. Adding a second op here means writing a second named constant and
+ * justifying it on its own merits, which is the point. In particular
+ * five9_delete_record_from_list, five9_modify_campaign_lists,
+ * five9_reset_campaign, five9_reset_list_position and five9_add_numbers_to_dnc
+ * stay gated; scripts/test-five9-approval-carveout.js asserts exactly that.
+ */
+const AUTO_APPROVED_FIVE9_OP = 'five9_add_records_to_list';
+
 export function resolveRequiresApproval(actionType, requested) {
-  const isFive9Write = String(actionType || '').startsWith('five9_');
+  const type = String(actionType || '');
+  const isFive9Write = type.startsWith('five9_');
+  // The carve-out only lowers the FLOOR the prefix rule imposes. An explicit
+  // requires_approval:true from the caller is still honoured — a human who
+  // deliberately asks to review this push gets to review it.
+  const isCarvedOut = type === AUTO_APPROVED_FIVE9_OP;
+  const requiresApproval = isFive9Write && !isCarvedOut ? true : (requested || false);
   return {
     isFive9Write,
-    requiresApproval: isFive9Write ? true : (requested || false),
-    coerced: isFive9Write && requested !== true,
+    requiresApproval,
+    coerced: isFive9Write && !isCarvedOut && requested !== true,
   };
 }
 

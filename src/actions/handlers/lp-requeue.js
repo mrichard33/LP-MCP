@@ -5,19 +5,38 @@
  * agent_rules id 324) when the analyzer returns
  * recommended_action=callback_request + requested_fulfillment=phone_call.
  *
- * THE PUSH IS THE DIAL TRIGGER. LP is the only writer into Five9's LP_ASAP
- * list (Mark's architecture decision, 2026-08-18): LeadAdd → LP pushes the
- * new inbound lead to LP_ASAP → DIAL ASAP dials, measured at ~4 seconds on
- * lead 567746. There is no LP endpoint that places a lead into a call queue
- * (queues are derived views), so "re-queue" always means "LeadAdd again".
+ * WHERE THE DIAL TRIGGER GOES — LP_REQUEUE_MODE, default 'five9' since
+ * 2026-09-04.
+ *
+ * It used to be an LP LeadAdd: LP creates the lead, LP feeds LP_ASAP, DIAL
+ * ASAP dials (~4s on lead 567746). That worked, and it also MINTED A NEW LP
+ * LEAD every single time, because LeadAdd is the only LP endpoint that puts a
+ * lead in a call queue — queues are derived views, so "re-queue" could only
+ * ever mean "add another lead". On 2026-09-04 that duplicate (lead 573111,
+ * contact zLDD7V1eosF8vldF5U7i) landed in LP's Data queue and triggered LP's
+ * own Revin bot to send new-lead intake copy to a customer waiting at home for
+ * an appointment we had already cancelled. The dedup was working — only one of
+ * four fires performed a LeadAdd. One correct re-queue was enough.
+ *
+ * So the default now pushes a DIALING COPY into the Five9 "Callback Request"
+ * list (src/five9/callback-push.js) and creates no LP lead at all. LP remains
+ * the system of record for contact data; the agent's screen pop opens LP by
+ * CustID. Setting LP_REQUEUE_MODE=lp_leadadd restores the old path exactly,
+ * without a deploy. See the rewritten banner in src/five9/list-dispatch.js for
+ * why writing this list is allowed where writing LP_ASAP still is not.
  *
  * Branching (handoff C3):
  *   no LP lead                    → create_lp_lead path (complete-address
  *                                   validation lives there; the Section-D
- *                                   hold-and-enrich gate hardens it)
- *   LP lead exists, address OK    → LeadAdd again (new lds row, ASAP push)
+ *                                   hold-and-enrich gate hardens it). Still a
+ *                                   LeadAdd in BOTH modes, deliberately: with
+ *                                   no LP lead there is no prospect id, so
+ *                                   there is no CustID to push and nothing for
+ *                                   the agent to open. Creating the lead is
+ *                                   genuine intake, not the duplicate above.
+ *   LP lead exists, address OK    → five9 push (or LeadAdd in lp_leadadd mode)
  *   LP lead exists, address blank → UpdateProspectInfo FIRST, read back to
- *                                   confirm, THEN LeadAdd. Never dispatch a
+ *                                   confirm, THEN push. Never dispatch a
  *                                   rep to a lead with no address.
  *
  * Guardrails: queue precondition (skip when an existing lead is already
@@ -43,7 +62,29 @@ import {
   recentRequeueExists,
   repairProspectAddress,
 } from '../../services/lp-callback-requeue.js';
+import {
+  buildCallbackRecord,
+  findContactInOtherLists,
+  callbackListName,
+  callbackCallNowMode,
+} from '../../five9/callback-push.js';
+
 import { executeCreateLPLead } from './lp-lead.js';
+
+/**
+ * Which system receives the dial trigger. 'five9' (default) pushes a dialing
+ * copy into the Five9 Callback Request list; 'lp_leadadd' restores the pre
+ * 2026-09-04 LP LeadAdd path exactly.
+ *
+ * Read per call so the whole change reverts from Railway without a deploy —
+ * that is the rollback for Part 1, and it must not need a build to take.
+ * Any unrecognised value falls back to 'five9' rather than throwing: a typo in
+ * an env var must not take the callback path down entirely.
+ */
+export function requeueMode() {
+  const raw = String(process.env.LP_REQUEUE_MODE || 'five9').trim().toLowerCase();
+  return raw === 'lp_leadadd' ? 'lp_leadadd' : 'five9';
+}
 
 // GHL custom field ids (canonical Reece location field map — same ids as lp-lead.js)
 const FIELD_LP_INBOUND_LEAD_ID = '3YMxheIlPyhACB8zyc3W'; // in1_id
@@ -268,7 +309,21 @@ export async function executeLpCallbackRequeue(action) {
     ).catch(() => {});
   }
 
-  // ── The re-queue LeadAdd ─────────────────────────────────────────
+  // ── FIVE9 PATH (default since 2026-09-04) ────────────────────────
+  // A dialing copy into the Callback Request list instead of a new LP lead.
+  // LP stays the system of record; nothing is written to LP but the note.
+  //
+  // Everything above this point is shared with the LeadAdd path on purpose —
+  // the dedup, the already-dialable check and the address repair are about
+  // whether a call should go out at all, which does not depend on who dials.
+  if (requeueMode() === 'five9') {
+    return pushCallbackToFive9({
+      action, contactId, ghlContact, lpRows, ldsIds, prospectId,
+      preInboundId, addressRepair, verifyDeadline, phone: String(ghlContact.phone || '').replace(/\D/g, '').slice(-10),
+    });
+  }
+
+  // ── The re-queue LeadAdd (LP_REQUEUE_MODE=lp_leadadd) ────────────
   // srs_id UNCHANGED: the newest existing lead's srs_id (raw_lp_data), then
   // the contact's LP Source custom field. No default — if we cannot resolve
   // the true source we fail rather than misattribute.
@@ -387,6 +442,200 @@ export async function executeLpCallbackRequeue(action) {
     address_repaired: !!addressRepair,
     verify_deadline: verifyDeadline,
     lp_path: lpResponse?._path || 'unknown',
+  };
+}
+
+/**
+ * Push the callback into the Five9 Callback Request list.
+ *
+ * Queues a five9_add_records_to_list row rather than calling the executor
+ * inline. That row is the audit trail — it carries the exact fieldsMapping and
+ * values that went to Five9, it is retryable, and five9.admin_write logs the
+ * write. It is queued UNARMED (requires_approval false), which is only legal
+ * for this one op: see AUTO_APPROVED_FIVE9_OP in src/tools/agent-tools.js and
+ * the matching exemption in src/actions/handlers/five9.js.
+ *
+ * Failure here is loud and reaches a human, because the customer has already
+ * been told someone will ring them.
+ */
+async function pushCallbackToFive9({
+  action, contactId, ghlContact, lpRows, ldsIds, prospectId,
+  preInboundId, addressRepair, verifyDeadline, phone,
+}) {
+  const listName = callbackListName();
+
+  // 1. Build the record. Throws on a missing CustID or an unusable phone —
+  //    a record the agent cannot work is worse than no record at all.
+  let record;
+  try {
+    record = buildCallbackRecord({ contactId, ghlContact, lpRow: lpRows[0] || {} });
+  } catch (err) {
+    await emitEvent({
+      event_type: 'lp.callback_requeue_refused',
+      source: 'lp_mcp',
+      entity_type: 'contact',
+      entity_id: String(contactId),
+      ghl_contact_id: contactId,
+      priority: 'high',
+      payload: { reason: 'unworkable_record', error: String(err.message).slice(0, 300), lp_prospect_id: prospectId, prior_lds_ids: ldsIds },
+      idempotency_key: `lp_callback_requeue_refused_${contactId}_${action.id}`,
+    }).catch(() => {});
+    sendGroupMeMessage(
+      `❌ CALLBACK PUSH REFUSED — PROMISED CALL AT RISK\n` +
+      `Contact: ${ghlContact.firstName || ''} ${ghlContact.lastName || ''} (${contactId})\n` +
+      `Phone: ${phone || 'unknown'}\n` +
+      `${String(err.message).slice(0, 240)}\n` +
+      `→ The customer was told someone will call. Place this call manually NOW.`
+    ).catch(() => {});
+    throw err;
+  }
+
+  // 2. Cross-list suppression. Fails open — see findContactInOtherLists.
+  const other = await findContactInOtherLists(record.number1, { listName });
+  if (other.failed_open) {
+    await emitEvent({
+      event_type: 'lp.callback_requeue_fail_open',
+      source: 'lp_mcp',
+      entity_type: 'contact',
+      entity_id: String(contactId),
+      ghl_contact_id: contactId,
+      priority: 'high',
+      payload: { stage: 'cross_list_check', error: String(other.error).slice(0, 300), proceeding: true },
+      idempotency_key: `lp_callback_requeue_failopen_${contactId}_${action.id}`,
+    }).catch(() => {});
+    console.warn(`[LP-REQUEUE] cross-list check failed for ${contactId} — proceeding (fail open): ${other.error}`);
+  }
+  if (other.suppress) {
+    console.log(`[LP-REQUEUE] ⏭️ Skip ${contactId}: already live in Five9 list(s) ${other.lists.join(', ')} — not double-dialing`);
+    await emitEvent({
+      event_type: 'lp.callback_requeue_suppressed',
+      source: 'lp_mcp',
+      entity_type: 'contact',
+      entity_id: String(contactId),
+      ghl_contact_id: contactId,
+      priority: 'normal',
+      payload: { reason: 'live_in_other_five9_list', lists: other.lists, number1: record.number1 },
+      idempotency_key: `lp_callback_requeue_supp_${contactId}_${action.id}`,
+    }).catch(() => {});
+    await addGHLNote(contactId,
+      `[LP REQUEUE] Skipped the Five9 callback push — this number is already being worked in ` +
+      `Five9 list(s): ${other.lists.join(', ')}. Pushing again would put two campaigns on the same ` +
+      `person the same afternoon. The callback rides the existing dial.`
+    ).catch(() => {});
+    return {
+      action: 'requeue_suppressed_other_list',
+      // requeued:false is load-bearing for the dedup contract — a suppressed
+      // push must NOT count as "a dial trigger already went out" for the next
+      // attempt, exactly like requeue_skipped_already_dialable.
+      requeued: false,
+      contact_id: contactId,
+      other_lists: other.lists,
+      number1: record.number1,
+    };
+  }
+
+  // 3. Queue the write.
+  const callNowMode = callbackCallNowMode();
+  const { data: queued, error } = await supabase.from('agent_actions').insert({
+    event_id: action?.event_id || null,
+    action_type: 'five9_add_records_to_list',
+    target_system: 'five9',
+    target_entity: 'list',
+    target_id: listName,
+    action_payload: {
+      list_name: listName,
+      field_names: record.fieldNames,
+      records: [record.values],
+      call_now_mode: callNowMode,
+    },
+    // The inverse of this push, ready to paste if a record needs pulling back.
+    rollback_payload: {
+      action_type: 'five9_delete_record_from_list',
+      list_name: listName,
+      field_names: ['number1'],
+      records: [[record.number1]],
+    },
+    reasoning:
+      `Agentic callback re-queue for GHL contact ${contactId} (LP prospect ${record.custId}). ` +
+      `Dialing copy only — LP remains the system of record. Queued unarmed under the ` +
+      `five9_add_records_to_list carve-out (Mark, 2026-09-04): a promised callback cannot wait on an approval click.`,
+    rule_applied: 'LP_CALLBACK_REQUEUE_FIVE9',
+    confidence: 1.0,
+    status: 'pending',
+    requires_approval: false,
+    priority: 90,
+  }).select('id').single();
+
+  if (error) {
+    sendGroupMeMessage(
+      `❌ CALLBACK PUSH COULD NOT BE QUEUED — PROMISED CALL AT RISK\n` +
+      `Contact: ${ghlContact.firstName || ''} ${ghlContact.lastName || ''} (${contactId})\n` +
+      `Phone: ${phone || 'unknown'} | LP Prospect: ${record.custId}\n` +
+      `Error: ${String(error.message).slice(0, 200)}\n` +
+      `→ The customer was told someone will call. Place this call manually NOW.`
+    ).catch(() => {});
+    throw new Error(`lp_callback_requeue: could not queue the Five9 push for ${contactId}: ${error.message}`);
+  }
+
+  await emitEvent({
+    event_type: 'lp.callback_requeued',
+    source: 'lp_mcp',
+    entity_type: 'contact',
+    entity_id: String(contactId),
+    ghl_contact_id: contactId,
+    priority: 'high',
+    payload: {
+      mode: 'five9',
+      list: listName,
+      five9_action_id: queued?.id ?? null,
+      call_now_mode: callNowMode,
+      cust_id: record.custId,
+      lead_id: record.fieldNames.includes('lead_id') ? record.values[record.fieldNames.indexOf('lead_id')] : null,
+      lp_rec_key: record.lpRecKey,
+      lp_rec_type: record.lpRecType,
+      lp_prospect_id: prospectId,
+      prior_lds_ids: ldsIds,
+      address_repaired: !!addressRepair,
+      verify_deadline: verifyDeadline,
+      cross_list_check_failed_open: other.failed_open,
+    },
+    idempotency_key: `lp_callback_requeue_${contactId}_five9_${queued?.id ?? action.id}`,
+  }).catch((err) => console.warn(`[LP-REQUEUE] event emit failed: ${err.message}`));
+
+  await addGHLNote(contactId,
+    `[LP REQUEUE] Callback pushed to the Five9 "${listName}" list\n` +
+    `CustID (LP prospect): ${record.custId} | lead_id: ${lpRows[0]?.lp_lead_id || 'none'}\n` +
+    `${record.lpRecKey ? `LPRecKey: ${record.lpRecKey}\n` : ''}` +
+    `callNowMode: ${callNowMode} | five9 action: ${queued?.id ?? 'unknown'}\n` +
+    `${addressRepair ? 'Prospect address was repaired from GHL before the push.\n' : ''}` +
+    `No new LP lead was created — LP stays the system of record and this is a dialing copy only. ` +
+    `The agent's screen pop opens LP by CustID; the AI BRIEF note on this contact carries the call context.`
+  ).catch(() => {});
+
+  console.log(`[LP-REQUEUE] ✅ Five9 callback push queued for ${contactId}: list="${listName}", CustID=${record.custId}, callNowMode=${callNowMode}, action=${queued?.id}`);
+
+  return {
+    action: 'requeued',
+    // requeued:true keeps the PR #823 dedup contract intact — the next attempt
+    // inside the window sees prior_requeue_completed and stands down, exactly
+    // as it did when this branch performed a LeadAdd.
+    requeued: true,
+    branch: addressRepair ? 'five9_push_address_repaired' : 'five9_push',
+    mode: 'five9',
+    contact_id: contactId,
+    lp_prospect_id: prospectId,
+    cust_id: record.custId,
+    pre_lds_ids: ldsIds,
+    pre_inbound_id: preInboundId || null,
+    five9_list: listName,
+    five9_action_id: queued?.id ?? null,
+    five9_field_names: record.fieldNames,
+    call_now_mode: callNowMode,
+    lp_rec_key: record.lpRecKey,
+    lp_rec_type: record.lpRecType,
+    address_repaired: !!addressRepair,
+    cross_list_check_failed_open: other.failed_open,
+    verify_deadline: verifyDeadline,
   };
 }
 

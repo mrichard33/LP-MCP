@@ -2,9 +2,13 @@
  * Five9 List Dispatch — src/five9/list-dispatch.js
  *
  * ═══════════════════════════════════════════════════════════════════════
- * BREAK-GLASS ONLY (architecture decision, Mark, 2026-08-18). Lead
- * Perfection is the ONLY writer into the Five9 LP_ASAP list; the agentic
- * system never inserts records into Five9 lists. The dialer feed
+ * BREAK-GLASS ONLY — for THIS module and for LP_ASAP. Scope narrowed by
+ * Mark on 2026-09-04; the 2026-08-18 decision is kept below in full because
+ * its reasoning is still what governs LP_ASAP.
+ *
+ * ── The 2026-08-18 decision, verbatim ──────────────────────────────────
+ * "Lead Perfection is the ONLY writer into the Five9 LP_ASAP list; the
+ * agentic system never inserts records into Five9 lists. The dialer feed
  * (POST /api/Downloads/GetLeadsByCQDID) carries Cst_ID + Lds_ID — the LP
  * identifiers that tie a dialed record back to the LP lead and drive the
  * agent's preview screen pop and the AddCallHistory write-back. A record
@@ -15,13 +19,51 @@
  * Five9 UPDATED an existing LP-owned record). When a lead should be
  * dialed, make the LP push correct and let LP feed LP_ASAP → DIAL ASAP;
  * latency is not a reason to bypass LP (lead 567746: LP creation to dial
- * in 4 seconds).
+ * in 4 seconds)."
  *
- * This module's ONLY remaining legitimate role: LP unreachable AND a call
- * already promised to a customer. Any use of it is an INCIDENT, not a
- * workflow. Do not extend it, do not wire dispatchConfirmationCallback
- * into the callback path, do not set FIVE9_DIRECT_DISPATCH, and do not
- * build an auto-approve carve-out for five9_add_records_to_list.
+ * ── What changed on 2026-09-04, and what did not ───────────────────────
+ * "Make the LP push correct" turned out to have a cost the decision could
+ * not have priced: the correct LP push is a LeadAdd, and a LeadAdd MINTS A
+ * NEW LP LEAD. On 2026-09-04 that produced lead 573111 for Robert Pederson
+ * (zLDD7V1eosF8vldF5U7i) — a duplicate that landed in LP's Data queue and
+ * triggered LP's own Revin bot to send new-lead intake copy to a customer
+ * sitting at home waiting for an appointment we had already cancelled. The
+ * dedup was working; only one of four fires performed a LeadAdd. One
+ * correct re-queue was enough to do the harm.
+ *
+ * So callbacks now go to a SEPARATE list, "Callback Request", through
+ * src/five9/callback-push.js. Both objections above were re-verified on
+ * 2026-09-04 and neither survives on that list:
+ *
+ *   OVERWRITE — specific to LP_ASAP, which LP FEEDS. Nothing but our own
+ *   push writes "Callback Request", so there is no LP writer to race. This
+ *   objection stands unchanged for LP_ASAP.
+ *
+ *   ORPHAN — true of THIS module, and the reason is worth recording: its
+ *   CUSTOM_FIELDS are call_purpose / requested_time / ghl_contact_id /
+ *   notes, and NOT ONE of those exists in the Five9 contact schema. Every
+ *   record it ever wrote degraded silently to number1 + first_name +
+ *   last_name. The domain does carry CustID, lead_id, LPRecKey and
+ *   LPRecType; the new path populates them and REFUSES to push without
+ *   CustID, which is what the LeadPerfection connector keys its screen pop
+ *   on (F9key=CustID, reading the Five9 contact record — not LP's feed).
+ *
+ * The latency argument stands and was never the justification: lead 567746
+ * still went LP-creation-to-dial in 4 seconds. Speed is not why this
+ * changed. Not minting a duplicate LP lead is.
+ *
+ * ── What is still forbidden ────────────────────────────────────────────
+ * LP_ASAP remains LP's. Do not write to it directly, do not extend this
+ * module, do not wire dispatchConfirmationCallback into the callback path,
+ * and do not set FIVE9_DIRECT_DISPATCH. Any use of THIS module is still an
+ * INCIDENT, not a workflow — it remains the LP-unreachable break-glass, and
+ * its broken field mapping is the standing proof that a record is only as
+ * good as the identifiers on it.
+ *
+ * The auto-approve carve-out this banner used to forbid now exists, for
+ * five9_add_records_to_list and nothing else (see AUTO_APPROVED_FIVE9_OP in
+ * src/tools/agent-tools.js). It is a set of one and
+ * scripts/test-five9-approval-carveout.js fails if it ever becomes two.
  * ═══════════════════════════════════════════════════════════════════════
  *
  * Write-side Five9 Configuration Web Services (Admin SOAP) client for the

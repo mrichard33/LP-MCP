@@ -785,16 +785,40 @@ function recordXml(values) {
  * (skipHeaderLine from basicImportSettings, cleanListBeforeUpdate from
  * listUpdateSettings) are sent explicitly false in sequence position.
  */
-export function buildAddRecordToListXml(listName, fieldNames, values) {
+export const CALL_NOW_MODES = new Set(['NONE', 'NEW_CRM_ONLY', 'NEW_LIST_ONLY', 'ANY']);
+
+export function buildAddRecordToListXml(listName, fieldNames, values, callNowMode = null) {
   const list = String(listName || '').trim();
   if (!list) throw new Error('list_name is required');
   if (!Array.isArray(fieldNames) || !Array.isArray(values) || fieldNames.length !== values.length || !fieldNames.length) {
     throw new Error(`fieldsMapping/values mismatch: ${fieldNames?.length ?? 0} fields vs ${values?.length ?? 0} values`);
   }
+  if (callNowMode != null && !CALL_NOW_MODES.has(callNowMode)) {
+    throw new Error(`invalid call_now_mode "${callNowMode}" (allowed: ${[...CALL_NOW_MODES].join(', ')})`);
+  }
+  // callNowMode is what makes a pushed record DIAL rather than wait for the
+  // next list pass — verified against the live v13 WSDL 2026-09-04, where
+  // listUpdateSettings extends basicImportSettings and the extension sequence
+  // opens callNowColumnNumber, callNowMode, callTime, callTimeColumnNumber,
+  // cleanListBeforeUpdate, ... So it belongs AFTER skipHeaderLine (the last
+  // base element) and BEFORE cleanListBeforeUpdate. JAXB rejects out-of-order
+  // elements, so this position is not cosmetic.
+  //
+  // Omitted by default: every pre-existing caller of this builder appends
+  // without dialing, and that behaviour must not change underneath them.
+  // Only the callback re-queue passes a mode.
+  //
+  // (For the record: callAsap, which reads like the obvious field, exists only
+  // on listUpdateSimpleSettings — the settings type for addRecordToListSimple,
+  // which this repo does not build. callNowMode is this op's equivalent, so no
+  // new op was needed. op-registry.js:168 called addRecordToListSimple
+  // "redundant with addRecordToList"; that is corrected there.)
+  const callNowXml = callNowMode ? `<callNowMode>${callNowMode}</callNowMode>` : '';
   return (
     `<listName>${escapeXml(list)}</listName>` +
     `<listUpdateSettings>${fieldsMappingXml(fieldNames)}` +
     `<skipHeaderLine>false</skipHeaderLine>` +
+    callNowXml +
     `<cleanListBeforeUpdate>false</cleanListBeforeUpdate>` +
     `<crmAddMode>ADD_NEW</crmAddMode>` +
     `<crmUpdateMode>UPDATE_FIRST</crmUpdateMode>` +
@@ -872,6 +896,43 @@ export function buildDeleteRecordFromListXml(listName, fieldNames, values, listD
  * order JAXB unmarshals in, nothing about what callers may set.
  */
 export const ASYNC_DELETE_FIELD_ORDER = ['listName', 'listDeleteSettings', 'importData'];
+
+/**
+ * WSDL xs:sequence for tns:listUpdateSettings, in INHERITANCE order.
+ *
+ * Added 2026-09-04 alongside callNowMode. Until then this type had no
+ * field-order constant and buildAddRecordToListXml's ordering was verified by
+ * eye alone — which is exactly the hand-transcription risk the sibling arrays
+ * exist to remove, and it is why the callNowMode slot needed the live WSDL to
+ * settle. The extension sequence opens with the four callNow and callTime
+ * elements, so anything dial-related sits BETWEEN skipHeaderLine and
+ * cleanListBeforeUpdate. scripts/test-five9-wsdl-schema.js now diffs this
+ * against the artifact, so a future insertion in the wrong slot fails the
+ * suite instead of reaching Five9 as an unmarshalling fault.
+ * NOTE: presence in this array does NOT imply patchable.
+ */
+export const LIST_UPDATE_SETTINGS_FIELD_ORDER = [
+  // --- tns:basicImportSettings (base) ---
+  'allowDataCleanup',
+  'callbackAuthProfileName',
+  'callbackFormat',
+  'callbackUrl',
+  'countryCode',
+  'failOnFieldParseError',
+  'fieldsMapping',
+  'reportEmail',
+  'separator',
+  'skipHeaderLine', // schema-REQUIRED (no minOccurs=0)
+  // --- tns:listUpdateSettings (extension) ---
+  'callNowColumnNumber',
+  'callNowMode',
+  'callTime',
+  'callTimeColumnNumber',
+  'cleanListBeforeUpdate', // schema-REQUIRED (no minOccurs=0)
+  'crmAddMode',
+  'crmUpdateMode',
+  'listAddMode',
+];
 
 /**
  * WSDL xs:sequence for tns:listDeleteSettings, in INHERITANCE order: JAXB
@@ -1345,17 +1406,25 @@ export function executeAddRecordsToList(action) {
   if (records.length > MAX_RECORDS_PER_ACTION) {
     throw new Error(`REFUSED: ${records.length} records > ${MAX_RECORDS_PER_ACTION} per action cap`);
   }
+  // Optional, and validated by the builder. Absent = a plain append, which is
+  // what every caller before the 2026-09-04 callback push wanted.
+  const callNowMode = payload.call_now_mode ?? null;
   return withFive9WriteGate({ action, subtype: 'add_records_to_list', entityType: 'five9_list', entityId: listName }, async (ctx) => {
     const sizeOf = async () => (await getListsInfo()).lists.find(l => l.name === listName) ?? { name: listName, size: null };
     ctx.previous_state = await sizeOf();
     let added = 0;
     for (const values of records) {
-      const xml = await ctx.soap('addRecordToList', buildAddRecordToListXml(listName, fieldNames, values));
+      const xml = await ctx.soap('addRecordToList', buildAddRecordToListXml(listName, fieldNames, values, callNowMode));
       if (xml !== null) assertNoRecordFailures('addRecordToList', xml);
       added += 1;
     }
     if (!ctx.dry_run) ctx.new_state = await sizeOf();
-    return { list: listName, records_added: ctx.dry_run ? 0 : added, records_previewed: ctx.dry_run ? added : undefined };
+    return {
+      list: listName,
+      records_added: ctx.dry_run ? 0 : added,
+      records_previewed: ctx.dry_run ? added : undefined,
+      call_now_mode: callNowMode,
+    };
   });
 }
 
