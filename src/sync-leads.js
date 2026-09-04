@@ -344,6 +344,22 @@ function lpBool(v) {
 // live: 20/105 of a day's leads had branch after hours of refreshes).
 //
 // Fires at most once per row: goes quiet as soon as the columns are populated.
+/**
+ * True when every 049-era attribution column on a stored lead row is populated.
+ *
+ * Exported because src/sync-engine.js's hash gate needs the SAME test: a row
+ * that is still incomplete must never be hash-skipped, or it can never be
+ * completed (LP does not bump lastchangedon for columns WE added, so its
+ * payload stays byte-identical forever). Two copies of this rule is how one of
+ * them ends up quietly disagreeing with the other.
+ */
+export function attributionColumnsComplete(row) {
+  return row?.set_by_name != null
+    && row?.ever_confirmed != null
+    && row?.ever_sat != null
+    && row?.raw_lp_data != null;
+}
+
 function needsAttributionBackfill(existing, lead) {
   if (!existing) return false;
   // Fires while ANY 049-era column is still unpopulated. The original two-column
@@ -353,11 +369,7 @@ function needsAttributionBackfill(existing, lead) {
   // added.
   // raw_lp_data joins the predicate: it is the discovery surface for LP fields
   // we have not mapped yet (rep_id has no known source field).
-  const complete = existing.set_by_name != null
-    && existing.ever_confirmed != null
-    && existing.ever_sat != null
-    && existing.raw_lp_data != null;
-  if (complete) return false;
+  if (attributionColumnsComplete(existing)) return false;
   return getField(lead, 'setbyname', 'SetByName') != null
     || getField(lead, 'everconfirmed', 'EverConfirmed') != null
     || getField(lead, 'eversat', 'EverSat') != null;

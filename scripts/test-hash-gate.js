@@ -25,7 +25,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 
-import { processProspect } from '../src/sync-leads.js';
+import { processProspect, attributionColumnsComplete } from '../src/sync-leads.js';
 
 // Duplicate of stableHash in src/sync-engine.js — see header comment.
 function stableHash(obj) {
@@ -85,4 +85,52 @@ test('processProspect is callable with and without an opts argument', () => {
     assert.ok(p && typeof p.then === 'function');
     p.catch(() => {});
   }
+});
+
+// ─── Attribution-backfill hold (2026-09-04) ──────────────────────
+//
+// The gate skips a prospect whose LP payload is byte-identical. That proves LP
+// has nothing new; it does NOT prove WE have finished writing our own columns.
+// LP never bumps lastchangedon for columns we added, so an incomplete row's
+// payload stays identical forever and an enforcing gate would freeze it NULL
+// permanently — the same failure mode that forced the lp_branch_id
+// backfill-on-skip, one level further up.
+//
+// Measured 2026-09-04: 214,285 of 237,747 lp_leads rows are still
+// attribution-incomplete and 3,923 of those ALREADY carry a hash, so this is
+// not hypothetical — it is what flipping SYNC_HASH_GATE_MODE=enforce would do
+// on the next pass.
+//
+// sync-engine.js imports this predicate rather than restating it; these tests
+// are what stop the two copies from drifting apart.
+
+const completeRow = {
+  set_by_name: 'Dana R', ever_confirmed: true, ever_sat: false, raw_lp_data: { cst_id: '1' },
+};
+
+test('a fully populated row is complete and may be hash-skipped', () => {
+  assert.equal(attributionColumnsComplete(completeRow), true);
+});
+
+test('any single unpopulated attribution column holds the row back', () => {
+  for (const col of ['set_by_name', 'ever_confirmed', 'ever_sat', 'raw_lp_data']) {
+    assert.equal(attributionColumnsComplete({ ...completeRow, [col]: null }), false,
+      `${col} null must disqualify the row from a hash skip`);
+    assert.equal(attributionColumnsComplete({ ...completeRow, [col]: undefined }), false,
+      `${col} absent must disqualify the row too`);
+  }
+});
+
+test('falsy-but-populated values are complete — false and 0 are real answers', () => {
+  // The bug this guards: a truthiness test would treat ever_sat=false as
+  // "not yet written" and hold the row back forever, which is the opposite
+  // failure — every never-sat lead reprocessed on every single pass.
+  assert.equal(attributionColumnsComplete({ ...completeRow, ever_confirmed: false, ever_sat: false }), true);
+  assert.equal(attributionColumnsComplete({ ...completeRow, set_by_name: '' }), true);
+});
+
+test('a missing row is not complete', () => {
+  assert.equal(attributionColumnsComplete(null), false);
+  assert.equal(attributionColumnsComplete(undefined), false);
+  assert.equal(attributionColumnsComplete({}), false);
 });

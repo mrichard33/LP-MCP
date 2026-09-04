@@ -153,7 +153,7 @@ import {
 } from './sync-log.js';
 import { populateSourceMapping, backfillSourceMappingsFromLeads } from './sync-sources.js';
 import { syncDispositions, backfillDispositionsFromLeads } from './sync-dispositions.js';
-import { upsertLeadOnly, processProspect } from './sync-leads.js';
+import { upsertLeadOnly, processProspect, attributionColumnsComplete } from './sync-leads.js';
 import { syncAllChildRecords, syncJobAndMilestones, getChildSkipStats } from './sync-children.js';
 import {
   describeJobUpsertError,
@@ -691,6 +691,10 @@ async function runLeadsSweep(since, windowEnd, logIds, maxLeads) {
   let gateStored = 0;   // prospects that had a stored hash to compare against
   let gateAbsent = 0;   // prospects with NO stored hash (never hashed / mixed rows)
   let gateMatched = 0;  // stored hash === freshly computed hash
+  // Matched the hash but was held back anyway: the row still has an unpopulated
+  // 049-era attribution column, and LP never bumps lastchangedon for columns WE
+  // added, so an enforcing gate would freeze it NULL forever.
+  let gateHeldForBackfill = 0;
 
   // v6.10: Load active deny-list once at sweep start. New denylist
   // transitions added mid-sweep (via recordProspectFailure return) are
@@ -787,19 +791,39 @@ async function runLeadsSweep(since, windowEnd, logIds, maxLeads) {
     // an interrupted prior run and must read as "changed" (fail-safe
     // reprocess, never a wrongful skip).
     const priorHashes = new Map();
+    // Prospects the hash gate must NEVER skip, however well their hash matches:
+    // at least one of their lead rows still has an unpopulated 049-era
+    // attribution column. See needsAttributionBackfill in src/sync-leads.js —
+    // LP does not bump lastchangedon for columns WE added, so such a row's
+    // payload is byte-identical forever and an enforcing gate would freeze it
+    // NULL permanently. That is the same failure mode that forced the
+    // lp_branch_id backfill-on-skip, arriving one level higher up.
+    //
+    // Measured 2026-09-04: 214,285 of 237,747 lp_leads rows are still
+    // attribution-incomplete, and 3,923 of them ALREADY carry a hash — so
+    // without this set, flipping SYNC_HASH_GATE_MODE to enforce would strand
+    // those 3,923 immediately and more as hashes populate.
+    const backfillPending = new Set();
     if (SYNC_HASH_GATE_MODE !== 'off') {
       try {
         const ids = items.map(l => String(l.cst_id || l.CstID || l.prospectid || l.ProspectID)).filter(Boolean);
         const { data: hashRows, error: hashErr } = await supabase.from('lp_leads')
-          .select('lp_prospect_id, lp_payload_hash').in('lp_prospect_id', ids);
+          .select('lp_prospect_id, lp_payload_hash, set_by_name, ever_confirmed, ever_sat, raw_lp_data')
+          .in('lp_prospect_id', ids);
         if (hashErr) throw new Error(hashErr.message);
         for (const h of hashRows || []) {
           const pid = String(h.lp_prospect_id);
           if (!priorHashes.has(pid)) priorHashes.set(pid, h.lp_payload_hash);
           else if (priorHashes.get(pid) !== h.lp_payload_hash) priorHashes.set(pid, null);
+          // Same predicate needsAttributionBackfill uses, imported rather than
+          // restated. Any ONE incomplete lead row disqualifies the whole
+          // prospect: the gate works per prospect, so that is the only safe
+          // granularity.
+          if (!attributionColumnsComplete(h)) backfillPending.add(pid);
         }
       } catch (e) {
         priorHashes.clear();
+        backfillPending.clear();
         console.warn(`[Sync:Leads] hash prefetch failed (${e.message}) — page processes ungated`);
       }
     }
@@ -866,8 +890,16 @@ async function runLeadsSweep(since, windowEnd, logIds, maxLeads) {
           if (prior === payloadHash) gateMatched++;
         }
         if (prior === payloadHash) {
-          unchangedSkipped++;
-          if (SYNC_HASH_GATE_MODE === 'enforce') return null;
+          // An identical payload proves LP has nothing new. It does NOT prove
+          // we have finished writing OUR columns for this row — see
+          // backfillPending above. Hold those out of the skip entirely so the
+          // count stays honest about what enforce would actually save.
+          if (backfillPending.has(cstIdStr)) {
+            gateHeldForBackfill++;
+          } else {
+            unchangedSkipped++;
+            if (SYNC_HASH_GATE_MODE === 'enforce') return null;
+          }
         }
       }
 
@@ -971,7 +1003,8 @@ async function runLeadsSweep(since, windowEnd, logIds, maxLeads) {
     const matchPct = gateStored > 0 ? ((gateMatched / gateStored) * 100).toFixed(0) : 'n/a';
     console.log(
       `[Sync:Leads] Hash gate diagnostics — ${gateStored} with stored hash (${gateMatched} matched, ${matchPct}%), ` +
-      `${gateAbsent} without a stored hash (cannot match; first pass or mixed-hash rows)`
+      `${gateAbsent} without a stored hash (cannot match; first pass or mixed-hash rows), ` +
+      `${gateHeldForBackfill} matched but HELD (attribution backfill still pending)`
     );
   }
   if (deepOffsetMode) {
