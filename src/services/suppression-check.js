@@ -339,9 +339,74 @@ export function isSuppressionAuditTag(tag) {
   return SUPPRESSION_AUDIT_TAG_RE.test(String(tag || ''));
 }
 
+// ─── 2026-09-03 — DE-ESCALATION EXEMPTION ──────────────────────────
+// Tom Messick (eqjK58AwEZ1juYJH6szE) told the bot he had lost his wife and
+// asked us to stop. stop-bot was applied, and the remove_from_workflow that
+// would have pulled him out of S5.2 Appointment Rescue (action 418776) was
+// rejected with "mutation suppressed: contact has stop-bot". The tag he
+// earned by asking us to stop is what stopped us honoring it.
+//
+// THE BINDING RULE: an action whose ONLY possible effect is to reduce
+// contact is never the thing a suppression tag should block. Suppression
+// exists to prevent outreach, and these actions prevent outreach.
+//
+// Deliberately NARROW. Two things are exempt and nothing else:
+//
+//   remove_from_workflow — unconditional. There is no payload shape that
+//     makes removing a contact from a workflow send more messages.
+//
+//   remove_tag of an ENROLLMENT tag — the "you are in an outbound sequence"
+//     family only. Removing one of these ends a cadence.
+//
+// EXPLICITLY NOT EXEMPT, each for a reason:
+//   - remove_tag of a suppression tag (stop-bot, dnc, cooling-active,
+//     unsubscribed, cannot-afford:*). Removing those RESUMES outreach — the
+//     exact inversion this gate exists to prevent. The only path to remove
+//     them stays the authorized lift's explicit bypass_suppression flag.
+//   - remove_tag of stage:* or active-entry:*. One of each per contact is a
+//     system invariant; a bare removal leaves the contact stateless and the
+//     next router pass has to guess.
+//   - cancel_appointment. stop-bot is ALSO the rep-takeover convention, so a
+//     rep who takes a contact over would have their customer's appointment
+//     auto-cancelled underneath them. Reducing contact is safe; cancelling a
+//     booked visit is not the same thing.
+const DE_ESCALATION_ACTION_TYPES = new Set(['remove_from_workflow']);
+
+// Enrollment/cohort membership only. Anchored, and narrow on purpose — a
+// pattern that accidentally matched a suppression tag would turn this
+// exemption into a suppression-removal hole.
+const ENROLLMENT_TAG_RE =
+  /^(agentic-active|booking:active|nurture-active|active-s\d|active-s\d+\.\d+|active-w\d)/i;
+
+/**
+ * True when the action can only REDUCE contact with this lead.
+ * Pure over the action row; unit-tested in
+ * scripts/test-suppression-and-tag-hygiene.js.
+ */
+export function isDeEscalationAction(action) {
+  if (!action) return false;
+  const type = String(action.action_type || '');
+
+  if (DE_ESCALATION_ACTION_TYPES.has(type)) return true;
+
+  if (type === 'remove_tag') {
+    const tag = String(action.action_payload?.tag || '').trim().toLowerCase();
+    if (!tag) return false;
+    // Belt and braces: never let the enrollment pattern reach a tag that
+    // any suppression list also claims. If the two ever overlap, the
+    // suppression list wins and the removal stays blocked.
+    if (SUPPRESS_SET.has(tag)) return false;
+    if (MUTATION_SUPPRESS_SET.has(tag)) return false;
+    if (isSuppressionAuditTag(tag)) return false;
+    return ENROLLMENT_TAG_RE.test(tag);
+  }
+
+  return false;
+}
+
 /**
  * Is this action exempt from the mutation-suppression gate? Pure predicate
- * over the action row. Two exemptions:
+ * over the action row. Three exemptions:
  *   (a) add_tag of a suppression/audit tag — that is how suppression itself is
  *       recorded on the contact.
  *   (b) 2026-07-11 — an authorized re-engagement lift (DNC_LIFT_ON_REENGAGEMENT)
@@ -350,13 +415,17 @@ export function isSuppressionAuditTag(tag) {
  *       a stop-bot contact; without an exemption the DNC blocks its own removal
  *       (the gate has no remove_tag audit-exemption, only an add_tag one) and a
  *       re-booked lead stays suppressed forever.
- * The flag is honored ONLY on rule-authored templates the operator controls;
- * every other mutation on a suppressed contact still blocks.
+ *   (c) 2026-09-03 — a DE-ESCALATION action (isDeEscalationAction): one whose
+ *       only possible effect is to reduce contact. See that function's header
+ *       for the incident and for what is deliberately excluded.
+ * The bypass flag is honored ONLY on rule-authored templates the operator
+ * controls; every other mutation on a suppressed contact still blocks.
  */
 export function isMutationGateExempt(action) {
   if (!action) return false;
   if (action.action_payload?.bypass_suppression === true) return true;
   if (action.action_type === 'add_tag' && isSuppressionAuditTag(action.action_payload?.tag)) return true;
+  if (isDeEscalationAction(action)) return true;
   return false;
 }
 
