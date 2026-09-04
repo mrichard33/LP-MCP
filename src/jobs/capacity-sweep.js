@@ -74,6 +74,7 @@ import { getField, extractArray, sleep, RATE_LIMIT_SLEEP_MS } from '../sync-util
 import { lpDateToEastern } from '../lp-dates.js';
 import { processProspect } from '../sync-leads.js';
 import { computeMarketAssignments } from './market-assignment-daily.js';
+import { createPageWalker } from '../lp-paging.js';
 
 const TIMEZONE = 'America/New_York';
 
@@ -367,11 +368,7 @@ async function sweepForwardLeadDispositions(windowStart, windowEnd) {
   const changeStart = addDays(windowStart, -CHANGE_BACK_DAYS);
   const changeEnd   = addDays(windowStart, 1);
 
-  let startIndex = 1;
   const stats = { scanned: 0, matched: 0, processed: 0, failed: 0, pages: 0 };
-  // v6.13: deep-offset mode, ported from runLeadsSweep (#709).
-  let deepOffsetMode = false;
-  let deepOffsetSince = null;
 
   // v6.13: the budget is now in ROWS, not pages. Deep-offset mode fetches one
   // row per call, so the old page-count bound would have silently cut coverage
@@ -380,64 +377,43 @@ async function sweepForwardLeadDispositions(windowStart, windowEnd) {
   // more iterations than rows because an empty page always terminates it.
   const LEAD_MAX_ROWS = LEAD_MAX_PAGES * LEAD_PAGE_SIZE;
 
+  // WO-13 / WO-15: this was the third hand-rolled copy of the deep-offset
+  // workaround. It now shares one walker with both sync-engine sweeps, which is
+  // the whole point — the paging fix could not land in three places by hand
+  // without them drifting apart.
+  //
+  // It is NOT assumed that getLeads behaves like getLeadData. The comment below
+  // records this endpoint returning further rows at StartIndex=200 after a
+  // 199-row page, which is ROW-offset behaviour, whereas getLeadData is
+  // page-indexed (23 of 23 triggers at exactly StartIndex=51). The walker
+  // settles that per endpoint at runtime: it adopts page addressing only when a
+  // page fetch and a row probe return the SAME record, and otherwise behaves
+  // exactly as this code did before. So if getLeads really is row-offset,
+  // nothing here changes.
+  const walker = createPageWalker({
+    fetch: ({ PageSize, StartIndex }) => getLeads({ startdate: changeStart, enddate: changeEnd, PageSize, StartIndex })
+      .then(extractArray),
+    pageSize: LEAD_PAGE_SIZE,
+    idOf: (p) => getField(p, 'cst_id', 'CstID', 'prospectid', 'ProspectID') ?? null,
+    label: '[CapacitySweep]',
+    // The fast pass must not starve while the walker makes its round trips, so
+    // yield before every call rather than once per page.
+    onFetch: () => yieldToFastPass('change-page'),
+  });
+
   while (stats.scanned < LEAD_MAX_ROWS) {
-    await yieldToFastPass(`change-page ${startIndex}`);
     let items;
-    const fetchSize = deepOffsetMode ? 1 : LEAD_PAGE_SIZE;
     try {
-      const res = await getLeads({
-        startdate: changeStart, enddate: changeEnd,
-        PageSize: fetchSize, StartIndex: startIndex,
-      });
-      items = extractArray(res);
+      const page = await walker.next();
+      if (page.done) break;
+      items = page.items;
     } catch (err) {
-      // A failed page means TRUNCATION, not completion — LP's server can
-      // 500 ("Execution Timeout") on heavy pages. Retry once at a quarter
-      // of the page size (lighter response) before giving up, and surface
-      // the truncation in stats — no silent caps.
-      console.error(`[CapacitySweep] GetLead page startIndex=${startIndex} failed: ${err.message} — retrying smaller`);
-      try {
-        const res = await getLeads({
-          startdate: changeStart, enddate: changeEnd,
-          PageSize: Math.max(1, Math.floor(fetchSize / 4)), StartIndex: startIndex,
-        });
-        items = extractArray(res);
-      } catch (err2) {
-        stats.truncated_at = startIndex;
-        stats.page_error = String(err2.message || err2).slice(0, 200);
-        console.error(`[CapacitySweep] GetLead page startIndex=${startIndex} failed after small-page retry — change sweep TRUNCATED: ${err2.message}`);
-        break;
-      }
-    }
-    if (!items.length) {
-      // v6.13: in deep-offset mode this fetch WAS the 1-row probe, so empty is
-      // authoritative — that is the end of the window.
-      if (deepOffsetMode) break;
-      // VERIFY the empty page before trusting it (2026-07-22): under load LP
-      // soft-fails by returning an EMPTY page at offsets where rows exist
-      // (proved live — StartIndex=151 empty at PageSize 50, same offset
-      // returns a row at PageSize 1). An unverified empty page silently
-      // truncates the scan while looking like clean completion.
-      try {
-        const probe = extractArray(await getLeads({
-          startdate: changeStart, enddate: changeEnd,
-          PageSize: 1, StartIndex: startIndex,
-        }));
-        if (!probe.length) break; // genuinely the end
-        // v6.13: the probe returning a row proves LP is up and serving; the
-        // empty multi-row page is DETERMINISTIC deep-offset behavior, not
-        // load. Keep the probe row as this page's work and drop to PageSize=1
-        // for the remainder — 1 LP call per row instead of 3.
-        deepOffsetMode = true;
-        deepOffsetSince = startIndex;
-        console.warn(`[CapacitySweep] deep-offset detected at startIndex=${startIndex} (empty page, probe returned rows) — switching to PageSize=1 for the remainder of this sweep`);
-        items = probe;
-      } catch (err) {
-        stats.truncated_at = startIndex;
-        stats.page_error = `empty-page verify failed: ${String(err.message || err).slice(0, 150)}`;
-        console.error(`[CapacitySweep] empty-page verification failed at startIndex=${startIndex} — change sweep TRUNCATED`);
-        break;
-      }
+      // A failed page means TRUNCATION, not completion — the walker already
+      // retried once at a quarter size. Surface it; no silent caps.
+      stats.truncated_at = walker.stats.rowsFetched + 1;
+      stats.page_error = String(err.message || err).slice(0, 200);
+      console.error(`[CapacitySweep] GetLead page at row ${stats.truncated_at} failed after small-page retry — change sweep TRUNCATED: ${err.message}`);
+      break;
     }
     stats.pages++;
     stats.scanned += items.length;
@@ -462,7 +438,6 @@ async function sweepForwardLeadDispositions(windowStart, windowEnd) {
       }
     });
 
-    startIndex += items.length;
     // DIAGNOSED 2026-07-22 (drift repro): LP habitually returns slightly-short
     // pages (199 of 200) with MORE pages behind them — StartIndex=200 on the
     // same window returned further full rows. Treating a short page as the
@@ -471,9 +446,14 @@ async function sweepForwardLeadDispositions(windowStart, windowEnd) {
     // page terminates; the LEAD_MAX_ROWS budget stays as the runaway backstop.
   }
 
-  if (deepOffsetMode) {
-    stats.deep_offset_from = deepOffsetSince;
-    console.log(`[CapacitySweep] deep-offset mode engaged at startIndex=${deepOffsetSince} — ${stats.scanned} rows scanned at 1 LP call/row`);
+  stats.api_calls = walker.stats.apiCalls;
+  if (walker.stats.pageModeFrom) {
+    stats.page_mode_from = walker.stats.pageModeFrom;
+    console.log(`[CapacitySweep] getLeads paged by PAGE INDEX from page ${walker.stats.pageModeFrom} — ${walker.stats.apiCalls} LP calls for ${stats.scanned} rows`);
+  }
+  if (walker.stats.deepFrom) {
+    stats.deep_offset_from = walker.stats.deepFrom;
+    console.log(`[CapacitySweep] deep-offset fallback engaged at row ${walker.stats.deepFrom} — ${stats.scanned} rows scanned at 1 LP call/row`);
   }
   if (stats.scanned >= LEAD_MAX_ROWS) {
     stats.row_budget_exhausted = LEAD_MAX_ROWS;

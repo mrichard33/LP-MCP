@@ -142,6 +142,7 @@ import { resetGHLState, matchToGHL, applyGHLTag } from './ghl.js';
 import { resetLinkVerifyBudget, logLinkCorroborationConfig } from './services/link-corroboration.js';
 import { processMilestoneTriggers } from './milestones.js';
 import { runPass1DailyWindows } from './full-sync-pass1.js';
+import { createPageWalker } from './lp-paging.js';
 import { pushNotesToGHL } from './ghl-notes-sync.js';
 
 import { SYNC_INTERVAL_MS, RATE_LIMIT_SLEEP_MS, sleep, extractArray, getField, loggedFirstKeys } from './sync-utils.js';
@@ -711,28 +712,20 @@ async function runLeadsSweep(since, windowEnd, logIds, maxLeads) {
   let denylistSkipped = 0;
   let newlyDenylisted = 0;
   let hitCap = false;
-  let startIndex = 1;
   const sweepStartedAt = Date.now();
   let lastHeartbeat = sweepStartedAt;
   // v6.11: hash-gate + soft-fail state
   let unchangedSkipped = 0;      // enforce: skipped; shadow: would-skip
   let scanned = 0;               // prospects fetched this sweep (changed or not)
   let softFailStreak = 0;        // consecutive ERROR pages (genuine failures only)
-  let pageSize = SYNC_PAGE_SIZE; // shrinks on genuine error pages
-  // v6.12: deep-offset mode. STICKY for the rest of the sweep once LP's
-  // deterministic empty-page behavior is proven at this depth (see the
-  // empty-page branch below). In this mode every fetch is PageSize=1:
-  // ONE LP call per row instead of the full-size-fetch → probe → retry
-  // triple that made deep pages cost 3 calls each.
-  let deepOffsetMode = false;
-  let deepOffsetSince = null;
-  // WO-6 (A4): paging telemetry. apiCalls counts every LP round trip this
-  // sweep makes — main fetches, small-page retries and empty-page probes
-  // alike, because the deep-offset cost story is precisely about the extra
-  // calls. pages counts loop iterations. Both are reported per sweep and
-  // persisted to lp_sync_log so the duration question stops being a guess.
-  let apiCalls = 0;
-  let pages = 0;
+  const pageSize = SYNC_PAGE_SIZE;
+  // WO-6 (A4) / WO-13: paging telemetry now comes from the walker, which is the
+  // only thing making LP calls for this sweep. apiCalls still counts EVERY
+  // round trip — main fetches, reduced-size retries, row probes and the
+  // one-off page-mode proof alike — because the cost story is precisely about
+  // the extra calls. It is persisted to lp_sync_log as sweep_api_calls, and it
+  // is the number that proves or disproves WO-13 in production: same
+  // rows_scanned at a fraction of the calls.
   // v6.12: hash-gate diagnostics — why the gate did or didn't match.
   let gateStored = 0;   // prospects that had a stored hash to compare against
   let gateAbsent = 0;   // prospects with NO stored hash (never hashed / mixed rows)
@@ -753,73 +746,35 @@ async function runLeadsSweep(since, windowEnd, logIds, maxLeads) {
   }
 
   let truncatedAt = null;
+  // WO-13: paging is now owned by the shared walker (src/lp-paging.js). It
+  // proves LP's StartIndex addressing at runtime and only pages by page index
+  // once both addressings agree on the record at that offset; otherwise it
+  // falls back to the pre-WO-13 one-row-per-call behaviour. See that file for
+  // the evidence — 23 of 23 deep-offset triggers fired at exactly StartIndex=51.
+  const walker = createPageWalker({
+    fetch: ({ PageSize, StartIndex }) => getLeadData({ startdate: since, enddate: windowEnd, PageSize, StartIndex })
+      .then(extractArray),
+    pageSize,
+    idOf: (r) => r?.cst_id ?? r?.id ?? null,
+    label: '[Sync:Leads]',
+  });
+
   while (counts.leads < maxLeads && scanned < MAX_SCANNED_LEADS) {
-    let leads;
-    // v6.12: in deep-offset mode LP only serves one row at a time here, so
-    // ask for exactly that. Anything larger comes back empty and costs a
-    // wasted round trip.
-    const fetchSize = deepOffsetMode ? 1 : pageSize;
-    pages++;
+    let items;
     try {
-      apiCalls++;
-      leads = await getLeadData({
-        startdate: since, enddate: windowEnd,
-        PageSize: fetchSize, StartIndex: startIndex,
-      });
+      const page = await walker.next();
+      if (page.done) break;
+      items = page.items;
     } catch (err) {
-      // A failed page means TRUNCATION, not completion. An ERROR page is a
-      // genuine failure (LP refused the request), so backoff is correct HERE
-      // and only here — unlike the empty-page path below, which is
-      // deterministic and must never sleep.
+      // A failed page means TRUNCATION, not completion — the walker already
+      // retried once at a reduced size before giving up. Back off so a
+      // genuinely overloaded LP is not hammered by the next sweep.
       softFailStreak++;
       const failBackoff = Math.min(SYNC_SOFTFAIL_BACKOFF_MAX_MS, SYNC_SOFTFAIL_BACKOFF_BASE_MS * 2 ** Math.min(softFailStreak - 1, 4));
-      console.error(`[Sync:Leads] GetLeadData page StartIndex=${startIndex} failed: ${err.message} — backing off ${failBackoff}ms, retrying smaller`);
+      truncatedAt = walker.stats.rowsFetched + 1;
+      console.error(`[Sync:Leads] page at row ${truncatedAt} failed after small-page retry — sweep TRUNCATED, changes beyond this offset NOT synced this run: ${err.message} (backing off ${failBackoff}ms before the sweep ends)`);
       await sleep(failBackoff);
-      try {
-        apiCalls++;
-        leads = await getLeadData({
-          startdate: since, enddate: windowEnd,
-          PageSize: Math.max(1, Math.floor(fetchSize / 4)), StartIndex: startIndex,
-        });
-      } catch (err2) {
-        truncatedAt = startIndex;
-        console.error(`[Sync:Leads] page StartIndex=${startIndex} failed after small-page retry — sweep TRUNCATED, changes beyond this offset NOT synced this run: ${err2.message}`);
-        break;
-      }
-    }
-    let items = extractArray(leads);
-    if (items.length === 0) {
-      // VERIFY the empty page before trusting it: under load LP soft-fails by
-      // returning an EMPTY page at offsets where rows exist (proved live
-      // 2026-07-22 — a recovery run "completed" at exactly 150 prospects
-      // while a 1-row probe at the next offset returned data). An unverified
-      // empty page truncates the sweep while looking like clean completion.
-      // v6.12: in deep-offset mode this fetch WAS the 1-row probe, so an
-      // empty result is authoritative — that is the end of the window.
-      if (deepOffsetMode) break;
-      try {
-        apiCalls++;
-        const probe = extractArray(await getLeadData({
-          startdate: since, enddate: windowEnd, PageSize: 1, StartIndex: startIndex,
-        }));
-        if (probe.length === 0) break; // genuinely the end
-        // v6.12: NEVER back off here. A PageSize=1 probe that returns a row
-        // in the same breath is positive proof LP is up and serving — the
-        // empty multi-row page is DETERMINISTIC deep-offset behavior, not
-        // load. Sleeping against it buys nothing and (measured 2026-08-18)
-        // multiplied per-row cost ~4x, turning truncation into an hour-long
-        // scheduler block. Instead: keep the probe row as this page's work
-        // and switch to PageSize=1 for the rest of the sweep, so every
-        // subsequent row costs ONE call rather than three.
-        deepOffsetMode = true;
-        deepOffsetSince = startIndex;
-        console.warn(`[Sync:Leads] deep-offset detected at StartIndex=${startIndex} (empty page, probe returned rows) — switching to PageSize=1 for the remainder of this sweep, no backoff`);
-        items = probe;
-      } catch (err) {
-        truncatedAt = startIndex;
-        console.error(`[Sync:Leads] empty-page verification failed at StartIndex=${startIndex} — sweep TRUNCATED: ${err.message}`);
-        break;
-      }
+      break;
     }
 
     // v6.12: a page that served rows on the first try clears the ERROR
@@ -878,7 +833,7 @@ async function runLeadsSweep(since, windowEnd, logIds, maxLeads) {
       }
     }
 
-    console.log(`[Sync:Leads] Page startIndex=${startIndex} fetched ${items.length} prospects — processing with concurrency=${SYNC_PROSPECT_CONCURRENCY}, per-prospect timeout=${SYNC_PROSPECT_TIMEOUT_MS / 1000}s`);
+    console.log(`[Sync:Leads] Page ${walker.stats.pages} (row ${walker.stats.rowsFetched - items.length + 1}) fetched ${items.length} prospects — processing with concurrency=${SYNC_PROSPECT_CONCURRENCY}, per-prospect timeout=${SYNC_PROSPECT_TIMEOUT_MS / 1000}s`);
 
     // Parallelize processProspect within the page. Each handler returns
     // its sub-counts (or null on skip/error) so we aggregate after
@@ -1027,16 +982,16 @@ async function runLeadsSweep(since, windowEnd, logIds, maxLeads) {
         `${unchangedSkipped} unchanged-${SYNC_HASH_GATE_MODE === 'enforce' ? 'skipped' : 'flagged'} (gate=${SYNC_HASH_GATE_MODE}), ` +
         `${failed} failed (${timedOut} timeout), ` +
         `${denylistSkipped} denylist-skipped (${newlyDenylisted} newly denied), ` +
-        `pageSize=${deepOffsetMode ? `1(deep@${deepOffsetSince})` : pageSize}, scanned=${scanned}, ` +
+        `paging=${walker.stats.mode}, scanned=${scanned}, ` +
         `rows/min=${(scanned / Math.max(0.1, (now - sweepStartedAt) / 60000)).toFixed(1)}, elapsed ${elapsedMin}min`
       );
       lastHeartbeat = now;
     }
 
     if (hitCap || counts.leads >= maxLeads) { hitCap = true; break; }
-    startIndex += items.length;
     await sleep(RATE_LIMIT_SLEEP_MS);
   }
+  const { apiCalls, pages, deepFrom, pageModeFrom } = walker.stats;
 
   if (hitCap) {
     console.log(`[Sync:Leads] Hit MAX_INCREMENTAL_LEADS cap (${maxLeads}) — stopping. Will continue in next run.`);
@@ -1057,10 +1012,13 @@ async function runLeadsSweep(since, windowEnd, logIds, maxLeads) {
       `${gateHeldForBackfill} matched but HELD (attribution backfill still pending)`
     );
   }
-  if (deepOffsetMode) {
+  if (pageModeFrom) {
+    console.log(`[Sync:Leads] Paged by PAGE INDEX from page ${pageModeFrom} — ${apiCalls} LP calls for ${scanned} rows (one call per page, not per row)`);
+  }
+  if (deepFrom) {
     const mins = (Date.now() - sweepStartedAt) / 60000;
     console.log(
-      `[Sync:Leads] Deep-offset mode engaged at StartIndex=${deepOffsetSince} — ` +
+      `[Sync:Leads] Deep-offset fallback engaged at row ${deepFrom} — ` +
       `${scanned} rows scanned at 1 LP call/row, ${(scanned / Math.max(0.1, mins)).toFixed(1)} rows/min`
     );
   }
@@ -1076,16 +1034,18 @@ async function runLeadsSweep(since, windowEnd, logIds, maxLeads) {
   // WO-6 (A4): one structured line per entity per run, plus the same
   // numbers persisted so this is queryable rather than log-only.
   //
-  // `mode` is the branch actually taken — deepOffsetMode is set only where
-  // LP's positional refusal was proven by a probe that returned rows. It is
-  // never inferred from how long the sweep took, which is the inference this
-  // telemetry exists to replace.
+  // `mode` is the branch the walker actually took, never inferred from how long
+  // the sweep ran. WO-13 changed what a 'deep' reading MEANS: it is no longer
+  // "LP refuses multi-row pages at depth" (that was a misreading of a unit
+  // mismatch) but "page-index addressing could not be proven here, so we fell
+  // back". A 'deep' row after WO-13 is worth investigating; before, it was the
+  // norm.
   //
   // NOTHING here changes paging behaviour. Page sizes, keyset cursors,
   // batch sizes and timeouts are deliberately untouched (WO-9 holds any
   // paging verdict until this has run 24 uninterrupted hours).
   const sweepMs = Date.now() - sweepStartedAt;
-  const pagingMode = deepOffsetMode ? 'deep' : 'normal';
+  const pagingMode = walker.stats.pagingMode;
   logSweepTelemetry('leads', { pagingMode, pages, apiCalls, rows: scanned, ms: sweepMs });
   //
   // 084: rows_scanned joins them. `scanned` is what this sweep FETCHED from LP;
@@ -1197,70 +1157,19 @@ async function runJobChangesSweep(since, windowEnd, logIds) {
   const healBudget = getJobParentHealBudget();
   let healsUsed = 0;
   let healed = 0;
-  let startIndex = 1;
-  // v6.13: deep-offset mode, ported from runLeadsSweep (#709). This sweep was
-  // left on the pre-fix path deliberately as the control arm; it has served
-  // that purpose and still logs the untreated 3-calls-per-row pattern.
-  let deepOffsetMode = false;
-  let deepOffsetSince = null;
   let scanned = 0;
   const sweepStartedAt = Date.now();
-  // WO-6 (A4): same counters as the leads sweep. This sweep is the untreated
-  // control arm for deep-offset cost, so its call count is the interesting one.
-  let apiCalls = 0;
-  let pages = 0;
 
   while (true) {
-    let jobs;
-    const fetchSize = deepOffsetMode ? 1 : SYNC_PAGE_SIZE;
-    pages++;
+    let items;
     try {
-      apiCalls++;
-      jobs = await getJobStatusChanges({
-        startdate: since, enddate: windowEnd,
-        PageSize: fetchSize, StartIndex: startIndex,
-      });
+      const page = await walker.next();
+      if (page.done) break;
+      items = page.items;
     } catch (err) {
-      // Same truncation-not-completion semantics as the leads sweep. An ERROR
-      // page is a genuine failure, so a retry is warranted here — unlike the
-      // deterministic empty-page path below.
-      console.error(`[Sync:JobChanges] page StartIndex=${startIndex} failed: ${err.message} — retrying smaller`);
-      try {
-        apiCalls++;
-        jobs = await getJobStatusChanges({
-          startdate: since, enddate: windowEnd,
-          PageSize: Math.max(1, Math.floor(fetchSize / 4)), StartIndex: startIndex,
-        });
-      } catch (err2) {
-        console.error(`[Sync:JobChanges] page StartIndex=${startIndex} failed after small-page retry — sweep TRUNCATED: ${err2.message}`);
-        break;
-      }
-    }
-    let items = extractArray(jobs);
-    if (items.length === 0) {
-      // In deep-offset mode this fetch WAS the 1-row probe, so empty is
-      // authoritative — that is the end of the window.
-      if (deepOffsetMode) break;
-      // Same empty-page verification as the leads sweep — an empty page is not
-      // proof of completion.
-      try {
-        apiCalls++;
-        const probe = extractArray(await getJobStatusChanges({
-          startdate: since, enddate: windowEnd, PageSize: 1, StartIndex: startIndex,
-        }));
-        if (probe.length === 0) break; // genuinely the end
-        // v6.13: a PageSize=1 probe returning a row proves LP is up and
-        // serving; the empty multi-row page is DETERMINISTIC deep-offset
-        // behavior. Keep the probe row as this page's work and drop to
-        // PageSize=1 for the rest of the sweep — 1 LP call per row, not 3.
-        deepOffsetMode = true;
-        deepOffsetSince = startIndex;
-        console.warn(`[Sync:JobChanges] deep-offset detected at StartIndex=${startIndex} (empty page, probe returned rows) — switching to PageSize=1 for the remainder of this sweep`);
-        items = probe;
-      } catch (err) {
-        console.error(`[Sync:JobChanges] empty-page verification failed at StartIndex=${startIndex} — sweep TRUNCATED: ${err.message}`);
-        break;
-      }
+      // Truncation, not completion — the walker already retried once smaller.
+      console.error(`[Sync:JobChanges] page at row ${walker.stats.rowsFetched + 1} failed after small-page retry — sweep TRUNCATED: ${err.message}`);
+      break;
     }
     scanned += items.length;
 
@@ -1331,14 +1240,17 @@ async function runJobChangesSweep(since, windowEnd, logIds) {
     syncLogProgress(logIds.jobs, counts.jobs);
     syncLogProgress(logIds.milestones, counts.milestones);
 
-    startIndex += items.length;
     await sleep(RATE_LIMIT_SLEEP_MS);
   }
+  const { apiCalls, pages, deepFrom, pageModeFrom } = walker.stats;
 
-  if (deepOffsetMode) {
+  if (pageModeFrom) {
+    console.log(`[Sync:JobChanges] Paged by PAGE INDEX from page ${pageModeFrom} — ${apiCalls} LP calls for ${scanned} rows`);
+  }
+  if (deepFrom) {
     const mins = (Date.now() - sweepStartedAt) / 60000;
     console.log(
-      `[Sync:JobChanges] Deep-offset mode engaged at StartIndex=${deepOffsetSince} — ` +
+      `[Sync:JobChanges] Deep-offset fallback engaged at row ${deepFrom} — ` +
       `${scanned} rows scanned at 1 LP call/row, ${(scanned / Math.max(0.1, mins)).toFixed(1)} rows/min`
     );
   }
@@ -1355,7 +1267,7 @@ async function runJobChangesSweep(since, windowEnd, logIds) {
 
   // WO-6 (A4): telemetry for the job-changes sweep.
   const sweepMs = Date.now() - sweepStartedAt;
-  const pagingMode = deepOffsetMode ? 'deep' : 'normal';
+  const pagingMode = walker.stats.pagingMode;
   logSweepTelemetry('job_changes', { pagingMode, pages, apiCalls, rows: scanned, ms: sweepMs });
 
   // 084: persist it, to the `jobs` row ONLY.
