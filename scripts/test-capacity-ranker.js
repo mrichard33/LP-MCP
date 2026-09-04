@@ -1290,8 +1290,9 @@ function fakeRun({
   prev = null, mode = 'shadow', rows = FIXTURE_2026_09_04, applyImpl = null,
   insertImpl = null, stale = false, now = null, performance = PERF_2026_09_04,
   history = [], historyImpl = null, perfWeight = 0.25,
+  lockHeld = false, lockImpl = null, releaseImpl = null,
 } = {}) {
-  const calls = { apply: 0, applyOpts: [], inserted: [] };
+  const calls = { apply: 0, applyOpts: [], inserted: [], acquired: 0, released: [] };
   const deps = {
     mode,
     swapMargin: 0.5,
@@ -1303,6 +1304,13 @@ function fakeRun({
     readAppliedHistory: historyImpl || (async () => history),
     readLastApplied: async () => prev,
     insertLog: insertImpl || (async (row) => { calls.inserted.push(row); return 42; }),
+    acquireRunLock: lockImpl || (async () => {
+      calls.acquired += 1;
+      return lockHeld
+        ? { acquired: false, reason: 'lock_held', held_by: 'capacity_ranker', expires_at: '2026-09-03T16:52:00Z' }
+        : { acquired: true, expires_at: '2026-09-03T16:53:00Z' };
+    }),
+    releaseRunLock: releaseImpl || (async (lock) => { calls.released.push(lock?.expires_at ?? null); }),
     apply: async (rankResult, opts) => {
       calls.apply += 1;
       calls.applyOpts.push(opts);
@@ -1323,6 +1331,116 @@ async function withCycleEnv(value, fn) {
     else process.env.CAPACITY_RANKER_CYCLE_CAMPAIGNS = prev;
   }
 }
+
+// ─── Run lock: only one ranker run at a time, fleet-wide ────────────────────
+//
+// WHY THIS EXISTS. The Five9 write gate already serializes each INDIVIDUAL
+// admin write fleet-wide (five9_admin:write in outbound_locks), but a ranker
+// run is a SEQUENCE of writes — stop, reorder, start, per campaign — and the
+// gate releases between each one. Two overlapping runs can therefore interleave
+// perfectly legally:
+//
+//     run A: stop Hot   (takes the write lock, releases it)
+//     run B: stop Warm  (takes the write lock, releases it)
+//     → BOTH Data campaigns are now stopped and the floor is dark.
+//
+// The peer check added in PR #844 narrows this but cannot close it: it reads
+// each peer's live state and refuses to stop while another is down, which is
+// check-then-act. If both runs read before either stop lands, both see RUNNING
+// and both proceed. That is a TOCTOU race, and no amount of re-reading fixes it.
+//
+// On 2026-09-04 two runs landed 42 seconds apart (n8n executions 286949 at
+// 18:15:00 mode=trigger, and 286951 at 18:15:42 mode=manual — someone hit
+// Execute in the n8n UI). Neither cycled that time, because the order already
+// matched, so nothing broke. A manual run landing 42 seconds into a real cycle
+// is the same race with a live floor attached.
+//
+// The lock is held for the WHOLE run, in Supabase (not process memory) so it
+// survives a Railway restart and holds if the service ever runs more than one
+// instance.
+
+test('LOCK: a second concurrent run is REFUSED with 409 — no ranking, no log row, no Five9 write', async () => {
+  const { deps, calls } = fakeRun({ mode: 'live', lockHeld: true });
+  const { status, body } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
+  assert.equal(status, 409);
+  assert.match(body.error, /already running/i);
+  assert.equal(body.lock_held_by, 'capacity_ranker');
+  assert.equal(calls.apply, 0, 'nothing was applied to Five9');
+  assert.equal(calls.inserted.length, 0, 'no dial_priority_log row — the run never happened');
+  assert.deepEqual(calls.released, [], 'a lock we never took is never released');
+});
+
+test('LOCK: the winning run proceeds normally and RELEASES the lock afterwards', async () => {
+  const { deps, calls } = fakeRun({ mode: 'live' });
+  const { status, body } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
+  assert.equal(status, 200);
+  assert.equal(calls.acquired, 1);
+  assert.deepEqual(calls.released, ['2026-09-03T16:53:00Z'], 'released with the expires_at it acquired');
+  assert.ok(body.ranking.length > 0);
+});
+
+test('LOCK: released even when the run THROWS — a crash must not wedge the next hour', async () => {
+  const { deps, calls } = fakeRun({
+    mode: 'live',
+    insertImpl: async () => { throw new Error('dial_priority_log insert exploded'); },
+  });
+  await assert.rejects(
+    runCapacityRanker({ slot_date: '2026-09-05' }, deps),
+    /insert exploded/,
+  );
+  assert.deepEqual(calls.released, ['2026-09-03T16:53:00Z'], 'the finally released it anyway');
+});
+
+test('LOCK: released compare-and-set — the release carries the acquired expires_at', async () => {
+  // Without this, a slow run whose lock expired and was re-taken by the NEXT
+  // run would release its successor's live lock on the way out, re-opening the
+  // exact race the lock exists to close.
+  const released = [];
+  const { deps } = fakeRun({
+    mode: 'live',
+    lockImpl: async () => ({ acquired: true, expires_at: '2026-09-03T17:00:00Z' }),
+    releaseImpl: async (lock) => { released.push(lock); },
+  });
+  await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
+  assert.equal(released.length, 1);
+  assert.equal(released[0].expires_at, '2026-09-03T17:00:00Z');
+});
+
+test('LOCK: FAILS OPEN — a lock backend error lets the run proceed rather than stalling the floor', async () => {
+  // Consistent with tryAcquireLock itself, which returns acquired:true with
+  // reason acquire_error_open when Supabase errors. A dial order that is one
+  // hour stale is worse than a small race window.
+  const warnings = [];
+  const { deps, calls } = fakeRun({
+    mode: 'live',
+    lockImpl: async () => ({ acquired: true, reason: 'acquire_error_open' }),
+  });
+  deps.log = (m) => warnings.push(m);
+  const { status } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
+  assert.equal(status, 200);
+  assert.equal(calls.apply, 1, 'the run still applied');
+});
+
+test('LOCK: taken BEFORE any capacity read — a refused run does no work at all', async () => {
+  const order = [];
+  const { deps } = fakeRun({
+    mode: 'live',
+    lockHeld: true,
+    lockImpl: async () => { order.push('lock'); return { acquired: false, reason: 'lock_held' }; },
+  });
+  deps.fetchCapacity = async () => { order.push('capacity'); return { rows: FIXTURE_2026_09_05, stale: false, last_sweep_at: null }; };
+  const { status } = await runCapacityRanker({ slot_date: '2026-09-05' }, deps);
+  assert.equal(status, 409);
+  assert.deepEqual(order, ['lock'], 'the capacity read never ran');
+});
+
+test('LOCK: a malformed slot_date is rejected BEFORE the lock is taken', async () => {
+  const { deps, calls } = fakeRun({ mode: 'live' });
+  const { status } = await runCapacityRanker({ slot_date: '09/05/2026' }, deps);
+  assert.equal(status, 400);
+  assert.equal(calls.acquired, 0, 'never took a lock for a request that cannot run');
+  assert.deepEqual(calls.released, []);
+});
 
 test('route: the 2026-09-05 board end to end — order, multipliers and new fields', async () => {
   const { deps, calls } = fakeRun({ rows: FIXTURE_2026_09_05 });
