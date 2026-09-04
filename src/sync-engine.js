@@ -1067,8 +1067,19 @@ async function runLeadsSweep(since, windowEnd, logIds, maxLeads) {
   const sweepMs = Date.now() - sweepStartedAt;
   const pagingMode = deepOffsetMode ? 'deep' : 'normal';
   logSweepTelemetry('leads', { pagingMode, pages, apiCalls, rows: scanned, ms: sweepMs });
+  //
+  // 084: rows_scanned joins them. `scanned` is what this sweep FETCHED from LP;
+  // records_synced on the same row is what it WROTE. Deep-offset triggers on
+  // the former, so without it the paging theory cannot be tested — the first
+  // attempt correlated duration against records_synced and came back
+  // inconclusive for exactly that reason.
+  //
+  // The entity list is deliberately NOT extended to jobs/milestones: those rows
+  // are co-owned with runJobChangesSweep, which writes its own paging columns
+  // onto the `jobs` row (see the block at the end of that function). Adding
+  // them here would have the two sweeps overwrite each other's numbers.
   await Promise.all(['leads', 'calls', 'notes', 'activities'].map(
-    (et) => syncLogTelemetry(logIds[et], { apiCalls, pagingMode }).catch(() => {})
+    (et) => syncLogTelemetry(logIds[et], { apiCalls, pagingMode, rowsScanned: scanned }).catch(() => {})
   ));
 
   return { counts, failed, hitCap, denylistSkipped, newlyDenylisted, unchangedSkipped, scanned, truncatedAt, apiCalls, pages, pagingMode };
@@ -1322,15 +1333,36 @@ async function runJobChangesSweep(since, windowEnd, logIds) {
     );
   }
 
-  // WO-6 (A4): telemetry for the job-changes sweep. jobs/milestones rows are
-  // co-owned with the leads sweep, so this writes only the log line and the
-  // columns for entities this sweep alone pages for — writing api_calls onto
-  // a co-owned row would silently overwrite the other sweep's number.
+  // WO-6 (A4): telemetry for the job-changes sweep.
   const sweepMs = Date.now() - sweepStartedAt;
   const pagingMode = deepOffsetMode ? 'deep' : 'normal';
   logSweepTelemetry('job_changes', { pagingMode, pages, apiCalls, rows: scanned, ms: sweepMs });
 
-  return { counts, failed, apiCalls, pages, pagingMode };
+  // 084: persist it, to the `jobs` row ONLY.
+  //
+  // A4 left this log-only on the reasoning that jobs/milestones rows are
+  // co-owned with the leads sweep and a write here would clobber the other
+  // sweep's number. That risk is real for records_synced — both sweeps add to
+  // it — but NOT for the paging columns: runLeadsSweep writes telemetry to
+  // ['leads','calls','notes','activities'] and deliberately excludes
+  // jobs/milestones, so these three columns are an empty slot rather than a
+  // contested one. Leaving them empty is what stops WO-3 being answerable,
+  // because THIS is the sweep that goes deep — the 2026-09-04 14:48 event was
+  // `[Sync:JobChanges] deep-offset detected at StartIndex=51`, and the leads
+  // sweep's own row cannot speak for it.
+  //
+  // INVARIANT, and the whole reason this is safe: exactly one sweep pages LP
+  // for a given entity's rows. runLeadsSweep pages getLeadData; this sweep
+  // pages getJobStatusChanges. If a future change ever has runLeadsSweep write
+  // paging telemetry to jobs or milestones, this write and that one must be
+  // reconciled first — they cannot both be right.
+  //
+  // `milestones` is intentionally left NULL rather than mirrored: milestones
+  // are not paged for at all, they arrive embedded in the job payloads counted
+  // here, and a copied number would read as an independent measurement.
+  await syncLogTelemetry(logIds?.jobs, { apiCalls, pagingMode, rowsScanned: scanned }).catch(() => {});
+
+  return { counts, failed, apiCalls, pages, pagingMode, scanned };
 }
 
 // ─── Incremental Sync ────────────────────────────────────────────

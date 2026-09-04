@@ -360,12 +360,18 @@ export async function markRunningLogsTerminal(status, reason) {
 // `pagingMode` MUST come from the branch the sweep actually took. Inferring
 // "it was slow, so it must have been deep paging" is the guess this column
 // exists to replace.
-export async function syncLogTelemetry(logId, { apiCalls, pagingMode } = {}) {
+// 084: `rowsScanned` is rows FETCHED from LP, whether or not they were written.
+// It is the variable deep-offset paging actually triggers on, and it is why the
+// first attempt to confirm that theory came back inconclusive — the correlation
+// was run against records_synced (rows WRITTEN), which is a different number:
+// measured 2026-09-04, one leads sweep scanned 543 rows and synced 303.
+export async function syncLogTelemetry(logId, { apiCalls, pagingMode, rowsScanned } = {}) {
   if (!logId) return;
   try {
     const patch = {};
     if (Number.isFinite(apiCalls)) patch.api_calls = apiCalls;
     if (pagingMode) patch.paging_mode = pagingMode;
+    if (Number.isFinite(rowsScanned)) patch.rows_scanned = rowsScanned;
     if (Object.keys(patch).length === 0) return;
     await supabase.from('lp_sync_log').update(patch).eq('id', logId);
   } catch (_) {
