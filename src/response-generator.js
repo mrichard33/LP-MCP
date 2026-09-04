@@ -1099,6 +1099,16 @@ Return ONLY a valid JSON object. The very first character MUST be { and the very
   }
 }`;
 
+/**
+ * The exact `system` string callClaude() hands to callLLM(). Pure pass-through,
+ * no logic, added 2026-09 so scripts/test-response-prompt-snapshot.js can assert
+ * on the system prompt the way it already can on the user prompt (which
+ * buildResponsePrompt returns verbatim). Nothing in src/ calls it.
+ */
+export function getResponseSystemPrompt() {
+  return SYSTEM_PROMPT;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // REPLY SENDER IDENTITY (2026-07-29 — Kelly Callahan incident)
 // ═══════════════════════════════════════════════════════════════════

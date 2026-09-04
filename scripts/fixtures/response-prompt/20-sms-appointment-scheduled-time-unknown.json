@@ -1,0 +1,66 @@
+{
+  "name": "20-sms-appointment-scheduled-time-unknown",
+  "covers": "sms · appointment_phase=scheduled, date-only LP row",
+  "env": {},
+  "channel": "sms",
+  "triggerMessage": "What time is my appointment?",
+  "fastTrack": false,
+  "trafficTemp": "warm",
+  "kbPack": null,
+  "availability": null,
+  "classification": {
+    "intent_class": "GENERAL_QUESTION",
+    "confidence": 0.82,
+    "classification_method": "llm",
+    "reasoning": "Lead asked an open pricing question with no objection language."
+  },
+  "context": {
+    "now": {
+      "iso": "2026-09-02T15:30:00Z",
+      "date_human": "Wednesday, September 2, 2026",
+      "time_human": "11:30 AM",
+      "tz": "America/New_York"
+    },
+    "lead": {
+      "ghl_contact_id": "FIXTURECONTACT000001",
+      "name": "Dana Whitfield",
+      "first_name": "Dana",
+      "lead_score": 42,
+      "date_added": "2026-08-30T13:00:00Z",
+      "entry_source": "Facebook Lead Form",
+      "current_tags": [],
+      "objection_tags": [],
+      "suppression_tags": [],
+      "contact_notes": [],
+      "rep_display_name": null,
+      "lp_rep_name": null,
+      "trust_level_score": null,
+      "current_buyer_tag": null,
+      "current_bj_tag": null,
+      "current_stage_tag": null
+    },
+    "lp": {
+      "matched": true,
+      "notes": [],
+      "recent_calls": [],
+      "appointment_set": true,
+      "appointment_date": "2026-09-05",
+      "appointment_phase": "scheduled",
+      "appointment_minutes_delta": null,
+      "appointment_time_human": null,
+      "appointment_days_delta": 3
+    },
+    "intelligence": {},
+    "engagement": {
+      "emails_opened": 0,
+      "links_clicked": 0,
+      "replies_count": 0,
+      "vsl_watched": false
+    },
+    "objection_state": null,
+    "pipeline": null,
+    "estimate": null,
+    "conversation_recent": []
+  },
+  "opts": {}
+}
