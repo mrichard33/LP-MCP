@@ -47,6 +47,7 @@
 
 import supabase from './supabase.js';
 import { emitEvent } from './event-emitter.js';
+import { utcToLpStoredIso } from './lp-dates.js';
 
 // Dispositions that prove a lead's appointment is still live on the books.
 const LIVE_APPOINTMENT_DISPOSITIONS = ['Set', 'Cnf'];
@@ -67,6 +68,9 @@ const SALE_LOOKBACK_DAYS = 30;
  *       disposition_code IN ('Set','Cnf')   — a live future appointment, or
  *   (b) disposition_code IN ('Sale','Sold') AND
  *       updated_at_lp >= now() - 30d        — already bought on another lead.
+ *
+ * Both now() bounds are expressed in the stored ET-wall-clock frame via
+ * utcToLpStoredIso(); see the comment on nowStored below for why.
  *
  * The triggering (cancelled/no-show) lead cannot match (a): its own
  * disposition is CXL/CCC/BO/NoHome/1Leg/NS. So there is no need to know which
@@ -134,8 +138,20 @@ export async function findBlockingLiveLeadWith(client, contact_id, logPrefix = '
   if (!contact_id) return null;
 
   const emit = deps.emitEvent || emitEvent;
-  const nowIso = new Date().toISOString();
-  const saleCutoff = new Date(Date.now() - SALE_LOOKBACK_DAYS * 86400000).toISOString();
+
+  // BOUNDS ARE BUILT IN THE STORED FRAME, NOT UTC. lp_leads appointment_date
+  // and updated_at_lp hold ET wall-clock digits wearing a +00:00 offset they
+  // did not earn (see the banner in src/lp-dates.js). A true-UTC bound against
+  // those columns is four hours off — and on clause (a) it fails in the unsafe
+  // direction: at 2:00 PM ET, new Date().toISOString() is 18:00Z and a 6:00 PM
+  // ET appointment is stored as 18:00Z, so the guard read a live appointment as
+  // past and stopped suppressing four hours before the appointment began.
+  // Verified 2026-09-04 on contact zLDD7V1eosF8vldF5U7i / lead 459770.
+  //
+  // utcToLpStoredIso() shifts the BOUND into the column's frame, so the
+  // comparison stays same-frame and index-eligible and no stored row changes.
+  const nowStored = utcToLpStoredIso();
+  const saleCutoffStored = utcToLpStoredIso(Date.now() - SALE_LOOKBACK_DAYS * 86400000);
 
   // TWO PLAIN QUERIES, NOT ONE .or() STRING. The previous single-call version
   // built a PostgREST logical tree — `or(and(...,in.(Set,Cnf)),and(in.(Sale,
@@ -161,7 +177,7 @@ export async function findBlockingLiveLeadWith(client, contact_id, logPrefix = '
       .eq('ghl_contact_id', String(contact_id))
       .eq('appointment_set', true)
       .in('disposition_code', LIVE_APPOINTMENT_DISPOSITIONS)
-      .gte('appointment_date', nowIso)
+      .gte('appointment_date', nowStored)
       .order('appointment_date', { ascending: false })
       .limit(1);
     if (error) {
@@ -181,7 +197,7 @@ export async function findBlockingLiveLeadWith(client, contact_id, logPrefix = '
       .select(BLOCKING_SELECT)
       .eq('ghl_contact_id', String(contact_id))
       .in('disposition_code', SOLD_DISPOSITIONS)
-      .gte('updated_at_lp', saleCutoff)
+      .gte('updated_at_lp', saleCutoffStored)
       .order('updated_at_lp', { ascending: false })
       .limit(1);
     if (error) {

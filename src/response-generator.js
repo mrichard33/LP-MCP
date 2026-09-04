@@ -295,6 +295,7 @@ import { resolveServicePhone } from './services/market-phone.js';
 // Every prompt string this file assembles. Copy only — no logic, no env reads.
 // See src/prompts/response-generator/index.js.
 import * as P from './prompts/response-generator/index.js';
+import { dialWindowPromptLine } from './dial-window.js';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy
@@ -950,6 +951,21 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   if (context.now?.time_human) {
     parts.push(...P.timeNowHardRule(context.now.time_human, context.now.date_human));
   }
+  // ── PHONE ROOM OPEN/CLOSED (2026-09-04, Robert Pederson) ──────────────
+  // Stated unconditionally and immediately after TIME NOW: a promise of an
+  // immediate call is only safe when the dialer is actually running, and
+  // before this the model was inferring that from context. See
+  // src/dial-window.js for why this is not a seventh "business hours".
+  //
+  // Anchored to context.now.iso, NOT to Date.now(), so this describes the same
+  // instant as the TIME NOW block directly above. An action generated from a
+  // replayed or queued context would otherwise pair a stated time of 11:30 AM
+  // with a phone room evaluated at whatever o'clock the worker happened to run,
+  // and the model would be handed two facts that contradict each other.
+  const nowMsForDial = Date.parse(context.now?.iso ?? '');
+  parts.push(...P.dialWindowHardRule(
+    dialWindowPromptLine(Number.isFinite(nowMsForDial) ? nowMsForDial : Date.now()),
+  ));
   if (context.lp?.appointment_phase) {
     const ph = context.lp.appointment_phase;
     const mins = context.lp.appointment_minutes_delta;

@@ -143,6 +143,8 @@ export function hasLegalSuppression(ctx) {
 // completed demo means they're PAST the appointment. Post-demo states
 // belong in ACTIVE_BOFU / S45_DEMO_STALL / post-demo-decline.
 
+import { lpStoredToUtcMs } from '../../../lp-dates.js';
+
 const APPT_GRACE_DAYS = Number(process.env.APPT_ACTIVE_GRACE_DAYS || 2);
 
 export function hasActiveBooking(ctx) {
@@ -150,7 +152,11 @@ export function hasActiveBooking(ctx) {
   if (ctx?.lp?.appointment_set === true && ctx?.lp?.demo_completed !== true) {
     const apptRaw = ctx?.lp?.appointment_date;
     if (apptRaw) {
-      const apptMs = new Date(apptRaw).getTime();
+      // lp.appointment_date holds ET wall-clock digits tagged +00:00, so
+      // new Date(...) reads it 4-5h early and this gate released a live
+      // booking that many hours before the grace cutoff. Convert to true
+      // UTC before comparing to Date.now(). See src/lp-dates.js.
+      const apptMs = lpStoredToUtcMs(apptRaw);
       if (Number.isFinite(apptMs)) {
         const graceCutoffMs = Date.now() - APPT_GRACE_DAYS * 86400000;
         if (apptMs >= graceCutoffMs) return true;

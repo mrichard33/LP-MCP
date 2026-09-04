@@ -105,9 +105,28 @@ export function lpCreatedDate(prospect, lead, getField) {
 //
 // Use this ONLY for columns written through lpDateToEastern(): lp_leads and
 // lp_notes created_at_lp/updated_at_lp, lp_call_logs.call_date,
-// lp_activities.activity_date, lp_jobs.created_at_lp. Do NOT use it on
-// synced_at, or on any system_events / agent_actions column — those are
-// written by this service and are already true UTC.
+// lp_activities.activity_date, lp_jobs.created_at_lp, and — added 2026-09-04
+// — lp_leads appointment_date / demo_date / set_date / confirmed_date. Do NOT
+// use it on synced_at, or on any system_events / agent_actions column — those
+// are written by this service and are already true UTC.
+//
+// THE APPOINTMENT COLUMNS, ADDED 2026-09-04. They were left off this list
+// because lpWallClockToGhlStartTime() already re-stamps appointment_date at
+// the GHL claim boundary. That covers every site that BUILDS a GHL appointment
+// and no site that COMPARES the column to now(). duplicate-lead-guard.js did
+// the latter — .gte('appointment_date', new Date().toISOString()) — putting a
+// true-UTC bound against an ET-wall-clock column, so a 6:00 PM ET appointment
+// read as past from 2:00 PM ET and the guard stopped protecting a booked
+// customer four hours before their appointment (contact zLDD7V1eosF8vldF5U7i,
+// lead 459770, 2026-09-04).
+//
+// The two mechanisms must never both be active on one value. The split is by
+// DIRECTION, not by column: utcToLpStoredIso() converts a BOUND into the
+// stored frame for comparison; lpWallClockToGhlStartTime() converts a stored
+// VALUE out of it for GHL. Neither touches what the other reads, and no stored
+// row changes, so nothing double-corrects. Do not "simplify" this by
+// converting the column instead of the bound — that also drops index
+// eligibility on every one of these queries.
 // ═══════════════════════════════════════════════════════════════════
 
 /** Offset in ms between UTC and a named zone at a given instant. */

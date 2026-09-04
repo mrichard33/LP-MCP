@@ -204,3 +204,73 @@ DST.
 - **Only the sites where the error changes an outcome are fixed.** The rest are in §3 with
   their skew percentage.
 - **`lpStoredAgeMinutes` returns `null`, not `0`,** on unparseable input.
+
+---
+
+## 9. The appointment columns — 2026-09-04
+
+§4 restricted the read-side helpers to the columns written through `lpDateToEastern()` and
+deliberately left `appointment_date` / `demo_date` / `set_date` / `confirmed_date` off the
+list, on the grounds that `lpWallClockToGhlStartTime()` already normalizes them at the GHL
+claim boundary.
+
+That was true of every site that **builds** a GHL appointment. It was not true of the sites
+that **compare** the column to `now()`, and nothing owned those.
+
+### What it cost
+
+`duplicate-lead-guard.js` clause (a) filtered `.gte('appointment_date', new Date().toISOString())`
+— a true-UTC bound against an ET-wall-clock column. A 6:00 PM ET appointment is stored
+`2026-09-04T18:00:00+00:00`, and from 2:00 PM ET the bound is already past it, so **the guard
+stopped protecting a booked customer four hours before their appointment began.** Verified on
+contact `zLDD7V1eosF8vldF5U7i`, lead 459770 (2026-09-04). The same contact held a 2:00 PM
+cancellation and a 6:00 PM live appointment on one day with no invariant catching it.
+
+`hasActiveBooking()` in `agentic/lead-state/signals/context-reader.js` had the same shape
+against `Date.now()`, releasing contacts from the S4.5 suppression gate 4–5h early.
+
+### What changed
+
+The bound, never the column. `utcToLpStoredIso()` at:
+
+- `src/duplicate-lead-guard.js` — both clauses
+- `src/jobs/appointment-parity-watchdog.js` (the `lp_leads` read only; the GHL
+  `appointments.start_time` read beside it is true UTC and is untouched)
+- `src/admin/ghl-appointment-backfill.js`, `src/admin/parity-report.js`
+- `src/services/lp-contact-backstop.js` — the appointment window and the `created_at_lp` window
+
+and `lpStoredToUtcMs()` in `context-reader.js`'s `hasActiveBooking`.
+
+**Nothing stored changed, so §2 still holds** — there is no second era and no backfill. The
+two mechanisms are split by DIRECTION, not by column: `utcToLpStoredIso()` moves a *bound*
+into the stored frame for comparison; `lpWallClockToGhlStartTime()` moves a stored *value*
+out of it for GHL. Neither touches what the other reads. Do not "simplify" this by converting
+the column — that also drops index eligibility on every one of these queries.
+
+### Correction to a note elsewhere
+
+`sql/migrations/2026-08-03_contact_appointment_authority.sql:47-55` states that
+`updated_at_lp` is true UTC ("0 of 228,013 rows are future-dated"). It is not — a
+non-future-dated column is not evidence of a true-UTC one. Measured 2026-09-04 on rows synced
+within 6h:
+
+```sql
+SELECT round(EXTRACT(EPOCH FROM (max(synced_at) - max(updated_at_lp)))/3600.0, 2) AS updated_lag_h,
+       round(EXTRACT(EPOCH FROM (max(synced_at) - max(created_at_lp)))/3600.0, 2) AS created_lag_h
+FROM lp_leads WHERE synced_at > now() - interval '6 hours';
+-- updated_lag_h 4.01 | created_lag_h 4.10
+```
+
+`updated_at_lp` carries the same ~4h skew as `created_at_lp`. On the guard's 30-day sale
+lookback that is 0.6% and changed no outcome, but the bound was moved to the stored frame
+anyway so both clauses read the same way.
+
+### Deliberately not fixed
+
+Per the §3 rule — fix only where the error changes an outcome — these still compare raw and
+are left alone, each on a multi-day window where 4h does not flip the decision:
+`src/intent-scorer.js:191`, `src/agentic/lead-selection/select.js:280,298`,
+`src/agentic/lead-state/signals/behavioral-signals.js:192,259`.
+
+`sql/schema.sql:39` `close_date` has no writer and no reader anywhere in `src/`, `scripts/`
+or `sql/`. Nothing to fix.

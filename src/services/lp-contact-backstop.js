@@ -73,6 +73,7 @@ import { normalizePhone } from '../sync-utils.js';
 import { appointmentDelta } from '../appointment-dates.js';
 import { emitDispositionBackfill } from '../sync-leads.js';
 import { notifyBackstopRun } from './backstop-notify.js';
+import { utcToLpStoredIso } from '../lp-dates.js';
 
 // LP custom field IDs (canonical: src/actions/handlers/lp-lead.js:65,
 // src/lp-appointment-sync.js:205-207). Written as { id, field_value } —
@@ -325,8 +326,10 @@ export async function scanContactBackstopCandidates({
   // horizonDays — the JS gate in selectBackstopTargets re-asserts the same bound
   // so garbage-dated rows can never slip through either layer.
   const effHorizon = Math.min(Math.max(0, horizonDays), MAX_HORIZON_DAYS);
-  const fromIso = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-  const toIso = new Date(Date.now() + (effHorizon + 1) * 24 * 3600 * 1000).toISOString();
+  // Bounds in the stored ET-wall-clock frame; appointment_date holds ET
+  // digits tagged +00:00. See src/lp-dates.js.
+  const fromIso = utcToLpStoredIso(Date.now() - 24 * 3600 * 1000);
+  const toIso = utcToLpStoredIso(Date.now() + (effHorizon + 1) * 24 * 3600 * 1000);
 
   const PAGE = 1000;
   const rows = [];
@@ -368,7 +371,21 @@ export async function scanIntakeBackstopCandidates({
   if (!supabase) throw new Error('Supabase not configured');
 
   const effLookback = Math.min(Math.max(0, lookbackHours), MAX_INTAKE_LOOKBACK_HOURS);
-  const fromIso = new Date(Date.now() - effLookback * 3600 * 1000).toISOString();
+  // created_at_lp is written through lpDateToEastern() and is in the same
+  // stored ET-wall-clock frame, so the SQL bound is built there too.
+  //
+  // This is BEHAVIOUR-NEUTRAL on its own, and deliberately so. The stored-frame
+  // bound is ~4h wider than the true-UTC one it replaces, but makeIntakeWindowGate
+  // below still compares Date.parse(created_at_lp) against a true-UTC cutoff and
+  // trims the extra rows back out — the JS gate remains the binding constraint
+  // and the selected set is unchanged. The bound is corrected anyway so the
+  // paging query is not quietly cross-frame for whoever reads it next; moving
+  // the JS gate too would widen the intake cohort, which is a routing change
+  // and does not belong in a guard fix.
+  //
+  // untilIso is a caller-supplied admin bound and is deliberately left in
+  // whatever frame the caller passes.
+  const fromIso = utcToLpStoredIso(Date.now() - effLookback * 3600 * 1000);
 
   const PAGE = 1000;
   const rows = [];

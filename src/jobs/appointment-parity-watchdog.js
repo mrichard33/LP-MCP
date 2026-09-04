@@ -115,6 +115,7 @@ import { getHlSupabase } from '../admin/hl-client.js';
 import { emitEvent } from '../event-emitter.js';
 import { syncAppointmentToLP } from '../lp-appointment-sync.js';
 import { getGHLContact } from '../ghl.js';
+import { utcToLpStoredIso } from '../lp-dates.js';
 
 const PARITY_AUTOHEAL = process.env.PARITY_AUTOHEAL === 'true';
 const PARITY_WINDOW_DAYS = Number(process.env.PARITY_WINDOW_DAYS || 45);
@@ -164,8 +165,11 @@ async function readLpBook(from, to) {
     .from('lp_leads')
     .select('ghl_contact_id, lp_lead_id, lp_prospect_id, first_name, last_name, disposition_code, appointment_set, appointment_confirmed, appointment_date, updated_at_lp')
     .eq('appointment_set', true)
-    .gte('appointment_date', from.toISOString())
-    .lt('appointment_date', to.toISOString())
+    // Bound built in the stored ET-wall-clock frame. Unlike the GHL
+    // appointments read above (start_time is true UTC), lp_leads
+    // appointment_date holds ET digits tagged +00:00 — see src/lp-dates.js.
+    .gte('appointment_date', utcToLpStoredIso(from.getTime()))
+    .lt('appointment_date', utcToLpStoredIso(to.getTime()))
     .not('ghl_contact_id', 'is', null);
   if (error) throw new Error(`LP appointment read: ${error.message}`);
 

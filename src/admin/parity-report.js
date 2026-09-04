@@ -22,6 +22,7 @@ import supabase from '../supabase.js';
 import { lpWallClockToGhlStartTime } from '../appointment-dates.js';
 import { sameStartTime } from '../services/lp-ghl-appointment-reconciler.js';
 import { listEstimatePoolEvents } from '../services/ghl-calendar-read.js';
+import { utcToLpStoredIso } from '../lp-dates.js';
 
 const ACTIVE_DISPOSITIONS = ['Set', 'Cnf', 'Verif'];
 
@@ -157,8 +158,10 @@ export async function runParityReport({ date = null, horizonDays = 14 } = {}) {
     startMs = Date.now();
     endMs = startMs + horizonDays * 24 * 3600 * 1000;
   }
-  const fromIso = new Date(startMs - 24 * 3600 * 1000).toISOString();
-  const toIso = new Date(endMs + 24 * 3600 * 1000).toISOString();
+  // Bounds in the stored ET-wall-clock frame; appointment_date holds ET
+  // digits tagged +00:00. See src/lp-dates.js.
+  const fromIso = utcToLpStoredIso(startMs - 24 * 3600 * 1000);
+  const toIso = utcToLpStoredIso(endMs + 24 * 3600 * 1000);
 
   const lpByContact = await scanLpExpectations({ fromIso, toIso, startMs, endMs });
 

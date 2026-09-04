@@ -238,3 +238,85 @@ test('two matching rows use the first and do not throw (kills the maybeSingle cl
   assert.equal(blocking.lp_lead_id, '572839', 'the first row is used');
   assert.equal(emit.events.length, 0, 'a multi-row result is not an error');
 });
+
+// ─── Bound frame (2026-09-04, Robert Pederson zLDD7V1eosF8vldF5U7i) ────────
+//
+// lp_leads.appointment_date holds ET wall-clock digits wearing a +00:00 offset
+// (see the banner in src/lp-dates.js). Clause (a) built its lower bound with
+// new Date().toISOString() — a true-UTC instant — so the comparison was
+// cross-frame by four hours, and it failed in the unsafe direction: a 6:00 PM
+// ET appointment is stored as 18:00Z, and from 2:00 PM ET onward the bound was
+// already past it. The guard stopped protecting a booked customer four hours
+// before their appointment began.
+//
+// These tests assert the BOUND, not the row, because the row filtering happens
+// in Postgres. A capturing client is used rather than the shared one above,
+// which discards .gte arguments.
+
+/** Client that records every .gte(column, value) pair it is handed. */
+function boundCapturingClient(...results) {
+  let call = 0;
+  const bounds = [];
+  const chain = {};
+  const self = () => chain;
+  for (const m of ['select', 'eq', 'in', 'order']) chain[m] = self;
+  chain.gte = (column, value) => { bounds.push({ column, value }); return chain; };
+  chain.limit = async () => results[call - 1] ?? { data: [], error: null };
+  const client = { from: () => { call += 1; return chain; } };
+  client.bounds = bounds;
+  return client;
+}
+
+/** The bound the guard hands Postgres for a given column. */
+async function boundFor(column, nowMs) {
+  const realNow = Date.now;
+  Date.now = () => nowMs;
+  try {
+    const client = boundCapturingClient(empty, empty);
+    await findBlockingLiveLeadWith(client, 'c1', 'DuplicateLeadGuard', { emitEvent: emitSpy() });
+    return client.bounds.find((b) => b.column === column)?.value;
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+test('EDT: the appointment bound is ET wall-clock, so a 6 PM appt is still future at 2 PM', async () => {
+  // 2026-09-04 18:00Z is 2:00 PM EDT. Robert's 6:00 PM ET appointment is
+  // stored as '2026-09-04T18:00:00+00:00'.
+  const bound = await boundFor('appointment_date', Date.parse('2026-09-04T18:00:00Z'));
+  assert.equal(bound.slice(0, 19), '2026-09-04T14:00:00',
+    'the bound is 14:00 (2 PM ET expressed in the stored frame), not 18:00');
+  assert.ok(bound < '2026-09-04T18:00:00+00:00',
+    'the stored 6 PM ET appointment sorts AFTER the bound and still blocks');
+});
+
+test('EDT: the appointment bound passes the appointment once it has actually started', async () => {
+  // 22:01Z is 6:01 PM EDT — one minute after the appointment began.
+  const bound = await boundFor('appointment_date', Date.parse('2026-09-04T22:01:00Z'));
+  assert.ok(bound > '2026-09-04T18:00:00+00:00',
+    'once 6 PM ET has passed the appointment no longer blocks');
+});
+
+test('EST: the bound shifts by five hours, not a hardcoded four', async () => {
+  // 2026-01-15 19:00Z is 2:00 PM EST.
+  const bound = await boundFor('appointment_date', Date.parse('2026-01-15T19:00:00Z'));
+  assert.equal(bound.slice(0, 19), '2026-01-15T14:00:00',
+    'EST resolves at -5, so the offset is read from the zone and not assumed');
+});
+
+test('the sale bound is built in the same frame as updated_at_lp', async () => {
+  // updated_at_lp is written through lpDateToEastern() and measured 4.01h
+  // skewed on 2026-09-04, so the 30-day cutoff must be shifted too.
+  const bound = await boundFor('updated_at_lp', Date.parse('2026-09-04T18:00:00Z'));
+  assert.equal(bound.slice(0, 19), '2026-08-05T14:00:00',
+    '30 days before 2 PM ET, expressed in the stored frame');
+});
+
+test('both bounds carry the +00:00 tag the stored column uses', async () => {
+  const appt = await boundFor('appointment_date', Date.parse('2026-09-04T18:00:00Z'));
+  const sale = await boundFor('updated_at_lp', Date.parse('2026-09-04T18:00:00Z'));
+  // A bare 'Z' would still compare correctly in Postgres, but the tag is what
+  // makes the frame legible to anyone reading a query log next to a stored row.
+  assert.ok(appt.endsWith('+00:00'), 'appointment bound is tagged +00:00');
+  assert.ok(sale.endsWith('+00:00'), 'sale bound is tagged +00:00');
+});

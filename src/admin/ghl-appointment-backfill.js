@@ -32,6 +32,7 @@
 import supabase from '../supabase.js';
 import { reconcileLpAppointmentToGhl } from '../services/lp-ghl-appointment-reconciler.js';
 import { lpWallClockToGhlStartTime, appointmentDelta } from '../appointment-dates.js';
+import { utcToLpStoredIso } from '../lp-dates.js';
 
 const DISPOSITIONS = ['Set', 'Cnf', 'CXL', 'Verif'];
 const DEFAULT_HORIZON_DAYS = 14;
@@ -52,8 +53,10 @@ function generateJobId() {
 export async function scanBackfillCandidates({ horizonDays = DEFAULT_HORIZON_DAYS, contactId = null, limit = 0 } = {}) {
   if (!supabase) throw new Error('Supabase not configured');
 
-  const fromIso = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-  const toIso = new Date(Date.now() + (horizonDays + 1) * 24 * 3600 * 1000).toISOString();
+  // Bounds in the stored ET-wall-clock frame; appointment_date holds ET
+  // digits tagged +00:00. See src/lp-dates.js.
+  const fromIso = utcToLpStoredIso(Date.now() - 24 * 3600 * 1000);
+  const toIso = utcToLpStoredIso(Date.now() + (horizonDays + 1) * 24 * 3600 * 1000);
 
   const PAGE = 1000;
   const rows = [];
