@@ -29,8 +29,13 @@ import {
 import {
   classifyRun,
   shouldNotify,
+  notifyBackstopRun,
   __resetCooldowns,
 } from '../src/services/backstop-notify.js';
+import { __setAlertStateClientForTests } from '../src/alert-state.js';
+import { mockAlertConditions } from './fixtures/alert-conditions-mock.js';
+
+process.env.LP_BACKSTOP_INSIGHT = 'off';
 
 /** Minimal Supabase stand-in capturing inserts per table. */
 function makeDb({ failWith = null } = {}) {
@@ -224,14 +229,27 @@ test('(C1) N failing leads in one run are ONE aggregate signal, not N', async ()
 test('(C2) N consecutive failing RUNS are debounced to one card per sweep mode', async () => {
   // The drain shape: a sweep every 15 min, each failing. Without debouncing
   // that is a card every 15 min for the length of the drain (#291).
+  //
+  // 2026-09-05: the debounce moved from an elapsed-time cooldown inside
+  // shouldNotify to a durable condition row (PR #845 follow-on), so this now
+  // drives the real notify path rather than the gate alone. The property under
+  // test is unchanged, and is in fact stronger — the old cooldown re-announced
+  // once it lapsed, however long the drain ran.
+  __setAlertStateClientForTests(mockAlertConditions());
   __resetCooldowns();
-  let cards = 0;
+  const sent = [];
+  const send = async (text) => { sent.push(text); return { sent: true }; };
+
   for (let run = 0; run < 12; run++) {
     const { severity } = classifyRun({ counts: { error: 8 }, scan: { processed: 25 } });
     assert.equal(severity, 'failing');
-    if (shouldNotify({ severity, sweepMode: 'intake' }).send) cards++;
+    await notifyBackstopRun({
+      sweepMode: 'intake', counts: { error: 8 }, scan: { processed: 25 }, send,
+    });
   }
-  assert.equal(cards, 1, '12 failing runs → 1 card, not 12');
+  assert.equal(sent.length, 1, '12 failing runs → 1 card, not 12');
+
+  __setAlertStateClientForTests(null);
   __resetCooldowns();
 });
 

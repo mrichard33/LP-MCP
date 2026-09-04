@@ -26,11 +26,41 @@ import {
   classifyRun,
   shouldNotify,
   buildBackstopCard,
+  notifyBackstopRun,
+  notifyBackstopFailure,
   __resetCooldowns,
   MAX_DETAIL_LEADS,
 } from '../src/services/backstop-notify.js';
 import { cleanInsight, generateBackstopInsight, INSIGHT_CHAR_CAP, _internal } from '../src/services/backstop-insight.js';
 import { resolveLLM, FUNCTION_GROUPS } from '../src/llm-client.js';
+import { __setAlertStateClientForTests } from '../src/alert-state.js';
+import { mockAlertConditions } from './fixtures/alert-conditions-mock.js';
+
+// No live model calls anywhere in this file.
+process.env.LP_BACKSTOP_INSIGHT = 'off';
+
+/**
+ * Binds the alert layer to an in-memory alert_conditions table and captures
+ * what would have gone to GroupMe. Pass an existing `rows` Map to model a
+ * REDEPLOY: fresh process state, same durable table.
+ *
+ * The send is injected rather than stubbed on the module — ES module bindings
+ * are read-only, so notifyBackstopRun/Failure take a `send` for exactly this.
+ */
+function backstopHarness({ rows = new Map() } = {}) {
+  const sent = [];
+  __setAlertStateClientForTests(mockAlertConditions(rows));
+  __resetCooldowns();
+  return {
+    sent,
+    rows,
+    send: async (text) => { sent.push(text); return { sent: true }; },
+    restore() {
+      __setAlertStateClientForTests(null);
+      __resetCooldowns();
+    },
+  };
+}
 
 const lead = (over = {}) => ({
   action: 'created',
@@ -146,72 +176,156 @@ test('(7) LP_BACKSTOP_NOTIFY_MODE=off silences every severity', () => {
   });
 });
 
-test('(8) backlog alerts are cooled down — second consecutive degraded is suppressed', () => {
-  __resetCooldowns();
+// 2026-09-05 (follow-on to PR #845). shouldNotify used to MUTATE a cooldown Map
+// as a side effect of being asked a question, and the tests below asserted that
+// side effect. That was the bug: a cooldown lapsing while the backlog was still
+// there re-announced it, and every redeploy wiped the Map and re-announced
+// everything at once. Debouncing now lives in alert_conditions, keyed on the
+// condition rather than on elapsed time, so these assert the two halves
+// separately — a pure policy gate, and a durable edge trigger.
+
+test('(8) shouldNotify is PURE — it answers the same way however often it is asked', () => {
   const first = shouldNotify({ severity: 'degraded', sweepMode: 'appointment' });
   assert.equal(first.send, true);
   assert.equal(first.reason, 'backlog_pressure');
+  assert.equal(first.kind, 'backlog', 'names the condition row the caller reports against');
 
-  const second = shouldNotify({ severity: 'degraded', sweepMode: 'appointment' });
-  assert.equal(second.send, false, 'chronic backlog must not alert every sweep');
-  assert.equal(second.reason, 'backlog_cooldown');
-
-  // Cooldown is per sweep mode — intake is independent of appointment.
-  assert.equal(shouldNotify({ severity: 'degraded', sweepMode: 'intake' }).send, true);
-  __resetCooldowns();
-});
-
-// 2026-08-23 (#292/#291): failing runs used to bypass the cooldown outright.
-// A 95,702-lead drain sweeping every 15 min turns that into a card every 15 min
-// for the length of the drain. Debounced per sweep mode instead — safe now that
-// persistSweepErrors() writes every errored lead to lp_sync_errors, so a
-// suppressed card loses a notification, not the record.
-test('(9) failing runs are debounced per sweep mode — N failures, ONE card', () => {
-  __resetCooldowns();
-  const first = shouldNotify({ severity: 'failing', sweepMode: 'appointment' });
-  assert.equal(first.send, true);
-  assert.equal(first.reason, 'lead_error_rate');
-
-  // Nine more failing runs inside the window must produce no further cards.
-  for (let i = 0; i < 9; i++) {
-    const next = shouldNotify({ severity: 'failing', sweepMode: 'appointment' });
-    assert.equal(next.send, false, `failing run ${i + 2} must not re-alert inside the window`);
-    assert.equal(next.reason, 'error_cooldown');
+  // Ten more asks must not change the answer. The old gate said "no" from the
+  // second call onward, which is why callers could never ask twice.
+  for (let i = 0; i < 10; i++) {
+    assert.deepEqual(shouldNotify({ severity: 'degraded', sweepMode: 'appointment' }), first);
   }
-
-  // Independent per sweep mode — an intake failure is its own signal.
-  assert.equal(shouldNotify({ severity: 'failing', sweepMode: 'intake' }).send, true);
-  __resetCooldowns();
+  assert.equal(shouldNotify({ severity: 'failing', sweepMode: 'appointment' }).kind, 'errors');
+  assert.equal(shouldNotify({ severity: 'healthy', sweepMode: 'appointment' }).kind, null);
 });
 
-test('(9b) a failing alert sends again once the error cooldown has elapsed', () => {
-  __resetCooldowns();
-  const t0 = 1_000_000_000;
-  assert.equal(shouldNotify({ severity: 'failing', sweepMode: 'intake', nowMs: t0 }).send, true);
-  // 60 min default → still suppressed at +59 min, sends again at +61.
-  assert.equal(shouldNotify({ severity: 'failing', sweepMode: 'intake', nowMs: t0 + 59 * 60000 }).send, false);
-  assert.equal(shouldNotify({ severity: 'failing', sweepMode: 'intake', nowMs: t0 + 61 * 60000 }).send, true);
-  __resetCooldowns();
+test('(9) N consecutive failing runs produce ONE card', async () => {
+  const h = backstopHarness();
+  const run = () => notifyBackstopRun({
+    sweepMode: 'appointment', counts: { error: 9 }, scan: { processed: 10 }, send: h.send,
+  });
+
+  const first = await run();
+  assert.equal(first.sent, true, 'the first failing run must alert');
+  assert.equal(first.severity, 'failing');
+
+  // The #222 drain: a sweep every 15 minutes, each with the same failure shape.
+  for (let i = 0; i < 9; i++) {
+    const next = await run();
+    assert.equal(next.sent, false, `failing run ${i + 2} is the same ongoing condition`);
+  }
+  assert.equal(h.sent.length, 1, 'one continuous failure is one card');
+
+  // A different sweep mode is a different condition and alerts on its own.
+  const intake = await notifyBackstopRun({
+    sweepMode: 'intake', counts: { error: 9 }, scan: { processed: 10 }, send: h.send,
+  });
+  assert.equal(intake.sent, true);
+  assert.equal(h.sent.length, 2);
+  h.restore();
 });
 
-test('(9c) error and backlog cooldowns are independent keys', () => {
-  __resetCooldowns();
-  assert.equal(shouldNotify({ severity: 'failing', sweepMode: 'appointment' }).send, true);
+test('(9b) time passing does NOT re-announce, but a recovery-then-relapse does', async () => {
+  const h = backstopHarness();
+  const failing = () => notifyBackstopRun({
+    sweepMode: 'intake', counts: { error: 9 }, scan: { processed: 10 }, send: h.send,
+  });
+
+  assert.equal((await failing()).sent, true);
+  // Six hours of the same failure — far past the old 60-minute error cooldown,
+  // which is exactly when the old code re-announced. It must stay silent.
+  for (let i = 0; i < 24; i++) assert.equal((await failing()).sent, false);
+  assert.equal(h.sent.length, 1);
+
+  // A clean run is the resolving edge; the next failure is a NEW incident.
+  const healthy = await notifyBackstopRun({
+    sweepMode: 'intake', counts: {}, scan: { processed: 10 }, send: h.send,
+  });
+  assert.equal(healthy.sent, false, 'a clean run is silent');
+  assert.equal((await failing()).sent, true, 'a relapse after a recovery is a new incident');
+  assert.equal(h.sent.length, 2);
+  h.restore();
+});
+
+test('(9c) error and backlog are independent conditions', async () => {
+  const h = backstopHarness();
+  assert.equal((await notifyBackstopRun({
+    sweepMode: 'appointment', counts: { error: 9 }, scan: { processed: 10 }, send: h.send,
+  })).sent, true);
   // A failing alert must not consume the backlog budget for the same mode.
-  const backlog = shouldNotify({ severity: 'degraded', sweepMode: 'appointment' });
-  assert.equal(backlog.send, true);
-  assert.equal(backlog.reason, 'backlog_pressure');
-  __resetCooldowns();
+  const backlog = await notifyBackstopRun({
+    sweepMode: 'appointment', counts: {}, scan: { processed: 10, deferredCapped: 5 }, send: h.send,
+  });
+  assert.equal(backlog.sent, true);
+  assert.equal(backlog.severity, 'degraded');
+  h.restore();
 });
 
-test('(10) a backlog alert sends again once the cooldown has elapsed', () => {
-  __resetCooldowns();
-  const t0 = 1_000_000_000;
-  assert.equal(shouldNotify({ severity: 'degraded', sweepMode: 'intake', nowMs: t0 }).send, true);
-  // 240 min default → still suppressed at +239 min, sends at +241.
-  assert.equal(shouldNotify({ severity: 'degraded', sweepMode: 'intake', nowMs: t0 + 239 * 60000 }).send, false);
-  assert.equal(shouldNotify({ severity: 'degraded', sweepMode: 'intake', nowMs: t0 + 241 * 60000 }).send, true);
-  __resetCooldowns();
+test('(10) a chronic backlog is one card, and a redeploy does not re-announce it', async () => {
+  const rows = new Map();
+  const h = backstopHarness({ rows });
+  const degraded = (send) => notifyBackstopRun({
+    sweepMode: 'intake', counts: {}, scan: { processed: 10, deferredCapped: 5 }, send,
+  });
+
+  assert.equal((await degraded(h.send)).sent, true);
+  for (let i = 0; i < 20; i++) assert.equal((await degraded(h.send)).sent, false);
+  assert.equal(h.sent.length, 1);
+  h.restore();
+
+  // A redeploy: fresh process state, same table. The condition is still open,
+  // so it must stay silent rather than announcing itself all over again.
+  const after = backstopHarness({ rows });
+  assert.equal((await degraded(after.send)).sent, false, 'a restart must not re-announce a live condition');
+  assert.equal(after.sent.length, 0);
+  after.restore();
+});
+
+test('(10b) LP_BACKSTOP_NOTIFY_MODE=off INHIBITS — it must not clear open conditions', async () => {
+  const h = backstopHarness();
+  const failing = (send) => notifyBackstopRun({
+    sweepMode: 'intake', counts: { error: 9 }, scan: { processed: 10 }, send,
+  });
+  assert.equal((await failing(h.send)).sent, true);
+
+  // Turning notifications off is not a statement that the sweep got healthy.
+  // Treating it as one would resolve every open condition here and re-announce
+  // all of them the moment somebody turned notifications back on.
+  //
+  // withEnv is synchronous — it would restore the variable at the first await —
+  // so this sets and restores around the awaits itself.
+  const prev = process.env.LP_BACKSTOP_NOTIFY_MODE;
+  process.env.LP_BACKSTOP_NOTIFY_MODE = 'off';
+  try {
+    for (let i = 0; i < 3; i++) {
+      assert.equal((await failing(h.send)).sent, false, 'off means silent');
+    }
+  } finally {
+    if (prev === undefined) delete process.env.LP_BACKSTOP_NOTIFY_MODE;
+    else process.env.LP_BACKSTOP_NOTIFY_MODE = prev;
+  }
+  assert.equal(h.rows.get('backstop:intake:errors').state, 'firing',
+    'an inhibited sweep must not resolve a live condition');
+
+  assert.equal((await failing(h.send)).sent, false, 'still the same incident once alerts come back');
+  assert.equal(h.sent.length, 1);
+  h.restore();
+});
+
+test('(11) a sweep that never completes alerts once per outage, whatever the error text', async () => {
+  const h = backstopHarness();
+  assert.equal((await notifyBackstopFailure({ sweepMode: 'intake', error: new Error('ETIMEDOUT'), send: h.send })).sent, true);
+  // A crash loop reporting a DIFFERENT message each cycle is still ONE outage.
+  // Keying on the text is what made one dead campaign read as three problems.
+  assert.equal((await notifyBackstopFailure({ sweepMode: 'intake', error: new Error('ECONNRESET'), send: h.send })).sent, false);
+  assert.equal((await notifyBackstopFailure({ sweepMode: 'intake', error: new Error('502 Bad Gateway'), send: h.send })).sent, false);
+  assert.equal(h.sent.length, 1);
+
+  // A sweep that runs to completion is the only evidence the loop has ended.
+  await notifyBackstopRun({ sweepMode: 'intake', counts: {}, scan: { processed: 10 }, send: h.send });
+  assert.equal((await notifyBackstopFailure({ sweepMode: 'intake', error: new Error('ETIMEDOUT'), send: h.send })).sent, true);
+  assert.equal(h.sent.length, 2);
+  h.restore();
 });
 
 // ─── §B1 summarizeSources ────────────────────────────────────────────
