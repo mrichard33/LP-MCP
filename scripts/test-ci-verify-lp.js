@@ -172,8 +172,11 @@ function fakeDb(seed = []) {
 
 test('THE FIX: a successful LP write records sent_unconfirmed, not synced', async () => {
   const db = fakeDb();
+  // now: NOW — without it syncToLp's 24h note-age gate skips the write once the
+  // fixture ages, and this asserts nothing. The rest of the file already pins
+  // the same clock; these two call sites were the ones that missed it.
   const r = await syncToLp(CALL, SUMMARY, MATCH, {
-    db, cfg: LIVE_LP, lpClient: { addNote: async () => 'UPDATED SUCCESSFULLY!' },
+    db, cfg: LIVE_LP, lpClient: { addNote: async () => 'UPDATED SUCCESSFULLY!' }, now: NOW,
   });
   assert.equal(r.sent, true);
   assert.equal(r.confirmed, false);
@@ -193,7 +196,7 @@ test('the write site no longer calls markSynced for LP at all', () => {
 test('a failed LP write is still a failure, not an unconfirmed one', async () => {
   const db = fakeDb();
   const r = await syncToLp(CALL, SUMMARY, MATCH, {
-    db, cfg: LIVE_LP, lpClient: { addNote: async () => { throw new Error('HTTP 500'); } },
+    db, cfg: LIVE_LP, lpClient: { addNote: async () => { throw new Error('HTTP 500'); } }, now: NOW,
   });
   assert.equal(r.failed, true);
   assert.notEqual(db.row().status, UNCONFIRMED);

@@ -21,3 +21,32 @@ jobs:
           echo "Checking src/**/*.js ..."
           find src -name '*.js' -print0 | xargs -0 -P4 -n1 node --check
           echo "All source files parsed OK."
+
+  # Runs `npm test` — the node:test suites under scripts/. Until this commit the
+  # only CI was the syntax parse above, so 3,500+ assertions ran nowhere but on
+  # a contributor's laptop, and a PR could be "green" while the suite was broken.
+  #
+  # ─────────────────────────────────────────────────────────────────────────
+  # MERGE ORDER: this job BLOCKS. It must not land before the PR that repairs
+  # the 23 assertions that were failing on main as of 2026-09-04
+  # (fix/ci-test-time-bombs — a dropped `now` in stageSync plus fixtures that
+  # aged past the 24h note-age gate). Merging this first turns every PR in the
+  # repo red. Sequence: fixes first, this second.
+  # ─────────────────────────────────────────────────────────────────────────
+  #
+  # With those fixed the suite is 3544 tests / 3535 pass / 0 fail / 9 skipped,
+  # so this gates honestly. If it ever goes red, fix the code or the test — do
+  # NOT restore continue-on-error, and do not skip or quarantine a failure. A
+  # suppressed test is worse than an ungated one, because it reads as green.
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Run the test suite (node --test scripts/test-*.js)
+        run: npm test

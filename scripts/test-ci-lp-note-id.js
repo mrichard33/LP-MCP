@@ -44,7 +44,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { syncToLp, shapeOf, ACK_TEMPLATE_MAX } from '../src/ci/sync.js';
+import { syncToLp as syncToLpAt, shapeOf, ACK_TEMPLATE_MAX } from '../src/ci/sync.js';
 import { extractNoteId } from '../src/ghl-note-pipeline/lp-write.js';
 import { parseConfig } from '../src/ci/config.js';
 
@@ -61,6 +61,13 @@ const CALL = {
   agent_name: 'John Manieri',
   team: 'reece',
 };
+
+// The clock is pinned to the fixture — see the long note in test-ci-sync.js.
+// Without it the 24h note-age gate skips the write, so the LP ack this file
+// exists to pin is never even requested. Derived from CALL; `...o` last so an
+// individual test can still override it.
+const NOW = new Date(Date.parse(CALL.call_start) + 60 * 60 * 1000);
+const syncToLp = (c, s, m, o = {}) => syncToLpAt(c, s, m, { now: NOW, ...o });
 
 const SUMMARY = {
   output: {
@@ -161,7 +168,9 @@ test('the write site runs no extractor over the LP response any more', () => {
   // A permanent no-op that reads like a capability is worse than an honest
   // absence — the next reader would assume external_ref is sometimes populated
   // at the write site and build on it.
-  const src = syncToLp.toString();
+  // syncToLpAt, not the pinned-clock wrapper above — this reads the real
+  // function's source, and the wrapper's body is three lines of test scaffolding.
+  const src = syncToLpAt.toString();
   assert.equal(/extractLpNoteId|idFromAck/.test(src), false,
     'LP note-id extraction was removed once LP was proven to return no id');
 });
@@ -171,7 +180,7 @@ test('the id DOES exist, and the read-back is the only thing allowed to record i
   // GetLead carries it, so external_ref is finally populated with something
   // true — by verify.js, after it has SEEN the note. The write site must never
   // set it, because at that point it has no id and no proof.
-  const src = syncToLp.toString();
+  const src = syncToLpAt.toString();   // the real function, not the wrapper
   assert.match(src, /markSentUnconfirmed/, 'the write records sent, not delivered');
   assert.equal(/markSynced\(/.test(src), false, 'only the read-back may mark an LP note synced');
 });

@@ -46,7 +46,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { composeNote, formatOutcomeSegment } from '../src/ci/notes.js';
-import { stageAnalyze, stageSync } from '../src/ci/worker.js';
+import { stageAnalyze, stageSync as stageSyncAt } from '../src/ci/worker.js';
 import {
   DEFER_REVIEW_UNTIL_SYNCED,
   NON_BLOCKING_REVIEW_FLAGS,
@@ -74,6 +74,15 @@ const CALL = {
   attempts: 0,
   pending_review_reason: null,
 };
+
+// The clock is pinned to the fixture — see the long note in test-ci-sync.js.
+// stageSync threads `now` down to syncToLp/syncToGhl, whose note-age gate
+// defaults to 24h; with a real `now` the LP write is skipped as `call_too_old`,
+// so "a sync FAILURE is recorded as one" saw no failure at all and read back
+// the call's original pending_review_reason instead. Derived from CALL; `...o`
+// last so an individual test can still override it.
+const NOW = new Date(Date.parse(CALL.call_start) + 60 * 60 * 1000);
+const stageSync = (c, o = {}) => stageSyncAt(c, { now: NOW, ...o });
 
 /** A minimal valid §7 output. */
 function validAnalysis(over = {}) {
