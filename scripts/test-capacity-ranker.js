@@ -32,6 +32,9 @@ import {
   resolveSwapMargin,
   cycleEnabled,
   withinCycleWindow,
+  withinWatchdogWindow,
+  decideWatchdogAlerts,
+  checkCampaignState,
   addDays,
   MissingTableError,
 } from '../src/routes/capacityRanker.js';
@@ -936,6 +939,137 @@ test('withinCycleWindow: honours America/New_York in winter too (EST, UTC-5)', (
   assert.equal(withinCycleWindow(new Date('2026-01-15T13:00:00Z')), true, '08:00 EST');
   assert.equal(withinCycleWindow(new Date('2026-01-15T12:59:00Z')), false, '07:59 EST');
   assert.equal(withinCycleWindow(new Date('2026-01-16T01:31:00Z')), false, '20:31 EST');
+});
+
+// ─── Campaign watchdog (LP-MCP sends the alert; n8n only polls) ──────────────
+//
+// The alert lives here because GROUPME_BOT_ID is set on LP-MCP and on NEITHER
+// n8n service. The first cut had n8n read $env.GROUPME_BOT_ID, which posted
+// with no bot id and was rejected — silently, since the node continues on
+// error. A watchdog that reports healthy while the floor is dark is the exact
+// failure it exists to catch, so these tests pin the alert to this side.
+
+function watchdogFake({ states = { hot: 'RUNNING', warm: 'RUNNING' }, throwFor = null, sendThrows = false } = {}) {
+  const sent = [];
+  const lastAlert = new Map();
+  return {
+    sent,
+    lastAlert,
+    deps: {
+      lastAlert,
+      log: () => {},
+      inWindow: () => true,
+      getOutbound: async (name) => {
+        if (throwFor && name === throwFor) throw new Error('Five9 getOutboundCampaign fault');
+        const tier = name === CAMPAIGNS.hot ? 'hot' : 'warm';
+        return { name, state: states[tier], lists: [] };
+      },
+      sendAlert: async (text) => {
+        if (sendThrows) throw new Error('GroupMe 400');
+        sent.push(text);
+      },
+    },
+  };
+}
+
+test('WATCHDOG: both RUNNING → 200, nothing sent', async () => {
+  const f = watchdogFake();
+  const { status, body } = await checkCampaignState(f.deps);
+  assert.equal(status, 200);
+  assert.equal(body.all_running, true);
+  assert.deepEqual(f.sent, [], 'a healthy floor pages nobody');
+  assert.deepEqual(body.alerted, []);
+});
+
+test('WATCHDOG: a stopped campaign → 503 AND the GroupMe alert goes out from LP-MCP', async () => {
+  const f = watchdogFake({ states: { hot: 'RUNNING', warm: 'NOT_RUNNING' } });
+  const { status, body } = await checkCampaignState(f.deps);
+  assert.equal(status, 503);
+  assert.equal(body.all_running, false);
+  assert.equal(f.sent.length, 1);
+  assert.match(f.sent[0], /CAPACITY RANKER: Data - Warm Leads less than 30 is NOT_RUNNING during dial hours/);
+  assert.match(f.sent[0], /Check Five9 now/);
+  assert.deepEqual(body.alerted, [CAMPAIGNS.warm]);
+  assert.ok(!f.sent.some((t) => t.includes(CAMPAIGNS.hot)), 'the healthy campaign is not named');
+});
+
+test('WATCHDOG: an unreadable campaign alerts too — "cannot confirm" is not "fine"', async () => {
+  const f = watchdogFake({ throwFor: CAMPAIGNS.hot });
+  const { status, body } = await checkCampaignState(f.deps);
+  assert.equal(status, 503);
+  assert.match(f.sent[0], /Data - Hot Leads less than 7 is UNREADABLE during dial hours/);
+  assert.equal(body.campaigns.find((c) => c.campaign === CAMPAIGNS.hot).state, null);
+});
+
+test('WATCHDOG: both down → both named, one message each', async () => {
+  const f = watchdogFake({ states: { hot: 'NOT_RUNNING', warm: 'NOT_RUNNING' } });
+  const { body } = await checkCampaignState(f.deps);
+  assert.equal(f.sent.length, 2);
+  assert.deepEqual(body.alerted, [CAMPAIGNS.hot, CAMPAIGNS.warm]);
+});
+
+test('WATCHDOG: suppression holds for 30 min, then re-alerts', async () => {
+  const f = watchdogFake({ states: { hot: 'RUNNING', warm: 'NOT_RUNNING' } });
+  const t0 = new Date('2026-09-03T16:00:00Z');
+  await checkCampaignState({ ...f.deps, now: t0 });
+  await checkCampaignState({ ...f.deps, now: new Date(t0.getTime() + 5 * 60000) });
+  await checkCampaignState({ ...f.deps, now: new Date(t0.getTime() + 29 * 60000) });
+  assert.equal(f.sent.length, 1, 'still inside the 30-minute window');
+  await checkCampaignState({ ...f.deps, now: new Date(t0.getTime() + 31 * 60000) });
+  assert.equal(f.sent.length, 2, 'still down after 30 minutes — say so again');
+});
+
+test('WATCHDOG: recovery clears suppression, so the NEXT outage alerts immediately', async () => {
+  const f = watchdogFake({ states: { hot: 'RUNNING', warm: 'NOT_RUNNING' } });
+  const t0 = new Date('2026-09-03T16:00:00Z');
+  await checkCampaignState({ ...f.deps, now: t0 });
+  assert.equal(f.sent.length, 1);
+  const healthy = watchdogFake();
+  await checkCampaignState({ ...healthy.deps, lastAlert: f.lastAlert, now: new Date(t0.getTime() + 60000) });
+  assert.equal(f.lastAlert.size, 0, 'a RUNNING read forgets the earlier alert');
+  await checkCampaignState({ ...f.deps, now: new Date(t0.getTime() + 120000) });
+  assert.equal(f.sent.length, 2, 'a fresh outage two minutes later is not suppressed');
+});
+
+test('WATCHDOG: outside the window → still 503, but nobody is paged at 3am', async () => {
+  const f = watchdogFake({ states: { hot: 'RUNNING', warm: 'NOT_RUNNING' } });
+  const { status, body } = await checkCampaignState({ ...f.deps, inWindow: () => false });
+  assert.equal(status, 503, 'the state is still reported honestly');
+  assert.equal(body.alert_window_open, false);
+  assert.deepEqual(f.sent, []);
+  assert.deepEqual(body.alerted, []);
+});
+
+test('WATCHDOG: a GroupMe send failure does not take the route down, and is not reported as alerted', async () => {
+  const f = watchdogFake({ states: { hot: 'RUNNING', warm: 'NOT_RUNNING' }, sendThrows: true });
+  const { status, body } = await checkCampaignState(f.deps);
+  assert.equal(status, 503);
+  assert.deepEqual(body.alerted, [], 'never claim an alert that did not go out');
+});
+
+test('decideWatchdogAlerts: pure — suppression is per campaign, not global', () => {
+  const lastAlert = new Map();
+  const rows = [
+    { campaign: CAMPAIGNS.hot, state: 'NOT_RUNNING', ok: false },
+    { campaign: CAMPAIGNS.warm, state: 'RUNNING', ok: true },
+  ];
+  assert.equal(decideWatchdogAlerts(rows, { now: 0, lastAlert }).length, 1);
+  assert.equal(decideWatchdogAlerts(rows, { now: 60000, lastAlert }).length, 0, 'hot is suppressed');
+  const warmDown = [
+    { campaign: CAMPAIGNS.hot, state: 'NOT_RUNNING', ok: false },
+    { campaign: CAMPAIGNS.warm, state: 'NOT_RUNNING', ok: false },
+  ];
+  const out = decideWatchdogAlerts(warmDown, { now: 120000, lastAlert });
+  assert.deepEqual(out.map((a) => a.campaign), [CAMPAIGNS.warm], 'warm is new, hot is still suppressed');
+});
+
+test('withinWatchdogWindow: 08:00–21:00 ET Mon–Sat, never Sunday', () => {
+  assert.equal(withinWatchdogWindow(new Date('2026-09-03T12:00:00Z')), true, 'Thu 08:00 ET');
+  assert.equal(withinWatchdogWindow(new Date('2026-09-03T11:59:00Z')), false, 'Thu 07:59 ET');
+  assert.equal(withinWatchdogWindow(new Date('2026-09-04T01:00:00Z')), true, 'Thu 21:00 ET');
+  assert.equal(withinWatchdogWindow(new Date('2026-09-04T01:01:00Z')), false, 'Thu 21:01 ET');
+  assert.equal(withinWatchdogWindow(new Date('2026-09-05T16:00:00Z')), true, 'Sat 12:00 ET');
+  assert.equal(withinWatchdogWindow(new Date('2026-09-06T16:00:00Z')), false, 'Sun 12:00 ET');
 });
 
 test('addDays: pure calendar arithmetic across a month boundary', () => {

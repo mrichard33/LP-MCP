@@ -23,9 +23,10 @@
  * window the cycle is skipped and a warning is logged. A campaign that fails
  * to restart forces applied=false and a 500 (restart_failures in the log row).
  *
- * GET /n8n/capacity-ranker/campaign-state — read-only, polled by the n8n
- * watchdog (OPS - Capacity Ranker Campaign Watchdog): 200 when both Data
- * campaigns read RUNNING, 503 otherwise.
+ * GET /n8n/capacity-ranker/campaign-state — polled by the n8n watchdog
+ * (OPS - Capacity Ranker Campaign Watchdog): 200 when both Data campaigns read
+ * RUNNING, 503 otherwise. It also SENDS the GroupMe alert when one is not,
+ * because the bot id lives here and not in n8n — see checkCampaignState.
  *
  * Body: { slot_date?: "YYYY-MM-DD" } — defaults to tomorrow, America/New_York.
  * No auth, matching the /n8n/* convention (n8n hourly cron is the caller).
@@ -43,6 +44,7 @@ import { getOutboundCampaign } from '../five9-admin.js';
 import {
   executeModifyCampaignLists, executeStartCampaign, executeStopCampaign, five9WritesEnabled,
 } from '../five9/admin-writes.js';
+import { sendGroupMeMessage } from '../groupme.js';
 import { rankMarkets, isMaterialChange, DEFAULT_SWAP_MARGIN, MARKET_CODES } from '../capacity/rankMarkets.js';
 import { applyDialPriority, CAMPAIGNS } from '../capacity/applyDialPriority.js';
 
@@ -259,6 +261,123 @@ export async function runCapacityRanker(input = {}, deps = {}) {
   };
 }
 
+/* ─── Campaign watchdog ──────────────────────────────────────────────────── *
+ *
+ * The alert is sent HERE, not by n8n. GROUPME_BOT_ID lives on LP-MCP and not
+ * on either n8n service, and n8n runs with N8N_BLOCK_ENV_ACCESS_IN_NODE set,
+ * so a workflow reading $env.GROUPME_BOT_ID posted with no bot id and GroupMe
+ * rejected it — silently, because the node continues on error. A watchdog that
+ * fails quietly is worse than none: it reports healthy while the floor is dark.
+ * LP-MCP already holds the bot id and already sends GroupMe alerts from half a
+ * dozen jobs, so the alert belongs on this side and n8n only has to poll.
+ *
+ * The n8n workflow's active state is the on switch: nothing calls this route
+ * until Mark activates it, so no alert can fire before then.
+ *
+ * RESIDUAL GAP, on purpose: if LP-MCP itself is down or this route throws,
+ * nobody is paged — the poller cannot alert without the bot id. That failure
+ * surfaces as a failed n8n execution instead. Closing it would mean putting the
+ * bot id in n8n after all, which is the thing that did not work.
+ */
+
+const WATCHDOG_SUPPRESS_MS = 30 * 60 * 1000;
+
+/** Process-local. A restart re-arms every alert, which is the safe direction. */
+const watchdogLastAlert = new Map();
+
+/** Dial hours for the watchdog: 08:00–21:00 ET, Mon–Sat. A stopped campaign at
+ *  02:00 on a Sunday is not an emergency and must not page anyone. */
+export function withinWatchdogWindow(now = new Date()) {
+  const day = new Intl.DateTimeFormat('en-US', { timeZone: TIMEZONE, weekday: 'short' }).format(now);
+  if (day === 'Sun') return false;
+  const hhmm = new Intl.DateTimeFormat('en-GB', {
+    timeZone: TIMEZONE, hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(now);
+  return hhmm >= '08:00' && hhmm <= '21:00';
+}
+
+/**
+ * Which campaigns to alert about right now. Pure; mutates only the map handed
+ * to it, so the suppression clock is testable without waiting 30 minutes.
+ * A campaign reading RUNNING clears its own suppression, so the next outage
+ * alerts immediately rather than inheriting the previous one's silence.
+ */
+export function decideWatchdogAlerts(campaigns, { now = Date.now(), lastAlert = new Map(), suppressMs = WATCHDOG_SUPPRESS_MS } = {}) {
+  const alerts = [];
+  for (const c of campaigns || []) {
+    if (c.ok) { lastAlert.delete(c.campaign); continue; }
+    const prev = lastAlert.get(c.campaign);
+    if (prev !== undefined && now - prev < suppressMs) continue;
+    lastAlert.set(c.campaign, now);
+    const state = c.state ? String(c.state).toUpperCase() : 'UNREADABLE';
+    alerts.push({
+      campaign: c.campaign,
+      state,
+      text: `⚠ CAPACITY RANKER: ${c.campaign} is ${state} during dial hours — floor is not dialing it. Check Five9 now.`,
+    });
+  }
+  return alerts;
+}
+
+/**
+ * Read both Data campaigns, alert on anything not RUNNING, and report.
+ * 200 when both are RUNNING, 503 otherwise.
+ *
+ * noDedup on the send is deliberate: groupme.js content-dedups identical text
+ * for 60 minutes by default, which would silently override the 30-minute
+ * re-alert this watchdog promises. Suppression is owned here so the interval
+ * is exactly what is documented.
+ */
+export async function checkCampaignState(deps = {}) {
+  const {
+    getOutbound = getOutboundCampaign,
+    sendAlert = (text) => sendGroupMeMessage(text, { noDedup: true }),
+    inWindow = withinWatchdogWindow,
+    lastAlert = watchdogLastAlert,
+    now = new Date(),
+    log = console.log,
+  } = deps;
+
+  const campaigns = await Promise.all([CAMPAIGNS.hot, CAMPAIGNS.warm].map(async (name) => {
+    const c = await getOutbound(name).catch(() => null);
+    return { campaign: name, state: c?.state ?? null, ok: String(c?.state || '').toUpperCase() === 'RUNNING' };
+  }));
+  const allRunning = campaigns.every((s) => s.ok);
+  const windowOpen = inWindow(now);
+  const alerted = [];
+
+  // A healthy read clears that campaign's suppression, so the next outage is
+  // never silenced by the previous one. This runs on EVERY check, including the
+  // all-clear ones that never reach the alert path below.
+  for (const c of campaigns) if (c.ok) lastAlert.delete(c.campaign);
+
+  if (!allRunning && windowOpen) {
+    for (const a of decideWatchdogAlerts(campaigns, { now: now.getTime(), lastAlert })) {
+      log(`[CapacityRanker] WATCHDOG ${a.text}`);
+      try {
+        await sendAlert(a.text);
+        alerted.push(a.campaign);
+      } catch (err) {
+        // The alert is the whole point, so a failure to send is itself loud.
+        log(`[CapacityRanker] WATCHDOG could not send the GroupMe alert for ${a.campaign}: ${err.message}`);
+      }
+    }
+  } else if (!allRunning) {
+    log(`[CapacityRanker] WATCHDOG ${campaigns.filter((c) => !c.ok).map((c) => c.campaign).join(', ')} not RUNNING, but outside 08:00–21:00 ET Mon–Sat — not alerting`);
+  }
+
+  return {
+    status: allRunning ? 200 : 503,
+    body: {
+      all_running: allRunning,
+      checked_at: now.toISOString(),
+      campaigns,
+      alert_window_open: windowOpen,
+      alerted,
+    },
+  };
+}
+
 export function registerCapacityRankerRoutes(app) {
   // No auth — matches the /n8n/* surface (n8n hourly cron calls it).
   app.post('/n8n/capacity-ranker/run', async (req, res) => {
@@ -270,17 +389,13 @@ export function registerCapacityRankerRoutes(app) {
       res.status(err.status || 500).json({ error: err.message });
     }
   });
-  // Read-only. The n8n watchdog polls this every 5 minutes during dial hours
-  // and alerts if either Data campaign is not RUNNING. No auth (/n8n/*).
+  // The n8n watchdog polls this every 5 minutes during dial hours. It reads
+  // Five9 and, when a Data campaign is not RUNNING, sends the GroupMe alert
+  // ITSELF — see checkCampaignState. No auth (/n8n/*).
   app.get('/n8n/capacity-ranker/campaign-state', async (req, res) => {
     try {
-      const names = [CAMPAIGNS.hot, CAMPAIGNS.warm];
-      const states = await Promise.all(names.map(async (name) => {
-        const c = await getOutboundCampaign(name).catch(() => null);
-        return { campaign: name, state: c?.state ?? null, ok: String(c?.state || '').toUpperCase() === 'RUNNING' };
-      }));
-      const allRunning = states.every((s) => s.ok);
-      res.status(allRunning ? 200 : 503).json({ all_running: allRunning, checked_at: new Date().toISOString(), campaigns: states });
+      const { status, body } = await checkCampaignState();
+      res.status(status).json(body);
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
