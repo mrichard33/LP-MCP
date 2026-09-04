@@ -2022,6 +2022,9 @@ test('HEAL: IDEMPOTENT — a second call against an already RUNNING campaign is 
   assert.deepEqual(calls.starts, [], 'never starts what is already up');
   assert.deepEqual(body.already_running, [CAMPAIGNS.warm]);
   assert.equal(body.no_op, true);
+  assert.equal(body.outcome, 'noop', 'a sweep that started nothing did not HEAL anything');
+  assert.equal(body.log_id, null);
+  assert.deepEqual(calls.inserted, [], 'and it writes no row — the watchdog calls this every 5 minutes for as long as ANY campaign is down, and one junk row per poll buries the rows that matter');
   assert.deepEqual(calls.alerts, [], 'a healthy sweep every 5 minutes must not become a 5-minute alarm');
   assert.deepEqual(calls.healed, [], 'nothing to close out');
 });
