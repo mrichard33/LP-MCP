@@ -46,6 +46,7 @@
  */
 
 import supabase from './supabase.js';
+import { emitEvent } from './event-emitter.js';
 
 // Dispositions that prove a lead's appointment is still live on the books.
 const LIVE_APPOINTMENT_DISPOSITIONS = ['Set', 'Cnf'];
@@ -86,6 +87,34 @@ export async function findBlockingLiveLead(contact_id, logPrefix = 'DuplicateLea
   return findBlockingLiveLeadWith(supabase, contact_id, logPrefix);
 }
 
+const BLOCKING_SELECT =
+  'lp_lead_id, lead_source_detail, disposition_code, appointment_set, appointment_date, updated_at_lp';
+
+/**
+ * A fail-open that nobody can see is indistinguishable from a guard that works.
+ * Every error path now emits duplicate_lead_guard_unavailable so the silence is
+ * countable. bypass_filter, no consuming rule — observability only, same stance
+ * as appointment.authority_denied.
+ */
+async function reportFailOpen(contact_id, logPrefix, stage, message, emit = emitEvent) {
+  console.warn(`[${logPrefix}] ${stage} failed for ${contact_id}: ${message} — FAILING OPEN`);
+  try {
+    await emit({
+      event_type: 'duplicate_lead_guard_unavailable',
+      event_subtype: stage,
+      source: 'duplicate_lead_guard',
+      entity_type: 'contact',
+      entity_id: String(contact_id),
+      ghl_contact_id: String(contact_id),
+      priority: 'high',
+      bypass_filter: true,
+      payload: { contact_id: String(contact_id), stage, call_site: logPrefix, error: String(message).slice(0, 300) },
+    });
+  } catch (err) {
+    console.warn(`[${logPrefix}] fail-open event emit failed: ${err.message}`);
+  }
+}
+
 /**
  * Same predicate against an injected client. Exported so the fail-open
  * contract can be asserted directly in scripts/test-duplicate-lead-guard.js —
@@ -95,36 +124,77 @@ export async function findBlockingLiveLead(contact_id, logPrefix = 'DuplicateLea
  * @param {object} client      a supabase-js-shaped client
  * @param {string} contact_id  GHL contact id
  * @param {string} [logPrefix]
+ * @param {object} [deps]      TEST SEAM ONLY — deps.emitEvent overrides the
+ *                             fail-open emitter so the test can assert that a
+ *                             fail-open is reported exactly once. Production
+ *                             callers pass three arguments and get emitEvent.
  * @returns {Promise<object|null>} blocking lp_leads row, or null to allow
  */
-export async function findBlockingLiveLeadWith(client, contact_id, logPrefix = 'DuplicateLeadGuard') {
+export async function findBlockingLiveLeadWith(client, contact_id, logPrefix = 'DuplicateLeadGuard', deps = {}) {
   if (!contact_id) return null;
 
-  try {
-    const nowIso = new Date().toISOString();
-    const saleCutoff = new Date(Date.now() - SALE_LOOKBACK_DAYS * 86400000).toISOString();
+  const emit = deps.emitEvent || emitEvent;
+  const nowIso = new Date().toISOString();
+  const saleCutoff = new Date(Date.now() - SALE_LOOKBACK_DAYS * 86400000).toISOString();
 
+  // TWO PLAIN QUERIES, NOT ONE .or() STRING. The previous single-call version
+  // built a PostgREST logical tree — `or(and(...,in.(Set,Cnf)),and(in.(Sale,
+  // Sold),...))` — and terminated it with .maybeSingle(). Both a parse failure
+  // in that nested string and maybeSingle()'s multiple-rows error land on the
+  // SAME silent `return null`, which is a pass. On 2026-09-03 contact
+  // eqjK58AwEZ1juYJH6szE had lead 572839 (Cnf, appointment 2026-09-04
+  // 10:00) matching clause (a) — the identical predicate in raw SQL returns
+  // that row — and BOTH call sites let the batch through: the rule
+  // GHL_APPT_CANCELLED_REBOOK_COLD queued 18 actions and the objection-state
+  // handler enrolled S5.2 Appointment Rescue on a live appointment. The guard's
+  // last suppression event was 2026-09-02 21:32.
+  //
+  // Simple .eq/.in/.gte filters and .limit(1) with an array result remove both
+  // hazards. Two round trips is the right price for a guard that decides
+  // whether a customer is told they cancelled.
+
+  // (a) another lead holds a live FUTURE appointment
+  try {
     const { data, error } = await client
       .from('lp_leads')
-      .select('lp_lead_id, lead_source_detail, disposition_code, appointment_set, appointment_date, updated_at_lp')
+      .select(BLOCKING_SELECT)
       .eq('ghl_contact_id', String(contact_id))
-      .or(
-        `and(appointment_set.eq.true,appointment_date.gte.${nowIso},disposition_code.in.(${LIVE_APPOINTMENT_DISPOSITIONS.join(',')})),` +
-        `and(disposition_code.in.(${SOLD_DISPOSITIONS.join(',')}),updated_at_lp.gte.${saleCutoff})`
-      )
+      .eq('appointment_set', true)
+      .in('disposition_code', LIVE_APPOINTMENT_DISPOSITIONS)
+      .gte('appointment_date', nowIso)
       .order('appointment_date', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
+      .limit(1);
     if (error) {
-      console.warn(`[${logPrefix}] query failed for ${contact_id}: ${error.message} — failing open`);
+      await reportFailOpen(contact_id, logPrefix, 'live_appointment_query', error.message, emit);
       return null;
     }
-    return data || null;
+    if (Array.isArray(data) && data.length > 0) return data[0];
   } catch (err) {
-    console.warn(`[${logPrefix}] threw for ${contact_id}: ${err.message} — failing open`);
+    await reportFailOpen(contact_id, logPrefix, 'live_appointment_query', err.message, emit);
     return null;
   }
+
+  // (b) another lead already bought inside the lookback
+  try {
+    const { data, error } = await client
+      .from('lp_leads')
+      .select(BLOCKING_SELECT)
+      .eq('ghl_contact_id', String(contact_id))
+      .in('disposition_code', SOLD_DISPOSITIONS)
+      .gte('updated_at_lp', saleCutoff)
+      .order('updated_at_lp', { ascending: false })
+      .limit(1);
+    if (error) {
+      await reportFailOpen(contact_id, logPrefix, 'recent_sale_query', error.message, emit);
+      return null;
+    }
+    if (Array.isArray(data) && data.length > 0) return data[0];
+  } catch (err) {
+    await reportFailOpen(contact_id, logPrefix, 'recent_sale_query', err.message, emit);
+    return null;
+  }
+
+  return null;
 }
 
 /**
