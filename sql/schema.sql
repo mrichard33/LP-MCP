@@ -183,10 +183,17 @@ CREATE TABLE IF NOT EXISTS lp_sync_log (
   entity_type     TEXT NOT NULL,                  -- leads, calls, notes, jobs, milestones, activities, dispositions, sources, ghl_backfill
   sync_type       TEXT NOT NULL DEFAULT 'full',   -- full, incremental, webhook_*
   status          TEXT NOT NULL DEFAULT 'running', -- running, completed, failed
-  records_synced  INTEGER DEFAULT 0,
+  records_synced  INTEGER DEFAULT 0,       -- rows WRITTEN
   error_message   TEXT,
   started_at      TIMESTAMPTZ DEFAULT now(),
-  completed_at    TIMESTAMPTZ
+  completed_at    TIMESTAMPTZ,
+  -- Paging telemetry. api_calls/paging_mode from 082, rows_scanned from 084.
+  -- Carried here so a fresh bootstrap matches production: syncLogTelemetry
+  -- writes all three, and against a table without them every write silently
+  -- no-ops inside its own try/catch.
+  api_calls       INTEGER,
+  paging_mode     TEXT,                    -- normal | deep (branch taken, never inferred)
+  rows_scanned    INTEGER                  -- rows FETCHED — what deep-offset triggers on
 );
 
 CREATE INDEX IF NOT EXISTS idx_sync_log_entity ON lp_sync_log(entity_type);
