@@ -747,31 +747,42 @@ export async function healCampaigns(deps = {}) {
   }
 
   const healedAt = now.toISOString();
-  const outcome = failed.length ? 'heal_failed' : 'healed';
+  // A sweep that started nothing did not "heal" anything. Saying so matters:
+  // the watchdog calls this every 5 minutes for as long as ANY campaign reads
+  // down, so a heal whose named campaign is already back reports noop on every
+  // one of those polls.
+  const acted = healed.length > 0 || failed.length > 0;
+  const outcome = failed.length ? 'heal_failed' : (healed.length ? 'healed' : 'noop');
   const summary = `heal: ${outcome} — healed=[${healed.join(', ')}] already_running=[${alreadyRunning.join(', ')}] failed=[${failed.map((f) => f.campaign).join(', ')}] (source dial_priority_log id ${source?.id ?? '?'})`;
   log(`[CapacityRanker] ${summary}`);
 
-  // The outcome row: a durable record that a heal ran and what it did. mode is
+  // The outcome row: a durable record that a heal DID something. mode is
   // 'heal' so these never mix with ranking runs, and ranking is [] because a
   // heal computes no ranking — it only restarts what a ranking run left dark.
+  //
+  // ONLY WHEN IT ACTED. The watchdog calls this every 5 minutes for as long as
+  // any campaign reads down, and a sweep that started nothing is not an event —
+  // logging it anyway buries the rows that matter under one junk row per poll.
   let logId = null;
-  try {
-    logId = await insertLog({
-      slot_date: todayET(now),
-      ranking: [],
-      unknown_markets: [],
-      changed: false,
-      applied: false,
-      mode: 'heal',
-      error_message: summary,
-      scoring_basis: 'heal',
-      cycled: false,
-      restart_failures: failed.length ? failed.map((f) => f.campaign) : null,
-      restart_attempts: null,
-      healed_at: healed.length ? healedAt : null,
-    });
-  } catch (err) {
-    log(`[CapacityRanker] WARN heal outcome row could not be written: ${err.message}`);
+  if (acted) {
+    try {
+      logId = await insertLog({
+        slot_date: todayET(now),
+        ranking: [],
+        unknown_markets: [],
+        changed: false,
+        applied: false,
+        mode: 'heal',
+        error_message: summary,
+        scoring_basis: 'heal',
+        cycled: false,
+        restart_failures: failed.length ? failed.map((f) => f.campaign) : null,
+        restart_attempts: null,
+        healed_at: healed.length ? healedAt : null,
+      });
+    } catch (err) {
+      log(`[CapacityRanker] WARN heal outcome row could not be written: ${err.message}`);
+    }
   }
 
   // Stamp the row that recorded the failure, so a later heal (and a human
@@ -786,7 +797,7 @@ export async function healCampaigns(deps = {}) {
 
   // Speak only when something actually happened. A no-op heal every five
   // minutes must not turn into a five-minute alarm.
-  if (healed.length || failed.length) {
+  if (acted) {
     const text = failed.length
       ? `🚨 CAPACITY RANKER HEAL FAILED: ${failed.map((f) => f.campaign).join(', ')} is STILL not RUNNING (${failed[0].error}). Start it in Five9 now.`
       : `✅ CAPACITY RANKER HEAL: restarted ${healed.join(', ')} — the floor is dialing ${healed.length > 1 ? 'them' : 'it'} again. Cycling stays disabled until Mark clears cycle_disabled_until.`;
@@ -804,7 +815,7 @@ export async function healCampaigns(deps = {}) {
       healed,
       already_running: alreadyRunning,
       failed,
-      no_op: healed.length === 0 && failed.length === 0,
+      no_op: !acted,
       source_log_id: source?.id ?? null,
       healed_at: healed.length ? healedAt : null,
       log_id: logId,
