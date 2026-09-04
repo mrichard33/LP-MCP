@@ -336,6 +336,26 @@ export async function computeGoalScorecard(opts = {}) {
   // freshness, not LP-API freshness. Auxiliary: a failure here must NOT abort the
   // LP-API write. Half-open range [start, nextDay(end)) covers the whole end day
   // whether created_at_lp is a date or a timestamp.
+  //
+  // ─── 2026-09-03 — LP wall-clock skew: THIS SITE IS ALREADY CORRECT ───
+  // created_at_lp is written through lpDateToEastern(), which tags ET
+  // wall-clock with +00:00 (see the READ SIDE block in src/lp-dates.js).
+  // A lead created 8:00 PM ET is stored as 2026-09-02T20:00:00+00:00, so the
+  // stored value's own date part IS the ET calendar day.
+  //
+  // periodStart / nextDay(periodEnd) are bare ET YYYY-MM-DD strings, which
+  // Postgres (session TimeZone = UTC) reads as midnight +00:00. Both sides of
+  // this comparison are therefore ET wall-clock in the same frame and the
+  // ~4h skew cancels exactly. Verified 2026-09-03 against live data: for
+  // 2026-09-02 the current bounds and (created_at_lp AT TIME ZONE 'UTC')::date
+  // both return 325 rows.
+  //
+  // DO NOT wrap these bounds in utcToLpStoredIso. That helper converts a
+  // TRUE-UTC instant into stored form; these bounds are not true-UTC instants,
+  // so it would shift them 4h earlier and pull in the previous ET evening —
+  // the same measurement returns 324 with shifted bounds. It would introduce
+  // the day-boundary bug, not remove it. The conversion belongs only where a
+  // bound really is a true-UTC instant (e.g. Date.now()-derived windows).
   let rawLeadsIn = null;
   try {
     const { count, error: cntErr } = await supabase

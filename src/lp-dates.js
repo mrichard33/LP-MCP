@@ -81,3 +81,87 @@ export function lpCreatedDate(prospect, lead, getField) {
   // Last resort: lead entrydate (date-only, midnight-zeroed)
   return lpDateToEastern(getField(lead, 'entrydate', 'EntryDate'));
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// READ SIDE — 2026-09-03
+//
+// The March 25 note above is wrong for the fields feeding created_at_lp.
+// Measured 2026-09-03 on rows synced minutes after creation:
+//   lp_leads  max(synced_at) - max(created_at_lp) = 4.54 h
+//   lp_notes  same shape                          = 4.03 h
+// and LP leads 572927/572928/572929 (contact eqjK58AwEZ1juYJH6szE) are
+// stored 19:57:45+00:00 while their own lp.disposition_changed events fired
+// at 23:59:48Z, two minutes after real creation. src/ci/lp-readback.js:43 and
+// scripts/test-ci-verify-lp.js:84 already say the same thing about lp_notes.
+//
+// So a stored value is ET WALL-CLOCK WEARING A +00:00 OFFSET, and comparing
+// it to a true-UTC Date.now() reads every row as ~4 h older than it is.
+//
+// THE WRITE PATH DOES NOT CHANGE. Re-tagging lpDateToEastern() with -04:00
+// would give new rows different semantics from ~228k existing ones with no
+// marker separating the two eras, and would collide with
+// lpWallClockToGhlStartTime()'s normalization of appointment_date. Callers
+// that need real elapsed time convert on READ, here.
+//
+// Use this ONLY for columns written through lpDateToEastern(): lp_leads and
+// lp_notes created_at_lp/updated_at_lp, lp_call_logs.call_date,
+// lp_activities.activity_date, lp_jobs.created_at_lp. Do NOT use it on
+// synced_at, or on any system_events / agent_actions column — those are
+// written by this service and are already true UTC.
+// ═══════════════════════════════════════════════════════════════════
+
+/** Offset in ms between UTC and a named zone at a given instant. */
+function zoneOffsetMs(atMs, timeZone) {
+  const d = new Date(atMs);
+  const asUtc = new Date(d.toLocaleString('en-US', { timeZone: 'UTC' }));
+  const asZone = new Date(d.toLocaleString('en-US', { timeZone }));
+  return asUtc.getTime() - asZone.getTime();
+}
+
+/**
+ * Convert a stored LP timestamp (ET wall-clock tagged +00:00) to true UTC ms.
+ *
+ * Two passes: the offset is looked up at the naive instant, then re-looked-up
+ * at the corrected instant. Within four hours of a DST transition those two
+ * differ, and the second answer is the right one. Exactly on the spring-forward
+ * gap the wall-clock time does not exist; we take the later offset, which is
+ * the same convention Postgres AT TIME ZONE uses.
+ *
+ * @param {string|Date|null} stored
+ * @returns {number|null} epoch ms in true UTC, or null if unparseable
+ */
+export function lpStoredToUtcMs(stored) {
+  if (!stored) return null;
+  const naiveMs = stored instanceof Date ? stored.getTime() : Date.parse(stored);
+  if (!Number.isFinite(naiveMs)) return null;
+  const firstPass = naiveMs + zoneOffsetMs(naiveMs, 'America/New_York');
+  return naiveMs + zoneOffsetMs(firstPass, 'America/New_York');
+}
+
+/**
+ * Age in minutes of a stored LP timestamp, measured against true now.
+ * Returns null when unparseable so callers can distinguish "no data" from
+ * "zero minutes old" — a freshness monitor must never read those the same way.
+ */
+export function lpStoredAgeMinutes(stored, nowMs = Date.now()) {
+  const utcMs = lpStoredToUtcMs(stored);
+  if (utcMs == null) return null;
+  return Math.round((nowMs - utcMs) / 60000);
+}
+
+/** ISO string in true UTC, for logging and for building query bounds. */
+export function lpStoredToUtcIso(stored) {
+  const ms = lpStoredToUtcMs(stored);
+  return ms == null ? null : new Date(ms).toISOString();
+}
+
+/**
+ * The inverse: a true-UTC instant expressed in the stored (ET wall-clock,
+ * +00:00-tagged) form, for building .gte/.lte bounds against these columns
+ * without converting every row. Prefer this over converting the column when
+ * the query must stay index-eligible.
+ */
+export function utcToLpStoredIso(atMs = Date.now()) {
+  const shifted = atMs - zoneOffsetMs(atMs, 'America/New_York');
+  return new Date(shifted).toISOString().replace('Z', '+00:00');
+}
