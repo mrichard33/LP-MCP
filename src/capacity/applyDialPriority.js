@@ -27,7 +27,9 @@
  * restarted in a finally block — the restart runs whether the write
  * succeeded, threw, or the read-back mismatched, is retried up to
  * restartAttempts with restartBackoffMs between, and is verified by reading
- * state. A campaign that does not come back is named in result.restart_failures
+ * state after restartSettleMs (Five9 reports state on a lag, so an immediate
+ * read is not evidence of anything) plus one final read restartFinalWaitMs
+ * later. A campaign that does not come back is named in result.restart_failures
  * and forces applied=false. Campaigns cycle one at a time (the TIERS loop is
  * sequential — never parallelise it) and a campaign is never stopped while one
  * cycled earlier in the run is still dark. Prior state is restored, not
@@ -183,7 +185,14 @@ export function verifyListOrder(intended, afterLists) {
  *        restored, never assumed). Never both campaigns at once — the TIERS
  *        loop is sequential and must stay that way.
  * @param {number} [deps.restartAttempts=3]
- * @param {number} [deps.restartBackoffMs=2000]
+ * @param {number} [deps.restartBackoffMs=2000]  Wait between restart attempts.
+ * @param {number} [deps.restartSettleMs=5000]
+ *        Wait after Five9 accepts a start before reading state back. Five9
+ *        reports state asynchronously (5-8s lag observed 2026-09-03), so an
+ *        immediate read reports a healthy restart as a failure.
+ * @param {number} [deps.restartFinalWaitMs=10000]
+ *        One last confirmation read after every attempt has failed, before
+ *        declaring the campaign dark.
  * @param {(ms:number)=>Promise<void>} [deps.sleep]
  * @param {(msg:string)=>void} [deps.log]
  */
@@ -192,6 +201,7 @@ export async function applyDialPriority(rankResult, deps) {
     getOutboundCampaign, modifyCampaignLists, five9WritesEnabled,
     stopCampaign = null, startCampaign = null, getCampaignState = null,
     cycleCampaigns = false, restartAttempts = 3, restartBackoffMs = 2000,
+    restartSettleMs = 5000, restartFinalWaitMs = 10000,
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
     log = console.log,
   } = deps || {};
@@ -288,6 +298,14 @@ export async function applyDialPriority(rankResult, deps) {
       if (mustCycle) {
         let restarted = false;
         let lastErr = null;
+        // The campaign is dialing again the moment Five9 accepts the start.
+        // Downtime is measured to THAT ack, not to the confirmation read
+        // below, which deliberately waits out the reporting lag.
+        let ackAt = null;
+        const readState = async () => (getCampaignState
+          ? String((await getCampaignState(campaignName))?.state || '').toUpperCase()
+          : String((await getOutboundCampaign(campaignName))?.state || '').toUpperCase());
+
         for (let attempt = 1; attempt <= restartAttempts && !restarted; attempt += 1) {
           try {
             await startCampaign({
@@ -296,9 +314,14 @@ export async function applyDialPriority(rankResult, deps) {
               requires_approval: true,
               action_payload: { campaign_name: campaignName },
             });
-            const state = getCampaignState
-              ? String((await getCampaignState(campaignName))?.state || '').toUpperCase()
-              : String((await getOutboundCampaign(campaignName))?.state || '').toUpperCase();
+            if (ackAt === null) ackAt = Date.now();
+            // Five9 reports campaign state asynchronously: getCampaignState
+            // still read NOT_RUNNING ~5s after a start that had already been
+            // accepted (STEP 0, 2026-09-03 — stop and start both lagged 5-8s).
+            // Reading immediately would call a healthy restart a failure and
+            // fire the CRITICAL alarm, so settle first.
+            await sleep(restartSettleMs);
+            const state = await readState();
             restarted = state === 'RUNNING';
             if (!restarted) lastErr = new Error(`state reads ${state || 'unknown'} after start`);
           } catch (err) {
@@ -306,7 +329,22 @@ export async function applyDialPriority(rankResult, deps) {
           }
           if (!restarted && attempt < restartAttempts) await sleep(restartBackoffMs);
         }
-        entry.downtime_ms = stoppedAt ? Date.now() - stoppedAt : null;
+
+        // Last word before declaring the floor dark: one more read after a
+        // longer wait. A stale read must never be the reason we page someone.
+        if (!restarted) {
+          try {
+            await sleep(restartFinalWaitMs);
+            const state = await readState();
+            restarted = state === 'RUNNING';
+            if (restarted) lastErr = null;
+            else if (!lastErr) lastErr = new Error(`state reads ${state || 'unknown'} after start`);
+          } catch (err) {
+            if (!lastErr) lastErr = err;
+          }
+        }
+
+        entry.downtime_ms = stoppedAt ? (restarted && ackAt ? ackAt : Date.now()) - stoppedAt : null;
         entry.restarted = restarted;
         if (!restarted) {
           entry.restart_error = lastErr?.message || 'unknown';

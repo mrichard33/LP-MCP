@@ -31,7 +31,7 @@
  */
 
 import supabase from '../../supabase.js';
-import { addLead as lpAddLead, extractInboundLeadId } from '../../lp-client.js';
+import { addLead as lpAddLead, extractInboundLeadId, getInboundLeadInfo } from '../../lp-client.js';
 import { sendGroupMeMessage } from '../../groupme.js';
 import { addGHLNote } from '../../ghl.js';
 import { isLPLeadId, ghlFetch } from '../helpers.js';
@@ -65,6 +65,71 @@ function verifyWindowMinutes() {
   return Math.max(2, Number(process.env.LP_REQUEUE_VERIFY_WINDOW_MIN) || 12);
 }
 
+// The executor kills a handler at 60s. loadQueueSnapshot() sweeps 5 Data queues
+// at up to 12 pages each with 1.2s inter-call sleeps, so a cold cache can pass
+// that limit on its own — which is what produced action 418351's two retries and
+// three LeadAdds on 2026-09-03. Bound the scan well inside the handler budget.
+// On timeout we proceed as "not present": the scan is an OPTIMISATION (skip a
+// redundant LeadAdd when the lead is already dialable), not the safety net. The
+// safety net is the dedup guard plus the LP inbound read below.
+function queueScanTimeoutMs() {
+  return Math.max(5000, Number(process.env.LP_REQUEUE_QUEUE_SCAN_TIMEOUT_MS) || 25000);
+}
+
+// deps is a TEST SEAM only — production calls this with ldsIds alone and both
+// defaults below reproduce the handoff's code exactly. It exists because the
+// timeout race is the whole point of this helper and an un-injectable race
+// cannot be asserted without a live LP credential and a 25s wall clock.
+export async function findLeadInDataQueuesBounded(ldsIds, deps = {}) {
+  const timeoutMs = Number(deps.timeoutMs) > 0 ? Number(deps.timeoutMs) : queueScanTimeoutMs();
+  const scan = deps.scan || findLeadInDataQueues;
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ __timedOut: true }), timeoutMs);
+  });
+  try {
+    const result = await Promise.race([scan(ldsIds), timeout]);
+    if (result?.__timedOut) {
+      console.warn(`[LP-REQUEUE] queue scan exceeded ${timeoutMs}ms — proceeding without the precondition`);
+      return { present: false, row: null, lds_id: null, truncated_queues: [], cache_age_ms: null, scan_timed_out: true };
+    }
+    return result;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * External idempotency read (satisfies requirement 1 of the reaper's
+ * "recoverable non-idempotent" contract, src/actions/reaper.js).
+ *
+ * Workflow 8e30ff37 and this handler both stamp lognumber = GHL contact id, so
+ * LP's own inbound queue is queryable evidence that a prior attempt's LeadAdd
+ * landed. Called only when this handler is re-entered for a contact that already
+ * has a re-queue row in the window; a hit means DO NOT post again.
+ *
+ * Fails CLOSED (returns true = "already landed") only on a definite hit. On any
+ * error it returns false so a transient LP outage never suppresses a first,
+ * legitimate re-queue.
+ */
+async function priorRequeueLandedInLp(contactId, sinceIso) {
+  try {
+    const info = await getInboundLeadInfo({ lognumber: contactId });
+    const rows = Array.isArray(info) ? info : (info?.data || info?.leads || info?.results || info?.items || []);
+    if (!Array.isArray(rows) || rows.length === 0) return false;
+    const sinceMs = Date.parse(sinceIso);
+    if (!Number.isFinite(sinceMs)) return rows.length > 0;
+    return rows.some((r) => {
+      const raw = r?.datereceived ?? r?.DateReceived ?? r?.created ?? r?.CreatedOn ?? null;
+      const ms = raw ? Date.parse(String(raw)) : NaN;
+      return Number.isFinite(ms) ? ms >= sinceMs - 60_000 : false;
+    });
+  } catch (err) {
+    console.warn(`[LP-REQUEUE] LP inbound idempotency read failed for ${contactId}: ${err.message} — not treating as landed`);
+    return false;
+  }
+}
+
 export async function executeLpCallbackRequeue(action) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
@@ -73,14 +138,26 @@ export async function executeLpCallbackRequeue(action) {
   }
 
   // ── Dedup window — one re-queue per contact per window ───────────
-  const dedup = await recentRequeueExists(contactId);
+  // retryCount is the load-bearing argument: a retry of this same action row is
+  // duplicate by definition, because the attempt that timed out may still have
+  // posted its LeadAdd (2026-09-03, action 418351 → LP leads 572927/28/29).
+  const dedup = await recentRequeueExists(contactId, {
+    currentActionId: action.id,
+    retryCount: Number(action.retry_count) || 0,
+  });
   if (dedup.duplicate) {
-    console.log(`[LP-REQUEUE] ⏭️ Skip ${contactId}: re-queue already ran inside the ${dedup.window_minutes}min window (action ${dedup.prior_action_id || 'unknown'})`);
+    const windowStart = new Date(Date.now() - dedup.window_minutes * 60 * 1000).toISOString();
+    const landed = await priorRequeueLandedInLp(contactId, windowStart);
+    console.log(`[LP-REQUEUE] ⏭️ Skip ${contactId}: ${dedup.reason} (prior action ${dedup.prior_action_id || 'unknown'}, LP inbound evidence=${landed})`);
     return {
       action: 'requeue_deduped',
       requeued: false,
       contact_id: contactId,
+      dedup_reason: dedup.reason,
       prior_action_id: dedup.prior_action_id || null,
+      prior_status: dedup.prior_status || null,
+      retry_count: dedup.retry_count ?? (Number(action.retry_count) || 0),
+      lp_inbound_evidence: landed,
       window_minutes: dedup.window_minutes,
     };
   }
@@ -150,7 +227,7 @@ export async function executeLpCallbackRequeue(action) {
   }
 
   // ── Precondition: already dialable in a Data queue? ──────────────
-  const queueCheck = await findLeadInDataQueues(ldsIds);
+  const queueCheck = await findLeadInDataQueuesBounded(ldsIds);
   if (queueCheck.present) {
     const row = queueCheck.row || {};
     console.log(`[LP-REQUEUE] ⏭️ Skip ${contactId}: lead ${queueCheck.lds_id} already dialable in queue ${row.Cqd_ID} (attempts=${row.NumDialingAttempts}, lastResult=${row.LastCallResult || 'none'}) — no second LeadAdd`);
@@ -257,7 +334,12 @@ export async function executeLpCallbackRequeue(action) {
   // the sender/user2 markers — LP's GetLead sync only returns the user
   // fields LP is configured to expose (currently 1/11/12), so this event +
   // this action row are the local source of truth for "was this a re-queue".
-  emitEvent({
+  //
+  // AWAITED as of 2026-09-03. Fire-and-forget meant contact
+  // eqjK58AwEZ1juYJH6szE produced three LeadAdds and ZERO lp.callback_requeued
+  // rows — the only durable cross-attempt trail never landed. The emit is still
+  // .catch()-guarded so a failure never blocks the re-queue.
+  await emitEvent({
     event_type: 'lp.callback_requeued',
     source: 'lp_mcp',
     entity_type: 'contact',
@@ -308,4 +390,4 @@ export async function executeLpCallbackRequeue(action) {
   };
 }
 
-export default { executeLpCallbackRequeue };
+export default { executeLpCallbackRequeue, findLeadInDataQueuesBounded };
