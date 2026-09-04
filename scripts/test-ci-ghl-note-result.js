@@ -33,7 +33,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { classifyGhlNoteResult, syncToGhl, markSyncFailed } from '../src/ci/sync.js';
+import { classifyGhlNoteResult, syncToGhl as syncToGhlAt, markSyncFailed } from '../src/ci/sync.js';
 import { parseConfig } from '../src/ci/config.js';
 
 const LIVE_GHL = parseConfig({
@@ -48,6 +48,15 @@ const CALL = {
   agent_name: 'John Manieri',
   team: 'reece',
 };
+
+// The clock is pinned to the fixture — see the long note in test-ci-sync.js.
+// syncToGhl runs noteAgeVerdict() before claimSync and maxNoteAgeHours
+// defaults to 24, so with a real `now` this fixture goes `call_too_old` and
+// every assertion below reads a skip instead of a classified GHL result.
+// Derived from CALL so re-dating the fixture keeps these green; `...o` last so
+// an individual test can still override it.
+const NOW = new Date(Date.parse(CALL.call_start) + 60 * 60 * 1000);
+const syncToGhl = (c, s, m, o = {}) => syncToGhlAt(c, s, m, { now: NOW, ...o });
 
 const SUMMARY = {
   output: {

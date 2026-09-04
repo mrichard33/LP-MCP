@@ -20,7 +20,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { composeNote, idempotencyKey, formatKeyDetails, formatFollowUp, outcomeLabel, formatEt, shortId } from '../src/ci/notes.js';
-import { syncCall, syncToLp, syncToGhl, tierWritable } from '../src/ci/sync.js';
+import {
+  syncCall as syncCallAt,
+  syncToLp as syncToLpAt,
+  syncToGhl as syncToGhlAt,
+  tierWritable,
+} from '../src/ci/sync.js';
 import { parseConfig } from '../src/ci/config.js';
 
 const SHADOW = parseConfig({});
@@ -58,6 +63,26 @@ const MATCH = (over = {}) => ({
   evidence: { note_target: { rectype: 'cst', recid: 453297 } },
   ...over,
 });
+
+// ─── The clock is pinned, deliberately ──────────────────────────────────────
+// CALL.call_start is a FIXED historical timestamp, so "now" has to be fixed
+// too. syncToLp/syncToGhl run noteAgeVerdict() before claimSync, and
+// maxNoteAgeHours defaults to 24 (config.js) — so once the fixture was more
+// than a day old, every sync below started returning
+// { skipped: true, reason: 'call_too_old' } instead of doing its work, and
+// seven assertions in this file went red without a line of src/ changing.
+// Wall-clock rot, not a regression: they were green the day they were written.
+//
+// NOW is derived from the fixture rather than hard-coded, so moving CALL to a
+// new date keeps the tests working. The wrappers below inject it as the
+// DEFAULT: `...o` is spread last, so any single test can still pass its own
+// `now` to exercise the age gate on purpose (see the age-gate test at the end
+// of this file, which does exactly that).
+const NOW = new Date(Date.parse(CALL.call_start) + 60 * 60 * 1000); // fixture + 1h
+
+const syncCall  = (c, s, m, o = {}) => syncCallAt(c, s, m, { now: NOW, ...o });
+const syncToLp  = (c, s, m, o = {}) => syncToLpAt(c, s, m, { now: NOW, ...o });
+const syncToGhl = (c, s, m, o = {}) => syncToGhlAt(c, s, m, { now: NOW, ...o });
 
 /**
  * A CRM client that must never be called. Any invocation throws, so a shadow
@@ -403,4 +428,42 @@ test('a failing alert transport never throws into the pipeline', async () => {
 test('the backlog threshold is a real number, not a placeholder', () => {
   assert.equal(REVIEW_BACKLOG_THRESHOLD, 20);
   assert.equal(shouldSend('never_sent_kind', 1), true);
+});
+
+// ─── The note-age gate, on purpose ──────────────────────────────────────────
+// Added 2026-09-04. Until now NOTHING in the suite exercised maxNoteAgeHours,
+// which is why the gate could silently swallow every sync in this file for two
+// weeks and read as seven ordinary assertion failures. These call the unwrapped
+// *At functions so the pinned clock above cannot mask the behaviour.
+
+test('a call older than the age gate is SKIPPED, and does not burn its key', async () => {
+  // LP stamps a note with the date it was WRITTEN and cannot backdate it, so a
+  // two-week-old call would post as though the conversation happened today.
+  const db = fakeDb();
+  const stale = new Date(Date.parse(CALL.call_start) + 25 * 60 * 60 * 1000); // 25h > 24h limit
+
+  const r = await syncToLpAt(CALL, SUMMARY, MATCH(), {
+    db,
+    cfg: LIVE_BOTH,
+    lpClient: forbiddenClient('lpClient.addNote'),   // a live write here would throw
+    now: stale,
+  });
+
+  assert.equal(r.skipped, true);
+  assert.equal(r.reason, 'call_too_old');
+  assert.equal(r.age_hours, 25);
+  assert.equal(db.rows.length, 0, 'the gate runs BEFORE claimSync — no row holds the key');
+});
+
+test('inside the window the same call syncs normally', async () => {
+  // The boundary matters in both directions: a gate that rejected everything
+  // would also make the seven tests above pass for the wrong reason.
+  const db = fakeDb();
+  const fresh = new Date(Date.parse(CALL.call_start) + 23 * 60 * 60 * 1000); // 23h < 24h limit
+
+  const r = await syncToLpAt(CALL, SUMMARY, MATCH(), { db, cfg: SHADOW, now: fresh });
+
+  assert.equal(r.skipped, undefined);
+  assert.equal(r.shadow, true);
+  assert.equal(db.rows.length, 1);
 });

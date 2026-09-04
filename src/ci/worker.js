@@ -991,8 +991,15 @@ export async function stageSync(call, { db = supabase, cfg = getConfig(), lpClie
     console.warn(`${LOG} call=${call.id} recording link unavailable: ${err.message}`);
   }
 
+  // `now` is threaded through deliberately. syncToLp/syncToGhl run
+  // noteAgeVerdict() against it, so omitting it here made the note-age gate read
+  // the wall clock no matter what the caller injected — every other stage in
+  // advanceOne got the injected clock and this one silently did not. Any caller
+  // replaying or backfilling historical calls with a pinned `now` had its writes
+  // skipped as `call_too_old`, and it made six test files rot from green to red
+  // as their fixtures aged past maxNoteAgeHours (2026-09-04).
   const result = await syncCall(call, summary, match, {
-    db, cfg, lpClient, ghlClient, link, agentLabel: agentLabelFor(call, agentMap),
+    db, cfg, lpClient, ghlClient, link, agentLabel: agentLabelFor(call, agentMap), now,
   });
 
   // A target that failed and has NOT exhausted its attempts gets another go.

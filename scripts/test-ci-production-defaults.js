@@ -43,8 +43,14 @@ import { fileURLToPath } from 'node:url';
 
 import { addNote as realAddNote } from '../src/lp-client.js';
 import { addGHLNote as realAddGHLNote } from '../src/ghl.js';
-import { syncToLp, syncToGhl, syncCall, defaultLpClient, defaultGhlClient } from '../src/ci/sync.js';
-import { stageSync, advanceOne, runTick } from '../src/ci/worker.js';
+import {
+  syncToLp as syncToLpAt,
+  syncToGhl as syncToGhlAt,
+  syncCall as syncCallAt,
+  defaultLpClient,
+  defaultGhlClient,
+} from '../src/ci/sync.js';
+import { stageSync as stageSyncAt, advanceOne as advanceOneAt, runTick } from '../src/ci/worker.js';
 import { parseConfig } from '../src/ci/config.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -69,6 +75,19 @@ const CALL = {
   attempts: 0,
   status: 'matched',
 };
+
+// The clock is pinned to the fixture — see the long note in test-ci-sync.js.
+// This file asserts what the PRODUCTION defaults do, so the age gate skipping
+// every write would make it assert nothing at all. Derived from CALL; `...o`
+// last so an individual test can still override it.
+const NOW = new Date(Date.parse(CALL.call_start) + 60 * 60 * 1000);
+const syncToLp  = (c, s, m, o = {}) => syncToLpAt(c, s, m, { now: NOW, ...o });
+const syncToGhl = (c, s, m, o = {}) => syncToGhlAt(c, s, m, { now: NOW, ...o });
+const syncCall  = (c, s, m, o = {}) => syncCallAt(c, s, m, { now: NOW, ...o });
+// The worker entry points reach syncToLp/syncToGhl underneath, so they need the
+// same pinned clock or the age gate skips the write these tests are asserting.
+const stageSync  = (c, o = {}) => stageSyncAt(c, { now: NOW, ...o });
+const advanceOne = (c, o = {}) => advanceOneAt(c, { now: NOW, ...o });
 
 const SUMMARY = {
   call_id: CALL.id,
@@ -253,9 +272,14 @@ test('stageSync with NO clients attempts the write — the exact production path
   assert.equal(r.outcome, 'deferred');
 });
 
-test('advanceOne on a matched call — the dispatch runTick uses — attempts the write', async () => {
+test('advanceOne on a syncing call — the dispatch runTick uses — attempts the write', async () => {
+  // status must be 'syncing', not 'matched'. This test exists to prove the
+  // DISPATCH reaches the write site with production defaults, and advanceOne
+  // routes 'matched' to stageTranscribe — only 'syncing' reaches stageSync. With
+  // the stale status it was asserting on the transcribe stage failing for want
+  // of a transcriber, which is a different test that happens to also be red.
   const db = fakeDb();
-  const r = await withoutLpCredentials(() => advanceOne(CALL, { db, cfg: LIVE_LP }));
+  const r = await withoutLpCredentials(() => advanceOne({ ...CALL, status: 'syncing' }, { db, cfg: LIVE_LP }));
   assert.doesNotMatch(String(r.result?.lp?.error || ''), MISSING_DEPENDENCY);
   assert.equal(r.outcome, 'deferred');
 });
