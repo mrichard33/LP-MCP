@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import supabase from '../supabase.js';
+import { runSourceReconcile } from '../jobs/source-reconcile.js';
 
 // Helper: fetch disposition labels + categories from lp_dispositions table
 async function getDispositionMap() {
@@ -16,32 +17,89 @@ async function getDispositionMap() {
 export function registerSourceTools(server) {
 
   // Tool 12: get_leads_needing_mapping
+  //
+  // 2026-09-04 — reads the RECONCILED gap (LP's own source catalog diffed
+  // against lp_source_mapping), not the raw lp_unmapped_sources queue.
+  //
+  // The queue was wrong 547 times out of 552: 372 of its rows were already
+  // mapped, 175 were duplicate NULL rows from a unique index that treated NULLs
+  // as distinct, and 5 were real. Ranking was worse than the list — it ordered
+  // by lead_count, which counted sync cycles rather than leads, so the top of
+  // the list was whichever dead source had been re-synced most. Both are fixed:
+  // the gap comes from the reconciler and the ranking from v_source_volume_90d.
   server.tool(
     'get_leads_needing_mapping',
-    'sourcesubdescr/source values not yet in the mapping table. Data maintenance.',
+    'LP sources with no lp_source_mapping entry, ranked by real 90-day lead volume. Data maintenance.',
     {
       limit: z.number().optional().describe('Max results (default 50)'),
     },
     async ({ limit = 50 }) => {
-      const { data, error } = await supabase
-        .from('lp_unmapped_sources')
-        .select('*')
-        .eq('reviewed', false)
-        .order('lead_count', { ascending: false })
-        .limit(limit);
+      try {
+        // alert:false — a read must never emit an event.
+        const report = await runSourceReconcile({}, { alert: false });
+        if (report.skipped) {
+          return { content: [{ type: 'text', text: `Error: ${report.reason}` }] };
+        }
+        const sources = report.unmapped.slice(0, limit);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              total_unmapped: report.unmapped.length,
+              lp_catalog_size: report.catalog_count,
+              ranked_by: 'leads_90d (v_source_volume_90d) — NOT the retired lp_unmapped_sources.lead_count',
+              sources,
+              action: 'Map each source to a GHL intent bucket in lp_source_mapping. Unmapped sources route to entry:other.',
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+      }
+    }
+  );
 
-      if (error) return { content: [{ type: 'text', text: `Error: ${error.message}` }] };
-
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({
-            total_unmapped: data.length,
-            sources: data,
-            action: 'Map each source to a GHL intent bucket in lp_source_mapping table',
-          }, null, 2),
-        }],
-      };
+  // Tool 12b: get_source_catalog_health
+  server.tool(
+    'get_source_catalog_health',
+    'Diffs LP\'s authoritative source catalog against lp_source_mapping: unmapped, orphaned and dormant sources, ranked by real 90-day volume. Read-only — never creates a mapping.',
+    {
+      limit: z.number().optional().describe('Max rows per diff (default 25)'),
+      include_dormant: z.boolean().optional().describe('Include mapped sources with zero leads in 90 days (default true)'),
+    },
+    async ({ limit = 25, include_dormant = true }) => {
+      try {
+        const report = await runSourceReconcile({}, { alert: false });
+        if (report.skipped) {
+          return { content: [{ type: 'text', text: `Error: ${report.reason}` }] };
+        }
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              ran_at: report.ran_at,
+              lp_catalog_size: report.catalog_count,
+              mapping_rows: report.mapping_count,
+              counts: {
+                unmapped: report.unmapped.length,
+                orphaned: report.orphaned.length,
+                dormant: report.dormant.length,
+              },
+              // In LP's catalog, no lp_source_mapping row. These leads route to
+              // entry:other today. This is the number that replaces the old 552.
+              unmapped: report.unmapped.slice(0, limit),
+              // Mapped, but LP no longer publishes the source. Report-only.
+              orphaned: report.orphaned.slice(0, limit),
+              // Mapped and live in LP, but zero leads in 90 days.
+              dormant: include_dormant ? report.dormant.slice(0, limit) : [],
+              alerting: `lp.source_mapping_gap fires at most once per source per ISO week, and only above ${report.threshold_30d} leads in 30 days. Orphaned and dormant never alert.`,
+              action: 'Classify unmapped sources in lp_source_mapping by hand — bucket and entry tag are a human decision.',
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+      }
     }
   );
 

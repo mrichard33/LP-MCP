@@ -262,6 +262,9 @@ import { registerLpReportRoutes } from './jobs/lp-report-ingest.js';
 import { registerLpCsvRoutes } from './jobs/lp-csv-ingest.js';
 // Daily 07:00 ET cross-source recon for the ingested LP reports.
 import { registerLpReportReconRoutes, startLpReportReconScheduler } from './jobs/lp-report-recon.js';
+// Daily 05:30 ET LP-driven source reconciler — diffs LP's authoritative source
+// list against lp_source_mapping. Reports only; never writes a mapping.
+import { registerSourceReconcileRoutes, startSourceReconcileScheduler } from './jobs/source-reconcile.js';
 // 07:30 ET missing-report watchdog — watches the OUTCOME table, independent
 // of every pipeline stage (LP schedule / Gmail / n8n / ingest route).
 import { startLpReportWatchdog } from './jobs/lp-report-watchdog.js';
@@ -1959,6 +1962,7 @@ registerCohortReobservationRoutes(app); // 2026-08-12 — cohort re-observation 
 registerLpReportRoutes(app);
 registerLpCsvRoutes(app);
 registerLpReportReconRoutes(app);
+registerSourceReconcileRoutes(app);
 registerScorecardValidateRoutes(app);
 registerFive9SnapshotRoutes(app, authenticate);
 registerCiRoutes(app, authenticate);            // 2026-08-21 — Call Intelligence ingest (PR 2; worker ships disarmed)
@@ -2013,6 +2017,7 @@ app.listen(PORT, async () => {
   // only when a human called POST /ci/discover. Ships DISARMED.
   startCiDiscoveryScheduler();
   startLpReportReconScheduler();
+  startSourceReconcileScheduler();
   startLpReportWatchdog();
   startLpCsvOrphanReaper();
   startFbPublishWatchdog();

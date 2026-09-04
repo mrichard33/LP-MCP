@@ -309,6 +309,24 @@ export async function backfillSourceMappingsFromLeads() {
 // Track already-logged unmapped sources to avoid log spam
 const loggedUnmappedSources = new Set();
 
+// The queue records EXISTENCE of an unmapped source and one sample lead.
+// Nothing more.
+//
+// 2026-09-04 — the counter is gone. The old body incremented lead_count on
+// every resolution attempt, which is once per lead PER SYNC PASS, not once per
+// lead. It accumulated passes forever: "Contractor Appointment Rev Share" read
+// 211,656 against 28,345 actual lp_leads rows and 179 leads in 90 days — a
+// figure larger than the entire lp_leads table. Ranking mapping work by it sent
+// you to dead sources first. Real volume now comes from v_source_volume_90d.
+//
+// The read that drove that update was broken too: it matched on
+// `sourceSubdetail || ''` — empty string — while the insert wrote `null`, so it
+// never found its own rows and inserted duplicates instead.
+//
+// insert-if-absent (ignoreDuplicates) is deliberate. It costs one write per NEW
+// source instead of one per lead, and it cannot overwrite a row a human has
+// already marked reviewed. Correctness depends on idx_unmapped_src being
+// NULLS NOT DISTINCT — see sql/migrations/2026-09-04_source_queue_repair.sql.
 async function logUnmappedSource(sourceSubdetail, sourceRaw, lpLeadId) {
   try {
     if (!sourceSubdetail && !sourceRaw) return;
@@ -317,21 +335,11 @@ async function logUnmappedSource(sourceSubdetail, sourceRaw, lpLeadId) {
       loggedUnmappedSources.add(key);
       console.log(`[Sync] Unmapped source: subdetail="${sourceSubdetail}", raw="${sourceRaw}"`);
     }
-    const { data: existing } = await supabase.from('lp_unmapped_sources')
-      .select('id, lead_count')
-      .eq('source_subdetail', sourceSubdetail || '')
-      .eq('source_raw', sourceRaw || '')
-      .maybeSingle();
-    if (existing) {
-      await supabase.from('lp_unmapped_sources')
-        .update({ lead_count: (existing.lead_count || 0) + 1, sample_lp_lead_id: lpLeadId || existing.sample_lp_lead_id })
-        .eq('id', existing.id);
-    } else {
-      await supabase.from('lp_unmapped_sources').insert({
-        source_subdetail: sourceSubdetail || null, source_raw: sourceRaw || null,
-        lead_count: 1, sample_lp_lead_id: lpLeadId || null,
-      });
-    }
+    await supabase.from('lp_unmapped_sources').upsert({
+      source_subdetail:  sourceSubdetail || null,
+      source_raw:        sourceRaw || null,
+      sample_lp_lead_id: lpLeadId || null,
+    }, { onConflict: 'source_subdetail,source_raw', ignoreDuplicates: true });
   } catch (err) {
     // Non-critical — don't break sync for mapping analytics
   }
