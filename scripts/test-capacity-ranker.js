@@ -759,13 +759,20 @@ test('verifyListOrder: reports mismatches, empty when read-back matches', () => 
  *                        before the campaign actually comes up (retry cases).
  *   startAlwaysFails  — startCampaign never brings the campaign back.
  *   startThrows       — startCampaign throws instead of returning.
+ *   stopDrainMs       — REAL FIVE9 BEHAVIOUR (observed in production
+ *                       2026-09-04): a graceful stop does not land instantly.
+ *                       The campaign reports STOPPING while it drains calls in
+ *                       progress, and startCampaign is REFUSED outright with
+ *                       "Illegal campaign state STOPPING" for that whole
+ *                       window. Only after it drains does it read NOT_RUNNING
+ *                       and become startable.
  *   calls             — ordered [op, campaign] log across stop/modify/start.
  */
 function fakeFive9({
   writesEnabled = true, applyWrites = true, refuse = null,
   states = null, refuseWhileRunning = false,
   startsBeforeRunning = 0, startAlwaysFails = false, startThrows = false,
-  startLagMs = 0,
+  startLagMs = 0, stopDrainMs = 0,
 } = {}) {
   const state = {
     [CAMPAIGNS.hot]: LIVE_HOT_LISTS.map((l) => ({ ...l })),
@@ -782,7 +789,17 @@ function fakeFive9({
   // test's injected sleep drives this clock through advance().
   let clock = 0;
   const flipAt = {};
+  const drainUntil = {};
   const readCampaignState = (name) => {
+    // A draining campaign reports STOPPING until it settles to NOT_RUNNING.
+    if (drainUntil[name] !== undefined) {
+      if (clock >= drainUntil[name]) {
+        delete drainUntil[name];
+        campaignState[name] = 'NOT_RUNNING';
+      } else {
+        return 'STOPPING';
+      }
+    }
     if (flipAt[name] !== undefined && clock >= flipAt[name]) {
       campaignState[name] = 'RUNNING';
       stoppedByUs.delete(name);
@@ -822,14 +839,20 @@ function fakeFive9({
         assert.equal(stoppedByUs.size, 0, `stop ${name}: a campaign this run stopped (${[...stoppedByUs].join(', ')}) is still dark — never both at once`);
         calls.push(['stop', name]);
         campaignState[name] = 'NOT_RUNNING';
+        if (stopDrainMs > 0) drainUntil[name] = clock + stopDrainMs;
         stoppedByUs.add(name);
-        return { campaign: name, method: 'stopCampaign', state: 'NOT_RUNNING' };
+        return { campaign: name, method: 'stopCampaign', state: stopDrainMs > 0 ? 'STOPPING' : 'NOT_RUNNING' };
       },
       startCampaign: async (action) => {
         const name = action.action_payload.campaign_name;
         assert.equal(action.action_type, 'five9_start_campaign');
         calls.push(['start', name]);
         startAttempts[name] = (startAttempts[name] || 0) + 1;
+        // Five9 refuses a start outright while the campaign is still draining.
+        // This is the exact fault that took the floor dark twice on 2026-09-04.
+        if (readCampaignState(name) === 'STOPPING') {
+          throw new Error(`Five9 startCampaign fault: Error updating campaign state "${name}": Illegal campaign state STOPPING`);
+        }
         if (startThrows) throw new Error('Five9 startCampaign fault');
         if (startAlwaysFails) return { campaign: name, method: 'startCampaign', state: 'NOT_RUNNING' };
         if (startAttempts[name] > startsBeforeRunning && campaignState[name] !== 'RUNNING') {
@@ -964,6 +987,136 @@ test('LAG: a genuinely dark campaign still fails after the final read — the al
   assert.ok(log.some((m) => /CRITICAL.*DID NOT RESTART/.test(m)));
 });
 
+// ─── DRAIN: the STOPPING window ─────────────────────────────────────────────
+//
+// THE PRODUCTION INCIDENT, 2026-09-04. A graceful stop does not land instantly:
+// Five9 reports STOPPING while it drains calls in progress, and it REFUSES
+// startCampaign for that entire window with "Illegal campaign state STOPPING".
+// The old restart loop spent all three attempts inside that window — a throwing
+// start skips the settle wait, so the whole budget was 2s + 2s + a 10s final
+// read ≈ 16s — and gave up while the campaign was still draining. Both Data
+// campaigns went dark that afternoon, ~85s and ~95s, and each needed a manual
+// start. The fix is to WAIT OUT the transitional state instead of firing
+// starts into it.
+
+test('DRAIN: no start is fired while the campaign reads STOPPING — the restart waits it out', async () => {
+  const f = fakeFive9({ stopDrainMs: 25000 }); // 25s drain, as seen live
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true,
+    sleep: async (ms) => { f.advance(ms); }, log: () => {},
+  });
+  // The old code fired 3 starts into STOPPING and every one was refused.
+  const hotStarts = f.calls.filter((c) => c[0] === 'start' && c[1] === CAMPAIGNS.hot);
+  assert.equal(hotStarts.length, 1, 'exactly ONE start, fired only once the campaign was startable');
+  assert.equal(out.campaigns.hot.restarted, true);
+  assert.equal(out.campaigns.hot.restart_error, undefined);
+  assert.deepEqual(out.restart_failures, []);
+  assert.equal(out.applied, true);
+});
+
+test('DRAIN: a 25s drain would have blown the OLD ~16s budget — both campaigns still come back', async () => {
+  const log = [];
+  const f = fakeFive9({ stopDrainMs: 25000 });
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true,
+    sleep: async (ms) => { f.advance(ms); }, log: (m) => log.push(m),
+  });
+  for (const t of ['hot', 'warm']) {
+    assert.equal(out.campaigns[t].cycled, true, `${t} cycled`);
+    assert.equal(out.campaigns[t].restarted, true, `${t} came back`);
+    assert.equal(out.campaigns[t].verified, true, `${t} reorder landed`);
+  }
+  assert.deepEqual(out.restart_failures, []);
+  assert.ok(!log.some((m) => /CRITICAL/.test(m)), 'nobody is paged for a normal drain');
+  assert.equal(out.applied, true);
+});
+
+test('DRAIN: waiting is BOUNDED — a campaign that never leaves STOPPING is declared dark, not hung', async () => {
+  const log = [];
+  const f = fakeFive9({ stopDrainMs: 10 * 60 * 1000 }); // drains long past any budget
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true, restartMaxWaitMs: 60000,
+    sleep: async (ms) => { f.advance(ms); }, log: (m) => log.push(m),
+  });
+  assert.equal(out.campaigns.hot.restarted, false, 'gave up rather than looping forever');
+  assert.deepEqual(out.restart_failures, [CAMPAIGNS.hot]);
+  assert.equal(out.applied, false);
+  assert.match(out.campaigns.hot.restart_error, /STOPPING/, 'the error names the state it was stuck in');
+  assert.ok(log.some((m) => /CRITICAL.*DID NOT RESTART/.test(m)), 'a genuinely stuck campaign still pages');
+});
+
+test('DRAIN: the dark window is still REPORTED, never hidden by the new waiting', async () => {
+  const f = fakeFive9({ stopDrainMs: 20000 });
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true,
+    sleep: async (ms) => { f.advance(ms); }, log: () => {},
+  });
+  // Waiting out the drain makes the restart RELIABLE, not free: the campaign
+  // genuinely was not dialing for that whole window. downtime_ms must still be
+  // reported so a long drain shows up in dial_priority_log rather than being
+  // silently absorbed.
+  assert.ok(Number.isFinite(out.campaigns.hot.downtime_ms), 'downtime is measured, not null');
+  assert.equal(out.campaigns.hot.restarted, true);
+});
+
+// ─── The never-both-dark guard, on LIVE state ───────────────────────────────
+
+test('GUARD: a campaign already dark from an EARLIER run blocks cycling the other one', async () => {
+  // 2026-09-04: the Hot campaign was left NOT_RUNNING by a failed restart at
+  // 17:07. The 17:15 run then cycled Warm anyway — the guard only looked at
+  // campaigns cycled in ITS OWN run, so it never saw that Hot was dark. Had
+  // Warm also failed to come back, the floor would have had NO Data campaign
+  // dialing at all.
+  const f = fakeFive9({ states: { [CAMPAIGNS.hot]: 'NOT_RUNNING' } });
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true, log: () => {},
+  });
+  assert.equal(out.campaigns.warm.cycled, false, 'warm must NOT be stopped while hot is dark');
+  assert.ok(!f.calls.some((c) => c[0] === 'stop' && c[1] === CAMPAIGNS.warm), 'no stop was issued for warm');
+  assert.match(out.campaigns.warm.skipped_reason, /Data - Hot Leads less than 7 is NOT_RUNNING/);
+  assert.match(out.campaigns.warm.skipped_reason, /never both campaigns stopped at once/);
+  // Hot itself is still reordered — it is already stopped, so no cycle needed.
+  assert.equal(out.campaigns.hot.cycled, false);
+  assert.equal(out.campaigns.hot.verified, true, 'hot got its new order');
+  assert.equal(out.applied, false, 'warm did not get its order — the run is not fully applied');
+});
+
+test('GUARD: an UNREADABLE peer is treated as dark — the campaign that cannot vouch for its peer does not stop', async () => {
+  const f = fakeFive9();
+  // Fail ONLY the very first read of warm — the peer check hot runs before it
+  // stops itself. Warm's own cycle later reads cleanly, so this isolates the
+  // guard rather than also breaking warm's restart verification.
+  let warmReads = 0;
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true, log: () => {},
+    getCampaignState: async (name) => {
+      if (name === CAMPAIGNS.warm && (warmReads += 1) === 1) throw new Error('Five9 unreachable');
+      return { name, state: f.campaignState[name] };
+    },
+  });
+  // Hot goes first and cannot confirm warm is up, so it refuses to stop —
+  // a peer we cannot see is not a peer we can vouch for.
+  assert.equal(out.campaigns.hot.cycled, false);
+  assert.match(out.campaigns.hot.skipped_reason, /unreadable/);
+  assert.ok(!f.calls.some((c) => c[0] === 'stop' && c[1] === CAMPAIGNS.hot), 'hot was never stopped');
+  // Warm CAN read hot (RUNNING), so it cycles normally. Only ever one down.
+  assert.equal(out.campaigns.warm.cycled, true);
+  assert.equal(out.campaigns.warm.restarted, true);
+  assert.equal(out.applied, false, 'hot kept its old order, so the run is not fully applied');
+});
+
+test('GUARD: with BOTH campaigns RUNNING the guard is silent — normal cycling is unaffected', async () => {
+  const f = fakeFive9();
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true, log: () => {},
+  });
+  assert.deepEqual(f.calls, [
+    ['stop', CAMPAIGNS.hot], ['modify', CAMPAIGNS.hot], ['start', CAMPAIGNS.hot],
+    ['stop', CAMPAIGNS.warm], ['modify', CAMPAIGNS.warm], ['start', CAMPAIGNS.warm],
+  ], 'one at a time, hot fully back before warm begins');
+  assert.equal(out.applied, true);
+});
+
 test('DOWNTIME: measured to the start Five9 accepted, not to the confirmation read that waits out the lag', async () => {
   const f = fakeFive9({ startLagMs: 30 });
   const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
@@ -992,7 +1145,7 @@ test('CYCLE: restart NEVER succeeds → applied:false, restart_failures populate
   assert.equal(f.campaignState[CAMPAIGNS.warm], 'RUNNING');
   assert.equal(out.campaigns.warm.cycled, false);
   assert.equal(out.campaigns.warm.written, false);
-  assert.match(out.campaigns.warm.skipped_reason, /did not restart earlier in this run/);
+  assert.match(out.campaigns.warm.skipped_reason, /Data - Hot Leads less than 7 is NOT_RUNNING/);
 });
 
 test('CYCLE: startCampaign THROWS every time → still bounded, restart_failures populated, the throw does not escape', async () => {
@@ -1012,8 +1165,13 @@ test('CYCLE: a campaign already NOT_RUNNING is reordered and LEFT STOPPED — ne
   assert.equal(out.campaigns.hot.was_running, false);
   assert.equal(out.campaigns.hot.restarted, undefined);
   assert.equal(f.campaignState[CAMPAIGNS.hot], 'NOT_RUNNING', 'prior state restored, not assumed');
-  assert.equal(out.campaigns.warm.cycled, true, 'warm (RUNNING) still cycles');
-  assert.equal(out.applied, true);
+  // BEHAVIOUR CHANGE (2026-09-04): warm used to cycle here. It must not. Hot
+  // is dark, so stopping warm would leave NO Data campaign dialing — exactly
+  // the state the never-both-dark guard exists to prevent. It only ever
+  // checked campaigns cycled in its own run, so it missed a peer that was
+  // already down. See the GUARD tests above.
+  assert.equal(out.campaigns.warm.cycled, false, 'warm must NOT cycle while hot is dark');
+  assert.equal(out.applied, false, 'warm kept its old order — not fully applied');
 });
 
 test('CYCLE: flag OFF (default) → no stop, no start, a RUNNING campaign still refuses the write (today\'s behavior)', async () => {
@@ -1061,7 +1219,13 @@ test('CYCLE: getCampaignState, when injected, is used for restart verification',
     ...f.deps, cycleCampaigns: true, log: () => {},
     getCampaignState: async (name) => { reads.push(name); return { name, state: f.campaignState[name] }; },
   });
-  assert.deepEqual(reads, [CAMPAIGNS.hot, CAMPAIGNS.warm]);
+  // The cheap read is used for all three jobs that need live state: the peer
+  // check before a stop, the drain check before a start, and the restart
+  // verification after one. Both campaigns are read; the exact sequence is not
+  // pinned, because adding a safety read must not break this test.
+  assert.ok(reads.includes(CAMPAIGNS.hot) && reads.includes(CAMPAIGNS.warm), 'both campaigns read via getCampaignState');
+  assert.ok(reads.indexOf(CAMPAIGNS.warm) < reads.lastIndexOf(CAMPAIGNS.hot),
+    'warm is read as hot\'s peer before hot is cycled');
   assert.equal(out.applied, true);
 });
 
