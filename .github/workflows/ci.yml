@@ -21,3 +21,32 @@ jobs:
           echo "Checking src/**/*.js ..."
           find src -name '*.js' -print0 | xargs -0 -P4 -n1 node --check
           echo "All source files parsed OK."
+
+  # Runs `npm test` — the node:test suites under scripts/. Until this commit the
+  # only CI was the syntax parse above, so 3,540 assertions ran nowhere but on a
+  # contributor's laptop, and a PR could be "green" while the suite was broken.
+  #
+  # REPORTING ONLY, NOT A MERGE GATE YET. continue-on-error is deliberate:
+  # 23 assertions across 7 files already fail on main as of 2026-09-04 —
+  #   test-ci-sync.js (7), test-ci-ghl-note-result.js (6),
+  #   test-ci-production-defaults.js (4), test-ci-lp-note-id.js (2),
+  #   test-ci-verify-lp.js (2), test-ci-deferred-review.js (1),
+  #   test-handler-timeout-overrides.js (1)
+  # Gating on that today would block every PR in the repo. Making it a real gate
+  # is two steps, in this order: fix those 23, then delete the continue-on-error
+  # line below and mark "tests" required in branch protection. Do NOT get there
+  # by skipping or quarantining the failures — a suppressed test is worse than
+  # an ungated one, because it reads as green.
+  tests:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Run the test suite (node --test scripts/test-*.js)
+        run: npm test
