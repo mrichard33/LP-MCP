@@ -34,6 +34,24 @@
 // - lp.milestone_completed payload now carries datetype, act_date, job_value
 //   and branch_code — needed by the P2 rules (opportunity value, market
 //   attribution) and to disambiguate the mdt_id 'X' collision downstream.
+//
+// v7.5 — SKIP UNCHANGED JOB + MILESTONE WRITES (perf/skip-unchanged-child-writes):
+// - Calls, notes and activities have skipped existing rows since v7.0. Jobs and
+//   milestones did NOT: every job payload triggered an unconditional lp_jobs
+//   upsert (raw_lp_data JSONB included) and every milestone in it was pushed
+//   into msRows, whether or not one field had changed. Both rows carry
+//   synced_at: new Date().toISOString(), so every one of those was a REAL write
+//   — same class of defect as the lp_last_synced = new Date() bug that caused
+//   858 full GHL pushes per cycle.
+// - Measured 2026-09-04 on lp-mcp-production: 2,111 milestone rows written per
+//   incremental pass against 2 leads that had actually changed; the sync ran
+//   7m 31s on a ~16min cycle. sql/058 already had lp_job_milestones at 15.9%
+//   dead tuples.
+// - The header line above ("milestones use existence check since they're
+//   append-only") described an existence check that only ever fed the FIRE
+//   decision. It never gated the write. It does now, via rowIsUnchanged().
+// - The fire path is UNCHANGED: firesToDo is still materialised from
+//   decisionByMdt, never from msRows, so a skipped row still fires its tag.
 
 import supabase from './supabase.js';
 import { buildJobUpsertError } from './job-upsert-error.js';
@@ -49,8 +67,128 @@ import { mapJobFields, mapMilestoneChangeFields } from './lp-job-fields.js';
 import { selectFurthestMilestone } from './milestone-order.js';
 
 // ─── Skip counter for observability ──────────────────────────────
-let _childSkips = { calls: 0, notes: 0, activities: 0 };
-export function getChildSkipStats() { const s = { ..._childSkips }; _childSkips = { calls: 0, notes: 0, activities: 0 }; return s; }
+// Read-once semantics: reading DRAINS the counter. src/sync-engine.js reads it
+// exactly once per cycle, in the final orchestrator log line.
+const emptySkips = () => ({ calls: 0, notes: 0, activities: 0, jobs: 0, milestones: 0 });
+let _childSkips = emptySkips();
+export function getChildSkipStats() { const s = { ..._childSkips }; _childSkips = emptySkips(); return s; }
+
+// ─── Unchanged-row gate (v7.5) ───────────────────────────────────
+// Kill switch. Default ON. Set SYNC_SKIP_UNCHANGED_CHILDREN to the string
+// 'false' on Railway to restore the old always-write behaviour without a deploy.
+// Read per call, not once at import, so the flag can be flipped by a restart
+// rather than a rebuild.
+const skipUnchangedEnabled = () => process.env.SYNC_SKIP_UNCHANGED_CHILDREN !== 'false';
+
+// Columns that change on EVERY sync regardless of whether the record changed.
+// Excluding them is the entire point of this helper — compare content, not clocks.
+//
+// raw_lp_data is excluded for a second reason: it is the whole LP payload, so
+// comparing it would mean pulling every byte of it back over PostgREST on the
+// existence read — which is most of the cost this change exists to remove.
+//
+// The consequence, stated plainly: a row now holds the raw payload from the last
+// sync that changed a MAPPED column, not from the last sync full stop. Nothing
+// on the hot path reads it — mapJobFields derives every lp_jobs column from the
+// live payload, never from the stored blob. Two readers exist and both are fine:
+//   • src/jobs/market-resolver.js falls back to raw_lp_data->>'brp_id' only when
+//     branch_code is NULL, and branch_code is a compared column derived from
+//     that same key — a null one means the payload carried no branch either.
+//   • src/admin/lp-rtp-job-backfill.js reads raw_lp_data->>'contractid', which
+//     is NOT a mapped column, so a contractid that changes with no other change
+//     can go stale here. That is a one-shot admin backfill described in its own
+//     header as best-effort; if it ever needs a guaranteed-fresh blob, set
+//     SYNC_SKIP_UNCHANGED_CHILDREN=false for a cycle first.
+const VOLATILE_COLS = new Set(['synced_at', 'raw_lp_data']);
+
+/**
+ * True when `row` would write nothing new over `existing`.
+ *
+ * Only keys PRESENT on `row` are compared: both lp_jobs and lp_job_milestones
+ * build sparse rows (ghl_contact_id, and the shape-scoped job keys updated_at_lp
+ * and financing_company, are OMITTED — not nulled — when unavailable), and an
+ * omitted key must never read as a change. That asymmetry is deliberate: a sweep
+ * arriving with no contact must not blank a link it simply never saw (#784).
+ *
+ * Returns false when `existing` is missing — a new row always writes.
+ *
+ * CALLER CONTRACT: every key `row` can carry must be in the caller's SELECT
+ * list. A written-but-unselected column reads as undefined on `existing`, so a
+ * populated value on `row` compares unequal and the row never skips — noisy, but
+ * safe. The dangerous direction is the reverse and cannot happen here: this
+ * helper never treats an unknown key as equal.
+ */
+function rowIsUnchanged(row, existing) {
+  if (!existing) return false;
+  for (const [k, v] of Object.entries(row)) {
+    if (VOLATILE_COLS.has(k)) continue;
+    const a = v === undefined ? null : v;
+    const b = existing[k] === undefined ? null : existing[k];
+    if (a === null && b === null) continue;
+    if (a === null || b === null) return false;
+    if (a instanceof Date || b instanceof Date) {
+      if (new Date(a).getTime() !== new Date(b).getTime()) return false;
+      continue;
+    }
+    // Timestamps come back from PostgREST as strings in the server's rendering
+    // ('2026-06-01T09:00:00+00:00'), not the string we sent. Normalise before
+    // declaring a change, or every timestamp column would read as changed
+    // forever and the gate would never skip anything.
+    if (typeof a === 'string' && typeof b === 'string' && a !== b) {
+      const ta = Date.parse(a), tb = Date.parse(b);
+      if (!Number.isNaN(ta) && !Number.isNaN(tb) && ta === tb) continue;
+      return false;
+    }
+    // job_value is the ONE numeric column written here (NUMERIC(12,2)). PostgREST
+    // renders numerics as a JSON number on most deployments and as a string on
+    // some; parseFloat gives us a number either way. Compare numerically when
+    // BOTH sides look numeric so a 19595 vs '19595.00' render difference does
+    // not read as a change on every single sync. Every other column we write is
+    // text/boolean/timestamp, where both sides are already the same JS type.
+    if (typeof a === 'number' || typeof b === 'number') {
+      const na = Number(a), nb = Number(b);
+      if (Number.isFinite(na) && Number.isFinite(nb)) {
+        if (na !== nb) return false;
+        continue;
+      }
+      return false;
+    }
+    if (a !== b) return false;
+  }
+  return true;
+}
+
+// Every lp_jobs column syncJobAndMilestones can write, so rowIsUnchanged has
+// something to compare against. financing_company is ALSO load-bearing as input
+// to mapJobFields (it is Shape-B-only; without it a Shape A sweep of a
+// known-financed job downgrades financing_status) — that is why the read existed
+// before this change.
+//
+// KEEP IN STEP WITH THE UPSERT LITERAL AND mapJobFields (src/lp-job-fields.js).
+// A column that is written but not listed here can never be seen as changed by
+// the gate... which is the SAFE direction (it reads as changed and writes). The
+// unsafe direction would be listing a column here that the row never carries,
+// and that is harmless too — unlisted keys on `existing` are simply not compared.
+const JOB_COMPARE_COLUMNS = [
+  'lp_job_id', 'lp_lead_id', 'ghl_contact_id',
+  'job_status', 'job_value', 'branch_code', 'rep_name', 'created_at_lp',
+  // mapJobFields — always written
+  'rep_id', 'job_stage', 'install_date', 'install_completed_date',
+  'permit_status', 'hoa_required', 'permit_required', 'financing_status',
+  // mapJobFields — shape-scoped
+  'updated_at_lp', 'financing_company',
+].join(', ');
+
+// Every lp_job_milestones column the built msRow can write. ghl_tag_fired is
+// read for the FIRE decision (it predates this change) and tag_suppressed_* only
+// appear on suppressed rows, which are never skipped — both are listed so the
+// comparison is complete either way.
+const MILESTONE_COMPARE_COLUMNS = [
+  'lp_job_id', 'lp_lead_id', 'ghl_contact_id', 'mdt_id',
+  'datetype', 'est_date', 'act_date', 'entered_by', 'entered_on',
+  'last_changed_by', 'last_changed_on',
+  'ghl_tag_fired', 'tag_suppressed_backfill',
+].join(', ');
 
 // ─── Milestone Tag Map (mdt_id → GHL tag) ────────────────────────
 // NOTE: duplicated in src/milestones.js — the two must stay in step.
@@ -433,10 +571,15 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
   // It needs the current row because financing_company is Shape-B-only: without it
   // a Shape A sweep of a known-financed job would find no finance evidence in hand
   // and downgrade the row to whatever its status implied.
+  //
+  // v7.5: the select was widened from 'financing_company' to every column this
+  // upsert can write, so rowIsUnchanged() can gate the write below. The
+  // financing_company read is unchanged in purpose — it is still passed into
+  // mapJobFields for cross-shape continuity.
   const { data: existingJob } = await supabase.from('lp_jobs')
-    .select('financing_company').eq('lp_job_id', jobId).maybeSingle();
+    .select(JOB_COMPARE_COLUMNS).eq('lp_job_id', jobId).maybeSingle();
 
-  const { error: jobErr } = await supabase.from('lp_jobs').upsert({
+  const jobRow = {
     lp_job_id:       jobId,
     lp_lead_id:      lpLeadId,
     // ghl_contact_id is OMITTED, not nulled, when the caller has none. The
@@ -454,7 +597,30 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
     ...mapJobFields(job, existingJob || {}),
     synced_at:       new Date().toISOString(),
     raw_lp_data:     job,
-  }, { onConflict: 'lp_job_id' });
+  };
+
+  // v7.5 — skip the write when nothing this payload carries would change. The
+  // job-changes sweep re-delivers the same 131 jobs every pass; before this,
+  // each one rewrote the row plus its raw_lp_data JSONB.
+  //
+  // wouldLinkJobNow is the #784 orphan-link fix and MUST bypass the gate: on the
+  // pass where a contact first becomes available, the link has to land even if
+  // every other column matches. (rowIsUnchanged already returns false in that
+  // case — an omitted-vs-populated ghl_contact_id compares unequal — so this is
+  // belt-and-braces against a future edit to the comparison, and it is what
+  // makes the intent readable at the call site.)
+  const wouldLinkJobNow = 'ghl_contact_id' in jobRow && !existingJob?.ghl_contact_id;
+  const skipJob = skipUnchangedEnabled() && !wouldLinkJobNow && rowIsUnchanged(jobRow, existingJob);
+
+  let jobErr = null;
+  if (skipJob) {
+    // A skipped job is a SUCCESS. It must not return jobUpsertError, or
+    // runJobChangesSweep would count every quiet job as a failure.
+    _childSkips.jobs++;
+  } else {
+    ({ error: jobErr } = await supabase.from('lp_jobs')
+      .upsert(jobRow, { onConflict: 'lp_job_id' }));
+  }
   if (jobErr) {
     console.error(
       `[Sync] Job upsert FAILED for job ${jobId} (lead ${lpLeadId}) — ` +
@@ -490,8 +656,11 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
   // upsert. The fire decision is identical, just computed in memory first.
   const existingByMdt = new Map();
   {
+    // v7.5: widened from 'mdt_id, act_date, ghl_tag_fired' to every column the
+    // built msRow can write, so rowIsUnchanged() has something to compare. The
+    // three original columns still drive the FIRE decision, unchanged.
     const { data: existingRows } = await supabase.from('lp_job_milestones')
-      .select('mdt_id, act_date, ghl_tag_fired').eq('lp_job_id', jobId);
+      .select(MILESTONE_COMPARE_COLUMNS).eq('lp_job_id', jobId);
     for (const r of existingRows || []) existingByMdt.set(String(r.mdt_id), r);
   }
 
@@ -581,10 +750,28 @@ export async function syncJobAndMilestones(job, lpLeadId, ghlContactId, opts = {
   }
 
   // Materialise the deduped rows + counts + fire list from the decision map.
+  //
+  // v7.5 — the WRITE is gated here; the FIRE is not. firesToDo is still built
+  // from decisionByMdt and never from msRows, so a row that skips its write
+  // still fires its tag and emits its event exactly as before. Keep them
+  // decoupled: reading the fire list off msRows would silently re-couple them.
   const msRows = [];               // one row per mdt_id for the bulk upsert
   const firesToDo = [];            // non-suppressed first-time completions to fire after the upsert
+  const skipUnchanged = skipUnchangedEnabled();
   for (const [mdtId, d] of decisionByMdt) {
-    msRows.push(d.msRow);
+    const existing = existingByMdt.get(String(mdtId));
+    // NEVER skip a row that is being suppressed — the ghl_tag_fired /
+    // tag_suppressed_backfill pre-mark is the whole point of that path, and
+    // without it the milestones.js sweeper fires the tag on a later sync (#512).
+    // NEVER skip a row that would newly write ghl_contact_id — that is the
+    // orphan-link fix (#784 and its child follow-up); skipping freezes the
+    // 1,773 orphaned milestone rows in place forever.
+    const wouldLinkNow = 'ghl_contact_id' in d.msRow && !existing?.ghl_contact_id;
+    if (skipUnchanged && !d.suppress && !wouldLinkNow && rowIsUnchanged(d.msRow, existing)) {
+      _childSkips.milestones++;
+    } else {
+      msRows.push(d.msRow);
+    }
     if (d.suppress) {
       if (d.ghlLinked) suppressedFires++; else suppressedUnlinked++;
     } else if (d.fire) {
