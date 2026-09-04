@@ -150,7 +150,9 @@ import {
   setSyncInProgress, setSyncStartedAt, activeLogIds,
   syncLogStart, syncLogStartAll, syncLogProgress, syncLogComplete, syncLogFail,
   logSyncError, getLastSyncTimestamp, markRunningLogsAsFailed,
+  markRunningLogsAsInterrupted, syncLogTelemetry, SYNC_STATUS,
 } from './sync-log.js';
+import { acquireSyncLock } from './sync-lock.js';
 import { populateSourceMapping, backfillSourceMappingsFromLeads } from './sync-sources.js';
 import { syncDispositions, backfillDispositionsFromLeads } from './sync-dispositions.js';
 import { upsertLeadOnly, processProspect, attributionColumnsComplete } from './sync-leads.js';
@@ -186,6 +188,11 @@ const MAX_INCREMENTAL_LEADS = parseInt(process.env.MAX_INCREMENTAL_LEADS || '500
 // SYNC_TIMEOUT_MINUTES=60
 const SYNC_TIMEOUT_MINUTES = parseInt(process.env.SYNC_TIMEOUT_MINUTES || '45', 10);
 const SYNC_TIMEOUT_MS = SYNC_TIMEOUT_MINUTES * 60 * 1000;
+
+// WO-6 (A3): one key for the whole sweep. fullSync and incrementalSync are
+// mutually exclusive with each other as well as with themselves — they read
+// and write the same tables over the same LP window.
+const SYNC_LOCK_KEY = 'lp_sync:sweep';
 
 // v6.5: Per-sweep timeout (each sweep gets its own budget) and bounded
 // concurrency for processProspect calls within a page.
@@ -485,6 +492,17 @@ export async function fullSync() {
   setSyncInProgress(true);
   setSyncStartedAt(Date.now());
 
+  // WO-6 (A3): cross-process single-flight. Acquired BEFORE any log row
+  // exists — a worker that loses the race must leave no trace in
+  // lp_sync_log, or the health metric fills with phantom sweeps.
+  const lock = await acquireSyncLock(SYNC_LOCK_KEY);
+  if (!lock.acquired) {
+    console.log(`[Sync] Full sync skipped — "${SYNC_LOCK_KEY}" held by another worker (${lock.key}). Skipping, not queueing.`);
+    setSyncInProgress(false);
+    setSyncStartedAt(null);
+    return null;
+  }
+
   console.log('[Sync] Starting FULL sync...');
   const startedAt = new Date();
   resetGHLState();
@@ -627,6 +645,7 @@ export async function fullSync() {
   } finally {
     setSyncInProgress(false);
     setSyncStartedAt(null);
+    await lock.release();
   }
 
   const duration = Date.now() - startedAt.getTime();
@@ -687,6 +706,13 @@ async function runLeadsSweep(since, windowEnd, logIds, maxLeads) {
   // triple that made deep pages cost 3 calls each.
   let deepOffsetMode = false;
   let deepOffsetSince = null;
+  // WO-6 (A4): paging telemetry. apiCalls counts every LP round trip this
+  // sweep makes — main fetches, small-page retries and empty-page probes
+  // alike, because the deep-offset cost story is precisely about the extra
+  // calls. pages counts loop iterations. Both are reported per sweep and
+  // persisted to lp_sync_log so the duration question stops being a guess.
+  let apiCalls = 0;
+  let pages = 0;
   // v6.12: hash-gate diagnostics — why the gate did or didn't match.
   let gateStored = 0;   // prospects that had a stored hash to compare against
   let gateAbsent = 0;   // prospects with NO stored hash (never hashed / mixed rows)
@@ -713,7 +739,9 @@ async function runLeadsSweep(since, windowEnd, logIds, maxLeads) {
     // ask for exactly that. Anything larger comes back empty and costs a
     // wasted round trip.
     const fetchSize = deepOffsetMode ? 1 : pageSize;
+    pages++;
     try {
+      apiCalls++;
       leads = await getLeadData({
         startdate: since, enddate: windowEnd,
         PageSize: fetchSize, StartIndex: startIndex,
@@ -728,6 +756,7 @@ async function runLeadsSweep(since, windowEnd, logIds, maxLeads) {
       console.error(`[Sync:Leads] GetLeadData page StartIndex=${startIndex} failed: ${err.message} — backing off ${failBackoff}ms, retrying smaller`);
       await sleep(failBackoff);
       try {
+        apiCalls++;
         leads = await getLeadData({
           startdate: since, enddate: windowEnd,
           PageSize: Math.max(1, Math.floor(fetchSize / 4)), StartIndex: startIndex,
@@ -749,6 +778,7 @@ async function runLeadsSweep(since, windowEnd, logIds, maxLeads) {
       // empty result is authoritative — that is the end of the window.
       if (deepOffsetMode) break;
       try {
+        apiCalls++;
         const probe = extractArray(await getLeadData({
           startdate: since, enddate: windowEnd, PageSize: 1, StartIndex: startIndex,
         }));
@@ -1023,7 +1053,51 @@ async function runLeadsSweep(since, windowEnd, logIds, maxLeads) {
       `${newlyDenylisted} newly denylisted this sweep (total active denylist size now: ${denylistSet.size})`
     );
   }
-  return { counts, failed, hitCap, denylistSkipped, newlyDenylisted, unchangedSkipped, scanned, truncatedAt };
+  // WO-6 (A4): one structured line per entity per run, plus the same
+  // numbers persisted so this is queryable rather than log-only.
+  //
+  // `mode` is the branch actually taken — deepOffsetMode is set only where
+  // LP's positional refusal was proven by a probe that returned rows. It is
+  // never inferred from how long the sweep took, which is the inference this
+  // telemetry exists to replace.
+  //
+  // NOTHING here changes paging behaviour. Page sizes, keyset cursors,
+  // batch sizes and timeouts are deliberately untouched (WO-9 holds any
+  // paging verdict until this has run 24 uninterrupted hours).
+  const sweepMs = Date.now() - sweepStartedAt;
+  const pagingMode = deepOffsetMode ? 'deep' : 'normal';
+  logSweepTelemetry('leads', { pagingMode, pages, apiCalls, rows: scanned, ms: sweepMs });
+  await Promise.all(['leads', 'calls', 'notes', 'activities'].map(
+    (et) => syncLogTelemetry(logIds[et], { apiCalls, pagingMode }).catch(() => {})
+  ));
+
+  return { counts, failed, hitCap, denylistSkipped, newlyDenylisted, unchangedSkipped, scanned, truncatedAt, apiCalls, pages, pagingMode };
+}
+
+/**
+ * WO-6 (A4) — the structured sweep line.
+ *
+ *   [Sync] entity=<x> mode=<normal|deep> pages=<n> apiCalls=<n> rows=<n> ms=<n> peakRssMb=<n>
+ *
+ * Fixed key=value shape on purpose: it is meant to be grepped and parsed
+ * out of Railway logs, so the field order and names must not drift.
+ *
+ * peakRssMb is this process's high-water resident set, not the sweep's own
+ * allocation — Node gives no per-task figure. It is still the number that
+ * matters for the OOM question, and it is read here so a memory claim can
+ * be checked against a log line instead of a dashboard hover.
+ */
+let _peakRssBytes = 0;
+function logSweepTelemetry(entity, { pagingMode, pages, apiCalls, rows, ms }) {
+  try {
+    const rss = process.memoryUsage().rss;
+    if (rss > _peakRssBytes) _peakRssBytes = rss;
+  } catch (_) { /* memoryUsage is not worth failing a sweep over */ }
+  const peakRssMb = Math.round(_peakRssBytes / 1048576);
+  console.log(
+    `[Sync] entity=${entity} mode=${pagingMode} pages=${pages} ` +
+    `apiCalls=${apiCalls} rows=${rows} ms=${ms} peakRssMb=${peakRssMb}`
+  );
 }
 
 /**
@@ -1100,11 +1174,17 @@ async function runJobChangesSweep(since, windowEnd, logIds) {
   let deepOffsetSince = null;
   let scanned = 0;
   const sweepStartedAt = Date.now();
+  // WO-6 (A4): same counters as the leads sweep. This sweep is the untreated
+  // control arm for deep-offset cost, so its call count is the interesting one.
+  let apiCalls = 0;
+  let pages = 0;
 
   while (true) {
     let jobs;
     const fetchSize = deepOffsetMode ? 1 : SYNC_PAGE_SIZE;
+    pages++;
     try {
+      apiCalls++;
       jobs = await getJobStatusChanges({
         startdate: since, enddate: windowEnd,
         PageSize: fetchSize, StartIndex: startIndex,
@@ -1115,6 +1195,7 @@ async function runJobChangesSweep(since, windowEnd, logIds) {
       // deterministic empty-page path below.
       console.error(`[Sync:JobChanges] page StartIndex=${startIndex} failed: ${err.message} — retrying smaller`);
       try {
+        apiCalls++;
         jobs = await getJobStatusChanges({
           startdate: since, enddate: windowEnd,
           PageSize: Math.max(1, Math.floor(fetchSize / 4)), StartIndex: startIndex,
@@ -1132,6 +1213,7 @@ async function runJobChangesSweep(since, windowEnd, logIds) {
       // Same empty-page verification as the leads sweep — an empty page is not
       // proof of completion.
       try {
+        apiCalls++;
         const probe = extractArray(await getJobStatusChanges({
           startdate: since, enddate: windowEnd, PageSize: 1, StartIndex: startIndex,
         }));
@@ -1239,7 +1321,16 @@ async function runJobChangesSweep(since, windowEnd, logIds) {
       (healsUsed >= healBudget ? ' — BUDGET SPENT, remainder deferred to next sweep' : '')
     );
   }
-  return { counts, failed };
+
+  // WO-6 (A4): telemetry for the job-changes sweep. jobs/milestones rows are
+  // co-owned with the leads sweep, so this writes only the log line and the
+  // columns for entities this sweep alone pages for — writing api_calls onto
+  // a co-owned row would silently overwrite the other sweep's number.
+  const sweepMs = Date.now() - sweepStartedAt;
+  const pagingMode = deepOffsetMode ? 'deep' : 'normal';
+  logSweepTelemetry('job_changes', { pagingMode, pages, apiCalls, rows: scanned, ms: sweepMs });
+
+  return { counts, failed, apiCalls, pages, pagingMode };
 }
 
 // ─── Incremental Sync ────────────────────────────────────────────
@@ -1259,6 +1350,15 @@ export async function incrementalSync() {
   setSyncInProgress(true);
   setSyncStartedAt(Date.now());
 
+  // WO-6 (A3): see fullSync. Acquired before the first lp_sync_log row.
+  const lock = await acquireSyncLock(SYNC_LOCK_KEY);
+  if (!lock.acquired) {
+    console.log(`[Sync] Incremental sync skipped — "${SYNC_LOCK_KEY}" held by another worker. Skipping, not queueing.`);
+    setSyncInProgress(false);
+    setSyncStartedAt(null);
+    return null;
+  }
+
   console.log('[Sync] Starting incremental sync...');
   const startedAt = new Date();
   resetGHLState();
@@ -1269,6 +1369,9 @@ export async function incrementalSync() {
     if (!lastSyncTime) {
       console.log('[Sync] No previous sync found — running full sync instead');
       setSyncInProgress(false);
+      // Hand the lock over rather than holding it across the delegation —
+      // fullSync acquires the same key and would otherwise skip itself.
+      await lock.release();
       return fullSync();
     }
 
@@ -1426,6 +1529,7 @@ export async function incrementalSync() {
   } finally {
     setSyncInProgress(false);
     setSyncStartedAt(null);
+    await lock.release();
   }
 }
 
@@ -1488,11 +1592,23 @@ export function startSyncScheduler() {
       await getToken();
       console.log('[Sync] LP token acquired');
 
-      // Clean up stale "running" rows from previous deployments
+      // Clean up orphaned "running" rows left by a process that was killed
+      // before its shutdown handler could run.
+      //
+      // WO-6 (A2): these land as `interrupted`, not `failed` — same reason
+      // as the SIGTERM handler. An orphaned row IS a container kill; it is
+      // only distinguishable from one because the kill was hard enough that
+      // no handler ran. Marking it `failed` put pure infrastructure noise
+      // into the metric operators are supposed to alert on.
+      //
+      // Note this is now a backstop, not the mechanism. The sweep lock is
+      // leased (src/sync-lock.js) and expires on its own, so a killed
+      // holder no longer blocks its successor and this sweep no longer has
+      // to run for the lock to be usable.
       try {
         const staleThreshold = new Date(Date.now() - STALE_LOCK_MINUTES * 60000).toISOString();
         const { data: staleRows } = await supabase.from('lp_sync_log')
-          .update({ status: 'failed', error_message: 'Stale lock — cleaned up on boot', completed_at: new Date().toISOString() })
+          .update({ status: SYNC_STATUS.INTERRUPTED, error_message: 'Stale lock — cleaned up on boot', completed_at: new Date().toISOString() })
           .eq('status', 'running').lt('started_at', staleThreshold).select('id');
         if (staleRows?.length > 0) console.log(`[Sync] Cleaned ${staleRows.length} stale running rows`);
       } catch (err) { console.warn('[Sync] Stale row cleanup failed:', err.message); }
@@ -1543,16 +1659,23 @@ export function stopSyncScheduler() {
 
 // ─── Process Signal Handlers ─────────────────────────────────────
 
+// WO-6 (A2.2): in-flight rows land as `interrupted`, not `failed`.
+//
+// Railway sends SIGTERM on every deploy. Over the 48h to 2026-09-04 that
+// was 186 of 198 "failures" — 17 deploys between 02:25 and 04:19 UTC alone,
+// each killing a container mid-sweep and each writing 6 rows (one per
+// entity type). None of them were sync failures. They are now labelled as
+// what they are, and get_sync_health counts them separately.
 process.on('SIGTERM', async () => {
   console.log('[Sync] SIGTERM received — cleaning up...');
   stopSyncScheduler();
-  await markRunningLogsAsFailed('SIGTERM — container terminated');
+  await markRunningLogsAsInterrupted('SIGTERM — container terminated');
   process.exit(0);
 });
 
 process.on('SIGINT', async () => {
   console.log('[Sync] SIGINT received — cleaning up...');
   stopSyncScheduler();
-  await markRunningLogsAsFailed('SIGINT — process interrupted');
+  await markRunningLogsAsInterrupted('SIGINT — process interrupted');
   process.exit(0);
 });

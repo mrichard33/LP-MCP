@@ -80,7 +80,20 @@ export function registerSyncTools(server) {
         .gte('started_at', oneDayAgo);
 
       const totalSynced = (recentSyncs || []).reduce((s, r) => s + (r.records_synced || 0), 0);
-      const totalFailed = (recentSyncs || []).filter(r => r.status === 'failed').length;
+
+      // WO-6 (A2.3): three terminal counts, reported separately.
+      //
+      // `failed_syncs` used to count every row with status='failed', and the
+      // SIGTERM handler wrote container kills into that status. Over the 48h
+      // to 2026-09-04 that made 192 of 198 "failures" infrastructure events
+      // — a 23% failure rate that was really a deploy count. The key is kept
+      // for backward compatibility with dashboards and saved queries, but it
+      // now counts ONLY real record-level failures. Alert on `failed`.
+      // `interrupted` is informational: a spike there means deploy or restart
+      // churn, never a data defect.
+      const totalCompleted   = (recentSyncs || []).filter(r => r.status === 'completed').length;
+      const totalFailed      = (recentSyncs || []).filter(r => r.status === 'failed').length;
+      const totalInterrupted = (recentSyncs || []).filter(r => r.status === 'interrupted').length;
 
       // Unmapped sources count — the raw review queue. Cheap and DB-only, so
       // it stays here; the authoritative gap (LP's catalog diffed against
@@ -121,8 +134,14 @@ export function registerSyncTools(server) {
             last_24h: {
               syncs_run: recentSyncs?.length || 0,
               records_synced: totalSynced,
+              completed: totalCompleted,
+              failed: totalFailed,
+              interrupted: totalInterrupted,
+              // Back-compat key. Same number as `failed` — real record-level
+              // failures only, no container kills.
               failed_syncs: totalFailed,
             },
+            sync_status_note: 'failed = real record-level failures only. interrupted = the container was killed mid-sweep (Railway deploy/restart) — infrastructure, not a data defect. Alert on failed; read interrupted as deploy churn.',
             unmapped_sources: unmappedCount || 0,
             unmapped_sources_note: 'Raw review-queue rows. For the real gap against LP\'s source catalog, run get_source_catalog_health.',
             unfired_milestone_triggers: unfiredMilestones || 0,
