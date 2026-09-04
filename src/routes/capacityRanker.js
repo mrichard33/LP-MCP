@@ -31,11 +31,14 @@
  * because the bot id lives here and not in n8n — see checkCampaignState.
  *
  * POST /n8n/capacity-ranker/heal — the same watchdog calls this when
- * campaign-state reports all_running:false. It restarts any campaign the last
- * failed cycle left NOT_RUNNING, verified, and records the outcome. Idempotent:
- * it only ever starts, never stops, and no-ops when everything is up. This is
- * the cover for the two failure modes the run cannot cover itself — a process
- * death between stop and start, and retries that genuinely exhaust. See
+ * campaign-state reports all_running:false. It sweeps BOTH Data campaigns'
+ * LIVE state and restarts any that reads NOT_RUNNING, verified, then records
+ * the outcome. It does NOT scope itself to the campaigns named in the last
+ * restart_failures row: a process death between stop and start writes no row
+ * at all, and a row naming one campaign says nothing about the other. That row
+ * is provenance only. A campaign the ranker is cycling RIGHT NOW is left
+ * alone — the run's own finally block owns that restart. Idempotent: it only
+ * ever starts, never stops, and no-ops when everything is up. See
  * healCampaigns.
  *
  * Body: { slot_date?: "YYYY-MM-DD" } — defaults to tomorrow, America/New_York.
@@ -76,7 +79,7 @@ import { tryAcquireLock, releaseLock } from '../services/outbound-locks.js';
 import { reportAlertCondition } from '../alert-state.js';
 import { rankMarkets, isMaterialChange, DEFAULT_SWAP_MARGIN, MARKET_CODES } from '../capacity/rankMarkets.js';
 import {
-  applyDialPriority, CAMPAIGNS, isCycling, restartCampaignVerified, DEFAULT_RESTART,
+  applyDialPriority, CAMPAIGNS, TIERS, isCycling, restartCampaignVerified, DEFAULT_RESTART,
 } from '../capacity/applyDialPriority.js';
 import {
   getMarketPerformance, countBottomHalfStreaks, resolvePerfWeight,
@@ -694,28 +697,52 @@ export async function healCampaigns(deps = {}) {
     insertLog = insertLogLive,
     markHealed = markHealedLive,
     sendAlert = (text) => sendGroupMeMessage(text, { noDedup: true }),
+    cycling = isCycling,
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
     now = new Date(),
     log = console.log,
   } = deps;
 
+  // THE FAILURE ROW SAYS WHY A CAMPAIGN IS DOWN. IT DOES NOT BOUND WHAT CAN BE.
+  //
+  // This used to sweep only the campaigns named in the most recent
+  // restart_failures row, which left two holes big enough to drive the original
+  // incident through:
+  //
+  //   1. A row naming Warm says nothing about Hot. If Hot died from a process
+  //      death between stop and start — the exact case this sweeper exists for —
+  //      the newest row still names Warm, and Hot was never even looked at.
+  //   2. A process death writes NO row at all. Both campaigns could be dark and
+  //      this returned "nothing to heal".
+  //
+  // So the sweep always covers BOTH Data campaigns and treats LIVE STATE as the
+  // authority, exactly as the watchdog's campaign-state does. The failure row is
+  // now only provenance — which incident this heal is closing out. A campaign
+  // that reads RUNNING is skipped either way, so widening the scope costs
+  // nothing and cannot start something that is already up.
   const source = await readLastRestartFailure();
   const names = Array.isArray(source?.restart_failures)
     ? source.restart_failures.filter(Boolean)
     : [];
-  if (!names.length) {
-    log('[CapacityRanker] HEAL: no dial_priority_log row carries restart_failures — nothing to heal');
-    return {
-      status: 200,
-      body: { healed: [], already_running: [], failed: [], source_log_id: source?.id ?? null, no_op: true, checked_at: now.toISOString() },
-    };
-  }
+  const sweep = [...new Set([...TIERS.map((t) => CAMPAIGNS[t]), ...names])];
 
   const healed = [];
   const alreadyRunning = [];
   const failed = [];
+  const skippedCycling = [];
 
-  for (const campaign of names) {
+  for (const campaign of sweep) {
+    // NEVER FIGHT A CYCLE IN FLIGHT. A campaign the ranker stopped seconds ago
+    // to reorder its lists is NOT_RUNNING on purpose, and the list write is
+    // refused against a RUNNING campaign — so starting it here would break the
+    // reorder this process is in the middle of. The run's own finally block
+    // owns that restart. Process-local, like the watchdog's suppression: if the
+    // process died, the mark died with it and this heals normally.
+    if (cycling(campaign)) {
+      skippedCycling.push(campaign);
+      log(`[CapacityRanker] HEAL: ${campaign} is NOT_RUNNING because the ranker is cycling it right now — leaving it to the run`);
+      continue;
+    }
     const readState = async () => String((await getOutbound(campaign))?.state || '').toUpperCase();
     let state = null;
     try {
@@ -732,8 +759,9 @@ export async function healCampaigns(deps = {}) {
       continue;
     }
     log(`[CapacityRanker] HEAL: ${campaign} reads ${state} — starting it`);
-    // restartCampaignVerified waits out STOPPING/STARTING before firing, so a
-    // heal that lands mid-cycle does not fight the run that is already there.
+    // The cycling guard above covers a cycle THIS process is running.
+    // restartCampaignVerified additionally waits out STOPPING/STARTING, which
+    // covers a stop that another process or a human started.
     const r = await restartCampaignVerified(campaign, {
       startCampaign, readState, sleep, log,
       maxAttempts: HEAL_BUDGET.maxAttempts,
@@ -753,7 +781,7 @@ export async function healCampaigns(deps = {}) {
   // one of those polls.
   const acted = healed.length > 0 || failed.length > 0;
   const outcome = failed.length ? 'heal_failed' : (healed.length ? 'healed' : 'noop');
-  const summary = `heal: ${outcome} — healed=[${healed.join(', ')}] already_running=[${alreadyRunning.join(', ')}] failed=[${failed.map((f) => f.campaign).join(', ')}] (source dial_priority_log id ${source?.id ?? '?'})`;
+  const summary = `heal: ${outcome} — healed=[${healed.join(', ')}] already_running=[${alreadyRunning.join(', ')}] failed=[${failed.map((f) => f.campaign).join(', ')}] cycling=[${skippedCycling.join(', ')}] (source dial_priority_log id ${source?.id ?? 'none'})`;
   log(`[CapacityRanker] ${summary}`);
 
   // The outcome row: a durable record that a heal DID something. mode is
@@ -787,7 +815,12 @@ export async function healCampaigns(deps = {}) {
 
   // Stamp the row that recorded the failure, so a later heal (and a human
   // reading the log) can see the incident was closed and when.
-  if (healed.length && source?.id) {
+  //
+  // ONLY for a campaign that row actually named. Now that the sweep covers both
+  // campaigns, healing Hot says nothing about a row that named Warm — marking
+  // that row healed would close out an incident nobody fixed.
+  const healedNamed = healed.filter((c) => names.includes(c));
+  if (healedNamed.length && source?.id) {
     try {
       await markHealed(source.id, healedAt);
     } catch (err) {
@@ -815,6 +848,11 @@ export async function healCampaigns(deps = {}) {
       healed,
       already_running: alreadyRunning,
       failed,
+      // What the sweep looked at, and what it deliberately left alone. swept is
+      // always BOTH Data campaigns — source_log_id is provenance for the
+      // incident being closed, not the scope of the sweep.
+      swept: sweep,
+      cycling: skippedCycling,
       no_op: !acted,
       source_log_id: source?.id ?? null,
       healed_at: healed.length ? healedAt : null,
