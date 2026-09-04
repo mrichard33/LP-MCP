@@ -55,6 +55,21 @@ export let syncInProgress = false;
 export let syncStartedAt = null;
 export const STALE_LOCK_MINUTES = 120; // 2 hours max before force-reset
 
+// WO-6 (082): terminal statuses. `failed` means real record-level failures
+// and NOTHING else — it is the number worth alerting on. `interrupted` is
+// the process being killed out from under an in-flight sweep, which is an
+// infrastructure event and never a data defect.
+//
+// Every SIGTERM row in lp_sync_log was written by a Railway deploy shutting
+// the old container down. Counting those as failures is what produced a
+// "23% failure rate" that nobody could act on for weeks.
+export const SYNC_STATUS = Object.freeze({
+  RUNNING:     'running',
+  COMPLETED:   'completed',
+  FAILED:      'failed',
+  INTERRUPTED: 'interrupted',
+});
+
 // v6.6: Max days to look back in incremental sync. Env-configurable.
 // Default lowered from 3 → 1 so a long gap between successful syncs
 // doesn't silently inflate per-run workload past the per-sweep timeout
@@ -234,12 +249,22 @@ export async function getLastSyncTimestamp() {
       .limit(1)
       .maybeSingle();
 
-    // Second try: failed syncs that wrote >100 records (partial progress is real)
+    // Second try: non-completed syncs that wrote >100 records (partial
+    // progress is real).
+    //
+    // WO-6 (082): this MUST include `interrupted` as well as `failed`. A
+    // sweep killed by a Railway deploy after writing 4,000 rows is the
+    // single most common partial-progress case there is — before 082 those
+    // rows were labelled `failed` and this query caught them. Matching only
+    // `failed` now would silently drop the cursor back to the last fully
+    // completed sync, re-scanning a window that was already synced and, on a
+    // long deploy run, drifting far enough back to trip the
+    // MAX_INCREMENTAL_DAYS cap and fire a false sync_gap alert.
     const { data: partialFailed } = await supabase
       .from('lp_sync_log')
       .select('started_at')
       .eq('entity_type', 'leads')
-      .eq('status', 'failed')
+      .in('status', [SYNC_STATUS.FAILED, SYNC_STATUS.INTERRUPTED])
       .gt('records_synced', 100)
       .not('started_at', 'is', null)
       .order('started_at', { ascending: false })
@@ -294,21 +319,56 @@ export async function getLastSyncTimestamp() {
 // the diagnostic loop "is Railway killing us or did we time out?" take
 // far longer than it should have.
 export async function markRunningLogsAsFailed(reason = 'Process terminated') {
+  return markRunningLogsTerminal(SYNC_STATUS.FAILED, reason);
+}
+
+// WO-6 (082): the shutdown path now marks its rows `interrupted`, not
+// `failed`. Same mechanics, honest status.
+//
+// This is the whole fix for the lying metric. A container kill during a
+// deploy is not a sync failure, and writing it into the same bucket as
+// "2 records failed" is what made failed_syncs unreadable.
+export async function markRunningLogsAsInterrupted(reason = 'Process terminated') {
+  return markRunningLogsTerminal(SYNC_STATUS.INTERRUPTED, reason);
+}
+
+export async function markRunningLogsTerminal(status, reason) {
   try {
     const ids = [...activeLogIds];
     if (ids.length === 0) {
       console.log('[Sync] No active sync log IDs to clean up');
-      return;
+      return 0;
     }
     await supabase.from('lp_sync_log')
       .update({
-        status: 'failed',
+        status,
         error_message: reason,
         completed_at: new Date().toISOString(),
       })
       .in('id', ids);
-    console.log(`[Sync] Marked ${ids.length} owned sync log rows as failed: "${reason}"`);
+    console.log(`[Sync] Marked ${ids.length} owned sync log rows as ${status}: "${reason}"`);
+    return ids.length;
   } catch (_) {
     // Best-effort — process is shutting down
+    return 0;
+  }
+}
+
+// WO-6 (A4): persist paging telemetry so the long-run problem becomes
+// queryable instead of log-only.
+//
+// `pagingMode` MUST come from the branch the sweep actually took. Inferring
+// "it was slow, so it must have been deep paging" is the guess this column
+// exists to replace.
+export async function syncLogTelemetry(logId, { apiCalls, pagingMode } = {}) {
+  if (!logId) return;
+  try {
+    const patch = {};
+    if (Number.isFinite(apiCalls)) patch.api_calls = apiCalls;
+    if (pagingMode) patch.paging_mode = pagingMode;
+    if (Object.keys(patch).length === 0) return;
+    await supabase.from('lp_sync_log').update(patch).eq('id', logId);
+  } catch (_) {
+    // Telemetry must never break a sync.
   }
 }
