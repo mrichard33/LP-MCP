@@ -321,6 +321,7 @@ function fakeFive9({
   writesEnabled = true, applyWrites = true, refuse = null,
   states = null, refuseWhileRunning = false,
   startsBeforeRunning = 0, startAlwaysFails = false, startThrows = false,
+  startLagMs = 0,
 } = {}) {
   const state = {
     [CAMPAIGNS.hot]: LIVE_HOT_LISTS.map((l) => ({ ...l })),
@@ -331,7 +332,22 @@ function fakeFive9({
   const calls = [];
   const startAttempts = {};
   const stoppedByUs = new Set(); // campaigns THIS run stopped and has not brought back
+  // Five9 reports campaign state on a lag: the SOAP start is accepted, but
+  // state reads keep saying NOT_RUNNING for a while (5-8s observed live on
+  // 2026-09-03). Time only passes here when the code under test sleeps, so the
+  // test's injected sleep drives this clock through advance().
+  let clock = 0;
+  const flipAt = {};
+  const readCampaignState = (name) => {
+    if (flipAt[name] !== undefined && clock >= flipAt[name]) {
+      campaignState[name] = 'RUNNING';
+      stoppedByUs.delete(name);
+      delete flipAt[name];
+    }
+    return campaignState[name];
+  };
   return {
+    advance: (ms) => { clock += ms; },
     state,
     campaignState,
     writes,
@@ -339,7 +355,7 @@ function fakeFive9({
     deps: {
       five9WritesEnabled: () => writesEnabled,
       getOutboundCampaign: async (name) => (state[name]
-        ? { name, state: campaignState[name], lists: state[name].map((l) => ({ ...l })) }
+        ? { name, state: readCampaignState(name), lists: state[name].map((l) => ({ ...l })) }
         : { name, error: 'campaign_not_found' }),
       modifyCampaignLists: async (action) => {
         const p = action.action_payload;
@@ -372,9 +388,13 @@ function fakeFive9({
         startAttempts[name] = (startAttempts[name] || 0) + 1;
         if (startThrows) throw new Error('Five9 startCampaign fault');
         if (startAlwaysFails) return { campaign: name, method: 'startCampaign', state: 'NOT_RUNNING' };
-        if (startAttempts[name] > startsBeforeRunning) {
-          campaignState[name] = 'RUNNING';
-          stoppedByUs.delete(name);
+        if (startAttempts[name] > startsBeforeRunning && campaignState[name] !== 'RUNNING') {
+          // Five9 has ACCEPTED the start; the campaign is dialing. State
+          // reporting catches up startLagMs later. A repeat start does not
+          // re-arm the lag — the campaign is already up (decideLifecycleNoop
+          // makes a start on a RUNNING campaign a skip).
+          if (flipAt[name] === undefined) flipAt[name] = clock + startLagMs;
+          if (startLagMs === 0) { campaignState[name] = 'RUNNING'; stoppedByUs.delete(name); delete flipAt[name]; }
         }
         return { campaign: name, method: 'startCampaign', state: campaignState[name] };
       },
@@ -440,14 +460,76 @@ test('CYCLE: restart reads non-RUNNING twice then RUNNING → retried with backo
   const sleeps = [];
   const f = fakeFive9({ startsBeforeRunning: 2 });
   const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
-    ...f.deps, cycleCampaigns: true, restartAttempts: 3, restartBackoffMs: 2000,
+    ...f.deps, cycleCampaigns: true, restartAttempts: 3, restartBackoffMs: 2000, restartSettleMs: 5000,
     sleep: async (ms) => { sleeps.push(ms); }, log: () => {},
   });
   assert.equal(f.calls.filter((c) => c[0] === 'start' && c[1] === CAMPAIGNS.hot).length, 3, 'three start attempts on hot');
-  assert.deepEqual(sleeps.slice(0, 2), [2000, 2000], '2s backoff between attempts');
+  assert.deepEqual(sleeps.slice(0, 5), [5000, 2000, 5000, 2000, 5000], 'settle before each read, 2s backoff between attempts');
   assert.equal(out.campaigns.hot.restarted, true);
   assert.equal(out.applied, true);
   assert.deepEqual(out.restart_failures, []);
+});
+
+// Five9 reports campaign state asynchronously. On 2026-09-03 the STEP 0 start
+// was accepted at 20:13:41 and getCampaignState still read NOT_RUNNING until
+// ~20:13:49. Reading state the instant the start returns therefore says
+// "campaign is dark" about a campaign that is dialing — a false CRITICAL, a
+// false 500, and a page for nobody.
+
+test('LAG: state still reads NOT_RUNNING right after an accepted start → settles, ONE start call, restarted:true', async () => {
+  const sleeps = [];
+  const f = fakeFive9({ startLagMs: 3000 }); // shorter than the 5s settle
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true, restartSettleMs: 5000,
+    sleep: async (ms) => { sleeps.push(ms); f.advance(ms); }, log: () => {},
+  });
+  assert.equal(f.calls.filter((c) => c[0] === 'start' && c[1] === CAMPAIGNS.hot).length, 1, 'the start was accepted once — never re-fired at a live campaign');
+  assert.equal(sleeps[0], 5000, 'settled before believing the read');
+  assert.equal(out.campaigns.hot.restarted, true);
+  assert.deepEqual(out.restart_failures, []);
+  assert.equal(out.applied, true);
+});
+
+test('LAG: every attempt reads stale, the FINAL confirmation read rescues it — no CRITICAL, applied stays true', async () => {
+  const sleeps = [];
+  const log = [];
+  // 25s lag: every attempt (3 × 5s settle + 2 × 2s backoff = 19s) reads stale.
+  const f = fakeFive9({ startLagMs: 25000 });
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true, restartAttempts: 3, restartSettleMs: 5000,
+    restartBackoffMs: 2000, restartFinalWaitMs: 10000,
+    sleep: async (ms) => { sleeps.push(ms); f.advance(ms); }, log: (m) => log.push(m),
+  });
+  assert.equal(sleeps.at(-1), 10000, 'the last wait is the final confirmation wait');
+  assert.equal(out.campaigns.hot.restarted, true);
+  assert.equal(out.campaigns.hot.restart_error, undefined, 'a rescued restart carries no error');
+  assert.ok(!log.some((m) => /CRITICAL/.test(m)), 'never paged anyone');
+  assert.deepEqual(out.restart_failures, []);
+  assert.equal(out.applied, true);
+});
+
+test('LAG: a genuinely dark campaign still fails after the final read — the alarm is not disarmed', async () => {
+  const log = [];
+  const f = fakeFive9({ startAlwaysFails: true });
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true, sleep: async () => {}, log: (m) => log.push(m),
+  });
+  assert.equal(out.campaigns.hot.restarted, false);
+  assert.deepEqual(out.restart_failures, [CAMPAIGNS.hot]);
+  assert.equal(out.applied, false);
+  assert.ok(log.some((m) => /CRITICAL.*DID NOT RESTART/.test(m)));
+});
+
+test('DOWNTIME: measured to the start Five9 accepted, not to the confirmation read that waits out the lag', async () => {
+  const f = fakeFive9({ startLagMs: 30 });
+  const out = await applyDialPriority(rankMarkets(FIXTURE_2026_09_04), {
+    ...f.deps, cycleCampaigns: true, restartSettleMs: 60, log: () => {},
+    // Real elapsed time AND fake-clock time, so the settle genuinely waits.
+    sleep: async (ms) => { f.advance(ms); await new Promise((r) => setTimeout(r, ms)); },
+  });
+  assert.ok(out.campaigns.hot.downtime_ms < 50,
+    `downtime ${out.campaigns.hot.downtime_ms}ms should exclude the settle wait — the campaign was already dialing`);
+  assert.equal(out.campaigns.hot.restarted, true);
 });
 
 test('CYCLE: restart NEVER succeeds → applied:false, restart_failures populated, restart_error recorded', async () => {
