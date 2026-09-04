@@ -23,23 +23,23 @@ jobs:
           echo "All source files parsed OK."
 
   # Runs `npm test` — the node:test suites under scripts/. Until this commit the
-  # only CI was the syntax parse above, so 3,540 assertions ran nowhere but on a
-  # contributor's laptop, and a PR could be "green" while the suite was broken.
+  # only CI was the syntax parse above, so 3,500+ assertions ran nowhere but on
+  # a contributor's laptop, and a PR could be "green" while the suite was broken.
   #
-  # REPORTING ONLY, NOT A MERGE GATE YET. continue-on-error is deliberate:
-  # 23 assertions across 7 files already fail on main as of 2026-09-04 —
-  #   test-ci-sync.js (7), test-ci-ghl-note-result.js (6),
-  #   test-ci-production-defaults.js (4), test-ci-lp-note-id.js (2),
-  #   test-ci-verify-lp.js (2), test-ci-deferred-review.js (1),
-  #   test-handler-timeout-overrides.js (1)
-  # Gating on that today would block every PR in the repo. Making it a real gate
-  # is two steps, in this order: fix those 23, then delete the continue-on-error
-  # line below and mark "tests" required in branch protection. Do NOT get there
-  # by skipping or quarantining the failures — a suppressed test is worse than
-  # an ungated one, because it reads as green.
+  # ─────────────────────────────────────────────────────────────────────────
+  # MERGE ORDER: this job BLOCKS. It must not land before the PR that repairs
+  # the 23 assertions that were failing on main as of 2026-09-04
+  # (fix/ci-test-time-bombs — a dropped `now` in stageSync plus fixtures that
+  # aged past the 24h note-age gate). Merging this first turns every PR in the
+  # repo red. Sequence: fixes first, this second.
+  # ─────────────────────────────────────────────────────────────────────────
+  #
+  # With those fixed the suite is 3544 tests / 3535 pass / 0 fail / 9 skipped,
+  # so this gates honestly. If it ever goes red, fix the code or the test — do
+  # NOT restore continue-on-error, and do not skip or quarantine a failure. A
+  # suppressed test is worse than an ungated one, because it reads as green.
   tests:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
