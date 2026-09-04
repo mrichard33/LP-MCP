@@ -681,8 +681,12 @@ const MUTATION_GATED_ACTION_TYPES = new Set([
 ]);
 
 // Mutation-gate exemptions (isMutationGateExempt): add_tag of a suppression/
-// audit tag, or an authorized DNC-lift flagged bypass_suppression. Centralized
-// in suppression-check.js so the exemption is unit-tested as a pure predicate.
+// audit tag, an authorized DNC-lift flagged bypass_suppression, or (2026-09-03)
+// a DE-ESCALATION action whose only possible effect is to reduce contact —
+// remove_from_workflow unconditionally, and remove_tag of an enrollment/cohort
+// tag only. A suppression tag must never be what blocks us from honoring it.
+// Centralized in suppression-check.js so the exemption is unit-tested as a
+// pure predicate.
 
 async function executeSingleAction(action, batchContext = {}, priorBatchResults = []) {
   const handler = ACTION_HANDLERS[action.action_type];
@@ -708,9 +712,15 @@ async function executeSingleAction(action, batchContext = {}, priorBatchResults 
   // matching checkSuppression.
   if (MUTATION_GATED_ACTION_TYPES.has(action.action_type)) {
     // Exempt: add_tag of a suppression/audit tag (how suppression is recorded),
-    // or an authorized DNC-lift flagged bypass_suppression (it must REMOVE the
-    // stack from a stop-bot contact — see isMutationGateExempt). Every other
-    // mutation on a suppressed contact still blocks.
+    // an authorized DNC-lift flagged bypass_suppression (it must REMOVE the
+    // stack from a stop-bot contact — see isMutationGateExempt), or a
+    // de-escalation action (2026-09-03): remove_from_workflow, and remove_tag
+    // of an enrollment/cohort tag. Those can only REDUCE contact, so a
+    // suppression tag blocking them inverts what the gate is for — it left a
+    // contact who asked us to stop still enrolled in a running sequence.
+    // remove_tag of a suppression tag, stage:*, active-entry:*, and
+    // cancel_appointment are all still gated. Every other mutation on a
+    // suppressed contact still blocks.
     if (!isMutationGateExempt(action)) {
       const mutationGate = await checkMutationSuppression(action.target_id);
       if (mutationGate.suppressed) {
