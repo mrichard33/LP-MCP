@@ -36,6 +36,33 @@
  * to follow within minutes, not within a deploy. Same reasoning as
  * isQuietHoursBypassed() in src/services/quiet-hours.js. The defaults are the
  * live Five9 values, so an unset env is already correct.
+ *
+ * THIS IS THE DIAL SCHEDULE, NOT AGENT AVAILABILITY — DECIDED, NOT OVERLOOKED
+ * ──────────────────────────────────────────────────────────────────────────
+ * The Callback Request campaign runs in PREVIEW mode. PREVIEW does not
+ * auto-dial: Five9 presents the record to a logged-in agent, who places the
+ * call. So the binding constraint on a callback actually happening is AN AGENT
+ * BEING LOGGED IN, which is not what this module measures.
+ *
+ * Observed live 2026-09-04: a correctly-built record sat in the Callback
+ * Request list without dialing at 18:49 ET — inside the 08:00-21:00 window,
+ * profile filter cleared, callNowMode=ANY applied — because
+ * five9_supervisor_statistics(AgentState) returned zero rows. Friday evening,
+ * empty floor. Nothing was broken; there was simply nobody to hand it to.
+ *
+ * The consequence is real and accepted: between the last agent logging off and
+ * 21:00, the bot will promise "someone will ring you in the next few minutes"
+ * and no call will go out until the floor is back. Mark ruled on this
+ * 2026-09-04 with the trade-off stated: keep PREVIEW, do NOT gate the promise
+ * on live agent availability, and keep the promise window on the dial schedule
+ * as it is.
+ *
+ * So if you are here because a callback was promised at 8:45 PM and never
+ * placed: that is this decision, not a defect. The alternatives were weighed
+ * and declined — narrowing the window to staffed hours (drifts from the dial
+ * schedule and needs hand-maintenance), and reading AgentState per reply (puts
+ * a live Five9 call in the reply path, which then has to fail toward the safer
+ * copy). Reopen it with Mark rather than "fixing" it here.
  */
 
 const TZ = 'America/New_York';
