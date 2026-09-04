@@ -111,6 +111,7 @@ function createRecorder() {
       lt(c, v)     { s.filters.push(['lt', c, v]);  return chain; },
       lte(c, v)    { s.filters.push(['lte', c, v]); return chain; },
       gte(c, v)    { s.filters.push(['gte', c, v]); return chain; },
+      is(c, v)     { s.filters.push(['is', c, v]);  return chain; },
       not(c, o, v) { s.filters.push(['not', c, o, v]); return chain; },
       order(c, o)  { s.filters.push(['order', c, o]); return chain; },
       limit(n)     { s.filters.push(['limit', n]); return chain; },
@@ -359,6 +360,54 @@ test('a degraded acquire fails open rather than stopping all syncing', async () 
     'a Supabase outage must not become an LP data-freshness outage — the in-memory guard still holds within the process');
   assert.equal(lock.degraded, true, 'and it must say so');
   assert.equal(lock._timer, null, 'a degraded lock heartbeats nothing');
+});
+
+// ─── 6. Stale-lock rows are container kills too (WO-14/G2) ───────
+//
+// A row orphaned in `running` because its holder was killed hard enough that
+// no handler ran is the SAME class of event as a SIGTERM row: infrastructure,
+// never a data defect. It was still landing as `failed`, which is why
+// get_sync_health kept reading 127 instead of single digits.
+
+test('boot-time stale-row cleanup writes interrupted, not failed [source-level]', () => {
+  const src = readFileSync(join(ROOT, 'src', 'sync-engine.js'), 'utf8');
+  const idx = src.indexOf('Stale lock — cleaned up on boot');
+  assert.ok(idx > 0, 'the stale-row cleanup must still exist');
+  // The status is set in the same .update() literal as the message.
+  const stmt = src.slice(Math.max(0, idx - 400), idx);
+  assert.match(stmt, /SYNC_STATUS\.INTERRUPTED/,
+    'an orphaned row is a container kill — classifying it failed is the metric defect WO-6 set out to end');
+});
+
+// ─── 7. The 085 backfill reclassifies history, and only history ──
+//
+// 082 fixed classification going forward and never backfilled. Measured
+// 2026-09-04: 8,805 'Process terminated' + 2,298 'SIGTERM — container
+// terminated' + 1,204 'Stale lock — cleaned up on boot' rows still sat in
+// `failed`. The migration must move exactly those and nothing else — a
+// backfill that also swallowed 'N records failed' would destroy the only
+// number worth alerting on.
+
+test('sql/085 backfills the three container-kill reasons and no others', () => {
+  const sql = readFileSync(join(ROOT, 'sql', '085_sync_watermark_window_complete.sql'), 'utf8');
+  const update = sql.slice(sql.indexOf('UPDATE lp_sync_log'));
+  assert.match(update, /SET status = 'interrupted'/);
+  assert.match(update, /WHERE status = 'failed'/,
+    'the backfill must be scoped to failed rows so it cannot disturb completed ones');
+
+  for (const reason of [
+    'SIGTERM — container terminated',
+    'Process terminated',
+    'Stale lock — cleaned up on boot',
+  ]) {
+    assert.ok(update.includes(`'${reason}'`), `backfill must cover: ${reason}`);
+  }
+
+  // Real record failures and sweep timeouts stay visible.
+  assert.ok(!/records failed/.test(update),
+    'record-level failures are the true signal — the backfill must never touch them');
+  assert.ok(!/timed out/.test(update),
+    'a sweep that ran out of budget is a capacity problem, not a container kill');
 });
 
 // ─── Tripwire ────────────────────────────────────────────────────

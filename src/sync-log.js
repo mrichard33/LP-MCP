@@ -77,6 +77,13 @@ export const SYNC_STATUS = Object.freeze({
 // one-shot override rather than raising this cap globally.
 export const MAX_INCREMENTAL_DAYS = parseInt(process.env.MAX_INCREMENTAL_DAYS || '1', 10);
 
+// WO-12 (085): kill switch for the processed-rows watermark. Default ON.
+// Set SYNC_WATERMARK_FROM_PROCESSED=false to fall back to the pre-085 rule
+// (advance only on runs that WROTE rows, anchored at completed_at). Railway is
+// authoritative for this value — a setting there overrides this default.
+export const WATERMARK_FROM_PROCESSED =
+  (process.env.SYNC_WATERMARK_FROM_PROCESSED || 'true').toLowerCase() !== 'false';
+
 // v6.4: Throttle for syncLogProgress writes. Callers can invoke per-record;
 // this map tracks the last DB-write timestamp per logId and skips writes
 // inside the throttle window. 5s default keeps the dashboard feeling live
@@ -134,17 +141,29 @@ export async function syncLogProgress(logId, count) {
 }
 
 // Mark entity sync as completed (skips if already completed/failed)
-export async function syncLogComplete(logId, count, errorMessage) {
+//
+// WO-12 (085): `windowComplete` says whether the sweep reached the END of its
+// window, which is a different question from whether it finished without
+// throwing. A run stopped by MAX_INCREMENTAL_LEADS or MAX_SCANNED_LEADS, or
+// truncated by a page that errored, is `completed` for log purposes and is
+// draining a backlog by design — but it has NOT covered its window, and
+// getLastSyncTimestamp must not advance past it or the remainder is abandoned.
+// Omit the argument to leave the column NULL (the honest value for every
+// caller that does not track window coverage).
+export async function syncLogComplete(logId, count, errorMessage, windowComplete) {
   if (!logId) return;
   activeLogIds.delete(logId);
   lastProgressWrite.delete(logId); // v6.4: clear throttle state for this logId
   try {
-    await supabase.from('lp_sync_log').update({
+    const patch = {
       status:         errorMessage ? 'failed' : 'completed',
       records_synced: count,
       error_message:  errorMessage || null,
       completed_at:   new Date().toISOString(),
-    }).eq('id', logId).eq('status', 'running'); // Only update if still running
+    };
+    if (typeof windowComplete === 'boolean') patch.window_complete = windowComplete;
+    await supabase.from('lp_sync_log').update(patch)
+      .eq('id', logId).eq('status', 'running'); // Only update if still running
   } catch (err) {
     console.error('[Sync] Failed to complete sync log:', err.message);
   }
@@ -237,12 +256,57 @@ export async function getLastSyncTimestamp() {
       }
     }
 
-    // First try: completed syncs with records (the ideal case)
+    // WO-12 (085): FIRST try — the last run that DRAINED its window.
+    //
+    // Two things changed here, and both are about the difference between rows
+    // PROCESSED and rows WRITTEN.
+    //
+    // 1. The gate is `window_complete`, not `records_synced > 0`.
+    //    #837/#846 stopped writing rows whose payload hash was unchanged. An
+    //    unchanged prospect returns null from the page mapper and never
+    //    increments counts.leads, so records_synced counts WRITES. A quiet
+    //    15-minute window in which every row is unchanged is a fully and
+    //    correctly synced window that writes nothing — and the old gate threw
+    //    that run away, dropping the cursor back to the last run that happened
+    //    to write something and re-opening the window a little further every
+    //    time. The date truncation masked this completely (a since-midnight
+    //    window always writes something); narrowing the window exposes it, so
+    //    this MUST land in the same change as the timestamp cursor, not after.
+    //
+    // 2. It reads `started_at`, not `completed_at`.
+    //    A sweep READS across [started_at .. completed_at]. A lead changed
+    //    while the sweep was already past its page is invisible to that run, so
+    //    a cursor at completed_at skips it forever. SYNC_WINDOW_OVERLAP_MIN was
+    //    sized to paper over exactly this; anchoring at started_at removes the
+    //    hazard instead of out-running it, and the overlap goes back to being
+    //    defence in depth rather than the only defence.
+    //
+    // `window_complete` is written by incrementalSync and is true ONLY when the
+    // leads sweep reached the end of its window: no MAX_INCREMENTAL_LEADS cap,
+    // no MAX_SCANNED_LEADS ceiling, no page that errored and truncated the
+    // sweep. A capped run is `completed` for log purposes but has NOT drained
+    // its window, and advancing past one silently abandons the remainder.
+    const { data: drained } = WATERMARK_FROM_PROCESSED ? await supabase
+      .from('lp_sync_log')
+      .select('started_at')
+      .eq('entity_type', 'leads')
+      .eq('status', 'completed')
+      .eq('window_complete', true)
+      .not('started_at', 'is', null)
+      .order('started_at', { ascending: false })
+      .limit(1)
+      .maybeSingle() : { data: null };
+
+    // Legacy path: rows written before 085 have no window_complete value at
+    // all. For those the old rule is the best available signal, so it stays —
+    // scoped to `window_complete IS NULL` so it can never out-rank a real
+    // drained-window row from the new path.
     const { data: completed } = await supabase
       .from('lp_sync_log')
       .select('completed_at')
       .eq('entity_type', 'leads')
       .eq('status', 'completed')
+      .is('window_complete', null)
       .gt('records_synced', 0)
       .not('completed_at', 'is', null)
       .order('completed_at', { ascending: false })
@@ -271,16 +335,16 @@ export async function getLastSyncTimestamp() {
       .limit(1)
       .maybeSingle();
 
+    const drainedTs = drained?.started_at ? new Date(drained.started_at) : null;
     const completedTs = completed?.completed_at ? new Date(completed.completed_at) : null;
     const failedTs = partialFailed?.started_at ? new Date(partialFailed.started_at) : null;
 
-    // Use whichever is more recent
-    let bestTs = null;
-    if (completedTs && failedTs) {
-      bestTs = completedTs > failedTs ? completedTs : failedTs;
-    } else {
-      bestTs = completedTs || failedTs;
-    }
+    // Use whichever is most recent. All three are lower bounds on "everything
+    // before this point is known synced", so max() is the correct combiner —
+    // and because each is a lower bound, over-selecting is never a skip.
+    const bestTs = [drainedTs, completedTs, failedTs]
+      .filter(Boolean)
+      .reduce((a, b) => (a > b ? a : b), null);
 
     if (!bestTs) return null;
 
@@ -365,11 +429,26 @@ export async function markRunningLogsTerminal(status, reason) {
 // first attempt to confirm that theory came back inconclusive — the correlation
 // was run against records_synced (rows WRITTEN), which is a different number:
 // measured 2026-09-04, one leads sweep scanned 543 rows and synced 303.
+//
+// WO-14/G4 (085): `api_calls` is now `sweep_api_calls`.
+//
+// The old name read as "LP calls made for THIS entity" and it never was. One
+// paging loop serves several entity rows, so runLeadsSweep wrote its single
+// counter onto all four of leads/calls/notes/activities — which is why they
+// reported an identical 101/101/101/101 and then 84/84/84/84. The number was
+// right; the name claimed a precision it did not have.
+//
+// Named `sweep_api_calls`, not `run_api_calls`: the counter is scoped to ONE
+// SWEEP, not one run. An incremental run makes two independent paging loops —
+// runLeadsSweep (getLeadData) and runJobChangesSweep (getJobStatusChanges) —
+// each with its own counter, landing on different rows. `run_` would have
+// re-made the same mistake one level up. To get a run total, sum the distinct
+// values across the run's rows; do not average them.
 export async function syncLogTelemetry(logId, { apiCalls, pagingMode, rowsScanned } = {}) {
   if (!logId) return;
   try {
     const patch = {};
-    if (Number.isFinite(apiCalls)) patch.api_calls = apiCalls;
+    if (Number.isFinite(apiCalls)) patch.sweep_api_calls = apiCalls;
     if (pagingMode) patch.paging_mode = pagingMode;
     if (Number.isFinite(rowsScanned)) patch.rows_scanned = rowsScanned;
     if (Object.keys(patch).length === 0) return;

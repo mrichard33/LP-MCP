@@ -252,10 +252,30 @@ const SYNC_SOFTFAIL_BACKOFF_MAX_MS = parseInt(process.env.SYNC_SOFTFAIL_BACKOFF_
 // it did not stop the re-scan. Modes:
 //   date      — legacy midnight-truncated window
 //   timestamp — real timestamp cursor (see the overlap note below)
-// Default `date`: LP's tolerance for a time component in `startdate` is
-// UNVERIFIED (no call site in this repo has ever sent one), so the new path
-// ships dark and is probed at runtime before use.
-const SYNC_WINDOW_MODE = (process.env.SYNC_WINDOW_MODE || 'date').toLowerCase();
+// v6.16 (WO-11/WO-12): the default is now `timestamp`.
+//
+// `date` shipped as the default because LP's tolerance for a time component in
+// `startdate` was UNVERIFIED. That caution cost us the whole fix: the timestamp
+// path has sat dark in production ever since, and the midnight-truncated window
+// it was written to replace IS the degradation reported on 2026-09-04.
+//
+// Measured, production, 2026-09-04 19:18:49Z:
+//   [Sync] Incremental window: 2026-09-04 → 2026-09-04 [date]
+//
+// A midnight-ET anchor with a moving end produces a daily sawtooth, not a
+// steady state: cheap at 05:00Z, ruinous by 19:00Z, reset at midnight ET.
+// Measured across three days of lp_sync_log (avg minutes per incremental run):
+//   Sep 2   04:00Z 2.08 → 05:00Z 0.30 → 19:00Z 38.00 → 23:00Z 4.86
+//   Sep 3   04:00Z 19.00 → 05:00Z 0.02 → 20:00Z 29.05
+//   Sep 4   04:00Z 54.13 → 05:00Z 0.16 → 18:00Z 16.93
+// The 04:00Z spike is the one run per day whose window spans two ET dates.
+//
+// The new path is still probed at runtime before use: resolveWindowStart()
+// falls back to the date window if LP does not honour a timestamped bound, if
+// the cursor would predate the date window, or if the window inverts. `date`
+// remains available as the kill switch. Railway is authoritative for the value
+// — a SYNC_WINDOW_MODE set there overrides this default.
+const SYNC_WINDOW_MODE = (process.env.SYNC_WINDOW_MODE || 'timestamp').toLowerCase();
 
 // v6.13: MANDATORY overlap, and the reason the cursor is not exact.
 //
@@ -1451,6 +1471,11 @@ export async function incrementalSync() {
     let denylistSkipped = 0;
     let newlyDenylisted = 0;
     let unchangedSkipped = 0;
+    // WO-12 (085): did the leads sweep reach the END of its window? Only a run
+    // that did may advance the watermark — see syncLogComplete. A sweep that
+    // never returned its result object (timeout, throw) has by definition not
+    // drained anything, so the default is false.
+    let windowComplete = false;
 
     if (leadsRes.status === 'fulfilled' && leadsRes.value) {
       const r = leadsRes.value;
@@ -1465,6 +1490,14 @@ export async function incrementalSync() {
       denylistSkipped = r.denylistSkipped || 0;
       newlyDenylisted = r.newlyDenylisted || 0;
       unchangedSkipped = r.unchangedSkipped || 0;
+      // Three distinct ways to stop short of the end of the window, and all
+      // three must block the watermark:
+      //   hitCap        — MAX_INCREMENTAL_LEADS reached; backlog still draining
+      //   scanned ceil. — MAX_SCANNED_LEADS reached; ditto
+      //   truncatedAt   — a page errored and the sweep gave up its position
+      windowComplete = !r.hitCap
+        && r.truncatedAt == null
+        && (r.scanned || 0) < MAX_SCANNED_LEADS;
     } else {
       const reason = leadsRes.reason?.message || 'leadsSweep failed';
       // v6.6: Log partial-progress counts even though the sweep didn't
@@ -1520,9 +1553,15 @@ export async function incrementalSync() {
     // Close logs for entity types whose owning sweep resolved fulfilled.
     // Skip entities whose sweep already failed above; those rows are
     // already in 'failed' state.
+    //
+    // WO-12 (085): window_complete is written to the `leads` row ONLY, because
+    // that is the only row getLastSyncTimestamp reads. A record-level failure
+    // already puts the row in `failed` and takes it out of the watermark's
+    // drained-window path, so `errorMsg` needs no separate handling here.
     const closes = [];
     if (leadsRes.status === 'fulfilled') {
-      closes.push(syncLogComplete(logIds.leads, counts.leads, errorMsg));
+      console.log(`[Sync] Leads window ${windowComplete ? 'DRAINED — watermark may advance to this run' : 'NOT drained (cap, ceiling or truncated page) — watermark holds'}`);
+      closes.push(syncLogComplete(logIds.leads, counts.leads, errorMsg, windowComplete));
       closes.push(syncLogComplete(logIds.calls, counts.calls));
       closes.push(syncLogComplete(logIds.notes, counts.notes));
       closes.push(syncLogComplete(logIds.activities, counts.activities));
