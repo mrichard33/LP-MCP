@@ -3,7 +3,13 @@
  * Paging telemetry persistence — scripts/test-sync-log-telemetry.js
  *
  * Covers 084: syncLogTelemetry now persists rows_scanned alongside the
- * api_calls / paging_mode columns 082 added.
+ * sweep_api_calls / paging_mode columns 082 added.
+ *
+ * 085 renamed api_calls → sweep_api_calls. The counter is scoped to one SWEEP,
+ * not one entity and not one run: a single paging loop feeds several entity
+ * rows and writes its one number onto all of them, which is why four entities
+ * reported an identical 101/101/101/101. The value was right; the old name
+ * claimed a per-entity precision it never had.
  *
  * WHY rows_scanned EXISTS
  * -----------------------
@@ -82,7 +88,7 @@ const lastPatch = () => { assert.equal(calls.length, 1, 'expected exactly one up
 test('rowsScanned is written to the rows_scanned column', async () => {
   fresh();
   await syncLogTelemetry(LOG_ID, { apiCalls: 12, pagingMode: 'deep', rowsScanned: 543 });
-  assert.deepEqual(lastPatch(), { api_calls: 12, paging_mode: 'deep', rows_scanned: 543 });
+  assert.deepEqual(lastPatch(), { sweep_api_calls: 12, paging_mode: 'deep', rows_scanned: 543 });
   assert.equal(calls[0].table, 'lp_sync_log');
   assert.deepEqual(calls[0].filters, [['id', LOG_ID]]);
 });
@@ -90,7 +96,7 @@ test('rowsScanned is written to the rows_scanned column', async () => {
 test('the 082 columns still work on their own', async () => {
   fresh();
   await syncLogTelemetry(LOG_ID, { apiCalls: 3, pagingMode: 'normal' });
-  assert.deepEqual(lastPatch(), { api_calls: 3, paging_mode: 'normal' });
+  assert.deepEqual(lastPatch(), { sweep_api_calls: 3, paging_mode: 'normal' });
 });
 
 test('rowsScanned can be written on its own', async () => {
@@ -107,7 +113,7 @@ test('rowsScanned = 0 IS written — a sweep that fetched nothing is a real resu
   // from "never measured" — the exact ambiguity 084 exists to remove.
   fresh();
   await syncLogTelemetry(LOG_ID, { rowsScanned: 0, apiCalls: 0 });
-  assert.deepEqual(lastPatch(), { api_calls: 0, rows_scanned: 0 });
+  assert.deepEqual(lastPatch(), { sweep_api_calls: 0, rows_scanned: 0 });
 });
 
 // ─── 3. Absent fields are omitted, never nulled ──────────────────
@@ -116,7 +122,7 @@ test('fields that were not measured are omitted from the patch', async () => {
   fresh();
   await syncLogTelemetry(LOG_ID, { rowsScanned: 90 });
   const patch = lastPatch();
-  assert.ok(!('api_calls' in patch), 'a null here would erase the owning sweep’s number');
+  assert.ok(!('sweep_api_calls' in patch), 'a null here would erase the owning sweep’s number');
   assert.ok(!('paging_mode' in patch));
 });
 
