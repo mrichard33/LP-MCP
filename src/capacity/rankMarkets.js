@@ -13,32 +13,59 @@
  * checked (ORL 4/27 and 9/27 against a live 11/27), and the snapshot is daily.
  *
  * RANKING RULES (settled — see HANDOFF, do not relitigate):
- *   Sort ascending by fill_pct = confirmed / requested for the slot date, with
- *   three guards, first-match-wins:
+ *   Sort DESCENDING by score = open_true × perf_multiplier, where
+ *   open_true = requested - confirmed - set_pending, with two guards that keep
+ *   their precedence and still win over score:
  *     1. UNKNOWN — FAIL OPEN. No capacity row, or requested = 0, means the
  *        market has NOT FILED YET, never that it has zero capacity. Excluded
  *        from the ranking, listed in unknown[], never ranked 1.
- *     2. OVERSOLD. open_true = requested - confirmed - set_pending. When
- *        open_true <= 0 the market cannot absorb another appointment no
- *        matter what its fill % reads — ranks last among ranked markets.
- *     3. SMALL DENOMINATOR. requested < 4 makes the percentage meaningless
- *        (a 2-slot market can only read 0 / 50 / 100 %) — ranks after every
- *        normal market, before oversold ones.
- *   A market can carry both OVERSOLD and SMALL_DENOMINATOR; both flags are
- *   reported, and the oversold tier decides where it sorts.
+ *     2. OVERSOLD. When open_true <= 0 the market cannot absorb another
+ *        appointment no matter how it scores — ranks last among ranked markets.
+ *     3. SMALL DENOMINATOR (requested < 4) is still computed and reported, but
+ *        NO LONGER REORDERS ANYTHING. Absolute scoring already handles small
+ *        markets correctly: a 2-slot market scores 2 and lands mid-table on
+ *        its own, which is where it belongs. The flag remains for the board.
+ *   A market can carry both flags; the oversold tier decides where it sorts.
  *
- * THE BEHAVIOUR THIS FILE EXISTS FOR: Lakeland on 2026-09-04 read 0.0 %
- * (0 confirmed of 2 requested) with 3 appointments already pending —
- * open_true = -1. A naive fill-% sort puts it at priority 1 and points the
- * whole floor at a market with nothing to sell. It ranks LAST.
+ * ── WHY ABSOLUTE OPEN SLOTS, AND NOT confirmed/requested ────────────────────
  *
- * fill_pct is reported in PERCENTAGE POINTS (0–100, one decimal) so the
- * swap margin (CAPACITY_RANKER_SWAP_MARGIN, "5 points") compares on the same
- * scale the dashboard displays. The board API itself emits a 0–1 fraction.
+ * THE BUG THIS FILE NOW FIXES: fill_pct = confirmed / requested ignores
+ * set_pending — the hopper. A market whose slots are all spoken for still
+ * reads "empty" and wins priority 1. On 2026-09-05 Jacksonville ranked FIRST
+ * with 2 confirmed + 14 pending against 17 slots — ONE genuinely open slot —
+ * while St. Pete and Fort Myers each had SEVEN. The oversold guard only fires
+ * at open_true <= 0, so JAX at 1 sailed straight through it.
+ *
+ * ABSOLUTE, NOT A RATE. The dialer's job is to fill slots, so the size of the
+ * prize is what matters. Sorting by open RATE puts Lakeland (2 of 2 open =
+ * 100 %) above St. Pete (7 of 20 = 35 %) and spends the floor's best hour on
+ * two appointments. Sorting by absolute open slots puts the work where the
+ * work is.
+ *
+ * THE WEIGHT IS DELIBERATELY TOO SMALL TO MATTER MUCH. perf_multiplier is
+ * clamped to [0.85, 1.15] (src/capacity/marketPerformance.js) and spans only
+ * 0.91–1.05 at the default W=0.25 — enough to break a near-tie (Fort Myers
+ * over St. Pete when both have 7 open), never enough to flip a 7-vs-4 gap.
+ * Capacity dominates; performance decides ties. Markets with no performance
+ * data score exactly as their open slots.
+ *
+ * fill_pct is KEPT in the output for dashboard parity — it is no longer the
+ * sort key. It is reported in PERCENTAGE POINTS (0–100, one decimal); the
+ * board API itself emits a 0–1 fraction.
  */
 
 export const DEFAULT_SMALL_DENOMINATOR = 4;
-export const DEFAULT_SWAP_MARGIN = 5;
+
+/**
+ * Minimum SCORE GAP (in slots) two adjacent markets must differ by before
+ * trading places counts as material. Was 5 fill-percentage points, which is
+ * meaningless now the sort key is a slot count — a fractional weight
+ * difference alone must not re-point the floor.
+ */
+export const DEFAULT_SWAP_MARGIN = 0.5;
+
+/** Consecutive bottom-half applied rankings before starvation promotion. */
+export const DEFAULT_STARVATION_THRESHOLD = 3;
 
 /** The seven LP markets. There is no Tampa market — LP has no TPA branch. */
 export const MARKET_CODES = Object.freeze([
@@ -46,10 +73,10 @@ export const MARKET_CODES = Object.freeze([
 ]);
 
 // Sort tiers — lower dials first. Precedence is UNKNOWN (excluded entirely) >
-// OVERSOLD > SMALL_DENOMINATOR > fill %.
+// OVERSOLD > score. SMALL_DENOMINATOR is no longer a tier: it is reported but
+// does not reorder.
 const TIER_NORMAL = 0;
-const TIER_SMALL_DENOMINATOR = 1;
-const TIER_OVERSOLD = 2;
+const TIER_OVERSOLD = 1;
 
 function toCount(v) {
   const n = Number(v);
@@ -58,6 +85,10 @@ function toCount(v) {
 
 function pct(confirmed, requested) {
   return Math.round((1000 * confirmed) / requested) / 10;
+}
+
+function round3(n) {
+  return Math.round(n * 1000) / 1000;
 }
 
 /**
@@ -70,9 +101,22 @@ function pct(confirmed, requested) {
  *        is visible rather than silently ranked against a list that does not
  *        exist.
  * @param {number} [opts.smallDenominator]  requested below this is flagged.
+ * @param {object} [opts.performance]  { MARKET: { multiplier, set_to_sale } }
+ *        from marketPerformance.js. A market absent from it scores at 1.0, so
+ *        an empty object is pure open-slot order and a scorecard outage
+ *        degrades gracefully instead of taking the ranker down.
+ * @param {object} [opts.starvationStreaks]  { MARKET: consecutiveBottomHalf }
+ *        from countBottomHalfStreaks. See the starvation guard below.
+ * @param {number} [opts.starvationThreshold]
  * @returns {{ ranking: Array, unknown: Array }}
  */
-export function rankMarkets(rows, { markets = MARKET_CODES, smallDenominator = DEFAULT_SMALL_DENOMINATOR } = {}) {
+export function rankMarkets(rows, {
+  markets = MARKET_CODES,
+  smallDenominator = DEFAULT_SMALL_DENOMINATOR,
+  performance = {},
+  starvationStreaks = {},
+  starvationThreshold = DEFAULT_STARVATION_THRESHOLD,
+} = {}) {
   const byMarket = new Map();
   for (const r of rows || []) {
     const code = String(r?.market ?? '').trim();
@@ -99,6 +143,8 @@ export function rankMarkets(rows, { markets = MARKET_CODES, smallDenominator = D
     const openTrue = requested - confirmed - setPending;
     const oversold = openTrue <= 0;
     const small = requested < smallDenominator;
+    const perf = performance?.[code] || null;
+    const multiplier = Number.isFinite(perf?.multiplier) ? perf.multiplier : 1;
     const flags = [];
     if (oversold) flags.push('oversold');
     if (small) flags.push('small_denominator');
@@ -109,10 +155,14 @@ export function rankMarkets(rows, { markets = MARKET_CODES, smallDenominator = D
       set_pending: setPending,
       fill_pct: pct(confirmed, requested),
       open_true: openTrue,
+      score: round3(openTrue * multiplier),
+      perf_multiplier: multiplier,
+      set_to_sale: Number.isFinite(perf?.set_to_sale) ? perf.set_to_sale : null,
       oversold,
       small_denominator: small,
+      starvation_promoted: false,
       flags,
-      _tier: oversold ? TIER_OVERSOLD : (small ? TIER_SMALL_DENOMINATOR : TIER_NORMAL),
+      _tier: oversold ? TIER_OVERSOLD : TIER_NORMAL,
     });
   }
 
@@ -132,9 +182,35 @@ export function rankMarkets(rows, { markets = MARKET_CODES, smallDenominator = D
 
   candidates.sort((a, b) =>
     (a._tier - b._tier)
-    || (a.fill_pct - b.fill_pct)
-    || (b.open_true - a.open_true)          // same fill %: more truly-open slots first
+    || (b.score - a.score)                  // MORE weighted open slots dial first
+    || (b.open_true - a.open_true)          // same score: more raw open slots
     || a.market.localeCompare(b.market));   // deterministic last resort
+
+  // ── Starvation guard ──────────────────────────────────────────────────────
+  //
+  // A small market can sit mid-table indefinitely and never get worked: its
+  // score is honestly low every single run, so it is never wrong to rank it
+  // there and it is never dialed either. When a market has slots open, has
+  // ZERO confirmed appointments, and has placed bottom-half in `threshold`
+  // consecutive APPLIED rankings, force it to rank 2 for one cycle.
+  //
+  // NEVER rank 1 — the top slot stays earned on score. Rank 2 is enough to get
+  // the market worked, and it self-cancels: rank 2 of seven is top half, so
+  // the streak resets and the guard stands down on the next run.
+  //
+  // Oversold markets are never promoted; there is nothing to sell.
+  const promoted = candidates.find((c) => (
+    !c.oversold
+    && c.open_true > 0
+    && c.confirmed === 0
+    && (starvationStreaks?.[c.market] || 0) >= starvationThreshold
+  ));
+  if (promoted && candidates.length > 1 && candidates.indexOf(promoted) > 1) {
+    promoted.starvation_promoted = true;
+    promoted.flags.push('starvation_promoted');
+    candidates.splice(candidates.indexOf(promoted), 1);
+    candidates.splice(1, 0, promoted);
+  }
 
   const ranking = candidates.map((c, i) => {
     const { _tier, ...rest } = c;
@@ -147,14 +223,23 @@ export function rankMarkets(rows, { markets = MARKET_CODES, smallDenominator = D
 /**
  * Material-change test between the last APPLIED ranking and a new one.
  *
- * Material = a rank swap between two markets whose fill % differ by at least
- * `swapMargin` points, OR any market changing oversold / small_denominator /
- * unknown state. Anything else is noise the floor should not be re-pointed
- * for. No prior applied ranking at all is material by definition — there is
- * nothing on Five9 that reflects this ranking yet.
+ * Material = a market MOVING POSITION where the two markets that traded places
+ * differ in score by at least `swapMargin` slots, OR any market changing
+ * oversold / small_denominator / starvation_promoted / unknown state.
+ * Anything else is noise the floor should not be re-pointed for. No prior
+ * applied ranking at all is material by definition — there is nothing on Five9
+ * that reflects this ranking yet.
+ *
+ * THE MARGIN CHANGED MEANING. It used to be 5 fill-percentage points, which is
+ * meaningless now the sort key is a slot count. It is now a minimum SCORE GAP
+ * in slots (default 0.5) required for two markets to trade places, so a
+ * fractional performance-weight difference alone can never trigger a Five9
+ * write — but a market genuinely gaining or losing a slot can.
  *
  * Both arguments are { ranking, unknown } shapes as produced by rankMarkets
- * (the log row stores exactly those two arrays).
+ * (the log row stores exactly those two arrays). Rows logged before this
+ * change carry no `score`; they fall back to open_true, which is the same
+ * number at multiplier 1.0.
  */
 export function isMaterialChange(prev, next, { swapMargin = DEFAULT_SWAP_MARGIN } = {}) {
   const reasons = [];
@@ -162,15 +247,18 @@ export function isMaterialChange(prev, next, { swapMargin = DEFAULT_SWAP_MARGIN 
     return { changed: true, reasons: ['no_prior_applied_ranking'] };
   }
 
+  const hasFlag = (r, f) => Array.isArray(r.flags) && r.flags.includes(f);
   const stateOf = (r) => ({
     unknown: false,
-    oversold: r.oversold === true || (Array.isArray(r.flags) && r.flags.includes('oversold')),
-    small_denominator: r.small_denominator === true || (Array.isArray(r.flags) && r.flags.includes('small_denominator')),
+    oversold: r.oversold === true || hasFlag(r, 'oversold'),
+    small_denominator: r.small_denominator === true || hasFlag(r, 'small_denominator'),
+    starvation_promoted: r.starvation_promoted === true || hasFlag(r, 'starvation_promoted'),
   });
+  const UNKNOWN_STATE = { unknown: true, oversold: false, small_denominator: false, starvation_promoted: false };
   const stateMap = (snap) => {
     const m = new Map();
     for (const r of snap.ranking || []) m.set(r.market, stateOf(r));
-    for (const u of snap.unknown || []) m.set(u.market, { unknown: true, oversold: false, small_denominator: false });
+    for (const u of snap.unknown || []) m.set(u.market, UNKNOWN_STATE);
     return m;
   };
   const prevState = stateMap(prev);
@@ -180,14 +268,16 @@ export function isMaterialChange(prev, next, { swapMargin = DEFAULT_SWAP_MARGIN 
     const a = prevState.get(market);
     const b = nextState.get(market);
     if (!a || !b) { reasons.push(`${market}: appeared_or_vanished`); continue; }
-    for (const k of ['unknown', 'oversold', 'small_denominator']) {
+    for (const k of ['unknown', 'oversold', 'small_denominator', 'starvation_promoted']) {
       if (a[k] !== b[k]) reasons.push(`${market}: ${k} ${a[k]} → ${b[k]}`);
     }
   }
 
+  // Score, falling back to open_true for rows logged before scoring existed.
+  const scoreOf = (r) => (Number.isFinite(Number(r.score)) ? Number(r.score) : Number(r.open_true) || 0);
   const prevIdx = new Map((prev.ranking || []).map((r, i) => [r.market, i]));
   const nextIdx = new Map((next.ranking || []).map((r, i) => [r.market, i]));
-  const nextFill = new Map((next.ranking || []).map((r) => [r.market, Number(r.fill_pct) || 0]));
+  const nextScore = new Map((next.ranking || []).map((r) => [r.market, scoreOf(r)]));
   const shared = [...nextIdx.keys()].filter((m) => prevIdx.has(m));
   for (let i = 0; i < shared.length; i += 1) {
     for (let j = i + 1; j < shared.length; j += 1) {
@@ -195,9 +285,9 @@ export function isMaterialChange(prev, next, { swapMargin = DEFAULT_SWAP_MARGIN 
       const b = shared[j];
       const swapped = Math.sign(prevIdx.get(a) - prevIdx.get(b)) !== Math.sign(nextIdx.get(a) - nextIdx.get(b));
       if (!swapped) continue;
-      const gap = Math.abs(nextFill.get(a) - nextFill.get(b));
+      const gap = Math.abs(nextScore.get(a) - nextScore.get(b));
       if (gap >= swapMargin) {
-        reasons.push(`${a}/${b}: rank swap with ${gap.toFixed(1)}-point fill gap (margin ${swapMargin})`);
+        reasons.push(`${a}/${b}: rank swap with a ${gap.toFixed(2)}-slot score gap (margin ${swapMargin})`);
       }
     }
   }

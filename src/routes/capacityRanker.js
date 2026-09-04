@@ -17,7 +17,7 @@
  *
  * CYCLING (CAPACITY_RANKER_CYCLE_CAMPAIGNS, default false): the list write
  * refuses a RUNNING campaign, and both Data campaigns run all day. With this
- * flag 'true' AND mode live AND the clock inside 08:00–20:30 ET, each campaign
+ * flag 'true' AND mode live AND the clock inside 07:00–20:30 ET, each campaign
  * is gracefully stopped → reordered → restarted, one at a time, with the
  * restart in a finally block (src/capacity/applyDialPriority.js). Outside the
  * window the cycle is skipped and a warning is logged. A campaign that fails
@@ -34,8 +34,18 @@
  * Always inserts one dial_priority_log row. If the table is missing (sql/080
  * not applied) the route answers 500 with a message that says so.
  *
- * Response: { slot_date, ranking:[{market, rank, fill_pct, open_true, flags[]}],
- *             unknown:[], changed, applied, mode, ... }
+ * SCORING (see src/capacity/rankMarkets.js): markets are ranked on
+ * score = open_true × perf_multiplier, DESCENDING — absolute open slots,
+ * scaled by a clamped trailing-90d conversion weight from
+ * src/capacity/marketPerformance.js. Both the performance read and the
+ * starvation history are best-effort: either failing degrades the ranking
+ * (unweighted, or no promotion) and adds a warning, never a 500. The floor
+ * always gets a dial order.
+ *
+ * Response: { slot_date, ranking:[{market, rank, score, open_true,
+ *             perf_multiplier, set_to_sale, starvation_promoted, fill_pct,
+ *             flags[]}], unknown:[], changed, applied, mode, perf_weight,
+ *             perf_baseline, scoring_basis, ... }
  */
 
 import supabase from '../supabase.js';
@@ -47,6 +57,9 @@ import {
 import { sendGroupMeMessage } from '../groupme.js';
 import { rankMarkets, isMaterialChange, DEFAULT_SWAP_MARGIN, MARKET_CODES } from '../capacity/rankMarkets.js';
 import { applyDialPriority, CAMPAIGNS, isCycling } from '../capacity/applyDialPriority.js';
+import {
+  getMarketPerformance, countBottomHalfStreaks, resolvePerfWeight,
+} from '../capacity/marketPerformance.js';
 
 const TIMEZONE = 'America/New_York';
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -114,6 +127,28 @@ async function readLastAppliedLive() {
   return row ? { id: row.id, ran_at: row.ran_at, slot_date: row.slot_date, ranking: row.ranking, unknown: row.unknown_markets } : null;
 }
 
+/**
+ * Recent APPLIED rankings, most recent first — the starvation guard's memory.
+ *
+ * Only applied rows count: a shadow or refused run never pointed the floor
+ * anywhere, so it cannot have starved anybody. `limit` is small because the
+ * guard only ever looks at a streak of a few.
+ */
+async function readAppliedHistoryLive(limit = 10) {
+  if (!supabase) throw new Error('Supabase not configured');
+  const { data, error } = await supabase
+    .from(TABLE)
+    .select('ranking')
+    .eq('applied', true)
+    .order('ran_at', { ascending: false })
+    .limit(limit);
+  if (error) {
+    if (isMissingTable(error)) throw new MissingTableError(error);
+    throw new Error(`${TABLE} history read failed: ${error.message}`);
+  }
+  return (data || []).map((r) => ({ ranking: r.ranking }));
+}
+
 async function insertLogLive(row) {
   if (!supabase) throw new Error('Supabase not configured');
   const { data, error } = await supabase.from(TABLE).insert(row).select('id').single();
@@ -128,12 +163,24 @@ export function cycleEnabled(raw = process.env.CAPACITY_RANKER_CYCLE_CAMPAIGNS) 
   return String(raw || 'false').trim().toLowerCase() === 'true';
 }
 
-/** Cycling is only safe inside dial hours — never near the 21:00 ET legal edge. */
+/**
+ * Cycling is only safe inside dial hours — never near the 21:00 ET legal edge.
+ *
+ * OPENS AT 07:00, NOT 08:00. The 07:15 baseline run is the first and largest
+ * ranking of each day, for a brand-new slot_date, and an 08:00 lower bound
+ * refused it every single morning (dial_priority_log row 12: changed=true,
+ * REFUSED) — it then sat and waited an hour to apply. 07:15 is in fact the
+ * SAFEST time to cycle: the campaign profiles dial 08:00–21:00, so at 07:15
+ * the campaigns are RUNNING but not dialing anyone and the stop/restart
+ * downtime costs nothing at all.
+ *
+ * The upper bound stays at 20:30, well clear of the 21:00 edge.
+ */
 export function withinCycleWindow(now = new Date()) {
   const hhmm = new Intl.DateTimeFormat('en-GB', {
     timeZone: TIMEZONE, hour: '2-digit', minute: '2-digit', hour12: false,
   }).format(now);
-  return hhmm >= '08:00' && hhmm <= '20:30';
+  return hhmm >= '07:00' && hhmm <= '20:30';
 }
 
 function applyLive(rankResult, { cycleCampaigns = false } = {}) {
@@ -156,10 +203,13 @@ export async function runCapacityRanker(input = {}, deps = {}) {
   const {
     fetchCapacity = fetchCapacityLive,
     readLastApplied = readLastAppliedLive,
+    readAppliedHistory = readAppliedHistoryLive,
+    getPerformance = getMarketPerformance,
     insertLog = insertLogLive,
     apply = applyLive,
     mode = resolveMode(),
     swapMargin = resolveSwapMargin(),
+    perfWeight = resolvePerfWeight(),
     now = new Date(),
     log = console.log,
   } = deps;
@@ -169,11 +219,34 @@ export async function runCapacityRanker(input = {}, deps = {}) {
     return { status: 400, body: { error: 'slot_date must be YYYY-MM-DD' } };
   }
 
+  const warnings = [];
+
   const capacity = await fetchCapacity(slotDate);
-  const { ranking, unknown } = rankMarkets(capacity.rows);
+
+  // Performance weighting and the starvation history are both BEST EFFORT. A
+  // failure in either degrades the ranking (to unweighted, or to no starvation
+  // promotion) but must never take the ranker down — the floor still needs a
+  // dial order. getMarketPerformance already fails open internally; the
+  // history read is wrapped here for the same reason.
+  const performance = await getPerformance({ asOf: todayET(now), weight: perfWeight, log });
+  if (!Object.keys(performance).length) {
+    warnings.push('market performance unavailable — ranking on unweighted open slots (every multiplier 1.0)');
+  }
+
+  let starvationStreaks = {};
+  try {
+    starvationStreaks = countBottomHalfStreaks(await readAppliedHistory());
+  } catch (err) {
+    warnings.push(`starvation history unavailable (${err.message}) — no starvation promotion this run`);
+  }
+
+  const { ranking, unknown } = rankMarkets(capacity.rows, { performance, starvationStreaks });
   const rankResult = { ranking, unknown };
 
-  const warnings = [];
+  const starved = ranking.filter((r) => r.starvation_promoted).map((r) => r.market);
+  if (starved.length) {
+    warnings.push(`starvation guard promoted ${starved.join(', ')} to rank 2 — bottom-half in 3+ consecutive applied rankings with zero confirmed`);
+  }
   const unmapped = unknown.filter((u) => u.reason === 'unmapped_market').map((u) => u.market);
   if (unmapped.length) {
     warnings.push(`capacity source returned market codes outside the mapping: ${unmapped.join(', ')} — not ranked; mapping is ${MARKET_CODES.join(', ')}`);
@@ -195,7 +268,7 @@ export async function runCapacityRanker(input = {}, deps = {}) {
 
   const cycle = cycleEnabled() && withinCycleWindow(now);
   if (cycleEnabled() && !cycle) {
-    warnings.push('outside the 08:00–20:30 ET cycle window — campaigns will not be stopped, so a RUNNING campaign will refuse the reorder');
+    warnings.push('outside the 07:00–20:30 ET cycle window — campaigns will not be stopped, so a RUNNING campaign will refuse the reorder');
   }
   if (changed && mode === 'live') {
     try {
@@ -213,7 +286,7 @@ export async function runCapacityRanker(input = {}, deps = {}) {
     }
   }
 
-  const summary = ranking.map((r) => `${r.rank}.${r.market}(${r.fill_pct}%${r.flags.length ? ' ' + r.flags.join('+') : ''})`).join(' ');
+  const summary = ranking.map((r) => `${r.rank}.${r.market}(${r.open_true}open×${r.perf_multiplier.toFixed(3)}=${r.score}${r.flags.length ? ' ' + r.flags.join('+') : ''})`).join(' ');
   log(`[CapacityRanker] slot_date=${slotDate} mode=${mode} changed=${changed} applied=${applied} ranking=${summary} unknown=${unknown.map((u) => u.market).join(',') || '-'}`);
 
   const logId = await insertLog({
@@ -224,6 +297,8 @@ export async function runCapacityRanker(input = {}, deps = {}) {
     applied,
     mode,
     error_message: errorMessage,
+    perf_weight: perfWeight,
+    scoring_basis: 'open_true_weighted',
     cycled: applyResult ? Object.values(applyResult.campaigns || {}).some((c) => c.cycled) : false,
     downtime_ms: applyResult
       ? Object.values(applyResult.campaigns || {}).reduce((a, c) => a + (c.downtime_ms || 0), 0) || null
@@ -238,11 +313,15 @@ export async function runCapacityRanker(input = {}, deps = {}) {
       ranking: ranking.map((r) => ({
         market: r.market,
         rank: r.rank,
-        fill_pct: r.fill_pct,
+        score: r.score,
+        open_true: r.open_true,
+        perf_multiplier: r.perf_multiplier,
+        set_to_sale: r.set_to_sale,
+        starvation_promoted: r.starvation_promoted,
+        fill_pct: r.fill_pct, // kept for dashboard parity — no longer the sort key
         requested: r.requested,
         confirmed: r.confirmed,
         set_pending: r.set_pending,
-        open_true: r.open_true,
         flags: r.flags,
       })),
       unknown,
@@ -250,6 +329,11 @@ export async function runCapacityRanker(input = {}, deps = {}) {
       change_reasons: material.reasons,
       applied,
       mode,
+      scoring_basis: 'open_true_weighted',
+      perf_weight: perfWeight,
+      perf_baseline: performance?._company
+        ? { set_to_sale: performance._company.set_to_sale, sets: performance._company.sets, sales: performance._company.sales }
+        : null,
       swap_margin: swapMargin,
       compared_to: prev ? { log_id: prev.id, ran_at: prev.ran_at, slot_date: prev.slot_date } : null,
       source: { last_sweep_at: capacity.last_sweep_at, stale: capacity.stale === true },
