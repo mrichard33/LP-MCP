@@ -38,7 +38,8 @@ import {
   cycleEnabled,
   withinCycleWindow,
   withinWatchdogWindow,
-  decideWatchdogAlerts,
+  watchdogAlertKey,
+  watchdogAlertText,
   checkCampaignState,
   addDays,
   MissingTableError,
@@ -1631,14 +1632,57 @@ test('withinCycleWindow: honours America/New_York in winter too (EST, UTC-5)', (
 // error. A watchdog that reports healthy while the floor is dark is the exact
 // failure it exists to catch, so these tests pin the alert to this side.
 
-function watchdogFake({ states = { hot: 'RUNNING', warm: 'RUNNING' }, throwFor = null, sendThrows = false, cyclingNames = [] } = {}) {
-  const sent = [];
-  const lastAlert = new Map();
+/**
+ * In-memory stand-in for src/alert-state.js, modelling the contract the route
+ * depends on: one card per incident, a recovery only if the incident was
+ * actually announced, and `active: null` touching nothing at all. The real
+ * module's own edges (the PK claim, the CAS, the fallback cooldown) are
+ * covered in scripts/test-alert-state.js; what is pinned HERE is that the
+ * watchdog hands it the right tri-state and the right key.
+ *
+ * `store` is shareable so a test can carry one condition across two fixtures.
+ */
+function alertStateStore() {
+  return { rows: new Map(), sent: [] };
+}
+
+function makeReport(store, { sendThrows = false } = {}) {
+  return async ({ key, active, label, text, recoveredText, send }) => {
+    if (active === null || active === undefined) return { action: 'noop', sent: false };
+    const emit = async (body) => {
+      try {
+        await send(body);
+        store.sent.push(body);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const row = store.rows.get(key);
+    if (active) {
+      if (row && row.state === 'firing') return { action: 'silent', sent: false };
+      const next = { state: 'firing', notifyCount: 0 };
+      store.rows.set(key, next);
+      const body = typeof text === 'function' ? await text() : text;
+      const ok = await emit(body);
+      if (ok) next.notifyCount = 1;
+      return { action: 'fired', sent: ok };
+    }
+    if (!row || row.state !== 'firing') return { action: 'idle', sent: false };
+    row.state = 'cleared';
+    if (!(row.notifyCount > 0)) return { action: 'recovered', sent: false };
+    const body = recoveredText ?? `✅ RECOVERED — ${label}`;
+    return { action: 'recovered', sent: await emit(body) };
+  };
+}
+
+function watchdogFake({ states = { hot: 'RUNNING', warm: 'RUNNING' }, throwFor = null, sendThrows = false, cyclingNames = [], store = alertStateStore() } = {}) {
+  const sent = store.sent;
   return {
     sent,
-    lastAlert,
+    store,
     deps: {
-      lastAlert,
+      report: makeReport(store, { sendThrows }),
       log: () => {},
       inWindow: () => true,
       cycling: (name) => cyclingNames.includes(name),
@@ -1647,9 +1691,8 @@ function watchdogFake({ states = { hot: 'RUNNING', warm: 'RUNNING' }, throwFor =
         const tier = name === CAMPAIGNS.hot ? 'hot' : 'warm';
         return { name, state: states[tier], lists: [] };
       },
-      sendAlert: async (text) => {
+      sendAlert: async () => {
         if (sendThrows) throw new Error('GroupMe 400');
-        sent.push(text);
       },
     },
   };
@@ -1691,27 +1734,84 @@ test('WATCHDOG: both down → both named, one message each', async () => {
   assert.deepEqual(body.alerted, [CAMPAIGNS.hot, CAMPAIGNS.warm]);
 });
 
-test('WATCHDOG: suppression holds for 30 min, then re-alerts', async () => {
+test('WATCHDOG: one continuous outage is ONE card, however long it runs', async () => {
+  // The 2026-09-04 defect. The old 30-minute re-alert paged 4x in 90 minutes
+  // for two campaigns that never came back up in between, and a channel that
+  // repeats itself is a channel people mute.
   const f = watchdogFake({ states: { hot: 'RUNNING', warm: 'NOT_RUNNING' } });
   const t0 = new Date('2026-09-03T16:00:00Z');
-  await checkCampaignState({ ...f.deps, now: t0 });
-  await checkCampaignState({ ...f.deps, now: new Date(t0.getTime() + 5 * 60000) });
-  await checkCampaignState({ ...f.deps, now: new Date(t0.getTime() + 29 * 60000) });
-  assert.equal(f.sent.length, 1, 'still inside the 30-minute window');
-  await checkCampaignState({ ...f.deps, now: new Date(t0.getTime() + 31 * 60000) });
-  assert.equal(f.sent.length, 2, 'still down after 30 minutes — say so again');
+  for (const min of [0, 5, 29, 31, 90, 240]) {
+    await checkCampaignState({ ...f.deps, now: new Date(t0.getTime() + min * 60000) });
+  }
+  assert.equal(f.sent.length, 1, 'still the same outage — say it once');
 });
 
-test('WATCHDOG: recovery clears suppression, so the NEXT outage alerts immediately', async () => {
-  const f = watchdogFake({ states: { hot: 'RUNNING', warm: 'NOT_RUNNING' } });
+test('WATCHDOG: a changing Five9 state is still ONE outage, not three', async () => {
+  // Five9 reported one continuous outage as UNREADABLE, then NOT_RUNNING, then
+  // STOPPING. The old alert keyed on that string, so one dead campaign read as
+  // three separate problems. The key must carry no live state.
+  const store = alertStateStore();
   const t0 = new Date('2026-09-03T16:00:00Z');
-  await checkCampaignState({ ...f.deps, now: t0 });
-  assert.equal(f.sent.length, 1);
-  const healthy = watchdogFake();
-  await checkCampaignState({ ...healthy.deps, lastAlert: f.lastAlert, now: new Date(t0.getTime() + 60000) });
-  assert.equal(f.lastAlert.size, 0, 'a RUNNING read forgets the earlier alert');
-  await checkCampaignState({ ...f.deps, now: new Date(t0.getTime() + 120000) });
-  assert.equal(f.sent.length, 2, 'a fresh outage two minutes later is not suppressed');
+  const seq = [
+    watchdogFake({ throwFor: CAMPAIGNS.hot, store }),                                  // UNREADABLE
+    watchdogFake({ states: { hot: 'NOT_RUNNING', warm: 'RUNNING' }, store }),
+    watchdogFake({ states: { hot: 'STOPPING', warm: 'RUNNING' }, store }),
+  ];
+  for (const [i, f] of seq.entries()) {
+    await checkCampaignState({ ...f.deps, now: new Date(t0.getTime() + i * 60000) });
+  }
+  assert.equal(store.sent.length, 1, 'one campaign down is one condition, whatever Five9 calls it');
+  assert.match(store.sent[0], /is UNREADABLE during dial hours/, 'the first observed state is the one reported');
+});
+
+test('WATCHDOG: recovery is announced exactly once', async () => {
+  const store = alertStateStore();
+  const t0 = new Date('2026-09-03T16:00:00Z');
+  const down = watchdogFake({ states: { hot: 'RUNNING', warm: 'NOT_RUNNING' }, store });
+  await checkCampaignState({ ...down.deps, now: t0 });
+  assert.equal(store.sent.length, 1);
+
+  const healthy = watchdogFake({ store });
+  await checkCampaignState({ ...healthy.deps, now: new Date(t0.getTime() + 60000) });
+  await checkCampaignState({ ...healthy.deps, now: new Date(t0.getTime() + 120000) });
+  assert.equal(store.sent.length, 2, 'one recovery card, and the second healthy sweep is silent');
+  assert.match(store.sent[1], /RECOVERED/);
+  assert.match(store.sent[1], new RegExp(CAMPAIGNS.warm));
+});
+
+test('WATCHDOG: a fresh outage after a recovery alerts immediately', async () => {
+  // Silence must be scoped to ONE incident. A campaign that recovers and dies
+  // again two minutes later is news, and must not inherit the first outage's
+  // silence.
+  const store = alertStateStore();
+  const t0 = new Date('2026-09-03T16:00:00Z');
+  const down = watchdogFake({ states: { hot: 'RUNNING', warm: 'NOT_RUNNING' }, store });
+  const healthy = watchdogFake({ store });
+
+  await checkCampaignState({ ...down.deps, now: t0 });
+  await checkCampaignState({ ...healthy.deps, now: new Date(t0.getTime() + 60000) });
+  await checkCampaignState({ ...down.deps, now: new Date(t0.getTime() + 120000) });
+
+  assert.equal(store.sent.length, 3, 'outage, recovery, second outage');
+  assert.match(store.sent[2], /is NOT_RUNNING during dial hours/);
+});
+
+test('WATCHDOG: outside dial hours it neither pages NOR announces a recovery', async () => {
+  // A campaign that dies at 22:00 and is still dead at 08:00 must page once at
+  // 08:00. It must not "recover" at 22:01 just because nobody is listening —
+  // that would be a false all-clear on a floor that is still dark.
+  const store = alertStateStore();
+  const t0 = new Date('2026-09-03T16:00:00Z');
+  const down = watchdogFake({ states: { hot: 'RUNNING', warm: 'NOT_RUNNING' }, store });
+  await checkCampaignState({ ...down.deps, now: t0 });
+  assert.equal(store.sent.length, 1);
+
+  const healthy = watchdogFake({ store });
+  await checkCampaignState({ ...healthy.deps, inWindow: () => false, now: new Date(t0.getTime() + 60000) });
+  assert.equal(store.sent.length, 1, 'no recovery card at 3am');
+
+  await checkCampaignState({ ...down.deps, now: new Date(t0.getTime() + 120000) });
+  assert.equal(store.sent.length, 1, 'and the outage is still held — it was never cleared');
 });
 
 test('WATCHDOG: outside the window → still 503, but nobody is paged at 3am', async () => {
@@ -1774,16 +1874,29 @@ test('CYCLE-SUPPRESS: a RUNNING campaign is never reported as cycling', async ()
   assert.ok(body.campaigns.every((c) => c.cycling === false));
 });
 
-test('CYCLE-SUPPRESS: suppression does not touch the 30-minute clock, so a real outage right after a cycle still pages', async () => {
+test('CYCLE-SUPPRESS: a mid-cycle poll leaves the condition untouched in BOTH directions', async () => {
+  // A cycling campaign is neither an alert nor a healthy read, so it must
+  // neither open the condition nor clear it. Getting this wrong in the second
+  // direction is the subtle one: a cycle mid-outage would announce a recovery
+  // for a floor that is still dark.
+  const store = alertStateStore();
   const t0 = new Date('2026-09-03T16:00:00Z');
-  const midCycle = watchdogFake({ states: { hot: 'RUNNING', warm: 'NOT_RUNNING' }, cyclingNames: [CAMPAIGNS.warm] });
+
+  // A cycle BEFORE any outage must not start a silence window.
+  const midCycle = watchdogFake({ states: { hot: 'RUNNING', warm: 'NOT_RUNNING' }, cyclingNames: [CAMPAIGNS.warm], store });
   await checkCampaignState({ ...midCycle.deps, now: t0 });
-  assert.deepEqual(midCycle.sent, []);
-  // The cycle ends badly: the mark is gone, the campaign is still down.
-  const after = watchdogFake({ states: { hot: 'RUNNING', warm: 'NOT_RUNNING' } });
-  const { status } = await checkCampaignState({ ...after.deps, lastAlert: midCycle.lastAlert, now: new Date(t0.getTime() + 30000) });
+  assert.deepEqual(store.sent, []);
+
+  // The cycle ends badly — the campaign is still down and unexplained.
+  const after = watchdogFake({ states: { hot: 'RUNNING', warm: 'NOT_RUNNING' }, store });
+  const { status } = await checkCampaignState({ ...after.deps, now: new Date(t0.getTime() + 30000) });
   assert.equal(status, 503);
-  assert.equal(after.sent.length, 1, 'pages 30 seconds later — the mid-cycle poll did not start a suppression window');
+  assert.equal(store.sent.length, 1, 'pages 30 seconds later — the mid-cycle poll suppressed nothing');
+
+  // A cycle DURING the outage must not read as recovery.
+  const cyclingAgain = watchdogFake({ states: { hot: 'RUNNING', warm: 'NOT_RUNNING' }, cyclingNames: [CAMPAIGNS.warm], store });
+  await checkCampaignState({ ...cyclingAgain.deps, now: new Date(t0.getTime() + 60000) });
+  assert.equal(store.sent.length, 1, 'no false all-clear from a cycle mid-outage');
 });
 
 test('CYCLE MARK: set while the reorder runs, cleared once the campaign is back', async () => {
@@ -1853,20 +1966,21 @@ test('CYCLE MARK: is per campaign, and clearCycling only clears its own', () => 
   _resetCycling();
 });
 
-test('decideWatchdogAlerts: pure — suppression is per campaign, not global', () => {
-  const lastAlert = new Map();
-  const rows = [
-    { campaign: CAMPAIGNS.hot, state: 'NOT_RUNNING', ok: false },
-    { campaign: CAMPAIGNS.warm, state: 'RUNNING', ok: true },
-  ];
-  assert.equal(decideWatchdogAlerts(rows, { now: 0, lastAlert }).length, 1);
-  assert.equal(decideWatchdogAlerts(rows, { now: 60000, lastAlert }).length, 0, 'hot is suppressed');
-  const warmDown = [
-    { campaign: CAMPAIGNS.hot, state: 'NOT_RUNNING', ok: false },
-    { campaign: CAMPAIGNS.warm, state: 'NOT_RUNNING', ok: false },
-  ];
-  const out = decideWatchdogAlerts(warmDown, { now: 120000, lastAlert });
-  assert.deepEqual(out.map((a) => a.campaign), [CAMPAIGNS.warm], 'warm is new, hot is still suppressed');
+test('watchdogAlertKey: identity carries no live state — that IS the fix', () => {
+  // The key must be identical across every state one outage passes through,
+  // and distinct per campaign so one dead campaign never silences another.
+  const hot = watchdogAlertKey(CAMPAIGNS.hot);
+  assert.equal(hot, watchdogAlertKey(CAMPAIGNS.hot), 'stable');
+  assert.notEqual(hot, watchdogAlertKey(CAMPAIGNS.warm), 'per campaign, not global');
+  for (const state of ['UNREADABLE', 'NOT_RUNNING', 'STOPPING', null]) {
+    assert.ok(!hot.includes(String(state)), `the key must not embed ${state}`);
+  }
+});
+
+test('watchdogAlertText: the live state belongs in the BODY', () => {
+  assert.match(watchdogAlertText(CAMPAIGNS.hot, 'stopping'), /is STOPPING during dial hours/);
+  assert.match(watchdogAlertText(CAMPAIGNS.hot, null), /is UNREADABLE during dial hours/);
+  assert.match(watchdogAlertText(CAMPAIGNS.hot, 'NOT_RUNNING'), /Check Five9 now/);
 });
 
 test('withinWatchdogWindow: 08:00–21:00 ET Mon–Sat, never Sunday', () => {

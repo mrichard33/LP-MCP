@@ -151,9 +151,31 @@ test('the unarmed set is logged AND alerted, not just returned', () => {
   assert.match(WATCHDOG_CODE, /BLIND SPOT/);
 });
 
-test('the unarmed alert is deduped once per ET day, like the missing alert', () => {
+test('the unarmed alert is edge-triggered, like the missing alert', () => {
+  // AMENDED 2026-09-04. This used to pin `lastAlertDate.get(UNARMED_SENTINEL)
+  // !== today` — a process-local Map that any restart wiped, and that could
+  // only ever suppress WITHIN one ET day. Both alerts now go through the
+  // durable layer in src/alert-state.js, which is keyed on condition identity
+  // and survives restarts and replicas.
   assert.match(WATCHDOG_CODE, /UNARMED_SENTINEL/);
-  assert.match(WATCHDOG_CODE, /lastAlertDate\.get\(UNARMED_SENTINEL\) !== today/);
+  assert.match(WATCHDOG_CODE, /reportAlertCondition\(/);
+  assert.match(WATCHDOG_CODE, /key: `lp_report:\$\{UNARMED_SENTINEL\}`/);
+  assert.doesNotMatch(WATCHDOG_CODE, /lastAlertDate/, 'the process-local Map is gone');
+});
+
+test('a report that finally lands CLEARS its alert instead of just going quiet', () => {
+  // Report 134 was missing from 2026-09-01 and re-announced 6 times over two
+  // days. Under the old code the healthy branch was a bare `continue`, so the
+  // alert had no way to resolve and nobody was ever told it came back.
+  assert.match(WATCHDOG_CODE, /const ingestedToday = lastEtDay === today/);
+  assert.match(WATCHDOG_CODE, /active: !ingestedToday/);
+});
+
+test('an unverified sweep never clears the blind-spot alert', () => {
+  // An empty `unarmed` list we could not actually verify is not evidence of
+  // health; clearing on it would announce an all-clear nobody earned.
+  assert.match(WATCHDOG_CODE, /readFailed = true/);
+  assert.match(WATCHDOG_CODE, /readFailed && unarmed\.length === 0 \? null/);
 });
 
 test('only a demonstrably live feed counts as a blind spot', () => {

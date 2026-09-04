@@ -78,7 +78,7 @@
 
 import supabase from './supabase.js';
 import { processEvents } from './decision-engine.js';
-import { sendGroupMeMessage } from './groupme.js';
+import { reportAlertCondition } from './alert-state.js';
 import {
   shouldAlertAgenticSilence,
   formatAgenticSilenceAlert,
@@ -135,6 +135,12 @@ const SILENCE_MIN_REPLIES = Math.max(
 // One page per window, not one per 60s heartbeat.
 const SILENCE_ALERT_COOLDOWN_MS = parseInt(
   process.env.AGENTIC_SILENCE_ALERT_COOLDOWN_MS || `${6 * 60 * 60 * 1000}`, 10
+);
+// 2026-09-04 — how long an UNRESOLVED silence waits before it re-reminds. The
+// cooldown above no longer paces the alert (alert-state.js is edge-triggered);
+// it survives only as the degraded path when the state table is unusable.
+const SILENCE_REMIND_MS = parseInt(
+  process.env.AGENTIC_SILENCE_REMIND_MS || `${24 * 60 * 60 * 1000}`, 10
 );
 
 const DRAIN_BATCH_LIMIT = parseInt(
@@ -274,33 +280,54 @@ async function getAgenticSilenceCounts() {
 }
 
 /**
- * 2026-08-03 — throttled GroupMe alert when the agentic pipeline has produced
- * no analyses while answerable replies arrived. Best-effort: a read failure or
- * a send failure is logged, never thrown, and a failed read NEVER alerts —
- * "I couldn't tell" must not page, matching the fail-open posture used
- * throughout this subsystem.
+ * 2026-08-03 — GroupMe alert when the agentic pipeline has produced no
+ * analyses while answerable replies arrived. Edge-triggered since 2026-09-04:
+ * one card per outage plus a daily reminder while it is unresolved.
+ *
+ * Best-effort: a read failure or a send failure is logged, never thrown, and a
+ * failed read NEVER alerts — "I couldn't tell" must not page, matching the
+ * fail-open posture used throughout this subsystem. Since 2026-09-04 that rule
+ * cuts both ways: it must not CLEAR either, or a quiet night would announce a
+ * recovery nobody earned.
  */
 async function maybeAlertAgenticSilence() {
   const counts = await getAgenticSilenceCounts();
   if (!counts) return { alerted: false, error: 'count_failed' };
 
-  const { alert, reasons, critical } = shouldAlertAgenticSilence(counts, {
+  const { alert, reasons, critical, verdict } = shouldAlertAgenticSilence(counts, {
     minReplies: SILENCE_MIN_REPLIES,
   });
-  lastSilenceCheck = { ...counts, alert, reasons };
+  lastSilenceCheck = { ...counts, alert, reasons, verdict };
 
-  if (!alert) return { alerted: false, counts };
-  if (Date.now() - lastSilenceAlertAt < SILENCE_ALERT_COOLDOWN_MS) {
-    return { alerted: false, suppressed: 'cooldown', reasons, counts };
-  }
-  lastSilenceAlertAt = Date.now();
-  try {
-    await sendGroupMeMessage(formatAgenticSilenceAlert(counts, reasons));
+  // 2026-09-04 — edge-triggered (src/alert-state.js). This alert fired 4x in
+  // 90min on 2026-09-04 for one continuous outage.
+  //
+  // The verdict mapping is the important part. shouldAlertAgenticSilence
+  // returns alert:false for TWO different reasons, and collapsing them would
+  // be worse than the bug being fixed: 'healthy' means analyses actually ran,
+  // but 'insufficient_evidence' only means the night was too quiet to
+  // conclude. Clearing on the latter would announce "RECOVERED" on every
+  // low-traffic night, telling an operator the bot is fine when nothing has
+  // been proven at all. That maps to null — touch nothing.
+  const active = verdict === 'alert' ? true : verdict === 'healthy' ? false : null;
+
+  // Leads are being ghosted while this is open and it does NOT self-resolve —
+  // the 2026-07-31 outage ran 47 hours — so unlike the live-ops keys this one
+  // carries a daily re-reminder.
+  const res = await reportAlertCondition({
+    key: 'agentic:silence',
+    active,
+    label: 'agentic bot answering again',
+    text: () => formatAgenticSilenceAlert(counts, reasons),
+    detail: reasons.join('; '),
+    remindMs: SILENCE_REMIND_MS,
+    fallbackCooldownMs: SILENCE_ALERT_COOLDOWN_MS,
+  });
+  if (res.sent && active === true) {
+    lastSilenceAlertAt = Date.now();
     console.error(`[DecisionEngineHeartbeat] AGENTIC SILENCE alert sent — ${reasons.join('; ')}`);
-  } catch (err) {
-    console.error(`[DecisionEngineHeartbeat] agentic-silence alert send failed: ${err.message}`);
   }
-  return { alerted: true, reasons, critical, counts };
+  return { alerted: !!(res.sent && active === true), action: res.action, reasons, critical, counts };
 }
 
 /**
