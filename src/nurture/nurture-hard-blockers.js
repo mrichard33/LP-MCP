@@ -51,7 +51,20 @@
  *   has_ps is informational — even URL CTAs can place the URL in the
  *   body (direct_assessment_ask), so has_ps alone doesn't tell us
  *   whether a link should exist. cta_type does.
+ *
+ * v1.6 — 2026-09-04. S4.5 v1.1/v1.2 alignment.
+ *   (a) BODY word bounds 200/500 → 150/340. The v1.1 prompt overrides
+ *       set 150–320; the old floor would have blocked a legitimate
+ *       150–199 word email, and the old ceiling let 350–370 word
+ *       bodies through (WK3=369, WK6=357 on 2026-09-04). 340 = cap +
+ *       20 words of grace for link text and salutation.
+ *   (b) BANNED_PHRASE scan now includes ps_text. Every "landed"
+ *       variant on 2026-09-04 was in the P.S., which the scan skipped.
  */
+
+// v1.6: body word bounds. Keep in sync with S4.5 overrides #1 (150–320).
+const BODY_MIN_WORDS = 150;
+const BODY_MAX_WORDS = 340;
 
 export const HARD_BLOCKER_CODES = Object.freeze({
   SUBJECT_TOO_LONG:        'SUBJECT_TOO_LONG',
@@ -248,8 +261,8 @@ export function runHardBlockers(output, prompt, context) {
   // 4. Body word count
   if (output.body_html !== undefined && output.body_html !== null) {
     const wordCount = stripHtml(output.body_html).split(/\s+/).filter(Boolean).length;
-    if (wordCount < 200) failures.push(HARD_BLOCKER_CODES.BODY_TOO_SHORT);
-    if (wordCount > 500) failures.push(HARD_BLOCKER_CODES.BODY_TOO_LONG);
+    if (wordCount < BODY_MIN_WORDS) failures.push(HARD_BLOCKER_CODES.BODY_TOO_SHORT);
+    if (wordCount > BODY_MAX_WORDS) failures.push(HARD_BLOCKER_CODES.BODY_TOO_LONG);
   }
 
   // 5. SMS length
@@ -260,7 +273,8 @@ export function runHardBlockers(output, prompt, context) {
   }
 
   // 6. Banned phrases — always-banned + prompt-specific
-  const fullText = [output.subject, output.preheader, output.body_html, output.sms_body]
+  //    v1.6: ps_text included — the P.S. is customer-facing copy too.
+  const fullText = [output.subject, output.preheader, output.body_html, output.ps_text, output.sms_body]
     .filter(Boolean)
     .join(' ')
     .toLowerCase();
@@ -338,7 +352,7 @@ export function runHardBlockers(output, prompt, context) {
 
   // v1.1
   // 12. Brand-line violation
-  const fullTextPreserveCase = [output.subject, output.preheader, output.body_html, output.sms_body]
+  const fullTextPreserveCase = [output.subject, output.preheader, output.body_html, output.ps_text, output.sms_body]
     .filter(Boolean)
     .join(' ');
   if (hasBrandLineViolation(fullTextPreserveCase)) {
