@@ -410,6 +410,162 @@ test('sql/085 backfills the three container-kill reasons and no others', () => {
     'a sweep that ran out of budget is a capacity problem, not a container kill');
 });
 
+// ─── 8. The sweep that pages must own a walker [source-level] ────
+//
+// 2026-09-04, five hours of silent data loss. 71fb7bf replaced both sweeps'
+// hand-rolled paging loops with the shared walker (src/lp-paging.js) and added
+// the createPageWalker construction to runLeadsSweep ONLY. runJobChangesSweep
+// was left calling walker.next() against a binding that does not exist in its
+// scope, so it threw `ReferenceError: walker is not defined` on its first
+// iteration of every run. Jobs synced fell from ~250/hour to 0.
+//
+// Nothing caught it. The throw was swallowed by the allSettled in
+// incrementalSync, the catch that would have logged it re-threw while reading
+// `walker` itself to build its message, and the log row still closed as
+// `completed`. The whole suite stayed green because no test ever entered that
+// function.
+//
+// This is a scope error, so `node --check` cannot see it and only a real LP
+// round trip would surface it at runtime. Pin it at source: any sweep that
+// reads `walker` must also create one.
+
+test('every sweep that uses a walker also constructs one [source-level]', () => {
+  const src = readFileSync(join(ROOT, 'src/sync-engine.js'), 'utf8');
+
+  // Slice the file into top-level `async function …Sweep(…)` bodies. Nested
+  // helpers do not matter here — a walker is per-sweep by construction.
+  const starts = [...src.matchAll(/^async function (\w*Sweep)\s*\(/gm)];
+  assert.ok(starts.length >= 2,
+    'expected to find the leads and job-changes sweeps — has this file been restructured?');
+
+  for (const [i, m] of starts.entries()) {
+    const name = m[1];
+    const end = i + 1 < starts.length ? starts[i + 1].index : src.length;
+    const body = src.slice(m.index, end);
+
+    if (!/\bwalker\s*\./.test(body)) continue;   // this sweep does not page
+
+    assert.match(body, /\bconst walker = createPageWalker\(/,
+      `${name} reads \`walker\` but never constructs one — this is the 71fb7bf defect: ` +
+      'the sweep throws ReferenceError on its first page and stops syncing entirely, ' +
+      'while its lp_sync_log row still reads completed');
+  }
+});
+
+test('the job-changes sweep pages the job-changes endpoint [source-level]', () => {
+  // The walker must be pointed at getJobStatusChanges, not copy-pasted from the
+  // leads sweep still holding getLeadData — that would silently sync the wrong
+  // entity while every assertion above passed.
+  const src = readFileSync(join(ROOT, 'src/sync-engine.js'), 'utf8');
+  const fn = src.slice(src.indexOf('async function runJobChangesSweep('));
+  const body = fn.slice(0, fn.indexOf('\nasync function ') + 1 || undefined);
+
+  const walkerCall = body.slice(body.indexOf('createPageWalker('));
+  assert.match(walkerCall.slice(0, 500), /getJobStatusChanges\(/,
+    'the job-changes walker must fetch getJobStatusChanges');
+  assert.doesNotMatch(walkerCall.slice(0, 500), /getLeadData\(/,
+    'the job-changes walker must not fetch leads');
+});
+
+// ─── 9. paging telemetry says which entities page, and which do not ──
+//
+// The handoff behind this section asked why jobs and milestones return NULL for
+// paging_mode/sweep_api_calls/rows_scanned while the other four populate. Two
+// different answers, and NULL could not tell them apart:
+//
+//   jobs        — pages for itself (getJobStatusChanges) and its telemetry write
+//                 already existed; the column was empty only because the sweep
+//                 crashed before reaching it. Fixed by section 8.
+//   milestones  — does not page at all. syncJobAndMilestones() makes zero LP
+//                 calls; milestones arrive embedded in the job payload. NULL was
+//                 correct but unreadable, so it is now the explicit 'n/a'.
+
+test('milestones are stamped n/a, unconditionally, once per run [source-level]', () => {
+  const src = readFileSync(join(ROOT, 'src/sync-engine.js'), 'utf8');
+  const fn = src.slice(src.indexOf('export async function incrementalSync('));
+
+  assert.match(fn, /syncLogTelemetry\(logIds\.milestones, \{ pagingMode: 'n\/a' \}\)/,
+    "milestones must record paging_mode='n/a' — an entity that does not page is a " +
+    'different fact from an entity nobody instrumented, and NULL says both');
+
+  // It must sit outside the per-sweep branches: "does not page" is a property of
+  // the entity, not of how a given run went, so a dead jobs sweep must not
+  // silently take it away.
+  const stamp = fn.indexOf("syncLogTelemetry(logIds.milestones, { pagingMode: 'n/a' })");
+  const branch = fn.lastIndexOf("if (jobsRes.status === 'fulfilled') {", stamp);
+  const branchEnd = fn.indexOf('\n    }', branch);
+  assert.ok(stamp > branchEnd,
+    'the n/a stamp must not be nested inside the jobs-sweep-succeeded branch');
+});
+
+test('the leads sweep still writes telemetry to exactly its own four entities [source-level]', () => {
+  // Today's behavior, pinned. sweep_api_calls is SWEEP-scoped: one counter
+  // written onto the four rows that counter actually paid for. Adding jobs or
+  // milestones here would have this sweep and runJobChangesSweep overwrite each
+  // other's numbers — see the invariant comment at that write site.
+  const src = readFileSync(join(ROOT, 'src/sync-engine.js'), 'utf8');
+  const fn = src.slice(src.indexOf('async function runLeadsSweep('));
+
+  assert.match(fn, /\['leads', 'calls', 'notes', 'activities'\]\.map\(\s*\n?\s*\(et\) => syncLogTelemetry\(/,
+    'the leads sweep must write telemetry to leads/calls/notes/activities and no others');
+});
+
+test('the job-changes sweep persists its own paging telemetry to the jobs row [source-level]', () => {
+  const src = readFileSync(join(ROOT, 'src/sync-engine.js'), 'utf8');
+  const fn = src.slice(src.indexOf('async function runJobChangesSweep('));
+
+  assert.match(fn, /syncLogTelemetry\(logIds\?\.jobs, \{ apiCalls, pagingMode, rowsScanned: scanned \}\)/,
+    'jobs pages for itself, so it gets real measured numbers — not a mirrored count');
+  assert.doesNotMatch(fn, /syncLogTelemetry\(logIds\?\.milestones, \{ apiCalls/,
+    'milestones must never be given the jobs sweep\'s counters — a copied number ' +
+    'would read as an independent measurement');
+});
+
+// ─── 10. A half-dead run must not read as completed ──────────────
+//
+// The other half of why the outage stayed invisible. jobs/milestones logs are
+// co-owned by both sweeps, and the old code marked them failed only if the LEADS
+// sweep also failed. So when the jobs sweep died and leads succeeded, both rows
+// closed `completed` with 0 records and NULL telemetry — the exact shape of a
+// window with no job changes.
+
+test('a dead jobs sweep marks jobs and milestones failed even when leads succeeded [source-level]', () => {
+  const src = readFileSync(join(ROOT, 'src/sync-engine.js'), 'utf8');
+  const fn = src.slice(src.indexOf('export async function incrementalSync('));
+
+  // The jobs-rejected branch.
+  const branch = fn.slice(fn.indexOf('Job-changes sweep failed'));
+  const head = branch.slice(0, branch.indexOf('\n    }'));
+
+  assert.match(head, /syncLogFail\(logIds\.jobs,/,
+    'a dead jobs sweep must mark the jobs row failed');
+  assert.match(head, /syncLogFail\(logIds\.milestones,/,
+    'and the milestones row with it — the same sweep owns both');
+  assert.doesNotMatch(head, /if \(leadsRes\.status !== 'fulfilled'\)/,
+    "the leads sweep succeeding must not suppress the jobs sweep's failure — " +
+    'that guard is what made a five-hour jobs outage read as a quiet window');
+
+  // And the completed-close is gated on the owning sweep, not on either sweep.
+  assert.doesNotMatch(fn, /if \(leadsRes\.status === 'fulfilled' \|\| jobsRes\.status === 'fulfilled'\) \{/,
+    'jobs/milestones must not be closed completed on the strength of the leads sweep alone');
+});
+
+test('sql/089 documents the three-value vocabulary and what NULL now means', () => {
+  const sql = readFileSync(join(ROOT, 'sql', '089_sync_log_paging_mode_na.sql'), 'utf8');
+  const comment = sql.slice(sql.indexOf('COMMENT ON COLUMN lp_sync_log.paging_mode'));
+
+  for (const v of ['normal', 'deep', 'n/a']) {
+    assert.ok(comment.includes(v), `column comment must document the '${v}' value`);
+  }
+  assert.match(comment, /NULL = uninstrumented/,
+    'the whole point of the sentinel is that NULL stops being ambiguous — say so in the column');
+
+  // The 084 reporting query grouped by paging_mode; with a third bucket it has
+  // to say which buckets it means.
+  assert.match(sql, /WHERE paging_mode IN \('normal','deep'\)/,
+    'the cost-per-row query must exclude entities that do not page for themselves');
+});
+
 // ─── Tripwire ────────────────────────────────────────────────────
 
 test('no network calls escaped the suite', () => {

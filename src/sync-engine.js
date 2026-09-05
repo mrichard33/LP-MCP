@@ -1160,6 +1160,23 @@ async function runJobChangesSweep(since, windowEnd, logIds) {
   let scanned = 0;
   const sweepStartedAt = Date.now();
 
+  // WO-13: paging is owned by the shared walker (src/lp-paging.js), same as
+  // runLeadsSweep. This construction is load-bearing and its absence is not a
+  // degraded mode — the loop below, the stats destructure and the telemetry
+  // write all read `walker`, so without it the sweep throws
+  // `ReferenceError: walker is not defined` on its first iteration, the
+  // rejection is swallowed by the allSettled in incrementalSync, and jobs stop
+  // syncing entirely while their log row still reads `completed`. That is
+  // exactly what 71fb7bf shipped: it converted this loop to walker.next() and
+  // added createPageWalker to runLeadsSweep only. Keep the two together.
+  const walker = createPageWalker({
+    fetch: ({ PageSize, StartIndex }) => getJobStatusChanges({ startdate: since, enddate: windowEnd, PageSize, StartIndex })
+      .then(extractArray),
+    pageSize: SYNC_PAGE_SIZE,
+    idOf: (r) => r?.job_id ?? r?.id ?? r?.JobID ?? null,
+    label: '[Sync:JobChanges]',
+  });
+
   while (true) {
     let items;
     try {
@@ -1438,15 +1455,19 @@ export async function incrementalSync() {
     } else {
       const reason = jobsRes.reason?.message || 'jobChangesSweep failed';
       console.error(`[Sync] Job-changes sweep failed: ${reason} — check lp_sync_log.records_synced for partial progress`);
-      // jobs/milestones logs are co-owned by the leads sweep — only
-      // mark them failed if leads sweep ALSO failed (otherwise leads-
-      // sweep contributions stand and we close those logs below).
-      if (leadsRes.status !== 'fulfilled') {
-        await Promise.all([
-          syncLogFail(logIds.jobs, 0, reason).catch(() => {}),
-          syncLogFail(logIds.milestones, 0, reason).catch(() => {}),
-        ]);
-      }
+      // jobs/milestones logs are co-owned by the leads sweep, and this used to
+      // mark them failed ONLY if the leads sweep also failed — on the reasoning
+      // that leads-sweep contributions still stand. They do, and they are still
+      // carried in records_synced below. But the row is the only durable record
+      // of the run, and letting it read `completed` while the sweep that owns
+      // these entities died outright is how a five-hour jobs outage looked like
+      // a quiet window on 2026-09-04: `completed`, 0 records, NULL telemetry —
+      // indistinguishable from a window with no job changes. A half-dead run is
+      // a failed run for these two entities; say so.
+      await Promise.all([
+        syncLogFail(logIds.jobs, counts.jobs, reason).catch(() => {}),
+        syncLogFail(logIds.milestones, counts.milestones, reason).catch(() => {}),
+      ]);
     }
 
     // v6.8: Cap-hit is informational, not a failure. The previous build
@@ -1478,11 +1499,29 @@ export async function incrementalSync() {
       closes.push(syncLogComplete(logIds.notes, counts.notes));
       closes.push(syncLogComplete(logIds.activities, counts.activities));
     }
-    // jobs/milestones close if EITHER sweep contributed successfully.
-    if (leadsRes.status === 'fulfilled' || jobsRes.status === 'fulfilled') {
+    // jobs/milestones close as completed only when the sweep that OWNS them
+    // survived. If it didn't, the branch above has already put both rows in
+    // `failed` with the reason, and syncLogComplete's `.eq('status','running')`
+    // guard would refuse to overwrite that anyway — this condition states the
+    // intent rather than relying on that guard to enforce it.
+    if (jobsRes.status === 'fulfilled') {
       closes.push(syncLogComplete(logIds.jobs, counts.jobs));
       closes.push(syncLogComplete(logIds.milestones, counts.milestones));
     }
+
+    // Milestones do not page, and NULL could not say so. They are never fetched
+    // independently: syncJobAndMilestones makes zero LP calls and reads them out
+    // of the job payload it is handed (`getField(job, 'milestones', ...)`), so
+    // the rows counted here arrive inside the pages runJobChangesSweep already
+    // charged to the `jobs` row. 'n/a' is that fact stated once, in the column a
+    // reader checks. The two counters stay NULL on purpose — there is no
+    // independent measurement to report, and mirroring the jobs sweep's numbers
+    // would read as one. NULL in paging_mode now means uninstrumented, nothing
+    // else. This is written unconditionally, outside the branches above, because
+    // "does not page" is a property of the entity and not of how a given run
+    // went.
+    closes.push(syncLogTelemetry(logIds.milestones, { pagingMode: 'n/a' }).catch(() => {}));
+
     await Promise.all(closes);
 
     // Push LP notes from Supabase to GHL contact records

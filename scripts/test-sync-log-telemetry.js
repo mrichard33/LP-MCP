@@ -105,6 +105,18 @@ test('rowsScanned can be written on its own', async () => {
   assert.deepEqual(lastPatch(), { rows_scanned: 51 });
 });
 
+test("pagingMode 'n/a' is written, and drags no counters along", async () => {
+  // An entity that does not page for itself (milestones ride inside the job
+  // payloads runJobChangesSweep already paged for) records the fact explicitly.
+  // NULL used to mean both "does not page" and "nobody instrumented this"; the
+  // sentinel splits them. The two counters must stay ABSENT — there is no
+  // independent measurement to report, and mirroring the jobs sweep's numbers
+  // onto this row would read as one, which is the same ambiguity moved sideways.
+  fresh();
+  await syncLogTelemetry(LOG_ID, { pagingMode: 'n/a' });
+  assert.deepEqual(lastPatch(), { paging_mode: 'n/a' });
+});
+
 // ─── 2. Zero is a measurement, not an absence ────────────────────
 
 test('rowsScanned = 0 IS written — a sweep that fetched nothing is a real result', async () => {
