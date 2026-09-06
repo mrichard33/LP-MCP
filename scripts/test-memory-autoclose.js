@@ -8,6 +8,7 @@ import {
   AUTOCLOSE_RULES, PROTECTED_ITEM_TYPES, PROTECTED_LIST_SQL, runAutoclose,
   RULE_A_SELECT, RULE_B_SELECT, RULE_C_SELECT, RULE_D1_SELECT, RULE_D2_SELECT, RULE_STALE_SELECT,
   shadowSql, closeSql, supersedeSql, staleFlagSql, clearWouldCloseSql, logSql, prNumbersIn, prRefsIn, mergedPrRows, mergedAfterSession,
+  prIntent, unresolvedReposIn,
 } from '../src/jobs/memory-autoclose.js';
 import { withRetry, isTransientError } from '../src/memory/with-retry.js';
 
@@ -98,11 +99,13 @@ test("mode='shadow': every statement sets would_close, none touches status / sta
   assert.equal(r.rules['A:next_step_30d'].affected, 1); assert.deepEqual(r.rules['A:next_step_30d'].sample_ids, [1]);
   assert.equal(r.rules['B:retro_90d'].affected, 1); assert.deepEqual(r.rules['B:retro_90d'].sample_ids, [4]);
   assert.equal(r.rules['C:duplicate'].affected, 2); assert.deepEqual(r.rules['C:duplicate'].sample_ids, [5, 6]);
-  assert.equal(r.rules['D:pr_merged'].affected, 1); assert.deepEqual(r.rules['D:pr_merged'].sample_ids, [7]);
+  // #7 "verify after PR #866 merges" is a passing mention: tagged D:pr_mentioned, never a close candidate.
+  assert.equal(r.rules['D:pr_merged'].affected, 0);
+  assert.equal(r.rules['D:pr_mentioned'].affected, 1); assert.deepEqual(r.rules['D:pr_mentioned'].sample_ids, [7]);
   assert.equal(r.rules['STALE:untouched_120d'].affected, 1); assert.deepEqual(r.rules['STALE:untouched_120d'].sample_ids, [9]);
-  // one log row per rule, in shadow mode
+  // one log row per rule (+ one for D:pr_mentioned), in shadow mode
   const logs = m.logs();
-  assert.equal(logs.length, AUTOCLOSE_RULES.length);
+  assert.equal(logs.length, AUTOCLOSE_RULES.length + 1);
   for (const l of logs) assert.match(l, /VALUES \('shadow'/);
   // the cleanup keeps every id tagged this run
   const cleanup = updates.find((u) => /SET would_close=NULL WHERE would_close IS NOT NULL/.test(u));
@@ -203,10 +206,10 @@ test('rule D2: skipped without a GitHub token; closes only rows whose named PRs 
   let calls = 0;
   const fetchPR = async (n) => { calls++; if (n === 1) return { merged_at: 'x' }; if (n === 2) return { merged_at: null }; if (n === 3) return null; throw new Error('GitHub 502'); };
   const d2 = await mergedPrRows([
-    { id: 10, description: 'PR #1' }, { id: 11, description: 'PR #1 and PR #2' }, { id: 12, description: 'PR #3' },
-    { id: 13, description: 'PR #4' }, { id: 14, description: 'PR #1 again' },
+    { id: 10, description: 'Merge PR #1' }, { id: 11, description: 'Merge PR #1 and PR #2' }, { id: 12, description: 'Merge PR #3' },
+    { id: 13, description: 'Merge PR #4' }, { id: 14, description: 'Deploy PR #1 again' },
   ], fetchPR);
-  assert.deepEqual(d2.ids, [10, 14]);
+  assert.deepEqual(d2.ids, [10, 14]); assert.deepEqual(d2.mention, []);
   assert.equal(calls, 4, 'one lookup per distinct PR');
   assert.equal(d2.errors.length, 1); assert.match(d2.errors[0], /^mrichard33\/LP-MCP#4: GitHub 502/);
   assert.equal(d2.too_early, 0);
@@ -222,6 +225,8 @@ test('rule D2 resolves the repo from the text and only counts merges on/after th
     { repo: 'mrichard33/HL-MCP', number: 12 }, { repo: 'mrichard33/n8n', number: 13 },
   ], 'a mention before the token beats a nearer one after it');
   assert.deepEqual(prRefsIn({ description: 'PR #5 and PR #5 again', ref: 'PR #5' }), [{ repo: 'mrichard33/LP-MCP', number: 5 }], 'deduped per repo+number');
+  assert.deepEqual(prRefsIn({ description: 'merge PR #390 into dev, promote dev to main, set the n8n Railway service to always-on' }),
+    [{ repo: 'mrichard33/LP-MCP', number: 390 }], 'a repo named a sentence later (#1148) does not claim the PR');
 
   // Date gate.
   assert.equal(mergedAfterSession('2026-07-30T12:00:00Z', '2026-07-28'), true);
@@ -241,7 +246,7 @@ test('rule D2 resolves the repo from the text and only counts merges on/after th
   const calls = [];
   const fetchPR = async (n, repo) => { calls.push(`${repo}#${n}`); const m = merged[`${repo}#${n}`]; return m ? { merged_at: m } : null; };
   const rows = [
-    { id: 402, description: 'HL-MCP PR #151 opportunities sync cadence and ceiling', session_date: '2026-07-28' },
+    { id: 402, description: 'HL-MCP PR #151 opportunities sync cadence and ceiling', item_type: 'awaiting_merge', session_date: '2026-07-28' },
     { id: 405, description: 'Confirm opportunities failure rate drops to near zero after PR #151 deploys', session_date: '2026-07-28' },
     { id: 533, description: 'PR #120 fix/kiosk-skips-supabase-auth open, awaiting Mark review and merge', session_date: '2026-07-31' },
     { id: 647, description: '56 already-fired-early milestone rows are NOT rolled back by PR #625', session_date: '2026-08-06' },
@@ -249,12 +254,103 @@ test('rule D2 resolves the repo from the text and only counts merges on/after th
     { id: 313, description: 'User merges PR #481 -> Railway deploys', session_date: '2026-07-06' },
   ];
   const d2 = await mergedPrRows(rows, fetchPR);
-  assert.deepEqual(d2.ids, [402, 371, 313]);
+  assert.deepEqual(d2.ids, [402, 371, 313]); assert.deepEqual(d2.mention, []);
   assert.equal(d2.too_early, 3, '#405, #533 and #647 name PRs merged before the item existed');
   assert.deepEqual(d2.errors, []);
   assert.equal(new Set(calls).size, calls.length, 'each repo+number fetched once');
   assert.ok(calls.includes('mrichard33/HL-MCP#151') && calls.includes('mrichard33/LP-MCP#151'));
   assert.match(RULE_D2_SELECT, /AS session_date/, 'the SELECT carries the session date the gate needs');
+});
+
+test('rule D2 (ruling 1): a row naming a repo the resolver does not know is skipped', () => {
+  assert.deepEqual(unresolvedReposIn({ description: 'HL-MCP PR #151 sync cadence' }), []);
+  assert.deepEqual(unresolvedReposIn({ description: 'PR #12 in the Reece Dashboard repo, then n8n PR #3' }), []);
+  assert.deepEqual(unresolvedReposIn({ description: 'mrichard33/kiosk PR #120 awaiting merge' }), ['kiosk']);
+  assert.deepEqual(unresolvedReposIn({ description: 'PR #7 open in the payroll-sync repo' }), ['payroll-sync']);
+  assert.deepEqual(unresolvedReposIn({ description: 'merge PR #9 (repo lightfire)' }), ['lightfire']);
+  assert.deepEqual(unresolvedReposIn({ description: 'this repo PR #4; same repo PR #5' }), [], 'stopwords are not repo names');
+});
+
+test('rule D2 (ruling 2): only items ABOUT SHIPPING the PR close; passing mentions never do', () => {
+  const ship = [
+    { description: 'PR #591 awaiting Mark review and merge' },
+    { description: 'User merges PR #481 -> Railway deploys' },
+    { description: 'Merge dev to main and deploy PR #402; until then STAGE_4/5_ROUTE reaps continue' },
+    { description: 'PR #328 (sync-leads v10.1 ghl_contact_id link fix) open on dev->main — awaiting Mark merge' },
+    { description: 'HL-MCP PR #151 opportunities sync cadence and ceiling', item_type: 'awaiting_merge' },
+    { description: 'Ship PR #12' },
+    { description: 'Close PR #77 once CI is green' },
+    { description: 'Merge PR #721, close #720 unmerged', item_type: 'next_step' },   // #2241: the shipping twin of #668; "#720 unmerged" is not a "PR #" ref
+    { description: 'PR #120 fix/kiosk-skips-supabase-auth open, awaiting Mark review and merge', item_type: 'merge_needed' },  // #533 (held by the date gate, not by intent)
+  ];
+  const mention = [
+    { description: '56 already-fired-early milestone rows are NOT rolled back by PR #625 - the 6 Install End fields' },   // #647
+    { description: 'Confirm opportunities failure rate drops to near zero after PR #151 deploys' },                       // #405
+    { description: 'verify after PR #866 merges', item_type: 'verification_needed' },
+    { description: 'Ask Mark to rule on whether the debounce is still needed on top of PR #810' },
+    { description: 'Answer the three section 4b questions in PR #797, especially Credit Decline' },
+    { description: 'Confirm PR #778 contains full Project 2 scope' },
+    { description: 'Close PHASE 0 items 1-6 before any PR #5 live-write flag flip' },
+    { description: 'Update the runbook with the field order from PR #640' },
+    // Real rows from the first shadow run that must NOT close:
+    { description: "Skill v4 delta for Mark's copy: set workflow_code on new decisions. Area is no longer the skill's job - sql/093 (LP-MCP PR #866, merged 2026-09-06) fills it by BEFORE INSERT trigger.", item_type: 'next_step' },        // #2863: "merged" AFTER the token is context
+    { description: 'Session 172 claimed HL main unchanged — false: PRs #153 and #154 merged. The PR #650 workflow-extractor handoff may still be unapplied', item_type: 'verification_needed' },  // #857
+    { description: 'Close PR #859 unmerged (patches dead file nurture-hard-blockers.js)' },                                                                                                       // #1004
+    { description: 'Pending at session end: merge PR #390 into dev, promote dev to main. Not confirmed.', item_type: 'verification_needed' },                                                    // #1148
+    { description: 'PR #141 merge not confirmed in-session', item_type: 'verification_needed' },                                                                                                  // #1162
+    { description: 'MERGE PR #721 (fix/lp-attribution-830-5574). CLOSE #720 UNMERGED — same commits.', item_type: 'review_needed' },                                                              // #668
+    { description: 'Apply PR #650 handoff (HL workflow-extractor write amplification) — still unapplied', item_type: 'next_step' },                                                              // #2396
+    { description: 'PR #845 has under 2 hours of live runtime as of this checkpoint. Re-check tomorrow morning.', item_type: 'verification_needed' },                                             // #1045
+  ];
+  for (const r of ship) assert.equal(prIntent(r), 'ship', `should be ship: ${r.description}`);
+  for (const r of mention) assert.equal(prIntent(r), 'mention', `should be mention: ${r.description}`);
+});
+
+test('rule D2 end to end: ship rows close, mention rows keep a D:pr_mentioned tag in BOTH modes, #647 never closes', async () => {
+  const merged = { 'mrichard33/LP-MCP#591': '2026-07-30T10:00:00Z', 'mrichard33/LP-MCP#625': '2026-08-20T10:00:00Z', 'mrichard33/HL-MCP#151': '2026-07-30T10:00:00Z', 'mrichard33/LP-MCP#120': '2026-08-02T10:00:00Z' };
+  const fetchPR = async (n, repo) => { const m = merged[`${repo}#${n}`]; return m ? { merged_at: m } : null; };
+  const d2rows = [
+    { id: 371, description: 'PR #591 awaiting Mark review and merge', session_date: '2026-07-29' },
+    { id: 647, description: '56 already-fired-early milestone rows are NOT rolled back by PR #625 - the 6 Install End fields', session_date: '2026-08-06' },
+    { id: 402, description: 'HL-MCP PR #151 opportunities sync cadence and ceiling', item_type: 'awaiting_merge', session_date: '2026-07-28' },
+    { id: 533, description: 'mrichard33/kiosk PR #120 open, awaiting Mark review and merge', item_type: 'merge_needed', session_date: '2026-07-31' },
+  ];
+  const d2 = await mergedPrRows(d2rows, fetchPR);
+  assert.deepEqual(d2.ids, [371, 402]);
+  assert.deepEqual(d2.mention, [647], '#647 is a passing mention: tagged, never closed');
+  assert.equal(d2.unresolved, 1, '#533 names a repo we cannot resolve and is skipped');
+
+  const runSQL = (calls) => async (sql) => {
+    calls.push(sql);
+    if (sql === RULE_D2_SELECT) return d2rows;
+    if (/^\s*SELECT/i.test(sql)) return [];
+    return { status: 'ok' };
+  };
+  for (const mode of ['shadow', 'live']) {
+    const calls = [];
+    const r = await runAutoclose({ mode, deps: { runSQL: runSQL(calls), fetchPR, env } });
+    assert.deepEqual(r.errors, []);
+    assert.equal(r.rules['D:pr_merged'].affected, 2); assert.deepEqual(r.rules['D:pr_merged'].sample_ids, [371, 402]);
+    assert.equal(r.rules['D:pr_mentioned'].affected, 1); assert.deepEqual(r.rules['D:pr_mentioned'].sample_ids, [647]);
+    assert.equal(r.rules['D:pr_mentioned'].closes, false);
+    assert.equal(r.rules['D:pr_merged'].unresolved_repo, 1);
+    const tagMention = calls.find((s) => /SET would_close='D:pr_mentioned'/.test(s));
+    assert.ok(tagMention, `${mode}: mention rows are tagged`); assert.match(tagMention, /ARRAY\[647\]/);
+    for (const s of calls.filter((s) => /^\s*UPDATE/.test(s))) {
+      if (/SET status=/.test(s)) assert.doesNotMatch(s, /\b647\b/, `${mode}: #647 must never be closed: ${s}`);
+    }
+    const logMention = calls.find((s) => /INSERT INTO claude_memory_autoclose_log/.test(s) && /'D:pr_mentioned'/.test(s));
+    assert.match(logMention, new RegExp(`VALUES \\('${mode}', 'D', 1, ARRAY\\[647\\]`));
+    const cleanup = calls.find((s) => /SET would_close=NULL WHERE would_close IS NOT NULL/.test(s));
+    assert.match(cleanup, /\b647\b/, `${mode}: the cleanup keeps #647's tag`);
+    if (mode === 'live') {
+      const close = calls.find((s) => /SET status='done'/.test(s));
+      assert.match(close, /closed_reason='D:pr_merged'/); assert.match(close, /ARRAY\[371,402\]/);
+      assert.doesNotMatch(cleanup, /\b371\b|\b402\b/, 'closed rows do not need their tag kept');
+    } else {
+      assert.ok(!calls.some((s) => /SET status=/.test(s)), 'shadow never closes');
+    }
+  }
 });
 
 test('a failing rule is recorded and the remaining rules still run', async () => {

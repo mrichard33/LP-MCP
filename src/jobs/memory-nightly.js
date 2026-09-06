@@ -97,6 +97,17 @@ GROUP BY mode, rule`;
 export const DIGEST_STALE_SQL = `
 SELECT count(*)::int AS stale FROM claude_pending_items WHERE status='open' AND stale`;
 
+// "Likely done — confirm": open rows whose named PR is merged but only mentioned
+// in passing (rule D2 tags D:pr_mentioned and never closes them — Mark's ruling).
+export const DIGEST_MENTION_SQL = `
+SELECT id, left(regexp_replace(description, '\\s+', ' ', 'g'), 80) AS description,
+       coalesce(session_date, created_at::date)::text AS session_date,
+       count(*) OVER ()::int AS total
+FROM claude_pending_items
+WHERE status='open' AND would_close='D:pr_mentioned'
+ORDER BY coalesce(session_date, created_at::date) ASC, id ASC
+LIMIT 5`;
+
 function todayET(now = new Date()) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
 }
@@ -135,11 +146,16 @@ function digestConfig(env = process.env) {
  *   1. [#id] first 80 chars of description  (session_date)
  *   Also: A expired / B duplicates superseded / C done by evidence this week · S open items flagged stale
  */
-export function formatDigest({ waiting = 0, oldest_days = 0, top = [], week = [], stale = 0, mode = 'off' }) {
+export function formatDigest({ waiting = 0, oldest_days = 0, top = [], week = [], stale = 0, mode = 'off', mentions = [], mention_total = 0 }) {
   const lines = [`📋 memory weekly — ${waiting} item${waiting === 1 ? '' : 's'} waiting on Mark (oldest: ${oldest_days} days)`];
   top.slice(0, 5).forEach((r, i) => {
     lines.push(`${i + 1}. [#${r.id}] ${String(r.description || '').trim()}  (${r.session_date})`);
   });
+  const total = mention_total || mentions.length;
+  if (total > 0) {
+    lines.push(`Likely done — confirm (PR merged, mentioned in passing): ${total}`);
+    mentions.slice(0, 5).forEach((r) => lines.push(`• [#${r.id}] ${String(r.description || '').trim()}  (${r.session_date})`));
+  }
   const sum = (rows, rule) => rows.filter((w) => w.rule === rule).reduce((n, w) => n + (Number(w.affected) || 0), 0);
   const live = week.filter((w) => w.mode === 'live');
   const shadow = week.filter((w) => w.mode === 'shadow');
@@ -182,14 +198,17 @@ export async function runWeeklyDigest({ dry_run = false, mode = 'off', now = new
   if (!cfg.enabled || (!due && !dry_run)) return out;
   const sql = deps.runSQL;
   const rows = (r) => (Array.isArray(r) ? r : []);
-  const [waitingRows, top, week, staleRows] = await Promise.all([
-    sql(DIGEST_WAITING_SQL), sql(DIGEST_TOP_SQL), sql(DIGEST_WEEK_SQL), sql(DIGEST_STALE_SQL),
+  const [waitingRows, top, week, staleRows, mentionRows] = await Promise.all([
+    sql(DIGEST_WAITING_SQL), sql(DIGEST_TOP_SQL), sql(DIGEST_WEEK_SQL), sql(DIGEST_STALE_SQL), sql(DIGEST_MENTION_SQL),
   ]);
   const waiting = rows(waitingRows)[0] || {};
+  const mentions = rows(mentionRows);
   out.waiting = Number(waiting.waiting) || 0;
+  out.likely_done = Number(mentions[0]?.total) || mentions.length;
   out.message = formatDigest({
     waiting: out.waiting, oldest_days: Number(waiting.oldest_days) || 0,
     top: rows(top), week: rows(week), stale: Number(rows(staleRows)[0]?.stale) || 0, mode,
+    mentions, mention_total: out.likely_done,
   });
   if (dry_run || !due) { out.would_send = due; return out; }
   out.sent = await (deps.postGroupMe || postGroupMe)(out.message);
