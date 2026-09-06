@@ -261,6 +261,65 @@ export async function getLastInboundMessageMs(contactId) {
 }
 
 /**
+ * Whether the contact has EVER sent us an inbound message on any channel.
+ *
+ * Return contract is deliberately three-valued and differs from
+ * getLastInboundMessageMs above, which collapses "no inbound ever" and "lookup
+ * failed" into NaN. The has_prior_inbound gate suppresses outbound on false, so
+ * conflating those two would silence a working rescue path during a GHL blip.
+ *
+ * @returns {Promise<boolean|null>} true = has inbound, false = verified none,
+ *   null = UNREADABLE (caller decides the failure direction).
+ */
+export async function hasPriorInboundMessage(contactId) {
+  const GHL_API_KEY = process.env.GHL_API_KEY;
+  if (!GHL_API_KEY || !contactId) return null;
+  const locationId = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
+
+  try {
+    const convRes = await fetch(
+      `https://services.leadconnectorhq.com/conversations/search?contactId=${contactId}&locationId=${locationId}&limit=20`,
+      {
+        headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-04-15', 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(8000),
+      }
+    );
+    if (!convRes.ok) {
+      console.warn(`[HasPriorInbound] conversation search failed for ${contactId}: ${convRes.status}`);
+      return null;
+    }
+    const convData = await convRes.json();
+    const convs = convData?.conversations || [];
+    // No conversation record at all = verified never engaged, not an error.
+    if (convs.length === 0) return false;
+
+    for (const conv of convs) {
+      if (!conv?.id) continue;
+      const msgRes = await fetch(
+        `https://services.leadconnectorhq.com/conversations/${conv.id}/messages`,
+        {
+          headers: { 'Authorization': `Bearer ${GHL_API_KEY}`, 'Version': '2021-04-15', 'Accept': 'application/json' },
+          signal: AbortSignal.timeout(8000),
+        }
+      );
+      if (!msgRes.ok) {
+        console.warn(`[HasPriorInbound] messages fetch failed for conv ${conv.id}: ${msgRes.status}`);
+        return null; // partial read is unreadable, not "none"
+      }
+      const msgData = await msgRes.json();
+      const messages = msgData?.messages?.messages || [];
+      if (messages.some(m => String(m.direction || '').toLowerCase() === 'inbound')) {
+        return true;
+      }
+    }
+    return false;
+  } catch (err) {
+    console.warn(`[HasPriorInbound] threw for ${contactId}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * Days since the contact was last in TRUE human contact, across both systems.
  * Both signals represent an actual person↔lead interaction and neither is
  * reset by our own marketing automation:

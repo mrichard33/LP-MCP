@@ -3,6 +3,16 @@
  *
  * The brain of the agentic system.
  *
+ * v2.20 — 2026-09-05. has_prior_inbound context operator — passes only when the
+ *   contact has ever sent us an inbound message. Gates the canvassing arm of the
+ *   four S5.2 enrollment rules behind real engagement. Canvassing SMS opt-outs
+ *   ran 14.3% over the 8 days to 2026-09-05 against 0–12% elsewhere, and 24 of
+ *   24 came from contacts who had never messaged us, each on their first-ever
+ *   message from us. Fails closed on an unreadable read.
+ *   MUST be deployed live BEFORE the SQL that adds it to agent_rules — the
+ *   switch fails closed on an unknown operator, so an early SQL land would
+ *   silence every cancellation and no-show rescue rule.
+ *
  * v2.19 — 2026-09-02. not_duplicate_lead_live_appointment context operator —
  *   blocks a cancellation / no-show routing rule when the SAME GHL contact
  *   holds a live future Set/Cnf appointment, or a Sale in the last 30 days, on
@@ -227,8 +237,12 @@ import { BOOKING_AUTHORITY_RANK as SERVICE_BOOKING_AUTHORITY_RANK }
 //   - inbound_within_hours     → getLastInboundMessageMs (fail-CLOSED — its inverse;
 //     the asymmetry guarantees at most one of the two timeout rules fires when the
 //     message layer is down. See sql/seeds/2026-06-12_s13_booking_push_timeout_hold.sql).
+// Canvassing engagement gate (2026-09-05, v2.20):
+//   - has_prior_inbound       → hasPriorInboundMessage (fail-CLOSED — three-valued,
+//     so an unreadable read is distinguishable from a verified "never engaged".
+//     See sql/seeds/2026-09-05_canvass_engagement_gate.sql).
 import { fetchUpcomingAppointments } from './knowledge/contact-appointments.js';
-import { getLastInboundMessageMs } from './actions/handlers/workflows.js';
+import { getLastInboundMessageMs, hasPriorInboundMessage } from './actions/handlers/workflows.js';
 // 2026-08-13 — shared with actions/index.executeLayer3Dispatch (see module header).
 import { inferChannelFromEvent } from './channel-inference.js';
 
@@ -1658,6 +1672,38 @@ async function evaluateContextConditions(conditions, intelligence, event, opts =
           return false;
         }
         break; // inbound within N hours → pass
+      }
+
+      // 2026-09-05 — has_prior_inbound (v2.20). Passes only when the contact has
+      // EVER sent us an inbound message. Written for the canvassing opt-out
+      // spike: canvassing contacts with no prior inbound opted out at 14.8%
+      // (24/162 over 8 days) while canvassing contacts who had engaged opted out
+      // at 0% (0/6). A canvasser logging an appointment at the door is not
+      // consent to text; the S5.2 rescue rules now require a real signal from
+      // the person before messaging that cohort.
+      //
+      // Used under any_of so the requirement applies to canvassing only:
+      //   any_of: [ {not_has_tag: "active-entry:canvassing"}, {has_prior_inbound: true} ]
+      // any_of short-circuits on the first passing alternative, so non-canvassing
+      // traffic never reaches this case and incurs no extra GHL read.
+      //
+      // FAILS CLOSED on an unreadable read (null), consistent with the
+      // 2026-07-03 doctrine: if we cannot verify the person ever talked to us,
+      // we do not text them. Scope is limited to the canvassing arm of four
+      // S5.2 enrollment rules, so an outage costs missed rescues on one source,
+      // not silence system-wide.
+      case 'has_prior_inbound': {
+        if (!event?.ghl_contact_id) return failClosed(key, 'no ghl_contact_id on event');
+        // deps seam mirrors deps.fetch / deps.supabase elsewhere in this file —
+        // the helper owns two live GHL calls and must be substitutable in tests.
+        const readPriorInbound = opts.deps?.hasPriorInboundMessage || hasPriorInboundMessage;
+        const priorInbound = await readPriorInbound(event.ghl_contact_id);
+        if (priorInbound === null) return failClosed(key, 'inbound history unreadable');
+        if (priorInbound !== !!expected) {
+          console.log(`[Context] BLOCKED: has_prior_inbound — contact ${event.ghl_contact_id} prior_inbound=${priorInbound}, wanted ${!!expected}`);
+          return false;
+        }
+        break;
       }
 
       // 2026-07-03 fail-closed: an unknown condition key used to warn and
