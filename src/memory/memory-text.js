@@ -16,7 +16,7 @@ export const SESSION_TEXT_CAP = 6000;
 // US phone numbers in any common layout; emails. UUIDs, 8-char UUID prefixes,
 // canonical codes (S4.5) and issue ids (#724) are deliberately untouched — they
 // are the exact tokens retrieval needs.
-const PHONE_RE = /(?:\+?1[\s.-]?)?\(?\b\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/g;
+const PHONE_RE = /(?<!\d)(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?!\d)/g;
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
 
 export function stripPii(text) {
