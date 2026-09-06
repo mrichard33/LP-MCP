@@ -36,6 +36,7 @@ import { registerLlmGatewayRoutes } from './llm-gateway.js';
 import { registerIntentScorerRoutes } from './intent-scorer.js';
 // ─── Phase 4: KB Vector Ingestion (agentic bot knowledge layer) ──
 import { registerKbIngestionRoutes } from './knowledge/ingest-embeddings.js';
+import { registerMemoryRoutes } from './memory/memory-routes.js';
 import { startTier1EmbedSweep } from './knowledge/tier1-semantic.js';
 import { startExemplarSweep } from './knowledge/exemplars.js';
 import { startCiMomentsSweep } from './knowledge/ci-moments.js';
@@ -1836,6 +1837,10 @@ registerIntentScorerRoutes(app);
 
 // ─── Phase 4: KB Vector Ingestion ────────────────────────────────
 registerKbIngestionRoutes(app);
+
+// ─── Memory vector tier (sql/094): server-side backfill + hybrid search ──
+// Operator surface only; nothing in the request path calls it. Authenticated.
+registerMemoryRoutes(app, authenticate);
 
 // ─── Pause-Workflow Fizzle Sweep ─────────────────────────────────
 registerPauseWorkflowSweepRoutes(app);

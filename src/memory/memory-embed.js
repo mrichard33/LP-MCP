@@ -67,7 +67,8 @@ export async function planKind(kind, opts = {}) {
   };
 }
 
-/** Embed + upsert the rows from planKind(). Returns counts and real cost. */
+/** Embed + upsert the rows from planKind(). Returns counts and real cost.
+ *  opts.log(msg) and opts.onProgress({kind, written, todo, tokens, cost_usd}) are optional. */
 export async function executePlan(plan, opts = {}) {
   const log = opts.log || (() => {});
   let written = 0; let tokens = 0; let cost = 0;
@@ -89,6 +90,7 @@ export async function executePlan(plan, opts = {}) {
     if (error) throw new Error(`upsert ${plan.kind} batch at ${i}: ${error.message}`);
     written += batch.length; tokens += result.tokens; cost += result.cost_usd;
     log(`[MemoryEmbed] ${plan.kind}: ${written}/${plan.todo.length} written (${tokens} tokens, $${cost.toFixed(4)})`);
+    if (typeof opts.onProgress === 'function') opts.onProgress({ kind: plan.kind, written, todo: plan.todo.length, tokens, cost_usd: cost });
   }
   return { kind: plan.kind, written, tokens, cost_usd: cost };
 }
