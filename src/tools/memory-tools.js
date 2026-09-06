@@ -15,9 +15,25 @@ import { z } from 'zod';
 import supabase from '../supabase.js';
 import { SOURCES } from '../memory/memory-text.js';
 import { planCheckpoint, applyCheckpoint, CheckpointError } from '../memory/memory-checkpoint.js';
+import { withRetry, isTransientError, CHECKPOINT_RETRY } from '../memory/with-retry.js';
 
 const text = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] });
 const KINDS = Object.keys(SOURCES);
+
+// Transport retry (issue #1627): the three tools share the Supabase client, so
+// the read tools get the same 3-attempt schedule as the checkpoint write.
+const READ_RETRY = { ...CHECKPOINT_RETRY, onRetry: (err, attempt, delay) => console.warn(`[Memory] read attempt ${attempt} failed (${err.message}) — retry in ${delay}ms`) };
+function rpcError(what, res) {
+  const err = new Error(`${what}: ${res.error.message}`);
+  if (res.status) err.status = res.status;
+  if (res.error.code) err.code = res.error.code;
+  if (res.error.details) err.details = res.error.details;
+  return err;
+}
+export function classifyCheckpointError(err) {
+  if (err instanceof CheckpointError) return 'validation';
+  return isTransientError(err) ? 'transport' : 'write';
+}
 
 export function registerMemoryTools(server) {
   server.tool(
@@ -26,9 +42,16 @@ export function registerMemoryTools(server) {
     { topic: z.string().optional().describe("2–5 words, e.g. 'appointment title' or 'LightFire payroll'. Omit only when there is no subject yet.") },
     async ({ topic } = {}) => {
       if (!supabase) return text({ error: 'Supabase client not configured' });
-      const { data, error } = await supabase.rpc('claude_memory_context', { p_topic: topic && topic.trim() ? topic.trim() : null });
-      if (error) return text({ error: `claude_memory_context: ${error.message}` });
-      return text(data);
+      try {
+        const data = await withRetry(async () => {
+          const res = await supabase.rpc('claude_memory_context', { p_topic: topic && topic.trim() ? topic.trim() : null });
+          if (res.error) throw rpcError('claude_memory_context', res);
+          return res.data;
+        }, READ_RETRY);
+        return text(data);
+      } catch (err) {
+        return text({ error: err.message, kind: isTransientError(err) ? 'transport' : 'read', attempts: err.attempts });
+      }
     },
   );
 
@@ -45,10 +68,10 @@ export function registerMemoryTools(server) {
     async ({ query, limit, area, kind, include_closed } = {}) => {
       try {
         const { hybridMemorySearch } = await import('../memory/memory-search.js');
-        const out = await hybridMemorySearch(query, { limit, filterArea: area, filterKind: kind, includeClosed: include_closed });
+        const out = await withRetry(() => hybridMemorySearch(query, { limit, filterArea: area, filterKind: kind, includeClosed: include_closed }), READ_RETRY);
         return text(out);
       } catch (err) {
-        return text({ error: err.message });
+        return text({ error: err.message, kind: isTransientError(err) ? 'transport' : 'read', attempts: err.attempts });
       }
     },
   );
@@ -94,14 +117,18 @@ export function registerMemoryTools(server) {
       pending: z.array(pending).optional(),
       close_pending: z.array(close).optional(),
       confirm: z.boolean().optional().describe('true to write; otherwise returns the plan'),
+      checkpoint_key: z.string().uuid().optional().describe('idempotency key from a previous transport failure (partial.checkpoint_key) — re-sending with it resumes that session instead of inserting a new one'),
     },
     async (args = {}) => {
       try {
         if (args.confirm !== true) return text(planCheckpoint(args));
-        const out = await applyCheckpoint(args);
+        const out = await applyCheckpoint(args, { checkpoint_key: args.checkpoint_key || null });
         return text({ ok: true, ...out });
       } catch (err) {
-        return text({ ok: false, error: err.message, kind: err instanceof CheckpointError ? 'validation' : 'write' });
+        const kind = classifyCheckpointError(err);
+        const body = { ok: false, kind, error: err.message, attempts: err.attempts ?? err.partial?.attempts ?? 1, partial: err.partial ?? null };
+        if (kind === 'transport') body.hint = 'Transient failure after retries. partial lists what already landed — fall back to SQL for the rest, or re-send with checkpoint_key=partial.checkpoint_key to resume.';
+        return text(body);
       }
     },
   );
