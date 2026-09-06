@@ -6,13 +6,25 @@
  *                      60+ days and no touch in 60+ days (updated_at for live
  *                      rows, reported_date for retro rows) is stale=true.
  *                      The job never clears stale — verification does.
- *   2. re-embed      — memory-embed.js planKind/executePlan for all four kinds;
+ *   2. auto-close    — memory-autoclose.js: pending-item rules A–D + stale
+ *                      flag, gated by MEMORY_AUTOCLOSE_MODE (off | shadow |
+ *                      live). Runs before re-embed so closed rows change
+ *                      status and re-embed picks them up.
+ *   3. re-embed      — memory-embed.js planKind/executePlan for all four kinds;
  *                      content-hash incremental, so a quiet day writes 0 rows.
- *   3. workflow ref  — claude_workflow_ref (sql/092) refreshed from the LP-side
+ *   4. workflow ref  — claude_workflow_ref (sql/092) refreshed from the LP-side
  *                      workflow_canonical_map mirror (itself synced from the HL
  *                      workflow_registry every 15 min). No HL dependency here.
- *   4. snapshot      — counts from claude_memory_context(NULL) logged for the
+ *   5. snapshot      — counts from claude_memory_context(NULL) logged for the
  *                      record.
+ *   6. weekly digest — rule E: on the run whose ET weekday is
+ *                      MEMORY_DIGEST_WEEKDAY (Monday), one GroupMe message
+ *                      listing what is waiting on Mark (the protected
+ *                      item_types) and what auto-close did this week.
+ *
+ * Every SQL step runs through withRetry (issue #1627): three attempts with
+ * 250 ms / 1 s / 3 s backoff on transient errors. A step that still fails is
+ * logged and alerted (GroupMe) but never aborts the remaining steps.
  *
  * What it does NOT do: read Claude chats. LP-MCP has no path to transcripts,
  * so un-checkpointed chats are still Mark's refresh pass; every other surface
@@ -21,14 +33,22 @@
  * SCHEDULE: daily at MEMORY_NIGHTLY_HOUR_ET (default 3) — same 5-minute
  * hour-check pattern as market-assignment-daily.js.
  * ROUTES:   POST /admin/memory/nightly { dry_run? }   GET /admin/memory/nightly/status
- * ENV:      MEMORY_NIGHTLY_ENABLED (default true), MEMORY_NIGHTLY_HOUR_ET (default 3)
+ *           dry_run:true plans the embed, counts the auto-close rules and
+ *           previews the digest — writes nothing, sends nothing.
+ * ENV:      MEMORY_NIGHTLY_ENABLED (default true), MEMORY_NIGHTLY_HOUR_ET (default 3),
+ *           MEMORY_AUTOCLOSE_MODE (default off), MEMORY_DIGEST_ENABLED (default true),
+ *           MEMORY_DIGEST_WEEKDAY (default Monday)
  */
 import supabase from '../supabase.js';
 import { runSQL } from '../admin/supabase-admin.js';
 import { SOURCES } from '../memory/memory-text.js';
+import { withRetry } from '../memory/with-retry.js';
+import { runAutoclose, PROTECTED_LIST_SQL, logSql } from './memory-autoclose.js';
 
 const TIMEZONE = 'America/New_York';
 const STALE_DAYS = 60;
+const SQL_RETRY = { attempts: 3, backoffMs: [250, 1000, 3000] };
+const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
 export const STALE_SQL = `
 UPDATE claude_known_issues
@@ -52,6 +72,31 @@ ON CONFLICT (canonical_code) DO UPDATE SET
   synced_at = now()
 RETURNING canonical_code`;
 
+// ─── Weekly digest (rule E) SQL ────────────────────────────────────────────
+// "Waiting on Mark" = open rows in the protected set (the rules never touch them).
+export const DIGEST_WAITING_SQL = `
+SELECT count(*)::int AS waiting,
+       coalesce(max(current_date - coalesce(session_date, created_at::date)), 0)::int AS oldest_days
+FROM claude_pending_items
+WHERE status='open' AND item_type IN ${PROTECTED_LIST_SQL}`;
+
+export const DIGEST_TOP_SQL = `
+SELECT id, left(regexp_replace(description, '\\s+', ' ', 'g'), 80) AS description,
+       coalesce(session_date, created_at::date)::text AS session_date
+FROM claude_pending_items
+WHERE status='open' AND item_type IN ${PROTECTED_LIST_SQL}
+ORDER BY coalesce(session_date, created_at::date) ASC, id ASC
+LIMIT 5`;
+
+export const DIGEST_WEEK_SQL = `
+SELECT mode, rule, sum(affected)::int AS affected
+FROM claude_memory_autoclose_log
+WHERE ran_at > now() - interval '7 days' AND rule <> 'DIGEST'
+GROUP BY mode, rule`;
+
+export const DIGEST_STALE_SQL = `
+SELECT count(*)::int AS stale FROM claude_pending_items WHERE status='open' AND stale`;
+
 function todayET(now = new Date()) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
 }
@@ -59,39 +104,131 @@ function hourET(now = new Date()) {
   const parts = new Intl.DateTimeFormat('en-US', { timeZone: TIMEZONE, hour: '2-digit', hour12: false }).formatToParts(now);
   return Number(parts.find((p) => p.type === 'hour')?.value ?? -1) % 24;
 }
+/** ET weekday name, e.g. 'Monday'. Exported for tests. */
+export function weekdayET(now = new Date()) {
+  return new Intl.DateTimeFormat('en-US', { timeZone: TIMEZONE, weekday: 'long' }).format(now);
+}
 
 /** Pure: should the tick fire now? Exported for tests. */
 export function shouldRun({ hour, today, lastRunDate, targetHour }) {
   return hour === targetHour && lastRunDate !== today;
 }
 
-async function alertGroupMe(text) {
+/** Pure: does the digest go out on this run? Exported for tests. */
+export function shouldSendDigest({ weekday, enabled = true, targetWeekday = 'Monday' }) {
+  if (enabled === false || String(enabled).toLowerCase() === 'false') return false;
+  const want = String(targetWeekday || 'Monday').trim().toLowerCase();
+  if (!WEEKDAYS.some((d) => d.toLowerCase() === want)) return false;
+  return String(weekday || '').toLowerCase() === want;
+}
+
+function digestConfig(env = process.env) {
+  return {
+    enabled: String(env.MEMORY_DIGEST_ENABLED ?? 'true').toLowerCase() !== 'false',
+    weekday: env.MEMORY_DIGEST_WEEKDAY || 'Monday',
+  };
+}
+
+/**
+ * Pure: build the digest text. No ⚠️ prefix — this is a report, not an alert.
+ *   📋 memory weekly — N items waiting on Mark (oldest: X days)
+ *   1. [#id] first 80 chars of description  (session_date)
+ *   Also: A expired / B duplicates superseded / C done by evidence this week · S open items flagged stale
+ */
+export function formatDigest({ waiting = 0, oldest_days = 0, top = [], week = [], stale = 0, mode = 'off' }) {
+  const lines = [`📋 memory weekly — ${waiting} item${waiting === 1 ? '' : 's'} waiting on Mark (oldest: ${oldest_days} days)`];
+  top.slice(0, 5).forEach((r, i) => {
+    lines.push(`${i + 1}. [#${r.id}] ${String(r.description || '').trim()}  (${r.session_date})`);
+  });
+  const sum = (rows, rule) => rows.filter((w) => w.rule === rule).reduce((n, w) => n + (Number(w.affected) || 0), 0);
+  const live = week.filter((w) => w.mode === 'live');
+  const shadow = week.filter((w) => w.mode === 'shadow');
+  const rows = live.length ? live : shadow;
+  const label = live.length ? 'Also:' : (shadow.length ? 'Also (shadow, would):' : 'Also:');
+  const expired = sum(rows, 'A') + sum(rows, 'B');
+  const dupes = sum(rows, 'C');
+  const done = sum(rows, 'D');
+  lines.push(`${label} ${expired} expired / ${dupes} duplicates superseded / ${done} done by evidence this week · ${stale} open items flagged stale${mode === 'off' && !rows.length ? ' (auto-close off)' : ''}`);
+  return lines.join('\n');
+}
+
+async function postGroupMe(text) {
   const botId = process.env.GROUPME_BOT_ID;
-  if (!botId) { console.warn('[MemoryNightly] GROUPME_BOT_ID unset — alert suppressed:', text); return; }
+  if (!botId) { console.warn('[MemoryNightly] GROUPME_BOT_ID unset — message suppressed:', text); return false; }
   try {
     await fetch('https://api.groupme.com/v3/bots/post', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bot_id: botId, text: `⚠️ memory nightly — ${text}` }), signal: AbortSignal.timeout(8000),
+      body: JSON.stringify({ bot_id: botId, text }), signal: AbortSignal.timeout(8000),
     });
-  } catch (err) { console.warn('[MemoryNightly] GroupMe alert failed:', err.message); }
+    return true;
+  } catch (err) { console.warn('[MemoryNightly] GroupMe post failed:', err.message); return false; }
+}
+
+async function alertGroupMe(text, post = postGroupMe) {
+  return post(`⚠️ memory nightly — ${text}`);
+}
+
+/**
+ * Rule E. Queries the waiting set + this week's auto-close log and posts one
+ * GroupMe message on the configured ET weekday. dry_run builds the message
+ * and reports would_send without posting or logging.
+ */
+export async function runWeeklyDigest({ dry_run = false, mode = 'off', now = new Date(), deps = {} } = {}) {
+  const env = deps.env || process.env;
+  const cfg = digestConfig(env);
+  const weekday = weekdayET(now);
+  const due = shouldSendDigest({ weekday, enabled: cfg.enabled, targetWeekday: cfg.weekday });
+  const out = { enabled: cfg.enabled, weekday, target_weekday: cfg.weekday, due, sent: false, message: null };
+  if (!cfg.enabled || (!due && !dry_run)) return out;
+  const sql = deps.runSQL;
+  const rows = (r) => (Array.isArray(r) ? r : []);
+  const [waitingRows, top, week, staleRows] = await Promise.all([
+    sql(DIGEST_WAITING_SQL), sql(DIGEST_TOP_SQL), sql(DIGEST_WEEK_SQL), sql(DIGEST_STALE_SQL),
+  ]);
+  const waiting = rows(waitingRows)[0] || {};
+  out.waiting = Number(waiting.waiting) || 0;
+  out.message = formatDigest({
+    waiting: out.waiting, oldest_days: Number(waiting.oldest_days) || 0,
+    top: rows(top), week: rows(week), stale: Number(rows(staleRows)[0]?.stale) || 0, mode,
+  });
+  if (dry_run || !due) { out.would_send = due; return out; }
+  out.sent = await (deps.postGroupMe || postGroupMe)(out.message);
+  await sql(logSql({ mode, rule: 'DIGEST', affected: out.waiting, notes: out.sent ? 'sent' : 'send failed' }));
+  return out;
 }
 
 let lastRun = null;
 
 /**
- * Run the job. dry_run computes the embed plan and counts but writes nothing
- * (stale UPDATE and workflow-ref upsert are skipped, not simulated).
+ * Run the job. dry_run computes the embed plan, the auto-close counts and the
+ * digest preview but writes nothing (stale UPDATE and workflow-ref upsert are
+ * skipped, not simulated).
  */
 export async function runMemoryNightly({ dry_run = false, deps = {} } = {}) {
   const startedAt = Date.now();
-  const result = { started_at: new Date().toISOString(), dry_run, stale_flagged: null, embed: {}, workflow_ref: null, counts: null, errors: [] };
-  const sql = deps.runSQL || runSQL;
+  const now = deps.now || new Date();
+  const env = deps.env || process.env;
+  const mode = env.MEMORY_AUTOCLOSE_MODE || 'off';
+  const result = { started_at: now.toISOString(), dry_run, autoclose_mode: mode, stale_flagged: null, autoclose: null, embed: {}, workflow_ref: null, counts: null, digest: null, errors: [] };
+  const rawSql = deps.runSQL || runSQL;
+  const sql = (text) => withRetry(() => rawSql(text), {
+    ...SQL_RETRY, sleep: deps.sleep,
+    onRetry: (err, attempt, delay) => console.warn(`[MemoryNightly] SQL attempt ${attempt} failed (${err.message}) — retry in ${delay}ms`),
+  });
   const db = deps.supabase || supabase;
+  const post = deps.postGroupMe || postGroupMe;
 
   if (!dry_run) {
     try { const rows = await sql(STALE_SQL); result.stale_flagged = Array.isArray(rows) ? rows.length : 0; }
     catch (err) { result.errors.push(`stale: ${err.message}`); }
   }
+
+  // Auto-close before re-embed: closed rows change status → re-embed picks them up.
+  try {
+    const ac = await runAutoclose({ mode, dry_run, deps: { runSQL: sql, fetchPR: deps.fetchPR, env } });
+    result.autoclose = ac;
+    for (const e of ac.errors) result.errors.push(`autoclose ${e}`);
+  } catch (err) { result.errors.push(`autoclose: ${err.message}`); }
 
   try {
     const m = deps.embed || await import('../memory/memory-embed.js');
@@ -117,11 +254,18 @@ export async function runMemoryNightly({ dry_run = false, deps = {} } = {}) {
     result.counts = data?.counts ?? null;
   } catch (err) { result.errors.push(`counts: ${err.message}`); }
 
+  try {
+    result.digest = await runWeeklyDigest({ dry_run, mode, now, deps: { runSQL: sql, postGroupMe: post, env } });
+  } catch (err) { result.errors.push(`digest: ${err.message}`); }
+
   result.elapsed_ms = Date.now() - startedAt;
   result.ok = result.errors.length === 0;
   lastRun = result;
-  console.log(`[MemoryNightly] ${dry_run ? 'DRY-RUN ' : ''}done stale=${result.stale_flagged} embed=${JSON.stringify(Object.fromEntries(Object.entries(result.embed).map(([k, v]) => [k, v.written])))} ref=${result.workflow_ref} errors=${result.errors.length} elapsed=${result.elapsed_ms}ms`);
-  if (!result.ok && !dry_run) await alertGroupMe(result.errors.join(' | '));
+  const acSummary = result.autoclose && result.autoclose.mode !== 'off'
+    ? `${result.autoclose.mode}:${Object.entries(result.autoclose.rules).map(([t, r]) => `${t.split(':')[0]}=${r.affected}`).join(',')}`
+    : 'off';
+  console.log(`[MemoryNightly] ${dry_run ? 'DRY-RUN ' : ''}done stale=${result.stale_flagged} autoclose=${acSummary} embed=${JSON.stringify(Object.fromEntries(Object.entries(result.embed).map(([k, v]) => [k, v.written])))} ref=${result.workflow_ref} digest=${result.digest?.sent ? 'sent' : (result.digest?.due ? 'due' : 'no')} errors=${result.errors.length} elapsed=${result.elapsed_ms}ms`);
+  if (!result.ok && !dry_run) await alertGroupMe(result.errors.join(' | '), post);
   return result;
 }
 
@@ -148,7 +292,7 @@ export function startMemoryNightlyScheduler() {
   };
   timer = setInterval(tick, 5 * 60 * 1000);
   if (typeof timer.unref === 'function') timer.unref();
-  console.log(`[MemoryNightly] scheduler started — daily at ${String(targetHour).padStart(2, '0')}:00 ET`);
+  console.log(`[MemoryNightly] scheduler started — daily at ${String(targetHour).padStart(2, '0')}:00 ET (autoclose=${process.env.MEMORY_AUTOCLOSE_MODE || 'off'}, digest=${digestConfig().enabled ? digestConfig().weekday : 'off'})`);
   return timer;
 }
 
@@ -161,7 +305,14 @@ export function registerMemoryNightlyRoutes(app, authenticate) {
     catch (err) { res.status(500).json({ ok: false, error: err.message }); }
   });
   app.get('/admin/memory/nightly/status', ...guards, (_req, res) => {
-    res.json({ last_run: lastRun, last_run_date: lastRunDate, enabled: String(process.env.MEMORY_NIGHTLY_ENABLED || 'true').toLowerCase() !== 'false', hour_et: Number(process.env.MEMORY_NIGHTLY_HOUR_ET || 3) });
+    const d = digestConfig();
+    res.json({
+      last_run: lastRun, last_run_date: lastRunDate,
+      enabled: String(process.env.MEMORY_NIGHTLY_ENABLED || 'true').toLowerCase() !== 'false',
+      hour_et: Number(process.env.MEMORY_NIGHTLY_HOUR_ET || 3),
+      autoclose_mode: process.env.MEMORY_AUTOCLOSE_MODE || 'off',
+      digest_enabled: d.enabled, digest_weekday: d.weekday,
+    });
   });
-  console.log(`[MemoryNightly] Routes: POST /admin/memory/nightly (dry_run:true = plan only) | GET /admin/memory/nightly/status${guards.length ? ' (authenticated)' : ' (UNAUTHENTICATED)'}`);
+  console.log(`[MemoryNightly] Routes: POST /admin/memory/nightly (dry_run:true = plan + autoclose counts + digest preview) | GET /admin/memory/nightly/status${guards.length ? ' (authenticated)' : ' (UNAUTHENTICATED)'}`);
 }

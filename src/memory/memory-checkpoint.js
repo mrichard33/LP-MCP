@@ -11,9 +11,25 @@
  *
  * `db` is injected so scripts/test-memory-checkpoint.js runs without env.
  *
+ * TRANSPORT RETRY (issue #1627, v1.1): the write sequence runs under
+ * withRetry — 3 attempts, 250 ms / 1 s / 3 s — for transient errors only
+ * (network, ECONNRESET, 5xx, "fetch failed"). Validation errors and 4xx are
+ * never retried. The sequence is idempotent on retry:
+ *   - the session INSERT carries a per-call `checkpoint_key` (uuid, column
+ *     claude_session_logs.checkpoint_key UNIQUE, sql/096); a retry after the
+ *     insert landed but the response was lost finds the row by key and
+ *     UPDATEs it instead of inserting a second session;
+ *   - every other step checks the progress object (`out`) before writing, so
+ *     rows that already landed are skipped, not duplicated.
+ * On final failure the error carries `partial` (everything that did land) so
+ * the calling skill can fall back to SQL without re-creating it.
+ *
  * v1.0 — 2026-09-06. Initial (priority #8).
+ * v1.1 — 2026-09-06. checkpoint_key idempotency + withRetry (#1627).
  */
+import { randomUUID } from 'node:crypto';
 import supabase from '../supabase.js';
+import { withRetry, CHECKPOINT_RETRY } from './with-retry.js';
 
 const SURFACES = new Set(['chat', 'cowork', 'code', 'n8n']);
 const SEVERITIES = new Set(['critical', 'high', 'medium', 'low']);
@@ -118,22 +134,72 @@ export function validateCheckpoint(input = {}, now = new Date()) {
 }
 
 function must(res, what) {
-  if (res.error) throw new Error(`${what}: ${res.error.message}`);
+  if (res.error) {
+    const e = res.error;
+    const detail = e.details && !String(e.message || '').includes(e.details) ? ` (${e.details})` : '';
+    const err = new Error(`${what}: ${e.message}${detail}`);
+    if (res.status) err.status = res.status;
+    if (e.code) err.code = e.code;
+    if (e.details) err.details = e.details;
+    throw err;
+  }
   return res.data;
 }
 
-/** Write the checkpoint. Returns ids. `db` defaults to the LP Supabase client. */
-export async function applyCheckpoint(input, { db = supabase, now = new Date() } = {}) {
+/**
+ * Write the checkpoint. Returns ids. `db` defaults to the LP Supabase client.
+ *   checkpoint_key  uuid for the session insert; generated here when omitted.
+ *                   Pass the same key on a manual re-call to resume instead of
+ *                   inserting a second session.
+ *   retry           { attempts, backoffMs, sleep } or false to disable.
+ * Throws with `err.partial` = progress so far when the write fails.
+ */
+export async function applyCheckpoint(input, { db = supabase, now = new Date(), checkpoint_key = null, retry = CHECKPOINT_RETRY } = {}) {
   if (!db) throw new Error('Supabase client not configured');
-  const c = validateCheckpoint(input, now);
-  const nowIso = now.toISOString();
-  const out = { session_id: null, updated: false, decision_ids: [], issue_ids: [], pending_ids: [], resolved: [], verified: [], closed: [], superseded: [], ledger: null };
+  const c = validateCheckpoint(input, now); // validation errors surface before any retry
+  const key = checkpoint_key ? String(checkpoint_key) : randomUUID();
+  const out = {
+    session_id: null, checkpoint_key: key, updated: false, recovered: false, attempts: 0,
+    decision_ids: [], issue_ids: [], pending_ids: [], resolved: [], verified: [], closed: [], superseded: [], ledger: null,
+  };
+  const step = (attempt) => { out.attempts = attempt; return writeCheckpoint(c, { db, now, key, out, resume: attempt > 1 }); };
+  try {
+    if (retry === false) await step(1);
+    else await withRetry(step, { ...retry, onRetry: (err, attempt, delay) => console.warn(`[MemoryCheckpoint] attempt ${attempt} failed (${err.message}) — retry in ${delay}ms; session_id=${out.session_id ?? 'none yet'}`) });
+  } catch (err) {
+    err.partial = partialOf(out);
+    throw err;
+  }
+  return out;
+}
 
-  // 1. Session row — UPDATE the named one, else INSERT.
+function partialOf(out) {
+  const p = { checkpoint_key: out.checkpoint_key, attempts: out.attempts };
+  if (out.session_id) { p.session_id = out.session_id; p.updated = out.updated; }
+  for (const k of ['decision_ids', 'issue_ids', 'pending_ids', 'resolved', 'verified', 'closed', 'superseded']) if (out[k].length) p[k] = [...out[k]];
+  if (out.ledger) p.ledger = out.ledger;
+  return p;
+}
+
+/** One attempt. Every step is guarded by `out`, so a re-run only does what has not landed yet. */
+async function writeCheckpoint(c, { db, now, key, out, resume }) {
+  const nowIso = now.toISOString();
+
+  // 1. Session row — UPDATE the named one, else INSERT (keyed on checkpoint_key).
+  const SESSION_COLS = 'id, transcript_search_keys, link_confidence, chat_url';
   let keys = c.session.search_keys;
-  if (c.session_id) {
-    const cur = must(await db.from('claude_session_logs').select('id, transcript_search_keys, link_confidence, chat_url').eq('id', c.session_id).maybeSingle(), 'load session');
-    if (!cur) throw new CheckpointError(`session ${c.session_id} not found`);
+  let sessionId = c.session_id;
+  let cur = null;
+  if (!sessionId && !out.session_id && resume) {
+    // A previous attempt may have inserted the row and lost the response.
+    cur = must(await db.from('claude_session_logs').select(SESSION_COLS).eq('checkpoint_key', key).maybeSingle(), 'find session by key');
+    if (cur?.id) { sessionId = cur.id; out.recovered = true; } else cur = null;
+  }
+  if (out.session_id) {
+    keys = out.keys || keys;
+  } else if (sessionId) {
+    if (!cur) cur = must(await db.from('claude_session_logs').select(SESSION_COLS).eq('id', sessionId).maybeSingle(), 'load session');
+    if (!cur) throw new CheckpointError(`session ${sessionId} not found`);
     keys = [...new Set([...(Array.isArray(cur.transcript_search_keys) ? cur.transcript_search_keys : []), ...keys])].slice(0, 12);
     const patch = { transcript_search_keys: keys, updated_at: nowIso };
     if (c.session.summary) patch.raw_summary = c.session.summary;
@@ -142,8 +208,8 @@ export async function applyCheckpoint(input, { db = supabase, now = new Date() }
     if (c.session.chat_url && cur.link_confidence !== 'exact') {
       patch.chat_url = c.session.chat_url; patch.chat_title = c.session.chat_title; patch.link_confidence = 'exact';
     }
-    must(await db.from('claude_session_logs').update(patch).eq('id', c.session_id), 'update session');
-    out.session_id = c.session_id; out.updated = true;
+    must(await db.from('claude_session_logs').update(patch).eq('id', sessionId), 'update session');
+    out.session_id = sessionId; out.updated = true; out.keys = keys;
   } else {
     const row = {
       session_date: c.session.date, session_title: c.session.title, phase_focus: c.session.phase_focus,
@@ -151,37 +217,43 @@ export async function applyCheckpoint(input, { db = supabase, now = new Date() }
       issues_resolved: [], pending_items: [], board_versions: [], mcp_verified_ids: c.session.mcp_verified_ids,
       next_steps: [], raw_summary: c.session.summary, chat_url: c.session.chat_url, chat_title: c.session.chat_title,
       transcript_search_keys: keys, surface: c.session.surface, log_origin: 'live',
-      link_confidence: c.session.chat_url ? 'exact' : 'unlinked',
+      link_confidence: c.session.chat_url ? 'exact' : 'unlinked', checkpoint_key: key,
     };
     const ins = must(await db.from('claude_session_logs').insert(row).select('id').single(), 'insert session');
-    out.session_id = ins.id;
+    out.session_id = ins.id; out.keys = keys;
   }
   const sid = out.session_id;
 
   // 2. Decisions (+ supersede).
-  for (const d of c.decisions) {
-    const ins = must(await db.from('claude_decision_log').insert({
-      session_id: sid, decision_date: c.session.date, category: d.category, decision: d.decision,
-      options_considered: d.options, rationale: d.rationale, workflow_code: d.workflow_code,
-      reversible: true, transcript_search_keys: keys,
-    }).select('id').single(), 'insert decision');
-    out.decision_ids.push(ins.id);
-    if (d.supersedes_id) {
-      must(await db.from('claude_decision_log').update({ status: 'superseded', superseded_by: ins.id }).eq('id', d.supersedes_id), 'supersede decision');
+  for (let i = 0; i < c.decisions.length; i++) {
+    const d = c.decisions[i];
+    if (out.decision_ids[i] == null) {
+      const ins = must(await db.from('claude_decision_log').insert({
+        session_id: sid, decision_date: c.session.date, category: d.category, decision: d.decision,
+        options_considered: d.options, rationale: d.rationale, workflow_code: d.workflow_code,
+        reversible: true, transcript_search_keys: keys,
+      }).select('id').single(), 'insert decision');
+      out.decision_ids[i] = ins.id;
+    }
+    if (d.supersedes_id && !out.superseded.includes(d.supersedes_id)) {
+      must(await db.from('claude_decision_log').update({ status: 'superseded', superseded_by: out.decision_ids[i] }).eq('id', d.supersedes_id), 'supersede decision');
       out.superseded.push(d.supersedes_id);
     }
   }
 
   // 3. Issues.
-  for (const x of c.issues) {
+  for (let i = 0; i < c.issues.length; i++) {
+    if (out.issue_ids[i] != null) continue;
+    const x = c.issues[i];
     const ins = must(await db.from('claude_known_issues').insert({
       reported_date: c.session.date, reported_session_id: sid, severity: x.severity, category: x.category,
       description: x.description, impact: x.impact, fix_instructions: x.fix_instructions,
       workflow_code: x.workflow_code, workflow_name: x.workflow_name, issue_type: x.issue_type, status: 'open',
     }).select('id').single(), 'insert issue');
-    out.issue_ids.push(ins.id);
+    out.issue_ids[i] = ins.id;
   }
   for (const r of c.resolved_issues) {
+    if (out.resolved.includes(r.id)) continue;
     must(await db.from('claude_known_issues').update({
       status: 'resolved', resolved_date: c.session.date, resolved_session_id: sid,
       verified_at: nowIso, verification_note: r.note, stale: false, updated_at: nowIso,
@@ -189,30 +261,39 @@ export async function applyCheckpoint(input, { db = supabase, now = new Date() }
     out.resolved.push(r.id);
   }
   for (const r of c.verified_issues) {
+    if (out.verified.includes(r.id)) continue;
     must(await db.from('claude_known_issues').update({ verified_at: nowIso, verification_note: r.note, stale: false, updated_at: nowIso }).eq('id', r.id), 'verify issue');
     out.verified.push(r.id);
   }
 
-  // 4. Pending items (source_index continues from the session's highest 'live' index).
-  if (c.pending.length) {
+  // 4. Pending items (source_index continues from the session's highest 'live' index —
+  //    re-queried on a retry, so rows inserted by an earlier attempt are counted).
+  if (c.pending.some((_, i) => out.pending_ids[i] == null)) {
     const last = must(await db.from('claude_pending_items').select('source_index').eq('source_session_id', sid).eq('source_field', 'live').order('source_index', { ascending: false }).limit(1), 'pending index');
     let idx = (last && last[0] && Number.isInteger(last[0].source_index)) ? last[0].source_index + 1 : 0;
-    for (const p of c.pending) {
+    for (let i = 0; i < c.pending.length; i++) {
+      if (out.pending_ids[i] != null) continue;
+      const p = c.pending[i];
       const ins = must(await db.from('claude_pending_items').insert({
         source_session_id: sid, source_field: 'live', source_index: idx++, kind: p.kind, item_type: p.item_type,
         description: p.description, status: 'open', priority: p.priority, effort: p.effort, blocked_by: p.blocked_by,
         ref: p.ref, owner: p.owner, origin: 'live', session_date: c.session.date, created_at: nowIso,
       }).select('id').single(), 'insert pending');
-      out.pending_ids.push(ins.id);
+      out.pending_ids[i] = ins.id;
     }
   }
   for (const cl of c.close_pending) {
-    must(await db.from('claude_pending_items').update({ status: cl.status, resolved_session_id: sid, updated_at: nowIso }).eq('id', cl.id), 'close pending');
+    if (out.closed.includes(cl.id)) continue;
+    // verified_at clears the sql/096 stale flag — closing is a human/skill verification, not activity.
+    must(await db.from('claude_pending_items').update({
+      status: cl.status, resolved_session_id: sid, closed_by: 'checkpoint', closed_reason: `checkpoint:${cl.status}`,
+      closed_at: nowIso, verified_at: nowIso, stale: false, updated_at: nowIso,
+    }).eq('id', cl.id), 'close pending');
     out.closed.push(cl.id);
   }
 
   // 5. Ledger row when a URL is on file.
-  if (c.session.chat_url) {
+  if (c.session.chat_url && !out.ledger) {
     must(await db.from('claude_transcript_ledger').upsert({
       chat_url: c.session.chat_url, chat_title: c.session.chat_title, chat_updated_at: nowIso,
       session_id: sid, disposition: 'linked', reviewed_at: nowIso,
@@ -220,6 +301,7 @@ export async function applyCheckpoint(input, { db = supabase, now = new Date() }
     }, { onConflict: 'chat_url' }), 'ledger upsert');
     out.ledger = 'linked';
   }
+  delete out.keys;
   return out;
 }
 

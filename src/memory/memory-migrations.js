@@ -23,6 +23,7 @@ export const MEMORY_MIGRATIONS = [
   { file: '092_memory_taxonomy_area_workflow_ref.sql', check: "SELECT 1 FROM pg_proc WHERE proname = 'claude_area_for'" },
   { file: '093_memory_area_trigger.sql',            check: "SELECT 1 FROM pg_proc WHERE proname = 'claude_set_area'" },
   { file: '094_claude_memory_embeddings.sql',       check: "SELECT 1 FROM pg_proc WHERE proname = 'match_memory_embeddings'" },
+  { file: '096_pending_autoclose.sql',              check: "SELECT 1 FROM information_schema.tables WHERE table_name = 'claude_memory_autoclose_log'" },
 ];
 
 export async function checkMemorySchema({ sql = runSQL, autoApply = String(process.env.MEMORY_MIGRATIONS_AUTOAPPLY || 'false') === 'true' } = {}) {
@@ -36,7 +37,7 @@ export async function checkMemorySchema({ sql = runSQL, autoApply = String(proce
       missing.push(m);
     }
   }
-  if (!missing.length) { console.log('[MemorySchema] sql/090–094 present'); return { ok: true, missing: [], applied: [] }; }
+  if (!missing.length) { console.log('[MemorySchema] sql/090–096 present'); return { ok: true, missing: [], applied: [] }; }
   for (const m of missing) console.warn(`[MemorySchema] MISSING: ${m.file} — ${autoApply ? 'applying' : 'set MEMORY_MIGRATIONS_AUTOAPPLY=true to apply at boot, or run the file by hand'}`);
   const applied = [];
   if (autoApply) {
