@@ -110,7 +110,7 @@ ORDER BY p.id`;
 // Only the "PR #123" form counts. Bare "PR 5" / "PR1" in this table are project
 // phase labels, not GitHub PRs, and would match ancient merged PRs.
 export const RULE_D2_SELECT = `
-SELECT id, description, ref, coalesce(session_date, created_at::date)::text AS session_date
+SELECT id, item_type, description, ref, coalesce(session_date, created_at::date)::text AS session_date
 FROM claude_pending_items
 WHERE status='open'
   AND (description ~* 'PR\\s*#\\s*\\d+' OR ref ~* 'PR\\s*#\\s*\\d+')

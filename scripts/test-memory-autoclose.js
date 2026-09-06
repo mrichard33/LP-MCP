@@ -260,6 +260,7 @@ test('rule D2 resolves the repo from the text and only counts merges on/after th
   assert.equal(new Set(calls).size, calls.length, 'each repo+number fetched once');
   assert.ok(calls.includes('mrichard33/HL-MCP#151') && calls.includes('mrichard33/LP-MCP#151'));
   assert.match(RULE_D2_SELECT, /AS session_date/, 'the SELECT carries the session date the gate needs');
+  assert.match(RULE_D2_SELECT, /^\s*SELECT id, item_type, description, ref,/, 'the SELECT carries item_type — prIntent reads it (second shadow run, 2026-09-06)');
 });
 
 test('rule D2 (ruling 1): a row naming a repo the resolver does not know is skipped', () => {
