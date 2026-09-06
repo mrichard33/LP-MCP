@@ -22,7 +22,13 @@
  *   B   anything from a retro session 90+ days old           → expired
  *   C   exact-duplicate descriptions → older copies           → superseded (by newest open copy)
  *   D1  ref points at a resolved/duplicate claude_known_issue → done
- *   D2  description/ref names an LP-MCP PR that is merged     → done   (GitHub; skipped without a token)
+ *   D2  description/ref names a "PR #n" that is merged        → done   (GitHub; skipped without a token)
+ *       The repo is resolved from the text (LP-MCP default; HL-MCP,
+ *       Reece-Dashboard, GHL-Workflows, n8n when named — nearest mention
+ *       wins), and the merge must have happened ON OR AFTER the item's
+ *       session date: an item cannot be waiting on a PR that was already
+ *       merged when the item was written, so an earlier merge means the
+ *       number belongs to another repo or the item is follow-up work.
  *   STALE  open, not protected, untouched 120+ days           → stale=true (flag only, never a status)
  *
  * HOW THE SQL IS SHAPED. Every rule is a candidate SELECT (ids) followed by an
@@ -95,7 +101,8 @@ ORDER BY p.id`;
 // Only the "PR #123" form counts. Bare "PR 5" / "PR1" in this table are project
 // phase labels, not GitHub PRs, and would match ancient merged PRs.
 export const RULE_D2_SELECT = `
-SELECT id, description, ref FROM claude_pending_items
+SELECT id, description, ref, coalesce(session_date, created_at::date)::text AS session_date
+FROM claude_pending_items
 WHERE status='open'
   AND (description ~* 'PR\\s*#\\s*\\d+' OR ref ~* 'PR\\s*#\\s*\\d+')
   AND ${protectedClause()}
@@ -165,52 +172,97 @@ VALUES (${q(mode)}, ${q(rule)}, ${Number(affected) || 0}, ${ids}, ${notes == nul
 // ─── Rule D2 helpers ───────────────────────────────────────────────────────
 const PR_RE = /\bPR\s*#\s*(\d{1,6})\b/gi;
 
-/** Distinct PR numbers named as "PR #n" in a row's description + ref. Exported for tests. */
-export function prNumbersIn(row) {
+/** Repos a pending item can name. Order matters only for the default (first). */
+export const KNOWN_REPOS = Object.freeze([
+  { repo: 'mrichard33/LP-MCP',          re: /\bLP[-_ ]?MCP\b/gi },
+  { repo: 'mrichard33/HL-MCP',          re: /\bHL[-_ ]?MCP\b/gi },
+  { repo: 'mrichard33/Reece-Dashboard', re: /\b(?:reece[-_ ]?)?dashboard\b/gi },
+  { repo: 'mrichard33/GHL-Workflows',   re: /\bGHL[-_ ]?Workflows\b/gi },
+  { repo: 'mrichard33/n8n',             re: /\bn8n\b/gi },
+]);
+
+/**
+ * Distinct { repo, number } refs named as "PR #n" in a row's description + ref.
+ * Repo = the nearest repo mention in the text (before the PR token preferred,
+ * then after); LP-MCP when none is named. Exported for tests.
+ */
+export function prRefsIn(row) {
   const text = `${row.description || ''} ${row.ref || ''}`;
-  const out = new Set();
-  for (const m of text.matchAll(PR_RE)) out.add(Number(m[1]));
-  return [...out];
+  const mentions = [];
+  for (const { repo, re } of KNOWN_REPOS) for (const m of text.matchAll(re)) mentions.push({ repo, at: m.index });
+  const resolve = (at) => {
+    let best = null;
+    for (const m of mentions) {
+      const d = m.at <= at ? at - m.at : (m.at - at) + 100000; // any "before" beats any "after"
+      if (!best || d < best.d) best = { repo: m.repo, d };
+    }
+    return best ? best.repo : D2_REPO;
+  };
+  const seen = new Set();
+  const out = [];
+  for (const m of text.matchAll(PR_RE)) {
+    const ref = { repo: resolve(m.index), number: Number(m[1]) };
+    const key = `${ref.repo}#${ref.number}`;
+    if (!seen.has(key)) { seen.add(key); out.push(ref); }
+  }
+  return out;
 }
+
+/** Back-compat: distinct PR numbers only. */
+export function prNumbersIn(row) { return [...new Set(prRefsIn(row).map((r) => r.number))]; }
 
 export function githubTokenPresent(env = process.env) {
   return Boolean(env.GITHUB_PAT || env.GITHUB_TOKEN);
 }
 
-/** GET /repos/mrichard33/LP-MCP/pulls/:n → { merged_at } | null (404). Throws on other errors. */
-async function defaultFetchPR(n, env = process.env) {
+/** GET /repos/:repo/pulls/:n → { merged_at } | null (404). Throws on other errors. */
+async function defaultFetchPR(n, repo = D2_REPO, env = process.env) {
   const token = env.GITHUB_PAT || env.GITHUB_TOKEN;
-  const res = await fetch(`https://api.github.com/repos/${D2_REPO}/pulls/${n}`, {
+  const res = await fetch(`https://api.github.com/repos/${repo}/pulls/${n}`, {
     headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github.v3+json' },
     signal: AbortSignal.timeout(10000),
   });
   if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`GitHub ${res.status} for PR #${n}`);
+  if (!res.ok) throw new Error(`GitHub ${res.status} for ${repo} PR #${n}`);
   const j = await res.json();
   return { merged_at: j.merged_at || null };
 }
 
+/** True when the PR merged on or after the item's session date (UTC date of merged_at vs YYYY-MM-DD). */
+export function mergedAfterSession(merged_at, session_date) {
+  if (!merged_at) return false;
+  if (!session_date) return true;
+  return String(merged_at).slice(0, 10) >= String(session_date).slice(0, 10);
+}
+
 /**
- * Rows whose named PRs are ALL merged. One GitHub call per distinct PR number
- * per run (cached). Unknown PRs (404) and lookup errors never close a row.
+ * Rows whose named PRs are ALL merged on or after the row's session date.
+ * One GitHub call per distinct repo+number per run (cached). Unknown PRs
+ * (404), lookup errors and merges that predate the item never close a row.
+ * fetchPR(number, repo) → { merged_at } | null.
  */
 export async function mergedPrRows(rows, fetchPR) {
   const cache = new Map();
-  const lookup = async (n) => {
-    if (!cache.has(n)) {
-      cache.set(n, fetchPR(n).then((r) => Boolean(r && r.merged_at)).catch((err) => { cache.set(`err:${n}`, err.message); return false; }));
+  const errors = new Map();
+  const lookup = async ({ repo, number }) => {
+    const key = `${repo}#${number}`;
+    if (!cache.has(key)) {
+      cache.set(key, Promise.resolve().then(() => fetchPR(number, repo)).then((r) => (r && r.merged_at) || null)
+        .catch((err) => { errors.set(key, err.message); return null; }));
     }
-    return cache.get(n);
+    return cache.get(key);
   };
   const out = [];
+  let too_early = 0;
   for (const row of rows) {
-    const prs = prNumbersIn(row);
-    if (!prs.length) continue;
-    const merged = await Promise.all(prs.map(lookup));
-    if (merged.every(Boolean)) out.push(row.id);
+    const refs = prRefsIn(row);
+    if (!refs.length) continue;
+    const mergedAts = await Promise.all(refs.map(lookup));
+    if (!mergedAts.every(Boolean)) continue;
+    if (mergedAts.every((m) => mergedAfterSession(m, row.session_date))) out.push(row.id);
+    else too_early++;
   }
-  const errors = [...cache.entries()].filter(([k]) => String(k).startsWith('err:')).map(([k, v]) => `${k.slice(4)}: ${v}`);
-  return { ids: out, checked: cache.size - errors.length, errors };
+  return { ids: out, checked: cache.size - errors.size, too_early, errors: [...errors.entries()].map(([k, v]) => `${k}: ${v}`) };
 }
 
 // ─── Runner ────────────────────────────────────────────────────────────────
@@ -237,7 +289,7 @@ export async function runAutoclose({ mode = process.env.MEMORY_AUTOCLOSE_MODE, d
   const sql = deps.runSQL;
   if (typeof sql !== 'function') throw new Error('runAutoclose: deps.runSQL required');
   const env = deps.env || process.env;
-  const fetchPR = deps.fetchPR || ((n) => defaultFetchPR(n, env));
+  const fetchPR = deps.fetchPR || ((n, repo) => defaultFetchPR(n, repo, env));
   const seen = new Set();          // ids matched earlier this run (rule ordering)
   const matchedAll = [];           // every id tagged/closed this run (for would_close cleanup)
 
@@ -250,6 +302,7 @@ export async function runAutoclose({ mode = process.env.MEMORY_AUTOCLOSE_MODE, d
       if (r.github) {
         const d2 = await mergedPrRows(rows, fetchPR);
         entry.prs_checked = d2.checked;
+        entry.merged_before_item = d2.too_early;
         if (d2.errors.length) entry.lookup_errors = d2.errors.slice(0, 5);
         const keep = new Set(d2.ids);
         rows = rows.filter((row) => keep.has(row.id));

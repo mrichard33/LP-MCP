@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import {
   AUTOCLOSE_RULES, PROTECTED_ITEM_TYPES, PROTECTED_LIST_SQL, runAutoclose,
   RULE_A_SELECT, RULE_B_SELECT, RULE_C_SELECT, RULE_D1_SELECT, RULE_D2_SELECT, RULE_STALE_SELECT,
-  shadowSql, closeSql, supersedeSql, staleFlagSql, clearWouldCloseSql, logSql, prNumbersIn, mergedPrRows,
+  shadowSql, closeSql, supersedeSql, staleFlagSql, clearWouldCloseSql, logSql, prNumbersIn, prRefsIn, mergedPrRows, mergedAfterSession,
 } from '../src/jobs/memory-autoclose.js';
 import { withRetry, isTransientError } from '../src/memory/with-retry.js';
 
@@ -66,7 +66,8 @@ function mockSql(rows) {
   return { runSQL, calls, updates: () => calls.filter((s) => /^\s*UPDATE/i.test(s)), logs: () => calls.filter((s) => /^\s*INSERT INTO claude_memory_autoclose_log/i.test(s)) };
 }
 
-const fetchPRMerged = async (n) => (n === 866 ? { merged_at: '2026-09-05T00:00:00Z' } : null);
+// PR #866 in LP-MCP "merged today" — always on/after fixture #7's session date (5 days ago).
+const fetchPRMerged = async (n, repo) => (n === 866 && repo === 'mrichard33/LP-MCP' ? { merged_at: new Date().toISOString() } : null);
 const env = { GITHUB_PAT: 'x' };
 
 // 1. off → zero SQL calls
@@ -207,7 +208,53 @@ test('rule D2: skipped without a GitHub token; closes only rows whose named PRs 
   ], fetchPR);
   assert.deepEqual(d2.ids, [10, 14]);
   assert.equal(calls, 4, 'one lookup per distinct PR');
-  assert.equal(d2.errors.length, 1); assert.match(d2.errors[0], /^4: GitHub 502/);
+  assert.equal(d2.errors.length, 1); assert.match(d2.errors[0], /^mrichard33\/LP-MCP#4: GitHub 502/);
+  assert.equal(d2.too_early, 0);
+});
+
+test('rule D2 resolves the repo from the text and only counts merges on/after the item session date', async () => {
+  // Repo resolution: nearest mention before the PR token wins, then after, else LP-MCP.
+  assert.deepEqual(prRefsIn({ description: 'HL-MCP PR #151 opportunities sync cadence' }), [{ repo: 'mrichard33/HL-MCP', number: 151 }]);
+  assert.deepEqual(prRefsIn({ description: 'PR #591 awaiting Mark review and merge' }), [{ repo: 'mrichard33/LP-MCP', number: 591 }]);
+  assert.deepEqual(prRefsIn({ description: 'Deploy PR #12 to the Reece Dashboard' }), [{ repo: 'mrichard33/Reece-Dashboard', number: 12 }]);
+  assert.deepEqual(prRefsIn({ description: 'lp-mcp PR #10 then hl_mcp PR #11 then PR #12 (ghl-workflows) and n8n PR #13' }), [
+    { repo: 'mrichard33/LP-MCP', number: 10 }, { repo: 'mrichard33/HL-MCP', number: 11 },
+    { repo: 'mrichard33/HL-MCP', number: 12 }, { repo: 'mrichard33/n8n', number: 13 },
+  ], 'a mention before the token beats a nearer one after it');
+  assert.deepEqual(prRefsIn({ description: 'PR #5 and PR #5 again', ref: 'PR #5' }), [{ repo: 'mrichard33/LP-MCP', number: 5 }], 'deduped per repo+number');
+
+  // Date gate.
+  assert.equal(mergedAfterSession('2026-07-30T12:00:00Z', '2026-07-28'), true);
+  assert.equal(mergedAfterSession('2026-07-28T23:59:00Z', '2026-07-28'), true, 'same day counts');
+  assert.equal(mergedAfterSession('2026-03-01T00:00:00Z', '2026-07-28'), false);
+  assert.equal(mergedAfterSession(null, '2026-07-28'), false);
+
+  // The three production false positives from the first shadow run, plus two correct closes.
+  const merged = {
+    'mrichard33/LP-MCP#151': '2026-03-02T10:00:00Z',   // LP-MCP's own #151 — merged months before the item
+    'mrichard33/HL-MCP#151': '2026-07-30T10:00:00Z',   // the HL-MCP PR the item actually names
+    'mrichard33/LP-MCP#120': '2026-02-11T10:00:00Z',   // "PR #120 fix/kiosk..." is not LP-MCP's #120
+    'mrichard33/LP-MCP#625': '2026-08-01T10:00:00Z',   // merged before the item that says rows are NOT rolled back by it
+    'mrichard33/LP-MCP#591': '2026-07-30T10:00:00Z',   // awaiting merge on 07-29, merged 07-30 → done
+    'mrichard33/LP-MCP#481': '2026-07-06T18:00:00Z',   // merged the same day → done
+  };
+  const calls = [];
+  const fetchPR = async (n, repo) => { calls.push(`${repo}#${n}`); const m = merged[`${repo}#${n}`]; return m ? { merged_at: m } : null; };
+  const rows = [
+    { id: 402, description: 'HL-MCP PR #151 opportunities sync cadence and ceiling', session_date: '2026-07-28' },
+    { id: 405, description: 'Confirm opportunities failure rate drops to near zero after PR #151 deploys', session_date: '2026-07-28' },
+    { id: 533, description: 'PR #120 fix/kiosk-skips-supabase-auth open, awaiting Mark review and merge', session_date: '2026-07-31' },
+    { id: 647, description: '56 already-fired-early milestone rows are NOT rolled back by PR #625', session_date: '2026-08-06' },
+    { id: 371, description: 'PR #591 awaiting Mark review and merge', session_date: '2026-07-29' },
+    { id: 313, description: 'User merges PR #481 -> Railway deploys', session_date: '2026-07-06' },
+  ];
+  const d2 = await mergedPrRows(rows, fetchPR);
+  assert.deepEqual(d2.ids, [402, 371, 313]);
+  assert.equal(d2.too_early, 3, '#405, #533 and #647 name PRs merged before the item existed');
+  assert.deepEqual(d2.errors, []);
+  assert.equal(new Set(calls).size, calls.length, 'each repo+number fetched once');
+  assert.ok(calls.includes('mrichard33/HL-MCP#151') && calls.includes('mrichard33/LP-MCP#151'));
+  assert.match(RULE_D2_SELECT, /AS session_date/, 'the SELECT carries the session date the gate needs');
 });
 
 test('a failing rule is recorded and the remaining rules still run', async () => {
