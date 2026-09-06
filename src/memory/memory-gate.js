@@ -101,7 +101,7 @@ export function fuseResults(ftsHits = [], vecHits = [], opts = {}) {
 
   const results = [...merged.values()].map((r) => ({
     ...r,
-    score: r.rrf * statusWeight(r.status) * originWeight(r.origin) + recencyBoost(r.row_date, today),
+    score: r.rrf * statusWeight(r.status) * originWeight(r.origin) * (1 + recencyBoost(r.row_date, today)),
   }))
     .sort((a, b) => b.score - a.score || (b.similarity ?? 0) - (a.similarity ?? 0))
     .slice(0, limit)
