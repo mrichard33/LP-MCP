@@ -89,3 +89,12 @@ test('content hash changes on text, status or area; toEmbeddingRow strips PII an
   assert.equal(row.row_date, '2026-08-01');
   assert.ok(row.embedded_text.includes('[phone]'));
 });
+
+test('stripPii catches +1 and bare 11-digit forms and leaves long numeric ids alone', () => {
+  const s = stripPii('rep SMS from +19542808890; try 14075126443 with leading 1; call 300000010260259 verified; actions 233119-233139; job lpintake_1787509134840_205nht');
+  assert.equal((s.match(/\[phone\]/g) || []).length, 2);
+  assert.ok(!/9542808890|4075126443/.test(s), 'phone leaked');
+  assert.ok(s.includes('300000010260259'), 'call id was mangled');
+  assert.ok(s.includes('233119-233139'), 'action range was mangled');
+  assert.ok(s.includes('1787509134840'), 'job timestamp was mangled');
+});
