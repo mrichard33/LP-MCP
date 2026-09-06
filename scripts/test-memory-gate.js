@@ -98,3 +98,10 @@ test('stripPii catches +1 and bare 11-digit forms and leaves long numeric ids al
   assert.ok(s.includes('233119-233139'), 'action range was mangled');
   assert.ok(s.includes('1787509134840'), 'job timestamp was mangled');
 });
+
+test('stripPii does not read decimal telemetry followed by a unit as a phone number', () => {
+  const s = stripPii('boot sweep log: embedded=56/56 tokens=1726 cost=$0.000035 4365ms; call 9548901067. then +1.954.890.1067 and 1-954-890-1067');
+  assert.ok(s.includes('cost=$0.000035 4365ms'), 'telemetry was mangled');
+  assert.equal((s.match(/\[phone\]/g) || []).length, 3);
+  assert.ok(!/9548901067|890[.-]1067/.test(s), 'phone leaked');
+});

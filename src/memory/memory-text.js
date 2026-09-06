@@ -15,8 +15,11 @@ export const SESSION_TEXT_CAP = 6000;
 
 // US phone numbers in any common layout; emails. UUIDs, 8-char UUID prefixes,
 // canonical codes (S4.5) and issue ids (#724) are deliberately untouched — they
-// are the exact tokens retrieval needs.
-const PHONE_RE = /(?<!\d)(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?!\d)/g;
+// are the exact tokens retrieval needs. Lookarounds, not \b: a country code
+// glued to the area code must be consumable. The leading class also rejects a
+// decimal point and the trailing class a unit letter, so telemetry such as
+// "cost=$0.000035 4365ms" (session 200) is not read as a phone number.
+const PHONE_RE = /(?<![\d.])(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?![\dA-Za-z])/g;
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
 
 export function stripPii(text) {
