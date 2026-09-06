@@ -105,3 +105,19 @@ test('stripPii does not read decimal telemetry followed by a unit as a phone num
   assert.equal((s.match(/\[phone\]/g) || []).length, 3);
   assert.ok(!/9548901067|890[.-]1067/.test(s), 'phone leaked');
 });
+
+test('recency is a nudge, not a ceiling: an older two-leg match outranks a recent one-leg match', () => {
+  const today = new Date('2026-09-06');
+  const fts = [
+    { kind: 'session', id: 700, date: '2026-09-06', text: 'recent, keyword only', origin: 'live', status: null, rank: 0.9 },
+    { kind: 'decision', id: 100, date: '2026-05-01', text: 'old, both legs', origin: 'live', status: 'active', rank: 0.8 },
+  ];
+  const vec = [
+    { kind: 'decision', source_id: 100, row_date: '2026-05-01', text: 'old, both legs', origin: 'live', status: 'active', similarity: 0.62 },
+  ];
+  const out = fuseResults(fts, vec, { today });
+  assert.equal(out.results[0].id, 100, 'two-leg match must win');
+  const byId = Object.fromEntries(out.results.map((r) => [r.id, r.score]));
+  assert.ok(byId[700] < byId[100]);
+  assert.ok(byId[700] < 0.05, 'a single-leg score must stay in rrf range even when recent');
+});
