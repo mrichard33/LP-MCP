@@ -6,7 +6,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { validateCheckpoint, planCheckpoint, applyCheckpoint, CheckpointError } from '../src/memory/memory-checkpoint.js';
 
-/** Minimal chainable fake: records every call, returns canned rows. */
+/**
+ * Minimal chainable fake: records every call, returns canned rows.
+ *   seed.session   row returned for a lookup by id
+ *   seed.byKey     row returned for a lookup by checkpoint_key
+ *   seed.fail      (ctx, n) => error|null — inject a failure for the n-th call
+ */
 function fakeDb(seed = {}) {
   const calls = [];
   let nextId = 900;
@@ -23,8 +28,13 @@ function fakeDb(seed = {}) {
     };
     const finish = async (maybe) => {
       calls.push({ ...ctx });
+      const injected = seed.fail ? seed.fail(ctx, calls.length) : null;
+      if (injected) return { data: null, error: injected, status: injected.status };
       if (ctx.op === 'insert') return { data: { id: nextId++ }, error: null };
-      if (ctx.op === null && table === 'claude_session_logs' && maybe) return { data: seed.session ?? null, error: null };
+      if (ctx.op === null && table === 'claude_session_logs' && maybe) {
+        if (ctx.filters.some(([k]) => k === 'checkpoint_key')) return { data: seed.byKey ?? null, error: null };
+        return { data: seed.session ?? null, error: null };
+      }
       if (ctx.op === null && table === 'claude_pending_items') return { data: seed.lastIndex != null ? [{ source_index: seed.lastIndex }] : [], error: null };
       return { data: null, error: null };
     };
@@ -32,6 +42,7 @@ function fakeDb(seed = {}) {
   };
   return { from: (t) => make(t), calls };
 }
+const NO_RETRY_WAIT = { attempts: 3, backoffMs: [0, 0, 0], sleep: async () => {} };
 
 const base = {
   session: { title: 'T', summary: 'S', search_keys: ['sql/094', 'PR #866', 'claude_set_area'], surface: 'code' },
@@ -98,4 +109,76 @@ test('apply (refresh): unknown session id fails before any write', async () => {
   const db = fakeDb({ session: null });
   await assert.rejects(() => applyCheckpoint({ ...base, session_id: 1 }, { db }), CheckpointError);
   assert.equal(db.calls.filter((c) => c.op).length, 0);
+});
+
+// ─── Transport retry + idempotency (issue #1627) ──────────────────────────
+test('apply (new session): the session INSERT carries a per-call checkpoint_key and the result echoes it', async () => {
+  const db = fakeDb();
+  const out = await applyCheckpoint(base, { db, retry: NO_RETRY_WAIT });
+  const sess = db.calls.find((c) => c.table === 'claude_session_logs' && c.op === 'insert').payload;
+  assert.match(sess.checkpoint_key, /^[0-9a-f-]{36}$/);
+  assert.equal(out.checkpoint_key, sess.checkpoint_key); assert.equal(out.attempts, 1); assert.equal(out.recovered, false);
+  const given = await applyCheckpoint(base, { db: fakeDb(), retry: NO_RETRY_WAIT, checkpoint_key: '11111111-1111-4111-8111-111111111111' });
+  assert.equal(given.checkpoint_key, '11111111-1111-4111-8111-111111111111');
+});
+
+test('a transient failure mid-sequence is retried and the retry only writes what has not landed', async () => {
+  let failed = false;
+  const db = fakeDb({ fail: (ctx) => {
+    if (!failed && ctx.table === 'claude_known_issues' && ctx.op === 'insert') { failed = true; return { message: 'TypeError', details: 'fetch failed', code: '' }; }
+    return null;
+  } });
+  const out = await applyCheckpoint(base, { db, retry: NO_RETRY_WAIT });
+  assert.equal(out.attempts, 2);
+  const inserts = (t) => db.calls.filter((c) => c.table === t && c.op === 'insert');
+  assert.equal(inserts('claude_session_logs').length, 1, 'session inserted once');
+  assert.equal(inserts('claude_decision_log').length, 1, 'decision inserted once');
+  assert.equal(inserts('claude_known_issues').length, 2, 'issue insert failed once then succeeded');
+  assert.equal(inserts('claude_pending_items').length, 2);
+  assert.equal(db.calls.filter((c) => c.table === 'claude_decision_log' && c.op === 'update').length, 1, 'supersede done once');
+  assert.deepEqual(out.decision_ids.length, 1); assert.deepEqual(out.issue_ids.length, 1); assert.equal(out.session_id, 900);
+  const byKey = db.calls.find((c) => c.table === 'claude_session_logs' && c.filters.some(([k]) => k === 'checkpoint_key'));
+  assert.equal(byKey, undefined, 'session id was known, so no lookup by key was needed');
+});
+
+test('a lost session-insert response is recovered by checkpoint_key on retry — no second session row', async () => {
+  let n = 0;
+  const db = fakeDb({
+    byKey: { id: 4242 },
+    fail: (ctx) => (ctx.table === 'claude_session_logs' && ctx.op === 'insert' && ++n === 1 ? { message: 'read ECONNRESET', code: 'ECONNRESET' } : null),
+  });
+  const out = await applyCheckpoint(base, { db, retry: NO_RETRY_WAIT });
+  assert.equal(out.attempts, 2); assert.equal(out.session_id, 4242); assert.equal(out.recovered, true); assert.equal(out.updated, true);
+  assert.equal(db.calls.filter((c) => c.table === 'claude_session_logs' && c.op === 'insert').length, 1, 'insert attempted once, then found by key');
+  const lookup = db.calls.find((c) => c.table === 'claude_session_logs' && c.filters.some(([k]) => k === 'checkpoint_key'));
+  assert.ok(lookup); assert.equal(lookup.filters[0][1], out.checkpoint_key);
+  const dec = db.calls.find((c) => c.table === 'claude_decision_log' && c.op === 'insert').payload;
+  assert.equal(dec.session_id, 4242);
+});
+
+test('after three transient failures the error carries partial (what landed) and validation / 4xx errors are not retried', async () => {
+  const db = fakeDb({ fail: (ctx) => (ctx.table === 'claude_known_issues' && ctx.op === 'insert' ? { message: 'TypeError', details: 'fetch failed' } : null) });
+  let err;
+  try { await applyCheckpoint(base, { db, retry: NO_RETRY_WAIT }); } catch (e) { err = e; }
+  assert.ok(err); assert.match(err.message, /insert issue: TypeError \(fetch failed\)/);
+  assert.equal(err.attempts, 3);
+  assert.equal(err.partial.session_id, 900); assert.deepEqual(err.partial.decision_ids, [901]); assert.deepEqual(err.partial.superseded, [5]);
+  assert.equal(err.partial.issue_ids, undefined); assert.match(err.partial.checkpoint_key, /^[0-9a-f-]{36}$/);
+  assert.equal(db.calls.filter((c) => c.table === 'claude_known_issues' && c.op === 'insert').length, 3);
+
+  const db4 = fakeDb({ fail: (ctx) => (ctx.table === 'claude_decision_log' && ctx.op === 'insert' ? { message: 'duplicate key value', code: '23505', status: 409 } : null) });
+  await assert.rejects(() => applyCheckpoint(base, { db: db4, retry: NO_RETRY_WAIT }), /insert decision: duplicate key value/);
+  assert.equal(db4.calls.filter((c) => c.table === 'claude_decision_log' && c.op === 'insert').length, 1, '4xx not retried');
+
+  const db5 = fakeDb();
+  await assert.rejects(() => applyCheckpoint({ ...base, session: { title: 'x', summary: 'y', search_keys: ['a'] } }, { db: db5, retry: NO_RETRY_WAIT }), CheckpointError);
+  assert.equal(db5.calls.length, 0, 'validation fails before any write or retry');
+});
+
+test('closing a pending item stamps closed_by=checkpoint and verified_at (clears the sql/096 stale flag)', async () => {
+  const db = fakeDb();
+  await applyCheckpoint(base, { db, retry: NO_RETRY_WAIT, now: new Date('2026-09-06T12:00:00Z') });
+  const closed = db.calls.find((c) => c.table === 'claude_pending_items' && c.op === 'update').payload;
+  assert.equal(closed.closed_by, 'checkpoint'); assert.equal(closed.closed_reason, 'checkpoint:done');
+  assert.equal(closed.verified_at, '2026-09-06T12:00:00.000Z'); assert.equal(closed.stale, false);
 });
