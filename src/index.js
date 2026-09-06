@@ -37,6 +37,8 @@ import { registerIntentScorerRoutes } from './intent-scorer.js';
 // ─── Phase 4: KB Vector Ingestion (agentic bot knowledge layer) ──
 import { registerKbIngestionRoutes } from './knowledge/ingest-embeddings.js';
 import { registerMemoryRoutes } from './memory/memory-routes.js';
+import { registerMemoryNightlyRoutes, startMemoryNightlyScheduler } from './jobs/memory-nightly.js';
+import { checkMemorySchema } from './memory/memory-migrations.js';
 import { startTier1EmbedSweep } from './knowledge/tier1-semantic.js';
 import { startExemplarSweep } from './knowledge/exemplars.js';
 import { startCiMomentsSweep } from './knowledge/ci-moments.js';
@@ -1841,6 +1843,7 @@ registerKbIngestionRoutes(app);
 // ─── Memory vector tier (sql/094): server-side backfill + hybrid search ──
 // Operator surface only; nothing in the request path calls it. Authenticated.
 registerMemoryRoutes(app, authenticate);
+registerMemoryNightlyRoutes(app, authenticate);
 
 // ─── Pause-Workflow Fizzle Sweep ─────────────────────────────────
 registerPauseWorkflowSweepRoutes(app);
@@ -2078,6 +2081,8 @@ app.listen(PORT, async () => {
   startLeadSelectionScheduler();
   startWorkflowProjectionLoop();
   startMarketAssignmentScheduler();
+  startMemoryNightlyScheduler();
+  checkMemorySchema().catch((err) => console.warn('[MemorySchema] boot check failed:', err.message));
   startCapacitySweepScheduler();
   startGoalScorecardScheduler();
   startScorecardValidateScheduler();

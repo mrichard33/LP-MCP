@@ -12,6 +12,7 @@ import { registerDriftTools } from './drift-tools.js';
 import { registerCapacityTools } from './capacity-tools.js';
 import { registerAdminTools } from './admin/index.js';
 import { registerFive9Tools } from './five9-tools.js';
+import { registerMemoryTools } from './memory-tools.js';
 
 export function registerAllTools(server) {
   // LP data tools (16)
@@ -53,4 +54,9 @@ export function registerAllTools(server) {
   //   (all read-only; writes execute only via the approve_action gate —
   //   see src/five9/admin-writes.js)
   registerFive9Tools(server);
+  // Project-memory tools (3) — priority #8 (2026-09-06)
+  //   memory_context (session-start pack), memory_search (hybrid, gated by
+  //   MEMORY_VECTOR_MODE), memory_checkpoint (confirm-gated write in the v4
+  //   skill shape). claude_* tables only; never the customer request path.
+  registerMemoryTools(server);
 }
