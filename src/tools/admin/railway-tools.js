@@ -45,6 +45,20 @@ export function registerRailwayTools(server) {
         }
       `, { serviceId: sid });
 
+      // Railway returns service: null for an unknown service, or one the
+      // RAILWAY_API_TOKEN cannot see. JSON.stringify(undefined) yields
+      // undefined, which is not a valid MCP text block and surfaces as a
+      // bare "Failed" with no message — so say what actually happened.
+      if (!data?.service) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            error: 'service_not_found',
+            service_id: sid,
+            message: 'Railway returned no service for this ID. Check the service_id, or that RAILWAY_API_TOKEN is scoped to the project that owns it.',
+          }, null, 2) }],
+        };
+      }
+
       return {
         content: [{ type: 'text', text: JSON.stringify(data.service, null, 2) }],
       };
@@ -76,7 +90,7 @@ export function registerRailwayTools(server) {
             }
           }
         `, { serviceId: sid });
-        deployId = svc.service?.deployments?.edges?.[0]?.node?.id;
+        deployId = svc?.service?.deployments?.edges?.[0]?.node?.id;
         if (!deployId) {
           return { content: [{ type: 'text', text: 'No deployments found.' }] };
         }
@@ -93,7 +107,7 @@ export function registerRailwayTools(server) {
         }
       `, { deploymentId: deployId, limit });
 
-      let logs = data.deploymentLogs || [];
+      let logs = data?.deploymentLogs || [];
       if (filter) {
         const f = filter.toLowerCase();
         logs = logs.filter(l => l.message?.toLowerCase().includes(f));
@@ -126,7 +140,7 @@ export function registerRailwayTools(server) {
       `, { projectId, environmentId, serviceId: sid });
 
       // data.variables is a JSON object like { KEY: "value", ... }
-      const rawVars = data.variables || {};
+      const rawVars = data?.variables || {};
       const vars = Object.entries(rawVars).map(([name, value]) => ({
         name,
         is_set: value !== null && value !== undefined && value !== '',
