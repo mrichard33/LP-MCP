@@ -6,7 +6,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   STALE_SQL, WORKFLOW_REF_SQL, shouldRun, runMemoryNightly,
-  DIGEST_WAITING_SQL, DIGEST_TOP_SQL, DIGEST_WEEK_SQL, DIGEST_STALE_SQL,
+  DIGEST_WAITING_SQL, DIGEST_TOP_SQL, DIGEST_WEEK_SQL, DIGEST_STALE_SQL, DIGEST_MENTION_SQL,
   weekdayET, shouldSendDigest, formatDigest, runWeeklyDigest, registerMemoryNightlyRoutes,
 } from '../src/jobs/memory-nightly.js';
 
@@ -136,6 +136,15 @@ test('digest message has the count line, top-5 lines and the weekly summary; no 
   const shadow = formatDigest({ waiting: 1, top: [], week: [{ mode: 'shadow', rule: 'A', affected: 5 }], stale: 0, mode: 'shadow' });
   assert.match(shadow, /^📋 memory weekly — 1 item waiting on Mark/);
   assert.match(shadow, /Also \(shadow, would\): 5 expired/);
+
+  // "Likely done — confirm": PR merged but only mentioned in passing (D:pr_mentioned). Listed, never closed.
+  const withMentions = formatDigest({ waiting: 0, top: [], week: [], stale: 0, mode: 'live',
+    mentions: [{ id: 647, description: '56 rows are NOT rolled back by PR #625', session_date: '2026-08-06' }], mention_total: 3 });
+  const ml = withMentions.split('\n');
+  assert.equal(ml[1], 'Likely done — confirm (PR merged, mentioned in passing): 3');
+  assert.equal(ml[2], '• [#647] 56 rows are NOT rolled back by PR #625  (2026-08-06)');
+  assert.match(ml[3], /^Also:/);
+  assert.doesNotMatch(msg, /Likely done/, 'section omitted when there are none');
 });
 
 test('runWeeklyDigest: skips off-day, posts on Monday via the injected sender, logs a DIGEST row; dry_run previews only', async () => {
@@ -146,6 +155,7 @@ test('runWeeklyDigest: skips off-day, posts on Monday via the injected sender, l
     if (s === DIGEST_TOP_SQL) return [{ id: 1, description: 'A', session_date: '2026-06-01' }, { id: 2, description: 'B', session_date: '2026-07-01' }];
     if (s === DIGEST_WEEK_SQL) return [{ mode: 'live', rule: 'A', affected: 4 }];
     if (s === DIGEST_STALE_SQL) return [{ stale: 7 }];
+    if (s === DIGEST_MENTION_SQL) return [{ id: 647, description: 'NOT rolled back by PR #625', session_date: '2026-08-06', total: 1 }];
     return { status: 'ok' };
   };
   const deps = { runSQL, postGroupMe: async (t) => { posts.push(t); return true; }, env: {} };
@@ -155,7 +165,8 @@ test('runWeeklyDigest: skips off-day, posts on Monday via the injected sender, l
   const on = await runWeeklyDigest({ now: MONDAY, mode: 'live', deps });
   assert.equal(on.due, true); assert.equal(on.sent, true); assert.equal(on.waiting, 2);
   assert.equal(posts.length, 1);
-  assert.equal(posts[0], '📋 memory weekly — 2 items waiting on Mark (oldest: 90 days)\n1. [#1] A  (2026-06-01)\n2. [#2] B  (2026-07-01)\nAlso: 4 expired / 0 duplicates superseded / 0 done by evidence this week · 7 open items flagged stale');
+  assert.equal(posts[0], '📋 memory weekly — 2 items waiting on Mark (oldest: 90 days)\n1. [#1] A  (2026-06-01)\n2. [#2] B  (2026-07-01)\nLikely done — confirm (PR merged, mentioned in passing): 1\n• [#647] NOT rolled back by PR #625  (2026-08-06)\nAlso: 4 expired / 0 duplicates superseded / 0 done by evidence this week · 7 open items flagged stale');
+  assert.equal(on.likely_done, 1);
   const log = calls.find((s) => /INSERT INTO claude_memory_autoclose_log/.test(s));
   assert.match(log, /VALUES \('live', 'DIGEST', 2, NULL, 'sent'\)/);
 
