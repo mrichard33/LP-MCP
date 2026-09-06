@@ -141,7 +141,11 @@ export function registerSyncTools(server) {
               // failures only, no container kills.
               failed_syncs: totalFailed,
             },
-            sync_status_note: 'failed = real record-level failures only. interrupted = the container was killed mid-sweep (Railway deploy/restart) — infrastructure, not a data defect. Alert on failed; read interrupted as deploy churn.',
+            sync_status_note: 'failed = real record-level failures, or a sweep that died outright (its entities are marked failed even when the other sweep succeeded — a half-dead run must not read as completed). interrupted = the container was killed mid-sweep (Railway deploy/restart) — infrastructure, not a data defect. Alert on failed; read interrupted as deploy churn.',
+            // Same job as sync_status_note, for the paging columns: say what an
+            // empty value means, so a reader does not have to guess whether a
+            // blank is a fact about the entity or a gap in the instrumentation.
+            paging_mode_note: "normal | deep = the paging branch the sweep actually took. n/a = this entity does not page — milestones arrive embedded in the job payloads the jobs sweep already paged for, so sweep_api_calls and rows_scanned are NULL beside it because there is no independent measurement to report. NULL paging_mode means uninstrumented (full syncs write no telemetry at all), not inapplicable.",
             unmapped_sources: unmappedCount || 0,
             unmapped_sources_note: 'Raw review-queue rows. For the real gap against LP\'s source catalog, run get_source_catalog_health.',
             unfired_milestone_triggers: unfiredMilestones || 0,
