@@ -104,6 +104,7 @@ export function registerMemoryTools(server) {
       session_id: z.number().int().optional().describe('existing session to update (refresh / mid-session). Omit for a new session.'),
       session: z.object({
         title: z.string().optional(), date: z.string().optional().describe('YYYY-MM-DD, default today ET'),
+        date_confidence: z.enum(['exact', 'write_date']).optional().describe("default exact. Use write_date when date is only the day this checkpoint is written (retro sweeps) — the session-start pack then demotes it"),
         phase_focus: z.string().optional(), summary: z.string().optional().describe('the narrative'),
         search_keys: z.array(z.string()).optional().describe('5–8 short strings that literally appeared in the conversation'),
         surface: z.enum(['chat', 'cowork', 'code', 'n8n']).optional(),
