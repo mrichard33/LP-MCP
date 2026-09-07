@@ -13,6 +13,39 @@
  * Output: Structured assessment written to lead_intelligence table
  *         + ai.analysis_completed event emitted for Decision Engine.
  *
+ * v1.12 (2026-09-07) — Customer-relationship gate (Shawn Friend incident).
+ *   PROBLEM: contact 19zXvwBKo8RISXbafGHC (LP lead 573369, rec type inq,
+ *   disposition CXL, no sale) replied angry about a cancelled appointment
+ *   and event 3460420 came back escalate_to_rep /
+ *   existing_customer_service. Two causes: (1) buildContextSummary only
+ *   said anything about customer status when closed_won was true —
+ *   silence read as "customer"; (2) the category definition listed
+ *   "scheduling complaints" as a service marker. Downstream that label
+ *   tagged esc:existing-customer, tripped the CS gate on the hot-call
+ *   path, and produced 24 actions and zero dials.
+ *
+ *   A person-level test is not enough: 92 returning customers in the last
+ *   180 days carry CXL-with-appointment on a NEW sales lead. Those are
+ *   sales conversations. So context-builder v2.9 now resolves
+ *   lp.customer_relationship ('prospect' | 'returning_customer' |
+ *   'service_customer') from the whole prospect history, and this file:
+ *     - renders CUSTOMER RELATIONSHIP into the prompt on EVERY analysis,
+ *       stated affirmatively both ways;
+ *     - tightens the existing_customer_service definition to require a
+ *       completed sale and excludes sales-appointment complaints;
+ *     - adds applyCustomerRelationshipGate() — deterministic, post-LLM,
+ *       same pattern as applyFastTrackEvidenceGate. Nulls
+ *       existing_customer_service on a prospect always, and on a returning
+ *       customer unless the message carries service/warranty language
+ *       (SERVICE_ISSUE_REGEX). Never touches a service_customer.
+ *     - emits customer_relationship / has_prior_sale / open_sales_lead on
+ *       ai.analysis_completed so agent_rules can gate on them.
+ *   recommended_action is deliberately left alone by the gate. Routing
+ *   the (now correctly un-categorized) escalation to the dialer is done
+ *   in HOT_CALL_IMMEDIATE (#324) via
+ *   sql/seeds/2026-09-07_rule324_escalate_to_rep_dialer_push.sql, which
+ *   gates on the customer_relationship field emitted below.
+ *
  * v1.9 (2026-05-07) — priority_lane sort in analyzePendingReplies.
  *   PROBLEM: analyzePendingReplies fetched pending ghl.reply_received
  *   events ordered by `priority` (text). Postgres sorts text alphabetically
@@ -260,7 +293,7 @@ const CONVERSATION_MESSAGE_SLICE_CHARS = 1000;
 // recommended_action exactly as before. The proposal envelope is
 // ADDITIVE for one release cycle, then recommended_action can be
 // retired in Phase 5.
-const CLASSIFIER_VERSION = 'message-analyzer-v1.11';
+const CLASSIFIER_VERSION = 'message-analyzer-v1.12';
 
 const ACTION_TO_STATE_MAP = {
   // Action string                     → state code (or null = no proposal)
@@ -502,8 +535,18 @@ requested_fulfillment captures the lead's OWN stated ask this turn — it outran
 ESCALATION CATEGORIES — escalation_category (with escalate_to_rep)
 ═══════════════════════════════════════════════════════════════════
 
-When recommended_action is "escalate_to_rep" (or wrong_person for identity cases), set escalation_category to the matching route:
-• "existing_customer_service" — existing customer with install problems, warranty claims, or scheduling complaints. No selling.
+When recommended_action is "escalate_to_rep" (or wrong_person for identity cases), set escalation_category to the matching route.
+
+READ CUSTOMER RELATIONSHIP FIRST. The LEAD CONTEXT states it on every analysis, in one of three forms:
+• PROSPECT — no completed sale on record. NEVER existing_customer_service.
+• RETURNING CUSTOMER — bought before AND has a NEW open sales lead. Default to SALES; use existing_customer_service only if the message is plainly about the work already installed (warranty, leak, repair, service call).
+• EXISTING CUSTOMER — bought before, no open sales lead. Service, warranty, install, and billing matters route to existing_customer_service.
+A deterministic gate enforces the PROSPECT rule after you answer; do not rely on it — classify correctly.
+• "existing_customer_service" — ONLY for a person whose CUSTOMER RELATIONSHIP (see the LEAD CONTEXT) is EXISTING CUSTOMER or RETURNING CUSTOMER, and ONLY when the message is about work already done: install problems, warranty claims, service on installed product, or scheduling for a SERVICE visit. No selling.
+  NEGATIVE EXAMPLES (leave escalation_category null — these are SALES escalations):
+  - CUSTOMER RELATIONSHIP is PROSPECT. A prospect cannot be existing_customer_service no matter what they say. A prospect angry about a cancelled, missed, rescheduled, or no-show SALES appointment is a sales escalation.
+  - CUSTOMER RELATIONSHIP is RETURNING CUSTOMER and the complaint is about the NEW project's estimate or appointment (cancelled, missed, rescheduled, "nobody called me back"). That is a sales conversation on the new lead, not service on the old one.
+  - Any "scheduling complaint" about a sales estimate or in-home appointment, regardless of tone.
 • "legal_media" — legal threats, injury, damage claims, or press/media inquiries. Acknowledge only.
 • "identity_ambiguous" — wrong number, deceased contact, or a minor.
   NEGATIVE EXAMPLE: a signature whose name or email differs from the record
@@ -773,6 +816,23 @@ function buildContextSummary(context) {
     parts.push(`(Full LP lead record not available in Supabase — limited context)`);
   }
 
+  // v1.12: customer relationship — stated on EVERY analysis, both ways.
+  // Silence here is what the Shawn Friend event read as "existing customer."
+  {
+    const rel = context.lp?.customer_relationship || 'prospect';
+    const priorDate = context.lp?.prior_sale_date
+      ? ` (sale recorded ${new Date(context.lp.prior_sale_date).toLocaleDateString()})`
+      : '';
+    const latestDisp = context.lp?.latest_lead_disposition || context.lp?.disposition || 'none';
+    if (rel === 'returning_customer') {
+      parts.push(`\nCUSTOMER RELATIONSHIP: RETURNING CUSTOMER — bought before${priorDate} AND has a NEW open sales lead now (latest LP disposition: ${latestDisp}). Treat this conversation as SALES unless the message is about warranty, install, or service on the work already done.`);
+    } else if (rel === 'service_customer') {
+      parts.push(`\nCUSTOMER RELATIONSHIP: EXISTING CUSTOMER${priorDate} — no open sales lead. Service, warranty, install, and billing matters route to existing_customer_service.`);
+    } else {
+      parts.push(`\nCUSTOMER RELATIONSHIP: PROSPECT — no completed sale on record. This person is NOT an existing customer. A complaint about a sales appointment (cancelled, missed, rescheduled, no-show) is a SALES escalation, never existing_customer_service.`);
+    }
+  }
+
   if (context.pipeline) {
     parts.push(`\nPIPELINE:`);
     parts.push(`Days in Current Stage: ${context.pipeline.days_in_stage}`);
@@ -962,6 +1022,72 @@ export function applyFastTrackEvidenceGate(analysis, messageText, context, conta
     analysis.recommended_action = 'escalate_to_rep';
     analysis.fast_track_eligible = false;
     analysis.recommended_story_arc = null;
+  }
+
+  return analysis;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CUSTOMER-RELATIONSHIP GATE (2026-09-07, Shawn Friend incident)
+// ═══════════════════════════════════════════════════════════════════
+// existing_customer_service is a claim about the PERSON (they bought) and the
+// CONVERSATION (it is about the work already done). The prompt now states
+// customer_relationship on every turn; this gate makes the two hard rules
+// deterministic, post-LLM, same shape as applyFastTrackEvidenceGate:
+//   prospect           → the category is impossible. Null it.
+//   returning_customer → sales by default; the category stands ONLY if the
+//                        message carries service/warranty language.
+//   service_customer   → untouched.
+// recommended_action is NOT changed here — an angry prospect is still a
+// human escalation. HOT_CALL_IMMEDIATE (#324) pushes escalate_to_rep with a
+// null escalation_category to the Five9 Callback Request list, gated on the
+// customer_relationship field emitted below (see the 2026-09-07 seed).
+
+// Language about installed product / service on work already done.
+// Word-bounded on every alternative. Exported for unit tests.
+export const SERVICE_ISSUE_REGEX = new RegExp(
+  '\\b(?:warranty|leak(?:s|ing|ed)?|repair(?:s|ed)?|broken|crack(?:s|ed)?' +
+  '|fog(?:gy|ging|ged)?|condensation|seal(?:s|ed)?\\s+(?:fail\\w*|broke\\w*|gone)' +
+  '|install(?:ed|ation)?\\s+(?:problem|issue|defect|wrong|crooked|damage[ds]?|team)' +
+  '|service\\s+(?:call|request|tech(?:nician)?|department|visit|appointment)' +
+  '|screen\\s+(?:torn|ripped|missing)|(?:doesn\'?t|won\'?t|don\'?t)\\s+(?:close|lock|open|seal|latch)' +
+  '|punch\\s*list|final\\s+inspection|permit\\s+(?:closed|final|inspection)' +
+  '|balance\\s+due|final\\s+payment|since\\s+(?:the\\s+)?install)\\b',
+  'i'
+);
+
+/**
+ * Apply the customer-relationship gate to a validated analysis. Mutates and
+ * returns `analysis`. Pure apart from logs.
+ *
+ * @param {object} analysis     output of validateAnalysis()
+ * @param {string} messageText  the inbound
+ * @param {object} context      buildLeadContext() output (lp.customer_relationship used)
+ * @param {string} [contactId]  for the log line only
+ */
+export function applyCustomerRelationshipGate(analysis, messageText, context, contactId = '?') {
+  if (!analysis) return analysis;
+  if (analysis.escalation_category !== 'existing_customer_service') return analysis;
+
+  const rel = context?.lp?.customer_relationship || 'prospect';
+  const text = String(messageText || '');
+
+  if (rel === 'prospect') {
+    console.log(
+      `[MessageAnalyzer] Customer-relationship gate for ${contactId}: ` +
+      `existing_customer_service cleared — relationship=prospect (no sale on record), action=${analysis.recommended_action}`
+    );
+    analysis.escalation_category = null;
+    return analysis;
+  }
+
+  if (rel === 'returning_customer' && !SERVICE_ISSUE_REGEX.test(text)) {
+    console.log(
+      `[MessageAnalyzer] Customer-relationship gate for ${contactId}: ` +
+      `existing_customer_service cleared — relationship=returning_customer with open sales lead and no service language, action=${analysis.recommended_action}`
+    );
+    analysis.escalation_category = null;
+    return analysis;
   }
 
   return analysis;
@@ -1178,6 +1304,11 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
     // before the booking-flow override (which reads fast_track_eligible).
     applyFastTrackEvidenceGate(analysis, messageText, context, ghlContactId);
 
+    // 2026-09-07 — customer-relationship gate. Runs after the fast-track gate
+    // (which may coerce toward escalate_to_rep) and before the booking-flow
+    // override, so a cleared category can never re-enter through either.
+    applyCustomerRelationshipGate(analysis, messageText, context, ghlContactId);
+
     // 2026-06-10 — S1.3 suppress-gate. In the S1.3 revival cohort, suppression
     // decisions belong to the reply-lane rules, not the LLM: dispatch row 1 now
     // carries the P1-lost contract, so a stray `suppress` on a neutral message
@@ -1298,6 +1429,12 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
         // minutes late right now." Both were previously appointment_active=true.
         appointment_phase: context.lp?.appointment_phase || null,
         appointment_minutes_delta: context.lp?.appointment_minutes_delta ?? null,
+        // 2026-09-07 (v1.12): customer relationship for the rules layer.
+        // Strings, to match payload_field_eq's string comparison (same
+        // convention as appointment_active above).
+        customer_relationship: context.lp?.customer_relationship || 'prospect',
+        has_prior_sale: context.lp?.has_prior_sale === true ? 'true' : 'false',
+        open_sales_lead: context.lp?.open_sales_lead === true ? 'true' : 'false',
       },
       priority: analysis.fast_track_eligible ? 'critical' :
                 analysis.engagement_quality === 'dnc' ? 'critical' :

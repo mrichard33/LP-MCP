@@ -1,6 +1,33 @@
 /**
  * Context Builder — src/context-builder.js
  *
+ * v2.9 — 2026-09-07. CUSTOMER RELATIONSHIP for the message analyzer
+ *   (Shawn Friend incident, contact 19zXvwBKo8RISXbafGHC, event 3460420).
+ *
+ *   PROBLEM: the analyzer prompt only stated customer status when
+ *   lp.closed_won was true. A prospect and a customer rendered
+ *   identically, so a prospect's scheduling complaint was classified
+ *   existing_customer_service. And because this builder resolves ONE
+ *   lp_leads row per contact, a returning customer (bought before, new
+ *   sales lead open now — 92 CXL-with-appointment cases in the last 180
+ *   days) could not be told apart from a warranty caller.
+ *
+ *   FIX: fetchLPProspectHistory() reads every lp_leads row on the
+ *   prospect (mirrors ghl-field-sync's everClosedWon aggregation).
+ *   deriveCustomerRelationship() folds that history + isCustomerP2()
+ *   tag/pipeline signals into three fields on context.lp:
+ *     has_prior_sale        — any sale on record, ever (person-level)
+ *     open_sales_lead       — the LATEST lead is a sales-side record
+ *                             (not closed_won, not Sale/SW/PM/P2)
+ *     customer_relationship — 'prospect' | 'returning_customer' |
+ *                             'service_customer'
+ *   Customer status comes from the whole history; the conversation's
+ *   nature comes from the latest lead. Reuses isCustomerP2 rather than
+ *   adding a fourth definition of "customer" to the codebase.
+ *
+ *   PAIRS WITH: message-analyzer.js v1.12 (prompt block + gate).
+ *   No schema changes, no env vars, no rule changes.
+ *
  * v2.7 — 2026-05-11. ADD NURTURE HISTORY BLOCK for the outbound nurture
  *   message generator (src/nurture/*).
  *
@@ -74,6 +101,9 @@ import supabase from './supabase.js';
 import { appointmentDelta, appointmentPhase, formatDateHuman, formatTimeHuman, APPOINTMENT_TZ } from './appointment-dates.js';
 import { stripQuotedEmail } from './email-thread.js';
 import { channelOfMessage } from './agentic/reply-sender.js';
+// v2.9: the canonical five-signal "is this person a customer" test. Reused
+// here so customer_relationship never disagrees with the suppression shapes.
+import { isCustomerP2 } from './agentic/lead-state/signals/context-reader.js';
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || 'SsBG7j5KQAIP1SFP2Sca';
@@ -133,6 +163,86 @@ const LP_ACTIVE_DISPOSITIONS = new Set([
 // Wednesday" incident). Effective-appointment derivation lives where
 // the lp context block is assembled.
 const LP_CANCELLED_APPT_DISPOSITIONS = new Set(['CXL']);
+
+// v2.9: dispositions that mark an lp_leads row as POST-SALE / service-side.
+// Any other non-closed_won row is a sales-side record (Data, Set, Cnf, Issue,
+// Verif, 1Leg, CXL, CCC, No Demo, NoHome, OPPFDN, Reset …). Upper-cased on
+// compare. Sale/SW are closed_won in sync-dispositions.js; PM/P2 are the
+// post-sale production codes.
+export const SERVICE_SIDE_DISPOSITIONS = new Set(['SALE', 'SW', 'PM', 'P2']);
+
+function dispositionUpper(row) {
+  return String(row?.disposition_code || '').trim().toUpperCase();
+}
+
+function isServiceSideRow(row) {
+  return row?.closed_won === true || SERVICE_SIDE_DISPOSITIONS.has(dispositionUpper(row));
+}
+
+/**
+ * v2.9 — Resolve the customer relationship from the prospect's FULL lead
+ * history plus the tag/pipeline signals isCustomerP2 already trusts.
+ *
+ * Two independent questions, answered from two different places:
+ *   has_prior_sale   — PERSON-level. Any sale-side row in history, or any
+ *                      isCustomerP2 signal (P2 pipeline, p2-stage:*,
+ *                      lp-milestone-completion, won opp + demo verified).
+ *   open_sales_lead  — CONVERSATION-level. Is the LATEST lead (by
+ *                      created_at_lp) a sales-side record? A returning
+ *                      customer with a new inquiry has a NEWER sales row than
+ *                      their Sale row; a warranty caller's latest row IS the
+ *                      Sale row.
+ *
+ *   prospect           — no prior sale. existing_customer_service is impossible.
+ *   returning_customer — prior sale AND open sales lead. This is a SALES
+ *                        conversation unless the message is about the work
+ *                        already done.
+ *   service_customer   — prior sale, no open sales lead. Genuine service.
+ *
+ * Pure. Exported for scripts/test-customer-relationship-gate.js.
+ *
+ * @param {object}   args
+ * @param {object[]} args.history  lp_leads rows for the prospect (any order)
+ * @param {object}   args.lpLead   the single resolved row (fallback when history is empty)
+ * @param {string[]} args.tags     GHL tags
+ * @param {object}   args.pipeline { pipeline_id, status } shim for isCustomerP2
+ */
+export function deriveCustomerRelationship({ history = [], lpLead = null, tags = [], pipeline = null } = {}) {
+  const rows = (Array.isArray(history) && history.length) ? history : (lpLead ? [lpLead] : []);
+  const saleRows = rows.filter(isServiceSideRow);
+
+  const priorSaleFromLp = saleRows.length > 0;
+  const priorSaleFromSignals = isCustomerP2({
+    lead: { current_tags: Array.isArray(tags) ? tags : [] },
+    pipeline: pipeline || {},
+    lp: { closed_won: lpLead?.closed_won === true },
+  });
+  const has_prior_sale = priorSaleFromLp || priorSaleFromSignals;
+
+  const latest = [...rows]
+    .sort((a, b) => String(b?.created_at_lp || '').localeCompare(String(a?.created_at_lp || '')))[0] || null;
+  const open_sales_lead = !!latest && !isServiceSideRow(latest);
+
+  const prior_sale_date = saleRows
+    .map(r => r?.created_at_lp)
+    .filter(Boolean)
+    .sort()
+    .slice(-1)[0] || null;
+
+  const customer_relationship = !has_prior_sale
+    ? 'prospect'
+    : (open_sales_lead ? 'returning_customer' : 'service_customer');
+
+  return {
+    has_prior_sale,
+    open_sales_lead,
+    customer_relationship,
+    prior_sale_date,
+    latest_lead_created_at_lp: latest?.created_at_lp || null,
+    latest_lead_disposition: latest?.disposition_code || null,
+    lead_history_count: rows.length,
+  };
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // IN-MEMORY CACHE
@@ -446,6 +556,30 @@ async function fetchLPLeadByLdsId(lpLeadId) {
   } catch (err) {
     console.error(`[ContextBuilder] lp_leads lp_lead_id lookup error:`, err.message);
     return null;
+  }
+}
+
+// v2.9 — every lp_leads row on the prospect, newest first. This is the read
+// the single-row resolvers above cannot make: "has this person EVER bought,
+// and is the newest thing on record a fresh sales lead?" Mirrors the
+// everClosedWon aggregation in ghl-field-sync.js. Fail-soft → [].
+async function fetchLPProspectHistory(prospectId, limit = 25) {
+  if (!prospectId) return [];
+  try {
+    const { data, error } = await withTimeout(
+      supabase
+        .from('lp_leads')
+        .select('lp_lead_id, closed_won, disposition_code, created_at_lp, appointment_set, appointment_date, demo_completed, job_value')
+        .eq('lp_prospect_id', String(prospectId))
+        .order('created_at_lp', { ascending: false })
+        .limit(limit),
+      'fetchLPProspectHistory',
+    );
+    if (error || !data) return [];
+    return data;
+  } catch (err) {
+    console.warn(`[ContextBuilder] fetchLPProspectHistory timed out/failed for prospect ${prospectId}: ${err.message}`);
+    return [];
   }
 }
 
@@ -775,7 +909,7 @@ export async function buildLeadContext(ghlContactId, options = {}) {
   }
 
   const lpLeadId = lpLead?.lp_lead_id || null;
-  const [conversation, lpNotes, lpCalls, pipelineStageInfo, nurtureHistory, openObjectionState, ghlNotes] = await Promise.all([
+  const [conversation, lpNotes, lpCalls, pipelineStageInfo, nurtureHistory, openObjectionState, ghlNotes, lpProspectHistory] = await Promise.all([
     (includeConversation && ghlContact) ? fetchConversation(ghlContactId, 10) : [],
     fetchLPNotes(lpLeadId),
     fetchLPCalls(lpLeadId),
@@ -783,6 +917,8 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     fetchNurtureHistory(ghlContactId, workflow_code),
     fetchOpenObjectionState(ghlContactId),
     fetchGHLNotes(ghlContactId),
+    // v2.9: whole-prospect history for customer_relationship.
+    fetchLPProspectHistory(lpLead?.lp_prospect_id || cfProspectId || null),
   ]);
 
   const tags = ghlContact?.tags || [];
@@ -806,6 +942,16 @@ export async function buildLeadContext(ghlContactId, options = {}) {
     (!!lpLead?.appointment_set && LP_CANCELLED_APPT_DISPOSITIONS.has(lpLead?.disposition_code))
     || tags.includes('appt-cancelled')
   );
+
+  // v2.9: customer relationship — person-level (has_prior_sale) and
+  // conversation-level (open_sales_lead) resolved separately. See
+  // deriveCustomerRelationship for the four quadrants.
+  const relationship = deriveCustomerRelationship({
+    history: lpProspectHistory,
+    lpLead,
+    tags,
+    pipeline: { pipeline_id: opportunity?.pipelineId || null, status: opportunity?.status || null },
+  });
 
   const context = {
     now: {
@@ -923,6 +1069,16 @@ export async function buildLeadContext(ghlContactId, options = {}) {
       call_count: lpLead?.call_count || 0,
       last_call_date: lpLead?.last_call_date || null,
       lost_reason: ghlCustomFieldLostReason || null,
+      // v2.9: customer relationship. has_prior_sale is PERSON-level (whole
+      // prospect history + isCustomerP2 signals); open_sales_lead is
+      // CONVERSATION-level (the newest lead is a sales-side record).
+      has_prior_sale: relationship.has_prior_sale,
+      open_sales_lead: relationship.open_sales_lead,
+      customer_relationship: relationship.customer_relationship,
+      prior_sale_date: relationship.prior_sale_date,
+      latest_lead_created_at_lp: relationship.latest_lead_created_at_lp,
+      latest_lead_disposition: relationship.latest_lead_disposition,
+      lead_history_count: relationship.lead_history_count,
       notes: lpNotes,
       recent_calls: lpCalls,
       synced_at: lpLead?.synced_at || null,
@@ -971,7 +1127,7 @@ export async function buildLeadContext(ghlContactId, options = {}) {
 
     meta: {
       context_built_at: new Date().toISOString(),
-      context_builder_version: '2.7',
+      context_builder_version: '2.9',
       cache_ttl_ms: CONTEXT_CACHE_TTL_MS,
       data_sources: {
         ghl_contact: !!ghlContact,
@@ -991,6 +1147,9 @@ export async function buildLeadContext(ghlContactId, options = {}) {
         // confirm the field was actually populated on a given test contact.
         estimate_total_present: estimateTotal !== null,
         window_count_present: windowCount !== null,
+        // v2.9
+        lp_prospect_history_rows: lpProspectHistory.length,
+        customer_relationship: relationship.customer_relationship,
       },
       warnings: [
         ...(staleness.isStaleActive ? [`lp_data_stale_active:${staleness.ageMinutes}min`] : []),
