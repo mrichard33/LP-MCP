@@ -38,6 +38,7 @@ import { registerIntentScorerRoutes } from './intent-scorer.js';
 import { registerKbIngestionRoutes } from './knowledge/ingest-embeddings.js';
 import { registerMemoryRoutes } from './memory/memory-routes.js';
 import { registerMemoryNightlyRoutes, startMemoryNightlyScheduler } from './jobs/memory-nightly.js';
+import { registerAdminMemoryRoutes } from './routes/admin-memory.js';
 import { checkMemorySchema } from './memory/memory-migrations.js';
 import { startTier1EmbedSweep } from './knowledge/tier1-semantic.js';
 import { startExemplarSweep } from './knowledge/exemplars.js';
@@ -1844,6 +1845,8 @@ registerKbIngestionRoutes(app);
 // Operator surface only; nothing in the request path calls it. Authenticated.
 registerMemoryRoutes(app, authenticate);
 registerMemoryNightlyRoutes(app, authenticate);
+// sql/098: n8n event door (pending / issue, never decision) + manual validation run.
+registerAdminMemoryRoutes(app, authenticate);
 
 // ─── Pause-Workflow Fizzle Sweep ─────────────────────────────────
 registerPauseWorkflowSweepRoutes(app);

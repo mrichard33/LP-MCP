@@ -12,15 +12,33 @@
  *                      status and re-embed picks them up.
  *   3. re-embed      — memory-embed.js planKind/executePlan for all four kinds;
  *                      content-hash incremental, so a quiet day writes 0 rows.
- *   4. workflow ref  — claude_workflow_ref (sql/092) refreshed from the LP-side
+ *   4. validation    — memory-validate.js (sql/098): unlinked sessions > 7 d,
+ *                      write_date rows, live rows in a batch pattern, active
+ *                      decisions with no area, embedding coverage, orphan
+ *                      embeddings, metadata drift, open conflicts, C1
+ *                      provenance mismatches, flagged sessions → one row each
+ *                      in claude_memory_validation_log. Repairs (live only):
+ *                      embedding metadata synced from the source rows, orphan
+ *                      embeddings marked stale. Runs AFTER re-embed so
+ *                      tonight's new embeddings get their metadata too.
+ *   5. conflict scan — memory-conflicts.js: active decisions (cosine ≥ 0.85)
+ *                      and open issues (≥ 0.90) in the same area, embedded in
+ *                      the last 24 h, filed in claude_memory_conflicts for a
+ *                      ruling. Nothing closed here.
+ *   6. drafts        — memory-validate.js runDraftCheckpoints: ledger rows
+ *                      deferred with no session get a draft session
+ *                      (origin 'nightly', summary + keys only).
+ *   7. workflow ref  — claude_workflow_ref (sql/092) refreshed from the LP-side
  *                      workflow_canonical_map mirror (itself synced from the HL
  *                      workflow_registry every 15 min). No HL dependency here.
- *   5. snapshot      — counts from claude_memory_context(NULL) logged for the
+ *   8. snapshot      — counts from claude_memory_context(NULL) logged for the
  *                      record.
- *   6. weekly digest — rule E: on the run whose ET weekday is
+ *   9. weekly digest — rule E: on the run whose ET weekday is
  *                      MEMORY_DIGEST_WEEKDAY (Monday), one GroupMe message
  *                      listing what is waiting on Mark (the protected
- *                      item_types) and what auto-close did this week.
+ *                      item_types), what auto-close did this week, open
+ *                      conflicts awaiting a ruling, sessions unlinked after
+ *                      7 days, and this week's validation failures.
  *
  * Every SQL step runs through withRetry (issue #1627): three attempts with
  * 250 ms / 1 s / 3 s backoff on transient errors. A step that still fails is
@@ -33,17 +51,22 @@
  * SCHEDULE: daily at MEMORY_NIGHTLY_HOUR_ET (default 3) — same 5-minute
  * hour-check pattern as market-assignment-daily.js.
  * ROUTES:   POST /admin/memory/nightly { dry_run? }   GET /admin/memory/nightly/status
- *           dry_run:true plans the embed, counts the auto-close rules and
- *           previews the digest — writes nothing, sends nothing.
+ *           dry_run:true plans the embed, counts the auto-close rules, runs the
+ *           validation / conflict / draft SELECTs and previews the digest —
+ *           writes nothing, sends nothing. (POST /admin/memory/validate
+ *           {dry_run:true} is the run that DOES write validation-log rows.)
  * ENV:      MEMORY_NIGHTLY_ENABLED (default true), MEMORY_NIGHTLY_HOUR_ET (default 3),
  *           MEMORY_AUTOCLOSE_MODE (default off), MEMORY_DIGEST_ENABLED (default true),
- *           MEMORY_DIGEST_WEEKDAY (default Monday)
+ *           MEMORY_DIGEST_WEEKDAY (default Monday), MEMORY_CONFLICT_THRESHOLD (default 0.85),
+ *           MEMORY_ISSUE_DUPLICATE_THRESHOLD (default 0.90)
  */
 import supabase from '../supabase.js';
 import { runSQL } from '../admin/supabase-admin.js';
 import { SOURCES } from '../memory/memory-text.js';
 import { withRetry } from '../memory/with-retry.js';
 import { runAutoclose, PROTECTED_LIST_SQL, logSql } from './memory-autoclose.js';
+import { runMemoryValidation, runDraftCheckpoints } from './memory-validate.js';
+import { runConflictScan } from './memory-conflicts.js';
 
 const TIMEZONE = 'America/New_York';
 const STALE_DAYS = 60;
@@ -97,6 +120,25 @@ GROUP BY mode, rule`;
 export const DIGEST_STALE_SQL = `
 SELECT count(*)::int AS stale FROM claude_pending_items WHERE status='open' AND stale`;
 
+// sql/098 sections: conflicts awaiting a ruling, sessions unlinked after 7 days,
+// validation checks that flagged rows this week (latest run per check).
+export const DIGEST_CONFLICTS_SQL = `
+SELECT id, kind, row_a, row_b, round(similarity::numeric, 2)::float8 AS similarity, count(*) OVER ()::int AS total
+FROM claude_memory_conflicts WHERE status='open'
+ORDER BY similarity DESC, id LIMIT 3`;
+
+export const DIGEST_UNLINKED_SQL = `
+SELECT count(*)::int AS unlinked,
+       count(*) FILTER (WHERE log_origin = 'nightly')::int AS drafts
+FROM claude_session_logs
+WHERE chat_url IS NULL AND coalesce(surface,'chat')='chat' AND created_at < now() - interval '7 days'`;
+
+export const DIGEST_VALIDATION_SQL = `
+SELECT DISTINCT ON (check_name) check_name, rows_flagged, ran_at::date::text AS ran_on
+FROM claude_memory_validation_log
+WHERE ran_at > now() - interval '7 days' AND mode = 'nightly' AND check_name NOT LIKE 'repair:%' AND coalesce(rows_flagged, 0) > 0
+ORDER BY check_name, ran_at DESC`;
+
 // "Likely done — confirm": open rows whose named PR is merged but only mentioned
 // in passing (rule D2 tags D:pr_mentioned and never closes them — Mark's ruling).
 export const DIGEST_MENTION_SQL = `
@@ -146,7 +188,8 @@ function digestConfig(env = process.env) {
  *   1. [#id] first 80 chars of description  (session_date)
  *   Also: A expired / B duplicates superseded / C done by evidence this week · S open items flagged stale
  */
-export function formatDigest({ waiting = 0, oldest_days = 0, top = [], week = [], stale = 0, mode = 'off', mentions = [], mention_total = 0 }) {
+export function formatDigest({ waiting = 0, oldest_days = 0, top = [], week = [], stale = 0, mode = 'off', mentions = [], mention_total = 0,
+  conflicts = [], conflict_total = 0, unlinked_7d = 0, drafts = 0, validation = [] }) {
   const lines = [`📋 memory weekly — ${waiting} item${waiting === 1 ? '' : 's'} waiting on Mark (oldest: ${oldest_days} days)`];
   top.slice(0, 5).forEach((r, i) => {
     lines.push(`${i + 1}. [#${r.id}] ${String(r.description || '').trim()}  (${r.session_date})`);
@@ -155,6 +198,18 @@ export function formatDigest({ waiting = 0, oldest_days = 0, top = [], week = []
   if (total > 0) {
     lines.push(`Likely done — confirm (PR merged, mentioned in passing): ${total}`);
     mentions.slice(0, 5).forEach((r) => lines.push(`• [#${r.id}] ${String(r.description || '').trim()}  (${r.session_date})`));
+  }
+  // sql/098 sections — each omitted when there is nothing to say.
+  const conflictCount = conflict_total || conflicts.length;
+  if (conflictCount > 0) {
+    lines.push(`Conflicts awaiting ruling: ${conflictCount}`);
+    conflicts.slice(0, 3).forEach((c) => lines.push(`• [conflict #${c.id}] ${c.kind} #${c.row_a} vs #${c.row_b}  (cosine ${Number(c.similarity).toFixed(2)})`));
+  }
+  if (unlinked_7d > 0 || drafts > 0) {
+    lines.push(`Unlinked after 7 days: ${unlinked_7d} session${unlinked_7d === 1 ? '' : 's'}${drafts > 0 ? ` · ${drafts} nightly draft${drafts === 1 ? '' : 's'} to confirm or drop` : ''}`);
+  }
+  if (validation.length) {
+    lines.push(`Validation this week: ${validation.map((v) => `${v.check_name}=${v.rows_flagged}`).join(' · ')}`);
   }
   const sum = (rows, rule) => rows.filter((w) => w.rule === rule).reduce((n, w) => n + (Number(w.affected) || 0), 0);
   const live = week.filter((w) => w.mode === 'live');
@@ -198,17 +253,27 @@ export async function runWeeklyDigest({ dry_run = false, mode = 'off', now = new
   if (!cfg.enabled || (!due && !dry_run)) return out;
   const sql = deps.runSQL;
   const rows = (r) => (Array.isArray(r) ? r : []);
-  const [waitingRows, top, week, staleRows, mentionRows] = await Promise.all([
+  const [waitingRows, top, week, staleRows, mentionRows, conflictRows, unlinkedRows, validationRows] = await Promise.all([
     sql(DIGEST_WAITING_SQL), sql(DIGEST_TOP_SQL), sql(DIGEST_WEEK_SQL), sql(DIGEST_STALE_SQL), sql(DIGEST_MENTION_SQL),
+    sql(DIGEST_CONFLICTS_SQL).catch((err) => { out.section_errors = [...(out.section_errors || []), `conflicts: ${err.message}`]; return []; }),
+    sql(DIGEST_UNLINKED_SQL).catch((err) => { out.section_errors = [...(out.section_errors || []), `unlinked: ${err.message}`]; return []; }),
+    sql(DIGEST_VALIDATION_SQL).catch((err) => { out.section_errors = [...(out.section_errors || []), `validation: ${err.message}`]; return []; }),
   ]);
   const waiting = rows(waitingRows)[0] || {};
   const mentions = rows(mentionRows);
+  const conflicts = rows(conflictRows);
+  const unlinked = rows(unlinkedRows)[0] || {};
   out.waiting = Number(waiting.waiting) || 0;
   out.likely_done = Number(mentions[0]?.total) || mentions.length;
+  out.open_conflicts = Number(conflicts[0]?.total) || conflicts.length;
+  out.unlinked_7d = Number(unlinked.unlinked) || 0;
   out.message = formatDigest({
     waiting: out.waiting, oldest_days: Number(waiting.oldest_days) || 0,
     top: rows(top), week: rows(week), stale: Number(rows(staleRows)[0]?.stale) || 0, mode,
     mentions, mention_total: out.likely_done,
+    conflicts, conflict_total: out.open_conflicts,
+    unlinked_7d: out.unlinked_7d, drafts: Number(unlinked.drafts) || 0,
+    validation: rows(validationRows),
   });
   if (dry_run || !due) { out.would_send = due; return out; }
   out.sent = await (deps.postGroupMe || postGroupMe)(out.message);
@@ -228,7 +293,7 @@ export async function runMemoryNightly({ dry_run = false, deps = {} } = {}) {
   const now = deps.now || new Date();
   const env = deps.env || process.env;
   const mode = env.MEMORY_AUTOCLOSE_MODE || 'off';
-  const result = { started_at: now.toISOString(), dry_run, autoclose_mode: mode, stale_flagged: null, autoclose: null, embed: {}, workflow_ref: null, counts: null, digest: null, errors: [] };
+  const result = { started_at: now.toISOString(), dry_run, autoclose_mode: mode, stale_flagged: null, autoclose: null, embed: {}, validation: null, conflicts: null, drafts: null, workflow_ref: null, counts: null, digest: null, errors: [] };
   const rawSql = deps.runSQL || runSQL;
   const sql = (text) => withRetry(() => rawSql(text), {
     ...SQL_RETRY, sleep: deps.sleep,
@@ -262,6 +327,24 @@ export async function runMemoryNightly({ dry_run = false, deps = {} } = {}) {
     }
   } catch (err) { result.errors.push(`embed: ${err.message}`); }
 
+  // sql/098 — validation (log + repairs), conflict scan, draft checkpoints.
+  // A dry run issues only the candidate SELECTs: no log rows, no repairs, no inserts.
+  try {
+    const v = await (deps.validate || runMemoryValidation)({ dry_run, mode: 'nightly', deps: { runSQL: sql, log: !dry_run } });
+    result.validation = { flagged_total: v.flagged_total, checks: Object.fromEntries(Object.entries(v.checks).map(([k, e]) => [k, e.error ? { error: e.error } : { checked: e.rows_checked, flagged: e.rows_flagged }])), repairs: v.repairs };
+    for (const e of v.errors) result.errors.push(`validation ${e}`);
+  } catch (err) { result.errors.push(`validation: ${err.message}`); }
+  try {
+    const s = await (deps.conflicts || runConflictScan)({ dry_run, full: false, deps: { runSQL: sql, env } });
+    result.conflicts = { filed: s.filed, kinds: Object.fromEntries(Object.entries(s.kinds).map(([k, e]) => [k, { threshold: e.threshold, candidates: e.candidates, filed: e.filed, error: e.error }])) };
+    for (const e of s.errors) result.errors.push(`conflicts ${e}`);
+  } catch (err) { result.errors.push(`conflicts: ${err.message}`); }
+  try {
+    const d = await (deps.drafts || runDraftCheckpoints)({ dry_run, now, deps: { runSQL: sql, db } });
+    result.drafts = { candidates: d.candidates, drafted: d.drafted.length, ids: d.drafted.slice(0, 20) };
+    for (const e of d.errors) result.errors.push(`drafts ${e}`);
+  } catch (err) { result.errors.push(`drafts: ${err.message}`); }
+
   if (!dry_run) {
     try { const rows = await sql(WORKFLOW_REF_SQL); result.workflow_ref = Array.isArray(rows) ? rows.length : 0; }
     catch (err) { result.errors.push(`workflow_ref: ${err.message}`); }
@@ -283,7 +366,7 @@ export async function runMemoryNightly({ dry_run = false, deps = {} } = {}) {
   const acSummary = result.autoclose && result.autoclose.mode !== 'off'
     ? `${result.autoclose.mode}:${Object.entries(result.autoclose.rules).map(([t, r]) => `${t.split(':')[0]}=${r.affected}`).join(',')}`
     : 'off';
-  console.log(`[MemoryNightly] ${dry_run ? 'DRY-RUN ' : ''}done stale=${result.stale_flagged} autoclose=${acSummary} embed=${JSON.stringify(Object.fromEntries(Object.entries(result.embed).map(([k, v]) => [k, v.written])))} ref=${result.workflow_ref} digest=${result.digest?.sent ? 'sent' : (result.digest?.due ? 'due' : 'no')} errors=${result.errors.length} elapsed=${result.elapsed_ms}ms`);
+  console.log(`[MemoryNightly] ${dry_run ? 'DRY-RUN ' : ''}done stale=${result.stale_flagged} autoclose=${acSummary} embed=${JSON.stringify(Object.fromEntries(Object.entries(result.embed).map(([k, v]) => [k, v.written])))} validation_flagged=${result.validation?.flagged_total ?? 'n/a'} conflicts_filed=${result.conflicts?.filed ?? 'n/a'} drafts=${result.drafts?.drafted ?? 'n/a'} ref=${result.workflow_ref} digest=${result.digest?.sent ? 'sent' : (result.digest?.due ? 'due' : 'no')} errors=${result.errors.length} elapsed=${result.elapsed_ms}ms`);
   if (!result.ok && !dry_run) await alertGroupMe(result.errors.join(' | '), post);
   return result;
 }

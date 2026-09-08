@@ -72,7 +72,9 @@ test('sql/097 is mirrored in the boot presence check', () => {
   const m = MEMORY_MIGRATIONS.find((x) => x.file === '097_pack_date_confidence.sql');
   assert.ok(m, 'missing from MEMORY_MIGRATIONS');
   assert.match(m.check, /claude_memory_context/); assert.match(m.check, /date_confidence/);
-  assert.equal(MEMORY_MIGRATIONS[MEMORY_MIGRATIONS.length - 1].file, '097_pack_date_confidence.sql', 'must apply after 090–096');
+  const idx = MEMORY_MIGRATIONS.findIndex((x) => x.file === '097_pack_date_confidence.sql');
+  assert.ok(idx > 0 && MEMORY_MIGRATIONS.slice(0, idx).every((x) => x.file < '097'), 'must apply after 090–096');
+  assert.equal(MEMORY_MIGRATIONS[idx + 1]?.file, '098_memory_integrity.sql', 'sql/098 applies right after 097');
 });
 
 // ─── memory_checkpoint: session.date_confidence ──────────────────────────────

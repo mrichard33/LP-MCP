@@ -13,6 +13,8 @@
  * scripts/memory-search.js is the caller.
  *
  * v1.0 — 2026-09-06. Initial.
+ * v1.1 — 2026-09-08. sql/098: include_closed defaults to false on both legs;
+ *        date_confidence flows through to the fuser's provenance weights.
  */
 import supabase from '../supabase.js';
 import { embed } from '../knowledge/openai-embeddings.js';
@@ -25,6 +27,7 @@ function normalizeFts(rows) {
   return (rows || []).map((r) => ({
     kind: r.kind, id: r.id, text: r.text, area: null, origin: r.origin ?? null,
     status: r.status ?? null, category: r.category ?? null, row_date: r.date ?? null,
+    date_confidence: r.date_confidence ?? null,
     fts_rank: null, vec_rank: null, similarity: null, score: r.rank ?? null,
   })).map((r, i) => ({ ...r, fts_rank: i + 1 }));
 }
@@ -42,8 +45,11 @@ export async function hybridMemorySearch(query, opts = {}) {
   const limit = Math.max(1, Math.min(opts.limit ?? DEFAULT_MATCH_COUNT, 100));
   const t0 = Date.now();
 
+  // sql/098: closed / superseded / duplicate rows are hidden by default on both
+  // legs; include_closed=true brings history back (weighted 0.2 by the fuser).
+  const includeClosed = opts.includeClosed ?? false;
   const { data: ftsRows, error: ftsErr } = await supabase.rpc('claude_memory_search', {
-    p_query: query, p_limit: Math.max(limit, 20),
+    p_query: query, p_limit: Math.max(limit, 20), p_include_closed: includeClosed,
   });
   if (ftsErr) throw new Error(`claude_memory_search: ${ftsErr.message}`);
   const fts = normalizeFts(ftsRows);
@@ -62,7 +68,7 @@ export async function hybridMemorySearch(query, opts = {}) {
       match_count: Math.max(limit, 20),
       filter_area: opts.filterArea ?? null,
       filter_kind: opts.filterKind ?? null,
-      include_closed: opts.includeClosed ?? true,
+      include_closed: includeClosed,
     });
     if (rpcErr) throw new Error(`match_memory_embeddings: ${rpcErr.message}`);
     vec = data || [];
