@@ -24,15 +24,44 @@
  * On final failure the error carries `partial` (everything that did land) so
  * the calling skill can fall back to SQL without re-creating it.
  *
+ * PROVENANCE GUARD (sql/098, v2.0). A memory row must prove where it came
+ * from before it is allowed in:
+ *   mode 'live'   (default) the caller is inside the chat. `date` must be the
+ *                 date on the chat's first message; a date in the future or
+ *                 more than MEMORY_MAX_DATE_AGE_DAYS (400) back is rejected.
+ *   mode 'retro'  the caller reconstructed the chat from search. `source`
+ *                 { chat_url, chat_title, chat_updated_at } is REQUIRED;
+ *                 log_origin is forced to 'retro', session_date =
+ *                 chat_updated_at::date (ET), link_confidence 'exact', the
+ *                 ledger row (disposition 'retro_written') is written in the
+ *                 same sequence, decisions default confidence 'reconstructed'
+ *                 unless the payload marks a Mark quote (confirmed_by_mark).
+ *   MEMORY_GUARD_MODE (off | shadow | live; code default shadow) governs the
+ *   two data-dependent checks:
+ *     batch pattern   3+ live checkpoints in the last 5 minutes = a sweep, not
+ *                     a session. shadow: logged to claude_memory_validation_log
+ *                     and written (the sql/098 trigger relabels it retro /
+ *                     write_date / flagged); live: rejected — use mode retro.
+ *     conflict rule   a new decision whose nearest ACTIVE decision (vector
+ *                     cosine ≥ MEMORY_CONFLICT_THRESHOLD, 0.85) is not named
+ *                     by supersedes_id or same_as_id. shadow: logged, written;
+ *                     live: rejected with the matching decision id. The check
+ *                     is skipped (never blocks) when OPENAI_API_KEY is unset or
+ *                     the embed call fails.
+ *   same_as_id     the decision is NOT inserted; the existing row gets
+ *                  verified_at + verification_note instead (a re-confirmation).
+ *
  * v1.0 — 2026-09-06. Initial (priority #8).
  * v1.1 — 2026-09-06. checkpoint_key idempotency + withRetry (#1627).
  * v1.2 — 2026-09-07. session.date_confidence ('exact' | 'write_date', sql/097).
+ * v2.0 — 2026-09-08. mode retro, date sanity, MEMORY_GUARD_MODE, conflict rule (sql/098).
  */
 import { randomUUID } from 'node:crypto';
 import supabase from '../supabase.js';
 import { withRetry, CHECKPOINT_RETRY } from './with-retry.js';
 
 const SURFACES = new Set(['chat', 'cowork', 'code', 'n8n']);
+const MODES = new Set(['live', 'retro']);
 // sql/097: 'exact' = session.date is the real date of the work; 'write_date' =
 // it is only the date the checkpoint was written (retro sweeps). The pack
 // demotes write_date sessions so a session start opens on real work.
@@ -43,7 +72,28 @@ const PENDING_KINDS = new Set(['pending', 'next_step']);
 const PENDING_TYPES = new Set(['action_needed', 'decision_needed', 'verification_needed', 'open_question', 'build_needed', 'next_step', 'unconfirmed_decision']);
 const CLOSE_STATUSES = new Set(['done', 'dropped', 'superseded', 'blocked', 'deferred', 'ratified']);
 
+export const GUARD_MODES = new Set(['off', 'shadow', 'live']);
+export const RETRO_SOURCE_MESSAGE = 'retro session requires chat_url and source_chat_updated_at';
+export const RETRO_PREFIX_RE = /^\s*\[RETRO/i;
+const BATCH_WINDOW_MINUTES = 5;
+const BATCH_LIMIT = 3;
+
 export class CheckpointError extends Error {}
+
+/** MEMORY_GUARD_MODE: off | shadow (default) | live. */
+export function getGuardMode(env = process.env) {
+  const m = String(env.MEMORY_GUARD_MODE || 'shadow').toLowerCase().trim();
+  return GUARD_MODES.has(m) ? m : 'shadow';
+}
+/** MEMORY_CONFLICT_THRESHOLD with a code default of 0.85 so it can be tuned without a deploy. */
+export function getConflictThreshold(env = process.env) {
+  const t = parseFloat(env.MEMORY_CONFLICT_THRESHOLD);
+  return Number.isFinite(t) && t > 0 && t <= 1 ? t : 0.85;
+}
+export function getMaxDateAgeDays(env = process.env) {
+  const n = parseInt(env.MEMORY_MAX_DATE_AGE_DAYS, 10);
+  return Number.isFinite(n) && n > 0 ? n : 400;
+}
 
 function str(v, name, { required = false, max = 20000 } = {}) {
   if (v == null || v === '') { if (required) throw new CheckpointError(`${name} is required`); return null; }
@@ -55,15 +105,27 @@ function isoDate(v, name, fallback) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(v))) throw new CheckpointError(`${name} must be YYYY-MM-DD`);
   return String(v);
 }
-function todayET(now = new Date()) {
-  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
+function dateET(d) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+}
+function todayET(now = new Date()) { return dateET(now); }
+function daysBetween(a, b) { return Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86_400_000); }
+
+function parseTimestamp(v, name) {
+  if (v == null || v === '') return null;
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) throw new CheckpointError(`${name} must be an ISO timestamp`);
+  return d;
 }
 
 /** Validate and normalise the payload. Throws CheckpointError on bad input. */
-export function validateCheckpoint(input = {}, now = new Date()) {
+export function validateCheckpoint(input = {}, now = new Date(), env = process.env) {
   const today = todayET(now);
+  const mode = input.mode == null || input.mode === '' ? 'live' : String(input.mode).toLowerCase().trim();
+  if (!MODES.has(mode)) throw new CheckpointError(`mode must be one of ${[...MODES].join(', ')}`);
   const sessionId = input.session_id == null ? null : Number(input.session_id);
   if (input.session_id != null && (!Number.isInteger(sessionId) || sessionId < 1)) throw new CheckpointError('session_id must be a positive integer');
+  if (mode === 'retro' && sessionId) throw new CheckpointError('retro mode creates a new session — refresh an existing one with mode live and session_id');
   const s = input.session || {};
   const keys = Array.isArray(s.search_keys) ? s.search_keys.map((k) => String(k).trim()).filter(Boolean) : [];
   if (!sessionId && keys.length < 3) throw new CheckpointError('session.search_keys needs at least 3 verbatim keys for a new session');
@@ -71,30 +133,62 @@ export function validateCheckpoint(input = {}, now = new Date()) {
   const surface = s.surface ? String(s.surface).toLowerCase() : 'chat';
   if (!SURFACES.has(surface)) throw new CheckpointError(`session.surface must be one of ${[...SURFACES].join(', ')}`);
   const dateConfidenceGiven = s.date_confidence != null && s.date_confidence !== '';
-  const date_confidence = dateConfidenceGiven ? String(s.date_confidence).toLowerCase() : 'exact';
+  let date_confidence = dateConfidenceGiven ? String(s.date_confidence).toLowerCase() : 'exact';
   if (!DATE_CONFIDENCE.has(date_confidence)) throw new CheckpointError(`session.date_confidence must be one of ${[...DATE_CONFIDENCE].join(', ')}`);
+
+  // Retro source — the row must say where it came from (sql/098 guard message).
+  let source = null;
+  if (mode === 'retro') {
+    const src = input.source || {};
+    const chat_url = str(src.chat_url, 'source.chat_url', { max: 500 });
+    const chat_updated_at = parseTimestamp(src.chat_updated_at, 'source.chat_updated_at');
+    if (!chat_url || !chat_updated_at) {
+      throw new CheckpointError(`${RETRO_SOURCE_MESSAGE} — pass source.chat_url and source.chat_updated_at from the search result`);
+    }
+    source = { chat_url, chat_title: str(src.chat_title, 'source.chat_title', { max: 300 }), chat_updated_at: chat_updated_at.toISOString() };
+    date_confidence = 'exact';
+  }
+
+  const date = mode === 'retro' ? dateET(new Date(source.chat_updated_at)) : isoDate(s.date, 'session.date', today);
+  // Date sanity — a new session's date is the date the work happened.
+  if (!sessionId || s.date) {
+    const maxAge = getMaxDateAgeDays(env);
+    if (date > today) throw new CheckpointError(`session.date ${date} is in the future (today ET is ${today}) — use the date on the chat's first message`);
+    if (daysBetween(date, today) > maxAge) throw new CheckpointError(`session.date ${date} is more than ${maxAge} days back — check the chat's first message date, or pass date_confidence 'write_date' with today's date`);
+  }
 
   const session = {
     title: str(s.title, 'session.title', { required: !sessionId, max: 300 }),
-    date: isoDate(s.date, 'session.date', today),
-    date_confidence, date_confidence_given: dateConfidenceGiven,
+    date, date_confidence, date_confidence_given: dateConfidenceGiven || mode === 'retro',
     phase_focus: str(s.phase_focus, 'session.phase_focus', { max: 120 }),
     summary: str(s.summary, 'session.summary', { required: !sessionId }),
     search_keys: keys, surface,
-    chat_url: str(s.chat_url, 'session.chat_url', { max: 500 }),
-    chat_title: str(s.chat_title, 'session.chat_title', { max: 300 }),
+    chat_url: source ? source.chat_url : str(s.chat_url, 'session.chat_url', { max: 500 }),
+    chat_title: source ? (source.chat_title ?? str(s.chat_title, 'session.chat_title', { max: 300 })) : str(s.chat_title, 'session.chat_title', { max: 300 }),
     workflows_touched: Array.isArray(s.workflows_touched) ? s.workflows_touched : [],
     mcp_verified_ids: Array.isArray(s.mcp_verified_ids) ? s.mcp_verified_ids : [],
   };
+  if (mode === 'retro' && session.summary && !RETRO_PREFIX_RE.test(session.summary)) {
+    session.summary = `[RETRO — reconstructed from transcript on ${today}. Decisions unconfirmed by Mark are marked inferred.] ${session.summary}`;
+  }
 
-  const decisions = (input.decisions || []).map((d, i) => ({
-    category: str(d.category, `decisions[${i}].category`, { required: true, max: 40 }),
-    decision: str(d.decision, `decisions[${i}].decision`, { required: true }),
-    rationale: str(d.rationale, `decisions[${i}].rationale`),
-    options: Array.isArray(d.options) ? d.options.map(String) : [],
-    workflow_code: str(d.workflow_code, `decisions[${i}].workflow_code`, { max: 20 }),
-    supersedes_id: d.supersedes_id == null ? null : Number(d.supersedes_id),
-  }));
+  const decisions = (input.decisions || []).map((d, i) => {
+    const supersedes_id = d.supersedes_id == null ? null : Number(d.supersedes_id);
+    const same_as_id = d.same_as_id == null ? null : Number(d.same_as_id);
+    if (supersedes_id && same_as_id) throw new CheckpointError(`decisions[${i}]: supersedes_id and same_as_id are mutually exclusive`);
+    for (const [k, v] of [['supersedes_id', supersedes_id], ['same_as_id', same_as_id]]) {
+      if (v != null && (!Number.isInteger(v) || v < 1)) throw new CheckpointError(`decisions[${i}].${k} must be a positive integer`);
+    }
+    return {
+      category: str(d.category, `decisions[${i}].category`, { required: true, max: 40 }),
+      decision: str(d.decision, `decisions[${i}].decision`, { required: true }),
+      rationale: str(d.rationale, `decisions[${i}].rationale`),
+      options: Array.isArray(d.options) ? d.options.map(String) : [],
+      workflow_code: str(d.workflow_code, `decisions[${i}].workflow_code`, { max: 20 }),
+      supersedes_id, same_as_id,
+      confirmed_by_mark: d.confirmed_by_mark === true,
+    };
+  });
   const issues = (input.issues || []).map((x, i) => {
     const severity = String(x.severity || '').toLowerCase();
     if (!SEVERITIES.has(severity)) throw new CheckpointError(`issues[${i}].severity must be critical|high|medium|low`);
@@ -139,7 +233,7 @@ export function validateCheckpoint(input = {}, now = new Date()) {
   for (const list of [resolved_issues, verified_issues, close_pending]) {
     for (const r of list) if (!Number.isInteger(r.id) || r.id < 1) throw new CheckpointError('ids must be positive integers');
   }
-  return { session_id: sessionId, session, decisions, issues, resolved_issues, verified_issues, pending, close_pending, today };
+  return { mode, source, session_id: sessionId, session, decisions, issues, resolved_issues, verified_issues, pending, close_pending, today };
 }
 
 function must(res, what) {
@@ -155,22 +249,114 @@ function must(res, what) {
   return res.data;
 }
 
+/** Text a decision is embedded as (mirrors memory-text.js memoryText('decision')). */
+export function decisionText(d) {
+  return [`Decision (${d.category || 'uncategorized'}): ${d.decision || ''}`, d.rationale ? `Rationale: ${d.rationale}` : '']
+    .filter(Boolean).join('\n');
+}
+
+/** Best-effort row in claude_memory_validation_log (sql/098). Never throws — the table may predate the migration. */
+async function logGuard(db, row) {
+  try {
+    const res = await db.from('claude_memory_validation_log').insert({
+      check_name: row.check_name, mode: row.mode, rows_checked: row.rows_checked ?? null,
+      rows_flagged: row.rows_flagged ?? null, sample: row.sample ?? null, notes: row.notes ?? null,
+    });
+    if (res?.error) console.warn(`[MemoryCheckpoint] guard log skipped: ${res.error.message}`);
+  } catch (err) { console.warn(`[MemoryCheckpoint] guard log skipped: ${err.message}`); }
+}
+
+/**
+ * Guard checks that need the database. Runs ONCE before the first write.
+ * Returns { checks: [...] }; throws CheckpointError in live mode.
+ */
+async function runGuard(c, { db, now, env, guard, embed, threshold, out }) {
+  const checks = [];
+  if (guard === 'off') return checks;
+
+  // 1. Batch pattern — a live session dated today, arriving in a burst.
+  if (c.mode === 'live' && !c.session_id && c.session.date === c.today) {
+    let recent = 0;
+    try {
+      const since = new Date(now.getTime() - BATCH_WINDOW_MINUTES * 60_000).toISOString();
+      const res = await db.from('claude_session_logs').select('id', { count: 'exact', head: true }).eq('log_origin', 'live').gte('created_at', since);
+      recent = Number(res?.count ?? (Array.isArray(res?.data) ? res.data.length : 0)) || 0;
+    } catch (err) { checks.push({ check: 'batch_pattern', skipped: err.message }); }
+    if (recent >= BATCH_LIMIT) {
+      const entry = { check: 'batch_pattern', live_rows_last_5_min: recent, would: 'reject' };
+      checks.push(entry);
+      await logGuard(db, { check_name: 'guard:batch_pattern', mode: guard, rows_checked: recent, rows_flagged: 1, sample: { title: c.session.title, surface: c.session.surface }, notes: guard === 'live' ? 'rejected' : 'written; trigger relabels retro/write_date' });
+      if (guard === 'live') throw new CheckpointError(`${recent} live checkpoints already written in the last ${BATCH_WINDOW_MINUTES} minutes — this looks like a batch pass, not a session. Use mode "retro" with source.chat_url and source.chat_updated_at.`);
+    }
+  }
+
+  // 2. Conflict rule — nearest ACTIVE decision on the same subject must be named.
+  const candidates = c.decisions.map((d, i) => ({ d, i })).filter(({ d }) => !d.supersedes_id && !d.same_as_id);
+  if (candidates.length) {
+    const canEmbed = typeof embed === 'function' && typeof db.rpc === 'function';
+    if (!canEmbed) {
+      out.conflict_check = embed ? 'skipped: db.rpc unavailable' : 'skipped: OPENAI_API_KEY unset';
+    } else {
+      for (const { d, i } of candidates) {
+        let hits = [];
+        try {
+          const q = await embed(decisionText(d));
+          const res = await db.rpc('match_memory_embeddings', {
+            query_embedding: q.embedding, match_threshold: threshold, match_count: 5,
+            filter_area: null, filter_kind: 'decision', include_closed: false,
+          });
+          if (res?.error) throw new Error(res.error.message);
+          hits = (res?.data || []).filter((h) => String(h.status || 'active') === 'active' && typeof h.similarity === 'number' && h.similarity >= threshold);
+        } catch (err) {
+          out.conflict_check = `skipped: ${err.message}`;
+          checks.push({ check: 'conflict', decision_index: i, skipped: err.message });
+          continue;
+        }
+        if (!hits.length) continue;
+        const top = hits[0];
+        const entry = { check: 'conflict', decision_index: i, matches: hits.slice(0, 3).map((h) => ({ id: h.source_id, similarity: Number(h.similarity.toFixed(3)), area: h.area, text: String(h.text || '').slice(0, 120) })), would: 'reject' };
+        checks.push(entry);
+        await logGuard(db, { check_name: 'guard:conflict', mode: guard, rows_checked: hits.length, rows_flagged: 1, sample: { decision: d.decision.slice(0, 200), nearest: entry.matches }, notes: guard === 'live' ? 'rejected' : 'written without supersedes_id/same_as_id' });
+        if (guard === 'live') {
+          throw new CheckpointError(`decisions[${i}] matches active decision #${top.source_id} (cosine ${top.similarity.toFixed(2)}): pass supersedes_id: ${top.source_id} to replace it or same_as_id: ${top.source_id} to re-confirm it`);
+        }
+      }
+      if (!out.conflict_check) out.conflict_check = 'ran';
+    }
+  }
+  return checks;
+}
+
+async function defaultEmbed(env = process.env) {
+  if (!env.OPENAI_API_KEY) return null;
+  const m = await import('../knowledge/openai-embeddings.js');
+  return m.embed;
+}
+
 /**
  * Write the checkpoint. Returns ids. `db` defaults to the LP Supabase client.
  *   checkpoint_key  uuid for the session insert; generated here when omitted.
  *                   Pass the same key on a manual re-call to resume instead of
  *                   inserting a second session.
  *   retry           { attempts, backoffMs, sleep } or false to disable.
+ *   env             for MEMORY_GUARD_MODE / MEMORY_CONFLICT_THRESHOLD (tests).
+ *   embed           (text) => { embedding } — injected in tests; defaults to
+ *                   the OpenAI client when OPENAI_API_KEY is set, else the
+ *                   conflict check is skipped.
  * Throws with `err.partial` = progress so far when the write fails.
  */
-export async function applyCheckpoint(input, { db = supabase, now = new Date(), checkpoint_key = null, retry = CHECKPOINT_RETRY } = {}) {
+export async function applyCheckpoint(input, { db = supabase, now = new Date(), checkpoint_key = null, retry = CHECKPOINT_RETRY, env = process.env, embed, guardMode } = {}) {
   if (!db) throw new Error('Supabase client not configured');
-  const c = validateCheckpoint(input, now); // validation errors surface before any retry
+  const c = validateCheckpoint(input, now, env); // validation errors surface before any retry
   const key = checkpoint_key ? String(checkpoint_key) : randomUUID();
+  const guard = guardMode || getGuardMode(env);
   const out = {
-    session_id: null, checkpoint_key: key, updated: false, recovered: false, attempts: 0,
-    decision_ids: [], issue_ids: [], pending_ids: [], resolved: [], verified: [], closed: [], superseded: [], ledger: null,
+    session_id: null, checkpoint_key: key, mode: c.mode, updated: false, recovered: false, attempts: 0,
+    guard: { mode: guard, checks: [] }, conflict_check: null,
+    decision_ids: [], issue_ids: [], pending_ids: [], resolved: [], verified: [], closed: [], superseded: [], confirmed: [], ledger: null,
   };
+  const embedFn = embed === undefined ? await defaultEmbed(env) : embed;
+  out.guard.checks = await runGuard(c, { db, now, env, guard, embed: embedFn, threshold: getConflictThreshold(env), out });
   const step = (attempt) => { out.attempts = attempt; return writeCheckpoint(c, { db, now, key, out, resume: attempt > 1 }); };
   try {
     if (retry === false) await step(1);
@@ -183,9 +369,9 @@ export async function applyCheckpoint(input, { db = supabase, now = new Date(), 
 }
 
 function partialOf(out) {
-  const p = { checkpoint_key: out.checkpoint_key, attempts: out.attempts };
+  const p = { checkpoint_key: out.checkpoint_key, attempts: out.attempts, mode: out.mode };
   if (out.session_id) { p.session_id = out.session_id; p.updated = out.updated; }
-  for (const k of ['decision_ids', 'issue_ids', 'pending_ids', 'resolved', 'verified', 'closed', 'superseded']) if (out[k].length) p[k] = [...out[k]];
+  for (const k of ['decision_ids', 'issue_ids', 'pending_ids', 'resolved', 'verified', 'closed', 'superseded', 'confirmed']) if (out[k].length) p[k] = [...out[k]];
   if (out.ledger) p.ledger = out.ledger;
   return p;
 }
@@ -193,9 +379,10 @@ function partialOf(out) {
 /** One attempt. Every step is guarded by `out`, so a re-run only does what has not landed yet. */
 async function writeCheckpoint(c, { db, now, key, out, resume }) {
   const nowIso = now.toISOString();
+  const retro = c.mode === 'retro';
 
   // 1. Session row — UPDATE the named one, else INSERT (keyed on checkpoint_key).
-  const SESSION_COLS = 'id, transcript_search_keys, link_confidence, chat_url';
+  const SESSION_COLS = 'id, transcript_search_keys, link_confidence, chat_url, log_origin';
   let keys = c.session.search_keys;
   let sessionId = c.session_id;
   let cur = null;
@@ -217,6 +404,8 @@ async function writeCheckpoint(c, { db, now, key, out, resume }) {
     // Only an explicit value changes an existing row — a refresh that omits it
     // must not reset a 'write_date' session back to the default.
     if (c.session.date_confidence_given) patch.date_confidence = c.session.date_confidence;
+    // A nightly draft that Mark refreshes from inside the chat becomes a real session.
+    if (cur.log_origin === 'nightly') { patch.log_origin = 'live'; patch.validation_status = 'passed'; }
     if (c.session.chat_url && cur.link_confidence !== 'exact') {
       patch.chat_url = c.session.chat_url; patch.chat_title = c.session.chat_title; patch.link_confidence = 'exact';
     }
@@ -228,29 +417,48 @@ async function writeCheckpoint(c, { db, now, key, out, resume }) {
       workflows_touched: c.session.workflows_touched, phase_status: {}, decisions_made: [], issues_found: [],
       issues_resolved: [], pending_items: [], board_versions: [], mcp_verified_ids: c.session.mcp_verified_ids,
       next_steps: [], raw_summary: c.session.summary, chat_url: c.session.chat_url, chat_title: c.session.chat_title,
-      transcript_search_keys: keys, surface: c.session.surface, log_origin: 'live',
+      transcript_search_keys: keys, surface: c.session.surface, log_origin: retro ? 'retro' : 'live',
       link_confidence: c.session.chat_url ? 'exact' : 'unlinked', checkpoint_key: key,
       date_confidence: c.session.date_confidence,
     };
+    if (retro) row.source_chat_updated_at = c.source.chat_updated_at; // sql/098 column; only sent for retro rows
     const ins = must(await db.from('claude_session_logs').insert(row).select('id').single(), 'insert session');
     out.session_id = ins.id; out.keys = keys;
   }
   const sid = out.session_id;
 
-  // 2. Decisions (+ supersede).
+  // 2. Decisions (+ supersede / re-confirm).
   for (let i = 0; i < c.decisions.length; i++) {
     const d = c.decisions[i];
+    if (d.same_as_id) {
+      // Not a second active decision on the same subject: re-confirm the existing one.
+      if (!out.confirmed.includes(d.same_as_id)) {
+        must(await db.from('claude_decision_log').update({
+          verified_at: nowIso, verification_note: `re-confirmed in session #${sid} (${c.today})${retro ? ' [retro]' : ''}`,
+        }).eq('id', d.same_as_id), 'confirm decision');
+        out.confirmed.push(d.same_as_id);
+      }
+      out.decision_ids[i] = d.same_as_id;
+      continue;
+    }
     if (out.decision_ids[i] == null) {
-      const ins = must(await db.from('claude_decision_log').insert({
+      const row = {
         session_id: sid, decision_date: c.session.date, category: d.category, decision: d.decision,
         options_considered: d.options, rationale: d.rationale, workflow_code: d.workflow_code,
         reversible: true, transcript_search_keys: keys,
-      }).select('id').single(), 'insert decision');
+      };
+      if (retro) { row.origin = 'retro'; row.confidence = d.confirmed_by_mark ? 'confirmed' : 'reconstructed'; }
+      const ins = must(await db.from('claude_decision_log').insert(row).select('id').single(), 'insert decision');
       out.decision_ids[i] = ins.id;
     }
     if (d.supersedes_id && !out.superseded.includes(d.supersedes_id)) {
       must(await db.from('claude_decision_log').update({ status: 'superseded', superseded_by: out.decision_ids[i] }).eq('id', d.supersedes_id), 'supersede decision');
       out.superseded.push(d.supersedes_id);
+      // Keep the vector index honest right away (the nightly sync would catch it anyway).
+      try {
+        const res = await db.from('claude_memory_embeddings').update({ status: 'superseded' }).eq('source_table', 'claude_decision_log').eq('source_id', d.supersedes_id);
+        if (res?.error) console.warn(`[MemoryCheckpoint] embedding status sync skipped: ${res.error.message}`);
+      } catch (err) { console.warn(`[MemoryCheckpoint] embedding status sync skipped: ${err.message}`); }
     }
   }
 
@@ -258,11 +466,13 @@ async function writeCheckpoint(c, { db, now, key, out, resume }) {
   for (let i = 0; i < c.issues.length; i++) {
     if (out.issue_ids[i] != null) continue;
     const x = c.issues[i];
-    const ins = must(await db.from('claude_known_issues').insert({
+    const row = {
       reported_date: c.session.date, reported_session_id: sid, severity: x.severity, category: x.category,
       description: x.description, impact: x.impact, fix_instructions: x.fix_instructions,
       workflow_code: x.workflow_code, workflow_name: x.workflow_name, issue_type: x.issue_type, status: 'open',
-    }).select('id').single(), 'insert issue');
+    };
+    if (retro) { row.origin = 'retro'; row.confidence = 'reconstructed'; }
+    const ins = must(await db.from('claude_known_issues').insert(row).select('id').single(), 'insert issue');
     out.issue_ids[i] = ins.id;
   }
   for (const r of c.resolved_issues) {
@@ -290,7 +500,7 @@ async function writeCheckpoint(c, { db, now, key, out, resume }) {
       const ins = must(await db.from('claude_pending_items').insert({
         source_session_id: sid, source_field: 'live', source_index: idx++, kind: p.kind, item_type: p.item_type,
         description: p.description, status: 'open', priority: p.priority, effort: p.effort, blocked_by: p.blocked_by,
-        ref: p.ref, owner: p.owner, origin: 'live', session_date: c.session.date, created_at: nowIso,
+        ref: p.ref, owner: p.owner, origin: retro ? 'retro' : 'live', session_date: c.session.date, created_at: nowIso,
       }).select('id').single(), 'insert pending');
       out.pending_ids[i] = ins.id;
     }
@@ -305,31 +515,38 @@ async function writeCheckpoint(c, { db, now, key, out, resume }) {
     out.closed.push(cl.id);
   }
 
-  // 5. Ledger row when a URL is on file.
+  // 5. Ledger row when a URL is on file — for a retro row this is part of the
+  //    same sequence, never optional (disposition 'retro_written').
   if (c.session.chat_url && !out.ledger) {
+    const disposition = retro ? 'retro_written' : 'linked';
     must(await db.from('claude_transcript_ledger').upsert({
-      chat_url: c.session.chat_url, chat_title: c.session.chat_title, chat_updated_at: nowIso,
-      session_id: sid, disposition: 'linked', reviewed_at: nowIso,
-      notes: `memory_checkpoint ${c.today}${out.updated ? ' (refresh)' : ''}`,
+      chat_url: c.session.chat_url, chat_title: c.session.chat_title,
+      chat_updated_at: retro ? c.source.chat_updated_at : nowIso,
+      session_id: sid, disposition, reviewed_at: nowIso,
+      notes: `memory_checkpoint ${retro ? 'retro ' : ''}${c.today}${out.updated ? ' (refresh)' : ''}`,
     }, { onConflict: 'chat_url' }), 'ledger upsert');
-    out.ledger = 'linked';
+    out.ledger = disposition;
   }
   delete out.keys;
   return out;
 }
 
 /** What applyCheckpoint would do, without touching the database. */
-export function planCheckpoint(input, now = new Date()) {
-  const c = validateCheckpoint(input, now);
+export function planCheckpoint(input, now = new Date(), env = process.env) {
+  const c = validateCheckpoint(input, now, env);
   return {
     dry_run: true,
-    session: c.session_id ? `UPDATE claude_session_logs #${c.session_id}` : `INSERT claude_session_logs (${c.session.surface}, ${c.session.date})`,
+    mode: c.mode,
+    guard_mode: getGuardMode(env),
+    session: c.session_id ? `UPDATE claude_session_logs #${c.session_id}` : `INSERT claude_session_logs (${c.session.surface}, ${c.session.date}, ${c.mode})`,
     date_confidence: c.session.date_confidence,
+    source: c.source,
     search_keys: c.session.search_keys,
     decisions: c.decisions.length, superseding: c.decisions.filter((d) => d.supersedes_id).length,
+    reconfirming: c.decisions.filter((d) => d.same_as_id).length,
     issues: c.issues.length, resolved_issues: c.resolved_issues.length, verified_issues: c.verified_issues.length,
     pending: c.pending.length, close_pending: c.close_pending.length,
-    ledger: c.session.chat_url ? 'linked (exact)' : 'none (unlinked)',
+    ledger: c.session.chat_url ? (c.mode === 'retro' ? 'retro_written (exact)' : 'linked (exact)') : 'none (unlinked)',
     hint: 'add "confirm": true to write',
   };
 }

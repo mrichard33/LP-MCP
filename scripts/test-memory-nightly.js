@@ -49,7 +49,10 @@ test('dry run plans every kind, writes nothing, and reports counts (MEMORY_AUTOC
   };
   const db = { rpc: async () => ({ data: { counts: { open_issues: 1 } }, error: null }) };
   const r = await runMemoryNightly({ dry_run: true, deps: { runSQL: async (s) => { sqlCalls.push(s); return []; }, embed, supabase: db, now: TUESDAY, env: NO_DIGEST_ENV } });
-  assert.equal(r.ok, true); assert.equal(sqlCalls.length, 0);
+  assert.equal(r.ok, true);
+  // sql/098: the dry run still SELECTs the validation / conflict / draft candidates, but writes nothing.
+  assert.ok(sqlCalls.length > 0 && sqlCalls.every((s) => /^\s*SELECT/i.test(s)), 'dry run issues only SELECTs');
+  assert.equal(r.validation.flagged_total, 0); assert.equal(r.conflicts.filed, 0); assert.equal(r.drafts.drafted, 0);
   assert.equal(r.stale_flagged, null); assert.equal(r.workflow_ref, null);
   assert.equal(r.embed.issue.to_embed, 2); assert.equal(r.embed.issue.written, 0);
   assert.deepEqual(r.counts, { open_issues: 1 });
@@ -65,7 +68,9 @@ test('live run executes only kinds with work, runs both SQL steps, and collects 
   };
   const db = { rpc: async () => ({ data: null, error: { message: 'boom' } }) };
   const posts = [];
-  const r = await runMemoryNightly({ deps: { runSQL: async (s) => { sqlCalls.push(s); return [{ id: 1 }, { id: 2 }]; }, embed, supabase: db, now: TUESDAY, env: NO_DIGEST_ENV, postGroupMe: async (t) => { posts.push(t); return true; } } });
+  const noop = async () => ({ flagged_total: 0, checks: {}, repairs: {}, errors: [] });
+  const r = await runMemoryNightly({ deps: { runSQL: async (s) => { sqlCalls.push(s); return [{ id: 1 }, { id: 2 }]; }, embed, supabase: db, now: TUESDAY, env: NO_DIGEST_ENV, postGroupMe: async (t) => { posts.push(t); return true; },
+    validate: noop, conflicts: async () => ({ filed: 0, kinds: {}, errors: [] }), drafts: async () => ({ candidates: 0, drafted: [], errors: [] }) } });
   assert.equal(sqlCalls.length, 2); assert.equal(r.stale_flagged, 2); assert.equal(r.workflow_ref, 2);
   assert.equal(r.embed.decision.written, 1); assert.equal(r.embed.issue.written, 0);
   assert.equal(r.ok, false); assert.match(r.errors[0], /^counts: boom/);
@@ -82,7 +87,8 @@ test('each SQL step retries transient errors and a step that still fails does no
   const embed = { planKind: async (kind) => ({ kind, total: 0, todo: [], est_tokens: 0, est_cost_usd: 0 }), executePlan: async () => ({ written: 0, cost_usd: 0 }) };
   const db = { rpc: async () => ({ data: { counts: {} }, error: null }) };
   const posts = [];
-  const r = await runMemoryNightly({ deps: { runSQL, embed, supabase: db, now: TUESDAY, env: NO_DIGEST_ENV, sleep: noSleep, postGroupMe: async (t) => { posts.push(t); return true; } } });
+  const r = await runMemoryNightly({ deps: { runSQL, embed, supabase: db, now: TUESDAY, env: NO_DIGEST_ENV, sleep: noSleep, postGroupMe: async (t) => { posts.push(t); return true; },
+    validate: async () => ({ flagged_total: 0, checks: {}, repairs: {}, errors: [] }), conflicts: async () => ({ filed: 0, kinds: {}, errors: [] }), drafts: async () => ({ candidates: 0, drafted: [], errors: [] }) } });
   assert.equal(attempts.stale, 3); assert.equal(r.stale_flagged, 1, 'stale step succeeded on the third attempt');
   assert.equal(attempts.ref, 3, 'three attempts then give up');
   assert.deepEqual(r.errors, ['workflow_ref: read ECONNRESET']);
