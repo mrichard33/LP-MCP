@@ -26,12 +26,17 @@
  *
  * v1.0 — 2026-09-06. Initial (priority #8).
  * v1.1 — 2026-09-06. checkpoint_key idempotency + withRetry (#1627).
+ * v1.2 — 2026-09-07. session.date_confidence ('exact' | 'write_date', sql/097).
  */
 import { randomUUID } from 'node:crypto';
 import supabase from '../supabase.js';
 import { withRetry, CHECKPOINT_RETRY } from './with-retry.js';
 
 const SURFACES = new Set(['chat', 'cowork', 'code', 'n8n']);
+// sql/097: 'exact' = session.date is the real date of the work; 'write_date' =
+// it is only the date the checkpoint was written (retro sweeps). The pack
+// demotes write_date sessions so a session start opens on real work.
+const DATE_CONFIDENCE = new Set(['exact', 'write_date']);
 const SEVERITIES = new Set(['critical', 'high', 'medium', 'low']);
 const ISSUE_TYPES = new Set(['defect', 'initiative', 'metric']);
 const PENDING_KINDS = new Set(['pending', 'next_step']);
@@ -65,10 +70,14 @@ export function validateCheckpoint(input = {}, now = new Date()) {
   if (keys.length > 12) throw new CheckpointError('session.search_keys: keep it under 12');
   const surface = s.surface ? String(s.surface).toLowerCase() : 'chat';
   if (!SURFACES.has(surface)) throw new CheckpointError(`session.surface must be one of ${[...SURFACES].join(', ')}`);
+  const dateConfidenceGiven = s.date_confidence != null && s.date_confidence !== '';
+  const date_confidence = dateConfidenceGiven ? String(s.date_confidence).toLowerCase() : 'exact';
+  if (!DATE_CONFIDENCE.has(date_confidence)) throw new CheckpointError(`session.date_confidence must be one of ${[...DATE_CONFIDENCE].join(', ')}`);
 
   const session = {
     title: str(s.title, 'session.title', { required: !sessionId, max: 300 }),
     date: isoDate(s.date, 'session.date', today),
+    date_confidence, date_confidence_given: dateConfidenceGiven,
     phase_focus: str(s.phase_focus, 'session.phase_focus', { max: 120 }),
     summary: str(s.summary, 'session.summary', { required: !sessionId }),
     search_keys: keys, surface,
@@ -205,6 +214,9 @@ async function writeCheckpoint(c, { db, now, key, out, resume }) {
     if (c.session.summary) patch.raw_summary = c.session.summary;
     if (c.session.title) patch.session_title = c.session.title;
     if (c.session.phase_focus) patch.phase_focus = c.session.phase_focus;
+    // Only an explicit value changes an existing row — a refresh that omits it
+    // must not reset a 'write_date' session back to the default.
+    if (c.session.date_confidence_given) patch.date_confidence = c.session.date_confidence;
     if (c.session.chat_url && cur.link_confidence !== 'exact') {
       patch.chat_url = c.session.chat_url; patch.chat_title = c.session.chat_title; patch.link_confidence = 'exact';
     }
@@ -218,6 +230,7 @@ async function writeCheckpoint(c, { db, now, key, out, resume }) {
       next_steps: [], raw_summary: c.session.summary, chat_url: c.session.chat_url, chat_title: c.session.chat_title,
       transcript_search_keys: keys, surface: c.session.surface, log_origin: 'live',
       link_confidence: c.session.chat_url ? 'exact' : 'unlinked', checkpoint_key: key,
+      date_confidence: c.session.date_confidence,
     };
     const ins = must(await db.from('claude_session_logs').insert(row).select('id').single(), 'insert session');
     out.session_id = ins.id; out.keys = keys;
@@ -311,6 +324,7 @@ export function planCheckpoint(input, now = new Date()) {
   return {
     dry_run: true,
     session: c.session_id ? `UPDATE claude_session_logs #${c.session_id}` : `INSERT claude_session_logs (${c.session.surface}, ${c.session.date})`,
+    date_confidence: c.session.date_confidence,
     search_keys: c.session.search_keys,
     decisions: c.decisions.length, superseding: c.decisions.filter((d) => d.supersedes_id).length,
     issues: c.issues.length, resolved_issues: c.resolved_issues.length, verified_issues: c.verified_issues.length,
