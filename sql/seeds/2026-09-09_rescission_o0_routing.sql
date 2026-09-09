@@ -33,7 +33,8 @@
 --   deadline.
 --
 -- RULING (Mark, 2026-09-09): O.0 IS the rescue arc. Its competitor branch is
---   PUBLISHED v154 with the trigger active. O.RR is superseded, not pending.
+--   PUBLISHED with the trigger active (version 157 when read live 2026-09-09
+--   22:30Z). O.RR is superseded, not pending.
 --
 -- WHAT THIS SEED DOES
 --   Sections 1-5 below, in order. Each statement is an idempotent

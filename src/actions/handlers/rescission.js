@@ -23,7 +23,10 @@
  *   ran nowhere.
  *
  *   The rescue arc is the COMPETITOR BRANCH of O.0 Objection Handler
- *   (fdf4ad82-33ab-4e73-b581-18d21d51ac42, PUBLISHED v154, trigger active).
+ *   (fdf4ad82-33ab-4e73-b581-18d21d51ac42) — PUBLISHED, trigger active; it was
+ *   version 157 when read live on 2026-09-09. Do not treat that number as
+ *   current: O.0 is edited often (157 landed the same evening). workflow_registry
+ *   in the HL Supabase holds canonical status.
  *   O.0 step 20 branches on the tag `objection-confirmed-competitor` — HYPHEN,
  *   not colon — or on webhook payload `objection_type == "competitor"`. The
  *   colon form this handler used to write (`objection-confirmed:competitor`)
