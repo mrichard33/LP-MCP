@@ -134,6 +134,10 @@
 import { createHash } from 'node:crypto';
 import supabase from './supabase.js';
 import { generateResponse } from './response-generator.js';
+// GroupMe → Slack migration (2026-09-09). Every card that POSTs to GroupMe is
+// mirrored to Slack at the send layer, so the two carry byte-identical text
+// with no second copy of any format. Fail-silent; see src/slack.js.
+import { mirrorToSlack } from './slack.js';
 
 const GROUPME_BOT_ID = process.env.GROUPME_BOT_ID || '';
 const GROUPME_GROUP_ID = process.env.GROUPME_GROUP_ID || '';
@@ -373,6 +377,9 @@ async function _isDuplicateCard(text, channel, opts = {}) {
  * @param {string} [opts.channel]     — Logical destination channel.
  *   'canvass' → GROUPME_CANVASS_BOT_ID (falls back to the main bot with a
  *   one-time warning when unset). Omitted/unknown → main bot.
+ * @param {string} [opts.market]      — LP market code (JAX, FTMYR, …). Used by
+ *   the Slack mirror only: a canvass-channel card with a market posts to that
+ *   market's Slack channel AND the all-markets rollup. Ignored by GroupMe.
  * @param {boolean} [opts.noDedup]    — v1.8: skip the content-dedup backstop.
  *   For cards that must send even when byte-identical to a recent one
  *   (approval cards — time-sensitive operator decisions).
@@ -399,11 +406,11 @@ export async function sendGroupMeMessage(text, opts = {}) {
     if (!noDedup && await _isDuplicateCard(text, channel)) {
       return { sent: false, reason: 'duplicate_suppressed' };
     }
-    return await _sendRawGroupMeMessage(text, botId);
+    return await _sendRawGroupMeMessage(text, botId, { channel, market: opts.market });
   }
 
   // Debounced path: queue for consolidation.
-  return _queueForConsolidation(contactId, contactName || null, text, channel);
+  return _queueForConsolidation(contactId, contactName || null, text, channel, opts.market);
 }
 
 /**
@@ -412,7 +419,10 @@ export async function sendGroupMeMessage(text, opts = {}) {
  * when a buffer's timer fires. Approval-card senders also call this
  * indirectly via sendGroupMeMessage(text) (no opts → immediate path).
  */
-async function _sendRawGroupMeMessage(text, botId = GROUPME_BOT_ID) {
+async function _sendRawGroupMeMessage(text, botId = GROUPME_BOT_ID, mirror = {}) {
+  // Fire-and-forget: Slack must never delay or fail a GroupMe send.
+  mirrorToSlack(text, mirror.channel, { market: mirror.market })
+    .catch((err) => console.warn(`[Slack] mirror threw (ignored): ${err.message}`));
   try {
     const res = await fetch('https://api.groupme.com/v3/bots/post', {
       method: 'POST',
@@ -436,7 +446,7 @@ async function _sendRawGroupMeMessage(text, botId = GROUPME_BOT_ID) {
 // v1.7: DEBOUNCE QUEUE INTERNALS
 // ═══════════════════════════════════════════════════════════════════
 
-function _queueForConsolidation(contactId, contactName, text, channel) {
+function _queueForConsolidation(contactId, contactName, text, channel, market) {
   // Buffers are keyed per channel+contact: canvass and main cards for the
   // same contact are different operator streams and must flush to their
   // own bots, never consolidate into one card.
@@ -474,6 +484,7 @@ function _queueForConsolidation(contactId, contactName, text, channel) {
     contactId,
     contactName: contactName || null,
     channel: channel || null,
+    market: market || null,
     lines: [text],
     firstQueuedAt: Date.now(),
     timer: null,
@@ -511,7 +522,7 @@ async function _flushBuffer(buf) {
       return { sent: false, reason: 'duplicate_suppressed' };
     }
     console.log(`[GroupMe] flushed contact=${buf.contactId} lines=1 elapsed_ms=${elapsed} (single, no header)`);
-    return await _sendRawGroupMeMessage(buf.lines[0], botId);
+    return await _sendRawGroupMeMessage(buf.lines[0], botId, { channel: buf.channel, market: buf.market });
   }
 
   const consolidated = _buildConsolidatedCard(buf);
@@ -524,7 +535,7 @@ async function _flushBuffer(buf) {
     return { sent: false, reason: 'duplicate_suppressed' };
   }
   console.log(`[GroupMe] flushed contact=${buf.contactId} lines=${buf.lines.length} elapsed_ms=${elapsed} consolidated_chars=${consolidated.length}`);
-  return await _sendRawGroupMeMessage(consolidated, botId);
+  return await _sendRawGroupMeMessage(consolidated, botId, { channel: buf.channel, market: buf.market });
 }
 
 function _buildConsolidatedCard(buf) {
