@@ -53,6 +53,13 @@ import { flattenWebhookBody, webhookShapeFingerprint } from './webhook-body.js';
 import { buildLeadNoteLines } from './services/lead-note-lines.js';
 import { resolveCanvasserProId } from './services/canvasser-roster.js';
 import { resolveMarket } from './actions/enrichment.js';
+import { checkServiceAreaZip } from './services/identity-extraction.js';
+
+// GHL custom field carrying the LP branch/market code (STPET, FTMYR, …) — the
+// same id enrichment.js names CF.MARKET_CODE. Read straight off the webhook
+// body when the workflow forwards it; the Slack mirror routes canvass cards to
+// the market's channel by this code.
+const GHL_MARKET_CODE_FIELD_ID = 'z0MV6mXi0w9WwdCOFThh';
 import { formatAddressLine } from './services/appointment-card.js';
 
 // GHL custom field: "LP Inbound Lead ID". Reminder: in1_id is the LP
@@ -257,6 +264,10 @@ export function validateCanvassingPayload(rawBody) {
       // looking, and never an error. See normalizeState in sync-utils.js.
       state: normalizeState(body.state),
       zip: trim(body.zip),
+      // LP market code from the GHL custom field (by id, or the flat key a
+      // workflow builder would name it). Slack routing only — the LP payload
+      // never reads it. Blank when the workflow does not forward the field.
+      market_code: String(trim(body[GHL_MARKET_CODE_FIELD_ID] ?? body.market_code) || '').toUpperCase(),
       window_count: trim(body.window_count),
       door_count: trim(body.door_count),
       slider_count: trim(body.slider_count),
@@ -489,6 +500,7 @@ const DEFAULT_DEPS = {
   updateSalesRabbitLead,
   emitEvent,
   resolveCanvasserProId,
+  checkServiceAreaZip,
   now: () => new Date(),
 };
 
@@ -537,6 +549,25 @@ export async function processCanvassingLead(payload, deps = {}) {
       console.warn(`[Canvassing] market resolution failed for ${p.ghl_contact_id} (cards fall back): ${err.message}`);
     }
 
+    // 1c. Resolve the LP market CODE once for the Slack mirror (2026-09-09
+    // addendum). `market` above is the display name the card prints; the
+    // mirror routes by code. Sources, in order: the GHL market-code custom
+    // field when the webhook carries it, else the homeowner's zip via
+    // service_area_zips. Neither → null: the card still reaches #canvass-all.
+    // Same fail-soft discipline as 1b — the card is never delayed or lost
+    // over a lookup.
+    let marketCode = null;
+    try {
+      marketCode = p.market_code || null;
+      if (!marketCode) {
+        const area = await d.checkServiceAreaZip(p.zip);
+        marketCode = area?.market_code ? String(area.market_code).toUpperCase() : null;
+      }
+    } catch (err) {
+      marketCode = null;
+      console.warn(`[Canvassing] market code resolution failed for ${p.ghl_contact_id} (rollup only): ${err.message}`);
+    }
+
     // 2. Required-field gate (skip cleanly; operator fixes in GHL).
     const missing = LP_REQUIRED_FIELDS.filter((k) => !p[k]);
     if (!(normalizePhone(p.phone_raw) || '').slice(-10) && !missing.includes('phone_raw')) missing.push('phone_raw');
@@ -554,7 +585,7 @@ export async function processCanvassingLead(payload, deps = {}) {
           narrative: `Lead cannot post to LP — missing ${missing.join(', ')}. Fix the contact in GHL and resubmit. ${link}`,
           actWithin: '1 hour',
         }),
-        { channel: 'canvass', flushNow: true, market }
+        { channel: 'canvass', flushNow: true, market: marketCode }
       );
       await writeCanvassMark(
         { dedup_key: p.ghl_contact_id, ghl_contact_id: p.ghl_contact_id, phone: p.phone_raw, status: 'lp_failed' },
@@ -584,7 +615,7 @@ export async function processCanvassingLead(payload, deps = {}) {
           market,
           narrative: `${detail} Lead posts to LP without an appointment — set the time manually in LP. ${link}`,
         }),
-        { channel: 'canvass', flushNow: true, market }
+        { channel: 'canvass', flushNow: true, market: marketCode }
       );
     } else if (appt.status === 'beyond_window') {
       await d.sendGroupMeMessage(
@@ -596,7 +627,7 @@ export async function processCanvassingLead(payload, deps = {}) {
           appointmentDisplay: apptDisplay,
           narrative: `Appointment is ${Math.round(appt.hoursOut)}h out — beyond the ${APPT_WINDOW_HOURS}h canvassing window (Friday→Monday excepted). Posted as Set anyway; verify the supervisor exception. ${link}`,
         }),
-        { channel: 'canvass', flushNow: true, market }
+        { channel: 'canvass', flushNow: true, market: marketCode }
       );
     }
 
@@ -637,7 +668,7 @@ export async function processCanvassingLead(payload, deps = {}) {
             + ` unaffected. Re-seed the roster if this canvasser is new; otherwise check what`
             + ` GHL is putting in that field.`,
         }),
-        { channel: 'canvass', flushNow: true, market },
+        { channel: 'canvass', flushNow: true, market: marketCode },
       );
     }
 
@@ -663,7 +694,7 @@ export async function processCanvassingLead(payload, deps = {}) {
           narrative: `Canvassing lead did NOT reach LP after retries. Enter manually or re-fire the intake. ${link}`,
           actWithin: '30 minutes',
         }),
-        { channel: 'canvass', flushNow: true, market }
+        { channel: 'canvass', flushNow: true, market: marketCode }
       );
       return { outcome: 'lp_failed', appt_status: appt.status };
     }
@@ -681,7 +712,7 @@ export async function processCanvassingLead(payload, deps = {}) {
           canvasserName,
           narrative: `LP accepted the canvassing lead but the inbound ID could not be read from the response — LP Inbound Lead ID not written back to GHL. ${link}`,
         }),
-        { channel: 'canvass', flushNow: true, market }
+        { channel: 'canvass', flushNow: true, market: marketCode }
       );
     }
 
@@ -715,7 +746,7 @@ export async function processCanvassingLead(payload, deps = {}) {
             lpRef: in1Id ? `inbound #${in1Id}` : undefined,
             narrative: `SalesRabbit lead ${p.salesrabbit_id} was not updated (${sr.reason || 'unknown'}). LP intake completed normally. ${link}`,
           }),
-          { channel: 'canvass', flushNow: true, market }
+          { channel: 'canvass', flushNow: true, market: marketCode }
         );
       }
     }
@@ -775,7 +806,7 @@ export async function processCanvassingLead(payload, deps = {}) {
         appointmentDisplay: apptDisplay,
         narrative: `Canvassing lead posted to LP${in1Id ? ` (inbound #${in1Id})` : ''}${apptDisplay ? ' as Set' : ' without an appointment'}. SMS confirmation flow takes it from here.`,
       }),
-      { channel: 'canvass', flushNow: true, market }
+      { channel: 'canvass', flushNow: true, market: marketCode }
     );
 
     console.log(`[Canvassing] ${p.ghl_contact_id} → LP ok in1_id=${in1Id || '(none)'} appt=${appt.status}`);

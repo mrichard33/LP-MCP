@@ -110,12 +110,15 @@ function mockMarksClient(rows = new Map(), { insertError = null } = {}) {
   };
 }
 
-function mockDeps({ addLeadImpl, salesRabbitImpl, client, resolveCanvasserProId } = {}) {
+function mockDeps({ addLeadImpl, salesRabbitImpl, client, resolveCanvasserProId, checkServiceAreaZip } = {}) {
   const calls = { addLead: [], groupme: [], ghlFields: [], salesrabbit: [], events: [] };
   const deps = {
     client: client ?? mockMarksClient(),
     now: () => NOW,
     ...(resolveCanvasserProId ? { resolveCanvasserProId } : {}),
+    // Zip → market code for the Slack mirror. Default: zip not in any market.
+    checkServiceAreaZip: checkServiceAreaZip
+      || (async (zip) => ({ checked: true, zip, in_service_area: false })),
     addLead: async (fields) => {
       calls.addLead.push(fields);
       if (addLeadImpl) return addLeadImpl(fields);
@@ -606,6 +609,48 @@ test('card: the canvasser NAME renders, and a numeric Pro ID never reaches the c
   assert.match(card, /🚪 Canvasser: Jordan Pérez/);
   assert.match(card, /📋 Src: .*Jordan Pérez/);
   assert.doesNotMatch(card, /4471/);
+});
+
+test('card: opts.market carries the LP market code for the Slack mirror — field, then zip, else null', async () => {
+  const createdOpts = (calls) => calls.groupme.find((g) => g.text.includes('CANVASSING LEAD CREATED')).opts;
+
+  // 1. The GHL market-code custom field on the webhook body wins outright.
+  {
+    const { deps, calls } = mockDeps({
+      checkServiceAreaZip: async () => { throw new Error('must not be consulted when the field is present'); },
+    });
+    await processCanvassingLead(validPayload({ z0MV6mXi0w9WwdCOFThh: 'FTMYR' }), deps);
+    assert.equal(createdOpts(calls).market, 'FTMYR');
+  }
+
+  // 2. No field → the homeowner's zip resolves through service_area_zips.
+  {
+    const seen = [];
+    const { deps, calls } = mockDeps({
+      checkServiceAreaZip: async (zip) => { seen.push(zip); return { checked: true, zip, in_service_area: true, market_code: 'FTLAU' }; },
+    });
+    await processCanvassingLead(validPayload(), deps);
+    assert.deepEqual(seen, ['33446']);
+    assert.equal(createdOpts(calls).market, 'FTLAU');
+  }
+
+  // 3. Neither the field nor a resolvable zip → null (card still reaches #canvass-all).
+  {
+    const { deps, calls } = mockDeps();
+    await processCanvassingLead(validPayload({ zip: '00000' }), deps);
+    assert.equal(createdOpts(calls).market, null);
+    for (const g of calls.groupme) assert.equal(g.opts.channel, 'canvass');
+  }
+
+  // 4. A lookup that throws is fail-soft: null, and the card still sends.
+  {
+    const { deps, calls } = mockDeps({
+      checkServiceAreaZip: async () => { throw new Error('db down'); },
+    });
+    const result = await processCanvassingLead(validPayload(), deps);
+    assert.equal(result.outcome, 'ok');
+    assert.equal(createdOpts(calls).market, null);
+  }
 });
 
 test('card: an unresolved canvasser omits the line entirely rather than printing an id', async () => {

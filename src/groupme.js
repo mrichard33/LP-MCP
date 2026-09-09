@@ -377,10 +377,9 @@ async function _isDuplicateCard(text, channel, opts = {}) {
  * @param {string} [opts.channel]     — Logical destination channel.
  *   'canvass' → GROUPME_CANVASS_BOT_ID (falls back to the main bot with a
  *   one-time warning when unset). Omitted/unknown → main bot.
- * @param {string} [opts.market]      — LP market code (JAX, FTMYR, …) or the
- *   display name resolveMarket() returns for it. Used by the Slack mirror
- *   only: a canvass-channel card with a market posts to that market's Slack
- *   channel AND the all-markets rollup. Ignored by GroupMe.
+ * @param {string} [opts.market]      — LP market code (JAX, FTMYR, …). Used by
+ *   the Slack mirror only: a canvass-channel card with a market posts to that
+ *   market's Slack channel AND the all-markets rollup. Ignored by GroupMe.
  * @param {boolean} [opts.noDedup]    — v1.8: skip the content-dedup backstop.
  *   For cards that must send even when byte-identical to a recent one
  *   (approval cards — time-sensitive operator decisions).

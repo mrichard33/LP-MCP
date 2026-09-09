@@ -19,6 +19,7 @@ const CH_MAIN = 'C_MAIN';
 const CH_CANVASS = 'C_CANVASS_ALL';
 const CH_OPS = 'C_OPS';
 const CH_FTMYR = 'C_CANVASS_FTMYR';
+const CH_FTLAU = 'C_CANVASS_FTLAU';
 
 // ─── fetch stub: capture Slack posts, script the response ───────
 const posts = [];
@@ -44,16 +45,17 @@ const stubDb = {
           return { data: [
             { channel_name: 'canvass-all', slack_channel_id: CH_CANVASS },
             { channel_name: 'canvass-fortmyers', slack_channel_id: CH_FTMYR },
+            { channel_name: 'canvass-fortlauderdale', slack_channel_id: CH_FTLAU },
             { channel_name: 'lead-intelligence', slack_channel_id: CH_MAIN },
           ] };
         }
         if (table === 'slack_market_slugs') {
-          return { data: [{ market_code: 'FTMYR', slug: 'fortmyers' }] };
+          return { data: [
+            { market_code: 'FTMYR', slug: 'fortmyers' },
+            { market_code: 'FTLAU', slug: 'fortlauderdale' },
+          ] };
         }
-        if (table === 'service_markets') {
-          return { data: [{ market_code: 'FTMYR', market_name: 'Ft. Myers / SW Florida' }] };
-        }
-        return { data: [] };
+        throw new Error(`unexpected table: ${table}`);
       },
     };
   },
@@ -139,11 +141,34 @@ test('canvass + market FTMYR → market channel first, then CH_CANVASS', async (
   assert.equal(warns.length, 0);
 });
 
-test('canvass + market display name (what resolveMarket returns) → same two channels', async () => {
+test('canvass + lowercase code → same two channels (case-insensitive)', async () => {
   reset(slack);
-  await slack.mirrorToSlack('canvass card', 'canvass', { market: 'Ft. Myers / SW Florida' });
+  await slack.mirrorToSlack('canvass card', 'canvass', { market: 'ftmyr' });
   assert.deepEqual(posts.map((p) => p.body.channel), [CH_FTMYR, CH_CANVASS]);
   assert.equal(warns.length, 0);
+});
+
+test('canvass + market BOCA → aliases to canvass-fortlauderdale AND CH_CANVASS', async () => {
+  reset(slack);
+  const r = await slack.mirrorToSlack('canvass card', 'canvass', { market: 'BOCA' });
+  assert.deepEqual(r, { mirrored: true, channels: 2, sent: 2 });
+  assert.deepEqual(posts.map((p) => p.body.channel), [CH_FTLAU, CH_CANVASS]);
+  assert.equal(warns.length, 0);
+});
+
+test('canvass + market MIAMI → aliases to canvass-fortlauderdale AND CH_CANVASS', async () => {
+  reset(slack);
+  await slack.mirrorToSlack('canvass card', 'canvass', { market: 'MIAMI' });
+  assert.deepEqual(posts.map((p) => p.body.channel), [CH_FTLAU, CH_CANVASS]);
+});
+
+test('canvass + market RFED (no alias, no slug) → CH_CANVASS only, one warning', async () => {
+  reset(slack);
+  const r = await slack.mirrorToSlack('canvass card', 'canvass', { market: 'RFED' });
+  assert.deepEqual(r, { mirrored: true, channels: 1, sent: 1 });
+  assert.deepEqual(posts.map((p) => p.body.channel), [CH_CANVASS]);
+  assert.equal(warns.length, 1);
+  assert.match(warns[0], /no canvass channel for market=RFED/);
 });
 
 test('canvass + unknown market → one POST to CH_CANVASS, one warning', async () => {
@@ -193,9 +218,9 @@ test('cache: second resolve inside TTL makes no supabase call', async () => {
   reset(slack);
   await slack.resolveSlackChannels('canvass', { market: 'FTMYR' });
   const afterFirst = dbCalls;
-  assert.equal(afterFirst, 3); // slack_channels + slack_market_slugs + service_markets
+  assert.equal(afterFirst, 2); // slack_channels + slack_market_slugs
   await slack.resolveSlackChannels('canvass', { market: 'FTMYR' });
-  await slack.resolveSlackChannels('canvass', { market: 'Ft. Myers / SW Florida' });
+  await slack.resolveSlackChannels('canvass', { market: 'BOCA' });
   assert.equal(dbCalls, afterFirst);
 });
 

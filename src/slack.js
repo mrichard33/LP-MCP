@@ -17,10 +17,8 @@
  *   ops     → SLACK_CHANNEL_OPS      (#ops-alerts)
  *   unknown → main (mirrors _resolveBotId's fallback exactly)
  *
- * opts.market accepts EITHER the LP market code (FTMYR) or the display name
- * service_markets carries for it ("Ft. Myers / SW Florida"). The canvassing
- * handler resolves the market once per run via resolveMarket(), which returns
- * the display name — so the mirror must not assume it is handed a code.
+ * opts.market is the LP market code (FTMYR, JAX, …), case-insensitive. Codes
+ * with no channel of their own map through MARKET_ALIASES first.
  */
 import supabase from './supabase.js';
 
@@ -30,9 +28,13 @@ const CH_MAIN = process.env.SLACK_CHANNEL_MAIN || '';
 const CH_CANVASS = process.env.SLACK_CHANNEL_CANVASS || '';
 const CH_OPS = process.env.SLACK_CHANNEL_OPS || '';
 
+// Codes with no Slack channel of their own. Boca and Miami are worked out of
+// the Fort Lauderdale office and post to its canvass channel.
+const MARKET_ALIASES = { BOCA: 'FTLAU', MIAMI: 'FTLAU' };
+
 const CACHE_TTL_MS = 10 * 60 * 1000;
 let channelCache = null;      // Map channel_name -> slack_channel_id
-let slugCache = null;         // Map UPPER(market_code) | UPPER(market_name) -> slug
+let slugCache = null;         // Map UPPER(market_code) -> slug
 let cacheLoadedAt = 0;
 let warnedNoToken = false;
 
@@ -57,10 +59,9 @@ function _normKey(v) {
 }
 
 /**
- * Load slack_channels + slack_market_slugs (+ service_markets, so a display
- * name resolves to the same slug its code does) into memory. Refreshed on a
- * TTL so a new market does not need a redeploy. Failure leaves the previous
- * cache in place — a stale map is strictly better than dropping the mirror.
+ * Load slack_channels + slack_market_slugs into memory. Refreshed on a TTL so
+ * a new market does not need a redeploy. Failure leaves the previous cache in
+ * place — a stale map is strictly better than dropping the mirror.
  */
 async function _loadCache() {
   if (channelCache && Date.now() - cacheLoadedAt < CACHE_TTL_MS) return;
@@ -70,21 +71,15 @@ async function _loadCache() {
     return;
   }
   try {
-    const [{ data: chans }, { data: slugs }, { data: markets }] = await Promise.all([
+    const [{ data: chans }, { data: slugs }] = await Promise.all([
       db.from('slack_channels').select('channel_name, slack_channel_id'),
       db.from('slack_market_slugs').select('market_code, slug'),
-      db.from('service_markets').select('market_code, market_name'),
     ]);
     if (chans?.length) {
       channelCache = new Map(chans.map((r) => [r.channel_name, r.slack_channel_id]));
-      const byCode = new Map((slugs || []).map((r) => [_normKey(r.market_code), r.slug]));
-      slugCache = new Map(byCode);
-      for (const m of markets || []) {
-        const slug = byCode.get(_normKey(m.market_code));
-        if (slug && m.market_name) slugCache.set(_normKey(m.market_name), slug);
-      }
+      slugCache = new Map((slugs || []).map((r) => [_normKey(r.market_code), r.slug]));
       cacheLoadedAt = Date.now();
-      console.log(`[Slack] channel cache loaded: ${channelCache.size} channels, ${byCode.size} markets`);
+      console.log(`[Slack] channel cache loaded: ${channelCache.size} channels, ${slugCache.size} markets`);
     }
   } catch (err) {
     console.warn(`[Slack] channel cache load failed (using previous): ${err.message}`);
@@ -106,7 +101,8 @@ export async function resolveSlackChannels(channel, opts = {}) {
     const out = [];
     if (opts.market) {
       await _loadCache();
-      const slug = slugCache?.get(_normKey(opts.market));
+      const code = MARKET_ALIASES[_normKey(opts.market)] || _normKey(opts.market);
+      const slug = slugCache?.get(code);
       const id = slug && channelCache?.get(`canvass-${slug}`);
       if (id) out.push(id);
       else console.warn(`[Slack] no canvass channel for market=${opts.market} — rollup only`);
