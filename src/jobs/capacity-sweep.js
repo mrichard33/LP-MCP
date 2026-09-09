@@ -75,6 +75,7 @@ import { lpDateToEastern } from '../lp-dates.js';
 import { processProspect } from '../sync-leads.js';
 import { computeMarketAssignments } from './market-assignment-daily.js';
 import { createPageWalker } from '../lp-paging.js';
+import { getDialRanks } from '../capacity/dialRankSource.js';
 
 const TIMEZONE = 'America/New_York';
 
@@ -749,6 +750,10 @@ export async function buildBoardResponse(date) {
     runSQL(`SELECT max(swept_at) AS last_sweep_at FROM lp_capacity_slots`),
   ]);
 
+  // Live Five9 dial order for the corner badge. Cached and fail-open — a Five9
+  // outage must never change a single count on this board.
+  const dial = await getDialRanks().catch(() => ({ ranks: {}, read_at: null, error: 'unavailable', campaign: null }));
+
   const markets = new Map(); // market_code → office_label
   for (const r of marketRows || []) markets.set(r.market_code, r.market_label);
 
@@ -781,6 +786,7 @@ export async function buildBoardResponse(date) {
     confirmed: b.confirmed,
     set_pending: b.set_pending,
     fill_pct: fillPct(b),
+    dial_rank: dial.ranks[market] ?? null,
   }));
 
   const totals = zero();
@@ -806,6 +812,7 @@ export async function buildBoardResponse(date) {
     stale_after_ms: STALE_AFTER_MS,
     offices,
     unresolved,                    // always present — may not be hidden
+    dial_rank_source: { campaign: dial.campaign, read_at: dial.read_at, error: dial.error ?? null },
     totals: { ...totals, fill_pct: fillPct(totals) },
   };
 }
