@@ -90,6 +90,36 @@ const LAYER3_STAMPED_POST_DEMO_TAGS = [
   'bj:stage-5-committed',
 ];
 
+// ─── 2026-09-09 — RESCISSION COMMITMENT CARVE-OUT (TL-2) ───────────────
+//
+// A contact who has SIGNED a contract with another vendor has performed a
+// commitment act — not merely attended a presentation. TL-2 exists to stop
+// L4-Commitment language landing on someone who has never committed to
+// anything. A signed contract is a STRONGER commitment signal than a demo,
+// so the invariant's own purpose is satisfied, not bypassed.
+//
+// Incident: Wally Scott (2LT4JDrObOgPlKnn3H0q), 2026-09-09. Ran the website
+// estimator, booked a Measurement Verification, cancelled it before it ran,
+// and signed with a competitor the same afternoon. O.0's competitor branch
+// (SA3 — "The Cheaper Quote" / "The Vanishing Warranty" / "The Hidden Math")
+// is the correct belief-shift arc for precisely this lead, and TL-2 blocked
+// the enrolment because no demo had happened. The alternative — stamping
+// lp-demo-completed to satisfy the gate — would have corrupted sit rate and
+// demo counts, so the carve-out is the honest fix.
+//
+// WHY THIS IS NOT THE SHOOPEN SELF-FULFILLING PATTERN:
+// `intent-rescission-rescue` is applied by the rescission handler
+// (src/actions/handlers/rescission.js) ONLY when rule 173
+// INTENT_PURCHASED_ELSEWHERE's regex matches the LEAD'S OWN WORDS — "signed
+// with another company", "went with a different company", "already hired
+// someone else". It is testimony FROM the contact about an act they took.
+// The bj:stage-* tags the Shoopen guard protects against are the opposite:
+// a stage the SYSTEM inferred about the contact, stamped by
+// LAYER3_DISPATCH on a CTA acceptance. Testimony qualifies; inference does
+// not. If a future producer ever applies this tag on inference rather than
+// on the contact's own statement, this carve-out must be revisited.
+const RESCISSION_COMMITMENT_TAGS = ['intent-rescission-rescue'];
+
 const POST_DECISION_TAGS = [
   'customer',
   'lp-sale',
@@ -169,7 +199,8 @@ export async function checkAppointmentRescueRequiresHistory(action, ctx = {}) {
 // TL-2 — post_demo_objection_requires_demo
 // ═══════════════════════════════════════════════════════════════════════
 //
-// Action enrolling in O.0 Objection Handler requires post-demo state.
+// Action enrolling in O.0 Objection Handler requires post-demo state, OR a
+// rescission commitment event (see RESCISSION_COMMITMENT_TAGS above).
 // Critically: the qualifying tag must NOT be one that LAYER3_DISPATCH
 // stamped earlier in the same batch — that's the self-fulfilling pattern
 // from the Shoopen Sengstock incident.
@@ -178,15 +209,28 @@ export async function checkAppointmentRescueRequiresHistory(action, ctx = {}) {
 // assumes the prospect has experienced the demo (L5 trust). Firing it on
 // a pre-demo prospect collapses the trust escalation.
 
-export async function checkPostDemoObjectionRequiresDemo(action, ctx = {}) {
-  const contactId = action.target_id;
-  if (!contactId) {
-    return { passed: true, reason: 'no_contact_id_open' };
-  }
-
-  const tags = await loadContactTags(contactId);
-  if (tags === null) {
-    return { passed: true, reason: 'infra_error_open' };
+/**
+ * Pure decision for TL-2 over an already-loaded tag Set. Extracted 2026-09-09
+ * so the carve-out and the self-fulfilling guard are unit-testable without a
+ * database. checkPostDemoObjectionRequiresDemo is the I/O wrapper.
+ *
+ * @param {Set<string>} tags   lowercased contact tags
+ * @param {object} [ctx]       { batchPriorTagsAdded?: Set<string> }
+ * @param {object} [action]    the action row (batch_id used in diagnostics)
+ */
+export function evaluatePostDemoObjection(tags, ctx = {}, action = {}) {
+  // Rescission carve-out — a signed competitor contract IS a commitment
+  // event. Checked BEFORE the post-demo requirement because it satisfies
+  // the invariant's purpose by a different and stronger route. Deliberately
+  // exempt from the Shoopen self-fulfilling check: see the block comment on
+  // RESCISSION_COMMITMENT_TAGS for why testimony differs from inference.
+  const rescissionMatches = intersect(RESCISSION_COMMITMENT_TAGS, tags);
+  if (rescissionMatches.length > 0) {
+    return {
+      passed: true,
+      reason: 'rescission_commitment_event',
+      matched_tags: rescissionMatches,
+    };
   }
 
   // Find which POST_DEMO_TAGS the contact has.
@@ -197,12 +241,14 @@ export async function checkPostDemoObjectionRequiresDemo(action, ctx = {}) {
       passed: false,
       reason:
         `Contact has no post-demo state tag. O.0 Objection Handler requires ` +
-        `one of: ${POST_DEMO_TAGS.join(', ')}. ` +
+        `one of: ${POST_DEMO_TAGS.join(', ')} ` +
+        `(or ${RESCISSION_COMMITMENT_TAGS.join(', ')} for a signed-elsewhere ` +
+        `commitment event). ` +
         `Routing pre-demo objections to O.0 deploys L4-Commitment language ` +
         `before L3-Solution trust exists — use S5.2 / O.x pre-demo branches.`,
       context_snapshot: {
         contact_tags_sample: [...tags].slice(0, 30),
-        required_any_of: POST_DEMO_TAGS,
+        required_any_of: [...POST_DEMO_TAGS, ...RESCISSION_COMMITMENT_TAGS],
       },
     };
   }
@@ -241,6 +287,20 @@ export async function checkPostDemoObjectionRequiresDemo(action, ctx = {}) {
     reason: 'post_demo_state_confirmed',
     matched_tags: matches,
   };
+}
+
+export async function checkPostDemoObjectionRequiresDemo(action, ctx = {}) {
+  const contactId = action.target_id;
+  if (!contactId) {
+    return { passed: true, reason: 'no_contact_id_open' };
+  }
+
+  const tags = await loadContactTags(contactId);
+  if (tags === null) {
+    return { passed: true, reason: 'infra_error_open' };
+  }
+
+  return evaluatePostDemoObjection(tags, ctx, action);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -358,4 +418,5 @@ export const __testing = {
   EDUCATION_COMPLETE_TAGS,
   PRE_POSITIONED_ENTRY_TAGS,
   LAYER3_STAMPED_POST_DEMO_TAGS,
+  RESCISSION_COMMITMENT_TAGS,
 };
