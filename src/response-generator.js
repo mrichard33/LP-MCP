@@ -260,7 +260,7 @@ import {
 } from './services/preferred-time.js';
 import { hasActiveBooking, isPostDemoDecline } from './agentic/lead-state/signals/context-reader.js';
 import { buildNepqBlock } from './agentic/nepq-layer.js';
-import { fetchUpcomingAppointments, formatAppointmentsForPrompt } from './knowledge/contact-appointments.js';
+import { fetchRecentAndUpcomingAppointments, formatAppointmentsForPrompt } from './knowledge/contact-appointments.js';
 import {
   resolveBookingCalendar,
   requiresInHomeGate,
@@ -1682,12 +1682,45 @@ function validateBookAppointmentCompanion(cap, ca) {
   };
 }
 
-function validateCancelAppointmentCompanion(cap, ca) {
-  const appointmentId = typeof cap.appointment_id === 'string' ? cap.appointment_id.trim() : '';
-  if (!appointmentId) {
+/**
+ * Known-appointment-id set for the turn, built from the same list that fed the
+ * EXISTING APPOINTMENTS prompt block. null = we don't know (fetch failed or was
+ * not attempted) → every id is accepted, exactly as before.
+ */
+function knownAppointmentIdSet(appointments) {
+  if (!Array.isArray(appointments)) return null;
+  return new Set(appointments.map((a) => a?.appointment_id).filter(Boolean));
+}
+
+/**
+ * An id the model produced that is NOT in the known list is an INVENTED id.
+ *
+ * 2026-09-09 (Wally Scott 2LT4JDrObOgPlKnn3H0q): with an empty EXISTING
+ * APPOINTMENTS block the model had nothing to quote and emitted
+ * OWd5WhnU2l6x56R9Y9mO. Dropping the companion is the wrong answer — the
+ * reply telling the lead they're off the calendar still goes out, and then
+ * nothing cancels anything. Stripping the id is the right answer: the
+ * executor resolves the contact's real appointment live and cancels THAT.
+ *
+ * Returns the id to use (possibly null = strip).
+ */
+function vetAppointmentId(appointmentId, knownIds, label) {
+  if (!appointmentId || !knownIds || knownIds.size === 0) return appointmentId || null;
+  if (knownIds.has(appointmentId)) return appointmentId;
+  console.warn(
+    `[ResponseGenerator] ${label}: appointment_id "${appointmentId}" is not in the known appointment list ` +
+    `[${[...knownIds].join(', ')}] — stripping the id, executor will resolve live`
+  );
+  return null;
+}
+
+function validateCancelAppointmentCompanion(cap, ca, knownIds) {
+  const rawId = typeof cap.appointment_id === 'string' ? cap.appointment_id.trim() : '';
+  if (!rawId) {
     console.warn(`[ResponseGenerator] Dropping cancel_appointment: missing appointment_id`);
     return null;
   }
+  const appointmentId = vetAppointmentId(rawId, knownIds, 'cancel_appointment');
   return {
     action_type: 'cancel_appointment',
     action_payload: {
@@ -1698,7 +1731,7 @@ function validateCancelAppointmentCompanion(cap, ca) {
   };
 }
 
-function validateRescheduleAppointmentCompanion(cap, ca) {
+function validateRescheduleAppointmentCompanion(cap, ca, knownIds) {
   const oldId = typeof cap.old_appointment_id === 'string' ? cap.old_appointment_id.trim() : '';
   const newCalendarName = typeof cap.new_calendar_name === 'string' ? cap.new_calendar_name.trim() : '';
   const newStartTime = typeof cap.new_start_time === 'string' ? cap.new_start_time.trim() : '';
@@ -1721,7 +1754,7 @@ function validateRescheduleAppointmentCompanion(cap, ca) {
   const qualifying_data = normalizeQualifyingData(cap.qualifying_data);
 
   const payload = {
-    old_appointment_id: oldId,
+    old_appointment_id: vetAppointmentId(oldId, knownIds, 'reschedule_appointment'),
     new_calendar_name: newCalendarName,
     new_start_time: newStartTime,
     duration_minutes: typeof cap.duration_minutes === 'number' && cap.duration_minutes > 0
@@ -1783,7 +1816,13 @@ function validateGuideDispositionCompanion(cap, ca) {
   };
 }
 
-function validateResponse(parsed, channel) {
+// `knownAppointments` is the SAME list that fed the EXISTING APPOINTMENTS
+// prompt block (fetchRecentAndUpcomingAppointments). Passing it here closes the
+// loop: the block is the only place the model may take an appointment_id from,
+// so an id that isn't in it was invented. Omit it (or pass null) and id vetting
+// is skipped entirely — pre-2026-09-09 behavior.
+function validateResponse(parsed, channel, knownAppointments = null) {
+  const knownIds = knownAppointmentIdSet(knownAppointments);
   if (!parsed || typeof parsed !== 'object') return null;
   if (!parsed.message || typeof parsed.message !== 'string') return null;
 
@@ -1840,9 +1879,9 @@ function validateResponse(parsed, channel) {
     } else if (ca.action_type === 'book_appointment') {
       companionAction = validateBookAppointmentCompanion(cap, ca);
     } else if (ca.action_type === 'cancel_appointment') {
-      companionAction = validateCancelAppointmentCompanion(cap, ca);
+      companionAction = validateCancelAppointmentCompanion(cap, ca, knownIds);
     } else if (ca.action_type === 'reschedule_appointment') {
-      companionAction = validateRescheduleAppointmentCompanion(cap, ca);
+      companionAction = validateRescheduleAppointmentCompanion(cap, ca, knownIds);
     } else if (ca.action_type === 'update_appointment_status') {
       companionAction = validateUpdateAppointmentStatusCompanion(cap, ca);
     } else if (ca.action_type === 'guide_disposition') {
@@ -2414,11 +2453,18 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // STATE 1 case A in the cancellation flow). Failures here NEVER block
   // generation — without the block, the AI can still produce a normal
   // response; the cancellation flow just degrades gracefully.
+  //
+  // 2026-09-09 — RECENT *and* upcoming. fetchUpcomingAppointments is
+  // future-only; Wally Scott's (2LT4JDrObOgPlKnn3H0q) slot had already passed
+  // when he wrote in, so this block came back empty and the model invented an
+  // appointment_id for the cancel companion. The 24h look-back gives it the
+  // real id for exactly the case that produced the invention. The double-book
+  // guards keep using the strict future-only fetch.
   let upcomingAppointments = null;
   try {
-    upcomingAppointments = await fetchUpcomingAppointments(contactId);
+    upcomingAppointments = await fetchRecentAndUpcomingAppointments(contactId);
   } catch (err) {
-    console.warn(`[ResponseGenerator] fetchUpcomingAppointments threw for ${contactId}: ${err.message} — proceeding without`);
+    console.warn(`[ResponseGenerator] fetchRecentAndUpcomingAppointments threw for ${contactId}: ${err.message} — proceeding without`);
     upcomingAppointments = null;
   }
 
@@ -2605,7 +2651,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   );
   const raw = await callClaude(userPrompt);
 
-  const validated = validateResponse(raw, channel);
+  const validated = validateResponse(raw, channel, upcomingAppointments);
   if (!validated) {
     throw new Error('AI response generation failed: invalid response structure');
   }

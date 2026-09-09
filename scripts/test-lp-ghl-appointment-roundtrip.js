@@ -31,16 +31,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-// Reconciler runs with supabase intentionally absent; force the create-claim
-// guard to fail-open so its REST calls never reach the stubbed global fetch.
-delete process.env.SUPABASE_URL;
-delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+// Supabase points at a stub host, NOT at nothing. The reconciler itself is
+// supabase-free, but the 2026-09-09 cancel-echo fix writes a
+// reschedule_inflight marker before the CXL PUT, and a null client would make
+// that write a silent no-op — the test would assert nothing. Every PostgREST
+// request is answered by the same stub below and recorded in `dbCalls`,
+// separately from `calls` so the GHL mutation counts stay exact.
+process.env.SUPABASE_URL = 'http://supabase.test';
+process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service-key';
 
 process.env.GHL_API_KEY = 'test-key';
-// Intentionally NOT setting SUPABASE_*.
 
 // ─── fetch stub with a mutable "GHL calendar" ────────────────────────────
 let calls = [];
+let dbCalls = []; // PostgREST requests, kept out of `calls` on purpose
+let seqCounter = 0; // shared ordering clock across the GHL and PostgREST legs
 let ghlCalendar = []; // events returned on GET /contacts/{id}/appointments
 
 function jsonRes(body) {
@@ -54,9 +59,21 @@ function jsonRes(body) {
 
 globalThis.fetch = async (url, opts = {}) => {
   const method = opts.method || 'GET';
-  const path = String(url).replace('https://services.leadconnectorhq.com', '');
+  const raw = String(url);
+
+  const seq = seqCounter++; // one clock across both legs, so order is assertable
+
+  // PostgREST leg — recorded apart from the GHL calls.
+  if (raw.startsWith('http://supabase.test')) {
+    let parsed = null;
+    try { parsed = opts.body ? JSON.parse(opts.body) : null; } catch { parsed = opts.body; }
+    dbCalls.push({ seq, method, path: raw.replace('http://supabase.test', ''), body: parsed });
+    return jsonRes(method === 'GET' ? [] : {});
+  }
+
+  const path = raw.replace('https://services.leadconnectorhq.com', '');
   const body = opts.body ? JSON.parse(opts.body) : null;
-  calls.push({ method, path, body });
+  calls.push({ seq, method, path, body });
 
   if (method === 'GET' && /^\/contacts\/[^/]+\/appointments/.test(path)) {
     return jsonRes({ events: ghlCalendar });
@@ -94,8 +111,13 @@ const LEAD_DATE = '2027-07-08T10:00:00+00:00'; // LP wall-clock-mislabeled-UTC
 const lead = (disposition_code) => ({ lp_lead_id: '555360', disposition_code, appointment_date: LEAD_DATE });
 const mutations = () => calls.filter((c) => c.method === 'POST' || c.method === 'PUT');
 
+// Rows this test's PostgREST stub saw written to `table`.
+const dbWrites = (table) => dbCalls.filter(
+  (c) => (c.method === 'POST' || c.method === 'PATCH') && c.path.startsWith(`/rest/v1/${table}`)
+);
+
 test('fixed point: Set→Cnf→CXL each converge — the second pass is mutation-free', async () => {
-  calls = []; ghlCalendar = [];
+  calls = []; dbCalls = []; ghlCalendar = [];
 
   // Set, pass 1: creates.
   let res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
@@ -151,8 +173,52 @@ test('reverse-leg guard: our POSTed startTime is date-equal AND wall-time-equal 
   assert.equal(toLpApptTime(postedWallTime), toLpApptTime('10:00'));
 });
 
+/**
+ * 2026-09-09 — LP→GHL CANCEL ECHO.
+ *
+ * Rule 271 LP_DISP_CANCEL_COLD_TO_S5_2 already answers an LP-originated CXL off
+ * lp.disposition_changed. The cancel PUT this reconciler makes fires
+ * ghl.appointment_cancelled, which rules 171 and 107 also answer — so one
+ * cancellation produced two task cards and two S5.2 routes (15–17 leads/day;
+ * reproduced on Wally Scott 2LT4JDrObOgPlKnn3H0q at 21:29Z, agent_actions
+ * 439330–439348). The reschedule-inflight marker, set BEFORE the PUT,
+ * suppresses the echo without touching 271.
+ */
+test('CXL reconcile sets the reschedule-inflight marker before cancelling', async () => {
+  calls = []; dbCalls = []; ghlCalendar = [];
+
+  await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
+
+  calls = []; dbCalls = [];
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('CXL') });
+  assert.equal(res.outcome, 'cancelled');
+
+  const marks = dbWrites('reschedule_inflight');
+  assert.equal(marks.length, 1, 'exactly one reschedule_inflight marker per cancellation');
+  assert.equal(marks[0].body.contact_id, 'c1');
+  assert.ok(new Date(marks[0].body.expires_at) > new Date(), 'marker must not be pre-expired');
+
+  // ORDER IS THE WHOLE POINT: a marker written after the PUT loses the race
+  // with the webhook it is meant to suppress.
+  const cancelPut = calls.find((c) => c.method === 'PUT' && c.path.startsWith('/calendars/'));
+  assert.ok(cancelPut, 'the cancel PUT must have happened');
+  assert.ok(
+    marks[0].seq < cancelPut.seq,
+    `marker (seq ${marks[0].seq}) must be written BEFORE the cancel PUT (seq ${cancelPut.seq})`,
+  );
+});
+
+test('a noop CXL (nothing to cancel) does not set the marker', async () => {
+  calls = []; dbCalls = []; ghlCalendar = [];
+
+  const res = await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('CXL') });
+  assert.equal(res.outcome, 'noop');
+  assert.equal(res.reason, 'nothing_to_cancel');
+  assert.equal(dbWrites('reschedule_inflight').length, 0);
+});
+
 test('round trip is stable across a reschedule: LP moves the time, second pass converges', async () => {
-  calls = []; ghlCalendar = [];
+  calls = []; dbCalls = []; ghlCalendar = [];
 
   await reconcileLpAppointmentToGhl({ contactId: 'c1', lead: lead('Set') });
   const moved = { ...lead('Set'), appointment_date: '2027-07-08T14:00:00+00:00' };

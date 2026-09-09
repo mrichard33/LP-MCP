@@ -191,9 +191,43 @@ export async function matchToGHL(lpLead) {
   return null;
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// TAG NORMALIZATION — objection-confirmed family (2026-09-09)
+//
+// The objection-confirmed family is written in TWO shapes across the system:
+//   objection-confirmed-competitor   ← what GHL actually branches on
+//   objection-confirmed:competitor   ← the namespaced form, matches nothing
+//
+// O.0 Objection Handler (fdf4ad82-33ab-4e73-b581-18d21d51ac42) step 20 tests
+// the HYPHEN form. A colon-form tag is a silently dead write: it lands on the
+// contact, no workflow reads it, and the lead enters no arc. That is exactly
+// how Wally Scott (2LT4JDrObOgPlKnn3H0q / LP 573728) — a lead who had signed
+// with a competitor inside the Florida rescission window — received nothing on
+// 2026-09-09.
+//
+// Fixing the one producer that got it wrong leaves every future producer free
+// to get it wrong again, so the correction lives at the chokepoint every tag
+// write passes through instead. Colon → hyphen, one warn line naming the
+// offender so the root can be fixed at the source too.
+// ═══════════════════════════════════════════════════════════════════
+const OBJECTION_PREFIX_COLON = /^objection-confirmed:([a-z-]+)$/i;
+
+export function normalizeTag(tag) {
+  const m = OBJECTION_PREFIX_COLON.exec(String(tag || '').trim());
+  if (m) {
+    const fixed = `objection-confirmed-${m[1].toLowerCase()}`;
+    console.warn(`[GHL] tag normalized: "${tag}" → "${fixed}" (O.0 branches on the hyphen form)`);
+    return fixed;
+  }
+  return tag;
+}
+
 // Apply tag via POST (additive) — NEVER use PUT which replaces all tags
 export async function applyGHLTag(ghlContactId, tag) {
   if (ghlDisabled || !ghlClient || !ghlContactId) return false;
+  // Chokepoint normalization: every producer that reaches GHL through this
+  // helper gets the hyphen form of the objection-confirmed family.
+  tag = normalizeTag(tag);
   // 2026-07-03 — tag hygiene backstop (all callers): a tag ending in ':' is
   // an empty namespace value (failed template interpolation). Refuse it.
   if (typeof tag === 'string' && tag.trim().endsWith(':')) {

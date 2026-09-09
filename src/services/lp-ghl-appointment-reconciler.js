@@ -59,6 +59,7 @@ import { lpWallClockToGhlStartTime } from '../appointment-dates.js';
 // convert either to a const arrow, and do not add module-level calls.
 import { findExistingAppointment, emitSlotCheckEvent, isSlotCheckEnabled } from '../appointments/slot-check.js';
 import { applyAppointmentFormatForContact } from '../appointments/format-contact.js';
+import { markRescheduleInflight } from './reschedule-inflight.js';
 
 export const WINDOW_ESTIMATE_CALENDAR_ID = BOOKING_CALENDARS.WINDOW_ESTIMATE;
 
@@ -471,9 +472,24 @@ export async function reconcileLpAppointmentToGhl({ contactId, lead, toNotify = 
   }
 
   if (plan.op === 'cancel') {
-    // NO reschedule-inflight marker here: an LP CXL is a real customer
-    // cancellation — the rebook/rescue rules (GHL_APPT_CANCELLED_REBOOK*)
-    // SHOULD see the cancellation webhook.
+    // 2026-09-09 — MARK RESCHEDULE-INFLIGHT BEFORE THE PUT. This reverses the
+    // prior comment ("NO marker here: an LP CXL is a real customer
+    // cancellation — the rebook/rescue rules SHOULD see the webhook"), which
+    // was written before rule 271 existed.
+    //
+    // Rule 271 LP_DISP_CANCEL_COLD_TO_S5_2 already handles an LP-originated
+    // CXL directly off the lp.disposition_changed event. Our mirrored cancel
+    // then fires ghl.appointment_cancelled, which rules 171
+    // (GHL_APPT_CANCELLED_REBOOK_COLD) and 107 (GHL_APPT_CANCELLED_REBOOK)
+    // also answer — so ONE cancellation produced TWO task cards and TWO S5.2
+    // routes. Measured 15–17 leads/day on the 2026-09-09 marks table;
+    // reproduced on Wally Scott (2LT4JDrObOgPlKnn3H0q) at 21:29Z, agent_actions
+    // 439330–439348.
+    //
+    // The marker does not lose the cancellation — 271 is the rule that owns
+    // it. It only suppresses the echo. Best-effort: a marker failure means the
+    // duplicate comes back, never that the cancel is skipped.
+    await markRescheduleInflight(contactId).catch(() => {});
     // Cancels EVERY active estimate-pool appointment (normally exactly one;
     // more than one is the duplicate anomaly, and LP says the estimate is
     // dead either way).

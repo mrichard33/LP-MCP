@@ -122,7 +122,7 @@ CONVERSATION HISTORY (most recent last):
 ANTI-REPETITION (HARD RULE): NEVER send a message substantially identical (~80%+ similar) to ANY [outbound] above. If what you were about to say has already been said, say something meaningfully different or advance the conversation to its next step instead.
 ANSWERED-QUESTION (HARD RULE): before drafting, check whether the newest [inbound] ANSWERS a question your last [outbound] asked. If it does, ACT on the answer — confirm it, schedule it, book it. Never re-ask a question the lead has answered ("4:00 PM works" answers "3:30 or 4:00?" — the only valid reply confirms 4:00 PM). Re-asking reads as not listening and destroys trust.
 
-═══════ EXISTING APPOINTMENTS (active, future) — AUTHORITATIVE for cancel/reschedule ═══════
+═══════ EXISTING APPOINTMENTS (active — upcoming, plus any that ended in the last 24h) — AUTHORITATIVE for cancel/reschedule ═══════
   [1] appointment_id="appt_0001" | calendar="Window Estimate" | start="Friday, September 4 at 10:00 AM" (2026-09-04T14:00:00Z) | status="new" | title="Window Estimate — Dana Whitfield"
 When emitting cancel_appointment or reschedule_appointment companions, use ONLY appointment_id values from this block.
 ═══════ END EXISTING APPOINTMENTS ═══════
