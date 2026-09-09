@@ -15,7 +15,8 @@ echoes a second S5.2 route.
   `objection-confirmed-competitor` (hyphen), the tag O.0 step 20 actually
   branches on. The colon form it wrote before matched nothing. Header corrected:
   O.RR was never built; the rescue arc is the O.0 competitor branch
-  (`fdf4ad82-33ab-4e73-b581-18d21d51ac42`, PUBLISHED v154, trigger active).
+  (`fdf4ad82-33ab-4e73-b581-18d21d51ac42`) — PUBLISHED with an active trigger,
+  read live as version 157 on 2026-09-09.
 - **`src/ghl.js`** — new exported `normalizeTag()`, applied inside
   `applyGHLTag()` and in the `add_tag` handler
   (`src/actions/handlers/tags.js`). Any `objection-confirmed:<value>` is
