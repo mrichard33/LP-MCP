@@ -554,7 +554,7 @@ export async function processCanvassingLead(payload, deps = {}) {
           narrative: `Lead cannot post to LP — missing ${missing.join(', ')}. Fix the contact in GHL and resubmit. ${link}`,
           actWithin: '1 hour',
         }),
-        { channel: 'canvass', flushNow: true }
+        { channel: 'canvass', flushNow: true, market }
       );
       await writeCanvassMark(
         { dedup_key: p.ghl_contact_id, ghl_contact_id: p.ghl_contact_id, phone: p.phone_raw, status: 'lp_failed' },
@@ -584,7 +584,7 @@ export async function processCanvassingLead(payload, deps = {}) {
           market,
           narrative: `${detail} Lead posts to LP without an appointment — set the time manually in LP. ${link}`,
         }),
-        { channel: 'canvass', flushNow: true }
+        { channel: 'canvass', flushNow: true, market }
       );
     } else if (appt.status === 'beyond_window') {
       await d.sendGroupMeMessage(
@@ -596,7 +596,7 @@ export async function processCanvassingLead(payload, deps = {}) {
           appointmentDisplay: apptDisplay,
           narrative: `Appointment is ${Math.round(appt.hoursOut)}h out — beyond the ${APPT_WINDOW_HOURS}h canvassing window (Friday→Monday excepted). Posted as Set anyway; verify the supervisor exception. ${link}`,
         }),
-        { channel: 'canvass', flushNow: true }
+        { channel: 'canvass', flushNow: true, market }
       );
     }
 
@@ -637,7 +637,7 @@ export async function processCanvassingLead(payload, deps = {}) {
             + ` unaffected. Re-seed the roster if this canvasser is new; otherwise check what`
             + ` GHL is putting in that field.`,
         }),
-        { channel: 'canvass', flushNow: true },
+        { channel: 'canvass', flushNow: true, market },
       );
     }
 
@@ -663,7 +663,7 @@ export async function processCanvassingLead(payload, deps = {}) {
           narrative: `Canvassing lead did NOT reach LP after retries. Enter manually or re-fire the intake. ${link}`,
           actWithin: '30 minutes',
         }),
-        { channel: 'canvass', flushNow: true }
+        { channel: 'canvass', flushNow: true, market }
       );
       return { outcome: 'lp_failed', appt_status: appt.status };
     }
@@ -681,7 +681,7 @@ export async function processCanvassingLead(payload, deps = {}) {
           canvasserName,
           narrative: `LP accepted the canvassing lead but the inbound ID could not be read from the response — LP Inbound Lead ID not written back to GHL. ${link}`,
         }),
-        { channel: 'canvass', flushNow: true }
+        { channel: 'canvass', flushNow: true, market }
       );
     }
 
@@ -715,7 +715,7 @@ export async function processCanvassingLead(payload, deps = {}) {
             lpRef: in1Id ? `inbound #${in1Id}` : undefined,
             narrative: `SalesRabbit lead ${p.salesrabbit_id} was not updated (${sr.reason || 'unknown'}). LP intake completed normally. ${link}`,
           }),
-          { channel: 'canvass', flushNow: true }
+          { channel: 'canvass', flushNow: true, market }
         );
       }
     }
@@ -775,7 +775,7 @@ export async function processCanvassingLead(payload, deps = {}) {
         appointmentDisplay: apptDisplay,
         narrative: `Canvassing lead posted to LP${in1Id ? ` (inbound #${in1Id})` : ''}${apptDisplay ? ' as Set' : ' without an appointment'}. SMS confirmation flow takes it from here.`,
       }),
-      { channel: 'canvass', flushNow: true }
+      { channel: 'canvass', flushNow: true, market }
     );
 
     console.log(`[Canvassing] ${p.ghl_contact_id} → LP ok in1_id=${in1Id || '(none)'} appt=${appt.status}`);
