@@ -109,6 +109,11 @@ import { getContactCached, setCachedContactTags } from '../contact-cache.js';
 // so suppression gates see executor tag mutations without waiting for the GHL
 // tag webhook round-trip. Fail-soft: never blocks the parent action.
 import { applyTagsToSnapshot } from '../../services/tag-snapshot.js';
+// 2026-09-09 — objection-confirmed family normalizer. executeAddTag POSTs
+// through ghlFetch, NOT through applyGHLTag, so the chokepoint in src/ghl.js
+// does not cover this path. Both producers must normalize or a rule-authored
+// `objection-confirmed:competitor` still lands dead on the contact.
+import { normalizeTag } from '../../ghl.js';
 
 // TAG-WRITE CONTRACT (do not break): tag mutations are ADDITIVE.
 //   add    → POST /contacts/{id}/tags { tags: [...] }   (GHL appends)
@@ -161,7 +166,7 @@ export const NAMESPACE_FALLBACK_VALUES = {
 
 export async function executeAddTag(action, context = {}) {
   const contactId = action.target_id;
-  const tag = action.action_payload?.tag;
+  const tag = normalizeTag(action.action_payload?.tag);
   if (!contactId || !tag) throw new Error('Missing contactId or tag');
 
   // 2026-07-03 — tag hygiene: a tag ending in ':' is a namespace with an

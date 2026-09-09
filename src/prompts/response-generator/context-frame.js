@@ -113,7 +113,7 @@ export const EXISTING_APPOINTMENTS_FOOTER = [
 // v2.7.8. Present only when the fetch returned appointments — the model is told elsewhere that an absent block means none on file.
 // Was response-generator.js:1346.
 export const EXISTING_APPOINTMENTS_HEADER = [
-  `\n═══════ EXISTING APPOINTMENTS (active, future) — AUTHORITATIVE for cancel/reschedule ═══════`,
+  `\n═══════ EXISTING APPOINTMENTS (active — upcoming, plus any that ended in the last 24h) — AUTHORITATIVE for cancel/reschedule ═══════`,
 ];
 
 // One field of one reviewed edit row. The row-level conditionals stay in the

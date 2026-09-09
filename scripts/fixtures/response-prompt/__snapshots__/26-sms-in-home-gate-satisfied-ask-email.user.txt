@@ -104,7 +104,7 @@ GUIDE OFFER STATUS: ELIGIBLE — offer ONLY per the GUIDE OFFER — BOOKING FAIL
 
 ENGAGEMENT: opens=0 | clicks=0 | replies=0 | VSL=not watched
 
-═══════ EXISTING APPOINTMENTS (active, future) — AUTHORITATIVE for cancel/reschedule ═══════
+═══════ EXISTING APPOINTMENTS (active — upcoming, plus any that ended in the last 24h) — AUTHORITATIVE for cancel/reschedule ═══════
   [1] appointment_id="appt_0001" | calendar="Window Estimate" | start="Friday, September 4 at 10:00 AM" (2026-09-04T14:00:00Z) | status="new" | title="Window Estimate — Dana Whitfield"
 When emitting cancel_appointment or reschedule_appointment companions, use ONLY appointment_id values from this block.
 ═══════ END EXISTING APPOINTMENTS ═══════

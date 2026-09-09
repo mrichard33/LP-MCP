@@ -1152,31 +1152,167 @@ async function resolveActiveAppointmentId(contactId) {
   }
 }
 
-export async function executeCancelAppointment(action) {
+/**
+ * Is `appointmentId` actually on this contact's GHL record?
+ *
+ * Returns true / false / null, and the null matters: a lookup failure must NOT
+ * be read as "the id is bad". On an unknown answer we keep the payload id and
+ * let the PUT decide — that is the pre-2026-09-09 behavior, unchanged.
+ */
+async function contactHasAppointmentId(contactId, appointmentId) {
+  if (!contactId || !appointmentId) return null;
+  try {
+    const result = await ghlFetch('GET', `/contacts/${contactId}/appointments`);
+    const list = (Array.isArray(result) ? result : null)
+      || result?.events
+      || result?.appointments
+      || [];
+    if (!Array.isArray(list)) return null;
+    return list.some((a) => (a?.id || a?.appointment_id) === appointmentId);
+  } catch (err) {
+    console.warn(`[ActionExecutor] cancel_appointment: could not verify payload id ${appointmentId} for ${contactId}: ${err.message} — trusting payload`);
+    return null;
+  }
+}
+
+// ghlFetch throws plain Errors carrying the status in the message
+// ("GHL PUT /calendars/events/appointments/x → 400: ..."). 400/404 on a
+// PUT to an appointment id is GHL saying that id does not exist.
+function isBadAppointmentIdError(err) {
+  return /→\s*(400|404)\b/.test(String(err?.message || ''));
+}
+
+/**
+ * Cancel escalation (2026-09-09, Wally Scott 2LT4JDrObOgPlKnn3H0q post-mortem).
+ *
+ * Mirrors the failed-booking escalation in executeBookAppointment, for the same
+ * reason and with more urgency: by the time this action runs, the bot has
+ * ALREADY told the lead the appointment is off the calendar. A silent failure
+ * leaves a live appointment on the books that the homeowner believes is gone —
+ * a rep drives to a house nobody is expecting them at, or the lead is a no-show
+ * on an appointment they thought they cancelled.
+ *
+ * Best-effort throughout; the caller rethrows the original error afterwards.
+ */
+async function escalateCancelFailure(contactId, { payloadId, resolvedId, error }, context) {
+  if (!contactId) return;
+  await applyGHLTag(contactId, 'cancel:failed').catch(() => {});
+  await emitEvent({
+    event_type: 'appointment.cancel_failed',
+    event_subtype: 'ghl_put_error',
+    source: 'lp_mcp',
+    entity_type: 'contact',
+    entity_id: contactId,
+    ghl_contact_id: contactId,
+    payload: { payload_id: payloadId || null, resolved_id: resolvedId || null, error },
+    priority: 'critical',
+    bypass_filter: true,
+  }).catch(() => {});
+  await executeCreateTask({
+    target_id: contactId,
+    action_payload: {
+      title: 'CANCEL FAILED — lead was told the appointment is off the calendar, it is NOT',
+      description:
+        `The agentic cancel for {{contact_name}} did not go through. The lead has already been told ` +
+        `their appointment is cancelled — it is still live in GHL. Cancel it by hand now, or call the ` +
+        `lead back if the appointment should stand. ` +
+        `payload appointment_id: ${payloadId || 'none'} | resolved appointment_id: ${resolvedId || 'none'} | ` +
+        `GHL error: ${error}`,
+      priority: 'high',
+    },
+  }, context).catch((taskErr) =>
+    console.warn(`[ActionExecutor] cancel-failed escalation task failed for ${contactId}: ${taskErr.message}`));
+}
+
+/**
+ * cancel_appointment.
+ *
+ * v3.3 (2026-09-09) — NEVER TRUST THE PAYLOAD ID BLINDLY.
+ *
+ * Root cause it closes: the response-generator emitted a cancel_appointment
+ * companion carrying a HALLUCINATED appointment id (OWd5WhnU2l6x56R9Y9mO for
+ * Wally Scott, 2LT4JDrObOgPlKnn3H0q). The EXISTING APPOINTMENTS prompt block
+ * was empty — fetchUpcomingAppointments is future-only and Wally's slot had
+ * already passed — so the model had no real id to quote and produced one.
+ * GHL returned 400. The action died. Nobody was told. The bot had already
+ * written "you're taken off the calendar" to the homeowner.
+ *
+ * Three layers now stand between a bad id and a silent failure:
+ *   (a) a payload id is checked against the contact's live appointment list
+ *       before the PUT; if it isn't there, resolve the real one;
+ *   (b) a 400/404 on a payload id retries once against the live-resolved id;
+ *   (c) if it still cannot cancel, the failure is LOUD — cancel:failed tag,
+ *       critical event, rep task — and then rethrows.
+ */
+export async function executeCancelAppointment(action, context) {
   const payload = action.action_payload || {};
-  let appointmentId = payload.appointment_id;
+  const contactId = action.target_id;
+  const payloadId = payload.appointment_id || null;
+  let appointmentId = payloadId;
   let resolvedFrom = appointmentId ? 'payload' : null;
   const newStatus = payload.status || 'cancelled';
   const reason = payload.reason || null;
+
+  // (a) Verify the payload id is real before acting on it. Only a definitive
+  // "not on this contact" triggers the fallback — an unverifiable answer
+  // (lookup failed) leaves the payload id in place.
+  let payloadIdRejected = false;
+  if (appointmentId && contactId) {
+    const present = await contactHasAppointmentId(contactId, appointmentId);
+    if (present === false) {
+      payloadIdRejected = true;
+      console.log(`[ActionExecutor] cancel_appointment: payload id ${appointmentId} not on contact — resolving live`);
+      const resolved = await resolveActiveAppointmentId(contactId);
+      appointmentId = resolved || null;
+      resolvedFrom = resolved ? 'live_api_after_invalid_payload' : null;
+    }
+  }
 
   // v3.2 — Fallback: rules that fire from ai.analysis_completed or
   // ghl.appointment_booked (e.g. INTENT_CANCEL_REQUESTED, SPOUSE_GATE_*)
   // know only the contact, not the appointment. Resolve via live GHL
   // appointments API (replaces v3.1's custom-field-based fallback).
-  if (!appointmentId && action.target_id) {
-    appointmentId = await resolveActiveAppointmentId(action.target_id);
+  // Skipped when (a) already resolved — no second lookup for the same answer.
+  if (!appointmentId && !payloadIdRejected && contactId) {
+    appointmentId = await resolveActiveAppointmentId(contactId);
     if (appointmentId) {
       resolvedFrom = 'live_api';
     }
   }
 
   if (!appointmentId) {
-    throw new Error(
-      `Missing appointment_id and live appointments API returned no active appointment for target_id=${action.target_id || 'none'}`
+    const err = new Error(
+      `Missing appointment_id and live appointments API returned no active appointment for target_id=${contactId || 'none'}` +
+      (payloadId ? ` (payload id ${payloadId} is not on the contact)` : '')
     );
+    await escalateCancelFailure(contactId, { payloadId, resolvedId: null, error: err.message }, context);
+    throw err;
   }
 
-  await ghlFetch('PUT', `/calendars/events/appointments/${appointmentId}`, { appointmentStatus: newStatus });
+  try {
+    await ghlFetch('PUT', `/calendars/events/appointments/${appointmentId}`, { appointmentStatus: newStatus });
+  } catch (err) {
+    // (b) A 400/404 on an unverified payload id means the id is wrong even
+    // though the (a) lookup could not prove it. Resolve live and retry ONCE.
+    const canRetry = isBadAppointmentIdError(err) && resolvedFrom === 'payload' && contactId;
+    let retryId = null;
+    if (canRetry) {
+      console.log(`[ActionExecutor] cancel_appointment: PUT on payload id ${appointmentId} → ${err.message} — resolving live and retrying once`);
+      retryId = await resolveActiveAppointmentId(contactId);
+    }
+    if (!retryId || retryId === appointmentId) {
+      await escalateCancelFailure(contactId, { payloadId, resolvedId: retryId, error: err.message }, context);
+      throw err;
+    }
+    try {
+      await ghlFetch('PUT', `/calendars/events/appointments/${retryId}`, { appointmentStatus: newStatus });
+      appointmentId = retryId;
+      resolvedFrom = 'live_api_after_invalid_payload';
+    } catch (retryErr) {
+      await escalateCancelFailure(contactId, { payloadId, resolvedId: retryId, error: retryErr.message }, context);
+      throw retryErr;
+    }
+  }
   console.log(`[ActionExecutor] ✅ Appointment ${appointmentId} status → ${newStatus}${reason ? ` (reason: ${reason})` : ''} [resolved_from: ${resolvedFrom}]`);
 
   // Mirror the cancellation onto the contact record + LP snapshot so
@@ -1334,8 +1470,19 @@ export async function executeRescheduleAppointment(action, context) {
   const payload = interpolatePayload(action.action_payload, context);
   if (!contactId) throw new Error('Missing contactId');
 
-  const oldId = payload.old_appointment_id;
-  if (!oldId) throw new Error('Missing old_appointment_id');
+  // 2026-09-09 — old_appointment_id may legitimately be absent: the
+  // response-generator now STRIPS an id the contact does not actually have
+  // rather than dropping the whole companion (see
+  // validateRescheduleAppointmentCompanion). Resolve the real one live, the
+  // same way the cancel path does, instead of failing the reschedule.
+  let oldId = payload.old_appointment_id;
+  if (!oldId) {
+    oldId = await resolveActiveAppointmentId(contactId);
+    if (oldId) {
+      console.log(`[ActionExecutor] reschedule_appointment: no old_appointment_id in payload — resolved ${oldId} live for ${contactId}`);
+    }
+  }
+  if (!oldId) throw new Error('Missing old_appointment_id and live appointments API returned no active appointment');
 
   // ─── Step 1/2: book the new appointment FIRST ──────────────────────
   const bookPayload = {

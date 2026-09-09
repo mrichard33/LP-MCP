@@ -12,9 +12,14 @@
  * decision like "cancel this appointment", we read GHL directly.
  *
  * Endpoint: GET /contacts/{contactId}/appointments
- * Filtering: future appointments only (endTime > now), excluding any
- * with appointmentStatus 'cancelled'/'noshow'/'no-show'. Cancelled appts
- * are noise for the cancellation flow — the lead doesn't care about them.
+ * Filtering: excludes any appointment with appointmentStatus
+ * 'cancelled'/'noshow'/'no-show' — those are noise for the cancellation flow,
+ * the lead doesn't care about them.
+ *   fetchUpcomingAppointments        → future only (endTime > now).
+ *   fetchRecentAndUpcomingAppointments → future PLUS anything that ended in
+ *                                        the last `pastHours` (default 24).
+ * The widened list exists for the EXISTING APPOINTMENTS prompt block only;
+ * the double-book guards keep the strict future-only view (see below).
  *
  * Returns:
  *   - Array (possibly empty) of upcoming active appointments on success.
@@ -111,6 +116,44 @@ function formatStartTimeForPrompt(iso) {
  * }> | null>}
  */
 export async function fetchUpcomingAppointments(contactId) {
+  return fetchContactAppointments(contactId, { pastHours: 0 });
+}
+
+/**
+ * Same list as fetchUpcomingAppointments, widened backwards: an active
+ * appointment whose end is within the last `pastHours` is KEPT.
+ *
+ * WHY (2026-09-09, Wally Scott 2LT4JDrObOgPlKnn3H0q / LP 573728):
+ * fetchUpcomingAppointments is future-only by design — that is correct for the
+ * double-book guards, which must never see a finished appointment as a live
+ * one. It is wrong for the EXISTING APPOINTMENTS prompt block. Wally's slot had
+ * already passed when he messaged, so the block came back empty, the model had
+ * no appointment_id to quote, and it invented one (OWd5WhnU2l6x56R9Y9mO). GHL
+ * returned 400 on the cancel and the bot had already told him he was "taken off
+ * the calendar."
+ *
+ * A lead who says "cancel my appointment" about a slot that ended an hour ago
+ * is making a perfectly ordinary request. Twenty-four hours of look-back covers
+ * the same-day and next-morning cases without reaching far enough to resurrect
+ * a stale appointment as the model's idea of "current".
+ *
+ * PROMPT-BLOCK USE ONLY. Do NOT route the booking / double-book guards through
+ * this — they need the strict future-only view.
+ *
+ * @param {string} contactId — GHL contact ID
+ * @param {{pastHours?: number}} [opts] — look-back window in hours (default 24)
+ * @returns {Promise<Array|null>} same element shape as fetchUpcomingAppointments
+ */
+export async function fetchRecentAndUpcomingAppointments(contactId, { pastHours = 24 } = {}) {
+  return fetchContactAppointments(contactId, { pastHours });
+}
+
+/**
+ * Shared implementation. `pastHours` is the only knob: 0 = future-only
+ * (the historical fetchUpcomingAppointments contract), >0 keeps active
+ * appointments whose end falls within that many hours in the past.
+ */
+async function fetchContactAppointments(contactId, { pastHours = 0 } = {}) {
   if (!contactId || !GHL_API_KEY) return null;
 
   try {
@@ -140,6 +183,7 @@ export async function fetchUpcomingAppointments(contactId) {
       : (Array.isArray(data?.appointments) ? data.appointments : []);
 
     const now = Date.now();
+    const floorMs = now - Math.max(0, Number(pastHours) || 0) * 3600_000;
     const out = [];
     for (const e of events) {
       // Filter out cancelled / noshow / past appointments.
@@ -151,7 +195,7 @@ export async function fetchUpcomingAppointments(contactId) {
       const endMs = endIso
         ? toEpochMsEt(endIso)
         : (startIso ? toEpochMsEt(startIso) + 90 * 60_000 : NaN);
-      if (Number.isNaN(endMs) || endMs < now) continue;
+      if (Number.isNaN(endMs) || endMs < floorMs) continue;
 
       const calendarId = e.calendarId || e.calendar_id || null;
       out.push({
@@ -163,6 +207,9 @@ export async function fetchUpcomingAppointments(contactId) {
         status: status || 'unknown',
         title: e.title || null,
         start_time_human: formatStartTimeForPrompt(startIso),
+        // True only for the widened window — lets the prompt say "already
+        // started/ended" rather than presenting it as upcoming.
+        already_ended: endMs < now,
       });
     }
 
@@ -246,6 +293,7 @@ export function formatAppointmentsForPrompt(appointments) {
       `calendar="${a.calendar_name}" | ` +
       `start="${a.start_time_human}" (${a.start_time || '?'}) | ` +
       `status="${a.status}"` +
+      (a.already_ended ? ' | ALREADY PASSED (still cancellable)' : '') +
       (a.title ? ` | title="${a.title.slice(0, 60)}"` : '')
     );
   });

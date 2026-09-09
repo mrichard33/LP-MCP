@@ -11,16 +11,30 @@
  *   1. Pull source event, extract inbound message text
  *   2. Detect signing date from text; default to today (D1: aggressive rescue)
  *   3. Compute Florida 3-business-day rescission deadline + variant
- *   4. SYNCHRONOUS: write custom fields + apply tags so GHL workflow O.RR
- *      can fire on the tag trigger immediately
+ *   4. SYNCHRONOUS: write custom fields + apply tags so the GHL rescue
+ *      workflow can fire on the tag trigger immediately
  *   5. QUEUE: GroupMe HIGH-priority alert + emit observability event
  *   6. If past_window: skip rescue, queue graceful-exit hand-off to L.1
  *
- * The actual 72-hour rescue arc lives in GHL workflow O.RR (built by Mark
- * in the GHL UI per Phase 2 build checklist). This handler activates it
- * by tagging + alerting; O.RR consumes the tags and runs the sequence.
+ * WHERE THE RESCUE ARC ACTUALLY LIVES (corrected 2026-09-09):
+ *   O.RR was never built. It exists only in the Phase 2 build checklist —
+ *   there is no such workflow in GHL, so for four months this handler tagged
+ *   contacts for a workflow that could not consume the tags and the rescue
+ *   ran nowhere.
+ *
+ *   The rescue arc is the COMPETITOR BRANCH of O.0 Objection Handler
+ *   (fdf4ad82-33ab-4e73-b581-18d21d51ac42, PUBLISHED v154, trigger active).
+ *   O.0 step 20 branches on the tag `objection-confirmed-competitor` — HYPHEN,
+ *   not colon — or on webhook payload `objection_type == "competitor"`. The
+ *   colon form this handler used to write (`objection-confirmed:competitor`)
+ *   matched neither, which is why Wally Scott (GHL 2LT4JDrObOgPlKnn3H0q,
+ *   LP 573728) entered nothing on 2026-09-09. Enrollment itself is driven by
+ *   agent_rule RESCISSION_RESCUE_HUMAN_OWNED (356), which adds the hyphen tag
+ *   and enrolls O.0 with objection_type in the payload; this handler's tags
+ *   are the state record the routing guards read.
  *
  * Built 2026-05-06 from Thomas Michaud (YTk89Ra5NOOgdtdbgsGF) post-mortem.
+ * Corrected 2026-09-09 from the Wally Scott post-mortem.
  */
 
 import supabase from '../../supabase.js';
@@ -128,12 +142,17 @@ export async function executeComputeRescissionDispatch(action /*, context */) {
     console.warn(`[rescission] no GHL_FIELD_RESCISSION_* env vars set — skipping custom field writes (tags only). See Phase 2 build checklist.`);
   }
 
-  // 4b. SYNCHRONOUS: tag the contact so GHL workflow O.RR can pick it up immediately
+  // 4b. SYNCHRONOUS: tag the contact so the O.0 competitor branch and the
+  // rescission routing guards can read the state immediately.
   const tagsToAdd = [
     `urgency:rescission-${stateLabel}`,
     `rescission-variant:${result.message_variant_key}`,
     `rescission-state:${stateLabel}`,
-    'objection-confirmed:competitor',
+    // HYPHEN, not colon. O.0 step 20 branches on `objection-confirmed-competitor`
+    // (or webhook objection_type == "competitor"); the colon form matches nothing
+    // and left Wally Scott (2LT4JDrObOgPlKnn3H0q / LP 573728) in no rescue arc at
+    // all on 2026-09-09. src/ghl.js normalizeTag is the backstop; this is the root.
+    'objection-confirmed-competitor',
     'intent-rescission-rescue',
   ];
   if (result.past_window) {
@@ -288,7 +307,7 @@ export async function executeComputeRescissionDispatch(action /*, context */) {
       priority: 'high',
       idempotency_key: `rescission_activated_${contactId}_${result.signed_date_iso}`,
     },
-    reasoning: 'Emit rescue-activated event for O.RR workflow + observability.',
+    reasoning: 'Emit rescue-activated event for O.0 competitor-branch observability.',
     confidence: 1.0,
     rule_applied: 'COMPETITOR_RESCISSION_WINDOW',
     status: 'pending',
