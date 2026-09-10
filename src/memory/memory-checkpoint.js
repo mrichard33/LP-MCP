@@ -15,7 +15,7 @@
  * withRetry — 3 attempts, 250 ms / 1 s / 3 s — for transient errors only
  * (network, ECONNRESET, 5xx, "fetch failed"). Validation errors and 4xx are
  * never retried. The sequence is idempotent on retry:
- *   - the session INSERT carries a per-call `checkpoint_key` (uuid, column
+ *   - the session INSERT carries a `checkpoint_key` (column
  *     claude_session_logs.checkpoint_key UNIQUE, sql/096); a retry after the
  *     insert landed but the response was lost finds the row by key and
  *     UPDATEs it instead of inserting a second session;
@@ -23,6 +23,25 @@
  *     rows that already landed are skipped, not duplicated.
  * On final failure the error carries `partial` (everything that did land) so
  * the calling skill can fall back to SQL without re-creating it.
+ *
+ * DETERMINISTIC KEY (sql/099, v2.1). The in-call retry above only covered
+ * retries inside ONE tool call. When the transport drops the RESPONSE, Claude
+ * re-sends the whole checkpoint as a BRAND NEW call — which used to mint a new
+ * random key and insert a twin session (17 duplicate pairs by 2026-09-09).
+ * The key is now a sha256 of the checkpoint's identity instead:
+ *
+ *     surface | session_date | normalized(title)
+ *
+ * normalized = whitespace collapsed, trimmed, lowercased. The SUMMARY is
+ * deliberately excluded — a retry may re-generate slightly different prose and
+ * must still collide. checkpointKeyFor() below is the single definition;
+ * sql/099's claude_checkpoint_key() mirrors it for the backfill.
+ * So every new-session write now looks the row up by key FIRST: found = refresh
+ * (keys union, summary replaced, chat_url never nulled, 'exact' never
+ * downgraded), not found = insert. A lost race on the unique index is caught
+ * (23505) and turned into the same refresh. `inserted` in the result says which
+ * happened, so the reply after a dropped response tells the truth.
+ * Children are deduped the same way — see loadExistingChildren().
  *
  * PROVENANCE GUARD (sql/098, v2.0). A memory row must prove where it came
  * from before it is allowed in:
@@ -55,8 +74,9 @@
  * v1.1 — 2026-09-06. checkpoint_key idempotency + withRetry (#1627).
  * v1.2 — 2026-09-07. session.date_confidence ('exact' | 'write_date', sql/097).
  * v2.0 — 2026-09-08. mode retro, date sanity, MEMORY_GUARD_MODE, conflict rule (sql/098).
+ * v2.1 — 2026-09-09. Deterministic checkpoint_key + idempotent children (sql/099).
  */
-import { randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import supabase from '../supabase.js';
 import { withRetry, CHECKPOINT_RETRY } from './with-retry.js';
 
@@ -79,6 +99,28 @@ const BATCH_WINDOW_MINUTES = 5;
 const BATCH_LIMIT = 3;
 
 export class CheckpointError extends Error {}
+
+// ─── Deterministic identity (sql/099) ──────────────────────────────────────
+// Whitespace (including nbsp and a stray BOM) collapsed to single spaces,
+// trimmed, lowercased. The same class is used in sql/099's regexp_replace, so
+// the two definitions agree byte for byte.
+const WS_RE = /[\s\u00a0\ufeff]+/g;
+
+/** Normalize free text for identity comparison. Not for display. */
+export function normText(v) {
+  return String(v ?? '').replace(WS_RE, ' ').trim().toLowerCase();
+}
+
+/**
+ * The checkpoint's identity key: sha256 of surface|session_date|normalized
+ * title. Two calls describing the same session — a transport-drop retry above
+ * all — produce the same key, so the second one refreshes instead of inserting
+ * a twin. MUST stay identical to claude_checkpoint_key() in sql/099.
+ */
+export function checkpointKeyFor({ surface, date, title } = {}) {
+  const s = String(surface ?? '').trim() || 'chat';
+  return createHash('sha256').update(`${s}|${date ?? ''}|${normText(title)}`).digest('hex');
+}
 
 /** MEMORY_GUARD_MODE: off | shadow (default) | live. */
 export function getGuardMode(env = process.env) {
@@ -334,10 +376,14 @@ async function defaultEmbed(env = process.env) {
 }
 
 /**
- * Write the checkpoint. Returns ids. `db` defaults to the LP Supabase client.
- *   checkpoint_key  uuid for the session insert; generated here when omitted.
- *                   Pass the same key on a manual re-call to resume instead of
- *                   inserting a second session.
+ * Write the checkpoint. Returns ids — including `inserted`: true when a new
+ * session row was created, false when an existing one was refreshed (a retry
+ * after a dropped response, or an explicit session_id). `db` defaults to the LP
+ * Supabase client.
+ *   checkpoint_key  override the identity key. Normally omitted: it is derived
+ *                   from surface|session_date|title (sql/099) so a re-send of
+ *                   the same checkpoint finds its own row instead of inserting
+ *                   a second session.
  *   retry           { attempts, backoffMs, sleep } or false to disable.
  *   env             for MEMORY_GUARD_MODE / MEMORY_CONFLICT_THRESHOLD (tests).
  *   embed           (text) => { embedding } — injected in tests; defaults to
@@ -348,12 +394,15 @@ async function defaultEmbed(env = process.env) {
 export async function applyCheckpoint(input, { db = supabase, now = new Date(), checkpoint_key = null, retry = CHECKPOINT_RETRY, env = process.env, embed, guardMode } = {}) {
   if (!db) throw new Error('Supabase client not configured');
   const c = validateCheckpoint(input, now, env); // validation errors surface before any retry
-  const key = checkpoint_key ? String(checkpoint_key) : randomUUID();
+  // sql/099: identity, not randomness. An explicit key still wins so an older
+  // caller holding a partial.checkpoint_key can resume that exact row.
+  const key = checkpoint_key ? String(checkpoint_key) : checkpointKeyFor({ surface: c.session.surface, date: c.session.date, title: c.session.title });
   const guard = guardMode || getGuardMode(env);
   const out = {
-    session_id: null, checkpoint_key: key, mode: c.mode, updated: false, recovered: false, attempts: 0,
+    session_id: null, checkpoint_key: key, mode: c.mode, inserted: false, updated: false, recovered: false, raced: false, attempts: 0,
     guard: { mode: guard, checks: [] }, conflict_check: null,
     decision_ids: [], issue_ids: [], pending_ids: [], resolved: [], verified: [], closed: [], superseded: [], confirmed: [], ledger: null,
+    deduped: { decisions: 0, issues: 0, pending: 0 },
   };
   const embedFn = embed === undefined ? await defaultEmbed(env) : embed;
   out.guard.checks = await runGuard(c, { db, now, env, guard, embed: embedFn, threshold: getConflictThreshold(env), out });
@@ -370,10 +419,39 @@ export async function applyCheckpoint(input, { db = supabase, now = new Date(), 
 
 function partialOf(out) {
   const p = { checkpoint_key: out.checkpoint_key, attempts: out.attempts, mode: out.mode };
-  if (out.session_id) { p.session_id = out.session_id; p.updated = out.updated; }
+  if (out.session_id) { p.session_id = out.session_id; p.updated = out.updated; p.inserted = out.inserted; }
   for (const k of ['decision_ids', 'issue_ids', 'pending_ids', 'resolved', 'verified', 'closed', 'superseded', 'confirmed']) if (out[k].length) p[k] = [...out[k]];
   if (out.ledger) p.ledger = out.ledger;
   return p;
+}
+
+const EMPTY_CHILDREN = Object.freeze({ decisions: new Map(), issues: new Map(), pending: new Map() });
+
+/** normalized text -> existing row id, for the children still live on a session. */
+function indexByText(rows, textCol, isLive) {
+  const m = new Map();
+  for (const r of Array.isArray(rows) ? rows : []) {
+    if (!isLive(r)) continue;
+    const k = normText(r[textCol]);
+    if (k && !m.has(k)) m.set(k, r.id);
+  }
+  return m;
+}
+
+/**
+ * What is already on this session, so a re-sent checkpoint appends nothing
+ * twice. Scoped to live rows only (mirrors the sql/099 partial indexes): an
+ * item that was closed and is later legitimately re-raised is not blocked.
+ */
+async function loadExistingChildren(db, sid) {
+  const dec = must(await db.from('claude_decision_log').select('id, decision, status').eq('session_id', sid), 'existing decisions');
+  const iss = must(await db.from('claude_known_issues').select('id, description, status').eq('reported_session_id', sid), 'existing issues');
+  const pen = must(await db.from('claude_pending_items').select('id, description, status').eq('source_session_id', sid), 'existing pending');
+  return {
+    decisions: indexByText(dec, 'decision', (r) => (r.status ?? 'active') === 'active'),
+    issues: indexByText(iss, 'description', (r) => ['open', 'in_progress'].includes(r.status ?? 'open')),
+    pending: indexByText(pen, 'description', (r) => (r.status ?? 'open') === 'open'),
+  };
 }
 
 /** One attempt. Every step is guarded by `out`, so a re-run only does what has not landed yet. */
@@ -381,22 +459,18 @@ async function writeCheckpoint(c, { db, now, key, out, resume }) {
   const nowIso = now.toISOString();
   const retro = c.mode === 'retro';
 
-  // 1. Session row — UPDATE the named one, else INSERT (keyed on checkpoint_key).
+  // 1. Session row — UPDATE the named one, else the one that already owns this
+  //    identity key, else INSERT. The key is deterministic (sql/099), so a
+  //    re-sent checkpoint after a dropped response resolves to its own row here
+  //    and refreshes it instead of inserting a twin session (#1627).
   const SESSION_COLS = 'id, transcript_search_keys, link_confidence, chat_url, log_origin';
   let keys = c.session.search_keys;
   let sessionId = c.session_id;
   let cur = null;
-  if (!sessionId && !out.session_id && resume) {
-    // A previous attempt may have inserted the row and lost the response.
-    cur = must(await db.from('claude_session_logs').select(SESSION_COLS).eq('checkpoint_key', key).maybeSingle(), 'find session by key');
-    if (cur?.id) { sessionId = cur.id; out.recovered = true; } else cur = null;
-  }
-  if (out.session_id) {
-    keys = out.keys || keys;
-  } else if (sessionId) {
-    if (!cur) cur = must(await db.from('claude_session_logs').select(SESSION_COLS).eq('id', sessionId).maybeSingle(), 'load session');
-    if (!cur) throw new CheckpointError(`session ${sessionId} not found`);
-    keys = [...new Set([...(Array.isArray(cur.transcript_search_keys) ? cur.transcript_search_keys : []), ...keys])].slice(0, 12);
+
+  /** Refresh an existing session: keys union, link never downgraded, url never nulled. */
+  const refresh = async (id, row) => {
+    keys = [...new Set([...(Array.isArray(row?.transcript_search_keys) ? row.transcript_search_keys : []), ...keys])].slice(0, 12);
     const patch = { transcript_search_keys: keys, updated_at: nowIso };
     if (c.session.summary) patch.raw_summary = c.session.summary;
     if (c.session.title) patch.session_title = c.session.title;
@@ -405,27 +479,62 @@ async function writeCheckpoint(c, { db, now, key, out, resume }) {
     // must not reset a 'write_date' session back to the default.
     if (c.session.date_confidence_given) patch.date_confidence = c.session.date_confidence;
     // A nightly draft that Mark refreshes from inside the chat becomes a real session.
-    if (cur.log_origin === 'nightly') { patch.log_origin = 'live'; patch.validation_status = 'passed'; }
-    if (c.session.chat_url && cur.link_confidence !== 'exact') {
+    if (row?.log_origin === 'nightly') { patch.log_origin = retro ? 'retro' : 'live'; patch.validation_status = 'passed'; }
+    if (c.session.chat_url && row?.link_confidence !== 'exact') {
       patch.chat_url = c.session.chat_url; patch.chat_title = c.session.chat_title; patch.link_confidence = 'exact';
     }
-    must(await db.from('claude_session_logs').update(patch).eq('id', sessionId), 'update session');
-    out.session_id = sessionId; out.updated = true; out.keys = keys;
+    must(await db.from('claude_session_logs').update(patch).eq('id', id), 'update session');
+    out.session_id = id; out.updated = true; out.inserted = false; out.keys = keys;
+  };
+
+  if (out.session_id) {
+    keys = out.keys || keys;
   } else {
-    const row = {
-      session_date: c.session.date, session_title: c.session.title, phase_focus: c.session.phase_focus,
-      workflows_touched: c.session.workflows_touched, phase_status: {}, decisions_made: [], issues_found: [],
-      issues_resolved: [], pending_items: [], board_versions: [], mcp_verified_ids: c.session.mcp_verified_ids,
-      next_steps: [], raw_summary: c.session.summary, chat_url: c.session.chat_url, chat_title: c.session.chat_title,
-      transcript_search_keys: keys, surface: c.session.surface, log_origin: retro ? 'retro' : 'live',
-      link_confidence: c.session.chat_url ? 'exact' : 'unlinked', checkpoint_key: key,
-      date_confidence: c.session.date_confidence,
-    };
-    if (retro) row.source_chat_updated_at = c.source.chat_updated_at; // sql/098 column; only sent for retro rows
-    const ins = must(await db.from('claude_session_logs').insert(row).select('id').single(), 'insert session');
-    out.session_id = ins.id; out.keys = keys;
+    if (!sessionId) {
+      cur = must(await db.from('claude_session_logs').select(SESSION_COLS).eq('checkpoint_key', key).maybeSingle(), 'find session by key');
+      // `resume` distinguishes the two ways this hits: an earlier ATTEMPT of
+      // this same call landed the insert and lost the response (recovered), or
+      // an earlier CALL wrote the session and this is a plain refresh.
+      if (cur?.id) { sessionId = cur.id; if (resume) out.recovered = true; } else cur = null;
+    }
+    if (sessionId) {
+      if (!cur) cur = must(await db.from('claude_session_logs').select(SESSION_COLS).eq('id', sessionId).maybeSingle(), 'load session');
+      if (!cur) throw new CheckpointError(`session ${sessionId} not found`);
+      await refresh(sessionId, cur);
+    } else {
+      const row = {
+        session_date: c.session.date, session_title: c.session.title, phase_focus: c.session.phase_focus,
+        workflows_touched: c.session.workflows_touched, phase_status: {}, decisions_made: [], issues_found: [],
+        issues_resolved: [], pending_items: [], board_versions: [], mcp_verified_ids: c.session.mcp_verified_ids,
+        next_steps: [], raw_summary: c.session.summary, chat_url: c.session.chat_url, chat_title: c.session.chat_title,
+        transcript_search_keys: keys, surface: c.session.surface, log_origin: retro ? 'retro' : 'live',
+        link_confidence: c.session.chat_url ? 'exact' : 'unlinked', checkpoint_key: key,
+        date_confidence: c.session.date_confidence,
+      };
+      if (retro) row.source_chat_updated_at = c.source.chat_updated_at; // sql/098 column; only sent for retro rows
+      try {
+        const ins = must(await db.from('claude_session_logs').insert(row).select('id').single(), 'insert session');
+        out.session_id = ins.id; out.inserted = true; out.keys = keys;
+      } catch (err) {
+        // Lost the race on the unique key: a concurrent call inserted this same
+        // identity between our lookup and our insert. That IS the fix working —
+        // adopt their row and refresh it rather than failing the checkpoint.
+        if (String(err.code) !== '23505') throw err;
+        const won = must(await db.from('claude_session_logs').select(SESSION_COLS).eq('checkpoint_key', key).maybeSingle(), 'find session after key conflict');
+        if (!won?.id) throw err;
+        out.raced = true;
+        await refresh(won.id, won);
+      }
+    }
   }
   const sid = out.session_id;
+
+  // Children are only idempotent if we check: when this call did NOT create the
+  // session row, an earlier call may already have written these very decisions,
+  // issues and pending items under it. Skipping by normalized text mirrors the
+  // partial unique indexes in sql/099 section E (which are the backstop under a
+  // race); the lookup is one query per table, not one per item.
+  const existing = out.inserted ? EMPTY_CHILDREN : await loadExistingChildren(db, sid);
 
   // 2. Decisions (+ supersede / re-confirm).
   for (let i = 0; i < c.decisions.length; i++) {
@@ -442,14 +551,20 @@ async function writeCheckpoint(c, { db, now, key, out, resume }) {
       continue;
     }
     if (out.decision_ids[i] == null) {
-      const row = {
-        session_id: sid, decision_date: c.session.date, category: d.category, decision: d.decision,
-        options_considered: d.options, rationale: d.rationale, workflow_code: d.workflow_code,
-        reversible: true, transcript_search_keys: keys,
-      };
-      if (retro) { row.origin = 'retro'; row.confidence = d.confirmed_by_mark ? 'confirmed' : 'reconstructed'; }
-      const ins = must(await db.from('claude_decision_log').insert(row).select('id').single(), 'insert decision');
-      out.decision_ids[i] = ins.id;
+      const already = existing.decisions.get(normText(d.decision));
+      if (already != null) {
+        // Same decision text already active on this session — a re-send.
+        out.decision_ids[i] = already; out.deduped.decisions++;
+      } else {
+        const row = {
+          session_id: sid, decision_date: c.session.date, category: d.category, decision: d.decision,
+          options_considered: d.options, rationale: d.rationale, workflow_code: d.workflow_code,
+          reversible: true, transcript_search_keys: keys,
+        };
+        if (retro) { row.origin = 'retro'; row.confidence = d.confirmed_by_mark ? 'confirmed' : 'reconstructed'; }
+        const ins = must(await db.from('claude_decision_log').insert(row).select('id').single(), 'insert decision');
+        out.decision_ids[i] = ins.id;
+      }
     }
     if (d.supersedes_id && !out.superseded.includes(d.supersedes_id)) {
       must(await db.from('claude_decision_log').update({ status: 'superseded', superseded_by: out.decision_ids[i] }).eq('id', d.supersedes_id), 'supersede decision');
@@ -466,6 +581,8 @@ async function writeCheckpoint(c, { db, now, key, out, resume }) {
   for (let i = 0; i < c.issues.length; i++) {
     if (out.issue_ids[i] != null) continue;
     const x = c.issues[i];
+    const already = existing.issues.get(normText(x.description));
+    if (already != null) { out.issue_ids[i] = already; out.deduped.issues++; continue; }
     const row = {
       reported_date: c.session.date, reported_session_id: sid, severity: x.severity, category: x.category,
       description: x.description, impact: x.impact, fix_instructions: x.fix_instructions,
@@ -491,6 +608,11 @@ async function writeCheckpoint(c, { db, now, key, out, resume }) {
 
   // 4. Pending items (source_index continues from the session's highest 'live' index —
   //    re-queried on a retry, so rows inserted by an earlier attempt are counted).
+  for (let i = 0; i < c.pending.length; i++) {
+    if (out.pending_ids[i] != null) continue;
+    const already = existing.pending.get(normText(c.pending[i].description));
+    if (already != null) { out.pending_ids[i] = already; out.deduped.pending++; }
+  }
   if (c.pending.some((_, i) => out.pending_ids[i] == null)) {
     const last = must(await db.from('claude_pending_items').select('source_index').eq('source_session_id', sid).eq('source_field', 'live').order('source_index', { ascending: false }).limit(1), 'pending index');
     let idx = (last && last[0] && Number.isInteger(last[0].source_index)) ? last[0].source_index + 1 : 0;
@@ -538,7 +660,10 @@ export function planCheckpoint(input, now = new Date(), env = process.env) {
     dry_run: true,
     mode: c.mode,
     guard_mode: getGuardMode(env),
-    session: c.session_id ? `UPDATE claude_session_logs #${c.session_id}` : `INSERT claude_session_logs (${c.session.surface}, ${c.session.date}, ${c.mode})`,
+    session: c.session_id ? `UPDATE claude_session_logs #${c.session_id}` : `INSERT claude_session_logs (${c.session.surface}, ${c.session.date}, ${c.mode}) — or UPDATE if this identity already exists`,
+    // The identity a re-send would collide on (sql/099). Same key = same session.
+    checkpoint_key: c.session_id ? null : checkpointKeyFor({ surface: c.session.surface, date: c.session.date, title: c.session.title }),
+    identity: c.session_id ? null : `${c.session.surface}|${c.session.date}|${normText(c.session.title)}`,
     date_confidence: c.session.date_confidence,
     source: c.source,
     search_keys: c.session.search_keys,

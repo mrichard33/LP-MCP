@@ -9,12 +9,15 @@ import { validateCheckpoint, planCheckpoint, applyCheckpoint, CheckpointError } 
 /**
  * Minimal chainable fake: records every call, returns canned rows.
  *   seed.session   row returned for a lookup by id
- *   seed.byKey     row returned for a lookup by checkpoint_key
+ *   seed.byKey     row returned for a lookup by checkpoint_key — a value, or a
+ *                  (nthLookup) => row|null so a test can make the row appear
+ *                  only after an insert landed
  *   seed.fail      (ctx, n) => error|null — inject a failure for the n-th call
  */
 function fakeDb(seed = {}) {
   const calls = [];
   let nextId = 900;
+  let keyLookups = 0;
   const make = (table) => {
     const ctx = { table, op: null, payload: null, filters: [] };
     const chain = {
@@ -32,7 +35,11 @@ function fakeDb(seed = {}) {
       if (injected) return { data: null, error: injected, status: injected.status };
       if (ctx.op === 'insert') return { data: { id: nextId++ }, error: null };
       if (ctx.op === null && table === 'claude_session_logs' && maybe) {
-        if (ctx.filters.some(([k]) => k === 'checkpoint_key')) return { data: seed.byKey ?? null, error: null };
+        if (ctx.filters.some(([k]) => k === 'checkpoint_key')) {
+          keyLookups += 1;
+          const row = typeof seed.byKey === 'function' ? seed.byKey(keyLookups) : seed.byKey;
+          return { data: row ?? null, error: null };
+        }
         return { data: seed.session ?? null, error: null };
       }
       if (ctx.op === null && table === 'claude_pending_items') return { data: seed.lastIndex != null ? [{ source_index: seed.lastIndex }] : [], error: null };
@@ -112,14 +119,15 @@ test('apply (refresh): unknown session id fails before any write', async () => {
 });
 
 // ─── Transport retry + idempotency (issue #1627) ──────────────────────────
-test('apply (new session): the session INSERT carries a per-call checkpoint_key and the result echoes it', async () => {
+test('apply (new session): the session INSERT carries the deterministic checkpoint_key and the result echoes it', async () => {
   const db = fakeDb();
   const out = await applyCheckpoint(base, { db, retry: NO_RETRY_WAIT });
   const sess = db.calls.find((c) => c.table === 'claude_session_logs' && c.op === 'insert').payload;
-  assert.match(sess.checkpoint_key, /^[0-9a-f-]{36}$/);
+  assert.match(sess.checkpoint_key, /^[0-9a-f]{64}$/, 'sha256 of the identity, not a uuid (sql/099)');
   assert.equal(out.checkpoint_key, sess.checkpoint_key); assert.equal(out.attempts, 1); assert.equal(out.recovered, false);
+  assert.equal(out.inserted, true);
   const given = await applyCheckpoint(base, { db: fakeDb(), retry: NO_RETRY_WAIT, checkpoint_key: '11111111-1111-4111-8111-111111111111' });
-  assert.equal(given.checkpoint_key, '11111111-1111-4111-8111-111111111111');
+  assert.equal(given.checkpoint_key, '11111111-1111-4111-8111-111111111111', 'an explicit key still wins');
 });
 
 test('a transient failure mid-sequence is retried and the retry only writes what has not landed', async () => {
@@ -137,18 +145,21 @@ test('a transient failure mid-sequence is retried and the retry only writes what
   assert.equal(inserts('claude_pending_items').length, 2);
   assert.equal(db.calls.filter((c) => c.table === 'claude_decision_log' && c.op === 'update').length, 1, 'supersede done once');
   assert.deepEqual(out.decision_ids.length, 1); assert.deepEqual(out.issue_ids.length, 1); assert.equal(out.session_id, 900);
-  const byKey = db.calls.find((c) => c.table === 'claude_session_logs' && c.filters.some(([k]) => k === 'checkpoint_key'));
-  assert.equal(byKey, undefined, 'session id was known, so no lookup by key was needed');
+  const byKey = db.calls.filter((c) => c.table === 'claude_session_logs' && c.filters.some(([k]) => k === 'checkpoint_key'));
+  assert.equal(byKey.length, 1, 'looked the identity up once, on the first attempt; the retry reused out.session_id');
 });
 
 test('a lost session-insert response is recovered by checkpoint_key on retry — no second session row', async () => {
   let n = 0;
   const db = fakeDb({
-    byKey: { id: 4242 },
+    // Nothing owns the identity when the call starts; the row appears only after
+    // the insert landed and its response was lost.
+    byKey: (nth) => (nth === 1 ? null : { id: 4242 }),
     fail: (ctx) => (ctx.table === 'claude_session_logs' && ctx.op === 'insert' && ++n === 1 ? { message: 'read ECONNRESET', code: 'ECONNRESET' } : null),
   });
   const out = await applyCheckpoint(base, { db, retry: NO_RETRY_WAIT });
   assert.equal(out.attempts, 2); assert.equal(out.session_id, 4242); assert.equal(out.recovered, true); assert.equal(out.updated, true);
+  assert.equal(out.inserted, false);
   assert.equal(db.calls.filter((c) => c.table === 'claude_session_logs' && c.op === 'insert').length, 1, 'insert attempted once, then found by key');
   const lookup = db.calls.find((c) => c.table === 'claude_session_logs' && c.filters.some(([k]) => k === 'checkpoint_key'));
   assert.ok(lookup); assert.equal(lookup.filters[0][1], out.checkpoint_key);
@@ -163,7 +174,7 @@ test('after three transient failures the error carries partial (what landed) and
   assert.ok(err); assert.match(err.message, /insert issue: TypeError \(fetch failed\)/);
   assert.equal(err.attempts, 3);
   assert.equal(err.partial.session_id, 900); assert.deepEqual(err.partial.decision_ids, [901]); assert.deepEqual(err.partial.superseded, [5]);
-  assert.equal(err.partial.issue_ids, undefined); assert.match(err.partial.checkpoint_key, /^[0-9a-f-]{36}$/);
+  assert.equal(err.partial.issue_ids, undefined); assert.match(err.partial.checkpoint_key, /^[0-9a-f]{64}$/);
   assert.equal(db.calls.filter((c) => c.table === 'claude_known_issues' && c.op === 'insert').length, 3);
 
   const db4 = fakeDb({ fail: (ctx) => (ctx.table === 'claude_decision_log' && ctx.op === 'insert' ? { message: 'duplicate key value', code: '23505', status: 409 } : null) });

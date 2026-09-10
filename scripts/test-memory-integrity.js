@@ -27,7 +27,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   validateCheckpoint, planCheckpoint, applyCheckpoint, CheckpointError, RETRO_SOURCE_MESSAGE,
-  getGuardMode, getConflictThreshold, getMaxDateAgeDays, decisionText,
+  getGuardMode, getConflictThreshold, getMaxDateAgeDays, decisionText, checkpointKeyFor,
 } from '../src/memory/memory-checkpoint.js';
 import { memoryPrecheck, classify, NEXT_STEP } from '../src/memory/memory-precheck.js';
 import { fuseResults, dateConfidenceWeight, originWeight, statusWeight } from '../src/memory/memory-gate.js';
@@ -148,10 +148,12 @@ test('sql/098 pack v5: write_date demotion reaches decisions and issues; open_co
   }
 });
 
-test('sql/098 is mirrored in the boot presence check, after 097', () => {
+test('sql/098 and sql/099 are mirrored in the boot presence check, in order', () => {
   const m = MEMORY_MIGRATIONS.find((x) => x.file === '098_memory_integrity.sql');
   assert.ok(m); assert.match(m.check, /trg_claude_guard_session_insert/); assert.match(m.check, /claude_memory_conflicts/);
-  assert.equal(MEMORY_MIGRATIONS[MEMORY_MIGRATIONS.length - 1].file, '098_memory_integrity.sql');
+  const k = MEMORY_MIGRATIONS.find((x) => x.file === '099_checkpoint_key_deterministic.sql');
+  assert.ok(k); assert.match(k.check, /claude_checkpoint_key/);
+  assert.deepEqual(MEMORY_MIGRATIONS.slice(-2).map((x) => x.file), ['098_memory_integrity.sql', '099_checkpoint_key_deterministic.sql']);
 });
 
 // ─── Env defaults ────────────────────────────────────────────────────────────
@@ -391,9 +393,9 @@ test('memoryPrecheck: vector leg with history visible, same area first, conflict
 
 // ─── Validation checks ───────────────────────────────────────────────────────
 test('every validation check is one SELECT with rows_checked / rows_flagged / sample; the log row is escaped', () => {
-  assert.equal(VALIDATION_CHECKS.length, 10);
+  assert.equal(VALIDATION_CHECKS.length, 11);
   const names = VALIDATION_CHECKS.map((c) => c.name);
-  for (const n of ['unlinked_sessions_7d', 'write_date_rows', 'batch_pattern_live', 'active_decisions_no_area', 'embedding_coverage', 'orphan_embeddings', 'embedding_metadata_drift', 'conflicts_open', 'provenance_mismatch_children', 'flagged_sessions']) assert.ok(names.includes(n), n);
+  for (const n of ['unlinked_sessions_7d', 'write_date_rows', 'batch_pattern_live', 'duplicate_sessions_24h', 'active_decisions_no_area', 'embedding_coverage', 'orphan_embeddings', 'embedding_metadata_drift', 'conflicts_open', 'provenance_mismatch_children', 'flagged_sessions']) assert.ok(names.includes(n), n);
   for (const c of VALIDATION_CHECKS) {
     assert.match(c.sql, /^\s*SELECT/, c.name);
     for (const col of ['rows_checked', 'rows_flagged', 'sample']) assert.ok(c.sql.includes(`AS ${col}`), `${c.name} lacks ${col}`);
@@ -418,9 +420,9 @@ test('runMemoryValidation: dry run logs every check and repairs nothing; live sy
   };
   const dryCalls = [];
   const dry = await runMemoryValidation({ dry_run: true, deps: { runSQL: async (s) => { dryCalls.push(s); return seed(s); } } });
-  assert.equal(dry.dry_run, true); assert.equal(Object.keys(dry.checks).length, 10); assert.equal(dry.flagged_total, 14);
+  assert.equal(dry.dry_run, true); assert.equal(Object.keys(dry.checks).length, 11); assert.equal(dry.flagged_total, 14);
   assert.equal(dry.checks.embedding_metadata_drift.rows_flagged, 12); assert.equal(dry.checks.orphan_embeddings.rows_flagged, 2);
-  assert.equal(dryCalls.filter((s) => /^INSERT INTO claude_memory_validation_log/.test(s)).length, 10, 'one log row per check');
+  assert.equal(dryCalls.filter((s) => /^INSERT INTO claude_memory_validation_log/.test(s)).length, 11, 'one log row per check');
   assert.ok(dryCalls.every((s) => /^\s*SELECT|^INSERT INTO claude_memory_validation_log/.test(s)), 'dry run never UPDATEs');
   assert.ok(dryCalls.some((s) => /'dry_run'/.test(s))); assert.deepEqual(dry.repairs, {});
 
@@ -437,7 +439,7 @@ test('runMemoryValidation: dry run logs every check and repairs nothing; live sy
   assert.equal(q.logged, false); assert.ok(quiet.every((s) => /^\s*SELECT/.test(s)));
 
   const broken = await runMemoryValidation({ dry_run: true, deps: { runSQL: async (s) => { if (/claude_memory_conflicts/.test(s) && /AS rows_checked/.test(s)) throw new Error('relation does not exist'); return seed(s); } } });
-  assert.match(broken.checks.conflicts_open.error, /does not exist/); assert.equal(broken.errors.length, 1); assert.equal(Object.keys(broken.checks).length, 10, 'one failing check does not stop the rest');
+  assert.match(broken.checks.conflicts_open.error, /does not exist/); assert.equal(broken.errors.length, 1); assert.equal(Object.keys(broken.checks).length, 11, 'one failing check does not stop the rest');
 });
 
 // ─── Conflict scan ───────────────────────────────────────────────────────────
@@ -479,7 +481,12 @@ test('draft checkpoints: deferred ledger rows with no session become origin=nigh
   const row = draftSessionRow({ chat_url: 'https://claude.ai/chat/z', chat_title: 'Payroll conflict', chat_updated_at: '2026-08-30T22:10:00Z' }, NOW);
   assert.equal(row.log_origin, 'nightly'); assert.equal(row.session_date, '2026-08-30'); assert.equal(row.date_confidence, 'exact');
   assert.equal(row.link_confidence, 'exact'); assert.equal(row.source_chat_updated_at, '2026-08-30T22:10:00.000Z'); assert.deepEqual(row.transcript_search_keys, ['Payroll conflict']);
-  assert.match(row.raw_summary, /^\[NIGHTLY DRAFT 2026-09-08/); assert.deepEqual(row.decisions_made, []); assert.match(row.checkpoint_key, /^[0-9a-f-]{36}$/);
+  assert.match(row.raw_summary, /^\[NIGHTLY DRAFT 2026-09-08/); assert.deepEqual(row.decisions_made, []);
+  // sql/099: the draft's key is its own identity, so a half-finished nightly
+  // pass re-run finds this draft instead of adding a second one.
+  assert.match(row.checkpoint_key, /^[0-9a-f]{64}$/);
+  assert.equal(row.checkpoint_key, checkpointKeyFor({ surface: 'chat', date: '2026-08-30', title: '[DRAFT] Payroll conflict' }));
+  assert.deepEqual(draftSessionRow({ chat_url: 'https://claude.ai/chat/z', chat_title: 'Payroll conflict', chat_updated_at: '2026-08-30T22:10:00Z' }, NOW).checkpoint_key, row.checkpoint_key, 'stable across runs');
   const undated = draftSessionRow({ chat_url: 'u', chat_title: null, chat_updated_at: null }, NOW);
   assert.equal(undated.date_confidence, 'write_date'); assert.equal(undated.session_date, '2026-09-08'); assert.equal(undated.source_chat_updated_at, null);
 

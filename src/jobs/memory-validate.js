@@ -30,7 +30,7 @@
  * RPC returns only {status:'ok'} for a non-SELECT), then UPDATE.
  */
 import supabase from '../supabase.js';
-import { randomUUID } from 'node:crypto';
+import { checkpointKeyFor } from '../memory/memory-checkpoint.js';
 
 const q = (s) => `'${String(s).replace(/'/g, "''")}'`;
 const SAMPLE = 10;
@@ -75,6 +75,27 @@ SELECT
        SELECT id, created_at, count(*) OVER (ORDER BY created_at RANGE BETWEEN interval '5 minutes' PRECEDING AND CURRENT ROW) AS n
        FROM claude_session_logs WHERE log_origin = 'live' AND created_at > now() - interval '30 days') w
      WHERE n >= 4 ORDER BY created_at DESC LIMIT ${SAMPLE}) x) AS sample`,
+  },
+  {
+    // Regression alarm for sql/099. Before the deterministic checkpoint_key a
+    // dropped transport response made Claude re-send the checkpoint, and the
+    // retry inserted a twin session (17 pairs by 2026-09-09). If this ever goes
+    // non-zero again the identity key has stopped colliding — it should show up
+    // in the Monday digest, not be found by hand.
+    name: 'duplicate_sessions_24h',
+    description: 'sessions sharing surface + date + title written in the last 24 hours (sql/099 regression)',
+    sql: `
+SELECT
+  (SELECT count(*) FROM claude_session_logs WHERE created_at > now() - interval '24 hours')::int AS rows_checked,
+  (SELECT coalesce(sum(n), 0) FROM (
+     SELECT count(*) AS n FROM claude_session_logs WHERE created_at > now() - interval '24 hours'
+     GROUP BY coalesce(surface, 'chat'), session_date, session_title HAVING count(*) > 1) d)::int AS rows_flagged,
+  (SELECT jsonb_agg(x) FROM (
+     SELECT coalesce(surface, 'chat') AS surface, session_date::text AS session_date,
+            left(session_title, 80) AS title, count(*) AS n, array_agg(id ORDER BY id) AS ids
+     FROM claude_session_logs WHERE created_at > now() - interval '24 hours'
+     GROUP BY 1, 2, session_title HAVING count(*) > 1
+     ORDER BY 4 DESC LIMIT ${SAMPLE}) x) AS sample`,
   },
   {
     name: 'active_decisions_no_area',
@@ -265,10 +286,12 @@ export function draftSessionRow(cand, now = new Date()) {
   const valid = updated && !Number.isNaN(updated.getTime());
   const title = String(cand.chat_title || 'untitled chat').slice(0, 300);
   const today = dateET(now);
+  const session_date = valid ? dateET(updated) : today;
+  const session_title = `[DRAFT] ${title}`.slice(0, 300);
   return {
-    session_date: valid ? dateET(updated) : today,
+    session_date,
     date_confidence: valid ? 'exact' : 'write_date',
-    session_title: `[DRAFT] ${title}`.slice(0, 300),
+    session_title,
     phase_focus: 'nightly draft — confirm or drop',
     raw_summary: `[NIGHTLY DRAFT ${today} — chat "${title}" was found by reconciliation but never checkpointed. Open the chat and refresh this session (memory_checkpoint with session_id) to confirm it, or mark the ledger row no_content to drop it.]`,
     transcript_search_keys: [title].filter(Boolean),
@@ -277,7 +300,9 @@ export function draftSessionRow(cand, now = new Date()) {
     surface: 'chat', log_origin: 'nightly', link_confidence: 'exact',
     workflows_touched: [], phase_status: {}, decisions_made: [], issues_found: [], issues_resolved: [],
     pending_items: [], board_versions: [], mcp_verified_ids: [], next_steps: [],
-    checkpoint_key: randomUUID(),
+    // sql/099: same identity as memory_checkpoint uses, so a nightly re-run
+    // after a half-finished pass finds this draft instead of adding a second one.
+    checkpoint_key: checkpointKeyFor({ surface: 'chat', date: session_date, title: session_title }),
   };
 }
 
