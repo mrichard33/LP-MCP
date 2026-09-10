@@ -4,6 +4,15 @@
  * Orchestrates structured KB lookups (Tier 1) for the response generator,
  * plus the Tier 2 vector search over kb_embeddings (v1.9, gated).
  *
+ * v1.13 — 2026-09-10. ESTIMATE PDF LINK.
+ *   Contact ECFITedNfAG0NVljENBx asked "Did not get estimate"; the bot promised
+ *   "a direct link to your estimate PDF" and sent none (agent_actions 441204).
+ *   The pack had booking links only. Now every estimate-completed lead
+ *   (estimator-completed / completed:wec) carries pack.estimate_link =
+ *   {{trigger_link.uyGlZ6ydYUmAqeWysREJ}} (redirects to the contact's own PDF),
+ *   rendered as an ESTIMATE LINK prompt block; requests are flagged as MUST
+ *   include. Pure helpers + send-time guard live in estimate-link.js.
+ *
  * v1.12 — 2026-09-03. CALL MOMENTS (KB_CALL_MOMENTS_MODE).
  *   4,462 CI transcripts since 2026-08-24 hold homeowner objections and
  *   questions in their own words, plus the agent's answer — and no speaker
@@ -170,6 +179,15 @@ import { runCallMomentsTier } from './ci-moments.js';
 const KB_CALL_MOMENTS_MAX_CHARS = parseInt(process.env.KB_CALL_MOMENTS_MAX_CHARS || '1200', 10);
 import { getKbExemplarMode, shouldRunExemplars, formatExemplarsForPrompt } from './exemplars-core.js';
 import { runExemplarTier } from './exemplars.js';
+import {
+  ESTIMATE_PDF_TRIGGER_ID,
+  getEstimatePdfMergeTag,
+  hasCompletedEstimate,
+  detectEstimateLinkRequest,
+  ensureEstimateLink,
+} from './estimate-link.js';
+
+export { getEstimatePdfMergeTag, hasCompletedEstimate, detectEstimateLinkRequest, ensureEstimateLink };
 
 const KB_EXEMPLAR_MAX_CHARS = parseInt(process.env.KB_EXEMPLAR_MAX_CHARS || '1200', 10);
 
@@ -266,6 +284,7 @@ export const TRIGGER_LINK_IDS = {
   WINDOW_ESTIMATE:     process.env.REECE_TRIGGER_WE            || 'QqvhMNyB7YQzHqSNOXHm',
   MV:                  process.env.REECE_TRIGGER_MV            || 'SPQHJKSLbwhJ1bhg2dIy',
   ESTIMATE_CALCULATOR: process.env.REECE_TRIGGER_CALCULATOR    || 'aS10ZzuBDRI2GUpzQh1v',
+  ESTIMATE_PDF:        ESTIMATE_PDF_TRIGGER_ID, // v1.13 — "View Calculator Estimate" → contact's own PDF
 };
 
 const BOOKING_SPECS = {
@@ -956,6 +975,9 @@ export async function buildKbPack(params) {
   const userBookingPreference = detectUserBookingPreference(messageText);
   // v1.7: scheduling-signal detection for defensive booking_context attachment
   const schedulingSignal = detectSchedulingSignal(messageText);
+  // v1.13: estimate PDF link — every estimate-completed lead carries it
+  const estimateEligible = hasCompletedEstimate(contactTags);
+  const estimateRequested = detectEstimateLinkRequest(messageText);
 
   const result = {
     intent_class: intentClass,
@@ -975,7 +997,11 @@ export async function buildKbPack(params) {
     call_moments_mode: 'off', // v1.12 — resolved KB_CALL_MOMENTS_MODE for this turn
     exemplars: [],        // v1.11 — past-win exchanges; injected only when exemplar_mode === 'live'
     exemplar_mode: 'off', // v1.11 — resolved KB_EXEMPLAR_MODE for this turn
+    estimate_link: estimateEligible // v1.13
+      ? { url: getEstimatePdfMergeTag(), requested: estimateRequested }
+      : null,
     detected_signals: {
+      estimate_link_requested: estimateRequested, // v1.13
       competitor: detectedCompetitor,
       objection: detectedObjection,
       objection_detected_by: objectionDetectedBy,  // v1.10 — 'keyword' | 'semantic' | null
@@ -1138,6 +1164,20 @@ export async function buildKbPack(params) {
 export function formatKbPackForPrompt(pack) {
   if (!pack) return '';
   const lines = [];
+
+  // v1.13 — ESTIMATE PDF LINK
+  if (pack.estimate_link?.url) {
+    lines.push('ESTIMATE LINK (this lead completed the online estimate — their PDF is on file):');
+    lines.push(`  Estimate link (use VERBATIM as merge tag): ${pack.estimate_link.url}`);
+    lines.push('  Whenever your message mentions, offers, resends, or points the lead to their estimate or estimate PDF, put this merge tag on its own line. Never write "here is the link" (or similar) without the merge tag. Never use any other URL for the estimate.');
+    if (pack.estimate_link.requested) {
+      lines.push('  ⚠️ The lead is asking for their estimate. This message MUST include the estimate link merge tag above.');
+    }
+    lines.push('');
+  } else if (pack.detected_signals?.estimate_link_requested) {
+    lines.push('ESTIMATE LINK: The lead is asking about an estimate, but no online estimate is on file for them. Do NOT promise, mention, or invent a link. Say a team member will get it over to them.');
+    lines.push('');
+  }
 
   if (pack.primary_arc) {
     lines.push('PRIMARY STORY ARC:');
