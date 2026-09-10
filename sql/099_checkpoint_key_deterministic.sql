@@ -38,6 +38,35 @@
 -- (memory-project ground rule 5). Mirrored in src/memory/memory-migrations.js
 -- as a presence check.
 --
+-- APPLIED 2026-09-10 on Mark's instruction, section by section, then the
+-- dedupe batch, then section E again. Final state:
+--   function claude_checkpoint_key ....... created; returns the same hash as
+--                                          checkpointKeyFor() for the pinned
+--                                          test vector (parity confirmed live)
+--   backfill ............................. 898 of 915 rows on deterministic
+--                                          keys, 0 left NULL
+--   all four unique indexes .............. created (session, decision, issue,
+--                                          pending)
+--   rows_left_on_legacy_key .............. 1
+--
+-- The dedupe batch folded the 16 twin pairs the way #841 was folded earlier:
+-- the loser is retitled '[FOLDED → #<winner>]', validation_status='flagged',
+-- and its key re-derived from the new title — nothing deleted, children left
+-- in place. The winner is always the row this file's backfill gave the
+-- identity key to (chat_url first, else lower id). All 915 sessions now hold
+-- distinct keys.
+--
+-- The 1 row left on a legacy key is #850: it and #841 were both folded into
+-- #221 on 2026-09-08 and so carry identical titles. Pre-existing, harmless
+-- (their stored keys still differ), and deliberately not touched.
+--
+-- ux_claude_decision_session_text was SKIPPED on the first pass — decisions
+-- #1966/#1967 on session 869 were an identical active pair, written 12.6
+-- seconds apart by the very retry this file fixes. #1967 was superseded by
+-- #1966 (with its embedding and conflict #38 updated to match) and the index
+-- then built. That is the DO block working as intended: it reported the
+-- blocker instead of aborting the file.
+--
 -- ROLLBACK (deterministic keys are harmless if left in place):
 --   DROP INDEX IF EXISTS ux_claude_session_checkpoint_key;
 --   DROP INDEX IF EXISTS ux_claude_decision_session_text;
@@ -88,8 +117,19 @@ ORDER BY 2 DESC, 4 DESC;
 -- twins) the winner is the one with a chat_url, else the lower id; the losers
 -- keep their old random key so the unique index can still be created. The
 -- dedupe batch marks those separately.
+--
+-- Written as UPDATE ... FROM (subquery), NOT a leading WITH: the LP MCP
+-- supabase_run_query tool dispatches on the statement's first keyword and
+-- rejects `WITH ... UPDATE` with "syntax error at or near UPDATE".
+--
+-- n8n rows are excluded. src/routes/admin-memory.js keys its one-session-per-day
+-- rows by the literal 'n8n:<date>' convention and finds them by that string; a
+-- re-run of this file after those rows exist would rekey them and the next
+-- lookup would miss and insert a second session for the day.
 
-WITH ranked AS (
+UPDATE claude_session_logs s
+SET checkpoint_key = r.newkey
+FROM (
   SELECT id,
          claude_checkpoint_key(surface, session_date, session_title) AS newkey,
          row_number() OVER (
@@ -97,15 +137,15 @@ WITH ranked AS (
            ORDER BY (chat_url IS NOT NULL) DESC, id ASC
          ) AS rn
   FROM claude_session_logs
-)
-UPDATE claude_session_logs s
-SET checkpoint_key = r.newkey
-FROM ranked r
+) r
 WHERE s.id = r.id
   AND r.rn = 1
-  AND s.checkpoint_key IS DISTINCT FROM r.newkey;
+  AND s.checkpoint_key IS DISTINCT FROM r.newkey
+  AND coalesce(s.surface, 'chat') <> 'n8n';
 
--- Report what stayed on a legacy key (expect exactly the duplicate pairs from B).
+-- Report what stayed on a legacy key. This is 0 ONLY if the dedupe batch ran
+-- first; applied before it, the count is exactly the number of twin groups
+-- (17 on 2026-09-10 — one loser per group, holding its old key).
 SELECT count(*) AS rows_left_on_legacy_key
 FROM claude_session_logs s
 WHERE s.checkpoint_key IS DISTINCT FROM
@@ -132,7 +172,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_claude_session_checkpoint_key
 --
 -- Created inside DO blocks: an index that cannot be built because pre-existing
 -- duplicates are in the way raises a NOTICE instead of aborting the whole file.
--- Measured 2026-09-09: 1 blocking group on claude_decision_log, 0 elsewhere.
+-- That is what happened on 2026-09-10: the issue and pending indexes built, the
+-- decision one did not (decisions #1966/#1967 on session 869 were an identical
+-- active pair). Superseding #1967 cleared it and a re-run of this section built
+-- the index; all four are in place now. Re-run this section after any dedupe.
 -- Correctness does not depend on these indexes — the JS guard stands alone.
 
 DO $$
