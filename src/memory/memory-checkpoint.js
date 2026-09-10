@@ -425,7 +425,12 @@ function partialOf(out) {
   return p;
 }
 
-const EMPTY_CHILDREN = Object.freeze({ decisions: new Map(), issues: new Map(), pending: new Map() });
+/**
+ * A FRESH set of maps each call. Never a shared frozen constant: the loops
+ * below record what they insert, so one shared Map would leak a session's
+ * children into the next checkpoint.
+ */
+const emptyChildren = () => ({ decisions: new Map(), issues: new Map(), pending: new Map() });
 
 /** normalized text -> existing row id, for the children still live on a session. */
 function indexByText(rows, textCol, isLive) {
@@ -534,7 +539,25 @@ async function writeCheckpoint(c, { db, now, key, out, resume }) {
   // issues and pending items under it. Skipping by normalized text mirrors the
   // partial unique indexes in sql/099 section E (which are the backstop under a
   // race); the lookup is one query per table, not one per item.
-  const existing = out.inserted ? EMPTY_CHILDREN : await loadExistingChildren(db, sid);
+  const existing = out.inserted ? emptyChildren() : await loadExistingChildren(db, sid);
+  /**
+   * Insert a child, then remember its text. Two items in ONE payload whose text
+   * normalizes the same are the same item — without this the second insert hits
+   * the sql/099 index (23505), which is a 4xx, so withRetry does not retry and
+   * the whole checkpoint aborts half-written. A row a concurrent writer landed
+   * between the load above and here is adopted for the same reason.
+   */
+  const addChild = async (map, textKey, table, row, what, reread) => {
+    const res = await db.from(table).insert(row).select('id').single();
+    if (res.error && (res.error.code === '23505' || /violates unique constraint/i.test(res.error.message || ''))) {
+      const found = (await reread()).get(textKey);
+      if (found != null) { map.set(textKey, found); return { id: found, deduped: true }; }
+    }
+    const ins = must(res, what);
+    if (textKey) map.set(textKey, ins.id);
+    return { id: ins.id, deduped: false };
+  };
+  const rereadChildren = async (kind) => (await loadExistingChildren(db, sid))[kind];
 
   // 2. Decisions (+ supersede / re-confirm).
   for (let i = 0; i < c.decisions.length; i++) {
@@ -562,8 +585,10 @@ async function writeCheckpoint(c, { db, now, key, out, resume }) {
           reversible: true, transcript_search_keys: keys,
         };
         if (retro) { row.origin = 'retro'; row.confidence = d.confirmed_by_mark ? 'confirmed' : 'reconstructed'; }
-        const ins = must(await db.from('claude_decision_log').insert(row).select('id').single(), 'insert decision');
-        out.decision_ids[i] = ins.id;
+        const r = await addChild(existing.decisions, normText(d.decision), 'claude_decision_log', row,
+          'insert decision', () => rereadChildren('decisions'));
+        out.decision_ids[i] = r.id;
+        if (r.deduped) out.deduped.decisions++;
       }
     }
     if (d.supersedes_id && !out.superseded.includes(d.supersedes_id)) {
@@ -589,8 +614,10 @@ async function writeCheckpoint(c, { db, now, key, out, resume }) {
       workflow_code: x.workflow_code, workflow_name: x.workflow_name, issue_type: x.issue_type, status: 'open',
     };
     if (retro) { row.origin = 'retro'; row.confidence = 'reconstructed'; }
-    const ins = must(await db.from('claude_known_issues').insert(row).select('id').single(), 'insert issue');
-    out.issue_ids[i] = ins.id;
+    const r = await addChild(existing.issues, normText(x.description), 'claude_known_issues', row,
+      'insert issue', () => rereadChildren('issues'));
+    out.issue_ids[i] = r.id;
+    if (r.deduped) out.deduped.issues++;
   }
   for (const r of c.resolved_issues) {
     if (out.resolved.includes(r.id)) continue;
@@ -619,12 +646,18 @@ async function writeCheckpoint(c, { db, now, key, out, resume }) {
     for (let i = 0; i < c.pending.length; i++) {
       if (out.pending_ids[i] != null) continue;
       const p = c.pending[i];
-      const ins = must(await db.from('claude_pending_items').insert({
-        source_session_id: sid, source_field: 'live', source_index: idx++, kind: p.kind, item_type: p.item_type,
+      const textKey = normText(p.description);
+      // A duplicate inside this payload was not seen by the pre-pass above, so
+      // check the running map before consuming a source_index.
+      const already = existing.pending.get(textKey);
+      if (already != null) { out.pending_ids[i] = already; out.deduped.pending++; continue; }
+      const r = await addChild(existing.pending, textKey, 'claude_pending_items', {
+        source_session_id: sid, source_field: 'live', source_index: idx, kind: p.kind, item_type: p.item_type,
         description: p.description, status: 'open', priority: p.priority, effort: p.effort, blocked_by: p.blocked_by,
         ref: p.ref, owner: p.owner, origin: retro ? 'retro' : 'live', session_date: c.session.date, created_at: nowIso,
-      }).select('id').single(), 'insert pending');
-      out.pending_ids[i] = ins.id;
+      }, 'insert pending', () => rereadChildren('pending'));
+      out.pending_ids[i] = r.id;
+      if (r.deduped) out.deduped.pending++; else idx++;
     }
   }
   for (const cl of c.close_pending) {

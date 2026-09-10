@@ -13,8 +13,16 @@ import assert from 'node:assert/strict';
 import { applyCheckpoint, checkpointKeyFor, normText } from '../src/memory/memory-checkpoint.js';
 
 // ─── A stateful fake Supabase ──────────────────────────────────────────────
-// Enough of the PostgREST surface for memory-checkpoint.js, plus the one
-// constraint that matters: claude_session_logs.checkpoint_key is UNIQUE.
+// Enough of the PostgREST surface for memory-checkpoint.js, plus the unique
+// indexes sql/099 actually created: claude_session_logs.checkpoint_key, and one
+// per child table on (session, normalized text) over the live rows only. The
+// child indexes matter — without them a test can "pass" on a payload that the
+// real database would reject with 23505 half way through the write.
+const CHILD_INDEXES = {
+  claude_decision_log: ['session_id', 'decision', (r) => (r.status ?? 'active') === 'active'],
+  claude_known_issues: ['reported_session_id', 'description', (r) => ['open', 'in_progress'].includes(r.status ?? 'open')],
+  claude_pending_items: ['source_session_id', 'description', (r) => (r.status ?? 'open') === 'open'],
+};
 function store() {
   const tables = {
     claude_session_logs: [], claude_decision_log: [], claude_known_issues: [],
@@ -24,7 +32,10 @@ function store() {
   let nextId = 1000;
   // Set by the race test: make one lookup-by-key miss a row that is really
   // there, which is exactly the window between the SELECT and the INSERT.
-  const opts = { missNextKeyLookup: false };
+  // hideChildrenOnce: drop these ids from the first read of that child table,
+  // modelling a row a concurrent writer lands after we looked but before we
+  // insert. Only the unique index can catch that one.
+  const opts = { missNextKeyLookup: false, hideChildrenOnce: null };
   const dupKeyError = {
     message: 'duplicate key value violates unique constraint "ux_claude_session_checkpoint_key"',
     code: '23505', details: 'checkpoint_key', status: 409,
@@ -41,6 +52,15 @@ function store() {
         const row = { id: nextId++, ...ctx.payload };
         if (table === 'claude_session_logs' && row.checkpoint_key != null
             && rows().some((r) => r.checkpoint_key === row.checkpoint_key)) return { error: dupKeyError };
+        const idx = CHILD_INDEXES[table];
+        if (idx) {
+          const [sessCol, textCol, isLive] = idx;
+          const k = normText(row[textCol]);
+          if (row[sessCol] != null && k && isLive(row)
+              && rows().some((r) => r[sessCol] === row[sessCol] && isLive(r) && normText(r[textCol]) === k)) {
+            return { error: { ...dupKeyError, message: `duplicate key value violates unique constraint "ux_${table}_session_text"` } };
+          }
+        }
         rows().push(row);
         return { data: row };
       }
@@ -58,6 +78,11 @@ function store() {
         return { data: [], count: 0 };
       }
       let out = hit;
+      if (opts.hideChildrenOnce?.table === table) {
+        const hidden = new Set(opts.hideChildrenOnce.ids);
+        opts.hideChildrenOnce = null;
+        out = out.filter((r) => !hidden.has(r.id));
+      }
       if (ctx.order) out = [...out].sort((a, b) => (ctx.desc ? -1 : 1) * ((a[ctx.order] ?? 0) - (b[ctx.order] ?? 0)));
       if (ctx.cap != null) out = out.slice(0, ctx.cap);
       return { data: out, count: hit.length };
@@ -268,7 +293,69 @@ test('a closed pending item can be legitimately re-raised', async () => {
   assert.equal(live.length, 1, 'dedupe is scoped to live rows, so a re-raise after closing works');
 });
 
+test('two items in ONE payload whose text normalizes the same are written once', async () => {
+  // Regression: the loops used to consult only the map loaded before the write
+  // and never recorded what they inserted, so the second of these hit the
+  // sql/099 index. That is a 23505 — a 4xx, so withRetry does not retry it —
+  // and the checkpoint aborted with the session row and the first child
+  // already written. A checkpoint must never be able to poison itself.
+  const db = store();
+  const out = await run(db, payload({
+    decisions: [
+      { category: 'chatbot', decision: 'Bot 1A greets by name before qualifying.' },
+      { category: 'chatbot', decision: '  bot 1a   GREETS by name before   qualifying. ' },
+    ],
+    issues: [
+      { severity: 'high', category: 'chatbot', description: 'Bot 1A opened with "Sure".' },
+      { severity: 'high', category: 'chatbot', description: 'BOT 1A opened with "Sure".' },
+    ],
+    pending: [
+      { description: 'Verify the greeting on live traffic.' },
+      { description: 'verify the   greeting on live traffic.' },
+    ],
+  }));
+  assert.equal(count(db, 'claude_decision_log'), 1);
+  assert.equal(count(db, 'claude_known_issues'), 1);
+  assert.equal(count(db, 'claude_pending_items'), 1);
+  // Both slots still report an id, so the caller sees a complete result.
+  assert.equal(out.decision_ids[0], out.decision_ids[1]);
+  assert.equal(out.issue_ids[0], out.issue_ids[1]);
+  assert.equal(out.pending_ids[0], out.pending_ids[1]);
+  assert.deepEqual(out.deduped, { decisions: 1, issues: 1, pending: 1 });
+  assert.deepEqual(db.tables.claude_pending_items.map((r) => r.source_index), [0], 'the skipped item consumed no index');
+});
+
+test('the child dedupe is scoped to one session, not global', async () => {
+  const db = store();
+  await run(db, withFacts());
+  await run(db, withFacts({ session: { date: '2026-09-08' } }));
+  assert.equal(count(db, 'claude_session_logs'), 2);
+  assert.equal(count(db, 'claude_decision_log'), 2, 'the same decision may be recorded on two different sessions');
+  assert.equal(count(db, 'claude_known_issues'), 2);
+});
+
 // ─── The race ──────────────────────────────────────────────────────────────
+test('a child a concurrent writer landed first is adopted, not a failed checkpoint', async () => {
+  const db = store();
+  const first = await run(db, withFacts());
+  // A second decision is already on the session, but our read of the children
+  // misses it once — the window between the SELECT and the INSERT.
+  db.tables.claude_decision_log.push({
+    id: 5150, session_id: first.session_id, decision: 'Ported the greeting fix to Bot 2.', status: 'active',
+  });
+  db.opts.hideChildrenOnce = { table: 'claude_decision_log', ids: [5150] };
+
+  const out = await run(db, withFacts({
+    decisions: [
+      { category: 'chatbot', decision: 'Bot 1A greets by name before qualifying.' },
+      { category: 'chatbot', decision: 'Ported the greeting fix to Bot 2.' },
+    ],
+  }));
+  assert.equal(count(db, 'claude_decision_log'), 2, 'no duplicate, and nothing thrown');
+  assert.equal(out.decision_ids[1], 5150, 'the row that won the race is the one reported');
+});
+
+
 test('losing the race on the unique key becomes a refresh, not a failed checkpoint', async () => {
   const db = store();
   // Someone else owns this identity already, but our lookup is made to miss it
