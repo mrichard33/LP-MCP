@@ -245,7 +245,12 @@
 
 import { buildLeadContext } from './context-builder.js';
 import { classifyInbound, isShortCircuit } from './knowledge/intent-classifier.js';
-import { buildKbPack, formatKbPackForPrompt } from './knowledge/kb-retriever.js';
+import {
+  buildKbPack,
+  formatKbPackForPrompt,
+  ensureEstimateLink,
+  hasCompletedEstimate,
+} from './knowledge/kb-retriever.js';
 import {
   fetchFreeSlots,
   formatSlotsForPrompt,
@@ -2681,6 +2686,23 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     validated.message = applyConfFlowMergeKeys(validated.message, confFlowContext);
   }
 
+  // ─── Estimate PDF link guard (2026-09-10 — Michael Carozza incident) ───
+  // agent_actions 441204 shipped "Here is a direct link to your estimate PDF
+  // so you have it on hand:" with nothing after the colon. Deterministic
+  // backstop for the ESTIMATE LINK prompt block: when this lead has a
+  // completed estimate on file and the reply promises a link it did not
+  // carry, insert the trigger-link merge tag. Only ever ADDS text.
+  // Runs BEFORE stripDanglingLinkReferences so the promise is honoured
+  // rather than deleted, and after sanitizeMessageUrls so the tag survives.
+  const estimateGuard = ensureEstimateLink(validated.message, {
+    eligible: hasCompletedEstimate(context.lead?.current_tags || []),
+    requested: !!kbPack?.detected_signals?.estimate_link_requested,
+  });
+  if (estimateGuard.changed) {
+    console.log(`[EstimateLinkGuard] ${contactId} ${estimateGuard.reason}`);
+    validated.message = estimateGuard.text;
+  }
+
   // ─── Unresolved-token guard (2026-07-29 — Kelly Callahan incident) ───
   // Every send in the 30-day bridge cohort shipped a body containing the
   // LITERAL string "{{custom_values.rep_name}}". It only ever looked right
@@ -2833,6 +2855,7 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     has_existing_appt: hasExistingAppt,
     upcoming_appointments_count: upcomingAppointments === null ? null : upcomingAppointments.length,
     merge_tag_sent: mergeTagInMessage,
+    estimate_link_guard: estimateGuard.reason, // v1.13 — null when the guard did not fire
     availability_slots_used: availability ? availability.slots.length : 0,
     availability_total_open: availability ? availability.slots_total_count : 0,
     edits_used_in_prompt: recentEdits.length,
