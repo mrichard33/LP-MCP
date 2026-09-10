@@ -30,7 +30,7 @@
  * RPC returns only {status:'ok'} for a non-SELECT), then UPDATE.
  */
 import supabase from '../supabase.js';
-import { randomUUID } from 'node:crypto';
+import { checkpointKeyFor } from '../memory/memory-checkpoint.js';
 
 const q = (s) => `'${String(s).replace(/'/g, "''")}'`;
 const SAMPLE = 10;
@@ -75,6 +75,25 @@ SELECT
        SELECT id, created_at, count(*) OVER (ORDER BY created_at RANGE BETWEEN interval '5 minutes' PRECEDING AND CURRENT ROW) AS n
        FROM claude_session_logs WHERE log_origin = 'live' AND created_at > now() - interval '30 days') w
      WHERE n >= 4 ORDER BY created_at DESC LIMIT ${SAMPLE}) x) AS sample`,
+  },
+  {
+    name: 'duplicate_sessions_24h',
+    description: 'sessions written twice for the same surface / date / title in the last 24 hours (sql/099 regression watch)',
+    sql: `
+SELECT
+  (SELECT count(*) FROM claude_session_logs WHERE created_at > now() - interval '24 hours')::int AS rows_checked,
+  (SELECT coalesce(sum(n - 1), 0) FROM (
+     SELECT count(*) AS n FROM claude_session_logs WHERE created_at > now() - interval '24 hours'
+     GROUP BY coalesce(surface, 'chat'), session_date,
+              lower(btrim(regexp_replace(coalesce(session_title, ''), '\\s+', ' ', 'g')))
+     HAVING count(*) > 1) t)::int AS rows_flagged,
+  (SELECT jsonb_agg(x) FROM (
+     SELECT session_date, left(min(session_title), 80) AS title, count(*) AS n, array_agg(id ORDER BY id) AS ids
+     FROM claude_session_logs WHERE created_at > now() - interval '24 hours'
+     GROUP BY coalesce(surface, 'chat'), session_date,
+              lower(btrim(regexp_replace(coalesce(session_title, ''), '\\s+', ' ', 'g')))
+     HAVING count(*) > 1
+     ORDER BY count(*) DESC, session_date DESC LIMIT ${SAMPLE}) x) AS sample`,
   },
   {
     name: 'active_decisions_no_area',
@@ -265,10 +284,12 @@ export function draftSessionRow(cand, now = new Date()) {
   const valid = updated && !Number.isNaN(updated.getTime());
   const title = String(cand.chat_title || 'untitled chat').slice(0, 300);
   const today = dateET(now);
+  const session_date = valid ? dateET(updated) : today;
+  const session_title = `[DRAFT] ${title}`.slice(0, 300);
   return {
-    session_date: valid ? dateET(updated) : today,
+    session_date,
     date_confidence: valid ? 'exact' : 'write_date',
-    session_title: `[DRAFT] ${title}`.slice(0, 300),
+    session_title,
     phase_focus: 'nightly draft — confirm or drop',
     raw_summary: `[NIGHTLY DRAFT ${today} — chat "${title}" was found by reconciliation but never checkpointed. Open the chat and refresh this session (memory_checkpoint with session_id) to confirm it, or mark the ledger row no_content to drop it.]`,
     transcript_search_keys: [title].filter(Boolean),
@@ -277,7 +298,9 @@ export function draftSessionRow(cand, now = new Date()) {
     surface: 'chat', log_origin: 'nightly', link_confidence: 'exact',
     workflows_touched: [], phase_status: {}, decisions_made: [], issues_found: [], issues_resolved: [],
     pending_items: [], board_versions: [], mcp_verified_ids: [], next_steps: [],
-    checkpoint_key: randomUUID(),
+    // Deterministic (sql/099): a second nightly pass over the same ledger row
+    // hits the unique key instead of drafting the chat twice.
+    checkpoint_key: checkpointKeyFor({ surface: 'chat', date: session_date, title: session_title }),
   };
 }
 
@@ -290,18 +313,26 @@ export async function runDraftCheckpoints({ dry_run = false, now = new Date(), d
   const sql = deps.runSQL;
   const db = deps.db || supabase;
   if (typeof sql !== 'function') throw new Error('runDraftCheckpoints: deps.runSQL required');
-  const out = { dry_run, candidates: 0, drafted: [], errors: [] };
+  const out = { dry_run, candidates: 0, drafted: [], already_drafted: [], errors: [] };
   const cands = rowsOf(await sql(DRAFT_CANDIDATES_SQL));
   out.candidates = cands.length;
   out.sample = cands.slice(0, 5).map((c) => ({ chat_url: c.chat_url, chat_title: c.chat_title }));
   if (dry_run || !cands.length || !db) return out;
   for (const cand of cands) {
     try {
-      const ins = await db.from('claude_session_logs').insert(draftSessionRow(cand, now)).select('id').single();
+      const row = draftSessionRow(cand, now);
+      let ins = await db.from('claude_session_logs').insert(row).select('id').single();
+      let fresh = true;
+      if (ins.error && (ins.error.code === '23505' || /duplicate key value|violates unique constraint/i.test(ins.error.message || ''))) {
+        // A previous pass already drafted this chat (sql/099 deterministic key).
+        ins = await db.from('claude_session_logs').select('id').eq('checkpoint_key', row.checkpoint_key).maybeSingle();
+        fresh = false;
+      }
       if (ins.error) throw new Error(ins.error.message);
+      if (!ins.data?.id) throw new Error('draft session vanished after a duplicate-key insert');
       const upd = await db.from('claude_transcript_ledger').update({ session_id: ins.data.id, notes: `nightly draft ${dateET(now)}` }).eq('chat_url', cand.chat_url);
       if (upd.error) throw new Error(upd.error.message);
-      out.drafted.push(ins.data.id);
+      (fresh ? out.drafted : out.already_drafted).push(ins.data.id);
     } catch (err) { out.errors.push(`${cand.chat_url}: ${err.message}`); }
   }
   if (out.drafted.length) {

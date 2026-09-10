@@ -107,7 +107,7 @@ export function registerMemoryTools(server) {
 
   server.tool(
     'memory_checkpoint',
-    'Write a project-memory checkpoint in one call (the v4 session-continuity shape): a session row, decisions (each stamped with the session search keys), issues, resolutions, pending items and closures. Give session_id to REFRESH an existing session instead of inserting a new one — it never creates a second session for the same chat. mode "live" (default) = you are inside the chat; mode "retro" = you reconstructed an old chat from search and MUST pass source{chat_url, chat_title, chat_updated_at} (the row is stamped retro, dated from the chat, ledger row written). A date in the future or more than 400 days back is rejected. A new decision whose nearest active decision scores ≥ 0.85 must name it via supersedes_id or same_as_id (MEMORY_GUARD_MODE shadow logs, live rejects). Dry run unless confirm is true.',
+    'Write a project-memory checkpoint in one call (the v4 session-continuity shape): a session row, decisions (each stamped with the session search keys), issues, resolutions, pending items and closures. Give session_id to REFRESH an existing session instead of inserting a new one — it never creates a second session for the same chat. mode "live" (default) = you are inside the chat; mode "retro" = you reconstructed an old chat from search and MUST pass source{chat_url, chat_title, chat_updated_at} (the row is stamped retro, dated from the chat, ledger row written). A date in the future or more than 400 days back is rejected. A new decision whose nearest active decision scores ≥ 0.85 must name it via supersedes_id or same_as_id (MEMORY_GUARD_MODE shadow logs, live rejects). Safe to re-send: the session identity is a hash of surface + date + title, so a call repeated after a dropped response refreshes that session (result: inserted false, "refreshed existing session #N") instead of writing a twin. Dry run unless confirm is true.',
     {
       mode: z.enum(['live', 'retro']).optional().describe('live (default): written from inside the chat. retro: reconstructed from a search result — source is required'),
       source: z.object({
@@ -132,7 +132,7 @@ export function registerMemoryTools(server) {
       pending: z.array(pending).optional(),
       close_pending: z.array(close).optional(),
       confirm: z.boolean().optional().describe('true to write; otherwise returns the plan'),
-      checkpoint_key: z.string().uuid().optional().describe('idempotency key from a previous transport failure (partial.checkpoint_key) — re-sending with it resumes that session instead of inserting a new one'),
+      checkpoint_key: z.string().min(8).optional().describe('override the identity key. Normally unnecessary: the key is derived from surface + session date + title, so simply re-sending the same checkpoint refreshes the same session. Pass partial.checkpoint_key from a previous transport failure to resume that exact session.'),
     },
     async (args = {}) => {
       try {
@@ -142,7 +142,7 @@ export function registerMemoryTools(server) {
       } catch (err) {
         const kind = classifyCheckpointError(err);
         const body = { ok: false, kind, error: err.message, attempts: err.attempts ?? err.partial?.attempts ?? 1, partial: err.partial ?? null };
-        if (kind === 'transport') body.hint = 'Transient failure after retries. partial lists what already landed — fall back to SQL for the rest, or re-send with checkpoint_key=partial.checkpoint_key to resume.';
+        if (kind === 'transport') body.hint = 'Transient failure after retries. partial lists what already landed — fall back to SQL for the rest, or simply re-send the same checkpoint: the identity key is deterministic, so it resumes that session rather than creating a second one.';
         if (kind === 'validation' && /supersedes_id|same_as_id/.test(err.message)) body.hint = 'Run memory_precheck on the decision text to see the matching decision, then re-send with supersedes_id (replace it) or same_as_id (re-confirm it).';
         return text(body);
       }
