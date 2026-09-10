@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import express from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
@@ -311,6 +312,54 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Expose-Headers', 'mcp-session-id');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
+});
+
+// ─── I.TRACK — tracker asset + tracking-domain guard ──────────────
+// The tracker is loaded on every Reece site from its own first-party
+// address, https://track.getreecewindows.com/reece-tracker.js, which is a
+// custom domain on this same Railway service. Two things follow.
+//
+// 1) The file has to be served, and today it is not — nothing mounts
+//    public/, so the URL 404s. We keep it unmounted on purpose:
+//    express.static('public') would publish every other file in that
+//    directory too. So exactly one file is exposed, by an explicit route,
+//    read once at boot rather than off disk per request.
+// 2) The tracking hostname must not expose the rest of this service. On
+//    that host only the tracker, /health and the collector may answer;
+//    everything else 404s, which keeps the MCP and admin surfaces
+//    unreachable through the tracking domain.
+//
+// Registered here, ahead of every other route, so both are reachable
+// without a token — the same way the /n8n/site/* collector routes are.
+const TRACKER_PATH = '/reece-tracker.js';
+const TRACKING_HOST = 'track.getreecewindows.com';
+const TRACKING_HOST_ALLOWED = new Set([
+  `GET ${TRACKER_PATH}`,
+  'GET /health',
+  'POST /n8n/site/collect',
+]);
+
+let trackerBundle = null;
+try {
+  trackerBundle = readFileSync(new URL('../public/reece-tracker.js', import.meta.url));
+  console.log(`[I.TRACK] Loaded public/reece-tracker.js (${trackerBundle.length} bytes)`);
+} catch (err) {
+  console.error(`[I.TRACK] public/reece-tracker.js unavailable — GET ${TRACKER_PATH} will 404: ${err.message}`);
+}
+
+app.use((req, res, next) => {
+  const host = (req.headers.host || '').split(':')[0].toLowerCase();
+  if (host !== TRACKING_HOST) return next();
+  if (TRACKING_HOST_ALLOWED.has(`${req.method} ${req.path}`)) return next();
+  return res.status(404).json({ error: 'Not found' });
+});
+
+app.get(TRACKER_PATH, (req, res) => {
+  if (!trackerBundle) return res.status(404).json({ error: 'Not found' });
+  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.send(trackerBundle);
 });
 
 const AUTH_SOFT_LAUNCH = process.env.AUTH_SOFT_LAUNCH === 'true';
