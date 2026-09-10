@@ -38,21 +38,34 @@
 -- (memory-project ground rule 5). Mirrored in src/memory/memory-migrations.js
 -- as a presence check.
 --
--- APPLIED 2026-09-10 on Mark's instruction, section by section. Result:
+-- APPLIED 2026-09-10 on Mark's instruction, section by section, then the
+-- dedupe batch, then section E again. Final state:
 --   function claude_checkpoint_key ....... created; returns the same hash as
 --                                          checkpointKeyFor() for the pinned
 --                                          test vector (parity confirmed live)
 --   backfill ............................. 898 of 915 rows on deterministic
 --                                          keys, 0 left NULL
---   rows_left_on_legacy_key .............. 17 (the twin losers — the dedupe
---                                          batch had not run yet; see C)
---   ux_claude_session_checkpoint_key ..... created
---   ux_claude_issue_session_text ......... created
---   ux_claude_pending_session_text ....... created
---   ux_claude_decision_session_text ...... SKIPPED by its DO block — decisions
---                                          #1966/#1967 on session 869 are an
---                                          identical active pair. Dedupe them,
---                                          then re-run section E.
+--   all four unique indexes .............. created (session, decision, issue,
+--                                          pending)
+--   rows_left_on_legacy_key .............. 1
+--
+-- The dedupe batch folded the 16 twin pairs the way #841 was folded earlier:
+-- the loser is retitled '[FOLDED → #<winner>]', validation_status='flagged',
+-- and its key re-derived from the new title — nothing deleted, children left
+-- in place. The winner is always the row this file's backfill gave the
+-- identity key to (chat_url first, else lower id). All 915 sessions now hold
+-- distinct keys.
+--
+-- The 1 row left on a legacy key is #850: it and #841 were both folded into
+-- #221 on 2026-09-08 and so carry identical titles. Pre-existing, harmless
+-- (their stored keys still differ), and deliberately not touched.
+--
+-- ux_claude_decision_session_text was SKIPPED on the first pass — decisions
+-- #1966/#1967 on session 869 were an identical active pair, written 12.6
+-- seconds apart by the very retry this file fixes. #1967 was superseded by
+-- #1966 (with its embedding and conflict #38 updated to match) and the index
+-- then built. That is the DO block working as intended: it reported the
+-- blocker instead of aborting the file.
 --
 -- ROLLBACK (deterministic keys are harmless if left in place):
 --   DROP INDEX IF EXISTS ux_claude_session_checkpoint_key;
@@ -160,8 +173,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_claude_session_checkpoint_key
 -- Created inside DO blocks: an index that cannot be built because pre-existing
 -- duplicates are in the way raises a NOTICE instead of aborting the whole file.
 -- That is what happened on 2026-09-10: the issue and pending indexes built, the
--- decision one did not (decisions #1966/#1967 on session 869 are an identical
--- active pair). Re-run this section after the dedupe batch to pick it up.
+-- decision one did not (decisions #1966/#1967 on session 869 were an identical
+-- active pair). Superseding #1967 cleared it and a re-run of this section built
+-- the index; all four are in place now. Re-run this section after any dedupe.
 -- Correctness does not depend on these indexes — the JS guard stands alone.
 
 DO $$
