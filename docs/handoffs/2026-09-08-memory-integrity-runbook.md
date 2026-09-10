@@ -146,3 +146,28 @@ Order: C1 → C2/C3 → C7/C8 → C4/C5 → C6/C9.
 ## 7. Dashboard tile (separate PR after this one merges)
 
 `reece-dashboard`: one tile reading `claude_memory_validation_log` (latest row per check) plus `claude_memory_context(NULL)->'counts'`: unlinked sessions · write_date rows · open conflicts · embedding coverage % · pack token size · median `memory_search` latency (`memory_vector_queries`). Green when unlinked ≤ 5, write_date = 0, conflicts ≤ 10, coverage 100 %, pack ≤ 9k tokens.
+
+---
+
+## Addendum — 2026-09-10: provenance inheritance narrowed (sql/100)
+
+Mark's ruling, after 95 rows were restored by hand on 09-09: **a refresh's new
+rows are live and confirmed even under a reconstructed session.** Confirmed
+beats reconstructed.
+
+The sql/098 `claude_inherit_provenance()` trigger copied a retro parent's
+`origin` / `confidence` onto every child it ever received, including children
+appended weeks later by a live refresh. sql/100 scopes inheritance to the
+parent's own checkpoint window (5 minutes, the same constant as
+`BATCH_WINDOW_MINUTES`): a retro checkpoint's own children still inherit, a
+later append keeps what its caller gave it. `date_confidence` follows the same
+window, because inside it the child is dated from the session and outside it the
+child is dated the day it was actually decided.
+
+The nightly `provenance_mismatch_children` check uses the same window and
+reports legitimate refresh children under `sample.refresh_children_excluded`
+rather than flagging them, so it reads 0 instead of 95 once applied.
+
+No existing row is rewritten by sql/100 — the 95 keep the provenance the ruling
+gave them. Rollback: re-run the `claude_inherit_provenance()` block in sql/098
+section C.

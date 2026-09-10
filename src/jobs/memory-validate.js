@@ -175,16 +175,25 @@ SELECT
   },
   {
     name: 'provenance_mismatch_children',
-    description: "decisions / issues stamped origin='live' whose parent session is retro (cleanup batch C1)",
+    description: "decisions / issues stamped origin='live' under a retro parent AND written inside that parent's own checkpoint window (sql/100). A later refresh keeps its own provenance by ruling and is counted in sample.refresh_children_excluded, not flagged.",
     sql: `
 SELECT
   ((SELECT count(*) FROM claude_decision_log d JOIN claude_session_logs s ON s.id = d.session_id)
    + (SELECT count(*) FROM claude_known_issues i JOIN claude_session_logs s ON s.id = i.reported_session_id))::int AS rows_checked,
-  ((SELECT count(*) FROM claude_decision_log d JOIN claude_session_logs s ON s.id = d.session_id WHERE s.log_origin = 'retro' AND d.origin = 'live')
-   + (SELECT count(*) FROM claude_known_issues i JOIN claude_session_logs s ON s.id = i.reported_session_id WHERE s.log_origin = 'retro' AND i.origin = 'live'))::int AS rows_flagged,
+  ((SELECT count(*) FROM claude_decision_log d JOIN claude_session_logs s ON s.id = d.session_id
+      WHERE s.log_origin = 'retro' AND d.origin = 'live' AND d.created_at <= s.created_at + interval '5 minutes')
+   + (SELECT count(*) FROM claude_known_issues i JOIN claude_session_logs s ON s.id = i.reported_session_id
+      WHERE s.log_origin = 'retro' AND i.origin = 'live' AND i.created_at <= s.created_at + interval '5 minutes'))::int AS rows_flagged,
   jsonb_build_object(
-    'decisions', (SELECT jsonb_agg(id ORDER BY id) FROM (SELECT d.id FROM claude_decision_log d JOIN claude_session_logs s ON s.id = d.session_id WHERE s.log_origin = 'retro' AND d.origin = 'live' ORDER BY d.id LIMIT ${SAMPLE}) x),
-    'issues', (SELECT jsonb_agg(id ORDER BY id) FROM (SELECT i.id FROM claude_known_issues i JOIN claude_session_logs s ON s.id = i.reported_session_id WHERE s.log_origin = 'retro' AND i.origin = 'live' ORDER BY i.id LIMIT ${SAMPLE}) x)) AS sample`,
+    'decisions', (SELECT jsonb_agg(id ORDER BY id) FROM (SELECT d.id FROM claude_decision_log d JOIN claude_session_logs s ON s.id = d.session_id
+       WHERE s.log_origin = 'retro' AND d.origin = 'live' AND d.created_at <= s.created_at + interval '5 minutes' ORDER BY d.id LIMIT ${SAMPLE}) x),
+    'issues', (SELECT jsonb_agg(id ORDER BY id) FROM (SELECT i.id FROM claude_known_issues i JOIN claude_session_logs s ON s.id = i.reported_session_id
+       WHERE s.log_origin = 'retro' AND i.origin = 'live' AND i.created_at <= s.created_at + interval '5 minutes' ORDER BY i.id LIMIT ${SAMPLE}) x),
+    'refresh_children_excluded',
+      (SELECT count(*) FROM claude_decision_log d JOIN claude_session_logs s ON s.id = d.session_id
+         WHERE s.log_origin = 'retro' AND d.origin = 'live' AND d.created_at > s.created_at + interval '5 minutes')
+      + (SELECT count(*) FROM claude_known_issues i JOIN claude_session_logs s ON s.id = i.reported_session_id
+         WHERE s.log_origin = 'retro' AND i.origin = 'live' AND i.created_at > s.created_at + interval '5 minutes')) AS sample`,
   },
   {
     name: 'flagged_sessions',

@@ -42,6 +42,7 @@ import { runMemoryNightly, formatDigest, DIGEST_CONFLICTS_SQL, DIGEST_UNLINKED_S
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const sql098 = fs.readFileSync(path.join(__dirname, '..', 'sql', '098_memory_integrity.sql'), 'utf8');
+const sql100 = fs.readFileSync(path.join(__dirname, '..', 'sql', '100_provenance_inherit_narrow.sql'), 'utf8');
 
 const NOW = new Date('2026-09-08T16:00:00Z');          // 12:00 ET, 2026-09-08
 const NO_RETRY = false;
@@ -148,12 +149,58 @@ test('sql/098 pack v5: write_date demotion reaches decisions and issues; open_co
   }
 });
 
-test('sql/098 and sql/099 are mirrored in the boot presence check, in order', () => {
+test('sql/098, 099 and 100 are mirrored in the boot presence check, in order', () => {
   const m = MEMORY_MIGRATIONS.find((x) => x.file === '098_memory_integrity.sql');
   assert.ok(m); assert.match(m.check, /trg_claude_guard_session_insert/); assert.match(m.check, /claude_memory_conflicts/);
   const k = MEMORY_MIGRATIONS.find((x) => x.file === '099_checkpoint_key_deterministic.sql');
   assert.ok(k); assert.match(k.check, /claude_checkpoint_key/);
-  assert.deepEqual(MEMORY_MIGRATIONS.slice(-2).map((x) => x.file), ['098_memory_integrity.sql', '099_checkpoint_key_deterministic.sql']);
+  const w = MEMORY_MIGRATIONS.find((x) => x.file === '100_provenance_inherit_narrow.sql');
+  assert.ok(w); assert.match(w.check, /claude_inherit_provenance/); assert.match(w.check, /in_parent_window/);
+  assert.deepEqual(MEMORY_MIGRATIONS.slice(-3).map((x) => x.file),
+    ['098_memory_integrity.sql', '099_checkpoint_key_deterministic.sql', '100_provenance_inherit_narrow.sql'],
+    'sql/100 must apply after 098 — it replaces the function 098 creates');
+});
+
+// ─── sql/100: provenance inheritance scoped to the parent's checkpoint ───────
+test('sql/100 replaces only the inherit function, scopes both fields to the window, and leaves the session guard alone', () => {
+  assert.match(sql100, /CREATE OR REPLACE FUNCTION claude_inherit_provenance\(\) RETURNS trigger/);
+  const stmts = sql100.replace(/--[^\n]*/g, '');   // count statements, not the prose describing them
+  assert.equal((stmts.match(/CREATE OR REPLACE FUNCTION/g) || []).length, 1, 'one function, nothing else');
+  assert.doesNotMatch(stmts, /CREATE OR REPLACE TRIGGER/, 'the sql/098 triggers keep pointing at the replaced function');
+  assert.doesNotMatch(stmts, /claude_guard_session_insert/, 'the session guard is not redefined here');
+  // the window itself, and the early return that makes a later append stand on its own
+  assert.match(sql100, /in_parent_window := p_created IS NOT NULL\s+AND p_created > now\(\) - interval '5 minutes'/);
+  assert.match(sql100, /IF NOT in_parent_window THEN RETURN NEW; END IF;/);
+  // both inherited fields sit AFTER that return, so both are scoped to the window
+  const afterReturn = sql100.slice(sql100.indexOf('IF NOT in_parent_window THEN RETURN NEW; END IF;'));
+  assert.match(afterReturn, /NEW\.origin := 'retro';/);
+  assert.match(afterReturn, /NEW\.confidence := 'reconstructed';/);
+  assert.match(afterReturn, /NEW\.date_confidence := 'write_date';/);
+  assert.doesNotMatch(stmts, /\bDELETE\b|\bTRUNCATE\b|DROP TABLE|DROP COLUMN|\bUPDATE\b/i, 'no existing row is rewritten');
+  assert.match(sql100, /ROLLBACK: re-run the claude_inherit_provenance\(\) block in/);
+});
+
+test('sql/100 uses the same 5-minute window as the checkpoint batch rule', () => {
+  const windows = [...sql100.matchAll(/interval '(\d+) minutes'/g)].map((m) => m[1]);
+  assert.ok(windows.length >= 1);
+  assert.ok(windows.every((w) => w === '5'), `all windows must be 5 minutes, got ${windows.join()}`);
+  // sql/098's batch rule and the tool constant agree with it
+  assert.match(sql098, /interval '5 minutes'/);
+});
+
+test('the nightly provenance check counts only in-window children and reports refreshes separately', () => {
+  const c = VALIDATION_CHECKS.find((x) => x.name === 'provenance_mismatch_children');
+  assert.ok(c);
+  // flagged: child created at or inside the parent's window
+  assert.match(c.sql, /d\.created_at <= s\.created_at \+ interval '5 minutes'/);
+  assert.match(c.sql, /i\.created_at <= s\.created_at \+ interval '5 minutes'/);
+  // excluded and surfaced, not silently dropped
+  assert.match(c.sql, /'refresh_children_excluded'/);
+  assert.match(c.sql, /d\.created_at > s\.created_at \+ interval '5 minutes'/);
+  assert.match(c.sql, /i\.created_at > s\.created_at \+ interval '5 minutes'/);
+  assert.match(c.description, /later refresh keeps its own provenance/);
+  assert.match(c.sql, /^\s*SELECT/);
+  assert.doesNotMatch(c.sql, /\b(UPDATE|DELETE|INSERT|DROP)\b/);
 });
 
 // ─── Env defaults ────────────────────────────────────────────────────────────
