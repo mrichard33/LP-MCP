@@ -61,6 +61,7 @@ import { checkServiceAreaZip } from './services/identity-extraction.js';
 // the market's channel by this code.
 const GHL_MARKET_CODE_FIELD_ID = 'z0MV6mXi0w9WwdCOFThh';
 import { formatAddressLine } from './services/appointment-card.js';
+import { trackBackground } from './graceful-shutdown.js';
 
 // GHL custom field: "LP Inbound Lead ID". Reminder: in1_id is the LP
 // inbound-QUEUE id, not lds_id — SetAppointment can never target it.
@@ -859,9 +860,9 @@ export function registerCanvassingLeadRoutes(app) {
 
     res.status(202).json({ accepted: true });
 
-    processCanvassingLead(payload).catch((err) =>
+    trackBackground(processCanvassingLead(payload).catch((err) =>
       console.error(`[Canvassing] async processing failed for ${payload.ghl_contact_id}: ${err.message}`)
-    );
+    ));
   });
 
   console.log('[Canvassing] POST /webhooks/canvassing-lead registered');

@@ -144,6 +144,7 @@ import { processMilestoneTriggers } from './milestones.js';
 import { runPass1DailyWindows } from './full-sync-pass1.js';
 import { createPageWalker } from './lp-paging.js';
 import { pushNotesToGHL } from './ghl-notes-sync.js';
+import { onShutdown } from './graceful-shutdown.js';
 
 import { SYNC_INTERVAL_MS, RATE_LIMIT_SLEEP_MS, sleep, extractArray, getField, loggedFirstKeys } from './sync-utils.js';
 import {
@@ -1688,16 +1689,17 @@ export function stopSyncScheduler() {
 // each killing a container mid-sweep and each writing 6 rows (one per
 // entity type). None of them were sync failures. They are now labelled as
 // what they are, and get_sync_health counts them separately.
-process.on('SIGTERM', async () => {
-  console.log('[Sync] SIGTERM received — cleaning up...');
+// Graceful-shutdown hooks (src/graceful-shutdown.js owns the signal + the exit).
+// 'start': stop the scheduler immediately so no new sweep begins during drain.
+// 'exit' : after drain, label anything still running as interrupted — same
+//          reason strings as before, so get_sync_health classification is unchanged.
+onShutdown(() => {
+  console.log('[Sync] Shutdown — stopping scheduler');
   stopSyncScheduler();
-  await markRunningLogsAsInterrupted('SIGTERM — container terminated');
-  process.exit(0);
-});
+}, 'start');
 
-process.on('SIGINT', async () => {
-  console.log('[Sync] SIGINT received — cleaning up...');
-  stopSyncScheduler();
-  await markRunningLogsAsInterrupted('SIGINT — process interrupted');
-  process.exit(0);
-});
+onShutdown(async (signal) => {
+  await markRunningLogsAsInterrupted(
+    signal === 'SIGINT' ? 'SIGINT — process interrupted' : 'SIGTERM — container terminated'
+  );
+}, 'exit');

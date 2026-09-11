@@ -67,6 +67,7 @@ import {
 import { flattenWebhookBody, webhookShapeFingerprint } from './webhook-body.js';
 import { buildLeadNoteLines } from './services/lead-note-lines.js';
 import { resolveCanvasserProId } from './services/canvasser-roster.js';
+import { trackBackground } from './graceful-shutdown.js';
 
 // Structural version gate. A literal on the workflow step, so it cannot fail
 // to resolve — if it arrives empty or wrong, the step is misconfigured and the
@@ -665,9 +666,9 @@ export function registerCanvassConfirmationRoutes(app, routeDeps = {}) {
 
     res.status(202).json({ accepted: true });
 
-    processCanvassConfirmation(payload, routeDeps).catch((err) =>
+    trackBackground(processCanvassConfirmation(payload, routeDeps).catch((err) =>
       console.error(`[CanvassConfirm] async processing failed for ${payload.ghl_contact_id}: ${err.message}`)
-    );
+    ));
   });
 
   console.log('[CanvassConfirm] POST /webhooks/canvass-confirmation registered');

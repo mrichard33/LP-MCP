@@ -40,6 +40,7 @@ import { hourFromLpAtime } from './lp-addlead-proxy.js';
 import { extractInboundLeadId } from './lp-client.js';
 import { normalizePhone } from './sync-utils.js';
 import { getSalesRabbitUserId } from './salesrabbit.js';
+import { trackBackground } from './graceful-shutdown.js';
 import {
   BUSINESS_HOUR_START_ET,
   BUSINESS_HOUR_END_ET,
@@ -421,8 +422,8 @@ export function registerCanvassingIntakeRoutes(app) {
     console.log(`[CANVASS-INTAKE] LIVE ${b.contact_id} plan=${plan.action}/${plan.reason} inbound=${inboundId || 'unparsed'} (${Date.now() - started}ms)`);
 
     // Async tail: never blocks the response.
-    writebacks({ b, plan, norm, notes, inboundId })
-      .catch((err) => console.warn(`[CANVASS-INTAKE] writeback tail failed: ${err.message}`));
+    trackBackground(writebacks({ b, plan, norm, notes, inboundId })
+      .catch((err) => console.warn(`[CANVASS-INTAKE] writeback tail failed: ${err.message}`)));
 
     res.json({ success: true, mode, plan: plan.action, reason: plan.reason, inbound_id: inboundId });
   });
