@@ -172,16 +172,44 @@ test('SIGTERM/SIGINT handlers are wired to the interrupted path [source-level]',
   // Pinned at source because flipping this one call back to
   // markRunningLogsAsFailed restores the original defect in full while
   // every behavioural test in this file still passes.
+  //
+  // The signal handling itself now lives in src/graceful-shutdown.js, which
+  // drains in-flight requests BEFORE running the 'exit' hooks. sync-engine.js
+  // registers those hooks; the classification contract is unchanged, so this
+  // test follows the wiring rather than relaxing what it checks.
   const src = readFileSync(join(ROOT, 'src/sync-engine.js'), 'utf8');
+  const shutdownSrc = readFileSync(join(ROOT, 'src/graceful-shutdown.js'), 'utf8');
 
+  // sync-engine must NOT take the signal itself — a second handler calling
+  // process.exit(0) would race the drain and reinstate the original defect.
+  assert.doesNotMatch(src, /process\.on\(\s*['"]SIG(TERM|INT)['"]/,
+    'sync-engine must delegate signals to graceful-shutdown, not exit on its own');
   for (const sig of ['SIGTERM', 'SIGINT']) {
-    const handler = src.slice(src.indexOf(`process.on('${sig}'`));
-    const body = handler.slice(0, handler.indexOf('});'));
-    assert.match(body, /markRunningLogsAsInterrupted/,
-      `${sig} handler must mark rows interrupted`);
-    assert.doesNotMatch(body, /markRunningLogsAsFailed/,
-      `${sig} handler must not write rows as failed`);
+    assert.match(shutdownSrc, new RegExp(`process\\.on\\('${sig}'`),
+      `graceful-shutdown must own the ${sig} handler`);
   }
+
+  // The 'exit' hook is the one that writes the row status.
+  const exitHook = src.slice(src.indexOf('onShutdown(async (signal)'));
+  const body = exitHook.slice(0, exitHook.indexOf("}, 'exit');"));
+  assert.ok(body.length > 0, 'sync-engine must register an exit-phase shutdown hook');
+  assert.match(body, /markRunningLogsAsInterrupted/,
+    'exit hook must mark rows interrupted');
+  assert.doesNotMatch(body, /markRunningLogsAsFailed/,
+    'exit hook must not write rows as failed');
+
+  // Reason strings are what get_sync_health classifies on — they must survive
+  // the refactor verbatim, per signal.
+  assert.match(body, /'SIGINT — process interrupted'/,
+    'SIGINT reason string must be unchanged');
+  assert.match(body, /'SIGTERM — container terminated'/,
+    'SIGTERM reason string must be unchanged');
+
+  // The scheduler must still stop immediately, before the drain wait, so no
+  // new sweep starts and writes fresh running rows mid-shutdown.
+  const startHook = src.slice(src.indexOf('onShutdown(() =>'));
+  assert.match(startHook.slice(0, startHook.indexOf("}, 'start');")), /stopSyncScheduler\(\)/,
+    'start hook must stop the sync scheduler');
 
   // The boot reclaim of orphaned rows is the same infrastructure event one
   // boot later, and reclassifies with the rest.

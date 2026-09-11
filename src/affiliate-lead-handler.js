@@ -66,6 +66,7 @@ import { buildLeadNoteLines } from './services/lead-note-lines.js';
 // different field IDs. Reminder: in1_id is the LP inbound-QUEUE id, not
 // lds_id — SetAppointment can never target it.
 import { FIELD_LP_INBOUND_LEAD_ID } from './canvassing-lead-handler.js';
+import { trackBackground } from './graceful-shutdown.js';
 
 export { FIELD_LP_INBOUND_LEAD_ID };
 
@@ -716,9 +717,9 @@ export function registerAffiliateLeadRoutes(app) {
 
     res.status(202).json({ accepted: true });
 
-    processAffiliateLead(payload).catch((err) =>
+    trackBackground(processAffiliateLead(payload).catch((err) =>
       console.error(`[Affiliate] async processing failed for ${payload.ghl_contact_id}: ${err.message}`)
-    );
+    ));
   });
 
   console.log('[Affiliate] POST /webhooks/affiliate-lead registered');

@@ -7,6 +7,7 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { registerAllTools } from './tools/index.js';
 import { startSyncScheduler, fullSync, incrementalSync, handleWebhookEvent } from './sync-engine.js';
+import { trackInflight, trackBackground, installGracefulShutdown } from './graceful-shutdown.js';
 import { testConnection, getLeads } from './lp-client.js';
 import { getTokenStatus } from './token-manager.js';
 import supabase from './supabase.js';
@@ -314,6 +315,8 @@ const app = express();
 app.use('/memory/omi', omiBodyParser());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+// Graceful drain: count in-flight requests so SIGTERM waits for them.
+app.use(trackInflight);
 
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -1866,7 +1869,7 @@ app.post('/webhook/lp', async (req, res) => {
   const event = req.body.event || req.headers['x-lp-event'] || 'lead.updated';
   const payload = req.body.data || req.body;
   res.json({ status: 'accepted', event });
-  handleWebhookEvent(event, payload).catch(e => console.error(`[Webhook] ${event}:`, e.message));
+  trackBackground(handleWebhookEvent(event, payload).catch(e => console.error(`[Webhook] ${event}:`, e.message)));
 });
 
 // ─── n8n APIs ─────────────────────────────────────────────────────
@@ -2118,7 +2121,7 @@ registerScorecardValidateRoutes(app);
 registerFive9SnapshotRoutes(app, authenticate);
 registerCiRoutes(app, authenticate);            // 2026-08-21 — Call Intelligence ingest (PR 2; worker ships disarmed)
 
-app.listen(PORT, async () => {
+const server = app.listen(PORT, async () => {
   console.log(`LP MCP Server v${SERVER_VERSION} running on port ${PORT}`);
   console.log(`Decision:     POST /n8n/decision-engine/process | /execute | /execute-action | /heartbeat | /heartbeat-de`);
   console.log(`Engagement:   POST /n8n/engagement/refresh | GET /n8n/engagement/status`);
@@ -2183,3 +2186,5 @@ app.listen(PORT, async () => {
     setInterval(async () => { try { await runBulkFieldSync(); logCycleStats(); } catch (e) { console.error('[FieldSync]', e.message); } }, FIELD_SYNC_INTERVAL_MS);
   }, 60000);
 });
+
+installGracefulShutdown(server);

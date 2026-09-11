@@ -312,6 +312,7 @@ import { checkApptEventDedup } from './services/appt-event-dedup.js';
 // real ai.analysis_completed for this contact exists inside this window.
 import { recentAnalysisExists, DEDUP_CONFIRM_WINDOW_MS } from './services/analysis-confirm.js';
 import { stripQuotedEmail } from './email-thread.js';
+import { trackBackground } from './graceful-shutdown.js';
 
 const GHL_WEBHOOK_SECRET = process.env.GHL_WEBHOOK_SECRET || '';
 const GHL_API_KEY = process.env.GHL_API_KEY;
@@ -1137,8 +1138,8 @@ async function handleAppointment(req, res) {
   // lp_leads.appointment_set keep describing the cancelled visit as
   // upcoming. Fire-and-forget: the webhook ack must not wait on GHL writes.
   if (eventType === 'ghl.appointment_cancelled' || eventType === 'ghl.appointment_no_show') {
-    syncCancelledAppointmentState(contactId, { appointmentId, calendarId })
-      .catch(err => console.warn(`[BehavioralEmitter] cancelled-appointment field sync failed for ${contactId}: ${err.message}`));
+    trackBackground(syncCancelledAppointmentState(contactId, { appointmentId, calendarId })
+      .catch(err => console.warn(`[BehavioralEmitter] cancelled-appointment field sync failed for ${contactId}: ${err.message}`)));
   }
 
   // 2026-07-07: stale-terminal-disposition guard (CXL replay incident) — a
@@ -1146,8 +1147,8 @@ async function handleAppointment(req, res) {
   // replays cancel the brand-new appointment. Refresh or clear the mirror.
   // Fire-and-forget: the webhook ack must never wait on GHL/LP reads.
   if (eventType === 'ghl.appointment_booked') {
-    checkDispositionStalenessOnBooking(contactId, { calendarId, appointmentId, startTime })
-      .catch(err => console.warn(`[BehavioralEmitter] disposition staleness guard failed for ${contactId}: ${err.message}`));
+    trackBackground(checkDispositionStalenessOnBooking(contactId, { calendarId, appointmentId, startTime })
+      .catch(err => console.warn(`[BehavioralEmitter] disposition staleness guard failed for ${contactId}: ${err.message}`)));
   }
 
   return res.json({ status: 'accepted', event_type: eventType });
