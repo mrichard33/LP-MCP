@@ -1,0 +1,105 @@
+{
+  "name": "I.OMI — Omi Conversation → LP Memory",
+  "nodes": [
+    {
+      "id": "0f000000-0000-4000-8000-000000000000",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-60, -420],
+      "parameters": {
+        "width": 1180,
+        "height": 340,
+        "color": 4,
+        "content": "## I.OMI · Omi Conversation → LP Memory\n\nA **thin relay**. All the work (extraction, PII scrub, dedupe, conflict check, write) happens in LP-MCP at `POST /memory/omi/ingest` — see `src/memory/omi-ingest.js` and `sql/101_omi_memory_source.sql`.\n\n**Why n8n is in the path at all:** Omi can only call one URL with one token in the query string. n8n moves that token out of the URL into a header, adds the LP-MCP Bearer credential, and gives Mark a **Retry** button on a failed run.\n\n**Setup after import**\n1. Create a **Header Auth** credential named `LP MCP – Omi ingest`: Name `Authorization`, Value `Bearer <OMI_INGEST_TOKEN>`.\n2. Select it on the **POST to LP-MCP** node (the field is empty on a fresh import).\n3. Activate, then set the Omi conversation webhook to:\n   `https://n8n-main-instance-production-981e.up.railway.app/webhook/omi-memory?token=<OMI_WEBHOOK_TOKEN>`\n\n**Executions are saved on failure only.** A successful run holds a transcript in its execution data, so success is saved as `none` on purpose. A failed run keeps everything so it can be retried — retrying is safe, LP-MCP is idempotent on the conversation id.\n\n**Reading a red run:** 401 = the Bearer credential or `OMI_WEBHOOK_TOKEN` is wrong. 403 = the uid is not in `OMI_ALLOWED_UIDS` (the first test always fails here — read the uid out of `claude_memory_validation_log`, check_name `omi:uid_rejected`). 503 = `OMI_INGEST_MODE` is still `off`. 500 = the ingest itself failed; the reason is in `claude_memory_validation_log`, check_name `omi:ingest_failed`."
+      }
+    },
+    {
+      "id": "0f000000-0000-4000-8000-000000000001",
+      "name": "Omi Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 0],
+      "webhookId": "5a6b1f2c-0e4d-4a71-9c33-7b2f0d51ae10",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "omi-memory",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "notes": "Omi POSTs the conversation body and passes ?uid= and ?token= in the query string. Nothing downstream of here logs the body."
+    },
+    {
+      "id": "0f000000-0000-4000-8000-000000000002",
+      "name": "POST to LP-MCP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [280, 0],
+      "parameters": {
+        "method": "POST",
+        "url": "https://lp-mcp-production.up.railway.app/memory/omi/ingest",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Omi-Token", "value": "={{ $json.query.token }}" },
+            { "name": "X-Omi-Uid", "value": "={{ $json.query.uid }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": { "timeout": 120000 }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueErrorOutput",
+      "notes": "The Authorization header comes from the Header Auth credential 'LP MCP – Omi ingest' — never from this JSON. Omi's own token and uid move out of the URL into headers here, so the secret never reaches an access log. Three tries, 5 s apart: LP-MCP is idempotent on sha256('omi|'+conversation_id), so a retry after a lost response writes nothing twice."
+    },
+    {
+      "id": "0f000000-0000-4000-8000-000000000003",
+      "name": "Respond 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [560, -100],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "0f000000-0000-4000-8000-000000000004",
+      "name": "Respond error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [560, 120],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ error: 'ingest failed' }) }}",
+        "options": { "responseCode": "={{ $json.error?.httpCode ?? 502 }}" }
+      },
+      "notes": "Omi gets a plain failure. The reason is in the n8n execution and in claude_memory_validation_log — never in the response body."
+    }
+  ],
+  "connections": {
+    "Omi Webhook": {
+      "main": [[{ "node": "POST to LP-MCP", "type": "main", "index": 0 }]]
+    },
+    "POST to LP-MCP": {
+      "main": [
+        [{ "node": "Respond 200", "type": "main", "index": 0 }],
+        [{ "node": "Respond error", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/New_York",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "all",
+    "executionTimeout": 180
+  }
+}

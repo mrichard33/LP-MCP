@@ -38,6 +38,7 @@ import { registerIntentScorerRoutes } from './intent-scorer.js';
 // ─── Phase 4: KB Vector Ingestion (agentic bot knowledge layer) ──
 import { registerKbIngestionRoutes } from './knowledge/ingest-embeddings.js';
 import { registerMemoryRoutes } from './memory/memory-routes.js';
+import { registerOmiRoutes, omiBodyParser } from './memory/omi-routes.js';
 import { registerMemoryNightlyRoutes, startMemoryNightlyScheduler } from './jobs/memory-nightly.js';
 import { registerAdminMemoryRoutes } from './routes/admin-memory.js';
 import { checkMemorySchema } from './memory/memory-migrations.js';
@@ -302,6 +303,11 @@ const FIELD_SYNC_INTERVAL_MS = 15 * 60 * 1000;
 const SERVER_VERSION = '6.5.1';
 
 const app = express();
+// sql/101 — an Omi conversation is far bigger than express.json()'s 100 kB
+// default, and the global parser would answer 413 before /memory/omi/ingest
+// could apply (and explain) its own OMI_MAX_BODY_BYTES cap. Mounted first, on
+// that path only; every other route keeps the default limit.
+app.use('/memory/omi', omiBodyParser());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -1893,6 +1899,10 @@ registerKbIngestionRoutes(app);
 // ─── Memory vector tier (sql/094): server-side backfill + hybrid search ──
 // Operator surface only; nothing in the request path calls it. Authenticated.
 registerMemoryRoutes(app, authenticate);
+// sql/101: Omi conversation ingest. Its own Bearer token (OMI_INGEST_TOKEN),
+// NOT MCP_AUTH_TOKEN — the n8n relay must not hold the key to every admin
+// route here. Answers 503 until OMI_INGEST_MODE is set to shadow or live.
+registerOmiRoutes(app);
 registerMemoryNightlyRoutes(app, authenticate);
 // sql/098: n8n event door (pending / issue, never decision) + manual validation run.
 registerAdminMemoryRoutes(app, authenticate);

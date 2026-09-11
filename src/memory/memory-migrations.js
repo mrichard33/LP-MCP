@@ -2,7 +2,7 @@
  * Memory schema presence check — src/memory/memory-migrations.js
  *
  * The "mirror in runMigrations()" promised for priority #8 (decision #1673),
- * done as a guarded self-heal: at boot, check that the objects sql/090–100
+ * done as a guarded self-heal: at boot, check that the objects sql/090–101
  * create are present; log one WARN line per missing object. Apply the files
  * ONLY when MEMORY_MIGRATIONS_AUTOAPPLY=true — production already has all of
  * them, and the .sql files stay the single definition (never copied into
@@ -28,6 +28,11 @@ export const MEMORY_MIGRATIONS = [
   { file: '098_memory_integrity.sql',               check: "SELECT 1 FROM pg_trigger t JOIN information_schema.tables x ON x.table_name = 'claude_memory_conflicts' WHERE t.tgname = 'trg_claude_guard_session_insert'" },
   { file: '099_checkpoint_key_deterministic.sql',   check: "SELECT 1 FROM pg_proc WHERE proname = 'claude_checkpoint_key'" },
   { file: '100_provenance_inherit_narrow.sql',      check: "SELECT 1 FROM pg_proc WHERE proname = 'claude_inherit_provenance' AND prosrc LIKE '%in_parent_window%'" },
+  // sql/101 needs BOTH halves: the writer function and the widened surface
+  // CHECK. With the function present but the constraint still on the old list,
+  // every Omi ingest would fail inside the transaction with a check_violation.
+  { file: '101_omi_memory_source.sql',              check: "SELECT 1 FROM pg_proc WHERE proname = 'claude_omi_ingest'" },
+  { file: '101_omi_memory_source.sql',              check: "SELECT 1 FROM pg_constraint WHERE conname = 'claude_session_logs_surface_check' AND pg_get_constraintdef(oid) LIKE '%omi%'" },
 ];
 
 export async function checkMemorySchema({ sql = runSQL, autoApply = String(process.env.MEMORY_MIGRATIONS_AUTOAPPLY || 'false') === 'true' } = {}) {
@@ -41,16 +46,19 @@ export async function checkMemorySchema({ sql = runSQL, autoApply = String(proce
       missing.push(m);
     }
   }
-  if (!missing.length) { console.log('[MemorySchema] sql/090–100 present'); return { ok: true, missing: [], applied: [] }; }
-  for (const m of missing) console.warn(`[MemorySchema] MISSING: ${m.file} — ${autoApply ? 'applying' : 'set MEMORY_MIGRATIONS_AUTOAPPLY=true to apply at boot, or run the file by hand'}`);
+  if (!missing.length) { console.log('[MemorySchema] sql/090–101 present'); return { ok: true, missing: [], applied: [] }; }
+  // A file can appear more than once above (sql/101 is checked in two parts);
+  // report and apply it once.
+  const missingFiles = [...new Set(missing.map((m) => m.file))];
+  for (const f of missingFiles) console.warn(`[MemorySchema] MISSING: ${f} — ${autoApply ? 'applying' : 'set MEMORY_MIGRATIONS_AUTOAPPLY=true to apply at boot, or run the file by hand'}`);
   const applied = [];
   if (autoApply) {
-    for (const m of missing) {
-      const text = fs.readFileSync(path.join(SQL_DIR, m.file), 'utf8');
+    for (const f of missingFiles) {
+      const text = fs.readFileSync(path.join(SQL_DIR, f), 'utf8');
       await sql(text);
-      applied.push(m.file);
-      console.log(`[MemorySchema] applied ${m.file}`);
+      applied.push(f);
+      console.log(`[MemorySchema] applied ${f}`);
     }
   }
-  return { ok: applied.length === missing.length, missing: missing.map((m) => m.file), applied };
+  return { ok: applied.length === missingFiles.length, missing: missingFiles, applied };
 }

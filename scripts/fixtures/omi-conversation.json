@@ -1,0 +1,59 @@
+{
+  "_comment": "SYNTHETIC Omi conversation-webhook payload (sql/101). Invented people, no real names or phone numbers. Used by scripts/test-omi-ingest.js and as the shape reference for src/memory/omi-ingest.js. Omi POSTs this to <url>?uid=<omi_uid>; the uid is a query parameter, not a body field, and the n8n relay moves it into the X-Omi-Uid header.",
+  "id": "omi-conv-fixture-0001",
+  "created_at": "2026-09-11T14:02:11.000Z",
+  "started_at": "2026-09-11T13:48:00.000Z",
+  "finished_at": "2026-09-11T14:02:05.000Z",
+  "discarded": false,
+  "structured": {
+    "title": "Jacksonville limits and the MOD report",
+    "overview": "Talked through the condo lead limit for Jacksonville and a missing set of dispositions on the MOD report.",
+    "emoji": "📈",
+    "category": "work",
+    "action_items": [
+      { "description": "Get the missing CCC dispositions onto the MOD report", "completed": false }
+    ],
+    "events": []
+  },
+  "transcript_segments": [
+    {
+      "text": "Okay so on Jacksonville, I think we should change the condo limit to a hundred and seventy five thousand.",
+      "speaker": "SPEAKER_0",
+      "speaker_id": 0,
+      "speaker_name": "Mark",
+      "is_user": true,
+      "start": 0.0,
+      "end": 6.4
+    },
+    {
+      "text": "That is higher than what we have now, right?",
+      "speaker": "SPEAKER_1",
+      "speaker_id": 1,
+      "speaker_name": "Dana",
+      "is_user": false,
+      "start": 6.4,
+      "end": 8.9
+    },
+    {
+      "text": "Yeah. And I need Amanda to add the missing CCC dispositions to the MOD report, they have been blank for two weeks.",
+      "speaker": "SPEAKER_0",
+      "speaker_id": 0,
+      "speaker_name": "Mark",
+      "is_user": true,
+      "start": 9.0,
+      "end": 16.2
+    },
+    {
+      "text": "I will put it on her list. Call me back on my cell, (727) 555-0142.",
+      "speaker": "SPEAKER_1",
+      "speaker_id": 1,
+      "speaker_name": "Dana",
+      "is_user": false,
+      "start": 16.2,
+      "end": 21.5
+    }
+  ],
+  "apps_response": [],
+  "folder_id": null,
+  "folder_name": null
+}
