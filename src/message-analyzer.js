@@ -253,6 +253,13 @@ import { callLLM, resolveLLM } from './llm-client.js';
 // handling or rep escalation (that produced a duplicate "a rep will call" send
 // alongside the booking confirmation).
 import { hasActiveBooking } from './agentic/lead-state/signals/context-reader.js';
+// 2026-09-11 (Alfredo Fontan) — the shared contract for which established
+// facts are writable and what values they accept. Pure; the action handler
+// that performs the write imports the same module, so the two cannot drift.
+import {
+  normalizeEstablishedFacts,
+  ANSWERABLE_QUESTION_KEYS,
+} from './agentic/established-facts-fields.js';
 
 const ANALYSIS_RATE_LIMIT = parseInt(process.env.ANALYSIS_RATE_LIMIT || '100', 10);
 // v1.2: default shortened from 3600000 (1h) → 120000 (2min). Content-hash
@@ -441,8 +448,51 @@ Required JSON structure:
   "guide_type": <null | "dhp" | "hurricane" | "energy" | "security" | "warranty" | "financing" | "reviews" | "credentials" | "booking-link" | "process">,
   "follow_up_bucket": <null | "tomorrow" | "few-days" | "1week" | "2weeks" | "1month" | "2months" | "after-holidays" | "seasonal">,
   "call_purpose": <null | "pricing_questions" | "general_questions" | "pre_visit_confirmation" | "requested_callback">,
+  "established_facts": {
+    "decision_makers_present": <null | "Yes" | "No" | "Solo Owner" | "Uncertain">,
+    "window_count": <null | integer>,
+    "address_confirmed": <null | true | false>,
+    "preferred_time": <null | string>,
+    "answered_question_keys": [<subset of "decision_makers","window_count","address","preferred_time","prior_quotes","email","timeline">]
+  },
   "reasoning": "<1-2 sentence explanation>"
 }
+
+═══════════════════════════════════════════════════════════════════
+ESTABLISHED FACTS — WRITE DOWN WHAT THEY ACTUALLY TOLD YOU
+═══════════════════════════════════════════════════════════════════
+
+You already work these out. You state them in your own reasoning and then they
+are lost, because prose is not something the system can act on. Emit them as
+data so the question is never asked twice.
+
+Emit a fact ONLY when the lead stated it, in their own words, in this turn or
+in a prior turn of this conversation. Never from our outbound — us saying
+something is not them confirming it. Never inferred, never assumed, never
+carried over from what is typical.
+
+• decision_makers_present — "Solo Owner" when they say it is only them ("just
+  me", "just myself", "it's my call"). "Yes" when they say everyone deciding
+  will be present ("both of us", "my wife and I will be here"). "No" when they
+  say someone who decides will NOT be there. "Uncertain" when they say they do
+  not know. NULL when they have not addressed it. A lead who was ASKED and did
+  not answer is NULL, not "Uncertain".
+• window_count — the number of windows/openings THEY stated. Never a number we
+  quoted at them, never a number from an estimate record, never a range you
+  narrowed yourself.
+• address_confirmed — true only when they confirmed the service address we
+  read back to them. Asking for an address is not confirming one.
+• preferred_time — the day/time window THEY asked for, in their words
+  ("mornings", "after 5", "Thursday").
+• answered_question_keys — every question this conversation has now ANSWERED,
+  whether or not a value above captured it. "prior_quotes" belongs here when
+  they have told you about other companies, quotes, or estimates; "email" when
+  they have given an address; "timeline" when they have stated when they want
+  it done.
+
+If nothing in the conversation establishes anything, emit established_facts
+with every value null and answered_question_keys empty. Do NOT omit the object
+and do NOT invent a value to fill it.
 
 APPOINTMENT-DAY OVERRIDE (highest precedence when it applies):
 Read appointment_phase from the context. When appointment_phase is
@@ -1347,6 +1397,45 @@ export async function analyzeMessage(ghlContactId, messageText, eventId = null, 
         `(appointment_set=${context.lp?.appointment_set} demo_completed=${context.lp?.demo_completed})`
       );
       analysis.recommended_action = safeAction;
+    }
+
+    // ─── ESTABLISHED FACTS (2026-09-11 — Alfredo Fontan) ────────────────
+    //
+    // Validated HERE, before the event is emitted, so an unusable value never
+    // reaches the rules layer at all. ANALYZER_ESTABLISHED_PERSIST gates on
+    // `established_facts` being non-null; an object whose every value is junk
+    // would fire the rule and then write nothing, which looks like a working
+    // rule in the dashboard and is worse than not firing.
+    //
+    // The model is asked for this shape; it is not trusted to produce it. A
+    // select value outside the live option list is dropped, never coerced —
+    // GHL accepts an off-list string on a select and every reader downstream
+    // then compares against something that can never match.
+    if (analysis.established_facts !== undefined) {
+      const ef = analysis.established_facts;
+      const norm = normalizeEstablishedFacts(ef);
+      if (norm.dropped.length) {
+        console.warn(
+          `[MessageAnalyzer] established_facts dropped for ${ghlContactId}: ` +
+          norm.dropped.map(d => `${d.key}="${d.value}" (${d.reason})`).join(', ')
+        );
+      }
+      // Null the whole object when nothing survived AND no question was
+      // answered — that is the not-null gate the rule reads.
+      const answered = Array.isArray(ef?.answered_question_keys)
+        ? ef.answered_question_keys.filter(k => ANSWERABLE_QUESTION_KEYS.includes(k))
+        : [];
+      analysis.established_facts = (norm.written.length || answered.length)
+        ? { ...ef, answered_question_keys: answered, _writable: norm.written }
+        : null;
+      if (norm.written.length) {
+        console.log(`[MessageAnalyzer] established_facts for ${ghlContactId}: ${norm.written.join(', ')}`);
+      }
+    } else {
+      // An older model response, or a path that never set it. Explicitly null
+      // so the rule's payload_field_not_null gate reads a real value rather
+      // than an absent key.
+      analysis.established_facts = null;
     }
 
     const historyEntry = {
