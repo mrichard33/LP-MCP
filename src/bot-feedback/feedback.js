@@ -107,8 +107,14 @@ export async function resolveActor(email) {
   return { ok: true, actor: { email: user.email, role: user.role, isAdmin } };
 }
 
-/** Append to the audit log. Never throws — a failed log must not undo a write. */
-async function logChange({ actor, action, targetTable, targetId, reason = null, before = null, after = null }) {
+/**
+ * Append to the audit log. Never throws — a failed log must not undo a write.
+ *
+ * Exported so the prompt editor (prompts.js) writes its promoted_live /
+ * rolled_back entries through the SAME function rather than a second copy that
+ * could drift on column names or on the swallow-errors rule.
+ */
+export async function logChange({ actor, action, targetTable, targetId, reason = null, before = null, after = null }) {
   try {
     const { error } = await supabase.from('bot_change_log').insert({
       actor, action, target_table: targetTable, target_id: String(targetId),

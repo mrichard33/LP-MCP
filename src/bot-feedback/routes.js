@@ -25,6 +25,10 @@ import {
   submitFeedback, undoFeedback, editFeedback, stopBot, calibrationNext,
   retractFeedback, dismissReview, undoDismissal, listCompleted,
 } from './feedback.js';
+import {
+  listPrompts, getPrompt, saveDraft, activatePrompt,
+  rollbackPrompt, togglePrompt, discardDraft,
+} from './prompts.js';
 
 /**
  * Count rows. Returns null when the relation is absent (sql/103 not applied) or
@@ -278,11 +282,83 @@ export function registerBotFeedbackRoutes(app, authenticate) {
     }
   });
 
+  // ══ Prompt editor — the live nurture prompts ═════════════════════
+  //
+  // Reads are open to anyone who may see Bot Review; every write is
+  // operator-and-above and re-checked in the service. These endpoints are the
+  // ONLY way the dashboard touches agentic_messaging_prompts, which the
+  // nurture selector reads live on every generation.
+
+  app.get('/api/bot-feedback/prompts', ...guards, async (req, res) => {
+    try {
+      return send(res, await listPrompts(actorOf(req)));
+    } catch (err) {
+      console.error(`[BotFeedback] GET /prompts threw: ${err.message}`);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.get('/api/bot-feedback/prompts/:id', ...guards, async (req, res) => {
+    try {
+      return send(res, await getPrompt(actorOf(req), req.params.id));
+    } catch (err) {
+      console.error(`[BotFeedback] GET /prompts/:id threw: ${err.message}`);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.post('/api/bot-feedback/prompts/:id/draft', ...guards, async (req, res) => {
+    try {
+      return send(res, await saveDraft(actorOf(req), req.params.id, req.body || {}));
+    } catch (err) {
+      console.error(`[BotFeedback] POST /prompts/:id/draft threw: ${err.message}`);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.delete('/api/bot-feedback/prompts/:id/draft', ...guards, async (req, res) => {
+    try {
+      return send(res, await discardDraft(actorOf(req), req.params.id));
+    } catch (err) {
+      console.error(`[BotFeedback] DELETE /prompts/:id/draft threw: ${err.message}`);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.post('/api/bot-feedback/prompts/:id/activate', ...guards, async (req, res) => {
+    try {
+      return send(res, await activatePrompt(actorOf(req), req.params.id, req.body || {}));
+    } catch (err) {
+      console.error(`[BotFeedback] POST /prompts/:id/activate threw: ${err.message}`);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.post('/api/bot-feedback/prompts/:id/rollback', ...guards, async (req, res) => {
+    try {
+      return send(res, await rollbackPrompt(actorOf(req), req.params.id, req.body || {}));
+    } catch (err) {
+      console.error(`[BotFeedback] POST /prompts/:id/rollback threw: ${err.message}`);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.post('/api/bot-feedback/prompts/:id/toggle', ...guards, async (req, res) => {
+    try {
+      return send(res, await togglePrompt(actorOf(req), req.params.id, req.body || {}));
+    } catch (err) {
+      console.error(`[BotFeedback] POST /prompts/:id/toggle threw: ${err.message}`);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
   console.log(
     '[BotFeedback] Routes: GET /health | POST /jobs/outcomes | POST /feedback | ' +
     'POST /feedback/:id/undo | POST /feedback/:id/edit | POST /feedback/:id/retract | ' +
     'POST /dismiss | POST /dismiss/:id/undo | GET /completed | ' +
-    'POST /lead/:contactId/stop-bot | GET /calibration/next' +
+    'POST /lead/:contactId/stop-bot | GET /calibration/next | ' +
+    'GET /prompts | GET /prompts/:id | POST+DELETE /prompts/:id/draft | ' +
+    'POST /prompts/:id/activate | POST /prompts/:id/rollback | POST /prompts/:id/toggle' +
     `${guards.length ? ' (authenticated)' : ' (UNAUTHENTICATED — no middleware passed)'}`,
   );
 }
