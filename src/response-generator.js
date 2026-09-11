@@ -930,6 +930,28 @@ function formatTodayForPrompt() {
   }).format(new Date());
 }
 
+// Same clock and same PROMPT_TIMEZONE as formatTodayForPrompt(), one calendar day on,
+// and formatted identically. Naming tomorrow's weekday explicitly is what stops the
+// model offering "tomorrow" and that weekday as two different days
+// (zOtz91P604CVWP47DIJx 2026-09-11 offered "tomorrow" and "Saturday" as alternatives).
+// Resolve today's date IN PROMPT_TIMEZONE first, then step one calendar day: adding 24h
+// of elapsed time would land on the wrong day across a DST boundary. The step itself is
+// plain UTC arithmetic on that already-localized date, so PROMPT_TIMEZONE stays the only
+// source of truth for which day it is.
+function formatTomorrowForPrompt() {
+  const [y, m, d] = new Intl.DateTimeFormat('en-CA', { timeZone: PROMPT_TIMEZONE })
+    .format(new Date())
+    .split('-')
+    .map(Number);
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'UTC',
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  }).format(new Date(Date.UTC(y, m - 1, d + 1)));
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // v2.7.4 — RECENT EDITS RETRIEVAL (in-context learning)
 // ═══════════════════════════════════════════════════════════════════
@@ -1007,7 +1029,7 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   parts.push(channel === 'sms' ? P.SMS_CONSTRAINTS : P.EMAIL_CONSTRAINTS);
 
   parts.push(...P.currentDateHeader(PROMPT_TIMEZONE));
-  parts.push(...P.todayIs(formatTodayForPrompt()));
+  parts.push(...P.todayIs(formatTodayForPrompt(), formatTomorrowForPrompt()));
 
   // ── TIME NOW (2026-08-29, Myron Thorner q5GehRye7DNkN6jlmjl3) ──────────
   // The model previously received only the current DATE — the block directly

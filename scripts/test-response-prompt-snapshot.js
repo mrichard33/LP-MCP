@@ -62,9 +62,13 @@ for (const [k, v] of Object.entries(FROZEN_ENV)) process.env[k] = v;
 
 // ── Pinned clock ─────────────────────────────────────────────────────
 // formatTodayForPrompt() calls new Date(), and the fast-track/temperature
-// helpers call Date.now(). Both are pinned to the instant every fixture's
-// context.now describes, so "TODAY IS:" is stable.
-const FIXED_NOW = new Date('2026-09-02T15:30:00Z').getTime();
+// helpers call Date.now(). Both are pinned to DEFAULT_NOW — the instant every fixture's
+// context.now describes — so "TODAY IS:" is stable.
+// FIXED_NOW is mutable so a fixture carrying "fixedNow" can pin a different day for its
+// own render: TODAY IS / TOMORROW IS read the clock, not context.now, so a fixture that
+// needs a specific weekday (34- needs a Friday) has no other way to ask for one.
+const DEFAULT_NOW = new Date('2026-09-02T15:30:00Z').getTime();
+let FIXED_NOW = DEFAULT_NOW;
 const RealDate = Date;
 class PinnedDate extends RealDate {
   constructor(...args) {
@@ -96,6 +100,8 @@ function render(fixture) {
     saved[k] = process.env[k];
     process.env[k] = v;
   }
+  const savedNow = FIXED_NOW;
+  if (fixture.fixedNow) FIXED_NOW = new RealDate(fixture.fixedNow).getTime();
   try {
     return {
       system: getResponseSystemPrompt(),
@@ -112,6 +118,7 @@ function render(fixture) {
       ),
     };
   } finally {
+    FIXED_NOW = savedNow;
     for (const [k, prev] of Object.entries(saved)) {
       if (prev === undefined) delete process.env[k];
       else process.env[k] = prev;

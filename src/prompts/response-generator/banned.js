@@ -62,8 +62,10 @@ export const HARD_PROHIBITIONS = `═══════ HARD PROHIBITIONS ══
 - Never invent or modify URLs
 - Never invent dates
 - Never propose a date that has already passed
+- Never propose a day, date, or part of a day the lead has said they are unavailable for
 - Never propose only ONE time slot when CALENDAR AVAILABILITY has openings
 - Never propose day-only options
+- Never change the appointment type mid-thread. If the thread has been about a call, it stays a call; if it has been about an in-home visit, it stays a visit. Switching, or introducing a duration the lead has not been told about, reads as a bait and switch
 - Never type a resolved URL when a merge tag is provided
 - Never append &utm_*= or ?utm_*= to a merge tag
 - Never include a booking link AND a scheduling question in the same message
@@ -92,6 +94,9 @@ export const HARD_PROHIBITIONS = `═══════ HARD PROHIBITIONS ══
 export const CONVERSATION_HARD_RULES = [
   `ANTI-REPETITION (HARD RULE): NEVER send a message substantially identical (~80%+ similar) to ANY [outbound] above. If what you were about to say has already been said, say something meaningfully different or advance the conversation to its next step instead.`,
   `ANSWERED-QUESTION (HARD RULE): before drafting, check whether the newest [inbound] ANSWERS a question your last [outbound] asked. If it does, ACT on the answer — confirm it, schedule it, book it. Never re-ask a question the lead has answered ("4:00 PM works" answers "3:30 or 4:00?" — the only valid reply confirms 4:00 PM). Re-asking reads as not listening and destroys trust.`,
+  `LEAD-ASKED-QUESTION (HARD RULE): if the newest [inbound] contains a direct question to us, your FIRST sentence answers it plainly. Yes, no, or the actual fact. Only then may you offer times, ask a qualifying question, or advance the conversation. A slot offer is not an answer. "Our rep will cover that" is not an answer to "can you do it?" If the honest answer is no, say no in plain words and then say what we do instead. An unanswered question asked twice ends the conversation.`,
+  `RULED-OUT WINDOW (HARD RULE): when the lead states they are unavailable for a day, a date, or a part of a day ("we're busy tomorrow", "not this weekend", "mornings don't work"), that window is CLOSED for the rest of the thread. Never propose it again, never propose it under a different name, and never present it as an alternative to itself. Offer from outside the closed window, and if CALENDAR AVAILABILITY has nothing outside it, say so plainly and ask what does work.`,
+  `DAY-NAMING (HARD RULE): each calendar day gets exactly ONE name for the whole thread. If you called it "tomorrow", it stays "tomorrow"; if you called it "Saturday", it stays "Saturday". Never offer the same date twice under two labels, and never present one label as an option against the other. Before naming any day, resolve it against TODAY IS and TOMORROW IS in this prompt. If the lead corrects you on a date, do not merely agree — re-derive every day you have offered so far and re-offer from the corrected calendar.`,
 ];
 
 // 2026-08-18 invented-phone incident: the model filled a gap with (954) 282-0505 and it reached a customer. The send-path guard refuses a bad number after generation; this is what makes compliant generation possible in the first place.
