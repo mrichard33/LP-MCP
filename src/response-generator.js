@@ -1106,7 +1106,10 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
   // discovery OFF for booked contacts. Kill switch: NEPQ_LAYER_MODE=off.
   // Placed after the date/time frame and the stage signals above, so the
   // questioning discipline is chosen against a context the model already has.
-  const nepqBlock = buildNepqBlock(context);
+  // v1.2 (2026-09-11): the layer now reads the established facts too, so it can
+  // subtract questions the lead has already answered and render an objection
+  // play. Same object the ESTABLISHED block above was built from.
+  const nepqBlock = buildNepqBlock(context, opts.established);
   if (nepqBlock) parts.push(nepqBlock);
 
   // Acknowledgment-only conduct is decided BEFORE the email opener, because it
@@ -2240,6 +2243,148 @@ export function findImmediateCallPromises(message) {
   return hits;
 }
 
+// ─── Repeat-ask and concession guards (2026-09-11 — Alfredo Fontan) ───
+//
+// Outbound yFkfGW3AOmm9M8Myk7W8, 21:11:55Z:
+//
+//   "Fair point, Alfredo — close is close. To get the visit scheduled
+//    correctly, will it just be you home, or is there someone else who'd
+//    want to be there?"
+//
+// Two defects in one sentence: it re-asks a question he answered at 19:37,
+// and it concedes his objection before pivoting off it. The ESTABLISHED block
+// and the NEPQ objection play make the correct reply possible; these make the
+// wrong one non-shippable, in the same spirit as the invented-phone and
+// timeline-promise guards — a prompt is a request, this is the rule.
+
+// Re-ask detection is by INTENT, not wording. The model will not repeat our
+// phrasing verbatim; it will ask the same thing a different way. Each closed
+// question key maps to the shapes that question actually takes.
+const REPEAT_QUESTION_PATTERNS = Object.freeze({
+  decision_makers: [
+    /\b(?:anyone|anybody|someone|somebody)\s+else\b/i,
+    /\bwho\s+else\b/i,
+    /\bjust\s+(?:you|yourself)\b/i,
+    /\bonly\s+you\b/i,
+    /\bboth\s+(?:of\s+you\s+)?(?:be\s+)?(?:home|there|present|available)\b/i,
+    /\bdecision[-\s]?makers?\b/i,
+    /\bis\s+it\s+your\s+call\b/i,
+    /\b(?:wife|husband|spouse|partner)\s+(?:be\s+)?(?:home|there|joining)\b/i,
+  ],
+  window_count: [
+    /\bhow\s+many\b[^?]{0,40}\b(?:windows?|openings?|doors?)\b/i,
+    /\bnumber\s+of\s+(?:windows?|openings?|doors?)\b/i,
+  ],
+  address: [
+    /\b(?:property|home|service|street|full|best)\s+address\b/i,
+    /\bwhat(?:'s|\s+is)\s+the\s+address\b/i,
+    /\bzip\s*code\b/i,
+  ],
+  preferred_time: [
+    /\bwhat\s+(?:day|time)\b/i,
+    /\bmornings?\s+or\s+afternoons?\b/i,
+    /\bwhen\s+(?:works|would\s+work|is\s+good)\b/i,
+  ],
+  prior_quotes: [
+    /\bhad\s+(?:anyone|anybody|someone)\s+out\b/i,
+    /\bhad\s+(?:any\s+)?(?:other\s+)?(?:quotes?|estimates?|bids?)\b/i,
+    /\bother\s+(?:companies|quotes?|estimates?|bids?)\b/i,
+    /\bshopping\s+around\b/i,
+  ],
+  email: [
+    /\bemail\s+address\b/i,
+    /\bwhat(?:'s|\s+is)\s+(?:your|the\s+best)\s+email\b/i,
+  ],
+  timeline: [
+    /\bhow\s+soon\b/i,
+    /\btime\s*frame\b/i,
+    /\bwhen\s+(?:are|were)\s+you\s+(?:looking|hoping|planning)\b/i,
+  ],
+});
+
+// A sentence that REFERENCES an answer rather than asking for it — "since it's
+// just you", "you mentioned it's just you". These carry the same nouns as the
+// question shapes above and are exactly what we WANT the reply to do, so they
+// suppress a match on that sentence.
+const REFERENCES_ANSWER_RX =
+  /\b(?:since|because|now\s+that|given\s+that|as)\s+(?:it'?s|it\s+is|you'?re|you\s+are|there'?s)\b|\byou\s+(?:mentioned|said|told\s+(?:me|us))\b|\bsounds\s+like\b/i;
+
+/**
+ * Closed questions a draft re-asks. Pure; exported for tests.
+ *
+ * Only sentences that are actually QUESTIONS are considered — a statement that
+ * happens to contain "just you" is not a re-ask — and a sentence that
+ * references their prior answer is skipped even when it carries the nouns.
+ *
+ * @param {string} message
+ * @param {object} established  buildEstablishedFacts() output
+ * @returns {string[]} closed question keys the message re-asks; empty is clean
+ */
+export function findRepeatedQuestions(message, established) {
+  const closed = established?.closed_questions || [];
+  if (!closed.length) return [];
+
+  const body = String(message || '');
+  // Sentence-grained: one clause referencing the answer must not excuse a
+  // different clause re-asking it, and vice versa.
+  const sentences = body.split(/(?<=[.!?])\s+/).filter(s => s.includes('?'));
+  const hits = new Set();
+
+  for (const sentence of sentences) {
+    if (REFERENCES_ANSWER_RX.test(sentence)) continue;
+    for (const key of closed) {
+      const patterns = REPEAT_QUESTION_PATTERNS[key];
+      if (patterns?.some(rx => rx.test(sentence))) hits.add(key);
+    }
+  }
+  return [...hits];
+}
+
+// The concede-and-pivot opener. Banned in the NEPQ objection block; detected
+// here. "Fair point, Alfredo — close is close." is the live instance.
+const CONCESSION_OPENER_RX =
+  /^\s*(?:fair\s+(?:point|enough)|you'?re\s+right|that'?s\s+(?:fair|true)|i\s+(?:understand|hear\s+you|get\s+(?:it|that))|that\s+makes\s+sense|totally\s+fair|absolutely|no\s+argument)\b/i;
+
+// A pivot: the concession is followed by a question about something else.
+// "To get the visit scheduled correctly, will it just be you home…" is the
+// live instance — it drops the objection and asks for a qualifier instead.
+const PIVOT_RX =
+  /\b(?:to\s+get|so\s+(?:i|we)\s+can|in\s+order\s+to|before\s+(?:we|i)|meanwhile|that\s+said|anyway)\b/i;
+
+/**
+ * Concession-then-pivot in a draft, while an objection is open. Pure; exported
+ * for tests.
+ *
+ * WARN-level by design, never a hard failure: a genuine apology and a genuine
+ * acknowledgment are legitimate replies, and a guard that threw on every one
+ * of them would cost leads a reply to save them a bad sentence. It sets a
+ * regeneration note instead.
+ *
+ * @param {string} message
+ * @param {object} established
+ * @param {{objectionOpen?: boolean}} [opts]
+ * @returns {string[]} violations; empty is clean
+ */
+export function findConcessionPivots(message, established, { objectionOpen = false } = {}) {
+  const hasObjection = objectionOpen || (established?.objections_raised || []).length > 0;
+  if (!hasObjection) return [];
+
+  const body = String(message || '').trim();
+  const sentences = body.split(/(?<=[.!?])\s+/).map(s => s.trim()).filter(Boolean);
+  const out = [];
+
+  for (let i = 0; i < sentences.length; i += 1) {
+    if (!CONCESSION_OPENER_RX.test(sentences[i])) continue;
+    // A concession that STAYS on the objection is fine. A concession followed
+    // by a pivot phrase or by a question about anything else is the defect.
+    const rest = sentences.slice(i + 1).join(' ');
+    if (PIVOT_RX.test(rest) || (rest.includes('?') && !CONCESSION_OPENER_RX.test(rest))) {
+      out.push(`concession then pivot: "${sentences[i]}"`);
+    }
+  }
+  return out;
+}
+
 /**
  * Timeline commitments found in an acknowledgment body. Pure; exported for
  * tests. Non-empty means the reply promised WHEN a human would respond.
@@ -3013,6 +3158,67 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // then-safe-fallback loop in send-message-handler: the lead still gets a
   // reply, and it is never one with raw template syntax in it.
   assertNoUnresolvedTokens(validated.message, contactId);
+
+  // ─── Repeat-ask guard (2026-09-11 — Alfredo Fontan incident) ───
+  //
+  // The ESTABLISHED block tells the model the question is closed. This makes
+  // re-asking it non-shippable. Throwing hands control to the existing
+  // retry-then-safe-fallback loop in send-message-handler, and the
+  // regenerationNote carries THE ANSWER rather than just the prohibition —
+  // a retry told only "don't ask that" has to guess what to say instead,
+  // which is how a repeat-ask becomes an invented question.
+  if (established?.closed_questions?.length) {
+    const repeats = findRepeatedQuestions(validated.message, established);
+    if (repeats.length) {
+      const answers = repeats.map(k => {
+        const f = established.facts.find(x => x.key === k);
+        const said = f?.their_words ? ` They said: "${f.their_words}".` : '';
+        return `${FACT_LABELS[k] || k} = ${f?.value ?? '(answered)'}.${said}`;
+      }).join(' ');
+      console.error(`[ResponseGenerator] ⛔ re-asked closed question(s) for ${contactId}: ${repeats.join(', ')}`);
+      const err = new Error(`repeated_closed_question: ${repeats.join(', ')}`);
+      // Carried on the error, NOT mutated onto opts: send-message-handler
+      // builds a fresh opts literal for each generation attempt, so a mutation
+      // here would be discarded and the retry would run the identical prompt.
+      // The note names the ANSWER, not just the prohibition — a retry told only
+      // "don't ask that" has to guess what to say instead, which is how a
+      // repeat-ask turns into an invented question.
+      err.regenerationNote =
+        `Your previous draft re-asked a question this customer has ALREADY ANSWERED: ${repeats.join(', ')}. ` +
+        `${answers} Do not ask it again. Reference their answer instead, and ask nothing in its place unless ` +
+        `something genuinely unanswered is needed this turn.`;
+      throw err;
+    }
+  }
+
+  // ─── Concession-pivot guard (2026-09-11 — Alfredo Fontan incident) ───
+  //
+  // "Fair point, Alfredo — close is close." followed by a pivot to a
+  // qualifying question is the defect. A genuine apology is a legitimate
+  // reply, and the two are not reliably separable by regex — so this
+  // REGENERATES ONCE and then gives up, rather than hard-failing a lead into
+  // the safe fallback over a sentence.
+  //
+  // `opts.regenerationNote` being set means this IS already a second draft, so
+  // whatever we have now ships. Bounded to one retry by construction.
+  {
+    const pivots = findConcessionPivots(validated.message, established, {
+      objectionOpen: !!context.objection_state?.state_code,
+    });
+    if (pivots.length) {
+      if (opts.regenerationNote) {
+        console.warn(`[ResponseGenerator] ⚠️ concession-then-pivot survived regeneration for ${contactId}: ${pivots.join(', ')} — sending anyway`);
+      } else {
+        console.warn(`[ResponseGenerator] ⚠️ concession-then-pivot for ${contactId}: ${pivots.join(', ')} — regenerating once`);
+        const err = new Error(`concession_pivot: ${pivots.join(', ')}`);
+        err.regenerationNote =
+          `Your previous draft conceded the customer's objection and then changed the subject: ${pivots.join(', ')}. ` +
+          `Do not open by agreeing with an objection and then asking for something else. Ask a question back about ` +
+          `THEIR position instead, using their own words — see the NEPQ objection block.`;
+        throw err;
+      }
+    }
+  }
 
   // ─── Email-direction guard (2026-09-11 — Alfredo Fontan incident) ───
   // The COMPANY INBOX prompt block makes a correct answer possible; this makes

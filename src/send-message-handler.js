@@ -2696,10 +2696,18 @@ export async function executeSendMessage(action, context) {
     // reply, and surface the failure (see fallbackUsed at the return below).
     const MAX_GENERATION_ATTEMPTS = 2;
     let generationErr = null;
+    // 2026-09-11 (Alfredo Fontan): a guard inside generateResponse can hand the
+    // retry an instruction. The repeat-ask guard uses it to carry the CLOSED
+    // QUESTION AND THE CUSTOMER'S ACTUAL ANSWER into attempt 2 — without it the
+    // retry re-runs a byte-identical prompt and is a coin flip on the same
+    // defect. Each attempt builds a fresh opts literal, so this cannot ride on
+    // a mutation; it rides on the thrown error.
+    let carriedRegenNote = null;
     for (let attempt = 1; attempt <= MAX_GENERATION_ATTEMPTS; attempt++) {
       try {
         generated = await generateResponse(contactId, generationChannel, triggerMessage, {
           threadSenderType: threadSenderType ?? 'rep',
+          regenerationNote: carriedRegenNote,
           // 2026-08-14 — the line this reply goes out from decides the sign-off
           // (Mark's direct number vs the shared Reece team number). Same value
           // the send itself uses, so the signature can never disagree with the
@@ -2762,6 +2770,9 @@ export async function executeSendMessage(action, context) {
       } catch (err) {
         generationErr = err;
         console.warn(`[SendMessage] AI generation attempt ${attempt}/${MAX_GENERATION_ATTEMPTS} failed for ${contactId}: ${err.message}`);
+        // A guard that knows HOW to fix the draft says so on the error. Carry
+        // it into the next attempt as the regeneration note (2026-09-11).
+        if (err.regenerationNote) carriedRegenNote = err.regenerationNote;
         if (attempt < MAX_GENERATION_ATTEMPTS) {
           await new Promise(r => setTimeout(r, 1500)); // brief backoff before retry
         }
