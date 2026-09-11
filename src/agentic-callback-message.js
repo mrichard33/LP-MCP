@@ -16,7 +16,7 @@
  *                   that number."
  *     after-hours: "Hi {{contact.first_name}}, our
  *                   {{contact.service_market_name}} office is closed
- *                   right now (we're open Mon-Fri 8 AM to 5 PM ET).
+ *                   right now (we're open <staffed hours, rendered live>).
  *                   Call us at {{contact.service_phone_display}} during
  *                   those hours and we'll take care of you."
  *
@@ -49,10 +49,10 @@
  *     "callback_type":           "service" | "sales"   // tone hint
  *   }
  *
- *   If business_hours is omitted, we compute it from current ET time
- *   (Mon-Fri 8:00-17:00 America/New_York). This way the workflow
- *   doesn't have to do timezone math; the LP MCP is the source of
- *   truth.
+ *   If business_hours is omitted, we compute it from canPromiseImmediateCall()
+ *   — the Five9 dial window AND the staffed floor (src/staffed-hours.js),
+ *   both. This way the workflow doesn't have to do timezone math; the LP MCP
+ *   is the source of truth, and there is exactly one of it.
  *
  * Response (always 200, never 4xx/5xx — GHL workflows can't
  * gracefully handle non-200 responses; we return a safe fallback
@@ -104,12 +104,13 @@
 import crypto from 'crypto';
 import supabase from './supabase.js';
 import { callLLM, resolveLLM } from './llm-client.js';
+import { canPromiseImmediateCall } from './dial-window.js';
+import { nextStaffedOpening, staffedHoursHuman } from './staffed-hours.js';
 
 // Provider + model resolved at call time by the shared client from the
 // `agentic_callback` fn key (customer_facing group). Provider/model/timeout
 // are env-controlled (CUSTOMER_FACING_* / AGENTIC_CALLBACK_* / LLM_TIMEOUT_MS).
 const MAX_TOKENS = parseInt(process.env.CALLBACK_MESSAGE_MAX_TOKENS || '300', 10);
-const TIMEZONE = process.env.REECE_TIMEZONE || 'America/New_York';
 
 // ═══════════════════════════════════════════════════════════════════
 // SYSTEM PROMPT
@@ -121,8 +122,8 @@ CONTEXT
 The lead has just sent an inbound message that triggered a handoff. The exact handoff tag varies (hdl:callback-service, hdl:callback-sales) but the SMS purpose is the same: acknowledge what they said, point them at the right office, and hand off cleanly. A human team takes it from here.
 
 Two paths:
-- WITHIN BUSINESS HOURS (Mon-Fri 8 AM-5 PM ET): the office can pick up now. The SMS confirms the handoff and gives the dispatch number as a fallback in case the call drops.
-- OUTSIDE BUSINESS HOURS: the office is closed. The SMS lets the lead know the hours and gives them the number to call back.
+- WITHIN STAFFED HOURS: the office can pick up now. The SMS confirms the handoff and gives the dispatch number as a fallback in case the call drops.
+- OUTSIDE STAFFED HOURS: the office is closed and nobody can call in the next few minutes. The SMS lets the lead know the hours and gives them the number to call back.
 
 VOICE
 - First person plural ("we", "our team") — never "I"
@@ -152,7 +153,7 @@ WITHIN BUSINESS HOURS:
 
 OUTSIDE BUSINESS HOURS:
 - Acknowledge briefly.
-- State that the office is closed AND the hours: "(Mon-Fri 8 AM to 5 PM ET)".
+- State that the office is closed AND the hours. Use the STAFFED HOURS line from the user message VERBATIM — never state hours from memory, they change.
 - Provide the dispatch number to call during hours.
 
 GOOD EXAMPLES
@@ -163,7 +164,7 @@ Within hours, market=Boca Raton / Palm Beach, phone=(754) 203-9190, name=Mark:
 
 Inbound: "Yes 30435"
 After hours, market=Boca Raton / Palm Beach, phone=(754) 203-9190, name=Mark:
-"Hey Mark — got your message. Our Boca Raton / Palm Beach office is closed right now (Mon-Fri 8 AM to 5 PM ET). Give them a call at (754) 203-9190 during those hours and we'll take care of you."
+"Hey Mark — got your message. Our Boca Raton / Palm Beach office is closed right now (we're open <STAFFED HOURS>). Give them a call at (754) 203-9190 during those hours and we'll take care of you."
 
 Inbound: "My windows won't close all the way and I have a leak"
 Within hours, market=Ft. Lauderdale, phone=(754) 203-9190, name=Sarah:
@@ -171,7 +172,7 @@ Within hours, market=Ft. Lauderdale, phone=(754) 203-9190, name=Sarah:
 
 Inbound: "Hello?? Is anyone there?"
 After hours, market=Central Florida, phone=(800) 555-1234, name=Jim:
-"Hey Jim — sorry for the wait. Our Central Florida office is closed right now (Mon-Fri 8 AM to 5 PM ET). Give them a call at (800) 555-1234 first thing tomorrow and we'll take care of you."
+"Hey Jim — sorry for the wait. Our Central Florida office is closed right now (we're open <STAFFED HOURS>). Someone can call you back <NEXT OPENING>, or reach them at (800) 555-1234 during those hours."
 
 Inbound: "Cancel"
 Within hours, name=Robert:
@@ -189,26 +190,17 @@ Return ONLY a valid JSON object. The first character must be { and the last must
 // ═══════════════════════════════════════════════════════════════════
 
 /**
- * Are we currently within Reece's stated business hours?
- * Mon-Fri 8 AM - 5 PM, America/New_York. Returns boolean.
+ * Can the office pick up right now?
+ *
+ * 2026-09-11 — this used to be a SEVENTH inline definition of "business hours"
+ * (Mon-Fri 08:00-17:00, hand-written right here), one of the six disagreeing
+ * definitions catalogued in src/dial-window.js. It now defers to
+ * canPromiseImmediateCall(), which is the single answer to "will a call
+ * actually go out in the next few minutes" — the Five9 dial window AND the
+ * staffed floor, both. Hours come from src/staffed-hours.js.
  */
 function isWithinBusinessHours(now = new Date()) {
-  // Use Intl to get the day of week + hour in ET regardless of server tz.
-  const fmt = new Intl.DateTimeFormat('en-US', {
-    timeZone: TIMEZONE,
-    weekday: 'short',
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: false,
-  });
-  const parts = fmt.formatToParts(now);
-  const weekday = parts.find(p => p.type === 'weekday')?.value || '';
-  const hourStr = parts.find(p => p.type === 'hour')?.value || '0';
-  const hour = parseInt(hourStr, 10);
-
-  const isWeekday = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'].includes(weekday);
-  const isInWindow = hour >= 8 && hour < 17;
-  return isWeekday && isInWindow;
+  return canPromiseImmediateCall(now.getTime());
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -225,7 +217,7 @@ function buildFallbackMessage({ first_name, market_name, service_phone_display, 
     return `Hi ${name}, connecting you with our ${market} office at ${phone}. ` +
            `They're picking up now. If the call drops, just call them back at that number.`;
   }
-  return `Hi ${name}, our ${market} office is closed right now (we're open Mon-Fri 8 AM to 5 PM ET). ` +
+  return `Hi ${name}, our ${market} office is closed right now (we're open ${staffedHoursHuman()}). ` +
          `Call us at ${phone} during those hours and we'll take care of you.`;
 }
 
@@ -247,7 +239,10 @@ function buildUserPrompt(input) {
   if (input.business_hours) {
     lines.push('PATH: WITHIN BUSINESS HOURS — the office can pick up now. The SMS confirms the handoff and gives the number as a fallback in case the call drops.');
   } else {
-    lines.push('PATH: OUTSIDE BUSINESS HOURS — the office is closed. The SMS gives them the hours (Mon-Fri 8 AM to 5 PM ET) and the number to call during those hours.');
+    lines.push(`PATH: OUTSIDE STAFFED HOURS — the office is closed and NOBODY can call in the next few minutes. Do NOT suggest anyone will. The SMS gives them the hours and the number to call during those hours.`);
+    lines.push(`STAFFED HOURS (state these VERBATIM if you state hours at all): ${staffedHoursHuman()}`);
+    const opening = nextStaffedOpening();
+    if (opening.human) lines.push(`NEXT OPENING (the earliest anyone can call): ${opening.human} ET.`);
   }
 
   if (input.callback_type) {
@@ -485,7 +480,7 @@ export function registerCallbackMessageRoutes(app) {
       // own try/catch). Log it and return the after-hours fallback as a last
       // resort so the workflow still gets a usable SMS body.
       console.error(`[CallbackMessage] Unhandled error: ${err.message}`);
-      const fallback = `Hi there, our team is closed right now (we're open Mon-Fri 8 AM to 5 PM ET). ` +
+      const fallback = `Hi there, our team is closed right now (we're open ${staffedHoursHuman()}). ` +
                        `Call us at (954) 800-8906 during those hours and we'll take care of you.`;
       res.json({
         message: fallback,

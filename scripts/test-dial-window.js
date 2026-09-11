@@ -33,6 +33,7 @@ import {
   isWithinDialWindow,
   dialWindowBounds,
   dialWindowPromptLine,
+  canPromiseImmediateCall,
   etHourMinute,
 } from '../src/dial-window.js';
 
@@ -137,21 +138,35 @@ test('a malformed override falls back to the default rather than clamping', () =
 
 // ─── The prompt line ───────────────────────────────────────────────────────
 
+// 2026-09-11 — the line is now built on canPromiseImmediateCall, not on
+// isWithinDialWindow, and the hours it quotes are the STAFFED hours
+// (src/staffed-hours.js), not the dial window. See the header of
+// src/dial-window.js for Mark's reversal of the 2026-09-04 ruling, and
+// scripts/test-call-promise-hours.js for the staffed-hours cases themselves.
+
 test('the prompt line states the verdict AND the boundary', () => {
-  const open = dialWindowPromptLine(edt(12, 0));
+  const open = dialWindowPromptLine(edt(12, 0));   // Wed noon — dialing and staffed
   assert.match(open, /OPEN/);
-  assert.match(open, /8:00 AM-9:00 PM ET/, 'the model is given the boundary, not left to invent one');
+  assert.match(open, /staffed Mon–Fri 8:00 AM–8:00 PM, Sat 9:00 AM–8:00 PM, Sun 9:00 AM–5:00 PM ET/,
+    'the model is given the boundary, not left to invent one');
   assert.match(open, /CAN be promised/);
 
-  const closed = dialWindowPromptLine(edt(22, 0));
+  const closed = dialWindowPromptLine(edt(22, 0)); // Wed 10 PM — neither
   assert.match(closed, /CLOSED/);
-  assert.match(closed, /8:00 AM-9:00 PM ET/);
+  assert.match(closed, /The next call can go out Thursday at 8:00 AM ET\./,
+    'a closed line names the reopening rather than leaving the model to invent one');
   assert.match(closed, /CANNOT be promised/);
 });
 
-test('the prompt line follows an override', () => {
-  withEnv({ FIVE9_DIAL_WINDOW_END_HOUR_ET: '20' }, () => {
-    assert.match(dialWindowPromptLine(edt(12, 0)), /8:00 AM-8:00 PM ET/);
+test('a dial-window override still moves the verdict', () => {
+  // The quoted hours are the staffed ones, but Five9 not dialing still closes
+  // the phone room — canPromiseImmediateCall needs BOTH facts.
+  withEnv({ FIVE9_DIAL_WINDOW_END_HOUR_ET: '10' }, () => {
+    assert.match(dialWindowPromptLine(edt(12, 0)), /PHONE ROOM: CLOSED/,
+      'staffed at noon, but the dialer stopped at 10 — no promise');
+  });
+  withEnv({ FIVE9_DIAL_WINDOW_END_HOUR_ET: '21' }, () => {
+    assert.match(dialWindowPromptLine(edt(12, 0)), /PHONE ROOM: OPEN/);
   });
 });
 
@@ -163,6 +178,17 @@ test('the open and closed lines are never both sayable at one instant', () => {
     const isOpen = /PHONE ROOM: OPEN/.test(line);
     const isClosed = /PHONE ROOM: CLOSED/.test(line);
     assert.ok(isOpen !== isClosed, `hour ${h} is unambiguously one or the other`);
-    assert.equal(isOpen, isWithinDialWindow(edt(h, 0)), `hour ${h} line matches the predicate`);
+    assert.equal(isOpen, canPromiseImmediateCall(edt(h, 0)), `hour ${h} line matches the predicate`);
   }
+});
+
+// ─── Dial window vs staffed floor ──────────────────────────────────────────
+
+test('the dial window stayed exactly what it was — every day, 08:00-21:00', () => {
+  // Mark's reversal narrowed the PROMISE, not this module. A regression here
+  // would mean someone folded staffed hours into the dialer's own question.
+  const sunday = Date.UTC(2026, 6, 19, 20 + 4, 0); // Sun 2026-07-19, 8 PM EDT
+  assert.equal(isWithinDialWindow(sunday), true, 'Five9 dials on a Sunday evening');
+  assert.equal(canPromiseImmediateCall(sunday), false, 'but nobody is there to place the call');
+  assert.deepEqual(dialWindowBounds(), { startHour: 8, endHour: 21, timeZone: 'America/New_York' });
 });
