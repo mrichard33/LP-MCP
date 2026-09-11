@@ -42,6 +42,9 @@ import { registerRecommendRoutes } from './memory/recommend-routes.js';
 import { registerOmiRoutes, omiBodyParser } from './memory/omi-routes.js';
 import { registerMemoryNightlyRoutes, startMemoryNightlyScheduler } from './jobs/memory-nightly.js';
 import { registerAdminMemoryRoutes } from './routes/admin-memory.js';
+// 2026-09-11 — Bot Review Phase 0 (handoff §5.1): coverage health + the 30-min
+// outcomes job n8n calls. No DDL, no boot-time table creation.
+import { registerBotFeedbackRoutes } from './bot-feedback/routes.js';
 import { checkMemorySchema } from './memory/memory-migrations.js';
 import { startTier1EmbedSweep } from './knowledge/tier1-semantic.js';
 import { startExemplarSweep } from './knowledge/exemplars.js';
@@ -1916,6 +1919,10 @@ registerPauseWorkflowSweepRoutes(app);
 
 // ─── Approval Escalation Sweep ───────────────────────────────────
 registerApprovalEscalationRoutes(app);
+
+// ─── Bot Review (Phase 0) ────────────────────────────────────────
+// GET /api/bot-feedback/health, POST /api/bot-feedback/jobs/outcomes.
+registerBotFeedbackRoutes(app, authenticate);
 
 // ─── REST API for GHL Agent Studio ───────────────────────────────
 registerRestApiRoutes(app, authenticate);

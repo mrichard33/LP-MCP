@@ -10,6 +10,17 @@
  * new action type: create a new handler file, import it here, and register
  * it in ACTION_HANDLERS.
  *
+ * 2026-09-11 — BOT REVIEW PHASE 0: SKIP FINGERPRINT.
+ *   PROBLEM: a send_message that never reached the contact (hard suppression,
+ *   stop-bot, supersession, quiet-hours hold, compliance short-circuit) left no
+ *   reviewable record of the decision — yet "should have replied" is one of the
+ *   feedback reasons the review queue offers.
+ *   FIX: after the status writeback, classifySkipOutcome() decides whether this
+ *   action ended with nothing delivered, and files one bot_message_context row
+ *   with message_type='skip'. One hook here covers every gate instead of six
+ *   call sites inside send-message-handler.js. Detached, post-writeback, and a
+ *   no-op when sql/103 has not been applied — it cannot delay or alter a send.
+ *
  * Refactored from src/action-executor.js on 2026-04-24. Behavior preserved
  * exactly; v4.2 approval-pipeline fixes live in approval-path.js. Stuck-
  * action reaper (added 2026-04-24, Phase 2 added 2026-04-28) runs first
@@ -171,6 +182,10 @@ import { reapStuckActions } from './reaper.js';
 import { verifyRecentSends } from '../services/send-delivery-verify.js';
 import { runPool, groupByBatch } from './concurrency.js';
 import { classifyHandlerResult } from './result-status.js';
+// 2026-09-11 — Bot Review Phase 0. One detached hook, after the writeback, for
+// every send that never reached the contact. See classifySkipOutcome().
+import { recordMessageContextDetached } from '../bot-feedback/fingerprint.js';
+import { classifySkipOutcome, skipReasonFor, normalizeChannel } from '../bot-feedback/fingerprint-core.js';
 
 // MVI v2.5 — outbound dedup + Layer 3 dispatch
 import { tryAcquireLock, releaseLock } from '../services/outbound-locks.js';
@@ -922,6 +937,31 @@ async function executeSingleAction(action, batchContext = {}, priorBatchResults 
     if (wbError) {
       console.error(`[ActionExecutor] writeback failed for action ${action.id}: ${wbError.message}`);
     }
+
+    // 2026-09-11 — Bot Review Phase 0. A send that was withheld is as much a
+    // reviewable decision as one that went out ("should have replied" is a
+    // feedback reason). Detached and post-writeback: it cannot delay anything,
+    // and a missing bot_message_context table is a logged no-op.
+    if (classifySkipOutcome(action.action_type, status, result) === 'skip') {
+      recordMessageContextDetached({
+        message_type: 'skip',
+        message_ref: String(action.id),
+        ghl_contact_id: action.target_id || null,
+        channel: normalizeChannel(result?.channel || action.action_payload?.channel),
+        intent_class: result?.intent_class || null,
+        rule_applied: action.rule_applied || null,
+        skip_reason: skipReasonFor(result, errorMessage),
+        inbound_text: context?.message_text || context?.messageText || context?.body || null,
+        input_snapshot: {
+          // No generation happened on a skipped send, so there is no KB pack and
+          // no prompt to replay — what a reviewer needs is which gate fired.
+          gate_result: result?.action || null,
+          gate_reason: result?.reason || null,
+          recorded_status: status,
+        },
+      });
+    }
+
     if (status === 'failed') {
       console.warn(`[ActionExecutor] ⚠️ ${action.action_type} marked failed (action ${action.id}, rule: ${action.rule_applied}): ${errorMessage}`);
     } else if (status === 'skipped') {

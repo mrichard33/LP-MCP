@@ -1,6 +1,13 @@
 /**
  * Nurture Orchestrator — src/nurture/nurture-orchestrator.js
  *
+ * 2026-09-11 — BOT REVIEW PHASE 0: NURTURE FINGERPRINT.
+ *   Step 8b files one bot_message_context row (message_type='nurture',
+ *   message_ref = the agentic_messages row id) after the GHL writeback, so
+ *   nurture sends land in the same review queue as replies. markGeneratedReady
+ *   now returns that id. Detached and post-writeback: it cannot delay, block or
+ *   alter a send, and it is a logged no-op until sql/103 is applied.
+ *
  * Coordinates the pipeline for one outbound nurture generation:
  *   1. assembleContext   (buildLeadContext)
  *   2. checkInterrupts   (inline — booked, DNC, recent reply)
@@ -132,6 +139,9 @@ import { sendGroupMeMessage } from '../groupme.js';
 import { resolveSequencePosition } from './nurture-sequence-resolver.js';
 import { buildNurtureState } from './nurture-booking-link.js';
 import { resolveAdaptiveCta, applyEvolution, injectEvolutionOverride } from '../agentic/cta-evolution.js';
+// 2026-09-11 — Bot Review Phase 0 fingerprint. Detached, post-writeback only.
+import { recordMessageContextDetached } from '../bot-feedback/fingerprint.js';
+import { buildInputSnapshot } from '../bot-feedback/fingerprint-core.js';
 
 const SHADOW_MODE = process.env.NURTURE_SHADOW_MODE === 'true';
 
@@ -348,7 +358,40 @@ export async function runNurtureGeneration(request) {
   }
 
   // Step 8 — final audit (pass path only)
-  await markGeneratedReady(generation_id, output, retryCount, autofixesApplied, evolution);
+  const messageRowId = await markGeneratedReady(generation_id, output, retryCount, autofixesApplied, evolution);
+
+  // Step 8b — Bot Review Phase 0 fingerprint. Detached, post-writeback: the
+  // message is already in GHL's draft fields, so nothing here can affect it.
+  // sent_at is stamped now because for nurture the writeback IS the send —
+  // GHL delivers on its own schedule and reports back through the engagement
+  // webhook, which this process does not wait for.
+  if (messageRowId) {
+    recordMessageContextDetached({
+      message_type: 'nurture',
+      message_ref: String(messageRowId),
+      ghl_contact_id: request.contact_id,
+      channel: request.channel,
+      workflow_code: request.workflow_code,
+      prompt_code: prompt?.prompt_code || null,
+      prompt_version: prompt?.version ?? null,
+      reply_text: output.sms_body || output.body_html || output.subject || null,
+      input_snapshot: buildInputSnapshot({
+        contactTags: context?.lead?.current_tags || [],
+        buyerStage: context?.lead?.buyer_stage ?? null,
+        lpDisposition: context?.lp?.disposition || null,
+        channel: request.channel,
+        nowEt: new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }),
+        extra: {
+          sequence_position: request.sequence_position,
+          retry_count: retryCount,
+          autofixes_applied: autofixesApplied,
+          evolved_cta_type: evolution?.cta_type || null,
+        },
+      }),
+      generated_at: new Date().toISOString(),
+      sent_at: new Date().toISOString(),
+    });
+  }
 
   const elapsed = Date.now() - startedAt;
   console.log(`[NurtureOrch] ok ${generation_id} contact=${request.contact_id} wf=${request.workflow_code} ` +
@@ -586,9 +629,14 @@ async function updateRowOnSuppress(generation_id, status, reason, extras) {
   if (error) console.warn(`[NurtureOrch] updateRowOnSuppress failed: ${error.message}`);
 }
 
+/**
+ * 2026-09-11 — returns the agentic_messages row id (Bot Review Phase 0 uses it
+ * as the fingerprint's message_ref; handoff §4.1 keys nurture on it). Returns
+ * null on any failure — callers must treat the id as optional.
+ */
 async function markGeneratedReady(generation_id, output, retryCount, autofixesApplied, evolution = null) {
-  if (!supabase) return;
-  const { error } = await supabase.from('agentic_messages')
+  if (!supabase) return null;
+  const { data, error } = await supabase.from('agentic_messages')
     .update({
       send_status: 'generated_ready',
       generated_subject: output.subject || null,
@@ -605,8 +653,14 @@ async function markGeneratedReady(generation_id, output, retryCount, autofixesAp
       written_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     })
-    .eq('generation_id', generation_id);
-  if (error) console.warn(`[NurtureOrch] markGeneratedReady failed: ${error.message}`);
+    .eq('generation_id', generation_id)
+    .select('id')
+    .maybeSingle();
+  if (error) {
+    console.warn(`[NurtureOrch] markGeneratedReady failed: ${error.message}`);
+    return null;
+  }
+  return data?.id ?? null;
 }
 
 async function markAwaitingApproval(generation_id, output, retryCount, autofixesApplied, evolution = null) {
