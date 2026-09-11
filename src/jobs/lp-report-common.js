@@ -266,12 +266,25 @@ export function todayET(d = new Date()) {
   }).format(d);
 }
 
-/** Current ET hour (0-23) — scheduler gates. */
+/**
+ * Current ET hour (0-23) — scheduler gates.
+ *
+ * ⚠️ 2026-09-11 — MIDNIGHT MUST READ 0, NEVER 24. This used `hour12: false`,
+ * which on the production ICU build renders the midnight hour as '24'. The LP
+ * report watchdog gate (`h < 7 → skip`) read 24 as "after 7:30 AM", swept at
+ * 00:01 ET — before any report can exist for the new day — and posted six
+ * false "LP report MISSING" cards every night, plus six RECOVERED cards at
+ * 07:31. `hourCycle: 'h23'` asks for 0-23 explicitly, and `% 24` is the
+ * belt-and-braces for any build that still says 24 (the same guard
+ * services/quiet-hours.js has carried since 2026-07-07).
+ * Regression test: scripts/test-lp-report-hour-et.js.
+ */
 export function hourET(d = new Date()) {
   const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/New_York', hour: '2-digit', hour12: false,
+    timeZone: 'America/New_York', hour: '2-digit', hourCycle: 'h23',
   }).formatToParts(d);
-  return Number(parts.find((p) => p.type === 'hour')?.value ?? -1);
+  const h = Number(parts.find((p) => p.type === 'hour')?.value ?? -1);
+  return h < 0 ? h : h % 24;
 }
 
 // ─── Ingest-route authentication ─────────────────────────────────────────────
