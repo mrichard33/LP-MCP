@@ -30,6 +30,21 @@
  *   one", leaving two live verdicts from the same reviewer on one message.
  *   supersedes_id is now set on the INSERT, where no trigger objects, and the
  *   guard stays as tight as it was.
+ *
+ * v1.2 — 2026-09-11.
+ *   PROBLEM: v1.1 made editFeedback select bot_feedback.retracted_at, which
+ *   only exists once sql/106 is applied — and sql/106 is applied BY HAND in the
+ *   Supabase dashboard, so there is always a window where this code is live and
+ *   the column is not. PostgREST reports an unknown column with the same "does
+ *   not exist" wording as an unknown table, so isMissingRelation() caught it and
+ *   every edit in that window returned a 503 telling Mark to apply sql/103 —
+ *   a file that was already applied, while the real blocker went unnamed.
+ *   Caught against production the moment LP-MCP#908 merged: the code deployed,
+ *   the migration had not been run, and the queue check showed 0 of the 5
+ *   sql/106 relations present.
+ *   FIX: fall back to the pre-migration column set. Editing keeps working
+ *   either side of the migration, and the v1.1 supersedes_id fix takes effect
+ *   immediately instead of waiting on it.
  */
 
 import supabase from '../supabase.js';
@@ -299,13 +314,36 @@ export async function editFeedback(actorEmail, id, body) {
   if (!who.ok) return { ok: false, error: who.error, status: 401 };
   const actor = who.actor;
 
-  const { data: prior, error } = await supabase
+  /*
+   * retracted_at only exists once sql/106 is applied, and PostgREST reports an
+   * unknown COLUMN with the same "does not exist" wording as an unknown table.
+   * Asking for it unconditionally would take editing down for the whole window
+   * between this code deploying and Mark running the migration by hand — and
+   * that window is real: sql/106 is applied in the dashboard, deliberately not
+   * at boot. So: ask for it, and fall back to the pre-migration column set.
+   *
+   * Nothing can be retracted before sql/106 exists, so the guard below is
+   * simply inert on the fallback path rather than wrong.
+   */
+  let prior = null;
+  let error = null;
+  ({ data: prior, error } = await supabase
     .from('bot_feedback')
     .select('id, message_type, message_ref, reviewer_email, undone_at, retracted_at')
-    .eq('id', id).maybeSingle();
+    .eq('id', id).maybeSingle());
+
   if (error && isMissingRelation(error)) {
-    return { ok: false, error: 'Bot Review is not migrated yet — apply sql/103.', status: 503 };
+    ({ data: prior, error } = await supabase
+      .from('bot_feedback')
+      .select('id, message_type, message_ref, reviewer_email, undone_at')
+      .eq('id', id).maybeSingle());
+    // Still missing with the original column set → the TABLE is absent, which
+    // is a different problem and names a different file.
+    if (error && isMissingRelation(error)) {
+      return { ok: false, error: 'Bot Review is not migrated yet — apply sql/103.', status: 503 };
+    }
   }
+  if (error) return { ok: false, error: error.message, status: 500 };
   if (!prior) return { ok: false, error: 'That review no longer exists.', status: 404 };
   if (!canUndo(actor, prior)) {
     return { ok: false, error: 'You can only edit your own review.', status: 403 };
