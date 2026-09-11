@@ -19,6 +19,10 @@
 import supabase from '../supabase.js';
 import { syncOutcomes } from './outcomes.js';
 import { getFingerprintMode, getJudgePersistMode, isMissingRelation } from './fingerprint-core.js';
+// v1.1 (Phase 1) — the human-review write surface.
+import {
+  submitFeedback, undoFeedback, editFeedback, stopBot, calibrationNext,
+} from './feedback.js';
 
 /**
  * Count rows. Returns null when the relation is absent (sql/103 not applied) or
@@ -168,8 +172,72 @@ export function registerBotFeedbackRoutes(app, authenticate) {
     }
   });
 
+  // ══ Phase 1 — human review (handoff §5.2) ════════════════════════
+  //
+  // Every one of these re-checks the actor server-side from the
+  // `x-actor-email` header against dashboard_users + executives. The dashboard
+  // hiding a button is the courtesy; resolveActor() is the gate.
+  //
+  // `send` maps a service result onto the wire: the service owns the status
+  // code, so a 403 stays a 403 and the UI can tell "not allowed" from "broke".
+  const send = (res, out) => {
+    const status = out.ok ? 200 : (out.status || 500);
+    const payload = out.ok
+      ? { ok: true, data: out.data }
+      : { ok: false, error: out.error, ...(out.field ? { field: out.field } : {}) };
+    return res.status(status).json(payload);
+  };
+  const actorOf = (req) => req.get('x-actor-email') || req.headers['x-actor-email'] || '';
+
+  app.post('/api/bot-feedback/feedback', ...guards, async (req, res) => {
+    try {
+      return send(res, await submitFeedback(actorOf(req), req.body || {}));
+    } catch (err) {
+      console.error(`[BotFeedback] POST /feedback threw: ${err.message}`);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.post('/api/bot-feedback/feedback/:id/undo', ...guards, async (req, res) => {
+    try {
+      return send(res, await undoFeedback(actorOf(req), req.params.id));
+    } catch (err) {
+      console.error(`[BotFeedback] POST /feedback/:id/undo threw: ${err.message}`);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.post('/api/bot-feedback/feedback/:id/edit', ...guards, async (req, res) => {
+    try {
+      return send(res, await editFeedback(actorOf(req), req.params.id, req.body || {}));
+    } catch (err) {
+      console.error(`[BotFeedback] POST /feedback/:id/edit threw: ${err.message}`);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.post('/api/bot-feedback/lead/:contactId/stop-bot', ...guards, async (req, res) => {
+    try {
+      return send(res, await stopBot(actorOf(req), req.params.contactId, (req.body || {}).reason));
+    } catch (err) {
+      console.error(`[BotFeedback] POST /lead/:contactId/stop-bot threw: ${err.message}`);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  app.get('/api/bot-feedback/calibration/next', ...guards, async (req, res) => {
+    try {
+      return send(res, await calibrationNext(actorOf(req)));
+    } catch (err) {
+      console.error(`[BotFeedback] GET /calibration/next threw: ${err.message}`);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
   console.log(
-    '[BotFeedback] Routes: GET /api/bot-feedback/health | POST /api/bot-feedback/jobs/outcomes' +
+    '[BotFeedback] Routes: GET /health | POST /jobs/outcomes | POST /feedback | ' +
+    'POST /feedback/:id/undo | POST /feedback/:id/edit | POST /lead/:contactId/stop-bot | ' +
+    'GET /calibration/next' +
     `${guards.length ? ' (authenticated)' : ' (UNAUTHENTICATED — no middleware passed)'}`,
   );
 }

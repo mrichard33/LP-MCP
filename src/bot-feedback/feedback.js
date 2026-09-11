@@ -1,0 +1,435 @@
+/**
+ * Bot Review — feedback service — src/bot-feedback/feedback.js
+ *
+ * v1.0 — 2026-09-11. BOT REVIEW PHASE 1.
+ *   The write surface for human review. Everything the dashboard does to a bot
+ *   table comes through here (handoff §3): the page never writes bot_feedback
+ *   itself, so permissions, the change log and the Unsafe alert cannot be
+ *   bypassed by a client that forgets them.
+ *
+ * Every mutating call (handoff §5):
+ *   · requires an `x-actor-email` header
+ *   · RE-CHECKS permission server-side against dashboard_users + executives,
+ *     via the service role. The dashboard's own gate is a courtesy; this is the
+ *     gate. Never trust the caller's claim about their own role.
+ *   · writes bot_change_log
+ *   · returns { ok, data | error }
+ *
+ * Degrades on a missing relation (sql/103 / sql/104 not applied) with a clear
+ * message rather than a 500 — the dashboard renders "needs migration".
+ */
+
+import supabase from '../supabase.js';
+import { sendGroupMeMessage } from '../groupme.js';
+import { isMissingRelation } from './fingerprint-core.js';
+import {
+  validateFeedback,
+  resolveReviewerRole,
+  canSubmitFeedback,
+  canStopBot,
+  canUndo,
+  alreadyStopped,
+  reviewDeepLink,
+  buildUnsafeAlert,
+  STOP_BOT_TAG,
+} from './feedback-core.js';
+
+/** Where the dashboard lives, for the deep link in an Unsafe alert (§8). */
+const DASHBOARD_URL = process.env.BOT_REVIEW_DASHBOARD_URL || '';
+
+/**
+ * Resolve who is calling, from the service role, using ONLY the email in the
+ * header. The caller does not get to say what role they have.
+ *
+ * Mirrors the dashboard's own model (lib/auth.ts): dashboard_users.role gives
+ * operator | team, executives.is_admin gives admin powers.
+ */
+export async function resolveActor(email) {
+  const addr = String(email || '').trim().toLowerCase();
+  if (!addr) return { ok: false, error: 'x-actor-email header is required.' };
+  if (!supabase) return { ok: false, error: 'Supabase is not configured.' };
+
+  const { data: user, error } = await supabase
+    .from('dashboard_users')
+    .select('email, role')
+    .ilike('email', addr)
+    .maybeSingle();
+
+  if (error) return { ok: false, error: `Could not verify the actor: ${error.message}` };
+  if (!user) return { ok: false, error: `${addr} is not on the dashboard allowlist.` };
+
+  // executives.is_admin — the same flag the Command Center rules on. A missing
+  // table (pre-migration) reads as "not an admin", never as an error.
+  let isAdmin = false;
+  try {
+    const { data: exec } = await supabase
+      .from('executives')
+      .select('is_admin')
+      .ilike('email', addr)
+      .eq('active', true)
+      .maybeSingle();
+    isAdmin = exec?.is_admin === true;
+  } catch { /* not an executive */ }
+
+  return { ok: true, actor: { email: user.email, role: user.role, isAdmin } };
+}
+
+/** Append to the audit log. Never throws — a failed log must not undo a write. */
+async function logChange({ actor, action, targetTable, targetId, reason = null, before = null, after = null }) {
+  try {
+    const { error } = await supabase.from('bot_change_log').insert({
+      actor, action, target_table: targetTable, target_id: String(targetId),
+      reason, before, after,
+    });
+    if (error && !isMissingRelation(error)) {
+      console.warn(`[BotFeedback] change log ${action} failed: ${error.message}`);
+    }
+  } catch (err) {
+    console.warn(`[BotFeedback] change log ${action} threw: ${err.message}`);
+  }
+}
+
+/** The active reason list, for validating submitted codes against reality. */
+async function knownReasonCodes() {
+  try {
+    const { data, error } = await supabase
+      .from('bot_feedback_reasons').select('code, label').eq('active', true);
+    if (error) return { codes: null, labels: new Map() };
+    return {
+      codes: (data ?? []).map((r) => r.code),
+      labels: new Map((data ?? []).map((r) => [r.code, r.label])),
+    };
+  } catch {
+    return { codes: null, labels: new Map() };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// POST /api/bot-feedback/feedback
+// ═══════════════════════════════════════════════════════════════════
+export async function submitFeedback(actorEmail, body) {
+  const who = await resolveActor(actorEmail);
+  if (!who.ok) return { ok: false, error: who.error, status: 401 };
+  const actor = who.actor;
+
+  if (!canSubmitFeedback(actor)) {
+    return { ok: false, error: 'You do not have access to review bot messages.', status: 403 };
+  }
+
+  const { codes, labels } = await knownReasonCodes();
+  const v = validateFeedback(body, codes);
+  if (!v.ok) return { ok: false, error: v.error, field: v.field, status: 400 };
+  const input = v.value;
+
+  // Resolve the context row: the server owns context_id, ghl_contact_id and
+  // ai_score_at_review, never the client. ai_score_at_review is a SNAPSHOT —
+  // the judge can rescore later and the reviewer's verdict must stay paired
+  // with the number they actually saw.
+  const { data: ctxRow, error: ctxError } = await supabase
+    .from('v_bot_review_queue')
+    .select('context_id, ghl_contact_id, ai_score, channel, rule_applied, reply_text, skip_reason, office')
+    .eq('message_type', input.message_type)
+    .eq('message_ref', input.message_ref)
+    .maybeSingle();
+
+  if (ctxError && isMissingRelation(ctxError)) {
+    return { ok: false, error: 'Bot Review is not migrated yet — apply sql/103 and sql/104.', status: 503 };
+  }
+  if (!ctxRow) {
+    return { ok: false, error: 'That message is no longer in the review queue.', status: 404 };
+  }
+
+  // counts: an uncalibrated team reviewer is STORED but does not move the
+  // rates (§5.2). Operators and admins always count.
+  let counts = true;
+  if (actor.role === 'team' && !actor.isAdmin) {
+    const { data: agree } = await supabase
+      .from('v_bot_reviewer_agreement')
+      .select('calibrated')
+      .ilike('reviewer_email', actor.email)
+      .maybeSingle();
+    // No row yet = no reviews yet = not calibrated.
+    counts = agree?.calibrated === true;
+  }
+
+  const row = {
+    ...input,
+    context_id: ctxRow.context_id,
+    ghl_contact_id: ctxRow.ghl_contact_id,
+    reviewer_email: actor.email,
+    reviewer_role: resolveReviewerRole(actor),
+    counts,
+    ai_score_at_review: ctxRow.ai_score ?? null,
+  };
+
+  const { data: inserted, error: insertError } = await supabase
+    .from('bot_feedback').insert(row).select('id, created_at').single();
+
+  if (insertError) {
+    if (isMissingRelation(insertError)) {
+      return { ok: false, error: 'Bot Review is not migrated yet — apply sql/103.', status: 503 };
+    }
+    console.error(`[BotFeedback] insert failed: ${insertError.message}`);
+    return { ok: false, error: insertError.message, status: 500 };
+  }
+
+  await logChange({
+    actor: actor.email, action: 'feedback_submitted',
+    targetTable: 'bot_feedback', targetId: inserted.id,
+    after: { verdict: input.verdict, reason_codes: input.reason_codes, counts },
+  });
+
+  // Unsafe → alert within 60s (§5.2). Detached: the reviewer's submit must not
+  // wait on GroupMe, and a failed alert must not lose the verdict. The row is
+  // already committed above, so the worst case is an alert that did not send —
+  // which the change log will show by the absence of feedback_unsafe_alert.
+  if (input.verdict === 'unsafe') {
+    alertUnsafeDetached({ actor, input, ctxRow, feedbackId: inserted.id, labels });
+  }
+
+  return {
+    ok: true,
+    data: {
+      id: inserted.id,
+      created_at: inserted.created_at,
+      counts,
+      context_id: ctxRow.context_id,
+      // The UI shows "your review is stored but doesn't count yet" from this.
+      uncalibrated: counts === false,
+    },
+  };
+}
+
+function alertUnsafeDetached({ actor, input, ctxRow, feedbackId, labels }) {
+  (async () => {
+    const text = buildUnsafeAlert({
+      office: ctxRow.office,
+      channel: ctxRow.channel,
+      ruleApplied: ctxRow.rule_applied,
+      replyText: ctxRow.reply_text,
+      skipReason: ctxRow.skip_reason,
+      reasonLabels: input.reason_codes.map((c) => labels.get(c) || c),
+      note: input.note,
+      reviewerEmail: actor.email,
+      link: reviewDeepLink(DASHBOARD_URL, ctxRow.context_id),
+    });
+    await sendGroupMeMessage(text);
+    await logChange({
+      actor: `system:unsafe_alert`, action: 'feedback_unsafe_alert',
+      targetTable: 'bot_feedback', targetId: feedbackId,
+      reason: input.note, after: { sent_at: new Date().toISOString() },
+    });
+  })().catch((err) => console.warn(`[BotFeedback] unsafe alert failed: ${err.message}`));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// POST /api/bot-feedback/feedback/:id/undo
+// ═══════════════════════════════════════════════════════════════════
+//
+// The 10-second window is enforced by the DB trigger (sql/103), not here. This
+// only decides WHO may undo; the trigger decides WHEN. Both have to agree, and
+// the trigger is the one that cannot be bypassed.
+export async function undoFeedback(actorEmail, id) {
+  const who = await resolveActor(actorEmail);
+  if (!who.ok) return { ok: false, error: who.error, status: 401 };
+  const actor = who.actor;
+
+  const { data: row, error } = await supabase
+    .from('bot_feedback').select('id, reviewer_email, undone_at').eq('id', id).maybeSingle();
+  if (error && isMissingRelation(error)) {
+    return { ok: false, error: 'Bot Review is not migrated yet — apply sql/103.', status: 503 };
+  }
+  if (!row) return { ok: false, error: 'That review no longer exists.', status: 404 };
+  if (!canUndo(actor, row)) {
+    return { ok: false, error: 'You can only undo your own review.', status: 403 };
+  }
+  if (row.undone_at) return { ok: true, data: { id: row.id, already_undone: true } };
+
+  const { error: updateError } = await supabase
+    .from('bot_feedback').update({ undone_at: new Date().toISOString() }).eq('id', id);
+
+  if (updateError) {
+    // The trigger's own message is the honest one — it says the window closed.
+    const closed = /undo window closed/i.test(updateError.message || '');
+    return {
+      ok: false,
+      error: closed ? 'Too late to undo — that review is already saved.' : updateError.message,
+      status: closed ? 409 : 500,
+    };
+  }
+
+  await logChange({
+    actor: actor.email, action: 'feedback_undone',
+    targetTable: 'bot_feedback', targetId: id,
+  });
+  return { ok: true, data: { id, undone: true } };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// POST /api/bot-feedback/feedback/:id/edit
+// ═══════════════════════════════════════════════════════════════════
+//
+// An edit is a NEW row carrying supersedes_id. Nothing is ever updated in
+// place, so the original verdict stays readable in history and
+// v_bot_current_feedback hides it from the rates. This is why the undo window
+// can be 10 seconds and still be safe: a late change is an edit, not an undo.
+export async function editFeedback(actorEmail, id, body) {
+  const who = await resolveActor(actorEmail);
+  if (!who.ok) return { ok: false, error: who.error, status: 401 };
+  const actor = who.actor;
+
+  const { data: prior, error } = await supabase
+    .from('bot_feedback')
+    .select('id, message_type, message_ref, reviewer_email, undone_at')
+    .eq('id', id).maybeSingle();
+  if (error && isMissingRelation(error)) {
+    return { ok: false, error: 'Bot Review is not migrated yet — apply sql/103.', status: 503 };
+  }
+  if (!prior) return { ok: false, error: 'That review no longer exists.', status: 404 };
+  if (!canUndo(actor, prior)) {
+    return { ok: false, error: 'You can only edit your own review.', status: 403 };
+  }
+
+  // The edit always targets the SAME message as the row it supersedes — a
+  // client cannot repoint a review at a different message.
+  const res = await submitFeedback(actorEmail, {
+    ...body,
+    message_type: prior.message_type,
+    message_ref: prior.message_ref,
+  });
+  if (!res.ok) return res;
+
+  const { error: linkError } = await supabase
+    .from('bot_feedback').update({ supersedes_id: id }).eq('id', res.data.id);
+  if (linkError) {
+    // The new verdict is saved; only the link failed. Say so rather than
+    // implying nothing happened — both rows now exist.
+    console.error(`[BotFeedback] supersedes link failed for ${res.data.id}: ${linkError.message}`);
+    return { ok: false, error: 'Saved the new review but could not link it to the old one. Tell Mark.', status: 500 };
+  }
+
+  await logChange({
+    actor: actor.email, action: 'feedback_edited',
+    targetTable: 'bot_feedback', targetId: res.data.id,
+    before: { superseded_id: id },
+  });
+  return { ok: true, data: { ...res.data, supersedes_id: id } };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// POST /api/bot-feedback/lead/:contactId/stop-bot
+// ═══════════════════════════════════════════════════════════════════
+//
+// Queues the EXISTING Action Executor add_tag handler (§1.4: GHL is read-only
+// from our code except through Action Executor). We never call GHL here.
+export async function stopBot(actorEmail, contactId, reason) {
+  const who = await resolveActor(actorEmail);
+  if (!who.ok) return { ok: false, error: who.error, status: 401 };
+  const actor = who.actor;
+
+  if (!canStopBot(actor)) {
+    return { ok: false, error: 'Stopping the bot is for operators and admins.', status: 403 };
+  }
+  const target = String(contactId || '').trim();
+  if (!target) return { ok: false, error: 'contactId is required.', status: 400 };
+
+  // Idempotent (§5.2). The tag snapshot is the cache the send path itself
+  // falls back on, so it is the right thing to read.
+  try {
+    const { data: snap } = await supabase
+      .from('contact_tag_snapshot').select('tags').eq('ghl_contact_id', target).maybeSingle();
+    if (snap && alreadyStopped(snap.tags)) {
+      return { ok: true, data: { already_stopped: true, action_id: null } };
+    }
+  } catch { /* no snapshot — queue the tag anyway; add_tag is itself idempotent in GHL */ }
+
+  const { data: action, error: insertError } = await supabase
+    .from('agent_actions')
+    .insert({
+      action_type: 'add_tag',
+      target_system: 'ghl',
+      target_entity: 'contact',
+      target_id: target,
+      action_payload: { tag: STOP_BOT_TAG },
+      reasoning: `Bot Review: ${actor.email} stopped the bot for this lead${reason ? ` — ${reason}` : ''}`,
+      confidence: 1.0,
+      rule_applied: 'BOT_REVIEW_STOP_BOT',
+      status: 'pending',
+      requires_approval: false,
+      sequence_order: 0,
+    })
+    .select('id').single();
+
+  if (insertError) {
+    console.error(`[BotFeedback] stop-bot queue failed for ${target}: ${insertError.message}`);
+    return { ok: false, error: insertError.message, status: 500 };
+  }
+
+  await logChange({
+    actor: actor.email, action: 'stop_bot',
+    targetTable: 'agent_actions', targetId: action.id,
+    reason: reason || null,
+    after: { ghl_contact_id: target, tag: STOP_BOT_TAG },
+  });
+
+  return { ok: true, data: { action_id: action.id, already_stopped: false } };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// GET /api/bot-feedback/calibration/next
+// ═══════════════════════════════════════════════════════════════════
+//
+// The next admin-reviewed message this reviewer has NOT done, with the admin's
+// verdict withheld. Withholding it is the whole point: a calibration score is
+// only meaningful if the reviewer could not see the answer.
+export async function calibrationNext(actorEmail) {
+  const who = await resolveActor(actorEmail);
+  if (!who.ok) return { ok: false, error: who.error, status: 401 };
+  const actor = who.actor;
+
+  const { data: adminRows, error } = await supabase
+    .from('v_bot_current_feedback')
+    .select('message_type, message_ref, created_at')
+    .eq('reviewer_role', 'admin')
+    .order('created_at', { ascending: false })
+    .limit(200);
+
+  if (error && isMissingRelation(error)) {
+    return { ok: false, error: 'Bot Review is not migrated yet — apply sql/104.', status: 503 };
+  }
+  if (error) return { ok: false, error: error.message, status: 500 };
+  if (!adminRows?.length) {
+    return { ok: true, data: { next: null, reason: 'no_admin_reviews_yet' } };
+  }
+
+  const { data: mine } = await supabase
+    .from('v_bot_current_feedback')
+    .select('message_type, message_ref')
+    .ilike('reviewer_email', actor.email);
+
+  const done = new Set((mine ?? []).map((r) => `${r.message_type}::${r.message_ref}`));
+  const next = adminRows.find((r) => !done.has(`${r.message_type}::${r.message_ref}`));
+  if (!next) return { ok: true, data: { next: null, reason: 'all_done' } };
+
+  const { data: progress } = await supabase
+    .from('v_bot_reviewer_agreement')
+    .select('calibration_done, agreement, calibrated, calibration_target, agreement_target')
+    .ilike('reviewer_email', actor.email)
+    .maybeSingle();
+
+  return {
+    ok: true,
+    data: {
+      // NOTE: the admin's verdict is deliberately NOT included.
+      next: { message_type: next.message_type, message_ref: next.message_ref },
+      progress: progress ?? {
+        calibration_done: 0, agreement: null, calibrated: false,
+        calibration_target: 30, agreement_target: 0.8,
+      },
+    },
+  };
+}
+
+export default {
+  resolveActor, submitFeedback, undoFeedback, editFeedback, stopBot, calibrationNext,
+};
