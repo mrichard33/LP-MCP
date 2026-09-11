@@ -24,16 +24,34 @@ import { getFingerprintMode, getJudgePersistMode, isMissingRelation } from './fi
  * Count rows. Returns null when the relation is absent (sql/103 not applied) or
  * unreadable — the caller renders null as "table not present", which is exactly
  * what Mark needs to see from /health before applying the SQL.
+ *
+ * 2026-09-11 (same-day fix) — this used `head: true`, which reported a MISSING
+ * table as present. A HEAD request carries no response body, so PostgREST's JSON
+ * error for an unknown relation had nothing to travel in: supabase-js returned
+ * `{ count: null, error: null }`, `count ?? 0` made that a 0, and /health said
+ * `bot_message_context: true` while the table did not exist. Caught against
+ * production the moment the endpoint went live — `tables` said true while
+ * `coverage` (which uses an ordinary select, so it DOES see the error) said
+ * null. The two disagreeing was the tell.
+ *
+ * Two changes, either of which alone would fix it, kept together because this
+ * function's whole job is to answer "is the table there?" honestly:
+ *   1. `.limit(1)` instead of `head: true` — a real body, so a real parsed
+ *      error. Costs at most one row.
+ *   2. a null count is null, never 0 — absence and emptiness are different
+ *      answers and must never collapse into each other.
  */
-async function safeCount(table, apply = (q) => q) {
+export async function safeCount(table, apply = (q) => q) {
   if (!supabase) return null;
   try {
-    const { count, error } = await apply(supabase.from(table).select('*', { count: 'exact', head: true }));
+    const { count, error } = await apply(
+      supabase.from(table).select('*', { count: 'exact' }).limit(1),
+    );
     if (error) {
       if (!isMissingRelation(error)) console.warn(`[BotFeedback] count(${table}) failed: ${error.message}`);
       return null;
     }
-    return count ?? 0;
+    return typeof count === 'number' ? count : null;
   } catch (err) {
     console.warn(`[BotFeedback] count(${table}) threw: ${err.message}`);
     return null;
@@ -156,4 +174,4 @@ export function registerBotFeedbackRoutes(app, authenticate) {
   );
 }
 
-export default { registerBotFeedbackRoutes };
+export default { registerBotFeedbackRoutes, safeCount };
