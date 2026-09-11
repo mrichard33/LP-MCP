@@ -18,6 +18,17 @@
  * prompt blocks. An unexplained snapshot diff means the change is wrong, not
  * the snapshot. Map: docs/handoffs/response-generator-split-map.md.
  *
+ * v2.7.14 — 2026-09-11. REPLAY CONTEXT FOR BOT REVIEW (PHASE 0).
+ *   PROBLEM: when a reply is wrong, nothing records the inputs that produced
+ *   it — the thread, tags, stage, disposition, the slots it could offer, which
+ *   KB tiers were live and what they returned. A fix could only be guessed at,
+ *   never replayed.
+ *   FIX: generateResponse() now returns an extra `_bot_context` field holding
+ *   exactly that snapshot, which src/bot-feedback/fingerprint.js writes to
+ *   bot_message_context. NO PROMPT TEXT CHANGES — this is read-only assembly of
+ *   values already in scope at the return, added after the message is final. It
+ *   cannot alter, delay or block a send; the snapshot test is unaffected.
+ *
  * v2.7.13 — 2026-08-30. SET IS NOT DISPATCHED — THE TEAM-CONFIRMATION CALL
  *   IS NOW STATED ON EVERY IN-HOME BOOKING.
  *   Mark's directive 2026-08-30. The bot was closing in-home bookings with
@@ -301,6 +312,15 @@ import { resolveServicePhone } from './services/market-phone.js';
 // See src/prompts/response-generator/index.js.
 import * as P from './prompts/response-generator/index.js';
 import { dialWindowPromptLine } from './dial-window.js';
+// v2.7.14 — Bot Review Phase 0. Pure shaping helpers only: no I/O, no writes.
+import { buildInputSnapshot, extractKbModes, extractKbSources } from './bot-feedback/fingerprint-core.js';
+
+/**
+ * v2.7.14 — the header version above, as a value. Stamped (with the deployed
+ * git sha) onto every fingerprint so a replay knows which generator wrote the
+ * reply. Bump it with the header note.
+ */
+export const RESPONSE_GENERATOR_VERSION = 'v2.7.14';
 
 // Provider + model resolved at call time by the shared client from the
 // `response_generator` fn key (customer_facing group). Legacy
@@ -2866,6 +2886,37 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
     // send handler passes both to the outbound phone guard as allowed numbers.
     resolved_service_phone: servicePhone?.phone_display || null,
     contact_known_phone: identityState?.identity?.phone || context?.lead?.phone || null,
+    // v2.7.14 — Bot Review Phase 0 replay context. Assembled from values already
+    // in scope; nothing is fetched and nothing is written here. The send handler
+    // hands it to recordMessageContext() with the action id as message_ref.
+    _bot_context: {
+      core_prompt_version: RESPONSE_GENERATOR_VERSION,
+      model: resolveLLM('response_generator').model,
+      kb_modes: extractKbModes(kbPack),
+      kb_sources: extractKbSources(kbPack),
+      input_snapshot: buildInputSnapshot({
+        conversation: context.conversation_recent || [],
+        contactTags: context.lead?.current_tags || [],
+        buyerStage,
+        activeEntryTag,
+        lpDisposition,
+        intentClass: classification.intent_class,
+        detectedSignals: kbPack?.detected_signals || null,
+        availability,
+        channel,
+        // Business timezone is ET (handoff §0): a replay of a booking turn is
+        // wrong by an hour or a day without the ET wall-clock it generated at.
+        nowEt: new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }),
+        extra: {
+          traffic_temperature: trafficTemp,
+          fast_track: fastTrack,
+          has_existing_appt: hasExistingAppt,
+          is_regenerate: !!opts.editInstruction,
+          booking_calendar: kbPack?.booking_context?.calendar_name || null,
+          booking_policy: kbPack?.booking_context?.policy || null,
+        },
+      }),
+    },
     ...validated,
   };
 }

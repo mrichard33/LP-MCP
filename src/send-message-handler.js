@@ -5,6 +5,22 @@
  * via channel-specific routing — webhook for SMS, Conversations API
  * for email — with cross-fallback for both.
  *
+ * v3.18 (2026-09-11) — BOT REVIEW PHASE 0: FINGERPRINT + AI JUDGE.
+ *   PROBLEM: nothing records why a reply said what it said, and the 5-dimension
+ *   judge in message-content-scorer.js has had zero call sites since it shipped
+ *   (message_scores held 0 rows on 2026-09-11). Reviewers had neither the
+ *   inputs behind a reply nor a score to sort a queue by.
+ *   FIX: two detached hooks on the send path and nothing else.
+ *     1. recordMessageContextDetached() after generation, BEFORE the send —
+ *        one bot_message_context row carrying generated._bot_context
+ *        (response-generator v2.7.14), keyed on the action id.
+ *     2. after the sent marker commits: markSentDetached() stamps sent_at and
+ *        judgeSentReplyDetached() scores the reply.
+ *   NEITHER IS AWAITED. Both are fire-and-forget with their own internal
+ *   timeouts and swallow every error, so a slow or absent bot_message_context
+ *   table (sql/103 not applied) cannot delay, block or alter a send — handoff
+ *   §1.7. No prompt text, no gate, no ordering on the send path changed.
+ *
  * v3.17 (2026-08-14) — Email replies are REPLY ALL.
  *   PROBLEM: the reply went only to the contact. Everyone else on the
  *   inbound was discarded — getInboundEmailToAddress fetched the inbound's
@@ -238,6 +254,9 @@ import supabase from './supabase.js';
 import { sendGroupMeMessage } from './groupme.js';
 import { acquireToken, report429 } from './ghl-rate-limiter.js';
 import { generateResponse, getReplySenderAllowlist, isRandyName } from './response-generator.js';
+// v3.18 — Bot Review Phase 0. Both are detached, fire-and-forget, never awaited.
+import { recordMessageContextDetached, markSentDetached } from './bot-feedback/fingerprint.js';
+import { judgeSentReplyDetached } from './bot-feedback/judge.js';
 import { buildAiFallback } from './ai-fallback.js';
 import { bumpContactCache } from './context-builder.js';
 // v3.6: rich GroupMe notification — same helpers used by tasks v2.0 +
@@ -1779,6 +1798,38 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
  * If TAG application fails, we don't ask a question the system can't hear
  * the answer to — fall straight back to the sales queue.
  */
+/**
+ * v3.18 — Bot Review Phase 0. Shape and file one reply fingerprint.
+ *
+ * Called on every send path immediately before the GHL call. Detached: it
+ * returns synchronously and the write settles on its own, so the send below it
+ * is never waiting on Supabase. `generated` may be null (safe-fallback sends);
+ * the row is still worth having — a fallback that went out is exactly the kind
+ * of message a reviewer needs to see.
+ */
+function fingerprintReply({ action, contactId, message, channel, triggerMessage, generated }) {
+  if (action?.id == null) return;   // no stable message_ref → no row (never a duplicate key)
+  const bot = generated?._bot_context || null;
+  recordMessageContextDetached({
+    message_type: 'reply',
+    message_ref: String(action.id),
+    ghl_contact_id: contactId,
+    channel,
+    intent_class: generated?.intent_class || null,
+    buyer_stage: generated?.buyer_stage ?? null,
+    rule_applied: action.rule_applied || null,
+    prompt_code: generated?.handler_code || null,
+    core_prompt_version: bot?.core_prompt_version || null,
+    model: bot?.model || null,
+    inbound_text: triggerMessage || null,
+    reply_text: message,
+    input_snapshot: bot?.input_snapshot || null,
+    kb_modes: bot?.kb_modes || null,
+    kb_sources: bot?.kb_sources || null,
+    // Phase 2 fills the guidance/example id arrays; they default to '{}'.
+  });
+}
+
 async function sendCustomerStatusProbe(contactId, generated, action, context, opts = {}) {
   const rawChannel = opts.channel || generated.channel || 'sms';
   const channel = rawChannel === 'email' ? 'email' : rawChannel === 'livechat' ? 'livechat' : 'sms';
@@ -1810,6 +1861,13 @@ async function sendCustomerStatusProbe(contactId, generated, action, context, op
     };
   }
 
+  // v3.18 — fingerprint after generation, before the send (handoff §5.1).
+  fingerprintReply({
+    action, contactId, message, channel,
+    triggerMessage: opts.triggerMessage || null,
+    generated,
+  });
+
   const { result: sendResult, sendMethod } = await sendWithFallback(
     contactId, message, channel, null, action,
     {
@@ -1828,6 +1886,21 @@ async function sendCustomerStatusProbe(contactId, generated, action, context, op
     await commitAgenticSend(contactId, String(action.id), {
       message_id: sendResult?.messageId || null,
       conversation_id: sendResult?.conversationId || null,
+    });
+  }
+
+  // v3.18 — post-send only, detached (same contract as the main send path).
+  if (action.id != null) {
+    markSentDetached('reply', String(action.id));
+    judgeSentReplyDetached({
+      actionId: action.id,
+      eventId: action.event_id || null,
+      ruleId: action.rule_applied || null,   // message_scores.rule_id is text; agent_actions has no rule_id column
+      contactId,
+      channel,
+      message,
+      triggerMessage: opts.triggerMessage || null,
+      intentClass: generated?.intent_class || null,
     });
   }
 
@@ -2517,6 +2590,11 @@ export async function executeSendMessage(action, context) {
   // requires_ai_generation block) can surface it to the action executor.
   let fallbackUsed = false;
   let fallbackError = null;
+  // v3.18 — the inbound this reply answers. Function-scoped for the same reason
+  // as fallbackUsed: the fingerprint is filed at the send, outside the
+  // requires_ai_generation block where the trigger is resolved. Stays null on a
+  // pre-generated send, where no inbound was read here.
+  let replyTriggerMessage = null;
 
   if (message) {
     console.log(`[SendMessage] Using ${payload.pre_generated ? 'pre-generated' : 'provided'} message for ${contactId} (${message.length} chars)`);
@@ -2535,6 +2613,7 @@ export async function executeSendMessage(action, context) {
       || context.body
       || context.message_preview
       || null;
+    replyTriggerMessage = triggerMessage;  // v3.18 — see the declaration above
     if (!triggerMessage) {
       const ctxKeys = Object.keys(context || {});
       console.error(`[SendMessage] ⛔ No trigger message in event context for ${contactId} (event_id=${action.event_id}) — refusing to call classifier on placeholder. Event payload keys: [${ctxKeys.join(', ')}]`);
@@ -3040,6 +3119,10 @@ export async function executeSendMessage(action, context) {
     }
   }
 
+  // v3.18 — fingerprint after generation, before the send (handoff §5.1).
+  // Detached: the send below never waits on it.
+  fingerprintReply({ action, contactId, message, channel, triggerMessage: replyTriggerMessage, generated });
+
   // ── Send (v3.3: channel-routed) ────────────────────────────────
   const _tPreSend = Date.now();
   const { result: sendResult, sendMethod } = await sendWithFallback(
@@ -3071,6 +3154,27 @@ export async function executeSendMessage(action, context) {
     });
   }
   const _tCommitted = Date.now();
+
+  // v3.18 — Bot Review Phase 0, post-send only. The message is already with
+  // GHL and the sent marker is committed; nothing below can affect delivery.
+  // Both calls are detached and swallow their own errors.
+  if (action.id != null) {
+    markSentDetached('reply', String(action.id));
+    judgeSentReplyDetached({
+      actionId: action.id,
+      eventId: action.event_id || null,
+      ruleId: action.rule_applied || null,   // message_scores.rule_id is text; agent_actions has no rule_id column
+      contactId,
+      channel,
+      message,
+      subject,
+      triggerMessage: replyTriggerMessage,
+      buyerStage: generated?.buyer_stage ?? null,
+      trustLevelTargeted: generated?.trust_level_targeted ?? null,
+      storyArc: generated?.story_arc || null,
+      intentClass: generated?.intent_class || null,
+    });
+  }
 
   // ── Post-send tail: companion queue + rich GroupMe notification ─
   // Fire-and-forget (2026-07-03 hotfix). This tail awaits GHL/LP reads
