@@ -175,3 +175,57 @@ test('a row with no usable message_ref is refused before any DB call', async () 
     supabase.from = original;
   }
 });
+
+// ─── /health table presence (2026-09-11 same-day regression) ────────
+//
+// The first cut of safeCount used `head: true`. A HEAD response has no body, so
+// PostgREST's JSON error for an unknown relation had nothing to travel in and
+// supabase-js returned `{ count: null, error: null }` — which `count ?? 0` then
+// turned into 0, so /health reported `bot_message_context: true` against a
+// database where the table did not exist. These tests pin the two properties
+// that make the answer honest.
+
+const { safeCount } = await import('../src/bot-feedback/routes.js');
+
+/** Stub one supabase.from(...) chain whose terminal await yields `result`. */
+function withCountResult(result, fn) {
+  const original = supabase.from;
+  supabase.from = () => {
+    const chain = {
+      select: () => chain,
+      limit: () => chain,
+      gte: () => chain,
+      eq: () => chain,
+      then: (resolve, reject) => Promise.resolve(result).then(resolve, reject),
+    };
+    return chain;
+  };
+  return Promise.resolve(fn()).finally(() => { supabase.from = original; });
+}
+
+test('safeCount reports a null count as absent, never as zero rows', async () => {
+  // The exact shape the old head:true request produced against a missing table.
+  await withCountResult({ count: null, error: null }, async () => {
+    assert.equal(await safeCount('bot_message_context'), null,
+      'a null count must stay null — absence and emptiness are different answers');
+  });
+});
+
+test('safeCount reports a missing relation as absent', async () => {
+  await withCountResult({ count: null, error: { code: '42P01', message: 'relation "bot_message_context" does not exist' } }, async () => {
+    assert.equal(await safeCount('bot_message_context'), null);
+  });
+});
+
+test('safeCount distinguishes a genuinely empty table from a missing one', async () => {
+  await withCountResult({ count: 0, error: null }, async () => {
+    assert.equal(await safeCount('bot_message_context'), 0,
+      'an applied-but-empty table must read 0, which /health renders as present');
+  });
+});
+
+test('safeCount returns a real count when rows exist', async () => {
+  await withCountResult({ count: 417, error: null }, async () => {
+    assert.equal(await safeCount('bot_message_context'), 417);
+  });
+});
