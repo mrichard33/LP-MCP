@@ -31,6 +31,34 @@
  *   'json' → application/json. Use only when the destination explicitly
  *      requires JSON (non-GHL targets, future integrations).
  *
+ * v2.1 (2026-09-11) — remove_from_workflow now clears the enrollment tag it used
+ *        to leave behind. ROOT CAUSE: executeRemoveFromWorkflow issued
+ *        DELETE /contacts/{id}/workflow/{wfId} and returned. It never removed the
+ *        active-<canonical_code> tag that marks the contact as enrolled — the exact
+ *        tag the v2.0 idempotency guard below reads. So every agentic removal
+ *        planted the flag that blocks the NEXT enrollment: the contact is out of
+ *        the workflow, still labeled as in it, and cannot be put back by any rule
+ *        carrying a canonical_code (add_to_workflow returns
+ *        skipped_already_enrolled forever). That add/remove asymmetry is the whole
+ *        bug — the guard was correct, its counterpart was missing.
+ *        Reference case: Alfredo Fontan (GHL VKMKhd8JQ4wsp3zMn8Lt), removed from
+ *        E.2 by actions 447848 / 447879 / 447891 on 2026-09-11, still carrying
+ *        active-e.2 hours later. Rule 305 removed 30 contacts from E.2 and S2.1
+ *        since 2026-06-25 and spot-checks confirm the tag survived on them too.
+ *        WHAT CHANGES: after the DELETE succeeds, resolve the canonical code
+ *        (action_payload.canonical_code first, else a reverse HL workflow_registry
+ *        lookup by workflow_id), derive the tag via tagsToClearOnRemoval(), remove
+ *        it through executeRemoveTag and mirror it into contact_tag_snapshot —
+ *        the same write-through executeIssueHold uses for
+ *        cannot-afford:pursuing-assistance, so suppression reads see it at once.
+ *        FAIL-SOFT AND VISIBLE: the GHL removal already happened and is never
+ *        rolled back over a tag write, so the clear is wrapped and the result
+ *        reports cleared_tags / tag_clear_failed / canonical_code_resolved_via
+ *        rather than failing silently.
+ *        NOT IN SCOPE: the remove_all branch (see the comment there) and stage:*
+ *        tags — stage: is a single-value namespace other workflows also write, so
+ *        clearing it on removal could blank a stage a different sequence owns.
+ *
  * v2.0 (2026-06-16) — Idempotency guard on add_to_workflow. Before enrolling,
  *        skip when the contact already carries active-<canonical_code> for the
  *        destination workflow (S4.1 → active-s4.1). Root cause of the 2026-06-16
@@ -171,7 +199,14 @@ import { ghlFetch } from '../helpers.js';
 // (generalizes the 2026-06-17 Peggy Webb inline write below).
 import { applyTagsToSnapshot } from '../../services/tag-snapshot.js';
 import { REMOVE_ALL_MARKETING_WF } from '../constants.js';
-import { resolveWorkflowIdByCanonicalCode } from '../../tools/admin/hl-fallback.js';
+import {
+  resolveWorkflowIdByCanonicalCode,
+  resolveCanonicalCodeByWorkflowId,
+} from '../../tools/admin/hl-fallback.js';
+// v2.1 — enrollment-tag clearing on removal goes through the same handler every
+// other tag write in the executor uses (present-check, cache upkeep, snapshot
+// write-through) rather than a raw DELETE from here.
+import { executeRemoveTag } from './tags.js';
 
 // ── Universal Dynamic Hold (2026-06-12) ────────────────────────────────
 // One GHL "dumb clock" workflow (dfd3ffaa) parks a contact for hold_hours and
@@ -185,6 +220,16 @@ const HOLD_TRIGGER_ID = process.env.AGENTIC_HOLD_TRIGGER_ID || '4ec11a08-acaa-41
 // 'false' only if GHL-side serialization is proven sufficient (concurrency test).
 const HOLD_SERIALIZATION_ENABLED = process.env.HOLD_SERIALIZATION_ENABLED !== 'false';
 const DEFAULT_HOLD_HOURS = 72;
+
+// v2.1 — wall-clock budget for the enrollment-tag clear that follows a workflow
+// removal. The clear adds up to three round trips (HL registry read, contact
+// GET, tag DELETE) behind a rate limiter that waits 30s per call at worst, and
+// the executor's handler watchdog is 60s (EXECUTOR_HANDLER_TIMEOUT_MS) — so
+// unbounded, a paused GHL bucket could turn a SUCCESSFUL removal into a
+// watchdog "failure" and a zombie retry. Capping it keeps the failure contained
+// to the thing that is already fail-soft: on expiry the removal stands and the
+// result reports tag_clear_failed.
+const TAG_CLEAR_BUDGET_MS = parseInt(process.env.WORKFLOW_TAG_CLEAR_BUDGET_MS || '20000', 10);
 // Slack past hold_hours after which an un-completed hold is treated as dead and
 // serialization releases — otherwise a lost completion (workflow unpublished,
 // contact deleted/merged, GHL hiccup) would lock the contact out of holds forever.
@@ -401,6 +446,22 @@ function deriveActiveTag(canonicalCode) {
   if (!canonicalCode || typeof canonicalCode !== 'string') return null;
   const code = canonicalCode.trim().toLowerCase();
   return code ? `active-${code}` : null;
+}
+
+/**
+ * v2.1 — The enrollment tags a removal from this workflow should clear.
+ *
+ * The mirror image of the v2.0 guard above: whatever deriveActiveTag stamps as
+ * "this contact is in the workflow" is what a removal has to take back off.
+ *
+ * Returns [] when no canonical_code is resolvable — clearing nothing is
+ * correct there; guessing at a tag name is not. An array (not a single tag) so
+ * a workflow that ever needs more than one enrollment marker cleared does not
+ * need a signature change at every call site.
+ */
+export function tagsToClearOnRemoval(canonicalCode) {
+  const tag = deriveActiveTag(canonicalCode);
+  return tag ? [tag] : [];
 }
 
 async function isAlreadyEnrolled(contactId, activeTag) {
@@ -774,10 +835,15 @@ export async function executeIssueHold(action) {
   };
 }
 
-export async function executeRemoveFromWorkflow(action) {
+export async function executeRemoveFromWorkflow(action, context = {}) {
   const contactId = action.target_id;
   const payload = action.action_payload || {};
   if (payload.remove_all) {
+    // OPEN GAP (v2.1): no enrollment tags are cleared on this branch. It routes
+    // the contact through the Remove All Marketing workflow, so the set of
+    // active-* tags to clear is not knowable from the payload — and a wildcard
+    // strip of active-* would be a guess, not a fix. Left deliberately for a
+    // separate decision rather than closed wrongly here.
     await ghlFetch('POST', `/contacts/${contactId}/workflow/${REMOVE_ALL_MARKETING_WF}`, {});
     return { action: 'added_to_remove_all_workflow', contact_id: contactId };
   }
@@ -789,6 +855,86 @@ export async function executeRemoveFromWorkflow(action) {
   if (!wfId) throw new Error('Missing workflow_id');
   await ghlFetch('DELETE', `/contacts/${contactId}/workflow/${wfId}`);
   console.log(`[ActionExecutor] ✅ Removed contact ${contactId} from workflow: ${wfLabel} (${wfId}${resolvedVia === 'hl_registry' ? ', via hl_registry' : ''})`);
+
+  // ── v2.1 Clear the enrollment tag ─────────────────────────────
+  // The removal above took the contact out of the workflow; without this the
+  // active-<code> tag stays behind and the v2.0 add_to_workflow guard reads it
+  // as "still enrolled", permanently blocking re-entry (Alfredo Fontan,
+  // VKMKhd8JQ4wsp3zMn8Lt / E.2, 2026-09-11).
+  //
+  // ENTIRELY FAIL-SOFT: the GHL removal is already committed and is never
+  // rolled back over a tag write. Any failure is logged and reported on the
+  // result (tag_clear_failed) instead of failing the action — a retry would
+  // re-issue a DELETE for a workflow the contact is already out of.
+  let clearedTags = [];
+  let tagClearFailed = false;
+  let codeResolvedVia = null;
+  let budgetTimer = null;
+  try {
+    const clear = async () => {
+      let code = canonicalCode;
+      if (code) {
+        codeResolvedVia = 'payload';
+      } else {
+        // Rules that carry only a UUID are the common case for rule 305, so the
+        // reverse registry read is what makes this fix cover them at all. It
+        // never throws — a null here just means we clear nothing.
+        code = await resolveCanonicalCodeByWorkflowId(wfId);
+        if (code) codeResolvedVia = 'hl_registry';
+      }
+
+      const tags = tagsToClearOnRemoval(code);
+      if (!tags.length) {
+        console.warn(
+          `[ActionExecutor] no canonical_code for workflow ${wfId} — removed ${contactId} but cleared no enrollment tag`,
+        );
+        return;
+      }
+
+      // executeRemoveTag skips tags the contact does not actually have, keeps
+      // the per-batch contact cache honest, and mirrors its own DELETE into
+      // contact_tag_snapshot.
+      const res = await executeRemoveTag(
+        { target_id: contactId, action_payload: { tags }, rule_applied: action.rule_applied || 'remove_from_workflow' },
+        context,
+      );
+      clearedTags = res?.tag_removed ? [res.tag_removed] : (res?.tags || []);
+      // Second, unconditional snapshot write-through — the same pattern
+      // executeIssueHold uses for cannot-afford:pursuing-assistance. It is NOT
+      // redundant with the mirror inside executeRemoveTag: when GHL no longer
+      // has the tag that call is a no_op and writes nothing, yet the snapshot
+      // can still hold a stale copy that suppression and re-entry reads would
+      // trust. This converges it either way.
+      await applyTagsToSnapshot(contactId, { remove: tags });
+      console.log(
+        `[ActionExecutor] 🏷️ cleared enrollment tag(s) [${tags.join(', ')}] for ${contactId} ` +
+        `after removal from ${wfLabel} (code via ${codeResolvedVia})`,
+      );
+    };
+
+    // Budgeted so a paused GHL bucket can never push a completed removal past
+    // the executor's 60s handler watchdog (see TAG_CLEAR_BUDGET_MS).
+    await Promise.race([
+      clear(),
+      new Promise((_, rej) => {
+        budgetTimer = setTimeout(
+          () => rej(new Error(`enrollment-tag clear exceeded ${TAG_CLEAR_BUDGET_MS}ms budget`)),
+          TAG_CLEAR_BUDGET_MS,
+        );
+      }),
+    ]);
+  } catch (err) {
+    tagClearFailed = true;
+    console.warn(
+      `[ActionExecutor] enrollment-tag clear FAILED for ${contactId} after removal from ${wfLabel}: ${err.message} ` +
+      '— removal stands; contact may still carry a stale active-* tag',
+    );
+  } finally {
+    // Without this the pending budget timer keeps the event loop alive for the
+    // full budget after a fast clear — enough to stall a short-lived process.
+    if (budgetTimer) clearTimeout(budgetTimer);
+  }
+
   return {
     action: 'removed',
     contact_id: contactId,
@@ -797,5 +943,8 @@ export async function executeRemoveFromWorkflow(action) {
     canonical_code: canonicalCode,
     canonical_name: canonicalName,
     resolved_via: resolvedVia,
+    cleared_tags: clearedTags,
+    tag_clear_failed: tagClearFailed,
+    canonical_code_resolved_via: codeResolvedVia,
   };
 }

@@ -50,6 +50,43 @@ export async function resolveWorkflowIdByCanonicalCode(canonicalCode) {
   return id;
 }
 
+/**
+ * Reverse of resolveWorkflowIdByCanonicalCode: workflow_id → canonical_code.
+ *
+ * Added 2026-09-11 for remove_from_workflow, which must know WHICH
+ * active-<code> enrollment tag to clear when the rule payload carries only a
+ * workflow UUID.
+ *
+ * FAIL-SOFT AND NEVER THROWS — deliberately unlike its sibling above, which
+ * re-raises so the caller can decide. Here there is nothing left to decide:
+ * the GHL removal has already happened and must never be rolled back over a
+ * tag write, so every failure mode (HL down, not configured, RPC error, no
+ * matching row) collapses to null and the caller simply clears nothing.
+ */
+export async function resolveCanonicalCodeByWorkflowId(workflowId) {
+  if (!workflowId) return null;
+  // Ordering mirrors the forward lookup — prefer active, then freshest.
+  const q =
+    `SELECT canonical_code FROM workflow_registry ` +
+    `WHERE workflow_id = '${esc(workflowId)}' ` +
+    `ORDER BY (status = 'active') DESC, updated_at DESC LIMIT 1`;
+  let rows;
+  try {
+    rows = await hlRunSQL(q);
+  } catch (err) {
+    console.warn(`[HlFallback] reverse registry lookup FAILED for ${workflowId}: ${err.message}`);
+    return null;                                   // never throws — see contract above
+  }
+  // hlRunSQL returns a row array today; the string/object shapes are the same
+  // defensive handling the forward lookup carries for older result shapes.
+  let code = null;
+  if (typeof rows === 'string') code = rows || null;
+  else if (Array.isArray(rows) && rows.length) code = rows[0]?.canonical_code || null;
+  else if (rows && typeof rows === 'object') code = rows.canonical_code || null;
+  if (!code) console.warn(`[HlFallback] reverse registry lookup: no row for workflow_id "${workflowId}"`);
+  return code;
+}
+
 export function registerHlFallbackTools(server) {
 
   // hl_query [READ-ONLY] — generic escape hatch
