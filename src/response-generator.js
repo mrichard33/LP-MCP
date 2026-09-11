@@ -877,6 +877,31 @@ function stampBookingResolution(bc, resolution, context) {
   bc.calendar_name = bc.resolved_calendar_name || bc.calendar_name;
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// COMPANY INBOX (2026-09-11 — Alfredo Fontan incident)
+// ═══════════════════════════════════════════════════════════════════
+//
+// The one address a customer may be told to email. Read PER CALL, not at
+// import, for the same reason the dial window is: if the inbox changes, this
+// must be able to follow within minutes rather than within a deploy. The
+// default is the live address, so an unset env is already correct.
+
+const DEFAULT_COMPANY_INBOX = 'team@getreecewindows.com';
+
+/** The company inbox, read fresh. Always lowercase and trimmed. */
+export function resolveCompanyInbox() {
+  return (process.env.REECE_CUSTOMER_INBOX || DEFAULT_COMPANY_INBOX).trim().toLowerCase();
+}
+
+/** Extra addresses the reply may direct a customer to (comma list, optional). */
+function companyInboxAllowlist() {
+  const extra = String(process.env.REECE_EMAIL_ALLOWLIST || '')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean);
+  return [resolveCompanyInbox(), ...extra];
+}
+
 function formatTodayForPrompt() {
   return new Intl.DateTimeFormat('en-US', {
     timeZone: PROMPT_TIMEZONE,
@@ -1169,6 +1194,15 @@ export function buildResponsePrompt(context, channel, triggerMessage, kbPack, cl
     parts.push(...P.KNOWN_CONTACT_PROFILE_RULE);
     parts.push(...P.KNOWN_CONTACT_PROFILE_FOOTER);
   }
+
+  // ─── COMPANY INBOX (2026-09-11 — Alfredo Fontan incident) ───
+  // UNCONDITIONAL, and deliberately OUTSIDE the bookingGate.known block above:
+  // the question "what email do I send this to?" does not wait for a booking
+  // gate, and a turn without a known-contact profile is exactly the turn where
+  // the model has the least to go on. Nothing in the repo previously named a
+  // company address, so under ANSWER FIRST the model answered with the only
+  // address it had — the lead's own.
+  parts.push(...P.companyInbox(resolveCompanyInbox()));
 
   // ─── v1.1 SERVICE AREA STATUS (zip-verified against service_area_zips) ───
   if (opts.serviceArea?.checked) {
@@ -1958,6 +1992,87 @@ function assertNoUnresolvedTokens(message, contactId) {
   if (bad.length) {
     console.error(`[ResponseGenerator] ⛔ unresolved merge token(s) in body for ${contactId}: ${bad.join(', ')}`);
     throw new Error(`unresolved_merge_token: ${bad.join(', ')}`);
+  }
+}
+
+// ─── Bad email directions (2026-09-11 — Alfredo Fontan incident) ──────
+//
+// Asked "do you have an email to send this to you", the bot replied "you can
+// send them to alfredo.fontan@gmail.com" (agent_actions 447887), then said it
+// again after the lead answered "That's my email" (447988). The lead's own
+// address was the only one in the model's context, so under ANSWER FIRST it
+// was the one that came out. The prompt now carries a COMPANY INBOX block;
+// this is the deterministic enforcement of it, in the same spirit as the
+// invented-phone guard — a prompt is a request, this is the rule.
+const EMAIL_IN_BODY_RX = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+
+// "Send it to…" — a sentence that TELLS THE CUSTOMER to send something. The
+// anchor list is deliberately narrow: it must match a customer-directed
+// imperative and must NOT match "We'll email the estimate to <address>", which
+// is us sending to them and is perfectly fine.
+const CUSTOMER_DIRECTED_SEND_RX =
+  /(?:^|[.!?]["')\]]?\s+|\n\s*|\byou\s+can\b|\byou\s+could\b|\bplease\b|\bjust\b|\bgo\s+ahead\s+and\b|\bfeel\s+free\s+to\b)\s*(?:send|forward|e-?mail|submit|attach)\b/gi;
+
+// How far after the send phrase the address still counts as its object. One
+// short clause — "send them to <address>" — not a whole paragraph.
+const OWN_EMAIL_PROXIMITY_CHARS = 60;
+
+/**
+ * Email-direction violations in a generated body. Pure; exported for tests.
+ *
+ *   (a) `unknown address: <x>` — an address that is neither the contact's own
+ *       nor on the allowlist. Covers the invented-address case.
+ *   (b) `told customer to send to their own email` — the contact's own address
+ *       used as the destination of a customer-directed send phrase. This is
+ *       the Alfredo failure exactly.
+ *
+ * @param {string} message
+ * @param {{contactEmail?: string|null, allowed?: string[]}} [opts]
+ * @returns {string[]} violations; empty means clean
+ */
+export function findBadEmailDirections(message, { contactEmail = null, allowed = [] } = {}) {
+  const body = String(message || '');
+  const violations = [];
+
+  const own = String(contactEmail || '').trim().toLowerCase();
+  const allowSet = new Set(
+    (allowed || []).map(a => String(a || '').trim().toLowerCase()).filter(Boolean)
+  );
+
+  // (a) Every distinct address in the body must be the customer's own (we may
+  //     state it back to them) or allowlisted (the company inbox).
+  const seen = new Set();
+  for (const m of body.matchAll(EMAIL_IN_BODY_RX)) {
+    const addr = m[0].toLowerCase().replace(/[.,;:]+$/, '');
+    if (seen.has(addr)) continue;
+    seen.add(addr);
+    if (addr === own || allowSet.has(addr)) continue;
+    violations.push(`unknown address: ${m[0]}`);
+  }
+
+  // (b) The customer's own inbox given as a place for them to send things.
+  if (own) {
+    for (const m of body.matchAll(CUSTOMER_DIRECTED_SEND_RX)) {
+      const from = m.index + m[0].length;
+      const after = body.slice(from, from + OWN_EMAIL_PROXIMITY_CHARS).toLowerCase();
+      if (after.includes(own)) {
+        violations.push('told customer to send to their own email');
+        break;
+      }
+    }
+  }
+
+  return violations;
+}
+
+function assertNoBadEmailDirections(message, contactId, contactEmail) {
+  const bad = findBadEmailDirections(message, {
+    contactEmail,
+    allowed: companyInboxAllowlist(),
+  });
+  if (bad.length) {
+    console.error(`[ResponseGenerator] ⛔ bad email direction in body for ${contactId}: ${bad.join(', ')}`);
+    throw new Error(`bad_email_direction: ${bad.join(', ')}`);
   }
 }
 
@@ -2776,6 +2891,18 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // then-safe-fallback loop in send-message-handler: the lead still gets a
   // reply, and it is never one with raw template syntax in it.
   assertNoUnresolvedTokens(validated.message, contactId);
+
+  // ─── Email-direction guard (2026-09-11 — Alfredo Fontan incident) ───
+  // The COMPANY INBOX prompt block makes a correct answer possible; this makes
+  // a wrong one non-shippable. Throwing hands control to the same retry-then-
+  // safe-fallback loop as the token guard above, so the lead still gets a
+  // reply — just never one pointing them at their own inbox or an address
+  // nobody at Reece reads.
+  assertNoBadEmailDirections(
+    validated.message,
+    contactId,
+    identityState?.identity?.email || context.lead?.email || null,
+  );
 
   // ─── Immediate-call promise outside staffed hours (2026-09-11) ───
   // Anchored to context.now.iso, the SAME instant buildResponsePrompt used for

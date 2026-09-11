@@ -362,8 +362,21 @@ export const knownAddress = (address) => [
 
 // Email on file, or NOT KNOWN.
 // Was response-generator.js:1126.
+//
+// 2026-09-11 (Alfredo Fontan incident, agent_actions 447887 / 447988): this
+// line printed a bare `Email: <address>` with no owner stated. Asked "do you
+// have an email to send this to you", the model read the only address in its
+// context and answered "you can send them to alfredo.fontan@gmail.com" — the
+// lead's own inbox. The label now names whose address it is and bans the
+// misuse in the same breath.
 export const knownEmail = (email) => [
-  `Email: ${email || 'NOT KNOWN'}`,
+  `Email (the CUSTOMER'S OWN address. Never tell them to send anything to it): ${email || 'NOT KNOWN'}`,
+];
+
+// 2026-09-11 — the company inbox. Always present, so the model never has to
+// infer a destination address from whatever happens to be in context.
+export const companyInbox = (inbox) => [
+  `COMPANY INBOX: ${inbox}. This is the ONLY email address a customer may send us files, photos, measurements, or documents. When a customer asks where to email something, give this address. NEVER tell a customer to send anything to their own email address, and never invent any other address.`,
 ];
 
 // Phone on file, or NOT KNOWN.

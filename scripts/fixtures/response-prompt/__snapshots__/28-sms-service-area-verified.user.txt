@@ -90,6 +90,7 @@ call before then to go over the details and finalize the visit."
 
 LEAD: Dana Whitfield
 Entry: Facebook Lead Form | Lead Score: 42 | Date Added: 2026-08-30T13:00:00Z
+COMPANY INBOX: team@getreecewindows.com. This is the ONLY email address a customer may send us files, photos, measurements, or documents. When a customer asks where to email something, give this address. NEVER tell a customer to send anything to their own email address, and never invent any other address.
 
 SERVICE AREA STATUS: zip 33071 VERIFIED IN SERVICE AREA (Coral Springs). If the customer provided their address or zip in this conversation and you have not yet told them, include a brief natural confirmation that they're in our service area (e.g. "Good news — Coral Springs is right in our service area."). Say it once; never repeat it on later turns.
 Inferred Buyer Stage: 2/5
