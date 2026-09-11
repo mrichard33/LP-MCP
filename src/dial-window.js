@@ -50,20 +50,33 @@
  * five9_supervisor_statistics(AgentState) returned zero rows. Friday evening,
  * empty floor. Nothing was broken; there was simply nobody to hand it to.
  *
- * The consequence is real and accepted: between the last agent logging off and
- * 21:00, the bot will promise "someone will ring you in the next few minutes"
- * and no call will go out until the floor is back. Mark ruled on this
- * 2026-09-04 with the trade-off stated: keep PREVIEW, do NOT gate the promise
- * on live agent availability, and keep the promise window on the dial schedule
- * as it is.
+ * On 2026-09-04 Mark ruled to accept the gap: keep PREVIEW, do NOT gate the
+ * promise on live agent availability, keep the promise window on the dial
+ * schedule as it is — and reopen it with him rather than "fixing" it here.
  *
- * So if you are here because a callback was promised at 8:45 PM and never
- * placed: that is this decision, not a defect. The alternatives were weighed
- * and declined — narrowing the window to staffed hours (drifts from the dial
- * schedule and needs hand-maintenance), and reading AgentState per reply (puts
- * a live Five9 call in the reply path, which then has to fail toward the safer
- * copy). Reopen it with Mark rather than "fixing" it here.
+ * REOPENED AND REVERSED — MARK, 2026-09-11
+ * ────────────────────────────────────────
+ * This IS that reopening, and it replaces the paragraph above. The accepted
+ * consequence turned out to be the wrong trade: between the floor going home
+ * and 21:00, and all day on a Sunday evening, the bot was promising "someone
+ * will ring you in the next few minutes" against an empty room. Mark's ruling:
+ * WHEN THE OFFICE IS CLOSED, THE BOT MUST NOT SUGGEST ANYONE WILL CALL
+ * IMMEDIATELY.
+ *
+ * The fix is NOT to narrow this module. This still answers only "is Five9
+ * dialing?", and its 08:00-21:00-every-day answer is still the correct one for
+ * that question. Staffed hours are a SECOND fact, owned by src/staffed-hours.js
+ * (Mon-Fri 8:00 AM-8:00 PM, Sat 9:00 AM-8:00 PM, Sun 9:00 AM-5:00 PM ET,
+ * confirmed by Mark 2026-09-11). canPromiseImmediateCall() below is the only
+ * place the two are combined — an immediate-callback promise needs both, and
+ * neither module has been widened to answer the other's question.
+ *
+ * The alternative still declined: reading AgentState per reply, which would put
+ * a live Five9 call in the reply path that then has to fail toward the safer
+ * copy anyway.
  */
+
+import { isWithinStaffedHours, nextStaffedOpening, staffedHoursHuman } from './staffed-hours.js';
 
 const TZ = 'America/New_York';
 
@@ -125,23 +138,39 @@ export function isWithinDialWindow(atMs = Date.now()) {
 }
 
 /**
+ * Can the bot promise a call in the next few minutes right now?
+ *
+ * BOTH facts have to hold: Five9 has to be dialing AND somebody has to be there
+ * to take the record. Mark's 2026-09-11 ruling, and the only place the two
+ * schedules are combined — see the header.
+ *
+ * @param {number} [atMs]  epoch ms; defaults to now
+ * @returns {boolean}
+ */
+export function canPromiseImmediateCall(atMs = Date.now()) {
+  return isWithinDialWindow(atMs) && isWithinStaffedHours(atMs);
+}
+
+/**
  * One line of fact for the reply prompt. Deliberately states the boundary as
- * well as the verdict: told only "the dialer is closed", a model will invent a
- * reopening time, and an invented one contradicts the SMS the customer gets.
+ * well as the verdict: told only "the phone room is closed", a model will
+ * invent a reopening time, and an invented one contradicts the SMS the
+ * customer gets.
+ *
+ * Built on canPromiseImmediateCall, not on isWithinDialWindow — the line
+ * describes whether a promise is safe, and that is the combined question. The
+ * hours it quotes are rendered from the live schedule so the copy can never
+ * drift from the code enforcing it.
  *
  * @param {number} [atMs]
  * @returns {string}
  */
 export function dialWindowPromptLine(atMs = Date.now()) {
-  const { startHour, endHour } = dialWindowBounds();
-  const open = isWithinDialWindow(atMs);
-  const fmt = (h) => {
-    const ampm = h >= 12 ? 'PM' : 'AM';
-    const h12 = h % 12 || 12;
-    return `${h12}:00 ${ampm}`;
-  };
-  const window = `${fmt(startHour)}-${fmt(endHour)} ET`;
-  return open
-    ? `PHONE ROOM: OPEN right now (the dialer runs ${window}). An immediate callback CAN be promised.`
-    : `PHONE ROOM: CLOSED right now (the dialer runs ${window}). An immediate callback CANNOT be promised — the next one goes out when it reopens.`;
+  const staffed = staffedHoursHuman();
+  if (canPromiseImmediateCall(atMs)) {
+    return `PHONE ROOM: OPEN right now (staffed ${staffed}). An immediate callback CAN be promised.`;
+  }
+  const next = nextStaffedOpening(atMs);
+  const when = next.human ? `The next call can go out ${next.human} ET. ` : '';
+  return `PHONE ROOM: CLOSED right now. ${when}An immediate callback CANNOT be promised.`;
 }

@@ -311,7 +311,7 @@ import { resolveServicePhone } from './services/market-phone.js';
 // Every prompt string this file assembles. Copy only — no logic, no env reads.
 // See src/prompts/response-generator/index.js.
 import * as P from './prompts/response-generator/index.js';
-import { dialWindowPromptLine } from './dial-window.js';
+import { dialWindowPromptLine, canPromiseImmediateCall } from './dial-window.js';
 // v2.7.14 — Bot Review Phase 0. Pure shaping helpers only: no I/O, no writes.
 import { buildInputSnapshot, extractKbModes, extractKbSources } from './bot-feedback/fingerprint-core.js';
 
@@ -1989,6 +1989,44 @@ const TIMELINE_PROMISE_PATTERNS = [
   /\bwithin\s+\d+\s*(?:hrs?|hours?|mins?|minutes?)\b/i,
 ];
 
+// ─── Immediate-call promises outside staffed hours (2026-09-11) ──────
+//
+// "PHONE ROOM: OPEN" used to be computed from the Five9 dial window alone —
+// 8 AM to 9 PM, EVERY DAY — so the prompt told the model an immediate callback
+// could be promised at 8:30 PM on a Sunday, with nobody on the floor to place
+// it. Mark reopened the 2026-09-04 ruling on 2026-09-11 and reversed it: when
+// the office is closed the bot must not suggest anyone will call immediately.
+// dialWindowPromptLine now says so; this enforces it on the generated body,
+// for the same reason findTimelinePromises exists — a prompt is a request, and
+// this is a promise made on the company's behalf.
+const CALL_VERB_RX = /\b(?:calls?|calling|rings?|ringing|phones?|phoning|reach(?:es|ing)?\s+out|reach\s+you|get(?:s|ting)?\s+back\s+to\s+you|contact(?:s|ing)?\s+you)\b/gi;
+
+const IMMEDIACY_RX = /\b(?:right\s+away|right\s+now|shortly|momentarily|asap|in\s+(?:the\s+)?(?:next\s+)?(?:a\s+)?few\s+minutes|within\s+(?:the\s+)?(?:next\s+)?\d+\s*min(?:ute)?s?|any\s+minute)\b/i;
+
+// The immediacy phrase must land in the same breath as the call verb, not three
+// sentences later. One clause's worth of characters.
+const IMMEDIACY_PROXIMITY_CHARS = 50;
+
+/**
+ * Immediate-callback promises in a generated body. Pure; exported for tests.
+ * Non-empty means the reply told the customer someone would ring them within
+ * minutes — which is only ever safe inside staffed hours.
+ *
+ * @param {string} message
+ * @returns {string[]} the offending fragments
+ */
+export function findImmediateCallPromises(message) {
+  const body = String(message || '');
+  const hits = [];
+  for (const m of body.matchAll(CALL_VERB_RX)) {
+    const from = m.index + m[0].length;
+    const window = body.slice(from, from + IMMEDIACY_PROXIMITY_CHARS);
+    const found = window.match(IMMEDIACY_RX);
+    if (found) hits.push(`${m[0]}…${found[0]}`);
+  }
+  return hits;
+}
+
 /**
  * Timeline commitments found in an acknowledgment body. Pure; exported for
  * tests. Non-empty means the reply promised WHEN a human would respond.
@@ -2738,6 +2776,24 @@ export async function generateResponse(contactId, channel, triggerMessage, opts 
   // then-safe-fallback loop in send-message-handler: the lead still gets a
   // reply, and it is never one with raw template syntax in it.
   assertNoUnresolvedTokens(validated.message, contactId);
+
+  // ─── Immediate-call promise outside staffed hours (2026-09-11) ───
+  // Anchored to context.now.iso, the SAME instant buildResponsePrompt used for
+  // the PHONE ROOM line — so the guard can never disagree with the fact the
+  // model was given. Throwing routes to the retry-then-safe-fallback loop: the
+  // lead still gets a reply, just never one promising a call from an empty
+  // room.
+  {
+    const parsedNow = Date.parse(context.now?.iso ?? '');
+    const nowMs = Number.isFinite(parsedNow) ? parsedNow : Date.now();
+    if (!canPromiseImmediateCall(nowMs)) {
+      const promises = findImmediateCallPromises(validated.message);
+      if (promises.length) {
+        console.error(`[ResponseGenerator] ⛔ immediate call promise while the phone room is closed for ${contactId}: ${promises.join(', ')}`);
+        throw new Error(`immediate_call_promise_while_closed: ${promises.join(', ')}`);
+      }
+    }
+  }
 
   // D5 (2026-07-29): "...is at the link below" with no link below it.
   validated.message = stripDanglingLinkReferences(validated.message);
