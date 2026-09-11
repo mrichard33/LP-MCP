@@ -67,6 +67,10 @@ function slimGhlContact(c) {
     city: c.city || null,
     postalCode: c.postalCode || c.postal_code || null,
     customFields: Array.isArray(c.customFields) ? c.customFields : [],
+    // 2026-09-11 — the contact's owning GHL user. create_task defaults its
+    // assignee from this when a rule didn't name one; carried on the snapshot
+    // so that costs zero extra API calls.
+    assignedTo: c.assignedTo || c.assigned_to || null,
   };
 }
 

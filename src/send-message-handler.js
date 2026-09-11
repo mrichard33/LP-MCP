@@ -258,6 +258,11 @@ import { generateResponse, getReplySenderAllowlist, isRandyName } from './respon
 import { recordMessageContextDetached, markSentDetached } from './bot-feedback/fingerprint.js';
 import { judgeSentReplyDetached } from './bot-feedback/judge.js';
 import { buildAiFallback } from './ai-fallback.js';
+import {
+  buildHumanHandoffAlertPayload,
+  handoffNeedsHumanAlert,
+  HANDOFF_ALERT_RULE,
+} from './human-handoff-alert.js';
 import { bumpContactCache } from './context-builder.js';
 // v3.6: rich GroupMe notification — same helpers used by tasks v2.0 +
 // notifications handlers, so all four GroupMe surfaces share one format.
@@ -1749,6 +1754,47 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
   const tagSummary = tagsToApply.join(', ') || 'none';
   const preview = (generated.trigger_message_preview || '').slice(0, 120);
 
+  // ── HUMAN NEEDED NOW (2026-09-11 — Alfredo Fontan, agent_actions 448032) ──
+  // A silent handoff sent nothing to the lead AND told nobody here. The card
+  // below ends "→ GHL workflow on tag now owns the response", which is true of
+  // the callback tags and false of a human handoff, where no workflow listens.
+  // Queue ONE action-required alert on exactly those, deduped per contact per
+  // 30 minutes by the send_notification cooldown. Fail-soft: the tag write has
+  // already happened and must not be undone by a Supabase hiccup here.
+  let humanAlertQueued = false;
+  if (!opts.dryRun && handoffNeedsHumanAlert(handoffTag)) {
+    try {
+      const { error: alertErr } = await supabase.from('agent_actions').insert({
+        event_id: action.event_id || null,
+        action_type: 'send_notification',
+        target_system: 'groupme',
+        target_entity: 'contact',
+        target_id: contactId,
+        action_payload: buildHumanHandoffAlertPayload({
+          contactId,
+          intentClass: generated.intent_class,
+          handlerCode: generated.handler_code,
+          handoffTag,
+          lastInbound: generated.trigger_message_preview || context?.trigger_message || '',
+          conversationId: context?.conversation_id || action?.action_payload?.conversation_id || null,
+        }),
+        reasoning:
+          `Silent human handoff (${generated.intent_class || 'unknown'}${generated.handler_code ? `/${generated.handler_code}` : ''}` +
+          `${handoffTag ? `, ${handoffTag}` : ''}) — the bot sent nothing and no GHL workflow answers this tag. ` +
+          `A person has to reply.`,
+        confidence: 1.0,
+        rule_applied: HANDOFF_ALERT_RULE,
+        status: 'pending',
+        requires_approval: false,
+      });
+      if (alertErr) throw new Error(alertErr.message);
+      humanAlertQueued = true;
+      console.log(`[SendMessage] 🚨 human-handoff alert queued for ${contactId} (${handoffTag || 'no tag'})`);
+    } catch (alertQueueErr) {
+      console.warn(`[SendMessage] human-handoff alert queue failed for ${contactId} (fail-soft): ${alertQueueErr.message}`);
+    }
+  }
+
   await sendGroupMeMessage(
     `🛑 AGENTIC SHORT-CIRCUIT${dqLabel}\n` +
     `👤 ${contactName}\n` +
@@ -1778,6 +1824,7 @@ async function handleShortCircuit(contactId, generated, action, context, opts = 
     classification_method: generated.classification_method,
     callback_basis: callbackBasis,
     pending_cleared: pendingCleared,
+    human_alert_queued: humanAlertQueued,
     reason: 'compliance_gate_handoff',
   };
 }

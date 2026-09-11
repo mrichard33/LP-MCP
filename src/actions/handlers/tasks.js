@@ -72,7 +72,21 @@ export async function executeCreateTask(action, context) {
   const payload = interpolatePayload(action.action_payload, enrichedContext);
   const title = payload?.title || 'Agent task';
   const description = typeof payload?.description === 'string' ? payload.description : '';
-  const assignedTo = typeof payload?.assigned_to === 'string' ? payload.assigned_to : null;
+  // ── Assignee (2026-09-11 — Alfredo Fontan incident) ───────────────
+  // The three create_task actions raised on that thread (447978 / 448010 /
+  // 448030) were all written with assigned_to: null, so the cards said
+  // nothing about who owned them and nobody picked them up. A rule that
+  // names an assignee still wins; when it doesn't, default to the contact's
+  // own GHL owner — the person who would be called about this lead anyway.
+  // Only a contact with no assigned user stays unassigned.
+  const payloadAssignee = typeof payload?.assigned_to === 'string' && payload.assigned_to.trim()
+    ? payload.assigned_to.trim()
+    : null;
+  const contactOwner = typeof ghlContact?.assignedTo === 'string' && ghlContact.assignedTo.trim()
+    ? ghlContact.assignedTo.trim()
+    : null;
+  const assignedTo = payloadAssignee || contactOwner;
+  const assigneeSource = payloadAssignee ? 'payload' : (contactOwner ? 'contact_owner' : 'unassigned');
 
   // ── GHL note: audit trail (unchanged from v1.0) ───────────────────
   const noteText = description ? `[AGENT TASK] ${title}\n${description}` : `[AGENT TASK] ${title}`;
@@ -95,7 +109,11 @@ export async function executeCreateTask(action, context) {
     full += `\n📝 ${trimmed}`;
   }
   if (assignedTo) {
-    full += `\n👉 Assigned: ${assignedTo}`;
+    // Say where the assignment came from: "GHL owner" tells a reviewer this is
+    // the contact's owning user, not a name a rule chose for this task.
+    full += `\n👉 Assigned: ${assignedTo}${assigneeSource === 'contact_owner' ? ' (GHL owner)' : ''}`;
+  } else {
+    full += `\n👉 Assigned: UNASSIGNED — this contact has no GHL owner`;
   }
 
   // v2.1: opt in to groupme.js v1.7 debounce — passing contactId routes
@@ -106,7 +124,7 @@ export async function executeCreateTask(action, context) {
     console.warn(`[ActionExecutor] create_task: GroupMe send failed for ${contactId}: ${err.message}`);
   });
 
-  console.log(`[ActionExecutor] ✅ create_task completed for ${contactId}: title="${title.slice(0, 60)}" desc=${description ? 'yes' : 'no'} assigned=${assignedTo || 'n/a'}`);
+  console.log(`[ActionExecutor] ✅ create_task completed for ${contactId}: title="${title.slice(0, 60)}" desc=${description ? 'yes' : 'no'} assigned=${assignedTo || 'n/a'} (${assigneeSource})`);
 
   return {
     action: 'task_created',
@@ -114,5 +132,6 @@ export async function executeCreateTask(action, context) {
     title,
     description: description ? description.slice(0, 200) : null,
     assigned_to: assignedTo,
+    assignee_source: assigneeSource,
   };
 }
