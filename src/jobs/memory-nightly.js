@@ -36,7 +36,8 @@
  *   9. weekly digest — rule E: on the run whose ET weekday is
  *                      MEMORY_DIGEST_WEEKDAY (Monday), one GroupMe message
  *                      listing what is waiting on Mark (the protected
- *                      item_types), what auto-close did this week, open
+ *                      item_types), what Omi heard this week and nobody has
+ *                      confirmed (sql/101), what auto-close did this week, open
  *                      conflicts awaiting a ruling, sessions unlinked after
  *                      7 days, and this week's validation failures.
  *
@@ -139,6 +140,22 @@ FROM claude_memory_validation_log
 WHERE ran_at > now() - interval '7 days' AND mode = 'nightly' AND check_name NOT LIKE 'repair:%' AND coalesce(rows_flagged, 0) > 0
 ORDER BY check_name, ran_at DESC`;
 
+// "Heard in Omi — confirm or drop" (sql/101): open Omi proposals from the last
+// 7 days. Nothing Omi hears is confirmed, so this section is a queue Mark
+// works, not a report. Conflicts first (they contradict a confirmed decision),
+// then unconfirmed decisions, then the rest; newest first inside each band.
+export const DIGEST_OMI_SQL = `
+SELECT id, item_type,
+       left(regexp_replace(description, '\\s+', ' ', 'g'), 80) AS description,
+       (raw->>'conflicts_with_decision_id') IS NOT NULL AS conflicting,
+       count(*) OVER ()::int AS total
+FROM claude_pending_items
+WHERE origin='omi' AND status='open' AND created_at > now() - interval '7 days'
+ORDER BY ((raw->>'conflicts_with_decision_id') IS NOT NULL) DESC,
+         (item_type = 'unconfirmed_decision') DESC,
+         created_at DESC, id DESC
+LIMIT 15`;
+
 // "Likely done — confirm": open rows whose named PR is merged but only mentioned
 // in passing (rule D2 tags D:pr_mentioned and never closes them — Mark's ruling).
 export const DIGEST_MENTION_SQL = `
@@ -189,11 +206,20 @@ function digestConfig(env = process.env) {
  *   Also: A expired / B duplicates superseded / C done by evidence this week · S open items flagged stale
  */
 export function formatDigest({ waiting = 0, oldest_days = 0, top = [], week = [], stale = 0, mode = 'off', mentions = [], mention_total = 0,
-  conflicts = [], conflict_total = 0, unlinked_7d = 0, drafts = 0, validation = [] }) {
+  conflicts = [], conflict_total = 0, unlinked_7d = 0, drafts = 0, validation = [], omi = [], omi_total = 0 }) {
   const lines = [`📋 memory weekly — ${waiting} item${waiting === 1 ? '' : 's'} waiting on Mark (oldest: ${oldest_days} days)`];
   top.slice(0, 5).forEach((r, i) => {
     lines.push(`${i + 1}. [#${r.id}] ${String(r.description || '').trim()}  (${r.session_date})`);
   });
+  // sql/101 — unconfirmed, so it never mixes into the numbered list above.
+  const omiCount = omi_total || omi.length;
+  if (omiCount > 0) {
+    lines.push(`Heard in Omi — confirm or drop: ${omiCount} this week`);
+    omi.slice(0, 15).forEach((r) => {
+      lines.push(`• [#${r.id}] ${r.conflicting ? '⚠ ' : ''}${String(r.description || '').trim()}`);
+    });
+    if (omiCount > Math.min(omi.length, 15)) lines.push(`  …and ${omiCount - Math.min(omi.length, 15)} more (claude_pending_items, origin 'omi')`);
+  }
   const total = mention_total || mentions.length;
   if (total > 0) {
     lines.push(`Likely done — confirm (PR merged, mentioned in passing): ${total}`);
@@ -253,20 +279,24 @@ export async function runWeeklyDigest({ dry_run = false, mode = 'off', now = new
   if (!cfg.enabled || (!due && !dry_run)) return out;
   const sql = deps.runSQL;
   const rows = (r) => (Array.isArray(r) ? r : []);
-  const [waitingRows, top, week, staleRows, mentionRows, conflictRows, unlinkedRows, validationRows] = await Promise.all([
+  const [waitingRows, top, week, staleRows, mentionRows, conflictRows, unlinkedRows, validationRows, omiRows] = await Promise.all([
     sql(DIGEST_WAITING_SQL), sql(DIGEST_TOP_SQL), sql(DIGEST_WEEK_SQL), sql(DIGEST_STALE_SQL), sql(DIGEST_MENTION_SQL),
     sql(DIGEST_CONFLICTS_SQL).catch((err) => { out.section_errors = [...(out.section_errors || []), `conflicts: ${err.message}`]; return []; }),
     sql(DIGEST_UNLINKED_SQL).catch((err) => { out.section_errors = [...(out.section_errors || []), `unlinked: ${err.message}`]; return []; }),
     sql(DIGEST_VALIDATION_SQL).catch((err) => { out.section_errors = [...(out.section_errors || []), `validation: ${err.message}`]; return []; }),
+    // sql/101 may not be applied yet — a missing column must not kill the digest.
+    sql(DIGEST_OMI_SQL).catch((err) => { out.section_errors = [...(out.section_errors || []), `omi: ${err.message}`]; return []; }),
   ]);
   const waiting = rows(waitingRows)[0] || {};
   const mentions = rows(mentionRows);
   const conflicts = rows(conflictRows);
   const unlinked = rows(unlinkedRows)[0] || {};
+  const omi = rows(omiRows);
   out.waiting = Number(waiting.waiting) || 0;
   out.likely_done = Number(mentions[0]?.total) || mentions.length;
   out.open_conflicts = Number(conflicts[0]?.total) || conflicts.length;
   out.unlinked_7d = Number(unlinked.unlinked) || 0;
+  out.omi_open_7d = Number(omi[0]?.total) || omi.length;
   out.message = formatDigest({
     waiting: out.waiting, oldest_days: Number(waiting.oldest_days) || 0,
     top: rows(top), week: rows(week), stale: Number(rows(staleRows)[0]?.stale) || 0, mode,
@@ -274,6 +304,7 @@ export async function runWeeklyDigest({ dry_run = false, mode = 'off', now = new
     conflicts, conflict_total: out.open_conflicts,
     unlinked_7d: out.unlinked_7d, drafts: Number(unlinked.drafts) || 0,
     validation: rows(validationRows),
+    omi, omi_total: out.omi_open_7d,
   });
   if (dry_run || !due) { out.would_send = due; return out; }
   out.sent = await (deps.postGroupMe || postGroupMe)(out.message);

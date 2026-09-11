@@ -156,9 +156,23 @@ test('sql/098, 099 and 100 are mirrored in the boot presence check, in order', (
   assert.ok(k); assert.match(k.check, /claude_checkpoint_key/);
   const w = MEMORY_MIGRATIONS.find((x) => x.file === '100_provenance_inherit_narrow.sql');
   assert.ok(w); assert.match(w.check, /claude_inherit_provenance/); assert.match(w.check, /in_parent_window/);
-  assert.deepEqual(MEMORY_MIGRATIONS.slice(-3).map((x) => x.file),
-    ['098_memory_integrity.sql', '099_checkpoint_key_deterministic.sql', '100_provenance_inherit_narrow.sql'],
+  // Order matters, not position: sql/100 replaces a function sql/098 creates,
+  // and sql/101 replaces the pack sql/098 last defined. New files append.
+  const order = MEMORY_MIGRATIONS.map((x) => x.file);
+  const at = (f) => order.indexOf(f);
+  assert.ok(at('098_memory_integrity.sql') < at('099_checkpoint_key_deterministic.sql'));
+  assert.ok(at('099_checkpoint_key_deterministic.sql') < at('100_provenance_inherit_narrow.sql'),
     'sql/100 must apply after 098 — it replaces the function 098 creates');
+  assert.ok(at('100_provenance_inherit_narrow.sql') < at('101_omi_memory_source.sql'),
+    'sql/101 must apply after 098 — it replaces the pack 098 last defined');
+});
+
+// ─── sql/101: Omi as an unconfirmed memory source ───────────────────────────
+test('sql/101 is mirrored in the boot check as BOTH the writer function and the widened surface CHECK', () => {
+  const rows = MEMORY_MIGRATIONS.filter((x) => x.file === '101_omi_memory_source.sql');
+  assert.equal(rows.length, 2, 'the function alone is not enough — the constraint has to be there too');
+  assert.ok(rows.some((r) => /claude_omi_ingest/.test(r.check)));
+  assert.ok(rows.some((r) => /claude_session_logs_surface_check/.test(r.check) && /omi/.test(r.check)));
 });
 
 // ─── sql/100: provenance inheritance scoped to the parent's checkpoint ───────

@@ -29,7 +29,12 @@ export const STATUS_WEIGHT = Object.freeze({
   superseded: 0.2, resolved: 0.2, done: 0.2, expired: 0.2, wont_fix: 0.2,
   archived: 0.2, dropped: 0.2, rejected: 0.2,
 });
-export const ORIGIN_WEIGHT = Object.freeze({ live: 1.0, retro: 0.8, nightly: 0.6, n8n: 0.9 });
+// Origins, highest first: live 1.0 (stated in the session) · n8n 0.9 (a system
+// event — machine-accurate, but nobody said it) · retro 0.8 (reconstructed from
+// a transcript) · nightly 0.6 (a draft nobody has confirmed) · omi 0.6
+// (sql/101 — overheard and unconfirmed, deliberately ranked no higher than a
+// nightly draft and below every reconstructed-but-reviewed row).
+export const ORIGIN_WEIGHT = Object.freeze({ live: 1.0, retro: 0.8, nightly: 0.6, n8n: 0.9, omi: 0.6 });
 export const DATE_CONFIDENCE_WEIGHT = Object.freeze({ exact: 1.0, write_date: 0.5 });
 export const RRF_K = 60;
 
